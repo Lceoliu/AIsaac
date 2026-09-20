@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+.venv/
+runs/
+turbo/build/
+**/target/
+*.py[cod]
+*.dmp
+*.log
+.env
+.env.*

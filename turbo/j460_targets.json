@@ -1,0 +1,54 @@
+{
+  "build": "J460",
+  "pe": { "timestamp": "0x69E6E3A7", "size_of_image": "0x0092C000" },
+  "note": "RVA = VA - 0x400000。prologue 字节从 isaac-ng.exe 只读读出（2026-09-19 四个加速层目标；2026-09-20 三个崩溃探针目标，证据见 rl/docs/NATIVE_CRASH_ANALYSIS.md）。`??` = 含绝对地址的字节，进程基址被 ASLR 重定位后与文件不同，比对时跳过。",
+  "functions": {
+    "glfw_get_time": {
+      "rva": "0x006266A0",
+      "abi": "no args; returns double in XMM0 (GLFW 3.4 glfwGetTime, LTCG custom return)",
+      "prologue": "55 8B EC 83 EC 08 83 3D ?? ?? ?? ?? 00 75 16"
+    },
+    "render_frame": {
+      "rva": "0x005555C0",
+      "abi": "no args (ECX saved then overwritten before use); plain ret",
+      "prologue": "53 8B DC 83 EC 08 83 E4 F8 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 6A FF"
+    },
+    "manager_update": {
+      "rva": "0x00554CD0",
+      "abi": "void __stdcall(char); ret 4 (NetFix profile main_loop_update)",
+      "prologue": "55 8B EC 83 E4 F0 81 EC 78 04 00 00 A1 ?? ?? ?? ?? 33 C4"
+    },
+    "game_update": {
+      "rva": "0x002FADC0",
+      "abi": "void __thiscall(Game*)",
+      "prologue": "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 ?? ?? ?? ?? 50 83 EC 4C 56 57"
+    },
+    "push_shader": {
+      "rva": "0x006140C0",
+      "abi": "int __stdcall(const char* name); ret 4; returns 1 only if the registry object exists and its flags bit0 is set (FUN_00a140c0)",
+      "prologue": "53 8B DC 83 EC 08 83 E4 F8 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 83 EC 18"
+    },
+    "font_draw": {
+      "rva": "0x0061BD80",
+      "abi": "void __thiscall(Font* this, 9 stack dwords, XMM2/XMM3 float inputs); ret 0x24 (FUN_00a1bd80; pushes KAGE_ColorTextureShader without checking, then pops)",
+      "prologue": "55 8B EC 83 E4 F8 83 EC 40 8B C1 F3 0F 11 54 24 34 56 0F 28 CB"
+    },
+    "file_open_plain": {
+      "rva": "0x00617EA0",
+      "abi": "bool __stdcall(const char* path, KAGE::Filesys::File** out); ret 8 (FUN_00a17ea0; out==NULL means existence check only)",
+      "prologue": "55 8B EC 51 53 56 57 8B 7D 08 85 FF 0F 84 82 00 00 00 80 3F 00 74 7D"
+    }
+  },
+  "data": {
+    "glfw_timer_offset": { "rva": "0x00874BA8", "type": "u64", "note": "_glfw.timer.offset；glfwGetTime = (QPC - offset) / frequency" },
+    "glfw_timer_frequency": { "rva": "0x00874BB0", "type": "u64", "note": "运行时与 QueryPerformanceFrequency 比对，不等则拒绝启用虚拟时钟" },
+    "manager_ptr": { "rva": "0x0087169C", "type": "ptr", "note": "DAT_00c7169c：Manager 单例指针" },
+    "manager_iteration_counter": { "offset": "0x4ABBC", "type": "u32", "note": "Manager+0x4ABBC，每次 Manager::Update 加一；渲染函数只在奇数（或 Manager+0x2A3C0 非零）时绘制" },
+    "manager_interpolation_flag": { "offset": "0x2A3C0", "type": "u8", "note": "静态只见比较不见写入，按 0 处理" },
+    "shader_registry_map": { "rva": "0x008379BC", "type": "std::map<u32 hash, Shader*>", "note": "+0 头节点指针（根 = head+4），+4 元素数；节点：+0 左 +4 父 +8 右 +0xD isnil +0x10 键 +0x14 值。键 = 小写 djb2" },
+    "shader_current": { "rva": "0x008379B8", "type": "ptr", "note": "当前 shader 对象；对象 +4 flags，bit0 = Shader::Create 成功" },
+    "shader_stack": { "rva": "0x008379CC", "type": "std::deque<Shader*>", "note": "+4 块表 +8 块表容量 +0xC 起始偏移 +0x10 深度；每块 4 个指针" },
+    "archive_slot_table": { "rva": "0x00837A14", "type": "32 x {char* path; u8 kind}", "note": "归档挂载槽，8 字节一项；kind 1/2 = 压缩，0 = XOR" },
+    "archive_slot_count": { "rva": "0x00837B14", "type": "u32", "note": "已用槽数" }
+  }
+}

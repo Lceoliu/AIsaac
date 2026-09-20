@@ -1,0 +1,8 @@
+# 与 netfix/rust/.cargo/config.toml 一致：GNU 工具链 + rust-lld 自包含链接，无需系统 MSVC/MinGW。
+[build]
+target-dir = "target"
+incremental = false
+
+[target.x86_64-pc-windows-gnu]
+linker = "rust-lld"
+rustflags = ["-Clink-self-contained=yes"]

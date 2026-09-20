@@ -1,0 +1,17 @@
+[package]
+name = "isaac_sim"
+version = "0.1.0"
+edition = "2021"
+description = "Headless single-room combat kernel for The Binding of Isaac (Repentance+ J460), translated from decompiled game logic"
+license = "MIT"
+publish = false
+
+[lib]
+name = "isaac_sim"
+path = "src/lib.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+debug = false
