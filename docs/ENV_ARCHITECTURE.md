@@ -91,6 +91,21 @@
 
 复用接口参考：[SB3自定义编码器](https://stable-baselines3.readthedocs.io/en/master/guide/custom_policy.html)、[MaskablePPO](https://sb3-contrib.readthedocs.io/en/master/modules/ppo_mask.html)、[激光采样API](https://wofsauge.github.io/IsaacDocs/rep/EntityLaser.html)。
 
+### 0.4 独立引擎并行采样（2026-09-21）
+
+用户验收标准：先2引擎共同训练一个模型，再实测4引擎的吞吐与资源；正式训练至少累计512个完整回合，单局上限120秒（3600逻辑帧）。step不等于局，死亡、清房、超时分开统计。
+
+实现：`train_parallel.py` + `isaac_bridge/parallel.py`。游戏进程独立、端口递增；同一Python进程的线程池并发发送/接收各自TCP动作，采样在SB3 VecEnv边界汇合，由单个MaskablePPO统一计算动作与梯度。模型/可见观测/奖励不变，总rollout固定256条transition（2实例各128步，4实例各64步），batch8、epochs4。CUDA运行库仅安装在本仓库忽略目录，使用本机4060，不改系统驱动。
+
+隔离：J460路径初始化函数`FUN_009a9510`首先动态调用`GetUserProfileDirectoryA`，不是直接相信USERPROFILE。原生可选`ISAAC_RL_WORKER_PROFILE`钩子重定向该worker到独立profile；配置SteamCloud=0，存档/日志独立；runtime拥有独立mods/data，资源目录junction及EXE/DLL硬链接共用未修改原始字节。启动验收读取每个runtime的savedatapath.txt与Lua加载日志，确认仅桥接Mod执行；推进worker0两帧，其他worker的逻辑帧、位置、历史窗口必须不变。
+
+已观察的失败与修正：
+- 初版给注入器设置cwd没有改变其子游戏目录：注入器按EXE所在目录启动。改为每worker独立runtime EXE入口，保留失败报告，两个游戏均正常退出。
+- SubprocVecEnv版2引擎通过，但4引擎分配512MiB动画历史数组时内存不足。改用线程并发TCP，避免额外四份Python/PyTorch，游戏仍是四个进程；没有缩短64步历史或减少实体容量。
+- 新runtime触发Steam重新同步订阅Mod，初版误把其他Mod重新启用；四引擎并发冷启动还出现握手超时。预置各订阅Mod的disable.it、核验仅桥接Lua执行，并逐个完成启动握手后再启动下一实例；正式采样仍并行。此前短测不能作为最终隔离配置的性能基准。
+
+43项离线测试通过，含线程并发屏障、独立写目录、累计局数而非步数、自动reset/terminal_observation/时间截断、动作mask和CUDA梯度更新。报告位于`runs/l1/20260921-parallel/`；正式512局完成情况以最终report与逐局episodes.jsonl为准，短测通过不替代该门槛。
+
 ## 1. 证据基线（2026-09-19 核实）
 
 | 主题 | 事实 | 证据 |

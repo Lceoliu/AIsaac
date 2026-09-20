@@ -38,10 +38,12 @@ FLAG_FONT_GUARD = 1 << 2
 FLAG_FILE_RETRY = 1 << 3
 FLAG_PROBE_DUMP = 1 << 4
 HOOK_CAPTURE_OVERLAY = 1 << 11
+HOOK_WORKER_PROFILE = 1 << 12
 STATUS_NAMES = {0: "loading", 1: "active", 2: "identity_failed", 3: "hook_failed", 4: "shm_failed"}
 HOOK_NAMES = {1: "glfw_get_time", 2: "manager_update", 4: "game_update", 8: "render_frame",
               16: "push_shader", 32: "font_draw", 64: "file_open_plain", 128: "crt_access",
-              256: "resolve_path", 512: "search_path", 1024: "search_miss", HOOK_CAPTURE_OVERLAY: "capture_overlay"}
+              256: "resolve_path", 512: "search_path", 1024: "search_miss", HOOK_CAPTURE_OVERLAY: "capture_overlay",
+              HOOK_WORKER_PROFILE: "worker_profile"}
 
 _HEAD = struct.Struct("<8I")          # 0x000..0x020
 _STATS = struct.Struct("<8QdQQII")    # 0x020..0x080
@@ -328,7 +330,8 @@ def launch_suspended(port: int, game_dir: str = DEFAULT_GAME_DIR, privileged: bo
                      virtual_clock: bool = False, font_guard: bool = True, file_retry: bool = True,
                      probe_dump: bool = True, log_dir: Optional[str] = None, engine_velocity: bool = False,
                      dll: str = DEFAULT_DLL, injector: str = DEFAULT_INJECTOR,
-                     disable_capture_overlays: bool = True, archive_path_fix: bool = True) -> Tuple[int, TurboControl, str]:
+                     disable_capture_overlays: bool = True, archive_path_fix: bool = True,
+                     worker_profile: Optional[str] = None) -> Tuple[int, TurboControl, str]:
     """挂起创建 isaac-ng.exe、注入探针 DLL、等钩子激活后再放行主线程（启动期取证必须用这个）。
 
     配置经环境变量传给 DLL（进程创建前无法预写控制块）。返回 (pid, 控制块, 注入器输出)。
@@ -345,6 +348,8 @@ def launch_suspended(port: int, game_dir: str = DEFAULT_GAME_DIR, privileged: bo
         raise FileNotFoundError(exe)
     env = dict(os.environ)
     env["ISAAC_RL_PORT"] = str(port)
+    if worker_profile is not None:
+        env["ISAAC_RL_WORKER_PROFILE"] = os.path.abspath(worker_profile)
     env["ISAAC_RL_PRIVILEGED"] = "1" if privileged else "0"
     env["ISAAC_RL_ENGINE_VEL"] = "1" if engine_velocity else "0"
     env["ISAAC_TURBO_SKIP_RENDER"] = "1" if skip_render else "0"

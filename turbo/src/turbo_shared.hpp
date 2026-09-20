@@ -43,6 +43,7 @@ constexpr std::uint32_t kHookCaptureOverlay = 1u << 11;  // startup-only, per-pr
 
 // Game::Update 单次耗时低于此值的调用计入 "fast" 桶：被 Lua 桥接阻塞等待训练器的那一帧会长达秒级，
 // 不能混进纯逻辑成本的统计。
+constexpr std::uint32_t kHookWorkerProfile = 1u << 12;
 constexpr std::uint64_t kFastGameUpdateMicros = 20000;
 
 constexpr std::uint32_t kMaxProbeDumps = 3;  // 每个进程最多写几份探针转储

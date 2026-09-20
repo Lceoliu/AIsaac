@@ -1,3 +1,4 @@
 gymnasium==1.2.3
 stable-baselines3==2.7.1
 sb3-contrib==2.7.1
+psutil==7.0.0

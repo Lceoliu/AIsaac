@@ -52,6 +52,22 @@ FILE* gLog = nullptr;
 char gLogDir[MAX_PATH] = {};
 char gLogPath[256] = {};
 char gStatus[128] = "LOADING";
+char gWorkerProfile[MAX_PATH] = {};
+using GetProfileFn = BOOL (WINAPI*)(HANDLE, LPSTR, LPDWORD);
+GetProfileFn gOrigGetProfile = nullptr;
+
+// J460 FUN_009a9510 resolves this API dynamically, before the getenv fallback.
+// Redirect only this worker's profile; never edit the account or global registry.
+BOOL WINAPI hookGetProfile(HANDLE token, LPSTR buffer, LPDWORD size) {
+  const DWORD needed = static_cast<DWORD>(std::strlen(gWorkerProfile) + 1);
+  if (!buffer || *size < needed) {
+    *size = needed;
+    SetLastError(ERROR_INSUFFICIENT_BUFFER);
+    return FALSE;
+  }
+  std::memcpy(buffer, gWorkerProfile, needed);
+  return TRUE;
+}
 
 VirtualClock gClock;
 bool gClockUsable = false;
@@ -898,6 +914,22 @@ bool installHooks() {
   gResolverProbe = envFlag("ISAAC_TURBO_RESOLVER_PROBE");
   gArchivePathFix = envFlag("ISAAC_TURBO_ARCHIVE_PATH_FIX");
   std::uint32_t mask = 0;
+  const DWORD profileLength = GetEnvironmentVariableA("ISAAC_RL_WORKER_PROFILE", gWorkerProfile, MAX_PATH);
+  if (profileLength) {
+    if (profileLength >= MAX_PATH || GetFileAttributesA(gWorkerProfile) == INVALID_FILE_ATTRIBUTES) {
+      setStatus(kStatusHookFailed, "ERROR:invalid worker profile");
+      return false;
+    }
+    HMODULE userenv = LoadLibraryA("userenv.dll");
+    void* target = reinterpret_cast<void*>(GetProcAddress(userenv, "GetUserProfileDirectoryA"));
+    st = MH_CreateHook(target, reinterpret_cast<void*>(&hookGetProfile), reinterpret_cast<void**>(&gOrigGetProfile));
+    if (st != MH_OK) {
+      setStatus(kStatusHookFailed, "ERROR:hook GetUserProfileDirectoryA=%d", static_cast<int>(st));
+      return false;
+    }
+    mask |= kHookWorkerProfile;
+    logf("worker profile: %s", gWorkerProfile);
+  }
   for (const auto& s : specs) {
     if (s.bit == kHookResolvePath && !(gResolverProbe || gArchivePathFix)) continue;
     if ((s.bit & (kHookSearchPath | kHookSearchMiss)) && !gResolverProbe) continue;

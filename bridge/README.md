@@ -4,6 +4,25 @@
 
 ## Transformer v1
 
+### 并行训练（2026-09-21）
+
+入口 `bridge/python/train_parallel.py`：2或4个独立游戏进程，独立端口、profile、options、日志及Mod存档目录，一个MaskablePPO学习器。原生只读资源共用，桥接Mod复制到每个runtime；`SteamCloud=0`仅写入worker配置。J460首先动态调用`GetUserProfileDirectoryA`，仅改USERPROFILE环境变量不足以隔离，因此启动期按worker重定向该API，不修改系统用户/注册表。
+
+采样复用SB3 VecEnv接口，通过线程池并发等待各游戏TCP连接；并不是同一个游戏里的四个假环境。先验证过SubprocVecEnv的2实例路径，但4实例因重复加载PyTorch及观测缓冲区分配而内存不足，改为单Python运行时，游戏进程仍独立。失败报告保留。
+
+```powershell
+$env:PYTHONPATH="D:\Projects\fortune\Isaac\rl\bridge\python;D:\Projects\fortune\Isaac\rl\runs\cuda-deps;D:\Projects\fortune\Isaac\rl\runs\training-deps"
+# 2/4实例等预算短测：每次PPO更新总计256条transition，epochs=4，batch_size=8
+python D:\Projects\fortune\Isaac\rl\bridge\python\train_parallel.py --workers 2 --device cuda --updates 2 --out D:\Projects\fortune\Isaac\rl\runs\parallel-2
+python D:\Projects\fortune\Isaac\rl\bridge\python\train_parallel.py --workers 4 --device cuda --updates 2 --out D:\Projects\fortune\Isaac\rl\runs\parallel-4
+# 正式训练：所有worker累计至少512个完整回合，不是512步；每个rollout完成更新后判断停止
+python D:\Projects\fortune\Isaac\rl\bridge\python\train_parallel.py --workers 4 --device cuda --episodes 512 --episode-frames 3600 --out D:\Projects\fortune\Isaac\rl\runs\parallel-512
+```
+
+`--episode-frames`为单局逻辑帧上限，30帧/秒；默认3600帧，即用户确认的120秒。死亡/清房提前结束，超时单独记为truncated。`--updates`仅供短测，会覆盖episodes停止条件。`--checkpoint`可接续模型和优化器，但512局计数从此次运行开始，旧run不重复计入。每8次更新及结束保存checkpoint；`episodes.jsonl`逐局记录worker、回报、长度和结局，`resources.jsonl`逐秒记录学习器与引擎RSS/CPU，`report.json`记录完整状态。RSS合计包含共享页，不是独占物理内存。
+
+本机CPU版PyTorch不能调用4060；CUDA版PyTorch2.7.1+cu128安装在忽略的`runs/cuda-deps`，不替换全局环境。安装参考：[官方版本矩阵](https://pytorch.org/get-started/previous-versions/)。接口参考：[SB3 VecEnv](https://stable-baselines3.readthedocs.io/en/master/guide/vec_envs.html)、[MaskablePPO](https://sb3-contrib.readthedocs.io/en/master/modules/ppo_mask.html)。实测状态见架构文档§0.4，未完成512局前不得记为训练验收完成。
+
 安装/复用 `python/requirements-training.txt` 中固定版本的训练依赖（本机位于 `rl/runs/training-deps`，未安装到全局）。游戏mods中的isaac_rl_bridge是指向本仓库Mod目录的junction，无需复制到自身；新worker会读到更新的schema=3。
 
 ```powershell
