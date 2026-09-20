@@ -21,7 +21,9 @@ python D:\Projects\fortune\Isaac\rl\bridge\python\train_parallel.py --workers 4 
 
 `--episode-frames`为单局逻辑帧上限，30帧/秒；默认3600帧，即用户确认的120秒。死亡/清房提前结束，超时单独记为truncated。`--updates`仅供短测，会覆盖episodes停止条件。`--checkpoint`可接续模型和优化器，但512局计数从此次运行开始，旧run不重复计入。每8次更新及结束保存checkpoint；`episodes.jsonl`逐局记录worker、回报、长度和结局，`resources.jsonl`逐秒记录学习器与引擎RSS/CPU，`report.json`记录完整状态。RSS合计包含共享页，不是独占物理内存。
 
-本机CPU版PyTorch不能调用4060；CUDA版PyTorch2.7.1+cu128安装在忽略的`runs/cuda-deps`，不替换全局环境。安装参考：[官方版本矩阵](https://pytorch.org/get-started/previous-versions/)。接口参考：[SB3 VecEnv](https://stable-baselines3.readthedocs.io/en/master/guide/vec_envs.html)、[MaskablePPO](https://sb3-contrib.readthedocs.io/en/master/modules/ppo_mask.html)。实测状态见架构文档§0.4，未完成512局前不得记为训练验收完成。
+本机CPU版PyTorch不能调用4060；CUDA版PyTorch2.7.1+cu128安装在忽略的`runs/cuda-deps`，不替换全局环境。安装参考：[官方版本矩阵](https://pytorch.org/get-started/previous-versions/)。接口参考：[SB3 VecEnv](https://stable-baselines3.readthedocs.io/en/master/guide/vec_envs.html)、[MaskablePPO](https://sb3-contrib.readthedocs.io/en/master/modules/ppo_mask.html)。
+
+**已完成512局正式实机训练**：4引擎累计512局、133632个新增step、约129分钟训练；单局上限120秒游戏时间。保存/重载/再次执行通过，四进程正常退出；结果512死亡、0击杀、0超时，基础训练链路过关但战斗能力未达标。最终模型在`../runs/l1/20260921-parallel/train-512-episodes/ppo_monstro.zip`，逐局记录和资源曲线在同目录。2/4实例等预算短测分别12.67/13.77决策每秒，峰值RSS合计4.28/5.41GiB；43项离线测试通过。详细证据与已解决失败见架构文档§0.4。
 
 安装/复用 `python/requirements-training.txt` 中固定版本的训练依赖（本机位于 `rl/runs/training-deps`，未安装到全局）。游戏mods中的isaac_rl_bridge是指向本仓库Mod目录的junction，无需复制到自身；新worker会读到更新的schema=3。
 
