@@ -121,6 +121,7 @@ class MonstroGymEnv(gym.Env):
             raise ValueError(f"Invalid action: {action}")
         repeat = min(self.bridge.action_repeat, self.max_episode_frames - self.elapsed_frames)
         previous = self.raw_obs["logic_frames"]
+        previous_room = self.raw_obs["room"]["room_idx"]
         previous_combat = self.raw_obs['combat']
         try:
             obs, _, _, _, info = self.bridge.step(action, repeat=repeat)
@@ -131,6 +132,9 @@ class MonstroGymEnv(gym.Env):
         advanced = obs["logic_frames"] - previous
         if advanced != repeat:
             raise RuntimeError(f"Expected {repeat} logic frames, received {advanced}")
+        if obs["room"]["room_idx"] != previous_room:
+            self.finished = True
+            raise BridgeError(f"Monstro arena room changed: {previous_room} -> {obs['room']['room_idx']}")
         self.raw_obs = obs
         self.elapsed_frames += advanced
         dead = obs["players"][0]["dead"]

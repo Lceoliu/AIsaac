@@ -7,8 +7,8 @@
 | 类别 | 直接故障 | 已确定 | 仍未确定 | 修复方向 |
 |---|---|---|---|---|
 | A 字体绘制 shader 栈下溢（RVA `0x61C423`） | 空栈出栈读到 `NULL+0xC`；入栈失败是重点候选 | CALL约束栈扫描支持正常渲染路径；注册表计数3、图形初始化位1，尚未验证树节点/键/对象 | 入栈返回值、目标对象状态及首次失配位置 | 记录push/pop、对象与堆；字体守卫只是待实机验收的缓解 |
-| B 启动期归档流空指针（RVA `0x668CB5`/`0x668CD6`） | 逐条目构造拿到空流后未检查即虚调用 | 新探针记录到NULL路径；无Turbo的历史进程也会崩溃，发生于Mod/shader初始化前 | 路径何时变空；真实 `_access`/打开返回值及当时错误码 | 先验证探针命中，再记录原始路径/错误码；有限重试效果待验证 |
-| C 退出时跳转到 `0xDEDEDEDE`（14:58，PID18788） | 执行无效地址，栈返回候选位于NVIDIA D3D11驱动 | 发生在shutdown日志之后；无Turbo对照也有异常退出，但没有相同现场转储 | 是否同一故障点、哪个组件损坏了指针 | 保留异常退出分类和退出码，对照取证，不当作clean_exit |
+| B 启动期归档流空指针（RVA `0x668CB5`/`0x668CD6`） | 逐条目构造拿到空流后未检查即虚调用 | 新探针记录到NULL路径；无Turbo的历史进程也会崩溃，发生于Mod/shader初始化前 | 相对路径搜索偶发失配的内部原因 | 已注册且确实存在于磁盘的容器走原生绝对路径分支；嵌套归档保留原生搜索，验收见§0.4 |
+| C 退出时跳转到 `0xDEDEDEDE` | 执行无效地址，栈顶候选NVIDIA驱动+0x91F091 | 新反向对照复现相同现场；隔离NvCamera32/nvspcap的worker正常退出 | 两个捕获模块各自责任及驱动内部指针损坏来源 | worker启动链默认进程级隔离；仍保留真实异常退出分类 |
 
 三类的故障现场均在原生代码，尚不能据此排除 Python 驱动的时序/生命周期是间接触发因素；A、B 在没有 Turbo/NetFix/REPENTOGON 模块的进程里也出现（9 份转储的模块表见 `dump-walk-all.json` 的 `nonsystem_modules`）。
 
@@ -35,6 +35,58 @@
 下一步优先捕获 `0x617180` 的原始相对路径、解析返回值，以及 `0x616C60` 的搜索目录/索引命中；再区分缓存缺项、路径内容/生命周期或后续归档查找问题。当前没有证据支持先设置杀软排除，也不应扩大睡眠重试掩盖索引错误。
 
 验证命令：`python turbo/tests/access_probe_test.py`（实际Hook函数编译到独立32位测试程序，3种输入）；`pwsh -NoProfile -File turbo/build.ps1`。初次控制器在进程已崩溃后枚举模块得到WinError299，已改为恢复主线程后立即读IAT；该工具错误与游戏的原生异常分别记录。
+
+## 0.3 2026-09-20：worker启动隔离与实战重置修复
+
+证据目录：`../runs/l1/20260920-resolver-fix/`。当前修复落在RL worker的启动链，而不是修改原游戏或NVIDIA驱动二进制。
+
+### 已验证的退出故障处理
+
+- 基线PID38200退出时 `EIP=EAX=0xDEDEDEDE`，栈顶返回候选 `nvwgf2um.dll+0x91F091`，与历史C类相同。单独设置 `SteamNoOverlayUI=1` 的对照仍异常退出。
+- 挂起启动时，`hookLdrLoadDll`仅拒绝当前进程加载 `NvCamera32.dll` / `nvspcap.dll` 两个可选捕获叠加层，返回 `STATUS_DLL_NOT_FOUND`。不拒绝 `nvoglv32`、`nvwgf2um`、D3D11或Steam overlay，不改系统设置、不卸载已加载模块。实战worker模块表确认NVIDIA OpenGL驱动及Steam overlay仍加载，两项捕获模块未加载。
+- 重新允许这两个模块后，PID48216到达120次逻辑更新，退出再次变成 `0xC0000005`；新WER转储同样为 `0xDEDEDEDE` / `nvwgf2um+0x91F091`。该转储已复制到本轮目录，避免WER轮转清除。这里证明的是两项捕获叠加层这一组对退出故障的影响，尚未拆分两者的个别责任。
+- 隔离后的严格门禁：4个无渲染worker、5个可视化worker均达到至少120次GameUpdate并正常退出0；可视化每进程实际执行3107–3146次字体调用，未打开字体守卫、文件重试、虚拟时钟或resolver诊断。更早17次只等待listening后2–4秒，其中14次未进入逻辑更新，另3次只到58、59、117次更新，**均未达到严格120次门禁，不计入这9次实玩法/渲染门禁**。
+
+`launch_suspended(..., disable_capture_overlays=True)`默认开启隔离，可传False做对照；`train_monstro.py --launch`和`monstro_rollout.py --launch`均在恢复主线程之前注入，修正了此前“启动完成之后才加控制层”的空档。`--pid`仍可附着，但已经加载的叠加层不能追溯移除，必须重启worker。
+
+### 相对路径诊断保留的事实
+
+PID27288和18872分别捕获 `afterbirthp.a`、`afterbirth.a` 解析返回NULL；PID18872的 `0x616C60` 搜索函数也返回NULL，但紧随其后的只读目录树遍历找到了对应hash、非空路径值，所经节点nil标记均为0。这把问题缩小到原生查找过程，而不是简单缺文件。没有依据直接修改文件索引或加睡眠重试。可选 `ISAAC_TURBO_RESOLVER_PROBE=1` 开启搜索/失败点取证Hook。后续PID10948在隔离捕获组件后仍复现B，因此不能把B归因为NVIDIA组件。当前正常worker只安装执行容器路径修复所需的ResolvePath Hook，关闭搜索树诊断。
+
+### rewind后的玩家资源模板
+
+首次2048步PPO在9个结束回合后被训练器的初始状态断言中止；再次诊断读到Isaac、无主动道具、最大红血6，但当前红血2、炸弹0。游戏仍存活，WM_CLOSE退出0，这不是原生崩溃。
+
+`monstro_empty.lua`现在只在episode初始化边界补齐红血，并恢复既有fixture的1炸弹、0钥匙、0金币；仍使用原生rewind，不重启游戏、不重新生成楼层，不在战斗中回血或开无敌。玩家位置、道具数量、Boss类型/血量、房间锚点的原有校验保留。资源调整使用游戏原生[EntityPlayer API](https://docs.moddingofisaac.com/ab_p/beta/docs/entityplayer)，受伤/命中/实际伤害的奖励权重未改变。玩家校验失败现在打印实际字段，避免笼统归为连接故障。
+
+### 第一轮长实战验收（历史结果，早于最终归档/房间边界修复）
+
+- `ppo-2048-fixed/report.json`：PID39024，2048步PPO、17个结束回合、64个训练epoch，291.21秒；参数L2变化1.28119；模型保存/重载、重载后再次执行通过。渲染调用0、虚拟tick0，安全房断开后WM_CLOSE退出0。
+- `visible-combat/report.json`：PID14188，5个完整实战回合，106.71秒；5821次真实渲染、75673次字体调用，push_failures=0、font_skipped=0、虚拟tick0；安全房断开后WM_CLOSE退出0。这里没有用字体守卫跳过文本来制造通过。
+- 两个过程均未强制终止，完整退出记录在 `combat-acceptance-pre-bar.json`。初次失败在 `ppo-2048/report.json` / `combat-acceptance-initial.json`，诊断失败在 `reset-diagnosis/report.json`，保留而不覆盖。场景同输入的基线/修改/回滚结果见 `scenario-BASELINE`、`scenario-MODIFIED`、`scenario-ROLLBACK`。
+- 该轮PPO记录16次死亡、1次“win”，但后来实测发现炸弹能炸开仅Close的门，旧逻辑会把邻接空房间视为胜利。该次win没有终局房间证据，**不计为有效Monstro击杀**。可视化规则策略5回合均死亡。
+
+## 0.4 2026-09-20：物理容器路径修复与严格房间边界
+
+### 修复路径与失败实验
+
+- PID10948（正式PPO启动）及6924（首个NULL返回后重试候选）均复现RVA `0x668CB5`、ECX=0，转储解析保存在 `archive-failed-dumps.json`。退出故障隔离不能解决这个独立问题；“仅返回NULL才重试”没有通过门禁，已弃用。
+- `hookResolvePath`只匹配32个挂载槽中容器路径的**原始指针身份**（包括计数尚未递增的正在挂载槽），且仅对确实存在的磁盘普通文件，将相对路径转为绝对路径后交给**原生解析函数**。原生函数仍负责存在性检查、字符串分配和后续释放；不伪造文件流、不吞读取错误、不添加睡眠重试、不修改资源索引、文件内容或RNG。
+- 初次把所有槽都改为磁盘路径时，PID30780在 `resources/secret.a` 失败：它是嵌套容器，不是磁盘文件。该错误实验保留在 `absolute-1`。最终实现先检查物理文件属性，对嵌套容器及普通资源查找保持原样。不能把“所有.a文件”都当作OS文件。
+- 默认 `launch_suspended(..., archive_path_fix=True)`；可传False做对照。单位测试直接编译实际Hook，覆盖第31槽、同名不同指针、嵌套容器、普通资源、已有绝对路径、真实失败传递、禁用开关及NULL输入，共8项；同时验证原生返回指针和errno/doserrno/LastError不被日志污染。
+- `physical-1`至`physical-20`：关闭搜索诊断、字体守卫、虚拟时钟及文件重试，20次冷启动均进入游戏、至少120次逻辑更新，WM_CLOSE退出0，没有强制终止。日志记录实际 `archive_resolve_absolute ... success=1`；这不是仅编译通过的候选。
+- 修复绕开已实测失配的“已知磁盘容器再次走相对资源索引”路径；**原生搜索为何偶发返回NULL/空路径仍未定位到内部写入点**。不要据此指控杀软、Steam或具体Mod，也不要把worker修复写成已修改原版引擎底层实现。
+
+### 防止跨房假胜利
+
+实机 `door-probe.log` 显示，Close后的门仍可炸开；执行原生 `Bar()` 后三扇门的 `CanBlowOpen=false`，`TryBlowOpen=true参数`也返回false。场景现在在初始化时Close+Bar，Gym在每个动作后检查room_idx不变，变化即报错而不是把邻接空房判为Boss胜利。对应单元回归在旧实现失败、修改实现通过、回滚实现再次失败。原生rewind、每次受伤−1、命中+0.05及按实际伤害归一化奖励均保留。
+
+### 最终长实战验收（两项原生修复 + Bar + 房间边界断言）
+
+- `ppo-2048-final/report.json`：PID21800，2048步PPO、64个训练epoch、17个结束回合，结局{'death': 17}；耗时293.31秒，参数L2变化1.318380。模型保存、重载、重载后再次执行通过。
+- `visible-combat-final/report.json`：PID51328，5个结束回合，结局{'death': 5}；实际渲染5763次、字体调用74919次，字体跳过0、shader入栈失败0、虚拟tick0。
+- 两者状态completed；安全房断开后WM_CLOSE实际退出0，均未强制终止。逐命令/退出记录在 `combat-acceptance.json`。20次冷启动和这2个长实战worker均未观察到崩溃；这是当前J460训练配置的通过结果，不是任意驱动/Mod组合下的无限稳定保证。
+- 崩溃修复已通过本轮验收；**战斗学习尚未达标**，不能把训练执行成功当作Agent已经会躲弹/击败Boss。此前已撤回的假胜利不计入上述结果。
 
 ## 1. 崩溃清单
 

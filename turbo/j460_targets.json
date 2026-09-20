@@ -33,6 +33,21 @@
       "abi": "void __thiscall(Font* this, 9 stack dwords, XMM2/XMM3 float inputs); ret 0x24 (FUN_00a1bd80; pushes KAGE_ColorTextureShader without checking, then pops)",
       "prologue": "55 8B EC 83 E4 F8 83 EC 40 8B C1 F3 0F 11 54 24 34 56 0F 28 CB"
     },
+    "search_miss": {
+      "rva": "0x00616DB2",
+      "abi": "mid-function search miss; EBX normalized copy, [EBP+8] last key; preserve all registers/flags",
+      "prologue": "85 DB 74 2A 8B 15 ?? ?? ?? ?? 85 D2"
+    },
+    "search_path": {
+      "rva": "0x00616C60",
+      "abi": "Directory* __thiscall(Filesys*, const char*, bool* inArchive); ret 8",
+      "prologue": "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 ?? ?? ?? ?? 50 83 EC 10 53 56 57"
+    },
+    "resolve_path": {
+      "rva": "0x00617180",
+      "abi": "char* __thiscall(Filesys*, const char*); ECX passed to relative search at 0x617229; ret 4",
+      "prologue": "55 8B EC 6A FF 68 ?? ?? ?? ?? 64 A1 ?? ?? ?? ?? 50 53 56 57 A1 ?? ?? ?? ?? 33 C5"
+    },
     "file_open_plain": {
       "rva": "0x00617EA0",
       "abi": "bool __stdcall(const char* path, KAGE::Filesys::File** out); ret 8 (FUN_00a17ea0; out==NULL means existence check only)",

@@ -8,10 +8,9 @@ from dataclasses import asdict
 import numpy as np
 
 from isaac_bridge.monstro_gym import MonstroGymEnv
-from isaac_bridge.launch import launch
 from isaac_bridge.env import BridgeError
 from isaac_bridge.rendering import configure_rendering
-from isaac_bridge.turbo import TurboError
+from isaac_bridge.turbo import TurboError, launch_suspended, process_exit_code, HOOK_CAPTURE_OVERLAY
 
 
 def tracking_action(obs):
@@ -56,13 +55,19 @@ def main():
     if args.launch == (args.pid is not None):
         p.error("specify exactly one of --launch or --pid")
     args.out.mkdir(parents=True, exist_ok=True)
-    proc = launch(args.port, privileged=True, extra_args=("--luadebug", "--set-stage=1")) if args.launch else None
-    pid = proc.pid if proc else args.pid
+    pid = args.pid
+    launch_output = None
+    if args.launch:
+        pid, startup_control, launch_output = launch_suspended(
+            args.port, extra_args=("--luadebug", "--set-stage=1"), skip_render=args.render_mode == "headless",
+            virtual_clock=False, font_guard=False, file_retry=False, probe_dump=False,
+            log_dir=str(args.out / "native"))
+        startup_control.close()
     print("PID", pid, "render_mode", args.render_mode, flush=True)
     env = MonstroGymEnv(port=args.port, max_episode_frames=args.frames)
     env.bridge.connect_timeout = args.connect_timeout
     report = {"episodes": [], "status": "started", "turbo": False, "pid": pid,
-              "render_mode": args.render_mode, "virtual_clock": False}
+              "render_mode": args.render_mode, "virtual_clock": False, "launch_output": launch_output}
     render_control = None
     start = time.perf_counter()
     try:
@@ -70,6 +75,7 @@ def main():
         env.connected = True
         render_control = configure_rendering(pid, args.render_mode)
         report["render_before"] = asdict(render_control.stats()) if render_control else None
+        report["capture_overlay_isolation"] = bool(render_control and report["render_before"]["hooks_mask"] & HOOK_CAPTURE_OVERLAY)
         for n, policy in enumerate(args.policies.split(",")):
             if policy not in ("idle", "track"): raise ValueError(policy)
             obs, info = env.reset(seed=0)
@@ -100,7 +106,7 @@ def main():
             report["cleanup"] = env.cleanup_outcome
             if report["status"] == "rollouts_completed": report["status"] = "completed"
         finally:
-            report["process_exit"] = proc.poll() if proc else None
+            report["process_exit"] = process_exit_code(pid) if args.launch else None
             if render_control:
                 report["render_after"] = asdict(render_control.stats())
                 render_control.close()

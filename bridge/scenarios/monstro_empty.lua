@@ -20,6 +20,12 @@ end
 for _, entity in ipairs(Isaac.GetRoomEntities()) do
     if entity.Type ~= EntityType.ENTITY_PLAYER then entity:Remove() end
 end
+-- Rewind can restore a later player snapshot (observed: 2/6 red HP and 0 bombs).
+-- Reapply the initial Isaac resource template at the episode boundary only.
+player:AddHearts(player:GetMaxHearts() - player:GetHearts())
+player:AddBombs(1 - player:GetNumBombs())
+player:AddKeys(-player:GetNumKeys())
+player:AddCoins(-player:GetNumCoins())
 player.Position = Vector(320, 380)
 player.Velocity = Vector(0, 0)
 local boss = game:Spawn(EntityType.ENTITY_MONSTRO, 0, Vector(320, 220),
@@ -27,7 +33,11 @@ local boss = game:Spawn(EntityType.ENTITY_MONSTRO, 0, Vector(320, 220),
 room:SetClear(false)
 for slot = 0, 7 do
     local door = room:GetDoor(slot)
-    if door then door:Close(true) end
+    if door then
+        door:Close(true)
+        door:Bar() -- ordinary closed doors can be bombed open; arena exits must stay blocked
+    end
 end
 Isaac.DebugString("[IsaacRLScenario] monstro_empty ready; player=0 collectibles=0 spawn_seed="
-                  .. tostring(boss.InitSeed) .. " hp=" .. tostring(boss.HitPoints))
+                  .. tostring(boss.InitSeed) .. " hp=" .. tostring(boss.HitPoints)
+                  .. " player_hearts=" .. tostring(player:GetHearts()) .. " bombs=" .. tostring(player:GetNumBombs()))

@@ -12,7 +12,9 @@
 //   5. 字体绘制 FUN_00a1bd80（RVA 0x0061BD80）：kFlagFontGuard 打开时先查 KAGE_ColorTextureShader 是否可用，
 //      不可用则跳过这一次文本绘制（缓解，不改玩法状态；训练默认无渲染时不会触发）。
 //   6. KAGE 文件打开 FUN_00a17ea0（RVA 0x00617EA0）：失败时记录路径、errno/_doserrno/GetLastError；
-//      kFlagFileRetry 打开时短暂重试（缓解 B 类：归档挂载逐条目 fopen 瞬时失败 -> 空流虚调用）。
+//      kFlagFileRetry 仅重试绝对 .a；相对归档路径解析失败不在此策略范围。
+//   7. 可选resolver诊断（ISAAC_TURBO_RESOLVER_PROBE=1），默认不安装，不改查找结果。
+//   8. worker启动时可排除NvCamera32/nvspcap录屏叠加层；不改驱动/系统设置，不卸载已加载模块。
 //
 // 单步同步（step(N) 恰好 N 个逻辑帧）由 Lua 桥接 mod 在 MC_POST_UPDATE 里阻塞完成，本 DLL 不做。
 // 证据与设计：rl/docs/L1_FEASIBILITY_PLAN.md、analysis/docs/J460_FRAME_LOOP.md。
@@ -20,12 +22,14 @@
 #include <windows.h>
 
 #include <dbghelp.h>
+#include <winternl.h>
 
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 
 #include "MinHook.h"
 #include "generated/j460_targets.hpp"
@@ -37,7 +41,7 @@ namespace {
 
 using namespace isaac_turbo;
 
-constexpr std::uint32_t kDllVersion = 2;
+constexpr std::uint32_t kDllVersion = 3;
 
 HMODULE gSelf = nullptr;
 volatile LONG gInitState = 0;  // 0 未开始，1 进行中，2 完成
@@ -71,6 +75,8 @@ using ManagerUpdateFn = void(__stdcall*)(char);
 using GameUpdateFn = void(__fastcall*)(void*, void*);
 using PushShaderFn = int(__stdcall*)(const char*);
 using FileOpenFn = unsigned char(__stdcall*)(const char*, void**);
+using ResolvePathFn = char*(__fastcall*)(void*, void*, const char*);
+using SearchPathFn = void*(__fastcall*)(void*, void*, const char*, unsigned char*);
 using GetErrnoFn = int(__cdecl*)(int*);
 using AccessFn = int(__cdecl*)(const char*, int);
 using SetErrnoFn = int(__cdecl*)(int);
@@ -80,6 +86,16 @@ ManagerUpdateFn gOrigManagerUpdate = nullptr;
 GameUpdateFn gOrigGameUpdate = nullptr;
 PushShaderFn gOrigPushShader = nullptr;
 FileOpenFn gOrigFileOpen = nullptr;
+ResolvePathFn gOrigResolvePath = nullptr;
+SearchPathFn gOrigSearchPath = nullptr;
+LONG gArchiveResolveCalls = 0;
+LONG gArchiveResolveRecoveries = 0;
+bool gArchivePathFix = false;
+bool gResolverProbe = false;
+thread_local void* gLastSearchDirectory = nullptr;
+thread_local unsigned char gLastSearchInArchive = 0;
+thread_local char gLastSearchCopy[384] = {};
+thread_local std::uint32_t gLastSearchKey = 0;
 void* gOrigGlfwGetTime = nullptr;  // 只为满足 MinHook 接口，本 DLL 不回调它（返回值在 XMM0，C 拿不到）
 GetErrnoFn gGetErrno = nullptr;
 GetErrnoFn gGetDosErrno = nullptr;
@@ -88,6 +104,8 @@ SetErrnoFn gSetErrno = nullptr;
 SetDosErrnoFn gSetDosErrno = nullptr;
 volatile LONG gAccessTotal = 0;
 volatile LONG gAccessFailed = 0;
+using LdrLoadDllFn = LONG(NTAPI*)(PWSTR, ULONG*, UNICODE_STRING*, HMODULE*);
+LdrLoadDllFn gOrigLdrLoadDll = nullptr;
 
 // ---------------------------------------------------------------- 日志与状态
 
@@ -377,6 +395,103 @@ void recordFailText(const char* text) {
 
 bool shouldLogOccurrence(std::uint64_t n) { return n <= 20 || n % 100 == 0; }
 
+// Filesys::ResolvePath 原始相对归档路径与返回值；不把可选文件缺失当作游戏故障。
+void* __fastcall hookSearchPath(void* self, void* edx, const char* path, unsigned char* inArchive) {
+  void* result = gOrigSearchPath(self, edx, path, inArchive);
+  gLastSearchDirectory = result;
+  gLastSearchInArchive = *inArchive;
+  return result;
+}
+
+char* __fastcall hookResolvePath(void* self, void* edx, const char* path) {
+  const std::size_t n = path ? std::strlen(path) : 0;
+  const bool absolutePath = n > 2 && path[1] == ':' && (path[2] == '/' || path[2] == '\\');
+  const char* lookup = path;
+  char absolute[MAX_PATH * 2] = {};
+  int containerSlot = -1;
+  if (gArchivePathFix && path && !absolutePath) {
+    // Only mounted container identity pointers, including the pending mount slot.
+    // Resolve them as OS files before entering the relative asset/archive search.
+    const auto* slots = reinterpret_cast<const std::uint32_t*>(gImageBase + j460::kArchiveSlotTableRva);
+    for (unsigned i = 0; i < 32; ++i) {
+      if (reinterpret_cast<const char*>(slots[i * 2]) != path) continue;
+      const DWORD length = GetFullPathNameA(path, sizeof(absolute), absolute, nullptr);
+      // Nested containers (notably resources/secret.a) exist only inside an archive.
+      // They must retain native archive lookup instead of becoming nonexistent OS paths.
+      const DWORD attributes = length > 0 && length < sizeof(absolute)
+          ? GetFileAttributesA(absolute) : INVALID_FILE_ATTRIBUTES;
+      if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        lookup = absolute;
+        containerSlot = static_cast<int>(i);
+      }
+      break;
+    }
+  }
+  // The original absolute-path branch performs access checking and native allocation.
+  // No retry, fabricated stream, or ownership transfer to the hook's stack buffer.
+  char* result = gOrigResolvePath(self, edx, lookup);
+  if (containerSlot >= 0) {
+    const LONG count = InterlockedIncrement(&gArchiveResolveRecoveries);
+    if (!result || count <= 3) {
+      const DWORD error = GetLastError();
+      int e = 0, de = 0;
+      if (gGetErrno) gGetErrno(&e);
+      if (gGetDosErrno) gGetDosErrno(&de);
+      logf("archive_resolve_absolute count=%ld slot=%d success=%d path=%s absolute=%s",
+           count, containerSlot, result ? 1 : 0, path, absolute);
+      if (gSetErrno) gSetErrno(e);
+      if (gSetDosErrno) gSetDosErrno(static_cast<unsigned long>(de));
+      SetLastError(error);
+    }
+  }
+  const DWORD lastError = GetLastError();
+  int err = 0, doserr = 0;
+  if (gGetErrno) gGetErrno(&err);
+  if (gGetDosErrno) gGetDosErrno(&doserr);
+  if (gResolverProbe && n >= 2 && path[n - 2] == '.' && (path[n - 1] == 'a' || path[n - 1] == 'A')) {
+    const LONG count = InterlockedIncrement(&gArchiveResolveCalls);
+    if (!result || count <= 8) {
+      const auto* fs = static_cast<const std::uint32_t*>(self);
+      const auto* begin = reinterpret_cast<const std::uint32_t*>(fs[2]);
+      const auto* end = reinterpret_cast<const std::uint32_t*>(fs[3]);
+      std::uint32_t hash = 5381;
+      for (const unsigned char* p = reinterpret_cast<const unsigned char*>(path); *p; ++p) {
+        unsigned char c = *p;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if (c == '\\') c = '/';
+        hash = hash * 33 + c;
+      }
+      logf("resolve_archive #%ld self=%p hash=%08X dirs=%ld result=%p path=%s resolved=%s",
+           count, self, hash, static_cast<long>(end - begin), result, path, result ? result : "(null)");
+      if (!result) {
+        logf("resolve_search returned=%p inArchive=%u native_key=%08X native_copy=%s",
+             gLastSearchDirectory, gLastSearchInArchive, gLastSearchKey, gLastSearchCopy);
+        for (const auto* p = begin; p != end; ++p) {
+          const auto* dir = reinterpret_cast<const std::uint32_t*>(*p);
+          const std::uint32_t head = dir[1];
+          std::uint32_t node = *reinterpret_cast<const std::uint32_t*>(head + 4), value = 0;
+          unsigned steps = 0;
+          while (node != head && steps++ < 64) {
+            const auto* words = reinterpret_cast<const std::uint32_t*>(node);
+            logf("resolve_tree step=%u node=%08X nil=%u key=%08X", steps, node,
+                 *(reinterpret_cast<const unsigned char*>(node) + 0xD), words[4]);
+            if (words[4] == hash) { value = words[5]; break; }
+            node = words[hash < words[4] ? 0 : 2];
+          }
+          logf("resolve_dir index=%ld dir=%p entries=%u hash_node=%08X value=%08X prefix=%s value_path=%s",
+               static_cast<long>(p - begin), dir, dir[2], node, value, reinterpret_cast<const char*>(dir[3]),
+               value ? reinterpret_cast<const char*>(value) : "(null)");
+        }
+        logStackScan(reinterpret_cast<const std::uint32_t*>(&path) - 1, 0x200, "resolve_archive");
+      }
+    }
+  }
+  if (gSetErrno) gSetErrno(err);
+  if (gSetDosErrno) gSetDosErrno(static_cast<unsigned long>(doserr));
+  SetLastError(lastError);
+  return result;
+}
+
 // ---------------------------------------------------------------- Hook：shader 入栈（A 类取证）
 
 void onPushFailure(const char* name, const void* stackStart) {
@@ -567,6 +682,25 @@ int __cdecl hookCrtAccess(const char* path, int mode) {
 extern "C" {
 double g_turbo_now_value = 0.0;
 void* g_orig_font_draw = nullptr;
+void* g_orig_search_miss = nullptr;
+
+void __cdecl turbo_search_miss_record(const char* copy, std::uint32_t key) {
+  std::snprintf(gLastSearchCopy, sizeof(gLastSearchCopy), "%s", copy ? copy : "(null)");
+  gLastSearchKey = key;
+}
+
+__attribute__((naked)) void turbo_hook_search_miss(void) {
+  __asm__ volatile(
+      "pushfl\n\t"
+      "pushal\n\t"
+      "pushl 8(%ebp)\n\t"
+      "pushl %ebx\n\t"
+      "call _turbo_search_miss_record\n\t"
+      "addl $8, %esp\n\t"
+      "popal\n\t"
+      "popfl\n\t"
+      "jmp *_g_orig_search_miss\n\t");
+}
 
 void __cdecl turbo_clock_read(void) {
   const double real = realGlfwTime();
@@ -707,6 +841,25 @@ void __fastcall hookRender(void* ecx, void* edx) {
 
 // ---------------------------------------------------------------- 安装
 
+// 仅当前worker的可选NVIDIA录屏/照片叠加层；不拦截图形驱动、Steam或其他进程。
+LONG NTAPI hookLdrLoadDll(PWSTR search, ULONG* flags, UNICODE_STRING* name, HMODULE* module) {
+  unsigned count = name->Length / sizeof(wchar_t), start = count;
+  while (start && name->Buffer[start - 1] != L'\\' && name->Buffer[start - 1] != L'/') --start;
+  wchar_t base[32] = {};
+  if (count - start < 32) {
+    for (unsigned i = start; i < count; ++i) {
+      wchar_t c = name->Buffer[i];
+      base[i - start] = c >= L'A' && c <= L'Z' ? c + 32 : c;
+    }
+    if (std::wcscmp(base, L"nvcamera32.dll") == 0 || std::wcscmp(base, L"nvspcap.dll") == 0) {
+      *module = nullptr;
+      logf("capture_overlay excluded: %ls", base);
+      return static_cast<LONG>(0xC0000135u);  // STATUS_DLL_NOT_FOUND
+    }
+  }
+  return gOrigLdrLoadDll(search, flags, name, module);
+}
+
 bool installHooks() {
   MH_STATUS st = MH_Initialize();
   if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) {
@@ -735,17 +888,36 @@ bool installHooks() {
        kHookFontDraw},
       {"file_open_plain", j460::kFileOpenPlainRva, reinterpret_cast<void*>(&hookFileOpen),
        reinterpret_cast<void**>(&gOrigFileOpen), kHookFileOpen},
+      {"resolve_path", j460::kResolvePathRva, reinterpret_cast<void*>(&hookResolvePath),
+       reinterpret_cast<void**>(&gOrigResolvePath), kHookResolvePath},
+      {"search_path", j460::kSearchPathRva, reinterpret_cast<void*>(&hookSearchPath),
+       reinterpret_cast<void**>(&gOrigSearchPath), kHookSearchPath},
+      {"search_miss", j460::kSearchMissRva, reinterpret_cast<void*>(&turbo_hook_search_miss),
+       &g_orig_search_miss, kHookSearchMiss},
   };
+  gResolverProbe = envFlag("ISAAC_TURBO_RESOLVER_PROBE");
+  gArchivePathFix = envFlag("ISAAC_TURBO_ARCHIVE_PATH_FIX");
+  std::uint32_t mask = 0;
   for (const auto& s : specs) {
+    if (s.bit == kHookResolvePath && !(gResolverProbe || gArchivePathFix)) continue;
+    if ((s.bit & (kHookSearchPath | kHookSearchMiss)) && !gResolverProbe) continue;
     void* target = const_cast<std::uint8_t*>(gImageBase) + s.rva;
     st = MH_CreateHook(target, s.detour, s.original);
     if (st != MH_OK) {
       setStatus(kStatusHookFailed, "ERROR:hook create %s=%d", s.name, static_cast<int>(st));
       return false;
     }
+    mask |= s.bit;
   }
-  std::uint32_t mask = 0;
-  for (const auto& s : specs) mask |= s.bit;
+  if (envFlag("ISAAC_TURBO_DISABLE_CAPTURE_OVERLAYS")) {
+    void* load = reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "LdrLoadDll"));
+    st = MH_CreateHook(load, reinterpret_cast<void*>(&hookLdrLoadDll), reinterpret_cast<void**>(&gOrigLdrLoadDll));
+    if (st != MH_OK) {
+      setStatus(kStatusHookFailed, "ERROR:hook LdrLoadDll=%d", static_cast<int>(st));
+      return false;
+    }
+    mask |= kHookCaptureOverlay;
+  }
   if (const HMODULE ucrt = GetModuleHandleA("ucrtbase.dll")) {
     if (void* access = reinterpret_cast<void*>(GetProcAddress(ucrt, "_access"))) {
       st = MH_CreateHook(access, reinterpret_cast<void*>(&hookCrtAccess), reinterpret_cast<void**>(&gOrigAccess));

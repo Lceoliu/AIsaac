@@ -12,10 +12,9 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
 from isaac_bridge.monstro_gym import MonstroGymEnv, OBSERVATION_SCHEMA
-from isaac_bridge.launch import launch
 from isaac_bridge.env import BridgeError
 from isaac_bridge.rendering import configure_rendering
-from isaac_bridge.turbo import TurboError
+from isaac_bridge.turbo import TurboError, launch_suspended, process_exit_code, HOOK_CAPTURE_OVERLAY
 
 
 class EpisodeLog(BaseCallback):
@@ -48,8 +47,14 @@ def main():
     if args.launch == (args.pid is not None):
         p.error("specify exactly one of --launch or --pid")
     args.out.mkdir(parents=True, exist_ok=True)
-    proc = launch(args.port, privileged=True, extra_args=("--luadebug", "--set-stage=1")) if args.launch else None
-    pid = proc.pid if proc else args.pid
+    pid = args.pid
+    launch_output = None
+    if args.launch:
+        pid, startup_control, launch_output = launch_suspended(
+            args.port, extra_args=("--luadebug", "--set-stage=1"), skip_render=args.render_mode == "headless",
+            virtual_clock=False, font_guard=False, file_retry=False, probe_dump=False,
+            log_dir=str(args.out / "native"))
+        startup_control.close()
     print("PID", pid, "render_mode", args.render_mode, flush=True)
     torch.set_num_threads(1)
     env = Monitor(MonstroGymEnv(port=args.port, max_episode_frames=args.episode_frames,
@@ -59,6 +64,7 @@ def main():
     callback = EpisodeLog()
     report = {"status": "started", "requested_steps": args.steps, "turbo": False,
               "pid": pid, "render_mode": args.render_mode, "virtual_clock": False,
+              "launch_output": launch_output,
               "observation_schema": OBSERVATION_SCHEMA,
               "reward": {"hurt": -1, "hit": args.hit_reward, "normalized_damage": args.damage_reward,
                          "clear": 1, "extra_death": 0, "time_limit": "truncation"}}
@@ -69,6 +75,7 @@ def main():
         env.unwrapped.connected = True
         render_control = configure_rendering(pid, args.render_mode)
         report["render_before"] = asdict(render_control.stats()) if render_control else None
+        report["capture_overlay_isolation"] = bool(render_control and report["render_before"]["hooks_mask"] & HOOK_CAPTURE_OVERLAY)
         model = PPO("MultiInputPolicy", env, n_steps=128, batch_size=64, n_epochs=4,
                     learning_rate=3e-4, seed=0, device="cpu", verbose=1,
                     policy_kwargs={"net_arch": dict(pi=[64, 64], vf=[64, 64])})
@@ -100,7 +107,7 @@ def main():
             env.close()
             report["cleanup"] = env.unwrapped.cleanup_outcome
         finally:
-            report["process_exit"] = proc.poll() if proc else None
+            report["process_exit"] = process_exit_code(pid) if args.launch else None
             if render_control:
                 report["render_after"] = asdict(render_control.stats())
                 render_control.close()

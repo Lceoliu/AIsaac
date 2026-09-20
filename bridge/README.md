@@ -17,7 +17,7 @@ python train_monstro.py --pid $workerPid --steps 512 --episode-frames 960 --out 
 python monstro_rollout.py --pid $workerPid --render-mode visible --frames 120 --policies track --out D:\Projects\fortune\Isaac\rl\runs\l1\monstro-visible
 ```
 
-`monstro_rollout.py` / `train_monstro.py` 的 `--launch` 通过原生 `--set-stage=1` 直接开局，无需点击菜单。已有游戏明确传 `--pid`，与 `--launch` 二选一；连接等待默认30秒，可用 `--connect-timeout` 调整。默认 `--render-mode headless`：桥接连接成功后使用已有 J460 控制层关闭渲染，**virtual_clock=false，不启用加速时钟**。`--render-mode visible` 恢复渲染；原本没有控制层的可视化进程不注入 DLL。正常结束回到安全房并保留当前渲染模式，不关闭游戏、不修改游戏 EXE。冷启动归档崩溃发生在控制层接入前，仍未解决；尚无自动重启监督器。
+`monstro_rollout.py` / `train_monstro.py` 的 `--launch` 现在先挂起创建进程、注入原生控制层，再用 `--set-stage=1` 直接开局。默认只在本worker排除 `NvCamera32.dll` / `nvspcap.dll` 录屏/照片叠加层，不改系统驱动、Steam设置或游戏EXE；用于处理已复现的NVIDIA退出故障。默认同时启用已注册物理容器的绝对路径解析修复，嵌套归档仍走原生搜索。默认 `--render-mode headless`，从启动阶段关闭渲染，**virtual_clock=false**；`--render-mode visible` 保留真实渲染。两种启动方式都使用隔离；不默认启用字体跳过、文件重试或探针转储。已有游戏使用 `--pid`（与 `--launch` 二选一），但无法追溯移除已加载的叠加层，需要重启worker才能应用启动隔离。正常结束回到安全房，保留游戏进程；验收脚本另外发送WM_CLOSE并检查实际退出码。连接等待默认30秒，可用 `--connect-timeout` 调整，尚无自动重启监督器。
 
 - 场景定义：`scenarios/monstro_empty.lua`；固定种子 `9AM0 7PRP`，Isaac，移除全部道具，玩家 `(320,380)`，原版 Monstro `(320,220)`。
 - 使用固定种子的空出生房，检查内部没有障碍；通过 `Game:Spawn` 指定房间种子生成 Monstro，不使用随机 `goto`。这是战斗训练场，不模拟完整 Boss 房奖励和转层。
@@ -37,17 +37,32 @@ python monstro_rollout.py --pid $workerPid --render-mode visible --frames 120 --
 - 20 项离线测试通过。新版实机 PPO **512 步 / 16 epochs / 74.27 秒**，参数 L2 改变 **0.6133**，存取档与重载动作一致；4个结束回合全部死亡，回报为 −5.552 / −4.744 / −5.744 / −5.230。奖励已生效，但没有战斗达标结论。
 - 另用规则控制器实测3回合：正奖励步骤 **24 / 23 / 25**，Boss 受伤比例 **36.4% / 35.0% / 36.4%**；不是 RL 学习成绩。三局在同一个 PID18788 内完成，重置类型 initialize / rewind / rewind；敌弹标记 **1642/1642** 正确；渲染调用增量和虚拟 tick 增量均为0。正常清理保留存活 worker。
 - 地形物理探针：从 x=260 向右走24逻辑帧，空地/飞行越坑/飞行越石头到 x≈435.07；地面石头/坑停在 x≈290，障碍中心 x=320。与掩码一致。测试坑由运行时生成后显式设为坑碰撞，非自然房间采样；飞行由测试道具提供，rewind 后确认移除。首次探针错误及飞行石头掩码缺陷均保留证据，修复后同输入通过。
-- 证据：[本轮结果](../runs/l1/20260920-rewind/live-summary.json)、[PPO 报告](../runs/l1/20260920-rewind/dense-ppo/report.json)、[地形探针](../runs/l1/20260920-rewind/terrain-probe.json)。冷启动归档崩溃与可视化 shader 崩溃根因仍未修复；这不是独立无窗口引擎。
+- 证据：[本轮结果](../runs/l1/20260920-rewind/live-summary.json)、[PPO 报告](../runs/l1/20260920-rewind/dense-ppo/report.json)、[地形探针](../runs/l1/20260920-rewind/terrain-probe.json)。该轮尚未完成原生崩溃修复；后续worker修复及实战结果见下节。这不是独立无窗口引擎。
+
+
+## 弹幕输入覆盖核对（2026-09-20）
+
+`main.lua::build_obs`逐个枚举当前房间实体，`entity_record`把Visible=true的敌弹（Type9）及眼泪（Type2）位置放入obs。`actor_observation`确实把位置归一化后写入Agent实体表，而不是只放进调试info。
+
+实机PID30060：300个同逻辑帧快照，对照独立控制台枚举、桥接obs、实际actor张量中的类型/数量；122个快照有敌弹，累计947条敌弹记录，单帧最多18颗敌弹/20个总实体，漏项0，原生与桥接坐标误差超过0.001的记录0；游戏正常退出0。已验证部署Mod与仓库代码一致。证据：`../runs/l1/20260920-resolver-fix/projectile-audit-final/report.json`。
+
+范围限制：Visible是引擎标志，不是屏幕像素可见性证明；默认每4逻辑帧采一次，不保证捕获采样间生成并消失的弹；128槽由所有实体共享，超限报错而非悄悄截断。激光目前只有通用实体字段，缺长度/方向/端点，特效危险受白名单限制。当前actor不输入原生速度，也没有历史帧或循环记忆，不能据单帧位置可靠判断弹道；这些边界不能用本次Monstro样本的0漏项推成全游戏完备性。
 
 ## 崩溃排查状态
 
-2026-09-20 更新：三类崩溃的机制、经 CALL 指令校验的调用链、崩溃时全局状态与修复方案统一维护在 [NATIVE_CRASH_ANALYSIS.md](../docs/NATIVE_CRASH_ANALYSIS.md)；本节以下是排查过程记录。其中"栈候选含 `Game::Update` 地址"一说已被纠正：`0x2FC3A4` 属于 `Game::Render`（`0x2FBC10`），三条 A 类链都在整帧渲染路径里。
+2026-09-20 18时更新：worker新增进程级NVIDIA捕获叠加层隔离；恢复叠加层的反向对照重新出现同一 `0xDEDEDEDE` / `nvwgf2um+0x91F091` 退出故障，隔离模式已通过逻辑更新与字体渲染门禁。完整实机验收与边界统一维护在 [NATIVE_CRASH_ANALYSIS.md](../docs/NATIVE_CRASH_ANALYSIS.md)；本节以下是排查过程记录。其中"栈候选含 `Game::Update` 地址"一说已被纠正：`0x2FC3A4` 属于 `Game::Render`（`0x2FBC10`），三条 A 类链都在整帧渲染路径里。
 
 已有转储显示 `Shader stack empty` 后在 RVA `0x0061C423` 读取地址 `0xC`，位于字体绘制的 shader 栈恢复路径。**停用其他 Mod 没有解决崩溃**：PID 30604 在先前测试结束后于 19:24 崩溃；本次启动的 PID 13508、11008 也在进入战斗前崩溃。三份新转储均为相同 RVA/空指针读取，未加载 Turbo、NetFix 或 REPENTOGON 模块。证据在 `../runs/l1/20260919-training-loop/new-crashes.json` 和对应日志。此前 25 次建场与 12600 帧通过仍有效，但不能作为长期稳定结论。
 
 上一轮 Computer Use 捕获到 Windows 锁屏，阻挡菜单操作；用户已自行关闭 ToDesk 断开自动锁屏。本轮解锁后首次冷启动 PID 29048 仍崩溃，新转储位置为 RVA `0x668CB5`：资源归档流对象为空。PID 22060 随后启动失败，转储 RVA 为 `0x668CD6`。PID 27476 成功直接开局并完成两次真实 PPO，但在 22:04:37 的清理后阶段再次出现 `Shader stack empty`，转储确认 RVA `0x61C423`、读取地址 `0xC`。这两类崩溃不能混为一个根因，训练验收成功也不等于长期稳定。随后 PID 48584 重启成功，完成种子修复的实机回归。只读探针与失败证据保存在 `../runs/l1/20260919-training-loop/resume-20260919-214224/`。未改游戏 EXE、显卡驱动或系统安全设置；不能宣称锁屏或其他 Mod 是已确认根因。
 
-### 2026-09-20 崩溃回归
+### 2026-09-20 当前worker验收（已完成）
+
+进程级叠加层隔离、挂起启动的正式入口、物理容器路径修复、rewind后玩家资源模板已接入。最终路径修复通过20次冷启动→至少120次逻辑更新→正常退出0；不启用虚拟时钟、文件重试或字体跳过。房间门使用Close+Bar，Gym拒绝跨房状态，避免把逃入空房误记为Boss胜利。此前2048步PPO的“1次win”证据不足，已撤回有效击杀结论；不能用它声称战斗能力达标。最终实战结果见根因文档§0.4及 `../runs/l1/20260920-resolver-fix/`。
+
+rewind不再被假定一定恢复完整玩家资源：已观察到2/6红血、0炸弹；场景脚本仅在episode开始补齐红血、恢复1炸弹/0钥匙/0金币，不在战斗中回血，仍不重新启动游戏或重建楼层。
+
+### 历史：2026-09-20 崩溃回归
 
 - 上次保留的 PID48584 后来也在同一字体渲染位置崩溃。新 PID32412 连续战斗第 4 回合再次崩溃，训练器收到连接错误；另一进程 PID42132 则完成 20 回合（335.37秒）及正常清理。**无代码修复的基线也能偶尔通过20回合，因此单次通过不能作为原生崩溃已修复的证据。**
 - 已修正 Python 的二次故障：`MonstroGymEnv.step/reset` 记录传输失败；`close` 不再向已断开的 worker 发安全房重置，保留首个错误。采样器与 PPO 报告明确写 `worker_error` / `broken_connection_closed`，不把进程故障伪装成死亡、截断或安全清理。

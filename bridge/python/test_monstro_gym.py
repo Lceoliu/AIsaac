@@ -10,6 +10,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 
 from isaac_bridge.monstro_gym import MonstroGymEnv, actor_observation, ENTITY_SLOTS, TERRAIN_SHAPE
+from isaac_bridge.env import BridgeError
 
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/monstro_initial_obs.json"
@@ -51,6 +52,14 @@ class GymTest(unittest.TestCase):
 
     def test_sb3_contract(self):
         check_env(self.env, warn=True)
+
+    def test_adjacent_empty_room_is_not_a_boss_win(self):
+        self.env.reset()
+        self.bridge.mode = 'win'
+        self.bridge.obs = copy.deepcopy(self.bridge.obs)
+        self.bridge.obs['room']['room_idx'] += 1
+        with self.assertRaisesRegex(BridgeError, 'arena room changed'):
+            self.env.step([0, 0, 0, 0])
 
     def test_time_limit_exact_remainder(self):
         self.env.reset()

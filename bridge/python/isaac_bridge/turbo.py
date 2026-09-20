@@ -37,9 +37,11 @@ FLAG_SKIP_RENDER = 1 << 1
 FLAG_FONT_GUARD = 1 << 2
 FLAG_FILE_RETRY = 1 << 3
 FLAG_PROBE_DUMP = 1 << 4
+HOOK_CAPTURE_OVERLAY = 1 << 11
 STATUS_NAMES = {0: "loading", 1: "active", 2: "identity_failed", 3: "hook_failed", 4: "shm_failed"}
 HOOK_NAMES = {1: "glfw_get_time", 2: "manager_update", 4: "game_update", 8: "render_frame",
-              16: "push_shader", 32: "font_draw", 64: "file_open_plain", 128: "crt_access"}
+              16: "push_shader", 32: "font_draw", 64: "file_open_plain", 128: "crt_access",
+              256: "resolve_path", 512: "search_path", 1024: "search_miss", HOOK_CAPTURE_OVERLAY: "capture_overlay"}
 
 _HEAD = struct.Struct("<8I")          # 0x000..0x020
 _STATS = struct.Struct("<8QdQQII")    # 0x020..0x080
@@ -325,11 +327,15 @@ def launch_suspended(port: int, game_dir: str = DEFAULT_GAME_DIR, privileged: bo
                      extra_args: Sequence[str] = ("--luadebug",), skip_render: bool = False,
                      virtual_clock: bool = False, font_guard: bool = True, file_retry: bool = True,
                      probe_dump: bool = True, log_dir: Optional[str] = None, engine_velocity: bool = False,
-                     dll: str = DEFAULT_DLL, injector: str = DEFAULT_INJECTOR) -> Tuple[int, TurboControl, str]:
+                     dll: str = DEFAULT_DLL, injector: str = DEFAULT_INJECTOR,
+                     disable_capture_overlays: bool = True, archive_path_fix: bool = True) -> Tuple[int, TurboControl, str]:
     """挂起创建 isaac-ng.exe、注入探针 DLL、等钩子激活后再放行主线程（启动期取证必须用这个）。
 
     配置经环境变量传给 DLL（进程创建前无法预写控制块）。返回 (pid, 控制块, 注入器输出)。
     进程不是本 Python 的子进程，用 wait_process / process_alive 跟踪。
+    默认仅在本worker阻止NvCamera/nvspcap录屏叠加层加载，避免已复现的退出崩溃；不改系统设置。
+    对照实验可传disable_capture_overlays=False；附着到已加载叠加层的进程不能追溯清除它们。
+    archive_path_fix默认将已注册的物理容器交给原生绝对路径分支；嵌套容器仍走原生搜索。
     """
     for path in (dll, injector):
         if not os.path.isfile(path):
@@ -346,6 +352,8 @@ def launch_suspended(port: int, game_dir: str = DEFAULT_GAME_DIR, privileged: bo
     env["ISAAC_TURBO_FONT_GUARD"] = "1" if font_guard else "0"
     env["ISAAC_TURBO_FILE_RETRY"] = "1" if file_retry else "0"
     env["ISAAC_TURBO_PROBE_DUMP"] = "1" if probe_dump else "0"
+    env["ISAAC_TURBO_DISABLE_CAPTURE_OVERLAYS"] = "1" if disable_capture_overlays else "0"
+    env["ISAAC_TURBO_ARCHIVE_PATH_FIX"] = "1" if archive_path_fix else "0"
     env.pop("ISAAC_TURBO", None)
     if log_dir:
         env["ISAAC_TURBO_LOG_DIR"] = log_dir

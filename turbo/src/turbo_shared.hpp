@@ -36,6 +36,10 @@ constexpr std::uint32_t kHookPushShader = 1u << 4;
 constexpr std::uint32_t kHookFontDraw = 1u << 5;
 constexpr std::uint32_t kHookFileOpen = 1u << 6;
 constexpr std::uint32_t kHookCrtAccess = 1u << 7;  // ucrtbase!_access（不是 J460 目标，按导出名定位）
+constexpr std::uint32_t kHookResolvePath = 1u << 8;
+constexpr std::uint32_t kHookSearchPath = 1u << 9;
+constexpr std::uint32_t kHookSearchMiss = 1u << 10;
+constexpr std::uint32_t kHookCaptureOverlay = 1u << 11;  // startup-only, per-process NVIDIA capture isolation
 
 // Game::Update 单次耗时低于此值的调用计入 "fast" 桶：被 Lua 桥接阻塞等待训练器的那一帧会长达秒级，
 // 不能混进纯逻辑成本的统计。

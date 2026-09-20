@@ -63,7 +63,7 @@ class IsaacTrainingEnv(IsaacBridgeEnv):
             if len(enemies) == 1 and enemies[0]["type"] == 20:
                 player = obs["players"][0]
                 if player["ptype"] != 0 or player["active"] != 0 or player["hearts"] != 6:
-                    raise BridgeError("Monstro arena player initialization failed")
+                    raise BridgeError(f"Monstro arena player initialization failed: {json.dumps(player, sort_keys=True)}")
                 if obs["room"]["alive"] != 1 or obs["room"]["clear"]:
                     raise BridgeError("Monstro arena enemy/clear state is invalid")
                 return obs, {**info, 'reset_kind': 'initialize' if initialize else 'rewind'}
