@@ -73,6 +73,8 @@ using PushShaderFn = int(__stdcall*)(const char*);
 using FileOpenFn = unsigned char(__stdcall*)(const char*, void**);
 using GetErrnoFn = int(__cdecl*)(int*);
 using AccessFn = int(__cdecl*)(const char*, int);
+using SetErrnoFn = int(__cdecl*)(int);
+using SetDosErrnoFn = int(__cdecl*)(unsigned long);
 RenderFn gOrigRender = nullptr;
 ManagerUpdateFn gOrigManagerUpdate = nullptr;
 GameUpdateFn gOrigGameUpdate = nullptr;
@@ -82,6 +84,10 @@ void* gOrigGlfwGetTime = nullptr;  // 只为满足 MinHook 接口，本 DLL 不�
 GetErrnoFn gGetErrno = nullptr;
 GetErrnoFn gGetDosErrno = nullptr;
 AccessFn gOrigAccess = nullptr;
+SetErrnoFn gSetErrno = nullptr;
+SetDosErrnoFn gSetDosErrno = nullptr;
+volatile LONG gAccessTotal = 0;
+volatile LONG gAccessFailed = 0;
 
 // ---------------------------------------------------------------- 日志与状态
 
@@ -427,8 +433,8 @@ void onFontGuardSkip(const RegistryLookup& l) {
 
 // ---------------------------------------------------------------- Hook：KAGE 文件打开（B 类取证 + 缓解）
 
-// 只把"已解析的绝对路径 + .a 后缀"当作归档容器：挂载函数自己的首次打开和逐条目重开都用解析后的绝对路径；
-// 相对路径（如可选的 resources/secret.a 探测）失败是正常结果，不取证、不重试。
+// 现有重试策略只覆盖 DOS 绝对路径 + .a，不等于识别了所有归档容器。
+// 实机槽表存 resources/packed/*.a 相对路径；其解析失败不在此策略的覆盖范围。
 bool looksLikeArchive(const char* path) {
   if (!path) return false;
   const std::size_t n = std::strlen(path);
@@ -474,10 +480,10 @@ unsigned char __stdcall hookFileOpen(const char* path, void** out) {
   return r;
 }
 
-// ---------------------------------------------------------------- Hook：ucrtbase!_access（B 类真正的失败点）
+// ---------------------------------------------------------------- Hook：ucrtbase!_access（B 类候选上游；记录过滤前证据）
 //
 // 路径解析 FUN_00a17180（RVA 0x617180）对绝对路径只做一件事：复制字符串后 _access(path, 0)，返回 -1 就整个返回空；
-// 归档挂载对每个条目重开容器文件时走的正是这条分支（smoke 实测：errno=2，路径随后为 NULL，ArchivedFile 拿到空流）。
+// NULL 路径和遗留 errno 不能证明这条分支失败；必须捕获本次调用的实际参数/返回值。
 
 void diagnoseAccessFailure(const char* path, int mode, int err, int doserr, DWORD lastError) {
   wchar_t wide[MAX_PATH * 2] = {};
@@ -507,13 +513,24 @@ void diagnoseAccessFailure(const char* path, int mode, int err, int doserr, DWOR
 
 int __cdecl hookCrtAccess(const char* path, int mode) {
   int r = gOrigAccess(path, mode);
-  if (!gBlock || !looksLikeArchive(path)) return r;
-  gBlock->access_calls++;
-  if (r == 0) return r;
-  const DWORD lastError = GetLastError();
+  DWORD lastError = GetLastError();
   int err = 0, doserr = 0;
   if (gGetErrno) gGetErrno(&err);
   if (gGetDosErrno) gGetDosErrno(&doserr);
+  const LONG total = InterlockedIncrement(&gAccessTotal);
+  const LONG failed = r != 0 ? InterlockedIncrement(&gAccessFailed) : 0;
+  const bool archive = looksLikeArchive(path);
+  // 有界采样；原 access_calls 仍只统计绝对 .a，避免悄悄改变共享内存字段语义。
+  if (total <= 8 || (failed != 0 && shouldLogOccurrence(failed))) {
+    logf("access_call total=%ld failed=%ld result=%d mode=%d archive=%d errno=%d doserrno=%d lastError=%lu path=%s",
+         total, failed, r, mode, archive ? 1 : 0, err, doserr, lastError, path ? path : "(null)");
+    if (gSetErrno) gSetErrno(err);
+    if (gSetDosErrno) gSetDosErrno(static_cast<unsigned long>(doserr));
+    SetLastError(lastError);
+  }
+  if (!gBlock || !archive) return r;
+  gBlock->access_calls++;
+  if (r == 0) return r;
   gBlock->access_failures++;
   diagnoseAccessFailure(path, mode, err, doserr, lastError);
   logStackScan(reinterpret_cast<const std::uint32_t*>(&path) - 1, 0x400, "access_fail");
@@ -523,6 +540,9 @@ int __cdecl hookCrtAccess(const char* path, int mode) {
       Sleep(static_cast<DWORD>(10 * attempt));
       gBlock->access_retries++;
       r = gOrigAccess(path, mode);
+      lastError = GetLastError();
+      if (gGetErrno) gGetErrno(&err);
+      if (gGetDosErrno) gGetDosErrno(&doserr);
       if (r == 0) {
         gBlock->access_retry_ok++;
         logf("access retry ok attempt=%d path=%s", attempt, path);
@@ -533,6 +553,10 @@ int __cdecl hookCrtAccess(const char* path, int mode) {
       }
     }
   }
+  // 日志/复查/转储不向游戏泄漏诊断错误；重试模式保留最后一次实际 _access 的状态。
+  if (gSetErrno) gSetErrno(err);
+  if (gSetDosErrno) gSetDosErrno(static_cast<unsigned long>(doserr));
+  SetLastError(lastError);
   return r;
 }
 
@@ -754,6 +778,8 @@ void loadCrtErrno() {
   }
   gGetErrno = reinterpret_cast<GetErrnoFn>(GetProcAddress(ucrt, "_get_errno"));
   gGetDosErrno = reinterpret_cast<GetErrnoFn>(GetProcAddress(ucrt, "_get_doserrno"));
+  gSetErrno = reinterpret_cast<SetErrnoFn>(GetProcAddress(ucrt, "_set_errno"));
+  gSetDosErrno = reinterpret_cast<SetDosErrnoFn>(GetProcAddress(ucrt, "_set_doserrno"));
   logf("probe: ucrt errno getters %s", gGetErrno && gGetDosErrno ? "ok" : "missing");
 }
 

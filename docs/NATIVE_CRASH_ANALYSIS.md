@@ -1,6 +1,6 @@
 # J460 worker 原生崩溃：根因分析与修复方案
 
-更新：2026-09-20。本文只处理原版 `isaac-ng.exe`（v1.9.7.17.J460）在 RL worker 用法下的三类原生崩溃。全部结论按"已确定 / 未确定"分列；地址一律写 RVA（VA = RVA + 0x400000；转储里的运行时基址为 0x100000）。反编译文件在 `analysis/j460/exports/j460-baseline/decompiled/`，本轮新增证据在 [`../runs/l1/20260920-native-crash-rootcause/`](../runs/l1/20260920-native-crash-rootcause/)（`dump_walk.py` 只读解析 9 份 WER 转储，`dump-walk-all.json` 是逐份输出，`globals-at-crash.txt` 是崩溃时 `.data` 全局值）。此前的排查记录见 [bridge/README.md 崩溃排查状态](../bridge/README.md#崩溃排查状态) 与 [L1_FEASIBILITY_PLAN.md 故障链复核](L1_FEASIBILITY_PLAN.md#2026-09-20原生崩溃故障链复核)；本文与它们冲突处以本文为准。
+更新：2026-09-20。本文只处理原版 `isaac-ng.exe`（v1.9.7.17.J460）在 RL worker 用法下的三类原生崩溃。全部结论按"已确定 / 未确定"分列；地址一律写 RVA（反汇编VA = RVA + 0x400000；运行时基址以每个进程/转储的模块表为准）。反编译文件在 `analysis/j460/exports/j460-baseline/decompiled/`，本轮新增证据在 [`../runs/l1/20260920-native-crash-rootcause/`](../runs/l1/20260920-native-crash-rootcause/)（`dump_walk.py` 只读解析 9 份 WER 转储，`dump-walk-all.json` 是逐份输出，`globals-at-crash.txt` 是崩溃时 `.data` 全局值）。此前的排查记录见 [bridge/README.md 崩溃排查状态](../bridge/README.md#崩溃排查状态) 与 [L1_FEASIBILITY_PLAN.md 故障链复核](L1_FEASIBILITY_PLAN.md#2026-09-20原生崩溃故障链复核)；本文与它们冲突处以本文为准。
 
 ## 0. 结论摘要
 
@@ -22,6 +22,19 @@
 - `writeProbeDump()`实际使用私有读写页、数据段和内存区域信息等flags，**没有 `MiniDumpWithFullMemory`**；必须检查新dump是否真的覆盖目标树节点/对象页。`FullMemoryInfo`不是全内存内容。[Microsoft MINIDUMP_TYPE](https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/ne-minidumpapiset-minidump_type)
 - 文件探针在失败后还会写日志、复查文件和转储；目前未保存/恢复所有返回时的errno、`_doserrno`、GetLastError，不能称作完全透明的只读探针。建议下一实现先分离诊断模式与重试模式，并保留调用者可见的错误状态。
 - 当前策略：先验收探针覆盖，再取实际失败的路径/对象；不根据现有数据把火绒定为根因，不自动更改排除项，不把退出崩溃吞掉。
+
+## 0.2 2026-09-20 17:07–17:12：探针覆盖实测，修正归档分支判断
+
+证据目录：`../runs/l1/20260920-probe-coverage/`。本轮启动4个独立进程，均显式关闭虚拟时钟、字体守卫、重试和探针转储，开启skip-render；没有改变游戏EXE、杀软、驱动或其他Mod的启用状态。
+
+- **Hook地址正确**：PID42268/16872的游戏IAT槽（RVA `0x7187C4`）与已加载ucrt `_access` 导出均指向 `0x774E91F0`，入口已是MinHook的E9跳转。新增过滤前日志确实捕获到options.ini、Mod标记和资源覆盖路径的调用。旧 `access_calls` 只统计绝对 `.a`，零值不是“Hook没执行”。
+- **推翻“归档槽存绝对路径”**：PID3432的只读进程内存采样直接读到18个槽，含 `resources/packed/animations.a`、`config.a`、`afterbirth.a`、`afterbirthp.a` 和 `resources/secret.a`，均为相对路径。`archive_snapshots`保留槽号、指针、kind和采样时刻。结合 `0x617180` 分支，这些路径走 `0x616C60` 的资源搜索/索引查找，不是绝对路径 `_access` 分支。
+- **B仍未修复**：PID46896和PID3432的新游戏转储均为RVA `0x668CB5`、读NULL；PID3432的CALL约束栈候选为 `0x6178D0 → 0x617F40 → 0x668A50 → 0x668C50`，说明还需检查挂载后的资源读取，不能把B限定为初次挂载。两份小转储都不含ArchivedFile对象的堆页，尚不能从崩溃对象确定具体容器；18槽采样不是崩溃瞬间的完整堆。PID42268也在listening前异常退出，但本轮未解析其转储，不强行分类。PID16872到达listening、执行64次GameUpdate，WM_CLOSE后仍以 `0xC0000005` 退出；这不构成修复成功或相同退出故障点的证据。
+- **探针本身有一项已修正的问题**：`hookCrtAccess`新增过滤前限频采样，并保存/恢复返回时的errno、`_doserrno`和GetLastError；有重试时采用最后一次实际调用的状态。确定性原生回归用会污染这三个值的诊断桩：修改前绝对路径失败/重试成功两项失败，修改后三项全通过。此测试验证Hook逻辑，不代替真实CRT与游戏故障复现。`hookFileOpen`的错误状态透明性仍待处理，不能将整个探针称为完全透明。
+
+下一步优先捕获 `0x617180` 的原始相对路径、解析返回值，以及 `0x616C60` 的搜索目录/索引命中；再区分缓存缺项、路径内容/生命周期或后续归档查找问题。当前没有证据支持先设置杀软排除，也不应扩大睡眠重试掩盖索引错误。
+
+验证命令：`python turbo/tests/access_probe_test.py`（实际Hook函数编译到独立32位测试程序，3种输入）；`pwsh -NoProfile -File turbo/build.ps1`。初次控制器在进程已崩溃后枚举模块得到WinError299，已改为恢复主线程后立即读IAT；该工具错误与游戏的原生异常分别记录。
 
 ## 1. 崩溃清单
 
@@ -57,7 +70,7 @@
 
 shader 栈是一个全局 `std::deque<Shader*>`，对象位于 RVA `0x8379CC`：`+4` 块表 `0x8379D0`、`+8` 块表容量 `0x8379D4`、`+0xC` 起始偏移 `0x8379D8`、`+0x10` 深度 `0x8379DC`；当前 shader 指针在 `0x8379B8`；注册表是 `std::map<uint32 hash, Shader*>`，头节点指针 `0x8379BC`、元素数 `0x8379C0`。哈希是对小写名字做的 djb2（`KAGE_ColorTextureShader` → `0xB3D14323`，与 09-19 活体读取的注册表键一致）。
 
-- 入栈 `FUN_00a140c0`（RVA `0x6140C0`，cdecl，一个栈参数 = 名字）：查注册表；只有"节点存在 且 对象非空 且 对象 `+4` 的 bit0 为 1"才把当前 shader 压栈、把该对象设为当前、返回 1；否则**不压栈返回 0**。
+- 入栈 `FUN_00a140c0`（RVA `0x6140C0`，stdcall，一个栈参数 = 名字；两个出口均为 `ret 4`）：查注册表；只有"节点存在 且 对象非空 且 对象 `+4` 的 bit0 为 1"才把当前 shader 压栈、把该对象设为当前、返回 1；否则**不压栈返回 0**。原文cdecl描述错误，现有C++ Hook的stdcall无需修改。
 - 字体绘制 `FUN_00a1bd80`（RVA `0x61BD80`）第 64 行调用入栈但**不检查返回值**；第 158–167 行出栈：深度为 0 时只写日志 `Shader stack empty`，然后照样调用取栈顶助手 `FUN_00684fc0`（RVA `0x284FC0`）：索引 = 偏移 + 深度 − 1 = `0xFFFFFFFF`（转储 ESI），块号 `(−1>>2) & 7 = 7`，块指针为空，于是取 `0 + 3×4 = 0xC`（转储 EAX），`mov eax,[eax]` 触发读 `0xC` 的访问违例。
 - 因此 A 类的充分条件是：**这一次入栈返回了 0**。字体绘制内部的四个助手（`0x61B580` 画字形、`0x61B8E0` 量宽、`0x61B510`、`0x62BFE0`）在静态调用图 5 层内不接触任何出栈/清栈代码（对 `0x8379DC` 的 20 处引用全部在入栈、`EndFrame`（`0x619180`）、`ResetState`（`0x613220`）和各个自带出栈的绘制例程里），降低了"由已检查的直接内部调用清空"的可能性；有限深度静态调用图不能排除间接调用、并发或内存破坏。
 
@@ -97,12 +110,12 @@ shader 栈是一个全局 `std::deque<Shader*>`，对象位于 RVA `0x8379CC`：
 
 探针拿到完整转储后，下一步是核对是谁在原地销毁/替换该对象：候选是设备丢失重建协议（`0x6180B0` 重建与 `0x613060` 销毁在同一张虚表 `.rdata 0x782434/0x782438`，静态没有直接调用者）和 `Shader` 自身虚表的销毁槽。
 
-## 3. B 类：启动期归档挂载时 `fopen` 失败
+## 3. B 类：归档重开得到空流，解析路径已观察到NULL
 
 ### 3.1 机制（已确定）
 
 - 归档挂载 `FUN_00a179c0`（`0x6179C0`）：解析路径（`0x617180` → `0x616C60` 在搜索目录表里定位）、分配 `0x837A14` 的槽位（上限 32）、`FUN_00a17ea0`（`0x617EA0`）打开容器文件、读 7 字节魔数 + 1 字节 kind（写入 `0x837A18[slot*8]`）+ 表偏移 + 条目数，然后**对每个条目**：分配 0x1C 的条目、`FUN_00a68a50`（`0x668A50`）构造 `ArchivedFile` 读全文算校验和、插入 0x8000 槽的全局哈希表、析构。
-- `ArchivedFile` 构造再次按容器路径调用 `FUN_00a178d0`（`0x6178D0`）：先查"是否在已挂载归档内"（`0x617F40`，不会命中），再 `FUN_00a17ea0` → `KAGE::Filesys::File::Open`（`0x652540`）→ CRT `fopen(path,"rb")`。失败时返回空，构造函数**不检查**就把空流交给 `FUN_00a68c50`（`0x668C50`）做虚调用 → 崩溃。kind 2（29048）走 `0x668CB5`，kind 0（22060）走 `0x668CD6`。
+- `ArchivedFile` 构造再次按容器路径调用 `FUN_00a178d0`（`0x6178D0`）：先经 `0x617180` 解析，再查已挂载归档（`0x617F40`），未取得流则回退 `FUN_00a17ea0`。只有有效路径才可能继续 `KAGE::Filesys::File::Open`（`0x652540`）→ CRT `fopen(path,"rb")`；NULL路径会直接失败。最终空流未经构造函数检查就传给 `FUN_00a68c50`（`0x668C50`）虚调用 → 崩溃。kind 2（29048）走 `0x668CB5`，kind 0（22060）走 `0x668CD6`。
 - 挂载函数自己对容器文件的首次打开是有检查的（失败会记 `Failed to open archive file`），但每条目的重复打开没有。一个 `afterbirthp.a` 有一万多个条目，等于启动阶段对同一文件做上万次 `fopen/fclose`。
 - 调用链（29048/22060 一致）：`J460_ApplicationMain+0x95F` → 挂载 → 构造 → 初始化。两次都在 `--luadebug` 纯启动、"Binding of Isaac: Repentance+ v1.9.7.17.J460" 横幅之后、shader 初始化和 mod 加载之前。
 
@@ -110,16 +123,16 @@ shader 栈是一个全局 `std::deque<Shader*>`，对象位于 RVA `0x8379CC`：
 
 启动即注入的探针（§3.3-1）第一次冷启动就复现了 B：游戏在挂载第 12 个归档时崩溃（`0x668CB5`，校验链 `ApplicationMain+0x95F` → 挂载 → 构造 → 初始化，转储在 `../runs/l1/20260920-native-crash-rootcause/cold-start-smoke/`）。探针记录到文件打开函数 `0x617EA0` 收到的**路径是 NULL、errno = 2（ENOENT）**，栈上是 `ArchivedFile` 构造（`0x668B27`）与挂载函数（`0x617CCF`）。对照反汇编：
 
-- 逐条目重开用的是挂载时存进槽表的**已解析绝对路径**，它走 `FUN_00a17180`（`0x617180`）的绝对路径分支：`0x6171D8` 复制路径 → `0x6171E4` 调 `FUN_00a524b0`（`0x6524B0`）→ 其中 `0x6524FE` `CALL [0x00b187c4]` 即 ucrt `_access(path, 0)` → 返回 −1 时 `0x6171F1` 释放副本并返回 NULL。
-- 所以 B 的重点候选起点是：**归档路径存在性检查失败，使解析结果为空**；当前 NULL 路径/ENOENT 下游记录尚不能直接确认 `_access` 失败及其当时 errno；解析结果为空后，`FUN_00a178d0` → `0x617EA0` 收到 NULL，构造函数拿到空流。此前把 `fopen` 当失败点的说法据此修正。
-- `_access` 在 ucrt 里落到 `GetFileAttributesExW`。同一进程此前已对同一批文件做了 17662 次成功打开；这支持继续调查间歇性路径/访问问题，但没有失败瞬间的原始路径与底层调用结果，不能据此排除路径生命周期问题或认定过滤驱动是原因。本机运行火绒（HipsDaemon），Defender 实时保护关闭；`fltmc` 需要管理员权限，本轮没有枚举过滤驱动。
+- **17:12实测修正**：槽表实际保存相对路径（见§0.2），不是这里先前推断的绝对路径。`0x617180`对绝对路径确有 `_access` 分支，但不能套用到已采样的归档路径。
+- 相对路径转入 `0x616C60`：逆序遍历搜索目录，检查已挂载归档及每个目录的名字哈希索引；遍历完未命中时返回0。随后 `0x617180` 返回NULL，`0x6178D0`把它交给后续打开函数。**究竟哪个目录/键或路径内容导致首次失配，尚未捕获**。
+- `errno=2`可能为遗留状态：新探针真实记录过 `_access`返回0且errno仍为2的调用。不能从下游NULL+errno2直接推断Windows文件访问失败，更不能据此确定过滤驱动/杀软根因。
 
-仍未确定：`_access` 失败瞬间 `GetLastError` 的具体值（下一轮探针直接钩 `ucrtbase!_access` 记录，并同时复查 `GetFileAttributesW` 与 `CreateFileW` 是否也失败），以及火绒是否为必要条件（需要用户决定是否临时把游戏目录加入排除做对照）。
+下一故障门：原始相对路径 → 搜索目录与哈希索引 → 解析返回值。先取得这一链路的失败现场，再决定是索引修复、路径修复还是底层文件操作处理。
 
 ### 3.3 修复方案（探针与缓解已实现，2026-09-20）
 
 1. **启动即注入的探针（已实现）**：注入器 `--launch` 模式以 `CREATE_SUSPENDED` 创建进程、注入、等控制块离开 loading 再 `ResumeThread`（`rl/turbo/src/injector.cpp`；Python `isaac_bridge.turbo.launch_suspended`）。钩子：`0x617EA0`（stdcall `(path, File**)`，`ret 8`）记录失败路径/errno/`_doserrno`/`GetLastError`/挂载槽数/栈上的返回地址候选；`ucrtbase!_access`（按导出名定位）对绝对路径 `.a` 的失败记录同样信息并立即用 `GetFileAttributesW`/`CreateFileW` 复查、记录进程句柄数；`kFlagProbeDump` 时写带私有读写页（堆）的 minidump，每进程最多 3 份。
-2. **缓解层（已实现，`kFlagFileRetry`）**：`_access` 对绝对路径 `.a` 失败时按 10/20/30/40/50 ms 退避重试最多 5 次，成功即返回 0；`0x617EA0` 层实际为20/40/60/80/100 ms，共300 ms；与 `_access` 层的150 ms不是同一预算。相对路径（如可选的 `resources/secret.a` 探测）失败是正常结果，不取证不重试。是否恢复取决于后续调用能否成功；固定睡眠累计分别为150/300 ms，还不含文件API、日志、转储及嵌套调用耗时，不能承诺端到端最多150 ms或已经修好。每次重试均有记录。
+2. **缓解层（已实现，`kFlagFileRetry`）**：`_access` 对绝对路径 `.a` 失败时按 10/20/30/40/50 ms 退避重试最多 5 次，成功即返回 0；`0x617EA0` 层实际为20/40/60/80/100 ms，共300 ms；与 `_access` 层的150 ms不是同一预算。当前策略不会重试相对路径或NULL路径；这不仅排除了可选文件，也漏掉了实测的 `resources/packed/*.a` 路径解析失败。是否恢复取决于后续调用能否成功；固定睡眠累计分别为150/300 ms，还不含文件API、日志、转储及嵌套调用耗时，不能承诺端到端最多150 ms或已经修好。每次重试均有记录。
 3. 离线验证：`rl/turbo/build.ps1` 全过（DLL、注入器、`clock_test`、新增 `registry_test`、身份门探针、7 个目标字节核对），`test_turbo_control.py` 与原有 20 项单测通过；字体守卫桩的机器码经 capstone 反汇编核对（保存 ECX/EDX/XMM0-3 → 检查 → `jmp [g_orig_font_draw]` 或 `ret 0x24`）。
 4. 冷启动循环 `rl/bridge/python/crash_probe/cold_start_loop.py`：挂起注入 → 等桥接 listening → 投递回车进入主菜单 → WM_CLOSE 正常退出 → 记录结局/探针计数/新转储；`--no-inject` 为不注入 DLL 的对照模式。
 3. **训练器侧**：worker 启动串行化、前一个进程退出后等待固定冷却再拉起下一个；启动失败按 `worker_start_failed` 记录并自动重试，而不是算作一场死亡（现有 `train_monstro.py` 已不把启动失败当死亡，缺的是自动重试与冷却）。
