@@ -10,11 +10,14 @@ import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
+from sb3_contrib import MaskablePPO
 
 from isaac_bridge.monstro_gym import MonstroGymEnv, OBSERVATION_SCHEMA
 from isaac_bridge.env import BridgeError
 from isaac_bridge.rendering import configure_rendering
 from isaac_bridge.turbo import TurboError, launch_suspended, process_exit_code, HOOK_CAPTURE_OVERLAY
+from isaac_bridge.transformer_obs import TransformerMonstroEnv, SCHEMA, HISTORY, ENTITY_CAPACITY
+from isaac_bridge.transformer_policy import CombatTransformer
 
 
 class EpisodeLog(BaseCallback):
@@ -39,6 +42,10 @@ def main():
     p.add_argument("--render-mode", choices=("headless", "visible"), default="headless")
     p.add_argument("--connect-timeout", type=float, default=30.)
     p.add_argument("--steps", type=int, default=512)
+    p.add_argument("--model", choices=("transformer", "mlp"), default="transformer")
+    p.add_argument("--entity-capacity", type=int, default=ENTITY_CAPACITY)
+    p.add_argument("--history", type=int, default=HISTORY)
+    p.add_argument("--device", default="cpu")
     p.add_argument("--episode-frames", type=int, default=960)
     p.add_argument("--hit-reward", type=float, default=0.05)
     p.add_argument("--damage-reward", type=float, default=1.0)
@@ -57,15 +64,20 @@ def main():
         startup_control.close()
     print("PID", pid, "render_mode", args.render_mode, flush=True)
     torch.set_num_threads(1)
-    env = Monitor(MonstroGymEnv(port=args.port, max_episode_frames=args.episode_frames,
-                              hit_reward=args.hit_reward, damage_reward=args.damage_reward),
+    env_class = TransformerMonstroEnv if args.model == 'transformer' else MonstroGymEnv
+    env_kwargs = dict(history=args.history, entity_capacity=args.entity_capacity) if args.model == 'transformer' else {}
+    env = Monitor(env_class(port=args.port, max_episode_frames=args.episode_frames,
+                              hit_reward=args.hit_reward, damage_reward=args.damage_reward, **env_kwargs),
                   filename=str(args.out / "monitor.csv"))
     env.unwrapped.bridge.connect_timeout = args.connect_timeout
     callback = EpisodeLog()
     report = {"status": "started", "requested_steps": args.steps, "turbo": False,
               "pid": pid, "render_mode": args.render_mode, "virtual_clock": False,
               "launch_output": launch_output,
-              "observation_schema": OBSERVATION_SCHEMA,
+              "model": args.model, "observation_schema": SCHEMA if args.model == 'transformer' else OBSERVATION_SCHEMA,
+              "history": args.history if args.model == 'transformer' else 1,
+              "entity_capacity": args.entity_capacity if args.model == 'transformer' else 128,
+              "action_repeat": env.unwrapped.bridge.action_repeat,
               "reward": {"hurt": -1, "hit": args.hit_reward, "normalized_damage": args.damage_reward,
                          "clear": 1, "extra_death": 0, "time_limit": "truncation"}}
     start = time.perf_counter()
@@ -76,18 +88,27 @@ def main():
         render_control = configure_rendering(pid, args.render_mode)
         report["render_before"] = asdict(render_control.stats()) if render_control else None
         report["capture_overlay_isolation"] = bool(render_control and report["render_before"]["hooks_mask"] & HOOK_CAPTURE_OVERLAY)
-        model = PPO("MultiInputPolicy", env, n_steps=128, batch_size=64, n_epochs=4,
-                    learning_rate=3e-4, seed=0, device="cpu", verbose=1,
-                    policy_kwargs={"net_arch": dict(pi=[64, 64], vf=[64, 64])})
+        algorithm = MaskablePPO if args.model == 'transformer' else PPO
+        policy_kwargs = {"net_arch": dict(pi=[64, 64], vf=[64, 64])}
+        if args.model == 'transformer':
+            policy_kwargs.update(features_extractor_class=CombatTransformer,
+                                 features_extractor_kwargs=dict(features_dim=256, layers=4, heads=8),
+                                 net_arch=dict(pi=[128], vf=[128]), normalize_images=False)
+        model = algorithm("MultiInputPolicy", env, n_steps=128,
+                          batch_size=8 if args.model == 'transformer' else 64, n_epochs=4,
+                          learning_rate=3e-4, seed=0, device=args.device, verbose=1,
+                          policy_kwargs=policy_kwargs)
+        report['parameters'] = sum(p.numel() for p in model.policy.parameters())
         initial = {k: v.detach().clone() for k, v in model.policy.state_dict().items()}
         model.learn(total_timesteps=args.steps, callback=callback)
         delta = sum(float(torch.sum((v - initial[k]) ** 2)) for k, v in model.policy.state_dict().items()) ** .5
         if delta == 0: raise RuntimeError("PPO did not change policy/value parameters")
         model.save(args.out / "ppo_monstro")
-        restored = PPO.load(args.out / "ppo_monstro", device="cpu")
+        restored = algorithm.load(args.out / "ppo_monstro", device=args.device)
         obs, _ = env.reset()
-        action, _ = model.predict(obs, deterministic=True)
-        restored_action, _ = restored.predict(obs, deterministic=True)
+        predict_kwargs = {'action_masks': env.unwrapped.action_masks()} if args.model == 'transformer' else {}
+        action, _ = model.predict(obs, deterministic=True, **predict_kwargs)
+        restored_action, _ = restored.predict(obs, deterministic=True, **predict_kwargs)
         np.testing.assert_array_equal(action, restored_action)
         _, reward, terminated, truncated, info = env.step(restored_action)
         report.update(status="completed", actual_steps=model.num_timesteps,
@@ -101,6 +122,9 @@ def main():
         raise
     except TurboError as error:
         report.update(status="render_control_error", error={"type": type(error).__name__, "message": str(error)})
+        raise
+    except (ValueError, RuntimeError, IndexError) as error:
+        report.update(status="model_error", error={"type": type(error).__name__, "message": str(error)})
         raise
     finally:
         try:

@@ -1,6 +1,26 @@
 # IsaacRLBridge：原版 J460 的同步训练桥接
 
-设计见 [ENV_ARCHITECTURE.md §3](../docs/ENV_ARCHITECTURE.md)。2026-09-19 已跑通原引擎真实采样 → PPO 更新 → checkpoint 保存/重载 → 游戏动作执行。固定种子课程的 512 步训练已通过，但策略尚未击杀 Boss，冷启动和训练后空闲阶段仍有崩溃。
+设计见 [ENV_ARCHITECTURE.md §0.3](../docs/ENV_ARCHITECTURE.md)。原引擎同步采样、原生worker修复与PPO存取档已验收。2026-09-21默认训练入口升级为实体注意力 + 地图CNN + 因果Transformer；保留MLP对照，不把短程接入当作战斗达标。
+
+## Transformer v1
+
+安装/复用 `python/requirements-training.txt` 中固定版本的训练依赖（本机位于 `rl/runs/training-deps`，未安装到全局）。游戏mods中的isaac_rl_bridge是指向本仓库Mod目录的junction，无需复制到自身；新worker会读到更新的schema=3。
+
+```powershell
+$env:PYTHONIOENCODING = 'utf-8'
+$env:PYTHONPATH = 'D:\Projects\fortune\Isaac\rl\bridge\python;D:\Projects\fortune\Isaac\rl\runs\training-deps'
+python D:\Projects\fortune\Isaac\rl\bridge\python\train_monstro.py --launch --model transformer --steps 512 --out D:\Projects\fortune\Isaac\rl\runs\transformer-smoke
+# 与训练完全相同的历史窗口、CNN、因果注意力及动作mask；不再使用规则控制器：
+$workerPid = [int](Read-Host '输入训练命令打印的游戏 PID')
+python D:\Projects\fortune\Isaac\rl\bridge\python\monstro_rollout.py --pid $workerPid --render-mode visible --checkpoint D:\Projects\fortune\Isaac\rl\runs\transformer-smoke\ppo_monstro.zip --episodes 3 --frames 960 --out D:\Projects\fortune\Isaac\rl\runs\transformer-eval
+```
+
+默认64步历史、每2逻辑帧决策、256个实体/激光线段容量；超容量报错，不能静默截断。`--history`和`--entity-capacity`属于checkpoint输入规格；评估会从checkpoint恢复。`--model mlp`保留原两层64单元网络/4帧动作间隔。两个模型不能直接互载checkpoint。`--pid`与`--launch`二选一；结束后进入安全房、保留worker，实际退出验收另发WM_CLOSE并记录退出码。
+
+新模型将完整原始历史作为每条PPO样本的一部分，因此不是给普通PPO偷偷添加一个训练时缺失的缓存。因果遮罩、padding、重置隔离、实体置换、动作mask、存取档均有测试：`python -m unittest test_transformer`。完整数据字段和边界见架构文档§0.3。
+
+本轮通过38项离线测试、原引擎512步Transformer训练及3回合checkpoint可视化评估；参数397万，完整验收均正常退出。最终checkpoint为 `../runs/l1/20260921-transformer/transformer-final/ppo_monstro.zip`。另实测199颗同时可见弹进入Actor，没有被旧128槽限制截掉。仍无Boss击杀，尚未完成收敛与泛化训练。证据与失败实验统一见架构文档§0.3和 `../runs/l1/20260921-transformer/acceptance-summary.json`。
+
 
 ## 正式入口：Isaac / 零道具 / Monstro / 空地形
 
@@ -12,7 +32,7 @@ $env:PYTHONPATH = 'D:\Projects\fortune\Isaac\rl\runs\training-deps'
 python -m unittest -v test_training test_monstro_gym test_rendering
 python monstro_rollout.py --launch --frames 2700 --policies idle,track,track --out D:\Projects\fortune\Isaac\rl\runs\l1\monstro-full-episodes
 $workerPid = [int](Read-Host '输入上一条命令打印的游戏 PID')
-python train_monstro.py --pid $workerPid --steps 512 --episode-frames 960 --out D:\Projects\fortune\Isaac\rl\runs\l1\monstro-ppo-smoke
+python train_monstro.py --pid $workerPid --model mlp --steps 512 --episode-frames 960 --out D:\Projects\fortune\Isaac\rl\runs\l1\monstro-ppo-smoke
 # 可视化验收（不改变逻辑时钟）：
 python monstro_rollout.py --pid $workerPid --render-mode visible --frames 120 --policies track --out D:\Projects\fortune\Isaac\rl\runs\l1\monstro-visible
 ```

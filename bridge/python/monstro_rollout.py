@@ -50,10 +50,19 @@ def main():
     p.add_argument("--connect-timeout", type=float, default=30.)
     p.add_argument("--frames", type=int, default=5400)
     p.add_argument("--policies", default="idle,track,track")
+    p.add_argument("--checkpoint", type=Path, help="Transformer checkpoint; overrides --policies")
+    p.add_argument("--episodes", type=int, default=3, help="Number of checkpoint evaluation episodes")
     p.add_argument("--out", required=True, type=Path)
     args = p.parse_args()
     if args.launch == (args.pid is not None):
         p.error("specify exactly one of --launch or --pid")
+    learned = None
+    if args.checkpoint:
+        import torch
+        from sb3_contrib import MaskablePPO
+        from isaac_bridge.transformer_obs import TransformerMonstroEnv
+        torch.set_num_threads(1)
+        learned = MaskablePPO.load(args.checkpoint, device='cpu')
     args.out.mkdir(parents=True, exist_ok=True)
     pid = args.pid
     launch_output = None
@@ -64,10 +73,16 @@ def main():
             log_dir=str(args.out / "native"))
         startup_control.close()
     print("PID", pid, "render_mode", args.render_mode, flush=True)
-    env = MonstroGymEnv(port=args.port, max_episode_frames=args.frames)
+    if learned is not None:
+        h, capacity, _ = learned.observation_space['entities'].shape
+        env = TransformerMonstroEnv(port=args.port, max_episode_frames=args.frames,
+                                    history=h, entity_capacity=capacity)
+    else:
+        env = MonstroGymEnv(port=args.port, max_episode_frames=args.frames)
     env.bridge.connect_timeout = args.connect_timeout
     report = {"episodes": [], "status": "started", "turbo": False, "pid": pid,
-              "render_mode": args.render_mode, "virtual_clock": False, "launch_output": launch_output}
+              "render_mode": args.render_mode, "virtual_clock": False, "launch_output": launch_output,
+              "checkpoint": str(args.checkpoint.resolve()) if args.checkpoint else None}
     render_control = None
     start = time.perf_counter()
     try:
@@ -76,8 +91,9 @@ def main():
         render_control = configure_rendering(pid, args.render_mode)
         report["render_before"] = asdict(render_control.stats()) if render_control else None
         report["capture_overlay_isolation"] = bool(render_control and report["render_before"]["hooks_mask"] & HOOK_CAPTURE_OVERLAY)
-        for n, policy in enumerate(args.policies.split(",")):
-            if policy not in ("idle", "track"): raise ValueError(policy)
+        policies = ['transformer']*args.episodes if learned is not None else args.policies.split(',')
+        for n, policy in enumerate(policies):
+            if learned is None and policy not in ("idle", "track"): raise ValueError(policy)
             obs, info = env.reset(seed=0)
             entry = {"episode": n, "policy": policy, "initial_info": info}
             report["episodes"].append(entry)
@@ -85,7 +101,10 @@ def main():
             with (args.out / f"episode{n}.jsonl").open("w", encoding="utf-8") as f:
                 f.write(json.dumps({"obs": env.raw_obs, "info": info}) + "\n")
                 while True:
-                    action = np.zeros(4, dtype=np.int64) if policy == "idle" else tracking_action(obs)
+                    if learned is not None:
+                        action, _ = learned.predict(obs, deterministic=True, action_masks=env.action_masks())
+                    else:
+                        action = np.zeros(4, dtype=np.int64) if policy == "idle" else tracking_action(obs)
                     obs, reward, terminal, truncated, info = env.step(action)
                     f.write(json.dumps({"action": action.tolist(), "obs": env.raw_obs, "reward": reward,
                                         "terminated": terminal, "truncated": truncated, "info": info}) + "\n")

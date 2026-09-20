@@ -221,6 +221,7 @@ local function player_record(p)
 		damage = p.Damage, fire_delay_max = p.MaxFireDelay, shot_speed = p.ShotSpeed, range = p.TearRange,
 		speed = p.MoveSpeed, luck = p.Luck, can_fly = p.CanFly,
 		active = p:GetActiveItem(), active_charge = p:GetActiveCharge(),
+		active_ready = p:GetActiveItem() ~= 0 and not p:NeedsCharge(),
 		invulnerable = p:GetDamageCooldown() > 0, controls = p.ControlsEnabled,
 		head_dir = p:GetHeadDirection(), fire_dir = p:GetFireDirection(), move_dir = p:GetMovementDirection(),
 		anim = sprite_anim(spr), aframe = spr:GetFrame(), flip = p.FlipX,
@@ -250,6 +251,14 @@ local function entity_record(e)
 		local pr = e:ToProjectile()
 		rec.projectile = true
 		rec.height = pr.Height; rec.fall = pr.FallingSpeed; rec.scale = pr.Scale
+	elseif t == EntityType.ENTITY_LASER then
+		local laser = e:ToLaser()
+		local points = {}
+		local samples = laser:GetSamples()
+		for i = 0, #samples - 1 do points[#points + 1] = vec(samples:Get(i)) end
+		rec.laser = { circle = laser:IsCircleLaser(), radius = laser.Radius,
+			angle = laser.AngleDegrees, length = laser.LaserLength,
+			width = 2 * e.Size, ["end"] = vec(laser:GetEndPoint()), samples = points }
 	elseif t == EntityType.ENTITY_BOMB then
 		rec.bomb = true
 	elseif t == EntityType.ENTITY_PICKUP then
@@ -290,6 +299,13 @@ end
 
 local function terrain_record(room, player)
 	local cells = {}
+	local hazards = {}
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		if e.Visible and e.Type == EntityType.ENTITY_EFFECT and cfg.effect_whitelist[e.Variant]
+			and e.CollisionDamage > 0 then
+			hazards[#hazards + 1] = e
+		end
+	end
 	for i = 0, room:GetGridSize() - 1 do
 		local pos = room:GetGridPosition(i)
 		local collision = room:GetGridCollision(i)
@@ -302,8 +318,16 @@ local function terrain_record(room, player)
 		local grid = room:GetGridEntity(i)
 		local kind = grid and grid:GetType() or GridEntityType.GRID_NULL
 		local spikes = kind == GridEntityType.GRID_SPIKES or kind == GridEntityType.GRID_SPIKES_ONOFF
+		local solid = collision ~= GridCollisionClass.COLLISION_NONE and not pit
+		local destructible = solid and grid and (grid:ToRock() ~= nil or grid:ToPoop() ~= nil or grid:ToTNT() ~= nil)
+		local hazard = spikes -- potential spike danger; not a hidden damage-timer read
+		for _, e in ipairs(hazards) do
+			-- Conservative cell footprint; precise entity geometry remains in obs.entities.
+			if pos:Distance(e.Position) <= e.Size + 28.3 then hazard = true end
+		end
 		cells[#cells + 1] = { i, pos.X, pos.Y, collision, inside and 1 or 0,
-			walkable and 1 or 0, pit and 1 or 0, spikes and 1 or 0 }
+			walkable and 1 or 0, pit and 1 or 0, hazard and 1 or 0,
+			solid and 1 or 0, destructible and 1 or 0 }
 	end
 	return { width = room:GetGridWidth(), height = room:GetGridHeight(), cells = cells }
 end
@@ -328,6 +352,7 @@ end
 local function build_obs()
 	local game = Game()
 	local obs = {
+		combat_schema = 3,
 		game_frame = game:GetFrameCount(), paused = game:IsPaused(),
 		logic_frames = state.logic_frames,
 		events = { damage = state.events.damage, tears = state.events.tears,

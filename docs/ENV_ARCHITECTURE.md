@@ -1,6 +1,6 @@
 # Isaac RL 环境架构：三层环境栈与统一契约
 
-更新：2026-09-20。当前主线为原版 J460 worker 的稳定训练、rewind 重置、密集奖励和玩家可见观测；§0.2 是当前实现，后文明确标记的 L2 方案/模块快照保留为历史设计。目标与信息边界沿用 [PROJECT_SPEC.md](PROJECT_SPEC.md)，外部经验见 [RELATED_WORK.md](RELATED_WORK.md)。
+更新：2026-09-21。当前主线为原版 J460 worker 的稳定训练、rewind 重置、密集奖励和玩家可见观测；§0.3 是当前模型实现，后文明确标记的 L2 方案/模块快照保留为历史设计。目标与信息边界沿用 [PROJECT_SPEC.md](PROJECT_SPEC.md)，外部经验见 [RELATED_WORK.md](RELATED_WORK.md)。
 
 ## 0. 结论
 
@@ -19,7 +19,7 @@
 4. 策略只接收玩家可观察信息。视觉或内存读取是采集方式，不是放宽信息边界的理由；NPC 内部状态、隐藏实体、种子和未来事件不能进入 actor。当前 Monstro v2 白名单已实机使用，并有隐藏字段不改变策略张量的测试；其他实体/道具组合仍需逐类验收。
 5. 进度分别记录为：**地址定位、有效伪 C、机制理解、Rust 移植、L0 验证**。这五项不能互相替代。最新逐模块清单见 §11。
 
-### 0.2 当前训练实现与下一阶段（2026-09-20，覆盖前文的历史优先级）
+### 0.2 v2 MLP 基线（2026-09-20，保留作对照）
 
 当前执行顺序：先稳定原引擎 worker，再扩展战斗数据，最后扩大训练。L2 手写模拟器不作为当前阻塞项；前文“模拟器是唯一可行样本来源”不是已证实结论，不能由一个社区实验推广到所有算法与工程方案。
 
@@ -49,6 +49,47 @@
 几何依据：[entities2.xml 的 collisionRadius / X-Y multiplier](https://wofsauge.github.io/IsaacDocs/rep/xml/entities2.html)、[EntityLaser 路径采样 API](https://wofsauge.github.io/IsaacDocs/rep/EntityLaser.html)。这些是数据入口，不等于已验证每一种攻击的实际命中判定。
 
 崩溃历史证据：`../runs/l1/20260920-crash/`；本轮 rewind/密集奖励/地形/PPO 证据：`../runs/l1/20260920-rewind/`。20项测试通过；新版512步实机 PPO 更新、存取档和重载执行通过，仍未学会击杀。详见 [桥接当前验收](../bridge/README.md)。原生冷启动/可视化崩溃根因仍待解决。
+
+
+### 0.3 Transformer 战斗策略 v1（2026-09-21）
+
+用户确认的架构：实体集合注意力 + 地形CNN + 64步因果时序Transformer。首版不使用LSTM、世界模型、跨房间规划或特权critic。实现入口为 `bridge/python/isaac_bridge/transformer_obs.py`、`transformer_policy.py`，训练仍复用SB3，动作屏蔽复用sb3-contrib 2.7.1的MaskablePPO。
+
+**数据路径**：当前可见实体→共享128维编码→4个玩家条件注意力查询；7通道地形→CNN→128维（保留空间位置，不使用全局平均池化）；23维玩家状态、动画、主动道具→64维；上一动作→32维。拼接后生成256维时刻token，进入4层、8头、FFN1024的Transformer，使用相对经过时间正弦编码、因果遮罩与历史padding遮罩。Actor/critic共享同一份可见历史，末端分别为128维MLP与动作/value输出。
+
+| 输入 | shape（不含batch） | 语义 |
+|---|---|---|
+| player | 64×23 | 房间位置、可见位置差分速度/有效位、尺寸、血量、资源、角色属性、飞行、主动充能/可用性、动画帧、flip、dt |
+| entity numeric | 64×N×26 | 相对位置、位置差分速度/有效位、尺寸、碰撞属性、可见Boss血条、动画帧、激光端点/方向/长度或环半径 |
+| entity kind | 64×N×3 | 类型/变种/子类型，分别embedding；不将编号作为有序实数 |
+| animation | 玩家64×32，实体64×N×32 | UTF-8名字字节的有序embedding，不做不稳定的Python hash；超32字节报错 |
+| terrain | 64×7×9×15 | 房内、玩家可通行、实体障碍、坑、可破坏障碍、地面危险、关闭的门 |
+| previous_action | 64×4 | 上一步joint/bomb/item及有效位；reset后全零 |
+| masks/time | 历史mask、实体mask、经过时间 | 新回合历史清空；不暴露全局绝对时间、种子、NPC隐藏HP/状态/RNG |
+
+`N`是Gym批处理分配容量，默认256，可用`--entity-capacity`改大；不是最近K个实体，也不是全游戏数量上界。超限立即报错，包含曲线激光拆出的线段。网络会紧凑收集有效实体，注意力不依赖槽位顺序；空房使用独立null token，不会对全masked序列做softmax。种类embedding当前支持type<1024、variant<8192、subtype<4096；本轮针对原版单房间，不声称任意Mod编号兼容。
+
+速度仅来自连续可见位置差分。Index只用于匹配，不进入网络；实体年龄连续性用于拒绝复用Index。失去可见性或rewind后断开追踪，不读取隐藏运动。普通敌人HP、引擎速度、受伤无敌计时及奖励结算计数不进入Actor，也不进入本版critic。动画帧是公开表现，不是NPC AI状态。
+
+**输出**：`MultiDiscrete([45,2,2])`；`joint=move*5+shoot`，移动9种、射击5种同时选择，另有炸弹/主动道具二分类。策略线性输出49个logit，拆成三个分布。MaskablePPO在采样、训练log-prob和推理时应用同一可用动作mask。每次动作推进2个逻辑帧，历史覆盖约4秒；炸弹/道具沿用bridge的按键边沿语义。主动道具mask目前为已有道具且不NeedsCharge，特殊充能道具仍需独立课程验证。
+
+**训练一致性**：每条PPO样本携带完整原始历史窗口，不缓存旧网络编码。minibatch可以打乱样本顺序，但每个样本内部的64步顺序不变；重算窗口的梯度会训练CNN、实体编码及时间注意力。dropout=0，避免采样与PPO log-prob重算不一致。训练和推理使用相同有限窗口，没有跨worker KV缓存。奖励仍为受伤−1、有效命中+0.05、归一化实际伤害、清房+1，死亡不额外扣分。
+
+**桥接schema=3**：原有terrain.cells前8列保留，追加solid/destructible；可破坏障碍识别岩石、粪便、TNT。危险通道是潜在尖刺及白名单中可见、有碰撞伤害特效的保守网格覆盖，不是完整全游戏伤害预测；关闭门映射到最近格。激光提供原生GetSamples路径/端点，曲线按线段入表、环形按圆入表；当前实机核对直线激光，环/曲线还需对应场景扩展。旧MLP忽略新增列，仍可用 `--model mlp` 对照。
+
+**已发现并修复的适配错误**：uint8的`64×256×32`动画表被SB3当成RGB图片，自动转置为`32×64×256`；小容量单测没有暴露这个问题。新增完整尺寸失败回归后，类别表改为int32，避免图像预处理。失败训练进程PID28028的游戏正常退出0，这不是原生崩溃。另用相同轨迹、相差1000万逻辑帧的worker时钟验证输入一致性：原实现失败，修正为先用整数减去本回合起点，再转浮点时间，避免绝对运行时间泄露及精度损失。过程日志保留在 `runs/l1/20260921-transformer/`。
+
+**本轮验收（证据在 `runs/l1/20260921-transformer/`）**：
+
+- 38项Python测试通过，包括因果未来隔离、过去影响当前、实体顺序/padding不变性、空实体、梯度进入CNN/实体/时序编码、可见速度/遮挡断轨、隐藏字段隔离、动作mask、reset、checkpoint存取、完整64×256尺寸的SB3转置回归及worker运行时间平移不变性。
+- PID8240实机跑100次2帧动作，窗口达到64并在回合截断后清空；直线激光采样点(176,200)→(600,200)，原生宽度32。原生LaserLength在此现场为0，因此模型长度由实际采样几何计算，不盲信该字段。生成岩石的格67实测walkable=0、solid=1、destructible=1；退出0。
+- 最终候选Transformer参数 **3,974,866**；PID24580完成512步PPO / 16 epochs / 124.89秒，参数L2变化7.90082，保存/重载动作一致，再执行通过；3个已结束回合均死亡，余下未结束回合不计胜负。WM_CLOSE退出0。checkpoint为`runs/l1/20260921-transformer/transformer-final/ppo_monstro.zip`；此前PID37072的通过结果保留为历史记录，不覆盖。
+- MLP兼容对照PID14116完成128步 / 4 epochs，存取档与再次执行通过，退出0。
+- 加载最终Transformer checkpoint，PID21900完成3个可视化回合：1死亡、2时间截断，2193次真实渲染、28509次字体调用，无字体跳过、shader入栈失败或虚拟时钟，退出0。评估执行的是学习策略，不是track规则控制器。
+- 密集弹幕探针PID30812：请求生成200发，采样时原生列表199、原生可见199，桥接/Actor均199发，逐位置核对无遗漏/误差，加载的Transformer能实际输出动作；退出0。初版探针错误地把200次生成请求当作采样时的存活数量，在199上断言失败；修正为同一冻结帧独立枚举引擎实体作为基准，保留两份报告。证明超过旧128槽的覆盖，不是高密度弹幕战斗达标。
+- 无有效Monstro击杀。以上是架构、梯度、协议及运行验收；训练预算太小且评估上限为360逻辑帧，不能据此与旧模型比较胜率。下一步是冻结实现后进行等预算、多初始状态的训练/评估。
+
+复用接口参考：[SB3自定义编码器](https://stable-baselines3.readthedocs.io/en/master/guide/custom_policy.html)、[MaskablePPO](https://sb3-contrib.readthedocs.io/en/master/modules/ppo_mask.html)、[激光采样API](https://wofsauge.github.io/IsaacDocs/rep/EntityLaser.html)。
 
 ## 1. 证据基线（2026-09-19 核实）
 

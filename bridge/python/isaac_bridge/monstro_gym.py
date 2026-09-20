@@ -28,7 +28,7 @@ def terrain_observation(obs):
     if (raw['height'], raw['width']) != TERRAIN_SHAPE[1:]:
         raise ValueError('This curriculum requires a 15x9 room grid')
     terrain = np.zeros(TERRAIN_SHAPE, dtype=np.float32)
-    for index, x, y, collision, inside, walkable, pit, hazard in raw['cells']:
+    for index, x, y, collision, inside, walkable, pit, hazard, *extra in raw['cells']:
         row, col = divmod(index, raw['width'])
         terrain[:, row, col] = [inside, walkable, collision / 5, pit, hazard]
     return terrain
@@ -112,7 +112,13 @@ class MonstroGymEnv(gym.Env):
         self.raw_obs = obs
         self.elapsed_frames = 0
         self.finished = False
-        return actor_observation(obs), {**info, "arena_seed": arena_seed, "outcome": "running"}
+        return self.encode_observation(obs), {**info, "arena_seed": arena_seed, "outcome": "running"}
+
+    def encode_observation(self, obs):
+        return actor_observation(obs)
+
+    def decode_action(self, action):
+        return action
 
     def step(self, action):
         if self.finished:
@@ -124,7 +130,7 @@ class MonstroGymEnv(gym.Env):
         previous_room = self.raw_obs["room"]["room_idx"]
         previous_combat = self.raw_obs['combat']
         try:
-            obs, _, _, _, info = self.bridge.step(action, repeat=repeat)
+            obs, _, _, _, info = self.bridge.step(self.decode_action(action), repeat=repeat)
         except (OSError, BridgeError):
             self.transport_failed = True
             self.finished = True
@@ -151,7 +157,7 @@ class MonstroGymEnv(gym.Env):
             'clear': self.clear_reward if won else 0.0,
         }
         reward = sum(components.values())
-        return actor_observation(obs), reward, terminated, truncated, {
+        return self.encode_observation(obs), reward, terminated, truncated, {
             **info, "outcome": outcome, "elapsed_frames": self.elapsed_frames,
             "logic_frames_advanced": advanced,
             "reward_components": components,
