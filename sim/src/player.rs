@@ -8,7 +8,7 @@
 use crate::entity::{flags, Entity, TYPE_PLAYER};
 use crate::math::Vec2;
 use crate::rng::Rng;
-use crate::tear::{self, tear_flags};
+use crate::tear;
 use crate::world::Event;
 
 /// 一帧的玩家输入。`move_dir`/`shoot_dir` 的分量取 [-1, 1]：键盘为 0/±1（左右相减、上下相减），
@@ -41,7 +41,7 @@ pub struct PlayerStats {
     pub damage: f32,
     /// +0x1474 TearHeight。
     pub tear_height: f32,
-    /// +0x1478 TearFallingSpeed（EvaluateItems 第 1789 行置 0；Init 的 0.2 会被覆盖）。
+    /// +0x1478 TearFallingSpeed (range conversion at EvaluateItems tail).
     pub tear_falling_speed: f32,
     /// +0x147c TearFallingAcceleration。
     pub tear_falling_accel: f32,
@@ -52,12 +52,12 @@ pub struct PlayerStats {
     /// +0x1570 CanFly。
     pub can_fly: bool,
     /// +0x1488 128 位 TearFlags。默认 `TEAR_NORMAL`（全局 DAT_00c79100，位于 .bss、未见写入 → 0），
-    /// 加上内部位 114 的选择见 `tear_flags::INTERNAL_RANGE_FALL` 的说明。
+    /// Native unmodified Isaac reports zero, not internal bit 114.
     pub tear_flags: u128,
 }
 
 impl PlayerStats {
-    /// Isaac 无道具：EvaluateItems 第 1788–1790 行（range 260、height −23.75、fall 0、accel 0）、
+    /// Isaac 无道具：range 260、height −23.75、accel 0；fall 在 EvaluateItems 末尾由射程重算。
     /// 伤害 3.5、射速 1.0、移速 1.0、开火延迟 10（Init 0x1460 = 10.0）。
     pub fn isaac() -> PlayerStats {
         PlayerStats {
@@ -66,14 +66,22 @@ impl PlayerStats {
             shot_speed: 1.0,
             damage: 3.5,
             tear_height: -23.75,
-            tear_falling_speed: 0.0,
+            tear_falling_speed: falling_speed_from_range(-23.75, 260.0, 1.0, 0.0),
             tear_falling_accel: 0.0,
             tear_range: 260.0,
             luck: 0.0,
             can_fly: false,
-            tear_flags: tear_flags::INTERNAL_RANGE_FALL,
+            tear_flags: 0,
         }
     }
+}
+
+/// EvaluateItems tail (RVA 0x00370564) calls 0x0027DA40 with XMM0..3;
+/// Ghidra's no-argument pseudocode drops this calculation completely.
+pub fn falling_speed_from_range(height: f32, range: f32, shot_speed: f32, accel: f32) -> f32 {
+    let frames = range / (shot_speed * 10.0);
+    let k = ((0.9_f32.powf(frames) - 1.0) * -9.491221_f32).max(0.01);
+    -((-5.0 - height - (accel * 10.0 + 1.0) * (frames - k)) / k)
 }
 
 /// 玩家移动方向枚举（+0x1624）：0 左、1 上、2 右、3 下、-1 无。
@@ -176,6 +184,19 @@ pub fn update_player(
     // 4. 武器：Weapon_Tears::Update → Weapon_Tears::Fire
     weapon_update(e);
     weapon_fire(e, rng, events, spawned);
+}
+
+/// Manager's odd 60 Hz tick calls Player::Update with INTERPOLATION_UPDATE.
+/// Movement is real, not visual interpolation; timers and tears remain 30 Hz.
+/// J460 Game::UpdateInterpolation RVA 0x002FD3F0, ordinary gameplay branch.
+pub fn interpolate_player(e: &mut Entity) {
+    if !e.exists || e.dead {
+        return;
+    }
+    e.flags |= crate::entity::flags::INTERPOLATION_UPDATE;
+    crate::physics::update(e);
+    update_movement(e);
+    e.flags &= !crate::entity::flags::INTERPOLATION_UPDATE;
 }
 
 /// `GetMovementInput`（FUN_00779360）：x = 右 − 左，y = 下 − 上（动作 0..3 的模拟量）。
@@ -374,9 +395,13 @@ fn fire_one(
     base += inherit;
     // GetMultiShotPositionVelocity：单发时 vel = 方向向量 × ShotSpeed，位置偏移 0
     let vel = base * stats.shot_speed;
-    let pos = e.pos;
+    // Alternating eyes, Weapon_Tears::Fire RVA 0x0060B9xx: a random
+    // perpendicular offset of 0.3..0.5 times the inherited shot vector.
+    // It is not a change to velocity, and the first shot uses the negative eye.
+    let eye = -(e.player().tear_displacement as f32) * (rng.next_f32() * 0.2 + 0.3);
+    let pos = Vec2::new(e.pos.x - base.y * eye, e.pos.y + base.x * eye);
 
-    // FUN_009f5ad0：调用 FireTear，之后按帧内相位 `-1 - fireDelay`（这里恒为 0）微调位置
+    // Integer-delay Isaac: intra-frame phase -1-fireDelay is zero at emission.
     let tear_entity = tear::fire_tear(e, pos, vel, rng);
     {
         let p = e.player_mut();

@@ -10,7 +10,7 @@
 //!    `Entity_Player::Update` 不触碰 `Room+0x76c`。
 //!
 //! 原版 Game::Update 内 Room::Update 与 EntityList::Update 的先后尚未核对，这里房间更新放在末尾。
-//! 本帧新生成的眼泪加入列表后参与本帧的碰撞阶段，但不再被本帧的 Update 循环第二次更新（近似）。
+//! 新眼泪出生时立即 Update 一次，加入本帧碰撞但不再重复 Update；已用原版出生/飞行轨迹验证。
 
 use crate::entity::{Entity, EntityKind};
 use crate::math::Vec2;
@@ -136,6 +136,24 @@ impl World {
 
     /// 推进一个逻辑帧（30 Hz）。
     pub fn step(&mut self) {
+        self.interpolate_players();
+        self.step_logic();
+    }
+
+    /// Odd manager tick (60 Hz); keyboard viewers can sample a new action here.
+    pub fn interpolate_players(&mut self) {
+        // From one MC_POST_UPDATE boundary to the next: odd manager tick first,
+        // then the full 30 Hz game tick. Only players get this extra integration.
+        for e in self.entities.iter_mut() {
+            if e.kind == EntityKind::Player && e.exists {
+                player::interpolate_player(e);
+                physics::resolve_grid_collision(e, &self.room, false);
+            }
+        }
+    }
+
+    /// Even manager tick. Call after interpolate_players, or use step() for RL.
+    pub fn step_logic(&mut self) {
         let player_pos = self.first_player_pos();
         let frame = self.frame;
 
@@ -214,10 +232,9 @@ impl World {
             }
         }
 
-        // 死亡的眼泪移除
+        // Keep the native-visible final integration until next tick's removal.
         for e in self.entities.iter_mut() {
             if e.exists && e.kind == EntityKind::Tear && e.dead {
-                e.exists = false;
                 events.push(Event::TearRemoved {
                     tear: e.id,
                     cause: e.tear().death_cause,

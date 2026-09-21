@@ -25,9 +25,9 @@ pub mod tear_flags {
     pub const DECELERATE: u128 = 1 << 82;
     /// 内部位 114（`.data` 常量 DAT_00c34780 = 1<<114）。置位时 `Entity_Tear::Update` 走"平飞到
     /// 年龄 > TearRange×0.25 后再下落"的模型，命中时对敌人做质量推挤；不置位时走"每帧
-    /// fallingSpeed = 0.9·v + 0.1 + accel"的持续下落模型，且 TearRange 对飞行无影响。
-    /// 静态分析未找到给普通眼泪置位的代码（默认标志 TEAR_NORMAL = 0），但只有置位模型能解释
-    /// 射程道具生效与眼泪推动敌人，故默认置位；**待实机验证**（见文档 §9）。
+    /// fallingSpeed = 0.9·v + 0.1 + accel"的持续下落模型。
+    /// 原版校准确认普通 Isaac 眼泪标志为零。射程通过 EvaluateItems 末尾的
+    /// falling_speed_from_range 生效，不能凭射程反推此位已置。
     pub const INTERNAL_RANGE_FALL: u128 = 1 << 114;
 }
 
@@ -172,6 +172,10 @@ pub fn update(e: &mut Entity) {
     if !e.exists || e.kind != EntityKind::Tear {
         return;
     }
+    if e.dead {
+        e.exists = false;
+        return;
+    }
     // 速度倍率：Room::GetTearTimeScale（FUN_007ea3e0）无道具、单人时为 1.0
     e.speed_mult = 1.0;
 
@@ -186,12 +190,16 @@ pub fn update(e: &mut Entity) {
     if height > -5.0 {
         e.dead = true;
         e.tear_mut().death_cause = 1;
+        // Native marks death before Entity::Update, but still integrates this
+        // final frame. Removal is deferred to the next entity-list update.
+        crate::physics::update(e);
         return;
     }
     // 2. 撞墙（BULLET 类只报告不推出；上一帧碰撞阶段置位）
     if e.collides_with_grid && height > -60.0 && flags & tear_flags::SPECTRAL == 0 {
         e.dead = true;
         e.tear_mut().death_cause = 2;
+        crate::physics::update(e);
         return;
     }
 
@@ -218,16 +226,10 @@ pub fn update(e: &mut Entity) {
         };
         t.falling_speed = new_v;
         t.height += sm * new_v; // FUN_00675fc0(height + sm·v')
-        let accel = t.falling_accel;
-        let h = t.height;
-        if !range_based {
-            // 汇编 0x00273048–0x00273084：无内部位时的屏幕方向下坠
-            if accel >= 0.001 {
-                e.vel.y += accel;
-            } else if h > -10.0 {
-                e.vel.y += 0.5;
-            }
-        }
+
+        // Screen-plane gravity at 0x00273048 is guarded by Room::IsDungeon
+        // (RVA 0x003EA190, room type 16). Ordinary top-down rooms only change
+        // Height, never Velocity.Y. Side-view crawlspaces are not modeled here.
     }
 }
 
@@ -350,7 +352,7 @@ mod tests {
         );
         // 平飞 65 帧（260×0.25）后以 v' = 0.9v + 0.2 下落，约 17 帧落地
         assert!((81..=84).contains(&frames), "landed at frame {}", frames);
-        assert!((t.pos.x - (100.0 + 10.0 * (frames as f32 - 1.0))).abs() < 1.0);
+        assert!((t.pos.x - (100.0 + 10.0 * frames as f32)).abs() < 1.0);
     }
 
     #[test]
@@ -364,8 +366,10 @@ mod tests {
         }
         assert!(t.dead && t.tear().death_cause == 1);
         assert!((25..=31).contains(&frames), "landed at frame {}", frames);
-        // 无内部位时接近地面会向屏幕下方漂移
-        assert!(t.pos.y > 280.0);
+        assert_eq!(
+            t.pos.y, 280.0,
+            "top-down rooms have no screen-plane gravity"
+        );
     }
 
     #[test]

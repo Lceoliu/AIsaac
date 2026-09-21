@@ -1,6 +1,6 @@
 # Isaac RL 环境架构：三层环境栈与统一契约
 
-更新：2026-09-21。当前主线为原版 J460 worker 的稳定训练、rewind 重置、密集奖励和玩家可见观测；§0.3 是当前模型实现，后文明确标记的 L2 方案/模块快照保留为历史设计。目标与信息边界沿用 [PROJECT_SPEC.md](PROJECT_SPEC.md)，外部经验见 [RELATED_WORK.md](RELATED_WORK.md)。
+更新：2026-09-21。原版 J460 已完成四引擎累计512局训练，但零清房。当前新增主线：先把 Rust 的基础 Isaac 手感对齐原版，再考虑 Linux 大规模采样；§0.5 是本轮实测结果，§0.3/0.4 保留现有模型与原版并行训练。目标与信息边界沿用 [PROJECT_SPEC.md](PROJECT_SPEC.md)。
 
 ## 0. 结论
 
@@ -120,6 +120,45 @@
 本次新增133632条transition、522次PPO rollout/update，耗时7740.93秒（129.02分钟；含启动/验收总墙钟7810.98秒）。从已有512步checkpoint接续，累计training_epochs=2096，其中本次2088；这不是optimizer minibatch步数。平均17.26决策/秒，整组峰值RSS6018.53MiB（约5.88GiB），平均CPU4.84逻辑核当量，CUDA张量峰值288.27MiB。参数L2变化132.11106；checkpoint保存/重载四路动作一致，并实际再次送入四个游戏；四进程WM_CLOSE退出均为0，无强制终止。
 
 模型：`runs/l1/20260921-parallel/train-512-episodes/ppo_monstro.zip`。逐局真值在`episodes.jsonl`与四份`monitor.csv`，不以step或启动次数代替局数。并行训练基础设施达到此次门槛，**单房间战斗能力未达标**；512局零击杀，不能声称策略已收敛或已学会Monstro。
+
+### 0.5 Rust 基础手感：原版对照已通过（2026-09-21）
+
+用户确认 Linux 训练机为3080 Ti / 96 GB；本轮不部署服务器、不开始100K局训练，先校准 **Isaac / 无额外道具 / 普通俯视空房**。原版仍是量具和策略迁移验收端，不再重复旧 `isaac_room` 玩具规则。
+
+**本轮修复**（核心在 `sim/src`，没有修改原版EXE或已安装Mod）：
+
+1. `World::step` 补上奇数 Manager tick 的真实玩家运动更新。原版玩家60 Hz积分、移动，眼泪/武器冷却/逻辑计时30 Hz；不是把速度简单乘二。`interpolate_players` / `step_logic` 也供可操作预览逐60 Hz采样。
+2. `resolve_grid_collision` 的玩家分支：转身离墙时仍推出既有重叠，只有速度反射以朝墙为条件。旧代码提前返回导致约0.527单位的位置残差。
+3. `PlayerStats::tear_flags=0`，删除“普通眼泪默认内部位114”的错误推断；`falling_speed_from_range` 移植 EvaluateItems 末尾 XMM 参数调用（RVA 0x00370564 → 0x0027DA40）。基础射程260实际得到 `TearFallingSpeed=-0.1833734512`，不是中途赋的0。
+4. 普通俯视房间下落只改 Height；原先错误加入的屏幕Y向重力只属于 type16侧视房间（RVA 0x003EA190）。补齐左右眼交替的随机垂直偏移，以及眼泪死亡帧的最后一次积分与下一帧移除。
+5. 速度继承仍为 **1.2×移动更新前的速度快照**，去掉射向反方向分量；不是1.2×当前帧结束速度。首帧向上走、向右射的原版眼泪速度为 `(10,-0.6338454485)`。
+
+**原版验收**：`runs/l2/20260921-player-alignment/{calibration2,heldout2}`。独立隔离进程、原版时钟、每次推进1逻辑帧；房间移除门后恢复整圈墙，等待清房奖励生成并移除（包括可能的 troll bomb），再初始化玩家。不留下隐藏Boss充当占位物。每组断言房间不变、生命6、无其他实体、边界碰撞类一致。特权诊断只注入隔离runtime副本，不进入策略观测。
+
+| 验收 | 校准集 | 独立留出集 |
+|---|---:|---:|
+| 输入序列 / 逻辑帧 | 7 / 644 | 46 / 6776 |
+| 原版眼泪数 / 轨迹点 | 26 / 493 | 595 / 10977 |
+| 玩家位置最大误差，游戏单位 | 0.00003081 | 0.00003049 |
+| 玩家速度最大误差 | 2.37e-7 | 2.38e-7 |
+| 出生眼泪速度最大误差 | 3.30e-7 | 4.80e-7 |
+| 眼泪飞行位置最大误差 | 0.00002951 | 0.00003252 |
+| 开火时机 / 死亡标记 / 移除时机不一致 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+留出输入覆盖9种移动×4种射击、短促点按、斜向变向、反向急停、四侧贴墙、连续随机动作段、四向长射程。误差门槛在验证脚本中固定：位置0.001、速度/高度/冷却1e-5。29项Rust测试通过。
+
+随机性明确分开：玩家和出生速度从输入开环回放；左右眼出生偏移与初始下落速度验证原版公式及取值范围。眼泪的后续轨迹从**一次原版出生状态**初始化，之后不再校正；由此验证飞行/下落/死亡，而不是声称两个不同随机流逐发位置完全相等。留出集208次静止发射的眼位系数在0.30011–0.49656，均值0.40074（规则为0.3–0.5）；595个下落随机量均在0–1。Rust保留确定性xorshift，未克隆整个原版全局RNG流。
+
+**复现与手测**：
+
+- `sim/tools/collect_native_motion.py --out <新的runs目录> --suite calibration|heldout`：使用现有bridge Python环境采原版；完整stdout/stderr及退出状态留在runs。
+- `sim/tests/fixtures/j460_motion_{calibration,heldout}.jsonl.gz`：压缩原版真值，不含资源图片、存档或个人配置。
+- `python sim/tools/verify_native_motion.py sim/tests/fixtures/j460_motion_heldout.jsonl.gz --exe sim/target/release/examples/motion_trace.exe --report runs/motion-verification.json`：无需启动原版即可重新验收；先 `cargo build --release --manifest-path sim/Cargo.toml --example motion_trace`。
+- Windows `pwsh -File sim/play_motion.ps1`：Rust动力学 + pygame展示，读取仓库已解包的原版玩家/眼泪ANM2与图片；WASD移动、方向键射击、R复位、F1碰撞圈、Esc退出。`-Smoke` 已实际执行240个60 Hz tick，Rust退出0。原图带旧sRGB profile，libpng报告3条警告，不影响加载；没有重写原图。
+
+当前可以交给用户比较**移动/射击手感**；预览的身体动画相位和背景拼接是展示近似，不是原版渲染器。尚未因此证明 Monstro、伤害击退、道具组合、侧视房间或策略迁移达标。下一步应先做 Monstro 动作/弹幕同级校准，再接现有观察/奖励契约，随后测试Linux128并行与100K+局。
+
+旧静态笔记 `analysis/docs/J460_PLAYER_TEAR_MODEL.md` 中“fall=0、默认位114、普遍Y向下坠、30Hz玩家移动”的推断，以本节和原版fixture纠正。早期采样中的邻房、隐藏NPC碰撞、延迟清房炸弹数据均保留在runs，但不属于验收集。
 
 ## 1. 证据基线（2026-09-19 核实）
 

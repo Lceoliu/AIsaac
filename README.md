@@ -1,6 +1,8 @@
 # Isaac RL 训练场
 
-更新：2026-09-20。**当前主线是原版 J460 训练 worker**：Lua 同步桥接 → Gymnasium → SB3 PPO，已在真实游戏中完成采样、参数更新和模型重载。训练默认跳过渲染但不改变逻辑时钟，另保留可视化验收。L2 独立模拟器保留为课程子集与校准研究，不再作为接入原引擎训练的前置条件。旧自编规则原型 `isaac_room/` 已否定，只作历史记录。正式命令与详细验收见 [bridge/README.md](bridge/README.md)，设计见 [ENV_ARCHITECTURE.md](docs/ENV_ARCHITECTURE.md)。
+更新：2026-09-21。**原版四引擎累计512局训练已完成，但零清房；当前先对齐 Rust 基础手感，再推进独立模拟器的大规模训练。** 原版训练与可视化验收保留，不修改已有 Transformer + 地图CNN方案。Rust基础Isaac已通过原版644帧校准和6776帧留出对照；这不等于Monstro战斗或sim2real迁移已通过。旧 `isaac_room/` 已否定，只作历史记录。详细结果与边界见 [ENV_ARCHITECTURE.md §0.5](docs/ENV_ARCHITECTURE.md#05-rust-基础手感原版对照已通过2026-09-21)。
+
+**手感测试：** `pwsh -File sim/play_motion.ps1`，WASD移动、方向键射击、R复位、F1显示碰撞圈。展示使用已有解包原图，动力学走同一Rust内核。
 
 ## 目标
 
@@ -11,10 +13,10 @@
 | 项 | 状态 | 位置 |
 |---|---|---|
 | 原版桥接与单房间课程 | 实机通过；Isaac / 无道具 / Monstro / 固定空房。首次建入口快照，此后 rewind + 本地 Boss 模板，实测重置约0.27秒 | [bridge/](bridge/README.md) |
-| Gymnasium / PPO v2 | 单 worker、CPU、4逻辑帧/动作、双层64单元 MLP；22项测试通过，512步实机 PPO 更新/存取档/重载动作通过，终局仍全部死亡 | [训练入口](bridge/python/train_monstro.py) |
-| 奖励与观测 | 用户确认受伤−1、扣血命中+0.05、实际伤害/敌人初始MaxHP、清房+1、死亡不重复扣分；地形5×9×15已进策略，敌弹标记已修复 | [契约与边界](docs/ENV_ARCHITECTURE.md#02-当前训练实现与下一阶段2026-09-20覆盖前文的历史优先级) |
-| 渲染控制与稳定性 | 无渲染20回合历史验收和新版3回合验收通过；虚拟时钟关闭；不是独立无窗口引擎。三类原生崩溃的机制、调用链与修复方案已成文：A 字体 shader 栈下溢（入栈失败、注册表完好）、B 启动期归档挂载逐条目 `fopen` 失败、C 退出时 NVIDIA 驱动内跳转；探针与缓解已有代码并通过离线构建；覆盖与实机有效性仍待验收 | [崩溃根因分析](docs/NATIVE_CRASH_ANALYSIS.md)、[L1 验收](docs/L1_FEASIBILITY_PLAN.md) |
-| L2 独立模拟器（保留研究） | Rust Gaper/Gusher/Pacer、移动/眼泪/碰撞等子集，历史24项单测通过；未完成原版轨迹校准，不代表全游戏引擎 | [sim/](sim/)、[机制分析](../analysis/docs/J460_NPC_MOVEMENT_MODEL.md) |
+| Gymnasium / PPO策略 | 地图CNN、实体注意力、64帧时序Transformer；2/4原版引擎共用模型训练已跑通，累计512局全部死亡 | [并行训练入口](bridge/python/train_parallel.py)、[实测](docs/ENV_ARCHITECTURE.md#04-独立引擎并行采样2026-09-21) |
+| 奖励与观测 | 受伤−1、扣血命中+0.05、实际伤害/敌人初始MaxHP、清房+1、死亡不重复扣分；当前模型地图7通道，可见实体含敌弹 | [契约与边界](docs/ENV_ARCHITECTURE.md#03-transformer-战斗策略-v12026-09-21) |
+| 渲染控制与稳定性 | 保留原版无渲染训练和可视化模式，虚拟时钟关闭；本轮两个正式校准采样进程均正常退出0。历史崩溃修复及边界见专项文档 | [崩溃根因分析](docs/NATIVE_CRASH_ANALYSIS.md)、[L1 验收](docs/L1_FEASIBILITY_PLAN.md) |
+| L2 独立模拟器 | 基础Isaac移动/射击已通过原版轨迹验收，29项Rust测试；NPC/完整战斗未完成同级校准 | [sim/](sim/)、[最新验收](docs/ENV_ARCHITECTURE.md#05-rust-基础手感原版对照已通过2026-09-21) |
 | 相关项目调研 | 已含 Isaac 专项项目的实测数据；2026-09-20 新增 SC2/Dota/SoulsGym/EnvPool/Isaac-RL 的引擎适配做法调研（逐条附 URL）与本项目的训练场差距清单和实施顺序 | [RELATED_WORK.md](docs/RELATED_WORK.md)、[训练场设计](docs/TRAINING_ARENA_DESIGN.md)、[调研笔记](docs/ARENA_RESEARCH_NOTES.md) |
 | 旧 v0 原型 | 已否定；代码与自测记录保留 | [SINGLE_ROOM_V0.md](docs/SINGLE_ROOM_V0.md)、`isaac_room/` |
 

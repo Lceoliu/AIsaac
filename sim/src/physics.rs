@@ -312,10 +312,12 @@ pub fn resolve_grid_collision(e: &mut Entity, room: &Room, interp: bool) {
     }
     // into = -(n·vel)：为负表示正在往墙里走
     let into = (-n.x) * e.vel.x - e.vel.y * n.y;
-    if into >= 0.0 {
+    if into >= 0.0 && !player {
         return;
     }
-    if !interp {
+    // PlayerCollideWithGrid still pushes an overlapping player out when the
+    // new input points away from the wall; only reflection is conditional.
+    if !interp && into < 0.0 {
         e.grid_hit_velocity = e.vel;
         e.collides_with_grid = true;
         // NPC：into·1.8 − 0.1（DAT_00baa5b4/DAT_00baa120）；玩家：into·0.9 − 0.1（DAT_00baa3e0）
