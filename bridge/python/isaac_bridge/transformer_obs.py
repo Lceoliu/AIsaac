@@ -12,7 +12,7 @@ from gymnasium import spaces
 
 from .monstro_gym import MonstroGymEnv
 
-SCHEMA = 'monstro-transformer-v1'
+SCHEMA = 'monstro-transformer-v2'
 HISTORY = 64
 ENTITY_CAPACITY = 256
 ANIMATION_BYTES = 32
@@ -23,7 +23,24 @@ PLAYER_FIELDS = ('x', 'y', 'vx', 'vy', 'motion_valid', 'size', 'hearts', 'max_he
 ENTITY_FIELDS = ('dx', 'dy', 'vx', 'vy', 'motion_valid', 'size', 'size_x', 'size_y',
                  'height', 'scale', 'collision', 'grid_collision', 'damage', 'enemy',
                  'boss', 'boss_hp', 'has_boss_hp', 'animation_frame', 'flip',
-                 'end_dx', 'end_dy', 'angle_sin', 'angle_cos', 'laser_length', 'ring_radius', 'circle')
+                 'end_dx', 'end_dy', 'angle_sin', 'angle_cos', 'laser_length', 'ring_radius', 'circle',
+                 'airborne', 'body_visible', 'shadow_dx', 'shadow_dy', 'shadow_valid')
+
+
+def monstro_visual(entity, player_pos, width, height):
+    """Features derived from *current* ANM2 only; never NPC.State/TargetPosition.
+
+    The Monstro shadow layer has (0,0) offset at every frame. Ground Position
+    is therefore the visible shadow position, including while the body is offscreen.
+    """
+    if (entity['type'], entity['variant']) != (20, 0):
+        return [0, 1, 0, 0, 0]
+    anim, frame = entity['anim'], entity['aframe']
+    airborne = ((anim == 'Walk' and 7 <= frame < 23) or
+                (anim == 'JumpUp' and frame >= 10) or (anim == 'JumpDown' and frame < 33))
+    body = not ((anim == 'JumpUp' and frame >= 11) or (anim == 'JumpDown' and frame < 29))
+    x,y = entity['pos']
+    return [airborne, body, (x-player_pos[0])/width, (y-player_pos[1])/height, 1]
 
 
 def animation_bytes(name):
@@ -139,6 +156,7 @@ class VisibleHistory:
                     math.hypot(dx, dy)/width if laser else 0,
                     laser['radius']/width if laser and laser['circle'] else 0,
                     bool(laser and laser['circle'])]
+                row.extend(monstro_visual(e,p['pos'],width,height))
                 rows.append((row, (e['type'], e['variant'], e['subtype']), animation_bytes(e['anim'])))
         if len(rows) > self.capacity:
             raise ValueError(f'Visible entity/laser segment overflow: {len(rows)} > {self.capacity}; increase capacity, never truncate')

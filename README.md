@@ -1,8 +1,10 @@
 # Isaac RL 训练场
 
-更新：2026-09-21。**原版四引擎累计512局训练已完成，但零清房；当前先对齐 Rust 基础手感，再推进独立模拟器的大规模训练。** 原版训练与可视化验收保留，不修改已有 Transformer + 地图CNN方案。Rust基础Isaac已通过原版644帧校准和6776帧留出对照；这不等于Monstro战斗或sim2real迁移已通过。旧 `isaac_room/` 已否定，只作历史记录。详细结果与边界见 [ENV_ARCHITECTURE.md §0.5](docs/ENV_ARCHITECTURE.md#05-rust-基础手感原版对照已通过2026-09-21)。
+更新：2026-09-21。**原版四引擎累计512局训练已完成，但零清房；Rust 基础手感已对齐，Monstro 基本行为已接入，下一步准备批量训练接口。** 原版训练与可视化验收保留，不修改已有 Transformer + 地图CNN方案。Rust基础Isaac已通过原版644帧校准和6776帧留出对照；Monstro 条件运动、弹道及高度碰撞对照见下文，尚无新策略的sim2real迁移成绩。旧 `isaac_room/` 已否定，只作历史记录。详细结果与边界见 [ENV_ARCHITECTURE.md §0.5](docs/ENV_ARCHITECTURE.md#05-rust-基础手感原版对照已通过2026-09-21)。
 
 **手感测试：** `pwsh -File sim/play_motion.ps1`，WASD移动、方向键射击、R复位、F1显示碰撞圈。展示使用已有解包原图，动力学走同一Rust内核。
+
+**Monstro 已接入（2026-09-21）：** `pwsh -File sim/play_motion.ps1 -Monstro -Seed 42`。普通 Monstro 的接近小跳、高跳锁定格子、落地环射、Taunt 前摇扇形喷弹及弹幕高度碰撞已实现；同 seed + 同输入可复现。原版 2,700 帧动作轨迹和额外高度碰撞探针已采集。观测走现有 CNN + Transformer，详见 [§0.6](docs/ENV_ARCHITECTURE.md#06-monstro-接入与可见观测2026-09-21)。尚未开始 Linux 128 并行或新策略训练。
 
 ## 目标
 
@@ -16,7 +18,7 @@
 | Gymnasium / PPO策略 | 地图CNN、实体注意力、64帧时序Transformer；2/4原版引擎共用模型训练已跑通，累计512局全部死亡 | [并行训练入口](bridge/python/train_parallel.py)、[实测](docs/ENV_ARCHITECTURE.md#04-独立引擎并行采样2026-09-21) |
 | 奖励与观测 | 受伤−1、扣血命中+0.05、实际伤害/敌人初始MaxHP、清房+1、死亡不重复扣分；当前模型地图7通道，可见实体含敌弹 | [契约与边界](docs/ENV_ARCHITECTURE.md#03-transformer-战斗策略-v12026-09-21) |
 | 渲染控制与稳定性 | 保留原版无渲染训练和可视化模式，虚拟时钟关闭；本轮两个正式校准采样进程均正常退出0。历史崩溃修复及边界见专项文档 | [崩溃根因分析](docs/NATIVE_CRASH_ANALYSIS.md)、[L1 验收](docs/L1_FEASIBILITY_PLAN.md) |
-| L2 独立模拟器 | 基础Isaac移动/射击已通过原版轨迹验收，29项Rust测试；NPC/完整战斗未完成同级校准 | [sim/](sim/)、[最新验收](docs/ENV_ARCHITECTURE.md#05-rust-基础手感原版对照已通过2026-09-21) |
+| L2 独立模拟器 | 基础Isaac已通过原版轨迹验收；Monstro运动、弹道及高度碰撞对照通过，共38项Rust测试；完整战斗迁移尚未验收 | [sim/](sim/)、[最新验收](docs/ENV_ARCHITECTURE.md#06-monstro-接入与可见观测2026-09-21) |
 | 相关项目调研 | 已含 Isaac 专项项目的实测数据；2026-09-20 新增 SC2/Dota/SoulsGym/EnvPool/Isaac-RL 的引擎适配做法调研（逐条附 URL）与本项目的训练场差距清单和实施顺序 | [RELATED_WORK.md](docs/RELATED_WORK.md)、[训练场设计](docs/TRAINING_ARENA_DESIGN.md)、[调研笔记](docs/ARENA_RESEARCH_NOTES.md) |
 | 旧 v0 原型 | 已否定；代码与自测记录保留 | [SINGLE_ROOM_V0.md](docs/SINGLE_ROOM_V0.md)、`isaac_room/` |
 
@@ -42,9 +44,9 @@ python .\rl\bridge\python\test_turbo_control.py  # Python 端共享内存双向�
 
 ## 下一步
 
-1. 按 [崩溃根因分析 §5](docs/NATIVE_CRASH_ANALYSIS.md) 的顺序先核对已有探针覆盖/错误码保真，再做冷启动循环和可视化回归；不把跳过渲染称为修复。
-2. 同进程50回合 rewind 耐久，检查每局状态、伤害奖励账目和精确逻辑帧，再扩大训练预算。
-3. 独立可视化留出验收；后续再补运动历史、危险区域、伤害来源归因与多实例隔离。
+1. 用户验收 Rust Monstro 战斗；保留原版作为对照量具。
+2. 将当前 Rust 观测适配器扩展为无 JSON/子进程开销的批量训练接口，接入既定奖励和 120 秒单局上限，再测试 Linux 128 并行。
+3. 用独立种子评估原版迁移；不把模拟器胜率当作原版通关成绩。
 
 ## 复用边界
 

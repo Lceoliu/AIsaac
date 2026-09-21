@@ -44,6 +44,19 @@ def tensors(obs):
 
 
 class TransformerObservationTest(unittest.TestCase):
+    def test_monstro_shadow_and_animation_are_visible_not_future_target(self):
+        from isaac_bridge.transformer_obs import monstro_visual
+        e=dict(type=20,variant=0,anim='JumpDown',aframe=15,pos=[300,240],
+               state=7,target=[500,400],rng=123)
+        visible=monstro_visual(e,[200,200],520,280)
+        self.assertEqual(visible[:2],[True,False])
+        self.assertAlmostEqual(visible[2],100/520)
+        self.assertAlmostEqual(visible[3],40/280)
+        e.update(state=8,target=[0,0],rng=987)
+        self.assertEqual(monstro_visual(e,[200,200],520,280),visible)
+        e['aframe']=34
+        self.assertEqual(monstro_visual(e,[200,200],520,280)[:2],[False,True])
+
     def test_schema_required_and_no_overflow_truncation(self):
         old = RecordedBridge().original
         with self.assertRaisesRegex(ValueError, 'combat_schema'):

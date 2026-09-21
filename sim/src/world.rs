@@ -23,6 +23,13 @@ use crate::tear;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    /// Internal spawn request; never an actor observation (contains current aim).
+    BossVolley {
+        from: u32,
+        pos: Vec2,
+        target: Vec2,
+        count: usize,
+    },
     /// Gusher 请求发射血弹（弹幕实体尚未实现）。
     FireProjectiles { from: u32, pos: Vec2, vel: Vec2 },
     /// NPC 死亡并被移除。
@@ -98,6 +105,10 @@ impl World {
         self.spawn(Entity::new_player(0, pos))
     }
 
+    pub fn spawn_monstro(&mut self, pos: Vec2) -> u32 {
+        self.spawn(Entity::new_monstro(0, pos))
+    }
+
     /// 兼容旧名。
     pub fn spawn_player_stub(&mut self, pos: Vec2) -> u32 {
         self.spawn_player(pos)
@@ -154,7 +165,8 @@ impl World {
 
     /// Even manager tick. Call after interpolate_players, or use step() for RL.
     pub fn step_logic(&mut self) {
-        let player_pos = self.first_player_pos();
+        self.events.clear();
+        let mut player_pos = self.first_player_pos();
         let frame = self.frame;
 
         // 1. PreUpdate
@@ -181,9 +193,28 @@ impl World {
                     &mut events,
                 ),
                 EntityKind::Player => {
-                    player::update_player(e, &mut self.rng, &mut events, &mut spawned)
+                    player::update_player(e, &mut self.rng, &mut events, &mut spawned);
+                    player_pos = e.pos;
                 }
                 EntityKind::Tear => tear::update(e),
+                EntityKind::Projectile => crate::projectile::update(e),
+            }
+        }
+        for event in &events {
+            if let Event::BossVolley {
+                from,
+                pos,
+                target,
+                count,
+            } = event
+            {
+                spawned.extend(crate::projectile::boss_volley(
+                    *pos,
+                    *target,
+                    *count,
+                    *from,
+                    &mut self.rng,
+                ));
             }
         }
         // 本帧发射的眼泪加入实体表（TearFired 事件里的 id 在此分配前为 0，这里回填）
@@ -222,6 +253,12 @@ impl World {
                     (EntityKind::Player, EntityKind::Npc) => npc_vs_player(b, a, &mut events),
                     (EntityKind::Tear, EntityKind::Npc) => tear_vs_npc(a, b, &mut events),
                     (EntityKind::Npc, EntityKind::Tear) => tear_vs_npc(b, a, &mut events),
+                    (EntityKind::Projectile, EntityKind::Player) => {
+                        projectile_vs_player(a, b, &mut events)
+                    }
+                    (EntityKind::Player, EntityKind::Projectile) => {
+                        projectile_vs_player(b, a, &mut events)
+                    }
                     _ => {}
                 }
             }
@@ -256,6 +293,9 @@ impl World {
 /// NPC–玩家：圆形推挤（FUN_006b2940）+ `Entity_NPC::HandleCollision` 第 1094–1099 行的接触伤害
 /// `player->TakeDamage(collisionDamage, 0, 0, source, 30)`。
 fn npc_vs_player(npc_e: &mut Entity, player_e: &mut Entity, events: &mut Vec<Event>) {
+    if npc_e.entity_collision_class == 0 {
+        return;
+    }
     if !physics::circle_push(npc_e, player_e) {
         return;
     }
@@ -271,7 +311,7 @@ fn npc_vs_player(npc_e: &mut Entity, player_e: &mut Entity, events: &mut Vec<Eve
 
 /// 眼泪–NPC：圆形重叠即命中（`Entity_Tear::HandleCollision`），眼泪不与发射者碰撞。
 fn tear_vs_npc(tear_e: &mut Entity, npc_e: &mut Entity, events: &mut Vec<Event>) {
-    if tear_e.dead || npc_e.dead {
+    if tear_e.dead || npc_e.dead || npc_e.entity_collision_class == 0 {
         return;
     }
     let d = npc_e.pos - tear_e.pos;
@@ -280,6 +320,16 @@ fn tear_vs_npc(tear_e: &mut Entity, npc_e: &mut Entity, events: &mut Vec<Event>)
         return;
     }
     tear::on_hit_npc(tear_e, npc_e, events);
+}
+
+fn projectile_vs_player(shot: &mut Entity, player: &mut Entity, events: &mut Vec<Event>) {
+    if shot.dead || shot.entity_collision_class == 0 {
+        return;
+    }
+    if (shot.pos - player.pos).length_sq() < (shot.size + player.size).powi(2) {
+        shot.dead = true;
+        crate::player::take_damage(player, 1.0, Some(shot.id), events);
+    }
 }
 
 #[cfg(test)]

@@ -56,17 +56,23 @@ pub const TYPE_PLAYER: i32 = 1;
 pub const TYPE_TEAR: i32 = 2;
 pub const TYPE_GAPER: i32 = 10;
 pub const TYPE_GUSHER: i32 = 11;
+pub const TYPE_MONSTRO: i32 = 20;
+pub const TYPE_PROJECTILE: i32 = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntityKind {
     Player,
     Npc,
     Tear,
+    Projectile,
 }
 
 /// `Entity_NPC` 专有字段。
 #[derive(Clone, Debug)]
 pub struct NpcState {
+    /// AI-only locked destination. Never included in actor observations.
+    pub target_pos: Vec2,
+    pub anim_finished: bool,
     /// +0xb64 `State`（1 = 出现中，4 = 常规行动，0x11/0x12 = 死亡动画）。
     pub state: i32,
     /// +0x410 `StateFrame`。
@@ -107,6 +113,8 @@ pub struct NpcState {
 impl Default for NpcState {
     fn default() -> Self {
         NpcState {
+            target_pos: Vec2::ZERO,
+            anim_finished: false,
             state: 1, // Entity_NPC::Init（RVA 0x002B8B20）第 77 行
             state_frame: 0,
             saved_state: 0,
@@ -209,6 +217,7 @@ pub struct Entity {
     pub npc: Option<NpcState>,
     pub player: Option<PlayerState>,
     pub tear: Option<TearState>,
+    pub projectile: Option<crate::projectile::ProjectileState>,
 }
 
 impl Entity {
@@ -275,6 +284,7 @@ impl Entity {
             npc: None,
             player: None,
             tear: None,
+            projectile: None,
         }
     }
 
@@ -307,6 +317,23 @@ impl Entity {
         e.hp = 6.0;
         crate::physics::set_size(&mut e, 10.0, Vec2::new(1.0, 1.0), 40);
         e.player = Some(PlayerState::default());
+        e
+    }
+
+    /// Normal, non-champion Monstro (20.0): entities2.xml and native scenario HP 250.
+    pub fn new_monstro(id: u32, pos: Vec2) -> Entity {
+        let mut e = Entity::base(id, EntityKind::Npc, TYPE_MONSTRO, 0, 0, pos);
+        e.hp = 250.0;
+        e.max_hp = 250.0;
+        e.mass = 50.0;
+        e.mass2 = 50.0;
+        e.collision_damage = 1.0;
+        crate::physics::set_size(&mut e, 40.0, Vec2::new(1.0, 1.0), 12);
+        e.npc = Some(NpcState {
+            state: 1,
+            anim: "Appear",
+            ..NpcState::default()
+        });
         e
     }
 

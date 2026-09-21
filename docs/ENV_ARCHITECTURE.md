@@ -160,6 +160,37 @@
 
 旧静态笔记 `analysis/docs/J460_PLAYER_TEAR_MODEL.md` 中“fall=0、默认位114、普遍Y向下坠、30Hz玩家移动”的推断，以本节和原版fixture纠正。早期采样中的邻房、隐藏NPC碰撞、延迟清房炸弹数据均保留在runs，但不属于验收集。
 
+### 0.6 Monstro 接入与可见观测（2026-09-21）
+
+当前实现正常 **20.0 Monstro**，Isaac 无额外道具、空 15×9 房间。没有替换已对齐的玩家/眼泪动力学；本次原版场景实际 HP=250，不沿用历史某些 rewind 实验中的 312.5。Monstro II、冠军、Monstro's Tooth 的 I1=2 特殊出生不属于此实现。
+
+**已实现的行为**（`sim/src/npc/monstro.rs`）：
+
+| 动作 | 原版规则和本次实现 |
+|---|---|
+| 接近小跳 Walk | 锁定玩家格中心；落地前速度递推 `v'=0.81v+1.08 normalize(target-pos)`，着地后 `v'=0.72v`。Jump 事件帧6、Land帧22；MC_POST_UPDATE 观测对应帧7开始无碰撞、帧23恢复。|
+| 高跳 JumpUp → JumpDown | JumpUp 事件帧10之后切 JumpDown，第一次 JumpDown AI 更新才读取一次当前玩家位置，锁定其格中心。正常 Boss 不使用速度预测、不持续重新锁定、也不瞬移；腾空时 `v'=0.9v+0.006(target-pos)+0.3 normalize(target-pos)`，阴影随实际平面位置移动。JumpDown Land帧32恢复碰撞，Shoot帧34向四周喷18发。最终落地受运动过程、墙和实体推挤影响，不保证精确踩在目标点。|
+| Taunt 喷弹 | 66帧动画，Shoot事件帧21（0.7秒前摇）向当时玩家方向喷13发。不是平均角度排列的扇形：`velocity=7*aim_unit + 3.5*u*(cos θ,sin θ)`，`θ=2*3.14*u`、半径u均匀。普通 Monstro 原版 `FireBossProjectiles` RVA=0x002CCDD0。|
+| 弹幕高度 | 出生高度−23；初始下落速度 `5−24u`，加速度0.32；每30Hz tick `fall'=0.9fall+0.1+0.32`、`height+=fall'`，XY速度不掺高度。height<−50关闭实体碰撞，越过−5当帧落地死亡，下帧移除。高度轴约定亦见 [Lua API](https://wofsauge.github.io/IsaacDocs/rep/EntityProjectile.html)。|
+
+`world::tear_vs_npc` 和接触伤害现在尊重 Monstro 的碰撞关闭，腾空不能被眼泪击中；血弹通过同一高度判定伤害玩家。修复了原有 `World.events` 跨帧保留会重复处理新增喷弹请求的问题（回归测试先暴露了运行不结束，修复后种子重放测试完成）。
+
+**动画不是猜时长**：使用 Afterbirth+ 覆盖资源 `020.000_monstro.anm2` 的 Jump/Land/Shoot 事件，不能用缺少这些事件的基础 animations.b 版本。已将当前正确资源放在分析区 `resources/animations-a/anm2/`，原图与原版资源不提交到 RL Git。非循环动画末帧保留一次再结束，与原版 `GetFrame()/IsFinished()` 对齐。查看器读取原版身体、阴影、血弹图片和 ANM2；背景、玩家身体相位与弹丸美术尺寸分档仍属展示层，不是原版渲染器。
+
+**证据和可复现入口**：
+
+- `sim/tools/collect_native_monstro.py --out <新的runs目录>`：隔离的原引擎 worker，stationary/moving/retarget 各900帧；仅给玩家受伤免疫以避免采样提前死亡，不改 Monstro AI。完整状态在 info，隐藏字段不进入 actor。
+- `--suite collision`：另一个原引擎采低空、头顶、落地3个探针。低空重叠 HP 6→5；高空重叠6帧 HP仍6；−5→−4.9当帧死亡、下一帧移除。两个 worker 均实际退出0。
+- `sim/tests/fixtures/j460_monstro.jsonl.gz`：2,700帧紧凑真值。`verify_native_monstro.py` 检查19次非接触锁定、793帧锁定保持、928帧小跳碰撞、793帧高跳碰撞、23次原版喷弹；353个无墙/实体接触干扰的条件单步运动样本误差≤0.0000152；4,631个原版出生状态起始的开环血弹轨迹点误差≤0.0000305。条件单步不是整场逐帧完全复刻；墙边落地/互相推挤未做同等级误差校准。
+- `sim/tests/monstro.rs`：种子重放、不同种子改变动作、目标一次锁定、小跳无敌、前摇事件、末帧停留、低空命中/高空越顶、落地删除、喷弹公式与不重复喷弹。连同旧测试共38项。
+- 重跑：先构建 `sim/examples/motion_trace.rs`，再 `python sim/tools/verify_native_monstro.py sim/tests/fixtures/j460_monstro.jsonl.gz --exe sim/target/release/examples/motion_trace.exe --report runs/monstro-laws.json`。
+
+**Agent 实际输入**：沿用动画名/帧号、实体平面位置/运动历史、碰撞圈、Boss可见血条、弹丸height、CNN地形；新增 `airborne/body_visible/shadow_dx/shadow_dy/shadow_valid`。它们只由当前可见 ANM2 和当前位置计算：高跳出画时仍有阴影，当前阴影不等于隐藏目标点。没有 NPC.State、TargetPosition、后续动作或 RNG。`monstro-transformer-v2` 每实体31维（原26维），旧v1 checkpoint不能直接加载，需显式迁移权重或重训。
+
+`bridge/python/isaac_bridge/sim_obs.py::rust_visible_observation` 将同一 Rust 可玩内核的快照转成既有可见观测契约；`test_sim_obs.py` 用真实 Rust 进程连续1,000帧观测，验证全部四种动作和血弹、隐藏字段污染不改变输入，最后执行现有 CombatTransformer 前向。此接口限定当前空房、基础 Isaac；炸弹/主动道具被禁用，玩家动画特征暂置空，不凭空产生看不见的数据。它不是128 worker训练后端，本次没有新增训练成绩。
+
+手测：`pwsh -File sim/play_motion.ps1 -Monstro -Seed 42`。WASD、方向键、R按同种子重开、F1碰撞圈、Esc退出；死亡/击杀后停止推进。指定另一 seed 改变模拟器动作选择和散射；相同 seed **和输入序列**可复现，不追求与原引擎全局RNG逐位相同。
+
 ## 1. 证据基线（2026-09-19 核实）
 
 | 主题 | 事实 | 证据 |

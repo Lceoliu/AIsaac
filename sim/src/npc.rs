@@ -13,6 +13,7 @@
 
 pub mod gaper;
 pub mod gusher;
+pub mod monstro;
 
 use crate::entity::{flags, Entity, EntityKind, TYPE_GAPER, TYPE_GUSHER};
 use crate::physics;
@@ -131,6 +132,7 @@ pub fn run_ai(
     match e.etype {
         TYPE_GAPER => gaper::update(e, room, player_pos, game_frame, rng),
         TYPE_GUSHER => gusher::update(e, room, game_frame, rng, events),
+        crate::entity::TYPE_MONSTRO => monstro::update(e, room, player_pos, rng, events),
         _ => {}
     }
 }

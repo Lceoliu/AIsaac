@@ -10,7 +10,8 @@
 //! 玩家移动/射击输入/开火节奏/眼泪参数/无敌帧、眼泪飞行/下落/落地/撞墙/命中与推挤、NPC 对玩家的接触伤害、
 //! EntityList 的更新顺序。
 //!
-//! 尚未翻译（占位或事件）：敌人弹幕实体、状态效果的施加、精灵动画（只保留可见动画名/帧号的近似）、
+//! 正常 Monstro 20.0 与其血弹已接入（原版条件运动/弹道及可见事件对照见 ENV_ARCHITECTURE §0.6）。
+//! 尚未翻译（占位或事件）：其他敌人弹幕、状态效果的施加、其他精灵动画、
 //! 道具/饰品效果、跨房。2026-09-21：基础 Isaac 的移动、射击与空房眼泪轨迹已通过
 //! J460 原版校准及独立留出测试（sim/tests/fixtures）；NPC/伤害/击退仍未完成此级别验收。
 
@@ -20,6 +21,7 @@ pub mod npc;
 pub mod pathfinder;
 pub mod physics;
 pub mod player;
+pub mod projectile;
 pub mod rng;
 pub mod room;
 pub mod tear;

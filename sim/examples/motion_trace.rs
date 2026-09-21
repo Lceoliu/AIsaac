@@ -28,6 +28,45 @@ fn main() {
                 fields[2].parse().unwrap(),
             ));
             world.entity_mut(player).unwrap().player_mut().fire_delay = fields[3].parse().unwrap();
+        } else if fields[0] == "monstro" {
+            world = World::new(Room::new_rectangular(15, 9), fields[1].parse().unwrap());
+            player = world.spawn_player(Vec2::new(320.0, 380.0));
+            world.spawn_monstro(Vec2::new(320.0, 220.0));
+        } else if fields[0] == "boss" {
+            let v: Vec<f32> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
+            world = World::new(Room::new_rectangular(15, 9), 42);
+            player = world.spawn_player(Vec2::new(v[8], v[9]));
+            let id = world.spawn_monstro(Vec2::new(v[2], v[3]));
+            let b = world.entity_mut(id).unwrap();
+            b.vel = Vec2::new(v[4], v[5]);
+            b.npc_mut().state = v[0] as i32;
+            b.npc_mut().anim_frame = v[1] as i32;
+            b.npc_mut().target_pos = Vec2::new(v[6], v[7]);
+            b.npc_mut().anim = match v[0] as i32 {
+                4 => "Walk",
+                6 => "JumpUp",
+                7 => "JumpDown",
+                8 => "Taunt",
+                _ => "Appear",
+            };
+        } else if fields[0] == "projectile" {
+            let v: Vec<f32> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
+            world = World::new(Room::new_rectangular(15, 9), 42);
+            player = world.spawn_player(Vec2::new(80.0, 160.0));
+            if v.len() == 10 {
+                world.entity_mut(player).unwrap().pos = Vec2::new(v[8], v[9]);
+            }
+            let mut p = isaac_sim::projectile::new(
+                Vec2::new(v[0], v[1]),
+                Vec2::new(v[2], v[3]),
+                v[5],
+                1.0,
+                0,
+            );
+            p.projectile.as_mut().unwrap().height = v[4];
+            p.projectile.as_mut().unwrap().falling_accel = v[6];
+            p.dead = v[7] != 0.0;
+            world.spawn(p);
         } else if fields[0] == "tear" {
             world = World::new(Room::new_rectangular(15, 9), 42);
             player = world.spawn_player(Vec2::new(320.0, 280.0));
@@ -78,7 +117,25 @@ fn main() {
             .iter()
             .filter(|e| e.kind == EntityKind::Tear && e.exists)
         {
-            print!("{}{{\"id\":{},\"pos\":[{},{}],\"vel\":[{},{}],\"height\":{},\"fall\":{},\"dead\":{}}}",sep,t.id,t.pos.x,t.pos.y,t.vel.x,t.vel.y,t.tear().height,t.tear().falling_speed,t.dead);
+            print!("{}{{\"id\":{},\"age\":{},\"pos\":[{},{}],\"vel\":[{},{}],\"height\":{},\"fall\":{},\"size\":{},\"scale\":{},\"dead\":{}}}",sep,t.id,t.time_cur,t.pos.x,t.pos.y,t.vel.x,t.vel.y,t.tear().height,t.tear().falling_speed,t.size,t.tear().scale,t.dead);
+            sep = ",";
+        }
+        print!("],\"hp\":{},\"frame\":{},\"bosses\":[", p.hp, world.frame);
+        sep = "";
+        for b in world.entities.iter().filter(|e| e.etype == 20) {
+            let n = b.npc();
+            print!("{}{{\"id\":{},\"age\":{},\"pos\":[{},{}],\"vel\":[{},{}],\"anim\":\"{}\",\"frame\":{},\"collision\":{},\"hp\":{},\"airborne\":{},\"body_visible\":{},\"shadow\":[{},{}],\"flip\":{},\"debug_state\":{},\"debug_target\":[{},{}]}}",sep,b.id,b.time_cur,b.pos.x,b.pos.y,b.vel.x,b.vel.y,n.anim,n.anim_frame,b.entity_collision_class,b.hp,isaac_sim::npc::monstro::airborne(n.anim,n.anim_frame),isaac_sim::npc::monstro::body_visible(n.anim,n.anim_frame),b.pos.x,b.pos.y,n.flip_x,n.state,n.target_pos.x,n.target_pos.y);
+            sep = ",";
+        }
+        print!("],\"projectiles\":[");
+        sep = "";
+        for b in world
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Projectile)
+        {
+            let q = b.projectile.as_ref().unwrap();
+            print!("{}{{\"id\":{},\"age\":{},\"pos\":[{},{}],\"vel\":[{},{}],\"height\":{},\"fall\":{},\"scale\":{},\"dead\":{},\"collision\":{}}}",sep,b.id,b.time_cur,b.pos.x,b.pos.y,b.vel.x,b.vel.y,q.height,q.falling_speed,q.scale,b.dead,b.entity_collision_class);
             sep = ",";
         }
         println!("]}}");

@@ -1,4 +1,4 @@
-param([switch]$Smoke)
+param([switch]$Smoke, [switch]$Monstro, [uint32]$Seed=42)
 $ErrorActionPreference = 'Stop'
 $OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new()
 $repo = Split-Path $PSScriptRoot
@@ -13,5 +13,6 @@ New-Item -ItemType Directory -Force $out | Out-Null
 if ($LASTEXITCODE -ne 0) { Get-Content "$out/build.log" -Tail 30; exit $LASTEXITCODE }
 $viewerArgs = @("$PSScriptRoot/tools/play_motion.py", '--exe', "$PSScriptRoot/target/release/examples/motion_trace.exe")
 if ($Smoke) { $viewerArgs += @('--smoke', "$out/preview.png") }
+if ($Monstro) { $viewerArgs += @('--monstro', '--seed', "$Seed") }
 & python @viewerArgs
 exit $LASTEXITCODE
