@@ -65,7 +65,11 @@ def sprite(animation,layer,tick,sheet,position,flip=False):
         fraction=t/int(a['Delay']);nxt=frames[index+1].attrib
         for k in ('XPosition','YPosition','XScale','YScale','AlphaTint'):
             a[k]=float(a[k])+(float(nxt[k])-float(a[k]))*fraction
-    image=sheet.subsurface(tuple(int(a[k]) for k in ('XCrop','YCrop','Width','Height')))
+    crop=pg.Rect(*(int(a[k]) for k in ('XCrop','YCrop','Width','Height')))
+    # Monstro JumpDown frames 0..28 intentionally point wholly outside the
+    # atlas: the body is offscreen while the separate shadow layer remains.
+    if not crop.colliderect(sheet.get_rect()):return
+    image=sheet.subsurface(crop)
     sx=float(a['XScale'])/100; sy=float(a['YScale'])/100
     image=pg.transform.scale(image,(round(image.get_width()*abs(sx)),round(image.get_height()*abs(sy))))
     image=pg.transform.flip(image,(sx<0)^flip,sy<0)
