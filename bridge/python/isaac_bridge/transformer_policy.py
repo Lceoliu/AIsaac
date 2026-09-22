@@ -92,14 +92,18 @@ class CombatTransformer(BaseFeaturesExtractor):
 
     def sequence_features(self, observations):
         sequence = self.encode_frames(observations)
+        return self.temporal_features(sequence, observations['time'], observations['history_mask'])
+
+    def temporal_features(self, sequence, elapsed, history_mask):
+        """Temporal stage shared by full-window training and frozen-frame sampling."""
         # Relative elapsed time, no global engine frame/seed as a memorization cue.
-        time = (observations['time']-observations['time'][:, :1])*15
+        time = (elapsed-elapsed[:, :1])*15
         angles = time.unsqueeze(-1) * self.frequency
         position = torch.stack([angles.sin(), angles.cos()], -1).flatten(-2)
         sequence = sequence + position
         length = sequence.shape[1]
         causal = torch.ones(length, length, dtype=torch.bool, device=sequence.device).triu(1)
-        padding = ~observations['history_mask'].bool()
+        padding = ~history_mask.bool()
         for layer in self.temporal:
             sequence = layer(sequence, src_mask=causal, src_key_padding_mask=padding)
         return self.final_norm(sequence)

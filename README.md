@@ -8,7 +8,7 @@
 
 ## 目标
 
-**2026-09-22 Infra优化，未开训：** 普通炸弹、4种Monstro地形、安全出生已接入。CPU/Rayon仿真 + CUDA模型推理，**不是GPU仿真**。二进制观测、批量环形历史、紧凑PPO rollout已实现：同配置128路采样+推理197→501决策/s，RSS4.26→2.79GiB；128×128步观测存储70.93→0.975GiB，已实际填满和抽样验证。仍未测反向训练吞吐，也未开始Linux128路正式训练。详见 [Infra实测与剩余缺口](docs/ENV_ARCHITECTURE.md#08-infra-优化与远端桌面恢复2026-09-22)。`python bridge/python/train_sim.py` 默认只展示配置；`--train`才开训。
+**2026-09-22 GPU缓存已实现，未正式开训：** GPU常驻原始帧/rollout，分块pinned双缓冲与异步传输，冻结采样期间只编码新帧；训练从原始历史重算梯度，minibatch默认32。本机128路短测约4088决策/s、峰值CUDA2.02GiB，默认1块快于2/4块；物理仍在CPU。28项测试及隔离更新探针通过，详见 [最新实现与实测](docs/ENV_ARCHITECTURE.md#09-gpu-原始帧rollout-与冻结编码缓存2026-09-22已实现)。`python bridge/python/train_sim.py` 默认只展示配置，`--train`才开训；`--pipeline legacy`保留CPU对照。
 
 构建可迁移到原版以撒的完整流程 AI。先证明单房间战斗能力，再扩展探索、道具选择、资源管理和整局决策。策略推理只接收玩家可观察信息；视觉或内存只是采集手段，隐藏实体、内部 AI 状态、RNG 和未来事件不得进入策略输入。成绩只以原版（L0）为准。
 

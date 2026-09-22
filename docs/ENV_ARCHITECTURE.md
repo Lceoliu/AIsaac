@@ -1,6 +1,6 @@
 # Isaac RL 环境架构：三层环境栈与统一契约
 
-更新：2026-09-22。当前结果见 §0.8：CPU/Rayon 仿真 + CUDA 批量推理，不是 GPU 仿真。二进制观测和紧凑历史 rollout 已接入，128 路端到端采样/推理 501 决策/s；128×128步观测存储从70.93降到0.975GiB。没有启动新训练。原版 J460 历史四引擎512局零清房。目标与信息边界沿用 [PROJECT_SPEC.md](PROJECT_SPEC.md)。
+更新：2026-09-22。当前结果见 §0.9：GPU 原始帧/rollout 常驻、增量异步传输、冻结单帧编码缓存已接入，minibatch默认32。128路短测约4088决策/s，采样峰值CUDA2.02GiB。物理仍为CPU/Rayon，未开始正式新策略训练；原版四引擎512局零清房的历史结论不变。
 
 ## 0. 结论
 
@@ -287,11 +287,39 @@ v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空
 
 验证：二进制和旧JSON编码4worker×240步逐字段对照；历史窗口所有权、容量溢出、seed覆盖；3个连续rollout、3轮shuffle、跨episode/前缀、GAE和mask与整窗参考逐项对照；SB3真实collect_rollouts和evaluate_actions接入通过。全部不调用 `learn/backward/optimizer.step`，权重不变。基准证据：`runs/l2/20260922-infra/{before,after,rollout}.json`。
 
-**剩余瓶颈与下一门槛**：策略每步仍组装/上传完整稠密64帧窗口，GPU每次重算CNN和实体编码。GPU原始帧环形缓存、增量H2D传输尚未实现；GPU物理内核也是独立工作，不能把本轮CPU二进制化包装成它。先做受控PPO更新测速再确定minibatch/环境数，随后Linux部署、长跑与原引擎迁移验收；本轮没有正式开训。
+**当时的增量GPU传输/编码缓存缺口现已完成，见§0.9。** 下一门槛为长时间完整PPO吞吐/密集实体显存测试、Linux部署，以及原引擎迁移验收。
 
 复现：`python -m unittest test_sim_infra test_sim_vec test_sim_obs`；`python sim/tools/benchmark_pipeline.py --envs 8 32 128 --steps 32 --out runs/infra-benchmark.json`；`python sim/tools/benchmark_rollout.py --out runs/infra-rollout.json`。扩展接口依据 [SB3 OnPolicyAlgorithm 文档](https://stable-baselines3.readthedocs.io/en/master/modules/base.html#stable_baselines3.common.on_policy_algorithm.OnPolicyAlgorithm)；后续传输优化需遵守 [PyTorch pinned memory/异步传输的生命周期与性能约束](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html)，不是每步临时pin_memory就会更快。
 
 **Ubuntu RDP（仅恢复服务，未动训练环境）：** `ssh -p 2222 eolc@100.76.185.120`；实机Ubuntu22.04.5、RTX3080Ti12GB、94GiB RAM。3389的owner是GNOME Remote Desktop42.9，不是inactive的xrdp。旧daemon PID1462监听队列积压8–9、存在多条CLOSE-WAIT；客户端RDP协商5秒超时，普通restart35秒也未结束，停在stop-sigterm。只终止挂死的远程桌面daemon并重新启动，未注销GNOME会话、改密码、改防火墙或重启主机。新PID1542226启动CUDA编码，监听队列回到0；从本机通过RDP/NLA协商及TLS1.3握手（证书与通过SSH读取的服务器公钥证书匹配），耗时50ms。探针不提交凭据，随后关闭连接产生的NLA认证失败日志是预期结果，不是验证了错误密码。用户仍需用原RDP凭据确认实际桌面显示；本轮未证明GNOME内部挂死根因或长期不复发。
+
+### 0.9 GPU 原始帧、rollout 与冻结编码缓存（2026-09-22，已实现）
+
+默认 `train_sim.py --pipeline gpu --batch-size 32 --chunks 1`；仍必须显式 `--train` 才启动训练。`--pipeline legacy` 保留 CPU 历史/rollout 对照。这里的原始帧是 v3 白名单结构化观测，不是屏幕像素；Rust/Rayon 物理仍在 CPU。
+
+- `gpu_buffer.py`：GPU 统一存储 `[T+H,N,...]` 原始帧及长度索引，历史与 rollout 共用，不重复存每条样本的64帧。actions、rewards、values、log-prob、mask、GAE/returns 和随机 minibatch 均在 GPU；仅 SB3 每次更新的 explained-variance 日志复制少量标量到 CPU。类别保持 int32、连续量 float32，没有有损压缩。
+- `gpu_env.py`：独立 Rust world 分块、固定总 Rayon 线程数，每块双份 pinned 帧/动作槽和独立 copy/compute streams。CPU worker 完成原生导出后立即排队 H2D，可与其他块推理重叠；CUDA events 保护 D2H 动作可读、pinned 槽可复写以及 GPU 槽消费完成。reset 只上传打包后的终止 worker 行，不重传整个块。
+- `gpu_ppo.py`：采样期间 no-grad 且禁止并发 train；记录参数版本，检测采样中更新。只编码新增帧（包括 reset 的新首帧），缓存 CNN、实体集注意力及其他单帧融合结果。每步仍重算有限窗口的时序 Transformer；不引入会改变相对时间/窗口语义的 KV cache。
+- PPO minibatch 从 GPU 原始帧重建完整窗口，重新计算带梯度的全部编码。更新后 retained prefix 用新权重重新编码一次；未更新的连续 rollout 直接复用。reset 清理该 worker 的有效历史，其他 worker 不受影响。timeout 在覆盖 reset 帧前计算 terminal value。checkpoint 不序列化临时 sampler。
+- 保留标准 VecEnv 的一次性 CPU reset 观测，collector 随即释放；热路径没有 CPU 全历史窗口。该专用 VecEnv 由 GPU collector 驱动；普通 `step`/通用评估请用原 SimVecEnv。terminal_observation 在此路径为 GPU tensor 字典。
+
+**精度修复：** 初版128路 cached/full-window value 偏差最大约3.53e-5，未通过原定误差门槛。定位到 cuDNN TF32 的 batch-shape 舍入差异后，GPU PPO 构造时关闭 cuDNN 和 matmul 的 TF32（进程级设置）。最终1/2/4块最大 value 偏差不超过1.20e-6、log-prob不超过2.39e-7，确定性动作一致；没有通过放宽门槛或改变模型结构掩盖问题。
+
+**本机 RTX4060 Laptop8GB，完整 H64/E256/4层/FP32，128环境×128步：** 预热一个 rollout 后测第二个，包含采样、缓存、推理、rollout写入及GAE，不包含优化器。随机策略导致平均有效历史约47帧；不能将此表直接当作始终满64帧或完整 PPO 训练吞吐。
+
+| 块数 | 决策/s | vector-step ms | 峰值CUDA张量 GiB | 进程RSS GiB |
+|---|---:|---:|---:|---:|
+| 1 | 4088 | 31.31 | 2.018 | 1.721 |
+| 2 | 3199 | 40.01 | 2.043 | 2.161 |
+| 4 | 1994 | 64.18 | 2.075 | 2.226 |
+
+默认1块是本机实测选择，不是未实现分块；2/4块可显式启用。Python/PyTorch 发射与同步开销目前抵消了更多块的重叠收益。独立 CUPTI trace 的4步/2块中观察到8次大帧 H2D、41对跨stream拷贝/计算交叠（交叠对累计约171微秒）；第一版0交叠的失败记录保留。异步实现不等于每台机器上多块一定更快。
+
+128×128 raw rollout（含64帧前缀及长度）**1.663GiB GPU**，融合缓存24MiB。相比之前0.975GiB的CPU紧凑类型存储，此版本保留原始dtype、直接GPU索引，二者不是同一存储布局。普通新增帧 H2D **8.87MiB/向量步**，原整窗567.47MiB，约64倍减少；额外reset帧另计。本次单块128步共编码16,468帧（16,384新步+84次reset），未每步重编码64帧。
+
+**验证及训练边界：** 28项Python测试通过，包括CPU逐字段/奖励对照、shuffle、GAE、连续rollout、独立reset、timeout bootstrap、权重冻结、训练后缓存失效、CNN/实体梯度、checkpoint、真实SB3 learn的两个极小测试更新。基准另外每配置只做2个minibatch32的隔离更新探针，峰值CUDA约2.36–2.42GiB；计时受首次Adam初始化影响，不能当作持续训练速度或胜率。未保存正式新策略、未开始512局/100K局训练，也未部署Ubuntu。256实体容量不代表已压测每帧都占满256实体的最坏显存。
+
+证据：`runs/l2/20260922-gpu-cache/benchmark-accepted.json`、`tests-accepted.log`、`streams-summary.json`、`streams-trace.json`；失败过程也保留。复现：`python -m unittest test_gpu_infra`；`python sim/tools/benchmark_gpu_pipeline.py --envs 128 --chunks 1 2 4 --out runs/gpu-benchmark.json`（默认无优化器，显式 `--update-probe` 才做隔离更新探针）。传输实现遵循 [PyTorch pinned-memory/异步生命周期规则](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html)。
 
 ## 1. 证据基线（2026-09-19 核实）
 

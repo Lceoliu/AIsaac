@@ -38,10 +38,11 @@ class RustBatch:
         if self.lib.isaac_frame_size()!=FRAME_DTYPE.itemsize:raise RuntimeError('Rebuild matching sim library: frame ABI mismatch')
         self.frames=np.empty(n,dtype=FRAME_DTYPE)
 
-    def observe(self):
-        overflow=self.lib.isaac_batch_observe(self.handle,self.frames.ctypes.data)
+    def observe(self,out=None):
+        target=self.frames if out is None else out
+        overflow=self.lib.isaac_batch_observe(self.handle,target.ctypes.data)
         if overflow:raise ValueError(f'Visible entity overflow: {overflow} > 256; never truncate')
-        return self.frames
+        return target
 
     def states(self):return json.loads(self.lib.isaac_batch_state(self.handle))
 

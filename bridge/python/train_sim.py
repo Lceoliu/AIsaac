@@ -25,7 +25,9 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--train',action='store_true');p.add_argument('--envs',type=int,default=8)
     p.add_argument('--threads',type=int,default=4);p.add_argument('--n-steps',type=int,default=32)
-    p.add_argument('--batch-size',type=int,default=8);p.add_argument('--episodes',type=int,default=512)
+    p.add_argument('--batch-size',type=int,default=32);p.add_argument('--episodes',type=int,default=512)
+    p.add_argument('--pipeline',choices=['gpu','legacy'],default='gpu')
+    p.add_argument('--chunks',type=int,default=1)
     p.add_argument('--seed',type=int,default=1);p.add_argument('--device',default='cuda')
     p.add_argument('--out',type=Path,default=Path('runs/sim-training'));args=p.parse_args()
     bytes_per_obs=sum(int(np.prod(s.shape))*s.dtype.itemsize for s in VisibleHistory().space.spaces.values())
@@ -36,17 +38,31 @@ def main():
             'legacy_rollout_observation_gib':bytes_per_obs*args.envs*args.n_steps/2**30,
             'rollout_observation_gib':(frame_bytes*args.envs*(args.n_steps+63)+4*args.envs*args.n_steps)/2**30,
             'simulation_device':'cpu/rayon','policy_device':args.device,'rollout_buffer':'HistoryRolloutBuffer'}
+    if args.pipeline=='gpu':
+        raw_bytes=bytes_per_obs//64
+        config.update(rollout_observation_gib=(raw_bytes+8)*args.envs*(args.n_steps+64)/2**30,
+                      rollout_buffer='GpuHistoryRolloutBuffer',frame_cache_gib=(args.n_steps+64)*args.envs*256*4/2**30,
+                      observation_storage_device=args.device,transfer='pinned double-buffer/chunk CUDA streams',
+                      frozen_collection_weights=True)
     print(json.dumps(config,indent=2))
     if not args.train:
         print('PREPARED ONLY: no environment, model, rollout buffer or optimizer created.');return
     if args.envs*args.n_steps%args.batch_size:raise ValueError('batch-size must divide envs*n-steps')
     torch.set_num_threads(4)
-    env=SimVecEnv(args.envs,args.seed,args.threads)
+    if args.pipeline=='gpu':
+        from isaac_bridge.gpu_env import GpuFrameVecEnv
+        from isaac_bridge.gpu_ppo import GpuMaskablePPO
+        from isaac_bridge.gpu_buffer import GpuHistoryRolloutBuffer
+        env=GpuFrameVecEnv(args.envs,args.seed,args.threads,args.chunks,device=args.device)
+        algorithm=GpuMaskablePPO;buffer_class=GpuHistoryRolloutBuffer
+    else:
+        env=SimVecEnv(args.envs,args.seed,args.threads)
+        algorithm=MaskablePPO;buffer_class=HistoryRolloutBuffer
     args.out.mkdir(parents=True,exist_ok=False)
     (args.out/'config.json').write_text(json.dumps(config,indent=2),encoding='utf8')
     try:
-        model=MaskablePPO('MultiInputPolicy',env,n_steps=args.n_steps,batch_size=args.batch_size,n_epochs=4,
-            rollout_buffer_class=HistoryRolloutBuffer,
+        model=algorithm('MultiInputPolicy',env,n_steps=args.n_steps,batch_size=args.batch_size,n_epochs=4,
+            rollout_buffer_class=buffer_class,
             policy_kwargs=dict(features_extractor_class=CombatTransformer,
                features_extractor_kwargs=dict(features_dim=256,layers=4,heads=8),
                net_arch=dict(pi=[256],vf=[256]),normalize_images=False),device=args.device,seed=args.seed,verbose=1)
