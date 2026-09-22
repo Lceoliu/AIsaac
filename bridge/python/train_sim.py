@@ -8,6 +8,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from isaac_bridge.sim_vec import SimVecEnv
 from isaac_bridge.transformer_policy import CombatTransformer
 from isaac_bridge.transformer_obs import SCHEMA,VisibleHistory
+from isaac_bridge.history_buffer import HistoryRolloutBuffer,STORAGE_DTYPES
 
 class CompleteEpisodes(BaseCallback):
     def __init__(self,target,path):super().__init__();self.target=target;self.completed=0;self.path=path
@@ -27,10 +28,14 @@ def main():
     p.add_argument('--batch-size',type=int,default=8);p.add_argument('--episodes',type=int,default=512)
     p.add_argument('--seed',type=int,default=1);p.add_argument('--device',default='cuda')
     p.add_argument('--out',type=Path,default=Path('runs/sim-training'));args=p.parse_args()
-    bytes_per_obs=sum(np.prod(s.shape)*s.dtype.itemsize for s in VisibleHistory().space.spaces.values())
+    bytes_per_obs=sum(int(np.prod(s.shape))*s.dtype.itemsize for s in VisibleHistory().space.spaces.values())
+    frame_bytes=sum(int(np.prod(s.shape[1:]))*np.dtype(STORAGE_DTYPES.get(k,s.dtype)).itemsize
+                    for k,s in VisibleHistory().space.spaces.items())
     config={**vars(args),'out':str(args.out),'schema':SCHEMA,'history':64,'entity_capacity':256,
             'max_episode_seconds':120,'decisions_per_game_second':15,'n_epochs':4,
-            'rollout_observation_gib':bytes_per_obs*args.envs*args.n_steps/2**30}
+            'legacy_rollout_observation_gib':bytes_per_obs*args.envs*args.n_steps/2**30,
+            'rollout_observation_gib':(frame_bytes*args.envs*(args.n_steps+63)+4*args.envs*args.n_steps)/2**30,
+            'simulation_device':'cpu/rayon','policy_device':args.device,'rollout_buffer':'HistoryRolloutBuffer'}
     print(json.dumps(config,indent=2))
     if not args.train:
         print('PREPARED ONLY: no environment, model, rollout buffer or optimizer created.');return
@@ -41,6 +46,7 @@ def main():
     (args.out/'config.json').write_text(json.dumps(config,indent=2),encoding='utf8')
     try:
         model=MaskablePPO('MultiInputPolicy',env,n_steps=args.n_steps,batch_size=args.batch_size,n_epochs=4,
+            rollout_buffer_class=HistoryRolloutBuffer,
             policy_kwargs=dict(features_extractor_class=CombatTransformer,
                features_extractor_kwargs=dict(features_dim=256,layers=4,heads=8),
                net_arch=dict(pi=[256],vf=[256]),normalize_images=False),device=args.device,seed=args.seed,verbose=1)

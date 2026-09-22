@@ -20,6 +20,7 @@ pub mod bomb;
 pub mod arena;
 pub mod snapshot;
 pub mod ffi;
+pub mod observation;
 pub mod math;
 pub mod npc;
 pub mod pathfinder;

@@ -10,8 +10,15 @@ import sys
 import numpy as np
 from gymnasium import spaces
 from stable_baselines3.common.vec_env import VecEnv
-from .sim_obs import rust_visible_observation
 from .transformer_obs import VisibleHistory,HISTORY,ENTITY_CAPACITY
+
+# Fixed C record, independently checked against Rust sizeof at load time.
+FRAME_DTYPE=np.dtype([
+    ('player','f4',(23,)),('player_anim','i4',(32,)),('active_kind','i4',(1,)),
+    ('entities','f4',(256,31)),('entity_kind','i4',(256,3)),('entity_anim','i4',(256,32)),
+    ('entity_mask','f4',(256,)),('terrain','f4',(7,9,15)),('previous_action','f4',(4,)),
+    ('time','f4'),('history_mask','f4'),('reward','f4'),('done','i4'),('truncated','i4'),
+    ('outcome','i4'),('elapsed','u4'),('layout','u4'),('count','u4')])
 
 
 class RustBatch:
@@ -22,10 +29,19 @@ class RustBatch:
         signatures={'new':([C.c_size_t,C.c_uint32,C.c_size_t],C.c_void_p),
                     'reset':([C.c_void_p,C.c_size_t,C.c_uint32],None),
                     'step':([C.c_void_p,C.POINTER(C.c_int32)],None),
-                    'state':([C.c_void_p],C.c_char_p),'free':([C.c_void_p],None)}
+                    'state':([C.c_void_p],C.c_char_p),'free':([C.c_void_p],None),
+                    'observe':([C.c_void_p,C.c_void_p],C.c_size_t)}
         for name,(args,result) in signatures.items():
             f=getattr(self.lib,'isaac_batch_'+name);f.argtypes=args;f.restype=result
         self.handle=self.lib.isaac_batch_new(n,seed,threads)
+        self.lib.isaac_frame_size.restype=C.c_size_t
+        if self.lib.isaac_frame_size()!=FRAME_DTYPE.itemsize:raise RuntimeError('Rebuild matching sim library: frame ABI mismatch')
+        self.frames=np.empty(n,dtype=FRAME_DTYPE)
+
+    def observe(self):
+        overflow=self.lib.isaac_batch_observe(self.handle,self.frames.ctypes.data)
+        if overflow:raise ValueError(f'Visible entity overflow: {overflow} > 256; never truncate')
+        return self.frames
 
     def states(self):return json.loads(self.lib.isaac_batch_state(self.handle))
 
@@ -46,51 +62,67 @@ class RustBatch:
 class SimVecEnv(VecEnv):
     def __init__(self,n=8,seed=1,threads=4,history=HISTORY,capacity=ENTITY_CAPACITY,library=None):
         self.batch=RustBatch(n,seed,threads,library)
-        self.histories=[VisibleHistory(history,capacity) for _ in range(n)]
+        if not 1<=capacity<=256:raise ValueError('Binary sim capacity must be 1..256')
+        self.history=history;self.capacity=capacity
+        space=VisibleHistory(history,capacity).space
+        self.ring={k:np.zeros((n,*v.shape),v.dtype) for k,v in space.spaces.items()}
+        self.cursor=np.zeros(n,np.int64);self.valid=np.zeros(n,np.int64)
         self.base_seed=seed;self.episodes=np.zeros(n,dtype=np.int64)
-        self.raw=[None]*n;self.actions=None;self.returns=np.zeros(n);self.lengths=np.zeros(n,dtype=np.int64)
-        super().__init__(n,self.histories[0].space,spaces.MultiDiscrete([45,2,2]))
+        self.actions=None;self.returns=np.zeros(n);self.lengths=np.zeros(n,dtype=np.int64)
+        super().__init__(n,space,spaces.MultiDiscrete([45,2,2]))
 
     def reset(self):
-        for i,h in enumerate(self.histories):
+        for i in range(self.num_envs):
             seed=self._seeds[i] if self._seeds[i] is not None else self.base_seed+i
-            self.batch.reset(i,int(seed));h.clear()
+            self.batch.reset(i,int(seed))
+        # Keep autoreset seeds rooted in an explicit VecEnv.seed() override.
+        if self._seeds[0] is not None:self.base_seed=int(self._seeds[0])
+        for v in self.ring.values():v.fill(0)
+        self.cursor[:]=0;self.valid[:]=0
         self._reset_seeds();self.episodes[:]=0;self.returns[:]=0;self.lengths[:]=0
-        rows=self.batch.states();return self._encode(rows)
+        self._append(self.batch.observe());return self._windows()
 
-    def _encode(self,rows):
-        obs=[]
-        for i,r in enumerate(rows):
-            self.raw[i]=rust_visible_observation(r['state'])
-            obs.append(self.histories[i].append(self.raw[i]))
-        return {k:np.stack([o[k] for o in obs]) for k in obs[0]}
+    def _append(self,frames,indices=None):
+        ids=np.arange(self.num_envs) if indices is None else np.asarray(indices)
+        if np.any(frames['count'][ids]>self.capacity):raise ValueError('Visible entity overflow; increase capacity, never truncate')
+        for k,v in self.ring.items():
+            values=frames[k][ids]
+            if k.startswith('entity') or k=='entities':values=values[:,:self.capacity]
+            v[ids,self.cursor[ids]]=values
+        self.cursor[ids]=(self.cursor[ids]+1)%self.history
+        self.valid[ids]=np.minimum(self.valid[ids]+1,self.history)
+
+    def _windows(self):
+        start=np.where(self.valid==self.history,self.cursor,0)
+        times=(start[:,None]+np.arange(self.history))%self.history
+        return {k:v[np.arange(self.num_envs)[:,None],times] for k,v in self.ring.items()}
 
     def action_masks(self):
-        return np.asarray([[True]*45+[True,r['players'][0]['bombs']>0]+[True,False] for r in self.raw],bool)
+        masks=np.ones((self.num_envs,49),bool)
+        masks[:,46]=self.batch.frames['player'][:,9]>0;masks[:,48]=False
+        return masks
 
     def step_async(self,actions):
         self.actions=np.asarray(actions).copy()
-        for h,a in zip(self.histories,self.actions):h.previous_action[:]=*a,1
         self.batch.step(self.actions)
 
     def step_wait(self):
-        rows=self.batch.states();observations=self._encode(rows)
-        rewards=np.asarray([r['reward'] for r in rows],np.float32);dones=np.asarray([r['done'] for r in rows],bool)
+        frames=self.batch.observe();self._append(frames)
+        rewards=frames['reward'].copy();dones=frames['done'].astype(bool)
         self.returns+=rewards;self.lengths+=1
-        infos=[dict(outcome=r['outcome'],elapsed_frames=r['state']['frame'],layout=r['state']['layout'],**{'TimeLimit.truncated':r['truncated']}) for r in rows]
+        outcomes=('running','death','win','time_limit')
+        infos=[dict(outcome=outcomes[r['outcome']],elapsed_frames=int(r['elapsed']),layout=int(r['layout']),**{'TimeLimit.truncated':bool(r['truncated'])}) for r in frames]
+        terminal=self._windows() if dones.any() else None
         for i in np.flatnonzero(dones):
-            infos[i]['terminal_observation']={k:v[i].copy() for k,v in observations.items()}
+            infos[i]['terminal_observation']={k:v[i].copy() for k,v in terminal.items()}
             infos[i]['episode']={'r':float(self.returns[i]),'l':int(self.lengths[i])}
             self.returns[i]=0;self.lengths[i]=0;self.episodes[i]+=1
             self.batch.reset(int(i),int(self.base_seed+i+self.num_envs*self.episodes[i]))
-            self.histories[i].clear()
+            for v in self.ring.values():v[i].fill(0)
+            self.cursor[i]=0;self.valid[i]=0
         if dones.any():
-            fresh=self.batch.states()
-            for i in np.flatnonzero(dones):
-                self.raw[i]=rust_visible_observation(fresh[i]['state'])
-                encoded=self.histories[i].append(self.raw[i])
-                for k in observations:observations[k][i]=encoded[k]
-        return observations,rewards,dones,infos
+            self._append(self.batch.observe(),np.flatnonzero(dones))
+        return self._windows(),rewards,dones,infos
 
     def close(self):self.batch.close()
     def get_attr(self,name,indices=None):

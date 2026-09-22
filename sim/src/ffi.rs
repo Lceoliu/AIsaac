@@ -13,6 +13,8 @@ pub struct Slot {
     pub done: bool,
     pub truncated: bool,
     pub outcome: &'static str,
+    pub previous: Option<crate::observation::Previous>,
+    pub action: [f32; 4],
 }
 impl Slot {
     pub fn new(seed: u32) -> Self {
@@ -24,10 +26,17 @@ impl Slot {
             done: false,
             truncated: false,
             outcome: "running",
+            previous: None,
+            action: [0.; 4],
         }
     }
     pub fn step(&mut self, action: &[i32]) {
         assert!(!self.done, "reset required");
+        self.previous = Some(crate::observation::Previous::capture(
+            &self.world,
+            self.player,
+        ));
+        self.action = [action[0] as f32, action[1] as f32, action[2] as f32, 1.];
         self.reward = 0.;
         let joint = action[0] as usize;
         const MOVES: [(f32, f32); 9] = [
@@ -126,4 +135,28 @@ pub unsafe extern "C" fn isaac_batch_state(batch: *mut Batch) -> *const c_char {
 #[no_mangle]
 pub unsafe extern "C" fn isaac_batch_free(batch: *mut Batch) {
     drop(Box::from_raw(batch));
+}
+
+/// Caller owns `count` contiguous Frame records. No JSON, allocation, or hidden
+/// AI state crosses this interface. Positive return value means capacity overflow.
+#[no_mangle]
+pub unsafe extern "C" fn isaac_batch_observe(
+    batch: *mut Batch,
+    out: *mut crate::observation::Frame,
+) -> usize {
+    let b = &*batch;
+    let frames = std::slice::from_raw_parts_mut(out, b.slots.len());
+    b.pool.install(|| {
+        b.slots
+            .par_iter()
+            .zip(frames.par_iter_mut())
+            .map(|(s, f)| crate::observation::encode(s, f))
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn isaac_frame_size() -> usize {
+    std::mem::size_of::<crate::observation::Frame>()
 }

@@ -1,6 +1,6 @@
 # 把原版引擎做成标准 RL 训练场：现状、参照与实施方案
 
-**2026-09-22 状态覆盖：** 下文是2026-09-20的原版引擎方案，单worker/共用存档等旧差距已不代表当前状态。L0已完成独立原引擎并行训练；L2现已接入普通炸弹、4种真实Monstro地形、10,000种子安全出生测试、共享v3观测和Rust/Rayon批量采样。1–128环境本机采样/推理基准已完成，未开训，完整数据见 [ENV_ARCHITECTURE §0.7](ENV_ARCHITECTURE.md#07-炸弹场景分布与训练准备2026-09-22)。当前优先项是紧凑历史rollout与二进制张量传输，不是继续堆环境数量。
+**2026-09-22 状态覆盖：** 下文是2026-09-20的原版引擎方案，单worker/共用存档等旧差距已不代表当前状态。L0已完成独立原引擎并行训练；L2现已接入普通炸弹、4种真实Monstro地形、10,000种子安全出生测试、共享v3观测和Rust/Rayon批量采样。1–128环境本机采样/推理基准已完成，未开训，完整数据见 [ENV_ARCHITECTURE §0.7](ENV_ARCHITECTURE.md#07-炸弹场景分布与训练准备2026-09-22)。紧凑历史rollout与CPU二进制观测已完成，最新实测见 [§0.8](ENV_ARCHITECTURE.md#08-infra-优化与远端桌面恢复2026-09-22)：128路197→501决策/s，128×128步观测0.975GiB。当前仍是CPU仿真+CUDA推理，不是GPU仿真；下一门槛为反向更新测速、增量GPU传输和Linux部署，不是直接开训。
 
 更新：2026-09-20。本文回答"原版 J460 worker 离一个标准 RL 训练环境还差什么、别人怎么做的、本项目怎么做"。参照项目的原文与 URL 全部在 [ARENA_RESEARCH_NOTES.md](ARENA_RESEARCH_NOTES.md)（2026-09-20 调研，每条事实附来源，查不到的明确标注），本文只引用其中已核实的条目；本项目的数字来自 [bridge/README.md](../bridge/README.md) 与 [ENV_ARCHITECTURE.md](ENV_ARCHITECTURE.md)。目标与信息边界不变（[PROJECT_SPEC.md](PROJECT_SPEC.md)）；崩溃问题单独见 [NATIVE_CRASH_ANALYSIS.md](NATIVE_CRASH_ANALYSIS.md)。
 

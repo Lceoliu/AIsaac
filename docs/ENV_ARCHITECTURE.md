@@ -1,6 +1,6 @@
 # Isaac RL 环境架构：三层环境栈与统一契约
 
-更新：2026-09-22。当前结果见 §0.7：炸弹、四种原版 Boss 地形、种子化安全出生、Rust 批量环境已接入，完成本机 1–128 环境采样/推理基准；没有启动新训练。原版 J460 历史四引擎512局零清房。目标与信息边界沿用 [PROJECT_SPEC.md](PROJECT_SPEC.md)。
+更新：2026-09-22。当前结果见 §0.8：CPU/Rayon 仿真 + CUDA 批量推理，不是 GPU 仿真。二进制观测和紧凑历史 rollout 已接入，128 路端到端采样/推理 501 决策/s；128×128步观测存储从70.93降到0.975GiB。没有启动新训练。原版 J460 历史四引擎512局零清房。目标与信息边界沿用 [PROJECT_SPEC.md](PROJECT_SPEC.md)。
 
 ## 0. 结论
 
@@ -236,7 +236,7 @@ v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空
 
 **接口一致 ≠ 世界状态逐帧一致。** 原引擎raw JSON还有更多不用的字段；模拟器尚不支持掉落物/道具组合/全部特效，死亡尾帧与完整接触/击退细节未完全校准。新模型仍需在原引擎独立验证胜率、受伤次数与清房时间；目前没有新的训练成绩。
 
-#### 本机基准（不是训练FPS）
+#### 优化前本机基准（历史对照；当前值见 §0.8，不是训练FPS）
 
 实测主机 i9-13900H、32GB、RTX4060 Laptop 8GB；不是计划中的3080Ti/96GB Linux主机。生产配置：64历史、256容量、4层Transformer、CUDA float32、Rust 4线程。每档先预热64次环境决策，再测32批；未训练策略采样真实动作，所有权重逐张量检查未变化。计量为所有环境累计的**决策/秒**，不是局/秒。实际可见实体最多16–23个，不是256实体满载压力测试。
 
@@ -254,13 +254,44 @@ v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空
 
 一个观测完整窗口为4,648,704 bytes。SB3逐transition存整窗会重复存储相邻历史：128环境×128步仅obs就**70.93GiB**；64环境为35.47GiB，均不适合本机32GB。它们能跑采样/推理，不代表能存下同配置PPO rollout。8环境×32步约1.11GiB、16环境×32步约2.22GiB，不含缓冲复制、网络与梯度。
 
-**建议本机首轮8–16环境，rollout每路32步，PPO minibatch先8；未实测反向更新的速度/峰值显存。** 下一步先做“一帧只存一份、训练时取64帧连续窗口”的紧凑rollout及二进制张量接口，再追求Linux128路/100K局。这里不缩短历史或删实体来制造提速。
+上述整窗存储问题已由 §0.8 的紧凑rollout及二进制接口解决。尚未测新管线反向更新的吞吐/峰值显存，因此不能把采样容量等同于训练最优配置。
 
 证据：`runs/l2/20260922-bombs-training/benchmark-final.json`、`layout-verification.json`、`bomb-verification.json`、原版trace与exit记录。44项Rust测试、13项不更新权重的Transformer测试、4项适配/自动重置测试通过；原有玩家留出轨迹、Monstro锁定/弹道、1,176次绘制回归均通过。
 
 复现（Python使用已有torch/SB3依赖环境）：`python sim/tools/benchmark_pipeline.py --steps 32 --out runs/sim-benchmark.json`；准备配置但不训练：`python bridge/python/train_sim.py`。查看器：`pwsh -File sim/play_motion.ps1 -Monstro -Seed 42`，E/左Shift放炸弹，R同seed重置，N下一seed；地形/炸弹绘制为验收表现层，不是完整原版动画复刻。
 
 批量接口按 [SB3 VecEnv 约定](https://stable-baselines3.readthedocs.io/en/master/guide/vec_envs.html) 保存终局 `terminal_observation`，区分 `TimeLimit.truncated`，随后自动重置并清空历史；底层使用标准 [ctypes CDLL](https://docs.python.org/3/library/ctypes.html) 与 Rayon线程池。
+
+### 0.8 Infra 优化与远端桌面恢复（2026-09-22）
+
+**纠正 GPU 并行的表述**：独立世界在 CPU/Rayon 上并行推进；Transformer/CNN 在单张 CUDA GPU 上批量计算。没有 GPU 常驻仿真、多 GPU 分布式训练或已完成的100K局训练。先前仅推理基准不能证明训练 Infra 完整。
+
+**本轮实际改动：**
+
+- `sim/src/observation.rs`、`ffi.rs`：CPU 线程池直接填写固定布局 C 数值记录，Python/NumPy 接收，不再经过 JSON、Python 实体字典和地图逐格解析。JSON 只保留诊断；只输出原白名单字段，速度仍由位置与年龄连续性推导，未引入真实速度、AI状态或未来目标。
+- `sim_vec.py`：批量环形历史，按索引一次组装窗口；不再每环境逐帧循环复制后再 stack。每次返回独立窗口，终局观测保留、异步结束的worker单独清空；原版接口的64历史/256实体容量不变，溢出报错不截断。
+- `history_buffer.py`：接入 SB3 官方 `rollout_buffer_class` 扩展点，保留其 PPO/GAE 实现。每个worker只存每transition新增帧及rollout起点的63帧前缀；按样本长度重建窗口，跨episode不串记忆。动画字节、类别、布尔地图使用无损紧凑类型；取minibatch恢复原dtype。没有FP16量化，也不缓存旧权重的embedding。
+- `train_sim.py` 默认使用 `HistoryRolloutBuffer`；仍须显式 `--train` 才训练。原版环境未自动切换buffer，未改已有checkpoint。
+
+**同一主机、同一脚本的前后实测：** 64历史、256实体容量、4层Transformer、CUDA float32、4个Rust线程；每档预热64步、测32批。实际最多20–22实体，不是满256实体压力测试。
+
+|环境数|采样/编码决策/s 前→后|含CUDA策略推理决策/s 前→后|进程RSS GiB 前→后|
+|---:|---:|---:|---:|
+|8|274.8 → 907.2|163.3 → 318.9|1.786 → 1.721|
+|32|248.5 → 796.2|189.8 → 442.5|2.298 → 1.946|
+|128|237.4 → 903.6|196.8 → 500.6|4.264 → 2.788|
+
+128路端到端提高2.54倍；同档CUDA峰值allocated仍1.384GiB、reserved1.563GiB，因为模型和GPU稠密输入尚未改。性能测量会受主机负载影响，不能拿不同时段的旧表挑更有利的数字比较。
+
+**实分配、填满并遍历的128环境×128步缓冲区：** 观测存储含长度索引1,046,928,896 bytes（0.975GiB）；旧整窗需要76,164,366,336 bytes（70.934GiB），减少98.63%。实际采样+存储881.4决策/s，过程RSS峰值2.882GiB；minibatch8的一遍2,048批历史重建23.33秒（不含网络/反向）。这与上表策略推理基准是两个独立进程，不能把耗时直接当作完整训练FPS。
+
+验证：二进制和旧JSON编码4worker×240步逐字段对照；历史窗口所有权、容量溢出、seed覆盖；3个连续rollout、3轮shuffle、跨episode/前缀、GAE和mask与整窗参考逐项对照；SB3真实collect_rollouts和evaluate_actions接入通过。全部不调用 `learn/backward/optimizer.step`，权重不变。基准证据：`runs/l2/20260922-infra/{before,after,rollout}.json`。
+
+**剩余瓶颈与下一门槛**：策略每步仍组装/上传完整稠密64帧窗口，GPU每次重算CNN和实体编码。GPU原始帧环形缓存、增量H2D传输尚未实现；GPU物理内核也是独立工作，不能把本轮CPU二进制化包装成它。先做受控PPO更新测速再确定minibatch/环境数，随后Linux部署、长跑与原引擎迁移验收；本轮没有正式开训。
+
+复现：`python -m unittest test_sim_infra test_sim_vec test_sim_obs`；`python sim/tools/benchmark_pipeline.py --envs 8 32 128 --steps 32 --out runs/infra-benchmark.json`；`python sim/tools/benchmark_rollout.py --out runs/infra-rollout.json`。扩展接口依据 [SB3 OnPolicyAlgorithm 文档](https://stable-baselines3.readthedocs.io/en/master/modules/base.html#stable_baselines3.common.on_policy_algorithm.OnPolicyAlgorithm)；后续传输优化需遵守 [PyTorch pinned memory/异步传输的生命周期与性能约束](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html)，不是每步临时pin_memory就会更快。
+
+**Ubuntu RDP（仅恢复服务，未动训练环境）：** `ssh -p 2222 eolc@100.76.185.120`；实机Ubuntu22.04.5、RTX3080Ti12GB、94GiB RAM。3389的owner是GNOME Remote Desktop42.9，不是inactive的xrdp。旧daemon PID1462监听队列积压8–9、存在多条CLOSE-WAIT；客户端RDP协商5秒超时，普通restart35秒也未结束，停在stop-sigterm。只终止挂死的远程桌面daemon并重新启动，未注销GNOME会话、改密码、改防火墙或重启主机。新PID1542226启动CUDA编码，监听队列回到0；从本机通过RDP/NLA协商及TLS1.3握手（证书与通过SSH读取的服务器公钥证书匹配），耗时50ms。探针不提交凭据，随后关闭连接产生的NLA认证失败日志是预期结果，不是验证了错误密码。用户仍需用原RDP凭据确认实际桌面显示；本轮未证明GNOME内部挂死根因或长期不复发。
 
 ## 1. 证据基线（2026-09-19 核实）
 
