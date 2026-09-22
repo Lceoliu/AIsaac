@@ -1,5 +1,5 @@
 """Finite-deadline objective, unchanged physics, countdown and weights migration."""
-import json,tempfile,unittest
+import gzip,json,tempfile,unittest
 from pathlib import Path
 import numpy as np
 import torch
@@ -119,8 +119,21 @@ class DeadlineGpuTest(unittest.TestCase):
                 model.learn(16,callback=Oracle())
                 self.assertEqual(model.gamma,.999);self.assertTrue(model.policy.optimizer.state)
                 self.assertGreater(model.policy.features_extractor.player[0].weight[:,-1].abs().sum().item(),0)
-                folder=out/'new';folder.mkdir();cfg['reward_profile']='combat-v1'
+                folder=out/'new';folder.mkdir();cfg.update(reward_profile='combat-v1',history=8,
+                    entity_capacity=128,schema='monstro-transformer-v4-deadline',eval_seeds=[2**31,2**31+1])
                 s=TrainingSession(cfg,folder);s.updates=1;cp=s.save(model,'update')
+                s.evaluate(model,cp)
+                from isaac_bridge.evaluation import visible_snapshot
+                for file in (folder/'evaluations').glob('*/*.jsonl.gz'):
+                    with gzip.open(file,'rt') as f:rows=[json.loads(line) for line in f]
+                    meta=rows.pop(0)['metadata'];self.assertEqual(meta['reward_profile'],'combat-v1')
+                    replay=RustBatch(1,meta['seed'],reward_profile='combat-v1')
+                    try:
+                        for row in rows[1:]:
+                            replay.step([row['action']])
+                            self.assertEqual(visible_snapshot(replay.states()[0]),{k:v for k,v in row.items() if k!='action'})
+                        self.assertTrue(rows[-1]['done']);self.assertFalse(rows[-1]['truncated'])
+                    finally:replay.close()
                 restored_env=GpuFrameVecEnv(2,91,2,1,history=8,capacity=128,reward_profile='combat-v1')
                 restored,_=resume_model(cp,restored_env)
                 self.assertEqual(restored.gamma,.999)

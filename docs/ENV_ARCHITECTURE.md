@@ -374,6 +374,19 @@ PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --r
 
 资源观测（旧正式训练，连续120个一秒采样）：GPU平均82.05%、最高87%，显存整卡6794/12288MiB，功耗约302W，温度约74℃；训练进程CPU约100.3%（相当一个逻辑核，不是全机100%），全机CPU约6.5%，进程RSS约3.10GiB，全机可用约82.3GiB，swap为0。物理8核/逻辑16线程。该观测不能单凭空余显存就推断增加环境数会加速；需要测PPO更新与CPU调度/GPU算子的实际占比。
 
+**切换已执行：** 旧进程1576867停止，旧目录完整保留；旧日志11027局，迁移源为第520轮checkpoint（11019局、8519680 transitions）。新目录`/home/eolc/isaac-rl/runs/monstro-128k-reward-v1-20260923`，128环境、8个Rust线程、单块、T128、minibatch32、4epochs、严格FP32；控制记录在`runs/reward-v1-20260923-control/`。本机/远端38项Python测试通过。不要把新实验重置的episode计数当成旧实验数据丢失。
+
+**隔离性能实验（3080Ti，旧进程停止后、新进程启动前）：** 从同一迁移源复制模型，对固定128×128 rollout做4epochs完整更新；各配置重置相同权重和Adam。采样1.640秒（约9991决策/秒），默认更新57.783秒，占采样+更新的97.24%；即使采样成本变成零，该短测最多只提升约2.84%。Profiler显示卷积反向、embedding反向、矩阵乘与attention反向突出，CPU侧有频繁CUDA同步/launch。不能把8个空闲CPU线程等同于8倍学习器加速。
+
+| 配置（隔离实验） | 更新秒数 | 含采样的新transition/s | 相对默认 | 峰值allocated显存GiB |
+|---|---:|---:|---:|---:|
+| minibatch32 / FP32 | 57.783 | 275.72 | 1.00× | 2.413 |
+| minibatch64 / FP32 | 48.965 | 323.77 | 1.17× | 2.965 |
+| minibatch128 / FP32 | 45.298 | 349.05 | 1.27× | 4.067 |
+| minibatch32 / BF16 autocast | 41.038 | 383.90 | 1.39× | 2.270 |
+
+这些不是同一优化轨迹：大minibatch把每轮optimizer.step从2048降为1024/512；BF16单批未更新时的log-prob最大偏差0.0570、value偏差0.00443，尚未通过采样/更新数值一致性与学习成绩验证。因此**生产继续32/FP32**，不把benchmark的加速假装已经上线。暖缓存长跑的nvidia-smi整卡显存与这里PyTorch峰值allocated不是同一口径。证据：本机`runs/l2/20260923-reward-v1/benchmark.json`、`resources.json`、远端对应control目录。进一步优先研究训练端混合精度一致性和同步/小kernel开销，而不是继续增大环境数。
+
 ## 1. 证据基线（2026-09-19 核实）
 
 | 主题 | 事实 | 证据 |
