@@ -1,5 +1,5 @@
 """Real Rust process -> visible schema -> existing CNN/Transformer forward pass."""
-import copy,json,subprocess,unittest
+import copy,json,subprocess,sys,unittest
 from pathlib import Path
 import torch
 from isaac_bridge.sim_obs import rust_visible_observation
@@ -8,7 +8,8 @@ from isaac_bridge.transformer_policy import CombatTransformer
 
 class RustObservationTest(unittest.TestCase):
     def test_live_monstro_observations_and_no_hidden_target_leak(self):
-        exe=Path(__file__).resolve().parents[2]/'sim/target/release/examples/motion_trace.exe'
+        name='motion_trace.exe' if sys.platform=='win32' else 'motion_trace'
+        exe=Path(__file__).resolve().parents[2]/'sim/target/release/examples'/name
         proc=subprocess.Popen([str(exe)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,encoding='utf8')
         def command(s):
             proc.stdin.write(s+'\n');proc.stdin.flush();return json.loads(proc.stdout.readline())
