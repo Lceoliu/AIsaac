@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.save_util import load_from_zip_file
 from .gpu_ppo import GpuMaskablePPO,FrameSampler
 
 HELD_OUT_SEEDS=list(range(0x80000000,0x80000010))
@@ -109,6 +110,8 @@ def resume_model(checkpoint,env,device='cuda'):
     """Rebuild native RNG/Previous state from seed+actions; restore raw history."""
     checkpoint=resolve_checkpoint(checkpoint)
     state=json.loads((checkpoint/'state.json').read_text())
+    if state['config'].get('reward_profile','legacy')!=env.reward_profile:
+        raise ValueError('Reward changed: use --warm-start, not exact --resume')
     with gzip.open(checkpoint/'continuation.pt.gz','rb') as f:
         data=torch.load(f,map_location='cpu',weights_only=False)
     model=GpuMaskablePPO.load(checkpoint/'model.zip',env=env,device=device,force_reset=False)
@@ -132,3 +135,21 @@ def resume_model(checkpoint,env,device='cuda'):
     torch.cuda.synchronize(model.device)
     restore_rng(data['rng'])
     return model,state
+
+
+def warm_start_model(model,checkpoint):
+    """Weights only. New countdown input starts at zero; optimizer/RNG stay fresh."""
+    checkpoint=resolve_checkpoint(checkpoint)
+    _,params,_=load_from_zip_file(checkpoint/'model.zip',device='cpu')
+    source=params['policy'];target=model.policy.state_dict();expanded=[]
+    for key,value in source.items():
+        if value.shape!=target[key].shape:
+            if not (key.endswith('player.0.weight') and value.ndim==2 and
+                    target[key].shape==(value.shape[0],value.shape[1]+1)):
+                raise ValueError(f'Unsupported migration shape: {key}')
+            extra=torch.zeros((value.shape[0],1),dtype=value.dtype)
+            source[key]=torch.cat([value,extra],dim=1);expanded.append(key)
+    model.policy.load_state_dict(source,strict=True)
+    if model.policy.optimizer.state:raise RuntimeError('Warm start requires a fresh optimizer')
+    return dict(checkpoint=str(checkpoint),expanded_zero_columns=expanded,
+                optimizer_restored=False,episode_state_restored=False)

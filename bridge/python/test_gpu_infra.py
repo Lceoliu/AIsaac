@@ -152,7 +152,8 @@ class GpuInfraTest(unittest.TestCase):
         with patch('sys.argv',['train_sim.py','--envs','128','--n-steps','128']),redirect_stdout(output):train_sim.main()
         c=json.loads(output.getvalue().split('PREPARED ONLY:')[0])
         self.assertEqual(c['batch_size'],32);self.assertEqual(c['pipeline'],'gpu')
-        self.assertAlmostEqual(c['rollout_observation_gib'],1.662689208984375)
+        self.assertAlmostEqual(c['rollout_observation_gib'],1.66278076171875)
+        self.assertEqual(c['reward_profile'],'combat-v1');self.assertEqual(c['gamma'],0.999)
 
     def test_sb3_learn_two_bounded_updates(self):
         env=GpuFrameVecEnv(2,history=8,capacity=128,threads=2,chunks=2)

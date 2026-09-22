@@ -22,7 +22,8 @@ class CombatTransformer(BaseFeaturesExtractor):
         self.variant = nn.Embedding(8192, 16)
         self.subtype = nn.Embedding(4096, 8)
         self.active_item = nn.Embedding(4096, 16)
-        self.player = nn.Sequential(nn.Linear(len(PLAYER_FIELDS)+32+16, 64), nn.GELU(),
+        self.has_deadline='remaining_time' in observation_space.spaces
+        self.player = nn.Sequential(nn.Linear(len(PLAYER_FIELDS)+32+16+int(self.has_deadline), 64), nn.GELU(),
                                     nn.Linear(64, 64), nn.LayerNorm(64))
         self.entity = nn.Sequential(nn.Linear(len(ENTITY_FIELDS)+32+16+8+32, 128), nn.GELU(),
                                     nn.Linear(128, 128), nn.LayerNorm(128))
@@ -59,7 +60,9 @@ class CombatTransformer(BaseFeaturesExtractor):
         p = observations['player'][valid_time]
         animation = self.animation_embedding(observations['player_anim'][valid_time])
         active = self.active_item(observations['active_kind'][valid_time].long().squeeze(-1))
-        player = self.player(torch.cat([p, animation, active], -1))
+        inputs=[p,animation,active]
+        if self.has_deadline:inputs.append(observations['remaining_time'][valid_time].unsqueeze(-1))
+        player = self.player(torch.cat(inputs, -1))
         mask = observations['entity_mask'][valid_time].bool()
         features = observations['entities'][valid_time][mask]
         kinds = observations['entity_kind'][valid_time][mask].long()

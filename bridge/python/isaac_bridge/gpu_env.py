@@ -31,7 +31,7 @@ class TransferSlot:
 class FrameChunk:
     def __init__(self,owner,start,stop,threads):
         self.owner=owner;self.start=start;self.stop=stop;self.n=stop-start
-        self.batch=RustBatch(self.n,owner.base_seed+start,threads)
+        self.batch=RustBatch(self.n,owner.base_seed+start,threads,reward_profile=owner.reward_profile)
         self.copy_stream=torch.cuda.Stream(device=owner.device)
         self.compute_stream=torch.cuda.Stream(device=owner.device)
         self.ready=torch.cuda.Event()
@@ -94,14 +94,15 @@ class FrameChunk:
 
 
 class GpuFrameVecEnv(VecEnv):
-    def __init__(self,n=8,seed=1,threads=4,chunks=1,history=HISTORY,capacity=ENTITY_CAPACITY,device='cuda'):
+    def __init__(self,n=8,seed=1,threads=4,chunks=1,history=HISTORY,capacity=ENTITY_CAPACITY,device='cuda',reward_profile='legacy'):
         if not 1<=chunks<=min(n,threads):raise ValueError('chunks must be <= envs and total Rust threads')
         if not 1<=capacity<=256:raise ValueError('capacity must be 1..256')
         self.device=torch.device(device)
         if self.device.type!='cuda':raise ValueError('GpuFrameVecEnv requires CUDA')
         self.base_seed=seed;self.capacity=capacity;self.history=history;self.generation=0
+        self.reward_profile=reward_profile
         self.record_states=False;self.training_seeds=False
-        super().__init__(n,VisibleHistory(history,capacity).space,spaces.MultiDiscrete([45,2,2]))
+        super().__init__(n,VisibleHistory(history,capacity,deadline=reward_profile=='combat-v1').space,spaces.MultiDiscrete([45,2,2]))
         boundaries=np.linspace(0,n,chunks+1,dtype=int)
         self.chunks=[FrameChunk(self,int(boundaries[i]),int(boundaries[i+1]),threads//chunks+int(i<threads%chunks)) for i in range(chunks)]
         self.executor=ThreadPoolExecutor(max_workers=chunks,thread_name_prefix='isaac-frame')
@@ -119,7 +120,7 @@ class GpuFrameVecEnv(VecEnv):
         obs={k:np.zeros((self.num_envs,*s.shape),s.dtype) for k,s in self.observation_space.spaces.items()}
         for c in self.chunks:
             for k,v in obs.items():
-                source=c.slots[0].frames[k]
+                source=np.ones(c.n,np.float32) if k=='remaining_time' else c.slots[0].frames[k]
                 if k.startswith('entity') or k=='entities':source=source[:,:self.capacity]
                 v[c.start:c.stop,0]=source
         return obs
@@ -141,12 +142,14 @@ class GpuFrameVecEnv(VecEnv):
 def decode_frame(words,space):
     result={}
     for k,s in space.spaces.items():
+        if k=='remaining_time':continue
         dtype,offset=FRAME_DTYPE.fields[k]
         v=words[:,offset//4:(offset+dtype.itemsize)//4]
         if dtype.base==np.dtype('float32'):v=v.view(torch.float32)
         v=v.reshape(len(words),*dtype.shape)
         if k.startswith('entity') or k=='entities':v=v[:,:s.shape[1]]
         result[k]=v
+    if 'remaining_time' in space.spaces:result['remaining_time']=(1-result['time']/120).clamp(0,1)
     return result
 
 

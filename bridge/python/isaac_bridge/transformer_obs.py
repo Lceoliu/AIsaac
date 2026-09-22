@@ -13,6 +13,7 @@ from gymnasium import spaces
 from .monstro_gym import MonstroGymEnv
 
 SCHEMA = 'monstro-transformer-v3'
+DEADLINE_SCHEMA = 'monstro-transformer-v4-deadline'
 HISTORY = 64
 ENTITY_CAPACITY = 256
 ANIMATION_BYTES = 32
@@ -76,7 +77,8 @@ def entity_key(entity):
 
 
 class VisibleHistory:
-    def __init__(self, history=HISTORY, capacity=ENTITY_CAPACITY):
+    def __init__(self, history=HISTORY, capacity=ENTITY_CAPACITY,deadline=False):
+        self.deadline=deadline
         self.history, self.capacity = history, capacity
         self.frames = deque(maxlen=history)
         self.previous = None
@@ -97,6 +99,7 @@ class VisibleHistory:
             'time': spaces.Box(0, np.inf, (h,), np.float32),
             'history_mask': spaces.Box(0, 1, (h,), np.float32),
         })
+        if deadline:self.space.spaces['remaining_time']=spaces.Box(0,1,(h,),np.float32)
 
     def clear(self):
         self.frames.clear()
@@ -177,6 +180,7 @@ class VisibleHistory:
         frame['terrain'] = terrain_channels(obs)
         frame['previous_action'] = self.previous_action.copy()
         frame['time'] = np.float32((obs['logic_frames']-self.origin)/30)
+        if self.deadline:frame['remaining_time']=np.float32(max(0,1-frame['time']/120))
         frame['history_mask'] = np.float32(1)
         self.frames.append(frame)
         self.previous = obs

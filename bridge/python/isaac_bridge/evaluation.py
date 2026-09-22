@@ -31,7 +31,8 @@ def evaluate_checkpoint(checkpoint,out,seeds,device='cuda'):
         raise ValueError('Evaluation seeds must be unique uint32 held-out seeds >= 2**31')
     saved=json.loads((checkpoint/'state.json').read_text());config=saved['config']
     env=GpuFrameVecEnv(len(seeds),seeds[0],min(4,len(seeds)),1,
-                       history=config['history'],capacity=config['entity_capacity'],device=device)
+                       history=config['history'],capacity=config['entity_capacity'],device=device,
+                       reward_profile=config.get('reward_profile','legacy'))
     try:
         model=GpuMaskablePPO.load(checkpoint/'model.zip',env=env,device=device,
                                 custom_objects={'n_envs':len(seeds)},force_reset=True)
@@ -55,6 +56,7 @@ def evaluate_checkpoint(checkpoint,out,seeds,device='cuda'):
                             checkpoint=str(checkpoint.resolve()),timesteps=saved['timesteps'],
                             updates=saved['updates'],deterministic=True,logic_fps=30,action_repeat=2,
                             schema=config['schema'],source_revision=config.get('source_revision'),
+                            reward_profile=config.get('reward_profile','legacy'),
                             visualization='Recorded geometry, not original sprite animation')
                         write_replay(out/f'seed-{seeds[i]}',metadata,rows[i])
                         results.append(dict(seed=seeds[i],outcome=info['outcome'],layout=info['layout'],

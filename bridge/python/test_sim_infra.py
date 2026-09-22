@@ -50,7 +50,7 @@ class CompactBufferTest(unittest.TestCase):
         from unittest.mock import patch
         import train_sim
         output=io.StringIO()
-        with patch('sys.argv',['train_sim.py','--envs','128','--n-steps','128','--pipeline','legacy']),redirect_stdout(output):
+        with patch('sys.argv',['train_sim.py','--envs','128','--n-steps','128','--pipeline','legacy','--reward-profile','legacy']),redirect_stdout(output):
             train_sim.main()
         config=json.loads(output.getvalue().split('PREPARED ONLY:')[0])
         self.assertEqual(config['legacy_rollout_observation_gib'],70.93359375)

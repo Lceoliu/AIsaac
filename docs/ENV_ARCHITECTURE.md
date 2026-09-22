@@ -1,6 +1,6 @@
 # Isaac RL 环境架构：三层环境栈与统一契约
 
-更新：2026-09-22。最新存档/续训/留出评估见§0.11，Ubuntu3080Ti已部署，44项Rust/33项Python测试通过。§0.10的128路采样9128决策/s、含4epochs更新约287条新transition/s不含新增存档/评估开销；正式100K局未启动。GPU缓存实现见§0.9；物理仍为CPU/Rayon。
+更新：2026-09-23。128K回合旧奖励训练已于9月22日启动；最新第一版战斗目标与迁移方案见§0.12，存档/评估见§0.11。历史隔离吞吐不代表正式长训速度；物理仍为CPU/Rayon。
 
 ## 0. 结论
 
@@ -359,6 +359,20 @@ PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --r
 **Ubuntu验收已完成：** 44项Rust、33项Python测试通过（含回合终止/autoreset后的历史恢复，以及中断写入不替换latest）。生产规模网络H64/E256/4层8头、128环境×8步、minibatch32/4epochs跑完一次更新，保存并关闭环境；从checkpoint恢复现场后再更新一次，总2048条transition、2轮更新。续训恢复5.777秒，末次checkpoint 67,633,447字节（64.50MiB），最终保存加16局评估6.760秒；本次总峰值CUDA2.058GiB。这里T=8，不取代§0.10的T=128完整训练性能数据；此短现场的恢复速度/压缩率也不是满H64历史的最坏值。
 
 16局固定留出评估全部生成轨迹与HTML（约20.77MiB），结果0胜/16死/0超时，均回报-5.876；模型仅经过两轮验证更新，没有训练效果主张。浏览器经localhost实际验收初始帧、95号帧、191号死亡帧和播放推进；单个HTML没有外部依赖，独立文件打开由用户侧浏览器完成。远端记录：`/home/eolc/isaac-rl/runs/checkpoint-acceptance-20260922/`；本机副本：`runs/l2/20260922-checkpoints/replays/index.html`。重建工具已从gzip记录重新产出`rebuilt.html`并验证时间轴。更新Rust ABI后需先重新build release库，再运行Python；仅替换Python源码不够。
+
+### 0.12 第一版战斗目标与权重迁移（2026-09-23）
+
+用户同意第一版：受伤−1、有效命中+0.05、伤害/敌人最大血量保持不变；清房+3，再加`max(0, 1 - elapsed_frames/3600)`速度奖金；120秒未清房−1。不增加每秒扣分、不增加死亡惩罚，也不引入无进展计时器。清房速度按游戏逻辑帧算，不能按训练墙钟算。`gamma=0.999`，旧实验保持0.99，GAE lambda仍0.95。
+
+- CLI默认`--reward-profile combat-v1`，可显式选`legacy`保留旧实验契约。奖励位于Python批量环境出口，Rust物理/ABI/原始机制不改；`RustBatch.observe()`与诊断`states()`导出同一奖励与终止语义。不是在Rust和Python各加一遍奖励。实际扣血导致的奖励与终局奖励可在同一步叠加。
+- 120秒现在是任务截止时间：`done=true, truncated=false`，PPO不得追加timeout bootstrap。legacy保留原有truncation。新actor schema=`monstro-transformer-v4-deadline`，增添归一化剩余时间`remaining_time∈[0,1]`；共享`VisibleHistory(deadline=True)`可供原引擎适配，当前实际长训为L2。
+- 原始帧ABI不变，GPU从原始`time`派生剩余时间，CPU参考管线同算；倒计时进入玩家编码器并参与冻结帧缓存。其余输入不变。截止帧为0，autoreset后的新房间为1；无效历史仍为0，依靠history_mask区分。
+- 旧实验保留，不把旧/新奖励回报混到同一曲线。用户确认从最新已发布checkpoint做**weights-only迁移**到新目录，并停止旧进程，避免两份训练抢GPU。`--warm-start CHECKPOINT`复制原网络权重，倒计时新增输入列置零；优化器、RNG、房间现场及实验内回合计数重置。不是精确断点续训。新实验目标仍为128000个完整回合。
+- `--resume`只允许同奖励语义、同配置继续现场；旧checkpoint缺失reward_profile时按legacy识别，禁止把旧现场默默接到新奖励。新模型精确续训仍保存Adam/RNG/动作前缀/历史。评估继承对应奖励版本并在每局回放metadata记录，不读取CLI默认值替代checkpoint配置。
+
+回归入口`test_combat_reward.py`覆盖奖励公式、真实记录的1226动作清房与1800动作超时、无每秒/死亡额外扣分、物理逐字段不变、CPU/GPU倒计时一致、截止终止不bootstrap、重置历史，以及零列权重迁移、Adam重置与v4现场续训。fixture仅包含动作/seed/终止帧，不包含原版游戏资源。
+
+资源观测（旧正式训练，连续120个一秒采样）：GPU平均82.05%、最高87%，显存整卡6794/12288MiB，功耗约302W，温度约74℃；训练进程CPU约100.3%（相当一个逻辑核，不是全机100%），全机CPU约6.5%，进程RSS约3.10GiB，全机可用约82.3GiB，swap为0。物理8核/逻辑16线程。该观测不能单凭空余显存就推断增加环境数会加速；需要测PPO更新与CPU调度/GPU算子的实际占比。
 
 ## 1. 证据基线（2026-09-19 核实）
 

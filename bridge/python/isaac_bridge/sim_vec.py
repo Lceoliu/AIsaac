@@ -11,6 +11,7 @@ import numpy as np
 from gymnasium import spaces
 from stable_baselines3.common.vec_env import VecEnv
 from .transformer_obs import VisibleHistory,HISTORY,ENTITY_CAPACITY
+from .combat_reward import REWARD_PROFILES,combat_v1_reward
 
 # Fixed C record, independently checked against Rust sizeof at load time.
 FRAME_DTYPE=np.dtype([
@@ -22,8 +23,10 @@ FRAME_DTYPE=np.dtype([
 
 
 class RustBatch:
-    def __init__(self, n, seed=0, threads=1, library=None):
+    def __init__(self, n, seed=0, threads=1, library=None,reward_profile='legacy'):
         if n<1 or threads<1:raise ValueError('n and threads must be positive')
+        if reward_profile not in REWARD_PROFILES:raise ValueError(reward_profile)
+        self.reward_profile=reward_profile
         path=Path(library) if library else Path(__file__).resolve().parents[3]/'sim/target/release'/('isaac_sim.dll' if sys.platform=='win32' else 'libisaac_sim.so')
         self.lib=C.CDLL(str(path));self.n=n
         signatures={'new':([C.c_size_t,C.c_uint32,C.c_size_t],C.c_void_p),
@@ -43,9 +46,19 @@ class RustBatch:
         target=self.frames if out is None else out
         overflow=self.lib.isaac_batch_observe(self.handle,target.ctypes.data)
         if overflow:raise ValueError(f'Visible entity overflow: {overflow} > 256; never truncate')
+        if self.reward_profile=='combat-v1':
+            target['reward']=combat_v1_reward(target['reward'],target['outcome'],target['elapsed'])
+            target['truncated']=0 # 120 s is a task deadline, not an external cutoff.
         return target
 
-    def states(self):return json.loads(self.lib.isaac_batch_state(self.handle))
+    def states(self):
+        result=json.loads(self.lib.isaac_batch_state(self.handle))
+        if self.reward_profile=='combat-v1':
+            for row in result:
+                outcome=('running','death','win','time_limit').index(row['outcome'])
+                row['reward']=float(combat_v1_reward(row['reward'],outcome,row['state']['frame']))
+                row['truncated']=False
+        return result
 
     def reset(self,index,seed):
         if not 0<=index<self.n:raise IndexError(index)
@@ -68,11 +81,12 @@ class RustBatch:
 
 
 class SimVecEnv(VecEnv):
-    def __init__(self,n=8,seed=1,threads=4,history=HISTORY,capacity=ENTITY_CAPACITY,library=None):
-        self.batch=RustBatch(n,seed,threads,library)
+    def __init__(self,n=8,seed=1,threads=4,history=HISTORY,capacity=ENTITY_CAPACITY,library=None,reward_profile='legacy'):
+        self.reward_profile=reward_profile
+        self.batch=RustBatch(n,seed,threads,library,reward_profile)
         if not 1<=capacity<=256:raise ValueError('Binary sim capacity must be 1..256')
         self.history=history;self.capacity=capacity
-        space=VisibleHistory(history,capacity).space
+        space=VisibleHistory(history,capacity,deadline=reward_profile=='combat-v1').space
         self.ring={k:np.zeros((n,*v.shape),v.dtype) for k,v in space.spaces.items()}
         self.cursor=np.zeros(n,np.int64);self.valid=np.zeros(n,np.int64)
         self.base_seed=seed;self.episodes=np.zeros(n,dtype=np.int64)
@@ -94,7 +108,7 @@ class SimVecEnv(VecEnv):
         ids=np.arange(self.num_envs) if indices is None else np.asarray(indices)
         if np.any(frames['count'][ids]>self.capacity):raise ValueError('Visible entity overflow; increase capacity, never truncate')
         for k,v in self.ring.items():
-            values=frames[k][ids]
+            values=np.maximum(0,1-frames['time'][ids]/120) if k=='remaining_time' else frames[k][ids]
             if k.startswith('entity') or k=='entities':values=values[:,:self.capacity]
             v[ids,self.cursor[ids]]=values
         self.cursor[ids]=(self.cursor[ids]+1)%self.history

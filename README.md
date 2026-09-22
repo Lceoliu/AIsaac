@@ -46,6 +46,10 @@ pwsh -NoProfile -File .\rl\turbo\build.ps1     # DLL + 注入器 + 离线测试 
 python .\rl\bridge\python\test_turbo_control.py  # Python 端共享内存双向测试
 ```
 
+## 当前训练更新（2026-09-23）
+
+旧奖励128K实验已启动；第一版战斗目标已接入：清房+3、清房速度额外0～1、超时−1、无每秒扣分，gamma=0.999。120秒改为任务终止，并增加可见剩余时间输入。使用`--warm-start CHECKPOINT`迁移旧权重、重置优化器并新开实验；同版本现场续训仍用`--resume`。旧实验和回放保留，详见[目标与资源观测](docs/ENV_ARCHITECTURE.md#012-第一版战斗目标与权重迁移2026-09-23)。旧的“尚未开训”文字属于历史验收阶段。
+
 ## 下一步
 
 1. 用户验收 Rust Monstro 战斗；保留原版作为对照量具。
