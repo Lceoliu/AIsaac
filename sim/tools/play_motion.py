@@ -31,6 +31,8 @@ canvas=pg.Surface((560,360))
 font=pg.font.Font(None,22)
 atlas=pg.image.load(str(art/'characters/costumes/character_001_isaac.png')).convert_alpha()
 tear_atlas=pg.image.load(str(art/'tears.png')).convert_alpha()
+bomb_image=pg.image.load(str(art/'items/pick ups/pickup_016_bomb.png')).convert_alpha().subsurface((0,0,32,32))
+rock_image=pg.image.load(str(art/'grid/rocks_basement.png')).convert_alpha().subsurface((32,0,32,32))
 player_xml=ET.parse(animations/'001.000_player.anm2')
 tear_xml=ET.parse(animations/'002.000_tear.anm2')
 player_anims={a.attrib['Name']:a for a in player_xml.findall('.//Animation')}
@@ -84,7 +86,7 @@ def command(line):
     proc.stdin.write(line+'\n'); proc.stdin.flush()
     return json.loads(proc.stdout.readline())
 
-reset_command=f'monstro {args.seed}' if args.monstro else 'reset 320 280 -1'
+reset_command=f'arena {args.seed}' if args.monstro else 'reset 320 280 -1'
 state=command(reset_command)
 tick=0; walk_time=0.; head='Down'; body='Down'; show_boxes=False
 deadline=time.perf_counter()
@@ -101,15 +103,19 @@ try:
                 if event.key==pg.K_F1: show_boxes=not show_boxes
                 if event.key==pg.K_r:
                     state=command(reset_command); tick=0
+                if event.key==pg.K_n and args.monstro:
+                    args.seed+=1;reset_command=f'arena {args.seed}';state=command(reset_command);tick=0
         if not running: break
         keys=pg.key.get_pressed()
         mx=int(keys[pg.K_d])-int(keys[pg.K_a]); my=int(keys[pg.K_s])-int(keys[pg.K_w])
         shoot=next((i for i,k in enumerate([pg.K_UP,pg.K_RIGHT,pg.K_DOWN,pg.K_LEFT],1) if keys[k]),0)
+        bomb=int(keys[pg.K_e] or keys[pg.K_LSHIFT])
         if args.smoke:
             mx,my,shoot=(1,0,1) if tick<60 else (-1,0,2) if tick<120 else (0,0,2)
+            bomb=int(tick<2)
         move=move_codes[mx,my]
         if not args.monstro or (state['hp']>0 and state['bosses']):
-            state=command(f"{'half' if tick%2==0 else 'logic'} {move} {shoot}")
+            state=command(f"{'half' if tick%2==0 else 'logic'} {move} {shoot} {bomb}")
         p=state['player']; vx,vy=p['vel']; speed=(vx*vx+vy*vy)**0.5
         if speed>0.05:
             body=('Right' if vx>0 else 'Left') if abs(vx)>abs(vy) else ('Down' if vy>0 else 'Up')
@@ -118,6 +124,14 @@ try:
         if shoot: head=directions[shoot]
         elif mx or my: head=body
         canvas.blit(background,(0,0))
+        for cell in state['terrain']['cells']:
+            if cell[9]:canvas.blit(pg.transform.scale(rock_image,(40,40)),(round(cell[1]-60),round(cell[2]-120)))
+        for door in state['doors']:
+            dx,dy=door['pos'];pg.draw.rect(canvas,(83,64,47),(round(dx-54),round(dy-114),28,28),3)
+        for b in state['bombs']:
+            x,y=b['pos']
+            if b['dead']:pg.draw.circle(canvas,(206,158,88),(round(x-40),round(y-100)),75,2)
+            else:canvas.blit(bomb_image,(round(x-56),round(y-124)))
         px,py=p['pos']
         for b in state['bosses']:
             animation=boss_anims[b['anim']]
@@ -145,9 +159,9 @@ try:
         sprite(player_anims['Head'+head],4,2 if shoot and p['fire_delay']>7 else 0,atlas,(px,py))
         if show_boxes: pg.draw.circle(canvas,(205,182,124),(round(px-40),round(py-100)),10,1)
         screen.fill((28,25,23)); screen.blit(pg.transform.scale(canvas,(1120,720)),(0,0))
-        label=f'WASD move | Arrows shoot | R reset | F1 collision circles | Esc exit    speed {speed:.3f}    60 Hz player / 30 Hz tears'
+        label=f'WASD | Arrows shoot | E bomb ({p["bombs"]}) | R reset | F1 hitboxes | Esc    speed {speed:.3f}'
         if args.monstro:
-            label=f'WASD | Arrows | R restart seed {args.seed} | F1 hitboxes    HP {state["hp"]:.0f}/6'
+            label=f'WASD | Arrows | E bomb ({p["bombs"]}) | R retry | N next seed ({args.seed}) | room {state["layout"]} | F1    HP {state["hp"]:.0f}/6'
             if state['hp']<=0 or not state['bosses']:label+='    DEAD / CLEAR - press R'
         screen.blit(font.render(label,True,(221,211,188)),(12,732))
         pg.display.flip(); tick+=1

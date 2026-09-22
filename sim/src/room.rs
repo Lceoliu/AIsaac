@@ -59,6 +59,8 @@ pub struct Room {
     /// Room+0x76c。
     pub path: Vec<i32>,
     pub frame: u32,
+    pub doors: [bool; 4],
+    pub layout: u32,
 }
 
 impl Room {
@@ -96,6 +98,8 @@ impl Room {
             cells,
             path,
             frame: 0,
+            doors: [false; 4],
+            layout: 0,
         };
         // FUN_007f2390 第 166–172 行（矩形房）
         let c11 = room.cell_center(width + 1);

@@ -23,6 +23,16 @@ use crate::tear;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
+    EnemyDamaged {
+        id: u32,
+        damage: f32,
+        hits: u32,
+        max_hp: f32,
+    },
+    BombExploded {
+        id: u32,
+        pos: Vec2,
+    },
     /// Internal spawn request; never an actor observation (contains current aim).
     BossVolley {
         from: u32,
@@ -31,9 +41,17 @@ pub enum Event {
         count: usize,
     },
     /// Gusher 请求发射血弹（弹幕实体尚未实现）。
-    FireProjectiles { from: u32, pos: Vec2, vel: Vec2 },
+    FireProjectiles {
+        from: u32,
+        pos: Vec2,
+        vel: Vec2,
+    },
     /// NPC 死亡并被移除。
-    NpcDied { id: u32, etype: i32, variant: i32 },
+    NpcDied {
+        id: u32,
+        etype: i32,
+        variant: i32,
+    },
     /// NPC 与玩家发生接触（每个重叠帧都会有）。
     Contact {
         npc: u32,
@@ -48,9 +66,17 @@ pub enum Event {
         vel: Vec2,
     },
     /// 眼泪命中 NPC（伤害进入 NPC 的待结算伤害，下一帧扣血）。
-    TearHit { tear: u32, npc: u32, damage: f32 },
+    TearHit {
+        tear: u32,
+        npc: u32,
+        damage: f32,
+    },
     /// 眼泪消失：cause 1 落地、2 撞墙、3 命中。
-    TearRemoved { tear: u32, cause: u8, pos: Vec2 },
+    TearRemoved {
+        tear: u32,
+        cause: u8,
+        pos: Vec2,
+    },
     /// 玩家受伤（半心单位）。
     PlayerDamaged {
         player: u32,
@@ -184,20 +210,80 @@ impl World {
                 continue;
             }
             match e.kind {
-                EntityKind::Npc => npc::update_npc(
-                    e,
-                    &mut self.room,
-                    player_pos,
-                    frame,
-                    &mut self.rng,
-                    &mut events,
-                ),
+                EntityKind::Npc => {
+                    let hp = e.hp;
+                    let hits = e.pending_hits;
+                    npc::update_npc(
+                        e,
+                        &mut self.room,
+                        player_pos,
+                        frame,
+                        &mut self.rng,
+                        &mut events,
+                    );
+                    if e.hp < hp {
+                        events.push(Event::EnemyDamaged {
+                            id: e.id,
+                            damage: hp.max(0.) - e.hp.max(0.),
+                            hits,
+                            max_hp: e.max_hp,
+                        });
+                    }
+                    e.pending_hits = 0;
+                }
                 EntityKind::Player => {
                     player::update_player(e, &mut self.rng, &mut events, &mut spawned);
                     player_pos = e.pos;
                 }
                 EntityKind::Tear => tear::update(e),
                 EntityKind::Projectile => crate::projectile::update(e),
+                EntityKind::Bomb => crate::bomb::update(e),
+            }
+        }
+
+        // Blast damage is queued for NPC settlement, as in the native engine.
+        let blasts: Vec<_> = self
+            .entities
+            .iter()
+            .filter(|e| e.kind == EntityKind::Bomb && e.exists && e.dead)
+            .map(|e| (e.id, e.pos))
+            .collect();
+        for (id, pos) in blasts {
+            events.push(Event::BombExploded { id, pos });
+            for e in &mut self.entities {
+                if !e.exists || e.dead || e.entity_collision_class == 0 {
+                    continue;
+                }
+                if (e.pos - pos).length() >= 75. + e.size {
+                    continue;
+                }
+                match e.kind {
+                    EntityKind::Player => {
+                        player::take_damage(e, 2., Some(id), &mut events);
+                    }
+                    EntityKind::Npc => {
+                        let actual = 100_f32.min((e.hp - e.pending_damage).max(0.));
+                        e.pending_damage += actual;
+                        if actual > 0. {
+                            e.pending_hits += 1;
+                        }
+                    }
+                    EntityKind::Bomb => {
+                        e.bomb.as_mut().unwrap().countdown = 0;
+                    }
+                    _ => {}
+                }
+            }
+            for index in 0..self.room.cell_count() {
+                if self.room.cells[index as usize].kind == crate::room::GridKind::Rock
+                    && (self.room.cell_center(index) - pos).length() < 75.
+                {
+                    self.room.cells[index as usize] = crate::room::GridCell {
+                        kind: crate::room::GridKind::Empty,
+                        collision_class: 0,
+                    };
+                    self.room.path[index as usize] = 0;
+                }
             }
         }
         for event in &events {
@@ -258,6 +344,22 @@ impl World {
                     }
                     (EntityKind::Player, EntityKind::Projectile) => {
                         projectile_vs_player(b, a, &mut events)
+                    }
+                    (EntityKind::Bomb, EntityKind::Npc) | (EntityKind::Npc, EntityKind::Bomb) => {
+                        if a.entity_collision_class != 0
+                            && b.entity_collision_class != 0
+                            && !a.dead
+                            && !b.dead
+                        {
+                            physics::circle_push(a, b);
+                        }
+                    }
+                    (EntityKind::Bomb, EntityKind::Player) => bomb_vs_player(a, b),
+                    (EntityKind::Player, EntityKind::Bomb) => bomb_vs_player(b, a),
+                    (EntityKind::Bomb, EntityKind::Tear) | (EntityKind::Tear, EntityKind::Bomb) => {
+                        if !a.dead && !b.dead {
+                            physics::circle_push(a, b);
+                        }
                     }
                     _ => {}
                 }
@@ -330,6 +432,21 @@ fn projectile_vs_player(shot: &mut Entity, player: &mut Entity, events: &mut Vec
         shot.dead = true;
         crate::player::take_damage(player, 1.0, Some(shot.id), events);
     }
+}
+
+fn bomb_vs_player(bomb: &mut Entity, player: &mut Entity) {
+    if bomb.dead
+        || player.dead
+        || (bomb.pos - player.pos).length_sq() >= (bomb.size + player.size).powi(2)
+    {
+        return;
+    }
+    if bomb.bomb.as_ref().unwrap().touch_grace > 0 {
+        bomb.bomb.as_mut().unwrap().touch_grace = 4;
+        return;
+    }
+    bomb.vel = bomb.vel + player.vel * 0.4;
+    physics::circle_push(bomb, player);
 }
 
 #[cfg(test)]

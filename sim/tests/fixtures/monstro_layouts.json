@@ -1,0 +1,117 @@
+{
+  "source": "analysis\\resources\\repentance-a\\derived\\abp_named_rooms_xml\\00.special rooms.xml",
+  "rooms": [
+    {
+      "variant": 1010,
+      "name": "Monstro",
+      "rocks": [],
+      "doors": [
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "variant": 1012,
+      "name": "Monstro",
+      "rocks": [
+        16,
+        17,
+        27,
+        28,
+        31,
+        43,
+        91,
+        103,
+        106,
+        107,
+        117,
+        118
+      ],
+      "doors": [
+        true,
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "variant": 1037,
+      "name": "Monstro (copy)",
+      "rocks": [
+        16,
+        17,
+        18,
+        19,
+        20,
+        31,
+        32,
+        33,
+        34,
+        46,
+        47,
+        48,
+        61,
+        62,
+        63,
+        76,
+        77,
+        78,
+        91,
+        92,
+        93,
+        94,
+        106,
+        107,
+        108,
+        109,
+        110
+      ],
+      "doors": [
+        false,
+        true,
+        true,
+        true
+      ]
+    },
+    {
+      "variant": 1038,
+      "name": "Monstro (copy)",
+      "rocks": [
+        16,
+        17,
+        20,
+        24,
+        27,
+        28,
+        31,
+        43,
+        76,
+        77,
+        87,
+        88,
+        91,
+        92,
+        93,
+        101,
+        102,
+        103,
+        106,
+        107,
+        108,
+        109,
+        115,
+        116,
+        117,
+        118
+      ],
+      "doors": [
+        true,
+        false,
+        true,
+        true
+      ]
+    }
+  ]
+}

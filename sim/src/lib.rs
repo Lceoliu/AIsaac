@@ -16,6 +16,10 @@
 //! J460 原版校准及独立留出测试（sim/tests/fixtures）；NPC/伤害/击退仍未完成此级别验收。
 
 pub mod entity;
+pub mod bomb;
+pub mod arena;
+pub mod snapshot;
+pub mod ffi;
 pub mod math;
 pub mod npc;
 pub mod pathfinder;

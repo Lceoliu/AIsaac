@@ -3,7 +3,7 @@
 //! `Weapon_Tears::Fire` 0x0060A720）、眼泪参数（`GetTearHitParams` 0x003BF6C0）与发射
 //! （`Entity_Player::FireTear` 0x00390AF0），以及受伤无敌（`Entity_Player::TakeDamage` 0x003729D0）。
 //!
-//! 规则出处与行号见 `analysis/docs/J460_PLAYER_TEAR_MODEL.md`。所有数值均未经实机校准。
+//! 规则出处见 `analysis/docs/J460_PLAYER_TEAR_MODEL.md`；移动/眼泪已通过原版留出轨迹验证。
 
 use crate::entity::{flags, Entity, TYPE_PLAYER};
 use crate::math::Vec2;
@@ -17,6 +17,7 @@ use crate::world::Event;
 pub struct PlayerInput {
     pub move_dir: Vec2,
     pub shoot_dir: Vec2,
+    pub bomb: bool,
 }
 
 impl PlayerInput {
@@ -24,6 +25,7 @@ impl PlayerInput {
         PlayerInput {
             move_dir: Vec2::new(move_x, move_y),
             shoot_dir: Vec2::new(shoot_x, shoot_y),
+            bomb: false,
         }
     }
 }
@@ -113,6 +115,9 @@ pub struct PlayerState {
     pub num_fired: i32,
     /// +0x13bc 受伤后的无敌倒计时（帧）。
     pub damage_cooldown: i32,
+    pub bombs: i32,
+    pub bomb_held: bool,
+    pub bomb_cooldown: i32,
     /// +0x1578：眼泪左右眼位移符号（每发交替 ±1；基础眼泪不用它改位置）。
     pub tear_displacement: i8,
     /// +0x146c：已发射眼泪计数（写入眼泪的 TearIndex）。
@@ -137,6 +142,9 @@ impl Default for PlayerState {
             weapon_direction: Vec2::ZERO,
             num_fired: 0,
             damage_cooldown: 0,
+            bombs: 1,
+            bomb_held: false,
+            bomb_cooldown: 0,
             tear_displacement: 1,
             tear_counter: 0,
             fired_this_frame: 0,
@@ -162,6 +170,26 @@ pub fn update_player(
         return;
     }
     e.speed_mult = 1.0;
+
+    // ACTION_BOMB is triggered on a rising edge, not repeatedly while held.
+    let pressed = e.player().input.bomb;
+    e.player_mut().bomb_cooldown = (e.player().bomb_cooldown - 1).max(0);
+    if pressed
+        && !e.player().bomb_held
+        && e.player().bombs > 0
+        && e.player().bomb_cooldown == 0
+        && e.player().controls_enabled
+    {
+        e.player_mut().bombs -= 1;
+        e.player_mut().bomb_cooldown = 30;
+        let mut b = crate::bomb::new(e.pos, e.vel * 0.1, e.id);
+        // Native player-created bombs receive their first update immediately.
+        crate::bomb::update(&mut b);
+        b.time_cur = 0.;
+        crate::bomb::update(&mut b);
+        spawned.push(b);
+    }
+    e.player_mut().bomb_held = pressed;
 
     // 1. Entity::Update：积分、状态倒计时、待结算伤害
     crate::physics::update(e);

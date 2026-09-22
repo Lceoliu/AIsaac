@@ -8,6 +8,8 @@
 
 ## 目标
 
+**2026-09-22 训练准备完成，未开训：** 普通炸弹、4种实机核实的Monstro地形、种子化门口/安全Boss出生点、Rust批量环境已接入。查看器新增E放炸弹、N换种子。原版与模拟器共用v3观测契约；本机实测8/16/128环境采样+推理为193/219/235决策每秒，当前观测历史搬运限制扩展效率。推荐先8–16环境；128×128步整窗rollout仅观测就70.93GiB，不能当作本机可用训练配置。详见 [最新验收与基准](docs/ENV_ARCHITECTURE.md#07-炸弹场景分布与训练准备2026-09-22)。`python bridge/python/train_sim.py` 默认只展示准备配置，不训练。
+
 构建可迁移到原版以撒的完整流程 AI。先证明单房间战斗能力，再扩展探索、道具选择、资源管理和整局决策。策略推理只接收玩家可观察信息；视觉或内存只是采集手段，隐藏实体、内部 AI 状态、RNG 和未来事件不得进入策略输入。成绩只以原版（L0）为准。
 
 ## 当前状态
@@ -18,7 +20,7 @@
 | Gymnasium / PPO策略 | 地图CNN、实体注意力、64帧时序Transformer；2/4原版引擎共用模型训练已跑通，累计512局全部死亡 | [并行训练入口](bridge/python/train_parallel.py)、[实测](docs/ENV_ARCHITECTURE.md#04-独立引擎并行采样2026-09-21) |
 | 奖励与观测 | 受伤−1、扣血命中+0.05、实际伤害/敌人初始MaxHP、清房+1、死亡不重复扣分；当前模型地图7通道，可见实体含敌弹 | [契约与边界](docs/ENV_ARCHITECTURE.md#03-transformer-战斗策略-v12026-09-21) |
 | 渲染控制与稳定性 | 保留原版无渲染训练和可视化模式，虚拟时钟关闭；本轮两个正式校准采样进程均正常退出0。历史崩溃修复及边界见专项文档 | [崩溃根因分析](docs/NATIVE_CRASH_ANALYSIS.md)、[L1 验收](docs/L1_FEASIBILITY_PLAN.md) |
-| L2 独立模拟器 | 基础Isaac已通过原版轨迹验收；Monstro运动、弹道及高度碰撞对照通过，共38项Rust测试；完整战斗迁移尚未验收 | [sim/](sim/)、[最新验收](docs/ENV_ARCHITECTURE.md#06-monstro-接入与可见观测2026-09-21) |
+| L2 独立模拟器 | 玩家/Monstro/普通炸弹对照通过，4种地形与10K种子安全出生，44项Rust测试；批量采样/推理跑到128环境，未开训，完整战斗迁移尚未验收 | [sim/](sim/)、[最新验收](docs/ENV_ARCHITECTURE.md#07-炸弹场景分布与训练准备2026-09-22) |
 | 相关项目调研 | 已含 Isaac 专项项目的实测数据；2026-09-20 新增 SC2/Dota/SoulsGym/EnvPool/Isaac-RL 的引擎适配做法调研（逐条附 URL）与本项目的训练场差距清单和实施顺序 | [RELATED_WORK.md](docs/RELATED_WORK.md)、[训练场设计](docs/TRAINING_ARENA_DESIGN.md)、[调研笔记](docs/ARENA_RESEARCH_NOTES.md) |
 | 旧 v0 原型 | 已否定；代码与自测记录保留 | [SINGLE_ROOM_V0.md](docs/SINGLE_ROOM_V0.md)、`isaac_room/` |
 

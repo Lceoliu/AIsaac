@@ -1,6 +1,6 @@
 //! Replay keyboard actions on the same simulation used by training.
 //! Input: reset x y fire_delay, or move(0..8) shoot(0..4), one per line.
-use isaac_sim::{entity::EntityKind, math::Vec2, player::PlayerInput, room::Room, world::World};
+use isaac_sim::{math::Vec2, player::PlayerInput, room::Room, world::World};
 use std::io::{self, BufRead, Write};
 
 fn main() {
@@ -32,6 +32,8 @@ fn main() {
             world = World::new(Room::new_rectangular(15, 9), fields[1].parse().unwrap());
             player = world.spawn_player(Vec2::new(320.0, 380.0));
             world.spawn_monstro(Vec2::new(320.0, 220.0));
+        } else if fields[0] == "arena" {
+            (world, player) = isaac_sim::arena::monstro(fields[1].parse().unwrap());
         } else if fields[0] == "boss" {
             let v: Vec<f32> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
             world = World::new(Room::new_rectangular(15, 9), 42);
@@ -49,6 +51,13 @@ fn main() {
                 8 => "Taunt",
                 _ => "Appear",
             };
+        } else if fields[0] == "bomb" {
+            let v: Vec<f32> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
+            world = World::new(Room::new_rectangular(15, 9), 42);
+            player = world.spawn_player(Vec2::new(v[5], v[6]));
+            let mut b = isaac_sim::bomb::new(Vec2::new(v[0], v[1]), Vec2::new(v[2], v[3]), player);
+            b.bomb.as_mut().unwrap().countdown = v[4] as i32;
+            world.spawn(b);
         } else if fields[0] == "projectile" {
             let v: Vec<f32> = fields[1..].iter().map(|s| s.parse().unwrap()).collect();
             world = World::new(Room::new_rectangular(15, 9), 42);
@@ -93,7 +102,9 @@ fn main() {
             let m = moves[fields[offset].parse::<usize>().unwrap()];
             let s = shots[fields[offset + 1].parse::<usize>().unwrap()];
             world.events.clear();
-            world.set_player_input(player, PlayerInput::new(m.0, m.1, s.0, s.1));
+            let mut input = PlayerInput::new(m.0, m.1, s.0, s.1);
+            input.bomb = fields.get(offset + 2).is_some_and(|x| *x == "1");
+            world.set_player_input(player, input);
             if half {
                 world.interpolate_players();
             } else if logic {
@@ -102,43 +113,7 @@ fn main() {
                 world.step();
             }
         }
-        let p = world.entity(player).unwrap();
-        print!(
-            "{{\"player\":{{\"pos\":[{},{}],\"vel\":[{},{}],\"fire_delay\":{}}},\"tears\":[",
-            p.pos.x,
-            p.pos.y,
-            p.vel.x,
-            p.vel.y,
-            p.player().fire_delay
-        );
-        let mut sep = "";
-        for t in world
-            .entities
-            .iter()
-            .filter(|e| e.kind == EntityKind::Tear && e.exists)
-        {
-            print!("{}{{\"id\":{},\"age\":{},\"pos\":[{},{}],\"vel\":[{},{}],\"height\":{},\"fall\":{},\"size\":{},\"scale\":{},\"dead\":{}}}",sep,t.id,t.time_cur,t.pos.x,t.pos.y,t.vel.x,t.vel.y,t.tear().height,t.tear().falling_speed,t.size,t.tear().scale,t.dead);
-            sep = ",";
-        }
-        print!("],\"hp\":{},\"frame\":{},\"bosses\":[", p.hp, world.frame);
-        sep = "";
-        for b in world.entities.iter().filter(|e| e.etype == 20) {
-            let n = b.npc();
-            print!("{}{{\"id\":{},\"age\":{},\"pos\":[{},{}],\"vel\":[{},{}],\"anim\":\"{}\",\"frame\":{},\"collision\":{},\"hp\":{},\"airborne\":{},\"body_visible\":{},\"shadow\":[{},{}],\"flip\":{},\"debug_state\":{},\"debug_target\":[{},{}]}}",sep,b.id,b.time_cur,b.pos.x,b.pos.y,b.vel.x,b.vel.y,n.anim,n.anim_frame,b.entity_collision_class,b.hp,isaac_sim::npc::monstro::airborne(n.anim,n.anim_frame),isaac_sim::npc::monstro::body_visible(n.anim,n.anim_frame),b.pos.x,b.pos.y,n.flip_x,n.state,n.target_pos.x,n.target_pos.y);
-            sep = ",";
-        }
-        print!("],\"projectiles\":[");
-        sep = "";
-        for b in world
-            .entities
-            .iter()
-            .filter(|e| e.kind == EntityKind::Projectile)
-        {
-            let q = b.projectile.as_ref().unwrap();
-            print!("{}{{\"id\":{},\"age\":{},\"pos\":[{},{}],\"vel\":[{},{}],\"height\":{},\"fall\":{},\"scale\":{},\"dead\":{},\"collision\":{}}}",sep,b.id,b.time_cur,b.pos.x,b.pos.y,b.vel.x,b.vel.y,q.height,q.falling_speed,q.scale,b.dead,b.entity_collision_class);
-            sep = ",";
-        }
-        println!("]}}");
+        println!("{}", isaac_sim::snapshot::state(&world, player));
         io::stdout().flush().unwrap();
     }
 }

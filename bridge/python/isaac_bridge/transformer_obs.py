@@ -12,7 +12,7 @@ from gymnasium import spaces
 
 from .monstro_gym import MonstroGymEnv
 
-SCHEMA = 'monstro-transformer-v2'
+SCHEMA = 'monstro-transformer-v3'
 HISTORY = 64
 ENTITY_CAPACITY = 256
 ANIMATION_BYTES = 32
@@ -105,6 +105,15 @@ class VisibleHistory:
         self.previous_action[:] = 0
 
     def append(self, obs):
+        # Shared sim/native contract: cosmetic player/tear/blood-shot animation
+        # is not calibrated in the simulator. Exclude it on BOTH backends,
+        # rather than let the policy distinguish domains from placeholder art.
+        obs = {**obs, 'players': [{**p, 'anim': '', 'aframe': 0, 'flip': False,
+                                  'active_charge': p['active_charge'] if p['active'] else 0}
+                                  for p in obs['players']],
+               'entities': [e if e['type'] in (20, 4) else
+                            {**e, 'anim': '', 'aframe': 0, 'flip': False}
+                            for e in obs['entities']]}
         if obs.get('combat_schema') != 3:
             raise ValueError('Transformer requires bridge combat_schema=3; deploy the matching Mod')
         if self.previous is None:

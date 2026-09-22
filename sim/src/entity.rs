@@ -65,6 +65,7 @@ pub enum EntityKind {
     Npc,
     Tear,
     Projectile,
+    Bomb,
 }
 
 /// `Entity_NPC` 专有字段。
@@ -189,6 +190,7 @@ pub struct Entity {
     pub max_hp: f32,
     /// +0x14：本帧累计的待结算伤害（`Entity::TakeDamage` 累加，`Entity::Update` 第 660–727 行扣血并清零）。
     pub pending_damage: f32,
+    pub pending_hits: u32,
     /// +0x308 击退方向（击退期间直接成为速度），+0x2f8 击退倒计时。
     pub knockback_dir: Vec2,
     pub knockback_countdown: i32,
@@ -218,6 +220,7 @@ pub struct Entity {
     pub player: Option<PlayerState>,
     pub tear: Option<TearState>,
     pub projectile: Option<crate::projectile::ProjectileState>,
+    pub bomb: Option<crate::bomb::BombState>,
 }
 
 impl Entity {
@@ -263,6 +266,7 @@ impl Entity {
             hp: 10.0,
             max_hp: 10.0,
             pending_damage: 0.0,
+            pending_hits: 0,
             knockback_dir: Vec2::ZERO,
             knockback_countdown: 0,
             freeze_countdown: 0,
@@ -285,6 +289,7 @@ impl Entity {
             player: None,
             tear: None,
             projectile: None,
+            bomb: None,
         }
     }
 

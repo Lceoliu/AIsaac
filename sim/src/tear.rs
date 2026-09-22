@@ -248,7 +248,11 @@ pub fn on_hit_npc(tear: &mut Entity, npc: &mut Entity, events: &mut Vec<Event>) 
         return false;
     }
     let damage = tear.collision_damage;
-    npc.pending_damage += damage;
+    let accepted = damage.min((npc.hp - npc.pending_damage).max(0.));
+    npc.pending_damage += accepted;
+    if accepted > 0. {
+        npc.pending_hits += 1;
+    }
     events.push(Event::TearHit {
         tear: tear.id,
         npc: npc.id,

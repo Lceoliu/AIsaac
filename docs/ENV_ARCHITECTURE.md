@@ -1,6 +1,6 @@
 # Isaac RL 环境架构：三层环境栈与统一契约
 
-更新：2026-09-21。原版 J460 已完成四引擎累计512局训练，但零清房。当前新增主线：先把 Rust 的基础 Isaac 手感对齐原版，再考虑 Linux 大规模采样；§0.5 是本轮实测结果，§0.3/0.4 保留现有模型与原版并行训练。目标与信息边界沿用 [PROJECT_SPEC.md](PROJECT_SPEC.md)。
+更新：2026-09-22。当前结果见 §0.7：炸弹、四种原版 Boss 地形、种子化安全出生、Rust 批量环境已接入，完成本机 1–128 环境采样/推理基准；没有启动新训练。原版 J460 历史四引擎512局零清房。目标与信息边界沿用 [PROJECT_SPEC.md](PROJECT_SPEC.md)。
 
 ## 0. 结论
 
@@ -187,11 +187,80 @@
 
 **Agent 实际输入**：沿用动画名/帧号、实体平面位置/运动历史、碰撞圈、Boss可见血条、弹丸height、CNN地形；新增 `airborne/body_visible/shadow_dx/shadow_dy/shadow_valid`。它们只由当前可见 ANM2 和当前位置计算：高跳出画时仍有阴影，当前阴影不等于隐藏目标点。没有 NPC.State、TargetPosition、后续动作或 RNG。`monstro-transformer-v2` 每实体31维（原26维），旧v1 checkpoint不能直接加载，需显式迁移权重或重训。
 
-`bridge/python/isaac_bridge/sim_obs.py::rust_visible_observation` 将同一 Rust 可玩内核的快照转成既有可见观测契约；`test_sim_obs.py` 用真实 Rust 进程连续1,000帧观测，验证全部四种动作和血弹、隐藏字段污染不改变输入，最后执行现有 CombatTransformer 前向。此接口限定当前空房、基础 Isaac；炸弹/主动道具被禁用，玩家动画特征暂置空，不凭空产生看不见的数据。它不是128 worker训练后端，本次没有新增训练成绩。
+观测适配初版的空房硬编码、炸弹禁用和缺少批量后端问题，已由 §0.7 替代。`test_sim_obs.py` 保留真实 Rust 进程1,000帧的输入/隐藏目标隔离回归。
 
 手测：`pwsh -File sim/play_motion.ps1 -Monstro -Seed 42`。WASD、方向键、R按同种子重开、F1碰撞圈、Esc退出；死亡/击杀后停止推进。指定另一 seed 改变模拟器动作选择和散射；相同 seed **和输入序列**可复现，不追求与原引擎全局RNG逐位相同。
 
 **跳跃查看器修复（2026-09-21）**：用户发现高跳时 `subsurface rectangle outside surface area`。JumpDown帧0–28的身体裁切矩形为 `(400,224,80,112)`，而图集仅400×224；这是身体出画阶段的空白图块，独立阴影图层仍然有效。查看器现跳过与图集完全不相交的空白帧，不改原图、AI或碰撞。`python sim/tools/test_play_motion.py` 直接测试生产绘制函数，覆盖全部1,176个Monstro动画帧/图层/朝向组合，并验证29帧只有阴影、帧29身体重新出现。另以seed7运行240 tick完整查看器，经过高跳后正常退出。先前seed42/9的短测未覆盖这个空白片段，不能替代逐动画覆盖。原图的libpng iCCP警告与该越界异常无关，仍保留。
+
+### 0.7 炸弹、场景分布与训练准备（2026-09-22）
+
+**已实现，未开训。** Rust `bomb.rs`、`arena.rs`、`ffi.rs` 与 Python `SimVecEnv` 共用可玩内核；不是重新写一套训练用物理。`train_sim.py` 默认只打印配置，只有显式 `--train` 才创建模型和开始 PPO；本轮未使用该参数，也未执行 `learn/backward/optimizer.step`。
+
+#### 炸弹的实机依据
+
+- J460 Bomb Init RVA `0x002A2050`、Update `0x002A24D0`、HandleCollision `0x002A5F00`。普通炸弹半径16、质量6；玩家放置继承当前速度×0.1，出生帧两次积分（可见 age=1），之后先积分，再×0.95，速度小于1再×0.5。
+- 首个可见帧为 Pulse 15；第45个可见逻辑帧爆炸。消耗1炸弹，按键上升沿触发，30逻辑帧放置冷却；一直按住不会连续放。默认 Isaac 初始1炸弹。
+- 敌人伤害100，自伤2半心；爆炸命中采用严格距离 `<75+实体半径`。实机玩家距离84命中、85不命中；Monstro距离114命中、115不命中。空中碰撞类0的 Monstro 免疫。NPC下一帧结算，奖励按实际扣血，截断过量伤害；自伤−1事件，不因扣一整心变成−2奖励。
+- 可以炸毁普通岩石，地形输入随即更新；支持普通接触推动。岩石掉落物、爆炸击退的完整细节、所有眼泪推炸弹/墙边组合及道具改造炸弹尚未逐项做原版对照，不能声称全量炸弹机制等价。
+- 三个隔离原版采样进程的 `native*/exit.json` 均记录正常退出0；不修改安装目录中的 Mod。紧凑真值 `sim/tests/fixtures/j460_bombs.json.gz` 含485条记录；`verify_native_bombs.py` 对出生运动、引信、静止/移动/持续按键/自由飞行与玩家边界做189项检查，最大位置/速度误差 < 1e−9。
+
+#### 原版地形与出生点
+
+RoomEditor `rooms.txt` 是类型名称表，不是地形库。实际来源为 `analysis/resources/repentance-a/derived/abp_named_rooms_xml/00.special rooms.xml`，导入脚本 `sim/tools/import_boss_layouts.py`：
+
+| 原版 variant | 布局 | 普通岩石格数 |
+|---|---|---:|
+|1010|空房|0|
+|1012|角落岩石|12|
+|1037|左侧密集、非对称岩石|27|
+|1038|上/下侧非对称岩石|26|
+
+四种布局已分别在当前 J460 用 `goto s.boss.<variant>` 打开，135格中的岩石坐标逐格匹配，非凭旧XML推断。XML门标记是**允许的门槽**；课程只实例化随机选中的一扇入口门。Isaac在门内侧20单位处；Monstro从能容纳半径42的空地格中心采样，与玩家距离≥200。场景 RNG 与战斗 RNG 分开；同 seed + 同输入可重放，不映射原版全局随机序列。10,000 seeds覆盖全部布局，出生无穿墙/重叠，前15个无输入逻辑帧均无受伤。
+
+#### 原引擎与模拟器的输入/输出
+
+两端统一 `monstro-transformer-v3`，共享 **VisibleHistory → CombatTransformer**，没有训练专用隐藏信息：
+
+| 项 | 共用契约 |
+|---|---|
+|玩家|23维：位置、观测差分速度、血量、炸弹库存、基础属性等|
+|实体|最多256个，31维+类别；含Boss、眼泪、敌弹、炸弹；越限报错，不静默丢子弹|
+|预判|当前Monstro动画/帧、离地标记、可见身体与阴影；不含目标锁定点、NPC.State、RNG|
+|地图|7×9×15：房内、可走、实心、坑、可破坏、危险、关闭的门；岩石炸毁后更新|
+|时序|64次决策原始历史，无跨局记忆；位置差分，不用隐藏真实速度|
+|动作|MultiDiscrete `[45,2,2]`：9移动×5射击，炸弹，主动道具；当前无道具，最后一项mask禁用|
+|时钟/奖励|一次动作2逻辑帧，即15决策/游戏秒；120s上限。实际受伤−1、实际扣血命中+0.05、伤害/初始MaxHP、清房+1，死亡无额外扣分|
+
+v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空、帧0、flip=false），保留Monstro与炸弹预警动画；无主动道具时charge统一0。维数不变但输入语义变了，不能把v2 checkpoint当成已通过v3迁移验收。
+
+**接口一致 ≠ 世界状态逐帧一致。** 原引擎raw JSON还有更多不用的字段；模拟器尚不支持掉落物/道具组合/全部特效，死亡尾帧与完整接触/击退细节未完全校准。新模型仍需在原引擎独立验证胜率、受伤次数与清房时间；目前没有新的训练成绩。
+
+#### 本机基准（不是训练FPS）
+
+实测主机 i9-13900H、32GB、RTX4060 Laptop 8GB；不是计划中的3080Ti/96GB Linux主机。生产配置：64历史、256容量、4层Transformer、CUDA float32、Rust 4线程。每档先预热64次环境决策，再测32批；未训练策略采样真实动作，所有权重逐张量检查未变化。计量为所有环境累计的**决策/秒**，不是局/秒。实际可见实体最多16–23个，不是256实体满载压力测试。
+
+| 并行环境 | 采样+编码决策/s | 再加模型推理决策/s | 每批延迟ms | Python RSS GiB | CUDA峰值已分配GiB |
+|---:|---:|---:|---:|---:|---:|
+|1|345.7|51.8|19.3|1.63|0.048|
+|4|359.7|142.7|28.0|1.77|0.080|
+|8|343.7|193.2|41.4|1.84|0.121|
+|16|341.6|218.8|73.1|2.01|0.208|
+|32|323.3|231.5|138.2|2.34|0.381|
+|64|317.3|237.3|269.7|3.00|0.711|
+|128|308.4|235.5|543.6|4.30|1.404|
+
+128环境CUDA allocator峰值reserved=1.563GiB，不含驱动上下文；CPU约0.97逻辑核当量。16→128环境只增加约7.6%吞吐。纯Rust生产Slot短测128路约150万决策/s，**不含JSON/观测历史/网络**，不能作为训练速度：当前端到端瓶颈主要在串行观测处理和历史搬运，而不是需要更多游戏物理线程。
+
+一个观测完整窗口为4,648,704 bytes。SB3逐transition存整窗会重复存储相邻历史：128环境×128步仅obs就**70.93GiB**；64环境为35.47GiB，均不适合本机32GB。它们能跑采样/推理，不代表能存下同配置PPO rollout。8环境×32步约1.11GiB、16环境×32步约2.22GiB，不含缓冲复制、网络与梯度。
+
+**建议本机首轮8–16环境，rollout每路32步，PPO minibatch先8；未实测反向更新的速度/峰值显存。** 下一步先做“一帧只存一份、训练时取64帧连续窗口”的紧凑rollout及二进制张量接口，再追求Linux128路/100K局。这里不缩短历史或删实体来制造提速。
+
+证据：`runs/l2/20260922-bombs-training/benchmark-final.json`、`layout-verification.json`、`bomb-verification.json`、原版trace与exit记录。44项Rust测试、13项不更新权重的Transformer测试、4项适配/自动重置测试通过；原有玩家留出轨迹、Monstro锁定/弹道、1,176次绘制回归均通过。
+
+复现（Python使用已有torch/SB3依赖环境）：`python sim/tools/benchmark_pipeline.py --steps 32 --out runs/sim-benchmark.json`；准备配置但不训练：`python bridge/python/train_sim.py`。查看器：`pwsh -File sim/play_motion.ps1 -Monstro -Seed 42`，E/左Shift放炸弹，R同seed重置，N下一seed；地形/炸弹绘制为验收表现层，不是完整原版动画复刻。
+
+批量接口按 [SB3 VecEnv 约定](https://stable-baselines3.readthedocs.io/en/master/guide/vec_envs.html) 保存终局 `terminal_observation`，区分 `TimeLimit.truncated`，随后自动重置并清空历史；底层使用标准 [ctypes CDLL](https://docs.python.org/3/library/ctypes.html) 与 Rayon线程池。
 
 ## 1. 证据基线（2026-09-19 核实）
 
