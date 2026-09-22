@@ -1,6 +1,6 @@
 # Isaac RL 环境架构：三层环境栈与统一契约
 
-更新：2026-09-22。当前结果见 §0.9：GPU 原始帧/rollout 常驻、增量异步传输、冻结单帧编码缓存已接入，minibatch默认32。128路短测约4088决策/s，采样峰值CUDA2.02GiB。物理仍为CPU/Rayon，未开始正式新策略训练；原版四引擎512局零清房的历史结论不变。
+更新：2026-09-22。最新部署见§0.10：Ubuntu3080Ti已部署，44项Rust/29项Python测试及一轮完整PPO更新验收通过；128路采样9128决策/s，含4epochs更新约287条新transition/s，正式100K局未启动。GPU缓存实现见§0.9；物理仍为CPU/Rayon。
 
 ## 0. 结论
 
@@ -320,6 +320,19 @@ v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空
 **验证及训练边界：** 28项Python测试通过，包括CPU逐字段/奖励对照、shuffle、GAE、连续rollout、独立reset、timeout bootstrap、权重冻结、训练后缓存失效、CNN/实体梯度、checkpoint、真实SB3 learn的两个极小测试更新。基准另外每配置只做2个minibatch32的隔离更新探针，峰值CUDA约2.36–2.42GiB；计时受首次Adam初始化影响，不能当作持续训练速度或胜率。未保存正式新策略、未开始512局/100K局训练，也未部署Ubuntu。256实体容量不代表已压测每帧都占满256实体的最坏显存。
 
 证据：`runs/l2/20260922-gpu-cache/benchmark-accepted.json`、`tests-accepted.log`、`streams-summary.json`、`streams-trace.json`；失败过程也保留。复现：`python -m unittest test_gpu_infra`；`python sim/tools/benchmark_gpu_pipeline.py --envs 128 --chunks 1 2 4 --out runs/gpu-benchmark.json`（默认无优化器，显式 `--update-probe` 才做隔离更新探针）。传输实现遵循 [PyTorch pinned-memory/异步生命周期规则](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html)。
+
+### 0.10 Ubuntu 部署与完整 PPO 验收（2026-09-22，未正式开训）
+
+- 主机 `ssh -p 2222 eolc@100.76.185.120`，仓库 `/home/eolc/isaac-rl`，分支 `ubuntu-training`；运行时代码 `f3ee070`（GPU优化 `ce5d3a0` + Linux导入修复）。RTX3080Ti12GB、94GiB RAM。独立 `.venv`：Python3.10、Torch2.7.1+cu128、NumPy1.26.4、Gymnasium1.2.3、SB3/contrib2.7.1。
+- Linux共享库为 `sim/target/release/libisaac_sim.so`；私有Rust工具链位于 `/home/eolc/.local/share/isaac-rl/{cargo,rustup}`，显式使用 `cargo +stable-x86_64-unknown-linux-gnu`，不采用仓库Windows默认toolchain。未改系统驱动、Steam、RDP或全局代理；慢速依赖下载用了临时loopback SSH代理转发，安装结束关闭。
+- 实际发现并修复 `isaac_bridge.__init__` 无条件加载 `ctypes.WinDLL` 的Linux导入失败；只在 `sys.platform == "win32"` 导出原生注入接口，TCP/模拟器保持跨平台。`test_sim_obs` 按平台选择 `motion_trace` 后缀。新增回归在旧版失败、修正版通过、隔离回滚再次失败，Windows原生导出保留。
+- 远端44项Rust测试、29项Python测试通过；128路单块/2块/4块采样分别约 **9128/7273/4561 决策/s**。继续采用单块，CPU/Rayon线程8、PyTorch线程4。
+- 完整PPO隔离探针：128环境×128步=16,384条新transition；minibatch32、4epochs=2,048次实际optimizer.step。采样1.792s，更新55.381s，端到端286.57条新transition/s；训练峰值CUDA2.387GiB、进程峰值RSS1.944GiB。模型参数确实更新，保存/重载确定性动作一致。探针checkpoint不是正式模型，不能把采样9128决策/s当作训练吞吐。
+- 准备配置：128环境、128步rollout、minibatch32、4epochs、chunks1、CPU线程8、seed1，目标累计100,000完整回合，单局120秒；`runs/deploy-20260922/prepared-config.txt` 的 `train=false`。未启动正式长训；此次只做测试及一轮完整尺寸更新验收。
+- 当前入口 `train_sim.py` 从随机初始化开始，各worker结束后进程内reset并更换seed，不重启原游戏。输入为64步v3可见历史，地图CNN+实体注意力+4层8头Transformer；输出45种移动/射击联合动作及独立炸弹开关，主动道具禁用。奖励仍为受伤−1、有效命中+0.05、归一化实际伤害、清房+1；死亡不重复扣分，timeout bootstrap。
+- **正式长训前的剩余准备：** 当前CLI仅结束时保存 `last.zip`，尚未接入周期checkpoint、CLI断点续训和固定留出seed评估。100K局长跑应先补这些；本次不以测试更新代替正式训练，不报告胜率提升。之后仍需原版引擎迁移验收。
+
+远端证据在 `/home/eolc/isaac-rl/runs/deploy-20260922/`；本机镜像在 `runs/l2/20260922-remote-deploy/remote-evidence/`。复查配置（不会训练）：`PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --envs 128 --threads 8 --chunks 1 --n-steps 128 --batch-size 32 --episodes 100000`。
 
 ## 1. 证据基线（2026-09-19 核实）
 
