@@ -1,6 +1,6 @@
 # Isaac RL 环境架构：三层环境栈与统一契约
 
-更新：2026-09-22。最新部署见§0.10：Ubuntu3080Ti已部署，44项Rust/29项Python测试及一轮完整PPO更新验收通过；128路采样9128决策/s，含4epochs更新约287条新transition/s，正式100K局未启动。GPU缓存实现见§0.9；物理仍为CPU/Rayon。
+更新：2026-09-22。最新存档/续训/留出评估见§0.11，Ubuntu3080Ti已部署，44项Rust/33项Python测试通过。§0.10的128路采样9128决策/s、含4epochs更新约287条新transition/s不含新增存档/评估开销；正式100K局未启动。GPU缓存实现见§0.9；物理仍为CPU/Rayon。
 
 ## 0. 结论
 
@@ -355,6 +355,10 @@ PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --r
 ```
 
 验收入口`bridge/python/test_training_session.py`：实际周期保存/评估；逐动作重放全部评估轨迹至终止现场；断点与不中断路径的后续动作、奖励、世界状态一致，恢复后再执行optimizer更新并对照参数；检查评估前后RNG不变。它是小模型管线测试，不是训练效果评估。正式100K局仍未启动。
+
+**Ubuntu验收已完成：** 44项Rust、33项Python测试通过（含回合终止/autoreset后的历史恢复，以及中断写入不替换latest）。生产规模网络H64/E256/4层8头、128环境×8步、minibatch32/4epochs跑完一次更新，保存并关闭环境；从checkpoint恢复现场后再更新一次，总2048条transition、2轮更新。续训恢复5.777秒，末次checkpoint 67,633,447字节（64.50MiB），最终保存加16局评估6.760秒；本次总峰值CUDA2.058GiB。这里T=8，不取代§0.10的T=128完整训练性能数据；此短现场的恢复速度/压缩率也不是满H64历史的最坏值。
+
+16局固定留出评估全部生成轨迹与HTML（约20.77MiB），结果0胜/16死/0超时，均回报-5.876；模型仅经过两轮验证更新，没有训练效果主张。浏览器经localhost实际验收初始帧、95号帧、191号死亡帧和播放推进；单个HTML没有外部依赖，独立文件打开由用户侧浏览器完成。远端记录：`/home/eolc/isaac-rl/runs/checkpoint-acceptance-20260922/`；本机副本：`runs/l2/20260922-checkpoints/replays/index.html`。重建工具已从gzip记录重新产出`rebuilt.html`并验证时间轴。更新Rust ABI后需先重新build release库，再运行Python；仅替换Python源码不够。
 
 ## 1. 证据基线（2026-09-19 核实）
 
