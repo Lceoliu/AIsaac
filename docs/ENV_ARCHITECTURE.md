@@ -330,9 +330,31 @@ v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空
 - 完整PPO隔离探针：128环境×128步=16,384条新transition；minibatch32、4epochs=2,048次实际optimizer.step。采样1.792s，更新55.381s，端到端286.57条新transition/s；训练峰值CUDA2.387GiB、进程峰值RSS1.944GiB。模型参数确实更新，保存/重载确定性动作一致。探针checkpoint不是正式模型，不能把采样9128决策/s当作训练吞吐。
 - 准备配置：128环境、128步rollout、minibatch32、4epochs、chunks1、CPU线程8、seed1，目标累计100,000完整回合，单局120秒；`runs/deploy-20260922/prepared-config.txt` 的 `train=false`。未启动正式长训；此次只做测试及一轮完整尺寸更新验收。
 - 当前入口 `train_sim.py` 从随机初始化开始，各worker结束后进程内reset并更换seed，不重启原游戏。输入为64步v3可见历史，地图CNN+实体注意力+4层8头Transformer；输出45种移动/射击联合动作及独立炸弹开关，主动道具禁用。奖励仍为受伤−1、有效命中+0.05、归一化实际伤害、清房+1；死亡不重复扣分，timeout bootstrap。
-- **正式长训前的剩余准备：** 当前CLI仅结束时保存 `last.zip`，尚未接入周期checkpoint、CLI断点续训和固定留出seed评估。100K局长跑应先补这些；本次不以测试更新代替正式训练，不报告胜率提升。之后仍需原版引擎迁移验收。
+- **存档与评估准备已由§0.11补齐。** 本节吞吐不含周期存档/评估开销，不以测试更新代替正式训练，不报告胜率提升。之后仍需原版引擎迁移验收。
 
 远端证据在 `/home/eolc/isaac-rl/runs/deploy-20260922/`；本机镜像在 `runs/l2/20260922-remote-deploy/remote-evidence/`。复查配置（不会训练）：`PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --envs 128 --threads 8 --chunks 1 --n-steps 128 --batch-size 32 --episodes 100000`。
+
+### 0.11 Checkpoint、断点续训与固定留出评估（2026-09-22）
+
+用户确认默认：**每10次完整PPO更新存档，每25次更新评估16个固定种子，结束时再存档并评估**。25轮评估点也先存档，使回放对应确切模型。一次更新仍含4个epochs，不把minibatch、采样step或回合混作“轮”。此功能接入默认GPU管线；`legacy`只保留旧对照行为。
+
+- 存档目录：`checkpoints/update-XXXXXXXX-step-XXXXXXXXXXXX-{update,final}/`。`model.zip`含策略和Adam状态；`continuation.pt.gz`含Python/NumPy/Torch CPU/CUDA RNG、各worker当前seed/动作前缀/回合累计奖励/长度/已完成回合数，以及最近H帧原始观测、有效长度和episode-start标记。原始帧gzip一级压缩，避免把大量padding零原样落盘；不存过期学习特征。`state.json`记录配置、总回合、更新次数、timesteps与阶段。
+- 在完整更新后、无采样任务飞行时发布；先写隐藏临时目录，再同文件系统rename，最后原子替换`checkpoints/latest.json`。崩溃后只读已发布目录，临时目录不会被自动当成最新版本。保留历史存档，不自动删除；仍需按磁盘容量管理长期实验。
+- `--resume`接受存档目录或`latest.json`，要求**新的`--out`目录**，原实验和已写日志不被覆盖。结构参数默认继承且不可悄悄更改；`--episodes`是累计完整回合目标，可向上扩展。模型和optimizer恢复后，以seed+当前回合动作重建各Rust世界（包括内部RNG、上一帧状态与炸弹），核对完整现场，再恢复原始历史并重编码。重建不计入采样步数、奖励或回合数。
+- 只承诺同模拟器实现/平台的现场续训，重建结果不符直接报错；不要将不同版本的世界强行续接。最终因回合预算打断的未更新rollout不用于未来梯度，记录`partial_rollout_discarded`；恢复时从保存的现场采集新rollout。异常退出从最近发布checkpoint重做其后工作，不是每步事务持久化。跨平台迁移可加载策略，不能据此承诺浮点位级相同。
+- 训练seed处于`[0, 2^31)`；固定留出seed为`2147483648..2147483663`，训练序列越界报错，不取模混入留出集。评估使用独立环境与冻结策略的确定性动作，不更新optimizer；保存并恢复全局RNG，不扰动训练采样。按每个seed的**首个完整回合**统计win/death/timeout、回报、长度和地形；这是固定验证集，不是额外未见的最终测试集，也不是原版迁移成绩。
+- 每轮评估：`evaluations/<checkpoint-name>/summary.json`、`index.html`、每seed一份`.jsonl.gz`与自包含`.html`。记录初始现场和每次动作后的现场（终止帧在autoreset之前）、动作、奖励、结局、模型身份、seed和30Hz/2帧重复。现场包括地图、玩家、Boss动画帧/离地/可见性/阴影、子弹位置/高度、炸弹；剔除隐藏AI目标/策略状态。诊断记录不喂给actor。
+- HTML离线直接打开，可播放/暂停、变速、拖动时间轴；几何体显示记录状态，不依赖Rust、原游戏或网络资源。不是原版精灵动画重放，决策间隔内没有记录的中间逻辑帧不作伪造。仅有压缩轨迹时，可用标准库工具重建：`python sim/tools/replay_episode.py RECORD.jsonl.gz --out replay.html`。
+
+Ubuntu启动与续训示例（只有显式`--train`才开训）：
+
+```bash
+cd /home/eolc/isaac-rl
+PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --envs 128 --threads 8 --chunks 1 --n-steps 128 --batch-size 32 --episodes 100000 --checkpoint-every 10 --eval-every 25 --out runs/monstro-100k
+PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --resume runs/monstro-100k/checkpoints/latest.json --episodes 100000 --out runs/monstro-100k-resumed
+```
+
+验收入口`bridge/python/test_training_session.py`：实际周期保存/评估；逐动作重放全部评估轨迹至终止现场；断点与不中断路径的后续动作、奖励、世界状态一致，恢复后再执行optimizer更新并对照参数；检查评估前后RNG不变。它是小模型管线测试，不是训练效果评估。正式100K局仍未启动。
 
 ## 1. 证据基线（2026-09-19 核实）
 

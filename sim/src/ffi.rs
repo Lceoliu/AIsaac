@@ -126,6 +126,10 @@ pub unsafe extern "C" fn isaac_batch_step(batch: *mut Batch, actions: *const i32
     });
 }
 #[no_mangle]
+pub unsafe extern "C" fn isaac_batch_step_one(batch: *mut Batch, index: usize, actions: *const i32) {
+    (&mut *batch).slots[index].step(std::slice::from_raw_parts(actions, 3));
+}
+#[no_mangle]
 pub unsafe extern "C" fn isaac_batch_state(batch: *mut Batch) -> *const c_char {
     let b = &mut *batch;
     let values:Vec<_>=b.slots.iter().map(|s|json!({"state":crate::snapshot::state(&s.world,s.player),"reward":s.reward,"done":s.done,"truncated":s.truncated,"outcome":s.outcome})).collect();

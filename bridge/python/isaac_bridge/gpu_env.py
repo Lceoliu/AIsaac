@@ -37,8 +37,11 @@ class FrameChunk:
         self.ready=torch.cuda.Event()
         self.slots=[TransferSlot(self.n,owner.device) for _ in range(2)]
         self.episodes=np.zeros(self.n,np.int64);self.returns=np.zeros(self.n);self.lengths=np.zeros(self.n,np.int64)
+        self.seeds=[owner.base_seed+i for i in range(start,stop)]
+        self.actions=[[] for _ in range(self.n)]
 
     def reset(self,seeds):
+        self.seeds=list(map(int,seeds));self.actions=[[] for _ in range(self.n)]
         for i,seed in enumerate(seeds):self.batch.reset(i,int(seed))
         self.episodes.fill(0);self.returns.fill(0);self.lengths.fill(0)
         self.batch.observe(self.slots[0].frames)
@@ -49,6 +52,7 @@ class FrameChunk:
         slot.action_ready.synchronize()
         if slot.used:slot.upload_done.synchronize()
         self.batch.step(slot.actions.numpy())
+        for trace,action in zip(self.actions,slot.actions.numpy().tolist()):trace.append(action)
         frames=self.batch.observe(slot.frames)
         if np.any(frames['count']>self.owner.capacity):raise ValueError('Visible entity overflow; never truncate')
         rewards=frames['reward'].copy();dones=frames['done'].astype(bool)
@@ -56,10 +60,15 @@ class FrameChunk:
         outcomes=('running','death','win','time_limit')
         infos=[dict(outcome=outcomes[r['outcome']],elapsed_frames=int(r['elapsed']),layout=int(r['layout']),
                     **{'TimeLimit.truncated':bool(r['truncated'])}) for r in frames]
+        for i,info in enumerate(infos):info['seed']=self.seeds[i]
+        if self.owner.record_states:
+            for info,state in zip(infos,self.batch.states()):info['replay_state']=state
         for i in np.flatnonzero(dones):
             infos[i]['episode']={'r':float(self.returns[i]),'l':int(self.lengths[i])}
             self.returns[i]=0;self.lengths[i]=0;self.episodes[i]+=1
             seed=self.owner.base_seed+self.start+i+self.owner.num_envs*self.episodes[i]
+            if self.owner.training_seeds and seed>=2**31:raise ValueError('Training seed entered held-out namespace')
+            self.seeds[i]=int(seed);self.actions[i]=[]
             self.batch.reset(int(i),int(seed))
         if dones.any():
             self.batch.observe(slot.reset_frames)
@@ -91,6 +100,7 @@ class GpuFrameVecEnv(VecEnv):
         self.device=torch.device(device)
         if self.device.type!='cuda':raise ValueError('GpuFrameVecEnv requires CUDA')
         self.base_seed=seed;self.capacity=capacity;self.history=history;self.generation=0
+        self.record_states=False;self.training_seeds=False
         super().__init__(n,VisibleHistory(history,capacity).space,spaces.MultiDiscrete([45,2,2]))
         boundaries=np.linspace(0,n,chunks+1,dtype=int)
         self.chunks=[FrameChunk(self,int(boundaries[i]),int(boundaries[i+1]),threads//chunks+int(i<threads%chunks)) for i in range(chunks)]

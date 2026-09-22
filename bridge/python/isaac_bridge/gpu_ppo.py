@@ -92,10 +92,11 @@ class GpuMaskablePPO(MaskablePPO):
         kwargs.setdefault('rollout_buffer_class',GpuHistoryRolloutBuffer)
         kwargs.setdefault('batch_size',32)
         self.policy_version=0;self._gpu_sampler=None;self._collecting=False
+        self.session=None;self.sampling_deterministic=False
         super().__init__(*args,**kwargs)
 
     def _excluded_save_params(self):
-        return super()._excluded_save_params()+['_gpu_sampler','_collecting']
+        return super()._excluded_save_params()+['_gpu_sampler','_collecting','session']
 
     def _setup_learn(self,*args,**kwargs):
         result=super()._setup_learn(*args,**kwargs)
@@ -109,6 +110,7 @@ class GpuMaskablePPO(MaskablePPO):
         if self._collecting:raise RuntimeError('Weights are frozen while collecting a rollout')
         try:super().train()
         finally:self.policy_version+=1
+        if self.session is not None:self.session.after_update(self)
 
     def collect_rollouts(self,env,callback,rollout_buffer,n_rollout_steps,use_masking=True):
         if not use_masking:raise ValueError('Isaac requires action masking')
@@ -129,7 +131,7 @@ class GpuMaskablePPO(MaskablePPO):
                     for c,ids in zip(env.chunks,s.workers):
                         slot=c.slots[s.steps%2]
                         with torch.cuda.stream(c.compute_stream):
-                            actions,values,log_prob,masks=s.action(old,ids)
+                            actions,values,log_prob,masks=s.action(old,ids,self.sampling_deterministic)
                             starts=s.starts[ids]
                             slot.actions.copy_(actions,non_blocking=True)
                             slot.action_ready.record(c.compute_stream)

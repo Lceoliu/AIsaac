@@ -29,6 +29,7 @@ class RustBatch:
         signatures={'new':([C.c_size_t,C.c_uint32,C.c_size_t],C.c_void_p),
                     'reset':([C.c_void_p,C.c_size_t,C.c_uint32],None),
                     'step':([C.c_void_p,C.POINTER(C.c_int32)],None),
+                    'step_one':([C.c_void_p,C.c_size_t,C.POINTER(C.c_int32)],None),
                     'state':([C.c_void_p],C.c_char_p),'free':([C.c_void_p],None),
                     'observe':([C.c_void_p,C.c_void_p],C.c_size_t)}
         for name,(args,result) in signatures.items():
@@ -55,6 +56,12 @@ class RustBatch:
         if a.shape!=(self.n,3) or np.any(a<0) or np.any(a[:,0]>=45) or np.any(a[:,1]>1) or np.any(a[:,2]!=0):
             raise ValueError('Expected [N,3]: joint 0..44, bomb 0..1, item 0 (no item equipped)')
         self.lib.isaac_batch_step(self.handle,a.ctypes.data_as(C.POINTER(C.c_int32)))
+
+    def step_one(self,index,action):
+        if not 0<=index<self.n:raise IndexError(index)
+        a=np.ascontiguousarray(action,dtype=np.int32)
+        if a.shape!=(3,) or np.any(a<0) or a[0]>=45 or a[1]>1 or a[2]!=0:raise ValueError('Invalid action')
+        self.lib.isaac_batch_step_one(self.handle,index,a.ctypes.data_as(C.POINTER(C.c_int32)))
 
     def close(self):
         if self.handle:self.lib.isaac_batch_free(self.handle);self.handle=None

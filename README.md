@@ -6,7 +6,7 @@
 
 **Monstro 已接入（2026-09-21）：** `pwsh -File sim/play_motion.ps1 -Monstro -Seed 42`。普通 Monstro 的接近小跳、高跳锁定格子、落地环射、Taunt 前摇扇形喷弹及弹幕高度碰撞已实现；同 seed + 同输入可复现。原版 2,700 帧动作轨迹和额外高度碰撞探针已采集。观测走现有 CNN + Transformer，详见 [§0.6](docs/ENV_ARCHITECTURE.md#06-monstro-接入与可见观测2026-09-21)。尚未开始 Linux 128 并行或新策略训练。
 
-**Ubuntu已部署（2026-09-22）：** `/home/eolc/isaac-rl`，RTX3080Ti；44项Rust/29项Python测试通过。完整PPO更新验收约287条新transition/s，峰值CUDA2.39GiB。128环境/100K局配置已准备，尚未正式开训；周期checkpoint、断点续训和留出seed评估仍待接入。详见 [部署与训练流程](docs/ENV_ARCHITECTURE.md#010-ubuntu-部署与完整-ppo-验收2026-09-22未正式开训)。
+**Ubuntu已部署（2026-09-22）：** `/home/eolc/isaac-rl`，RTX3080Ti。完整PPO更新验收约287条新transition/s，峰值CUDA2.39GiB。128环境/100K局配置已准备，尚未正式开训；GPU管线新增每10轮checkpoint、每25轮16个固定留出种子评估、房间现场续训和离线状态回放。详见 [存档与评估](docs/ENV_ARCHITECTURE.md#011-checkpoint断点续训与固定留出评估2026-09-22)。
 
 ## 目标
 
