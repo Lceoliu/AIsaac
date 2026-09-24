@@ -30,6 +30,19 @@ impl Slot {
             action: [0.; 4],
         }
     }
+    /// Training-only start (OpenAI Five "Roshan health" randomisation): the same room, spawns and
+    /// combat RNG as `new`, then player HP (half-hearts) and the Boss HP fraction are overridden.
+    /// Max HP is unchanged, so visible HP and damage/max_hp rewards keep their meaning.
+    pub fn with_start(seed: u32, player_hp: f32, boss_hp_fraction: f32) -> Self {
+        let mut slot = Self::new(seed);
+        let id = slot.player;
+        let player = slot.world.entity_mut(id).unwrap();
+        player.hp = player_hp.clamp(1.0, player.max_hp);
+        for boss in slot.world.entities.iter_mut().filter(|e| e.etype == 20) {
+            boss.hp = (boss.max_hp * boss_hp_fraction.clamp(0.01, 1.0)).max(1.0);
+        }
+        slot
+    }
     pub fn step(&mut self, action: &[i32]) {
         assert!(!self.done, "reset required");
         self.previous = Some(crate::observation::Previous::capture(
@@ -115,6 +128,16 @@ pub unsafe extern "C" fn isaac_batch_reset(batch: *mut Batch, index: usize, seed
     (&mut *batch).slots[index] = Slot::new(seed);
 }
 #[no_mangle]
+pub unsafe extern "C" fn isaac_batch_reset_start(
+    batch: *mut Batch,
+    index: usize,
+    seed: u32,
+    player_hp: f32,
+    boss_hp_fraction: f32,
+) {
+    (&mut *batch).slots[index] = Slot::with_start(seed, player_hp, boss_hp_fraction);
+}
+#[no_mangle]
 pub unsafe extern "C" fn isaac_batch_step(batch: *mut Batch, actions: *const i32) {
     let b = &mut *batch;
     let a = std::slice::from_raw_parts(actions, b.slots.len() * 3);
@@ -163,4 +186,57 @@ pub unsafe extern "C" fn isaac_batch_observe(
 #[no_mangle]
 pub extern "C" fn isaac_frame_size() -> usize {
     std::mem::size_of::<crate::observation::Frame>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn start_override_changes_only_hp() {
+        for seed in [7u32, 1234, 2147483700] {
+            let base = Slot::new(seed);
+            let full = Slot::with_start(seed, 6.0, 1.0);
+            assert_eq!(
+                crate::snapshot::state(&full.world, full.player),
+                crate::snapshot::state(&base.world, base.player)
+            );
+            let s = Slot::with_start(seed, 3.0, 0.4);
+            assert_eq!(s.world.entity(s.player).unwrap().hp, 3.0);
+            let boss = s.world.entities.iter().find(|e| e.etype == 20).unwrap();
+            let base_boss = base.world.entities.iter().find(|e| e.etype == 20).unwrap();
+            assert!((boss.hp - 100.0).abs() < 1e-4);
+            assert_eq!(boss.max_hp, 250.0);
+            assert_eq!(boss.pos, base_boss.pos);
+            assert_eq!(s.world.room.layout, base.world.room.layout);
+        }
+    }
+
+    #[test]
+    fn low_hp_boss_is_cleared_and_rewarded() {
+        let mut s = Slot::with_start(42, 6.0, 0.02);
+        let mut total = 0.;
+        for _ in 0..1800 {
+            // Scripted probe: approach when far, shoot along the dominant axis toward the Boss.
+            let p = s.world.entity(s.player).unwrap().pos;
+            let b = s.world.entities.iter().find(|e| e.etype == 20).unwrap().pos;
+            let (dx, dy) = (b.x - p.x, b.y - p.y);
+            let shoot = if dx.abs() > dy.abs() { if dx > 0. { 2 } else { 4 } } else if dy > 0. { 3 } else { 1 };
+            let far = dx.hypot(dy) > 160.;
+            let step = |v: f32| if far && v.abs() > 20. { v.signum() as i32 } else { 0 };
+            let (mx, my) = (step(dx), step(dy));
+            let movement = [(0, 0), (0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1)]
+                .iter()
+                .position(|m| *m == (mx, my))
+                .unwrap() as i32;
+            s.step(&[movement * 5 + shoot, 0, 0]);
+            total += s.reward;
+            if s.done {
+                break;
+            }
+        }
+        assert_eq!(s.outcome, "win", "a 5-HP Monstro must be killable within the deadline");
+        // Normalised damage uses max HP 250, so a 5-HP Boss yields at most 5/250 of damage reward.
+        assert!(total < 1.0 + 0.05 * 3. + 5. / 250. + 1e-4);
+    }
 }

@@ -1,5 +1,5 @@
 """Prepare local Monstro PPO. Training requires the explicit --train flag."""
-import argparse,json,subprocess,sys
+import argparse,hashlib,json,subprocess,sys
 from pathlib import Path
 import numpy as np
 import torch
@@ -36,18 +36,45 @@ def main():
     p.add_argument('--warm-start',type=Path,help='weights-only migration; optimizer, RNG and rooms start fresh')
     p.add_argument('--reward-profile',choices=REWARD_PROFILES,default='combat-v1')
     p.add_argument('--gamma',type=float,default=None)
+    p.add_argument('--n-epochs',type=int,default=4)
+    p.add_argument('--micro-batch',type=int,default=None,
+                   help='enable frame-deduplicated segment minibatches; bounds activation memory only')
+    p.add_argument('--segment-length',type=int,default=32,help='consecutive steps per worker segment (segment minibatches)')
+    p.add_argument('--ent-coef',type=float,default=0.0)
+    p.add_argument('--boss-hp-prob',type=float,default=0.0,help='share of training episodes whose Boss starts weakened')
+    p.add_argument('--boss-hp-min',type=float,default=0.1,help='lowest Boss HP fraction of a weakened start')
+    p.add_argument('--player-hp-prob',type=float,default=0.0,help='share of training episodes whose player starts hurt')
+    p.add_argument('--player-hp-min',type=int,default=3,help='lowest player half-hearts of a hurt start (drawn from min..5)')
     p.add_argument('--out',type=Path,default=Path('runs/sim-training'));args=p.parse_args()
     from isaac_bridge.training_session import TrainingSession,HELD_OUT_SEEDS,resolve_checkpoint,resume_model,warm_start_model
     if args.resume and args.warm_start:p.error('--resume and --warm-start are mutually exclusive')
+    # Optimisation and training-start distribution may change on resume; world/reward semantics may not.
+    tunable=('episodes','checkpoint_every','eval_every','batch_size','n_epochs','micro_batch','segment_length','ent_coef',
+             'boss_hp_prob','boss_hp_min','player_hp_prob','player_hp_min')
     if args.resume:
         args.resume=resolve_checkpoint(args.resume)
         previous=json.loads((args.resume/'state.json').read_text())['config']
-        previous.setdefault('reward_profile','legacy');previous.setdefault('gamma',0.99)
-        for key in ('envs','threads','chunks','n_steps','batch_size','pipeline','seed','checkpoint_every','eval_every','episodes','reward_profile','gamma'):
+        for key,value in dict(reward_profile='legacy',gamma=0.99,n_epochs=4,micro_batch=None,segment_length=32,ent_coef=0.0,
+                              boss_hp_prob=0.0,boss_hp_min=0.1,player_hp_prob=0.0,player_hp_min=3).items():
+            previous.setdefault(key,value)
+        for key in ('envs','threads','chunks','n_steps','pipeline','seed','reward_profile','gamma')+tunable:
             flag='--'+key.replace('_','-')
             if not any(x==flag or x.startswith(flag+'=') for x in sys.argv[1:]):setattr(args,key,previous[key])
-            elif key not in ('episodes','checkpoint_every','eval_every') and getattr(args,key)!=previous[key]:
+            elif key not in tunable and getattr(args,key)!=previous[key]:
                 p.error(f'Resume requires unchanged {flag}')
+    if args.micro_batch is not None:
+        if args.pipeline!='gpu':p.error('--micro-batch requires the GPU pipeline')
+        if (args.micro_batch<=0 or args.segment_length<=0 or args.batch_size%args.micro_batch
+                or args.micro_batch%args.segment_length or args.n_steps%args.segment_length):
+            p.error('need segment-length | n-steps, segment-length | micro-batch and micro-batch | batch-size')
+    if args.n_epochs<=0 or args.ent_coef<0:p.error('n-epochs must be positive and ent-coef non-negative')
+    start_randomization=None
+    if args.boss_hp_prob or args.player_hp_prob:
+        if args.pipeline!='gpu':p.error('Start randomisation requires the GPU pipeline')
+        from isaac_bridge.gpu_env import validate_start_randomization
+        try:start_randomization=validate_start_randomization(dict(boss_hp_prob=args.boss_hp_prob,boss_hp_min=args.boss_hp_min,
+                player_hp_prob=args.player_hp_prob,player_hp_min=args.player_hp_min))
+        except ValueError as e:p.error(str(e))
     if args.gamma is None:args.gamma=0.999 if args.reward_profile=='combat-v1' else 0.99
     if not 0<args.gamma<1:p.error('gamma must be between 0 and 1')
     if args.warm_start:
@@ -64,7 +91,10 @@ def main():
             'warm_start':str(args.warm_start) if args.warm_start else None,
             'eval_seeds':HELD_OUT_SEEDS,'schema':DEADLINE_SCHEMA if args.reward_profile=='combat-v1' else SCHEMA,'history':64,'entity_capacity':256,
             'timeout_semantics':'termination' if args.reward_profile=='combat-v1' else 'truncation',
-            'max_episode_seconds':120,'decisions_per_game_second':15,'n_epochs':4,
+            'max_episode_seconds':120,'decisions_per_game_second':15,
+            'minibatch':('segments: frame-deduplicated, advantages normalised per batch_size, gradient-accumulated micro-batches'
+                         if args.micro_batch else 'SB3 per-window random samples'),
+            'start_randomization':start_randomization,'evaluation_start':'full HP',
             'legacy_rollout_observation_gib':bytes_per_obs*args.envs*args.n_steps/2**30,
             'rollout_observation_gib':(frame_bytes*args.envs*(args.n_steps+63)+4*args.envs*args.n_steps)/2**30,
             'simulation_device':'cpu/rayon','policy_device':args.device,'rollout_buffer':'HistoryRolloutBuffer'}
@@ -83,23 +113,32 @@ def main():
         from isaac_bridge.gpu_env import GpuFrameVecEnv
         from isaac_bridge.gpu_ppo import GpuMaskablePPO
         from isaac_bridge.gpu_buffer import GpuHistoryRolloutBuffer
-        env=GpuFrameVecEnv(args.envs,args.seed,args.threads,args.chunks,device=args.device,reward_profile=args.reward_profile)
+        env=GpuFrameVecEnv(args.envs,args.seed,args.threads,args.chunks,device=args.device,reward_profile=args.reward_profile,
+                           start_randomization=start_randomization)
         algorithm=GpuMaskablePPO;buffer_class=GpuHistoryRolloutBuffer
     else:
         env=SimVecEnv(args.envs,args.seed,args.threads,reward_profile=args.reward_profile)
         algorithm=MaskablePPO;buffer_class=HistoryRolloutBuffer
     args.out.mkdir(parents=True,exist_ok=False)
-    config['source_revision']=subprocess.check_output(['git','rev-parse','HEAD'],cwd=Path(__file__).resolve().parents[2],text=True).strip()
+    repo=Path(__file__).resolve().parents[2]
+    config['source_revision']=subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip()
+    # Uncommitted deployments stay reproducible: keep the exact tracked-file diff next to the run.
+    patch=subprocess.check_output(['git','diff','HEAD','--binary'],cwd=repo)
+    if patch:
+        (args.out/'source.patch').write_bytes(patch)
+        config['source_patch_sha256']=hashlib.sha256(patch).hexdigest()
     (args.out/'config.json').write_text(json.dumps(config,indent=2),encoding='utf8')
     try:
         if args.resume:
             model,state=resume_model(args.resume,env,args.device)
             if args.episodes<=state['completed_episodes']:raise ValueError('--episodes must exceed already completed episodes')
-        else:model=algorithm('MultiInputPolicy',env,n_steps=args.n_steps,batch_size=args.batch_size,n_epochs=4,gamma=args.gamma,
-            rollout_buffer_class=buffer_class,
+            model.batch_size=args.batch_size;model.n_epochs=args.n_epochs;model.ent_coef=args.ent_coef
+        else:model=algorithm('MultiInputPolicy',env,n_steps=args.n_steps,batch_size=args.batch_size,n_epochs=args.n_epochs,
+            gamma=args.gamma,ent_coef=args.ent_coef,rollout_buffer_class=buffer_class,
             policy_kwargs=dict(features_extractor_class=CombatTransformer,
                features_extractor_kwargs=dict(features_dim=256,layers=4,heads=8),
                net_arch=dict(pi=[256],vf=[256]),normalize_images=False),device=args.device,seed=args.seed,verbose=1)
+        if args.pipeline=='gpu':model.micro_batch_size=args.micro_batch;model.segment_length=args.segment_length
         if args.warm_start:
             migration=warm_start_model(model,args.warm_start)
             (args.out/'migration.json').write_text(json.dumps(migration,indent=2),encoding='utf8')

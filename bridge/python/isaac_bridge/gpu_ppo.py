@@ -7,6 +7,8 @@ from concurrent.futures import as_completed
 import numpy as np
 import torch
 from sb3_contrib import MaskablePPO
+from stable_baselines3.common.preprocessing import preprocess_obs
+from stable_baselines3.common.utils import explained_variance
 from .gpu_buffer import GpuHistoryRolloutBuffer
 from .gpu_env import GpuFrameVecEnv,decode_frame,metadata
 
@@ -93,6 +95,9 @@ class GpuMaskablePPO(MaskablePPO):
         kwargs.setdefault('batch_size',32)
         self.policy_version=0;self._gpu_sampler=None;self._collecting=False
         self.session=None;self.sampling_deterministic=False
+        # None keeps SB3's per-window minibatches; an int enables frame-deduplicated segment
+        # minibatches with gradient accumulation (see _train_segments).
+        self.micro_batch_size=None;self.segment_length=32
         super().__init__(*args,**kwargs)
 
     def _excluded_save_params(self):
@@ -108,9 +113,114 @@ class GpuMaskablePPO(MaskablePPO):
 
     def train(self):
         if self._collecting:raise RuntimeError('Weights are frozen while collecting a rollout')
-        try:super().train()
+        try:
+            if self.micro_batch_size:self._train_segments()
+            else:super().train()
         finally:self.policy_version+=1
         if self.session is not None:self.session.after_update(self)
+
+    def evaluate_segments(self,workers,t0):
+        """Values, log-probs and entropies for whole L-step segments of single workers.
+
+        Every stored frame the segment needs is encoded once and shared by the windows that
+        contain it. Each sample still sees exactly its own causal window (same frames, times,
+        padding and last token), so per-sample outputs equal policy.evaluate_actions on
+        buffer.window(); only float summation order differs.
+        """
+        b=self.rollout_buffer;enc=self.policy.features_extractor
+        H,L,dev=b.history,self.segment_length,self.device
+        rows=t0[:,None]+torch.arange(L+H-1,device=dev)             # frame rows the segment may need
+        q=t0[:,None]+torch.arange(L,device=dev)+H-1                 # frame row of each sample's observation
+        lengths=b.lengths[q,workers[:,None]]
+        first=q[:,0]-lengths[:,0]+1                                  # windows' union is [first, q[:,-1]]
+        obs={k:v[rows,workers[:,None]] for k,v in b.frames.items()}
+        obs['history_mask']=(rows>=first[:,None]).to(obs['history_mask'].dtype)
+        obs=preprocess_obs(obs,self.observation_space,normalize_images=self.policy.normalize_images)
+        frames=enc.encode_frames(obs)
+        j=torch.arange(H,device=dev)
+        valid=j<lengths[...,None]
+        offset=torch.where(valid,torch.arange(L,device=dev)[:,None]+H-lengths[...,None]+j,0)
+        seg=torch.arange(len(workers),device=dev)[:,None,None]
+        window=frames[seg,offset].masked_fill(~valid[...,None],0).flatten(0,1)
+        elapsed=obs['time'][seg,offset].masked_fill(~valid,0).flatten(0,1)
+        valid=valid.flatten(0,1)
+        latent=enc.temporal_features(window,elapsed,valid)
+        latent=latent[torch.arange(len(latent),device=dev),valid.long().sum(-1)-1]
+        pi,vf=self.policy.mlp_extractor(latent)
+        dist=self.policy._get_action_dist_from_latent(pi)
+        steps=(q-(H-1)).flatten();owners=workers[:,None].expand(-1,L).flatten()
+        dist.apply_masking(b.action_masks[steps,owners])
+        return self.policy.value_net(vf).flatten(),dist.log_prob(b.actions[steps,owners]),dist.entropy(),steps,owners
+
+    def _train_segments(self):
+        """PPO over frame-deduplicated segment minibatches with gradient accumulation.
+
+        batch_size is the effective minibatch (whole segments, advantages normalised over it);
+        micro_batch_size only bounds activation memory. Loss, clipping, entropy/value weights,
+        grad clipping, target_kl and log keys follow MaskablePPO.train.
+        """
+        b=self.rollout_buffer;policy=self.policy
+        T,N,L=b.buffer_size,b.n_envs,self.segment_length
+        if T%L or self.batch_size%self.micro_batch_size or self.micro_batch_size%L:
+            raise ValueError('segment_length must divide n_steps and micro_batch_size; micro_batch_size must divide batch_size')
+        policy.set_training_mode(True)
+        self._update_learning_rate(policy.optimizer)
+        clip_range=self.clip_range(self._current_progress_remaining)
+        clip_range_vf=self.clip_range_vf(self._current_progress_remaining) if self.clip_range_vf is not None else None
+        per_worker=T//L;segments=N*per_worker
+        seg_batch=self.batch_size//L;seg_micro=self.micro_batch_size//L
+        pg_losses,value_losses,entropy_losses,clip_fractions=[],[],[],[]
+        continue_training=True;steps=0;loss=0.0
+        for epoch in range(self.n_epochs):
+            approx_kl_divs=[]
+            order=torch.randperm(segments,device=self.device)
+            for s in range(0,segments,seg_batch):
+                chosen=order[s:s+seg_batch]
+                workers=torch.div(chosen,per_worker,rounding_mode='floor');t0=(chosen%per_worker)*L
+                adv=b.advantages[t0[:,None]+torch.arange(L,device=self.device),workers[:,None]]
+                mean,std,n=adv.mean(),adv.std(),adv.numel()
+                policy.optimizer.zero_grad()
+                sums=torch.zeros(5,device=self.device)
+                for m in range(0,len(chosen),seg_micro):
+                    values,log_prob,entropy,t,w=self.evaluate_segments(workers[m:m+seg_micro],t0[m:m+seg_micro])
+                    a=(b.advantages[t,w]-mean)/(std+1e-8)
+                    old=b.log_probs[t,w]
+                    ratio=torch.exp(log_prob-old)
+                    pg=-torch.min(a*ratio,a*torch.clamp(ratio,1-clip_range,1+clip_range))
+                    if clip_range_vf is not None:
+                        values=b._values[t,w]+torch.clamp(values-b._values[t,w],-clip_range_vf,clip_range_vf)
+                    vl=(b._returns[t,w]-values)**2
+                    el=-entropy
+                    ((pg.sum()+self.ent_coef*el.sum()+self.vf_coef*vl.sum())/n).backward()
+                    with torch.no_grad():
+                        lr_=log_prob-old
+                        sums+=torch.stack([pg.sum(),vl.sum(),el.sum(),((torch.exp(lr_)-1)-lr_).sum(),
+                                           ((ratio-1).abs()>clip_range).float().sum()])
+                pg_loss,value_loss,entropy_loss,approx_kl,clip_fraction=(sums/n).tolist()
+                pg_losses.append(pg_loss);value_losses.append(value_loss);entropy_losses.append(entropy_loss)
+                approx_kl_divs.append(approx_kl);clip_fractions.append(clip_fraction)
+                loss=pg_loss+self.ent_coef*entropy_loss+self.vf_coef*value_loss
+                # Same semantics as SB3: KL is measured on this minibatch before its step.
+                if self.target_kl is not None and approx_kl>1.5*self.target_kl:
+                    continue_training=False
+                    if self.verbose>=1:print(f'Early stopping at step {epoch} due to reaching max kl: {approx_kl:.2f}')
+                    break
+                torch.nn.utils.clip_grad_norm_(policy.parameters(),self.max_grad_norm)
+                policy.optimizer.step();steps+=1
+            if not continue_training:break
+        self._n_updates+=self.n_epochs
+        explained_var=explained_variance(b.values.flatten(),b.returns.flatten())
+        self.logger.record('train/entropy_loss',np.mean(entropy_losses))
+        self.logger.record('train/policy_gradient_loss',np.mean(pg_losses))
+        self.logger.record('train/value_loss',np.mean(value_losses))
+        self.logger.record('train/approx_kl',np.mean(approx_kl_divs))
+        self.logger.record('train/clip_fraction',np.mean(clip_fractions))
+        self.logger.record('train/loss',loss)
+        self.logger.record('train/explained_variance',explained_var)
+        self.logger.record('train/n_updates',self._n_updates,exclude='tensorboard')
+        self.logger.record('train/clip_range',clip_range)
+        if clip_range_vf is not None:self.logger.record('train/clip_range_vf',clip_range_vf)
+        self.logger.record('train/optimizer_steps',steps)
 
     def collect_rollouts(self,env,callback,rollout_buffer,n_rollout_steps,use_masking=True):
         if not use_masking:raise ValueError('Isaac requires action masking')

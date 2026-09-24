@@ -31,6 +31,7 @@ class RustBatch:
         self.lib=C.CDLL(str(path));self.n=n
         signatures={'new':([C.c_size_t,C.c_uint32,C.c_size_t],C.c_void_p),
                     'reset':([C.c_void_p,C.c_size_t,C.c_uint32],None),
+                    'reset_start':([C.c_void_p,C.c_size_t,C.c_uint32,C.c_float,C.c_float],None),
                     'step':([C.c_void_p,C.POINTER(C.c_int32)],None),
                     'step_one':([C.c_void_p,C.c_size_t,C.POINTER(C.c_int32)],None),
                     'state':([C.c_void_p],C.c_char_p),'free':([C.c_void_p],None),
@@ -60,9 +61,13 @@ class RustBatch:
                 row['truncated']=False
         return result
 
-    def reset(self,index,seed):
+    def reset(self,index,seed,player_hp=6.0,boss_hp_fraction=1.0):
         if not 0<=index<self.n:raise IndexError(index)
-        self.lib.isaac_batch_reset(self.handle,index,seed)
+        if (player_hp,boss_hp_fraction)==(6.0,1.0):self.lib.isaac_batch_reset(self.handle,index,seed)
+        else:
+            # Training-only start override; evaluation always uses the full-HP reset above.
+            if not (1<=player_hp<=6 and 0<boss_hp_fraction<=1):raise ValueError('Start HP out of range')
+            self.lib.isaac_batch_reset_start(self.handle,index,seed,player_hp,boss_hp_fraction)
 
     def step(self,actions):
         a=np.ascontiguousarray(actions,dtype=np.int32)

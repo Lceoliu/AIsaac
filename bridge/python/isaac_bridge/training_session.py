@@ -14,6 +14,7 @@ import torch
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.save_util import load_from_zip_file
 from .gpu_ppo import GpuMaskablePPO,FrameSampler
+from .gpu_env import FULL_START
 
 HELD_OUT_SEEDS=list(range(0x80000000,0x80000010))
 
@@ -48,9 +49,10 @@ class TrainingSession(BaseCallback):
             for worker,(done,info) in enumerate(zip(self.locals['dones'],self.locals['infos'])):
                 if done:
                     self.completed+=1
+                    start={'start':info['episode_start']} if 'episode_start' in info else {}
                     f.write(json.dumps(dict(episode=self.completed,worker=worker,seed=info['seed'],
                         outcome=info['outcome'],layout=info['layout'],frames=info['elapsed_frames'],
-                        **info['episode']))+'\n')
+                        **info['episode'],**start))+'\n')
         return self.completed<self.config['episodes']
 
     def after_update(self,model):
@@ -76,7 +78,7 @@ class TrainingSession(BaseCallback):
                    policy_version=model.policy_version)
         chunks=[]
         for c in model.env.chunks:
-            chunks.append(dict(seeds=c.seeds,actions=c.actions,episodes=c.episodes.copy(),
+            chunks.append(dict(seeds=c.seeds,starts=[list(s) for s in c.starts],actions=c.actions,episodes=c.episodes.copy(),
                                returns=c.returns.copy(),lengths=c.lengths.copy(),states=c.batch.states()))
         with gzip.open(temp/'continuation.pt.gz','wb',compresslevel=1) as f:
             torch.save(dict(rng=rng_state(),chunks=chunks,base_seed=model.env.base_seed,
@@ -117,7 +119,9 @@ def resume_model(checkpoint,env,device='cuda'):
     model=GpuMaskablePPO.load(checkpoint/'model.zip',env=env,device=device,force_reset=False)
     env.base_seed=data['base_seed'];env.generation+=1
     for c,saved in zip(env.chunks,data['chunks'],strict=True):
-        c.reset(saved['seeds'])
+        # Rebuild in-progress rooms with the starts actually used; older checkpoints predate
+        # start randomisation and were all full HP. New episodes follow the env's current config.
+        c.reset(saved['seeds'],saved.get('starts') or [FULL_START]*len(saved['seeds']))
         for i,actions in enumerate(saved['actions']):
             for action in actions:c.batch.step_one(i,action)
         if c.batch.states()!=saved['states']:

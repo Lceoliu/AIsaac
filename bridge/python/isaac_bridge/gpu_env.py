@@ -11,6 +11,31 @@ from stable_baselines3.common.vec_env import VecEnv
 from .sim_vec import RustBatch,FRAME_DTYPE
 from .transformer_obs import VisibleHistory,HISTORY,ENTITY_CAPACITY
 
+FULL_START=(6.0,1.0)  # player half-hearts, Boss HP fraction
+
+
+def sample_start(seed,config):
+    """Seed-deterministic training start, independent of the combat RNG.
+
+    OpenAI Five randomised Roshan's HP so agents that had learned "never approach" still met
+    kills; here some Boss starts are weakened and some player starts reduced. None -> full HP.
+    Resume restores the starts actually applied, so a later config change never rewrites them.
+    """
+    if not config:return FULL_START
+    rng=np.random.default_rng([int(seed),0x5EED])
+    player=float(rng.integers(config['player_hp_min'],6)) if rng.random()<config['player_hp_prob'] else 6.0
+    boss=float(rng.uniform(config['boss_hp_min'],1.0)) if rng.random()<config['boss_hp_prob'] else 1.0
+    return player,boss
+
+
+def validate_start_randomization(config):
+    if not config:return None
+    config={k:config[k] for k in ('boss_hp_prob','boss_hp_min','player_hp_prob','player_hp_min')}
+    if not (0<=config['boss_hp_prob']<=1 and 0<config['boss_hp_min']<=1 and 0<=config['player_hp_prob']<=1
+            and config['player_hp_min']==int(config['player_hp_min']) and 1<=config['player_hp_min']<=5):
+        raise ValueError(f'Invalid start randomisation {config}')
+    return config if config['boss_hp_prob'] or config['player_hp_prob'] else None
+
 
 class TransferSlot:
     def __init__(self,n,device):
@@ -39,10 +64,14 @@ class FrameChunk:
         self.episodes=np.zeros(self.n,np.int64);self.returns=np.zeros(self.n);self.lengths=np.zeros(self.n,np.int64)
         self.seeds=[owner.base_seed+i for i in range(start,stop)]
         self.actions=[[] for _ in range(self.n)]
+        self.starts=[FULL_START]*self.n
 
-    def reset(self,seeds):
+    def reset(self,seeds,starts=None):
+        """starts=None samples from the owner's training config; resume passes the saved starts."""
         self.seeds=list(map(int,seeds));self.actions=[[] for _ in range(self.n)]
-        for i,seed in enumerate(seeds):self.batch.reset(i,int(seed))
+        self.starts=([tuple(map(float,s)) for s in starts] if starts is not None else
+                     [sample_start(s,self.owner.start_randomization) for s in self.seeds])
+        for i,(seed,start) in enumerate(zip(self.seeds,self.starts)):self.batch.reset(i,seed,*start)
         self.episodes.fill(0);self.returns.fill(0);self.lengths.fill(0)
         self.batch.observe(self.slots[0].frames)
 
@@ -65,11 +94,13 @@ class FrameChunk:
             for info,state in zip(infos,self.batch.states()):info['replay_state']=state
         for i in np.flatnonzero(dones):
             infos[i]['episode']={'r':float(self.returns[i]),'l':int(self.lengths[i])}
+            infos[i]['episode_start']={'player_hp':self.starts[i][0],'boss_hp_fraction':self.starts[i][1]}
             self.returns[i]=0;self.lengths[i]=0;self.episodes[i]+=1
             seed=self.owner.base_seed+self.start+i+self.owner.num_envs*self.episodes[i]
             if self.owner.training_seeds and seed>=2**31:raise ValueError('Training seed entered held-out namespace')
             self.seeds[i]=int(seed);self.actions[i]=[]
-            self.batch.reset(int(i),int(seed))
+            self.starts[i]=sample_start(seed,self.owner.start_randomization)
+            self.batch.reset(int(i),int(seed),*self.starts[i])
         if dones.any():
             self.batch.observe(slot.reset_frames)
             # Pack only reset rows in the pinned prefix; do not upload a whole
@@ -94,13 +125,16 @@ class FrameChunk:
 
 
 class GpuFrameVecEnv(VecEnv):
-    def __init__(self,n=8,seed=1,threads=4,chunks=1,history=HISTORY,capacity=ENTITY_CAPACITY,device='cuda',reward_profile='legacy'):
+    def __init__(self,n=8,seed=1,threads=4,chunks=1,history=HISTORY,capacity=ENTITY_CAPACITY,device='cuda',reward_profile='legacy',
+                 start_randomization=None):
         if not 1<=chunks<=min(n,threads):raise ValueError('chunks must be <= envs and total Rust threads')
         if not 1<=capacity<=256:raise ValueError('capacity must be 1..256')
         self.device=torch.device(device)
         if self.device.type!='cuda':raise ValueError('GpuFrameVecEnv requires CUDA')
         self.base_seed=seed;self.capacity=capacity;self.history=history;self.generation=0
         self.reward_profile=reward_profile
+        # Training-only; evaluation constructs this env without it and therefore starts at full HP.
+        self.start_randomization=validate_start_randomization(start_randomization)
         self.record_states=False;self.training_seeds=False
         super().__init__(n,VisibleHistory(history,capacity,deadline=reward_profile=='combat-v1').space,spaces.MultiDiscrete([45,2,2]))
         boundaries=np.linspace(0,n,chunks+1,dtype=int)

@@ -155,6 +155,91 @@ class GpuInfraTest(unittest.TestCase):
         self.assertAlmostEqual(c['rollout_observation_gib'],1.66278076171875)
         self.assertEqual(c['reward_profile'],'combat-v1');self.assertEqual(c['gamma'],0.999)
 
+    def test_segment_minibatches_match_window_path(self):
+        env=GpuFrameVecEnv(3,seed=17,threads=2,chunks=1,history=8,capacity=128)
+        try:
+            m=model_for(env,8);m.segment_length=4;_,cb=m._setup_learn(10**6,Callback())
+            for _ in range(3):self.assertTrue(m.collect_rollouts(env,cb,m.rollout_buffer,8))
+            b=m.rollout_buffer;H=b.history
+            # Episode starts inside segments and inside the retained prefix (both paths read lengths).
+            for worker,row in ((1,H-1+5),(2,H-1)):
+                for k,r in enumerate(range(row,b.buffer_size+H)):b.lengths[r,worker]=min(k+1,H)
+            workers=torch.tensor([0,1,2,0,1,2],device='cuda');t0=torch.tensor([0,4,0,4,0,4],device='cuda')
+            m.policy.set_training_mode(True)
+            v,lp,ent,t,w=m.evaluate_segments(workers,t0)
+            d=b._get_samples(w*b.buffer_size+t)
+            v2,lp2,ent2=m.policy.evaluate_actions(d.observations,d.actions,action_masks=d.action_masks)
+            torch.testing.assert_close(v,v2.flatten(),rtol=1e-4,atol=1e-5)
+            torch.testing.assert_close(lp,lp2,rtol=1e-4,atol=1e-5)
+            torch.testing.assert_close(ent,ent2,rtol=1e-4,atol=1e-5)
+            grads=[]
+            for loss in ((v*1.3+lp*0.7+ent).sum(),(v2.flatten()*1.3+lp2*0.7+ent2).sum()):
+                m.policy.optimizer.zero_grad();loss.backward()
+                grads.append({n:p.grad.clone() for n,p in m.policy.named_parameters() if p.grad is not None})
+            self.assertEqual(grads[0].keys(),grads[1].keys())
+            for n in grads[0]:torch.testing.assert_close(grads[0][n],grads[1][n],rtol=1e-3,atol=2e-5,msg=n)
+        finally:env.close()
+
+    def test_segment_training_updates_with_accumulation(self):
+        env=GpuFrameVecEnv(4,seed=23,threads=2,chunks=1,history=8,capacity=128)
+        try:
+            m=model_for(env,8);m.segment_length=4;m.micro_batch_size=4;m.batch_size=16;m.n_epochs=2;m.ent_coef=0.01
+            _,cb=m._setup_learn(10**6,Callback());self.assertTrue(m.collect_rollouts(env,cb,m.rollout_buffer,8))
+            weights=[p.detach().clone() for p in m.policy.parameters()]
+            m.train()
+            self.assertTrue(any(not torch.equal(a,p) for a,p in zip(weights,m.policy.parameters())))
+            logged=m.logger.name_to_value
+            self.assertEqual(logged['train/optimizer_steps'],4)  # 8 segments / 4 per batch x 2 epochs
+            self.assertTrue(0<=logged['train/clip_fraction']<=1 and np.isfinite(logged['train/approx_kl']))
+            self.assertEqual(m.policy_version,1)
+            m.micro_batch_size=3
+            with self.assertRaisesRegex(ValueError,'segment_length'):m.train()
+        finally:env.close()
+
+    def test_training_start_randomisation_is_seeded_and_evaluation_full_hp(self):
+        from isaac_bridge.gpu_env import sample_start,FULL_START
+        from isaac_bridge.sim_vec import RustBatch
+        cfg=dict(boss_hp_prob=0.5,boss_hp_min=0.1,player_hp_prob=0.25,player_hp_min=3)
+        self.assertEqual(sample_start(123,None),FULL_START)
+        starts=[sample_start(s,cfg) for s in range(4000)]
+        self.assertEqual(starts,[sample_start(s,cfg) for s in range(4000)])
+        players=np.array([p for p,_ in starts]);bosses=np.array([b for _,b in starts])
+        self.assertTrue(set(players)<={3.0,4.0,5.0,6.0} and 0.2<(players<6).mean()<0.3)
+        self.assertTrue(((bosses>=0.1)&(bosses<=1)).all() and 0.45<(bosses<1).mean()<0.55)
+        batch=RustBatch(1,0,1,reward_profile='combat-v1')
+        try:
+            batch.reset(0,77,3.0,0.4);f=batch.observe()
+            boss=int(np.flatnonzero(f['entity_kind'][0,:,0]==20)[0])
+            self.assertAlmostEqual(float(f['player'][0,6])*6,3.0,places=5)
+            self.assertAlmostEqual(float(f['entities'][0,boss,15])*250,100.0,places=3)
+            with self.assertRaisesRegex(ValueError,'Start HP'):batch.reset(0,77,0.0,1.0)
+        finally:batch.close()
+        for randomised in (True,False):
+            env=GpuFrameVecEnv(8,seed=40,threads=2,chunks=1,history=8,capacity=128,
+                               start_randomization=cfg if randomised else None)
+            try:
+                env.reset();c=env.chunks[0];frames=c.slots[0].frames
+                expected=[sample_start(s,cfg) if randomised else FULL_START for s in c.seeds]
+                self.assertEqual(c.starts,expected)
+                for i,(player,boss_frac) in enumerate(expected):
+                    boss=int(np.flatnonzero(frames['entity_kind'][i,:,0]==20)[0])
+                    self.assertAlmostEqual(float(frames['player'][i,6])*6,player,places=5)
+                    self.assertAlmostEqual(float(frames['entities'][i,boss,15]),boss_frac,places=4)
+                if randomised:self.assertNotEqual(expected,[FULL_START]*8)
+                # An episode end reports the start it used, and the next seed gets its own start.
+                slot=c.slots[0];slot.actions.zero_();slot.action_ready.record();torch.cuda.synchronize()
+                used=c.starts[0];real_observe=c.batch.observe;calls=[0]
+                def observe(out=None):
+                    result=real_observe(out);calls[0]+=1
+                    if calls[0]==1:result['done'][0]=1  # pretend worker 0 just finished
+                    return result
+                with patch.object(c.batch,'observe',side_effect=observe):_,dones,infos=c.advance(slot)
+                self.assertTrue(dones[0])
+                self.assertEqual(infos[0]['episode_start'],{'player_hp':used[0],'boss_hp_fraction':used[1]})
+                self.assertEqual(c.seeds[0],40+8)
+                self.assertEqual(c.starts[0],sample_start(48,cfg) if randomised else FULL_START)
+            finally:env.close()
+
     def test_sb3_learn_two_bounded_updates(self):
         env=GpuFrameVecEnv(2,history=8,capacity=128,threads=2,chunks=2)
         try:
