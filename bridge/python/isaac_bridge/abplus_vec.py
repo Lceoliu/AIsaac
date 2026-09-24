@@ -252,6 +252,8 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
                 'worker_step_ms': float(m['step_ms'].mean()), 'worker_step_ms_max': float(m['step_ms'].max()),
                 'switch_wait_ms_max': float(m['switch_wait_ms'].max()), 'reset_ms_mean': float(m['reset_ms'].mean()),
                 'worker_errors': int(m['errors'].sum()), 'instance_recycles': int(m['recycles'].sum()),
+                'instance_start_failures': int(m['start_failures'].sum()),
+                'recycle_deferrals': int(m['recycle_deferrals'].sum()),
                 'exchange_ms': 1000 * sum(c.exchange_s for c in self.chunks) / max(1, exchanges)}
 
     def step_async(self, actions):

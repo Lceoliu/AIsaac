@@ -14,16 +14,24 @@ components, a win adds 2 plus a [0, 1] speed bonus). In both the 120 s deadline 
 as a termination, not a truncation.
 
 Instance recycling: an instance that has played config['recycle_episodes'] episodes (default 200,
-0 = never) is restarted in its background preparation thread, while the other instance plays, so
-the batch does not wait for the restart. It was added for a leak of ~0.76 MiB per training episode
-that also slowed resets; the cause was render-lite stubbing ImageManager::apply_frame_images, which
-recycles transparent render batches (fixed in tools/stub_render_f.txt, analysis/docs/
+0 = never) is replaced in its background preparation thread, while the other instance plays, so
+the batch does not wait. It was added for a leak of ~0.76 MiB per training episode that also slowed
+resets; the cause was render-lite stubbing ImageManager::apply_frame_images, which recycles
+transparent render batches (fixed in tools/stub_render_f.txt, analysis/docs/
 ABP_LINUX_REVERSE_ENGINEERING.md 15.11). Recycling stays as a guard against slower leaks.
+
+Every start of an AB+ process needs a running, logged-in Steam client (steam_watch.py). A recycle
+therefore starts the replacement under the instance's second identity (name + 'x', port +
+2 * num_envs) and stops the old process only once the new one serves the bridge. With no Steam
+client running the recycle is deferred; a replacement that exits or does not come up within
+STARTUP_S is counted as a start failure and the old process keeps playing. Either way the next
+attempt comes RETRY_EPISODES episodes later. META counts both for the learner's alerts.
 """
 from __future__ import annotations
 
 import os
 import signal
+import socket
 import struct
 import subprocess
 import threading
@@ -37,6 +45,7 @@ from .abplus import AbplusTransformerEnv, launch_abplus, stop_abplus
 from .abplus_reward import COMPONENTS, CombatV2
 from .abplus_tasks import TASKS, TaskSampler
 from .combat_reward import combat_v1_reward
+from .steam_watch import steam_running
 
 # Must equal sim_vec.FRAME_DTYPE (checked by abplus_vec at import; sim_vec imports torch).
 FRAME_DTYPE = np.dtype([
@@ -52,12 +61,15 @@ FRAME_KEYS = ('player', 'player_anim', 'active_kind', 'entities', 'entity_kind',
 META_DTYPE = np.dtype([
     ('seed', 'i8'), ('start', 'f4', (2,)), ('reset_seed', 'i8'), ('reset_start', 'f4', (2,)),
     ('step_ms', 'f4'), ('switch_wait_ms', 'f4'), ('reset_ms', 'f4'), ('errors', 'i4'), ('episodes', 'i4'),
-    ('task', 'i4'), ('reset_task', 'i4'), ('components', 'f4', (len(COMPONENTS),)), ('recycles', 'i4')])
+    ('task', 'i4'), ('reset_task', 'i4'), ('components', 'f4', (len(COMPONENTS),)), ('recycles', 'i4'),
+    ('start_failures', 'i4'), ('recycle_deferrals', 'i4')])
 REWARD_PROFILES = ('combat-v1', 'combat-v2')
 OUTCOMES = ('running', 'death', 'win', 'time_limit', 'error')
 FULL_START = (6.0, 1.0)  # player half-hearts, Boss HP fraction
 MAX_EPISODE_FRAMES = 3600  # 120 s at 30 logic frames/s
 RECYCLE_EPISODES = 200     # restart an AB+ process after this many episodes (memory leak; 0 = never)
+RETRY_EPISODES = 50        # a deferred or failed recycle is tried again this many episodes later
+STARTUP_S = 30.0           # a replacement process must serve the bridge within this time
 
 
 def sample_start(seed, config):
@@ -82,26 +94,89 @@ class FrameEnv(AbplusTransformerEnv):
         return self.history.encode(obs)
 
 
-class Instance:
-    """One AB+ process with its bridge; prepare() resets it for an episode in a background thread."""
+def wait_listening(proc, port, timeout):
+    """True once the game serves the bridge on port (bound after its first logic frame); False when
+    the process exits first (e.g. the DRM stub handing over to steam.sh) or the time runs out."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return False
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.25)
+    return False
 
-    def __init__(self, name, port, config):
-        self.name, self.port, self.config = name, port, config
+
+class Instance:
+    """One AB+ process with its bridge; prepare() resets it for an episode in a background thread.
+
+    The process runs under one of two identities (instance name and port) so that a recycle can
+    start the replacement before the old process stops."""
+
+    def __init__(self, name, port, config, alt_port=None):
+        self.names = (name, name + 'x')
+        self.ports = (port, port if alt_port is None else alt_port)
+        self.slot = 0
+        self.config = config
         self.proc = self.env = None
         self.thread = None
         self.ready = threading.Event()
         self.result = self.error = None
         self.episodes = 0   # episodes prepared since this process started
-        self.recycles = 0
+        self.recycles = self.start_failures = self.recycle_deferrals = 0
         self.launch()
+
+    @property
+    def name(self):
+        return self.names[self.slot]
+
+    @property
+    def port(self):
+        return self.ports[self.slot]
+
+    def _env(self, port):
+        env = FrameEnv(port=port, max_episode_frames=MAX_EPISODE_FRAMES, deadline=True)
+        env.bridge.binary_obs = self.config.get('binary_obs', True)
+        spec = self.config.get('tasks')
+        env.bridge.tasks = TaskSampler(spec['weights'], spec['normal'], spec['boss']) if spec else None
+        return env
 
     def launch(self):
         self.episodes = 0
         self.proc = launch_abplus(self.name, self.port, self.config['mode'], nice=self.config['nice'])
-        self.env = FrameEnv(port=self.port, max_episode_frames=MAX_EPISODE_FRAMES, deadline=True)
-        self.env.bridge.binary_obs = self.config.get('binary_obs', True)
-        spec = self.config.get('tasks')
-        self.env.bridge.tasks = TaskSampler(spec['weights'], spec['normal'], spec['boss']) if spec else None
+        self.env = self._env(self.port)
+
+    def _replace(self):
+        """Start the other identity; stop the current process only when the new one is up."""
+        slot = 1 - self.slot
+        name, port = self.names[slot], self.ports[slot]
+        proc = launch_abplus(name, port, self.config['mode'], nice=self.config['nice'])
+        if not wait_listening(proc, port, STARTUP_S):
+            self._end(proc, name, None)
+            return False
+        old = (self.proc, self.name, self.env)
+        self.slot, self.proc, self.env = slot, proc, self._env(port)
+        self.episodes = 0
+        self._end(*old)
+        return True
+
+    def _recycle(self):
+        retry_at = max(0, int(self.config.get('recycle_episodes', RECYCLE_EPISODES)) - RETRY_EPISODES)
+        if self.ports[0] == self.ports[1]:        # no second identity: stop, then start
+            self._stop_process()
+            time.sleep(1.0)
+            self.launch()
+            self.recycles += 1
+        elif not steam_running():
+            self.recycle_deferrals += 1
+            self.episodes = retry_at
+        elif self._replace():
+            self.recycles += 1
+        else:
+            self.start_failures += 1
+            self.episodes = retry_at
 
     def relaunch(self):
         self.close()
@@ -109,14 +184,11 @@ class Instance:
         self.launch()
 
     def prepare(self, seed, start, recycle=False):
-        """Reset for an episode in a background thread; recycle=True first restarts the process."""
+        """Reset for an episode in a background thread; recycle=True first replaces the process."""
         def run():
             try:
                 if recycle:
-                    self._stop_process()
-                    time.sleep(1.0)
-                    self.launch()
-                    self.recycles += 1
+                    self._recycle()
                 self.episodes += 1
                 t = time.perf_counter()
                 frame, info = self.env.reset(options={'arena_seed': int(seed), 'start': start})
@@ -138,25 +210,29 @@ class Instance:
             raise RuntimeError(f'{self.name} reset failed:\n{self.error}')
         return self.result
 
-    def _stop_process(self):
-        """Close the bridge and end the game; waits for the exit so the port is free again."""
+    @staticmethod
+    def _end(proc, name, env):
+        """Close a bridge and end its game; waits for the exit so the port is free again."""
         try:
-            if self.env is not None:
-                self.env.close()
+            if env is not None:
+                env.close()
         except Exception:
             pass
         finally:
-            if self.proc is not None:
-                stop_abplus(self.proc, self.name)
+            if proc is not None:
+                stop_abplus(proc, name)
                 try:
-                    self.proc.wait(timeout=20)
+                    proc.wait(timeout=20)
                 except subprocess.TimeoutExpired:
                     try:
-                        os.killpg(self.proc.pid, signal.SIGKILL)
+                        os.killpg(proc.pid, signal.SIGKILL)
                     except OSError:
                         pass
-                    self.proc.wait(timeout=20)
-            self.proc = self.env = None
+                    proc.wait(timeout=20)
+
+    def _stop_process(self):
+        self._end(self.proc, self.name, self.env)
+        self.proc = self.env = None
 
     def close(self):
         if self.thread is not None and self.thread.is_alive() and self.thread is not threading.current_thread():
@@ -182,7 +258,9 @@ class Worker:
         self.step_row, self.reset_row, self.meta = step_row, reset_row, meta
         name = f"{config['name']}{index}"
         port = config['port'] + 2 * index
-        self.instances = [Instance(name + 'a', port, config), Instance(name + 'b', port + 1, config)]
+        alt = 2 * config['num_envs']   # second identities use the port block after the first
+        self.instances = [Instance(name + 'a', port, config, port + alt),
+                          Instance(name + 'b', port + 1, config, port + 1 + alt)]
         self.active = 0
         self.episode = 0
         self.seed = None
@@ -297,6 +375,8 @@ class Worker:
             self.meta['reset_ms'] = reset_ms
             self.meta['episodes'] = self.episode
             self.meta['recycles'] = sum(instance.recycles for instance in self.instances)
+            self.meta['start_failures'] = sum(instance.start_failures for instance in self.instances)
+            self.meta['recycle_deferrals'] = sum(instance.recycle_deferrals for instance in self.instances)
             # The instance that just finished prepares the episode after the one now starting,
             # restarting its process first when it has played recycle_after episodes.
             finished = self.instances[old]

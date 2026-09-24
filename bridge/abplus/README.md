@@ -328,6 +328,20 @@ Python worker 的内存稳定（前后都是 8,856 MiB），Lua 堆稳定在约 
 - 当时停掉了卡住的评估进程及其 worker，用户在远端桌面重新登录 Steam 后，回收和评估都恢复正常。
 - 以后看到评估长时间 0 局，或实例日志里有 `SteamAPI_IsSteamRunning() did not locate a running instance of Steam`，先检查远端的 Steam 是否在运行且已登录。
 
+**Steam 预警**（2026-09-25 加入，从下一次训练起生效；当时正在跑的 abp-mix-01b 仍是旧代码）：
+- **检测**：学习器每轮检查 Steam 客户端进程（`isaac_bridge/steam_watch.py`，进程名 `steam`、可执行文件 `…/ubuntu12_32/steam`）。`~/.steam/registry.vdf` 里的 `SteamPID` 与实际客户端对不上，不采用。
+- **报警渠道**：
+  - 训练日志里的 `steam_down` / `steam_up` 事件，以及 `abplus/steam_ok`；
+  - 运行目录下的 `STEAM_DOWN` 文件；
+  - 远端桌面通知；
+  - `$ABP_ALERT_CMD`（启动训练前设置）。例如推送到手机：`export ABP_ALERT_CMD='curl -s -d "$ABP_ALERT_MESSAGE" https://ntfy.sh/<自己的主题>'`。
+- **报警节奏**：Steam 一退出就报警，未恢复时每 10 分钟重复一次，恢复时再通知一次。
+- **Steam 不在时**：跳过评估（`abplus_eval.py` 启动时也会检查并直接退出），实例回收推迟 50 局再试。
+- **回收改为先启后停**：先用实例的第二套身份（名字加 `x`，端口加 2 × 环境数）启动新进程，确认它能服务桥接后再停旧进程。新进程起不来（例如 Steam 在运行但被别处登录挤下线）时，保留旧进程继续训练，记一次 `instance_start_failures` 并报警 `instance_start_failed`。
+- **测试**：
+  - `test_steam_watch.py` 6 个单元测试；
+  - 实机每 3 局回收一次，90 秒回收 29 次、0 错误、无残留进程。在这种极端设置下，吞吐从先停后启的 227 升到 338 决策/秒，最长切换等待从 4.1 秒降到 2.1 秒。
+
 停训练要用 SIGTERM，不能用 Ctrl-C。原因是后台（nohup/&）启动的进程继承了"忽略 SIGINT"，Python 就不装 KeyboardInterrupt。SIGTERM 之后，worker 发现管道关闭，会各自关掉自己的 AB+ 实例。
 
 - 默认配置：16 个环境（32 个实例）、`--chunks 1`、每轮 1024 步 × 16 个环境 = 16,384 样本、batch 1024、2 epoch、ent 0.01、gamma 0.999、严格 FP32。

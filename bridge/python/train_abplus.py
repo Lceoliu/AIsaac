@@ -11,6 +11,12 @@ reward components; episodes.jsonl has the components of every episode. Progress 
 game time: one decision is 2 logic frames, 30 logic frames are one game second, so
 game/speed_x_realtime = decisions/s / 15.
 
+Steam watch (isaac_bridge/steam_watch.py): every rollout checks that the Steam client runs (every
+AB+ start needs it) and alerts when it stops, is still down every 10 min, or comes back, and when
+workers report instance starts that failed: a JSON event in this log, abplus/steam_ok, a STEAM_DOWN
+file in the run directory, a desktop notification on the host and $ABP_ALERT_CMD if set.
+Evaluations are skipped while Steam is down; workers defer instance recycles.
+
 Checkpoints hold weights, optimizer, counters and RNG. A resume starts fresh episodes (the
 in-progress rooms are not rebuilt). Periodic evaluation runs abplus_eval.py as a separate CPU
 process on a few extra instances, so the learner keeps the GPU to itself.
@@ -39,7 +45,8 @@ SOURCES = ('train_abplus.py', 'abplus_eval.py', 'isaac_bridge/abplus.py', 'isaac
            'isaac_bridge/abplus_obs.py', 'isaac_bridge/abplus_tasks.py', 'isaac_bridge/abplus_reward.py',
            'isaac_bridge/abplus_vec.py', 'isaac_bridge/transformer_obs.py', 'isaac_bridge/transformer_policy.py',
            'isaac_bridge/gpu_ppo.py', 'isaac_bridge/gpu_buffer.py', 'isaac_bridge/gpu_env.py',
-           'isaac_bridge/combat_reward.py', 'isaac_bridge/monstro_gym.py', 'isaac_bridge/env.py')
+           'isaac_bridge/combat_reward.py', 'isaac_bridge/monstro_gym.py', 'isaac_bridge/env.py',
+           'isaac_bridge/steam_watch.py')
 
 
 def game_hours(decisions):
@@ -60,6 +67,7 @@ def source_hashes():
 
 
 def session_class():
+    from isaac_bridge.steam_watch import SteamWatch
     from isaac_bridge.training_session import TrainingSession
 
     class AbplusSession(TrainingSession):
@@ -72,6 +80,7 @@ def session_class():
             self.last_steps = None
             self.evaluation = None
             self.rollout_episodes = []
+            self.steam = SteamWatch(out)
 
         def _on_rollout_end(self):
             now, steps = time.monotonic(), self.model.num_timesteps
@@ -81,8 +90,11 @@ def session_class():
                 self.logger.record('game/speed_x_realtime', rate * FRAMES_PER_DECISION / GAME_FPS)
             self.logger.record('game/hours_this_run', game_hours(steps - self.start_timesteps))
             self.logger.record('game/hours_total', game_hours(steps))
-            for key, value in self.model.env.diagnostics().items():
+            diagnostics = self.model.env.diagnostics()
+            for key, value in diagnostics.items():
                 self.logger.record('abplus/' + key, value)
+            self.logger.record('abplus/steam_ok', int(self.steam.poll()))
+            self.steam.launch_failed(diagnostics.get('instance_start_failures', 0))
             episodes, self.rollout_episodes = self.rollout_episodes, []
             for task in sorted({e['task'] for e in episodes}):
                 mine = [e for e in episodes if e['task'] == task]
@@ -115,6 +127,10 @@ def session_class():
         def evaluate(self, model, checkpoint):
             count = self.config.get('eval_seeds_count', 0)
             if not count:
+                return
+            if not self.steam.poll():
+                print(json.dumps(dict(event='evaluation_skipped', reason='steam client not running',
+                                      checkpoint=checkpoint.name)), flush=True)
                 return
             if self.evaluation is not None and self.evaluation.poll() is None:
                 print(json.dumps(dict(event='evaluation_skipped', reason='previous evaluation still running',

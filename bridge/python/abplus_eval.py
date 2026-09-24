@@ -33,6 +33,7 @@ from stable_baselines3.common.save_util import load_from_zip_file
 from isaac_bridge.abplus import AbplusTransformerEnv, launch_abplus, sim_arena, stop_abplus
 from isaac_bridge.abplus_reward import CombatV2
 from isaac_bridge.abplus_tasks import TaskSampler
+from isaac_bridge.steam_watch import steam_running
 
 DEADLINE_PROFILES = ('combat-v1', 'combat-v2')  # reward profiles trained with the 120 s deadline input
 
@@ -307,6 +308,10 @@ def main():
     p.add_argument('--port', type=int, default=27200)
     p.add_argument('--name', default='beval')
     args = p.parse_args()
+    if not steam_running():
+        # Every AB+ start needs the Steam client; without it the game only launches steam.sh and exits.
+        print(json.dumps({'event': 'evaluation_skipped', 'reason': 'steam client not running'}), flush=True)
+        raise SystemExit(3)
     checkpoint, out = Path(args.checkpoint), Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     saved = json.loads((checkpoint / 'state.json').read_text())
