@@ -17,6 +17,10 @@ workers report instance starts that failed: a JSON event in this log, abplus/ste
 file in the run directory, a desktop notification on the host and $ABP_ALERT_CMD if set.
 Evaluations are skipped while Steam is down; workers defer instance recycles.
 
+Collection sampler (--sampler): graph (default) replays each chunk's per-step inference as CUDA
+graphs (isaac_bridge/graph_sampler.py, ~1.7 ms instead of ~10.8 ms per step for 16 environments)
+and logs its self-check against the eager path as sampler/graph_*; eager is FrameSampler.
+
 Checkpoints hold weights, optimizer, counters and RNG. A resume starts fresh episodes (the
 in-progress rooms are not rebuilt). Periodic evaluation runs abplus_eval.py as a separate CPU
 process on a few extra instances, so the learner keeps the GPU to itself.
@@ -46,7 +50,7 @@ SOURCES = ('train_abplus.py', 'abplus_eval.py', 'isaac_bridge/abplus.py', 'isaac
            'isaac_bridge/abplus_vec.py', 'isaac_bridge/transformer_obs.py', 'isaac_bridge/transformer_policy.py',
            'isaac_bridge/gpu_ppo.py', 'isaac_bridge/gpu_buffer.py', 'isaac_bridge/gpu_env.py',
            'isaac_bridge/combat_reward.py', 'isaac_bridge/monstro_gym.py', 'isaac_bridge/env.py',
-           'isaac_bridge/steam_watch.py')
+           'isaac_bridge/steam_watch.py', 'isaac_bridge/graph_sampler.py')
 
 
 def game_hours(decisions):
@@ -104,13 +108,22 @@ def session_class():
             parts = [e['reward_components'] for e in episodes if 'reward_components' in e]
             for key in (parts[0] if parts else ()):
                 self.logger.record('reward/' + key, float(np.mean([c[key] for c in parts])))
+            sampler = self.model._gpu_sampler
+            if getattr(sampler, 'diffs', None) is not None:
+                for key, value in sampler.diffs.items():
+                    self.logger.record('sampler/graph_' + key, value)
+                sampler.diffs = dict.fromkeys(sampler.diffs, 0.0)
             self.last_time, self.last_steps = now, steps
 
         def _on_step(self):
-            # TrainingSession._on_step plus the task of each finished episode.
-            with (self.out / 'episodes.jsonl').open('a', encoding='utf8') as f:
-                for worker, (done, info) in enumerate(zip(self.locals['dones'], self.locals['infos'])):
-                    if done:
+            # TrainingSession._on_step plus the task of each finished episode (the file is opened
+            # only on steps where an episode ended).
+            dones = self.locals['dones']
+            if dones.any():
+                with (self.out / 'episodes.jsonl').open('a', encoding='utf8') as f:
+                    for worker, (done, info) in enumerate(zip(dones, self.locals['infos'])):
+                        if not done:
+                            continue
                         self.completed += 1
                         start = {'start': info['episode_start']} if 'episode_start' in info else {}
                         parts = ({'reward_components': info['reward_components']}
@@ -224,6 +237,10 @@ def main():
                    help='room mixture spec (weights, normal and boss room lists); none = Monstro arena only')
     p.add_argument('--task-weights', default=None, help='override, e.g. arena=0.2,normal=0.45,boss=0.35')
     p.add_argument('--json-obs', action='store_true', help='bridge v1 JSON observations instead of binary v2')
+    p.add_argument('--sampler', choices=('graph', 'eager'), default='graph',
+                   help='graph: per-step inference replayed as CUDA graphs (graph_sampler.py); eager: FrameSampler')
+    p.add_argument('--graph-check-every', type=int, default=1024,
+                   help='graph sampler steps between self-checks against the eager path (0 = never)')
     p.add_argument('--recycle-episodes', type=int, default=200,
                    help='restart each AB+ process after this many episodes (the game leaks memory while it plays); 0 = never')
     p.add_argument('--reward-profile', choices=('combat-v2', 'combat-v1'), default='combat-v2',
@@ -262,7 +279,7 @@ def main():
                         'boss_rooms': len(tasks['boss'])} if tasks else 'monstro-arena (sim seeds)'),
               'tasks_spec': tasks,
               'observation_transport': 'json (bridge v1)' if args.json_obs else 'binary (bridge v2, abp-0.2.1)',
-              'reward_profile': args.reward_profile,
+              'reward_profile': args.reward_profile, 'collection_sampler': args.sampler,
               'reward': (describe_reward() if args.reward_profile == 'combat-v2'
                          else 'combat-v1: legacy hurt/hit/damage/clear, win +2 + speed bonus, timeout -1'),
               'schema': DEADLINE_SCHEMA, 'history': 64, 'entity_capacity': 256,
@@ -303,6 +320,10 @@ def main():
                                    net_arch=dict(pi=[256], vf=[256]), normalize_images=False),
                 device=args.device, seed=args.seed, verbose=1)
         model.micro_batch_size, model.segment_length = args.micro_batch, args.segment_length
+        if args.sampler == 'graph':
+            from functools import partial
+            from isaac_bridge.graph_sampler import GraphFrameSampler
+            model.sampler_class = partial(GraphFrameSampler, check_every=args.graph_check_every)
         if args.warm_start:
             migration = warm_start_model(model, args.warm_start)
             (args.out / 'migration.json').write_text(json.dumps(migration, indent=2), encoding='utf8')

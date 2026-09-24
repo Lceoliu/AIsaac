@@ -86,6 +86,10 @@ class FrameSampler:
 
 
 class GpuMaskablePPO(MaskablePPO):
+    # Collection sampler factory, called with the model; None = FrameSampler (graph_sampler.py
+    # provides a CUDA-graph variant for the AB+ learner).
+    sampler_class=None
+
     def __init__(self,*args,**kwargs):
         # TF32 cuDNN changes CNN rounding with batch shape (one frame vs H
         # frames). Keep collection and PPO likelihood evaluation in strict FP32.
@@ -101,7 +105,7 @@ class GpuMaskablePPO(MaskablePPO):
         super().__init__(*args,**kwargs)
 
     def _excluded_save_params(self):
-        return super()._excluded_save_params()+['_gpu_sampler','_collecting','session']
+        return super()._excluded_save_params()+['_gpu_sampler','_collecting','session','sampler_class']
 
     def _setup_learn(self,*args,**kwargs):
         result=super()._setup_learn(*args,**kwargs)
@@ -230,7 +234,7 @@ class GpuMaskablePPO(MaskablePPO):
         versions=tuple(p._version for p in self.policy.parameters())
         try:
             with torch.no_grad():
-                if self._gpu_sampler is None:self._gpu_sampler=FrameSampler(self)
+                if self._gpu_sampler is None:self._gpu_sampler=(self.sampler_class or FrameSampler)(self)
                 s=self._gpu_sampler;b=rollout_buffer;s.begin()
                 callback.on_rollout_start()
                 dones=self._last_episode_starts

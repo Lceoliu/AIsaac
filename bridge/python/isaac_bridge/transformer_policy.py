@@ -93,6 +93,34 @@ class CombatTransformer(BaseFeaturesExtractor):
         sequence[valid_time] = fused
         return sequence
 
+    def encode_frame_static(self, o):
+        """encode_frames for one frame per row, (n, ...) inputs, without data-dependent shapes.
+
+        All 256 entity slots go through the entity MLP and the padding ones are masked out of the
+        attention instead of being compacted away, so no host synchronisation is needed and the
+        computation can be captured in a CUDA graph (graph_sampler.py). Same result as
+        encode_frames up to float summation order; rows whose history_mask is 0 give zeros.
+        """
+        n = o['player'].shape[0]
+        inputs = [o['player'], self.animation_embedding(o['player_anim']),
+                  self.active_item(o['active_kind'].long().squeeze(-1))]
+        if self.has_deadline:
+            inputs.append(o['remaining_time'].unsqueeze(-1))
+        player = self.player(torch.cat(inputs, -1))
+        kinds = o['entity_kind'].long()
+        encoded = self.entity(torch.cat([o['entities'], self.entity_type(kinds[..., 0]), self.variant(kinds[..., 1]),
+                                         self.subtype(kinds[..., 2]), self.animation_embedding(o['entity_anim'])], -1))
+        entities = torch.cat([self.empty_entity.expand(n, 1, -1), encoded], 1)
+        padding = torch.cat([torch.zeros((n, 1), dtype=torch.bool, device=player.device), ~o['entity_mask'].bool()], 1)
+        queries = self.queries.unsqueeze(0) + self.player_query(player).unsqueeze(1)
+        summary, _ = self.entity_attention(queries, entities, entities, key_padding_mask=padding, need_weights=False)
+        terrain = self.map_cnn(o['terrain'])
+        old = o['previous_action']
+        actions = self.action(torch.cat([self.joint_action(old[:, 0].long()), self.bomb_action(old[:, 1].long()),
+                                         self.item_action(old[:, 2].long()), old[:, 3:4]], -1)) * old[:, 3:4]
+        fused = self.fusion(torch.cat([player, summary.flatten(1), terrain, actions], -1))
+        return fused * o['history_mask'].unsqueeze(-1)
+
     def sequence_features(self, observations):
         sequence = self.encode_frames(observations)
         return self.temporal_features(sequence, observations['time'], observations['history_mask'])
