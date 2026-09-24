@@ -36,7 +36,7 @@ def monstro_visual(entity, player_pos, width, height):
     """
     if (entity['type'], entity['variant']) != (20, 0):
         return [0, 1, 0, 0, 0]
-    anim, frame = entity['anim'], entity['aframe']
+    anim, frame = entity.get('anim', ''), entity['aframe']  # AB+: no anim when no known name matched
     airborne = ((anim == 'Walk' and 7 <= frame < 23) or
                 (anim == 'JumpUp' and frame >= 10) or (anim == 'JumpDown' and frame < 33))
     body = not ((anim == 'JumpUp' and frame >= 11) or (anim == 'JumpDown' and frame < 29))
@@ -107,7 +107,11 @@ class VisibleHistory:
         self.origin = None
         self.previous_action[:] = 0
 
-    def append(self, obs):
+    def encode(self, obs):
+        """Append obs to the history and return only its frame (window row, no padding copy).
+
+        The GPU learner keeps the window on the device, so rollout workers need just this.
+        """
         # Shared sim/native contract: cosmetic player/tear/blood-shot animation
         # is not calibrated in the simulator. Exclude it on BOTH backends,
         # rather than let the policy distinguish domains from placeholder art.
@@ -169,7 +173,7 @@ class VisibleHistory:
                     laser['radius']/width if laser and laser['circle'] else 0,
                     bool(laser and laser['circle'])]
                 row.extend(monstro_visual(e,p['pos'],width,height))
-                rows.append((row, (e['type'], e['variant'], e['subtype']), animation_bytes(e['anim'])))
+                rows.append((row, (e['type'], e['variant'], e['subtype']), animation_bytes(e.get('anim', ''))))
         if len(rows) > self.capacity:
             raise ValueError(f'Visible entity/laser segment overflow: {len(rows)} > {self.capacity}; increase capacity, never truncate')
         for i, (row, kind, anim) in enumerate(rows):
@@ -177,13 +181,26 @@ class VisibleHistory:
             frame['entity_kind'][i] = kind
             frame['entity_anim'][i] = anim
             frame['entity_mask'][i] = 1
-        frame['terrain'] = terrain_channels(obs)
+        # Binary observations (abplus_obs) mark unchanged terrain with a version: reuse its channels.
+        version = obs['terrain'].get('version')
+        if version is None:
+            frame['terrain'] = terrain_channels(obs)
+        else:
+            key = (version, tuple((d['pos'][0], d['pos'][1], bool(d['open'])) for d in obs['doors']))
+            if key != getattr(self, '_terrain_key', None):
+                self._terrain_key, self._terrain_value = key, terrain_channels(obs)
+            frame['terrain'] = self._terrain_value
         frame['previous_action'] = self.previous_action.copy()
         frame['time'] = np.float32((obs['logic_frames']-self.origin)/30)
         if self.deadline:frame['remaining_time']=np.float32(max(0,1-frame['time']/120))
         frame['history_mask'] = np.float32(1)
         self.frames.append(frame)
         self.previous = obs
+        self.last_rows = len(rows)
+        return frame
+
+    def append(self, obs):
+        self.encode(obs)
         result = {k: np.zeros(v.shape, dtype=v.dtype) for k, v in self.space.spaces.items()}
         # Right padding: causal attention always has a real first key, even at episode start.
         for i, record in enumerate(self.frames):

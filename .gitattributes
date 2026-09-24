@@ -1,0 +1,2 @@
+# Scripts that run on the Linux training host keep LF on every checkout (core.autocrlf is on here).
+*.sh text eol=lf

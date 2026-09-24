@@ -1,0 +1,500 @@
+{
+ "runs": 300,
+ "stages": {
+  "1|0": 300
+ },
+ "rooms": [
+  {
+   "variant": 4013,
+   "name": "Famine (copy)",
+   "shape": 1,
+   "count": 12
+  },
+  {
+   "variant": 1089,
+   "name": "Little Horn (copy)",
+   "shape": 1,
+   "count": 11
+  },
+  {
+   "variant": 1019,
+   "name": "Ragman",
+   "shape": 1,
+   "count": 10
+  },
+  {
+   "variant": 1096,
+   "name": "Little Horn (copy)",
+   "shape": 1,
+   "count": 9
+  },
+  {
+   "variant": 1095,
+   "name": "Little Horn (copy)",
+   "shape": 1,
+   "count": 9
+  },
+  {
+   "variant": 2016,
+   "name": "The Duke of Flies (copy)",
+   "shape": 1,
+   "count": 9
+  },
+  {
+   "variant": 2011,
+   "name": "The Duke of Flies",
+   "shape": 1,
+   "count": 9
+  },
+  {
+   "variant": 1088,
+   "name": "Little Horn",
+   "shape": 1,
+   "count": 9
+  },
+  {
+   "variant": 1035,
+   "name": "Ragman (copy)",
+   "shape": 1,
+   "count": 9
+  },
+  {
+   "variant": 2070,
+   "name": "Steven",
+   "shape": 1,
+   "count": 8
+  },
+  {
+   "variant": 1036,
+   "name": "Ragman (copy)",
+   "shape": 1,
+   "count": 8
+  },
+  {
+   "variant": 4011,
+   "name": "Famine (copy)",
+   "shape": 3,
+   "count": 7
+  },
+  {
+   "variant": 4014,
+   "name": "Famine (copy)",
+   "shape": 1,
+   "count": 6
+  },
+  {
+   "variant": 4010,
+   "name": "Famine",
+   "shape": 1,
+   "count": 6
+  },
+  {
+   "variant": 1046,
+   "name": "Larry Jr. (copy)",
+   "shape": 1,
+   "count": 6
+  },
+  {
+   "variant": 1119,
+   "name": "Dangle (copy)",
+   "shape": 1,
+   "count": 6
+  },
+  {
+   "variant": 1025,
+   "name": "Larry Jr. (copy)",
+   "shape": 1,
+   "count": 5
+  },
+  {
+   "variant": 1012,
+   "name": "Monstro",
+   "shape": 1,
+   "count": 5
+  },
+  {
+   "variant": 1117,
+   "name": "Dangle",
+   "shape": 1,
+   "count": 5
+  },
+  {
+   "variant": 2071,
+   "name": "Steven",
+   "shape": 1,
+   "count": 5
+  },
+  {
+   "variant": 1027,
+   "name": "Larry Jr. (copy)",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 1010,
+   "name": "Monstro",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 2052,
+   "name": "Gemini",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 1021,
+   "name": "Larry Jr.",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 1023,
+   "name": "Larry Jr.",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 2053,
+   "name": "Gemini",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 1011,
+   "name": "Monstro",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 4012,
+   "name": "Famine (copy)",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 1028,
+   "name": "Larry Jr. (copy)",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 2010,
+   "name": "The Duke of Flies",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 1029,
+   "name": "Ragman (copy)",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 1078,
+   "name": "Monstro (copy)",
+   "shape": 3,
+   "count": 4
+  },
+  {
+   "variant": 2014,
+   "name": "The Duke of Flies (copy)",
+   "shape": 1,
+   "count": 4
+  },
+  {
+   "variant": 2013,
+   "name": "The Duke of Flies",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 2051,
+   "name": "Gemini",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 2050,
+   "name": "Gemini",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 2072,
+   "name": "Steven",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 1037,
+   "name": "Monstro (copy)",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 1018,
+   "name": "Monstro (copy)",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 2018,
+   "name": "The Duke of Flies (copy)",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 4052,
+   "name": "Headless Horseman (copy)",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 2073,
+   "name": "Steven",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 2015,
+   "name": "The Duke of Flies (copy)",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 5149,
+   "name": "Turdling (copy)",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 1014,
+   "name": "Monstro",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 1039,
+   "name": "Monstro (copy)",
+   "shape": 1,
+   "count": 3
+  },
+  {
+   "variant": 1026,
+   "name": "Larry Jr. (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 5144,
+   "name": "Gurglings (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1024,
+   "name": "Larry Jr.",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1047,
+   "name": "Larry Jr. (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 5145,
+   "name": "Gurglings (copy)",
+   "shape": 2,
+   "count": 2
+  },
+  {
+   "variant": 1120,
+   "name": "Dangle (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1128,
+   "name": "Ragman (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 5023,
+   "name": "Dingle (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 5140,
+   "name": "Gurglings",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1022,
+   "name": "Larry Jr.",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 5141,
+   "name": "Gurglings (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 4050,
+   "name": "Headless Horseman",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 5026,
+   "name": "Dingle (copy)",
+   "shape": 2,
+   "count": 2
+  },
+  {
+   "variant": 2017,
+   "name": "The Duke of Flies (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1017,
+   "name": "Monstro (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1020,
+   "name": "Larry Jr.",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1016,
+   "name": "Monstro (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1048,
+   "name": "Larry Jr. (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1045,
+   "name": "Monstro (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 5024,
+   "name": "Dingle (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1013,
+   "name": "Monstro",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1038,
+   "name": "Monstro (copy)",
+   "shape": 1,
+   "count": 2
+  },
+  {
+   "variant": 1077,
+   "name": "Monstro (copy)",
+   "shape": 2,
+   "count": 2
+  },
+  {
+   "variant": 1124,
+   "name": "Larry Jr. (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 1129,
+   "name": "Ragman (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 5147,
+   "name": "Turdling (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 1118,
+   "name": "Dangle (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 5021,
+   "name": "Dingle (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 5020,
+   "name": "Dingle",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 5148,
+   "name": "Turdling (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 1121,
+   "name": "Dangle (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 1015,
+   "name": "Monstro (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 5143,
+   "name": "Gurglings (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 4051,
+   "name": "Headless Horseman (copy)",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 5146,
+   "name": "Turdling",
+   "shape": 1,
+   "count": 1
+  },
+  {
+   "variant": 2012,
+   "name": "The Duke of Flies",
+   "shape": 1,
+   "count": 1
+  }
+ ]
+}
