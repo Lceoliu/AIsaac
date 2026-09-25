@@ -240,6 +240,81 @@ class GpuInfraTest(unittest.TestCase):
                 self.assertEqual(c.starts[0],sample_start(48,cfg) if randomised else FULL_START)
             finally:env.close()
 
+    def test_training_on_a_rollout_copy_matches_the_rollout(self):
+        # copy_rollout must carry everything segment training reads (async_training trains on it).
+        import copy
+        env=GpuFrameVecEnv(3,seed=29,threads=2,chunks=1,history=8,capacity=128)
+        try:
+            m=model_for(env,8);m.segment_length=4;m.micro_batch_size=4;m.batch_size=12
+            _,cb=m._setup_learn(10**6,Callback())
+            for _ in range(2):self.assertTrue(m.collect_rollouts(env,cb,m.rollout_buffer,8))
+            b=m.rollout_buffer
+            snapshot=m.rollout_buffer_class(m.n_steps,m.observation_space,m.action_space,device=m.device,
+                gamma=m.gamma,gae_lambda=m.gae_lambda,n_envs=m.n_envs)
+            m.copy_rollout(b,snapshot)
+            start={k:v.clone() for k,v in m.policy.state_dict().items()}
+            optimizer=copy.deepcopy(m.policy.optimizer.state_dict())
+            results=[]
+            for buffer in (b,snapshot):
+                m.policy.load_state_dict(start);m.policy.optimizer.load_state_dict(optimizer)
+                torch.manual_seed(5)
+                m._train_segments(buffer)
+                results.append([p.detach().clone() for p in m.policy.parameters()])
+            for x,y in zip(*results):torch.testing.assert_close(x,y,rtol=1e-4,atol=1e-6)
+            self.assertTrue(any(not torch.equal(x,start[n]) for x,(n,_) in zip(results[0],m.policy.named_parameters())))
+        finally:env.close()
+
+    def test_proximal_objective_without_lag_is_ppo(self):
+        import copy
+        env=GpuFrameVecEnv(3,seed=31,threads=2,chunks=1,history=8,capacity=128)
+        try:
+            m=model_for(env,8);m.segment_length=4;m.micro_batch_size=4;m.batch_size=12
+            _,cb=m._setup_learn(10**6,Callback())
+            for _ in range(2):self.assertTrue(m.collect_rollouts(env,cb,m.rollout_buffer,8))
+            b=m.rollout_buffer
+            # The collecting weights reproduce the recorded log-probabilities.
+            torch.testing.assert_close(m.proximal_log_probs(b),b.log_probs,rtol=1e-4,atol=1e-5)
+            start={k:v.clone() for k,v in m.policy.state_dict().items()}
+            optimizer=copy.deepcopy(m.policy.optimizer.state_dict())
+            results=[]
+            for proximal in (None,b.log_probs.clone()):
+                m.policy.load_state_dict(start);m.policy.optimizer.load_state_dict(optimizer)
+                torch.manual_seed(5)
+                m._train_segments(b,proximal)
+                results.append([p.detach().clone() for p in m.policy.parameters()])
+            for x,y in zip(*results):torch.testing.assert_close(x,y,rtol=1e-5,atol=1e-7)
+            self.assertEqual(m.logger.name_to_value['train/lag_weight_truncated'],0.0)
+            self.assertAlmostEqual(m.logger.name_to_value['train/lag_kl'],0.0,places=6)
+        finally:env.close()
+
+    def test_async_learn_trains_while_the_actor_collects(self):
+        env=GpuFrameVecEnv(2,history=8,capacity=128,threads=2,chunks=2)
+        try:
+            m=model_for(env,4);m.segment_length=4;m.micro_batch_size=4;m.async_training=True
+            seen=[]
+            class Session:
+                def after_update(inner,model):
+                    same=all(torch.equal(a,p) for a,p in zip(model.actor.parameters(),model.policy.parameters()))
+                    seen.append((model.policy_version,model._collecting,same))
+            m.session=Session()
+            m.learn(total_timesteps=24)  # 3 rollouts of 2 envs x 4 steps, each one trained
+            self.assertEqual(m.num_timesteps,24)
+            self.assertEqual(m.policy_version,3)
+            # Each update is joined at a rollout boundary, after the actor (update k-1) collected.
+            self.assertEqual(seen,[(1,False,False),(2,False,False),(3,False,False)])
+            self.assertIs(m._gpu_sampler.policy,m.actor)
+            self.assertIsNone(m.actor.optimizer);self.assertTrue(m.policy.optimizer.state)
+            self.assertFalse(any(p.requires_grad for p in m.actor.parameters()))
+            self.assertEqual(m.logger.name_to_value.get('train/optimizer_steps'),2)
+            self.assertTrue(np.isfinite(m.logger.name_to_value['train/lag_kl']))
+            self.assertEqual(m.logger.name_to_value['train/lag_weight_truncated'],0.0)
+            with tempfile.TemporaryDirectory() as d:
+                m.save(Path(d)/'m.zip')
+                loaded=GpuMaskablePPO.load(Path(d)/'m.zip',env=env,device='cuda')
+                self.assertIsNone(loaded.actor);self.assertFalse(loaded.async_training)
+                for a,p in zip(loaded.policy.parameters(),m.policy.parameters()):self.assertTrue(torch.equal(a,p))
+        finally:env.close()
+
     def test_sb3_learn_two_bounded_updates(self):
         env=GpuFrameVecEnv(2,history=8,capacity=128,threads=2,chunks=2)
         try:

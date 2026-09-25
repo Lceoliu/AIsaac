@@ -21,6 +21,12 @@ Collection sampler (--sampler): graph (default) replays each chunk's per-step in
 graphs (isaac_bridge/graph_sampler.py, ~1.7 ms instead of ~10.8 ms per step for 16 environments)
 and logs its self-check against the eager path as sampler/graph_*; eager is FrameSampler.
 
+--async-train overlaps each PPO update with the next rollout (GpuMaskablePPO.async_training: an
+actor copy collects while the learner trains on the previous rollout; one update of policy lag,
+handled by the decoupled PPO objective, see isaac_bridge/gpu_ppo.py). The log adds
+async/collect_s, async/update_s, async/join_wait_s (time the collector waited for the update),
+train/lag_kl and train/lag_weight_truncated.
+
 Checkpoints hold weights, optimizer, counters and RNG. A resume starts fresh episodes (the
 in-progress rooms are not rebuilt). Periodic evaluation runs abplus_eval.py as a separate CPU
 process on a few extra instances, so the learner keeps the GPU to itself.
@@ -241,6 +247,8 @@ def main():
                    help='graph: per-step inference replayed as CUDA graphs (graph_sampler.py); eager: FrameSampler')
     p.add_argument('--graph-check-every', type=int, default=1024,
                    help='graph sampler steps between self-checks against the eager path (0 = never)')
+    p.add_argument('--async-train', action='store_true',
+                   help='train on the previous rollout while collecting the next (one update of policy lag)')
     p.add_argument('--recycle-episodes', type=int, default=200,
                    help='restart each AB+ process after this many episodes (the game leaks memory while it plays); 0 = never')
     p.add_argument('--reward-profile', choices=('combat-v2', 'combat-v1'), default='combat-v2',
@@ -280,6 +288,10 @@ def main():
               'tasks_spec': tasks,
               'observation_transport': 'json (bridge v1)' if args.json_obs else 'binary (bridge v2, abp-0.2.1)',
               'reward_profile': args.reward_profile, 'collection_sampler': args.sampler,
+              'update_schedule': ('asynchronous: each update trains while the next rollout is collected by the '
+                                  'weights it started from (one update of policy lag); decoupled PPO objective: '
+                                  'ratio clipped against the update start, samples weighted by '
+                                  'pi_start/pi_behaviour truncated at 2' if args.async_train else 'synchronous'),
               'reward': (describe_reward() if args.reward_profile == 'combat-v2'
                          else 'combat-v1: legacy hurt/hit/damage/clear, win +2 + speed bonus, timeout -1'),
               'schema': DEADLINE_SCHEMA, 'history': 64, 'entity_capacity': 256,
@@ -320,6 +332,7 @@ def main():
                                    net_arch=dict(pi=[256], vf=[256]), normalize_images=False),
                 device=args.device, seed=args.seed, verbose=1)
         model.micro_batch_size, model.segment_length = args.micro_batch, args.segment_length
+        model.async_training = args.async_train
         if args.sampler == 'graph':
             from functools import partial
             from isaac_bridge.graph_sampler import GraphFrameSampler

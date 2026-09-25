@@ -14,7 +14,9 @@ Per chunk two graphs are captured once, at the start of a rollout when nothing e
   act     the chunk's causal windows from the buffer at a position held in a device tensor, the
           temporal Transformer, heads, the same action masks as FrameSampler.action, Gumbel-max
           sampling of each action component (the categorical distribution) and its log-probability.
-The graphs read the parameters in place, so optimizer steps need no re-capture. Everything else
+The graphs read the sampling policy's parameters in place (the learner's, or the actor copy with
+asynchronous training), so weight updates need no re-capture; a different policy object is
+re-captured at the next rollout start. Everything else
 (episode resets of single environments, value estimates, deterministic actions, prefix
 re-encoding) stays on the eager FrameSampler path.
 
@@ -39,6 +41,7 @@ class GraphFrameSampler(FrameSampler):
         self.nvec = [int(n) for n in self.env.action_space.nvec]
         self.device = model.device
         self.graphs = None                      # per chunk: dict(encode=..., act=...)
+        self.captured = None                    # the policy the graphs read
         self.chunk_of = {id(ids): i for i, ids in enumerate(self.workers)}
         self.graph_steps = 0
         self.diffs = {'features': 0.0, 'log_prob': 0.0, 'value': 0.0, 'checks': 0}
@@ -46,9 +49,10 @@ class GraphFrameSampler(FrameSampler):
     # ---- capture --------------------------------------------------------------------------------
     def begin(self):
         super().begin()
-        if self.graphs is None:
+        if self.graphs is None or self.captured is not self.policy:
             torch.cuda.synchronize(self.device)
             self.graphs = [self._capture_chunk(i) for i in range(len(self.workers))]
+            self.captured = self.policy
             torch.cuda.synchronize(self.device)
 
     def _graph(self, fn):
@@ -76,7 +80,7 @@ class GraphFrameSampler(FrameSampler):
 
     def _act(self, position, ids):
         """FrameSampler.action with the position as a device tensor and Gumbel-max sampling."""
-        b, policy = self.buffer, self.model.policy
+        b, policy = self.buffer, self.policy
         length = b.lengths[position, ids]
         j = torch.arange(b.history, device=self.device)[None, :]
         valid = j < length[:, None]
@@ -126,7 +130,7 @@ class GraphFrameSampler(FrameSampler):
         graph.replay()
         actions, values, log_prob, masks = out
         if self.check_every and self.graph_steps % self.check_every == 0:
-            policy = self.model.policy
+            policy = self.policy
             pi, vf = policy.mlp_extractor(self.latent(position, ids))
             dist = policy._get_action_dist_from_latent(pi)
             dist.apply_masking(masks)

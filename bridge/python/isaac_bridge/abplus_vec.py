@@ -40,7 +40,8 @@ class AbplusChunk:
         self.owner, self.start, self.stop, self.n = owner, start, stop, stop - start
         self.conns = owner.conns[start:stop]
         self.copy_stream = torch.cuda.Stream(device=owner.device)
-        self.compute_stream = torch.cuda.Stream(device=owner.device)
+        # High priority: with asynchronous training the learner's kernels share the GPU.
+        self.compute_stream = torch.cuda.Stream(device=owner.device, priority=-1)
         self.ready = torch.cuda.Event()
         self.slots = [TransferSlot(self.n, owner.device) for _ in range(2)]
         self.episodes = np.zeros(self.n, np.int64)
