@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AB+ 回放</title>
+<style>
+:root{--bg:#15171a;--panel:#1d2024;--panel2:#262a30;--line:#33383f;--text:#e7e3da;--muted:#9aa1a9;--accent:#f0a04b;
+--win:#58c27a;--death:#e5534b;--tl:#d9a83a}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 "Microsoft YaHei","PingFang SC","Noto Sans SC",system-ui,sans-serif}
+header{padding:12px 20px 10px;border-bottom:1px solid var(--line)}
+header h1{margin:0;font-size:18px;font-weight:600}
+header p{margin:3px 0 0;color:var(--muted);font-size:13px}
+.layout{display:grid;grid-template-columns:310px minmax(0,1fr)}
+aside{border-right:1px solid var(--line);overflow-y:auto;height:calc(100vh - 62px);padding:4px 0 20px}
+aside h2{font-size:12px;font-weight:600;color:var(--muted);margin:14px 16px 4px}
+.row{padding:6px 16px 7px;border-left:3px solid transparent;cursor:pointer}
+.row:hover{background:var(--panel)}
+.row.active{background:var(--panel2);border-left-color:var(--accent)}
+.row .a{display:flex;gap:8px;align-items:baseline}
+.row .seed{font-variant-numeric:tabular-nums;font-weight:600;flex:none}
+.row .sub{color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.badges{display:flex;gap:4px;flex-wrap:wrap;margin-top:3px}
+.badge{font:12px/18px inherit;padding:0 6px;border-radius:3px;border:1px solid transparent;background:none;color:inherit;cursor:pointer}
+.badge.win{border-color:var(--win);color:var(--win)}.badge.death{border-color:var(--death);color:var(--death)}
+.badge.time_limit{border-color:var(--tl);color:var(--tl)}
+.badge.on.win{background:var(--win);color:#10230f}.badge.on.death{background:var(--death);color:#2a0d0b}
+.badge.on.time_limit{background:var(--tl);color:#2a1f05}
+main{padding:12px 20px 30px;min-width:0;max-width:1000px}
+.head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.head .title{font-size:16px;font-weight:600}
+.head .desc{color:var(--muted);font-size:13px}
+.hud{display:flex;gap:18px;flex-wrap:wrap;margin:10px 0 8px;font-variant-numeric:tabular-nums}
+.hud div{white-space:nowrap}.hud b{font-weight:600}.hud .k{color:var(--muted);margin-right:4px}
+.hearts span{font-size:15px;letter-spacing:1px}
+canvas{display:block;width:100%}
+#room{border-radius:4px;background:#241f1b}
+#timeline{margin-top:8px;cursor:pointer;border-radius:4px;background:var(--panel)}
+.controls{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px}
+.controls button{font:inherit;min-width:36px;height:30px;padding:0 10px;border-radius:4px;border:1px solid var(--line);background:var(--panel2);color:var(--text);cursor:pointer}
+.controls button:hover{border-color:#4a515a}.controls button.on{background:var(--accent);border-color:var(--accent);color:#2b1a05}
+.controls .gap{width:10px}
+.controls label{color:var(--muted);display:flex;gap:4px;align-items:center;margin-left:4px;user-select:none}
+#seek{flex:1 1 200px;accent-color:var(--accent)}
+.keys{color:var(--muted);font-size:12px;margin-top:4px}
+.cols{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:16px;margin-top:14px}
+section{background:var(--panel);border-radius:4px;padding:10px 14px}
+section h3{margin:0 0 6px;font-size:13px;font-weight:600;color:var(--muted)}
+.note{border-left:3px solid var(--accent);padding:4px 10px;margin:0 0 8px;background:var(--panel2)}
+table{border-collapse:collapse;width:100%}td{padding:2px 0;vertical-align:top}td:first-child{color:var(--muted);width:44%}
+.legend div{display:flex;align-items:center;gap:8px;margin:3px 0}
+.sw{width:14px;height:14px;border-radius:50%;flex:none}
+.sq{width:14px;height:14px;border-radius:2px;flex:none}
+@media (max-width:820px){.layout{grid-template-columns:1fr}aside{height:auto;max-height:38vh;border-right:0;border-bottom:1px solid var(--line)}.cols{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header><h1 id="title"></h1><p id="subtitle"></p></header>
+<div class="layout">
+<aside id="list"></aside>
+<main>
+  <div class="head"><div><div class="title" id="epTitle"></div><div class="desc" id="epDesc"></div></div><div class="badges" id="switch"></div></div>
+  <div class="hud" id="hud"></div>
+  <canvas id="room"></canvas>
+  <div class="controls">
+    <button id="bStart" title="回到开头 (Home)">⏮</button>
+    <button id="bBack" title="后退 1 秒 (Shift+←)">−1s</button>
+    <button id="bPlay" title="播放 / 暂停 (空格)" style="min-width:64px">播放</button>
+    <button id="bFwd" title="前进 1 秒 (Shift+→)">+1s</button>
+    <button id="bEnd" title="跳到结尾 (End)">⏭</button>
+    <span class="gap"></span>
+    <span id="speeds"></span>
+    <input id="seek" type="range" min="0" value="0">
+    <label><input type="checkbox" id="optTrail" checked>轨迹</label>
+    <label><input type="checkbox" id="optCells" checked>走过的格子</label>
+    <label><input type="checkbox" id="optNames" checked>名字</label>
+  </div>
+  <div class="keys">空格 播放/暂停 · ←/→ 单步 · Shift+←/→ 1 秒 · [ ] 调速 · 点击下方时间轴跳转</div>
+  <canvas id="timeline"></canvas>
+  <div class="cols">
+    <section id="stats"></section>
+    <section class="legend" id="legend"></section>
+  </div>
+</main>
+</div>
+<!--DATA-->
+<script>
+const EPISODES=/*EPISODES*/, NAMES=/*NAMES*/, VARIANTS=/*VARIANTS*/, TITLE=/*TITLE*/;
+const TASK={normal:'普通房',boss:'Boss 房',arena:'竞技场（Monstro）'}, OUT={time_limit:'超时',win:'通关',death:'死亡'};
+const MOVE=[[0,0],[0,-1],[1,-1],[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1]], SHOT=[[0,0],[0,-1],[1,0],[0,1],[-1,0]];
+const ARROW=['—','↑','↗','→','↘','↓','↙','←','↖'], SHOT_ARROW=['—','↑','→','↓','←'];
+const SPEEDS=[0.5,1,2,4,8], STEP_S=2/30;
+const C={floor:'#6a5543',floorLine:'#5e4b3b',wall:'#2a2420',rock:'#9c968d',rockEdge:'#6d6962',block:'#56606a',poop:'#87562b',
+  pit:'#0e0c0b',spike:'#b9b3aa',door:'#b88d4a',enemy:'#e0564b',enemyInv:'#8c929b',boss:'#b784e3',npc:'#d6993a',
+  tear:'#8fd6ff',proj:'#ff5c50',bomb:'#2b2b2b',pickup:'#f2d14b',creep:'rgba(120,200,90,.35)',player:'#f5dcc0',
+  playerEdge:'#3a2a1e',move:'#ffffff',shot:'#5fd3f3',trail:'255,214,150',visited:'rgba(255,230,160,.13)'};
+const $=id=>document.getElementById(id);
+const room=$('room'), rctx=room.getContext('2d'), tl=$('timeline'), tctx=tl.getContext('2d');
+const cache=[]; let cur=-1, D=null, E=null, step=0, playing=false, speed=2, acc=0, lastT=0;
+let S=1.6, X0=20, Y0=100, W=960, H=576, gridCanvas=null, gridKey=null, tlBase=null, visitedUpTo=null;
+
+$('title').textContent=TITLE[0]; $('subtitle').textContent=TITLE[1];
+function data(i){if(!cache[i])cache[i]=JSON.parse($('ep-'+i).textContent);return cache[i]}
+function short(seed){return '…'+String(seed).slice(-3)}
+
+// ---- episode list: one row per seed, one badge per run ----
+const LABELS=[...new Set(EPISODES.map(e=>e.label))], bySeed=new Map();
+EPISODES.forEach((e,i)=>{if(!bySeed.has(e.seed))bySeed.set(e.seed,{});bySeed.get(e.seed)[e.label]=i});
+const groups=new Map();
+for(const [seed,m] of bySeed){const base=EPISODES[m[LABELS[0]]??Object.values(m)[0]];const key=base.task+'|'+base.outcome;
+  if(!groups.has(key))groups.set(key,[]);groups.get(key).push(seed)}
+const rank=k=>({time_limit:0,death:1,win:2}[k.split('|')[1]]??3)*10+({normal:0,boss:1,arena:2}[k.split('|')[0]]??3);
+function renderList(){
+  const list=$('list');list.innerHTML='';
+  for(const key of [...groups.keys()].sort((a,b)=>rank(a)-rank(b))){
+    const [task,out]=key.split('|'),seeds=groups.get(key);
+    const h=document.createElement('h2');h.textContent=`${TASK[task]||task} · ${LABELS[0]} ${OUT[out]||out}（${seeds.length}）`;list.append(h);
+    for(const seed of seeds){
+      const m=bySeed.get(seed),base=EPISODES[m[LABELS[0]]??Object.values(m)[0]];
+      const row=document.createElement('div');row.className='row';row.dataset.seed=seed;
+      row.innerHTML=`<div class="a"><span class="seed">${short(seed)}</span><span class="sub">房间 ${base.layout} · ${base.enemies.slice(0,3).join('，')}</span></div>`;
+      const badges=document.createElement('div');badges.className='badges';
+      for(const label of LABELS){if(m[label]===undefined)continue;const e=EPISODES[m[label]];
+        const b=document.createElement('button');b.className='badge '+e.outcome;b.dataset.i=m[label];
+        b.textContent=`${label} ${OUT[e.outcome]||e.outcome}`;b.onclick=ev=>{ev.stopPropagation();open(+b.dataset.i)};badges.append(b)}
+      row.append(badges);row.onclick=()=>open(m[LABELS[0]]??Object.values(m)[0]);list.append(row)}}
+}
+
+// ---- geometry ----
+function setup(){
+  const [gw,gh]=E.shape;W=960;S=W/(40*gw);H=Math.round(40*gh*S);X0=E.cell0[0]-20;Y0=E.cell0[1]-20;
+  const dpr=window.devicePixelRatio||1;
+  room.width=W*dpr;room.height=H*dpr;room.style.aspectRatio=`${W}/${H}`;rctx.setTransform(dpr,0,0,dpr,0,0);
+  tl.width=W*dpr;tl.height=120*dpr;tl.style.aspectRatio=`${W}/120`;tctx.setTransform(dpr,0,0,dpr,0,0);
+  gridKey=null;tlBase=null;
+}
+const sx=x=>(x-X0)*S, sy=y=>(y-Y0)*S;
+function gridAt(k){let g=D.grids[0][1];for(const [i,s] of D.grids){if(i<=k)g=s;else break}return g}
+function drawGrid(g){
+  if(g===gridKey)return gridCanvas;
+  const [gw,gh]=E.shape,dpr=window.devicePixelRatio||1,c=document.createElement('canvas');c.width=W*dpr;c.height=H*dpr;
+  const x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);const cs=40*S;
+  for(let i=0;i<gw*gh;i++){
+    const ch=g[i],px=(i%gw)*cs,py=Math.floor(i/gw)*cs;
+    x.fillStyle=ch==='W'?C.wall:ch==='O'?C.pit:C.floor;x.fillRect(px,py,cs+.5,cs+.5);
+    if(ch!=='W'&&ch!=='O'){x.strokeStyle=C.floorLine;x.lineWidth=1;x.strokeRect(px+.5,py+.5,cs-1,cs-1)}
+    const m=cs*.12,r=cs*.18;
+    if(ch==='R'||ch==='T'||ch==='M'||ch==='L'){x.fillStyle=ch==='L'?'#7d7466':C.rock;x.strokeStyle=C.rockEdge;x.lineWidth=2;
+      x.beginPath();x.roundRect(px+m,py+m,cs-2*m,cs-2*m,r);x.fill();x.stroke();
+      if(ch==='T'){x.strokeStyle='#7fb8e0';x.lineWidth=3;x.beginPath();x.moveTo(px+cs*.35,py+cs*.35);x.lineTo(px+cs*.65,py+cs*.65);x.moveTo(px+cs*.65,py+cs*.35);x.lineTo(px+cs*.35,py+cs*.65);x.stroke()}}
+    else if(ch==='B'){x.fillStyle=C.block;x.fillRect(px+m*.5,py+m*.5,cs-m,cs-m);x.strokeStyle='#39414a';x.lineWidth=2;x.strokeRect(px+m*.5,py+m*.5,cs-m,cs-m)}
+    else if(ch==='P'){x.fillStyle=C.poop;x.beginPath();x.ellipse(px+cs/2,py+cs*.62,cs*.36,cs*.24,0,0,7);x.fill();
+      x.beginPath();x.ellipse(px+cs/2,py+cs*.42,cs*.24,cs*.18,0,0,7);x.fill();x.beginPath();x.ellipse(px+cs/2,py+cs*.27,cs*.12,cs*.1,0,0,7);x.fill()}
+    else if(ch==='p'||ch==='r'){x.fillStyle=ch==='p'?'rgba(135,86,43,.45)':'rgba(156,150,141,.45)';for(const [a,b] of [[.3,.6],[.55,.45],[.7,.68]]){x.beginPath();x.arc(px+cs*a,py+cs*b,cs*.07,0,7);x.fill()}}
+    else if(ch==='S'){x.fillStyle=C.spike;for(const [a,b] of [[.25,.3],[.65,.3],[.45,.68]]){x.beginPath();x.moveTo(px+cs*a,py+cs*(b+.14));x.lineTo(px+cs*(a+.08),py+cs*(b-.1));x.lineTo(px+cs*(a+.16),py+cs*(b+.14));x.fill()}}
+    else if(ch==='X'){x.fillStyle='#b8392f';x.fillRect(px+m,py+m,cs-2*m,cs-2*m)}
+    else if(ch==='w'){x.strokeStyle='rgba(235,235,235,.5)';x.lineWidth=1;x.beginPath();x.moveTo(px,py);x.lineTo(px+cs,py+cs);x.moveTo(px+cs,py);x.lineTo(px,py+cs);x.stroke()}
+    else if(ch==='D'){x.fillStyle=C.door;x.fillRect(px+cs*.15,py+cs*.15,cs*.7,cs*.7)}
+  }
+  gridCanvas=c;gridKey=g;return c;
+}
+function circle(x,y,r,fill,stroke,lw=1.5){rctx.beginPath();rctx.arc(x,y,Math.max(1.5,r),0,7);if(fill){rctx.fillStyle=fill;rctx.fill()}if(stroke){rctx.strokeStyle=stroke;rctx.lineWidth=lw;rctx.stroke()}}
+function arrow(x,y,dx,dy,len,color,width){const n=Math.hypot(dx,dy);if(!n)return;dx/=n;dy/=n;const ex=x+dx*len,ey=y+dy*len;
+  rctx.strokeStyle=rctx.fillStyle=color;rctx.lineWidth=width;rctx.beginPath();rctx.moveTo(x,y);rctx.lineTo(ex,ey);rctx.stroke();
+  rctx.beginPath();rctx.moveTo(ex+dx*7,ey+dy*7);rctx.lineTo(ex-dy*5,ey+dx*5);rctx.lineTo(ex+dy*5,ey-dx*5);rctx.fill()}
+function label(text,x,y,color){rctx.font='12px "Microsoft YaHei",sans-serif';rctx.textAlign='center';rctx.lineWidth=3;rctx.strokeStyle='rgba(0,0,0,.75)';rctx.strokeText(text,x,y);rctx.fillStyle=color;rctx.fillText(text,x,y)}
+
+function drawRoom(){
+  const f=D.frames[step];rctx.clearRect(0,0,W,H);rctx.drawImage(drawGrid(gridAt(step)),0,0,W,H);
+  for(const [x,y,locked] of E.doors){rctx.fillStyle=locked?'#6d4e25':C.door;rctx.fillRect(sx(x)-14*S,sy(y)-14*S,28*S,28*S)}
+  if($('optCells').checked){ // cells visited up to now
+    const cs=40*S;rctx.fillStyle=C.visited;for(const k of visited(step)){const [c,r]=k.split(',').map(Number);rctx.fillRect(sx(E.cell0[0]+40*c-20),sy(E.cell0[1]+40*r-20),cs,cs)}}
+  const ents=f[10];
+  for(const e of ents)if(e[0]===7)circle(sx(e[1]),sy(e[2]),e[3]*S,C.creep);
+  for(const e of ents){ // ground shadows of airborne shots
+    if(e[0]===2||e[0]===3){rctx.fillStyle='rgba(0,0,0,.35)';rctx.beginPath();rctx.ellipse(sx(e[1]),sy(e[2]),e[3]*S*.8,e[3]*S*.4,0,0,7);rctx.fill()}}
+  for(const e of ents){const x=sx(e[1]),y=sy(e[2]);
+    if(e[0]===4){circle(x,y,e[3]*S,C.bomb,'#111');circle(x+e[3]*S*.5,y-e[3]*S*.7,3,'#ffb347')}
+    else if(e[0]===5){rctx.fillStyle=C.pickup;rctx.beginPath();rctx.moveTo(x,y-7);rctx.lineTo(x+6,y);rctx.lineTo(x,y+7);rctx.lineTo(x-6,y);rctx.fill()}
+    else if(e[0]===6){rctx.strokeStyle='rgba(255,90,80,.8)';rctx.lineWidth=Math.max(2,e[5]*S*.5);rctx.beginPath();rctx.moveTo(x,y);rctx.lineTo(sx(e[3]),sy(e[4]));rctx.stroke()}}
+  for(const e of ents)if(e[0]===1){const x=sx(e[1]),y=sy(e[2]),fl=e[6],enemy=fl&1,vul=fl&2,boss=fl&4;
+    const col=boss?C.boss:enemy?(vul?C.enemy:C.enemyInv):C.npc;circle(x,y,e[3]*S,col+'cc',col,2);
+    if(boss){const w=46*S*.8,hp=Math.max(0,Math.min(1,e[7]||0));rctx.fillStyle='#000a';rctx.fillRect(x-w/2,y-e[3]*S-16,w,5);rctx.fillStyle=C.boss;rctx.fillRect(x-w/2,y-e[3]*S-16,w*hp,5)}
+    if($('optNames').checked){const nm=(VARIANTS[e[4]+'.'+e[5]]||NAMES[e[4]]||('type '+e[4]))+(enemy&&!vul?'（无敌）':'')+(boss&&e[8]?' · '+e[8]:'');label(nm,x,y-e[3]*S-(boss?20:6),'#fff')}}
+  for(const e of ents){if(e[0]!==2&&e[0]!==3)continue;const x=sx(e[1]),y=sy(e[2]+(e[4]||0));circle(x,y,e[3]*S*.9,e[0]===2?C.tear:C.proj,'rgba(0,0,0,.4)',1)}
+  // player: trail, body, input
+  if($('optTrail').checked){const from=Math.max(0,step-120);for(let k=from+1;k<=step;k++){const a=D.frames[k-1],b=D.frames[k];
+    rctx.strokeStyle=`rgba(${C.trail},${(0.08+0.6*(k-from)/(step-from+1)).toFixed(3)})`;rctx.lineWidth=3;rctx.beginPath();rctx.moveTo(sx(a[0]),sy(a[1]));rctx.lineTo(sx(b[0]),sy(b[1]));rctx.stroke()}}
+  const px=sx(f[0]),py=sy(f[1]);circle(px,py,10*S,C.player,C.playerEdge,2);
+  arrow(px,py,MOVE[f[4]][0],MOVE[f[4]][1],26*S*.9,C.move,3);
+  arrow(px,py,SHOT[f[5]][0],SHOT[f[5]][1],38*S*.9,C.shot,3);
+}
+function visited(k){ // cells the player occupied at steps 0..k
+  if(!visitedUpTo||visitedUpTo.k>k){visitedUpTo={k:-1,set:new Set()}}
+  for(let i=visitedUpTo.k+1;i<=k;i++){const f=D.frames[i];visitedUpTo.set.add(Math.round((f[0]-E.cell0[0])/40)+','+Math.round((f[1]-E.cell0[1])/40))}
+  visitedUpTo.k=k;return visitedUpTo.set;
+}
+
+// ---- timeline: blocking HP, hearts, hits, hurts ----
+function buildTimeline(){
+  const c=document.createElement('canvas'),dpr=window.devicePixelRatio||1;c.width=W*dpr;c.height=120*dpr;const x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);
+  const n=D.frames.length-1||1,L=10,R=W-10,T=28,B=96,X=k=>L+(R-L)*k/n;
+  const maxB=Math.max(1,...D.frames.map(f=>f[7])),maxH=Math.max(E.max_hearts||6,...D.frames.map(f=>f[2]));
+  const pf=E.stats.parked_from_s/STEP_S;
+  if((n-pf)*STEP_S>=10){x.fillStyle='rgba(217,168,58,.12)';x.fillRect(X(pf),T,R-X(pf),B-T);x.fillStyle='#d9a83a';x.font='12px sans-serif';x.fillText(`从 ${E.stats.parked_from_s} 秒起停在原地`,X(pf)+6,T+12)}
+  x.strokeStyle='#3a4048';x.lineWidth=1;x.font='11px sans-serif';x.fillStyle='#8a929b';x.textAlign='center';
+  const secs=n*STEP_S;for(let s=0;s<=secs+1e-6;s+=10){x.beginPath();x.moveTo(X(s/STEP_S),B);x.lineTo(X(s/STEP_S),B+4);x.stroke();x.fillText(s+'s',X(s/STEP_S),B+15)}
+  const line=(fn,color)=>{x.strokeStyle=color;x.lineWidth=2;x.beginPath();D.frames.forEach((f,k)=>{const y=B-(B-T)*fn(f);k?x.lineTo(X(k),y):x.moveTo(X(k),y)});x.stroke()};
+  line(f=>f[7]/maxB,'#f0a04b');line(f=>f[2]/maxH,'#ff6b6b');
+  for(let k=1;k<=n;k++){const a=D.frames[k-1],b=D.frames[k];
+    if(b[8]>a[8]){x.fillStyle='#58c27a';x.fillRect(X(k)-.5,T-10,1.5,7)}
+    if(b[9]>a[9]){x.fillStyle='#ff6b6b';x.fillRect(X(k)-1,B-8,2.5,10)}}
+  x.textAlign='left';x.font='12px "Microsoft YaHei",sans-serif';let lx=L;
+  for(const [kind,color,text] of [['line','#f0a04b','阻挡血量（挡门敌人剩余血量）'],['line','#ff6b6b','心'],['tick','#58c27a','命中敌人'],['tick','#ff6b6b','受伤']]){
+    x.fillStyle=color;if(kind==='line')x.fillRect(lx,7,14,2.5);else x.fillRect(lx+5,2,2.5,10);
+    x.fillStyle='#b9bec5';x.fillText(text,lx+19,12);lx+=24+x.measureText(text).width}
+  tlBase={canvas:c,X,n,L,R};
+}
+function drawTimeline(){if(!tlBase)buildTimeline();tctx.clearRect(0,0,W,120);tctx.drawImage(tlBase.canvas,0,0,W,120);
+  const x=tlBase.X(step);tctx.strokeStyle='#fff';tctx.lineWidth=2;tctx.beginPath();tctx.moveTo(x,4);tctx.lineTo(x,100);tctx.stroke()}
+function seekFromEvent(ev){const r=tl.getBoundingClientRect(),x=(ev.clientX-r.left)*W/r.width;setStep(Math.round((x-tlBase.L)/(tlBase.R-tlBase.L)*tlBase.n))}
+tl.onmousedown=ev=>{seekFromEvent(ev);const mv=e=>seekFromEvent(e),up=()=>{removeEventListener('mousemove',mv);removeEventListener('mouseup',up)};addEventListener('mousemove',mv);addEventListener('mouseup',up)};
+
+// ---- HUD, stats, legend ----
+function hearts(h,max,soul){let s='';for(let i=0;i<Math.ceil(max/2);i++){const v=h-2*i;s+=v>=2?'<span style="color:#ff5d5d">♥</span>':v===1?'<span style="color:#ff5d5d;opacity:.5">♥</span>':'<span style="color:#666">♡</span>'}
+  for(let i=0;i<Math.ceil(soul/2);i++)s+='<span style="color:#6fa8ff">♥</span>';return s}
+function drawHud(){const f=D.frames[step],enemies=f[10].filter(e=>e[0]===1&&(e[6]&1)).length;
+  $('hud').innerHTML=`<div><span class="k">时间</span><b>${(step*STEP_S).toFixed(1)}</b> / ${(D.frames.length-1)*STEP_S|0} 秒</div>
+  <div class="hearts"><span class="k">心</span>${hearts(f[2],E.max_hearts,f[3])}</div>
+  <div><span class="k">阻挡血量</span><b>${+f[7].toFixed(1)}</b></div><div><span class="k">敌人</span><b>${enemies}</b></div>
+  <div><span class="k">命中</span><b>${f[8]}</b></div><div><span class="k">受伤</span><b>${f[9]}</b></div>
+  <div><span class="k">输入</span>移动 <b>${ARROW[f[4]]}</b> · 射击 <b style="color:${C.shot}">${SHOT_ARROW[f[5]]}</b>${f[6]?' · 炸弹':''}</div>`;
+  $('seek').value=step;$('bPlay').textContent=playing?'暂停':'播放'}
+function pct(v){return Math.round(v*100)+'%'}
+function renderStats(){const s=E.stats,c=E.components||{};
+  const comp=Object.entries(c).filter(([k,v])=>Math.abs(v)>1e-9).map(([k,v])=>`${k} ${v>0?'+':''}${v.toFixed(2)}`).join('，');
+  $('stats').innerHTML=`<h3>这一局</h3>${E.note?`<p class="note">${E.note}</p>`:''}<table>
+  <tr><td>结局</td><td>${OUT[E.outcome]||E.outcome}，${E.seconds} 秒</td></tr>
+  <tr><td>开局敌人</td><td>${E.enemies.join('，')||'—'}</td></tr>
+  <tr><td>阻挡血量</td><td>${+s.blocking[0].toFixed(1)} → ${+s.blocking[1].toFixed(1)}</td></tr>
+  <tr><td>命中敌人 / 受伤</td><td>${s.hits} 次 / ${s.hurt} 次</td></tr>
+  <tr><td>最后一次命中</td><td>${s.hits?s.last_hit_s+' 秒':'从未命中'}</td></tr>
+  <tr><td>走过的格子</td><td>${s.cells} 个（房间内部 ${(E.shape[0]-2)*(E.shape[1]-2)} 个）</td></tr>
+  <tr><td>停在原地</td><td>${(E.seconds-s.parked_from_s)>=10?`从 ${s.parked_from_s} 秒起（最后位置 1 格内）`:'—'}</td></tr>
+  <tr><td>有移动输入 / 有射击输入</td><td>${pct(s.move)} / ${pct(s.shoot)} 的步数</td></tr>
+  <tr><td>离最近敌人（中位数）</td><td>${s.dist_median??'—'} 像素（1 格 = 40）</td></tr>
+  <tr><td>开局炸弹</td><td>${E.start_bombs??'—'}</td></tr>
+  <tr><td>奖励 ${E.reward_name||'combat-v2'}</td><td>${E.reward!=null?E.reward.toFixed(2):'—'}${comp?`（${comp}）`:''}</td></tr>
+  <tr><td>策略</td><td>第 ${E.updates} 轮，${E.deterministic?'每步取概率最大的动作':'按概率采样（种子 '+E.sample_seed+'）'}</td></tr></table>`}
+$('legend').innerHTML=`<h3>图例</h3>
+<div><span class="sw" style="background:${C.player};border:2px solid ${C.playerEdge}"></span>玩家；白箭头 = 移动输入，蓝箭头 = 射击方向</div>
+<div><span class="sw" style="background:${C.enemy}"></span>敌人（可被打伤）；灰色 = 当前无敌</div>
+<div><span class="sw" style="background:${C.boss}"></span>Boss，上方是血条和动画名</div>
+<div><span class="sw" style="background:${C.tear}"></span>玩家的眼泪；<span class="sw" style="background:${C.proj}"></span>敌人的弹幕（带地面影子）</div>
+<div><span class="sq" style="background:${C.rock}"></span>石头 <span class="sq" style="background:${C.poop}"></span>便便 <span class="sq" style="background:${C.block}"></span>铁块 <span class="sq" style="background:${C.pit}"></span>坑</div>
+<div><span class="sq" style="background:rgba(255,230,160,.35)"></span>玩家到目前为止走过的格子；黄线 = 最近 8 秒的轨迹</div>
+<div style="color:var(--muted)">画的是原引擎逐步记录的状态（每步 = 2 个逻辑帧 = 1/15 秒），不重新模拟。</div>`;
+
+// ---- playback ----
+function setStep(k){step=Math.max(0,Math.min(D.frames.length-1,k|0));render()}
+function render(){drawRoom();drawTimeline();drawHud()}
+function open(i){if(i===cur)return;cur=i;E=EPISODES[i];D=data(i);step=0;acc=0;visitedUpTo=null;setup();
+  const m=bySeed.get(E.seed);$('epTitle').textContent=`种子 ${E.seed} · ${TASK[E.task]||E.task} · 房间 ${E.layout}${E.room?'（'+E.room+'）':''}`;
+  $('epDesc').textContent=`${E.label}：${E.deterministic?'每步取概率最大的动作（定期评估的做法）':'按概率采样动作（训练时的做法）'} · ${OUT[E.outcome]||E.outcome}`;
+  const sw=$('switch');sw.innerHTML='';for(const label of LABELS){if(m[label]===undefined)continue;const e=EPISODES[m[label]];
+    const b=document.createElement('button');b.className='badge '+e.outcome+(m[label]===i?' on':'');b.textContent=`${label} ${OUT[e.outcome]||e.outcome}`;b.onclick=()=>open(m[label]);sw.append(b)}
+  document.querySelectorAll('.row').forEach(r=>r.classList.toggle('active',+r.dataset.seed===E.seed));
+  $('seek').max=D.frames.length-1;renderStats();render();history.replaceState(null,'','#'+encodeURIComponent(E.id))}
+function tick(t){const dt=Math.min(.25,(t-lastT)/1000);lastT=t;
+  if(playing&&D){acc+=dt*15*speed;const n=Math.floor(acc);if(n>0){acc-=n;setStep(step+n);if(step>=D.frames.length-1){playing=false;drawHud()}}}
+  requestAnimationFrame(tick)}
+function toggle(){if(!D)return;if(step>=D.frames.length-1)step=0;playing=!playing;acc=0;drawHud()}
+function setSpeed(v){speed=v;document.querySelectorAll('#speeds button').forEach(b=>b.classList.toggle('on',+b.dataset.v===v))}
+for(const v of SPEEDS){const b=document.createElement('button');b.textContent=v+'×';b.dataset.v=v;b.onclick=()=>setSpeed(v);$('speeds').append(b)}
+$('bPlay').onclick=toggle;$('bStart').onclick=()=>setStep(0);$('bEnd').onclick=()=>setStep(1e9);
+$('bBack').onclick=()=>setStep(step-15);$('bFwd').onclick=()=>setStep(step+15);$('seek').oninput=()=>setStep(+$('seek').value);
+for(const id of ['optTrail','optCells','optNames'])$(id).onchange=render;
+addEventListener('keydown',ev=>{if(ev.target.tagName==='INPUT'&&ev.target.type==='range'&&ev.key.startsWith('Arrow'))ev.preventDefault();
+  if(ev.key===' '){ev.preventDefault();toggle()}else if(ev.key==='ArrowRight')setStep(step+(ev.shiftKey?15:1));else if(ev.key==='ArrowLeft')setStep(step-(ev.shiftKey?15:1));
+  else if(ev.key==='Home')setStep(0);else if(ev.key==='End')setStep(1e9);
+  else if(ev.key===']'||ev.key==='['){const i=SPEEDS.indexOf(speed)+(ev.key===']'?1:-1);setSpeed(SPEEDS[Math.max(0,Math.min(SPEEDS.length-1,i))])}});
+addEventListener('resize',()=>{if(D){setup();render()}});
+renderList();setSpeed(2);
+const want=decodeURIComponent(location.hash.slice(1)),start=EPISODES.findIndex(e=>e.id===want);
+open(start>=0?start:(()=>{const first=document.querySelector('.row');return first?(bySeed.get(+first.dataset.seed)[LABELS[0]]??0):0})());
+requestAnimationFrame(t=>{lastT=t;tick(t)});
+</script>
+</body>
+</html>

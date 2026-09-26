@@ -16,6 +16,15 @@ by pi_proximal/pi_behaviour, truncated at lag_weight_max, for the one-update lag
 the collection log-probabilities instead anchors the trust region one update back: measured on
 AB+ (abp-mix-01d, 2026-09-25) the clip fraction rose from 0.03 to 0.2-0.46 and approx_kl doubled.
 With no lag (synchronous training) the objective is standard PPO.
+
+Action heads (combat-v5): any MultiDiscrete ending in (bomb, item) works; the masks allow the bomb
+only with bombs and never the item (action_masks). Entropy is logged per head (train/entropy_<head>)
+and head_ent_coefs, if set, weights each head's entropy instead of ent_coef. A policy with an
+auxiliary geometry head (transformer_policy.GeometryPolicy) and observations carrying its labels
+(aim_label, fire_distance, approach) adds aux_coef * (cross-entropy + squared error) to the loss and
+logs aux/* and behavior/mode_* (argmax of the shoot head against the aim label, of the move head
+against the moves that shorten d_fire). Frames with a 'hit' field record each step's hit reward;
+train/hit_advantage_gap is the mean advantage of those steps minus the rest, in advantage std.
 """
 from concurrent.futures import as_completed
 from types import SimpleNamespace
@@ -31,6 +40,16 @@ from stable_baselines3.common.utils import explained_variance
 from .gpu_buffer import GpuHistoryRolloutBuffer
 from .gpu_env import GpuFrameVecEnv,decode_frame,metadata
 
+HEAD_NAMES={(45,2,2):('joint','bomb','item'),(9,5,2,2):('move','shoot','bomb','item')}
+
+
+def action_masks(nvec,bombs_ok):
+    """Masks of MultiDiscrete heads ending in (bomb, item): the bomb only with bombs, never the item."""
+    masks=torch.ones((len(bombs_ok),sum(nvec)),dtype=torch.bool,device=bombs_ok.device)
+    bomb=sum(nvec[:-2]);item=bomb+nvec[-2]
+    masks[:,bomb+1]=bombs_ok;masks[:,item+1]=False
+    return masks
+
 
 class FrameSampler:
     def __init__(self,model):
@@ -40,6 +59,7 @@ class FrameSampler:
         self.workers=[torch.arange(c.start,c.stop,device=model.device) for c in self.env.chunks]
         self.generation=-1;self.version=-1;self.steps=0
         self.upload_bytes=0;self.encoded_frames=0;self.prefix_rebuilds=0
+        self.nvec=[int(n) for n in self.env.action_space.nvec]
 
     # The weights that collect: the actor copy while training runs asynchronously.
     @property
@@ -64,7 +84,7 @@ class FrameSampler:
             for c,ids in zip(self.env.chunks,self.workers):
                 slot=c.slots[0]
                 slot.device.copy_(slot.host,non_blocking=True)
-                self.encode(b.frame_pos,ids,decode_frame(slot.device,self.env.observation_space))
+                self.encode(b.frame_pos,ids,decode_frame(slot.device,self.env.observation_space,self.env.frame_dtype))
                 b.lengths[b.frame_pos,ids]=1
                 self.upload_bytes+=slot.host.numel()*slot.host.element_size()
                 slot.upload_done.record(stream);slot.consumed.record(stream);slot.used=True
@@ -100,8 +120,7 @@ class FrameSampler:
 
     def action(self,position,ids,deterministic=False):
         policy=self.policy
-        masks=torch.ones((len(ids),49),dtype=torch.bool,device=ids.device)
-        masks[:,46]=self.buffer.frames['player'][position,ids,9]>0;masks[:,48]=False
+        masks=action_masks(self.nvec,self.buffer.frames['player'][position,ids,9]>0)
         pi,vf=policy.mlp_extractor(self.latent(position,ids))
         distribution=policy._get_action_dist_from_latent(pi)
         distribution.apply_masking(masks)
@@ -132,6 +151,9 @@ class GpuMaskablePPO(MaskablePPO):
         # None keeps SB3's per-window minibatches; an int enables frame-deduplicated segment
         # minibatches with gradient accumulation (see _train_segments).
         self.micro_batch_size=None;self.segment_length=32
+        # combat-v5: per-head entropy weights (None: ent_coef on the summed entropy) and the
+        # auxiliary geometry loss weight (used when the policy has aux_outputs).
+        self.head_ent_coefs=None;self.aux_coef=0.0
         super().__init__(*args,**kwargs)
 
     def _excluded_save_params(self):
@@ -244,17 +266,18 @@ class GpuMaskablePPO(MaskablePPO):
     def copy_rollout(src,dst):
         """Everything segment training reads from a GpuHistoryRolloutBuffer."""
         for k,v in src.frames.items():dst.frames[k].copy_(v)
-        for name in ('lengths','actions','rewards','_returns','episode_starts','_values','log_probs','advantages','action_masks'):
+        for name in ('lengths','actions','rewards','_returns','episode_starts','_values','log_probs','advantages','action_masks','hits'):
             getattr(dst,name).copy_(getattr(src,name))
         dst.frame_pos,dst.pos,dst.full=src.frame_pos,src.pos,src.full
 
-    def evaluate_segments(self,workers,t0,buffer=None):
+    def evaluate_segments(self,workers,t0,buffer=None,details=False):
         """Values, log-probs and entropies for whole L-step segments of single workers.
 
         Every stored frame the segment needs is encoded once and shared by the windows that
         contain it. Each sample still sees exactly its own causal window (same frames, times,
         padding and last token), so per-sample outputs equal policy.evaluate_actions on
-        buffer.window(); only float summation order differs.
+        buffer.window(); only float summation order differs. details=True adds a dict: per-head
+        entropies and argmaxes, and with an auxiliary head its outputs and the samples' labels.
         """
         b=buffer if buffer is not None else self.rollout_buffer;enc=self.policy.features_extractor
         H,L,dev=b.history,self.segment_length,self.device
@@ -279,7 +302,15 @@ class GpuMaskablePPO(MaskablePPO):
         dist=self.policy._get_action_dist_from_latent(pi)
         steps=(q-(H-1)).flatten();owners=workers[:,None].expand(-1,L).flatten()
         dist.apply_masking(b.action_masks[steps,owners])
-        return self.policy.value_net(vf).flatten(),dist.log_prob(b.actions[steps,owners]),dist.entropy(),steps,owners
+        values,log_prob,entropy=self.policy.value_net(vf).flatten(),dist.log_prob(b.actions[steps,owners]),dist.entropy()
+        if not details:return values,log_prob,entropy,steps,owners
+        extra={'head_entropy':torch.stack([d.entropy() for d in dist.distributions],1),
+               'mode':torch.stack([d.probs.argmax(-1) for d in dist.distributions],1)}
+        if hasattr(self.policy,'aux_outputs') and 'aim_label' in obs:
+            extra['aux']=self.policy.aux_outputs(latent)
+            # Each sample's own frame is the last H-1+l row of its segment's rows.
+            extra['labels']={k:obs[k][:,H-1:].flatten(0,1) for k in ('aim_label','fire_distance','approach')}
+        return values,log_prob,entropy,steps,owners,extra
 
     def _train_segments(self,buffer=None,proximal=None):
         """PPO over frame-deduplicated segment minibatches with gradient accumulation.
@@ -303,6 +334,13 @@ class GpuMaskablePPO(MaskablePPO):
         seg_batch=self.batch_size//L;seg_micro=self.micro_batch_size//L
         pg_losses,value_losses,entropy_losses,clip_fractions=[],[],[],[]
         continue_training=True;steps=0;loss=0.0
+        nvec=tuple(int(n) for n in self.action_space.nvec)
+        heads=HEAD_NAMES.get(nvec) or tuple(f'head{i}' for i in range(len(nvec)))
+        head_coefs=(torch.as_tensor(self.head_ent_coefs,dtype=torch.float32,device=self.device)
+                    if self.head_ent_coefs is not None else None)
+        # sums over the samples of: head entropies (heads), aux CE, aux squared error, aux hits,
+        # aligned samples, aligned aux hits, aligned mode aim hits, approach samples, approach hits
+        diag=None
         for epoch in range(self.n_epochs):
             approx_kl_divs=[]
             order=torch.randperm(segments,device=self.device)
@@ -314,7 +352,7 @@ class GpuMaskablePPO(MaskablePPO):
                 policy.optimizer.zero_grad()
                 sums=torch.zeros(5,device=self.device)
                 for m in range(0,len(chosen),seg_micro):
-                    values,log_prob,entropy,t,w=self.evaluate_segments(workers[m:m+seg_micro],t0[m:m+seg_micro],b)
+                    values,log_prob,entropy,t,w,extra=self.evaluate_segments(workers[m:m+seg_micro],t0[m:m+seg_micro],b,True)
                     a=(b.advantages[t,w]-mean)/(std+1e-8)
                     old=b.log_probs[t,w]
                     anchor=old if proximal is None else proximal[t,w]
@@ -325,7 +363,28 @@ class GpuMaskablePPO(MaskablePPO):
                         values=b._values[t,w]+torch.clamp(values-b._values[t,w],-clip_range_vf,clip_range_vf)
                     vl=(b._returns[t,w]-values)**2
                     el=-entropy
-                    ((pg.sum()+self.ent_coef*el.sum()+self.vf_coef*vl.sum())/n).backward()
+                    ent=(-(extra['head_entropy']*head_coefs).sum() if head_coefs is not None else self.ent_coef*el.sum())
+                    aux=0.0
+                    if 'aux' in extra:
+                        logits,predicted=extra['aux'];labels=extra['labels']
+                        ce=torch.nn.functional.cross_entropy(logits,labels['aim_label'].long(),reduction='none')
+                        se=(predicted-labels['fire_distance'])**2
+                        aux=self.aux_coef*(ce.sum()+se.sum())
+                    ((pg.sum()+ent+self.vf_coef*vl.sum()+aux)/n).backward()
+                    if epoch==0:
+                        with torch.no_grad():
+                            row=[extra['head_entropy'].sum(0)]
+                            if 'aux' in extra:
+                                aim=labels['aim_label'].long();aligned=aim>0;guess=logits.argmax(-1)
+                                row.append(torch.stack([ce.sum(),se.sum(),(guess==aim).float().sum(),aligned.float().sum(),
+                                                        ((guess==aim)&aligned).float().sum()]))
+                                if heads[:2]==('move','shoot'):
+                                    mode=extra['mode'];far=labels['fire_distance']>1
+                                    closer=labels['approach'].gather(1,mode[:,:1]).squeeze(1)>0
+                                    row.append(torch.stack([((mode[:,1]==aim)&aligned).float().sum(),far.float().sum(),
+                                                            (closer&far).float().sum()]))
+                            row=torch.cat(row)
+                            diag=row if diag is None else diag+row
                     with torch.no_grad():
                         lr_=log_prob-anchor
                         sums+=torch.stack([pg.sum(),vl.sum(),el.sum(),((torch.exp(lr_)-1)-lr_).sum(),
@@ -343,6 +402,7 @@ class GpuMaskablePPO(MaskablePPO):
                 policy.optimizer.step();steps+=1
             if not continue_training:break
         self._n_updates+=self.n_epochs
+        self._log_diagnostics(b,diag,heads)
         explained_var=explained_variance(b.values.flatten(),b.returns.flatten())
         self.logger.record('train/entropy_loss',np.mean(entropy_losses))
         self.logger.record('train/policy_gradient_loss',np.mean(pg_losses))
@@ -359,6 +419,28 @@ class GpuMaskablePPO(MaskablePPO):
             lag=proximal-b.log_probs;weight=torch.exp(lag)  # pi_proximal/pi_behaviour
             self.logger.record('train/lag_kl',float(((weight-1)-lag).mean()))
             self.logger.record('train/lag_weight_truncated',float((weight>self.lag_weight_max).float().mean()))
+
+    def _log_diagnostics(self,b,diag,heads):
+        """Per-head entropy, auxiliary head, mode aiming/approach (first epoch) and hit advantage gap."""
+        count=b.buffer_size*b.n_envs
+        if diag is not None:
+            diag=diag.tolist();k=len(heads)
+            for i,name in enumerate(heads):self.logger.record(f'train/entropy_{name}',diag[i]/count)
+            if len(diag)>k:
+                ce,se,hit,aligned,aligned_hit=diag[k:k+5]
+                self.logger.record('aux/aim_ce',ce/count);self.logger.record('aux/distance_mse',se/count)
+                self.logger.record('aux/aim_accuracy',hit/count);self.logger.record('aux/aligned_share',aligned/count)
+                if aligned:self.logger.record('aux/aim_accuracy_aligned',aligned_hit/aligned)
+                if len(diag)>k+5:
+                    mode_aim,far,closer=diag[k+5:k+8]
+                    if aligned:self.logger.record('behavior/mode_aim_rate',mode_aim/aligned)
+                    if far:self.logger.record('behavior/mode_approach_rate',closer/far)
+                    self.logger.record('behavior/far_share',far/count)
+        hit=b.hits>0
+        if hit.any() and (~hit).any():
+            adv=b.advantages;std=adv.std()+1e-8
+            self.logger.record('train/hit_advantage_gap',float((adv[hit].mean()-adv[~hit].mean())/std))
+            self.logger.record('train/hit_step_share',float(hit.float().mean()))
 
     def collect_rollouts(self,env,callback,rollout_buffer,n_rollout_steps,use_masking=True):
         if not use_masking:raise ValueError('Isaac requires action masking')
@@ -382,7 +464,7 @@ class GpuMaskablePPO(MaskablePPO):
                         with torch.cuda.stream(c.compute_stream):
                             actions,values,log_prob,masks=s.action(old,ids,self.sampling_deterministic)
                             starts=s.starts[ids]
-                            slot.actions.copy_(actions,non_blocking=True)
+                            slot.actions.copy_(env.transfer_actions(actions),non_blocking=True)
                             slot.action_ready.record(c.compute_stream)
                         future=env.executor.submit(c.advance_and_upload,slot)
                         pending[future]=(c,ids,slot,actions,values,log_prob,masks,starts)
@@ -395,10 +477,11 @@ class GpuMaskablePPO(MaskablePPO):
                         s.upload_bytes+=(c.n+len(terminal))*slot.host.shape[1]*slot.host.element_size()
                         with torch.cuda.stream(c.compute_stream):
                             c.compute_stream.wait_event(slot.upload_done)
-                            raw=decode_frame(slot.device,env.observation_space)
+                            raw=decode_frame(slot.device,env.observation_space,env.frame_dtype)
                             b.lengths[new,ids]=(b.lengths[old,ids]+1).clamp_max(b.history)
                             s.encode(new,ids,raw)
-                            reward=metadata(slot.device,'reward').clone()
+                            reward=metadata(slot.device,'reward',env.frame_dtype).clone()
+                            hits=metadata(slot.device,'hit',env.frame_dtype).clone() if 'hit' in env.frame_dtype.names else None
                             if len(terminal):
                                 local=torch.as_tensor(terminal,device=self.device);done_ids=ids[local]
                                 terminal_obs=b.window(new,done_ids)
@@ -407,10 +490,10 @@ class GpuMaskablePPO(MaskablePPO):
                                 if timeout:
                                     ti=torch.as_tensor(timeout,device=self.device)
                                     reward[ti]+=self.gamma*s.values(new,ids[ti])
-                                reset=decode_frame(slot.reset_device[:len(terminal)],env.observation_space)
+                                reset=decode_frame(slot.reset_device[:len(terminal)],env.observation_space,env.frame_dtype)
                                 s.encode(new,done_ids,reset);b.lengths[new,done_ids]=1
-                            b.add_chunk(t,ids,actions,values,log_prob,masks,reward,starts)
-                            s.starts[ids]=metadata(slot.device,'done').bool()
+                            b.add_chunk(t,ids,actions,values,log_prob,masks,reward,starts,hits)
+                            s.starts[ids]=metadata(slot.device,'done',env.frame_dtype).bool()
                             slot.consumed.record(c.compute_stream);c.ready.record(c.compute_stream)
                     for c in env.chunks:torch.cuda.current_stream(self.device).wait_event(c.ready)
                     b.frame_pos=new;b.pos=t+1;b.full=b.pos==b.buffer_size;s.steps+=1

@@ -31,11 +31,12 @@ import torch
 from stable_baselines3.common.save_util import load_from_zip_file
 
 from isaac_bridge.abplus import AbplusTransformerEnv, launch_abplus, sim_arena, stop_abplus
-from isaac_bridge.abplus_reward import CombatV2
+from isaac_bridge.abplus_reward import REWARDS, CombatV2
+from isaac_bridge.abplus_worker import EPISODE_STATS, EpisodeStats, observation_options, sample_bombs
 from isaac_bridge.abplus_tasks import TaskSampler
 from isaac_bridge.steam_watch import steam_running
+from isaac_bridge.transformer_obs import factored_masks, factored_to_joint
 
-DEADLINE_PROFILES = ('combat-v1', 'combat-v2')  # reward profiles trained with the 120 s deadline input
 
 BOSS_MAX_HP = 250.0  # Monstro; the simulator audit reports absolute boss HP
 TYPE_MONSTRO = 20
@@ -171,15 +172,27 @@ class Metrics:
                     **({'anomalies': self.anomalies} if self.anomalies else {}))
 
 
-def run_episode(env, cached, seed, args, replay_path=None):
+def run_episode(env, cached, seed, args, replay_path=None, config=None):
     arena = sim_arena(seed)
+    config = config or {}
     if args.stochastic:
         torch.manual_seed(args.sample_seed + seed)
-    obs, info = env.reset(options={'arena_seed': seed})
+    # Runs trained with a random bomb start are evaluated with the same draw, fixed per seed.
+    bombs = sample_bombs(seed, config['start_bombs']) if config.get('start_bombs') else None
+    obs, info = env.reset(options={'arena_seed': seed, **({'bombs': bombs} if bombs is not None else {})})
     env.bridge.last_reset = dict(info)
     task = env.bridge.last_reset.get('task', 'arena')
     reward_v2 = CombatV2()  # reported for every checkpoint, whatever reward it was trained with
     reward_v2.reset(env.raw_obs, task)
+    # The checkpoint's own reward (combat-v3/v4) next to combat-v2, which every checkpoint reports.
+    profile = config.get('reward_profile')
+    own = (REWARDS[profile](**config.get('reward_options', {})) if profile in REWARDS and profile != 'combat-v2'
+           else None)
+    # combat-v5 policies have factored heads (move, shoot, bomb, item); the env takes the joint layout.
+    factored = len(cached.policy.action_space.nvec) == 4
+    if own is not None:
+        own.reset(env.raw_obs, task)
+    stats = EpisodeStats(env.raw_obs)
     frames = 0
     cached.reset()
     metrics = Metrics(env.raw_obs)
@@ -192,10 +205,12 @@ def run_episode(env, cached, seed, args, replay_path=None):
     policy_s = 0.0
     try:
         while True:
-            mask = env.action_masks()
+            mask = factored_masks(env.action_masks()) if factored else env.action_masks()
             tp = time.perf_counter()
             dist = cached.distribution(env.history.frames[-1], mask)
             action = dist.get_actions(deterministic=not args.stochastic)[0].cpu().numpy()
+            if factored:
+                action = factored_to_joint(action)
             if steps < args.verify_steps:
                 full = cached.full_distribution(obs, mask)
                 verify.append(float((logits(dist) - logits(full)).abs().max()))
@@ -204,6 +219,9 @@ def run_episode(env, cached, seed, args, replay_path=None):
             total_return += reward
             steps += 1
             reward_v2.step(env.raw_obs, info['outcome'], info['elapsed_frames'] - frames)
+            if own is not None:
+                own.step(env.raw_obs, info['outcome'], info['elapsed_frames'] - frames)
+            stats.step(env.raw_obs, info['elapsed_frames'] - frames)
             frames = info['elapsed_frames']
             metrics.step(action, env.raw_obs, info['outcome'])
             raw = env.raw_obs
@@ -225,7 +243,12 @@ def run_episode(env, cached, seed, args, replay_path=None):
                   policy_ms=round(1000 * policy_s / max(1, steps), 3), trajectory=trajectory.hexdigest()[:16],
                   reward_v2=round(sum(reward_v2.totals.values()), 4),
                   reward_v2_components={k: round(v, 4) for k, v in reward_v2.totals.items()},
-                  reward_v2_start=reward_v2.start)
+                  reward_v2_start=reward_v2.start, start_bombs=env.bridge.start_bombs,
+                  stats={k: round(float(v), 2) for k, v in zip(EPISODE_STATS, stats.array())})
+    if own is not None:
+        tag = 'reward_' + profile.split('-')[1]
+        result.update({tag: round(sum(own.totals.values()), 4),
+                       tag + '_components': {k: round(v, 4) for k, v in own.totals.items()}})
     if verify:
         result['verify_max_logit_diff'] = max(verify)
     return result
@@ -243,9 +266,11 @@ def worker(index, args, config, tasks, results):
     def start():
         state['proc'] = launch_abplus(name, port, args.mode)
         env = AbplusTransformerEnv(port=port, max_episode_frames=int(config['max_episode_seconds'] * 30),
-                                   deadline=config.get('reward_profile') in DEADLINE_PROFILES,
+                                   **observation_options(config.get('reward_profile')),
                                    history=config['history'], entity_capacity=config['entity_capacity'])
         env.bridge.binary_obs = not args.json_obs
+        if config.get('lineage_mode') is not None:
+            env.bridge.lineage_mode = int(config['lineage_mode'])
         env.bridge.tasks = TaskSampler.from_file(args.tasks_file) if args.tasks_file != 'none' else None
         if env.observation_space != policy.observation_space:
             raise ValueError(f'AB+ observation space {env.observation_space} differs from the checkpoint '
@@ -273,7 +298,7 @@ def worker(index, args, config, tasks, results):
                 break
             for attempt in range(2):
                 try:
-                    result = run_episode(state['env'], cached, seed, args, replay)
+                    result = run_episode(state['env'], cached, seed, args, replay, config)
                     break
                 except Exception:
                     result = dict(seed=seed, outcome='error', layout=sim_arena(seed)['variant'],
@@ -351,7 +376,8 @@ def main():
         proc.start()
     finished, t0, steps = 0, time.monotonic(), 0
     counts = collections.Counter()
-    per_task = collections.defaultdict(lambda: {'outcomes': collections.Counter(), 'reward_v2': []})
+    per_task = collections.defaultdict(lambda: {'outcomes': collections.Counter(), 'reward_v2': [], 'reward_own': [],
+                                                'bombs_0': collections.Counter(), 'bombs_1+': collections.Counter()})
     with results_path.open('a') as fh:
         while finished < n:
             try:
@@ -370,6 +396,12 @@ def main():
             per_task[r.get('task', 'arena')]['outcomes'][r['outcome']] += 1
             if 'reward_v2' in r:
                 per_task[r.get('task', 'arena')]['reward_v2'].append(r['reward_v2'])
+            for tag in ('reward_v3', 'reward_v4', 'reward_v5'):
+                if tag in r:
+                    per_task[r.get('task', 'arena')]['reward_own'].append(r[tag])
+            if r.get('start_bombs') is not None:
+                split = 'bombs_0' if r['start_bombs'] == 0 else 'bombs_1+'
+                per_task[r.get('task', 'arena')][split][r['outcome']] += 1
             steps += r.get('l', 0)
             elapsed = time.monotonic() - t0
             print(f"{time.strftime('%H:%M:%S')} seed {r['seed']} L{r['layout']} {r['outcome']:<10} "
@@ -377,10 +409,13 @@ def main():
                   f"{sum(counts.values())}/{len(todo)} {dict(counts)} {steps / elapsed:.0f} decisions/s", flush=True)
     for proc in procs:
         proc.join()
+    mean = lambda values: round(float(np.mean(values)), 3) if values else None
     print(json.dumps({'outcomes': counts, 'seconds': round(time.monotonic() - t0, 1),
                       'decisions': steps, 'decisions_per_s': round(steps / max(1e-9, time.monotonic() - t0), 1),
-                      'tasks': {k: {'outcomes': v['outcomes'],
-                                    'reward_v2_mean': round(float(np.mean(v['reward_v2'])), 3) if v['reward_v2'] else None}
+                      'tasks': {k: {'outcomes': v['outcomes'], 'reward_v2_mean': mean(v['reward_v2']),
+                                    **({'reward_own_mean': mean(v['reward_own'])} if v['reward_own'] else {}),
+                                    **({'bombs_0': v['bombs_0'], 'bombs_1+': v['bombs_1+']}
+                                       if v['bombs_0'] or v['bombs_1+'] else {})}
                                 for k, v in sorted(per_task.items())}}))
 
 

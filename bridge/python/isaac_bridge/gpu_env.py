@@ -38,12 +38,12 @@ def validate_start_randomization(config):
 
 
 class TransferSlot:
-    def __init__(self,n,device):
-        words=FRAME_DTYPE.itemsize//4
+    def __init__(self,n,device,dtype=FRAME_DTYPE):
+        words=dtype.itemsize//4
         self.host=torch.empty((n,words),dtype=torch.int32,pin_memory=True)
-        self.frames=self.host.numpy().view(FRAME_DTYPE).reshape(n)
+        self.frames=self.host.numpy().view(dtype).reshape(n)
         self.reset_host=torch.empty_like(self.host,pin_memory=True)
-        self.reset_frames=self.reset_host.numpy().view(FRAME_DTYPE).reshape(n)
+        self.reset_frames=self.reset_host.numpy().view(dtype).reshape(n)
         self.device=torch.empty((n,words),dtype=torch.int32,device=device)
         self.reset_device=torch.empty_like(self.device)
         self.actions=torch.empty((n,3),dtype=torch.int32,pin_memory=True)
@@ -125,6 +125,7 @@ class FrameChunk:
 
 
 class GpuFrameVecEnv(VecEnv):
+    frame_dtype=FRAME_DTYPE  # record layout of the chunk slots (AB+ may extend it)
     def __init__(self,n=8,seed=1,threads=4,chunks=1,history=HISTORY,capacity=ENTITY_CAPACITY,device='cuda',reward_profile='legacy',
                  start_randomization=None):
         if not 1<=chunks<=min(n,threads):raise ValueError('chunks must be <= envs and total Rust threads')
@@ -159,6 +160,9 @@ class GpuFrameVecEnv(VecEnv):
                 v[c.start:c.stop,0]=source
         return obs
 
+    def transfer_actions(self,actions):
+        """Policy actions -> the (n, 3) rows the transfer slots send (identity: the joint layout)."""
+        return actions
     def step_async(self,actions):raise NotImplementedError('Use GpuMaskablePPO chunk collector, or SimVecEnv for CPU stepping')
     def step_wait(self):raise NotImplementedError('Use GpuMaskablePPO chunk collector')
     def close(self):
@@ -173,11 +177,12 @@ class GpuFrameVecEnv(VecEnv):
     def env_is_wrapped(self,wrapper_class,indices=None):return [False for _ in self._get_indices(indices)]
 
 
-def decode_frame(words,space):
+def decode_frame(words,space,frame_dtype=FRAME_DTYPE):
+    """Observation tensors of packed frame records (frame_dtype: the env's frame_dtype)."""
     result={}
     for k,s in space.spaces.items():
         if k=='remaining_time':continue
-        dtype,offset=FRAME_DTYPE.fields[k]
+        dtype,offset=frame_dtype.fields[k]
         v=words[:,offset//4:(offset+dtype.itemsize)//4]
         if dtype.base==np.dtype('float32'):v=v.view(torch.float32)
         v=v.reshape(len(words),*dtype.shape)
@@ -187,7 +192,7 @@ def decode_frame(words,space):
     return result
 
 
-def metadata(words,name):
-    dtype,offset=FRAME_DTYPE.fields[name]
+def metadata(words,name,frame_dtype=FRAME_DTYPE):
+    dtype,offset=frame_dtype.fields[name]
     v=words[:,offset//4]
     return v.view(torch.float32) if dtype==np.dtype('float32') else v

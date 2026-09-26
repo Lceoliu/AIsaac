@@ -18,6 +18,8 @@ class GpuHistoryRolloutBuffer(MaskableDictRolloutBuffer):
             self.actions=torch.empty((self.buffer_size,self.n_envs,self.action_dim),dtype=torch.long,device=self.device)
             for name in ('rewards','_returns','episode_starts','_values','log_probs','advantages'):
                 setattr(self,name,torch.empty((self.buffer_size,self.n_envs),device=self.device))
+            # Each step's hit reward when the frames carry one (combat-v5 diagnostics), else 0.
+            self.hits=torch.zeros((self.buffer_size,self.n_envs),device=self.device)
             self.action_masks=torch.empty((self.buffer_size,self.n_envs,self.mask_dims),dtype=torch.bool,device=self.device)
         self.pos=0;self.full=False;self.generator_ready=False
 
@@ -57,8 +59,9 @@ class GpuHistoryRolloutBuffer(MaskableDictRolloutBuffer):
             result[k]=value
         return result
 
-    def add_chunk(self,t,workers,actions,values,log_prob,masks,rewards,starts):
+    def add_chunk(self,t,workers,actions,values,log_prob,masks,rewards,starts,hits=None):
         self.actions[t,workers]=actions
+        if hits is not None:self.hits[t,workers]=hits
         self._values[t,workers]=values.flatten()
         self.log_probs[t,workers]=log_prob
         self.action_masks[t,workers]=masks

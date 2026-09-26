@@ -10,6 +10,7 @@ import math
 import numpy as np
 from gymnasium import spaces
 
+from .abplus_geometry import CELL, D_FIRE_MAX, MOVES, fire_geometry
 from .monstro_gym import MonstroGymEnv
 
 SCHEMA = 'monstro-transformer-v3'
@@ -17,6 +18,17 @@ DEADLINE_SCHEMA = 'monstro-transformer-v4-deadline'
 HISTORY = 64
 ENTITY_CAPACITY = 256
 ANIMATION_BYTES = 32
+# combat-v3 room state (VisibleHistory(combat_state=True), AB+ bridge abp-0.2.2): what the reward's
+# time price and first-minute penalty depend on beyond the remaining time.
+COMBAT_FIELDS = ('blocking_count', 'engaged', 'blocking_fraction', 'since_hit')
+# combat-v4 has no stall or time penalty, so it keeps only the room aggregates.
+COMBAT_FIELDS_V4 = ('blocking_count', 'blocking_fraction')
+# combat-v5 (VisibleHistory(geometry=True, factored_actions=True)): per-NPC flags from bridge
+# abp-0.2.3, the critic's d_fire input (fire_distance = d_fire / 40, at most 15) and the heads the
+# 45-way joint action was split into.
+ENTITY_FLAGS = ('lineage', 'blocking')
+FIRE_DISTANCE_MAX = D_FIRE_MAX / CELL
+FACTORED_NVEC = (9, 5, 2, 2)
 PLAYER_FIELDS = ('x', 'y', 'vx', 'vy', 'motion_valid', 'size', 'hearts', 'max_hearts',
                  'soul', 'bombs', 'keys', 'coins', 'damage', 'speed', 'shot_speed',
                  'fire_delay_max', 'range', 'can_fly', 'active_charge', 'active_ready',
@@ -76,14 +88,36 @@ def entity_key(entity):
     return entity['id'], entity['type'], entity['variant'], entity['subtype']
 
 
+def factored_to_joint(actions):
+    """Policy actions (move, shoot, bomb, item) -> the bridge's (move*5 + shoot, bomb, item)."""
+    a = np.asarray(actions)
+    return np.stack([a[..., 0] * 5 + a[..., 1], a[..., 2], a[..., 3]], -1)
+
+
+def factored_masks(joint_mask):
+    """TransformerMonstroEnv.action_masks (45 joint + bomb + item) -> the factored heads' masks."""
+    m = np.asarray(joint_mask, bool)
+    return np.concatenate([np.ones(9 + 5, bool), m[45:47], m[47:49]])
+
+
 class VisibleHistory:
-    def __init__(self, history=HISTORY, capacity=ENTITY_CAPACITY,deadline=False):
+    def __init__(self, history=HISTORY, capacity=ENTITY_CAPACITY,deadline=False,combat_state=False,
+                 geometry=False,factored_actions=False):
         self.deadline=deadline
+        # combat_state: False, True (COMBAT_FIELDS) or the tuple of COMBAT_FIELDS to observe.
+        self.combat_fields=(COMBAT_FIELDS if combat_state is True else tuple(combat_state)) if combat_state else ()
+        self.combat_state=bool(self.combat_fields)
+        self.combat=None
+        # combat-v5: per-NPC lineage/blocking flags (bridge abp-0.2.3), d_fire / 40 for the critic,
+        # and the auxiliary head's labels (abplus_geometry.fire_geometry); the previous action as
+        # the one-hot of the factored heads (move 9, shoot 5, bomb 2, item 2).
+        self.geometry, self.factored_actions = geometry, factored_actions
+        self.d_fire = None
         self.history, self.capacity = history, capacity
         self.frames = deque(maxlen=history)
         self.previous = None
         self.origin = None
-        self.previous_action = np.zeros(4, np.float32)
+        self.previous_action = np.zeros(sum(FACTORED_NVEC) if factored_actions else 4, np.float32)
         h, n = history, capacity
         self.space = spaces.Dict({
             'player': spaces.Box(-np.inf, np.inf, (h, len(PLAYER_FIELDS)), np.float32),
@@ -100,12 +134,33 @@ class VisibleHistory:
             'history_mask': spaces.Box(0, 1, (h,), np.float32),
         })
         if deadline:self.space.spaces['remaining_time']=spaces.Box(0,1,(h,),np.float32)
+        # Doors-blocking NPCs alive / 10, whether any of them lost HP yet this episode, their HP as
+        # a fraction of the start, seconds since they last lost HP (or since the start) / 60.
+        if self.combat_state:self.space.spaces['combat']=spaces.Box(0,np.inf,(h,len(self.combat_fields)),np.float32)
+        if factored_actions:self.space.spaces['previous_action']=spaces.Box(0,1,(h,sum(FACTORED_NVEC)),np.float32)
+        if geometry:
+            self.space.spaces['entity_flags']=spaces.Box(0,1,(h,n,len(ENTITY_FLAGS)),np.float32)
+            self.space.spaces['fire_distance']=spaces.Box(0,FIRE_DISTANCE_MAX,(h,),np.float32)
+            self.space.spaces['aim_label']=spaces.Box(0,4,(h,),np.float32)
+            self.space.spaces['approach']=spaces.Box(0,1,(h,len(MOVES)),np.float32)
 
     def clear(self):
         self.frames.clear()
         self.previous = None
         self.origin = None
+        self.combat = None
+        self.d_fire = None
         self.previous_action[:] = 0
+
+    def set_previous_action(self, joint, bomb, item):
+        """The action just sent to the bridge, in this history's previous_action format."""
+        if self.factored_actions:
+            move, shoot = divmod(int(joint), 5)
+            self.previous_action[:] = 0
+            for offset, value in zip((0, 9, 14, 16), (move, shoot, int(bomb), int(item))):
+                self.previous_action[offset + value] = 1
+        else:
+            self.previous_action[:] = joint, bomb, item, 1
 
     def encode(self, obs):
         """Append obs to the history and return only its frame (window row, no padding copy).
@@ -173,14 +228,23 @@ class VisibleHistory:
                     laser['radius']/width if laser and laser['circle'] else 0,
                     bool(laser and laser['circle'])]
                 row.extend(monstro_visual(e,p['pos'],width,height))
-                rows.append((row, (e['type'], e['variant'], e['subtype']), animation_bytes(e.get('anim', ''))))
+                flags = [float(bool(e.get(k))) for k in ENTITY_FLAGS]
+                rows.append((row, (e['type'], e['variant'], e['subtype']), animation_bytes(e.get('anim', '')), flags))
         if len(rows) > self.capacity:
             raise ValueError(f'Visible entity/laser segment overflow: {len(rows)} > {self.capacity}; increase capacity, never truncate')
-        for i, (row, kind, anim) in enumerate(rows):
+        for i, (row, kind, anim, flags) in enumerate(rows):
             frame['entities'][i] = row
             frame['entity_kind'][i] = kind
             frame['entity_anim'][i] = anim
             frame['entity_mask'][i] = 1
+            if self.geometry:
+                frame['entity_flags'][i] = flags
+        if self.geometry:
+            g = fire_geometry(obs, self.d_fire)
+            self.d_fire = g['d_fire']
+            frame['fire_distance'] = np.float32(min(g['d_fire'], D_FIRE_MAX) / CELL)
+            frame['aim_label'] = np.float32(g['aim'])
+            frame['approach'][:] = g['approach']
         # Binary observations (abplus_obs) mark unchanged terrain with a version: reuse its channels.
         version = obs['terrain'].get('version')
         if version is None:
@@ -193,11 +257,25 @@ class VisibleHistory:
         frame['previous_action'] = self.previous_action.copy()
         frame['time'] = np.float32((obs['logic_frames']-self.origin)/30)
         if self.deadline:frame['remaining_time']=np.float32(max(0,1-frame['time']/120))
+        if self.combat_state:frame['combat'][:]=self.combat_features(obs['combat'],float(frame['time']))
         frame['history_mask'] = np.float32(1)
         self.frames.append(frame)
         self.previous = obs
         self.last_rows = len(rows)
         return frame
+
+    def combat_features(self, combat, t):
+        """COMBAT_FIELDS; 'engaged' and the last hit follow combat-v3's definition (blocking HP fell)."""
+        hp, count = float(combat['blocking_hp']), float(combat['blocking_count'])
+        if self.combat is None:
+            self.combat = dict(start=hp, last=hp, engaged=False, hit=0.0)
+        c = self.combat
+        if hp < c['last'] - 1e-9:
+            c['engaged'], c['hit'] = True, t
+        c['last'] = hp
+        values = dict(blocking_count=min(count, 30.0) / 10, engaged=float(c['engaged']),
+                      blocking_fraction=min(hp / max(1.0, c['start']), 3.0), since_hit=min(t - c['hit'], 120.0) / 60)
+        return tuple(values[k] for k in self.combat_fields)
 
     def append(self, obs):
         self.encode(obs)
@@ -233,6 +311,6 @@ class TransformerMonstroEnv(MonstroGymEnv):
         mask = self.action_masks()
         if not mask[45+bomb] or not mask[47+item]:
             raise ValueError('Requested unavailable bomb/active item')
-        self.history.previous_action[:] = joint, bomb, item, 1
+        self.history.set_previous_action(joint, bomb, item)
         move, shoot = divmod(joint, 5)
         return [move, shoot, bomb, item]

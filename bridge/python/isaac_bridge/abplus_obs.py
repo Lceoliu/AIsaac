@@ -1,4 +1,4 @@
-"""Decoder of abp_bridge.lua's binary observation (format 2, abp-0.2.1).
+"""Decoder of abp_bridge.lua's binary observation (format 2, abp-0.2.3).
 
 Produces the same dict as json.loads of the format-1 message: same keys, same key presence
 (anim only when an animation matched, boss_hp only for bosses, per-kind extras), same values
@@ -24,7 +24,8 @@ ENTITY_EFFECT = 1000
 KINDS = {1: 'tear', 2: 'projectile', 3: 'laser', 4: 'bomb', 5: 'pickup', 6: 'npc'}
 
 _HEADER = struct.Struct('<IIIBqqqq')
-_COMBAT = struct.Struct('<ddddddd')  # abp-0.2.1 adds blocking_hp, blocking_points
+# abp-0.2.1 adds blocking_hp, blocking_points; abp-0.2.2 blocking_count; abp-0.2.3 the lineage counters
+_COMBAT = struct.Struct('<dddddddddddd')
 _ROOM = struct.Struct('<qqqqddddBqqqqqq')
 _ROOM_DATA = struct.Struct('<qq')
 _DOOR = struct.Struct('<BBBddq')
@@ -35,7 +36,7 @@ _ENTITY_TAIL = struct.Struct('<qBqB')
 _VEL = struct.Struct('<dd')
 _TPH = struct.Struct('<ddd')
 _LASER = struct.Struct('<Bddddddq')
-_NPC = struct.Struct('<BBBqBd')
+_NPC = struct.Struct('<BBBqBdBB')  # abp-0.2.3: + lineage, blocking
 _U8 = struct.Struct('<B')
 _U16 = struct.Struct('<H')
 _U32 = struct.Struct('<I')
@@ -153,11 +154,12 @@ class ObsDecoder:
             elif kind == 5:
                 rec['pickup'] = True
             elif kind == 6:
-                enemy, vulnerable, boss, champion, has_hp, hp = _NPC.unpack_from(payload, off)
+                enemy, vulnerable, boss, champion, has_hp, hp, lineage, blocking = _NPC.unpack_from(payload, off)
                 off += _NPC.size
                 rec.update(enemy=bool(enemy), vulnerable=bool(vulnerable), boss=bool(boss), champion=champion)
                 if has_hp:
                     rec['boss_hp'] = hp
+                rec.update(lineage=bool(lineage), blocking=bool(blocking))
             entities.append(rec)
         if off != len(payload):
             raise ValueError(f'observation payload has {len(payload) - off} trailing bytes')
@@ -168,7 +170,8 @@ class ObsDecoder:
                     terrain=self._terrain_with_hazards(entities),
                     combat=dict(player_damage_events=c[0], player_damage=c[1], enemy_damage_events=c[2],
                                 enemy_damage=c[3], enemy_damage_fraction=c[4], blocking_hp=c[5],
-                                blocking_points=c[6]))
+                                blocking_points=c[6], blocking_count=c[7], lineage_damage=c[8],
+                                lineage_kills=c[9], lineage_count=c[10], lineage_hp=c[11]))
 
     def _terrain_with_hazards(self, entities):
         hazards = [e for e in entities if e['type'] == ENTITY_EFFECT and e['cdmg'] > 0]

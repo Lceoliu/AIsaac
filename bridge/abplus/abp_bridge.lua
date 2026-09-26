@@ -41,11 +41,20 @@ Protocol (one JSON object per line), identical to 0.2.0 plus "lua", "format" and
   Entity:CanShutDoors, the engine's clear condition) and blocking_points (their daily-run kill
   points, ceil(5 * MaxHitPoints^0.2) as in ScoreSheet::AddKilledEnemy); both are current values,
   not counters. Used by combat-v2 (python/isaac_bridge/abplus_reward.py).
+  abp-0.2.2: combat gains blocking_count, the number of those NPCs (combat-v3 prices time by the
+  enemies still alive and pays a kill per NPC removed).
+  abp-0.2.3: the roster lineage (combat-v5). The setup chunk calls AbpRosterMark(mode), which takes
+  the doors-blocking NPCs alive at that moment as the roster. Death successors join by frame and
+  place (AB+ leaves their SpawnerEntity nil; mode, see LINEAGE_RADIUS); NPCs spawned by a living
+  one never join. Morph keeps the entity, so it stays in the lineage. The HP a lineage NPC loses is counted up to the HP it had when it
+  joined (regrowth earns nothing new) into combat.lineage_damage; its death adds 1 to
+  combat.lineage_kills. combat also reports lineage_count and lineage_hp (the alive lineage NPCs),
+  and every NPC record carries lineage and blocking (CanShutDoors) flags.
   move: 0 stop 1 up 2 up-right 3 right 4 down-right 5 down 6 down-left 7 left 8 up-left;
   shoot: 0 none 1 up 2 right 3 down 4 left.
 ]]
 
-local VERSION = "abp-0.2.1"
+local VERSION = "abp-0.2.3"
 local mod = RegisterMod("AbpRLBridge", 1)
 
 -- The game ships LuaSocket for both architectures; make sure the 64-bit core is found.
@@ -109,17 +118,24 @@ local state = {
 	logic_frames = 0,
 	events = { damage = 0, tears = 0, npc_deaths = 0, clears = 0 },
 	combat = { player_damage_events = 0, player_damage = 0, enemy_damage_events = 0,
-		enemy_damage = 0, enemy_damage_fraction = 0, blocking_hp = 0, blocking_points = 0 },
+		enemy_damage = 0, enemy_damage_fraction = 0, blocking_hp = 0, blocking_points = 0, blocking_count = 0,
+		lineage_damage = 0, lineage_kills = 0, lineage_count = 0, lineage_hp = 0 },
 	health = { players = {}, npcs = {}, deaths = {} },
 	lethal = {},             -- player index -> true once a lethal hit was cancelled (virtual death)
+	-- abp-0.2.3 roster lineage, keyed by entity_key: HP budget still countable, HP last seen,
+	-- members that died or left, and this frame's lineage deaths and NPC inits (resolved per frame).
+	lineage = {}, lineage_hp = {}, lineage_gone = {}, lineage_dying = {}, lineage_born = {},
 }
 
 local function zero_events()
 	state.events = { damage = 0, tears = 0, npc_deaths = 0, clears = 0 }
 	state.combat = { player_damage_events = 0, player_damage = 0, enemy_damage_events = 0,
-		enemy_damage = 0, enemy_damage_fraction = 0, blocking_hp = 0, blocking_points = 0 }
+		enemy_damage = 0, enemy_damage_fraction = 0, blocking_hp = 0, blocking_points = 0, blocking_count = 0,
+		lineage_damage = 0, lineage_kills = 0, lineage_count = 0, lineage_hp = 0 }
 	state.health = { players = {}, npcs = {}, deaths = {} }
 	state.lethal = {}
+	state.lineage, state.lineage_hp, state.lineage_gone = {}, {}, {}
+	state.lineage_dying, state.lineage_born = {}, {}
 end
 
 local function entity_key(e) return tostring(e.Index) .. ':' .. tostring(e.InitSeed) end
@@ -133,9 +149,135 @@ local function record_enemy_loss(previous, hp)
 	end
 end
 
+-- abp-0.2.3 roster lineage ------------------------------------------------------------------
+-- Entity:CanShutDoors() is a method; the EntityNPC a callback receives has a CanShutDoors field.
+local function blocks_doors(e)
+	local v = e.CanShutDoors
+	if type(v) == "function" then return v(e) == true end
+	return v == true
+end
+
+local function join_lineage(e)
+	local key = entity_key(e)
+	if state.lineage[key] == nil then
+		local hp = math.max(0, e.HitPoints)
+		state.lineage[key] = hp
+		state.lineage_hp[key] = hp
+	end
+end
+
+-- Death successors. In AB+ the NPCs a death leaves (a Nest's Big Spider or Trite, a Mulligan's
+-- flies) are initialised in the frame of the death callback with SpawnerEntity nil, so they are
+-- found by frame and place: doors-blocking NPCs initialised in that frame within LINEAGE_RADIUS
+-- of where the lineage NPC died. mode 0: none join; 1: all of them join; 2: they join only when
+-- the death left exactly one (a transformation), not several (flies released at death).
+local LINEAGE_RADIUS = 60
+
+-- The setup chunk (abplus.py ROOM_LUA / ARENA_LUA) calls this once the room is ready: the
+-- doors-blocking NPCs alive now are the roster. Returns their number.
+function AbpRosterMark(mode)
+	state.lineage_mode = tonumber(mode) or 0
+	state.lineage, state.lineage_hp, state.lineage_gone = {}, {}, {}
+	state.lineage_dying, state.lineage_born = {}, {}
+	state.combat.lineage_damage, state.combat.lineage_kills = 0, 0
+	local n = 0
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		-- Exists(): the arena setup removes the room's own NPCs in the same frame.
+		if e:ToNPC() and e:Exists() and e:CanShutDoors() and not e:IsDead() then
+			join_lineage(e)
+			n = n + 1
+		end
+	end
+	return n
+end
+
+local function in_lineage(e)
+	local key = entity_key(e)
+	return state.lineage[key] ~= nil and not state.lineage_gone[key]
+end
+
+-- HP a lineage NPC lost since last seen, up to its remaining budget.
+local function charge_lineage(key, hp)
+	local previous = state.lineage_hp[key]
+	if previous and hp < previous then
+		local loss = math.min(previous - hp, state.lineage[key])
+		state.lineage[key] = state.lineage[key] - loss
+		state.combat.lineage_damage = state.combat.lineage_damage + loss
+	end
+	state.lineage_hp[key] = hp
+end
+
+-- Diagnostics of the successor rule (read through the lua command).
+AbpLineageStats = { deaths = 0, born = 0, near = 0, joined = 0, errors = 0, last_error = "" }
+
+-- Successors of this frame's lineage deaths join the lineage (see LINEAGE_RADIUS).
+local function resolve_lineage()
+	local mode = state.lineage_mode or 0
+	if mode > 0 and next(state.lineage_dying) ~= nil then
+		local stats = AbpLineageStats
+		for _ in pairs(state.lineage_dying) do stats.deaths = stats.deaths + 1 end
+		stats.born = stats.born + #state.lineage_born
+		local left = {}   -- dying key -> NPCs initialised this frame near where it died
+		for _, npc in ipairs(state.lineage_born) do
+			local ok, err = pcall(function()
+				if npc:Exists() and not npc:IsDead() and blocks_doors(npc) then
+					for key, pos in pairs(state.lineage_dying) do
+						if npc.Position:Distance(pos) <= LINEAGE_RADIUS then
+							left[key] = left[key] or {}
+							left[key][#left[key] + 1] = npc
+							stats.near = stats.near + 1
+							break
+						end
+					end
+				end
+			end)
+			if not ok then stats.errors = stats.errors + 1; stats.last_error = tostring(err) end
+		end
+		for _, npcs in pairs(left) do
+			if mode == 1 or #npcs == 1 then
+				for _, npc in ipairs(npcs) do join_lineage(npc); stats.joined = stats.joined + 1 end
+			end
+		end
+	end
+	state.lineage_dying, state.lineage_born = {}, {}
+end
+
+local function update_lineage()
+	local seen, count, hp_total = {}, 0, 0
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		if e:ToNPC() and in_lineage(e) then
+			local key = entity_key(e)
+			seen[key] = true
+			local dead = e:IsDead() or state.health.deaths[key]
+			local hp = dead and 0 or math.max(0, e.HitPoints)
+			charge_lineage(key, hp)
+			if dead then
+				state.lineage_gone[key] = true
+				state.combat.lineage_kills = state.combat.lineage_kills + 1
+			else
+				count = count + 1
+				hp_total = hp_total + hp
+			end
+		end
+	end
+	for key in pairs(state.lineage) do
+		if not seen[key] and not state.lineage_gone[key] then
+			-- Left the room: a death this frame is a kill, anything else only ends the tracking.
+			if state.health.deaths[key] then
+				charge_lineage(key, 0)
+				state.combat.lineage_kills = state.combat.lineage_kills + 1
+			end
+			state.lineage_gone[key] = true
+		end
+	end
+	state.combat.lineage_count = count
+	state.combat.lineage_hp = hp_total
+end
+
 -- Settled health every logic frame (same definition as 0.2.0).
 local function update_combat()
 	local game = Game()
+	resolve_lineage()
 	for i = 0, game:GetNumPlayers() - 1 do
 		local p = Isaac.GetPlayer(i)
 		local total = p:GetTotalDamageTaken()
@@ -147,11 +289,12 @@ local function update_combat()
 		state.health.players[i] = total
 	end
 	local current = {}
-	local blocking_hp, blocking_points = 0, 0
+	local blocking_hp, blocking_points, blocking_count = 0, 0, 0
 	for _, e in ipairs(Isaac.GetRoomEntities()) do
 		if e:ToNPC() and e:CanShutDoors() and not e:IsDead() then
 			blocking_hp = blocking_hp + math.max(0, e.HitPoints)
 			blocking_points = blocking_points + math.ceil(5 * math.max(0, e.MaxHitPoints) ^ 0.2)
+			blocking_count = blocking_count + 1
 		end
 		if e:ToNPC() and e:IsEnemy() and e.MaxHitPoints > 0 then
 			local key = entity_key(e)
@@ -164,10 +307,12 @@ local function update_combat()
 	for key, previous in pairs(state.health.npcs) do
 		if not current[key] and state.health.deaths[key] then record_enemy_loss(previous, 0) end
 	end
+	update_lineage()
 	state.health.npcs = current
 	state.health.deaths = {}
 	state.combat.blocking_hp = blocking_hp
 	state.combat.blocking_points = blocking_points
+	state.combat.blocking_count = blocking_count
 end
 
 local function log(msg)
@@ -344,6 +489,7 @@ local function entity_record(e)
 			rec.enemy = e:IsEnemy(); rec.vulnerable = e:IsVulnerableEnemy(); rec.boss = e:IsBoss()
 			rec.champion = npc:GetChampionColorIdx()
 			if rec.boss and e.MaxHitPoints > 0 then rec.boss_hp = e.HitPoints / e.MaxHitPoints end
+			rec.lineage = in_lineage(e); rec.blocking = e:CanShutDoors() and not e:IsDead()
 		end
 	end
 	return rec
@@ -446,7 +592,10 @@ local function build_obs()
 	obs.combat = { player_damage_events = state.combat.player_damage_events,
 		player_damage = state.combat.player_damage, enemy_damage_events = state.combat.enemy_damage_events,
 		enemy_damage = state.combat.enemy_damage, enemy_damage_fraction = state.combat.enemy_damage_fraction,
-		blocking_hp = state.combat.blocking_hp, blocking_points = state.combat.blocking_points }
+		blocking_hp = state.combat.blocking_hp, blocking_points = state.combat.blocking_points,
+		blocking_count = state.combat.blocking_count, lineage_damage = state.combat.lineage_damage,
+		lineage_kills = state.combat.lineage_kills, lineage_count = state.combat.lineage_count,
+		lineage_hp = state.combat.lineage_hp }
 	return obs
 end
 
@@ -542,8 +691,9 @@ local function pack_entity(e)
 		if npc then
 			local boss = e:IsBoss()
 			local has_hp = boss and e.MaxHitPoints > 0
-			kind, extra = 6, packf("<BBBi8Bd", B(e:IsEnemy()), B(e:IsVulnerableEnemy()), B(boss),
-				I(npc:GetChampionColorIdx()), B(has_hp), has_hp and e.HitPoints / e.MaxHitPoints or 0)
+			kind, extra = 6, packf("<BBBi8BdBB", B(e:IsEnemy()), B(e:IsVulnerableEnemy()), B(boss),
+				I(npc:GetChampionColorIdx()), B(has_hp), has_hp and e.HitPoints / e.MaxHitPoints or 0,
+				B(in_lineage(e)), B(e:CanShutDoors() and not e:IsDead()))
 		end
 	end
 	local vel = cfg.engine_velocity and packf("<Bdd", 1, e.Velocity.X, e.Velocity.Y) or packf("<B", 0)
@@ -577,8 +727,9 @@ local function pack_obs(event)
 	local parts = {
 		packf("<I4I4I4Bi8i8i8i8", OBS_MAGIC, I(state.logic_frames), I(game:GetFrameCount()), B(game:IsPaused()),
 			I(state.events.damage), I(state.events.tears), I(state.events.npc_deaths), I(state.events.clears)),
-		packf("<ddddddd", c.player_damage_events, c.player_damage, c.enemy_damage_events, c.enemy_damage,
-			c.enemy_damage_fraction, c.blocking_hp, c.blocking_points),
+		packf("<dddddddddddd", c.player_damage_events, c.player_damage, c.enemy_damage_events, c.enemy_damage,
+			c.enemy_damage_fraction, c.blocking_hp, c.blocking_points, c.blocking_count,
+			c.lineage_damage, c.lineage_kills, c.lineage_count, c.lineage_hp),
 		packf("<i8i8i8i8ddddBi8i8i8i8i8i8", I(room:GetType()), I(room:GetRoomShape()), I(room:GetGridWidth()),
 			I(room:GetGridHeight()), tl.X, tl.Y, br.X, br.Y, B(room:IsClear()), I(room:GetAliveEnemiesCount()),
 			I(room:GetFrameCount()), I(level:GetStage()), I(level:GetStageType()), I(level:GetCurses()),
@@ -787,7 +938,17 @@ mod:AddCallback(ModCallbacks.MC_POST_FIRE_TEAR, function(_, tear)
 end)
 mod:AddCallback(ModCallbacks.MC_POST_NPC_DEATH, function(_, npc)
 	state.events.npc_deaths = state.events.npc_deaths + 1
-	state.health.deaths[entity_key(npc)] = true
+	local key = entity_key(npc)
+	state.health.deaths[key] = true
+	-- IsDead() can turn true a frame before this callback, when update_lineage has already counted
+	-- the kill: any member (alive or just gone) marks its death place for its successors.
+	if state.lineage[key] ~= nil then
+		state.lineage_dying[key] = Vector(npc.Position.X, npc.Position.Y)
+		AbpLineageStats.marked = (AbpLineageStats.marked or 0) + 1
+	end
+end)
+mod:AddCallback(ModCallbacks.MC_POST_NPC_INIT, function(_, npc)
+	state.lineage_born[#state.lineage_born + 1] = npc
 end)
 mod:AddCallback(ModCallbacks.MC_PRE_SPAWN_CLEAN_AWARD, function(_, rng, pos)
 	state.events.clears = state.events.clears + 1

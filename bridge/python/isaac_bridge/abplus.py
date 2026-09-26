@@ -101,7 +101,7 @@ for id = 1, CollectibleType.NUM_COLLECTIBLES - 1 do
   while player:HasCollectible(id) do player:RemoveCollectible(id) end
 end
 player:AddHearts({player_hp} - player:GetHearts())
-player:AddBombs(1 - player:GetNumBombs())
+player:AddBombs({bombs} - player:GetNumBombs())
 player:AddKeys(-player:GetNumKeys())
 player:AddCoins(-player:GetNumCoins())
 player.Position = Vector({px}, {py}); player.Velocity = Vector(0, 0)
@@ -128,8 +128,11 @@ for slot = 0, 7 do
   local door = room:GetDoor(slot)
   if door then door:Close(true); door:Bar() end
 end
+-- abp-0.2.3: the doors-blocking NPCs now are the episode's roster (combat-v5 lineage).
+local roster = AbpRosterMark({lineage_mode})
 return tostring(player:GetCollectibleCount()) .. " " .. tostring(player:GetHearts()) .. " curses=" ..
-  tostring(level:GetCurses()) .. " subtype=" .. tostring(monstro.SubType) .. " reseeded=" .. tostring(reseeded)
+  tostring(level:GetCurses()) .. " subtype=" .. tostring(monstro.SubType) .. " roster=" .. tostring(roster) ..
+  " reseeded=" .. tostring(reseeded)
 """
 
 # Mixture rooms (normal and boss rooms with their own enemies): the player/level template of the
@@ -141,7 +144,7 @@ for id = 1, CollectibleType.NUM_COLLECTIBLES - 1 do
   while player:HasCollectible(id) do player:RemoveCollectible(id) end
 end
 player:AddHearts({player_hp} - player:GetHearts())
-player:AddBombs(1 - player:GetNumBombs())
+player:AddBombs({bombs} - player:GetNumBombs())
 player:AddKeys(-player:GetNumKeys())
 player:AddCoins(-player:GetNumCoins())
 player.Velocity = Vector(0, 0)
@@ -157,7 +160,10 @@ for slot = 0, 7 do
   if door then door:Close(true); door:Bar() end
 end
 local reseeded = os.getenv("ABP_RESEED:{rng_seed}")
-return "curses=" .. tostring(level:GetCurses()) .. " clear=" .. tostring(room:IsClear()) .. " reseeded=" .. tostring(reseeded)
+-- abp-0.2.3: the doors-blocking NPCs now are the episode's roster (combat-v5 lineage).
+local roster = AbpRosterMark({lineage_mode})
+return "curses=" .. tostring(level:GetCurses()) .. " clear=" .. tostring(room:IsClear()) .. " roster=" .. tostring(roster) ..
+  " reseeded=" .. tostring(reseeded)
 """
 
 # Monstro subtypes present in the room (the goto room's own boss before the arena cleanup).
@@ -168,7 +174,7 @@ for _, e in ipairs(Isaac.GetRoomEntities()) do
 end
 return table.concat(s, ",")
 """
-BRIDGE_VERSION = "abp-0.2.1"
+BRIDGE_VERSION = "abp-0.2.3"
 GOTO_SETTLE_FRAMES = 8
 MAX_ROOM_ATTEMPTS = 16
 MAX_ROOM_RETRIES = 8  # mixture rooms tried per seed before giving up
@@ -190,6 +196,9 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
     restart_run = True
     tasks = None          # abplus_tasks.TaskSampler: room-level mixture; None = Monstro arena only
     unusable_rooms = []   # (seed, kind, variant, reason) of rooms skipped for content reasons
+    # abp-0.2.3 roster lineage: which death successors join (abp_bridge.lua LINEAGE_RADIUS): 0 none,
+    # 1 all NPCs a lineage death leaves (the default, user decision 2026-09-26), 2 only a single one.
+    lineage_mode = 1
     binary_obs = False    # format 2 (abp-0.2.1): binary observations decoded by abplus_obs.ObsDecoder
     validate_obs = False  # with binary_obs: receive the JSON observation too and compare every frame
     obs_format = 1
@@ -270,9 +279,13 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
         if start is not None:
             player_hp, boss_hp_fraction = start
             self.pending_start = None
+        # Bombs the player starts with (training start randomisation); the game's own start is 1.
+        pending, self.pending_bombs = getattr(self, "pending_bombs", None), None
+        bombs = 1 if pending is None else int(pending)
         player_hp, boss_hp_fraction = int(round(player_hp)), float(boss_hp_fraction)
-        if not (1 <= player_hp <= 6 and 0 < boss_hp_fraction <= 1):
-            raise ValueError(f"start out of range: {player_hp}, {boss_hp_fraction}")
+        if not (1 <= player_hp <= 6 and 0 < boss_hp_fraction <= 1 and 0 <= bombs <= 99):
+            raise ValueError(f"start out of range: {player_hp}, {boss_hp_fraction}, {bombs} bombs")
+        self.start_bombs = bombs
         if self.restart_run:
             # A new run recreates the player: goto keeps Entity_Player state across episodes (which eye
             # fires next, the player's RNG), and AB+ has no rewind. The global MT19937 seeds the run.
@@ -319,7 +332,8 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             raise BridgeError(f"no champion-free {arena['variant']} room in {MAX_ROOM_ATTEMPTS} attempts")
         (px, py), (bx, by) = arena["player"], arena["boss"]
         result = self.lua(ARENA_LUA.format(px=px, py=py, bx=bx, by=by, rng_seed=int(seed) & 0xFFFFFFFF,
-                                           player_hp=player_hp, boss_hp_fraction=repr(boss_hp_fraction)))
+                                           player_hp=player_hp, boss_hp_fraction=repr(boss_hp_fraction),
+                                           bombs=self.start_bombs, lineage_mode=int(self.lineage_mode)))
         if " curses=0 subtype=0 " not in str(result) or (self.require_reseed and not str(result).endswith("reseeded=1")):
             raise BridgeError(f"arena setup failed: {result}")
         for _ in range(90):
@@ -329,7 +343,8 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
                 if [round(v) for v in enemies[0]["pos"]] != [round(bx), round(by)]:
                     raise BridgeError(f"arena Monstro at {enemies[0]['pos']}, expected {(bx, by)}")
                 player = obs["players"][0]
-                if player["ptype"] != 0 or player["active"] != 0 or player["hearts"] != player_hp:
+                if (player["ptype"] != 0 or player["active"] != 0 or player["hearts"] != player_hp
+                        or player["bombs"] != self.start_bombs):
                     raise BridgeError(f"AB+ arena player initialization failed: {json.dumps(player, sort_keys=True)}")
                 if abs(enemies[0].get("boss_hp", 0.0) - boss_hp_fraction) > 1e-3:
                     raise BridgeError(f"arena Monstro HP {enemies[0].get('boss_hp')} != {boss_hp_fraction}")
@@ -366,7 +381,8 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
         else:
             raise RoomUnusable(f"{command}: no entrance slot accepted (doors {obs['doors']})")
         result = self.lua(ROOM_LUA.format(player_hp=player_hp, boss_hp_fraction=repr(boss_hp_fraction),
-                                          rng_seed=seed & 0xFFFFFFFF))
+                                          rng_seed=seed & 0xFFFFFFFF, bombs=self.start_bombs,
+                                          lineage_mode=int(self.lineage_mode)))
         if str(result).startswith("curses=0 clear=true"):
             raise RoomUnusable(f"{command} is clear at the start: {result}")
         if (not str(result).startswith("curses=0 clear=false") or
@@ -374,7 +390,8 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             raise BridgeError(f"room setup failed ({command}): {result}")
         obs, _, _, _, info = self.step({}, repeat=1)
         player = obs["players"][0]
-        if player["ptype"] != 0 or player["active"] != 0 or player["hearts"] != player_hp:
+        if (player["ptype"] != 0 or player["active"] != 0 or player["hearts"] != player_hp
+                or player["bombs"] != self.start_bombs):
             raise BridgeError(f"room player initialization failed: {json.dumps(player, sort_keys=True)}")
         if obs["room"]["clear"]:
             raise RoomUnusable(f"{command} is clear after the first frame")
@@ -392,20 +409,29 @@ class AbplusTransformerEnv(TransformerMonstroEnv):
     """TransformerMonstroEnv on AB+. deadline=True adds combat-v1's remaining_time input (120 s task).
 
     reset(options={"arena_seed": seed}) takes the simulator's integer arena seed; an optional
-    options["start"] = (player half hearts, Boss HP fraction) applies a training start.
+    options["start"] = (player half hearts, Boss HP fraction) applies a training start and
+    options["bombs"] the bombs the player starts with (default 1, the game's start).
+    combat_state=True adds the combat-v3 room state input (VisibleHistory 'combat'); geometry and
+    factored_actions are combat-v5's inputs (VisibleHistory). The action space stays the bridge's
+    joint one; a factored policy converts with transformer_obs.factored_to_joint / factored_masks.
     """
 
-    def __init__(self, port: int, max_episode_frames: int = 3600, deadline: bool = True, **kwargs):
+    def __init__(self, port: int, max_episode_frames: int = 3600, deadline: bool = True,
+                 combat_state: bool = False, geometry: bool = False, factored_actions: bool = False, **kwargs):
         super().__init__(port=port, max_episode_frames=max_episode_frames,
                          bridge=AbplusTrainingEnv(port=port), **kwargs)
-        if deadline:
-            self.history = VisibleHistory(self.history.history, self.history.capacity, deadline=True)
+        if deadline or combat_state or geometry or factored_actions:
+            self.history = VisibleHistory(self.history.history, self.history.capacity, deadline=deadline,
+                                          combat_state=combat_state, geometry=geometry,
+                                          factored_actions=factored_actions)
             self.observation_space = self.history.space
 
     def reset(self, *, seed=None, options=None):
         options = dict(options or {})
         start = options.pop("start", None)
         self.bridge.pending_start = tuple(start) if start is not None else None
+        bombs = options.pop("bombs", None)
+        self.bridge.pending_bombs = int(bombs) if bombs is not None else None
         return super().reset(seed=seed, options=options)
 
 

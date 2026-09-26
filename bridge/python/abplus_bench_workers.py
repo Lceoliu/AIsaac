@@ -42,10 +42,11 @@ def main():
     recycle = int(sys.argv[6]) if len(sys.argv) > 6 else W.RECYCLE_EPISODES
     if tasks:
         tasks = {k: tasks[k] for k in ('weights', 'normal', 'boss')}
-    frame_bytes = 2 * n * W.FRAME_DTYPE.itemsize
+    frame_dtype, _ = W.frame_layout(profile)
+    frame_bytes = 2 * n * frame_dtype.itemsize
     shm = shared_memory.SharedMemory(create=True, size=frame_bytes + n * W.META_DTYPE.itemsize)
     meta = np.ndarray((n,), W.META_DTYPE, buffer=shm.buf, offset=frame_bytes)
-    frames = np.ndarray((2, n), W.FRAME_DTYPE, buffer=shm.buf)
+    frames = np.ndarray((2, n), frame_dtype, buffer=shm.buf)
     config = dict(num_envs=n, base_seed=1, mode='exact', name='bw', port=27600, nice=nice,
                   start_randomization=None, tasks=tasks, binary_obs=True, reward_profile=profile,
                   recycle_episodes=recycle)

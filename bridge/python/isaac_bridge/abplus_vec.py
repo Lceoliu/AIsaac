@@ -23,8 +23,9 @@ from stable_baselines3.common.vec_env import VecEnv
 
 from . import abplus_worker as W
 from .gpu_env import FULL_START, GpuFrameVecEnv, TransferSlot, sample_start, validate_start_randomization
+from .plr import PrioritizedLevels
 from .sim_vec import FRAME_DTYPE
-from .transformer_obs import ENTITY_CAPACITY, HISTORY, VisibleHistory
+from .transformer_obs import ENTITY_CAPACITY, FACTORED_NVEC, HISTORY, VisibleHistory
 
 if W.FRAME_DTYPE != FRAME_DTYPE:
     raise ImportError('abplus_worker.FRAME_DTYPE differs from sim_vec.FRAME_DTYPE')
@@ -43,7 +44,7 @@ class AbplusChunk:
         # High priority: with asynchronous training the learner's kernels share the GPU.
         self.compute_stream = torch.cuda.Stream(device=owner.device, priority=-1)
         self.ready = torch.cuda.Event()
-        self.slots = [TransferSlot(self.n, owner.device) for _ in range(2)]
+        self.slots = [TransferSlot(self.n, owner.device, owner.frame_dtype) for _ in range(2)]
         self.episodes = np.zeros(self.n, np.int64)
         self.returns = np.zeros(self.n)
         self.lengths = np.zeros(self.n, np.int64)
@@ -120,17 +121,20 @@ class AbplusChunk:
         self.returns += rewards
         self.lengths += 1
         infos = [dict(outcome=W.OUTCOMES[r['outcome']], elapsed_frames=int(r['elapsed']), layout=int(r['layout']),
-                      seed=int(m['seed']), task=W.TASKS[int(m['task'])],
+                      seed=int(m['seed']), task=W.TASKS[int(m['task'])], level=int(m['level']),
                       **{'TimeLimit.truncated': bool(r['truncated'])})
                  for r, m in zip(frames, meta)]
         terminal = np.flatnonzero(dones)
+        components = self.owner.components
         for i in terminal:
             infos[i]['episode'] = {'r': float(self.returns[i]), 'l': int(self.lengths[i])}
-            if self.owner.reward_profile == 'combat-v2':
+            if components:
                 infos[i]['reward_components'] = {k: round(float(v), 4)
-                                                 for k, v in zip(W.COMPONENTS, meta['components'][i])}
+                                                 for k, v in zip(components, meta['components'][i])}
             infos[i]['episode_start'] = {'player_hp': float(meta['start'][i][0]),
-                                         'boss_hp_fraction': float(meta['start'][i][1])}
+                                         'boss_hp_fraction': float(meta['start'][i][1]),
+                                         'bombs': int(meta['bombs'][i])}
+            infos[i]['episode_stats'] = {k: round(float(v), 2) for k, v in zip(W.EPISODE_STATS, meta['stats'][i])}
             self.returns[i] = 0
             self.lengths[i] = 0
             self.episodes[i] += 1
@@ -169,7 +173,8 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
 
     def __init__(self, n=8, seed=1, chunks=1, device='cuda', reward_profile='combat-v2', start_randomization=None,
                  mode='exact', name='tr', port=27400, nice=19, history=HISTORY, capacity=ENTITY_CAPACITY,
-                 startup_timeout=600, tasks=None, binary_obs=True, recycle_episodes=W.RECYCLE_EPISODES):
+                 startup_timeout=600, tasks=None, binary_obs=True, recycle_episodes=W.RECYCLE_EPISODES,
+                 start_bombs=None, plr_levels=None, reward_options=None, lineage_mode=None):
         if reward_profile not in W.REWARD_PROFILES:
             raise ValueError(f'AB+ reward profiles are {W.REWARD_PROFILES} (deadline observation)')
         if not 1 <= chunks <= n:
@@ -186,16 +191,42 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
         self.record_states = False
         self.training_seeds = False
         self.closed = True
-        VecEnv.__init__(self, n, VisibleHistory(history, capacity, deadline=True).space, spaces.MultiDiscrete([45, 2, 2]))
-        frame_bytes = 2 * n * W.FRAME_DTYPE.itemsize
+        self.components = {'combat-v2': W.COMPONENTS, 'combat-v3': W.COMPONENTS_V3,
+                           'combat-v4': W.COMPONENTS_V4, 'combat-v5': W.COMPONENTS_V5}.get(reward_profile)
+        # combat-v3 frames add the room state input (abplus_worker.FRAME_DTYPE_COMBAT).
+        self.frame_dtype, _ = W.frame_layout(reward_profile)
+        # start_bombs {'zero_prob', 'max'}: training bomb start (abplus_worker.sample_bombs); None: 1.
+        self.start_bombs = dict(start_bombs) if start_bombs else None
+        options = W.observation_options(reward_profile)
+        # combat-v5: the policy's heads are (move, shoot, bomb, item); the workers keep the joint layout.
+        self.factored_actions = bool(options.get('factored_actions'))
+        VecEnv.__init__(self, n, VisibleHistory(history, capacity, **options).space,
+                        spaces.MultiDiscrete(FACTORED_NVEC if self.factored_actions else [45, 2, 2]))
+        frame_bytes = 2 * n * self.frame_dtype.itemsize
         self.shm = shared_memory.SharedMemory(create=True, size=frame_bytes + n * W.META_DTYPE.itemsize)
-        self.staging = np.ndarray((2, n), dtype=W.FRAME_DTYPE, buffer=self.shm.buf)
+        self.staging = np.ndarray((2, n), dtype=self.frame_dtype, buffer=self.shm.buf)
         self.meta = np.ndarray((n,), dtype=W.META_DTYPE, buffer=self.shm.buf, offset=frame_bytes)
         self.meta[...] = np.zeros((), W.META_DTYPE)
+        # plr_levels: the rooms Prioritized Level Replay draws from (plr.mixture_levels); the learner
+        # writes their probabilities with set_level_probabilities(), workers read them per episode.
+        self.plr_levels = [list(level) for level in plr_levels] if plr_levels else None
+        self.plr_shm = self.level_probabilities = None
+        if self.plr_levels:
+            if not tasks:
+                raise ValueError('plr_levels need the tasks spec (its kind weights)')
+            self.plr_shm = shared_memory.SharedMemory(create=True, size=8 * len(self.plr_levels))
+            self.level_probabilities = np.ndarray((len(self.plr_levels),), np.float64, buffer=self.plr_shm.buf)
+            # The workers' first episodes start before the learner writes PLR's distribution: the
+            # mixture's kind weights over rooms not played yet (not uniform over all rooms).
+            self.level_probabilities[:] = PrioritizedLevels(self.plr_levels, tasks['weights']).probabilities()
         # tasks: abplus_tasks spec {'weights', 'normal', 'boss'}; None trains the Monstro arena only.
         config = dict(num_envs=n, base_seed=seed, mode=mode, name=name, port=port, nice=nice,
                       start_randomization=self.start_randomization, tasks=tasks, binary_obs=binary_obs,
-                      reward_profile=reward_profile, recycle_episodes=recycle_episodes)
+                      reward_profile=reward_profile, recycle_episodes=recycle_episodes,
+                      start_bombs=self.start_bombs, plr_levels=self.plr_levels,
+                      plr_shm=self.plr_shm.name if self.plr_shm else None,
+                      reward_options=dict(reward_options or {}),
+                      **({'lineage_mode': int(lineage_mode)} if lineage_mode is not None else {}))
         ctx = mp.get_context('spawn')
         self.conns, self.procs = [], []
         self.closed = False
@@ -290,6 +321,23 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
         del self.staging, self.meta
         self.shm.close()
         self.shm.unlink()
+        if self.plr_shm is not None:
+            self.level_probabilities = None
+            self.plr_shm.close()
+            self.plr_shm.unlink()
+
+    def transfer_actions(self, actions):
+        """Factored policy actions (move, shoot, bomb, item) -> the workers' (joint, bomb, item)."""
+        if not self.factored_actions:
+            return actions
+        return torch.stack([actions[:, 0] * 5 + actions[:, 1], actions[:, 2], actions[:, 3]], -1)
+
+    def set_level_probabilities(self, p):
+        """Room distribution of the next episodes (PLR); workers read it at every episode start."""
+        p = np.asarray(p, np.float64)
+        if self.level_probabilities is None or p.shape != self.level_probabilities.shape:
+            raise ValueError('set_level_probabilities needs plr_levels and one probability per level')
+        self.level_probabilities[:] = p / p.sum()
 
     def get_attr(self, name, indices=None):
         return [None if name == 'render_mode' else getattr(self, name) for _ in self._get_indices(indices)]

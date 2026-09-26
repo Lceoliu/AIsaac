@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from .gpu_env import decode_frame
-from .gpu_ppo import FrameSampler
+from .gpu_ppo import FrameSampler, action_masks
 
 HUGE_NEG = -1e8   # sb3_contrib MaskableCategorical's masked logit
 
@@ -38,7 +38,6 @@ class GraphFrameSampler(FrameSampler):
     def __init__(self, model, check_every=1024):
         super().__init__(model)
         self.check_every = check_every
-        self.nvec = [int(n) for n in self.env.action_space.nvec]
         self.device = model.device
         self.graphs = None                      # per chunk: dict(encode=..., act=...)
         self.captured = None                    # the policy the graphs read
@@ -69,7 +68,7 @@ class GraphFrameSampler(FrameSampler):
 
     def _capture_chunk(self, i):
         chunk, ids = self.env.chunks[i], self.workers[i]
-        raw = decode_frame(chunk.slots[0].device, self.env.observation_space)
+        raw = decode_frame(chunk.slots[0].device, self.env.observation_space, self.env.frame_dtype)
         inputs = {k: v.clone() for k, v in raw.items()}
         encode = self._graph(lambda: self.encoder.encode_frame_static(inputs))
         # Shape (1,), not a 0-dim tensor: indexing with a 0-dim integer tensor turns it into a Python int
@@ -89,9 +88,7 @@ class GraphFrameSampler(FrameSampler):
         elapsed = b.frames['time'][times, ids[:, None]].masked_fill(~valid, 0)
         seq = self.encoder.temporal_features(fused, elapsed, valid)
         latent = seq[torch.arange(len(ids), device=self.device), valid.long().sum(-1) - 1]
-        masks = torch.ones((len(ids), sum(self.nvec)), dtype=torch.bool, device=self.device)
-        masks[:, 46] = b.frames['player'][position, ids, 9] > 0
-        masks[:, 48] = False
+        masks = action_masks(self.nvec, b.frames['player'][position, ids, 9] > 0)
         pi, vf = policy.mlp_extractor(latent)
         logits = torch.where(masks, policy.action_net(pi), torch.full_like(masks, HUGE_NEG, dtype=torch.float32))
         noise = torch.rand(logits.shape, device=self.device).clamp_(1e-10, 1 - 1e-7)
