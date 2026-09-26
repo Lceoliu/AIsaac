@@ -63,7 +63,7 @@ python .\rl\bridge\python\test_turbo_control.py  # Python 端共享内存双向�
 
 ## 下一步
 
-0. **（待决定）修模拟器的 Monstro 出场阶段。** `new_monstro` 缺 `FLAG_APPEAR`；J460 录像和 AB+ 里，Monstro 开局约 30 帧不行动。修复后用 256 个种子重评 u425 和新实验的检查点，确认胜率是否依赖开局炸弹。证据见 [bridge/abplus/README.md](bridge/abplus/README.md#迁移评估u425-在-ab-上2026-09-24)。
+0. **（待决定）修模拟器的 Monstro 出场阶段。** `new_monstro` 缺 `FLAG_APPEAR`；J460 录像和 AB+ 里，Monstro 开局约 30 帧不行动。修复后用 256 个种子重评 u425 和新实验的检查点，确认胜率是否依赖开局炸弹。证据见 [bridge/abplus/EXPERIMENTS.md](bridge/abplus/EXPERIMENTS.md#a2-u425-迁移评估2026-09-24) 的 A2。
 1. 观察新配置：价值拟合是否恢复（EV/价值损失）、满血开局训练局胜率，以及256种子验证集（2147483728–2147483983）上的满血确定性/随机胜率。训练曲线须按每局`start`字段分开统计。
 2. 若满血表现停滞，再单独调整一项：开局随机化比例、熵系数或清房奖励权重。帧编码去重之后，时序Transformer成为更新的主要耗时。
 3. 稳定单房间学习后，用原版留出场景做迁移验收；2147500000起的种子保留为最终测试。真人录制/BC数据保留，暂不继续模仿学习。
