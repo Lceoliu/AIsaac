@@ -65,6 +65,7 @@ class Room:
     shape: int
     spawns: list[Spawn] = field(repr=False)
     flags: int = 0
+    door_list: list = field(default_factory=list, repr=False)   # (x, y, slot bit) of the STB doors that exist
 
 
 def door_bit(x: int, y: int, shape: int) -> int:
@@ -138,11 +139,13 @@ def parse_stb(data: bytes, stage: int) -> list[Room]:
         weight, width, height, shape, door_count, spawn_count = struct.unpack_from('<fBBBBH', data, pos)
         pos += 10
         doors = 0
+        door_list = []
         for _ in range(door_count):
             x, y, exists = struct.unpack_from('<hhB', data, pos)
             pos += 5
             if exists:
                 doors |= door_bit(x, y, shape)
+                door_list.append((x, y, door_bit(x, y, shape)))
         spawns = []
         for _ in range(spawn_count):
             x, y, n = struct.unpack_from('<hhB', data, pos)
@@ -156,7 +159,7 @@ def parse_stb(data: bytes, stage: int) -> list[Room]:
             spawns.append(Spawn(x, y, entries, float(total)))
         w = F32(weight)
         rooms.append(Room(stage, rtype, variant, subtype, name, difficulty, w, w, doors, width, height,
-                          shape, spawns, _post_flags(stage, variant)))
+                          shape, spawns, _post_flags(stage, variant), door_list))
     if pos != len(data):
         raise ValueError(f'trailing bytes after {count} rooms: {len(data) - pos}')
     return rooms

@@ -17,14 +17,24 @@ Super secret room: the deepest dead end left after the boss room, reshaped to a 
 always touches exactly one room, a normal room. Its position is not determined by the visible map,
 so we weight the candidate cells with a small table fitted on generated floors (see
 tools/fit_super_secret.py) and marginalise the secret-room posterior over it.
+
+Layout evidence (LayoutEvidence / hidden_posterior): normal rooms get their layouts after both
+hidden rooms are placed, from RoomConfig::GetRandomRoom with the room's connections as required
+doors, and that call prefers layouts whose door slots equal the required doors exactly (factor
+9.99). A normal room whose layout has a door slot on a wall with no visible door is therefore
+evidence of a hidden room behind that wall, and a layout without the slot rules the cell out. In
+AB+ no two normal layouts share their visible content but differ in door slots, so a player who
+recognises the room knows its slots.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from math import comb
 
 from .floor import Floor, FloorRoom
 from .level import ROOM_BOSS, ROOM_DEFAULT, ROOM_SECRET, ROOM_SUPERSECRET
 from .levelgen import GRID, ROOM_SIZE, TRAVEL, door_target, index
+from .roomconfig import EXACT_DOORS_FACTOR, SHAPE_ANY, stage_id
 
 SCORE_BASE, SCORE_SPAN = 10, 5
 OFFSETS = {1: -6, 2: -3}          # neighbour count -> score offset (3 or 4 neighbours: 0)
@@ -142,6 +152,7 @@ def super_secret_candidates(floor: Floor) -> dict[int, dict]:
             if floor.room(i).type != ROOM_BOSS and floor.room(i).grid_index != floor.start
             and len(floor.neighbors(floor.room(i))) == 1]
     deepest = max((dist[r.index] for r in dead), default=0)
+    boss_depth = max((dist[r.index] for r in floor.rooms if r.type == ROOM_BOSS and r.index in dist), default=0)
     out = {}
     for i in range(GRID * GRID):
         if floor.grid[i] >= 0:
@@ -159,19 +170,25 @@ def super_secret_candidates(floor: Floor) -> dict[int, dict]:
             continue
         out[i] = dict(parent=parent.index, depth=dist[parent.index] + 1,
                       delta=dist[parent.index] + 1 - deepest,
+                      boss_delta=dist[parent.index] + 1 - boss_depth,
                       parent_is_start=parent.grid_index == floor.start)
     return out
 
 
 # Relative weights per delta, fitted by tools/fit_super_secret.py (conditional-logit MLE on 11,896
 # floors of 1,500 generated runs, stages 1-8, seed 1). Keys are clipped to [-2, 3].
-SUPER_SECRET_DELTA_WEIGHTS = {-2: 0.0082, -1: 0.0489, 0: 1.0, 1: 1.504, 2: 1.4456, 3: 0.9732}
+SUPER_SECRET_DELTA_WEIGHTS = {-2: 0.0126, -1: 0.0466, 0: 1.0, 1: 1.6891, 2: 1.1624, 3: 0.4776}
+# Depth relative to the boss room, clipped to [-3, 1] (the boss takes the deepest dead end first).
+SUPER_SECRET_BOSS_WEIGHTS = {-3: 0.2968, -2: 0.9324, -1: 1.4996, 0: 1.0, 1: 0.1865}
 
 
-def super_secret_prior(floor: Floor, weights: dict[int, float] | None = None) -> dict[int, float]:
+def super_secret_prior(floor: Floor, weights: dict[int, float] | None = None,
+                       boss_weights: dict[int, float] | None = None) -> dict[int, float]:
     weights = weights or SUPER_SECRET_DELTA_WEIGHTS
+    boss_weights = boss_weights or SUPER_SECRET_BOSS_WEIGHTS
     cands = super_secret_candidates(floor)
-    raw = {c: weights[max(-2, min(3, f['delta']))] for c, f in cands.items()}
+    raw = {c: weights[max(-2, min(3, f['delta']))] * boss_weights[max(-3, min(1, f['boss_delta']))]
+           for c, f in cands.items()}
     total = sum(raw.values())
     return {c: w / total for c, w in raw.items()} if total > 0 else {}
 
@@ -252,3 +269,139 @@ def expected_bombs(posterior: dict[int, float], truth: int) -> float:
         return float('nan')
     higher, ties = _rank(posterior, truth)
     return higher + (ties + 1) / 2
+
+
+# ------------------------------------------------------------------------------ layout evidence
+class LayoutEvidence:
+    """P(layout | required doors) for the normal rooms of one floor kind, from GetRandomRoom's rule
+    (float32 details and the in-floor weight decay are ignored) and the stage's room pool, filtered
+    like Level::generate_dungeon (normal-mode difficulty ranges, 1-15 fallback)."""
+
+    def __init__(self, room_config, stage: int, stage_type: int, hard: bool = False):
+        sid = stage_id(stage, stage_type)
+        if hard:
+            max_d, min_d = (15, 10) if stage < 9 and stage % 2 == 0 else (5, 5)
+        else:
+            max_d, min_d = (10, 5) if stage < 9 and stage % 2 == 0 else (5, 1)
+        pool = room_config.get_rooms(sid, ROOM_DEFAULT, SHAPE_ANY, 0, 0xFFFFFFFF, min_d, max_d, 0, -1)
+        if len(pool) < 20:
+            pool = room_config.get_rooms(sid, ROOM_DEFAULT, SHAPE_ANY, 0, 0xFFFFFFFF, 1, 15, 0, -1)
+        min_variant = int(stage == 11)
+        self.by_shape: dict[int, list] = defaultdict(list)
+        self.layout: dict[tuple, tuple] = {}
+        for r in pool:
+            if r.variant >= min_variant:
+                self.by_shape[r.shape].append((r.doors, float(r.initial_weight)))
+                self.layout[(r.shape, r.variant)] = (r.doors, float(r.initial_weight))
+        self._totals: dict = {}
+        self.factor = float(EXACT_DOORS_FACTOR)
+
+    def known(self, room: FloorRoom) -> bool:
+        return (room.shape, room.variant) in self.layout
+
+    def prob(self, room: FloorRoom, required: int) -> float:
+        doors, weight = self.layout[(room.shape, room.variant)]
+        if required & doors != required:
+            return 0.0
+        key = (room.shape, required)
+        if key not in self._totals:
+            total = exact = 0.0
+            for d, w in self.by_shape[room.shape]:
+                if required & d == required:
+                    total += w
+                    if d == required:
+                        exact += w
+            self._totals[key] = (total, exact)
+        total, exact = self._totals[key]
+        p_exact = min(1.0, self.factor * exact / total) if exact > 0 else 0.0
+        p = (1.0 - p_exact) * weight / total
+        if doors == required:
+            p += p_exact * weight / exact
+        return p
+
+
+def _facing_slots(floor: Floor) -> dict[int, list]:
+    """cell -> [(normal room, slot bits)] for every empty cell that a normal room (not the start
+    room, whose layout is fixed) has a door target in."""
+    out: dict[int, dict] = defaultdict(dict)
+    for r in floor.rooms:
+        if r.type != ROOM_DEFAULT or r.grid_index == floor.start:
+            continue
+        for slot in range(8):
+            t = r.slot_target(slot)
+            if t >= 0 and floor.grid[t] < 0:
+                out[t][r.index] = out[t].get(r.index, 0) | (1 << slot)
+    return {c: [(floor.room(i), bits) for i, bits in m.items()] for c, m in out.items()}
+
+
+def hidden_posterior(floor: Floor, evidence: LayoutEvidence | None = None,
+                     ss_prior: dict[int, float] | None = None,
+                     secret_cell: int | None = None) -> tuple[dict[int, float], dict[int, float]]:
+    """Joint posterior of the secret room cell c and the super secret room cell h given the visible
+    floor, returned as the two marginals (P(secret at c), P(super secret at h)).
+
+    P(c, h) is proportional to prior(h) * P_rules(c | h) * the product over normal rooms R next to
+    c or h of P(layout_R | visible doors_R + slots to c and h) / P(layout_R | visible doors_R).
+    Without `evidence` this is secret_posterior / super_secret_prior. `secret_cell` conditions on a
+    secret room already found there (it must not be part of `floor`).
+    """
+    prior = ss_prior if ss_prior is not None else super_secret_prior(floor)
+    if not prior:
+        prior = {None: 1.0}
+    facing = _facing_slots(floor) if evidence is not None else {}
+    base: dict[int, float] = {}
+
+    def layout_factor(cells) -> float:
+        extra: dict[int, list] = {}
+        for cell in cells:
+            for room, bits in facing.get(cell, ()):
+                if evidence.known(room):
+                    extra.setdefault(room.index, [room, 0])[1] |= bits
+        f = 1.0
+        for room, bits in extra.values():
+            if room.index not in base:
+                base[room.index] = evidence.prob(room, room.doors)
+            if base[room.index] > 0:
+                f *= evidence.prob(room, room.doors | bits) / base[room.index]
+            if f == 0.0:
+                break
+        return f
+
+    joint: dict[tuple, float] = {}
+    for h, ph in prior.items():
+        rule = secret_given_super_secret(floor, h)
+        for c, pc in rule.items():
+            if secret_cell is not None and c != secret_cell:
+                continue
+            w = ph * pc
+            if w > 0 and evidence is not None:
+                w *= layout_factor([c] if h is None else [c, h])
+            if w > 0:
+                joint[(c, h)] = w
+    total = sum(joint.values())
+    if total <= 0:
+        return {}, {}
+    ps: dict[int, float] = defaultdict(float)
+    pss: dict[int, float] = defaultdict(float)
+    for (c, h), w in joint.items():
+        ps[c] += w / total
+        if h is not None:
+            pss[h] += w / total
+    return dict(ps), dict(pss)
+
+
+def wall_slot_heuristic(floor: Floor) -> dict[int, float]:
+    """Player rule of thumb: cells behind walls where a recognised normal-room layout has a door
+    slot but shows no door come first (more such walls first), then cells with more neighbours."""
+    facing = _facing_slots(floor)
+    out = {}
+    for i in range(GRID * GRID):
+        if floor.grid[i] >= 0:
+            continue
+        x, y = i % GRID, i // GRID
+        nbs = sum(1 for dx, dy in TRAVEL if (j := index(x + dx, y + dy)) >= 0 and floor.grid[j] >= 0)
+        if not nbs:
+            continue
+        slots = sum(1 for room, bits in facing.get(i, ()) if room.layout_doors & bits)
+        out[i] = slots * 10 + nbs
+    return out

@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AB+ 楼层生成器</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <h1>AB+ 楼层生成器</h1>
+    <p class="sub">输入种子，离线生成《以撒的结合：胎衣†》v1.06 每一层的地图</p>
+  </div>
+  <form id="controls" class="controls" autocomplete="off">
+    <label class="field seed">
+      <span>种子</span>
+      <input id="seed" name="seed" type="text" placeholder="例如 DXNH NZLG" spellcheck="false">
+    </label>
+    <button type="button" id="random" class="ghost" title="随机一个种子">随机</button>
+    <label class="field">
+      <span>开局方式</span>
+      <select id="mode" name="mode">
+        <option value="debug">调试开局（RL 实例：地下室 I）</option>
+        <option value="normal">正常开局（输入种子开新局）</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>第 5 章路线</span>
+      <select id="route" name="route">
+        <option value="sheol">阴间 → 暗室</option>
+        <option value="cathedral">教堂 → 玩具箱</option>
+      </select>
+    </label>
+    <label class="field">
+      <span>生成到</span>
+      <select id="last" name="last">
+        <option value="11">第 11 层</option>
+        <option value="8">第 8 层</option>
+      </select>
+    </label>
+    <details class="field resources">
+      <summary>玩家资源</summary>
+      <div class="res-grid">
+        <label>硬币<input id="coins" type="number" min="0" max="99" value="0"></label>
+        <label>钥匙<input id="keys" type="number" min="0" max="99" value="0"></label>
+        <label>红心<input id="hearts" type="number" min="0" max="24" value="6"></label>
+        <label>心之容器<input id="max_hearts" type="number" min="0" max="24" value="6"></label>
+        <label>魂心<input id="soul" type="number" min="0" max="24" value="0"></label>
+        <p class="hint">单位是半颗心。每层都按这组资源生成：硬币 ≥ 5 时偶数层可能出赌博房或宝库，钥匙 ≥ 2 提高骰子房和宝库的概率，满血才出挑战房，低血才可能出卧室。</p>
+      </div>
+    </details>
+    <button type="submit" id="go" class="primary">生成</button>
+  </form>
+</header>
+
+<div id="status" class="status" role="status"></div>
+
+<main id="app" hidden>
+  <section class="summary">
+    <div id="seedline" class="seedline"></div>
+    <nav id="floors" class="floors" aria-label="楼层"></nav>
+  </section>
+
+  <section class="workspace">
+    <div class="mapcol">
+      <div class="maphead">
+        <h2 id="floortitle"></h2>
+        <div class="toggles">
+          <label><input type="checkbox" id="t-hidden" checked> 显示隐藏房</label>
+          <label><input type="checkbox" id="t-player"> 玩家视角 + 隐藏房概率</label>
+          <label><input type="checkbox" id="t-depth"> 生成深度</label>
+        </div>
+      </div>
+      <div id="mapwrap" class="mapwrap"><svg id="map" role="img" aria-label="楼层地图"></svg></div>
+      <div id="legend" class="legend"></div>
+    </div>
+
+    <aside class="sidecol">
+      <div class="card" id="floorinfo"></div>
+      <div class="card" id="roominfo">
+        <p class="muted">点击地图上的房间查看详情和布局。</p>
+      </div>
+    </aside>
+  </section>
+</main>
+
+<footer class="foot">
+  <p>生成器逐函数翻译自 AB+ v1.06 的楼层生成代码。已与引擎核对：9,774 个地下室种子的引擎日志逐一一致；6,000 个引擎整层导出（第 1–8、10、11 层的全部变体）逐房间一致，包括隐藏房和超级隐藏房的位置。
+  核对条件：全部成就解锁、以撒、没有饰品。依赖饰品和道具的分支（银元、血冠、碎卡片、黑蜡烛等），以及正常开局时第一层的类型选择，还没在引擎里核对。</p>
+  <p>"隐藏房概率"只用玩家看得见的信息计算：地图、各房间的布局及其门位（布局可以从房间内容认出），再按生成规则推断隐藏房和超级隐藏房的联合后验。它和种子无关。在引擎楼层上，按它炸墙第 1 颗就炸中隐藏房的概率是 88%，超级隐藏房是 76%。</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>
