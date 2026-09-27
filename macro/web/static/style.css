@@ -29,9 +29,14 @@
   --t-vault: #b8975a;
   --t-dice: #4f86b0;
   --t-bedroom: #a07aa0;
+  --t-planetarium: #2fb3cf;
+  --t-ultrasecret: #d4508f;
   --t-other: #6f6f6f;
   --heat: #ffcf40;
   --heat-ss: #c9a4ff;
+  --heat-us: #ff7eb6;
+  --warn-bg: #fbe3c4;
+  --warn-ink: #7a3d00;
   --sel: #ffffff;
   --tile-floor: #3b342a;
   --tile-wall: #1c1914;
@@ -51,12 +56,15 @@
     --map-bg: #110f0c;
     --cell-empty: #1a1713;
     --grid-line: #24201a;
+    --warn-bg: #4a2e10;
+    --warn-ink: #ffcf96;
     color-scheme: dark;
   }
 }
 :root[data-theme="dark"] {
   --bg: #15130f; --panel: #1e1b16; --panel-2: #26221b; --ink: #ece6da; --muted: #a39b8b; --line: #37312a;
   --accent: #d0553f; --focus: #6fb0ff; --map-bg: #110f0c; --cell-empty: #1a1713; --grid-line: #24201a;
+  --warn-bg: #4a2e10; --warn-ink: #ffcf96;
   color-scheme: dark;
 }
 
@@ -105,6 +113,7 @@ main { padding: 16px 20px 8px; }
 .summary { margin-bottom: 14px; }
 .seedline { display: flex; flex-wrap: wrap; gap: 6px 18px; color: var(--muted); margin-bottom: 10px; }
 .seedline b { color: var(--ink); font-family: ui-monospace, Consolas, monospace; letter-spacing: .06em; }
+.badge { background: var(--warn-bg); color: var(--warn-ink); border-radius: 4px; padding: 0 8px; font-size: 12px; font-weight: 600; cursor: help; }
 .floors { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 6px; }
 .floorbtn {
   flex: 0 0 auto; display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 8px 8px 6px;

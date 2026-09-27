@@ -9,7 +9,7 @@ const TYPE_COLOR = {
   1: '--room', 2: '--t-shop', 3: '--t-other', 4: '--t-treasure', 5: '--t-boss', 6: '--t-miniboss',
   7: '--t-secret', 8: '--t-supersecret', 9: '--t-arcade', 10: '--t-curse', 11: '--t-challenge',
   12: '--t-library', 13: '--t-sacrifice', 18: '--t-bedroom', 19: '--t-bedroom', 20: '--t-vault',
-  21: '--t-dice',
+  21: '--t-dice', 24: '--t-planetarium', 29: '--t-ultrasecret',
 };
 const LEGEND = [
   ['--t-start', '起始房间'], ['--room', '普通'], ['--t-boss', '头目房'], ['--t-treasure', '宝箱房'],
@@ -17,6 +17,17 @@ const LEGEND = [
   ['--t-miniboss', '小头目房'], ['--t-challenge', '挑战房'], ['--t-library', '图书馆'], ['--t-sacrifice', '献祭房'],
   ['--t-arcade', '赌博房'], ['--t-vault', '宝库'], ['--t-dice', '骰子房'], ['--t-bedroom', '卧室'],
 ];
+const LEGEND_REP = [['--t-planetarium', '星象房'], ['--t-ultrasecret', '究极隐藏房']];
+// hidden-room heat layers: [JSON key, map tag, colour, legend]
+const HEAT = [
+  ['secret_posterior', '隐', '--heat', '隐藏房概率'],
+  ['super_secret_posterior', '超', '--heat-ss', '超级隐藏房概率'],
+  ['ultra_secret_posterior', '极', '--heat-us', '究极隐藏房概率'],
+];
+const GAME_TEXT = {
+  abplus: { sub: '输入种子，离线生成《以撒的结合：胎衣†》v1.06 每一层的地图', title: '胎衣†' },
+  repplus: { sub: '输入种子，离线生成《以撒的结合：忏悔+》v1.9.7.17 每一层的地图（静态移植，未经游戏验证）', title: '忏悔+' },
+};
 const KIND = {
   rock: ['#8a8175', '石头类'], poop: ['#7a5230', '大便'], tnt: ['#b0412e', '炸药桶'], block: ['#9aa3ad', '方块'],
   pit: ['#050404', '沟壑'], spikes: ['#7d2020', '地刺'], web: ['#cfcfcf', '蛛网'], plate: ['#3d6fb0', '按钮'],
@@ -50,15 +61,22 @@ function hex(n) { return '0x' + (n >>> 0).toString(16).toUpperCase().padStart(8,
 // ---------------------------------------------------------------------------- requests
 function readParams() {
   return {
-    seed: $('seed').value.trim(), mode: $('mode').value, route: $('route').value, last: $('last').value,
-    coins: $('coins').value, keys: $('keys').value, hearts: $('hearts').value,
+    game: $('game').value, seed: $('seed').value.trim(), mode: $('mode').value, route: $('route').value,
+    last: $('last').value, coins: $('coins').value, keys: $('keys').value, hearts: $('hearts').value,
     max_hearts: $('max_hearts').value, soul: $('soul').value,
   };
 }
 function writeParams(p) {
-  for (const k of ['seed', 'mode', 'route', 'last', 'coins', 'keys', 'hearts', 'max_hearts', 'soul']) {
+  for (const k of ['game', 'seed', 'mode', 'route', 'last', 'coins', 'keys', 'hearts', 'max_hearts', 'soul']) {
     if (p.get(k) !== null && $(k)) $(k).value = p.get(k);
   }
+  if (!GAME_TEXT[$('game').value]) $('game').value = 'abplus';
+}
+function applyGame() {
+  const game = $('game').value;
+  $('subtitle').textContent = GAME_TEXT[game].sub;
+  document.title = `以撒楼层生成器 · ${GAME_TEXT[game].title}`;
+  for (const f of document.querySelectorAll('footer[data-game]')) f.hidden = f.dataset.game !== game;
 }
 function setStatus(text, error = false) {
   const s = $('status');
@@ -127,23 +145,20 @@ function drawFloor(svg, floor, opts) {
   // heat map of hidden-room probabilities (player view)
   if (heat) {
     const gh = el('g', {}, svg);
-    const cells = new Set([...Object.keys(floor.secret_posterior), ...Object.keys(floor.super_secret_prior)]);
+    const layers = HEAT.filter(([key]) => floor[key] && Object.keys(floor[key]).length);
+    const cells = new Set(layers.flatMap(([key]) => Object.keys(floor[key])));
     for (const key of cells) {
       const c = Number(key);
       if (byCell.has(c)) continue;
       const [x, y] = pos(c);
-      const ps = floor.secret_posterior[key] || 0;
-      const pss = floor.super_secret_prior[key] || 0;
-      if (ps < 0.01 && pss < 0.01) continue;
-      const main = ps >= pss ? ['--heat', ps] : ['--heat-ss', pss];
+      const lines = layers.map(([k, tag, col]) => [tag, floor[k][key] || 0, col]).filter(([, p]) => p >= 0.01);
+      if (!lines.length) continue;
+      const main = lines.reduce((a, b) => (b[1] > a[1] ? b : a));
       el('rect', { x: x + gap / 2, y: y + gap / 2, width: S - gap, height: S - gap, rx: S * 0.08,
-        fill: css(main[0]), 'fill-opacity': 0.12 + 0.6 * Math.min(1, main[1] / 0.5) }, gh);
-      const lines = [];
-      if (ps >= 0.01) lines.push(['隐', ps, '--heat']);
-      if (pss >= 0.01) lines.push(['超', pss, '--heat-ss']);
-      lines.forEach(([tag, p, col], i) => {
-        const t = el('text', { x: x + S / 2, y: y + S / 2 + (i - (lines.length - 1) / 2) * S * 0.28 + S * 0.09,
-          'text-anchor': 'middle', 'font-size': S * 0.22, fill: css('--label'), 'font-weight': 600 }, gh);
+        fill: css(main[2]), 'fill-opacity': 0.12 + 0.6 * Math.min(1, main[1] / 0.5) }, gh);
+      lines.forEach(([tag, p], i) => {
+        const t = el('text', { x: x + S / 2, y: y + S / 2 + (i - (lines.length - 1) / 2) * S * 0.26 + S * 0.08,
+          'text-anchor': 'middle', 'font-size': S * 0.21, fill: css('--label'), 'font-weight': 600 }, gh);
         t.textContent = `${tag}${Math.round(p * 100)}%`;
       });
     }
@@ -221,15 +236,19 @@ function render() {
   $('app').hidden = false;
   const modeText = d.mode === 'debug' ? '调试开局' : '正常开局';
   const parts = [
-    ['种子 ', d.seed.text], ['数字 ', String(d.seed.value)], ['', modeText],
+    ['', `${d.game_name} ${d.version}`], ['种子 ', d.seed.text], ['数字 ', String(d.seed.value)], ['', modeText],
     ['', `${d.floors.length} 层，${d.floors.reduce((a, f) => a + f.rooms.length, 0)} 个房间，${d.ms} ms`],
   ];
-  $('seedline').replaceChildren(...parts.map(([k, v]) => {
+  const line = parts.map(([k, v]) => {
     const s = html('span', {}, k);
     const b = html('b', {}, v);
     s.appendChild(b);
     return s;
-  }));
+  });
+  if (!d.validated) {
+    line.splice(1, 0, html('span', { class: 'badge', title: '静态移植，只做过一致性检查，还没和游戏本体核对' }, '未经游戏验证'));
+  }
+  $('seedline').replaceChildren(...line);
 
   const nav = $('floors');
   nav.replaceChildren();
@@ -265,23 +284,20 @@ function renderFloor() {
 }
 
 function renderLegend(player) {
-  const lg = $('legend');
-  lg.replaceChildren(...LEGEND.map(([v, name]) => {
+  const rep = state.data.game === 'repplus';
+  const items = LEGEND.concat(rep ? LEGEND_REP : []);
+  if (player) {
+    for (const [, , col, name] of HEAT) {
+      if (rep || col !== '--heat-us') items.push([col, name]);
+    }
+  }
+  $('legend').replaceChildren(...items.map(([v, name]) => {
     const s = html('span');
     const i = html('i');
     i.style.background = css(v);
     s.append(i, name);
     return s;
   }));
-  if (player) {
-    for (const [v, name] of [['--heat', '隐藏房概率'], ['--heat-ss', '超级隐藏房概率']]) {
-      const s = html('span');
-      const i = html('i');
-      i.style.background = css(v);
-      s.append(i, name);
-      lg.appendChild(s);
-    }
-  }
 }
 
 function kvList(rows) {
@@ -337,10 +353,11 @@ async function selectRoom(index) {
     html('div', { class: 'layoutbox', id: 'layoutbox' }, '加载布局…'),
   );
   try {
-    const key = `${r.file}.${r.type}.${r.variant}`;
+    const game = state.data.game;
+    const key = `${game}.${r.file}.${r.type}.${r.variant}`;
     let lay = state.layoutCache.get(key);
     if (!lay) {
-      const res = await fetch(`/api/layout?stage=${r.file}&type=${r.type}&variant=${r.variant}`);
+      const res = await fetch(`/api/layout?game=${game}&stage=${r.file}&type=${r.type}&variant=${r.variant}`);
       lay = await res.json();
       if (!res.ok) throw new Error(lay.error || res.statusText);
       state.layoutCache.set(key, lay);
@@ -409,6 +426,10 @@ $('random').addEventListener('click', async () => {
 for (const id of ['t-hidden', 't-player', 't-depth']) {
   $(id).addEventListener('change', () => { if (state.data) renderFloor(); });
 }
+$('game').addEventListener('change', () => {
+  applyGame();
+  if ($('seed').value.trim()) generate(true);
+});
 document.addEventListener('keydown', (e) => {
   if (!state.data || ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
   if (e.key === 'ArrowRight' && state.floor < state.data.floors.length - 1) { state.floor++; state.room = null; render(); }
@@ -418,4 +439,5 @@ window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () 
 
 const initial = new URLSearchParams(location.search);
 writeParams(initial);
+applyGame();
 if (initial.get('seed')) generate(true);

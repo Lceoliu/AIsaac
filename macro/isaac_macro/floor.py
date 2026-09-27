@@ -40,6 +40,7 @@ class FloorRoom:
     difficulty: int = 0
     name: str = ''
     cells: tuple = field(default=())
+    file: int = -1             # room file (stage id) of the layout; -1 = unknown
 
     def __post_init__(self):
         if not self.cells:
@@ -79,13 +80,16 @@ class Floor:
         gen = level.generator
         rooms = []
         for d in level.rooms:
+            # J460 descriptors can lie off the grid (negative index) or in another dimension
+            if d.grid_index < 0 or d.config is None or getattr(d, 'dimension', 0) != 0:
+                continue
             x, y = d.grid_index % GRID, d.grid_index // GRID
             depth = -1
             if gen is not None and gen.grid[d.safe_grid_index] >= 0:
                 depth = gen.rooms[gen.grid[d.safe_grid_index]].depth
             cfg = d.config
             rooms.append(FloorRoom(d.list_index, x, y, d.shape, cfg.type, cfg.variant, cfg.subtype,
-                                   cfg.doors, 0, depth, cfg.difficulty, cfg.name))
+                                   cfg.doors, 0, depth, cfg.difficulty, cfg.name, file=cfg.stage))
         return cls(rooms, level.stage, level.stage_type, level.curses, level.stage_seed)
 
     @classmethod
@@ -157,7 +161,7 @@ class Floor:
         """The map after exploring every reachable room without finding hidden rooms: the same
         rooms minus secret and super secret rooms; generator depths are dropped."""
         rooms = [FloorRoom(r.index, r.x, r.y, r.shape, r.type, r.variant, r.subtype, r.layout_doors, 0, -1,
-                           r.difficulty, r.name)
+                           r.difficulty, r.name, file=r.file)
                  for r in self.rooms if r.type not in hidden_types]
         return Floor(rooms, self.stage, self.stage_type, self.curses, 0, self.start)
 

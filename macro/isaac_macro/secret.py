@@ -198,15 +198,18 @@ def _with_room(floor: Floor, room: FloorRoom) -> Floor:
     return Floor(floor.rooms + [room], floor.stage, floor.stage_type, floor.curses, floor.seed, floor.start)
 
 
-def secret_given_super_secret(floor: Floor, super_secret: int | None) -> dict[int, float]:
+def secret_given_super_secret(floor: Floor, super_secret: int | None,
+                              blocked: set[int] | frozenset = frozenset()) -> dict[int, float]:
     """Exact P(secret room cell) given the visible floor and the super secret cell (None = the
-    floor has none, or it is already part of `floor`)."""
+    floor has none, or it is already part of `floor`). `blocked`: cells GetNewSecretRoom skips
+    besides the blacklist (J460's blocked cells, see rep/secret.py; none in AB+)."""
     if super_secret is not None and floor.grid[super_secret] < 0:
         ss = FloorRoom(max(r.index for r in floor.rooms) + 1, super_secret % GRID, super_secret // GRID, 1,
                        ROOM_SUPERSECRET, layout_doors=ALL_DOORS)
         floor = _with_room(floor, ss)
     placed_before = [r for r in floor.rooms if r.type not in (ROOM_DEFAULT, ROOM_SECRET)]
-    offsets = candidate_offsets(floor, blacklist(placed_before, floor.stage, floor.start))
+    banned = blacklist(placed_before, floor.stage, floor.start)
+    offsets = candidate_offsets(floor, banned | blocked if blocked else banned)
     return win_probabilities(offsets)
 
 
@@ -275,7 +278,11 @@ def expected_bombs(posterior: dict[int, float], truth: int) -> float:
 class LayoutEvidence:
     """P(layout | required doors) for the normal rooms of one floor kind, from GetRandomRoom's rule
     (float32 details and the in-floor weight decay are ignored) and the stage's room pool, filtered
-    like Level::generate_dungeon (normal-mode difficulty ranges, 1-15 fallback)."""
+    like Level::generate_dungeon (normal-mode difficulty ranges, 1-15 fallback).
+
+    The pool can be a mixture: `_build` takes (probability, rooms) pairs, one per pool the pick may
+    use (J460 lowers the minimum difficulty one time in eight, rep/secret.py). A pool with no layout
+    that fits the required doors makes the engine retry the floor, so the others are renormalised."""
 
     def __init__(self, room_config, stage: int, stage_type: int, hard: bool = False):
         sid = stage_id(stage, stage_type)
@@ -287,37 +294,95 @@ class LayoutEvidence:
         if len(pool) < 20:
             pool = room_config.get_rooms(sid, ROOM_DEFAULT, SHAPE_ANY, 0, 0xFFFFFFFF, 1, 15, 0, -1)
         min_variant = int(stage == 11)
+        self._build(sid, [(1.0, [r for r in pool if r.variant >= min_variant])])
+
+    def _build(self, sid: int, components: list) -> None:
+        self.sid = sid
+        self.factor = float(EXACT_DOORS_FACTOR)
+        self.components = []                              # (probability, by_shape, layout)
         self.by_shape: dict[int, list] = defaultdict(list)
         self.layout: dict[tuple, tuple] = {}
-        for r in pool:
-            if r.variant >= min_variant:
-                self.by_shape[r.shape].append((r.doors, float(r.initial_weight)))
-                self.layout[(r.shape, r.variant)] = (r.doors, float(r.initial_weight))
+        for share, rooms in components:
+            by_shape, layout = defaultdict(list), {}
+            for r in rooms:
+                by_shape[r.shape].append((r.doors, float(r.initial_weight)))
+                layout[(r.shape, r.variant)] = (r.doors, float(r.initial_weight))
+            self.components.append((share, by_shape, layout))
+            for key, value in layout.items():
+                if key not in self.layout:
+                    self.layout[key] = value
+                    self.by_shape[key[0]].append(value)
         self._totals: dict = {}
-        self.factor = float(EXACT_DOORS_FACTOR)
 
     def known(self, room: FloorRoom) -> bool:
-        return (room.shape, room.variant) in self.layout
+        """The room's layout was drawn from this pool (not the start room's or another file's)."""
+        return room.file in (-1, self.sid) and (room.shape, room.variant) in self.layout
+
+    def _stats(self, shape: int, required: int) -> list:
+        key = (shape, required)
+        st = self._totals.get(key)
+        if st is None:
+            st = []
+            for share, by_shape, _ in self.components:
+                total = exact = 0.0
+                for d, w in by_shape[shape]:
+                    if required & d == required:
+                        total += w
+                        if d == required:
+                            exact += w
+                st.append([share if total > 0 else 0.0, total, exact])
+            norm = sum(c[0] for c in st)
+            for c in st:
+                c[0] = c[0] / norm if norm > 0 else 0.0
+            self._totals[key] = st
+        return st
 
     def prob(self, room: FloorRoom, required: int) -> float:
         doors, weight = self.layout[(room.shape, room.variant)]
         if required & doors != required:
             return 0.0
-        key = (room.shape, required)
-        if key not in self._totals:
-            total = exact = 0.0
-            for d, w in self.by_shape[room.shape]:
-                if required & d == required:
-                    total += w
-                    if d == required:
-                        exact += w
-            self._totals[key] = (total, exact)
-        total, exact = self._totals[key]
-        p_exact = min(1.0, self.factor * exact / total) if exact > 0 else 0.0
-        p = (1.0 - p_exact) * weight / total
-        if doors == required:
-            p += p_exact * weight / exact
+        p = 0.0
+        for (share, total, exact), (_, _, layout) in zip(self._stats(room.shape, required), self.components):
+            if share == 0.0 or (room.shape, room.variant) not in layout:
+                continue
+            p_exact = min(1.0, self.factor * exact / total) if exact > 0 else 0.0
+            q = (1.0 - p_exact) * weight / total
+            if doors == required:
+                q += p_exact * weight / exact
+            p += share * q
         return p
+
+
+class LayoutFactor:
+    """prod over normal rooms R of P(layout_R | visible doors_R + extra slots_R) / P(layout_R |
+    visible doors_R): how much more likely the recognised layouts become when hidden rooms add the
+    `extra` required doors ({room index: [room, slot bits]}). Rooms without a recognised layout
+    (the start room, layouts from other files, unknown ones) do not count."""
+
+    def __init__(self, floor: Floor, evidence: LayoutEvidence):
+        self.evidence = evidence
+        self.facing = _facing_slots(floor)
+        self.base: dict[int, float] = {}
+
+    def cell_slots(self, cells) -> dict[int, list]:
+        """The extra slots of the rooms whose door targets are `cells` (hidden rooms there)."""
+        extra: dict[int, list] = {}
+        for cell in cells:
+            for room, bits in self.facing.get(cell, ()):
+                if self.evidence.known(room):
+                    extra.setdefault(room.index, [room, 0])[1] |= bits
+        return extra
+
+    def __call__(self, extra: dict) -> float:
+        f = 1.0
+        for room, bits in extra.values():
+            if room.index not in self.base:
+                self.base[room.index] = self.evidence.prob(room, room.doors)
+            if self.base[room.index] > 0:
+                f *= self.evidence.prob(room, room.doors | bits) / self.base[room.index]
+            if f == 0.0:
+                break
+        return f
 
 
 def _facing_slots(floor: Floor) -> dict[int, list]:
@@ -348,24 +413,7 @@ def hidden_posterior(floor: Floor, evidence: LayoutEvidence | None = None,
     prior = ss_prior if ss_prior is not None else super_secret_prior(floor)
     if not prior:
         prior = {None: 1.0}
-    facing = _facing_slots(floor) if evidence is not None else {}
-    base: dict[int, float] = {}
-
-    def layout_factor(cells) -> float:
-        extra: dict[int, list] = {}
-        for cell in cells:
-            for room, bits in facing.get(cell, ()):
-                if evidence.known(room):
-                    extra.setdefault(room.index, [room, 0])[1] |= bits
-        f = 1.0
-        for room, bits in extra.values():
-            if room.index not in base:
-                base[room.index] = evidence.prob(room, room.doors)
-            if base[room.index] > 0:
-                f *= evidence.prob(room, room.doors | bits) / base[room.index]
-            if f == 0.0:
-                break
-        return f
+    factor = LayoutFactor(floor, evidence) if evidence is not None else None
 
     joint: dict[tuple, float] = {}
     for h, ph in prior.items():
@@ -374,8 +422,8 @@ def hidden_posterior(floor: Floor, evidence: LayoutEvidence | None = None,
             if secret_cell is not None and c != secret_cell:
                 continue
             w = ph * pc
-            if w > 0 and evidence is not None:
-                w *= layout_factor([c] if h is None else [c, h])
+            if w > 0 and factor is not None:
+                w *= factor(factor.cell_slots([c] if h is None else [c, h]))
             if w > 0:
                 joint[(c, h)] = w
     total = sum(joint.values())

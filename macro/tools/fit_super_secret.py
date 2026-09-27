@@ -3,21 +3,31 @@
 Conditional logit over the candidate cells of each floor's visible map (secret and super secret
 rooms hidden) with two categorical features: `delta` (depth minus the deepest visible dead end,
 clipped to [-2, 3]) and `boss_delta` (depth minus the boss room's depth, clipped to [-3, 1]).
-usage: python tools/fit_super_secret.py [runs] [seed]
+usage: python tools/fit_super_secret.py [runs] [seed] [--rep]
+       --rep: floors of the J460 (Repentance+) port, for rep/secret.py
 """
 import collections
 import math
 import sys
 
 sys.path.insert(0, __file__.rsplit('tools', 1)[0])
-from isaac_macro.dataset import iter_floors
-from isaac_macro.roomconfig import default_room_config
 from isaac_macro.secret import super_secret_candidates
+
+REP = '--rep' in sys.argv
+args = [a for a in sys.argv[1:] if a != '--rep']
+if REP:
+    from isaac_macro.rep.dataset import iter_floors
+    from isaac_macro.rep.roomconfig import default_room_config
+    from isaac_macro.rep.secret import HIDDEN_TYPES
+else:
+    from isaac_macro.dataset import iter_floors
+    from isaac_macro.floor import HIDDEN_TYPES
+    from isaac_macro.roomconfig import default_room_config
 
 DELTA = (-2, 3)
 BOSS = (-3, 1)
-runs = int(sys.argv[1]) if len(sys.argv) > 1 else 2000
-seed = int(sys.argv[2]) if len(sys.argv) > 2 else 1
+runs = int(args[0]) if args else 2000
+seed = int(args[1]) if len(args) > 1 else 1
 rc = default_room_config()
 data = []                       # per floor: (list of candidate feature keys, index of the truth)
 stats = collections.Counter()
@@ -27,7 +37,7 @@ for rec, floor in iter_floors(rc, runs, seed):
         stats['no_super_secret'] += 1
         continue
     truth = rec['super_secret'][0]
-    cands = super_secret_candidates(floor.visible())
+    cands = super_secret_candidates(floor.visible(HIDDEN_TYPES))
     if truth not in cands:
         stats['truth_not_candidate'] += 1
         continue
