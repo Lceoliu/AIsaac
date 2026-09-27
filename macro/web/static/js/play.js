@@ -71,11 +71,14 @@ export function useBomb(floor, play, cell) {
   return entry;
 }
 
+// The quiz keeps the Red Key for red rooms and the ultra secret room: a key used right on a secret or
+// super secret room (a bomb would have opened that wall too) counts as a bomb, entry.tool 'bomb'.
 export function useKey(floor, play, cell) {
   const kind = truthAt(floor, cell);
+  if (kind === 'secret' || kind === 'super') return useBomb(floor, play, cell);
   const added = [];
   const found = [];
-  if (kind) {                       // the door opens into a hidden room
+  if (kind) {                       // the door opens into the ultra secret room
     added.push([cell, kind]);
     found.push(kind);
   } else {                          // a red room: it connects to every adjacent room

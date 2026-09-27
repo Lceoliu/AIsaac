@@ -126,10 +126,11 @@ function today() {
   return new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
 }
 // the day a daily run in the address belongs to: today's, or yesterday's while it can still be sent
+function yesterday() {
+  return new Date(Date.parse(`${today()}T00:00:00Z`) - 86400e3).toISOString().slice(0, 10);
+}
 function challengeDay(day) {
-  const t = today();
-  const y = new Date(Date.parse(`${t}T00:00:00Z`) - 86400e3).toISOString().slice(0, 10);
-  return day === y ? y : t;
+  return day === yesterday() ? day : today();
 }
 function dayName(day) { const [, mm, dd] = day.split('-'); return `${+mm} 月 ${+dd} 日`; }
 function dailySeed(day, game) {
@@ -414,8 +415,9 @@ async function loadBoard() {
   const list = $('board');
   list.setAttribute('aria-busy', 'true');
   if (!state.board) list.replaceChildren(...Array.from({ length: 5 }, () => html('li', { class: 'ghostrow' })));
-  const day = today();
-  $('board-sub').textContent = state.scope === 'today' ? `${day} · ${GAMES[state.game]} · 今日挑战` : `${GAMES[state.game]} · 所有挑战的积分`;
+  const day = state.scope === 'today' ? today() : state.scope === 'yesterday' ? yesterday() : null;
+  $('board-sub').textContent = day ? `${day} · ${GAMES[state.game]} · ${state.scope === 'today' ? '今日' : '昨日'}挑战`
+    : `${GAMES[state.game]} · 所有挑战的积分`;
   try {
     const res = await state.scoreboard.board({ scope: state.scope, game: state.game, day, limit: 20, me: state.profile.id });
     if (job !== state.boardJob) return;
@@ -432,7 +434,8 @@ function renderBoardList() {
   const { rows, mine, rank } = state.board;
   const list = $('board');
   if (!rows.length) {
-    list.replaceChildren(html('li', { class: 'board-empty' }, state.scope === 'today' ? '今天还没有人上榜，来当第一个。' : '还没有成绩，来当第一个。'));
+    const empty = { today: '今天还没有人上榜，来当第一个。', yesterday: '昨天的今日挑战没有人上榜。' }[state.scope] || '还没有成绩，来当第一个。';
+    list.replaceChildren(html('li', { class: 'board-empty' }, empty));
   } else {
     list.replaceChildren(...rows.map((r, i) => {
       const li = html('li', { class: r.client_id === state.profile.id ? 'me' : '' });
@@ -441,7 +444,8 @@ function renderBoardList() {
       return li;
     }));
   }
-  $('board-me').textContent = mine ? `你排第 ${rank} 名 · ${mine.points} 分` : state.profile.name ? '你还没有上榜的成绩' : '起个名字，成绩就会上榜';
+  $('board-me').textContent = mine ? `你排第 ${rank} 名 · ${mine.points} 分`
+    : !state.profile.name ? '起个名字，成绩就会上榜' : state.scope === 'yesterday' ? '你昨天没有成绩' : '你还没有上榜的成绩';
   $('board-note').textContent = state.scoreboard.remote ? '' : '在线排行榜还没接上，现在只显示这台设备上的成绩。';
 }
 
@@ -602,6 +606,10 @@ function act(cell) {
   } else {
     if (!canKey(f, p, cell)) { flash('红钥匙只能用在房间的门位外面。'); return; }
     entry = useKey(f, p, cell);
+    if (entry.tool === 'bomb') {      // right on a (super) secret room: scored as a bomb (play.js)
+      state.tool = 'bomb';
+      flash(`${KIND_NAME[entry.found[0]]}按炸弹算：记一颗炸弹，已换回炸弹。`);
+    }
   }
   savePlay();
   render();
@@ -673,7 +681,7 @@ function adviceText(f, p, inf) {
   if (isComplete(f, p)) return ['这一层的隐藏房全找到了。', true];
   if (!inf.ok) return ['这一层有推算模型没考虑到的情况，暂时给不出概率。', true];
   if (!hintsOn() || !state.hints.next) {
-    return [state.tool === 'key' ? '选一个房间外的门位，用红钥匙开门。房间布局里的红色虚线门就是能开的地方。' : '点挨着房间的空格子，用炸弹炸开那面墙。', true];
+    return [state.tool === 'key' ? '选一个房间外的门位，用红钥匙开门。房间布局里的红色虚线门就是能开的地方。门后要是隐藏房或超级隐藏房，按一颗炸弹算。' : '点挨着房间的空格子，用炸弹炸开那面墙。', true];
   }
   if (state.tool === 'key') {
     if (foundKinds(p).has('ultra')) return ['究极隐藏房已经找到了。剩下的用炸弹找。', true];

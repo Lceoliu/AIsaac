@@ -37,7 +37,7 @@ function localStore() {
       return { duplicate: false };
     },
     async board({ scope, game, day, limit = 20 }) {
-      const rows = readJson(LOCAL, []).filter((r) => r.game === game && (scope !== 'today' || (r.mode === 'daily' && r.day === day)));
+      const rows = readJson(LOCAL, []).filter((r) => r.game === game && (scope === 'total' || (r.mode === 'daily' && r.day === day)));
       const all = aggregate(rows);
       return { rows: all.slice(0, limit), total: all.length, all };
     },
@@ -72,9 +72,10 @@ function supabaseStore({ url, key }) {
       return { duplicate: false };
     },
     async board({ scope, game, day, limit = 20, me = null }) {
-      const view = scope === 'today' ? 'hr_board_daily' : 'hr_board_total';
+      const daily = scope !== 'total';          // today's or yesterday's challenge: one day's board
+      const view = daily ? 'hr_board_daily' : 'hr_board_total';
       const q = new URLSearchParams({ select: 'client_id,player,points,floors', game: `eq.${game}`, order: 'points.desc,last_at.asc', limit: String(limit) });
-      if (scope === 'today') q.set('day', `eq.${day}`);
+      if (daily) q.set('day', `eq.${day}`);
       const res = await get(`${view}?${q}`, { Prefer: 'count=exact' });
       const rows = await res.json();
       const range = res.headers.get('content-range') || '';
@@ -83,11 +84,11 @@ function supabaseStore({ url, key }) {
       let rank = mine ? rows.indexOf(mine) + 1 : null;
       if (me && !mine) {                     // outside the top rows: my total, then how many are ahead
         const mq = new URLSearchParams({ select: 'client_id,player,points,floors', game: `eq.${game}`, client_id: `eq.${me}` });
-        if (scope === 'today') mq.set('day', `eq.${day}`);
+        if (daily) mq.set('day', `eq.${day}`);
         [mine] = await (await get(`${view}?${mq}`)).json();
         if (mine) {
           const aq = new URLSearchParams({ select: 'client_id', game: `eq.${game}`, points: `gt.${mine.points}`, limit: '1' });
-          if (scope === 'today') aq.set('day', `eq.${day}`);
+          if (daily) aq.set('day', `eq.${day}`);
           const ahead = await get(`${view}?${aq}`, { Prefer: 'count=exact' });
           rank = (parseInt((ahead.headers.get('content-range') || '').split('/')[1], 10) || 0) + 1;
         }
