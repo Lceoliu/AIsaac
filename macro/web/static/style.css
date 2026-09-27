@@ -57,7 +57,7 @@ button, input, select { font: inherit; color: inherit; }
 .eyebrow { margin: 0 0 2px; color: var(--bone-3); font-size: 12px; letter-spacing: .18em; }
 .logo { font: 400 32px/1 var(--display); letter-spacing: .06em; color: var(--bone); text-shadow: 0 3px 0 var(--blood-deep); }
 .brand:hover .logo { color: #fff; }
-.top-right { display: flex; align-items: center; gap: 8px; }
+.top-right { display: flex; align-items: center; gap: 8px; margin-left: auto; }
 .me-chip { display: inline-flex; align-items: center; gap: 8px; min-height: 38px; padding: 4px 14px 4px 10px; border-radius: 999px; font-weight: 700; }
 .me-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--coin); box-shadow: 0 0 0 3px rgba(233, 185, 73, .18); }
 .me-chip.unnamed { color: var(--bone-3); font-weight: 400; }
@@ -135,7 +135,7 @@ body[data-screen="home"]::before {                       /* MenuOverlay: the men
   background: url("art/ui/menu-overlay.png") center / 100% 100% no-repeat; mix-blend-mode: multiply; opacity: .55;
 }
 body[data-screen="home"] > * { position: relative; z-index: 1; }
-body[data-screen="home"] .brand { visibility: hidden; }
+body[data-screen="home"] .brand { display: none; }          /* the title says it; the buttons keep the first row */
 body[data-screen="home"] .foot { color: var(--ink-2); }
 body[data-screen="home"] .icon-btn, body[data-screen="home"] .me-chip {
   color: var(--ink); background: transparent; border: 12px solid transparent; border-radius: 0; min-height: 0;
@@ -203,7 +203,7 @@ body[data-screen="home"] .me-dot { background: var(--paper-red); box-shadow: non
 .menu-item:nth-child(2) { transform: rotate(1deg); }
 .menu-item:nth-child(3) { transform: rotate(-.6deg); }
 .menu-item b { font: 400 30px/1.15 var(--display); letter-spacing: .04em; }
-.menu-item small { font-size: 13px; line-height: 1.4; color: var(--ink-2); }
+.menu-item small { font-size: 13px; line-height: 1.4; color: var(--ink-2); word-break: keep-all; text-wrap: balance; }
 .menu-item em { font-style: normal; font-size: 13px; font-weight: 700; color: var(--paper-red); }
 .menu-item::before {                                      /* GameMenu's cursor, next to the chosen item */
   content: ""; position: absolute; left: 0; top: 6px; width: 32px; height: 32px; opacity: 0;
@@ -265,7 +265,7 @@ body[data-screen="home"] .me-dot { background: var(--paper-red); box-shadow: non
 .rules-strip b { font: 15px/1 var(--pixel); color: var(--ink); }
 .rules-strip b.neg { color: var(--paper-red); }
 .engine { min-height: 1.5em; margin: 14px 0 0; font-size: 13px; color: var(--ink-2); }
-.engine.busy::before {
+.engine.working::before {
   content: ""; display: inline-block; width: 9px; height: 9px; margin-right: 8px; vertical-align: -1px;
   border-radius: 50%; border: 2px solid var(--ink); border-top-color: transparent; animation: spin .8s linear infinite;
 }
@@ -420,7 +420,7 @@ button.ghost { background: transparent; }
 .aibar { margin-top: 10px; }
 .aibar button { min-width: 44px; }
 .aistep { margin: 8px 0 4px; font: 13px/1.4 var(--pixel); color: var(--coin); }
-.ailog { max-height: 260px; }
+.ailog { position: relative; max-height: 260px; }   /* the offset parent of its items (main.js scrolls it) */
 .ailog li { display: block; padding: 5px 6px; border-radius: 6px; cursor: pointer; }
 .ailog li b { font-weight: 700; color: var(--bone); }
 .ailog li .prob { display: block; font-size: 11px; color: var(--bone-3); }

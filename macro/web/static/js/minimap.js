@@ -485,8 +485,17 @@ function openLarge(build, title) {
   close.focus();
 }
 
-// the layout with its caption and a count of what spawns in it: in the game's art when it can be
-// loaded (room and floor given), else as the diagram
+// a room's layout straight in the dialog (on a phone the panel that shows it is below the map);
+// false when the art cannot be had
+export async function openRoom(lay, doorState, where) {
+  const art = await loadArt();
+  if (!art) return false;
+  const prep = prepare(art, lay, where.room, where.floor);
+  if (!prep.ready) await prep.job;
+  openLarge(() => layoutArt(art, lay, where.room, where.floor, doorState), where.title || '房间布局');
+  return true;
+}
+
 // a placeholder of the room's size while its layout and art load (instead of a different drawing)
 export function roomSkeleton(shape) {
   const [w, h] = shapeSize(shape);

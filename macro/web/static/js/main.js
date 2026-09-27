@@ -8,7 +8,8 @@ import {
   KIND_NAME, KIND_TYPE, best, infer, nextBomb, nextRedKey, pct, where,
 } from './infer.js';
 import {
-  HEAT, boundsOf, css, drawLayout, drawMap, drawThumb, iconOnly, layoutArt, layoutSvg, playEffect, roomSkeleton, tileIcon,
+  HEAT, boundsOf, css, drawLayout, drawMap, drawThumb, iconOnly, layoutArt, layoutSvg, openRoom, playEffect, roomSkeleton,
+  tileIcon,
 } from './minimap.js';
 import {
   canBomb, canKey, foundKinds, hiddenRooms, isComplete, keyTargets, knownCells, newPlay, undo, useBomb, useKey,
@@ -27,6 +28,7 @@ const MODES = {
 const PARAMS = ['mode', 'route', 'last', 'coins', 'keys', 'hearts', 'max_hearts', 'soul'];
 const DEFAULTS = { mode: 'normal', route: 'sheol', last: '11', coins: '0', keys: '0', hearts: '6', max_hearts: '6', soul: '0' };
 const STORE_TEXT = 'isaac-mapgen-text-labels';
+const ONE_COLUMN = window.matchMedia('(max-width: 980px)');   // the panel sits below the map (style.css)
 const PROFILE = 'hr-profile-v1';
 const PLAYS = 'hr-play-v1:';     // + game:seed:floor -> a ranked floor's play, kept across reloads
 const RUNS = 'hr-run-v1:';       // + game:seed -> {mode, day, points: {floor: points}}
@@ -151,7 +153,7 @@ function renderEngine() {
   if (state.backend.kind !== 'pyodide') { e.textContent = ''; return; }
   const running = [...state.progress.values()].find((p) => p.state === 'run');
   e.textContent = state.engineReady ? '' : running ? `准备中：${running.text}…` : '准备中…';
-  e.classList.toggle('busy', !state.engineReady);
+  e.classList.toggle('working', !state.engineReady);   // not 'busy': that is the board's badge
 }
 function renderLoading() {
   // the first run shows every step; later, only while a game's data is being loaded
@@ -542,7 +544,7 @@ function renderBoard() {
     redKey: redKeyIcon() };
   hideTip();
   if (state.view === 'map') {
-    state.geo = drawMap($('map'), f, { ...base, view: 'map', selected: state.selected, onRoom: (r) => selectRoom(r.index) });
+    state.geo = drawMap($('map'), f, { ...base, view: 'map', selected: state.selected, onRoom: pickRoom });
     return;
   }
   if (aiShown()) { renderAiBoard(f, base); return; }
@@ -557,7 +559,7 @@ function renderBoard() {
     ...base, view: 'find', obs: p.obs, revealed: p.revealed, selected: state.selected,
     heat: hintsOn() && state.hints.heat && !done && inf.ok ? inf : null, suggest,
     actionable: done ? () => false : (c) => (state.tool === 'bomb' ? canBomb(f, p, c) : canKey(f, p, c)),
-    onCell: act, onRoom: (r) => selectRoom(r.index),
+    onCell: act, onRoom: pickRoom,
   });
 }
 
@@ -817,7 +819,11 @@ function winCard(f, p) {
   if (all) win.appendChild(html('p', { class: 'total' }, `挑战完成！${state.data.floors.length} 层一共 ${runPoints()} 分。`));
   const acts = html('div', { class: 'actions' });
   const watch = html('button', { type: 'button' }, '看 AI 怎么找');
-  watch.addEventListener('click', () => showAi(0));
+  watch.addEventListener('click', () => {
+    showAi(0);
+    // in one column the controls come right under the map: bring the map to the top
+    if (ONE_COLUMN.matches) $('map').closest('.frame').scrollIntoView({ block: 'start', behavior: 'smooth' });
+  });
   acts.appendChild(watch);
   if (!last) {
     const next = html('button', { type: 'button', class: 'primary' }, '下一层');
@@ -939,8 +945,8 @@ function renderAiPanel(panel) {
   const n = replay.steps.length;
   panel.appendChild(html('h3', {}, 'AI 怎么找'));
   const kinds = hiddenRooms(f).map((h) => KIND_NAME[h.kind]).join('、');
-  panel.appendChild(html('p', { class: 'advice quiet' }, `AI 只看你也能看到的：地图、房间布局和门位，以及这一层藏着${kinds}。`
-    + `它先用炸弹，每次炸最可能有隐藏房的墙${rep() ? '；找完后用红钥匙，每次开最可能通到究极隐藏房的门位' : ''}。地图上的数字是它推算的概率，框出来的是它下一步的选择。`));
+  const about = html('p', { class: 'advice quiet' }, `AI 只看你也能看到的：地图、房间布局和门位，以及这一层藏着${kinds}。`
+    + `它先用炸弹，每次炸最可能有隐藏房的墙${rep() ? '；找完后用红钥匙，每次开最可能通到究极隐藏房的门位' : ''}。地图上的数字是它推算的概率，框出来的是它下一步的选择。`);
   const exp = expected ? `${expected.bombs.toFixed(1)} 颗炸弹${rep() ? `、${expected.keys.toFixed(1)} 次红钥匙` : ''}` : '';
   panel.appendChild(kv([
     ['AI 平均要', exp || '—'],
@@ -959,6 +965,7 @@ function renderAiPanel(panel) {
   btn(state.aiTimer ? '暂停' : '自动播放', playAi, n === 0);
   panel.appendChild(bar);
   panel.appendChild(html('p', { class: 'aistep' }, at.k >= n ? `共 ${n} 步，全部找到了。` : `第 ${at.k + 1} / ${n} 步`));
+  panel.appendChild(about);
   const ol = html('ol', { class: 'log ailog' });
   replay.steps.forEach((st, i) => {
     const [head, prob, result, hit] = aiStepText(st, f);
@@ -973,8 +980,8 @@ function renderAiPanel(panel) {
   b.addEventListener('click', () => { stopAi(); render(); });
   back.appendChild(b);
   panel.appendChild(back);
-  const cur = ol.querySelector('.now');
-  if (cur) cur.scrollIntoView({ block: 'nearest' });
+  const cur = ol.querySelector('.now');   // the list scrolls to it; the page stays where it is
+  if (cur) ol.scrollTop = Math.max(0, cur.offsetTop - (ol.clientHeight - cur.offsetHeight) / 2);
 }
 
 // ---------------------------------------------------------------------------- room layouts
@@ -1062,6 +1069,16 @@ function selectRoom(index) {
   state.selected = index;
   renderBoard();
   renderPanel();
+}
+// a room tapped on the map. In one column its layout (in the panel) would be out of sight below the
+// map, so it opens in the dialog, or failing that the panel is scrolled to it.
+function pickRoom(r) {
+  selectRoom(r.index);
+  if (!ONE_COLUMN.matches) return;
+  fetchLayout(r).then(async (lay) => {
+    if (state.selected !== r.index) return;
+    if (!(await openRoom(lay, doorState(r), roomWhere(r)))) $('layoutbox')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }).catch(() => {});
 }
 
 function renderPanel() {
