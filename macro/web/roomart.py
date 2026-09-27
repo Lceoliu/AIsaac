@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from isaac_macro.archive import ArchiveSet                                   # noqa: E402
 from isaac_macro.rep.roomconfig import default_archive_path as rep_archive  # noqa: E402
 
-VERSION = 4
+VERSION = 5
 REP_GFX = ('sfx.a', 'music.a', 'graphics.a', 'afterbirth.a', 'afterbirthp.a', 'repentance.a')
 DEFAULT_OUT = Path(__file__).resolve().parents[2] / 'runs' / 'macro' / 'art'
 
@@ -86,7 +86,6 @@ MENU_ART = {  # pieces of the game's own menus for the home page: name -> (sheet
     'strip2': ('Effect_024.2_FortunePaper.png', (0, 60, 300, 134)),
     'streak': ('Effect_024_Streak.png', None),                         # the item name banner (ui_streak)
     'cursor': ('main menu/GameMenu.png', (0, 304, 32, 336)),           # GameMenu "Cursor"
-    'doodles': ('main menu/IsaacDailySketches.png', None),             # Menu_DailyRun "Sketch" frames, 48 px
     'sketches': ('main menu/sketches.png', None),
     'stain': ('main menu/splashes.png', (192, 368, 368, 528)),         # GameMenu "Stain"
     'fly': ('main menu/fly.png', None),                                # the title screen's flies
@@ -545,6 +544,13 @@ def build_ui(r: Renderer, out: Path, log=print) -> dict:
             im = im.crop(box)
         im.save(ui / f'menu-{name}.png', optimize=True)
         index['menu'][name] = dict(file=f'ui/menu-{name}.png', w=im.width, h=im.height)
+    # Menu_DailyRun's sketch note, placed as its "Idle" animation places them: layer 10 "SketchPaper" and
+    # layer 11 "Sketch", whose frame 0 is Isaac
+    daily = r.anm2('resources/gfx/ui/main menu/menu_dailyrun.anm2')
+    note = r.render(daily, 'Idle', 0, only={10, 11}) if daily else None
+    if note:
+        note[0].save(ui / 'menu-note.png', optimize=True)
+        index['menu']['note'] = dict(file='ui/menu-note.png', w=note[0].width, h=note[0].height)
     index['sounds'] = {}
     ffmpeg = shutil.which('ffmpeg')
     for name, path in SOUNDS.items():

@@ -20,8 +20,8 @@ import { createScoreboard } from './scoreboard.js';
 const $ = (id) => document.getElementById(id);
 const GAMES = { abplus: '胎衣†', repplus: '忏悔+' };
 const MODES = {
-  daily: { name: '今日挑战', ranked: true, floors: 5 },
-  random: { name: '随机挑战', ranked: true, floors: 5 },
+  daily: { name: '今日挑战', ranked: true, floors: 7 },
+  random: { name: '随机挑战', ranked: true, floors: 7 },
   practice: { name: '自由练习', ranked: false, floors: null },
 };
 const PARAMS = ['mode', 'route', 'last', 'coins', 'keys', 'hearts', 'max_hearts', 'soul'];
@@ -368,7 +368,8 @@ function renderHome() {
   for (const li of document.querySelectorAll('.rules-strip .rep-only')) li.hidden = state.game !== 'repplus';
   const day = today();
   const [, mm, dd] = day.split('-');
-  $('daily-meta').textContent = `${+mm} 月 ${+dd} 日 · 5 层 · 所有人同一局`;
+  $('daily-meta').textContent = `${+mm} 月 ${+dd} 日 · ${MODES.daily.floors} 层 · 所有人同一局`;
+  $('random-meta').textContent = `${MODES.random.floors} 层 · 随机种子 · 计入总榜`;
   const rec = readJson(runKey(state.game, dailySeed(day, state.game)), null);
   const done = rec ? Object.keys(rec.points).length : 0;
   const pts = rec ? Object.values(rec.points).reduce((a, b) => a + b, 0) : 0;

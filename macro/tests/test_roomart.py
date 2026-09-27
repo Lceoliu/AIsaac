@@ -83,6 +83,6 @@ def test_ui_assets(renderer, tmp_path):
     assert {'IconSecretRoom', 'IconSuperSecretRoom', 'IconUltraSecretRoom', 'IconBomb'} <= set(ui['icons'])
     assert set(ui['sounds']) == {'secret', 'thumbsup'}
     menu = ui['menu']                              # the home page is built from the game's own menus
-    assert {'wall', 'pinned', 'board', 'strip', 'streak', 'cursor', 'fly'} <= set(menu)
+    assert {'wall', 'pinned', 'board', 'strip', 'streak', 'cursor', 'fly', 'note'} <= set(menu)
     assert (menu['wall']['w'], menu['wall']['h']) == (480, 270) and (menu['board']['w'], menu['board']['h']) == (416, 240)
 

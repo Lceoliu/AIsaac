@@ -155,8 +155,12 @@ body[data-screen="home"] .me-dot { background: var(--paper-red); box-shadow: non
 }
 .hero-isaac { position: absolute; left: clamp(330px, 50vw, 560px); top: -6px; cursor: pointer; }
 .streak {                                                  /* ui_streak: the item name banner */
-  display: inline-flex; align-items: center; min-height: 64px; margin: 10px 0 0 -6px; padding: 0 70px 2px 58px;
-  transform: rotate(-1deg); background: url("art/ui/menu-streak.png") center / 100% 100% no-repeat;
+  /* The stroke is rows 16-48 of the image, drawn at twice its height. Its ragged ends (x < 96, x > 316)
+     keep their width and only the middle stretches, so the text always sits on the solid part (rows 21-38
+     there); the cuts are where the edges run level, so the stretch leaves no step. */
+  display: inline-flex; align-items: center; min-height: 64px; margin: 10px 0 0 -6px; padding: 0 10px 3px;
+  border: solid transparent; border-width: 0 84px 0 96px;
+  border-image: url("art/ui/menu-streak.png") 16 84 16 96 fill / 0 84px 0 96px stretch;
   image-rendering: pixelated; color: #fff; font: 400 21px/1 var(--display); letter-spacing: .08em; white-space: nowrap;
 }
 .fly {
@@ -177,8 +181,13 @@ body[data-screen="home"] .me-dot { background: var(--paper-red); box-shadow: non
   position: relative; width: 100%; aspect-ratio: 198 / 218; transform: rotate(-1.2deg);
   background: url("art/ui/menu-pinned.png") 0 0 / 100% 100% no-repeat; image-rendering: pixelated;
 }
-.pinned-inner { position: absolute; inset: 13% 12% 13% 11%; display: grid; align-content: start; gap: 14px; image-rendering: auto; }
-.namefield { display: flex; align-items: baseline; gap: 10px; font: 400 20px/1 var(--display); color: var(--ink-2); }
+.pinned-inner {                          /* one column no wider than the sheet: the name input would widen it */
+  position: absolute; inset: 13% 12% 13% 11%; display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: 14px;
+  image-rendering: auto;
+}
+.namefield {                             /* the sheet's right edge is at x 166 of 198 up here: stay inside it */
+  display: flex; align-items: baseline; gap: 10px; margin-right: 9%; font: 400 20px/1 var(--display); color: var(--ink-2);
+}
 .namefield input {
   flex: 1; min-width: 0; padding: 2px 4px 4px; border: 0; border-bottom: 2px dashed var(--ink-2); background: transparent;
   font: 400 22px/1.2 var(--display); color: var(--paper-red);
@@ -206,7 +215,7 @@ body[data-screen="home"] .me-dot { background: var(--paper-red); box-shadow: non
 .menu-item:focus-visible { outline: none; }
 .menu-item:active { transform: translateY(1px); }
 .menu-item:disabled { cursor: progress; opacity: .6; }
-.gamepick { display: flex; align-items: center; gap: 18px; margin-top: 4px; }
+.gamepick { display: flex; align-items: center; gap: 18px; margin: 4px 0 0 6%; }   /* the sheet's left edge slants in */
 .gamepick button {
   min-height: 0; padding: 4px 12px; border: 2px solid transparent; background: transparent; box-shadow: none;
   font: 400 22px/1.1 var(--display); color: var(--ink-3); border-radius: 50% 45% 55% 42% / 60% 48% 52% 44%;
@@ -219,9 +228,9 @@ body[data-screen="home"] .me-dot { background: var(--paper-red); box-shadow: non
   position: relative; padding: 0; border: 28px solid transparent; border-image: url("art/ui/menu-board.png") 28 fill stretch;
   image-rendering: auto; transform: rotate(.6deg); box-shadow: none; background: none;
 }
-.board-card .doodle {
-  position: absolute; right: -18px; top: -70px; width: 96px; height: 96px; pointer-events: none;
-  background: url("art/ui/menu-doodles.png") -192px 0 / 512px 896px no-repeat; image-rendering: pixelated;
+.board-card .doodle {         /* Menu_DailyRun's sketch note (Isaac), resting 12px on the paper's top edge */
+  position: absolute; right: 150px; top: -150px; width: 123px; height: 134px; pointer-events: none;   /* (offsets start inside the 28px border) */
+  background: url("art/ui/menu-note.png") 0 0 / 100% 100% no-repeat; image-rendering: pixelated; transform: rotate(5deg);
 }
 .board-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
 .board-top h2 { margin: 0; font: 400 30px/1.1 var(--display); letter-spacing: .06em; color: var(--ink); }
@@ -474,7 +483,8 @@ button.ghost { background: transparent; }
   .ready .stage { grid-template-columns: minmax(0, 1fr); }
   .menu-row { grid-template-columns: minmax(0, 1fr); justify-items: center; }
   .pinned { max-width: 440px; }
-  .board-card { width: 100%; max-width: 560px; }
+  .board-card { width: 100%; max-width: 560px; margin-top: 56px; }   /* room for the note above it */
+  .board-card .doodle { right: 24px; top: -105px; width: 82px; height: 89px; }
 }
 @media (max-width: 760px) {
   .hero-isaac { left: auto; right: 0; top: -10px; }
@@ -487,9 +497,13 @@ button.ghost { background: transparent; }
   .brand .eyebrow { display: none; }
   .quiz-title { font-size: 48px; }
   .hero-isaac .isaac { transform: scale(.5); }
-  .streak { font-size: 15px; min-height: 50px; padding: 0 40px 2px 32px; }
+  .streak {
+    min-height: 48px; padding: 0 4px 2px; border-width: 0 50px 0 56px; border-image-width: 0 50px 0 56px;
+    font-size: clamp(12px, 3.8vw, 15px); letter-spacing: .05em;
+  }
   .menu-item b { font-size: 24px; }
   .pinned-inner { inset: 12% 10% 11% 10%; gap: 8px; }
+  .namefield { margin-right: 12%; }
   .rules-strip { font-size: 15px; gap: 2px 14px; }
   .me-chip { max-width: 44vw; overflow: hidden; }
   main { padding: 0 16px 12px; }
