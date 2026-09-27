@@ -50,6 +50,7 @@ const state = {
   selected: null, layouts: new Map(), layoutJobs: new Map(), expected: new Map(), progress: new Map(), pending: 0,
   geo: null, k: 6, hover: null, tipSig: null, art: undefined, profile: null, scoreboard: null, scope: 'today',
   board: null, boardJob: 0, warmed: new Set(), engineReady: false, ai: null, aiCache: new Map(), aiTimer: null,
+  day: null,        // a daily run's own day: its seed and its scores keep it after midnight
 };
 
 // ---------------------------------------------------------------------------- small helpers
@@ -124,6 +125,13 @@ function setName(name) {
 function today() {
   return new Date(Date.now() + 8 * 3600e3).toISOString().slice(0, 10);
 }
+// the day a daily run in the address belongs to: today's, or yesterday's while it can still be sent
+function challengeDay(day) {
+  const t = today();
+  const y = new Date(Date.parse(`${t}T00:00:00Z`) - 86400e3).toISOString().slice(0, 10);
+  return day === y ? y : t;
+}
+function dayName(day) { const [, mm, dd] = day.split('-'); return `${+mm} 月 ${+dd} 日`; }
 function dailySeed(day, game) {
   let h = 0x811c9dc5;
   for (const b of new TextEncoder().encode(`找隐藏房:${day}:${game}`)) h = Math.imul(h ^ b, 0x01000193) >>> 0;
@@ -209,7 +217,7 @@ function savePlay(i = state.floor) {
 }
 function recordRun(i, points) {
   const key = runKey(state.data.game, state.data.seed.value);
-  const rec = readJson(key, null) || { mode: state.mode, day: state.mode === 'daily' ? today() : null, points: {} };
+  const rec = readJson(key, null) || { mode: state.mode, day: state.mode === 'daily' ? state.day : null, points: {} };
   rec.points[i] = points;
   writeJson(key, rec);
 }
@@ -248,7 +256,7 @@ function writeUrl(push = false) {
     if (state.mode !== 'daily') {
       const seed = state.data ? state.data.seed.text : $('seed').value.trim();
       if (seed) q.set('seed', seed);
-    }
+    } else if (state.day) q.set('day', state.day);
     if (state.data) q.set('f', String(state.floor + 1));
     if (state.mode === 'practice') for (const k of PARAMS) if ($(k).value !== DEFAULTS[k]) q.set(k, $(k).value);
   }
@@ -262,7 +270,7 @@ function readUrl() {
   if (!mode || !MODES[mode]) return { screen: 'home' };
   for (const k of PARAMS) if (q.get(k) !== null) $(k).value = q.get(k);
   const f = parseInt(q.get('f') || '1', 10);
-  return { screen: 'play', mode, seed: q.get('seed'), floorIndex: Number.isFinite(f) ? f - 1 : 0 };
+  return { screen: 'play', mode, seed: q.get('seed'), day: q.get('day'), floorIndex: Number.isFinite(f) ? f - 1 : 0 };
 }
 function goHome(push = true) {
   showScreen('home');
@@ -290,7 +298,7 @@ async function askName() {
   $('dlgname').focus();
   return new Promise((resolve) => { nameAnswer = resolve; });
 }
-async function start(mode, { seed = null, floorIndex = 0, push = true } = {}) {
+async function start(mode, { seed = null, day = null, floorIndex = 0, push = true } = {}) {
   if (MODES[mode].ranked && !state.profile.name && !(await askName())) return;
   state.mode = mode;
   state.view = 'find';
@@ -305,7 +313,8 @@ async function start(mode, { seed = null, floorIndex = 0, push = true } = {}) {
     else writeUrl(push);
     return;
   }
-  const s = mode === 'daily' ? String(dailySeed(today(), state.game)) : (seed || String(randomSeed()));
+  state.day = mode === 'daily' ? challengeDay(day) : null;
+  const s = mode === 'daily' ? String(dailySeed(state.day, state.game)) : (seed || String(randomSeed()));
   await generate({ seed: s, floorIndex, push });
 }
 function runParams(seed) {
@@ -459,7 +468,8 @@ function render() {
 }
 function renderPlaybar() {
   const m = MODES[state.mode];
-  $('mode-badge').textContent = `${m.name} · ${state.data ? GAMES[state.data.game] : GAMES[state.game]}`;
+  const name = state.mode === 'daily' && state.day && state.day !== today() ? `${dayName(state.day)}挑战` : m.name;
+  $('mode-badge').textContent = `${name} · ${state.data ? GAMES[state.data.game] : GAMES[state.game]}`;
   $('mode-badge').dataset.mode = state.mode;
   $('seedform').hidden = state.mode !== 'practice';
   $('seed-tag').hidden = state.mode === 'practice' || !state.data;
@@ -627,10 +637,12 @@ async function finishFloor() {
     render();
     const res = await state.scoreboard.submit({
       client_id: state.profile.id, player: state.profile.name || '无名', game: state.data.game, mode: state.mode,
-      day: state.mode === 'daily' ? today() : null, seed: state.data.seed.value, floor: i, points: sc.total,
+      day: state.mode === 'daily' ? state.day : null, seed: state.data.seed.value, floor: i, points: sc.total,
       bombs: p.bombs, keys: p.keys, hints: false,
     });
-    if (res.error) flash('成绩先存在本机，下次联网时会自动补交。');
+    if (res.refused) flash('这一局已经过了提交期限，这层成绩没有计入排行榜。');
+    else if (res.error) flash('成绩先存在本机，下次联网时会自动补交。');
+    else if (state.mode === 'daily' && state.day !== today()) flash(`已过零点：这一局的成绩仍算在 ${dayName(state.day)}的挑战里。`);
     state.board = null;
   } else {
     render();
@@ -1311,7 +1323,7 @@ function init() {
   window.addEventListener('popstate', () => {
     const r = readUrl();
     if (r.screen === 'home') goHome(false);
-    else start(r.mode, { seed: r.seed, floorIndex: r.floorIndex, push: false });
+    else start(r.mode, { seed: r.seed, day: r.day, floorIndex: r.floorIndex, push: false });
   });
 
   renderMute();
@@ -1325,7 +1337,7 @@ function init() {
   });
   state.scoreboard.flush();
   if (route.screen === 'play') {
-    start(route.mode, { seed: route.seed, floorIndex: route.floorIndex, push: false });
+    start(route.mode, { seed: route.seed, day: route.day, floorIndex: route.floorIndex, push: false });
   } else {
     showScreen('home');
     renderHome();

@@ -29,7 +29,7 @@
 | [`enginelog.py`](isaac_macro/enginelog.py) | 解析引擎 `log.txt` 里的楼层生成记录 | — |
 | [`web/`](web/) | 网页"找隐藏房"（胎衣† 和忏悔+）：`api.py`（JSON 接口的全部逻辑）、`server.py`（本地 HTTP 服务）、`roomart.py`（房间布局的原版贴图打包）、`static/`（原生 JS 模块 + SVG/Canvas，本地或 Pyodide 两种后端） | `Room::LoadBackdropGraphics` 0x42D430、`Backdrop::pre_render_floor`/`pre_render_walls` 0x1150A0/0x10A2C0、`GridEntity_Pit::PostInit` 0x300C70、`GridEntity_Rock::InitSubclass` 0x30ADF0 |
 | [`tools/`](tools/) | `export_floors.py`（多进程导出数据集）、`eval_secret.py`、`eval_planner.py`、`fit_super_secret.py`、`compare_engine_floors.py`（对照引擎导出）、`check_rep_runs.py`（忏悔+ 整局一致性检查）、`build_site.py`（打包静态站点）；`eval_secret.py` 和 `fit_super_secret.py` 加 `--rep` 改用忏悔+ 楼层 | — |
-| [`tests/`](tests/) | pytest，135 项，约 55 秒；`tests/test_js.py` 用 Node 在生成的楼层上跑页面的 JS（AI 回放、红钥匙的目标、计分），没有 Node 时跳过；缺少档案时自动跳过；含 454 层引擎日志和 184 层引擎整层导出两份回归数据 | — |
+| [`tests/`](tests/) | pytest，136 项，约 55 秒；`tests/test_js.py` 用 Node 在生成的楼层上跑页面的 JS（AI 回放、红钥匙的目标、计分），没有 Node 时跳过；缺少档案时自动跳过；含 454 层引擎日志和 184 层引擎整层导出两份回归数据 | — |
 
 **数据来源**
 - 房间库只需要 AB+ 的 `afterbirthp.a`。
@@ -70,6 +70,8 @@ post = secret_posterior(floor.visible())   # {格子: 概率}，只用玩家可�
   - 玩家名（存在浏览器里，附一个随机的玩家 id）、游戏版本、三种玩法、计分规则和排行榜。页面一打开就在后台准备运行环境，并逐个解析房间文件，点"开始"时通常已经就绪。
   - **今日挑战**：种子由日期（北京时间）和游戏版本算出（FNV-1a），所有人同一局，7 层。
   - **随机挑战**：随机种子，7 层，计入总榜。
+  - 跨零点：今日挑战的日期在开局时定下，写进网址（`day`）。做到一半过了零点，剩下的层仍算在开局那天的榜上（原来按提交时的日期算，会记到新的一天），标签显示"9 月 27 日挑战"并提示一次；零点后刷新也回到同一局（昨天的挑战还能接着交，数据库只收今天和昨天的今日挑战成绩），更早的网址换成当天的挑战。
+  - 待补交的成绩：数据库拒收的（返回 SQLSTATE，比如过了提交期限）从队列里去掉，不再挡住后面的成绩；断网、网关错误照旧留着下次补交（`tests/js/check_scoreboard.mjs`）。
   - **自由练习**：原来的工具，自选种子和开局选项，随时看完整地图，不计分。
   - 挑战里：没有"显示概率"和"提示下一步"，"完整地图"要等这一层找完或放弃才能看（它会直接显示答案）；每层的进度存在浏览器里，刷新不会重来；没有撤销，只能"放弃这一层"（按已找到的计分并揭晓）；运行只生成挑战的 7 层（`run` 的 `floors` 参数；原来是 5 层，2026-09-27 改成 7 层让分数拉得开。同一天的今日挑战种子不变，前 5 层和原来一样，已有的进度接着算）。提示和完整地图在自由练习里照常可用。
 - **计分**（`js/score.js`）：隐藏房 +100，超级隐藏房 +150，究极隐藏房 +200；炸弹或红钥匙什么都没找到 −25；一次不空、全部找到 +50。每层不低于 0 分。

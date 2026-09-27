@@ -61,7 +61,14 @@ function supabaseStore({ url, key }) {
         body: JSON.stringify(entry),
       });
       if (res.status === 409) return { duplicate: true };
-      if (!res.ok) throw new Error(`分数提交失败（HTTP ${res.status}）`);
+      if (!res.ok) {
+        // an error from the database itself (a SQLSTATE code: a check, or the daily-date rule) refuses
+        // this row for good; anything else (the network, the gateway, a key) may pass later
+        const body = await res.json().catch(() => ({}));
+        const err = new Error(`分数提交失败（HTTP ${res.status}）`);
+        err.refused = /^[0-9A-Z]{5}$/.test(String(body.code || ''));
+        throw err;
+      }
       return { duplicate: false };
     },
     async board({ scope, game, day, limit = 20, me = null }) {
@@ -99,22 +106,26 @@ export function createScoreboard() {
       const outbox = readJson(OUTBOX, []);
       if (!outbox.some((r) => same(r, entry))) outbox.push(entry);
       writeJson(OUTBOX, outbox);
-      return store.flush();
+      const out = await store.flush();
+      return { ...out, refused: out.refused.some((r) => same(r, entry)) };
     },
+    // send what is queued, in order; one the database refuses is dropped (it would block the rest
+    // forever), anything else stops the round and waits for the next
     async flush() {
       let outbox = readJson(OUTBOX, []);
       let error = null;
+      const refused = [];
       for (const entry of [...outbox]) {
         try {
           await sb.submit(entry);
-          outbox = outbox.filter((r) => !same(r, entry));
-          writeJson(OUTBOX, outbox);
         } catch (err) {
-          error = err;
-          break;
+          if (!err.refused) { error = err; break; }
+          refused.push(entry);
         }
+        outbox = outbox.filter((r) => !same(r, entry));
+        writeJson(OUTBOX, outbox);
       }
-      return { pending: outbox.length, error };
+      return { pending: outbox.length, error, refused };
     },
     async board(opts) {
       const out = await sb.board(opts);

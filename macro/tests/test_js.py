@@ -26,3 +26,13 @@ def test_page_logic_on_generated_floors(rc, rep_rc, tmp_path):
                          capture_output=True, text=True, timeout=300)
     assert out.returncode == 0, out.stderr or out.stdout
     assert out.stdout.startswith('ok ')
+
+
+def test_score_queue_drops_refused_scores():
+    """A score the database refuses (an old day's challenge) must not block the scores behind it."""
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('node is not installed')
+    out = subprocess.run([node, str(MACRO / 'tests' / 'js' / 'check_scoreboard.mjs')], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr or out.stdout
+    assert out.stdout.startswith('ok ')
