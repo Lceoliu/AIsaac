@@ -578,6 +578,7 @@ function doorState(r) {
 
 // ---------------------------------------------------------------------------- find mode
 function act(cell) {
+  if (!state.data || aiShown()) return;         // a map from before a new run, or the AI's replay
   const f = floor();
   const p = play();
   if (p.revealed || isComplete(f, p)) return;
