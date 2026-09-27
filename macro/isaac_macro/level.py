@@ -15,13 +15,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import numpy as np
 
 from .levelgen import GRID, LevelGenerator, PLACEMENT, index
 from .rng import RNG
 from .roomconfig import SHAPE_ANY, Room, RoomConfig, stage_id
 
-F32 = np.float32
+from .f32 import F32  # noqa: E402
 LABYRINTH_FACTOR = 1.8                               # 0x96C328 (double)
 CHOOSE_BOSS_ALT_THRESHOLD = F32(0.33000001311302185)  # 0x957E90
 CHOOSE_BOSS_THRESHOLD = F32(0.10000000149011612)      # 0x9502A0

@@ -16,12 +16,11 @@ import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
 
 from .archive import ArchiveSet
 from .rng import RNG
 
-F32 = np.float32
+from .f32 import F32  # noqa: E402
 EXACT_DOORS_FACTOR = F32(9.989999771118164)   # 0x9A5AD8
 WEIGHT_DECAY = F32(0.10000000149011612)       # 0x9502A0
 WEIGHT_FLOOR = F32(1.0000000116860974e-07)    # 0x9A5AD4
@@ -57,8 +56,8 @@ class Room:
     subtype: int
     name: str
     difficulty: int
-    initial_weight: np.float32
-    weight: np.float32
+    initial_weight: float     # float32 values (f32.F32)
+    weight: float
     doors: int            # DoorSlot bit mask (bit 0 LEFT0 ... bit 7 DOWN1), from read_room
     width: int
     height: int
@@ -125,38 +124,46 @@ def _post_flags(stage: int, variant: int) -> int:
     return flags
 
 
+_ROOM_HEAD = struct.Struct('<IIIBH')
+_ROOM_BODY = struct.Struct('<fBBBBH')
+_POINT = struct.Struct('<hhB')          # a door (x, y, exists) or a spawn point (x, y, entries)
+_ENTRY = struct.Struct('<HHHf')
+
+
 def parse_stb(data: bytes, stage: int) -> list[Room]:
     if data[:4] != b'STB1':
         raise ValueError('not an STB1 room file')
     (count,) = struct.unpack_from('<I', data, 4)
     pos = 8
     rooms = []
+    head, body, point, entry = _ROOM_HEAD.unpack_from, _ROOM_BODY.unpack_from, _POINT.unpack_from, _ENTRY.iter_unpack
     for _ in range(count):
-        rtype, variant, subtype, difficulty, name_len = struct.unpack_from('<IIIBH', data, pos)
+        rtype, variant, subtype, difficulty, name_len = head(data, pos)
         pos += 15
         name = data[pos:pos + name_len].decode('latin-1')
         pos += name_len
-        weight, width, height, shape, door_count, spawn_count = struct.unpack_from('<fBBBBH', data, pos)
+        weight, width, height, shape, door_count, spawn_count = body(data, pos)
         pos += 10
         doors = 0
         door_list = []
         for _ in range(door_count):
-            x, y, exists = struct.unpack_from('<hhB', data, pos)
+            x, y, exists = point(data, pos)
             pos += 5
             if exists:
-                doors |= door_bit(x, y, shape)
-                door_list.append((x, y, door_bit(x, y, shape)))
+                bit = door_bit(x, y, shape)
+                doors |= bit
+                door_list.append((x, y, bit))
         spawns = []
         for _ in range(spawn_count):
-            x, y, n = struct.unpack_from('<hhB', data, pos)
+            x, y, n = point(data, pos)
             pos += 5
-            entries, total = [], F32(0)
-            for _ in range(n):
-                etype, evar, esub, ew = struct.unpack_from('<HHHf', data, pos)
-                pos += 10
-                entries.append(SpawnEntry(etype, evar, esub, ew))
-                total = F32(total + F32(ew))
-            spawns.append(Spawn(x, y, entries, float(total)))
+            entries = [SpawnEntry(*e) for e in entry(data[pos:pos + 10 * n])]
+            pos += 10 * n
+            total = entries[0].weight if n == 1 else 0.0      # weights are float32 already ('<f')
+            if n > 1:
+                for e in entries:
+                    total = F32(total + e.weight)
+            spawns.append(Spawn(x, y, entries, total))
         w = F32(weight)
         rooms.append(Room(stage, rtype, variant, subtype, name, difficulty, w, w, doors, width, height,
                           shape, spawns, _post_flags(stage, variant), door_list))
@@ -254,7 +261,7 @@ class RoomConfig:
         return chosen
 
 
-def _weighted_pick(rooms: list[Room], target: np.float32) -> Room | None:
+def _weighted_pick(rooms: list[Room], target: float) -> Room | None:
     acc = F32(rooms[0].weight + F32(0))
     i = 0
     while acc <= target:

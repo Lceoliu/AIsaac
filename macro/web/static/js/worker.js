@@ -1,30 +1,35 @@
 // Runs the floor generators (Python, web/api.py) in the browser with Pyodide. A module worker (Pyodide
-// loads its own files with import()); the page sends {type: 'init', pyodide: <distribution URL>} once,
-// then {type: 'call', id, method, params}.
+// loads its own files with import()); the page sends {type: 'init', pyodide: <distribution URL>, game}
+// once, then {type: 'call', id, method, params}. The generator code and the game's room data download
+// while the runtime loads; numpy is not needed (isaac_macro/f32.py).
 let pyodide = null;
 let ready = null;
-const games = new Map();   // game -> Promise that its data is unpacked and configured
+const games = new Map();       // game -> Promise that its data is unpacked and configured
+const downloads = new Map();   // path -> Promise<ArrayBuffer>
 
 function progress(step, state, text) {
   postMessage({ type: 'progress', step, state, text });
 }
 
-async function fetchBuffer(path) {
-  const res = await fetch(new URL(path, self.location.href));
-  if (!res.ok) throw new Error(`下载 ${path} 失败（HTTP ${res.status}）`);
-  return res.arrayBuffer();
+function fetchBuffer(path) {
+  if (!downloads.has(path)) {
+    downloads.set(path, fetch(new URL(path, self.location.href)).then((res) => {
+      if (!res.ok) throw new Error(`下载 ${path} 失败（HTTP ${res.status}）`);
+      return res.arrayBuffer();
+    }));
+  }
+  return downloads.get(path);
 }
 
-async function init(url) {
-  progress('runtime', 'run', '下载 Python 运行环境（约 10 MB）');
+async function init(url, game) {
+  const code = fetchBuffer('../py/macro.zip');
+  if (game) fetchBuffer(`../data/${game}.zip`).catch(() => {});
+  progress('runtime', 'run', '下载 Python 运行环境');
   const { loadPyodide } = await import(url + 'pyodide.mjs');
   pyodide = await loadPyodide({ indexURL: url });
   progress('runtime', 'done');
-  progress('numpy', 'run', '加载 numpy');
-  await pyodide.loadPackage('numpy');
-  progress('numpy', 'done');
   progress('code', 'run', '加载生成器');
-  pyodide.unpackArchive(await fetchBuffer('../py/macro.zip'), 'zip', { extractDir: '/app' });
+  pyodide.unpackArchive(await code, 'zip', { extractDir: '/app' });
   pyodide.runPython("import sys\nsys.path.insert(0, '/app')\nimport api");
   progress('code', 'done');
 }
@@ -45,7 +50,7 @@ function loadGame(game) {
 self.onmessage = async (e) => {
   const m = e.data;
   if (m.type === 'init') {
-    ready = init(m.pyodide);
+    ready = init(m.pyodide, m.game);
     ready.catch((err) => progress('runtime', 'error', String(err && err.message || err)));
     return;
   }

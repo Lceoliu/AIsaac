@@ -80,3 +80,18 @@ def test_extracted_files_give_the_same_run(server, rc, rep_rc, tmp_path):
             assert server.run_json(dict(params, game=game))['floors'] == ref[game]
     finally:
         server.configure({game: None for game in ref})
+
+
+def test_challenge_runs_and_batch_layouts(server, rep_rc):
+    """A challenge generates only its first floors; a floor's layouts come in one request."""
+    out = server.run_json(dict(game='repplus', seed='1234', mode='normal', floors='5'))
+    full = server.run_json(dict(game='repplus', seed='1234', mode='normal'))
+    assert len(out['floors']) == 5 and len(full['floors']) > 5
+    assert out['floors'] == full['floors'][:5]                   # the same floors, just fewer
+    rooms = out['floors'][0]['rooms']
+    keys = sorted({f"{r['file']}.{r['type']}.{r['variant']}" for r in rooms})
+    lays = server.layouts_json(dict(game='repplus', keys=','.join(keys + ['0.1.999999'])))
+    assert all(lays[k] and lays[k]['spawns'] is not None for k in keys)
+    assert lays['0.1.999999'] is None                              # no such layout
+    assert server.warmup_json(dict(game='repplus', stage='1'))['rooms'] > 0
+

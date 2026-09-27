@@ -69,3 +69,20 @@ def test_entity_sprites(renderer):
     pedestal, _, _ = roomart.entity_sprite(r, entities, items, (5, 100, 0))
     assert pedestal.size[1] > 32                                        # the altar and the "?" above it
     assert roomart.entity_sprite(r, entities, items, (5, 0, 0)) is None  # a random pickup has no sprite
+
+
+def test_ui_assets(renderer, tmp_path):
+    """The page's own bits: Isaac's thumbs up (the player's Happy animation), the Red Key (items.xml
+    580), minimap icons, and the secret room jingle and thumbs-up sound when they are there."""
+    roomart, r = renderer
+    ui = roomart.build_ui(r, tmp_path, log=lambda m: None)
+    happy = ui['happy']
+    assert len(happy['delays']) == 7 and happy['delays'][happy['thumb']] == 12      # the thumb is held longest
+    assert (tmp_path / happy['file']).stat().st_size > 0
+    assert (ui['redkey']['w'], ui['redkey']['h']) == (27, 14)
+    assert {'IconSecretRoom', 'IconSuperSecretRoom', 'IconUltraSecretRoom', 'IconBomb'} <= set(ui['icons'])
+    assert set(ui['sounds']) == {'secret', 'thumbsup'}
+    menu = ui['menu']                              # the home page is built from the game's own menus
+    assert {'wall', 'pinned', 'board', 'strip', 'streak', 'cursor', 'fly'} <= set(menu)
+    assert (menu['wall']['w'], menu['wall']['h']) == (480, 270) and (menu['board']['w'], menu['board']['h']) == (416, 240)
+

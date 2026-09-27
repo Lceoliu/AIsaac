@@ -47,7 +47,7 @@ function rng(seed) {
 }
 
 // walkable interior tiles of each room shape (narrow rooms keep the 1x1 or 2x1 grid)
-function walkable(shape, W, H) {
+export function walkable(shape, W, H) {
   return (x, y) => {
     if (x < 0 || y < 0 || x >= W || y >= H) return false;
     switch (shape) {
@@ -278,7 +278,7 @@ function pitFrame(m, at) {
 }
 
 // door slots: where the door sits and which way it faces (rotation of the door sprite)
-function doorPlace(d, walk) {
+export function doorPlace(d, walk) {
   const [x, y] = d;
   if (walk(x + 1, y)) return { x, y, angle: -Math.PI / 2 };
   if (walk(x - 1, y)) return { x, y, angle: Math.PI / 2 };
@@ -306,8 +306,33 @@ export function prepare(art, lay, room, floor) {
   return { ready: list.every(loaded), job: Promise.all(list.map((u) => image(u).job)).then(() => true) };
 }
 
+// the interior size of a room shape in tiles (for a placeholder of the right size before the layout loads)
+export function shapeSize(shape) {
+  return [shape >= 6 ? 26 : 13, [4, 5, 8, 9, 10, 11, 12].includes(shape) ? 14 : 7];
+}
+
+// composed rooms, by what they depend on (the same room is shown in the panel, the tip and the dialog)
+const composed = new Map();
+function copyOf(src) {
+  const c = document.createElement('canvas');
+  c.width = src.width;
+  c.height = src.height;
+  c.getContext('2d').drawImage(src, 0, 0);
+  return c;
+}
+
 // the room drawn at the game's scale (26 px a tile) with walls around it; call after prepare() is ready
 export function compose(art, lay, room, floor, doorState) {
+  const open = lay.door_list.map((d) => (doorState(d[2]) === 'open' ? 1 : 0)).join('');
+  const key = [room.backdrop, floor.backdrop, floor.stage, room.seeds && room.seeds.decoration, lay.stage, lay.type, lay.variant, open].join('.');
+  if (!composed.has(key)) {
+    composed.set(key, composeRoom(art, lay, room, floor, doorState));
+    if (composed.size > 80) composed.delete(composed.keys().next().value);
+  }
+  return copyOf(composed.get(key));
+}
+
+function composeRoom(art, lay, room, floor, doorState) {
   const [bd, bdId] = backdropOf(art, room, floor.backdrop);
   const W = lay.width, H = lay.height;
   const canvas = document.createElement('canvas');

@@ -12,7 +12,8 @@ ids they use are the same.
 
     python web/roomart.py [--out DIR]        default rl/runs/macro/art (the local server's cache)
 
-writes art.json (the index), bd/*.png (backdrop sheets) and s/*.png (sprites, named by content).
+writes art.json (the index), bd/*.png (backdrop sheets), s/*.png (sprites, named by content) and
+ui/ (the page's own bits: Isaac's thumbs-up animation, the Red Key, minimap icons, two sounds).
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ import math
 import posixpath
 import re
 import shutil
+import subprocess
 import sys
 import time
 import xml.etree.ElementTree as ET
@@ -37,8 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from isaac_macro.archive import ArchiveSet                                   # noqa: E402
 from isaac_macro.rep.roomconfig import default_archive_path as rep_archive  # noqa: E402
 
-VERSION = 2
-REP_GFX = ('graphics.a', 'afterbirth.a', 'afterbirthp.a', 'repentance.a')
+VERSION = 4
+REP_GFX = ('sfx.a', 'music.a', 'graphics.a', 'afterbirth.a', 'afterbirthp.a', 'repentance.a')
 DEFAULT_OUT = Path(__file__).resolve().parents[2] / 'runs' / 'macro' / 'art'
 
 # Backdrops the layout view can ask for: the stages' (stages.xml) and the special rooms'
@@ -72,6 +74,28 @@ POSES = ('Idle', 'IdleDown', 'Idle Down', 'WalkDown', 'Walk Down', 'WalkVert', '
          'Float', 'FloatDown', 'Hop', 'Move', 'Shake', 'Stand')
 OVERLAYS = ('Head', 'HeadDown', 'Head Down')   # drawn on top of the pose (gapers' heads)
 TRANSIENT = re.compile(r'appear|death|die|spawn|dissapear|disappear|collect', re.I)
+UI_ICONS = ('IconSecretRoom', 'IconSuperSecretRoom', 'IconUltraSecretRoom', 'IconBomb', 'IconKey', 'IconBoss')
+MENU_ART = {  # pieces of the game's own menus for the home page: name -> (sheet under gfx/ui, crop or None)
+    'wall': ('main menu/EmptyScreen.png', None),                       # the menus' sketched wall
+    'overlay': ('main menu/MenuOverlay.png', None),                    # and its vignette
+    'sheet': ('main menu/Menu_DailyRun.png', (0, 0, 240, 176)),        # Menu_DailyRun "Sheet"
+    'sheet2': ('main menu/Menu_DailyRun.png', (272, 112, 464, 272)),   # "Sheet2"
+    'board': ('LeaderboardMenu.png', (0, 0, 416, 240)),                # LeaderboardMenu "Paper"
+    'pinned': ('main menu/GameMenu.png', (144, 20, 342, 238)),         # the pinned sheet of GameMenu "Main"
+    'strip': ('Effect_024.2_FortunePaper.png', (0, 0, 300, 56)),       # ui_FortunePaper strips
+    'strip2': ('Effect_024.2_FortunePaper.png', (0, 60, 300, 134)),
+    'streak': ('Effect_024_Streak.png', None),                         # the item name banner (ui_streak)
+    'cursor': ('main menu/GameMenu.png', (0, 304, 32, 336)),           # GameMenu "Cursor"
+    'doodles': ('main menu/IsaacDailySketches.png', None),             # Menu_DailyRun "Sketch" frames, 48 px
+    'sketches': ('main menu/sketches.png', None),
+    'stain': ('main menu/splashes.png', (192, 368, 368, 528)),         # GameMenu "Stain"
+    'fly': ('main menu/fly.png', None),                                # the title screen's flies
+}
+SOUNDS = {  # the page's sounds: music.xml track 85 (TryBlowOpen plays it for an unseen secret room,
+    # AB+ 0x2FC530) and sounds.xml 268 SOUND_THUMBSUP
+    'secret': 'resources/music/JINGLE OGG/secret room find v2_07.ogg',
+    'thumbsup': 'resources/sfx/Feedback/thumbs up.wav',
+}
 
 
 def gfx_archives() -> ArchiveSet:
@@ -463,12 +487,81 @@ def build(out: Path = DEFAULT_OUT, log=print) -> dict:
             missing.append(key)
     log(f'entities: {len(keys) - len(missing)} of {len(keys)} drawn; no sprite for {len(missing)}')
 
+    ui = build_ui(r, out, log)
     index = dict(version=VERSION, tile=26, backdrops=bd_index, sprites=sprites.index, groups=sprites.groups,
-                 missing=['%d.%d.%d' % k for k in missing])
+                 missing=['%d.%d.%d' % k for k in missing], ui=ui)
     (out / 'art.json').write_text(json.dumps(index, separators=(',', ':')), encoding='utf-8')
     size = sum(p.stat().st_size for p in out.rglob('*') if p.is_file())
     log(f'art: {len(sprites.index)} sprites in {len(sprites._files)} files, {size / 1e6:.1f} MB, '
         f'{time.time() - t0:.1f} s -> {out}')
+    return index
+
+
+def build_ui(r: Renderer, out: Path, log=print) -> dict:
+    """Isaac's "Happy" animation (the thumbs up) as a strip of equal cells, the Red Key's item sprite,
+    a few minimap icons, and the sounds (the jingle as MP3 when ffmpeg is there: Safari cannot decode
+    Ogg Vorbis)."""
+    ui = out / 'ui'
+    shutil.rmtree(ui, ignore_errors=True)
+    ui.mkdir(parents=True)
+    index = {}
+    player = r.anm2('resources/gfx/001.000_Player.anm2')
+    frames = player.anims['Happy']['layers'][12][2] if player else []
+    shots, t = [], 0
+    for f in frames:
+        shots.append((r.render(player, 'Happy', t), int(_num(f, 'Delay', 1))))
+        t += int(_num(f, 'Delay', 1))
+    shots = [(x, d) for x, d in shots if x]
+    if shots:
+        left = max(ox for (im, ox, oy), _ in shots)
+        top = max(oy for (im, ox, oy), _ in shots)
+        width = max(left + im.width - ox for (im, ox, oy), _ in shots)
+        height = max(top + im.height - oy for (im, ox, oy), _ in shots)
+        strip = Image.new('RGBA', (width * len(shots), height))
+        for i, ((im, ox, oy), _) in enumerate(shots):
+            strip.paste(im, (i * width + left - ox, top - oy))
+        strip.save(ui / 'happy.png', optimize=True)
+        index['happy'] = dict(file='ui/happy.png', w=width, h=height, ox=left, oy=top, fps=30,
+                              delays=[d for _, d in shots], thumb=max(range(len(shots)), key=lambda i: shots[i][1]))
+    key = r.sheet('resources/gfx/items/collectibles/Collectibles_580_SecretKey.png')   # items.xml 580, Red Key
+    if key is not None:
+        box = key.getbbox()
+        key.crop(box).save(ui / 'redkey.png', optimize=True)
+        index['redkey'] = dict(file='ui/redkey.png', w=box[2] - box[0], h=box[3] - box[1])
+    icons = r.anm2('resources/gfx/ui/minimap_icons.anm2')
+    index['icons'] = {}
+    for name in UI_ICONS:
+        shot = r.render(icons, name, 0) if icons and name in icons.anims else None
+        if shot:
+            im = shot[0]
+            im.save(ui / f'{name}.png', optimize=True)
+            index['icons'][name] = dict(file=f'ui/{name}.png', w=im.width, h=im.height)
+    index['menu'] = {}
+    for name, (sheet, box) in MENU_ART.items():
+        im = r.sheet('resources/gfx/ui/' + sheet)
+        if im is None:
+            continue
+        if box:
+            im = im.crop(box)
+        im.save(ui / f'menu-{name}.png', optimize=True)
+        index['menu'][name] = dict(file=f'ui/menu-{name}.png', w=im.width, h=im.height)
+    index['sounds'] = {}
+    ffmpeg = shutil.which('ffmpeg')
+    for name, path in SOUNDS.items():
+        try:
+            data = r.archives.read(path)
+        except FileNotFoundError:
+            continue
+        ext = path.rsplit('.', 1)[1].lower()
+        (ui / f'{name}.{ext}').write_bytes(data)
+        if ext == 'ogg' and ffmpeg:
+            subprocess.run([ffmpeg, '-y', '-loglevel', 'error', '-i', str(ui / f'{name}.ogg'), '-codec:a', 'libmp3lame',
+                            '-b:a', '96k', str(ui / f'{name}.mp3')], check=True)
+            (ui / f'{name}.ogg').unlink()
+            ext = 'mp3'
+        index['sounds'][name] = f'ui/{name}.{ext}'
+    log(f"ui: happy {len(shots)} frames, red key {'yes' if 'redkey' in index else 'no'}, "
+        f"{len(index['icons'])} icons, {len(index['menu'])} menu pieces, sounds {sorted(index['sounds'])}")
     return index
 
 

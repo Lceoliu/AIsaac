@@ -10,10 +10,9 @@ float32 constant at 0x9A41EC (2.3283061589829401e-10), all in single precision.
 """
 from __future__ import annotations
 
-import numpy as np
 
 MASK32 = 0xFFFFFFFF
-F32 = np.float32
+from .f32 import F32  # noqa: E402
 RANDOM_FLOAT = F32(2.3283061589829401e-10)
 
 SHIFTS = [
@@ -63,10 +62,10 @@ class RNG:
         self.next()
         return self.seed % n if n else 0
 
-    def random_float(self) -> np.float32:
+    def random_float(self) -> float:
         """RNG::Random(): float32(state) * float32 constant, in single precision."""
         self.next()
-        return F32(self.seed) * RANDOM_FLOAT
+        return F32(F32(self.seed) * RANDOM_FLOAT)
 
 
 class Seeds:

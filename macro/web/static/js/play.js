@@ -44,26 +44,29 @@ export function canBomb(floor, play, cell) {
 }
 
 // the Red Key opens a door slot: those of the explored rooms' layouts (floor.door_targets), and every
-// side of a hidden or red room found so far (1x1 rooms)
+// side of a hidden or red room found so far (1x1 rooms). A wall already bombed for nothing is still a
+// door slot: the key makes a red room there all the same.
 export function keyTargets(floor, play) {
   const out = new Set(floor.door_targets || []);
   for (const [c, kind] of play.obs) {
     if (kind !== 'empty') for (const n of neighbours(c)) out.add(n);
   }
-  return [...out].filter((c) => isFree(floor, play, c));
+  const visible = visibleCells(floor);
+  return [...out].filter((c) => c >= 0 && c < GRID * GRID && !visible.has(c) && (!play.obs.has(c) || play.obs.get(c) === 'empty'));
 }
 
 export function canKey(floor, play, cell) {
   return keyTargets(floor, play).includes(cell);
 }
 
-// returns {added: [[cell, kind]], found: [kind]} and records it for undo
+// returns {added: [[cell, kind]], found: [kind]} and records it (with what it replaced) for undo
 export function useBomb(floor, play, cell) {
   const kind = truthAt(floor, cell);
   const added = [[cell, kind || 'empty']];
+  const prev = added.map(([c]) => [c, play.obs.get(c)]);
   play.obs.set(cell, kind || 'empty');
   play.bombs += 1;
-  const entry = { tool: 'bomb', cell, added, found: kind ? [kind] : [] };
+  const entry = { tool: 'bomb', cell, added, prev, found: kind ? [kind] : [] };
   play.log.push(entry);
   return entry;
 }
@@ -85,9 +88,10 @@ export function useKey(floor, play, cell) {
       }
     }
   }
+  const prev = added.map(([c]) => [c, play.obs.get(c)]);
   for (const [c, k] of added) play.obs.set(c, k);
   play.keys += 1;
-  const entry = { tool: 'key', cell, added, found };
+  const entry = { tool: 'key', cell, added, prev, found };
   play.log.push(entry);
   return entry;
 }
@@ -95,7 +99,9 @@ export function useKey(floor, play, cell) {
 export function undo(play) {
   const entry = play.log.pop();
   if (!entry) return null;
-  for (const [c] of entry.added) play.obs.delete(c);
+  for (const [c, k] of entry.prev || entry.added.map(([c]) => [c, undefined])) {
+    if (k === undefined) play.obs.delete(c); else play.obs.set(c, k);
+  }
   if (entry.tool === 'bomb') play.bombs -= 1;
   else play.keys -= 1;
   return entry;

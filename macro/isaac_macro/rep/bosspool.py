@@ -120,12 +120,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-import numpy as np
 
 from ..rng import MASK32, RANDOM_FLOAT, RNG
 from .roomconfig import SHAPE_ANY, stage_id
 
-F32 = np.float32
+from ..f32 import F32  # noqa: E402
 
 POOL_COUNT = 37                 # BossPool_Pool _pool[37], stride 0x3C (destructor 0x21880: 0x3C x 0x25)
 BOSS_BITS = 0x68                # both vector<bool> resized to 104 by Init (FUN_00423090(0x68))
@@ -258,8 +257,8 @@ class BossContext:
 class BossEntry:
     """BossPool_Entry (0x14 bytes)."""
     id: int                          # +0x0
-    initial_weight: np.float32       # +0x4, cumulative scan
-    weight: np.float32               # +0x8, eligibility (> 0 and prev + weight > r)
+    initial_weight: float            # +0x4, cumulative scan
+    weight: float                    # +0x8, eligibility (> 0 and prev + weight > r)
     achievement: int                 # +0xC, EntityConfig_Boss.achievement of the id (-1 = none)
     room_variant_start: int          # +0x10, XML "room": GetBossId returns -value when non-zero
 
@@ -270,7 +269,7 @@ class Pool:
     index: int
     name: str = ''                                      # +0x0
     entries: list = field(default_factory=list)         # +0x18
-    total_weight: np.float32 = F32(0)                   # +0x24
+    total_weight: float = F32(0)                        # +0x24
     rng: RNG = field(default_factory=RNG)               # +0x28 (constructor 0x21810: default RNG)
     double_trouble: int = 0                             # +0x38 _doubleTroubleRoomVariantStart
 

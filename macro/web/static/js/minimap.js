@@ -3,7 +3,7 @@
 // room icons on top, scaled by an integer k so the pixels stay crisp. Text style draws coloured rooms
 // with labels. Both use the same geometry: a cell is 9k x 8k.
 import { GRID, TYPE_KIND, neighbours } from './infer.js';
-import { ORIGIN, TILE, compose, loadArt, prepare, shownEntry, unshown } from './roomart.js';
+import { ORIGIN, TILE, compose, doorPlace, loadArt, prepare, shapeSize, shownEntry, unshown, walkable } from './roomart.js';
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 export const ICONS = {
@@ -19,6 +19,7 @@ const TYPE_COLOR = {
   21: '--t-dice', 24: '--t-planetarium', 29: '--t-ultrasecret',
 };
 const LABEL = { 7: '隐', 8: '超', 29: '究' };
+const NARROW = { 2: 'h', 7: 'h', 3: 'v', 5: 'v' };      // the narrow room shapes: a corridor across or down
 export const HEAT = [['secret', '隐', '--heat'], ['super', '超', '--heat-ss'], ['ultra', '究', '--heat-us']];
 
 export function css(name) {
@@ -164,12 +165,26 @@ export function drawMap(svg, floor, v) {
     const r = d.room;
     const g = el('g', { class: v.onRoom ? 'room' : '', 'data-index': r.index }, gRooms);
     if (d.found) g.setAttribute('data-found', r.cells[0]);
+    const narrow = NARROW[r.shape];
     if (icons) {
+      // the game's own tile for the shape (narrow rooms are thin), then the icon: half size on a narrow
+      // room so the thin tile still shows around it. Neither takes the pointer: the icon's frame is
+      // bigger than the room, so the room's own cells below answer instead.
       const [x, y] = pos(r.y * GRID + r.x);
-      sprite(g, sheet.tiles, sheet.tiles.frames[d.tile][r.shape - 1], x, y, k, { class: 'cell' });
+      sprite(g, sheet.tiles, sheet.tiles.frames[d.tile][r.shape - 1], x, y, k, { class: 'cell', 'pointer-events': 'none' });
       const icon = sheet.icons.frames[iconName(r.type, r.subtype)];
       const [cx, cy] = centre(r);
-      if (icon) sprite(g, sheet.icons, icon, cx - 6.5 * k, cy - 6 * k, k, d.missed ? { opacity: 0.75 } : {});
+      const ki = narrow ? Math.max(1, Math.round(k / 2)) : k;
+      if (icon) sprite(g, sheet.icons, icon, cx - 6.5 * ki, cy - 6 * ki, ki, { 'pointer-events': 'none', ...(d.missed ? { opacity: 0.75 } : {}) });
+    } else if (narrow) {
+      // a narrow room as a corridor through its cells
+      const fill = r.start ? css('--t-start') : css(TYPE_COLOR[r.type] || '--t-other');
+      const xs = r.cells.map((c) => pos(c)[0]), ys = r.cells.map((c) => pos(c)[1]);
+      const x0 = Math.min(...xs), y0 = Math.min(...ys), x1 = Math.max(...xs) + Sx, y1 = Math.max(...ys) + Sy;
+      const t = narrow === 'h' ? Sy * 0.42 : Sx * 0.42;
+      el('rect', narrow === 'h'
+        ? { x: x0 + gap / 2, y: (y0 + y1) / 2 - t / 2, width: x1 - x0 - gap, height: t, rx: k * 0.8, fill, class: 'cell' }
+        : { x: (x0 + x1) / 2 - t / 2, y: y0 + gap / 2, width: t, height: y1 - y0 - gap, rx: k * 0.8, fill, class: 'cell' }, g);
     } else {
       const fill = r.start ? css('--t-start') : css(TYPE_COLOR[r.type] || '--t-other');
       const set = new Set(r.cells);
@@ -196,6 +211,10 @@ export function drawMap(svg, floor, v) {
       const [cx, cy] = centre(r);
       el('text', { x: cx, y: cy + k * 1.2, 'text-anchor': 'middle', 'font-size': k * 3, 'font-weight': 700, fill: css('--label'),
         class: 'outlined num', 'stroke-width': k * 0.7 }, g).textContent = r.depth;
+    }
+    for (const c of r.cells) {                  // the room answers the pointer exactly over its cells
+      const [x, y] = pos(c);
+      el('rect', { x, y, width: Sx, height: Sy, fill: 'transparent', class: 'roomhit' }, g);
     }
     if (v.onRoom) g.addEventListener('click', () => v.onRoom(r));
     if (v.onHover) {
@@ -228,6 +247,17 @@ export function drawMap(svg, floor, v) {
     }
   }
 
+  // the order of the AI's moves (its replay)
+  if (v.stepLabels) {
+    const fs = Math.max(9, Math.round(k * 2));
+    for (const [c, label] of v.stepLabels) {
+      if (!inside(c)) continue;
+      const [x, y] = pos(c);
+      el('text', { x: x + k * 0.8, y: y + fs * 0.95, 'font-size': fs, fill: css('--coin'), class: 'outlined num step',
+        'stroke-width': Math.max(2, k * 0.6) }, svg).textContent = label;
+    }
+  }
+
   // selection outline (map view)
   if (v.selected !== null && v.selected !== undefined) {
     const r = floor.rooms.find((q) => q.index === v.selected);
@@ -251,7 +281,10 @@ export function drawMap(svg, floor, v) {
     const [x, y] = pos(c);
     el('rect', { x: x + k * 0.5, y: y + k * 0.5, width: Sx - k, height: Sy - k, rx: k, fill: 'none', stroke: col,
       'stroke-width': Math.max(2, k * 0.55), class: 'suggest' }, svg);
-    if (icons && sheet.icons.frames[iconName]) {
+    if (iconName === 'IconKey' && v.redKey) {             // the Red Key's own sprite
+      const w = v.redKey.w * Math.max(1, k / 4), h = v.redKey.h * Math.max(1, k / 4);
+      el('image', { href: v.redKey.url, x: x - w / 2, y: y - h / 2, width: w, height: h, class: 'pixel suggest-icon' }, svg);
+    } else if (icons && sheet.icons.frames[iconName]) {
       const k2 = Math.max(1, Math.round(k / 2));          // a half-size glyph on the ring's corner
       sprite(svg, sheet.icons, sheet.icons.frames[iconName], x - k - 2 * k2, y - k - 2 * k2, k2, { class: 'suggest-icon' });
     } else {
@@ -343,11 +376,13 @@ function countSpawn(tally, sp) {
   const key = sp.entries.length > 1 ? sp.entries.map((e) => e.name).join(' / ') + '（随机）' : shownEntry(sp).name;
   tally.set(key, (tally.get(key) || 0) + 1);
 }
-const DOOR_TITLE = { open: '门：通向看得见的房间', slot: '布局上有门位，这边看不到门' };
+// what a door slot shows (doorState(bit)): 'open', a door into a room the player knows; 'key', a slot the
+// Red Key can open (only while the Red Key is the tool); 'wall', nothing, as in the game
+const DOOR_TITLE = { open: '门：通向你知道的房间', key: '红钥匙可以在这里开门' };
+const RED_DOOR = 'M -12 13 V -6 A 12 12 0 0 1 12 -6 V 13';     // an arched doorway, open side into the room
 
-// A room layout as a plain diagram (tiles 16 units), for when the game art is not available:
-// walls, door slots, obstacles and spawns. doorState(bit) says what a door slot shows: 'open' (a
-// door into a room the viewer knows) or 'slot' (the layout has a door there, but no door can be seen).
+// A room layout as a plain diagram (tiles 16 units), for when the game art cannot be loaded: walls,
+// doors, obstacles and spawns.
 export function layoutSvg(lay, doorState, tally = null) {
   const T = 16, W = lay.width, H = lay.height;
   const svg = el('svg', { viewBox: `0 0 ${(W + 2) * T} ${(H + 2) * T}`, role: 'img', 'aria-label': '房间布局' });
@@ -357,11 +392,12 @@ export function layoutSvg(lay, doorState, tally = null) {
     el('rect', { x: (mx + 1) * T, y: (my + 1) * T, width: mw * T, height: mh * T, fill: css('--tile-wall') }, svg);
   }
   for (const [dx, dy, bit] of lay.door_list) {
-    const open = doorState(bit) === 'open';
+    const st = doorState(bit);
+    if (st === 'wall') continue;
     const d = el('rect', { x: (dx + 1) * T + 1, y: (dy + 1) * T + 1, width: T - 2, height: T - 2, rx: 2,
-      fill: open ? '#4fbf6a' : '#2a241e', stroke: open ? 'none' : '#e9b949', 'stroke-width': open ? 0 : 1.5,
-      'stroke-dasharray': open ? 'none' : '3 2' }, svg);
-    el('title', {}, d).textContent = DOOR_TITLE[open ? 'open' : 'slot'];
+      fill: st === 'open' ? '#4fbf6a' : 'rgba(201, 53, 44, .3)', stroke: st === 'open' ? 'none' : '#ff4b3e',
+      'stroke-width': 1.5, 'stroke-dasharray': st === 'open' ? 'none' : '3 2' }, svg);
+    el('title', {}, d).textContent = DOOR_TITLE[st];
   }
   for (const sp of lay.spawns) {
     spawnMarker(svg, sp, (sp.x + 1) * T, (sp.y + 1) * T, T);
@@ -387,8 +423,9 @@ function spawnMarker(svg, sp, x, y, T) {
   if (sp.entries.length > 1) el('circle', { cx: x + T - 3, cy: y + 3, r: 2.6, fill: '#fff' }, svg);
 }
 
-// The layout in the game's art (roomart.js): the composed room with an overlay for the door slots
-// no door can be seen at, spawns the art has no sprite for, and a tooltip on every spawn point.
+// The layout in the game's art (roomart.js): the composed room, and on top of it the doors the Red
+// Key could open (red dashed doorways), markers for spawns the art has no sprite for, and a tooltip on
+// every spawn point.
 export function layoutArt(art, lay, room, floor, doorState, tally = null) {
   const canvas = compose(art, lay, room, floor, doorState);
   const wrap = document.createElement('div');
@@ -396,12 +433,15 @@ export function layoutArt(art, lay, room, floor, doorState, tally = null) {
   wrap.appendChild(canvas);
   const T = TILE, O = ORIGIN;
   const svg = el('svg', { viewBox: `0 0 ${canvas.width} ${canvas.height}`, role: 'img', 'aria-label': '房间布局（原版贴图）' }, wrap);
+  const walk = walkable(lay.shape, lay.width, lay.height);
   for (const [dx, dy, bit] of lay.door_list) {
-    const state = doorState(bit);
-    const d = el('rect', { x: O + dx * T + 2, y: O + dy * T + 2, width: T - 4, height: T - 4, rx: 3,
-      fill: state === 'open' ? 'transparent' : 'rgba(20, 15, 12, .55)', stroke: state === 'open' ? 'none' : '#e9b949',
-      'stroke-width': 2, 'stroke-dasharray': '5 3' }, svg);
-    el('title', {}, d).textContent = DOOR_TITLE[state === 'open' ? 'open' : 'slot'];
+    const st = doorState(bit);
+    if (st === 'wall') continue;
+    const p = doorPlace([dx, dy], walk);
+    const g = el('g', { transform: `translate(${O + (p.x + 0.5) * T} ${O + (p.y + 0.5) * T}) rotate(${Math.round(p.angle * 180 / Math.PI)})` }, svg);
+    if (st === 'key') el('path', { d: RED_DOOR, class: 'reddoor' }, g);
+    else el('rect', { x: -13, y: -13, width: 26, height: 26, fill: 'transparent' }, g);
+    el('title', {}, g).textContent = DOOR_TITLE[st];
   }
   const missing = new Set(unshown(art, lay, room, floor));
   for (const sp of lay.spawns) {
@@ -447,6 +487,18 @@ function openLarge(build, title) {
 
 // the layout with its caption and a count of what spawns in it: in the game's art when it can be
 // loaded (room and floor given), else as the diagram
+// a placeholder of the room's size while its layout and art load (instead of a different drawing)
+export function roomSkeleton(shape) {
+  const [w, h] = shapeSize(shape);
+  const box = document.createElement('div');
+  box.className = 'roomart skeleton';
+  box.style.aspectRatio = `${w + 4} / ${h + 4}`;
+  box.setAttribute('aria-label', '加载中');
+  return box;
+}
+
+// the layout with its caption and a count of what spawns in it: in the game's art (room and floor
+// given, art.json loaded), else the diagram
 export async function drawLayout(box, lay, doorState, where = null) {
   const tally = new Map();
   let view = null;
@@ -455,8 +507,8 @@ export async function drawLayout(box, lay, doorState, where = null) {
   if (art) {
     const prep = prepare(art, lay, room, floor);
     if (!prep.ready) {
-      box.textContent = '加载贴图…';
-      if (!(await prep.job)) prep.ready = false;
+      if (!box.querySelector('.skeleton')) box.replaceChildren(roomSkeleton(lay.shape));
+      await prep.job;
     }
     if (!box.isConnected) return;
     try {
@@ -476,11 +528,12 @@ export async function drawLayout(box, lay, doorState, where = null) {
     view.addEventListener('click', open);
     view.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); } });
   }
+  const keys = lay.door_list.some((d) => doorState(d[2]) === 'key');
   const cap = document.createElement('div');
   cap.className = 'caption';
   cap.textContent = isArt
-    ? `${lay.width}×${lay.height} 格，原版贴图${borrowed ? '（借用忏悔+ 的美术）' : ''}，点击放大。画出的门通向你知道的房间；黄框是布局上的门位，看不出有没有门。白点：多个候选，悬停查看。地板和石头的样式按规则随机，细节可能与游戏不同。`
-    : `${lay.width}×${lay.height} 格。绿色是门，黄色虚线是布局上有门位、这边却看不到门的地方。白点表示该处有多个候选，悬停查看概率。`;
+    ? `${lay.width}×${lay.height} 格，原版贴图${borrowed ? '（借用忏悔+ 的美术）' : ''}，点击放大。画出的门通向你知道的房间${keys ? '；红色虚线门是红钥匙能打开的门位' : ''}。白点：多个候选，悬停查看。地板和石头的样式按规则随机，细节可能与游戏不同。`
+    : `${lay.width}×${lay.height} 格。绿色是门${keys ? '，红色虚线是红钥匙能打开的门位' : ''}。白点表示该处有多个候选，悬停查看概率。`;
   const ul = document.createElement('ul');
   ul.className = 'spawnlist';
   for (const [name, n] of [...tally].sort((a, q) => q[1] - a[1])) {

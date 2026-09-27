@@ -72,17 +72,26 @@ export function nextBomb(inf, obs, allowed = null) {
   return best(score);
 }
 
-// the cell to open with the Red Key: a red room there reaches the ultra secret room if it is adjacent
+// the cell to open with the Red Key: a red room there reaches the ultra secret room if it is adjacent.
+// When no door slot is next to a place the ultra secret room could be, the one with most of it two
+// cells away (a red room there opens the way for a second one).
 export function nextRedKey(inf, obs, targets) {
   if (!inf.ultra.size || [...obs.values()].includes('ultra')) return null;
-  const score = new Map();
+  const open = (c) => !obs.has(c) || obs.get(c) === 'empty';
+  const score = new Map(), reach = new Map();
   for (const e of targets) {
-    if (obs.has(e)) continue;
-    let p = 0;
-    for (const n of neighbours(e)) p += inf.ultra.get(n) || 0;
+    if (!open(e)) continue;
+    let p = 0, q = 0;
+    const near = neighbours(e);
+    for (const n of near) p += inf.ultra.get(n) || 0;
+    for (const n of near) {
+      if (!open(n)) continue;
+      for (const m of neighbours(n)) if (m !== e && !near.includes(m)) q += inf.ultra.get(m) || 0;
+    }
     if (p > 1e-9) score.set(e, p);
+    else if (q > 1e-9) reach.set(e, q);
   }
-  return best(score);
+  return best(score) || best(reach);
 }
 
 // Expected bombs to find the secret and super secret rooms when always bombing the nextBomb cell,

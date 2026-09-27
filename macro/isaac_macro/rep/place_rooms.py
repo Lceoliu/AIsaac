@@ -199,7 +199,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import numpy as np
 
 from ..level import (CURSE_LABYRINTH, Player, ROOM_ARCADE, ROOM_BARREN, ROOM_BLACK_MARKET, ROOM_BOSS,
                      ROOM_BOSSRUSH, ROOM_CHALLENGE, ROOM_CHEST, ROOM_CURSE, ROOM_DEFAULT, ROOM_DICE,
@@ -210,7 +209,7 @@ from .bosspool import BossContext, pick_boss_room
 from .levelgen import GRID, PLACEMENT, door_target, index
 from .roomconfig import SHAPE_ANY, stage_id
 
-F32 = np.float32
+from ..f32 import F32  # noqa: E402
 ANY_VARIANT = 0xFFFFFFFF
 
 ROOM_ANGEL, ROOM_PLANETARIUM, ROOM_ULTRASECRET = 15, 24, 29
@@ -555,7 +554,7 @@ def end_room_blacklist(level) -> set[int]:
 
 
 # ---------------------------------------------------------------------------------------- odds
-def planetarium_chance(level) -> np.float32:
+def planetarium_chance(level) -> float:
     """Game::GetPlanetariumChance (0x34DBD0), float32 like the engine."""
     ctx, p, stage = level.ctx, level.ctx.player, level.stage
     sp = _stage_prime(level)

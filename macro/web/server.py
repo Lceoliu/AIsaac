@@ -11,6 +11,7 @@ the browser on the static site (tools/build_site.py), so the page works with eit
   GET /api/sprites?game=abplus|repplus
   GET /api/random
   GET /art/...      the room layouts' game art (web/roomart.py), built into rl/runs/macro/art once
+  GET /config.js    the page's settings; with rl/runs/macro/supabase.json the scoreboard is shared
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ import api  # noqa: E402
 import roomart  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / 'static'
+SUPABASE = Path(__file__).resolve().parents[2] / 'runs' / 'macro' / 'supabase.json'
 _art = {'dir': None}
 _art_lock = threading.Lock()
 
@@ -76,8 +78,25 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _config(self) -> None:
+        cfg = dict(backend='server')
+        try:
+            sb = json.loads(SUPABASE.read_text(encoding='utf-8'))
+            if sb.get('url') and sb.get('key'):
+                cfg['supabase'] = dict(url=sb['url'].rstrip('/'), key=sb['key'])
+        except (OSError, ValueError):
+            pass
+        body = f'window.MAPGEN_CONFIG = {json.dumps(cfg, ensure_ascii=False)};\n'.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/javascript; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         url = urlparse(self.path)
+        if url.path == '/config.js':
+            return self._config()
         if not url.path.startswith('/api/'):
             return super().do_GET()
         method = url.path[len('/api/'):]

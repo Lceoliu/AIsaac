@@ -3,8 +3,10 @@ site, where it runs in the browser under Pyodide (tools/build_site.py).
 
   run_json(params)      every floor of a run: rooms, doors, the hidden rooms' joint posterior
   layout_json(params)   one room layout with its spawns
+  layouts_json(params)  several layouts at once (keys "stage.type.variant,..."), for a whole floor
   sprites_json(params)  the game's minimap room tiles and room icons (data URLs + anm2 frames)
   random_json()         a random seed
+  warmup_json(params)   parse a game's room files ahead of the first run
   call(method, json)    the same, JSON in and out (for the Pyodide worker)
 
 Game data comes from each game's afterbirthp.a (roomconfig.default_archive_path(),
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import base64
 import html as htmllib
+import itertools
 import json
 import random
 import re
@@ -244,16 +247,19 @@ class Game:
                 self.evidence[key] = LayoutEvidence(self.room_config(), stage, stage_type)
         return self.evidence[key]
 
-    def levels(self, seed: int, player: Player, last: int, debug: bool, cathedral: bool) -> list:
+    def levels(self, seed: int, player: Player, last: int, debug: bool, cathedral: bool, floors: int = 99) -> list:
+        """The run's floors up to stage `last`, at most `floors` of them (the run stops there)."""
         rc = self.room_config()
         if self.rep:
             from isaac_macro.rep.level import RepGameContext
             from isaac_macro.rep.rng import Seeds as RepSeeds
             from isaac_macro.rep.run import iter_run as rep_iter_run
-            return list(rep_iter_run(rc, RepSeeds(seed), RepGameContext(player=player), last_stage=last,
-                                     debug_start=debug, cathedral=cathedral))
-        return list(iter_run(rc, Seeds(seed), GameContext(player=player), last_stage=last, debug_start=debug,
-                             cathedral=cathedral))
+            run = rep_iter_run(rc, RepSeeds(seed), RepGameContext(player=player), last_stage=last,
+                               debug_start=debug, cathedral=cathedral)
+        else:
+            run = iter_run(rc, Seeds(seed), GameContext(player=player), last_stage=last, debug_start=debug,
+                           cathedral=cathedral)
+        return list(itertools.islice(run, floors))
 
     def joint(self, floor: Floor, lv) -> dict[tuple, float]:
         """P(secret, super secret, ultra secret cells | the visible floor) as {(c, h, u): p}."""
@@ -396,7 +402,6 @@ def run_json(params: dict) -> dict:
     game = get_game(params)
     seed = parse_seed(params.get('seed', ''))
     mode = params.get('mode', 'debug')
-    last = 11 if params.get('last', '11') == '11' else 8
     cathedral = params.get('route', 'sheol') == 'cathedral'
 
     def num(key, default, lo, hi):
@@ -406,11 +411,14 @@ def run_json(params: dict) -> dict:
             v = default
         return max(lo, min(hi, v))
 
+    last = num('last', 11, 1, 11)
+    max_floors = num('floors', 99, 1, 99)          # a challenge plays the first few floors only
+
     max_hearts = num('max_hearts', 6, 0, 24)
     player = Player(hearts=num('hearts', 6, 0, max_hearts), max_hearts=max_hearts, soul_hearts=num('soul', 0, 0, 24),
                     keys=num('keys', 0, 0, 99), coins=num('coins', 0, 0, 99))
     with game.lock:
-        levels = game.levels(seed, player, last, mode == 'debug', cathedral)
+        levels = game.levels(seed, player, last, mode == 'debug', cathedral, max_floors)
         floors = []
         for lv in levels:
             floor = Floor.from_level(lv)
@@ -457,6 +465,37 @@ def layout_json(params: dict) -> dict:
                 missing=[list(c) for c in _missing_quadrant(room.shape)])
 
 
+def layouts_json(params: dict) -> dict:
+    """{key: layout} for keys "stage.type.variant" joined by commas; null where there is none."""
+    out = {}
+    for key in [k for k in params.get('keys', '').split(',') if k][:64]:
+        try:
+            sid, rtype, variant = (int(v) for v in key.split('.'))
+            out[key] = layout_json(dict(game=params.get('game', 'abplus'), stage=sid, type=rtype, variant=variant))
+        except ValueError:
+            out[key] = None
+    return out
+
+
+WARMUP_ORDER = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 13)   # special rooms, then by stage
+
+
+def warmup_json(params: dict) -> dict:
+    """Parse room files ahead of the first run: one stage file (`stage`), or all of them. The page asks
+    for one at a time while it is idle, so a real request never waits long behind it."""
+    rc = get_game(params).room_config()
+    stages = [int(params['stage'])] if 'stage' in params else sorted(rc.paths)
+    count = 0
+    for sid in stages:
+        if sid not in rc.paths:
+            continue
+        try:
+            count += len(rc.rooms(sid))
+        except (FileNotFoundError, NotImplementedError, ValueError):
+            continue
+    return dict(rooms=count, order=list(WARMUP_ORDER))
+
+
 def _missing_quadrant(shape: int) -> list:
     """Tile rectangles (x, y, w, h) that are not part of an L-shaped room (13x7 quadrants)."""
     return {9: [(0, 0, 13, 7)], 10: [(13, 0, 13, 7)], 11: [(0, 7, 13, 7)], 12: [(13, 7, 13, 7)]}.get(shape, [])
@@ -478,7 +517,8 @@ def random_json(params: dict | None = None) -> dict:
     return dict(value=v, text=seed_to_string(v))
 
 
-METHODS = {'run': run_json, 'layout': layout_json, 'sprites': sprites_json, 'random': random_json}
+METHODS = {'run': run_json, 'layout': layout_json, 'layouts': layouts_json, 'sprites': sprites_json,
+           'random': random_json, 'warmup': warmup_json}
 
 
 def call(method: str, params_json: str = '{}') -> str:
