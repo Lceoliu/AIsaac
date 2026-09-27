@@ -1057,6 +1057,7 @@ function roomPreview(r) {
   return roomSkeleton(r.shape);
 }
 function selectRoom(index) {
+  if (!state.data) return;
   state.selected = index;
   renderBoard();
   renderPanel();
@@ -1119,6 +1120,7 @@ function positionTip(e) {
   tip.style.top = `${Math.max(6, y)}px`;
 }
 function showTip(target, e) {
+  if (!state.data) return;
   const tip = $('tip');
   state.hover = { target, e };
   const p = play();
