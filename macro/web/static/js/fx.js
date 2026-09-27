@@ -83,6 +83,28 @@ export function animateIsaac(el, ui, scale = 2) {
 }
 
 // a thumbs up and "+100" popping up at (x, y) inside `host` (a positioned element), then fading
+// a floor with no miss: the Perfection trinket (满分考卷, the "A+" paper) stamped on the map
+export function stampPerfect(host, ui, text) {
+  if (!ui || !ui.perfect) return;
+  const box = document.createElement('div');
+  box.className = 'stamp';
+  box.appendChild(perfectIcon(ui, 5));
+  const label = document.createElement('b');
+  label.textContent = text;
+  box.appendChild(label);
+  host.appendChild(box);
+  setTimeout(() => box.remove(), 2600);
+}
+export function perfectIcon(ui, scale) {
+  const img = document.createElement('img');
+  img.src = 'art/' + ui.perfect.file;
+  img.alt = '满分考卷';
+  img.width = ui.perfect.w * scale;
+  img.height = ui.perfect.h * scale;
+  img.className = 'pixel perfect';
+  return img;
+}
+
 export function celebrate(host, ui, x, y, text, good = true) {
   const box = document.createElement('div');
   box.className = good ? 'cheer' : 'cheer miss';

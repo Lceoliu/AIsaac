@@ -81,9 +81,17 @@
     </aside>
   </div>
 
-  <p class="rules-strip" aria-label="计分规则">
+  <p class="rules-strip" id="rules-v1" aria-label="计分规则">
     <span>隐藏房 <b>+100</b></span><span>超级隐藏房 <b>+150</b></span><span class="rep-only">究极隐藏房 <b>+200</b></span>
     <span>空炸一次 <b class="neg">−25</b></span><span>一次不空全找到 <b>+50</b></span>
+  </p>
+  <p class="rules-strip" id="rules-v2" aria-label="计分规则" hidden>
+    <span>隐藏房 <b>+100</b></span><span>超级隐藏房 <b>+150</b></span><span class="rep-only">究极隐藏房 <b>+200</b></span>
+    <span class="note">第 1、2 层减半</span>
+    <span>每个一次就找到 <b>+25</b> <span class="note">第 6、7 层 +50</span></span>
+    <span title="只挨着一个房间的隐藏房">单连隐藏房 <b>+25</b></span><span class="rep-only" title="只有一个门位能开红房间连到它">单连究极隐藏房 <b>+50</b></span>
+    <span>空炸一次 <b class="neg">−25</b></span>
+    <span>一层不空 <b>+25</b> / <b>+50</b> / <b>+125</b> <span class="note">第 1–2 / 3–5 / 6–7 层</span></span>
   </p>
   <p id="engine" class="engine" role="status" aria-live="polite"></p>
 </main>

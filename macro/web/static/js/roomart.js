@@ -16,7 +16,9 @@ const images = new Map();
 
 export function loadArt() {
   if (!artJob) {
-    artJob = fetch('art/art.json').then((r) => (r.ok ? r.json() : null)).catch(() => null);
+    // asked again each time (a 304 when unchanged): its name never changes, and a copy cached from
+    // before an update would miss what the update added
+    artJob = fetch('art/art.json', { cache: 'no-cache' }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
   }
   return artJob;
 }

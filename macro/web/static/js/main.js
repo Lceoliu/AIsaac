@@ -3,7 +3,7 @@
 // linked posterior as optional hints (infer.js), points (score.js) and a shared board (scoreboard.js).
 import { aiExpected, aiReplay } from './ai.js';
 import { createBackend } from './backend.js';
-import { celebrate, isMuted, isaacSprite, animateIsaac, loadSounds, playSound, setMuted } from './fx.js';
+import { celebrate, isMuted, isaacSprite, animateIsaac, loadSounds, perfectIcon, playSound, setMuted, stampPerfect } from './fx.js';
 import {
   KIND_NAME, KIND_TYPE, best, infer, nextBomb, nextRedKey, pct, where,
 } from './infer.js';
@@ -15,7 +15,7 @@ import {
   canBomb, canKey, foundKinds, hiddenRooms, isComplete, keyTargets, knownCells, newPlay, undo, useBomb, useKey,
 } from './play.js';
 import { loadArt, prepare } from './roomart.js';
-import { CLEAN_BONUS, FIND_POINTS, MISS_POINTS, actionPoints, floorScore, maxScore } from './score.js';
+import { MISS_POINTS, floorScore, maxScore, rulesFor, rulesOf, singleLinked, tierOf } from './score.js';
 import { createScoreboard } from './scoreboard.js';
 
 const $ = (id) => document.getElementById(id);
@@ -51,6 +51,8 @@ const state = {
   geo: null, k: 6, hover: null, tipSig: null, art: undefined, profile: null, scoreboard: null, scope: 'today',
   board: null, boardJob: 0, warmed: new Set(), engineReady: false, ai: null, aiCache: new Map(), aiTimer: null,
   day: null,        // a daily run's own day: its seed and its scores keep it after midnight
+  started: null,    // the day this run was opened, and the scoring rules it plays by (score.js)
+  rules: null,
 };
 
 // ---------------------------------------------------------------------------- small helpers
@@ -218,16 +220,27 @@ function savePlay(i = state.floor) {
 }
 function recordRun(i, points) {
   const key = runKey(state.data.game, state.data.seed.value);
-  const rec = readJson(key, null) || { mode: state.mode, day: state.mode === 'daily' ? state.day : null, points: {} };
+  const rec = readJson(key, null) || { mode: state.mode, day: state.mode === 'daily' ? state.day : null, rules: state.rules.v, points: {} };
   rec.points[i] = points;
   writeJson(key, rec);
 }
+// the rules this run is scored by: those of the day it began; a random run already on record keeps
+// the ones it began with
+function runRules() {
+  if (state.mode === 'daily') return rulesFor(state.day);
+  if (state.mode === 'random') {
+    const rec = readJson(runKey(state.data.game, state.data.seed.value), null);
+    if (rec) return rulesOf(rec.rules || 1);
+  }
+  return rulesFor(state.started || today());
+}
+function scoreOf(i, p) { return floorScore(state.data.floors[i], p, i, state.rules); }
 function runPoints() {
   if (!state.data) return 0;
   let total = 0;
   state.data.floors.forEach((f, i) => {
     const p = state.plays.get(i) || (ranked() ? play(i) : null);
-    if (p && (p.log.length || p.revealed)) total += floorScore(f, p).total;
+    if (p && (p.log.length || p.revealed)) total += scoreOf(i, p).total;
   });
   return total;
 }
@@ -315,6 +328,7 @@ async function start(mode, { seed = null, day = null, floorIndex = 0, push = tru
     return;
   }
   state.day = mode === 'daily' ? challengeDay(day) : null;
+  state.started = today();
   const s = mode === 'daily' ? String(dailySeed(state.day, state.game)) : (seed || String(randomSeed()));
   await generate({ seed: s, floorIndex, push });
 }
@@ -342,6 +356,7 @@ async function generate({ seed = null, keepFloor = false, floorIndex = null, pus
   try {
     const [data, sheet] = await Promise.all([call('run', params), loadSheet(params.game)]);
     state.data = data;
+    state.rules = runRules();
     state.sheet = sheet;
     state.plays = new Map();
     state.expected = new Map();
@@ -378,6 +393,9 @@ function renderHome() {
   renderMe();
   for (const b of $('home-game').querySelectorAll('button')) b.setAttribute('aria-checked', String(b.dataset.game === state.game));
   for (const li of document.querySelectorAll('.rules-strip .rep-only')) li.hidden = state.game !== 'repplus';
+  const v2 = rulesFor(today()).v === 2;                       // the rules of a run begun today
+  $('rules-v1').hidden = v2;
+  $('rules-v2').hidden = !v2;
   const day = today();
   const [, mm, dd] = day.split('-');
   $('daily-meta').textContent = `${+mm} 月 ${+dd} 日 · ${MODES.daily.floors} 层 · 所有人同一局`;
@@ -494,7 +512,7 @@ function floorStatus(i) {
   const p = state.plays.get(i) || (ranked() ? play(i) : null);
   const total = hiddenRooms(f).length;
   const found = p ? foundKinds(p).size : 0;
-  if (ranked() && p && (p.revealed || found >= total)) return { text: `${floorScore(f, p).total} 分`, done: true };
+  if (ranked() && p && (p.revealed || found >= total)) return { text: `${scoreOf(i, p).total} 分`, done: true };
   if (p && p.revealed) return { text: '已揭晓', done: false };
   return { text: found >= total ? '全找到了' : `${found}/${total}`, done: found >= total };
 }
@@ -599,7 +617,7 @@ function act(cell) {
   const f = floor();
   const p = play();
   if (p.revealed || isComplete(f, p)) return;
-  let entry;
+  let entry, note = null;
   if (state.tool === 'bomb') {
     if (!canBomb(f, p, cell)) { flash('这里挨不着任何房间，炸不到。'); return; }
     entry = useBomb(f, p, cell);
@@ -608,36 +626,42 @@ function act(cell) {
     entry = useKey(f, p, cell);
     if (entry.tool === 'bomb') {      // right on a (super) secret room: scored as a bomb (play.js)
       state.tool = 'bomb';
-      flash(`${KIND_NAME[entry.found[0]]}按炸弹算：记一颗炸弹，已换回炸弹。`);
+      note = `${KIND_NAME[entry.found[0]]}按炸弹算：记一颗炸弹，已换回炸弹`;
     }
   }
   savePlay();
   render();
   playEffect($('map'), state.geo, entry.cell, entry.found.length > 0 || entry.tool === 'key', state.k);
-  feedback(entry);
+  feedback(entry, note);
   if (isComplete(f, p)) finishFloor();
 }
 
-// the found room pops with Isaac's thumbs up and the jingle; a miss shows what it cost
-function feedback(entry) {
+// the found room pops with Isaac's thumbs up and the jingle; a miss shows what it cost. The status line
+// says what this action alone earned besides (and clears what an earlier one said).
+function feedback(entry, note = null) {
   const map = $('map'), frame = $('frame');
   const r = map.getBoundingClientRect(), fr = frame.getBoundingClientRect();
   const scale = r.width / (parseFloat(map.getAttribute('width')) || r.width);
   const [x, y] = state.geo.pos(entry.cell);
   const px = r.left - fr.left + (x + state.geo.Sx / 2) * scale, py = r.top - fr.top + (y + state.geo.Sy / 2) * scale;
-  const pts = actionPoints(entry);
+  const sc = scoreOf(state.floor, play());
+  const pts = sc.per[sc.per.length - 1];
   if (entry.found.length) {
     playSound('secret');
     celebrate($('fx'), ui(), px, py, ranked() ? `+${pts}` : KIND_NAME[entry.found[0]]);
+    const extra = [note, bonusText(sc.parts[sc.parts.length - 1])].filter(Boolean).join('；');
+    if (extra) flash(extra); else setStatus('');
   } else {
+    setStatus('');
     celebrate($('fx'), ui(), px, py, ranked() ? `${pts}` : '空的', false);
   }
 }
 
 async function finishFloor() {
   const f = floor(), p = play(), i = state.floor;
-  const sc = floorScore(f, p);
+  const sc = scoreOf(i, p);
   if (sc.complete && !p.revealed) setTimeout(() => playSound('thumbsup', 0.9), 900);
+  if (sc.clean) setTimeout(() => stampPerfect($('fx'), ui(), `一次不空 +${sc.bonus}`), 700);   // the "A+" paper
   if (ranked() && !p.submitted) {
     p.submitted = true;
     savePlay(i);
@@ -658,8 +682,8 @@ async function finishFloor() {
 }
 
 async function giveUp() {
-  const f = floor(), p = play();
-  const sc = floorScore(f, p);
+  const p = play();
+  const sc = scoreOf(state.floor, p);
   const ok = !ranked() || confirm(`放弃这一层？按现在找到的计 ${sc.total} 分，之后不能再炸，并会揭晓答案。`);
   if (!ok) return;
   p.revealed = true;
@@ -694,14 +718,22 @@ function adviceText(f, p, inf) {
   return [`下一步：炸${where(s[0], f.start)}，${pct(s[1])} 能炸出${left.map((k) => KIND_NAME[k]).join('或')}。`, false];
 }
 
+// the bonuses of one find, as a line (null when it earned the room's points only)
+function bonusText(parts) {
+  const out = (parts || []).filter(([label]) => label === 'first' || label === 'link')
+    .map(([label, v, kind]) => (label === 'first' ? `一次就找到 +${v}` : `单连${KIND_NAME[kind]} +${v}`));
+  return out.length ? out.join(' · ') : null;
+}
 function scoreLine(f, p) {
-  const sc = floorScore(f, p);
+  const sc = scoreOf(state.floor, p);
   const box = html('div', { class: 'scoreline' });
   box.append(html('span', { class: 'lbl' }, ranked() ? '本层得分' : '本层得分（练习）'), html('b', { class: 'num' }, String(sc.total)));
   const bits = [];
   if (sc.misses) bits.push(`空 ${sc.misses} 次 −${sc.misses * MISS_POINTS}`);
-  if (sc.clean) bits.push(`干净利落 +${CLEAN_BONUS}`);
-  bits.push(`满分 ${maxScore(f)}`);
+  if (sc.firstPts) bits.push(`一次就找到 ${sc.firsts} 个 +${sc.firstPts}`);
+  if (sc.linkPts) bits.push(`单连 +${sc.linkPts}`);
+  if (sc.clean) bits.push(`一次不空 +${sc.bonus}`);
+  bits.push(`满分 ${maxScore(f, state.floor, state.rules)}`);
   box.appendChild(html('span', { class: 'bits' }, bits.join(' · ')));
   return box;
 }
@@ -732,7 +764,9 @@ function renderFindPanel(panel) {
     li.appendChild(state.sheet ? tileIcon(state.sheet, KIND_TYPE[h.kind], 2, got ? 'RoomVisited' : 'RoomUnvisited')
       : html('i', { style: `display:block;width:18px;height:16px;border-radius:3px;background:${css(TYPE_COLOR[KIND_TYPE[h.kind]])}` }));
     li.appendChild(html('span', {}, `${KIND_NAME[h.kind]}`));
-    const st = got ? `找到了 · +${FIND_POINTS[h.kind]}` : p.revealed ? `在${where(h.cell, f.start)}` : `${FIND_POINTS[h.kind]} 分`;
+    const worth = state.rules.room(h.kind, tierOf(state.floor));
+    const linked = state.rules.link[h.kind] && singleLinked(f).has(h.kind);   // only once found or shown
+    const st = got ? `找到了 · +${worth}${linked ? ' · 单连' : ''}` : p.revealed ? `在${where(h.cell, f.start)}${linked ? ' · 单连' : ''}` : `${worth} 分`;
     li.appendChild(html('span', { class: 'state' }, st));
     ul.appendChild(li);
   }
@@ -804,14 +838,15 @@ function renderFindPanel(panel) {
   if (p.log.length) {
     panel.appendChild(html('h4', {}, '记录'));
     const ol = html('ol', { class: 'log' });
-    for (const e of p.log) {
+    const per = scoreOf(state.floor, p).per;
+    p.log.forEach((e, idx) => {
       const [head, result, hit] = logText(e, f);
       const li = html('li', {}, head);
       li.appendChild(html('span', { class: hit ? 'hit' : '' }, result));
-      const pts = actionPoints(e);
+      const pts = per[idx];
       li.appendChild(html('span', { class: pts > 0 ? 'pts up' : 'pts' }, pts > 0 ? `+${pts}` : String(pts)));
       ol.appendChild(li);
-    }
+    });
     panel.appendChild(ol);
     ol.scrollTop = ol.scrollHeight;
   }
@@ -820,7 +855,7 @@ function renderFindPanel(panel) {
 // the card after a floor: Isaac's thumbs up, the points, and what is next
 function winCard(f, p) {
   const complete = isComplete(f, p) && !p.revealed;
-  const sc = floorScore(f, p);
+  const sc = scoreOf(state.floor, p);
   const last = state.floor >= state.data.floors.length - 1;
   const all = ranked() && state.data.floors.every((_, i) => floorDone(i));
   const win = html('div', { class: complete ? 'win' : 'win gaveup' });
@@ -830,12 +865,14 @@ function winCard(f, p) {
     head.appendChild(isaac);
     animateIsaac(isaac, ui(), 2);
   }
-  head.appendChild(html('h3', {}, complete ? '全找到了！' : '这一层结束了'));
+  if (sc.clean && ui() && ui().perfect) head.appendChild(perfectIcon(ui(), 2));   // 满分考卷: no miss on the floor
+  head.appendChild(html('h3', {}, complete ? (sc.clean ? '一次不空，全找到了！' : '全找到了！') : '这一层结束了'));
   win.appendChild(head);
   const ai = aiFor(state.floor).expected;
   const used = `你用了 ${p.bombs} 颗炸弹` + (p.keys ? `、${p.keys} 次红钥匙` : '');
   const aiText = ai ? `AI 平均要消耗 ${ai.bombs.toFixed(1)} 颗炸弹${rep() ? `和 ${ai.keys.toFixed(1)} 次红钥匙` : ''}。` : '';
-  win.appendChild(html('p', {}, `${ranked() ? `本层 ${sc.total} 分。` : ''}${used}；${aiText}`));
+  const perfect = sc.clean ? `（含一次不空 +${sc.bonus}）` : '';
+  win.appendChild(html('p', {}, `${ranked() ? `本层 ${sc.total} 分${perfect}。` : ''}${used}；${aiText}`));
   if (all) win.appendChild(html('p', { class: 'total' }, `挑战完成！${state.data.floors.length} 层一共 ${runPoints()} 分。`));
   const acts = html('div', { class: 'actions' });
   const watch = html('button', { type: 'button' }, '看 AI 怎么找');

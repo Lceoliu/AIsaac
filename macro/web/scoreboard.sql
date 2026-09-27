@@ -6,7 +6,10 @@
 -- first score counts, a replay of the same floor is refused.
 --
 -- The page computes the points itself, so a determined player could send made-up scores; the checks
--- below only keep them within what a floor can give.
+-- below only keep them within what a floor can give. Since the 2026-09-29 rules (js/score.js) a floor
+-- gives up to 800; a table made before then needs its cap raised once:
+--   alter table public.hr_scores drop constraint hr_scores_points_check;
+--   alter table public.hr_scores add constraint hr_scores_points_check check (points between 0 and 1000);
 
 create table if not exists public.hr_scores (
   id         bigint generated always as identity primary key,
@@ -17,7 +20,7 @@ create table if not exists public.hr_scores (
   day        date,
   seed       bigint      not null check (seed between 1 and 4294967295),
   floor      smallint    not null check (floor between 0 and 15),
-  points     smallint    not null check (points between 0 and 500),
+  points     smallint    not null check (points between 0 and 1000),
   bombs      smallint    not null check (bombs between 0 and 300),
   keys       smallint    not null check (keys between 0 and 300),
   hints      boolean     not null default false,

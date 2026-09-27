@@ -80,6 +80,7 @@ def test_ui_assets(renderer, tmp_path):
     assert len(happy['delays']) == 7 and happy['delays'][happy['thumb']] == 12      # the thumb is held longest
     assert (tmp_path / happy['file']).stat().st_size > 0
     assert (ui['redkey']['w'], ui['redkey']['h']) == (27, 14)
+    assert (ui['perfect']['w'], ui['perfect']['h']) == (19, 22)          # trinket 145, the "A+" paper
     assert {'IconSecretRoom', 'IconSuperSecretRoom', 'IconUltraSecretRoom', 'IconBomb'} <= set(ui['icons'])
     assert set(ui['sounds']) == {'secret', 'thumbsup'}
     menu = ui['menu']                              # the home page is built from the game's own menus

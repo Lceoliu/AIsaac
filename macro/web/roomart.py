@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from isaac_macro.archive import ArchiveSet                                   # noqa: E402
 from isaac_macro.rep.roomconfig import default_archive_path as rep_archive  # noqa: E402
 
-VERSION = 5
+VERSION = 6
 REP_GFX = ('sfx.a', 'music.a', 'graphics.a', 'afterbirth.a', 'afterbirthp.a', 'repentance.a')
 DEFAULT_OUT = Path(__file__).resolve().parents[2] / 'runs' / 'macro' / 'art'
 
@@ -527,6 +527,12 @@ def build_ui(r: Renderer, out: Path, log=print) -> dict:
         box = key.getbbox()
         key.crop(box).save(ui / 'redkey.png', optimize=True)
         index['redkey'] = dict(file='ui/redkey.png', w=box[2] - box[0], h=box[3] - box[1])
+    # items.xml trinket 145, Perfection (满分考卷, the "A+" paper): the badge of a floor with no miss
+    perfect = r.sheet('resources/gfx/items/trinkets/trinket_145_Perfection.png')
+    if perfect is not None:
+        box = perfect.getbbox()
+        perfect.crop(box).save(ui / 'perfect.png', optimize=True)
+        index['perfect'] = dict(file='ui/perfect.png', w=box[2] - box[0], h=box[3] - box[1])
     icons = r.anm2('resources/gfx/ui/minimap_icons.anm2')
     index['icons'] = {}
     for name in UI_ICONS:
@@ -566,7 +572,7 @@ def build_ui(r: Renderer, out: Path, log=print) -> dict:
             (ui / f'{name}.ogg').unlink()
             ext = 'mp3'
         index['sounds'][name] = f'ui/{name}.{ext}'
-    log(f"ui: happy {len(shots)} frames, red key {'yes' if 'redkey' in index else 'no'}, "
+    log(f"ui: happy {len(shots)} frames, red key {'yes' if 'redkey' in index else 'no'}, A+ {'yes' if 'perfect' in index else 'no'}, "
         f"{len(index['icons'])} icons, {len(index['menu'])} menu pieces, sounds {sorted(index['sounds'])}")
     return index
 
