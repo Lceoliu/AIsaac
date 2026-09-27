@@ -67,14 +67,86 @@ def checksum(data: bytes) -> int:
 
 
 class IsaacRng:
-    """Bob Jenkins' ISAAC as used by MiniZ::scramble for stored (uncompressed) archive blocks.
+    """Bob Jenkins' ISAAC as MiniZ::scramble (0x4ADB40) uses it for stored (uncompressed) blocks.
 
-    Seeded with a single 32-bit value (the entry's FNV hash). Not needed by any room file seen so far;
-    the stored path raises until it is verified against a real entry.
+    ISAACRNG::ISAACRNG(seed) (0x4B0740) fills the 256 result words from a PCG-style generator (64-bit
+    LCG, multiplier 0x5851F42D4C957F2D, increment 0x7F, XSH-RR output) started at
+    (seed << 32) | xorshift(seed), then runs the standard randinit(true) (init 0x4B03C0) and isaac()
+    (0x4B02A0). next() (0x4B0380) reads the results in order and refills after 256. MiniZ::init_decode
+    (0x4ADAB0) seeds it with the entry's second hash at every rewind.
     """
 
     def __init__(self, seed: int):
-        raise NotImplementedError('stored MiniZ blocks (ISAACRNG) are not translated yet')
+        seed &= MASK32
+        state = (seed << 32) | ((seed << 8) ^ (seed >> 9) ^ seed ^ (seed << 23)) & MASK32
+        self.rsl = []
+        for _ in range(256):
+            rot = state >> 59
+            x = (((state >> 18) ^ state) >> 27) & MASK32
+            self.rsl.append(((x >> rot) | (x << (-rot & 31))) & MASK32)
+            state = (state * 0x5851F42D4C957F2D + 0x7F) & 0xFFFFFFFFFFFFFFFF
+        self.mem = [0] * 256
+        self.aa = self.bb = self.cc = 0
+        self._randinit()
+        self.count = 0
+
+    @staticmethod
+    def _mix(a, b, c, d, e, f, g, h):
+        a ^= (b << 11) & MASK32; d = (d + a) & MASK32; b = (b + c) & MASK32
+        b ^= c >> 2; e = (e + b) & MASK32; c = (c + d) & MASK32
+        c ^= (d << 8) & MASK32; f = (f + c) & MASK32; d = (d + e) & MASK32
+        d ^= e >> 16; g = (g + d) & MASK32; e = (e + f) & MASK32
+        e ^= (f << 10) & MASK32; h = (h + e) & MASK32; f = (f + g) & MASK32
+        f ^= g >> 4; a = (a + f) & MASK32; g = (g + h) & MASK32
+        g ^= (h << 8) & MASK32; b = (b + g) & MASK32; h = (h + a) & MASK32
+        h ^= a >> 9; c = (c + h) & MASK32; a = (a + b) & MASK32
+        return [a, b, c, d, e, f, g, h]
+
+    def _randinit(self) -> None:
+        v = [0x9E3779B9] * 8
+        for _ in range(4):
+            v = self._mix(*v)
+        for src in (self.rsl, self.mem):
+            for i in range(0, 256, 8):
+                v = self._mix(*[(v[k] + src[i + k]) & MASK32 for k in range(8)])
+                self.mem[i:i + 8] = v
+        self._isaac()
+
+    def _isaac(self) -> None:
+        mem, rsl = self.mem, self.rsl
+        self.cc = (self.cc + 1) & MASK32
+        aa, bb = self.aa, (self.bb + self.cc) & MASK32
+        for i in range(256):
+            x = mem[i]
+            k = i & 3
+            if k == 0:
+                aa ^= (aa << 13) & MASK32
+            elif k == 1:
+                aa ^= aa >> 6
+            elif k == 2:
+                aa ^= (aa << 2) & MASK32
+            else:
+                aa ^= aa >> 16
+            aa = (mem[(i + 128) & 255] + aa) & MASK32
+            y = mem[i] = (mem[(x >> 2) & 255] + aa + bb) & MASK32
+            bb = rsl[i] = (mem[(y >> 10) & 255] + x) & MASK32
+        self.aa, self.bb = aa, bb
+
+    def next(self) -> int:
+        value = self.rsl[self.count]
+        self.count += 1
+        if self.count > 255:
+            self._isaac()
+            self.count = 0
+        return value
+
+    def scramble(self, buf: bytearray) -> None:
+        """MiniZ::scramble: one next() per 4 bytes, used low byte first."""
+        value = 0
+        for i in range(len(buf)):
+            if i & 3 == 0:
+                value = self.next()
+            buf[i] ^= (value >> (8 * (i & 3))) & 0xFF
 
 
 @dataclass(frozen=True)
@@ -126,18 +198,25 @@ class Archive:
     @staticmethod
     def _read_miniz(f, entry: Entry) -> bytes:
         # refill_buffer kind 2: [u32 header: bit31 = final, low 31 bits = compressed size] + bytes.
-        # A non-final chunk of exactly 0x400 bytes switches the stream to stored+scrambled mode.
+        # MiniZ::decode (0x4ADC80): the first non-final chunk of exactly 0x400 bytes switches the
+        # stream to stored mode for good; stored chunks are copied and XOR-ed with ISAAC output.
         inflater = zlib.decompressobj(-15)
+        isaac = None
         out = bytearray()
         while len(out) < entry.length:
             (header,) = struct.unpack('<I', f.read(4))
             size, final = header & 0x7FFFFFFF, bool(header >> 31)
-            chunk = f.read(size)
-            if not final and size == 0x400:
-                IsaacRng(entry.hash_b)
-            out += inflater.decompress(chunk)
+            chunk = bytearray(f.read(size))
+            if isaac is None and not final and size == 0x400:
+                isaac = IsaacRng(entry.hash_b)
+            if isaac is not None:
+                isaac.scramble(chunk)
+                out += chunk
+            else:
+                out += inflater.decompress(bytes(chunk))
+                if final:
+                    out += inflater.flush()
             if final:
-                out += inflater.flush()
                 break
         return bytes(out)
 

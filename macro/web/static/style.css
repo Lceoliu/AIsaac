@@ -35,6 +35,7 @@
   --heat: #ffcf40;
   --heat-ss: #c9a4ff;
   --heat-us: #ff7eb6;
+  --suggest: #ffd84d;
   --warn-bg: #fbe3c4;
   --warn-ink: #7a3d00;
   --sel: #ffffff;
@@ -129,7 +130,27 @@ main { padding: 16px 20px 8px; }
 .maphead h2 { margin: 0; font-size: 18px; }
 .toggles { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 13px; }
 .toggles label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
-.mapwrap { background: var(--map-bg); border-radius: 10px; padding: 12px; }
+.mapwrap { position: relative; background: var(--map-bg); border-radius: 10px; padding: 12px; }
+.cellmenu {
+  position: absolute; z-index: 6; width: 310px; max-width: calc(100% - 8px); padding: 10px 12px;
+  background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0,0,0,.35); font-size: 13px;
+}
+.cellmenu h4 { margin: 0 0 6px; font-size: 13px; }
+.cellmenu .hyp { margin: 0 0 4px; color: var(--muted); font-size: 12px; }
+.menubtns { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+.menubtns button { min-height: 30px; padding: 4px 10px; text-align: left; font-size: 13px; }
+.menubtns button[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.menumsg { margin: 6px 0 0; color: var(--accent); font-size: 12px; }
+.menumsg:empty { display: none; }
+.obslist { list-style: none; margin: 4px 0 8px; padding: 0; font-size: 12px; }
+.obslist li { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 2px 0; border-bottom: 1px dashed var(--line); }
+button.mini { min-height: 24px; padding: 0 8px; font-size: 12px; }
+button.mini.wide { width: 100%; }
+.card h4 { margin: 10px 0 4px; font-size: 13px; }
+.card .hint { margin: 10px 0 0; font-size: 12px; color: var(--muted); }
+svg .hitcell { cursor: pointer; }
+svg .hitcell:hover { fill: rgba(255, 255, 255, .08); }
 #map { display: block; width: 100%; height: auto; max-height: max(320px, calc(100vh - 300px)); }
 .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 12px; color: var(--muted); }
 .legend span { display: inline-flex; align-items: center; gap: 5px; }
@@ -151,6 +172,9 @@ main { padding: 16px 20px 8px; }
 
 .foot { padding: 6px 20px 24px; color: var(--muted); font-size: 12px; max-width: 1100px; }
 
+.pixel { image-rendering: crisp-edges; image-rendering: pixelated; }
+.legend svg { display: block; overflow: hidden; }
+svg text.outlined { paint-order: stroke; stroke: #000; stroke-width: 4px; stroke-linejoin: round; }
 svg .room { cursor: pointer; }
 svg .room:hover .cell { filter: brightness(1.18); }
 svg text { pointer-events: none; font-family: "PingFang SC", "Microsoft YaHei", sans-serif; }

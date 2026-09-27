@@ -37,6 +37,12 @@ from .levelgen import GRID, ROOM_SIZE, TRAVEL, door_target, index
 from .roomconfig import EXACT_DOORS_FACTOR, SHAPE_ANY, stage_id
 
 SCORE_BASE, SCORE_SPAN = 10, 5
+# LayoutEvidence ignores GetRandomRoom's in-floor weight decay. Where the exact-door layouts hold at
+# least 1/9.99 of the pool's initial weight it would call every other layout impossible, but once
+# earlier picks on the floor have decayed them the engine does take the other branch now and then:
+# 1 room in ~3,000 such rooms on generated floors (AB+ 1/2,629, J460 port 1/3,176). Keeping that
+# branch at least this likely stops one such room from ruling out the true hidden rooms.
+NON_EXACT_FLOOR = 5e-4
 OFFSETS = {1: -6, 2: -3}          # neighbour count -> score offset (3 or 4 neighbours: 0)
 SPECIAL_BLOCKING_TYPES = (ROOM_BOSS, ROOM_SUPERSECRET, ROOM_SECRET)
 ALL_DOORS = 0xFF
@@ -345,7 +351,7 @@ class LayoutEvidence:
         for (share, total, exact), (_, _, layout) in zip(self._stats(room.shape, required), self.components):
             if share == 0.0 or (room.shape, room.variant) not in layout:
                 continue
-            p_exact = min(1.0, self.factor * exact / total) if exact > 0 else 0.0
+            p_exact = min(1.0 - NON_EXACT_FLOOR, self.factor * exact / total) if exact > 0 else 0.0
             q = (1.0 - p_exact) * weight / total
             if doors == required:
                 q += p_exact * weight / exact
@@ -399,16 +405,42 @@ def _facing_slots(floor: Floor) -> dict[int, list]:
     return {c: [(floor.room(i), bits) for i, bits in m.items()] for c, m in out.items()}
 
 
-def hidden_posterior(floor: Floor, evidence: LayoutEvidence | None = None,
-                     ss_prior: dict[int, float] | None = None,
-                     secret_cell: int | None = None) -> tuple[dict[int, float], dict[int, float]]:
+def normalise(joint: dict[tuple, float]) -> dict[tuple, float]:
+    total = sum(joint.values())
+    return {k: w / total for k, w in joint.items()} if total > 0 else {}
+
+
+def condition_joint(joint: dict[tuple, float], known: dict[int, int] | None = None,
+                    empty=()) -> dict[tuple, float]:
+    """Bayes update of a joint over hidden-room cells by what the player saw: `known` {position in
+    the key: cell} (that hidden room was found there), `empty` cells that hold none of them (bombed
+    or opened with nothing behind). The hypotheses left keep their relative weights; {} if none is
+    left (the observations contradict the model)."""
+    empty = set(empty)
+    kept = {k: p for k, p in joint.items()
+            if all(k[i] == cell for i, cell in (known or {}).items())
+            and not any(c is not None and c in empty for c in k)}
+    return normalise(kept)
+
+
+def joint_marginals(joint: dict[tuple, float], width: int) -> list[dict[int, float]]:
+    """P(hidden room i at cell) for each position i of the joint's keys (None = no such room)."""
+    out: list[dict] = [defaultdict(float) for _ in range(width)]
+    for key, p in joint.items():
+        for i, cell in enumerate(key):
+            if cell is not None:
+                out[i][cell] += p
+    return [dict(m) for m in out]
+
+
+def hidden_joint(floor: Floor, evidence: LayoutEvidence | None = None,
+                 ss_prior: dict[int, float] | None = None) -> dict[tuple, float]:
     """Joint posterior of the secret room cell c and the super secret room cell h given the visible
-    floor, returned as the two marginals (P(secret at c), P(super secret at h)).
+    floor, as {(c, h): probability} (h None: the floor has no super secret room).
 
     P(c, h) is proportional to prior(h) * P_rules(c | h) * the product over normal rooms R next to
     c or h of P(layout_R | visible doors_R + slots to c and h) / P(layout_R | visible doors_R).
-    Without `evidence` this is secret_posterior / super_secret_prior. `secret_cell` conditions on a
-    secret room already found there (it must not be part of `floor`).
+    Without `evidence` its marginals are secret_posterior / super_secret_prior.
     """
     prior = ss_prior if ss_prior is not None else super_secret_prior(floor)
     if not prior:
@@ -419,23 +451,24 @@ def hidden_posterior(floor: Floor, evidence: LayoutEvidence | None = None,
     for h, ph in prior.items():
         rule = secret_given_super_secret(floor, h)
         for c, pc in rule.items():
-            if secret_cell is not None and c != secret_cell:
-                continue
             w = ph * pc
             if w > 0 and factor is not None:
                 w *= factor(factor.cell_slots([c] if h is None else [c, h]))
             if w > 0:
                 joint[(c, h)] = w
-    total = sum(joint.values())
-    if total <= 0:
-        return {}, {}
-    ps: dict[int, float] = defaultdict(float)
-    pss: dict[int, float] = defaultdict(float)
-    for (c, h), w in joint.items():
-        ps[c] += w / total
-        if h is not None:
-            pss[h] += w / total
-    return dict(ps), dict(pss)
+    return normalise(joint)
+
+
+def hidden_posterior(floor: Floor, evidence: LayoutEvidence | None = None,
+                     ss_prior: dict[int, float] | None = None,
+                     secret_cell: int | None = None) -> tuple[dict[int, float], dict[int, float]]:
+    """The marginals (P(secret at c), P(super secret at h)) of hidden_joint. `secret_cell`
+    conditions on a secret room already found there (it must not be part of `floor`)."""
+    joint = hidden_joint(floor, evidence, ss_prior)
+    if secret_cell is not None:
+        joint = condition_joint(joint, {0: secret_cell})
+    ps, pss = joint_marginals(joint, 2)
+    return ps, pss
 
 
 def wall_slot_heuristic(floor: Floor) -> dict[int, float]:

@@ -25,14 +25,12 @@ Static translation: nothing here has been checked against the running J460 engin
 """
 from __future__ import annotations
 
-from collections import defaultdict
-
 from ..floor import Floor, FloorRoom
 from ..level import CURSE_LABYRINTH, ROOM_BOSS, ROOM_CURSE, ROOM_DEFAULT, ROOM_SECRET, ROOM_SUPERSECRET
 from ..levelgen import GRID, TRAVEL, door_target, index
 from ..roomconfig import SHAPE_ANY
-from ..secret import OFFSETS, LayoutEvidence, LayoutFactor, secret_given_super_secret, super_secret_prior, \
-    win_probabilities
+from ..secret import (OFFSETS, LayoutEvidence, LayoutFactor, condition_joint, joint_marginals, normalise,
+                      secret_given_super_secret, super_secret_prior, win_probabilities)
 from .levelgen import BLOCK_OFFSETS, RING2
 from .place_rooms import ROOM_ULTRASECRET
 from .roomconfig import stage_id
@@ -213,14 +211,27 @@ def rep_super_secret_prior(floor: Floor) -> dict[int, float]:
 
 def hidden_posterior(floor: Floor, evidence: LayoutEvidence | None = None,
                      ss_prior: dict[int, float] | None = None, secret_cell: int | None = None,
-                     strange_door: bool = False) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
+                     strange_door: bool = False, super_cell: int | None = None,
+                     ultra_cell: int | None = None) -> tuple[dict[int, float], dict[int, float], dict[int, float]]:
+    """The marginals (P(c), P(h), P(u)) of hidden_joint; `secret_cell`, `super_cell` and
+    `ultra_cell` condition on hidden rooms found there (not part of `floor`)."""
+    joint = hidden_joint(floor, evidence, ss_prior, strange_door)
+    known = {i: cell for i, cell in enumerate((secret_cell, super_cell, ultra_cell)) if cell is not None}
+    if known:
+        joint = condition_joint(joint, known)
+    ps, pss, pus = joint_marginals(joint, 3)
+    return ps, pss, pus
+
+
+def hidden_joint(floor: Floor, evidence: LayoutEvidence | None = None,
+                 ss_prior: dict[int, float] | None = None, strange_door: bool = False) -> dict[tuple, float]:
     """Joint posterior of the secret room cell c, the super secret cell h and the ultra secret cell u
-    given the visible floor (all three hidden), returned as the marginals (P(c), P(h), P(u)).
+    given the visible floor (all three hidden), as {(c, h, u): probability} (None: no such room).
 
     P(c, h, u) is proportional to prior(h) * P_rules(c | h) * P_rules(u | c, h) * the product over
     recognised normal-room layouts of P(layout | visible doors + slots to c, h and u's red-room
-    cells) / P(layout | visible doors). `strange_door`: (6, 5) is blocked (strange_door_floor);
-    `secret_cell` conditions on a secret room found there (not part of `floor`)."""
+    cells) / P(layout | visible doors). `strange_door`: (6, 5) is blocked (strange_door_floor).
+    Observations update it with isaac_macro.secret.condition_joint."""
     prior = ss_prior if ss_prior is not None else rep_super_secret_prior(floor)
     if not prior:
         prior = {None: 1.0}
@@ -241,8 +252,6 @@ def hidden_posterior(floor: Floor, evidence: LayoutEvidence | None = None,
     for h, ph in prior.items():
         rule = secret_given_super_secret(floor, h, blocked)
         for c, pc in rule.items():
-            if secret_cell is not None and c != secret_cell:
-                continue
             w = ph * pc
             if w <= 0:
                 continue
@@ -258,16 +267,4 @@ def hidden_posterior(floor: Floor, evidence: LayoutEvidence | None = None,
                     wu *= factor(extra)
                 if wu > 0:
                     joint[(c, h, u)] = wu
-    total = sum(joint.values())
-    if total <= 0:
-        return {}, {}, {}
-    ps: dict[int, float] = defaultdict(float)
-    pss: dict[int, float] = defaultdict(float)
-    pus: dict[int, float] = defaultdict(float)
-    for (c, h, u), w in joint.items():
-        ps[c] += w / total
-        if h is not None:
-            pss[h] += w / total
-        if u is not None:
-            pus[u] += w / total
-    return dict(ps), dict(pss), dict(pus)
+    return normalise(joint)

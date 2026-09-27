@@ -10,15 +10,19 @@ anywhere. Repentance+ entity names come from its own string table (official Simp
   GET /api/run?game=abplus|repplus&seed=DXNH%20NZLG&mode=debug|normal&last=8|11&route=sheol|cathedral
               &coins=0&keys=0&hearts=6&max_hearts=6&soul=0
   GET /api/layout?game=abplus|repplus&stage=<room file id>&type=<room type>&variant=<variant>
+  GET /api/sprites?game=abplus|repplus   the game's minimap room tiles and room icons (read from its
+                                         own archive at run time, as data URLs with anm2 frames)
   GET /api/random
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import html as htmllib
 import json
 import random
 import re
+import struct
 import sys
 import threading
 import time
@@ -35,7 +39,7 @@ from isaac_macro.levelgen import GRID, TRAVEL, index                          # 
 from isaac_macro.rng import Seeds, seed_to_string, string_to_seed            # noqa: E402
 from isaac_macro.roomconfig import default_room_config                       # noqa: E402
 from isaac_macro.run import iter_run                                          # noqa: E402
-from isaac_macro.secret import LayoutEvidence, hidden_posterior              # noqa: E402
+from isaac_macro.secret import LayoutEvidence, hidden_joint, joint_marginals  # noqa: E402
 
 STATIC = Path(__file__).resolve().parent / 'static'
 
@@ -61,8 +65,9 @@ ROOM_TYPES = {  # type -> (Chinese name, map label)
     14: ('恶魔房', '魔'), 15: ('天使房', '天'), 16: ('夹层', '夹'), 17: ('头目车轮战', '车'),
     18: ('干净的卧室', '卧'), 19: ('肮脏的卧室', '卧'), 20: ('宝库', '库'), 21: ('骰子房', '骰'),
     22: ('黑市', '黑'), 23: ('贪婪出口', '出'), 24: ('星象房', '星'), 25: ('传送房', '传'),
-    26: ('传送出口', '传'), 27: ('隐藏出口', '出'), 28: ('蓝色房间', '蓝'), 29: ('究极隐藏房', '极'),
+    26: ('传送出口', '传'), 27: ('隐藏出口', '出'), 28: ('蓝色房间', '蓝'), 29: ('究极隐藏房', '究'),
 }
+MINIMAP_TILES = ('RoomVisited', 'RoomUnvisited', 'RoomCurrent')   # one frame per room shape 1-12
 SHAPES = ['', '1×1', '横向贮藏室', '纵向贮藏室', '1×2', '竖向长走廊', '2×1', '横向长走廊', '2×2',
           'L 型（缺左上）', 'L 型（缺右上）', 'L 型（缺左下）', 'L 型（缺右下）']
 SLOTS = ['左', '上', '右', '下', '左2', '上2', '右2', '下2']
@@ -96,6 +101,27 @@ def load_strings(archives) -> dict[str, tuple[str, str]]:
     return out
 
 
+def anm2_frames(xml: str) -> dict[str, list]:
+    """Animation name -> [[x crop, y crop, width, height, x pivot, y pivot], ...] of its first layer."""
+    out = {}
+    for m in re.finditer(r'<Animation Name="([^"]+)"[^>]*>(.*?)</Animation>', xml, re.S):
+        layer = re.search(r'<LayerAnimation[^>]*>(.*?)</LayerAnimation>', m.group(2), re.S)
+        if not layer:
+            continue
+        frames = []
+        for attrs in re.findall(r'<Frame ([^>]*?)/?>', layer.group(1)):
+            a = dict(re.findall(r'(\w+)="([^"]*)"', attrs))
+            frames.append([int(float(a.get(k, 0))) for k in ('XCrop', 'YCrop', 'Width', 'Height', 'XPivot', 'YPivot')])
+        out[m.group(1)] = frames
+    return out
+
+
+def png_sheet(archives, path: str) -> dict:
+    png = archives.read(path)
+    width, height = struct.unpack('>II', png[16:24])       # IHDR
+    return dict(url='data:image/png;base64,' + base64.b64encode(png).decode('ascii'), w=width, h=height)
+
+
 def load_entities(archives, strings: dict) -> dict[tuple, str]:
     xml = archives.read('resources/entities2.xml').decode('utf-8-sig', 'replace')
     out: dict[tuple, str] = {}
@@ -122,6 +148,7 @@ class Game:
         self.lock = threading.Lock()   # RoomConfig keeps the per-floor room weights: one generation at a time
         self._load_lock = threading.Lock()
         self._rc = None
+        self._sprites = None
         self.entities: dict = {}
         self.evidence: dict = {}
 
@@ -142,6 +169,21 @@ class Game:
                     self.entities = load_entities(rc.archives, strings)
                     self._rc = rc
         return self._rc
+
+    def sprites(self) -> dict:
+        """The minimap's room tiles (gfx/ui/minimap1) and room icons: Repentance+ keeps the icons in
+        gfx/ui/minimap_icons, AB+ in minimap1 itself. Frames come from the matching anm2."""
+        if self._sprites is None:
+            archives = self.room_config().archives
+            icon_file = 'minimap_icons' if self.rep else 'minimap1'
+            tiles = anm2_frames(archives.read('resources/gfx/ui/minimap1.anm2').decode('utf-8-sig', 'replace'))
+            icons = anm2_frames(archives.read(f'resources/gfx/ui/{icon_file}.anm2').decode('utf-8-sig', 'replace'))
+            self._sprites = dict(
+                tiles=dict(png_sheet(archives, 'resources/gfx/ui/minimap1.png'),
+                           frames={k: tiles[k] for k in MINIMAP_TILES if k in tiles}),
+                icons=dict(png_sheet(archives, f'resources/gfx/ui/{icon_file}.png'),
+                           frames={k: v[0] for k, v in icons.items() if k.startswith('Icon') and v}))
+        return self._sprites
 
     def layout_evidence(self, stage: int, stage_type: int, curses: int):
         if stage > 11 or stage == 9:
@@ -166,14 +208,14 @@ class Game:
         return list(iter_run(rc, Seeds(seed), GameContext(player=player), last_stage=last, debug_start=debug,
                              cathedral=cathedral))
 
-    def posteriors(self, floor: Floor, lv) -> tuple[dict, dict, dict]:
+    def joint(self, floor: Floor, lv) -> dict[tuple, float]:
+        """P(secret, super secret, ultra secret cells | the visible floor) as {(c, h, u): p}."""
         vis = floor.visible(self.hidden_types)
         ev = self.layout_evidence(lv.stage, lv.stage_type, lv.curses)
         if self.rep:
-            from isaac_macro.rep.secret import hidden_posterior as rep_hidden_posterior, strange_door_floor
-            return rep_hidden_posterior(vis, ev, strange_door=strange_door_floor(lv.stage, lv.stage_type, lv.curses))
-        ps, pss = hidden_posterior(vis, ev)
-        return ps, pss, {}
+            from isaac_macro.rep.secret import hidden_joint as rep_hidden_joint, strange_door_floor
+            return rep_hidden_joint(vis, ev, strange_door=strange_door_floor(lv.stage, lv.stage_type, lv.curses))
+        return {(c, h, None): p for (c, h), p in hidden_joint(vis, ev).items()}
 
     def entity_name(self, t: int, v: int, s: int) -> tuple[str, str]:
         if t == 0:
@@ -275,6 +317,29 @@ def _probs(post: dict) -> dict:
     return {str(c): round(p, 4) for c, p in post.items() if p >= 0.0005}
 
 
+def _door_targets(floor: Floor, game: Game) -> list:
+    """Empty cells behind a door slot of a visible room's layout: where the Red Key can open a red
+    room (Repentance+ only)."""
+    if not game.rep:
+        return []
+    vis = floor.visible(game.hidden_types)
+    out = set()
+    for r in vis.rooms:
+        for slot in range(8):
+            if r.layout_doors >> slot & 1:
+                t = r.slot_target(slot)
+                if t >= 0 and vis.grid[t] < 0:
+                    out.add(t)
+    return sorted(out)
+
+
+def _joint_rows(joint: dict) -> list:
+    """[[secret, super secret, ultra secret, p], ...] with -1 for a missing room; the page conditions
+    it on the player's observations (bombed walls, rooms found)."""
+    return [[c, -1 if h is None else h, -1 if u is None else u, float(f'{p:.5g}')]
+            for (c, h, u), p in sorted(joint.items(), key=lambda kv: -kv[1]) if p >= 1e-12]
+
+
 def run_json(params: dict) -> dict:
     t0 = time.time()
     game = get_game(params)
@@ -300,14 +365,16 @@ def run_json(params: dict) -> dict:
             floor = Floor.from_level(lv)
             by_index = {r.index: r for r in floor.rooms}
             rooms = [room_json(game, floor, d, by_index[d.list_index]) for d in lv.rooms if d.list_index in by_index]
-            ps, pss, pus = game.posteriors(floor, lv)
+            joint = game.joint(floor, lv)
+            ps, pss, pus = joint_marginals(joint, 3)
             zh, en = stage_label(lv.stage, lv.stage_type, lv.curses)
             floors.append(dict(
                 stage=lv.stage, stage_type=lv.stage_type, name=zh, name_en=en, stage_seed=lv.stage_seed,
                 curses=[zh_c for bit, zh_c, _ in CURSES if lv.curses & bit], curse_bits=lv.curses,
                 attempts=lv.attempts, start=floor.start, rooms=rooms, doors=door_segments(floor),
                 bosses=[dict(name=r['name'], variant=r['variant'], subtype=r['subtype']) for r in rooms if r['type'] == 5],
-                secret_posterior=_probs(ps), super_secret_posterior=_probs(pss), ultra_secret_posterior=_probs(pus)))
+                secret_posterior=_probs(ps), super_secret_posterior=_probs(pss), ultra_secret_posterior=_probs(pus),
+                joint=_joint_rows(joint), door_targets=_door_targets(floor, game)))
     return dict(game=game.key, game_name=game.title, version=game.version, validated=game.validated,
                 seed=dict(value=seed, text=seed_to_string(seed)), mode=mode, last=last,
                 route='cathedral' if cathedral else 'sheol',
@@ -369,10 +436,14 @@ class Handler(SimpleHTTPRequestHandler):
                 return self._json(200, run_json(params))
             if url.path == '/api/layout':
                 return self._json(200, layout_json(params))
+            if url.path == '/api/sprites':
+                return self._json(200, get_game(params).sprites())
             if url.path == '/api/random':
                 v = random.getrandbits(32) or 1
                 return self._json(200, dict(value=v, text=seed_to_string(v)))
             return self._json(404, dict(error='未知接口'))
+        except ConnectionError:   # the page went away (reload, new request) before the answer was sent
+            return None
         except FileNotFoundError as exc:
             return self._json(500, dict(error=f'找不到游戏资源文件：{exc}'))
         except (ValueError, KeyError) as exc:

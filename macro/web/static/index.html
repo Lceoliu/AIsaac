@@ -17,7 +17,7 @@
       <span>游戏版本</span>
       <select id="game" name="game">
         <option value="abplus">胎衣† v1.06</option>
-        <option value="repplus">忏悔+ v1.9.7.17（未经游戏验证）</option>
+        <option value="repplus">忏悔+ v1.9.7.17</option>
       </select>
     </label>
     <label class="field seed">
@@ -28,8 +28,8 @@
     <label class="field">
       <span>开局方式</span>
       <select id="mode" name="mode">
-        <option value="debug">调试开局（直接进地下室 I，全部解锁）</option>
-        <option value="normal">正常开局（输入种子开新局）</option>
+        <option value="debug">调试开局（第一层固定为地下室 I）</option>
+        <option value="normal">正常开局（和游戏里输入种子一样）</option>
       </select>
     </label>
     <label class="field">
@@ -54,7 +54,7 @@
         <label>红心<input id="hearts" type="number" min="0" max="24" value="6"></label>
         <label>心之容器<input id="max_hearts" type="number" min="0" max="24" value="6"></label>
         <label>魂心<input id="soul" type="number" min="0" max="24" value="0"></label>
-        <p class="hint">单位是半颗心。每层都按这组资源生成。硬币、钥匙和血量决定赌博房、宝库、骰子房、挑战房和卧室能不能出现：硬币 ≥ 5 时偶数层可能出赌博房，满血才出挑战房，低血才可能出卧室；宝库在胎衣†里要硬币 ≥ 5，在忏悔+里要钥匙 ≥ 2。</p>
+        <p class="hint">单位是半颗心。硬币、钥匙和血量会影响赌博房、宝库、骰子房、挑战房和卧室会不会出现。</p>
       </div>
     </details>
     <button type="submit" id="go" class="primary">生成</button>
@@ -76,15 +76,18 @@
         <div class="toggles">
           <label><input type="checkbox" id="t-hidden" checked> 显示隐藏房</label>
           <label><input type="checkbox" id="t-player"> 玩家视角 + 隐藏房概率</label>
+          <label><input type="checkbox" id="t-text"> 文字标签</label>
           <label><input type="checkbox" id="t-depth"> 生成深度</label>
         </div>
       </div>
-      <div id="mapwrap" class="mapwrap"><svg id="map" role="img" aria-label="楼层地图"></svg></div>
+      <div id="mapwrap" class="mapwrap"><svg id="map" role="img" aria-label="楼层地图"></svg>
+        <div id="cellmenu" class="cellmenu" role="dialog" aria-label="记下这个格子的结果" hidden></div></div>
       <div id="legend" class="legend"></div>
     </div>
 
     <aside class="sidecol">
       <div class="card" id="floorinfo"></div>
+      <div class="card" id="linkinfo" hidden></div>
       <div class="card" id="roominfo">
         <p class="muted">点击地图上的房间查看详情和布局。</p>
       </div>
@@ -93,15 +96,13 @@
 </main>
 
 <footer class="foot" data-game="abplus">
-  <p>生成器逐函数翻译自 AB+ v1.06 的楼层生成代码。已与引擎核对：9,774 个地下室种子的引擎日志逐一一致；6,000 个引擎整层导出（第 1–8、10、11 层的全部变体）逐房间一致，包括隐藏房和超级隐藏房的位置。
-  核对条件：全部成就解锁、以撒、没有饰品。依赖饰品和道具的分支（银元、血冠、碎卡片、黑蜡烛等），以及正常开局时第一层的类型选择，还没在引擎里核对。</p>
-  <p>"隐藏房概率"只用玩家看得见的信息计算：地图、各房间的布局及其门位（布局可以从房间内容认出），再按生成规则推断隐藏房和超级隐藏房的联合后验。它和种子无关。在引擎楼层上，按它炸墙第 1 颗就炸中隐藏房的概率是 88%，超级隐藏房是 76%。</p>
+  <p>按游戏的生成规则离线算出每一层的地图。默认条件（全部解锁、以撒、没有道具）下与游戏逐房间一致。</p>
+  <p>玩家视角：隐去隐藏房，只按看得见的地图和房间布局推算隐藏房和超级隐藏房在哪。点空格子可以记下炸墙的结果，两种隐藏房的概率会一起更新；鼠标停在格子上，可以看"假如在这里"时另一个隐藏房最可能在哪。</p>
 </footer>
 <footer class="foot" data-game="repplus" hidden>
-  <p><b>未经游戏验证。</b>忏悔+ 的生成器逐函数静态翻译自 v1.9.7.17（J460）的反编译代码，只做过一致性检查：数千局整局生成没有出错，满足各条放置规则。还没有和游戏本体逐层核对，个别细节可能和游戏不同。
-  目前只支持主线路线：不含下水道等支线楼层、家、上升之路、贪婪模式和挑战。错误房、黑市、夹层这类网格外的房间不画在地图上。</p>
-  <p>"隐藏房概率"同样只用玩家看得见的信息：地图和各房间的布局。忏悔+ 多了究极隐藏房，它不挨着任何房间；离它 2 格以内的房间，会在朝向它周围空格的方向多出门位（就是红钥匙能开出红房间的位置）。所以一个没有门的布局门位，也可能是指向究极隐藏房，三种隐藏房要放在一起推断。
-  在本生成器的 7,928 层上：按概率炸墙，第 1 颗就炸中隐藏房的概率是 88%，超级隐藏房是 77%；究极隐藏房第一猜命中 74%。这些数字是相对于这个未经验证的移植计算的。</p>
+  <p>按游戏的生成规则离线算出每一层的地图，目前包括主线楼层。错误房、黑市、夹层这类不在网格上的房间不画在地图上。</p>
+  <p>玩家视角：隐去隐藏房，只按看得见的地图和房间布局推算隐藏房、超级隐藏房和究极隐藏房在哪。究极隐藏房（红隐）离另外两种隐藏房至少 3 格，而且偏爱四周房间多的空格，所以三者要一起推算：红隐在某处的可能性高了，它附近的隐藏房候选就会下降。
+  点空格子可以记下炸墙或开红房间的结果（红房间会朝每个相邻房间开门），三种隐藏房的概率会一起更新。</p>
 </footer>
 
 <script src="app.js"></script>

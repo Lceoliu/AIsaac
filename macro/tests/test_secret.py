@@ -64,3 +64,46 @@ def test_posterior_supports_generated_truth(rc):
             assert secret_posterior(vis).get(truth, 0) > 0
         if rec['super_secret']:
             assert rec['super_secret'][0] in super_secret_candidates(vis)
+
+
+def test_condition_joint_is_bayes_by_elimination():
+    from isaac_macro.secret import condition_joint, joint_marginals
+    joint = {(1, 5, 9): 0.4, (1, 6, None): 0.2, (2, 5, 9): 0.3, (3, None, 8): 0.1}
+    ps, pss, pus = joint_marginals(joint, 3)
+    assert abs(ps[1] - 0.6) < 1e-12 and abs(pss[5] - 0.7) < 1e-12 and abs(pus[9] - 0.7) < 1e-12
+    empty = condition_joint(joint, empty=[1])        # bombed cell 1: nothing there
+    assert set(empty) == {(2, 5, 9), (3, None, 8)} and abs(empty[(2, 5, 9)] - 0.75) < 1e-12
+    found = condition_joint(joint, {2: 9})           # the third room found at cell 9
+    assert abs(joint_marginals(found, 3)[0][1] - 4 / 7) < 1e-12
+    assert condition_joint(joint, {0: 1}, empty=[5, 6]) == {}   # contradiction
+
+
+def test_hidden_posterior_conditioning_matches_the_joint(rc):
+    from isaac_macro.secret import LayoutEvidence, condition_joint, hidden_joint, hidden_posterior, joint_marginals
+    for rec, floor in iter_floors(rc, 6, seed=17):
+        if len(rec['secret']) != 1:
+            continue
+        vis = floor.visible()
+        ev = LayoutEvidence(rc, floor.stage, floor.stage_type)
+        joint = hidden_joint(vis, ev)
+        assert abs(sum(joint.values()) - 1) < 1e-9
+        _, pss = hidden_posterior(vis, ev, secret_cell=rec['secret'][0])
+        _, expected = joint_marginals(condition_joint(joint, {0: rec['secret'][0]}), 2)
+        assert pss.keys() == expected.keys() and all(abs(pss[k] - expected[k]) < 1e-12 for k in pss)
+
+
+def test_superset_layouts_never_impossible(rc):
+    """Where the exact-door layouts would always win with initial weights, a layout with extra door
+    slots keeps a small probability (GetRandomRoom's in-floor weight decay is not modelled)."""
+    from isaac_macro.floor import FloorRoom
+    from isaac_macro.secret import NON_EXACT_FLOOR, LayoutEvidence
+    ev = LayoutEvidence(rc, 3, 0)
+    checked = 0
+    for (shape, variant), (doors, _) in ev.layout.items():
+        for required in {d for d, _ in ev.by_shape[shape] if d & doors == d and d != doors}:
+            share, total, exact = ev._stats(shape, required)[0]
+            if exact and ev.factor * exact / total >= 1:
+                p = ev.prob(FloorRoom(0, 0, 0, shape, 1, variant), required)
+                assert 0 < p <= NON_EXACT_FLOOR
+                checked += 1
+    assert checked > 0
