@@ -1,15 +1,16 @@
-"""Smoke test of the web UI's JSON API (web/server.py) for both games."""
+"""Smoke test of the web page's JSON API (web/api.py) for both games, from the archives and from the
+extracted files the static site ships."""
 import importlib.util
 from pathlib import Path
 
 import pytest
 
-SERVER = Path(__file__).resolve().parents[1] / 'web' / 'server.py'
+API = Path(__file__).resolve().parents[1] / 'web' / 'api.py'
 
 
 @pytest.fixture(scope='module')
 def server():
-    spec = importlib.util.spec_from_file_location('macro_web_server', SERVER)
+    spec = importlib.util.spec_from_file_location('macro_web_api', API)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -58,3 +59,24 @@ def test_sprites_are_the_games_minimap(server, rc, rep_rc):
         assert all(len(sprites['tiles']['frames'][k]) == 12 for k in ('RoomVisited', 'RoomUnvisited', 'RoomCurrent'))
         assert sprites['tiles']['frames']['RoomVisited'][0][2:4] == [9, 8]          # a 1x1 room is 9x8 pixels
         assert icon_names <= set(sprites['icons']['frames'])
+
+
+def test_extracted_files_give_the_same_run(server, rc, rep_rc, tmp_path):
+    """The static site reads tools/build_site.py's extracted files (archive.FileSet) instead of the
+    archives; the runs must be identical."""
+    spec = importlib.util.spec_from_file_location('build_site', API.parents[1] / 'tools' / 'build_site.py')
+    build = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(build)
+    params = dict(seed='DXNH NZLG', last='8', mode='normal')
+    ref = {game: server.run_json(dict(params, game=game))['floors'] for game in ('abplus', 'repplus')}
+    for game in ref:
+        for name, data in build.game_files(game).items():
+            path = tmp_path / game / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(data)
+    server.configure({game: str(tmp_path / game) for game in ref})
+    try:
+        for game in ref:
+            assert server.run_json(dict(params, game=game))['floors'] == ref[game]
+    finally:
+        server.configure({game: None for game in ref})

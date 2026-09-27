@@ -256,6 +256,20 @@ def _unscramble(buf: bytearray, key: int) -> int:
     return key
 
 
+class FileSet:
+    """Resource files extracted under `root` with their archive paths lower-cased (resources/...),
+    read like an ArchiveSet. The static web build ships these instead of the game's .a archives."""
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root)
+
+    def read(self, name: str) -> bytes:
+        path = self.root / _normalise(name).decode('latin-1')
+        if not path.is_file():
+            raise FileNotFoundError(name)
+        return path.read_bytes()
+
+
 class ArchiveSet:
     """Archives in load order; a later archive overrides an earlier one (LoadArchiveFile)."""
 

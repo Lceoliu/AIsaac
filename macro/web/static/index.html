@@ -3,108 +3,116 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>以撒楼层生成器</title>
+<title>找隐藏房 · 以撒的结合</title>
+<meta name="description" content="输入种子，生成《以撒的结合》真实的楼层，在游戏小地图上用炸弹和红钥匙找出隐藏房。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Silkscreen&family=ZCOOL+KuaiLe&display=swap">
 <link rel="stylesheet" href="style.css">
+<script src="config.js"></script>
 </head>
 <body>
-<header class="topbar">
+<header class="top">
   <div class="brand">
-    <h1>以撒楼层生成器</h1>
-    <p class="sub" id="subtitle">输入种子，离线生成《以撒的结合：胎衣†》v1.06 每一层的地图</p>
+    <p class="eyebrow">以撒的结合 · 楼层与隐藏房</p>
+    <h1>找隐藏房</h1>
   </div>
-  <form id="controls" class="controls" autocomplete="off">
-    <label class="field">
-      <span>游戏版本</span>
-      <select id="game" name="game">
-        <option value="abplus">胎衣† v1.06</option>
-        <option value="repplus">忏悔+ v1.9.7.17</option>
-      </select>
+  <form id="seedform" class="seedbar" autocomplete="off">
+    <div class="segmented" role="radiogroup" aria-label="游戏版本">
+      <button type="button" role="radio" data-game="abplus" aria-checked="true">胎衣†</button>
+      <button type="button" role="radio" data-game="repplus" aria-checked="false">忏悔+</button>
+    </div>
+    <label class="seed">
+      <span class="visually-hidden">种子</span>
+      <input id="seed" type="text" inputmode="text" placeholder="种子，如 DXNH NZLG" spellcheck="false" maxlength="10">
     </label>
-    <label class="field seed">
-      <span>种子</span>
-      <input id="seed" name="seed" type="text" placeholder="例如 DXNH NZLG" spellcheck="false">
-    </label>
-    <button type="button" id="random" class="ghost" title="随机一个种子">随机</button>
-    <label class="field">
-      <span>开局方式</span>
-      <select id="mode" name="mode">
-        <option value="debug">调试开局（第一层固定为地下室 I）</option>
-        <option value="normal">正常开局（和游戏里输入种子一样）</option>
-      </select>
-    </label>
-    <label class="field">
-      <span>第 5 章路线</span>
-      <select id="route" name="route">
-        <option value="sheol">阴间 → 暗室</option>
-        <option value="cathedral">教堂 → 玩具箱</option>
-      </select>
-    </label>
-    <label class="field">
-      <span>生成到</span>
-      <select id="last" name="last">
-        <option value="11">第 11 层</option>
-        <option value="8">第 8 层</option>
-      </select>
-    </label>
-    <details class="field resources">
-      <summary>玩家资源</summary>
-      <div class="res-grid">
-        <label>硬币<input id="coins" type="number" min="0" max="99" value="0"></label>
-        <label>钥匙<input id="keys" type="number" min="0" max="99" value="0"></label>
-        <label>红心<input id="hearts" type="number" min="0" max="24" value="6"></label>
-        <label>心之容器<input id="max_hearts" type="number" min="0" max="24" value="6"></label>
-        <label>魂心<input id="soul" type="number" min="0" max="24" value="0"></label>
+    <button type="button" id="dice" class="icon-btn" title="随机种子" aria-label="随机种子">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="1.5" width="13" height="13" rx="2.5"/><circle cx="5" cy="5" r="1.3"/><circle cx="11" cy="5" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="5" cy="11" r="1.3"/><circle cx="11" cy="11" r="1.3"/></svg>
+    </button>
+    <button type="submit" id="go" class="primary">生成</button>
+    <details class="options" id="options">
+      <summary>选项</summary>
+      <div class="options-panel">
+        <label>开局方式
+          <select id="mode">
+            <option value="normal">正常开局（和游戏里输入种子一样）</option>
+            <option value="debug">调试开局（第一层固定为地下室 I）</option>
+          </select>
+        </label>
+        <label>第 5 章路线
+          <select id="route">
+            <option value="sheol">阴间 → 暗室</option>
+            <option value="cathedral">教堂 → 玩具箱</option>
+          </select>
+        </label>
+        <label>生成到
+          <select id="last">
+            <option value="11">第 11 层</option>
+            <option value="8">第 8 层</option>
+          </select>
+        </label>
+        <fieldset>
+          <legend>进每一层时的资源</legend>
+          <label>硬币<input id="coins" type="number" min="0" max="99" value="0"></label>
+          <label>钥匙<input id="keys" type="number" min="0" max="99" value="0"></label>
+          <label>红心<input id="hearts" type="number" min="0" max="24" value="6"></label>
+          <label>心之容器<input id="max_hearts" type="number" min="0" max="24" value="6"></label>
+          <label>魂心<input id="soul" type="number" min="0" max="24" value="0"></label>
+        </fieldset>
         <p class="hint">单位是半颗心。硬币、钥匙和血量会影响赌博房、宝库、骰子房、挑战房和卧室会不会出现。</p>
       </div>
     </details>
-    <button type="submit" id="go" class="primary">生成</button>
   </form>
 </header>
 
-<div id="status" class="status" role="status"></div>
+<p id="status" class="status" role="status" aria-live="polite"></p>
 
-<main id="app" hidden>
-  <section class="summary">
-    <div id="seedline" class="seedline"></div>
-    <nav id="floors" class="floors" aria-label="楼层"></nav>
-  </section>
+<main id="app">
+  <nav id="floors" class="floors" aria-label="楼层" hidden></nav>
 
-  <section class="workspace">
-    <div class="mapcol">
-      <div class="maphead">
+  <section class="stage">
+    <div class="board">
+      <div class="board-head" id="boardhead" hidden>
         <h2 id="floortitle"></h2>
-        <div class="toggles">
-          <label><input type="checkbox" id="t-hidden" checked> 显示隐藏房</label>
-          <label><input type="checkbox" id="t-player"> 玩家视角 + 隐藏房概率</label>
-          <label><input type="checkbox" id="t-text"> 文字标签</label>
-          <label><input type="checkbox" id="t-depth"> 生成深度</label>
+        <div class="tabs" role="tablist" aria-label="视图">
+          <button type="button" role="tab" id="tab-find" data-view="find" aria-selected="true">找隐藏房</button>
+          <button type="button" role="tab" id="tab-map" data-view="map" aria-selected="false">完整地图</button>
         </div>
       </div>
-      <div id="mapwrap" class="mapwrap"><svg id="map" role="img" aria-label="楼层地图"></svg>
-        <div id="cellmenu" class="cellmenu" role="dialog" aria-label="记下这个格子的结果" hidden></div></div>
-      <div id="legend" class="legend"></div>
+      <div id="frame" class="frame">
+        <svg id="map" class="map" role="img" aria-label="楼层小地图"></svg>
+        <div id="welcome" class="welcome">
+          <h2>选一个种子，把藏起来的房间找出来</h2>
+          <ol>
+            <li>选游戏版本，输入种子，或者随机来一局。</li>
+            <li>在小地图上点墙外的格子，用炸弹炸开。忏悔+ 还能用红钥匙开红房间。</li>
+            <li>彩色格子是按生成规则算出的概率，只用你看得见的信息。</li>
+          </ol>
+          <button type="button" id="welcome-random" class="primary">随机来一局</button>
+        </div>
+        <div id="loading" class="loading" hidden>
+          <h2>正在准备</h2>
+          <ul id="loading-steps"></ul>
+          <p class="hint">只有第一次打开要下载约 15 MB，之后浏览器会缓存。</p>
+        </div>
+        <div id="busy" class="busy" hidden><span></span>生成中</div>
+        <div id="tip" class="tip" hidden></div>
+      </div>
+      <div class="board-foot" id="boardfoot" hidden>
+        <div id="legend" class="legend"></div>
+        <label class="toggle"><input type="checkbox" id="t-text"> 文字标签</label>
+      </div>
     </div>
 
-    <aside class="sidecol">
-      <div class="card" id="floorinfo"></div>
-      <div class="card" id="linkinfo" hidden></div>
-      <div class="card" id="roominfo">
-        <p class="muted">点击地图上的房间查看详情和布局。</p>
-      </div>
-    </aside>
+    <aside class="panel" id="panel" hidden></aside>
   </section>
 </main>
 
-<footer class="foot" data-game="abplus">
-  <p>按游戏的生成规则离线算出每一层的地图。默认条件（全部解锁、以撒、没有道具）下与游戏逐房间一致。</p>
-  <p>玩家视角：隐去隐藏房，只按看得见的地图和房间布局推算隐藏房和超级隐藏房在哪。点空格子可以记下炸墙的结果，两种隐藏房的概率会一起更新；鼠标停在格子上，可以看"假如在这里"时另一个隐藏房最可能在哪。</p>
-</footer>
-<footer class="foot" data-game="repplus" hidden>
-  <p>按游戏的生成规则离线算出每一层的地图，目前包括主线楼层。错误房、黑市、夹层这类不在网格上的房间不画在地图上。</p>
-  <p>玩家视角：隐去隐藏房，只按看得见的地图和房间布局推算隐藏房、超级隐藏房和究极隐藏房在哪。究极隐藏房（红隐）离另外两种隐藏房至少 3 格，而且偏爱四周房间多的空格，所以三者要一起推算：红隐在某处的可能性高了，它附近的隐藏房候选就会下降。
-  点空格子可以记下炸墙或开红房间的结果（红房间会朝每个相邻房间开门），三种隐藏房的概率会一起更新。</p>
+<footer class="foot">
+  <p>楼层按游戏的生成规则离线算出；隐藏房的概率只用玩家看得见的信息（地图和房间布局）推算。</p>
+  <p>《以撒的结合》的房间数据、图标和贴图来自游戏本体，版权归 Edmund McMillen 和 Nicalis 所有。</p>
 </footer>
 
-<script src="app.js"></script>
+<script type="module" src="js/main.js"></script>
 </body>
 </html>
