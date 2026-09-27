@@ -85,6 +85,7 @@ post = secret_posterior(floor.visible())   # {格子: 概率}，只用玩家可�
   - 本地服务第一次用时把贴图打包到 `rl/runs/macro/art`（约 13 秒，3.8 MB），`python web/roomart.py` 也能单独打包；静态站点打包进 `art/`。浏览器按房间需要加载，面板里的图可以点开放大（整数倍放大）。
 - **画法**：默认是游戏的小地图，格子贴图 `gfx/ui/minimap1`（每种形状一帧，9×8 像素），房间图标取自忏悔+ 的 `gfx/ui/minimap_icons` 或胎衣† 的 `minimap1`，按整数倍放大保持像素清晰。楼层缩略图就是 1 倍大小的小地图。勾"文字标签"改成彩色格子加汉字（究极隐藏房标"究"）。
 - **界面**：游戏版本、种子（自动加空格，可随机）和"选项"（开局方式、第 5 章路线、生成到第几层、进每层时的资源）。URL 带着游戏、种子、视图和楼层，可以直接分享。快捷键：←/→ 换层，B 炸弹，K 红钥匙，H 概率，Z 撤销，M 切换视图。
+- **已发布**：<https://lceoliu.github.io/find-Isaac-hiding-rooms/>（公开仓库 [Lceoliu/find-Isaac-hiding-rooms](https://github.com/Lceoliu/find-Isaac-hiding-rooms)，只放构建好的站点和一份说明，Pages 从 `main` 分支根目录发布；2026-09-27 首次发布，对应 24e2404）。更新时重新运行 `build_site.py`，把输出目录的内容同步到发布仓库的本地副本 `rl/runs/macro/publish/find-Isaac-hiding-rooms`（保留它的 `.git` 和 `README.md`），提交并推送即可。
 - **发布到 GitHub Pages**：把输出目录的内容推到一个公开仓库（根目录或 `docs/`），在仓库设置里开启 Pages。目录里有 `.nojekyll`，所有路径都是相对路径，放在子路径下也能用。**注意**：`data/*.zip`、`art/` 和小地图图片是游戏本体的版权素材，发布站点等于公开分发它们；忏悔+ 的生成器还没和游戏逐层核对。
 
 **导出数据集**
