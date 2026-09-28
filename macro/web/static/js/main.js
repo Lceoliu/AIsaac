@@ -29,6 +29,8 @@ const PARAMS = ['mode', 'route', 'last', 'coins', 'keys', 'hearts', 'max_hearts'
 const DEFAULTS = { mode: 'normal', route: 'sheol', last: '11', coins: '0', keys: '0', hearts: '6', max_hearts: '6', soul: '0' };
 const STORE_TEXT = 'isaac-mapgen-text-labels';
 const ONE_COLUMN = window.matchMedia('(max-width: 980px)');   // the panel sits below the map (style.css)
+const FLOORS_OPEN = 'hr-floors-open';
+const COACH = 'hr-coach-room';     // set once the player has opened a room's layout from the map
 const PROFILE = 'hr-profile-v1';
 const PLAYS = 'hr-play-v1:';     // + game:seed:floor -> a ranked floor's play, kept across reloads
 const RUNS = 'hr-run-v1:';       // + game:seed -> {mode, day, points: {floor: points}}
@@ -53,6 +55,7 @@ const state = {
   day: null,        // a daily run's own day: its seed and its scores keep it after midnight
   started: null,    // the day this run was opened, and the scoring rules it plays by (score.js)
   rules: null,
+  floorsOpen: false, // in one column the floor thumbnails fold into a row of numbers
 };
 
 // ---------------------------------------------------------------------------- small helpers
@@ -473,6 +476,9 @@ function render() {
   $('app').classList.toggle('ready', has);
   $('welcome').hidden = has || state.pending > 0 || state.mode !== 'practice';
   $('floors').hidden = !has;
+  $('floorbar').hidden = !has;
+  $('maptools').hidden = true;                     // renderMapTools shows it when it applies
+  $('app').classList.toggle('floors-open', state.floorsOpen);
   $('boardhead').hidden = !has;
   $('boardfoot').hidden = !has;
   $('panel').hidden = !has;
@@ -483,8 +489,10 @@ function render() {
   $('t-text').checked = state.text;
   $('t-text').disabled = !state.sheet;
   renderFloors();
+  renderFloorbar();
   renderBoard();
   renderPanel();
+  renderMapTools();
   renderLegend();
   prefetchFloor();
 }
@@ -557,6 +565,7 @@ function redKeyIcon() {
 }
 
 function renderBoard() {
+  for (const el of document.querySelectorAll('.coach')) el.remove();
   const f = floor();
   const title = $('floortitle');
   title.replaceChildren(document.createTextNode(f.name), html('small', {}, f.name_en));
@@ -593,6 +602,78 @@ function renderBoard() {
     actionable: done ? () => false : (c) => (state.tool === 'bomb' ? canBomb(f, p, c) : canKey(f, p, c)),
     onCell: act, onRoom: pickRoom,
   });
+  renderCoach(f);
+}
+
+// Folded floors (one column): the floors as a row of numbers, the thumbnails one tap away.
+function renderFloorbar() {
+  const pills = html('div', { class: 'fpills' });
+  state.data.floors.forEach((f, i) => {
+    const st = floorStatus(i);
+    const b = html('button', { type: 'button', class: st.done ? 'fpill done' : 'fpill', 'aria-current': String(i === state.floor),
+      title: `${f.name} · ${st.text}`, 'aria-label': `第 ${i + 1} 层 ${f.name}，${st.text}` }, String(i + 1));
+    b.addEventListener('click', () => goFloor(i));
+    pills.appendChild(b);
+  });
+  const more = html('button', { type: 'button', class: 'fmore', 'aria-expanded': String(state.floorsOpen), 'aria-controls': 'floors' },
+    state.floorsOpen ? '收起 ▴' : '缩略图 ▾');
+  more.addEventListener('click', () => {
+    state.floorsOpen = !state.floorsOpen;
+    try { localStorage.setItem(FLOORS_OPEN, state.floorsOpen ? '1' : '0'); } catch { /* storage unavailable */ }
+    render();
+  });
+  $('floorbar').replaceChildren(pills, more);
+  const cur = pills.children[state.floor];         // keep the current floor in view, horizontally only
+  if (cur && (cur.offsetLeft < pills.scrollLeft || cur.offsetLeft + cur.offsetWidth > pills.scrollLeft + pills.clientWidth)) {
+    pills.scrollLeft = cur.offsetLeft - 8;
+  }
+}
+
+// The bomb and the Red Key right under the map, so switching needs no scrolling (one column, Rep+;
+// style.css hides it on wide screens, where the panel with the tools is beside the map).
+function toolButton(id, label, count, disabled) {
+  const b = html('button', { type: 'button', 'aria-pressed': String(state.tool === id), title: `${label}（${id === 'bomb' ? 'B' : 'K'}）`, disabled });
+  b.appendChild(toolIcon(id));
+  b.append(html('span', {}, label), html('b', { class: 'count', title: '已用' }, String(count)));
+  b.addEventListener('click', () => { state.tool = id; render(); });
+  return b;
+}
+function renderMapTools() {
+  const box = $('maptools');
+  const f = floor(), p = play();
+  const show = state.view === 'find' && !aiShown() && rep() && !isComplete(f, p) && !p.revealed;
+  box.hidden = !show;
+  $('app').classList.toggle('has-maptools', show);
+  box.replaceChildren(...(show ? [toolButton('bomb', '炸弹', p.bombs, false), toolButton('key', '红钥匙', p.keys, false)] : []));
+}
+
+// The first time on a phone: a ring on a room and a note that a tap shows its layout (the panel that
+// says so is below the map). Gone for good once a room is opened, or the note is tapped.
+function renderCoach(f) {
+  for (const el of document.querySelectorAll('.coach')) el.remove();
+  let seen = true;
+  try { seen = localStorage.getItem(COACH) === '1'; } catch { /* storage unavailable: never nag */ }
+  if (seen || !ONE_COLUMN.matches || !state.geo) return;
+  const room = f.rooms.find((r) => !r.hidden && r.type === 5) || f.rooms.find((r) => r.start);
+  if (!room) return;
+  const map = $('map'), frame = $('frame');
+  const mr = map.getBoundingClientRect(), fr = frame.getBoundingClientRect();
+  const scale = mr.width / (parseFloat(map.getAttribute('width')) || mr.width);
+  const pts = room.cells.map((c) => state.geo.pos(c));
+  const cx = pts.reduce((a, q) => a + q[0], 0) / pts.length + state.geo.Sx / 2;
+  const cy = pts.reduce((a, q) => a + q[1], 0) / pts.length + state.geo.Sy / 2;
+  const x = mr.left - fr.left + cx * scale, y = mr.top - fr.top + cy * scale;
+  const ring = html('span', { class: 'coach ring', style: `left:${x}px;top:${y}px` });
+  const below = y < 90;
+  const note = html('button', { type: 'button', class: below ? 'coach note below' : 'coach note',
+    style: `left:${Math.max(110, Math.min(fr.width - 110, x))}px;top:${below ? y + 30 : y - 30}px` }, '点房间，看它的布局和门位');
+  note.appendChild(html('b', { 'aria-hidden': 'true' }, '✕'));
+  note.addEventListener('click', dismissCoach);
+  frame.append(ring, note);
+}
+function dismissCoach() {
+  try { localStorage.setItem(COACH, '1'); } catch { /* storage unavailable */ }
+  for (const el of document.querySelectorAll('.coach')) el.remove();
 }
 
 // What a room's door slots show. In the map view every door is known. In the find view a door is
@@ -774,15 +855,8 @@ function renderFindPanel(panel) {
   panel.appendChild(scoreLine(f, p));
 
   const tools = html('div', { class: 'tools', role: 'group', 'aria-label': '工具' });
-  const tool = (id, label, count) => {
-    const b = html('button', { type: 'button', 'aria-pressed': String(state.tool === id), title: `${label}（${id === 'bomb' ? 'B' : 'K'}）`, disabled: done });
-    b.appendChild(toolIcon(id));
-    b.append(html('span', {}, label), html('b', { class: 'count', title: '已用' }, String(count)));
-    b.addEventListener('click', () => { state.tool = id; render(); });
-    return b;
-  };
-  tools.appendChild(tool('bomb', '炸弹', p.bombs));
-  if (rep()) tools.appendChild(tool('key', '红钥匙', p.keys));
+  tools.appendChild(toolButton('bomb', '炸弹', p.bombs, done));
+  if (rep()) tools.appendChild(toolButton('key', '红钥匙', p.keys, done));
   panel.appendChild(tools);
 
   const [advice, quiet] = adviceText(f, p, inf);
@@ -1130,6 +1204,7 @@ function selectRoom(index) {
 // a room tapped on the map. In one column its layout (in the panel) would be out of sight below the
 // map, so it opens in the dialog, or failing that the panel is scrolled to it.
 function pickRoom(r) {
+  dismissCoach();
   selectRoom(r.index);
   if (!ONE_COLUMN.matches) return;
   fetchLayout(r).then(async (lay) => {
@@ -1293,6 +1368,7 @@ function init() {
   state.profile = loadProfile();
   state.scoreboard = createScoreboard();
   try { state.text = localStorage.getItem(STORE_TEXT) === '1'; } catch { /* storage unavailable */ }
+  try { state.floorsOpen = localStorage.getItem(FLOORS_OPEN) === '1'; } catch { /* storage unavailable */ }
   const route = readUrl();
   state.backend = createBackend(onProgress, state.game);
 
