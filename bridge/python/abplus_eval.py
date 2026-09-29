@@ -12,15 +12,21 @@ skips finished seeds.
 
 usage: python abplus_eval.py --checkpoint DIR --seeds seeds.json --out DIR [--instances 4]
                              [--limit N] [--device cuda|cpu] [--stochastic --sample-seed S]
+
+Duel (--duel-file, isaac_bridge/abplus_duel.py): each seed is a duel under the game rules (a death or the deadline ends
+it; the first hit, the training outcome under --hurt-ends-episode, is recorded). --opponent self: the checkpoint plays
+both sides, one episode per seed; scripted: against abplus_duel.ScriptedDuellist, or <checkpoint dir>: against that
+policy, two episodes per seed (the checkpoint as the player, then as the NPC). Results carry policy_side, first_hit,
+winner and per-side counters; replays carry both sides' actions.
 """
 import argparse
 import collections
 import gzip
 import hashlib
 import json
+import os
 import math
 import multiprocessing as mp
-import os
 import queue
 import time
 import traceback
@@ -31,6 +37,7 @@ import torch
 from stable_baselines3.common.save_util import load_from_zip_file
 
 from isaac_bridge.abplus import AbplusTransformerEnv, launch_abplus, sim_arena, stop_abplus
+from isaac_bridge.abplus_geometry import blocked_moves
 from isaac_bridge.abplus_reward import REWARDS, CombatV2
 from isaac_bridge.abplus_worker import EPISODE_STATS, EpisodeStats, observation_options, sample_bombs
 from isaac_bridge.abplus_tasks import TaskSampler
@@ -40,6 +47,18 @@ from isaac_bridge.transformer_obs import factored_masks, factored_to_joint
 
 BOSS_MAX_HP = 250.0  # Monstro; the simulator audit reports absolute boss HP
 TYPE_MONSTRO = 20
+
+
+def rss_mib(pid):
+    """Resident memory of a process in MiB (0 when it cannot be read)."""
+    try:
+        with open(f'/proc/{pid}/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1024
+    except (OSError, ValueError):
+        pass
+    return 0.0
 
 
 def load_policy(checkpoint, device):
@@ -177,8 +196,10 @@ def run_episode(env, cached, seed, args, replay_path=None, config=None):
     config = config or {}
     if args.stochastic:
         torch.manual_seed(args.sample_seed + seed)
-    # Runs trained with a random bomb start are evaluated with the same draw, fixed per seed.
-    bombs = sample_bombs(seed, config['start_bombs']) if config.get('start_bombs') else None
+    # Runs trained with a random bomb start are evaluated with the same draw, fixed per seed, unless --bombs fixes the
+    # start (C41: the game's 1 bomb, as the base stats and full HP).
+    bombs = (int(args.bombs) if getattr(args, 'bombs', None) is not None
+             else sample_bombs(seed, config['start_bombs']) if config.get('start_bombs') else None)
     obs, info = env.reset(options={'arena_seed': seed, **({'bombs': bombs} if bombs is not None else {})})
     env.bridge.last_reset = dict(info)
     task = env.bridge.last_reset.get('task', 'arena')
@@ -188,7 +209,8 @@ def run_episode(env, cached, seed, args, replay_path=None, config=None):
     profile = config.get('reward_profile')
     own = (REWARDS[profile](**config.get('reward_options', {})) if profile in REWARDS and profile != 'combat-v2'
            else None)
-    # combat-v5 policies have factored heads (move, shoot, bomb, item); the env takes the joint layout.
+    # combat-v5 / combat-hitrate policies have factored heads (move, shoot, bomb, item); the env takes
+    # the joint layout.
     factored = len(cached.policy.action_space.nvec) == 4
     if own is not None:
         own.reset(env.raw_obs, task)
@@ -203,9 +225,13 @@ def run_episode(env, cached, seed, args, replay_path=None, config=None):
     verify, total_return, steps, t0 = [], 0.0, 0, time.monotonic()
     trajectory = hashlib.sha256()
     policy_s = 0.0
+    # C30: runs trained with --block-moves are evaluated with the same mask (--block-moves forces it).
+    block = factored and (bool(config.get('block_moves')) or bool(getattr(args, 'block_moves', False)))
     try:
         while True:
             mask = factored_masks(env.action_masks()) if factored else env.action_masks()
+            if block:
+                mask[:9] &= ~np.asarray(blocked_moves(env.raw_obs), bool)
             tp = time.perf_counter()
             dist = cached.distribution(env.history.frames[-1], mask)
             action = dist.get_actions(deterministic=not args.stochastic)[0].cpu().numpy()
@@ -246,11 +272,115 @@ def run_episode(env, cached, seed, args, replay_path=None, config=None):
                   reward_v2_start=reward_v2.start, start_bombs=env.bridge.start_bombs,
                   stats={k: round(float(v), 2) for k, v in zip(EPISODE_STATS, stats.array())})
     if own is not None:
-        tag = 'reward_' + profile.split('-')[1]
+        tag = 'reward_' + profile[len('combat-'):].replace('-', '_')
         result.update({tag: round(sum(own.totals.values()), 4),
                        tag + '_components': {k: round(v, 4) for k, v in own.totals.items()}})
     if verify:
         result['verify_max_logit_diff'] = max(verify)
+    return result
+
+
+DUEL_SIDES = ('player', 'npc')
+
+
+def duel_mask():
+    """Factored masks of a duel side: no bombs, no active item (both views)."""
+    return factored_masks(np.asarray([True] * 45 + [True, False] + [True, False], bool))
+
+
+def run_duel_episode(env, controllers, seed, args, replay_path=None, config=None, labels=('policy', 'policy'),
+                     policy_side='both'):
+    """One duel under the game rules (a death or the deadline ends it; the first hit is recorded, the training outcome
+    under --hurt-ends-episode). controllers: per side (player, NPC) ('policy', CachedPolicy) or ('script',
+    ScriptedDuellist)."""
+    config = config or {}
+    if args.stochastic:
+        torch.manual_seed(args.sample_seed + seed)
+    frames, reset_info = env.reset(seed)
+    for kind, c in controllers:
+        c.reset()
+    profile = config.get('reward_profile')
+    rewards = [REWARDS[profile](**config.get('reward_options', {})) if profile in REWARDS else None for _ in DUEL_SIDES]
+    for r, v in zip(rewards, env.views):
+        if r is not None:
+            r.reset(v, 'normal')
+    stats = [EpisodeStats(v) for v in env.views]
+    writer = gzip.open(replay_path, 'wt', encoding='utf8') if replay_path else None
+    if writer:
+        writer.write(json.dumps({'metadata': {'seed': seed, 'format': 'abplus-raw-obs-v1', 'duel': True, 'sides': list(labels),
+                                              'policy_side': policy_side}}) + '\n')
+        writer.write(json.dumps({'action': None, 'duel_action': None, 'obs': env.raw_obs}, separators=(',', ':')) + '\n')
+    first_hit, first_hit_s, steps, frames_played = None, None, 0, 0
+    trajectory = hashlib.sha256()
+    # C30: runs trained with --block-moves are evaluated with the same mask, per side from its own view
+    block = bool(config.get('block_moves')) or bool(getattr(args, 'block_moves', False))
+    t0, policy_s = time.monotonic(), 0.0
+    try:
+        while True:
+            actions = []
+            tp = time.perf_counter()
+            for side, (kind, c) in enumerate(controllers):
+                if kind == 'policy':
+                    mask = duel_mask()
+                    if block:
+                        mask[:9] &= ~np.asarray(blocked_moves(env.views[side]), bool)
+                    dist = c.distribution(env.histories[side].frames[-1], mask)
+                    a = dist.get_actions(deterministic=not args.stochastic)[0].cpu().numpy()
+                    actions.append((int(a[0]), int(a[1])))
+                else:
+                    actions.append(c(env.views[side]))
+            policy_s += time.perf_counter() - tp
+            before = [v['combat']['player_damage_events'] for v in env.views]
+            frames, outcomes, terminated, truncated, info = env.step([a[0] for a in actions], [a[1] for a in actions])
+            steps += 1
+            advanced = info['elapsed_frames'] - frames_played
+            frames_played = info['elapsed_frames']
+            for side in range(2):
+                view = env.views[side]
+                if rewards[side] is not None:
+                    rewards[side].step(view, outcomes[side], advanced)
+                stats[side].step(view, advanced)
+            hurt = [v['combat']['player_damage_events'] > b for v, b in zip(env.views, before)]
+            if first_hit is None and any(hurt):
+                # the side whose shot landed first (both: the same step)
+                first_hit = 'both' if all(hurt) else DUEL_SIDES[1 - hurt.index(True)]
+                first_hit_s = frames_played / 30
+            raw = env.raw_obs
+            trajectory.update(json.dumps([actions, raw['players'][0]['pos'], raw['duel']['pos'], raw['duel']['hp'],
+                                          raw['players'][0]['hearts']]).encode())
+            if writer:
+                writer.write(json.dumps({'action': [actions[0][0] * 5 + actions[0][1], 0, 0],
+                                         'duel_action': [actions[1][0] * 5 + actions[1][1], 0, 0], 'obs': raw},
+                                        separators=(',', ':')) + '\n')
+            if terminated or truncated:
+                break
+    finally:
+        if writer:
+            writer.close()
+    d = env.raw_obs['duel']
+    sides = {}
+    for side, key in enumerate(('player', 'npc_side')):
+        c = d[key]
+        sides[DUEL_SIDES[side]] = dict(
+            controller=labels[side], outcome=outcomes[side], shots=c['shots'], hits=c['hits'], misses=c['misses'],
+            hit_rate=round(c['hits'] / c['shots'], 4) if c['shots'] else None, hurt=c['hurt'],
+            stats={k: round(float(v), 2) for k, v in zip(EPISODE_STATS, stats[side].array())},
+            **({'reward': round(sum(rewards[side].totals.values()), 4),
+                'reward_components': {k: round(v, 4) for k, v in rewards[side].totals.items()}} if rewards[side] else {}))
+    winner = ('player' if outcomes == ['win', 'death'] else 'npc' if outcomes == ['death', 'win']
+              else 'both_dead' if outcomes == ['death', 'death'] else 'none')
+    # the checkpoint's view of the episode: its own outcome and first hit (self-play: the player side's)
+    mine = 0 if policy_side in ('player', 'both') else 1
+    result = dict(seed=seed, task='duel', policy_side=policy_side, sides_played=list(labels),
+                  outcome=outcomes[mine], first_hit=first_hit, first_hit_s=first_hit_s,
+                  first_hit_won=None if first_hit in (None, 'both') else first_hit == DUEL_SIDES[mine],
+                  winner=winner, layout=reset_info.get('room_variant'), arm=reset_info.get('duel_arm'),
+                  cells=reset_info.get('duel_cells'), frames=frames_played, l=steps, sides=sides,
+                  seconds=round(time.monotonic() - t0, 2), policy_ms=round(1000 * policy_s / max(1, steps), 3),
+                  trajectory=trajectory.hexdigest()[:16])
+    if rewards[mine] is not None:
+        tag = 'reward_' + profile[len('combat-'):].replace('-', '_')
+        result.update({tag: sides[DUEL_SIDES[mine]]['reward'], tag + '_components': sides[DUEL_SIDES[mine]]['reward_components']})
     return result
 
 
@@ -262,16 +392,54 @@ def worker(index, args, config, tasks, results):
     policy = load_policy(args.checkpoint, args.device)
     cached = CachedPolicy(policy, config['history'], deterministic=not args.stochastic)
     state = {'proc': None, 'env': None}
+    duel = json.loads(Path(args.duel_file).read_text(encoding='utf8')) if args.duel_file else None
+    if duel:
+        from isaac_bridge.abplus_duel import DuelEnv, ScriptedDuellist, duel_tasks
+        # a second cache of the same weights for the other side, or the opponent checkpoint's policy
+        other = None
+        if args.opponent == 'self':
+            other = ('policy', CachedPolicy(policy, config['history'], deterministic=not args.stochastic))
+        elif args.opponent != 'scripted':
+            other = ('policy', CachedPolicy(load_policy(args.opponent, args.device), config['history'],
+                                            deterministic=not args.stochastic))
+
+    def start_duel():
+        state['proc'] = launch_abplus(name, port, args.mode)
+        env = DuelEnv(port, int(config['max_episode_seconds'] * 30), duel['duel'], duel_tasks(duel), hurt_ends=False,
+                      lineage_mode=int(config.get('lineage_mode') or 3), miss_cap=int(config.get('miss_cap', 20)),
+                      binary_obs=not args.json_obs, **observation_options(config.get('reward_profile')),
+                      history=config['history'], entity_capacity=config['entity_capacity'])
+        if env.observation_space != policy.observation_space:
+            raise ValueError('duel observation space differs from the checkpoint policy')
+        state['env'] = env
 
     def start():
+        if duel:
+            return start_duel()
         state['proc'] = launch_abplus(name, port, args.mode)
+        # C39: the checkpoint's frames per decision, and remaining_time over this evaluation's deadline.
         env = AbplusTransformerEnv(port=port, max_episode_frames=int(config['max_episode_seconds'] * 30),
                                    **observation_options(config.get('reward_profile')),
+                                   deadline_s=float(config['max_episode_seconds']),
+                                   frames_per_decision=int(config.get('frames_per_decision', 2)),
                                    history=config['history'], entity_capacity=config['entity_capacity'])
         env.bridge.binary_obs = not args.json_obs
         if config.get('lineage_mode') is not None:
             env.bridge.lineage_mode = int(config['lineage_mode'])
-        env.bridge.tasks = TaskSampler.from_file(args.tasks_file) if args.tasks_file != 'none' else None
+        # The hit-rate test trains and evaluates an invincible player (bridge abp-0.2.4); --mortal evaluates
+        # such a checkpoint with damage on (the stage-2 baseline, C33).
+        env.bridge.invincible = bool(config.get('invincible', False)) and not args.mortal
+        # combat-hitrate-miss: the per-miss penalty's cap (bridge abp-0.2.6; 0 = none).
+        env.bridge.miss_cap = int(config.get('miss_cap', 0))
+        # The single-enemy aiming arena (C22): the run's tasks file carries the target; its arms (tier 6,
+        # C28) choose the normal rooms, so the sampler takes them from the target in use.
+        env.bridge.target = config.get('target')
+        if args.tasks_file != 'none':
+            spec = json.loads(Path(args.tasks_file).read_text(encoding='utf8'))
+            env.bridge.tasks = TaskSampler(spec['weights'], spec['normal'], spec['boss'],
+                                           (config.get('target') or {}).get('arms'))
+        else:
+            env.bridge.tasks = None
         if env.observation_space != policy.observation_space:
             raise ValueError(f'AB+ observation space {env.observation_space} differs from the checkpoint '
                              f'policy {policy.observation_space}')
@@ -293,20 +461,34 @@ def worker(index, args, config, tasks, results):
         start()
         while True:
             try:
-                seed, replay = tasks.get_nowait()
+                seed, replay, side = tasks.get_nowait()
             except queue.Empty:
                 break
             for attempt in range(2):
                 try:
-                    result = run_episode(state['env'], cached, seed, args, replay, config)
+                    if duel:
+                        me = ('policy', cached)
+                        rival = other if other is not None else ('script', ScriptedDuellist())
+                        rival_label = 'self' if args.opponent == 'self' else args.opponent
+                        pair = (me, rival) if side in ('player', 'both') else (rival, me)
+                        labels = ('checkpoint', rival_label) if side in ('player', 'both') else (rival_label, 'checkpoint')
+                        result = run_duel_episode(state['env'], pair, seed, args, replay, config, labels, side)
+                    else:
+                        result = run_episode(state['env'], cached, seed, args, replay, config)
                     break
                 except Exception:
-                    result = dict(seed=seed, outcome='error', layout=sim_arena(seed)['variant'],
-                                  error=traceback.format_exc()[-3000:], attempt=attempt)
+                    result = dict(seed=seed, outcome='error', layout=0 if duel else sim_arena(seed)['variant'],
+                                  error=traceback.format_exc()[-3000:], attempt=attempt, policy_side=side)
                     stop()
                     time.sleep(2)
                     start()
             result['worker'] = index
+            # C39 t3r: an instance over the memory cap is restarted before its next episode.
+            if args.recycle_rss_mib > 0 and state['proc'] is not None and \
+                    rss_mib(state['proc'].pid) >= args.recycle_rss_mib:
+                stop()
+                time.sleep(2)
+                start()
             results.put(result)
     finally:
         stop()
@@ -321,6 +503,12 @@ def main():
     p.add_argument('--limit', type=int, default=0)
     p.add_argument('--instances', type=int, default=4)
     p.add_argument('--mode', default='exact', choices=('exact', 'skip', 'render'))
+    p.add_argument('--bombs', type=int, default=None,
+                   help='bombs at the start of every episode (default: the run start-bomb draw fixed per seed, or '
+                        'the game default 1 without one; C41: 1)')
+    p.add_argument('--recycle-rss-mib', type=float, default=0,
+                   help='restart an instance between episodes once its resident memory reaches this many MiB '
+                        '(C39 t3r); 0 = never')
     p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
     p.add_argument('--torch-threads', type=int, default=1)
     p.add_argument('--stochastic', action='store_true')
@@ -329,10 +517,37 @@ def main():
     p.add_argument('--replays', type=int, default=0, help='write raw-observation replays for the first N seeds')
     p.add_argument('--repeat', type=int, default=1, help='episodes per seed (reproducibility check)')
     p.add_argument('--tasks-file', default='none', help="room mixture spec (abplus_tasks); 'none' = Monstro arena")
+    p.add_argument('--target-from-tasks', action='store_true',
+                   help="the tasks file's target arena replaces the checkpoint's (another tier's seeds, C27)")
+    p.add_argument('--block-moves', action='store_true',
+                   help='mask the moves the terrain stops dead even if the checkpoint was trained without (C30)')
+    p.add_argument('--mortal', action='store_true',
+                   help='the player takes damage even if the checkpoint was trained invincible (C33)')
+    p.add_argument('--episode-seconds', type=float, default=0,
+                   help="the episode deadline instead of the checkpoint's, also for a death's cost (another task, C35)")
     p.add_argument('--json-obs', action='store_true', help='bridge v1 JSON observations instead of binary v2')
     p.add_argument('--port', type=int, default=27200)
+    p.add_argument('--software-gl', action='store_true',
+                   help="the AB+ instances use Mesa's software OpenGL (no GPU memory, identical trajectories; B7)")
     p.add_argument('--name', default='beval')
+    p.add_argument('--duel-file', default=None, help='duel spec (catalog/duel_rooms.json): duel evaluation')
+    p.add_argument('--opponent', default='self',
+                   help="duel: self (the checkpoint on both sides), scripted (abplus_duel.ScriptedDuellist) or an opponent "
+                        "checkpoint directory")
     args = p.parse_args()
+    try:
+        # An evaluation is the first process the kernel kills when memory runs out (C39 t3 died of an OOM while one ran):
+        # its workers and AB+ instances inherit this.
+        with open('/proc/self/oom_score_adj', 'w') as f:
+            f.write('1000')
+    except OSError:
+        pass
+    if args.device == 'cpu':
+        # The workers (spawned) then open no CUDA context: ~270 MiB of the learner's GPU each otherwise (B7).
+        os.environ.setdefault('CUDA_VISIBLE_DEVICES', '')
+    if args.software_gl:
+        from isaac_bridge.abplus import SOFTWARE_GL_ENV
+        os.environ.update(SOFTWARE_GL_ENV)
     if not steam_running():
         # Every AB+ start needs the Steam client; without it the game only launches steam.sh and exits.
         print(json.dumps({'event': 'evaluation_skipped', 'reason': 'steam client not running'}), flush=True)
@@ -341,6 +556,15 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     saved = json.loads((checkpoint / 'state.json').read_text())
     config = saved['config']
+    if args.target_from_tasks:
+        if args.tasks_file == 'none':
+            raise SystemExit('--target-from-tasks needs --tasks-file')
+        config = dict(config, target=json.loads(Path(args.tasks_file).read_text()).get('target'))
+    if args.episode_seconds:
+        options = dict(config.get('reward_options', {}))
+        if 'deadline_s' in options:   # combat-hitrate-hurt: a death costs the rest of the deadline
+            options['deadline_s'] = args.episode_seconds
+        config = dict(config, max_episode_seconds=args.episode_seconds, reward_options=options)
     if args.seeds.startswith('range:'):
         start, count = map(int, args.seeds.split(':')[1:])
         seeds = list(range(start, start + count))
@@ -350,25 +574,37 @@ def main():
     if args.limit:
         seeds = seeds[:args.limit]
     results_path = out / 'results.jsonl'
+    if args.duel_file:
+        # duel: self-play one episode per seed; against another controller the checkpoint plays each side once
+        sides = ('both',) if args.opponent == 'self' else ('player', 'npc')
+        config = dict(config, max_episode_seconds=args.episode_seconds or config['max_episode_seconds'])
+    else:
+        sides = (None,)
     done = set()
     if results_path.exists():
         for line in results_path.read_text().splitlines():
             r = json.loads(line)
             if r['outcome'] != 'error':
-                done.add(r['seed'])
-    todo = [s for s in seeds if s not in done for _ in range(args.repeat)]
+                done.add((r['seed'], r.get('policy_side')))
+    todo = [(s, side) for s in seeds for side in sides if (s, side) not in done for _ in range(args.repeat)]
     meta = dict(checkpoint=str(checkpoint.resolve()), updates=saved['updates'], timesteps=saved['timesteps'],
                 schema=config['schema'], reward_profile=config.get('reward_profile'), mode=args.mode,
                 deterministic=not args.stochastic, sample_seed=args.sample_seed if args.stochastic else None,
                 device=args.device, instances=args.instances, seeds=len(seeds), engine='abplus-1.06',
                 tasks_file=args.tasks_file, observation_transport='json' if args.json_obs else 'binary v2',
-                started=time.strftime('%Y-%m-%d %H:%M:%S'))
+                target=config.get('target'), target_from_tasks=args.target_from_tasks,
+                block_moves=bool(config.get('block_moves')) or args.block_moves,
+                invincible=bool(config.get('invincible', False)) and not args.mortal,
+                episode_seconds=config['max_episode_seconds'], frames_per_decision=int(config.get('frames_per_decision', 2)),
+                started=time.strftime('%Y-%m-%d %H:%M:%S'),
+                duel_file=args.duel_file, opponent=args.opponent if args.duel_file else None)
     (out / 'meta.json').write_text(json.dumps(meta, indent=1))
     (out / 'replays').mkdir(exist_ok=True)
     ctx = mp.get_context('spawn')
     tasks, results = ctx.Queue(), ctx.Queue()
-    for i, s in enumerate(todo):
-        tasks.put((s, str(out / 'replays' / f'seed-{s}-{i}.jsonl.gz') if i < args.replays else None))
+    for i, (s, side) in enumerate(todo):
+        name = f'seed-{s}-{i}' + (f'-{side}' if side else '')
+        tasks.put((s, str(out / 'replays' / f'{name}.jsonl.gz') if i < args.replays else None, side))
     n = min(args.instances, len(todo))
     print(f'{len(done)} done, {len(todo)} to run on {n} AB+ instances ({args.mode}, {args.device})', flush=True)
     procs = [ctx.Process(target=worker, args=(i, args, config, tasks, results), daemon=True) for i in range(n)]
@@ -396,7 +632,8 @@ def main():
             per_task[r.get('task', 'arena')]['outcomes'][r['outcome']] += 1
             if 'reward_v2' in r:
                 per_task[r.get('task', 'arena')]['reward_v2'].append(r['reward_v2'])
-            for tag in ('reward_v3', 'reward_v4', 'reward_v5'):
+            for tag in ('reward_v3', 'reward_v4', 'reward_v5', 'reward_hitrate', 'reward_hitrate_walk',
+                        'reward_hitrate_miss', 'reward_hitrate_fire', 'reward_hitrate_hurt', 'reward_hp'):
                 if tag in r:
                     per_task[r.get('task', 'arena')]['reward_own'].append(r[tag])
             if r.get('start_bombs') is not None:
@@ -404,8 +641,10 @@ def main():
                 per_task[r.get('task', 'arena')][split][r['outcome']] += 1
             steps += r.get('l', 0)
             elapsed = time.monotonic() - t0
+            detail = (f"side {r.get('policy_side')} first hit {r.get('first_hit')} winner {r.get('winner')}"
+                      if args.duel_file else f"dmg {r.get('damage_frac') or 0:.2f}")
             print(f"{time.strftime('%H:%M:%S')} seed {r['seed']} L{r['layout']} {r['outcome']:<10} "
-                  f"frames {r.get('frames', '-'):>5} dmg {r.get('damage_frac') or 0:.2f} | "
+                  f"frames {r.get('frames', '-'):>5} {detail} | "
                   f"{sum(counts.values())}/{len(todo)} {dict(counts)} {steps / elapsed:.0f} decisions/s", flush=True)
     for proc in procs:
         proc.join()

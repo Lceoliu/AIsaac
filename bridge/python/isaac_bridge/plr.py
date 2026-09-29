@@ -24,26 +24,42 @@ beta = 1 (P_rank proportional to 1 / rank: the top 10 of the 495 normal rooms ge
 than the paper's 0.1-0.3, which with 16 environments and 1-2 episodes per environment per rollout
 would put most of every rollout into one or two rooms. The workers read P from shared memory at
 every episode start (abplus_worker.PlrTaskChooser); evaluation keeps the seed's fixed room.
+
+by_steps (user decision 2026-09-28, EXPERIMENTS.md C39: PLR by each room's real duration): P_kind is the share of
+the kind's steps a level should get, not of its episode starts. A level whose episodes last L steps then starts
+with probability proportional to P_kind / L, so the steps it collects are proportional to P_kind. L is the
+level's measured episode length (the mean of its first DURATION_WINDOW finished episodes, then an exponential
+average with weight 1 / DURATION_WINDOW); a level with none finished yet takes the mean L of its kind's
+measured levels (1 when there is none). probabilities() is then the start distribution; step_shares() is P.
+
+Parallel task groups (abplus_groups, C39): group_levels() makes every (group, room, arm) a level; the kinds are
+the groups and their weights the group shares. The workers draw only within their episode's group (the group
+itself comes from the step budget, abplus_groups.GroupScheduler), so a kind's weight only scales its block of P.
 """
 import numpy as np
 
+DURATION_WINDOW = 10
+
 
 class PrioritizedLevels:
-    def __init__(self, levels, weights, beta=1.0, staleness=0.3, floor=0.1):
-        """levels: (kind, variant) rooms (mixture_levels); weights: the mixture's weight of each kind."""
+    def __init__(self, levels, weights, beta=1.0, staleness=0.3, floor=0.1, by_steps=False):
+        """levels: (kind, variant) rooms (mixture_levels) or (group, room, arm) levels (group_levels); weights: the
+        weight of each kind (the mixture's, or the group shares); by_steps: P is a share of the steps (C39)."""
         self.levels = [tuple(level) for level in levels]
         n = len(self.levels)
         if n == 0:
             raise ValueError('PLR needs at least one level')
         self.beta, self.staleness, self.floor = float(beta), float(staleness), float(floor)
-        kinds = list(dict.fromkeys(kind for kind, _ in self.levels))
+        self.by_steps = bool(by_steps)
+        kinds = list(dict.fromkeys(level[0] for level in self.levels))
         unweighted = [kind for kind in kinds if float(weights.get(kind, 0)) <= 0]
         if unweighted:
             raise ValueError(f'PLR rooms of kinds without mixture weight: {unweighted}')
         total = sum(float(weights[kind]) for kind in kinds)
         self.weights = {kind: float(weights[kind]) / total for kind in kinds}
-        self.groups = {kind: np.array([i for i, (k, _) in enumerate(self.levels) if k == kind]) for kind in kinds}
+        self.groups = {kind: np.array([i for i, level in enumerate(self.levels) if level[0] == kind]) for kind in kinds}
         self.scores = np.zeros(n)
+        self.durations = np.zeros(n)     # measured episode length in steps (0: none finished yet)
         self.seen = np.zeros(n, bool)
         self.last = np.zeros(n)          # finished-episode count when the room last finished
         self.plays = np.zeros(n, np.int64)
@@ -61,14 +77,14 @@ class PrioritizedLevels:
             level, total, steps = self.partial.get(i, (-1, 0.0, 0))
             for t in range(steps_total):
                 if starts[t, i] and steps:
-                    self._finish(level, total / steps)
+                    self._finish(level, total / steps, steps)
                     total, steps = 0.0, 0
                 level = int(levels[t, i])
                 total += positive[t, i]
                 steps += 1
             self.partial[i] = (level, total, steps)
 
-    def _finish(self, level, score):
+    def _finish(self, level, score, steps=0):
         if level < 0:
             return
         self.finished += 1
@@ -76,6 +92,8 @@ class PrioritizedLevels:
         self.seen[level] = True
         self.last[level] = self.finished
         self.plays[level] += 1
+        if steps > 0:   # mean of the first DURATION_WINDOW episodes, then an exponential average
+            self.durations[level] += (steps - self.durations[level]) / min(self.plays[level], DURATION_WINDOW)
 
     def _within(self, rooms):
         """P_kind over the rooms (level indices) of one kind; sums to 1."""
@@ -98,11 +116,29 @@ class PrioritizedLevels:
         q = (1 - self.floor) * q + self.floor / n
         return q / q.sum()
 
-    def probabilities(self):
+    def lengths(self, rooms):
+        """Episode length of each level of one kind: its measured one, else the kind's mean (1 without any)."""
+        d = self.durations[rooms]
+        known = d > 0
+        return np.where(known, d, d[known].mean() if known.any() else 1.0)
+
+    def step_shares(self):
+        """P: each level's intended share of the steps (by_steps) or of the episode starts."""
         p = np.zeros(len(self.levels))
         for kind, rooms in self.groups.items():
             p[rooms] = self.weights[kind] * self._within(rooms)
         return p / p.sum()
+
+    def probabilities(self):
+        """The start distribution the workers draw from: P, or with by_steps P / length within each kind."""
+        p = self.step_shares()
+        if not self.by_steps:
+            return p
+        out = np.zeros(len(self.levels))
+        for kind, rooms in self.groups.items():
+            q = p[rooms] / self.lengths(rooms)
+            out[rooms] = self.weights[kind] * q / q.sum()
+        return out / out.sum()
 
     def summary(self, p=None):
         """Scalars for the training log: each kind's share and effective number of rooms, and totals."""
@@ -113,6 +149,15 @@ class PrioritizedLevels:
             result[f'share_{kind}'] = float(q.sum())
             within = q[q > 0] / q.sum()
             result[f'effective_{kind}'] = float(np.exp(-(within * np.log(within)).sum()))
+        if self.by_steps:
+            shares = self.step_shares()
+            for kind, rooms in sorted(self.groups.items()):
+                q = shares[rooms] / shares[rooms].sum()
+                q = q[q > 0]
+                result[f'effective_steps_{kind}'] = float(np.exp(-(q * np.log(q)).sum()))
+                known = self.durations[rooms] > 0
+                if known.any():
+                    result[f'length_mean_{kind}'] = float(self.durations[rooms][known].mean())
         nz = p[p > 0]
         result.update(seen=int(self.seen.sum()), finished=int(self.finished), max_p=float(p.max()),
                       effective_levels=float(np.exp(-(nz * np.log(nz)).sum())),
@@ -123,13 +168,14 @@ class PrioritizedLevels:
         p = self.probabilities() if p is None else p
         order = np.argsort(-p)[:k]
         return [dict(level=list(self.levels[i]), p=round(float(p[i]), 4), score=round(float(self.scores[i]), 4),
-                     plays=int(self.plays[i])) for i in order]
+                     plays=int(self.plays[i]), length=round(float(self.durations[i]), 1)) for i in order]
 
     def state_dict(self):
         return dict(levels=[list(level) for level in self.levels], weights=self.weights, beta=self.beta,
                     staleness=self.staleness, floor=self.floor, scores=self.scores.tolist(), seen=self.seen.tolist(),
                     last=self.last.tolist(), plays=self.plays.tolist(), finished=self.finished,
-                    partial={str(k): list(v) for k, v in self.partial.items()})
+                    partial={str(k): list(v) for k, v in self.partial.items()},
+                    by_steps=self.by_steps, durations=self.durations.tolist())
 
     @classmethod
     def from_state(cls, state, weights=None):
@@ -138,14 +184,29 @@ class PrioritizedLevels:
         weights = weights if weights is not None else state.get('weights')
         if weights is None:
             raise ValueError('this PLR state has no kind weights; pass the mixture weights')
-        plr = cls(state['levels'], weights, state['beta'], state['staleness'], state['floor'])
+        plr = cls(state['levels'], weights, state['beta'], state['staleness'], state['floor'], state.get('by_steps', False))
         plr.scores = np.asarray(state['scores'], np.float64)
+        if 'durations' in state:
+            plr.durations = np.asarray(state['durations'], np.float64)
         plr.seen = np.asarray(state['seen'], bool)
         plr.last = np.asarray(state['last'], np.float64)
         plr.plays = np.asarray(state['plays'], np.int64)
         plr.finished = int(state['finished'])
         # Episodes in progress at the checkpoint restart fresh on resume.
         return plr
+
+
+def group_levels(groups):
+    """Levels of parallel task groups (abplus_groups.load_groups): (group name, room, arm) for every room of each
+    target arm, or (group name, room, -1) for a group without arms; and the kind weights (the group shares)."""
+    levels = []
+    for g in groups:
+        arms = (g.get('target') or {}).get('arms')
+        if arms:
+            levels += [(g['name'], int(v), a) for a, arm in enumerate(arms) for v in arm['rooms']]
+        else:
+            levels += [(g['name'], int(v), -1) for v in g['spec']['normal']]
+    return levels, {g['name']: float(g['share']) for g in groups}
 
 
 def mixture_levels(spec):

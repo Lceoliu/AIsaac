@@ -46,15 +46,83 @@ Protocol (one JSON object per line), identical to 0.2.0 plus "lua", "format" and
   abp-0.2.3: the roster lineage (combat-v5). The setup chunk calls AbpRosterMark(mode), which takes
   the doors-blocking NPCs alive at that moment as the roster. Death successors join by frame and
   place (AB+ leaves their SpawnerEntity nil; mode, see LINEAGE_RADIUS); NPCs spawned by a living
-  one never join. Morph keeps the entity, so it stays in the lineage. The HP a lineage NPC loses is counted up to the HP it had when it
+  one never join. Morph keeps the entity, so it stays in the lineage (one that follows a death: abp-0.2.8). The HP a lineage NPC loses is counted up to the HP it had when it
   joined (regrowth earns nothing new) into combat.lineage_damage; its death adds 1 to
   combat.lineage_kills. combat also reports lineage_count and lineage_hp (the alive lineage NPCs),
   and every NPC record carries lineage and blocking (CanShutDoors) flags.
+  abp-0.2.4 (the hit-rate test, user spec 2026-09-26): the setup chunk calls AbpSetInvincible(on);
+  an invincible player takes no damage while a client is connected (MC_ENTITY_TAKE_DMG returns
+  false, combat.blocked_hits counts the cancelled hits). combat.tear_hits counts the player tears
+  that damaged a lineage NPC, once per tear; the tears fired are events.tears (MC_POST_FIRE_TEAR).
+  EntityRef.Type and SpawnerType are eEntityType userdata whose read aborts AB+ (LuaBridge
+  assertion, Userdata.h:376), so the damage source is read through source.Entity. Player tears
+  have SpawnerEntity nil; in the curriculum rooms only the player fires tears.
+  abp-0.2.5 (user decisions 2026-09-26: every enemy earns reward, misses are penalised):
+  lineage mode 3 makes every doors-blocking NPC a lineage member from the first frame it is seen,
+  spawns of living NPCs included, with its HP then as its budget, so hits, kills and tear hits
+  count on every enemy. Every tear the player fires is followed until it is gone; one that is gone
+  without having damaged a lineage NPC is a miss. combat.tear_misses counts them; miss_streak is the
+  misses since the last hit (a hit resets it to 0); miss_units adds the streak at every miss
+  (1 + 2 + ... over consecutive misses), so a penalty growing linearly per consecutive miss is
+  c * delta(miss_units).
+  abp-0.2.6 (user decision 2026-09-26): the setup chunk calls AbpSetMissCap(k); with k > 0 a miss adds
+  min(miss_streak, k) to miss_units, so the growth stops at the k-th miss in a row (0 = no cap;
+  reset turns it off). miss_streak itself is not capped.
+  abp-0.2.7 (user decision 2026-09-27, credit at the firing step): every tear the player fires
+  records the logic frame it was fired in. The HP a lineage NPC loses is charged to the tears that
+  hit it (oldest first, up to each tear's damage), a lineage death to the tear that hit it last
+  (within KILL_FRAMES), a miss to the missing tear; anything without a tear is charged to the
+  current frame. combat.credits lists, per fire frame, the damage, kills and miss units charged
+  since the previous step observation ({fire_frame, damage, kills, miss_units}, sorted by frame);
+  a step observation clears it. The cumulative counters are unchanged.
+  abp-0.2.8 (user decision 2026-09-28, EXPERIMENTS.md C37): a lineage NPC that dies and lives on as
+  the same entity (a Gaper that loses its head becomes a Gusher or Pacer: same Index and InitSeed,
+  MC_POST_NPC_DEATH fired) stayed out of the lineage for good, because its key was already gone: hits
+  on it earned nothing and tears on it were misses. In lineage modes 1-3 it now joins again from the
+  frame after its death, with its HP then as the budget; its own death later is another kill.
+  abp-0.2.9 (user request 2026-09-28, EXPERIMENTS.md A6): the duel. The setup chunk spawns one NPC of type
+  DUEL_TYPE (a Pacer, 11.1: wanders, never attacks, no death spawns) and calls AbpDuelAttach(npc); from then on the
+  step command's duel_move / duel_shoot (the player's move and shoot values) drive it as a second Isaac, calibrated
+  to the player (A6): the player's movement law (two physics sub-steps per logic frame), a shot every 11 frames
+  (fire delay 10), shots at 10 px/frame plus 1.2 x its velocity, spawned 10 px ahead and 3-5 px to the side
+  (alternating), with a tear's range, and a hit radius of the player's (NPC Size 10, shot Size 8.165); 21 HP (six
+  3.5 tears; the player dies to six half-heart shots); after damage 29 frames without damage, shots absorbed
+  meanwhile (as the player's damage cooldown); a lethal hit is cancelled and the NPC is dead (as the player's);
+  tear hits push it (0.3 x the tear's velocity). The NPC plays after its spawn phase only (about 20 frames, the
+  engine's FLAG_APPEAR): obs.duel.active. obs.duel also reports, per side (the player, the NPC), shots fired, shots
+  that damaged the other side (hits), shots gone without (misses, their run and units, the miss cap applies to
+  both), damage dealt (in the other side's units: NPC HP, half hearts) and damage taken (events, amount). A reset
+  drops the binding. The binary observation ends with the duel block (a flag byte, 0 without a duel).
+  abp-0.2.8-hp (user decision 2026-09-28, EXPERIMENTS.md C39; abp-0.2.8 plus one counter, kept apart from the
+  duel's abp-0.2.9 on host 2): combat.monster_damage, the HP every monster in the room lost, the room's own and every
+  spawn alike, doors-blocking or not. A monster is an NPC of the engine's active-enemy types
+  (Entity::IsActiveEnemy: types 10-999 except shopkeepers 17, fire places 33, poop 245, movable TNT 292).
+  Only real HP loss counts: per frame the fall of each monster's HitPoints (floored at 0), so a death without
+  damage (an explosion of its own, a Portal that closes) adds nothing and regrown HP can be lost again. A
+  monster that is gone from the room in the frame of its death callback is charged the damage
+  MC_ENTITY_TAKE_DMG reported for it in that frame, up to the HP it had. The binary combat block grows to 18
+  doubles (monster_damage last).
+  abp-0.2.10 (2026-09-29): abp-0.2.9 (the duel) with abp-0.2.8-hp's combat.monster_damage; the binary
+  combat block has 18 doubles and the duel block stays last.
   move: 0 stop 1 up 2 up-right 3 right 4 down-right 5 down 6 down-left 7 left 8 up-left;
   shoot: 0 none 1 up 2 right 3 down 4 left.
 ]]
 
-local VERSION = "abp-0.2.3"
+-- abp-0.2.11 (C41, user decisions 2026-09-29): AbpSetStats(speed, damage, shot_speed, tears, range), called by the room
+-- setup chunk before the episode reseed, offsets the player's stats for the episode in MC_EVALUATE_CACHE on top of what
+-- the game computes. MoveSpeed, Damage and ShotSpeed are added to; tears is the change in shots per second
+-- (30 / (MaxFireDelay + 1)), rounded to a whole MaxFireDelay as AB+ keeps it an integer; range is in Repentance units of
+-- 40 px: TearHeight is scaled by (6.5 + range) / 6.5, so the reported range 260 * TearHeight / -23.75 moves by 40 px per
+-- unit. ShotSpeed stops at 0.6, as the engine does (measured: a lower value reads back as 0.6). Every reset clears the offsets; while they are all zero nothing is re-evaluated, so older runs and the
+-- evaluations play exactly as before.
+-- abp-0.2.12 (Go-Explore, user request 2026-09-30): batched replay. {"cmd":"play","actions":[code, ...],"repeat":k,
+-- "repeats":[k, ...] (optional, per action),"stop_clear":bool} plays the actions back to back, each held for its repeat
+-- logic frames exactly as the same step commands would (the next action is applied where a step observation would
+-- have been sent), with a single observation at the end: first {"type":"ok","cmd":"play","played":n,"stop":"done"|
+-- "dead"|"clear"}, then the step observation (its credits cover the whole batch). The batch stops early once the player
+-- is dead (a cancelled lethal hit included) or, with stop_clear, the room is clear. code = move + 9 shoot + 45 bomb +
+-- 90 item. Not with the duel NPC (its action comes with each step).
+local VERSION = "abp-0.2.12"
 local mod = RegisterMod("AbpRLBridge", 1)
 
 -- The game ships LuaSocket for both architectures; make sure the 64-bit core is found.
@@ -119,26 +187,86 @@ local state = {
 	events = { damage = 0, tears = 0, npc_deaths = 0, clears = 0 },
 	combat = { player_damage_events = 0, player_damage = 0, enemy_damage_events = 0,
 		enemy_damage = 0, enemy_damage_fraction = 0, blocking_hp = 0, blocking_points = 0, blocking_count = 0,
-		lineage_damage = 0, lineage_kills = 0, lineage_count = 0, lineage_hp = 0 },
-	health = { players = {}, npcs = {}, deaths = {} },
+		lineage_damage = 0, lineage_kills = 0, lineage_count = 0, lineage_hp = 0, tear_hits = 0, blocked_hits = 0,
+		tear_misses = 0, miss_units = 0, miss_streak = 0, monster_damage = 0 },
+	-- abp-0.2.8-hp: monsters = HP last seen per monster key; monster_hits = damage reported this frame per key.
+	health = { players = {}, npcs = {}, deaths = {}, monsters = {}, monster_hits = {} },
 	lethal = {},             -- player index -> true once a lethal hit was cancelled (virtual death)
 	-- abp-0.2.3 roster lineage, keyed by entity_key: HP budget still countable, HP last seen,
 	-- members that died or left, and this frame's lineage deaths and NPC inits (resolved per frame).
 	lineage = {}, lineage_hp = {}, lineage_gone = {}, lineage_dying = {}, lineage_born = {},
+	-- abp-0.2.4: tears already counted as a hit (entity_key), and the invincible player.
+	tear_hit = {}, invincible = false,
+	-- abp-0.2.5: the player's tears still in flight (entity_key -> EntityTear), resolved as hit or miss.
+	tears_live = {},
+	-- abp-0.2.6: the streak at which a miss's share of miss_units stops growing (0 = no cap).
+	miss_cap = 0,
+	-- abp-0.2.7: fire frame per tear key, hits waiting for their HP loss per NPC key ({fire, left,
+	-- frame}), the last hit per NPC key ({fire, frame}), and the credits per fire frame ({d, k, m}).
+	tear_fire = {}, pending_hits = {}, last_hit = {}, credits = {},
+	-- abp-0.2.12: the play batch being run ({codes, repeats, rep, i, stop_clear}), nil outside one.
+	play = nil,
 }
 
+-- abp-0.2.9 duel: the NPC's constants, measured on the player (EXPERIMENTS.md A6).
+local DUEL_TYPE = 11   -- Pacer (11.1); MC_NPC_UPDATE is registered for this type
+local DUEL = {
+	-- movement per physics sub-step, two per logic frame: pos += v, then v = (the part along the input direction
+	-- x friction, or x friction_against when it points against it; the part across x friction_side) + accel x input;
+	-- no input: v x friction. Fitted on the player (MoveSpeed 1): largest error 0.003 px/frame.
+	friction = 0.8803, friction_against = 0.845, friction_side = 0.78, accel = 0.528, substeps = 2,
+	engine_factor = 0.75,   -- the NPC moves 0.75 x the velocity set in MC_NPC_UPDATE in the same frame
+	fire_delay = 10,        -- the player's MaxFireDelay: a shot every 11 frames while shooting
+	shot_speed = 10.0, inherit = 1.2, shot_spawn = 10.0, shot_side_min = 3.0, shot_side_max = 5.0,
+	shot_height = -23.75, shot_falling = 0.13, shot_size = 8.165,
+	iframes = 30,           -- damage again 30 frames after a hit (the player: cooldown 60, -2 per frame)
+	hp = 21.0, size = 10.0, knockback = 0.3,
+}
+local DUEL_MOVES = { [0] = { 0, 0 }, { 0, -1 }, { 0.70710678, -0.70710678 }, { 1, 0 }, { 0.70710678, 0.70710678 },
+	{ 0, 1 }, { -0.70710678, 0.70710678 }, { -1, 0 }, { -0.70710678, -0.70710678 } }
+local DUEL_SHOTS = { [1] = { 0, -1 }, [2] = { 1, 0 }, [3] = { 0, 1 }, [4] = { -1, 0 } }
+
+local function duel_side()
+	return { shots = 0, hits = 0, misses = 0, miss_units = 0, miss_streak = 0, damage = 0, hurt = 0, hurt_amount = 0 }
+end
+
+-- key: the NPC's entity_key (nil: no duel); vx, vy: its velocity in the player's engine units; intended: the
+-- displacement set last frame; hit_frame: logic_frames at its last damage; eye: side of the next shot; kick: tear
+-- pushes waiting for the next frame (pushed: the tears that pushed); side[1] the player, side[2] the NPC; live[s]:
+-- shots in flight (key -> entity); hit[s]: shots that damaged the other side.
+local duel = {}
+local function duel_clear()
+	duel = { key = nil, active = false, dead = false, move = 0, shoot = 0, cooldown = 0, vx = 0, vy = 0,
+		last = nil, intended = nil, hit_frame = nil, updated = nil, eye = 1, rng = nil, kick_x = 0, kick_y = 0, pushed = {},
+		side = { duel_side(), duel_side() }, live = { {}, {} }, hit = { {}, {} } }
+end
+duel_clear()
+
 local function zero_events()
+	duel_clear()   -- abp-0.2.9: a reset drops the duel (a new NPC can reuse the old one's Index and InitSeed)
 	state.events = { damage = 0, tears = 0, npc_deaths = 0, clears = 0 }
 	state.combat = { player_damage_events = 0, player_damage = 0, enemy_damage_events = 0,
 		enemy_damage = 0, enemy_damage_fraction = 0, blocking_hp = 0, blocking_points = 0, blocking_count = 0,
-		lineage_damage = 0, lineage_kills = 0, lineage_count = 0, lineage_hp = 0 }
-	state.health = { players = {}, npcs = {}, deaths = {} }
+		lineage_damage = 0, lineage_kills = 0, lineage_count = 0, lineage_hp = 0, tear_hits = 0, blocked_hits = 0,
+		tear_misses = 0, miss_units = 0, miss_streak = 0, monster_damage = 0 }
+	state.health = { players = {}, npcs = {}, deaths = {}, monsters = {}, monster_hits = {} }
 	state.lethal = {}
 	state.lineage, state.lineage_hp, state.lineage_gone = {}, {}, {}
 	state.lineage_dying, state.lineage_born = {}, {}
+	state.tear_hit, state.invincible, state.tears_live = {}, false, {}
+	state.miss_cap = 0
+	state.stat_mods = nil   -- abp-0.2.11: the player's stat offsets (AbpSetStats)
+	state.tear_fire, state.pending_hits, state.last_hit, state.credits = {}, {}, {}, {}
 end
 
 local function entity_key(e) return tostring(e.Index) .. ':' .. tostring(e.InitSeed) end
+
+-- abp-0.2.8-hp: the engine's active-enemy types (Entity::IsActiveEnemy, RVA 0x13E0E0: 10 <= type < 1000, not a
+-- shopkeeper 17, fire place 33, poop 245 or movable TNT 292); e must be an NPC.
+local function is_monster(e)
+	local t = e.Type
+	return t >= 10 and t < 1000 and t ~= 17 and t ~= 33 and t ~= 245 and t ~= 292
+end
 
 local function record_enemy_loss(previous, hp)
 	local loss = math.max(0, previous.hp - math.max(0, hp))
@@ -180,6 +308,10 @@ function AbpRosterMark(mode)
 	state.lineage, state.lineage_hp, state.lineage_gone = {}, {}, {}
 	state.lineage_dying, state.lineage_born = {}, {}
 	state.combat.lineage_damage, state.combat.lineage_kills = 0, 0
+	state.combat.tear_hits, state.tear_hit = 0, {}
+	state.combat.tear_misses, state.combat.miss_units, state.combat.miss_streak = 0, 0, 0
+	state.tears_live = {}
+	state.tear_fire, state.pending_hits, state.last_hit, state.credits = {}, {}, {}, {}
 	local n = 0
 	for _, e in ipairs(Isaac.GetRoomEntities()) do
 		-- Exists(): the arena setup removes the room's own NPCs in the same frame.
@@ -196,6 +328,241 @@ local function in_lineage(e)
 	return state.lineage[key] ~= nil and not state.lineage_gone[key]
 end
 
+-- abp-0.2.4: the setup chunk switches the player's invincibility per episode (reset turns it off).
+function AbpSetInvincible(on)
+	state.invincible = (on == true)
+	return state.invincible
+end
+
+-- abp-0.2.6: the setup chunk sets the miss cap per episode (reset turns it off).
+function AbpSetMissCap(k)
+	state.miss_cap = math.max(0, math.floor(tonumber(k) or 0))
+	return state.miss_cap
+end
+
+-- abp-0.2.11 (C41): the player's stat offsets for the episode (header). stats_modified: the cached stats carry offsets,
+-- so a call with all zero re-evaluates once to bring the base stats back.
+local stats_modified = false
+function AbpSetStats(speed, damage, shot_speed, tears, range)
+	local m = { speed = tonumber(speed) or 0, damage = tonumber(damage) or 0, shot_speed = tonumber(shot_speed) or 0,
+		tears = tonumber(tears) or 0, range = tonumber(range) or 0 }
+	local any = m.speed ~= 0 or m.damage ~= 0 or m.shot_speed ~= 0 or m.tears ~= 0 or m.range ~= 0
+	state.stat_mods = any and m or nil
+	local player = Isaac.GetPlayer(0)
+	if any or stats_modified then
+		player:AddCacheFlags(CacheFlag.CACHE_ALL)
+		player:EvaluateItems()
+	end
+	stats_modified = any
+	return string.format("%.4f,%.4f,%.4f,%.4f,%.4f", player.MoveSpeed, player.Damage, player.ShotSpeed,
+		player.MaxFireDelay, player.TearHeight)
+end
+
+mod:AddCallback(ModCallbacks.MC_EVALUATE_CACHE, function(_, player, flag)
+	local m = state.stat_mods
+	if not m then return end
+	if flag == CacheFlag.CACHE_SPEED then
+		player.MoveSpeed = math.max(0.1, player.MoveSpeed + m.speed)
+	elseif flag == CacheFlag.CACHE_DAMAGE then
+		player.Damage = math.max(0.5, player.Damage + m.damage)
+	elseif flag == CacheFlag.CACHE_SHOTSPEED then
+		player.ShotSpeed = math.max(0.6, player.ShotSpeed + m.shot_speed)   -- the engine's own floor is 0.6
+	elseif flag == CacheFlag.CACHE_FIREDELAY then
+		local tears = math.max(0.5, 30 / (player.MaxFireDelay + 1) + m.tears)
+		player.MaxFireDelay = math.max(1, math.floor(30 / tears - 1 + 0.5))
+	elseif flag == CacheFlag.CACHE_RANGE then
+		player.TearHeight = player.TearHeight * (6.5 + m.range) / 6.5
+	end
+end)
+
+-- abp-0.2.9 duel ------------------------------------------------------------------------------
+-- The setup chunk calls this with the NPC it spawned (DUEL_TYPE): hp (default 21), no contact damage, the player's
+-- Size and Mass, no engine knockback or status effects (tear pushes go through the duel's own movement law). The NPC starts
+-- playing when its spawn phase ends (the first MC_NPC_UPDATE: duel.active).
+function AbpDuelAttach(e, hp)
+	local npc = e and e:ToNPC()
+	if npc == nil or e.Type ~= DUEL_TYPE then return "not a duel NPC" end
+	duel_clear()
+	duel.key = entity_key(e)
+	hp = tonumber(hp) or DUEL.hp
+	npc.MaxHitPoints, npc.HitPoints = hp, hp
+	npc.CollisionDamage = 0
+	e.Size = DUEL.size
+	e.Mass = Isaac.GetPlayer(0).Mass   -- bodies push each other alike (Pacer 3, player 5)
+	npc:AddEntityFlags(EntityFlag.FLAG_NO_STATUS_EFFECTS | EntityFlag.FLAG_NO_KNOCKBACK)
+	local rng = RNG()
+	rng:SetSeed(e.InitSeed, 35)   -- the shots' side offsets: a function of the (reseeded) spawn
+	duel.rng = rng
+	return "attached " .. duel.key
+end
+
+-- Damage to the duel NPC (MC_ENTITY_TAKE_DMG): the player's damage cooldown and lethal rule; the player's tear that
+-- does the damage is a hit. Returns false to cancel the damage, nil to let it through.
+local function duel_take_damage(e, amount, source)
+	if duel.dead or not duel.active then return false end
+	if duel.hit_frame ~= nil and state.logic_frames - duel.hit_frame < DUEL.iframes then return false end
+	duel.hit_frame = state.logic_frames
+	local hp = math.max(0, e.HitPoints)
+	local dealt = math.min(amount, hp)
+	local me = duel.side[2]
+	me.hurt, me.hurt_amount = me.hurt + 1, me.hurt_amount + dealt
+	local shot = source and source.Entity
+	if shot ~= nil and shot.Type == EntityType.ENTITY_TEAR then
+		local key = entity_key(shot)
+		if duel.live[1][key] ~= nil then
+			duel.hit[1][key] = true
+			local p = duel.side[1]
+			p.hits, p.damage, p.miss_streak = p.hits + 1, p.damage + dealt, 0
+		end
+	end
+	if amount >= hp then
+		duel.dead = true   -- as the player's lethal hit: cancelled and counted; the NPC stays where it is
+		return false
+	end
+	return nil
+end
+
+-- The engine's grid collision lets the NPC, moving diagonally, into a corner up to the corner point (2.9 px deeper
+-- than the player into each wall, A6): at the end of every frame its circle (the player's radius) is pushed out of
+-- every blocking grid cell around it, as the player is.
+local function duel_unstick()
+	if duel.key == nil or not duel.active then return end
+	local e = nil
+	for _, x in ipairs(Isaac.GetRoomEntities()) do
+		if entity_key(x) == duel.key then e = x; break end
+	end
+	if e == nil then return end
+	local room = Game():GetRoom()
+	local width, size = room:GetGridWidth(), room:GetGridSize()
+	local r = DUEL.size
+	local x, y = e.Position.X, e.Position.Y
+	local changed = false
+	for _ = 1, 4 do
+		local moved = false
+		local centre = room:GetGridIndex(Vector(x, y))
+		local col, row = centre % width, centre // width
+		for dr = -1, 1 do
+			for dc = -1, 1 do
+				local c, rr = col + dc, row + dr
+				local index = rr * width + c
+				if c >= 0 and c < width and rr >= 0 and index < size
+					and room:GetGridCollision(index) ~= GridCollisionClass.COLLISION_NONE then
+					local cell = room:GetGridPosition(index)
+					local qx = math.max(cell.X - 20, math.min(x, cell.X + 20))
+					local qy = math.max(cell.Y - 20, math.min(y, cell.Y + 20))
+					local dx, dy = x - qx, y - qy
+					local d = math.sqrt(dx * dx + dy * dy)
+					if d < r - 1e-6 then
+						if d > 1e-6 then
+							x, y = qx + dx / d * r, qy + dy / d * r
+						else   -- the centre inside the cell: out along the nearer side
+							local ox, oy = 20 + r - math.abs(x - cell.X), 20 + r - math.abs(y - cell.Y)
+							if ox < oy then x = x + (x >= cell.X and ox or -ox) else y = y + (y >= cell.Y and oy or -oy) end
+						end
+						moved, changed = true, true
+					end
+				end
+			end
+		end
+		if not moved then break end
+	end
+	if changed then e.Position = Vector(x, y) end
+end
+
+-- Duel shots that are gone: one that never damaged the other side is a miss (abp-0.2.5's miss rules and abp-0.2.6's
+-- cap, for both sides).
+local function duel_resolve()
+	if duel.key == nil then return end
+	for s = 1, 2 do
+		local side, live, hit = duel.side[s], duel.live[s], duel.hit[s]
+		for key, shot in pairs(live) do
+			local ok, alive = pcall(function() return shot:Exists() and not shot:IsDead() end)
+			if not ok or not alive then
+				live[key] = nil
+				if not hit[key] then
+					side.misses = side.misses + 1
+					side.miss_streak = side.miss_streak + 1
+					side.miss_units = side.miss_units + (state.miss_cap > 0 and math.min(side.miss_streak, state.miss_cap)
+						or side.miss_streak)
+				end
+				hit[key] = nil
+			end
+		end
+	end
+end
+
+-- abp-0.2.4: a player tear that damages a (vulnerable, living) lineage NPC is one hit; a tear counts
+-- once. Called from MC_ENTITY_TAKE_DMG for non-player entities; only source.Entity is read (see
+-- the header: EntityRef.Type aborts the game).
+local function count_tear_hit(entity, amount, source)
+	if amount <= 0 or source == nil then return end
+	local tear = source.Entity
+	if tear == nil or tear.Type ~= EntityType.ENTITY_TEAR then return end
+	if not entity:ToNPC() or entity:IsDead() or not entity:IsVulnerableEnemy() or not in_lineage(entity) then return end
+	local key = entity_key(tear)
+	if state.tear_hit[key] then return end
+	state.tear_hit[key] = true
+	state.combat.tear_hits = state.combat.tear_hits + 1
+	state.combat.miss_streak = 0      -- abp-0.2.5: a hit ends the run of misses
+	-- abp-0.2.7: the HP loss this hit causes (charged a frame later at most) goes to the tear's fire frame.
+	local fire, npc = state.tear_fire[key], entity_key(entity)
+	local list = state.pending_hits[npc]
+	if list == nil then list = {}; state.pending_hits[npc] = list end
+	list[#list + 1] = { fire = fire, left = amount, frame = state.logic_frames }
+	state.last_hit[npc] = { fire = fire, frame = state.logic_frames }
+end
+
+-- abp-0.2.7: charge an amount of damage (d), kills (k) or miss units (m) to the frame a tear was
+-- fired in; nil (no tear) charges the current frame.
+local function credit(fire, field, amount)
+	if amount == 0 then return end
+	local f = fire or state.logic_frames
+	local c = state.credits[f]
+	if c == nil then c = { d = 0, k = 0, m = 0 }; state.credits[f] = c end
+	c[field] = c[field] + amount
+end
+
+local PENDING_FRAMES = 4   -- a hit whose HP loss has not shown up after this many frames is dropped
+local KILL_FRAMES = 6      -- a lineage death this soon after a tear hit it is that tear's kill
+
+local function kill_credit(key)
+	local h = state.last_hit[key]
+	credit(h and state.logic_frames - h.frame <= KILL_FRAMES and h.fire or nil, "k", 1)
+end
+
+local function credit_list()
+	local frames = {}
+	for f in pairs(state.credits) do frames[#frames + 1] = f end
+	table.sort(frames)
+	local out = {}
+	for _, f in ipairs(frames) do
+		local c = state.credits[f]
+		out[#out + 1] = { f, c.d, c.k, c.m }
+	end
+	return out
+end
+
+-- abp-0.2.5: tears that are gone. One that never damaged a lineage NPC is a miss; each miss adds the
+-- length of the current run of misses to miss_units (so the k-th miss in a row adds k), up to the
+-- miss cap (abp-0.2.6).
+local function resolve_tears()
+	for key, tear in pairs(state.tears_live) do
+		local ok, alive = pcall(function() return tear:Exists() and not tear:IsDead() end)
+		if not ok or not alive then
+			state.tears_live[key] = nil
+			if not state.tear_hit[key] then
+				local c = state.combat
+				c.tear_misses = c.tear_misses + 1
+				c.miss_streak = c.miss_streak + 1
+				local units = state.miss_cap > 0 and math.min(c.miss_streak, state.miss_cap) or c.miss_streak
+				c.miss_units = c.miss_units + units
+				credit(state.tear_fire[key], "m", units)   -- abp-0.2.7
+			end
+			state.tear_fire[key] = nil
+		end
+	end
+end
+
 -- HP a lineage NPC lost since last seen, up to its remaining budget.
 local function charge_lineage(key, hp)
 	local previous = state.lineage_hp[key]
@@ -203,6 +570,16 @@ local function charge_lineage(key, hp)
 		local loss = math.min(previous - hp, state.lineage[key])
 		state.lineage[key] = state.lineage[key] - loss
 		state.combat.lineage_damage = state.combat.lineage_damage + loss
+		-- abp-0.2.7: the loss goes to the tears that hit this NPC, oldest first, up to each one's damage.
+		local list, left = state.pending_hits[key], loss
+		while list and #list > 0 and left > 0 do
+			local p = list[1]
+			local take = math.min(p.left, left)
+			credit(p.fire, "d", take)
+			p.left, left = p.left - take, left - take
+			if p.left <= 1e-9 then table.remove(list, 1) end
+		end
+		if left > 0 then credit(nil, "d", left) end
 	end
 	state.lineage_hp[key] = hp
 end
@@ -242,7 +619,30 @@ local function resolve_lineage()
 	state.lineage_dying, state.lineage_born = {}, {}
 end
 
+-- abp-0.2.8: a member that died and lives on as the same entity (a Gaper that loses its head becomes a
+-- Gusher or Pacer) joins again with its HP then as the budget. Not in the frame of its death callback:
+-- update_lineage counts that death as the kill first (IsDead() can turn true a frame before it).
+local function rejoin_lineage(e)
+	local key = entity_key(e)
+	if state.lineage_gone[key] and not state.health.deaths[key] then
+		local hp = math.max(0, e.HitPoints)
+		state.lineage[key], state.lineage_hp[key], state.lineage_gone[key] = hp, hp, nil
+		AbpLineageStats.rejoined = (AbpLineageStats.rejoined or 0) + 1
+	end
+end
+
 local function update_lineage()
+	local mode = state.lineage_mode or 0
+	if mode > 0 then
+		for _, e in ipairs(Isaac.GetRoomEntities()) do
+			if e:ToNPC() and e:Exists() and not e:IsDead() and blocks_doors(e) then
+				-- abp-0.2.5: in mode 3 every doors-blocking NPC joins from the first frame it is seen
+				-- (spawns included).
+				if mode == 3 then join_lineage(e) end
+				rejoin_lineage(e)
+			end
+		end
+	end
 	local seen, count, hp_total = {}, 0, 0
 	for _, e in ipairs(Isaac.GetRoomEntities()) do
 		if e:ToNPC() and in_lineage(e) then
@@ -254,6 +654,7 @@ local function update_lineage()
 			if dead then
 				state.lineage_gone[key] = true
 				state.combat.lineage_kills = state.combat.lineage_kills + 1
+				kill_credit(key)   -- abp-0.2.7
 			else
 				count = count + 1
 				hp_total = hp_total + hp
@@ -266,18 +667,27 @@ local function update_lineage()
 			if state.health.deaths[key] then
 				charge_lineage(key, 0)
 				state.combat.lineage_kills = state.combat.lineage_kills + 1
+				kill_credit(key)   -- abp-0.2.7
 			end
 			state.lineage_gone[key] = true
 		end
 	end
 	state.combat.lineage_count = count
 	state.combat.lineage_hp = hp_total
+	-- abp-0.2.7: hits whose HP loss never showed up (a spent budget, a cancelled hit) are dropped.
+	for key, list in pairs(state.pending_hits) do
+		while #list > 0 and state.logic_frames - list[1].frame > PENDING_FRAMES do table.remove(list, 1) end
+		if #list == 0 then state.pending_hits[key] = nil end
+	end
 end
 
 -- Settled health every logic frame (same definition as 0.2.0).
 local function update_combat()
 	local game = Game()
 	resolve_lineage()
+	resolve_tears()
+	duel_unstick()   -- abp-0.2.9
+	duel_resolve()
 	for i = 0, game:GetNumPlayers() - 1 do
 		local p = Isaac.GetPlayer(i)
 		local total = p:GetTotalDamageTaken()
@@ -288,7 +698,7 @@ local function update_combat()
 		end
 		state.health.players[i] = total
 	end
-	local current = {}
+	local current, monsters = {}, {}
 	local blocking_hp, blocking_points, blocking_count = 0, 0, 0
 	for _, e in ipairs(Isaac.GetRoomEntities()) do
 		if e:ToNPC() and e:CanShutDoors() and not e:IsDead() then
@@ -303,10 +713,25 @@ local function update_combat()
 			if previous then record_enemy_loss(previous, hp) end
 			current[key] = { hp = hp, max_hp = previous and previous.max_hp or e.MaxHitPoints }
 		end
+		-- abp-0.2.8-hp: a monster's real HP loss since the last frame (a dead one keeps its HitPoints).
+		if e:ToNPC() and is_monster(e) then
+			local key = entity_key(e)
+			local hp = math.max(0, e.HitPoints)
+			local previous = state.health.monsters[key]
+			if previous and hp < previous then state.combat.monster_damage = state.combat.monster_damage + (previous - hp) end
+			monsters[key] = hp
+		end
 	end
 	for key, previous in pairs(state.health.npcs) do
 		if not current[key] and state.health.deaths[key] then record_enemy_loss(previous, 0) end
 	end
+	-- abp-0.2.8-hp: a monster gone in the frame of its death: the damage reported for it this frame, up to its HP.
+	for key, previous in pairs(state.health.monsters) do
+		if not monsters[key] and state.health.deaths[key] then
+			state.combat.monster_damage = state.combat.monster_damage + math.min(previous, state.health.monster_hits[key] or 0)
+		end
+	end
+	state.health.monsters, state.health.monster_hits = monsters, {}
 	update_lineage()
 	state.health.npcs = current
 	state.health.deaths = {}
@@ -339,6 +764,7 @@ local function disconnect(reason)
 	if state.client then state.client:close() end
 	state.client = nil
 	state.held = {}; state.triggered = {}; state.frames_left = 0; state.pending_reset = false
+	state.play = nil
 end
 
 local function try_bind()
@@ -569,6 +995,40 @@ local function room_record(game)
 	return rec
 end
 
+-- abp-0.2.9: the duel NPC entity (nil when gone) and the observation's duel record (nil without a duel).
+local function duel_npc()
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		if entity_key(e) == duel.key then return e end
+	end
+	return nil
+end
+
+local function duel_record()
+	if duel.key == nil then return nil end
+	local e = duel_npc()
+	local p = Isaac.GetPlayer(0)
+	return {
+		active = duel.active, dead = duel.dead, npc = e and e.Index or -1, pos = e and vec(e.Position) or { 0, 0 },
+		size = e and e.Size or 0, hp = (e ~= nil and not duel.dead) and math.max(0, e.HitPoints) or 0,
+		max_hp = e and e.MaxHitPoints or 0,
+		-- frames of the coming ones in which damage is still blocked (both sides: 29 right after a hit)
+		iframes = duel.hit_frame and math.max(0, DUEL.iframes - (state.logic_frames - duel.hit_frame)) or 0,
+		player_iframes = math.max(0, p:GetDamageCooldown() // 2 - 1),
+		cooldown = duel.cooldown, vel = { duel.vx, duel.vy }, move = duel.move, shoot = duel.shoot,
+		player = duel.side[1], npc_side = duel.side[2],
+	}
+end
+
+-- abp-0.2.9: moves the duel NPC to (x, y) at rest (checks and setups; lua command).
+function AbpDuelPlace(x, y)
+	local e = duel_npc()
+	if e == nil then return "no duel NPC" end
+	e.Position, e.Velocity = Vector(x, y), Vector(0, 0)
+	duel.vx, duel.vy, duel.kick_x, duel.kick_y, duel.intended = 0, 0, 0, 0, nil
+	duel.last = Vector(x, y)
+	return "ok"
+end
+
 local function build_obs()
 	local game = Game()
 	local obs = {
@@ -595,7 +1055,12 @@ local function build_obs()
 		blocking_hp = state.combat.blocking_hp, blocking_points = state.combat.blocking_points,
 		blocking_count = state.combat.blocking_count, lineage_damage = state.combat.lineage_damage,
 		lineage_kills = state.combat.lineage_kills, lineage_count = state.combat.lineage_count,
-		lineage_hp = state.combat.lineage_hp }
+		lineage_hp = state.combat.lineage_hp, tear_hits = state.combat.tear_hits,
+		blocked_hits = state.combat.blocked_hits, tear_misses = state.combat.tear_misses,
+		miss_units = state.combat.miss_units, miss_streak = state.combat.miss_streak,
+		credits = credit_list(),   -- abp-0.2.7
+		monster_damage = state.combat.monster_damage }   -- abp-0.2.8-hp
+	obs.duel = duel_record()   -- abp-0.2.9
 	return obs
 end
 
@@ -718,6 +1183,28 @@ local function pack_player(p)
 		B(p:IsDead() or state.lethal[p.Index] == true), I(p:GetPlayerType())) .. vel
 end
 
+-- abp-0.2.7: combat.credits as a count and {fire_frame:int64, damage, kills, miss_units:double} records.
+local function pack_credits()
+	local list = credit_list()
+	local parts = { packf("<I2", #list) }
+	for _, r in ipairs(list) do parts[#parts + 1] = packf("<i8ddd", I(r[1]), r[2], r[3], r[4]) end
+	return table.concat(parts)
+end
+
+-- abp-0.2.9: the duel block, last in the payload: 0, or 1 and the NPC's state and both sides' counters
+-- (python/isaac_bridge/abplus_obs.py _DUEL, _DUEL_SIDE).
+local function pack_duel()
+	local r = duel_record()
+	if r == nil then return packf("<B", 0) end
+	local parts = { packf("<BBBi8ddddd" .. "i8i8i8ddBB", 1, B(r.active), B(r.dead), I(r.npc), r.pos[1], r.pos[2], r.size, r.hp,
+		r.max_hp, I(r.iframes), I(r.player_iframes), I(r.cooldown), r.vel[1], r.vel[2], I(r.move), I(r.shoot)) }
+	for _, s in ipairs({ r.player, r.npc_side }) do
+		parts[#parts + 1] = packf("<dddddddd", s.shots, s.hits, s.misses, s.miss_units, s.miss_streak, s.damage, s.hurt,
+			s.hurt_amount)
+	end
+	return table.concat(parts)
+end
+
 local function pack_obs(event)
 	local game = Game()
 	local room, level = game:GetRoom(), game:GetLevel()
@@ -727,9 +1214,11 @@ local function pack_obs(event)
 	local parts = {
 		packf("<I4I4I4Bi8i8i8i8", OBS_MAGIC, I(state.logic_frames), I(game:GetFrameCount()), B(game:IsPaused()),
 			I(state.events.damage), I(state.events.tears), I(state.events.npc_deaths), I(state.events.clears)),
-		packf("<dddddddddddd", c.player_damage_events, c.player_damage, c.enemy_damage_events, c.enemy_damage,
+		packf("<dddddddddddddddddd", c.player_damage_events, c.player_damage, c.enemy_damage_events, c.enemy_damage,
 			c.enemy_damage_fraction, c.blocking_hp, c.blocking_points, c.blocking_count,
-			c.lineage_damage, c.lineage_kills, c.lineage_count, c.lineage_hp),
+			c.lineage_damage, c.lineage_kills, c.lineage_count, c.lineage_hp, c.tear_hits, c.blocked_hits,
+			c.tear_misses, c.miss_units, c.miss_streak, c.monster_damage),   -- abp-0.2.8-hp: 18 doubles
+		pack_credits(),   -- abp-0.2.7
 		packf("<i8i8i8i8ddddBi8i8i8i8i8i8", I(room:GetType()), I(room:GetRoomShape()), I(room:GetGridWidth()),
 			I(room:GetGridHeight()), tl.X, tl.Y, br.X, br.Y, B(room:IsClear()), I(room:GetAliveEnemiesCount()),
 			I(room:GetFrameCount()), I(level:GetStage()), I(level:GetStageType()), I(level:GetCurses()),
@@ -775,6 +1264,7 @@ local function pack_obs(event)
 	end
 	parts[#parts + 1] = packf("<I2", #ents)
 	for _, rec in ipairs(ents) do parts[#parts + 1] = rec end
+	parts[#parts + 1] = pack_duel()   -- abp-0.2.9
 	return table.concat(parts)
 end
 
@@ -789,7 +1279,7 @@ local function send_raw(data)
 	return true
 end
 
-local function send_obs(event)
+local function send_obs_now(event)
 	state.seq = state.seq + 1
 	if state.obs_format == 2 then
 		if state.obs_validate then
@@ -809,10 +1299,17 @@ local function send_obs(event)
 	return send(msg)
 end
 
+-- abp-0.2.7: a step observation hands over the credits collected since the previous one.
+local function send_obs(event)
+	local sent = send_obs_now(event)
+	if event == "step" then state.credits = {} end
+	return sent
+end
+
 ------------------------------------------------------------------ command loop
 
 local function do_reset(cmd)
-	state.held = {}; state.triggered = {}; state.frames_left = 0
+	state.held = {}; state.triggered = {}; state.frames_left = 0; state.play = nil
 	state.terrain_dirty = true
 	state.stats.resets = state.stats.resets + 1
 	zero_events()
@@ -830,6 +1327,34 @@ local function run_lua(code)
 	return pcall(chunk)
 end
 
+-- abp-0.2.12 play: the batch's next action, applied as the step command applies its own.
+local function play_next()
+	local p = state.play
+	p.i = p.i + 1
+	local code = math.floor(tonumber(p.codes[p.i]) or 0)
+	apply_action({ move = code % 9, shoot = (code // 9) % 5, bomb = (code // 45) % 2, item = (code // 90) % 2 })
+	state.frames_left = math.max(1, math.floor(tonumber(p.repeats and p.repeats[p.i]) or p.rep))
+	state.stats.steps = state.stats.steps + 1
+end
+
+-- Where a step observation would be sent: true when the batch goes on with its next action; false when it has ended
+-- (the ok message is sent, the step observation follows).
+local function play_continue()
+	local p = state.play
+	local player = Isaac.GetPlayer(0)
+	local stop = nil
+	if player ~= nil and (player:IsDead() or state.lethal[player.Index] == true) then stop = "dead"
+	elseif p.stop_clear and Game():GetRoom():IsClear() then stop = "clear"
+	elseif p.i >= #p.codes then stop = "done" end
+	if stop == nil then
+		play_next()
+		return true
+	end
+	state.play = nil
+	send({ type = "ok", cmd = "play", played = p.i, stop = stop })
+	return false
+end
+
 local function wait_command()
 	while state.client do
 		local line, err = state.client:receive("*l")
@@ -839,9 +1364,26 @@ local function wait_command()
 			send({ type = "error", msg = "bad json" })
 		elseif cmd.cmd == "step" then
 			apply_action(cmd)
+			if duel.key ~= nil then   -- abp-0.2.9: the duel NPC's move and shoot for the frames of this step
+				duel.move = math.max(0, math.min(8, math.floor(tonumber(cmd.duel_move) or 0)))
+				duel.shoot = math.max(0, math.min(4, math.floor(tonumber(cmd.duel_shoot) or 0)))
+			end
 			state.frames_left = math.max(1, math.floor(tonumber(cmd["repeat"]) or cfg.default_repeat))
 			state.stats.steps = state.stats.steps + 1
 			return
+		elseif cmd.cmd == "play" then   -- abp-0.2.12
+			if type(cmd.actions) ~= "table" or #cmd.actions == 0 then
+				send({ type = "error", msg = "play: no actions" })
+			elseif cmd.repeats ~= nil and (type(cmd.repeats) ~= "table" or #cmd.repeats ~= #cmd.actions) then
+				send({ type = "error", msg = "play: repeats must match actions" })
+			elseif duel.key ~= nil then
+				send({ type = "error", msg = "play: not with the duel NPC" })
+			else
+				state.play = { codes = cmd.actions, repeats = cmd.repeats, i = 0, stop_clear = cmd.stop_clear == true,
+					rep = math.max(1, math.floor(tonumber(cmd["repeat"]) or cfg.default_repeat)) }
+				play_next()
+				return
+			end
 		elseif cmd.cmd == "reset" then
 			do_reset(cmd)
 			return
@@ -919,10 +1461,47 @@ local function health_units(p)
 	return p:GetHearts() + p:GetSoulHearts() + p:GetEternalHearts() + 2 * p:GetBoneHearts()
 end
 
+-- abp-0.2.9: damage the player takes in a duel (every source; the engine calls MC_ENTITY_TAKE_DMG for the player only
+-- outside its damage cooldown); the duel NPC's shot that does it is the NPC's hit.
+local function duel_player_damage(p, amount, source)
+	local dealt = math.min(amount, health_units(p))
+	local me = duel.side[1]
+	me.hurt, me.hurt_amount = me.hurt + 1, me.hurt_amount + dealt
+	local shot = source and source.Entity
+	if shot ~= nil and shot.Type == EntityType.ENTITY_PROJECTILE then
+		local key = entity_key(shot)
+		if duel.live[2][key] ~= nil then
+			duel.hit[2][key] = true
+			local n = duel.side[2]
+			n.hits, n.damage, n.miss_streak = n.hits + 1, n.damage + dealt, 0
+		end
+	end
+end
+
 mod:AddCallback(ModCallbacks.MC_ENTITY_TAKE_DMG, function(_, entity, amount, flags, source, countdown)
 	local p = entity and entity:ToPlayer()
-	if not p then return nil end
+	if not p then
+		if entity then
+			if duel.key ~= nil and entity_key(entity) == duel.key then   -- abp-0.2.9
+				local result = duel_take_damage(entity, amount, source)
+				if result ~= nil then return result end
+			end
+			if entity:ToNPC() and is_monster(entity) then   -- abp-0.2.8-hp: for a monster gone this frame
+				local key = entity_key(entity)
+				state.health.monster_hits[key] = (state.health.monster_hits[key] or 0) + math.max(0, amount)
+			end
+			count_tear_hit(entity, amount, source)
+		end
+		return nil
+	end
+	-- abp-0.2.4: an invincible player takes no damage (returning false cancels it, and the later
+	-- callbacks of the same event are not called).
+	if state.invincible and state.client then
+		state.combat.blocked_hits = state.combat.blocked_hits + 1
+		return false
+	end
 	state.events.damage = state.events.damage + 1
+	if duel.key ~= nil and not state.lethal[p.Index] then duel_player_damage(p, amount, source) end   -- abp-0.2.9
 	if cfg.block_lethal and state.client and p:GetExtraLives() == 0 and amount >= health_units(p) then
 		if not state.lethal[p.Index] then
 			state.lethal[p.Index] = true
@@ -935,6 +1514,102 @@ mod:AddCallback(ModCallbacks.MC_ENTITY_TAKE_DMG, function(_, entity, amount, fla
 end)
 mod:AddCallback(ModCallbacks.MC_POST_FIRE_TEAR, function(_, tear)
 	state.events.tears = state.events.tears + 1
+	local key = entity_key(tear)
+	state.tears_live[key] = tear   -- abp-0.2.5: followed until resolved (resolve_tears)
+	-- abp-0.2.7: MC_POST_UPDATE (which counts logic_frames) runs after the entities of the frame.
+	state.tear_fire[key] = state.logic_frames + 1
+	if duel.key ~= nil then   -- abp-0.2.9: the player's duel shots
+		duel.live[1][key] = tear
+		duel.side[1].shots = duel.side[1].shots + 1
+	end
+end)
+
+-- abp-0.2.9: the duel NPC's frame, after the engine's AI for it (which is overridden). The engine then moves it by
+-- 0.75 x the velocity set here, in this frame (A6: no lag).
+mod:AddCallback(ModCallbacks.MC_NPC_UPDATE, function(_, npc)
+	if duel.key == nil or entity_key(npc) ~= duel.key then return end
+	local pos = npc.Position
+	if not duel.active then
+		-- The engine updates a new NPC once when it spawns and then not until its spawn phase is over (about 20
+		-- frames): it plays from the second of two updates in consecutive frames.
+		local frame = state.logic_frames
+		local previous = duel.updated
+		duel.updated = frame
+		if previous == nil or frame - previous ~= 1 then
+			npc.Velocity = Vector(0, 0)   -- not the engine's own walk
+			return
+		end
+		duel.active = true
+		duel.cooldown = -1      -- the player's fire delay is below 0 by now: both can shoot at once
+		duel.last = Vector(pos.X, pos.Y)
+	end
+	if duel.dead then
+		npc.Velocity = Vector(0, 0)
+		return
+	end
+	-- Walls: the part of last frame's displacement that did not happen stops that part of the velocity, as the
+	-- player's grid collision does.
+	if duel.intended ~= nil then
+		local dx, dy = pos.X - duel.last.X, pos.Y - duel.last.Y
+		local ix, iy = duel.intended[1], duel.intended[2]
+		if math.abs(ix) > 1e-6 then duel.vx = duel.vx * math.max(0, math.min(1, dx / ix)) end
+		if math.abs(iy) > 1e-6 then duel.vy = duel.vy * math.max(0, math.min(1, dy / iy)) end
+	end
+	local vx, vy = duel.vx + duel.kick_x, duel.vy + duel.kick_y
+	duel.kick_x, duel.kick_y = 0, 0
+	local start_x, start_y = vx, vy   -- the velocity a shot of this frame inherits (the player's at the frame start)
+	local u = DUEL_MOVES[duel.move] or DUEL_MOVES[0]
+	local ux, uy = u[1], u[2]
+	local sx, sy = 0, 0
+	for _ = 1, DUEL.substeps do
+		sx, sy = sx + vx, sy + vy
+		if ux == 0 and uy == 0 then
+			vx, vy = vx * DUEL.friction, vy * DUEL.friction
+		else
+			local along = vx * ux + vy * uy
+			local qx, qy = vx - along * ux, vy - along * uy
+			along = along * (along >= 0 and DUEL.friction or DUEL.friction_against)
+			vx = along * ux + qx * DUEL.friction_side + DUEL.accel * ux
+			vy = along * uy + qy * DUEL.friction_side + DUEL.accel * uy
+		end
+	end
+	duel.vx, duel.vy = vx, vy
+	duel.intended = { sx, sy }
+	duel.last = Vector(pos.X, pos.Y)
+	npc.Velocity = Vector(sx / DUEL.engine_factor, sy / DUEL.engine_factor)
+	-- Shooting, as the player's fire delay: down by one every frame, a shot when it is below 0 while shooting.
+	duel.cooldown = duel.cooldown - 1
+	local d = DUEL_SHOTS[duel.shoot]
+	if d ~= nil and duel.cooldown < 0 then
+		local side = duel.eye * (DUEL.shot_side_min + (DUEL.shot_side_max - DUEL.shot_side_min) * duel.rng:RandomFloat())
+		duel.eye = -duel.eye
+		local wx, wy = d[1] * DUEL.shot_speed + DUEL.inherit * start_x, d[2] * DUEL.shot_speed + DUEL.inherit * start_y
+		-- A tear starts from where the player ends the frame and moves once in the frame it is fired in; a projectile
+		-- spawned here moves from the next frame on, so it starts one move and one fall step ahead.
+		local x = pos.X + sx + d[1] * DUEL.shot_spawn - d[2] * side + wx
+		local y = pos.Y + sy + d[2] * DUEL.shot_spawn + d[1] * side + wy
+		local shot = Isaac.Spawn(EntityType.ENTITY_PROJECTILE, 0, 0, Vector(x, y), Vector(wx, wy), npc):ToProjectile()
+		local fall = DUEL.shot_falling + 0.1 * (1 - DUEL.shot_falling)   -- a tear's falling speed after its first frame
+		shot.Height, shot.FallingSpeed, shot.FallingAccel = DUEL.shot_height + fall, fall, 0
+		shot.Size = DUEL.shot_size
+		duel.live[2][entity_key(shot)] = shot
+		duel.side[2].shots = duel.side[2].shots + 1
+		duel.cooldown = DUEL.fire_delay
+	end
+end, DUEL_TYPE)
+
+-- abp-0.2.9: a player tear that meets the duel NPC pushes it (the player's push from a projectile: 0.3 x its velocity),
+-- also when it does no damage.
+mod:AddCallback(ModCallbacks.MC_PRE_TEAR_COLLISION, function(_, tear, other, low)
+	if duel.key ~= nil and other ~= nil and not duel.dead and entity_key(other) == duel.key then
+		local key = entity_key(tear)
+		if not duel.pushed[key] then   -- once per tear
+			duel.pushed[key] = true
+			duel.kick_x = duel.kick_x + DUEL.knockback * tear.Velocity.X
+			duel.kick_y = duel.kick_y + DUEL.knockback * tear.Velocity.Y
+		end
+	end
+	return nil
 end)
 mod:AddCallback(ModCallbacks.MC_POST_NPC_DEATH, function(_, npc)
 	state.events.npc_deaths = state.events.npc_deaths + 1
@@ -975,6 +1650,7 @@ mod:AddCallback(ModCallbacks.MC_POST_UPDATE, function()
 	end
 	if state.frames_left > 0 then state.frames_left = state.frames_left - 1 end
 	if state.frames_left == 0 then
+		if state.play ~= nil and play_continue() then return end   -- abp-0.2.12
 		if send_obs("step") then wait_command() end
 	end
 end)

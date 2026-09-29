@@ -10,6 +10,11 @@ one-hot. Their fire_distance (d_fire / 40) is the critic's input for the alignme
 bypasses the Transformer and is appended to the features as the last dimension, which
 SplitMlpExtractor gives to the value branch only, so the actor and the auxiliary geometry head
 (GeometryPolicy) must find the firing geometry themselves.
+
+Size (user plan 2026-09-28, a larger distillation student): features_dim is the model width (fusion output
+and Transformer), layers / heads the temporal Transformer, entity_queries the learned queries of the
+entity-set attention (each gives one entity_dim summary of the frame's entities; fusion takes all of them),
+entity_dim the entity token width. The defaults are the architecture of every run up to C37.
 """
 import math
 
@@ -22,7 +27,7 @@ from .transformer_obs import ANIMATION_BYTES, ENTITY_FIELDS, PLAYER_FIELDS
 
 
 class CombatTransformer(BaseFeaturesExtractor):
-    def __init__(self, observation_space, features_dim=256, layers=4, heads=8):
+    def __init__(self, observation_space, features_dim=256, layers=4, heads=8, entity_queries=4, entity_dim=128):
         spaces = observation_space.spaces
         # features_dim is the model width; fire_distance (combat-v5) rides along as one more output.
         value_extra = int('fire_distance' in spaces)
@@ -42,15 +47,17 @@ class CombatTransformer(BaseFeaturesExtractor):
         self.combat_dim=observation_space.spaces['combat'].shape[-1] if 'combat' in observation_space.spaces else 0
         self.player = nn.Sequential(nn.Linear(len(PLAYER_FIELDS)+32+16+int(self.has_deadline)+self.combat_dim, 64), nn.GELU(),
                                     nn.Linear(64, 64), nn.LayerNorm(64))
-        self.entity = nn.Sequential(nn.Linear(len(ENTITY_FIELDS)+self.flag_dim+32+16+8+32, 128), nn.GELU(),
-                                    nn.Linear(128, 128), nn.LayerNorm(128))
-        self.queries = nn.Parameter(torch.randn(4, 128)*0.02)
-        self.player_query = nn.Linear(64, 128)
-        self.empty_entity = nn.Parameter(torch.zeros(1, 128))
-        self.entity_attention = nn.MultiheadAttention(128, 4, dropout=0, batch_first=True)
+        self.entity = nn.Sequential(nn.Linear(len(ENTITY_FIELDS)+self.flag_dim+32+16+8+32, entity_dim), nn.GELU(),
+                                    nn.Linear(entity_dim, entity_dim), nn.LayerNorm(entity_dim))
+        self.queries = nn.Parameter(torch.randn(entity_queries, entity_dim)*0.02)
+        self.player_query = nn.Linear(64, entity_dim)
+        self.empty_entity = nn.Parameter(torch.zeros(1, entity_dim))
+        self.entity_attention = nn.MultiheadAttention(entity_dim, 4, dropout=0, batch_first=True)
+        # The terrain canvas (rows, cols): 9x15 (5x8 after the stride), C41's 16x28 (8x14).
+        rows, cols = spaces['terrain'].shape[-2:]
         self.map_cnn = nn.Sequential(nn.Conv2d(7, 16, 3, padding=1), nn.GELU(),
                                      nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.GELU(),
-                                     nn.Flatten(), nn.Linear(32*5*8, 128), nn.GELU())
+                                     nn.Flatten(), nn.Linear(32*((rows+1)//2)*((cols+1)//2), 128), nn.GELU())
         if self.factored_previous:
             # One-hot of the factored heads (all zero before the first action).
             self.action = nn.Linear(spaces['previous_action'].shape[-1], 32)
@@ -59,7 +66,7 @@ class CombatTransformer(BaseFeaturesExtractor):
             self.bomb_action = nn.Embedding(2, 4)
             self.item_action = nn.Embedding(2, 4)
             self.action = nn.Linear(25, 32)
-        self.fusion = nn.Sequential(nn.Linear(64+512+128+32, features_dim),
+        self.fusion = nn.Sequential(nn.Linear(64+entity_queries*entity_dim+128+32, features_dim),
                                     nn.LayerNorm(features_dim), nn.GELU())
         # Construct independently, rather than cloning one identically initialized layer.
         # Dropout=0 keeps rollout and PPO likelihood evaluation consistent.

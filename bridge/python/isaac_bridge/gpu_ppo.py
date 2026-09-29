@@ -25,10 +25,22 @@ auxiliary geometry head (transformer_policy.GeometryPolicy) and observations car
 logs aux/* and behavior/mode_* (argmax of the shoot head against the aim label, of the move head
 against the moves that shorten d_fire). Frames with a 'hit' field record each step's hit reward;
 train/hit_advantage_gap is the mean advantage of those steps minus the rest, in advantage std.
+
+Online distillation (user plan 2026-09-28; policy distillation, Rusu et al. 2016; kickstarting, Schmitt
+et al. 2018): with a teacher (a frozen policy, load_frozen_policy) every training sample adds
+distill_coef * T^2 * sum over the heads of KL(teacher || student), both distributions from logits under the
+sample's stored action masks and softened by distill_temperature T. The PPO policy-gradient term is
+weighted by rl_coef (0: pure distillation); the value loss, the entropy term and the auxiliary aim loss are
+unchanged. distill_coef moves linearly to distill_coef_end over the learn() budget (progress_remaining).
+The samples are fresh rollouts of the student (on-policy distillation); for the first teacher_acts_updates
+updates the teacher collects them instead (its states, the student learns their targets). The log adds
+distill/kl, distill/coef and distill/agree_<head> (argmax agreement of the two policies).
 """
 from concurrent.futures import as_completed
 from types import SimpleNamespace
 import copy
+import json
+import math
 import sys
 import threading
 import time
@@ -38,16 +50,55 @@ from sb3_contrib import MaskablePPO
 from stable_baselines3.common.preprocessing import preprocess_obs
 from stable_baselines3.common.utils import explained_variance
 from .gpu_buffer import GpuHistoryRolloutBuffer
-from .gpu_env import GpuFrameVecEnv,decode_frame,metadata
+from .gpu_env import GpuFrameVecEnv,decode_frame,metadata,metadata_array
 
 HEAD_NAMES={(45,2,2):('joint','bomb','item'),(9,5,2,2):('move','shoot','bomb','item')}
 
 
-def action_masks(nvec,bombs_ok):
-    """Masks of MultiDiscrete heads ending in (bomb, item): the bomb only with bombs, never the item."""
+class LearningRateSchedule:
+    """SB3 learning-rate schedule of progress_remaining (1 -> 0 over the learn() budget): constant, or
+    linear / cosine from initial down to final (C36). A class, not a closure, so checkpoints pickle it."""
+    def __init__(self,kind,initial,final):
+        if kind not in ('constant','linear','cosine'):raise ValueError(f'unknown learning-rate schedule {kind}')
+        self.kind,self.initial,self.final=kind,float(initial),float(final)
+    def __call__(self,progress_remaining):
+        done=min(1.0,max(0.0,1.0-float(progress_remaining)))
+        if self.kind=='constant':return self.initial
+        if self.kind=='linear':return self.initial+(self.final-self.initial)*done
+        return self.final+(self.initial-self.final)*0.5*(1.0+math.cos(math.pi*done))
+    def __repr__(self):
+        return f'LearningRateSchedule({self.kind!r}, {self.initial:g}, {self.final:g})'
+
+
+def full_kl(prox_logits,new_logits,nvec):
+    """Per sample, the sum over the heads of KL(pi_proximal || pi_new) from their (masked) logits (C32)."""
+    kl=0
+    for p,q in zip(torch.split(prox_logits,nvec,-1),torch.split(new_logits,nvec,-1)):
+        p,q=torch.log_softmax(p,-1),torch.log_softmax(q,-1)
+        kl=kl+(p.exp()*(p-q)).sum(-1)
+    return kl
+
+
+def load_frozen_policy(path,device,observation_space=None,action_space=None):
+    """The policy of a saved model.zip, without its algorithm (no rollout buffer), frozen for inference (a
+    distillation teacher). The spaces, if given, must equal the saved ones."""
+    from stable_baselines3.common.save_util import load_from_zip_file
+    data,params,_=load_from_zip_file(path,device=device)
+    for name,space in (('observation_space',observation_space),('action_space',action_space)):
+        if space is not None and data[name]!=space:raise ValueError(f'teacher {name} differs from the environment')
+    policy=data['policy_class'](data['observation_space'],data['action_space'],lambda _:0.0,**data['policy_kwargs'])
+    policy.load_state_dict(params['policy']);policy.to(device);policy.set_training_mode(False)
+    for p in policy.parameters():p.requires_grad_(False)
+    return policy
+
+
+def action_masks(nvec,bombs_ok,move_block=None):
+    """Masks of MultiDiscrete heads ending in (bomb, item): the bomb only with bombs, never the item;
+    move_block (n, 9) bool (C30, --block-moves): the moves of the first head the terrain stops dead."""
     masks=torch.ones((len(bombs_ok),sum(nvec)),dtype=torch.bool,device=bombs_ok.device)
     bomb=sum(nvec[:-2]);item=bomb+nvec[-2]
     masks[:,bomb+1]=bombs_ok;masks[:,item+1]=False
+    if move_block is not None:masks[:,:nvec[0]]&=~move_block
     return masks
 
 
@@ -60,6 +111,10 @@ class FrameSampler:
         self.generation=-1;self.version=-1;self.steps=0
         self.upload_bytes=0;self.encoded_frames=0;self.prefix_rebuilds=0
         self.nvec=[int(n) for n in self.env.action_space.nvec]
+        # C30 (--block-moves): per environment, the moves its newest frame's terrain stops dead (the frames'
+        # move_block field, set by collect_rollouts); masked in every action and stored with the masks.
+        self.block_moves=bool(getattr(model,'block_moves',False))
+        self.move_block=torch.zeros((self.env.num_envs,self.nvec[0]),dtype=torch.bool,device=model.device)
 
     # The weights that collect: the actor copy while training runs asynchronously.
     @property
@@ -74,6 +129,9 @@ class FrameSampler:
 
     def begin(self):
         b=self.buffer
+        if self.features.shape[-1]!=self.encoder.features_dim:
+            # Another sampling policy (distillation: teacher <-> student) with another width: re-encode the prefix.
+            self.features=torch.zeros((*b.lengths.shape,self.encoder.features_dim),device=self.model.device);self.version=None
         version=(self.model.policy_version,tuple(p._version for p in self.policy.parameters()))
         # Join all previously queued writes before compacting the shared prefix.
         stream=torch.cuda.current_stream(self.model.device)
@@ -120,7 +178,8 @@ class FrameSampler:
 
     def action(self,position,ids,deterministic=False):
         policy=self.policy
-        masks=action_masks(self.nvec,self.buffer.frames['player'][position,ids,9]>0)
+        masks=action_masks(self.nvec,self.buffer.frames['player'][position,ids,9]>0,
+                           self.move_block[ids] if self.block_moves else None)
         pi,vf=policy.mlp_extractor(self.latent(position,ids))
         distribution=policy._get_action_dist_from_latent(pi)
         distribution.apply_masking(masks)
@@ -137,6 +196,20 @@ class GpuMaskablePPO(MaskablePPO):
     async_training=False
     async_switch_interval=0.0005
     lag_weight_max=2.0
+    # C30: mask the moves the terrain stops dead (the frames' move_block field; FrameSampler.move_block).
+    block_moves=False
+    # C32 diagnostic (--kl-probe): per update, the samples with the largest pi_new / pi_proximal, appended to
+    # kl_probe_path as one JSON line (host syncs: only for probe runs); greedy_actors only labels them.
+    kl_probe=False
+    kl_probe_path=None
+    greedy_actors=0
+    # Online distillation (module docstring): the frozen teacher policy and the loss weights.
+    teacher=None
+    distill_coef=1.0
+    distill_coef_end=None
+    distill_temperature=1.0
+    rl_coef=1.0
+    teacher_acts_updates=0
 
     def __init__(self,*args,**kwargs):
         # TF32 cuDNN changes CNN rounding with batch shape (one frame vs H
@@ -154,15 +227,25 @@ class GpuMaskablePPO(MaskablePPO):
         # combat-v5: per-head entropy weights (None: ent_coef on the summed entropy) and the
         # auxiliary geometry loss weight (used when the policy has aux_outputs).
         self.head_ent_coefs=None;self.aux_coef=0.0
+        # weight of the aux head's d_fire regression next to its aim cross-entropy (C21: 0 lets the aim learn)
+        self.aux_distance_coef=1.0
+        # aux_balance: aligned and unaligned samples weigh half each in the aim cross-entropy (C22: with one
+        # small target ~8% of the frames are aligned and the head learns 'none' everywhere)
+        self.aux_balance=False
         super().__init__(*args,**kwargs)
 
     def _excluded_save_params(self):
         return super()._excluded_save_params()+['_gpu_sampler','_collecting','session','sampler_class',
-                                                'async_training','actor','train_buffer','_train_stream']
+                                                'async_training','actor','train_buffer','_train_stream','teacher']
 
     @property
     def sampling_policy(self):
+        if self.teacher is not None and self.policy_version<self.teacher_acts_updates:return self.teacher
         return self.actor if self.actor is not None else self.policy
+
+    def current_distill_coef(self):
+        end=self.distill_coef if self.distill_coef_end is None else self.distill_coef_end
+        return end+(self.distill_coef-end)*float(self._current_progress_remaining)
 
     def _setup_learn(self,*args,**kwargs):
         result=super()._setup_learn(*args,**kwargs)
@@ -253,12 +336,20 @@ class GpuMaskablePPO(MaskablePPO):
         T,N,L=buffer.buffer_size,buffer.n_envs,self.segment_length
         per_worker=T//L;step=self.micro_batch_size//L
         out=torch.empty_like(buffer.log_probs)
+        # C32: the proximal distributions themselves, for the exact KL to the updated policy (train/kl_full).
+        self._prox_logits=torch.zeros((T,N,int(sum(self.action_space.nvec))),device=self.device)
+        if self.kl_probe:
+            self._prox_heads=torch.zeros((T,N,len(self.action_space.nvec)),device=self.device)
+            self._prox_mode=torch.zeros((T,N,len(self.action_space.nvec)),dtype=torch.long,device=self.device)
         self.policy.set_training_mode(True)  # no dropout: the same function as the training passes
         with torch.no_grad():
             for s in range(0,N*per_worker,step):
                 chosen=torch.arange(s,min(s+step,N*per_worker),device=self.device)
                 workers=torch.div(chosen,per_worker,rounding_mode='floor');t0=(chosen%per_worker)*L
-                _,log_prob,_,t,w=self.evaluate_segments(workers,t0,buffer)
+                _,log_prob,_,t,w,extra=self.evaluate_segments(workers,t0,buffer,True)
+                self._prox_logits[t,w]=extra['logits']
+                if self.kl_probe:
+                    self._prox_heads[t,w]=extra['head_log_prob'];self._prox_mode[t,w]=extra['mode']
                 out[t,w]=log_prob
         return out
 
@@ -279,7 +370,30 @@ class GpuMaskablePPO(MaskablePPO):
         buffer.window(); only float summation order differs. details=True adds a dict: per-head
         entropies and argmaxes, and with an auxiliary head its outputs and the samples' labels.
         """
-        b=buffer if buffer is not None else self.rollout_buffer;enc=self.policy.features_extractor
+        b=buffer if buffer is not None else self.rollout_buffer
+        x=self._segment_inputs(workers,t0,b);obs,steps,owners=x.obs,x.steps,x.owners
+        latent=self._segment_latent(self.policy,x)
+        pi,vf=self.policy.mlp_extractor(latent)
+        dist=self.policy._get_action_dist_from_latent(pi)
+        dist.apply_masking(b.action_masks[steps,owners])
+        values,log_prob,entropy=self.policy.value_net(vf).flatten(),dist.log_prob(b.actions[steps,owners]),dist.entropy()
+        if not details:return values,log_prob,entropy,steps,owners
+        extra={'head_entropy':torch.stack([d.entropy() for d in dist.distributions],1),
+               'mode':torch.stack([d.probs.argmax(-1) for d in dist.distributions],1),
+               # Normalised log-probabilities of every action of every head (masked ones ~ -1e8): train/kl_full.
+               'logits':torch.cat([d.logits for d in dist.distributions],-1)}
+        if self.kl_probe:   # per-head log-probabilities of the taken actions (the KL outlier probe)
+            taken=b.actions[steps,owners].long().unbind(-1)
+            extra['head_log_prob']=torch.stack([d.log_prob(a) for d,a in zip(dist.distributions,taken)],1)
+        if hasattr(self.policy,'aux_outputs') and 'aim_label' in obs:
+            extra['aux']=self.policy.aux_outputs(latent)
+            # Each sample's own frame is the last H-1+l row of its segment's rows.
+            extra['labels']={k:obs[k][:,b.history-1:].flatten(0,1) for k in ('aim_label','fire_distance','approach')}
+        extra['inputs']=x
+        return values,log_prob,entropy,steps,owners,extra
+
+    def _segment_inputs(self,workers,t0,b):
+        """The raw frames of whole L-step segments of single workers and the causal window of every sample."""
         H,L,dev=b.history,self.segment_length,self.device
         rows=t0[:,None]+torch.arange(L+H-1,device=dev)             # frame rows the segment may need
         q=t0[:,None]+torch.arange(L,device=dev)+H-1                 # frame row of each sample's observation
@@ -288,29 +402,32 @@ class GpuMaskablePPO(MaskablePPO):
         obs={k:v[rows,workers[:,None]] for k,v in b.frames.items()}
         obs['history_mask']=(rows>=first[:,None]).to(obs['history_mask'].dtype)
         obs=preprocess_obs(obs,self.observation_space,normalize_images=self.policy.normalize_images)
-        frames=enc.encode_frames(obs)
         j=torch.arange(H,device=dev)
         valid=j<lengths[...,None]
         offset=torch.where(valid,torch.arange(L,device=dev)[:,None]+H-lengths[...,None]+j,0)
         seg=torch.arange(len(workers),device=dev)[:,None,None]
-        window=frames[seg,offset].masked_fill(~valid[...,None],0).flatten(0,1)
-        elapsed=obs['time'][seg,offset].masked_fill(~valid,0).flatten(0,1)
-        valid=valid.flatten(0,1)
+        return SimpleNamespace(obs=obs,valid=valid,offset=offset,seg=seg,steps=(q-(H-1)).flatten(),
+                               owners=workers[:,None].expand(-1,L).flatten())
+
+    @staticmethod
+    def _segment_latent(policy,x):
+        """A policy's features of every sample of _segment_inputs (each frame encoded once)."""
+        enc=policy.features_extractor
+        frames=enc.encode_frames(x.obs)
+        window=frames[x.seg,x.offset].masked_fill(~x.valid[...,None],0).flatten(0,1)
+        elapsed=x.obs['time'][x.seg,x.offset].masked_fill(~x.valid,0).flatten(0,1)
+        valid=x.valid.flatten(0,1)
         latent=enc.temporal_features(window,elapsed,valid)
-        latent=latent[torch.arange(len(latent),device=dev),valid.long().sum(-1)-1]
-        pi,vf=self.policy.mlp_extractor(latent)
-        dist=self.policy._get_action_dist_from_latent(pi)
-        steps=(q-(H-1)).flatten();owners=workers[:,None].expand(-1,L).flatten()
-        dist.apply_masking(b.action_masks[steps,owners])
-        values,log_prob,entropy=self.policy.value_net(vf).flatten(),dist.log_prob(b.actions[steps,owners]),dist.entropy()
-        if not details:return values,log_prob,entropy,steps,owners
-        extra={'head_entropy':torch.stack([d.entropy() for d in dist.distributions],1),
-               'mode':torch.stack([d.probs.argmax(-1) for d in dist.distributions],1)}
-        if hasattr(self.policy,'aux_outputs') and 'aim_label' in obs:
-            extra['aux']=self.policy.aux_outputs(latent)
-            # Each sample's own frame is the last H-1+l row of its segment's rows.
-            extra['labels']={k:obs[k][:,H-1:].flatten(0,1) for k in ('aim_label','fire_distance','approach')}
-        return values,log_prob,entropy,steps,owners,extra
+        return latent[torch.arange(len(latent),device=latent.device),valid.long().sum(-1)-1]
+
+    def teacher_logits(self,x,b):
+        """The teacher's normalised log-probabilities of every action of every head on the samples of
+        _segment_inputs, under the samples' stored masks (no gradient)."""
+        with torch.no_grad():
+            latent=self._segment_latent(self.teacher,x)
+            dist=self.teacher._get_action_dist_from_latent(self.teacher.mlp_extractor.forward_actor(latent))
+            dist.apply_masking(b.action_masks[x.steps,x.owners])
+            return torch.cat([d.logits for d in dist.distributions],-1)
 
     def _train_segments(self,buffer=None,proximal=None):
         """PPO over frame-deduplicated segment minibatches with gradient accumulation.
@@ -333,6 +450,7 @@ class GpuMaskablePPO(MaskablePPO):
         per_worker=T//L;segments=N*per_worker
         seg_batch=self.batch_size//L;seg_micro=self.micro_batch_size//L
         pg_losses,value_losses,entropy_losses,clip_fractions=[],[],[],[]
+        kl_fulls,outlier_shares=[],[]   # C32: exact KL(pi_proximal || pi_new) and the share of |log ratio| > 5
         continue_training=True;steps=0;loss=0.0
         nvec=tuple(int(n) for n in self.action_space.nvec)
         heads=HEAD_NAMES.get(nvec) or tuple(f'head{i}' for i in range(len(nvec)))
@@ -341,6 +459,11 @@ class GpuMaskablePPO(MaskablePPO):
         # sums over the samples of: head entropies (heads), aux CE, aux squared error, aux hits,
         # aligned samples, aligned aux hits, aligned mode aim hits, approach samples, approach hits
         diag=None
+        probe=[]   # --kl-probe: the samples with the largest pi_new / pi_proximal of each micro-batch
+        distill_coef=self.current_distill_coef() if self.teacher is not None else 0.0
+        tau=float(self.distill_temperature)
+        # sums over the first epoch's samples: KL(teacher || student), argmax agreement per head
+        distill_sums=torch.zeros(1+len(nvec),device=self.device)
         for epoch in range(self.n_epochs):
             approx_kl_divs=[]
             order=torch.randperm(segments,device=self.device)
@@ -350,7 +473,7 @@ class GpuMaskablePPO(MaskablePPO):
                 adv=b.advantages[t0[:,None]+torch.arange(L,device=self.device),workers[:,None]]
                 mean,std,n=adv.mean(),adv.std(),adv.numel()
                 policy.optimizer.zero_grad()
-                sums=torch.zeros(5,device=self.device)
+                sums=torch.zeros(5,device=self.device);robust=torch.zeros(2,device=self.device)
                 for m in range(0,len(chosen),seg_micro):
                     values,log_prob,entropy,t,w,extra=self.evaluate_segments(workers[m:m+seg_micro],t0[m:m+seg_micro],b,True)
                     a=(b.advantages[t,w]-mean)/(std+1e-8)
@@ -364,13 +487,27 @@ class GpuMaskablePPO(MaskablePPO):
                     vl=(b._returns[t,w]-values)**2
                     el=-entropy
                     ent=(-(extra['head_entropy']*head_coefs).sum() if head_coefs is not None else self.ent_coef*el.sum())
+                    distill=0.0
+                    if self.teacher is not None:
+                        target=self.teacher_logits(extra['inputs'],b)
+                        kl=full_kl(target/tau,extra['logits']/tau,nvec)
+                        distill=distill_coef*tau*tau*kl.sum()
+                        if epoch==0:
+                            with torch.no_grad():
+                                agree=[(p.argmax(-1)==q.argmax(-1)).float().sum() for p,q in
+                                       zip(torch.split(target,nvec,-1),torch.split(extra['logits'],nvec,-1))]
+                                distill_sums+=torch.stack([kl.sum(),*agree])
                     aux=0.0
                     if 'aux' in extra:
                         logits,predicted=extra['aux'];labels=extra['labels']
                         ce=torch.nn.functional.cross_entropy(logits,labels['aim_label'].long(),reduction='none')
                         se=(predicted-labels['fire_distance'])**2
-                        aux=self.aux_coef*(ce.sum()+se.sum())
-                    ((pg.sum()+ent+self.vf_coef*vl.sum()+aux)/n).backward()
+                        weighted=ce
+                        if self.aux_balance:
+                            aligned=(labels['aim_label']>0).float();share=aligned.mean().clamp(0.02,0.98)
+                            weighted=ce*(aligned/(2*share)+(1-aligned)/(2*(1-share)))
+                        aux=self.aux_coef*(weighted.sum()+self.aux_distance_coef*se.sum())
+                    ((self.rl_coef*pg.sum()+ent+self.vf_coef*vl.sum()+aux+distill)/n).backward()
                     if epoch==0:
                         with torch.no_grad():
                             row=[extra['head_entropy'].sum(0)]
@@ -389,9 +526,15 @@ class GpuMaskablePPO(MaskablePPO):
                         lr_=log_prob-anchor
                         sums+=torch.stack([pg.sum(),vl.sum(),el.sum(),((torch.exp(lr_)-1)-lr_).sum(),
                                            ((ratio-1).abs()>clip_range).float().sum()])
+                        if self.kl_probe:probe.extend(self._probe_samples(b,lr_,log_prob,anchor,old,t,w,extra,epoch,s))
+                        if proximal is not None:
+                            robust+=torch.stack([full_kl(self._prox_logits[t,w],extra['logits'],nvec).sum(),
+                                                 (lr_.abs()>5).float().sum()])
                 pg_loss,value_loss,entropy_loss,approx_kl,clip_fraction=(sums/n).tolist()
                 pg_losses.append(pg_loss);value_losses.append(value_loss);entropy_losses.append(entropy_loss)
                 approx_kl_divs.append(approx_kl);clip_fractions.append(clip_fraction)
+                if proximal is not None:
+                    kl_full,outlier_share=(robust/n).tolist();kl_fulls.append(kl_full);outlier_shares.append(outlier_share)
                 loss=pg_loss+self.ent_coef*entropy_loss+self.vf_coef*value_loss
                 # Same semantics as SB3: KL is measured on this minibatch before its step.
                 if self.target_kl is not None and approx_kl>1.5*self.target_kl:
@@ -403,11 +546,25 @@ class GpuMaskablePPO(MaskablePPO):
             if not continue_training:break
         self._n_updates+=self.n_epochs
         self._log_diagnostics(b,diag,heads)
+        if self.teacher is not None:
+            count=b.buffer_size*b.n_envs;values=(distill_sums/count).tolist()
+            self.logger.record('distill/kl',values[0]);self.logger.record('distill/coef',distill_coef)
+            for name,value in zip(heads,values[1:]):self.logger.record(f'distill/agree_{name}',value)
+            self.logger.record('distill/teacher_collects',int(self.policy_version<self.teacher_acts_updates))
+        if self.kl_probe and self.kl_probe_path:
+            probe.sort(key=lambda r:-r['log_ratio'])
+            with open(self.kl_probe_path,'a',encoding='utf8') as fh:
+                fh.write(json.dumps({'update':self._n_updates//max(1,self.n_epochs),'samples':probe[:20]})+'\n')
         explained_var=explained_variance(b.values.flatten(),b.returns.flatten())
         self.logger.record('train/entropy_loss',np.mean(entropy_losses))
         self.logger.record('train/policy_gradient_loss',np.mean(pg_losses))
         self.logger.record('train/value_loss',np.mean(value_losses))
         self.logger.record('train/approx_kl',np.mean(approx_kl_divs))
+        if kl_fulls:
+            # approx_kl (the sampled action's (r - 1) - log r) is dominated by a few near-deterministic states whose
+            # choice flips between updates (C32); these two measure the whole distributions.
+            self.logger.record('train/kl_full',np.mean(kl_fulls))
+            self.logger.record('train/ratio_outlier_share',np.mean(outlier_shares))
         self.logger.record('train/clip_fraction',np.mean(clip_fractions))
         self.logger.record('train/loss',loss)
         self.logger.record('train/explained_variance',explained_var)
@@ -419,6 +576,28 @@ class GpuMaskablePPO(MaskablePPO):
             lag=proximal-b.log_probs;weight=torch.exp(lag)  # pi_proximal/pi_behaviour
             self.logger.record('train/lag_kl',float(((weight-1)-lag).mean()))
             self.logger.record('train/lag_weight_truncated',float((weight>self.lag_weight_max).float().mean()))
+
+    def _probe_samples(self,b,lr,log_prob,anchor,old,t,w,extra,epoch,batch,k=3):
+        """--kl-probe: the k samples of a micro-batch with the largest log(pi_new / pi_proximal), with per-head
+        log-probabilities, whether each taken action is allowed by its stored mask, and the frame's context."""
+        nvec=[int(n) for n in self.action_space.nvec];offsets=np.cumsum([0]+nvec[:-1]).tolist()
+        out=[]
+        for i in torch.topk(lr,min(k,len(lr))).indices.tolist():
+            ti,wi=int(t[i]),int(w[i]);action=b.actions[ti,wi].long().tolist();mask=b.action_masks[ti,wi]
+            out.append(dict(log_ratio=float(lr[i]),epoch=epoch,batch=batch,t=ti,w=wi,action=action,
+                            allowed=[bool(mask[o+a]) for o,a in zip(offsets,action)],
+                            new=[round(float(x),4) for x in extra['head_log_prob'][i]],
+                            prox=[round(float(x),4) for x in self._prox_heads[ti,wi]],
+                            joint_new=float(log_prob[i]),joint_prox=float(anchor[i]),behaviour=float(old[i]),
+                            advantage=float(b.advantages[ti,wi]),start=bool(b.episode_starts[ti,wi]),
+                            entities=(float(b.frames['entity_mask'][ti+b.history-1,wi].sum())
+                                      if 'entity_mask' in b.frames else None),
+                            greedy_actor=wi<int(self.greedy_actors),
+                            prox_mode=self._prox_mode[ti,wi].tolist(),new_mode=extra['mode'][i].tolist(),
+                            **{k:(b.frames[k][ti+b.history-1,wi].tolist() if b.frames[k][ti+b.history-1,wi].dim() else
+                                  float(b.frames[k][ti+b.history-1,wi]))
+                               for k in ('aim_label','fire_distance','approach') if k in b.frames}))
+        return out
 
     def _log_diagnostics(self,b,diag,heads):
         """Per-head entropy, auxiliary head, mode aiming/approach (first epoch) and hit advantage gap."""
@@ -441,6 +620,9 @@ class GpuMaskablePPO(MaskablePPO):
             adv=b.advantages;std=adv.std()+1e-8
             self.logger.record('train/hit_advantage_gap',float((adv[hit].mean()-adv[~hit].mean())/std))
             self.logger.record('train/hit_step_share',float(hit.float().mean()))
+        if self.block_moves:   # C30: share of steps whose masks drop at least one move (the terrain blocks it)
+            first=int(self.action_space.nvec[0])
+            self.logger.record('behavior/move_blocked_share',float((~b.action_masks[...,:first]).any(-1).float().mean()))
 
     def collect_rollouts(self,env,callback,rollout_buffer,n_rollout_steps,use_masking=True):
         if not use_masking:raise ValueError('Isaac requires action masking')
@@ -480,8 +662,13 @@ class GpuMaskablePPO(MaskablePPO):
                             raw=decode_frame(slot.device,env.observation_space,env.frame_dtype)
                             b.lengths[new,ids]=(b.lengths[old,ids]+1).clamp_max(b.history)
                             s.encode(new,ids,raw)
+                            if s.block_moves:s.move_block[ids]=metadata_array(slot.device,'move_block',env.frame_dtype)>0.5
                             reward=metadata(slot.device,'reward',env.frame_dtype).clone()
                             hits=metadata(slot.device,'hit',env.frame_dtype).clone() if 'hit' in env.frame_dtype.names else None
+                            # combat-hitrate-fire: the part of this step's reward that belongs to the steps
+                            # its tears were fired in; moved there before GAE (GpuHistoryRolloutBuffer).
+                            credit=(metadata_array(slot.device,'credit',env.frame_dtype)
+                                    if 'credit' in env.frame_dtype.names else None)
                             if len(terminal):
                                 local=torch.as_tensor(terminal,device=self.device);done_ids=ids[local]
                                 terminal_obs=b.window(new,done_ids)
@@ -492,7 +679,11 @@ class GpuMaskablePPO(MaskablePPO):
                                     reward[ti]+=self.gamma*s.values(new,ids[ti])
                                 reset=decode_frame(slot.reset_device[:len(terminal)],env.observation_space,env.frame_dtype)
                                 s.encode(new,done_ids,reset);b.lengths[new,done_ids]=1
+                                if s.block_moves:
+                                    s.move_block[done_ids]=metadata_array(slot.reset_device[:len(terminal)],'move_block',
+                                                                          env.frame_dtype)>0.5
                             b.add_chunk(t,ids,actions,values,log_prob,masks,reward,starts,hits)
+                            if credit is not None:b.add_credit(t,ids,credit)
                             s.starts[ids]=metadata(slot.device,'done',env.frame_dtype).bool()
                             slot.consumed.record(c.compute_stream);c.ready.record(c.compute_stream)
                     for c in env.chunks:torch.cuda.current_stream(self.device).wait_event(c.ready)
@@ -507,6 +698,10 @@ class GpuMaskablePPO(MaskablePPO):
                     with torch.cuda.stream(c.compute_stream):
                         last_values[ids]=s.values(b.frame_pos,ids);c.ready.record(c.compute_stream)
                     torch.cuda.current_stream(self.device).wait_event(c.ready)
+                if 'credit' in env.frame_dtype.names:
+                    moved,kept=b.apply_credits()   # scaled reward per rollout
+                    self.logger.record('train/credit_moved',float(moved))
+                    self.logger.record('train/credit_kept',float(kept))
                 b.compute_returns_and_advantage(last_values,dones)
                 if versions!=tuple(p._version for p in sampling.parameters()):
                     raise RuntimeError('Policy weights changed during frozen collection')

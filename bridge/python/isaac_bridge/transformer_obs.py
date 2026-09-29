@@ -11,6 +11,7 @@ import numpy as np
 from gymnasium import spaces
 
 from .abplus_geometry import CELL, D_FIRE_MAX, MOVES, fire_geometry
+from .hit_rate import HitRate
 from .monstro_gym import MonstroGymEnv
 
 SCHEMA = 'monstro-transformer-v3'
@@ -23,12 +24,25 @@ ANIMATION_BYTES = 32
 COMBAT_FIELDS = ('blocking_count', 'engaged', 'blocking_fraction', 'since_hit')
 # combat-v4 has no stall or time penalty, so it keeps only the room aggregates.
 COMBAT_FIELDS_V4 = ('blocking_count', 'blocking_fraction')
+# The hit-rate test (combat-hitrate) prices time by the running tear hit rate (hit_rate.HitRate).
+COMBAT_FIELDS_HITRATE = ('blocking_count', 'blocking_fraction', 'hit_rate')
+# combat-hitrate-miss adds the current run of misses (bridge abp-0.2.5 miss_streak): the next miss costs
+# its length + 1 times the miss price.
+COMBAT_FIELDS_MISS = COMBAT_FIELDS_HITRATE + ('miss_streak',)
 # combat-v5 (VisibleHistory(geometry=True, factored_actions=True)): per-NPC flags from bridge
 # abp-0.2.3, the critic's d_fire input (fire_distance = d_fire / 40, at most 15) and the heads the
 # 45-way joint action was split into.
 ENTITY_FLAGS = ('lineage', 'blocking')
 FIRE_DISTANCE_MAX = D_FIRE_MAX / CELL
 FACTORED_NVEC = (9, 5, 2, 2)
+# C41 (combat-hp2): the terrain canvas of the largest Basement room grid (2x2: 28 x 16 cells; a smaller room fills its
+# top-left corner) and the interior of a 1x1 room in pixels (top_left (60, 140), bottom_right (580, 420)): positions,
+# velocities and sizes in those units keep a 1x1 room's values and let a larger room reach about 2.
+BIG_TERRAIN = (16, 28)
+ROOM_1X1 = (520.0, 280.0)
+# C41 (combat-hp2-camera, the continuation of C39): a 1x1 room's grid is the terrain view; in a larger room the view is
+# the window of that size around the player, stopping at the room's edges, as the game's camera does.
+CAMERA_VIEW = (9, 15)
 PLAYER_FIELDS = ('x', 'y', 'vx', 'vy', 'motion_valid', 'size', 'hearts', 'max_hearts',
                  'soul', 'bombs', 'keys', 'coins', 'damage', 'speed', 'shot_speed',
                  'fire_delay_max', 'range', 'can_fly', 'active_charge', 'active_ready',
@@ -65,22 +79,41 @@ def animation_bytes(name):
     return result
 
 
-def terrain_channels(obs):
+def terrain_channels(obs, shape=(9, 15)):
+    """The room's grid as 7 channels on a (rows, cols) canvas: (9, 15), a 1x1 room's grid, requires one; a larger canvas
+    (C41: BIG_TERRAIN) takes any room that fits, from the top-left corner, the rest zero (outside)."""
     terrain = obs['terrain']
-    if (terrain['height'], terrain['width']) != (9, 15):
+    height, width = terrain['height'], terrain['width']
+    if tuple(shape) == (9, 15) and (height, width) != (9, 15):
         raise ValueError('Transformer curriculum requires a 15x9 room')
-    result = np.zeros((7, 9, 15), np.float32)
+    if height > shape[0] or width > shape[1]:
+        raise ValueError(f'room grid {width}x{height} exceeds the terrain canvas {shape[1]}x{shape[0]}')
+    result = np.zeros((7, *shape), np.float32)
     positions = []
     for index, x, y, collision, inside, walkable, pit, hazard, solid, destructible in terrain['cells']:
-        row, col = divmod(index, 15)
+        row, col = divmod(index, width)
         result[:, row, col] = (inside, walkable, solid, pit, destructible, hazard, 0)
         positions.append((index, x, y))
     for door in obs['doors']:
         if not door['open']:
             index, _, _ = min(positions, key=lambda c: (c[1]-door['pos'][0])**2 + (c[2]-door['pos'][1])**2)
-            row, col = divmod(index, 15)
+            row, col = divmod(index, width)
             result[6, row, col] = 1
     return result
+
+
+def camera_origin(obs, height, width, view=CAMERA_VIEW):
+    """(row, col) of the top-left cell of the view-sized window of a height x width room grid that follows the player:
+    centred on the player's cell, stopping at the room's edges; (0, 0) in a room of the view's size."""
+    rows, cols = view
+    x0 = y0 = None
+    for index, x, y, *_ in obs['terrain']['cells']:
+        if index == 0:
+            x0, y0 = x, y
+            break
+    px, py = obs['players'][0]['pos']
+    row, col = int(round((py - y0) / CELL)), int(round((px - x0) / CELL))
+    return min(max(row - rows // 2, 0), height - rows), min(max(col - cols // 2, 0), width - cols)
 
 
 def entity_key(entity):
@@ -102,15 +135,29 @@ def factored_masks(joint_mask):
 
 class VisibleHistory:
     def __init__(self, history=HISTORY, capacity=ENTITY_CAPACITY,deadline=False,combat_state=False,
-                 geometry=False,factored_actions=False):
+                 geometry=False,factored_actions=False,deadline_s=120.0,terrain_shape=(9, 15),room_scale='room'):
         self.deadline=deadline
+        # C41: the terrain canvas and the units of positions, velocities and sizes. 'room' divides by this room's width
+        # and height (every earlier run); 'fixed' by a 1x1 room's (ROOM_1X1), the terrain on the canvas (combat-hp2);
+        # 'camera' by a 1x1 room's, the terrain the CAMERA_VIEW window around the player (combat-hp2-camera: a 1x1 room
+        # encodes exactly as with 'room', so C39's network continues).
+        self.terrain_shape=tuple(int(v) for v in terrain_shape)
+        if room_scale not in ('room','fixed','camera'):
+            raise ValueError(f'room_scale {room_scale!r}')
+        if room_scale=='camera' and self.terrain_shape!=CAMERA_VIEW:
+            raise ValueError(f'the camera view is {CAMERA_VIEW}, not {self.terrain_shape}')
+        self.room_scale=room_scale
+        # remaining_time = 1 - elapsed / deadline_s (combat-v1..v3: the 120 s task; combat-hp: each group's deadline,
+        # set per episode by the worker, C39).
+        self.deadline_s=float(deadline_s)
         # combat_state: False, True (COMBAT_FIELDS) or the tuple of COMBAT_FIELDS to observe.
         self.combat_fields=(COMBAT_FIELDS if combat_state is True else tuple(combat_state)) if combat_state else ()
         self.combat_state=bool(self.combat_fields)
         self.combat=None
         # combat-v5: per-NPC lineage/blocking flags (bridge abp-0.2.3), d_fire / 40 for the critic,
-        # and the auxiliary head's labels (abplus_geometry.fire_geometry); the previous action as
-        # the one-hot of the factored heads (move 9, shoot 5, bomb 2, item 2).
+        # and the auxiliary head's labels (abplus_geometry.fire_geometry; geometry='walk' measures
+        # d_fire as the walking distance); the previous action as the one-hot of the factored heads
+        # (move 9, shoot 5, bomb 2, item 2).
         self.geometry, self.factored_actions = geometry, factored_actions
         self.d_fire = None
         self.history, self.capacity = history, capacity
@@ -128,7 +175,7 @@ class VisibleHistory:
             'entity_kind': spaces.Box(0, 65535, (h, n, 3), np.int32),
             'entity_anim': spaces.Box(0, 255, (h, n, ANIMATION_BYTES), np.int32),
             'entity_mask': spaces.Box(0, 1, (h, n), np.float32),
-            'terrain': spaces.Box(0, 1, (h, 7, 9, 15), np.float32),
+            'terrain': spaces.Box(0, 1, (h, 7, *self.terrain_shape), np.float32),
             'previous_action': spaces.Box(0, 44, (h, 4), np.float32),
             'time': spaces.Box(0, np.inf, (h,), np.float32),
             'history_mask': spaces.Box(0, 1, (h,), np.float32),
@@ -183,7 +230,7 @@ class VisibleHistory:
         p = obs['players'][0]
         left, top = obs['room']['top_left']
         right, bottom = obs['room']['bottom_right']
-        width, height = right-left, bottom-top
+        width, height = (right-left, bottom-top) if self.room_scale == 'room' else ROOM_1X1
         dt = obs['logic_frames']-self.previous['logic_frames'] if self.previous is not None else 0
         if self.previous is not None and dt <= 0:
             raise ValueError('Observation time must advance; clear history on reset')
@@ -240,41 +287,57 @@ class VisibleHistory:
             if self.geometry:
                 frame['entity_flags'][i] = flags
         if self.geometry:
-            g = fire_geometry(obs, self.d_fire)
+            # geometry='walk': the walking distance to a firing position (combat-hitrate-walk).
+            g = fire_geometry(obs, self.d_fire, walk=self.geometry == 'walk')
             self.d_fire = g['d_fire']
             frame['fire_distance'] = np.float32(min(g['d_fire'], D_FIRE_MAX) / CELL)
             frame['aim_label'] = np.float32(g['aim'])
             frame['approach'][:] = g['approach']
-        # Binary observations (abplus_obs) mark unchanged terrain with a version: reuse its channels.
+        # Binary observations (abplus_obs) mark unchanged terrain with a version: reuse its channels. The camera view
+        # keeps the whole room's channels and takes the window around the player every frame.
+        camera = self.room_scale == 'camera'
+        shape = (obs['terrain']['height'], obs['terrain']['width']) if camera else self.terrain_shape
         version = obs['terrain'].get('version')
         if version is None:
-            frame['terrain'] = terrain_channels(obs)
+            channels = terrain_channels(obs, shape)
         else:
             key = (version, tuple((d['pos'][0], d['pos'][1], bool(d['open'])) for d in obs['doors']))
             if key != getattr(self, '_terrain_key', None):
-                self._terrain_key, self._terrain_value = key, terrain_channels(obs)
-            frame['terrain'] = self._terrain_value
+                self._terrain_key, self._terrain_value = key, terrain_channels(obs, shape)
+            channels = self._terrain_value
+        if camera:
+            row, col = camera_origin(obs, *shape)
+            channels = channels[:, row:row + CAMERA_VIEW[0], col:col + CAMERA_VIEW[1]]
+        frame['terrain'] = channels
         frame['previous_action'] = self.previous_action.copy()
         frame['time'] = np.float32((obs['logic_frames']-self.origin)/30)
-        if self.deadline:frame['remaining_time']=np.float32(max(0,1-frame['time']/120))
-        if self.combat_state:frame['combat'][:]=self.combat_features(obs['combat'],float(frame['time']))
+        if self.deadline:frame['remaining_time']=np.float32(max(0,1-frame['time']/self.deadline_s))
+        if self.combat_state:frame['combat'][:]=self.combat_features(obs['combat'],float(frame['time']),obs)
         frame['history_mask'] = np.float32(1)
         self.frames.append(frame)
         self.previous = obs
         self.last_rows = len(rows)
         return frame
 
-    def combat_features(self, combat, t):
-        """COMBAT_FIELDS; 'engaged' and the last hit follow combat-v3's definition (blocking HP fell)."""
+    def combat_features(self, combat, t, obs=None):
+        """COMBAT_FIELDS; 'engaged' and the last hit follow combat-v3's definition (blocking HP fell);
+        'hit_rate' is the running tear hit rate the hit-rate test's time price uses (obs needed)."""
         hp, count = float(combat['blocking_hp']), float(combat['blocking_count'])
+        rated = 'hit_rate' in self.combat_fields
         if self.combat is None:
-            self.combat = dict(start=hp, last=hp, engaged=False, hit=0.0)
+            self.combat = dict(start=hp, last=hp, engaged=False, hit=0.0, rate=0.0)
+            if rated:
+                self.hit_rate = HitRate()
+                self.hit_rate.reset(obs)
+        elif rated:
+            self.combat['rate'] = self.hit_rate.update(obs)
         c = self.combat
         if hp < c['last'] - 1e-9:
             c['engaged'], c['hit'] = True, t
         c['last'] = hp
         values = dict(blocking_count=min(count, 30.0) / 10, engaged=float(c['engaged']),
-                      blocking_fraction=min(hp / max(1.0, c['start']), 3.0), since_hit=min(t - c['hit'], 120.0) / 60)
+                      blocking_fraction=min(hp / max(1.0, c['start']), 3.0), since_hit=min(t - c['hit'], 120.0) / 60,
+                      hit_rate=c['rate'], miss_streak=min(float(combat.get('miss_streak', 0)), 100.0) / 20)
         return tuple(values[k] for k in self.combat_fields)
 
     def append(self, obs):

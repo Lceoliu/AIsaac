@@ -85,6 +85,133 @@ class FireGeometryTest(unittest.TestCase):
         self.assertEqual(fire_geometry(room(440, 280, (3, 4, 2, 1)))['aim'], 4)
 
 
+def walk_room(px, py, target, rocks=()):
+    """15x9 room, cell (c, r) centred at (40 + 40c, 120 + 40r), walls on the border; rocks block both
+    walking (terrain) and tears (grid)."""
+    blocked = set(rocks)
+    cells = [[r * 15 + c, 40.0 + 40 * c, 120.0 + 40 * r, 0, int(0 < r < 8 and 0 < c < 14),
+              int(0 < r < 8 and 0 < c < 14 and (c, r) not in blocked), 0, 0, 0, 0] for r in range(9) for c in range(15)]
+    o = obs(px, py, (target[0], target[1], 13, True, True))
+    o['terrain'] = {'cells': cells, 'width': 15}
+    o['room'] = {'gw': 15}
+    o['grid'] = [[r * 15 + c, 2, 0, 1, 3, 40.0 + 40 * c, 120.0 + 40 * r] for c, r in rocks]
+    o['logic_frames'] = 10
+    return o
+
+
+class WalkDistanceTest(unittest.TestCase):
+    TAU = 13 + TEAR_RADIUS
+
+    def test_open_room_walks_the_straight_distance(self):
+        # Player in cell (10, 6), target in (5, 4): the target's horizontal band is 80 - tau above the
+        # player, and nothing is in the way.
+        o = walk_room(440, 360, (240, 280))
+        straight, walking = fire_geometry(o)['d_fire'], fire_geometry(o, walk=True)['d_fire']
+        self.assertAlmostEqual(straight, 80 - self.TAU)
+        self.assertAlmostEqual(walking, straight)
+        self.assertEqual(fire_geometry(walk_room(440, 280, (240, 280)), walk=True)['d_fire'], 0.0)   # in the band
+
+    def test_a_wall_makes_the_walk_longer_and_turns_the_approach(self):
+        # A rock wall along row 5 (columns 6-13) between the player (10, 6) and the target's row: the
+        # straight distance still points up at the row behind the wall; walking, the nearest firing
+        # position is the target's column band, 4 cells left along row 6.
+        wall = [(c, 5) for c in range(6, 14)]
+        o = walk_room(440, 360, (240, 280), rocks=wall)
+        straight, walked = fire_geometry(o), fire_geometry(o, walk=True)
+        self.assertAlmostEqual(straight['d_fire'], 80 - self.TAU)
+        self.assertAlmostEqual(walked['d_fire'], 200 - self.TAU)
+        self.assertIn(1, [m for m, v in enumerate(straight['approach']) if v])          # straight: up, into the wall
+        self.assertEqual([m for m, v in enumerate(walked['approach']) if v], [6, 7, 8])  # walking: the leftward moves
+
+    def test_no_corner_cutting_and_unreachable_targets(self):
+        # Rocks on both sides of a diagonal gap: the path may not squeeze through it.
+        o = walk_room(440, 360, (240, 280), rocks=[(9, 6), (10, 5)] + [(c, 7) for c in range(1, 14)])
+        grid = __import__('isaac_bridge.abplus_geometry', fromlist=['walk_grid']).walk_grid(o)
+        neighbours = dict(grid[2])[(10, 6)]
+        self.assertNotIn((9, 5), [n for n, _ in neighbours])
+        # A target walled in on every side: no firing position can be reached.
+        ring = [(c, r) for c in range(4, 7) for r in range(3, 6) if (c, r) != (5, 4)]
+        self.assertEqual(fire_geometry(walk_room(440, 360, (240, 280), rocks=ring), walk=True)['d_fire'], D_FIRE_MAX)
+
+    def test_repeated_calls_do_not_share_labels(self):
+        o = walk_room(440, 360, (240, 280), rocks=[(c, 5) for c in range(6, 14)])
+        first = fire_geometry(o, walk=True)
+        first['approach'][7] = 99
+        self.assertEqual(fire_geometry(o, walk=True)['approach'][7], 1)
+
+
+class BlockedMovesTest(unittest.TestCase):
+    """C30: the moves the terrain stops dead (MOVES order: stay, up, up-right, right, down-right, down, ...)."""
+
+    @staticmethod
+    def blocked(o):
+        from isaac_bridge.abplus_geometry import MOVES, blocked_moves
+        names = ['stay', 'up', 'up-right', 'right', 'down-right', 'down', 'down-left', 'left', 'up-left']
+        assert len(MOVES) == len(names)
+        return {n for n, b in zip(names, blocked_moves(o)) if b}
+
+    def test_open_floor_blocks_nothing(self):
+        self.assertEqual(self.blocked(walk_room(320, 280, (160, 280))), set())
+
+    def test_against_a_wall_and_in_a_corner(self):
+        # Cell 13 is the last interior column (x 540-580): 10.5 px from its right edge the circle touches the
+        # wall, so right is blocked, but the diagonals along it slide.
+        self.assertEqual(self.blocked(walk_room(569.5, 280, (160, 280))), {'right'})
+        # The top right inner corner: up, right and up-right, while down-right and up-left still slide.
+        self.assertEqual(self.blocked(walk_room(569.5, 149.5, (160, 280))), {'up', 'up-right', 'right'})
+
+    def test_a_rock_that_covers_only_part_of_the_edge_lets_it_slide(self):
+        rock = [(8, 4)]      # x 340-380, y 260-300
+        self.assertEqual(self.blocked(walk_room(329.5, 280, (160, 400), rocks=rock)), {'right'})
+        self.assertEqual(self.blocked(walk_room(329.5, 305, (160, 400), rocks=rock)), set())
+
+
+class TrapDepthTest(unittest.TestCase):
+    """Tier 6 (C28): how far one must go back after heading straight for the target runs into a dead end."""
+
+    @staticmethod
+    def depth(o, start):
+        from isaac_bridge import abplus_geometry as G
+        grid = G.walk_grid(o)
+        found = G.targets(o)
+        stops, origin = G.tear_stops(o)
+        limits = [G.target_limits(t, R, stops, origin) for t in found]
+        return G.trap_depth(grid, G.walk_field(grid, found, limits), start, found[0])
+
+    def test_open_room_has_no_dead_end(self):
+        # Target in cell (3, 4), player in (10, 4): walking straight at it goes down its row into the band.
+        self.assertEqual(self.depth(walk_room(440, 280, (160, 280)), (10, 4)), 0.0)
+
+    def test_a_cup_facing_away_from_the_target(self):
+        # Rocks on column 9 (rows 2-6) and at (10, 2), (10, 6) make a cup around the player's cell (10, 4)
+        # that opens away from the target (3, 4): no neighbour is nearer the target and the cup is no
+        # firing position, so the player must first get farther from the target, round the wall's end.
+        cup = [(9, r) for r in range(2, 7)] + [(10, 2), (10, 6)]
+        o = walk_room(440, 280, (160, 280), rocks=cup)
+        # The way out passes (11, 1) (or (11, 7)): no corner cutting past (10, 2), 8.54 cells from the target.
+        self.assertAlmostEqual(self.depth(o, (10, 4)), math.hypot(8, 3) * 40.0 - 7 * 40.0, places=6)
+
+    def test_a_pocket_on_the_way_is_a_dead_end_too(self):
+        # A bar on column 7 (rows 1-6): from (11, 2) walking straight for a target at (4, 2) stops against
+        # the bar in (8, 2), and the way round its bottom end passes (8, 7), farther from the target.
+        bar = [(7, r) for r in range(1, 7)]
+        o = walk_room(480, 200, (200, 200), rocks=bar)
+        self.assertAlmostEqual(self.depth(o, (11, 2)), math.hypot(4, 5) * 40.0 - 4 * 40.0, places=6)
+        # Along row 7 there is no dead end: straight at the target passes the gap.
+        self.assertEqual(self.depth(walk_room(520, 400, (200, 400), rocks=bar), (12, 7)), 0.0)
+
+    def test_escape_is_infinite_when_sealed(self):
+        from isaac_bridge import abplus_geometry as G
+        ring = [(c, r) for c in range(4, 7) for r in range(3, 6) if (c, r) != (5, 4)]
+        o = walk_room(440, 360, (240, 280), rocks=ring)
+        grid = G.walk_grid(o)
+        found = G.targets(o)
+        stops, origin = G.tear_stops(o)
+        limits = [G.target_limits(t, R, stops, origin) for t in found]
+        field = G.walk_field(grid, found, limits)
+        self.assertEqual(G.escape_rise(grid, field, (10, 6), lambda c: 0.0), math.inf)
+
+
 def raw_obs(px, py, enemies, frame=10):
     """A minimal bridge observation (15x9 room, cell 0 at (40, 120)); enemies: (x, y, lineage, blocking)."""
     cells = [[r * 15 + c, 40.0 + 40 * c, 120.0 + 40 * r, 0, int(0 < r < 8 and 0 < c < 14), int(0 < r < 8 and 0 < c < 14),

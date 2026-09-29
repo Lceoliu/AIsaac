@@ -90,7 +90,7 @@ const EPISODES=/*EPISODES*/, NAMES=/*NAMES*/, VARIANTS=/*VARIANTS*/, TITLE=/*TIT
 const TASK={normal:'普通房',boss:'Boss 房',arena:'竞技场（Monstro）'}, OUT={time_limit:'超时',win:'通关',death:'死亡'};
 const MOVE=[[0,0],[0,-1],[1,-1],[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1]], SHOT=[[0,0],[0,-1],[1,0],[0,1],[-1,0]];
 const ARROW=['—','↑','↗','→','↘','↓','↙','←','↖'], SHOT_ARROW=['—','↑','→','↓','←'];
-const SPEEDS=[0.5,1,2,4,8], STEP_S=2/30;
+const SPEEDS=[0.5,1,2,4,8]; let STEP_S=2/30;   // seconds per step: the episode's step_s (C39: 4 frames)
 const C={floor:'#6a5543',floorLine:'#5e4b3b',wall:'#2a2420',rock:'#9c968d',rockEdge:'#6d6962',block:'#56606a',poop:'#87562b',
   pit:'#0e0c0b',spike:'#b9b3aa',door:'#b88d4a',enemy:'#e0564b',enemyInv:'#8c929b',boss:'#b784e3',npc:'#d6993a',
   tear:'#8fd6ff',proj:'#ff5c50',bomb:'#2b2b2b',pickup:'#f2d14b',creep:'rgba(120,200,90,.35)',player:'#f5dcc0',
@@ -185,11 +185,13 @@ function drawRoom(){
     if($('optNames').checked){const nm=(VARIANTS[e[4]+'.'+e[5]]||NAMES[e[4]]||('type '+e[4]))+(enemy&&!vul?'（无敌）':'')+(boss&&e[8]?' · '+e[8]:'');label(nm,x,y-e[3]*S-(boss?20:6),'#fff')}}
   for(const e of ents){if(e[0]!==2&&e[0]!==3)continue;const x=sx(e[1]),y=sy(e[2]+(e[4]||0));circle(x,y,e[3]*S*.9,e[0]===2?C.tear:C.proj,'rgba(0,0,0,.4)',1)}
   // player: trail, body, input
-  if($('optTrail').checked){const from=Math.max(0,step-120);for(let k=from+1;k<=step;k++){const a=D.frames[k-1],b=D.frames[k];
+  if($('optTrail').checked){const from=Math.max(0,step-Math.round(8/STEP_S));for(let k=from+1;k<=step;k++){const a=D.frames[k-1],b=D.frames[k];
     rctx.strokeStyle=`rgba(${C.trail},${(0.08+0.6*(k-from)/(step-from+1)).toFixed(3)})`;rctx.lineWidth=3;rctx.beginPath();rctx.moveTo(sx(a[0]),sy(a[1]));rctx.lineTo(sx(b[0]),sy(b[1]));rctx.stroke()}}
   const px=sx(f[0]),py=sy(f[1]);circle(px,py,10*S,C.player,C.playerEdge,2);
   arrow(px,py,MOVE[f[4]][0],MOVE[f[4]][1],26*S*.9,C.move,3);
   arrow(px,py,SHOT[f[5]][0],SHOT[f[5]][1],38*S*.9,C.shot,3);
+  if(f[11]){const [nm,ns,,nx,ny]=f[11],qx=sx(nx),qy=sy(ny); // duel: the NPC's input
+    arrow(qx,qy,MOVE[nm][0],MOVE[nm][1],26*S*.9,C.move,3);arrow(qx,qy,SHOT[ns][0],SHOT[ns][1],38*S*.9,'#ffa45c',3)}
 }
 function visited(k){ // cells the player occupied at steps 0..k
   if(!visitedUpTo||visitedUpTo.k>k){visitedUpTo={k:-1,set:new Set()}}
@@ -230,13 +232,21 @@ function drawHud(){const f=D.frames[step],enemies=f[10].filter(e=>e[0]===1&&(e[6
   <div class="hearts"><span class="k">心</span>${hearts(f[2],E.max_hearts,f[3])}</div>
   <div><span class="k">阻挡血量</span><b>${+f[7].toFixed(1)}</b></div><div><span class="k">敌人</span><b>${enemies}</b></div>
   <div><span class="k">命中</span><b>${f[8]}</b></div><div><span class="k">受伤</span><b>${f[9]}</b></div>
-  <div><span class="k">输入</span>移动 <b>${ARROW[f[4]]}</b> · 射击 <b style="color:${C.shot}">${SHOT_ARROW[f[5]]}</b>${f[6]?' · 炸弹':''}</div>`;
+  <div><span class="k">输入</span>移动 <b>${ARROW[f[4]]}</b> · 射击 <b style="color:${C.shot}">${SHOT_ARROW[f[5]]}</b>${f[6]?' · 炸弹':''}</div>
+  ${f[11]?`<div><span class="k">对手</span>血 <b>${+f[11][2].toFixed(1)}</b> · 命中 <b>${f[11][5]}</b> · 移动 <b>${ARROW[f[11][0]]}</b> · 射击 <b style="color:#ffa45c">${SHOT_ARROW[f[11][1]]}</b></div>`:''}`;
   $('seek').value=step;$('bPlay').textContent=playing?'暂停':'播放'}
 function pct(v){return Math.round(v*100)+'%'}
+const SIDE={player:'玩家',npc:'NPC',both:'双方',none:'无',both_dead:'双方都死'};
+function duelRows(d){const who=s=>s==='checkpoint'?'检查点':s==='scripted'?'脚本':s==='self'?'检查点（自对弈）':s;
+  const side=x=>x?`命中 ${x.hits}/${x.shots} 发，受伤 ${x.hurt} 次`:'—';
+  return `<tr><td>对战</td><td>玩家 = ${who((d.sides||[])[0])}，NPC = ${who((d.sides||[])[1])}；地形 ${d.arm||'—'}</td></tr>
+  <tr><td>先命中 / 胜者</td><td>${SIDE[d.first_hit]||'无'}${d.first_hit_s!=null?'（'+d.first_hit_s.toFixed(1)+' 秒）':''} / ${SIDE[d.winner]||d.winner}</td></tr>
+  <tr><td>玩家</td><td>${side(d.player)}</td></tr><tr><td>NPC</td><td>${side(d.npc)}</td></tr>`}
 function renderStats(){const s=E.stats,c=E.components||{};
   const comp=Object.entries(c).filter(([k,v])=>Math.abs(v)>1e-9).map(([k,v])=>`${k} ${v>0?'+':''}${v.toFixed(2)}`).join('，');
   $('stats').innerHTML=`<h3>这一局</h3>${E.note?`<p class="note">${E.note}</p>`:''}<table>
   <tr><td>结局</td><td>${OUT[E.outcome]||E.outcome}，${E.seconds} 秒</td></tr>
+  ${E.duel?duelRows(E.duel):''}
   <tr><td>开局敌人</td><td>${E.enemies.join('，')||'—'}</td></tr>
   <tr><td>阻挡血量</td><td>${+s.blocking[0].toFixed(1)} → ${+s.blocking[1].toFixed(1)}</td></tr>
   <tr><td>命中敌人 / 受伤</td><td>${s.hits} 次 / ${s.hurt} 次</td></tr>
@@ -253,14 +263,15 @@ $('legend').innerHTML=`<h3>图例</h3>
 <div><span class="sw" style="background:${C.enemy}"></span>敌人（可被打伤）；灰色 = 当前无敌</div>
 <div><span class="sw" style="background:${C.boss}"></span>Boss，上方是血条和动画名</div>
 <div><span class="sw" style="background:${C.tear}"></span>玩家的眼泪；<span class="sw" style="background:${C.proj}"></span>敌人的弹幕（带地面影子）</div>
+<div>对战回放：Pacer 是对手 NPC，它的白箭头 = 移动输入，橙箭头 = 射击方向；橙线（阻挡血量）是它的血</div>
 <div><span class="sq" style="background:${C.rock}"></span>石头 <span class="sq" style="background:${C.poop}"></span>便便 <span class="sq" style="background:${C.block}"></span>铁块 <span class="sq" style="background:${C.pit}"></span>坑</div>
 <div><span class="sq" style="background:rgba(255,230,160,.35)"></span>玩家到目前为止走过的格子；黄线 = 最近 8 秒的轨迹</div>
-<div style="color:var(--muted)">画的是原引擎逐步记录的状态（每步 = 2 个逻辑帧 = 1/15 秒），不重新模拟。</div>`;
+<div style="color:var(--muted)">画的是原引擎逐步记录的状态（每步 = ${Math.round(STEP_S*30)} 个逻辑帧 = ${STEP_S.toFixed(3)} 秒），不重新模拟。</div>`;
 
 // ---- playback ----
 function setStep(k){step=Math.max(0,Math.min(D.frames.length-1,k|0));render()}
 function render(){drawRoom();drawTimeline();drawHud()}
-function open(i){if(i===cur)return;cur=i;E=EPISODES[i];D=data(i);step=0;acc=0;visitedUpTo=null;setup();
+function open(i){if(i===cur)return;cur=i;E=EPISODES[i];STEP_S=E.step_s||2/30;D=data(i);step=0;acc=0;visitedUpTo=null;setup();
   const m=bySeed.get(E.seed);$('epTitle').textContent=`种子 ${E.seed} · ${TASK[E.task]||E.task} · 房间 ${E.layout}${E.room?'（'+E.room+'）':''}`;
   $('epDesc').textContent=`${E.label}：${E.deterministic?'每步取概率最大的动作（定期评估的做法）':'按概率采样动作（训练时的做法）'} · ${OUT[E.outcome]||E.outcome}`;
   const sw=$('switch');sw.innerHTML='';for(const label of LABELS){if(m[label]===undefined)continue;const e=EPISODES[m[label]];
@@ -268,16 +279,16 @@ function open(i){if(i===cur)return;cur=i;E=EPISODES[i];D=data(i);step=0;acc=0;vi
   document.querySelectorAll('.row').forEach(r=>r.classList.toggle('active',+r.dataset.seed===E.seed));
   $('seek').max=D.frames.length-1;renderStats();render();history.replaceState(null,'','#'+encodeURIComponent(E.id))}
 function tick(t){const dt=Math.min(.25,(t-lastT)/1000);lastT=t;
-  if(playing&&D){acc+=dt*15*speed;const n=Math.floor(acc);if(n>0){acc-=n;setStep(step+n);if(step>=D.frames.length-1){playing=false;drawHud()}}}
+  if(playing&&D){acc+=dt*speed/STEP_S;const n=Math.floor(acc);if(n>0){acc-=n;setStep(step+n);if(step>=D.frames.length-1){playing=false;drawHud()}}}
   requestAnimationFrame(tick)}
 function toggle(){if(!D)return;if(step>=D.frames.length-1)step=0;playing=!playing;acc=0;drawHud()}
 function setSpeed(v){speed=v;document.querySelectorAll('#speeds button').forEach(b=>b.classList.toggle('on',+b.dataset.v===v))}
 for(const v of SPEEDS){const b=document.createElement('button');b.textContent=v+'×';b.dataset.v=v;b.onclick=()=>setSpeed(v);$('speeds').append(b)}
 $('bPlay').onclick=toggle;$('bStart').onclick=()=>setStep(0);$('bEnd').onclick=()=>setStep(1e9);
-$('bBack').onclick=()=>setStep(step-15);$('bFwd').onclick=()=>setStep(step+15);$('seek').oninput=()=>setStep(+$('seek').value);
+$('bBack').onclick=()=>setStep(step-Math.round(1/STEP_S));$('bFwd').onclick=()=>setStep(step+Math.round(1/STEP_S));$('seek').oninput=()=>setStep(+$('seek').value);
 for(const id of ['optTrail','optCells','optNames'])$(id).onchange=render;
 addEventListener('keydown',ev=>{if(ev.target.tagName==='INPUT'&&ev.target.type==='range'&&ev.key.startsWith('Arrow'))ev.preventDefault();
-  if(ev.key===' '){ev.preventDefault();toggle()}else if(ev.key==='ArrowRight')setStep(step+(ev.shiftKey?15:1));else if(ev.key==='ArrowLeft')setStep(step-(ev.shiftKey?15:1));
+  if(ev.key===' '){ev.preventDefault();toggle()}else if(ev.key==='ArrowRight')setStep(step+(ev.shiftKey?Math.round(1/STEP_S):1));else if(ev.key==='ArrowLeft')setStep(step-(ev.shiftKey?Math.round(1/STEP_S):1));
   else if(ev.key==='Home')setStep(0);else if(ev.key==='End')setStep(1e9);
   else if(ev.key===']'||ev.key==='['){const i=SPEEDS.indexOf(speed)+(ev.key===']'?1:-1);setSpeed(SPEEDS[Math.max(0,Math.min(SPEEDS.length-1,i))])}});
 addEventListener('resize',()=>{if(D){setup();render()}});

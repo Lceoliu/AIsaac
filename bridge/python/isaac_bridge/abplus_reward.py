@@ -25,9 +25,12 @@ half heart lost, about 200 score points in a completed run.
             room earns the same progress total and the shaping only speeds up learning; it does
             not change which behaviour is best.
 """
+import bisect
+
 import numpy as np
 
 from .abplus_geometry import CELL, fire_geometry
+from .hit_rate import WINDOW_FRAMES, HitRate
 
 PROFILE = 'combat-v2'
 COMPONENTS = ('hurt', 'death', 'time', 'bomb', 'clear', 'timeout', 'progress')
@@ -444,3 +447,476 @@ def describe_v5(hit_hp=None, align=None, gamma=None):
                 hurt=f"-{V5['hurt_event']:g} per damage event (flat)", death=-V5['death'],
                 clear=f"+{V5['clear']:g} - {V5['lambda_health']:g}/half heart lost - {V5['lambda_bomb']:g}/bomb used, at the clear",
                 timeout='truncation (value bootstrap), no penalty; no elapsed-time input', training_scale=V5['scale'])
+
+
+# ---------------------------------------------------------------------------------------------
+# The hit-rate test (user spec 2026-09-26, a temporary experiment). The player is invincible
+# (bridge abp-0.2.4), starts without bombs, and the deadline is 180 s (truncated, the learner
+# bootstraps). Only three terms remain, each paid at the step it happens; nothing is settled at the
+# end of the episode:
+#   hit   +1 per 5 HP the roster lineage loses (combat.lineage_damage, as combat-v5)
+#   kill  +0.25 per lineage NPC death (as combat-v5)
+#   time  -price(rate) per game second, linear in time. rate is the running tear hit rate
+#         (hit_rate.HitRate: tear hits / tears fired over the last 3 s, 0 when no tear was fired),
+#         price(rate) = 2 - 1.5 * rate: 2 per second at rate 0, 0.5 at rate 1.
+# No clear bonus, alignment potential, hurt, death or bomb terms: a clear pays by ending the time
+# price. The observation carries the same rate (transformer_obs.COMBAT_FIELDS_HITRATE). Training
+# scales the reward by 0.1.
+# ---------------------------------------------------------------------------------------------
+PROFILE_HR = 'combat-hitrate'
+COMPONENTS_HR = ('hit', 'kill', 'time')
+HR = dict(hit_hp=5.0, kill=0.25, cost_hit=0.5, cost_miss=2.0, window_frames=WINDOW_FRAMES, deadline_s=180.0,
+          scale=0.1, lineage_mode=1)
+
+
+def time_price(rate, cost_hit=HR['cost_hit'], cost_miss=HR['cost_miss']):
+    """Time penalty per game second at a hit rate in [0, 1] (linear between the two ends)."""
+    return cost_miss + (cost_hit - cost_miss) * min(1.0, max(0.0, float(rate)))
+
+
+class CombatHitRate:
+    """Per-episode state of the hit-rate test; same interface as CombatV2 (overrides: hit_hp,
+    cost_hit = price at rate 1, cost_miss = price at rate 0)."""
+    components = COMPONENTS_HR
+    scale = HR['scale']
+
+    def __init__(self, hit_hp=None, cost_hit=None, cost_miss=None):
+        self.hit_hp = float(HR['hit_hp'] if hit_hp is None else hit_hp)
+        self.cost_hit = float(HR['cost_hit'] if cost_hit is None else cost_hit)
+        self.cost_miss = float(HR['cost_miss'] if cost_miss is None else cost_miss)
+
+    def reset(self, obs, kind):
+        c = obs['combat']
+        self.kind = kind
+        self.lineage_damage = float(c['lineage_damage'])
+        self.lineage_kills = float(c['lineage_kills'])
+        self.hit_rate = HitRate(HR['window_frames'])
+        self.rate = self.hit_rate.reset(obs)
+        self.start = dict(lineage_hp=float(c['lineage_hp']), lineage_count=float(c['lineage_count']))
+        self.totals = dict.fromkeys(COMPONENTS_HR, 0.0)
+
+    def step(self, obs, outcome, frames):
+        """Components of one step (unscaled). outcome: running/death/win/time_limit."""
+        c = obs['combat']
+        r = dict.fromkeys(COMPONENTS_HR, 0.0)
+        damage, kills = float(c['lineage_damage']), float(c['lineage_kills'])
+        r['hit'] = max(0.0, damage - self.lineage_damage) / self.hit_hp
+        r['kill'] = max(0.0, kills - self.lineage_kills) * HR['kill']
+        self.lineage_damage, self.lineage_kills = damage, kills
+        self.rate = self.hit_rate.update(obs)
+        r['time'] = -time_price(self.rate, self.cost_hit, self.cost_miss) * frames / FRAMES_PER_SECOND
+        for k, v in r.items():
+            self.totals[k] += v
+        return r
+
+    def totals_array(self):
+        return np.array([self.totals[k] for k in COMPONENTS_HR], np.float32)
+
+
+REWARDS[PROFILE_HR] = CombatHitRate
+
+
+def describe_hitrate(hit_hp=None, cost_hit=None, cost_miss=None):
+    """Constants for run configs."""
+    reward = CombatHitRate(hit_hp, cost_hit, cost_miss)
+    return dict(profile=PROFILE_HR, stage='temporary test: invincible, no bombs, hit-rate time price (user spec 2026-09-26)',
+                hit=f"+1 per {reward.hit_hp:g} HP the roster lineage loses (bridge abp-0.2.3 lineage_damage)",
+                kill=f"+{HR['kill']:g} per lineage NPC death",
+                time=f"-({reward.cost_miss:g} + ({reward.cost_hit:g} - {reward.cost_miss:g}) * hit_rate) per game second, every step",
+                hit_rate=f"tear hits on lineage NPCs / tears fired over the last {HR['window_frames'] / FRAMES_PER_SECOND:g} s "
+                         f"(bridge abp-0.2.4 combat.tear_hits, events.tears), 0 when no tear was fired",
+                player='invincible (bridge abp-0.2.4 AbpSetInvincible), 0 bombs',
+                deadline=f"{HR['deadline_s']:g} s, truncation (value bootstrap), no penalty",
+                removed='clear bonus, alignment potential, hurt, death, bomb terms', training_scale=HR['scale'])
+
+
+# ---------------------------------------------------------------------------------------------
+# The walking-distance potential on the hit-rate test (user decision 2026-09-26): combat-hitrate
+# plus the potential shaping term of combat-v5, with d_fire measured as the distance the player has
+# to walk to a firing position (abplus_geometry.fire_geometry(walk=True)), so it has no local
+# minimum in front of rocks:
+#   align  gamma * Phi(s') - Phi(s), Phi = -0.2 * d_walk / 40 (d_walk at most 600 px, Phi in [-3, 0]).
+#          Phi(s') = 0 after a clear; the truncated deadline keeps it (the learner bootstraps).
+#          Potential-based: along any episode it sums to gamma^T Phi(s_T) - Phi(s_0), so it changes
+#          no ranking of outcomes; gamma must equal the learner's discount (train_abplus passes it).
+# The observation's fire_distance and the auxiliary approach label use the same walking distance.
+# ---------------------------------------------------------------------------------------------
+PROFILE_HRW = 'combat-hitrate-walk'
+COMPONENTS_HRW = ('hit', 'kill', 'time', 'align')
+HRW = dict(HR, align=0.2, gamma=0.9995)
+
+
+class CombatHitRateWalk(CombatHitRate):
+    """combat-hitrate with the walking-distance potential (overrides: align, gamma)."""
+    components = COMPONENTS_HRW
+
+    def __init__(self, hit_hp=None, cost_hit=None, cost_miss=None, align=None, gamma=None):
+        super().__init__(hit_hp, cost_hit, cost_miss)
+        self.align = float(HRW['align'] if align is None else align)
+        self.gamma = float(HRW['gamma'] if gamma is None else gamma)
+
+    def potential(self, d_walk):
+        return -self.align * d_walk / CELL
+
+    def reset(self, obs, kind):
+        super().reset(obs, kind)
+        self.d_walk = fire_geometry(obs, walk=True)['d_fire']
+        self.phi = self.potential(self.d_walk)
+        self.start['d_walk'] = self.d_walk
+        self.totals = dict.fromkeys(COMPONENTS_HRW, 0.0)
+
+    def step(self, obs, outcome, frames):
+        """Components of one step (unscaled). outcome: running/death/win/time_limit."""
+        r = super().step(obs, outcome, frames)
+        self.d_walk = fire_geometry(obs, self.d_walk, walk=True)['d_fire']
+        phi = 0.0 if outcome in ('win', 'death') else self.potential(self.d_walk)
+        r['align'] = self.gamma * phi - self.phi
+        self.phi = phi
+        self.totals['align'] += r['align']
+        return r
+
+    def totals_array(self):
+        return np.array([self.totals[k] for k in COMPONENTS_HRW], np.float32)
+
+
+REWARDS[PROFILE_HRW] = CombatHitRateWalk
+
+
+def describe_hitrate_walk(hit_hp=None, cost_hit=None, cost_miss=None, align=None, gamma=None):
+    """Constants for run configs."""
+    reward = CombatHitRateWalk(hit_hp, cost_hit, cost_miss, align, gamma)
+    base = describe_hitrate(hit_hp, cost_hit, cost_miss)
+    return dict(base, profile=PROFILE_HRW,
+                stage='temporary test: the hit-rate test plus the walking-distance potential, all normal rooms (user decision 2026-09-26)',
+                align=f"gamma*Phi(s')-Phi(s), Phi = -{reward.align:g} * d_walk / 40, d_walk = walking distance "
+                      f"to the nearest firing position (<= 600 px), gamma {reward.gamma:g}; Phi(s') = 0 after a clear",
+                removed='clear bonus, hurt, death, bomb terms')
+
+
+# ---------------------------------------------------------------------------------------------
+# combat-hitrate-miss (user decisions 2026-09-26): combat-hitrate-walk with every enemy earning
+# reward and a penalty for misses.
+#   every enemy  lineage mode 3 (bridge abp-0.2.5): every doors-blocking NPC joins the lineage when it
+#                is first seen, spawns of living NPCs included, so hit (+1 per 5 HP), kill (+0.25) and
+#                the hit rate's tear hits count on all of them. Each NPC's hits count up to the HP it
+#                had when it joined.
+#   miss         -0.01 * min(k, 20) for the k-th miss in a row: a tear that is gone without having
+#                damaged an enemy is a miss, and a hit resets the count (bridge miss_streak / miss_units:
+#                the step's penalty is -0.01 * delta(miss_units)). Paid at the step the tear is gone.
+#                The cap (bridge abp-0.2.6 AbpSetMissCap, user decision 2026-09-26) stops the growth at the
+#                20th miss in a row: uncapped, n misses in a row cost 0.01 * n(n+1)/2 and the untrained
+#                policy's miss term was as large as the time term (EXPERIMENTS.md C18).
+# Spawners can now be farmed in principle; the time price (at least 0.5 per second) is the check.
+# Three rooms where farming pays at a reachable hit rate are left out of the room set (C18).
+# hurt_rest (user decision 2026-09-28, after C37): when the first damage ends the episode
+# (train_abplus --hurt-ends-episode, outcome 'hurt'), that hurt also costs the rest of the deadline at
+# the no-hit time price, cost_miss per second (component 'rest'; combat-hitrate-hurt's death term
+# without its constant). C37 without it learned to walk into enemies that earned nothing (a Gaper's
+# Gusher before bridge abp-0.2.8): a hit that ends the episode for free beats paying the time price.
+# With it, ending the episode by a hit is never cheaper than standing until the deadline.
+# ---------------------------------------------------------------------------------------------
+PROFILE_HRM = 'combat-hitrate-miss'
+COMPONENTS_HRM = ('hit', 'kill', 'time', 'align', 'miss')
+COMPONENTS_HRM_REST = COMPONENTS_HRM + ('rest',)
+HRM = dict(HRW, miss=0.01, miss_cap=20, lineage_mode=3)
+
+
+class CombatHitRateMiss(CombatHitRateWalk):
+    """combat-hitrate-walk plus the miss penalty (override: miss = price of the first miss in a row;
+    hurt_rest: the hurt that ends the episode costs the rest of deadline_s at cost_miss per second).
+
+    The cap on the growth is applied by the bridge (miss_units), so the reward only prices its delta.
+    """
+    components = COMPONENTS_HRM
+
+    def __init__(self, hit_hp=None, cost_hit=None, cost_miss=None, align=None, gamma=None, miss=None,
+                 deadline_s=None, hurt_rest=False):
+        super().__init__(hit_hp, cost_hit, cost_miss, align, gamma)
+        self.miss = float(HRM['miss'] if miss is None else miss)
+        self.deadline_s = float(HR['deadline_s'] if deadline_s is None else deadline_s)
+        self.hurt_rest = bool(hurt_rest)
+        if self.hurt_rest:
+            self.components = COMPONENTS_HRM_REST
+
+    def reset(self, obs, kind):
+        super().reset(obs, kind)
+        self.miss_units = float(obs['combat'].get('miss_units', 0))
+        self.played_s = 0.0
+        self.totals = dict.fromkeys(self.components, 0.0)
+
+    def step(self, obs, outcome, frames):
+        """Components of one step (unscaled). outcome: running/death/win/time_limit/hurt."""
+        r = super().step(obs, outcome, frames)
+        units = float(obs['combat'].get('miss_units', 0))
+        r['miss'] = -self.miss * max(0.0, units - self.miss_units)
+        self.miss_units = units
+        self.totals['miss'] += r['miss']
+        self.played_s += frames / FRAMES_PER_SECOND
+        if self.hurt_rest:
+            r['rest'] = -self.cost_miss * max(0.0, self.deadline_s - self.played_s) if outcome == 'hurt' else 0.0
+            self.totals['rest'] += r['rest']
+        return r
+
+    def totals_array(self):
+        return np.array([self.totals[k] for k in self.components], np.float32)
+
+
+REWARDS[PROFILE_HRM] = CombatHitRateMiss
+
+
+def describe_hitrate_miss(hit_hp=None, cost_hit=None, cost_miss=None, align=None, gamma=None, miss=None,
+                          miss_cap=None, deadline_s=None, hurt_rest=False):
+    """Constants for run configs (miss_cap: the bridge's cap on the growth, 0 = none)."""
+    reward = CombatHitRateMiss(hit_hp, cost_hit, cost_miss, align, gamma, miss, deadline_s, hurt_rest)
+    cap = int(HRM['miss_cap'] if miss_cap is None else miss_cap)
+    rest = (dict(rest=f"at the hurt that ends the episode (--hurt-ends-episode): -{reward.cost_miss:g} per second "
+                      f"left of the {reward.deadline_s:g} s deadline") if reward.hurt_rest else {})
+    return dict(describe_hitrate_walk(hit_hp, cost_hit, cost_miss, align, gamma), profile=PROFILE_HRM,
+                stage='temporary test: every enemy rewarded, walking potential, linearly growing miss penalty (user decisions 2026-09-26)',
+                hit=f"+1 per {reward.hit_hp:g} HP any doors-blocking NPC loses, spawns included (lineage mode 3, bridge abp-0.2.5)",
+                kill=f"+{HRM['kill']:g} per doors-blocking NPC death",
+                miss=(f"-{reward.miss:g} * min(k, {cap}) for the k-th miss in a row (bridge abp-0.2.6 cap)" if cap
+                      else f"-{reward.miss:g} * k for the k-th miss in a row") +
+                     " (a tear gone without damaging an enemy); a hit resets k",
+                hit_rate='tear hits on any doors-blocking NPC / tears fired over the last 3 s, 0 when no tear was fired',
+                **rest)
+
+
+# ---------------------------------------------------------------------------------------------
+# combat-hitrate-fire (user decision 2026-09-27): combat-hitrate-miss with the tear terms credited to
+# the step the tear was fired in. A tear lands 0-14 steps after it is fired (C19's check), and the
+# policy fires every step, so paid at landing a hit's credit reaches the firing decision only
+# through GAE, spread over the steps in between.
+#   The bridge (abp-0.2.7 combat.credits) charges each frame's lineage HP loss to the tears that hit
+#   (oldest first, up to each tear's damage), a lineage death to the tear that hit it last, and a
+#   miss to the missing tear, per fire frame. Here the fire frame becomes a step: transition s covers
+#   the logic frames (L_s, L_s+1] of consecutive observations.
+#   The step reward is unchanged (every term at the step it is observed); credit[j - 1] is the part
+#   of it (hit, kill, miss of tears fired j steps back, 1 <= j <= CREDIT_STEPS) that the learner moves
+#   to that step's reward before GAE. Totals per episode are unchanged; a credit whose step is before
+#   the rollout stays where it was observed.
+# ---------------------------------------------------------------------------------------------
+PROFILE_HRF = 'combat-hitrate-fire'
+COMPONENTS_HRF = COMPONENTS_HRM
+HRF = dict(HRM)
+CREDIT_STEPS = 32
+
+
+class CombatHitRateFire(CombatHitRateMiss):
+    """combat-hitrate-miss whose hit, kill and miss terms carry the step their tear was fired in."""
+    components = COMPONENTS_HRF
+
+    def reset(self, obs, kind):
+        super().reset(obs, kind)
+        self.marks = [int(obs['logic_frames'])]
+        self.credit = np.zeros(CREDIT_STEPS, np.float32)
+        self.credited = 0.0      # unscaled reward of this episode moved to earlier steps
+
+    def step(self, obs, outcome, frames):
+        r = super().step(obs, outcome, frames)
+        self.marks.append(int(obs['logic_frames']))
+        s = len(self.marks) - 2                      # the transition just played
+        credit = np.zeros(CREDIT_STEPS, np.float64)
+        for fire, damage, kills, miss_units in obs['combat'].get('credits', ()):
+            i = bisect.bisect_left(self.marks, fire) - 1   # the transition whose frames hold the fire frame
+            j = s - i
+            if i >= 0 and 1 <= j <= CREDIT_STEPS:
+                credit[j - 1] += damage / self.hit_hp + HRM['kill'] * kills - self.miss * miss_units
+        self.credit = credit.astype(np.float32)
+        self.credited += float(credit.sum())
+        return r
+
+
+REWARDS[PROFILE_HRF] = CombatHitRateFire
+
+
+def describe_hitrate_fire(hit_hp=None, cost_hit=None, cost_miss=None, align=None, gamma=None, miss=None,
+                          miss_cap=None, deadline_s=None, hurt_rest=False):
+    """Constants for run configs."""
+    return dict(describe_hitrate_miss(hit_hp, cost_hit, cost_miss, align, gamma, miss, miss_cap, deadline_s, hurt_rest),
+                profile=PROFILE_HRF,
+                stage='every enemy rewarded, walking potential, capped miss penalty, tear terms credited to the '
+                      'firing step (user decision 2026-09-27)',
+                credit=f'hit, kill and miss of a tear go to the step it was fired in (bridge abp-0.2.7 combat.credits, '
+                       f'up to {CREDIT_STEPS} steps back); time and alignment stay at their step')
+
+
+# ---------------------------------------------------------------------------------------------
+# combat-hitrate-hurt (stage 2, user decisions 2026-09-27, EXPERIMENTS.md C33): combat-hitrate-miss with the
+# player no longer invincible, plus
+#   hurt   combat-v2's health curve: half hearts lost from h cost V(h) - V(h - n) (1.00 for the first of six,
+#          up to 4.09 for the last), counted by the game's GetTotalDamageTaken (bridge combat.player_damage).
+#   death  terminal: the rest of the deadline at the no-hit time price (cost_miss per second) plus 5, so a
+#          death is never cheaper than standing until the deadline (no incentive to die early in a hard room;
+#          combat-v3 charged the remaining time for the same reason). The walking potential is not paid out
+#          at a death (Phi keeps its value; it is at a clear), which can only make a death worse.
+# Hits, kills, misses, the time price and the potential are unchanged; the deadline is truncated.
+# death=False (user decision 2026-09-28, C36) drops the death term: the lethal hit still ends the
+# episode and its half hearts still cost the health curve, but a death costs nothing more (so it also
+# ends the time price).
+# ---------------------------------------------------------------------------------------------
+PROFILE_HRH = 'combat-hitrate-hurt'
+COMPONENTS_HRH = COMPONENTS_HRM + ('hurt', 'death')
+HRH = dict(HRM, death=DEATH)
+
+
+class CombatHitRateHurt(CombatHitRateMiss):
+    """combat-hitrate-miss plus the health curve and a death that costs the rest of the deadline
+    (overrides: deadline_s, the episode's truncation deadline in seconds; death=False drops the death
+    term, C36)."""
+    components = COMPONENTS_HRH
+
+    def __init__(self, hit_hp=None, cost_hit=None, cost_miss=None, align=None, gamma=None, miss=None,
+                 deadline_s=None, death=True):
+        super().__init__(hit_hp, cost_hit, cost_miss, align, gamma, miss)
+        self.deadline_s = float(HR['deadline_s'] if deadline_s is None else deadline_s)
+        self.death_cost = bool(death)
+
+    def reset(self, obs, kind):
+        super().reset(obs, kind)
+        self.health = health_units(obs['players'][0])
+        self.damage = float(obs['combat']['player_damage'])
+        self.elapsed_s = 0.0
+        self.start['health'] = self.health
+        self.totals = dict.fromkeys(COMPONENTS_HRH, 0.0)
+
+    def step(self, obs, outcome, frames):
+        """Components of one step (unscaled). outcome: running/death/win/time_limit."""
+        r = super().step(obs, outcome, frames)
+        c, p = obs['combat'], obs['players'][0]
+        self.elapsed_s += frames / FRAMES_PER_SECOND
+        counted = float(c['player_damage']) - self.damage
+        r['hurt'] = -(health_value(self.health) - health_value(self.health - counted)) if counted > 0 else 0.0
+        self.damage, self.health = float(c['player_damage']), health_units(p)
+        r['death'] = 0.0
+        if outcome == 'death':
+            if self.death_cost:
+                r['death'] = -self.cost_miss * max(0.0, self.deadline_s - self.elapsed_s) - HRH['death']
+            # combat-hitrate-walk paid the potential out (Phi(s') = 0); a death keeps it instead.
+            kept = self.gamma * self.potential(self.d_walk)
+            r['align'] += kept
+            self.totals['align'] += kept
+            self.phi = self.potential(self.d_walk)
+        self.totals['hurt'] += r['hurt']
+        self.totals['death'] += r['death']
+        return r
+
+    def totals_array(self):
+        return np.array([self.totals[k] for k in COMPONENTS_HRH], np.float32)
+
+
+REWARDS[PROFILE_HRH] = CombatHitRateHurt
+
+
+def describe_hitrate_hurt(hit_hp=None, cost_hit=None, cost_miss=None, align=None, gamma=None, miss=None,
+                          miss_cap=None, deadline_s=None, death=True):
+    """Constants for run configs."""
+    reward = CombatHitRateHurt(hit_hp, cost_hit, cost_miss, align, gamma, miss, deadline_s, death)
+    return dict(describe_hitrate_miss(hit_hp, cost_hit, cost_miss, align, gamma, miss, miss_cap), profile=PROFILE_HRH,
+                stage='stage 2: combat-hitrate-miss without invincibility (user decisions 2026-09-27)',
+                player='not invincible, 0 bombs',
+                hurt=[round(health_value(h) - health_value(h - 1), 3) for h in range(HP_FULL, 0, -1)],
+                death=(f"-{reward.cost_miss:g} per second left of the {reward.deadline_s:g} s deadline - {HRH['death']:g}; "
+                       f"the walking potential is kept (not paid out) at a death" if reward.death_cost else
+                       'none (C36): the lethal hit ends the episode and costs only the health curve'),
+                removed='clear bonus, bomb terms')
+
+
+# ---------------------------------------------------------------------------------------------
+# combat-hp (user decisions 2026-09-28, EXPERIMENTS.md C39): trained from random weights on four room groups
+# (real normal rooms, one Horf, 1-3 Horfs among rocks, spawners), no curriculum terms.
+#   damage   +1 per 3.5 HP any monster in the room loses: bridge abp-0.2.8-hp combat.monster_damage, every
+#            active-enemy NPC (the room's own and every spawn, doors-blocking or not), real HP loss only.
+#   hurt     -0.5 per half heart the player loses (combat.player_damage, Entity_Player::GetTotalDamageTaken; the
+#            lethal hit the bridge cancels is counted with its amount).
+#   clear    +100 when the room is cleared (outcome win).
+#   timeout  -100 at the deadline (180 s), a termination; the policy observes the remaining time.
+#   death    -100, a termination (user decision: a death fails the room like the deadline, so dying early never
+#            saves the deadline's cost).
+# No time price, potential, miss or hit-rate term; the training scale is 0.1.
+# ---------------------------------------------------------------------------------------------
+PROFILE_HP = 'combat-hp'
+COMPONENTS_HP = ('damage', 'hurt', 'clear', 'timeout', 'death')
+HPR = dict(damage_hp=3.5, hurt=0.5, clear=100.0, timeout=100.0, death=100.0, scale=0.1, lineage_mode=3)
+
+
+class CombatHp:
+    """Per-episode combat-hp state (overrides: damage_hp, hurt, clear, timeout, death)."""
+    components = COMPONENTS_HP
+    scale = HPR['scale']
+
+    def __init__(self, damage_hp=None, hurt=None, clear=None, timeout=None, death=None):
+        self.damage_hp = float(HPR['damage_hp'] if damage_hp is None else damage_hp)
+        self.hurt = float(HPR['hurt'] if hurt is None else hurt)
+        self.clear = float(HPR['clear'] if clear is None else clear)
+        self.timeout = float(HPR['timeout'] if timeout is None else timeout)
+        self.death = float(HPR['death'] if death is None else death)
+
+    def reset(self, obs, kind):
+        c = obs['combat']
+        if 'monster_damage' not in c:
+            raise ValueError('combat-hp needs bridge abp-0.2.8-hp (combat.monster_damage)')
+        self.monster_damage = float(c['monster_damage'])
+        self.player_damage = float(c['player_damage'])
+        self.start = dict(monster_damage=self.monster_damage, player_damage=self.player_damage)
+        self.totals = dict.fromkeys(COMPONENTS_HP, 0.0)
+
+    def step(self, obs, outcome, frames):
+        """Components of one step (unscaled). outcome: running/death/win/time_limit."""
+        c = obs['combat']
+        r = dict.fromkeys(COMPONENTS_HP, 0.0)
+        damage, hurt = float(c['monster_damage']), float(c['player_damage'])
+        r['damage'] = max(0.0, damage - self.monster_damage) / self.damage_hp
+        r['hurt'] = -self.hurt * max(0.0, hurt - self.player_damage)
+        self.monster_damage, self.player_damage = damage, hurt
+        if outcome == 'win':
+            r['clear'] = self.clear
+        elif outcome == 'time_limit':
+            r['timeout'] = -self.timeout
+        elif outcome == 'death':
+            r['death'] = -self.death
+        for k, v in r.items():
+            self.totals[k] += v
+        return r
+
+    def totals_array(self):
+        return np.array([self.totals[k] for k in COMPONENTS_HP], np.float32)
+
+
+REWARDS[PROFILE_HP] = CombatHp
+
+# combat-hp2 (user decisions 2026-09-29, EXPERIMENTS.md C41): combat-hp with -1 per half heart, on the 1x1 and the other
+# Basement I room shapes and the Basement I boss rooms (the observation's 16x28 terrain canvas, abplus_worker).
+PROFILE_HP2 = 'combat-hp2'
+HPR2 = dict(HPR, hurt=1.0)
+
+
+class CombatHp2(CombatHp):
+    """combat-hp with HPR2's default cost per half heart."""
+
+    def __init__(self, damage_hp=None, hurt=None, clear=None, timeout=None, death=None):
+        super().__init__(damage_hp, HPR2['hurt'] if hurt is None else hurt, clear, timeout, death)
+
+
+REWARDS[PROFILE_HP2] = CombatHp2
+REWARDS['combat-hp2-camera'] = CombatHp2   # C41 as C39's continuation: the same reward, the camera's terrain view
+
+
+def describe_hp(**options):
+    """Constants for run configs."""
+    reward = CombatHp(**options)
+    return dict(profile=PROFILE_HP, stage='C39: random weights, four room groups (user decisions 2026-09-28)',
+                damage=(f'+1 per {reward.damage_hp:g} HP any monster in the room loses: every active-enemy NPC (types '
+                        '10-999 but shopkeepers, fire places, poop, movable TNT), the room own and every spawn, real HP '
+                        'loss only (bridge abp-0.2.8-hp combat.monster_damage)'),
+                hurt=f'-{reward.hurt:g} per half heart the player loses (GetTotalDamageTaken)',
+                clear=f'+{reward.clear:g} at the clear', timeout=f'-{reward.timeout:g} at the deadline, terminal',
+                death=f'-{reward.death:g}, terminal', training_scale=HPR['scale'],
+                removed='time price, potentials, miss and hit-rate terms, bomb term')
+
+
+def describe_hp2(**options):
+    """Constants for run configs (C41)."""
+    return {**describe_hp(**{'hurt': HPR2['hurt'], **options}), 'profile': PROFILE_HP2,
+            'stage': 'C41: random weights, 1x1 and other-shape normal rooms, rocks with Horfs, boss rooms; stat, HP and '
+                     'bomb start noise (user decisions 2026-09-29)'}

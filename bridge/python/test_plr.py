@@ -144,7 +144,8 @@ class WorkerHelpersTest(unittest.TestCase):
         stats.step(raw(200, 100, 26.5, bombs=0), 2)             # moves, hits, drops the bomb
         for _ in range(15):
             stats.step(raw(200, 100, 26.5, bombs=0), 2)
-        first, no_hit, stationary, cells, bombs = stats.array()
+        first, no_hit, stationary, cells, bombs, shots, hits, misses = stats.array()
+        self.assertEqual((shots, hits, misses), (0, 0, 0))      # no events / tear counters in these observations
         self.assertAlmostEqual(first, 301 * 2 / 30, places=4)
         self.assertAlmostEqual(no_hit, 301 * 2 / 30, places=4)
         self.assertAlmostEqual(stationary, 301 * 2 / 30, places=4)

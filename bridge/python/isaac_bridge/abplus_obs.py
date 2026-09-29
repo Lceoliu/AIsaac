@@ -1,4 +1,6 @@
-"""Decoder of abp_bridge.lua's binary observation (format 2, abp-0.2.3).
+"""Decoder of abp_bridge.lua's binary observation (format 2, abp-0.2.10: abp-0.2.7's layout with monster_damage at
+the end of the combat block (abp-0.2.8-hp) and the duel block at the end (abp-0.2.9); abp-0.2.8 changed only the
+lineage rule).
 
 Produces the same dict as json.loads of the format-1 message: same keys, same key presence
 (anim only when an animation matched, boss_hp only for bosses, per-kind extras), same values
@@ -24,8 +26,11 @@ ENTITY_EFFECT = 1000
 KINDS = {1: 'tear', 2: 'projectile', 3: 'laser', 4: 'bomb', 5: 'pickup', 6: 'npc'}
 
 _HEADER = struct.Struct('<IIIBqqqq')
-# abp-0.2.1 adds blocking_hp, blocking_points; abp-0.2.2 blocking_count; abp-0.2.3 the lineage counters
-_COMBAT = struct.Struct('<dddddddddddd')
+# abp-0.2.1 adds blocking_hp, blocking_points; abp-0.2.2 blocking_count; abp-0.2.3 the lineage counters;
+# abp-0.2.4 tear_hits, blocked_hits; abp-0.2.5 tear_misses, miss_units, miss_streak; abp-0.2.8-hp monster_damage
+_COMBAT = struct.Struct('<dddddddddddddddddd')
+# abp-0.2.7: after the combat block, a count and per fire frame (frame, damage, kills, miss units)
+_CREDIT = struct.Struct('<qddd')
 _ROOM = struct.Struct('<qqqqddddBqqqqqq')
 _ROOM_DATA = struct.Struct('<qq')
 _DOOR = struct.Struct('<BBBddq')
@@ -37,6 +42,11 @@ _VEL = struct.Struct('<dd')
 _TPH = struct.Struct('<ddd')
 _LASER = struct.Struct('<Bddddddq')
 _NPC = struct.Struct('<BBBqBdBB')  # abp-0.2.3: + lineage, blocking
+# abp-0.2.9 duel block (after a flag byte): active, dead, NPC index, position, size, HP, max HP, iframes, the player's
+# iframes, fire cooldown, velocity, move, shoot; then per side (the player, the NPC) the counters of DUEL_SIDE_KEYS
+_DUEL = struct.Struct('<BBqdddddqqqddBB')
+_DUEL_SIDE = struct.Struct('<dddddddd')
+DUEL_SIDE_KEYS = ('shots', 'hits', 'misses', 'miss_units', 'miss_streak', 'damage', 'hurt', 'hurt_amount')
 _U8 = struct.Struct('<B')
 _U16 = struct.Struct('<H')
 _U32 = struct.Struct('<I')
@@ -60,6 +70,12 @@ class ObsDecoder:
         off += _HEADER.size
         c = _COMBAT.unpack_from(payload, off)
         off += _COMBAT.size
+        n = _U16.unpack_from(payload, off)[0]
+        off += 2
+        credits = []
+        for _ in range(n):
+            credits.append(list(_CREDIT.unpack_from(payload, off)))
+            off += _CREDIT.size
         r = _ROOM.unpack_from(payload, off)
         off += _ROOM.size
         room = dict(type=r[0], shape=r[1], gw=r[2], gh=r[3], top_left=[r[4], r[5]], bottom_right=[r[6], r[7]],
@@ -161,9 +177,22 @@ class ObsDecoder:
                     rec['boss_hp'] = hp
                 rec.update(lineage=bool(lineage), blocking=bool(blocking))
             entities.append(rec)
+        duel = None
+        if payload[off]:   # abp-0.2.9
+            d = _DUEL.unpack_from(payload, off + 1)
+            off += 1 + _DUEL.size
+            sides = []
+            for _ in range(2):
+                sides.append(dict(zip(DUEL_SIDE_KEYS, _DUEL_SIDE.unpack_from(payload, off))))
+                off += _DUEL_SIDE.size
+            duel = dict(active=bool(d[0]), dead=bool(d[1]), npc=d[2], pos=[d[3], d[4]], size=d[5], hp=d[6], max_hp=d[7],
+                        iframes=d[8], player_iframes=d[9], cooldown=d[10], vel=[d[11], d[12]], move=d[13], shoot=d[14],
+                        player=sides[0], npc_side=sides[1])
+        else:
+            off += 1
         if off != len(payload):
             raise ValueError(f'observation payload has {len(payload) - off} trailing bytes')
-        return dict(combat_schema=3, engine='abplus-1.06', game_frame=game_frame, paused=bool(paused),
+        obs = dict(combat_schema=3, engine='abplus-1.06', game_frame=game_frame, paused=bool(paused),
                     logic_frames=logic_frames,
                     events=dict(damage=damage, tears=tears, npc_deaths=npc_deaths, clears=clears),
                     players=players, entities=entities, room=room, grid=self.grid, doors=doors,
@@ -171,7 +200,12 @@ class ObsDecoder:
                     combat=dict(player_damage_events=c[0], player_damage=c[1], enemy_damage_events=c[2],
                                 enemy_damage=c[3], enemy_damage_fraction=c[4], blocking_hp=c[5],
                                 blocking_points=c[6], blocking_count=c[7], lineage_damage=c[8],
-                                lineage_kills=c[9], lineage_count=c[10], lineage_hp=c[11]))
+                                lineage_kills=c[9], lineage_count=c[10], lineage_hp=c[11],
+                                tear_hits=c[12], blocked_hits=c[13], tear_misses=c[14], miss_units=c[15],
+                                miss_streak=c[16], credits=credits, monster_damage=c[17]))
+        if duel is not None:
+            obs['duel'] = duel
+        return obs
 
     def _terrain_with_hazards(self, entities):
         hazards = [e for e in entities if e['type'] == ENTITY_EFFECT and e['cdmg'] > 0]

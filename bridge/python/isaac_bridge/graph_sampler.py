@@ -24,6 +24,13 @@ Self-check: every check_every-th graph step also runs the eager path on the same
 records the largest difference of the new features, of the log-probability of the sampled
 actions and of the values (diffs, logged by train_abplus as sampler/*). Differences come from
 float summation order only (~1e-5).
+
+Near-greedy actors (tier 7 of the aiming arena, EXPERIMENTS.md C29): the first greedy_actors
+environments sample every head from softmax(logits / greedy_temperature), so their trajectories
+follow the policy's mode and reach the states where the deterministic policy gets stuck. Their
+stored behaviour log-probabilities are the tempered ones; the asynchronous (decoupled) update
+weights each sample by pi_proximal / pi_behaviour, which corrects for it. Temperature 1 is the
+policy's own distribution, bit for bit.
 """
 import torch
 import torch.nn.functional as F
@@ -34,8 +41,15 @@ from .gpu_ppo import FrameSampler, action_masks
 HUGE_NEG = -1e8   # sb3_contrib MaskableCategorical's masked logit
 
 
+def tempered_sample(logits, u, temperature):
+    """Gumbel-max sample of softmax(logits / temperature) from uniforms u, and its log-probability."""
+    scaled = logits / temperature
+    a = torch.argmax(scaled - torch.log(-torch.log(u)), -1)
+    return a, F.log_softmax(scaled, -1).gather(-1, a[:, None])[:, 0]
+
+
 class GraphFrameSampler(FrameSampler):
-    def __init__(self, model, check_every=1024):
+    def __init__(self, model, check_every=1024, greedy_actors=0, greedy_temperature=1.0):
         super().__init__(model)
         self.check_every = check_every
         self.device = model.device
@@ -44,6 +58,9 @@ class GraphFrameSampler(FrameSampler):
         self.chunk_of = {id(ids): i for i, ids in enumerate(self.workers)}
         self.graph_steps = 0
         self.diffs = {'features': 0.0, 'log_prob': 0.0, 'value': 0.0, 'checks': 0}
+        # Per-environment sampling temperature: the first greedy_actors environments are near-greedy.
+        self.temperature = torch.ones(model.n_envs, device=self.device)
+        self.temperature[:int(greedy_actors)] = float(greedy_temperature)
 
     # ---- capture --------------------------------------------------------------------------------
     def begin(self):
@@ -88,15 +105,18 @@ class GraphFrameSampler(FrameSampler):
         elapsed = b.frames['time'][times, ids[:, None]].masked_fill(~valid, 0)
         seq = self.encoder.temporal_features(fused, elapsed, valid)
         latent = seq[torch.arange(len(ids), device=self.device), valid.long().sum(-1) - 1]
-        masks = action_masks(self.nvec, b.frames['player'][position, ids, 9] > 0)
+        # C30 (--block-moves): the moves the newest frame's terrain stops dead (FrameSampler.move_block, in place).
+        masks = action_masks(self.nvec, b.frames['player'][position, ids, 9] > 0,
+                             self.move_block[ids] if self.block_moves else None)
         pi, vf = policy.mlp_extractor(latent)
         logits = torch.where(masks, policy.action_net(pi), torch.full_like(masks, HUGE_NEG, dtype=torch.float32))
         noise = torch.rand(logits.shape, device=self.device).clamp_(1e-10, 1 - 1e-7)
+        temperature = self.temperature[ids][:, None]
         actions, log_prob = [], 0
         for part, u in zip(torch.split(logits, self.nvec, -1), torch.split(noise, self.nvec, -1)):
-            a = torch.argmax(part - torch.log(-torch.log(u)), -1)
+            a, lp = tempered_sample(part, u, temperature)
             actions.append(a)
-            log_prob = log_prob + F.log_softmax(part, -1).gather(-1, a[:, None])[:, 0]
+            log_prob = log_prob + lp
         return torch.stack(actions, -1), policy.value_net(vf).flatten(), log_prob, masks
 
     # ---- per-step use ---------------------------------------------------------------------------
@@ -131,7 +151,10 @@ class GraphFrameSampler(FrameSampler):
             pi, vf = policy.mlp_extractor(self.latent(position, ids))
             dist = policy._get_action_dist_from_latent(pi)
             dist.apply_masking(masks)
-            self._note('log_prob', (dist.log_prob(actions) - log_prob).abs().max())
+            temperature = self.temperature[ids][:, None]
+            eager = sum(F.log_softmax(d.logits / temperature, -1).gather(-1, a[:, None])[:, 0]
+                        for d, a in zip(dist.distributions, actions.unbind(-1)))
+            self._note('log_prob', (eager - log_prob).abs().max())
             self._note('value', (policy.value_net(vf).flatten() - values).abs().max())
             self.diffs['checks'] += 1
         self.graph_steps += 1

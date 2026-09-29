@@ -8,6 +8,10 @@ CUDA user. Each worker process (abplus_worker.py) owns one environment slot and 
 Per step the learner makes one batched policy call per chunk (chunks=1: all environments at
 once), sends every worker 13 bytes over a pipe and copies back only the newest FRAME_DTYPE record
 (~73 KB) per environment from shared memory into the chunk's pinned slot.
+
+Duel (abplus_duel.py, bridge abp-0.2.9): one worker process per duel game serves two consecutive slots, the player (2k)
+and the duel NPC (2k + 1); it gets both slots' actions in one 25-byte message and writes both frames. The policy acts
+for both (self-play); infos carry the slot's side.
 """
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
@@ -22,6 +26,8 @@ from gymnasium import spaces
 from stable_baselines3.common.vec_env import VecEnv
 
 from . import abplus_worker as W
+from .abplus_duel import SIDES, duel_worker_main
+from .abplus_groups import BUDGETS, slot_groups
 from .gpu_env import FULL_START, GpuFrameVecEnv, TransferSlot, sample_start, validate_start_randomization
 from .plr import PrioritizedLevels
 from .sim_vec import FRAME_DTYPE
@@ -34,12 +40,21 @@ if any(W.sample_start(s, _probe) != sample_start(s, _probe) for s in range(64)):
     raise ImportError('abplus_worker.sample_start differs from gpu_env.sample_start')
 
 
+def step_messages(actions, agents=1):
+    """The workers' step messages for the slots' (joint, bomb, item) rows: b'S' + int32s, one per worker of `agents`
+    consecutive slots (duel: 2)."""
+    return [b'S' + struct.pack(f'<{3 * agents}i', *[int(x) for a in actions[j:j + agents] for x in a])
+            for j in range(0, len(actions), agents)]
+
+
 class AbplusChunk:
     """A group of workers stepped together; one policy call and one upload per step."""
 
     def __init__(self, owner, start, stop):
         self.owner, self.start, self.stop, self.n = owner, start, stop, stop - start
-        self.conns = owner.conns[start:stop]
+        # one worker per owner.agents slots (duel: 2); chunk boundaries fall between workers
+        self.agents = owner.agents
+        self.conns = owner.conns[start // self.agents:stop // self.agents]
         self.copy_stream = torch.cuda.Stream(device=owner.device)
         # High priority: with asynchronous training the learner's kernels share the GPU.
         self.compute_stream = torch.cuda.Stream(device=owner.device, priority=-1)
@@ -76,7 +91,7 @@ class AbplusChunk:
                 except EOFError:
                     reply = b'Eworker process exited'
                 if reply[:1] != b'k':
-                    errors.append(f'[env {self.start + i}] {reply[1:].decode("utf8", "replace")}')
+                    errors.append(f'[worker {self.start // self.agents + i}] {reply[1:].decode("utf8", "replace")}')
         if errors:
             raise RuntimeError('AB+ worker failure:\n' + '\n'.join(errors))
 
@@ -85,9 +100,9 @@ class AbplusChunk:
         self.seeds = list(map(int, seeds))
         self.actions = [[] for _ in range(self.n)]
         messages = []
-        for i, seed in enumerate(self.seeds):
+        for i in range(0, self.n, self.agents):   # a worker's first slot (a duel worker draws its own first seed)
             player, boss = (float('nan'), float('nan')) if starts is None else map(float, starts[i])
-            messages.append(b'R' + struct.pack('<qqff', seed, self.owner.base_seed, player, boss))
+            messages.append(b'R' + struct.pack('<qqff', self.seeds[i], self.owner.base_seed, player, boss))
         self._exchange(messages)
         rows = slice(self.start, self.stop)
         self.slots[0].frames[:] = self.owner.staging[0, rows]
@@ -107,7 +122,7 @@ class AbplusChunk:
             self.cycle_s += t - self.last_advance
             self.cycles += 1
         self.last_advance = t
-        self._exchange([b'S' + struct.pack('<3i', *a) for a in actions])
+        self._exchange(step_messages(actions, self.agents))
         self.exchange_s += time.perf_counter() - t
         self.exchanges += 1
         rows = slice(self.start, self.stop)
@@ -121,9 +136,14 @@ class AbplusChunk:
         self.returns += rewards
         self.lengths += 1
         infos = [dict(outcome=W.OUTCOMES[r['outcome']], elapsed_frames=int(r['elapsed']), layout=int(r['layout']),
-                      seed=int(m['seed']), task=W.TASKS[int(m['task'])], level=int(m['level']),
+                      seed=int(m['seed']), task=W.TASKS[int(m['task'])], level=int(m['level']), group=int(m['group']),
+                      replay=int(m['replay']), rss_mib=float(m['rss_mib']), instance=int(m['instance']),
+                      instance_episodes=int(m['instance_episodes']),
                       **{'TimeLimit.truncated': bool(r['truncated'])})
                  for r, m in zip(frames, meta)]
+        if self.agents == 2:   # duel: slot 2k is the player, 2k + 1 the duel NPC
+            for i, info in enumerate(infos):
+                info['side'] = SIDES[(self.start + i) % 2]
         terminal = np.flatnonzero(dones)
         components = self.owner.components
         for i in terminal:
@@ -133,7 +153,9 @@ class AbplusChunk:
                                                  for k, v in zip(components, meta['components'][i])}
             infos[i]['episode_start'] = {'player_hp': float(meta['start'][i][0]),
                                          'boss_hp_fraction': float(meta['start'][i][1]),
-                                         'bombs': int(meta['bombs'][i])}
+                                         'bombs': int(meta['bombs'][i]),
+                                         **({'stats': {k: round(float(v), 4) for k, v in zip(W.STAT_KEYS, meta['stats_mod'][i])}}
+                                            if meta['stats_mod'][i].any() else {})}
             infos[i]['episode_stats'] = {k: round(float(v), 2) for k, v in zip(W.EPISODE_STATS, meta['stats'][i])}
             self.returns[i] = 0
             self.lengths[i] = 0
@@ -174,13 +196,37 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
     def __init__(self, n=8, seed=1, chunks=1, device='cuda', reward_profile='combat-v2', start_randomization=None,
                  mode='exact', name='tr', port=27400, nice=19, history=HISTORY, capacity=ENTITY_CAPACITY,
                  startup_timeout=600, tasks=None, binary_obs=True, recycle_episodes=W.RECYCLE_EPISODES,
-                 start_bombs=None, plr_levels=None, reward_options=None, lineage_mode=None):
+                 recycle_rss_mib=W.RECYCLE_RSS_MIB,
+                 start_bombs=None, plr_levels=None, reward_options=None, lineage_mode=None,
+                 max_episode_frames=W.MAX_EPISODE_FRAMES, invincible=False, miss_cap=0, target=None,
+                 hurt_ends=False, groups=None, budget='steps', duel=None, frames_per_decision=2, room_buffer=None,
+                 stat_noise=None):
+        """groups (abplus_groups.load_groups) replace tasks / target / max_episode_frames per episode; budget
+        splits the steps between them (abplus_groups.BUDGETS); with plr_levels (plr.group_levels) each group draws
+        its rooms by PLR. duel: a duel spec file's contents (abplus_duel, catalog/duel_rooms.json): n slots are n / 2
+        duel games, the player in slot 2k and the duel NPC in 2k + 1. frames_per_decision: logic frames per action
+        (C39). room_buffer (C39): dict(capacity, fresh_share) for a per-group Room Buffer seed table in shared memory
+        (set_room_buffer)."""
         if reward_profile not in W.REWARD_PROFILES:
             raise ValueError(f'AB+ reward profiles are {W.REWARD_PROFILES} (deadline observation)')
-        if not 1 <= chunks <= n:
-            raise ValueError('chunks must be 1..envs')
+        self.duel = dict(duel) if duel else None
+        self.agents = 2 if self.duel else 1
+        if self.duel and (groups or plr_levels or tasks or target or invincible):
+            raise ValueError('the duel brings its own rooms and NPC (no groups, tasks, target, PLR or invincibility)')
+        if n % self.agents:
+            raise ValueError('duel slots come in pairs: the number of environments must be even')
+        if not 1 <= chunks <= n // self.agents:
+            raise ValueError('chunks must be 1..envs (duel: 1..games)')
         if (history, capacity) != (HISTORY, ENTITY_CAPACITY):
             raise ValueError('The frame record is fixed at 64 frames x 256 entities')
+        if groups and (tasks or target):
+            raise ValueError('parallel task groups bring their own rooms and targets (no tasks or target)')
+        if groups and budget not in BUDGETS:
+            raise ValueError(f'budget must be one of {BUDGETS}')
+        self.groups = [dict(g) for g in groups] if groups else None
+        self.budget = budget if groups else None
+        # slots budget: the group of every environment slot (interleaved; abplus_groups.slot_groups)
+        self.slot_groups = slot_groups([g['share'] for g in self.groups], n) if self.groups else None
         self.device = torch.device(device)
         if self.device.type != 'cuda':
             raise ValueError('AbplusFrameVecEnv feeds GpuMaskablePPO and requires CUDA')
@@ -192,7 +238,14 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
         self.training_seeds = False
         self.closed = True
         self.components = {'combat-v2': W.COMPONENTS, 'combat-v3': W.COMPONENTS_V3,
-                           'combat-v4': W.COMPONENTS_V4, 'combat-v5': W.COMPONENTS_V5}.get(reward_profile)
+                           'combat-v4': W.COMPONENTS_V4, 'combat-v5': W.COMPONENTS_V5,
+                           'combat-hitrate': W.COMPONENTS_HR, 'combat-hitrate-walk': W.COMPONENTS_HRW,
+                           'combat-hitrate-miss': W.COMPONENTS_HRM,
+                           'combat-hitrate-fire': W.COMPONENTS_HRF,
+                           'combat-hitrate-hurt': W.COMPONENTS_HRH, 'combat-hp': W.COMPONENTS_HP,
+                           'combat-hp2': W.COMPONENTS_HP, 'combat-hp2-camera': W.COMPONENTS_HP}.get(reward_profile)
+        if self.components and (reward_options or {}).get('hurt_rest'):
+            self.components = self.components + ('rest',)   # abplus_reward.COMPONENTS_HRM_REST
         # combat-v3 frames add the room state input (abplus_worker.FRAME_DTYPE_COMBAT).
         self.frame_dtype, _ = W.frame_layout(reward_profile)
         # start_bombs {'zero_prob', 'max'}: training bomb start (abplus_worker.sample_bombs); None: 1.
@@ -212,29 +265,55 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
         self.plr_levels = [list(level) for level in plr_levels] if plr_levels else None
         self.plr_shm = self.level_probabilities = None
         if self.plr_levels:
-            if not tasks:
-                raise ValueError('plr_levels need the tasks spec (its kind weights)')
+            if not tasks and not self.groups:
+                raise ValueError('plr_levels need the tasks spec (its kind weights) or groups')
             self.plr_shm = shared_memory.SharedMemory(create=True, size=8 * len(self.plr_levels))
             self.level_probabilities = np.ndarray((len(self.plr_levels),), np.float64, buffer=self.plr_shm.buf)
             # The workers' first episodes start before the learner writes PLR's distribution: the
             # mixture's kind weights over rooms not played yet (not uniform over all rooms).
-            self.level_probabilities[:] = PrioritizedLevels(self.plr_levels, tasks['weights']).probabilities()
+            weights = {g['name']: g['share'] for g in self.groups} if self.groups else tasks['weights']
+            self.level_probabilities[:] = PrioritizedLevels(self.plr_levels, weights).probabilities()
+        # C39 Room Buffer table: seeds (G, K) int64, start probabilities (G, K), fresh start probability (G,).
+        self.buffer_shm = self.buffer_arrays = None
+        if room_buffer:
+            if not self.groups or plr_levels:
+                raise ValueError('the Room Buffer needs parallel task groups and no PLR')
+            g, k = len(self.groups), int(room_buffer['capacity'])
+            self.buffer_shm = shared_memory.SharedMemory(create=True, size=16 * g * k + 8 * g)
+            self.buffer_arrays = (np.ndarray((g, k), np.int64, buffer=self.buffer_shm.buf),
+                                  np.ndarray((g, k), np.float64, buffer=self.buffer_shm.buf, offset=8 * g * k),
+                                  np.ndarray((g,), np.float64, buffer=self.buffer_shm.buf, offset=16 * g * k))
+            self.buffer_arrays[0][:] = -1
+            self.buffer_arrays[1][:] = 0.0
+            self.buffer_arrays[2][:] = 1.0     # every episode fresh until the learner writes the first table
         # tasks: abplus_tasks spec {'weights', 'normal', 'boss'}; None trains the Monstro arena only.
         config = dict(num_envs=n, base_seed=seed, mode=mode, name=name, port=port, nice=nice,
                       start_randomization=self.start_randomization, tasks=tasks, binary_obs=binary_obs,
                       reward_profile=reward_profile, recycle_episodes=recycle_episodes,
+                      recycle_rss_mib=recycle_rss_mib,
                       start_bombs=self.start_bombs, plr_levels=self.plr_levels,
                       plr_shm=self.plr_shm.name if self.plr_shm else None,
                       reward_options=dict(reward_options or {}),
+                      # The hit-rate test: 180 s episodes, an invincible player; combat-hitrate-miss's
+                      # miss cap (bridge abp-0.2.6, 0 = none).
+                      max_episode_frames=int(max_episode_frames), invincible=bool(invincible),
+                      miss_cap=int(miss_cap), target=dict(target) if target else None,
+                      hurt_ends=bool(hurt_ends),   # C37: the first damage ends the episode (abplus_worker)
+                      frames_per_decision=int(frames_per_decision),   # C39
+                      stat_noise=dict(stat_noise) if stat_noise else None,   # C41 (abplus_worker.sample_stats)
+                      room_buffer=(dict(shm=self.buffer_shm.name, groups=len(self.groups), capacity=int(room_buffer['capacity']),
+                                        fresh_share=float(room_buffer['fresh_share'])) if self.buffer_shm else None),
+                      groups=self.groups, budget=self.budget, slot_groups=self.slot_groups,
+                      duel_spec=self.duel, num_games=n // self.agents,
                       **({'lineage_mode': int(lineage_mode)} if lineage_mode is not None else {}))
         ctx = mp.get_context('spawn')
         self.conns, self.procs = [], []
         self.closed = False
         try:
-            for i in range(n):
+            for i in range(n // self.agents):
                 parent, child = ctx.Pipe()
-                proc = ctx.Process(target=W.worker_main, args=(i, config, self.shm.name, child),
-                                   name=f'abplus-worker-{i}')
+                proc = ctx.Process(target=duel_worker_main if self.duel else W.worker_main,
+                                   args=(i, config, self.shm.name, child), name=f'abplus-worker-{i}')
                 proc.start()
                 child.close()
                 self.conns.append(parent)
@@ -250,7 +329,7 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
                     if reply[:1] != b'r':
                         raise RuntimeError(f'AB+ worker failed to start:\n{reply[1:].decode("utf8", "replace")}')
                     pending.discard(conn)
-            boundaries = np.linspace(0, n, chunks + 1, dtype=int)
+            boundaries = np.linspace(0, n // self.agents, chunks + 1, dtype=int) * self.agents
             self.chunks = [AbplusChunk(self, int(boundaries[i]), int(boundaries[i + 1])) for i in range(chunks)]
             self.executor = ThreadPoolExecutor(max_workers=chunks, thread_name_prefix='abplus-frame')
         except BaseException:
@@ -286,6 +365,8 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
                 'worker_errors': int(m['errors'].sum()), 'instance_recycles': int(m['recycles'].sum()),
                 'instance_start_failures': int(m['start_failures'].sum()),
                 'recycle_deferrals': int(m['recycle_deferrals'].sum()),
+                'memory_recycles': int(m['memory_recycles'].sum()),
+                'instance_rss_max_mib': float(m['rss_mib'].max()),
                 'exchange_ms': 1000 * sum(c.exchange_s for c in self.chunks) / max(1, exchanges)}
 
     def step_async(self, actions):
@@ -325,6 +406,10 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
             self.level_probabilities = None
             self.plr_shm.close()
             self.plr_shm.unlink()
+        if self.buffer_shm is not None:
+            self.buffer_arrays = None
+            self.buffer_shm.close()
+            self.buffer_shm.unlink()
 
     def transfer_actions(self, actions):
         """Factored policy actions (move, shoot, bomb, item) -> the workers' (joint, bomb, item)."""
@@ -338,6 +423,13 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
         if self.level_probabilities is None or p.shape != self.level_probabilities.shape:
             raise ValueError('set_level_probabilities needs plr_levels and one probability per level')
         self.level_probabilities[:] = p / p.sum()
+
+    def set_room_buffer(self, seeds, probs, fresh):
+        """The Room Buffer table the workers read at every episode boundary (C39)."""
+        if self.buffer_arrays is None:
+            raise ValueError('set_room_buffer needs room_buffer')
+        s, p, f = self.buffer_arrays
+        s[:], p[:], f[:] = seeds, probs, fresh
 
     def get_attr(self, name, indices=None):
         return [None if name == 'render_mode' else getattr(self, name) for _ in self._get_indices(indices)]

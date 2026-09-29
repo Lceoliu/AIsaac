@@ -15,7 +15,27 @@ as a termination, not a truncation. combat-v3 frames carry the room state input 
 (FRAME_DTYPE_COMBAT, transformer_obs.COMBAT_FIELDS), and training can randomise the bombs the player
 starts with (sample_bombs) and draw rooms by Prioritized Level Replay (PlrTaskChooser reads the
 learner's room distribution from shared memory). Every finished episode reports EPISODE_STATS
-(behaviour: first hit, longest time without a hit, longest stay in one spot, cells, bombs used).
+(behaviour: first hit, longest time without a hit, longest stay in one spot, cells, bombs used,
+tears fired and tears that hit a lineage NPC). The hit-rate test (combat-hitrate) plays with an
+invincible player (config 'invincible') and a longer deadline (config 'max_episode_frames').
+combat-hitrate-fire frames also carry 'credit': the part of the step's reward that belongs to the
+steps its tears were fired in (credit[j - 1]: j steps back), which the learner moves there.
+config 'hurt_ends' (C37, user decision 2026-09-28): the first damage the player takes ends the episode
+as a failure, outcome 'hurt', terminal (no bootstrap); evaluation (abplus_eval) keeps the game's rules.
+The reward sees that step with outcome 'hurt' (combat-hitrate-miss hurt_rest charges the rest of the deadline).
+config 'groups' (parallel task groups, abplus_groups.py): every episode plays one group's rooms, target and
+deadline; config 'budget' and 'slot_groups' decide the group of each slot's next episode (GroupScheduler),
+at the episode boundary. META 'group' is the group of the episode that stepped, 'reset_group' the next one's.
+With PLR (config 'plr_levels': (group, room, arm) levels, plr.group_levels) each group draws its rooms by PLR
+(GroupPlrChooser over that group's levels).
+config 'room_buffer' (C39, room_buffer.py): the learner's per-group seed table in shared memory; at an episode boundary
+the slot plays a buffer seed (replay) or its own next training seed (fresh) of the group the step budget chose, fresh
+or replay by a second step budget per group (GroupScheduler over (fresh, replay), shares fresh_share and the rest).
+An episode that is fresh only because the group's buffer is still empty stays outside that budget (the first rollout
+of a run: counted, it made the next rollouts replay almost only, C39 smoke test). META 'replay' says whether the stepping
+episode replays.
+config 'frames_per_decision' (C39; default 2): the logic frames each action is held for. combat-hp frames
+(C39) carry remaining_time (the deadline of the episode's group), which the learner reads as it is.
 
 Instance recycling: an instance that has played config['recycle_episodes'] episodes (default 200,
 0 = never) is replaced in its background preparation thread, while the other instance plays, so
@@ -47,9 +67,14 @@ from multiprocessing import shared_memory
 import numpy as np
 
 from .abplus import AbplusTransformerEnv, launch_abplus, stop_abplus
-from .abplus_reward import COMPONENTS, COMPONENTS_V3, COMPONENTS_V4, COMPONENTS_V5, REWARDS
+from .abplus_geometry import blocked_moves
+from .abplus_groups import GroupScheduler
+from .abplus_reward import (COMPONENTS, COMPONENTS_HP, COMPONENTS_HR, COMPONENTS_HRF, COMPONENTS_HRH, COMPONENTS_HRM,
+                            COMPONENTS_HRM_REST, COMPONENTS_HRW, COMPONENTS_V3, COMPONENTS_V4, COMPONENTS_V5, CREDIT_STEPS,
+                            REWARDS)
 from .abplus_tasks import TASKS, Task, TaskSampler
-from .transformer_obs import COMBAT_FIELDS, COMBAT_FIELDS_V4, ENTITY_FLAGS, FACTORED_NVEC
+from .transformer_obs import (BIG_TERRAIN, COMBAT_FIELDS, COMBAT_FIELDS_HITRATE, COMBAT_FIELDS_MISS, COMBAT_FIELDS_V4,
+                              ENTITY_FLAGS, FACTORED_NVEC)
 from .combat_reward import combat_v1_reward
 from .steam_watch import steam_running
 
@@ -65,33 +90,71 @@ FRAME_KEYS = ('player', 'player_anim', 'active_kind', 'entities', 'entity_kind',
 # combat-v3: the simulator record plus the room state input (not part of the simulator ABI).
 FRAME_DTYPE_COMBAT = np.dtype(FRAME_DTYPE.descr + [('combat', 'f4', (len(COMBAT_FIELDS),))])
 FRAME_KEYS_COMBAT = FRAME_KEYS + ('combat',)
-EPISODE_STATS = ('first_hit_s', 'longest_no_hit_s', 'longest_stationary_s', 'cells', 'bombs_used')
+EPISODE_STATS = ('first_hit_s', 'longest_no_hit_s', 'longest_stationary_s', 'cells', 'bombs_used', 'shots',
+                 'tear_hits', 'misses')
 # Per-environment side channel: the episode that stepped, the episode that starts after a done,
 # and timings for diagnostics.
 META_DTYPE = np.dtype([
     ('seed', 'i8'), ('start', 'f4', (2,)), ('reset_seed', 'i8'), ('reset_start', 'f4', (2,)),
     ('step_ms', 'f4'), ('switch_wait_ms', 'f4'), ('reset_ms', 'f4'), ('errors', 'i4'), ('episodes', 'i4'),
     ('task', 'i4'), ('reset_task', 'i4'),
-    ('components', 'f4', (max(len(COMPONENTS), len(COMPONENTS_V3), len(COMPONENTS_V4), len(COMPONENTS_V5)),)),
+    ('components', 'f4', (max(len(COMPONENTS), len(COMPONENTS_V3), len(COMPONENTS_V4), len(COMPONENTS_V5),
+                               len(COMPONENTS_HR), len(COMPONENTS_HRW), len(COMPONENTS_HRM), len(COMPONENTS_HRM_REST),
+                               len(COMPONENTS_HRF), len(COMPONENTS_HRH), len(COMPONENTS_HP)),)),
     ('recycles', 'i4'), ('start_failures', 'i4'), ('recycle_deferrals', 'i4'), ('level', 'i4'), ('reset_level', 'i4'),
-    ('bombs', 'i4'), ('reset_bombs', 'i4'), ('stats', 'f4', (len(EPISODE_STATS),))])
-REWARD_PROFILES = ('combat-v1', 'combat-v2', 'combat-v3', 'combat-v4', 'combat-v5')
+    ('bombs', 'i4'), ('reset_bombs', 'i4'), ('stats', 'f4', (len(EPISODE_STATS),)),
+    ('group', 'i4'), ('reset_group', 'i4'),   # parallel task groups (abplus_groups), -1 without
+    ('replay', 'i4'),   # C39: 1 when the stepping episode replays a Room Buffer seed
+    # C39 t3r, written at the end of an episode: the resident memory of the process that played it, which instance
+    # (0 a, 1 b) and its episodes since that process started; recycles started by the memory cap.
+    ('rss_mib', 'f4'), ('instance', 'i4'), ('instance_episodes', 'i4'), ('memory_recycles', 'i4'),
+    ('stats_mod', 'f4', (5,))])   # C41: the stepping episode's stat offsets (STAT_KEYS)
+REWARD_PROFILES = ('combat-v1', 'combat-v2', 'combat-v3', 'combat-v4', 'combat-v5', 'combat-hitrate',
+                   'combat-hitrate-walk', 'combat-hitrate-miss', 'combat-hitrate-fire', 'combat-hitrate-hurt',
+                   'combat-hp', 'combat-hp2', 'combat-hp2-camera')
 # Room state input per profile, and the profiles whose 120 s deadline is an observed termination
-# (combat-v4/v5 truncate at the deadline instead and observe no elapsed time).
-COMBAT_LAYOUTS = {'combat-v3': COMBAT_FIELDS, 'combat-v4': COMBAT_FIELDS_V4, 'combat-v5': COMBAT_FIELDS_V4}
-DEADLINE_PROFILES = ('combat-v1', 'combat-v2', 'combat-v3')
-TRUNCATING_PROFILES = ('combat-v4', 'combat-v5')
+# (combat-v4/v5 and the hit-rate test truncate at the deadline instead and observe no elapsed time).
+COMBAT_LAYOUTS = {'combat-v3': COMBAT_FIELDS, 'combat-v4': COMBAT_FIELDS_V4, 'combat-v5': COMBAT_FIELDS_V4,
+                  'combat-hitrate': COMBAT_FIELDS_HITRATE, 'combat-hitrate-walk': COMBAT_FIELDS_HITRATE,
+                  'combat-hitrate-miss': COMBAT_FIELDS_MISS, 'combat-hitrate-fire': COMBAT_FIELDS_MISS,
+                  'combat-hitrate-hurt': COMBAT_FIELDS_MISS, 'combat-hp': COMBAT_FIELDS_V4, 'combat-hp2': COMBAT_FIELDS_V4,
+                  'combat-hp2-camera': COMBAT_FIELDS_V4}
+# combat-hp (C39) observes the remaining time of its group's deadline, which ends the episode as a termination.
+DEADLINE_PROFILES = ('combat-v1', 'combat-v2', 'combat-v3', 'combat-hp', 'combat-hp2', 'combat-hp2-camera')
+# Frames that carry remaining_time (the deadline differs per group); for the others the learner derives it as
+# 1 - time / 120 (gpu_env.decode_frame).
+STORED_DEADLINE_PROFILES = ('combat-hp', 'combat-hp2', 'combat-hp2-camera')
+# C41 (combat-hp2): rooms of every Basement shape: the terrain on transformer_obs.BIG_TERRAIN, positions in 1x1-room units.
+BIG_ROOM_PROFILES = ('combat-hp2',)
+# C41 as C39's continuation (combat-hp2-camera): the terrain is the camera's 15x9 window, positions in 1x1-room units; the
+# frames and the network are combat-hp's.
+CAMERA_PROFILES = ('combat-hp2-camera',)
+TRUNCATING_PROFILES = ('combat-v4', 'combat-v5', 'combat-hitrate', 'combat-hitrate-walk', 'combat-hitrate-miss',
+                       'combat-hitrate-fire', 'combat-hitrate-hurt')
 # combat-v5 frames: firing geometry (entity flags, fire_distance, the auxiliary labels) and the
 # factored previous action; 'hit' carries the step's hit reward for the learner's diagnostics.
-GEOMETRY_PROFILES = ('combat-v5',)
+# The hit-rate test keeps combat-v5's observation and heads; combat-hitrate-walk measures d_fire
+# (the critic's fire_distance, the approach label) as the walking distance (WALK_PROFILES).
+GEOMETRY_PROFILES = ('combat-v5', 'combat-hitrate', 'combat-hitrate-walk', 'combat-hitrate-miss', 'combat-hitrate-fire',
+                     'combat-hitrate-hurt', 'combat-hp', 'combat-hp2', 'combat-hp2-camera')
+WALK_PROFILES = ('combat-hitrate-walk', 'combat-hitrate-miss', 'combat-hitrate-fire', 'combat-hitrate-hurt', 'combat-hp',
+                 'combat-hp2', 'combat-hp2-camera')
+# combat-hitrate-fire: per step, the reward to move to the steps the tears were fired in (1..CREDIT_STEPS back).
+CREDIT_PROFILES = ('combat-hitrate-fire',)
+CREDIT_FIELDS = [('credit', 'f4', (CREDIT_STEPS,))]
 GEOMETRY_FIELDS = [('entity_flags', 'f4', (256, len(ENTITY_FLAGS))), ('fire_distance', 'f4'), ('aim_label', 'f4'),
-                   ('approach', 'f4', (9,)), ('hit', 'f4')]
+                   ('approach', 'f4', (9,)), ('hit', 'f4'),
+                   # C30: the moves the terrain stops dead (abplus_geometry.blocked_moves), for --block-moves masks;
+                   # not an observation.
+                   ('move_block', 'f4', (9,))]
 GEOMETRY_KEYS = ('entity_flags', 'fire_distance', 'aim_label', 'approach')
-OUTCOMES = ('running', 'death', 'win', 'time_limit', 'error')
+OUTCOMES = ('running', 'death', 'win', 'time_limit', 'error', 'hurt')   # append only: frames store the index
 FULL_START = (6.0, 1.0)  # player half-hearts, Boss HP fraction
 MAX_EPISODE_FRAMES = 3600  # 120 s at 30 logic frames/s
 RECYCLE_EPISODES = 200     # restart an AB+ process after this many episodes (memory leak; 0 = never)
 RETRY_EPISODES = 50        # a deferred or failed recycle is tried again this many episodes later
+RECYCLE_RSS_MIB = 0        # C39 t3r: also restart it once its resident memory reaches this many MiB (0 = never)
+MEMORY_RETRY_EPISODES = 10  # a deferred or failed recycle for memory is tried again this many episodes later
 STARTUP_S = 30.0           # a replacement process must serve the bridge within this time
 
 
@@ -116,14 +179,35 @@ def frame_layout(profile):
     # The simulator record with the one-hot factored previous action in place of (joint, bomb, item, valid).
     base = [('previous_action', 'f4', (sum(FACTORED_NVEC),)) if field[0] == 'previous_action' else field
             for field in FRAME_DTYPE.descr]
-    return np.dtype(base + combat + GEOMETRY_FIELDS), FRAME_KEYS_COMBAT + GEOMETRY_KEYS
+    if profile in BIG_ROOM_PROFILES:   # C41: the terrain canvas of every room shape
+        base = [('terrain', 'f4', (7, *BIG_TERRAIN)) if field[0] == 'terrain' else field for field in base]
+    credit = CREDIT_FIELDS if profile in CREDIT_PROFILES else []
+    deadline = [('remaining_time', 'f4')] if profile in STORED_DEADLINE_PROFILES else []
+    return np.dtype(base + combat + GEOMETRY_FIELDS + credit + deadline), FRAME_KEYS_COMBAT + GEOMETRY_KEYS
 
 
 def observation_options(profile):
     """VisibleHistory / AbplusTransformerEnv options of a reward profile."""
     geometry = profile in GEOMETRY_PROFILES
     return dict(deadline=profile in DEADLINE_PROFILES, combat_state=COMBAT_LAYOUTS.get(profile, False),
-                **(dict(geometry=True, factored_actions=True) if geometry else {}))
+                **(dict(geometry='walk' if profile in WALK_PROFILES else True, factored_actions=True)
+                   if geometry else {}),
+                **(dict(terrain_shape=BIG_TERRAIN, room_scale='fixed') if profile in BIG_ROOM_PROFILES else {}),
+                **(dict(room_scale='camera') if profile in CAMERA_PROFILES else {}))
+
+
+STAT_KEYS = ('speed', 'damage', 'shot_speed', 'tears', 'range')
+
+
+def sample_stats(seed, spec):
+    """C41 (user decisions 2026-09-29): the player's stat offsets of an episode (STAT_KEYS; tears in shots per second,
+    range in Repentance units of 40 px), each uniform in [-a, a] for the spec's half widths {stat: a}; a pure function of
+    the seed, so a replayed seed replays its stats. No spec: None (the base stats)."""
+    if not spec:
+        return None
+    rng = np.random.default_rng([int(seed) & 0xFFFFFFFF, 0x57A75])
+    widths = [float(spec.get(k, 0.0)) for k in STAT_KEYS]
+    return tuple(float(rng.uniform(-a, a)) if a > 0 else 0.0 for a in widths)
 
 
 def sample_bombs(seed, config):
@@ -141,6 +225,25 @@ def level_index(levels, info):
     task = info.get('task', 'arena')
     key = ('arena', 0) if task == 'arena' else (task, int(info.get('room_variant', -1)))
     return levels.get(key, -1)
+
+
+class GroupPlrChooser:
+    """TaskSampler's choose() over one parallel group's PLR levels ((group, room, arm), plr.group_levels): the
+    learner's probabilities restricted to that group's levels."""
+
+    def __init__(self, levels, probabilities, indices):
+        self.levels, self.probabilities = [tuple(level) for level in levels], probabilities
+        self.indices = np.asarray(indices, np.int64)
+        if not len(self.indices):
+            raise ValueError('a PLR group needs levels')
+
+    def choose(self, seed, retry=0):
+        rng = np.random.default_rng([int(seed) & 0xFFFFFFFF, 0x9E8, int(retry)])
+        p = np.clip(np.asarray(self.probabilities, np.float64)[self.indices], 0.0, None)
+        p = p / p.sum() if p.sum() > 0 else np.full(len(p), 1.0 / len(p))
+        i = min(int(np.searchsorted(np.cumsum(p), rng.random(), side='right')), len(p) - 1)
+        _, variant, arm = self.levels[int(self.indices[i])]
+        return Task('normal', int(variant), int(rng.integers(4)), int(arm))
 
 
 class PlrTaskChooser:
@@ -170,6 +273,13 @@ class EpisodeStats:
         self.anchor = tuple(p['pos'])
         self.cells = {self.cell(p['pos'])}
         self.bombs0 = self.bombs = int(p['bombs'])
+        self.shots0 = self.shots = self.fired(obs)
+        self.hits0 = self.hits = int(obs['combat'].get('tear_hits', 0))
+        self.misses0 = self.misses = int(obs['combat'].get('tear_misses', 0))
+
+    @staticmethod
+    def fired(obs):
+        return int(obs.get('events', {}).get('tears', 0))
 
     @staticmethod
     def cell(pos):
@@ -191,11 +301,20 @@ class EpisodeStats:
             self.anchor, self.anchor_t = pos, self.t
         self.cells.add(self.cell(pos))
         self.bombs = int(p['bombs'])
+        self.shots = self.fired(obs)
+        self.hits = int(obs['combat'].get('tear_hits', 0))
+        self.misses = int(obs['combat'].get('tear_misses', 0))
 
     def array(self):
         return np.array([self.first_hit, max(self.no_hit, self.t - self.last_hit),
-                         max(self.stationary, self.t - self.anchor_t), len(self.cells), self.bombs0 - self.bombs],
-                        np.float32)
+                         max(self.stationary, self.t - self.anchor_t), len(self.cells), self.bombs0 - self.bombs,
+                         self.shots - self.shots0, self.hits - self.hits0, self.misses - self.misses0], np.float32)
+
+
+def recycle_threshold(base, index):
+    """Episodes an instance of slot `index` plays before its process is replaced: base .. 2 base - 1, spread over the slots
+    (0: never)."""
+    return base + (index * 61) % base if base > 0 else 0
 
 
 def episode_seed(config, index, episode):
@@ -242,6 +361,7 @@ class Instance:
         self.result = self.error = None
         self.episodes = 0   # episodes prepared since this process started
         self.recycles = self.start_failures = self.recycle_deferrals = 0
+        self.memory_retry_at = 0   # episodes of this process before which the memory cap starts no recycle
         self.launch()
 
     @property
@@ -252,20 +372,52 @@ class Instance:
     def port(self):
         return self.ports[self.slot]
 
+    def rss_mib(self):
+        """Resident memory of the game process in MiB (0 when it cannot be read; run_instance.sh execs the game, so
+        the pid is the game's)."""
+        try:
+            with open(f'/proc/{self.proc.pid}/status') as f:
+                for line in f:
+                    if line.startswith('VmRSS:'):
+                        return int(line.split()[1]) / 1024
+        except (AttributeError, OSError, ValueError):
+            pass
+        return 0.0
+
     def _env(self, port):
-        env = FrameEnv(port=port, max_episode_frames=MAX_EPISODE_FRAMES,
+        frames = int(self.config.get('max_episode_frames', MAX_EPISODE_FRAMES))
+        env = FrameEnv(port=port, max_episode_frames=frames, deadline_s=frames / 30,
+                       frames_per_decision=int(self.config.get('frames_per_decision', 2)),
                        **observation_options(self.config.get('reward_profile')))
         env.bridge.binary_obs = self.config.get('binary_obs', True)
         env.bridge.lineage_mode = int(self.config.get('lineage_mode', env.bridge.lineage_mode))
+        env.bridge.invincible = bool(self.config.get('invincible', False))
+        env.bridge.miss_cap = int(self.config.get('miss_cap', 0))
+        env.bridge.target = self.config.get('target')   # single-enemy aiming arena (C22)
         spec = self.config.get('tasks')
-        if self.config.get('plr_probabilities') is not None:
+        groups = self.config.get('groups')
+        if groups and self.config.get('plr_probabilities') is not None:
+            # Parallel task groups with PLR: each group draws its (room, arm) levels by PLR; use_group() before a reset.
+            levels = [tuple(level) for level in self.config['plr_levels']]
+            self.samplers = [GroupPlrChooser(levels, self.config['plr_probabilities'],
+                                             [i for i, level in enumerate(levels) if level[0] == g['name']])
+                             for g in groups]
+            env.bridge.tasks, env.bridge.target = self.samplers[0], groups[0].get('target')
+        elif groups:
+            # Parallel task groups: each group's own mixture (target arms included); use_group() before a reset.
+            self.samplers = [TaskSampler(g['spec']['weights'], g['spec']['normal'], g['spec']['boss'],
+                                         (g.get('target') or {}).get('arms')) for g in groups]
+            env.bridge.tasks, env.bridge.target = self.samplers[0], groups[0].get('target')
+        elif self.config.get('plr_probabilities') is not None:
             env.bridge.tasks = PlrTaskChooser(self.config['plr_levels'], self.config['plr_probabilities'])
         else:
-            env.bridge.tasks = TaskSampler(spec['weights'], spec['normal'], spec['boss']) if spec else None
+            # Tier 6 (C28): the target's arms choose the normal rooms (abplus_tasks.target_arm).
+            arms = (self.config.get('target') or {}).get('arms')
+            env.bridge.tasks = TaskSampler(spec['weights'], spec['normal'], spec['boss'], arms) if spec else None
         return env
 
     def launch(self):
-        self.episodes = 0
+        self.episodes = self.memory_retry_at = 0
         self.proc = launch_abplus(self.name, self.port, self.config['mode'], nice=self.config['nice'])
         self.env = self._env(self.port)
 
@@ -279,7 +431,7 @@ class Instance:
             return False
         old = (self.proc, self.name, self.env)
         self.slot, self.proc, self.env = slot, proc, self._env(port)
-        self.episodes = 0
+        self.episodes = self.memory_retry_at = 0
         self._end(*old)
         return True
 
@@ -293,28 +445,45 @@ class Instance:
         elif not steam_running():
             self.recycle_deferrals += 1
             self.episodes = retry_at
+            self.memory_retry_at = retry_at + MEMORY_RETRY_EPISODES
         elif self._replace():
             self.recycles += 1
         else:
             self.start_failures += 1
             self.episodes = retry_at
+            self.memory_retry_at = retry_at + MEMORY_RETRY_EPISODES
 
     def relaunch(self):
         self.close()
         time.sleep(1.0)
         self.launch()
 
-    def prepare(self, seed, start, bombs=1, recycle=False):
-        """Reset for an episode in a background thread; recycle=True first replaces the process."""
+    def use_group(self, group):
+        """The rooms, target and deadline of a parallel task group for the next reset."""
+        g = self.config['groups'][group]
+        self.env.bridge.tasks, self.env.bridge.target = self.samplers[group], g.get('target')
+        self.env.max_episode_frames = int(g['frames'])
+        self.env.history.deadline_s = float(g['seconds'])   # remaining_time (combat-hp)
+
+    def prepare(self, seed, start, bombs=1, group=-1, replay=0, recycle=False):
+        """Reset for an episode in a background thread; recycle=True first replaces the process; group >= 0:
+        an episode of that parallel task group; replay (C39): 1 a Room Buffer seed, 0 a fresh seed, -1 a fresh seed
+        outside the fresh/replay budget (the buffer was empty)."""
         def run():
             try:
                 if recycle:
                     self._recycle()
+                if group >= 0:
+                    self.use_group(group)
                 self.episodes += 1
                 t = time.perf_counter()
-                frame, info = self.env.reset(options={'arena_seed': int(seed), 'start': start, 'bombs': int(bombs)})
+                stats = sample_stats(seed, self.config.get('stat_noise'))   # C41
+                options = {'arena_seed': int(seed), 'start': start, 'bombs': int(bombs)}
+                if stats is not None:
+                    options['stats'] = stats
+                frame, info = self.env.reset(options=options)
                 self.result = (int(seed), tuple(start), int(bombs), frame, info, self.env.history.last_rows,
-                               1000 * (time.perf_counter() - t))
+                               1000 * (time.perf_counter() - t), int(group), int(replay), stats)
             except BaseException:
                 self.error = traceback.format_exc()
             finally:
@@ -361,13 +530,17 @@ class Instance:
         self._stop_process()
 
 
-def write_frame(row, frame, reward, done, truncated, outcome, elapsed, layout, count, hit=0.0):
+def write_frame(row, frame, reward, done, truncated, outcome, elapsed, layout, count, hit=0.0, credit=None, raw=None):
     names = row.dtype.names
-    for key in FRAME_KEYS + ('combat',) + GEOMETRY_KEYS:
+    for key in FRAME_KEYS + ('combat',) + GEOMETRY_KEYS + ('remaining_time',):
         if key in names:
             row[key] = frame[key]
     if 'hit' in names:
         row['hit'] = hit
+    if 'move_block' in names:   # raw: the observation of this frame (None: nothing blocked)
+        row['move_block'] = blocked_moves(raw) if raw is not None else 0.0
+    if 'credit' in names:   # every row, so a reset or error row never keeps the last step's credit
+        row['credit'] = 0.0 if credit is None else credit
     row['reward'] = reward
     row['done'] = int(done)
     row['truncated'] = int(truncated)
@@ -398,29 +571,78 @@ class Worker:
         self.elapsed = 0
         self.last_frame = None
         self.stats = None
-        self.recycle_after = int(config.get('recycle_episodes', RECYCLE_EPISODES))
+        # Staggered by slot (C39 t3 OOM, 09-29 03:06): the slots start together, so one threshold for all of them recycled
+        # a dozen processes within one rollout, each replacement running next to the process it replaces.
+        base = int(config.get('recycle_episodes', RECYCLE_EPISODES))
+        self.recycle_after = recycle_threshold(base, index)
+        self.recycle_rss = float(config.get('recycle_rss_mib', RECYCLE_RSS_MIB))
         self.profile = config.get('reward_profile', 'combat-v1')
         if self.profile not in REWARD_PROFILES:
             raise ValueError(f'unknown reward profile {self.profile!r}')
         self.reward = (REWARDS[self.profile](**config.get('reward_options', {})) if self.profile in REWARDS
                        else None)
+        self.hurt_ends = bool(config.get('hurt_ends', False))
+        self.damage0 = 0.0   # combat.player_damage when the episode started
+        # Parallel task groups: the group of the episode being played and its decisions so far.
+        groups = config.get('groups')
+        self.scheduler = (GroupScheduler([g['share'] for g in groups], config.get('budget', 'steps'),
+                                         (config.get('slot_groups') or [0] * (index + 1))[index]) if groups else None)
+        self.group, self.decisions = -1, 0
+        self.stats_mod = np.zeros(len(STAT_KEYS), np.float32)   # C41
+        self.replay = 0
+        # C39 Room Buffer: seeds (G, K), start probabilities (G, K), (log only) (worker_main maps them); per group a step
+        # budget over (fresh, replay).
+        self.buffer = config.get('buffer_arrays')
+        self.kinds = None
+        if self.buffer is not None and groups:
+            f = float(config['room_buffer']['fresh_share'])
+            self.kinds = [GroupScheduler([f, 1.0 - f], 'steps') for _ in groups]
 
     def schedule(self, episode):
+        """(seed, start, bombs, group, replay) of this slot's episode-th episode: the group from the step budget, then
+        with a Room Buffer a replayed buffer seed (replay 1) or the slot's own fresh seed (0; -1 when the group's buffer is
+        empty, outside the fresh/replay budget). A pure function of the fresh seed and the slot's budget."""
         seed = episode_seed(self.config, self.index, episode)
+        group = self.scheduler.choose(seed) if self.scheduler is not None else -1
+        replay = 0
+        if self.buffer is not None and group >= 0:
+            seeds, probs, _ = self.buffer
+            p = np.clip(np.asarray(probs[group], np.float64), 0.0, None)
+            if p.sum() <= 0:
+                replay = -1
+            elif self.kinds[group].choose(seed) == 1:
+                rng = np.random.default_rng([int(seed) & 0xFFFFFFFF, 0xB0FF])
+                i = min(int(np.searchsorted(np.cumsum(p / p.sum()), rng.random(), side='right')), len(p) - 1)
+                if int(seeds[group, i]) >= 0:
+                    seed, replay = int(seeds[group, i]), 1
         return (seed, sample_start(seed, self.config['start_randomization']),
-                sample_bombs(seed, self.config.get('start_bombs')))
+                sample_bombs(seed, self.config.get('start_bombs')), group, replay)
 
     def _begin(self, instance_index, result):
-        seed, start, bombs, frame, info, rows, reset_ms = result
+        seed, start, bombs, frame, info, rows, reset_ms, group, replay, stats = result
+        self.stats_mod = np.asarray(stats if stats is not None else (0.0,) * len(STAT_KEYS), np.float32)
         self.active = instance_index
+        self.group, self.decisions, self.replay = group, 0, replay
+        if self.kinds is not None and group >= 0 and replay >= 0:
+            self.kinds[group].start(replay)
+        if self.scheduler is not None:
+            self.scheduler.start(group)
+            if self.reward is not None and hasattr(self.reward, 'deadline_s'):
+                # hurt_rest and a death term charge the rest of this group's deadline
+                self.reward.deadline_s = float(self.config['groups'][group]['seconds'])
         self.seed, self.start, self.bombs = seed, start, bombs
         self.layout = int(info.get('room_variant', info.get('arena', {}).get('variant', 0)))
         self.task = TASKS.index(info.get('task', 'arena'))
-        self.level = level_index(self.levels, info)
+        if self.levels and group >= 0:   # parallel groups with PLR: (group, room, arm) levels
+            self.level = self.levels.get((self.config['groups'][group]['name'], int(info.get('room_variant', -1)),
+                                          int(info.get('target_arm', -1))), -1)
+        else:
+            self.level = level_index(self.levels, info)
         self.elapsed = 0
         self.last_frame = frame
         raw = self.instances[instance_index].env.raw_obs
         self.stats = EpisodeStats(raw)
+        self.damage0 = float(raw['combat']['player_damage']) if 'combat' in raw else 0.0
         if self.reward is not None:
             self.reward.reset(raw, TASKS[self.task])
         return frame, rows, reset_ms
@@ -437,15 +659,25 @@ class Worker:
                 except RuntimeError:
                     instance.relaunch()
         start = sample_start(seed, self.config['start_randomization']) if start is None else start
-        first.prepare(seed, start, sample_bombs(seed, self.config.get('start_bombs')))
+        if self.scheduler is not None:
+            self.scheduler.clear_inflight()   # the episodes prepared for the old generation are dropped
+        for kinds in self.kinds or ():
+            kinds.clear_inflight()
+        group = self.scheduler.choose(seed) if self.scheduler is not None else -1
+        # A generation's first episode is the learner's fresh seed (outside the budget while the group's buffer is empty).
+        empty = self.buffer is not None and group >= 0 and not np.asarray(self.buffer[1][group]).sum() > 0
+        first.prepare(seed, start, sample_bombs(seed, self.config.get('start_bombs')), group, -1 if empty else 0)
         frame, rows, reset_ms = self._begin(0, first.take())
-        write_frame(self.step_row, frame, 0.0, False, False, 0, 0, self.layout, rows)
+        write_frame(self.step_row, frame, 0.0, False, False, 0, 0, self.layout, rows, raw=first.env.raw_obs)
         self.instances[1].prepare(*self.schedule(1))
         self.meta['seed'] = self.seed
         self.meta['start'] = self.start
         self.meta['task'] = self.task
         self.meta['level'] = self.level
         self.meta['bombs'] = self.bombs
+        self.meta['group'] = self.meta['reset_group'] = self.group
+        self.meta['replay'] = int(self.replay == 1)
+        self.meta['stats_mod'] = self.stats_mod
         self.meta['reset_ms'] = reset_ms
         self.meta['episodes'] = 0
 
@@ -457,19 +689,32 @@ class Worker:
         self.meta['task'] = self.task
         self.meta['level'] = self.level
         self.meta['bombs'] = self.bombs
+        self.meta['group'] = self.group
+        self.meta['replay'] = int(self.replay == 1)
+        self.meta['stats_mod'] = self.stats_mod
+        self.decisions += 1
         try:
             # The learner masks the bomb from the same frame; a mismatch only drops the bomb.
             if bomb and not active.env.action_masks()[46]:
                 bomb = 0
             frame, reward, terminated, truncated, info = active.env.step(np.array([joint, bomb, item]))
+            if (self.hurt_ends and info['outcome'] == 'running'
+                    and float(active.env.raw_obs['combat']['player_damage']) > self.damage0):
+                # C37: the first damage ends the episode as a failure (terminal): the rest of the room's
+                # rewards are lost; the reward charges the rest of the deadline only with hurt_rest.
+                # The instance is reset for a later episode.
+                info = {**info, 'outcome': 'hurt'}
+                terminated, truncated = True, False
             outcome = OUTCOMES.index(info['outcome'])
             elapsed = int(info['elapsed_frames'])
             self.stats.step(active.env.raw_obs, elapsed - self.elapsed)
-            hit = 0.0
+            hit, credit = 0.0, None
             if self.reward is not None:
                 parts = self.reward.step(active.env.raw_obs, info['outcome'], elapsed - self.elapsed)
                 reward = self.reward.scale * float(sum(parts.values()))
-                hit = float(parts.get('hit', 0.0))
+                hit = float(parts.get('hit', parts.get('damage', 0.0)))   # combat-hp: the monster damage
+                if hasattr(self.reward, 'credit'):
+                    credit = self.reward.scale * self.reward.credit
             else:
                 reward = float(combat_v1_reward(reward, outcome, elapsed))
             done = bool(terminated or truncated)
@@ -477,7 +722,7 @@ class Worker:
             # combat-v4 truncates there (the learner bootstraps the value of the last frame).
             cut = self.profile in TRUNCATING_PROFILES and info['outcome'] == 'time_limit'
             write_frame(self.step_row, frame, reward, done, cut, outcome, elapsed, self.layout,
-                        active.env.history.last_rows, hit)
+                        active.env.history.last_rows, hit, credit, raw=active.env.raw_obs)
             self.last_frame = frame
             self.elapsed = elapsed
         except Exception:
@@ -491,6 +736,10 @@ class Worker:
             active.relaunch()
         self.meta['step_ms'] = 1000 * (time.perf_counter() - t)
         if done:
+            if self.scheduler is not None:
+                self.scheduler.finish(self.group, self.decisions)
+            if self.kinds is not None and self.group >= 0 and self.replay >= 0:
+                self.kinds[self.group].finish(self.replay, self.decisions)
             if self.reward is not None:
                 totals = self.reward.totals_array()
                 self.meta['components'] = np.pad(totals, (0, len(self.meta['components']) - len(totals)))
@@ -514,12 +763,14 @@ class Worker:
             self.meta['switch_wait_ms'] = 1000 * (time.perf_counter() - t)
             old = self.active
             frame, rows, reset_ms = self._begin(standby_index, result)
-            write_frame(self.reset_row, frame, 0.0, False, False, 0, 0, self.layout, rows)
+            write_frame(self.reset_row, frame, 0.0, False, False, 0, 0, self.layout, rows,
+                        raw=self.instances[standby_index].env.raw_obs)
             self.meta['reset_seed'] = self.seed
             self.meta['reset_start'] = self.start
             self.meta['reset_task'] = self.task
             self.meta['reset_level'] = self.level
             self.meta['reset_bombs'] = self.bombs
+            self.meta['reset_group'] = self.group
             self.meta['reset_ms'] = reset_ms
             self.meta['episodes'] = self.episode
             self.meta['recycles'] = sum(instance.recycles for instance in self.instances)
@@ -529,8 +780,15 @@ class Worker:
             # restarting its process first when it has played recycle_after episodes.
             finished = self.instances[old]
             recycle = bool(self.recycle_after) and finished.episodes >= self.recycle_after
-            seed, start, bombs = self.schedule(self.episode + 1)
-            finished.prepare(seed, start, bombs, recycle=recycle)
+            # C39 t3r (09-29 14:59, out of memory on 31 GB): some processes grew by 100-200 MiB a minute while others
+            # stayed at ~290 MiB, so a cap on resident memory bounds each process whatever the cause.
+            rss = finished.rss_mib()
+            self.meta['rss_mib'], self.meta['instance'], self.meta['instance_episodes'] = rss, old, finished.episodes
+            if (not recycle and self.recycle_rss > 0 and rss >= self.recycle_rss
+                    and finished.episodes >= finished.memory_retry_at):
+                recycle = True
+                self.meta['memory_recycles'] += 1
+            finished.prepare(*self.schedule(self.episode + 1), recycle=recycle)
 
     def close(self):
         for instance in self.instances:
@@ -548,6 +806,16 @@ def worker_main(index, config, shm_name, conn):
     frame_dtype, _ = frame_layout(config.get('reward_profile'))
     frames = np.ndarray((2, n), dtype=frame_dtype, buffer=shm.buf)
     meta = np.ndarray((n,), dtype=META_DTYPE, buffer=shm.buf, offset=2 * n * frame_dtype.itemsize)
+    buffer_shm = None
+    if config.get('room_buffer'):
+        # C39: the learner rewrites the Room Buffer table after every rollout.
+        spec = config['room_buffer']
+        g, k = int(spec['groups']), int(spec['capacity'])
+        buffer_shm = shared_memory.SharedMemory(name=spec['shm'])
+        config = {**config, 'buffer_arrays': (
+            np.ndarray((g, k), np.int64, buffer=buffer_shm.buf),
+            np.ndarray((g, k), np.float64, buffer=buffer_shm.buf, offset=8 * g * k),
+            np.ndarray((g,), np.float64, buffer=buffer_shm.buf, offset=16 * g * k))}
     plr_shm = None
     if config.get('plr_shm'):
         # The learner rewrites the room distribution after every rollout (float64 per level).
@@ -585,6 +853,15 @@ def worker_main(index, config, shm_name, conn):
             worker.close()
         del frames, meta
         config.pop('plr_probabilities', None)
+        config.pop('buffer_arrays', None)
+        if worker is not None:   # its reset() copies the config: drop every view of the buffer table
+            worker.buffer = None
+            worker.config.pop('buffer_arrays', None)
         shm.close()
         if plr_shm is not None:
             plr_shm.close()
+        if buffer_shm is not None:
+            try:
+                buffer_shm.close()
+            except BufferError:   # a view still held somewhere: the process ends anyway
+                pass

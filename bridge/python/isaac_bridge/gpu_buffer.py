@@ -68,6 +68,29 @@ class GpuHistoryRolloutBuffer(MaskableDictRolloutBuffer):
         self.rewards[t,workers]=rewards
         self.episode_starts[t,workers]=starts.float()
 
+    def add_credit(self,t,workers,credit):
+        """combat-hitrate-fire: credit[:, j-1] of the reward observed at step t belongs to step t-j, the
+        step its tear was fired in. Stored per step (one copy); apply_credits moves it before GAE."""
+        if getattr(self,'credits',None) is None or self.credits.shape[-1]!=credit.shape[1]:
+            self.credits=torch.zeros((self.buffer_size,self.n_envs,credit.shape[1]),device=self.device)
+        self.credits[t,workers]=credit
+
+    def apply_credits(self):
+        """Move every stored credit from the step it was observed at to the step t-j it belongs to. A
+        credit whose step is before this rollout stays where it was observed. Returns the moved and
+        the kept totals (tensors)."""
+        c=self.credits;k=c.shape[-1];n=self.buffer_size
+        self.rewards-=c.sum(-1)
+        kept=torch.zeros((),device=self.device)
+        for j in range(1,k+1):
+            if j<n:self.rewards[:-j]+=c[j:,:,j-1]
+            head=c[:min(j,n),:,j-1]
+            self.rewards[:head.shape[0]]+=head
+            kept=kept+head.sum()
+        moved=c.sum()-kept
+        c.zero_()
+        return moved,kept
+
     def compute_returns_and_advantage(self,last_values,dones):
         last=torch.zeros(self.n_envs,device=self.device)
         dones=torch.as_tensor(dones,device=self.device)

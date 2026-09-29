@@ -1,0 +1,33 @@
+{
+ "description": "C39 parallel task groups (user decisions 2026-09-28): four groups 1:1:1:1 by collected steps, each episode 180 s; rooms within a group by PLR (train_abplus --room-sampling plr --plr-by-steps)",
+ "groups": [
+  {
+   "name": "normal",
+   "tasks": "scaling_normal_rooms.json",
+   "share": 0.25,
+   "episode_seconds": 180,
+   "about": "491 real Basement I normal rooms with their own enemies"
+  },
+  {
+   "name": "horf",
+   "tasks": "mixture_target_horf.json",
+   "share": 0.25,
+   "episode_seconds": 180,
+   "about": "one Horf in an empty room (C22)"
+  },
+  {
+   "name": "horf_rocks",
+   "tasks": "mixture_target_horf_rocks.json",
+   "share": 0.25,
+   "episode_seconds": 180,
+   "about": "1-3 Horfs in 365 rooms with rocks"
+  },
+  {
+   "name": "spawners",
+   "tasks": "mixture_target_spawners.json",
+   "share": 0.25,
+   "episode_seconds": 180,
+   "about": "one Portal / Mulligan / Nest / Baby Long Legs and 0-3 others in an empty room"
+  }
+ ]
+}

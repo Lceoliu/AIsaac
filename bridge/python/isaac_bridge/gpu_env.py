@@ -180,15 +180,16 @@ class GpuFrameVecEnv(VecEnv):
 def decode_frame(words,space,frame_dtype=FRAME_DTYPE):
     """Observation tensors of packed frame records (frame_dtype: the env's frame_dtype)."""
     result={}
+    stored='remaining_time' in frame_dtype.fields   # combat-hp frames carry it (per-group deadline, C39)
     for k,s in space.spaces.items():
-        if k=='remaining_time':continue
+        if k=='remaining_time' and not stored:continue
         dtype,offset=frame_dtype.fields[k]
         v=words[:,offset//4:(offset+dtype.itemsize)//4]
         if dtype.base==np.dtype('float32'):v=v.view(torch.float32)
         v=v.reshape(len(words),*dtype.shape)
         if k.startswith('entity') or k=='entities':v=v[:,:s.shape[1]]
         result[k]=v
-    if 'remaining_time' in space.spaces:result['remaining_time']=(1-result['time']/120).clamp(0,1)
+    if 'remaining_time' in space.spaces and not stored:result['remaining_time']=(1-result['time']/120).clamp(0,1)
     return result
 
 
@@ -196,3 +197,10 @@ def metadata(words,name,frame_dtype=FRAME_DTYPE):
     dtype,offset=frame_dtype.fields[name]
     v=words[:,offset//4]
     return v.view(torch.float32) if dtype==np.dtype('float32') else v
+
+
+def metadata_array(words,name,frame_dtype=FRAME_DTYPE):
+    """A per-frame array field (e.g. combat-hitrate-fire's 'credit') as an (n, size) tensor."""
+    dtype,offset=frame_dtype.fields[name]
+    v=words[:,offset//4:(offset+dtype.itemsize)//4]
+    return v.view(torch.float32) if dtype.base==np.dtype('float32') else v

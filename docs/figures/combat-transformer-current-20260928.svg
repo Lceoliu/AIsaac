@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1390" viewBox="0 0 2200 1390">
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#425262"/></marker></defs>
+<rect width="2200" height="1390" fill="white"/>
+<text x="65" y="60" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="38" font-weight="700" fill="#263442">Isaac Combat Policy</text>
+<text x="65" y="101" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="400" fill="#586979">Entity-set attention + spatial CNN + finite-window causal Transformer</text>
+<text x="2135" y="63" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" fill="#64788a">CURRENT IMPLEMENTATION</text>
+<text x="2135" y="98" text-anchor="end" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#64788a">C37 configuration / 28 Sep 2026</text>
+<rect x="55" y="145" width="2090" height="570" rx="5" fill="#fcfdfe" stroke="#d5dde4" stroke-width="1.6"/>
+<text x="80" y="183" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" fill="#263442">(a) Shared per-frame encoder</text>
+<text x="80" y="212" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#637385">Structured game observations, not image pixels</text>
+<rect x="85" y="239" width="315" height="88" rx="5" fill="#f4f6f8" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="242.5" y="277.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Player &amp; room state</text>
+<text x="242.5" y="307.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Stats, animation, item, timer</text>
+<rect x="455" y="239" width="335" height="88" rx="5" fill="#eaf1f7" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="622.5" y="277.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Player encoder</text>
+<text x="622.5" y="307.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Embeddings + MLP → 64</text>
+<path d="M 400,283 L 455,283" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="85" y="361" width="315" height="100" rx="5" fill="#f4f6f8" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="242.5" y="391.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#263442">Entity set  (N ≤ 256)</text>
+<text x="242.5" y="421.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Geometry, motion, flags,</text>
+<text x="242.5" y="449.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">type / variant / subtype, anim.</text>
+<rect x="455" y="361" width="335" height="100" rx="5" fill="#eaf1f7" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="622.5" y="405.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#263442">Shared entity encoder</text>
+<text x="622.5" y="435.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Embeddings + MLP → N × 128</text>
+<path d="M 400,411 L 455,411" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="880" y="358" width="410" height="105" rx="5" fill="#e7eef5" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="1085.0" y="390.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Entity cross-attention</text>
+<text x="1085.0" y="420.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">4 player-conditioned queries</text>
+<text x="1085.0" y="448.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">4 heads; output 4 × 128 → 512</text>
+<path d="M 790,411 L 880,411" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="831" y="401" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#263442">K,V</text>
+<path d="M 790,283 L 835,283 L 835,376 L 880,376" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="850" y="312" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#263442">Q = learned queries + Wp</text>
+<text x="902" y="491" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#66798c">Entity padding mask + learned null entity</text>
+<rect x="85" y="510" width="315" height="80" rx="5" fill="#f4f6f8" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="242.5" y="544.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Terrain grid</text>
+<text x="242.5" y="574.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">7 × 9 × 15</text>
+<rect x="455" y="510" width="335" height="80" rx="5" fill="#eaf1f7" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="622.5" y="544.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Spatial CNN</text>
+<text x="622.5" y="574.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Conv 7→16→32; flatten → 128</text>
+<path d="M 400,550 L 455,550" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="85" y="623" width="315" height="68" rx="5" fill="#f4f6f8" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="242.5" y="651.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#263442">Previous action</text>
+<text x="242.5" y="681.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">18-dimensional one-hot</text>
+<rect x="455" y="623" width="335" height="68" rx="5" fill="#eaf1f7" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="622.5" y="651.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#263442">Action projection</text>
+<text x="622.5" y="681.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Linear 18 → 32</text>
+<path d="M 400,657 L 455,657" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1400" y="268" width="285" height="387" rx="5" fill="#e8f0ed" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="1542.5" y="399.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#263442">Feature fusion</text>
+<text x="1542.5" y="429.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Concatenate</text>
+<text x="1542.5" y="457.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">64 + 512 + 128 + 32</text>
+<text x="1542.5" y="485.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442"></text>
+<text x="1542.5" y="513.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">736 → 256</text>
+<text x="1542.5" y="541.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">LayerNorm + GELU</text>
+<path d="M 790,260 L 1350,260 L 1350,325 L 1400,325" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1303" y="247" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#263442">64</text>
+<path d="M 1290,411 L 1400,411" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1324" y="400" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#263442">512</text>
+<path d="M 790,550 L 1400,550" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1314" y="538" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#263442">128</text>
+<path d="M 790,657 L 1350,657 L 1350,612 L 1400,612" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1304" y="645" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#263442">32</text>
+<rect x="1780" y="415" width="290" height="92" rx="5" fill="#e8f0ed" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="1925.0" y="455.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="26" font-weight="700" fill="#263442">Frame token zₜ</text>
+<text x="1925.0" y="485.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">256 dimensions</text>
+<path d="M 1685,461 L 1780,461" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1778" y="556" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#657487">No entity-to-entity Transformer</text>
+<text x="1778" y="584" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#657487">No explicit entity–map cross-attention</text>
+<text x="780" y="733" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#556778">One token per time step; shared frame-encoder weights</text>
+<rect x="55" y="782" width="1100" height="467" rx="5" fill="#fcfdfe" stroke="#d5dde4" stroke-width="1.6"/>
+<text x="80" y="817" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" fill="#263442">(b) Temporal backbone</text>
+<rect x="85" y="861" width="245" height="143" rx="5" fill="#e8f0ed" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="207.5" y="898.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="22" font-weight="700" fill="#263442">Token history</text>
+<text x="207.5" y="928.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">H = 64 tokens</text>
+<text x="207.5" y="956.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">64 × 256</text>
+<text x="207.5" y="984.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">~4.3 s at 15 decisions/s</text>
+<path d="M 330,930 L 372,930" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<circle cx="394" cy="930" r="20" fill="white" stroke="#8fa3b5" stroke-width="1.8"/>
+<text x="394" y="939" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="28" font-weight="400" fill="#263442">+</text>
+<path d="M 415,930 L 460,930" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="460" y="850" width="350" height="210" rx="5" fill="#e7eef5" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="635.0" y="907.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#263442">Causal Transformer × 4</text>
+<text x="635.0" y="937.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">d_model = 256; 8 heads</text>
+<text x="635.0" y="965.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">FFN 256 → 1024 → 256</text>
+<text x="635.0" y="993.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Pre-LN; GELU; dropout = 0</text>
+<text x="635.0" y="1021.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Causal + history padding masks</text>
+<rect x="85" y="1091" width="405" height="80" rx="5" fill="#f4f6f8" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="287.5" y="1125.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" fill="#263442">Relative-time sinusoidal encoding</text>
+<text x="287.5" y="1155.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Relative elapsed time × 15</text>
+<path d="M 394,1091 L 394,951" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="870" y="866" width="255" height="129" rx="5" fill="#e8f0ed" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="997.5" y="910.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#263442">Readout</text>
+<text x="997.5" y="940.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Final LayerNorm</text>
+<text x="997.5" y="968.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Last valid token hₜ ∈ R²⁵⁶</text>
+<path d="M 810,930 L 870,930" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="85" y="1212" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#637385">Finite causal window, not Transformer-XL recurrence or persistent KV memory.</text>
+<text x="1225" y="817" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="25" font-weight="700" fill="#263442">(c) Policy, value and auxiliary branches</text>
+<path d="M 1125,930 L 1188,930" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round"/>
+<path d="M 1188,872 L 1188,1182" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round"/>
+<rect x="1230" y="843" width="275" height="79" rx="5" fill="#edf2f8" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="1367.5" y="876.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Actor MLP</text>
+<text x="1367.5" y="906.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">256 → 256; Tanh</text>
+<path d="M 1188,882 L 1230,882" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1610" y="841" width="475" height="105" rx="5" fill="#edf2f8" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="1847.5" y="873.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Factorized action logits</text>
+<text x="1847.5" y="903.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Move 9 | Shoot 5 | Bomb 2 | Item 2</text>
+<text x="1847.5" y="931.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Legal-action masks → sample / argmax</text>
+<path d="M 1505,882 L 1610,882" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="1620" y="970" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="400" fill="#68798b">Bomb head retained; current run starts with 0 bombs.</text>
+<rect x="1230" y="1007" width="275" height="83" rx="5" fill="#f3efe7" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="1367.5" y="1042.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Auxiliary MLP</text>
+<text x="1367.5" y="1072.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">256 → 128 (GELU) → 6</text>
+<path d="M 1188,1048 L 1230,1048" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" stroke-dasharray="8 6" marker-end="url(#arrow)"/>
+<rect x="1610" y="1000" width="475" height="105" rx="5" fill="#f3efe7" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="1847.5" y="1032.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Geometry supervision</text>
+<text x="1847.5" y="1062.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Aim: 5 classes, balanced CE (active)</text>
+<text x="1847.5" y="1090.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Distance: 1 scalar (loss weight = 0)</text>
+<path d="M 1505,1048 L 1610,1048" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" stroke-dasharray="8 6" marker-end="url(#arrow)"/>
+<rect x="1230" y="1137" width="275" height="90" rx="5" fill="#eeeaf3" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="1367.5" y="1176.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="23" font-weight="700" fill="#263442">Critic MLP</text>
+<text x="1367.5" y="1206.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">257 → 256; Tanh</text>
+<path d="M 1188,1160 L 1230,1160" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="1610" y="1146" width="475" height="72" rx="5" fill="#eeeaf3" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="1847.5" y="1176.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="24" font-weight="700" fill="#263442">State value V(sₜ)</text>
+<text x="1847.5" y="1206.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">Linear 256 → 1</text>
+<path d="M 1505,1182 L 1610,1182" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="870" y="1105" width="255" height="72" rx="5" fill="#eeeaf3" stroke="#aab6c1" stroke-width="1.6"/>
+<text x="997.5" y="1135.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="21" font-weight="700" fill="#263442">Geometry scalar</text>
+<text x="997.5" y="1165.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="400" fill="#263442">fire_distance = d_fire / 40</text>
+<path d="M 1125,1141 L 1148,1141 L 1148,1235 L 1210,1235 L 1210,1200 L 1230,1200" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" stroke-dasharray="8 6" marker-end="url(#arrow)"/>
+<text x="1280" y="1243" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="400" fill="#70617f">Critic-only concatenation: [hₜ ; fire_distance]</text>
+<path d="M 2070,461 L 2110,461 L 2110,742 L 35,742 L 35,930 L 85,930" fill="none" stroke="#425262" stroke-width="2.2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<line x1="65" y1="1280" x2="2135" y2="1280" stroke="#cad3dc" stroke-width="1.4"/>
+<text x="70" y="1310" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#526577">Solid arrows: policy/value forward path. Dashed branches: auxiliary supervision or critic-only geometry input.</text>
+<text x="70" y="1340" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="19" font-weight="400" fill="#526577">Geometry labels and fire_distance are not direct actor inputs. PPO updates the shared encoder and temporal backbone.</text>
+<text x="70" y="1368" text-anchor="start" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="400" fill="#6d7e8d">Source: transformer_policy.py · transformer_obs.py · train_abplus.py · EXPERIMENTS.md (C37). Diagram is code-derived; no model changes.</text>
+</svg>

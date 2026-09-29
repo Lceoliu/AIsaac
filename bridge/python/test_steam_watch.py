@@ -97,7 +97,7 @@ class FakeEnv:
     def __init__(self, port, **kwargs):
         self.port = port
         self.closed = False
-        self.bridge = mock.Mock()
+        self.bridge = mock.Mock(lineage_mode=1)   # the worker reads it as the default lineage mode
 
     def close(self):
         self.closed = True

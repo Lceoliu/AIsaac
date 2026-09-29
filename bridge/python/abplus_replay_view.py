@@ -10,6 +10,9 @@ blocking HP (the NPCs that keep the doors shut) and the player's hearts over tim
 re-simulated. Episodes of different runs with the same seed can be switched side by side.
 
 notes.json maps "LABEL|SEED" or "SEED" to a short note shown with the episode.
+
+Duel replays (abplus_eval.py --duel-file) also draw the duel NPC's input and HP; the NPC's HP is the blocking HP line,
+the player's hits and hurts are the duel counters, and the stats show who hit first and who won.
 """
 import argparse
 import gzip
@@ -131,6 +134,7 @@ def park_start(positions, radius=48.0):
 def episode(path, result, meta, label, notes):
     rows = [json.loads(line) for line in gzip.open(path, 'rt', encoding='utf8')]
     seed = rows[0]['metadata']['seed']
+    duel = bool(rows[0]['metadata'].get('duel'))
     first = rows[1]['obs']
     room = first['room']
     gw, gh = room['gw'], room['gh']
@@ -147,11 +151,19 @@ def episode(path, result, meta, label, notes):
         if grid != last_grid:
             grids.append([k, grid])
             last_grid = grid
-        p, c = obs['players'][0], obs['combat']
-        hits = int(c['enemy_damage_events'])
+        p, c, d = obs['players'][0], obs['combat'], obs.get('duel')
+        if d:   # the duel's counters: the player's hits on the NPC and the NPC's on the player; the NPC's HP
+            hits, hurt, blocking = int(d['player']['hits']), int(d['player']['hurt']), float(d['hp'])
+        else:
+            hits, hurt, blocking = int(c['enemy_damage_events']), int(c['player_damage_events']), c['blocking_hp']
         ents = [x for x in (entity(e) for e in obs['entities']) if x]
         frames.append([r1(p['pos'][0]), r1(p['pos'][1]), p['hearts'], p['soul'], move, shot, bomb,
-                       round(c['blocking_hp'], 2), hits, int(c['player_damage_events']), ents])
+                       round(blocking, 2), hits, hurt, ents])
+        if d:
+            da = row.get('duel_action')
+            npc_move, npc_shot = divmod(int(da[0]), 5) if da else (0, 0)
+            frames[-1].append([npc_move, npc_shot, round(float(d['hp']), 2), r1(d['pos'][0]), r1(d['pos'][1]),
+                               int(d['npc_side']['hits'])])
         positions.append(tuple(p['pos']))
         cells.add((round((p['pos'][0] - cell0[1]) / 40), round((p['pos'][1] - cell0[2]) / 40)))
         if k:
@@ -168,24 +180,33 @@ def episode(path, result, meta, label, notes):
     parked = park_start(positions)
     start_npcs = Counter(npc_name(e['type'], e['variant']) for e in first['entities'] if e.get('enemy'))
     note = notes.get(f'{label}|{seed}') or notes.get(str(seed))
+    side = rows[0]['metadata'].get('policy_side')
     # The checkpoint's own reward (abplus_eval reward_v3/v4) when it has one; combat-v2 otherwise.
-    own = next((k for k in ('reward_v5', 'reward_v4', 'reward_v3') if k in result), 'reward_v2')
+    own = next((k for k in ('reward_hp', 'reward_hitrate_hurt', 'reward_hitrate_fire', 'reward_hitrate_miss',
+                            'reward_hitrate_walk', 'reward_hitrate', 'reward_v5', 'reward_v4', 'reward_v3')
+                if k in result), 'reward_v2')
+    fpd = int(meta.get('frames_per_decision', 2))   # C39: logic frames per step
     info = dict(
-        id=f'{label}|{seed}', label=label, seed=seed, task=result.get('task'), outcome=result.get('outcome'),
+        id=f'{label}|{seed}' + (f'|{side}' if side and side != 'both' else ''), label=label, seed=seed,
+        task=result.get('task'), outcome=result.get('outcome'),
         layout=result.get('layout'), room=room.get('name'), shape=[gw, gh], cell0=[cell0[1], cell0[2]],
         max_hearts=first['players'][0]['max_hearts'], steps=len(frames) - 1,
-        seconds=round(result.get('frames', 2 * n) / 30, 1), reward=result.get(own),
-        reward_name='combat-' + own.split('_')[1], components=result.get(own + '_components'),
+        seconds=round(result.get('frames', fpd * n) / 30, 1), step_s=fpd / 30, reward=result.get(own),
+        reward_name='combat-' + own[len('reward_'):].replace('_', '-'), components=result.get(own + '_components'),
         updates=meta.get('updates'), start_bombs=result.get('start_bombs'),
         deterministic=meta.get('deterministic'), sample_seed=meta.get('sample_seed'),
         enemies=[f'{v}× {k}' if v > 1 else k for k, v in start_npcs.most_common()],
         doors=[[d['pos'][0], d['pos'][1], int(d['locked'])] for d in first['doors']],
         stats=dict(cells=len(cells), move=round(moves / n, 2), shoot=round(shots / n, 2),
                    dist_median=round(dists[len(dists) // 2]) if dists else None,
-                   last_hit_s=round(last_hit * 2 / 30, 1), parked_from_s=round(parked * 2 / 30, 1),
+                   last_hit_s=round(last_hit * fpd / 30, 1), parked_from_s=round(parked * fpd / 30, 1),
                    hits=frames[-1][8], hurt=frames[-1][9],
                    blocking=[frames[0][7], frames[-1][7]]),
         note=note)
+    if duel:
+        info['duel'] = dict(sides=rows[0]['metadata'].get('sides'), policy_side=side, first_hit=result.get('first_hit'),
+                            first_hit_s=result.get('first_hit_s'), winner=result.get('winner'), arm=result.get('arm'),
+                            player=(result.get('sides') or {}).get('player'), npc=(result.get('sides') or {}).get('npc'))
     return info, dict(grids=grids, frames=frames)
 
 
@@ -207,10 +228,11 @@ def main():
         results = {}
         for line in (run / 'results.jsonl').read_text(encoding='utf8').splitlines():
             r = json.loads(line)
-            results[r['seed']] = r
+            results[(r['seed'], r.get('policy_side'))] = r   # duel: one per side the checkpoint played
         for path in sorted((run / 'replays').glob('seed-*.jsonl.gz')):
-            seed = int(path.name.split('-')[1])
-            info, data = episode(path, results.get(seed, {}), meta, label, notes)
+            parts = path.name[:-len('.jsonl.gz')].split('-')
+            seed, side = int(parts[1]), (parts[3] if len(parts) > 3 else None)
+            info, data = episode(path, results.get((seed, side), {}), meta, label, notes)
             infos.append(info)
             blocks.append(f'<script type="application/json" id="ep-{len(infos) - 1}">'
                           + json.dumps(data, separators=(',', ':')).replace('</', '<\\/') + '</script>')

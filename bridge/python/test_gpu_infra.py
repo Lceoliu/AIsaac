@@ -22,6 +22,19 @@ def model_for(env,steps=8):
 
 
 @unittest.skipUnless(torch.cuda.is_available(),'CUDA required')
+class LearningRateScheduleTest(unittest.TestCase):
+    """C36: SB3 progress_remaining runs 1 -> 0 over the learn() budget."""
+    def test_shapes(self):
+        from isaac_bridge.gpu_ppo import LearningRateSchedule
+        cos=LearningRateSchedule('cosine',3e-4,3e-5)
+        self.assertAlmostEqual(cos(1.0),3e-4);self.assertAlmostEqual(cos(0.5),1.65e-4);self.assertAlmostEqual(cos(0.0),3e-5)
+        self.assertAlmostEqual(cos(-0.01),3e-5)   # the budget's last partial rollout overshoots slightly
+        lin=LearningRateSchedule('linear',3e-4,3e-5)
+        self.assertAlmostEqual(lin(0.5),1.65e-4);self.assertAlmostEqual(lin(0.1),5.7e-5)
+        self.assertEqual(LearningRateSchedule('constant',3e-4,3e-5)(0.3),3e-4)
+        with self.assertRaises(ValueError):LearningRateSchedule('step',3e-4,3e-5)
+
+
 class GpuInfraTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):torch.set_num_threads(2)

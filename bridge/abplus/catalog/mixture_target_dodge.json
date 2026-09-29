@@ -1,0 +1,126 @@
+{
+ "description": "Mortal dodging arena (user decision 2026-09-28, EXPERIMENTS.md C35): tier 1's rooms (mixture_target_horf.json: the 63 1x1 Basement I normal rooms without any grid entity, emptied) with 1-4 shooters: the target and 0, 1, 2 or 3 extra NPCs (uniform), each one of Horf, Round Worm, Pooter (uniform) - the three enemies whose shots did most of C33's projectile damage (C34); every NPC on an interior cell at least 3 cells from the player, the extras 2 from each other",
+ "sources": {
+  "normal": "mixture_target_horf.json (C22)",
+  "shooters": "C34: projectile hits on C19 seeds by shooter (C33 greedy / sampled): Horf 27 / 36, Round Worm 12 / 10, Pooter 9 / 16"
+ },
+ "weights": {
+  "arena": 0.0,
+  "normal": 1.0,
+  "boss": 0.0
+ },
+ "normal": [
+  0,
+  8,
+  10,
+  18,
+  26,
+  27,
+  39,
+  48,
+  50,
+  67,
+  90,
+  100,
+  104,
+  129,
+  138,
+  146,
+  147,
+  150,
+  156,
+  160,
+  163,
+  180,
+  183,
+  187,
+  190,
+  191,
+  192,
+  193,
+  195,
+  197,
+  199,
+  201,
+  202,
+  203,
+  204,
+  232,
+  238,
+  243,
+  244,
+  253,
+  258,
+  271,
+  297,
+  309,
+  315,
+  320,
+  325,
+  632,
+  652,
+  792,
+  841,
+  853,
+  855,
+  857,
+  871,
+  872,
+  878,
+  904,
+  912,
+  914,
+  915,
+  923,
+  950
+ ],
+ "boss": [],
+ "target": {
+  "types": [
+   {
+    "type": 12,
+    "variant": 0,
+    "name": "Horf"
+   },
+   {
+    "type": 244,
+    "variant": 0,
+    "name": "Round Worm"
+   },
+   {
+    "type": 14,
+    "variant": 0,
+    "name": "Pooter"
+   }
+  ],
+  "min_cells": 3,
+  "extras": {
+   "counts": [
+    0,
+    1,
+    2,
+    3
+   ],
+   "types": [
+    {
+     "type": 12,
+     "variant": 0,
+     "name": "Horf"
+    },
+    {
+     "type": 244,
+     "variant": 0,
+     "name": "Round Worm"
+    },
+    {
+     "type": 14,
+     "variant": 0,
+     "name": "Pooter"
+    }
+   ],
+   "min_cells": 3,
+   "attempts": 200
+  },
+  "name": "躲子弹：Horf / Round Worm / Pooter，共 1–4 只"
+ }
+}
