@@ -1,0 +1,70 @@
+{
+ "description": "Goal-conditioned line C44 (user decisions 2026-09-30): five groups 1:1:1:1:1 by steps, COMBAT trained (stage 2). GOTO_POSITION in emptied 1x1 rooms (8 goals, 8 s each), after a won combat (4 goals), in a real-floor chain (COMBAT in A, 1 goal, GOTO_DOOR to B, COMBAT in B), in emptied rooms of the other shapes (IH, IV, 1x2, IIV, 2x1, IIH, 2x2, L; 8 goals, 15 s each), and the single-room COMBAT (C39's clear). Training rooms: goal_rooms_train.json (393 of C39's 491 1x1 rooms) and goal_big_rooms_train.json (285 of C41's 358); goals drawn straight : detour : dead end = 1 : 2 : 2 in training. Evaluations: the GOTO groups on the held-out rooms (goal_rooms_holdout.json 98, goal_big_rooms_holdout.json 73), the chain and the single-room COMBAT on all 491 1x1 rooms (comparable with M1 / C39); strata drawn uniformly.",
+ "groups": [
+  {
+   "name": "gotoempty",
+   "tasks": "goal_rooms_train.json",
+   "eval_tasks": "goal_rooms_holdout.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "goto_empty",
+   "goals": 8,
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   }
+  },
+  {
+   "name": "combatgoto",
+   "tasks": "goal_rooms_train.json",
+   "eval_tasks": "goal_rooms_holdout.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat_goto",
+   "goals": 4,
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   }
+  },
+  {
+   "name": "chain",
+   "tasks": "goal_rooms_train.json",
+   "eval_tasks": "scaling_normal_rooms.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "chain",
+   "goals": 1,
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   }
+  },
+  {
+   "name": "gotobig",
+   "tasks": "goal_big_rooms_train.json",
+   "eval_tasks": "goal_big_rooms_holdout.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "goto_empty",
+   "goals": 8,
+   "goto_seconds": 15,
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   }
+  },
+  {
+   "name": "combat",
+   "tasks": "goal_rooms_train.json",
+   "eval_tasks": "scaling_normal_rooms.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat"
+  }
+ ]
+}

@@ -871,7 +871,9 @@ class CombatHp:
         self.monster_damage, self.player_damage = damage, hurt
         if outcome == 'win':
             r['clear'] = self.clear
-        elif outcome == 'time_limit':
+        elif outcome in ('time_limit', 'exit'):
+            # 'exit': bridge abp-0.2.13 goal-line runs up to C43 ended a COMBAT option that left its room this way; since
+            # 2026-09-30 (user decision, EXPERIMENTS.md A13) the option goes on and every room's monsters count as ever
             r['timeout'] = -self.timeout
         elif outcome == 'death':
             r['death'] = -self.death
@@ -900,6 +902,94 @@ class CombatHp2(CombatHp):
 
 REWARDS[PROFILE_HP2] = CombatHp2
 REWARDS['combat-hp2-camera'] = CombatHp2   # C41 as C39's continuation: the same reward, the camera's terrain view
+
+
+# ---------------------------------------------------------------------------------------------
+# Goal-conditioned line (rl/docs/GOAL_CONDITIONED_DESIGN.md, user decisions 2026-09-30), profile goal-hp:
+#   COMBAT options (standard single rooms and rooms of a chain): combat-hp2, -1 per half heart (unscaled; -0.1 trained).
+#   GOTO options (GotoReward; the values below unscaled, x 0.1 in training, the user's table in trained units):
+#     goal     +10 when the goal is reached (position: within the radius on some logic frame; door: through the door)
+#     time     -0.1 per decision
+#     shaping  gamma Phi(s') - Phi(s), Phi = -0.2 d_geo / 40 (d_geo: abplus_nav walking distance, cells of 40 px);
+#              Phi = 0 at every true terminal; with a changed map the old state's potential is its own (the map it saw)
+#     hurt     -1 per half heart lost
+#     fail     an early failure (death, leaving through a door on a position task, the wrong door) pays the time it
+#              leaves unused: -0.1 gamma (1 - gamma^N) / (1 - gamma) for the N decisions of the deadline still ahead,
+#              the discounted value of paying -0.1 on each of them (the deadline itself costs nothing more)
+# ---------------------------------------------------------------------------------------------
+PROFILE_GOAL = 'goal-hp'
+COMPONENTS_GOTO = ('goal', 'time', 'shaping', 'hurt', 'fail')
+GOTO = dict(goal=10.0, time=0.1, alpha=0.2, hurt=1.0, gamma=0.999, scale=0.1)
+GOTO_FAILURES = ('death', 'exit', 'wrong_door')
+REWARDS[PROFILE_GOAL] = CombatHp2
+REWARDS['goal-hp2'] = CombatHp2   # C44: goal-hp's rewards; the observation adds the full room
+REWARDS['goal-hp3'] = CombatHp2   # C45: goal-hp2 plus the expert labels (its constants come from the run's reward options)
+
+
+def remaining_time_cost(cost, gamma, n):
+    """The discounted value of paying `cost` on each of the next n decisions: cost * gamma (1 - gamma^n) / (1 - gamma)."""
+    if n <= 0:
+        return 0.0
+    if gamma >= 1.0:
+        return cost * n
+    return cost * gamma * (1.0 - gamma ** n) / (1.0 - gamma)
+
+
+class GotoReward:
+    """Per-option GOTO reward state (overrides: goal, time, alpha, hurt, gamma)."""
+    components = COMPONENTS_GOTO
+    scale = GOTO['scale']
+
+    def __init__(self, goal=None, time=None, alpha=None, hurt=None, gamma=None):
+        self.goal = float(GOTO['goal'] if goal is None else goal)
+        self.time = float(GOTO['time'] if time is None else time)
+        self.alpha = float(GOTO['alpha'] if alpha is None else alpha)
+        self.hurt = float(GOTO['hurt'] if hurt is None else hurt)
+        self.gamma = float(GOTO['gamma'] if gamma is None else gamma)
+
+    def potential(self, distance):
+        return -self.alpha * distance / 40.0
+
+    def reset(self, obs, distance):
+        """The option's start: the player's damage counter and the start's potential (distance None: 0)."""
+        self.player_damage = float(obs['combat']['player_damage'])
+        self.phi = self.potential(distance) if distance is not None else 0.0
+        self.totals = dict.fromkeys(COMPONENTS_GOTO, 0.0)
+
+    def step(self, obs, outcome, distance, decisions_left):
+        """Components of one decision (unscaled). outcome: running, goal, time_limit or one of GOTO_FAILURES; distance:
+        d_geo after the step on the map after it (None: unknown, the potential stays); decisions_left: the deadline's
+        decisions after this one."""
+        r = dict.fromkeys(COMPONENTS_GOTO, 0.0)
+        r['time'] = -self.time
+        hurt = float(obs['combat']['player_damage'])
+        r['hurt'] = -self.hurt * max(0.0, hurt - self.player_damage)
+        self.player_damage = hurt
+        terminal = outcome != 'running'
+        phi = 0.0 if terminal else (self.potential(distance) if distance is not None else self.phi)
+        r['shaping'] = self.gamma * phi - self.phi
+        self.phi = phi
+        if outcome == 'goal':
+            r['goal'] = self.goal
+        elif outcome in GOTO_FAILURES:
+            r['fail'] = -remaining_time_cost(self.time, self.gamma, decisions_left)
+        for k, v in r.items():
+            self.totals[k] += v
+        return r
+
+    def totals_array(self):
+        return np.array([self.totals[k] for k in COMPONENTS_GOTO], np.float32)
+
+
+def describe_goal(**options):
+    """Constants for run configs (goal-conditioned line)."""
+    g = GotoReward(**options.get('goto', {}))
+    return dict(profile=PROFILE_GOAL, stage='goal-conditioned line (user decisions 2026-09-30)',
+                combat=describe_hp2(**options.get('combat', {})),
+                goto=dict(goal=f'+{g.goal:g} at the goal', time=f'-{g.time:g} per decision',
+                          shaping=f'gamma Phi(s\') - Phi(s), Phi = -{g.alpha:g} d_geo / 40, 0 at every terminal, gamma {g.gamma:g}',
+                          hurt=f'-{g.hurt:g} per half heart', fail=f'-{g.time:g} gamma (1 - gamma^N) / (1 - gamma) for the N '
+                          'decisions left, at death / exit / wrong door', training_scale=GotoReward.scale))
 
 
 def describe_hp(**options):

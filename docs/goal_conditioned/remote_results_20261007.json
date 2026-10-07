@@ -1,0 +1,987 @@
+{
+  "observed_at": "2026-10-07T22:35:00+08:00",
+  "scope": "Read-only synchronization of both hosts; no training, game or evaluator launched.",
+  "c64_floor256": {
+    "policy": "<ABP_HOME>/fk2/runs/c64-year/checkpoints/last.pt",
+    "update": 38751,
+    "decisions": 317531400,
+    "greedy": false,
+    "weights_not_exact": [],
+    "mode": "floor",
+    "seeds": "2147492000:256",
+    "frames_per_decision": 4,
+    "episode_seconds": 480.0,
+    "seconds": 93.2,
+    "game_hours": 8.046185185185186,
+    "x_real_time": 310.79685264663806,
+    "errors": 0.0,
+    "empty": 0.0,
+    "groups": {
+      "floor": {
+        "episodes": 256,
+        "floor_clear": 0.703125,
+        "death": 0.1484375,
+        "timeout": 0.1484375,
+        "boss_clear": 0.703125,
+        "rooms_cleared": 3.921875,
+        "rooms_entered": 5.1640625,
+        "hurt_per_floor": 2.390625,
+        "hurt_per_cleared_room": 0.6095617529880478,
+        "clear_without_hit": 0.1171875,
+        "seconds_per_clear": 106.8851851851852
+      }
+    }
+  },
+  "c67": {
+    "training_final_update": 9885,
+    "training_game_hours": 3000.1,
+    "training_wall_hours": 6.21,
+    "final_checkpoint_evaluated": false,
+    "evaluations": [
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-000600.pt",
+        "update": 600,
+        "decisions": 4916860,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 323.1,
+        "game_hours": 1.8326666666666667,
+        "x_real_time": 20.419684308263694,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.8125,
+            "timeout": 0.1875,
+            "stage_reached": {
+              "1": 9,
+              "2": 19,
+              "3": 4
+            },
+            "floors_cleared": 0.84375,
+            "death_stage": {
+              "1": 5,
+              "2": 17,
+              "3": 4
+            },
+            "rooms_cleared": 5.90625,
+            "boss_clear": 0.84375,
+            "hurt_per_run": 4.3125,
+            "seconds": 206.175,
+            "items_taken": 0.03125,
+            "active_uses": 1.53125,
+            "pills_used": 0.0625
+          }
+        },
+        "items": true,
+        "tag": "update-000600"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-001200.pt",
+        "update": 1200,
+        "decisions": 9833609,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 417.9,
+        "game_hours": 2.262296296296296,
+        "x_real_time": 19.48855388051368,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.71875,
+            "timeout": 0.28125,
+            "stage_reached": {
+              "1": 8,
+              "2": 20,
+              "3": 4
+            },
+            "floors_cleared": 0.875,
+            "death_stage": {
+              "1": 3,
+              "2": 17,
+              "3": 3
+            },
+            "rooms_cleared": 6.40625,
+            "boss_clear": 0.875,
+            "hurt_per_run": 4.125,
+            "seconds": 254.50833333333333,
+            "items_taken": 0.03125,
+            "active_uses": 1.34375,
+            "pills_used": 0.03125
+          }
+        },
+        "items": true,
+        "tag": "update-001200"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-001800.pt",
+        "update": 1800,
+        "decisions": 14750239,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 312.3,
+        "game_hours": 1.7810370370370372,
+        "x_real_time": 20.530686305902446,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.71875,
+            "timeout": 0.28125,
+            "stage_reached": {
+              "1": 9,
+              "2": 19,
+              "3": 4
+            },
+            "floors_cleared": 0.84375,
+            "death_stage": {
+              "1": 5,
+              "2": 15,
+              "3": 3
+            },
+            "rooms_cleared": 6.125,
+            "boss_clear": 0.84375,
+            "hurt_per_run": 4.40625,
+            "seconds": 200.36666666666667,
+            "items_taken": 0.0,
+            "active_uses": 1.0625,
+            "pills_used": 0.03125
+          }
+        },
+        "items": true,
+        "tag": "update-001800"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-002400.pt",
+        "update": 2400,
+        "decisions": 19666873,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 318.9,
+        "game_hours": 1.711851851851852,
+        "x_real_time": 19.32476220340755,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.84375,
+            "timeout": 0.15625,
+            "stage_reached": {
+              "1": 8,
+              "2": 19,
+              "3": 5
+            },
+            "floors_cleared": 0.90625,
+            "death_stage": {
+              "1": 4,
+              "2": 19,
+              "3": 4
+            },
+            "rooms_cleared": 6.4375,
+            "boss_clear": 0.90625,
+            "hurt_per_run": 4.53125,
+            "seconds": 192.58333333333334,
+            "items_taken": 0.0,
+            "active_uses": 0.875,
+            "pills_used": 0.0625
+          }
+        },
+        "items": true,
+        "tag": "update-002400"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-003000.pt",
+        "update": 3000,
+        "decisions": 24583523,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 302.7,
+        "game_hours": 1.7137037037037037,
+        "x_real_time": 20.381015306684287,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.84375,
+            "timeout": 0.15625,
+            "stage_reached": {
+              "1": 12,
+              "2": 15,
+              "3": 5
+            },
+            "floors_cleared": 0.78125,
+            "death_stage": {
+              "1": 9,
+              "2": 13,
+              "3": 5
+            },
+            "rooms_cleared": 5.96875,
+            "boss_clear": 0.78125,
+            "hurt_per_run": 4.5625,
+            "seconds": 192.79166666666666,
+            "items_taken": 0.0625,
+            "active_uses": 0.6875,
+            "pills_used": 0.0625
+          }
+        },
+        "items": true,
+        "tag": "update-003000"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-003600.pt",
+        "update": 3600,
+        "decisions": 29500255,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 373.6,
+        "game_hours": 2.1354444444444445,
+        "x_real_time": 20.577087794432547,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.78125,
+            "timeout": 0.21875,
+            "stage_reached": {
+              "1": 8,
+              "2": 18,
+              "3": 6
+            },
+            "floors_cleared": 0.9375,
+            "death_stage": {
+              "1": 5,
+              "2": 15,
+              "3": 5
+            },
+            "rooms_cleared": 6.84375,
+            "boss_clear": 0.9375,
+            "hurt_per_run": 4.59375,
+            "seconds": 240.2375,
+            "items_taken": 0.09375,
+            "active_uses": 0.8125,
+            "pills_used": 0.0625
+          }
+        },
+        "items": true,
+        "tag": "update-003600"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-004200.pt",
+        "update": 4200,
+        "decisions": 34416921,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 322.7,
+        "game_hours": 1.853925925925926,
+        "x_real_time": 20.68216093378783,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.8125,
+            "timeout": 0.1875,
+            "stage_reached": {
+              "1": 9,
+              "2": 16,
+              "3": 7
+            },
+            "floors_cleared": 0.9375,
+            "death_stage": {
+              "1": 5,
+              "2": 15,
+              "3": 6
+            },
+            "rooms_cleared": 6.75,
+            "boss_clear": 0.9375,
+            "hurt_per_run": 4.4375,
+            "seconds": 208.56666666666666,
+            "items_taken": 0.03125,
+            "active_uses": 0.65625,
+            "pills_used": 0.0625
+          }
+        },
+        "items": true,
+        "tag": "update-004200"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-004800.pt",
+        "update": 4800,
+        "decisions": 39333712,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 343.7,
+        "game_hours": 1.8887037037037036,
+        "x_real_time": 19.78275627970129,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.8125,
+            "timeout": 0.1875,
+            "stage_reached": {
+              "1": 9,
+              "2": 16,
+              "3": 7
+            },
+            "floors_cleared": 0.9375,
+            "death_stage": {
+              "1": 6,
+              "2": 13,
+              "3": 7
+            },
+            "rooms_cleared": 6.5625,
+            "boss_clear": 0.9375,
+            "hurt_per_run": 4.5625,
+            "seconds": 212.47916666666666,
+            "items_taken": 0.09375,
+            "active_uses": 0.9375,
+            "pills_used": 0.09375
+          }
+        },
+        "items": true,
+        "tag": "update-004800"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-005400.pt",
+        "update": 5400,
+        "decisions": 44250435,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 352.5,
+        "game_hours": 2.0055185185185187,
+        "x_real_time": 20.481891252955084,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.9375,
+            "timeout": 0.0625,
+            "stage_reached": {
+              "1": 10,
+              "2": 14,
+              "3": 8
+            },
+            "floors_cleared": 0.9375,
+            "death_stage": {
+              "1": 8,
+              "2": 14,
+              "3": 8
+            },
+            "rooms_cleared": 6.3125,
+            "boss_clear": 0.9375,
+            "hurt_per_run": 4.75,
+            "seconds": 225.62083333333334,
+            "items_taken": 0.03125,
+            "active_uses": 0.8125,
+            "pills_used": 0.03125
+          }
+        },
+        "items": true,
+        "tag": "update-005400"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-006000.pt",
+        "update": 6000,
+        "decisions": 49167185,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 340.9,
+        "game_hours": 1.8837777777777778,
+        "x_real_time": 19.893223819301852,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.84375,
+            "timeout": 0.15625,
+            "stage_reached": {
+              "1": 8,
+              "2": 17,
+              "3": 7
+            },
+            "floors_cleared": 0.96875,
+            "death_stage": {
+              "1": 5,
+              "2": 15,
+              "3": 7
+            },
+            "rooms_cleared": 6.75,
+            "boss_clear": 0.96875,
+            "hurt_per_run": 4.875,
+            "seconds": 211.925,
+            "items_taken": 0.03125,
+            "active_uses": 0.3125,
+            "pills_used": 0.09375
+          }
+        },
+        "items": true,
+        "tag": "update-006000"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-006600.pt",
+        "update": 6600,
+        "decisions": 54083817,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 301.6,
+        "game_hours": 1.666851851851852,
+        "x_real_time": 19.896109637488948,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.78125,
+            "timeout": 0.21875,
+            "stage_reached": {
+              "1": 11,
+              "2": 16,
+              "3": 5
+            },
+            "floors_cleared": 0.8125,
+            "death_stage": {
+              "1": 6,
+              "2": 14,
+              "3": 5
+            },
+            "rooms_cleared": 6.59375,
+            "boss_clear": 0.8125,
+            "hurt_per_run": 4.3125,
+            "seconds": 187.52083333333334,
+            "items_taken": 0.03125,
+            "active_uses": 0.25,
+            "pills_used": 0.03125
+          }
+        },
+        "items": true,
+        "tag": "update-006600"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-007200.pt",
+        "update": 7200,
+        "decisions": 59000520,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 370.8,
+        "game_hours": 1.9966296296296298,
+        "x_real_time": 19.384753685724558,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.8125,
+            "timeout": 0.1875,
+            "stage_reached": {
+              "1": 5,
+              "2": 20,
+              "3": 7
+            },
+            "floors_cleared": 1.0625,
+            "death_stage": {
+              "1": 4,
+              "2": 16,
+              "3": 6
+            },
+            "rooms_cleared": 6.90625,
+            "boss_clear": 1.0625,
+            "hurt_per_run": 4.78125,
+            "seconds": 224.62083333333334,
+            "items_taken": 0.0,
+            "active_uses": 0.59375,
+            "pills_used": 0.0625
+          }
+        },
+        "items": true,
+        "tag": "update-007200"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-007800.pt",
+        "update": 7800,
+        "decisions": 63917302,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 310.3,
+        "game_hours": 1.7645555555555554,
+        "x_real_time": 20.47180148243635,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.6875,
+            "timeout": 0.3125,
+            "stage_reached": {
+              "1": 10,
+              "2": 17,
+              "3": 5
+            },
+            "floors_cleared": 0.84375,
+            "death_stage": {
+              "1": 5,
+              "2": 13,
+              "3": 4
+            },
+            "rooms_cleared": 6.28125,
+            "boss_clear": 0.84375,
+            "hurt_per_run": 4.15625,
+            "seconds": 198.5125,
+            "items_taken": 0.0625,
+            "active_uses": 0.5625,
+            "pills_used": 0.0
+          }
+        },
+        "items": true,
+        "tag": "update-007800"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-008400.pt",
+        "update": 8400,
+        "decisions": 68833920,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 335.2,
+        "game_hours": 1.956037037037037,
+        "x_real_time": 21.00755767700875,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.6875,
+            "timeout": 0.3125,
+            "stage_reached": {
+              "1": 8,
+              "2": 18,
+              "3": 6
+            },
+            "floors_cleared": 0.9375,
+            "death_stage": {
+              "1": 3,
+              "2": 13,
+              "3": 6
+            },
+            "rooms_cleared": 6.84375,
+            "boss_clear": 0.9375,
+            "hurt_per_run": 4.125,
+            "seconds": 220.05416666666667,
+            "items_taken": 0.09375,
+            "active_uses": 0.6875,
+            "pills_used": 0.0625
+          }
+        },
+        "items": true,
+        "tag": "update-008400"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-009000.pt",
+        "update": 9000,
+        "decisions": 73750634,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 314.0,
+        "game_hours": 1.787,
+        "x_real_time": 20.487898089171974,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.78125,
+            "timeout": 0.21875,
+            "stage_reached": {
+              "1": 10,
+              "2": 17,
+              "3": 5
+            },
+            "floors_cleared": 0.84375,
+            "death_stage": {
+              "1": 7,
+              "2": 15,
+              "3": 3
+            },
+            "rooms_cleared": 6.375,
+            "boss_clear": 0.84375,
+            "hurt_per_run": 4.65625,
+            "seconds": 201.0375,
+            "items_taken": 0.0625,
+            "active_uses": 0.34375,
+            "pills_used": 0.03125
+          }
+        },
+        "items": true,
+        "tag": "update-009000"
+      },
+      {
+        "policy": "<ABP_HOME>/fk2/runs/c67-run/checkpoints/update-009600.pt",
+        "update": 9600,
+        "decisions": 78667292,
+        "greedy": false,
+        "weights_not_exact": [],
+        "mode": "run",
+        "seeds": "2147490000:32",
+        "frames_per_decision": 4,
+        "episode_seconds": 1800.0,
+        "seconds": 469.7,
+        "game_hours": 2.589,
+        "x_real_time": 19.84330423674686,
+        "errors": 0.0,
+        "empty": 0.0,
+        "groups": {
+          "run": {
+            "episodes": 32,
+            "death": 0.625,
+            "timeout": 0.375,
+            "stage_reached": {
+              "1": 7,
+              "2": 14,
+              "3": 11
+            },
+            "floors_cleared": 1.125,
+            "death_stage": {
+              "1": 3,
+              "2": 11,
+              "3": 6
+            },
+            "rooms_cleared": 7.84375,
+            "boss_clear": 1.125,
+            "hurt_per_run": 4.53125,
+            "seconds": 291.2625,
+            "items_taken": 0.03125,
+            "active_uses": 0.5625,
+            "pills_used": 0.03125
+          }
+        },
+        "items": true,
+        "tag": "update-009600"
+      }
+    ]
+  },
+  "phase_b2": {
+    "summaries": {
+      "m3_nocrn.sum.json": {
+        "run": "m3_nocrn",
+        "updates": 264,
+        "game_hours_trained": 80.1,
+        "actual_game_hours": 64.56,
+        "branch_game_hours": 15.27,
+        "wall_hours": 0.207,
+        "x_real_time_median": 395.0,
+        "errors": 0.0,
+        "b_errors": 0.0,
+        "stalls": 0.0,
+        "totals": {
+          "bp_item": 33.0,
+          "bp_item_left": 287.0,
+          "bp_door": 3321.0,
+          "bp_dropped": 39.0,
+          "b_points": 276.0,
+          "b_branches": 991.0,
+          "b_invalid": 4.0,
+          "b_walk_fail": 6.0,
+          "b_shop_skip": 2.0,
+          "b_unreach_skip": 30.0,
+          "b_twins": 18.0,
+          "b_twin_act_diff": 38.0,
+          "b_pairs": 489.0,
+          "b_noise_pairs": 244.0,
+          "b_cond_pairs": 0.0,
+          "b_archived": 0.0,
+          "choices": 244.0,
+          "b_s": 2244.60814435035,
+          "b_cpu": 180.28693882300004
+        },
+        "snap_miss_calls": 0.0,
+        "labels": {
+          "item_left": 213,
+          "item": 29
+        },
+        "labels_per_actual_game_hour": {
+          "item_left": 3.3,
+          "item": 0.45
+        },
+        "labels_per_wall_hour": {
+          "item_left": 1027.6,
+          "item": 139.9
+        },
+        "points_per_actual_game_hour": {
+          "bp_item": 0.51,
+          "bp_item_left": 4.45
+        },
+        "twins": {
+          "n": 18,
+          "steps": 7634.0,
+          "state_same_all": 0,
+          "act_diff_while_same": 38.0,
+          "first_state_diff": [
+            3,
+            3,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            5,
+            2,
+            2,
+            3,
+            2,
+            2,
+            4
+          ]
+        },
+        "twin_score_diff": {
+          "n": 18,
+          "nonzero": 16,
+          "sd": 0.7116
+        },
+        "score_table": {
+          "item": {
+            "points": 29,
+            "labels": 29,
+            "noise_pairs": 29,
+            "label_sd": 1.329,
+            "noise_sd": 0.498,
+            "label_mean": 0.511,
+            "label_abs_mean": 0.889,
+            "zero_share": 0.069,
+            "signal_share": 0.86,
+            "signal_share_se": 0.047
+          },
+          "item_left": {
+            "points": 215,
+            "labels": 213,
+            "noise_pairs": 213,
+            "label_sd": 1.118,
+            "noise_sd": 0.948,
+            "label_mean": -0.051,
+            "label_abs_mean": 0.807,
+            "zero_share": 0.0,
+            "signal_share": 0.282,
+            "signal_share_se": 0.146
+          }
+        },
+        "score10_table": {
+          "item": {
+            "points": 29,
+            "labels": 29,
+            "noise_pairs": 29,
+            "label_sd": 1.181,
+            "noise_sd": 0.495,
+            "label_mean": 0.409,
+            "label_abs_mean": 0.665,
+            "zero_share": 0.0,
+            "signal_share": 0.825,
+            "signal_share_se": 0.113
+          },
+          "item_left": {
+            "points": 215,
+            "labels": 213,
+            "noise_pairs": 213,
+            "label_sd": 0.727,
+            "noise_sd": 0.562,
+            "label_mean": -0.264,
+            "label_abs_mean": 0.529,
+            "zero_share": 0.0,
+            "signal_share": 0.402,
+            "signal_share_se": 0.158
+          }
+        },
+        "score20_table": {
+          "item": {
+            "points": 29,
+            "labels": 29,
+            "noise_pairs": 29,
+            "label_sd": 1.202,
+            "noise_sd": 0.466,
+            "label_mean": 0.488,
+            "label_abs_mean": 0.728,
+            "zero_share": 0.0,
+            "signal_share": 0.849,
+            "signal_share_se": 0.065
+          },
+          "item_left": {
+            "points": 215,
+            "labels": 213,
+            "noise_pairs": 213,
+            "label_sd": 1.034,
+            "noise_sd": 0.816,
+            "label_mean": -0.164,
+            "label_abs_mean": 0.738,
+            "zero_share": 0.0,
+            "signal_share": 0.377,
+            "signal_share_se": 0.127
+          }
+        },
+        "score30_table": {
+          "item": {
+            "points": 29,
+            "labels": 29,
+            "noise_pairs": 29,
+            "label_sd": 1.284,
+            "noise_sd": 0.476,
+            "label_mean": 0.442,
+            "label_abs_mean": 0.751,
+            "zero_share": 0.0,
+            "signal_share": 0.863,
+            "signal_share_se": 0.058
+          },
+          "item_left": {
+            "points": 215,
+            "labels": 213,
+            "noise_pairs": 213,
+            "label_sd": 1.108,
+            "noise_sd": 0.908,
+            "label_mean": -0.09,
+            "label_abs_mean": 0.763,
+            "zero_share": 0.0,
+            "signal_share": 0.328,
+            "signal_share_se": 0.135
+          }
+        },
+        "outcome_table": {
+          "item": {
+            "points": 29,
+            "labels": 29,
+            "noise_pairs": 29,
+            "label_sd": 2.883,
+            "noise_sd": 1.861,
+            "label_mean": 0.826,
+            "label_abs_mean": 1.976,
+            "zero_share": 0.103,
+            "signal_share": 0.583,
+            "signal_share_se": 0.19
+          },
+          "item_left": {
+            "points": 215,
+            "labels": 213,
+            "noise_pairs": 213,
+            "label_sd": 2.695,
+            "noise_sd": 2.507,
+            "label_mean": 0.429,
+            "label_abs_mean": 1.96,
+            "zero_share": 0.0,
+            "signal_share": 0.135,
+            "signal_share_se": 0.168
+          }
+        },
+        "branch_end_codes": {
+          "item:1": 7,
+          "item:2": 20,
+          "item:3": 3,
+          "item:4": 77,
+          "item:5": 13,
+          "item_left:1": 92,
+          "item_left:3": 32,
+          "item_left:4": 670,
+          "item_left:5": 74,
+          "item_left:6": 2,
+          "item_left:7": 4
+        },
+        "choice_head_last": {
+          "choice_labeled": "242",
+          "choice_train_pairs": "402",
+          "choice_loss": "0.16498276591300964",
+          "choice_spread": "0.37281081080436707",
+          "choice_held_n": "41",
+          "choice_held_acc": "0.4634146341463415",
+          "choice_held_acc_sig": "0.45454545454545453",
+          "choice_held_sig_n": "11",
+          "choice_held_mse": "1.8639676570892334",
+          "choice_held_floor": "0.39344405982552505",
+          "choice_held_corr": "-0.19794579849271132",
+          "choice_held_slope": "-0.3646112825869642",
+          "choice_train_n": "201",
+          "choice_train_acc": "0.845",
+          "choice_train_acc_sig": "1.0",
+          "choice_train_mse": "0.21535080671310425",
+          "choice_train_floor": "0.4133719331886045",
+          "choice_train_corr": "0.8766539815294079",
+          "choice_train_slope": "1.0698594717442487"
+        }
+      }
+    },
+    "default_last_progress": {
+      "b_cond_pairs": "88.0",
+      "b_archived": "107.0"
+    },
+    "interpretation": "Choice head held-out accuracy 0.4634 on 41 cases; no demonstrated generalization benefit."
+  },
+  "local_artifacts": "runs/sync-20261007/{host3080,host3090}/ (gitignored)",
+  "source_decision": "Keep local source: brn2 differs only in older comments in train_tok.py and tok_branch.py; archive older fk2 without overwriting."
+}

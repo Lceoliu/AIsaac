@@ -141,11 +141,32 @@ def resume_model(checkpoint,env,device='cuda'):
     return model,state
 
 
+# Goal-conditioned line (rl/docs/GOAL_CONDITIONED_DESIGN.md): the modules a checkpoint from before it does not have
+# (transformer_policy.GOAL_LINE_MODULES; C44 adds the full-room branch, ROOM_MODULES).
+from .transformer_policy import GOAL_LINE_MODULES, ROOM_MODULES, module_name
+
+
+def _goal_line_key(key):
+    return module_name(key,GOAL_LINE_MODULES)
+
+
+def _room_key(key):
+    return module_name(key,ROOM_MODULES)
+
+
 def warm_start_model(model,checkpoint):
-    """Weights only. New countdown input starts at zero; optimizer/RNG stay fresh."""
+    """Weights only. New countdown input starts at zero; optimizer/RNG stay fresh.
+
+    Into a goal-line policy (CombatTransformer.goal_dim): every source key must exist with the same shape; the target's
+    keys the source lacks must be goal-line modules (GOAL_LINE_MODULES), which keep their fresh values, and the layers that
+    add the goal to the existing computation must still be zero afterwards, so the migrated policy computes the source's
+    function on COMBAT frames. From a goal-line checkpoint (C43: C42's final) every key is there and loads strictly,
+    trained goal layers included."""
     checkpoint=resolve_checkpoint(checkpoint)
     _,params,_=load_from_zip_file(checkpoint/'model.zip',device='cpu')
     source=params['policy'];target=model.policy.state_dict();expanded=[]
+    unknown=[k for k in source if k not in target]
+    if unknown:raise ValueError(f'Checkpoint keys the model does not have: {unknown[:5]}')
     for key,value in source.items():
         if value.shape!=target[key].shape:
             if not (key.endswith('player.0.weight') and value.ndim==2 and
@@ -153,7 +174,67 @@ def warm_start_model(model,checkpoint):
                 raise ValueError(f'Unsupported migration shape: {key}')
             extra=torch.zeros((value.shape[0],1),dtype=value.dtype)
             source[key]=torch.cat([value,extra],dim=1);expanded.append(key)
-    model.policy.load_state_dict(source,strict=True)
+    missing=[k for k in target if k not in source]
+    bad=[k for k in missing if not _goal_line_key(k)]
+    if bad:raise ValueError(f'Model keys missing from the checkpoint: {bad[:5]}')
+    result=model.policy.load_state_dict(source,strict=not missing)
+    if missing and (result.unexpected_keys or set(result.missing_keys)!=set(missing)):
+        raise RuntimeError(f'Unexpected load result: {result}')
+    fe=model.policy.features_extractor
+    goal_source=any(_goal_line_key(k) for k in source)   # a goal-line checkpoint (C42, C43)
+    if getattr(fe,'goal_dim',0) and goal_source:
+        loaded=model.policy.state_dict()
+        if any(not torch.equal(loaded[k].cpu(),source[k]) for k in source if _goal_line_key(k)):
+            raise RuntimeError('Goal-line parameters differ from the checkpoint after loading')
+        if missing and (any(not _room_key(k) for k in missing) or not fe.room_injection_zero()):
+            raise RuntimeError('From a goal-line checkpoint only the full-room branch may be new, and it must start at zero')
+    if getattr(fe,'goal_dim',0) and missing and not goal_source:
+        nav=model.policy.action_net.nav[-1]
+        if not fe.goal_injections_zero() or nav.weight.any() or nav.bias.any() or not fe.room_injection_zero():
+            raise RuntimeError('Goal injections are not zero after the migration')
     if model.policy.optimizer.state:raise RuntimeError('Warm start requires a fresh optimizer')
-    return dict(checkpoint=str(checkpoint),expanded_zero_columns=expanded,
+    return dict(checkpoint=str(checkpoint),expanded_zero_columns=expanded,new_goal_line_keys=len(missing),
                 optimizer_restored=False,episode_state_restored=False)
+
+
+def _optimizer_names(policy,groups):
+    """Parameter names in the flat order of an optimizer state's param_groups: one unnamed group is named_parameters()'s
+    order (every checkpoint before C44); named groups ('shared', 'goal') are GeometryPolicy(lr_groups=True)'s."""
+    named=list(policy.named_parameters())
+    if len(groups)==1 and not groups[0].get('name'):return [n for n,_ in named]
+    order=[]
+    for g in groups:
+        pick={'shared':lambda n:not _goal_line_key(n),'goal':_goal_line_key}.get(g.get('name'))
+        if pick is None:raise RuntimeError(f"unknown optimizer group {g.get('name')!r}")
+        order+=[n for n,_ in named if pick(n)]
+    return order
+
+
+def warm_start_optimizer(model,checkpoint,only=None):
+    """The checkpoint's Adam state for the parameters it shares with the model, matched by name (a goal-line policy has
+    more parameters than a checkpoint from before it, so positions differ; C44's optimizer has named groups); the other
+    parameters keep theirs. only: 'shared' or 'goal' restricts it to that kind of parameter (C44: the shared ones from C39's
+    final, whose frozen stage-1 successors have none; the goal line's from C43's). The parameter order of the checkpoint is
+    that of its own policy, rebuilt from its saved class and arguments."""
+    checkpoint=resolve_checkpoint(checkpoint)
+    data,params,_=load_from_zip_file(checkpoint/'model.zip',device=model.device)
+    saved=params['policy.optimizer']
+    old=data['policy_class'](data['observation_space'],data['action_space'],lambda _:0.0,**data['policy_kwargs'])
+    old_names=_optimizer_names(old,saved['param_groups'])
+    flat=[i for g in saved['param_groups'] for i in g['params']]
+    if len(old_names)!=len(flat):raise RuntimeError('Optimizer state does not match its policy')
+    optimizer=model.policy.optimizer
+    by_id={id(q):n for n,q in model.policy.named_parameters()}
+    new_names=[by_id[id(q)] for g in optimizer.param_groups for q in g['params']]
+    index={n:i for i,n in enumerate(new_names)}
+    state=optimizer.state_dict()
+    keep=(lambda n:True) if only is None else (lambda n:_goal_line_key(n)==(only=='goal'))
+    restored=0
+    for position,name in enumerate(old_names):
+        if name not in index:raise ValueError(f'Checkpoint parameter {name} is not in the model')
+        i=flat[position]
+        if i in saved['state'] and keep(name):
+            state['state'][index[name]]=saved['state'][i];restored+=1
+    optimizer.load_state_dict(state)
+    return dict(optimizer_restored=True,optimizer_state_entries=restored,
+                optimizer_fresh_parameters=len(new_names)-len(old_names),optimizer_only=only)

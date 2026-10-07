@@ -1,0 +1,86 @@
+{
+ "description": "Goal-conditioned line C45 (user decisions 2026-10-01): five groups 1:1:1:1:1 by steps. Emptied-room navigation over the 1x1 and the other-shape rooms together (8 goals; 8 s per goal, 15 s in rooms beyond 1x1), combat then navigation (1x1, 4 goals), the real-floor chain, Basement I boss rooms, and single-room COMBAT over the 1x1 and the other-shape normal rooms. Start: bombs from the run (--start-bombs 0.5:3); half hearts 1 with probability 0.5 else uniform 1-6 in the navigation group (a bomb of its own kills), uniform 1-6 elsewhere. Training rooms exclude the GOTO held-out rooms; GOTO evaluations on them, the chain on all 491 1x1 rooms, the single-room COMBAT on all 849 normal rooms, the boss group on its 82 rooms (validation seeds).",
+ "groups": [
+  {
+   "name": "gotoempty",
+   "tasks": "goal_rooms_all_train.json",
+   "eval_tasks": "goal_rooms_all_holdout.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "goto_empty",
+   "goals": 8,
+   "goto_seconds": 8,
+   "goto_seconds_big": 15,
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   },
+   "start_hp": {
+    "one_prob": 0.5,
+    "min": 1,
+    "max": 6
+   }
+  },
+  {
+   "name": "combatgoto",
+   "tasks": "goal_rooms_train.json",
+   "eval_tasks": "goal_rooms_holdout.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat_goto",
+   "goals": 4,
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   },
+   "start_hp": {
+    "min": 1,
+    "max": 6
+   }
+  },
+  {
+   "name": "chain",
+   "tasks": "goal_rooms_train.json",
+   "eval_tasks": "scaling_normal_rooms.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "chain",
+   "goals": 1,
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   },
+   "start_hp": {
+    "min": 1,
+    "max": 6
+   }
+  },
+  {
+   "name": "boss",
+   "tasks": "scaling2_boss_rooms.json",
+   "eval_tasks": "scaling2_boss_rooms.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat",
+   "start_hp": {
+    "min": 1,
+    "max": 6
+   }
+  },
+  {
+   "name": "combat",
+   "tasks": "goal_rooms_all_train.json",
+   "eval_tasks": "goal_rooms_all.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat",
+   "start_hp": {
+    "min": 1,
+    "max": 6
+   }
+  }
+ ]
+}

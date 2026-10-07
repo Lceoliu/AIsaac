@@ -1,0 +1,32 @@
+{
+ "description": "Goal-conditioned line M2 (GOTO stage 1, user decisions 2026-09-30): GOTO_POSITION in emptied rooms (8 goals), after a won combat (4 goals) and in a real-floor chain (1 goal in A, then GOTO_DOOR to B), 1:1:1 by steps; trained on goal_rooms_train.json (393 of C39's 491 1x1 normal rooms; 20 % per solve class held out, design M2 / E-GOTO); the GOTO groups are evaluated on the 98 held-out rooms, the chain on all 491 (a chain with A and B both held out is rare; comparable with M1, EXPERIMENTS.md A12)",
+ "groups": [
+  {
+   "name": "gotoempty",
+   "tasks": "goal_rooms_train.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "goto_empty",
+   "goals": 8,
+   "eval_tasks": "goal_rooms_holdout.json"
+  },
+  {
+   "name": "combatgoto",
+   "tasks": "goal_rooms_train.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat_goto",
+   "goals": 4,
+   "eval_tasks": "goal_rooms_holdout.json"
+  },
+  {
+   "name": "chain",
+   "tasks": "goal_rooms_train.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "chain",
+   "goals": 1,
+   "eval_tasks": "scaling_normal_rooms.json"
+  }
+ ]
+}

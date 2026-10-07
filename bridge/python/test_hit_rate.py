@@ -252,7 +252,8 @@ class CombatHitRateHurtTest(unittest.TestCase):
     def test_hurt_outcome_is_appended(self):
         """C37: frames store the outcome index, so 'hurt' only extends the table."""
         from isaac_bridge import abplus_worker as W
-        self.assertEqual(W.OUTCOMES, ('running', 'death', 'win', 'time_limit', 'error', 'hurt'))
+        # append only (the goal line adds goal, exit, wrong_door after these)
+        self.assertEqual(W.OUTCOMES[:6], ('running', 'death', 'win', 'time_limit', 'error', 'hurt'))
 
     def test_death_cost_can_be_dropped(self):
         """C36: death=False leaves only the health curve at the lethal hit (no rest-of-deadline, no -5)."""

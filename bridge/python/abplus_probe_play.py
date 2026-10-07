@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from goexplore_abplus import default_bridge_lua, load_spec, parse_seeds
+from goexplore_abplus import default_bridge_lua, default_preload, load_spec, parse_seeds
 from isaac_bridge.abplus_goexplore import Explorer, GxConfig, Instance
 from isaac_bridge.env import BridgeError
 
@@ -95,10 +95,12 @@ def main():
     p.add_argument('--port', type=int, default=27590)
     p.add_argument('--bridge-lua', default=None)
     p.add_argument('--out', required=True)
+    p.add_argument('--no-al-stopped', action='store_true', help='OpenAL source states as the audio thread reports them (A8)')
     args = p.parse_args()
     spec = load_spec(args)
     cfg = GxConfig(frames_per_decision=args.frames_per_decision, bomb_prob=args.bomb_prob, mode=args.mode,
-                   bridge_lua=args.bridge_lua or default_bridge_lua())
+                   bridge_lua=args.bridge_lua or default_bridge_lua(), preload=default_preload(),
+                   al_stopped=not args.no_al_stopped)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     seeds = parse_seeds(args.seeds)

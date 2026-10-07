@@ -11,6 +11,10 @@ re-simulated. Episodes of different runs with the same seed can be switched side
 
 notes.json maps "LABEL|SEED" or "SEED" to a short note shown with the episode.
 
+Goal-line replays (abplus_eval_options.py --replays: whole option sequences, possibly over several rooms) also draw each
+option's target (GOTO_POSITION: the goal and its radius; GOTO_DOOR: the door), the option segments on the timeline and the
+options' outcomes; the doors follow the room.
+
 Duel replays (abplus_eval.py --duel-file) also draw the duel NPC's input and HP; the NPC's HP is the blocking HP line,
 the player's hits and hurts are the duel counters, and the stats show who hit first and who won.
 """
@@ -140,6 +144,8 @@ def episode(path, result, meta, label, notes):
     gw, gh = room['gw'], room['gh']
     cell0 = first['terrain']['cells'][0]
     frames, grids, last_grid = [], [], None
+    goal = bool(rows[0]['metadata'].get('goal'))
+    segments, door_changes, last_room = [], [], None   # goal line: [first, last step, index, task, x, y, radius]
     positions, cells, dists = [], set(), []
     moves = shots = 0
     last_hit, previous_hits = 0, None
@@ -147,6 +153,15 @@ def episode(path, result, meta, label, notes):
         obs, action = row['obs'], row['action']
         move, shot = divmod(int(action[0]), 5) if action else (0, 0)
         bomb = int(action[1]) if action else 0
+        if goal:
+            tag = row.get('option')
+            if tag is not None and (not segments or segments[-1][2] != tag[0]):
+                segments.append([k, k] + list(tag))
+            elif segments:
+                segments[-1][1] = k
+            if obs['room']['room_idx'] != last_room:
+                door_changes.append([k, [[d['pos'][0], d['pos'][1], int(d['locked'])] for d in obs['doors']]])
+                last_room = obs['room']['room_idx']
         grid = grid_string(obs, gw, gh)
         if grid != last_grid:
             grids.append([k, grid])
@@ -195,6 +210,7 @@ def episode(path, result, meta, label, notes):
         reward_name='combat-' + own[len('reward_'):].replace('_', '-'), components=result.get(own + '_components'),
         updates=meta.get('updates'), start_bombs=result.get('start_bombs'),
         deterministic=meta.get('deterministic'), sample_seed=meta.get('sample_seed'),
+        policy_note=meta.get('policy_note'),   # replaces the checkpoint line, e.g. Go-Explore's open-loop replays
         enemies=[f'{v}× {k}' if v > 1 else k for k, v in start_npcs.most_common()],
         doors=[[d['pos'][0], d['pos'][1], int(d['locked'])] for d in first['doors']],
         stats=dict(cells=len(cells), move=round(moves / n, 2), shoot=round(shots / n, 2),
@@ -203,11 +219,28 @@ def episode(path, result, meta, label, notes):
                    hits=frames[-1][8], hurt=frames[-1][9],
                    blocking=[frames[0][7], frames[-1][7]]),
         note=note)
+    if goal:
+        opts = result.get('options') or []
+        info.update(task=result.get('group'), mode=result.get('mode'), layout=result.get('room_variant'),
+                    chain=result.get('chain'),
+                    outcome='completed' if result.get('completed') else (opts[-1]['outcome'] if opts else 'error'),
+                    seconds=round(sum(o.get('frames', 0) for o in opts) / 30, 1),
+                    reward=round(sum(o['ret'] for o in opts if o.get('ret') is not None), 3) if opts else None,
+                    reward_name='goal-hp（各 option 回报之和，训练单位）', components=None,
+                    options=[dict(task=o['task'], outcome=o['outcome'], decisions=o.get('decisions'),
+                                  seconds=round(o.get('frames', 0) / 30, 1), stratum=o.get('stratum'), d0=o.get('d0'),
+                                  walked=o.get('walked'), hurt=o.get('hurt'), ret=o.get('ret')) for o in opts])
+        for seg in segments:
+            index = seg[2]
+            seg.append(opts[index]['outcome'] if index < len(opts) else None)
     if duel:
         info['duel'] = dict(sides=rows[0]['metadata'].get('sides'), policy_side=side, first_hit=result.get('first_hit'),
                             first_hit_s=result.get('first_hit_s'), winner=result.get('winner'), arm=result.get('arm'),
                             player=(result.get('sides') or {}).get('player'), npc=(result.get('sides') or {}).get('npc'))
-    return info, dict(grids=grids, frames=frames)
+    data = dict(grids=grids, frames=frames)
+    if goal:
+        data.update(options=segments, doors=door_changes)
+    return info, data
 
 
 def main():

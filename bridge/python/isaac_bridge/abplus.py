@@ -13,9 +13,12 @@ Monstro position, so the two backends can be compared episode by episode.
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
+import socket
 import subprocess
+import time
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -142,6 +145,54 @@ return tostring(player:GetCollectibleCount()) .. " " .. tostring(player:GetHeart
   " invincible=" .. tostring(invincible) .. " miss_cap=" .. tostring(miss_cap) .. " reseeded=" .. tostring(reseeded)
 """
 
+# Goal-conditioned line (EXPERIMENTS.md A9, rl/docs/GOAL_CONDITIONED_DESIGN.md): the generated floor after `restart 0`
+# (the curses as generated, before anything removes one) and every room descriptor.
+FLOOR_LUA = """
+local level = Game():GetLevel()
+local out = {"curses=" .. tostring(level:GetCurses()), "start=" .. tostring(level:GetStartingRoomIndex())}
+local rooms = level:GetRooms()
+for i = 0, rooms.Size - 1 do
+  local r = rooms:Get(i); local d = r.Data
+  local ok, t, v, sh, doors = pcall(function() return d.Type, d.Variant, d.Shape, d.Doors end)
+  if ok then out[#out + 1] = table.concat({r.SafeGridIndex, t, v, sh, doors}, ",") end
+end
+return table.concat(out, ";")
+"""
+
+# The first room of a chain after the Lua transition into it: ROOM_LUA's player template without barring the doors (they
+# open and close as the engine decides, user decision 2026-09-30); the curses left after the floor check are removed.
+CHAIN_LUA = """
+local game = Game(); local room = game:GetRoom(); local level = game:GetLevel(); local player = Isaac.GetPlayer(0)
+for _, curse in ipairs({{1, 2, 4, 8, 16, 32, 64, 128}}) do pcall(function() level:RemoveCurse(curse) end) end
+for id = 1, CollectibleType.NUM_COLLECTIBLES - 1 do
+  while player:HasCollectible(id) do player:RemoveCollectible(id) end
+end
+player:AddHearts({player_hp} - player:GetHearts())
+player:AddBombs({bombs} - player:GetNumBombs())
+player:AddKeys(-player:GetNumKeys())
+player:AddCoins(-player:GetNumCoins())
+player.Velocity = Vector(0, 0)
+pcall(function() player.FireDelay = 0 end)
+pcall(function() player:ResetDamageCooldown() end)
+local stats = AbpSetStats({stats})
+local reseeded = os.getenv("ABP_RESEED:{rng_seed}")
+local roster = AbpRosterMark({lineage_mode})
+local invincible = AbpSetInvincible({invincible})
+local miss_cap = AbpSetMissCap({miss_cap})
+return "curses=" .. tostring(level:GetCurses()) .. " clear=" .. tostring(room:IsClear()) .. " room=" ..
+  tostring(level:GetCurrentRoomIndex()) .. " roster=" .. tostring(roster) .. " stats=" .. stats .. " reseeded=" .. tostring(reseeded)
+"""
+
+# An emptied room for GOTO practice: every entity but the player removed; the player is put on a cell.
+EMPTY_LUA = """
+for _, e in ipairs(Isaac.GetRoomEntities()) do
+  if e.Type ~= EntityType.ENTITY_PLAYER then e:Remove() end
+end
+local player = Isaac.GetPlayer(0)
+player.Position = Vector({x}, {y}); player.Velocity = Vector(0, 0)
+return "ok"
+"""
+
 # Mixture rooms (normal and boss rooms with their own enemies): the player/level template of the
 # arena, Boss HP start randomisation, then the episode reseed. Doors are barred like the arena's.
 ROOM_LUA = """
@@ -151,6 +202,8 @@ for id = 1, CollectibleType.NUM_COLLECTIBLES - 1 do
   while player:HasCollectible(id) do player:RemoveCollectible(id) end
 end
 player:AddHearts({player_hp} - player:GetHearts())
+-- C49: half hearts beyond the 6 red ones as soul hearts (none before C49)
+player:AddSoulHearts({soul} - player:GetSoulHearts())
 player:AddBombs({bombs} - player:GetNumBombs())
 player:AddKeys(-player:GetNumKeys())
 player:AddCoins(-player:GetNumCoins())
@@ -451,7 +504,9 @@ for _, e in ipairs(Isaac.GetRoomEntities()) do
 end
 return table.concat(s, ",")
 """
-BRIDGE_VERSION = "abp-0.2.12"
+BRIDGE_VERSION = "abp-0.2.15"
+# 2026-10-04: send steps as the bridge's step line when its hello offers it (AbplusTrainingEnv.step_line); 0 = JSON
+STEP_LINE = os.environ.get("ISAAC_RL_STEP_LINE", "1") != "0"
 GOTO_SETTLE_FRAMES = 8
 MAX_ROOM_ATTEMPTS = 16
 MAX_ROOM_RETRIES = 8  # mixture rooms tried per seed before giving up
@@ -466,9 +521,42 @@ def room_seed(seed: int, attempt: int) -> int:
     return ((seed ^ 0x51ED2701) + attempt * 0x9E3779B9) & 0xFFFFFFFF
 
 
-def action_code(move: int, shoot: int, bomb: int = 0, item: int = 0) -> int:
-    """One action of the bridge's play command (abp-0.2.12): move 0-8, shoot 0-4, bomb and item 0/1."""
-    return int(move) + 9 * int(shoot) + 45 * int(bomb) + 90 * int(item)
+MAX_CHAIN_ATTEMPTS = 64   # about half the floors have a usable chain (seed 903: 1 of 12, and that one Lost): 12 failed
+                          # a C42 smoke reset; 64 leaves ~1e-16; seeds done within 12 attempts get the same floor
+CHAIN_REROLL_CURSES = 2 | 4 | 32   # Labyrinth, Lost, Maze: the floor's layout or its doors' destinations change
+CHAIN_SLOTS = {0: -1, 1: -13, 2: 1, 3: 13}   # 1x1 door slots LEFT0 UP0 RIGHT0 DOWN0 -> grid index offset
+
+
+def chain_pairs(floor, start, rooms):
+    """(slot start->A, A, slot A->B, B) of a floor ({grid index: dict(type, variant, shape, doors)}): A and B 1x1 normal
+    rooms (type 1, shape 1) whose variants are in `rooms`, A next to the start room, B next to A (not the start room), each
+    through a door slot both layouts have."""
+    def neighbours(idx):
+        col = idx % 13
+        for slot, offset in CHAIN_SLOTS.items():
+            if (slot == 0 and col == 0) or (slot == 2 and col == 12):
+                continue
+            yield slot, idx + offset
+
+    def fits(room, slot):
+        return (room is not None and room["type"] == 1 and room["shape"] == 1 and room["variant"] in rooms
+                and room["doors"] >= 0 and (room["doors"] >> slot) & 1)
+
+    out = []
+    for slot_a, a in neighbours(start):
+        room_a = floor.get(a)
+        if not fits(room_a, (slot_a + 2) % 4):
+            continue
+        for slot_b, b in neighbours(a):
+            if b != start and (room_a["doors"] >> slot_b) & 1 and fits(floor.get(b), (slot_b + 2) % 4):
+                out.append((slot_a, a, slot_b, b))
+    return out
+
+
+def action_code(move: int, shoot: int, bomb: int = 0, item: int = 0, pill: int = 0) -> int:
+    """One action of the bridge's play command (abp-0.2.12): move 0-8, shoot 0-4, bomb and item 0/1; 2026-10-06 the pill /
+    card action 0/1 (+ 180; the bridge's play_next decodes it)."""
+    return int(move) + 9 * int(shoot) + 45 * int(bomb) + 90 * int(item) + 180 * int(pill)
 
 
 def joint_code(joint: int, bomb: int = 0, item: int = 0) -> int:
@@ -508,12 +596,83 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
     # duel_action is the NPC's (move, shoot) sent with every step (None: no duel NPC action in the step command).
     duel = None
     duel_action = None
+    # abp-0.2.13: (x, y, r) sent with every step: the bridge checks the player's distance each logic frame and ends the step
+    # at the first frame it is <= r (obs['nav']['goal_hit']); None: no goal check.
+    goal = None
+    # abp-0.2.13 goal line: True sends stop_clear with every step: the step ends at the frame the room becomes clear.
+    stop_clear = False
+    # Goal-conditioned line: how a reset builds the episode's start. None: a room of the tasks mixture (every earlier run);
+    # 'chain': a real Basement I floor, the Lua transition into room A, a 1x1 normal neighbour of the start room, with B
+    # a 1x1 normal neighbour of A, both of chain_rooms (variants; _reset_chain); 'goto_room': a room of the mixture
+    # emptied, the player on a random cell of its largest walkable component (_reset_goto_room).
+    reset_mode = None
+    chain_rooms = frozenset()
     binary_obs = False    # format 2 (abp-0.2.1): binary observations decoded by abplus_obs.ObsDecoder
     validate_obs = False  # with binary_obs: receive the JSON observation too and compare every frame
     obs_format = 1
 
+    # 2026-10-06 (the root's first-build hang): a file the bridge writes the port it listens on to (launched with
+    # ISAAC_RL_PORT_FILE, abplus_goexplore.Instance); None: connect to self.port as before.
+    port_file = None
+    process_exit = None   # with port_file: a callable giving the game process's exit status, None while it runs
+    last_cmd = None   # diagnostic: (cmd, monotonic s) of the last JSON command sent (tok_sampler.stall_evidence)
+
+    def _send(self, msg):
+        self.last_cmd = (msg.get("cmd"), round(time.monotonic(), 3))
+        super()._send(msg)
+
+    def _connect_port_file(self):
+        """IsaacBridgeEnv.connect for an instance launched with ISAAC_RL_PORT_FILE (2026-10-06). The bridge binds its
+        port on the game's first logic frame; when another process holds it (a connection of a parked clone whose
+        ephemeral local port it happens to be, or another run's instance) the bind used to fail and the game ran on
+        without a bridge (EXPERIMENTS.md, the first-build hang). Now the bridge then binds a free port, and writes the
+        port it listens on to the file in both cases. This loop connects to the file's port once the file is there, to
+        the configured one before; a connection that brings no hello within 10 s (another process's listener) is
+        dropped and tried again. Ends when abort() sets the port to 0."""
+        configured = self.port
+        deadline = time.monotonic() + self.connect_timeout
+        last_err = None
+        while time.monotonic() < deadline and self.port:
+            # the game process has ended before its bridge answered (seen 2026-10-06: SIGSEGV during start-up, before
+            # main): no use waiting for it (process_exit: set by abplus_goexplore.Instance, None while it runs)
+            ended = self.process_exit() if self.process_exit is not None else None
+            if ended is not None:
+                raise BridgeError(f"the game process ended (exit status {ended}) before its bridge answered")
+            port = configured
+            try:
+                with open(self.port_file) as f:
+                    port = int(f.read().strip())
+            except (OSError, ValueError):
+                pass
+            s = None
+            try:
+                s = socket.create_connection((self.host, port), timeout=5.0)
+                s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                s.settimeout(min(10.0, self.recv_timeout or 10.0))
+                self._sock, self._buf = s, b""
+                self.obs_format = 1
+                hello = self._recv()
+                if hello.get("type") != "hello":
+                    raise BridgeError(f"unexpected first message: {hello}")
+                self.hello = hello
+                self._expect_obs()   # the observation sent with the hello (IsaacTrainingEnv.connect)
+                s.settimeout(self.recv_timeout)
+                if not self.port:   # aborted meanwhile
+                    raise BridgeError("aborted")
+                self.port, self.hello = port, hello
+                return hello
+            except (OSError, BridgeError, ValueError) as exc:
+                last_err = exc
+                if s is not None:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+                self._sock = None
+                time.sleep(0.5)
+        raise BridgeError(f"could not connect to {self.host}:{configured} (port file {self.port_file}): {last_err}")
     def connect(self):
-        hello = super().connect()
+        hello = self._connect_port_file() if self.port_file else super().connect()
         if hello.get("version") != BRIDGE_VERSION:
             # The binary layout and combat-v2's blocking_hp/blocking_points need this exact bridge.
             raise BridgeError(f"abp_bridge.lua is {hello.get('version')}, this client needs {BRIDGE_VERSION}")
@@ -574,6 +733,19 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             self.last_pair = (msg["obs"], binary["obs"])
         return msg
 
+    def abort(self):
+        """Give this client up from another thread (2026-10-05, tok_sampler's start-state time limit: the instance hung
+        during a reset that a helper thread runs). The socket is shut down, so a recv blocked in that thread returns
+        ("connection closed by game"); the port is set to 0, so a connect loop running there (IsaacBridgeEnv.connect
+        retries for connect_timeout) can no longer reach an instance relaunched on the same port."""
+        self.port = 0
+        s = self._sock
+        if s is not None:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
     def lua(self, code: str) -> Optional[str]:
         self._send({"cmd": "lua", "code": code})
         msg = self._recv()
@@ -581,13 +753,118 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             raise BridgeError(f"lua failed: {msg}")
         return msg.get("result")
 
-    def play(self, codes, repeat=None, repeats=None, stop_clear=True):
+    def pickup_block(self, subtype=None, x=None, y=None):
+        """2026-10-07 (tok_branch): make the collectible pedestal holding `subtype` nearest to (x, y) (the player when
+        not given) untakeable for the rest of this process and its clones (bridge pickup_block: MC_PRE_PICKUP_COLLISION
+        answered false for the player's contacts; the player bumps into it, nothing else changes). Returns the answer
+        dict (found 0 / 1, the pedestal's seed, subtype and position)."""
+        msg = {"cmd": "pickup_block"}
+        if subtype is not None:
+            msg["subtype"] = int(subtype)
+        if x is not None and y is not None:
+            msg["x"], msg["y"] = float(x), float(y)
+        self._send(msg)
+        ack = self._recv()
+        if ack.get("type") != "ok" or ack.get("cmd") != "pickup_block":
+            raise BridgeError(f"pickup_block failed: {ack}")
+        return ack
+
+    def reseed(self, value):
+        """2026-10-07 (tok_branch): reseed the game's global MT in place (abp_turbo ABP_RESEED through the bridge's lua
+        command), as fork(reseed=value) does in a new clone. The next observation carries the terrain block again."""
+        return self.lua("return tostring(os.getenv('ABP_RESEED:%d'))" % int(value))
+
+    def fork(self, tag=None, timeout=20.0, alarm=None, reseed=None, lean=None):
+        """A clone of the game in exactly its current state (bridge abp-0.2.14, abp_turbo ABP_FORK): the game process
+        forks; the clone connects back here and is driven like any instance (step, play, lua, fork). Returns a new
+        client of this class with this client's settings; its close() ends the clone process, and so does `alarm` real
+        seconds after the fork (None: abp_turbo's ABP_FORK_ALARM, 120 s; 0: never). With `reseed` the clone reseeds the
+        game's global MT (ABP_RESEED) before it answers: clones of one state then differ in the later random draws.
+        lean=True puts the clone into the bridge's lean mode (no per-frame bookkeeping, observations in the layout of
+        abplus_lean.py: read them with abplus_lean.read_lean, not with step / play).
+        Launch the instance with FORK_ENV. The clone's client shares this client's last observation and terrain cache
+        (neither is changed in place)."""
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(timeout)
+            self._send({"cmd": "fork", "host": "127.0.0.1", "port": listener.getsockname()[1], "tag": tag,
+                        "alarm": alarm, "reseed": reseed, "lean": lean})
+            ack = self._recv()
+            if ack.get("type") != "ok" or ack.get("cmd") != "fork":
+                raise BridgeError(f"fork failed: {ack}")
+            conn, _ = listener.accept()
+        finally:
+            listener.close()
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.settimeout(self.recv_timeout)
+        clone = copy.copy(self)
+        clone._sock, clone._buf = conn, b""
+        clone.decoder = copy.copy(self.decoder)
+        clone.last_obs, clone.last_info = self.last_obs, dict(self.last_info)
+        clone.validation = dict(self.validation)
+        clone.hello = clone._recv()
+        if clone.hello.get("type") != "hello" or not clone.hello.get("clone"):
+            raise BridgeError(f"unexpected first message of the clone: {clone.hello}")
+        clone.pid = int(ack["pid"])
+        return clone
+
+    def fork_many(self, batches, repeat=None, alarm=None, stop_clear=False, self_last=False, stat=False):
+        """Clones of the current state, one per batch of action codes, each playing its batch as `play` would on a
+        fork() clone and reporting only its end (bridge fork_many, 2026-10-04: no connection, hello or observation per
+        clone). Lean mode only. Returns per batch (player 0's total damage taken, dead, played, stop) at the frame the
+        play's observation would have been built, or None for a clone that did not report. self_last: this clone plays
+        the last batch itself (one fork fewer); it is then no longer in its state: close it afterwards.
+        stat (diagnostic, 2026-10-05): each reporter also sends abp_turbo's ABP_FORK_TIMES numbers; they are left in
+        self.fm_stat (batch index -> list of ints), the return value is unchanged."""
+        msg = {"cmd": "fork_many", "batches": [[int(c) for c in b] for b in batches],
+               "repeat": int(repeat or self.action_repeat), "alarm": alarm, "stop_clear": bool(stop_clear),
+               "self_last": bool(self_last)}
+        if stat:
+            msg["stat"] = True
+        self._send(msg)
+        msg = self._recv()
+        if msg.get("type") != "ok" or msg.get("cmd") != "fork_many":
+            raise BridgeError(f"fork_many failed: {msg}")
+        found = {}
+        self.fm_stat = {}
+        for part in str(msg.get("results") or "").split(";"):
+            if part.strip():
+                fields = part.split()
+                i, damage, dead, played, stop = fields[:5]
+                found[int(i)] = (float(damage), dead == "1", int(played), stop)
+                if len(fields) > 5:
+                    self.fm_stat[int(i) - 1] = [int(v) for v in fields[5:]]
+        return [found.get(i + 1) for i in range(len(batches))]
+
+    def step_line(self, move, shoot, bomb=0, item=0, repeat=None, pill=0):
+        """Send a step as the bridge's step line ("S <repeat> <move> <shoot> <bomb> <item>", 2026-10-04: no JSON on
+        either side; the same step as the step command without goal, stop_clear or duel fields) when the bridge's hello
+        offers it (step_line) and ISAAC_RL_STEP_LINE is not 0, else as the JSON step command. Only sends: read the
+        observation as after step (abplus_lean.read_lean in lean mode)."""
+        rep = int(repeat or self.action_repeat)
+        if self.hello.get("step_line") and STEP_LINE:
+            if pill:   # 2026-10-06: the sixth number (bridges that say items = true in their hello)
+                self._sock.sendall(b"S %d %d %d %d %d %d\n" % (rep, move, shoot, bomb, item, pill))
+            else:
+                self._sock.sendall(b"S %d %d %d %d %d\n" % (rep, move, shoot, bomb, item))
+        else:
+            msg = {"cmd": "step", "repeat": rep, "move": int(move), "shoot": int(shoot), "bomb": int(bomb),
+                   "item": int(item)}
+            if pill:
+                msg["pill"] = int(pill)
+            self._send(msg)
+
+    def play(self, codes, repeat=None, repeats=None, stop_clear=True, stop_room=False):
         """Batched replay (bridge abp-0.2.12): the actions (action_code values) back to back, each held for `repeat`
         logic frames (or its entry of `repeats`), exactly as the same step commands; one observation at the end. The
         batch stops early once the player is dead or (stop_clear) the room is clear. Returns (obs, played, stop) with
         stop 'done', 'dead' or 'clear'; the observation's credits cover the whole batch."""
         msg = {"cmd": "play", "actions": [int(c) for c in codes], "repeat": int(repeat or self.action_repeat),
                "stop_clear": bool(stop_clear)}
+        if stop_room:   # 2026-10-07: a room change ends the batch (the old behaviour); default: it ends the action only
+            msg["stop_room"] = True
         if repeats is not None:
             msg["repeats"] = [int(r) for r in repeats]
         self._send(msg)
@@ -599,11 +876,17 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
 
 
     def step(self, action, repeat=None):
-        """IsaacBridgeEnv.step; with duel_action set (abp-0.2.9) the duel NPC's move and shoot go with it."""
-        if self.duel_action is None:
+        """IsaacBridgeEnv.step; with duel_action set (abp-0.2.9) the duel NPC's move and shoot go with it, with goal set
+        (abp-0.2.13) the goal to check."""
+        if self.duel_action is None and self.goal is None and not self.stop_clear:
             return super().step(action, repeat)
-        msg = {"cmd": "step", "repeat": int(repeat or self.action_repeat), **Action.from_any(action).__dict__,
-               "duel_move": int(self.duel_action[0]), "duel_shoot": int(self.duel_action[1])}
+        msg = {"cmd": "step", "repeat": int(repeat or self.action_repeat), **Action.from_any(action).__dict__}
+        if self.duel_action is not None:
+            msg.update(duel_move=int(self.duel_action[0]), duel_shoot=int(self.duel_action[1]))
+        if self.goal is not None:
+            msg["goal"] = [float(v) for v in self.goal]
+        if self.stop_clear:
+            msg["stop_clear"] = True
         self._send(msg)
         obs = self._expect_obs()
         return obs, 0.0, self.is_terminal(obs), False, dict(self.last_info)
@@ -622,9 +905,14 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
         stats, self.pending_stats = getattr(self, "pending_stats", None), None
         self.start_stats = tuple(float(v) for v in stats) if stats is not None else None
         player_hp, boss_hp_fraction = int(round(player_hp)), float(boss_hp_fraction)
-        if not (1 <= player_hp <= 6 and 0 < boss_hp_fraction <= 1 and 0 <= bombs <= 99):
+        # C49: up to 12 half hearts, the ones beyond 6 as soul hearts (normal and boss rooms only, _reset_room)
+        if not (1 <= player_hp <= (6 if self.reset_mode in ('chain',) else 12) and 0 < boss_hp_fraction <= 1 and 0 <= bombs <= 99):
             raise ValueError(f"start out of range: {player_hp}, {boss_hp_fraction}, {bombs} bombs")
         self.start_bombs = bombs
+        if self.reset_mode == "chain":   # goal line: it restarts a floor per attempt itself
+            return self._reset_chain(int(seed), player_hp)
+        if self.reset_mode == "floor":   # the floor runner (abplus_floor_run.py): a whole floor from its start room
+            return self._reset_floor(int(seed))
         if self.restart_run:
             # A new run recreates the player: goto keeps Entity_Player state across episodes (which eye
             # fires next, the player's RNG), and AB+ has no rewind. The global MT19937 seeds the run.
@@ -645,6 +933,14 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
         for retry in range(1, MAX_ROOM_RETRIES + 1):
             if task is None or task.kind == "arena":
                 return self._reset_arena(int(seed), player_hp, boss_hp_fraction)
+            if self.reset_mode == "goto_room":
+                try:
+                    obs, info = self._reset_goto_room(int(seed), task, player_hp)
+                    return obs, {**info, "room_retries": retry - 1}
+                except RoomUnusable as exc:
+                    self.unusable_rooms.append((int(seed), task.kind, task.variant, str(exc)))
+                    task = self.tasks.choose(seed, retry)
+                    continue
             try:
                 obs, info = self._reset_room(int(seed), task, player_hp, boss_hp_fraction)
                 return obs, {**info, "room_retries": retry - 1}
@@ -768,7 +1064,8 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             if expected not in str(result) or f" extras={len(extras)} extra_champions=0 " not in str(result):
                 raise BridgeError(f"target setup failed ({command}): {result}")
         else:
-            result = self.lua(ROOM_LUA.format(player_hp=player_hp, boss_hp_fraction=repr(boss_hp_fraction),
+            result = self.lua(ROOM_LUA.format(player_hp=min(player_hp, 6), soul=max(0, player_hp - 6),
+                                              boss_hp_fraction=repr(boss_hp_fraction),
                                               stats=lua_stats(getattr(self, 'start_stats', None)),
                                               rng_seed=seed & 0xFFFFFFFF, bombs=self.start_bombs,
                                               lineage_mode=int(self.lineage_mode),
@@ -787,8 +1084,8 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             # C36: a mortal player hurt while the arena settles (the start is unsafe for this seed): next room.
             raise RoomUnusable(f"{command}: the player was hurt while the arena settled ({player['hearts']} of "
                                f"{player_hp} half hearts)")
-        if (player["ptype"] != 0 or player["active"] != 0 or player["hearts"] != player_hp
-                or player["bombs"] != self.start_bombs):
+        if (player["ptype"] != 0 or player["active"] != 0 or player["hearts"] != min(player_hp, 6)
+                or player.get("soul", 0) != max(0, player_hp - 6) or player["bombs"] != self.start_bombs):
             raise BridgeError(f"room player initialization failed: {json.dumps(player, sort_keys=True)}")
         if obs["room"]["clear"]:
             raise RoomUnusable(f"{command} is clear after the first frame")
@@ -801,6 +1098,123 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
         return obs, {**info, "task": task.kind, "room_variant": task.variant, "entrance": slot,
                      "room_attempts": attempt + 1, "room_setup": result, "reset_kind": "goto", "target_arm": task.arm,
                      "target_extras": extras}
+
+    def _restart_floor(self, n):
+        """A new run (floor) from the start seed n with the A7 hooks, as reset_monstro's restart."""
+        reseeded = self.lua(f"return tostring(os.getenv('ABP_SOUND_RESET')) .. "
+                            f"tostring(os.getenv('ABP_RESEED:{n}')) .. tostring(os.getenv('ABP_STARTSEED:{n}'))")
+        if self.require_reseed and reseeded != "111":
+            raise BridgeError(f"abp_turbo sound reset / reseed / start-seed override unavailable ({reseeded})")
+        self.reset(phases=[["restart 0"]], settle=2)
+        parts = self.lua(FLOOR_LUA).split(";")
+        curses, start = int(parts[0].split("=")[1]), int(parts[1].split("=")[1])
+        rooms = parts[2:]
+        floor = {}
+        for row in rooms:
+            idx, t, v, shape, doors = (int(x) for x in row.split(","))
+            floor[idx] = dict(type=t, variant=v, shape=shape, doors=doors)
+        return curses, start, floor
+
+    def _reset_chain(self, seed, player_hp):
+        """Room A of a real-floor chain (reset_mode 'chain', EXPERIMENTS.md A9): per attempt a floor from start seed
+        room_seed(seed, -2 - attempt); floors with Labyrinth, Lost or Maze (they change the layout or the destinations)
+        are skipped; the (A, B) pairs of 1x1 normal rooms of chain_rooms (A a neighbour of the start room, B of A, through
+        doors both layouts have) are listed and one drawn from the seed; Level.LeaveDoor = slot and
+        Game():StartRoomTransition(A, slot, 0) enter A as a door does (A9: same landing, doors, spawns); then CHAIN_LUA.
+        A must have enemies. info['chain'] = (slot_a, a, slot_b, b, a_variant, b_variant)."""
+        rng = np.random.default_rng([int(seed) & 0xFFFFFFFF, 0xC4A1])
+        for attempt in range(MAX_CHAIN_ATTEMPTS):
+            curses, start, floor = self._restart_floor(room_seed(seed, -2 - attempt))
+            if curses & CHAIN_REROLL_CURSES:
+                continue
+            pairs = chain_pairs(floor, start, self.chain_rooms)
+            if not pairs:
+                continue
+            slot_a, a, slot_b, b = pairs[int(rng.integers(len(pairs)))]
+            self.lua(f"local l = Game():GetLevel(); l.LeaveDoor = {slot_a}; Game():StartRoomTransition({a}, {slot_a}, 0); "
+                     "return 'ok'")
+            for _ in range(6):
+                obs, _, _, _, info = self.step({}, repeat=1)
+                if obs["room"]["room_idx"] == a:
+                    break
+            else:
+                raise BridgeError(f"seed {seed}: the transition into room {a} did not happen")
+            result = self.lua(CHAIN_LUA.format(player_hp=player_hp, bombs=self.start_bombs,
+                                               stats=lua_stats(getattr(self, 'start_stats', None)),
+                                               rng_seed=seed & 0xFFFFFFFF, lineage_mode=int(self.lineage_mode),
+                                               invincible='true' if self.invincible else 'false',
+                                               miss_cap=int(self.miss_cap)))
+            if not str(result).startswith("curses=0 clear=false") or (self.require_reseed and not
+                                                                     str(result).endswith("reseeded=1")):
+                continue   # A is clear (no enemies) or the setup failed: another floor
+            obs, _, _, _, info = self.step({}, repeat=1)
+            player = obs["players"][0]
+            if player["hearts"] != player_hp or player["bombs"] != self.start_bombs or obs["room"]["clear"]:
+                continue
+            chain = (slot_a, a, slot_b, b, floor[a]["variant"], floor[b]["variant"])
+            return obs, {**info, "task": "normal", "room_variant": floor[a]["variant"], "entrance": (slot_a + 2) % 4,
+                         "room_attempts": attempt + 1, "room_setup": result, "reset_kind": "chain", "chain": chain,
+                         "floor_curses": curses}
+        raise BridgeError(f"seed {seed}: no usable chain in {MAX_CHAIN_ATTEMPTS} floors")
+
+    def _reset_floor(self, seed):
+        """A whole real Basement I floor from its start room (reset_mode 'floor', the floor runner abplus_floor_run.py): per
+        attempt a run from start seed room_seed(seed, -2 - attempt), floors with Labyrinth, Lost or Maze skipped as the
+        chain does (they change the layout or the doors' destinations); the run's own start is kept (Isaac: 3 red hearts,
+        1 bomb, no keys, coins or items, base stats) and so are the other curses. info['floor'] = {grid index: room},
+        info['start_room'], info['floor_curses'], info['room_attempts']."""
+        for attempt in range(MAX_CHAIN_ATTEMPTS):
+            curses, start, floor = self._restart_floor(room_seed(seed, -2 - attempt))
+            if curses & CHAIN_REROLL_CURSES:
+                continue
+            self.lua("AbpSetInvincible(false); AbpSetMissCap(0); return 'ok'")
+            obs, _, _, _, info = self.step({}, repeat=1)
+            if obs["room"]["room_idx"] != start:
+                raise BridgeError(f"seed {seed}: the run did not start in its start room ({obs['room']['room_idx']} != {start})")
+            return obs, {**info, "task": "normal", "room_variant": floor.get(start, {}).get("variant"), "reset_kind": "floor",
+                         "floor": floor, "start_room": start, "floor_curses": curses, "room_attempts": attempt + 1}
+        raise BridgeError(f"seed {seed}: no floor without Labyrinth / Lost / Maze in {MAX_CHAIN_ATTEMPTS} attempts")
+
+    def _reset_goto_room(self, seed, task, player_hp):
+        """A room of the mixture emptied for GOTO practice (reset_mode 'goto_room'): the room as _reset_room builds it
+        (its layout, the player template), every other entity removed, the player on a cell of the largest walkable
+        component drawn from the seed; then logic frames without input until the room is clear (the doors then open as
+        the engine opens them)."""
+        from .abplus_geometry import walk_grid
+        obs, info = self._reset_room(seed, task, player_hp, 1.0)
+        grid = walk_grid(obs)
+        if grid is None:
+            raise RoomUnusable("no walkable grid")
+        origin, walkable, neighbours = grid
+        seen, best = set(), []
+        for cell in sorted(walkable):
+            if cell in seen:
+                continue
+            part, todo = [], [cell]
+            seen.add(cell)
+            while todo:
+                c = todo.pop()
+                part.append(c)
+                for n, _ in neighbours[c]:
+                    if n not in seen:
+                        seen.add(n)
+                        todo.append(n)
+            if len(part) > len(best):
+                best = part
+        if len(best) < 8:
+            raise RoomUnusable(f"largest walkable component has {len(best)} cells")
+        rng = np.random.default_rng([int(seed) & 0xFFFFFFFF, 0x607])
+        col, row = sorted(best)[int(rng.integers(len(best)))]
+        x, y = origin[0] + 40.0 * col, origin[1] + 40.0 * row
+        self.lua(EMPTY_LUA.format(x=x, y=y))
+        for _ in range(60):
+            obs, _, _, _, info = self.step({}, repeat=1)
+            if obs["room"]["clear"] and not self.visible_enemies(obs):
+                break
+        else:
+            raise RoomUnusable("the emptied room did not become clear")
+        return obs, {**info, "task": task.kind, "room_variant": task.variant, "reset_kind": "goto_room",
+                     "start_cell": (col, row)}
 
     def _reset_duel(self, seed, task, command, obs, slot, attempt):
         """The duel in the room the goto loaded (obs): the arm's placement (duel_cells), DUEL_LUA, then logic frames
@@ -866,18 +1280,22 @@ class AbplusTransformerEnv(TransformerMonstroEnv):
     def __init__(self, port: int, max_episode_frames: int = 3600, deadline: bool = True,
                  combat_state: bool = False, geometry: bool = False, factored_actions: bool = False,
                  deadline_s: float = 120.0, frames_per_decision: int = 2, terrain_shape=(9, 15),
-                 room_scale: str = 'room', **kwargs):
+                 room_scale: str = 'room', goal: bool = False, window_position: bool = False, room_bits: bool = False,
+                 expert: bool = False, **kwargs):
         super().__init__(port=port, max_episode_frames=max_episode_frames,
                          bridge=AbplusTrainingEnv(port=port), **kwargs)
         if not 1 <= int(frames_per_decision) <= 30:
             raise ValueError('frames_per_decision must be 1..30')
         self.bridge.action_repeat = int(frames_per_decision)
         big = tuple(terrain_shape) != (9, 15) or room_scale != 'room'   # C41: rooms of every shape
-        if deadline or combat_state or geometry or factored_actions or big:
+        # goal / window_position / room_bits (C44): the goal-conditioned line's observation fields (VisibleHistory; off by
+        # default)
+        if deadline or combat_state or geometry or factored_actions or big or goal or window_position or room_bits or expert:
             self.history = VisibleHistory(self.history.history, self.history.capacity, deadline=deadline,
                                           combat_state=combat_state, geometry=geometry,
                                           factored_actions=factored_actions, deadline_s=deadline_s,
-                                          terrain_shape=terrain_shape, room_scale=room_scale)
+                                          terrain_shape=terrain_shape, room_scale=room_scale, goal=goal,
+                                          window_position=window_position, room_bits=room_bits, expert=expert)
             self.observation_space = self.history.space
 
     def reset(self, *, seed=None, options=None):
@@ -917,11 +1335,11 @@ class AbplusTransformerEnv(TransformerMonstroEnv):
             self.finished = True
             raise
         advanced = obs["logic_frames"] - previous
-        if advanced != sum(repeats[:played]):
-            raise RuntimeError(f"Expected {sum(repeats[:played])} logic frames, received {advanced}")
-        if obs["room"]["room_idx"] != room:
+        if obs["room"]["room_idx"] != room:   # checked first: a room change shortens the step that crossed it
             self.finished = True
             raise BridgeError(f"room changed during play: {room} -> {obs['room']['room_idx']}")
+        if advanced != sum(repeats[:played]):
+            raise RuntimeError(f"Expected {sum(repeats[:played])} logic frames, received {advanced}")
         self.raw_obs = obs
         self.elapsed_frames += advanced
         self.history.clear()
@@ -939,6 +1357,11 @@ class AbplusTransformerEnv(TransformerMonstroEnv):
 # Mesa's software OpenGL (llvmpipe) for the game instead of the NVIDIA driver (EXPERIMENTS.md B7): each instance
 # then holds no GPU memory (about 80 MiB of the learner's GPU otherwise), with identical trajectories.
 SOFTWARE_GL_ENV = {"__GLX_VENDOR_LIBRARY_NAME": "mesa", "LIBGL_ALWAYS_SOFTWARE": "1"}
+# An instance to be cloned with fork() (EXPERIMENTS.md A19): the GL context is memory of the process and has no
+# threads of its own (no rasteriser pool, no shader disk cache), OpenAL uses its null backend, and every source reads
+# as stopped to the game, as it does in a clone.
+FORK_ENV = {**SOFTWARE_GL_ENV, "LP_NUM_THREADS": "0", "MESA_SHADER_CACHE_DISABLE": "true",
+            "MESA_GLSL_CACHE_DISABLE": "true", "ALSOFT_DRIVERS": "null", "ABP_AL_STOPPED": "1"}
 ABP_HOME = Path(os.environ.get("ABP_HOME", Path.home() / "isaac-abplus"))
 MODES = {
     # Exactly equivalent to real rendering (analysis doc §10.1): render path runs, pixels do not.
@@ -955,13 +1378,26 @@ MODES = {
 OOM_SCORE_ADJ = 500   # AB+ instances go before the trainer (adj 0) when memory runs out (C39 t3)
 
 
+def _die_with_parent() -> None:
+    """Popen preexec_fn: the kernel sends SIGKILL to this process when the thread that launched it ends
+    (PR_SET_PDEATHSIG; kept across the execs of the launch chain, not inherited by fork clones)."""
+    import ctypes
+    import signal
+    try:
+        ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)   # PR_SET_PDEATHSIG = 1
+    except Exception:
+        pass
+
+
 def launch_abplus(name: str, port: int, mode: str = "exact", bridge_lua: Optional[str] = None,
                   nice: int = 19, fixed_time: Optional[int] = None,
-                  extra_env: Optional[Dict[str, str]] = None) -> subprocess.Popen:
+                  extra_env: Optional[Dict[str, str]] = None, die_with_parent: bool = False) -> subprocess.Popen:
     """Start one isolated AB+ instance (run_instance.sh) serving the bridge on 127.0.0.1:port.
 
     The bridge script is bridge_lua, else $ABP_BRIDGE_LUA (inherited by worker processes, so a test copy
-    can run next to the installed one), else $ABP_HOME/bridge/abp_bridge.lua."""
+    can run next to the installed one), else $ABP_HOME/bridge/abp_bridge.lua.
+    die_with_parent (2026-10-05, tok_sampler's workers): the instance gets SIGKILL from the kernel when the launching
+    thread's process ends, however it ends (_die_with_parent); off: as before."""
     tools = ABP_HOME / "tools"
     lua = Path(bridge_lua or os.environ.get("ABP_BRIDGE_LUA") or ABP_HOME / "bridge" / "abp_bridge.lua")
     if not lua.is_file():
@@ -979,7 +1415,8 @@ def launch_abplus(name: str, port: int, mode: str = "exact", bridge_lua: Optiona
     return subprocess.Popen(["sh", "-c", f'echo {OOM_SCORE_ADJ} > /proc/self/oom_score_adj 2>/dev/null; exec "$@"', "sh",
                              "nice", "-n", str(nice), str(tools / "run_instance.sh"), name.lower(), "--luadebug",
                              "--set-stage=1", "--set-stage-type=0"], env=env, stdin=subprocess.DEVNULL,
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                            preexec_fn=_die_with_parent if die_with_parent else None)
 
 
 def stop_abplus(proc: subprocess.Popen, name: str) -> None:
@@ -997,3 +1434,59 @@ def stop_abplus(proc: subprocess.Popen, name: str) -> None:
                 os.kill(int(pid), 15)
         except OSError:
             pass
+
+
+def _instance_pids(pgid: Optional[int], name: str) -> list:
+    """Live processes (not zombies) of an instance: its process group (launch_abplus starts a new session; fork clones
+    stay in it) and every isaac.x64 whose environment names the instance's data directory (stop_abplus's rule)."""
+    found, tag = [], f"instances/{name.lower()}/data".encode()
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                stat = f.read()
+            fields = stat[stat.rindex(")") + 2:].split()
+            if fields[0] in ("Z", "X"):
+                continue
+            if pgid is not None and int(fields[2]) == pgid:
+                found.append(int(pid))
+                continue
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() != "isaac.x64":
+                    continue
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                if tag in f.read():
+                    found.append(int(pid))
+        except (OSError, ValueError, IndexError):
+            pass
+    return found
+
+
+def kill_abplus(proc: Optional[subprocess.Popen], name: str, timeout: float = 10.0) -> list:
+    """End an instance now, whatever state it is in (2026-10-05): SIGKILL to its process group and to every isaac.x64
+    process of its name (a stopped game never acts on SIGTERM, a hung one may not), the launcher reaped, then wait until
+    none is left. Returns the pids still alive after `timeout` s (empty: all gone)."""
+    pgid = proc.pid if proc is not None else None
+    end = time.monotonic() + timeout
+    left = _instance_pids(pgid, name)
+    while True:
+        if pgid is not None:
+            try:
+                os.killpg(pgid, 9)
+            except OSError:
+                pass
+        for pid in left:
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+        if proc is not None:
+            try:
+                proc.wait(timeout=0.2)
+            except Exception:
+                pass
+        left = _instance_pids(pgid, name)
+        if not left or time.monotonic() > end:
+            return left
+        time.sleep(0.1)

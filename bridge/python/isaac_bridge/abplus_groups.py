@@ -9,7 +9,8 @@ arena through its 'target'), its share of the budget and its episode deadline:
                 {"name": "dodge", "tasks": "mixture_target_dodge.json", "share": 0.25, "episode_seconds": 30}]}
 
 Task paths are relative to the groups file. Within a group the rooms come from the seed by the group's own
-mixture (TaskSampler, target arms included); there is no room-level PLR.
+mixture (TaskSampler, target arms included); there is no room-level PLR. An optional "eval_tasks" (same format) is the
+spec the group's evaluations use instead (goal line M2: held-out rooms, catalog/goal_rooms_holdout.json).
 
 Budget modes: which group an environment slot plays next. The choice is made at an episode boundary, so an
 episode in progress is never cut. Each worker prepares its next episode on the standby instance when the
@@ -33,7 +34,8 @@ GAME_FPS = 30
 
 def load_groups(path):
     """The groups of a groups file, resolved: name, share (normalised), tasks file, spec {weights, normal, boss},
-    target (or None), episode seconds and frames."""
+    target (or None), episode seconds and frames; with "eval_tasks" also eval_tasks and eval_spec (the evaluations'
+    rooms)."""
     path = Path(path)
     raw = json.loads(path.read_text(encoding='utf8'))
     groups = raw['groups'] if isinstance(raw, dict) else raw
@@ -57,10 +59,50 @@ def load_groups(path):
         # Monstro arena of the simulator's seeds is no group (the aiming arenas are normal rooms with a target).
         if spec.get('weights', {}).get('arena', 0):
             raise ValueError(f"group {g['name']}: no Monstro arena in a group (the aiming arenas are normal rooms with a target)")
+        # Goal-conditioned line (abplus_worker.GROUP_MODES): the group's option sequence, the GOTO_POSITION goals per
+        # sequence, a GOTO option's deadline (s) and the goal radius (px).
+        mode = str(g.get('mode', 'combat'))
+        if mode not in ('combat', 'combat_goto', 'goto_empty', 'chain'):
+            raise ValueError(f"group {g['name']}: unknown mode {mode!r}")
+        extra = dict(mode=mode, goals=int(g.get('goals', 0)), goto_seconds=float(g.get('goto_seconds', 8.0)),
+                     goal_radius=float(g.get('goal_radius', 20.0))) if mode != 'combat' or 'goals' in g else {}
+        # C45: a GOTO deadline for rooms beyond 1x1 (abplus_options), and the group's start half hearts (sample_group_hp)
+        if 'goto_seconds_big' in g:
+            extra['goto_seconds_big'] = float(g['goto_seconds_big'])
+        if 'start_hp' in g:
+            hp = dict(one_prob=float(g['start_hp'].get('one_prob', 0.0)), min=int(g['start_hp'].get('min', 1)),
+                      max=int(g['start_hp'].get('max', 6)))
+            # C49: up to 12 half hearts, the ones beyond 6 as soul hearts (abplus._reset_room; normal and boss rooms)
+            if not (0 <= hp['one_prob'] <= 1 and 1 <= hp['min'] <= hp['max'] <= 12):
+                raise ValueError(f"group {g['name']}: start_hp needs 0 <= one_prob <= 1 and 1 <= min <= max <= 12")
+            extra['start_hp'] = hp
+        # C43: GOTO_POSITION strata weights for training (abplus_nav.sample_goal); evaluations draw without them
+        if 'goal_strata' in g:
+            strata = {str(k): float(v) for k, v in g['goal_strata'].items()}
+            if not strata or set(strata) - {'straight', 'detour', 'dead_end'} or min(strata.values()) < 0 or not sum(strata.values()):
+                raise ValueError(f"group {g['name']}: goal_strata needs non-negative weights of straight / detour / dead_end")
+            extra['goal_strata'] = strata
+        if 'eval_tasks' in g:
+            eval_tasks = (path.parent / g['eval_tasks']).resolve()
+            eval_spec = json.loads(eval_tasks.read_text(encoding='utf8'))
+            if eval_spec.get('target') != spec.get('target'):
+                raise ValueError(f"group {g['name']}: eval_tasks must have the tasks' target")
+            extra.update(eval_tasks=str(eval_tasks), eval_spec={k: eval_spec[k] for k in ('weights', 'normal', 'boss')})
         out.append(dict(name=str(g['name']), share=float(share), tasks=str(tasks),
                         spec={k: spec[k] for k in ('weights', 'normal', 'boss')}, target=spec.get('target'),
-                        seconds=seconds, frames=int(round(seconds * GAME_FPS))))
+                        seconds=seconds, frames=int(round(seconds * GAME_FPS)), **extra))
     return out
+
+
+def sample_group_hp(seed, spec):
+    """C45: a group's start half hearts, a pure function of the seed: 1 with probability one_prob, else uniform in
+    min..max (group key start_hp); None without a spec (the run's own start)."""
+    if not spec:
+        return None
+    rng = np.random.default_rng([int(seed) & 0xFFFFFFFF, 0x4E17])
+    if rng.random() < spec['one_prob']:
+        return 1.0
+    return float(rng.integers(spec['min'], spec['max'] + 1))
 
 
 def describe_groups(groups, budget):
@@ -70,7 +112,11 @@ def describe_groups(groups, budget):
                                             rooms=len(g['spec']['normal']) + len(g['spec']['boss']),
                                             has_target=bool(g['target']),
                                             target=(g['target'] or {}).get('name') if g['target'] else None,
-                                            arms=len((g['target'] or {}).get('arms') or ()))
+                                            arms=len((g['target'] or {}).get('arms') or ()),
+                                            **{k: g[k] for k in ('mode', 'goals', 'goto_seconds', 'goal_radius', 'eval_tasks',
+                                                                 'goal_strata', 'goto_seconds_big', 'start_hp') if k in g},
+                                            **({'eval_rooms': len(g['eval_spec']['normal']) + len(g['eval_spec']['boss'])}
+                                               if 'eval_spec' in g else {}))
                                        for g in groups])
 
 

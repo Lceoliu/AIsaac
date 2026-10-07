@@ -94,6 +94,37 @@ class MonstroGymEnv(gym.Env):
         self.elapsed_frames = 0
         self.transport_failed = False
         self.cleanup_outcome = "not_connected"
+        # Goal-conditioned line (rl/docs/GOAL_CONDITIONED_DESIGN.md): the option being played. 'combat' is every earlier
+        # run's episode (its room's clear wins; a room change is an error unless combat_multi_room, below). 'goto': the clear does not end it; it ends
+        # when the bridge reports the goal reached ('goal'), a room change ('room', the caller decides what that door
+        # meant), a death or the option's frames. The bridge (abp-0.2.13) ends a step early at a reached goal or a room
+        # change, so such a step may have fewer frames.
+        self.option = "combat"
+        # Goal line (user decision 2026-09-30, EXPERIMENTS.md A13): the player may leave the room during a COMBAT option
+        # (a door a bomb blew open: on a real floor, or out of a goto room into the floor behind it) and the option goes
+        # on; the history restarts at each room change (on_room_change). It is won only when its own room (target_room)
+        # is clear: there by the room's clear, as before; from elsewhere by that room's descriptor (the engine clears a
+        # room left during its clear countdown, A13). Another room's clear is not a win. Off: a room change during
+        # COMBAT is an error (every earlier run).
+        self.combat_multi_room = False
+        self.target_room = None
+
+    def begin_option(self, option, max_frames):
+        """Start the next option in place, on the current observation (no reset): its kind and frame budget."""
+        if option not in ("combat", "goto"):
+            raise ValueError(f"unknown option {option!r}")
+        self.option = option
+        self.max_episode_frames = int(max_frames)
+        self.elapsed_frames = 0
+        self.finished = False
+        self.target_room = self.raw_obs["room"]["room_idx"] if option == "combat" and self.raw_obs is not None else None
+
+    def on_room_change(self):
+        """A COMBAT option went on into another room (combat_multi_room), before its first observation is encoded."""
+
+    def target_room_clear(self):
+        """The COMBAT option's room is clear by its room descriptor (asked only while the player is elsewhere)."""
+        return self.bridge.lua(f"return tostring(Game():GetLevel():GetRoomByIdx({int(self.target_room)}).Clear)") == "true"
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -112,6 +143,8 @@ class MonstroGymEnv(gym.Env):
         self.raw_obs = obs
         self.elapsed_frames = 0
         self.finished = False
+        self.option = "combat"
+        self.target_room = obs["room"]["room_idx"]
         return self.encode_observation(obs), {**info, "arena_seed": arena_seed, "outcome": "running"}
 
     def encode_observation(self, obs):
@@ -136,19 +169,37 @@ class MonstroGymEnv(gym.Env):
             self.finished = True
             raise
         advanced = obs["logic_frames"] - previous
-        if advanced != repeat:
+        nav = obs.get("nav") or {}
+        cut = bool(nav.get("goal_hit") or nav.get("room_changed")   # abp-0.2.13: the bridge ended the step early
+                   or (getattr(self.bridge, "stop_clear", False) and obs["room"]["clear"]))
+        if advanced != repeat and not (cut and 0 < advanced <= repeat):
             raise RuntimeError(f"Expected {repeat} logic frames, received {advanced}")
-        if obs["room"]["room_idx"] != previous_room:
+        changed = obs["room"]["room_idx"] != previous_room
+        if changed and self.option == "combat" and not self.combat_multi_room:
             self.finished = True
             raise BridgeError(f"Monstro arena room changed: {previous_room} -> {obs['room']['room_idx']}")
         self.raw_obs = obs
         self.elapsed_frames += advanced
         dead = obs["players"][0]["dead"]
-        won = obs["room"]["clear"] and not dead
-        terminated = bool(dead or won)
-        truncated = self.elapsed_frames >= self.max_episode_frames and not terminated
-        self.finished = terminated or truncated
-        outcome = "death" if dead else "win" if won else "time_limit" if truncated else "running"
+        if self.option == "goto":
+            reached = bool(nav.get("goal_hit")) and not dead and not changed
+            terminated = bool(dead or reached or changed)
+            truncated = self.elapsed_frames >= self.max_episode_frames and not terminated
+            self.finished = terminated or truncated
+            won = False
+            outcome = ("death" if dead else "room" if changed else "goal" if reached else "time_limit" if truncated
+                       else "running")
+        else:
+            if changed:
+                self.on_room_change()
+            if obs["room"]["room_idx"] == self.target_room:
+                won = obs["room"]["clear"] and not dead   # unchanged for every episode that never leaves its room
+            else:
+                won = not dead and self.target_room_clear()
+            terminated = bool(dead or won)
+            truncated = self.elapsed_frames >= self.max_episode_frames and not terminated
+            self.finished = terminated or truncated
+            outcome = "death" if dead else "win" if won else "time_limit" if truncated else "running"
         combat = obs['combat']
         components = {
             'hurt': -float(combat['player_damage_events'] - previous_combat['player_damage_events']),

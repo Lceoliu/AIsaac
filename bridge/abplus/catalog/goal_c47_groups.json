@@ -1,0 +1,29 @@
+{
+ "description": "C47 (10-01, floor-clear mandate): COMBAT only, boss-heavy: the Basement I boss rooms 7 : normal rooms (1x1 and the other shapes) 3 by steps, start half hearts uniform 2-6; boss HP start randomisation from the command line (C47: 70% of the episodes at 15-100% boss HP), so that the bosses nothing beats yet (Monstro: 0/417 at full HP in C46) are won weakened first.",
+ "groups": [
+  {
+   "name": "boss",
+   "tasks": "scaling2_boss_rooms.json",
+   "eval_tasks": "scaling2_boss_rooms.json",
+   "share": 7,
+   "episode_seconds": 180,
+   "mode": "combat",
+   "start_hp": {
+    "min": 2,
+    "max": 6
+   }
+  },
+  {
+   "name": "combat",
+   "tasks": "goal_rooms_all_train.json",
+   "eval_tasks": "goal_rooms_all.json",
+   "share": 3,
+   "episode_seconds": 180,
+   "mode": "combat",
+   "start_hp": {
+    "min": 2,
+    "max": 6
+   }
+  }
+ ]
+}

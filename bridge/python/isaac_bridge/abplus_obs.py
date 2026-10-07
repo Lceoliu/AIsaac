@@ -47,6 +47,9 @@ _NPC = struct.Struct('<BBBqBdBB')  # abp-0.2.3: + lineage, blocking
 _DUEL = struct.Struct('<BBqdddddqqqddBB')
 _DUEL_SIDE = struct.Struct('<dddddddd')
 DUEL_SIDE_KEYS = ('shots', 'hits', 'misses', 'miss_units', 'miss_streak', 'damage', 'hurt', 'hurt_amount')
+# abp-0.2.13 navigation record of the step (always last): goal reached, room changed, Level.LeaveDoor / EnterDoor,
+# closest distance to the step's goal (-1 without one)
+_NAV = struct.Struct('<BBqqd')
 _U8 = struct.Struct('<B')
 _U16 = struct.Struct('<H')
 _U32 = struct.Struct('<I')
@@ -190,6 +193,10 @@ class ObsDecoder:
                         player=sides[0], npc_side=sides[1])
         else:
             off += 1
+        hit, changed, leave, enter, closest = _NAV.unpack_from(payload, off)   # abp-0.2.13
+        off += _NAV.size
+        nav = dict(goal_hit=bool(hit), room_changed=bool(changed), leave_door=leave, enter_door=enter,
+                   goal_min_dist=closest)
         if off != len(payload):
             raise ValueError(f'observation payload has {len(payload) - off} trailing bytes')
         obs = dict(combat_schema=3, engine='abplus-1.06', game_frame=game_frame, paused=bool(paused),
@@ -205,6 +212,7 @@ class ObsDecoder:
                                 miss_streak=c[16], credits=credits, monster_damage=c[17]))
         if duel is not None:
             obs['duel'] = duel
+        obs['nav'] = nav
         return obs
 
     def _terrain_with_hazards(self, entities):

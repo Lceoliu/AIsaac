@@ -122,7 +122,32 @@ Protocol (one JSON object per line), identical to 0.2.0 plus "lua", "format" and
 -- "dead"|"clear"}, then the step observation (its credits cover the whole batch). The batch stops early once the player
 -- is dead (a cancelled lethal hit included) or, with stop_clear, the room is clear. code = move + 9 shoot + 45 bomb +
 -- 90 item. Not with the duel NPC (its action comes with each step).
-local VERSION = "abp-0.2.12"
+-- abp-0.2.13 (goal-conditioned line, EXPERIMENTS.md A9/A10, rl/docs/GOAL_CONDITIONED_DESIGN.md):
+--   * An undiscovered secret-room door (GridEntityDoor variant 7, DOOR_HIDDEN) is left out of the doors of every
+--     observation and its grid cell is reported as a wall (type 15); a bomb turns it into variant 8 (open), from then on
+--     it is listed as usual. The goto rooms of the earlier runs have only their barred entrance, so they are unchanged.
+--   * A step ends early, at the first logic frame after the room changed (MC_POST_NEW_ROOM during the step): the held
+--     action keeps acting on that frame, as the engine does, and the observation is the new room's first frame. A play
+--     batch stopped there too (stop "room") until 2026-10-07; since then (same VERSION) the action under way ends there
+--     as a step's does and the batch goes on with its next action, so a play is the same game as the same step lines
+--     across room changes (a bomb opening a secret room, a door walked through); "stop_room":true in a play or
+--     fork_many command keeps the old stop.
+--   * "goal":[x, y, r] in a step command: every logic frame of the step the player's distance to (x, y) is checked; the
+--     step ends early at the first frame it is <= r.
+--   * Every observation carries nav = {goal_hit, room_changed, leave_door, enter_door, goal_min_dist} for its step
+--     (binary v2: a trailing <BBqqd> section).
+--   * "stop_clear":true in a step command (the goal line's COMBAT options): the step ends at the logic frame the room
+--     becomes clear, so the player cannot walk out through a door that opens within the same step.
+-- abp-0.2.14 (EXPERIMENTS.md A19, B9, B10): `fork` (a clone of the process through abp_turbo's ABP_FORK), lean mode and
+-- native input; described at "lean mode" and "fork" below.
+-- abp-0.2.15 (whole-floor episodes, EXPERIMENTS.md C57): the lean observation's room index is the room's SafeGridIndex,
+-- a door's fourth byte says whether the room behind it was visited / is clear, a trapdoor or stairs appearing resends
+-- the terrain, and a map block carries the rooms the minimap shows. Everything else as abp-0.2.14.
+-- Native obs (2026-10-03, same VERSION: the bytes on the wire are unchanged): with a libabp_turbo.so that has
+-- ABP_OBS_INIT, the lean observation's fixed part and its terrain check are built in C (see "native obs" at pack_lean);
+-- ISAAC_RL_NATIVE_OBS=0 or the `native_obs` command (mode 0 / 1 / 2 = Lua / native / check) selects the path, and
+-- `lean_profile` times the parts.
+local VERSION = "abp-0.2.15"
 local mod = RegisterMod("AbpRLBridge", 1)
 
 -- The game ships LuaSocket for both architectures; make sure the 64-bit core is found.
@@ -140,6 +165,8 @@ local function getenv(name)
 	end
 	return nil
 end
+
+local FM_AVAILABLE = getenv("ABP_FM_PROBE") == "1"   -- abp_turbo has fork_many's pipe (see fork_many)
 
 local cfg = {
 	host = "127.0.0.1",
@@ -206,7 +233,22 @@ local state = {
 	tear_fire = {}, pending_hits = {}, last_hit = {}, credits = {},
 	-- abp-0.2.12: the play batch being run ({codes, repeats, rep, i, stop_clear}), nil outside one.
 	play = nil,
+	-- abp-0.2.13: the step's goal ({x, y, r}, nil without one) and what happened during the step.
+	goal = nil, nav = { hit = false, changed = false, min = -1 },
+	stop_clear = false, was_clear = false,
+	lean = false,            -- abp-0.2.14: lean mode (pack_lean)
+	native_input = false,    -- abp-0.2.14: abp_turbo answers the engine's input queries (lean mode)
+	-- 2026-10-06 (items, Phase A; same VERSION, hello says items = true): the lean observation's inventory block (flag 16,
+	-- see pack_lean) and the run-mode map rules. Off unless ISAAC_RL_LEAN_ITEMS=1 at launch or the `lean_items` command
+	-- (clones inherit it); off, the bytes on the wire are those of abp-0.2.15.
+	lean_items = getenv("ISAAC_RL_LEAN_ITEMS") == "1",
 }
+
+-- abp-0.2.13: an undiscovered secret-room door (DOOR_HIDDEN) is not part of what the player sees.
+local DOOR_HIDDEN = 7
+local function visible_door(d)
+	return d:GetVariant() ~= DOOR_HIDDEN
+end
 
 -- abp-0.2.9 duel: the NPC's constants, measured on the player (EXPERIMENTS.md A6).
 local DUEL_TYPE = 11   -- Pacer (11.1); MC_NPC_UPDATE is registered for this type
@@ -760,11 +802,33 @@ local function send(tbl)
 end
 
 local function disconnect(reason)
+	if state.clone then getenv("ABP_EXIT") end   -- abp-0.2.14: a clone lives as long as its connection
 	log("client disconnected: " .. tostring(reason))
 	if state.client then state.client:close() end
 	state.client = nil
 	state.held = {}; state.triggered = {}; state.frames_left = 0; state.pending_reset = false
 	state.play = nil
+	if state.native_input then   -- abp-0.2.14: without a client the engine reads the real devices again
+		getenv("ABP_INPUT_OFF")
+		state.native_input = false
+	end
+end
+
+-- 2026-10-06 (the root's first-build hang, EXPERIMENTS.md): ISAAC_RL_PORT_FILE=<path> (set by the tok workers'
+-- instances, abplus_goexplore.Instance) makes the bridge write the port it listens on to that file, and bind a free
+-- port (port 0) when the configured one is taken. Before, a taken port (a parked clone's connection that happened to get
+-- it as its ephemeral local port, another run's instance) disabled the bridge: the game ran on without a client at a
+-- full core and the worker waited for it. Without the variable nothing changes. Networking only: no game state.
+local function write_port_file(port)
+	local path = getenv("ISAAC_RL_PORT_FILE")
+	if not path or path == "" or not io or not io.open then return end
+	local ok, f = pcall(io.open, path .. ".tmp", "w")
+	if not ok or not f then log("port file " .. path .. " not written"); return end
+	f:write(tostring(port) .. "\n")
+	f:close()
+	local renamed, res = false, nil
+	if os and os.rename then renamed, res = pcall(os.rename, path .. ".tmp", path) end
+	if not (renamed and res) then log("port file " .. path .. " not renamed") end
 end
 
 local function try_bind()
@@ -774,17 +838,26 @@ local function try_bind()
 		return
 	end
 	local server, err = socket.bind(cfg.host, cfg.port, 1)
+	if not server and (getenv("ISAAC_RL_PORT_FILE") or "") ~= "" then
+		log("bind failed on " .. cfg.host .. ":" .. cfg.port .. " (" .. tostring(err) .. "); binding a free port")
+		server, err = socket.bind(cfg.host, 0, 1)
+		if server then
+			local _, p = server:getsockname()
+			cfg.port = tonumber(p) or cfg.port
+		end
+	end
 	if not server then
 		log("bind failed on " .. cfg.host .. ":" .. cfg.port .. " (" .. tostring(err) .. "). Bridge disabled.")
 		return
 	end
 	server:settimeout(0)
 	state.server = server
+	write_port_file(cfg.port)
 	log("listening on " .. cfg.host .. ":" .. cfg.port .. " (" .. VERSION .. ")")
 end
 
 local function try_accept()
-	if not state.server then return end
+	if not state.server or state.clone then return end
 	local c = state.server:accept()
 	if c then
 		c:settimeout(nil)
@@ -793,11 +866,35 @@ local function try_accept()
 		state.obs_format, state.obs_validate, state.terrain_dirty = 1, false, true
 		log("client connected on port " .. cfg.port)
 		send({ type = "hello", version = VERSION, engine = "abplus-1.06", port = cfg.port,
-			privileged = cfg.privileged, game_frame = Game():GetFrameCount(), logic_frames = state.logic_frames })
+			privileged = cfg.privileged, game_frame = Game():GetFrameCount(), logic_frames = state.logic_frames,
+			step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items })
 	end
 end
 
 ------------------------------------------------------------------ actions
+
+-- abp-0.2.14 native input (lean mode; abp_turbo ABP_INPUT): the held and pressed-this-frame actions as bit masks,
+-- answered by abp_turbo to the engine's input queries in place of the MC_INPUT_ACTION callback below, with the same
+-- values. Every change of state.held / state.triggered is pushed.
+local function push_input()
+	if not state.native_input then return end
+	local h, t = 0, 0
+	for a in pairs(state.held) do h = h | (1 << a) end
+	for a in pairs(state.triggered) do t = t | (1 << a) end
+	getenv("ABP_INPUT:" .. h .. ":" .. t)
+end
+
+local function set_native_input(on)
+	if on and state.client and state.control then
+		local mask = 0
+		for a in pairs(CONTROLLED) do mask = mask | (1 << a) end
+		state.native_input = getenv("ABP_INPUT_ON:" .. mask) == "1"
+		push_input()
+	else
+		if state.native_input then getenv("ABP_INPUT_OFF") end
+		state.native_input = false
+	end
+end
 
 local function apply_action(cmd)
 	local held = {}
@@ -813,10 +910,11 @@ local function apply_action(cmd)
 	end
 	state.held = held
 	state.triggered = trig
+	push_input()
 end
 
 mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, function(_, entity, hook, action)
-	if not state.client or not state.control then return nil end
+	if not (state.client or state.headless) or not state.control then return nil end
 	if entity == nil then return nil end
 	if not CONTROLLED[action] then return nil end
 	local player = entity:ToPlayer()
@@ -928,14 +1026,16 @@ local function grid_records(room)
 		local g = room:GetGridEntity(i)
 		if g then
 			local gt = g:GetType()
-			if gt ~= GridEntityType.GRID_NULL and gt ~= GridEntityType.GRID_DECORATION then
+			if gt == GridEntityType.GRID_DOOR and g:GetVariant() == DOOR_HIDDEN then   -- abp-0.2.13: seen as a wall
+				cells[#cells + 1] = { i, GridEntityType.GRID_WALL, 0, 0, g.CollisionClass, g.Position.X, g.Position.Y }
+			elseif gt ~= GridEntityType.GRID_NULL and gt ~= GridEntityType.GRID_DECORATION then
 				cells[#cells + 1] = { i, gt, g:GetVariant(), g.State, g.CollisionClass, g.Position.X, g.Position.Y }
 			end
 		end
 	end
 	for slot = 0, 7 do
 		local d = room:GetDoor(slot)
-		if d then
+		if d and visible_door(d) then
 			doors[#doors + 1] = { slot = slot, open = d:IsOpen(), locked = d:IsLocked(), pos = vec(d.Position),
 				target_type = d.TargetRoomType }
 		end
@@ -1029,6 +1129,13 @@ function AbpDuelPlace(x, y)
 	return "ok"
 end
 
+-- abp-0.2.13: what happened during the step (python/isaac_bridge/abplus_obs.py _NAV).
+local function nav_record()
+	local level = Game():GetLevel()
+	return { goal_hit = state.nav.hit, room_changed = state.nav.changed, leave_door = level.LeaveDoor,
+		enter_door = level.EnterDoor, goal_min_dist = state.nav.min }
+end
+
 local function build_obs()
 	local game = Game()
 	local obs = {
@@ -1047,6 +1154,7 @@ local function build_obs()
 		if rec then obs.entities[#obs.entities + 1] = rec end
 	end
 	obs.room = room_record(game)
+	obs.nav = nav_record()   -- abp-0.2.13
 	obs.grid, obs.doors = grid_records(game:GetRoom())
 	obs.terrain = terrain_record(game:GetRoom(), Isaac.GetPlayer(0))
 	obs.combat = { player_damage_events = state.combat.player_damage_events,
@@ -1120,6 +1228,12 @@ end
 local function terrain_signature(room, player)
 	local parts = { tostring(player.CanFly), tostring(player.Size) }
 	for i = 0, room:GetGridSize() - 1 do parts[#parts + 1] = room:GetGridCollision(i) end
+	-- abp-0.2.13: door variants too, so the grid is re-sent on the frame a bomb reveals a secret door (DOOR_HIDDEN ->
+	-- open), not a frame later when its collision changes
+	for slot = 0, 7 do
+		local d = room:GetDoor(slot)
+		parts[#parts + 1] = d and d:GetVariant() or -1
+	end
 	return table.concat(parts, ",")
 end
 
@@ -1205,6 +1319,11 @@ local function pack_duel()
 	return table.concat(parts)
 end
 
+local function pack_nav()
+	local r = nav_record()
+	return packf("<BBi8i8d", B(r.goal_hit), B(r.room_changed), I(r.leave_door), I(r.enter_door), r.goal_min_dist)
+end
+
 local function pack_obs(event)
 	local game = Game()
 	local room, level = game:GetRoom(), game:GetLevel()
@@ -1237,7 +1356,7 @@ local function pack_obs(event)
 	local doors = {}
 	for slot = 0, 7 do
 		local d = room:GetDoor(slot)
-		if d then
+		if d and visible_door(d) then
 			doors[#doors + 1] = packf("<BBBddi8", slot, B(d:IsOpen()), B(d:IsLocked()), d.Position.X, d.Position.Y,
 				I(d.TargetRoomType))
 		end
@@ -1265,7 +1384,604 @@ local function pack_obs(event)
 	parts[#parts + 1] = packf("<I2", #ents)
 	for _, rec in ipairs(ents) do parts[#parts + 1] = rec end
 	parts[#parts + 1] = pack_duel()   -- abp-0.2.9
+	parts[#parts + 1] = pack_nav()    -- abp-0.2.13
 	return table.concat(parts)
+end
+
+------------------------------------------------------------------ lean mode (abp-0.2.14)
+-- For the fork sampler's episode clones (the `lean` command, or lean = true in `fork`): the per-frame bookkeeping of
+-- the reward profiles (update_combat, the tear and lineage tables) is skipped, and a step answers with one
+-- fixed-layout observation, "L <bytes> <event> <seq>\n" + payload, decoded by isaac_bridge/abplus_lean.py:
+--   header   <I4I4I4BBBB  "ABP3", logic frames, game frame, flags (1 room clear, 2 terrain block present, 4 paused,
+--            8 map block present), players, doors, lasers
+--   room     <i4i4i4i4i4i4i4i4ffff  type, shape, grid width, grid height, room index (the room's SafeGridIndex: the
+--            same through whichever door a big room was entered; negative off the grid), stage, alive enemies, room
+--            frame, top left x y, bottom right x y
+--   totals   <dddd  player 0's total damage taken since the run's start (half hearts), the summed HitPoints of the
+--            room's monsters (is_monster), the summed HitPoints and the count of its door-blocking NPCs. For rewards
+--            and the episode's end, not for the policy: a monster's HP is not something the player sees.
+--   players  x 38 doubles (LEAN_PLAYER; abplus_lean.PLAYER_FIELDS). 2026-10-07 (charge, same VERSION): the last two
+--            are the charge counter of a charged weapon (Entity_Player +0x2634, int: what the charge bar shows for
+--            Brimstone, Monstro's Lung, Mom's Knife, Chocolate Milk, Cursed Eye, Tech X, the Forgotten's bone; 0 while
+--            nothing charges; abp_turbo's abp_player_charge, no Lua API reads it) and the weapon types as a bit mask
+--            (bit w set when HasWeaponType(w), w = 0 .. 10: 1 tears, 2 Brimstone, 3 Technology, 4 Mom's Knife, 5 Dr.
+--            Fetus, 6 Epic Fetus, 7 Monstro's Lung, 8 Ludovico, 9 Tech X, 10 bone)
+--   doors    x <BBBBffi4  slot, open, locked, flags (1 the room behind was visited, 2 it is clear: what the
+--            minimap shows), x, y, target room type (visible doors only)
+--   <I2 entity count, entities x LEAN_ENTITY (108 bytes; the rules of pack_entity: no player, only whitelisted
+--            effects, only visible entities; hp is HitPoints / MaxHitPoints for bosses only, as in format 2)
+--   lasers   x <i8 entity index + format 2's laser block
+--   terrain  (flag 2) <I4 version, s4 terrain JSON, s4 grid JSON, as format 2
+--   map      (flag 8) <B count, rooms x <BBBBB  GridIndex, shape, type (0 unless its icon is shown or it was visited),
+--            DisplayFlags, flags (1 visited, 2 visited and clear, 4 the room the player is in). Only rooms the minimap
+--            shows (DisplayFlags ~= 0): what the player sees of the floor. Sent with a connection's first observation
+--            and when it changes (checked at a room change, a clear and every LEAN_FULL_EVERY logic frames).
+-- The engine's velocity is always sent. The terrain is checked every step on the cells that held something at the
+-- last full pass (a destroyed rock or poop shows at once) and in full every LEAN_FULL_EVERY logic frames; since
+-- 2026-10-07 also every step on everything the block's grid records hold (terrain_content_sig: a grid entity's type,
+-- variant, state, collision class), so a step's terrain block is never behind the game's.
+local LEAN_MAGIC = 0x33504241
+local LEAN_ENTITY = "<i8i4i4i4ddddfffi4i4fi4i4BBBBi4ffff"
+local LEAN_PLAYER = "<" .. string.rep("d", 38)
+local LEAN_FULL_EVERY = 30
+local lean = { cells = nil, full_at = -100000, full_sig = nil, part_sig = nil, map_key = nil, map_at = -100000,
+	map_sig = nil }
+
+local function lean_room_index(level)
+	local idx = level:GetCurrentRoomIndex()
+	if idx >= 0 then
+		local ok, safe = pcall(function() return level:GetCurrentRoomDesc().SafeGridIndex end)
+		if ok and math.tointeger(safe) then idx = math.tointeger(safe) end
+	end
+	return idx
+end
+
+local function lean_map(level, here)
+	-- items / run mode (state.lean_items): under Curse of the Lost the game shows no map
+	if state.lean_items and (level:GetCurses() & 4) ~= 0 then return spack("<B", 0) end
+	local rooms = level:GetRooms()
+	local recs = {}
+	for i = 0, rooms.Size - 1 do
+		local r = rooms:Get(i)
+		local display, gi = r.DisplayFlags, r.GridIndex
+		if display ~= 0 and gi >= 0 and gi < 169 then
+			local d = r.Data
+			local visited = r.VisitedCount > 0
+			local known = visited or (display & 4) ~= 0
+			recs[#recs + 1] = spack("<BBBBB", gi, d.Shape & 255, known and (d.Type & 255) or 0, display & 255,
+				(visited and 1 or 0) + ((visited and r.Clear) and 2 or 0) + (r.SafeGridIndex == here and 4 or 0))
+		end
+	end
+	return spack("<B", #recs) .. table.concat(recs)
+end
+
+-- Inventory block (2026-10-06, items, Phase A; flag 16; only with state.lean_items, built here in Lua in every mode, so
+-- the native and the Lua paths send the same bytes):
+--   <BBHHHHHHI4  n (held collectible ids that follow, at most INV_CAP), layout version 1, the active item's MaxCharges
+--                (0 without one), trinket slots 0 and 1, pill color in pocket slot 0, its PillEffect + 1 when the pill
+--                is identified (what the game names) else 0, card / rune in slot 0, the level's curses
+--   n x <HB      collectible id (1 .. 1023), how many are held (GetCollectibleNum, at most 255); newest first: an id
+--                whose count went up moves to the front, ids gained together in id order, an id held at the first scan
+--                of the run in id order
+-- The held set comes from GetCollectibleNum over every collectible id of the item config (AB+: 1 .. 552). The scan runs
+-- when a cheap key changes (GetCollectibleCount, the active item, pill, card, trinkets, curses, room, stage), at a
+-- connection's first observation and every LEAN_FULL_EVERY logic frames; the block is sent with a connection's first
+-- observation and when its bytes change. ISAAC_RL_INV_CHECK=1 (diagnostic): every decision in between also compares
+-- the cached block with a full scan (ABP_INV.checks / misses) without changing what is sent.
+local INV_CAP = 64
+local INV = { n = nil, order = {}, counts = {}, key = nil, at = -100000, block = nil, sent = nil, scans = 0,
+	checks = 0, misses = 0, first_miss = nil }
+ABP_INV = INV
+local INV_CHECK = getenv("ISAAC_RL_INV_CHECK") == "1"
+
+local function inv_ids()
+	if INV.n == nil then
+		local ok, size = pcall(function() return Isaac.GetItemConfig():GetCollectibles().Size end)
+		size = ok and math.tointeger(size) or 553
+		INV.n = math.min(1023, size - 1)
+	end
+	return INV.n
+end
+
+local function inv_held(p)
+	local held = {}
+	for id = 1, inv_ids() do
+		local c = p:GetCollectibleNum(id)
+		if c > 0 then held[id] = c end
+	end
+	return held
+end
+
+local function inv_order(held)
+	local new, isnew = {}, {}
+	for id, c in pairs(held) do
+		if (INV.counts[id] or 0) < c then new[#new + 1] = id; isnew[id] = true end
+	end
+	table.sort(new)
+	local order = new
+	for _, id in ipairs(INV.order) do
+		if held[id] and not isnew[id] then order[#order + 1] = id end
+	end
+	INV.order, INV.counts = order, held
+end
+
+local function inv_header(p, level, n)
+	local active = p:GetActiveItem()
+	local maxc = 0
+	if active ~= 0 then
+		pcall(function() maxc = math.tointeger(Isaac.GetItemConfig():GetCollectible(active).MaxCharges) or 0 end)
+	end
+	local pill = p:GetPill(0)
+	local effect = 0
+	if pill ~= 0 then
+		pcall(function()
+			local pool = Game():GetItemPool()
+			if pool:IsPillIdentified(pill) then effect = (math.tointeger(pool:GetPillEffect(pill)) or -1) + 1 end
+		end)
+	end
+	return spack("<BBHHHHHHI4", n, 1, maxc, p:GetTrinket(0) & 0xFFFF, p:GetTrinket(1) & 0xFFFF, pill & 0xFFFF, effect,
+		p:GetCard(0) & 0xFFFF, level:GetCurses())
+end
+
+local function inv_block(p, level)
+	local n = math.min(#INV.order, INV_CAP)
+	local parts = {}
+	for k = 1, n do
+		local id = INV.order[k]
+		parts[k] = spack("<HB", id, math.min(INV.counts[id], 255))
+	end
+	return inv_header(p, level, n) .. table.concat(parts)
+end
+
+local function lean_inventory(event, here)
+	local p = Isaac.GetPlayer(0)
+	local level = Game():GetLevel()
+	local key = table.concat({ p:GetCollectibleCount(), p:GetActiveItem(), p:GetPill(0), p:GetCard(0), p:GetTrinket(0),
+		p:GetTrinket(1), level:GetCurses(), here, level:GetStage() }, ",")
+	local due = event ~= "step" or INV.block == nil or key ~= INV.key or state.logic_frames - INV.at >= LEAN_FULL_EVERY
+		or state.logic_frames < INV.at
+	if INV_CHECK and not due then   -- diagnostic: the cached block against a full scan
+		INV.checks = INV.checks + 1
+		local held, same = inv_held(p), true
+		for id, c in pairs(held) do if INV.counts[id] ~= c then same = false end end
+		for id, c in pairs(INV.counts) do if held[id] ~= c then same = false end end
+		if inv_header(p, level, math.min(#INV.order, INV_CAP)) ~= INV.block:sub(1, 18) then same = false end
+		if not same then
+			INV.misses = INV.misses + 1
+			if INV.first_miss == nil then INV.first_miss = state.logic_frames end
+		end
+	end
+	if due then
+		INV.key, INV.at = key, state.logic_frames
+		inv_order(inv_held(p))
+		INV.scans = INV.scans + 1
+		INV.block = inv_block(p, level)
+	end
+	if event ~= "step" or INV.block ~= INV.sent then
+		INV.sent = INV.block
+		return INV.block
+	end
+	return ""
+end
+
+-- Per cell the room's collision class and, with a grid entity, its type, variant, State and CollisionClass, else -1
+-- (abp_turbo's obs_terrain_content reads the same values).
+local function terrain_content_sig(room)
+	local parts, k = {}, 0
+	for i = 0, room:GetGridSize() - 1 do
+		k = k + 1
+		parts[k] = room:GetGridCollision(i)
+		local g = room:GetGridEntity(i)
+		if g then
+			parts[k + 1], parts[k + 2], parts[k + 3], parts[k + 4] = g:GetType(), g:GetVariant(), g.State, g.CollisionClass
+			k = k + 4
+		else
+			k = k + 1
+			parts[k] = -1
+		end
+	end
+	return table.concat(parts, ",")
+end
+
+local function lean_terrain_changed(room, player, force)
+	local changed = false
+	if force or lean.cells == nil or state.logic_frames - lean.full_at >= LEAN_FULL_EVERY
+		or state.logic_frames < lean.full_at then
+		local sig = terrain_signature(room, player)
+		-- a trapdoor or stairs appearing (the floor's exit after the boss) changes no collision class
+		for i = 0, room:GetGridSize() - 1 do
+			local g = room:GetGridEntity(i)
+			if g then
+				local gt = g:GetType()
+				if gt == 17 or gt == 18 then sig = sig .. ";" .. gt .. "@" .. i end
+			end
+		end
+		lean.full_at = state.logic_frames
+		if force or sig ~= lean.full_sig then
+			lean.full_sig = sig
+			local cells = {}
+			for i = 0, room:GetGridSize() - 1 do
+				local c = room:GetGridCollision(i)
+				if c ~= 0 and c ~= 4 then cells[#cells + 1] = i end   -- not empty, not a wall
+			end
+			lean.cells, lean.part_sig = cells, nil
+			changed = true
+		end
+	end
+	local parts, cells = {}, lean.cells
+	for k = 1, #cells do parts[k] = room:GetGridCollision(cells[k]) end
+	for slot = 0, 7 do
+		local d = room:GetDoor(slot)
+		parts[#parts + 1] = d and d:GetVariant() or -1
+	end
+	local sig = table.concat(parts, ",")
+	if lean.part_sig ~= nil and sig ~= lean.part_sig then changed = true end
+	lean.part_sig = sig
+	-- 2026-10-07: every decision, what the terrain block's grid records hold (terrain_content_sig): a grid entity's
+	-- state or variant changing without a collision change (a poop or a cobweb hit by a bomb or a tear, a trapdoor
+	-- appearing) is resent at once, not at the next full pass, so a step's terrain is always the current one (as a
+	-- restored clone's, whose first observation carries it anew)
+	local content = terrain_content_sig(room)
+	if lean.content_sig ~= nil and content ~= lean.content_sig then changed = true end
+	lean.content_sig = content
+	if changed then lean.full_sig = nil end   -- the next full pass re-reads the cells to watch
+	return changed
+end
+
+-- Native obs (2026-10-03, on top of abp-0.2.15; VERSION is unchanged because the Python client checks it). abp_turbo
+-- (getenv "ABP_OBS_INIT") registers two Lua C functions that read the engine through the same getters luabridge calls
+-- for the Lua code below: abp_native_lean(logic_frames, extra_flags), the fixed part of the observation (header, room,
+-- totals, players, doors, entity records; nil, reason when a laser is in the room: its samples are built in Lua), and
+-- abp_native_terrain(logic_frames, force) -> resend, room index, clear: lean_terrain_changed with its own state, plus
+-- what the map block needs. The terrain and map blocks themselves are still built here (rare). Mode (env
+-- ISAAC_RL_NATIVE_OBS, or the `native_obs` command): 0 the Lua code only, 1 native when available (default), 2 check:
+-- both, the Lua result is sent, ABP_NATIVE_OBS counts the comparisons and keeps the first difference. Changing the
+-- mode forces a full terrain pass (each path keeps its own terrain state). While a player has a cancelled lethal hit
+-- (state.lethal) the Lua code builds the observation.
+local native_lean, native_terrain = nil, nil
+if getenv("ABP_OBS_INIT") == "1" and type(abp_native_lean) == "function" and type(abp_native_terrain) == "function" then
+	native_lean, native_terrain = abp_native_lean, abp_native_terrain
+end
+-- Post-update skip (2026-10-04, frame-cost work, same VERSION: nothing on the wire changes). abp_turbo puts a gate on the
+-- engine's one call of LuaEngine::PostUpdate (Game::Update); abp_pu_arm(n) makes it answer the next n calls itself, with
+-- what this file's MC_POST_UPDATE callback does on a step's inner frames in lean mode with native input: count the frame,
+-- count the step down, and on its first frame clear the pressed-this-frame actions (input_triggered = 0). A step line
+-- arms rep - 1 frames (begin_step_line); MC_POST_UPDATE first takes the count (abp_pu_take) and adds it to
+-- state.logic_frames and subtracts it from state.frames_left; a room change disarms it (MC_POST_NEW_ROOM ends the step).
+-- Only with lean mode, native input and a client, without a duel. Off unless ISAAC_RL_PU_SKIP=1 or ABP_PU.enabled = true.
+local pu_arm, pu_take = nil, nil
+if native_lean ~= nil and type(abp_pu_arm) == "function" and type(abp_pu_take) == "function" then
+	pu_arm, pu_take = abp_pu_arm, abp_pu_take
+end
+ABP_PU = { available = pu_arm ~= nil, enabled = pu_arm ~= nil and getenv("ISAAC_RL_PU_SKIP") == "1", armed = 0 }
+-- 2026-10-05 (the teacher's cost): ISAAC_RL_PU_PLAY=1 (or ABP_PU.play = true) arms the same skip for each action of a
+-- play batch (the teacher's restore replay, fork_many's clones, the clone that plays the last batch itself): its inner
+-- frames are those of a step line (no goal; stop_clear, the room-clear stop of play, is checked at an action's end
+-- only), so the callback does the same on them. Needs ABP_PU.enabled; not when a stale step stop_clear is set.
+ABP_PU.play = ABP_PU.enabled and getenv("ISAAC_RL_PU_PLAY") == "1"
+ABP_PU.play_armed = 0
+state.native_obs = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_OBS") or "1")) or 1
+ABP_NATIVE_OBS = { available = native_lean ~= nil, native = 0, fallbacks = 0, last_fallback = nil, checks = 0,
+	mismatches = 0, first = nil }
+-- Terrain block cache (2026-10-04, same VERSION: the bytes on the wire are unchanged). The lean terrain check resends
+-- the terrain block every LEAN_FULL_EVERY logic frames once anything in the room changed (a full pass after a change
+-- clears the full signature), each time built anew in Lua: the cells' tables and two json.encode, the costliest thing
+-- left per decision on average. abp_turbo's abp_native_terrain_key(mark) compares everything the two JSON strings are
+-- built from (the room's shape, size, index and stage, player 0's Size and CanFly, every cell's collision and its grid
+-- entity's type, variant, state, collision class and position) with the key of the last block built (mark: and makes
+-- this the new one); when equal, the last block's JSON strings are reused, with the new version number. Mode
+-- (ISAAC_RL_TERRAIN_CACHE, or "terrain_cache" in the native_step command): 0 off, 1 on (default), 2 check (built anew
+-- and compared with the cached strings: ABP_TERRAIN_CACHE.mismatches).
+local native_tkey = native_lean ~= nil and type(abp_native_terrain_key) == "function" and abp_native_terrain_key or nil
+state.terrain_cache = math.tointeger(tonumber(getenv("ISAAC_RL_TERRAIN_CACHE") or "1")) or 1
+ABP_TERRAIN_CACHE = { available = native_tkey ~= nil, hits = 0, builds = 0, checks = 0, mismatches = 0 }
+
+-- The entity part of the lean observation in Lua: (<I2 count .. records, laser blocks, monsters' HP, door-blocking HP,
+-- door-blocking count).
+local function lean_entities()
+	local ents, lasers = {}, {}
+	local monsters_hp, blocking_hp, blocking_count = 0, 0, 0
+	local whitelist = cfg.effect_whitelist
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		local t = e.Type
+		local npc = t >= 10 and t < 1000 and e:ToNPC() or nil
+		if npc then
+			local hp = e.HitPoints
+			if hp > 0 then
+				if is_monster(e) then monsters_hp = monsters_hp + hp end
+				if e:CanShutDoors() and not e:IsDead() then
+					blocking_hp = blocking_hp + hp
+					blocking_count = blocking_count + 1
+				end
+			elseif e:CanShutDoors() and not e:IsDead() then
+				blocking_count = blocking_count + 1
+			end
+		end
+		if t ~= 1 and (t ~= 1000 or whitelist[e.Variant]) and e.Visible then
+			local kind, flags, hpf, a, b, c, champion = 0, 0, 0.0, 0.0, 0.0, 0.0, -1
+			if t == 2 then
+				local x = e:ToTear()
+				kind, a, b, c = 1, x.Height, x.FallingSpeed, x.Scale
+			elseif t == 9 then
+				local x = e:ToProjectile()
+				kind, a, b, c = 2, x.Height, x.FallingSpeed, x.Scale
+			elseif t == 7 then
+				kind = 3
+				lasers[#lasers + 1] = spack("<i8", e.Index) .. pack_laser(e)
+			elseif t == TYPE_BOMB then
+				kind = 4
+			elseif t == 5 then
+				kind = 5
+			elseif npc then
+				kind = 6
+				local boss = e:IsBoss()
+				if e:IsEnemy() then flags = flags + 1 end
+				if e:IsVulnerableEnemy() then flags = flags + 2 end
+				if boss then
+					flags = flags + 4
+					if e.MaxHitPoints > 0 then hpf = e.HitPoints / e.MaxHitPoints end
+				end
+				if e:CanShutDoors() and not e:IsDead() then flags = flags + 8 end
+				champion = npc:GetChampionColorIdx()
+			end
+			local spr = e:GetSprite()
+			local anim, names = 0, ANIMATIONS[t]
+			if names then
+				for k = 1, #names do
+					if spr:IsPlaying(names[k]) or spr:IsFinished(names[k]) then anim = k; break end
+				end
+			end
+			local pos, vel, sm = e.Position, e.Velocity, e.SizeMulti
+			ents[#ents + 1] = spack(LEAN_ENTITY, e.Index, t, e.Variant, e.SubType, pos.X, pos.Y, vel.X, vel.Y, e.Size,
+				sm.X, sm.Y, e.EntityCollisionClass, e.GridCollisionClass, e.CollisionDamage, spr:GetFrame(),
+				e.FrameCount, kind, flags, anim, B(e.FlipX), champion, hpf, a, b, c)
+		end
+	end
+	return spack("<I2", #ents) .. table.concat(ents), lasers, monsters_hp, blocking_hp, blocking_count
+end
+
+-- 2026-10-07 (charge): player i's charge counter (abp_turbo's abp_player_charge, registered with the native obs; 0
+-- without it) and its weapon types (HasWeaponType 0 .. 10 as bits).
+local function lean_charge(i)
+	if type(abp_player_charge) ~= "function" then return 0 end
+	return abp_player_charge(i) or 0
+end
+
+local function lean_weapons(p)
+	local mask = 0
+	for w = 0, 10 do
+		if p:HasWeaponType(w) then mask = mask | (1 << w) end
+	end
+	return mask
+end
+
+local function lean_players(n_players)
+	local players = {}
+	for i = 0, n_players - 1 do
+		local p = Isaac.GetPlayer(i)
+		local pos, vel = p.Position, p.Velocity
+		players[#players + 1] = spack(LEAN_PLAYER, p.Index, pos.X, pos.Y, vel.X, vel.Y, p.Size,
+			p:GetHearts(), p:GetMaxHearts(), p:GetSoulHearts(), p:GetBlackHearts(), p:GetBoneHearts(),
+			p:GetEternalHearts(), p:GetGoldenHearts(), p:GetExtraLives(), p:GetNumCoins(), p:GetNumBombs(),
+			p:GetNumKeys(), p.Damage, p.MaxFireDelay, p.ShotSpeed, tear_range(p), p.MoveSpeed, p.Luck, B(p.CanFly),
+			p:GetActiveItem(), p:GetActiveCharge(), B(p:GetActiveItem() ~= 0 and not p:NeedsCharge()),
+			B(p:GetDamageCooldown() > 0), B(p.ControlsEnabled), p:GetHeadDirection(), p:GetFireDirection(),
+			p:GetMovementDirection(), p:GetSprite():GetFrame(), B(p:IsDead() or state.lethal[p.Index] == true),
+			p.FireDelay, p:GetDamageCooldown(), lean_charge(i), lean_weapons(p))
+	end
+	return players
+end
+
+local function lean_doors(room, level)
+	local doors = {}
+	for slot = 0, 7 do
+		local d = room:GetDoor(slot)
+		if d and visible_door(d) then
+			local pos = d.Position
+			local seen = 0
+			pcall(function()
+				local behind = level:GetRoomByIdx(d.TargetRoomIndex)
+				if behind.VisitedCount > 0 then
+					seen = behind.Clear and 3 or 1
+				end
+			end)
+			doors[#doors + 1] = spack("<BBBBffi4", slot, B(d:IsOpen()), B(d:IsLocked()), seen, pos.X, pos.Y,
+				math.tointeger(d.TargetRoomType) or 0)
+		end
+	end
+	return doors
+end
+
+local function hex16(s, at)
+	return (s:sub(at, at + 15):gsub(".", function(ch) return string.format("%02x", ch:byte()) end))
+end
+
+-- mode 2: one comparison of a native result with the Lua one.
+local function native_check(what, equal, native, lua)
+	local s = ABP_NATIVE_OBS
+	s.checks = s.checks + 1
+	if equal then return end
+	s.mismatches = s.mismatches + 1
+	if s.first ~= nil then return end
+	if what == "fixed" then
+		local at = 1
+		while at <= #native and native:byte(at) == lua:byte(at) do at = at + 1 end
+		s.first = string.format("%s frame=%d byte=%d len=%d/%d native=%s lua=%s", what, state.logic_frames, at - 1,
+			#native, #lua, hex16(native, at), hex16(lua, at))
+	else
+		s.first = string.format("%s frame=%d native=%s lua=%s", what, state.logic_frames, native, lua)
+	end
+end
+
+-- The fixed part in Lua: header .. room .. totals .. players .. doors .. entities .. lasers.
+local function lean_fixed_lua(game, room, level, player0, here, extra_flags)
+	local n_players = game:GetNumPlayers()
+	local tl, br = room:GetTopLeftPos(), room:GetBottomRightPos()
+	local players = lean_players(n_players)
+	local doors = lean_doors(room, level)
+	local ents_blob, lasers, monsters_hp, blocking_hp, blocking_count = lean_entities()
+	local flags = (room:IsClear() and 1 or 0) + extra_flags + (game:IsPaused() and 4 or 0)
+	return table.concat({
+		spack("<I4I4I4BBBB", LEAN_MAGIC, state.logic_frames, game:GetFrameCount(), flags, n_players, #doors, #lasers),
+		spack("<i4i4i4i4i4i4i4i4ffff", room:GetType(), room:GetRoomShape(), room:GetGridWidth(), room:GetGridHeight(),
+			here, level:GetStage(), room:GetAliveEnemiesCount(), room:GetFrameCount(),
+			tl.X, tl.Y, br.X, br.Y),
+		spack("<dddd", player0:GetTotalDamageTaken(), monsters_hp, blocking_hp, blocking_count),
+		table.concat(players), table.concat(doors), ents_blob, table.concat(lasers) })
+end
+
+local pack_lean, lean_blocks, lean_fixed   -- defined below; lean_profile times pack_lean
+
+-- Diagnostic (the `lean_profile` command; use a throw-away clone: it moves the terrain checks' state): os.clock
+-- milliseconds of each part of pack_lean in the current state, n times each.
+local function lean_profile(n)
+	local game = Game()
+	local room, level = game:GetRoom(), game:GetLevel()
+	local player0 = Isaac.GetPlayer(0)
+	local ms, t = {}, 0
+	local function timed(name, f)
+		t = os.clock()
+		for _ = 1, n do f() end
+		ms[name] = 1000 * (os.clock() - t) / n
+	end
+	timed("players", function() lean_players(game:GetNumPlayers()) end)
+	timed("doors", function() lean_doors(room, level) end)
+	timed("entities_lua", lean_entities)
+	timed("fixed_lua", function() lean_fixed_lua(game, room, level, player0, lean_room_index(level), 0) end)
+	timed("terrain_step", function() lean_terrain_changed(room, player0, false) end)
+	timed("terrain_full", function() lean.full_at = -100000; lean_terrain_changed(room, player0, false) end)
+	timed("room_index", function() lean_room_index(level) end)
+	timed("map", function() lean_map(level, lean_room_index(level)) end)
+	local mode = state.native_obs
+	if native_lean then
+		timed("fixed_native", function() native_lean(state.logic_frames, 0) end)
+		timed("terrain_native_step", function() native_terrain(state.logic_frames, false) end)
+		local k = 0
+		timed("terrain_native_full", function() k = k + 100; native_terrain(state.logic_frames + k, false) end)
+	end
+	for m = 0, (native_lean and 1 or 0) do
+		state.native_obs = m
+		timed("pack_lean_mode" .. m, function() pack_lean("step") end)
+	end
+	state.native_obs = mode
+	-- the per-step command path (2026-10-04 breakdown): the JSON step command's parse, apply_action (with the native
+	-- input push), the step branch's prelude, the "L" frame's header line
+	local line = '{"cmd":"step","repeat":4,"move":3,"shoot":2,"bomb":0,"item":0}'
+	timed("cmd_json_decode", function() json.decode(line) end)
+	local cmd = json.decode(line)
+	local held0, trig0 = state.held, state.triggered
+	timed("apply_action", function() apply_action(cmd) end)
+	timed("push_input", push_input)
+	timed("step_prelude", function()
+		state.nav = { hit = false, changed = false, min = -1 }
+		state.was_clear = Game():GetRoom():IsClear()
+	end)
+	local payload = pack_lean("step")
+	timed("frame_header", function() return "L " .. #payload .. " step " .. state.seq .. "\n" .. payload end)
+	-- the terrain block (resent every LEAN_FULL_EVERY logic frames once anything changed): Lua tables, JSON
+	timed("terrain_block_tables", function() terrain_record(room, player0, true); grid_records(room) end)
+	timed("terrain_block_build", function()
+		return spack("<I4s4s4", 1, json.encode(terrain_record(room, player0, true)), json.encode(grid_records(room)))
+	end)
+	if native_tkey then timed("terrain_key_native", function() native_tkey(false) end) end
+	state.held, state.triggered = held0, trig0
+	push_input()
+	state.terrain_dirty = true
+	return ms
+end
+
+local function lean_handles()
+	local game = Game()
+	return game, game:GetRoom(), game:GetLevel(), Isaac.GetPlayer(0)
+end
+
+function pack_lean(event)
+	local mode = native_lean ~= nil and state.native_obs or 0
+	local force = event ~= "step" or state.terrain_dirty
+	local game, room, level, player0   -- mode 1 needs them only for the rare Lua-built parts
+	if mode ~= 1 then game, room, level, player0 = lean_handles() end
+	local resend, here, clear
+	if mode ~= 0 then resend, here, clear = native_terrain(state.logic_frames, force) end
+	if resend == nil or mode == 2 then
+		if game == nil then game, room, level, player0 = lean_handles() end
+		local lr = lean_terrain_changed(room, player0, force)
+		local lh, lc = lean_room_index(level), room:IsClear()
+		if resend ~= nil then
+			native_check("terrain", resend == lr and here == lh and clear == lc,
+				tostring(resend) .. "," .. tostring(here) .. "," .. tostring(clear),
+				tostring(lr) .. "," .. tostring(lh) .. "," .. tostring(lc))
+		end
+		resend, here, clear = lr, lh, lc
+	end
+	state.terrain_dirty = false
+	local terrain, map, inv = lean_blocks(event, resend, here, clear)
+	return lean_fixed(mode, here, (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) .. terrain
+		.. map .. inv
+end
+
+-- The terrain block (when the terrain check says resend) and the map block (when it is due and changed) of a lean
+-- observation; "" for a block that is not sent.
+function lean_blocks(event, resend, here, clear)
+	local terrain = ""
+	if resend then
+		local _, room, _, player0 = lean_handles()
+		terrain_cache.version = terrain_cache.version + 1
+		terrain_cache.sig = nil
+		local tc, mode = ABP_TERRAIN_CACHE, native_tkey ~= nil and state.terrain_cache or 0
+		local same = false
+		if mode ~= 0 then same = native_tkey(true) and lean.tblock ~= nil end
+		local tj, gj
+		if same and mode == 1 then
+			tj, gj = lean.tblock[1], lean.tblock[2]
+			tc.hits = tc.hits + 1
+		else
+			tj, gj = json.encode(terrain_record(room, player0, true)), json.encode(grid_records(room))
+			tc.builds = tc.builds + 1
+			if same then
+				tc.checks = tc.checks + 1
+				if tj ~= lean.tblock[1] or gj ~= lean.tblock[2] then tc.mismatches = tc.mismatches + 1 end
+			end
+			lean.tblock = mode ~= 0 and { tj, gj } or nil
+		end
+		terrain = spack("<I4s4s4", terrain_cache.version, tj, gj)
+	end
+	local map = ""
+	local map_key = here * 2 + (clear and 1 or 0)
+	-- items / run mode: a new floor's start room may have the index of the room the trapdoor was in
+	if state.lean_items then map_key = map_key + 1000 * Game():GetLevel():GetStage() end
+	if event ~= "step" or map_key ~= lean.map_key or state.logic_frames - lean.map_at >= LEAN_FULL_EVERY
+		or state.logic_frames < lean.map_at then
+		lean.map_key, lean.map_at = map_key, state.logic_frames
+		local ok, block = pcall(lean_map, Game():GetLevel(), here)
+		if not ok then block = spack("<B", 0) end
+		if event ~= "step" or block ~= lean.map_sig then
+			lean.map_sig = block
+			map = block
+		end
+	end
+	local inv = state.lean_items and lean_inventory(event, here) or ""
+	return terrain, map, inv
+end
+
+-- The fixed part of a lean observation (header .. entities .. lasers): native in mode 1 / 2 when it can, else Lua.
+function lean_fixed(mode, here, extra)
+	if mode ~= 0 and next(state.lethal) == nil then
+		local s = ABP_NATIVE_OBS
+		local fixed, why = native_lean(state.logic_frames, extra)
+		if fixed ~= nil then
+			if mode == 1 then
+				s.native = s.native + 1
+				return fixed
+			end
+			local ref = lean_fixed_lua(Game(), Game():GetRoom(), Game():GetLevel(), Isaac.GetPlayer(0), here, extra)
+			native_check("fixed", fixed == ref, fixed, ref)
+			return ref
+		end
+		s.fallbacks = s.fallbacks + 1
+		s.last_fallback = why
+	end
+	local game, room, level, player0 = lean_handles()
+	return lean_fixed_lua(game, room, level, player0, here, extra)
 end
 
 local function send_raw(data)
@@ -1281,6 +1997,14 @@ end
 
 local function send_obs_now(event)
 	state.seq = state.seq + 1
+	if state.lean then
+		local ok, payload = pcall(pack_lean, event)
+		if not ok then
+			log("lean pack failed: " .. tostring(payload))
+			return send({ type = "error", msg = "pack: " .. tostring(payload) })
+		end
+		return send_raw("L " .. #payload .. " " .. event .. " " .. state.seq .. "\n" .. payload)
+	end
 	if state.obs_format == 2 then
 		if state.obs_validate then
 			-- Validation: the JSON message first, then the binary frame of the same state.
@@ -1310,6 +2034,9 @@ end
 
 local function do_reset(cmd)
 	state.held = {}; state.triggered = {}; state.frames_left = 0; state.play = nil
+	push_input()
+	state.goal, state.nav = nil, { hit = false, changed = false, min = -1 }   -- abp-0.2.13
+	state.stop_clear = false
 	state.terrain_dirty = true
 	state.stats.resets = state.stats.resets + 1
 	zero_events()
@@ -1332,9 +2059,16 @@ local function play_next()
 	local p = state.play
 	p.i = p.i + 1
 	local code = math.floor(tonumber(p.codes[p.i]) or 0)
-	apply_action({ move = code % 9, shoot = (code // 9) % 5, bomb = (code // 45) % 2, item = (code // 90) % 2 })
+	-- 2026-10-06 (items): + 180 x the pill / card action (codes below 180 as before)
+	apply_action({ move = code % 9, shoot = (code // 9) % 5, bomb = (code // 45) % 2, item = (code // 90) % 2,
+		pill = (code // 180) % 2 })
 	state.frames_left = math.max(1, math.floor(tonumber(p.repeats and p.repeats[p.i]) or p.rep))
 	state.stats.steps = state.stats.steps + 1
+	if ABP_PU.play and state.frames_left > 1 and state.lean and state.native_input and not state.stop_clear
+		and (state.client ~= nil or state.headless) and duel.key == nil and state.goal == nil then
+		pu_arm(state.frames_left - 1)   -- see ABP_PU.play
+		ABP_PU.play_armed = ABP_PU.play_armed + 1
+	end
 end
 
 -- Where a step observation would be sent: true when the batch goes on with its next action; false when it has ended
@@ -1344,33 +2078,232 @@ local function play_continue()
 	local player = Isaac.GetPlayer(0)
 	local stop = nil
 	if player ~= nil and (player:IsDead() or state.lethal[player.Index] == true) then stop = "dead"
+	elseif state.nav.changed and p.stop_room then stop = "room"   -- abp-0.2.13 (2026-10-07: only with stop_room)
 	elseif p.stop_clear and Game():GetRoom():IsClear() then stop = "clear"
 	elseif p.i >= #p.codes then stop = "done" end
 	if stop == nil then
+		-- 2026-10-07: a room change ended the action under way (as it ends a step); the next action starts with a fresh
+		-- record, as begin_step_line gives each step one
+		if state.nav.changed then state.nav = { hit = false, changed = false, min = -1 } end
 		play_next()
 		return true
 	end
 	state.play = nil
-	send({ type = "ok", cmd = "play", played = p.i, stop = stop })
+	if state.headless then   -- fork_many: kept for the report, no message
+		state.headless.played, state.headless.stop = p.i, stop
+	else
+		send({ type = "ok", cmd = "play", played = p.i, stop = stop })
+	end
 	return false
 end
 
-local function wait_command()
-	while state.client do
-		local line, err = state.client:receive("*l")
-		if not line then disconnect(err); return end
+-- abp-0.2.14 fork, in the clone (abp_turbo ABP_FORK answered "0"): the parent's sockets are private dummies here and are
+-- dropped; the clone connects to the address in the command, says hello there and takes its commands from that
+-- connection, in the state the parent was in when it read the fork command. Without a connection it ends.
+local function fork_clone(cmd)
+	state.clone = true
+	if tonumber(cmd.alarm) then getenv("ABP_ALARM:" .. math.floor(tonumber(cmd.alarm))) end   -- real seconds it may live
+	-- reseed: the clone's global MT starts anew, so clones of one state differ in the game's later random draws
+	if tonumber(cmd.reseed) then getenv("ABP_RESEED:" .. math.floor(tonumber(cmd.reseed))) end
+	if cmd.lean ~= nil then state.lean = cmd.lean == true end
+	-- 2026-10-04 (frame-cost work, off by default): ISAAC_RL_LUA_GCPAUSE=<n> sets the Lua collector's pause in a lean
+	-- clone (collectgarbage "setpause"; Lua's default 200 = a cycle each time the heap doubles). A clone lives about an
+	-- episode and makes ~8 KB of Lua garbage per decision on a ~2 MB heap; a larger pause means fewer marking passes over
+	-- the heap it shares copy-on-write with its parent. Lua memory only: nothing the game reads.
+	local gcpause = state.lean and math.tointeger(tonumber(getenv("ISAAC_RL_LUA_GCPAUSE") or "")) or nil
+	if gcpause and gcpause > 0 then collectgarbage("setpause", gcpause) end
+	state.terrain_dirty = true   -- the clone's first observation carries the terrain: its client may be a new one
+	if state.lean_items then   -- items / run mode: and the map and inventory blocks (a restore clone's first observation
+		lean.map_key, lean.map_sig, INV.sent = nil, nil, nil   -- is a play's step observation)
+	end
+	pcall(function() state.client:close() end)
+	pcall(function() state.server:close() end)
+	state.server = true   -- never accepts: MC_POST_UPDATE only checks that it is set
+	state.client = nil
+	local c = socket.connect(tostring(cmd.host or cfg.host), math.floor(tonumber(cmd.port) or 0))
+	if not c then getenv("ABP_EXIT"); return end
+	c:settimeout(nil)
+	c:setoption("tcp-nodelay", true)
+	state.client = c
+	set_native_input(state.lean)   -- needs the connection: without a client the engine reads the real devices
+	send({ type = "hello", version = VERSION, engine = "abplus-1.06", clone = true, tag = cmd.tag,
+		game_frame = Game():GetFrameCount(), logic_frames = state.logic_frames, turbo = getenv("ABP_FORK_COUNTERS"),
+		step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items })
+end
+
+-- fork_many (2026-10-04, same VERSION; hello says fork_many = true when abp_turbo has ABP_FM_*): the hindsight teacher's
+-- children in one command. {"cmd":"fork_many","batches":[[code, ...], ...],"repeat":r,"alarm":s,"stop_clear":b} in lean
+-- mode: one clone per batch, made one after the other from this state. A clone gets no connection: it plays its batch
+-- exactly as a `play` command (same repeat and stop_clear) sent to a `fork` clone of this state would (state.headless
+-- stands in for the client where the game's course depends on one: lethal-hit blocking, invincibility, input; native
+-- input stays on as the parent had it), and at the frame the play's observation would be built it reports "<batch>
+-- <player 0's total damage taken> <dead 0/1> <played> <stop>" through abp_turbo's pipe and ends. The parent answers
+-- {"type":"ok","cmd":"fork_many","forked":n,"results":"<report>;<report>;..."} once every clone has reported or ended.
+local function fork_headless(cmd, i, codes)
+	state.clone = true
+	if tonumber(cmd.alarm) then getenv("ABP_ALARM:" .. math.floor(tonumber(cmd.alarm))) end   -- real seconds it may live
+	pcall(function() state.client:close() end)
+	pcall(function() state.server:close() end)
+	state.server = true   -- never accepts
+	state.client = nil
+	state.headless = { batch = i, played = 0, stop = "?", stat = cmd.stat == true }
+	state.goal, state.nav = nil, { hit = false, changed = false, min = -1 }
+	state.play = { codes = codes, repeats = nil, i = 0, stop_clear = cmd.stop_clear == true,
+		stop_room = cmd.stop_room == true, rep = math.max(1, math.floor(tonumber(cmd["repeat"]) or cfg.default_repeat)) }
+	play_next()
+end
+
+local function fork_many(cmd)
+	local batches = cmd.batches
+	local ok = FM_AVAILABLE and state.lean and state.native_input and duel.key == nil and type(batches) == "table"
+		and #batches > 0
+	for _, codes in ipairs(ok and batches or {}) do
+		if type(codes) ~= "table" or #codes == 0 then ok = false end
+	end
+	if not ok then
+		send({ type = "error", msg = "fork_many: needs lean mode, native input, abp_turbo ABP_FM and non-empty batches" })
+		return false
+	end
+	if getenv("ABP_FM_OPEN") ~= "1" then
+		send({ type = "error", msg = "fork_many: no pipe" })
+		return false
+	end
+	-- self_last: this process plays the last batch itself (no fork for it) and answers at its end; it is no longer in
+	-- the state it was cloned in afterwards (the teacher closes it)
+	local own = cmd.self_last == true and #batches or nil
+	local n = 0
+	for i, codes in ipairs(batches) do
+		if i == own then break end
+		local answer = getenv("ABP_FORK")
+		if answer == "0" then
+			fork_headless(cmd, i, codes)
+			return true   -- the clone: its frames run
+		elseif answer == nil or answer == "-1" then
+			own = nil
+			break
+		end
+		n = n + 1
+	end
+	if own ~= nil then
+		state.headless = { batch = own, played = 0, stop = "?", parent = true, forked = n, stat = cmd.stat == true }
+		state.goal, state.nav = nil, { hit = false, changed = false, min = -1 }
+		state.play = { codes = batches[own], repeats = nil, i = 0, stop_clear = cmd.stop_clear == true,
+			stop_room = cmd.stop_room == true, rep = math.max(1, math.floor(tonumber(cmd["repeat"]) or cfg.default_repeat)) }
+		play_next()
+		return true   -- its frames run; headless_report answers
+	end
+	send({ type = "ok", cmd = "fork_many", forked = n, results = getenv("ABP_FM_COLLECT:" .. n) or "" })
+	return false
+end
+
+
+-- pickup_block (2026-10-07, same VERSION; the counterfactual branches of tok_branch.py): {"cmd":"pickup_block",
+-- "subtype":id,"x":..,"y":..} makes the collectible pedestal (pickup variant 100) holding that collectible nearest to
+-- (x, y) (the player when absent) untakeable for the rest of this process and of its clones: the engine's
+-- MC_PRE_PICKUP_COLLISION is answered false for player contacts with it, which in AB+ v1.06 keeps the collision (the
+-- player bumps into it as into a shop item it cannot afford) and skips the pickup code (checked 2026-10-07: nil takes,
+-- false keeps the pedestal and the player stands at it, true lets the player through and the pedestal vanishes).
+-- Nothing else is written. The pedestal is known by its InitSeed and by (room index, position) (a room left and
+-- entered again rebuilds it). The callback is registered at the first such command only: a process that never gets
+-- one runs exactly as before. Answers {"type":"ok","cmd":"pickup_block","found":0/1,"seed":..,"subtype":..,"x":..,"y":..}.
+local PICKUP_BLOCK = nil   -- { seeds = {InitSeed = true}, places = {{room, x, y}}, contacts = n }
+local function pickup_blocked(pickup)
+	local b = PICKUP_BLOCK
+	if b.seeds[pickup.InitSeed] then return true end
+	if #b.places == 0 then return false end
+	local here = lean_room_index(Game():GetLevel())
+	local pos = pickup.Position
+	for _, pl in ipairs(b.places) do
+		if pl[1] == here and math.abs(pos.X - pl[2]) < 1 and math.abs(pos.Y - pl[3]) < 1 then return true end
+	end
+	return false
+end
+local function pickup_block(cmd)
+	local x, y = tonumber(cmd.x), tonumber(cmd.y)
+	local p = Isaac.GetPlayer(0)
+	if x == nil or y == nil then x, y = p.Position.X, p.Position.Y end
+	local want = math.tointeger(tonumber(cmd.subtype))
+	local best, best_d = nil, nil
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		if e.Type == EntityType.ENTITY_PICKUP and e.Variant == 100 and (want == nil or e.SubType == want) then
+			local d = (e.Position.X - x) ^ 2 + (e.Position.Y - y) ^ 2
+			if best_d == nil or d < best_d then best, best_d = e, d end
+		end
+	end
+	if best == nil then return { type = "ok", cmd = "pickup_block", found = 0 } end
+	if PICKUP_BLOCK == nil then
+		PICKUP_BLOCK = { seeds = {}, places = {}, contacts = 0 }
+		mod:AddCallback(ModCallbacks.MC_PRE_PICKUP_COLLISION, function(_, pickup, other, low)
+			if PICKUP_BLOCK == nil or other == nil or other.Type ~= EntityType.ENTITY_PLAYER then return nil end
+			if pickup.Variant ~= 100 or not pickup_blocked(pickup) then return nil end
+			PICKUP_BLOCK.contacts = PICKUP_BLOCK.contacts + 1
+			return false
+		end)
+	end
+	PICKUP_BLOCK.seeds[best.InitSeed] = true
+	PICKUP_BLOCK.places[#PICKUP_BLOCK.places + 1] = { lean_room_index(Game():GetLevel()), best.Position.X, best.Position.Y }
+	return { type = "ok", cmd = "pickup_block", found = 1, seed = best.InitSeed, subtype = best.SubType,
+		x = best.Position.X, y = best.Position.Y, contacts = PICKUP_BLOCK.contacts }
+end
+
+-- Step line (2026-10-04, same VERSION; hello says step_line = true): "S <repeat> <move> <shoot> <bomb> <item>\n" is the
+-- step command {"cmd":"step","repeat":..,"move":..,"shoot":..,"bomb":..,"item":..} without goal, stop_clear or duel
+-- fields, without its JSON parse (json.decode of a step command cost 0.07-0.12 ms, more than the native observation).
+-- 2026-10-06 (items): an optional sixth number is the pill / card action ("S <repeat> <move> <shoot> <bomb> <item>
+-- <pill>"); without it 0.
+local step_cmd = { move = 0, shoot = 0, bomb = 0, item = 0, pill = 0 }
+local function begin_step_line(rep, move, shoot, bomb, item, pill)
+	step_cmd.move, step_cmd.shoot, step_cmd.bomb, step_cmd.item, step_cmd.pill = move, shoot, bomb, item, pill or 0
+	apply_action(step_cmd)
+	state.goal = nil
+	state.nav = { hit = false, changed = false, min = -1 }
+	state.stop_clear = false
+	state.was_clear = Game():GetRoom():IsClear()
+	if duel.key ~= nil then duel.move, duel.shoot = 0, 0 end
+	state.frames_left = math.max(1, rep)
+	state.stats.steps = state.stats.steps + 1
+	if ABP_PU.enabled and state.frames_left > 1 and state.lean and state.native_input and state.client ~= nil
+		and not state.headless and duel.key == nil and state.play == nil then
+		pu_arm(state.frames_left - 1)
+		ABP_PU.armed = ABP_PU.armed + 1
+	end
+end
+
+-- One command line; true when the frame loop goes on (a step, play, reset or close), false to wait for the next.
+local function handle_command(line)
+		if line:byte(1) == 83 then   -- "S": a step line
+			local rep, move, shoot, bomb, item, pill = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+) (%d+)$")
+			if rep == nil then
+				rep, move, shoot, bomb, item = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+)$")
+				pill = "0"
+			end
+			if rep == nil then
+				send({ type = "error", msg = "bad step line" })
+				return false
+			end
+			begin_step_line(math.tointeger(tonumber(rep)), math.tointeger(tonumber(move)),
+				math.tointeger(tonumber(shoot)), math.tointeger(tonumber(bomb)), math.tointeger(tonumber(item)),
+				math.tointeger(tonumber(pill)))
+			return true
+		end
 		local ok, cmd = pcall(json.decode, line)
 		if not ok or type(cmd) ~= "table" then
 			send({ type = "error", msg = "bad json" })
 		elseif cmd.cmd == "step" then
 			apply_action(cmd)
+			-- abp-0.2.13: the step's goal and a fresh record of what happens during it
+			local g = cmd.goal
+			state.goal = (type(g) == "table" and #g == 3) and { tonumber(g[1]), tonumber(g[2]), tonumber(g[3]) } or nil
+			state.nav = { hit = false, changed = false, min = -1 }
+			state.stop_clear = cmd.stop_clear == true
+			state.was_clear = Game():GetRoom():IsClear()
 			if duel.key ~= nil then   -- abp-0.2.9: the duel NPC's move and shoot for the frames of this step
 				duel.move = math.max(0, math.min(8, math.floor(tonumber(cmd.duel_move) or 0)))
 				duel.shoot = math.max(0, math.min(4, math.floor(tonumber(cmd.duel_shoot) or 0)))
 			end
 			state.frames_left = math.max(1, math.floor(tonumber(cmd["repeat"]) or cfg.default_repeat))
 			state.stats.steps = state.stats.steps + 1
-			return
+			return true
 		elseif cmd.cmd == "play" then   -- abp-0.2.12
 			if type(cmd.actions) ~= "table" or #cmd.actions == 0 then
 				send({ type = "error", msg = "play: no actions" })
@@ -1379,14 +2312,63 @@ local function wait_command()
 			elseif duel.key ~= nil then
 				send({ type = "error", msg = "play: not with the duel NPC" })
 			else
+				state.goal, state.nav = nil, { hit = false, changed = false, min = -1 }   -- abp-0.2.13
 				state.play = { codes = cmd.actions, repeats = cmd.repeats, i = 0, stop_clear = cmd.stop_clear == true,
+					stop_room = cmd.stop_room == true,
 					rep = math.max(1, math.floor(tonumber(cmd["repeat"]) or cfg.default_repeat)) }
 				play_next()
-				return
+				return true
 			end
 		elseif cmd.cmd == "reset" then
 			do_reset(cmd)
-			return
+			return true
+		elseif cmd.cmd == "lean" then   -- abp-0.2.14
+			state.lean = cmd.enabled ~= false
+			set_native_input(state.lean)
+			state.terrain_dirty = true
+			send({ type = "ok", cmd = "lean", enabled = state.lean })
+		elseif cmd.cmd == "lean_items" then   -- 2026-10-06 (items, Phase A): the inventory block and run-mode map rules
+			if cmd.enabled ~= nil then
+				state.lean_items = cmd.enabled == true
+				lean.map_key, lean.map_sig, INV.sent = nil, nil, nil
+			end
+			send({ type = "ok", cmd = "lean_items", enabled = state.lean_items, scans = INV.scans, checks = INV.checks,
+				misses = INV.misses, first_miss = INV.first_miss, ids = inv_ids() })
+		elseif cmd.cmd == "lean_profile" then   -- native obs: cost of each part of pack_lean (diagnostic)
+			local ok, ms = pcall(lean_profile, math.max(1, math.floor(tonumber(cmd.n) or 100)))
+			send(ok and { type = "ok", cmd = "lean_profile", ms = ms } or { type = "error", msg = tostring(ms) })
+		elseif cmd.cmd == "native_obs" then   -- native obs: 0 Lua, 1 native when available, 2 check (pack_lean)
+			if cmd.mode ~= nil then
+				state.native_obs = math.tointeger(tonumber(cmd.mode)) or 1
+				state.terrain_dirty = true   -- the paths keep their own terrain state: a full pass resyncs it
+			end
+			local s = ABP_NATIVE_OBS
+			send({ type = "ok", cmd = "native_obs", mode = state.native_obs, available = s.available, checks = s.checks,
+				mismatches = s.mismatches, fallbacks = s.fallbacks, last_fallback = s.last_fallback, native = s.native,
+				first = s.first, turbo = getenv("ABP_OBS_STATUS") })
+		elseif cmd.cmd == "fork_many" then   -- 2026-10-04 (see fork_many)
+			if fork_many(cmd) then return true end
+		elseif cmd.cmd == "pickup_block" then   -- 2026-10-07 (see pickup_block)
+			local ok, answer = pcall(pickup_block, cmd)
+			send(ok and answer or { type = "error", msg = "pickup_block: " .. tostring(answer) })
+		elseif cmd.cmd == "native_step" then   -- native step: 0 off, 1 on when available (see native_step_obs)
+			if cmd.mode ~= nil then state.native_step = math.tointeger(tonumber(cmd.mode)) or 1 end
+			if cmd.terrain_cache ~= nil then state.terrain_cache = math.tointeger(tonumber(cmd.terrain_cache)) or 1 end
+			local s, tc = ABP_NATIVE_STEP, ABP_TERRAIN_CACHE
+			send({ type = "ok", cmd = "native_step", mode = state.native_step, available = s.available, steps = s.steps,
+				lines = s.lines, other = s.other, fallbacks = s.fallbacks, blocks = s.blocks, last_fallback = s.last_fallback,
+				turbo = getenv("ABP_OBS_STATUS"), prof = getenv("ABP_STEP_PROF"), terrain_cache = state.terrain_cache,
+				tc_available = tc.available, tc_hits = tc.hits, tc_builds = tc.builds, tc_checks = tc.checks,
+				tc_mismatches = tc.mismatches })
+		elseif cmd.cmd == "fork" then   -- abp-0.2.14
+			local answer = getenv("ABP_FORK")
+			if answer == "0" then
+				fork_clone(cmd)
+			elseif answer == nil or answer == "-1" then
+				send({ type = "error", msg = "fork: " .. (answer == nil and "abp_turbo has no ABP_FORK" or "fork failed") })
+			else
+				send({ type = "ok", cmd = "fork", pid = tonumber(answer), tag = cmd.tag })
+			end
 		elseif cmd.cmd == "exec" then
 			state.terrain_dirty = true
 			Isaac.ExecuteCommand(tostring(cmd.command or ""))
@@ -1437,19 +2419,124 @@ local function wait_command()
 		elseif cmd.cmd == "control" then
 			state.control = (cmd.enabled ~= false)
 			if not state.control then state.held = {}; state.triggered = {} end
+			set_native_input(state.lean)
 			send({ type = "ok", cmd = "control", enabled = state.control })
 		elseif cmd.cmd == "close" then
 			disconnect("close requested")
-			return
+			return true
 		else
 			send({ type = "error", msg = "unknown cmd" })
 		end
+		return false
+end
+
+local function wait_command()
+	while state.client do
+		local line, err = state.client:receive("*l")
+		if not line then disconnect(err); return end
+		if handle_command(line) then return end
 	end
 end
 
+-- In a fork_many clone, where its play's observation would be built: the report, then the clone ends. In the parent
+-- that played the last batch itself (self_last): the answer with every report, then the next command.
+local function headless_report()
+	local p = Isaac.GetPlayer(0)
+	local dead = p:IsDead() or state.lethal[p.Index] == true
+	local h = state.headless
+	local line = string.format("%d %.17g %d %d %s", h.batch, p:GetTotalDamageTaken(), dead and 1 or 0, h.played, h.stop)
+	-- 2026-10-05 (diagnostic, "stat":true in the command): abp_turbo's ABP_FORK_TIMES of this process after the report's
+	-- fields (the teacher's cost breakdown; a client that does not ask gets the five fields as before). The parent
+	-- collects first (and then waits for its clones to exit, so the times include their exits).
+	if h.parent then
+		state.headless = nil
+		local res = getenv("ABP_FM_COLLECT:" .. h.forked .. (h.stat and ":w" or "")) or ""
+		if h.stat then line = line .. " " .. (getenv("ABP_FORK_TIMES") or "") end
+		send({ type = "ok", cmd = "fork_many", forked = h.forked, results = res .. line .. ";" })
+		wait_command()
+		return
+	end
+	if h.stat then line = line .. " " .. (getenv("ABP_FORK_TIMES") or "") end
+	getenv("ABP_FM_RESULT:" .. line)
+	getenv("ABP_EXIT")
+end
+
+-- Native step (2026-10-04, same VERSION: the bytes on the wire are unchanged). In lean mode with the native observation
+-- (mode 1) and abp_turbo's abp_native_step, a step observation's fixed part is built and written to the client's socket
+-- by abp_turbo, which then waits for the next command and takes it when it is a step line: no Lua string of the
+-- payload, no luasocket send / receive, no JSON. The terrain check and the terrain / map blocks are pack_lean's (here);
+-- when a block is sent, or the native fixed part hands over (a laser), the observation is built and sent as before.
+-- Any other command is left in the socket for wait_command. ISAAC_RL_NATIVE_STEP=0 or the `native_step` command (mode
+-- 0 / 1) switches it off / on; a client gets the step line (hello: step_line) either way.
+local native_step = nil
+if native_lean ~= nil and type(abp_native_step) == "function" then native_step = abp_native_step end
+state.native_step = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_STEP") or "1")) or 1
+ABP_NATIVE_STEP = { available = native_step ~= nil, steps = 0, lines = 0, other = 0, fallbacks = 0, blocks = 0,
+	last_fallback = nil }
+
+local function send_lean_payload(build)
+	local ok, payload = pcall(build)
+	if not ok then
+		log("lean pack failed: " .. tostring(payload))
+		return send({ type = "error", msg = "pack: " .. tostring(payload) })
+	end
+	return send_raw("L " .. #payload .. " step " .. state.seq .. "\n" .. payload)
+end
+
+-- In place of send_obs("step") and wait_command(): false when the native step does not apply.
+local function native_step_obs()
+	local c = state.client
+	if native_step == nil or state.native_step ~= 1 or not state.lean or state.native_obs ~= 1 or c == nil
+		or next(state.lethal) ~= nil or c:dirty() then
+		return false
+	end
+	local resend, here, clear = native_terrain(state.logic_frames, state.terrain_dirty)
+	if resend == nil then return false end
+	state.terrain_dirty = false
+	state.seq = state.seq + 1
+	state.credits = {}
+	local s = ABP_NATIVE_STEP
+	local consecutive = s.consecutive
+	s.consecutive = false
+	local ok, terrain, map, inv = pcall(lean_blocks, "step", resend, here, clear)
+	if not ok or terrain ~= "" or map ~= "" or inv ~= "" then   -- a block goes with it: built and sent as pack_lean does
+		s.blocks = s.blocks + 1
+		local sent = send_lean_payload(function()
+			if not ok then error(terrain) end
+			return lean_fixed(1, here, (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) ..
+				terrain .. map .. inv
+		end)
+		if sent then wait_command() end
+		return true
+	end
+	local code, a, b, cc, d, e, f = native_step(c:getfd(), state.logic_frames, state.seq, consecutive)
+	if code == 1 then   -- a step line: (repeat, move, shoot, bomb, item[, pill]: a library without it gives nil = 0)
+		s.steps, s.lines, s.consecutive = s.steps + 1, s.lines + 1, true
+		ABP_NATIVE_OBS.native = ABP_NATIVE_OBS.native + 1
+		begin_step_line(a, b, cc, d, e, f)
+	elseif code == 2 or code == 3 then   -- sent; another kind of command waits in the socket, or a bad step line
+		s.steps, s.other = s.steps + 1, s.other + 1
+		ABP_NATIVE_OBS.native = ABP_NATIVE_OBS.native + 1
+		if code == 3 then send({ type = "error", msg = "bad step line" }) end
+		wait_command()
+	elseif code == 0 then   -- nothing sent: the native fixed part handed over (a laser)
+		s.fallbacks, s.last_fallback = s.fallbacks + 1, a
+		if send_lean_payload(function() return lean_fixed(1, here, 0) end) then wait_command() end
+	else   -- the connection failed
+		disconnect(a)
+	end
+	return true
+end
+
 mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, function()
+	if pu_arm ~= nil then pu_arm(0) end   -- a room change ends the step at its next MC_POST_UPDATE (post-update skip)
 	state.room_ready = true
 	state.terrain_dirty = true
+	-- abp-0.2.13: a room change during a step or play batch ends it at the new room's first logic frame
+	if state.frames_left > 0 or state.play ~= nil then
+		state.nav.changed = true
+		state.goal = nil
+	end
 end)
 
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, function(_, from_save)
@@ -1496,13 +2583,13 @@ mod:AddCallback(ModCallbacks.MC_ENTITY_TAKE_DMG, function(_, entity, amount, fla
 	end
 	-- abp-0.2.4: an invincible player takes no damage (returning false cancels it, and the later
 	-- callbacks of the same event are not called).
-	if state.invincible and state.client then
+	if state.invincible and (state.client or state.headless) then
 		state.combat.blocked_hits = state.combat.blocked_hits + 1
 		return false
 	end
 	state.events.damage = state.events.damage + 1
 	if duel.key ~= nil and not state.lethal[p.Index] then duel_player_damage(p, amount, source) end   -- abp-0.2.9
-	if cfg.block_lethal and state.client and p:GetExtraLives() == 0 and amount >= health_units(p) then
+	if cfg.block_lethal and (state.client or state.headless) and p:GetExtraLives() == 0 and amount >= health_units(p) then
 		if not state.lethal[p.Index] then
 			state.lethal[p.Index] = true
 			state.combat.player_damage_events = state.combat.player_damage_events + 1
@@ -1514,6 +2601,7 @@ mod:AddCallback(ModCallbacks.MC_ENTITY_TAKE_DMG, function(_, entity, amount, fla
 end)
 mod:AddCallback(ModCallbacks.MC_POST_FIRE_TEAR, function(_, tear)
 	state.events.tears = state.events.tears + 1
+	if state.lean then return end   -- nothing resolves the tables below in lean mode
 	local key = entity_key(tear)
 	state.tears_live[key] = tear   -- abp-0.2.5: followed until resolved (resolve_tears)
 	-- abp-0.2.7: MC_POST_UPDATE (which counts logic_frames) runs after the entities of the frame.
@@ -1613,6 +2701,7 @@ mod:AddCallback(ModCallbacks.MC_PRE_TEAR_COLLISION, function(_, tear, other, low
 end)
 mod:AddCallback(ModCallbacks.MC_POST_NPC_DEATH, function(_, npc)
 	state.events.npc_deaths = state.events.npc_deaths + 1
+	if state.lean then return end
 	local key = entity_key(npc)
 	state.health.deaths[key] = true
 	-- IsDead() can turn true a frame before this callback, when update_lineage has already counted
@@ -1623,6 +2712,7 @@ mod:AddCallback(ModCallbacks.MC_POST_NPC_DEATH, function(_, npc)
 	end
 end)
 mod:AddCallback(ModCallbacks.MC_POST_NPC_INIT, function(_, npc)
+	if state.lean then return end
 	state.lineage_born[#state.lineage_born + 1] = npc
 end)
 mod:AddCallback(ModCallbacks.MC_PRE_SPAWN_CLEAN_AWARD, function(_, rng, pos)
@@ -1631,15 +2721,23 @@ mod:AddCallback(ModCallbacks.MC_PRE_SPAWN_CLEAN_AWARD, function(_, rng, pos)
 end)
 
 mod:AddCallback(ModCallbacks.MC_POST_UPDATE, function()
+	if pu_take ~= nil then   -- the frames abp_turbo answered for this callback (post-update skip)
+		local k = pu_take()
+		if k > 0 then state.logic_frames, state.frames_left = state.logic_frames + k, state.frames_left - k end
+	end
 	state.logic_frames = state.logic_frames + 1
-	update_combat()
+	if not state.lean then update_combat() end
 	if not state.bind_attempted then try_bind() end
 	if not state.server then return end
-	if not state.client then
+	if state.clone and not state.client and not state.headless then getenv("ABP_EXIT") end   -- abp-0.2.14
+	if not state.client and not state.headless then
 		try_accept()
 		if not state.client then return end
 	end
-	state.triggered = {}
+	if next(state.triggered) ~= nil then   -- (2026-10-04: no new table per frame when there is nothing to clear)
+		state.triggered = {}
+		if state.native_input then push_input() end
+	end
 	if state.pending_reset then
 		if not state.room_ready then return end
 		state.settle = state.settle - 1
@@ -1648,9 +2746,26 @@ mod:AddCallback(ModCallbacks.MC_POST_UPDATE, function()
 		if send_obs("reset") then wait_command() end
 		return
 	end
-	if state.frames_left > 0 then state.frames_left = state.frames_left - 1 end
+	if state.frames_left > 0 then
+		-- abp-0.2.13: the goal check of this logic frame; a reached goal or a room change ends the step here
+		local goal = state.goal
+		local player = goal ~= nil and Isaac.GetPlayer(0) or nil   -- (2026-10-04: the player only with a goal)
+		if goal ~= nil and player ~= nil then
+			local d = player.Position:Distance(Vector(goal[1], goal[2]))
+			if state.nav.min < 0 or d < state.nav.min then state.nav.min = d end
+			if d <= goal[3] then state.nav.hit = true end
+		end
+		if state.nav.hit or state.nav.changed then state.frames_left = 1 end
+		if state.stop_clear and not state.was_clear and Game():GetRoom():IsClear() then state.frames_left = 1 end
+		state.frames_left = state.frames_left - 1
+	end
 	if state.frames_left == 0 then
 		if state.play ~= nil and play_continue() then return end   -- abp-0.2.12
+		if state.headless then   -- 2026-10-04 fork_many: a clone reports and ends, the parent answers
+			headless_report()
+			return
+		end
+		if native_step_obs() then return end   -- 2026-10-04
 		if send_obs("step") then wait_command() end
 	end
 end)

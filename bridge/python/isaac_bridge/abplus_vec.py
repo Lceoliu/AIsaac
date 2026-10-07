@@ -139,6 +139,8 @@ class AbplusChunk:
                       seed=int(m['seed']), task=W.TASKS[int(m['task'])], level=int(m['level']), group=int(m['group']),
                       replay=int(m['replay']), rss_mib=float(m['rss_mib']), instance=int(m['instance']),
                       instance_episodes=int(m['instance_episodes']),
+                      **({'option': W.GOAL_TASKS[int(m['option'])], 'source': W.SOURCES[int(m['source'])]}
+                         if self.owner.goal_line else {}),
                       **{'TimeLimit.truncated': bool(r['truncated'])})
                  for r, m in zip(frames, meta)]
         if self.agents == 2:   # duel: slot 2k is the player, 2k + 1 the duel NPC
@@ -148,7 +150,13 @@ class AbplusChunk:
         components = self.owner.components
         for i in terminal:
             infos[i]['episode'] = {'r': float(self.returns[i]), 'l': int(self.lengths[i])}
-            if components:
+            if self.owner.goal_line:   # the option's reward: combat-hp2 or GotoReward
+                names = W.COMPONENTS_HP if infos[i]['option'] == 'combat' else W.COMPONENTS_GOTO
+                infos[i]['reward_components'] = {k: round(float(v), 4) for k, v in zip(names, meta['components'][i])}
+                if meta['seq_end'][i]:   # C44: the option sequence ended here (the Room Buffer's unit)
+                    infos[i]['sequence'] = dict(ok=bool(meta['seq_ok'][i]), hurt=round(float(meta['seq_hurt'][i]), 2),
+                                                steps=int(meta['seq_steps'][i]))
+            elif components:
                 infos[i]['reward_components'] = {k: round(float(v), 4)
                                                  for k, v in zip(components, meta['components'][i])}
             infos[i]['episode_start'] = {'player_hp': float(meta['start'][i][0]),
@@ -243,7 +251,10 @@ class AbplusFrameVecEnv(GpuFrameVecEnv):
                            'combat-hitrate-miss': W.COMPONENTS_HRM,
                            'combat-hitrate-fire': W.COMPONENTS_HRF,
                            'combat-hitrate-hurt': W.COMPONENTS_HRH, 'combat-hp': W.COMPONENTS_HP,
-                           'combat-hp2': W.COMPONENTS_HP, 'combat-hp2-camera': W.COMPONENTS_HP}.get(reward_profile)
+                           'combat-hp2': W.COMPONENTS_HP, 'combat-hp2-camera': W.COMPONENTS_HP,
+                           'goal-hp': W.COMPONENTS_HP, 'goal-hp2': W.COMPONENTS_HP,
+                           'goal-hp3': W.COMPONENTS_HP}.get(reward_profile)
+        self.goal_line = reward_profile in W.GOAL_PROFILES
         if self.components and (reward_options or {}).get('hurt_rest'):
             self.components = self.components + ('rest',)   # abplus_reward.COMPONENTS_HRM_REST
         # combat-v3 frames add the room state input (abplus_worker.FRAME_DTYPE_COMBAT).

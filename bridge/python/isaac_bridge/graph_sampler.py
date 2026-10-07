@@ -36,7 +36,7 @@ import torch
 import torch.nn.functional as F
 
 from .gpu_env import decode_frame
-from .gpu_ppo import FrameSampler, action_masks
+from .gpu_ppo import FrameSampler, action_masks, ACTIVE_READY
 
 HUGE_NEG = -1e8   # sb3_contrib MaskableCategorical's masked logit
 
@@ -107,7 +107,8 @@ class GraphFrameSampler(FrameSampler):
         latent = seq[torch.arange(len(ids), device=self.device), valid.long().sum(-1) - 1]
         # C30 (--block-moves): the moves the newest frame's terrain stops dead (FrameSampler.move_block, in place).
         masks = action_masks(self.nvec, b.frames['player'][position, ids, 9] > 0,
-                             self.move_block[ids] if self.block_moves else None)
+                             self.move_block[ids] if self.block_moves else None,
+                             b.frames['player'][position, ids, ACTIVE_READY] > 0 if self.model.item_available else None)
         pi, vf = policy.mlp_extractor(latent)
         logits = torch.where(masks, policy.action_net(pi), torch.full_like(masks, HUGE_NEG, dtype=torch.float32))
         noise = torch.rand(logits.shape, device=self.device).clamp_(1e-10, 1 - 1e-7)

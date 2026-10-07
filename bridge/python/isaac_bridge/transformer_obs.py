@@ -43,6 +43,30 @@ ROOM_1X1 = (520.0, 280.0)
 # C41 (combat-hp2-camera, the continuation of C39): a 1x1 room's grid is the terrain view; in a larger room the view is
 # the window of that size around the player, stopping at the room's edges, as the game's camera does.
 CAMERA_VIEW = (9, 15)
+# C44 (goal-hp2, rl/docs/GOAL_CONDITIONED_DESIGN.md 2.2 item 5): the whole room on the largest Basement grid (2x2: 16 x 28
+# cells), a smaller room from the top-left corner, one value per cell with these bits (bit k = ROOM_BITS[k]); the model's
+# full-room CNN unpacks them. 'door': every visible door (open or closed), 'goal': the GOTO target's cell, 'window': the
+# cells of the camera view.
+ROOM_CANVAS = (16, 28)
+ROOM_BITS = ('inside', 'walkable', 'hazard', 'destructible', 'door', 'player', 'goal', 'window')
+# C45 (goal-hp3, user decisions 2026-10-01): 'expert_move', the scripted A* expert's move as a distribution over the move
+# head (not a network input; the learner's imitation loss). A GOTO frame: the scripted navigator's move on the option's
+# walking-distance field (abplus_nav.descent_move; one-hot). A COMBAT frame, only once the player has pushed a move against
+# the terrain for STUCK_FRAMES (every decision moved under STUCK_FRACTION of a free step, FREE_SPEED px per frame, and a
+# non-walkable cell - rock, block, pit, poop, wall - lies in the pushed direction): the moves that shorten the walk to the
+# nearest firing position ('approach'), uniform over them. Every other frame: zeros (no label).
+STUCK_FRAMES = 90
+STUCK_FRACTION = 0.3
+FREE_SPEED = 5.4
+# Goal-conditioned line (rl/docs/GOAL_CONDITIONED_DESIGN.md, VisibleHistory(goal=True)): the option's task one-hot (8 slots, 4
+# reserved), then the goal relative to the player in the entities' units (dx / width, dy / height), the distance (px / width),
+# sin / cos of its direction in pixel space ((0, 0) closer than 1 px) and whether the goal cell is in the terrain view.
+GOAL_TASKS = ('combat', 'goto_position', 'goto_door', 'goto_pickup')
+GOAL_SLOTS = 8
+GOAL_FIELDS = GOAL_SLOTS + 6
+# Where a sample comes from (the frames' 'source'; not a network input): standard single-room combat, combat in a room
+# chain, a GOTO option. The learner's KL to the frozen C39 policy applies to 'single' only (user decision 2026-09-30).
+SOURCES = ('single', 'chain', 'goto')
 PLAYER_FIELDS = ('x', 'y', 'vx', 'vy', 'motion_valid', 'size', 'hearts', 'max_hearts',
                  'soul', 'bombs', 'keys', 'coins', 'damage', 'speed', 'shot_speed',
                  'fire_delay_max', 'range', 'can_fly', 'active_charge', 'active_ready',
@@ -135,8 +159,29 @@ def factored_masks(joint_mask):
 
 class VisibleHistory:
     def __init__(self, history=HISTORY, capacity=ENTITY_CAPACITY,deadline=False,combat_state=False,
-                 geometry=False,factored_actions=False,deadline_s=120.0,terrain_shape=(9, 15),room_scale='room'):
+                 geometry=False,factored_actions=False,deadline_s=120.0,terrain_shape=(9, 15),room_scale='room',
+                 goal=False,window_position=False,room_bits=False,expert=False):
         self.deadline=deadline
+        # Goal-conditioned line: goal=True adds 'goal' (GOAL_FIELDS), 'goal_map' (2 x view: the goal cell, the open doors),
+        # 'goal_distance' (critic only: the walking distance to the goal / 40, -1 without one) and 'source' (SOURCES index,
+        # not a network input). goal_state is set by the caller before each encode: task (GOAL_TASKS), target (x, y) in
+        # px or None, distance in px or None, source.
+        self.goal_enabled=bool(goal)
+        self.goal_state=dict(task='combat',target=None,distance=None,source='single')
+        # window_position (camera view only, off by default): the player's x, y from the view window's top-left instead of
+        # the room's; a room whose grid is the view (every 15 x 9 grid) encodes exactly as before.
+        if window_position and room_scale!='camera':
+            raise ValueError('window_position needs the camera view')
+        self.window_position=bool(window_position)
+        # room_bits (C44, camera view only): 'room_bits', the whole room on ROOM_CANVAS (ROOM_BITS per cell)
+        if room_bits and room_scale!='camera':
+            raise ValueError('room_bits needs the camera view')
+        self.room_bits=bool(room_bits)
+        # expert (C45): 'expert_move' (ROOM_BITS-style comment above STUCK_FRAMES); needs the goal fields and the geometry
+        if expert and not (goal and geometry and factored_actions):
+            raise ValueError('expert needs goal, geometry and factored_actions')
+        self.expert=bool(expert)
+        self.stuck_frames=0
         # C41: the terrain canvas and the units of positions, velocities and sizes. 'room' divides by this room's width
         # and height (every earlier run); 'fixed' by a 1x1 room's (ROOM_1X1), the terrain on the canvas (combat-hp2);
         # 'camera' by a 1x1 room's, the terrain the CAMERA_VIEW window around the player (combat-hp2-camera: a 1x1 room
@@ -185,15 +230,45 @@ class VisibleHistory:
         # a fraction of the start, seconds since they last lost HP (or since the start) / 60.
         if self.combat_state:self.space.spaces['combat']=spaces.Box(0,np.inf,(h,len(self.combat_fields)),np.float32)
         if factored_actions:self.space.spaces['previous_action']=spaces.Box(0,1,(h,sum(FACTORED_NVEC)),np.float32)
+        if self.goal_enabled:
+            self.space.spaces['goal']=spaces.Box(-np.inf,np.inf,(h,GOAL_FIELDS),np.float32)
+            self.space.spaces['goal_map']=spaces.Box(0,1,(h,2,*self.terrain_shape),np.float32)
+            self.space.spaces['goal_distance']=spaces.Box(-1,np.inf,(h,),np.float32)
+            self.space.spaces['source']=spaces.Box(0,len(SOURCES)-1,(h,),np.float32)
+        if self.room_bits:
+            self.space.spaces['room_bits']=spaces.Box(0,2**len(ROOM_BITS)-1,(h,*ROOM_CANVAS),np.float32)
         if geometry:
             self.space.spaces['entity_flags']=spaces.Box(0,1,(h,n,len(ENTITY_FLAGS)),np.float32)
             self.space.spaces['fire_distance']=spaces.Box(0,FIRE_DISTANCE_MAX,(h,),np.float32)
             self.space.spaces['aim_label']=spaces.Box(0,4,(h,),np.float32)
             self.space.spaces['approach']=spaces.Box(0,1,(h,len(MOVES)),np.float32)
+        if self.expert:
+            self.space.spaces['expert_move']=spaces.Box(0,1,(h,len(MOVES)),np.float32)
 
     def clear(self):
         self.frames.clear()
         self.previous = None
+        self.before_previous = None
+        self.origin = None
+        self.combat = None
+        self.d_fire = None
+        self.previous_action[:] = 0
+        self.stuck_frames = 0
+
+    def room_clear(self):
+        '''A COMBAT option went on into another room (monstro_gym combat_multi_room): a fresh window, velocity and combat
+        baselines, previous action; the time origin is kept, so time and remaining_time go on counting the option's
+        deadline.'''
+        origin = self.origin
+        self.clear()
+        self.origin = origin
+
+    def soft_clear(self):
+        '''An option switch within the same room: a fresh window, time origin, combat baseline and previous action. The
+        new option's first frame is the observation the last one ended on, encoded again: the observation before it is
+        kept as the previous one, so that frame's player and entity velocities stay valid (a room change clears).'''
+        self.previous = getattr(self, 'before_previous', None)
+        self.frames.clear()
         self.origin = None
         self.combat = None
         self.d_fire = None
@@ -225,7 +300,7 @@ class VisibleHistory:
                             for e in obs['entities']]}
         if obs.get('combat_schema') != 3:
             raise ValueError('Transformer requires bridge combat_schema=3; deploy the matching Mod')
-        if self.previous is None:
+        if self.origin is None:
             self.origin = obs['logic_frames']
         p = obs['players'][0]
         left, top = obs['room']['top_left']
@@ -236,7 +311,11 @@ class VisibleHistory:
             raise ValueError('Observation time must advance; clear history on reset')
         pv = (np.asarray(p['pos'])-self.previous['players'][0]['pos']) / dt if dt else np.zeros(2)
         frame = {k: np.zeros(v.shape[1:], dtype=v.dtype) for k, v in self.space.spaces.items()}
-        frame['player'][:] = ((p['pos'][0]-left)/width, (p['pos'][1]-top)/height,
+        px0, py0 = left, top
+        if self.window_position:
+            row0, col0 = camera_origin(obs, obs['terrain']['height'], obs['terrain']['width'])
+            px0, py0 = left + CELL * col0, top + CELL * row0
+        frame['player'][:] = ((p['pos'][0]-px0)/width, (p['pos'][1]-py0)/height,
             pv[0]/width, pv[1]/height, bool(dt), p['size']/width, p['hearts']/6,
             p['max_hearts']/6, p['soul']/6, p['bombs']/10, p['keys']/10, p['coins']/100,
             p['damage']/10, p['speed'], p['shot_speed'], p['fire_delay_max']/30,
@@ -305,19 +384,135 @@ class VisibleHistory:
             if key != getattr(self, '_terrain_key', None):
                 self._terrain_key, self._terrain_value = key, terrain_channels(obs, shape)
             channels = self._terrain_value
+        row = col = 0
+        full = channels
         if camera:
             row, col = camera_origin(obs, *shape)
             channels = channels[:, row:row + CAMERA_VIEW[0], col:col + CAMERA_VIEW[1]]
         frame['terrain'] = channels
+        if self.room_bits:
+            frame['room_bits'][:] = self.room_bits_frame(obs, full, row, col,
+                                                         self._terrain_key if version is not None else None)
+        if self.goal_enabled:
+            self.goal_features(obs, frame, p, width, height, row, col)
+        if self.expert:
+            frame['expert_move'][:] = self.expert_label(obs, p, full, dt, frame)
         frame['previous_action'] = self.previous_action.copy()
         frame['time'] = np.float32((obs['logic_frames']-self.origin)/30)
         if self.deadline:frame['remaining_time']=np.float32(max(0,1-frame['time']/self.deadline_s))
         if self.combat_state:frame['combat'][:]=self.combat_features(obs['combat'],float(frame['time']),obs)
         frame['history_mask'] = np.float32(1)
         self.frames.append(frame)
-        self.previous = obs
+        self.before_previous, self.previous = self.previous, obs
         self.last_rows = len(rows)
         return frame
+
+    def expert_label(self, obs, player, full, dt, frame):
+        '''expert_move of this frame (see STUCK_FRAMES): GOTO: the scripted navigator's move (one-hot) on the option's
+        field (goal_state nav_state, rebuilt by goal_features on a changed map); COMBAT: after STUCK_FRAMES pushing against
+        the terrain, the approach moves, uniform; else zeros.'''
+        from .abplus_nav import descent_move
+        out = np.zeros(len(MOVES), np.float32)
+        px, py = player['pos']
+        g = self.goal_state
+        if g['task'] != 'combat':
+            self.stuck_frames = 0
+            nav = (g.get('nav_state') or {}).get('nav')
+            if nav is not None:
+                out[descent_move(px, py, nav)] = 1.0
+            return out
+        move = int(np.argmax(self.previous_action[:len(MOVES)])) if self.previous_action[:len(MOVES)].any() else 0
+        if self.previous is not None and dt:
+            qx, qy = self.previous['players'][0]['pos']
+            pushing = move and math.hypot(px - qx, py - qy) < STUCK_FRACTION * FREE_SPEED * dt
+            self.stuck_frames = self.stuck_frames + dt if pushing and self.blocked_by_terrain(obs, full, px, py, move) else 0
+        if self.stuck_frames >= STUCK_FRAMES and frame['approach'].any():
+            out[:] = frame['approach'] / frame['approach'].sum()
+        return out
+
+    @staticmethod
+    def blocked_by_terrain(obs, full, px, py, move):
+        '''A non-walkable cell (or the grid's edge) in the pushed direction: the horizontal and vertical neighbour of the
+        player's cell along a component of the move, and the diagonal one for a diagonal move.'''
+        cells = obs['terrain']['cells']
+        x0, y0 = cells[0][1], cells[0][2]
+        height, width = full.shape[1:]
+        col, row = int(round((px - x0) / CELL)), int(round((py - y0) / CELL))
+        dx, dy = MOVES[move]
+        around = ([(row, col + dx)] if dx else []) + ([(row + dy, col)] if dy else []) + ([(row + dy, col + dx)] if dx and dy else [])
+        return any(not (0 <= r < height and 0 <= c < width) or full[1, r, c] < 0.5 for r, c in around)
+
+    def room_bits_frame(self, obs, full, row0, col0, static_key=None):
+        '''room_bits of this frame: the room's static bits (from its terrain channels and doors; cached under static_key,
+        the terrain channels' own key, None: rebuilt) and the player's cell, the goal's (goal_state target) and the
+        camera window (top-left cell row0, col0).'''
+        height, width = obs['terrain']['height'], obs['terrain']['width']
+        if height > ROOM_CANVAS[0] or width > ROOM_CANVAS[1]:
+            raise ValueError(f'room grid {width}x{height} exceeds the room canvas {ROOM_CANVAS[1]}x{ROOM_CANVAS[0]}')
+        cells = obs['terrain']['cells']
+        x0, y0 = cells[0][1], cells[0][2]
+
+        def cell(x, y):
+            r, c = int(round((y - y0) / CELL)), int(round((x - x0) / CELL))
+            return (min(max(r, 0), height - 1), min(max(c, 0), width - 1))
+
+        key = (static_key, tuple((d['pos'][0], d['pos'][1]) for d in obs['doors']))
+        if static_key is None or key != getattr(self, '_room_bits_key', None):
+            static = np.zeros(ROOM_CANVAS, np.int64)
+            for bit, channel in ((0, 0), (1, 1), (2, 5), (3, 4)):   # inside, walkable, hazard, destructible
+                static[:height, :width] |= (full[channel] > 0.5).astype(np.int64) << bit
+            for door in obs['doors']:
+                static[cell(*door['pos'])] |= 1 << 4
+            self._room_bits_key, self._room_bits_static = key, static
+        bits = self._room_bits_static.copy()
+        bits[cell(*obs['players'][0]['pos'])] |= 1 << 5
+        target = self.goal_state.get('target') if self.goal_enabled else None
+        if target is not None:
+            bits[cell(*target)] |= 1 << 6
+        bits[row0:row0 + CAMERA_VIEW[0], col0:col0 + CAMERA_VIEW[1]] |= 1 << 7
+        return bits.astype(np.float32)
+
+    def goal_features(self, obs, frame, player, width, height, row0, col0):
+        '''goal, goal_map, goal_distance and source of this frame from goal_state (the view's top-left cell is row0, col0).'''
+        g = self.goal_state
+        vec = frame['goal']
+        vec[:] = 0
+        vec[GOAL_TASKS.index(g['task'])] = 1
+        gm = frame['goal_map']
+        gm[:] = 0
+        rows, cols = self.terrain_shape
+        x0 = y0 = None
+        for index, x, y, *_ in obs['terrain']['cells']:
+            if index == 0:
+                x0, y0 = x, y
+                break
+
+        def view_cell(x, y):
+            r, c = int(round((y - y0) / CELL)) - row0, int(round((x - x0) / CELL)) - col0
+            return (r, c) if 0 <= r < rows and 0 <= c < cols else None
+
+        for door in obs['doors']:
+            if door['open']:
+                cell = view_cell(*door['pos'])
+                if cell is not None:
+                    gm[1][cell] = 1
+        if g['target'] is not None:
+            tx, ty = (float(v) for v in g['target'])
+            dx, dy = tx - player['pos'][0], ty - player['pos'][1]
+            d = math.hypot(dx, dy)
+            vec[GOAL_SLOTS:GOAL_SLOTS + 3] = (dx / width, dy / height, d / width)
+            if d >= 1:
+                vec[GOAL_SLOTS + 3:GOAL_SLOTS + 5] = (dy / d, dx / d)
+            cell = view_cell(tx, ty)
+            if cell is not None:
+                gm[0][cell] = 1
+                vec[GOAL_SLOTS + 5] = 1
+        # distance: px, None, or a callable of the observation (the worker's walking distance on the current map)
+        distance = g['distance'](obs) if callable(g['distance']) else g['distance']
+        frame['goal_distance'] = np.float32(distance / CELL if distance is not None else -1)
+        frame['source'] = np.float32(SOURCES.index(g['source']))
+        if not np.all(np.isfinite(vec)):
+            raise ValueError(f'non-finite goal features {vec}')
 
     def combat_features(self, combat, t, obs=None):
         """COMBAT_FIELDS; 'engaged' and the last hit follow combat-v3's definition (blocking HP fell);
@@ -364,6 +559,9 @@ class TransformerMonstroEnv(MonstroGymEnv):
 
     def encode_observation(self, obs):
         return self.history.append(obs)
+
+    def on_room_change(self):
+        self.history.room_clear()
 
     def action_masks(self):
         p = self.raw_obs['players'][0]

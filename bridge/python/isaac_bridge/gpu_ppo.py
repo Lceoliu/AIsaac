@@ -70,6 +70,21 @@ class LearningRateSchedule:
         return f'LearningRateSchedule({self.kind!r}, {self.initial:g}, {self.final:g})'
 
 
+class GroupLearningRate:
+    """C44 (design 4.8): a parameter group's learning rate, of progress_remaining and the completed updates: warmup_updates
+    linear steps from warmup_start up to the schedule, then the schedule (LearningRateSchedule). A class, so it pickles."""
+    def __init__(self,kind,initial,final,warmup_updates=0,warmup_start=None):
+        self.schedule=LearningRateSchedule(kind,initial,final)
+        self.warmup_updates=int(warmup_updates);self.warmup_start=float(warmup_start if warmup_start is not None else final)
+    def __call__(self,progress_remaining,updates=0):
+        lr=self.schedule(progress_remaining)
+        if updates<self.warmup_updates:
+            lr=self.warmup_start+(lr-self.warmup_start)*updates/self.warmup_updates
+        return lr
+    def __repr__(self):
+        return f'GroupLearningRate({self.schedule!r}, warmup {self.warmup_updates} from {self.warmup_start:g})'
+
+
 def full_kl(prox_logits,new_logits,nvec):
     """Per sample, the sum over the heads of KL(pi_proximal || pi_new) from their (masked) logits (C32)."""
     kl=0
@@ -92,12 +107,16 @@ def load_frozen_policy(path,device,observation_space=None,action_space=None):
     return policy
 
 
-def action_masks(nvec,bombs_ok,move_block=None):
-    """Masks of MultiDiscrete heads ending in (bomb, item): the bomb only with bombs, never the item;
+ACTIVE_READY=19   # transformer_obs.PLAYER_FIELDS index of active_ready
+
+
+def action_masks(nvec,bombs_ok,move_block=None,item_ok=None):
+    """Masks of MultiDiscrete heads ending in (bomb, item): the bomb only with bombs, never the item (item_ok given: the
+    item only with a charged active item, as the environment's own masks; goal line, user decision 2026-09-30);
     move_block (n, 9) bool (C30, --block-moves): the moves of the first head the terrain stops dead."""
     masks=torch.ones((len(bombs_ok),sum(nvec)),dtype=torch.bool,device=bombs_ok.device)
     bomb=sum(nvec[:-2]);item=bomb+nvec[-2]
-    masks[:,bomb+1]=bombs_ok;masks[:,item+1]=False
+    masks[:,bomb+1]=bombs_ok;masks[:,item+1]=item_ok if item_ok is not None else False
     if move_block is not None:masks[:,:nvec[0]]&=~move_block
     return masks
 
@@ -179,7 +198,8 @@ class FrameSampler:
     def action(self,position,ids,deterministic=False):
         policy=self.policy
         masks=action_masks(self.nvec,self.buffer.frames['player'][position,ids,9]>0,
-                           self.move_block[ids] if self.block_moves else None)
+                           self.move_block[ids] if self.block_moves else None,
+                           self.buffer.frames['player'][position,ids,ACTIVE_READY]>0 if self.model.item_available else None)
         pi,vf=policy.mlp_extractor(self.latent(position,ids))
         distribution=policy._get_action_dist_from_latent(pi)
         distribution.apply_masking(masks)
@@ -210,6 +230,47 @@ class GpuMaskablePPO(MaskablePPO):
     distill_temperature=1.0
     rl_coef=1.0
     teacher_acts_updates=0
+    # Goal-conditioned line (rl/docs/GOAL_CONDITIONED_DESIGN.md, user decisions 2026-09-30), active when the frames carry
+    # 'goal'. item_available: the item head by the active item's charge (else never). Advantages are normalised per task
+    # (COMBAT / GOTO). loss_tasks 'goto' (stage 1, the shared weights frozen): the PPO, value and entropy terms average
+    # over the GOTO samples only. The auxiliary aim loss skips GOTO samples. preserve_teacher (a frozen copy of the
+    # migrated policy, equal to C39 on COMBAT frames): preserve_coef x the mean over the minibatch's single-room samples
+    # (frames' source 0) of KL(teacher || policy); with preserve_target the coefficient adapts after each update (x1.5
+    # above 1.5 target, /1.5 below target / 1.5, within preserve_bounds).
+    item_available=False
+    loss_tasks='all'
+    preserve_teacher=None
+    preserve_coef=0.0
+    preserve_target=None
+    preserve_bounds=(0.1,30.0)
+    # C44 (design 4.8): {param group name: GroupLearningRate} for an optimizer with named groups (GeometryPolicy(lr_groups=
+    # True): 'shared', 'goal'); a group without an entry follows lr_schedule. None: SB3's one rate for every group.
+    lr_groups=None
+    # C45 (goal-hp3, user decisions 2026-10-01): imitation of the scripted A* expert on the move head. The frames' expert_move
+    # (transformer_obs: GOTO frames always, COMBAT frames once stuck against the terrain) is a target distribution; the loss
+    # adds expert_coef x (1 - done / expert_until, at least 0) x the mean over the minibatch's labelled samples of the
+    # cross-entropy -sum target log pi_move (done: the run's completed fraction).
+    expert_coef=0.0
+    expert_until=0.5
+    # A15 (diagnosis of C45's imitation): imitation_only keeps the expert cross-entropy alone (a supervised fit on the
+    # policy's own states, every other loss term dropped); grad_probe logs, on the first micro-batch of each update, each
+    # loss term's gradient norm per optimizer group (one backward pass each), and every step's total norm before clipping.
+    imitation_only=False
+    grad_probe=False
+
+    def _probe_gradients(self,terms,n):
+        '''grad_probe: the gradient norm of each loss term (a tensor) over each optimizer group's parameters.'''
+        groups=[(g.get('name',f'group{i}'),[p for p in g['params'] if p.requires_grad])
+                for i,g in enumerate(self.policy.optimizer.param_groups)]
+        params=[p for _,ps in groups for p in ps]
+        for name,term in terms.items():
+            if not torch.is_tensor(term) or not term.requires_grad:continue
+            grads=torch.autograd.grad(term/n,params,retain_graph=True,allow_unused=True)
+            i=0
+            for gname,ps in groups:
+                sq=sum(float((g*g).sum()) for g in grads[i:i+len(ps)] if g is not None)
+                self.logger.record(f'probe/grad_{name}_{gname}',sq**0.5)
+                i+=len(ps)
 
     def __init__(self,*args,**kwargs):
         # TF32 cuDNN changes CNN rounding with batch shape (one frame vs H
@@ -236,7 +297,8 @@ class GpuMaskablePPO(MaskablePPO):
 
     def _excluded_save_params(self):
         return super()._excluded_save_params()+['_gpu_sampler','_collecting','session','sampler_class',
-                                                'async_training','actor','train_buffer','_train_stream','teacher']
+                                                'async_training','actor','train_buffer','_train_stream','teacher',
+                                                'preserve_teacher']
 
     @property
     def sampling_policy(self):
@@ -254,6 +316,24 @@ class GpuMaskablePPO(MaskablePPO):
         # must not remain resident throughout training. State lives in raw GPU frames.
         self._last_obs={}
         return result
+
+    def current_expert_coef(self):
+        """The imitation loss's coefficient now: expert_coef, falling linearly to 0 at expert_until of the run."""
+        if not self.expert_coef:
+            return 0.0
+        done=1.0-float(self._current_progress_remaining)
+        return float(self.expert_coef)*max(0.0,1.0-done/max(1e-9,float(self.expert_until)))
+
+    def _update_learning_rate(self,optimizers):
+        if not self.lr_groups:
+            return super()._update_learning_rate(optimizers)
+        updates=self._n_updates//max(1,self.n_epochs)
+        self.logger.record('train/learning_rate',self.lr_schedule(self._current_progress_remaining))
+        for optimizer in (optimizers if isinstance(optimizers,list) else [optimizers]):
+            for group in optimizer.param_groups:
+                fn=self.lr_groups.get(group.get('name'))
+                group['lr']=fn(self._current_progress_remaining,updates) if fn is not None else self.lr_schedule(self._current_progress_remaining)
+                if group.get('name'):self.logger.record(f"train/lr_{group['name']}",group['lr'])
 
     def train(self):
         if self._collecting:raise RuntimeError('Weights are frozen while collecting a rollout')
@@ -420,12 +500,13 @@ class GpuMaskablePPO(MaskablePPO):
         latent=enc.temporal_features(window,elapsed,valid)
         return latent[torch.arange(len(latent),device=latent.device),valid.long().sum(-1)-1]
 
-    def teacher_logits(self,x,b):
+    def teacher_logits(self,x,b,teacher=None):
         """The teacher's normalised log-probabilities of every action of every head on the samples of
         _segment_inputs, under the samples' stored masks (no gradient)."""
+        teacher=self.teacher if teacher is None else teacher
         with torch.no_grad():
-            latent=self._segment_latent(self.teacher,x)
-            dist=self.teacher._get_action_dist_from_latent(self.teacher.mlp_extractor.forward_actor(latent))
+            latent=self._segment_latent(teacher,x)
+            dist=teacher._get_action_dist_from_latent(teacher.mlp_extractor.forward_actor(latent))
             dist.apply_masking(b.action_masks[x.steps,x.owners])
             return torch.cat([d.logits for d in dist.distributions],-1)
 
@@ -459,11 +540,26 @@ class GpuMaskablePPO(MaskablePPO):
         # sums over the samples of: head entropies (heads), aux CE, aux squared error, aux hits,
         # aligned samples, aligned aux hits, aligned mode aim hits, approach samples, approach hits
         diag=None
+        grad_norms=[]   # grad_probe: each optimizer step's gradient norm before clipping
         probe=[]   # --kl-probe: the samples with the largest pi_new / pi_proximal of each micro-batch
         distill_coef=self.current_distill_coef() if self.teacher is not None else 0.0
         tau=float(self.distill_temperature)
         # sums over the first epoch's samples: KL(teacher || student), argmax agreement per head
         distill_sums=torch.zeros(1+len(nvec),device=self.device)
+        # goal line: each sample's task (True: GOTO) and source (0 single room, 1 chain, 2 GOTO), from its own frame
+        goal_line='goal' in b.frames
+        if goal_line:
+            from .transformer_policy import goal_gate
+            H=b.history
+            task_goto=goal_gate(b.frames['goal'][H-1:H-1+T])
+            source=b.frames['source'][H-1:H-1+T].round().long()
+            preserve_sums=torch.zeros(3,device=self.device)   # KL sum, single samples, first-epoch samples
+        preserve=goal_line and self.preserve_teacher is not None and self.preserve_coef>0
+        expert_now=self.current_expert_coef() if 'expert_move' in b.frames else 0.0
+        if expert_now>0:
+            expert_frames=b.frames['expert_move'][b.history-1:b.history-1+T]
+            # first epoch: CE sum, labelled, GOTO labelled, GOTO samples, COMBAT labelled, COMBAT samples, agreements
+            expert_sums=torch.zeros(7,device=self.device)
         for epoch in range(self.n_epochs):
             approx_kl_divs=[]
             order=torch.randperm(segments,device=self.device)
@@ -472,11 +568,27 @@ class GpuMaskablePPO(MaskablePPO):
                 workers=torch.div(chosen,per_worker,rounding_mode='floor');t0=(chosen%per_worker)*L
                 adv=b.advantages[t0[:,None]+torch.arange(L,device=self.device),workers[:,None]]
                 mean,std,n=adv.mean(),adv.std(),adv.numel()
+                if goal_line:
+                    rows_t=t0[:,None]+torch.arange(L,device=self.device)
+                    goto_mb=task_goto[rows_t,workers[:,None]]
+                    n_goto=goto_mb.sum();n_single=(source[rows_t,workers[:,None]]==0).sum()
+                    if expert_now>0:n_expert=(expert_frames[rows_t,workers[:,None]].sum(-1)>0).sum()
+                    def task_stats(mask):
+                        k=mask.sum()
+                        if k<2:return mean,std   # too few for their own statistics: the minibatch's
+                        values=adv[mask];return values.mean(),values.std()
+                    (mean_g,std_g),(mean_c,std_c)=task_stats(goto_mb),task_stats(~goto_mb)
                 policy.optimizer.zero_grad()
                 sums=torch.zeros(5,device=self.device);robust=torch.zeros(2,device=self.device)
                 for m in range(0,len(chosen),seg_micro):
                     values,log_prob,entropy,t,w,extra=self.evaluate_segments(workers[m:m+seg_micro],t0[m:m+seg_micro],b,True)
                     a=(b.advantages[t,w]-mean)/(std+1e-8)
+                    weight=None
+                    if goal_line:
+                        goto_tw=task_goto[t,w]
+                        a=torch.where(goto_tw,(b.advantages[t,w]-mean_g)/(std_g+1e-8),(b.advantages[t,w]-mean_c)/(std_c+1e-8))
+                        if self.loss_tasks=='goto':   # stage 1: the losses average over the GOTO samples
+                            weight=goto_tw.float()*(n/max(1,int(n_goto)))
                     old=b.log_probs[t,w]
                     anchor=old if proximal is None else proximal[t,w]
                     ratio=torch.exp(log_prob-anchor)
@@ -486,7 +598,33 @@ class GpuMaskablePPO(MaskablePPO):
                         values=b._values[t,w]+torch.clamp(values-b._values[t,w],-clip_range_vf,clip_range_vf)
                     vl=(b._returns[t,w]-values)**2
                     el=-entropy
-                    ent=(-(extra['head_entropy']*head_coefs).sum() if head_coefs is not None else self.ent_coef*el.sum())
+                    if weight is not None:
+                        pg,vl,el=pg*weight,vl*weight,el*weight
+                        ent=(-(extra['head_entropy']*head_coefs).sum(-1)*weight).sum() if head_coefs is not None else self.ent_coef*el.sum()
+                    else:
+                        ent=(-(extra['head_entropy']*head_coefs).sum() if head_coefs is not None else self.ent_coef*el.sum())
+                    if preserve:
+                        single=(source[t,w]==0).float()
+                        kl_p=full_kl(self.teacher_logits(extra['inputs'],b,self.preserve_teacher),extra['logits'],nvec)
+                        distill_p=self.preserve_coef*(kl_p*single).sum()*(n/max(1,int(n_single)))
+                        if epoch==0:
+                            with torch.no_grad():preserve_sums+=torch.stack([(kl_p*single).sum(),single.sum(),single.new_tensor(len(single))])
+                    else:
+                        distill_p=0.0
+                    imitation=0.0
+                    if expert_now>0:
+                        target=expert_frames[t,w];labelled=target.sum(-1)>0
+                        target=target/target.sum(-1,keepdim=True).clamp_min(1e-8)
+                        logp=torch.log_softmax(extra['logits'][:,:target.shape[-1]],-1).clamp_min(-30.0)
+                        ce=-(target*logp).sum(-1)*labelled.float()
+                        imitation=expert_now*ce.sum()*(n/max(1,int(n_expert)))
+                        if epoch==0:
+                            with torch.no_grad():
+                                goto_tw=task_goto[t,w];best=logp.argmax(-1)
+                                agree=(target.gather(1,best[:,None]).squeeze(1)>0)&labelled
+                                expert_sums+=torch.stack([ce.sum(),labelled.float().sum(),(labelled&goto_tw).float().sum(),
+                                                          goto_tw.float().sum(),(labelled&~goto_tw).float().sum(),
+                                                          (~goto_tw).float().sum(),agree.float().sum()])
                     distill=0.0
                     if self.teacher is not None:
                         target=self.teacher_logits(extra['inputs'],b)
@@ -502,12 +640,20 @@ class GpuMaskablePPO(MaskablePPO):
                         logits,predicted=extra['aux'];labels=extra['labels']
                         ce=torch.nn.functional.cross_entropy(logits,labels['aim_label'].long(),reduction='none')
                         se=(predicted-labels['fire_distance'])**2
+                        if goal_line:   # the aim labels mean nothing on a GOTO sample
+                            keep=(~task_goto[t,w]).float();ce,se=ce*keep,se*keep
                         weighted=ce
                         if self.aux_balance:
                             aligned=(labels['aim_label']>0).float();share=aligned.mean().clamp(0.02,0.98)
                             weighted=ce*(aligned/(2*share)+(1-aligned)/(2*(1-share)))
                         aux=self.aux_coef*(weighted.sum()+self.aux_distance_coef*se.sum())
-                    ((self.rl_coef*pg.sum()+ent+self.vf_coef*vl.sum()+aux+distill)/n).backward()
+                    if self.grad_probe and epoch==0 and s==0 and m==0:
+                        self._probe_gradients(dict(pg=self.rl_coef*pg.sum(),entropy=ent,value=self.vf_coef*vl.sum(),aux=aux,
+                                                   preserve=distill_p,imitation=imitation),n)
+                    if self.imitation_only:
+                        if torch.is_tensor(imitation):(imitation/n).backward()
+                    else:
+                        ((self.rl_coef*pg.sum()+ent+self.vf_coef*vl.sum()+aux+distill+distill_p+imitation)/n).backward()
                     if epoch==0:
                         with torch.no_grad():
                             row=[extra['head_entropy'].sum(0)]
@@ -541,11 +687,35 @@ class GpuMaskablePPO(MaskablePPO):
                     continue_training=False
                     if self.verbose>=1:print(f'Early stopping at step {epoch} due to reaching max kl: {approx_kl:.2f}')
                     break
-                torch.nn.utils.clip_grad_norm_(policy.parameters(),self.max_grad_norm)
+                total_norm=torch.nn.utils.clip_grad_norm_(policy.parameters(),self.max_grad_norm)
+                if self.grad_probe:grad_norms.append(float(total_norm))
                 policy.optimizer.step();steps+=1
             if not continue_training:break
         self._n_updates+=self.n_epochs
         self._log_diagnostics(b,diag,heads)
+        if grad_norms:
+            self.logger.record('probe/grad_norm',float(np.mean(grad_norms)))
+            self.logger.record('probe/grad_clipped_share',float(np.mean([g>self.max_grad_norm for g in grad_norms])))
+            self.logger.record('probe/max_grad_norm',float(self.max_grad_norm))
+        if expert_now>0:
+            ce_sum,lab,lab_goto,goto_n,lab_combat,combat_n,agree=expert_sums.tolist()
+            self.logger.record('expert/coef',expert_now)
+            self.logger.record('expert/ce',ce_sum/max(1.0,lab))
+            self.logger.record('expert/agree',agree/max(1.0,lab))
+            self.logger.record('expert/goto_labelled_share',lab_goto/max(1.0,goto_n))
+            self.logger.record('expert/combat_stuck_share',lab_combat/max(1.0,combat_n))
+        if goal_line:
+            self.logger.record('goal/goto_share',float(task_goto.float().mean()))
+            self.logger.record('goal/single_share',float((source==0).float().mean()))
+            self.logger.record('goal/chain_share',float((source==1).float().mean()))
+        if preserve:
+            kl_sum,singles,samples=preserve_sums.tolist()
+            kl_mean=kl_sum/max(1.0,singles)
+            self.logger.record('preserve/kl',kl_mean);self.logger.record('preserve/coef',self.preserve_coef)
+            if self.preserve_target:
+                low,high=self.preserve_bounds
+                if kl_mean>1.5*self.preserve_target:self.preserve_coef=min(high,self.preserve_coef*1.5)
+                elif kl_mean<self.preserve_target/1.5:self.preserve_coef=max(low,self.preserve_coef/1.5)
         if self.teacher is not None:
             count=b.buffer_size*b.n_envs;values=(distill_sums/count).tolist()
             self.logger.record('distill/kl',values[0]);self.logger.record('distill/coef',distill_coef)

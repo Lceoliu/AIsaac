@@ -140,6 +140,7 @@ def source_hashes():
 
 
 def session_class():
+    from isaac_bridge.abplus_worker import GOAL_PROFILES
     from isaac_bridge.steam_watch import SteamWatch
     from isaac_bridge.training_session import TrainingSession
 
@@ -222,20 +223,52 @@ def session_class():
             if self.buffer is not None:
                 # C39: the finished episodes update their seeds, then the workers get the new table.
                 from isaac_bridge.room_buffer import family_key
-                hurt = self.config['reward_options'].get('hurt', 0.5)
+                options = self.config['reward_options']
+                hurt = (options.get('combat') or options).get('hurt', 0.5)
                 for e in episodes:
                     if 'group' not in e or 'reward_components' not in e:
                         continue
                     g = self.group_names.index(e['group'])
-                    damage = -float(e['reward_components'].get('hurt', 0.0)) / hurt
-                    self.buffer.observe(g, e['seed'], e['outcome'] == 'win', damage, e['l'],
+                    if 'option' in e:
+                        # goal line (C44, user decision 2026-09-30): a seed's episode is its whole option sequence; success
+                        # = every option of it succeeded (single-room COMBAT: the clear), d = the half hearts it lost
+                        seq = e.get('sequence')
+                        if seq is None:
+                            continue   # the sequence goes on (or an engine failure ended it)
+                        win, damage, steps = seq['ok'], float(seq['hurt']), seq['steps']
+                    else:
+                        win, steps = e['outcome'] == 'win', e['l']
+                        damage = -float(e['reward_components'].get('hurt', 0.0)) / hurt
+                    self.buffer.observe(g, e['seed'], win, damage, steps,
                                         family_key(self.groups[g], e['seed'], e['layout']), bool(e.get('replay')))
                 self.model.env.set_room_buffer(*self.buffer.table())
                 for key, value in self.buffer.summary().items():
                     self.logger.record('buffer/' + key, value)
-            parts = [e['reward_components'] for e in episodes if 'reward_components' in e]
-            for key in (parts[0] if parts else ()):
-                self.logger.record('reward/' + key, float(np.mean([c[key] for c in parts])))
+            if any('option' in e for e in episodes):
+                # goal line: COMBAT and GOTO options have their own reward components; per option kind and outcome rates
+                for kind in ('combat', 'goto'):
+                    mine = [e for e in episodes if 'option' in e and (e['option'] == 'combat') == (kind == 'combat')]
+                    parts = [e['reward_components'] for e in mine if 'reward_components' in e]
+                    for key in (parts[0] if parts else ()):
+                        self.logger.record(f'reward/{kind}/{key}', float(np.mean([c[key] for c in parts])))
+                    for outcome in ('win', 'goal', 'death', 'time_limit', 'exit', 'wrong_door', 'error'):
+                        if mine:
+                            self.logger.record(f'option/{kind}/{outcome}_rate',
+                                               sum(e['outcome'] == outcome for e in mine) / len(mine))
+                    self.logger.record(f'option/{kind}/episodes', len(mine))
+                for source in ('single', 'chain'):
+                    mine = [e for e in episodes if e.get('option') == 'combat' and e.get('source') == source]
+                    if mine:
+                        self.logger.record(f'option/combat_{source}/win_rate', sum(e['outcome'] == 'win' for e in mine) / len(mine))
+                        self.logger.record(f'option/combat_{source}/episodes', len(mine))
+                door = [e for e in episodes if e.get('option') == 'goto_door']
+                if door:
+                    self.logger.record('option/goto_door/goal_rate', sum(e['outcome'] == 'goal' for e in door) / len(door))
+                    self.logger.record('option/goto_door/episodes', len(door))
+            else:
+                parts = [e['reward_components'] for e in episodes if 'reward_components' in e]
+                for key in (parts[0] if parts else ()):
+                    self.logger.record('reward/' + key, float(np.mean([c[key] for c in parts])))
             stats = [e['stats'] for e in episodes if 'stats' in e]
             if stats:
                 first = [st['first_hit_s'] for st in stats]
@@ -335,7 +368,12 @@ def session_class():
                         # C39 t3r: the resident memory of the process that played the episode, at its end.
                         memory = ({'rss_mib': round(info['rss_mib'], 1), 'instance': info['instance'],
                                    'instance_episodes': info['instance_episodes']} if 'rss_mib' in info else {})
+                        # goal line: the option (GOAL_TASKS) and the sample source of this PPO episode
+                        option = ({'option': info['option'], 'source': info['source']} if 'option' in info else {})
+                        if 'sequence' in info:   # C44: the option sequence ended with this option
+                            option['sequence'] = info['sequence']
                         record = dict(episode=self.completed, worker=worker, seed=info['seed'], **group, **replay, **memory,
+                                      **option,
                                       task=info.get('task'), outcome=info['outcome'], layout=info['layout'],
                                       level=info.get('level', -1), frames=info['elapsed_frames'],
                                       truncated=bool(info.get('TimeLimit.truncated')), **info['episode'],
@@ -399,13 +437,28 @@ def session_class():
                                   pid=self.evaluation.pid)), flush=True)
 
         def _evaluate_groups(self, checkpoint, cmd, count, replays):
-            """Parallel task groups: every group's rooms, target and deadline on the held-out seeds, greedy and
-            sampled, one replay page each (evaluations-<group>/<checkpoint>/); one chained process."""
+            """Parallel task groups: every group's rooms (its eval_tasks when it has them), target and deadline on the
+            held-out seeds, greedy and sampled, one replay page each (evaluations-<group>/<checkpoint>/); one chained
+            process."""
             runs = []
             for g in self.config['groups']['groups']:
                 out = self.out / f"evaluations-{g['name']}" / checkpoint.name
                 out.mkdir(parents=True, exist_ok=True)
-                base = cmd + ['--tasks-file', g['tasks'], '--seeds', f"range:{self.config['eval_seed_start']}:{count}",
+                if g.get('mode', 'combat') != 'combat' or self.config.get('reward_profile') in GOAL_PROFILES:
+                    # goal line: whole option sequences (abplus_eval_options), greedy and sampled; letters-only names;
+                    # a goal-line run's single-room COMBAT group too (C44: its observation has the goal fields)
+                    opt = [sys.executable, '-u', str(HERE / 'abplus_eval_options.py'), '--checkpoint', str(checkpoint),
+                           '--groups-file', self.config['groups_file'], '--group', g['name'],
+                           '--seeds', f"range:{self.config['eval_seed_start']}:{count}",
+                           '--instances', str(self.config['eval_instances']), '--name', 'evo',
+                           '--port', str(self.config['port'] - 200),
+                           '--recycle-rss-mib', str(self.config.get('recycle_rss_mib') or 400)]
+                    runs.append(opt + ['--out', str(out)])
+                    if self.config.get('eval_sampled'):
+                        runs.append(opt + ['--out', str(out / 'sampled'), '--stochastic', '--sample-seed', '0'])
+                    continue
+                base = cmd + ['--tasks-file', g.get('eval_tasks') or g['tasks'],
+                              '--seeds', f"range:{self.config['eval_seed_start']}:{count}",
                               '--episode-seconds', str(g['episode_seconds'])]
                 if g.get('has_target'):
                     base.append('--target-from-tasks')
@@ -550,6 +603,13 @@ def main():
                         'down to --lr-final (C36)')
     p.add_argument('--lr-final', type=float, default=None,
                    help='--lr-schedule linear / cosine: the learning rate at the end (default 0.1 x --learning-rate)')
+    p.add_argument('--shared-learning-rate', type=float, default=None,
+                   help='C44 (design 4.8): two optimizer groups; the shared (pre-goal-line) parameters peak at this rate '
+                        '(--lr-schedule down to --shared-lr-final, after --shared-lr-warmup-updates linear updates from '
+                        '--shared-lr-warmup-start); the goal-line parameters follow --learning-rate / --lr-final')
+    p.add_argument('--shared-lr-final', type=float, default=None, help='default 0.1 x --shared-learning-rate')
+    p.add_argument('--shared-lr-warmup-updates', type=int, default=0)
+    p.add_argument('--shared-lr-warmup-start', type=float, default=None, help='default --shared-lr-final')
     p.add_argument('--episodes', type=int, default=10 ** 9, help='stop after this many completed episodes')
     p.add_argument('--game-hours', type=float, default=None, help='stop after this much game time in this run')
     p.add_argument('--seed', type=int, default=1)
@@ -577,6 +637,9 @@ def main():
     p.add_argument('--warm-start-optimizer', action='store_true',
                    help='with --warm-start: also the checkpoint\'s optimizer state (Adam moments); the learning rate follows '
                         'this run\'s schedule (C41 continuing C39)')
+    p.add_argument('--warm-start-optimizer-shared', type=Path, default=None,
+                   help='C44: the Adam state of the shared (pre-goal-line) parameters from this checkpoint (the final of C39: they '
+                        'were frozen after it); --warm-start-optimizer then restores only the state of the goal-line parameters')
     p.add_argument('--resume', type=Path, help='AB+ checkpoint directory or checkpoints/latest.json; use a new --out')
     p.add_argument('--tasks-file', default=str(HERE.parent / 'abplus' / 'catalog' / 'mixture_basement1.json'),
                    help='room mixture spec (weights, normal and boss room lists); none = Monstro arena only')
@@ -597,6 +660,21 @@ def main():
     p.add_argument('--block-moves', action='store_true',
                    help='mask the moves the terrain stops dead (abplus_geometry.blocked_moves) in training and in '
                         'this run\'s evaluations (C30)')
+    p.add_argument('--goal-reward', type=float, default=None,
+                   help='goal line: the GOTO reward for reaching the goal, unscaled (default 10 = +1 trained; C45 15)')
+    p.add_argument('--damage-hp', type=float, default=None,
+                   help='goal line: monster HP per unscaled reward point of COMBAT damage (default 3.5 = +0.1 trained per '
+                        '3.5 HP; C45 1.75 = +0.2)')
+    p.add_argument('--expert-coef', type=float, default=0.0,
+                   help='goal-hp3 (C45): imitation of the scripted A* expert on the move head (gpu_ppo.expert_coef), '
+                        'falling linearly to 0 at --expert-until of the run')
+    p.add_argument('--expert-until', type=float, default=0.5)
+    p.add_argument('--expert-only', action='store_true',
+                   help='diagnosis (A15): the expert cross-entropy is the only loss (a supervised fit on the policy states)')
+    p.add_argument('--grad-probe', action='store_true',
+                   help='diagnosis (A15): log each loss term gradient norm per optimizer group and the clipping')
+    p.add_argument('--max-grad-norm', type=float, default=None,
+                   help='the gradient clipping norm (default: the checkpoint or SB3 value, 0.5)')
     p.add_argument('--hurt-cost', type=float, default=None,
                    help='combat-hp / combat-hp2: the cost per half heart (default 0.5 / 1.0)')
     p.add_argument('--stat-noise', default=None,
@@ -634,12 +712,25 @@ def main():
     p.add_argument('--recycle-rss-mib', type=float, default=0,
                    help='also restart an AB+ process once its resident memory reaches this many MiB, checked at the end '
                         'of each of its episodes (C39 t3r); 0 = never')
+    p.add_argument('--freeze-shared', action='store_true',
+                   help='goal line stage 1: every parameter but the goal-line modules (goal encoder and injections, the '
+                        'navigation residual, the GOTO critic) is frozen and the losses average over the GOTO samples')
+    p.add_argument('--preserve-coef', type=float, default=0.0,
+                   help='goal line: weight of KL(frozen copy of the migrated policy || policy) on the single-room samples '
+                        '(user decision 2026-09-30: standard single-room combat keeps its PPO data and gets this KL)')
+    p.add_argument('--preserve-target', type=float, default=None,
+                   help='goal line: adapt --preserve-coef after each update towards this mean KL on the single-room samples '
+                        '(x1.5 above 1.5 target, /1.5 below target / 1.5; EXPERIMENTS.md A10 measured C39 u800 vs u820 at '
+                        '0.07-0.14 per decision)')
     p.add_argument('--reward-profile', choices=('combat-v5', 'combat-hitrate', 'combat-hitrate-walk', 'combat-hitrate-miss',
                                                 'combat-hitrate-fire', 'combat-hitrate-hurt', 'combat-hp', 'combat-hp2',
-                                                'combat-hp2-camera', 'combat-v4',
+                                                'combat-hp2-camera', 'goal-hp', 'goal-hp2', 'goal-hp3', 'combat-v4',
                                                 'combat-v3', 'combat-v2', 'combat-v1'),
                    default='combat-v5',
-                   help='combat-hp (C39): +1 per 3.5 HP any monster loses, -0.5 per half heart, clear +100, deadline and '
+                   help='goal-hp (goal-conditioned line): COMBAT options as combat-hp2, GOTO options by '
+                        'abplus_reward.GotoReward, the observation with the goal fields (camera view), the group modes '
+                        'combat / combat_goto / goto_empty / chain; '
+                        'combat-hp (C39): +1 per 3.5 HP any monster loses, -0.5 per half heart, clear +100, deadline and '
                         'death -100 (terminal), the remaining time observed; combat-hp2 (C41): the same with -1 per half '
                         'heart on rooms of every shape (16x28 terrain canvas, positions in 1x1-room units); '
                         'combat-hp2-camera (C41 continuing C39): the same reward, the terrain the 15x9 window around the '
@@ -733,13 +824,23 @@ def main():
         os.environ.update(SOFTWARE_GL_ENV)
     from isaac_bridge.abplus_reward import (HPR, HR, HRM, HRW, V5, describe as describe_reward, describe_hitrate,
                                             describe_hitrate_fire, describe_hitrate_hurt, describe_hitrate_miss,
-                                            describe_hitrate_walk, describe_hp, describe_hp2, HPR2,
+                                            describe_hitrate_walk, describe_hp, describe_hp2, describe_goal, HPR2,
                                             describe_v3, describe_v4, describe_v5)
-    from isaac_bridge.abplus_worker import observation_options
+    from isaac_bridge.abplus_worker import GOAL_PROFILES, observation_options
     from isaac_bridge.gpu_env import validate_start_randomization
     from isaac_bridge.training_session import resolve_checkpoint, warm_start_model
     if args.resume and args.warm_start:
         p.error('--resume and --warm-start are mutually exclusive')
+    if (args.goal_reward is not None or args.damage_hp is not None) and args.reward_profile not in GOAL_PROFILES:
+        p.error('--goal-reward / --damage-hp are goal-line options')
+    if args.expert_coef and args.reward_profile != 'goal-hp3':
+        p.error('--expert-coef needs goal-hp3 (the frames carry the expert labels)')
+    if args.expert_only and not args.expert_coef:
+        p.error('--expert-only needs --expert-coef')
+    if args.shared_learning_rate and args.reward_profile not in GOAL_PROFILES:
+        p.error('--shared-learning-rate is a goal-line option (goal-hp, goal-hp2)')
+    if args.warm_start_optimizer_shared and not (args.warm_start and args.shared_learning_rate):
+        p.error('--warm-start-optimizer-shared needs --warm-start and --shared-learning-rate')
     if args.warm_start_optimizer and not args.warm_start:
         p.error('--warm-start-optimizer needs --warm-start')
     if (args.micro_batch <= 0 or args.segment_length <= 0 or args.batch_size % args.micro_batch
@@ -795,8 +896,13 @@ def main():
     walk = args.reward_profile in ('combat-hitrate-walk', 'combat-hitrate-miss', 'combat-hitrate-fire', 'combat-hitrate-hurt')
     hitrate = args.reward_profile in ('combat-hitrate', 'combat-hitrate-walk', 'combat-hitrate-miss', 'combat-hitrate-fire',
                                       'combat-hitrate-hurt')
-    hp = args.reward_profile in ('combat-hp', 'combat-hp2', 'combat-hp2-camera')   # C39, C41
-    hp2 = args.reward_profile in ('combat-hp2', 'combat-hp2-camera')
+    goal = args.reward_profile in GOAL_PROFILES   # goal-conditioned line (goal-hp, C44 goal-hp2): COMBAT as combat-hp2
+    hp = args.reward_profile in ('combat-hp', 'combat-hp2', 'combat-hp2-camera') or goal   # C39, C41
+    hp2 = args.reward_profile in ('combat-hp2', 'combat-hp2-camera') or goal
+    if (args.freeze_shared or args.preserve_coef or args.preserve_target) and not goal:
+        p.error('--freeze-shared / --preserve-coef / --preserve-target are goal-hp options')
+    if groups and not goal and any(g.get('mode', 'combat') != 'combat' for g in groups):
+        p.error('group modes other than combat need --reward-profile goal-hp')
     geometric = v5 or hitrate or hp   # combat-v5's observation, factored heads and auxiliary head
     if duel and not hitrate:
         p.error('--duel-file needs a combat-hitrate profile (the duel views carry its combat fields)')
@@ -840,6 +946,17 @@ def main():
             reward_options.update(deadline_s=float(episode_seconds))
             if args.no_death_cost:
                 reward_options.update(death=False)
+    elif goal:   # COMBAT options: combat-hp2 (all combat -1 per half heart, user decision 2026-09-30); GOTO: the
+        # learner's gamma keeps the shaping potential-based
+        reward_options = dict(combat=dict(hurt=args.hurt_cost if args.hurt_cost is not None else HPR2['hurt']),
+                              goto=dict(gamma=args.gamma))
+        # C45: the same price per half heart for GOTO, and the goal / damage rewards when given
+        if args.hurt_cost is not None:
+            reward_options['goto']['hurt'] = args.hurt_cost
+        if args.goal_reward is not None:
+            reward_options['goto']['goal'] = args.goal_reward
+        if args.damage_hp is not None:
+            reward_options['combat']['damage_hp'] = args.damage_hp
     elif hp:   # the cost per half heart is always recorded: the Room Buffer's d is the damage in half hearts
         reward_options = dict(hurt=args.hurt_cost if args.hurt_cost is not None else (HPR2 if hp2 else HPR)['hurt'])
     else:
@@ -970,6 +1087,7 @@ def main():
               'duel_transfer': duel_transfer,
               'tasks_spec': tasks,
               'groups': describe_groups(groups, args.budget) if groups else None,
+              'groups_file': str(args.groups_file.resolve()) if groups else None,
               'observation_transport': 'json (bridge v1)' if args.json_obs else f'binary (bridge v2, {BRIDGE_VERSION})',
               'start_bombs': start_bombs,
               'room_sampling': (dict(method='plr', levels=len(plr_levels), beta=args.plr_beta,
@@ -1000,11 +1118,26 @@ def main():
               'learning_rate_schedule': (f'{args.learning_rate:g} constant' if args.lr_schedule == 'constant' else
                                          f'{args.lr_schedule} from {args.learning_rate:g} to {lr_final:g} over this run\'s '
                                          f'{args.game_hours:g} game hours'),
+              'expert_imitation': (dict(coef=args.expert_coef, until=args.expert_until,
+                                        schedule=f'{args.expert_coef:g} falling linearly to 0 at {args.expert_until:g} of the run',
+                                        labels='GOTO: the scripted navigator (abplus_nav.descent_move); COMBAT: the approach '
+                                               'moves once stuck against the terrain for 3 s (transformer_obs.STUCK_FRAMES)')
+                                   if args.expert_coef else None),
+              'diagnosis': (dict(expert_only=args.expert_only, grad_probe=args.grad_probe, max_grad_norm=args.max_grad_norm)
+                            if args.expert_only or args.grad_probe or args.max_grad_norm is not None else None),
+              'learning_rate_groups': (dict(
+                  goal=f'goal-line parameters: {args.lr_schedule} from {args.learning_rate:g} to {lr_final:g}',
+                  shared=(f'shared parameters: {args.shared_lr_warmup_updates} updates linear from '
+                          f'{args.shared_lr_warmup_start if args.shared_lr_warmup_start is not None else (args.shared_lr_final if args.shared_lr_final is not None else 0.1 * args.shared_learning_rate):g}, '
+                          f'then {args.lr_schedule} from {args.shared_learning_rate:g} to '
+                          f'{args.shared_lr_final if args.shared_lr_final is not None else 0.1 * args.shared_learning_rate:g}'))
+                                       if args.shared_learning_rate else None),
               'update_schedule': ('asynchronous: each update trains while the next rollout is collected by the '
                                   'weights it started from (one update of policy lag); decoupled PPO objective: '
                                   'ratio clipped against the update start, samples weighted by '
                                   'pi_start/pi_behaviour truncated at 2' if args.async_train else 'synchronous'),
-              'reward': (({**describe_hp2(**reward_options), 'profile': args.reward_profile} if hp2
+              'reward': (dict(describe_goal(**reward_options), profile=args.reward_profile) if goal else
+                         ({**describe_hp2(**reward_options), 'profile': args.reward_profile} if hp2
                           else describe_hp(**reward_options)) if hp
                          else describe_v5(**reward_options) if v5
                          else describe_hitrate_hurt(**reward_options, miss_cap=miss_cap) if hurting
@@ -1107,8 +1240,23 @@ def main():
                                                                   heads=args.model_heads,
                                                                   entity_queries=args.entity_queries,
                                                                   entity_dim=args.entity_width),
-                                   net_arch=dict(pi=[args.head_width], vf=[args.head_width]), normalize_images=False),
+                                   net_arch=dict(pi=[args.head_width], vf=[args.head_width]), normalize_images=False,
+                                   **(dict(lr_groups=True) if args.shared_learning_rate else {})),
                 device=args.device, seed=args.seed, verbose=1)
+        if args.shared_learning_rate:
+            # C44 (design 4.8): the shared parameters warm up to their own peak, the goal-line ones follow --learning-rate
+            from isaac_bridge.gpu_ppo import GroupLearningRate
+            shared_final = args.shared_lr_final if args.shared_lr_final is not None else 0.1 * args.shared_learning_rate
+            model.lr_groups = dict(
+                shared=GroupLearningRate(args.lr_schedule, args.shared_learning_rate, shared_final,
+                                         args.shared_lr_warmup_updates, args.shared_lr_warmup_start),
+                goal=GroupLearningRate(args.lr_schedule, args.learning_rate, lr_final))
+            if [g.get('name') for g in model.policy.optimizer.param_groups] != ['shared', 'goal']:
+                raise RuntimeError('--shared-learning-rate needs the two optimizer groups of the policy (lr_groups)')
+        model.expert_coef, model.expert_until = args.expert_coef, args.expert_until   # C45
+        model.imitation_only, model.grad_probe = args.expert_only, args.grad_probe   # A15 diagnosis
+        if args.max_grad_norm is not None:
+            model.max_grad_norm = args.max_grad_norm
         model.micro_batch_size, model.segment_length = args.micro_batch, args.segment_length
         model.aux_coef = args.aux_coef if geometric else 0.0
         model.aux_distance_coef = args.aux_distance_coef
@@ -1127,12 +1275,40 @@ def main():
         if args.warm_start:
             migration = warm_start_model(model, args.warm_start)
             if args.warm_start_optimizer:
-                # C41: the Adam moments of the checkpoint (same network); each update sets this run's learning rate.
-                from stable_baselines3.common.save_util import load_from_zip_file
-                _, params, _ = load_from_zip_file(args.warm_start / 'model.zip', device=model.device)
-                model.policy.optimizer.load_state_dict(params['policy.optimizer'])
-                migration.update(optimizer_restored=True, optimizer_state_entries=len(params['policy.optimizer']['state']))
+                # C41: the Adam moments of the checkpoint, matched by parameter name (a goal-line policy has more
+                # parameters); each update sets this run's learning rate.
+                from isaac_bridge.training_session import warm_start_optimizer
+                migration.update(warm_start_optimizer(model, args.warm_start,
+                                                      'goal' if args.warm_start_optimizer_shared else None))
+            if args.warm_start_optimizer_shared:
+                # C44: the shared parameters' moments from C39's final (frozen in stage 1, they have none since)
+                from isaac_bridge.training_session import warm_start_optimizer
+                migration['shared_optimizer'] = dict(checkpoint=str(args.warm_start_optimizer_shared),
+                                                     **warm_start_optimizer(model, args.warm_start_optimizer_shared, 'shared'))
             (args.out / 'migration.json').write_text(json.dumps(migration, indent=2), encoding='utf8')
+        if goal:
+            # goal line (user decisions 2026-09-30): the item head by the active item's charge (no item is given); stage 1
+            # freezes everything but the goal-line modules; the preservation KL's teacher is the policy as migrated (on
+            # COMBAT frames exactly the checkpoint's function)
+            import copy
+            from isaac_bridge.training_session import _goal_line_key
+            model.item_available = True
+            if args.freeze_shared:
+                frozen = 0
+                for name, param in model.policy.named_parameters():
+                    if not _goal_line_key(name):
+                        param.requires_grad_(False)
+                        frozen += param.numel()
+                model.loss_tasks = 'goto'
+                (args.out / 'freeze.json').write_text(json.dumps(dict(frozen_parameters=frozen, trainable=sum(
+                    q.numel() for q in model.policy.parameters() if q.requires_grad)), indent=2), encoding='utf8')
+            if args.preserve_coef > 0:
+                teacher = copy.deepcopy(model.policy)
+                teacher.set_training_mode(False)
+                for param in teacher.parameters():
+                    param.requires_grad_(False)
+                model.preserve_teacher, model.preserve_coef = teacher, args.preserve_coef
+                model.preserve_target = args.preserve_target
         if args.distill_from:
             from isaac_bridge.gpu_ppo import load_frozen_policy
             model.teacher = load_frozen_policy(args.distill_from / 'model.zip', model.device, env.observation_space,

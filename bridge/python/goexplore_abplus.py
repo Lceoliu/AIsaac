@@ -49,6 +49,13 @@ def default_bridge_lua():
     raise SystemExit('abp_bridge.lua not found next to this script; pass --bridge-lua')
 
 
+def default_preload():
+    """libabp_turbo.so of this copy (<copy>/tools, built with ABP_AL_STOPPED), '' when there is none (launch_abplus then
+    uses $ABP_HOME/tools/libabp_turbo.so)."""
+    path = HERE.parent / 'tools' / 'libabp_turbo.so'
+    return str(path) if path.is_file() else ''
+
+
 def load_spec(args):
     """{'name', 'spec': {weights, normal, boss}, 'target', 'seconds', 'tasks'} of --tasks or of --groups-file/--group."""
     if args.groups_file:
@@ -448,21 +455,24 @@ def main():
     p.add_argument('--bridge-lua', default=None)
     p.add_argument('--software-gl', action='store_true', help='Mesa software OpenGL for the instances (B7)')
     for f, v in asdict(GxConfig()).items():
-        if f == 'bridge_lua':
+        if f in ('bridge_lua', 'preload'):
             continue
         flag = '--' + f.replace('_', '-')
         if isinstance(v, bool):
-            p.add_argument(flag, action='store_true', default=v)
+            p.add_argument(flag, action=argparse.BooleanOptionalAction, default=v)
         else:
             p.add_argument(flag, type=type(v), default=v)
+    p.add_argument('--preload', default=None, help='libabp_turbo.so for the instances (default: <copy>/tools, else '
+                                                    '$ABP_HOME/tools)')
     args = p.parse_args()
     if not steam_running():
         raise SystemExit('the Steam client is not running (every AB+ start needs it)')
     if args.software_gl:
         from isaac_bridge.abplus import SOFTWARE_GL_ENV
         os.environ.update(SOFTWARE_GL_ENV)
-    cfg = GxConfig(**{f: getattr(args, f) for f in asdict(GxConfig()) if f != 'bridge_lua'},
-                   bridge_lua=args.bridge_lua or default_bridge_lua())
+    cfg = GxConfig(**{f: getattr(args, f) for f in asdict(GxConfig()) if f not in ('bridge_lua', 'preload')},
+                   bridge_lua=args.bridge_lua or default_bridge_lua(),
+                   preload=default_preload() if args.preload is None else args.preload)
     spec = load_spec(args)
     seeds = parse_seeds(args.seeds)
     out = Path(args.out)

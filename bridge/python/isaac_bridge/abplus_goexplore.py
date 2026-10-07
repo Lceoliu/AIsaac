@@ -40,7 +40,7 @@ from dataclasses import dataclass, field, asdict
 
 import numpy as np
 
-from .abplus import AbplusTransformerEnv, launch_abplus, stop_abplus
+from .abplus import ABP_HOME, AbplusTransformerEnv, kill_abplus, launch_abplus, stop_abplus
 from .abplus_tasks import TaskSampler
 
 # The A7 digest (EXPERIMENTS.md A7) without its trace; diag adds the lines that differ between instance histories by
@@ -167,8 +167,12 @@ class GxConfig:
     # instances
     mode: str = 'exact'
     bridge_lua: str = ''
+    preload: str = ''             # libabp_turbo.so for the instances ('' = $ABP_HOME/tools)
+    al_stopped: bool = True       # ABP_AL_STOPPED: OpenAL sources read as stopped (A8: otherwise play follows real time)
+    stub_list: str = ''           # ABP_STUB_LIST for the instances ('' = the mode's own list)
     nice: int = 10
     recycle_rss_mib: float = 600.0
+    die_with_parent: bool = False # the instance gets SIGKILL when its launching process ends (abplus.launch_abplus)
 
 
 def pack(joint, bomb=0, item=0):
@@ -459,9 +463,34 @@ class Instance:
         self.launch()
 
     def launch(self):
+        extra = {}
+        if self.cfg.preload:
+            extra['ABP_PRELOAD'] = self.cfg.preload
+        if self.cfg.al_stopped:
+            extra['ABP_AL_STOPPED'] = '1'
+        if self.cfg.stub_list:
+            extra['ABP_STUB_LIST'] = self.cfg.stub_list
+        # 2026-10-06 (the root's first-build hang): the bridge writes the port it listens on to this file, and binds a
+        # free port when the configured one is taken (abp_bridge.lua try_bind); the client connects to the file's port
+        # (AbplusTrainingEnv.connect). A stale file of the previous launch goes first.
+        home = ABP_HOME / 'instances' / self.name.lower()
+        self.port_file = home / 'bridge_port'
+        self.stack_dir = home / 'stalls' / 'stacks'   # abp_turbo writes SIGUSR2 stack dumps here (tok_sampler)
+        try:
+            self.stack_dir.mkdir(parents=True, exist_ok=True)
+            self.port_file.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        extra['ISAAC_RL_PORT_FILE'] = str(self.port_file)
+        extra['ABP_STACK_DUMP_DIR'] = str(self.stack_dir)
         self.proc = launch_abplus(self.name, self.port, self.cfg.mode, bridge_lua=self.cfg.bridge_lua or None,
-                                  nice=self.cfg.nice)
+                                  nice=self.cfg.nice, extra_env=extra or None,
+                                  die_with_parent=getattr(self.cfg, 'die_with_parent', False))
         self.env = make_env(self.port, self.cfg, self.spec)
+        self.env.bridge.port_file = str(self.port_file)
+        self.env.bridge.process_exit = self.proc.poll   # the connect loop gives up at once when the game has ended
         self.digest_ready = False
         self.launches += 1
 
@@ -477,20 +506,68 @@ class Instance:
                 stop_abplus(self.proc, self.name)
                 try:
                     self.proc.wait(timeout=30)
-                except Exception:
-                    pass
+                except Exception:   # still there 30 s after SIGTERM (stopped or hung): SIGKILL (2026-10-05)
+                    kill_abplus(self.proc, self.name)
                 self.proc = None
 
-    def relaunch(self):
-        self.close()
+    def kill(self):
+        """End this instance now, whatever state it is in (2026-10-05; tok_sampler: a root instance hung during a
+        reset that a helper thread runs). The client is aborted first (AbplusTrainingEnv.abort: a recv blocked in that
+        thread returns, its connect loop can no longer reach this port), then abplus.kill_abplus (SIGKILL to the
+        process group, clones included, and to every game process of this name). Returns the pids still alive
+        afterwards (empty: all gone)."""
+        env, self.env = self.env, None
+        if env is not None:
+            try:
+                env.bridge.abort()
+            except Exception:
+                pass
+        proc, self.proc = self.proc, None
+        self.digest_ready = False
+        return kill_abplus(proc, self.name)
+
+    def retire(self):
+        """End this instance's game process alone (2026-10-06, the tok workers' root recycling): the client is given up
+        (abort) and closed, SIGKILL goes to the game's pid only (launch_abplus execs it, so it is the launcher's pid) and
+        the launcher is reaped. Its fork clones (parked templates and room entries: same name and process group) are left
+        running: they live as long as their own connections. launch() then starts a new process."""
+        env, self.env = self.env, None
+        if env is not None:
+            try:
+                env.bridge.abort()
+                if env.bridge._sock is not None:
+                    env.bridge._sock.close()
+                    env.bridge._sock = None
+            except Exception:
+                pass
+        proc, self.proc = self.proc, None
+        self.digest_ready = False
+        if proc is not None:
+            try:
+                os.kill(proc.pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+
+    def relaunch(self, hard=False):
+        """A new process for this instance; hard: the old one killed (kill) instead of closed."""
+        if hard:
+            self.kill()
+        else:
+            self.close()
         time.sleep(1.0)
         self.launch()
 
-    def rss_mib(self):
+    def rss_mib(self, field='VmRSS'):
+        """The game process's resident memory (MiB) from /proc/<pid>/status: VmRSS, or RssAnon (its private heap and
+        stacks, without the files and shared memory it maps, 2026-10-06)."""
         try:
             with open(f'/proc/{self.proc.pid}/status') as f:
                 for line in f:
-                    if line.startswith('VmRSS:'):
+                    if line.startswith(field + ':'):
                         return int(line.split()[1]) / 1024
         except (AttributeError, OSError, ValueError):
             pass
@@ -502,6 +579,10 @@ class Instance:
         if not self.digest_ready:   # the bridge connects on the first reset; the function lives in its Lua state
             if self.env.bridge.lua(DIGEST_LUA) != 'ok':
                 raise RuntimeError('digest function not installed')
+            counters = self.env.bridge.lua("return tostring(os.getenv('ABP_TURBO_COUNTERS'))") or ''
+            if self.cfg.al_stopped and 'al_stopped=' not in counters:
+                raise RuntimeError(f'al_stopped needs a libabp_turbo.so with ABP_AL_STOPPED (A8), got {counters!r}: '
+                                   f'build analysis/scripts/abplus/abp_turbo.c and pass it as preload')
             self.digest_ready = True
         return obs, info
 

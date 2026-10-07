@@ -68,13 +68,15 @@ import numpy as np
 
 from .abplus import AbplusTransformerEnv, launch_abplus, stop_abplus
 from .abplus_geometry import blocked_moves
-from .abplus_groups import GroupScheduler
+from .abplus_groups import GroupScheduler, sample_group_hp
 from .abplus_reward import (COMPONENTS, COMPONENTS_HP, COMPONENTS_HR, COMPONENTS_HRF, COMPONENTS_HRH, COMPONENTS_HRM,
                             COMPONENTS_HRM_REST, COMPONENTS_HRW, COMPONENTS_V3, COMPONENTS_V4, COMPONENTS_V5, CREDIT_STEPS,
                             REWARDS)
 from .abplus_tasks import TASKS, Task, TaskSampler
+from .abplus_options import GOTO_RADIUS, GOTO_SECONDS, GROUP_MODES, OptionSequence
+from .abplus_reward import COMPONENTS_GOTO, GotoReward
 from .transformer_obs import (BIG_TERRAIN, COMBAT_FIELDS, COMBAT_FIELDS_HITRATE, COMBAT_FIELDS_MISS, COMBAT_FIELDS_V4,
-                              ENTITY_FLAGS, FACTORED_NVEC)
+                              ENTITY_FLAGS, FACTORED_NVEC, GOAL_FIELDS, GOAL_TASKS, ROOM_CANVAS, SOURCES)
 from .combat_reward import combat_v1_reward
 from .steam_watch import steam_running
 
@@ -108,27 +110,48 @@ META_DTYPE = np.dtype([
     # C39 t3r, written at the end of an episode: the resident memory of the process that played it, which instance
     # (0 a, 1 b) and its episodes since that process started; recycles started by the memory cap.
     ('rss_mib', 'f4'), ('instance', 'i4'), ('instance_episodes', 'i4'), ('memory_recycles', 'i4'),
-    ('stats_mod', 'f4', (5,))])   # C41: the stepping episode's stat offsets (STAT_KEYS)
+    ('stats_mod', 'f4', (5,)),    # C41: the stepping episode's stat offsets (STAT_KEYS)
+    # goal line: the stepping option's task (GOAL_TASKS) and sample source (SOURCES), and the next one's
+    ('option', 'i4'), ('source', 'i4'), ('reset_option', 'i4'), ('reset_source', 'i4'),
+    # C44 (Room Buffer for the goal groups), written when an option ends: whether its option sequence ended with it, whether
+    # every option of the sequence succeeded (a plan cut short because no goal could be drawn counts as done), the half
+    # hearts the sequence lost and its decisions
+    ('seq_end', 'i4'), ('seq_ok', 'i4'), ('seq_hurt', 'f4'), ('seq_steps', 'i4')])
 REWARD_PROFILES = ('combat-v1', 'combat-v2', 'combat-v3', 'combat-v4', 'combat-v5', 'combat-hitrate',
                    'combat-hitrate-walk', 'combat-hitrate-miss', 'combat-hitrate-fire', 'combat-hitrate-hurt',
-                   'combat-hp', 'combat-hp2', 'combat-hp2-camera')
+                   'combat-hp', 'combat-hp2', 'combat-hp2-camera', 'goal-hp', 'goal-hp2', 'goal-hp3')
 # Room state input per profile, and the profiles whose 120 s deadline is an observed termination
 # (combat-v4/v5 and the hit-rate test truncate at the deadline instead and observe no elapsed time).
 COMBAT_LAYOUTS = {'combat-v3': COMBAT_FIELDS, 'combat-v4': COMBAT_FIELDS_V4, 'combat-v5': COMBAT_FIELDS_V4,
                   'combat-hitrate': COMBAT_FIELDS_HITRATE, 'combat-hitrate-walk': COMBAT_FIELDS_HITRATE,
                   'combat-hitrate-miss': COMBAT_FIELDS_MISS, 'combat-hitrate-fire': COMBAT_FIELDS_MISS,
                   'combat-hitrate-hurt': COMBAT_FIELDS_MISS, 'combat-hp': COMBAT_FIELDS_V4, 'combat-hp2': COMBAT_FIELDS_V4,
-                  'combat-hp2-camera': COMBAT_FIELDS_V4}
+                  'combat-hp2-camera': COMBAT_FIELDS_V4, 'goal-hp': COMBAT_FIELDS_V4, 'goal-hp2': COMBAT_FIELDS_V4,
+                  'goal-hp3': COMBAT_FIELDS_V4}
 # combat-hp (C39) observes the remaining time of its group's deadline, which ends the episode as a termination.
-DEADLINE_PROFILES = ('combat-v1', 'combat-v2', 'combat-v3', 'combat-hp', 'combat-hp2', 'combat-hp2-camera')
+DEADLINE_PROFILES = ('combat-v1', 'combat-v2', 'combat-v3', 'combat-hp', 'combat-hp2', 'combat-hp2-camera', 'goal-hp',
+                     'goal-hp2', 'goal-hp3')
 # Frames that carry remaining_time (the deadline differs per group); for the others the learner derives it as
 # 1 - time / 120 (gpu_env.decode_frame).
-STORED_DEADLINE_PROFILES = ('combat-hp', 'combat-hp2', 'combat-hp2-camera')
+STORED_DEADLINE_PROFILES = ('combat-hp', 'combat-hp2', 'combat-hp2-camera', 'goal-hp', 'goal-hp2', 'goal-hp3')
 # C41 (combat-hp2): rooms of every Basement shape: the terrain on transformer_obs.BIG_TERRAIN, positions in 1x1-room units.
 BIG_ROOM_PROFILES = ('combat-hp2',)
 # C41 as C39's continuation (combat-hp2-camera): the terrain is the camera's 15x9 window, positions in 1x1-room units; the
 # frames and the network are combat-hp's.
-CAMERA_PROFILES = ('combat-hp2-camera',)
+CAMERA_PROFILES = ('combat-hp2-camera', 'goal-hp', 'goal-hp2', 'goal-hp3')
+# Goal-conditioned line (rl/docs/GOAL_CONDITIONED_DESIGN.md): the observation's goal fields (camera view as base, so a room
+# of another shape entered through a door still encodes), COMBAT options rewarded as combat-hp2, GOTO options by GotoReward.
+GOAL_PROFILES = ('goal-hp', 'goal-hp2', 'goal-hp3')
+# C44 (goal-hp2): goal-hp's observation with the player's position from the camera window (window_position) and the whole
+# room on the 16 x 28 canvas (room_bits) for the model's full-room branch; a 1x1 room encodes as goal-hp plus room_bits.
+ROOM_BITS_PROFILES = ('goal-hp2', 'goal-hp3')
+# C45 (goal-hp3): goal-hp2 plus 'expert_move', the scripted A* expert's move (transformer_obs.STUCK_FRAMES) for the learner's
+# imitation loss; not a network input, so a goal-hp2 checkpoint migrates without new parameters.
+EXPERT_PROFILES = ('goal-hp3',)
+GOAL_FIELDS_DTYPE = [('goal', 'f4', (GOAL_FIELDS,)), ('goal_map', 'f4', (2, 9, 15)), ('goal_distance', 'f4'),
+                     ('source', 'f4')]
+GOAL_KEYS = ('goal', 'goal_map', 'goal_distance', 'source')
+# Group modes (a group's 'mode') and the option sequences: abplus_options (GROUP_MODES, OptionSequence).
 TRUNCATING_PROFILES = ('combat-v4', 'combat-v5', 'combat-hitrate', 'combat-hitrate-walk', 'combat-hitrate-miss',
                        'combat-hitrate-fire', 'combat-hitrate-hurt')
 # combat-v5 frames: firing geometry (entity flags, fire_distance, the auxiliary labels) and the
@@ -136,9 +159,10 @@ TRUNCATING_PROFILES = ('combat-v4', 'combat-v5', 'combat-hitrate', 'combat-hitra
 # The hit-rate test keeps combat-v5's observation and heads; combat-hitrate-walk measures d_fire
 # (the critic's fire_distance, the approach label) as the walking distance (WALK_PROFILES).
 GEOMETRY_PROFILES = ('combat-v5', 'combat-hitrate', 'combat-hitrate-walk', 'combat-hitrate-miss', 'combat-hitrate-fire',
-                     'combat-hitrate-hurt', 'combat-hp', 'combat-hp2', 'combat-hp2-camera')
+                     'combat-hitrate-hurt', 'combat-hp', 'combat-hp2', 'combat-hp2-camera', 'goal-hp', 'goal-hp2',
+                     'goal-hp3')
 WALK_PROFILES = ('combat-hitrate-walk', 'combat-hitrate-miss', 'combat-hitrate-fire', 'combat-hitrate-hurt', 'combat-hp',
-                 'combat-hp2', 'combat-hp2-camera')
+                 'combat-hp2', 'combat-hp2-camera', 'goal-hp', 'goal-hp2', 'goal-hp3')
 # combat-hitrate-fire: per step, the reward to move to the steps the tears were fired in (1..CREDIT_STEPS back).
 CREDIT_PROFILES = ('combat-hitrate-fire',)
 CREDIT_FIELDS = [('credit', 'f4', (CREDIT_STEPS,))]
@@ -148,7 +172,9 @@ GEOMETRY_FIELDS = [('entity_flags', 'f4', (256, len(ENTITY_FLAGS))), ('fire_dist
                    # not an observation.
                    ('move_block', 'f4', (9,))]
 GEOMETRY_KEYS = ('entity_flags', 'fire_distance', 'aim_label', 'approach')
-OUTCOMES = ('running', 'death', 'win', 'time_limit', 'error', 'hurt')   # append only: frames store the index
+# append only: frames store the index. Goal line: goal (a GOTO option reached its goal), exit (left through a door on a
+# position task), wrong_door.
+OUTCOMES = ('running', 'death', 'win', 'time_limit', 'error', 'hurt', 'goal', 'exit', 'wrong_door')
 FULL_START = (6.0, 1.0)  # player half-hearts, Boss HP fraction
 MAX_EPISODE_FRAMES = 3600  # 120 s at 30 logic frames/s
 RECYCLE_EPISODES = 200     # restart an AB+ process after this many episodes (memory leak; 0 = never)
@@ -183,7 +209,12 @@ def frame_layout(profile):
         base = [('terrain', 'f4', (7, *BIG_TERRAIN)) if field[0] == 'terrain' else field for field in base]
     credit = CREDIT_FIELDS if profile in CREDIT_PROFILES else []
     deadline = [('remaining_time', 'f4')] if profile in STORED_DEADLINE_PROFILES else []
-    return np.dtype(base + combat + GEOMETRY_FIELDS + credit + deadline), FRAME_KEYS_COMBAT + GEOMETRY_KEYS
+    goal = GOAL_FIELDS_DTYPE if profile in GOAL_PROFILES else []
+    room = [('room_bits', 'f4', ROOM_CANVAS)] if profile in ROOM_BITS_PROFILES else []
+    expert = [('expert_move', 'f4', (9,))] if profile in EXPERT_PROFILES else []
+    keys = (FRAME_KEYS_COMBAT + GEOMETRY_KEYS + (GOAL_KEYS if goal else ()) + (('room_bits',) if room else ())
+            + (('expert_move',) if expert else ()))
+    return np.dtype(base + combat + GEOMETRY_FIELDS + credit + deadline + goal + room + expert), keys
 
 
 def observation_options(profile):
@@ -193,7 +224,10 @@ def observation_options(profile):
                 **(dict(geometry='walk' if profile in WALK_PROFILES else True, factored_actions=True)
                    if geometry else {}),
                 **(dict(terrain_shape=BIG_TERRAIN, room_scale='fixed') if profile in BIG_ROOM_PROFILES else {}),
-                **(dict(room_scale='camera') if profile in CAMERA_PROFILES else {}))
+                **(dict(room_scale='camera') if profile in CAMERA_PROFILES else {}),
+                **(dict(goal=True) if profile in GOAL_PROFILES else {}),
+                **(dict(window_position=True, room_bits=True) if profile in ROOM_BITS_PROFILES else {}),
+                **(dict(expert=True) if profile in EXPERT_PROFILES else {}))
 
 
 STAT_KEYS = ('speed', 'damage', 'shot_speed', 'tears', 'range')
@@ -391,6 +425,7 @@ class Instance:
                        **observation_options(self.config.get('reward_profile')))
         env.bridge.binary_obs = self.config.get('binary_obs', True)
         env.bridge.lineage_mode = int(self.config.get('lineage_mode', env.bridge.lineage_mode))
+        env.combat_multi_room = self.config.get('reward_profile') in GOAL_PROFILES   # goal line: COMBAT may leave its room
         env.bridge.invincible = bool(self.config.get('invincible', False))
         env.bridge.miss_cap = int(self.config.get('miss_cap', 0))
         env.bridge.target = self.config.get('target')   # single-enemy aiming arena (C22)
@@ -464,6 +499,10 @@ class Instance:
         self.env.bridge.tasks, self.env.bridge.target = self.samplers[group], g.get('target')
         self.env.max_episode_frames = int(g['frames'])
         self.env.history.deadline_s = float(g['seconds'])   # remaining_time (combat-hp)
+        mode = g.get('mode', 'combat')   # goal line: how the group's episodes start
+        self.env.bridge.reset_mode = {'chain': 'chain', 'goto_empty': 'goto_room'}.get(mode)
+        if mode == 'chain':
+            self.env.bridge.chain_rooms = frozenset(int(v) for v in g['spec']['normal'])
 
     def prepare(self, seed, start, bombs=1, group=-1, replay=0, recycle=False):
         """Reset for an episode in a background thread; recycle=True first replaces the process; group >= 0:
@@ -530,15 +569,31 @@ class Instance:
         self._stop_process()
 
 
-def write_frame(row, frame, reward, done, truncated, outcome, elapsed, layout, count, hit=0.0, credit=None, raw=None):
+class _OptionStepped(Exception):
+    """Worker.step: the goal line's option_step wrote the step (skips the combat-only path, keeps the error handling)."""
+
+
+# Shield in training (floor-clear mandate, A17): with ABP_SHIELD_TRAIN=1 a frame's move_block is the collision shield's
+# dangerous moves (isaac_bridge.abplus_shield.danger on the last two observations), unless every move is dangerous; with
+# --block-moves the sampler masks them, the same rule the floor runner's --shield applies at test time.
+SHIELD_TRAIN = os.environ.get('ABP_SHIELD_TRAIN') == '1'
+
+
+def write_frame(row, frame, reward, done, truncated, outcome, elapsed, layout, count, hit=0.0, credit=None, raw=None,
+                prev=None):
     names = row.dtype.names
-    for key in FRAME_KEYS + ('combat',) + GEOMETRY_KEYS + ('remaining_time',):
+    for key in FRAME_KEYS + ('combat',) + GEOMETRY_KEYS + ('remaining_time',) + GOAL_KEYS + ('room_bits', 'expert_move'):
         if key in names:
             row[key] = frame[key]
     if 'hit' in names:
         row['hit'] = hit
     if 'move_block' in names:   # raw: the observation of this frame (None: nothing blocked)
-        row['move_block'] = blocked_moves(raw) if raw is not None else 0.0
+        if SHIELD_TRAIN:
+            from .abplus_shield import danger
+            bad = danger(prev, raw) if raw is not None else [False] * 9
+            row['move_block'] = 0.0 if all(bad) else np.asarray(bad, np.float32)
+        else:
+            row['move_block'] = blocked_moves(raw) if raw is not None else 0.0
     if 'credit' in names:   # every row, so a reset or error row never keeps the last step's credit
         row['credit'] = 0.0 if credit is None else credit
     row['reward'] = reward
@@ -579,8 +634,15 @@ class Worker:
         self.profile = config.get('reward_profile', 'combat-v1')
         if self.profile not in REWARD_PROFILES:
             raise ValueError(f'unknown reward profile {self.profile!r}')
-        self.reward = (REWARDS[self.profile](**config.get('reward_options', {})) if self.profile in REWARDS
-                       else None)
+        # goal line: reward_options = {'combat': {...}, 'goto': {...}}; COMBAT options use combat-hp2, GOTO options GotoReward
+        self.goal_line = self.profile in GOAL_PROFILES
+        options = config.get('reward_options', {})
+        if self.goal_line:
+            self.reward = REWARDS[self.profile](**options.get('combat', {}))
+            self.goto_reward = GotoReward(**options.get('goto', {}))
+        else:
+            self.reward = REWARDS[self.profile](**options) if self.profile in REWARDS else None
+        self.seq, self.option = None, None
         self.hurt_ends = bool(config.get('hurt_ends', False))
         self.damage0 = 0.0   # combat.player_damage when the episode started
         # Parallel task groups: the group of the episode being played and its decisions so far.
@@ -615,8 +677,14 @@ class Worker:
                 i = min(int(np.searchsorted(np.cumsum(p / p.sum()), rng.random(), side='right')), len(p) - 1)
                 if int(seeds[group, i]) >= 0:
                     seed, replay = int(seeds[group, i]), 1
-        return (seed, sample_start(seed, self.config['start_randomization']),
-                sample_bombs(seed, self.config.get('start_bombs')), group, replay)
+        return (seed, self.start_of(seed, group), sample_bombs(seed, self.config.get('start_bombs')), group, replay)
+
+    def start_of(self, seed, group):
+        """(player half hearts, boss HP fraction) of an episode: the run's start randomisation, the half hearts replaced by
+        the group's start_hp when it has one (C45, abplus_groups.sample_group_hp)."""
+        start = sample_start(seed, self.config['start_randomization'])
+        hp = sample_group_hp(seed, self.group_spec(group).get('start_hp')) if group >= 0 else None
+        return (hp, start[1]) if hp is not None else start
 
     def _begin(self, instance_index, result):
         seed, start, bombs, frame, info, rows, reset_ms, group, replay, stats = result
@@ -643,9 +711,87 @@ class Worker:
         raw = self.instances[instance_index].env.raw_obs
         self.stats = EpisodeStats(raw)
         self.damage0 = float(raw['combat']['player_damage']) if 'combat' in raw else 0.0
+        if self.goal_line:
+            self.seq = OptionSequence(self.group_spec(group), seed, info, (self.reward, self.goto_reward))
+            started = self.start_option(self.instances[instance_index].env, first=True)
+            if started is None:
+                raise RuntimeError(f'seed {seed}: the first option found no goal')
+            frame, rows = started
+            self.last_frame = frame
+            return frame, rows, reset_ms
         if self.reward is not None:
             self.reward.reset(raw, TASKS[self.task])
         return frame, rows, reset_ms
+
+    # ------------------------------------------------------------------ goal line: options
+    def group_spec(self, group):
+        return self.config['groups'][group] if group >= 0 else {}
+
+    def option_plan(self, group, info):
+        """The options of the sequence this reset started (abplus_options.option_plan)."""
+        from .abplus_options import option_plan
+        return option_plan(self.group_spec(group), info)
+
+    def start_option(self, env, first=False, room_changed=False):
+        """Start the sequence's current option in place (OptionSequence.start) and reset this worker's per-option state;
+        None when a GOTO option finds no goal."""
+        started = self.seq.start(env, first=first, room_changed=room_changed)
+        if started is None:
+            return None
+        self.option = self.seq.option
+        if 'variant' in self.option:
+            self.layout = int(self.option['variant'])
+        self.stats = EpisodeStats(env.raw_obs)
+        self.elapsed = 0
+        return started
+
+    def option_codes(self):
+        """(GOAL_TASKS index, SOURCES index) of the current option."""
+        return GOAL_TASKS.index(self.option['task']), SOURCES.index(self.option['source'])
+
+    def option_step(self, active, frame, info, terminated, truncated):
+        """One decision of the current option: its outcome, reward and step row. When the option ended with a win or a
+        reached goal and the plan goes on, the next option starts in place (its first frame in the reset row) and False
+        is returned; True when the sequence ended (the caller switches to the standby instance)."""
+        raw = active.env.raw_obs
+        option = self.option
+        outcome = self.seq.outcome(raw, info['outcome'])
+        elapsed = int(info['elapsed_frames'])
+        self.stats.step(raw, elapsed - self.elapsed)
+        reward, parts, hit = self.seq.step(raw, outcome, elapsed - self.elapsed)
+        done = bool(terminated or truncated)
+        write_frame(self.step_row, frame, reward, done, False, OUTCOMES.index(outcome), elapsed, self.layout,
+                    active.env.history.last_rows, hit, None, raw=raw, prev=getattr(active.env.history, 'before_previous', None))
+        self.last_frame = frame
+        self.elapsed = elapsed
+        if not done:
+            return False
+        totals = self.seq.totals()
+        self.meta['components'] = np.pad(totals, (0, len(self.meta['components']) - len(totals)))
+        self.meta['stats'] = self.stats.array()
+        success = outcome in ('win', 'goal')
+        self.meta['seq_end'], self.meta['seq_ok'] = 1, int(success and self.seq.index + 1 >= len(self.seq.plan))
+        self.meta['seq_hurt'] = max(0.0, float(raw['combat']['player_damage']) - self.damage0)
+        self.meta['seq_steps'] = self.decisions
+        if self.seq.next(outcome, raw['room']['room_idx']):
+            started = self.start_option(active.env, room_changed=option['task'] == 'goto_door')
+            if started is None:
+                self.meta['seq_ok'] = 1   # the plan went on but no goal could be drawn: every option played succeeded
+            else:
+                self.meta['seq_end'] = 0
+                first, rows = started
+                write_frame(self.reset_row, first, 0.0, False, False, 0, 0, self.layout, rows, raw=raw)
+                self.last_frame = first
+                self.meta['reset_seed'], self.meta['reset_start'] = self.seed, self.start
+                self.meta['reset_task'], self.meta['reset_level'] = self.task, self.level
+                self.meta['reset_bombs'], self.meta['reset_group'] = self.bombs, self.group
+                self.meta['reset_option'], self.meta['reset_source'] = self.option_codes()
+                self.meta['reset_ms'] = 0.0
+                return False
+        return True
+
+    def option_outcome(self, raw, outcome):
+        return self.seq.outcome(raw, outcome)
 
     def reset(self, seed, base_seed, start):
         """First episode of a (new) collection generation: explicit seed, schedule afterwards."""
@@ -658,12 +804,12 @@ class Worker:
                     instance.take()
                 except RuntimeError:
                     instance.relaunch()
-        start = sample_start(seed, self.config['start_randomization']) if start is None else start
         if self.scheduler is not None:
             self.scheduler.clear_inflight()   # the episodes prepared for the old generation are dropped
         for kinds in self.kinds or ():
             kinds.clear_inflight()
         group = self.scheduler.choose(seed) if self.scheduler is not None else -1
+        start = self.start_of(seed, group) if start is None else start
         # A generation's first episode is the learner's fresh seed (outside the budget while the group's buffer is empty).
         empty = self.buffer is not None and group >= 0 and not np.asarray(self.buffer[1][group]).sum() > 0
         first.prepare(seed, start, sample_bombs(seed, self.config.get('start_bombs')), group, -1 if empty else 0)
@@ -679,6 +825,9 @@ class Worker:
         self.meta['replay'] = int(self.replay == 1)
         self.meta['stats_mod'] = self.stats_mod
         self.meta['reset_ms'] = reset_ms
+        if self.goal_line:
+            self.meta['option'], self.meta['source'] = self.option_codes()
+            self.meta['reset_option'], self.meta['reset_source'] = self.meta['option'], self.meta['source']
         self.meta['episodes'] = 0
 
     def step(self, joint, bomb, item):
@@ -692,12 +841,17 @@ class Worker:
         self.meta['group'] = self.group
         self.meta['replay'] = int(self.replay == 1)
         self.meta['stats_mod'] = self.stats_mod
+        if self.goal_line:
+            self.meta['option'], self.meta['source'] = self.option_codes()
         self.decisions += 1
         try:
             # The learner masks the bomb from the same frame; a mismatch only drops the bomb.
             if bomb and not active.env.action_masks()[46]:
                 bomb = 0
             frame, reward, terminated, truncated, info = active.env.step(np.array([joint, bomb, item]))
+            if self.goal_line:
+                done = self.option_step(active, frame, info, terminated, truncated)
+                raise _OptionStepped
             if (self.hurt_ends and info['outcome'] == 'running'
                     and float(active.env.raw_obs['combat']['player_damage']) > self.damage0):
                 # C37: the first damage ends the episode as a failure (terminal): the rest of the room's
@@ -722,9 +876,12 @@ class Worker:
             # combat-v4 truncates there (the learner bootstraps the value of the last frame).
             cut = self.profile in TRUNCATING_PROFILES and info['outcome'] == 'time_limit'
             write_frame(self.step_row, frame, reward, done, cut, outcome, elapsed, self.layout,
-                        active.env.history.last_rows, hit, credit, raw=active.env.raw_obs)
+                        active.env.history.last_rows, hit, credit, raw=active.env.raw_obs,
+                        prev=getattr(active.env.history, 'before_previous', None))
             self.last_frame = frame
             self.elapsed = elapsed
+        except _OptionStepped:
+            pass
         except Exception:
             # Engine or bridge failure: end the episode as a truncation (value bootstrap) on the
             # last good frame, replace the process, continue with the standby instance.
@@ -732,6 +889,7 @@ class Worker:
             print(f'[worker {self.index}] {active.name} failed:\n{traceback.format_exc()}', flush=True)
             write_frame(self.step_row, self.last_frame, 0.0, True, True, OUTCOMES.index('error'),
                         self.elapsed, self.layout, int(self.last_frame['entity_mask'].sum()))
+            self.meta['seq_end'] = 0   # C44: an engine failure says nothing about the seed (the Room Buffer skips it)
             done = True
             active.relaunch()
         self.meta['step_ms'] = 1000 * (time.perf_counter() - t)
@@ -740,10 +898,12 @@ class Worker:
                 self.scheduler.finish(self.group, self.decisions)
             if self.kinds is not None and self.group >= 0 and self.replay >= 0:
                 self.kinds[self.group].finish(self.replay, self.decisions)
-            if self.reward is not None:
+            if self.reward is not None and not self.goal_line:   # the goal line wrote its option's totals
                 totals = self.reward.totals_array()
                 self.meta['components'] = np.pad(totals, (0, len(self.meta['components']) - len(totals)))
-            self.meta['stats'] = self.stats.array()
+                self.meta['stats'] = self.stats.array()
+            elif not self.goal_line:
+                self.meta['stats'] = self.stats.array()
             self.episode += 1
             standby_index = 1 - self.active
             standby = self.instances[standby_index]
@@ -772,6 +932,8 @@ class Worker:
             self.meta['reset_bombs'] = self.bombs
             self.meta['reset_group'] = self.group
             self.meta['reset_ms'] = reset_ms
+            if self.goal_line:
+                self.meta['reset_option'], self.meta['reset_source'] = self.option_codes()
             self.meta['episodes'] = self.episode
             self.meta['recycles'] = sum(instance.recycles for instance in self.instances)
             self.meta['start_failures'] = sum(instance.start_failures for instance in self.instances)

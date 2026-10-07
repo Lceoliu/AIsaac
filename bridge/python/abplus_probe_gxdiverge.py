@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from goexplore_abplus import default_bridge_lua, load_spec
+from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.abplus_goexplore import GxConfig, Instance, unpack
 
 
@@ -92,6 +92,22 @@ def variants(inst, seed, actions):
     return out
 
 
+def warm_up_same_room(inst, run, seed, skip_key, count):
+    """Y's history as in Go-Explore: returns (play) to `count` other cells of the same room."""
+    done = 0
+    with gzip.open(Path(run) / 'rooms' / f'{seed}.cells.json.gz', 'rt', encoding='utf8') as f:
+        for line in f:
+            c = json.loads(line)
+            if tuple(c['key']) == skip_key or c['outcome'] != 'running' or not c['actions']:
+                continue
+            inst.reset(seed)
+            inst.env.play([unpack(b) for b in bytes.fromhex(c['actions'])])
+            done += 1
+            if done >= count:
+                break
+    return done
+
+
 def warm_up(inst, seeds, steps, rng):
     for seed in seeds:
         inst.reset(seed)
@@ -135,13 +151,17 @@ def main():
     p.add_argument('--warmup', type=int, default=20)
     p.add_argument('--warmup-steps', type=int, default=100)
     p.add_argument('--warmup-start', type=int, default=2147700000)
+    p.add_argument('--warmup-same-room', type=int, default=0,
+                   help='instead of random episodes: Y first returns to this many other cells of the same room')
     p.add_argument('--frames-per-decision', type=int, default=4)
     p.add_argument('--name', default='gxdv')
     p.add_argument('--port', type=int, default=27580)
     p.add_argument('--out', required=True)
+    p.add_argument('--no-al-stopped', action='store_true', help='OpenAL source states as the audio thread reports them (A8)')
     args = p.parse_args()
     spec = load_spec(args)
-    cfg = GxConfig(frames_per_decision=args.frames_per_decision, bridge_lua=default_bridge_lua())
+    cfg = GxConfig(frames_per_decision=args.frames_per_decision, bridge_lua=default_bridge_lua(),
+                   preload=default_preload(), al_stopped=not args.no_al_stopped)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     cells = cells_with_failures(args.run, args.count, args.only_same)
@@ -149,9 +169,12 @@ def main():
     x = Instance(args.name + 'x', args.port, cfg, spec)
     y = Instance(args.name + 'y', args.port + 1, cfg, spec)
     try:
-        warm_up(y, range(args.warmup_start, args.warmup_start + args.warmup), args.warmup_steps,
-                np.random.default_rng(0))
+        if not args.warmup_same_room:
+            warm_up(y, range(args.warmup_start, args.warmup_start + args.warmup), args.warmup_steps,
+                    np.random.default_rng(0))
         for seed, key, actions, stored, counts in cells:
+            if args.warmup_same_room:
+                warm_up_same_room(y, args.run, seed, key, args.warmup_same_room)
             dx = run_trajectory(x, seed, actions)
             dy = run_trajectory(y, seed, actions)
             rec = dict(seed=seed, key=list(key), steps=len(actions), mismatches=counts, **compare(dx, dy, stored))

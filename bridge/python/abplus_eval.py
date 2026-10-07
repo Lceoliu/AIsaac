@@ -109,6 +109,40 @@ def logits(dist):
     return torch.cat([d.logits for d in dist.distributions], -1)
 
 
+class Comparison:
+    """--compare (goal-conditioned M0, EXPERIMENTS.md A9): other checkpoints fed the acting policy's frames and masks;
+    per action head KL(other || acting) and whether the two greedy actions agree, summed over the episode's decisions."""
+
+    def __init__(self, label, cached):
+        self.label, self.cached = label, cached
+        self.reset()
+
+    def reset(self):
+        self.cached.reset()
+        self.kl, self.agree, self.steps = None, None, 0
+        self.kl_max = 0.0
+
+    @torch.inference_mode()
+    def step(self, frame, mask, dist):
+        other = self.cached.distribution(frame, mask)
+        kl, agree = [], []
+        for mine, theirs in zip(dist.distributions, other.distributions):
+            lp, lq = torch.log_softmax(mine.logits, -1), torch.log_softmax(theirs.logits, -1)
+            kl.append(float((lq.exp() * (lq - lp)).sum()))
+            agree.append(float(mine.logits.argmax(-1).item() == theirs.logits.argmax(-1).item()))
+        if self.kl is None:
+            self.kl, self.agree = [0.0] * len(kl), [0.0] * len(agree)
+        self.kl = [a + b for a, b in zip(self.kl, kl)]
+        self.agree = [a + b for a, b in zip(self.agree, agree)]
+        self.kl_max = max(self.kl_max, sum(kl))
+        self.steps += 1
+
+    def summary(self):
+        n = max(1, self.steps)
+        return dict(steps=self.steps, kl=[round(v / n, 6) for v in self.kl or []], kl_sum=round(sum(self.kl or []) / n, 6),
+                    kl_max=round(self.kl_max, 6), agree=[round(v / n, 4) for v in self.agree or []])
+
+
 class Metrics:
     """e2_reeval.Acc on AB+ observations (hp in half hearts, boss HP from the visible boss bar)."""
 
@@ -217,6 +251,9 @@ def run_episode(env, cached, seed, args, replay_path=None, config=None):
     stats = EpisodeStats(env.raw_obs)
     frames = 0
     cached.reset()
+    compare = getattr(cached, 'compare', ())
+    for c in compare:
+        c.reset()
     metrics = Metrics(env.raw_obs)
     writer = gzip.open(replay_path, 'wt', encoding='utf8') if replay_path else None
     if writer:
@@ -234,6 +271,8 @@ def run_episode(env, cached, seed, args, replay_path=None, config=None):
                 mask[:9] &= ~np.asarray(blocked_moves(env.raw_obs), bool)
             tp = time.perf_counter()
             dist = cached.distribution(env.history.frames[-1], mask)
+            for c in compare:
+                c.step(env.history.frames[-1], mask, dist)
             action = dist.get_actions(deterministic=not args.stochastic)[0].cpu().numpy()
             if factored:
                 action = factored_to_joint(action)
@@ -277,6 +316,8 @@ def run_episode(env, cached, seed, args, replay_path=None, config=None):
                        tag + '_components': {k: round(v, 4) for k, v in own.totals.items()}})
     if verify:
         result['verify_max_logit_diff'] = max(verify)
+    if compare:
+        result['compare'] = {c.label: c.summary() for c in compare}
     return result
 
 
@@ -391,6 +432,11 @@ def worker(index, args, config, tasks, results):
     name, port = f'{args.name}{index}', args.port + index
     policy = load_policy(args.checkpoint, args.device)
     cached = CachedPolicy(policy, config['history'], deterministic=not args.stochastic)
+    cached.compare = [Comparison(Path(c).name, CachedPolicy(load_policy(c, args.device), config['history'], True))
+                      for c in (args.compare.split(',') if args.compare else ())]
+    for c in cached.compare:
+        if c.cached.policy.observation_space != policy.observation_space:
+            raise ValueError(f'--compare {c.label}: observation space differs from the checkpoint')
     state = {'proc': None, 'env': None}
     duel = json.loads(Path(args.duel_file).read_text(encoding='utf8')) if args.duel_file else None
     if duel:
@@ -514,6 +560,9 @@ def main():
     p.add_argument('--stochastic', action='store_true')
     p.add_argument('--sample-seed', type=int, default=0)
     p.add_argument('--verify-steps', type=int, default=0, help='compare cached vs full forward for N steps/episode')
+    p.add_argument('--compare', default='',
+                   help='comma-separated checkpoint directories fed the same frames: per head KL(other || this) and greedy '
+                        'agreement per episode (goal-conditioned M0 drift reference)')
     p.add_argument('--replays', type=int, default=0, help='write raw-observation replays for the first N seeds')
     p.add_argument('--repeat', type=int, default=1, help='episodes per seed (reproducibility check)')
     p.add_argument('--tasks-file', default='none', help="room mixture spec (abplus_tasks); 'none' = Monstro arena")
@@ -597,7 +646,8 @@ def main():
                 invincible=bool(config.get('invincible', False)) and not args.mortal,
                 episode_seconds=config['max_episode_seconds'], frames_per_decision=int(config.get('frames_per_decision', 2)),
                 started=time.strftime('%Y-%m-%d %H:%M:%S'),
-                duel_file=args.duel_file, opponent=args.opponent if args.duel_file else None)
+                duel_file=args.duel_file, opponent=args.opponent if args.duel_file else None,
+                compare=[str(Path(c).resolve()) for c in args.compare.split(',')] if args.compare else None)
     (out / 'meta.json').write_text(json.dumps(meta, indent=1))
     (out / 'replays').mkdir(exist_ok=True)
     ctx = mp.get_context('spawn')

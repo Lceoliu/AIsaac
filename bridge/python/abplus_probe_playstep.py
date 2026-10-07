@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from goexplore_abplus import default_bridge_lua, load_spec
+from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.abplus_goexplore import GxConfig, Instance, unpack
 
 
@@ -80,6 +80,7 @@ def main():
     p.add_argument('--name', default='gxps')
     p.add_argument('--port', type=int, default=27585)
     p.add_argument('--out', required=True)
+    p.add_argument('--no-al-stopped', action='store_true', help='OpenAL source states as the audio thread reports them (A8)')
     p.add_argument('--order-test', action='store_true',
                    help='instead: fresh instances running play then step, and step then play (mode or history?)')
     p.add_argument('--repeats', type=int, default=3, help='with --order-test: runs of each mode per instance')
@@ -88,9 +89,18 @@ def main():
     p.add_argument('--mode', default='exact', help='instance mode (exact, skip: the render path skipped)')
     p.add_argument('--step-sleep', type=float, default=0.0, help='with --order-test: seconds slept before each step')
     p.add_argument('--fixed-time', type=int, default=None, help='ABP_FIXED_TIME for the instances (time() fixed)')
+    p.add_argument('--extra-preload', default='', help='a test library loaded after libabp_turbo.so (LD_PRELOAD)')
+    p.add_argument('--extra-env', default='', help='JSON object of more environment for the instances')
     args = p.parse_args()
     if args.fixed_time is not None:
         os.environ['ABP_FIXED_TIME'] = str(args.fixed_time)   # launch_abplus passes the environment on
+    if args.extra_preload or args.extra_env:
+        import isaac_bridge.abplus_goexplore as gx
+        from isaac_bridge.abplus import ABP_HOME, launch_abplus
+        extra = json.loads(args.extra_env or '{}')
+        if args.extra_preload:
+            extra['ABP_PRELOAD'] = f"{ABP_HOME / 'tools' / 'libabp_turbo.so'} {args.extra_preload}"
+        gx.launch_abplus = lambda *a, **k: launch_abplus(*a, **{**k, 'extra_env': {**(k.get('extra_env') or {}), **extra}})
     key = [int(v) if v.lstrip('-').isdigit() else v for v in args.key.split(',')]
     actions = None
     with gzip.open(Path(args.run) / 'rooms' / f'{args.seed}.cells.json.gz', 'rt', encoding='utf8') as f:
@@ -102,7 +112,8 @@ def main():
     if actions is None:
         raise SystemExit('cell not found')
     spec = load_spec(args)
-    cfg = GxConfig(frames_per_decision=args.frames_per_decision, bridge_lua=default_bridge_lua(), mode=args.mode)
+    cfg = GxConfig(frames_per_decision=args.frames_per_decision, bridge_lua=default_bridge_lua(),
+                   preload=default_preload(), al_stopped=not args.no_al_stopped, mode=args.mode)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     if args.order_test:

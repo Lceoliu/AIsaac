@@ -87,7 +87,10 @@ table{border-collapse:collapse;width:100%}td{padding:2px 0;vertical-align:top}td
 <!--DATA-->
 <script>
 const EPISODES=/*EPISODES*/, NAMES=/*NAMES*/, VARIANTS=/*VARIANTS*/, TITLE=/*TITLE*/;
-const TASK={normal:'普通房',boss:'Boss 房',arena:'竞技场（Monstro）'}, OUT={time_limit:'超时',win:'通关',death:'死亡'};
+const TASK={normal:'普通房',boss:'Boss 房',arena:'竞技场（Monstro）',gotoempty:'空房导航',combatgoto:'战斗后导航',chain:'两房链'},
+  OUT={time_limit:'超时',win:'通关',death:'死亡',completed:'全部完成',goal:'到达',exit:'走出房间',wrong_door:'进错门',no_goal:'没有目标',error:'出错'};
+const OPT={combat:'战斗',goto_position:'走到位置',goto_door:'走进门'}, STRATUM={straight:'直线',detour:'绕路',dead_end:'死路'};
+const OPT_COLOR={combat:'#e0564b',goto_position:'#4fd1c5',goto_door:'#b794f4'};
 const MOVE=[[0,0],[0,-1],[1,-1],[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1]], SHOT=[[0,0],[0,-1],[1,0],[0,1],[-1,0]];
 const ARROW=['—','↑','↗','→','↘','↓','↙','←','↖'], SHOT_ARROW=['—','↑','→','↓','←'];
 const SPEEDS=[0.5,1,2,4,8]; let STEP_S=2/30;   // seconds per step: the episode's step_s (C39: 4 frames)
@@ -110,7 +113,7 @@ EPISODES.forEach((e,i)=>{if(!bySeed.has(e.seed))bySeed.set(e.seed,{});bySeed.get
 const groups=new Map();
 for(const [seed,m] of bySeed){const base=EPISODES[m[LABELS[0]]??Object.values(m)[0]];const key=base.task+'|'+base.outcome;
   if(!groups.has(key))groups.set(key,[]);groups.get(key).push(seed)}
-const rank=k=>({time_limit:0,death:1,win:2}[k.split('|')[1]]??3)*10+({normal:0,boss:1,arena:2}[k.split('|')[0]]??3);
+const rank=k=>({time_limit:0,death:1,exit:1,wrong_door:1,win:2,completed:2}[k.split('|')[1]]??3)*10+({normal:0,boss:1,arena:2}[k.split('|')[0]]??3);
 function renderList(){
   const list=$('list');list.innerHTML='';
   for(const key of [...groups.keys()].sort((a,b)=>rank(a)-rank(b))){
@@ -168,7 +171,12 @@ function label(text,x,y,color){rctx.font='12px "Microsoft YaHei",sans-serif';rct
 
 function drawRoom(){
   const f=D.frames[step];rctx.clearRect(0,0,W,H);rctx.drawImage(drawGrid(gridAt(step)),0,0,W,H);
-  for(const [x,y,locked] of E.doors){rctx.fillStyle=locked?'#6d4e25':C.door;rctx.fillRect(sx(x)-14*S,sy(y)-14*S,28*S,28*S)}
+  for(const [x,y,locked] of doorsAt(step)){rctx.fillStyle=locked?'#6d4e25':C.door;rctx.fillRect(sx(x)-14*S,sy(y)-14*S,28*S,28*S)}
+  const o=optionAt(step);   // goal line: the option's target
+  if(o&&o[4]!=null){const x=sx(o[4]),y=sy(o[5]),col=OPT_COLOR[o[3]]||'#fff';rctx.save();rctx.setLineDash([6,4]);
+    if(o[3]==='goto_door'){rctx.strokeStyle=col;rctx.lineWidth=3;rctx.strokeRect(x-20*S,y-20*S,40*S,40*S)}
+    else{circle(x,y,o[6]*S,col+'33',col,2.5);rctx.setLineDash([]);rctx.strokeStyle=col;rctx.lineWidth=2;rctx.beginPath();rctx.moveTo(x-8,y);rctx.lineTo(x+8,y);rctx.moveTo(x,y-8);rctx.lineTo(x,y+8);rctx.stroke()}
+    rctx.restore();label(`目标 ${o[2]+1}：${OPT[o[3]]||o[3]}`,x,y-o[6]*S-8,col)}
   if($('optCells').checked){ // cells visited up to now
     const cs=40*S;rctx.fillStyle=C.visited;for(const k of visited(step)){const [c,r]=k.split(',').map(Number);rctx.fillRect(sx(E.cell0[0]+40*c-20),sy(E.cell0[1]+40*r-20),cs,cs)}}
   const ents=f[10];
@@ -193,6 +201,8 @@ function drawRoom(){
   if(f[11]){const [nm,ns,,nx,ny]=f[11],qx=sx(nx),qy=sy(ny); // duel: the NPC's input
     arrow(qx,qy,MOVE[nm][0],MOVE[nm][1],26*S*.9,C.move,3);arrow(qx,qy,SHOT[ns][0],SHOT[ns][1],38*S*.9,'#ffa45c',3)}
 }
+function doorsAt(k){if(!D.doors)return E.doors;let d=D.doors[0][1];for(const [i,v] of D.doors){if(i<=k)d=v;else break}return d}
+function optionAt(k){if(!D.options)return null;let o=null;for(const s of D.options){if(s[0]<=k)o=s;else break}return o}
 function visited(k){ // cells the player occupied at steps 0..k
   if(!visitedUpTo||visitedUpTo.k>k){visitedUpTo={k:-1,set:new Set()}}
   for(let i=visitedUpTo.k+1;i<=k;i++){const f=D.frames[i];visitedUpTo.set.add(Math.round((f[0]-E.cell0[0])/40)+','+Math.round((f[1]-E.cell0[1])/40))}
@@ -208,6 +218,10 @@ function buildTimeline(){
   if((n-pf)*STEP_S>=10){x.fillStyle='rgba(217,168,58,.12)';x.fillRect(X(pf),T,R-X(pf),B-T);x.fillStyle='#d9a83a';x.font='12px sans-serif';x.fillText(`从 ${E.stats.parked_from_s} 秒起停在原地`,X(pf)+6,T+12)}
   x.strokeStyle='#3a4048';x.lineWidth=1;x.font='11px sans-serif';x.fillStyle='#8a929b';x.textAlign='center';
   const secs=n*STEP_S;for(let s=0;s<=secs+1e-6;s+=10){x.beginPath();x.moveTo(X(s/STEP_S),B);x.lineTo(X(s/STEP_S),B+4);x.stroke();x.fillText(s+'s',X(s/STEP_S),B+15)}
+  if(D.options){x.font='11px "Microsoft YaHei",sans-serif';x.textAlign='left';   // goal line: option segments
+    for(const o of D.options){const a=X(Math.max(0,o[0]-(o[0]?1:0))),b=X(o[1]),col=OPT_COLOR[o[3]]||'#888';
+      x.fillStyle=col+'22';x.fillRect(a,T,b-a,B-T);x.fillStyle=col;x.fillRect(a,T,1.5,B-T);
+      if(b-a>28)x.fillText(`${o[2]+1} ${OPT[o[3]]||o[3]}${o[7]&&o[7]!=='running'?' · '+(OUT[o[7]]||o[7]):''}`,a+4,B-4)}}
   const line=(fn,color)=>{x.strokeStyle=color;x.lineWidth=2;x.beginPath();D.frames.forEach((f,k)=>{const y=B-(B-T)*fn(f);k?x.lineTo(X(k),y):x.moveTo(X(k),y)});x.stroke()};
   line(f=>f[7]/maxB,'#f0a04b');line(f=>f[2]/maxH,'#ff6b6b');
   for(let k=1;k<=n;k++){const a=D.frames[k-1],b=D.frames[k];
@@ -232,6 +246,7 @@ function drawHud(){const f=D.frames[step],enemies=f[10].filter(e=>e[0]===1&&(e[6
   <div class="hearts"><span class="k">心</span>${hearts(f[2],E.max_hearts,f[3])}</div>
   <div><span class="k">阻挡血量</span><b>${+f[7].toFixed(1)}</b></div><div><span class="k">敌人</span><b>${enemies}</b></div>
   <div><span class="k">命中</span><b>${f[8]}</b></div><div><span class="k">受伤</span><b>${f[9]}</b></div>
+  ${(()=>{const o=optionAt(step);return o?`<div><span class="k">option</span><b style="color:${OPT_COLOR[o[3]]}">${o[2]+1}. ${OPT[o[3]]||o[3]}</b>${o[7]?' → '+(OUT[o[7]]||o[7]):''}</div>`:''})()}
   <div><span class="k">输入</span>移动 <b>${ARROW[f[4]]}</b> · 射击 <b style="color:${C.shot}">${SHOT_ARROW[f[5]]}</b>${f[6]?' · 炸弹':''}</div>
   ${f[11]?`<div><span class="k">对手</span>血 <b>${+f[11][2].toFixed(1)}</b> · 命中 <b>${f[11][5]}</b> · 移动 <b>${ARROW[f[11][0]]}</b> · 射击 <b style="color:#ffa45c">${SHOT_ARROW[f[11][1]]}</b></div>`:''}`;
   $('seek').value=step;$('bPlay').textContent=playing?'暂停':'播放'}
@@ -246,6 +261,8 @@ function renderStats(){const s=E.stats,c=E.components||{};
   const comp=Object.entries(c).filter(([k,v])=>Math.abs(v)>1e-9).map(([k,v])=>`${k} ${v>0?'+':''}${v.toFixed(2)}`).join('，');
   $('stats').innerHTML=`<h3>这一局</h3>${E.note?`<p class="note">${E.note}</p>`:''}<table>
   <tr><td>结局</td><td>${OUT[E.outcome]||E.outcome}，${E.seconds} 秒</td></tr>
+  ${E.options?E.options.map((o,i)=>`<tr><td>option ${i+1}</td><td><b style="color:${OPT_COLOR[o.task]}">${OPT[o.task]||o.task}</b>${o.stratum?'（'+(STRATUM[o.stratum]||o.stratum)+(o.d0!=null?'，'+Math.round(o.d0)+' px':'')+'）':''} → ${OUT[o.outcome]||o.outcome}，${o.seconds} 秒${o.hurt?'，掉 '+o.hurt+' 个半心':''}</td></tr>`).join(''):''}
+  ${E.chain?`<tr><td>链</td><td>A 房 ${E.chain[1]}（variant ${E.chain[4]}）→ B 房 ${E.chain[3]}（variant ${E.chain[5]}）</td></tr>`:''}
   ${E.duel?duelRows(E.duel):''}
   <tr><td>开局敌人</td><td>${E.enemies.join('，')||'—'}</td></tr>
   <tr><td>阻挡血量</td><td>${+s.blocking[0].toFixed(1)} → ${+s.blocking[1].toFixed(1)}</td></tr>
@@ -257,7 +274,7 @@ function renderStats(){const s=E.stats,c=E.components||{};
   <tr><td>离最近敌人（中位数）</td><td>${s.dist_median??'—'} 像素（1 格 = 40）</td></tr>
   <tr><td>开局炸弹</td><td>${E.start_bombs??'—'}</td></tr>
   <tr><td>奖励 ${E.reward_name||'combat-v2'}</td><td>${E.reward!=null?E.reward.toFixed(2):'—'}${comp?`（${comp}）`:''}</td></tr>
-  <tr><td>策略</td><td>第 ${E.updates} 轮，${E.deterministic?'每步取概率最大的动作':'按概率采样（种子 '+E.sample_seed+'）'}</td></tr></table>`}
+  <tr><td>策略</td><td>${E.policy_note||('第 '+E.updates+' 轮，'+(E.deterministic?'每步取概率最大的动作':'按概率采样（种子 '+E.sample_seed+'）'))}</td></tr></table>`}
 $('legend').innerHTML=`<h3>图例</h3>
 <div><span class="sw" style="background:${C.player};border:2px solid ${C.playerEdge}"></span>玩家；白箭头 = 移动输入，蓝箭头 = 射击方向</div>
 <div><span class="sw" style="background:${C.enemy}"></span>敌人（可被打伤）；灰色 = 当前无敌</div>
@@ -266,14 +283,15 @@ $('legend').innerHTML=`<h3>图例</h3>
 <div>对战回放：Pacer 是对手 NPC，它的白箭头 = 移动输入，橙箭头 = 射击方向；橙线（阻挡血量）是它的血</div>
 <div><span class="sq" style="background:${C.rock}"></span>石头 <span class="sq" style="background:${C.poop}"></span>便便 <span class="sq" style="background:${C.block}"></span>铁块 <span class="sq" style="background:${C.pit}"></span>坑</div>
 <div><span class="sq" style="background:rgba(255,230,160,.35)"></span>玩家到目前为止走过的格子；黄线 = 最近 8 秒的轨迹</div>
-<div style="color:var(--muted)">画的是原引擎逐步记录的状态（每步 = ${Math.round(STEP_S*30)} 个逻辑帧 = ${STEP_S.toFixed(3)} 秒），不重新模拟。</div>`;
+<div id="stepNote" style="color:var(--muted)"></div>`;
+const stepNote=()=>{$('stepNote').textContent=`画的是原引擎逐步记录的状态（每步 = ${Math.round(STEP_S*30)} 个逻辑帧 = ${STEP_S.toFixed(3)} 秒），不重新模拟。`};
 
 // ---- playback ----
 function setStep(k){step=Math.max(0,Math.min(D.frames.length-1,k|0));render()}
 function render(){drawRoom();drawTimeline();drawHud()}
-function open(i){if(i===cur)return;cur=i;E=EPISODES[i];STEP_S=E.step_s||2/30;D=data(i);step=0;acc=0;visitedUpTo=null;setup();
+function open(i){if(i===cur)return;cur=i;E=EPISODES[i];STEP_S=E.step_s||2/30;stepNote();D=data(i);step=0;acc=0;visitedUpTo=null;setup();
   const m=bySeed.get(E.seed);$('epTitle').textContent=`种子 ${E.seed} · ${TASK[E.task]||E.task} · 房间 ${E.layout}${E.room?'（'+E.room+'）':''}`;
-  $('epDesc').textContent=`${E.label}：${E.deterministic?'每步取概率最大的动作（定期评估的做法）':'按概率采样动作（训练时的做法）'} · ${OUT[E.outcome]||E.outcome}`;
+  $('epDesc').textContent=`${E.label}：${E.policy_note||(E.deterministic?'每步取概率最大的动作（定期评估的做法）':'按概率采样动作（训练时的做法）')} · ${OUT[E.outcome]||E.outcome}`;
   const sw=$('switch');sw.innerHTML='';for(const label of LABELS){if(m[label]===undefined)continue;const e=EPISODES[m[label]];
     const b=document.createElement('button');b.className='badge '+e.outcome+(m[label]===i?' on':'');b.textContent=`${label} ${OUT[e.outcome]||e.outcome}`;b.onclick=()=>open(m[label]);sw.append(b)}
   document.querySelectorAll('.row').forEach(r=>r.classList.toggle('active',+r.dataset.seed===E.seed));
