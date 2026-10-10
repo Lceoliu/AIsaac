@@ -42,6 +42,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import signal
 import sys
 import threading
 import time
@@ -77,6 +78,7 @@ from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, Searc
 # restore point and the ones its hurts hold, every parked clone still open (pid, holders, kind), the finished builds.
 # abplus_probe_memory.py joins them with /proc to give the memory per role. Nothing else changes.
 MEM_LOG = os.environ.get('ISAAC_RL_MEM_LOG', '')
+SEARCH_CHILD_LIMIT = float(os.environ.get('ISAAC_RL_SEARCH_CHILD_LIMIT', '120'))   # s a forked search may take
 MEM_EVERY = float(os.environ.get('ISAAC_RL_MEM_EVERY', '10'))
 
 
@@ -323,10 +325,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     def search(item, pair=True):
         base_, reseed_, applied_, hurt_at, seed_, episode_, offset, fatal = item
         items = [item]   # teacher_pair: the next queued hurts of the same episode and room share the restore
-        with qlock:
-            while pair and cfg.teacher_pair and queue and queue[-1][0] is base_ and queue[-1][2] is applied_ and \
-                    queue[-1][7] == fatal:   # (a fatal hurt is searched on its own: other depths and margin)
-                items.append(queue.pop())
+        if pair:   # (a forked child never takes qlock: a lock the parent held at fork time stays locked in the child)
+            with qlock:
+                while cfg.teacher_pair and queue and queue[-1][0] is base_ and queue[-1][2] is applied_ and \
+                        queue[-1][7] == fatal:   # (a fatal hurt is searched on its own: other depths and margin)
+                    items.append(queue.pop())
         t0 = time.perf_counter()
         held = control[1]
         prof = [] if prof_file is not None else None
@@ -513,8 +516,28 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 pass
             copy.clone = None
             Parked.live.discard(copy)
-            _, status = os.waitpid(pid, 0)
-            if status != 0:
+            # 2026-10-10 (C84 on HPC128: every worker's search thread froze within 800 game hours): the child is
+            # waited for with a time limit; a hung child (a lock copied locked at fork time, a dead clone) is killed
+            t_wait = time.perf_counter()
+            while True:
+                wpid, status = os.waitpid(pid, os.WNOHANG)
+                if wpid == pid:
+                    break
+                if time.perf_counter() - t_wait > SEARCH_CHILD_LIMIT:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    os.waitpid(pid, 0)
+                    status = -1
+                    mine[ST['errors']] += 1
+                    if search_errors[0] < 5:
+                        search_errors[0] += 1
+                        print(f'tok floor worker {index}: search child {pid} killed after {SEARCH_CHILD_LIMIT:.0f} s',
+                              file=sys.stderr, flush=True)
+                    break
+                time.sleep(0.01)
+            if status != 0 and status != -1:
                 mine[ST['errors']] += 1
         finally:
             gate.give(j)
