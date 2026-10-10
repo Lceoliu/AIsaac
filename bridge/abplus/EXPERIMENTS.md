@@ -7184,7 +7184,9 @@ C68 的训练数据 71% 的决策从一层开始、死亡都在二、三层：�
 
 **实验结果**
 
-- 代码提交（本条），尚无训练结果。
+- 代码提交 。
+- **真机冒烟**（HPC128 新沙箱 `ws4` = 仓库 `13f917c`，与 C84 并行、8 worker、1.5 游戏小时、C67 最终 + 死亡教师 + fork 搜索，`--memory gru --memory-dim 128 --memory-bptt 32`，10-11 01:1x–01:4x）：两种路径都 **0 个 Traceback**、各 5 次更新跑完——`smoke-mem`（`--learner-fast 1`，CUDA 图 actor 带状态表）kl 0.004–0.007、ev 0.93、每次更新 260 个块 / 8,300 条记录（8,192 决策）；`smoke-mem2`（`--learner-fast 0 --memory-graph 0`，eager actor）kl 0.004–0.010、ev 0.94。日志里有"memory: --resume of a memory-free checkpoint … Adam state padded"和"actor inference through CUDA graphs with the state table"两行。吞吐 170× / 111×（和 C84 抢 CPU，不作数）。
+- 下一步：C87（HPC128，C84 结束后从 `ws4` 启动）= C77 配置 + 记忆，12,000 小时，与 C77 / C84 同点对照。
 
 ### C77 十游戏年：C67 + 死亡教师，HPC 节点（2026-10-10，进行中）
 
