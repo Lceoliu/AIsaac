@@ -202,6 +202,9 @@ class TokSamplerConfig:
     teacher_v2_random: float = 0.0                # random decision points per game hour of play (0: hurts / deaths only)
     teacher_v2_queue: int = 8                     # points waiting per worker (each holds its room's parked entry)
     teacher_v2_depths: tuple = ()                 # hurts' depths (empty: teacher_depths); deaths: teacher_death_depths
+    # 2026-10-11 (train_tok --memory gru): the policy's GRU state size; with teacher_v2 the lanes and the V2 ring then
+    # carry states too (tok_teacher2.attach_v2_mem). 0: nothing changes
+    memory_dim: int = 0
     mode: str = 'room'                          # 'room': one room per episode; 'floor' / 'run': tok_floor.py
     items: bool = False                           # 2026-10-06: the bridge's lean_items, ROW's item fields, 5 actions
     run_seconds: float = 1800.0                   # run: an episode's time limit (game seconds)
@@ -1237,6 +1240,7 @@ class TokSampler:
         # pipe per worker that the actor answers outside the rollout) and the imitation records' rings
         v2_names = None
         self.lane_rows = self.lane_io = self.lane_out = self.main_value = self.v2_rows = self.v2_meta = None
+        self.main_h = self.lane_h = self.v2_h = None   # 2026-10-11 (memory, with teacher v2)
         self.lane_ready = []
         self._lanes = {}
         if cfg.teacher_v2 and cfg.mode in ('floor', 'run') and not cfg.eval_seeds:
@@ -1252,6 +1256,15 @@ class TokSampler:
             self.main_value[:] = 0
             self.attached += attached
             self.v2_seen = np.zeros(n, np.int64)
+            if cfg.memory_dim > 0:   # 2026-10-11 (memory): the GRU states of the main records, lanes and V2 ring
+                from .tok_teacher2 import attach_v2_mem, v2_mem_sizes
+                more = [shared_memory.SharedMemory(create=True, size=s) for s in v2_mem_sizes(n, cfg.memory_dim)]
+                v2_names = v2_names + [b.name for b in more]
+                self.blocks += more
+                attached, self.main_h, self.lane_h, self.v2_h = attach_v2_mem(v2_names[6:], n, cfg.memory_dim)
+                self.main_h[:] = 0
+                self.lane_h[:] = 0
+                self.attached += attached
         self.stats[:] = 0
         self.control[:] = 0
         # 2026-10-06: one decoded-PNG cache for all the instances of this sampler (abp_turbo ABP_PNG_CACHE_FILE) instead
@@ -1341,22 +1354,29 @@ class TokSampler:
             except OSError:
                 pass
 
-    def v2_records(self):
-        """The teacher-v2 imitation records written since the last call: (rows, meta [n, V2_META]); None without."""
+    def v2_records(self, with_h=False):
+        """The teacher-v2 imitation records written since the last call: (rows, meta [n, V2_META]); None without.
+        with_h (2026-10-11, memory): (rows, meta, h [n, memory_dim] float32: each record's GRU input state; zeros where
+        the ring has none)."""
         if self.v2_rows is None:
             return None
         from .tok_teacher2 import V2_META, V2_RING
-        rows, meta = [], []
+        rows, meta, hs = [], [], []
+        dim = int(self.cfg.memory_dim)
         for i in range(self.cfg.workers):
             count = int(self.stats[i, ST['v2_records']])
             first = max(int(self.v2_seen[i]), count - V2_RING)
             for c in range(first, count):
                 rows.append(self.v2_rows[i, c % V2_RING].copy())
                 meta.append(self.v2_meta[i, c % V2_RING].copy())
+                if with_h:
+                    hs.append(self.v2_h[i, c % V2_RING].copy() if self.v2_h is not None else np.zeros(dim, np.float32))
             self.v2_seen[i] = count
         if not rows:
-            return np.zeros((0,), ROW), np.zeros((0, V2_META), np.float64)
-        return np.stack(rows), np.stack(meta)
+            out = np.zeros((0,), ROW), np.zeros((0, V2_META), np.float64)
+            return out + (np.zeros((0, dim), np.float32),) if with_h else out
+        out = np.stack(rows), np.stack(meta)
+        return out + (np.stack(hs).astype(np.float32),) if with_h else out
 
     def _drop(self, c):
         if c in self.live:
@@ -1509,6 +1529,7 @@ class TokSampler:
         self.choice_rows = self.choice_meta = self.aux = None
         self.lab_jobs = self.lab_res = None
         self.lane_rows = self.lane_io = self.lane_out = self.main_value = self.v2_rows = self.v2_meta = None
+        self.main_h = self.lane_h = self.v2_h = None
         for b in self.attached:
             b.close()
         for b in self.blocks:

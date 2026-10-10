@@ -7165,6 +7165,27 @@ C68 的训练数据 71% 的决策从一层开始、死亡都在二、三层：�
 - **损失**：`teacher_v2_loss` 与 float64 手算差 1.7e-7（`log_prob` 和 `log_prob_fast` 相同；`--items` 2.5e-9）；并入布局对单独前向损失差 0、梯度相对差 1.1e-7（`--items` 7e-8）；单步后记录动作的 log 概率 −4.206 → −4.165（`--items` −5.734 → −5.644）。
 - **还没测的**：真实 actor 下 lane 的延迟和对采集的影响、GPU 上训练器的整条路径（交给 HPC 冒烟）；打分的"10 选 1"偏差只由边距和复制分支挡；`v2_prior` / `v2_improving_share` 的趋势要等训练对照。
 
+### B20 记忆（GRU）：按 worker 延续、只在新一局清零的隐状态（2026-10-11，代码完成，真机冒烟待跑）
+
+**实验目的**
+
+`rl/docs/SCALING_THESIS.md` §记忆 / 顺序第三项：策略无记忆，教师验证的是持续几步的路线、策略执行不出来（C83 / C84 的 `v2_prior` 不升是同一现象的一个解释）；整局模式里换房、换层之后策略也应记得这一局之前发生的事（拿过什么、哪个方向的房清过）。先把机制做成可开关的选项，再在主机上 3,000 小时对照、之后上 HPC 的 10 年尺度。
+
+**实验方法**
+
+- **代码**（opus 子代理实现，我复核 + 跑 CPU 冒烟）：`train_tok.py --memory gru --memory-dim D --memory-bptt T --memory-graph 0/1`，默认关、关时与旧代码逐位一致（`tests/test_memory_smoke.py` 对比 git HEAD 的 `tok_policy.py`）。
+  - 策略：GRUCell 读池化后的玩家 token + 上一步 h；各头读玩家 token + 新 h 的一个零初始化投影——头的形状不变，从无记忆检查点 `--resume` 起步时输出与该检查点完全相同，第一步只有投影有梯度、之后 GRU 才开始学。
+  - actor：每个 worker 一行状态在 GPU 上（CUDA 图 actor、快照 actor、eager 路径共用），只在一局的第一条记录清零（新游戏 / 档案起点 / 实验室起点），换房换层不清；每个决策用的输入状态存进 rollout。
+  - 学习器：按 worker 把决策切成 `--memory-bptt`（默认 32）长的块，每块从首决策存下来的状态起（旧状态，同步更新的首步是精确的）做截断 BPTT；minibatch = 整块的集合，`--sort-micro` 关、`--micro` 取整到整块；`--learner-fast 0/1` 都支持；价值重算从存下的状态走一步 GRU。
+  - 教师 v2：车道有自己的状态表，分支从 fork 点的那一局状态复制起步（worker 按记录存状态、分支首次请求带上），模仿记录带自己的输入状态。**仍是近似**（用零状态）：旧教师的记录、选择修正记录、`tok_branch` 的分支局。
+  - 检查点 / 评估：记忆检查点原样续；无记忆检查点 + `--memory gru` 新建 GRU、补 Adam 状态并打日志；`eval_tok.py` 每个评估 worker 带状态、每局清零。
+- **CPU 冒烟**（PC，`cd rl/bridge/python && python tests/test_memory_smoke.py`）：全部通过——关闭时与 HEAD 逐位一致（padded / packed / act / evaluate，普通和道具配置）；新建记忆模型 = 无记忆输出；状态逐步变化、局首为零；分块 BPTT 复现 actor 逐步输出（logits 2e-7、状态 1e-6），梯度到达 GRU 全部参数并在块内穿越时间；检查点往返；从无记忆检查点续训补 Adam。GraphActor 对 eager 的检查需要 CUDA，跳过。
+- **待做**：3080 空出后（C86 结束，约 06:00）跑 8 worker、1.5 游戏小时的真机冒烟（`--memory gru --memory-dim 128 --memory-bptt 32`，再一次 `--learner-fast 0 --memory-graph 0`），然后 3,000 小时对照（C77 配置 + 记忆 vs C75 / C81 的 0.90）。
+
+**实验结果**
+
+- 代码提交（本条），尚无训练结果。
+
 ### C77 十游戏年：C67 + 死亡教师，HPC 节点（2026-10-10，进行中）
 
 **实验目的**

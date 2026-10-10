@@ -715,6 +715,17 @@ worker 进程 × N（tok_sampler.worker_main，不导入 torch）
   - 评估默认仍是以撒；`eval_tok.py --characters …` 时每个种子的角色只由种子决定（`tok_floor.character_of_seed`），`summary.json` 加 `by_character`。
   - 注意：初始属性增强（`--stat-aug-prob`）的偏移是按以撒的基础值算的，叠在别的角色上倍率只是近似；各角色的起始道具取决于该机存档的解锁（第二台的以撒带 D6）。探针 `abplus_probe_characters.py`、`abplus_probe_characters_sampler.py`。
 
+### 记忆（GRU）（2026-10-11，`--memory gru`；还没训练过）
+
+`rl/docs/SCALING_THESIS.md` §5b 的"记忆"：让策略能把信息带过房间、带过楼层（整局模式）。默认 `--memory off`，代码路径和数值与之前逐位相同（`tests/test_memory_smoke.py` 对 git HEAD 的 `tok_policy.py` 核对）。
+
+- **网络**（`TokPolicy(memory=D)`，检查点配置 `memory`）：玩家 token 经最终归一化后的向量 z（原来各个头的输入）和上一步的隐状态 h 进 `GRUCell(宽度, D)`，各个头改读 z + `mem_out`(h_new)。`mem_out`（D → 宽度）初值为 0：等价于把 h_new 拼到每个头的输入上、新列权重从 0 开始，但策略、价值、危险、选择头共用一个投影，头的形状都不变。GRU 和 `mem_out` 注册在所有参数之后。
+- **actor**：每个 worker 一行隐状态，放在 GPU 上的表里（主 actor 的各个 `GraphActor`、快照 actor 和即时执行路径共用）；只在一局的第一条记录（`first`，新的一局 / 新种子 / 起点库开局）清零，换房、换层都不清。CUDA Graph 照用：每次调用前在图外按 worker 取出状态（新局的置 0）放进图的输入，图算出新状态，调用结束前写回表里。每个决策用到的输入状态存进 rollout（`Rollout.h`）。`--memory-graph 0` 退回即时执行（启动时打印用的是哪条）。
+- **学习器**：每个 worker 的决策序列（包括不训练的：最后一个还没奖励的、分支截断的）按 `--memory-bptt T`（默认 32）切段（`tok_policy.memory_chunks`，最后一段用重复最后一条补齐、权重 0），每段从存下的第一条的输入状态出发跑 GRU（截断 BPTT；状态是 actor 当时的权重算的，"陈旧 h"，同步 PPO 一次更新的第一步上是精确的），段内遇到新一局的第一条时清零。小批 = `--minibatch` // T 个段，`--micro` 取整到整段，`--sort-micro` 关；PPO 各项损失按训练的决策求平均。`--recompute-values` 时价值从每个决策存下的状态走一步。`--learner-fast` 0 / 1 两条路径都支持（记录顺序不变，打包 / 分桶 / 去重都按记录走）。`progress.csv` 多 `mem_chunks`、`mem_rows`。
+- **教师**：教师 v2 的车道有自己的状态表：一条分支开始时 worker 把原局在决策 d 的输入状态（actor 每次回答前写进共享内存，worker 记进 `V2Log.h`）交给 actor（`LanePolicy.begin`），之后沿分支自己往下走，不碰 worker 本身的状态；每条模仿记录带它的输入状态（V2 环 → 训练器的 GPU 环），训练时各自走一步。近似：老教师的记录、选择头的修正记录、分支教师（`tok_branch`）的分支局都用 0 状态。
+- **检查点**：`--resume` 记忆检查点时沿用它的 `memory`（大小以检查点为准）；`--resume` 无记忆的检查点加 `--memory gru` 时 GRU 新初始化（`mem_out` = 0，一开始输出与检查点相同）、Adam 状态补上新参数（打印一行）。`eval_tok.py` 读到 `memory` 时每个评估 worker 带自己的状态、每局开头清零。
+- **核对**：`python tests/test_memory_smoke.py`（CPU，无引擎）：关闭时与 HEAD 逐位相同、新初始化的记忆模型与无记忆模型输出相同、状态逐步变化且新局清零、分段 BPTT 复现 actor 的逐步输出（1e-6 级）、梯度到达 GRU、检查点往返和从无记忆检查点续训；有 CUDA 时再比 `GraphActor` 与即时执行（不要在跑着训练器的 GPU 上跑，B13）。
+
 ### 构筑实验室（第三阶段，2026-10-08；EXPERIMENTS.md A23）
 
 用户 10-06 的设计：构筑（持有的道具，以及随之而来的属性、心、跟班）在以撒里可以搬到任何状态上，所以可以直接量一个构筑有多强：把它移植进一组固定的、停着的房间状态，用当前策略打，各构筑共用随机数；用结果训练构筑模型，挑模型最拿不准的构筑去量；实验室的局本身也是带道具的正常策略局（练习用道具）。代码 `isaac_bridge/tok_lab.py`（模块说明是完整的设计），`train_tok.py --lab-*`，worker 一侧在 `tok_floor.py`。只在整层 / 整局模式；`--lab-share 0`（默认）时什么都不变。

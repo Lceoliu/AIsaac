@@ -93,6 +93,18 @@ Teacher v2 (2026-10-10, isaac_bridge/tok_teacher2.py, rl/docs/SCALING_THESIS.md 
   (v2_improving_share, v2_gain0_mean, v2_spread_mean) and, on the records new to this update before it trains on them,
   v2_prior (mean log pi of the best branch's first move), v2_prior_p, v2_verr (V - G): the acceptance test is v2_prior
   rising and v2_improving_share falling over training.
+Memory (2026-10-11, --memory gru --memory-dim D --memory-bptt T; off by default, then nothing changes; rl/docs/
+  SCALING_THESIS.md S5b; TokPolicy memory): a GRU state per worker carried by the actor (a table on the GPU, zeroed only
+  at an episode's first record: not at a room or floor change), the input state of each decision stored in the rollout
+  (Rollout.h). The learner cuts each worker's decisions into chunks of T (tok_policy.memory_chunks; minibatch = a set of
+  chunks, --sort-micro off, --micro rounded to whole chunks) and runs the GRU over each chunk from the stored state of
+  its first decision (stale-h: that state came from the actor's weights then, not the learner's current ones; the
+  usual truncated-BPTT approximation, exact at an update's first step in synchronous PPO) with the usual PPO losses as
+  means over the trained decisions; values recomputed at an update's start (--recompute-values) take one GRU step from
+  each decision's stored state. Teacher v2's lanes keep their own state table (a branch starts from the episode's state
+  at the fork, sent by the worker; tok_teacher2.LanePolicy.begin) and its imitation records carry their input states.
+  Approximate: the old teacher's records, the choice correction's records and branch episodes (tok_branch) use a zero
+  state. --resume of a memory-free checkpoint starts a fresh GRU (its output projection zero: the same outputs).
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
 
@@ -183,8 +195,10 @@ def parse_groups(text, workers):
 class Rollout:
     """Decisions per worker, in arrival order."""
 
-    def __init__(self, workers, capacity, n_heads=3):
+    def __init__(self, workers, capacity, n_heads=3, mem_dim=0):
         self.n, self.cap, self.nh = workers, capacity, n_heads
+        # 2026-10-11 (memory): the GRU's input state of each decision (None without memory)
+        self.h = np.zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
         self.rows = np.zeros((workers, capacity), ROW)
         self.pending = np.zeros((workers, capacity, n_heads), np.int64)
         self.actions = np.zeros((workers, capacity, n_heads), np.int64)
@@ -217,6 +231,8 @@ class Rollout:
         k = other.open[i]
         for name in ('rows', 'pending', 'actions', 'logp', 'value', 'version', 'boot'):
             getattr(self, name)[i, 0] = getattr(other, name)[i, k]
+        if self.h is not None:   # (memory)
+            self.h[i, 0] = other.h[i, k]
         self.length[i], self.open[i] = 1, 0
 
 
@@ -382,13 +398,17 @@ class Episodes:
         return go
 
 
-def store(roll, a_idx, rows, under_way, actions, logp, value, version):
-    """Store the decisions just answered (workers a_idx, distinct) as their workers' open ones."""
+def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None):
+    """Store the decisions just answered (workers a_idx, distinct) as their workers' open ones. h (memory): the GRU's
+    input state of each."""
     kk = roll.length[a_idx]
     ok = kk < roll.cap   # cannot fail with the trainer's capacity; drop rather than overrun
     if not ok.all():
         a_idx, kk, rows, under_way = a_idx[ok], kk[ok], rows[ok], under_way[ok]
         actions, logp, value = actions[ok], logp[ok], value[ok]
+        h = h[ok] if h is not None else None
+    if h is not None and roll.h is not None:   # 2026-10-11 (memory)
+        roll.h[a_idx, kk] = h
     roll.rows[a_idx, kk] = rows
     roll.boot[a_idx, kk] = rows['done'] == DONE_BRANCH   # 2026-10-07 (branches; always False without them)
     roll.pending[a_idx, kk], roll.actions[a_idx, kk] = under_way, actions
@@ -445,7 +465,8 @@ def main():
     from isaac_bridge.tok_obs import ENT_CAP
     from isaac_bridge.tok_policy import (ENTITY_FIELDS, ROW_BYTES, GraphActor, TokPolicy, cat_batch, crn_uniforms,
                                          DEDUP, decode_rows, distinct_ids, first_of, learner_plan, load_compatible,
-                                         packed_index, plan_tokens, rows_to_device, take, to_batch, used_entities)
+                                         memory_chunks, packed_index, pad_optimizer_state, plan_tokens, rows_to_device,
+                                         take, to_batch, used_entities)
     p = argparse.ArgumentParser()
     p.add_argument('--groups-file', required=True)
     p.add_argument('--groups', default='normal:8,boss:5,normal_big:3')
@@ -756,6 +777,18 @@ def main():
                         'other threads, its workers and their games are kept off them. The fast learner is bound by '
                         'its host thread, which a busy sibling or a game on the same core slows by ~20%%. '
                         "'' (default): no pinning")
+    # 2026-10-11 (memory, rl/docs/SCALING_THESIS.md S5b; see the module docstring)
+    p.add_argument('--memory', default='off', choices=('off', 'gru'),
+                   help='gru: a GRU state per worker between the token encoder and the heads, carried through the '
+                        'episode (reset only at a new episode) and trained with truncated BPTT; a resumed memory '
+                        'checkpoint keeps its memory. off (default): as before')
+    p.add_argument('--memory-dim', type=int, default=128, help="the GRU state's size (a resumed checkpoint's wins)")
+    p.add_argument('--memory-bptt', type=int, default=32,
+                   help="decisions per BPTT chunk (a worker's sequence cut into chunks of this many; a minibatch is "
+                        '--minibatch // this chunks)')
+    p.add_argument('--memory-graph', type=int, default=1,
+                   help='1: the actor answers through CUDA graphs with the state table (GraphActor memory); 0: eager '
+                        'inference for every call (a fallback)')
     p.add_argument('--fused-adam', type=int, default=0,
                    help='1: Adam as one fused CUDA kernel (the same update rule; float rounding may differ)')
     p.add_argument('--dump-rollouts', type=int, default=0,
@@ -796,6 +829,21 @@ def main():
     elif args.pchar < 0:
         args.pchar = int(bool(args.characters))
     pchar = bool(args.pchar)
+    mem_fresh = False   # 2026-10-11 (memory): a resumed memory checkpoint keeps its memory and its size
+    if args.resume:
+        ck_mem = int(torch.load(args.resume, map_location='cpu').get('config', {}).get('memory', 0) or 0)
+        if ck_mem:
+            if args.memory != 'gru' or args.memory_dim != ck_mem:
+                print(f'memory: the resumed checkpoint has a GRU of size {ck_mem}: --memory gru --memory-dim {ck_mem}',
+                      flush=True)
+            args.memory, args.memory_dim = 'gru', ck_mem
+        else:
+            mem_fresh = args.memory == 'gru'
+    mem_on = args.memory == 'gru'
+    mem_dim = int(args.memory_dim) if mem_on else 0
+    T_mem = max(1, int(args.memory_bptt))
+    if mem_on and args.memory_dim <= 0:
+        p.error('--memory gru needs --memory-dim > 0')
     rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0, heal=0.0, resource=0.0)
     rw.update({k: float(v) for k, v in (kv.split('=') for kv in (FLOOR_REWARD if floor else ROOM_REWARD).split(','))})
     if args.reward:
@@ -871,6 +919,7 @@ def main():
                            teacher_v2_cap=args.teacher_v2_cap, teacher_v2_random=args.teacher_v2_random,
                            teacher_v2_queue=args.teacher_v2_queue,
                            teacher_v2_depths=tuple(int(v) for v in args.teacher_v2_depths.split(',') if v.strip()),
+                           memory_dim=mem_dim,
                            bridge_lua=default_bridge_lua(), preload=default_preload(),
                            stub_list=stub if stub and Path(stub).is_file() else '')
     print('instances: stub list', cfg.stub_list or '(the launch mode\'s own)', '| environment',
@@ -885,8 +934,8 @@ def main():
     if args.resume:
         args.choice_heads = int(torch.load(args.resume, map_location='cpu').get('config', {}).get('choice', 0)) or             args.choice_heads
     n_choice = int(args.choice_heads)
-    learner_model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge,
-                              choice=n_choice, ent_ext=ent_ext, pchar=pchar).to(device)   # the weights PPO updates
+    learner_model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
+                              ent_ext=ent_ext, pchar=pchar, memory=mem_dim).to(device)   # the weights PPO updates
     nh = len(learner_model.heads)
     fused = bool(args.fused_adam) or bool(args.learner_fast)   # (B18: --learner-fast 1 implies the fused Adam)
     # (Phase B2: the choice heads are not PPO's: main_parameters() is parameters() without them, in the same order)
@@ -899,11 +948,16 @@ def main():
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
         missing, unexpected = learner_model.load_state_dict(ck['model'], strict=False)
-        if unexpected or any(not k.startswith('choice.') for k in missing):
+        if unexpected or any(not k.startswith('choice.') and not (mem_fresh and k.startswith('mem_')) for k in missing):
             raise SystemExit(f'--resume: weights do not match ({missing[:4]} {unexpected[:4]})')
         if copt is not None and ck.get('choice_optimizer'):
             copt.load_state_dict(ck['choice_optimizer'])
         osd = ck['optimizer']
+        if mem_fresh:   # 2026-10-11 (memory): the GRU's parameters are the optimiser's last ones, with no state yet
+            added = pad_optimizer_state(osd, len(learner_model.main_parameters()))
+            print(f'memory: --resume of a memory-free checkpoint: GRU (size {mem_dim}) initialised fresh, its output '
+                  f'projection zero (the same outputs as the checkpoint at the start); Adam state padded with {added} '
+                  'new tensors', flush=True)
         for g in osd['param_groups']:   # the checkpoint's groups carry its own implementation choice: this run's wins
             g['fused'], g['foreach'] = (True, None) if fused else (None, None)
         opt.load_state_dict(osd)        # (fused: Adam's step counts go to the device, else they stay / go to the CPU)
@@ -919,8 +973,8 @@ def main():
     def autocast():
         """The learner's forward passes (the losses are computed outside, in float32)."""
         return torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp)
-    model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge,
-                      choice=n_choice, ent_ext=ent_ext, pchar=pchar).to(device).eval()   # the actor's copy
+    model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
+                      ent_ext=ent_ext, pchar=pchar, memory=mem_dim).to(device).eval()   # the actor's copy
     model.load_state_dict(learner_model.state_dict())
     actor_params = [t for t in list(model.parameters()) + list(model.buffers())]
     learner_params = [t for t in list(learner_model.parameters()) + list(learner_model.buffers())]
@@ -1048,7 +1102,7 @@ def main():
             out_['lab_model_rows'] = len(m_.rows)
             return out_
     capacity = args.rollout // n * 4 + 64
-    roll, spare = Rollout(n, capacity, nh), Rollout(n, capacity, nh)
+    roll, spare = Rollout(n, capacity, nh, mem_dim), Rollout(n, capacity, nh, mem_dim)
 
     def teach_pending(meta):
         """The action under way of teacher records from their meta (int64 [k, 16], numpy or a tensor): columns 0-2,
@@ -1058,16 +1112,34 @@ def main():
         if isinstance(meta, np.ndarray):
             return np.concatenate([meta[:, :3], meta[:, 15:16] & 1, (meta[:, 15:16] >> 1) & 1], 1)
         return torch.cat([meta[:, :3], meta[:, 15:16] & 1, (meta[:, 15:16] >> 1) & 1], 1)
+    # 2026-10-11 (memory): the GRU state per worker on the device (the actor's, shared by its graphs, the snapshots'
+    # and the eager path; rows zeroed at an episode's first record), and the teacher-v2 lanes' own table
+    mem_table = torch.zeros((n, mem_dim), device=device) if mem_on else None
+    use_graphs = args.graph_entities > 0 and (bool(args.memory_graph) or not mem_on)
+    if mem_on:
+        print(f'memory: GRU size {mem_dim}, BPTT chunks of {T_mem} decisions (minibatch = {max(1, args.minibatch // T_mem)}'
+              ' chunks, --sort-micro off, --micro in whole chunks), actor inference '
+              + ('through CUDA graphs with the state table (GraphActor memory)' if use_graphs else
+                 'eager (--memory-graph 0 or --graph-entities 0)'), flush=True)
     # streams: the actor's calls go first on the GPU, the learner's kernels fill the rest. --actor-slots calls may be
     # in flight at once, each on its own stream (one GraphActor each)
-    actors = [GraphActor(model, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5), crn=bool(args.branch_crn))
-              for _ in range(max(1, args.actor_slots))] if args.graph_entities > 0 else []
+    actors = [GraphActor(model, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5), crn=bool(args.branch_crn),
+                         memory=mem_table)
+              for _ in range(max(1, args.actor_slots))] if use_graphs else []
     free = list(actors)
     # 2026-10-10 (teacher v2): the workers' lanes are answered by a GraphActor of their own (the actor's weights; the
     # lane records never enter the rollout); the eager path for what it cannot take
     v2_on = bool(args.teacher_v2) and getattr(sampler, 'lane_rows', None) is not None
-    lane_actor = GraphActor(model, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5), crn=False) \
-        if v2_on and args.graph_entities > 0 else None
+    lane_table = torch.zeros((n, mem_dim), device=device) if (mem_on and v2_on) else None
+    lane_actor = GraphActor(model, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5), crn=False,
+                            memory=lane_table) if v2_on and use_graphs else None
+
+    def mem_rows(table, idx, reset):
+        """(memory) the GRU states of workers idx from a table (zero where reset, a bool array, is set)."""
+        h = table.index_select(0, torch.from_numpy(np.ascontiguousarray(idx, np.int64)).to(device))
+        if reset is not None and np.any(reset):
+            h = h * torch.from_numpy(~np.asarray(reset, bool)).to(device).float()[:, None]
+        return h
     lane_stat = dict(calls=0, rows=0, s=0.0)
     inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
     actor_stream = torch.cuda.Stream(priority=-5)
@@ -1174,6 +1246,8 @@ def main():
             value_now = rl.value.copy()
             every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
+            # (memory: one GRU step from each decision's stored input state)
+            h_all = torch.from_numpy(rl.h.reshape(-1, mem_dim)[all_flat]).to(device) if mem_on else None
             vals, lps = [], []
             with torch.inference_mode():
                 chunk = args.micro or args.minibatch
@@ -1181,7 +1255,8 @@ def main():
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
                     with autocast():
                         lp_, _, v_, _ = learner_model.evaluate(take(every, part), acts_all[part],
-                                                               packed=bool(args.packed))
+                                                               packed=bool(args.packed),
+                                                               mem=h_all[part] if mem_on else None)
                     vals.append(v_)
                     lps.append(lp_)
             if recompute:
@@ -1196,8 +1271,14 @@ def main():
         if lab_on and not args.lab_ppo:   # 2026-10-08: the lab episodes' decisions left out of PPO
             mask &= rl.rows['lab'] == 0
         sec('gae')
-        flat = np.flatnonzero(mask.reshape(-1))
-        count = len(flat)
+        lw = None   # (memory) per row of flat: 1 = trained, 0 = only stepped through by the GRU (or padding)
+        if mem_on:   # 2026-10-11 (memory): every worker's decisions in chunks of T_mem (memory_chunks), chunk-major
+            mplan = memory_chunks(rl.length, mask, T_mem)
+            flat, lw = mplan['pos'], mplan['weight']
+            count = int(lw.sum())
+        else:
+            flat = np.flatnonzero(mask.reshape(-1))
+            count = len(flat)
         frac = min(1.0, (L['decisions'] - start_decisions) / max(1, target_decisions - start_decisions))
         lr = args.lr + (args.lr_final - args.lr) * frac
         for g in opt.param_groups:
@@ -1212,9 +1293,9 @@ def main():
         else:
             stage = None
             if fast:   # B18: gathered into a pinned buffer kept between updates, copied asynchronously
-                if L.get('stage') is None or L['stage'].shape[0] < count:
+                if L.get('stage') is None or L['stage'].shape[0] < len(flat):
                     L['stage'] = None
-                    L['stage'] = torch.empty((int(count * 1.25) + 64, ROW_BYTES), dtype=torch.uint8).pin_memory()
+                    L['stage'] = torch.empty((int(len(flat) * 1.25) + 64, ROW_BYTES), dtype=torch.uint8).pin_memory()
                 stage = L['stage']
             batch = rows_to_device(rl.rows, flat, rl.pending.reshape(-1, nh)[flat], device, stage=stage,
                                    with_raw=fast)
@@ -1226,7 +1307,16 @@ def main():
         b_ret = torch.from_numpy(ret.reshape(-1)[flat]).to(device)
         used_value = rl.value if value_now is None else value_now
         b_val = torch.from_numpy(used_value.reshape(-1)[flat]).to(device)
-        stale = float((rl.version.reshape(-1)[flat] < L['update']).mean()) if count else 0.0
+        if lw is None:
+            stale = float((rl.version.reshape(-1)[flat] < L['update']).mean()) if count else 0.0
+            reward_mean = float(rl.reward.reshape(-1)[flat].mean())
+        else:   # (memory: over the trained rows only)
+            stale = float(((rl.version.reshape(-1)[flat] < L['update']) * lw).sum() / max(count, 1))
+            reward_mean = float((rl.reward.reshape(-1)[flat] * lw).sum() / max(count, 1))
+            b_w = torch.from_numpy(lw).to(device)
+            b_reset = torch.from_numpy(rl.rows['first'].reshape(-1)[flat] != 0).to(device)
+            b_h0 = torch.from_numpy(rl.h.reshape(-1, mem_dim)[mplan['start']]).to(device)   # each chunk's first state
+            ev_rows = torch.from_numpy(np.flatnonzero(lw > 0)).to(device)
         sec('batch')
         acc = torch.zeros(5, device=device)        # pg, vf, ent, kl, clipped (sums over steps, on the GPU)
         tacc = torch.zeros(3, device=device)       # teach, danger, safe_mass
@@ -1247,7 +1337,7 @@ def main():
                     has = meta[:, 14] > 0
                     safe_new = float((mass * has).sum() / has.sum().clamp(min=1))
             L['teach_rate'] = teach_new if L['teach_rate'] is None else 0.9 * L['teach_rate'] + 0.1 * teach_new
-            planned = args.epochs * max(1, count // args.minibatch)
+            planned = args.epochs * max(1, len(flat) // args.minibatch)
             teach_step = int(min(args.teach_batch, args.teach_reuse * L['teach_rate'] / planned))
             at_ = (L['teach_at'] + np.arange(teach_new)) % args.teach_buffer   # the ring positions, in order
             if teach_new:
@@ -1271,7 +1361,10 @@ def main():
         vacc = torch.zeros(3, device=device)   # teacher v2: mean(-w logp), mean((V - G)^2), mean(logp) (sums)
         v2_steps = 0
         if v2_on and job.get('v2') is not None:
-            v_rows, v_meta = job['v2']
+            if mem_on:   # (memory: and each record's GRU input state, from the lane)
+                v_rows, v_meta, v_hs = job['v2']
+            else:
+                v_rows, v_meta = job['v2']
             v2_new = len(v_rows)
             B_ = args.teacher_v2_buffer
             if v2_new:
@@ -1284,7 +1377,11 @@ def main():
                     for at in range(0, v2_new, 512):
                         b_ = to_batch(v_rows[at:at + 512], pend_v[at:at + 512], device)
                         with autocast():
-                            lg_, vv_, _ = learner_model(b_, packed=bool(args.packed))
+                            if mem_on:
+                                lg_, vv_, _ = learner_model(b_, packed=bool(args.packed), mem=torch.from_numpy(
+                                    v_hs[at:at + 512]).to(device))[:3]
+                            else:
+                                lg_, vv_, _ = learner_model(b_, packed=bool(args.packed))
                         a_ = torch.from_numpy(act_v[at:at + 512]).to(device)
                         lp_all.append(learner_model.log_prob(lg_, learner_model.gate(b_), a_)[0].float())
                         lp_mv.append(torch.log_softmax(lg_.float()[:, :9], -1).gather(-1, a_[:, :1])[:, 0])
@@ -1307,7 +1404,11 @@ def main():
                     L['v2_act'] = torch.zeros((B_, nh), dtype=torch.int64, device=device)
                     L['v2_w'] = torch.zeros(B_, dtype=torch.float32, device=device)
                     L['v2_G'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                    if mem_on:   # (memory) the records' GRU input states
+                        L['v2_h'] = torch.zeros((B_, mem_dim), dtype=torch.float32, device=device)
                 at_d = torch.from_numpy(at_v).to(device)
+                if mem_on:
+                    L['v2_h'][at_d] = torch.from_numpy(np.ascontiguousarray(v_hs, np.float32)).to(device)
                 L['v2_raw'][at_d] = torch.from_numpy(
                     np.ascontiguousarray(v_rows).view(np.uint8).reshape(v2_new, ROW_BYTES)).to(device)
                 L['v2_pend'][at_d] = torch.from_numpy(pend_v).to(device)
@@ -1315,7 +1416,7 @@ def main():
                 L['v2_w'][at_d] = torch.from_numpy(v_meta[:, V2I['weight']].astype(np.float32)).to(device)
                 L['v2_G'][at_d] = torch.from_numpy(G_v).to(device)
             L['v2_rate'] = v2_new if L['v2_rate'] is None else 0.9 * L['v2_rate'] + 0.1 * v2_new
-            planned_v = args.epochs * max(1, count // args.minibatch)
+            planned_v = args.epochs * max(1, len(flat) // args.minibatch)
             v2_step = int(min(args.teacher_v2_batch, args.teacher_v2_reuse * L['v2_rate'] / planned_v))
             L['v2_at'] = (L['v2_at'] + v2_new) % B_
             L['v2_n'] = min(L['v2_n'] + v2_new, B_)
@@ -1502,21 +1603,42 @@ def main():
         t_meta = torch.from_numpy(teach_meta[:max(teach_n, 1)]).to(device) if fast else None   # (B18)
         learner_model.train()
         corr_stats = torch.zeros(2, device=device)   # Phase B2: the correction's loss and clipped share (sums)
+        # the units a minibatch is drawn in: decisions, or (memory) whole chunks of T_mem decisions
+        n_units, mb_units = (mplan['chunks'], max(1, args.minibatch // T_mem)) if mem_on else (count, args.minibatch)
+
+        def pmean(x, pm, pn):
+            """The mean over a part's rows: x.mean() (as before), or (memory) over its trained rows only."""
+            return x.mean() if pm is None else (x * pm).sum() / pn
+        pm = pn = n_sel = None
         for _ in range(args.epochs):
-            perm = torch.randperm(count, device=device)
+            perm = torch.randperm(n_units, device=device)
             perm_h = perm.cpu().numpy()
             first_step = True
-            for at in range(0, count, args.minibatch):
-                sel_h = perm_h[at:at + args.minibatch]
-                if len(sel_h) < args.minibatch // 4:
+            for at in range(0, n_units, mb_units):
+                sel_h = perm_h[at:at + mb_units]
+                if len(sel_h) < mb_units // 4:
                     continue
-                sel = perm[at:at + args.minibatch]
-                a_all = b_adv[sel]
-                adv_std = a_all.std()
-                a_all = (a_all - a_all.mean()) / (a_all.std() + 1e-8)
+                sel = perm[at:at + mb_units]
+                if mem_on:   # (memory) the chunks' rows, chunk after chunk (the GRU runs along each)
+                    ch_h = sel_h
+                    ch_d = dev(ch_h)
+                    sel_h = (ch_h[:, None] * T_mem + np.arange(T_mem)[None]).reshape(-1)
+                    sel = dev(sel_h)
+                    n_sel = max(float(lw[sel_h].sum()), 1.0)   # the minibatch's trained decisions
+                    a_all, w_all = b_adv[sel], b_w[sel]
+                    mu_ = (a_all * w_all).sum() / n_sel
+                    adv_std = (((a_all - mu_) ** 2 * w_all).sum() / max(n_sel - 1.0, 1.0)).sqrt()
+                    a_all = (a_all - mu_) / (adv_std + 1e-8) * w_all   # (untrained rows and padding: 0)
+                else:
+                    n_sel = len(sel)
+                    a_all = b_adv[sel]
+                    adv_std = a_all.std()
+                    a_all = (a_all - a_all.mean()) / (a_all.std() + 1e-8)
                 opt.zero_grad(set_to_none=True)
                 micro = args.micro or len(sel)
-                if micro < len(sel) and args.sort_micro:
+                if mem_on:   # (memory) parts of whole chunks
+                    micro = max(T_mem, micro // T_mem * T_mem)
+                if micro < len(sel) and args.sort_micro and not mem_on:
                     # the minibatch's rows ordered by their entity count before they are cut into parts: each part
                     # then pads to fewer entity tokens. The minibatch's gradient is the same sum over its rows
                     # (numpy's stable argsort: the order torch.argsort(stable=True) gives on the device)
@@ -1553,13 +1675,18 @@ def main():
                     v_ent = min(ENT_CAP, used_entities(L['v2_cnt']['n_ent'][vpick]))
                     vb = vpick_d if raw_mode else decode_rows(L['v2_raw'].index_select(0, vpick_d),
                                                               pending=v_pend, entities=v_ent)
-                    v_share = args.teacher_v2_weight * v2_step / len(sel)
+                    v_h = L['v2_h'].index_select(0, vpick_d) if mem_on else None   # (memory) their input states
+                    v_share = args.teacher_v2_weight * v2_step / n_sel
                     sec('teach_build')
                 last = (len(sel) - 1) // micro * micro
                 for lo_ in range(0, len(sel), micro):   # the minibatch's means, a part at a time
                     part = sel[lo_:lo_ + micro]
                     part_h = sel_h[lo_:lo_ + micro]
-                    w = len(part) / len(sel)
+                    if mem_on:   # (memory) the part's share of the minibatch's trained decisions
+                        pn = float(lw[part_h].sum())
+                        w, pm, pn = pn / n_sel, b_w[part], max(pn, 1.0)
+                    else:
+                        w = len(part) / len(sel)
                     used = min(width, used_entities(ne_h[part_h]))
                     merged = tb is not None and args.teach_merge and lo_ == last
                     vmerged = vb is not None and args.teach_merge and lo_ == last   # (teacher v2: after the teacher's)
@@ -1624,25 +1751,35 @@ def main():
                         mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1]))
                     k_ = len(part)
                     with autocast():
-                        logits_, value_, danger_ = learner_model(mb, packed=bool(args.packed))
+                        if mem_on:   # (memory) BPTT over the part's chunks from their stored first states; the
+                            #          teacher's records one step each (the old teacher's from 0, teacher v2's own)
+                            c0 = lo_ // T_mem
+                            tails = ([torch.zeros((len(pick), mem_dim), device=device)] if merged else []) + \
+                                ([v_h] if vmerged else [])
+                            memd = dict(h0=b_h0.index_select(0, ch_d[c0:c0 + k_ // T_mem]), T=T_mem,
+                                        reset=b_reset[part].view(-1, T_mem),
+                                        tail=torch.cat(tails) if len(tails) > 1 else (tails[0] if tails else None))
+                            logits_, value_, danger_ = learner_model(mb, packed=bool(args.packed), mem=memd)[:3]
+                        else:
+                            logits_, value_, danger_ = learner_model(mb, packed=bool(args.packed))
                     logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
                         logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
                     value = value_[:k_].float()
                     a = a_all[lo_:lo_ + micro]
                     if prox is None:   # PPO's ratio to the behaviour policy (the one that sampled the action)
                         ratio = torch.exp(logp - b_logp[part])
-                        pg = -torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a).mean()
+                        pg = -pmean(torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a), pm, pn)
                     else:   # decoupled: clipped around the weights at the update's start, importance-weighted
                         ratio = torch.exp(logp - prox[part])
                         weight = torch.exp(prox[part] - b_logp[part]).clamp(max=args.decoupled_max_weight)
-                        pg = -(weight * torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a)
-                               ).mean()
-                    vf = 0.5 * ((value - b_ret[part]) ** 2).mean()
-                    ent = entropy.sum(-1).mean()
+                        pg = -pmean(weight * torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a),
+                                    pm, pn)
+                    vf = 0.5 * pmean((value - b_ret[part]) ** 2, pm, pn)
+                    ent = pmean(entropy.sum(-1), pm, pn)
                     loss = (pg + args.vf_coef * vf - args.ent_coef * ent) * w
                     if merged:
                         t_end = k_ + len(pick) if vmerged else None   # (teacher v2's records follow)
-                        tloss, tstats = teacher_loss(logits_[k_:t_end], danger_[k_:t_end], meta, len(sel))
+                        tloss, tstats = teacher_loss(logits_[k_:t_end], danger_[k_:t_end], meta, n_sel)
                         loss = loss + tloss
                     if vmerged:   # 2026-10-10 (teacher v2): -w log pi(a | obs) over the heads + (V(obs) - G)^2
                         o_ = k_ + (len(pick) if merged else 0)
@@ -1653,9 +1790,9 @@ def main():
                         loss = loss + vloss
                     loss.backward()
                     with torch.no_grad():
-                        acc += torch.stack([pg, vf, ent, (b_logp[part] - logp).mean(),
-                                            ((ratio - 1).abs() > args.clip).float().mean()]) * w
-                        ent_heads += entropy.mean(0) * w
+                        acc += torch.stack([pg, vf, ent, pmean(b_logp[part] - logp, pm, pn),
+                                            pmean(((ratio - 1).abs() > args.clip).float(), pm, pn)]) * w
+                        ent_heads += (entropy.mean(0) if pm is None else (entropy * pm[:, None]).sum(0) / pn) * w
                         if merged:
                             tacc += tstats
                             teach_steps += 1
@@ -1671,7 +1808,7 @@ def main():
                     ratio_c = torch.exp(lp_c - corr_batch['logp'])
                     a_c = corr_batch['adv'] / (adv_std + 1e-8)
                     loss_c = -args.choice_adv_coef * torch.min(
-                        ratio_c * a_c, torch.clamp(ratio_c, 1 - args.clip, 1 + args.clip) * a_c).sum() / len(sel)
+                        ratio_c * a_c, torch.clamp(ratio_c, 1 - args.clip, 1 + args.clip) * a_c).sum() / n_sel
                     loss_c.backward()
                     with torch.no_grad():
                         corr_stats += torch.stack([loss_c.detach(),
@@ -1682,7 +1819,7 @@ def main():
                 if tb is not None and not args.teach_merge:
                     with autocast():
                         t_logits, _, t_danger = learner_model(tb, packed=bool(args.packed))
-                    tloss, tstats = teacher_loss(t_logits, t_danger, meta, len(sel))
+                    tloss, tstats = teacher_loss(t_logits, t_danger, meta, n_sel)
                     tloss.backward()
                     with torch.no_grad():
                         tacc += tstats
@@ -1690,7 +1827,7 @@ def main():
                     sec('teach')
                 if vb is not None and not args.teach_merge:   # 2026-10-10 (teacher v2): a pass of its own
                     with autocast():
-                        v_logits, v_value, _ = learner_model(vb, packed=bool(args.packed))
+                        v_logits, v_value, _ = learner_model(vb, packed=bool(args.packed), mem=v_h)[:3]
                     lp_v, _ = learner_model.log_prob(v_logits, learner_model.gate(vb), v_act)
                     vloss, vstats = teacher_v2_loss(lp_v, v_value, v_w, v_G, v_share, args.teacher_v2_coef,
                                                     args.teacher_v2_vf)
@@ -1725,6 +1862,8 @@ def main():
         L['seconds'] += wall
         upd = L['update']
         acc_c, tacc_c = acc.cpu().numpy(), tacc.cpu().numpy()
+        if mem_on:   # (memory: the trained rows only)
+            b_ret, b_val = b_ret.index_select(0, ev_rows), b_val.index_select(0, ev_rows)
         var = float(b_ret.var())
         ev = 1.0 - float((b_ret - b_val).var()) / var if var > 0 else 0.0
         steps_ = max(steps, 1)
@@ -1744,7 +1883,7 @@ def main():
             'ent_bomb': float(ent_heads[2]) / steps_, 'kl': acc_c[3] / steps_,
             **({'ent_item': float(ent_heads[3]) / steps_, 'ent_pill': float(ent_heads[4]) / steps_} if nh > 3 else {}),
             'clip_frac': acc_c[4] / steps_, 'explained_variance': ev,
-            'reward_mean': float(rl.reward.reshape(-1)[flat].mean()), 'episodes': len(finished),
+            'reward_mean': reward_mean, 'episodes': len(finished),
             'errors': float(stats[:, 5].sum()),
             'stalls': float(stats[:, ST['stalls']].sum()), 'build_retries': float(stats[:, ST['retries']].sum()),
             'port_moves': float(stats[:, ST['port_moves']].sum()), 'root_recycles': float(stats[:, ST['recycles']].sum()),
@@ -1774,6 +1913,8 @@ def main():
             'c_dec_max': job.get('dec_max', 0.0), 'dec_w': job.get('dec_w', ''),
             'c_trainer_cores': job.get('proc_cores', 0.0),
         }
+        if mem_on:   # 2026-10-11 (memory): BPTT chunks and rows of the update (trained decisions: count)
+            row['mem_chunks'], row['mem_rows'] = mplan['chunks'], len(flat)
         row.update({f'u_{k}': v for k, v in U.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
         if run or items:   # 2026-10-06: run / item counters (absent in the other modes: their columns are unchanged)
@@ -1980,12 +2121,32 @@ def main():
         t_l = time.perf_counter()
         rows_l = sampler.lane_rows[idx_l]
         pend_l = sampler.lane_io[idx_l, :nh].astype(np.int64)
-        got = lane_actor.act(rows_l, pend_l) if lane_actor is not None else None
+        lane_h = getattr(sampler, 'lane_h', None) if mem_on else None
+        if lane_h is not None:   # 2026-10-11 (memory): a branch's first request sets the lane's state from the worker
+            #                     (the episode's state at the fork, LanePolicy.begin); later ones carry the lane's own
+            new_b = lane_h[idx_l, mem_dim] > 0.5
+            if new_b.any():
+                j_l = idx_l[new_b]
+                lane_table.index_copy_(0, torch.from_numpy(j_l).to(device),
+                                       torch.from_numpy(np.ascontiguousarray(lane_h[j_l, :mem_dim])).to(device))
+                torch.cuda.current_stream().synchronize()   # (done before the lane actor's stream reads the table)
+                lane_h[j_l, mem_dim] = 0.0
+        got = lane_actor.act(rows_l, pend_l, *((idx_l, None) if mem_on else ())) if lane_actor is not None else None
+        h_l = lane_actor.h_used if got is not None and mem_on else None
         if got is None:   # (no graph, or more records than it holds: eager)
             with torch.inference_mode():
-                a_l, lp_l, v_l = model.act(to_batch(rows_l, pend_l, device))
+                if mem_on:
+                    h_in = mem_rows(lane_table, idx_l, None)
+                    a_l, lp_l, v_l, hn_l = model.act(to_batch(rows_l, pend_l, device), mem=h_in)
+                else:
+                    a_l, lp_l, v_l = model.act(to_batch(rows_l, pend_l, device))
+            if mem_on:
+                lane_table.index_copy_(0, torch.from_numpy(idx_l).to(device), hn_l)
+                h_l = h_in.cpu().numpy()
             got = (a_l.cpu().numpy(), lp_l.cpu().numpy(), v_l.cpu().numpy())
         a_l, lp_l, v_l = got
+        if lane_h is not None:   # the input state of each answer, for the branch's imitation records
+            lane_h[idx_l, :mem_dim] = h_l
         sampler.lane_io[idx_l, 5:5 + nh] = a_l
         sampler.lane_out[idx_l, 0], sampler.lane_out[idx_l, 1], sampler.lane_out[idx_l, 2] = v_l, lp_l, version
         sampler.reply_lanes(idx_l)
@@ -2005,29 +2166,31 @@ def main():
     aux = sampler.aux   # Phase B2 (branches): the actor's value, log-probability and choice outputs per worker
     from isaac_bridge.tok_branch import AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_USED
     snaps = []   # Phase B2: the weight snapshots the branch records are answered with (tok_branch, aux block)
-    if aux is not None and args.branch_snap_every > 0 and args.graph_entities > 0:
+    if aux is not None and args.branch_snap_every > 0 and use_graphs:
         for k_s in range(2):
-            m_s = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge,
-                            choice=n_choice, ent_ext=ent_ext, pchar=pchar).to(device).eval()
+            m_s = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
+                            ent_ext=ent_ext, pchar=pchar, memory=mem_dim).to(device).eval()
             m_s.load_state_dict(model.state_dict())
             e_s = dict(id=version if k_s == 0 else -1, model=m_s, actors=[],
                        params=list(m_s.parameters()) + list(m_s.buffers()))
             for _ in range(max(1, args.actor_slots)):   # (calls in flight per snapshot, as the actor's own)
                 g_s = GraphActor(m_s, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5),
-                                 crn=bool(args.branch_crn))
+                                 crn=bool(args.branch_crn), memory=mem_table)
                 g_s.snap, g_s.in_flight = e_s, False
                 e_s['actors'].append(g_s)
             snaps.append(e_s)
         aux[n, AUX_SNAP], aux[n, AUX_SNAP_ON] = version, 1
         torch.cuda.synchronize()
 
-    def answer(prof, a_idx, sub, under_way, actions, logp, value, extra=None, ver=None):
+    def answer(prof, a_idx, sub, under_way, actions, logp, value, extra=None, ver=None, h=None):
         """The actions out to the workers, the decisions into the rollout. ver: the weights that answered (a
-        snapshot's id; None: the actor's own)."""
+        snapshot's id; None: the actor's own). h (memory): the GRU's input state of each record."""
         t2 = time.perf_counter()
         sampler.actions[a_idx, :nh] = actions
         if v2_on:   # 2026-10-10 (teacher v2): the value of the record, for the worker's log (before the reply)
             sampler.main_value[a_idx] = value
+            if h is not None and getattr(sampler, 'main_h', None) is not None:   # (memory: and its input state)
+                sampler.main_h[a_idx] = h
         if aux is not None:   # (written before the reply: the worker reads it after its answer)
             aux[a_idx, 0], aux[a_idx, 1] = value, logp
             if extra is not None:
@@ -2038,7 +2201,7 @@ def main():
         sampler.reply(a_idx)
         t3 = time.perf_counter()
         prof['reply'] += t3 - t2
-        store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver)
+        store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h)
         pending[a_idx] = actions
         prof['store'] += time.perf_counter() - t3
 
@@ -2058,7 +2221,7 @@ def main():
         prof['latency'] += t2 - t_sub
         if was_busy:
             prof['act_busy'] += t2 - t_sub
-        answer(prof, a_idx, sub, under_way, actions, logp, value, slot.extra, ver)
+        answer(prof, a_idx, sub, under_way, actions, logp, value, slot.extra, ver, slot.h_used)
 
     def submit_snapshots(prof, idx_b, sub_b, uw_b, t1):
         """Phase B2: branch records to the snapshots their workers ask for (the newest when that one is gone)."""
@@ -2072,7 +2235,7 @@ def main():
             while all(g_.in_flight for g_ in e['actors']):
                 finish(prof)
             g = next(g_ for g_ in e['actors'] if not g_.in_flight)
-            g.submit(sub_b[m_], uw_b[m_])
+            g.submit(sub_b[m_], uw_b[m_], *((idx_b[m_], sub_b[m_]['first'] != 0) if mem_on else ()))
             g.in_flight = True
             inflight.append((g, idx_b[m_], sub_b[m_], uw_b[m_], t1, busy))
             prof['snap_calls'] += 1
@@ -2145,7 +2308,7 @@ def main():
                             prof['act'] += time.perf_counter() - t1
                             continue
                         a_idx, sub, under_way = a_idx[~is_b], sub[~is_b], under_way[~is_b]
-                if free and free[-1].submit(sub, under_way):
+                if free and free[-1].submit(sub, under_way, *((a_idx, sub['first'] != 0) if mem_on else ())):
                     inflight.append((free.pop(), a_idx, sub, under_way, t1, busy))
                     prof['act'] += time.perf_counter() - t1
                     continue
@@ -2153,6 +2316,7 @@ def main():
                 while inflight:
                     finish(prof)
                 prof['eager'] += 1
+                h_e = None
                 with torch.inference_mode():
                     u_crn = None
                     if args.branch_crn and sub['crn'].any():   # Phase B2: the branch records' common random numbers
@@ -2160,14 +2324,21 @@ def main():
                         sel_c = np.flatnonzero(sub['crn'])
                         u_crn[torch.from_numpy(sel_c).to(device)] = torch.from_numpy(
                             crn_uniforms(sub['crn'][sel_c], sub['t'][sel_c], u_crn.shape[1])).to(device)
-                    actions, logp, value = model.act(to_batch(sub, under_way, device), u=u_crn)
+                    if mem_on:   # 2026-10-11 (memory): the workers' states in, the new ones back into the table
+                        h_e = mem_rows(mem_table, a_idx, sub['first'] != 0)
+                        actions, logp, value, hn_e = model.act(to_batch(sub, under_way, device), u=u_crn, mem=h_e)
+                    else:
+                        actions, logp, value = model.act(to_batch(sub, under_way, device), u=u_crn)
+                if mem_on:
+                    mem_table.index_copy_(0, torch.from_numpy(np.ascontiguousarray(a_idx, np.int64)).to(device), hn_e)
+                    h_e = h_e.cpu().numpy()
                 actions, logp, value = actions.cpu().numpy(), logp.cpu().numpy(), value.cpu().numpy()
                 t2 = time.perf_counter()
                 prof['act'] += t2 - t1
                 prof['latency'] += t2 - t1
                 if busy:
                     prof['act_busy'] += t2 - t1
-                answer(prof, a_idx, sub, under_way, actions, logp, value)
+                answer(prof, a_idx, sub, under_way, actions, logp, value, h=h_e)
             while inflight:
                 finish(prof)
             collect_s = time.perf_counter() - t0
@@ -2198,7 +2369,7 @@ def main():
                        **lab_job,
                        teach=sampler.teacher_records() if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,
-                       v2=sampler.v2_records() if v2_on else None,   # 2026-10-10 (teacher v2)
+                       v2=(sampler.v2_records(with_h=True) if mem_on else sampler.v2_records()) if v2_on else None,
                        branch_finished=book.branch_finished,
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,

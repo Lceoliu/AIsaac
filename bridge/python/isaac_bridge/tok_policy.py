@@ -36,6 +36,19 @@ columns of that Linear. A checkpoint without it loads with load_compatible (char
 the same outputs whatever character the records hold (one-hot columns padded into the Linear gave the same values only
 up to summation order, about 3e-5 on the logits: abplus_probe_charge_compat.py). char_emb is registered after every
 other parameter (their order, and an optimiser state of a run without it, unchanged).
+
+Memory (2026-10-11, rl/docs/SCALING_THESIS.md S5b "记忆"; TokPolicy(memory=D), config key 'memory'): a GRUCell(width, D)
+reads the player token after the final norm (z, the heads' input) and the hidden state h of the step before; the heads
+then read z + mem_out(h_new) (mem_out: Linear(D, width), zero at the start). That is the same function as
+concatenating h_new to every head's input with zero-initialised new columns, but one projection serves the policy,
+value, danger and choice heads and their shapes stay as they are: a model resumed from a memory-free checkpoint (the GRU
+fresh, mem_out zero) computes exactly that checkpoint's outputs until training moves mem_out (and through it the GRU).
+h is per environment (worker) and carried by the caller: forward / act / evaluate take mem = h [B, D] (one GRU step per
+record; h_new is returned last by forward / act), or for the learner a dict of chunks (h0 [C, D] the stored state at
+each chunk's first record, T, reset [C, T] episode starts inside the chunk, optional tail [R, D] for R more records
+after the C x T chunk records, one step each): truncated BPTT over the chunk. mem=None on a memory model = h of zeros
+(an episode's start) and the output arity of a memory-free model. The memory modules are registered last (after
+char_emb): the parameters before them keep their order. Without memory nothing here changes.
 """
 import contextlib
 import os
@@ -376,7 +389,8 @@ class ChoiceHeads(nn.Module):
 
 
 class TokPolicy(nn.Module):
-    def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False):
+    def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
+                 memory=0):
         super().__init__()
         self.config = dict(width=width, layers=layers, heads=heads)
         if items:   # (the key only when set: items-free checkpoints keep their config)
@@ -439,6 +453,14 @@ class TokPolicy(nn.Module):
         self.char_emb = nn.Embedding(N_CHAR, width) if pchar else None
         if pchar:
             nn.init.zeros_(self.char_emb.weight)
+        # 2026-10-11 (memory): registered after everything else; mem_out zero at the start (the module docstring)
+        self.memory = int(memory or 0)
+        if self.memory:   # (the key only when set: memory-free checkpoints keep their config)
+            self.config['memory'] = self.memory
+            self.mem_gru = nn.GRUCell(width, self.memory)
+            self.mem_out = nn.Linear(self.memory, width)
+            nn.init.zeros_(self.mem_out.weight)
+            nn.init.zeros_(self.mem_out.bias)
 
     def main_parameters(self):
         """The parameters PPO's optimiser owns: all but the choice heads' (in the order of parameters())."""
@@ -459,11 +481,13 @@ class TokPolicy(nn.Module):
         x = x.float()
         return x.contiguous(memory_format=torch.channels_last) if getattr(self, 'nhwc', False) else x
 
-    def forward(self, b, entities=None, packed=False, need_h=False):
+    def forward(self, b, entities=None, packed=False, need_h=False, mem=None):
         """b: the dict of to_batch. Returns (logits [B, 16], value [B], danger logits [B, 9]).
         packed: the Transformer's per-token layers on the real tokens only (Block.forward_packed; the padded door and
         entity tokens are skipped). Same values up to summation order, less work when many tokens are padding (the
-        learner); not for CUDA-graph capture (the number of real tokens varies)."""
+        learner); not for CUDA-graph capture (the number of real tokens varies).
+        mem (2026-10-11, memory models only): the GRU's state (module docstring); then the new state h_new [B, D] is
+        returned as the last element."""
         n = b['player'].shape[0]
         used = entities or b['ent'].shape[1]
         ids = b['ent_id'][:, :used]
@@ -518,7 +542,7 @@ class TokPolicy(nn.Module):
             door = embed(self.door, b['doors'].reshape(n * DOOR_CAP, -1).index_select(0, b['dkeep'])) + self.kind[2]
             xp = torch.cat([player, room, level, door, entity]).index_select(0, b['xperm'])
             x0 = self._blocks_bucketed(xp, b).index_select(0, b['starts'])
-            return self._heads(x0, need_h)
+            return self._heads(x0, need_h, mem)
         door = embed(self.door, b['doors']) + self.kind[2]
         x = torch.cat([player[:, None], room[:, None], level[:, None], door, entity], 1)
         dev = x.device
@@ -546,7 +570,7 @@ class TokPolicy(nn.Module):
             for block in self.blocks:
                 x = block(x, bias)
             x0 = x[:, 0]
-        return self._heads(x0, need_h)
+        return self._heads(x0, need_h, mem)
 
     def _cnn(self, seq, b, key):
         """A grid input's CNN; with b[key + '_u'] / b[key + '_i'] (B18, the learner's fast path: the distinct grids of
@@ -568,8 +592,10 @@ class TokPolicy(nn.Module):
             xp = block.forward_packed(xp, None, None, shape)
         return xp
 
-    def _heads(self, x0, need_h):
+    def _heads(self, x0, need_h, mem=None):
         """The final norm and the heads on the player's tokens x0."""
+        if self.memory:   # 2026-10-11 (memory models; without memory the code below, unchanged)
+            return self._heads_mem(x0, need_h, mem)
         if _autocast_on():   # the heads in float32 (logits and value not rounded to bfloat16)
             with torch.autocast('cuda', enabled=False):
                 h = self.norm(x0.float())
@@ -580,6 +606,42 @@ class TokPolicy(nn.Module):
         if need_h:
             return self.pi(h), self.value(h)[:, 0], self.danger(h), h
         return self.pi(h), self.value(h)[:, 0], self.danger(h)
+
+    def _heads_mem(self, x0, need_h, mem):
+        """_heads of a memory model (2026-10-11): z = norm(x0), h_new = GRU(z, h), the heads on z + mem_out(h_new);
+        all in float32 (also under autocast, like the heads). h_new is appended to the outputs when mem is given."""
+        ctx = torch.autocast('cuda', enabled=False) if _autocast_on() else contextlib.nullcontext()
+        with ctx:
+            z = self.norm(x0.float())
+            h_new = self.recur(z, mem)
+            z = z + self.mem_out(h_new)
+            out = (self.pi(z), self.value(z)[:, 0], self.danger(z)) + ((z,) if need_h else ())
+            return out + ((h_new,) if mem is not None else ())
+
+    def recur(self, z, mem):
+        """The GRU over the records' pooled representations z [N, width] (float32): mem None (zeros), a tensor
+        [N, D] (one step per record) or a chunk dict (truncated BPTT: h0 [C, D], T, reset [C, T] bool where a record
+        starts an episode (its input state is zeroed before its step, as the actor does), tail [R, D] or None for the
+        N - C x T records after the chunks, one step each from that state (None: zeros)). Returns h_new [N, D]."""
+        n = z.shape[0]
+        if mem is None:
+            return self.mem_gru(z, z.new_zeros((n, self.memory)))
+        if torch.is_tensor(mem):
+            return self.mem_gru(z, mem.float())
+        h, T, reset = mem['h0'].float(), int(mem['T']), mem['reset']
+        k = h.shape[0] * T
+        zs = z[:k].view(h.shape[0], T, -1)
+        keep = (~reset.bool()).float()
+        outs = []
+        for t in range(T):   # (the chunk's first state is the stored one, already zero at an episode start)
+            h = self.mem_gru(zs[:, t], h * keep[:, t, None])
+            outs.append(h)
+        hs = torch.stack(outs, 1).reshape(k, -1)
+        if k < n:
+            tail = mem.get('tail')
+            tail = z.new_zeros((n - k, self.memory)) if tail is None else tail.float()
+            hs = torch.cat([hs, self.mem_gru(z[k:], tail)])
+        return hs
 
     @staticmethod
     def gate(b):
@@ -605,25 +667,34 @@ class TokPolicy(nn.Module):
                 out[j] = torch.stack([h[:, 0], h[:, 1].masked_fill(~gate[:, i], -1e9)], -1)
         return out
 
-    def act(self, b, greedy=False, entities=None, u=None):
+    def act(self, b, greedy=False, entities=None, u=None, mem=None):
         """Actions [B, heads], their log-probability [B] and the value [B]. u (2026-10-07, Phase B2): sampling
         uniforms [B, sum of head sizes] for Gumbel-max (GraphActor's rule; the common random numbers of branch
-        records); None: torch.multinomial as before."""
-        logits, value, _ = self.forward(b, entities)
+        records); None: torch.multinomial as before. mem (2026-10-11, memory models): the GRU's state [B, D]; the
+        new state is then returned as a fourth element."""
+        if mem is not None:
+            logits, value, _, h_new = self.forward(b, entities, mem=mem)
+        else:
+            logits, value, _ = self.forward(b, entities)
+        tail = (h_new,) if mem is not None else ()
         if u is not None and not greedy:
             actions, logp = gumbel_sample(self.split(logits.float(), self.gate(b)), u)
-            return actions, logp, value.float()
+            return (actions, logp, value.float()) + tail
         actions, logp = [], 0.0
         for head in self.split(logits.float(), self.gate(b)):
             logs = F.log_softmax(head, -1)
             a = logs.argmax(-1) if greedy else torch.multinomial(logs.exp(), 1)[:, 0]
             actions.append(a)
             logp = logp + logs.gather(-1, a[:, None])[:, 0]
-        return torch.stack(actions, 1), logp, value.float()
+        return (torch.stack(actions, 1), logp, value.float()) + tail
 
-    def evaluate(self, b, actions, entities=None, packed=False):
-        """Log-probability of the actions [B], entropy per head [B, heads], value [B], danger logits [B, 9]."""
-        logits, value, danger = self.forward(b, entities, packed)
+    def evaluate(self, b, actions, entities=None, packed=False, mem=None):
+        """Log-probability of the actions [B], entropy per head [B, heads], value [B], danger logits [B, 9]. mem
+        (memory models): the GRU's state (forward's; the new state is not returned)."""
+        if mem is not None:
+            logits, value, danger = self.forward(b, entities, packed, mem=mem)[:3]
+        else:
+            logits, value, danger = self.forward(b, entities, packed)
         logp, entropy = self.log_prob(logits, self.gate(b), actions)
         return logp, entropy, value.float(), danger.float()
 
@@ -890,12 +961,31 @@ class GraphActor:
     rows_max records (the caller then uses the eager path).
     submit() / result() split a call so that the caller can work (or run another GraphActor on another stream) while
     the GPU computes; `stream`: the CUDA stream of the calls (None: the current stream at each call).
+    Memory models (2026-10-11, TokPolicy memory): `memory` is the GRU state table [slots, D] on the device (one row per
+    worker, shared by every actor that answers those workers); submit() takes each record's slot and whether its
+    episode starts there. Before the replay the records' states are gathered from the table into the graph's input
+    (zeroed where an episode starts), after it the new states are written back (both outside the graph, on the call's
+    stream, before its completion event: a worker's next record, which can only come after the answer, sees them);
+    result() leaves the input state of every record in self.h_used (numpy [n, D]: what the rollout stores).
     """
 
-    def __init__(self, model, rows_max, entities=32, stream=None, crn=True):
+    def __init__(self, model, rows_max, entities=32, stream=None, crn=True, memory=None):
         from .tok_obs import ENT_CAP
         dev = next(model.parameters()).device
         self.model, self.n, self.stream, self._n = model, rows_max, stream, 0
+        self.mem = int(getattr(model, 'memory', 0) or 0)   # 2026-10-11 (memory): the GRU state's size, 0 without
+        self.h_used = None
+        if self.mem:
+            if memory is None:
+                raise ValueError('GraphActor: a memory model needs its state table (memory=)')
+            self.table = memory
+            self.h_in = torch.zeros((rows_max, self.mem), device=dev)
+            self.widx = torch.zeros(rows_max, dtype=torch.int64, device=dev)
+            self.keep = torch.ones(rows_max, device=dev)
+            self.widx_stage = torch.zeros(rows_max, dtype=torch.int64).pin_memory()
+            self.keep_stage = torch.ones(rows_max).pin_memory()
+            self.widx_np, self.keep_np = self.widx_stage.numpy(), self.keep_stage.numpy()
+            self.h_outs, self._h_last = [], None
         n = rows_max
         heads = model.heads
         nh = self.nh = len(heads)
@@ -923,7 +1013,7 @@ class GraphActor:
         self.choice = getattr(model, 'choice', None) is not None
         self.n_extra = 2 if self.choice else 0
         self.extra = None
-        self.out_host = torch.zeros((n, nh + 2 + self.n_extra), dtype=torch.float32).pin_memory()
+        self.out_host = torch.zeros((n, nh + 2 + self.n_extra + self.mem), dtype=torch.float32).pin_memory()
         self.out_np = self.out_host.numpy()
         self.done = torch.cuda.Event()
         self.sizes = sorted({min(int(entities), ENT_CAP), ENT_CAP})
@@ -931,7 +1021,10 @@ class GraphActor:
 
         def run(tokens):
             b = decode_rows(self.raw, entities=tokens, n_heads=nh)
-            if self.choice:
+            if self.mem:   # (memory: the state's input from self.h_in, the new state kept for the write-back)
+                outs = model(b, tokens, need_h=self.choice, mem=self.h_in)
+                logits, value, h, self._h_last = outs[0], outs[1], outs[3] if self.choice else None, outs[-1]
+            elif self.choice:
                 logits, value, _, h = model(b, tokens, need_h=True)
             else:
                 logits, value, _ = model(b, tokens)
@@ -950,6 +1043,8 @@ class GraphActor:
                 d = model.choice.take_minus_skip(h.float(), item).float()
                 keep = has.float()[:, None]
                 cols += [d.mean(1, keepdim=True) * keep, d.std(1, keepdim=True) * keep]
+            if self.mem:   # (memory: each record's input state, for the rollout)
+                cols.append(self.h_in)
             return torch.cat(cols, 1)
 
         self.graphs, self.outs = [], []
@@ -970,14 +1065,20 @@ class GraphActor:
                 pool = graph.pool()
                 self.graphs.append(graph)
                 self.outs.append(out)
+                if self.mem:
+                    self.h_outs.append(self._h_last)
         torch.cuda.synchronize()
 
-    def submit(self, rows, pending):
+    def submit(self, rows, pending, widx=None, reset=None):
         """Start a call (returns at once; False if it does not fit). rows: a C-contiguous ROW array, pending [n, heads]
-        int64. The next submit may only follow this call's result()."""
+        int64. The next submit may only follow this call's result(). Memory models: widx [n] the records' rows of the
+        state table (distinct), reset [n] bool (None: none) where an episode starts (its state is zero)."""
         n = len(rows)
         if n > self.n:
             return False
+        if self.mem:
+            self.widx_np[:n] = widx
+            self.keep_np[:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
         most = int(rows['n_ent'].max())
         g = 0 if most <= self.sizes[0] else len(self.sizes) - 1
         self.stage_np[:n, :ROW_BYTES] = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
@@ -1000,7 +1101,13 @@ class GraphActor:
                 self.crn_u[:k].copy_(self.crn_stage[:k], non_blocking=True)
                 self.crn_idx[:k].copy_(self.crn_idx_stage[:k], non_blocking=True)
                 self.u.index_copy_(0, self.crn_idx[:k], self.crn_u[:k])
+            if self.mem:   # the records' states into the graph's input (zero at an episode start)
+                self.widx[:n].copy_(self.widx_stage[:n], non_blocking=True)
+                self.keep[:n].copy_(self.keep_stage[:n], non_blocking=True)
+                self.h_in[:n] = self.table.index_select(0, self.widx[:n]) * self.keep[:n, None]
             self.graphs[g].replay()
+            if self.mem:   # the new states back into the table
+                self.table.index_copy_(0, self.widx[:n], self.h_outs[g][:n])
             self.out_host[:n].copy_(self.outs[g][:n], non_blocking=True)
             self.done.record()
         self._n = n
@@ -1011,12 +1118,55 @@ class GraphActor:
         self.done.synchronize()
         out = self.out_np[:self._n].copy()
         nh = self.nh
-        self.extra = out[:, nh + 2:] if self.n_extra else None
+        self.extra = out[:, nh + 2:nh + 2 + self.n_extra] if self.n_extra else None
+        if self.mem:   # (memory) each record's input state
+            self.h_used = out[:, nh + 2 + self.n_extra:]
         return out[:, :nh].astype(np.int64), out[:, nh], out[:, nh + 1]
 
-    def act(self, rows, pending):
+    def act(self, rows, pending, widx=None, reset=None):
         """submit + result: (actions, log-probabilities, values), or None if it does not fit."""
-        return self.result() if self.submit(rows, pending) else None
+        return self.result() if self.submit(rows, pending, widx, reset) else None
+
+
+def memory_chunks(length, mask, T):
+    """2026-10-11 (memory, the learner's truncated BPTT): a rollout's decisions cut into chunks of T per worker.
+    length [W]: decisions stored per worker; mask [W, cap] bool: the decisions trained on. Each worker's sequence
+    0 .. length-1 (untrained decisions included: the actor's GRU stepped through them too) is cut at 0, T, 2T, ...; a
+    worker's last chunk is padded to T by repeating its last decision (weight 0); chunks without a trained decision are
+    dropped. Returns dict(pos [C*T] int64 flat positions w * cap + t (chunk-major), weight [C*T] float32 (1: trained),
+    start [C] int64 the flat position of each chunk's first decision (its stored state starts the chunk), chunks C)."""
+    W, cap = mask.shape
+    ar = np.arange(T)
+    pos, weight, start = [], [], []
+    for w in range(W):
+        n = int(length[w])
+        for s in range(0, n, T):
+            e = min(s + T, n)
+            m = np.zeros(T, bool)
+            m[:e - s] = mask[w, s:e]
+            if not m.any():
+                continue
+            pos.append(w * cap + np.minimum(s + ar, e - 1))
+            weight.append(m)
+            start.append(w * cap + s)
+    if not pos:
+        return dict(pos=np.zeros(0, np.int64), weight=np.zeros(0, np.float32), start=np.zeros(0, np.int64), chunks=0)
+    return dict(pos=np.concatenate(pos).astype(np.int64), weight=np.concatenate(weight).astype(np.float32),
+                start=np.asarray(start, np.int64), chunks=len(start))
+
+
+def pad_optimizer_state(osd, n_params):
+    """2026-10-11 (memory): an optimiser state dict of a model with fewer parameters (a memory-free checkpoint) made
+    loadable into an optimiser over n_params parameters whose first ones are the checkpoint's (the memory modules are
+    registered last): the single param group gets the new parameters' ids, with no state (Adam initialises it at the
+    first step). Returns the number of parameters added."""
+    g = osd['param_groups'][0]
+    have = len(g['params'])
+    if len(osd['param_groups']) != 1 or have >= n_params:
+        return 0
+    top = max(list(g['params']) + [-1])
+    g['params'] = list(g['params']) + list(range(top + 1, top + 1 + n_params - have))
+    return n_params - have
 
 
 def load_compatible(model, state):

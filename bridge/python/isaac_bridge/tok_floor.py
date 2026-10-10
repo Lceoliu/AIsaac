@@ -313,6 +313,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                    V2Log, V2Point, V2Stop, attach_v2, records_of, search_point)
         v2_blocks, lane_rows, lane_io, lane_out, main_value, v2_rows, v2_meta = attach_v2(v2_names, cfg.workers)
         blocks = blocks + v2_blocks
+        main_h = lane_h = v2_h = None   # 2026-10-11 (memory, cfg.memory_dim): the GRU states (tok_teacher2.attach_v2_mem)
+        if getattr(cfg, 'memory_dim', 0) and len(v2_names) > 6:
+            from .tok_teacher2 import attach_v2_mem
+            mem_blocks, main_h, lane_h, v2_h = attach_v2_mem(v2_names[6:], cfg.workers, cfg.memory_dim)
+            blocks = blocks + mem_blocks
         v2ctx = V2Context(cfg, limit, stall, run, fast_fn, group, lane_rows[index:index + 1], cfg.branch_reward)
         v2_rng = np.random.default_rng([cfg.seed, index, 19])    # its own: the episodes' rng draws stay as without
         v2_srng = np.random.default_rng([cfg.seed, index, 23])   # the search thread's (candidates, reseeds)
@@ -398,7 +403,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         """One teacher-v2 point (tok_teacher2.search_point through the lane): its imitation records into the ring
         when it improves; the counters."""
         t0, c0 = time.perf_counter(), time.thread_time()
-        policy = LanePolicy(v2_conn, lane_io, lane_out, index, lambda: bool(control[0]) or search_stop.is_set())
+        policy = LanePolicy(v2_conn, lane_io, lane_out, index, lambda: bool(control[0]) or search_stop.is_set(),
+                            lane_h=lane_h)
         s0 = dict(v2ctx.stats)
         res = None
         try:
@@ -431,10 +437,13 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             if res['improving']:
                 mine[ST['v2_improving']] += 1
                 rows_, meta_ = records_of(res, v2ctx, pt, index, cfg.teacher_v2_cap)
+                hs_ = res['best'].get('h')   # 2026-10-11 (memory): each record's GRU input state (None without)
                 for j in range(len(rows_)):
                     slot = int(mine[ST['v2_records']]) % V2_RING
                     v2_rows[index, slot] = rows_[j]
                     v2_meta[index, slot] = meta_[j]
+                    if v2_h is not None:
+                        v2_h[index, slot] = hs_[j] if hs_ is not None else 0.0
                     mine[ST['v2_records']] += 1
         mine[ST['v2_queue']] = len(v2_queue)
         mine[ST['v2_wait_s']] += policy.wait_s
@@ -1467,6 +1476,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                          float(aux[index, AUX_UNCERT])))
                         if v2on:   # 2026-10-10 (teacher v2): the actor's value of record t_ep - 1
                             v2log.value.append(float(main_value[index]))
+                            if main_h is not None:   # 2026-10-11 (memory): and its GRU input state
+                                v2log.h.append(main_h[index].copy())
                     conn.send_bytes(b'1' if t_ep & 1 else b'0')
                     waiting = True
                     if done or control[0]:

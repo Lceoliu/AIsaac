@@ -22,6 +22,8 @@ usage (from the bridge's python dir, PYTHONPATH=.):
   character drawn from the seed alone (tok_floor.character_of_seed); summary 'by_character'. Default: Isaac.
   --record <dir>: every record of every episode and the actions decided, one npz per episode (tok_record.py; the HTML
   replay viewer: abplus_tok_replay_build.py).
+  Memory checkpoints (2026-10-11, train_tok --memory gru; config 'memory'): the GRU state is carried per worker and
+  zeroed at each episode's first record, as in training.
 """
 import argparse
 import json
@@ -127,6 +129,14 @@ def main():
                                                  run_seconds=args.run_seconds), n_heads=5 if items else 3)
     nh = 5 if items else 3
     pending = np.zeros((n, nh), np.int64)
+    # 2026-10-11 (memory checkpoints, config 'memory'): the GRU state per eval worker, zeroed at an episode's first
+    # record (as in training: not at a room or floor change)
+    mem_dim = int(getattr(model, 'memory', 0) or 0) if model is not None else 0
+    mem_h = torch.zeros((n, mem_dim), device=device) if mem_dim else None
+    mem_reset = np.zeros(n, bool)
+    if mem_dim:
+        info['memory'] = mem_dim
+        print(f'memory: GRU state of size {mem_dim} per worker, reset at each episode start', flush=True)
     hurt = np.zeros(n)
     events = np.zeros((n, 3), np.int64)   # rooms cleared, rooms entered, boss rooms cleared
     extra = np.zeros((n, 6), np.int64)    # run / items: exits, collectibles, active uses, pill uses, stage0, deepest
@@ -145,6 +155,7 @@ def main():
                 r = rows[j]
                 if r['first']:
                     pending[i], hurt[i], events[i], extra[i] = 0, 0.0, 0, 0
+                    mem_reset[i] = True
                     extra[i, 4] = extra[i, 5] = int(r['stage'])
                     char0[i] = int(r['pchar'])
                 if recorder is not None:
@@ -174,6 +185,15 @@ def main():
                 if model is None:
                     actions = np.stack([rng.integers(9, size=len(act_idx)), rng.integers(5, size=len(act_idx))]
                                        + [np.zeros(len(act_idx), np.int64)] * (nh - 2), 1)
+                elif mem_h is not None:   # (memory) the workers' states in, the new ones kept
+                    ai = torch.tensor(act_idx, dtype=torch.int64, device=device)
+                    h_in = mem_h.index_select(0, ai) * torch.from_numpy(~mem_reset[act_idx]).float().to(device)[:, None]
+                    mem_reset[act_idx] = False
+                    with torch.inference_mode():
+                        out_ = model.act(to_batch(rows[act_rows], pending[act_idx], device), greedy=args.greedy,
+                                         mem=h_in)
+                    mem_h.index_copy_(0, ai, out_[3])
+                    actions = out_[0].cpu().numpy()
                 else:
                     with torch.inference_mode():
                         actions = model.act(to_batch(rows[act_rows], pending[act_idx], device),

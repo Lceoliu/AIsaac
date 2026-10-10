@@ -75,7 +75,7 @@ def attach_v2(names, workers):
     actor's value of each worker's last answered ordinary record float64 [workers], v2 rows [workers, V2_RING] ROW,
     v2 meta float64 [workers, V2_RING, V2_META])."""
     from multiprocessing import shared_memory
-    blocks = [shared_memory.SharedMemory(name=n) for n in names]
+    blocks = [shared_memory.SharedMemory(name=n) for n in names[:6]]   # (more names: attach_v2_mem's blocks)
     lane_rows = np.ndarray((workers,), ROW, buffer=blocks[0].buf)
     lane_io = np.ndarray((workers, LANE_IO), np.int32, buffer=blocks[1].buf)
     lane_out = np.ndarray((workers, LANE_OUT), np.float64, buffer=blocks[2].buf)
@@ -83,6 +83,25 @@ def attach_v2(names, workers):
     rows = np.ndarray((workers, V2_RING), ROW, buffer=blocks[4].buf)
     meta = np.ndarray((workers, V2_RING, V2_META), np.float64, buffer=blocks[5].buf)
     return blocks, lane_rows, lane_io, lane_out, main_value, rows, meta
+
+
+def v2_mem_sizes(workers, dim):
+    """2026-10-11 (memory, train_tok --memory gru): shared-memory block sizes (bytes) of attach_v2_mem's arrays."""
+    return 4 * workers * dim, 4 * workers * (dim + 1), 4 * workers * V2_RING * dim
+
+
+def attach_v2_mem(names, workers, dim):
+    """2026-10-11 (memory): (blocks, main_h float32 [workers, dim]: the GRU input state of each worker's last answered
+    ordinary record (written by the actor before its reply, like main_value), lane_h float32 [workers, dim + 1]: the
+    lane's state (the worker writes a branch's start state and sets column dim = 1, LanePolicy.begin; the actor then
+    writes the input state of each answer there), v2_h float32 [workers, V2_RING, dim]: each imitation record's input
+    state)."""
+    from multiprocessing import shared_memory
+    blocks = [shared_memory.SharedMemory(name=n) for n in names[:3]]
+    main_h = np.ndarray((workers, dim), np.float32, buffer=blocks[0].buf)
+    lane_h = np.ndarray((workers, dim + 1), np.float32, buffer=blocks[1].buf)
+    v2_h = np.ndarray((workers, V2_RING, dim), np.float32, buffer=blocks[2].buf)
+    return blocks, main_h, lane_h, v2_h
 
 
 def parse_ints(text, default=()):
@@ -103,11 +122,13 @@ class V2Stop(Exception):
 
 class V2Log:
     """The episode's per-record values the taken score needs: damage share, half hearts lost, done code, events, the
-    stall counter after the record (EpisodeState.progress_t) and the actor's value of the record (answered ones)."""
-    __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value')
+    stall counter after the record (EpisodeState.progress_t) and the actor's value of the record (answered ones); h
+    (2026-10-11, memory): the GRU input state the actor used for the record (answered ones; empty without memory)."""
+    __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value', 'h')
 
     def __init__(self):
         self.damage, self.hurt, self.done, self.events, self.progress, self.value = [], [], [], [], [], []
+        self.h = []
 
     def add(self, row, done, progress):
         self.damage.append(float(row['damage'][0]))
@@ -212,7 +233,11 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
     B = S.fork(lean=True, alarm=ctx.alarm)
     intent.reset()
     out = dict(score=0.0, n=0, end=END_STOP, boot=False, v_end=0.0, frames=0)
-    rows, pends, acts, vals, lps, rews = [], [], [], [], [], []
+    rows, pends, acts, vals, lps, rews, hs = [], [], [], [], [], [], []
+    begin = getattr(policy, 'begin', None)
+    if begin is not None:   # 2026-10-11 (memory): the branch's GRU state starts as a copy of the episode's at record d
+        log_h = getattr(pt.log, 'h', None) or []
+        begin(log_h[d] if d < len(log_h) else None)
     try:
         if reseed is not None:
             B.reseed(reseed)
@@ -267,6 +292,7 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
                 acts.append(act)
                 vals.append(float(v))
                 lps.append(float(lp))
+                hs.append(getattr(policy, 'h_used', None))   # (memory: the answer's GRU input state; else None)
             under = act
             t += 1
             j += 1
@@ -282,7 +308,8 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
         G[i] = rews[i] + ctx.gamma * G[i + 1]
     out.update(score=float(G[0]), n=n, frames=lf - lf0, rews=rews)
     if keep:
-        out.update(rows=rows[:n], pend=pends[:n], act=acts[:n], ret=G[:n].copy(), value=vals[:n], logp=lps[:n])
+        out.update(rows=rows[:n], pend=pends[:n], act=acts[:n], ret=G[:n].copy(), value=vals[:n], logp=lps[:n],
+                   h=hs[:n] if hs and hs[0] is not None else None)
     ctx.stats['branches'] += 1
     ctx.stats['decisions'] += n
     ctx.stats['frames'] += lf - lf0
@@ -390,12 +417,23 @@ def records_of(res, ctx, pt, worker, cap_w):
 
 class LanePolicy:
     """The actor through a worker's lane (training): request() writes the action under way and wakes the actor (the
-    record is already in the lane slot), answer() waits for its answer (stop(): give up, V2Stop)."""
+    record is already in the lane slot), answer() waits for its answer (stop(): give up, V2Stop).
+    lane_h (2026-10-11, memory; attach_v2_mem's, None without): begin(h0) hands the actor a branch's start state (a copy
+    of the episode's at the fork; None: zeros), so the branch never touches the worker's own state; after each answer
+    h_used is the GRU input state the actor used for it."""
 
-    def __init__(self, conn, lane_io, lane_out, index, stop):
+    def __init__(self, conn, lane_io, lane_out, index, stop, lane_h=None):
         self.conn, self.io, self.out, self.i, self.stop = conn, lane_io, lane_out, index, stop
         self.wait_s = 0.0
         self.calls = 0
+        self.lane_h, self.h_used = lane_h, None
+        if lane_h is None:   # (without memory: play_branch finds no begin)
+            self.begin = None
+
+    def begin(self, h0):
+        dim = self.lane_h.shape[1] - 1
+        self.lane_h[self.i, :dim] = 0.0 if h0 is None else h0
+        self.lane_h[self.i, dim] = 1.0   # (read and cleared by the actor at the branch's first request)
 
     def request(self, row, under_way):
         self.io[self.i, :5] = under_way
@@ -409,6 +447,8 @@ class LanePolicy:
         self.conn.recv_bytes()
         self.wait_s += time.perf_counter() - t0
         self.calls += 1
+        if self.lane_h is not None:   # (memory)
+            self.h_used = self.lane_h[self.i, :self.lane_h.shape[1] - 1].copy()
         return tuple(int(v) for v in self.io[self.i, 5:10]), float(self.out[self.i, 0]), float(self.out[self.i, 1])
 
 
