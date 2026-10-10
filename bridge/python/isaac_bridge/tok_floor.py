@@ -30,12 +30,6 @@ choice record in the worker's ring. With branch_share 0 nothing of this runs and
 Hindsight search teacher (cfg.teacher): with it every room change is cloned, and a hurt is restored from the clone of
 the room it happened in (the bridge's play command ends at a room change, so a restore never crosses one). The parked
 clones are shared by the archive, the running episode and queued searches through a reference count.
-
-Teacher v2 (cfg.teacher_v2, 2026-10-10; tok_teacher2.py has the definitions; needs cfg.teacher_thread): every room
-change is cloned as with the teacher; the worker logs each record's reward fields, stall counter and the actor's value
-(the sampler's main_value block), queues points (hurts, deaths, random records; tok_teacher2.V2Point) at the episode's
-end, and the search thread runs them (search_point) with the actor answering the branches through the worker's lane;
-an improving point's imitation records go to the worker's V2 ring. With teacher_v2 off nothing of this exists.
 """
 import dataclasses
 import json
@@ -181,44 +175,30 @@ class Parked:
 
     def __init__(self, clone, **info):
         self.clone, self.refs, self.info = clone, 1, info
-        # 2026-10-10 (teacher v2): the search thread forks and releases parked clones that the worker's own thread
-        # forks and releases too (an archive entry or template is also a queued search's restore point): one command
-        # on the clone's connection at a time, and the reference count changed under the same lock
-        self.lock = threading.Lock()
         Parked.live.add(self)
 
     def hold(self):
-        with self.lock:
-            self.refs += 1
+        self.refs += 1
         return self
 
     def release(self):
-        with self.lock:
-            self.refs -= 1
-            if self.refs <= 0 and self.clone is not None:
-                try:
-                    self.clone.close()
-                except OSError:
-                    pass
-                self.clone = None
-                Parked.live.discard(self)
-
-    def fork(self, **kw):
-        """A fork of the parked clone (its client's fork(**kw)), under the lock."""
-        with self.lock:
-            return self.clone.fork(**kw)
+        self.refs -= 1
+        if self.refs <= 0 and self.clone is not None:
+            try:
+                self.clone.close()
+            except OSError:
+                pass
+            self.clone = None
+            Parked.live.discard(self)
 
     @property
     def pid(self):
         return getattr(self.clone, 'pid', None) if self.clone is not None else None
 
 
-def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=None, lab_names=None, v2_names=None,
-                      v2_conn=None):
+def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=None, lab_names=None):
     blocks, rows, actions, stats, control = attach(names, cfg.workers)
     evaluation = bool(cfg.eval_seeds)
-    # 2026-10-10 (teacher v2, tok_teacher2.py): off unless cfg.teacher_v2 and the sampler gave this worker a lane
-    v2on = bool(cfg.teacher_v2) and v2_names is not None and v2_conn is not None and not evaluation
     teaching = cfg.teacher and teacher_names is not None and not evaluation
     if teaching:
         teach_blocks, teach_rows, teach_meta = attach_teacher(teacher_names, cfg.workers)
@@ -284,8 +264,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     # character, prepare below; archive starts keep the character of the episode they were parked from)
     chars = parse_characters(cfg.characters)
     char_rng = np.random.default_rng([cfg.seed, index, 17])   # its own: the episodes' rng draws stay as without
-    # every room change is parked as the restore point of what happens in that room
-    rebase = teaching or branching or v2on
+    rebase = teaching or branching   # every room change is parked as the restore point of what happens in that room
     t_begin = time.perf_counter()
     mine = stats[index]
     slots = (rows[2 * index:2 * index + 1], rows[2 * index + 1:2 * index + 2])
@@ -298,28 +277,15 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     stall = int(round(cfg.floor_stall_seconds * 30 / cfg.frames_per_decision))
     queue = []      # hurts to search: (parked base, reseed, applied actions, hurt_at, seed, episode, base's decision)
     archive = []
-    # 2026-10-10 (teacher v2): its points (tok_teacher2.V2Point), searched by the search thread through the lane
-    v2_queue = []
-    if v2on:
-        from .tok_obs import RC_PROGRESS
-        from .tok_teacher2 import (KIND_FATAL, KIND_HURT, KIND_RANDOM, V2_RING, Context as V2Context, LanePolicy,
-                                   V2Log, V2Point, V2Stop, attach_v2, records_of, search_point)
-        v2_blocks, lane_rows, lane_io, lane_out, main_value, v2_rows, v2_meta = attach_v2(v2_names, cfg.workers)
-        blocks = blocks + v2_blocks
-        v2ctx = V2Context(cfg, limit, stall, run, fast_fn, group, lane_rows[index:index + 1], cfg.branch_reward)
-        v2_rng = np.random.default_rng([cfg.seed, index, 19])    # its own: the episodes' rng draws stay as without
-        v2_srng = np.random.default_rng([cfg.seed, index, 23])   # the search thread's (candidates, reseeds)
-        v2_p = cfg.teacher_v2_random * cfg.frames_per_decision / 30 / 3600   # random points per decision
-        v2_n = [0]
 
     qlock = threading.RLock()   # 2026-10-10: the queue is shared with the search thread (cfg.teacher_thread)
     search_errors = [0]
 
-    def search(item, pair=True):
+    def search(item):
         base_, reseed_, applied_, hurt_at, seed_, episode_, offset, fatal = item
         items = [item]   # teacher_pair: the next queued hurts of the same episode and room share the restore
         with qlock:
-            while pair and cfg.teacher_pair and queue and queue[-1][0] is base_ and queue[-1][2] is applied_ and \
+            while cfg.teacher_pair and queue and queue[-1][0] is base_ and queue[-1][2] is applied_ and \
                     queue[-1][7] == fatal:   # (a fatal hurt is searched on its own: other depths and margin)
                 items.append(queue.pop())
         t0 = time.perf_counter()
@@ -328,12 +294,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         c0 = time.thread_time()
         cfg_s = cfg_death if fatal else cfg   # 2026-10-09 (death teacher)
         try:
-            # (2026-10-10: the Parked itself, whose fork() holds its lock: the worker's thread forks the same clones)
             if len(items) > 1:
-                founds = hindsight_shared(base_, reseed_, applied_, [it[3] for it in items], cfg_s, limit, offset,
+                founds = hindsight_shared(base_.clone, reseed_, applied_, [it[3] for it in items], cfg_s, limit, offset,
                                           prof=prof)
             else:
-                founds = [hindsight(base_, reseed_, applied_, hurt_at, cfg_s, limit, offset, prof=prof)]
+                founds = [hindsight(base_.clone, reseed_, applied_, hurt_at, cfg_s, limit, offset, prof=prof)]
         except (BridgeError, OSError, RuntimeError, ValueError) as exc:
             mine[ST['errors']] += 1
             founds = [[] for _ in items]
@@ -369,7 +334,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                        n_found, len(queue), len(items))
 
     prof_file = open(os.path.join(TEACH_PROF, f'w{index}.jsonl'), 'a') if TEACH_PROF and teaching else None
-    gate = SearchSlots(cfg) if (teaching or v2on) else None
+    gate = SearchSlots(cfg) if teaching else None
 
     def search_gated():
         """The newest queued hurt searched when a search slot is free (cfg.teacher_slots); False when none was."""
@@ -385,160 +350,28 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             gate.give(j)
         return True
 
-    # ------------------------------------------------------------------ teacher v2 (tok_teacher2.py, 2026-10-10)
-    def v2_search(pt):
-        """One teacher-v2 point (tok_teacher2.search_point through the lane): its imitation records into the ring
-        when it improves; the counters."""
-        t0, c0 = time.perf_counter(), time.thread_time()
-        policy = LanePolicy(v2_conn, lane_io, lane_out, index, lambda: bool(control[0]) or search_stop.is_set())
-        s0 = dict(v2ctx.stats)
-        res = None
-        try:
-            res = search_point(pt, v2ctx, policy, v2_srng)
-        except V2Stop:
-            pass
-        except (BridgeError, OSError, RuntimeError, ValueError) as exc:
-            mine[ST['errors']] += 1
-            mine[ST['v2_errors']] += 1
-            if search_errors[0] < 5:
-                search_errors[0] += 1
-                print(f'tok floor worker {index}: teacher v2 search failed: {type(exc).__name__}: {str(exc)[:200]}',
-                      file=sys.stderr, flush=True)
-        finally:
-            pt.base.release()
-        mine[ST['v2_points']] += 1
-        mine[ST['v2_random']] += pt.kind == KIND_RANDOM
-        mine[ST['v2_fatal']] += pt.kind == KIND_FATAL
-        for k_s, name in (('branches', 'v2_branches'), ('decisions', 'v2_dec'), ('frames', 'v2_frames'),
-                          ('replicates', 'v2_reps')):
-            mine[ST[name]] += v2ctx.stats[k_s] - s0[k_s]
-        if res is None:
-            mine[ST['v2_nodepth']] += 1
-        else:
-            mine[ST['v2_depths']] += res['depths']
-            mine[ST['v2_gain0']] += res['gain0']
-            mine[ST['v2_gain']] += res['gain']
-            if res['spread'] is not None:
-                mine[ST['v2_spread']] += res['spread']
-            if res['improving']:
-                mine[ST['v2_improving']] += 1
-                rows_, meta_ = records_of(res, v2ctx, pt, index, cfg.teacher_v2_cap)
-                for j in range(len(rows_)):
-                    slot = int(mine[ST['v2_records']]) % V2_RING
-                    v2_rows[index, slot] = rows_[j]
-                    v2_meta[index, slot] = meta_[j]
-                    mine[ST['v2_records']] += 1
-        mine[ST['v2_queue']] = len(v2_queue)
-        mine[ST['v2_wait_s']] += policy.wait_s
-        mine[ST['v2_cpu']] += time.thread_time() - c0
-        mine[ST['v2_s']] += time.perf_counter() - t0
-
-    def v2_gated():
-        """The newest queued teacher-v2 point searched when a search slot is free; False when none was."""
-        j = gate.take()
-        if j is None:
-            return False
-        try:
-            with qlock:
-                pt = v2_queue.pop() if v2_queue else None
-            if pt is not None:
-                v2_search(pt)
-        finally:
-            gate.give(j)
-        return True
-
-    def search_time():
-        """The search thread's seconds outside the trainer's updates (the teacher's and teacher v2's)."""
-        return mine[ST['teach_s']] + mine[ST['v2_s']] if v2on else mine[ST['teach_s']]
-
     # 2026-10-10 (cfg.teacher_thread): the searches in a thread of their own, so the worker's episode never waits for
     # one. The thread searches whenever the trainer updates (control[1]) and otherwise while its search time stays
     # within cfg.teacher_share of the worker's wall time; the socket work of a search releases the GIL.
-    # (teacher v2: its points on the same thread, within the same share; the queue whose searches took less time so
-    # far goes first)
-    threaded = (teaching or v2on) and bool(cfg.teacher_thread)
+    threaded = teaching and bool(cfg.teacher_thread)
     search_stop = threading.Event()
-    # 2026-10-10 (cfg.teacher_fork, with the thread): each hurt search runs in a forked child of the worker instead of
-    # the thread itself. The thread's numpy / encode work held the GIL for milliseconds at a time (C77 on the HPC: the
-    # worker's own encode 0.2 -> 8 ms per record while a search ran, throughput 1,800 -> 600x). The child gets its own
-    # parked copy of the restore point (one fork command on the shared clone, under its lock), the parent lets go of
-    # that copy's connection without closing the clone, the child writes the teacher records into the shared ring
-    # (one child per worker at a time: the ring index stays consistent) and _exits; the thread only waits for it.
-    forking = threaded and bool(cfg.teacher_fork)
-
-    def search_forked():
-        j = gate.take()
-        if j is None:
-            return False
-        try:
-            with qlock:
-                item = queue.pop() if queue else None
-            if item is None:
-                return True
-            base_ = item[0]
-            try:
-                copy = Parked(base_.fork(tag='search', alarm=0), **base_.info)
-            except (BridgeError, OSError, RuntimeError, ValueError) as exc:
-                mine[ST['errors']] += 1
-                base_.release()
-                if search_errors[0] < 5:
-                    search_errors[0] += 1
-                    print(f'tok floor worker {index}: search copy failed: {type(exc).__name__}: {str(exc)[:200]}',
-                          file=sys.stderr, flush=True)
-                return True
-            base_.release()
-            child_item = (copy,) + tuple(item[1:])
-            pid = os.fork()
-            if pid == 0:   # the child: the search on its own copy, records into the shared ring, then gone
-                code = 0
-                try:
-                    search(child_item, pair=False)
-                except BaseException:
-                    code = 1
-                finally:
-                    os._exit(code)
-            # the parent: its end of the copy's connection closed without the close command (the clone lives on
-            # with the child's end), then the child waited for (the thread blocks here; the GIL is free)
-            try:
-                sock = copy.clone._sock
-                copy.clone._sock = None
-                if sock is not None:
-                    sock.close()
-            except (AttributeError, OSError):
-                pass
-            copy.clone = None
-            Parked.live.discard(copy)
-            _, status = os.waitpid(pid, 0)
-            if status != 0:
-                mine[ST['errors']] += 1
-        finally:
-            gate.give(j)
-        return True
 
     def search_loop():
         while not search_stop.is_set():
-            if not (queue or v2_queue) or control[0]:
+            if not queue or control[0]:
                 time.sleep(0.02)
                 continue
-            if not (control[1] or search_time() < cfg.teacher_share * (time.perf_counter() - t_begin)):
+            if not (control[1] or mine[ST['teach_s']] < cfg.teacher_share * (time.perf_counter() - t_begin)):
                 time.sleep(0.02)
                 continue
             try:
-                if v2_queue and (not queue or mine[ST['v2_s']] <= mine[ST['teach_s']]):
-                    ok = v2_gated()
-                else:
-                    ok = search_forked() if forking else search_gated()
-                if not ok:
+                if not search_gated():
                     time.sleep(0.01)
             except Exception as exc:   # (never the worker's death: logged, the next item)
                 mine[ST['errors']] += 1
                 print(f'tok floor worker {index}: search thread: {type(exc).__name__}: {str(exc)[:200]}',
                       file=sys.stderr, flush=True)
     search_thread = threading.Thread(target=search_loop, name=f'search{index}', daemon=True) if threaded else None
-    if threaded:
-        # 2026-10-10: the interpreter's default switch interval (5 ms) made the main thread wait that long for the GIL
-        # every time the search thread held it (C77 on the HPC: encode 0.2 -> 7 ms per record, throughput 1,800 -> 600x)
-        sys.setswitchinterval(float(os.environ.get('ISAAC_RL_SWITCH_INTERVAL', '0.0002')))
 
     def receive():
         """The server's answer. While the trainer updates, queued searches run instead of waiting (without the
@@ -1164,12 +997,6 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['dropped']] += len(queue)
             queue.clear()
             mine[ST['queue']] = 0
-            if v2on:   # 2026-10-10 (teacher v2): its queued points hold restore points of the instance too
-                for pt in v2_queue:
-                    pt.base.release()
-                mine[ST['v2_dropped']] += len(v2_queue)
-                v2_queue.clear()
-                mine[ST['v2_queue']] = 0
         for parked in archive:
             parked.release()
         archive.clear()
@@ -1293,7 +1120,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             t0 = time.perf_counter()
             try:
                 reseed = state_seed % (2 ** 31 - 1) + 1 if evaluation else int(rng.integers(1, 2 ** 31 - 1))
-                episode = src.fork(alarm=cfg.clone_alarm, reseed=reseed, lean=True)   # (under its lock, 2026-10-10)
+                episode = src.clone.fork(alarm=cfg.clone_alarm, reseed=reseed, lean=True)
                 # 2026-10-08: a start build (floor starts only: archive entries carry their episode's build along)
                 if building and not from_archive and build_rng.random() < cfg.start_build_prob:
                     episode.lua(transplant_lua(random_build()))
@@ -1347,10 +1174,6 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             # Phase B2: copies of the last records and the actor's outputs per record (the points' decision records)
             ring = deque(maxlen=8 + cfg.branch_left_back) if branching else None
             hist = [] if branching else None
-            # 2026-10-10 (teacher v2): each record's reward fields, stall counter and the actor's value (the taken
-            # score); its points: (record, the restore point then, its reseed, its decision, kind)
-            v2log = V2Log() if v2on else None
-            v2_pts = []
             try:
                 while True:
                     t0 = time.perf_counter()
@@ -1367,13 +1190,6 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     # and was never a hurt to search; the death teacher queues it by its done code)
                     if teaching and (hurt or (death_teaching and done == 2)):
                         hurts.append((t_ep, base.hold(), base_reseed, base_t))
-                    if v2on:   # 2026-10-10 (teacher v2): the record's log, and a point at a hurt, a death or at random
-                        v2log.add(row, done, enc.ctx[RC_PROGRESS] if enc is not None else st.progress_t)
-                        if hurt or done == 2:
-                            v2_pts.append((t_ep, base.hold(), base_reseed, base_t, KIND_FATAL if done == 2 else KIND_HURT))
-                        elif v2_p > 0 and not done and t_ep > base_t + 1 and room_idx == room_now and \
-                                not row['events'][0] & EV_EXIT and v2_rng.random() < v2_p:
-                            v2_pts.append((t_ep + 1, base.hold(), base_reseed, base_t, KIND_RANDOM))
                     if branching and t_ep > 0 and not done:   # branch points of this record (tok_branch)
                         ev_b = int(row['events'][0])
                         changed_b = room_idx != room_now or bool(ev_b & EV_EXIT)
@@ -1416,8 +1232,6 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         if branching:   # Phase B2: the actor's outputs for record t_ep - 1 (hist[t] is record t's)
                             hist.append((float(aux[index, AUX_LOGP]), float(aux[index, AUX_PRED]),
                                          float(aux[index, AUX_UNCERT])))
-                        if v2on:   # 2026-10-10 (teacher v2): the actor's value of record t_ep - 1
-                            v2log.value.append(float(main_value[index]))
                     conn.send_bytes(b'1' if t_ep & 1 else b'0')
                     waiting = True
                     if done or control[0]:
@@ -1471,33 +1285,6 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                             mine[ST['teach_s']] < cfg.teacher_share * (time.perf_counter() - t_begin):
                         if not search_gated():
                             break
-                if v2_pts:   # 2026-10-10 (teacher v2): the death and random points always, cfg.teacher_per_episode
-                    #          of the hurts (drawn with its own rng); the oldest make room, deaths last
-                    hurt_j = [j for j, p_ in enumerate(v2_pts) if p_[4] == KIND_HURT]
-                    keep_j = set(int(j) for j in v2_rng.permutation(hurt_j)[:cfg.teacher_per_episode]) | \
-                        {j for j, p_ in enumerate(v2_pts) if p_[4] != KIND_HURT}
-                    with qlock:
-                        for j, (at_, parked, reseed_, offset, kind) in enumerate(v2_pts):
-                            if j not in keep_j:
-                                parked.release()
-                                continue
-                            v2_n[0] += 1
-                            v2_queue.append(V2Point(
-                                base=parked, reseed=reseed_, applied=applied, log=v2log, at=at_, offset=offset,
-                                kind=kind, seed=seed_now, episode=episode_n, visited=parked.info.get('visited', ()),
-                                stage0=parked.info.get('stage0'), pid=index * 10 ** 9 + v2_n[0],
-                                version=int(control[3])))
-                        v2_pts = []
-                        excess = len(v2_queue) - cfg.teacher_v2_queue
-                        if excess > 0:
-                            drop = [j for j in range(len(v2_queue)) if v2_queue[j].kind != KIND_FATAL][:excess]
-                            drop += [j for j in range(len(v2_queue)) if v2_queue[j].kind == KIND_FATAL][
-                                :excess - len(drop)]
-                            for j in drop:
-                                v2_queue[j].base.release()
-                                mine[ST['v2_dropped']] += 1
-                            v2_queue[:] = [p_ for j, p_ in enumerate(v2_queue) if j not in set(drop)]
-                        mine[ST['v2_queue']] = len(v2_queue)
             except (BridgeError, OSError, RuntimeError, ValueError) as exc:
                 # the server may hold a record of this episode without its end: the next record is a first one
                 mine[ST['errors']] += 1
@@ -1508,8 +1295,6 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 if waiting:
                     conn.recv_bytes()
                 for h in hurts:
-                    h[1].release()
-                for h in v2_pts:   # 2026-10-10 (teacher v2)
                     h[1].release()
             finally:
                 try:
@@ -1539,7 +1324,6 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             except OSError:
                 pass
             for parked in [template, base] + archive + [item[0] for item in queue] + \
-                    [pt.base for pt in v2_queue] + \
                     ([p.base for p in points.items] if branching else []) + \
                     (list(panel.values()) if labbing else []):
                 if parked is not None:
