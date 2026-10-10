@@ -283,6 +283,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     # 2026-10-08: character randomisation (cfg.characters; floor starts: the root's reset restarts the run as the drawn
     # character, prepare below; archive starts keep the character of the episode they were parked from)
     chars = parse_characters(cfg.characters)
+    # 2026-10-10 (cfg.archive_plr): the trainer's learning-potential score per finished episode (stats plr_*) goes to
+    # the archive entry the episode started from (ep_src: episode number -> Parked)
+    plr_on = cfg.archive_plr > 0 and not evaluation
+    plr_seen = [0.0]
+    ep_src = {}
     char_rng = np.random.default_rng([cfg.seed, index, 17])   # its own: the episodes' rng draws stay as without
     # every room change is parked as the restore point of what happens in that room
     rebase = teaching or branching or v2on
@@ -558,6 +563,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 bosses = [j for j in pool if archive[j].info.get('boss')]
                 if len(bosses) <= cfg.archive_size // 2 and len(bosses) < len(archive):
                     pool = [j for j in pool if not archive[j].info.get('boss')]
+            if cfg.archive_plr > 0:   # 2026-10-10: the lowest learning-potential score goes first (unscored: kept)
+                scored = [j for j in pool if archive[j].info.get('score') is not None]
+                if scored:
+                    pool = [min(scored, key=lambda j: archive[j].info['score'])]
             victim = max(pool, key=lambda j: (archive[j].info['uses'], -j))
             archive.pop(victim).release()
         archive.append(parked)
@@ -1281,7 +1290,22 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             elif episodes_left <= 0:
                 mine[ST['extra_episodes']] += 1
             from_archive = bool(archive) and not evaluation and rng.random() < cfg.archive_prob
-            if from_archive and cfg.archive_deep != 1:   # 2026-10-08: entries weighted archive_deep^(floor - 1)
+            if plr_on and mine[ST['plr_episode']] != plr_seen[0]:   # 2026-10-10: the trainer's score of an episode
+                plr_seen[0] = mine[ST['plr_episode']]
+                p_src = ep_src.pop(int(plr_seen[0]), None)
+                if p_src is not None:
+                    sc, old_sc = float(mine[ST['plr_score']]), p_src.info.get('score')
+                    p_src.info['score'] = sc if old_sc is None else 0.5 * old_sc + 0.5 * sc
+                for k_ in [k_ for k_ in ep_src if k_ < plr_seen[0] - 64]:   # (episodes the trainer never scored)
+                    ep_src.pop(k_, None)
+            if from_archive and plr_on:   # 2026-10-10: drawn by the rank of the score, unscored entries first
+                order = sorted(range(len(archive)), key=lambda j: (archive[j].info.get('score') is not None,
+                                                                 -(archive[j].info.get('score') or 0.0)))
+                w = np.zeros(len(archive))
+                for rank_, j in enumerate(order):
+                    w[j] = (rank_ + 1) ** (-cfg.archive_plr)
+                src = archive[int(rng.choice(len(archive), p=w / w.sum()))]
+            elif from_archive and cfg.archive_deep != 1:   # 2026-10-08: entries weighted archive_deep^(floor - 1)
                 w = np.array([float(cfg.archive_deep) ** ((a.info.get('stage') or 1) - 1) for a in archive])
                 src = archive[int(rng.choice(len(archive), p=w / w.sum()))]
             else:
@@ -1332,6 +1356,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['forks']] += 1
             episodes_left -= 1
             src.info['uses'] += 1
+            if plr_on:
+                ep_src[episode_n + 1] = src   # (episode_n is incremented just below)
             mine[ST['archive_starts']] += from_archive
             episode_n += 1
             seed_now = src.info['seed']

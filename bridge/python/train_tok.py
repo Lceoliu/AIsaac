@@ -225,6 +225,10 @@ class Episodes:
     worker's open decision, episode ends and their statistics, the action under way."""
 
     def __init__(self, workers, rw, floor, run=False, items=False):
+        # 2026-10-10 (archive_plr): per worker the actor's value at the episode's first record, its discounted return
+        # and the number of decisions closed; plr = (stats array, ST, gamma) when the trainer reports the scores
+        self.v0, self.gret, self.steps = np.zeros(workers), np.zeros(workers), np.zeros(workers, np.int64)
+        self.plr = None
         self.rw, self.floor, self.run, self.items = rw, floor or run, run, items
         self.end_bonus = rw['exit'] if self.floor else rw['clear']
         self.ret, self.hurt, self.damage = np.zeros(workers), np.zeros(workers), np.zeros(workers)
@@ -296,6 +300,12 @@ class Episodes:
             roll.reward[w, kk], roll.terminal[w, kk] = reward, (d != 0) & (d != DONE_BRANCH)
             roll.open[w] = -1
             self.ret[w] += reward
+            if self.plr is not None:   # 2026-10-10 (archive_plr)
+                stats_, ST_, gamma_ = self.plr
+                first_dec = self.steps[w] == 0
+                self.v0[w[first_dec]] = roll.value[w[first_dec], kk[first_dec]]
+                self.gret[w] += (gamma_ ** self.steps[w]) * reward
+                self.steps[w] += 1
             self.hurt[w] += hu
             self.damage[w] += dmg
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
@@ -352,6 +362,14 @@ class Episodes:
             self.ret[e], self.hurt[e], self.damage[e], self.rooms[e], self.boss[e] = 0.0, 0.0, 0.0, 0, 0
             self.extra[e] = 0
             self.healed[e], self.gathered[e] = 0.0, 0.0
+            if self.plr is not None:   # 2026-10-10 (archive_plr): the score of each finished ordinary episode
+                stats_, ST_, gamma_ = self.plr
+                for j in np.flatnonzero(ended):
+                    i, r = int(idx[j]), rows[j]
+                    if r['lab'] == 0 and r['branch'] == 0 and self.steps[i] > 0:
+                        stats_[i, ST_['plr_score']] = abs(float(self.gret[i]) - float(self.v0[i]))
+                        stats_[i, ST_['plr_episode']] = float(r['episode'])
+                self.v0[e], self.gret[e], self.steps[e] = 0.0, 0.0, 0
             boot = done == DONE_BRANCH
             pending[idx[ended & ~boot]] = 0   # (a truncated branch end keeps it: its record is evaluated, see below)
         else:
@@ -476,6 +494,10 @@ def main():
     p.add_argument('--archive-boss', type=float, default=0.0,
                    help='floor mode: share of the archive starts taken from boss-room entries (they are always parked '
                         'and evicted last); 0: the archive as before')
+    p.add_argument('--archive-plr', type=float, default=0.0,
+                   help='run / floor modes, 2026-10-10: archive entries drawn by the rank of their learning-potential '
+                        'score (EMA of |discounted return - V(first record)| of the episodes started from them), weight '
+                        'rank^(-value); the lowest score evicted first. 1 = 1/rank; 0 = off (uniform, as before)')
     p.add_argument('--archive-deep', type=float, default=1.0,
                    help='run mode: archive entries drawn with weight archive_deep^(floor - 1), the shallowest floor '
                         'evicted first (1: uniform, as before)')
@@ -839,7 +861,7 @@ def main():
                            lab_share=args.lab_share if lab_on else 0.0, lab_seconds=args.lab_seconds,
                            lab_specs=lab_specs, lab_panel=lab_panel, lab_owner=lab_owner,
                            start_build_prob=args.start_build_prob if floor else 0.0, start_build_max=args.start_build_max,
-                           start_build_items=args.lab_items, archive_deep=args.archive_deep,
+                           start_build_items=args.lab_items, archive_deep=args.archive_deep, archive_plr=args.archive_plr,
                            stat_aug_prob=args.stat_aug_prob if floor else 0.0, stat_aug=args.stat_aug,
                            characters=args.characters if floor else '',
                            teacher_v2=bool(args.teacher_v2) and floor,
@@ -1766,6 +1788,8 @@ def main():
                 row['start_builds'] = float(stats[:, ST['start_builds']].sum())
         if cfg.stat_aug_prob > 0:   # 2026-10-08: stat augmentations applied so far (worker totals)
             row['stat_augs'] = float(stats[:, ST['stat_augs']].sum())
+        if cfg.archive_plr > 0:   # 2026-10-10: mean score of the last reported episodes
+            row['plr_score'] = float(stats[:, ST['plr_score']].mean())
         if cfg.teacher_death_depths:   # 2026-10-09: fatal hurts searched / with a safe move / their seconds (totals)
             for k_d in ('death_searches', 'death_avoidable', 'death_s'):
                 row[k_d] = float(stats[:, ST[k_d]].sum())
@@ -1915,6 +1939,8 @@ def main():
     # ------------------------------------------------------------------ actor (the main thread)
     pending = np.zeros((n, nh), np.int64)            # the action under way per worker
     book = Episodes(n, rw, floor, run=run, items=items)
+    if cfg.archive_plr > 0:   # 2026-10-10: the trainer reports each episode's learning-potential score to its worker
+        book.plr = (sampler.stats, ST, args.gamma)
     if cfg.stat_aug_prob > 0:   # 2026-10-08: the start stats of every episode into episodes.jsonl
         book.stats0 = {}
     if char_ids:   # 2026-10-08: the character of every episode into episodes.jsonl (char0)

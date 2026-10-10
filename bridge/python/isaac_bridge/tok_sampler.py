@@ -121,6 +121,9 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          'start_builds', 'stat_augs',
          # 2026-10-08 (cfg.characters): floor starts built as a character other than Isaac
          'char_starts',
+         # 2026-10-10 (cfg.archive_plr): written by the TRAINER, read by the worker: the number of the worker's last
+         # finished episode and its learning-potential score |discounted return - value at its first record|
+         'plr_episode', 'plr_score',
          # 2026-10-09 (death teacher): fatal hurts searched, of them with a safe move found, their search seconds
          'death_searches', 'death_avoidable', 'death_s',
          # 2026-10-10 (teacher v2, tok_teacher2.py; tok_floor only, zero unless cfg.teacher_v2): points searched (and of
@@ -256,6 +259,10 @@ class TokSamplerConfig:
     # 2026-10-08: deeper floors first: archive entries are drawn with weight archive_deep^(floor - 1) and the
     # shallowest floor's entries are evicted first (1: uniform, as before)
     archive_deep: float = 1.0
+    # 2026-10-10 (SCALING_THESIS.md S5b, regret curriculum, the cheap proxy = Prioritized Level Replay): archive
+    # entries drawn by the rank of their score (an EMA of |discounted return - V(first record)| of the episodes started
+    # from them; unscored entries rank first), weight rank^(-archive_plr); the lowest score is evicted first. 0: off
+    archive_plr: float = 0.0
     # 2026-10-08 (character randomisation; floor / run modes): the PlayerTypes a floor start restarts the run as, with
     # weights ("0,1,2" or "0:4,7:1"; tok_floor.parse_characters); each floor start's character is drawn from the worker's
     # own rng (evaluation: from the seed); archive starts keep the character of the episode they were parked from.
