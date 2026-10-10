@@ -184,7 +184,6 @@ class TokSamplerConfig:
     # C77 on the HPC, collect 1.4 -> 12 s); teacher_share then bounds the thread's search time outside the updates.
     # 0 = as before (searches during the updates and, within teacher_share, in the worker's own loop)
     teacher_thread: int = 0
-    teacher_fork: int = 0                        # 2026-10-10: with teacher_thread, each hurt search in a forked child
     # 2026-10-10 (teacher v2, tok_teacher2.py; floor / run modes, needs teacher_thread; off = nothing changes): whole
     # branches from decision points (hurts, deaths, random records) with movement intents x the actor's per-step answers
     # (through a lane of the worker), the best one's every step an imitation record when it beats the episode's own

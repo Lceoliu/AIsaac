@@ -315,11 +315,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     qlock = threading.RLock()   # 2026-10-10: the queue is shared with the search thread (cfg.teacher_thread)
     search_errors = [0]
 
-    def search(item, pair=True):
+    def search(item):
         base_, reseed_, applied_, hurt_at, seed_, episode_, offset, fatal = item
         items = [item]   # teacher_pair: the next queued hurts of the same episode and room share the restore
         with qlock:
-            while pair and cfg.teacher_pair and queue and queue[-1][0] is base_ and queue[-1][2] is applied_ and \
+            while cfg.teacher_pair and queue and queue[-1][0] is base_ and queue[-1][2] is applied_ and \
                     queue[-1][7] == fatal:   # (a fatal hurt is searched on its own: other depths and margin)
                 items.append(queue.pop())
         t0 = time.perf_counter()
@@ -458,62 +458,6 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     # far goes first)
     threaded = (teaching or v2on) and bool(cfg.teacher_thread)
     search_stop = threading.Event()
-    # 2026-10-10 (cfg.teacher_fork, with the thread): each hurt search runs in a forked child of the worker instead of
-    # the thread itself. The thread's numpy / encode work held the GIL for milliseconds at a time (C77 on the HPC: the
-    # worker's own encode 0.2 -> 8 ms per record while a search ran, throughput 1,800 -> 600x). The child gets its own
-    # parked copy of the restore point (one fork command on the shared clone, under its lock), the parent lets go of
-    # that copy's connection without closing the clone, the child writes the teacher records into the shared ring
-    # (one child per worker at a time: the ring index stays consistent) and _exits; the thread only waits for it.
-    forking = threaded and bool(cfg.teacher_fork)
-
-    def search_forked():
-        j = gate.take()
-        if j is None:
-            return False
-        try:
-            with qlock:
-                item = queue.pop() if queue else None
-            if item is None:
-                return True
-            base_ = item[0]
-            try:
-                copy = Parked(base_.fork(tag='search', alarm=0), **base_.info)
-            except (BridgeError, OSError, RuntimeError, ValueError) as exc:
-                mine[ST['errors']] += 1
-                base_.release()
-                if search_errors[0] < 5:
-                    search_errors[0] += 1
-                    print(f'tok floor worker {index}: search copy failed: {type(exc).__name__}: {str(exc)[:200]}',
-                          file=sys.stderr, flush=True)
-                return True
-            base_.release()
-            child_item = (copy,) + tuple(item[1:])
-            pid = os.fork()
-            if pid == 0:   # the child: the search on its own copy, records into the shared ring, then gone
-                code = 0
-                try:
-                    search(child_item, pair=False)
-                except BaseException:
-                    code = 1
-                finally:
-                    os._exit(code)
-            # the parent: its end of the copy's connection closed without the close command (the clone lives on
-            # with the child's end), then the child waited for (the thread blocks here; the GIL is free)
-            try:
-                sock = copy.clone._sock
-                copy.clone._sock = None
-                if sock is not None:
-                    sock.close()
-            except (AttributeError, OSError):
-                pass
-            copy.clone = None
-            Parked.live.discard(copy)
-            _, status = os.waitpid(pid, 0)
-            if status != 0:
-                mine[ST['errors']] += 1
-        finally:
-            gate.give(j)
-        return True
 
     def search_loop():
         while not search_stop.is_set():
@@ -527,7 +471,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 if v2_queue and (not queue or mine[ST['v2_s']] <= mine[ST['teach_s']]):
                     ok = v2_gated()
                 else:
-                    ok = search_forked() if forking else search_gated()
+                    ok = search_gated()
                 if not ok:
                     time.sleep(0.01)
             except Exception as exc:   # (never the worker's death: logged, the next item)
@@ -535,10 +479,6 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 print(f'tok floor worker {index}: search thread: {type(exc).__name__}: {str(exc)[:200]}',
                       file=sys.stderr, flush=True)
     search_thread = threading.Thread(target=search_loop, name=f'search{index}', daemon=True) if threaded else None
-    if threaded:
-        # 2026-10-10: the interpreter's default switch interval (5 ms) made the main thread wait that long for the GIL
-        # every time the search thread held it (C77 on the HPC: encode 0.2 -> 7 ms per record, throughput 1,800 -> 600x)
-        sys.setswitchinterval(float(os.environ.get('ISAAC_RL_SWITCH_INTERVAL', '0.0002')))
 
     def receive():
         """The server's answer. While the trainer updates, queued searches run instead of waiting (without the

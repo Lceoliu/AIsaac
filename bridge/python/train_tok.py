@@ -521,9 +521,6 @@ def main():
                         'Default: off (the fatal hurt is an ordinary hurt)')
     p.add_argument('--teacher-death-margin', type=int, default=15,
                    help='decisions after the fatal step a held move must stay unhurt (2 s); 0: --teacher-margin')
-    p.add_argument('--teacher-fork', type=int, default=0,
-                   help='2026-10-10, with --teacher-thread 1: each hurt search runs in a forked child of the worker (no '
-                        'GIL contention with the episode; one child per worker at a time)')
     p.add_argument('--teacher-thread', type=int, default=0,
                    help='2026-10-10, floor / run modes: 1 = the searches run in a thread of the worker (its episode '
                         'never waits for a search; --teacher-share bounds the search time outside the updates); 0 = as '
@@ -820,7 +817,7 @@ def main():
                            teacher_slots=args.teacher_slots, teacher_skip_known=bool(args.teacher_skip_known),
                            teacher_pair=bool(args.teacher_pair),
                            teacher_death_depths=tuple(int(v) for v in args.teacher_death_depths.split(',') if v.strip())
-                           if floor else (), teacher_death_margin=args.teacher_death_margin, teacher_thread=args.teacher_thread, teacher_fork=args.teacher_fork,
+                           if floor else (), teacher_death_margin=args.teacher_death_margin, teacher_thread=args.teacher_thread,
                            mode=args.mode,
                            floor_seconds=args.floor_seconds, floor_stall_seconds=args.floor_stall_seconds,
                            archive_size=args.archive_size, archive_prob=args.archive_prob,
