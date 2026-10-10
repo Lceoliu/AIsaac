@@ -3,7 +3,7 @@ export ABP_HOME=/101063/AIsaac/ws1
 export HOME=$ABP_HOME/home TMPDIR=$ABP_HOME/tmp CUDA_CACHE_PATH=$ABP_HOME/cache
 export ABP_BRIDGE_LUA=$ABP_HOME/bridge/abp_bridge.lua
 export PATH=/opt/aisaac-env/bin:$PATH
-export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export OMP_NUM_THREADS=${OMP_NUM_THREADS:-8} MKL_NUM_THREADS=${OMP_NUM_THREADS:-8} OPENBLAS_NUM_THREADS=${OMP_NUM_THREADS:-8}
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export DISPLAY=:93
 # one Xvfb for every instance (the engine needs a GLX-capable display at start-up; the stub list skips the rendering)
