@@ -7213,6 +7213,20 @@ C68 的训练数据 71% 的决策从一层开始、死亡都在二、三层：�
 
 - 13:30：约 **267×**（C75 480×：车道推理的代价），0 个 Traceback；3,000 小时约 11 小时。
 
+### C84 教师 v2 的规模对照：C77 配置 + 教师 v2，HPC128（2026-10-10，进行中）
+
+**实验目的**
+
+教师 v2 在主机上（C83，约 300×）要 11 小时才有 3,000 小时；用户 10-10 17:15 新给的 HPC128（128 核配额、H20，和 HPC160 共用 `/101063` 存储但进程独立）跑同配置的放大版，和 C77 在同等游戏小时上做 A/B：验收指标 `v2_prior` 上升、`v2_improving_share` 下降，128 种子多层评估对 C77 同点（0.9–1.05 层）。
+
+**实验方法**
+
+- **沙箱** `/101063/AIsaac/ws3`：仓库 `abplus-training`（6b299c3）的 `git worktree` + `python` / `abplus` 符号链接，`tools/` 由 `src/bridge/engine` 编译（`.so` 808c88f2），Xvfb `:94`，`hpc_guard.sh`（配额 128）循环中。冒烟（16 worker，3 游戏小时）：0 Traceback、0 errors，37 个 v2 点、3,456 条记录、车道调用 14,237、234×（`infer` 5.4 ms：车道推理压在 actor 上）。
+- **运行**：`ws3/runs/c84-teacher2`（脚本 `ws3/hpc_c84.sh run`，17:4x PC 时间起，端口 43000 / 评估 43300），48 worker（配额 128），其余 = C77 第 10 次重启的配置（`--rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 --teacher-death-depths 2,4,8,16,32 --teacher-thread 1 --teacher-fork 1 --teacher-share 0.1 --teacher-slots 6 --poll-wait 0.003`）加 `--teacher-v2 1 --teacher-v2-random 60`，`--resume` C67 最终，12,000 游戏小时。
+- **评估**：每个检查点 128 种子（`hpc_c84.sh watch`）。
+
+**实验结果**（进行中）
+
 ## 待决定与已知问题
 
 - **等用户决定**：

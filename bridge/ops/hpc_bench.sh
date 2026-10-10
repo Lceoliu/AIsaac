@@ -4,7 +4,7 @@
 N=${1:-64}; H=${2:-20}; shift 2
 source /101063/AIsaac/ws1/hpc_env.sh
 R=$ABP_HOME/runs
-OUT=$R/bench-w$N
+OUT=$R/bench-w$N${TAG:-}
 PYTHONPATH=. timeout 3600 $PY train_tok.py --groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --workers $N \
   --game-hours $H --epochs 3 --checkpoint-every 100000 --teacher --teacher-queue 12 --archive-size 12 --micro 1024 \
   --lr 1e-4 --lr-final 1e-4 --episodes-per-state 8 "$@" \
