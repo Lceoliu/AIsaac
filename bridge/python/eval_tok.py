@@ -18,6 +18,8 @@ usage (from the bridge's python dir, PYTHONPATH=.):
   python eval_tok.py --checkpoint <run>/checkpoints/last.pt --groups-file ../abplus/catalog/scaling2_groups.json \
       --groups normal:6,boss:4,normal_big:2 --seeds 2147490000:128 --greedy --out <dir>
   python eval_tok.py --checkpoint ... --groups-file ... --mode floor --workers 8 --seeds 2147490000:128 --out <dir>
+  --characters "0,7,13" (2026-10-08, floor / run modes): the floors are played as these PlayerTypes, each seed's
+  character drawn from the seed alone (tok_floor.character_of_seed); summary 'by_character'. Default: Isaac.
   --record <dir>: every record of every episode and the actions decided, one npz per episode (tok_record.py; the HTML
   replay viewer: abplus_tok_replay_build.py).
 """
@@ -60,11 +62,23 @@ def main():
     p.add_argument('--dump-final', action='store_true', help="save each episode's last record (final_rows.npy)")
     p.add_argument('--record', default='', help='save every record of every episode (and the actions decided) to '
                                                 'this directory, one compressed npz per episode (tok_record.py)')
+    p.add_argument('--characters', default='',
+                   help='2026-10-08, floor / run modes: the PlayerTypes the floors are played as (train_tok '
+                        '--characters syntax; each seed\'s character is drawn from the seed alone: '
+                        'tok_floor.character_of_seed). Default: Isaac')
     args = p.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     run = args.mode == 'run'
     floor = args.mode == 'floor' or run
+    if args.characters:   # 2026-10-08 (a bad spec fails here, not in the workers)
+        if not floor:
+            p.error('--characters needs --mode floor/run')
+        from isaac_bridge.tok_floor import parse_characters
+        try:
+            parse_characters(args.characters)
+        except ValueError as exc:
+            p.error(str(exc))
     ck = None
     if not args.random:
         ck = torch.load(args.checkpoint, map_location=os.environ.get('TOK_EVAL_DEVICE', 'cpu'))
@@ -88,6 +102,7 @@ def main():
                            episode_seconds=args.episode_seconds, eval_seeds=eval_seeds, name=args.name, port=args.port,
                            mode=args.mode, floor_seconds=args.floor_seconds,
                            floor_stall_seconds=args.floor_stall_seconds, items=items, run_seconds=args.run_seconds,
+                           characters=args.characters if floor else '',
                            bridge_lua=default_bridge_lua(), preload=default_preload(),
                            stub_list=stub if Path(stub).is_file() else '', nice=0)
     # CPU by default: a second CUDA process on the trainer's GPU can crash a trainer that replays CUDA graphs (B12)
@@ -115,6 +130,7 @@ def main():
     hurt = np.zeros(n)
     events = np.zeros((n, 3), np.int64)   # rooms cleared, rooms entered, boss rooms cleared
     extra = np.zeros((n, 6), np.int64)    # run / items: exits, collectibles, active uses, pill uses, stage0, deepest
+    char0 = np.zeros(n, np.int64)         # 2026-10-08: ROW pchar at the episode's first record
     episodes = []
     finals = []
     t0 = time.perf_counter()
@@ -130,6 +146,7 @@ def main():
                 if r['first']:
                     pending[i], hurt[i], events[i], extra[i] = 0, 0.0, 0, 0
                     extra[i, 4] = extra[i, 5] = int(r['stage'])
+                    char0[i] = int(r['pchar'])
                 if recorder is not None:
                     recorder.add(i, r)
                 hurt[i] += float(r['hurt'])
@@ -146,6 +163,8 @@ def main():
                     if run or items:
                         episodes[-1].update(exits=int(extra[i, 0]), items=int(extra[i, 1]), uses=int(extra[i, 2]),
                                             pills=int(extra[i, 3]), stage0=int(extra[i, 4]), stage=int(extra[i, 5]))
+                    if args.characters:   # 2026-10-08
+                        episodes[-1]['char0'] = int(char0[i])
                     if recorder is not None:
                         recorder.finish(i, episodes[-1])
                     continue
@@ -211,6 +230,17 @@ def main():
                 clear_without_hit=sum(e['hurt'] == 0 for e in wins) / m,
                 seconds_per_clear=(sum(e['decisions'] for e in wins) / max(len(wins), 1)
                                    * args.frames_per_decision / 30))
+        if args.characters:   # 2026-10-08: per character (the PlayerType of the episodes' first records)
+            summary['characters'] = args.characters
+            summary['by_character'] = {}
+            for c_id in sorted({e['char0'] for e in episodes}):
+                eps = [e for e in episodes if e['char0'] == c_id]
+                m = len(eps)
+                summary['by_character'][str(c_id)] = dict(
+                    episodes=m, win=sum(e['done'] == 1 for e in eps) / m, death=sum(e['done'] == 2 for e in eps) / m,
+                    timeout=sum(e['done'] == 3 for e in eps) / m, boss_clear=sum(e['boss'] > 0 for e in eps) / m,
+                    rooms_cleared=sum(e['rooms'] for e in eps) / m, hurt=sum(e['hurt'] for e in eps) / m,
+                    **({'floors_cleared': sum(e['exits'] for e in eps) / m} if run else {}))
         (out / 'episodes.json').write_text(json.dumps(episodes))
         if recorder is not None:
             recorder.close()

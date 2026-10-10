@@ -78,7 +78,9 @@ def compare(ep, t, row, offsets):
         bad.append('player')
     n = int(row['n_ent'][0])
     ent, ids = recorded_row(ep, t, offsets)
-    if n != len(ent) or not np.array_equal(row['ent'][0][:n], ent) or not np.array_equal(row['ent_id'][0][:n], ids):
+    # (a recording from before 2026-10-08 has tok_obs.ENT_F0 = 33 entity columns: those are compared)
+    if n != len(ent) or not np.array_equal(row['ent'][0][:n, :ent.shape[1]], ent) or \
+            not np.array_equal(row['ent_id'][0][:n], ids):
         bad.append('ent')
     k = int(row['n_doors'][0])
     if k != int(ep['n_doors'][t]) or not np.array_equal(row['doors'][0][:k], ep['doors'][t][:k]):

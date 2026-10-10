@@ -37,8 +37,9 @@ def key(raw, lf0):
     head = raw[:4] + struct.pack('<I', lf - lf0) + raw[8:]
     if not flags & 2:
         return hashlib.sha256(head).hexdigest()
-    off = 96 + 288 * n_players + 16 * n_doors
-    off += 2 + 108 * struct.unpack_from('<H', raw, off)[0]
+    from isaac_bridge.abplus_lean import DOOR, ENTITY, PLAYER   # (2026-10-08: the record sizes of the decoder)
+    off = 96 + PLAYER.itemsize * n_players + DOOR.itemsize * n_doors
+    off += 2 + ENTITY.itemsize * struct.unpack_from('<H', raw, off)[0]
     for _ in range(n_lasers):
         off += 65 + 16 * struct.unpack_from('<q', raw, off + 57)[0]
     version, n = struct.unpack_from('<II', raw, off)

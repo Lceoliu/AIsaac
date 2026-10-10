@@ -1,4 +1,4 @@
-"""Decoder of abp_bridge.lua's lean observation (abp-0.2.15, pack_lean): fixed-layout records read as numpy arrays.
+"""Decoder of abp_bridge.lua's lean observation (abp-0.2.17, pack_lean): fixed-layout records read as numpy arrays.
 
 The layout is described above pack_lean in abp_bridge.lua. A LeanObs holds views into the payload (players, doors and
 entities as structured arrays) and the terrain dict of the last terrain block (cached per connection, as ObsDecoder
@@ -19,7 +19,10 @@ PLAYER_FIELDS = ('id', 'x', 'y', 'vx', 'vy', 'size', 'hearts', 'max_hearts', 'so
                  'head_dir', 'fire_dir', 'move_dir', 'aframe', 'dead', 'fire_delay', 'damage_cooldown',
                  # 2026-10-07 (charge): the charge counter of a charged weapon (Entity_Player +0x2634) and the weapon
                  # types as bits (bit w: HasWeaponType(w), w = 0 .. 10); see pack_lean in abp_bridge.lua
-                 'charge', 'weapons')
+                 'charge', 'weapons',
+                 # 2026-10-08 (abp-0.2.17, character randomisation): the PlayerType (p:GetPlayerType(): 0 Isaac,
+                 # 1 Magdalene, ... 17 The Soul; AB+ resources/scripts/enums.lua PlayerType)
+                 'ptype')
 PLAYER = np.dtype([(name, '<f8') for name in PLAYER_FIELDS])
 DOOR = np.dtype([('slot', 'u1'), ('open', 'u1'), ('locked', 'u1'), ('seen', 'u1'), ('x', '<f4'), ('y', '<f4'),
                  ('target_type', '<i4')])
@@ -27,14 +30,19 @@ ENTITY = np.dtype([('id', '<i8'), ('type', '<i4'), ('variant', '<i4'), ('subtype
                    ('vx', '<f8'), ('vy', '<f8'), ('size', '<f4'), ('size_mx', '<f4'), ('size_my', '<f4'),
                    ('coll', '<i4'), ('gcoll', '<i4'), ('cdmg', '<f4'), ('aframe', '<i4'), ('age', '<i4'),
                    ('kind', 'u1'), ('flags', 'u1'), ('anim', 'u1'), ('flip', 'u1'), ('champion', '<i4'),
-                   ('hp', '<f4'), ('height', '<f4'), ('fall', '<f4'), ('scale', '<f4')])
+                   ('hp', '<f4'), ('height', '<f4'), ('fall', '<f4'), ('scale', '<f4'),
+                   # abp-0.2.16 (2026-10-08): the flag word (a tear's / laser's TearFlags, a projectile's
+                   # ProjectileFlags; 0 otherwise) and a laser's geometry (0 otherwise): cos / sin of its angle,
+                   # LaserLength (0: unbounded), end point (a circle laser's position), Radius, circle
+                   ('tflags', '<i8'), ('l_cos', '<f4'), ('l_sin', '<f4'), ('l_len', '<f4'), ('l_ex', '<f4'),
+                   ('l_ey', '<f4'), ('l_radius', '<f4'), ('l_circle', '<i4')])
 MAP_ROOM = np.dtype([('idx', 'u1'), ('shape', 'u1'), ('type', 'u1'), ('display', 'u1'), ('flags', 'u1')])
 # 2026-10-06 (items, Phase A): the inventory block (flag 16, abp_bridge.lua lean_inventory; only when the bridge's
 # lean_items is on): a header, then n x (collectible id, count), newest first
 INV_HEADER = struct.Struct('<BBHHHHHHI')   # n, layout version, active MaxCharges, trinket 0, trinket 1, pill color,
 #                                           pill effect + 1 when identified (0 unknown / none), card, curses
 INV_ITEM = np.dtype([('id', '<u2'), ('count', 'u1')])
-assert PLAYER.itemsize == 304 and DOOR.itemsize == 16 and ENTITY.itemsize == 108 and MAP_ROOM.itemsize == 5
+assert PLAYER.itemsize == 312 and DOOR.itemsize == 16 and ENTITY.itemsize == 144 and MAP_ROOM.itemsize == 5
 assert INV_HEADER.size == 18 and INV_ITEM.itemsize == 3
 _LASER = struct.Struct('<qBddddddq')
 # entity kinds (as format 2) and flag bits

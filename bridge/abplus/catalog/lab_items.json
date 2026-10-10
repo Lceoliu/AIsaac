@@ -1,0 +1,5728 @@
+{
+"about": "AB+ v1.06 collectibles eligible for the build lab (tok_lab.py): items.xml passive/active/familiar entries that appear in at least one normal-mode item pool of itempools.xml (greed* pools ignored). Generated 2026-10-08 from analysis/abplus-linux/resources/extract/afterbirthp/resources.",
+"items": [
+{
+"id": 1,
+"name": "The Sad Onion",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 2,
+"name": "The Inner Eye",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 3,
+"name": "Spoon Bender",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed tearcolor tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 4,
+"name": "Cricket's Head",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage shotspeed",
+"pools": [
+"goldenChest",
+"treasure"
+]
+},
+{
+"id": 5,
+"name": "My Reflection",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag shotspeed range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 6,
+"name": "Number One",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay range tearcolor",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 7,
+"name": "Blood of the Martyr",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 8,
+"name": "Brother Bobby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 10,
+"name": "Halo of Flies",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"keyMaster",
+"treasure"
+]
+},
+{
+"id": 11,
+"name": "1up!",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret"
+]
+},
+{
+"id": 12,
+"name": "Magic Mushroom",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage range speed",
+"pools": [
+"boss",
+"treasure"
+]
+},
+{
+"id": 13,
+"name": "The Virus",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"demonBeggar",
+"treasure"
+]
+},
+{
+"id": 14,
+"name": "Roid Rage",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range speed",
+"pools": [
+"boss",
+"demonBeggar",
+"treasure"
+]
+},
+{
+"id": 15,
+"name": "<3",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss",
+"treasure"
+]
+},
+{
+"id": 16,
+"name": "Raw Liver",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret"
+]
+},
+{
+"id": 17,
+"name": "Skeleton Key",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret"
+]
+},
+{
+"id": 19,
+"name": "Boom!",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"challenge",
+"treasure"
+]
+},
+{
+"id": 20,
+"name": "Transcendence",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "flying",
+"pools": [
+"secret"
+]
+},
+{
+"id": 21,
+"name": "The Compass",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"shop"
+]
+},
+{
+"id": 22,
+"name": "Lunch",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"boss",
+"dungeon"
+]
+},
+{
+"id": 23,
+"name": "Dinner",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"boss",
+"dungeon"
+]
+},
+{
+"id": 24,
+"name": "Dessert",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"boss",
+"dungeon"
+]
+},
+{
+"id": 25,
+"name": "Breakfast",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"boss",
+"dungeon"
+]
+},
+{
+"id": 26,
+"name": "Rotten Meat",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"boss",
+"dungeon"
+]
+},
+{
+"id": 27,
+"name": "Wooden Spoon",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"boss"
+]
+},
+{
+"id": 28,
+"name": "The Belt",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"boss"
+]
+},
+{
+"id": 29,
+"name": "Mom's Underwear",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range",
+"pools": [
+"boss",
+"dungeon"
+]
+},
+{
+"id": 30,
+"name": "Mom's Heels",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range",
+"pools": [
+"boss",
+"dungeon"
+]
+},
+{
+"id": 31,
+"name": "Mom's Lipstick",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range",
+"pools": [
+"boss",
+"dungeon"
+]
+},
+{
+"id": 32,
+"name": "Wire Coat Hanger",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"boss"
+]
+},
+{
+"id": 33,
+"name": "The Bible",
+"kind": "active",
+"maxcharges": 6,
+"cache": "flying",
+"pools": [
+"angel",
+"library",
+"shop"
+]
+},
+{
+"id": 34,
+"name": "The Book of Belial",
+"kind": "active",
+"maxcharges": 3,
+"cache": "damage",
+"pools": [
+"devil",
+"library"
+]
+},
+{
+"id": 35,
+"name": "The Necronomicon",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"devil",
+"library",
+"secret"
+]
+},
+{
+"id": 36,
+"name": "The Poop",
+"kind": "active",
+"maxcharges": 1,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 37,
+"name": "Mr. Boom",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"challenge",
+"treasure"
+]
+},
+{
+"id": 38,
+"name": "Tammy's Head",
+"kind": "active",
+"maxcharges": 1,
+"cache": "",
+"pools": [
+"goldenChest"
+]
+},
+{
+"id": 39,
+"name": "Mom's Bra",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"dungeon",
+"treasure"
+]
+},
+{
+"id": 40,
+"name": "Kamikaze!",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 41,
+"name": "Mom's Pad",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"dungeon",
+"treasure"
+]
+},
+{
+"id": 42,
+"name": "Bob's Rotten Head",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"goldenChest",
+"treasure"
+]
+},
+{
+"id": 44,
+"name": "Teleport!",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 45,
+"name": "Yum Heart",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 46,
+"name": "Lucky Foot",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "luck",
+"pools": [
+"beggar",
+"treasure"
+]
+},
+{
+"id": 47,
+"name": "Doctor's Remote",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 48,
+"name": "Cupid's Arrow",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 49,
+"name": "Shoop da Whoop!",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 50,
+"name": "Steven",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"goldenChest"
+]
+},
+{
+"id": 51,
+"name": "Pentagram",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"boss",
+"curse",
+"devil"
+]
+},
+{
+"id": 52,
+"name": "Dr. Fetus",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 53,
+"name": "Magneto",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 54,
+"name": "Treasure Map",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"shop"
+]
+},
+{
+"id": 55,
+"name": "Mom's Eye",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"dungeon",
+"treasure"
+]
+},
+{
+"id": 56,
+"name": "Lemon Mishap",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 57,
+"name": "Distant Admiration",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"keyMaster",
+"treasure"
+]
+},
+{
+"id": 58,
+"name": "Book of Shadows",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"library",
+"treasure"
+]
+},
+{
+"id": 60,
+"name": "The Ladder",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"shop"
+]
+},
+{
+"id": 62,
+"name": "Charm of the Vampire",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 63,
+"name": "The Battery",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 64,
+"name": "Steam Sale",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 65,
+"name": "Anarchist Cookbook",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"library",
+"treasure"
+]
+},
+{
+"id": 66,
+"name": "The Hourglass",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 67,
+"name": "Sister Maggy",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 68,
+"name": "Technology",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 69,
+"name": "Chocolate Milk",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 70,
+"name": "Growth Hormones",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage speed",
+"pools": [
+"boss",
+"demonBeggar"
+]
+},
+{
+"id": 71,
+"name": "Mini Mush",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 72,
+"name": "Rosary",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 74,
+"name": "A Quarter",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret",
+"treasure"
+]
+},
+{
+"id": 75,
+"name": "PHD",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop",
+"treasure"
+]
+},
+{
+"id": 76,
+"name": "X-Ray Vision",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 77,
+"name": "My Little Unicorn",
+"kind": "active",
+"maxcharges": 6,
+"cache": "speed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 78,
+"name": "Book of Revelations",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"library",
+"treasure"
+]
+},
+{
+"id": 79,
+"name": "The Mark",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage speed",
+"pools": [
+"curse",
+"devil"
+]
+},
+{
+"id": 80,
+"name": "The Pact",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage firedelay",
+"pools": [
+"curse",
+"devil"
+]
+},
+{
+"id": 81,
+"name": "Dead Cat",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"devil",
+"redChest"
+]
+},
+{
+"id": 82,
+"name": "Lord of the Pit",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "flying speed",
+"pools": [
+"devil"
+]
+},
+{
+"id": 83,
+"name": "The Nail",
+"kind": "active",
+"maxcharges": 6,
+"cache": "speed damage",
+"pools": [
+"devil"
+]
+},
+{
+"id": 84,
+"name": "We Need To Go Deeper!",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"devil",
+"secret"
+]
+},
+{
+"id": 85,
+"name": "Deck of Cards",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"shop",
+"treasure"
+]
+},
+{
+"id": 86,
+"name": "Monstro's Tooth",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 87,
+"name": "Loki's Horns",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 88,
+"name": "Little Chubby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 89,
+"name": "Spider Bite",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 91,
+"name": "Spelunker Hat",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 92,
+"name": "Super Bandage",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss",
+"treasure"
+]
+},
+{
+"id": 93,
+"name": "The Gamekid",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 94,
+"name": "Sack of Pennies",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"goldenChest",
+"secret",
+"treasure"
+]
+},
+{
+"id": 95,
+"name": "Robo-Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 96,
+"name": "Little C.H.A.D.",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 97,
+"name": "The Book of Sin",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"devil",
+"library",
+"treasure"
+]
+},
+{
+"id": 98,
+"name": "The Relic",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 99,
+"name": "Little Gish",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 100,
+"name": "Little Steven",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss",
+"treasure"
+]
+},
+{
+"id": 101,
+"name": "The Halo",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage firedelay range speed",
+"pools": [
+"angel",
+"boss",
+"treasure"
+]
+},
+{
+"id": 102,
+"name": "Mom's Bottle of Pills",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"beggar",
+"demonBeggar",
+"dungeon",
+"shop",
+"treasure"
+]
+},
+{
+"id": 103,
+"name": "The Common Cold",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 104,
+"name": "The Parasite",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 105,
+"name": "The D6",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 106,
+"name": "Mr. Mega",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bossrush",
+"challenge",
+"secret",
+"treasure"
+]
+},
+{
+"id": 107,
+"name": "The Pinking Shears",
+"kind": "active",
+"maxcharges": 6,
+"cache": "familiars",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 108,
+"name": "The Wafer",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 109,
+"name": "Money = Power",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 110,
+"name": "Mom's Contacts",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor tearflag range",
+"pools": [
+"dungeon",
+"treasure"
+]
+},
+{
+"id": 111,
+"name": "The Bean",
+"kind": "active",
+"maxcharges": 1,
+"cache": "",
+"pools": [
+"beggar",
+"treasure"
+]
+},
+{
+"id": 112,
+"name": "Guardian Angel",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 113,
+"name": "Demon Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"demonBeggar",
+"devil",
+"treasure"
+]
+},
+{
+"id": 114,
+"name": "Mom's Knife",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"devil",
+"dungeon",
+"treasure"
+]
+},
+{
+"id": 115,
+"name": "Ouija Board",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag tearcolor",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 116,
+"name": "9 Volt",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 117,
+"name": "Dead Bird",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "familiars",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 118,
+"name": "Brimstone",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"devil"
+]
+},
+{
+"id": 119,
+"name": "Blood Bag",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"goldenChest"
+]
+},
+{
+"id": 120,
+"name": "Odd Mushroom",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage firedelay speed",
+"pools": [
+"secret",
+"treasure"
+]
+},
+{
+"id": 121,
+"name": "Odd Mushroom",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage speed range",
+"pools": [
+"secret",
+"treasure"
+]
+},
+{
+"id": 122,
+"name": "Whore of Babylon",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage speed",
+"pools": [
+"devil"
+]
+},
+{
+"id": 123,
+"name": "Monster Manual",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 124,
+"name": "Dead Sea Scrolls",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 125,
+"name": "Bobby-Bomb",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"challenge",
+"treasure"
+]
+},
+{
+"id": 126,
+"name": "Razor Blade",
+"kind": "active",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"devil"
+]
+},
+{
+"id": 127,
+"name": "Forget Me Now",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret",
+"treasure"
+]
+},
+{
+"id": 128,
+"name": "Forever alone",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"keyMaster",
+"treasure"
+]
+},
+{
+"id": 129,
+"name": "Bucket of Lard",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 131,
+"name": "Bomb Bag",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"challenge",
+"goldenChest",
+"secret",
+"treasure"
+]
+},
+{
+"id": 133,
+"name": "Guppy's Paw",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"devil",
+"redChest"
+]
+},
+{
+"id": 134,
+"name": "Guppy's Tail",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"devil",
+"redChest"
+]
+},
+{
+"id": 135,
+"name": "IV Bag",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"goldenChest"
+]
+},
+{
+"id": 136,
+"name": "Best Friend",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 137,
+"name": "Remote Detonator",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bossrush",
+"challenge",
+"shop",
+"treasure"
+]
+},
+{
+"id": 138,
+"name": "Stigmata",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 139,
+"name": "Mom's Purse",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"dungeon",
+"shop"
+]
+},
+{
+"id": 140,
+"name": "Bob's Curse",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"challenge",
+"redChest",
+"treasure"
+]
+},
+{
+"id": 141,
+"name": "Pageant Boy",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss"
+]
+},
+{
+"id": 142,
+"name": "Scapular",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 143,
+"name": "Speed Ball",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed shotspeed",
+"pools": [
+"boss",
+"demonBeggar",
+"treasure"
+]
+},
+{
+"id": 144,
+"name": "Bum Friend",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"treasure"
+]
+},
+{
+"id": 145,
+"name": "Guppy's Head",
+"kind": "active",
+"maxcharges": 1,
+"cache": "",
+"pools": [
+"curse",
+"devil",
+"goldenChest",
+"redChest"
+]
+},
+{
+"id": 146,
+"name": "Prayer Card",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 147,
+"name": "Notched Axe",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 148,
+"name": "Infestation",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 149,
+"name": "Ipecac",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 150,
+"name": "Tough Love",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 151,
+"name": "The Mulligan",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 152,
+"name": "Technology 2",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "weapon damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 153,
+"name": "Mutant Spider",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 154,
+"name": "Chemical Peel",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 155,
+"name": "The Peeper",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 156,
+"name": "Habit",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"shop"
+]
+},
+{
+"id": 157,
+"name": "Bloody Lust",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 158,
+"name": "Crystal Ball",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 159,
+"name": "Spirit of the Night",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "flying tearflag tearcolor",
+"pools": [
+"devil"
+]
+},
+{
+"id": 160,
+"name": "Crack the Sky",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 161,
+"name": "Ankh",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 162,
+"name": "Celtic Cross",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 163,
+"name": "Ghost Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 164,
+"name": "The Candle",
+"kind": "active",
+"maxcharges": 110,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 165,
+"name": "Cat-o-nine-tails",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "shotspeed damage",
+"pools": [
+"boss"
+]
+},
+{
+"id": 166,
+"name": "D20",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 167,
+"name": "Harlequin Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 168,
+"name": "Epic Fetus",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 169,
+"name": "Polyphemus",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage firedelay tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 170,
+"name": "Daddy Longlegs",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 171,
+"name": "Spider Butt",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 172,
+"name": "Sacrificial Dagger",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 173,
+"name": "Mitre",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 174,
+"name": "Rainbow Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 175,
+"name": "Dad's Key",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"keyMaster",
+"treasure"
+]
+},
+{
+"id": 176,
+"name": "Stem Cells",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "shotspeed",
+"pools": [
+"boss",
+"treasure"
+]
+},
+{
+"id": 177,
+"name": "Portable Slot",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"shop"
+]
+},
+{
+"id": 178,
+"name": "Holy Water",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 179,
+"name": "Fate",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "flying",
+"pools": [
+"goldenChest"
+]
+},
+{
+"id": 180,
+"name": "The Black Bean",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"treasure"
+]
+},
+{
+"id": 182,
+"name": "Sacred Heart",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage firedelay range shotspeed tearcolor tearflag",
+"pools": [
+"angel"
+]
+},
+{
+"id": 183,
+"name": "Tooth Picks",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "shotspeed firedelay",
+"pools": [
+"boss"
+]
+},
+{
+"id": 184,
+"name": "Holy Grail",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "flying",
+"pools": [
+"angel"
+]
+},
+{
+"id": 185,
+"name": "Dead Dove",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "flying tearflag tearcolor",
+"pools": [
+"angel"
+]
+},
+{
+"id": 186,
+"name": "Blood Rights",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 187,
+"name": "Guppy's Hairball",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil"
+]
+},
+{
+"id": 188,
+"name": "Abel",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"goldenChest",
+"treasure"
+]
+},
+{
+"id": 189,
+"name": "SMB Super Fan",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay damage speed range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 190,
+"name": "Pyro",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"secret",
+"treasure"
+]
+},
+{
+"id": 191,
+"name": "3 Dollar Bill",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 192,
+"name": "Telepathy For Dummies",
+"kind": "active",
+"maxcharges": 2,
+"cache": "tearflag tearcolor",
+"pools": [
+"library",
+"treasure"
+]
+},
+{
+"id": 193,
+"name": "MEAT!",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"boss"
+]
+},
+{
+"id": 194,
+"name": "Magic 8 Ball",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "shotspeed",
+"pools": [
+"boss"
+]
+},
+{
+"id": 195,
+"name": "Mom's Coin Purse",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"boss",
+"demonBeggar",
+"dungeon",
+"shop"
+]
+},
+{
+"id": 196,
+"name": "Squeezy",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"boss"
+]
+},
+{
+"id": 197,
+"name": "Jesus Juice",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage range",
+"pools": [
+"boss"
+]
+},
+{
+"id": 198,
+"name": "Box",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"boss",
+"dungeon"
+]
+},
+{
+"id": 199,
+"name": "Mom's Key",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"dungeon",
+"keyMaster",
+"shop"
+]
+},
+{
+"id": 200,
+"name": "Mom's Eyeshadow",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor",
+"pools": [
+"dungeon",
+"treasure"
+]
+},
+{
+"id": 201,
+"name": "Iron Bar",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 202,
+"name": "Midas' Touch",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 203,
+"name": "Humbleing Bundle",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 204,
+"name": "Fanny Pack",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"shop"
+]
+},
+{
+"id": 205,
+"name": "Sharp Plug",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 206,
+"name": "Guillotine",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "damage firedelay",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 208,
+"name": "Champion Belt",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"shop"
+]
+},
+{
+"id": 209,
+"name": "Butt Bombs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"challenge",
+"treasure"
+]
+},
+{
+"id": 210,
+"name": "Gnawed Leaf",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 211,
+"name": "Spiderbaby",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 212,
+"name": "Guppy's Collar",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"devil",
+"redChest"
+]
+},
+{
+"id": 213,
+"name": "Lost Contact",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "shotspeed",
+"pools": [
+"secret",
+"treasure"
+]
+},
+{
+"id": 214,
+"name": "Anemic",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 215,
+"name": "Goat Head",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"curse",
+"devil",
+"goldenChest"
+]
+},
+{
+"id": 216,
+"name": "Ceremonial Robes",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"curse",
+"demonBeggar",
+"devil"
+]
+},
+{
+"id": 217,
+"name": "Mom's Wig",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"dungeon",
+"treasure"
+]
+},
+{
+"id": 218,
+"name": "Placenta",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss"
+]
+},
+{
+"id": 219,
+"name": "Old Bandage",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss"
+]
+},
+{
+"id": 220,
+"name": "Sad Bombs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"challenge",
+"treasure"
+]
+},
+{
+"id": 221,
+"name": "Rubber Cement",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 222,
+"name": "Anti-Gravity",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 223,
+"name": "Pyromaniac",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 224,
+"name": "Cricket's Body",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay range tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 225,
+"name": "Gimpy",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"demonBeggar",
+"devil",
+"treasure"
+]
+},
+{
+"id": 226,
+"name": "Black Lotus",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret"
+]
+},
+{
+"id": 227,
+"name": "Piggy Bank",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop",
+"treasure"
+]
+},
+{
+"id": 228,
+"name": "Mom's Perfume",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay tearcolor",
+"pools": [
+"dungeon",
+"treasure"
+]
+},
+{
+"id": 229,
+"name": "Monstro's Lung",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 230,
+"name": "Abaddon",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage speed",
+"pools": [
+"devil"
+]
+},
+{
+"id": 231,
+"name": "Ball of Tar",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 232,
+"name": "Stop Watch",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"shop"
+]
+},
+{
+"id": 233,
+"name": "Tiny Planet",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 234,
+"name": "Infestation 2",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 236,
+"name": "E. Coli",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 237,
+"name": "Death's Touch",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag firedelay damage",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 240,
+"name": "Experimental Treatment",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"boss",
+"demonBeggar",
+"treasure"
+]
+},
+{
+"id": 241,
+"name": "Contract from Below",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"demonBeggar",
+"devil"
+]
+},
+{
+"id": 242,
+"name": "Infamy",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"goldenChest",
+"secret",
+"treasure"
+]
+},
+{
+"id": 243,
+"name": "Trinity Shield",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "weapon",
+"pools": [
+"angel"
+]
+},
+{
+"id": 244,
+"name": "Tech.5",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 245,
+"name": "20/20",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 246,
+"name": "Blue Map",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"shop"
+]
+},
+{
+"id": 247,
+"name": "BFFS!",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 248,
+"name": "Hive Mind",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 249,
+"name": "There's Options",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 250,
+"name": "BOGO Bombs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"shop"
+]
+},
+{
+"id": 251,
+"name": "Starter Deck",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 252,
+"name": "Little Baggy",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"goldenChest",
+"shop"
+]
+},
+{
+"id": 253,
+"name": "Magic Scab",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "luck",
+"pools": [
+"boss"
+]
+},
+{
+"id": 254,
+"name": "Blood Clot",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss"
+]
+},
+{
+"id": 255,
+"name": "Screw",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay shotspeed",
+"pools": [
+"boss"
+]
+},
+{
+"id": 256,
+"name": "Hot Bombs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"treasure"
+]
+},
+{
+"id": 257,
+"name": "Fire Mind",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 258,
+"name": "Missing No.",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"secret"
+]
+},
+{
+"id": 259,
+"name": "Dark Matter",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"devil"
+]
+},
+{
+"id": 260,
+"name": "Black Candle",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"curse",
+"shop"
+]
+},
+{
+"id": 261,
+"name": "Proptosis",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 262,
+"name": "Missing Page 2",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"demonBeggar",
+"devil",
+"secret"
+]
+},
+{
+"id": 264,
+"name": "Smart Fly",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"keyMaster",
+"treasure"
+]
+},
+{
+"id": 265,
+"name": "Dry Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 266,
+"name": "Juicy Sack",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 267,
+"name": "Robo-Baby 2.0",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 268,
+"name": "Rotten Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 269,
+"name": "Headless Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 270,
+"name": "Leech",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 271,
+"name": "Mystery Sack",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"goldenChest",
+"secret",
+"treasure"
+]
+},
+{
+"id": 272,
+"name": "BBF",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"keyMaster",
+"treasure"
+]
+},
+{
+"id": 273,
+"name": "Bob's Brain",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"goldenChest",
+"treasure"
+]
+},
+{
+"id": 274,
+"name": "Best Bud",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 275,
+"name": "Lil Brimstone",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 276,
+"name": "Isaac's Heart",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 277,
+"name": "Lil Haunt",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 278,
+"name": "Dark Bum",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 279,
+"name": "Big Fan",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 280,
+"name": "Sissy Longlegs",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 281,
+"name": "Punching Bag",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 282,
+"name": "How to Jump",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"library",
+"treasure"
+]
+},
+{
+"id": 283,
+"name": "D100",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 284,
+"name": "D4",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 285,
+"name": "D10",
+"kind": "active",
+"maxcharges": 1,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 286,
+"name": "Blank Card",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"secret",
+"shop",
+"treasure"
+]
+},
+{
+"id": 287,
+"name": "Book of Secrets",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"library",
+"secret",
+"treasure"
+]
+},
+{
+"id": 288,
+"name": "Box of Spiders",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 289,
+"name": "Red Candle",
+"kind": "active",
+"maxcharges": 110,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 290,
+"name": "The Jar",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 291,
+"name": "Flush!",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 292,
+"name": "Satanic Bible",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"devil",
+"library",
+"treasure"
+]
+},
+{
+"id": 294,
+"name": "Butter Bean",
+"kind": "active",
+"maxcharges": 90,
+"cache": "",
+"pools": [
+"beggar",
+"treasure"
+]
+},
+{
+"id": 295,
+"name": "Magic Fingers",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop",
+"treasure"
+]
+},
+{
+"id": 296,
+"name": "Converter",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 297,
+"name": "Pandora's Box",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"redChest",
+"shop"
+]
+},
+{
+"id": 298,
+"name": "Unicorn Stump",
+"kind": "active",
+"maxcharges": 1,
+"cache": "speed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 299,
+"name": "Taurus",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 300,
+"name": "Aries",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 301,
+"name": "Cancer",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 302,
+"name": "Leo",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 303,
+"name": "Virgo",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 304,
+"name": "Libra",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed firedelay damage range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 305,
+"name": "Scorpio",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 306,
+"name": "Sagittarius",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag speed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 307,
+"name": "Capricorn",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed firedelay damage range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 308,
+"name": "Aquarius",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 309,
+"name": "Pisces",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 310,
+"name": "Eve's Mascara",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "shotspeed damage tearcolor firedelay",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 311,
+"name": "Judas' Shadow",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 312,
+"name": "Maggy's Bow",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 313,
+"name": "Holy Mantle",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 314,
+"name": "Thunder Thighs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 315,
+"name": "Strange Attractor",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 316,
+"name": "Cursed Eye",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"redChest",
+"secret",
+"treasure"
+]
+},
+{
+"id": 317,
+"name": "Mysterious Liquid",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 318,
+"name": "Gemini",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 319,
+"name": "Cain's Other Eye",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 320,
+"name": "???'s Only Friend",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"keyMaster",
+"treasure"
+]
+},
+{
+"id": 321,
+"name": "Samson's Chains",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret",
+"treasure"
+]
+},
+{
+"id": 322,
+"name": "Mongo Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 323,
+"name": "Isaac's Tears",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 324,
+"name": "Undefined",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 325,
+"name": "Scissors",
+"kind": "active",
+"maxcharges": 2,
+"cache": "familiars",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 326,
+"name": "Breath of Life",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 329,
+"name": "The Ludovico Technique",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 330,
+"name": "Soy Milk",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay damage tearcolor",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 331,
+"name": "Godhead",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag shotspeed firedelay range damage",
+"pools": [
+"angel"
+]
+},
+{
+"id": 332,
+"name": "Lazarus' Rags",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 333,
+"name": "The Mind",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 334,
+"name": "The Body",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 335,
+"name": "The Soul",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 336,
+"name": "Dead Onion",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor tearflag range shotspeed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 337,
+"name": "Broken Watch",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 338,
+"name": "The Boomerang",
+"kind": "active",
+"maxcharges": 70,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 339,
+"name": "Safety Pin",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range shotspeed damage",
+"pools": [
+"boss"
+]
+},
+{
+"id": 340,
+"name": "Caffeine Pill",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "speed",
+"pools": [
+"boss",
+"demonBeggar"
+]
+},
+{
+"id": 341,
+"name": "Torn Photo",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "shotspeed firedelay",
+"pools": [
+"boss"
+]
+},
+{
+"id": 342,
+"name": "Blue Cap",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "shotspeed firedelay",
+"pools": [
+"boss"
+]
+},
+{
+"id": 343,
+"name": "Latch Key",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "luck",
+"pools": [
+"boss"
+]
+},
+{
+"id": 344,
+"name": "Match Book",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"boss"
+]
+},
+{
+"id": 345,
+"name": "Synthoil",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage range",
+"pools": [
+"boss",
+"demonBeggar"
+]
+},
+{
+"id": 346,
+"name": "A Snack",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss",
+"dungeon"
+]
+},
+{
+"id": 347,
+"name": "Diplopia",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 348,
+"name": "Placebo",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 349,
+"name": "Wooden Nickel",
+"kind": "active",
+"maxcharges": 1,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 350,
+"name": "Toxic Shock",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 351,
+"name": "Mega Bean",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 352,
+"name": "Glass Cannon",
+"kind": "active",
+"maxcharges": 110,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 353,
+"name": "Bomber Boy",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"treasure"
+]
+},
+{
+"id": 354,
+"name": "Crack Jacks",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss"
+]
+},
+{
+"id": 355,
+"name": "Mom's Pearls",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "luck range",
+"pools": [
+"boss",
+"dungeon"
+]
+},
+{
+"id": 356,
+"name": "Car Battery",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 357,
+"name": "Box of Friends",
+"kind": "active",
+"maxcharges": 4,
+"cache": "familiars",
+"pools": [
+"shop"
+]
+},
+{
+"id": 358,
+"name": "The Wiz",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 359,
+"name": "8 Inch Nails",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 360,
+"name": "Incubus",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil"
+]
+},
+{
+"id": 361,
+"name": "Fate's Reward",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"goldenChest",
+"treasure"
+]
+},
+{
+"id": 362,
+"name": "Lil Chest",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"treasure"
+]
+},
+{
+"id": 363,
+"name": "Sworn Protector",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 364,
+"name": "Friend Zone",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"keyMaster",
+"treasure"
+]
+},
+{
+"id": 365,
+"name": "Lost Fly",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"keyMaster",
+"treasure"
+]
+},
+{
+"id": 366,
+"name": "Scatter Bombs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"treasure"
+]
+},
+{
+"id": 367,
+"name": "Sticky Bombs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"treasure"
+]
+},
+{
+"id": 368,
+"name": "Epiphora",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 369,
+"name": "Continuum",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 370,
+"name": "Mr. Dolly",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range firedelay",
+"pools": [
+"boss"
+]
+},
+{
+"id": 371,
+"name": "Curse of the Tower",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bossrush",
+"curse",
+"redChest",
+"treasure"
+]
+},
+{
+"id": 372,
+"name": "Charged Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 373,
+"name": "Dead Eye",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 374,
+"name": "Holy Light",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 375,
+"name": "Host Hat",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 376,
+"name": "Restock",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"shop"
+]
+},
+{
+"id": 377,
+"name": "Bursting Sack",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 378,
+"name": "No. 2",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bossrush",
+"treasure"
+]
+},
+{
+"id": 379,
+"name": "Pupula Duplex",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 380,
+"name": "Pay To Play",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 381,
+"name": "Eden's Blessing",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 382,
+"name": "Friendly Ball",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 383,
+"name": "Tear Detonator",
+"kind": "active",
+"maxcharges": 1,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 384,
+"name": "Lil Gurdy",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 385,
+"name": "Bumbo",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"treasure"
+]
+},
+{
+"id": 386,
+"name": "D12",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 387,
+"name": "Censer",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 388,
+"name": "Key Bum",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"keyMaster",
+"secret",
+"treasure"
+]
+},
+{
+"id": 389,
+"name": "Rune Bag",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"goldenChest",
+"secret",
+"treasure"
+]
+},
+{
+"id": 390,
+"name": "Seraphim",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"treasure"
+]
+},
+{
+"id": 391,
+"name": "Betrayal",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 392,
+"name": "Zodiac",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 393,
+"name": "Serpent's Kiss",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 394,
+"name": "Marked",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 395,
+"name": "Tech X",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 396,
+"name": "Ventricle Razor",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 397,
+"name": "Tractor Beam",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay tearflag range shotspeed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 398,
+"name": "God's Flesh",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 399,
+"name": "Maw Of The Void",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor damage",
+"pools": [
+"devil"
+]
+},
+{
+"id": 400,
+"name": "Spear Of Destiny",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 401,
+"name": "Explosivo",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag tearcolor",
+"pools": [
+"bossrush",
+"treasure"
+]
+},
+{
+"id": 402,
+"name": "Chaos",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 403,
+"name": "Spider Mod",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 404,
+"name": "Farting Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 405,
+"name": "GB Bug",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret",
+"treasure"
+]
+},
+{
+"id": 406,
+"name": "D8",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 407,
+"name": "Purity",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage firedelay speed range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 408,
+"name": "Athame",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"devil"
+]
+},
+{
+"id": 409,
+"name": "Empty Vessel",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "flying",
+"pools": [
+"devil"
+]
+},
+{
+"id": 410,
+"name": "Evil Eye",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 411,
+"name": "Lusty Blood",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 412,
+"name": "Cambion Conception",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil"
+]
+},
+{
+"id": 413,
+"name": "Immaculate Conception",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 414,
+"name": "More Options",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 415,
+"name": "Crown Of Light",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage shotspeed range",
+"pools": [
+"angel"
+]
+},
+{
+"id": 416,
+"name": "Deep Pockets",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 417,
+"name": "Succubus",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"demonBeggar",
+"devil"
+]
+},
+{
+"id": 418,
+"name": "Fruit Cake",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 419,
+"name": "Teleport 2.0",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 420,
+"name": "Black Powder",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil"
+]
+},
+{
+"id": 421,
+"name": "Kidney Bean",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 422,
+"name": "Glowing Hour Glass",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"shop",
+"treasure"
+]
+},
+{
+"id": 423,
+"name": "Circle of Protection",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 424,
+"name": "Sack Head",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 425,
+"name": "Night Light",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 426,
+"name": "Obsessed Fan",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 427,
+"name": "Mine Crafter",
+"kind": "active",
+"maxcharges": 1,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 428,
+"name": "PJs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss"
+]
+},
+{
+"id": 429,
+"name": "Head of the Keeper",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"goldenChest"
+]
+},
+{
+"id": 430,
+"name": "Papa Fly",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 431,
+"name": "Multidimensional Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil",
+"treasure"
+]
+},
+{
+"id": 432,
+"name": "Glitter Bombs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bossrush",
+"treasure"
+]
+},
+{
+"id": 433,
+"name": "My Shadow",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil"
+]
+},
+{
+"id": 434,
+"name": "Jar of Flies",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 435,
+"name": "Lil Loki",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 436,
+"name": "Milk!",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 437,
+"name": "D7",
+"kind": "active",
+"maxcharges": 3,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 438,
+"name": "Binky",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"boss"
+]
+},
+{
+"id": 439,
+"name": "Mom's Box",
+"kind": "active",
+"maxcharges": 4,
+"cache": "all",
+"pools": [
+"dungeon",
+"shop"
+]
+},
+{
+"id": 440,
+"name": "Kidney Stone",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range speed firedelay",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 441,
+"name": "Mega Blast",
+"kind": "active",
+"maxcharges": 12,
+"cache": "",
+"pools": [
+"devil"
+]
+},
+{
+"id": 442,
+"name": "Dark Princes Crown",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range firedelay shotspeed",
+"pools": [
+"curse",
+"devil"
+]
+},
+{
+"id": 443,
+"name": "Apple!",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 444,
+"name": "Lead Pencil",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 445,
+"name": "Dog Tooth",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage speed",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 446,
+"name": "Dead Tooth",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 447,
+"name": "Linger Bean",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"treasure"
+]
+},
+{
+"id": 448,
+"name": "Shard of Glass",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 449,
+"name": "Metal Plate",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 450,
+"name": "Eye of Greed",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret"
+]
+},
+{
+"id": 451,
+"name": "Tarot Cloth",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"shop"
+]
+},
+{
+"id": 452,
+"name": "Varicose Veins",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 453,
+"name": "Compound Fracture",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 454,
+"name": "Polydactyly",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss"
+]
+},
+{
+"id": 455,
+"name": "Dad's Lost Coin",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range",
+"pools": [
+"beggar",
+"boss"
+]
+},
+{
+"id": 456,
+"name": "Moldy Bread",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"beggar",
+"boss",
+"dungeon"
+]
+},
+{
+"id": 457,
+"name": "Cone Head",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 458,
+"name": "Belly Button",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss"
+]
+},
+{
+"id": 459,
+"name": "Sinus Infection",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 460,
+"name": "Glaucoma",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 461,
+"name": "Parasitoid",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 462,
+"name": "Eye of Belial",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "range tearflag",
+"pools": [
+"devil"
+]
+},
+{
+"id": 463,
+"name": "Sulfuric Acid",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage tearcolor tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 464,
+"name": "Glyph of Balance",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 465,
+"name": "Analog Stick",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 466,
+"name": "Contagion",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 467,
+"name": "Finger!",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 468,
+"name": "Shade",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"devil"
+]
+},
+{
+"id": 469,
+"name": "Depression",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 470,
+"name": "Hushy",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 471,
+"name": "Lil Monstro",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 472,
+"name": "King Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 473,
+"name": "Big Chubby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 475,
+"name": "Plan C",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"demonBeggar",
+"devil",
+"redChest",
+"shop"
+]
+},
+{
+"id": 476,
+"name": "D1",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 477,
+"name": "Void",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"angel",
+"devil"
+]
+},
+{
+"id": 478,
+"name": "Pause",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 479,
+"name": "Smelter",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 480,
+"name": "Compost",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"secret",
+"shop"
+]
+},
+{
+"id": 481,
+"name": "Dataminer",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 482,
+"name": "Clicker",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 483,
+"name": "Mama Mega!",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"challenge",
+"shop"
+]
+},
+{
+"id": 484,
+"name": "Wait What?",
+"kind": "active",
+"maxcharges": 300,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 485,
+"name": "Crooked Penny",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"beggar",
+"shop",
+"treasure"
+]
+},
+{
+"id": 486,
+"name": "Dull Razor",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 487,
+"name": "Potato Peeler",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"demonBeggar",
+"shop"
+]
+},
+{
+"id": 488,
+"name": "Metronome",
+"kind": "active",
+"maxcharges": 2,
+"cache": "all",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 489,
+"name": "D infinity",
+"kind": "active",
+"maxcharges": 2,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 490,
+"name": "Eden's Soul",
+"kind": "active",
+"maxcharges": 12,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 491,
+"name": "Acid Baby",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"demonBeggar",
+"treasure"
+]
+},
+{
+"id": 492,
+"name": "YO LISTEN!",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "luck",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 493,
+"name": "Adrenaline",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 494,
+"name": "Jacob's Ladder",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 495,
+"name": "Ghost Pepper",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 496,
+"name": "Euthanasia",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"demonBeggar",
+"treasure"
+]
+},
+{
+"id": 497,
+"name": "Camo Undies",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 498,
+"name": "Duality",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"devil"
+]
+},
+{
+"id": 499,
+"name": "Eucharist",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 500,
+"name": "Sack of Sacks",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"goldenChest",
+"shop"
+]
+},
+{
+"id": 501,
+"name": "Greed's Gullet",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret"
+]
+},
+{
+"id": 502,
+"name": "Large Zit",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 503,
+"name": "Little Horn",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"demonBeggar"
+]
+},
+{
+"id": 504,
+"name": "Brown Nugget",
+"kind": "active",
+"maxcharges": 250,
+"cache": "familiars",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 505,
+"name": "Poke Go",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 506,
+"name": "BackStabber",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 507,
+"name": "Sharp Straw",
+"kind": "active",
+"maxcharges": 300,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 508,
+"name": "Mom's Razor",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"dungeon",
+"treasure"
+]
+},
+{
+"id": 509,
+"name": "Bloodshot Eye",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 510,
+"name": "Delirious",
+"kind": "active",
+"maxcharges": 12,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 511,
+"name": "Angry Fly",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 512,
+"name": "Black Hole",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 513,
+"name": "Bozo",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 514,
+"name": "Broken Modem",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 515,
+"name": "Mystery Gift",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 516,
+"name": "Sprinkler",
+"kind": "active",
+"maxcharges": 4,
+"cache": "familiars",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 517,
+"name": "Fast Bombs",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"bombBum",
+"bossrush",
+"challenge",
+"treasure"
+]
+},
+{
+"id": 518,
+"name": "Buddy in a Box",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 519,
+"name": "Lil Delirium",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"devil"
+]
+},
+{
+"id": 520,
+"name": "Jumper Cables",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 521,
+"name": "Coupon",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 522,
+"name": "Telekinesis",
+"kind": "active",
+"maxcharges": 60,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 523,
+"name": "Moving Box",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 524,
+"name": "Technology Zero",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 525,
+"name": "Leprosy",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 526,
+"name": "7 Seals",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel",
+"devil"
+]
+},
+{
+"id": 527,
+"name": "Mr. ME!",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 528,
+"name": "Angelic Prism",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"angel"
+]
+},
+{
+"id": 529,
+"name": "Pop!",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 530,
+"name": "Death's List",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"devil"
+]
+},
+{
+"id": 531,
+"name": "Haemolacria",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "weapon firedelay damage tearcolor",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 532,
+"name": "Lachryphagy",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 533,
+"name": "Trisagion",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag",
+"pools": [
+"angel"
+]
+},
+{
+"id": 534,
+"name": "Schoolbag",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 535,
+"name": "Blanket",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"shop"
+]
+},
+{
+"id": 536,
+"name": "Sacrificial Altar",
+"kind": "active",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"curse",
+"devil"
+]
+},
+{
+"id": 537,
+"name": "Lil Spewer",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 538,
+"name": "Marbles",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "luck",
+"pools": [
+"boss"
+]
+},
+{
+"id": 539,
+"name": "Mystery Egg",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 540,
+"name": "Flat Stone",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearflag damage firedelay",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 541,
+"name": "Marrow",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"boss"
+]
+},
+{
+"id": 542,
+"name": "Slipped Rib",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 543,
+"name": "Hallowed Ground",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 544,
+"name": "Pointy Rib",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 545,
+"name": "Book of the Dead",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [
+"devil",
+"library",
+"treasure"
+]
+},
+{
+"id": 546,
+"name": "Dad's Ring",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"secret"
+]
+},
+{
+"id": 547,
+"name": "Divorce Papers",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "firedelay",
+"pools": [
+"boss"
+]
+},
+{
+"id": 548,
+"name": "Jaw Bone",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+},
+{
+"id": 549,
+"name": "Brittle Bones",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [
+"treasure"
+]
+}
+],
+"excluded": [
+{
+"id": 9,
+"name": "Skatole",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): special drop, not a pedestal item of a normal run"
+},
+{
+"id": 18,
+"name": "A Dollar",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): special drop, not a pedestal item of a normal run"
+},
+{
+"id": 73,
+"name": "Cube of Meat",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): special drop, not a pedestal item of a normal run"
+},
+{
+"id": 90,
+"name": "The Small Rock",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "tearcolor damage speed firedelay",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): special drop, not a pedestal item of a normal run"
+},
+{
+"id": 130,
+"name": "A Pony",
+"kind": "active",
+"maxcharges": 4,
+"cache": "flying speed",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): special drop, not a pedestal item of a normal run"
+},
+{
+"id": 132,
+"name": "A Lump of Coal",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "damage tearflag tearcolor",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): special drop, not a pedestal item of a normal run"
+},
+{
+"id": 181,
+"name": "White Pony",
+"kind": "active",
+"maxcharges": 6,
+"cache": "flying speed",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): special drop, not a pedestal item of a normal run"
+},
+{
+"id": 207,
+"name": "Ball of Bandages",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): special drop, not a pedestal item of a normal run"
+},
+{
+"id": 238,
+"name": "Key Piece 1",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): quest item"
+},
+{
+"id": 239,
+"name": "Key Piece 2",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): quest item"
+},
+{
+"id": 293,
+"name": "Head of Krampus",
+"kind": "active",
+"maxcharges": 6,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): special drop, not a pedestal item of a normal run"
+},
+{
+"id": 327,
+"name": "The Polaroid",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): quest item"
+},
+{
+"id": 328,
+"name": "The Negative",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): quest item"
+},
+{
+"id": 474,
+"name": "Tonsil",
+"kind": "familiar",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): in no pool; id 474 is also another item in Repentance+"
+},
+{
+"id": 550,
+"name": "Broken Shovel",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): quest item"
+},
+{
+"id": 551,
+"name": "Broken Shovel",
+"kind": "passive",
+"maxcharges": 0,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): quest item"
+},
+{
+"id": 552,
+"name": "Mom's Shovel",
+"kind": "active",
+"maxcharges": 4,
+"cache": "",
+"pools": [],
+"why": "in no normal-mode item pool (itempools.xml; greed pools ignored): quest item"
+}
+]
+}

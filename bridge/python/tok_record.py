@@ -7,7 +7,8 @@ applied during the step t+1 -> t+2 (the one-decision action lag); the step t -> 
 
 Per episode file ep<k>_<seed>.npz:
   player (T, 31) float32, the ROW's player features; t, hurt, damage, done, first, bombs, events (T,)
-  n_ent (T,) and ent (N, 33) float32 / ent_id (N, 3) int16: the first n_ent entity rows of every record, concatenated
+  n_ent (T,) and ent (N, ENT_F) float32 / ent_id (N, 3) int16: the first n_ent entity rows of every record,
+      concatenated (ENT_F = 33 before 2026-10-08, 56 since: tok_obs's flag and laser columns appended)
   n_doors (T,), doors (T, 8, 7) float32
   grids (G, 7, 16, 28) uint8 with grid_idx (T,): the room grids, each distinct one once
   maps (M, 8, 13, 13) uint8 with map_idx (T,): the minimaps, each distinct one once

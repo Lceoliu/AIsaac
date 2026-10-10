@@ -504,7 +504,8 @@ for _, e in ipairs(Isaac.GetRoomEntities()) do
 end
 return table.concat(s, ",")
 """
-BRIDGE_VERSION = "abp-0.2.15"
+BRIDGE_VERSION = "abp-0.2.17"   # 2026-10-08: lean player records with the PlayerType (abplus_lean; abp-0.2.16: lean
+#                                 entity records with flag word and laser geometry)
 # 2026-10-04: send steps as the bridge's step line when its hello offers it (AbplusTrainingEnv.step_line); 0 = JSON
 STEP_LINE = os.environ.get("ISAAC_RL_STEP_LINE", "1") != "0"
 GOTO_SETTLE_FRAMES = 8
@@ -607,6 +608,10 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
     # emptied, the player on a random cell of its largest walkable component (_reset_goto_room).
     reset_mode = None
     chain_rooms = frozenset()
+    # 2026-10-08 (character randomisation): the PlayerType a floor / chain reset restarts the run as (_restart_floor:
+    # abp_turbo's ABP_PLAYERTYPE; AB+ resources/scripts/enums.lua PlayerType: 0 Isaac .. 17 The Soul); set per reset
+    # (tok_floor's prepare). 0: as before.
+    character = 0
     binary_obs = False    # format 2 (abp-0.2.1): binary observations decoded by abplus_obs.ObsDecoder
     validate_obs = False  # with binary_obs: receive the JSON observation too and compare every frame
     obs_format = 1
@@ -1100,11 +1105,19 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
                      "target_extras": extras}
 
     def _restart_floor(self, n):
-        """A new run (floor) from the start seed n with the A7 hooks, as reset_monstro's restart."""
+        """A new run (floor) from the start seed n with the A7 hooks, as reset_monstro's restart. 2026-10-08: as the
+        character self.character, armed with abp_turbo's ABP_PLAYERTYPE (the instances run a debug game, whose restarts
+        start as Isaac whatever `restart <id>` says; see abp_turbo.c start_debug_player_init). A library without the
+        hook still restarts as Isaac (character 0); another character then fails here."""
+        c = int(self.character)
         reseeded = self.lua(f"return tostring(os.getenv('ABP_SOUND_RESET')) .. "
-                            f"tostring(os.getenv('ABP_RESEED:{n}')) .. tostring(os.getenv('ABP_STARTSEED:{n}'))")
+                            f"tostring(os.getenv('ABP_RESEED:{n}')) .. tostring(os.getenv('ABP_STARTSEED:{n}')) .. "
+                            f"'|' .. tostring(os.getenv('ABP_PLAYERTYPE:{c}'))")
+        reseeded, _, typed = str(reseeded).partition("|")
         if self.require_reseed and reseeded != "111":
             raise BridgeError(f"abp_turbo sound reset / reseed / start-seed override unavailable ({reseeded})")
+        if c != 0 and typed != "1":
+            raise BridgeError(f"abp_turbo player-type override unavailable ({typed}): character {c} needs it")
         self.reset(phases=[["restart 0"]], settle=2)
         parts = self.lua(FLOOR_LUA).split(";")
         curses, start = int(parts[0].split("=")[1]), int(parts[1].split("=")[1])
@@ -1171,6 +1184,9 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             obs, _, _, _, info = self.step({}, repeat=1)
             if obs["room"]["room_idx"] != start:
                 raise BridgeError(f"seed {seed}: the run did not start in its start room ({obs['room']['room_idx']} != {start})")
+            if int(obs["players"][0]["ptype"]) != int(self.character):   # 2026-10-08 (character randomisation)
+                raise BridgeError(f"seed {seed}: the run started as PlayerType {obs['players'][0]['ptype']}, "
+                                  f"not {self.character}")
             return obs, {**info, "task": "normal", "room_variant": floor.get(start, {}).get("variant"), "reset_kind": "floor",
                          "floor": floor, "start_room": start, "floor_curses": curses, "room_attempts": attempt + 1}
         raise BridgeError(f"seed {seed}: no floor without Labyrinth / Lost / Maze in {MAX_CHAIN_ATTEMPTS} attempts")

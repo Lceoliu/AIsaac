@@ -2,7 +2,7 @@
 
 目的：在 Afterbirth+ v1.06 原生 Linux 版（原版引擎，经 `abp_turbo` 改造加速）上训练和评估战斗策略；最初用来评估模拟器训练出的策略。协议和观测格式沿用 J460 的 IsaacRLBridge 0.2.0（combat_schema=3），`VisibleHistory` 和策略网络不用改。
 
-引擎层（实例隔离、虚拟时钟、严格等价的 render-lite 模式）见 [ABP_LINUX_REVERSE_ENGINEERING.md](../../../analysis/docs/ABP_LINUX_REVERSE_ENGINEERING.md)，本桥接查明的引擎行为在其 §15。本文只写设计、奖励定义和用法；实验都在 [EXPERIMENTS.md](EXPERIMENTS.md)，下文用编号（如 A2、C12）引用。
+引擎层（实例隔离、虚拟时钟、严格等价的 render-lite 模式）见 [ABP_LINUX_REVERSE_ENGINEERING.md](../../../analysis/docs/ABP_LINUX_REVERSE_ENGINEERING.md)，本桥接查明的引擎行为在其 §15。本文只写设计、奖励定义和用法；实验都在 [EXPERIMENTS.md](EXPERIMENTS.md)，下文用编号（如 A2、C12）引用。训练路线的核心思路（算力、数据多样性、价值视野、奖励项、回溯搜索的下一步；2026-10-08）在 [rl/docs/SCALING_THESIS.md](../../docs/SCALING_THESIS.md)。
 
 **最新同步状态（2026-10-07 22:35，Asia/Shanghai）**：第一台 3080 的 `fk2/runs/c67-run` 已完成 9885 更新 / 3000.1 游戏小时；最新实际评估为 u9600，32 局平均过 1.125 层，最终 `last.pt` 尚未评估。第二台 3090 的 `brn2` 已完成 B2 默认流程与噪声/快照对照，最新 `m3_nocrn` 选择头留出准确率 46.3%（41 例），尚未证明泛化有效。两机没有训练器或评估器；第一台 C67 的等待脚本仍在，本次未停止它。源码、模型、原始结果分别保存到本地 `runs/sync-20261007/host3080/` 与 `host3090/`；未用第一台较旧的实验源码覆盖工作区。详细结果见 EXPERIMENTS.md C67 和 B17 的 B2 补充。
 
@@ -19,7 +19,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| [`abp_bridge.lua`](abp_bridge.lua) | 游戏侧，现为 abp-0.2.15（`fork`、`lean`，见"克隆与精简模式"；0.2.15 给精简观测加了小地图，见"整层环境"）。runtime 副本 `main.lua` 的钩子在 `--luadebug` 下 `dofile(ABP_LUA)` 加载，不走 mods 目录；协议比 0.2.0 多 `{"cmd":"lua"}`、`format`（二进制观测 v2）、`profile`（观测分项耗时）、`play`（批量重放，见"Go-Explore"）；致命伤在 `MC_ENTITY_TAKE_DMG` 里拦下记为死亡（AB+ 没有 rewind）。实例加载的脚本：`launch_abplus(bridge_lua=...)`，否则环境变量 `ABP_BRIDGE_LUA`（worker 进程会继承，可以让测试副本和安装的那份同时跑），否则 `$ABP_HOME/bridge/abp_bridge.lua`（安装的那份）；Python 端 `BRIDGE_VERSION` 必须和它一致 |
+| [`abp_bridge.lua`](abp_bridge.lua) | 游戏侧，现为 abp-0.2.16（`fork`、`lean`，见"克隆与精简模式"；0.2.15 给精简观测加了小地图，见"整层环境"；0.2.16 给实体记录加了标志字和激光几何，见"token 策略与 fork 训练器"）。runtime 副本 `main.lua` 的钩子在 `--luadebug` 下 `dofile(ABP_LUA)` 加载，不走 mods 目录；协议比 0.2.0 多 `{"cmd":"lua"}`、`format`（二进制观测 v2）、`profile`（观测分项耗时）、`play`（批量重放，见"Go-Explore"）；致命伤在 `MC_ENTITY_TAKE_DMG` 里拦下记为死亡（AB+ 没有 rewind）。实例加载的脚本：`launch_abplus(bridge_lua=...)`，否则环境变量 `ABP_BRIDGE_LUA`（worker 进程会继承，可以让测试副本和安装的那份同时跑），否则 `$ABP_HOME/bridge/abp_bridge.lua`（安装的那份）；Python 端 `BRIDGE_VERSION` 必须和它一致 |
 | [`isaac_bridge/abplus.py`](../python/isaac_bridge/abplus.py) | `AbplusTrainingEnv`（竞技场、房间、练习场和对战场的重置）、`AbplusTransformerEnv`（Gymnasium 环境，deadline 观测）、`launch_abplus`/`stop_abplus`（起停实例）、`sim_arena`（逐位复刻 `rl/sim/src/arena.rs`） |
 | [`abplus_eval.py`](../python/abplus_eval.py) | 多实例评估：每个 worker 一个 AB+ 实例加一份策略，按 `FrameSampler` 方式增量推理；指标同模拟器审计 `e2_reeval.py`；对战评估见"对战场" |
 | [`abplus_transfer_report.py`](../python/abplus_transfer_report.py) | 同种子配对比较模拟器与 AB+ 的结局、行为指标和 Monstro 动画时长 |
@@ -104,6 +104,7 @@
 
 | abp-0.2.14 | `fork`（克隆进程）、`lean`（精简模式）；见下一节。格式 2 的观测不变 |
 | abp-0.2.15 | 只改精简观测（整层环境用，C57）：房间号改为房间的 `SafeGridIndex`（大房间从哪个门进都一样）；门的第 4 个字节是"门后房间去过 / 已清"；出口活板门或楼梯出现时重发地形；新增小地图块（标志位 8）。其余同 abp-0.2.14 |
+| abp-0.2.16 | 只改精简观测的实体记录（10-08，A24）：108 → 144 字节，原有字段不变，末尾追加标志字（眼泪、激光的 `TearFlags`，敌弹的 `ProjectileFlags`，引擎的 uint64 原样；其他实体为 0）和激光的几何（角度的 cos / sin、`LaserLength`、端点（圆形激光为它自己的位置）、`Radius`、是否圆形；其他实体为 0）。原生观测（`abp_turbo.c`）同样写标志字，激光仍交给 Lua。激光块不变。其余同 abp-0.2.15 |
 
 ### 克隆与精简模式（abp-0.2.14，2026-10-03）
 
@@ -119,7 +120,7 @@
 **精简模式**：`{"cmd":"lean","enabled":bool}`，或 `fork` 带 `lean = true`。给 fork 采样器的每局克隆体用：
 - 不做每帧的 `update_combat` 和谱系、眼泪归因的登记；`combat` 块里的计数不再更新。
 - 输入由 abp_turbo 直接回答引擎（`ABP_INPUT`），不进 `MC_INPUT_ACTION` 回调。
-- `step`、`obs` 的观测是定长记录 `"L <字节数> <事件> <序号>\n" + 负载`，布局写在 `abp_bridge.lua` 的 `pack_lean` 上方，`abplus_lean.LeanDecoder` 直接读成 numpy 结构数组（玩家 36 个 double、门 16 字节、实体 108 字节）。带引擎的速度；奖励用的量只有玩家累计受伤、怪物总血量、挡门怪的血量和数量。
+- `step`、`obs` 的观测是定长记录 `"L <字节数> <事件> <序号>\n" + 负载`，布局写在 `abp_bridge.lua` 的 `pack_lean` 上方，`abplus_lean.LeanDecoder` 直接读成 numpy 结构数组（玩家 38 个 double、门 16 字节、实体 144 字节；abp-0.2.16 之前实体 108 字节）。带引擎的速度；奖励用的量只有玩家累计受伤、怪物总血量、挡门怪的血量和数量。
 - 地形每步只查上次有东西的格子，每 30 个逻辑帧全查一次：打掉的石头、便便立刻更新，空格上新出现的东西最迟 1 秒后更新。
 - 精简模式不改变游戏，观测与格式 2 逐字段一致（B9）。重置流程仍用原来的桥：采样器只让克隆体进精简模式。
 - 原生观测（B11，含 `ABP_OBS_INIT` 的 `libabp_turbo.so`）：记录的固定部分和地形检查由 abp_turbo 在 C 里填，字节与 Lua 打包的相同；小地图块、地形 JSON、激光房仍由 Lua 打包。环境变量 `ISAAC_RL_NATIVE_OBS`：0 Lua，1 原生（默认），2 两者都算并比较。
@@ -610,6 +611,31 @@ worker 进程 × N（tok_sampler.worker_main，不导入 torch）
 - **记录**（`tok_obs.ROW`，约 14 KB）：策略看到的就是玩家看得到的。
   - 玩家 31 维：位置、速度、各种心、炸弹钥匙硬币、属性、无敌时间、射击冷却、房间是否已清、时间用了多少等；
   - 实体最多 64 个（超出时取最近的），每个 33 维：相对玩家的位置和距离、引擎速度、大小、碰撞类别、接触伤害、动画帧、年龄、种类独热、敌人 / 可受伤 / Boss / 挡门标志、Boss 的血条、子弹的高度和下落速度，再加 type、variant、subtype 三个编号（查嵌入表）。小怪的血量、AI 状态和随机数不在里面；
+  - 10-08（桥 abp-0.2.16，A24）起每个实体再追加 23 维（`ENT_F` 33 → 56，前 33 维的含义和顺序不变，不适用的实体为 0）：
+    - 第 33–48 列，16 个标志位：眼泪和激光按 `tok_obs.TEAR_FLAG_MASKS` 读 `TearFlags`，敌弹按 `PROJ_FLAG_MASKS` 读 `ProjectileFlags`（标志字有掩码里的任一位即为 1）。位号取自游戏自带的 `resources/scripts/enums.lua`，引擎的 getter（`Entity_Tear::GetTearFlags` 读 +0x758、`Entity_Projectile::GetProjectileFlags` 读 +0x760）返回 uint64，luabridge 用 `lua_pushinteger` 交给 Lua：
+
+      | 列 | 眼泪 / 激光（TearFlags 位） | 敌弹（ProjectileFlags 位） |
+      |---|---|---|
+      | 33 | 幽灵 SPECTRAL（0） | 穿墙 NO_WALL_COLLIDE（13） |
+      | 34 | 穿透 PIERCING（1） | 穿过实体 GHOST（4） |
+      | 35 | 追踪 HOMING（2） | 追踪玩家 SMART（0） |
+      | 36 | 减速 SLOW（3） | SLOWED（24） |
+      | 37 | 中毒 POISON（4） | 酸液 ACID_GREEN、ACID_RED（2、8） |
+      | 38 | 冰冻 FREEZE（5） | 留下黏液 GOO、RED_CREEP、CREEP_BROWN（3、10、14） |
+      | 39 | 分裂 SPLIT、QUADSPLIT（6、18） | 爆开成更多子弹 BURST、BURST3（16、29） |
+      | 40 | 变大 GROW（7） | 加速 ACCELERATE（27） |
+      | 41 | 回旋 BOMBERANG（8） | 回旋 BOOMERANG（6） |
+      | 42 | 持续 PERSISTENT（9） | 能打怪 HIT_ENEMIES（7） |
+      | 43 | 扭动 WIGGLE、SPIRAL、BIG_SPIRAL（10、26、44） | 扭动 WIGGLE、SINE_VELOCITY、MEGA_WIGGLE、SAWTOOTH_WIGGLE（5、21–23） |
+      | 44 | 爆炸 EXPLOSIVE（12，Ipecac） | 爆炸 EXPLODE（1） |
+      | 45 | 环绕 ORBIT（16） | 环绕 ORBIT_CW、ORBIT_CCW（11、12） |
+      | 46 | 反弹 BOUNCE（19） | 弯曲 CURVE_LEFT、CURVE_RIGHT、TURN_HORIZONTAL（18–20） |
+      | 47 | 燃烧 BURN（22） | 火 FIRE（15） |
+      | 48 | 击退 KNOCKBACK（24） | 打不到玩家 CANT_HIT_PLAYER（31） |
+
+    - 第 49–55 列，激光（种类 3）：角度的 cos、sin，`LaserLength` / 300（AB+ 里玩家的 Brimstone、Technology 都是 0 = 不限长），端点相对玩家 / 200（`GetEndPoint`；圆形激光用它自己的位置），是否圆形（Tech X），`Radius` / 100。宽度就是第 7 列的大小（激光的 `Size`）。原来的激光块（采样点）照旧在精简观测里，不进 ROW。
+    - 网络读不读这 23 列由 `TokPolicy(ent_ext=True)`（检查点配置的 `ent_ext`）决定：读时接在实体 token 输入的最后（嵌入之后），旧检查点 `--init`（`load_compatible`）时新列权重为 0，输出与原检查点逐位相同；不读时与之前完全一样。`train_tok.py --ent-ext 1` 默认开，`--resume` 的检查点保持原来的设置；
+    - ROW 因此 14,760 → 20,648 字节（`ent` 之后的字段偏移都变了；同一次运行内由 `tok_obs.ROW` 统一）。FastRow（`abp_row_encode`）第 5 版；
   - 门最多 8 个，每个 7 维：相对位置、开着、锁着、门后房间类型、门后房间去过、已清；
   - 地形 7×16×28（`terrain_channels` 的 7 个通道）和以玩家为中心的 9×9 格局部地形；
   - 小地图 8×13×13（只在整层模式下有内容）；
@@ -632,7 +658,8 @@ worker 进程 × N（tok_sampler.worker_main，不导入 torch）
 - **训练器的速度选项**（B11）：`--overlap`（学习器在线程里更新，actor 同时用上一份权重采下一轮）、`--decoupled 1`（解耦 PPO，与 `--overlap` 一起用）、`--sort-micro`（默认 1）；开 `--overlap` 时 `--teacher-share` 默认 0.15。SIGINT / SIGTERM 时先存 `last.pt`。`--resume` 时 `--game-hours` 是再练多少。`--amp bf16`（学习器前向用 bf16）、step 行 / 原生 step / 地形缓存 / FastRow / `fork_many` 的环境变量开关和 actor 槽的修正见 B12。默认设置（C60）：3 个 epoch、同步、float32、教师；bf16 不默认开。`--overlap` 现在不用：同卡还有别的 CUDA 进程时会崩溃（B13）。`train_tok.py`、`tok_policy.py` 在环境里没有时设 `CUDA_DEVICE_MAX_CONNECTIONS=1`；`eval_tok.py` 默认在 CPU 上推理（`TOK_EVAL_DEVICE` 可改）；一块 GPU 只跑一个 CUDA 训练器。
 - **B14 的选项**：学习器 `--packed`、`--teach-merge`、`--teach-gpu`（默认都是 1，0 回到旧路径）。引擎帧改动（H 打桩表、`ABP_FAST=3`、`ISAAC_RL_PU_SKIP=1`）10-05 起是 worker 实例的默认（见下一条）；`ISAAC_RL_WATCH_PID=0` 让 worker 不设 `ABP_WATCH_PID`。精确性、速度和 watcher 的崩溃见 B14；两台的资源守护 `~/isaac-abplus/guard.sh` 见 EXPERIMENTS.md 的"已知问题"。
 - **B15 的默认和选项**：worker 的 root 实例默认 H 打桩表（`default_stub_list()`，`--stub-list` 可换）和 `tok_sampler.INSTANCE_ENV_DEFAULTS`（`ABP_FAST=3`、`ISAAC_RL_PU_SKIP=1`、`ABP_FORK_LITE=1`；环境里已设的不覆盖，设 0 关掉）；`--teacher-pair`（默认 1）、`--teacher-skip-known`（默认 0，少测一个移动的标签）、`--teacher-slots`（默认 0 = 不限）；`--build-timeout`（默认 120 秒，起始状态建不好就杀掉重启）；测试用的 `ISAAC_RL_FAULT_HANG`。`eval_tok.py` 仍默认 G 表。成本、精确性和卡死见 B15。
-- **没做的**：学习器的 CUDA Graph。（道具、药丸、卡牌的动作头 10-06 做了，见 A21。）
+- **B18 的选项（学习器快路径，10-10）**：`--learner-fast 1`（默认 0 = 原路径）：同一个 PPO 更新（同样的小批、epoch、裁剪、教师并入、损失），每个 4,096 行的小批步在 H20 上 87 → 40 毫秒（每步实体 token 到 56 的 C77 式 rollout 123 → 40 毫秒；都是绑核时，不绑核 41–54 毫秒）。做法：注意力按记录的真实 token 数分桶、在 float32 下用矩阵乘算（一层的几个桶一个 autograd 节点；原来 t > 64 时 SDPA 的耗时翻三倍）；实体、门的输入 MLP 只算真实 token；房间、小地图、玩家周围格子的 CNN 只算小批里不同的格子（每次更新在 GPU 上精确去重一次）；卷积 channels-last；层归一化的权重梯度用列和；各动作头的 log-softmax 一起算；小批按记录字节整行取；rollout 经常驻的锁页缓冲区上传，教师的 meta 在 GPU 上留一份（每步不再阻塞）；同时用 fused Adam。快路径之后一步受主机线程限速，和游戏进程抢核时慢约 20%：`--learner-cpus 56-59,168-171`（HPC 节点上 GPU 所在 NUMA 节点的 4 个核连同超线程）让学习器线程独占这些 CPU，训练器的其他线程、worker 和游戏都不上去（默认空 = 不绑）。不是逐位相同（求和次序不同；去重和聚集的梯度是原子加，同一路径两次之间也差约 1e-7），与 float64 参考的距离和原路径同一量级（见 B18）。端到端（48 个 worker、死亡教师）一次更新 2.12 → 1.05 秒，之后限速的是教师搜索（B18）。基准：`abplus_bench_learner.py`（带引擎跑一次时存下一个 rollout 和学习器状态，之后不起引擎反复跑真正的 `learn()`；`--check` 比较两条路径第一步的损失和梯度，`--profile`、`ISAAC_RL_LEARNER_CPROFILE=1` 剖析）；`abplus_check_learner_fp64.py`（两条路径与 float64 的距离）。
+- **没做的**：学习器的 CUDA Graph、`torch.compile`（每步的形状都在变；B18 以后一步的 GPU 时间和主机时间差不多，约各 35 毫秒）。（道具、药丸、卡牌的动作头 10-06 做了，见 A21。）
 
 ### 整层环境（C57 起，2026-10-03，桥 abp-0.2.15）
 
@@ -665,7 +692,42 @@ worker 进程 × N（tok_sampler.worker_main，不导入 torch）
 - **道具**（`--items`，A21）：库存块（持有的道具从新到旧带个数、主动道具和最大充能、饰品、药丸颜色和已知效果、卡牌、诅咒）进玩家 token，台座上的道具编号进实体 token（致盲诅咒下给 1023）；嵌入表道具 1024、饰品 256、药丸效果 256、卡牌 256、药丸颜色 16（按 Repentance(+) 的编号留了余量；只有道具 474 在 AB+ 和 Repentance+ 意义不同）。两个动作头：用主动道具、用药丸 / 卡牌（初始偏置 −4，用不了时屏蔽）。旧检查点 `--init` 时新输入补 0、新头新初始化。
 - **蓄力**（`--charge 1`，默认开，A22）：玩家的蓄力计数（`Entity_Player+0x2634`）和武器类型进 ROW 的 `pcharge`；`--resume` 的检查点保持原来的设置。4 帧一决策不丢任何一档离散的蓄力效果。
 - **`play` 与换房**（A22）：`play`、`fork_many` 遇到换房时把它当作一步的结束、接着走（与 step 行一致）；`stop_room: true` 回到以前"停下整批"的行为。地形块在网格实体的状态变化时也重发。
-- **分支**（第二阶段，B17/B2，仅在第二台 `brn` / `brn2` 沙箱实验，没有部署到 C67）：`tok_branch.py`。在拿道具、留下道具离开、换房还有别的门的地方，从房间入口的克隆体分出几支（原动作 / `pickup_block` 不拿 / 脚本走到别的门或台座），共用就地 reseed 由 actor 各打一段，结果存成选择记录（`choices.jsonl`）；`train_tok.py --branch-share`、`--branch-noise`、`--branch-max`、`--branch-ppo` 等。B2 已完成共用策略噪声、快照、截断自举与选择头的实验；目前尚未证明 CRN/快照的优势或选择头的留出泛化收益。
+- **分支**（第二阶段，B17/B2，仅在第二台 `brn` / `brn2` 沙箱实验，没有部署到 C67）：`tok_branch.py`。在拿道具、留下道具离开、换房还有别的门的地方，从房间入口的克隆体分出几支（原动作 / `pickup_block` 不拿 / 脚本走到别的门或台座），共用就地 reseed 由 actor 各打一段，结果存成选择记录（`choices.jsonl`）；`train_tok.py --branch-share`、`--branch-noise`、`--branch-max`、`--branch-ppo` 等。B2 已完成共用策略噪声、快照、截断自举与选择头的实验；目前尚未证明 CRN/快照的优势或选择头的留出泛化收益。C68（第一台，C67 最终 + 分支教师 + 分支起点库，3,000 游戏小时）：多层评估与 C67 持平，8,725 个选择点里"拿"平均比"不拿"低 0.3–0.5，选择头的在线预测与实测之差相关约 0（EXPERIMENTS.md C68）。
+- **起始构筑**（10-08，`--start-build-prob p --start-build-max k`，默认 0 = 照旧）：训练里从楼层起点开的局，以概率 p 在克隆体上移植一个随机构筑（`catalog/lab_items.json` 里 1..k 件，最多一件主动道具；实验室的 `transplant_lua`），从起点库开的局沿用那一局的构筑。目的：不靠标签，让策略在真实的整局环境里带着道具打（C70）。`episodes.jsonl` 的 `build0` 是第一条记录时持有的道具（以撒自带 D6 = 105，所以总非空），`progress.csv` 的 `start_builds` 是移植次数。
+- **初始属性增强**（10-08，用户：先练无道具的通关能力，对攻击力、射速、射程等初始属性做随机增强提升泛化；`--stat-aug-prob p [--stat-aug "damage=0.7:2.5,tears=0.7:2,range=0.8:1.5,shot_speed=0.8:1.3,speed=0.9:1.3"]`，默认 0 = 照旧）：训练里从楼层起点开的局以概率 p 抽一组对数均匀的倍率，换算成 C41 的 `AbpSetStats` 偏移（`tok_floor.stat_offsets`：伤害 3.5、弹速 1.0、移速 1.0 按倍率加偏移，射速按每秒发数 30/11 加偏移再由引擎取整 `MaxFireDelay`，射程按 `TearHeight` 的 (6.5 + r)/6.5 比例），在克隆体上 `MC_EVALUATE_CACHE` 重算，起点库的局沿用那一局的属性；玩家 token 本来就带这些属性。探针 `abplus_probe_stat_aug.py`（第二台沙箱 `aug`，10 次抽样）：观测到的属性与 `expected_stats` 完全一致，打 60 步和再 fork 后保持，起点状态的新克隆仍是基础值。`episodes.jsonl` 的 `stats0` = 第一条记录的（伤害、`MaxFireDelay`、弹速、射程、移速），`progress.csv` 的 `stat_augs`。评估不加。
+- **死亡回溯教师**（10-09，`--teacher-death-depths "2,4,8,16,32" [--teacher-death-margin 15]`，默认关 = 照旧；`rl/docs/SCALING_THESIS.md` §5）：原来的教师对每局最多 `--teacher-per-episode`（2）个随机挑出的受伤做搜索，深度 2 / 4 / 8 个决策、之后 4 个决策不受伤即算安全，致命的那一次受伤和别的受伤没有区别、还可能没被挑中。开了之后：导致死亡的受伤**总是**搜（队列满时最后被丢），深度按给定的列表直到 32 个决策（4.3 秒）前，而且要求之后 `--teacher-death-margin`（15 个决策 = 2 秒）内都不受伤才算安全（只是推迟死亡的方向不算）；记录格式不变，训练器照常用。致命受伤单独搜、不和同房间的其他受伤共用恢复点。统计 `progress.csv` 的 `death_searches`、`death_avoidable`、`death_s`。探针 `abplus_probe_death_teacher.py`（第二台沙箱 `aug`，随机动作打到死，6 个种子 5 次死亡）：机制正确——有 4 次在深度 2 就有安全方向；一次在普通口径（边距 4）有"安全"方向、死亡口径（边距 15）下 5 个深度全部无路（只是推迟死亡），每次搜索 0.2–1.2 秒。
+- **教师 v2：整条分支蒸馏**（10-10，`--teacher-v2 1`，需要 `--teacher-thread 1`，整层 / 整局模式；默认 0 = 照旧，和 `--teacher` 互相独立、可以同时开；`isaac_bridge/tok_teacher2.py`，`rl/docs/SCALING_THESIS.md` §5b，EXPERIMENTS.md B19）。动机：老教师只把恢复点那**一个**决策蒸馏进策略，`safe_mass_new` 一个游戏年恒为 0.61——搜索发现的路线没有被内化。
+  - **决策点**：受伤、死亡（致命那一步，深度用 `--teacher-death-depths`）、以及 `--teacher-v2-random`（每游戏小时的个数，默认 0）个随机记录。受伤按 `--teacher-per-episode` 抽、死亡和随机点总是进队列（`--teacher-v2-queue` 8，满时先丢非死亡的旧点）。恢复 = 老教师的恢复点（房间入口克隆体 + 重放到决策 d）；受伤按深度 2 / 4 / 8（`--teacher-v2-depths` 可改）逐个试，第一个"有改进"的深度就停。
+  - **候选（意图 × 每步重算）**：九个方向各按住 h 个决策（h 从 `--teacher-v2-hold "2,4,8"` 每个方向各抽一个），外加 `--teacher-v2-sticky-n`（1）个"粘性策略"意图（在 max(h) 个决策内，策略自己采样的方向保持几何分布、均值 `--teacher-v2-sticky` 4 个决策）。意图**只管移动**；射击、炸弹、道具、药丸每一步都由 actor 按分支自己的新状态给（温度 1，不用高温采样）；意图到期后策略接着打。每支最多 `--teacher-v2-seconds`（20 秒 = 150 个决策）或到死 / 本局的结束规则。
+  - **actor 怎么进 worker 的搜索线程**："lane"：每个 worker 多一个记录槽、一条管道和共享的动作 / 价值数组；搜索线程把分支的记录写进槽、发请求，训练器的 actor 用一个专门的 `GraphActor`（同一份权重）答，这些记录**不进 rollout、不进 PPO**。同步模式下 actor 等学习器时也答 lane。worker 一边等答复一边执行"进行中的动作"那一步（同主循环的一拍延迟）。
+  - **打分**：训练器的奖励项（`tok_branch.step_reward`，不含 heal / resource）按 γ 折扣，到 20 秒截断时加 γ^T·V（actor 对最后一条记录的价值）。本局自己的后续（taken）用 worker 记下的每条记录的奖励字段、停滞计数和 actor 的价值在同一窗口里算。最好的候选换一个 MT 种子重跑一次（复制分支）定噪声底：只有 best − taken > `--teacher-v2-margin`（0.3）**且** > |best − 复制| 才算改进。
+  - **蒸馏**：改进点的最好分支**每一步**都是一条模仿记录（ROW 照原局的样子编：决策下标 t = d 起、房间的初始怪物血量、本局在 d 的停滞计数），带进行中的动作、实际施加的动作（移动、射击、炸弹、道具、药丸）、权重 w = min(best − taken, `--teacher-v2-cap` 2) 和该步的折扣 return-to-go G。worker 的 V2 环（每 worker 384 条）→ 训练器 GPU 上的环（`--teacher-v2-buffer` 30,000 条，约 20 KB / 条）。每个小批步抽 `--teacher-v2-batch`（256，按 `--teacher-v2-reuse` 4 折算）条并进最后一个 micro 段（`--teach-merge 0` 时单独一遍；`--learner-fast` 两条路径都支持）：损失 + share ×（`--teacher-v2-coef` × mean(−w·Σ_头 log π(a|o)) + `--teacher-v2-vf` × mean((V(o) − G)²)），share = `--teacher-v2-weight` × 条数 / 小批大小；`--teacher-v2-vf` 默认 0.25（= PPO 价值项的 0.5 × 0.5）。
+  - **诊断**（`progress.csv` 的 `v2_*`）：worker 累计 `v2_points`、`v2_improving`、`v2_records`、`v2_s`、`v2_cpu`、`v2_wait_s`（等 actor 的秒数）、`v2_branches`、`v2_dec`、`v2_errors` 等；本次更新窗口的 `v2_improving_share`、`v2_gain0_mean`（第一个深度的 best − taken 平均）、`v2_spread_mean`、`v2_cpu_per_point`；新到记录上训练前的 `v2_prior`（最好分支第一步移动的 log π）、`v2_prior_p`、`v2_prior_all`（各头之和）、`v2_verr`（V − G）；训练中的 `v2_loss_pi`、`v2_loss_vf`、`v2_logp`；lane 的 `v2_lane_calls` / `_rows` / `_s`。**验收**：`v2_prior` 随训练上升、`v2_improving_share` 下降，否则这一版也算失败。
+  - 探针 `abplus_probe_teacher_v2.py`（不带 actor：用"重放原局动作"和"随机射击"两种替身检查管线）、`abplus_check_teacher_v2_loss.py`（损失对手算值、并入布局对单独前向）。同一改动给 `tok_floor.Parked` 加了锁：搜索线程和 worker 主线程会 fork 同一个停放的克隆体（模板 / 起点库条目也是排队搜索的恢复点），以前在 `--teacher-thread 1` 下没有互斥。
+- **搜索不阻塞采样**（10-10，`--teacher-thread 1 [--teacher-fork 1] [--teacher-share s] [--teacher-slots k]`，默认关 = 照旧）：原来受伤搜索在 worker 的主循环里做，只在训练器更新时和 `--teacher-share` 内跑；学习器快了（B18）之后搜索装不进更新窗口、溢到采样里。`--teacher-thread 1` 把搜索放进 worker 的线程（队列加锁、`Parked` 的 fork / hold / release 加锁），但线程里的 numpy / 编码一次握 GIL 几毫秒，worker 自己的编码从 0.2 ms 涨到 8 ms（HPC C77：1,800× ↔ 600× 摆动；`sys.setswitchinterval(0.0002)` 也不够）。`--teacher-fork 1`：每次搜索在 worker 的 fork 子进程里跑——线程先在共享的恢复点上 fork 一份搜索专用副本（锁内一条命令），父进程只关掉自己这端的连接（克隆体跟着子进程活）、子进程搜完把教师记录写进共享内存的环后 `_exit`，线程只等它；一个 worker 同时只有一个子进程，环的下标不乱。HPC 32 worker 基准：collect 0.55 秒 / 8,192 决策稳定、队列 0、0 errors。`--teacher-slots` 的文件锁跨进程照样生效。
+- **深层优先的起点库**（10-08，`--archive-deep d`，默认 1 = 照旧）：整局模式从起点库开局时按 d^(层−1) 加权抽（d = 4：二层入口 4 倍、三层 16 倍），起点库满时先换掉最浅一层的条目。依据：C68 的决策 71% 从一层开始、23% 二层、6% 三层，而死亡都在二、三层（C71）。
+- **角色随机**（10-08，A25，桥 abp-0.2.17；`--characters "0,1,2,3,5,6,7,8,13,15"`、带权重 `"0:4,7:1"` 或 `all` = `tok_floor.CHARACTERS_ALL` 的 0–9、13–15 均匀；默认空 = 只用以撒，照旧）：整层 / 整局模式训练里，每个楼层起点由 worker 自己的随机数（`[seed, worker, 17]`）抽一个角色，`tok_floor` 的 `prepare` 设到 root 的 `bridge.character`，`_restart_floor` 用 abp_turbo 的 `ABP_PLAYERTYPE:<id>` 让这次开局以该角色开始；从起点库开的局沿用那一局的角色。为什么不用控制台的 `restart <id>`：实例以 `--set-stage=1` 跑调试局，每次 restart 都走 `Game::StartDebug`，它调 `PlayerManager::Init` 时角色固定传 0，`restart` 的参数在调试局里不起作用（A25 的第一次探针全是以撒）；abp_turbo 把这一处调用（0x6dff3f）改到自己的函数，装填了就换成装填的角色（一次性），没装填就照旧传 0。角色 0 的记录与改动前逐字节相同（A25）。
+  - 观测：精简观测的玩家记录加第 39 个 double `ptype`（`GetPlayerType()`，Lua 和原生两条路径；库的 `abp_native_player_f` 不是 39 时桥只用 Lua 路径）；ROW 追加 int16 `pchar`（0..31，原字段偏移和 ROW 的 20,648 字节都不变），FastRow 第 6 版。
+  - 网络：`TokPolicy(pchar=True)`（检查点配置 `pchar`）用一张 32 × 宽度的角色表（初值 0），按 `pchar` 取一行加在玩家 MLP 第一层的输出上（等价于 32 个独热输入列）；旧检查点 `--init` 后输出逐位不变（A25；直接补零输入列只到求和顺序误差 3e-5，所以没用）。`--pchar -1`（默认）= 有 `--characters` 时开，`--resume` 沿用检查点的设置。
+  - 不支持（报错）：10 The Lost（一碰就死，另一种任务）、11 Lazarus II、12 Black Judas（复活 / 变身后的形态，不是开局角色）、16 The Forgotten / 17 The Soul（两个身体靠一个键切换，动作空间里没有；骨棒不是眼泪）。14 Keeper 包括在内、没做任何特殊处理：AB+ 里它的硬币心在引擎里就是红心容器（`GetHearts` / `GetMaxHearts` = 4），玩家 token 的心的列照常有值，捡硬币回血是游戏自己的规则。8 Lazarus 死一次时第一条 dead 记录就结束这一局（之后他会以 Lazarus II 复活，但训练里不玩复活后的部分），与带额外生命的道具一样。
+  - 记录：`episodes.jsonl` 的 `char0`（第一条记录的 `pchar`）；`progress.csv` 的 `char_starts`（以非以撒角色建的楼层起点，worker 累计）和每个角色的 `char_<id>/episodes`、`char_<id>/win`（这次更新结束的局）。
+  - 评估默认仍是以撒；`eval_tok.py --characters …` 时每个种子的角色只由种子决定（`tok_floor.character_of_seed`），`summary.json` 加 `by_character`。
+  - 注意：初始属性增强（`--stat-aug-prob`）的偏移是按以撒的基础值算的，叠在别的角色上倍率只是近似；各角色的起始道具取决于该机存档的解锁（第二台的以撒带 D6）。探针 `abplus_probe_characters.py`、`abplus_probe_characters_sampler.py`。
+
+### 构筑实验室（第三阶段，2026-10-08；EXPERIMENTS.md A23）
+
+用户 10-06 的设计：构筑（持有的道具，以及随之而来的属性、心、跟班）在以撒里可以搬到任何状态上，所以可以直接量一个构筑有多强：把它移植进一组固定的、停着的房间状态，用当前策略打，各构筑共用随机数；用结果训练构筑模型，挑模型最拿不准的构筑去量；实验室的局本身也是带道具的正常策略局（练习用道具）。代码 `isaac_bridge/tok_lab.py`（模块说明是完整的设计），`train_tok.py --lab-*`，worker 一侧在 `tok_floor.py`。只在整层 / 整局模式；`--lab-share 0`（默认）时什么都不变。
+
+- **移植**（`tok_lab.transplant_lua`）：Lua 里对每个道具 `AddCollectible(id, 充能, true)`，主动道具给满充能。这就是引擎拾取的那条路去掉台座：台座被碰到后道具进队列、举过头，`Entity_Player::FlushQueueItem` 再调用 `AddCollectible(id, 台座的充能, 没碰过)`；`AddCollectible` 自己调用 `EvaluateItems`、加心和消耗品、生成跟班和掉落物（反编译和调用表）。实机核对见 A23：属性当场生效，与拾取后的构筑相同。
+- **面板**（`--lab-panel normal:24,boss:6,normal_big:6 --lab-seed 2147700000`）：目录组的房间（单房 worker 的房间重置：goto 房间、自带的怪、门封住，以撒 6 个半心、1 个炸弹、没有道具），留出种子，三组交错排列。每个状态由一个 worker 在自己的 root 里建好停着（`build_panel_state`，root 的建立线程空闲时），按估计时长用 LPT 分给 worker（`assign_panel`；`--lab-costs <之前运行的 lab.jsonl>` 用实测的每状态时长）；root 重启丢了就在下一个起始状态处按同样的种子重建（重建出的状态摘要相同）。
+- **任务**：训练器的 `LabScheduler` 发任务（共享数组 64 个槽，任务号 j 在槽 j mod 64，最多 `--lab-inflight` 个没完成），一个任务 = 一个构筑 + 一个重复号 rep。每个 worker 按任务号顺序对自己的面板状态各跑一局：停着的状态的精简克隆体 → 移植 → 就地 reseed `state_reseed(状态的种子, rep)`（全局 MT：从第一条记录起共用随机数，不管移植抽过多少随机数）→ 由 actor 打。记录带 ROW `lab`（任务号）、`lab_s`（面板状态号 + 1）、`crn`（`state_crn(状态, rep)`：策略的采样噪声也共用）。结束：死亡、房间清掉、离开房间、`--lab-seconds`（90 秒；后三种是截断，`done = DONE_BRANCH`，训练器自举）、整层的 60 秒停滞规则。同一构筑、同一 rep、同一权重的两次是同一局（双胞胎核对），换 rep 是种子噪声。worker 的实验室时间占 `--lab-share`（≥ 1：有任务就做）；状态的结果写进每个 worker 的结果环（`RES`），训练器按任务拼起来（`LabBook`），全部状态都到了是一个构筑结果，写进 `lab.jsonl`（每个状态：清掉、死、掉的半心、打掉的怪物血量占比、帧数、训练器奖励单位下的不折扣回报、结束方式、轨迹摘要、权重版本）。
+- **选构筑**（`--lab-mix`，默认 `base=0.08,model=0.15,random=0.1,seen=0.05`，其余是单个道具）：空构筑（基线）；单个道具（`abplus/catalog/lab_items.json` 的 530 个，每个都轮到一次再重来）；模型的候选（构筑模型对随机 2–3 件的候选池 `--lab-pool` 的分歧最大的）或随机的 2–3 件；训练局结束时持有的道具；`--lab-builds` 文件里的构筑最先；`--lab-noise` 的份额复制最近的任务（一半同 rep：双胞胎，一半换 rep：种子噪声）。一个构筑最多一个主动道具。
+- **道具池**：`lab_items.json` 由 AB+ 的 `items.xml`、`itempools.xml` 生成：passive / active / familiar 共 547 个，出现在至少一个普通模式道具池（不算 greed 池）里的 530 个；排除的 17 个和原因在文件里（钥匙碎片、宝丽来、底片、铲子等任务道具，Krampus 的头、两匹马、肉块、绷带球等特殊掉落，474 Tonsil 等）。
+- **构筑模型**（`LabModel`，学习器线程里、CPU 上）：K 个（`--lab-model-k`，5）小 MLP：道具的嵌入袋（多热）+ 移植后的属性（还没量过的候选用基线属性加各道具单件构筑的属性差）→ 回报、清掉、死、掉血、伤害、时间（标准化）；每个头用自己的 Poisson(1) 自举权重；每次更新 `--lab-model-steps` 步；分歧 = 各头回报预测的标准差；新构筑先做一次样本外预测（`lab_preq_abs`）再加进去。
+- **PPO**：实验室的局默认也进 PPO（`--lab-ppo 0` 去掉），它们是带道具的同策略数据；在 `progress.csv` 里单独计数（`lab_*` 列），不进普通局的统计。
+- **工具**：`abplus_probe_transplant.py`（移植对拾取）、`abplus_probe_lab_panel.py`（面板的建立、内存、重建、启动成本）、`abplus_lab_report.py <运行目录…>`（噪声底、基线、单件表、"用不了"候选、两件的协同；`--pairs-json` 写出前 N 个单件的两两组合；`--model-check` 按顺序重放构筑模型的样本外预测）。
+- **用法**：训练里 `train_tok.py --mode run --items … --lab-share 0.3 [--lab-costs <之前运行的 lab.jsonl>]`；冻结策略的普查 `--lr 0 --lr-final 0 --lab-share 1 --lab-inflight 48 --lab-noise 0.1 --lab-mix base=0.05,model=0,random=0,seen=0 [--lab-builds <文件>]`（第二台 `lab/runs/lab_survey.sh`）。输出 `lab.jsonl`（每个构筑一行）、`lab_panel.json`（面板和各状态的 worker）、`progress.csv` 的 `lab_*` 列。
+- **量到的**（A23，C67 最终，第二台 16 个 worker）：一个构筑约 0.235 游戏小时（36 局），冻结普查约 850–990 个构筑 / 墙钟小时，训练里 `--lab-share 0.3` 约 1.3 个 / 游戏小时；冻结策略下同构筑同种子逐局相同，构筑平均的种子噪声 0.10；530 个单件中位增益 −0.095。
 
 ### 对着人类定的指标（2026-10-03）
 

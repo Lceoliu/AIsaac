@@ -111,7 +111,26 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # with equal states but other actions (must stay 0 with common random numbers), pairs run (all, unconditional
          # replicate, conditional), branch states parked in the archive
          'b_shop_skip', 'b_unreach_skip', 'b_twins', 'b_twin_act_diff', 'b_pairs', 'b_noise_pairs', 'b_cond_pairs',
-         'b_archived')
+         'b_archived',
+         # 2026-10-08 (build lab, tok_lab.py; tok_floor only, zero unless cfg.lab_share > 0): jobs taken, panel states
+         # run (lab episodes), their decisions and logic frames, wall / worker-thread CPU / game-clone CPU seconds,
+         # errors, result records written, panel states parked now, seconds building them, panel (re)builds
+         'lab_jobs', 'lab_states', 'lab_dec', 'lab_frames', 'lab_s', 'lab_cpu', 'lab_game_cpu', 'lab_errors',
+         'lab_results', 'lab_panel', 'lab_panel_s', 'lab_panel_builds',
+         # 2026-10-08: start builds transplanted (cfg.start_build_prob), stat augmentations applied (cfg.stat_aug_prob)
+         'start_builds', 'stat_augs',
+         # 2026-10-08 (cfg.characters): floor starts built as a character other than Isaac
+         'char_starts',
+         # 2026-10-09 (death teacher): fatal hurts searched, of them with a safe move found, their search seconds
+         'death_searches', 'death_avoidable', 'death_s',
+         # 2026-10-10 (teacher v2, tok_teacher2.py; tok_floor only, zero unless cfg.teacher_v2): points searched (and of
+         # them random / fatal ones), depths tried, points with an improving branch, sums of best - taken at the first
+         # and at the last depth, sum of the replicate spreads and replicates run, branches run, their decisions and
+         # logic frames, imitation records written, wall / worker-thread CPU / lane-wait seconds, errors, points
+         # queued now, dropped, without a possible depth
+         'v2_points', 'v2_random', 'v2_fatal', 'v2_depths', 'v2_improving', 'v2_gain0', 'v2_gain', 'v2_spread',
+         'v2_reps', 'v2_branches', 'v2_dec', 'v2_frames', 'v2_records', 'v2_s', 'v2_cpu', 'v2_wait_s', 'v2_errors',
+         'v2_queue', 'v2_dropped', 'v2_nodepth')
 TEACH_RING = 128     # teacher records per worker the trainer may fall behind by
 TEACH_META = 16      # per record: the action under way (3), nine danger bits, the move taken, depth, safe moves, 0
 ST = {k: i for i, k in enumerate(STATS)}
@@ -156,7 +175,31 @@ class TokSamplerConfig:
     teacher_slots: int = 0                        # searches running at once over all workers at most (0: no limit)
     teacher_skip_known: bool = False              # no clone for a move whose hurt is known (known_hurt_move)
     teacher_pair: bool = False                    # the queued hurts of one episode share a restore (hindsight_shared)
-    mode: str = 'room'                            # 'room': one room per episode; 'floor' / 'run': tok_floor.py
+    # 2026-10-09 (death teacher, SCALING_THESIS.md S5; off unless teacher_death_depths is set): the fatal hurt of an
+    # episode is always searched (never dropped by teacher_per_episode), with these depths and this margin instead
+    teacher_death_depths: tuple = ()              # e.g. (2, 4, 8, 16, 32): up to 4.3 s before the fatal step
+    teacher_death_margin: int = 0                 # 0: teacher_margin
+    # 2026-10-10 (floor / run modes): 1 = the searches run in a thread of the worker, so a search never holds the
+    # worker's episode (with a fast learner the searches no longer fit into the update and stalled the collection:
+    # C77 on the HPC, collect 1.4 -> 12 s); teacher_share then bounds the thread's search time outside the updates.
+    # 0 = as before (searches during the updates and, within teacher_share, in the worker's own loop)
+    teacher_thread: int = 0
+    teacher_fork: int = 0                        # 2026-10-10: with teacher_thread, each hurt search in a forked child
+    # 2026-10-10 (teacher v2, tok_teacher2.py; floor / run modes, needs teacher_thread; off = nothing changes): whole
+    # branches from decision points (hurts, deaths, random records) with movement intents x the actor's per-step answers
+    # (through a lane of the worker), the best one's every step an imitation record when it beats the episode's own
+    # continuation by more than the margin and its replicate's spread
+    teacher_v2: bool = False
+    teacher_v2_hold: tuple = (2, 4, 8)            # decisions a held-move intent lasts (one drawn per move and depth)
+    teacher_v2_sticky: float = 4.0                # mean decisions a sticky-policy intent keeps a sampled move (0: none)
+    teacher_v2_sticky_n: int = 1                  # sticky-policy intents per depth
+    teacher_v2_seconds: float = 20.0              # a branch's game-time cap (then the value bootstrap)
+    teacher_v2_margin: float = 0.3                # best - taken must exceed this (and the replicate's spread)
+    teacher_v2_cap: float = 2.0                   # an imitation record's weight: min(best - taken, this)
+    teacher_v2_random: float = 0.0                # random decision points per game hour of play (0: hurts / deaths only)
+    teacher_v2_queue: int = 8                     # points waiting per worker (each holds its room's parked entry)
+    teacher_v2_depths: tuple = ()                 # hurts' depths (empty: teacher_depths); deaths: teacher_death_depths
+    mode: str = 'room'                          # 'room': one room per episode; 'floor' / 'run': tok_floor.py
     items: bool = False                           # 2026-10-06: the bridge's lean_items, ROW's item fields, 5 actions
     run_seconds: float = 1800.0                   # run: an episode's time limit (game seconds)
     floor_seconds: float = 480.0                  # floor: an episode's time limit
@@ -192,6 +235,32 @@ class TokSamplerConfig:
     branch_gamma: float = 0.995                   # the trainer's discount (the score)
     branch_archive: int = 0                       # 1: the take branch's took state and end state into the archive
     branch_left_back: int = 4                     # item_left: restored this many decisions before the leaving step
+    # 2026-10-08: the build lab (tok_lab.py; floor / run modes; off at share 0)
+    lab_share: float = 0.0                        # share of a worker's wall time on lab jobs (>= 1: whenever a job waits)
+    lab_seconds: float = 90.0                     # a lab episode's game-time cap
+    lab_specs: list = field(default_factory=list)  # task specs of the panel's groups (load_spec)
+    lab_panel: list = field(default_factory=list)  # panel states: (index into lab_specs, seed)
+    lab_owner: list = field(default_factory=list)  # the worker of each panel state (tok_lab.assign_panel; empty: k mod W)
+    # 2026-10-08: start builds (floor / run modes, training only): this share of the ordinary episodes that start from
+    # the floor's start state begin with a random build of 1 .. start_build_max eligible collectibles
+    # (tok_lab.transplant_lua into the episode's clone); archive entries carry their episode's build along
+    start_build_prob: float = 0.0
+    start_build_max: int = 3
+    start_build_items: str = ''                   # catalog/lab_items.json ('' : the default next to the bridge)
+    # 2026-10-08 (user: augment the base stats for generalisation): stat_aug_prob of the floor-start training episodes
+    # get random multipliers of the player's stats, log-uniform within stat_aug's ranges ("damage=0.7:2.5,tears=0.7:2,
+    # range=0.8:1.5,shot_speed=0.8:1.3,speed=0.9:1.3"), applied as AbpSetStats offsets on Isaac's base values
+    # (abplus.STAT_BASE) in the episode's clone; archive entries carry their episode's stats along
+    stat_aug_prob: float = 0.0
+    stat_aug: str = ''
+    # 2026-10-08: deeper floors first: archive entries are drawn with weight archive_deep^(floor - 1) and the
+    # shallowest floor's entries are evicted first (1: uniform, as before)
+    archive_deep: float = 1.0
+    # 2026-10-08 (character randomisation; floor / run modes): the PlayerTypes a floor start restarts the run as, with
+    # weights ("0,1,2" or "0:4,7:1"; tok_floor.parse_characters); each floor start's character is drawn from the worker's
+    # own rng (evaluation: from the seed); archive starts keep the character of the episode they were parked from.
+    # '': Isaac only, as before
+    characters: str = ''
 
 
 def attach(names, workers):
@@ -222,6 +291,15 @@ def attach_choices(names, workers):
     meta = np.ndarray((workers, CHOICE_RING, CHOICE_META), np.float64, buffer=blocks[1].buf)
     aux = np.ndarray((workers + 1, AUX_F), np.float64, buffer=blocks[2].buf)
     return blocks, rows, meta, aux
+
+
+def attach_lab(names, workers):
+    """(blocks, jobs [LAB_JOBS, JOB_F] int64, results [workers, LAB_RING, RES_F] float64) of the build lab (tok_lab)."""
+    from .tok_lab import JOB_F, LAB_JOBS, LAB_RING, RES_F
+    blocks = [shared_memory.SharedMemory(name=n) for n in names]
+    jobs = np.ndarray((LAB_JOBS, JOB_F), np.int64, buffer=blocks[0].buf)
+    res = np.ndarray((workers, LAB_RING, RES_F), np.float64, buffer=blocks[1].buf)
+    return blocks, jobs, res
 
 
 def play_actions(clone, decoder, acts, repeat):
@@ -1133,6 +1211,38 @@ class TokSampler:
             self.aux[:] = 0
             self.attached += attached
             self.choice_seen = np.zeros(n, np.int64)
+        # 2026-10-08: the build lab's job slots and result rings (tok_lab; floor / run modes, training only)
+        lab_names = None
+        self.lab_jobs = self.lab_res = None
+        if cfg.lab_share > 0 and cfg.mode in ('floor', 'run') and not cfg.eval_seeds and cfg.lab_panel:
+            from .tok_lab import JOB_F, LAB_JOBS, LAB_RING, RES_F
+            more = [shared_memory.SharedMemory(create=True, size=s)
+                    for s in (8 * LAB_JOBS * JOB_F, 8 * n * LAB_RING * RES_F)]
+            lab_names = [b.name for b in more]
+            self.blocks += more
+            attached, self.lab_jobs, self.lab_res = attach_lab(lab_names, n)
+            self.lab_jobs[:] = 0
+            self.attached += attached
+            self.lab_seen = np.zeros(n, np.int64)
+        # 2026-10-10 (teacher v2, tok_teacher2; floor / run modes, training only): the lanes (a second record slot and
+        # pipe per worker that the actor answers outside the rollout) and the imitation records' rings
+        v2_names = None
+        self.lane_rows = self.lane_io = self.lane_out = self.main_value = self.v2_rows = self.v2_meta = None
+        self.lane_ready = []
+        self._lanes = {}
+        if cfg.teacher_v2 and cfg.mode in ('floor', 'run') and not cfg.eval_seeds:
+            from .tok_teacher2 import attach_v2, v2_sizes
+            more = [shared_memory.SharedMemory(create=True, size=s) for s in v2_sizes(n)]
+            v2_names = [b.name for b in more]
+            self.blocks += more
+            attached, self.lane_rows, self.lane_io, self.lane_out, self.main_value, self.v2_rows, self.v2_meta = \
+                attach_v2(v2_names, n)
+            self.lane_rows[:] = np.zeros(1, ROW)[0]
+            self.lane_io[:] = 0
+            self.lane_out[:] = 0
+            self.main_value[:] = 0
+            self.attached += attached
+            self.v2_seen = np.zeros(n, np.int64)
         self.stats[:] = 0
         self.control[:] = 0
         # 2026-10-06: one decoded-PNG cache for all the instances of this sampler (abp_turbo ABP_PNG_CACHE_FILE) instead
@@ -1146,12 +1256,23 @@ class TokSampler:
         target = worker_main
         if cfg.mode in ('floor', 'run'):
             from .tok_floor import floor_worker_main as target
+        self.lane_conns = []
         for i in range(n):
             ours, theirs = ctx.Pipe()
-            extra = (choice_names,) if choice_names is not None else ()   # (tok_floor's worker only)
-            proc = ctx.Process(target=target, args=(i, cfg, names, theirs, teacher_names) + extra, daemon=True)
+            # (tok_floor's worker only; 2026-10-08: and the lab's blocks)
+            extra = (choice_names, lab_names) if lab_names is not None else \
+                (choice_names,) if choice_names is not None else ()
+            kw = {}
+            if v2_names is not None:   # 2026-10-10 (teacher v2): the worker's lane
+                lane_ours, lane_theirs = ctx.Pipe()
+                kw = dict(v2_names=v2_names, v2_conn=lane_theirs)
+            proc = ctx.Process(target=target, args=(i, cfg, names, theirs, teacher_names) + extra, kwargs=kw,
+                               daemon=True)
             proc.start()
             theirs.close()
+            if v2_names is not None:
+                lane_theirs.close()
+                self.lane_conns.append(lane_ours)
             self.conns.append(ours)
             self.procs.append(proc)
         self.index = {c: i for i, c in enumerate(self.conns)}
@@ -1163,6 +1284,70 @@ class TokSampler:
         for c in self.conns:
             self._poller.register(c.fileno(), select.POLLIN)
             self._by_fd[c.fileno()] = c
+        # 2026-10-10 (teacher v2): the lanes' pipes in the same poll set (a lane request wakes the actor's poll; it is
+        # collected in lane_ready, not returned as a record) and in a poll set of their own (wait_lanes)
+        self._lane_poller = select.poll() if self.lane_conns else None
+        for i, c in enumerate(self.lane_conns):
+            self._lanes[c.fileno()] = i
+            self._poller.register(c.fileno(), select.POLLIN)
+            self._lane_poller.register(c.fileno(), select.POLLIN)
+
+    def _lane_message(self, fd):
+        """A lane's request (one 5-byte message) into lane_ready; a closed lane leaves the poll sets."""
+        try:
+            msg = os.read(fd, 5)
+        except OSError:
+            msg = b''
+        if msg in (_MSG0, _MSG1):
+            self.lane_ready.append(self._lanes[fd])
+            return
+        for p in (self._poller, self._lane_poller):
+            try:
+                p.unregister(fd)
+            except (KeyError, ValueError, OSError):
+                pass
+        self._lanes.pop(fd, None)
+
+    def wait_lanes(self, timeout):
+        """Teacher v2: waits up to `timeout` s for lane requests (while the actor has no records to answer, e.g. while
+        it waits for the learner); True when some are in lane_ready."""
+        if self._lane_poller is None:
+            return False
+        if not self.lane_ready:
+            for fd, _ in self._lane_poller.poll(max(0, int(timeout * 1000))):
+                if fd in self._lanes:
+                    self._lane_message(fd)
+        return bool(self.lane_ready)
+
+    def take_lanes(self):
+        """The workers whose lane requests are waiting (int64 array, distinct), lane_ready emptied."""
+        idx = np.unique(np.array(self.lane_ready, np.int64))
+        self.lane_ready = []
+        return idx
+
+    def reply_lanes(self, idx):
+        for i in idx:
+            try:
+                os.write(self.lane_conns[i].fileno(), _REPLY)
+            except OSError:
+                pass
+
+    def v2_records(self):
+        """The teacher-v2 imitation records written since the last call: (rows, meta [n, V2_META]); None without."""
+        if self.v2_rows is None:
+            return None
+        from .tok_teacher2 import V2_META, V2_RING
+        rows, meta = [], []
+        for i in range(self.cfg.workers):
+            count = int(self.stats[i, ST['v2_records']])
+            first = max(int(self.v2_seen[i]), count - V2_RING)
+            for c in range(first, count):
+                rows.append(self.v2_rows[i, c % V2_RING].copy())
+                meta.append(self.v2_meta[i, c % V2_RING].copy())
+            self.v2_seen[i] = count
+        if not rows:
+            return np.zeros((0,), ROW), np.zeros((0, V2_META), np.float64)
+        return np.stack(rows), np.stack(meta)
 
     def _drop(self, c):
         if c in self.live:
@@ -1190,6 +1375,9 @@ class TokSampler:
         first = None
         while True:
             for fd, ev in self._poller.poll(timeout):
+                if self._lanes and fd in self._lanes:   # 2026-10-10 (teacher v2): a lane request, not a record
+                    self._lane_message(fd)
+                    continue
                 c = self._by_fd.get(fd)
                 if c is None or c not in self.live:
                     continue
@@ -1276,6 +1464,21 @@ class TokSampler:
             return np.zeros((0,), ROW), np.zeros((0, CHOICE_META), np.float64)
         return np.stack(rows), np.stack(meta)
 
+    def lab_records(self):
+        """The lab's result records written since the last call (tok_lab RES vectors, [n, RES_F]); None without the
+        lab."""
+        if self.lab_res is None:
+            return None
+        from .tok_lab import LAB_RING, RES_F
+        out = []
+        for i in range(self.cfg.workers):
+            count = int(self.stats[i, ST['lab_results']])
+            first = max(int(self.lab_seen[i]), count - LAB_RING)
+            for c in range(first, count):
+                out.append(self.lab_res[i, c % LAB_RING].copy())
+            self.lab_seen[i] = count
+        return np.stack(out) if out else np.zeros((0, RES_F), np.float64)
+
     def reply(self, idx):
         for i in idx:
             try:   # what Connection.send_bytes(b'a') writes (header and byte in one write), without its layers
@@ -1295,6 +1498,8 @@ class TokSampler:
                 p.terminate()
         self.rows = self.actions = self.stats = self.control = self.teach_rows = self.teach_meta = None
         self.choice_rows = self.choice_meta = self.aux = None
+        self.lab_jobs = self.lab_res = None
+        self.lane_rows = self.lane_io = self.lane_out = self.main_value = self.v2_rows = self.v2_meta = None
         for b in self.attached:
             b.close()
         for b in self.blocks:

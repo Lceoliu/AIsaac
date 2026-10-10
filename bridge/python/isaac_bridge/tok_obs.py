@@ -21,7 +21,45 @@ import numpy as np
 from .transformer_obs import terrain_channels
 
 ENT_CAP = 64
-ENT_F = 33
+# 2026-10-08 (abp-0.2.16, the policy's view of lasers and tear flags): entity columns 0 .. 32 are those of before (same
+# meaning, same order); appended are FLAG_F flag columns and LASER_F laser columns, 0 for entities they do not apply to.
+#   flag columns (FLAG_COLUMN + j): 1 when the entity's flag word (abplus_lean 'tflags': a tear's or a laser's
+#     TearFlags, a projectile's ProjectileFlags) has a bit of TEAR_FLAG_MASKS[j] (tears, lasers) or PROJ_FLAG_MASKS[j]
+#     (projectiles). Bit numbers: AB+'s own resources/scripts/enums.lua (TearFlags, ProjectileFlags); the engine's
+#     getters (Entity_Tear::GetTearFlags +0x758, Entity_Projectile::GetProjectileFlags +0x760) return the uint64 that
+#     luabridge pushes as a Lua integer.
+#   laser columns (LASER_COLUMN + 0 .. 6): cos and sin of the laser's angle, LaserLength / 300 (0: an unbounded beam
+#     such as Brimstone's), its end point relative to the player / 200 (GetEndPoint; a circle laser's own position), circle
+#     (1 / 0), Radius / 100. A laser's width is its Size (column 7).
+ENT_F0 = 33
+FLAG_F = 16
+LASER_F = 7
+FLAG_COLUMN = ENT_F0
+LASER_COLUMN = ENT_F0 + FLAG_F
+ENT_F = ENT_F0 + FLAG_F + LASER_F
+_B = [1 << k for k in range(64)]
+# j: tear (and laser) TearFlags | projectile ProjectileFlags
+TEAR_FLAG_MASKS = np.array([
+    _B[0],                     # 0 TEAR_SPECTRAL          | NO_WALL_COLLIDE (13)
+    _B[1],                     # 1 TEAR_PIERCING          | GHOST (4)
+    _B[2],                     # 2 TEAR_HOMING            | SMART (0)
+    _B[3],                     # 3 TEAR_SLOW              | SLOWED (24)
+    _B[4],                     # 4 TEAR_POISON            | ACID_GREEN, ACID_RED (2, 8)
+    _B[5],                     # 5 TEAR_FREEZE            | GOO, RED_CREEP, CREEP_BROWN (3, 10, 14)
+    _B[6] | _B[18],            # 6 TEAR_SPLIT, QUADSPLIT  | BURST, BURST3 (16, 29)
+    _B[7],                     # 7 TEAR_GROW              | ACCELERATE (27)
+    _B[8],                     # 8 TEAR_BOMBERANG         | BOOMERANG (6)
+    _B[9],                     # 9 TEAR_PERSISTENT        | HIT_ENEMIES (7)
+    _B[10] | _B[26] | _B[44],  # 10 TEAR_WIGGLE, SPIRAL, BIG_SPIRAL | WIGGLE, SINE_VELOCITY, MEGA_WIGGLE, SAWTOOTH (5, 21-23)
+    _B[12],                    # 11 TEAR_EXPLOSIVE (Ipecac) | EXPLODE (1)
+    _B[16],                    # 12 TEAR_ORBIT            | ORBIT_CW, ORBIT_CCW (11, 12)
+    _B[19],                    # 13 TEAR_BOUNCE           | CURVE_LEFT, CURVE_RIGHT, TURN_HORIZONTAL (18-20)
+    _B[22],                    # 14 TEAR_BURN             | FIRE (15)
+    _B[24]], np.int64)         # 15 TEAR_KNOCKBACK        | CANT_HIT_PLAYER (31)
+PROJ_FLAG_MASKS = np.array([
+    _B[13], _B[4], _B[0], _B[24], _B[2] | _B[8], _B[3] | _B[10] | _B[14], _B[16] | _B[29], _B[27], _B[6], _B[7],
+    _B[5] | _B[21] | _B[22] | _B[23], _B[1], _B[11] | _B[12], _B[18] | _B[19] | _B[20], _B[15], _B[31]], np.int64)
+assert len(TEAR_FLAG_MASKS) == len(PROJ_FLAG_MASKS) == FLAG_F
 PLAYER_F = 31
 DOOR_CAP = 8
 DOOR_F = 7
@@ -91,7 +129,18 @@ ROW = np.dtype([
     # actor's sampling uniforms of such a record are tok_policy.crn_uniforms(key, ROW 't', head slot), the same in
     # every branch of the pair. Never a policy input.
     ('crn', np.int64),
+    # 2026-10-08 (the build lab, tok_lab.py; appended, the fields above keep their offsets): 0 in every ordinary record;
+    # in a lab episode's records the job id of the build being benchmarked and the panel state's number + 1. Never a
+    # policy input.
+    ('lab', np.int64),
+    ('lab_s', np.int16),
+    # 2026-10-08 (character randomisation, bridge abp-0.2.17; appended, the fields above keep their offsets): player 0's
+    # PlayerType (abplus_lean 'ptype', clipped to 0 .. N_CHAR - 1), written in every mode; a policy input only for
+    # TokPolicy(pchar=True)
+    ('pchar', np.int16),
 ], align=True)
+N_CHAR = 32           # 2026-10-08: PlayerType ids the policy's character input has room for (AB+ 0 .. 17, Repentance+ 0 .. 40
+#                       would need more)
 DONE_BRANCH = 4       # ROW 'done' of a branch episode's last record when it ends for the branch's own reasons (the
 #                       floor's exit or a boss cleared in run mode, or the branch's time cap): a truncation, the
 #                       trainer bootstraps from the value of that record (train_tok: the boot decisions)
@@ -195,6 +244,7 @@ def encode_row(o, st, row, t):
     weapons = int(p['weapons'])
     row['pcharge'][0] = (min(p['charge'], 120) / 60, min(p['charge'] / max(p['fire_delay_max'], 1.0), 3.0) / 3) + \
         tuple(float((weapons >> w) & 1) for w in range(1, 11))
+    row['pchar'] = min(max(int(p['ptype']), 0), N_CHAR - 1)   # 2026-10-08 (abp_row_encode version 6)
     e = o.entities
     n = len(e)
     out = row['ent'][0]
@@ -220,6 +270,18 @@ def encode_row(o, st, row, t):
         out[:n, 25], out[:n, 26] = (flags >> 2) & 1, (flags >> 3) & 1
         out[:n, 27], out[:n, 28], out[:n, 29] = e['hp'], e['height'] / 30, e['fall'] / 10
         out[:n, 30], out[:n, 31], out[:n, 32] = e['scale'], e['anim'] / 8, e['flip']
+        # 2026-10-08 (abp-0.2.16): flag and laser columns (abp_turbo.c abp_row_encode version 5)
+        word = e['tflags']
+        if word.any():
+            masks = np.where((kind == 2)[:, None], PROJ_FLAG_MASKS[None], TEAR_FLAG_MASKS[None])
+            out[:n, FLAG_COLUMN:FLAG_COLUMN + FLAG_F] = (word[:, None] & masks) != 0
+        lz = np.flatnonzero(e['kind'] == 3)
+        if len(lz):
+            L, el = LASER_COLUMN, e[lz]
+            out[lz, L], out[lz, L + 1], out[lz, L + 2] = el['l_cos'], el['l_sin'], el['l_len'] / 300
+            out[lz, L + 3] = (el['l_ex'].astype(np.float64) - px).astype(np.float32) / 200
+            out[lz, L + 4] = (el['l_ey'].astype(np.float64) - py).astype(np.float32) / 200
+            out[lz, L + 5], out[lz, L + 6] = el['l_circle'], el['l_radius'] / 100
         ids = row['ent_id'][0]
         ids[:n, 0] = np.clip(e['type'], 0, 1023)
         ids[:n, 1] = e['variant'] % 1024
@@ -366,11 +428,13 @@ def _items_step(st, row, stage, active, charge, events):
 # ISAAC_RL_FAST_ROW=0 switches it off.
 FAST_ROW = os.environ.get('ISAAC_RL_FAST_ROW', '1') != '0'
 _ROW_FIELDS = ('player', 'ent', 'ent_id', 'doors', 'patch', 'grid', 'map', 'n_ent', 'n_doors', 't', 'hurt', 'damage',
-               'done', 'bombs', 'events', 'episode', 'seed', 'group', 'first', 'ent_item', 'pcharge')
+               'done', 'bombs', 'events', 'episode', 'seed', 'group', 'first', 'ent_item', 'pcharge', 'pchar')
 _ROW_OFFS_ITEMS = np.array([ROW.fields[k][1] for k in _ROW_FIELDS], np.int64)
 _ROW_OFFS = _ROW_OFFS_ITEMS.copy()
 _ROW_OFFS[_ROW_FIELDS.index('ent_item')] = -1   # without items abp_row_encode leaves ent_item alone (version 3)
-_ROW_VERSION = 4   # abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge)
+_ROW_VERSION = 6   # abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
+#                    2026-10-08, abp-0.2.16's 144-byte entity records and ENT_F = 56; 6: 2026-10-08, abp-0.2.17's
+#                    39-double player record (PlayerType) and pchar)
 # ctx slots (abp_turbo.c RC_*)
 (RC_T, RC_LIMIT, RC_FLOOR, RC_STALL, RC_PROGRESS, RC_STAGE0, RC_HP0, RC_PREV_DMG, RC_PREV_HP, RC_HAVE_PREV, RC_ROOM,
  RC_WAS_CLEAR, RC_ORIGIN_X, RC_ORIGIN_Y, RC_N_EXITS, RC_EXITS) = range(16)
@@ -400,7 +464,7 @@ def fast_row_function(path):
             version = lib.abp_row_encode_version
             version.restype = ctypes.c_int
             if version() == (_ROW_VERSION << 16) | (RC_COUNT << 8) | len(_ROW_FIELDS) and ENT_CAP == 64 and \
-                    ENT_F == 33 and PCHARGE_F == 12 and \
+                    ENT_F == 56 and ENT_F0 == 33 and PCHARGE_F == 12 and N_CHAR == 32 and \
                     DOOR_CAP == 8 and DOOR_F == 7 and PATCH == 9 and GRID == (7, 16, 28) and MAP == (8, 13, 13):
                 fn = lib.abp_row_encode
                 fn.restype = ctypes.c_int

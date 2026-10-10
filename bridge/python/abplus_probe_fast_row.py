@@ -11,6 +11,7 @@ hurt flags. Reported: records, how many FastRow did itself (fast) and how many i
 usage (from the bridge's python dir, PYTHONPATH=.):
   python abplus_probe_fast_row.py --groups-file ../abplus/catalog/scaling2_groups.json --group normal \
       --seeds range:2147500000:24 --out <dir>
+2026-10-08: --dump keeps the reference records (rows_<seed>.npz) for abplus_probe_laser_flags.py --compare.
 2026-10-06 (Phase A): --floor --items --run: the root's bridge sends the inventory block (ISAAC_RL_LEAN_ITEMS=1), the
 records are those of a run with items (EpisodeState run, items; ROW's item fields compared too), the random actions also
 press the item and pill / card buttons (--item-prob), and after --legs legs a trapdoor is spawned in the room (cleared
@@ -41,7 +42,10 @@ TRAPDOOR_LUA = ("local p = Isaac.GetPlayer(0) local room = Game():GetRoom() "
 
 
 class Pair:
+    dump = False   # 2026-10-08 (--dump): keep every reference record (encode_row's) for a later comparison
+
     def __init__(self, fn, limit, floor, stall, run=False, items=False):
+        self.kept = []
         self.dec_a, self.st_a = LeanDecoder(), EpisodeState(limit, floor=floor, stall=stall, run=run, items=items)
         self.rows_a, self.rows_b = np.zeros(2, ROW), np.zeros(2, ROW)
         self.addr_b = [self.rows_b[i:i + 1].ctypes.data for i in range(2)]
@@ -76,6 +80,8 @@ class Pair:
                 self.counts[bit] = self.counts.get(bit, 0) + 1
         self.stages.add(int(o.room[5]))
         self.last_row = ra.copy()
+        if Pair.dump:
+            self.kept.append(ra.copy())
         if self.mismatch is None and (da != db or ha != self.enc.hurt or ra.tobytes() != rb.tobytes()):
             diff = [k for k in ROW.names if ra[k].tobytes() != rb[k].tobytes()]
             self.mismatch = dict(t=t, done=(da, db), hurt=(ha, bool(self.enc.hurt)), fields=diff)
@@ -154,8 +160,18 @@ def room_seed(inst, seed, args, rep, fn):
             if after < 0:
                 break
     c.close()
+    dump_rows(args, seed, pair)
     return dict(seed=seed, records=pair.t, fast=pair.enc.fast, slow=pair.enc.slow, reasons=pair.enc.reasons,
                 max_entities=ents, mismatch=pair.mismatch)
+
+
+def dump_rows(args, seed, pair):
+    """--dump: the seed's reference records as rows_<seed>.npz, one array per ROW field (abplus_probe_laser_flags.py
+    --compare compares two such dumps field by field, e.g. before and after a change of the entity columns)."""
+    if not Pair.dump or not pair.kept:
+        return
+    rows = np.concatenate(pair.kept)
+    np.savez_compressed(Path(args.out) / f'rows_{seed}.npz', **{k: rows[k] for k in rows.dtype.names})
 
 
 def floor_seed(inst, seed, args, rep, fn):
@@ -220,6 +236,7 @@ def floor_seed(inst, seed, args, rep, fn):
             for _ in range(args.after_clear):
                 o, _ = pair.record(step(c, (0, 0, 0, 0), rep))
     c.close()
+    dump_rows(args, seed, pair)
     return dict(seed=seed, legs=legs, rooms=len(rooms), records=pair.t, fast=pair.enc.fast, slow=pair.enc.slow,
                 reasons=pair.enc.reasons, max_entities=ents, mismatch=pair.mismatch, floors=floors,
                 stages=sorted(pair.stages), events={str(k): v for k, v in pair.counts.items()},
@@ -246,10 +263,13 @@ def main():
     p.add_argument('--fpd', type=int, default=4)
     p.add_argument('--port', type=int, default=34200)
     p.add_argument('--name', default='stpfast')
+    p.add_argument('--dump', action='store_true',
+                   help='2026-10-08: save every reference record per seed (rows_<seed>.npz in --out)')
     p.add_argument('--out', required=True)
     args = p.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
+    Pair.dump = args.dump
     spec = load_spec(args)
     os.environ.update(FORK_ENV)
     if args.items:

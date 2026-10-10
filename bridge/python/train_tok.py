@@ -81,6 +81,18 @@ Counterfactual branches (2026-10-07, isaac_bridge/tok_branch.py; floor / run mod
   hands the heads' spread at every record to the workers (the point priority's uncertainty, --branch-uncert), and
   --choice-adv-coef > 0 adds a PPO-clipped correction with the measured own - alternative difference on the choice
   records' decision records. With --branch-share 0 none of this exists and the run is as before.
+Teacher v2 (2026-10-10, isaac_bridge/tok_teacher2.py, rl/docs/SCALING_THESIS.md S5b; floor / run modes, --teacher-v2 1
+  with --teacher-thread 1; off by default, then nothing changes): the workers' search threads run whole branches from
+  hurts, deaths and --teacher-v2-random points (movement intents x the actor's per-step answers, asked through each
+  worker's lane and answered here by a GraphActor of their own outside the rollout), and every step of a branch that
+  beats the episode's own continuation becomes an imitation record (V2 ring -> job['v2'] -> a GPU ring of
+  --teacher-v2-buffer records). Each minibatch step draws up to --teacher-v2-batch of them (--teacher-v2-reuse) into
+  its last part (or a pass of its own with --teach-merge 0): + share x (--teacher-v2-coef x mean(-w log pi(a|obs)) +
+  --teacher-v2-vf x mean((V(obs) - G)^2)), share = --teacher-v2-weight x b / minibatch (tok_teacher2.teacher_v2_loss).
+  progress.csv v2_*: the workers' totals (points, improving, gains, spreads, records, seconds), this update's window
+  (v2_improving_share, v2_gain0_mean, v2_spread_mean) and, on the records new to this update before it trains on them,
+  v2_prior (mean log pi of the best branch's first move), v2_prior_p, v2_verr (V - G): the acceptance test is v2_prior
+  rising and v2_improving_share falling over training.
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
 
@@ -127,6 +139,10 @@ ROOM_REWARD = 'damage=1,hurt=0.75,clear=1,death=2,timeout=1,time=0.002'
 # whole floors: room = a room with monsters cleared, explore = a room entered for the first time, boss = the boss
 # room cleared (on top of room), exit = the next floor reached
 FLOOR_REWARD = 'damage=1,hurt=0.75,room=1,explore=0.5,boss=2,exit=3,death=2,timeout=1,time=0.002'
+# 2026-10-08 (SCALING_THESIS.md §3, off by default): heal = per half heart of health units gained between two records
+# (red + soul + black + eternal + 2 x bone, the player token's units column; gains only, so a hurt stays the hurt term),
+# resource = per coin / bomb / key gained (the player token's columns, capped there at 50 / 10 / 10); e.g.
+# --reward heal=0.5,resource=0.25 (Episodes.cur_gains; floor / run modes only)
 OVERLAP_TEACHER_SHARE = 0.15
 # ISAAC_RL_PROFILE=1: the learner synchronises the GPU between the parts of an update and logs their seconds (u_*
 # columns); a measurement aid that costs a little speed. Without it the u_* columns hold only host-side times.
@@ -218,6 +234,23 @@ class Episodes:
         self.extra = np.zeros((workers, 6), np.int64)   # exits, items, uses, pills, stage0, stage_max
         self.finished = []                       # episodes ended since the last hand-over
         self.branch_finished = []                # 2026-10-07: branch episodes ended since then (tok_branch)
+        self.lab_finished = []                   # 2026-10-08: lab episodes ended since then (tok_lab)
+        self.seen_inv = None                     # 2026-10-08 (lab on): held collectibles at ordinary episodes' ends
+        self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
+        self.stats0 = None                       # 2026-10-08 (stat aug on): worker -> the stats at the first record
+        self.char0 = None                        # 2026-10-08 (characters on): worker -> ROW pchar at the first record
+        # 2026-10-08 (heal / resource terms, floor modes): per worker the health units and coins + bombs + keys of the
+        # last record (the deltas' base) and the episode's gains so far
+        self.gains = np.zeros((workers, 2)) if self.floor and (rw.get('heal') or rw.get('resource')) else None
+        self.healed, self.gathered = np.zeros(workers), np.zeros(workers)
+
+    @staticmethod
+    def cur_gains(rows):
+        """[health units, coins + bombs + keys] of each record, from the player token (tok_obs / abp_row_encode
+        columns 7 units / 12, 8 min(bombs, 10) / 10, 9 min(keys, 10) / 10, 10 min(coins, 50) / 50)."""
+        pl = rows['player']
+        return np.stack([np.rint(pl[:, 7] * 12.0), np.rint(pl[:, 8] * 10.0) + np.rint(pl[:, 9] * 10.0)
+                         + np.rint(pl[:, 10] * 50.0)], 1).astype(np.float64)
 
     def arrive(self, roll, rows, idx, pending):
         """Records `rows` of workers `idx` (distinct): close the decisions before them, end episodes, reset the action
@@ -246,6 +279,11 @@ class Episodes:
                     reward = reward + rw['exit'] * ((ev & EV_EXIT) > 0)
                 self.rooms[w] += (ev & 1) > 0
                 self.boss[w] += (ev & 4) > 0
+                if self.gains is not None:   # 2026-10-08: health units and resources gained since the record before
+                    dl = self.cur_gains(rows)[has] - self.gains[w]
+                    reward = reward + rw['heal'] * np.maximum(dl[:, 0], 0) + rw['resource'] * np.maximum(dl[:, 1], 0)
+                    self.healed[w] += np.maximum(dl[:, 0], 0)
+                    self.gathered[w] += np.maximum(dl[:, 1], 0)
             if self.run or self.items:
                 ev = rows['events'][has].astype(np.int64)
                 x = self.extra
@@ -260,11 +298,25 @@ class Episodes:
             self.ret[w] += reward
             self.hurt[w] += hu
             self.damage[w] += dmg
-        if self.run or self.items:   # an episode's first record: its stage
+        if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
+            self.gains[idx] = self.cur_gains(rows)
+        if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
             st0 = first
             if st0.any():
                 self.extra[idx[st0], 4] = rows['stage'][st0]
                 self.extra[idx[st0], 5] = rows['stage'][st0]
+                if self.items:
+                    for j in np.flatnonzero(st0):
+                        self.inv0[int(idx[j])] = [int(v) for v, c in rows[j]['inv'] if v > 0 and c > 0]
+                if self.stats0 is not None:   # 2026-10-08 (stat aug): damage, fire delay, shot speed, range, speed
+                    for j in np.flatnonzero(st0):
+                        pl = rows[j]['player']
+                        self.stats0[int(idx[j])] = [round(float(pl[11]) * 10, 3), round(float(pl[12]) * 20, 3),
+                                                    round(float(pl[13]) * 2, 3), round(float(pl[14]) * 500, 1),
+                                                    round(float(pl[15]) * 2, 3)]
+        if self.char0 is not None and first.any():   # 2026-10-08 (characters): the episode's character
+            for j in np.flatnonzero(first):
+                self.char0[int(idx[j])] = int(rows[j]['pchar'])
         ended = done != 0
         if ended.any():
             for j in np.flatnonzero(ended):
@@ -276,14 +328,30 @@ class Episodes:
                     x = self.extra[i]
                     fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]),
                                stage0=int(x[4]), stage=int(max(x[5], r['stage'])))
-                if r['branch'] != 0:   # 2026-10-07: a branch episode (tok_branch): kept apart from the episode stats
+                    if self.inv0.get(int(i)):   # 2026-10-08: the collectibles held at the first record (start builds)
+                        fin['build0'] = self.inv0[int(i)]
+                if self.stats0 is not None and int(i) in self.stats0:   # 2026-10-08 (stat aug): the start stats
+                    fin['stats0'] = self.stats0[int(i)]
+                if self.char0 is not None and int(i) in self.char0:   # 2026-10-08 (characters): its PlayerType
+                    fin['char0'] = self.char0[int(i)]
+                if self.gains is not None:   # 2026-10-08: health units healed, coins + bombs + keys gathered
+                    fin.update(healed=float(self.healed[i]), gathered=float(self.gathered[i]))
+                if r['lab'] != 0:   # 2026-10-08: a lab episode (tok_lab): kept apart from the episode stats
+                    fin.update(lab=int(r['lab']), lab_s=int(r['lab_s']))
+                    self.lab_finished.append(fin)
+                elif r['branch'] != 0:   # 2026-10-07: a branch episode (tok_branch): kept apart from the episode stats
                     fin.update(point=int(r['point']), branch=int(r['branch']))
                     self.branch_finished.append(fin)
                 else:
                     self.finished.append(fin)
+                    if self.seen_inv is not None and self.items:   # the build it ended with
+                        held = [int(v) for v, c in r['inv'] if v > 0 and c > 0]
+                        if held:
+                            self.seen_inv.append(held)
             e = idx[ended]
             self.ret[e], self.hurt[e], self.damage[e], self.rooms[e], self.boss[e] = 0.0, 0.0, 0.0, 0, 0
             self.extra[e] = 0
+            self.healed[e], self.gathered[e] = 0.0, 0.0
             boot = done == DONE_BRANCH
             pending[idx[ended & ~boot]] = 0   # (a truncated branch end keeps it: its record is evaluated, see below)
         else:
@@ -358,8 +426,8 @@ def main():
     import torch
     from isaac_bridge.tok_obs import ENT_CAP
     from isaac_bridge.tok_policy import (ENTITY_FIELDS, ROW_BYTES, GraphActor, TokPolicy, cat_batch, crn_uniforms,
-                                         decode_rows, load_compatible, packed_index, rows_to_device, take, to_batch,
-                                         used_entities)
+                                         DEDUP, decode_rows, distinct_ids, first_of, learner_plan, load_compatible,
+                                         packed_index, plan_tokens, rows_to_device, take, to_batch, used_entities)
     p = argparse.ArgumentParser()
     p.add_argument('--groups-file', required=True)
     p.add_argument('--groups', default='normal:8,boss:5,normal_big:3')
@@ -397,6 +465,9 @@ def main():
     p.add_argument('--charge', type=int, default=1,
                    help="2026-10-07: the player's charge state (ROW pcharge) as policy input; a resumed checkpoint keeps "
                         'its own setting')
+    p.add_argument('--ent-ext', type=int, default=1,
+                   help='2026-10-08: the entity flag and laser columns (tok_obs ENT_F0 .. ENT_F) as policy input; a '
+                        'resumed checkpoint keeps its own setting, --init pads them with zeros')
     p.add_argument('--floor-seconds', type=float, default=480.0)
     p.add_argument('--floor-stall-seconds', type=float, default=60.0)
     p.add_argument('--archive-size', type=int, default=12)
@@ -405,6 +476,9 @@ def main():
     p.add_argument('--archive-boss', type=float, default=0.0,
                    help='floor mode: share of the archive starts taken from boss-room entries (they are always parked '
                         'and evicted last); 0: the archive as before')
+    p.add_argument('--archive-deep', type=float, default=1.0,
+                   help='run mode: archive entries drawn with weight archive_deep^(floor - 1), the shallowest floor '
+                        'evicted first (1: uniform, as before)')
     p.add_argument('--init', default='', help='checkpoint whose weights start the run (shapes that differ are padded)')
     p.add_argument('--width', type=int, default=192)
     p.add_argument('--layers', type=int, default=4)
@@ -440,6 +514,54 @@ def main():
                    help="1 (default since 2026-10-05): the queued hurts of one episode are searched together, one "
                         'restore replay for their first depth (tok_sampler.hindsight_shared; the same records and '
                         'lost[]); 0: one restore per hurt')
+    # 2026-10-09 (death teacher, SCALING_THESIS.md S5): the fatal hurt always searched, deeper, with its own margin
+    p.add_argument('--teacher-death-depths', default='',
+                   help='floor / run modes: depths (decisions before the fatal step) for the episode-ending hurt, e.g. '
+                        '"2,4,8,16,32"; it is then always searched (never dropped by --teacher-per-episode). '
+                        'Default: off (the fatal hurt is an ordinary hurt)')
+    p.add_argument('--teacher-death-margin', type=int, default=15,
+                   help='decisions after the fatal step a held move must stay unhurt (2 s); 0: --teacher-margin')
+    p.add_argument('--teacher-fork', type=int, default=0,
+                   help='2026-10-10, with --teacher-thread 1: each hurt search runs in a forked child of the worker (no '
+                        'GIL contention with the episode; one child per worker at a time)')
+    p.add_argument('--teacher-thread', type=int, default=0,
+                   help='2026-10-10, floor / run modes: 1 = the searches run in a thread of the worker (its episode '
+                        'never waits for a search; --teacher-share bounds the search time outside the updates); 0 = as '
+                        'before (searches during the updates, and within --teacher-share in the worker loop)')
+    # 2026-10-10 (teacher v2, isaac_bridge/tok_teacher2.py, rl/docs/SCALING_THESIS.md S5b; floor / run modes, needs
+    # --teacher-thread 1; independent of --teacher, both can be on)
+    p.add_argument('--teacher-v2', type=int, default=0,
+                   help='1: teacher v2: at hurts, deaths (and --teacher-v2-random points) whole branches with movement '
+                        'intents x the actor\'s per-step answers; every step of the best branch that beats the episode '
+                        'by more than --teacher-v2-margin and its replicate\'s spread becomes an imitation record '
+                        '(-w log pi(a|obs) over the heads + value regression to the branch\'s return-to-go). 0: off, '
+                        'nothing changes')
+    p.add_argument('--teacher-v2-hold', default='2,4,8',
+                   help='decisions a held-move intent lasts (drawn per move and depth from this list)')
+    p.add_argument('--teacher-v2-sticky', type=float, default=4.0,
+                   help='mean decisions the sticky-policy intent keeps a sampled move (geometric; 0: no such intent)')
+    p.add_argument('--teacher-v2-sticky-n', type=int, default=1, help='sticky-policy intents per depth')
+    p.add_argument('--teacher-v2-seconds', type=float, default=20.0,
+                   help="a branch's game-time cap (the score then bootstraps from the actor's value)")
+    p.add_argument('--teacher-v2-margin', type=float, default=0.3,
+                   help='best - taken (discounted return units) a point needs to count as an improvement')
+    p.add_argument('--teacher-v2-cap', type=float, default=2.0, help="an imitation record's weight: min(gain, cap)")
+    p.add_argument('--teacher-v2-random', type=float, default=0.0,
+                   help='random decision points per game hour of play (0: hurts and deaths only)')
+    p.add_argument('--teacher-v2-queue', type=int, default=8, help='points waiting per worker')
+    p.add_argument('--teacher-v2-depths', default='',
+                   help="hurts' depths (decisions before the hurting step); default the teacher's (--teacher-depths "
+                        'of the sampler: 2,4,8); deaths use --teacher-death-depths when given')
+    p.add_argument('--teacher-v2-coef', type=float, default=1.0, help='weight of -w log pi(a|obs)')
+    p.add_argument('--teacher-v2-vf', type=float, default=0.25,
+                   help="weight of (V(obs) - G)^2 (0.25 = PPO's value term: --vf-coef 0.5 x 0.5)")
+    p.add_argument('--teacher-v2-weight', type=float, default=1.0,
+                   help='decisions one imitation record counts for in a minibatch step (as --teach-weight)')
+    p.add_argument('--teacher-v2-batch', type=int, default=256, help='imitation records per minibatch step at most')
+    p.add_argument('--teacher-v2-reuse', type=float, default=4.0,
+                   help='how often an imitation record is used in all (as --teach-reuse)')
+    p.add_argument('--teacher-v2-buffer', type=int, default=30000,
+                   help='imitation records kept (the newest; on the GPU as record bytes, ~20 KB each)')
     # 2026-10-07: counterfactual branches at decision points (isaac_bridge/tok_branch.py; floor / run modes)
     p.add_argument('--branch-share', type=float, default=0.0,
                    help="share of a worker's wall time spent on branch points (0: off, nothing changes)")
@@ -498,6 +620,50 @@ def main():
     p.add_argument('--branch-ppo', type=int, default=1,
                    help='1: the branch episodes\' decisions are PPO samples too (on-policy, legitimate states); 0: masked')
     p.add_argument('--choice-buffer', type=int, default=5000, help='choice records kept (the newest)')
+    # 2026-10-08: the build lab (isaac_bridge/tok_lab.py; floor / run modes, off unless --lab-share > 0)
+    p.add_argument('--lab-share', type=float, default=0.0,
+                   help="share of a worker's wall time on lab jobs (0: off, nothing changes; >= 1: whenever one waits)")
+    p.add_argument('--lab-panel', default='normal:24,boss:6,normal_big:6',
+                   help='panel states per catalog group (room-mode resets of held-out seeds, tok_lab.parse_panel)')
+    p.add_argument('--lab-seed', type=int, default=2147700000, help='seed of the panel states (tok_lab.parse_panel)')
+    p.add_argument('--lab-seconds', type=float, default=90.0, help="a lab episode's game-time cap")
+    p.add_argument('--lab-costs', default='',
+                   help="an earlier run's lab.jsonl (same panel): its states' mean game seconds balance the states over "
+                        'the workers (tok_lab.assign_panel); default: by group')
+    p.add_argument('--lab-ppo', type=int, default=1, help="1: the lab episodes' decisions are PPO samples; 0: masked")
+    p.add_argument('--lab-items', default='', help='eligible collectibles (default ../abplus/catalog/lab_items.json)')
+    p.add_argument('--lab-mix', default='base=0.08,model=0.15,random=0.1,seen=0.05',
+                   help='shares of the new jobs by kind (the rest: single items, each eligible one in turn)')
+    p.add_argument('--lab-builds', default='', help='a JSON list of builds (lists of ids) benchmarked first')
+    p.add_argument('--lab-noise', type=float, default=0.0,
+                   help='share of the jobs that replicate a recent job (half the same rep: the twin check, half a new '
+                        'rep: the seed noise)')
+    p.add_argument('--lab-inflight', type=int, default=24, help='jobs posted and not yet complete at most')
+    p.add_argument('--lab-timeout', type=float, default=900.0, help='s after which a job with states missing is closed')
+    p.add_argument('--lab-max-items', type=int, default=3, help='collectibles of a model / random build at most')
+    p.add_argument('--lab-model-k', type=int, default=5, help='heads of the build model (ensemble)')
+    p.add_argument('--lab-model-steps', type=int, default=50, help='build-model Adam steps per update')
+    p.add_argument('--lab-pool', type=int, default=512, help='random candidate builds the model ranks per update')
+    # 2026-10-08: start builds (floor / run modes): random builds transplanted into ordinary episodes' start states
+    p.add_argument('--start-build-prob', type=float, default=0.0,
+                   help='share of the floor-start training episodes that begin with a random build (0: off; archive '
+                        'starts keep their build)')
+    p.add_argument('--start-build-max', type=int, default=3, help='collectibles of a start build at most (1 .. max)')
+    # 2026-10-08: stat augmentation (floor / run modes): random multipliers of the base stats at floor starts
+    p.add_argument('--stat-aug-prob', type=float, default=0.0,
+                   help='share of the floor-start training episodes whose base stats get random multipliers (0: off)')
+    p.add_argument('--stat-aug', default='',
+                   help='multiplier ranges, log-uniform: "damage=0.7:2.5,tears=0.7:2,range=0.8:1.5,shot_speed=0.8:1.3,'
+                        'speed=0.9:1.3" (the default; keys speed, damage, shot_speed, tears, range)')
+    # 2026-10-08: character randomisation (floor / run modes): floor starts restart the run as a drawn character
+    p.add_argument('--characters', default='',
+                   help='PlayerTypes floor starts are built as, with optional weights: "0,1,2,3,5,6,7,8,13,15", '
+                        '"0:4,7:1" or "all" (tok_floor.CHARACTERS_ALL); refused: 10 The Lost, 11 Lazarus II, 12 Black '
+                        'Judas, 16 The Forgotten, 17 The Soul (tok_floor.CHARACTERS_UNSUPPORTED). Default: Isaac only')
+    p.add_argument('--pchar', type=int, default=-1,
+                   help="2026-10-08: the player's PlayerType (ROW pchar, TokPolicy's char_emb table) as policy input; "
+                        '-1: on with --characters; a resumed checkpoint keeps its own setting, --init starts the table '
+                        'at zero (the same outputs as the checkpoint)')
     p.add_argument('--build-timeout', type=float, default=60.0,
                    help="s a worker's root instance may take for the first start state after its launch (launch, "
                         'connect, reset): past it the instance is killed and relaunched and the same seed built once '
@@ -555,6 +721,19 @@ def main():
                         'residual stream, layer norms, the input MLPs over raw float features (entity, player, door), '
                         'the heads, log-softmax and every loss stay float32 (TokPolicy). The actor (sampling, stored '
                         'log-probabilities) stays float32. off: float32 throughout (TF32 matrix products with --tf32)')
+    p.add_argument('--learner-fast', type=int, default=0,
+                   help="2026-10-10 (B18): 1: the learner's fast path: the same PPO update (losses, gradients, steps) "
+                        'with about half the GPU and host time per minibatch step (attention per length bucket as '
+                        'float32 matrix products, the input mlps on the real tokens, the CNNs on the distinct grids, '
+                        'no host sync per step, the fused Adam; learn() in train_tok.py, EXPERIMENTS.md B18). Not '
+                        'bit-identical: the same function in another summation order (abplus_bench_learner.py '
+                        '--check, abplus_check_learner_fp64.py). 0: as before')
+    p.add_argument('--learner-cpus', default='',
+                   help='2026-10-10 (B18): CPUs for the learner thread alone, e.g. 56-59,168-171 (Linux numbering; '
+                        'whole cores with their hyperthread siblings, best on the GPU\'s NUMA node): the trainer\'s '
+                        'other threads, its workers and their games are kept off them. The fast learner is bound by '
+                        'its host thread, which a busy sibling or a game on the same core slows by ~20%%. '
+                        "'' (default): no pinning")
     p.add_argument('--fused-adam', type=int, default=0,
                    help='1: Adam as one fused CUDA kernel (the same update rule; float rounding may differ)')
     p.add_argument('--dump-rollouts', type=int, default=0,
@@ -568,6 +747,11 @@ def main():
         args.poll_want = max(1, args.workers // 2)
     if args.teacher_share is None:
         args.teacher_share = OVERLAP_TEACHER_SHARE if (args.overlap and args.teacher) else 0.0
+    if args.teacher_v2:   # 2026-10-10 (teacher v2)
+        if args.mode not in ('floor', 'run'):
+            p.error('--teacher-v2 needs --mode floor/run')
+        if not args.teacher_thread:
+            p.error('--teacher-v2 needs --teacher-thread 1 (its searches run in the workers\' search threads)')
     recompute = args.recompute_values == 'on' or (args.recompute_values == 'auto' and args.overlap)
     if args.switch_interval > 0:
         sys.setswitchinterval(args.switch_interval)
@@ -582,7 +766,15 @@ def main():
     if args.resume:
         args.charge = int(bool(torch.load(args.resume, map_location='cpu').get('config', {}).get('charge')))
     charge = bool(args.charge)
-    rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0)
+    if args.resume:   # 2026-10-08
+        args.ent_ext = int(bool(torch.load(args.resume, map_location='cpu').get('config', {}).get('ent_ext')))
+    ent_ext = bool(args.ent_ext)
+    if args.resume:   # 2026-10-08 (characters)
+        args.pchar = int(bool(torch.load(args.resume, map_location='cpu').get('config', {}).get('pchar')))
+    elif args.pchar < 0:
+        args.pchar = int(bool(args.characters))
+    pchar = bool(args.pchar)
+    rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0, heal=0.0, resource=0.0)
     rw.update({k: float(v) for k, v in (kv.split('=') for kv in (FLOOR_REWARD if floor else ROOM_REWARD).split(','))})
     if args.reward:
         rw.update({k: float(v) for k, v in (kv.split('=') for kv in args.reward.split(','))})
@@ -593,6 +785,31 @@ def main():
         names, assign = parse_groups(args.groups, args.workers)
         specs = [load_spec(argparse.Namespace(groups_file=args.groups_file, group=n, tasks='', seconds=0.0))
                  for n in names]
+    lab_on = floor and args.lab_share > 0   # 2026-10-08 (tok_lab)
+    if args.start_build_prob > 0 and not (floor and items):
+        p.error('--start-build-prob needs --mode floor/run and --items')
+    if args.stat_aug_prob > 0:
+        if not floor:
+            p.error('--stat-aug-prob needs --mode floor/run')
+        from isaac_bridge.tok_floor import parse_stat_aug
+        parse_stat_aug(args.stat_aug)   # (a bad spec fails here, not in the workers)
+    char_ids = []   # 2026-10-08 (characters)
+    if args.characters:
+        if not floor:
+            p.error('--characters needs --mode floor/run')
+        from isaac_bridge.tok_floor import parse_characters
+        try:
+            char_ids = [int(c) for c in parse_characters(args.characters)[0]]
+        except ValueError as exc:
+            p.error(str(exc))
+    lab_names, lab_panel, lab_specs, lab_owner = [], [], [], []
+    if lab_on:
+        from isaac_bridge.tok_lab import assign_panel, parse_panel, state_costs_from
+        lab_names, lab_panel = parse_panel(args.lab_panel, args.lab_seed)
+        lab_owner = assign_panel(lab_panel, lab_names, args.workers, state_costs=state_costs_from(
+            args.lab_costs, len(lab_panel)) if args.lab_costs else None)
+        lab_specs = [load_spec(argparse.Namespace(groups_file=args.groups_file, group=nm, tasks='', seconds=0.0))
+                     for nm in lab_names]
     lo, hi = (int(v) for v in args.start_hp.split(':'))
     # the instances' stub list: stub_render_h.txt next to the library (B14; else _g), or --stub-list
     stub = args.stub_list or default_stub_list(default_preload())
@@ -602,6 +819,8 @@ def main():
                            teacher=args.teacher, teacher_share=args.teacher_share, teacher_queue=args.teacher_queue,
                            teacher_slots=args.teacher_slots, teacher_skip_known=bool(args.teacher_skip_known),
                            teacher_pair=bool(args.teacher_pair),
+                           teacher_death_depths=tuple(int(v) for v in args.teacher_death_depths.split(',') if v.strip())
+                           if floor else (), teacher_death_margin=args.teacher_death_margin, teacher_thread=args.teacher_thread, teacher_fork=args.teacher_fork,
                            mode=args.mode,
                            floor_seconds=args.floor_seconds, floor_stall_seconds=args.floor_stall_seconds,
                            archive_size=args.archive_size, archive_prob=args.archive_prob,
@@ -617,6 +836,19 @@ def main():
                            branch_replicate_max=args.branch_replicate_max, branch_noise_prior=args.branch_noise_prior,
                            branch_reward=','.join(f'{k}={v}' for k, v in rw.items()), branch_gamma=args.gamma,
                            branch_archive=args.branch_archive, branch_left_back=args.branch_left_back,
+                           lab_share=args.lab_share if lab_on else 0.0, lab_seconds=args.lab_seconds,
+                           lab_specs=lab_specs, lab_panel=lab_panel, lab_owner=lab_owner,
+                           start_build_prob=args.start_build_prob if floor else 0.0, start_build_max=args.start_build_max,
+                           start_build_items=args.lab_items, archive_deep=args.archive_deep,
+                           stat_aug_prob=args.stat_aug_prob if floor else 0.0, stat_aug=args.stat_aug,
+                           characters=args.characters if floor else '',
+                           teacher_v2=bool(args.teacher_v2) and floor,
+                           teacher_v2_hold=tuple(int(v) for v in args.teacher_v2_hold.split(',') if v.strip()),
+                           teacher_v2_sticky=args.teacher_v2_sticky, teacher_v2_sticky_n=args.teacher_v2_sticky_n,
+                           teacher_v2_seconds=args.teacher_v2_seconds, teacher_v2_margin=args.teacher_v2_margin,
+                           teacher_v2_cap=args.teacher_v2_cap, teacher_v2_random=args.teacher_v2_random,
+                           teacher_v2_queue=args.teacher_v2_queue,
+                           teacher_v2_depths=tuple(int(v) for v in args.teacher_v2_depths.split(',') if v.strip()),
                            bridge_lua=default_bridge_lua(), preload=default_preload(),
                            stub_list=stub if stub and Path(stub).is_file() else '')
     print('instances: stub list', cfg.stub_list or '(the launch mode\'s own)', '| environment',
@@ -632,9 +864,9 @@ def main():
         args.choice_heads = int(torch.load(args.resume, map_location='cpu').get('config', {}).get('choice', 0)) or             args.choice_heads
     n_choice = int(args.choice_heads)
     learner_model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge,
-                              choice=n_choice).to(device)   # the weights PPO updates
+                              choice=n_choice, ent_ext=ent_ext, pchar=pchar).to(device)   # the weights PPO updates
     nh = len(learner_model.heads)
-    fused = bool(args.fused_adam)
+    fused = bool(args.fused_adam) or bool(args.learner_fast)   # (B18: --learner-fast 1 implies the fused Adam)
     # (Phase B2: the choice heads are not PPO's: main_parameters() is parameters() without them, in the same order)
     opt = torch.optim.Adam(learner_model.main_parameters(), lr=args.lr, eps=1e-5,
                            **(dict(fused=True) if fused else {}))
@@ -666,7 +898,7 @@ def main():
         """The learner's forward passes (the losses are computed outside, in float32)."""
         return torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp)
     model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge,
-                      choice=n_choice).to(device).eval()   # the actor's copy
+                      choice=n_choice, ent_ext=ent_ext, pchar=pchar).to(device).eval()   # the actor's copy
     model.load_state_dict(learner_model.state_dict())
     actor_params = [t for t in list(model.parameters()) + list(model.buffers())]
     learner_params = [t for t in list(learner_model.parameters()) + list(learner_model.buffers())]
@@ -706,8 +938,93 @@ def main():
     episodes_path = open(out / 'episodes.jsonl', 'a')
     branch_path = open(out / 'branch_episodes.jsonl', 'a') if branching else None
     choice_path = open(out / 'choices.jsonl', 'a') if branching else None
-    sampler = TokSampler(cfg)
+    learner_cpus = set()   # 2026-10-10 (B18, --learner-cpus): before the workers start (they inherit the rest)
+    for part_ in filter(None, args.learner_cpus.split(',')):
+        lo_, _, hi_ = part_.partition('-')
+        learner_cpus.update(range(int(lo_), int(hi_ or lo_) + 1))
+    if learner_cpus:
+        os.sched_setaffinity(0, os.sched_getaffinity(0) - learner_cpus)
+    bench_job = None   # 2026-10-10 (B18, abplus_bench_learner.py): a saved rollout instead of the engine
+    if os.environ.get('ISAAC_RL_LEARNER_BENCH') and Path(os.environ.get('ISAAC_RL_LEARNER_JOB') or '-').is_file():
+        from abplus_bench_learner import JobSampler, load_job
+        bench_job, bench_stats = load_job(os.environ['ISAAC_RL_LEARNER_JOB'], Rollout,
+                                          args.rollout // args.workers * 4 + 64)
+        sampler = JobSampler(bench_stats)
+    else:
+        sampler = TokSampler(cfg)
     n = args.workers
+    lab = None
+    if lab_on:   # 2026-10-08: the build lab's trainer side (tok_lab: LabBook, LabScheduler, LabModel)
+        from isaac_bridge.tok_lab import (JI as LAB_JI, LAB_JOBS, LabBook, LabModel, LabScheduler, load_items)
+        lab_items = load_items(args.lab_items or str(Path(__file__).resolve().parent.parent / 'abplus' / 'catalog' /
+                                                     'lab_items.json'))
+        mix = {k: float(v) for k, v in (kv.split('=') for kv in args.lab_mix.split(',') if kv.strip())}
+        first_builds = json.loads(Path(args.lab_builds).read_text()) if args.lab_builds else []
+        lab = dict(book=LabBook(len(lab_panel), args.lab_timeout),
+                   sched=LabScheduler(lab_items, args.seed, mix, first_builds, args.lab_noise, args.lab_max_items),
+                   model=LabModel(k=args.lab_model_k, device='cpu', seed=args.seed),
+                   out=open(out / 'lab.jsonl', 'a'), hist={}, pool_rng=np.random.default_rng([args.seed, 0x900D]),
+                   posted=0, preq=[], twin=[0, 0], loss=None)
+        (out / 'lab_panel.json').write_text(json.dumps(dict(groups=lab_names, states=lab_panel, owner=lab_owner),
+                                                       indent=0))
+
+        def post_lab_jobs():
+            """New jobs into free slots while fewer than --lab-inflight are open (the job id is written last)."""
+            now_ = time.time()
+            while len(lab['book'].open) < args.lab_inflight:
+                row_ = lab['sched'].make_job()
+                slot_ = int(row_[LAB_JI['job']]) % LAB_JOBS
+                if int(sampler.lab_jobs[slot_, 0]) in lab['book'].open:   # (only with --lab-inflight >= LAB_JOBS)
+                    break
+                sampler.lab_jobs[slot_, 1:] = row_[1:]
+                sampler.lab_jobs[slot_, 0] = row_[0]
+                lab['book'].post(row_, now_)
+                lab['posted'] += 1
+
+        def lab_learn(results):
+            """In the learner thread: the new build results (prequential prediction first, the twin check of
+            replicates, then into the model and lab.jsonl), the model's steps and its candidates for the scheduler."""
+            m_ = lab['model']
+            out_ = dict(lab_builds=len(results), lab_complete=sum(bool(r_.get('complete')) for r_ in results))
+            errs = []
+            for r_ in results:
+                pre = m_.prequential(r_)
+                if pre is not None:
+                    r_['pred'], r_['pred_sd'] = pre
+                    errs.append(abs(pre[0] - r_['ret']))
+                if r_['kind'] == 'replicate' and r_['flags'] in lab['hist'] and r_.get('per_state'):
+                    o_ = lab['hist'][r_['flags']]
+                    r_['of'] = dict(job=o_['job'], rep=o_['rep'], ret=o_.get('ret'))
+                    if o_['rep'] == r_['rep']:   # a twin: per state with the same weights the same game
+                        for s_, v_ in r_['per_state'].items():
+                            w_ = o_.get('per_state', {}).get(s_)
+                            if w_ is not None and v_[8] == v_[9] == w_[8] == w_[9]:
+                                lab['twin'][0] += 1
+                                lab['twin'][1] += int(v_[7] == w_[7])
+                m_.add(r_)
+                lab['hist'][r_['job']] = r_
+                lab['out'].write(json.dumps(dict(r_, update=L['update'])) + '\n')
+            if len(lab['hist']) > 6000:
+                for j_ in sorted(lab['hist'])[:1000]:
+                    del lab['hist'][j_]
+            lab['out'].flush()
+            if results:
+                lab['loss'] = m_.train(args.lab_model_steps)
+                sched_ = lab['sched']
+                ids_, act_ = sched_.ids, sched_.actives
+                pool, rng_ = [], lab['pool_rng']
+                while len(pool) < args.lab_pool:
+                    b_ = sorted(int(v) for v in rng_.choice(ids_, size=int(rng_.integers(2, args.lab_max_items + 1)),
+                                                            replace=False))
+                    if sum(i_ in act_ for i_ in b_) <= 1:
+                        pool.append(b_)
+                sched_.candidates = m_.rank(pool)[:64]
+            out_['lab_preq_abs'] = float(np.mean(errs)) if errs else ''
+            out_['lab_model_loss'] = lab['loss'] if lab['loss'] is not None else ''
+            out_['lab_cand_sd'] = lab['sched'].candidates[0][0] if lab['sched'].candidates else ''
+            out_['lab_twin_n'], out_['lab_twin_same'] = lab['twin']
+            out_['lab_model_rows'] = len(m_.rows)
+            return out_
     capacity = args.rollout // n * 4 + 64
     roll, spare = Rollout(n, capacity, nh), Rollout(n, capacity, nh)
 
@@ -724,6 +1041,12 @@ def main():
     actors = [GraphActor(model, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5), crn=bool(args.branch_crn))
               for _ in range(max(1, args.actor_slots))] if args.graph_entities > 0 else []
     free = list(actors)
+    # 2026-10-10 (teacher v2): the workers' lanes are answered by a GraphActor of their own (the actor's weights; the
+    # lane records never enter the rollout); the eager path for what it cannot take
+    v2_on = bool(args.teacher_v2) and getattr(sampler, 'lane_rows', None) is not None
+    lane_actor = GraphActor(model, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5), crn=False) \
+        if v2_on and args.graph_entities > 0 else None
+    lane_stat = dict(calls=0, rows=0, s=0.0)
     inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
     actor_stream = torch.cuda.Stream(priority=-5)
     learner_stream = torch.cuda.Stream(priority=0)
@@ -758,6 +1081,13 @@ def main():
                  c_hold=np.zeros(args.choice_buffer, bool),
                  c_boot=np.ones((args.choice_buffer, max(n_choice, 1)), np.float32), noise={})
         crng = np.random.default_rng([args.seed, 77])
+    if args.teacher_v2:   # 2026-10-10 (teacher v2): the imitation records' ring (bytes and per-record targets on the
+        #                   GPU, entity / door counts on the host for the minibatch planning)
+        from isaac_bridge.tok_teacher2 import VI as V2I, teacher_v2_loss
+        L.update(v2_cnt=np.zeros((args.teacher_v2_buffer,), np.dtype([('n_ent', ROW.fields['n_ent'][0]),
+                                                                       ('n_doors', ROW.fields['n_doors'][0])])),
+                 v2_n=0, v2_at=0, v2_rate=None, v2_raw=None)
+        v2_rng = np.random.default_rng([args.seed, 0x7E2])   # its own: the teacher's draws stay as without
     target_decisions = decisions_total + int(args.game_hours / hours_per_decision)
     start_decisions = decisions_total
 
@@ -783,6 +1113,24 @@ def main():
             mark[0] = now_
         rl = job['roll']
         lengths = rl.length
+        # 2026-10-10 (B18, --learner-fast 1): the same update with about half the GPU and host work per step
+        # (EXPERIMENTS.md B18). math: attention as float32 matrix products, all length buckets of a layer in one
+        # autograd node (TokPolicy _MathAttention / _BucketAttention); buckets: attention per bucket of records with
+        # similar token counts, each record's real tokens only (learner_plan / plan_tokens: the positions planned per
+        # record on the host, expanded on the GPU); ekeep: the entity and door input mlps on the real tokens only, the
+        # packed tokens built from them; dedup: the room / map / patch CNNs on a minibatch's distinct grids
+        # (distinct_ids once per update); nhwc: channels-last convolutions; ln: the packed layer norms' weight
+        # gradients as column sums; logp: the heads' log-softmax side by side; raw: a minibatch gathered as record
+        # bytes. Always with it: the records staged in a pinned buffer, the teacher's meta read from a copy on the GPU
+        # (no blocking copy per step), the fused Adam. Not bit-identical to 0 (another summation order):
+        # abplus_bench_learner.py --check, abplus_check_learner_fp64.py.
+        fast = bool(args.learner_fast)
+        # (ISAAC_RL_LEARNER_PARTS: a subset of the parts, for the bench's attribution; default all)
+        fparts = set(os.environ.get('ISAAC_RL_LEARNER_PARTS', 'math,ekeep,buckets,nhwc,ln,dedup,logp,raw').split(',')
+                     if fast else ())
+        learner_model.set_math_attention('math' in fparts, nhwc='nhwc' in fparts, ln='ln' in fparts)
+        n_buckets = int(os.environ.get('ISAAC_RL_LEARNER_BUCKETS', '3'))   # (at most; a measurement aid)
+        raw_mode = 'raw' in fparts and teach_gpu and bool(args.teach_merge)   # (B18: minibatches gathered as bytes)
         if L['dumped'] < args.dump_rollouts:   # the rollout and the learner's weights before this update
             L['dumped'] += 1
             m = int(lengths.max())
@@ -823,6 +1171,8 @@ def main():
         adv, ret, mask = gae(rl, args.gamma, args.lam, value_now)
         if branching and not args.branch_ppo:   # 2026-10-07: the branch episodes' decisions left out of PPO
             mask &= rl.rows['branch'] == 0
+        if lab_on and not args.lab_ppo:   # 2026-10-08: the lab episodes' decisions left out of PPO
+            mask &= rl.rows['lab'] == 0
         sec('gae')
         flat = np.flatnonzero(mask.reshape(-1))
         count = len(flat)
@@ -833,12 +1183,22 @@ def main():
         if every is not None:   # the decisions with a reward, out of the records already on the device
             pos = torch.from_numpy(np.searchsorted(all_flat, flat)).to(device)
             batch = take(every, pos)
+            raw_mode = False   # (B18: no record bytes here; the fields are gathered as before)
             if args.decoupled:
                 prox = prox_all[pos].clone()
             del every, prox_all
         else:
-            batch = rows_to_device(rl.rows, flat, rl.pending.reshape(-1, nh)[flat], device)
-        b_act = torch.from_numpy(rl.actions.reshape(-1, nh)[flat]).to(device)
+            stage = None
+            if fast:   # B18: gathered into a pinned buffer kept between updates, copied asynchronously
+                if L.get('stage') is None or L['stage'].shape[0] < count:
+                    L['stage'] = None
+                    L['stage'] = torch.empty((int(count * 1.25) + 64, ROW_BYTES), dtype=torch.uint8).pin_memory()
+                stage = L['stage']
+            batch = rows_to_device(rl.rows, flat, rl.pending.reshape(-1, nh)[flat], device, stage=stage,
+                                   with_raw=fast)
+            if fast:   # (B18: a minibatch's records are gathered as bytes, the fields are views of them)
+                batch, raw_all, pend_all = batch
+        b_act =torch.from_numpy(rl.actions.reshape(-1, nh)[flat]).to(device)
         b_logp = torch.from_numpy(rl.logp.reshape(-1)[flat]).to(device)
         b_adv = torch.from_numpy(adv.reshape(-1)[flat]).to(device)
         b_ret = torch.from_numpy(ret.reshape(-1)[flat]).to(device)
@@ -883,6 +1243,61 @@ def main():
             L['teach_n'] = min(L['teach_n'] + teach_new, args.teach_buffer)
             sec('teach_new')
         teach_n = L['teach_n']
+        # 2026-10-10 (teacher v2): the new imitation records into the ring, and what the policy and the value head
+        # say on them before this update trains on them (v2_prior: log pi of the move at a best branch's first record)
+        v2_new, v2_step, v2_log = 0, 0, {}
+        vacc = torch.zeros(3, device=device)   # teacher v2: mean(-w logp), mean((V - G)^2), mean(logp) (sums)
+        v2_steps = 0
+        if v2_on and job.get('v2') is not None:
+            v_rows, v_meta = job['v2']
+            v2_new = len(v_rows)
+            B_ = args.teacher_v2_buffer
+            if v2_new:
+                pend_v = v_meta[:, V2I['pend0']:V2I['pend0'] + nh].astype(np.int64)
+                act_v = v_meta[:, V2I['act0']:V2I['act0'] + nh].astype(np.int64)
+                G_v = v_meta[:, V2I['ret']].astype(np.float32)
+                first_v = v_meta[:, V2I['j']] == 0
+                lp_all, lp_mv, val_v = [], [], []
+                with torch.inference_mode():
+                    for at in range(0, v2_new, 512):
+                        b_ = to_batch(v_rows[at:at + 512], pend_v[at:at + 512], device)
+                        with autocast():
+                            lg_, vv_, _ = learner_model(b_, packed=bool(args.packed))
+                        a_ = torch.from_numpy(act_v[at:at + 512]).to(device)
+                        lp_all.append(learner_model.log_prob(lg_, learner_model.gate(b_), a_)[0].float())
+                        lp_mv.append(torch.log_softmax(lg_.float()[:, :9], -1).gather(-1, a_[:, :1])[:, 0])
+                        val_v.append(vv_.float())
+                lp_all = torch.cat(lp_all).cpu().numpy()
+                lp_mv = torch.cat(lp_mv).cpu().numpy()
+                val_v = torch.cat(val_v).cpu().numpy()
+                if first_v.any():
+                    v2_log.update(v2_prior=float(lp_mv[first_v].mean()), v2_prior_p=float(np.exp(lp_mv[first_v]).mean()),
+                                  v2_prior_all=float(lp_all[first_v].mean()), v2_firsts=int(first_v.sum()),
+                                  v2_new_gain=float(v_meta[first_v, V2I['gain']].mean()),
+                                  v2_new_spread=float(v_meta[first_v, V2I['spread']].mean()))
+                v2_log.update(v2_prior_move_all=float(lp_mv.mean()), v2_verr=float((val_v - G_v).mean()),
+                              v2_verr_abs=float(np.abs(val_v - G_v).mean()))
+                at_v = (L['v2_at'] + np.arange(v2_new)) % B_
+                L['v2_cnt']['n_ent'][at_v], L['v2_cnt']['n_doors'][at_v] = v_rows['n_ent'], v_rows['n_doors']
+                if L['v2_raw'] is None:
+                    L['v2_raw'] = torch.zeros((B_, ROW_BYTES), dtype=torch.uint8, device=device)
+                    L['v2_pend'] = torch.zeros((B_, nh), dtype=torch.int64, device=device)
+                    L['v2_act'] = torch.zeros((B_, nh), dtype=torch.int64, device=device)
+                    L['v2_w'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                    L['v2_G'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                at_d = torch.from_numpy(at_v).to(device)
+                L['v2_raw'][at_d] = torch.from_numpy(
+                    np.ascontiguousarray(v_rows).view(np.uint8).reshape(v2_new, ROW_BYTES)).to(device)
+                L['v2_pend'][at_d] = torch.from_numpy(pend_v).to(device)
+                L['v2_act'][at_d] = torch.from_numpy(act_v).to(device)
+                L['v2_w'][at_d] = torch.from_numpy(v_meta[:, V2I['weight']].astype(np.float32)).to(device)
+                L['v2_G'][at_d] = torch.from_numpy(G_v).to(device)
+            L['v2_rate'] = v2_new if L['v2_rate'] is None else 0.9 * L['v2_rate'] + 0.1 * v2_new
+            planned_v = args.epochs * max(1, count // args.minibatch)
+            v2_step = int(min(args.teacher_v2_batch, args.teacher_v2_reuse * L['v2_rate'] / planned_v))
+            L['v2_at'] = (L['v2_at'] + v2_new) % B_
+            L['v2_n'] = min(L['v2_n'] + v2_new, B_)
+            sec('teach_new')
         choice_new = 0
         if branching and job.get('choices') is not None:   # 2026-10-07: choice records into the ring and choices.jsonl
             c_rows, c_meta = job['choices']
@@ -1049,10 +1464,20 @@ def main():
         ne_h = rl.rows['n_ent'].reshape(-1)[flat].astype(np.int64)
         nd_h = rl.rows['n_doors'].reshape(-1)[flat].astype(np.int64)
         width = batch['ent'].shape[1]
+        # B18: the records' ids among the rollout's distinct room grids, level maps and player patches (the CNNs then
+        # run on a minibatch's distinct ones: ~380 of 4,096 rooms and maps, ~2,100 patches in a run-mode rollout)
+        dd = {k_: distinct_ids(batch[k_]).cpu().numpy() for k_ in DEDUP} if 'dedup' in fparts else {}
+        dd_size = {k_: int(v_.max()) + 1 for k_, v_ in dd.items()}
 
         def dev(a):
             return torch.from_numpy(np.ascontiguousarray(a, np.int64)).pin_memory().to(device, non_blocking=True)
+
+        def dev_many(arrays):
+            """(B18) int64 arrays to the device in one pinned copy: views of it, in order."""
+            on = torch.from_numpy(np.concatenate([np.asarray(a, np.int64) for a in arrays])).pin_memory()
+            return list(on.to(device, non_blocking=True).split([len(a) for a in arrays]))
         tokens = parts = 0
+        t_meta = torch.from_numpy(teach_meta[:max(teach_n, 1)]).to(device) if fast else None   # (B18)
         learner_model.train()
         corr_stats = torch.zeros(2, device=device)   # Phase B2: the correction's loss and clipped share (sums)
         for _ in range(args.epochs):
@@ -1082,36 +1507,104 @@ def main():
                     # the teacher's records of this step (drawn here, before the PPO parts: the same draws as when
                     # they were drawn after them, nothing else uses numpy's generator)
                     pick = np.random.randint(0, teach_n, teach_step)
-                    meta = torch.from_numpy(teach_meta[pick]).to(device)
-                    if teach_gpu:
-                        tb = decode_rows(L['teach_raw'].index_select(0, dev(pick)), pending=teach_pending(meta).clone(),
+                    if fast:   # B18: from the meta's copy on the device (no blocking copy)
+                        pick_d = dev(pick)
+                        meta = t_meta.index_select(0, pick_d)
+                    else:
+                        meta = torch.from_numpy(teach_meta[pick]).to(device)
+                        pick_d = None
+                    if raw_mode:   # (B18: merged as bytes below)
+                        tb = pick_d
+                    elif teach_gpu:
+                        tb = decode_rows(L['teach_raw'].index_select(0, dev(pick) if pick_d is None else pick_d),
+                                         pending=teach_pending(meta).clone(),
                                          entities=min(ENT_CAP, used_entities(teach_rows['n_ent'][pick])))
                     else:
                         tb = to_batch(teach_rows[pick], teach_pending(teach_meta[pick]), device)
+                    sec('teach_build')
+                vb = None   # 2026-10-10 (teacher v2): this step's imitation records (drawn with their own generator)
+                if v2_step >= 8 and v2_on and L['v2_n'] >= 256:
+                    vpick = v2_rng.integers(0, L['v2_n'], v2_step)
+                    vpick_d = dev(vpick)
+                    v_pend, v_act = L['v2_pend'].index_select(0, vpick_d), L['v2_act'].index_select(0, vpick_d)
+                    v_w, v_G = L['v2_w'].index_select(0, vpick_d), L['v2_G'].index_select(0, vpick_d)
+                    v_ent = min(ENT_CAP, used_entities(L['v2_cnt']['n_ent'][vpick]))
+                    vb = vpick_d if raw_mode else decode_rows(L['v2_raw'].index_select(0, vpick_d),
+                                                              pending=v_pend, entities=v_ent)
+                    v_share = args.teacher_v2_weight * v2_step / len(sel)
                     sec('teach_build')
                 last = (len(sel) - 1) // micro * micro
                 for lo_ in range(0, len(sel), micro):   # the minibatch's means, a part at a time
                     part = sel[lo_:lo_ + micro]
                     part_h = sel_h[lo_:lo_ + micro]
                     w = len(part) / len(sel)
-                    mb = {k: v[part] for k, v in batch.items()}   # take(batch, part), entity tokens from the host
                     used = min(width, used_entities(ne_h[part_h]))
-                    for k_e in ENTITY_FIELDS:
-                        mb[k_e] = mb[k_e][:, :used]
+                    merged = tb is not None and args.teach_merge and lo_ == last
+                    vmerged = vb is not None and args.teach_merge and lo_ == last   # (teacher v2: after the teacher's)
+                    if raw_mode:
+                        # B18: the part's records (and the teacher's) as bytes, the fields views of them (decode_rows)
+                        rp, pp, e_ = raw_all.index_select(0, part), pend_all.index_select(0, part), used
+                        if merged:
+                            e_ = max(used, min(ENT_CAP, used_entities(teach_rows['n_ent'][pick])))
+                            rp = torch.cat([rp, L['teach_raw'].index_select(0, pick_d)])
+                            pp = torch.cat([pp, teach_pending(meta)])
+                        if vmerged:
+                            e_ = max(e_, v_ent)
+                            rp = torch.cat([rp, L['v2_raw'].index_select(0, vpick_d)])
+                            pp = torch.cat([pp, v_pend])
+                        mb = decode_rows(rp, pending=pp, entities=e_)
+                    elif fast:   # (B18: the entity fields cut before the gather)
+                        mb = {k: (v[:, :used] if k in ENTITY_FIELDS else v)[part] for k, v in batch.items()}
+                    else:
+                        mb = {k: v[part] for k, v in batch.items()}   # take(batch, part), entity tokens from the host
+                        for k_e in ENTITY_FIELDS:
+                            mb[k_e] = mb[k_e][:, :used]
                     tokens += used
                     parts += 1
-                    merged = tb is not None and args.teach_merge and lo_ == last
                     ne_p, nd_p = ne_h[part_h], nd_h[part_h]
                     if merged:   # the teacher's records ride along in the last part: one forward and backward
-                        mb = cat_batch(mb, tb)
+                        if not raw_mode:
+                            mb = cat_batch(mb, tb)
                         ne_p = np.concatenate([ne_p, teach_rows['n_ent'][pick]])
                         nd_p = np.concatenate([nd_p, teach_rows['n_doors'][pick]])
-                    if args.packed:
+                    if vmerged:   # (teacher v2) its records after the teacher's
+                        if not raw_mode:
+                            mb = cat_batch(mb, vb)
+                        ne_p = np.concatenate([ne_p, L['v2_cnt']['n_ent'][vpick]])
+                        nd_p = np.concatenate([nd_p, L['v2_cnt']['n_doors'][vpick]])
+                    if args.packed and fast:   # B18: + the entity positions and the attention buckets, one copy
+                        plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets)
+                        hn = ['rec', 'base']
+                        for k_ in dd:   # the distinct grids of this part (the teacher's records each their own)
+                            u_, i_ = first_of(dd[k_][part_h], dd_size[k_])
+                            if merged or vmerged:
+                                t_ = len(mb['n_ent']) - len(part)
+                                u_, i_ = (np.concatenate([u_, len(part) + np.arange(t_)]),
+                                          np.concatenate([i_, len(u_) + np.arange(t_)]))
+                            plan[k_ + '_u'], plan[k_ + '_i'] = u_, i_
+                            hn += [k_ + '_u', k_ + '_i']
+                        bk_ = plan['buckets'] if 'buckets' in fparts else []
+                        got = dev_many([plan[k_].reshape(-1) for k_ in hn] + [c_ for c_, _ in bk_])
+                        got[0] = got[0].view(-1, 6)
+                        mb.update(zip(hn[2:], got[2:len(hn)]))
+                        tok = plan_tokens(plan, got[0], got[1])
+                        pnames = ['keep', 'starts']
+                        if 'ekeep' in fparts:
+                            pnames.append('ekeep')
+                        if 'buckets' in fparts:
+                            pnames.append('gpos')
+                            if 'ekeep' in fparts:   # the packed tokens built from the real ones (forward's xperm)
+                                pnames += ['dkeep', 'xperm']
+                        mb.update((k_, tok[k_]) for k_ in pnames)
+                        if bk_:
+                            mb['buckets'] = [(c_, w_) for c_, (_, w_) in zip(got[len(hn):], bk_)]
+                    elif args.packed:
                         mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1]))
                     k_ = len(part)
                     with autocast():
                         logits_, value_, danger_ = learner_model(mb, packed=bool(args.packed))
-                    logp, entropy = learner_model.log_prob(logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
+                    logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
+                        logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
                     value = value_[:k_].float()
                     a = a_all[lo_:lo_ + micro]
                     if prox is None:   # PPO's ratio to the behaviour policy (the one that sampled the action)
@@ -1126,8 +1619,16 @@ def main():
                     ent = entropy.sum(-1).mean()
                     loss = (pg + args.vf_coef * vf - args.ent_coef * ent) * w
                     if merged:
-                        tloss, tstats = teacher_loss(logits_[k_:], danger_[k_:], meta, len(sel))
+                        t_end = k_ + len(pick) if vmerged else None   # (teacher v2's records follow)
+                        tloss, tstats = teacher_loss(logits_[k_:t_end], danger_[k_:t_end], meta, len(sel))
                         loss = loss + tloss
+                    if vmerged:   # 2026-10-10 (teacher v2): -w log pi(a | obs) over the heads + (V(obs) - G)^2
+                        o_ = k_ + (len(pick) if merged else 0)
+                        lp_v, _ = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
+                            logits_[o_:], learner_model.gate(mb)[o_:], v_act)
+                        vloss, vstats = teacher_v2_loss(lp_v, value_[o_:], v_w, v_G, v_share, args.teacher_v2_coef,
+                                                        args.teacher_v2_vf)
+                        loss = loss + vloss
                     loss.backward()
                     with torch.no_grad():
                         acc += torch.stack([pg, vf, ent, (b_logp[part] - logp).mean(),
@@ -1136,6 +1637,9 @@ def main():
                         if merged:
                             tacc += tstats
                             teach_steps += 1
+                        if vmerged:
+                            vacc += vstats
+                            v2_steps += 1
                 if corr_batch is not None and first_step:
                     # Phase B2: the choice records' correction, once per epoch (its records count as decisions of
                     # this minibatch, their advantage in the minibatch's units)
@@ -1162,6 +1666,21 @@ def main():
                         tacc += tstats
                     teach_steps += 1
                     sec('teach')
+                if vb is not None and not args.teach_merge:   # 2026-10-10 (teacher v2): a pass of its own
+                    with autocast():
+                        v_logits, v_value, _ = learner_model(vb, packed=bool(args.packed))
+                    lp_v, _ = learner_model.log_prob(v_logits, learner_model.gate(vb), v_act)
+                    vloss, vstats = teacher_v2_loss(lp_v, v_value, v_w, v_G, v_share, args.teacher_v2_coef,
+                                                    args.teacher_v2_vf)
+                    vloss.backward()
+                    with torch.no_grad():
+                        vacc += vstats
+                    v2_steps += 1
+                    sec('teach')
+                if L.get('trace') is not None:   # B18 check: the loss sums after each step, the first step's gradient
+                    L['trace'].append((acc.clone(), tacc.clone(), None if L['trace'] else
+                                       [None if q.grad is None else q.grad.clone()
+                                        for q in opt.param_groups[0]['params']]))
                 torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                 opt.step()
                 sec('opt')
@@ -1174,7 +1693,9 @@ def main():
         job['cpu0'] = cpu0
         L['update'] += 1
         L['decisions'] += count
-        fresh.set()                               # the actor may take the new weights now
+        L['last_update_s'], L['last_steps'], L['last_count'], L['last_U'] = update_s, steps, count, U   # (B18 bench)
+        if not L.get('bench'):
+            fresh.set()                           # the actor may take the new weights now
         # ---- logging (the actor is already running on)
         t_end = time.perf_counter()
         wall = t_end - (L['t_end'] if L['t_end'] is not None else job['t_start'])
@@ -1241,6 +1762,50 @@ def main():
                         'exits': sum(e.get('exits', 0) for e in finished),
                         'stage_max': max([e.get('stage', 0) for e in finished] or [0]),
                         'stage_mean': sum(e.get('stage', 0) for e in finished) / m_all})
+            if cfg.start_build_prob > 0:   # 2026-10-08: start builds transplanted so far (worker totals)
+                row['start_builds'] = float(stats[:, ST['start_builds']].sum())
+        if cfg.stat_aug_prob > 0:   # 2026-10-08: stat augmentations applied so far (worker totals)
+            row['stat_augs'] = float(stats[:, ST['stat_augs']].sum())
+        if cfg.teacher_death_depths:   # 2026-10-09: fatal hurts searched / with a safe move / their seconds (totals)
+            for k_d in ('death_searches', 'death_avoidable', 'death_s'):
+                row[k_d] = float(stats[:, ST[k_d]].sum())
+        if v2_on:   # 2026-10-10 (teacher v2): worker totals, this update's window, the trainer's side
+            tot = {k_v: float(stats[:, ST[k_v]].sum()) for k_v in (
+                'v2_points', 'v2_random', 'v2_fatal', 'v2_depths', 'v2_improving', 'v2_gain0', 'v2_gain', 'v2_spread',
+                'v2_reps', 'v2_branches', 'v2_dec', 'v2_frames', 'v2_records', 'v2_s', 'v2_cpu', 'v2_wait_s',
+                'v2_errors', 'v2_queue', 'v2_dropped', 'v2_nodepth')}
+            prev = L.get('v2_prev') or dict.fromkeys(tot, 0.0)
+            dlt = {k_v: tot[k_v] - prev[k_v] for k_v in tot}
+            L['v2_prev'] = tot
+            row.update(tot)
+            pts_ = dlt['v2_points'] - dlt['v2_nodepth']   # points with a depth searched in this window
+            row['v2_points_w'] = dlt['v2_points']
+            row['v2_improving_share'] = dlt['v2_improving'] / pts_ if pts_ > 0 else ''
+            row['v2_gain0_mean'] = dlt['v2_gain0'] / pts_ if pts_ > 0 else ''
+            row['v2_spread_mean'] = dlt['v2_spread'] / dlt['v2_reps'] if dlt['v2_reps'] > 0 else ''
+            row['v2_cpu_per_point'] = dlt['v2_cpu'] / dlt['v2_points'] if dlt['v2_points'] > 0 else ''
+            row['v2_game_hours'] = tot['v2_frames'] / 30 / 3600
+            row['v2_new'], row['v2_held'], row['v2_step'] = v2_new, L['v2_n'], v2_step
+            for k_v in ('v2_prior', 'v2_prior_p', 'v2_prior_all', 'v2_firsts', 'v2_new_gain', 'v2_new_spread',
+                        'v2_prior_move_all', 'v2_verr', 'v2_verr_abs'):
+                row[k_v] = v2_log.get(k_v, '')
+            vacc_c = vacc.cpu().numpy()
+            row['v2_loss_pi'] = vacc_c[0] / v2_steps if v2_steps else ''
+            row['v2_loss_vf'] = vacc_c[1] / v2_steps if v2_steps else ''
+            row['v2_logp'] = vacc_c[2] / v2_steps if v2_steps else ''
+            row['v2_lane_calls'], row['v2_lane_rows'] = lane_stat['calls'], lane_stat['rows']
+            row['v2_lane_s'] = lane_stat['s']
+        if char_ids:   # 2026-10-08 (characters): floor starts built as non-Isaac (worker totals) and, per character,
+            #            this update's finished episodes and their floor clears
+            row['char_starts'] = float(stats[:, ST['char_starts']].sum())
+            for c_id in char_ids:
+                eps_c = [e for e in finished if e.get('char0') == c_id]
+                row[f'char_{c_id}/episodes'] = len(eps_c)
+                row[f'char_{c_id}/win'] = sum(e['done'] == 1 for e in eps_c) / max(len(eps_c), 1)
+        if book.gains is not None:   # 2026-10-08: heal / resource terms on: per finished episode
+            m_all = max(len(finished), 1)
+            row['healed'] = sum(e.get('healed', 0.0) for e in finished) / m_all
+            row['gathered'] = sum(e.get('gathered', 0.0) for e in finished) / m_all
             for k_st in range(1, 9):
                 row[f'stage_{k_st}'] = sum(e.get('stage', 0) == k_st for e in finished)
         if branching:   # 2026-10-07: branch counters (worker totals so far) and this update's branch episodes
@@ -1270,6 +1835,15 @@ def main():
                         'choice_train_acc', 'choice_train_acc_sig', 'choice_train_mse', 'choice_train_floor',
                         'choice_train_corr', 'choice_train_slope'):
                 row[k_c] = choice_log.get(k_c, '')
+        if lab is not None:   # 2026-10-08: the lab's counters (worker totals so far) and this update's builds
+            for k_l in ('lab_jobs', 'lab_states', 'lab_dec', 'lab_s', 'lab_cpu', 'lab_game_cpu', 'lab_errors',
+                        'lab_results', 'lab_panel', 'lab_panel_s', 'lab_panel_builds'):
+                row[k_l] = float(stats[:, ST[k_l]].sum())
+            row['actual_game_hours'] = float(stats[:, ST['frames']].sum()) / 30 / 3600
+            row['lab_game_hours'] = float(stats[:, ST['lab_frames']].sum()) / 30 / 3600
+            row['lab_episodes'] = len(job.get('lab_finished', []))
+            row['lab_posted'], row['lab_open'] = lab['posted'], len(lab['book'].open)
+            row.update(lab_learn(job.get('lab_results', [])))
         for gi, name in enumerate(names):
             eps = [e for e in finished if e['group'] == gi]
             m = max(len(eps), 1)
@@ -1315,11 +1889,20 @@ def main():
 
     def learner_loop():
         torch.cuda.set_stream(learner_stream)
+        if learner_cpus:   # (B18: this thread, and the threads it starts, on --learner-cpus)
+            os.sched_setaffinity(0, learner_cpus)
         while True:
             job = jobs.get()
             if job is None:
                 return
             try:
+                if os.environ.get('ISAAC_RL_LEARNER_BENCH') and not L.get('stop'):
+                    # 2026-10-10 (B18): the learner bench on this job (abplus_bench_learner.py), then the run ends
+                    from abplus_bench_learner import run_bench
+                    if run_bench(dict(learn=learn, job=job, model=learner_model, opt=opt, L=L, args=args,
+                                      stats=sampler.stats.copy())):
+                        fresh.set()
+                        continue
                 learn(job)
             except BaseException as exc:   # handed to the main thread
                 failure.append(exc)
@@ -1332,6 +1915,10 @@ def main():
     # ------------------------------------------------------------------ actor (the main thread)
     pending = np.zeros((n, nh), np.int64)            # the action under way per worker
     book = Episodes(n, rw, floor, run=run, items=items)
+    if cfg.stat_aug_prob > 0:   # 2026-10-08: the start stats of every episode into episodes.jsonl
+        book.stats0 = {}
+    if char_ids:   # 2026-10-08: the character of every episode into episodes.jsonl (char0)
+        book.char0 = {}
     version = update                                # the actor's weights: updates done
     busy = False                                     # an update is running on the learner
     handed = decisions_total
@@ -1359,8 +1946,32 @@ def main():
             aux[n, AUX_SNAP] = version
         busy = False
 
+    def serve_lanes():
+        """2026-10-10 (teacher v2): the waiting lane requests answered (actions, value, log-probability, weights)."""
+        idx_l = sampler.take_lanes()
+        if not len(idx_l):
+            return
+        t_l = time.perf_counter()
+        rows_l = sampler.lane_rows[idx_l]
+        pend_l = sampler.lane_io[idx_l, :nh].astype(np.int64)
+        got = lane_actor.act(rows_l, pend_l) if lane_actor is not None else None
+        if got is None:   # (no graph, or more records than it holds: eager)
+            with torch.inference_mode():
+                a_l, lp_l, v_l = model.act(to_batch(rows_l, pend_l, device))
+            got = (a_l.cpu().numpy(), lp_l.cpu().numpy(), v_l.cpu().numpy())
+        a_l, lp_l, v_l = got
+        sampler.lane_io[idx_l, 5:5 + nh] = a_l
+        sampler.lane_out[idx_l, 0], sampler.lane_out[idx_l, 1], sampler.lane_out[idx_l, 2] = v_l, lp_l, version
+        sampler.reply_lanes(idx_l)
+        lane_stat['calls'] += 1
+        lane_stat['rows'] += len(idx_l)
+        lane_stat['s'] += time.perf_counter() - t_l
+
     def wait_learner():
-        while not fresh.wait(0.5):
+        # (teacher v2: the lanes are answered meanwhile; their poll releases the GIL)
+        while not fresh.wait(0.0 if v2_on else 0.5):
+            if v2_on and sampler.wait_lanes(0.005):
+                serve_lanes()
             if failure or not learner.is_alive():
                 break
         take_weights()
@@ -1371,7 +1982,7 @@ def main():
     if aux is not None and args.branch_snap_every > 0 and args.graph_entities > 0:
         for k_s in range(2):
             m_s = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge,
-                            choice=n_choice).to(device).eval()
+                            choice=n_choice, ent_ext=ent_ext, pchar=pchar).to(device).eval()
             m_s.load_state_dict(model.state_dict())
             e_s = dict(id=version if k_s == 0 else -1, model=m_s, actors=[],
                        params=list(m_s.parameters()) + list(m_s.buffers()))
@@ -1389,6 +2000,8 @@ def main():
         snapshot's id; None: the actor's own)."""
         t2 = time.perf_counter()
         sampler.actions[a_idx, :nh] = actions
+        if v2_on:   # 2026-10-10 (teacher v2): the value of the record, for the worker's log (before the reply)
+            sampler.main_value[a_idx] = value
         if aux is not None:   # (written before the reply: the worker reads it after its answer)
             aux[a_idx, 0], aux[a_idx, 1] = value, logp
             if extra is not None:
@@ -1438,17 +2051,28 @@ def main():
             inflight.append((g, idx_b[m_], sub_b[m_], uw_b[m_], t1, busy))
             prof['snap_calls'] += 1
 
+    if lab is not None:   # 2026-10-08: the first lab jobs, and the builds ordinary episodes end with
+        book.seen_inv = []
+        post_lab_jobs()
     t_run = time.perf_counter()
     t_cycle, w_mark = t_run, sampler.stats.copy()
     proc_mark = time.process_time()   # this process's CPU seconds (all threads)
     try:
-        while handed < target_decisions and sampler.live:
+        if bench_job is not None:   # B18: the saved job straight to the learner's bench, in this thread (no collection)
+            from abplus_bench_learner import run_bench
+            torch.cuda.set_stream(learner_stream)
+            run_bench(dict(learn=learn, job=bench_job, model=learner_model, opt=opt, L=L, args=args,
+                           stats=sampler.stats.copy()))
+            torch.cuda.set_stream(actor_stream)
+        while handed < target_decisions and sampler.live and not L.get('stop'):
             # ---- collect
             t0 = time.perf_counter()
             cpu_c0 = cpu_ticks()
             prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=0, calls=0, rows=0, eager=0,
                         act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0)
             while roll.usable() < args.rollout and sampler.live:
+                if v2_on and sampler.lane_ready:   # 2026-10-10 (teacher v2): lane requests the last poll saw
+                    serve_lanes()
                 if busy and fresh.is_set():
                     while inflight:
                         finish(prof)
@@ -1535,9 +2159,20 @@ def main():
             wst = sampler.stats.copy()
             dw = (wst - w_mark).sum(0)
             dec_w = (wst - w_mark)[:, ST['decisions']]   # decisions per worker in this cycle
+            lab_job = {}
+            if lab is not None:   # 2026-10-08: the lab's results joined per job, the builds seen, new jobs posted
+                lab['book'].add(sampler.lab_records(), time.time())
+                lab_job = dict(lab_results=lab['book'].take(), lab_finished=book.lab_finished)
+                book.lab_finished = []
+                for held in book.seen_inv:
+                    lab['sched'].note_seen(held)
+                book.seen_inv = []
+                post_lab_jobs()
             job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
+                       **lab_job,
                        teach=sampler.teacher_records() if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,
+                       v2=sampler.v2_records() if v2_on else None,   # 2026-10-10 (teacher v2)
                        branch_finished=book.branch_finished,
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,
@@ -1572,7 +2207,7 @@ def main():
         if log_file is not None:
             log_file.close()
         episodes_path.close()
-        for f_ in (branch_path, choice_path):
+        for f_ in (branch_path, choice_path) + ((lab['out'],) if lab is not None else ()):
             if f_ is not None:
                 f_.close()
         if branching and L.get('choice_n'):   # the choice records' ring as it is at the end (rows + meta)

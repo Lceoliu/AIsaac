@@ -147,7 +147,14 @@ Protocol (one JSON object per line), identical to 0.2.0 plus "lua", "format" and
 -- ABP_OBS_INIT, the lean observation's fixed part and its terrain check are built in C (see "native obs" at pack_lean);
 -- ISAAC_RL_NATIVE_OBS=0 or the `native_obs` command (mode 0 / 1 / 2 = Lua / native / check) selects the path, and
 -- `lean_profile` times the parts.
-local VERSION = "abp-0.2.15"
+-- abp-0.2.16 (2026-10-08, the token policy's view of lasers and tear flags): a lean entity record grows from 108 to 144
+-- bytes: a tear's / laser's TearFlags or a projectile's ProjectileFlags, and a laser's geometry (cos / sin of its
+-- angle, length, end point, radius, circle). Everything else as abp-0.2.15 (see pack_lean).
+-- abp-0.2.17 (2026-10-08, character randomisation): a lean player record grows from 38 to 39 doubles, the last one the
+-- player's PlayerType (p:GetPlayerType(): 0 Isaac .. 17 The Soul, AB+ resources/scripts/enums.lua). The native obs is
+-- used only with a libabp_turbo.so that writes the same records (abp_native_player_f == 39). Everything else as
+-- abp-0.2.16.
+local VERSION = "abp-0.2.17"
 local mod = RegisterMod("AbpRLBridge", 1)
 
 -- The game ships LuaSocket for both architectures; make sure the 64-bit core is found.
@@ -1237,8 +1244,8 @@ local function terrain_signature(room, player)
 	return table.concat(parts, ",")
 end
 
-local function pack_laser(e)
-	local l = laser_record(e)
+local function pack_laser(e, l)
+	l = l or laser_record(e)
 	local parts = { packf("<Bddddddi8", B(l.circle), l.radius, l.angle, l.length, l.width, l["end"][1], l["end"][2],
 		#l.samples) }
 	for _, s in ipairs(l.samples) do parts[#parts + 1] = packf("<dd", s[1], s[2]) end
@@ -1400,16 +1407,22 @@ end
 --   totals   <dddd  player 0's total damage taken since the run's start (half hearts), the summed HitPoints of the
 --            room's monsters (is_monster), the summed HitPoints and the count of its door-blocking NPCs. For rewards
 --            and the episode's end, not for the policy: a monster's HP is not something the player sees.
---   players  x 38 doubles (LEAN_PLAYER; abplus_lean.PLAYER_FIELDS). 2026-10-07 (charge, same VERSION): the last two
+--   players  x 39 doubles (LEAN_PLAYER; abplus_lean.PLAYER_FIELDS). 2026-10-07 (charge, same VERSION): the last two
 --            are the charge counter of a charged weapon (Entity_Player +0x2634, int: what the charge bar shows for
 --            Brimstone, Monstro's Lung, Mom's Knife, Chocolate Milk, Cursed Eye, Tech X, the Forgotten's bone; 0 while
 --            nothing charges; abp_turbo's abp_player_charge, no Lua API reads it) and the weapon types as a bit mask
 --            (bit w set when HasWeaponType(w), w = 0 .. 10: 1 tears, 2 Brimstone, 3 Technology, 4 Mom's Knife, 5 Dr.
---            Fetus, 6 Epic Fetus, 7 Monstro's Lung, 8 Ludovico, 9 Tech X, 10 bone)
---   doors    x <BBBBffi4  slot, open, locked, flags (1 the room behind was visited, 2 it is clear: what the
+--            Fetus, 6 Epic Fetus, 7 Monstro's Lung, 8 Ludovico, 9 Tech X, 10 bone). abp-0.2.17 (2026-10-08): a 39th,
+--            the PlayerType (p:GetPlayerType(); Entity_Player::GetPlayerType in abp_turbo)
+--   doors   x <BBBBffi4  slot, open, locked, flags (1 the room behind was visited, 2 it is clear: what the
 --            minimap shows), x, y, target room type (visible doors only)
---   <I2 entity count, entities x LEAN_ENTITY (108 bytes; the rules of pack_entity: no player, only whitelisted
---            effects, only visible entities; hp is HitPoints / MaxHitPoints for bosses only, as in format 2)
+--   <I2 entity count, entities x LEAN_ENTITY (144 bytes; the rules of pack_entity: no player, only whitelisted
+--            effects, only visible entities; hp is HitPoints / MaxHitPoints for bosses only, as in format 2).
+--            abp-0.2.16 (2026-10-08): the first 108 bytes as before, then <i8ffffffi4: the flag word (a tear's and a
+--            laser's TearFlags, a projectile's ProjectileFlags: the engine's uint64 as Lua's integer, luabridge
+--            lua_pushinteger; 0 for everything else) and a laser's geometry (0 for everything else): cos and sin of
+--            AngleDegrees, LaserLength (0 for an unbounded beam such as Brimstone's), the end point (GetEndPoint; a
+--            circle laser's own position), Radius, circle (1 / 0). The laser block after the entities is unchanged.
 --   lasers   x <i8 entity index + format 2's laser block
 --   terrain  (flag 2) <I4 version, s4 terrain JSON, s4 grid JSON, as format 2
 --   map      (flag 8) <B count, rooms x <BBBBB  GridIndex, shape, type (0 unless its icon is shown or it was visited),
@@ -1421,8 +1434,9 @@ end
 -- 2026-10-07 also every step on everything the block's grid records hold (terrain_content_sig: a grid entity's type,
 -- variant, state, collision class), so a step's terrain block is never behind the game's.
 local LEAN_MAGIC = 0x33504241
-local LEAN_ENTITY = "<i8i4i4i4ddddfffi4i4fi4i4BBBBi4ffff"
-local LEAN_PLAYER = "<" .. string.rep("d", 38)
+local LEAN_ENTITY = "<i8i4i4i4ddddfffi4i4fi4i4BBBBi4ffff" .. "i8ffffffi4"   -- abp-0.2.16: + flag word, laser geometry
+local LEAN_PLAYER = "<" .. string.rep("d", 39)   -- abp-0.2.17: + PlayerType
+local LEAN_PLAYER_F = 39
 local LEAN_FULL_EVERY = 30
 local lean = { cells = nil, full_at = -100000, full_sig = nil, part_sig = nil, map_key = nil, map_at = -100000,
 	map_sig = nil }
@@ -1639,7 +1653,9 @@ end
 -- mode forces a full terrain pass (each path keeps its own terrain state). While a player has a cancelled lethal hit
 -- (state.lethal) the Lua code builds the observation.
 local native_lean, native_terrain = nil, nil
-if getenv("ABP_OBS_INIT") == "1" and type(abp_native_lean) == "function" and type(abp_native_terrain) == "function" then
+-- (abp-0.2.17: only a library whose player records have LEAN_PLAYER_F doubles; an older one leaves the Lua code)
+if getenv("ABP_OBS_INIT") == "1" and type(abp_native_lean) == "function" and type(abp_native_terrain) == "function"
+		and abp_native_player_f == LEAN_PLAYER_F then
 	native_lean, native_terrain = abp_native_lean, abp_native_terrain
 end
 -- Post-update skip (2026-10-04, frame-cost work, same VERSION: nothing on the wire changes). abp_turbo puts a gate on the
@@ -1699,15 +1715,28 @@ local function lean_entities()
 		end
 		if t ~= 1 and (t ~= 1000 or whitelist[e.Variant]) and e.Visible then
 			local kind, flags, hpf, a, b, c, champion = 0, 0, 0.0, 0.0, 0.0, 0.0, -1
+			-- abp-0.2.16: flag word and laser geometry (lcirc: 1 circle laser)
+			local word, lcos, lsin, llen, lex, ley, lrad, lcirc = 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
 			if t == 2 then
 				local x = e:ToTear()
 				kind, a, b, c = 1, x.Height, x.FallingSpeed, x.Scale
+				word = x.TearFlags
 			elseif t == 9 then
 				local x = e:ToProjectile()
 				kind, a, b, c = 2, x.Height, x.FallingSpeed, x.Scale
+				word = x.ProjectileFlags
 			elseif t == 7 then
 				kind = 3
-				lasers[#lasers + 1] = spack("<i8", e.Index) .. pack_laser(e)
+				local l = laser_record(e)
+				lasers[#lasers + 1] = spack("<i8", e.Index) .. pack_laser(e, l)
+				pcall(function() word = e:ToLaser().TearFlags end)
+				local rad = math.rad(l.angle)
+				lcos, lsin, llen, lrad = math.cos(rad), math.sin(rad), l.length, l.radius
+				if l.circle then
+					lcirc, lex, ley = 1, e.Position.X, e.Position.Y
+				else
+					lex, ley = l["end"][1], l["end"][2]
+				end
 			elseif t == TYPE_BOMB then
 				kind = 4
 			elseif t == 5 then
@@ -1734,7 +1763,8 @@ local function lean_entities()
 			local pos, vel, sm = e.Position, e.Velocity, e.SizeMulti
 			ents[#ents + 1] = spack(LEAN_ENTITY, e.Index, t, e.Variant, e.SubType, pos.X, pos.Y, vel.X, vel.Y, e.Size,
 				sm.X, sm.Y, e.EntityCollisionClass, e.GridCollisionClass, e.CollisionDamage, spr:GetFrame(),
-				e.FrameCount, kind, flags, anim, B(e.FlipX), champion, hpf, a, b, c)
+				e.FrameCount, kind, flags, anim, B(e.FlipX), champion, hpf, a, b, c, word, lcos, lsin, llen, lex, ley,
+				lrad, lcirc)
 		end
 	end
 	return spack("<I2", #ents) .. table.concat(ents), lasers, monsters_hp, blocking_hp, blocking_count
@@ -1767,7 +1797,7 @@ local function lean_players(n_players)
 			p:GetActiveItem(), p:GetActiveCharge(), B(p:GetActiveItem() ~= 0 and not p:NeedsCharge()),
 			B(p:GetDamageCooldown() > 0), B(p.ControlsEnabled), p:GetHeadDirection(), p:GetFireDirection(),
 			p:GetMovementDirection(), p:GetSprite():GetFrame(), B(p:IsDead() or state.lethal[p.Index] == true),
-			p.FireDelay, p:GetDamageCooldown(), lean_charge(i), lean_weapons(p))
+			p.FireDelay, p:GetDamageCooldown(), lean_charge(i), lean_weapons(p), p:GetPlayerType())
 	end
 	return players
 end
