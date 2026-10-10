@@ -516,7 +516,9 @@ class SearchSlots:
 
     def __init__(self, cfg):
         self.n = int(cfg.teacher_slots or 0)
-        self.paths = [f'/dev/shm/abp-teach-{cfg.name}-{cfg.port}-{j}' for j in range(self.n)]
+        # 2026-10-10: the trainer's pid in the names: stale lock files of an earlier launch (held by orphaned search
+        # children) blocked every search of C84 on HPC128 after a relaunch
+        self.paths = [f'/dev/shm/abp-teach-{cfg.name}-{cfg.port}-{os.getppid()}-{j}' for j in range(self.n)]
         self.fds = []
         for p in self.paths:
             self.fds.append(os.open(p, os.O_RDWR | os.O_CREAT, 0o600))

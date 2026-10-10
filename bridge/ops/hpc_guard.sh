@@ -25,6 +25,11 @@ check() {
       kill -KILL $p 2>/dev/null
     fi
   done
+  # 2026-10-10: worker helpers / forked search children whose parent is gone (reparented to init) hold the search
+  # slot locks and spin: ended
+  for p in $(ps -eo pid,ppid,cmd | grep "[f]rom multiprocessing" | awk '$2<=41 {print $1}'); do
+    echo "$now orphaned worker helper $p ended" >> $LOG; kill -KILL $p 2>/dev/null
+  done
   if [ "$(trainers)" = 0 ]; then
     idle_checks=$((idle_checks + 1))
     if [ $idle_checks -ge 3 ] && [ "$(pgrep -c isaac.x64)" -gt 0 ]; then end_all "no trainer for 3 min"; fi
