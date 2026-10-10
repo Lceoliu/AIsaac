@@ -30,6 +30,14 @@ check() {
   for p in $(ps -eo pid,ppid,cmd | grep "[f]rom multiprocessing" | awk '$2<=41 {print $1}'); do
     echo "$now orphaned worker helper $p ended" >> $LOG; kill -KILL $p 2>/dev/null
   done
+  # 2026-10-11: forked search children (parent = a worker helper) older than 10 min are stuck (C77 under the pre-fix
+  # code: 5 of 6 search slots held for hours, search rate down 4x): ended, the worker's waitpid returns, slot freed
+  for p in $(ps -eo pid,ppid,etimes,cmd | grep "[f]rom multiprocessing" | awk '$3>600 {print $1}'); do
+    pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
+    if [ -n "$pp" ] && ps -o cmd= -p "$pp" 2>/dev/null | grep -q "from multiprocessing"; then
+      echo "$now stuck search child $p (parent $pp) ended" >> $LOG; kill -KILL "$p" 2>/dev/null
+    fi
+  done
   if [ "$(trainers)" = 0 ]; then
     idle_checks=$((idle_checks + 1))
     if [ $idle_checks -ge 3 ] && [ "$(pgrep -c isaac.x64)" -gt 0 ]; then end_all "no trainer for 3 min"; fi
