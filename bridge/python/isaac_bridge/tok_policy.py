@@ -49,6 +49,41 @@ each chunk's first record, T, reset [C, T] episode starts inside the chunk, opti
 after the C x T chunk records, one step each): truncated BPTT over the chunk. mem=None on a memory model = h of zeros
 (an episode's start) and the output arity of a memory-free model. The memory modules are registered last (after
 char_emb): the parameters before them keep their order. Without memory nothing here changes.
+
+Extra tokens (2026-10-12, B21 item tokens / B22 global token; TokPolicy(item_tokens=True) needs items=True,
+TokPolicy(global_token=True); config keys 'item_tokens', 'global_token', only when set). A fixed number G of tokens per
+record (static shapes for the CUDA graphs) beside the old ones (player, room, map, doors, entities):
+  B21 (ItemTokens, 20): one per held collectible (ROW 'inv', up to INV_CAP = 16, newest first: a collectible table of
+  its own (dim 32), the count and count > 1, a slot embedding), one for the active item (its id in the same table,
+  'pinv' columns 0-1: charge share, max charge / 12), one per trinket (2), one for the pocket (pill colour, pill effect,
+  card); each token = mlp(those inputs) + a type embedding (held, active, trinket, pocket). Absent ones are masked as
+  keys (-1e9 in the attention bias, as absent entities). The old multi-hot / pinv inputs of the player token stay.
+  B22 (GlobalToken, 1): a learned vector; a second value head `value_global` reads it (after a norm of its own; with
+  memory + mem_out(h_new) as the other heads); with memory the GRU's input is z + mem_in(norm(global token)) (mem_in
+  zero at the start: the concatenation of the two through a zero-initialised projection of the global part).
+Why not simply zero tokens in the one softmax: a zero token is not neutral there. Its key is W_k LN(0) + b_k =
+W_k beta + b_k (beta = n1's bias), not zero, so it takes softmax mass from every query with a non-zero bias, and its
+value W_v beta + b_v is mixed in; even a key masked with -1e9 changes the softmax's and the p @ v product's length and
+so their summation order (not bit-identical, see load_compatible's note on padded columns). A key bias log(g) would give
+exactly zero weight at g = 0 but its gradient is 0 x 1/g (NaN), and any exactly-zero softmax weight has a zero
+gradient through the softmax. So the old tokens' attention is left exactly as it was (same tensors, same calls) and the
+extra tokens reach them through separate, gated terms (Block._ext): for every old query, per layer l,
+  a_old = softmax(q k_old^T + bias) v_old   (unchanged)
+          + gate_items[l] * has_item * softmax(q k_items^T + item mask) v_items
+          + gate_global[l] * v_global          (one key: its softmax weight is 1)
+before the block's output projection; the gates are scalars per layer, zero at the start. The extra tokens themselves
+are updated like any token (their queries attend over every real old and extra key in one softmax, then proj and the
+feed-forward of the same block). At gates 0 every gated term is exactly +-0 (its factors are finite: a softmax over
+all-masked keys is a finite mean, has_item = 0 removes it), a_old + 0 = a_old, and the policy, value, danger and memory
+outputs are bit-identical to a model without the options (tests/test_item_global_smoke.py). Gradients: d loss / d gate
+= <term, d loss / d a_old> is non-zero from the first step (the gates open by themselves); everything upstream of a gate
+(the item embeddings, the global token's vector) gets a zero gradient through that path until its gate is non-zero
+(the same as the GRU behind B20's zero mem_out). value_global's loss reaches the item tokens at once (the global token
+attends to them inside the extra tokens' own softmax). Cost: G more tokens per record through every layer (queries
+over t + G keys) and a G-key cross term for every old token: about G / t more per-token work (actor: t = 43 at 32
+entity tokens, G = 21). The learner's packed paths compute the extra attention in the padded [records, t] layout (the
+old tokens' q / k / v scattered there once per layer). The new modules are registered after everything else (memory
+included): an optimiser state without them is remapped by parameter names (remap_optimizer_state).
 """
 import contextlib
 import os
@@ -65,8 +100,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .tok_obs import (DOOR_CAP, DOOR_F, ENT_F, ENT_F0, GRID, MAP, N_CARD, N_CHAR, N_COLLECTIBLE, N_PILL_COLOR,
-                      N_PILL_EFFECT, N_TRINKET, PATCH, PCHARGE_F, PINV_F, PLAYER_F, ROW)
+from .tok_obs import (DOOR_CAP, DOOR_F, ENT_F, ENT_F0, GRID, INV_CAP, MAP, N_CARD, N_CHAR, N_COLLECTIBLE,
+                      N_PILL_COLOR, N_PILL_EFFECT, N_TRINKET, PATCH, PCHARGE_F, PINV_F, PLAYER_F, ROW)
 
 N_MOVE, N_SHOOT, N_BOMB = 9, 5, 2
 HEADS = (N_MOVE, N_SHOOT, N_BOMB)
@@ -78,6 +113,11 @@ ITEM_EMB, TRINKET_EMB, PILL_EMB, EFFECT_EMB, CARD_EMB = 16, 8, 4, 8, 8
 # player-token inputs the items add: the two heads' action under way, pinv, held (multi-hot), active, two trinkets, pill
 # color, pill effect, card
 PLAYER_ITEMS_F = N_ITEM + N_PILL + PINV_F + ITEM_EMB + ITEM_EMB + 2 * TRINKET_EMB + PILL_EMB + EFFECT_EMB + CARD_EMB
+# 2026-10-12 (B21 item tokens): an item token's inputs: collectible (held or active), trinket, pill colour, pill effect,
+# card embeddings, then count, count > 1, charge share, max charge / 12 (zero where a kind has none)
+IT_COLL, IT_TRINKET, IT_POCKET = 32, 16, 8
+IT_F = IT_COLL + IT_TRINKET + 3 * IT_POCKET + 4
+N_ITEM_TOK = INV_CAP + 4   # held collectibles, the active item, two trinkets, the pocket
 
 
 _GOLDEN = np.uint64(0x9E3779B97F4A7C15)
@@ -297,14 +337,53 @@ class Block(nn.Module):
         self.math = False      # 2026-10-10 (B18): attention() as _MathAttention (TokPolicy.set_math_attention)
         self.ln_fast = False   # (B18) the packed layer norms as _LayerNorm
 
-    def forward(self, x, bias):
+    def forward(self, x, bias, ext=None):
         b, t, d = x.shape
         q, k, v = self.qkv(self.n1(x)).view(b, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
         a = attention(q, k, v, bias, self.math)
+        if ext is not None:   # 2026-10-12 (B21 / B22): the gated terms of the extra tokens (module docstring)
+            a = a + self._ext(q, k, v, bias, ext)
         x = x + self.proj(a.transpose(1, 2).reshape(b, t, d))
         return x + self.ff(self.n2(x))
 
-    def forward_packed(self, x, bias, keep, shape):
+    def _ext(self, q, k, v, bias, ext):
+        """(B21 / B22) The extra tokens of this layer: returns the gated terms they add to the old tokens' attention
+        output ([b, heads, t, dh], q / k / v / bias the old tokens' in the padded [b, t] layout) and updates ext['y'] (the
+        extra tokens [b, G, d]: attention over every real old and extra key, the projection and the feed-forward of
+        this block). ext: y, ybias [b, 1, 1, G] (0 / -1e9), cross [(lo, hi, gates [layers], has [b, 1, 1, 1] bool or
+        None)], l (this layer's index)."""
+        y = ext['y']
+        b, G, d = y.shape
+        t = q.shape[2]
+        qy, ky, vy = self.qkv(self.n1(y)).view(b, G, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
+        add = None
+        for lo, hi, gates, has in ext['cross']:
+            if hi - lo == 1:   # one key: its softmax weight is exactly 1, the term is its value
+                c = vy[:, :, lo:hi].expand(-1, -1, t, -1)
+            else:   # (a record without any real key: a finite mean of the masked values, removed by has = 0)
+                c = F.scaled_dot_product_attention(q, ky[:, :, lo:hi], vy[:, :, lo:hi],
+                                                   attn_mask=ext['ybias'][..., lo:hi].to(q.dtype))
+            g = gates[ext['l']]
+            c = c * (g.to(c.dtype) if has is None else g.to(c.dtype) * has.to(c.dtype))
+            add = c if add is None else add + c
+        mask = torch.cat([bias.expand(b, 1, 1, t), ext['ybias']], -1)
+        ay = F.scaled_dot_product_attention(qy, torch.cat([k, ky], 2), torch.cat([v, vy], 2), attn_mask=mask.to(qy.dtype))
+        y = y + self.proj(ay.transpose(1, 2).reshape(b, G, d))
+        ext['y'] = y + self.ff(self.n2(y))
+        return add
+
+    def _ext_packed(self, qkv, ext):
+        """(B21 / B22) _ext for the packed layers: the real old tokens' q / k / v (qkv [m, 3d], at the flat positions
+        ext['keep'] of the [n, t] layout) scattered into that layout; the gated terms back at the real tokens [m, d]."""
+        m, d3 = qkv.shape
+        d = d3 // 3
+        n, t, keep = ext['n'], ext['t'], ext['keep']
+        full = qkv.new_zeros((n * t, d3)).index_copy(0, keep, qkv)
+        q, k, v = full.view(n, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
+        add = self._ext(q, k, v, ext['pbias'], ext)
+        return add.transpose(1, 2).reshape(n * t, d).index_select(0, keep)
+
+    def forward_packed(self, x, bias, keep, shape, ext=None):
         """forward() on the real tokens only: x [m, d] holds the tokens at the flat positions `keep` of a [b, t]
         layout (shape (b, t)). The per-token parts (layer norms, qkv, projection, feed-forward) run on the m real
         tokens; attention runs in the padded layout with the same mask (padded keys get weight exactly 0, padded
@@ -319,7 +398,10 @@ class Block(nn.Module):
             gpos = shape['gpos']
             full = qkv.new_zeros((shape['total'], 3 * d)).index_copy(0, gpos, qkv)
             if self.math and full.dtype == torch.float32 and not _autocast_on():   # (one node for all buckets)
-                x = x + self.proj(_BucketAttention.apply(full, self.heads, shape['buckets']).index_select(0, gpos))
+                a = _BucketAttention.apply(full, self.heads, shape['buckets']).index_select(0, gpos)
+                if ext is not None:   # (B21 / B22)
+                    a = a + self._ext_packed(qkv, ext)
+                x = x + self.proj(a)
                 return x + self.ff(layer_norm(self.n2, x, self.ln_fast))
             outs, at = [], 0
             for nb, t, bias_k in shape['buckets']:
@@ -328,12 +410,16 @@ class Block(nn.Module):
                 outs.append(a.transpose(1, 2).reshape(nb * t, d))
                 at += nb * t
             a = (torch.cat(outs) if len(outs) > 1 else outs[0]).index_select(0, gpos)
+            if ext is not None:   # (B21 / B22)
+                a = a + self._ext_packed(qkv, ext)
             x = x + self.proj(a)
             return x + self.ff(layer_norm(self.n2, x, self.ln_fast))
         b, t = shape
         full = qkv.new_zeros((b * t, 3 * d)).index_copy(0, keep, qkv)
         q, k, v = full.view(b, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
         a = attention(q, k, v, bias, self.math)
+        if ext is not None:   # (B21 / B22)
+            a = a + self._ext(q, k, v, bias, ext)
         x = x + self.proj(a.transpose(1, 2).reshape(b * t, d).index_select(0, keep))
         return x + self.ff(layer_norm(self.n2, x, self.ln_fast))
 
@@ -388,10 +474,74 @@ class ChoiceHeads(nn.Module):
         return item, mask.any(1)
 
 
+class ItemTokens(nn.Module):
+    """B21 (2026-10-12; TokPolicy(item_tokens=True)): N_ITEM_TOK tokens per record from ROW 'inv', 'pitem', 'pinv' (the
+    module docstring) and their key mask, plus the per-layer gates of the old tokens' term (zero at the start)."""
+
+    def __init__(self, width, layers):
+        super().__init__()
+        self.coll = nn.Embedding(N_COLLECTIBLE, IT_COLL, padding_idx=0)
+        self.trinket = nn.Embedding(N_TRINKET, IT_TRINKET, padding_idx=0)
+        self.pill = nn.Embedding(N_PILL_COLOR, IT_POCKET, padding_idx=0)
+        self.effect = nn.Embedding(N_PILL_EFFECT, IT_POCKET, padding_idx=0)
+        self.card = nn.Embedding(N_CARD, IT_POCKET, padding_idx=0)
+        self.mlp = mlp(IT_F, width, width)
+        self.slot = nn.Embedding(INV_CAP, width)   # a held collectible's position in 'inv' (newest first)
+        self.kind = nn.Embedding(4, width)         # held, active, trinket, pocket
+        nn.init.normal_(self.slot.weight, std=0.02)
+        nn.init.normal_(self.kind.weight, std=0.02)
+        self.gate = nn.Parameter(torch.zeros(layers))
+
+    def forward(self, b):
+        """(tokens [n, N_ITEM_TOK, width], present [n, N_ITEM_TOK] bool). No host synchronisation, static shapes."""
+        inv, pit, pinv = b['inv'].long(), b['pitem'].long(), b['pinv'].float()
+        n = inv.shape[0]
+        hid, cnt = inv[..., 0].clamp(0, N_COLLECTIBLE - 1), inv[..., 1]
+
+        def zf(k, w):
+            return pinv.new_zeros((n, k, w))
+        cf = cnt.float()[..., None]
+        held = torch.cat([self.coll(hid), zf(INV_CAP, IT_TRINKET + 3 * IT_POCKET), cf, (cf > 1).float(),
+                          zf(INV_CAP, 2)], -1)
+        active = torch.cat([self.coll(pit[:, 0].clamp(0, N_COLLECTIBLE - 1))[:, None],
+                            zf(1, IT_TRINKET + 3 * IT_POCKET + 2), pinv[:, None, 0:2]], -1)
+        trink = torch.cat([zf(2, IT_COLL), self.trinket(pit[:, 1:3].clamp(0, N_TRINKET - 1)),
+                           zf(2, 3 * IT_POCKET + 4)], -1)
+        pocket = torch.cat([zf(1, IT_COLL + IT_TRINKET), self.pill(pit[:, 3].clamp(0, N_PILL_COLOR - 1))[:, None],
+                            self.effect(pit[:, 4].clamp(0, N_PILL_EFFECT - 1))[:, None],
+                            self.card(pit[:, 5].clamp(0, N_CARD - 1))[:, None], zf(1, 4)], -1)
+        x = embed(self.mlp, torch.cat([held, active, trink, pocket], 1))
+        kw = self.kind.weight   # (slices, no index tensors: nothing is copied from the host inside a CUDA graph)
+        pos = torch.cat([self.slot.weight + kw[0:1], kw[1:2], kw[2:3], kw[2:3], kw[3:4]])
+        present = torch.cat([(hid > 0) & (cnt > 0), pit[:, 0:1] > 0, pit[:, 1:3] > 0,
+                             ((pit[:, 3] > 0) | (pit[:, 5] > 0))[:, None]], 1)
+        return x + pos, present
+
+
+class GlobalToken(nn.Module):
+    """B22 (2026-10-12; TokPolicy(global_token=True)): a learned token, the per-layer gates of its term for the old
+    tokens (zero at the start), the second value head value_global on it (own norm) and, with memory, mem_in (zero at
+    the start: the GRU's input is z + mem_in(norm(global token)))."""
+
+    def __init__(self, width, layers, memory=0):
+        super().__init__()
+        self.tok = nn.Parameter(torch.zeros(width))
+        nn.init.normal_(self.tok, std=0.02)
+        self.gate = nn.Parameter(torch.zeros(layers))
+        self.norm = nn.LayerNorm(width)
+        self.value = mlp(width, width, 1)
+        self.mem_in = nn.Linear(width, width) if memory else None
+        if memory:
+            nn.init.zeros_(self.mem_in.weight)
+            nn.init.zeros_(self.mem_in.bias)
+
+
 class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
-                 memory=0):
+                 memory=0, item_tokens=False, global_token=False):
         super().__init__()
+        if item_tokens and not items:
+            raise ValueError('TokPolicy: item_tokens needs items=True (ROW inv / pitem / pinv)')
         self.config = dict(width=width, layers=layers, heads=heads)
         if items:   # (the key only when set: items-free checkpoints keep their config)
             self.config['items'] = True
@@ -461,6 +611,50 @@ class TokPolicy(nn.Module):
             self.mem_out = nn.Linear(self.memory, width)
             nn.init.zeros_(self.mem_out.weight)
             nn.init.zeros_(self.mem_out.bias)
+        # 2026-10-12 (B21 / B22): registered after everything else (memory included), gates zero at the start (the
+        # module docstring); the config keys only when set
+        self.item_tokens, self.global_token = bool(item_tokens), bool(global_token)
+        if self.item_tokens:
+            self.config['item_tokens'] = True
+        if self.global_token:
+            self.config['global_token'] = True
+        self.itok = ItemTokens(width, layers) if self.item_tokens else None
+        self.gtok = GlobalToken(width, layers, self.memory) if self.global_token else None
+
+    def gate_values(self):
+        """(B21 / B22) {'item_gate': mean |gate| over the layers, 'global_gate': ...} of the options that are on."""
+        out = {}
+        with torch.no_grad():
+            if self.itok is not None:
+                out['item_gate'] = float(self.itok.gate.abs().mean())
+            if self.gtok is not None:
+                out['global_gate'] = float(self.gtok.gate.abs().mean())
+        return out
+
+    def _ext_tokens(self, b):
+        """(B21 / B22) The extra tokens of a batch and their attention bookkeeping (Block._ext's ext dict); None when
+        both options are off."""
+        if self.itok is None and self.gtok is None:
+            return None
+        toks, masks, cross = [], [], []
+        n = b['player'].shape[0]
+        dev = b['player'].device
+        if self.itok is not None:
+            tok, present = self.itok(b)
+            toks.append(tok)
+            masks.append(present)
+            cross.append((0, N_ITEM_TOK, self.itok.gate, present.any(1)[:, None, None, None]))
+        glob = None
+        if self.gtok is not None:
+            glob = sum(t_.shape[1] for t_ in toks)
+            toks.append(self.gtok.tok.view(1, 1, -1).expand(n, 1, -1))
+            masks.append(torch.ones((n, 1), dtype=torch.bool, device=dev))
+            cross.append((glob, glob + 1, self.gtok.gate, None))
+        y = torch.cat(toks, 1) if len(toks) > 1 else toks[0]
+        present = torch.cat(masks, 1) if len(masks) > 1 else masks[0]
+        ybias = torch.zeros((n, 1, 1, y.shape[1]), device=dev, dtype=y.dtype).masked_fill(
+            ~present[:, None, None], -1e9)
+        return dict(y=y, ybias=ybias, cross=cross, l=0, glob=glob)
 
     def main_parameters(self):
         """The parameters PPO's optimiser owns: all but the choice heads' (in the order of parameters())."""
@@ -481,13 +675,18 @@ class TokPolicy(nn.Module):
         x = x.float()
         return x.contiguous(memory_format=torch.channels_last) if getattr(self, 'nhwc', False) else x
 
-    def forward(self, b, entities=None, packed=False, need_h=False, mem=None):
+    def forward(self, b, entities=None, packed=False, need_h=False, mem=None, need_vg=False):
         """b: the dict of to_batch. Returns (logits [B, 16], value [B], danger logits [B, 9]).
         packed: the Transformer's per-token layers on the real tokens only (Block.forward_packed; the padded door and
         entity tokens are skipped). Same values up to summation order, less work when many tokens are padding (the
         learner); not for CUDA-graph capture (the number of real tokens varies).
         mem (2026-10-11, memory models only): the GRU's state (module docstring); then the new state h_new [B, D] is
-        returned as the last element."""
+        returned as the last element.
+        need_vg (2026-10-12, B22 global-token models only): value_global [B] appended as the very last element (after
+        h_new). The extra tokens of B21 / B22 (module docstring) need nothing from the caller."""
+        if need_vg and self.gtok is None:
+            raise ValueError('TokPolicy.forward: need_vg needs a global-token model (global_token=True)')
+        ext = self._ext_tokens(b)   # (B21 / B22; None when off: the code below is the one before)
         n = b['player'].shape[0]
         used = entities or b['ent'].shape[1]
         ids = b['ent_id'][:, :used]
@@ -541,8 +740,13 @@ class TokPolicy(nn.Module):
         if fast:   # (B18) the door mlp on the real doors only; the real tokens grouped by kind, then in packed order
             door = embed(self.door, b['doors'].reshape(n * DOOR_CAP, -1).index_select(0, b['dkeep'])) + self.kind[2]
             xp = torch.cat([player, room, level, door, entity]).index_select(0, b['xperm'])
-            x0 = self._blocks_bucketed(xp, b).index_select(0, b['starts'])
-            return self._heads(x0, need_h, mem)
+            if ext is not None:   # (B21 / B22: the padded layout of the extra attention)
+                t_ = 3 + DOOR_CAP + used
+                real_ = torch.zeros(n * t_, dtype=torch.bool, device=xp.device).index_fill_(0, b['keep'], True)
+                ext.update(n=n, t=t_, keep=b['keep'], pbias=torch.zeros(
+                    (n, 1, 1, t_), device=xp.device, dtype=xp.dtype).masked_fill(~real_.view(n, 1, 1, t_), -1e9))
+            x0 = self._blocks_bucketed(xp, b, ext).index_select(0, b['starts'])
+            return self._heads(x0, need_h, mem, self._yg(ext), need_vg)
         door = embed(self.door, b['doors']) + self.kind[2]
         x = torch.cat([player[:, None], room[:, None], level[:, None], door, entity], 1)
         dev = x.device
@@ -560,17 +764,28 @@ class TokPolicy(nn.Module):
                 counts = real.sum(1)
                 starts = counts.cumsum(0) - counts
             xp = x.reshape(n * t, -1).index_select(0, keep)
+            if ext is not None:   # (B21 / B22: the padded layout of the extra attention)
+                ext.update(n=n, t=t, keep=keep, pbias=bias)
             if 'buckets' in b:   # 2026-10-10 (B18): attention per length bucket (learner_plan, from the host)
-                xp = self._blocks_bucketed(xp, b)
+                xp = self._blocks_bucketed(xp, b, ext)
             else:
-                for block in self.blocks:
-                    xp = block.forward_packed(xp, bias, keep, (n, t))
+                for l_, block in enumerate(self.blocks):
+                    if ext is not None:
+                        ext['l'] = l_
+                    xp = block.forward_packed(xp, bias, keep, (n, t), ext)
             x0 = xp.index_select(0, starts)   # the player's token: the first of each record
         else:
-            for block in self.blocks:
-                x = block(x, bias)
+            for l_, block in enumerate(self.blocks):
+                if ext is not None:
+                    ext['l'] = l_
+                x = block(x, bias, ext)
             x0 = x[:, 0]
-        return self._heads(x0, need_h, mem)
+        return self._heads(x0, need_h, mem, self._yg(ext), need_vg)
+
+    @staticmethod
+    def _yg(ext):
+        """(B22) the global token after the blocks [B, width], or None."""
+        return ext['y'][:, ext['glob']] if ext is not None and ext['glob'] is not None else None
 
     def _cnn(self, seq, b, key):
         """A grid input's CNN; with b[key + '_u'] / b[key + '_i'] (B18, the learner's fast path: the distinct grids of
@@ -581,21 +796,37 @@ class TokPolicy(nn.Module):
             return seq(self._conv_in(b[key]))
         return seq(self._conv_in(b[key].index_select(0, u))).index_select(0, b[key + '_i'])
 
-    def _blocks_bucketed(self, xp, b):
-        """(B18) the blocks on the packed tokens xp with attention per length bucket (learner_plan's gpos, buckets)."""
+    def _blocks_bucketed(self, xp, b, ext=None):
+        """(B18) the blocks on the packed tokens xp with attention per length bucket (learner_plan's gpos, buckets).
+        ext (B21 / B22): the extra tokens (forward's, with n, t, keep, pbias of the padded layout)."""
         dev = xp.device
         ar = torch.arange(max(w_ for _, w_ in b['buckets']), device=dev)
         shape = dict(gpos=b['gpos'], total=sum(len(c_) * w_ for c_, w_ in b['buckets']), buckets=[
             (len(c_), w_, torch.zeros((len(c_), 1, 1, w_), device=dev, dtype=xp.dtype).masked_fill(
                 (ar[None, :w_] >= c_[:, None])[:, None, None], -1e9)) for c_, w_ in b['buckets']])
-        for block in self.blocks:
-            xp = block.forward_packed(xp, None, None, shape)
+        for l_, block in enumerate(self.blocks):
+            if ext is not None:
+                ext['l'] = l_
+            xp = block.forward_packed(xp, None, None, shape, ext)
         return xp
 
-    def _heads(self, x0, need_h, mem=None):
-        """The final norm and the heads on the player's tokens x0."""
+    def _value_global(self, yg, h_new=None):
+        """(B22) value_global [B] from the global token after the blocks (float32, also under autocast); memory
+        models: its norm + mem_out(h_new), as the other heads read the player token."""
+        ctx = torch.autocast('cuda', enabled=False) if _autocast_on() else contextlib.nullcontext()
+        with ctx:
+            zg = self.gtok.norm(yg.float())
+            if h_new is not None:
+                zg = zg + self.mem_out(h_new)
+            return self.gtok.value(zg)[:, 0]
+
+    def _heads(self, x0, need_h, mem=None, yg=None, need_vg=False):
+        """The final norm and the heads on the player's tokens x0. yg, need_vg (B22): the global token after the blocks
+        and whether value_global is appended to the outputs."""
         if self.memory:   # 2026-10-11 (memory models; without memory the code below, unchanged)
-            return self._heads_mem(x0, need_h, mem)
+            return self._heads_mem(x0, need_h, mem, yg, need_vg)
+        if need_vg:   # (B22) the heads as below, value_global appended
+            return self._heads(x0, need_h) + (self._value_global(yg),)
         if _autocast_on():   # the heads in float32 (logits and value not rounded to bfloat16)
             with torch.autocast('cuda', enabled=False):
                 h = self.norm(x0.float())
@@ -607,16 +838,22 @@ class TokPolicy(nn.Module):
             return self.pi(h), self.value(h)[:, 0], self.danger(h), h
         return self.pi(h), self.value(h)[:, 0], self.danger(h)
 
-    def _heads_mem(self, x0, need_h, mem):
+    def _heads_mem(self, x0, need_h, mem, yg=None, need_vg=False):
         """_heads of a memory model (2026-10-11): z = norm(x0), h_new = GRU(z, h), the heads on z + mem_out(h_new);
-        all in float32 (also under autocast, like the heads). h_new is appended to the outputs when mem is given."""
+        all in float32 (also under autocast, like the heads). h_new is appended to the outputs when mem is given.
+        (B22) the GRU's input is z + mem_in(norm(global token)) (mem_in zero at the start); value_global appended last
+        when need_vg."""
         ctx = torch.autocast('cuda', enabled=False) if _autocast_on() else contextlib.nullcontext()
         with ctx:
             z = self.norm(x0.float())
-            h_new = self.recur(z, mem)
+            if yg is not None:   # (B22)
+                h_new = self.recur(z + self.gtok.mem_in(self.gtok.norm(yg.float())), mem)
+            else:
+                h_new = self.recur(z, mem)
             z = z + self.mem_out(h_new)
             out = (self.pi(z), self.value(z)[:, 0], self.danger(z)) + ((z,) if need_h else ())
-            return out + ((h_new,) if mem is not None else ())
+            out = out + ((h_new,) if mem is not None else ())
+            return out + ((self._value_global(yg, h_new),) if need_vg else ())
 
     def recur(self, z, mem):
         """The GRU over the records' pooled representations z [N, width] (float32): mem None (zeros), a tensor
@@ -1167,6 +1404,34 @@ def pad_optimizer_state(osd, n_params):
     top = max(list(g['params']) + [-1])
     g['params'] = list(g['params']) + list(range(top + 1, top + 1 + n_params - have))
     return n_params - have
+
+
+def remap_optimizer_state(osd, old_names, new_names):
+    """2026-10-12 (B21 / B22): an optimiser state dict (one param group) saved for the parameters old_names (in its
+    order) made loadable into an optimiser over new_names: each parameter keeps the state of the same name, new ones
+    start without state (Adam initialises it at the first step). General form of pad_optimizer_state (any new
+    parameters anywhere, e.g. memory added to a checkpoint that already has item tokens). Returns the number of
+    parameters without state. Raises ValueError if the group's size is not len(old_names)."""
+    g = osd['param_groups'][0]
+    if len(osd['param_groups']) != 1 or len(g['params']) != len(old_names):
+        raise ValueError(f"remap_optimizer_state: {len(g['params'])} saved parameters for {len(old_names)} names")
+    old_id = dict(zip(old_names, g['params']))
+    state = {}
+    for j, name in enumerate(new_names):
+        i = old_id.get(name)
+        if i is not None and i in osd['state']:
+            state[j] = osd['state'][i]
+    added = sum(name not in old_id for name in new_names)
+    osd['state'] = state
+    g['params'] = list(range(len(new_names)))
+    return added
+
+
+def main_parameter_names(names):
+    """(B21 / B22) The names of the parameters PPO's optimiser owns (TokPolicy.main_parameters' order) among a state
+    dict's keys or named_parameters() names (TokPolicy has no buffers: a state dict's keys are its parameters, in the
+    order of parameters())."""
+    return [k for k in names if not k.startswith('choice.')]
 
 
 def load_compatible(model, state):

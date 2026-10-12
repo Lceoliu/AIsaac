@@ -24,6 +24,9 @@ usage (from the bridge's python dir, PYTHONPATH=.):
   replay viewer: abplus_tok_replay_build.py).
   Memory checkpoints (2026-10-11, train_tok --memory gru; config 'memory'): the GRU state is carried per worker and
   zeroed at each episode's first record, as in training.
+  Item-token / global-token checkpoints (2026-10-12, train_tok --item-tokens 1 / --global-token 1; config 'item_tokens',
+  'global_token'): built from the config like every other option (the extra tokens need no other input; value_global
+  is not used for acting); summary 'item_tokens' / 'global_token'.
 """
 import argparse
 import json
@@ -116,6 +119,9 @@ def main():
         changed = load_compatible(model, ck['model'])
         info = dict(policy=str(args.checkpoint), update=ck.get('update'), decisions=ck.get('decisions'),
                     greedy=args.greedy, weights_not_exact=changed)
+        for key_ in ('item_tokens', 'global_token'):   # 2026-10-12 (B21 / B22)
+            if model.config.get(key_):
+                info[key_] = True
     sampler = TokSampler(cfg)
     n = cfg.workers
     recorder = None

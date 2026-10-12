@@ -7188,6 +7188,25 @@ C68 的训练数据 71% 的决策从一层开始、死亡都在二、三层：�
 - **真机冒烟**（HPC128 新沙箱 `ws4` = 仓库 `13f917c`，与 C84 并行、8 worker、1.5 游戏小时、C67 最终 + 死亡教师 + fork 搜索，`--memory gru --memory-dim 128 --memory-bptt 32`，10-11 01:1x–01:4x）：两种路径都 **0 个 Traceback**、各 5 次更新跑完——`smoke-mem`（`--learner-fast 1`，CUDA 图 actor 带状态表）kl 0.004–0.007、ev 0.93、每次更新 260 个块 / 8,300 条记录（8,192 决策）；`smoke-mem2`（`--learner-fast 0 --memory-graph 0`，eager actor）kl 0.004–0.010、ev 0.94。日志里有"memory: --resume of a memory-free checkpoint … Adam state padded"和"actor inference through CUDA graphs with the state table"两行。吞吐 170× / 111×（和 C84 抢 CPU，不作数）。
 - 下一步：C87（HPC128，C84 结束后从 `ws4` 启动）= C77 配置 + 记忆，12,000 小时，与 C77 / C84 同点对照。
 
+### B21/B22 道具 token + 全局 token 与全局价值头（2026-10-12，代码完成，冒烟中）
+
+**实验目的**
+
+用户 10-12 的设计（我评估后认可）：(1) 道具编码从玩家 token 里拆出来——现在是最新 16 个持有道具的 16 维嵌入求和，无数量、无槽位，压缩太大；(2) 4 层 Transformer 要有一个全局 token 读出，接到记忆模块并直达一个全局价值头。目标是让"全局策略"（道具取舍、何时用主动、过层）有自己的表示和价值尺度，而不是都挤在管贴脸控制的玩家 token 里。
+
+**实验方法**
+
+- **代码**（opus 子代理实现，我复核 + 跑 CPU 冒烟）：`train_tok.py --item-tokens 1`（B21）、`--global-token 1 --gamma-global 0.999 --vf-global-coef 0.5`（B22），默认都关、关时与旧代码逐位一致，从没有这两项的检查点（如 C90）`--resume` 起步时输出完全相同（`tests/test_item_global_smoke.py` 35 项检查）。
+  - B21：最多 20 个新 token——每个持有道具一个（id 32 维嵌入 + 数量 + 数量>1 标志 + 槽位嵌入 + 类型嵌入，最多 16 个）、主动道具一个（id + 充能份额 + 满充能）、饰品最多 2 个、口袋道具 1 个；缺位的被注意力掩掉；玩家 token 原来的多热求和和 `pinv` 输入保持不变（只加不减，便于兼容）。
+  - B22：一个可学习的全局 token；策略 / 危险 / 原价值头仍读玩家 token，新的 `value_global` 头读全局 token，用 `--gamma-global`（默认 0.999）的 GAE 回报做辅助损失（权重 `--vf-global-coef`），PPO 的优势仍用原价值头；开记忆时 GRU 输入 = 玩家 token + 零初始化投影后的全局 token。
+  - **零门控机制**（关键）：零向量的 token 在 softmax 里不是中性的（它的 key 带偏置会分走注意力权重；掩成 −1e9 又改变求和顺序，不能逐位一致；`log(gate)` 做 key 偏置在 0 处梯度 NaN）。实现改为：旧 token 之间的注意力原样不动，新 token 对旧 token 的影响是每层一个**独立的注意力项**，乘上每层一个从 0 起步的标量门：道具 = `gate_item[l] × softmax(q·k_items + mask)·v_items`，全局 = `gate_global[l] × v_global`（只有一个 key，权重恒为 1）。门为 0 时该项恰为 0（逐位一致），门从第一步就有梯度；道具嵌入在门离开 0 之前只从 `value_global` 的损失拿梯度（B22 开着就有）。新 token 自己正常地关注所有真实 token。
+  - 其它：Adam 状态改为按参数名重映射（新参数可在任意位置）；`progress.csv` 新列 `v_global_loss / v_global_ev / item_gate / global_gate`；eval_tok 按检查点配置建模型；教师 v2 车道、快照 actor、fork 搜索子进程都走 `GraphActor` / `model.act`，形状固定为 +21 个 token。
+- **代价与要盯的点**（子代理的提醒）：CPU 前向慢 65–80%（+21 个 token 对 43 个），GPU 上 actor / 学习器预计慢约两成；`value_global` 在 γ=0.999 下回报大，梯度裁剪是全参数一起的，早期可能压住 PPO 的步长——看 `v_global_loss` 和 `kl`，必要时降 `--vf-global-coef`；每层一个标量门在 Adam 下每步约动 1e-4，几百次更新后门才明显打开；`--recompute-values` 关时每次更新多一遍推理算 `value_global`。
+
+**实验结果**
+
+- CPU 冒烟（PC）：待补。HPC128 真机冒烟：待补。
+
 ### C77 十游戏年：C67 + 死亡教师，HPC 节点（2026-10-10，进行中）
 
 **实验目的**

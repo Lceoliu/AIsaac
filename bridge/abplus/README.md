@@ -726,6 +726,25 @@ worker 进程 × N（tok_sampler.worker_main，不导入 torch）
 - **检查点**：`--resume` 记忆检查点时沿用它的 `memory`（大小以检查点为准）；`--resume` 无记忆的检查点加 `--memory gru` 时 GRU 新初始化（`mem_out` = 0，一开始输出与检查点相同）、Adam 状态补上新参数（打印一行）。`eval_tok.py` 读到 `memory` 时每个评估 worker 带自己的状态、每局开头清零。
 - **核对**：`python tests/test_memory_smoke.py`（CPU，无引擎）：关闭时与 HEAD 逐位相同、新初始化的记忆模型与无记忆模型输出相同、状态逐步变化且新局清零、分段 BPTT 复现 actor 的逐步输出（1e-6 级）、梯度到达 GRU、检查点往返和从无记忆检查点续训；有 CUDA 时再比 `GraphActor` 与即时执行（不要在跑着训练器的 GPU 上跑，B13）。
 
+### 道具 token（B21）（2026-10-12，`--item-tokens 1`；还没训练过）
+
+默认 0，代码路径和数值与之前逐位相同。需要 `--items`（道具检查点）。
+
+- **网络**（`TokPolicy(item_tokens=True)`，检查点配置 `item_tokens`，`tok_policy.ItemTokens`）：每条记录固定 20 个 token（CUDA Graph 的形状不变）：持有的道具每个一个（ROW `inv` 最多 16 个、最新的在前；新的道具表 32 维、数量和"数量 > 1"、槽位嵌入）、主动道具一个（同一张道具表 + `pinv` 的充能比例和最大充能）、饰品每个一个（2）、口袋一个（药丸颜色、药丸效果、卡牌）；每个 = mlp(输入) + 类型嵌入（持有 / 主动 / 饰品 / 口袋）。没有的槽作为键被屏蔽（-1e9，同缺席的实体）。玩家 token 原来的多热和 `pinv` 输入照旧保留。
+- **为什么不是"零 token + 门"**：零 token 在同一个 softmax 里不中性：它的键 = W_k·LN(0) + b_k = W_k·β + b_k ≠ 0，会从每个查询那里分走权重，值也会混进来；就算用 -1e9 屏蔽，softmax 和 p·v 的长度变了、求和顺序跟着变，不能逐位相同；log(门) 当偏置在门 = 0 处梯度是 0 × ∞。所以**旧 token 的注意力原样不动**，新 token 通过每层一个标量门（初值 0）的**单独一项**加到旧 token 的注意力输出上（在该层的输出投影之前）：门 × [是否有道具] × softmax(q·k_道具 + 屏蔽)·v_道具。门 = 0 时这一项正好是 ±0，输出与关闭时逐位相同；门本身从第一步就有梯度（自己会打开），门后面的道具嵌入要等门不为 0 才有策略梯度（与 B20 的 GRU 在 `mem_out` = 0 时一样）；有 B22 时 `value_global` 的损失一开始就经全局 token 传到道具 token。新 token 自己照常更新（查询看所有真实的旧键和新键，同一层的投影和前馈）。
+- **代价**：每条记录多 20 个 token 过每一层，外加每个旧 token 对 20 个键的一项；CPU 上前向约 +65%～+80%（256 条、24 个实体 token；GPU 未量）。学习器的打包 / 分桶路径把旧 token 的 q/k/v 每层散到补齐的 [记录, t] 布局里算新 token 的注意力（多一份显存）。
+- **续训**：`--resume` 没有道具 token 的检查点（如 C90）加 `--item-tokens 1`：新模块新初始化、门 = 0（一开始输出与检查点相同），Adam 状态按参数名重排（`tok_policy.remap_optimizer_state`，打印一行）；有道具 token 的检查点沿用。`progress.csv` 多 `item_gate`（各层 |门| 的平均）。
+
+### 全局 token 与全局价值头（B22）（2026-10-12，`--global-token 1`；还没训练过）
+
+默认 0，代码路径和数值与之前逐位相同。
+
+- **网络**（`TokPolicy(global_token=True)`，配置 `global_token`，`tok_policy.GlobalToken`）：序列里多一个学来的全局 token（与 B21 同一套门：每层一个标量门、初值 0，对旧 token 的一项是门 × 它的值向量，单个键的 softmax 权重恒为 1）。策略、危险和原价值头仍读玩家 token；新增第二个价值头 `value_global` 读全局 token（自己的归一化；有记忆时再加 `mem_out`(h_new)）。有记忆时 GRU 的输入 = z + `mem_in`(归一化的全局 token)，`mem_in` 初值 0（等价于把两者拼起来、全局部分的投影从 0 开始），记忆输出一开始不变。
+- **学习器**：`value_global` 用自己的折扣 `--gamma-global`（0.999）的 λ-回报（GAE 的 λ，用 `value_global` 自举；每次更新开始时对 rollout 的每个决策算一次 `value_global`，有 `--recompute-values` 时并在那一遍里，否则单独一遍）做辅助损失：`--vf-global-coef`（0.5）× 0.5 × mean((value_global − 回报)²)，记忆模式按训练的决策求平均。PPO 的优势仍用原价值头。`progress.csv` 多 `v_global_loss`、`v_global_ev`（更新开始时的 `value_global` 的解释方差）、`global_gate`。
+- **注意**：`value_global` 是新头，γ = 0.999 的回报量级比原价值头大，起初的辅助梯度可能占掉 `--max-grad-norm` 1.0 的梯度裁剪的大头（裁剪对全部参数一起），会压小 PPO 的步长；看 `v_global_loss` 和 `kl`，必要时调小 `--vf-global-coef`。
+- **续训 / 评估**：同 B21（`--resume` 无全局 token 的检查点：新初始化、门和 `mem_in` = 0、Adam 按名重排、打印一行）。`eval_tok.py` 从配置建模型，两个选项都不需要别的输入，`summary.json` 记 `item_tokens` / `global_token`。
+- **核对**：`python tests/test_item_global_smoke.py`（CPU，无引擎）：(a) 关闭时与 HEAD 逐位相同（填充、打包、分桶快路径含数学注意力、act、evaluate、分段 BPTT），(b) 打开、门为 0 时与关闭逐位相同（各路径、有无记忆），(c) 梯度到达门和 `mem_in`、`value_global` 的损失到达道具嵌入、门打开后策略损失到达全部新参数，(d) 检查点往返、从类 C90 检查点续训（Adam 按名重排）、给 B21 检查点加记忆，(e) 打开时分段 BPTT 复现 actor 的逐步输出（含 `value_global`），(f) 有 CUDA 时 `GraphActor` = 即时执行。
+
 ### 构筑实验室（第三阶段，2026-10-08；EXPERIMENTS.md A23）
 
 用户 10-06 的设计：构筑（持有的道具，以及随之而来的属性、心、跟班）在以撒里可以搬到任何状态上，所以可以直接量一个构筑有多强：把它移植进一组固定的、停着的房间状态，用当前策略打，各构筑共用随机数；用结果训练构筑模型，挑模型最拿不准的构筑去量；实验室的局本身也是带道具的正常策略局（练习用道具）。代码 `isaac_bridge/tok_lab.py`（模块说明是完整的设计），`train_tok.py --lab-*`，worker 一侧在 `tok_floor.py`。只在整层 / 整局模式；`--lab-share 0`（默认）时什么都不变。

@@ -105,6 +105,17 @@ Memory (2026-10-11, --memory gru --memory-dim D --memory-bptt T; off by default,
   at the fork, sent by the worker; tok_teacher2.LanePolicy.begin) and its imitation records carry their input states.
   Approximate: the old teacher's records, the choice correction's records and branch episodes (tok_branch) use a zero
   state. --resume of a memory-free checkpoint starts a fresh GRU (its output projection zero: the same outputs).
+Item tokens / global token (2026-10-12, B21 --item-tokens 1 (needs --items), B22 --global-token 1; off by default, then
+  nothing changes; TokPolicy item_tokens / global_token, the module docstring of tok_policy has the mechanism): 20 item
+  tokens (held collectibles, active, trinkets, pocket) and / or one learned global token per record, reaching the old
+  tokens through per-layer gates that start at 0 (the same outputs as without them at the start, also when resumed
+  from a checkpoint without them: their modules fresh, Adam's state remapped by parameter name, a line is printed; a
+  checkpoint with them keeps them). B22's second value head value_global (on the global token) is trained on
+  lambda-returns with --gamma-global (0.999; GAE's lambda, bootstrapped from value_global itself, which is computed for
+  every stored decision at the update's start, in the --recompute-values pass when there is one, else a pass of its
+  own) as an auxiliary loss --vf-global-coef x 0.5 x mean((value_global - return)^2); PPO's advantages keep using the
+  value head. progress.csv: v_global_loss, v_global_ev (explained variance of the update-start value_global), item_gate /
+  global_gate (mean |gate| over the layers).
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
 
@@ -463,9 +474,10 @@ def main():
     # torch is imported here, not at the top: the sampler's workers are spawned and import this module too
     import torch
     from isaac_bridge.tok_obs import ENT_CAP
-    from isaac_bridge.tok_policy import (ENTITY_FIELDS, ROW_BYTES, GraphActor, TokPolicy, cat_batch, crn_uniforms,
-                                         DEDUP, decode_rows, distinct_ids, first_of, learner_plan, load_compatible,
-                                         memory_chunks, packed_index, pad_optimizer_state, plan_tokens, rows_to_device,
+    from isaac_bridge.tok_policy import (ENTITY_FIELDS, N_ITEM_TOK, ROW_BYTES, GraphActor, TokPolicy, cat_batch,
+                                         crn_uniforms, DEDUP, decode_rows, distinct_ids, first_of, learner_plan,
+                                         load_compatible, main_parameter_names, memory_chunks, packed_index,
+                                         pad_optimizer_state, plan_tokens, remap_optimizer_state, rows_to_device,
                                          take, to_batch, used_entities)
     p = argparse.ArgumentParser()
     p.add_argument('--groups-file', required=True)
@@ -789,6 +801,17 @@ def main():
     p.add_argument('--memory-graph', type=int, default=1,
                    help='1: the actor answers through CUDA graphs with the state table (GraphActor memory); 0: eager '
                         'inference for every call (a fallback)')
+    # 2026-10-12 (B21 / B22; see the module docstring)
+    p.add_argument('--item-tokens', type=int, default=0,
+                   help='1: one Transformer token per held collectible, the active item, each trinket and the pocket '
+                        '(needs --items; gated, the same outputs at the start; a resumed checkpoint with them keeps '
+                        'them). 0 (default): as before')
+    p.add_argument('--global-token', type=int, default=0,
+                   help='1: a learned global token (gated, the same outputs at the start) and a second value head '
+                        'value_global on it, trained with --gamma-global as an auxiliary loss (a resumed checkpoint '
+                        'with it keeps it). 0 (default): as before')
+    p.add_argument('--gamma-global', type=float, default=0.999, help="value_global's discount (B22)")
+    p.add_argument('--vf-global-coef', type=float, default=0.5, help="weight of value_global's loss (B22)")
     p.add_argument('--fused-adam', type=int, default=0,
                    help='1: Adam as one fused CUDA kernel (the same update rule; float rounding may differ)')
     p.add_argument('--dump-rollouts', type=int, default=0,
@@ -844,6 +867,23 @@ def main():
     T_mem = max(1, int(args.memory_bptt))
     if mem_on and args.memory_dim <= 0:
         p.error('--memory gru needs --memory-dim > 0')
+    # 2026-10-12 (B21 / B22): a resumed checkpoint with item tokens / a global token keeps them; one without them gets
+    # them fresh when asked (gates zero: its outputs at the start)
+    itok_fresh = gtok_fresh = False
+    if args.resume:
+        ck_cfg = torch.load(args.resume, map_location='cpu').get('config', {})
+        for key_, opt_ in (('item_tokens', 'item_tokens'), ('global_token', 'global_token')):
+            if ck_cfg.get(key_):
+                if not getattr(args, opt_):
+                    print(f'{key_}: the resumed checkpoint has them: --{opt_.replace("_", "-")} 1', flush=True)
+                setattr(args, opt_, 1)
+        itok_fresh = bool(args.item_tokens) and not ck_cfg.get('item_tokens')
+        gtok_fresh = bool(args.global_token) and not ck_cfg.get('global_token')
+        del ck_cfg
+    itok_on, gtok_on = bool(args.item_tokens), bool(args.global_token)
+    if itok_on and not items:
+        p.error('--item-tokens 1 needs --items (or an items checkpoint)')
+    tok_kw = dict(item_tokens=itok_on, global_token=gtok_on)   # (TokPolicy's B21 / B22 options; False: as before)
     rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0, heal=0.0, resource=0.0)
     rw.update({k: float(v) for k, v in (kv.split('=') for kv in (FLOOR_REWARD if floor else ROOM_REWARD).split(','))})
     if args.reward:
@@ -935,7 +975,7 @@ def main():
         args.choice_heads = int(torch.load(args.resume, map_location='cpu').get('config', {}).get('choice', 0)) or             args.choice_heads
     n_choice = int(args.choice_heads)
     learner_model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
-                              ent_ext=ent_ext, pchar=pchar, memory=mem_dim).to(device)   # the weights PPO updates
+                              ent_ext=ent_ext, pchar=pchar, memory=mem_dim, **tok_kw).to(device)   # the weights PPO updates
     nh = len(learner_model.heads)
     fused = bool(args.fused_adam) or bool(args.learner_fast)   # (B18: --learner-fast 1 implies the fused Adam)
     # (Phase B2: the choice heads are not PPO's: main_parameters() is parameters() without them, in the same order)
@@ -948,12 +988,26 @@ def main():
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
         missing, unexpected = learner_model.load_state_dict(ck['model'], strict=False)
-        if unexpected or any(not k.startswith('choice.') and not (mem_fresh and k.startswith('mem_')) for k in missing):
+        new_ok = (('mem_', 'gtok.mem_in.') if mem_fresh else ()) + (('itok.',) if itok_fresh else ()) + \
+            (('gtok.',) if gtok_fresh else ())   # (B21 / B22: the fresh modules' keys)
+        if unexpected or any(not k.startswith('choice.') and not (new_ok and k.startswith(new_ok)) for k in missing):
             raise SystemExit(f'--resume: weights do not match ({missing[:4]} {unexpected[:4]})')
         if copt is not None and ck.get('choice_optimizer'):
             copt.load_state_dict(ck['choice_optimizer'])
         osd = ck['optimizer']
-        if mem_fresh:   # 2026-10-11 (memory): the GRU's parameters are the optimiser's last ones, with no state yet
+        ck_ext = any(k.startswith(('itok.', 'gtok.')) for k in ck['model'])
+        if itok_fresh or gtok_fresh or (mem_fresh and ck_ext):
+            # 2026-10-12 (B21 / B22): new parameters (not necessarily the last ones): Adam's state remapped by name
+            added = remap_optimizer_state(osd, main_parameter_names(list(ck['model'])),
+                                          main_parameter_names([k for k, _ in learner_model.named_parameters()]))
+            for flag_, name_, what_ in ((itok_fresh, 'item tokens', f'{N_ITEM_TOK} item tokens per record'),
+                                        (gtok_fresh, 'global token', 'the global token and value_global'),
+                                        (mem_fresh, 'memory', f'GRU (size {mem_dim})')):
+                if flag_:
+                    print(f'{name_}: --resume of a checkpoint without them: {what_} initialised fresh, gates / output '
+                          'projections zero (the same outputs as the checkpoint at the start)', flush=True)
+            print(f'--resume: Adam state remapped by parameter name, {added} new tensors without state', flush=True)
+        elif mem_fresh:   # 2026-10-11 (memory): the GRU's parameters are the optimiser's last ones, with no state yet
             added = pad_optimizer_state(osd, len(learner_model.main_parameters()))
             print(f'memory: --resume of a memory-free checkpoint: GRU (size {mem_dim}) initialised fresh, its output '
                   f'projection zero (the same outputs as the checkpoint at the start); Adam state padded with {added} '
@@ -974,7 +1028,7 @@ def main():
         """The learner's forward passes (the losses are computed outside, in float32)."""
         return torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp)
     model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
-                      ent_ext=ent_ext, pchar=pchar, memory=mem_dim).to(device).eval()   # the actor's copy
+                      ent_ext=ent_ext, pchar=pchar, memory=mem_dim, **tok_kw).to(device).eval()   # the actor's copy
     model.load_state_dict(learner_model.state_dict())
     actor_params = [t for t in list(model.parameters()) + list(model.buffers())]
     learner_params = [t for t in list(learner_model.parameters()) + list(learner_model.buffers())]
@@ -1121,6 +1175,11 @@ def main():
               ' chunks, --sort-micro off, --micro in whole chunks), actor inference '
               + ('through CUDA graphs with the state table (GraphActor memory)' if use_graphs else
                  'eager (--memory-graph 0 or --graph-entities 0)'), flush=True)
+    if itok_on or gtok_on:   # 2026-10-12 (B21 / B22)
+        print('extra tokens: ' + ', '.join(
+            ([f'item tokens ({N_ITEM_TOK} per record)'] if itok_on else []) +
+            ([f'global token + value_global (gamma {args.gamma_global}, coef {args.vf_global_coef})'] if gtok_on else []))
+            + f'; gates now {learner_model.gate_values()}', flush=True)
     # streams: the actor's calls go first on the GPU, the learner's kernels fill the rest. --actor-slots calls may be
     # in flight at once, each on its own stream (one GraphActor each)
     actors = [GraphActor(model, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5), crn=bool(args.branch_crn),
@@ -1240,6 +1299,7 @@ def main():
         all_flat = (np.arange(n)[:, None] * capacity + np.arange(capacity)[None, :])[
             np.arange(capacity)[None, :] < lengths[:, None]]
         value_now = every = prox = None
+        vgs, vg_now, ret_g = [], None, None   # (B22) value_global at the update's start, its returns
         if (recompute or args.decoupled) and len(all_flat):
             # the values the advantages need (and with --decoupled the log-probabilities of the stored actions), from
             # the weights at the start of this update
@@ -1253,10 +1313,19 @@ def main():
                 chunk = args.micro or args.minibatch
                 for at in range(0, len(all_flat), chunk):
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
-                    with autocast():
-                        lp_, _, v_, _ = learner_model.evaluate(take(every, part), acts_all[part],
-                                                               packed=bool(args.packed),
-                                                               mem=h_all[part] if mem_on else None)
+                    if gtok_on:   # (B22: value_global in the same pass; evaluate's values otherwise)
+                        b_p = take(every, part)
+                        with autocast():
+                            o_ = learner_model(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
+                                               need_vg=True)
+                        lp_ = learner_model.log_prob(o_[0], learner_model.gate(b_p), acts_all[part])[0]
+                        v_ = o_[1].float()
+                        vgs.append(o_[-1].float())
+                    else:
+                        with autocast():
+                            lp_, _, v_, _ = learner_model.evaluate(take(every, part), acts_all[part],
+                                                                   packed=bool(args.packed),
+                                                                   mem=h_all[part] if mem_on else None)
                     vals.append(v_)
                     lps.append(lp_)
             if recompute:
@@ -1264,6 +1333,23 @@ def main():
             else:
                 value_now = None
             prox_all = torch.cat(lps)
+            sec('recompute')
+        if gtok_on and len(all_flat):   # 2026-10-12 (B22): value_global of every stored decision, for its returns
+            vg_now = np.zeros_like(rl.value)
+            if not vgs:   # (no recompute pass: one of its own, a chunk of records at a time)
+                with torch.inference_mode():
+                    chunk = args.micro or args.minibatch
+                    for at in range(0, len(all_flat), chunk):
+                        idx_ = all_flat[at:at + chunk]
+                        with autocast():
+                            o_ = learner_model(rows_to_device(rl.rows, idx_, rl.pending.reshape(-1, nh)[idx_], device),
+                                               packed=bool(args.packed), need_vg=True,
+                                               mem=torch.from_numpy(rl.h.reshape(-1, mem_dim)[idx_]).to(device)
+                                               if mem_on else None)
+                        vgs.append(o_[-1].float())
+            vg_now.reshape(-1)[all_flat] = torch.cat(vgs).cpu().numpy()
+            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now)
+            del adv_g
             sec('recompute')
         adv, ret, mask = gae(rl, args.gamma, args.lam, value_now)
         if branching and not args.branch_ppo:   # 2026-10-07: the branch episodes' decisions left out of PPO
@@ -1307,6 +1393,11 @@ def main():
         b_ret = torch.from_numpy(ret.reshape(-1)[flat]).to(device)
         used_value = rl.value if value_now is None else value_now
         b_val = torch.from_numpy(used_value.reshape(-1)[flat]).to(device)
+        glob_loss = ret_g is not None   # (B22) value_global's returns and its update-start values
+        if glob_loss:
+            b_ret_g = torch.from_numpy(ret_g.reshape(-1)[flat]).to(device)
+            b_vg = torch.from_numpy(vg_now.reshape(-1)[flat]).to(device)
+        gacc = torch.zeros(1, device=device)   # (B22) value_global's loss (sums over steps)
         if lw is None:
             stale = float((rl.version.reshape(-1)[flat] < L['update']).mean()) if count else 0.0
             reward_mean = float(rl.reward.reshape(-1)[flat].mean())
@@ -1759,9 +1850,12 @@ def main():
                             memd = dict(h0=b_h0.index_select(0, ch_d[c0:c0 + k_ // T_mem]), T=T_mem,
                                         reset=b_reset[part].view(-1, T_mem),
                                         tail=torch.cat(tails) if len(tails) > 1 else (tails[0] if tails else None))
-                            logits_, value_, danger_ = learner_model(mb, packed=bool(args.packed), mem=memd)[:3]
+                            outs_ = learner_model(mb, packed=bool(args.packed), mem=memd,
+                                                  **(dict(need_vg=True) if glob_loss else {}))
                         else:
-                            logits_, value_, danger_ = learner_model(mb, packed=bool(args.packed))
+                            outs_ = learner_model(mb, packed=bool(args.packed),
+                                                  **(dict(need_vg=True) if glob_loss else {}))
+                        logits_, value_, danger_ = outs_[:3]
                     logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
                         logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
                     value = value_[:k_].float()
@@ -1777,6 +1871,10 @@ def main():
                     vf = 0.5 * pmean((value - b_ret[part]) ** 2, pm, pn)
                     ent = pmean(entropy.sum(-1), pm, pn)
                     loss = (pg + args.vf_coef * vf - args.ent_coef * ent) * w
+                    if glob_loss:   # 2026-10-12 (B22): value_global on its own returns (an auxiliary loss)
+                        vgf = 0.5 * pmean((outs_[-1][:k_].float() - b_ret_g[part]) ** 2, pm, pn)
+                        loss = loss + args.vf_global_coef * vgf * w
+                        gacc += vgf.detach() * w
                     if merged:
                         t_end = k_ + len(pick) if vmerged else None   # (teacher v2's records follow)
                         tloss, tstats = teacher_loss(logits_[k_:t_end], danger_[k_:t_end], meta, n_sel)
@@ -1915,6 +2013,17 @@ def main():
         }
         if mem_on:   # 2026-10-11 (memory): BPTT chunks and rows of the update (trained decisions: count)
             row['mem_chunks'], row['mem_rows'] = mplan['chunks'], len(flat)
+        if itok_on or gtok_on:   # 2026-10-12 (B21 / B22): the gates (mean |gate| over the layers)
+            row.update(learner_model.gate_values())
+        if gtok_on:   # (B22) value_global's loss and the explained variance of its update-start values
+            row['v_global_loss'] = float(gacc[0]) / steps_ if glob_loss else ''
+            if glob_loss:
+                rg_, vg_ = (b_ret_g, b_vg) if not mem_on else (b_ret_g.index_select(0, ev_rows),
+                                                                b_vg.index_select(0, ev_rows))
+                var_g = float(rg_.var())
+                row['v_global_ev'] = 1.0 - float((rg_ - vg_).var()) / var_g if var_g > 0 else 0.0
+            else:
+                row['v_global_ev'] = ''
         row.update({f'u_{k}': v for k, v in U.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
         if run or items:   # 2026-10-06: run / item counters (absent in the other modes: their columns are unchanged)
@@ -2169,7 +2278,7 @@ def main():
     if aux is not None and args.branch_snap_every > 0 and use_graphs:
         for k_s in range(2):
             m_s = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
-                            ent_ext=ent_ext, pchar=pchar, memory=mem_dim).to(device).eval()
+                            ent_ext=ent_ext, pchar=pchar, memory=mem_dim, **tok_kw).to(device).eval()
             m_s.load_state_dict(model.state_dict())
             e_s = dict(id=version if k_s == 0 else -1, model=m_s, actors=[],
                        params=list(m_s.parameters()) + list(m_s.buffers()))
