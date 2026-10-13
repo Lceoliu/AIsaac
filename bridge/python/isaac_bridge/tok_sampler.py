@@ -133,7 +133,12 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # queued now, dropped, without a possible depth
          'v2_points', 'v2_random', 'v2_fatal', 'v2_depths', 'v2_improving', 'v2_gain0', 'v2_gain', 'v2_spread',
          'v2_reps', 'v2_branches', 'v2_dec', 'v2_frames', 'v2_records', 'v2_s', 'v2_cpu', 'v2_wait_s', 'v2_errors',
-         'v2_queue', 'v2_dropped', 'v2_nodepth')
+         'v2_queue', 'v2_dropped', 'v2_nodepth',
+         # 2026-10-13 (B23, tok_pickup.py; zero unless --start-build-mode pedestal / --pickup-force): pf_p is written by
+         # the TRAINER (the current per-episode probability of a forced episode), read by the worker; episodes drawn as
+         # forced, forced decisions, EV_ITEM while forcing / outside forcing (ordinary episodes), pedestals spawned by
+         # pedestal start builds
+         'pf_p', 'pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups', 'start_pedestals')
 TEACH_RING = 128     # teacher records per worker the trainer may fall behind by
 TEACH_META = 16      # per record: the action under way (3), nine danger bits, the move taken, depth, safe moves, 0
 ST = {k: i for i, k in enumerate(STATS)}
@@ -271,6 +276,12 @@ class TokSamplerConfig:
     # own rng (evaluation: from the seed); archive starts keep the character of the episode they were parked from.
     # '': Isaac only, as before
     characters: str = ''
+    # 2026-10-13 (B23, tok_pickup.py; floor / run modes, training only): 'pedestal' spawns a start build's collectibles
+    # as pedestals in the floor's starting room instead of adding them to the inventory ('inventory': as before);
+    # pickup_force (A, B): the per-episode probability of a forced-pickup episode goes from A to B over the run (the
+    # trainer writes it into the stats column 'pf_p'); (0, 0): off
+    start_build_mode: str = 'inventory'
+    pickup_force: tuple = (0.0, 0.0)
 
 
 def attach(names, workers):
@@ -1267,6 +1278,8 @@ class TokSampler:
                 self.attached += attached
         self.stats[:] = 0
         self.control[:] = 0
+        if max(getattr(cfg, 'pickup_force', (0.0, 0.0)) or (0.0, 0.0)) > 0:   # 2026-10-13 (B23): the run's first p
+            self.stats[:, ST['pf_p']] = float(cfg.pickup_force[0])        # (the trainer rewrites it after each update)
         # 2026-10-06: one decoded-PNG cache for all the instances of this sampler (abp_turbo ABP_PNG_CACHE_FILE) instead
         # of one per root; the workers inherit the variable, removed again in close(). ISAAC_RL_PNG_SHARED=0: as before.
         self.png_file = None

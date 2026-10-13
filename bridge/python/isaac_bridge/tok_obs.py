@@ -138,6 +138,14 @@ ROW = np.dtype([
     # PlayerType (abplus_lean 'ptype', clipped to 0 .. N_CHAR - 1), written in every mode; a policy input only for
     # TokPolicy(pchar=True)
     ('pchar', np.int16),
+    # 2026-10-13 (B23, tok_pickup.py; appended, the fields above keep their offsets): 0 in every record unless the
+    # trainer's --start-build-mode pedestal / --pickup-force is on. pforce: the move (1 .. 8) the worker forces at this
+    # record (the actor substitutes it for the sampled move and answers shoot 0; the learner's flag of a forced
+    # decision), 0 = the policy's own; pmode: 1 in every record of an episode drawn as forced; bped: the collectible ids
+    # of the episode's start build spawned as pedestals (0 = none). Never a policy input.
+    ('pforce', np.uint8),
+    ('pmode', np.uint8),
+    ('bped', np.int16, (3,)),
 ], align=True)
 N_CHAR = 32           # 2026-10-08: PlayerType ids the policy's character input has room for (AB+ 0 .. 17, Repentance+ 0 .. 40
 #                       would need more)

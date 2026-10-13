@@ -116,6 +116,20 @@ Item tokens / global token (2026-10-12, B21 --item-tokens 1 (needs --items), B22
   own) as an auxiliary loss --vf-global-coef x 0.5 x mean((value_global - return)^2); PPO's advantages keep using the
   value head. progress.csv: v_global_loss, v_global_ev (explained variance of the update-start value_global), item_gate /
   global_gate (mean |gate| over the layers).
+Pedestal builds / forced pickups / shared item table (2026-10-13, B23; isaac_bridge/tok_pickup.py has the mechanism;
+  all off by default, then nothing changes): --start-build-mode pedestal spawns a start build's collectibles as
+  pedestals in the floor's starting room instead of adding them to the inventory (episodes.jsonl build_pedestals);
+  --pickup-force A:B draws each training episode as forced with p going linearly from A to B over the run (the learning
+  rate's fraction); in a forced episode the worker marks the records of clear rooms with a pedestal (ROW pforce = the
+  move toward the nearest one) and answer() below replaces the sampled move with it and the shot with none before the
+  decision is stored and sent; the learner keeps forced decisions in the value loss and the memory chunks, leaves them
+  out of the policy term and the entropy, and trains move and shoot on them as imitation targets
+  (--pickup-force-imitation, tok_pickup.ppo_part_terms). progress.csv: pickup_force_p, pickup_forced_eps,
+  pickup_forced_steps, pickups_forced, pickups_free (this update's worker deltas), start_pedestals (total);
+  pickup_imit (the imitation term), forced_share (forced share of the trained decisions). --item-shared 1 (needs item
+  tokens): the item tokens' collectible table is the policy's item_emb (tok_policy share_item_table: --resume of a B21
+  checkpoint drops its own 32-column table, re-initialises the 16 collectible columns of the item tokens' first
+  Linear, keeps everything else; Adam's state of that Linear starts fresh). Evaluation (eval_tok.py) never forces.
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
 
@@ -270,6 +284,9 @@ class Episodes:
         self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
         self.stats0 = None                       # 2026-10-08 (stat aug on): worker -> the stats at the first record
         self.char0 = None                        # 2026-10-08 (characters on): worker -> ROW pchar at the first record
+        # 2026-10-13 (B23, --start-build-mode pedestal / --pickup-force): per worker the episode's pedestal build (ROW
+        # bped at the first record), whether it was drawn as forced (pmode) and its forced decisions (pforce > 0)
+        self.pick = None
         # 2026-10-08 (heal / resource terms, floor modes): per worker the health units and coins + bombs + keys of the
         # last record (the deltas' base) and the episode's gains so far
         self.gains = np.zeros((workers, 2)) if self.floor and (rw.get('heal') or rw.get('resource')) else None
@@ -354,6 +371,13 @@ class Episodes:
         if self.char0 is not None and first.any():   # 2026-10-08 (characters): the episode's character
             for j in np.flatnonzero(first):
                 self.char0[int(idx[j])] = int(rows[j]['pchar'])
+        if self.pick is not None:   # 2026-10-13 (B23)
+            pk = self.pick
+            if first.any():
+                for j in np.flatnonzero(first):
+                    pk['bped'][int(idx[j])] = [int(v) for v in rows[j]['bped'] if v > 0]
+                pk['steps'][idx[first]] = 0
+            pk['steps'][idx] += rows['pforce'] > 0
         ended = done != 0
         if ended.any():
             for j in np.flatnonzero(ended):
@@ -373,6 +397,9 @@ class Episodes:
                     fin['char0'] = self.char0[int(i)]
                 if self.gains is not None:   # 2026-10-08: health units healed, coins + bombs + keys gathered
                     fin.update(healed=float(self.healed[i]), gathered=float(self.gathered[i]))
+                if self.pick is not None:   # 2026-10-13 (B23): the pedestal build, the forcing draw and its decisions
+                    fin.update(build_pedestals=self.pick['bped'].get(int(i), []), pickup_forced=int(r['pmode']),
+                               forced_steps=int(self.pick['steps'][i]))
                 if r['lab'] != 0:   # 2026-10-08: a lab episode (tok_lab): kept apart from the episode stats
                     fin.update(lab=int(r['lab']), lab_s=int(r['lab_s']))
                     self.lab_finished.append(fin)
@@ -474,9 +501,11 @@ def main():
     # torch is imported here, not at the top: the sampler's workers are spawned and import this module too
     import torch
     from isaac_bridge.tok_obs import ENT_CAP
+    from isaac_bridge.tok_pickup import normalise_advantages, parse_pickup_force, pickup_force_p, ppo_part_terms
     from isaac_bridge.tok_policy import (ENTITY_FIELDS, N_ITEM_TOK, ROW_BYTES, GraphActor, TokPolicy, cat_batch,
                                          crn_uniforms, DEDUP, decode_rows, distinct_ids, first_of, learner_plan,
                                          load_compatible, main_parameter_names, memory_chunks, packed_index,
+                                         ITEM_SHARED_KEY, share_item_table,
                                          pad_optimizer_state, plan_tokens, remap_optimizer_state, rows_to_device,
                                          take, to_batch, used_entities)
     p = argparse.ArgumentParser()
@@ -704,6 +733,16 @@ def main():
                    help='share of the floor-start training episodes that begin with a random build (0: off; archive '
                         'starts keep their build)')
     p.add_argument('--start-build-max', type=int, default=3, help='collectibles of a start build at most (1 .. max)')
+    # 2026-10-13 (B23, isaac_bridge/tok_pickup.py)
+    p.add_argument('--start-build-mode', default='inventory', choices=('inventory', 'pedestal'),
+                   help='inventory (default): a start build is added to the inventory (AddCollectible); pedestal: its '
+                        'collectibles are spawned as pedestals in the floor\'s starting room')
+    p.add_argument('--pickup-force', default='0:0',
+                   help='A:B: probability of a forced-pickup episode, linear in the run\'s game-hour fraction from A '
+                        '(start) to B (end); in such an episode the move toward the nearest collectible pedestal and '
+                        'no shot are forced in clear rooms (needs --items, floor / run modes). 0:0 (default): off')
+    p.add_argument('--pickup-force-imitation', type=float, default=1.0,
+                   help='weight of the imitation term on the forced decisions\' move and shoot (B23)')
     # 2026-10-08: stat augmentation (floor / run modes): random multipliers of the base stats at floor starts
     p.add_argument('--stat-aug-prob', type=float, default=0.0,
                    help='share of the floor-start training episodes whose base stats get random multipliers (0: off)')
@@ -811,6 +850,10 @@ def main():
                         'value_global on it, trained with --gamma-global as an auxiliary loss (a resumed checkpoint '
                         'with it keeps it). 0 (default): as before')
     p.add_argument('--gamma-global', type=float, default=0.999, help="value_global's discount (B22)")
+    p.add_argument('--item-shared', type=int, default=0,
+                   help='1 (B23, needs --item-tokens 1): the item tokens\' collectible table is the policy\'s item_emb '
+                        '(one representation for held and pedestal items; a B21 checkpoint is converted on --resume, '
+                        'tok_policy.share_item_table). 0 (default): their own table, as before')
     p.add_argument('--vf-global-coef', type=float, default=0.5, help="weight of value_global's loss (B22)")
     p.add_argument('--fused-adam', type=int, default=0,
                    help='1: Adam as one fused CUDA kernel (the same update rule; float rounding may differ)')
@@ -869,21 +912,30 @@ def main():
         p.error('--memory gru needs --memory-dim > 0')
     # 2026-10-12 (B21 / B22): a resumed checkpoint with item tokens / a global token keeps them; one without them gets
     # them fresh when asked (gates zero: its outputs at the start)
-    itok_fresh = gtok_fresh = False
+    itok_fresh = gtok_fresh = share_convert = False
     if args.resume:
         ck_cfg = torch.load(args.resume, map_location='cpu').get('config', {})
-        for key_, opt_ in (('item_tokens', 'item_tokens'), ('global_token', 'global_token')):
+        for key_, opt_ in (('item_tokens', 'item_tokens'), ('global_token', 'global_token'),
+                           ('item_shared', 'item_shared')):
             if ck_cfg.get(key_):
                 if not getattr(args, opt_):
                     print(f'{key_}: the resumed checkpoint has them: --{opt_.replace("_", "-")} 1', flush=True)
                 setattr(args, opt_, 1)
         itok_fresh = bool(args.item_tokens) and not ck_cfg.get('item_tokens')
         gtok_fresh = bool(args.global_token) and not ck_cfg.get('global_token')
+        # 2026-10-13 (B23): a B21 checkpoint's own item-token table converted into the shared one (share_item_table)
+        share_convert = bool(args.item_shared) and bool(ck_cfg.get('item_tokens')) and not ck_cfg.get('item_shared')
         del ck_cfg
     itok_on, gtok_on = bool(args.item_tokens), bool(args.global_token)
     if itok_on and not items:
         p.error('--item-tokens 1 needs --items (or an items checkpoint)')
+    if args.item_shared and not itok_on:
+        p.error('--item-shared 1 needs --item-tokens 1')
     tok_kw = dict(item_tokens=itok_on, global_token=gtok_on)   # (TokPolicy's B21 / B22 options; False: as before)
+    if args.item_shared:   # (B23; the key only when set: TokPolicy's signature as before otherwise)
+        tok_kw['item_shared'] = True
+    pick_force = parse_pickup_force(args.pickup_force)   # 2026-10-13 (B23)
+    pf_on = max(pick_force) > 0
     rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0, heal=0.0, resource=0.0)
     rw.update({k: float(v) for k, v in (kv.split('=') for kv in (FLOOR_REWARD if floor else ROOM_REWARD).split(','))})
     if args.reward:
@@ -898,6 +950,10 @@ def main():
     lab_on = floor and args.lab_share > 0   # 2026-10-08 (tok_lab)
     if args.start_build_prob > 0 and not (floor and items):
         p.error('--start-build-prob needs --mode floor/run and --items')
+    if pf_on and not (floor and items):
+        p.error('--pickup-force needs --mode floor/run and --items')
+    if args.start_build_mode == 'pedestal' and args.start_build_prob <= 0:
+        p.error('--start-build-mode pedestal needs --start-build-prob > 0')
     if args.stat_aug_prob > 0:
         if not floor:
             p.error('--stat-aug-prob needs --mode floor/run')
@@ -952,6 +1008,7 @@ def main():
                            start_build_items=args.lab_items, archive_deep=args.archive_deep, archive_plr=args.archive_plr,
                            stat_aug_prob=args.stat_aug_prob if floor else 0.0, stat_aug=args.stat_aug,
                            characters=args.characters if floor else '',
+                           start_build_mode=args.start_build_mode, pickup_force=pick_force if floor else (0.0, 0.0),
                            teacher_v2=bool(args.teacher_v2) and floor,
                            teacher_v2_hold=tuple(int(v) for v in args.teacher_v2_hold.split(',') if v.strip()),
                            teacher_v2_sticky=args.teacher_v2_sticky, teacher_v2_sticky_n=args.teacher_v2_sticky_n,
@@ -987,7 +1044,11 @@ def main():
         print('init', args.init, load_compatible(learner_model, torch.load(args.init, map_location=device)['model']))
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
-        missing, unexpected = learner_model.load_state_dict(ck['model'], strict=False)
+        ck_model = ck['model']
+        if share_convert:   # 2026-10-13 (B23): the B21 table dropped, the item tokens' first Linear converted
+            ck_model, note_ = share_item_table(learner_model, ck_model)
+            print(note_, flush=True)
+        missing, unexpected = learner_model.load_state_dict(ck_model, strict=False)
         new_ok = (('mem_', 'gtok.mem_in.') if mem_fresh else ()) + (('itok.',) if itok_fresh else ()) + \
             (('gtok.',) if gtok_fresh else ())   # (B21 / B22: the fresh modules' keys)
         if unexpected or any(not k.startswith('choice.') and not (new_ok and k.startswith(new_ok)) for k in missing):
@@ -996,10 +1057,12 @@ def main():
             copt.load_state_dict(ck['choice_optimizer'])
         osd = ck['optimizer']
         ck_ext = any(k.startswith(('itok.', 'gtok.')) for k in ck['model'])
-        if itok_fresh or gtok_fresh or (mem_fresh and ck_ext):
+        if itok_fresh or gtok_fresh or (mem_fresh and ck_ext) or share_convert:
             # 2026-10-12 (B21 / B22): new parameters (not necessarily the last ones): Adam's state remapped by name
+            # (B23 share_convert: itok.coll's state gone with it, the converted Linear's state starts fresh)
             added = remap_optimizer_state(osd, main_parameter_names(list(ck['model'])),
-                                          main_parameter_names([k for k, _ in learner_model.named_parameters()]))
+                                          main_parameter_names([k for k, _ in learner_model.named_parameters()]),
+                                          drop=(ITEM_SHARED_KEY,) if share_convert else ())
             for flag_, name_, what_ in ((itok_fresh, 'item tokens', f'{N_ITEM_TOK} item tokens per record'),
                                         (gtok_fresh, 'global token', 'the global token and value_global'),
                                         (mem_fresh, 'memory', f'GRU (size {mem_dim})')):
@@ -1398,6 +1461,15 @@ def main():
             b_ret_g = torch.from_numpy(ret_g.reshape(-1)[flat]).to(device)
             b_vg = torch.from_numpy(vg_now.reshape(-1)[flat]).to(device)
         gacc = torch.zeros(1, device=device)   # (B22) value_global's loss (sums over steps)
+        # 2026-10-13 (B23): the forced decisions of the batch (ROW pforce > 0; tok_pickup) and the imitation term's sum
+        pf_share = 0.0
+        b_pf = None
+        if pf_on:
+            pf_np = rl.rows['pforce'].reshape(-1)[flat] > 0
+            b_pf = torch.from_numpy(pf_np).to(device)
+            pf_share = float((pf_np * lw).sum() / max(count, 1)) if lw is not None else \
+                (float(pf_np.mean()) if len(pf_np) else 0.0)
+        pacc = torch.zeros(1, device=device)
         if lw is None:
             stale = float((rl.version.reshape(-1)[flat] < L['update']).mean()) if count else 0.0
             reward_mean = float(rl.reward.reshape(-1)[flat].mean())
@@ -1716,15 +1788,21 @@ def main():
                     sel_h = (ch_h[:, None] * T_mem + np.arange(T_mem)[None]).reshape(-1)
                     sel = dev(sel_h)
                     n_sel = max(float(lw[sel_h].sum()), 1.0)   # the minibatch's trained decisions
-                    a_all, w_all = b_adv[sel], b_w[sel]
-                    mu_ = (a_all * w_all).sum() / n_sel
-                    adv_std = (((a_all - mu_) ** 2 * w_all).sum() / max(n_sel - 1.0, 1.0)).sqrt()
-                    a_all = (a_all - mu_) / (adv_std + 1e-8) * w_all   # (untrained rows and padding: 0)
+                    if pf_on:   # (B23: normalised over the decisions PPO trains, forced ones 0)
+                        a_all, adv_std = normalise_advantages(b_adv[sel], b_pf[sel], b_w[sel])
+                    else:
+                        a_all, w_all = b_adv[sel], b_w[sel]
+                        mu_ = (a_all * w_all).sum() / n_sel
+                        adv_std = (((a_all - mu_) ** 2 * w_all).sum() / max(n_sel - 1.0, 1.0)).sqrt()
+                        a_all = (a_all - mu_) / (adv_std + 1e-8) * w_all   # (untrained rows and padding: 0)
                 else:
                     n_sel = len(sel)
-                    a_all = b_adv[sel]
-                    adv_std = a_all.std()
-                    a_all = (a_all - a_all.mean()) / (a_all.std() + 1e-8)
+                    if pf_on:   # (B23)
+                        a_all, adv_std = normalise_advantages(b_adv[sel], b_pf[sel])
+                    else:
+                        a_all = b_adv[sel]
+                        adv_std = a_all.std()
+                        a_all = (a_all - a_all.mean()) / (a_all.std() + 1e-8)
                 opt.zero_grad(set_to_none=True)
                 micro = args.micro or len(sel)
                 if mem_on:   # (memory) parts of whole chunks
@@ -1860,7 +1938,13 @@ def main():
                         logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
                     value = value_[:k_].float()
                     a = a_all[lo_:lo_ + micro]
-                    if prox is None:   # PPO's ratio to the behaviour policy (the one that sampled the action)
+                    if pf_on:   # 2026-10-13 (B23): forced decisions out of pg and the entropy, imitation on them
+                        pg, vf, ent, imit, ratio, kl_f, clip_f = ppo_part_terms(
+                            logits_[:k_], logp, entropy, b_logp[part], a, value, b_ret[part], b_act[part], b_pf[part],
+                            args.clip, pm, pn, prox[part] if prox is not None else None, args.decoupled_max_weight)
+                        loss = (pg + args.vf_coef * vf - args.ent_coef * ent + args.pickup_force_imitation * imit) * w
+                        pacc += imit.detach() * w
+                    elif prox is None:   # PPO's ratio to the behaviour policy (the one that sampled the action)
                         ratio = torch.exp(logp - b_logp[part])
                         pg = -pmean(torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a), pm, pn)
                     else:   # decoupled: clipped around the weights at the update's start, importance-weighted
@@ -1868,9 +1952,10 @@ def main():
                         weight = torch.exp(prox[part] - b_logp[part]).clamp(max=args.decoupled_max_weight)
                         pg = -pmean(weight * torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a),
                                     pm, pn)
-                    vf = 0.5 * pmean((value - b_ret[part]) ** 2, pm, pn)
-                    ent = pmean(entropy.sum(-1), pm, pn)
-                    loss = (pg + args.vf_coef * vf - args.ent_coef * ent) * w
+                    if not pf_on:
+                        vf = 0.5 * pmean((value - b_ret[part]) ** 2, pm, pn)
+                        ent = pmean(entropy.sum(-1), pm, pn)
+                        loss = (pg + args.vf_coef * vf - args.ent_coef * ent) * w
                     if glob_loss:   # 2026-10-12 (B22): value_global on its own returns (an auxiliary loss)
                         vgf = 0.5 * pmean((outs_[-1][:k_].float() - b_ret_g[part]) ** 2, pm, pn)
                         loss = loss + args.vf_global_coef * vgf * w
@@ -1888,8 +1973,11 @@ def main():
                         loss = loss + vloss
                     loss.backward()
                     with torch.no_grad():
-                        acc += torch.stack([pg, vf, ent, pmean(b_logp[part] - logp, pm, pn),
-                                            pmean(((ratio - 1).abs() > args.clip).float(), pm, pn)]) * w
+                        if pf_on:   # (B23: kl and clip share over the PPO-trained decisions' rows)
+                            acc += torch.stack([pg, vf, ent, kl_f, clip_f]) * w
+                        else:
+                            acc += torch.stack([pg, vf, ent, pmean(b_logp[part] - logp, pm, pn),
+                                                pmean(((ratio - 1).abs() > args.clip).float(), pm, pn)]) * w
                         ent_heads += (entropy.mean(0) if pm is None else (entropy * pm[:, None]).sum(0) / pn) * w
                         if merged:
                             tacc += tstats
@@ -1950,6 +2038,10 @@ def main():
         job['cpu0'] = cpu0
         L['update'] += 1
         L['decisions'] += count
+        if pf_on:   # 2026-10-13 (B23): the forcing probability of the episodes to come (the workers read 'pf_p')
+            L['pf_p'] = pickup_force_p(pick_force, (L['decisions'] - start_decisions) /
+                                       max(1, target_decisions - start_decisions))
+            sampler.stats[:, ST['pf_p']] = L['pf_p']
         L['last_update_s'], L['last_steps'], L['last_count'], L['last_U'] = update_s, steps, count, U   # (B18 bench)
         if not L.get('bench'):
             fresh.set()                           # the actor may take the new weights now
@@ -2036,6 +2128,19 @@ def main():
                         'stage_mean': sum(e.get('stage', 0) for e in finished) / m_all})
             if cfg.start_build_prob > 0:   # 2026-10-08: start builds transplanted so far (worker totals)
                 row['start_builds'] = float(stats[:, ST['start_builds']].sum())
+        if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): this update's worker deltas
+            tot = {k_p: float(stats[:, ST[k_p]].sum()) for k_p in ('pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups')}
+            prev = L.get('pf_prev') or dict.fromkeys(tot, 0.0)
+            L['pf_prev'] = tot
+            row['pickup_force_p'] = L.get('pf_p', pick_force[0]) if pf_on else 0.0
+            row['pickup_forced_eps'] = tot['pf_eps'] - prev['pf_eps']
+            row['pickup_forced_steps'] = tot['pf_steps'] - prev['pf_steps']
+            row['pickups_forced'] = tot['pf_pickups'] - prev['pf_pickups']
+            row['pickups_free'] = tot['free_pickups'] - prev['free_pickups']
+            row['start_pedestals'] = float(stats[:, ST['start_pedestals']].sum())
+            if pf_on:
+                row['pickup_imit'] = float(pacc[0]) / steps_
+                row['forced_share'] = pf_share   # (forced share of the update's trained decisions)
         if cfg.stat_aug_prob > 0:   # 2026-10-08: stat augmentations applied so far (worker totals)
             row['stat_augs'] = float(stats[:, ST['stat_augs']].sum())
         if cfg.archive_plr > 0:   # 2026-10-10: mean score of the last reported episodes
@@ -2195,6 +2300,8 @@ def main():
         book.stats0 = {}
     if char_ids:   # 2026-10-08: the character of every episode into episodes.jsonl (char0)
         book.char0 = {}
+    if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): build_pedestals, pickup_forced, forced_steps
+        book.pick = dict(bped={}, steps=np.zeros(n, np.int64))
     version = update                                # the actor's weights: updates done
     busy = False                                     # an update is running on the learner
     handed = decisions_total
@@ -2295,6 +2402,13 @@ def main():
         """The actions out to the workers, the decisions into the rollout. ver: the weights that answered (a
         snapshot's id; None: the actor's own). h (memory): the GRU's input state of each record."""
         t2 = time.perf_counter()
+        if pf_on:   # 2026-10-13 (B23): a forced record's move is the worker's (ROW pforce), its shoot none; stored so
+            fm = sub['pforce']
+            if fm.any():
+                actions = np.array(actions, copy=True)
+                sel_f = np.flatnonzero(fm)
+                actions[sel_f, 0] = fm[sel_f]
+                actions[sel_f, 1] = 0
         sampler.actions[a_idx, :nh] = actions
         if v2_on:   # 2026-10-10 (teacher v2): the value of the record, for the worker's log (before the reply)
             sampler.main_value[a_idx] = value

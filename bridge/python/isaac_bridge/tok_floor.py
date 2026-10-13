@@ -271,6 +271,18 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 b = sorted(int(v) for v in build_rng.choice(build_ids, size=k, replace=False))
                 if sum(i in build_active for i in b) <= 1:
                     return b
+    # 2026-10-13 (B23, tok_pickup.py): pedestal builds (cfg.start_build_mode 'pedestal': the build's collectibles spawned
+    # as pedestals in the floor's starting room instead of AddCollectible) and forced pickups (cfg.pickup_force: an
+    # episode drawn as forced with the trainer's probability, stats column 'pf_p', gets ROW 'pforce' = the move toward
+    # the nearest pedestal in clear rooms; the actor substitutes it). Both off by default: nothing below changes then.
+    ped_mode = building and getattr(cfg, 'start_build_mode', 'inventory') == 'pedestal'
+    pf_on = cfg.items and not evaluation and max(getattr(cfg, 'pickup_force', (0.0, 0.0)) or (0.0, 0.0)) > 0
+    pf_track = pf_on or ped_mode   # the B23 ROW fields written, pickups counted
+    if pf_track:
+        from .tok_pickup import PED_MAX, PickupForcer, parse_spawned, spawn_lua
+        forcer = PickupForcer()
+        pf_rng = np.random.default_rng([cfg.seed, index, 29])   # its own: the episodes' rng draws stay as without
+        pf_counts = dict(steps=0, forced=0, free=0)
     # 2026-10-08: stat augmentation (cfg.stat_aug_prob of the floor-start training episodes get random multipliers of
     # the base stats, as AbpSetStats offsets in the episode's clone; user: generalisation of the no-item play)
     augmenting = cfg.stat_aug_prob > 0 and not evaluation
@@ -1351,8 +1363,13 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 reseed = state_seed % (2 ** 31 - 1) + 1 if evaluation else int(rng.integers(1, 2 ** 31 - 1))
                 episode = src.fork(alarm=cfg.clone_alarm, reseed=reseed, lean=True)   # (under its lock, 2026-10-10)
                 # 2026-10-08: a start build (floor starts only: archive entries carry their episode's build along)
+                bped = ()
                 if building and not from_archive and build_rng.random() < cfg.start_build_prob:
-                    episode.lua(transplant_lua(random_build()))
+                    if ped_mode:   # 2026-10-13 (B23): the build as pedestals in the starting room
+                        bped = tuple(i for i, _, _ in parse_spawned(episode.lua(spawn_lua(random_build()))))[:PED_MAX]
+                        mine[ST['start_pedestals']] += len(bped)
+                    else:
+                        episode.lua(transplant_lua(random_build()))
                     mine[ST['start_builds']] += 1
                 # 2026-10-08: stat augmentation (floor starts only, like the builds; after the build: offsets add to
                 # whatever the build gives, the cache is re-evaluated once)
@@ -1409,6 +1426,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             # score); its points: (record, the restore point then, its reseed, its decision, kind)
             v2log = V2Log() if v2on else None
             v2_pts = []
+            if pf_track:   # 2026-10-13 (B23): this episode's draw (the trainer's p) and its pedestal build
+                pf_ep = pf_on and pf_rng.random() < float(mine[ST['pf_p']])
+                forcer.begin(pf_ep)
+                mine[ST['pf_eps']] += pf_ep
+                bped_row = np.zeros(PED_MAX, np.int16)
+                bped_row[:len(bped)] = bped
             try:
                 while True:
                     t0 = time.perf_counter()
@@ -1423,6 +1446,16 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         hurt, room_idx = row['hurt'][0] > 0, obs.room[4]
                     # (2026-10-09: the fatal hit does not raise the bridge's damage_taken, so a death record has hurt 0
                     # and was never a hurt to search; the death teacher queues it by its done code)
+                    if pf_track:   # 2026-10-13 (B23): the forced move of this record (0: the policy's), the episode's
+                        #             draw and pedestal build; pickups counted (tok_pickup.PickupForcer)
+                        s0 = pf_counts['steps'], pf_counts['forced'], pf_counts['free']
+                        row['pforce'] = forcer.step(row, (int(row['stage'][0]), int(room_idx)),
+                                                    t_ep > 0 and bool(row['events'][0] & EV_ITEM), done, pf_counts)
+                        row['pmode'] = forcer.on
+                        row['bped'][0] = bped_row
+                        mine[ST['pf_steps']] += pf_counts['steps'] - s0[0]
+                        mine[ST['pf_pickups']] += pf_counts['forced'] - s0[1]
+                        mine[ST['free_pickups']] += pf_counts['free'] - s0[2]
                     if teaching and (hurt or (death_teaching and done == 2)):
                         hurts.append((t_ep, base.hold(), base_reseed, base_t))
                     if v2on:   # 2026-10-10 (teacher v2): the record's log, and a point at a hurt, a death or at random
@@ -1579,6 +1612,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 episode = None
                 base.release()
                 base = None
+                if pf_track:   # (B23: branch and lab episodes reuse the slots and never write these fields)
+                    for s_ in slots:
+                        s_['pforce'], s_['pmode'], s_['bped'] = 0, 0, 0
             if branching and not control[0]:   # queued branch points, within cfg.branch_share (tok_branch)
                 run_points()
             if labbing and not control[0]:   # 2026-10-08: posted lab jobs, within cfg.lab_share (tok_lab)

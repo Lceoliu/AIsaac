@@ -84,6 +84,13 @@ over t + G keys) and a G-key cross term for every old token: about G / t more pe
 entity tokens, G = 21). The learner's packed paths compute the extra attention in the padded [records, t] layout (the
 old tokens' q / k / v scattered there once per layer). The new modules are registered after everything else (memory
 included): an optimiser state without them is remapped by parameter names (remap_optimizer_state).
+
+Shared collectible table (2026-10-13, B23; TokPolicy(item_shared=True), needs item_tokens, config key 'item_shared'):
+ItemTokens reads the policy's item_emb (ITEM_EMB = 16 columns, the pedestal ids' and the multi-hot's table) instead of
+a table of its own (IT_COLL = 32): one representation of a collectible whether it lies on a pedestal or is held. The
+table is not registered a second time (one parameter, one state-dict key). A B21 checkpoint is converted by
+share_item_table (its own table dropped, the item-token mlp's first Linear keeps its 44 other columns and gets fresh
+collectible columns); off: the B21 module, bit for bit (tests/test_pickup_smoke.py).
 """
 import contextlib
 import os
@@ -476,38 +483,53 @@ class ChoiceHeads(nn.Module):
 
 class ItemTokens(nn.Module):
     """B21 (2026-10-12; TokPolicy(item_tokens=True)): N_ITEM_TOK tokens per record from ROW 'inv', 'pitem', 'pinv' (the
-    module docstring) and their key mask, plus the per-layer gates of the old tokens' term (zero at the start)."""
+    module docstring) and their key mask, plus the per-layer gates of the old tokens' term (zero at the start).
+    B23 (2026-10-13; TokPolicy(item_shared=True)): coll = the policy's item_emb (ITEM_EMB = 16 columns, the table of the
+    pedestals' ids and the multi-hot), passed in and not registered here (one parameter, one state-dict key
+    'item_emb.weight'); the mlp's first Linear then reads ITEM_EMB collectible columns instead of IT_COLL."""
 
-    def __init__(self, width, layers):
+    def __init__(self, width, layers, coll=None):
         super().__init__()
-        self.coll = nn.Embedding(N_COLLECTIBLE, IT_COLL, padding_idx=0)
+        self.shared = coll is not None
+        if self.shared:   # (not a submodule: nn.Module.__setattr__ would register it a second time)
+            self.__dict__['_shared_coll'] = coll
+        else:
+            self.coll = nn.Embedding(N_COLLECTIBLE, IT_COLL, padding_idx=0)
+        self.dc = coll.embedding_dim if self.shared else IT_COLL   # the collectible columns of an item token's input
         self.trinket = nn.Embedding(N_TRINKET, IT_TRINKET, padding_idx=0)
         self.pill = nn.Embedding(N_PILL_COLOR, IT_POCKET, padding_idx=0)
         self.effect = nn.Embedding(N_PILL_EFFECT, IT_POCKET, padding_idx=0)
         self.card = nn.Embedding(N_CARD, IT_POCKET, padding_idx=0)
-        self.mlp = mlp(IT_F, width, width)
+        self.mlp = mlp(IT_F - IT_COLL + self.dc, width, width)
         self.slot = nn.Embedding(INV_CAP, width)   # a held collectible's position in 'inv' (newest first)
         self.kind = nn.Embedding(4, width)         # held, active, trinket, pocket
         nn.init.normal_(self.slot.weight, std=0.02)
         nn.init.normal_(self.kind.weight, std=0.02)
         self.gate = nn.Parameter(torch.zeros(layers))
 
+    @property
+    def coll(self):
+        """The collectible table: its own (B21) or the policy's item_emb (B23 item_shared)."""
+        own = self._modules.get('coll')
+        return own if own is not None else self.__dict__['_shared_coll']
+
     def forward(self, b):
         """(tokens [n, N_ITEM_TOK, width], present [n, N_ITEM_TOK] bool). No host synchronisation, static shapes."""
         inv, pit, pinv = b['inv'].long(), b['pitem'].long(), b['pinv'].float()
         n = inv.shape[0]
         hid, cnt = inv[..., 0].clamp(0, N_COLLECTIBLE - 1), inv[..., 1]
+        coll, dc = self.coll, self.dc
 
         def zf(k, w):
             return pinv.new_zeros((n, k, w))
         cf = cnt.float()[..., None]
-        held = torch.cat([self.coll(hid), zf(INV_CAP, IT_TRINKET + 3 * IT_POCKET), cf, (cf > 1).float(),
+        held = torch.cat([coll(hid), zf(INV_CAP, IT_TRINKET + 3 * IT_POCKET), cf, (cf > 1).float(),
                           zf(INV_CAP, 2)], -1)
-        active = torch.cat([self.coll(pit[:, 0].clamp(0, N_COLLECTIBLE - 1))[:, None],
+        active = torch.cat([coll(pit[:, 0].clamp(0, N_COLLECTIBLE - 1))[:, None],
                             zf(1, IT_TRINKET + 3 * IT_POCKET + 2), pinv[:, None, 0:2]], -1)
-        trink = torch.cat([zf(2, IT_COLL), self.trinket(pit[:, 1:3].clamp(0, N_TRINKET - 1)),
+        trink = torch.cat([zf(2, dc), self.trinket(pit[:, 1:3].clamp(0, N_TRINKET - 1)),
                            zf(2, 3 * IT_POCKET + 4)], -1)
-        pocket = torch.cat([zf(1, IT_COLL + IT_TRINKET), self.pill(pit[:, 3].clamp(0, N_PILL_COLOR - 1))[:, None],
+        pocket = torch.cat([zf(1, dc + IT_TRINKET), self.pill(pit[:, 3].clamp(0, N_PILL_COLOR - 1))[:, None],
                             self.effect(pit[:, 4].clamp(0, N_PILL_EFFECT - 1))[:, None],
                             self.card(pit[:, 5].clamp(0, N_CARD - 1))[:, None], zf(1, 4)], -1)
         x = embed(self.mlp, torch.cat([held, active, trink, pocket], 1))
@@ -538,10 +560,12 @@ class GlobalToken(nn.Module):
 
 class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
-                 memory=0, item_tokens=False, global_token=False):
+                 memory=0, item_tokens=False, global_token=False, item_shared=False):
         super().__init__()
         if item_tokens and not items:
             raise ValueError('TokPolicy: item_tokens needs items=True (ROW inv / pitem / pinv)')
+        if item_shared and not item_tokens:
+            raise ValueError('TokPolicy: item_shared needs item_tokens=True (B23: the item tokens read item_emb)')
         self.config = dict(width=width, layers=layers, heads=heads)
         if items:   # (the key only when set: items-free checkpoints keep their config)
             self.config['items'] = True
@@ -618,7 +642,12 @@ class TokPolicy(nn.Module):
             self.config['item_tokens'] = True
         if self.global_token:
             self.config['global_token'] = True
-        self.itok = ItemTokens(width, layers) if self.item_tokens else None
+        # 2026-10-13 (B23): the item tokens' collectible table is item_emb itself (the key only when set)
+        self.item_shared = bool(item_shared)
+        if self.item_shared:
+            self.config['item_shared'] = True
+        self.itok = ItemTokens(width, layers, coll=self.item_emb if self.item_shared else None) \
+            if self.item_tokens else None
         self.gtok = GlobalToken(width, layers, self.memory) if self.global_token else None
 
     def gate_values(self):
@@ -1406,11 +1435,12 @@ def pad_optimizer_state(osd, n_params):
     return n_params - have
 
 
-def remap_optimizer_state(osd, old_names, new_names):
+def remap_optimizer_state(osd, old_names, new_names, drop=()):
     """2026-10-12 (B21 / B22): an optimiser state dict (one param group) saved for the parameters old_names (in its
     order) made loadable into an optimiser over new_names: each parameter keeps the state of the same name, new ones
     start without state (Adam initialises it at the first step). General form of pad_optimizer_state (any new
-    parameters anywhere, e.g. memory added to a checkpoint that already has item tokens). Returns the number of
+    parameters anywhere, e.g. memory added to a checkpoint that already has item tokens). drop (B23): names whose saved
+    state is not carried over (a tensor whose shape changed: share_item_table's ITEM_SHARED_KEY). Returns the number of
     parameters without state. Raises ValueError if the group's size is not len(old_names)."""
     g = osd['param_groups'][0]
     if len(osd['param_groups']) != 1 or len(g['params']) != len(old_names):
@@ -1418,10 +1448,10 @@ def remap_optimizer_state(osd, old_names, new_names):
     old_id = dict(zip(old_names, g['params']))
     state = {}
     for j, name in enumerate(new_names):
-        i = old_id.get(name)
+        i = old_id.get(name) if name not in drop else None
         if i is not None and i in osd['state']:
             state[j] = osd['state'][i]
-    added = sum(name not in old_id for name in new_names)
+    added = sum(name not in old_id or name in drop for name in new_names)
     osd['state'] = state
     g['params'] = list(range(len(new_names)))
     return added
@@ -1434,12 +1464,46 @@ def main_parameter_names(names):
     return [k for k in names if not k.startswith('choice.')]
 
 
+ITEM_SHARED_KEY = 'itok.mlp.0.weight'   # B23: the item tokens' first Linear (its collectible columns come first)
+
+
+def share_item_table(model, state):
+    """B23 (2026-10-13): a B21 checkpoint's state dict (item tokens with their own 'itok.coll.weight' table, IT_COLL =
+    32 columns) made loadable into a model with item_shared (the item tokens read item_emb, ITEM_EMB = 16 columns).
+    The old table is dropped; the first Linear of the item-token mlp ('itok.mlp.0.weight', [width, 32 + 44]) becomes
+    [width, 16 + 44]: its 44 non-collectible columns (trinket, pill, effect, card embeddings, count, count > 1, charge
+    share, max charge) are the checkpoint's, its 16 collectible columns keep the model's fresh initialisation (torch's
+    nn.Linear default, U(-1/sqrt(60), 1/sqrt(60)), drawn when the model was built). Every other tensor (bias, gates,
+    slot / kind embeddings, the rest of the mlp, item_emb itself) is the checkpoint's. Returns (state, a log line or
+    None when nothing was converted). The input dict is not changed."""
+    itok = getattr(model, 'itok', None)
+    if itok is None or not itok.shared or 'itok.coll.weight' not in state:
+        return state, None
+    state = dict(state)
+    old = state.pop('itok.coll.weight')
+    own = model.state_dict()[ITEM_SHARED_KEY]
+    w_old = state.get(ITEM_SHARED_KEY)
+    rest = own.shape[1] - itok.dc
+    if w_old is None or w_old.shape[0] != own.shape[0] or w_old.shape[1] - old.shape[1] != rest:
+        raise ValueError(f'share_item_table: {ITEM_SHARED_KEY} {tuple(w_old.shape) if w_old is not None else None} does '
+                         f'not fit a {old.shape[1]}-column collectible table and {rest} other columns')
+    w = own.detach().clone().to(device=w_old.device, dtype=w_old.dtype)
+    w[:, itok.dc:] = w_old[:, old.shape[1]:]
+    state[ITEM_SHARED_KEY] = w
+    return state, (f"item_shared (B23): the checkpoint's own item-token table itok.coll ({old.shape[0]} x {old.shape[1]}) "
+                   f'dropped, the item tokens now read item_emb ({itok.dc} columns); {ITEM_SHARED_KEY} '
+                   f'{tuple(w_old.shape)} -> {tuple(w.shape)}: its {rest} other columns kept, its {itok.dc} collectible '
+                   "columns re-initialised (the fresh model's nn.Linear default); everything else loaded as saved")
+
+
 def load_compatible(model, state):
     """Load a checkpoint's weights into a model whose input layers may have grown (more door features, ...): a
     tensor of another shape is copied into the leading part of the model's (the rest keeps its fresh values, zero
-    for added input columns). Returns the names that did not match exactly."""
+    for added input columns). Returns the names that did not match exactly. (B23: a B21 checkpoint's own item-token
+    table into an item_shared model goes through share_item_table first, reported as 'itok.coll.weight (shared: ...)'.)"""
+    state, note = share_item_table(model, state)
     own = model.state_dict()
-    changed = []
+    changed = [] if note is None else ['itok.coll.weight (shared: ' + note + ')']
     for name, value in state.items():
         if name not in own:
             changed.append(name + ' (dropped)')
