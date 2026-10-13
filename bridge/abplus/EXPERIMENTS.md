@@ -7208,6 +7208,24 @@ C68 的训练数据 71% 的决策从一层开始、死亡都在二、三层：�
 - **CPU 冒烟**（PC，`tests/test_item_global_smoke.py`）：35 项全过——关闭时与 HEAD 逐位一致（普通 / 道具 / 道具 + 记忆三条路径）；开启且门为 0 时与关闭逐位一致（最大差 0）；梯度到达两个门和 `mem_in`、`value_global` 一开始就把梯度送到道具嵌入；检查点往返、从 C90 类检查点续训（只缺 itok./gtok.，Adam 按名重映射）；分块 BPTT 三条路径复现 actor（logits 2e-7）。CPU 前向 314 → 546 ms（+74%）。`tests/test_memory_smoke.py` 仍全过。
 - **HPC128 真机**（`ws4` worktree 移到 `4a2c1b3`，10-12 20:3x）：GPU 版测试含 (f) CUDA 图 = eager 全过；`hpc_c92.sh smoke`（8 worker、1.5 小时、C90 最终 + 记忆 + B21 + B22 + 起始构筑 + 回血/资源奖励）0 个 Traceback，日志有三条"--resume of a checkpoint without them"行，5 次更新里 `item_gate` / `global_gate` 从 0 走到 3e-4 / 4e-4（每步约一个学习率），`v_global_ev` 0.03 → 0.21，kl 0.009–0.012，每次更新 3 个起始构筑。
 
+### B23 底座构筑 + 强制拾取 + 共享道具表（2026-10-13，代码完成，冒烟中）
+
+**实验目的**
+
+C92/C93 证明"持有道具有益"（移植 1/2/3 件 +0.07/+0.13/+0.25 层），但策略自己捡底座道具的局只有 5%。用户 10-13 的诊断（代码核对属实）：起始构筑是直接进背包的，数据里没有"底座 → 走过去 → 进背包 → 变强"这条链；底座的道具 id 用老的 16 维表、B21 的持有道具 token 用另一张 32 维表，"认得它是什么"不互通。用户的决定：一开始强制走过去捡，不给额外奖励，两张表必须合一。
+
+**实验方法**
+
+- **代码**（opus 子代理实现，我复核 + CPU 测试；提交见下）：三项都默认关、关时逐位一致、能从 B21/B22 检查点（C93）续训。
+  - A `--start-build-mode pedestal`：起始构筑不再 AddCollectible 进背包，而是在起始房间用 Lua `Isaac.Spawn(5, 100, id, pos, ...)` 刷成底座（位置取玩家周围的固定偏移，经 `Room:FindFreePickupSpawnPosition` 修正、距玩家和其他底座 ≥ 60 px、在房间内），同一套 `lab_items.json` 过滤、最多一件主动。`episodes.jsonl` 新字段 `build_pedestals`（刷出的 id；`build0` 仍是开局持有的）。
+  - B `--pickup-force A:B`：每局按运行进度（与学习率同一时间轴）从 A 到 B 线性变化的概率 p 抽为"强制局"；强制局里，房间已清（ROW `player[23]` = `room:IsClear()`）且实体表里有带道具的底座（type 5 / variant 100 / `ent_item` > 0）时，worker 把策略的移动改成朝最近底座的 8 向（`ent[:,0:2]` 的相对位置，`ent[:,2]` 的距离）、射击改成不射，其余头不动；直到 EV_ITEM、换房或该底座 150 个决策为止（拿到后换下一个底座重新计 150）；商店等特殊房（小地图通道 6/7）不强制，直线走不绕障碍。强制决策存一个标志：学习器里 PPO 的策略项和熵项按 ratio=1、优势 0 处理（优势归一化只在非强制决策上算），价值损失和记忆块照常，另加一项模仿损失 `--pickup-force-imitation`（默认 1.0）× 强制行的 −(log π_move + log π_shoot)。评估从不强制。`progress.csv` 新列 `start_pedestals / pickup_force_p / pickup_forced_eps / pickup_forced_steps / pickups_forced / pickups_free / pickup_imit / forced_share`。
+  - C `--item-shared 1`：`ItemTokens.coll` 与 `item_emb`（底座 / 多热那张 16 维表）成为同一个 `nn.Embedding`；从 B21 检查点续训时丢掉它的 `itok.coll`（1024×32），道具 token 第一层 Linear 的 32 个道具列换成 16 个新初始化的列、其余 44 列照搬，Adam 按名重映射，打一行日志。因为 C93 的门已经打开，续训第一步输出就会变。
+- **CPU 测试**（`tests/test_pickup_smoke.py`，43 项）：关闭时与 HEAD 逐位一致；共享表下底座路径和持有路径的梯度都到达 `item_emb`；B21 式检查点（分离的 `itok.coll`）加载后其它张量全保留；学习器掩码：强制行的策略项为 0、模仿项只在强制行非零、价值项覆盖全部；8 向选择对若干偏移正确；Lua 片段括号平衡、解析正确。B21/B22 与 B20 的测试仍全过。
+
+**实验结果**
+
+- HPC160 `ws7` 真机冒烟（8 worker、1.5 小时、C93 最新检查点续训）：待补。
+
 ### C77 十游戏年：C67 + 死亡教师，HPC 节点（2026-10-10，进行中）
 
 **实验目的**
