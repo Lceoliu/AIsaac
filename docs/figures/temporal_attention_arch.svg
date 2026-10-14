@@ -1,0 +1,216 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="900" viewBox="0 0 1560 900" font-family="Segoe UI, Microsoft YaHei, Noto Sans CJK SC, sans-serif" font-size="14">
+  <defs>
+    <marker id="ao" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3b6ea5"/>
+    </marker>
+    <marker id="an" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d9742b"/>
+    </marker>
+    <marker id="af" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,5 L0,10 z" fill="#888"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1560" height="900" fill="#ffffff"/>
+  <text x="30" y="36" font-size="22" font-weight="700" fill="#222">B27 时间注意力：在每步的空间 transformer 之上加一个同量级的时间 transformer（第 t 步）</text>
+  <text x="30" y="60" fill="#555">蓝色 = 现有（C95：B20 记忆、B21 道具 token、B22 全局 token、B23 共享表、B24 融合注意力）；橙色 = 新加；灰色虚线 = 以后（宏观决策头）。门 g₁、g₂ 零起步：加上去的瞬间与 C95 逐位相同。</text>
+
+  <!-- ===================== OLD: inputs ===================== -->
+  <rect x="30" y="90" width="900" height="150" rx="8" fill="#f4f8fc" stroke="#3b6ea5" stroke-dasharray="4 3"/>
+  <text x="42" y="110" font-weight="700" fill="#3b6ea5">观测 → token（每 4 帧一条记录；在场的才算，上限 96 个）</text>
+
+  <g>
+    <rect x="42" y="122" width="150" height="100" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="52" y="142" font-weight="700" fill="#1f3f63">玩家 ×1</text>
+    <text x="52" y="160" fill="#333">31 维状态、上一步动作</text>
+    <text x="52" y="176" fill="#333">持有道具 multi-hot</text>
+    <text x="52" y="192" fill="#333">钥匙/炸弹/硬币/血量</text>
+    <text x="52" y="212" fill="#666" font-size="12">z_t 从这个 token 读出</text>
+  </g>
+  <g>
+    <rect x="204" y="122" width="130" height="100" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="214" y="142" font-weight="700" fill="#1f3f63">房间 ×1</text>
+    <text x="214" y="160" fill="#333">网格 7×16×28</text>
+    <text x="214" y="176" fill="#333">→ 小 CNN</text>
+  </g>
+  <g>
+    <rect x="346" y="122" width="130" height="100" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="356" y="142" font-weight="700" fill="#1f3f63">小地图 ×1</text>
+    <text x="356" y="160" fill="#333">8×13×13 → CNN</text>
+    <text x="356" y="176" fill="#333">已探/已清/Boss/</text>
+    <text x="356" y="192" fill="#333">宝箱房/商店/特殊房</text>
+  </g>
+  <g>
+    <rect x="488" y="122" width="110" height="100" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="498" y="142" font-weight="700" fill="#1f3f63">门 ≤8</text>
+    <text x="498" y="160" fill="#333">开/锁、目标</text>
+    <text x="498" y="176" fill="#333">房间类型</text>
+  </g>
+  <g>
+    <rect x="610" y="122" width="130" height="100" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="620" y="142" font-weight="700" fill="#1f3f63">实体 ≤64</text>
+    <text x="620" y="160" fill="#333">怪、子弹、掉落物、</text>
+    <text x="620" y="176" fill="#333">底座（33+40 维</text>
+    <text x="620" y="192" fill="#333">+ 道具嵌入）</text>
+  </g>
+  <g>
+    <rect x="752" y="122" width="82" height="100" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="760" y="142" font-weight="700" fill="#1f3f63">道具 ×20</text>
+    <text x="760" y="160" fill="#333">16 持有</text>
+    <text x="760" y="176" fill="#333">+主动+2 饰品</text>
+    <text x="760" y="192" fill="#333">+口袋 (B21)</text>
+  </g>
+  <g>
+    <rect x="846" y="122" width="74" height="100" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="854" y="142" font-weight="700" fill="#1f3f63">全局 ×1</text>
+    <text x="854" y="160" fill="#333">学出的</text>
+    <text x="854" y="176" fill="#333">向量</text>
+    <text x="854" y="192" fill="#333">(B22)</text>
+  </g>
+
+  <!-- NEW: history token input -->
+  <g>
+    <rect x="960" y="122" width="160" height="100" rx="6" fill="#fdf0e4" stroke="#d9742b" stroke-width="2"/>
+    <text x="970" y="142" font-weight="700" fill="#9a4a0e">历史 token ×1（新）</text>
+    <text x="970" y="160" fill="#333">g₂ · Q(o_{t−1})</text>
+    <text x="970" y="176" fill="#333">上一步时间侧输出，</text>
+    <text x="970" y="192" fill="#333">进入空间注意力</text>
+    <text x="970" y="212" fill="#9a4a0e" font-size="12">反馈路，g₂ 零起步</text>
+  </g>
+
+  <!-- arrows inputs -> spatial -->
+  <path d="M480 240 L480 270" stroke="#3b6ea5" stroke-width="2" marker-end="url(#ao)"/>
+  <path d="M1040 222 L1040 250 L560 250 L560 270" stroke="#d9742b" stroke-width="2" fill="none" marker-end="url(#an)"/>
+
+  <!-- ===================== OLD: spatial transformer ===================== -->
+  <rect x="30" y="272" width="1090" height="86" rx="8" fill="#e8f0f8" stroke="#3b6ea5" stroke-width="2"/>
+  <text x="42" y="296" font-size="17" font-weight="700" fill="#1f3f63">空间 transformer（现有，原样保留）：4 层 × 4 头，宽 192，一个 softmax（B24 融合），≤96（+1 历史）token，≈3.7M 参数</text>
+  <text x="42" y="318" fill="#333">这一帧内的注意力：谁在哪、子弹往哪飞、门和底座在哪。没有任何跨时间的注意力——时间只靠下面的读出。</text>
+  <text x="42" y="340" fill="#333">按 B23/B24：道具 token 用共享的 16 维道具表；道具/全局 token 的值向量带每层的门（已打开）。</text>
+
+  <!-- readouts -->
+  <path d="M300 358 L300 392" stroke="#3b6ea5" stroke-width="2" marker-end="url(#ao)"/>
+  <path d="M760 358 L760 392" stroke="#3b6ea5" stroke-width="2" marker-end="url(#ao)"/>
+  <g>
+    <rect x="200" y="394" width="200" height="54" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="212" y="416" font-weight="700" fill="#1f3f63">z_t = norm(玩家 token 输出)</text>
+    <text x="212" y="436" fill="#333">宽 192</text>
+  </g>
+  <g>
+    <rect x="660" y="394" width="200" height="54" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="672" y="416" font-weight="700" fill="#1f3f63">yg_t = 全局 token 输出</text>
+    <text x="672" y="436" fill="#333">宽 192</text>
+  </g>
+
+  <!-- OLD: GRU -->
+  <path d="M300 448 L300 500" stroke="#3b6ea5" stroke-width="2" marker-end="url(#ao)"/>
+  <path d="M760 448 L760 470 L420 470 L420 500" stroke="#3b6ea5" stroke-width="2" fill="none" marker-end="url(#ao)"/>
+  <text x="430" y="490" fill="#3b6ea5" font-size="12">mem_in(norm(yg_t))</text>
+  <g>
+    <rect x="200" y="502" width="300" height="70" rx="6" fill="#e8f0f8" stroke="#3b6ea5"/>
+    <text x="212" y="524" font-weight="700" fill="#1f3f63">GRU 128（现有，B27 先保留，之后对比）</text>
+    <text x="212" y="544" fill="#333">h_t = GRU(z_t + mem_in(yg_t), h_{t−1})，每局清零</text>
+    <text x="212" y="562" fill="#333">训练 BPTT 32 步 ≈ 4.3 s；只在读出层生效</text>
+  </g>
+
+  <!-- OLD: heads -->
+  <path d="M350 572 L350 630" stroke="#3b6ea5" stroke-width="2" marker-end="url(#ao)"/>
+  <text x="358" y="605" fill="#3b6ea5" font-size="12">z_t + mem_out(h_t)</text>
+  <g>
+    <rect x="200" y="632" width="560" height="96" rx="6" fill="#e8f0f8" stroke="#3b6ea5" stroke-width="2"/>
+    <text x="212" y="656" font-size="16" font-weight="700" fill="#1f3f63">读出头（现有）：输入 = z_t + mem_out(h_t) + g₁ · P(o_t)</text>
+    <text x="212" y="678" fill="#333">动作头 20 个 logit：移动 9 · 射击 5 · 炸弹 2 · 用主动 2 · 用药/卡 2（每头各采样一个）</text>
+    <text x="212" y="698" fill="#333">价值 V(s_t)（γ 决策级）· 危险头 9（辅助，教师用）</text>
+    <text x="212" y="718" fill="#333">value_global（γ=0.999）← 现在读 yg_t；B27 改读 o_t（时间侧看得更远）</text>
+  </g>
+  <path d="M760 448 L760 580 L790 580 L790 640" stroke="#3b6ea5" stroke-width="2" fill="none" stroke-dasharray="5 3"/>
+  <text x="798" y="600" fill="#3b6ea5" font-size="12">value_global（现）</text>
+
+  <!-- ===================== NEW: temporal side ===================== -->
+  <rect x="1140" y="90" width="400" height="760" rx="10" fill="#fff8f2" stroke="#d9742b" stroke-width="2" stroke-dasharray="6 4"/>
+  <text x="1152" y="112" font-size="17" font-weight="700" fill="#9a4a0e">时间侧（新，≈3.3M 参数，与空间侧同量级）</text>
+
+  <!-- s_t -->
+  <path d="M400 421 L1140 421" stroke="#d9742b" stroke-width="2" fill="none" stroke-dasharray="2 3"/>
+  <path d="M860 421 L1150 421" stroke="#d9742b" stroke-width="2" fill="none" marker-end="url(#an)"/>
+  <g>
+    <rect x="1152" y="392" width="376" height="58" rx="6" fill="#fdf0e4" stroke="#d9742b" stroke-width="2"/>
+    <text x="1164" y="414" font-weight="700" fill="#9a4a0e">压缩：s_t = W · [z_t ; yg_t] → 宽 256（每步 1 个 token）</text>
+    <text x="1164" y="434" fill="#333">96 个空间 token → 1 个步 token；存进 rollout（256 维/步）</text>
+  </g>
+
+  <!-- caches -->
+  <path d="M1340 450 L1340 478" stroke="#d9742b" stroke-width="2" marker-end="url(#an)"/>
+  <g>
+    <rect x="1152" y="480" width="180" height="110" rx="6" fill="#fdf0e4" stroke="#d9742b" stroke-width="2"/>
+    <text x="1162" y="500" font-weight="700" fill="#9a4a0e">步 token 缓存</text>
+    <text x="1162" y="518" fill="#333">最近 W = 256 步</text>
+    <text x="1162" y="534" fill="#333">≈ 34 s，环形缓存</text>
+    <text x="1162" y="550" fill="#333">XL 式：窗口外的</text>
+    <text x="1162" y="566" fill="#333">缓存不回传梯度</text>
+    <text x="1162" y="582" fill="#333">相对位置（步距）</text>
+  </g>
+  <g>
+    <rect x="1348" y="480" width="180" height="110" rx="6" fill="#fdf0e4" stroke="#d9742b" stroke-width="2"/>
+    <text x="1358" y="500" font-weight="700" fill="#9a4a0e">房间 token r_k</text>
+    <text x="1358" y="518" fill="#333">离开房间那一步的 o_t</text>
+    <text x="1358" y="534" fill="#333">+ 房间序号/层号嵌入</text>
+    <text x="1358" y="550" fill="#333">整局 ≤128 个，全程可见</text>
+    <text x="1358" y="566" fill="#333">= 分层压缩：步 → 房间</text>
+    <text x="1358" y="582" fill="#666" font-size="12">（以后：宏观头读它）</text>
+  </g>
+
+  <!-- temporal transformer -->
+  <path d="M1242 590 L1242 618" stroke="#d9742b" stroke-width="2" marker-end="url(#an)"/>
+  <path d="M1438 590 L1438 618" stroke="#d9742b" stroke-width="2" marker-end="url(#an)"/>
+  <g>
+    <rect x="1152" y="620" width="376" height="96" rx="6" fill="#f7c9a1" stroke="#d9742b" stroke-width="2"/>
+    <text x="1164" y="642" font-size="16" font-weight="700" fill="#7a3608">时间 transformer（新）</text>
+    <text x="1164" y="662" fill="#333">4 层 × 4 头，宽 256，FFN 1024，因果注意力</text>
+    <text x="1164" y="680" fill="#333">查询 = 当前步 token；键/值 = 256 步 + ≤128 房间 token</text>
+    <text x="1164" y="698" fill="#333">actor 每步只有 1 个查询（几乎免费）；学习器按 256 步的块算</text>
+  </g>
+
+  <!-- o_t -->
+  <path d="M1340 716 L1340 744" stroke="#d9742b" stroke-width="2" marker-end="url(#an)"/>
+  <g>
+    <rect x="1152" y="746" width="376" height="40" rx="6" fill="#fdf0e4" stroke="#d9742b" stroke-width="2"/>
+    <text x="1164" y="771" font-weight="700" fill="#9a4a0e">o_t（宽 256）：这一步的"带历史的状态"</text>
+  </g>
+
+  <!-- o_t -> heads (gate g1) -->
+  <path d="M1152 766 L1000 766 L1000 700 L760 700" stroke="#d9742b" stroke-width="2.5" fill="none" marker-end="url(#an)"/>
+  <text x="1010" y="760" fill="#9a4a0e" font-weight="700">读出路：g₁ · P(o_t) 加到读出头输入，g₁ 零起步</text>
+  <!-- o_t -> value_global -->
+  <text x="1010" y="780" fill="#9a4a0e" font-size="12">value_global 改读 o_t</text>
+
+  <!-- o_t -> feedback (next step) -->
+  <path d="M1528 766 L1548 766 L1548 172 L1120 172" stroke="#d9742b" stroke-width="2.5" fill="none" marker-end="url(#an)"/>
+  <text x="1270" y="806" fill="#9a4a0e" font-weight="700">反馈路：o_t → 下一步（t+1）的历史 token，g₂ 零起步</text>
+  <text x="1270" y="824" fill="#333" font-size="12">让空间注意力能被历史条件化（记得这房间左上角那个底座已经拿过）</text>
+
+  <!-- room token write-back -->
+  <path d="M1528 766 L1540 766 L1540 600 L1500 600 L1500 590" stroke="#d9742b" stroke-width="1.5" fill="none" stroke-dasharray="4 3" marker-end="url(#an)"/>
+  <text x="1440" y="470" fill="#9a4a0e" font-size="12">离开房间时写入 r_k</text>
+
+  <!-- future macro head -->
+  <g>
+    <rect x="1152" y="836" width="376" height="0" fill="none"/>
+  </g>
+  <rect x="820" y="760" width="300" height="80" rx="6" fill="#f3f3f3" stroke="#888" stroke-dasharray="6 4"/>
+  <text x="832" y="782" font-weight="700" fill="#555">以后：宏观决策头（灰，不在 B27 里）</text>
+  <text x="832" y="802" fill="#555">在房间 token 上选门 / 房间尺度价值</text>
+  <text x="832" y="822" fill="#555">房间尺度 PPO，γ≈1；反事实分支教师</text>
+  <path d="M1348 560 L1130 560 L1130 760" stroke="#888" stroke-width="1.5" fill="none" stroke-dasharray="6 4" marker-end="url(#af)"/>
+
+  <!-- ===================== legend / numbers ===================== -->
+  <rect x="30" y="760" width="560" height="110" rx="8" fill="#fafafa" stroke="#ccc"/>
+  <text x="42" y="782" font-weight="700" fill="#222">参数与计算（每步，H20）</text>
+  <text x="42" y="802" fill="#333">空间侧 3.7M 参数，≈96 token × 4 层 ≈ 1.8 亿 FLOP/步（actor 的主要开销）</text>
+  <text x="42" y="820" fill="#333">时间侧 ≈3.3M 参数；actor 1 个查询对 ≤384 键 ≈ 400 万 FLOP/步（空间侧的 2%）</text>
+  <text x="42" y="838" fill="#333">K/V 缓存：384 × 256 × 2 × 4 层 × bf16 ≈ 1.5 MB / worker；64 worker ≈ 100 MB</text>
+  <text x="42" y="856" fill="#333">学习器：256 步的块 + 256 步不回传的上下文；估计每次更新 +0.3–0.5 s（现 2.0 s）</text>
+
+  <rect x="610" y="860" width="18" height="12" fill="#e8f0f8" stroke="#3b6ea5"/><text x="634" y="871" fill="#333">现有</text>
+  <rect x="690" y="860" width="18" height="12" fill="#fdf0e4" stroke="#d9742b" stroke-width="2"/><text x="714" y="871" fill="#333">新加（B27）</text>
+  <rect x="800" y="860" width="18" height="12" fill="#f3f3f3" stroke="#888" stroke-dasharray="4 3"/><text x="824" y="871" fill="#333">以后</text>
+</svg>
