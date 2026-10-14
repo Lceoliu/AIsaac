@@ -794,6 +794,29 @@ def main():
                         'abplus_probe_trim.py); 0: as before')
     p.add_argument('--graph-entities', type=int, default=32,
                    help='entity tokens of the CUDA-graph actor (0: eager inference); a second graph takes all 64')
+    p.add_argument('--actor-bf16', type=int, default=0,
+                   help='1 (B29): the actor graphs run the network under bfloat16 autocast (input mlps, heads, GRU, '
+                        'value_global and the sampling stay float32; NOT float32-equivalent, see EXPERIMENTS.md B29); '
+                        '0: float32 as before')
+    p.add_argument('--actor-compile', default='',
+                   help="B29: torch.compile mode of the actor graphs' network and sampling (e.g. "
+                        "max-autotune-no-cudagraphs or default; the compiled kernels captured in the graphs; float32 "
+                        "values up to summation order; compiling takes minutes at start); '': eager kernels as before")
+    p.add_argument('--actor-fold', type=int, default=0,
+                   help='1 (B29): the per-call work around the actor graphs moves inside them (uniforms, common random '
+                        'numbers, the GRU state gather / write-back; GraphActor fold): 4 enqueued operations per call '
+                        'instead of ~12 and only the entity rows the graph reads packed; other uniform draws (the same '
+                        'distribution); 0: as before')
+    p.add_argument('--actor-sdpa-math', type=int, default=0,
+                   help="1 (B29): the actor graphs' attention as PyTorch's math SDPA (matrix products under --tf32) "
+                        'instead of the float32 memory-efficient kernel; with --actor-compile the softmax fuses; '
+                        '0: as before')
+    p.add_argument('--actor-row-buckets', default='',
+                   help='B29 (needs --actor-fold 1): more batch sizes of the actor graphs, e.g. 16,32 (a call replays '
+                        "the smallest graph that holds its records instead of always --workers rows); '': as before")
+    p.add_argument('--graph-entities-extra', default='',
+                   help='B29: more entity-token sizes of the actor graphs, e.g. 16,40 (a call replays the smallest '
+                        "graph that holds its records' entities); '': --graph-entities and 64 as before")
     p.add_argument('--overlap', action='store_true',
                    help='collect the next rollout while the learner updates (one update of policy lag; see above)')
     p.add_argument('--recompute-values', default='auto', choices=('auto', 'on', 'off'),
@@ -1297,16 +1320,21 @@ def main():
             + f'; gates now {learner_model.gate_values()}', flush=True)
     # streams: the actor's calls go first on the GPU, the learner's kernels fill the rest. --actor-slots calls may be
     # in flight at once, each on its own stream (one GraphActor each)
-    actors = [GraphActor(model, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5), crn=bool(args.branch_crn),
-                         memory=mem_table)
+    gkw = dict(bf16=bool(args.actor_bf16), compile_mode=args.actor_compile or None, fold=bool(args.actor_fold),
+               sdpa_math=bool(args.actor_sdpa_math),
+               row_sizes=[int(x) for x in args.actor_row_buckets.split(',') if x.strip()] or None)   # (B29; off)
+    g_ents = sorted({args.graph_entities} | {int(x) for x in args.graph_entities_extra.split(',') if x.strip()})
+    g_ents = g_ents[0] if len(g_ents) == 1 else g_ents
+    actors = [GraphActor(model, n, g_ents, stream=torch.cuda.Stream(priority=-5), crn=bool(args.branch_crn),
+                         memory=mem_table, **gkw)
               for _ in range(max(1, args.actor_slots))] if use_graphs else []
     free = list(actors)
     # 2026-10-10 (teacher v2): the workers' lanes are answered by a GraphActor of their own (the actor's weights; the
     # lane records never enter the rollout); the eager path for what it cannot take
     v2_on = bool(args.teacher_v2) and getattr(sampler, 'lane_rows', None) is not None
     lane_table = torch.zeros((n, mem_dim), device=device) if (mem_on and v2_on) else None
-    lane_actor = GraphActor(model, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5), crn=False,
-                            memory=lane_table) if v2_on and use_graphs else None
+    lane_actor = GraphActor(model, n, g_ents, stream=torch.cuda.Stream(priority=-5), crn=False,
+                            memory=lane_table, **gkw) if v2_on and use_graphs else None
 
     def mem_rows(table, idx, reset):
         """(memory) the GRU states of workers idx from a table (zero where reset, a bool array, is set)."""
@@ -2473,8 +2501,8 @@ def main():
             e_s = dict(id=version if k_s == 0 else -1, model=m_s, actors=[],
                        params=list(m_s.parameters()) + list(m_s.buffers()))
             for _ in range(max(1, args.actor_slots)):   # (calls in flight per snapshot, as the actor's own)
-                g_s = GraphActor(m_s, n, args.graph_entities, stream=torch.cuda.Stream(priority=-5),
-                                 crn=bool(args.branch_crn), memory=mem_table)
+                g_s = GraphActor(m_s, n, g_ents, stream=torch.cuda.Stream(priority=-5),
+                                 crn=bool(args.branch_crn), memory=mem_table, **gkw)
                 g_s.snap, g_s.in_flight = e_s, False
                 e_s['actors'].append(g_s)
             snaps.append(e_s)

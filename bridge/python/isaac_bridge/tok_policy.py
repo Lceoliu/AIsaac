@@ -1445,7 +1445,26 @@ class GraphActor:
     it in self.vg (numpy [n]: the rollout stores it like the value, the learner's global returns bootstrap from it).
     """
 
-    def __init__(self, model, rows_max, entities=32, stream=None, crn=True, memory=None):
+    def __init__(self, model, rows_max, entities=32, stream=None, crn=True, memory=None, bf16=False, compile_mode=None,
+                 extra=None, fold=False, sdpa_math=False, row_sizes=None):
+        """bf16 (2026-10-14, B29; train_tok --actor-bf16): the network's forward under bfloat16 autocast inside the
+        graphs (the input mlps, the heads, the GRU and value_global stay float32 as in the learner's --amp bf16; the
+        sampling is float32). compile_mode (B29; --actor-compile): the forward and the sampling compiled with
+        torch.compile(mode=compile_mode, dynamic=False) and the compiled code captured in the graphs (fewer, fused
+        kernels; float32 values up to summation order). extra (B29, a measurement aid): a callable (b, model outputs,
+        h_in) -> tensor run inside the graphs after the network (its output stays on the device: self.extra_out, of the
+        last graph captured). entities (B29) may also be a sequence of entity-token sizes: one graph per size (and
+        ENT_CAP), a call replays the smallest that holds its records (fewer padded tokens; the same values).
+        fold (B29; --actor-fold): the per-call work around the replay moves into the graphs: the uniforms are drawn
+        inside (graph-safe RNG: the same distribution, other draws than without fold), the common random numbers, the
+        GRU states' gather from the table and their write-back too; the host packs each record's table row, reset and
+        common random numbers into a small control block sent with the records (two H2D copies, the replay, one D2H
+        copy: 4 enqueued operations instead of ~12). Rows past the call's records (the graphs' fixed batch) write the
+        state of the call's first record to its own row (the same value: no other worker's state is touched).
+        row_sizes (B29, needs fold; --actor-row-buckets): more batch sizes of the graphs (e.g. 16, 32): a call replays
+        the smallest graph that holds its records instead of always rows_max rows (the same values per record).
+        sdpa_math (B29, measurement aid): attention through PyTorch's math SDPA (matrix products under the process's
+        TF32 setting) instead of the float32 memory-efficient kernel. All default off: the graphs as before."""
         from .tok_obs import ENT_CAP
         dev = next(model.parameters()).device
         self.model, self.n, self.stream, self._n = model, rows_max, stream, 0
@@ -1495,42 +1514,97 @@ class GraphActor:
                                     dtype=torch.float32).pin_memory()
         self.out_np = self.out_host.numpy()
         self.done = torch.cuda.Event()
-        self.sizes = sorted({min(int(entities), ENT_CAP), ENT_CAP})
+        ents = [entities] if np.ndim(entities) == 0 else list(entities)
+        self.sizes = sorted({min(int(e), ENT_CAP) for e in ents} | {ENT_CAP})
         self.entities = self.sizes[0]
+        self.fold = bool(fold)
+        if row_sizes and not self.fold:
+            raise ValueError('GraphActor: row_sizes needs fold=True')
+        self.rsizes = sorted({min(int(r_), n) for r_ in (row_sizes or ())} | {n})
+        if self.fold:   # (B29) the control block per row: table row (int64), keep, dup, crn flag (float32), crn uniforms
+            H = sum(heads)
+            cw = -(-(20 + 4 * H) // 8) * 8
+            self.ctrl_stage = torch.zeros((n, cw), dtype=torch.uint8).pin_memory()
+            self.ctrl = torch.zeros((n, cw), dtype=torch.uint8, device=dev)
+            cs = self.ctrl_stage.numpy()
+            self.c_widx, self.c_keep, self.c_dup, self.c_cf = (cs[:, 0:8].view(np.int64)[:, 0], cs[:, 8:12].view(
+                np.float32)[:, 0], cs[:, 12:16].view(np.float32)[:, 0], cs[:, 16:20].view(np.float32)[:, 0])
+            self.c_cu = cs[:, 20:20 + 4 * H].view(np.float32)
+            self.c_dup[:] = 1.0
+            self.c_keep[:] = 1.0
+            # (the staging copy skips the entity rows a graph does not read: ROW 'ent' rows past its size; their bytes
+            # in the staging buffer and on the device are stale and never decoded)
+            dt_e, off_e = ROW.fields['ent'][:2]
+            self._ent_span = (off_e, dt_e.itemsize // dt_e.shape[0], off_e + dt_e.itemsize)
 
-        def run(tokens):
-            b = decode_rows(self.raw, entities=tokens, n_heads=nh)
-            kw = dict(need_vg=True) if self.vg_on else {}   # (B24: value_global appended last)
-            if self.mem:   # (memory: the state's input from self.h_in, the new state kept for the write-back)
-                outs = model(b, tokens, need_h=self.choice, mem=self.h_in, **kw)
-                logits, value, h, self._h_last = (outs[0], outs[1], outs[3] if self.choice else None,
-                                                  outs[-2] if self.vg_on else outs[-1])
-            elif self.choice:
-                outs = model(b, tokens, need_h=True, **kw)
-                logits, value, h = outs[0], outs[1], outs[3]
-            else:
-                outs = model(b, tokens, **kw)
-                logits, value = outs[0], outs[1]
+        mem_on, choice_on, vg_on = bool(self.mem), self.choice, self.vg_on
+
+        def core(b, u, h_in, tokens):
+            """The network and the sampling on decoded records b: (output columns [n, k], the new GRU state or None)."""
+            kw = dict(need_vg=True) if vg_on else {}   # (B24: value_global appended last)
+            h_last = None
+            with (torch.autocast('cuda', dtype=torch.bfloat16) if bf16 else contextlib.nullcontext()), \
+                    (_sdpa_math() if sdpa_math else contextlib.nullcontext()):
+                if mem_on:   # (memory: the state's input from h_in, the new state kept for the write-back)
+                    outs = model(b, tokens, need_h=choice_on, mem=h_in, **kw)
+                    logits, value, h, h_last = (outs[0], outs[1], outs[3] if choice_on else None,
+                                                outs[-2] if vg_on else outs[-1])
+                elif choice_on:
+                    outs = model(b, tokens, need_h=True, **kw)
+                    logits, value, h = outs[0], outs[1], outs[3]
+                else:
+                    outs = model(b, tokens, **kw)
+                    logits, value = outs[0], outs[1]
             actions, logp, at = [], 0.0, 0
             for head in model.split(logits.float(), model.gate(b)):
                 k = head.shape[1]
                 logs = F.log_softmax(head, -1)
-                gumbel = -torch.log(-torch.log(self.u[:, at:at + k].clamp(1e-10, 1 - 1e-7)))
+                gumbel = -torch.log(-torch.log(u[:, at:at + k].clamp(1e-10, 1 - 1e-7)))
                 a = torch.argmax(logs + gumbel, -1)
                 actions.append(a)
                 logp = logp + logs.gather(-1, a[:, None])[:, 0]
                 at += k
             cols = [torch.stack(actions, 1).float(), logp[:, None], value.float()[:, None]]
-            if self.choice:
+            if choice_on:
                 item, has = ChoiceHeads.nearest_pedestal(b)
                 d = model.choice.take_minus_skip(h.float(), item).float()
                 keep = has.float()[:, None]
                 cols += [d.mean(1, keepdim=True) * keep, d.std(1, keepdim=True) * keep]
-            if self.mem:   # (memory: each record's input state, for the rollout)
-                cols.append(self.h_in)
-            if self.vg_on:   # (B24) value_global
+            if mem_on:   # (memory: each record's input state, for the rollout)
+                cols.append(h_in)
+            if vg_on:   # (B24) value_global
                 cols.append(outs[-1].float()[:, None])
-            return torch.cat(cols, 1)
+            ex = extra(b, outs, h_in) if extra is not None else None   # (B29 measurement aid: stays on the device)
+            return torch.cat(cols, 1), h_last, ex
+
+        if compile_mode:   # (every actor, graph size and model is a recompile of core: above dynamo's default limit
+            # of 8 the calls would silently run uncompiled)
+            import torch._dynamo as _dynamo
+            dcfg = _dynamo.config
+            for name_, v_ in (('recompile_limit', 256), ('cache_size_limit', 256), ('accumulated_recompile_limit', 4096),
+                              ('accumulated_cache_size_limit', 4096)):
+                if hasattr(dcfg, name_):
+                    setattr(dcfg, name_, max(int(getattr(dcfg, name_)), v_))
+        fn = core if not compile_mode else torch.compile(core, mode=compile_mode, dynamic=False)
+
+        def run(tokens, r=None):
+            if not self.fold:
+                b = decode_rows(self.raw, entities=tokens, n_heads=nh)
+                out, self._h_last, self.extra_out = fn(b, self.u, self.h_in if self.mem else None, tokens)
+                return out
+            b = decode_rows(self.raw[:r], entities=tokens, n_heads=nh)
+            c = self.ctrl[:r]   # (B29 fold: the control block decoded on the device, the per-call work inside the graph)
+            widx, keep, dup, cf = (c[:, 0:8].view(torch.int64)[:, 0], c[:, 8:12].view(torch.float32)[:, 0],
+                                   c[:, 12:16].view(torch.float32)[:, 0], c[:, 16:20].view(torch.float32)[:, 0])
+            ur = self.u[:r]
+            ur.uniform_()
+            u = torch.where(cf[:, None] > 0, c[:, 20:20 + 4 * self.u.shape[1]].view(torch.float32), ur)
+            h_in = self.table.index_select(0, widx) * keep[:, None] if self.mem else None
+            out, h_last, self.extra_out = fn(b, u, h_in, tokens)
+            if self.mem:
+                self.table.index_copy_(0, widx, torch.where(dup[:, None] > 0, h_last[0:1], h_last))
+            self._h_last = h_last
+            return out
 
         self.graphs, self.outs = [], []
         pool = None
@@ -1540,13 +1614,13 @@ class GraphActor:
         # split-K products: the value head's output (seen as wrong stored values in about 9% of the decisions)
         capture = torch.cuda.Stream()
         with torch.inference_mode():
-            for tokens in self.sizes:
+            for tokens, r in [(t_, r_) for r_ in self.rsizes for t_ in self.sizes]:   # (graph index: r x sizes + t)
                 for _ in range(3):   # allocations and algorithm choices happen before the capture
-                    run(tokens)
+                    run(tokens, r)
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, pool=pool, stream=capture):   # never replayed at once: one memory pool
-                    out = run(tokens)
+                    out = run(tokens, r)
                 pool = graph.pool()
                 self.graphs.append(graph)
                 self.outs.append(out)
@@ -1561,11 +1635,14 @@ class GraphActor:
         n = len(rows)
         if n > self.n:
             return False
+        if self.fold:
+            return self._submit_fold(rows, pending, widx, reset)
         if self.mem:
             self.widx_np[:n] = widx
             self.keep_np[:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
         most = int(rows['n_ent'].max())
-        g = 0 if most <= self.sizes[0] else len(self.sizes) - 1
+        g = 0 if most <= self.sizes[0] else (len(self.sizes) - 1 if len(self.sizes) == 2 else
+                                             int(np.searchsorted(self.sizes, most)))
         self.stage_np[:n, :ROW_BYTES] = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
         self.stage_np[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * self.nh)
         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
@@ -1598,6 +1675,50 @@ class GraphActor:
         self._n = n
         return True
 
+    def _submit_fold(self, rows, pending, widx, reset):
+        """submit() with fold (B29): records + control block in, the replay, the outputs out."""
+        g = self._pack_fold(rows, pending, widx, reset)
+        n = len(rows)
+        r = self.rsizes[int(np.searchsorted(self.rsizes, n))]
+        g += self.rsizes.index(r) * len(self.sizes)
+        stream = self.stream if self.stream is not None else torch.cuda.current_stream()
+        with torch.cuda.stream(stream):
+            self.raw[:n].copy_(self.stage[:n], non_blocking=True)
+            self.ctrl[:r].copy_(self.ctrl_stage[:r], non_blocking=True)
+            with torch.inference_mode():   # (the graphs draw uniforms: replay advances the RNG state they captured,
+                self.graphs[g].replay()    # an inference tensor since the capture ran in inference mode)
+            self.out_host[:n].copy_(self.outs[g][:n], non_blocking=True)
+            self.done.record()
+        self._n = n
+        return True
+
+    def _pack_fold(self, rows, pending, widx, reset):
+        """(fold) The records and the control block into the pinned staging buffers; returns the graph to replay."""
+        n = len(rows)
+        most = int(rows['n_ent'].max())
+        g = int(np.searchsorted(self.sizes, most))
+        src = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
+        off_e, per_e, end_e = self._ent_span
+        cut = off_e + per_e * self.sizes[g]
+        self.stage_np[:n, :cut] = src[:, :cut]
+        self.stage_np[:n, end_e:ROW_BYTES] = src[:, end_e:]
+        self.stage_np[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * self.nh)
+        if self.mem:
+            self.c_widx[:n] = widx
+            self.c_widx[n:] = widx[0]
+            self.c_keep[:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
+        self.c_dup[:n] = 0.0
+        self.c_dup[n:] = 1.0
+        self.c_cf[:] = 0.0
+        if self.crn and 'crn' in rows.dtype.names:
+            crn = rows['crn']
+            if crn.any():
+                sel = np.flatnonzero(crn)
+                self.c_cu[sel] = crn_uniforms(crn[sel], rows['t'][sel], self.u.shape[1])
+                self.c_cf[sel] = 1.0
+                self.crn_rows += len(sel)
+        return g
+
     def result(self):
         """(actions [n, heads] int64, log-probabilities [n], values [n]) of the submitted call, as numpy arrays."""
         self.done.synchronize()
@@ -1612,6 +1733,12 @@ class GraphActor:
     def act(self, rows, pending, widx=None, reset=None):
         """submit + result: (actions, log-probabilities, values), or None if it does not fit."""
         return self.result() if self.submit(rows, pending, widx, reset) else None
+
+
+def _sdpa_math():
+    """(B29) scaled_dot_product_attention through PyTorch's math backend inside the context."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    return sdpa_kernel(SDPBackend.MATH)
 
 
 def memory_chunks(length, mask, T):
