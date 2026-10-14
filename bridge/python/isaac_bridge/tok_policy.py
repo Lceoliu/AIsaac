@@ -91,6 +91,22 @@ a table of its own (IT_COLL = 32): one representation of a collectible whether i
 table is not registered a second time (one parameter, one state-dict key). A B21 checkpoint is converted by
 share_item_table (its own table dropped, the item-token mlp's first Linear keeps its 44 other columns and gets fresh
 collectible columns); off: the B21 module, bit for bit (tests/test_pickup_smoke.py).
+
+Fused extra tokens and item slots (2026-10-14, B24; TokPolicy(item_tokens_fused=True), config key 'item_tokens_fused';
+TokPolicy(item_slots=N), config key 'item_slots' when N != INV_CAP; both need item / global tokens). The separate gated
+terms above cost an extra attention per layer over a padded copy of every record's q / k / v (the learner: 2.25 x the
+time of an update without them, C94). Fused (_forward_fused): the N + 4 item tokens and the global token are appended to
+the old tokens and every block runs ONE attention over all of them (one softmax; the same LayerNorm, q / k / v
+projections, output projection and feed-forward as every token); absent items are masked keys like absent entities.
+The per-layer gates stay as multipliers of the item / global tokens' value vectors (Block vscale; 1 at a fresh start).
+The heads read the player token; value_global (and with memory mem_in) the global token. The learner's packed layouts
+treat the present item tokens like entities (ItemTokens(compact=True) moves them to the front, item_count() gives
+their number on the host, packed_index / learner_plan / plan_tokens take it): no padded copies, no cross terms.
+item_slots N: the newest N held collectibles get tokens (slot embeddings 0 .. N-1 of the INV_CAP table: the parameters
+keep their shapes). A B21 / B22 / B23 checkpoint loads into a fused model with every tensor as saved (the same names and
+shapes, so Adam's state too; convert_to_fused): the gates keep their values as value multipliers. That is NOT the same
+function (one softmax cannot reproduce softmax_old + gate x softmax_items: the extra keys take attention mass from the
+old ones), so the outputs change at the switch; tests/test_fused_tokens_smoke.py (c) measures by how much.
 """
 import contextlib
 import os
@@ -344,9 +360,13 @@ class Block(nn.Module):
         self.math = False      # 2026-10-10 (B18): attention() as _MathAttention (TokPolicy.set_math_attention)
         self.ln_fast = False   # (B18) the packed layer norms as _LayerNorm
 
-    def forward(self, x, bias, ext=None):
+    def forward(self, x, bias, ext=None, vscale=None):
+        """vscale (B24 fused): [t] multipliers of the tokens' value vectors (1 for the old tokens, the item / global
+        gates for the extra ones); None: unscaled (as before)."""
         b, t, d = x.shape
         q, k, v = self.qkv(self.n1(x)).view(b, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
+        if vscale is not None:
+            v = v * vscale.to(v.dtype).view(1, 1, t, 1)
         a = attention(q, k, v, bias, self.math)
         if ext is not None:   # 2026-10-12 (B21 / B22): the gated terms of the extra tokens (module docstring)
             a = a + self._ext(q, k, v, bias, ext)
@@ -390,7 +410,7 @@ class Block(nn.Module):
         add = self._ext(q, k, v, ext['pbias'], ext)
         return add.transpose(1, 2).reshape(n * t, d).index_select(0, keep)
 
-    def forward_packed(self, x, bias, keep, shape, ext=None):
+    def forward_packed(self, x, bias, keep, shape, ext=None, vscale=None):
         """forward() on the real tokens only: x [m, d] holds the tokens at the flat positions `keep` of a [b, t]
         layout (shape (b, t)). The per-token parts (layer norms, qkv, projection, feed-forward) run on the m real
         tokens; attention runs in the padded layout with the same mask (padded keys get weight exactly 0, padded
@@ -401,6 +421,8 @@ class Block(nn.Module):
         exactly 0 either way) on far fewer padded positions; its cost grows with t^2 and jumps past 64 tokens."""
         m, d = x.shape
         qkv = self.qkv(layer_norm(self.n1, x, self.ln_fast))
+        if vscale is not None:   # (B24 fused: [m] multipliers of the real tokens' value vectors)
+            qkv = torch.cat([qkv[:, :2 * d], qkv[:, 2 * d:] * vscale.to(qkv.dtype)[:, None]], 1)
         if isinstance(shape, dict):   # 2026-10-10 (B18): attention per length bucket (learner_plan)
             gpos = shape['gpos']
             full = qkv.new_zeros((shape['total'], 3 * d)).index_copy(0, gpos, qkv)
@@ -488,8 +510,12 @@ class ItemTokens(nn.Module):
     pedestals' ids and the multi-hot), passed in and not registered here (one parameter, one state-dict key
     'item_emb.weight'); the mlp's first Linear then reads ITEM_EMB collectible columns instead of IT_COLL."""
 
-    def __init__(self, width, layers, coll=None):
+    def __init__(self, width, layers, coll=None, slots=INV_CAP, fused=False):
         super().__init__()
+        if not 1 <= int(slots) <= INV_CAP:
+            raise ValueError(f'ItemTokens: slots must be in 1 .. {INV_CAP}, not {slots}')
+        self.slots = int(slots)            # B24: held-collectible token slots (newest first; INV_CAP = as before)
+        self.n_tok = self.slots + 4        # + the active item, two trinkets, the pocket
         self.shared = coll is not None
         if self.shared:   # (not a submodule: nn.Module.__setattr__ would register it a second time)
             self.__dict__['_shared_coll'] = coll
@@ -505,7 +531,8 @@ class ItemTokens(nn.Module):
         self.kind = nn.Embedding(4, width)         # held, active, trinket, pocket
         nn.init.normal_(self.slot.weight, std=0.02)
         nn.init.normal_(self.kind.weight, std=0.02)
-        self.gate = nn.Parameter(torch.zeros(layers))
+        # (B24 fused: the per-layer multipliers of the item tokens' value vectors, 1 = ordinary tokens at the start)
+        self.gate = nn.Parameter(torch.ones(layers) if fused else torch.zeros(layers))
 
     @property
     def coll(self):
@@ -513,18 +540,24 @@ class ItemTokens(nn.Module):
         own = self._modules.get('coll')
         return own if own is not None else self.__dict__['_shared_coll']
 
-    def forward(self, b):
-        """(tokens [n, N_ITEM_TOK, width], present [n, N_ITEM_TOK] bool). No host synchronisation, static shapes."""
-        inv, pit, pinv = b['inv'].long(), b['pitem'].long(), b['pinv'].float()
-        n = inv.shape[0]
+    def forward(self, b, compact=False):
+        """(tokens [n, n_tok, width], present [n, n_tok] bool). No host synchronisation, static shapes. n_tok =
+        N_ITEM_TOK unless slots (B24 --item-slots) keeps fewer held collectibles (the newest ones: ROW 'inv' is newest
+        first). compact (B24 fused): the present tokens moved to the front of each record, in their order (the absent
+        ones after them; the attention does not depend on the order of its keys): the real item tokens are the first
+        item_count() of a record, as the real entities are the first n_ent (the packed layouts plan them from that
+        count on the host)."""
+        inv = b['inv'] if self.slots == INV_CAP else b['inv'][:, :self.slots]
+        inv, pit, pinv = inv.long(), b['pitem'].long(), b['pinv'].float()
+        n, S = inv.shape[0], inv.shape[1]
         hid, cnt = inv[..., 0].clamp(0, N_COLLECTIBLE - 1), inv[..., 1]
         coll, dc = self.coll, self.dc
 
         def zf(k, w):
             return pinv.new_zeros((n, k, w))
         cf = cnt.float()[..., None]
-        held = torch.cat([coll(hid), zf(INV_CAP, IT_TRINKET + 3 * IT_POCKET), cf, (cf > 1).float(),
-                          zf(INV_CAP, 2)], -1)
+        held = torch.cat([coll(hid), zf(S, IT_TRINKET + 3 * IT_POCKET), cf, (cf > 1).float(),
+                          zf(S, 2)], -1)
         active = torch.cat([coll(pit[:, 0].clamp(0, N_COLLECTIBLE - 1))[:, None],
                             zf(1, IT_TRINKET + 3 * IT_POCKET + 2), pinv[:, None, 0:2]], -1)
         trink = torch.cat([zf(2, dc), self.trinket(pit[:, 1:3].clamp(0, N_TRINKET - 1)),
@@ -534,10 +567,27 @@ class ItemTokens(nn.Module):
                             self.card(pit[:, 5].clamp(0, N_CARD - 1))[:, None], zf(1, 4)], -1)
         x = embed(self.mlp, torch.cat([held, active, trink, pocket], 1))
         kw = self.kind.weight   # (slices, no index tensors: nothing is copied from the host inside a CUDA graph)
-        pos = torch.cat([self.slot.weight + kw[0:1], kw[1:2], kw[2:3], kw[2:3], kw[3:4]])
+        sw = self.slot.weight if S == INV_CAP else self.slot.weight[:S]
+        pos = torch.cat([sw + kw[0:1], kw[1:2], kw[2:3], kw[2:3], kw[3:4]])
         present = torch.cat([(hid > 0) & (cnt > 0), pit[:, 0:1] > 0, pit[:, 1:3] > 0,
                              ((pit[:, 3] > 0) | (pit[:, 5] > 0))[:, None]], 1)
-        return x + pos, present
+        if not compact:
+            return x + pos, present
+        # (B24) rank of each token: present ones 0 .. c-1 in order, absent ones c .. n_tok-1 (a permutation per record)
+        c = present.long()
+        rank = torch.where(present, c.cumsum(1) - 1, c.sum(1, keepdim=True) + (1 - c).cumsum(1) - 1)
+        y = x + pos
+        y = torch.zeros_like(y).scatter(1, rank[..., None].expand(-1, -1, y.shape[-1]), y)
+        return y, torch.arange(present.shape[1], device=present.device)[None] < c.sum(1, keepdim=True)
+
+
+def item_count(rows, slots=INV_CAP):
+    """(B24) The present item tokens of ROW records (numpy, host): ItemTokens' present mask summed per record (held
+    collectibles among the first `slots` of 'inv', the active item, two trinkets, the pocket). int64 [n]."""
+    inv, pit = rows['inv'][:, :slots], rows['pitem']
+    held = ((inv[..., 0] > 0) & (inv[..., 1] > 0)).sum(1)
+    pocket = (pit[:, 3] > 0) | (pit[:, 5] > 0)
+    return (held + (pit[:, 0] > 0) + (pit[:, 1] > 0) + (pit[:, 2] > 0) + pocket).astype(np.int64)
 
 
 class GlobalToken(nn.Module):
@@ -545,11 +595,11 @@ class GlobalToken(nn.Module):
     tokens (zero at the start), the second value head value_global on it (own norm) and, with memory, mem_in (zero at
     the start: the GRU's input is z + mem_in(norm(global token)))."""
 
-    def __init__(self, width, layers, memory=0):
+    def __init__(self, width, layers, memory=0, fused=False):
         super().__init__()
         self.tok = nn.Parameter(torch.zeros(width))
         nn.init.normal_(self.tok, std=0.02)
-        self.gate = nn.Parameter(torch.zeros(layers))
+        self.gate = nn.Parameter(torch.ones(layers) if fused else torch.zeros(layers))   # (B24 fused: as ItemTokens)
         self.norm = nn.LayerNorm(width)
         self.value = mlp(width, width, 1)
         self.mem_in = nn.Linear(width, width) if memory else None
@@ -560,8 +610,13 @@ class GlobalToken(nn.Module):
 
 class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
-                 memory=0, item_tokens=False, global_token=False, item_shared=False):
+                 memory=0, item_tokens=False, global_token=False, item_shared=False, item_tokens_fused=False,
+                 item_slots=INV_CAP):
         super().__init__()
+        if item_tokens_fused and not (item_tokens or global_token):
+            raise ValueError('TokPolicy: item_tokens_fused needs item_tokens or global_token (B24)')
+        if int(item_slots) != INV_CAP and not item_tokens:
+            raise ValueError('TokPolicy: item_slots needs item_tokens=True (B24)')
         if item_tokens and not items:
             raise ValueError('TokPolicy: item_tokens needs items=True (ROW inv / pitem / pinv)')
         if item_shared and not item_tokens:
@@ -646,9 +701,16 @@ class TokPolicy(nn.Module):
         self.item_shared = bool(item_shared)
         if self.item_shared:
             self.config['item_shared'] = True
-        self.itok = ItemTokens(width, layers, coll=self.item_emb if self.item_shared else None) \
-            if self.item_tokens else None
-        self.gtok = GlobalToken(width, layers, self.memory) if self.global_token else None
+        # 2026-10-14 (B24): the item / global tokens as ordinary tokens of the one attention (_forward_fused), and the
+        # number of held-collectible token slots (the keys only when set; the same parameters, names and shapes)
+        self.fused = bool(item_tokens_fused)
+        if self.fused:
+            self.config['item_tokens_fused'] = True
+        if self.item_tokens and int(item_slots) != INV_CAP:
+            self.config['item_slots'] = int(item_slots)
+        self.itok = ItemTokens(width, layers, coll=self.item_emb if self.item_shared else None, slots=int(item_slots),
+                               fused=self.fused) if self.item_tokens else None
+        self.gtok = GlobalToken(width, layers, self.memory, fused=self.fused) if self.global_token else None
 
     def gate_values(self):
         """(B21 / B22) {'item_gate': mean |gate| over the layers, 'global_gate': ...} of the options that are on."""
@@ -672,7 +734,7 @@ class TokPolicy(nn.Module):
             tok, present = self.itok(b)
             toks.append(tok)
             masks.append(present)
-            cross.append((0, N_ITEM_TOK, self.itok.gate, present.any(1)[:, None, None, None]))
+            cross.append((0, self.itok.n_tok, self.itok.gate, present.any(1)[:, None, None, None]))
         glob = None
         if self.gtok is not None:
             glob = sum(t_.shape[1] for t_ in toks)
@@ -715,7 +777,59 @@ class TokPolicy(nn.Module):
         h_new). The extra tokens of B21 / B22 (module docstring) need nothing from the caller."""
         if need_vg and self.gtok is None:
             raise ValueError('TokPolicy.forward: need_vg needs a global-token model (global_token=True)')
+        if self.fused:   # 2026-10-14 (B24): one attention over the old and the extra tokens
+            return self._forward_fused(b, entities, packed, need_h, mem, need_vg)
         ext = self._ext_tokens(b)   # (B21 / B22; None when off: the code below is the one before)
+        n, used, fast, player, room, level, entity = self._embed_old(b, entities, packed)
+        if fast:   # (B18) the door mlp on the real doors only; the real tokens grouped by kind, then in packed order
+            door = embed(self.door, b['doors'].reshape(n * DOOR_CAP, -1).index_select(0, b['dkeep'])) + self.kind[2]
+            xp = torch.cat([player, room, level, door, entity]).index_select(0, b['xperm'])
+            if ext is not None:   # (B21 / B22: the padded layout of the extra attention)
+                t_ = 3 + DOOR_CAP + used
+                real_ = torch.zeros(n * t_, dtype=torch.bool, device=xp.device).index_fill_(0, b['keep'], True)
+                ext.update(n=n, t=t_, keep=b['keep'], pbias=torch.zeros(
+                    (n, 1, 1, t_), device=xp.device, dtype=xp.dtype).masked_fill(~real_.view(n, 1, 1, t_), -1e9))
+            x0 = self._blocks_bucketed(xp, b, ext).index_select(0, b['starts'])
+            return self._heads(x0, need_h, mem, self._yg(ext), need_vg)
+        door = embed(self.door, b['doors']) + self.kind[2]
+        x = torch.cat([player[:, None], room[:, None], level[:, None], door, entity], 1)
+        dev = x.device
+        pad = torch.cat([torch.zeros((n, 3), dtype=torch.bool, device=dev),
+                         torch.arange(DOOR_CAP, device=dev)[None] >= b['n_doors'][:, None],
+                         torch.arange(used, device=dev)[None] >= b['n_ent'][:, None]], 1)
+        bias = torch.zeros((n, 1, 1, x.shape[1]), device=dev, dtype=x.dtype).masked_fill(pad[:, None, None], -1e9)
+        if packed:
+            t = x.shape[1]
+            if 'keep' in b:   # the real tokens' positions computed on the host (packed_index: no wait for the GPU)
+                keep, starts = b['keep'], b['starts']
+            else:
+                real = ~pad
+                keep = real.reshape(-1).nonzero().squeeze(1)
+                counts = real.sum(1)
+                starts = counts.cumsum(0) - counts
+            xp = x.reshape(n * t, -1).index_select(0, keep)
+            if ext is not None:   # (B21 / B22: the padded layout of the extra attention)
+                ext.update(n=n, t=t, keep=keep, pbias=bias)
+            if 'buckets' in b:   # 2026-10-10 (B18): attention per length bucket (learner_plan, from the host)
+                xp = self._blocks_bucketed(xp, b, ext)
+            else:
+                for l_, block in enumerate(self.blocks):
+                    if ext is not None:
+                        ext['l'] = l_
+                    xp = block.forward_packed(xp, bias, keep, (n, t), ext)
+            x0 = xp.index_select(0, starts)   # the player's token: the first of each record
+        else:
+            for l_, block in enumerate(self.blocks):
+                if ext is not None:
+                    ext['l'] = l_
+                x = block(x, bias, ext)
+            x0 = x[:, 0]
+        return self._heads(x0, need_h, mem, self._yg(ext), need_vg)
+
+    def _embed_old(self, b, entities, packed):
+        """forward()'s token embeddings of the old tokens (player, room, map, entities; the doors are the
+        caller's): (n, entity tokens used, fast, player [n, d], room, level, entity: [n, used, d], or with the B18
+        fast path the real entities [m_e, d])."""
         n = b['player'].shape[0]
         used = entities or b['ent'].shape[1]
         ids = b['ent_id'][:, :used]
@@ -766,50 +880,85 @@ class TokPolicy(nn.Module):
             player = embed(self.player, torch.cat(parts, -1)) + self.kind[0]
         room = self._cnn(self.room, b, 'grid') + self.kind[1]
         level = self._cnn(self.map, b, 'map') + self.kind[4]
-        if fast:   # (B18) the door mlp on the real doors only; the real tokens grouped by kind, then in packed order
+        return n, used, fast, player, room, level, entity
+
+    def extra_tokens(self):
+        """(B24) (item tokens per record, global tokens per record) of the fused layout ((0, 0) when not fused)."""
+        if not self.fused:
+            return 0, 0
+        return (self.itok.n_tok if self.itok is not None else 0), (1 if self.gtok is not None else 0)
+
+    def _vtable(self):
+        """(B24 fused) [layers, 3] value multipliers per token group: old tokens (1), item tokens (itok.gate), the
+        global token (gtok.gate)."""
+        one = self.kind.new_ones(len(self.blocks))
+        return torch.stack([one, self.itok.gate if self.itok is not None else one,
+                            self.gtok.gate if self.gtok is not None else one], 1)
+
+    def _forward_fused(self, b, entities, packed, need_h, mem, need_vg):
+        """forward() of a B24 model (item_tokens_fused): the item tokens (ItemTokens, compacted: the present ones first)
+        and the global token are appended to the old tokens, [player, room, map, doors, entities, items, global], and
+        every block runs ONE attention over all of them (one softmax, the same q / k / v projections; absent items
+        are masked keys like absent entities); the gates multiply the value vectors of the item / global tokens
+        (Block vscale). The heads read the player token, value_global (and with memory mem_in) the global token.
+        Packed layouts (the learner): the real item tokens are the first item_count() of a record, the global token is
+        each record's last real token; host plans (packed_index / learner_plan with n_item) include them."""
+        NI, G = self.extra_tokens()
+        n, used, fast, player, room, level, entity = self._embed_old(b, entities, packed)
+        vt = self._vtable()
+        if NI:
+            itok, ipres = self.itok(b, compact=True)
+        if fast:   # (B18 fast path: learner_plan / plan_tokens with n_item; the real tokens grouped by kind)
             door = embed(self.door, b['doors'].reshape(n * DOOR_CAP, -1).index_select(0, b['dkeep'])) + self.kind[2]
-            xp = torch.cat([player, room, level, door, entity]).index_select(0, b['xperm'])
-            if ext is not None:   # (B21 / B22: the padded layout of the extra attention)
-                t_ = 3 + DOOR_CAP + used
-                real_ = torch.zeros(n * t_, dtype=torch.bool, device=xp.device).index_fill_(0, b['keep'], True)
-                ext.update(n=n, t=t_, keep=b['keep'], pbias=torch.zeros(
-                    (n, 1, 1, t_), device=xp.device, dtype=xp.dtype).masked_fill(~real_.view(n, 1, 1, t_), -1e9))
-            x0 = self._blocks_bucketed(xp, b, ext).index_select(0, b['starts'])
-            return self._heads(x0, need_h, mem, self._yg(ext), need_vg)
+            src = [player, room, level, door, entity]
+            if NI:
+                src.append(itok.reshape(n * NI, -1).index_select(0, b['ikeep']))
+            if G:
+                src.append(self.gtok.tok.view(1, -1).expand(n, -1))
+            xp = self._blocks_bucketed(torch.cat(src).index_select(0, b['xperm']), b, vgroup=(b['tgroup'], vt))
+            return self._heads(xp.index_select(0, b['starts']), need_h, mem,
+                               xp.index_select(0, b['glast']) if G else None, need_vg)
         door = embed(self.door, b['doors']) + self.kind[2]
-        x = torch.cat([player[:, None], room[:, None], level[:, None], door, entity], 1)
-        dev = x.device
-        pad = torch.cat([torch.zeros((n, 3), dtype=torch.bool, device=dev),
-                         torch.arange(DOOR_CAP, device=dev)[None] >= b['n_doors'][:, None],
-                         torch.arange(used, device=dev)[None] >= b['n_ent'][:, None]], 1)
-        bias = torch.zeros((n, 1, 1, x.shape[1]), device=dev, dtype=x.dtype).masked_fill(pad[:, None, None], -1e9)
+        dev = player.device
+        toks = [player[:, None], room[:, None], level[:, None], door, entity]
+        pads = [torch.zeros((n, 3), dtype=torch.bool, device=dev),
+                torch.arange(DOOR_CAP, device=dev)[None] >= b['n_doors'][:, None],
+                torch.arange(used, device=dev)[None] >= b['n_ent'][:, None]]
+        if NI:
+            toks.append(itok)
+            pads.append(~ipres)
+        if G:
+            toks.append(self.gtok.tok.view(1, 1, -1).expand(n, 1, -1))
+            pads.append(torch.zeros((n, 1), dtype=torch.bool, device=dev))
+        x = torch.cat(toks, 1)
+        pad = torch.cat(pads, 1)
+        t = x.shape[1]
+        group = torch.cat([torch.zeros(t - NI - G, dtype=torch.int64, device=dev),
+                           torch.ones(NI, dtype=torch.int64, device=dev),
+                           torch.full((G,), 2, dtype=torch.int64, device=dev)])
+        bias = torch.zeros((n, 1, 1, t), device=dev, dtype=x.dtype).masked_fill(pad[:, None, None], -1e9)
         if packed:
-            t = x.shape[1]
-            if 'keep' in b:   # the real tokens' positions computed on the host (packed_index: no wait for the GPU)
+            if 'keep' in b:   # (host plan: packed_index with n_item)
                 keep, starts = b['keep'], b['starts']
+                last = torch.cat([starts[1:], starts.new_full((1,), keep.shape[0])]) - 1
             else:
                 real = ~pad
                 keep = real.reshape(-1).nonzero().squeeze(1)
                 counts = real.sum(1)
                 starts = counts.cumsum(0) - counts
+                last = starts + counts - 1
             xp = x.reshape(n * t, -1).index_select(0, keep)
-            if ext is not None:   # (B21 / B22: the padded layout of the extra attention)
-                ext.update(n=n, t=t, keep=keep, pbias=bias)
-            if 'buckets' in b:   # 2026-10-10 (B18): attention per length bucket (learner_plan, from the host)
-                xp = self._blocks_bucketed(xp, b, ext)
+            tg = group.index_select(0, keep.remainder(t))
+            if 'buckets' in b:
+                xp = self._blocks_bucketed(xp, b, vgroup=(tg, vt))
             else:
                 for l_, block in enumerate(self.blocks):
-                    if ext is not None:
-                        ext['l'] = l_
-                    xp = block.forward_packed(xp, bias, keep, (n, t), ext)
-            x0 = xp.index_select(0, starts)   # the player's token: the first of each record
-        else:
-            for l_, block in enumerate(self.blocks):
-                if ext is not None:
-                    ext['l'] = l_
-                x = block(x, bias, ext)
-            x0 = x[:, 0]
-        return self._heads(x0, need_h, mem, self._yg(ext), need_vg)
+                    xp = block.forward_packed(xp, bias, keep, (n, t), vscale=vt[l_].index_select(0, tg))
+            return self._heads(xp.index_select(0, starts), need_h, mem, xp.index_select(0, last) if G else None,
+                               need_vg)
+        for l_, block in enumerate(self.blocks):
+            x = block(x, bias, vscale=vt[l_].index_select(0, group))
+        return self._heads(x[:, 0], need_h, mem, x[:, -1] if G else None, need_vg)
 
     @staticmethod
     def _yg(ext):
@@ -825,9 +974,10 @@ class TokPolicy(nn.Module):
             return seq(self._conv_in(b[key]))
         return seq(self._conv_in(b[key].index_select(0, u))).index_select(0, b[key + '_i'])
 
-    def _blocks_bucketed(self, xp, b, ext=None):
+    def _blocks_bucketed(self, xp, b, ext=None, vgroup=None):
         """(B18) the blocks on the packed tokens xp with attention per length bucket (learner_plan's gpos, buckets).
-        ext (B21 / B22): the extra tokens (forward's, with n, t, keep, pbias of the padded layout)."""
+        ext (B21 / B22): the extra tokens (forward's, with n, t, keep, pbias of the padded layout). vgroup (B24 fused):
+        (each packed token's group [m] (0 old, 1 item, 2 global), _vtable()): the value multipliers per layer."""
         dev = xp.device
         ar = torch.arange(max(w_ for _, w_ in b['buckets']), device=dev)
         shape = dict(gpos=b['gpos'], total=sum(len(c_) * w_ for c_, w_ in b['buckets']), buckets=[
@@ -836,7 +986,10 @@ class TokPolicy(nn.Module):
         for l_, block in enumerate(self.blocks):
             if ext is not None:
                 ext['l'] = l_
-            xp = block.forward_packed(xp, None, None, shape, ext)
+            if vgroup is not None:
+                xp = block.forward_packed(xp, None, None, shape, vscale=vgroup[1][l_].index_select(0, vgroup[0]))
+            else:
+                xp = block.forward_packed(xp, None, None, shape, ext)
         return xp
 
     def _value_global(self, yg, h_new=None):
@@ -933,16 +1086,20 @@ class TokPolicy(nn.Module):
                 out[j] = torch.stack([h[:, 0], h[:, 1].masked_fill(~gate[:, i], -1e9)], -1)
         return out
 
-    def act(self, b, greedy=False, entities=None, u=None, mem=None):
+    def act(self, b, greedy=False, entities=None, u=None, mem=None, need_vg=False):
         """Actions [B, heads], their log-probability [B] and the value [B]. u (2026-10-07, Phase B2): sampling
         uniforms [B, sum of head sizes] for Gumbel-max (GraphActor's rule; the common random numbers of branch
         records); None: torch.multinomial as before. mem (2026-10-11, memory models): the GRU's state [B, D]; the
-        new state is then returned as a fourth element."""
+        new state is then returned as a fourth element. need_vg (2026-10-14, B24; global-token models): value_global
+        [B] (float32) appended last (after the new state)."""
+        kw = dict(need_vg=True) if need_vg else {}
         if mem is not None:
-            logits, value, _, h_new = self.forward(b, entities, mem=mem)
+            outs = self.forward(b, entities, mem=mem, **kw)
+            logits, value, h_new = outs[0], outs[1], outs[3]
         else:
-            logits, value, _ = self.forward(b, entities)
-        tail = (h_new,) if mem is not None else ()
+            outs = self.forward(b, entities, **kw)
+            logits, value = outs[0], outs[1]
+        tail = ((h_new,) if mem is not None else ()) + ((outs[-1].float(),) if need_vg else ())
         if u is not None and not greedy:
             actions, logp = gumbel_sample(self.split(logits.float(), self.gate(b)), u)
             return (actions, logp, value.float()) + tail
@@ -1032,15 +1189,20 @@ def take(b, index):
     return out
 
 
-def packed_index(n_ent, n_doors, entities):
+def packed_index(n_ent, n_doors, entities, n_item=None, item_tok=0, glob=0):
     """forward(packed=True)'s token positions from the host's entity and door counts (numpy, one per record) for a
     batch with `entities` entity tokens: (keep, starts) int64, the flat positions of the real tokens in the [n, t]
     layout (t = 3 + DOOR_CAP + entities) and each record's first real token among them. Put into the batch dict as
-    'keep' and 'starts' (tensors on its device) they spare forward() the wait for the GPU that finding them costs."""
+    'keep' and 'starts' (tensors on its device) they spare forward() the wait for the GPU that finding them costs.
+    B24 (a fused model: TokPolicy.extra_tokens() = (item_tok, glob)): n_item the records' item_count(), t grows by
+    item_tok + glob (the real item tokens first, the global token always real)."""
     n = len(n_ent)
-    real = np.ones((n, 3 + DOOR_CAP + entities), bool)
+    real = np.ones((n, 3 + DOOR_CAP + entities + item_tok + glob), bool)
     real[:, 3:3 + DOOR_CAP] = np.arange(DOOR_CAP)[None] < np.asarray(n_doors)[:, None]
-    real[:, 3 + DOOR_CAP:] = np.arange(entities)[None] < np.asarray(n_ent)[:, None]
+    real[:, 3 + DOOR_CAP:3 + DOOR_CAP + entities] = np.arange(entities)[None] < np.asarray(n_ent)[:, None]
+    if item_tok:
+        real[:, 3 + DOOR_CAP + entities:3 + DOOR_CAP + entities + item_tok] = \
+            np.arange(item_tok)[None] < np.asarray(n_item)[:, None]
     counts = real.sum(1)
     return np.flatnonzero(real), np.cumsum(counts) - counts
 
@@ -1048,7 +1210,7 @@ def packed_index(n_ent, n_doors, entities):
 BUCKET_COST = 2.0e5   # a bucket's fixed cost in record x token^2 units (its ~12 more kernels per layer; H20, B18)
 
 
-def learner_plan(n_ent, n_doors, entities, buckets=3):
+def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, glob=0):
     """2026-10-10 (B18, the learner's fast path): forward(packed=True)'s token layout for a batch with `entities`
     entity tokens, planned on the host per record (counts only; plan_tokens expands it per token on the device). A
     record has c = 3 + doors + entities real tokens, in slot order (player, room, map, its doors, its entities). The
@@ -1057,16 +1219,25 @@ def learner_plan(n_ent, n_doors, entities, buckets=3):
     (a record's tokens first, in order), the blocks one after another. Returns dict(rec=[n, 6] int64 per record:
     c, first packed position, doors, entities, first real door, first real entity (in record order); base=[n] its
     first position in the attention layout; m, m_doors, m_ent: the real tokens, doors, entities; t, entities;
-    buckets=[(counts, width)] per group in layout order)."""
+    buckets=[(counts, width)] per group in layout order).
+    B24 (a fused model, TokPolicy.extra_tokens() = (item_tok, glob)): n_item the records' item_count(); a record's real
+    tokens are then player, room, map, doors, entities, its real item tokens, the global token (c grows by
+    n_item + glob), rec gets two more columns (items, first real item) and m_item, item_tok, glob are set."""
     ne = np.minimum(np.asarray(n_ent, np.int64), entities)
     nd = np.minimum(np.asarray(n_doors, np.int64), DOOR_CAP)
     cnt = 3 + nd + ne
     n = len(cnt)
-    rec = np.empty((n, 6), np.int64)
+    fused = bool(item_tok or glob)
+    if fused:
+        ni = np.minimum(np.asarray(n_item, np.int64), item_tok) if item_tok else np.zeros(n, np.int64)
+        cnt = cnt + ni + glob
+    rec = np.empty((n, 8 if fused else 6), np.int64)
     rec[:, 0], rec[:, 2], rec[:, 3] = cnt, nd, ne
     rec[:, 1] = np.cumsum(cnt) - cnt
     rec[:, 4] = np.cumsum(nd) - nd
     rec[:, 5] = np.cumsum(ne) - ne
+    if fused:
+        rec[:, 6], rec[:, 7] = ni, np.cumsum(ni) - ni
     top = int(cnt.max())
     upto = np.cumsum(np.bincount(cnt, minlength=top + 1))   # records with c <= index
     w = np.arange(top + 1, dtype=np.float64)
@@ -1083,7 +1254,9 @@ def learner_plan(n_ent, n_doors, entities, buckets=3):
     group = np.where(cnt <= i, 0, np.where(cnt <= j, 1, 2))
     base = np.zeros(n, np.int64)
     out = dict(rec=rec, base=base, m=int(cnt.sum()), m_doors=int(nd.sum()), m_ent=int(ne.sum()),
-               t=3 + DOOR_CAP + entities, entities=entities, buckets=[])
+               t=3 + DOOR_CAP + entities + item_tok + glob, entities=entities, buckets=[])
+    if fused:
+        out.update(m_item=int(ni.sum()), item_tok=int(item_tok), glob=int(glob))
     at = 0
     for k in range(3):
         r = np.flatnonzero(group == k)
@@ -1105,7 +1278,13 @@ def plan_tokens(plan, rec, base):
         input mlps run on these only);
       xperm: each packed token's row in [players; rooms; maps; real doors; real entities] (forward builds the packed
         tokens from these);
-      gpos: each packed token's position in the attention buckets' layout."""
+      gpos: each packed token's position in the attention buckets' layout.
+    B24 (a fused plan, rec [n, 8]): xperm's source is [players; rooms; maps; real doors; real entities; real items;
+    globals], and also: ikeep (the real item tokens' flat positions in the [n, item_tok] layout of ItemTokens(compact)),
+    tgroup (each packed token's group: 0 old, 1 item, 2 global), glast (each record's last packed token: the global
+    token)."""
+    if rec.shape[1] == 8:
+        return _plan_tokens_fused(plan, rec, base)
     n, dev = rec.shape[0], rec.device
     m, m_d, m_e, t, e = plan['m'], plan['m_doors'], plan['m_ent'], plan['t'], plan['entities']
     cnt, starts, nd, ne, dstart, estart = rec.unbind(1)
@@ -1119,6 +1298,35 @@ def plan_tokens(plan, rec, base):
     xperm = torch.where(slot < 3, slot * n + r, torch.where(slot < 3 + DOOR_CAP, 3 * n + dstart[r] + slot - 3,
                                                             3 * n + m_d + estart[r] + slot - 3 - DOOR_CAP))
     return dict(keep=r * t + slot, starts=starts, ekeep=ekeep, dkeep=dkeep, xperm=xperm, gpos=base[r] + within)
+
+
+def _plan_tokens_fused(plan, rec, base):
+    """(B24) plan_tokens of a fused plan (learner_plan with item tokens / a global token)."""
+    n, dev = rec.shape[0], rec.device
+    m, m_d, m_e, t, e = plan['m'], plan['m_doors'], plan['m_ent'], plan['t'], plan['entities']
+    m_i, NI, G = plan['m_item'], plan['item_tok'], plan['glob']
+    cnt, starts, nd, ne, dstart, estart, ni, istart = rec.unbind(1)
+    ar = torch.arange(n, device=dev)
+    r = torch.repeat_interleave(ar, cnt, output_size=m)
+    within = torch.arange(m, device=dev) - starts[r]
+    nd_r, ne_r, ni_r = nd[r], ne[r], ni[r]
+    b1 = 3 + nd_r          # first entity
+    b2 = b1 + ne_r         # first item
+    b3 = b2 + ni_r         # the global token
+    zero = torch.zeros_like(within)
+    slot = within + torch.where(within >= b1, DOOR_CAP - nd_r, zero) + torch.where(within >= b2, e - ne_r, zero) + \
+        torch.where(within >= b3, NI - ni_r, zero)
+    ekeep = torch.repeat_interleave(ar * e - estart, ne, output_size=m_e) + torch.arange(m_e, device=dev)
+    dkeep = torch.repeat_interleave(ar * DOOR_CAP - dstart, nd, output_size=m_d) + torch.arange(m_d, device=dev)
+    ikeep = torch.repeat_interleave(ar * NI - istart, ni, output_size=m_i) + torch.arange(m_i, device=dev)
+    base_e, base_i, base_g = 3 * n + m_d, 3 * n + m_d + m_e, 3 * n + m_d + m_e + m_i
+    xperm = torch.where(within < 3, within * n + r, torch.where(
+        within < b1, 3 * n + dstart[r] + within - 3, torch.where(
+            within < b2, base_e + estart[r] + within - b1, torch.where(
+                within < b3, base_i + istart[r] + within - b2, base_g + r))))
+    tgroup = (within >= b2).long() + (within >= b3).long()
+    return dict(keep=r * t + slot, starts=starts, ekeep=ekeep, dkeep=dkeep, xperm=xperm, gpos=base[r] + within,
+                ikeep=ikeep, tgroup=tgroup, glast=starts + cnt - 1)
 
 
 def first_of(ids, size):
@@ -1233,6 +1441,8 @@ class GraphActor:
     (zeroed where an episode starts), after it the new states are written back (both outside the graph, on the call's
     stream, before its completion event: a worker's next record, which can only come after the answer, sees them);
     result() leaves the input state of every record in self.h_used (numpy [n, D]: what the rollout stores).
+    Global-token models (2026-10-14, B24; TokPolicy global_token): the graphs also compute value_global; result() leaves
+    it in self.vg (numpy [n]: the rollout stores it like the value, the learner's global returns bootstrap from it).
     """
 
     def __init__(self, model, rows_max, entities=32, stream=None, crn=True, memory=None):
@@ -1279,7 +1489,10 @@ class GraphActor:
         self.choice = getattr(model, 'choice', None) is not None
         self.n_extra = 2 if self.choice else 0
         self.extra = None
-        self.out_host = torch.zeros((n, nh + 2 + self.n_extra + self.mem), dtype=torch.float32).pin_memory()
+        self.vg_on = getattr(model, 'gtok', None) is not None   # (B24) value_global as the last output column
+        self.vg = None
+        self.out_host = torch.zeros((n, nh + 2 + self.n_extra + self.mem + int(self.vg_on)),
+                                    dtype=torch.float32).pin_memory()
         self.out_np = self.out_host.numpy()
         self.done = torch.cuda.Event()
         self.sizes = sorted({min(int(entities), ENT_CAP), ENT_CAP})
@@ -1287,13 +1500,17 @@ class GraphActor:
 
         def run(tokens):
             b = decode_rows(self.raw, entities=tokens, n_heads=nh)
+            kw = dict(need_vg=True) if self.vg_on else {}   # (B24: value_global appended last)
             if self.mem:   # (memory: the state's input from self.h_in, the new state kept for the write-back)
-                outs = model(b, tokens, need_h=self.choice, mem=self.h_in)
-                logits, value, h, self._h_last = outs[0], outs[1], outs[3] if self.choice else None, outs[-1]
+                outs = model(b, tokens, need_h=self.choice, mem=self.h_in, **kw)
+                logits, value, h, self._h_last = (outs[0], outs[1], outs[3] if self.choice else None,
+                                                  outs[-2] if self.vg_on else outs[-1])
             elif self.choice:
-                logits, value, _, h = model(b, tokens, need_h=True)
+                outs = model(b, tokens, need_h=True, **kw)
+                logits, value, h = outs[0], outs[1], outs[3]
             else:
-                logits, value, _ = model(b, tokens)
+                outs = model(b, tokens, **kw)
+                logits, value = outs[0], outs[1]
             actions, logp, at = [], 0.0, 0
             for head in model.split(logits.float(), model.gate(b)):
                 k = head.shape[1]
@@ -1311,6 +1528,8 @@ class GraphActor:
                 cols += [d.mean(1, keepdim=True) * keep, d.std(1, keepdim=True) * keep]
             if self.mem:   # (memory: each record's input state, for the rollout)
                 cols.append(self.h_in)
+            if self.vg_on:   # (B24) value_global
+                cols.append(outs[-1].float()[:, None])
             return torch.cat(cols, 1)
 
         self.graphs, self.outs = [], []
@@ -1386,7 +1605,8 @@ class GraphActor:
         nh = self.nh
         self.extra = out[:, nh + 2:nh + 2 + self.n_extra] if self.n_extra else None
         if self.mem:   # (memory) each record's input state
-            self.h_used = out[:, nh + 2 + self.n_extra:]
+            self.h_used = out[:, nh + 2 + self.n_extra:nh + 2 + self.n_extra + self.mem]
+        self.vg = out[:, -1] if self.vg_on else None   # (B24) value_global
         return out[:, :nh].astype(np.int64), out[:, nh], out[:, nh + 1]
 
     def act(self, rows, pending, widx=None, reset=None):
@@ -1494,6 +1714,26 @@ def share_item_table(model, state):
                    f'dropped, the item tokens now read item_emb ({itok.dc} columns); {ITEM_SHARED_KEY} '
                    f'{tuple(w_old.shape)} -> {tuple(w.shape)}: its {rest} other columns kept, its {itok.dc} collectible '
                    "columns re-initialised (the fresh model's nn.Linear default); everything else loaded as saved")
+
+
+def convert_to_fused(model, state):
+    """B24 (2026-10-14): a B21 / B22 / B23 checkpoint's state dict (separate gated terms) for a fused model
+    (TokPolicy item_tokens_fused, any item_slots). Deterministic and data-free: every tensor is kept as saved, the
+    gates (itok.gate, gtok.gate: per-layer scalars of the old tokens' extra terms) become the multipliers of the item /
+    global tokens' value vectors (tests/test_fused_tokens_smoke.py (c): closer to the checkpoint's outputs than gates
+    reset to 1 on synthetic records with C92-sized gates). Approximate, not exact (module docstring). Returns (state,
+    a log line); raises ValueError if the model is not fused or a tensor does not fit."""
+    if not getattr(model, 'fused', False):
+        raise ValueError('convert_to_fused: the model is not fused (item_tokens_fused)')
+    own = model.state_dict()
+    bad = [k for k, v in state.items() if k not in own or own[k].shape != v.shape]
+    missing = [k for k in own if k not in state and not k.startswith('choice.')]
+    if bad or missing:
+        raise ValueError(f'convert_to_fused: tensors that do not fit {bad[:4]}, missing {missing[:4]}')
+    gates = {k: [round(float(v_), 4) for v_ in state[k]] for k in ('itok.gate', 'gtok.gate') if k in state}
+    return dict(state), ('item_tokens_fused (B24): every tensor kept as saved; the gates ' + str(gates) + ' are now the '
+                         'multipliers of the extra tokens\' value vectors; approximate (one softmax over the old and the '
+                         'extra tokens instead of the gated terms)')
 
 
 def load_compatible(model, state):

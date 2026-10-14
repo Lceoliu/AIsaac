@@ -130,6 +130,16 @@ Pedestal builds / forced pickups / shared item table (2026-10-13, B23; isaac_bri
   tokens): the item tokens' collectible table is the policy's item_emb (tok_policy share_item_table: --resume of a B21
   checkpoint drops its own 32-column table, re-initialises the 16 collectible columns of the item tokens' first
   Linear, keeps everything else; Adam's state of that Linear starts fresh). Evaluation (eval_tok.py) never forces.
+Fused extra tokens / item slots / stored value_global (2026-10-14, B24; tok_policy TokPolicy item_tokens_fused /
+  item_slots): --item-tokens-fused 1 (needs --item-tokens 1 or --global-token 1) makes the item tokens and the global
+  token ordinary tokens of each block's one attention (one softmax over the old and the extra tokens; the gates multiply
+  the extra tokens' value vectors); the learner's packed layouts plan the real item tokens on the host (item_count) like
+  the entities, with no padded copies. --resume of a B21 / B22 / B23 checkpoint with --item-tokens-fused 1 loads every
+  tensor as saved (the same names and shapes, Adam's state as it is; approximate: the outputs change, the gates keep
+  their values; tests/test_fused_tokens_smoke.py measures by how much). --item-slots N: held-collectible token slots
+  (newest first, default 16 = INV_CAP; + active, two trinkets, pocket). With --global-token the actor's CUDA graphs
+  also output value_global, the rollout stores it (Rollout.value_g) and its returns bootstrap from the stored values
+  (from the recomputed ones with --recompute-values on): no pass of its own at the update's start.
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
 
@@ -220,8 +230,10 @@ def parse_groups(text, workers):
 class Rollout:
     """Decisions per worker, in arrival order."""
 
-    def __init__(self, workers, capacity, n_heads=3, mem_dim=0):
+    def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False):
         self.n, self.cap, self.nh = workers, capacity, n_heads
+        # 2026-10-14 (B24, global-token models): value_global of each decision, as the actor computed it (None without)
+        self.value_g = np.zeros((workers, capacity), np.float32) if value_g else None
         # 2026-10-11 (memory): the GRU's input state of each decision (None without memory)
         self.h = np.zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
         self.rows = np.zeros((workers, capacity), ROW)
@@ -258,6 +270,8 @@ class Rollout:
             getattr(self, name)[i, 0] = getattr(other, name)[i, k]
         if self.h is not None:   # (memory)
             self.h[i, 0] = other.h[i, k]
+        if self.value_g is not None and other.value_g is not None:   # (B24)
+            self.value_g[i, 0] = other.value_g[i, k]
         self.length[i], self.open[i] = 1, 0
 
 
@@ -436,15 +450,18 @@ class Episodes:
         return go
 
 
-def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None):
+def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, vg=None):
     """Store the decisions just answered (workers a_idx, distinct) as their workers' open ones. h (memory): the GRU's
-    input state of each."""
+    input state of each. vg (B24, global-token models): value_global of each."""
     kk = roll.length[a_idx]
     ok = kk < roll.cap   # cannot fail with the trainer's capacity; drop rather than overrun
     if not ok.all():
         a_idx, kk, rows, under_way = a_idx[ok], kk[ok], rows[ok], under_way[ok]
         actions, logp, value = actions[ok], logp[ok], value[ok]
         h = h[ok] if h is not None else None
+        vg = vg[ok] if vg is not None else None
+    if vg is not None and roll.value_g is not None:   # 2026-10-14 (B24)
+        roll.value_g[a_idx, kk] = vg
     if h is not None and roll.h is not None:   # 2026-10-11 (memory)
         roll.h[a_idx, kk] = h
     roll.rows[a_idx, kk] = rows
@@ -500,12 +517,12 @@ def main():
     os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
     # torch is imported here, not at the top: the sampler's workers are spawned and import this module too
     import torch
-    from isaac_bridge.tok_obs import ENT_CAP
+    from isaac_bridge.tok_obs import ENT_CAP, INV_CAP
     from isaac_bridge.tok_pickup import normalise_advantages, parse_pickup_force, pickup_force_p, ppo_part_terms
-    from isaac_bridge.tok_policy import (ENTITY_FIELDS, N_ITEM_TOK, ROW_BYTES, GraphActor, TokPolicy, cat_batch,
+    from isaac_bridge.tok_policy import (ENTITY_FIELDS, ROW_BYTES, GraphActor, TokPolicy, cat_batch,
                                          crn_uniforms, DEDUP, decode_rows, distinct_ids, first_of, learner_plan,
                                          load_compatible, main_parameter_names, memory_chunks, packed_index,
-                                         ITEM_SHARED_KEY, share_item_table,
+                                         ITEM_SHARED_KEY, share_item_table, item_count,
                                          pad_optimizer_state, plan_tokens, remap_optimizer_state, rows_to_device,
                                          take, to_batch, used_entities)
     p = argparse.ArgumentParser()
@@ -855,6 +872,15 @@ def main():
                         '(one representation for held and pedestal items; a B21 checkpoint is converted on --resume, '
                         'tok_policy.share_item_table). 0 (default): their own table, as before')
     p.add_argument('--vf-global-coef', type=float, default=0.5, help="weight of value_global's loss (B22)")
+    # 2026-10-14 (B24; see the module docstring)
+    p.add_argument('--item-tokens-fused', type=int, default=0,
+                   help='1 (B24, needs --item-tokens 1 or --global-token 1): the item tokens and the global token are '
+                        "ordinary tokens of each block's one attention (one softmax; the gates multiply their value "
+                        'vectors); a B21 / B22 / B23 checkpoint resumes with every tensor as saved (approximate: the '
+                        'outputs change). A resumed fused checkpoint keeps it. 0 (default): the separate gated terms')
+    p.add_argument('--item-slots', type=int, default=None,
+                   help='B24: held-collectible token slots (newest first; + active, two trinkets, pocket). Default: '
+                        'a resumed checkpoint\'s, else 16 (INV_CAP, as before)')
     p.add_argument('--fused-adam', type=int, default=0,
                    help='1: Adam as one fused CUDA kernel (the same update rule; float rounding may differ)')
     p.add_argument('--dump-rollouts', type=int, default=0,
@@ -912,11 +938,11 @@ def main():
         p.error('--memory gru needs --memory-dim > 0')
     # 2026-10-12 (B21 / B22): a resumed checkpoint with item tokens / a global token keeps them; one without them gets
     # them fresh when asked (gates zero: its outputs at the start)
-    itok_fresh = gtok_fresh = share_convert = False
+    itok_fresh = gtok_fresh = share_convert = fuse_convert = False
     if args.resume:
         ck_cfg = torch.load(args.resume, map_location='cpu').get('config', {})
         for key_, opt_ in (('item_tokens', 'item_tokens'), ('global_token', 'global_token'),
-                           ('item_shared', 'item_shared')):
+                           ('item_shared', 'item_shared'), ('item_tokens_fused', 'item_tokens_fused')):
             if ck_cfg.get(key_):
                 if not getattr(args, opt_):
                     print(f'{key_}: the resumed checkpoint has them: --{opt_.replace("_", "-")} 1', flush=True)
@@ -925,6 +951,11 @@ def main():
         gtok_fresh = bool(args.global_token) and not ck_cfg.get('global_token')
         # 2026-10-13 (B23): a B21 checkpoint's own item-token table converted into the shared one (share_item_table)
         share_convert = bool(args.item_shared) and bool(ck_cfg.get('item_tokens')) and not ck_cfg.get('item_shared')
+        # 2026-10-14 (B24): a separate-term checkpoint with item / global tokens into the fused layout (same tensors)
+        fuse_convert = bool(args.item_tokens_fused) and bool(ck_cfg.get('item_tokens') or ck_cfg.get('global_token')) \
+            and not ck_cfg.get('item_tokens_fused')
+        if args.item_slots is None and ck_cfg.get('item_slots'):
+            args.item_slots = int(ck_cfg['item_slots'])
         del ck_cfg
     itok_on, gtok_on = bool(args.item_tokens), bool(args.global_token)
     if itok_on and not items:
@@ -934,6 +965,18 @@ def main():
     tok_kw = dict(item_tokens=itok_on, global_token=gtok_on)   # (TokPolicy's B21 / B22 options; False: as before)
     if args.item_shared:   # (B23; the key only when set: TokPolicy's signature as before otherwise)
         tok_kw['item_shared'] = True
+    fused_on = bool(args.item_tokens_fused)   # 2026-10-14 (B24)
+    if fused_on and not (itok_on or gtok_on):
+        p.error('--item-tokens-fused 1 needs --item-tokens 1 or --global-token 1')
+    if fused_on:
+        tok_kw['item_tokens_fused'] = True
+    item_slots = INV_CAP if args.item_slots is None else int(args.item_slots)
+    if item_slots != INV_CAP:
+        if not itok_on:
+            p.error('--item-slots needs --item-tokens 1')
+        if not 1 <= item_slots <= INV_CAP:
+            p.error(f'--item-slots must be in 1 .. {INV_CAP}')
+        tok_kw['item_slots'] = item_slots
     pick_force = parse_pickup_force(args.pickup_force)   # 2026-10-13 (B23)
     pf_on = max(pick_force) > 0
     rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0, heal=0.0, resource=0.0)
@@ -1053,6 +1096,11 @@ def main():
             (('gtok.',) if gtok_fresh else ())   # (B21 / B22: the fresh modules' keys)
         if unexpected or any(not k.startswith('choice.') and not (new_ok and k.startswith(new_ok)) for k in missing):
             raise SystemExit(f'--resume: weights do not match ({missing[:4]} {unexpected[:4]})')
+        if fuse_convert:   # 2026-10-14 (B24)
+            print('item_tokens_fused (B24): a separate-term checkpoint loaded into the fused layout: every tensor as '
+                  'saved (gates kept, now multipliers of the extra tokens\' value vectors; '
+                  f'{item_slots} held-item slots); approximate: the outputs change at the start (one softmax over the old '
+                  'and the extra tokens instead of the gated terms)', flush=True)
         if copt is not None and ck.get('choice_optimizer'):
             copt.load_state_dict(ck['choice_optimizer'])
         osd = ck['optimizer']
@@ -1063,10 +1111,13 @@ def main():
             added = remap_optimizer_state(osd, main_parameter_names(list(ck['model'])),
                                           main_parameter_names([k for k, _ in learner_model.named_parameters()]),
                                           drop=(ITEM_SHARED_KEY,) if share_convert else ())
-            for flag_, name_, what_ in ((itok_fresh, 'item tokens', f'{N_ITEM_TOK} item tokens per record'),
+            for flag_, name_, what_ in ((itok_fresh, 'item tokens', f'{item_slots + 4} item tokens per record'),
                                         (gtok_fresh, 'global token', 'the global token and value_global'),
                                         (mem_fresh, 'memory', f'GRU (size {mem_dim})')):
-                if flag_:
+                if flag_ and fused_on and name_ != 'memory':   # (B24: fused gates start at 1, ordinary tokens)
+                    print(f'{name_}: --resume of a checkpoint without them: {what_} initialised fresh, fused (B24: '
+                          'gates 1, the outputs change at the start)', flush=True)
+                elif flag_:
                     print(f'{name_}: --resume of a checkpoint without them: {what_} initialised fresh, gates / output '
                           'projections zero (the same outputs as the checkpoint at the start)', flush=True)
             print(f'--resume: Adam state remapped by parameter name, {added} new tensors without state', flush=True)
@@ -1219,7 +1270,7 @@ def main():
             out_['lab_model_rows'] = len(m_.rows)
             return out_
     capacity = args.rollout // n * 4 + 64
-    roll, spare = Rollout(n, capacity, nh, mem_dim), Rollout(n, capacity, nh, mem_dim)
+    roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on), Rollout(n, capacity, nh, mem_dim, gtok_on)
 
     def teach_pending(meta):
         """The action under way of teacher records from their meta (int64 [k, 16], numpy or a tensor): columns 0-2,
@@ -1239,8 +1290,9 @@ def main():
               + ('through CUDA graphs with the state table (GraphActor memory)' if use_graphs else
                  'eager (--memory-graph 0 or --graph-entities 0)'), flush=True)
     if itok_on or gtok_on:   # 2026-10-12 (B21 / B22)
-        print('extra tokens: ' + ', '.join(
-            ([f'item tokens ({N_ITEM_TOK} per record)'] if itok_on else []) +
+        print('extra tokens: ' + ('fused into the one attention (B24), ' if fused_on else 'separate gated terms, ') +
+            ', '.join(
+            ([f'item tokens ({item_slots + 4} per record, {item_slots} held slots)'] if itok_on else []) +
             ([f'global token + value_global (gamma {args.gamma_global}, coef {args.vf_global_coef})'] if gtok_on else []))
             + f'; gates now {learner_model.gate_values()}', flush=True)
     # streams: the actor's calls go first on the GPU, the learner's kernels fill the rest. --actor-slots calls may be
@@ -1274,8 +1326,11 @@ def main():
     # 2026-10-06 (host memory): with --teach-gpu 1 the teacher's records are read from their bytes on the GPU, and the
     # host keeps only their entity and door counts (the minibatch planning reads them); the full host copy (--teach-
     # buffer x ROW, about 0.85 GB at 60,000) filled up over the first ~1,000 game hours. --teach-gpu 0: as before.
+    # 2026-10-14 (B24 fused): the packed layouts plan the real item tokens on the host from their count (item_count)
+    NI_f, G_f = learner_model.extra_tokens()
     host_teach = ROW if not teach_gpu else np.dtype([('n_ent', ROW.fields['n_ent'][0]),
-                                                     ('n_doors', ROW.fields['n_doors'][0])])
+                                                     ('n_doors', ROW.fields['n_doors'][0])] +
+                                                    ([('n_item', np.int16)] if NI_f else []))
     L = dict(update=update, decisions=decisions_total, seconds=seconds_total, writer=None, t_end=None,
              teach_rows=np.zeros((args.teach_buffer,), host_teach) if args.teacher else None,
              teach_meta=np.zeros((args.teach_buffer, 16), np.int64), teach_n=0, teach_at=0, teach_rate=None,
@@ -1301,7 +1356,8 @@ def main():
         #                   GPU, entity / door counts on the host for the minibatch planning)
         from isaac_bridge.tok_teacher2 import VI as V2I, teacher_v2_loss
         L.update(v2_cnt=np.zeros((args.teacher_v2_buffer,), np.dtype([('n_ent', ROW.fields['n_ent'][0]),
-                                                                       ('n_doors', ROW.fields['n_doors'][0])])),
+                                                                       ('n_doors', ROW.fields['n_doors'][0])] +
+                                                                      ([('n_item', np.int16)] if NI_f else []))),
                  v2_n=0, v2_at=0, v2_rate=None, v2_raw=None)
         v2_rng = np.random.default_rng([args.seed, 0x7E2])   # its own: the teacher's draws stay as without
     target_decisions = decisions_total + int(args.game_hours / hours_per_decision)
@@ -1354,6 +1410,7 @@ def main():
             stem = out / 'rollouts' / f'rollout-{L["update"]:06d}'
             np.savez(str(stem) + '.npz', **{k: getattr(rl, k)[:, :m] for k in (
                 'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version')},
+                **({'value_g': rl.value_g[:, :m]} if getattr(rl, 'value_g', None) is not None else {}),
                 length=rl.length, open=rl.open, update=L['update'])
             torch.save(dict(model=learner_model.state_dict(), config=learner_model.config, update=L['update']),
                        str(stem) + '.pt')
@@ -1363,6 +1420,9 @@ def main():
             np.arange(capacity)[None, :] < lengths[:, None]]
         value_now = every = prox = None
         vgs, vg_now, ret_g = [], None, None   # (B22) value_global at the update's start, its returns
+        # 2026-10-14 (B24): the actor's stored value_global (Rollout.value_g) is used like the stored value: recomputed
+        # only with --recompute-values; a rollout without it (a bench job) gets a pass of its own, as before
+        vg_stored = getattr(rl, 'value_g', None) if gtok_on else None
         if (recompute or args.decoupled) and len(all_flat):
             # the values the advantages need (and with --decoupled the log-probabilities of the stored actions), from
             # the weights at the start of this update
@@ -1376,7 +1436,7 @@ def main():
                 chunk = args.micro or args.minibatch
                 for at in range(0, len(all_flat), chunk):
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
-                    if gtok_on:   # (B22: value_global in the same pass; evaluate's values otherwise)
+                    if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
                         b_p = take(every, part)
                         with autocast():
                             o_ = learner_model(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
@@ -1397,7 +1457,11 @@ def main():
                 value_now = None
             prox_all = torch.cat(lps)
             sec('recompute')
-        if gtok_on and len(all_flat):   # 2026-10-12 (B22): value_global of every stored decision, for its returns
+        if gtok_on and len(all_flat) and vg_stored is not None and not vgs:   # (B24) the actor's values, as stored
+            vg_now = vg_stored
+            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now)
+            del adv_g
+        elif gtok_on and len(all_flat):   # 2026-10-12 (B22): value_global of every stored decision, for its returns
             vg_now = np.zeros_like(rl.value)
             if not vgs:   # (no recompute pass: one of its own, a chunk of records at a time)
                 with torch.inference_mode():
@@ -1506,6 +1570,8 @@ def main():
             if teach_new:
                 if teach_gpu:   # (field by field: the host keeps the counts only)
                     teach_rows['n_ent'][at_], teach_rows['n_doors'][at_] = new_rows['n_ent'], new_rows['n_doors']
+                    if NI_f:   # (B24)
+                        teach_rows['n_item'][at_] = item_count(new_rows, item_slots)
                 else:
                     teach_rows[at_] = new_rows
                 teach_meta[at_] = new_meta
@@ -1561,6 +1627,8 @@ def main():
                               v2_verr_abs=float(np.abs(val_v - G_v).mean()))
                 at_v = (L['v2_at'] + np.arange(v2_new)) % B_
                 L['v2_cnt']['n_ent'][at_v], L['v2_cnt']['n_doors'][at_v] = v_rows['n_ent'], v_rows['n_doors']
+                if NI_f:   # (B24)
+                    L['v2_cnt']['n_item'][at_v] = item_count(v_rows, item_slots)
                 if L['v2_raw'] is None:
                     L['v2_raw'] = torch.zeros((B_, ROW_BYTES), dtype=torch.uint8, device=device)
                     L['v2_pend'] = torch.zeros((B_, nh), dtype=torch.int64, device=device)
@@ -1749,6 +1817,13 @@ def main():
         # packed token positions) and the learner thread never waits for the GPU inside an epoch
         ne_h = rl.rows['n_ent'].reshape(-1)[flat].astype(np.int64)
         nd_h = rl.rows['n_doors'].reshape(-1)[flat].astype(np.int64)
+        # (B24 fused) the records' real item tokens; the plans' extra arguments (none without fused tokens)
+        ni_h = item_count(rl.rows.reshape(-1)[flat], item_slots) if NI_f else None
+        xplan = dict(item_tok=NI_f, glob=G_f) if (NI_f or G_f) else {}
+
+        def teach_ni(pick_):
+            """(B24) the teacher records' item counts (the host ring keeps them with --teach-gpu 1)."""
+            return teach_rows['n_item'][pick_] if teach_gpu else item_count(teach_rows[pick_], item_slots)
         width = batch['ent'].shape[1]
         # B18: the records' ids among the rollout's distinct room grids, level maps and player patches (the CNNs then
         # run on a minibatch's distinct ones: ~380 of 4,096 rooms and maps, ~2,100 patches in a run-mode rollout)
@@ -1880,18 +1955,25 @@ def main():
                     tokens += used
                     parts += 1
                     ne_p, nd_p = ne_h[part_h], nd_h[part_h]
+                    ni_p = ni_h[part_h] if NI_f else None
                     if merged:   # the teacher's records ride along in the last part: one forward and backward
                         if not raw_mode:
                             mb = cat_batch(mb, tb)
                         ne_p = np.concatenate([ne_p, teach_rows['n_ent'][pick]])
                         nd_p = np.concatenate([nd_p, teach_rows['n_doors'][pick]])
+                        if NI_f:
+                            ni_p = np.concatenate([ni_p, teach_ni(pick)])
                     if vmerged:   # (teacher v2) its records after the teacher's
                         if not raw_mode:
                             mb = cat_batch(mb, vb)
                         ne_p = np.concatenate([ne_p, L['v2_cnt']['n_ent'][vpick]])
                         nd_p = np.concatenate([nd_p, L['v2_cnt']['n_doors'][vpick]])
+                        if NI_f:
+                            ni_p = np.concatenate([ni_p, L['v2_cnt']['n_item'][vpick]])
+                    if xplan:   # (B24 fused: the real item tokens and the global token in the plans)
+                        xplan['n_item'] = ni_p
                     if args.packed and fast:   # B18: + the entity positions and the attention buckets, one copy
-                        plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets)
+                        plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets, **xplan)
                         hn = ['rec', 'base']
                         for k_ in dd:   # the distinct grids of this part (the teacher's records each their own)
                             u_, i_ = first_of(dd[k_][part_h], dd_size[k_])
@@ -1903,7 +1985,7 @@ def main():
                             hn += [k_ + '_u', k_ + '_i']
                         bk_ = plan['buckets'] if 'buckets' in fparts else []
                         got = dev_many([plan[k_].reshape(-1) for k_ in hn] + [c_ for c_, _ in bk_])
-                        got[0] = got[0].view(-1, 6)
+                        got[0] = got[0].view(-1, plan['rec'].shape[1])
                         mb.update(zip(hn[2:], got[2:len(hn)]))
                         tok = plan_tokens(plan, got[0], got[1])
                         pnames = ['keep', 'starts']
@@ -1912,12 +1994,13 @@ def main():
                         if 'buckets' in fparts:
                             pnames.append('gpos')
                             if 'ekeep' in fparts:   # the packed tokens built from the real ones (forward's xperm)
-                                pnames += ['dkeep', 'xperm']
+                                pnames += ['dkeep', 'xperm'] + (['ikeep', 'tgroup', 'glast'] if xplan else [])
                         mb.update((k_, tok[k_]) for k_ in pnames)
                         if bk_:
                             mb['buckets'] = [(c_, w_) for c_, (_, w_) in zip(got[len(hn):], bk_)]
                     elif args.packed:
-                        mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1]))
+                        mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1],
+                                                                                   **xplan))
                     k_ = len(part)
                     with autocast():
                         if mem_on:   # (memory) BPTT over the part's chunks from their stored first states; the
@@ -2398,9 +2481,10 @@ def main():
         aux[n, AUX_SNAP], aux[n, AUX_SNAP_ON] = version, 1
         torch.cuda.synchronize()
 
-    def answer(prof, a_idx, sub, under_way, actions, logp, value, extra=None, ver=None, h=None):
+    def answer(prof, a_idx, sub, under_way, actions, logp, value, extra=None, ver=None, h=None, vg=None):
         """The actions out to the workers, the decisions into the rollout. ver: the weights that answered (a
-        snapshot's id; None: the actor's own). h (memory): the GRU's input state of each record."""
+        snapshot's id; None: the actor's own). h (memory): the GRU's input state of each record. vg (B24): value_global
+        of each record (global-token models)."""
         t2 = time.perf_counter()
         if pf_on:   # 2026-10-13 (B23): a forced record's move is the worker's (ROW pforce), its shoot none; stored so
             fm = sub['pforce']
@@ -2424,7 +2508,7 @@ def main():
         sampler.reply(a_idx)
         t3 = time.perf_counter()
         prof['reply'] += t3 - t2
-        store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h)
+        store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h, vg)
         pending[a_idx] = actions
         prof['store'] += time.perf_counter() - t3
 
@@ -2444,7 +2528,7 @@ def main():
         prof['latency'] += t2 - t_sub
         if was_busy:
             prof['act_busy'] += t2 - t_sub
-        answer(prof, a_idx, sub, under_way, actions, logp, value, slot.extra, ver, slot.h_used)
+        answer(prof, a_idx, sub, under_way, actions, logp, value, slot.extra, ver, slot.h_used, slot.vg)
 
     def submit_snapshots(prof, idx_b, sub_b, uw_b, t1):
         """Phase B2: branch records to the snapshots their workers ask for (the newest when that one is gone)."""
@@ -2549,9 +2633,12 @@ def main():
                             crn_uniforms(sub['crn'][sel_c], sub['t'][sel_c], u_crn.shape[1])).to(device)
                     if mem_on:   # 2026-10-11 (memory): the workers' states in, the new ones back into the table
                         h_e = mem_rows(mem_table, a_idx, sub['first'] != 0)
-                        actions, logp, value, hn_e = model.act(to_batch(sub, under_way, device), u=u_crn, mem=h_e)
+                        out_e = model.act(to_batch(sub, under_way, device), u=u_crn, mem=h_e, need_vg=gtok_on)
+                        actions, logp, value, hn_e = out_e[:4]
                     else:
-                        actions, logp, value = model.act(to_batch(sub, under_way, device), u=u_crn)
+                        out_e = model.act(to_batch(sub, under_way, device), u=u_crn, need_vg=gtok_on)
+                        actions, logp, value = out_e[:3]
+                vg_e = out_e[-1].cpu().numpy() if gtok_on else None   # (B24: value_global, stored like the value)
                 if mem_on:
                     mem_table.index_copy_(0, torch.from_numpy(np.ascontiguousarray(a_idx, np.int64)).to(device), hn_e)
                     h_e = h_e.cpu().numpy()
@@ -2561,7 +2648,7 @@ def main():
                 prof['latency'] += t2 - t1
                 if busy:
                     prof['act_busy'] += t2 - t1
-                answer(prof, a_idx, sub, under_way, actions, logp, value, h=h_e)
+                answer(prof, a_idx, sub, under_way, actions, logp, value, h=h_e, vg=vg_e)
             while inflight:
                 finish(prof)
             collect_s = time.perf_counter() - t0

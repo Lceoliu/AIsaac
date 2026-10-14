@@ -102,7 +102,7 @@ def main():
         moved = [k for k in row_head.names if ROW.fields[k][1] != row_head.fields[k][1]]
         check('(a) ROW: the old fields keep their offsets, B23 fields appended',
               not moved and ROW.names[:len(row_head.names)] == row_head.names and
-              ROW.names[len(row_head.names):] == ('pforce', 'pmode', 'bped'),
+              ROW.names[-3:] == ('pforce', 'pmode', 'bped'),   # (HEAD has them since 7003c76: then nothing appended)
               f'HEAD {row_head.itemsize} B, now {ROW.itemsize} B')
 
     # ------------------------------------------------------------ (b) shared table: forward / backward, gradients

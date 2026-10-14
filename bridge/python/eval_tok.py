@@ -119,7 +119,7 @@ def main():
         changed = load_compatible(model, ck['model'])
         info = dict(policy=str(args.checkpoint), update=ck.get('update'), decisions=ck.get('decisions'),
                     greedy=args.greedy, weights_not_exact=changed)
-        for key_ in ('item_tokens', 'global_token'):   # 2026-10-12 (B21 / B22)
+        for key_ in ('item_tokens', 'global_token', 'item_tokens_fused'):   # 2026-10-12 (B21 / B22), 10-14 (B24)
             if model.config.get(key_):
                 info[key_] = True
     sampler = TokSampler(cfg)
