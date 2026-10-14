@@ -7615,5 +7615,6 @@ C92 在 11,660 小时内对 C91 领先 0.06 层且门还在打开（`item_gate` 
 - **运行**：HPC160 `ws7/runs/c94-pickup`（脚本 `ws7/hpc_c94.sh run <ckpt>`，由 `launch_c94_after_c91.sh` 在 C91 结束后自动启动，预计 10-14 09:00 前后；端口 49000 / 评估 49300），64 worker，参数 = C93 + `--item-shared 1 --start-build-mode pedestal --pickup-force 1:0`，`--resume` 启动时 C93 的最新 `update-*.pt`（权重 + Adam，门已打开），`--game-hours 12000`。
 - **评估**：每 600 次更新 128 种子（无道具口径，从不强制）；看 `pickups_free`（非强制局的自主拾取）随 p 下降的走势、训练局 `items` 的分布、与 C93 同更新数的过层。
 
-**实验结果**（待启动）
+**实验结果**（进行中）
 
+- **C94 启动**（10-14 09:1x，HPC160 `ws7`，64 worker）：`--resume` C93 u54600（57,316 小时），5 分钟后 **607–664×**（学习器 4.3–4.8 秒 / 更新），0 个 Traceback，显存 18 GB。12,000 小时约 5.5 小时，预计 15:00 前后结束。
