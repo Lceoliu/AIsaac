@@ -12,9 +12,9 @@ COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items 
   --teacher-share 0.1 --teacher-slots 6 --poll-wait 0.003 --memory gru --memory-dim 128 --memory-bptt 32 \
   --item-tokens 1 --global-token 1 --item-shared 1 --start-build-prob 0.5 --start-build-max 3 --start-build-mode pedestal \
   --pickup-force 0:0 --reward heal=0.5,resource=0.25 --item-tokens-fused 1 --item-slots 8 \
-  --temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256 \
-  --actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
-# (smoke: the compile flags are dropped below: a first compile takes ~18 min; the smoke checks the model, the run checks speed)
+  --temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256"
+# B29 actor speed flags (run only: a first compile takes ~18 min; the smoke checks the model, the run checks speed)
+FAST="--actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
 if [ "$1" = smoke ]; then
   shift; CK=$1; shift
   tag=${TAG:-smoke-c96}
@@ -26,14 +26,13 @@ if [ "$1" = smoke ]; then
   python3 -c "
 import csv
 rows=list(csv.DictReader(open('$R/$tag/progress.csv')))
-print([(r['update'], r.get('start_pedestals'), r.get('pickup_force_p'), r.get('pickup_forced_eps'), r.get('pickups_forced'), r.get('pickups_free'), r.get('pickup_imit'), r.get('forced_share'), r['kl'][:6]) for r in rows])"
-  grep -c build_pedestals $R/$tag/episodes.jsonl
+print([(r['update'], r['kl'][:6], r.get('update_s','')[:5], r.get('infer_ms','')[:5], r.get('t_gate_read'), r.get('t_gate_feed'), r.get('t_gate_vg'), r.get('pickups_free')) for r in rows])"
   exit 0
 fi
 if [ "$1" = run ]; then
   CK=$2
   mkdir -p $R/c96-temporal/checkpoints && cp "$CK" $R/c96-temporal/checkpoints/from-c95.pt
-  PYTHONPATH=. nohup $PY train_tok.py $COMMON --workers 64 --game-hours 12000 --checkpoint-every 1000 \
+  PYTHONPATH=. nohup $PY train_tok.py $COMMON $FAST --workers 64 --game-hours 12000 --checkpoint-every 1000 \
     --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 \
     --resume $R/c96-temporal/checkpoints/from-c95.pt --name hc96 --port 49000 --out $R/c96-temporal > $R/c96-temporal.log 2>&1 < /dev/null &
   sleep 300
