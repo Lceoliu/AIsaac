@@ -7332,6 +7332,32 @@ opus 子代理，HPC128 `ws10`，C95 u61000（融合布局）：新基准 `abplu
 - **结论**：(1) 推理每次调用压了 56–67%，float32 等价，但 × 只从 954 到 1,005——**同步的学习器更新（2.6–2.7 s）已经比采集（1.7 s）长**，worker 等更新的时间算进 idle，所以 idle 不动；下一道瓶颈是学习器（`--overlap` 异步更新或更快的 learner）。(2) actor 循环里的 Python（记账 0.49 s、存储 0.34 s、回复 0.16 s ≈ 每 2 s 采集的一半）成了 actor 侧最大的开销。(3) slot 数加多有害，poll-wait 无影响，保持 2 slot。(4) 推荐默认：`--actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32`（128 worker 时 `16,32,64`）；首次编译约 18 分钟，有缓存（`$TMPDIR/torchinductor_root`，6.7 GB）后 1.5 分钟；`--actor-compile default` 20 秒/图、每次调用多 0.1 ms。(5) B27 时间侧的增量没有有效测量（GPU 被占）；分析估计：就地读环形缓存、bf16 存储、编译后 batch 64 约 +0.2–0.3 ms，128 约 +0.35–0.5 ms；若每次调用把 256 步 K/V 拷出来拼接则拷贝占主导（+0.35 / +0.7 ms），设计上要避免。
 - 代码（默认全关）：`tok_policy.py` GraphActor 的 bf16 / compile / fold / SDPA / 行分桶 / 实体槽位列表选项，`train_tok.py` 六个 `--actor-*` / `--graph-entities-extra` 标志，`abplus_bench_actor.py`，`ops/hpc_b29_knobs.sh`；`test_fused_tokens_smoke.py` 34 项通过。
 
+### B30 时间注意力：实现与冒烟（2026-10-14 → 10-15，已完成）
+
+**实验目的**
+
+用户 10-14 定下的架构（`docs/TEMPORAL_ATTENTION.md`、`docs/figures/temporal_attention_arch.svg`）：保留每步的空间 transformer，在其上加一个参数量同量级的时间 transformer（256 宽 × 4 层、窗口 256 步 + 房间 token），反馈路开，GRU 先保留，门零起步、加上去的瞬间与 C95 逐位相同。
+
+**实验方法**
+
+- **代码**（opus 子代理实现，我逐段复核 + 本地复跑全部测试；提交 `f87c4fc`）：`TemporalAttention`（`step` 给 actor、`sequence` 给学习器）、`TemporalState`（每 worker 槽位的每层 K/V 环形缓存 `[L, 2, slots+1, H, R+W, dh]` bf16、房间计数、上一步 o、上一张小地图）、历史 token 进空间注意力的项 `a + g2·σ·(v_u − a)`（σ = sigmoid(q·k_u − lse)：与把 u 当普通 token 放进同一个 softmax 等价，门为零时精确为零）、读出 `z + mem_out(h) + g1·P(o)`、`value_global + g3·P_g(o)`；房间变化 = 小地图"当前房间"通道变化或 EV_EXIT/EV_NEW_ROOM；rollout 每步多存 K/V 4 KB + s 0.5 KB + o 1 KB（64 worker 两份 rollout ≈ 2 GB 主机内存，GPU 缓存 98 MiB）；学习器按 256 步分块（GRU 的 32 步块嵌在里面），块前 255 步上下文和块前房间 token 用存下的（stop-grad），块内房间 token 有梯度（但来源是存下的 o_{t−1}），反馈路在学习器里用存下的 o_{t−1}（stop-grad）；`--temporal 1` 要求 `--memory gru` 和融合布局，v1 不支持分支和教师 v2，旧教师记录无时间侧读出。
+- **测试**：`tests/test_temporal_smoke.py` 22 项：关 == HEAD 逐位；开且门零 == 关 逐位（actor、学习器各路径、stored 模式）；逐步 actor == 一次性学习器（max 1.6e-6，含环 wrap、块首房间、新局、EV_EXIT、房间上限、rollout 交接）；bf16 K/V 对 fp32 logit 差 1e-3；梯度到达全部 43 个时间侧张量，门零时只有门有梯度；合成 C95 检查点转换只缺 `tatt.*`（67 个张量、3.51M 参数）、Adam remap、输出逐位；eval 路径。原五个冒烟测试不变。HPC160 H20 上含 GraphActor 的项全过。
+- **冒烟**（HPC160 `ws9`，8 worker、1.5 小时、C95 u64000 续训，与 C95 同节点）：无加速标志——0 Traceback，KL 0.007–0.010，`infer` **9.4 ms**（B24 同配置 4.5）、collect 10.3 s、update 3.2–4.1 s（B24 1.7）；加 B29 加速标志——0 Traceback（编译时几条 triton 共享内存不够的配置被跳过，无害），KL 0.008–0.011，`infer` **3.1 ms**、collect 4.3 s、update 3.1–3.8 s，idle 0.72；门在 5 次更新后 g1 ≈ 1e-3、g2 ≈ 7e-4、g3 ≈ −5e-4（在动）。
+
+**结论**：功能正确、逐位等价性成立；速度上 actor 必须配 B29 的编译/折叠/分桶（否则时间侧的小算子把推理拉到 9 ms），学习器每次更新约慢 1.5–2 倍（8 worker、micro 1024 下 1.7 → 3.1–3.8 s），64 worker 的真实代价由 C96 的头 5 分钟给出；若 × 掉到 800 以下，候选：缩短 `--temporal-bptt`、学习器的时间侧改用 SDPA。
+
+### C96 B30 时间注意力续跑 C95：HPC160 `ws9`（2026-10-15，待 C95 结束后自动启动）
+
+**实验目的**
+
+(1) 64 worker 下 B30 + B29 的速度；(2) 道具线（C95 六点均值 1.54、后三点 1.45 / 1.50 / 1.63）加上时间上下文后涨不涨；(3) 三个门的走势 = 时间侧被用了多少。对照 = C95 的曲线与最终 512 种子。
+
+**实验方法**
+
+HPC160 `ws9/runs/c96-temporal`（`ws9/hpc_c96.sh run <ckpt>`，`launch_c96_after_c95.sh` 在 C95 的 `finished` 后 90 秒从 `last.pt` 启动，10-15 00:35 布好；端口 49000 / 评估 49300），64 worker，参数 = C95 + `--temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256` + B29 `--actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32`，`--pickup-force 0:0`，12,000 小时，每 1,000 次更新 128 种子；首次编译约 18 分钟。
+
+**实验结果**（待启动）
+
 ### A27 512 种子定论评估：各主线最终检查点（2026-10-13/14，3090）
 
 **实验目的**
