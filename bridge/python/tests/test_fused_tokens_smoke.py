@@ -102,7 +102,7 @@ def perturb(m, seed, scale=0.02):
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for p in m.parameters():
-            p.add_(torch.randn(p.shape, generator=g) * scale)
+            p.add_((torch.randn(p.shape, generator=g) * scale).to(p.device))
 
 
 def c92_gates(m, seed):
