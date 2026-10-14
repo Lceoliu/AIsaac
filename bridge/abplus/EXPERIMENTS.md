@@ -7346,6 +7346,20 @@ opus 子代理，HPC128 `ws10`，C95 u61000（融合布局）：新基准 `abplu
 
 **结论**：功能正确、逐位等价性成立；速度上 actor 必须配 B29 的编译/折叠/分桶（否则时间侧的小算子把推理拉到 9 ms），学习器每次更新约慢 1.5–2 倍（8 worker、micro 1024 下 1.7 → 3.1–3.8 s），64 worker 的真实代价由 C96 的头 5 分钟给出；若 × 掉到 800 以下，候选：缩短 `--temporal-bptt`、学习器的时间侧改用 SDPA。
 
+### B31 去掉 B30 的搬运与重算：rollout 常驻 GPU、历史 token 变普通 token、房间 token 每 epoch 一次（2026-10-15，已完成）
+
+**实验目的**
+
+用户 10-15 01:xx："1、2、3 完全需要做"——B30 每步把 5.6 KB 的 K/V/s/o 从 GPU 拷到主机再拷回学习器；历史 token 的独立项每层多一次 q·kᵀ + logsumexp；块前房间 token 每个 part 重算 4 层。
+
+**实验方法**
+
+opus 子代理实现，我复核 GraphActor 的设备侧写入与 rollout 设备池；提交 `7c6a04b`。(1) 时间侧数据（每层 K/V bf16、s、o、房间 token 来源）放在每份 rollout 的设备张量池里（`t_assign/t_dest/t_free/t_grow`，池按需增长、增长前排空在飞的调用），actor 的图输出用 `index_copy_` 直接写进 rollout 行（`submit(tdest=)`、`_t_store`），学习器在设备上 gather（`temporal_inputs` 只建索引），`carry` 设备内拷贝上下文；每步跨总线 8 B 进 + 16 B 出（B30 约 5.6 KB 来回）；两份 rollout 约 570 MB 显存（各含自己的 255 步上下文）。(2) 历史 token 作为融合注意力里的一个普通 token（顺序 … 道具、历史、全局），门 g2 只乘它的值向量，无上一步时屏蔽它的 key（永远不用门值屏蔽，保证 g2 在 0 处有梯度）；`_hist/_hist_update` 及 packed/bucket 特例全部删除。(3) `TemporalAttention.room_table`：每个 epoch 对整份 rollout 的房间按 (worker, 局) 因果算一次每层 K/V，`sequence` 的块前房间从表里取，块内房间照旧有梯度。
+- **测试**：`test_temporal_smoke.py` 27 项全过（PC 与 HPC160 H20，含 GraphActor）：门零对关闭不再逐位——小模型 logit 最大差 0.139（logit 量级 4.8，2.9%）、C95 尺寸的 resume 0.103（2.3%），动作全同；逐步 actor 对一次性学习器 1.2e-6（容差收紧到 1e-5）；bf16 rollout 对 bf16 actor 6.8e-4；门零时 Q 和 hist_kind 也通过 key 得到梯度。CPU 基准：学习器块开销比 B30 ×1.45 → **×1.06–1.19**（+ 每 epoch 房间表 3–4 ms）；actor eager 无明显变化。
+- **冒烟**（HPC160 `ws9`，8 worker、C95 u65000 续训，与 C95 同节点）：无加速——0 Traceback，update **2.3–3.1 s**（B30 3.2–4.1，B24 1.7），infer 10.0 ms（B30 9.4）；加速——0 Traceback，update 2.4–3.5 s，**infer 4.7–4.95 ms（B30 + 加速 3.1）**，首次更新 KL 0.029（门零偏差所致），之后 0.01–0.028。编译时间都算在 8 分钟的冒烟里，infer 的差异不能定论。
+
+**结论**：学习器的目标达到（每次更新比 B30 省 25–30%）；actor 在加速标志下反而比 B30 慢 1.6 ms 的原因待查（候选：多一个 token 让记录落到更大的实体分桶、`_t_store` 的 index_copy、编译缓存未命中），由 C96 的 64 worker 真实数字判断。C96 改用 B31 启动（ws9 已切到 7c6a04b）。
+
 ### C96 B30 时间注意力续跑 C95：HPC160 `ws9`（2026-10-15，待 C95 结束后自动启动）
 
 **实验目的**
@@ -7354,7 +7368,7 @@ opus 子代理，HPC128 `ws10`，C95 u61000（融合布局）：新基准 `abplu
 
 **实验方法**
 
-HPC160 `ws9/runs/c96-temporal`（`ws9/hpc_c96.sh run <ckpt>`，`launch_c96_after_c95.sh` 在 C95 的 `finished` 后 90 秒从 `last.pt` 启动，10-15 00:35 布好；端口 49000 / 评估 49300），64 worker，参数 = C95 + `--temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256` + B29 `--actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32`，`--pickup-force 0:0`，12,000 小时，每 1,000 次更新 128 种子；首次编译约 18 分钟。
+HPC160 `ws9/runs/c96-temporal`（`ws9/hpc_c96.sh run <ckpt>`，`launch_c96_after_c95.sh` 在 C95 的 `finished` 后 90 秒从 `last.pt` 启动，10-15 00:35 布好，02:0x 把 ws9 切到 B31 `7c6a04b`；端口 49000 / 评估 49300），64 worker，参数 = C95 + `--temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256` + B29 `--actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32`，`--pickup-force 0:0`，12,000 小时，每 1,000 次更新 128 种子；首次编译约 18 分钟。
 
 **实验结果**（待启动）
 
