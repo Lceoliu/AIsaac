@@ -44,6 +44,12 @@ SDPA。可与 B29 的 `--actor-compile/--actor-fold/--actor-row-buckets` 共存�
 - 房间 token 在学习器里用存下的（stop-grad，除了 E_room/E_stage/W_r 以外没有梯度 → v1 中 W_r 也只通过"块内创建的房间 token"学：
   块内若发生离开房间，该房间 token 用块内算出的 o 重算，有梯度）。
 - 分块 BPTT 对 GRU 照旧（32 步一块嵌在 256 步的块里）。
+- **B31（10-15，用户批准）去掉三处多余的拷贝 / 重算，表达能力不变**：(1) rollout 的每步 K/V、s、o 和房间来源留在 GPU（`Rollout`
+  的设备张量池，actor 的 step 输出在设备上 `index_copy_` 写进去，学习器在设备上 gather；每步只有计数过总线：写入行号 8 B 进、
+  create/nroom/steps/stage_prev 16 B 出）；(2) 历史 token 是融合注意力里的**普通 token**（[…, 道具, 历史, 全局]，一次 softmax），
+  g2 乘在它的 value 上（同 B24 的 vscale），无上一步时 mask 掉它的 key（从不按门值 mask：g2 = 0 时梯度非零）；代价是门为零时
+  输出不再与关闭逐位相同（这把 key 占一份 softmax、value 为零，测试里 logit 偏差约 2–3%），Q 与历史 kind 在门为零时经 key 也有梯度；
+  (3) 块前房间 token 每个 PPO epoch 开始时对整个 rollout 算一次（`room_table`，stop-grad，当前参数），各块按索引取。
 
 ## 4. 标志与检查点
 

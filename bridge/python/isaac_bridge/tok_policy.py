@@ -118,14 +118,15 @@ including itself, a learned per-head bias over the step distance 0 .. W-1; rel[:
 token r_k = W_r o_exit + E_room[k] + E_stage[stage] (o_exit: o of the last step in the room left, k: the episode's k-th
 room, < temporal_rooms; past the cap no more are made) attends to the earlier room tokens and itself only, so its K / V
 per layer are computed once, when it is made. Output o_t = norm(x_t). Readout: the heads read z + mem_out(h) + g1 P(o_t),
-value_global norm_g(yg) (+ mem_out(h)) + g3 P_g(o_t). Feedback: a history token u_t = Q(o_{t-1}) + kind_hist enters the
-spatial blocks with presence g2 (x has_prev, 0 at an episode's first step): for every token's query in every layer the
-attention output becomes a + g2 sigma (v_u - a), sigma = sigmoid(q k_u / sqrt(dh) - lse(q, keys)); at g2 = 1 that is
-exactly the one softmax over the old keys and u's key (u an ordinary token of the fused attention), at g2 = 0 it is a
-(+-0: bit-identical; a literal zero-scaled extra token would still take softmax mass). u is updated like a token (its
-query over the record's keys and itself, proj, feed-forward) and read by nobody else. g1, g2, g3 are scalars, zero at
-the start: a model with temporal on and zero gates computes exactly the outputs of the model without it
-(tests/test_temporal_smoke.py). Room changes: a record whose map shows a current room (ROW map channel 3) other than
+value_global norm_g(yg) (+ mem_out(h)) + g3 P_g(o_t). Feedback (B31, 2026-10-15; B30 had a separate gated term with
+an extra q k^T and logsumexp per layer): a history token u_t = Q(o_{t-1}) + kind_hist is one more ORDINARY token of the
+fused attention, [..., items, history, global] (one softmax over all tokens, the blocks' projections and feed-forward;
+a temporal model without item / global tokens uses the fused layout for it), its VALUE vector scaled by g2 like the
+item / global gates of B24 (Block vscale), its KEY masked where there is no previous step (an episode's first step);
+the key is never masked by the gate, so d loss / d g2 is non-zero at g2 = 0 (and Q, kind_hist get a gradient through
+the key's softmax share). g1, g2, g3 are scalars, zero at the start; at zero gates the outputs are close to, not
+bit-identical with, the model without the temporal branch (the history key takes a share of the softmax with a zero
+value; tests/test_temporal_smoke.py measures it). Room changes: a record whose map shows a current room (ROW map channel 3) other than
 the last one shown in the episode, or with EV_EXIT / EV_NEW_ROOM (TemporalAttention.step; never at an episode's first
 step; whole-floor / run modes only: room-mode records have no map).
 Actor (TemporalState, per worker slot, plus a scratch slot for padded graph rows): one K / V tensor
@@ -136,10 +137,14 @@ writes their K / V into the cache in place and ONE scaled_dot_product_attention 
 directly (queries of the other slots are zeros, their rows discarded): no window is gathered or concatenated. The step
 runs outside torch.compile (a graph break) and is captured in GraphActor's CUDA graphs like the rest.
 Learner (sequence): chunks of up to temporal_bptt consecutive stored decisions of one worker; per chunk the stored K / V
-of the window - 1 decisions before it (stop-grad), the episode's room tokens made before the chunk (recomputed from their
-stored o_exit without gradient) and those made inside the chunk (recomputed WITH gradient through W_r, the embeddings
-and the layers, from the stored o_{t-1}: v1 approximation, see TEMPORAL_ATTENTION.md); block-causal attention with the
-same masks and relative bias as the actor. The history token uses the stored o_{t-1} (stop-grad).
+of the window - 1 decisions before it (stop-grad), the episode's room tokens made before the chunk (stop-grad: B31,
+their per-layer K / V computed once per PPO epoch for every room of the rollout, room_table, and gathered per chunk)
+and those made inside the chunk (recomputed WITH gradient through W_r, the embeddings and the layers, from the stored
+o_{t-1}: v1 approximation, see TEMPORAL_ATTENTION.md); block-causal attention with the same masks and relative bias as
+the actor. The history token uses the stored o_{t-1} (stop-grad).
+Storage (B31): the rollout's per-decision K / V, s and o stay on the GPU (train_tok.Rollout's device tensors, written
+by GraphActor / the eager step with index_copy_, gathered by temporal_inputs / temporal_part); only counters cross the
+bus (per record: its rollout row in, create / nroom / steps / stage_prev out).
 """
 import contextlib
 import os
@@ -393,9 +398,9 @@ class Block(nn.Module):
         self.math = False      # 2026-10-10 (B18): attention() as _MathAttention (TokPolicy.set_math_attention)
         self.ln_fast = False   # (B18) the packed layer norms as _LayerNorm
 
-    def forward(self, x, bias, ext=None, vscale=None, hist=None):
+    def forward(self, x, bias, ext=None, vscale=None):
         """vscale (B24 fused): [t] multipliers of the tokens' value vectors (1 for the old tokens, the item / global
-        gates for the extra ones); None: unscaled (as before). hist (B30): the history token (module docstring)."""
+        gates for the extra ones; B31: g2 for the history token); None: unscaled (as before)."""
         b, t, d = x.shape
         q, k, v = self.qkv(self.n1(x)).view(b, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
         if vscale is not None:
@@ -403,42 +408,8 @@ class Block(nn.Module):
         a = attention(q, k, v, bias, self.math)
         if ext is not None:   # 2026-10-12 (B21 / B22): the gated terms of the extra tokens (module docstring)
             a = a + self._ext(q, k, v, bias, ext)
-        if hist is not None:   # 2026-10-14 (B30)
-            a, oh = self._hist(q, k, v, a, bias, hist)
-            self._hist_update(hist, oh)
         x = x + self.proj(a.transpose(1, 2).reshape(b, t, d))
         return x + self.ff(self.n2(x))
-
-    def _hist(self, q, k, v, a, bias, hist, brec=None):
-        """(B30) The history token's term in one attention layout: q, k, v, a [B, heads, t, dh] (a: this layer's
-        attention output), bias [B, 1, 1, t]; brec [B]: the record of each row (None: row = record). Returns (a with
-        the term, the history query's own attention output [B, heads, dh]): a + w sigma (v_u - a), sigma =
-        sigmoid(q k_u * scale - lse(q k^T * scale + bias)) (the history key's weight in one softmax over the keys and
-        it), w = g2 x has_prev per record; the history query attends over the keys and itself in one softmax."""
-        B, H, t, dh = q.shape
-        y = hist['y']
-        qh, kh, vh = self.qkv(self.n1(y)).view(y.shape[0], 3, H, dh).unbind(1)
-        w = hist['w']
-        if brec is not None:
-            qh, kh, vh, w = qh.index_select(0, brec), kh.index_select(0, brec), vh.index_select(0, brec), \
-                w.index_select(0, brec)
-        qh, kh, vh = qh.to(q.dtype), kh.to(q.dtype), vh.to(q.dtype)
-        scale = dh ** -0.5
-        bias = bias.to(q.dtype)
-        lse = torch.logsumexp(torch.matmul(q, k.transpose(-1, -2)) * scale + bias, -1)
-        sig = torch.sigmoid((q * kh[:, :, None]).sum(-1) * scale - lse)
-        a = a + (w.to(a.dtype)[:, None, None, None] * sig[..., None].to(a.dtype)) * (vh[:, :, None].to(a.dtype) - a)
-        lg = torch.cat([(qh[:, :, None] * k).sum(-1) * scale + bias[:, :, 0], (qh * kh).sum(-1, keepdim=True) * scale],
-                       -1)
-        p = torch.softmax(lg.float(), -1).to(v.dtype)
-        oh = torch.matmul(p[:, :, None, :t], v)[:, :, 0] + p[..., t:] * vh.to(v.dtype)
-        return a, oh
-
-    def _hist_update(self, hist, oh):
-        """(B30) The history token after this layer from its attention output oh [n, heads, dh] (record order)."""
-        y = hist['y']
-        y = y + self.proj(oh.reshape(y.shape[0], -1))
-        hist['y'] = y + self.ff(self.n2(y))
 
     def _ext(self, q, k, v, bias, ext):
         """(B21 / B22) The extra tokens of this layer: returns the gated terms they add to the old tokens' attention
@@ -477,7 +448,7 @@ class Block(nn.Module):
         add = self._ext(q, k, v, ext['pbias'], ext)
         return add.transpose(1, 2).reshape(n * t, d).index_select(0, keep)
 
-    def forward_packed(self, x, bias, keep, shape, ext=None, vscale=None, hist=None):
+    def forward_packed(self, x, bias, keep, shape, ext=None, vscale=None):
         """forward() on the real tokens only: x [m, d] holds the tokens at the flat positions `keep` of a [b, t]
         layout (shape (b, t)). The per-token parts (layer norms, qkv, projection, feed-forward) run on the m real
         tokens; attention runs in the padded layout with the same mask (padded keys get weight exactly 0, padded
@@ -494,26 +465,17 @@ class Block(nn.Module):
             gpos = shape['gpos']
             full = qkv.new_zeros((shape['total'], 3 * d)).index_copy(0, gpos, qkv)
             if self.math and full.dtype == torch.float32 and not _autocast_on():   # (one node for all buckets)
-                a = _BucketAttention.apply(full, self.heads, shape['buckets'])
-                if hist is not None:   # (B30) the history term per bucket, on the buckets' layout
-                    a = self._hist_buckets(full, a, shape, hist)
-                a = a.index_select(0, gpos)
+                a = _BucketAttention.apply(full, self.heads, shape['buckets']).index_select(0, gpos)
                 if ext is not None:   # (B21 / B22)
                     a = a + self._ext_packed(qkv, ext)
                 x = x + self.proj(a)
                 return x + self.ff(layer_norm(self.n2, x, self.ln_fast))
-            outs, ohs, at = [], [], 0
-            for j_, (nb, t, bias_k) in enumerate(shape['buckets']):
+            outs, at = [], 0
+            for nb, t, bias_k in shape['buckets']:
                 q, k, v = full[at:at + nb * t].view(nb, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
-                a = attention(q, k, v, bias_k, self.math)
-                if hist is not None:   # (B30)
-                    a, oh = self._hist(q, k, v, a, bias_k, hist, shape['brecs'][j_])
-                    ohs.append(oh)
-                outs.append(a.transpose(1, 2).reshape(nb * t, d))
+                outs.append(attention(q, k, v, bias_k, self.math).transpose(1, 2).reshape(nb * t, d))
                 at += nb * t
             a = (torch.cat(outs) if len(outs) > 1 else outs[0]).index_select(0, gpos)
-            if hist is not None:
-                self._hist_update(hist, self._hist_gather(ohs, shape, hist))
             if ext is not None:   # (B21 / B22)
                 a = a + self._ext_packed(qkv, ext)
             x = x + self.proj(a)
@@ -524,34 +486,8 @@ class Block(nn.Module):
         a = attention(q, k, v, bias, self.math)
         if ext is not None:   # (B21 / B22)
             a = a + self._ext(q, k, v, bias, ext)
-        if hist is not None:   # (B30)
-            a, oh = self._hist(q, k, v, a, bias, hist)
-            self._hist_update(hist, oh)
         x = x + self.proj(a.transpose(1, 2).reshape(b * t, d).index_select(0, keep))
         return x + self.ff(layer_norm(self.n2, x, self.ln_fast))
-
-    def _hist_buckets(self, full, out, shape, hist):
-        """(B30) _BucketAttention's output `out` [rows, d] (the buckets' layout) with the history term of each bucket
-        added (q / k / v views of `full`); updates the history token."""
-        d = out.shape[1]
-        dh = d // self.heads
-        outs, ohs, at = [], [], 0
-        for j_, (nb, t, bias_k) in enumerate(shape['buckets']):
-            q, k, v = full[at:at + nb * t].view(nb, t, 3, self.heads, dh).permute(2, 0, 3, 1, 4)
-            a = out[at:at + nb * t].view(nb, t, self.heads, dh).transpose(1, 2)
-            a, oh = self._hist(q, k, v, a, bias_k, hist, shape['brecs'][j_])
-            outs.append(a.transpose(1, 2).reshape(nb * t, d))
-            ohs.append(oh)
-            at += nb * t
-        self._hist_update(hist, self._hist_gather(ohs, shape, hist))
-        return torch.cat(outs) if len(outs) > 1 else outs[0]
-
-    @staticmethod
-    def _hist_gather(ohs, shape, hist):
-        """(B30) the buckets' history outputs back in record order [n, heads, dh]."""
-        oh = torch.cat(ohs) if len(ohs) > 1 else ohs[0]
-        rec = torch.cat(shape['brecs']) if len(ohs) > 1 else shape['brecs'][0]
-        return oh.new_zeros((hist['y'].shape[0],) + tuple(oh.shape[1:])).index_copy(0, rec, oh)
 
 
 CHOICE_EMB, CHOICE_HIDDEN = 16, 64
@@ -872,11 +808,39 @@ class TemporalAttention(nn.Module):
         return dict(o=o, s=s, kv=torch.stack(kv_out, 1).to(dt), create=create, nroom=nroom1, steps=steps0,
                     stage_prev=stage_prev)
 
+    def room_table(self, o_store, td):
+        """(B31, the learner; once per PPO epoch, at its start) every room token of the rollout through the layers
+        without gradient, with the current parameters: per (worker, episode) group of temporal_inputs' plan td the room
+        tokens r = W_r o_exit + E_room[k] + E_stage[stage] (o_exit: rows r_src of o_store, the rollout's o) in their
+        order, each attending to the earlier ones of its group and itself (the actor's room query). Returns
+        [(K, V) per layer]: [rooms + 1, heads, dh] each (the last row: the plan's dummy room, the padding target of
+        temporal_part's gathers). Run it under the learner's autocast: the values are those the per-chunk recomputation
+        of the rooms made before a chunk gave (B30), up to summation order."""
+        D, H = self.D, self.H
+        dh = D // H
+        grp = td['r_grp']
+        G, Rg = grp.shape
+        dev = grp.device
+        with torch.no_grad():
+            xr = self.room_token(o_store.index_select(0, td['r_src']), td['r_k'], td['r_stage'])
+            valid = grp >= 0
+            x = xr.index_select(0, grp.clamp(min=0).reshape(-1)).view(G, Rg, D)
+            ar = torch.arange(Rg, device=dev)
+            ok = ((ar[:, None] >= ar[None]) & valid[:, None, :]) | torch.eye(Rg, dtype=torch.bool, device=dev)
+            bias = torch.where(ok, 0.0, torch.full((), T_NEG, device=dev))[:, None]
+            pos = td['r_gpos']
+            out = []
+            for lay in self.layers:
+                q, k, v = lay.qkv_of(x)   # [G, Rg, H, dh]
+                out.append((k.reshape(G * Rg, H, dh).index_select(0, pos), v.reshape(G * Rg, H, dh).index_select(0, pos)))
+                x = lay.finish(x, _attend(q, k, v, bias))
+        return out
+
     def sequence(self, s_rows, tp):
         """The learner's chunks (temporal_part's plan tp): s_rows [rows, D] (with gradient) -> o [rows, D]. Per chunk:
-        the room tokens made before it (stop-grad, recomputed from their stored o_exit), those made inside it (with
-        gradient), the stored K / V of the window - 1 decisions before it (stop-grad) and its own decisions, with the
-        actor's masks and relative bias (block-causal)."""
+        the room tokens made before it (stop-grad: their per-layer K / V from the epoch's room_table, B31), those made
+        inside it (with gradient), the stored K / V of the window - 1 decisions before it (stop-grad) and its own
+        decisions, with the actor's masks and relative bias (block-causal)."""
         C, Tc = tp['qep'].shape
         D, H, W, L = self.D, self.H, self.W, self.L
         dev = s_rows.device
@@ -886,17 +850,7 @@ class TemporalAttention(nn.Module):
         Rp, Ri = pre_ok.shape[1], in_ok.shape[1]
         rel = self.rel
         neg = torch.full((), T_NEG, device=dev)
-        # rooms made before the chunk: causal over their order (one episode), stop-grad
-        kv_pre = []
-        with torch.no_grad():
-            xr = self.room_token(tp['pre_o'], tp['pre_k'], tp['pre_stage'])
-            ar = torch.arange(Rp, device=dev)
-            ok = ((ar[:, None] >= ar[None]) & pre_ok[:, None, :]) | torch.eye(Rp, dtype=torch.bool, device=dev)
-            bias = torch.where(ok, 0.0, neg)[:, None]
-            for lay in self.layers:
-                q, k, v = lay.qkv_of(xr)
-                kv_pre.append((k, v))
-                xr = lay.finish(xr, _attend(q, k, v, bias))
+        kv_pre = tp['pre_kv']   # rooms made before the chunk: [(K, V) [C, Rp, H, dh] per layer] (B31: the table's)
         # rooms made inside the chunk (gradient): the earlier rooms of their episode and themselves
         xr = self.room_token(tp['in_o'], tp['in_k'], tp['in_stage'])
         ai = torch.arange(Ri, device=dev)
@@ -908,9 +862,10 @@ class TemporalAttention(nn.Module):
         for l_, lay in enumerate(self.layers):
             q, k, v = lay.qkv_of(xr)
             kv_in.append((k, v))
-            xr = lay.finish(xr, _attend(q, torch.cat([kv_pre[l_][0], k], 1), torch.cat([kv_pre[l_][1], v], 1), bias))
+            xr = lay.finish(xr, _attend(q, torch.cat([kv_pre[l_][0], k], 1),
+                                        torch.cat([kv_pre[l_][1], v], 1), bias))
         # the chunk's decisions: rooms (pre, in), the context (P decisions before the chunk), the chunk itself
-        ctx, ctx_ep = tp['ctx_kv'], tp['ctx_ep']   # [C, P, L, 2, D], [C, P]
+        ctx, ctx_ep = tp['ctx_kv'], tp['ctx_ep']   # [C, P, L, 2, D] (as stored), [C, P]
         P = ctx.shape[1]
         i = torch.arange(Tc, device=dev)
         d_ctx = i[:, None] + P - torch.arange(P, device=dev)[None]
@@ -967,26 +922,15 @@ class TemporalState:
             t_.zero_()
 
 
-def temporal_numpy(info):
-    """(B30) a step's outputs (TemporalAttention.step) as numpy for the rollout: dict(o float32 [n, D], s / kv as
-    stored (bfloat16 bits as uint16, else float32), create bool, nroom, steps, stage_prev int64)."""
-    def bits(x):
-        x = x.detach()
-        if x.dtype == torch.bfloat16:
-            return x.contiguous().view(torch.int16).cpu().numpy().view(np.uint16)
-        return x.float().cpu().numpy()
-    return dict(o=info['o'].detach().float().cpu().numpy(), s=bits(info['s'].to(info['kv'].dtype)),
-                kv=bits(info['kv']), create=info['create'].cpu().numpy().astype(bool),
-                nroom=info['nroom'].cpu().numpy().astype(np.int64), steps=info['steps'].cpu().numpy().astype(np.int64),
-                stage_prev=info['stage_prev'].cpu().numpy().astype(np.int64))
-
-
-def stored_to_tensor(a, device):
-    """(B30) a rollout array of K / V or s (uint16 = bfloat16 bits, or float32) as a tensor on the device (float32)."""
-    a = np.ascontiguousarray(a)
-    if a.dtype == np.uint16:
-        return torch.from_numpy(a.view(np.int16)).to(device).view(torch.bfloat16).float()
-    return torch.from_numpy(a).to(device).float()
+def temporal_out(info):
+    """(B31) a step's outputs (TemporalAttention.step) for the rollout (train_tok.store): the counters as numpy
+    (create bool, nroom, steps, stage_prev int64: one device -> host copy of 4 integers per record) and the step
+    token's K / V, s and o as the tensors they are, on their device (kv [n, L, 2, D] and s [n, D] in the state's
+    dtype, o [n, D] float32): store writes them into the rollout's device tensors (no copy to the host)."""
+    c = torch.stack([info['create'].long(), info['nroom'].long(), info['steps'].long(), info['stage_prev'].long()],
+                    1).cpu().numpy()
+    return dict(create=c[:, 0] != 0, nroom=c[:, 1], steps=c[:, 2], stage_prev=c[:, 3], kv=info['kv'].detach(),
+                s=info['s'].detach().to(info['kv'].dtype), o=info['o'].detach().float())
 
 
 def temporal_chunks(length, mask, T, T_mem):
@@ -1019,64 +963,82 @@ def temporal_chunks(length, mask, T, T_mem):
                 start=np.asarray(start, np.int64), chunks=len(start), tch=np.asarray(tch, np.int64))
 
 
-def temporal_inputs(roll, tch, P):
-    """(B30, the learner, host) per temporal chunk (tch rows: offset, rows, worker, first decision s0, real n) the
-    inputs of TemporalAttention.sequence from a rollout's temporal arrays (train_tok.Rollout: t_kv / t_ep [workers,
-    P + cap, ...] with the P decisions before the rollout first, rooms_* lists). Returns numpy dict: ctx_kv [C, P, L, 2,
-    D] (as stored), ctx_ep [C, P]; pre_o / pre_k / pre_stage / pre_valid [C, Rp(, D)] (the chunk's episode's rooms made
-    before it), in_o / in_k / in_stage / in_at / in_ep / in_valid [C, Ri(, D)] (rooms made at its real decisions, in_at
-    the chunk position that first sees it); Rp, Ri >= 1 (padding invalid)."""
+def temporal_inputs(roll, tch):
+    """(B30 / B31, the learner, once per update) the device plan of a rollout's temporal chunks (tch rows: offset,
+    rows, worker, first decision s0, real decisions) for TemporalAttention.room_table and (through temporal_part)
+    sequence. The rollout's K / V and o stay where the actor wrote them (train_tok.Rollout: device tensors t_kv
+    [rows, L, 2, D], t_o [rows, D]; host maps t_row: decision -> row, rooms_*: the room tokens' sources); only integer
+    index arrays are built here and sent to the device once. Returns dict:
+      kv, o: the rollout's tensors; ctx_rows [C, P] (rows of kv: the P decisions before each chunk), ctx_ep [C, P];
+      the room tokens (every one in the rollout's room lists, per worker in order, then one dummy): r_src [N + 1] (rows
+        of o: o_exit), r_k, r_stage, r_grp [G, Rg] (the rooms of each (worker, episode) in order, -1 padding: the
+        causal groups of room_table), r_gpos [N + 1] (each room's position in r_grp's flat layout);
+      pre_id / pre_valid [C, Rp] (the chunk's episode's rooms made before it; ids into the rooms, padding: the
+        dummy), in_id / in_at / in_ep / in_valid [C, Ri] (rooms made at its real decisions, in_at the chunk position
+        that first sees it); pre_n, in_n (numpy: the chunks' room counts); Rp, Ri >= 1."""
+    dev = roll.t_o.device
+    P = roll.tP
+    tch = np.asarray(tch, np.int64).reshape(-1, 5)
     C = len(tch)
-    ctx_kv = np.stack([roll.t_kv[w, s0:s0 + P] for _, _, w, s0, _ in tch]) if C else None
-    ctx_ep = np.stack([roll.t_ep[w, s0:s0 + P] for _, _, w, s0, _ in tch]) if C else None
+    ws, s0s = tch[:, 2], tch[:, 3]
+    ext = s0s[:, None] + np.arange(P)[None]
+    ctx_rows = roll.t_row[ws[:, None], ext]
+    ctx_rows = np.where(ctx_rows >= 0, ctx_rows, roll.t_kv.shape[0] - 1)   # (never -1: a guard, the scratch row)
+    ctx_ep = roll.t_ep[ws[:, None], ext]
+    nr = np.asarray(roll.rooms_n, np.int64)
+    off = np.cumsum(nr) - nr
+    N = int(nr.sum())
+    wid = np.repeat(np.arange(len(nr)), nr)
+    j = np.arange(N) - off[wid]
+    r_src = np.append(roll.rooms_src[wid, j], 0)
+    r_k = np.append(roll.rooms_k[wid, j], 0)
+    r_stage = np.append(roll.rooms_stage[wid, j], 0)
+    r_ep, r_t = roll.rooms_ep[wid, j], roll.rooms_t[wid, j]
+    newg = np.ones(N, bool)
+    newg[1:] = (wid[1:] != wid[:-1]) | (r_ep[1:] != r_ep[:-1])
+    gid = np.cumsum(newg) - 1
+    gstart = np.flatnonzero(newg)
+    within = np.arange(N) - gstart[gid] if N else np.zeros(0, np.int64)
+    G = len(gstart)
+    Rg = max(int(within.max()) + 1 if N else 1, 1)
+    grp = np.full((G + 1, Rg), -1, np.int64)
+    grp[gid, within] = np.arange(N)
+    grp[G, 0] = N   # (the dummy room: a group of its own)
+    r_gpos = np.append(gid * Rg + within, G * Rg)
     pre, inn = [], []
-    for _, _, w, s0, nr in tch:
-        k = int(roll.rooms_n[w])
-        rt, rep_ = roll.rooms_t[w, :k], roll.rooms_ep[w, :k]
+    for _, _, w, s0, nr_ in tch:
+        lo, m = off[w], nr[w]
+        rt_w, ep_w = r_t[lo:lo + m], r_ep[lo:lo + m]
         ep0 = roll.t_ep[w, P + s0]
-        pre.append(np.flatnonzero((rep_ == ep0) & (rt < s0)))
-        inn.append(np.flatnonzero((rt >= s0) & (rt < s0 + nr)))
+        pre.append(lo + np.flatnonzero((ep_w == ep0) & (rt_w < s0)))
+        inn.append(lo + np.flatnonzero((rt_w >= s0) & (rt_w < s0 + nr_)))
     Rp = max([len(x) for x in pre] + [1])
     Ri = max([len(x) for x in inn] + [1])
-    D = roll.rooms_o.shape[-1]
-    out = dict(ctx_kv=ctx_kv, ctx_ep=ctx_ep,
-               pre_o=np.zeros((C, Rp, D), np.float32), pre_k=np.zeros((C, Rp), np.int64),
-               pre_stage=np.zeros((C, Rp), np.int64), pre_valid=np.zeros((C, Rp), bool),
-               in_o=np.zeros((C, Ri, D), np.float32), in_k=np.zeros((C, Ri), np.int64),
-               in_stage=np.zeros((C, Ri), np.int64), in_at=np.zeros((C, Ri), np.int64),
-               in_ep=np.full((C, Ri), -3, np.int64), in_valid=np.zeros((C, Ri), bool),
-               pre_n=np.array([len(x) for x in pre], np.int64), in_n=np.array([len(x) for x in inn], np.int64))
-    for c, (_, _, w, s0, _) in enumerate(tch):
-        for name, sel in (('pre', pre[c]), ('in', inn[c])):
-            m = len(sel)
-            out[name + '_o'][c, :m] = roll.rooms_o[w, sel]
-            out[name + '_k'][c, :m] = roll.rooms_k[w, sel]
-            out[name + '_stage'][c, :m] = roll.rooms_stage[w, sel]
-            out[name + '_valid'][c, :m] = True
+    pre_id, in_id = np.full((C, Rp), N, np.int64), np.full((C, Ri), N, np.int64)
+    pre_valid, in_valid = np.zeros((C, Rp), bool), np.zeros((C, Ri), bool)
+    in_at, in_ep = np.zeros((C, Ri), np.int64), np.full((C, Ri), -3, np.int64)
+    for c in range(C):
+        pre_id[c, :len(pre[c])], pre_valid[c, :len(pre[c])] = pre[c], True
         m = len(inn[c])
-        out['in_at'][c, :m] = roll.rooms_t[w, inn[c]] - s0
-        out['in_ep'][c, :m] = roll.rooms_ep[w, inn[c]]
-    return out
+        in_id[c, :m], in_valid[c, :m] = inn[c], True
+        in_at[c, :m] = r_t[inn[c]] - s0s[c]
+        in_ep[c, :m] = r_ep[inn[c]]
+
+    def t(a):
+        return torch.from_numpy(np.ascontiguousarray(a)).to(dev)
+    return dict(kv=roll.t_kv, o=roll.t_o, ctx_rows=t(ctx_rows), ctx_ep=t(ctx_ep), r_src=t(r_src), r_k=t(r_k),
+                r_stage=t(r_stage), r_grp=t(grp), r_gpos=t(r_gpos), pre_id=t(pre_id), pre_valid=t(pre_valid),
+                in_id=t(in_id), in_at=t(in_at), in_ep=t(in_ep), in_valid=t(in_valid),
+                pre_n=np.array([len(x) for x in pre], np.int64), in_n=np.array([len(x) for x in inn], np.int64))
 
 
-def temporal_device(tin, device):
-    """(B30) temporal_inputs' arrays on the device (K / V as float32 from their stored form)."""
-    out = {}
-    for k, v in tin.items():
-        if k == 'ctx_kv':
-            out[k] = stored_to_tensor(v, device)
-        elif k.endswith('_n'):
-            out[k] = v   # (host: the parts' room counts)
-        else:
-            out[k] = torch.from_numpy(np.ascontiguousarray(v)).to(device)
-    return out
-
-
-def temporal_part(td, cids, counts, qep_rows, to_dev=None):
-    """(B30, the learner) TemporalAttention.sequence's plan for a part made of whole temporal chunks: td
-    (temporal_device), cids (numpy) the chunks in the part's order, counts (numpy) their rows (the part's rows are the
-    chunks' rows one after another), qep_rows [rows] (tensor) the episode serial of each row. Rooms trimmed to the
-    part's largest counts. to_dev: int64 numpy -> device tensor (train_tok: pinned, non-blocking; default .to)."""
+def temporal_part(td, cids, counts, qep_rows, table, to_dev=None):
+    """(B30 / B31, the learner) TemporalAttention.sequence's plan for a part made of whole temporal chunks: td
+    (temporal_inputs), cids (numpy) the chunks in the part's order, counts (numpy) their rows (the part's rows are the
+    chunks' rows one after another), qep_rows [rows] (tensor) the episode serial of each row, table: the epoch's
+    room_table. Everything is gathered on the device (the context's stored K / V, the rooms' K / V, the in-chunk
+    rooms' sources); rooms trimmed to the part's largest counts. to_dev: int64 numpy -> device tensor (train_tok:
+    pinned, non-blocking; default .to)."""
     dev = qep_rows.device
     if to_dev is None:
         def to_dev(a):
@@ -1092,12 +1054,20 @@ def temporal_part(td, cids, counts, qep_rows, to_dev=None):
     Rp = max(int(td['pre_n'][cids].max()), 1)
     Ri = max(int(td['in_n'][cids].max()), 1)
     imap_t = to_dev(imap.reshape(-1))
-    tp = dict(imap=imap_t, omap=to_dev(omap),
-              qep=qep_rows.index_select(0, imap_t).view(C, Tc),
-              ctx_kv=td['ctx_kv'].index_select(0, ci), ctx_ep=td['ctx_ep'].index_select(0, ci))
-    for k in ('pre_o', 'pre_k', 'pre_stage', 'pre_valid'):
-        tp[k] = td[k].index_select(0, ci)[:, :Rp]
-    for k in ('in_o', 'in_k', 'in_stage', 'in_at', 'in_ep', 'in_valid'):
+    kv = td['kv']
+    P = td['ctx_rows'].shape[1]
+    ctx_kv = kv.index_select(0, td['ctx_rows'].index_select(0, ci).reshape(-1)).view(C, P, *kv.shape[1:])
+    tp = dict(imap=imap_t, omap=to_dev(omap), qep=qep_rows.index_select(0, imap_t).view(C, Tc), ctx_kv=ctx_kv,
+              ctx_ep=td['ctx_ep'].index_select(0, ci))
+    pre_id = td['pre_id'].index_select(0, ci)[:, :Rp].reshape(-1)
+    tp['pre_valid'] = td['pre_valid'].index_select(0, ci)[:, :Rp]
+    tp['pre_kv'] = [(K.index_select(0, pre_id).view(C, Rp, *K.shape[1:]), V.index_select(0, pre_id).view(
+        C, Rp, *V.shape[1:])) for K, V in table]
+    in_id = td['in_id'].index_select(0, ci)[:, :Ri].reshape(-1)
+    tp['in_o'] = td['o'].index_select(0, td['r_src'].index_select(0, in_id)).view(C, Ri, -1)
+    tp['in_k'] = td['r_k'].index_select(0, in_id).view(C, Ri)
+    tp['in_stage'] = td['r_stage'].index_select(0, in_id).view(C, Ri)
+    for k in ('in_at', 'in_ep', 'in_valid'):
         tp[k] = td[k].index_select(0, ci)[:, :Ri]
     return tp
 
@@ -1292,16 +1262,18 @@ class TokPolicy(nn.Module):
           'chunk': the learner: dict(mode='chunk', plan=temporal_part(...), o_prev=[k, D] stored o_{t-1}, has=[k]
                   bool) for the first k records (chunk-major, the plan's rows), the rest (teacher records) without;
           'stored': dict(mode='stored', o=[k, D] stored o_t, o_prev, has): the stored outputs for the readout (the
-                  values recomputed at an update's start)."""
+                  values recomputed at an update's start).
+        (B31) With a temporal context the history token is a token of the fused layout: host plans of a packed batch
+        (packed_index / learner_plan) need hist= each record's has (False past the first k)."""
         if need_vg and self.gtok is None:
             raise ValueError('TokPolicy.forward: need_vg needs a global-token model (global_token=True)')
         tctx = hist = None
         if temporal is not None and self.tatt is not None:   # 2026-10-14 (B30)
             tctx, hist = self._temporal_in(b, temporal)
-        if self.fused:   # 2026-10-14 (B24): one attention over the old and the extra tokens
+        if self.fused or hist is not None:   # 2026-10-14 (B24): one attention over the old and the extra tokens
+            # (B31: the history token is one of them; a temporal model without item / global tokens uses this layout too)
             return self._forward_fused(b, entities, packed, need_h, mem, need_vg, tctx, hist)
         ext = self._ext_tokens(b)   # (B21 / B22; None when off: the code below is the one before)
-        hk = dict(hist=hist) if hist is not None else {}   # (B30; no keyword without it: the calls as before)
         n, used, fast, player, room, level, entity = self._embed_old(b, entities, packed)
         if fast:   # (B18) the door mlp on the real doors only; the real tokens grouped by kind, then in packed order
             door = embed(self.door, b['doors'].reshape(n * DOOR_CAP, -1).index_select(0, b['dkeep'])) + self.kind[2]
@@ -1311,7 +1283,7 @@ class TokPolicy(nn.Module):
                 real_ = torch.zeros(n * t_, dtype=torch.bool, device=xp.device).index_fill_(0, b['keep'], True)
                 ext.update(n=n, t=t_, keep=b['keep'], pbias=torch.zeros(
                     (n, 1, 1, t_), device=xp.device, dtype=xp.dtype).masked_fill(~real_.view(n, 1, 1, t_), -1e9))
-            x0 = self._blocks_bucketed(xp, b, ext, **hk).index_select(0, b['starts'])
+            x0 = self._blocks_bucketed(xp, b, ext).index_select(0, b['starts'])
             return self._heads(x0, need_h, mem, self._yg(ext), need_vg, tctx)
         door = embed(self.door, b['doors']) + self.kind[2]
         x = torch.cat([player[:, None], room[:, None], level[:, None], door, entity], 1)
@@ -1333,18 +1305,18 @@ class TokPolicy(nn.Module):
             if ext is not None:   # (B21 / B22: the padded layout of the extra attention)
                 ext.update(n=n, t=t, keep=keep, pbias=bias)
             if 'buckets' in b:   # 2026-10-10 (B18): attention per length bucket (learner_plan, from the host)
-                xp = self._blocks_bucketed(xp, b, ext, **hk)
+                xp = self._blocks_bucketed(xp, b, ext)
             else:
                 for l_, block in enumerate(self.blocks):
                     if ext is not None:
                         ext['l'] = l_
-                    xp = block.forward_packed(xp, bias, keep, (n, t), ext, **hk)
+                    xp = block.forward_packed(xp, bias, keep, (n, t), ext)
             x0 = xp.index_select(0, starts)   # the player's token: the first of each record
         else:
             for l_, block in enumerate(self.blocks):
                 if ext is not None:
                     ext['l'] = l_
-                x = block(x, bias, ext, **hk)
+                x = block(x, bias, ext)
             x0 = x[:, 0]
         return self._heads(x0, need_h, mem, self._yg(ext), need_vg, tctx)
 
@@ -1410,12 +1382,14 @@ class TokPolicy(nn.Module):
             return 0, 0
         return (self.itok.n_tok if self.itok is not None else 0), (1 if self.gtok is not None else 0)
 
-    def _vtable(self):
+    def _vtable(self, hist=False):
         """(B24 fused) [layers, 3] value multipliers per token group: old tokens (1), item tokens (itok.gate), the
-        global token (gtok.gate)."""
+        global token (gtok.gate); hist (B31): [layers, 4], the history token's (g2, the same at every layer) last."""
         one = self.kind.new_ones(len(self.blocks))
-        return torch.stack([one, self.itok.gate if self.itok is not None else one,
-                            self.gtok.gate if self.gtok is not None else one], 1)
+        cols = [one, self.itok.gate if self.itok is not None else one, self.gtok.gate if self.gtok is not None else one]
+        if hist:
+            cols.append(self.tatt.g_feed.expand(len(self.blocks)))
+        return torch.stack(cols, 1)
 
     def _forward_fused(self, b, entities, packed, need_h, mem, need_vg, tctx=None, hist=None):
         """forward() of a B24 model (item_tokens_fused): the item tokens (ItemTokens, compacted: the present ones first)
@@ -1424,11 +1398,14 @@ class TokPolicy(nn.Module):
         are masked keys like absent entities); the gates multiply the value vectors of the item / global tokens
         (Block vscale). The heads read the player token, value_global (and with memory mem_in) the global token.
         Packed layouts (the learner): the real item tokens are the first item_count() of a record, the global token is
-        each record's last real token; host plans (packed_index / learner_plan with n_item) include them."""
+        each record's last real token; host plans (packed_index / learner_plan with n_item) include them.
+        hist (B31, temporal models; _temporal_in's dict(y [n, width], has [n] bool)): the history token, one more
+        ordinary token before the global one, [..., items, history, global] (group 3 of the value multipliers: g2);
+        its key masked where has is False (packed layouts: not a real token there; host plans with hist=has)."""
         NI, G = self.extra_tokens()
-        hk = dict(hist=hist) if hist is not None else {}   # (B30; no keyword without it: the calls as before)
+        HS = int(hist is not None)
         n, used, fast, player, room, level, entity = self._embed_old(b, entities, packed)
-        vt = self._vtable()
+        vt = self._vtable(bool(HS))
         if NI:
             itok, ipres = self.itok(b, compact=True)
         if fast:   # (B18 fast path: learner_plan / plan_tokens with n_item; the real tokens grouped by kind)
@@ -1436,9 +1413,11 @@ class TokPolicy(nn.Module):
             src = [player, room, level, door, entity]
             if NI:
                 src.append(itok.reshape(n * NI, -1).index_select(0, b['ikeep']))
+            if HS:   # (every record's; xperm picks the present ones)
+                src.append(hist['y'].to(player.dtype))
             if G:
                 src.append(self.gtok.tok.view(1, -1).expand(n, -1))
-            xp = self._blocks_bucketed(torch.cat(src).index_select(0, b['xperm']), b, vgroup=(b['tgroup'], vt), **hk)
+            xp = self._blocks_bucketed(torch.cat(src).index_select(0, b['xperm']), b, vgroup=(b['tgroup'], vt))
             return self._heads(xp.index_select(0, b['starts']), need_h, mem,
                                xp.index_select(0, b['glast']) if G else None, need_vg, tctx)
         door = embed(self.door, b['doors']) + self.kind[2]
@@ -1450,14 +1429,18 @@ class TokPolicy(nn.Module):
         if NI:
             toks.append(itok)
             pads.append(~ipres)
+        if HS:   # (B31)
+            toks.append(hist['y'].to(player.dtype)[:, None])
+            pads.append(~hist['has'].bool()[:, None])
         if G:
             toks.append(self.gtok.tok.view(1, 1, -1).expand(n, 1, -1))
             pads.append(torch.zeros((n, 1), dtype=torch.bool, device=dev))
         x = torch.cat(toks, 1)
         pad = torch.cat(pads, 1)
         t = x.shape[1]
-        group = torch.cat([torch.zeros(t - NI - G, dtype=torch.int64, device=dev),
+        group = torch.cat([torch.zeros(t - NI - HS - G, dtype=torch.int64, device=dev),
                            torch.ones(NI, dtype=torch.int64, device=dev),
+                           torch.full((HS,), 3, dtype=torch.int64, device=dev),
                            torch.full((G,), 2, dtype=torch.int64, device=dev)])
         bias = torch.zeros((n, 1, 1, t), device=dev, dtype=x.dtype).masked_fill(pad[:, None, None], -1e9)
         if packed:
@@ -1473,14 +1456,14 @@ class TokPolicy(nn.Module):
             xp = x.reshape(n * t, -1).index_select(0, keep)
             tg = group.index_select(0, keep.remainder(t))
             if 'buckets' in b:
-                xp = self._blocks_bucketed(xp, b, vgroup=(tg, vt), **hk)
+                xp = self._blocks_bucketed(xp, b, vgroup=(tg, vt))
             else:
                 for l_, block in enumerate(self.blocks):
-                    xp = block.forward_packed(xp, bias, keep, (n, t), vscale=vt[l_].index_select(0, tg), **hk)
+                    xp = block.forward_packed(xp, bias, keep, (n, t), vscale=vt[l_].index_select(0, tg))
             return self._heads(xp.index_select(0, starts), need_h, mem, xp.index_select(0, last) if G else None,
                                need_vg, tctx)
         for l_, block in enumerate(self.blocks):
-            x = block(x, bias, vscale=vt[l_].index_select(0, group), **hk)
+            x = block(x, bias, vscale=vt[l_].index_select(0, group))
         return self._heads(x[:, 0], need_h, mem, x[:, -1] if G else None, need_vg, tctx)
 
     @staticmethod
@@ -1497,32 +1480,23 @@ class TokPolicy(nn.Module):
             return seq(self._conv_in(b[key]))
         return seq(self._conv_in(b[key].index_select(0, u))).index_select(0, b[key + '_i'])
 
-    def _blocks_bucketed(self, xp, b, ext=None, vgroup=None, hist=None):
+    def _blocks_bucketed(self, xp, b, ext=None, vgroup=None):
         """(B18) the blocks on the packed tokens xp with attention per length bucket (learner_plan's gpos, buckets).
         ext (B21 / B22): the extra tokens (forward's, with n, t, keep, pbias of the padded layout). vgroup (B24 fused):
-        (each packed token's group [m] (0 old, 1 item, 2 global), _vtable()): the value multipliers per layer."""
+        (each packed token's group [m] (0 old, 1 item, 2 global, 3 history), _vtable()): the value multipliers per
+        layer."""
         dev = xp.device
         ar = torch.arange(max(w_ for _, w_ in b['buckets']), device=dev)
         shape = dict(gpos=b['gpos'], total=sum(len(c_) * w_ for c_, w_ in b['buckets']), buckets=[
             (len(c_), w_, torch.zeros((len(c_), 1, 1, w_), device=dev, dtype=xp.dtype).masked_fill(
                 (ar[None, :w_] >= c_[:, None])[:, None, None], -1e9)) for c_, w_ in b['buckets']])
-        hk = {}
-        if hist is not None:   # (B30) each bucket row's record (its first position is a real token, the player)
-            starts = b['starts'].contiguous()
-            rec = torch.searchsorted(starts, torch.arange(xp.shape[0], device=dev), right=True) - 1
-            brec = rec.new_zeros(shape['total']).index_copy(0, b['gpos'], rec)
-            shape['brecs'], at_ = [], 0
-            for c_, w_ in b['buckets']:
-                shape['brecs'].append(brec[at_:at_ + len(c_) * w_].view(len(c_), w_)[:, 0])
-                at_ += len(c_) * w_
-            hk = dict(hist=hist)
         for l_, block in enumerate(self.blocks):
             if ext is not None:
                 ext['l'] = l_
             if vgroup is not None:
-                xp = block.forward_packed(xp, None, None, shape, vscale=vgroup[1][l_].index_select(0, vgroup[0]), **hk)
+                xp = block.forward_packed(xp, None, None, shape, vscale=vgroup[1][l_].index_select(0, vgroup[0]))
             else:
-                xp = block.forward_packed(xp, None, None, shape, ext, **hk)
+                xp = block.forward_packed(xp, None, None, shape, ext)
         return xp
 
     def _value_global(self, yg, h_new=None):
@@ -1574,7 +1548,8 @@ class TokPolicy(nn.Module):
 
     def _temporal_in(self, b, temporal):
         """(B30) forward's temporal context (the mode's inputs and, for 'step', the records' fields) and the history
-        token dict(y [n, width] float32, w [n] = g2 x has_prev) for the blocks."""
+        token dict(y [n, width] float32 = Q(o_{t-1}) + kind_hist, has [n] bool: a previous step exists) for the blocks
+        (B31: an ordinary token of the fused attention, its value scaled by g2, its key masked where has is False)."""
         n = b['player'].shape[0]
         mode = temporal['mode']
         ta = self.tatt
@@ -1597,9 +1572,8 @@ class TokPolicy(nn.Module):
             raise ValueError(f'TokPolicy: temporal mode {mode!r}')
         ctx = torch.autocast('cuda', enabled=False) if _autocast_on() else contextlib.nullcontext()
         with ctx:
-            y = ta.feed(o_prev.to(dev)) + ta.hist_kind
-            w = ta.g_feed * has.to(dev).float()
-        return tctx, dict(y=y, w=w)
+            y = ta.feed(o_prev.to(dev).float()) + ta.hist_kind
+        return tctx, dict(y=y, has=has.to(dev).bool())
 
     def _heads_temporal(self, x0, need_h, mem, yg, need_vg, tctx):
         """(B30) _heads / _heads_mem of a temporal model: the same computation (bit for bit at zero gates) with
@@ -1796,20 +1770,25 @@ def take(b, index):
     return out
 
 
-def packed_index(n_ent, n_doors, entities, n_item=None, item_tok=0, glob=0):
+def packed_index(n_ent, n_doors, entities, n_item=None, item_tok=0, glob=0, hist=None):
     """forward(packed=True)'s token positions from the host's entity and door counts (numpy, one per record) for a
     batch with `entities` entity tokens: (keep, starts) int64, the flat positions of the real tokens in the [n, t]
     layout (t = 3 + DOOR_CAP + entities) and each record's first real token among them. Put into the batch dict as
     'keep' and 'starts' (tensors on its device) they spare forward() the wait for the GPU that finding them costs.
     B24 (a fused model: TokPolicy.extra_tokens() = (item_tok, glob)): n_item the records' item_count(), t grows by
-    item_tok + glob (the real item tokens first, the global token always real)."""
+    item_tok + glob (the real item tokens first, the global token always real).
+    hist (B31, a temporal model's forward with its temporal context): per record whether it has the history token
+    (has_prev; bool); t grows by one more slot (after the item tokens, before the global token)."""
     n = len(n_ent)
-    real = np.ones((n, 3 + DOOR_CAP + entities + item_tok + glob), bool)
+    hs = int(hist is not None)
+    real = np.ones((n, 3 + DOOR_CAP + entities + item_tok + hs + glob), bool)
     real[:, 3:3 + DOOR_CAP] = np.arange(DOOR_CAP)[None] < np.asarray(n_doors)[:, None]
     real[:, 3 + DOOR_CAP:3 + DOOR_CAP + entities] = np.arange(entities)[None] < np.asarray(n_ent)[:, None]
     if item_tok:
         real[:, 3 + DOOR_CAP + entities:3 + DOOR_CAP + entities + item_tok] = \
             np.arange(item_tok)[None] < np.asarray(n_item)[:, None]
+    if hs:
+        real[:, 3 + DOOR_CAP + entities + item_tok] = np.asarray(hist, bool)
     counts = real.sum(1)
     return np.flatnonzero(real), np.cumsum(counts) - counts
 
@@ -1817,7 +1796,7 @@ def packed_index(n_ent, n_doors, entities, n_item=None, item_tok=0, glob=0):
 BUCKET_COST = 2.0e5   # a bucket's fixed cost in record x token^2 units (its ~12 more kernels per layer; H20, B18)
 
 
-def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, glob=0):
+def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, glob=0, hist=None):
     """2026-10-10 (B18, the learner's fast path): forward(packed=True)'s token layout for a batch with `entities`
     entity tokens, planned on the host per record (counts only; plan_tokens expands it per token on the device). A
     record has c = 3 + doors + entities real tokens, in slot order (player, room, map, its doors, its entities). The
@@ -1829,22 +1808,28 @@ def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, g
     buckets=[(counts, width)] per group in layout order).
     B24 (a fused model, TokPolicy.extra_tokens() = (item_tok, glob)): n_item the records' item_count(); a record's real
     tokens are then player, room, map, doors, entities, its real item tokens, the global token (c grows by
-    n_item + glob), rec gets two more columns (items, first real item) and m_item, item_tok, glob are set."""
+    n_item + glob), rec gets two more columns (items, first real item) and m_item, item_tok, glob are set.
+    hist (B31, packed_index's): the fused layout (also without item / global tokens) with the history token after
+    the real item tokens where hist is set (c grows by one there); rec gets a ninth column (0 / 1), 'hist' = 1."""
     ne = np.minimum(np.asarray(n_ent, np.int64), entities)
     nd = np.minimum(np.asarray(n_doors, np.int64), DOOR_CAP)
     cnt = 3 + nd + ne
     n = len(cnt)
-    fused = bool(item_tok or glob)
+    hs = int(hist is not None)
+    fused = bool(item_tok or glob or hs)
     if fused:
         ni = np.minimum(np.asarray(n_item, np.int64), item_tok) if item_tok else np.zeros(n, np.int64)
-        cnt = cnt + ni + glob
-    rec = np.empty((n, 8 if fused else 6), np.int64)
+        nh = np.asarray(hist, bool).astype(np.int64) if hs else None
+        cnt = cnt + ni + glob + (nh if hs else 0)
+    rec = np.empty((n, (9 if hs else 8) if fused else 6), np.int64)
     rec[:, 0], rec[:, 2], rec[:, 3] = cnt, nd, ne
     rec[:, 1] = np.cumsum(cnt) - cnt
     rec[:, 4] = np.cumsum(nd) - nd
     rec[:, 5] = np.cumsum(ne) - ne
     if fused:
         rec[:, 6], rec[:, 7] = ni, np.cumsum(ni) - ni
+    if hs:
+        rec[:, 8] = nh
     top = int(cnt.max())
     upto = np.cumsum(np.bincount(cnt, minlength=top + 1))   # records with c <= index
     w = np.arange(top + 1, dtype=np.float64)
@@ -1861,9 +1846,9 @@ def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, g
     group = np.where(cnt <= i, 0, np.where(cnt <= j, 1, 2))
     base = np.zeros(n, np.int64)
     out = dict(rec=rec, base=base, m=int(cnt.sum()), m_doors=int(nd.sum()), m_ent=int(ne.sum()),
-               t=3 + DOOR_CAP + entities + item_tok + glob, entities=entities, buckets=[])
+               t=3 + DOOR_CAP + entities + item_tok + hs + glob, entities=entities, buckets=[])
     if fused:
-        out.update(m_item=int(ni.sum()), item_tok=int(item_tok), glob=int(glob))
+        out.update(m_item=int(ni.sum()), item_tok=int(item_tok), glob=int(glob), hist=hs)
     at = 0
     for k in range(3):
         r = np.flatnonzero(group == k)
@@ -1889,8 +1874,9 @@ def plan_tokens(plan, rec, base):
     B24 (a fused plan, rec [n, 8]): xperm's source is [players; rooms; maps; real doors; real entities; real items;
     globals], and also: ikeep (the real item tokens' flat positions in the [n, item_tok] layout of ItemTokens(compact)),
     tgroup (each packed token's group: 0 old, 1 item, 2 global), glast (each record's last packed token: the global
-    token)."""
-    if rec.shape[1] == 8:
+    token). B31 (rec [n, 9], plan 'hist'): the history tokens' source rows [n] come after the real items' (one per
+    record, present where rec[:, 8]), tgroup 3."""
+    if rec.shape[1] >= 8:
         return _plan_tokens_fused(plan, rec, base)
     n, dev = rec.shape[0], rec.device
     m, m_d, m_e, t, e = plan['m'], plan['m_doors'], plan['m_ent'], plan['t'], plan['entities']
@@ -1911,15 +1897,15 @@ def _plan_tokens_fused(plan, rec, base):
     """(B24) plan_tokens of a fused plan (learner_plan with item tokens / a global token)."""
     n, dev = rec.shape[0], rec.device
     m, m_d, m_e, t, e = plan['m'], plan['m_doors'], plan['m_ent'], plan['t'], plan['entities']
-    m_i, NI, G = plan['m_item'], plan['item_tok'], plan['glob']
-    cnt, starts, nd, ne, dstart, estart, ni, istart = rec.unbind(1)
+    m_i, NI, G, HS = plan['m_item'], plan['item_tok'], plan['glob'], int(plan.get('hist', 0))
+    cnt, starts, nd, ne, dstart, estart, ni, istart = rec.unbind(1)[:8]
     ar = torch.arange(n, device=dev)
     r = torch.repeat_interleave(ar, cnt, output_size=m)
     within = torch.arange(m, device=dev) - starts[r]
     nd_r, ne_r, ni_r = nd[r], ne[r], ni[r]
     b1 = 3 + nd_r          # first entity
     b2 = b1 + ne_r         # first item
-    b3 = b2 + ni_r         # the global token
+    b3 = b2 + ni_r         # the history token (B31), else the global token
     zero = torch.zeros_like(within)
     slot = within + torch.where(within >= b1, DOOR_CAP - nd_r, zero) + torch.where(within >= b2, e - ne_r, zero) + \
         torch.where(within >= b3, NI - ni_r, zero)
@@ -1927,6 +1913,19 @@ def _plan_tokens_fused(plan, rec, base):
     dkeep = torch.repeat_interleave(ar * DOOR_CAP - dstart, nd, output_size=m_d) + torch.arange(m_d, device=dev)
     ikeep = torch.repeat_interleave(ar * NI - istart, ni, output_size=m_i) + torch.arange(m_i, device=dev)
     base_e, base_i, base_g = 3 * n + m_d, 3 * n + m_d + m_e, 3 * n + m_d + m_e + m_i
+    if HS:   # (B31) [..., items, history (n rows), globals]: the history slot between them
+        nh_r = rec[:, 8][r]
+        b4 = b3 + nh_r     # the global token
+        base_h, base_g = base_g, base_g + n
+        slot = slot + torch.where(within >= b4, 1 - nh_r, zero)
+        xperm = torch.where(within < 3, within * n + r, torch.where(
+            within < b1, 3 * n + dstart[r] + within - 3, torch.where(
+                within < b2, base_e + estart[r] + within - b1, torch.where(
+                    within < b3, base_i + istart[r] + within - b2, torch.where(within < b4, base_h + r, base_g + r)))))
+        tgroup = torch.where(within < b2, zero, torch.where(within < b3, zero + 1, torch.where(within < b4, zero + 3,
+                                                                                                zero + 2)))
+        return dict(keep=r * t + slot, starts=starts, ekeep=ekeep, dkeep=dkeep, xperm=xperm, gpos=base[r] + within,
+                    ikeep=ikeep, tgroup=tgroup, glast=starts + cnt - 1)
     xperm = torch.where(within < 3, within * n + r, torch.where(
         within < b1, 3 * n + dstart[r] + within - 3, torch.where(
             within < b2, base_e + estart[r] + within - b1, torch.where(
@@ -2053,7 +2052,11 @@ class GraphActor:
     Temporal models (2026-10-14, B30; TokPolicy temporal): `temporal` is the TemporalState (shared like the GRU table);
     the step runs inside the graphs (the records' table rows are their slots; rows past the call's records, the graph's
     fixed batch, use the state's scratch slot), the state is reset after the capture; result() leaves the step's
-    outputs in self.t_out (temporal_numpy's dict: what the rollout stores).
+    counters in self.t_out (dict create, nroom, steps, stage_prev: 16 bytes per record come back). B31: the step
+    token's K / V, s and o never leave the device: submit(tdest=...) names the rollout's device tensors and each
+    record's row there (8 bytes per record go in: with fold in the control block), and after the replay the call's
+    stream copies the graph's outputs into those rows (index_copy_, outside the graph: the rollout's tensors are not
+    captured and may be replaced between calls).
     """
 
     def __init__(self, model, rows_max, entities=32, stream=None, crn=True, memory=None, bf16=False, compile_mode=None,
@@ -2121,26 +2124,28 @@ class GraphActor:
         self.extra = None
         self.vg_on = getattr(model, 'gtok', None) is not None   # (B24) value_global as the last output column
         self.vg = None
-        # 2026-10-14 (B30, temporal models): the state, the slot of each graph row, the step's outputs: o, create, nroom,
-        # steps, stage_prev as float columns behind value_global; K / V per layer and s in a second buffer (state dtype)
+        # 2026-10-14 (B30, temporal models): the state, the slot of each graph row, the step's counters (create, nroom,
+        # steps, stage_prev) as float columns behind value_global; (B31) the step token's K / V per layer and s (state
+        # dtype) and o (float32) stay in the graphs' output tensors on the device, copied into the rollout's rows
         self.t_on = getattr(model, 'tatt', None) is not None
         self.t_out = None
         self.n_tcol = 0
+        self._tdest = None   # (B31) the submitted call's rollout rows (submit's tdest)
         if self.t_on:
             if temporal is None:
                 raise ValueError('GraphActor: a temporal model needs its TemporalState (temporal=)')
             self.tstate = temporal
             ta = model.tatt
-            self.n_tcol = ta.D + 4
+            self.n_tcol = 4
             self.t_dt = temporal.dtype
-            tw = ta.L * 2 * ta.D + ta.D
-            self.t_host = torch.zeros((n, tw), dtype=torch.int16 if self.t_dt == torch.bfloat16 else self.t_dt
-                                      ).pin_memory()
-            self.t_host_dt = self.t_host.view(self.t_dt)   # (the device's bfloat16 rows copied in as they are)
+            self.t_L2D = ta.L * 2 * ta.D
             self.t_outs, self._t_last = [], None
             self.tslot = torch.full((n,), temporal.scratch, dtype=torch.int64, device=dev)
             self.tslot_stage = torch.full((n,), temporal.scratch, dtype=torch.int64).pin_memory()
             self.tslot_np = self.tslot_stage.numpy()
+            self.tdest = torch.zeros(n, dtype=torch.int64, device=dev)   # (B31: the records' rollout rows, no fold)
+            self.tdest_stage = torch.zeros(n, dtype=torch.int64).pin_memory()
+            self.tdest_np = self.tdest_stage.numpy()
         self.out_host = torch.zeros((n, nh + 2 + self.n_extra + self.mem + int(self.vg_on) + self.n_tcol),
                                     dtype=torch.float32).pin_memory()
         self.out_np = self.out_host.numpy()
@@ -2155,12 +2160,16 @@ class GraphActor:
         if self.fold:   # (B29) the control block per row: table row (int64), keep, dup, crn flag (float32), crn uniforms
             H = sum(heads)
             cw = -(-(20 + 4 * H) // 8) * 8
+            self.c_dest_at = cw   # (B31, temporal: the record's rollout row (int64) after them)
+            if self.t_on:
+                cw += 8
             self.ctrl_stage = torch.zeros((n, cw), dtype=torch.uint8).pin_memory()
             self.ctrl = torch.zeros((n, cw), dtype=torch.uint8, device=dev)
             cs = self.ctrl_stage.numpy()
             self.c_widx, self.c_keep, self.c_dup, self.c_cf = (cs[:, 0:8].view(np.int64)[:, 0], cs[:, 8:12].view(
                 np.float32)[:, 0], cs[:, 12:16].view(np.float32)[:, 0], cs[:, 16:20].view(np.float32)[:, 0])
             self.c_cu = cs[:, 20:20 + 4 * H].view(np.float32)
+            self.c_dest = cs[:, cw - 8:cw].view(np.int64)[:, 0] if self.t_on else None
             self.c_dup[:] = 1.0
             self.c_keep[:] = 1.0
             # (the staging copy skips the entity rows a graph does not read: ROW 'ent' rows past its size; their bytes
@@ -2211,11 +2220,12 @@ class GraphActor:
             if vg_on:   # (B24) value_global
                 cols.append(outs[-1].float()[:, None])
             tkv = None
-            if t_on:   # (B30) the step's outputs for the rollout
+            if t_on:   # (B30) the step's outputs for the rollout: the counters to the host, (B31) the rest stays
                 ti = tdict['out']
-                cols += [ti['o'].float(), ti['create'].float()[:, None], ti['nroom'].float()[:, None],
+                cols += [ti['create'].float()[:, None], ti['nroom'].float()[:, None],
                          ti['steps'].float()[:, None], ti['stage_prev'].float()[:, None]]
-                tkv = torch.cat([ti['kv'].reshape(ti['kv'].shape[0], -1), ti['s'].to(ti['kv'].dtype)], 1)
+                tkv = (torch.cat([ti['kv'].reshape(ti['kv'].shape[0], -1), ti['s'].to(ti['kv'].dtype)], 1),
+                       ti['o'].float())
             ex = extra(b, outs, h_in) if extra is not None else None   # (B29 measurement aid: stays on the device)
             return torch.cat(cols, 1), h_last, ex, tkv
 
@@ -2277,13 +2287,17 @@ class GraphActor:
             self.tstate.reset_()
             torch.cuda.synchronize()
 
-    def submit(self, rows, pending, widx=None, reset=None):
+    def submit(self, rows, pending, widx=None, reset=None, tdest=None):
         """Start a call (returns at once; False if it does not fit). rows: a C-contiguous ROW array, pending [n, heads]
         int64. The next submit may only follow this call's result(). Memory models: widx [n] the records' rows of the
-        state table (distinct), reset [n] bool (None: none) where an episode starts (its state is zero)."""
+        state table (distinct), reset [n] bool (None: none) where an episode starts (its state is zero).
+        tdest (B31, temporal models; train_tok Rollout.t_dest): dict(kv [rows, L, 2, D], s [rows, D], o [rows', D]
+        device tensors, obase (o's row = kv's row + obase), rows [n] int64 numpy: each record's row); None: the step's
+        K / V, s and o are not kept."""
         n = len(rows)
         if n > self.n:
             return False
+        self._tdest = tdest if self.t_on else None
         if self.fold:
             return self._submit_fold(rows, pending, widx, reset)
         if self.mem:
@@ -2292,6 +2306,8 @@ class GraphActor:
         if self.t_on:   # (B30) the records' slots; the graph's other rows on the scratch slot
             self.tslot_np[:n] = widx
             self.tslot_np[n:] = self.tstate.scratch
+            if self._tdest is not None:   # (B31) the records' rollout rows
+                self.tdest_np[:n] = self._tdest['rows']
         most = int(rows['n_ent'].max())
         g = 0 if most <= self.sizes[0] else (len(self.sizes) - 1 if len(self.sizes) == 2 else
                                              int(np.searchsorted(self.sizes, most)))
@@ -2321,12 +2337,14 @@ class GraphActor:
                 self.h_in[:n] = self.table.index_select(0, self.widx[:n]) * self.keep[:n, None]
             if self.t_on:   # (B30)
                 self.tslot.copy_(self.tslot_stage, non_blocking=True)
+                if self._tdest is not None:
+                    self.tdest[:n].copy_(self.tdest_stage[:n], non_blocking=True)
             self.graphs[g].replay()
             if self.mem:   # the new states back into the table
                 self.table.index_copy_(0, self.widx[:n], self.h_outs[g][:n])
             self.out_host[:n].copy_(self.outs[g][:n], non_blocking=True)
-            if self.t_on:   # (B30) the step's K / V and s
-                self.t_host_dt[:n].copy_(self.t_outs[g][:n], non_blocking=True)
+            if self._tdest is not None:   # (B31) the step's K / V, s and o into the rollout's rows, on the device
+                self._t_store(g, n, self.tdest[:n])
             self.done.record()
         self._n = n
         return True
@@ -2344,11 +2362,23 @@ class GraphActor:
             with torch.inference_mode():   # (the graphs draw uniforms: replay advances the RNG state they captured,
                 self.graphs[g].replay()    # an inference tensor since the capture ran in inference mode)
             self.out_host[:n].copy_(self.outs[g][:n], non_blocking=True)
-            if self.t_on:   # (B30) the step's K / V and s
-                self.t_host_dt[:n].copy_(self.t_outs[g][:n], non_blocking=True)
+            if self._tdest is not None:   # (B31) the step's K / V, s and o into the rollout's rows, on the device
+                a_ = self.c_dest_at
+                self._t_store(g, n, self.ctrl[:n, a_:a_ + 8].view(torch.int64)[:, 0].contiguous())
             self.done.record()
         self._n = n
         return True
+
+    def _t_store(self, g, n, rows):
+        """(B31) graph g's step outputs of the call's n records into the rollout tensors of self._tdest at rows (a
+        device int64 tensor [n]); on the call's stream, after the replay."""
+        td = self._tdest
+        tkv, o = self.t_outs[g]
+        kv = td['kv']
+        L2D = self.t_L2D
+        kv.index_copy_(0, rows, tkv[:n, :L2D].reshape((n,) + tuple(kv.shape[1:])).to(kv.dtype))
+        td['s'].index_copy_(0, rows, tkv[:n, L2D:].to(td['s'].dtype))
+        td['o'].index_copy_(0, rows + int(td.get('obase', 0)), o[:n].to(td['o'].dtype))
 
     def _pack_fold(self, rows, pending, widx, reset):
         """(fold) The records and the control block into the pinned staging buffers; returns the graph to replay."""
@@ -2366,6 +2396,8 @@ class GraphActor:
             self.c_widx[n:] = widx[0]
         if self.mem:
             self.c_keep[:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
+        if self._tdest is not None:   # (B31) each record's rollout row
+            self.c_dest[:n] = self._tdest['rows']
         self.c_dup[:n] = 0.0
         self.c_dup[n:] = 1.0
         self.c_cf[:] = 0.0
@@ -2388,22 +2420,15 @@ class GraphActor:
             self.h_used = out[:, nh + 2 + self.n_extra:nh + 2 + self.n_extra + self.mem]
         at = nh + 2 + self.n_extra + self.mem
         self.vg = out[:, at] if self.vg_on else None   # (B24) value_global
-        if self.t_on:   # (B30) the step's outputs, as temporal_numpy's dict
+        if self.t_on:   # (B30) the step's counters (B31: K / V, s and o went to the rollout on the device)
             tc = out[:, at + int(self.vg_on):]
-            D = tc.shape[1] - 4
-            raw = self.t_host[:self._n].numpy().copy()
-            if self.t_dt == torch.bfloat16:
-                raw = raw.view(np.uint16)
-            ta = self.model.tatt
-            self.t_out = dict(o=np.ascontiguousarray(tc[:, :D]), create=tc[:, D] > 0.5,
-                              nroom=np.rint(tc[:, D + 1]).astype(np.int64), steps=np.rint(tc[:, D + 2]).astype(np.int64),
-                              stage_prev=np.rint(tc[:, D + 3]).astype(np.int64),
-                              kv=raw[:, :ta.L * 2 * D].reshape(-1, ta.L, 2, D), s=raw[:, ta.L * 2 * D:])
+            self.t_out = dict(create=tc[:, 0] > 0.5, nroom=np.rint(tc[:, 1]).astype(np.int64),
+                              steps=np.rint(tc[:, 2]).astype(np.int64), stage_prev=np.rint(tc[:, 3]).astype(np.int64))
         return out[:, :nh].astype(np.int64), out[:, nh], out[:, nh + 1]
 
-    def act(self, rows, pending, widx=None, reset=None):
+    def act(self, rows, pending, widx=None, reset=None, tdest=None):
         """submit + result: (actions, log-probabilities, values), or None if it does not fit."""
-        return self.result() if self.submit(rows, pending, widx, reset) else None
+        return self.result() if self.submit(rows, pending, widx, reset, tdest) else None
 
 
 def _sdpa_math():

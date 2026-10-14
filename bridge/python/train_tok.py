@@ -229,30 +229,46 @@ def parse_groups(text, workers):
 
 class Rollout:
     """Decisions per worker, in arrival order.
-    temporal (2026-10-14, B30; dict(P, L, D, R, kv 'bf16' | 'fp32')): per decision the temporal step's outputs (t_kv
-    [workers, P + capacity, L, 2, D]: the step token's K / V per layer as stored (bfloat16 bits or float32), t_s: s_t,
-    t_o: o_t, t_ep: the worker's episode serial, t_step: the decision's index in its episode, t_rc: a room token made
-    there, t_nroom: the episode's room tokens after it); entry P + k is decision k, entries 0 .. P-1 hold the P decisions
-    before this rollout (carry: the learner's context of its first chunks). Per worker the room tokens' sources
-    (rooms_o: o of the last decision in the room left, rooms_stage, rooms_k: index in the episode, rooms_ep, rooms_t:
-    the decision that made it, -1 before this rollout; rooms_n): the rollout's own and the going episode's earlier ones."""
+    temporal (2026-10-14, B30; dict(P, L, D, R, kv 'bf16' | 'fp32', device, rows)): per decision the temporal step's
+    outputs. B31 (2026-10-15): the tensors stay on the device (the actor's and the learner's GPU; the CPU in tests and
+    without CUDA) in one pool of rows: t_kv [rows, L, 2, D] (the step token's K / V per layer, bfloat16 or float32), t_s
+    [rows, D] (s_t, same dtype), t_o [t_obase + rows, D] float32 (o_t; its first t_obase = workers x R rows hold the
+    carried room tokens' sources); rows = workers x P (the P decisions before this rollout, worker w's at w * P + j:
+    the learner's context of its first chunks, filled by carry) + `rows` pool rows (default workers x capacity; the
+    trainer passes about --rollout + 4 x workers and the pool grows if ever needed: t_grow) + one scratch row (where a
+    decision past capacity goes). The host keeps only integers: t_row [workers, P + capacity] (entry P + k = decision
+    k, entries 0 .. P-1 the decisions before; -1: no row yet) -> the row, t_ep: the worker's episode serial, t_step:
+    the decision's index in its episode, t_rc: a room token made there, t_nroom: the episode's room tokens after it. Per
+    worker the room tokens' sources (rooms_src: the t_o row of o of the last decision in the room left, rooms_stage,
+    rooms_k: index in the episode, rooms_ep, rooms_t: the decision that made it, -1 before this rollout; rooms_n): the
+    rollout's own and the going episode's earlier ones. Rows are assigned when a decision is submitted (t_dest) or
+    stored (store_temporal); the actor writes them on the device (GraphActor tdest / store's index_copy_)."""
 
     def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False, temporal=None):
         self.n, self.cap, self.nh = workers, capacity, n_heads
         self.t_kv = None   # (B30)
         if temporal:
+            import torch
             P, L, D, R = (int(temporal[k]) for k in ('P', 'L', 'D', 'R'))
-            kdt = np.uint16 if temporal.get('kv', 'bf16') == 'bf16' else np.float32
+            kdt = torch.bfloat16 if temporal.get('kv', 'bf16') == 'bf16' else torch.float32
+            dev = torch.device(temporal.get('device') or 'cpu')
             self.tP, self.tR = P, R
-            self.t_kv = np.zeros((workers, P + capacity, L, 2, D), kdt)
-            self.t_s = np.zeros((workers, P + capacity, D), kdt)
-            self.t_o = np.zeros((workers, P + capacity, D), np.float32)
+            self.t_pool = int(temporal.get('rows') or workers * capacity)
+            self.t_obase = workers * R
+            rows = workers * P + self.t_pool + 1
+            self.t_kv = torch.zeros((rows, L, 2, D), dtype=kdt, device=dev)
+            self.t_s = torch.zeros((rows, D), dtype=kdt, device=dev)
+            self.t_o = torch.zeros((self.t_obase + rows, D), device=dev)
+            self.t_row = np.full((workers, P + capacity), -1, np.int64)
+            self.t_row[:, :P] = np.arange(workers)[:, None] * P + np.arange(P)[None]
+            self.t_used = 0      # pool rows assigned
+            self.t_grown = 0     # times the pool grew
             self.t_ep = np.full((workers, P + capacity), -2, np.int64)
             self.t_step = np.zeros((workers, P + capacity), np.int64)
             self.t_rc = np.zeros((workers, P + capacity), bool)
             self.t_nroom = np.zeros((workers, P + capacity), np.int64)
             rc = R + capacity
-            self.rooms_o = np.zeros((workers, rc, D), np.float32)
+            self.rooms_src = np.zeros((workers, rc), np.int64)
             self.rooms_stage = np.zeros((workers, rc), np.int64)
             self.rooms_k = np.zeros((workers, rc), np.int64)
             self.rooms_ep = np.full((workers, rc), -3, np.int64)
@@ -286,6 +302,58 @@ class Rollout:
     def reset(self):
         self.length[:] = 0
         self.open[:] = -1
+        if self.t_kv is not None:   # (B31) the pool's rows free again
+            self.t_used = 0
+            self.t_row[:, self.tP:] = -1
+
+    def t_free(self):
+        """(B31) pool rows not yet assigned."""
+        return self.t_pool - self.t_used
+
+    def t_scratch(self):
+        """(B31) the scratch row (decisions past capacity; never read)."""
+        return self.t_kv.shape[0] - 1
+
+    def t_grow(self, need=0):
+        """(B31) a larger pool (at least `need` more rows free): new device tensors, the assigned rows copied. Only
+        while no call in flight writes into the old ones (the trainer drains its calls first)."""
+        import torch
+        extra = max(int(need), self.t_pool // 4, 64)
+        keep = self.n * self.tP + self.t_used
+        rows = self.n * self.tP + self.t_pool + extra + 1
+        for name, base in (('t_kv', 0), ('t_s', 0), ('t_o', self.t_obase)):
+            old = getattr(self, name)
+            new = torch.zeros((base + rows,) + tuple(old.shape[1:]), dtype=old.dtype, device=old.device)
+            new[:base + keep] = old[:base + keep]
+            setattr(self, name, new)
+        self.t_pool += extra
+        self.t_grown += 1
+
+    def t_assign(self, a_idx, kk=None):
+        """(B31) the rows of decisions kk (default: the next one, length) of workers a_idx (distinct): assigned from
+        the pool where they have none (t_row), the scratch row past capacity. Returns int64 [n]."""
+        kk = self.length[a_idx] if kk is None else np.asarray(kk, np.int64)
+        P = self.tP
+        out = np.full(len(a_idx), self.t_scratch(), np.int64)
+        ok = kk < self.cap
+        if not ok.any():
+            return out
+        cur = self.t_row[a_idx[ok], P + kk[ok]]
+        new = cur < 0
+        k_new = int(new.sum())
+        if k_new > self.t_free():
+            self.t_grow(k_new - self.t_free())
+        if k_new:
+            cur[new] = self.n * P + self.t_used + np.arange(k_new)
+            self.t_used += k_new
+            self.t_row[a_idx[ok][new], P + kk[ok][new]] = cur[new]
+        out[ok] = cur
+        return out
+
+    def t_dest(self, a_idx):
+        """(B31) GraphActor.submit's tdest for the next decisions of workers a_idx: this rollout's device tensors and
+        the records' rows."""
+        return dict(kv=self.t_kv, s=self.t_s, o=self.t_o, obase=self.t_obase, rows=self.t_assign(a_idx))
 
     def carry(self, other):
         """Start this (empty) rollout with the other's open decisions (their rewards are still to come)."""
@@ -300,8 +368,10 @@ class Rollout:
             self.value_g[i, 0] = other.value_g[i, k]
         self.length[i], self.open[i] = 1, 0
         if self.t_kv is not None:   # (B30) the P decisions before this rollout, the open one, the episode's rooms
-            P = self.tP
-            names = ('t_kv', 't_s', 't_o', 't_ep', 't_step', 't_rc', 't_nroom')
+            import torch
+            P, R = self.tP, self.tR
+            names = ('t_ep', 't_step', 't_rc', 't_nroom')
+            src, dst, o_src, o_dst = [], [], [], []   # (B31) rows copied on the device: K / V, s, o; room sources
             for w in range(self.n):
                 k_ = int(other.open[w])
                 end = P + (k_ if k_ >= 0 else int(other.length[w]))
@@ -310,14 +380,34 @@ class Rollout:
                     a_[w, :P] = b_[w, end - P:end]
                     if k_ >= 0:
                         a_[w, P] = b_[w, end]
+                src.append(other.t_row[w, end - P:end])
+                dst.append(self.t_row[w, :P])
+                if k_ >= 0:   # (the open decision: decision 0 here)
+                    src.append(other.t_row[w, end:end + 1])
+                    dst.append(self.t_assign(np.array([w]), np.array([0])))
                 ep_now = other.t_ep[w, end] if k_ >= 0 else other.t_ep[w, end - 1]
                 m_ = int(other.rooms_n[w])
                 sel = np.flatnonzero(other.rooms_ep[w, :m_] == ep_now) if ep_now >= 0 else np.zeros(0, np.int64)
-                c_ = len(sel)
-                for name in ('rooms_o', 'rooms_stage', 'rooms_k', 'rooms_ep'):
+                c_ = len(sel)   # (<= R: an episode makes at most R room tokens)
+                for name in ('rooms_stage', 'rooms_k', 'rooms_ep'):
                     getattr(self, name)[w, :c_] = getattr(other, name)[w, sel]
                 self.rooms_t[w, :c_] = np.where((other.rooms_t[w, sel] == k_) & (k_ >= 0), 0, -1)
                 self.rooms_n[w] = c_
+                self.rooms_src[w, :c_] = w * R + np.arange(c_)   # (the carried sources' own rows of t_o)
+                o_src.append(other.rooms_src[w, sel])
+                o_dst.append(self.rooms_src[w, :c_])
+            src, dst = np.concatenate(src), np.concatenate(dst)
+            src = np.where(src >= 0, src, other.t_scratch())   # (never: every decision before `end` has its row)
+            dev = self.t_kv.device
+            si = torch.from_numpy(src).to(dev)
+            di = torch.from_numpy(dst).to(dev)
+            self.t_kv.index_copy_(0, di, other.t_kv.index_select(0, si).to(self.t_kv.dtype))
+            self.t_s.index_copy_(0, di, other.t_s.index_select(0, si).to(self.t_s.dtype))
+            self.t_o.index_copy_(0, di + self.t_obase, other.t_o.index_select(0, si + other.t_obase))
+            o_src, o_dst = np.concatenate(o_src), np.concatenate(o_dst)
+            if len(o_src):
+                self.t_o.index_copy_(0, torch.from_numpy(o_dst).to(dev),
+                                     other.t_o.index_select(0, torch.from_numpy(o_src).to(dev)))
 
 
 class Episodes:
@@ -498,7 +588,8 @@ class Episodes:
 def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, vg=None, tinfo=None):
     """Store the decisions just answered (workers a_idx, distinct) as their workers' open ones. h (memory): the GRU's
     input state of each. vg (B24, global-token models): value_global of each. tinfo (B30, temporal models): the
-    temporal step's outputs of each (tok_policy.temporal_numpy's dict)."""
+    temporal step's outputs of each (GraphActor.t_out's counters, or tok_policy.temporal_out's dict with the step's
+    tensors: store_temporal)."""
     kk = roll.length[a_idx]
     ok = kk < roll.cap   # cannot fail with the trainer's capacity; drop rather than overrun
     if not ok.all():
@@ -506,7 +597,8 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
         actions, logp, value = actions[ok], logp[ok], value[ok]
         h = h[ok] if h is not None else None
         vg = vg[ok] if vg is not None else None
-        tinfo = {k_: v_[ok] for k_, v_ in tinfo.items()} if tinfo is not None else None
+        tinfo = {k_: (v_[torch_from(ok, v_.device)] if not isinstance(v_, np.ndarray) else v_[ok])
+                 for k_, v_ in tinfo.items()} if tinfo is not None else None
     if tinfo is not None and roll.t_kv is not None:   # 2026-10-14 (B30)
         store_temporal(roll, a_idx, kk, rows, tinfo)
     if vg is not None and roll.value_g is not None:   # 2026-10-14 (B24)
@@ -522,15 +614,20 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
 
 def store_temporal(roll, a_idx, kk, rows, t):
     """(B30) The temporal step's outputs of decisions kk of workers a_idx into the rollout; a made room token's source
-    (o of the decision before, the room's stage and index, the episode) appended to the worker's room list."""
+    (o of the decision before, the room's stage and index, the episode) appended to the worker's room list.
+    B31: t holds the counters (numpy: create, nroom, steps, stage_prev); the K / V, s and o are on the device already
+    (GraphActor tdest) or, from the eager step (tok_policy.temporal_out), tensors in t written here into the decisions'
+    rows (index_copy_ on their device; rows assigned where they have none)."""
     P = roll.tP
     at = P + kk
     first = rows['first'] != 0
     ep_prev = roll.t_ep[a_idx, at - 1]
     ep = np.where(first, np.maximum(ep_prev, -1) + 1, np.maximum(ep_prev, 0))
-    roll.t_kv[a_idx, at] = t['kv']
-    roll.t_s[a_idx, at] = t['s']
-    roll.t_o[a_idx, at] = t['o']
+    if 'kv' in t:   # (the eager step's tensors)
+        r_ = torch_from(roll.t_assign(a_idx, kk), roll.t_kv.device)
+        roll.t_kv.index_copy_(0, r_, t['kv'].to(roll.t_kv.device, roll.t_kv.dtype))
+        roll.t_s.index_copy_(0, r_, t['s'].to(roll.t_s.device, roll.t_s.dtype))
+        roll.t_o.index_copy_(0, r_ + roll.t_obase, t['o'].to(roll.t_o.device, roll.t_o.dtype))
     roll.t_ep[a_idx, at] = ep
     roll.t_step[a_idx, at] = t['steps']
     roll.t_rc[a_idx, at] = t['create']
@@ -538,9 +635,9 @@ def store_temporal(roll, a_idx, kk, rows, t):
     for j in np.flatnonzero(t['create']):
         w = a_idx[j]
         r = int(roll.rooms_n[w])
-        if r >= roll.rooms_o.shape[1]:
+        if r >= roll.rooms_src.shape[1]:
             continue
-        roll.rooms_o[w, r] = roll.t_o[w, at[j] - 1]
+        roll.rooms_src[w, r] = roll.t_row[w, at[j] - 1] + roll.t_obase
         roll.rooms_stage[w, r] = t['stage_prev'][j]
         roll.rooms_k[w, r] = t['nroom'][j] - 1
         roll.rooms_ep[w, r] = ep[j]
@@ -549,12 +646,15 @@ def store_temporal(roll, a_idx, kk, rows, t):
 
 
 def temporal_rows(rl, flat, cap, device):
-    """(B30, the learner) per decision at flat positions (w * cap + t) of a rollout: its stored o_t, o_{t-1}, whether
-    it has one (not an episode's first decision) and its episode serial, as tensors on the device."""
+    """(B30, the learner) per decision at flat positions (w * cap + t) of a rollout: its stored o_t, o_{t-1} (B31:
+    gathered on the device from the rollout's t_o), whether it has one (not an episode's first decision) and its
+    episode serial, as tensors on the device."""
     w, t = flat // cap, flat % cap
     at = rl.tP + t
-    return dict(o=torch_from(rl.t_o[w, at], device), o_prev=torch_from(rl.t_o[w, at - 1], device),
-                has=torch_from(rl.t_step[w, at] > 0, device), ep=torch_from(rl.t_ep[w, at], device))
+    rows = np.stack([rl.t_row[w, at], rl.t_row[w, at - 1]])
+    rows = torch_from(np.where(rows >= 0, rows, rl.t_scratch()) + rl.t_obase, rl.t_o.device)   # (-1: never; a guard)
+    o = rl.t_o.index_select(0, rows.reshape(-1)).view(2, len(flat), -1).to(device)
+    return dict(o=o[0], o_prev=o[1], has=torch_from(rl.t_step[w, at] > 0, device), ep=torch_from(rl.t_ep[w, at], device))
 
 
 def torch_from(a, device):
@@ -632,7 +732,7 @@ def main():
                                          ITEM_SHARED_KEY, share_item_table, item_count,
                                          pad_optimizer_state, plan_tokens, remap_optimizer_state, rows_to_device,
                                          take, to_batch, used_entities, TemporalState, temporal_chunks,
-                                         temporal_device, temporal_inputs, temporal_numpy, temporal_part)
+                                         temporal_inputs, temporal_out, temporal_part)
     p = argparse.ArgumentParser()
     p.add_argument('--groups-file', required=True)
     p.add_argument('--groups', default='normal:8,boss:5,normal_big:3')
@@ -1444,8 +1544,10 @@ def main():
             out_['lab_model_rows'] = len(m_.rows)
             return out_
     capacity = args.rollout // n * 4 + 64
+    # (B30; B31: the per-decision K / V, s and o on the device, a pool of --rollout + 4 x workers rows: a rollout ends
+    # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
     t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
-                 kv=args.temporal_kv) if t_on else None   # (B30)
+                 kv=args.temporal_kv, device=device, rows=args.rollout + 4 * n + 64) if t_on else None
     roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg), Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg)
 
     def teach_pending(meta):
@@ -1749,12 +1851,16 @@ def main():
             b_reset = torch.from_numpy(rl.rows['first'].reshape(-1)[flat] != 0).to(device)
             b_h0 = torch.from_numpy(rl.h.reshape(-1, mem_dim)[mplan['start']]).to(device)   # each chunk's first state
             ev_rows = torch.from_numpy(np.flatnonzero(lw > 0)).to(device)
-        tch = TD = t_rows = None
+        tch = TD = t_rows = has_h = None
         if t_on:   # 2026-10-14 (B30): per temporal chunk its context, room tokens; per row its stored o_{t-1}, episode
+            # (B31: index plans only; the K / V and o stay on the device where the actor wrote them)
             t_t0 = time.perf_counter()
             tch = mplan['tch']
-            TD = temporal_device(temporal_inputs(rl, tch, rl.tP), device)
+            TD = temporal_inputs(rl, tch)
             t_rows = temporal_rows(rl, flat, capacity, device)
+            has_h = rl.t_step[flat // capacity, rl.tP + flat % capacity] > 0   # (the history token's presence, host)
+            if PROFILE:
+                torch.cuda.current_stream().synchronize()
             U['temporal'] += time.perf_counter() - t_t0
         sec('batch')
         acc = torch.zeros(5, device=device)        # pg, vf, ent, kl, clipped (sums over steps, on the GPU)
@@ -2031,7 +2137,7 @@ def main():
         nd_h = rl.rows['n_doors'].reshape(-1)[flat].astype(np.int64)
         # (B24 fused) the records' real item tokens; the plans' extra arguments (none without fused tokens)
         ni_h = item_count(rl.rows.reshape(-1)[flat], item_slots) if NI_f else None
-        xplan = dict(item_tok=NI_f, glob=G_f) if (NI_f or G_f) else {}
+        xplan = dict(item_tok=NI_f, glob=G_f) if (NI_f or G_f or t_on) else {}
 
         def teach_ni(pick_):
             """(B24) the teacher records' item counts (the host ring keeps them with --teach-gpu 1)."""
@@ -2062,7 +2168,15 @@ def main():
             """The mean over a part's rows: x.mean() (as before), or (memory) over its trained rows only."""
             return x.mean() if pm is None else (x * pm).sum() / pn
         pm = pn = n_sel = None
+        t_table = None
         for _ in range(args.epochs):
+            if t_on:   # (B31) the rooms made before each chunk: every room token's K / V once per epoch (stop-grad)
+                t_t0 = time.perf_counter()
+                with autocast():
+                    t_table = learner_model.tatt.room_table(rl.t_o, TD)
+                if PROFILE:
+                    torch.cuda.current_stream().synchronize()
+                U['temporal'] += time.perf_counter() - t_t0
             perm = torch.randperm(n_units, device=device)
             perm_h = perm.cpu().numpy()
             first_step = True
@@ -2195,6 +2309,8 @@ def main():
                             ni_p = np.concatenate([ni_p, L['v2_cnt']['n_item'][vpick]])
                     if xplan:   # (B24 fused: the real item tokens and the global token in the plans)
                         xplan['n_item'] = ni_p
+                    if t_on:   # (B31: the history token where a previous step exists; none for the teachers' records)
+                        xplan['hist'] = np.concatenate([has_h[part_h], np.zeros(len(ne_p) - len(part_h), bool)])
                     if args.packed and fast:   # B18: + the entity positions and the attention buckets, one copy
                         plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets, **xplan)
                         hn = ['rec', 'base']
@@ -2237,7 +2353,7 @@ def main():
                             tk_ = {}
                             if t_on:   # (B30) the temporal transformer over the part's chunks
                                 tk_ = dict(temporal=dict(mode='chunk', plan=temporal_part(
-                                    TD, np.asarray(cids_), tch[cids_, 1], t_rows['ep'][part], dev),
+                                    TD, np.asarray(cids_), tch[cids_, 1], t_rows['ep'][part], t_table, dev),
                                     o_prev=t_rows['o_prev'][part], has=t_rows['has'][part]))
                             outs_ = learner_model(mb, packed=bool(args.packed), mem=memd,
                                                   **(dict(need_vg=True) if glob_loss else {}), **tk_)
@@ -2848,7 +2964,17 @@ def main():
                             prof['act'] += time.perf_counter() - t1
                             continue
                         a_idx, sub, under_way = a_idx[~is_b], sub[~is_b], under_way[~is_b]
-                if free and free[-1].submit(sub, under_way, *((a_idx, sub['first'] != 0) if (mem_on or t_on) else ())):
+                tdest = None
+                if t_on and free:   # (B31) the decisions' rows of the rollout: the graph's outputs go there on the GPU
+                    if roll.t_free() < len(a_idx):   # (the pool full: never with its size; grow it, no call in flight)
+                        while inflight:
+                            finish(prof)
+                        torch.cuda.synchronize()
+                        roll.t_grow(len(a_idx))
+                        print(f'temporal (B31): the rollout pool grew to {roll.t_pool} rows', flush=True)
+                    tdest = roll.t_dest(a_idx)
+                if free and free[-1].submit(sub, under_way, *((a_idx, sub['first'] != 0) if (mem_on or t_on) else ()),
+                                            **(dict(tdest=tdest) if t_on else {})):
                     inflight.append((free.pop(), a_idx, sub, under_way, t1, busy))
                     prof['act'] += time.perf_counter() - t1
                     continue
@@ -2874,8 +3000,8 @@ def main():
                     else:
                         out_e = model.act(to_batch(sub, under_way, device), u=u_crn, need_vg=gtok_on, **tk_e)
                         actions, logp, value = out_e[:3]
-                    if t_on:
-                        t_e = temporal_numpy(tk_e['temporal']['out'])
+                    if t_on:   # (B31: the counters to the host; K / V, s and o written into the rollout by store)
+                        t_e = temporal_out(tk_e['temporal']['out'])
                 vg_e = out_e[-1].cpu().numpy() if gtok_on else None   # (B24: value_global, stored like the value)
                 if mem_on:
                     mem_table.index_copy_(0, torch.from_numpy(np.ascontiguousarray(a_idx, np.int64)).to(device), hn_e)
@@ -2928,6 +3054,8 @@ def main():
             job['proc_cores'] = (proc_now - proc_mark) / max(job['cycle_s'], 1e-9)
             proc_mark = proc_now
             handed += roll.usable()
+            if t_on:   # (B31) the actor's writes into the rollout's device tensors done before the learner reads them
+                torch.cuda.current_stream().synchronize()
             spare.carry(roll)
             roll, spare = spare, roll
             book.finished = []

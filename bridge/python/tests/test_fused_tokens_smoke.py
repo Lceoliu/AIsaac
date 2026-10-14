@@ -69,17 +69,22 @@ def realistic_rows(rng, n):
     return r
 
 
-def plan_kw(model, rows):
-    """(B24) the host plans' extra arguments of a model for ROW records (none when not fused)."""
+def plan_kw(model, rows, hist=None):
+    """(B24) the host plans' extra arguments of a model for ROW records (none when not fused). hist (B31): the records'
+    history-token presence (a temporal model's forward with a temporal context)."""
     NI, Gn = model.extra_tokens()
-    if not (NI or Gn):
+    if not (NI or Gn or hist is not None):
         return {}
-    return dict(n_item=TP.item_count(rows, model.itok.slots) if NI else None, item_tok=NI, glob=Gn)
+    out = dict(n_item=TP.item_count(rows, model.itok.slots) if NI else None, item_tok=NI, glob=Gn)
+    if hist is not None:
+        out['hist'] = np.asarray(hist, bool)
+    return out
 
 
-def fast_batch(model, b, rows, nb=3, xperm=True):
+def fast_batch(model, b, rows, nb=3, xperm=True, hist=None):
     """The learner's fast path batch (train_tok --learner-fast 1, --packed 1), fused-aware."""
-    plan = TP.learner_plan(b['n_ent'].numpy(), b['n_doors'].numpy(), b['ent'].shape[1], nb, **plan_kw(model, rows))
+    plan = TP.learner_plan(b['n_ent'].numpy(), b['n_doors'].numpy(), b['ent'].shape[1], nb,
+                           **plan_kw(model, rows, hist))
     tok = TP.plan_tokens(plan, torch.from_numpy(plan['rec']), torch.from_numpy(plan['base']))
     mb = dict(b)
     names = ['keep', 'starts', 'gpos'] + (['ekeep', 'dkeep', 'xperm'] if xperm else [])
@@ -90,9 +95,10 @@ def fast_batch(model, b, rows, nb=3, xperm=True):
     return mb
 
 
-def host_batch(model, b, rows):
+def host_batch(model, b, rows, hist=None):
     """forward(packed=True) with the host's positions (packed_index), fused-aware."""
-    keep, starts = TP.packed_index(b['n_ent'].numpy(), b['n_doors'].numpy(), b['ent'].shape[1], **plan_kw(model, rows))
+    keep, starts = TP.packed_index(b['n_ent'].numpy(), b['n_doors'].numpy(), b['ent'].shape[1],
+                                   **plan_kw(model, rows, hist))
     mb = dict(b)
     mb['keep'], mb['starts'] = torch.from_numpy(keep), torch.from_numpy(starts)
     return mb

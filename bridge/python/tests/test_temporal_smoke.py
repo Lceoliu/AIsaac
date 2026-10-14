@@ -1,31 +1,38 @@
-"""CPU smoke test of B30 (2026-10-14): the temporal transformer (TokPolicy(temporal=True), train_tok --temporal 1,
-rl/docs/TEMPORAL_ATTENTION.md): TemporalAttention / TemporalState / the history token / the learner's chunks.
+"""CPU smoke test of B30 (2026-10-14) / B31 (2026-10-15): the temporal transformer (TokPolicy(temporal=True), train_tok
+--temporal 1, rl/docs/TEMPORAL_ATTENTION.md): TemporalAttention / TemporalState / the history token / the learner's
+chunks. B31: the history token is an ordinary token of the fused attention (value x g2, key masked without a previous
+step), the rollout's K / V, s and o are tensors on the device (here the CPU) written by the step's outputs and gathered
+by the learner, the rooms made before a chunk come from a room table computed once per epoch.
 
 No game, no GPU needed (the GraphActor part runs only where CUDA is available). Plain script:
   cd rl/bridge/python && python tests/test_temporal_smoke.py
 Checks:
   (a) temporal off: the policy module == git HEAD's, bit for bit (plain, items + memory, fused C95-like; forward padded /
       packed / fast path, act with uniforms, chunked BPTT), no temporal config key;
-  (b) temporal on with zero gates (the other weights random) == off, bit for bit: the actor's steps (forward, act) over
-      a sequence with room changes and episode resets, the learner's chunk forward (padded, packed, fast path with math
-      attention on / off, several parts), the stored-output mode, temporal=None;
+  (b) temporal on with zero gates (the other weights random) CLOSE to off (B31: the history key takes a share of the
+      softmax with a zero value; max logit difference reported, tolerance ZERO_GATE_TOL): the actor's steps (forward,
+      act) over a sequence with room changes and episode resets, the learner's chunk forward (padded, packed, fast
+      path with math attention on / off, several parts), the stored-output mode; temporal=None == off bit for bit;
   (c) the actor's step-by-step forward (TemporalState, float32 K / V) == the learner's one-shot chunk forward over the
       same decisions (perturbed weights and gates g1 / g2 / g3, a window of 8 that wraps, room changes incl. one at a
       chunk's first decision and one in a new episode inside a chunk, EV_EXIT, the room cap, an episode reset, a
-      rollout hand-over (train_tok Rollout.carry: the context and the rooms of the going episode carried)): logits,
-      values, value_global, GRU states; parts of whole chunks; bfloat16 K / V close to float32;
+      rollout hand-over (train_tok Rollout.carry: the context and the rooms of the going episode carried), a rollout
+      pool that grows (Rollout.t_grow)): logits, values, value_global, GRU states; parts of whole chunks; the
+      rollout's device rows == the step's o; bfloat16 K / V close to float32 (actor; and a bfloat16 rollout through
+      the learner's chunks);
   (d) the chunked learner forward / backward (memory + temporal, fast path) reaches every temporal parameter (relative
-      bias, room / stage embeddings, W_r, Q, the history kind, P, P_g, g1 / g2 / g3); at zero gates only the gates get
-      a gradient from the temporal branch;
+      bias, room / stage embeddings, W_r, Q, the history kind, P, P_g, g1 / g2 / g3); at zero gates only the gates and
+      (B31: through the history key's softmax share) Q and the history kind get a gradient from the temporal branch;
   (e) a synthetic C95-style checkpoint (fused, memory 128, 8 item slots, global token, shared item table, gates of
       C95's size) resumed into a temporal model (default sizes 256 x 4, window 256, rooms 128): only tatt.* missing,
-      Adam remapped by name and stepping, and the outputs (actor steps, act, learner chunks) == the checkpoint's model,
-      bit for bit;
+      Adam remapped by name and stepping, and the outputs (actor steps, act, learner chunks) close to the checkpoint's
+      model (B31: max logit difference reported, tolerance ZERO_GATE_TOL);
   (f) eval_tok: a temporal checkpoint builds (build_eval_model), policy_actions with the per-worker CPU state ==
       act step by step; summary key 'temporal';
-  (g) CUDA only: GraphActor with a TemporalState == the eager step (fold off / on).
-  info: CPU times (indicative only): the learner's chunk forward + backward (256 decisions, fast path) and the actor's
-      eager step (16 records), temporal off vs on.
+  (g) CUDA only: GraphActor with a TemporalState and a device rollout (tdest) == the eager step (fold off / on):
+      values, the counters, the o written into the rollout's rows;
+  info: CPU times (indicative only): the learner's chunk forward + backward (256 decisions, fast path; the room table
+      outside the timing: once per epoch) and the actor's eager step (16 records), temporal off vs on.
 """
 import io
 import re
@@ -45,6 +52,9 @@ from isaac_bridge import tok_policy as TP   # noqa: E402
 from isaac_bridge.tok_obs import EV_EXIT   # noqa: E402
 
 FAIL = []
+ZERO_GATE_TOL = 0.5   # (B31) max |difference| of logits / values / GRU states, temporal on at zero gates vs off (random
+#                      weights, logits up to ~5): the history key's softmax share (~1 / tokens) shrinks every attention
+#                      output by that share; measured 0.1 - 0.35, the logits 2 - 4 % of their range
 BASE = dict(items=True, charge=True, ent_ext=True, pchar=True)
 SMALL = dict(width=64, layers=2, heads=4)
 DM = 16
@@ -139,7 +149,7 @@ def run_actor(model, seq, pend, mem_dim, st=None, kv_rolls=None, u=None):
             log['o'].append(td['out']['o'] if td is not None else torch.zeros(nw, 1))
             if roll is not None:
                 TT.store(roll, np.arange(nw), rows, pend[t], np.zeros((nw, len(model.heads)), np.int64),
-                         np.zeros(nw, np.float32), v.numpy(), 0, h_in.numpy(), vg.numpy(), TP.temporal_numpy(td['out']))
+                         np.zeros(nw, np.float32), v.numpy(), 0, h_in.numpy(), vg.numpy(), TP.temporal_out(td['out']))
         table = hn.clone()
     if u is not None:   # act with uniforms: a second pass on a fresh state copy
         st2 = TP.TemporalState(model, nw, 'cpu', st.dtype) if st is not None else None
@@ -156,12 +166,13 @@ def run_actor(model, seq, pend, mem_dim, st=None, kv_rolls=None, u=None):
     return {k: torch.stack(v) for k, v in log.items() if v}
 
 
-def new_rolls(model, cap=40):
+def new_rolls(model, cap=40, rows=(None, 5), kv='fp32'):
+    """Rollouts A and B (B31: device tensors on the CPU; B's pool of 5 rows has to grow)."""
     import train_tok as TT
     ta = model.tatt
-    tcfg = dict(P=ta.W - 1, L=ta.L, D=ta.D, R=ta.R, kv='fp32')
-    return TT.Rollout(NW, cap, len(model.heads), model.memory, True, tcfg), \
-        TT.Rollout(NW, cap, len(model.heads), model.memory, True, tcfg)
+    tcfg = dict(P=ta.W - 1, L=ta.L, D=ta.D, R=ta.R, kv=kv, device='cpu')
+    return TT.Rollout(NW, cap, len(model.heads), model.memory, True, dict(tcfg, rows=rows[0])), \
+        TT.Rollout(NW, cap, len(model.heads), model.memory, True, dict(tcfg, rows=rows[1]))
 
 
 def learner_outputs(model, roll, path='padded', micro=None, mode='chunk'):
@@ -173,8 +184,14 @@ def learner_outputs(model, roll, path='padded', micro=None, mode='chunk'):
     mask = np.arange(cap)[None] < roll.length[:, None]
     plan = TP.temporal_chunks(roll.length, mask, TT_CH, TT_MEM)
     flat, tch = plan['pos'], plan['tch']
-    td = TP.temporal_device(TP.temporal_inputs(roll, tch, roll.tP), 'cpu')
+    td = TP.temporal_inputs(roll, tch)
     trow = TT.temporal_rows(roll, flat, cap, 'cpu')
+    has_all = trow['has'].numpy()
+    table = None
+    if model.tatt is not None and mode == 'chunk':   # (B31: once per epoch in train_tok)
+        model.set_math_attention(path == 'fast')
+        table = model.tatt.room_table(roll.t_o, td)
+        model.set_math_attention(False)
     rows_all = roll.rows.reshape(-1)[flat]
     pend_all = roll.pending.reshape(-1, len(model.heads))[flat]
     h0_all = torch.from_numpy(roll.h.reshape(-1, model.memory)[plan['start']])
@@ -184,21 +201,22 @@ def learner_outputs(model, roll, path='padded', micro=None, mode='chunk'):
         b = TP.to_batch(rows, pend_all[lo:hi], 'cpu')
         memd = dict(h0=h0_all[lo // TT_MEM:hi // TT_MEM], T=TT_MEM,
                     reset=torch.from_numpy(rows['first'] != 0).view(-1, TT_MEM))
-        if mode == 'chunk':
-            tk = dict(mode='chunk', plan=TP.temporal_part(td, np.asarray(cids), tch[cids, 1], trow['ep'][lo:hi]),
+        if model.tatt is None:
+            tk = None
+        elif mode == 'chunk':
+            tk = dict(mode='chunk', plan=TP.temporal_part(td, np.asarray(cids), tch[cids, 1], trow['ep'][lo:hi], table),
                       o_prev=trow['o_prev'][lo:hi], has=trow['has'][lo:hi])
         else:
             tk = dict(mode='stored', o=trow['o'][lo:hi], o_prev=trow['o_prev'][lo:hi], has=trow['has'][lo:hi])
-        if model.tatt is None:
-            tk = None
         kw = dict(temporal=tk) if tk is not None else {}
+        hs = has_all[lo:hi] if tk is not None else None   # (B31: the history token in the host plans)
         model.set_math_attention(path == 'fast')
         if path == 'padded':
             o = model(b, mem=memd, need_vg=True, **kw)
         elif path == 'packed':
-            o = model(FT.host_batch(model, b, rows), packed=True, mem=memd, need_vg=True, **kw)
+            o = model(FT.host_batch(model, b, rows, hs), packed=True, mem=memd, need_vg=True, **kw)
         else:
-            o = model(FT.fast_batch(model, b, rows), packed=True, mem=memd, need_vg=True, **kw)
+            o = model(FT.fast_batch(model, b, rows, hist=hs), packed=True, mem=memd, need_vg=True, **kw)
         model.set_math_attention(False)
         outs.append([o[0], o[1], o[-1], o[-2]])
     return [torch.cat(x) for x in zip(*outs)], flat, plan['weight']
@@ -216,6 +234,13 @@ def maxd(xs, ys, sel=None):
     if sel is not None:
         xs, ys = [x[sel] for x in xs], [y[sel] for y in ys]
     return max(float((x.detach().float() - y.detach().float()).abs().max()) for x, y in zip(xs, ys))
+
+
+def _lgd(a, b):
+    """(B31) the logits' max |difference| and their range, as text."""
+    d = float((a['logits'] - b['logits']).abs().max())
+    r = float(b['logits'].abs().max())
+    return f'{d:.3f} of max |logit| {r:.2f} ({100 * d / r:.1f} %)'
 
 
 def same(xs, ys):
@@ -261,7 +286,7 @@ def main():
                 o_ref.append(ref(b, mem=cd, **vk))
         check(f'(a) temporal off == HEAD, every path [{tag}]', all(same(x, y) for x, y in zip(o_new, o_ref)))
 
-    # ------------------------------------------------------------ (b) on, zero gates == off
+    # ------------------------------------------------------------ (b) on, zero gates close to off
     cfg_off = dict(SMALL, memory=DM, **BASE, **FUSED)
     cfg_on = dict(cfg_off, **TK)
     for tag, co, cn in (('fused C95-like', cfg_off, cfg_on),
@@ -274,34 +299,37 @@ def main():
         pend = [M.synth_pending(rng, NW, m_on.heads) for _ in seq]
         u = [torch.rand((NW, sum(m_on.heads))) for _ in seq]
         if not m_on.global_token:   # (need_vg needs a global token: compare without it)
-            check(f'(b) on (zero gates) == off: forward without a global token [{tag}]',
-                  _plain_equal(m_on, m_off, seq, pend))
+            d_p = _plain_diff(m_on, m_off, seq, pend)
+            check(f'(b) on (zero gates) close to off: forward without a global token [{tag}]', d_p < ZERO_GATE_TOL,
+                  f'max |diff| (logits, value, danger, GRU state) {d_p:.2f}')
             continue
         st = TP.TemporalState(m_on, NW, 'cpu', torch.float32)
         ra, rb = new_rolls(m_on)
         log_on = run_actor(m_on, seq, pend, DM, st, (ra, rb), u)
         log_off = run_actor(m_off, seq, pend, DM, None, None, u)
-        check(f'(b) actor steps: on (zero gates) == off, bit for bit (forward, act) [{tag}]',
-              same([log_on[k] for k in ('logits', 'value', 'vg', 'h', 'act', 'logp')],
-                   [log_off[k] for k in ('logits', 'value', 'vg', 'h', 'act', 'logp')]))
+        keys = ('logits', 'value', 'vg', 'h')
+        d_a = maxd([log_on[k] for k in keys], [log_off[k] for k in keys])
+        acts = float((log_on['act'] == log_off['act']).float().mean())
+        check(f'(b) actor steps: on (zero gates) close to off (logits, values, GRU states; actions) [{tag}]',
+              d_a < ZERO_GATE_TOL and acts > 0.9, f'max |diff| {d_a:.2f}, logits {_lgd(log_on, log_off)}, '
+              f'same actions {acts:.2f}')
         check(f'(b) the temporal state moved (rooms made, o non-zero) [{tag}]',
               int(st.nroom.max()) > 0 and float(log_on['o'].abs().max()) > 0, f'rooms {st.nroom.tolist()}')
-        ok_l, det = True, []
+        worst = 0.0
         for path in ('padded', 'packed', 'fast', 'fast-nomath'):
             for micro in (None, 2 * TT_CH):
                 for roll in (ra, rb):
                     o1, _, _ = learner_outputs(m_on, roll, path, micro)
                     o2, _, _ = learner_outputs(m_off, roll, path, micro)
-                    if not same(o1, o2):
-                        ok_l = False
-                        det.append(f'{path}/{micro}: {maxd(o1, o2):.1e}')
+                    worst = max(worst, maxd(o1, o2))
         o1, _, _ = learner_outputs(m_on, rb, 'packed', None, mode='stored')
         o2, _, _ = learner_outputs(m_off, rb, 'packed', None)
-        check(f'(b) learner chunks: on (zero gates) == off, bit for bit (padded, packed, fast math on / off, parts; '
-              f'stored mode) [{tag}]', ok_l and same(o1, o2), ', '.join(det))
+        d_s = maxd(o1, o2)
+        check(f'(b) learner chunks: on (zero gates) close to off (padded, packed, fast math on / off, parts; stored '
+              f'mode) [{tag}]', max(worst, d_s) < ZERO_GATE_TOL, f'max |diff| chunks {worst:.2f}, stored {d_s:.2f}')
         b0 = TP.to_batch(seq[3], pend[3], dev)
         with torch.no_grad():
-            check(f'(b) temporal=None == off [{tag}]',
+            check(f'(b) temporal=None == off, bit for bit [{tag}]',
                   same(m_on(b0, mem=torch.ones(NW, DM), need_vg=True), m_off(b0, mem=torch.ones(NW, DM), need_vg=True)))
 
     # ------------------------------------------------------------ (c) step by step == one-shot chunks
@@ -318,6 +346,15 @@ def main():
           and bool((rb.rooms_t[:, :max(int(rb.rooms_n.max()), 1)] == -1).any()),
           f'rooms A {ra.rooms_n.tolist()}, B {rb.rooms_n.tolist()}, state {st.nroom.tolist()}')
     P_ = ra.tP
+    d_rows = 0.0   # (B31) the rollouts' device rows of o == the actor's o (A: steps 0 .. T1 - 1, B: T1 - 1 ..)
+    for roll_, offs_ in ((ra, 0), (rb, T1 - 1)):
+        for w in range(NW):
+            k_ = int(roll_.length[w])
+            r_ = torch.from_numpy(roll_.t_row[w, P_:P_ + k_] + roll_.t_obase)
+            d_rows = max(d_rows, float((roll_.t_o[r_] - log['o'][offs_:offs_ + k_, w]).abs().max()))
+    check('(c) device rollout: the rows hold the step\'s o (both rollouts, carried open decision), B\'s pool grew',
+          d_rows == 0.0 and rb.t_grown > 0 and ra.t_grown == 0, f'max |diff| {d_rows:.1e}, B pool {rb.t_pool} rows, '
+          f'grew {rb.t_grown}x')
     made = [int(ra.t_rc[w, P_:P_ + ra.length[w]].sum() + rb.t_rc[w, P_ + 1:P_ + rb.length[w]].sum()) for w in range(NW)]
     check('(c) room tokens made per worker = room changes + EV_EXIT per episode, capped at temporal_rooms',
           made == [3, 4, 3], f'{made}')
@@ -346,7 +383,7 @@ def main():
                 errs[(name, path, micro)] = maxd(o, actor_rows(log, flat, roll.cap, offs), sel)
     worst = max(errs.values())
     check('(c) actor step by step == learner chunks (logits, value, value_global, GRU state; both rollouts, every path, '
-          'parts)', worst < 2e-4, f'max |diff| {worst:.1e}')
+          'parts)', worst < 1e-5, f'max |diff| {worst:.1e}')
     with torch.no_grad():   # the gates matter: the same records with the gates closed differ
         m0 = TP.TokPolicy(**cfg_on).eval()
         m0.load_state_dict(m.state_dict())
@@ -360,6 +397,14 @@ def main():
     log16 = run_actor(m, seq, pend, DM, st16)
     d16 = float((log16['logits'] - log['logits']).abs().max())
     check('(c) bfloat16 K / V close to float32 (actor)', d16 < 0.1, f'max logit diff {d16:.3f}')
+    ra16, rb16 = new_rolls(m, kv='bf16')   # (--temporal-kv bf16: the rollout's K / V and s stored in bfloat16)
+    log16b = run_actor(m, seq, pend, DM, TP.TemporalState(m, NW, 'cpu', torch.bfloat16), (ra16, rb16))
+    d16b = 0.0
+    for roll_, offs_ in ((ra16, 0), (rb16, T1 - 1)):
+        o16, flat16, w16 = learner_outputs(m, roll_, 'fast', TT_CH)
+        d16b = max(d16b, maxd(o16, actor_rows(log16b, flat16, roll_.cap, offs_), torch.from_numpy(w16 > 0)))
+    check('(c) bfloat16 rollout storage (K / V, s): learner chunks close to the bfloat16 actor', d16b < 0.05 and
+          ra16.t_kv.dtype == torch.bfloat16, f'max |diff| {d16b:.1e}')
     m.eval()
 
     # ------------------------------------------------------------ (d) gradients of the chunked learner
@@ -385,9 +430,11 @@ def main():
         learner.tatt.g_vg.zero_()
     g0 = grads(learner)
     gates_ = ('tatt.g_read', 'tatt.g_feed', 'tatt.g_vg')
-    check('(d) at zero gates: the gates get a gradient, the branch behind them none',
-          all(g0[k] > 0 for k in gates_) and all(v == 0.0 for k, v in g0.items() if k not in gates_),
-          ', '.join(f'{k} {g0[k]:.2e}' for k in gates_))
+    key_ = ('tatt.feed.weight', 'tatt.feed.bias', 'tatt.hist_kind')   # (B31: the history key's softmax share)
+    check('(d) at zero gates: the gates get a gradient (g2 too: its key is not masked by the gate), Q and the history '
+          'kind through the key, the rest of the branch none',
+          all(g0[k] > 0 for k in gates_ + key_) and all(v == 0.0 for k, v in g0.items() if k not in gates_ + key_),
+          ', '.join(f'{k} {g0[k]:.2e}' for k in gates_ + key_))
 
     # ------------------------------------------------------------ (e) a C95-style checkpoint resumed with temporal
     _c95_resume(rng)
@@ -406,20 +453,21 @@ def main():
     return 1 if FAIL else 0
 
 
-def _plain_equal(m_on, m_off, seq, pend):
+def _plain_diff(m_on, m_off, seq, pend):
+    """(b) max |difference| of the outputs of a temporal model at zero gates and its twin without, step by step."""
     st = TP.TemporalState(m_on, NW, 'cpu', torch.float32)
     t_on = torch.zeros(NW, DM)
     t_off = torch.zeros(NW, DM)
-    ok = True
+    worst = 0.0
     for t, rows in enumerate(seq):
         b = TP.to_batch(rows, pend[t], 'cpu')
         keep = torch.from_numpy(rows['first'] == 0).float()[:, None]
         with torch.no_grad():
             o1 = m_on(b, mem=t_on * keep, temporal=dict(mode='step', state=st, slot=torch.arange(NW)))
             o2 = m_off(b, mem=t_off * keep)
-        ok &= same(o1, o2)
+        worst = max(worst, maxd(o1, o2))
         t_on, t_off = o1[-1], o2[-1]
-    return ok
+    return worst
 
 
 def _c95_resume(rng):
@@ -473,30 +521,37 @@ def _c95_resume(rng):
     ra = TT.Rollout(2, 16, len(dst.heads), Dm, True, tcfg)
     lo = _run2(dst, seq, pend, Dm, st, ra, u)
     lr_ = _run2(src, seq, pend, Dm, None, None, u)
-    check('(e) resumed model == the checkpoint\'s, bit for bit: actor steps (forward, act)',
-          all(torch.equal(lo[k], lr_[k]) for k in lo))
+    d_a = maxd([lo[k] for k in ('lg', 'v', 'vg', 'h')], [lr_[k] for k in ('lg', 'v', 'vg', 'h')])
+    acts = float((lo['a'] == lr_['a']).float().mean())
+    check('(e) resumed model close to the checkpoint\'s (zero gates): actor steps (forward, act)',
+          d_a < ZERO_GATE_TOL and acts > 0.9, f'max |diff| {d_a:.2f}, logits '
+          f'{_lgd(dict(logits=lo["lg"]), dict(logits=lr_["lg"]))}, same actions {acts:.2f}')
     mask = np.arange(ra.cap)[None] < ra.length[:, None]
     plan = TP.temporal_chunks(ra.length, mask, 8, 4)
     flat, tch = plan['pos'], plan['tch']
-    td = TP.temporal_device(TP.temporal_inputs(ra, tch, ra.tP), 'cpu')
+    td = TP.temporal_inputs(ra, tch)
     trow = TT.temporal_rows(ra, flat, ra.cap, 'cpu')
     rows = ra.rows.reshape(-1)[flat]
     b = TP.to_batch(rows, ra.pending.reshape(-1, len(dst.heads))[flat], 'cpu')
     memd = dict(h0=torch.from_numpy(ra.h.reshape(-1, Dm)[plan['start']]), T=4,
                 reset=torch.from_numpy(rows['first'] != 0).view(-1, 4))
-    tk = dict(mode='chunk', plan=TP.temporal_part(td, np.arange(len(tch)), tch[:, 1], trow['ep']),
-              o_prev=trow['o_prev'], has=trow['has'])
-    ok = True
+    hs = trow['has'].numpy()
+    d_l = 0.0
     for fast in (False, True):
         for mdl in (dst, src):
             mdl.set_math_attention(fast)
-        bb = FT.fast_batch(dst, b, rows) if fast else FT.host_batch(dst, b, rows)
+        tk = dict(mode='chunk', plan=TP.temporal_part(td, np.arange(len(tch)), tch[:, 1], trow['ep'],
+                                                      dst.tatt.room_table(ra.t_o, td)),
+                  o_prev=trow['o_prev'], has=trow['has'])
+        bb = FT.fast_batch(dst, b, rows, hist=hs) if fast else FT.host_batch(dst, b, rows, hs)
+        bs = FT.fast_batch(src, b, rows) if fast else FT.host_batch(src, b, rows)
         with torch.no_grad():
-            ok &= same(dst(bb, packed=True, mem=memd, need_vg=True, temporal=tk),
-                       src(bb, packed=True, mem=memd, need_vg=True))
+            d_l = max(d_l, maxd(dst(bb, packed=True, mem=memd, need_vg=True, temporal=tk),
+                                src(bs, packed=True, mem=memd, need_vg=True)))
     for mdl in (dst, src):
         mdl.set_math_attention(False)
-    check('(e) resumed model == the checkpoint\'s, bit for bit: learner chunks (packed, fast path)', ok)
+    check('(e) resumed model close to the checkpoint\'s (zero gates): learner chunks (packed, fast path)',
+          d_l < ZERO_GATE_TOL, f'max |diff| {d_l:.2f}')
 
 
 def _run2(model, seq, pend, Dm, st, roll, u):
@@ -513,7 +568,7 @@ def _run2(model, seq, pend, Dm, st, roll, u):
             lg, v, _, hn, vg = model(b, mem=h_in, need_vg=True, **kw)
             if roll is not None:
                 TT.store(roll, np.arange(nw), rows, pend[t], np.zeros((nw, len(model.heads)), np.int64),
-                         np.zeros(nw, np.float32), v.numpy(), 0, h_in.numpy(), vg.numpy(), TP.temporal_numpy(td['out']))
+                         np.zeros(nw, np.float32), v.numpy(), 0, h_in.numpy(), vg.numpy(), TP.temporal_out(td['out']))
         for k, x in zip(('lg', 'v', 'vg', 'h'), (lg, v, vg, hn)):
             out[k].append(x)
         table = hn.clone()
@@ -570,11 +625,13 @@ def _eval_path(rng, m, cfg_on):
 
 
 def _graph_actor(rng):
-    """(g) CUDA: GraphActor with a TemporalState == the eager step on a copy of the state."""
+    """(g) CUDA: GraphActor with a TemporalState and a device rollout == the eager step on a copy of the state."""
+    import train_tok as TT
     cuda = torch.device('cuda')
     cfg = dict(SMALL, memory=DM, **BASE, **FUSED, **TK)
     gm = TP.TokPolicy(**cfg).to(cuda).eval()
     perturb_all(gm, 21)
+    ta = gm.tatt
     seq = make_seq(rng, 4, 10, {(0, 3), (1, 5)}, {(2, 6)}, {(3, 4)})
     for fold in (False, True):
         tab = torch.zeros((6, DM), device=cuda)
@@ -582,12 +639,15 @@ def _graph_actor(rng):
         actor = TP.GraphActor(gm, 6, 32, stream=torch.cuda.Stream(), crn=False, memory=tab, temporal=st, fold=fold)
         st_e = TP.TemporalState(gm, 6, cuda, torch.float32)
         tab_e = torch.zeros((6, DM), device=cuda)
+        roll = TT.Rollout(6, 16, len(gm.heads), DM, True, dict(P=ta.W - 1, L=ta.L, D=ta.D, R=ta.R, kv='fp32',
+                                                                device=cuda))
         widx = np.array([5, 0, 3, 1])
         ok = True
         for t, rows in enumerate(seq):
             rows['n_ent'] = np.minimum(rows['n_ent'], 32)
             pend = M.synth_pending(rng, 4, gm.heads)
-            _, lp, val = actor.act(rows, pend, widx, rows['first'] != 0)
+            tdest = roll.t_dest(widx)
+            _, lp, val = actor.act(rows, pend, widx, rows['first'] != 0, tdest)
             torch.cuda.synchronize()
             wi = torch.from_numpy(widx).to(cuda)
             h_in = tab_e[wi] * torch.from_numpy(rows['first'] == 0).float().to(cuda)[:, None]
@@ -595,10 +655,17 @@ def _graph_actor(rng):
             with torch.no_grad():
                 _, v_ref, _, hn, _ = gm(TP.to_batch(rows, pend, cuda), mem=h_in, need_vg=True, temporal=td)
             tab_e[wi] = hn
+            o_rows = roll.t_o[torch.from_numpy(tdest['rows'] + roll.t_obase).to(cuda)]
+            kv_rows = roll.t_kv[torch.from_numpy(tdest['rows']).to(cuda)]
             ok &= np.allclose(val, v_ref.cpu().numpy(), atol=1e-3) and \
-                np.allclose(actor.t_out['o'], td['out']['o'].cpu().numpy(), atol=1e-3) and \
-                np.array_equal(actor.t_out['nroom'], td['out']['nroom'].cpu().numpy())
-        check(f'(g) GraphActor + TemporalState == the eager step (values, o, room counts) [fold {int(fold)}]', ok)
+                bool(torch.allclose(o_rows, td['out']['o'], atol=1e-3)) and \
+                bool(torch.allclose(kv_rows.float(), td['out']['kv'].float(), atol=1e-3)) and \
+                np.array_equal(actor.t_out['nroom'], td['out']['nroom'].cpu().numpy()) and \
+                np.array_equal(actor.t_out['create'], td['out']['create'].cpu().numpy())
+            TT.store(roll, widx, rows, pend, np.zeros((4, len(gm.heads)), np.int64), lp, val, 0, None, None,
+                     actor.t_out)
+        check(f'(g) GraphActor + TemporalState + device rollout == the eager step (values, counters, the rollout\'s '
+              f'o and K / V rows) [fold {int(fold)}]', ok)
 
 
 def bench(reps=3):
@@ -617,21 +684,33 @@ def bench(reps=3):
     m_off = off_twin(m_on, cfg)
     ta = m_on.tatt
     P = ta.W - 1
-    td = dict(ctx_kv=torch.randn(1, P, ta.L, 2, ta.D), ctx_ep=torch.zeros(1, P, dtype=torch.int64),
-              pre_o=torch.randn(1, 10, ta.D), pre_k=torch.arange(10)[None], pre_stage=torch.ones(1, 10, dtype=torch.int64),
-              pre_valid=torch.ones(1, 10, dtype=torch.bool), in_o=torch.randn(1, 2, ta.D),
-              in_k=torch.tensor([[10, 11]]), in_stage=torch.ones(1, 2, dtype=torch.int64),
-              in_at=torch.tensor([[40, 200]]), in_ep=torch.zeros(1, 2, dtype=torch.int64),
+    # (B31) a device rollout's plan by hand: the context's K / V and the rooms' sources in the pool's tensors
+    kv = torch.randn(P + 1, ta.L, 2, ta.D)
+    o_st = torch.randn(13, ta.D)
+    i64 = torch.int64
+    td = dict(kv=kv, o=o_st, ctx_rows=torch.arange(P)[None], ctx_ep=torch.zeros(1, P, dtype=i64),
+              r_src=torch.arange(13), r_k=torch.arange(13), r_stage=torch.ones(13, dtype=i64),
+              r_grp=torch.cat([torch.arange(12)[None], torch.full((1, 12), -1)]), r_gpos=torch.cat([torch.arange(12),
+                                                                                                    torch.tensor([12])]),
+              pre_id=torch.arange(10)[None], pre_valid=torch.ones(1, 10, dtype=torch.bool),
+              in_id=torch.tensor([[10, 11]]), in_at=torch.tensor([[40, 200]]), in_ep=torch.zeros(1, 2, dtype=i64),
               in_valid=torch.ones(1, 2, dtype=torch.bool), pre_n=np.array([10]), in_n=np.array([2]))
-    tp = TP.temporal_part(td, np.array([0]), np.array([n]), torch.zeros(n, dtype=torch.int64))
+    td['r_grp'][1, 0] = 12
+    m_on.set_math_attention(True)
+    t0 = time.perf_counter()
+    table = m_on.tatt.room_table(o_st, td)
+    t_table = time.perf_counter() - t0
+    m_on.set_math_attention(False)
+    tp = TP.temporal_part(td, np.array([0]), np.array([n]), torch.zeros(n, dtype=torch.int64), table)
     tk = dict(mode='chunk', plan=tp, o_prev=torch.randn(n, ta.D), has=torch.ones(n, dtype=torch.bool))
+    hs = np.ones(n, bool)
     b = TP.to_batch(rows, M.synth_pending(rng, n, m_on.heads), 'cpu')
     memd = dict(h0=torch.zeros(n // 32, 128), T=32, reset=torch.zeros(n // 32, 32, dtype=torch.bool))
     res = {}
     for tag, mdl, kw in (('off', m_off, {}), ('on', m_on, dict(temporal=tk))):
         mdl.train()
         mdl.set_math_attention(True)
-        fb = FT.fast_batch(mdl, b, rows)
+        fb = FT.fast_batch(mdl, b, rows, hist=hs if kw else None)
         ts = []
         for k in range(reps + 1):
             t0 = time.perf_counter()
@@ -659,7 +738,8 @@ def bench(reps=3):
         res[tag].append(np.median(ts))
     print(f'info: CPU, {torch.get_num_threads()} threads, median of {reps} (indicative only): learner chunk of 256 '
           f'decisions fwd+bwd (fast path) off {res["off"][0] * 1000:.0f} ms / on {res["on"][0] * 1000:.0f} ms '
-          f'(x{res["on"][0] / res["off"][0]:.2f}); actor eager step of 16 records (64 slots) off '
+          f'(x{res["on"][0] / res["off"][0]:.2f}; + the epoch\'s room table of 12 rooms {t_table * 1000:.1f} ms, '
+          f'once per epoch); actor eager step of 16 records (64 slots) off '
           f'{res["off"][1] * 1000:.1f} ms / on {res["on"][1] * 1000:.1f} ms (x{res["on"][1] / res["off"][1]:.2f})')
 
 
