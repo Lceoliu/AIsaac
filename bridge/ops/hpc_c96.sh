@@ -11,7 +11,10 @@ COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items 
   --lr 1e-4 --lr-final 1e-4 --episodes-per-state 8 --teacher-death-depths 2,4,8,16,32 --teacher-thread 1 --teacher-fork 1 \
   --teacher-share 0.1 --teacher-slots 6 --poll-wait 0.003 --memory gru --memory-dim 128 --memory-bptt 32 \
   --item-tokens 1 --global-token 1 --item-shared 1 --start-build-prob 0.5 --start-build-max 3 --start-build-mode pedestal \
-  --pickup-force 0:0 --reward heal=0.5,resource=0.25 --item-tokens-fused 1 --item-slots 8 \n  --temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256 \n  --actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
+  --pickup-force 0:0 --reward heal=0.5,resource=0.25 --item-tokens-fused 1 --item-slots 8 \
+  --temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256 \
+  --actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
+# (smoke: the compile flags are dropped below: a first compile takes ~18 min; the smoke checks the model, the run checks speed)
 if [ "$1" = smoke ]; then
   shift; CK=$1; shift
   tag=${TAG:-smoke-c96}
