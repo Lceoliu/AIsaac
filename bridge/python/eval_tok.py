@@ -40,6 +40,9 @@ A28 (2026-10-14), evaluation-only switches (all off by default: the evaluation i
   --no-pedestals 1 (floor / run modes): every collectible pedestal (type 5, variant 100) removed from the room before
   the step of each record that shows one (tok_floor, tok_pickup.NO_PEDESTAL_LUA through the bridge's lua command), so
   the policy never picks one up. Summary 'no_pedestals', 'pedestal_runs', 'pedestals_removed'.
+Temporal checkpoints (2026-10-14, B30, train_tok --temporal 1; config 'temporal'): a TemporalState per eval worker on
+the evaluation's device (K / V float32 on the CPU), stepped by every answered record and reset by an episode's first
+record, as the actor's in training (policy_actions). Summary 'temporal': true.
 """
 import argparse
 import json
@@ -130,13 +133,36 @@ def apply_ablation(model, what):
             model._ext_tokens = ext_tokens
         else:
             for block in model.blocks:
-                def fwd(x, bias, ext=None, vscale=None, _inner=block.forward):
+                def fwd(x, bias, ext=None, vscale=None, _inner=block.forward, **kw):   # (kw: B30's hist)
                     return _inner(x, bias.index_fill(-1, torch.tensor([bias.shape[-1] - 1], device=bias.device),
-                                                     -1e9), ext, vscale)
+                                                     -1e9), ext, vscale, **kw)
 
                 def packed(*a, **k):
                     raise NotImplementedError('--ablate global (fused): the padded forward only (eval_tok act)')
                 block.forward, block.forward_packed = fwd, packed
+
+
+def policy_actions(model, rows, pending, act_idx, device, greedy=False, mem_h=None, mem_reset=None, t_state=None):
+    """The policy's actions [k, heads] (numpy) for records `rows` of workers act_idx (a list, distinct) with their
+    actions under way: memory checkpoints read and update the workers' GRU states mem_h (zero where mem_reset, which is
+    then cleared); temporal checkpoints (B30) step the workers' slots of t_state (TemporalState; an episode's first
+    record resets its slot)."""
+    import torch
+    from isaac_bridge.tok_policy import to_batch
+    kw = {}
+    if t_state is not None:
+        kw['temporal'] = dict(mode='step', state=t_state,
+                              slot=torch.tensor(act_idx, dtype=torch.int64, device=t_state.kv.device))
+    b = to_batch(rows, pending, device)
+    with torch.inference_mode():
+        if mem_h is not None:   # (memory) the workers' states in, the new ones kept
+            ai = torch.tensor(act_idx, dtype=torch.int64, device=device)
+            h_in = mem_h.index_select(0, ai) * torch.from_numpy(~mem_reset[act_idx]).float().to(device)[:, None]
+            mem_reset[act_idx] = False
+            out_ = model.act(b, greedy=greedy, mem=h_in, **kw)
+            mem_h.index_copy_(0, ai, out_[3])
+            return out_[0].cpu().numpy()
+        return model.act(b, greedy=greedy, **kw)[0].cpu().numpy()
 
 
 def main():
@@ -235,7 +261,7 @@ def main():
             print(note, flush=True)
         info = dict(policy=str(args.checkpoint), update=ck.get('update'), decisions=ck.get('decisions'),
                     greedy=args.greedy, weights_not_exact=changed)
-        for key_ in ('item_tokens', 'global_token', 'item_tokens_fused'):   # 2026-10-12 (B21 / B22), 10-14 (B24)
+        for key_ in ('item_tokens', 'global_token', 'item_tokens_fused', 'temporal'):   # B21 / B22, B24, B30
             if model.config.get(key_):
                 info[key_] = True
         if args.fused_override:   # A28
@@ -268,6 +294,12 @@ def main():
     if mem_dim:
         info['memory'] = mem_dim
         print(f'memory: GRU state of size {mem_dim} per worker, reset at each episode start', flush=True)
+    t_state = None   # 2026-10-14 (B30): the temporal state per eval worker
+    if model is not None and getattr(model, 'tatt', None) is not None:
+        from isaac_bridge.tok_policy import TemporalState
+        t_state = TemporalState(model, n, device, torch.float32 if device.type == 'cpu' else None)
+        print(f'temporal: state per worker (window {model.tatt.W}, rooms {model.tatt.R}), reset at each episode start',
+              flush=True)
     hurt = np.zeros(n)
     events = np.zeros((n, 3), np.int64)   # rooms cleared, rooms entered, boss rooms cleared
     extra = np.zeros((n, 6), np.int64)    # run / items: exits, collectibles, active uses, pill uses, stage0, deepest
@@ -316,19 +348,9 @@ def main():
                 if model is None:
                     actions = np.stack([rng.integers(9, size=len(act_idx)), rng.integers(5, size=len(act_idx))]
                                        + [np.zeros(len(act_idx), np.int64)] * (nh - 2), 1)
-                elif mem_h is not None:   # (memory) the workers' states in, the new ones kept
-                    ai = torch.tensor(act_idx, dtype=torch.int64, device=device)
-                    h_in = mem_h.index_select(0, ai) * torch.from_numpy(~mem_reset[act_idx]).float().to(device)[:, None]
-                    mem_reset[act_idx] = False
-                    with torch.inference_mode():
-                        out_ = model.act(to_batch(rows[act_rows], pending[act_idx], device), greedy=args.greedy,
-                                         mem=h_in)
-                    mem_h.index_copy_(0, ai, out_[3])
-                    actions = out_[0].cpu().numpy()
-                else:
-                    with torch.inference_mode():
-                        actions = model.act(to_batch(rows[act_rows], pending[act_idx], device),
-                                            greedy=args.greedy)[0].cpu().numpy()
+                else:   # (memory: the workers' GRU states; B30 temporal: their temporal slots)
+                    actions = policy_actions(model, rows[act_rows], pending[act_idx], act_idx, device, args.greedy,
+                                             mem_h, mem_reset, t_state)
                 for j, i in enumerate(act_idx):
                     pending[i] = actions[j]
                     sampler.actions[i, :nh] = actions[j]
