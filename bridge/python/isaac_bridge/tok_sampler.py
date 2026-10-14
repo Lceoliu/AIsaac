@@ -138,7 +138,10 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # the TRAINER (the current per-episode probability of a forced episode), read by the worker; episodes drawn as
          # forced, forced decisions, EV_ITEM while forcing / outside forcing (ordinary episodes), pedestals spawned by
          # pedestal start builds
-         'pf_p', 'pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups', 'start_pedestals')
+         'pf_p', 'pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups', 'start_pedestals',
+         # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
+         # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
+         'np_runs', 'np_removed')
 TEACH_RING = 128     # teacher records per worker the trainer may fall behind by
 TEACH_META = 16      # per record: the action under way (3), nine danger bits, the move taken, depth, safe moves, 0
 ST = {k: i for i, k in enumerate(STATS)}
@@ -282,6 +285,10 @@ class TokSamplerConfig:
     # trainer writes it into the stats column 'pf_p'); (0, 0): off
     start_build_mode: str = 'inventory'
     pickup_force: tuple = (0.0, 0.0)
+    # A28 (2026-10-14, eval_tok --no-pedestals 1; floor / run modes, evaluation only): every collectible pedestal
+    # (type 5, variant 100) removed from the room before the step of each record that shows one (tok_floor,
+    # tok_pickup.NO_PEDESTAL_LUA through Bridge.lua's lua command); False: nothing changes
+    no_pedestals: bool = False
 
 
 def attach(names, workers):

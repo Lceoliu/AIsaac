@@ -278,6 +278,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     ped_mode = building and getattr(cfg, 'start_build_mode', 'inventory') == 'pedestal'
     pf_on = cfg.items and not evaluation and max(getattr(cfg, 'pickup_force', (0.0, 0.0)) or (0.0, 0.0)) > 0
     pf_track = pf_on or ped_mode   # the B23 ROW fields written, pickups counted
+    # A28 (2026-10-14, eval_tok --no-pedestals 1; evaluation only): every collectible pedestal removed from the room
+    # before the step of each record that shows one (tok_pickup.no_pedestal_due / NO_PEDESTAL_LUA through Bridge.lua's
+    # lua command in the episode's clone); off by default: nothing below changes then
+    np_on = bool(getattr(cfg, 'no_pedestals', False)) and evaluation
+    if np_on:
+        from .tok_pickup import NO_PEDESTAL_LUA, no_pedestal_due
     if pf_track:
         from .tok_pickup import PED_MAX, PickupForcer, parse_spawned, spawn_lua
         forcer = PickupForcer()
@@ -1456,6 +1462,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         mine[ST['pf_steps']] += pf_counts['steps'] - s0[0]
                         mine[ST['pf_pickups']] += pf_counts['forced'] - s0[1]
                         mine[ST['free_pickups']] += pf_counts['free'] - s0[2]
+                    if np_on and not done and no_pedestal_due(row):   # A28: the room's pedestals removed before
+                        #             the next step (a pickup happens only during a step's frames; this record itself
+                        #             still shows them, the next one no longer does)
+                        removed = episode.lua(NO_PEDESTAL_LUA)
+                        mine[ST['np_runs']] += 1
+                        mine[ST['np_removed']] += int(removed or 0)
                     if teaching and (hurt or (death_teaching and done == 2)):
                         hurts.append((t_ep, base.hold(), base_reseed, base_t))
                     if v2on:   # 2026-10-10 (teacher v2): the record's log, and a point at a hurt, a death or at random

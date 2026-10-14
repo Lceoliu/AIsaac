@@ -189,6 +189,33 @@ def spawn_lua(items):
     return SPAWN_LUA.format(ids=', '.join(str(int(i)) for i in items))
 
 
+# A28 (2026-10-14, eval_tok --no-pedestals 1; evaluation only): every collectible pedestal (EntityType.ENTITY_PICKUP 5,
+# PickupVariant.PICKUP_COLLECTIBLE 100; with or without an item, priced or free) of the current room removed, run
+# through Bridge.lua's lua command in the episode's clone by tok_floor (cfg.no_pedestals) before the step of a record
+# that shows one (no_pedestal_due). Returns the number removed.
+NO_PEDESTAL_LUA = """
+local n = 0
+for _, e in ipairs(Isaac.GetRoomEntities()) do
+  if e.Type == 5 and e.Variant == 100 then
+    e:Remove()
+    n = n + 1
+  end
+end
+return tostring(n)
+"""
+
+
+def no_pedestal_due(r):
+    """(A28) True when record r (a ROW element or a length-1 ROW view) shows a collectible pedestal among its entities
+    (ent_id type 5, variant 100, with or without an item), or holds the full ENT_CAP entities (the nearest ones only: a
+    pedestal may be among those left out). tok_floor then runs NO_PEDESTAL_LUA before the record's step."""
+    if getattr(r, 'shape', ()) == (1,):
+        r = r[0]
+    n = int(r['n_ent'])
+    ids = r['ent_id'][:n]
+    return n >= r['ent_id'].shape[0] or bool(((ids[:, 0] == 5) & (ids[:, 1] == 100)).any())
+
+
 def parse_spawned(result):
     """Bridge.lua's answer to spawn_lua -> [(id, x, y), ...] of the pedestals spawned."""
     out = []
