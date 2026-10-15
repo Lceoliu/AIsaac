@@ -7360,7 +7360,7 @@ opus 子代理实现，我复核 GraphActor 的设备侧写入与 rollout 设备
 
 **结论**：学习器的目标达到（每次更新比 B30 省 25–30%）；actor 在加速标志下反而比 B30 慢 1.6 ms 的原因待查（候选：多一个 token 让记录落到更大的实体分桶、`_t_store` 的 index_copy、编译缓存未命中），由 C96 的 64 worker 真实数字判断。C96 改用 B31 启动（ws9 已切到 7c6a04b）。
 
-### C96 B30 时间注意力续跑 C95：HPC160 `ws9`（2026-10-15，待 C95 结束后自动启动）
+### C96 B30/B31 时间注意力续跑 C95：HPC160 `ws9`（2026-10-15，进行中）
 
 **实验目的**
 
@@ -7370,7 +7370,10 @@ opus 子代理实现，我复核 GraphActor 的设备侧写入与 rollout 设备
 
 HPC160 `ws9/runs/c96-temporal`（`ws9/hpc_c96.sh run <ckpt>`，`launch_c96_after_c95.sh` 在 C95 的 `finished` 后 90 秒从 `last.pt` 启动，10-15 00:35 布好，02:0x 把 ws9 切到 B31 `7c6a04b`；端口 49000 / 评估 49300），64 worker，参数 = C95 + `--temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256` + B29 `--actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32`，`--pickup-force 0:0`，12,000 小时，每 1,000 次更新 128 种子；首次编译约 18 分钟。
 
-**实验结果**（待启动）
+**实验结果**（进行中）
+
+- **第一次启动失败**（10-15 04:5x 由启动器拉起，05:14 崩）：`--actor-compile max-autotune-no-cudagraphs` 在 64 行图上编译时 inductor 的 autotune 预编译抛异常（`select_algorithm.wait_on_futures`，8 worker 冒烟时没碰到），训练器在 GraphActor 构造时退出，**HPC160 空转了约 8 小时**（我当时额度用尽没能及时处理）。
+- **重启**（13:0x，`--actor-compile default`，其余不变，仍从 C95 `last.pt`）：5 分钟后 **867–890×**（collect 2.0 s = C95；update **2.9–3.0 s**，C95 2.1；infer 2.4–2.6 ms = C95，B31 冒烟里担心的 actor 变慢在 64 worker 下不存在），idle 0.79，KL 0.016–0.019（门零偏差，应回落），0 个 Traceback，显存 11 GB。12,000 小时按 880× 约 13.6 小时，预计 10-16 02:40 前后结束。差距全在学习器的 +0.9 s。
 
 ### A27 512 种子定论评估：各主线最终检查点（2026-10-13/14，3090）
 
@@ -7827,4 +7830,5 @@ C92 在 11,660 小时内对 C91 领先 0.06 层且门还在打开（`item_gate` 
 - **第八点**（u66000，约 8,900 小时入）：过层 **1.55**（到第四层 7，每局拿 1.70 件，受伤 6.8，用时 336 秒）。八点均值 1.55。
 - **第九点**（u67000，约 10,100 小时入）：过层 **1.50**（到第四层 6，每局拿 1.61 件，受伤 6.9，用时 325 秒）。九点均值 1.55，后五点 1.50 / 1.63 / 1.64 / 1.55 / 1.50。
 - **第十点**（u68000，约 11,300 小时入）：过层 **1.66**（到第四层 7，每局拿 1.85 件，受伤 6.8，用时 363 秒）。十点均值 1.56，后五点 1.63 / 1.64 / 1.55 / 1.50 / 1.66 ≈ 1.60。
+- **结束**（10-15 04:55，`finished 68684 updates 74387.7 game hours 11.24 h`：净 12,000 小时 **1,068×**，0 个 Traceback）。十个 128 种子点 1.41 / 1.83 / 1.41 / 1.45 / 1.50 / 1.63 / 1.64 / 1.55 / 1.50 / 1.66，均值 1.56；对照 C94 终点（128 种子 1.57 / 512 种子 1.46）。最终 `last.pt` 的 512 种子在 3090 `b24/runs/ev512/c95-final`（05:01 起）。
 

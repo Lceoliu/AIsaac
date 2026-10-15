@@ -14,7 +14,7 @@ COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items 
   --pickup-force 0:0 --reward heal=0.5,resource=0.25 --item-tokens-fused 1 --item-slots 8 \
   --temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256"
 # B29 actor speed flags (run only: a first compile takes ~18 min; the smoke checks the model, the run checks speed)
-FAST="--actor-compile max-autotune-no-cudagraphs --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
+FAST="--actor-compile default --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
 if [ "$1" = smoke ]; then
   shift; CK=$1; shift
   tag=${TAG:-smoke-c96}
