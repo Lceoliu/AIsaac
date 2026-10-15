@@ -46,6 +46,14 @@ if [ "$1" = run ]; then
   nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader; uptime
   exit 0
 fi
+if [ "$1" = resume ]; then   # (B36 restart: same flags, --resume the given checkpoint into the same --out)
+  CK=$2
+  PYTHONPATH=. nohup $PY train_tok.py $COMMON $FAST --workers 64 --game-hours 25000 --checkpoint-every 1000     --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1     --resume "$CK" --name hc99 --port 49000 --out $R/c99-scratch >> $R/c99-scratch.log 2>&1 < /dev/null &
+  sleep 300
+  date +%T; tail -n 3 $R/c99-scratch.log | cut -c1-220; echo "tracebacks $(grep -c Traceback $R/c99-scratch.log)"
+  nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader; uptime
+  exit 0
+fi
 if [ "$1" = watch ]; then
   export OMP_NUM_THREADS=4
   mkdir -p $R/c99-scratch/evals
