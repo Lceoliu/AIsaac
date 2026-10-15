@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 
 from abplus_probe_fork import split_code, sticky_actions
-from abplus_probe_native_obs import KILL_LUA, aim, move_to, read_raw
+from abplus_probe_native_obs import KILL_LUA, aim, move_to, read_raw, v2_spawn
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec, parse_seeds
 from isaac_bridge.abplus import FORK_ENV
 from isaac_bridge.abplus_goexplore import GxConfig, Instance
@@ -142,6 +142,8 @@ def room_seed(inst, seed, args, rep, fn):
     _, _, stop = inst.env.bridge.play(warm, repeat=rep, stop_clear=True)
     if stop != 'done':
         return dict(seed=seed, skipped='episode ended in the warm-up')
+    if args.prices:   # 2026-10-16 (B35): priced pickups, black / eternal / bone hearts
+        v2_spawn(inst.env.bridge)
     c = inst.env.bridge.fork(tag='fastrow', lean=True, alarm=900)
     pair = Pair(fn, 10 ** 6, False, 0)
     c._send({"cmd": "obs"})
@@ -178,6 +180,8 @@ def floor_seed(inst, seed, args, rep, fn):
     inst.env.bridge.reset_mode = 'floor'
     inst.reset(seed)
     rng = np.random.default_rng(seed)
+    if args.prices:   # 2026-10-16 (B35)
+        v2_spawn(inst.env.bridge)
     c = inst.env.bridge.fork(tag='fastrow', lean=True, alarm=900)
     pair = Pair(fn, 10 ** 6, True, 450, run=args.run, items=args.items)
     c._send({"cmd": "obs"})
@@ -253,6 +257,9 @@ def main():
     p.add_argument('--seeds', default='range:2147500000:16')
     p.add_argument('--floor', action='store_true')
     p.add_argument('--items', action='store_true', help='2026-10-06: the inventory block and ROW item fields')
+    p.add_argument('--prices', action='store_true',
+                   help='2026-10-16 (B35): priced pickups and black / eternal / bone hearts before the clone forks '
+                        '(abplus_probe_native_obs.V2_SPAWN_LUA): ROW ent_price / phearts exercised')
     p.add_argument('--run', action='store_true', help='2026-10-06: run records; with --floors > 1 through trapdoors')
     p.add_argument('--floors', type=int, default=1)
     p.add_argument('--item-prob', type=float, default=0.05)

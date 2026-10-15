@@ -985,6 +985,13 @@ def main():
                    help="2026-10-08: the player's PlayerType (ROW pchar, TokPolicy's char_emb table) as policy input; "
                         '-1: on with --characters; a resumed checkpoint keeps its own setting, --init starts the table '
                         'at zero (the same outputs as the checkpoint)')
+    p.add_argument('--obs-v2', type=int, default=0,
+                   help='2026-10-16 (B35, observation v2, bridge abp-0.2.18): 1 = the policy also reads the pickups\' '
+                        'prices (ROW ent_price: coins / 15, heart containers, three soul hearts, for sale), the heart '
+                        'split (ROW phearts: black, eternal, bone) and the room type (ROW room_type, a learned table '
+                        'added to the room token): TokPolicy obs_prices, obs_hearts, obs_room_type. A resumed '
+                        'checkpoint keeps its own setting; --init from a checkpoint without them starts the new '
+                        'weights at zero (load_compatible)')
     p.add_argument('--build-timeout', type=float, default=60.0,
                    help="s a worker's root instance may take for the first start state after its launch (launch, "
                         'connect, reset): past it the instance is killed and relaunched and the same seed built once '
@@ -1164,6 +1171,17 @@ def main():
     elif args.pchar < 0:
         args.pchar = int(bool(args.characters))
     pchar = bool(args.pchar)
+    # 2026-10-16 (B35): observation v2 (TokPolicy obs_prices / obs_hearts / obs_room_type); a resumed checkpoint keeps
+    # its own keys
+    obs_v2 = dict.fromkeys(('obs_prices', 'obs_hearts', 'obs_room_type'), bool(args.obs_v2))
+    if args.resume:
+        ck_cfg = torch.load(args.resume, map_location='cpu').get('config', {})
+        ck_v2 = {k: bool(ck_cfg.get(k)) for k in obs_v2}
+        if ck_v2 != obs_v2:
+            print(f'obs-v2: the resumed checkpoint has {ck_v2}: kept', flush=True)
+        obs_v2 = ck_v2
+        args.obs_v2 = int(all(obs_v2.values()))
+        del ck_cfg
     mem_fresh = mem_drop = False   # 2026-10-11 (memory): a resumed memory checkpoint keeps its memory and its size
     if args.resume:
         ck_mem = int(torch.load(args.resume, map_location='cpu').get('config', {}).get('memory', 0) or 0)
@@ -1212,6 +1230,7 @@ def main():
     if args.item_shared and not itok_on:
         p.error('--item-shared 1 needs --item-tokens 1')
     tok_kw = dict(item_tokens=itok_on, global_token=gtok_on)   # (TokPolicy's B21 / B22 options; False: as before)
+    tok_kw.update({k: True for k, on_ in obs_v2.items() if on_})   # (B35; nothing when off: TokPolicy as before)
     if args.item_shared:   # (B23; the key only when set: TokPolicy's signature as before otherwise)
         tok_kw['item_shared'] = True
     item_slots = INV_CAP if args.item_slots is None else int(args.item_slots)

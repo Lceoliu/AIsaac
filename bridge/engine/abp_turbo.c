@@ -1373,6 +1373,7 @@ typedef int (*lua_cfn)(lua_State *);
     X(PROJ_SCALE, 0x781d60, "_ZNK17Entity_Projectile8GetScaleEv") \
     X(TEAR_FLAGS, 0x780a10, "_ZNK11Entity_Tear12GetTearFlagsEv") \
     X(PROJ_FLAGS, 0x781da0, "_ZNK17Entity_Projectile18GetProjectileFlagsEv") \
+    X(PICKUP_PRICE, 0x782250, "_ZNK13Entity_Pickup8GetPriceEv") \
     X(P_GET, 0x747190, "_ZN9LuaEngine14lua_get_playerEi") X(G_NUM_PLAYERS, 0x781ed0, "_ZN4Game13GetNumPlayersEv") \
     X(G_FRAME, 0x781f30, "_ZN4Game13GetFrameCountEv") X(G_PAUSED, 0x6dd5b0, "_ZNK4Game8IsPausedEv") \
     X(G_ROOM, 0x781ec0, "_ZN4Game7GetRoomEv") X(G_LEVEL, 0x781eb0, "_ZN4Game8GetLevelEv") \
@@ -1416,7 +1417,7 @@ static const struct { uintptr_t va; const char *name; } OBS_FUNCS[F_COUNT] = { O
 typedef struct { float x, y; } vec2f;
 typedef void *(*dyncast_fn)(const void *, const void *, const void *, ptrdiff_t);
 static dyncast_fn obs_dyncast;
-static const void *ti_entity, *ti_npc, *ti_tear, *ti_projectile;
+static const void *ti_entity, *ti_npc, *ti_tear, *ti_projectile, *ti_pickup;
 static int obs_ready = -1;            // -1 not checked, 0 refused, 1 registered
 static char obs_refusal[160];
 static unsigned char *obs_buf;
@@ -1449,8 +1450,9 @@ static int obs_check(void) {
     ti_npc = dlsym(RTLD_DEFAULT, "_ZTI10Entity_NPC");
     ti_tear = dlsym(RTLD_DEFAULT, "_ZTI11Entity_Tear");
     ti_projectile = dlsym(RTLD_DEFAULT, "_ZTI17Entity_Projectile");
+    ti_pickup = dlsym(RTLD_DEFAULT, "_ZTI13Entity_Pickup");   // 2026-10-16 (B35, bridge abp-0.2.18)
     const uintptr_t *vt = (const uintptr_t *)dlsym(RTLD_DEFAULT, "_ZTV6Entity");
-    if (!obs_dyncast || !ti_entity || !ti_npc || !ti_tear || !ti_projectile || !vt) {
+    if (!obs_dyncast || !ti_entity || !ti_npc || !ti_tear || !ti_projectile || !ti_pickup || !vt) {
         snprintf(obs_refusal, sizeof obs_refusal, "dynamic_cast / typeinfo / vtable not found");
         return 0;
     }
@@ -1718,7 +1720,10 @@ static const char *const ANIM_BOMB[] = {"Pulse", "Idle", "Explode"};
 // GetTearFlags / Entity_Projectile::GetProjectileFlags, the uint64 at +0x758 / +0x760 that luabridge pushes with
 // lua_pushinteger as the Lua properties TearFlags / ProjectileFlags; 0 for other entities) and the laser geometry
 // (zero here: a laser in the room sends the observation to the Lua code).
-#define LEAN_ENTITY_BYTES 144
+// abp-0.2.18 (2026-10-16, B35, observation v2): LEAN_ENTITY_BYTES = 148: the 144 of abp-0.2.16, then a pickup's price
+// (int32; Entity_Pickup::GetPrice, the int at +0xC30 that the Lua property EntityPickup.Price reads: > 0 coins, -1 / -2
+// one / two heart containers, -3 three soul hearts, -1000 free; 0 for everything that is not a pickup).
+#define LEAN_ENTITY_BYTES 148
 static const char *obs_entities(uintptr_t room, size_t *off, double *monsters_hp, double *blocking_hp,
                                 long long *blocking_count) {
     void *const *list = *(void *const *const *)(room + ROOM_ENTITIES);
@@ -1757,6 +1762,7 @@ static const char *obs_entities(uintptr_t room, size_t *off, double *monsters_hp
         int32_t champion = -1;
         float hpf = 0.0f, a = 0.0f, b = 0.0f, c = 0.0f;
         uint64_t word = 0;
+        int32_t price = 0;
         if (t == 2) {
             const void *x = obs_dyncast(e, ti_entity, ti_tear, 0);
             if (!x) return "ToTear";
@@ -1778,7 +1784,10 @@ static const char *obs_entities(uintptr_t room, size_t *off, double *monsters_hp
         } else if (t == 4) {
             kind = 4;
         } else if (t == 5) {
+            const void *x = obs_dyncast(e, ti_entity, ti_pickup, 0);   // e:ToPickup()
+            if (!x) return "ToPickup";
             kind = 5;
+            price = G0(int32_t, PICKUP_PRICE, x);
         } else if (npc) {
             kind = 6;
             int boss = vcall_bool(e, VT_IS_BOSS);
@@ -1831,7 +1840,8 @@ static const char *obs_entities(uintptr_t room, size_t *off, double *monsters_hp
         PUT(at + 100, b);
         PUT(at + 104, c);
         PUT(at + 108, (int64_t)word);   // Lua's integer: the same 64 bits
-        memset(obs_buf + at + 116, 0, LEAN_ENTITY_BYTES - 116);
+        memset(obs_buf + at + 116, 0, 144 - 116);
+        PUT(at + 144, price);   // abp-0.2.18
         at += LEAN_ENTITY_BYTES;
         count++;
     }
@@ -2195,6 +2205,10 @@ static char *obs_init(void) {
     // only when this equals its own LEAN_PLAYER_F
     LPUSHINT(L, OBS_PLAYER_F);
     ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_native_player_f");
+    // 2026-10-16 (bridge abp-0.2.18): the bytes of an entity record obs_entities writes; the bridge uses the native obs
+    // only when this equals its own LEAN_ENTITY_BYTES
+    LPUSHINT(L, LEAN_ENTITY_BYTES);
+    ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_native_entity_bytes");
     if (pu_patched) {
         ((void (*)(lua_State *, lua_cfn, int))FN(PUSHCCLOSURE))(L, obs_lua_pu_arm, 0);
         ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_pu_arm");
@@ -2593,6 +2607,11 @@ char *getenv(const char *name) {
 // Version 6 (2026-10-08, bridge abp-0.2.17, character randomisation): the lean player record has RE_PLAYER_F = 39
 // doubles (the 39th the PlayerType) and RO_PCHAR (offs < 0: not written) gets tok_obs.encode_row's 'pchar' (int16, the
 // PlayerType clipped to 0 .. RE_N_CHAR - 1).
+// Version 7 (2026-10-16, B35, bridge abp-0.2.18, observation v2): lean entity records of LEAN_ENTITY_BYTES = 148 (a
+// pickup's price last) and three more ROW fields (offs < 0: not written): RO_ENT_PRICE (int16 per entity: the price
+// clipped to the int16 range, 0 for the floor's exit tokens), RO_PHEARTS (RE_PHEART_F float32: player 0's black half
+// hearts / 12 (the half hearts of the soul hearts whose slot bit is set in GetBlackHearts' mask), eternal hearts,
+// bone hearts / 6) and RO_ROOM_TYPE (uint8: the room's RoomType clipped to 0 .. RE_N_ROOM_TYPE - 1).
 enum {
     RC_T, RC_LIMIT, RC_FLOOR, RC_STALL, RC_PROGRESS, RC_STAGE0, RC_HP0, RC_PREV_DMG, RC_PREV_HP, RC_HAVE_PREV, RC_ROOM,
     RC_WAS_CLEAR, RC_ORIGIN_X, RC_ORIGIN_Y, RC_N_EXITS, RC_EXITS, RC_TVERSION = RC_EXITS + 16, RC_TSEEN, RC_HURT,
@@ -2601,7 +2620,9 @@ enum {
 // offs: byte offsets of the ROW fields in this order
 enum { RO_PLAYER, RO_ENT, RO_ENT_ID, RO_DOORS, RO_PATCH, RO_GRID, RO_MAP, RO_N_ENT, RO_N_DOORS, RO_T, RO_HURT, RO_DAMAGE,
        RO_DONE, RO_BOMBS, RO_EVENTS, RO_EPISODE, RO_SEED, RO_GROUP, RO_FIRST, RO_ENT_ITEM, RO_PCHARGE, RO_PCHAR,
-       RO_COUNT };
+       RO_ENT_PRICE, RO_PHEARTS, RO_ROOM_TYPE, RO_COUNT };
+#define RE_PHEART_F 3          // version 7: tok_obs.PHEART_F
+#define RE_N_ROOM_TYPE 32      // version 7: tok_obs.N_ROOM_TYPE
 #define RE_PCHARGE_F 12
 #define RE_PLAYER_F 39         // doubles of a lean player record (version 6; 38 in versions 4 and 5)
 #define RE_N_CHAR 32           // tok_obs.N_CHAR: 'pchar' is clipped to 0 .. RE_N_CHAR - 1
@@ -2636,7 +2657,7 @@ static inline int32_t rd_i(const unsigned char *p) { int32_t v; memcpy(&v, p, 4)
 static inline void wr_f(unsigned char *p, float v) { memcpy(p, &v, 4); }
 static inline long floor_mod(long a, long m) { long r = a % m; return r < 0 ? r + m : r; }
 
-int abp_row_encode_version(void) { return (6 << 16) | (RC_COUNT << 8) | RO_COUNT; }
+int abp_row_encode_version(void) { return (7 << 16) | (RC_COUNT << 8) | RO_COUNT; }
 
 int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double *ctx, const unsigned char *grid,
                    const unsigned char *padded, const unsigned char *map, const long *offs, const long *refs) {
@@ -2720,10 +2741,23 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
         int16_t ch = (int16_t)(c < 0 ? 0 : c > RE_N_CHAR - 1 ? RE_N_CHAR - 1 : c);
         memcpy(row + offs[RO_PCHAR], &ch, 2);
     }
+    if (offs[RO_PHEARTS] >= 0) {   // version 7: tok_obs.encode_row's phearts
+        long soul = (long)pv[8];
+        unsigned long mask = (unsigned long)((long)pv[9] & 0xffffffffL);
+        long black = 0;
+        for (int k = 0; k < 32; k++)
+            if (((mask >> k) & 1) && 2L * k < soul) black += soul - 2L * k < 2 ? soul - 2L * k : 2;
+        float ph[RE_PHEART_F] = {(float)((double)black / 12), (float)pv[11], (float)(pv[10] / 6)};
+        memcpy(row + offs[RO_PHEARTS], ph, sizeof ph);
+    }
+    if (offs[RO_ROOM_TYPE] >= 0)   // version 7: tok_obs.encode_row's room_type
+        row[offs[RO_ROOM_TYPE]] = (unsigned char)(room_type < 0 ? 0 : room_type > RE_N_ROOM_TYPE - 1 ? RE_N_ROOM_TYPE - 1
+                                                                                                   : room_type);
     // entities
     unsigned char *out = row + offs[RO_ENT];
     unsigned char *ids = row + offs[RO_ENT_ID];
     unsigned char *eitem = offs[RO_ENT_ITEM] >= 0 ? row + offs[RO_ENT_ITEM] : NULL;
+    unsigned char *eprice = offs[RO_ENT_PRICE] >= 0 ? row + offs[RO_ENT_PRICE] : NULL;
     for (unsigned i = 0; i < n_ent; i++) {
         const unsigned char *e = ents + (long)LEAN_ENTITY_BYTES * i;
         unsigned char *o = out + 4L * RE_F * i;
@@ -2798,6 +2832,11 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
             }
             memcpy(eitem + 4L * i, it, sizeof it);
         }
+        if (eprice) {   // version 7: tok_obs.encode_row's ent_price (the price clipped to int16)
+            int32_t pr = rd_i(e + 144);
+            int16_t p16 = (int16_t)(pr < -32768 ? -32768 : pr > 32767 ? 32767 : pr);
+            memcpy(eprice + 2L * i, &p16, 2);
+        }
     }
     // doors
     int k = n_doors < RE_DOOR_CAP ? n_doors : RE_DOOR_CAP;
@@ -2835,6 +2874,7 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
         int16_t idv[3] = {1023, 0, 0};
         memcpy(ids + 6L * n, idv, sizeof idv);
         if (eitem) memset(eitem + 4L * n, 0, 4);
+        if (eprice) memset(eprice + 2L * n, 0, 2);
         n++;
     }
     {

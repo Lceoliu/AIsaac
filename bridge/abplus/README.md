@@ -105,6 +105,7 @@
 | abp-0.2.14 | `fork`（克隆进程）、`lean`（精简模式）；见下一节。格式 2 的观测不变 |
 | abp-0.2.15 | 只改精简观测（整层环境用，C57）：房间号改为房间的 `SafeGridIndex`（大房间从哪个门进都一样）；门的第 4 个字节是"门后房间去过 / 已清"；出口活板门或楼梯出现时重发地形；新增小地图块（标志位 8）。其余同 abp-0.2.14 |
 | abp-0.2.16 | 只改精简观测的实体记录（10-08，A24）：108 → 144 字节，原有字段不变，末尾追加标志字（眼泪、激光的 `TearFlags`，敌弹的 `ProjectileFlags`，引擎的 uint64 原样；其他实体为 0）和激光的几何（角度的 cos / sin、`LaserLength`、端点（圆形激光为它自己的位置）、`Radius`、是否圆形；其他实体为 0）。原生观测（`abp_turbo.c`）同样写标志字，激光仍交给 Lua。激光块不变。其余同 abp-0.2.15 |
+| abp-0.2.18 | 只改精简观测的实体记录（10-16，B35 观测 v2）：144 → 148 字节，末尾追加 `<i4` 价格：拾取物（类型 5）的 `EntityPickup.Price`（引擎 `Entity_Pickup::GetPrice`，+0xC30），其他实体为 0。原生观测同样写（`abp_turbo.c` 经 `__dynamic_cast` 转成 `Entity_Pickup` 后调 `GetPrice`），桥只在库的 `abp_native_entity_bytes == 148` 时用原生观测（旧库自动退回 Lua）。其余同 abp-0.2.17 |
 
 ### 克隆与精简模式（abp-0.2.14，2026-10-03）
 
@@ -120,7 +121,7 @@
 **精简模式**：`{"cmd":"lean","enabled":bool}`，或 `fork` 带 `lean = true`。给 fork 采样器的每局克隆体用：
 - 不做每帧的 `update_combat` 和谱系、眼泪归因的登记；`combat` 块里的计数不再更新。
 - 输入由 abp_turbo 直接回答引擎（`ABP_INPUT`），不进 `MC_INPUT_ACTION` 回调。
-- `step`、`obs` 的观测是定长记录 `"L <字节数> <事件> <序号>\n" + 负载`，布局写在 `abp_bridge.lua` 的 `pack_lean` 上方，`abplus_lean.LeanDecoder` 直接读成 numpy 结构数组（玩家 38 个 double、门 16 字节、实体 144 字节；abp-0.2.16 之前实体 108 字节）。带引擎的速度；奖励用的量只有玩家累计受伤、怪物总血量、挡门怪的血量和数量。
+- `step`、`obs` 的观测是定长记录 `"L <字节数> <事件> <序号>\n" + 负载`，布局写在 `abp_bridge.lua` 的 `pack_lean` 上方，`abplus_lean.LeanDecoder` 直接读成 numpy 结构数组（玩家 39 个 double、门 16 字节、实体 148 字节；abp-0.2.16 之前实体 108 字节，abp-0.2.18 之前 144 字节）。带引擎的速度；奖励用的量只有玩家累计受伤、怪物总血量、挡门怪的血量和数量。
 - 地形每步只查上次有东西的格子，每 30 个逻辑帧全查一次：打掉的石头、便便立刻更新，空格上新出现的东西最迟 1 秒后更新。
 - 精简模式不改变游戏，观测与格式 2 逐字段一致（B9）。重置流程仍用原来的桥：采样器只让克隆体进精简模式。
 - 原生观测（B11，含 `ABP_OBS_INIT` 的 `libabp_turbo.so`）：记录的固定部分和地形检查由 abp_turbo 在 C 里填，字节与 Lua 打包的相同；小地图块、地形 JSON、激光房仍由 Lua 打包。环境变量 `ISAAC_RL_NATIVE_OBS`：0 Lua，1 原生（默认），2 两者都算并比较。
@@ -641,6 +642,11 @@ worker 进程 × N（tok_sampler.worker_main，不导入 torch）
   - 小地图 8×13×13（只在整层模式下有内容）；
   - 这一步的奖励项（掉了几个半心、打掉的怪物血量占比、事件位）和结局随记录一起传，不是策略输入；
   - 10-06/07 起在末尾追加道具（库存、台座编号、层数，`--items`）和蓄力（`pcharge`，`--charge`）的字段，14,288 → 14,720 字节，原有字段的偏移不变（EXPERIMENTS.md A21、A22；见下面"整局模式、道具、蓄力和分支"）。
+  - **观测 v2**（10-16，B35，用户批准，给从头训练的 C99；桥 abp-0.2.18；`train_tok.py --obs-v2 1` 三项一起开，检查点配置写 `obs_prices`、`obs_hearts`、`obs_room_type`，只在开时写；没有这些键的检查点照旧建出原来的网络，输出逐位相同）。ROW 末尾追加三个字段（原有字段偏移不变，20,656 → 20,800 字节），每种模式都写，只有打开对应开关的网络读：
+    - `ent_price`（每个实体一个 int16）：拾取物的价格（桥的实体记录新增的 `price`，即 `EntityPickup.Price`），非拾取物和出口 token 为 0。网络读的是 `tok_obs.price_columns` 换算出的 4 列，接在实体 MLP 输入的最后（`ent_ext` 列之后）：硬币价 / 15（价格 > 0 时）、要几个心之容器（-1 → 1，-2 → 2）、三个魂心（-3 → 1）、在售（价格 ≠ 0；-1000 = 免费的商店物品也算在售）。价格的含义取自 AB+ 反编译的 `Entity_Pickup::SetPrice` 和 `Room::GetShopItemPrice`：正数是硬币（道具 15、普通拾取物 5、心 3，Steam 特卖减半）；恶魔房 / 黑市道具按道具配置的 DevilPrice 为 -1 或 -2，玩家没有心之容器时为 -3；-1000 是免费；
+    - `phearts`（3 个 float32，玩家 0）：黑心半心数 / 12、永恒之心（0 / 1）、骨心数 / 6，接在玩家 MLP 输入的最后（`pcharge` 之后）。AB+ 的 `GetBlackHearts()` 返回的是位掩码（第 k 位 = 第 k 个魂心槽是黑心），所以黑心半心数按魂心数和掩码算（`tok_obs.black_half_hearts`，C 里同样算）。红心 / 12、魂心（含黑心）/ 12 原来就是玩家第 4、5 列，没有重复加；`units` 列不变；
+    - `room_type`（uint8）：当前房间的 `room:GetType()`（精简观测房间块里本来就有），截到 0–31；网络用一张 `nn.Embedding(32, width)`（`room_type_emb`，初始为 0，最后注册）查出来加到房间 token 上；
+    - FastRow（`abp_row_encode`）第 7 版写同样的字节；Lua 与原生观测的逐字节核对：`abplus_probe_native_obs.py --prices`（先在房间里生成带价格的拾取物、给黑心 / 永恒之心 / 骨心），C 与 Python 的 ROW 逐字节核对：`abplus_probe_fast_row.py --prices`；离线测试 `tests/test_obs_v2_smoke.py`。
 - **网络**（`tok_policy.TokPolicy`，默认 192 宽、4 层、4 头；单房 277 万、整层 339 万参数）：玩家、房间、小地图、每个门、每个实体各是一个 token，位置都相对玩家，进 Transformer 之前不做池化；玩家 token 的输出接移动（9）、射击（5）、炸弹（2）三个头、价值头和"危险"头（9 个移动各自会不会受伤，给教师用）。没有炸弹时炸弹头只能选"不放"。
 - **推理**（`GraphActor`）：最多 N 条记录、每条 32 个实体 token 的固定形状前向录成一个 CUDA Graph，采样用 Gumbel-max，图直接读模型参数，优化器更新后不用重录。实体超过 32 个的记录走即时执行。
 - **奖励**（`--reward`，默认 `ROOM_REWARD`）：打掉的怪物血量占房间初始总血量的比例 × 1；每掉半心 −0.75；清房 +1；死亡 −2；超时 −1；每个决策 −0.002。没有别的塑形项。

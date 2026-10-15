@@ -154,7 +154,12 @@ Protocol (one JSON object per line), identical to 0.2.0 plus "lua", "format" and
 -- player's PlayerType (p:GetPlayerType(): 0 Isaac .. 17 The Soul, AB+ resources/scripts/enums.lua). The native obs is
 -- used only with a libabp_turbo.so that writes the same records (abp_native_player_f == 39). Everything else as
 -- abp-0.2.16.
-local VERSION = "abp-0.2.17"
+-- abp-0.2.18 (2026-10-16, B35, observation v2): a lean entity record grows from 144 to 148 bytes, the last <i4 a
+-- pickup's price (EntityPickup.Price; Entity_Pickup::GetPrice, +0xC30 in AB+: > 0 coins, -1 / -2 one / two heart
+-- containers, -3 three soul hearts, -1000 free; 0 = not for sale and for every other entity). The native obs is used
+-- only with a libabp_turbo.so that writes the same records (abp_native_entity_bytes == 148). Everything else as
+-- abp-0.2.17.
+local VERSION = "abp-0.2.18"
 local mod = RegisterMod("AbpRLBridge", 1)
 
 -- The game ships LuaSocket for both architectures; make sure the 64-bit core is found.
@@ -1423,6 +1428,9 @@ end
 --            lua_pushinteger; 0 for everything else) and a laser's geometry (0 for everything else): cos and sin of
 --            AngleDegrees, LaserLength (0 for an unbounded beam such as Brimstone's), the end point (GetEndPoint; a
 --            circle laser's own position), Radius, circle (1 / 0). The laser block after the entities is unchanged.
+--            abp-0.2.18 (2026-10-16, B35): 148 bytes, the last <i4 a pickup's (type 5) price, e:ToPickup().Price (AB+
+--            Entity_Pickup::GetPrice: > 0 coins; -1, -2 one / two heart containers; -3 three soul hearts; -1000 free
+--            (a shop item that costs nothing); 0 not for sale), 0 for every other entity.
 --   lasers   x <i8 entity index + format 2's laser block
 --   terrain  (flag 2) <I4 version, s4 terrain JSON, s4 grid JSON, as format 2
 --   map      (flag 8) <B count, rooms x <BBBBB  GridIndex, shape, type (0 unless its icon is shown or it was visited),
@@ -1435,6 +1443,8 @@ end
 -- variant, state, collision class), so a step's terrain block is never behind the game's.
 local LEAN_MAGIC = 0x33504241
 local LEAN_ENTITY = "<i8i4i4i4ddddfffi4i4fi4i4BBBBi4ffff" .. "i8ffffffi4"   -- abp-0.2.16: + flag word, laser geometry
+	.. "i4"   -- abp-0.2.18: + a pickup's price
+local LEAN_ENTITY_BYTES = 148
 local LEAN_PLAYER = "<" .. string.rep("d", 39)   -- abp-0.2.17: + PlayerType
 local LEAN_PLAYER_F = 39
 local LEAN_FULL_EVERY = 30
@@ -1653,9 +1663,10 @@ end
 -- mode forces a full terrain pass (each path keeps its own terrain state). While a player has a cancelled lethal hit
 -- (state.lethal) the Lua code builds the observation.
 local native_lean, native_terrain = nil, nil
--- (abp-0.2.17: only a library whose player records have LEAN_PLAYER_F doubles; an older one leaves the Lua code)
+-- (abp-0.2.17: only a library whose player records have LEAN_PLAYER_F doubles; abp-0.2.18: and whose entity records
+-- have LEAN_ENTITY_BYTES bytes; an older one leaves the Lua code)
 if getenv("ABP_OBS_INIT") == "1" and type(abp_native_lean) == "function" and type(abp_native_terrain) == "function"
-		and abp_native_player_f == LEAN_PLAYER_F then
+		and abp_native_player_f == LEAN_PLAYER_F and abp_native_entity_bytes == LEAN_ENTITY_BYTES then
 	native_lean, native_terrain = abp_native_lean, abp_native_terrain
 end
 -- Post-update skip (2026-10-04, frame-cost work, same VERSION: nothing on the wire changes). abp_turbo puts a gate on the
@@ -1717,6 +1728,7 @@ local function lean_entities()
 			local kind, flags, hpf, a, b, c, champion = 0, 0, 0.0, 0.0, 0.0, 0.0, -1
 			-- abp-0.2.16: flag word and laser geometry (lcirc: 1 circle laser)
 			local word, lcos, lsin, llen, lex, ley, lrad, lcirc = 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0
+			local price = 0   -- abp-0.2.18: a pickup's Price
 			if t == 2 then
 				local x = e:ToTear()
 				kind, a, b, c = 1, x.Height, x.FallingSpeed, x.Scale
@@ -1741,6 +1753,8 @@ local function lean_entities()
 				kind = 4
 			elseif t == 5 then
 				kind = 5
+				local pk = e:ToPickup()
+				price = pk and math.tointeger(pk.Price) or 0
 			elseif npc then
 				kind = 6
 				local boss = e:IsBoss()
@@ -1764,7 +1778,7 @@ local function lean_entities()
 			ents[#ents + 1] = spack(LEAN_ENTITY, e.Index, t, e.Variant, e.SubType, pos.X, pos.Y, vel.X, vel.Y, e.Size,
 				sm.X, sm.Y, e.EntityCollisionClass, e.GridCollisionClass, e.CollisionDamage, spr:GetFrame(),
 				e.FrameCount, kind, flags, anim, B(e.FlipX), champion, hpf, a, b, c, word, lcos, lsin, llen, lex, ley,
-				lrad, lcirc)
+				lrad, lcirc, price)
 		end
 	end
 	return spack("<I2", #ents) .. table.concat(ents), lasers, monsters_hp, blocking_hp, blocking_count

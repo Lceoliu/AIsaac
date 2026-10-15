@@ -20,6 +20,10 @@ usage (from the bridge's python dir, PYTHONPATH=.):
       --seeds range:2147500000:32 --out <dir>
   python abplus_probe_native_obs.py --groups-file ../abplus/catalog/scaling2_groups.json --floor --seeds range:2147600000:4 \
       --out <dir>
+2026-10-16 (B35, bridge abp-0.2.18): --prices spawns priced pickups (coins 15 and 3, -1, -2, -3 and -1000 devil / free
+prices, one at 0) next to the player and gives black, eternal and bone hearts (V2_SPAWN_LUA, on the parent before the
+three clones are forked: the same state in all three), so the entity records' price field and the player's heart fields
+are exercised with values other than 0.
 """
 import argparse
 import json
@@ -137,6 +141,8 @@ def room_seed(inst, seed, args, rep):
     _, _, stop = inst.env.bridge.play(warm, repeat=rep, stop_clear=True)
     if stop != 'done':
         return dict(seed=seed, skipped='episode ended in the warm-up')
+    if args.prices:   # 2026-10-16 (B35)
+        v2_spawn(inst.env.bridge)
     trio = Trio(inst.env.bridge, args.check)
     after = None
     for code in test:
@@ -162,6 +168,8 @@ def floor_seed(inst, seed, args, rep):
     inst.env.bridge.reset_mode = 'floor'
     inst.reset(seed)
     rng = np.random.default_rng(seed)
+    if args.prices:   # 2026-10-16 (B35)
+        v2_spawn(inst.env.bridge)
     trio = Trio(inst.env.bridge, args.check)
     legs, rooms, kills = 0, set(), 0
     o = trio.obs
@@ -203,6 +211,23 @@ def floor_seed(inst, seed, args, rep):
 
 KILL_LUA = ("for _, e in ipairs(Isaac.GetRoomEntities()) do "
             "if e:IsActiveEnemy(false) then e:Kill() end end return 'ok'")
+# 2026-10-16 (B35, --prices): pickups (variant, subtype, Price) around the player and the hearts of the heart split
+V2_SPAWN_LUA = ("local p = Isaac.GetPlayer(0) local room = Game():GetRoom() "
+                "local spec = {{100, 1, 15}, {10, 1, 3}, {100, 2, -1}, {100, 3, -2}, {100, 4, -3}, {30, 1, -1000}, "
+                "{20, 1, 0}} "
+                "local offs = {{-120, -80}, {-60, -80}, {0, -80}, {60, -80}, {120, -80}, {-120, 80}, {120, 80}} "
+                "for i, s in ipairs(spec) do "
+                "local pos = room:FindFreeTilePosition(p.Position + Vector(offs[i][1], offs[i][2]), 0) "
+                "local e = Isaac.Spawn(5, s[1], s[2], pos, Vector(0, 0), nil) "
+                "local pk = e:ToPickup() if pk then pk.Price = s[3] end end "
+                "pcall(function() p:AddBlackHearts(3) end) pcall(function() p:AddEternalHearts(1) end) "
+                "pcall(function() p:AddBoneHearts(1) end) return 'ok'")
+
+
+def v2_spawn(bridge):
+    """--prices: V2_SPAWN_LUA on a bridge client (the parent, before its clones are forked)."""
+    if bridge.lua(V2_SPAWN_LUA) != 'ok':
+        raise RuntimeError('V2_SPAWN_LUA failed')
 
 
 def aim(o):
@@ -235,6 +260,8 @@ def main():
     p.add_argument('--steps', type=int, default=200)
     p.add_argument('--after-clear', type=int, default=15)
     p.add_argument('--check', type=int, default=25)
+    p.add_argument('--prices', action='store_true',
+                   help='2026-10-16 (B35): priced pickups and black / eternal / bone hearts before the clones fork')
     p.add_argument('--port', type=int, default=31000)
     p.add_argument('--name', default='nobprobe')
     p.add_argument('--out', required=True)
@@ -266,7 +293,8 @@ def main():
                        native_fallbacks=sum(r['native_fallbacks'] for r in done),
                        check_checks=sum(r['check_checks'] for r in done),
                        check_mismatches=sum(r['check_mismatches'] for r in done),
-                       laser_obs=sum(r['laser_obs'] for r in done), seconds=round(time.perf_counter() - t0, 1))
+                       laser_obs=sum(r['laser_obs'] for r in done), seconds=round(time.perf_counter() - t0, 1),
+                       prices=bool(args.prices))
         (out / 'rows.json').write_text(json.dumps(rows, indent=1, default=str))
         (out / 'summary.json').write_text(json.dumps(summary, indent=1))
         print('SUMMARY', json.dumps(summary))

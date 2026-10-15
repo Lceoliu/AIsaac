@@ -6,6 +6,9 @@
 # builds, forced pickup 1 -> 0 over the run, heal / resource rewards). No --resume / --init: random weights.
 # Purpose: does the architecture itself learn faster than the inherited lineage (C77 / C87 curves at equal game hours),
 # and does it pass the inherited 1.7 floors? usage: hpc_c99.sh smoke | run | watch
+# 2026-10-16 (B35, user-approved): --obs-v2 1 (pickup prices, heart split, room type; ROW v2). Needs the sandbox's
+# abp_bridge.lua = abp-0.2.18 and a libabp_turbo.so rebuilt from this commit's abp_turbo.c (abp_native_entity_bytes 148,
+# abp_row_encode version 7); with an older library the bridge falls back to the Lua observation and FastRow is off (slow).
 source /101063/AIsaac/ws9/hpc_env.sh
 R=$ABP_HOME/runs
 COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --epochs 3 --teacher --teacher-queue 12 --archive-size 12 \
@@ -13,7 +16,8 @@ COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items 
   --teacher-share 0.1 --teacher-slots 6 --poll-wait 0.003 \
   --item-tokens 1 --global-token 1 --item-shared 1 --start-build-prob 0.5 --start-build-max 3 --start-build-mode pedestal \
   --pickup-force 1:0 --reward heal=0.5,resource=0.25 --item-slots 8 \
-  --temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256"
+  --temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256 \
+  --obs-v2 1"
 FAST="--actor-compile default --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
 if [ "$1" = smoke ]; then
   shift

@@ -116,6 +116,17 @@ bus (per record: its rollout row in, create / nroom / steps / stage_prev out).
 Without the GRU (B32, 2026-10-15; TokPolicy(memory=0, temporal=True)): the same model minus mem_out(h) and mem_in;
 the learner's chunks are the temporal chunks alone (temporal_chunks(..., T_mem=None)); drop_memory converts a
 memory + temporal checkpoint (the GRU's tensors dropped, every other one exact).
+
+Observation v2 (2026-10-16, B35, bridge abp-0.2.18; train_tok --obs-v2 1 sets all three; config keys only when on, a
+checkpoint without them builds the model of before, bit for bit):
+  obs_prices (key 'obs_prices'): tok_obs.price_columns(ROW 'ent_price') (coin price / 15, heart containers 0 / 1 / 2,
+    three soul hearts 0 / 1, for sale) as the entity mlp's last PRICE_F inputs (after the ent_ext columns);
+  obs_hearts (key 'obs_hearts'): ROW 'phearts' (black half hearts / 12, eternal, bone hearts / 6) as the player mlp's
+    last PHEART_F inputs (after pcharge);
+  obs_room_type (key 'obs_room_type'): a learned table of N_ROOM_TYPE vectors (room_type_emb, zero at the start,
+    registered after everything else) indexed by ROW 'room_type' and added to the room token.
+A checkpoint without them loads with load_compatible (new Linear columns zero, room_type_emb zero) and computes the
+same outputs up to the first Linears' summation order (tests/test_obs_v2_smoke.py).
 """
 import contextlib
 import os
@@ -133,7 +144,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .tok_obs import (DOOR_CAP, DOOR_F, ENT_F, ENT_F0, EV_EXIT, EV_NEW_ROOM, GRID, INV_CAP, MAP, N_CARD, N_CHAR,
-                      N_COLLECTIBLE, N_PILL_COLOR, N_PILL_EFFECT, N_TRINKET, PATCH, PCHARGE_F, PINV_F, PLAYER_F, ROW)
+                      N_COLLECTIBLE, N_PILL_COLOR, N_PILL_EFFECT, N_ROOM_TYPE, N_TRINKET, PATCH, PCHARGE_F, PHEART_F,
+                      PINV_F, PLAYER_F, PRICE_F, ROW, price_columns)
 
 N_MOVE, N_SHOOT, N_BOMB = 9, 5, 2
 HEADS = (N_MOVE, N_SHOOT, N_BOMB)
@@ -983,7 +995,8 @@ def temporal_part(td, cids, counts, qep_rows, table, to_dev=None):
 class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
                  memory=0, item_tokens=False, global_token=False, item_shared=False, item_slots=INV_CAP, temporal=False,
-                 temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128):
+                 temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128,
+                 obs_prices=False, obs_hearts=False, obs_room_type=False):
         super().__init__()
         if int(item_slots) != INV_CAP and not item_tokens:
             raise ValueError('TokPolicy: item_slots needs item_tokens=True (B24)')
@@ -1002,6 +1015,11 @@ class TokPolicy(nn.Module):
             self.config['ent_ext'] = True
         if pchar:   # 2026-10-08: ROW 'pchar' one-hot as the player token's last inputs (the key only when set)
             self.config['pchar'] = True
+        # 2026-10-16 (B35, observation v2; the module docstring): the keys only when set
+        self.obs_prices, self.obs_hearts, self.obs_room_type = bool(obs_prices), bool(obs_hearts), bool(obs_room_type)
+        for key_, on_ in (('obs_prices', obs_prices), ('obs_hearts', obs_hearts), ('obs_room_type', obs_room_type)):
+            if on_:
+                self.config[key_] = True
         self.items = bool(items)
         self.charge = bool(charge)
         self.ent_ext = bool(ent_ext)
@@ -1015,13 +1033,13 @@ class TokPolicy(nn.Module):
             self.pill_emb = nn.Embedding(N_PILL_COLOR, PILL_EMB, padding_idx=0)
             self.effect_emb = nn.Embedding(N_PILL_EFFECT, EFFECT_EMB, padding_idx=0)
             self.card_emb = nn.Embedding(N_CARD, CARD_EMB, padding_idx=0)
-        self.entity = mlp(ENT_F0 + 40 + ((ITEM_EMB + TRINKET_EMB) if items else 0) + ((ENT_F - ENT_F0) if ent_ext else 0),
-                          width, width)
+        self.entity = mlp(ENT_F0 + 40 + ((ITEM_EMB + TRINKET_EMB) if items else 0) + ((ENT_F - ENT_F0) if ent_ext else 0)
+                          + (PRICE_F if obs_prices else 0), width, width)
         self.patch = nn.Sequential(nn.Conv2d(GRID[0], 32, 3, padding=1), nn.GELU(),
                                    nn.Conv2d(32, 32, 3, padding=1), nn.GELU(), nn.Flatten(),
                                    nn.Linear(32 * PATCH * PATCH, 128), nn.GELU())
-        self.player = mlp(PLAYER_F + sum(HEADS) + 128 + (PLAYER_ITEMS_F if items else 0) + (PCHARGE_F if charge else 0),
-                          width, width)
+        self.player = mlp(PLAYER_F + sum(HEADS) + 128 + (PLAYER_ITEMS_F if items else 0) + (PCHARGE_F if charge else 0)
+                          + (PHEART_F if obs_hearts else 0), width, width)
         self.room = nn.Sequential(nn.Conv2d(GRID[0], 32, 3, padding=1), nn.GELU(),
                                   nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.GELU(),
                                   nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.GELU(), nn.Flatten(),
@@ -1087,6 +1105,12 @@ class TokPolicy(nn.Module):
             self.tatt = TemporalAttention(width, glob=self.global_token, D=int(temporal_width),
                                           layers=int(temporal_layers), heads=int(temporal_heads),
                                           window=int(temporal_window), rooms=int(temporal_rooms))
+        # 2026-10-16 (B35): the room-type table, registered after everything else, zero at the start (the module
+        # docstring)
+        self.room_type_emb = None
+        if self.obs_room_type:
+            self.room_type_emb = nn.Embedding(N_ROOM_TYPE, width)
+            nn.init.zeros_(self.room_type_emb.weight)
 
     def main_parameters(self):
         """The parameters PPO's optimiser owns: all but the choice heads' (in the order of parameters())."""
@@ -1177,6 +1201,7 @@ class TokPolicy(nn.Module):
         ids = b['ent_id'][:, :used]
         it = b['ent_item'][:, :used] if self.items else None
         ent = b['ent'][:, :used]
+        price = b['ent_price'][:, :used] if self.obs_prices else None   # 2026-10-16 (B35)
         ekeep = b.get('ekeep') if packed else None
         if ekeep is not None:
             # 2026-10-10 (B18, the learner's fast path): the entity tokens' embeddings and input mlp on the real
@@ -1186,6 +1211,7 @@ class TokPolicy(nn.Module):
             ids = ids.reshape(flat, -1).index_select(0, ekeep)
             it = it.reshape(flat, -1).index_select(0, ekeep) if it is not None else None
             ent = ent.reshape(flat, -1).index_select(0, ekeep)
+            price = price.reshape(flat, -1).index_select(0, ekeep) if price is not None else None
         ids = ids.long()
         emb = [self.type_emb(ids[..., 0]), self.variant_emb(ids[..., 1]), self.subtype_emb(ids[..., 2])]
         if self.items:
@@ -1194,6 +1220,8 @@ class TokPolicy(nn.Module):
         parts = [ent[..., :ENT_F0]] + emb
         if self.ent_ext:   # appended last: load_compatible pads these columns with zeros
             parts.append(ent[..., ENT_F0:])
+        if price is not None:   # 2026-10-16 (B35): appended after the ent_ext columns (load_compatible: zeros)
+            parts.append(price_columns(price[..., 0]))
         entity = embed(self.entity, torch.cat(parts, -1)) + self.kind[3]
         fast = ekeep is not None and 'xperm' in b   # B18: the packed tokens built directly (learner_plan's xperm)
         if ekeep is not None and not fast:
@@ -1211,6 +1239,8 @@ class TokPolicy(nn.Module):
                       self.effect_emb(pit[:, 4]), self.card_emb(pit[:, 5])]
         if self.charge:   # appended last: load_compatible pads these columns with zeros
             parts.append(b['pcharge'])
+        if self.obs_hearts:   # 2026-10-16 (B35): appended after pcharge (load_compatible: zeros)
+            parts.append(b['phearts'])
         if self.pchar:   # 2026-10-08: the character's vector added before the first GELU (exact for old checkpoints)
             char = self.char_emb(b['pchar'].long().clamp(0, N_CHAR - 1))
             seq = self.player
@@ -1221,6 +1251,8 @@ class TokPolicy(nn.Module):
         else:
             player = embed(self.player, torch.cat(parts, -1)) + self.kind[0]
         room = self._cnn(self.room, b, 'grid') + self.kind[1]
+        if self.room_type_emb is not None:   # 2026-10-16 (B35): the room's type, added to its token
+            room = room + self.room_type_emb(b['room_type'].long().clamp(0, N_ROOM_TYPE - 1)).to(room.dtype)
         level = self._cnn(self.map, b, 'map') + self.kind[4]
         return n, used, fast, player, room, level, entity
 
@@ -1554,7 +1586,8 @@ class TokPolicy(nn.Module):
         return logp, -(logs.exp() * logs.clamp(min=-50)).sum(-1)
 
 
-ENTITY_FIELDS = ('ent', 'ent_id', 'ent_item')   # per-entity batch fields (cut to the entity tokens used)
+ENTITY_FIELDS = ('ent', 'ent_id', 'ent_item', 'ent_price')   # per-entity batch fields (cut to the entity tokens used;
+#                                                               ent_price: 2026-10-16, B35)
 
 
 def used_entities(n_ent):
@@ -1571,7 +1604,8 @@ def to_batch(rows, pending, device):
     b = dict(player=t('player'), doors=t('doors'), patch=t('patch'), grid=t('grid'), map=t('map'), n_ent=t('n_ent'),
              n_doors=t('n_doors'), bombs=t('bombs'), inv=t('inv'), pitem=t('pitem'), pinv=t('pinv'),
              pcharge=t('pcharge'), pchar=t('pchar'),
-             first=t('first'), events=t('events'), stage=t('stage'))   # (B30: the temporal step reads them)
+             first=t('first'), events=t('events'), stage=t('stage'),   # (B30: the temporal step reads them)
+             phearts=t('phearts'), room_type=t('room_type'))   # (B35)
     for k in ENTITY_FIELDS:
         b[k] = torch.from_numpy(np.ascontiguousarray(rows[k][:, :used])).to(device, non_blocking=True)
     b['pending'] = torch.from_numpy(np.ascontiguousarray(pending)).to(device, non_blocking=True).long()
@@ -1798,7 +1832,8 @@ def cat_batch(a, b):
 
 ROW_BYTES = ROW.itemsize          # a multiple of 8 (the record holds int64 fields and is aligned)
 _INPUTS = ('player', 'ent', 'ent_id', 'doors', 'patch', 'grid', 'map', 'n_ent', 'n_doors', 'bombs', 'ent_item', 'inv',
-           'pitem', 'pinv', 'pcharge', 'pchar', 'first', 'events', 'stage')   # (B30: the last three)
+           'pitem', 'pinv', 'pcharge', 'pchar', 'first', 'events', 'stage',   # (B30: the last three)
+           'ent_price', 'phearts', 'room_type')   # (B35)
 _TORCH = {np.dtype(np.float32): torch.float32, np.dtype(np.int16): torch.int16, np.dtype(np.int32): torch.int32,
           np.dtype(np.uint8): torch.uint8}
 

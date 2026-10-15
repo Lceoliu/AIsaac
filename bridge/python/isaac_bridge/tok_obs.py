@@ -146,7 +146,21 @@ ROW = np.dtype([
     ('pforce', np.uint8),
     ('pmode', np.uint8),
     ('bped', np.int16, (3,)),
+    # 2026-10-16 (B35, observation v2, bridge abp-0.2.18; appended, the fields above keep their offsets), written in
+    # every mode; policy inputs only for TokPolicy(obs_prices / obs_hearts / obs_room_type) (train_tok --obs-v2 1):
+    #   ent_price: per entity its price (abplus_lean ENTITY 'price': EntityPickup.Price of a pickup, 0 otherwise),
+    #     clipped to int16; the policy's PRICE_F price columns are price_columns() of it;
+    #   phearts: player 0's black half hearts / 12, eternal hearts (0 / 1), bone hearts / 6 (PHEART_F; red and soul
+    #     half hearts / 12 are already player columns 4 and 5);
+    #   room_type: the room's RoomType (the lean room block's room:GetType()) clipped to 0 .. N_ROOM_TYPE - 1.
+    ('ent_price', np.int16, (ENT_CAP, 1)),
+    ('phearts', np.float32, (3,)),
+    ('room_type', np.uint8),
 ], align=True)
+PHEART_F = 3          # 2026-10-16 (B35): ROW 'phearts'
+PRICE_F = 4           # 2026-10-16 (B35): price_columns() per entity
+N_ROOM_TYPE = 32      # 2026-10-16 (B35): room types the policy's room-type table has room for (AB+ 0 .. 23, Repentance+
+#                       0 .. 29)
 N_CHAR = 32           # 2026-10-08: PlayerType ids the policy's character input has room for (AB+ 0 .. 17, Repentance+ 0 .. 40
 #                       would need more)
 DONE_BRANCH = 4       # ROW 'done' of a branch episode's last record when it ends for the branch's own reasons (the
@@ -154,6 +168,34 @@ DONE_BRANCH = 4       # ROW 'done' of a branch episode's last record when it end
 #                       trainer bootstraps from the value of that record (train_tok: the boot decisions)
 KIND_COLUMN = 16      # entity columns 16..22: one-hot of pack_lean's kind (0 other, 1 tear, 2 projectile, 3 laser,
 #                       4 bomb, 5 pickup, 6 NPC)
+PRICE_COINS = 15.0    # 2026-10-16 (B35): a coin price's scale (AB+ Room::GetShopItemPrice: 15 a collectible, 5 a pickup,
+#                       3 a heart; halved by Steam Sale)
+
+
+def price_columns(price):
+    """2026-10-16 (B35): the policy's price columns of ROW 'ent_price' values (an array of any shape, numpy or torch;
+    float32 out with one more trailing axis of PRICE_F): coin price / PRICE_COINS (0 unless the price is in coins),
+    heart containers the price takes (1 at -1, 2 at -2, else 0), soul-heart price (1 at -3: three soul hearts, else 0),
+    for sale (price != 0; a free shop item, -1000, is for sale at no cost). Price semantics: AB+ Entity_Pickup::SetPrice
+    and Room::GetShopItemPrice (decompiled, analysis/abplus-linux): > 0 coins; devil-deal prices -1 (one heart
+    container), -2 (two), -3 (three soul hearts, when the player has no heart containers); -1000 free (Steam Sale)."""
+    if isinstance(price, np.ndarray):
+        p = price.astype(np.float32)
+        cols = [np.maximum(p, 0) / np.float32(PRICE_COINS), (p == -1) + 2 * (p == -2), p == -3, p != 0]
+        return np.stack([c.astype(np.float32) for c in cols], -1)
+    import torch
+    p = price.float()
+    cols = [p.clamp(min=0) / PRICE_COINS, (p == -1).float() + 2 * (p == -2).float(), (p == -3).float(),
+            (p != 0).float()]
+    return torch.stack(cols, -1)
+
+
+def black_half_hearts(soul, mask):
+    """2026-10-16 (B35): player 0's black half hearts from GetSoulHearts (soul half hearts, black ones included) and
+    GetBlackHearts (AB+: a bit mask, bit k set when soul-heart slot k, half hearts 2k + 1 and 2k + 2, is black;
+    Entity_Player::IsBlackHeart reads bit (i - 1) >> 1 of +0x25c4). abp_turbo.c abp_row_encode computes the same."""
+    soul, mask = int(soul), int(mask) & 0xFFFFFFFF
+    return sum(min(2, soul - 2 * k) for k in range(32) if (mask >> k) & 1 and 2 * k < soul)
 
 
 class EpisodeState:
@@ -253,6 +295,9 @@ def encode_row(o, st, row, t):
     row['pcharge'][0] = (min(p['charge'], 120) / 60, min(p['charge'] / max(p['fire_delay_max'], 1.0), 3.0) / 3) + \
         tuple(float((weapons >> w) & 1) for w in range(1, 11))
     row['pchar'] = min(max(int(p['ptype']), 0), N_CHAR - 1)   # 2026-10-08 (abp_row_encode version 6)
+    # 2026-10-16 (B35, abp_row_encode version 7): the heart split and the room's type
+    row['phearts'][0] = (black_half_hearts(p['soul'], p['black']) / 12, p['eternal'], p['bone'] / 6)
+    row['room_type'] = min(max(int(room[0]), 0), N_ROOM_TYPE - 1)
     e = o.entities
     n = len(e)
     out = row['ent'][0]
@@ -294,6 +339,7 @@ def encode_row(o, st, row, t):
         ids[:n, 0] = np.clip(e['type'], 0, 1023)
         ids[:n, 1] = e['variant'] % 1024
         ids[:n, 2] = e['subtype'] % 256
+        row['ent_price'][0][:n, 0] = np.clip(e['price'], -32768, 32767)   # 2026-10-16 (B35)
         if st.items:   # abp_turbo.c abp_row_encode's ent_item
             pickup = e['type'] == 5
             it = row['ent_item'][0]
@@ -316,6 +362,7 @@ def encode_row(o, st, row, t):
         out[n, 0], out[n, 1], out[n, 2] = (ex - px) / 200, (ey - py) / 200, np.hypot(ex - px, ey - py) / 300
         out[n, 5], out[n, 6], out[n, 7], out[n, KIND_COLUMN] = (ex - tlx) / w, (ey - tly) / h, 1.0, 1.0
         row['ent_id'][0, n] = (EXIT_TYPE, 0, 0)
+        row['ent_price'][0, n] = 0
         if st.items:
             row['ent_item'][0, n] = 0
         n += 1
@@ -436,13 +483,15 @@ def _items_step(st, row, stage, active, charge, events):
 # ISAAC_RL_FAST_ROW=0 switches it off.
 FAST_ROW = os.environ.get('ISAAC_RL_FAST_ROW', '1') != '0'
 _ROW_FIELDS = ('player', 'ent', 'ent_id', 'doors', 'patch', 'grid', 'map', 'n_ent', 'n_doors', 't', 'hurt', 'damage',
-               'done', 'bombs', 'events', 'episode', 'seed', 'group', 'first', 'ent_item', 'pcharge', 'pchar')
+               'done', 'bombs', 'events', 'episode', 'seed', 'group', 'first', 'ent_item', 'pcharge', 'pchar',
+               'ent_price', 'phearts', 'room_type')
 _ROW_OFFS_ITEMS = np.array([ROW.fields[k][1] for k in _ROW_FIELDS], np.int64)
 _ROW_OFFS = _ROW_OFFS_ITEMS.copy()
 _ROW_OFFS[_ROW_FIELDS.index('ent_item')] = -1   # without items abp_row_encode leaves ent_item alone (version 3)
-_ROW_VERSION = 6   # abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
+_ROW_VERSION = 7   # abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
 #                    2026-10-08, abp-0.2.16's 144-byte entity records and ENT_F = 56; 6: 2026-10-08, abp-0.2.17's
-#                    39-double player record (PlayerType) and pchar)
+#                    39-double player record (PlayerType) and pchar; 7: 2026-10-16 (B35), abp-0.2.18's 148-byte entity
+#                    records (price) and ent_price, phearts, room_type)
 # ctx slots (abp_turbo.c RC_*)
 (RC_T, RC_LIMIT, RC_FLOOR, RC_STALL, RC_PROGRESS, RC_STAGE0, RC_HP0, RC_PREV_DMG, RC_PREV_HP, RC_HAVE_PREV, RC_ROOM,
  RC_WAS_CLEAR, RC_ORIGIN_X, RC_ORIGIN_Y, RC_N_EXITS, RC_EXITS) = range(16)
@@ -472,7 +521,8 @@ def fast_row_function(path):
             version = lib.abp_row_encode_version
             version.restype = ctypes.c_int
             if version() == (_ROW_VERSION << 16) | (RC_COUNT << 8) | len(_ROW_FIELDS) and ENT_CAP == 64 and \
-                    ENT_F == 56 and ENT_F0 == 33 and PCHARGE_F == 12 and N_CHAR == 32 and \
+                    ENT_F == 56 and ENT_F0 == 33 and PCHARGE_F == 12 and N_CHAR == 32 and PHEART_F == 3 and \
+                    N_ROOM_TYPE == 32 and \
                     DOOR_CAP == 8 and DOOR_F == 7 and PATCH == 9 and GRID == (7, 16, 28) and MAP == (8, 13, 13):
                 fn = lib.abp_row_encode
                 fn.restype = ctypes.c_int

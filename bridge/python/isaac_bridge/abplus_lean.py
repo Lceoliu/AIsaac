@@ -1,4 +1,4 @@
-"""Decoder of abp_bridge.lua's lean observation (abp-0.2.17, pack_lean): fixed-layout records read as numpy arrays.
+"""Decoder of abp_bridge.lua's lean observation (abp-0.2.18, pack_lean): fixed-layout records read as numpy arrays.
 
 The layout is described above pack_lean in abp_bridge.lua. A LeanObs holds views into the payload (players, doors and
 entities as structured arrays) and the terrain dict of the last terrain block (cached per connection, as ObsDecoder
@@ -35,14 +35,18 @@ ENTITY = np.dtype([('id', '<i8'), ('type', '<i4'), ('variant', '<i4'), ('subtype
                    # ProjectileFlags; 0 otherwise) and a laser's geometry (0 otherwise): cos / sin of its angle,
                    # LaserLength (0: unbounded), end point (a circle laser's position), Radius, circle
                    ('tflags', '<i8'), ('l_cos', '<f4'), ('l_sin', '<f4'), ('l_len', '<f4'), ('l_ex', '<f4'),
-                   ('l_ey', '<f4'), ('l_radius', '<f4'), ('l_circle', '<i4')])
+                   ('l_ey', '<f4'), ('l_radius', '<f4'), ('l_circle', '<i4'),
+                   # abp-0.2.18 (2026-10-16, B35): a pickup's price (EntityPickup.Price, AB+ Entity_Pickup::GetPrice:
+                   # > 0 coins, -1 / -2 one / two heart containers, -3 three soul hearts, -1000 free; 0 not for sale
+                   # and for every entity that is not a pickup)
+                   ('price', '<i4')])
 MAP_ROOM = np.dtype([('idx', 'u1'), ('shape', 'u1'), ('type', 'u1'), ('display', 'u1'), ('flags', 'u1')])
 # 2026-10-06 (items, Phase A): the inventory block (flag 16, abp_bridge.lua lean_inventory; only when the bridge's
 # lean_items is on): a header, then n x (collectible id, count), newest first
 INV_HEADER = struct.Struct('<BBHHHHHHI')   # n, layout version, active MaxCharges, trinket 0, trinket 1, pill color,
 #                                           pill effect + 1 when identified (0 unknown / none), card, curses
 INV_ITEM = np.dtype([('id', '<u2'), ('count', 'u1')])
-assert PLAYER.itemsize == 312 and DOOR.itemsize == 16 and ENTITY.itemsize == 144 and MAP_ROOM.itemsize == 5
+assert PLAYER.itemsize == 312 and DOOR.itemsize == 16 and ENTITY.itemsize == 148 and MAP_ROOM.itemsize == 5
 assert INV_HEADER.size == 18 and INV_ITEM.itemsize == 3
 _LASER = struct.Struct('<qBddddddq')
 # entity kinds (as format 2) and flag bits

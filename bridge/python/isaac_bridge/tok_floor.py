@@ -169,6 +169,7 @@ def row_digest(row):
     ne, nd = int(r['n_ent']), int(r['n_doors'])
     parts = [r['player'], r['ent'][:ne], r['ent_id'][:ne], r['ent_item'][:ne], r['doors'][:nd], r['patch'],
              r['grid'], r['map'], r['inv'], r['pitem'], r['pinv'], r['pcharge'],
+             r['ent_price'][:ne], r['phearts'], np.array([r['room_type']], np.int64),   # (2026-10-16, B35)
              np.array([r['bombs'], r['events'], r['done'], r['stage']], np.int64),
              np.array([r['hurt'], r['damage']], np.float64)]
     c = 0
