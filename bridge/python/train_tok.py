@@ -2774,7 +2774,6 @@ def main():
             row['v2_lane_calls'], row['v2_lane_rows'] = lane_stat['calls'], lane_stat['rows']
             row['v2_lane_s'] = lane_stat['s']
         if cf_on:   # B34 (the counterfactual teacher): worker totals, this update's window, the trainer's side
-            from isaac_bridge.tok_cf import TRIGGERS as CF_TRIGGERS
             keys_c = [k_c for k_c in ST if k_c.startswith('cf_')]
             tot_c = {k_c: float(stats[:, ST[k_c]].sum()) for k_c in keys_c}
             prev_c = L.get('cf_prev') or dict.fromkeys(tot_c, 0.0)
