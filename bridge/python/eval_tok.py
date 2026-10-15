@@ -28,15 +28,11 @@ usage (from the bridge's python dir, PYTHONPATH=.):
   'global_token'): built from the config like every other option (the extra tokens need no other input; value_global
   is not used for acting); summary 'item_tokens' / 'global_token'.
 A28 (2026-10-14), evaluation-only switches (all off by default: the evaluation is the one before):
-  --fused-override 1: a separate-term (B21 / B22 / B23) checkpoint evaluated in the fused layout (B24,
-  tok_policy.convert_to_fused, as train_tok's resume with --item-tokens-fused 1; approximate, no training);
-  --item-slots N overrides the held-item token slots (default: the checkpoint's). Summary 'item_tokens_fused',
-  'fused_override' (and 'item_slots').
-  --ablate items|global|both: items = every item token absent (ItemTokens' present mask all False, so the old tokens,
-  the global token and the memory see none; separate-term layout: ItemTokens.gate zeroed as well; the player token's
-  own item inputs stay); global = GlobalToken.gate zeroed (separate: its term for the old tokens; fused: the multiplier
-  of its value vector), mem_in zeroed (the GRU's input without it) and its key masked in every attention (no
-  token attends to it); apply_ablation. Summary 'ablate'.
+  --item-slots N overrides the held-item token slots (default: the checkpoint's). Summary 'item_slots'.
+  --ablate items|global|both, by masking keys only (B33: no gates): items = every item token absent (ItemTokens'
+  present mask all False: no token attends to them; the player token's own item inputs stay); global = the global
+  token's key masked in every attention (no token attends to it) and, with a GRU, mem_in zeroed (the GRU's input
+  without it); apply_ablation. Summary 'ablate'.
   --no-pedestals 1 (floor / run modes): every collectible pedestal (type 5, variant 100) removed from the room before
   the step of each record that shows one (tok_floor, tok_pickup.NO_PEDESTAL_LUA through the bridge's lua command), so
   the policy never picks one up. Summary 'no_pedestals', 'pedestal_runs', 'pedestals_removed'.
@@ -59,41 +55,26 @@ from isaac_bridge.tok_sampler import ST, TokSampler, TokSamplerConfig
 ABLATE = ('', 'items', 'global', 'both')
 
 
-def build_eval_model(ck, items, device, fused_override=False, item_slots=None):
-    """(A28) The evaluated policy of a checkpoint: (model in eval mode, load_compatible's changed names, the conversion
-    note or None). Without fused_override / item_slots: TokPolicy(**config, items) + load_compatible, as before.
-    fused_override: a separate-term checkpoint (config item_tokens / global_token, not item_tokens_fused) built fused and
-    its state converted by convert_to_fused (every tensor as saved). item_slots: the held-item token slots (needs
-    item_tokens)."""
-    from isaac_bridge.tok_policy import TokPolicy, convert_to_fused, load_compatible
+def build_eval_model(ck, items, device, item_slots=None):
+    """(A28) The evaluated policy of a checkpoint: (model in eval mode, load_compatible's changed names).
+    TokPolicy(**config, items) + load_compatible; item_slots: the held-item token slots (needs item_tokens)."""
+    from isaac_bridge.tok_policy import TokPolicy, load_compatible
     cfg = dict(ck['config'], items=items)
-    if fused_override:
-        if cfg.get('item_tokens_fused'):
-            raise ValueError('--fused-override: the checkpoint is fused already')
-        if not (cfg.get('item_tokens') or cfg.get('global_token')):
-            raise ValueError('--fused-override needs an item-token or global-token checkpoint')
-        cfg['item_tokens_fused'] = True
     if item_slots is not None:
         if not cfg.get('item_tokens'):
             raise ValueError('--item-slots needs an item-token checkpoint')
         cfg['item_slots'] = int(item_slots)
     model = TokPolicy(**cfg).to(device).eval()
-    state, note = ck['model'], None
-    if fused_override:
-        state, note = convert_to_fused(model, state)
-    return model, load_compatible(model, state), note
+    return model, load_compatible(model, ck['model'])
 
 
 def apply_ablation(model, what):
     """(A28) Remove the item tokens ('items'), the global token ('global') or both ('both') from an evaluated model in
-    place ('' : nothing). items: ItemTokens.forward wrapped to return its tokens with an all-False present mask (every
-    item token a masked key in both layouts: the old tokens, the global token and the memory see none; the player
-    token's own item inputs, the item_emb multi-hot and the active / trinket / pocket embeddings, stay); separate-term
-    layout: ItemTokens.gate zeroed too (the extra term exactly 0). global: GlobalToken.gate zeroed (separate: its term
-    for the old tokens; fused: the multiplier of its value vector) and mem_in zeroed (the GRU's input no longer carries
-    it), and its key masked in every attention (separate: the extra tokens' key mask; fused: the blocks' key mask;
-    the fused packed layers then refuse to run); value_global is not used for acting. Raises ValueError if the model
-    lacks the tokens."""
+    place ('' : nothing), by masking their keys. items: ItemTokens.forward wrapped to return its tokens with an
+    all-False present mask (every item token a masked key: no other token attends to them; the player token's own item
+    inputs, the item_emb multi-hot and the active / trinket / pocket embeddings, stay). global: its key (the last
+    token) masked in every block (the packed layers then refuse to run) and, with a GRU, mem_in zeroed (the GRU's input
+    no longer carries it); value_global is not used for acting. Raises ValueError if the model lacks the tokens."""
     import torch
     if what not in ABLATE:
         raise ValueError(f'--ablate {what!r}: one of {ABLATE[1:]}')
@@ -107,39 +88,21 @@ def apply_ablation(model, what):
             tok, present = inner(b, compact)
             return tok, torch.zeros_like(present)
         it.forward = masked   # (an instance attribute: nn.Module.__call__ runs it)
-        if not model.fused:
-            with torch.no_grad():
-                it.gate.zero_()
     if what in ('global', 'both'):
         g = getattr(model, 'gtok', None)
         if g is None:
             raise ValueError('--ablate global needs a global-token checkpoint (config global_token)')
-        with torch.no_grad():
-            g.gate.zero_()
-            if g.mem_in is not None:
+        if g.mem_in is not None:   # (a GRU: its input no longer carries the global token)
+            with torch.no_grad():
                 g.mem_in.weight.zero_()
                 g.mem_in.bias.zero_()
-        # and its KEY masked in every attention: it neither feeds the item tokens (separate layout: the extra tokens'
-        # key mask ybias) nor takes softmax mass (fused: the blocks' key mask, the global token is the last token)
-        if not model.fused:
-            inner_ext = model._ext_tokens
+        for block in model.blocks:   # its KEY (the last token) masked in every attention: no token attends to it
+            def fwd(x, bias, _inner=block.forward):
+                return _inner(x, bias.index_fill(-1, torch.tensor([bias.shape[-1] - 1], device=bias.device), -1e9))
 
-            def ext_tokens(b):
-                ext = inner_ext(b)
-                if ext is not None and ext['glob'] is not None:
-                    col = torch.tensor([ext['glob']], device=ext['ybias'].device)
-                    ext['ybias'] = ext['ybias'].index_fill(-1, col, -1e9)
-                return ext
-            model._ext_tokens = ext_tokens
-        else:
-            for block in model.blocks:
-                def fwd(x, bias, ext=None, vscale=None, _inner=block.forward, **kw):   # (kw: B30's hist)
-                    return _inner(x, bias.index_fill(-1, torch.tensor([bias.shape[-1] - 1], device=bias.device),
-                                                     -1e9), ext, vscale, **kw)
-
-                def packed(*a, **k):
-                    raise NotImplementedError('--ablate global (fused): the padded forward only (eval_tok act)')
-                block.forward, block.forward_packed = fwd, packed
+            def packed(*a, **k):
+                raise NotImplementedError('--ablate global: the padded forward only (eval_tok act)')
+            block.forward, block.forward_packed = fwd, packed
 
 
 def policy_actions(model, rows, pending, act_idx, device, greedy=False, mem_h=None, mem_reset=None, t_state=None):
@@ -195,8 +158,6 @@ def main():
                    help='2026-10-08, floor / run modes: the PlayerTypes the floors are played as (train_tok '
                         '--characters syntax; each seed\'s character is drawn from the seed alone: '
                         'tok_floor.character_of_seed). Default: Isaac')
-    p.add_argument('--fused-override', type=int, default=0,
-                   help='A28: 1 = a separate-term checkpoint evaluated in the fused layout (convert_to_fused)')
     p.add_argument('--item-slots', type=int, default=None,
                    help="A28: held-item token slots of the evaluated model (default: the checkpoint's)")
     p.add_argument('--ablate', default='', choices=ABLATE,
@@ -204,8 +165,8 @@ def main():
     p.add_argument('--no-pedestals', type=int, default=0,
                    help='A28, floor / run modes: 1 = every collectible pedestal removed from the rooms entered')
     args = p.parse_args()
-    if args.random and (args.fused_override or args.item_slots is not None or args.ablate):
-        p.error('--fused-override / --item-slots / --ablate need a checkpoint')
+    if args.random and (args.item_slots is not None or args.ablate):
+        p.error('--item-slots / --ablate need a checkpoint')
     if args.no_pedestals and args.mode not in ('floor', 'run'):
         p.error('--no-pedestals needs --mode floor or run')
     out = Path(args.out)
@@ -251,26 +212,21 @@ def main():
     model, info = None, dict(policy='random')
     rng = np.random.default_rng(0)
     if not args.random:
-        # (--items on an items-free one: padded; A28 --fused-override / --item-slots: build_eval_model)
+        # (--items on an items-free one: padded; A28 --item-slots: build_eval_model)
         try:
-            model, changed, note = build_eval_model(ck, items, device, bool(args.fused_override), args.item_slots)
+            model, changed = build_eval_model(ck, items, device, args.item_slots)
             apply_ablation(model, args.ablate)
         except ValueError as exc:
             p.error(str(exc))
-        if note:
-            print(note, flush=True)
         info = dict(policy=str(args.checkpoint), update=ck.get('update'), decisions=ck.get('decisions'),
                     greedy=args.greedy, weights_not_exact=changed)
-        for key_ in ('item_tokens', 'global_token', 'item_tokens_fused', 'temporal'):   # B21 / B22, B24, B30
+        for key_ in ('item_tokens', 'global_token', 'temporal'):   # B21 / B22, B30
             if model.config.get(key_):
                 info[key_] = True
-        if args.fused_override:   # A28
-            info['fused_override'] = True
         if args.item_slots is not None:
             info['item_slots'] = int(args.item_slots)
         if args.ablate:
             info['ablate'] = args.ablate
-            print(f'ablate {args.ablate}: gates now {model.gate_values()}', flush=True)
     if args.no_pedestals:   # A28
         info['no_pedestals'] = True
     sampler = TokSampler(cfg)

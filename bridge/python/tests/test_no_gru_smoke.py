@@ -13,7 +13,7 @@ Checks:
       decisions (episode resets, room changes, EV_EXIT, a rollout hand-over with the carried context, minibatches of
       whole chunks in a random order, parts of whole chunks): logits, value, value_global to ~1e-5;
   (c) resume conversion (train_tok --resume with --memory off): a synthetic memory + temporal checkpoint (C96-like,
-      gates open, trained-looking mem_out / mem_in) into the no-memory temporal model: only the GRU tensors dropped
+      trained-looking mem_out / mem_in) into the no-memory temporal model: only the GRU tensors dropped
       (mem_gru.*, mem_out.*, gtok.mem_in.*), every other tensor exact, Adam remapped by name (the dropped entries
       gone, the others' state carried); outputs == the source model with mem_out (and mem_in) zeroed (actor steps,
       act, stored-mode forward); the outputs differ from the unchanged source (the GRU's contribution);
@@ -306,7 +306,7 @@ def _resume_conversion(rng):
     cfg_src = dict(CFG, memory=DM)
     torch.manual_seed(21)
     src = TP.TokPolicy(**cfg_src)
-    TS.perturb_all(src, 22)   # (random weights, gates g1 / g2 / g3 open)
+    TS.perturb_all(src, 22)   # (random weights)
     with torch.no_grad():   # (trained-looking GRU projections; mem_out's bias too: it is part of what the GRU adds)
         g = torch.Generator().manual_seed(23)
         src.mem_out.weight.copy_(torch.randn(src.mem_out.weight.shape, generator=g) * 0.1)
@@ -428,9 +428,9 @@ def _eval_path(rng):
     torch.save(dict(model=m.state_dict(), config=m.config, update=1, decisions=0), buf)
     buf.seek(0)
     ck = torch.load(buf, map_location='cpu')
-    em, changed, note = E.build_eval_model(ck, True, torch.device('cpu'))
+    em, changed = E.build_eval_model(ck, True, torch.device('cpu'))
     check('(e) build_eval_model: a no-GRU temporal checkpoint builds with every tensor exact, no memory',
-          em.tatt is not None and not changed and note is None and em.memory == 0 and em.config.get('temporal'))
+          em.tatt is not None and not changed and em.memory == 0 and em.config.get('temporal'))
     seq = TS.make_seq(rng)
     pend = [M.synth_pending(rng, NW, em.heads) for _ in seq]
     t_state = TP.TemporalState(em, NW, 'cpu', torch.float32)
@@ -450,7 +450,7 @@ def _eval_path(rng):
     check('(e) policy_actions with the per-worker temporal state and no GRU state == act step by step (greedy '
           'actions; states up to rounding: workers reordered)', ok and d_o < 1e-4 and
           torch.equal(t_state.nroom, ref_st.nroom), f'max |o diff| {d_o:.1e}')
-    em2, _, _ = E.build_eval_model(ck, True, torch.device('cpu'))
+    em2, _ = E.build_eval_model(ck, True, torch.device('cpu'))
     try:
         E.apply_ablation(em2, 'global')
         st2 = TP.TemporalState(em2, NW, 'cpu', torch.float32)

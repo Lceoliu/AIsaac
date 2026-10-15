@@ -50,83 +50,51 @@ after the C x T chunk records, one step each): truncated BPTT over the chunk. me
 (an episode's start) and the output arity of a memory-free model. The memory modules are registered last (after
 char_emb): the parameters before them keep their order. Without memory nothing here changes.
 
-Extra tokens (2026-10-12, B21 item tokens / B22 global token; TokPolicy(item_tokens=True) needs items=True,
-TokPolicy(global_token=True); config keys 'item_tokens', 'global_token', only when set). A fixed number G of tokens per
-record (static shapes for the CUDA graphs) beside the old ones (player, room, map, doors, entities):
-  B21 (ItemTokens, 20): one per held collectible (ROW 'inv', up to INV_CAP = 16, newest first: a collectible table of
-  its own (dim 32), the count and count > 1, a slot embedding), one for the active item (its id in the same table,
-  'pinv' columns 0-1: charge share, max charge / 12), one per trinket (2), one for the pocket (pill colour, pill effect,
-  card); each token = mlp(those inputs) + a type embedding (held, active, trinket, pocket). Absent ones are masked as
-  keys (-1e9 in the attention bias, as absent entities). The old multi-hot / pinv inputs of the player token stay.
+Extra tokens (2026-10-12, B21 item tokens / B22 global token; B24 one attention; B33 no gates; TokPolicy(item_tokens=
+True) needs items=True, TokPolicy(global_token=True); config keys 'item_tokens', 'global_token', only when set). A
+fixed number of ordinary tokens per record (static shapes for the CUDA graphs) appended to the old ones (player, room,
+map, doors, entities): [..., items, global] (_forward_fused). Every block runs ONE attention over all of them (one
+softmax; the same LayerNorm, q / k / v projections, output projection and feed-forward as every token):
+  B21 (ItemTokens): one per held collectible (ROW 'inv', newest first, the newest item_slots of them: a collectible
+  table of its own (dim 32), the count and count > 1, a slot embedding), one for the active item (its id in the same
+  table, 'pinv' columns 0-1: charge share, max charge / 12), one per trinket (2), one for the pocket (pill colour, pill
+  effect, card); each token = mlp(those inputs) + a type embedding (held, active, trinket, pocket). Absent ones are
+  masked keys (-1e9 in the attention bias, as absent entities). The old multi-hot / pinv inputs of the player token
+  stay.
   B22 (GlobalToken, 1): a learned vector; a second value head `value_global` reads it (after a norm of its own; with
   memory + mem_out(h_new) as the other heads); with memory the GRU's input is z + mem_in(norm(global token)) (mem_in
-  zero at the start: the concatenation of the two through a zero-initialised projection of the global part).
-Why not simply zero tokens in the one softmax: a zero token is not neutral there. Its key is W_k LN(0) + b_k =
-W_k beta + b_k (beta = n1's bias), not zero, so it takes softmax mass from every query with a non-zero bias, and its
-value W_v beta + b_v is mixed in; even a key masked with -1e9 changes the softmax's and the p @ v product's length and
-so their summation order (not bit-identical, see load_compatible's note on padded columns). A key bias log(g) would give
-exactly zero weight at g = 0 but its gradient is 0 x 1/g (NaN), and any exactly-zero softmax weight has a zero
-gradient through the softmax. So the old tokens' attention is left exactly as it was (same tensors, same calls) and the
-extra tokens reach them through separate, gated terms (Block._ext): for every old query, per layer l,
-  a_old = softmax(q k_old^T + bias) v_old   (unchanged)
-          + gate_items[l] * has_item * softmax(q k_items^T + item mask) v_items
-          + gate_global[l] * v_global          (one key: its softmax weight is 1)
-before the block's output projection; the gates are scalars per layer, zero at the start. The extra tokens themselves
-are updated like any token (their queries attend over every real old and extra key in one softmax, then proj and the
-feed-forward of the same block). At gates 0 every gated term is exactly +-0 (its factors are finite: a softmax over
-all-masked keys is a finite mean, has_item = 0 removes it), a_old + 0 = a_old, and the policy, value, danger and memory
-outputs are bit-identical to a model without the options (tests/test_item_global_smoke.py). Gradients: d loss / d gate
-= <term, d loss / d a_old> is non-zero from the first step (the gates open by themselves); everything upstream of a gate
-(the item embeddings, the global token's vector) gets a zero gradient through that path until its gate is non-zero
-(the same as the GRU behind B20's zero mem_out). value_global's loss reaches the item tokens at once (the global token
-attends to them inside the extra tokens' own softmax). Cost: G more tokens per record through every layer (queries
-over t + G keys) and a G-key cross term for every old token: about G / t more per-token work (actor: t = 43 at 32
-entity tokens, G = 21). The learner's packed paths compute the extra attention in the padded [records, t] layout (the
-old tokens' q / k / v scattered there once per layer). The new modules are registered after everything else (memory
-included): an optimiser state without them is remapped by parameter names (remap_optimizer_state).
+  zero at the start, as mem_out).
+The heads read the player token. The learner's packed layouts treat the present item tokens like entities
+(ItemTokens(compact=True) moves them to the front, item_count() gives their number on the host, packed_index /
+learner_plan / plan_tokens take it). item_slots N (TokPolicy(item_slots=N), config key 'item_slots' when N != INV_CAP;
+needs item tokens): the newest N held collectibles get tokens (slot embeddings 0 .. N-1 of the INV_CAP table: the
+parameters keep their shapes). The modules are registered after everything else (memory included): an optimiser state
+without them is remapped by parameter names (remap_optimizer_state). B33 (2026-10-16): B21 / B22's separate gated
+terms (Block._ext), B24's per-layer gates (value multipliers) and the conversion between the two layouts are gone;
+checkpoints with gates are run from sandboxes at commit b0a89b9 or earlier.
 
 Shared collectible table (2026-10-13, B23; TokPolicy(item_shared=True), needs item_tokens, config key 'item_shared'):
 ItemTokens reads the policy's item_emb (ITEM_EMB = 16 columns, the pedestal ids' and the multi-hot's table) instead of
 a table of its own (IT_COLL = 32): one representation of a collectible whether it lies on a pedestal or is held. The
 table is not registered a second time (one parameter, one state-dict key). A B21 checkpoint is converted by
 share_item_table (its own table dropped, the item-token mlp's first Linear keeps its 44 other columns and gets fresh
-collectible columns); off: the B21 module, bit for bit (tests/test_pickup_smoke.py).
+collectible columns); off: the B21 module (tests/test_pickup_smoke.py).
 
-Fused extra tokens and item slots (2026-10-14, B24; TokPolicy(item_tokens_fused=True), config key 'item_tokens_fused';
-TokPolicy(item_slots=N), config key 'item_slots' when N != INV_CAP; both need item / global tokens). The separate gated
-terms above cost an extra attention per layer over a padded copy of every record's q / k / v (the learner: 2.25 x the
-time of an update without them, C94). Fused (_forward_fused): the N + 4 item tokens and the global token are appended to
-the old tokens and every block runs ONE attention over all of them (one softmax; the same LayerNorm, q / k / v
-projections, output projection and feed-forward as every token); absent items are masked keys like absent entities.
-The per-layer gates stay as multipliers of the item / global tokens' value vectors (Block vscale; 1 at a fresh start).
-The heads read the player token; value_global (and with memory mem_in) the global token. The learner's packed layouts
-treat the present item tokens like entities (ItemTokens(compact=True) moves them to the front, item_count() gives
-their number on the host, packed_index / learner_plan / plan_tokens take it): no padded copies, no cross terms.
-item_slots N: the newest N held collectibles get tokens (slot embeddings 0 .. N-1 of the INV_CAP table: the parameters
-keep their shapes). A B21 / B22 / B23 checkpoint loads into a fused model with every tensor as saved (the same names and
-shapes, so Adam's state too; convert_to_fused): the gates keep their values as value multipliers. That is NOT the same
-function (one softmax cannot reproduce softmax_old + gate x softmax_items: the extra keys take attention mass from the
-old ones), so the outputs change at the switch; tests/test_fused_tokens_smoke.py (c) measures by how much.
-
-Temporal attention (2026-10-14, B30, rl/docs/TEMPORAL_ATTENTION.md; TokPolicy(temporal=True, temporal_width=256, ...),
-config keys 'temporal', 'temporal_width', 'temporal_layers', 'temporal_heads', 'temporal_window', 'temporal_rooms' only
-when on; needs the fused layout when item / global tokens are on). TemporalAttention (registered after everything else:
-an optimiser state without it is remapped by name) is a pre-LN transformer of width D over one token per stored decision:
+Temporal attention (2026-10-14, B30 / B31, B33 no gates; rl/docs/TEMPORAL_ATTENTION.md; TokPolicy(temporal=True,
+temporal_width=256, ...), config keys 'temporal', 'temporal_width', 'temporal_layers', 'temporal_heads',
+'temporal_window', 'temporal_rooms' only when on). TemporalAttention (registered after everything else: an optimiser
+state without it is remapped by name) is a pre-LN transformer of width D over one token per stored decision:
 s_t = W_s [z_t ; norm_g(yg_t)] (z_t = norm(player token), yg_t the global token after the blocks, without one W_s z_t).
 A step token attends to the room tokens created so far in its episode and to the window's step tokens <= t (W steps
 including itself, a learned per-head bias over the step distance 0 .. W-1; rel[:, W] is the bias of a room key); a room
 token r_k = W_r o_exit + E_room[k] + E_stage[stage] (o_exit: o of the last step in the room left, k: the episode's k-th
 room, < temporal_rooms; past the cap no more are made) attends to the earlier room tokens and itself only, so its K / V
-per layer are computed once, when it is made. Output o_t = norm(x_t). Readout: the heads read z + mem_out(h) + g1 P(o_t),
-value_global norm_g(yg) (+ mem_out(h)) + g3 P_g(o_t). Feedback (B31, 2026-10-15; B30 had a separate gated term with
-an extra q k^T and logsumexp per layer): a history token u_t = Q(o_{t-1}) + kind_hist is one more ORDINARY token of the
-fused attention, [..., items, history, global] (one softmax over all tokens, the blocks' projections and feed-forward;
-a temporal model without item / global tokens uses the fused layout for it), its VALUE vector scaled by g2 like the
-item / global gates of B24 (Block vscale), its KEY masked where there is no previous step (an episode's first step);
-the key is never masked by the gate, so d loss / d g2 is non-zero at g2 = 0 (and Q, kind_hist get a gradient through
-the key's softmax share). g1, g2, g3 are scalars, zero at the start; at zero gates the outputs are close to, not
-bit-identical with, the model without the temporal branch (the history key takes a share of the softmax with a zero
-value; tests/test_temporal_smoke.py measures it). Room changes: a record whose map shows a current room (ROW map channel 3) other than
+per layer are computed once, when it is made. Output o_t = norm(x_t). Readout: the heads read z (+ mem_out(h)) + P(o_t),
+value_global norm_g(yg) (+ mem_out(h)) + P_g(o_t). Feedback (B31): a history token u_t = Q(o_{t-1}) + kind_hist is one
+more ordinary token of the one attention, [..., items, history, global] (a temporal model without item / global tokens
+uses the same layout for it), its key masked where there is no previous step (an episode's first step). P, P_g and Q
+are ordinary Linear layers (torch's default initialisation): the temporal side is part of the network from the first
+step. Room changes: a record whose map shows a current room (ROW map channel 3) other than
 the last one shown in the episode, or with EV_EXIT / EV_NEW_ROOM (TemporalAttention.step; never at an episode's first
 step; whole-floor / run modes only: room-mode records have no map).
 Actor (TemporalState, per worker slot, plus a scratch slot for padded graph rows): one K / V tensor
@@ -401,57 +369,14 @@ class Block(nn.Module):
         self.math = False      # 2026-10-10 (B18): attention() as _MathAttention (TokPolicy.set_math_attention)
         self.ln_fast = False   # (B18) the packed layer norms as _LayerNorm
 
-    def forward(self, x, bias, ext=None, vscale=None):
-        """vscale (B24 fused): [t] multipliers of the tokens' value vectors (1 for the old tokens, the item / global
-        gates for the extra ones; B31: g2 for the history token); None: unscaled (as before)."""
+    def forward(self, x, bias):
         b, t, d = x.shape
         q, k, v = self.qkv(self.n1(x)).view(b, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
-        if vscale is not None:
-            v = v * vscale.to(v.dtype).view(1, 1, t, 1)
         a = attention(q, k, v, bias, self.math)
-        if ext is not None:   # 2026-10-12 (B21 / B22): the gated terms of the extra tokens (module docstring)
-            a = a + self._ext(q, k, v, bias, ext)
         x = x + self.proj(a.transpose(1, 2).reshape(b, t, d))
         return x + self.ff(self.n2(x))
 
-    def _ext(self, q, k, v, bias, ext):
-        """(B21 / B22) The extra tokens of this layer: returns the gated terms they add to the old tokens' attention
-        output ([b, heads, t, dh], q / k / v / bias the old tokens' in the padded [b, t] layout) and updates ext['y'] (the
-        extra tokens [b, G, d]: attention over every real old and extra key, the projection and the feed-forward of
-        this block). ext: y, ybias [b, 1, 1, G] (0 / -1e9), cross [(lo, hi, gates [layers], has [b, 1, 1, 1] bool or
-        None)], l (this layer's index)."""
-        y = ext['y']
-        b, G, d = y.shape
-        t = q.shape[2]
-        qy, ky, vy = self.qkv(self.n1(y)).view(b, G, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
-        add = None
-        for lo, hi, gates, has in ext['cross']:
-            if hi - lo == 1:   # one key: its softmax weight is exactly 1, the term is its value
-                c = vy[:, :, lo:hi].expand(-1, -1, t, -1)
-            else:   # (a record without any real key: a finite mean of the masked values, removed by has = 0)
-                c = F.scaled_dot_product_attention(q, ky[:, :, lo:hi], vy[:, :, lo:hi],
-                                                   attn_mask=ext['ybias'][..., lo:hi].to(q.dtype))
-            g = gates[ext['l']]
-            c = c * (g.to(c.dtype) if has is None else g.to(c.dtype) * has.to(c.dtype))
-            add = c if add is None else add + c
-        mask = torch.cat([bias.expand(b, 1, 1, t), ext['ybias']], -1)
-        ay = F.scaled_dot_product_attention(qy, torch.cat([k, ky], 2), torch.cat([v, vy], 2), attn_mask=mask.to(qy.dtype))
-        y = y + self.proj(ay.transpose(1, 2).reshape(b, G, d))
-        ext['y'] = y + self.ff(self.n2(y))
-        return add
-
-    def _ext_packed(self, qkv, ext):
-        """(B21 / B22) _ext for the packed layers: the real old tokens' q / k / v (qkv [m, 3d], at the flat positions
-        ext['keep'] of the [n, t] layout) scattered into that layout; the gated terms back at the real tokens [m, d]."""
-        m, d3 = qkv.shape
-        d = d3 // 3
-        n, t, keep = ext['n'], ext['t'], ext['keep']
-        full = qkv.new_zeros((n * t, d3)).index_copy(0, keep, qkv)
-        q, k, v = full.view(n, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
-        add = self._ext(q, k, v, ext['pbias'], ext)
-        return add.transpose(1, 2).reshape(n * t, d).index_select(0, keep)
-
-    def forward_packed(self, x, bias, keep, shape, ext=None, vscale=None):
+    def forward_packed(self, x, bias, keep, shape):
         """forward() on the real tokens only: x [m, d] holds the tokens at the flat positions `keep` of a [b, t]
         layout (shape (b, t)). The per-token parts (layer norms, qkv, projection, feed-forward) run on the m real
         tokens; attention runs in the padded layout with the same mask (padded keys get weight exactly 0, padded
@@ -462,15 +387,11 @@ class Block(nn.Module):
         exactly 0 either way) on far fewer padded positions; its cost grows with t^2 and jumps past 64 tokens."""
         m, d = x.shape
         qkv = self.qkv(layer_norm(self.n1, x, self.ln_fast))
-        if vscale is not None:   # (B24 fused: [m] multipliers of the real tokens' value vectors)
-            qkv = torch.cat([qkv[:, :2 * d], qkv[:, 2 * d:] * vscale.to(qkv.dtype)[:, None]], 1)
         if isinstance(shape, dict):   # 2026-10-10 (B18): attention per length bucket (learner_plan)
             gpos = shape['gpos']
             full = qkv.new_zeros((shape['total'], 3 * d)).index_copy(0, gpos, qkv)
             if self.math and full.dtype == torch.float32 and not _autocast_on():   # (one node for all buckets)
                 a = _BucketAttention.apply(full, self.heads, shape['buckets']).index_select(0, gpos)
-                if ext is not None:   # (B21 / B22)
-                    a = a + self._ext_packed(qkv, ext)
                 x = x + self.proj(a)
                 return x + self.ff(layer_norm(self.n2, x, self.ln_fast))
             outs, at = [], 0
@@ -479,16 +400,12 @@ class Block(nn.Module):
                 outs.append(attention(q, k, v, bias_k, self.math).transpose(1, 2).reshape(nb * t, d))
                 at += nb * t
             a = (torch.cat(outs) if len(outs) > 1 else outs[0]).index_select(0, gpos)
-            if ext is not None:   # (B21 / B22)
-                a = a + self._ext_packed(qkv, ext)
             x = x + self.proj(a)
             return x + self.ff(layer_norm(self.n2, x, self.ln_fast))
         b, t = shape
         full = qkv.new_zeros((b * t, 3 * d)).index_copy(0, keep, qkv)
         q, k, v = full.view(b, t, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
         a = attention(q, k, v, bias, self.math)
-        if ext is not None:   # (B21 / B22)
-            a = a + self._ext(q, k, v, bias, ext)
         x = x + self.proj(a.transpose(1, 2).reshape(b * t, d).index_select(0, keep))
         return x + self.ff(layer_norm(self.n2, x, self.ln_fast))
 
@@ -545,12 +462,12 @@ class ChoiceHeads(nn.Module):
 
 class ItemTokens(nn.Module):
     """B21 (2026-10-12; TokPolicy(item_tokens=True)): N_ITEM_TOK tokens per record from ROW 'inv', 'pitem', 'pinv' (the
-    module docstring) and their key mask, plus the per-layer gates of the old tokens' term (zero at the start).
+    module docstring) and their key mask.
     B23 (2026-10-13; TokPolicy(item_shared=True)): coll = the policy's item_emb (ITEM_EMB = 16 columns, the table of the
     pedestals' ids and the multi-hot), passed in and not registered here (one parameter, one state-dict key
     'item_emb.weight'); the mlp's first Linear then reads ITEM_EMB collectible columns instead of IT_COLL."""
 
-    def __init__(self, width, layers, coll=None, slots=INV_CAP, fused=False):
+    def __init__(self, width, coll=None, slots=INV_CAP):
         super().__init__()
         if not 1 <= int(slots) <= INV_CAP:
             raise ValueError(f'ItemTokens: slots must be in 1 .. {INV_CAP}, not {slots}')
@@ -571,8 +488,6 @@ class ItemTokens(nn.Module):
         self.kind = nn.Embedding(4, width)         # held, active, trinket, pocket
         nn.init.normal_(self.slot.weight, std=0.02)
         nn.init.normal_(self.kind.weight, std=0.02)
-        # (B24 fused: the per-layer multipliers of the item tokens' value vectors, 1 = ordinary tokens at the start)
-        self.gate = nn.Parameter(torch.ones(layers) if fused else torch.zeros(layers))
 
     @property
     def coll(self):
@@ -583,7 +498,7 @@ class ItemTokens(nn.Module):
     def forward(self, b, compact=False):
         """(tokens [n, n_tok, width], present [n, n_tok] bool). No host synchronisation, static shapes. n_tok =
         N_ITEM_TOK unless slots (B24 --item-slots) keeps fewer held collectibles (the newest ones: ROW 'inv' is newest
-        first). compact (B24 fused): the present tokens moved to the front of each record, in their order (the absent
+        first). compact (B24): the present tokens moved to the front of each record, in their order (the absent
         ones after them; the attention does not depend on the order of its keys): the real item tokens are the first
         item_count() of a record, as the real entities are the first n_ent (the packed layouts plan them from that
         count on the host)."""
@@ -631,15 +546,13 @@ def item_count(rows, slots=INV_CAP):
 
 
 class GlobalToken(nn.Module):
-    """B22 (2026-10-12; TokPolicy(global_token=True)): a learned token, the per-layer gates of its term for the old
-    tokens (zero at the start), the second value head value_global on it (own norm) and, with memory, mem_in (zero at
-    the start: the GRU's input is z + mem_in(norm(global token)))."""
+    """B22 (2026-10-12; TokPolicy(global_token=True)): a learned token, the second value head value_global on it (own
+    norm) and, with memory, mem_in (zero at the start: the GRU's input is z + mem_in(norm(global token)))."""
 
-    def __init__(self, width, layers, memory=0, fused=False):
+    def __init__(self, width, memory=0):
         super().__init__()
         self.tok = nn.Parameter(torch.zeros(width))
         nn.init.normal_(self.tok, std=0.02)
-        self.gate = nn.Parameter(torch.ones(layers) if fused else torch.zeros(layers))   # (B24 fused: as ItemTokens)
         self.norm = nn.LayerNorm(width)
         self.value = mlp(width, width, 1)
         self.mem_in = nn.Linear(width, width) if memory else None
@@ -707,8 +620,7 @@ class TemporalLayer(nn.Module):
 class TemporalAttention(nn.Module):
     """B30 (2026-10-14; TokPolicy(temporal=True)): the temporal transformer (module docstring, rl/docs/
     TEMPORAL_ATTENTION.md). width: the spatial width d; glob: the policy has a global token (s_t reads it, value_global's
-    readout P_g and gate g3 exist); D, layers, heads, window W, rooms R. Gates g_read (g1), g_feed (g2), g_vg (g3):
-    one-element parameters, zero at the start."""
+    readout P_g exists); D, layers, heads, window W, rooms R."""
 
     def __init__(self, width, glob, D=256, layers=4, heads=4, window=256, rooms=128):
         super().__init__()
@@ -729,16 +641,6 @@ class TemporalAttention(nn.Module):
         nn.init.normal_(self.room_emb.weight, std=0.02)
         nn.init.normal_(self.stage_emb.weight, std=0.02)
         nn.init.normal_(self.hist_kind, std=0.02)
-        self.g_read = nn.Parameter(torch.zeros(1))
-        self.g_feed = nn.Parameter(torch.zeros(1))
-        self.g_vg = nn.Parameter(torch.zeros(1)) if glob else None
-
-    def gates(self):
-        """{'t_gate_read': g1, 't_gate_feed': g2, 't_gate_vg': g3} (progress.csv)."""
-        out = {'t_gate_read': float(self.g_read), 't_gate_feed': float(self.g_feed)}
-        if self.g_vg is not None:
-            out['t_gate_vg'] = float(self.g_vg)
-        return out
 
     def embed(self, z, gn):
         """s_t = W_s [z ; norm_g(yg)] (float32)."""
@@ -1080,14 +982,9 @@ def temporal_part(td, cids, counts, qep_rows, table, to_dev=None):
 
 class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
-                 memory=0, item_tokens=False, global_token=False, item_shared=False, item_tokens_fused=False,
-                 item_slots=INV_CAP, temporal=False, temporal_width=256, temporal_layers=4, temporal_heads=4,
-                 temporal_window=256, temporal_rooms=128):
+                 memory=0, item_tokens=False, global_token=False, item_shared=False, item_slots=INV_CAP, temporal=False,
+                 temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128):
         super().__init__()
-        if temporal and (item_tokens or global_token) and not item_tokens_fused:
-            raise ValueError('TokPolicy: temporal needs the fused layout (item_tokens_fused) with item / global tokens')
-        if item_tokens_fused and not (item_tokens or global_token):
-            raise ValueError('TokPolicy: item_tokens_fused needs item_tokens or global_token (B24)')
         if int(item_slots) != INV_CAP and not item_tokens:
             raise ValueError('TokPolicy: item_slots needs item_tokens=True (B24)')
         if item_tokens and not items:
@@ -1163,8 +1060,8 @@ class TokPolicy(nn.Module):
             self.mem_out = nn.Linear(self.memory, width)
             nn.init.zeros_(self.mem_out.weight)
             nn.init.zeros_(self.mem_out.bias)
-        # 2026-10-12 (B21 / B22): registered after everything else (memory included), gates zero at the start (the
-        # module docstring); the config keys only when set
+        # 2026-10-12 (B21 / B22): registered after everything else (memory included; the module docstring); the
+        # config keys only when set
         self.item_tokens, self.global_token = bool(item_tokens), bool(global_token)
         if self.item_tokens:
             self.config['item_tokens'] = True
@@ -1174,18 +1071,14 @@ class TokPolicy(nn.Module):
         self.item_shared = bool(item_shared)
         if self.item_shared:
             self.config['item_shared'] = True
-        # 2026-10-14 (B24): the item / global tokens as ordinary tokens of the one attention (_forward_fused), and the
-        # number of held-collectible token slots (the keys only when set; the same parameters, names and shapes)
-        self.fused = bool(item_tokens_fused)
-        if self.fused:
-            self.config['item_tokens_fused'] = True
+        # 2026-10-14 (B24): the number of held-collectible token slots (the key only when set; the same parameters)
         if self.item_tokens and int(item_slots) != INV_CAP:
             self.config['item_slots'] = int(item_slots)
-        self.itok = ItemTokens(width, layers, coll=self.item_emb if self.item_shared else None, slots=int(item_slots),
-                               fused=self.fused) if self.item_tokens else None
-        self.gtok = GlobalToken(width, layers, self.memory, fused=self.fused) if self.global_token else None
-        # 2026-10-14 (B30): the temporal transformer, registered after everything else, gates zero (module docstring);
-        # the config keys only when on
+        self.itok = ItemTokens(width, coll=self.item_emb if self.item_shared else None,
+                               slots=int(item_slots)) if self.item_tokens else None
+        self.gtok = GlobalToken(width, self.memory) if self.global_token else None
+        # 2026-10-14 (B30): the temporal transformer, registered after everything else (module docstring); the config
+        # keys only when on
         self.tatt = None
         if temporal:
             self.config.update(temporal=True, temporal_width=int(temporal_width), temporal_layers=int(temporal_layers),
@@ -1194,43 +1087,6 @@ class TokPolicy(nn.Module):
             self.tatt = TemporalAttention(width, glob=self.global_token, D=int(temporal_width),
                                           layers=int(temporal_layers), heads=int(temporal_heads),
                                           window=int(temporal_window), rooms=int(temporal_rooms))
-
-    def gate_values(self):
-        """(B21 / B22) {'item_gate': mean |gate| over the layers, 'global_gate': ...} of the options that are on."""
-        out = {}
-        with torch.no_grad():
-            if self.itok is not None:
-                out['item_gate'] = float(self.itok.gate.abs().mean())
-            if self.gtok is not None:
-                out['global_gate'] = float(self.gtok.gate.abs().mean())
-            if self.tatt is not None:   # (B30) the readout, feedback and value_global gates as they are
-                out.update(self.tatt.gates())
-        return out
-
-    def _ext_tokens(self, b):
-        """(B21 / B22) The extra tokens of a batch and their attention bookkeeping (Block._ext's ext dict); None when
-        both options are off."""
-        if self.itok is None and self.gtok is None:
-            return None
-        toks, masks, cross = [], [], []
-        n = b['player'].shape[0]
-        dev = b['player'].device
-        if self.itok is not None:
-            tok, present = self.itok(b)
-            toks.append(tok)
-            masks.append(present)
-            cross.append((0, self.itok.n_tok, self.itok.gate, present.any(1)[:, None, None, None]))
-        glob = None
-        if self.gtok is not None:
-            glob = sum(t_.shape[1] for t_ in toks)
-            toks.append(self.gtok.tok.view(1, 1, -1).expand(n, 1, -1))
-            masks.append(torch.ones((n, 1), dtype=torch.bool, device=dev))
-            cross.append((glob, glob + 1, self.gtok.gate, None))
-        y = torch.cat(toks, 1) if len(toks) > 1 else toks[0]
-        present = torch.cat(masks, 1) if len(masks) > 1 else masks[0]
-        ybias = torch.zeros((n, 1, 1, y.shape[1]), device=dev, dtype=y.dtype).masked_fill(
-            ~present[:, None, None], -1e9)
-        return dict(y=y, ybias=ybias, cross=cross, l=0, glob=glob)
 
     def main_parameters(self):
         """The parameters PPO's optimiser owns: all but the choice heads' (in the order of parameters())."""
@@ -1259,7 +1115,7 @@ class TokPolicy(nn.Module):
         mem (2026-10-11, memory models only): the GRU's state (module docstring); then the new state h_new [B, D] is
         returned as the last element.
         need_vg (2026-10-12, B22 global-token models only): value_global [B] appended as the very last element (after
-        h_new). The extra tokens of B21 / B22 (module docstring) need nothing from the caller.
+        h_new). The item / global tokens (module docstring) need nothing from the caller.
         temporal (2026-10-14, B30, temporal models only; None: the temporal branch is skipped, the outputs are those
         of the model without it): a dict, mode
           'step': dict(mode='step', state=TemporalState, slot=[B] long): the actor's / evaluator's step (in place on
@@ -1269,28 +1125,20 @@ class TokPolicy(nn.Module):
                   bool) for the first k records (chunk-major, the plan's rows), the rest (teacher records) without;
           'stored': dict(mode='stored', o=[k, D] stored o_t, o_prev, has): the stored outputs for the readout (the
                   values recomputed at an update's start).
-        (B31) With a temporal context the history token is a token of the fused layout: host plans of a packed batch
-        (packed_index / learner_plan) need hist= each record's has (False past the first k)."""
+        (B31) With a temporal context the history token is one more token (_forward_fused): host plans of a packed
+        batch (packed_index / learner_plan) need hist= each record's has (False past the first k)."""
         if need_vg and self.gtok is None:
             raise ValueError('TokPolicy.forward: need_vg needs a global-token model (global_token=True)')
         tctx = hist = None
         if temporal is not None and self.tatt is not None:   # 2026-10-14 (B30)
             tctx, hist = self._temporal_in(b, temporal)
-        if self.fused or hist is not None:   # 2026-10-14 (B24): one attention over the old and the extra tokens
-            # (B31: the history token is one of them; a temporal model without item / global tokens uses this layout too)
+        if self.itok is not None or self.gtok is not None or hist is not None:   # the item / global / history tokens
             return self._forward_fused(b, entities, packed, need_h, mem, need_vg, tctx, hist)
-        ext = self._ext_tokens(b)   # (B21 / B22; None when off: the code below is the one before)
         n, used, fast, player, room, level, entity = self._embed_old(b, entities, packed)
         if fast:   # (B18) the door mlp on the real doors only; the real tokens grouped by kind, then in packed order
             door = embed(self.door, b['doors'].reshape(n * DOOR_CAP, -1).index_select(0, b['dkeep'])) + self.kind[2]
             xp = torch.cat([player, room, level, door, entity]).index_select(0, b['xperm'])
-            if ext is not None:   # (B21 / B22: the padded layout of the extra attention)
-                t_ = 3 + DOOR_CAP + used
-                real_ = torch.zeros(n * t_, dtype=torch.bool, device=xp.device).index_fill_(0, b['keep'], True)
-                ext.update(n=n, t=t_, keep=b['keep'], pbias=torch.zeros(
-                    (n, 1, 1, t_), device=xp.device, dtype=xp.dtype).masked_fill(~real_.view(n, 1, 1, t_), -1e9))
-            x0 = self._blocks_bucketed(xp, b, ext).index_select(0, b['starts'])
-            return self._heads(x0, need_h, mem, self._yg(ext), need_vg, tctx)
+            return self._heads(self._blocks_bucketed(xp, b).index_select(0, b['starts']), need_h, mem)
         door = embed(self.door, b['doors']) + self.kind[2]
         x = torch.cat([player[:, None], room[:, None], level[:, None], door, entity], 1)
         dev = x.device
@@ -1308,23 +1156,17 @@ class TokPolicy(nn.Module):
                 counts = real.sum(1)
                 starts = counts.cumsum(0) - counts
             xp = x.reshape(n * t, -1).index_select(0, keep)
-            if ext is not None:   # (B21 / B22: the padded layout of the extra attention)
-                ext.update(n=n, t=t, keep=keep, pbias=bias)
             if 'buckets' in b:   # 2026-10-10 (B18): attention per length bucket (learner_plan, from the host)
-                xp = self._blocks_bucketed(xp, b, ext)
+                xp = self._blocks_bucketed(xp, b)
             else:
-                for l_, block in enumerate(self.blocks):
-                    if ext is not None:
-                        ext['l'] = l_
-                    xp = block.forward_packed(xp, bias, keep, (n, t), ext)
+                for block in self.blocks:
+                    xp = block.forward_packed(xp, bias, keep, (n, t))
             x0 = xp.index_select(0, starts)   # the player's token: the first of each record
         else:
-            for l_, block in enumerate(self.blocks):
-                if ext is not None:
-                    ext['l'] = l_
-                x = block(x, bias, ext)
+            for block in self.blocks:
+                x = block(x, bias)
             x0 = x[:, 0]
-        return self._heads(x0, need_h, mem, self._yg(ext), need_vg, tctx)
+        return self._heads(x0, need_h, mem)
 
     def _embed_old(self, b, entities, packed):
         """forward()'s token embeddings of the old tokens (player, room, map, entities; the doors are the
@@ -1383,35 +1225,23 @@ class TokPolicy(nn.Module):
         return n, used, fast, player, room, level, entity
 
     def extra_tokens(self):
-        """(B24) (item tokens per record, global tokens per record) of the fused layout ((0, 0) when not fused)."""
-        if not self.fused:
-            return 0, 0
+        """(B24) (item tokens per record, global tokens per record) appended to the old ones ((0, 0) without them)."""
         return (self.itok.n_tok if self.itok is not None else 0), (1 if self.gtok is not None else 0)
 
-    def _vtable(self, hist=False):
-        """(B24 fused) [layers, 3] value multipliers per token group: old tokens (1), item tokens (itok.gate), the
-        global token (gtok.gate); hist (B31): [layers, 4], the history token's (g2, the same at every layer) last."""
-        one = self.kind.new_ones(len(self.blocks))
-        cols = [one, self.itok.gate if self.itok is not None else one, self.gtok.gate if self.gtok is not None else one]
-        if hist:
-            cols.append(self.tatt.g_feed.expand(len(self.blocks)))
-        return torch.stack(cols, 1)
-
     def _forward_fused(self, b, entities, packed, need_h, mem, need_vg, tctx=None, hist=None):
-        """forward() of a B24 model (item_tokens_fused): the item tokens (ItemTokens, compacted: the present ones first)
-        and the global token are appended to the old tokens, [player, room, map, doors, entities, items, global], and
-        every block runs ONE attention over all of them (one softmax, the same q / k / v projections; absent items
-        are masked keys like absent entities); the gates multiply the value vectors of the item / global tokens
-        (Block vscale). The heads read the player token, value_global (and with memory mem_in) the global token.
+        """forward() of a model with item / global tokens or a history token (B24): the item tokens (ItemTokens,
+        compacted: the present ones first) and the global token are appended to the old tokens, [player, room, map,
+        doors, entities, items, global], and every block runs ONE attention over all of them (one softmax, the same
+        q / k / v projections; absent items are masked keys like absent entities). The heads read the player token,
+        value_global (and with memory mem_in) the global token.
         Packed layouts (the learner): the real item tokens are the first item_count() of a record, the global token is
         each record's last real token; host plans (packed_index / learner_plan with n_item) include them.
         hist (B31, temporal models; _temporal_in's dict(y [n, width], has [n] bool)): the history token, one more
-        ordinary token before the global one, [..., items, history, global] (group 3 of the value multipliers: g2);
-        its key masked where has is False (packed layouts: not a real token there; host plans with hist=has)."""
+        ordinary token before the global one, [..., items, history, global]; its key masked where has is False
+        (packed layouts: not a real token there; host plans with hist=has)."""
         NI, G = self.extra_tokens()
         HS = int(hist is not None)
         n, used, fast, player, room, level, entity = self._embed_old(b, entities, packed)
-        vt = self._vtable(bool(HS))
         if NI:
             itok, ipres = self.itok(b, compact=True)
         if fast:   # (B18 fast path: learner_plan / plan_tokens with n_item; the real tokens grouped by kind)
@@ -1423,7 +1253,7 @@ class TokPolicy(nn.Module):
                 src.append(hist['y'].to(player.dtype))
             if G:
                 src.append(self.gtok.tok.view(1, -1).expand(n, -1))
-            xp = self._blocks_bucketed(torch.cat(src).index_select(0, b['xperm']), b, vgroup=(b['tgroup'], vt))
+            xp = self._blocks_bucketed(torch.cat(src).index_select(0, b['xperm']), b)
             return self._heads(xp.index_select(0, b['starts']), need_h, mem,
                                xp.index_select(0, b['glast']) if G else None, need_vg, tctx)
         door = embed(self.door, b['doors']) + self.kind[2]
@@ -1444,10 +1274,6 @@ class TokPolicy(nn.Module):
         x = torch.cat(toks, 1)
         pad = torch.cat(pads, 1)
         t = x.shape[1]
-        group = torch.cat([torch.zeros(t - NI - HS - G, dtype=torch.int64, device=dev),
-                           torch.ones(NI, dtype=torch.int64, device=dev),
-                           torch.full((HS,), 3, dtype=torch.int64, device=dev),
-                           torch.full((G,), 2, dtype=torch.int64, device=dev)])
         bias = torch.zeros((n, 1, 1, t), device=dev, dtype=x.dtype).masked_fill(pad[:, None, None], -1e9)
         if packed:
             if 'keep' in b:   # (host plan: packed_index with n_item)
@@ -1460,22 +1286,16 @@ class TokPolicy(nn.Module):
                 starts = counts.cumsum(0) - counts
                 last = starts + counts - 1
             xp = x.reshape(n * t, -1).index_select(0, keep)
-            tg = group.index_select(0, keep.remainder(t))
             if 'buckets' in b:
-                xp = self._blocks_bucketed(xp, b, vgroup=(tg, vt))
+                xp = self._blocks_bucketed(xp, b)
             else:
-                for l_, block in enumerate(self.blocks):
-                    xp = block.forward_packed(xp, bias, keep, (n, t), vscale=vt[l_].index_select(0, tg))
+                for block in self.blocks:
+                    xp = block.forward_packed(xp, bias, keep, (n, t))
             return self._heads(xp.index_select(0, starts), need_h, mem, xp.index_select(0, last) if G else None,
                                need_vg, tctx)
-        for l_, block in enumerate(self.blocks):
-            x = block(x, bias, vscale=vt[l_].index_select(0, group))
+        for block in self.blocks:
+            x = block(x, bias)
         return self._heads(x[:, 0], need_h, mem, x[:, -1] if G else None, need_vg, tctx)
-
-    @staticmethod
-    def _yg(ext):
-        """(B22) the global token after the blocks [B, width], or None."""
-        return ext['y'][:, ext['glob']] if ext is not None and ext['glob'] is not None else None
 
     def _cnn(self, seq, b, key):
         """A grid input's CNN; with b[key + '_u'] / b[key + '_i'] (B18, the learner's fast path: the distinct grids of
@@ -1486,23 +1306,15 @@ class TokPolicy(nn.Module):
             return seq(self._conv_in(b[key]))
         return seq(self._conv_in(b[key].index_select(0, u))).index_select(0, b[key + '_i'])
 
-    def _blocks_bucketed(self, xp, b, ext=None, vgroup=None):
-        """(B18) the blocks on the packed tokens xp with attention per length bucket (learner_plan's gpos, buckets).
-        ext (B21 / B22): the extra tokens (forward's, with n, t, keep, pbias of the padded layout). vgroup (B24 fused):
-        (each packed token's group [m] (0 old, 1 item, 2 global, 3 history), _vtable()): the value multipliers per
-        layer."""
+    def _blocks_bucketed(self, xp, b):
+        """(B18) the blocks on the packed tokens xp with attention per length bucket (learner_plan's gpos, buckets)."""
         dev = xp.device
         ar = torch.arange(max(w_ for _, w_ in b['buckets']), device=dev)
         shape = dict(gpos=b['gpos'], total=sum(len(c_) * w_ for c_, w_ in b['buckets']), buckets=[
             (len(c_), w_, torch.zeros((len(c_), 1, 1, w_), device=dev, dtype=xp.dtype).masked_fill(
                 (ar[None, :w_] >= c_[:, None])[:, None, None], -1e9)) for c_, w_ in b['buckets']])
-        for l_, block in enumerate(self.blocks):
-            if ext is not None:
-                ext['l'] = l_
-            if vgroup is not None:
-                xp = block.forward_packed(xp, None, None, shape, vscale=vgroup[1][l_].index_select(0, vgroup[0]))
-            else:
-                xp = block.forward_packed(xp, None, None, shape, ext)
+        for block in self.blocks:
+            xp = block.forward_packed(xp, None, None, shape)
         return xp
 
     def _value_global(self, yg, h_new=None):
@@ -1555,7 +1367,7 @@ class TokPolicy(nn.Module):
     def _temporal_in(self, b, temporal):
         """(B30) forward's temporal context (the mode's inputs and, for 'step', the records' fields) and the history
         token dict(y [n, width] float32 = Q(o_{t-1}) + kind_hist, has [n] bool: a previous step exists) for the blocks
-        (B31: an ordinary token of the fused attention, its value scaled by g2, its key masked where has is False)."""
+        (B31: an ordinary token of the one attention, its key masked where has is False)."""
         n = b['player'].shape[0]
         mode = temporal['mode']
         ta = self.tatt
@@ -1582,10 +1394,10 @@ class TokPolicy(nn.Module):
         return tctx, dict(y=y, has=has.to(dev).bool())
 
     def _heads_temporal(self, x0, need_h, mem, yg, need_vg, tctx):
-        """(B30) _heads / _heads_mem of a temporal model: the same computation (bit for bit at zero gates) with
-        s_t = W_s [z ; norm_g(yg)] -> o_t (the temporal transformer: tctx's mode) -> the heads read
-        z (+ mem_out(h_new)) + g1 P(o), value_global norm_g(yg) (+ mem_out(h_new)) + g3 P_g(o). Rows without a temporal
-        output (chunk / stored modes: past the first k) get no readout term (exactly 0)."""
+        """(B30) _heads / _heads_mem of a temporal model: the same computation with s_t = W_s [z ; norm_g(yg)] -> o_t
+        (the temporal transformer: tctx's mode) -> the heads read z (+ mem_out(h_new)) + P(o), value_global
+        norm_g(yg) (+ mem_out(h_new)) + P_g(o). Rows without a temporal output (chunk / stored modes: past the first k)
+        get no readout term (exactly 0)."""
         ta = self.tatt
         ctx = torch.autocast('cuda', enabled=False) if _autocast_on() else contextlib.nullcontext()
         with ctx:
@@ -1610,13 +1422,13 @@ class TokPolicy(nn.Module):
                 o_k = ta.sequence(s_t[:k], tctx['plan']) if mode == 'chunk' else tctx['o'].float()
                 o = torch.cat([o_k, o_k.new_zeros((n - k, o_k.shape[1]))]) if k < n else o_k
                 m = torch.cat([z.new_ones(k), z.new_zeros(n - k)]) if k < n else z.new_ones(n)
-            zr = zr + (ta.g_read * m)[:, None] * ta.read(o)
+            zr = zr + m[:, None] * ta.read(o)
             out = (self.pi(zr), self.value(zr)[:, 0], self.danger(zr)) + ((zr,) if need_h else ())
             if self.memory and mem is not None:
                 out = out + (h_new,)
             if need_vg:
                 zg = gn + mo if self.memory else gn
-                zg = zg + (ta.g_vg * m)[:, None] * ta.read_g(o)
+                zg = zg + m[:, None] * ta.read_g(o)
                 out = out + (self.gtok.value(zg)[:, 0],)
             return out
 
@@ -1815,7 +1627,7 @@ def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, g
     B24 (a fused model, TokPolicy.extra_tokens() = (item_tok, glob)): n_item the records' item_count(); a record's real
     tokens are then player, room, map, doors, entities, its real item tokens, the global token (c grows by
     n_item + glob), rec gets two more columns (items, first real item) and m_item, item_tok, glob are set.
-    hist (B31, packed_index's): the fused layout (also without item / global tokens) with the history token after
+    hist (B31, packed_index's): the same layout (also without item / global tokens) with the history token after
     the real item tokens where hist is set (c grows by one there); rec gets a ninth column (0 / 1), 'hist' = 1."""
     ne = np.minimum(np.asarray(n_ent, np.int64), entities)
     nd = np.minimum(np.asarray(n_doors, np.int64), DOOR_CAP)
@@ -1879,9 +1691,8 @@ def plan_tokens(plan, rec, base):
       gpos: each packed token's position in the attention buckets' layout.
     B24 (a fused plan, rec [n, 8]): xperm's source is [players; rooms; maps; real doors; real entities; real items;
     globals], and also: ikeep (the real item tokens' flat positions in the [n, item_tok] layout of ItemTokens(compact)),
-    tgroup (each packed token's group: 0 old, 1 item, 2 global), glast (each record's last packed token: the global
-    token). B31 (rec [n, 9], plan 'hist'): the history tokens' source rows [n] come after the real items' (one per
-    record, present where rec[:, 8]), tgroup 3."""
+    glast (each record's last packed token: the global token). B31 (rec [n, 9], plan 'hist'): the history tokens'
+    source rows [n] come after the real items' (one per record, present where rec[:, 8])."""
     if rec.shape[1] >= 8:
         return _plan_tokens_fused(plan, rec, base)
     n, dev = rec.shape[0], rec.device
@@ -1928,17 +1739,14 @@ def _plan_tokens_fused(plan, rec, base):
             within < b1, 3 * n + dstart[r] + within - 3, torch.where(
                 within < b2, base_e + estart[r] + within - b1, torch.where(
                     within < b3, base_i + istart[r] + within - b2, torch.where(within < b4, base_h + r, base_g + r)))))
-        tgroup = torch.where(within < b2, zero, torch.where(within < b3, zero + 1, torch.where(within < b4, zero + 3,
-                                                                                                zero + 2)))
         return dict(keep=r * t + slot, starts=starts, ekeep=ekeep, dkeep=dkeep, xperm=xperm, gpos=base[r] + within,
-                    ikeep=ikeep, tgroup=tgroup, glast=starts + cnt - 1)
+                    ikeep=ikeep, glast=starts + cnt - 1)
     xperm = torch.where(within < 3, within * n + r, torch.where(
         within < b1, 3 * n + dstart[r] + within - 3, torch.where(
             within < b2, base_e + estart[r] + within - b1, torch.where(
                 within < b3, base_i + istart[r] + within - b2, base_g + r))))
-    tgroup = (within >= b2).long() + (within >= b3).long()
     return dict(keep=r * t + slot, starts=starts, ekeep=ekeep, dkeep=dkeep, xperm=xperm, gpos=base[r] + within,
-                ikeep=ikeep, tgroup=tgroup, glast=starts + cnt - 1)
+                ikeep=ikeep, glast=starts + cnt - 1)
 
 
 def first_of(ids, size):
@@ -2522,7 +2330,7 @@ def share_item_table(model, state):
     The old table is dropped; the first Linear of the item-token mlp ('itok.mlp.0.weight', [width, 32 + 44]) becomes
     [width, 16 + 44]: its 44 non-collectible columns (trinket, pill, effect, card embeddings, count, count > 1, charge
     share, max charge) are the checkpoint's, its 16 collectible columns keep the model's fresh initialisation (torch's
-    nn.Linear default, U(-1/sqrt(60), 1/sqrt(60)), drawn when the model was built). Every other tensor (bias, gates,
+    nn.Linear default, U(-1/sqrt(60), 1/sqrt(60)), drawn when the model was built). Every other tensor (bias,
     slot / kind embeddings, the rest of the mlp, item_emb itself) is the checkpoint's. Returns (state, a log line or
     None when nothing was converted). The input dict is not changed."""
     itok = getattr(model, 'itok', None)
@@ -2543,26 +2351,6 @@ def share_item_table(model, state):
                    f'dropped, the item tokens now read item_emb ({itok.dc} columns); {ITEM_SHARED_KEY} '
                    f'{tuple(w_old.shape)} -> {tuple(w.shape)}: its {rest} other columns kept, its {itok.dc} collectible '
                    "columns re-initialised (the fresh model's nn.Linear default); everything else loaded as saved")
-
-
-def convert_to_fused(model, state):
-    """B24 (2026-10-14): a B21 / B22 / B23 checkpoint's state dict (separate gated terms) for a fused model
-    (TokPolicy item_tokens_fused, any item_slots). Deterministic and data-free: every tensor is kept as saved, the
-    gates (itok.gate, gtok.gate: per-layer scalars of the old tokens' extra terms) become the multipliers of the item /
-    global tokens' value vectors (tests/test_fused_tokens_smoke.py (c): closer to the checkpoint's outputs than gates
-    reset to 1 on synthetic records with C92-sized gates). Approximate, not exact (module docstring). Returns (state,
-    a log line); raises ValueError if the model is not fused or a tensor does not fit."""
-    if not getattr(model, 'fused', False):
-        raise ValueError('convert_to_fused: the model is not fused (item_tokens_fused)')
-    own = model.state_dict()
-    bad = [k for k, v in state.items() if k not in own or own[k].shape != v.shape]
-    missing = [k for k in own if k not in state and not k.startswith('choice.')]
-    if bad or missing:
-        raise ValueError(f'convert_to_fused: tensors that do not fit {bad[:4]}, missing {missing[:4]}')
-    gates = {k: [round(float(v_), 4) for v_ in state[k]] for k in ('itok.gate', 'gtok.gate') if k in state}
-    return dict(state), ('item_tokens_fused (B24): every tensor kept as saved; the gates ' + str(gates) + ' are now the '
-                         'multipliers of the extra tokens\' value vectors; approximate (one softmax over the old and the '
-                         'extra tokens instead of the gated terms)')
 
 
 MEMORY_PREFIXES = ('mem_gru.', 'mem_out.', 'gtok.mem_in.')   # B32: the GRU memory's tensors (B20; B22's mem_in)

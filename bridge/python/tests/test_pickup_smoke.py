@@ -5,11 +5,11 @@
 No game, no GPU. Plain script:
   cd rl/bridge/python && python tests/test_pickup_smoke.py
 Checks:
-  (a) options off == git HEAD's policy module, bit for bit, on every path (plain, items, items + memory, and B21 item
-      tokens / B22 global token with open gates, not shared); ROW's old fields keep HEAD's offsets;
+  (a) options off == git HEAD's policy module, bit for bit, on every path (plain, items, items + memory); ROW's old
+      fields keep HEAD's offsets;
   (b) item_shared: itok.coll is item_emb (one parameter, no itok.coll key), forward / backward work, and item_emb gets
       gradient from the pedestal path (ids only on pedestals) and from the held-item path through the item tokens
-      (the gradient with the gates open minus the gradient with the gates closed is non-zero on the held ids);
+      (the item tokens' output alone gives gradient on the held ids);
   (c) a synthetic B21 checkpoint (own 32-column itok.coll) into an item_shared model through share_item_table /
       load_compatible: every other tensor kept, the first Linear's 44 other columns kept, its 16 collectible columns
       the fresh model's, the log line; Adam state remapped with the converted Linear dropped (a step runs); a
@@ -74,14 +74,10 @@ def main():
 
     # ------------------------------------------------------------ (a) off == HEAD
     old = M.head_module()
-    cases = (('plain', dict(), False), ('items', BASE, False), ('items+memory', dict(BASE, memory=D), False),
-             ('B21 item tokens, gates open', dict(BASE, item_tokens=True), True),
-             ('B21 + B22 + memory, gates open', dict(BASE, memory=D, item_tokens=True, global_token=True), True))
-    for tag, cfg, gates in cases:
+    cases = (('plain', dict()), ('items', BASE), ('items+memory', dict(BASE, memory=D)))
+    for tag, cfg in cases:
         torch.manual_seed(1)
         new = TP.TokPolicy(**cfg).eval()
-        if gates:
-            G.open_gates(new)
         n = 11
         b = TP.to_batch(G.rows_with_empty(rng, n), M.synth_pending(rng, n, new.heads), dev)
         acts = torch.from_numpy(M.synth_pending(rng, n, new.heads))
@@ -134,19 +130,19 @@ def main():
 
     def emb_grad(m):
         m.zero_grad()
-        logits, value, _, _ = m(G.fast_batch(b), packed=True, mem=memd)
+        logits, value, _, _ = m(G.fast_batch(b, m), packed=True, mem=memd)
         logp, ent = m.log_prob(logits, m.gate(b), acts)
         (-(logp * adv).mean() + 0.5 * ((value - ret) ** 2).mean() - 0.01 * ent.sum(-1).mean()).backward()
         return m.item_emb.weight.grad.clone()
     sh.train()
-    g_closed = emb_grad(sh)
+    g_all = emb_grad(sh)
     check('(b) backward runs, pedestal path: gradient on the pedestal-only ids',
-          bool(torch.isfinite(g_closed).all()) and all(float(g_closed[i].abs().sum()) > 0 for i in ped_ids),
-          ', '.join(f'{i}: {float(g_closed[i].abs().sum()):.2e}' for i in ped_ids))
-    G.open_gates(sh)
-    g_open = emb_grad(sh)
-    dh = [float((g_open[i] - g_closed[i]).abs().sum()) for i in held_ids]
-    check('(b) held path: the item tokens add gradient on the held ids (gates open - gates closed != 0)',
+          bool(torch.isfinite(g_all).all()) and all(float(g_all[i].abs().sum()) > 0 for i in ped_ids),
+          ', '.join(f'{i}: {float(g_all[i].abs().sum()):.2e}' for i in ped_ids))
+    sh.zero_grad()
+    sh.itok(b)[0].pow(2).sum().backward()   # (the item tokens alone: not the player token's multi-hot)
+    dh = [float(sh.item_emb.weight.grad[i].abs().sum()) for i in held_ids]
+    check('(b) held path: the item tokens give gradient on the held ids',
           all(v > 0 for v in dh), ', '.join(f'{i}: {v:.2e}' for i, v in zip(held_ids, dh)))
     with torch.no_grad():   # (the item tokens alone: their table is item_emb)
         tok, present = sh.itok(b)
@@ -167,7 +163,7 @@ def main():
     others = [k for k in sd if k not in ('itok.coll.weight', TP.ITEM_SHARED_KEY)]
     kept = all(torch.equal(got[k], sd[k]) for k in others)
     w_new, w_old = got[TP.ITEM_SHARED_KEY], sd[TP.ITEM_SHARED_KEY]
-    check('(c) every other tensor kept (gates, slot / kind, mlp rest, item_emb, ...)', kept and len(others) == len(got) - 1,
+    check('(c) every other tensor kept (slot / kind, mlp rest, item_emb, ...)', kept and len(others) == len(got) - 1,
           f'{len(others)} tensors')
     check('(c) first Linear: 44 other columns kept, 16 collectible columns = the fresh model\'s',
           w_new.shape == (w_old.shape[0], w_old.shape[1] - 16) and torch.equal(w_new[:, 16:], w_old[:, 32:]) and
@@ -178,12 +174,11 @@ def main():
     new2 = TP.TokPolicy(**BASE, memory=D, item_tokens=True, global_token=True, item_shared=True)
     changed = TP.load_compatible(new2, sd)
     check('(c) load_compatible: converted, nothing else changed', len(changed) == 1 and 'shared' in changed[0] and
-          torch.equal(new2.state_dict()['itok.gate'], sd['itok.gate']), str(changed)[:120])
+          torch.equal(new2.state_dict()['itok.slot.weight'], sd['itok.slot.weight']), str(changed)[:120])
     # the optimiser: Adam over the B21 model's main parameters, one step, remapped with the converted Linear dropped
     opt_old = torch.optim.Adam(b21.main_parameters(), lr=1e-3)
     nb = TP.to_batch(M.synth_rows(rng, 6), M.synth_pending(rng, 6, b21.heads), dev)
-    G.open_gates(b21)
-    b21(nb, need_vg=True)[-1].sum().backward()
+    b21(nb, need_vg=True, mem=torch.zeros(6, D))[-1].sum().backward()
     opt_old.step()
     osd = opt_old.state_dict()
     old_names = TP.main_parameter_names(list(sd))

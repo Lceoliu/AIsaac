@@ -1,6 +1,7 @@
 #!/bin/bash
-# C99 "the new architecture from scratch" (user 10-15/16): the C96 architecture (spatial transformer + GRU + B31 temporal
-# attention 256x4 / W 256 / rooms 128, fused item tokens, global token, shared table) trained from zero in run mode on
+# C99 "the new architecture from scratch" (user 10-15/16): the B33 default model (spatial transformer + B31 temporal
+# attention 256x4 / W 256 / rooms 128, item tokens (8 slots), global token, shared table; no GRU, no gates: the temporal
+# side is part of the network from the first step) trained from zero in run mode on
 # HPC160 (sandbox ws9, 64 workers, B29 actor flags), with the environment design of the items line (pedestal start
 # builds, forced pickup 1 -> 0 over the run, heal / resource rewards). No --resume / --init: random weights.
 # Purpose: does the architecture itself learn faster than the inherited lineage (C77 / C87 curves at equal game hours),
@@ -9,9 +10,9 @@ source /101063/AIsaac/ws9/hpc_env.sh
 R=$ABP_HOME/runs
 COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --epochs 3 --teacher --teacher-queue 12 --archive-size 12 \
   --lr 1e-4 --lr-final 1e-4 --episodes-per-state 8 --teacher-death-depths 2,4,8,16,32 --teacher-thread 1 --teacher-fork 1 \
-  --teacher-share 0.1 --teacher-slots 6 --poll-wait 0.003 --memory gru --memory-dim 128 --memory-bptt 32 \
+  --teacher-share 0.1 --teacher-slots 6 --poll-wait 0.003 \
   --item-tokens 1 --global-token 1 --item-shared 1 --start-build-prob 0.5 --start-build-max 3 --start-build-mode pedestal \
-  --pickup-force 1:0 --reward heal=0.5,resource=0.25 --item-tokens-fused 1 --item-slots 8 \
+  --pickup-force 1:0 --reward heal=0.5,resource=0.25 --item-slots 8 \
   --temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256"
 FAST="--actor-compile default --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
 if [ "$1" = smoke ]; then

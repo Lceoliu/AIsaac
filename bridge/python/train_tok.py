@@ -105,21 +105,21 @@ Memory (2026-10-11, --memory gru --memory-dim D --memory-bptt T; off by default,
   at the fork, sent by the worker; tok_teacher2.LanePolicy.begin) and its imitation records carry their input states.
   Approximate: the old teacher's records, the choice correction's records and branch episodes (tok_branch) use a zero
   state. --resume of a memory-free checkpoint starts a fresh GRU (its output projection zero: the same outputs).
+  Not given: a resumed checkpoint's, else off (the default model has no GRU).
   B32 (2026-10-15): --resume of a memory checkpoint with an explicit --memory off drops the GRU (tok_policy.drop_memory:
   mem_gru, mem_out, gtok.mem_in and their Adam state; every other tensor exact; the outputs lose mem_out(h)); without
   --memory the checkpoint's memory is kept as before. A temporal model needs no GRU: its learner chunks are then the
   temporal chunks alone (--temporal-bptt, no nested GRU chunks).
 Item tokens / global token (2026-10-12, B21 --item-tokens 1 (needs --items), B22 --global-token 1; off by default, then
-  nothing changes; TokPolicy item_tokens / global_token, the module docstring of tok_policy has the mechanism): 20 item
-  tokens (held collectibles, active, trinkets, pocket) and / or one learned global token per record, reaching the old
-  tokens through per-layer gates that start at 0 (the same outputs as without them at the start, also when resumed
-  from a checkpoint without them: their modules fresh, Adam's state remapped by parameter name, a line is printed; a
-  checkpoint with them keeps them). B22's second value head value_global (on the global token) is trained on
+  nothing changes; TokPolicy item_tokens / global_token, the module docstring of tok_policy has the mechanism): up to
+  20 item tokens (held collectibles, active, trinkets, pocket) and / or one learned global token per record, ordinary
+  tokens of each block's one attention (B24; B33: no gates). --resume of a checkpoint without them: their modules
+  fresh (the outputs change), Adam's state remapped by parameter name, a line is printed; a checkpoint with them keeps
+  them. B22's second value head value_global (on the global token) is trained on
   lambda-returns with --gamma-global (0.999; GAE's lambda, bootstrapped from value_global itself, which is computed for
   every stored decision at the update's start, in the --recompute-values pass when there is one, else a pass of its
   own) as an auxiliary loss --vf-global-coef x 0.5 x mean((value_global - return)^2); PPO's advantages keep using the
-  value head. progress.csv: v_global_loss, v_global_ev (explained variance of the update-start value_global), item_gate /
-  global_gate (mean |gate| over the layers).
+  value head. progress.csv: v_global_loss, v_global_ev (explained variance of the update-start value_global).
 Pedestal builds / forced pickups / shared item table (2026-10-13, B23; isaac_bridge/tok_pickup.py has the mechanism;
   all off by default, then nothing changes): --start-build-mode pedestal spawns a start build's collectibles as
   pedestals in the floor's starting room instead of adding them to the inventory (episodes.jsonl build_pedestals);
@@ -134,13 +134,10 @@ Pedestal builds / forced pickups / shared item table (2026-10-13, B23; isaac_bri
   tokens): the item tokens' collectible table is the policy's item_emb (tok_policy share_item_table: --resume of a B21
   checkpoint drops its own 32-column table, re-initialises the 16 collectible columns of the item tokens' first
   Linear, keeps everything else; Adam's state of that Linear starts fresh). Evaluation (eval_tok.py) never forces.
-Fused extra tokens / item slots / stored value_global (2026-10-14, B24; tok_policy TokPolicy item_tokens_fused /
-  item_slots): --item-tokens-fused 1 (needs --item-tokens 1 or --global-token 1) makes the item tokens and the global
-  token ordinary tokens of each block's one attention (one softmax over the old and the extra tokens; the gates multiply
-  the extra tokens' value vectors); the learner's packed layouts plan the real item tokens on the host (item_count) like
-  the entities, with no padded copies. --resume of a B21 / B22 / B23 checkpoint with --item-tokens-fused 1 loads every
-  tensor as saved (the same names and shapes, Adam's state as it is; approximate: the outputs change, the gates keep
-  their values; tests/test_fused_tokens_smoke.py measures by how much). --item-slots N: held-collectible token slots
+Item slots / stored value_global (2026-10-14, B24; tok_policy TokPolicy item_slots): the learner's packed layouts plan
+  the real item tokens on the host (item_count) like the entities. B33 (2026-10-16): --item-tokens-fused and the
+  separate gated layout are gone (checkpoints with gates: sandboxes at commit b0a89b9). --item-slots N: held-collectible
+  token slots
   (newest first, default 16 = INV_CAP; + active, two trinkets, pocket). With --global-token the actor's CUDA graphs
   also output value_global, the rollout stores it (Rollout.value_g) and its returns bootstrap from the stored values
   (from the recomputed ones with --recompute-values on): no pass of its own at the update's start.
@@ -1086,7 +1083,7 @@ def main():
                    help='gru: a GRU state per worker between the token encoder and the heads, carried through the '
                         'episode (reset only at a new episode) and trained with truncated BPTT; a resumed memory '
                         'checkpoint keeps its memory unless --memory off is given (B32: then its GRU is dropped, '
-                        'tok_policy.drop_memory). Not given (default): the resumed checkpoint\'s, else off (as before)')
+                        'tok_policy.drop_memory). Not given (default): the resumed checkpoint\'s, else off')
     p.add_argument('--memory-dim', type=int, default=128, help="the GRU state's size (a resumed checkpoint's wins)")
     p.add_argument('--memory-bptt', type=int, default=32,
                    help="decisions per BPTT chunk (a worker's sequence cut into chunks of this many; a minibatch is "
@@ -1097,12 +1094,11 @@ def main():
     # 2026-10-12 (B21 / B22; see the module docstring)
     p.add_argument('--item-tokens', type=int, default=0,
                    help='1: one Transformer token per held collectible, the active item, each trinket and the pocket '
-                        '(needs --items; gated, the same outputs at the start; a resumed checkpoint with them keeps '
-                        'them). 0 (default): as before')
+                        '(needs --items; a resumed checkpoint with them keeps them). 0 (default): none')
     p.add_argument('--global-token', type=int, default=0,
-                   help='1: a learned global token (gated, the same outputs at the start) and a second value head '
-                        'value_global on it, trained with --gamma-global as an auxiliary loss (a resumed checkpoint '
-                        'with it keeps it). 0 (default): as before')
+                   help='1: a learned global token and a second value head value_global on it, trained with '
+                        '--gamma-global as an auxiliary loss (a resumed checkpoint with it keeps it). '
+                        '0 (default): none')
     p.add_argument('--gamma-global', type=float, default=0.999, help="value_global's discount (B22)")
     p.add_argument('--item-shared', type=int, default=0,
                    help='1 (B23, needs --item-tokens 1): the item tokens\' collectible table is the policy\'s item_emb '
@@ -1110,20 +1106,14 @@ def main():
                         'tok_policy.share_item_table). 0 (default): their own table, as before')
     p.add_argument('--vf-global-coef', type=float, default=0.5, help="weight of value_global's loss (B22)")
     # 2026-10-14 (B24; see the module docstring)
-    p.add_argument('--item-tokens-fused', type=int, default=0,
-                   help='1 (B24, needs --item-tokens 1 or --global-token 1): the item tokens and the global token are '
-                        "ordinary tokens of each block's one attention (one softmax; the gates multiply their value "
-                        'vectors); a B21 / B22 / B23 checkpoint resumes with every tensor as saved (approximate: the '
-                        'outputs change). A resumed fused checkpoint keeps it. 0 (default): the separate gated terms')
     p.add_argument('--item-slots', type=int, default=None,
                    help='B24: held-collectible token slots (newest first; + active, two trinkets, pocket). Default: '
                         'a resumed checkpoint\'s, else 16 (INV_CAP, as before)')
     # 2026-10-14 (B30; see the module docstring and rl/docs/TEMPORAL_ATTENTION.md)
     p.add_argument('--temporal', type=int, default=0,
-                   help='1 (B30; with item / global tokens --item-tokens-fused 1; B32: with or without --memory '
-                        'gru): the temporal transformer over the last --temporal-window decisions and the episode\'s room tokens; gates '
-                        'zero at the start (the same outputs as without it; a resumed checkpoint without it gets it '
-                        'fresh, Adam remapped; one with it keeps it). 0 (default): as before')
+                   help='1 (B30; B32: with or without --memory gru): the temporal transformer over the last '
+                        '--temporal-window decisions and the episode\'s room tokens (a resumed checkpoint without it '
+                        'gets it fresh, Adam remapped; one with it keeps it). 0 (default): none')
     p.add_argument('--temporal-width', type=int, default=256, help="(B30) the temporal transformer's width D")
     p.add_argument('--temporal-layers', type=int, default=4, help='(B30) its layers')
     p.add_argument('--temporal-heads', type=int, default=4, help='(B30) its heads')
@@ -1192,12 +1182,12 @@ def main():
     if mem_on and args.memory_dim <= 0:
         p.error('--memory gru needs --memory-dim > 0')
     # 2026-10-12 (B21 / B22): a resumed checkpoint with item tokens / a global token keeps them; one without them gets
-    # them fresh when asked (gates zero: its outputs at the start)
-    itok_fresh = gtok_fresh = share_convert = fuse_convert = tatt_fresh = False
+    # them fresh when asked
+    itok_fresh = gtok_fresh = share_convert = tatt_fresh = False
     if args.resume:
         ck_cfg = torch.load(args.resume, map_location='cpu').get('config', {})
         for key_, opt_ in (('item_tokens', 'item_tokens'), ('global_token', 'global_token'),
-                           ('item_shared', 'item_shared'), ('item_tokens_fused', 'item_tokens_fused')):
+                           ('item_shared', 'item_shared')):
             if ck_cfg.get(key_):
                 if not getattr(args, opt_):
                     print(f'{key_}: the resumed checkpoint has them: --{opt_.replace("_", "-")} 1', flush=True)
@@ -1206,9 +1196,6 @@ def main():
         gtok_fresh = bool(args.global_token) and not ck_cfg.get('global_token')
         # 2026-10-13 (B23): a B21 checkpoint's own item-token table converted into the shared one (share_item_table)
         share_convert = bool(args.item_shared) and bool(ck_cfg.get('item_tokens')) and not ck_cfg.get('item_shared')
-        # 2026-10-14 (B24): a separate-term checkpoint with item / global tokens into the fused layout (same tensors)
-        fuse_convert = bool(args.item_tokens_fused) and bool(ck_cfg.get('item_tokens') or ck_cfg.get('global_token')) \
-            and not ck_cfg.get('item_tokens_fused')
         if args.item_slots is None and ck_cfg.get('item_slots'):
             args.item_slots = int(ck_cfg['item_slots'])
         if ck_cfg.get('temporal'):   # 2026-10-14 (B30): a temporal checkpoint keeps it, with its sizes
@@ -1227,11 +1214,6 @@ def main():
     tok_kw = dict(item_tokens=itok_on, global_token=gtok_on)   # (TokPolicy's B21 / B22 options; False: as before)
     if args.item_shared:   # (B23; the key only when set: TokPolicy's signature as before otherwise)
         tok_kw['item_shared'] = True
-    fused_on = bool(args.item_tokens_fused)   # 2026-10-14 (B24)
-    if fused_on and not (itok_on or gtok_on):
-        p.error('--item-tokens-fused 1 needs --item-tokens 1 or --global-token 1')
-    if fused_on:
-        tok_kw['item_tokens_fused'] = True
     item_slots = INV_CAP if args.item_slots is None else int(args.item_slots)
     if item_slots != INV_CAP:
         if not itok_on:
@@ -1245,8 +1227,6 @@ def main():
     # chunks nest inside), or none)
     chunked = mem_on or t_on
     if t_on:
-        if (itok_on or gtok_on) and not fused_on:
-            p.error('--temporal 1 needs --item-tokens-fused 1 with item / global tokens')
         if T_t < 1:
             p.error('--temporal-bptt must be >= 1')
         if mem_on and (T_t < T_mem or T_t % T_mem):
@@ -1379,15 +1359,10 @@ def main():
             (('gtok.',) if gtok_fresh else ()) + (('tatt.',) if tatt_fresh else ())   # (B21 / B22 / B30: fresh keys)
         if unexpected or any(not k.startswith('choice.') and not (new_ok and k.startswith(new_ok)) for k in missing):
             raise SystemExit(f'--resume: weights do not match ({missing[:4]} {unexpected[:4]})')
-        if fuse_convert:   # 2026-10-14 (B24)
-            print('item_tokens_fused (B24): a separate-term checkpoint loaded into the fused layout: every tensor as '
-                  'saved (gates kept, now multipliers of the extra tokens\' value vectors; '
-                  f'{item_slots} held-item slots); approximate: the outputs change at the start (one softmax over the old '
-                  'and the extra tokens instead of the gated terms)', flush=True)
         if copt is not None and ck.get('choice_optimizer'):
             copt.load_state_dict(ck['choice_optimizer'])
         osd = ck['optimizer']
-        ck_ext = any(k.startswith(('itok.', 'gtok.')) for k in ck['model'])
+        ck_ext = any(k.startswith(('itok.', 'gtok.', 'tatt.')) for k in ck['model'])   # (registered after the GRU)
         if itok_fresh or gtok_fresh or (mem_fresh and ck_ext) or share_convert or tatt_fresh or mem_drop:
             # 2026-10-12 (B21 / B22): new parameters (not necessarily the last ones): Adam's state remapped by name
             # (B23 share_convert: itok.coll's state gone with it, the converted Linear's state starts fresh)
@@ -1395,20 +1370,19 @@ def main():
                                           main_parameter_names([k for k, _ in learner_model.named_parameters()]),
                                           drop=(ITEM_SHARED_KEY,) if share_convert else ())
             for flag_, name_, what_ in ((itok_fresh, 'item tokens', f'{item_slots + 4} item tokens per record'),
-                                        (gtok_fresh, 'global token', 'the global token and value_global'),
-                                        (mem_fresh, 'memory', f'GRU (size {mem_dim})')):
-                if flag_ and fused_on and name_ != 'memory':   # (B24: fused gates start at 1, ordinary tokens)
-                    print(f'{name_}: --resume of a checkpoint without them: {what_} initialised fresh, fused (B24: '
-                          'gates 1, the outputs change at the start)', flush=True)
-                elif flag_:
-                    print(f'{name_}: --resume of a checkpoint without them: {what_} initialised fresh, gates / output '
-                          'projections zero (the same outputs as the checkpoint at the start)', flush=True)
+                                        (gtok_fresh, 'global token', 'the global token and value_global')):
+                if flag_:
+                    print(f'{name_}: --resume of a checkpoint without them: {what_} initialised fresh (the outputs '
+                          'change at the start)', flush=True)
+            if mem_fresh:
+                print(f'memory: --resume of a checkpoint without it: GRU (size {mem_dim}) initialised fresh, its '
+                      'output projection zero (the same outputs as the checkpoint at the start)', flush=True)
             if tatt_fresh:   # 2026-10-14 (B30)
                 n_t = sum(q.numel() for q in learner_model.tatt.parameters())
                 print(f'temporal (B30): --resume of a checkpoint without it: the temporal transformer ({n_t / 1e6:.2f}M '
                       f'parameters, width {args.temporal_width} x {args.temporal_layers} layers, window '
-                      f'{args.temporal_window}, rooms {args.temporal_rooms}) appended fresh, gates g1 / g2 / g3 zero '
-                      '(the same outputs as the checkpoint at the start)', flush=True)
+                      f'{args.temporal_window}, rooms {args.temporal_rooms}) appended fresh (the outputs change at '
+                      'the start)', flush=True)
             print(f'--resume: Adam state remapped by parameter name, {added} new tensors without state'
                   + (f', {len(mem_names)} dropped (the GRU\'s)' if mem_drop else ''), flush=True)
         elif mem_fresh:   # 2026-10-11 (memory): the GRU's parameters are the optimiser's last ones, with no state yet
@@ -1586,8 +1560,7 @@ def main():
               f'heads, window {args.temporal_window}, rooms {args.temporal_rooms}, learner chunks of {T_t} decisions '
               + (f'(GRU chunks of {T_mem} inside)' if mem_on else '(no GRU: no nested chunks)')
               + f', K / V {args.temporal_kv}; actor cache '
-              f'{t_state.kv.numel() * t_state.kv.element_size() / 2 ** 20:.0f} MiB; gates {learner_model.tatt.gates()}',
-              flush=True)
+              f'{t_state.kv.numel() * t_state.kv.element_size() / 2 ** 20:.0f} MiB', flush=True)
     use_graphs = args.graph_entities > 0 and (bool(args.memory_graph) or not mem_on)
     if mem_on:
         print(f'memory: GRU size {mem_dim}, BPTT chunks of {T_mem} decisions (minibatch = {max(1, args.minibatch // T_mem)}'
@@ -1595,11 +1568,10 @@ def main():
               + ('through CUDA graphs with the state table (GraphActor memory)' if use_graphs else
                  'eager (--memory-graph 0 or --graph-entities 0)'), flush=True)
     if itok_on or gtok_on:   # 2026-10-12 (B21 / B22)
-        print('extra tokens: ' + ('fused into the one attention (B24), ' if fused_on else 'separate gated terms, ') +
-            ', '.join(
+        print('extra tokens: ' + ', '.join(
             ([f'item tokens ({item_slots + 4} per record, {item_slots} held slots)'] if itok_on else []) +
-            ([f'global token + value_global (gamma {args.gamma_global}, coef {args.vf_global_coef})'] if gtok_on else []))
-            + f'; gates now {learner_model.gate_values()}', flush=True)
+            ([f'global token + value_global (gamma {args.gamma_global}, coef {args.vf_global_coef})']
+             if gtok_on else [])), flush=True)
     # streams: the actor's calls go first on the GPU, the learner's kernels fill the rest. --actor-slots calls may be
     # in flight at once, each on its own stream (one GraphActor each)
     gkw = dict(bf16=bool(args.actor_bf16), compile_mode=args.actor_compile or None, fold=bool(args.actor_fold),
@@ -1636,7 +1608,7 @@ def main():
     # 2026-10-06 (host memory): with --teach-gpu 1 the teacher's records are read from their bytes on the GPU, and the
     # host keeps only their entity and door counts (the minibatch planning reads them); the full host copy (--teach-
     # buffer x ROW, about 0.85 GB at 60,000) filled up over the first ~1,000 game hours. --teach-gpu 0: as before.
-    # 2026-10-14 (B24 fused): the packed layouts plan the real item tokens on the host from their count (item_count)
+    # 2026-10-14 (B24): the packed layouts plan the real item tokens on the host from their count (item_count)
     NI_f, G_f = learner_model.extra_tokens()
     host_teach = ROW if not teach_gpu else np.dtype([('n_ent', ROW.fields['n_ent'][0]),
                                                      ('n_doors', ROW.fields['n_doors'][0])] +
@@ -2155,7 +2127,7 @@ def main():
         # packed token positions) and the learner thread never waits for the GPU inside an epoch
         ne_h = rl.rows['n_ent'].reshape(-1)[flat].astype(np.int64)
         nd_h = rl.rows['n_doors'].reshape(-1)[flat].astype(np.int64)
-        # (B24 fused) the records' real item tokens; the plans' extra arguments (none without fused tokens)
+        # (B24) the records' real item tokens; the plans' extra arguments (none without item / global / history tokens)
         ni_h = item_count(rl.rows.reshape(-1)[flat], item_slots) if NI_f else None
         xplan = dict(item_tok=NI_f, glob=G_f) if (NI_f or G_f or t_on) else {}
 
@@ -2327,7 +2299,7 @@ def main():
                         nd_p = np.concatenate([nd_p, L['v2_cnt']['n_doors'][vpick]])
                         if NI_f:
                             ni_p = np.concatenate([ni_p, L['v2_cnt']['n_item'][vpick]])
-                    if xplan:   # (B24 fused: the real item tokens and the global token in the plans)
+                    if xplan:   # (B24: the real item tokens and the global token in the plans)
                         xplan['n_item'] = ni_p
                     if t_on:   # (B31: the history token where a previous step exists; none for the teachers' records)
                         xplan['hist'] = np.concatenate([has_h[part_h], np.zeros(len(ne_p) - len(part_h), bool)])
@@ -2353,7 +2325,7 @@ def main():
                         if 'buckets' in fparts:
                             pnames.append('gpos')
                             if 'ekeep' in fparts:   # the packed tokens built from the real ones (forward's xperm)
-                                pnames += ['dkeep', 'xperm'] + (['ikeep', 'tgroup', 'glast'] if xplan else [])
+                                pnames += ['dkeep', 'xperm'] + (['ikeep', 'glast'] if xplan else [])
                         mb.update((k_, tok[k_]) for k_ in pnames)
                         if bk_:
                             mb['buckets'] = [(c_, w_) for c_, (_, w_) in zip(got[len(hn):], bk_)]
@@ -2554,10 +2526,7 @@ def main():
         }
         if mem_on:   # 2026-10-11 (memory): BPTT chunks and rows of the update (trained decisions: count)
             row['mem_chunks'], row['mem_rows'] = mplan['chunks'], len(flat)
-        if itok_on or gtok_on:   # 2026-10-12 (B21 / B22): the gates (mean |gate| over the layers)
-            row.update(learner_model.gate_values())
-        if t_on:   # 2026-10-14 (B30): g1 / g2 / g3, the update's chunks and the room tokens made in the rollout
-            row.update(learner_model.tatt.gates())
+        if t_on:   # 2026-10-14 (B30): the update's chunks and the room tokens made in the rollout
             row['t_chunks'] = len(tch)
             row['t_rooms_new'] = int(sum(rl.t_rc[w_, rl.tP:rl.tP + rl.length[w_]].sum() for w_ in range(rl.n)))
         if gtok_on:   # (B22) value_global's loss and the explained variance of its update-start values

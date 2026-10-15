@@ -1,5 +1,6 @@
 """CPU smoke test of the token policy's item tokens (B21, TokPolicy(item_tokens=True), train_tok --item-tokens 1) and
-global token + value_global head (B22, TokPolicy(global_token=True), train_tok --global-token 1); 2026-10-12.
+global token + value_global head (B22, TokPolicy(global_token=True), train_tok --global-token 1); 2026-10-12. B33
+(2026-10-16): ordinary tokens of the one attention, no gates.
 
 No game, no GPU needed (the GraphActor part runs only where CUDA is available). Plain script:
   cd rl/bridge/python && python tests/test_item_global_smoke.py
@@ -7,16 +8,15 @@ Checks:
   (a) options off: the outputs (forward padded / packed / the learner's fast path with buckets, math attention on and
       off; act with uniforms; evaluate; with memory also the chunked BPTT forward) are bit-identical to the policy
       module of git HEAD (skipped if git or HEAD's file is not available);
-  (b) options on with fresh new modules (gates 0, mem_in 0) loaded from an options-off state: the same outputs as the
-      options-off model on every path (bit-identical, else the max abs difference is reported and the check fails);
-  (c) gradients: at the start they reach both gates and mem_in, and the item embeddings through value_global's loss
-      (the global token attends to the item tokens); the policy loss alone gives the item embeddings zero gradient at
-      gate 0 (by construction) and a non-zero one once the gates are open; the opened tokens change the outputs;
+  (b) options on, loaded from an options-off state (only itok.* / gtok.* missing): value_global appended last, finite,
+      the same on the padded and the fast path; config keys;
+  (c) gradients from the first step: the policy loss alone reaches every item / global token parameter (value head
+      aside) and, with memory, mem_in; value_global's loss reaches the item tokens through the global token;
   (d) checkpoint round trip (config keys, weights, outputs); resume of a C90-like checkpoint (items + memory, no
       B21 / B22): missing keys = itok.* / gtok.* only, Adam state remapped by name (old states kept, new parameters
       fresh, steps on); resume of a B21 checkpoint without memory into memory + B21 (new parameters in the middle);
-  (e) chunked BPTT with the options on (gates open): the chunked forward (padded, packed, fast path) reproduces the
-      actor's per-step logits, states and value_global;
+  (e) chunked BPTT with the options on: the chunked forward (padded, packed, fast path) reproduces the actor's
+      per-step logits, states and value_global;
   (f) CUDA only: GraphActor with the options on = the eager act.
 """
 import io
@@ -55,13 +55,20 @@ def rows_with_empty(rng, n):
     return r
 
 
-def fast_batch(b):
+def fast_batch(b, model=None):
     """The learner's fast path batch (train_tok --learner-fast 1 with --packed 1): learner_plan / plan_tokens'
-    positions, the buckets, the packed tokens built from the real ones (xperm)."""
-    plan = TP.learner_plan(b['n_ent'].numpy(), b['n_doors'].numpy(), b['ent'].shape[1], 3)
+    positions, the buckets, the packed tokens built from the real ones (xperm); model: its item / global tokens in the
+    plans (B24)."""
+    NI, Gn = model.extra_tokens() if model is not None else (0, 0)
+    kw = {}
+    if NI or Gn:
+        kw = dict(item_tok=NI, glob=Gn, n_item=TP.item_count(dict(inv=b['inv'].numpy(), pitem=b['pitem'].numpy()),
+                                                              model.itok.slots) if NI else None)
+    plan = TP.learner_plan(b['n_ent'].numpy(), b['n_doors'].numpy(), b['ent'].shape[1], 3, **kw)
     tok = TP.plan_tokens(plan, torch.from_numpy(plan['rec']), torch.from_numpy(plan['base']))
     mb = dict(b)
-    mb.update((k, tok[k]) for k in ('keep', 'starts', 'ekeep', 'gpos', 'dkeep', 'xperm'))
+    mb.update((k, tok[k]) for k in ('keep', 'starts', 'ekeep', 'gpos', 'dkeep', 'xperm') + (('ikeep', 'glast')
+                                                                                         if kw else ()))
     mb['buckets'] = [(torch.from_numpy(c_), w_) for c_, w_ in plan['buckets']]
     return mb
 
@@ -94,14 +101,11 @@ def chunk_dict(n):
     return dict(h0=torch.randn(c, D), T=T, reset=reset, tail=torch.randn(n - c * T, D) if n > c * T else None)
 
 
-def open_gates(m, scale=0.3):
+def trained_memory(m):
+    """Trained-looking memory projections (mem_in, mem_out: zero at a fresh start)."""
     with torch.no_grad():
-        if m.itok is not None:
-            m.itok.gate.normal_(0, scale)
-        if m.gtok is not None:
-            m.gtok.gate.normal_(0, scale)
-            if m.gtok.mem_in is not None:
-                m.gtok.mem_in.weight.normal_(0, 0.05)
+        if m.gtok is not None and m.gtok.mem_in is not None:
+            m.gtok.mem_in.weight.normal_(0, 0.05)
         if m.memory:
             m.mem_out.weight.normal_(0, 0.1)
 
@@ -133,29 +137,24 @@ def main():
         check(f'(a) options off == HEAD, all paths [{tag}]', M.same(o_new, o_ref) and len(o_new) == len(o_ref),
               f'{len(o_new)} tensors, max diff {M.maxdiff(o_new, o_ref):.1e}')
 
-    # ------------------------------------------------------------ (b) options on, fresh gates = options off
+    # ------------------------------------------------------------ (b) options on, loaded from an options-off state
     for mtag, mcfg in (('no memory', {}), ('memory', dict(memory=D))):
         torch.manual_seed(2)
         off = TP.TokPolicy(**BASE, **mcfg).eval()
         heads = off.heads
         n = 13
         b = TP.to_batch(rows_with_empty(rng, n), M.synth_pending(rng, n, heads), dev)
-        acts = torch.from_numpy(M.synth_pending(rng, n, heads))
-        u = torch.rand((n, sum(heads)))
         mem = torch.randn(n, D) if mcfg else None
-        memd = chunk_dict(n) if mcfg else None
-        o_off = outputs(off, b, acts, u, mem, memd)
         for otag, ocfg in OPTS:
             on = TP.TokPolicy(**BASE, **mcfg, **ocfg).eval()
             missing, unexpected = on.load_state_dict(off.state_dict(), strict=False)
             ok_keys = not unexpected and missing and all(k.startswith(('itok.', 'gtok.')) for k in missing)
-            o_on = outputs(on, b, acts, u, mem, memd)
-            check(f'(b) fresh {otag} == off, all paths [{mtag}]', ok_keys and M.same(o_on, o_off),
-                  f'{len(o_on)} tensors, max diff {M.maxdiff(o_on, o_off):.1e}, {len(missing)} new tensors')
+            check(f'(b) {otag} loaded from an options-off state: only itok.* / gtok.* missing [{mtag}]', ok_keys,
+                  f'{len(missing)} new tensors')
             if on.gtok is not None:
                 with torch.no_grad():
                     vg = on(b, need_vg=True, **({} if mem is None else dict(mem=mem)))[-1]
-                    vg_f = on(fast_batch(b), packed=True, need_vg=True,
+                    vg_f = on(fast_batch(b, on), packed=True, need_vg=True,
                               **({} if mem is None else dict(mem=mem)))[-1]
                 check(f'(b) value_global appended last, finite, paths agree [{otag}, {mtag}]',
                       vg.shape == (n,) and bool(torch.isfinite(vg).all()) and float((vg - vg_f).abs().max()) < 1e-4,
@@ -177,7 +176,7 @@ def main():
         learner.mem_out.weight.normal_(0, 0.1)
 
     def losses(m):
-        logits, value, _, _, vg = m(fast_batch(b), packed=True, mem=memd, need_vg=True)
+        logits, value, _, _, vg = m(fast_batch(b, m), packed=True, mem=memd, need_vg=True)
         logp, ent = m.log_prob(logits, m.gate(b), acts)
         ppo = -(logp * adv).mean() + 0.5 * ((value - ret) ** 2).mean() - 0.01 * ent.sum(-1).mean()
         return ppo, 0.5 * 0.5 * ((vg - ret_g) ** 2).mean()
@@ -186,39 +185,25 @@ def main():
         learner.zero_grad()
         loss.backward()
         return {k: (0.0 if p.grad is None else float(p.grad.abs().sum())) for k, p in learner.named_parameters()}
-    ppo, vgl = losses(learner)
-    g_all = grads(ppo + vgl)
-    check('(c) at the start: gradient reaches both gates and mem_in',
-          g_all['itok.gate'] > 0 and g_all['gtok.gate'] > 0 and g_all['gtok.mem_in.weight'] > 0,
-          f"item gate {g_all['itok.gate']:.2e}, global gate {g_all['gtok.gate']:.2e}, "
-          f"mem_in {g_all['gtok.mem_in.weight']:.2e}")
-    check('(c) at the start: value_global loss reaches the item tokens (through the global token)',
-          g_all['itok.coll.weight'] > 0 and g_all['itok.mlp.0.weight'] > 0 and g_all['gtok.tok'] > 0,
-          f"coll {g_all['itok.coll.weight']:.2e}, mlp {g_all['itok.mlp.0.weight']:.2e}, tok {g_all['gtok.tok']:.2e}")
+    _, vgl = losses(learner)
+    g_vg = grads(vgl)
+    check('(c) value_global loss reaches the item tokens (through the global token)',
+          g_vg['itok.coll.weight'] > 0 and g_vg['itok.mlp.0.weight'] > 0 and g_vg['gtok.tok'] > 0,
+          f"coll {g_vg['itok.coll.weight']:.2e}, mlp {g_vg['itok.mlp.0.weight']:.2e}, tok {g_vg['gtok.tok']:.2e}")
     ppo, _ = losses(learner)
     g_pi = grads(ppo)
-    check('(c) at the start: the policy loss alone gives the item embeddings zero gradient (gate 0)',
-          g_pi['itok.coll.weight'] == 0.0 and g_pi['itok.gate'] > 0, f"coll {g_pi['itok.coll.weight']:.1e}")
-    with torch.no_grad():
-        before = learner(b, mem=memd)[0].clone()
-    open_gates(learner)
-    with torch.no_grad():
-        after = learner(b, mem=memd)[0]
-    check('(c) opened gates change the outputs', float((after - before).abs().max()) > 1e-5,
-          f'max logit change {float((after - before).abs().max()):.2e}')
-    ppo, _ = losses(learner)
-    g_open = grads(ppo)
-    new_names = [k for k in g_open if k.startswith(('itok.', 'gtok.')) and not k.startswith('gtok.value')
+    new_names = [k for k in g_pi if k.startswith(('itok.', 'gtok.')) and not k.startswith('gtok.value')
                  and not k.startswith('gtok.norm')]
-    zero = [k for k in new_names if g_open[k] == 0.0]
-    check('(c) gates open: the policy loss reaches every item / global token parameter (value head aside)', not zero,
+    zero = [k for k in new_names if g_pi[k] == 0.0]
+    check('(c) from the first step: the policy loss alone reaches every item / global token parameter (value head '
+          'aside) incl. mem_in', not zero and g_pi['gtok.mem_in.weight'] > 0,
           f'zero: {zero}' if zero else f'{len(new_names)} tensors')
     # (padding_idx 0 rows of the tables stay at zero gradient: absent items)
 
     # ------------------------------------------------------------ (d) checkpoints
     torch.manual_seed(4)
     model = TP.TokPolicy(**BASE, memory=D, item_tokens=True, global_token=True).eval()
-    open_gates(model)
+    trained_memory(model)
     buf = io.BytesIO()
     torch.save(dict(model=model.state_dict(), config=model.config), buf)
     buf.seek(0)
@@ -266,13 +251,6 @@ def main():
           not unexpected and missing and all(k.startswith(('itok.', 'gtok.')) for k in missing) and kept and
           fresh_none and added == len(missing) and int(opt_run.state[p0]['step']) == 2,
           f'{len(missing)} new tensors, added {added}, step {int(opt_run.state[p0]["step"])}')
-    with torch.no_grad():   # and it starts with the checkpoint's outputs
-        c90.eval()
-        run2 = TP.TokPolicy(**ck90['config'], item_tokens=True, global_token=True).eval()
-        run2.load_state_dict(ck90['model'], strict=False)
-        hh = torch.randn(n, D)
-        same90 = M.same(c90(b, mem=hh), run2(b, mem=hh)[:4])
-    check('(d) resumed C90-like model starts with the checkpoint\'s outputs (logits, value, danger, h_new)', same90)
     # memory added to a B21 checkpoint: the memory modules sit before itok.* (remap by name, not padding)
     torch.manual_seed(6)
     b21 = TP.TokPolicy(**BASE, item_tokens=True)
@@ -290,10 +268,10 @@ def main():
           all(k.startswith('mem_') for k in missing3) and torch.equal(
               st_coll['exp_avg'], opt21.state[dict(b21.named_parameters())['itok.coll.weight']]['exp_avg']))
 
-    # ------------------------------------------------------------ (e) chunked BPTT with the options on (gates open)
+    # ------------------------------------------------------------ (e) chunked BPTT with the options on
     torch.manual_seed(7)
     model = TP.TokPolicy(**BASE, memory=D, item_tokens=True, global_token=True).eval()
-    open_gates(model)
+    trained_memory(model)
     heads = model.heads
     steps = 9
     seq_rows = [rows_with_empty(rng, W) for _ in range(steps)]
@@ -336,7 +314,7 @@ def main():
     ref_v = torch.stack(vg_log, 1).reshape(W * steps)[wsel]
     for ptag, fn in (('padded', lambda: model(bc, mem=memd, need_vg=True)),
                      ('packed', lambda: model(bc, packed=True, mem=memd, need_vg=True)),
-                     ('fast path', lambda: model(fast_batch(bc), packed=True, mem=memd, need_vg=True))):
+                     ('fast path', lambda: model(fast_batch(bc, model), packed=True, mem=memd, need_vg=True))):
         with torch.no_grad():
             o = fn()
         el, eh, ev = (float((o[0] - ref_l).abs().max()), float((o[3] - ref_h).abs().max()),
@@ -348,7 +326,7 @@ def main():
     if torch.cuda.is_available():
         cuda = torch.device('cuda')
         gm = TP.TokPolicy(**BASE, memory=D, item_tokens=True, global_token=True).to(cuda).eval()
-        open_gates(gm)
+        trained_memory(gm)
         tab = torch.randn((W + 2, D), device=cuda)
         start = tab.clone()
         actor = TP.GraphActor(gm, W + 2, 32, stream=torch.cuda.Stream(), crn=False, memory=tab)

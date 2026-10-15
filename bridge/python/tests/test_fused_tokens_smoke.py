@@ -1,28 +1,23 @@
-"""CPU smoke test of B24 (2026-10-14): the fused item / global tokens (TokPolicy(item_tokens_fused=True), train_tok
---item-tokens-fused 1), the held-item slots (TokPolicy(item_slots=N), --item-slots N) and value_global stored by the
-actor (GraphActor / act(need_vg=True) -> Rollout.value_g -> the learner's global returns).
+"""CPU smoke test of B24 (2026-10-14): the item / global tokens as ordinary tokens of the one attention (B33: the only
+layout, no gates), the held-item slots (TokPolicy(item_slots=N), --item-slots N) and value_global stored by the actor
+(GraphActor / act(need_vg=True) -> Rollout.value_g -> the learner's global returns).
 
 No game, no GPU needed (the GraphActor part runs only where CUDA is available). Plain script:
   cd rl/bridge/python && python tests/test_fused_tokens_smoke.py
 Checks:
-  (a) off-mode (no item / global tokens; and the separate-term B21 / B22 / B23 model with open gates) == git HEAD's
-      policy module, bit for bit, on every path (forward padded / packed / fast path, act, evaluate, chunked BPTT);
-  (b) fused: every path (padded, packed with the device's or the host's positions, fast path with math attention off /
-      on, buckets without xperm) gives the same outputs; backward reaches the item tokens, the gates, the global token
-      and mem_in from the policy loss alone; the chunked BPTT forward reproduces the actor's per-step logits, states and
-      value_global; B23's shared table and forced-pickup masking (tok_pickup.ppo_part_terms) work on fused outputs;
-  (c) a synthetic B21 / B22 / B23 checkpoint (memory 128, item tokens, global token, shared table, gates the size C92
-      logged: mean |gate| 0.10 / 0.03) converted with convert_to_fused: strict load, Adam state loads and steps; the
-      output differences to the checkpoint's model are REPORTED (approximate, not exact) for the conversion (gates
-      kept) and for gates reset to 1, next to the checkpoint's own gates-closed difference as a scale;
+  (a) off-mode (no item / global tokens) == git HEAD's policy module, bit for bit, on every path (forward padded /
+      packed / fast path, act, evaluate, chunked BPTT);
+  (b) item / global tokens: every path (padded, packed with the device's or the host's positions, fast path with math
+      attention off / on, buckets without xperm) gives the same outputs; backward reaches the item tokens, the global
+      token and mem_in from the policy loss alone; the chunked BPTT forward reproduces the actor's per-step logits,
+      states and value_global; B23's shared table and forced-pickup masking (tok_pickup.ppo_part_terms) work;
   (d) item_slots 8: token / mask shapes, config key, sequence lengths of the padded and planned layouts, the older
       held items (slots 8 .. 15) do not change the outputs, item_count;
   (e) value_global stored by the actor (act(need_vg=True); GraphActor on CUDA) == the learner's forward on the same
       records; train_tok's Rollout / store / gae use the stored values.
-  info: CPU forward times of 256 records (the existing test's shapes): separate terms (HEAD) vs fused vs fused + 8 slots,
+  info: CPU forward times of 256 records (the existing test's shapes): off vs item / global tokens (16 and 8 slots),
       and the learner's fast path forward + backward. CPU ratios are indicative only (the H20 is what counts).
 """
-import io
 import sys
 import time
 from pathlib import Path
@@ -42,7 +37,7 @@ from isaac_bridge.tok_obs import INV_CAP, ROW   # noqa: E402
 FAIL = []
 D, W = 32, 4
 BASE = G.BASE
-FUSED = dict(item_tokens=True, global_token=True, item_tokens_fused=True)
+FUSED = dict(item_tokens=True, global_token=True)
 
 
 def check(name, ok, detail=''):
@@ -70,8 +65,8 @@ def realistic_rows(rng, n):
 
 
 def plan_kw(model, rows, hist=None):
-    """(B24) the host plans' extra arguments of a model for ROW records (none when not fused). hist (B31): the records'
-    history-token presence (a temporal model's forward with a temporal context)."""
+    """(B24) the host plans' extra arguments of a model for ROW records (none without item / global tokens). hist
+    (B31): the records' history-token presence (a temporal model's forward with a temporal context)."""
     NI, Gn = model.extra_tokens()
     if not (NI or Gn or hist is not None):
         return {}
@@ -82,21 +77,21 @@ def plan_kw(model, rows, hist=None):
 
 
 def fast_batch(model, b, rows, nb=3, xperm=True, hist=None):
-    """The learner's fast path batch (train_tok --learner-fast 1, --packed 1), fused-aware."""
+    """The learner's fast path batch (train_tok --learner-fast 1, --packed 1) with the model's extra tokens."""
     plan = TP.learner_plan(b['n_ent'].numpy(), b['n_doors'].numpy(), b['ent'].shape[1], nb,
                            **plan_kw(model, rows, hist))
     tok = TP.plan_tokens(plan, torch.from_numpy(plan['rec']), torch.from_numpy(plan['base']))
     mb = dict(b)
     names = ['keep', 'starts', 'gpos'] + (['ekeep', 'dkeep', 'xperm'] if xperm else [])
     if xperm and 'ikeep' in tok:
-        names += ['ikeep', 'tgroup', 'glast']
+        names += ['ikeep', 'glast']
     mb.update((k, tok[k]) for k in names)
     mb['buckets'] = [(torch.from_numpy(c_), w_) for c_, w_ in plan['buckets']]
     return mb
 
 
 def host_batch(model, b, rows, hist=None):
-    """forward(packed=True) with the host's positions (packed_index), fused-aware."""
+    """forward(packed=True) with the host's positions (packed_index) with the model's extra tokens."""
     keep, starts = TP.packed_index(b['n_ent'].numpy(), b['n_doors'].numpy(), b['ent'].shape[1],
                                    **plan_kw(model, rows, hist))
     mb = dict(b)
@@ -109,19 +104,6 @@ def perturb(m, seed, scale=0.02):
     with torch.no_grad():
         for p in m.parameters():
             p.add_((torch.randn(p.shape, generator=g) * scale).to(p.device))
-
-
-def c92_gates(m, seed):
-    """Gates of the size C92 logged at its end (mean |gate| 0.104 items, 0.026 global) and trained-looking memory
-    projections."""
-    g = torch.Generator().manual_seed(seed)
-    with torch.no_grad():
-        L_ = len(m.blocks)
-        m.itok.gate.copy_(torch.randn(L_, generator=g) * 0.13)
-        m.gtok.gate.copy_(torch.randn(L_, generator=g) * 0.033)
-        if m.memory:
-            m.mem_out.weight.normal_(0, 0.05, generator=g)
-            m.gtok.mem_in.weight.normal_(0, 0.05, generator=g)
 
 
 def chunk_dict(n, d=D):
@@ -138,22 +120,17 @@ def main():
 
     # ------------------------------------------------------------ (a) off == HEAD
     old = M.head_module()
-    cases = (('plain', dict(), False), ('items', BASE, False), ('items+memory', dict(BASE, memory=D), False),
-             ('B21 + B22 + B23 + memory, separate terms, gates open',
-              dict(BASE, memory=D, item_tokens=True, global_token=True, item_shared=True), True))
-    for tag, cfg, gates in cases:
+    cases = (('plain', dict()), ('items', BASE), ('items+memory', dict(BASE, memory=D)))
+    for tag, cfg in cases:
         torch.manual_seed(1)
         new = TP.TokPolicy(**cfg).eval()
-        if gates:
-            G.open_gates(new)
         n = 11
         b = TP.to_batch(G.rows_with_empty(rng, n), M.synth_pending(rng, n, new.heads), dev)
         acts = torch.from_numpy(M.synth_pending(rng, n, new.heads))
         u = torch.rand((n, sum(new.heads)))
         mem = torch.randn(n, D) if cfg.get('memory') else None
         memd = G.chunk_dict(n) if cfg.get('memory') else None
-        check(f'(a) no B24 keys in the config [{tag}]',
-              'item_tokens_fused' not in new.config and 'item_slots' not in new.config and not new.fused)
+        check(f'(a) no B24 keys in the config [{tag}]', 'item_slots' not in new.config)
         if old is None:
             print('skip (a) HEAD comparison: git HEAD not readable')
             continue
@@ -163,7 +140,7 @@ def main():
         check(f'(a) == HEAD, all paths [{tag}]', M.same(o_new, o_ref) and len(o_new) == len(o_ref),
               f'{len(o_new)} tensors, max diff {M.maxdiff(o_new, o_ref):.1e}')
 
-    # ------------------------------------------------------------ (b) fused: paths, backward, BPTT, B23
+    # ------------------------------------------------------------ (b) item / global tokens: paths, backward, BPTT
     for tag, extra in (('items + global', {}), ('items only', dict(global_token=False)),
                        ('global only', dict(item_tokens=False)), ('shared table, 8 slots', dict(item_shared=True,
                                                                                                 item_slots=8))):
@@ -187,7 +164,7 @@ def main():
                                                                   **kw)
             m.set_math_attention(False)
         worst = max(M.maxdiff(o, ref) for o in outs.values())
-        check(f'(b) fused, every path agrees [{tag}]', worst < 1e-4 and all(len(o) == len(ref) for o in outs.values()),
+        check(f'(b) every path agrees [{tag}]', worst < 1e-4 and all(len(o) == len(ref) for o in outs.values()),
               f'{len(outs)} paths x {len(ref)} outputs, max diff {worst:.1e}')
 
     torch.manual_seed(4)
@@ -207,11 +184,11 @@ def main():
     (-(logp * adv).mean() + 0.5 * ((value - ret) ** 2).mean() - 0.01 * ent.sum(-1).mean()).backward()
     learner.set_math_attention(False)
     gr = {k: (0.0 if p.grad is None else float(p.grad.abs().sum())) for k, p in learner.named_parameters()}
-    need = ['itok.coll.weight', 'itok.mlp.0.weight', 'itok.slot.weight', 'itok.gate', 'gtok.tok', 'gtok.gate',
+    need = ['itok.coll.weight', 'itok.mlp.0.weight', 'itok.slot.weight', 'itok.kind.weight', 'gtok.tok',
             'gtok.mem_in.weight']
     zero = [k for k in need if not gr[k] > 0]
-    check('(b) fused backward (fast path, BPTT chunks): the policy loss alone reaches the item tokens, gates, the '
-          'global token and mem_in', not zero and all(np.isfinite(v_) for v_ in gr.values()),
+    check('(b) backward (fast path, BPTT chunks): the policy loss alone reaches the item tokens, the global token and '
+          'mem_in', not zero and all(np.isfinite(v_) for v_ in gr.values()),
           f'zero: {zero}' if zero else ', '.join(f'{k} {gr[k]:.1e}' for k in need[:4]))
 
     # chunked BPTT reproduces the actor (padded, packed, fast)
@@ -266,10 +243,10 @@ def main():
             o = fn()
         el, eh, ev = (float((o[0] - ref_l).abs().max()), float((o[3] - ref_h).abs().max()),
                       float((o[4] - ref_v).abs().max()))
-        check(f'(b) fused BPTT chunks reproduce the actor [{ptag}]', el < 1e-4 and eh < 1e-4 and ev < 1e-4,
+        check(f'(b) BPTT chunks reproduce the actor [{ptag}]', el < 1e-4 and eh < 1e-4 and ev < 1e-4,
               f'logits {el:.1e}, states {eh:.1e}, value_global {ev:.1e}')
 
-    # B23 in fused mode: the shared table gets gradient from the held items; forced-pickup masking on fused logits
+    # B23: the shared table gets gradient from the held items; forced-pickup masking
     torch.manual_seed(9)
     sh = TP.TokPolicy(**BASE, memory=D, item_shared=True, **FUSED)
     perturb(sh, 10)
@@ -300,81 +277,11 @@ def main():
     imit.backward()
     g_im = logits.grad.abs().sum(1)
     held_g = [float(sh.item_emb.weight.grad[i].abs().sum()) for i in (801, 802)]
-    check('(b) fused + shared table: item_emb gets gradient from the held items (item tokens only)',
+    check('(b) shared table: item_emb gets gradient from the held items (item tokens only)',
           sh.itok.coll is sh.item_emb and all(v_ > 0 for v_ in held_g), f'{held_g[0]:.1e}, {held_g[1]:.1e}')
-    check('(b) fused + forced pickups: policy term zero on forced rows, imitation only on them',
+    check('(b) forced pickups: policy term zero on forced rows, imitation only on them',
           bool((g_pg[forced] == 0).all()) and bool((g_pg[~forced] > 0).all()) and bool((g_im[forced] > 0).all())
           and bool((g_im[~forced] == 0).all()))
-
-    # ------------------------------------------------------------ (c) conversion of a B21 / B22 / B23 checkpoint
-    Dm = 128
-    ck_cfg = dict(BASE, memory=Dm, item_tokens=True, global_token=True, item_shared=True)
-    rows_eval = realistic_rows(np.random.default_rng(99), 256)
-    lines = []
-    for seed in (11, 12, 13):
-        torch.manual_seed(seed)
-        src = TP.TokPolicy(**ck_cfg)
-        perturb(src, seed)
-        c92_gates(src, seed)
-        opt = torch.optim.Adam(src.main_parameters(), lr=1e-4, eps=1e-5)
-        nb_ = TP.to_batch(realistic_rows(rng, 8), M.synth_pending(rng, 8, src.heads), dev)
-        src(nb_, need_vg=True, mem=torch.zeros(8, Dm))[-1].sum().backward()
-        opt.step()
-        buf = io.BytesIO()
-        torch.save(dict(model=src.state_dict(), optimizer=opt.state_dict(), config=src.config), buf)
-        buf.seek(0)
-        ck = torch.load(buf, map_location='cpu')
-        src.eval()
-        for slots in (INV_CAP, 8):
-            fu = TP.TokPolicy(**dict(ck['config'], item_tokens_fused=True, item_slots=slots)).eval()
-            state, note = TP.convert_to_fused(fu, ck['model'])
-            fu.load_state_dict(state, strict=True)
-            if seed == 11 and slots == INV_CAP:
-                check('(c) convert_to_fused: strict load, log line', 'gates' in note, note[:110] + ' ...')
-                opt_f = torch.optim.Adam(fu.main_parameters(), lr=1e-4, eps=1e-5)
-                opt_f.load_state_dict(ck['optimizer'])
-                fu.train()
-                fu.zero_grad()
-                fu(nb_, need_vg=True, mem=torch.zeros(8, Dm))[-1].sum().backward()
-                opt_f.step()
-                p0 = fu.main_parameters()[0]
-                check('(c) Adam state of the checkpoint loads as it is (same names / order) and steps',
-                      int(opt_f.state[p0]['step']) == 2)
-                fu.load_state_dict(state, strict=True)
-                fu.eval()
-            n_e = len(rows_eval)
-            b_e = TP.to_batch(rows_eval, M.synth_pending(np.random.default_rng(seed), n_e, src.heads), dev)
-            h_e = torch.randn(n_e, Dm, generator=torch.Generator().manual_seed(seed)) * 0.3
-            with torch.no_grad():
-                ref = src(b_e, mem=h_e, need_vg=True)
-                kept = fu(b_e, mem=h_e, need_vg=True)
-                fu.itok.gate.fill_(1.0)
-                fu.gtok.gate.fill_(1.0)
-                ones = fu(b_e, mem=h_e, need_vg=True)
-                closed = TP.TokPolicy(**ck_cfg).eval()
-                closed.load_state_dict(ck['model'])
-                closed.itok.gate.zero_()
-                closed.gtok.gate.zero_()
-                shut = closed(b_e, mem=h_e, need_vg=True)
-
-            def md(o):
-                return (float((o[0] - ref[0]).abs().max()), float((o[0] - ref[0]).abs().mean()),
-                        float((o[1] - ref[1]).abs().max()), float((o[-1] - ref[-1]).abs().max()))
-            r_k, r_1, r_c = md(kept), md(ones), md(shut)
-            ok_ = all(np.isfinite(r_k)) and r_k[0] > 0   # (not exact: one softmax is another function)
-            lines.append((seed, slots, r_k, r_1, r_c))
-            check(f'(c) converted checkpoint runs, outputs finite, not exact [seed {seed}, {slots} slots]', ok_,
-                  f'max |logit diff| {r_k[0]:.3f} (mean {r_k[1]:.4f}), value {r_k[2]:.3f}, value_global {r_k[3]:.3f}')
-    print('info (c): max |diff| to the checkpoint on 256 realistic synthetic records (logits max / mean, value, '
-          'value_global)')
-    for seed, slots, r_k, r_1, r_c in lines:
-        print(f'  seed {seed} slots {slots:2d}: gates kept {r_k[0]:.3f} / {r_k[1]:.4f} / {r_k[2]:.3f} / {r_k[3]:.3f}'
-              f' | gates 1 {r_1[0]:.3f} / {r_1[1]:.4f} / {r_1[2]:.3f} / {r_1[3]:.3f}'
-              f' | (scale: checkpoint with its gates closed {r_c[0]:.3f} / {r_c[1]:.4f})')
-    kept_m = np.mean([x[2][1] for x in lines])
-    ones_m = np.mean([x[3][1] for x in lines])
-    check('(c) gates kept is the closer conversion (mean |logit diff| over the seeds)', kept_m <= ones_m,
-          f'kept {kept_m:.4f}, gates 1 {ones_m:.4f}')
 
     # ------------------------------------------------------------ (d) item_slots 8
     torch.manual_seed(14)
@@ -407,18 +314,15 @@ def main():
     check('(d) 8 slots: fast path == padded', M.maxdiff(f1, f0) < 1e-4, f'{M.maxdiff(f1, f0):.1e}')
     check('(d) item_slots without item tokens / out of range rejected',
           _raises(lambda: TP.TokPolicy(**BASE, global_token=True, item_slots=8)) and
-          _raises(lambda: TP.TokPolicy(**BASE, item_tokens=True, item_slots=17)) and
-          _raises(lambda: TP.TokPolicy(**BASE, item_tokens_fused=True)))
+          _raises(lambda: TP.TokPolicy(**BASE, item_tokens=True, item_slots=17)))
 
     # ------------------------------------------------------------ (e) stored value_global == forward value_global
     import train_tok as TT
     torch.manual_seed(16)
-    for tag, cfg in (('fused', dict(BASE, memory=D, **FUSED)),
-                     ('separate terms', dict(BASE, memory=D, item_tokens=True, global_token=True))):
+    for tag, cfg in (('items + global', dict(BASE, memory=D, **FUSED)),
+                     ('global only', dict(BASE, memory=D, global_token=True))):
         mv = TP.TokPolicy(**cfg).eval()
         perturb(mv, 17)
-        if not mv.fused:
-            G.open_gates(mv)
         n = 12
         rows = G.rows_with_empty(rng, n)
         pend = M.synth_pending(rng, n, mv.heads)
@@ -455,8 +359,8 @@ def main():
     # ------------------------------------------------------------ (f) CUDA: GraphActor value_global
     if torch.cuda.is_available():
         cuda = torch.device('cuda')
-        for tag, cfg in (('fused', dict(BASE, memory=D, **FUSED)), ('fused, 8 slots', dict(BASE, memory=D, item_slots=8,
-                                                                                          **FUSED))):
+        for tag, cfg in (('16 slots', dict(BASE, memory=D, **FUSED)), ('8 slots', dict(BASE, memory=D, item_slots=8,
+                                                                                       **FUSED))):
             gm = TP.TokPolicy(**cfg).to(cuda).eval()
             perturb(gm, 18)
             tab = torch.randn((W + 2, D), device=cuda)
@@ -496,9 +400,8 @@ def bench(reps=5):
     rows['n_ent'] = np.minimum(rows['n_ent'], 32)
     rows_r = realistic_rows(rng, n)
     cases = (('off (no item / global tokens)', {}),
-             ('separate terms (HEAD B21 + B22)', dict(item_tokens=True, global_token=True)),
-             ('fused, 16 slots', dict(FUSED)),
-             ('fused, 8 slots', dict(FUSED, item_slots=8)))
+             ('item / global tokens, 16 slots', dict(FUSED)),
+             ('item / global tokens, 8 slots', dict(FUSED, item_slots=8)))
     print(f'info: CPU, {torch.get_num_threads()} threads, {reps} repetitions, median ms (indicative only: the GPU '
           'is what counts)')
     for tag, extra in cases:
