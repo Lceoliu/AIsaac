@@ -38,7 +38,6 @@ if [ "$1" = smoke ]; then
   exit 0
 fi
 if [ "$1" = run ]; then
-  mkdir -p $R/c99-scratch/checkpoints
   PYTHONPATH=. nohup $PY train_tok.py $COMMON $FAST --workers 64 --game-hours 25000 --checkpoint-every 1000 \
     --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 \
     --name hc99 --port 49000 --out $R/c99-scratch > $R/c99-scratch.log 2>&1 < /dev/null &
