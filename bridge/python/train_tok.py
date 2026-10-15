@@ -104,6 +104,13 @@ Counterfactual branch teacher (B34, 2026-10-16, isaac_bridge/tok_cf.py, rl/docs/
   TemporalState of their own, a choice point's branches start from a device copy of the worker's slot before the point's
   record (the snapshot bank, cf_snap), the lane answers carry (o_{t-1}, has, o_t) and the learner reads the imitation
   records' readout from them (temporal 'stored' / 'tail'). progress.csv cf_* (cf_prior, cf_improving_share, ...).
+  B36 (2026-10-16, isaac_bridge/tok_lanes.py LaneService): the lanes (teacher v2's and the cf's) are served in rounds:
+  after the first waiting request a window of --cf-lane-wait (ends early after --cf-lane-quiet without a new request,
+  or when every lane active lately waits), then ONE lane GraphActor call for all waiting lanes (row buckets
+  --cf-lane-buckets, default the actor's; each row's temporal slot its lane; uniforms keyed by the request's sequence
+  number and lane, --cf-lane-ukeys), asynchronous (--cf-lane-async 1: submitted, answered when its event completed,
+  the workers' records served meanwhile; none in flight across take_weights); the echo is the number read when the
+  request was taken. progress.csv v2_lane_calls / _rows / _s (actor-thread seconds) / _fly_s / _held_s / _eager.
 Memory (2026-10-11, --memory gru --memory-dim D --memory-bptt T; off by default, then nothing changes; rl/docs/
   SCALING_THESIS.md S5b; TokPolicy memory): a GRU state per worker carried by the actor (a table on the GPU, zeroed only
   at an episode's first record: not at a room or floor change), the input state of each decision stored in the rollout
@@ -912,6 +919,21 @@ def main():
     p.add_argument('--cf-queue', type=int, default=8, help='choice points waiting per worker (the oldest make room)')
     p.add_argument('--cf-sticky-eps', type=float, default=0.25,
                    help="the sticky branches' share of uniform move re-picks (the \"high temperature\")")
+    # B36 (2026-10-16): the lanes' service (isaac_bridge/tok_lanes.py; teacher v2 and --cf): one call for all waiting
+    # lanes after a short window, asynchronous to the workers' records
+    p.add_argument('--cf-lane-wait', type=float, default=0.002,
+                   help="s the lanes' service waits after the first waiting lane request for more before its call "
+                        '(ends early: --cf-lane-quiet, or every lane active lately waiting); 0: at once')
+    p.add_argument('--cf-lane-quiet', type=float, default=0.0005,
+                   help='the window ends when no new lane request came for this long (0: off)')
+    p.add_argument('--cf-lane-async', type=int, default=1,
+                   help='1: a lane call is submitted and answered when it has completed, the actor serves the workers '
+                        'meanwhile; 0: the actor waits for it (as before)')
+    p.add_argument('--cf-lane-ukeys', type=int, default=1,
+                   help="1: a lane request's sampling uniforms are keyed by its sequence number and lane (the answer "
+                        "does not depend on the call's other lanes); 0: the graphs' own draws")
+    p.add_argument('--cf-lane-buckets', default='',
+                   help="row sizes of the lane actor's graphs (e.g. 8,16,32); '': --actor-row-buckets")
     # 2026-10-07: counterfactual branches at decision points (isaac_bridge/tok_branch.py; floor / run modes)
     p.add_argument('--branch-share', type=float, default=0.0,
                    help="share of a worker's wall time spent on branch points (0: off, nothing changes)")
@@ -1679,8 +1701,11 @@ def main():
               f' MiB)' + (f', choice-point snapshot bank {n} x {bank_rows(cfg)} rows '
                           f'({bank_tstate.kv.numel() * bank_tstate.kv.element_size() / 2 ** 20:.0f} MiB)'
                           if bank_tstate is not None else ''), flush=True)
+    lkw = dict(gkw)   # B36: the lane actor's own row buckets (--cf-lane-buckets; '': the actor's)
+    if args.cf_lane_buckets.strip() and gkw['fold']:
+        lkw['row_sizes'] = [int(x) for x in args.cf_lane_buckets.split(',') if x.strip()]
     lane_actor = GraphActor(model, n, g_ents, stream=torch.cuda.Stream(priority=-5), crn=False,
-                            memory=lane_table, temporal=lane_tstate, **gkw) if v2_on and use_graphs else None
+                            memory=lane_table, temporal=lane_tstate, **lkw) if v2_on and use_graphs else None
 
     def mem_rows(table, idx, reset):
         """(memory) the GRU states of workers idx from a table (zero where reset, a bool array, is set)."""
@@ -1688,7 +1713,14 @@ def main():
         if reset is not None and np.any(reset):
             h = h * torch.from_numpy(~np.asarray(reset, bool)).to(device).float()[:, None]
         return h
-    lane_stat = dict(calls=0, rows=0, s=0.0)
+    lane_stat = dict(calls=0, rows=0, s=0.0, fly_s=0.0, held_s=0.0, eager=0)
+    lanes = None
+    if v2_on:   # B36: the lanes' service (isaac_bridge/tok_lanes.py): batched, a wait window, asynchronous
+        from isaac_bridge.tok_lanes import LaneService
+        lanes = LaneService(sampler, model, device, nh, actor=lane_actor, table=lane_table, tstate=lane_tstate,
+                            bank=bank_tstate, tdest=lane_tdest, gtok=gtok_on, wait=args.cf_lane_wait,
+                            quiet=args.cf_lane_quiet, ukeys=bool(args.cf_lane_ukeys), async_=bool(args.cf_lane_async),
+                            version=lambda: version, stat=lane_stat)
     inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
     actor_stream = torch.cuda.Stream(priority=-5)
     learner_stream = torch.cuda.Stream(priority=0)
@@ -2772,7 +2804,9 @@ def main():
             row['v2_loss_vf'] = vacc_c[1] / v2_steps if v2_steps else ''
             row['v2_logp'] = vacc_c[2] / v2_steps if v2_steps else ''
             row['v2_lane_calls'], row['v2_lane_rows'] = lane_stat['calls'], lane_stat['rows']
-            row['v2_lane_s'] = lane_stat['s']
+            row['v2_lane_s'] = lane_stat['s']   # (B36: the actor thread's seconds in the lane service)
+            row['v2_lane_fly_s'], row['v2_lane_held_s'] = lane_stat['fly_s'], lane_stat['held_s']   # (B36)
+            row['v2_lane_eager'] = lane_stat['eager']
         if cf_on:   # B34 (the counterfactual teacher): worker totals, this update's window, the trainer's side
             keys_c = [k_c for k_c in ST if k_c.startswith('cf_')]
             tot_c = {k_c: float(stats[:, ST[k_c]].sum()) for k_c in keys_c}
@@ -2953,85 +2987,15 @@ def main():
             aux[n, AUX_SNAP] = version
         busy = False
 
-    def serve_lanes():
-        """2026-10-10 (teacher v2): the waiting lane requests answered (actions, value, log-probability, weights)."""
-        idx_l = sampler.take_lanes()
-        if not len(idx_l):
-            return
-        t_l = time.perf_counter()
-        rows_l = sampler.lane_rows[idx_l]
-        pend_l = sampler.lane_io[idx_l, :nh].astype(np.int64)
-        lane_h = getattr(sampler, 'lane_h', None) if mem_on else None
-        if lane_h is not None:   # 2026-10-11 (memory): a branch's first request sets the lane's state from the worker
-            #                     (the episode's state at the fork, LanePolicy.begin); later ones carry the lane's own
-            new_b = lane_h[idx_l, mem_dim] > 0.5
-            if new_b.any():
-                j_l = idx_l[new_b]
-                lane_table.index_copy_(0, torch.from_numpy(j_l).to(device),
-                                       torch.from_numpy(np.ascontiguousarray(lane_h[j_l, :mem_dim])).to(device))
-                torch.cuda.current_stream().synchronize()   # (done before the lane actor's stream reads the table)
-                lane_h[j_l, mem_dim] = 0.0
-        sl_d = op_l = has_l = None
-        if lane_tstate is not None:   # B34 (temporal): a branch's first request sets the lane's state (the point's
-            #                           snapshot from the bank, or a reset state); o_{t-1} and has before the step
-            sl_d = torch.from_numpy(np.ascontiguousarray(idx_l, np.int64)).to(device)
-            beg = sampler.lane_io[idx_l, 11].astype(np.int64)
-            if (beg != 0).any():
-                pos, neg = beg > 0, beg < 0
-                if pos.any() and bank_tstate is not None:
-                    lane_tstate.copy_slot_(beg[pos] - 1, idx_l[pos], other=bank_tstate)
-                elif pos.any():
-                    lane_tstate.reset_slot_(idx_l[pos])
-                if neg.any():
-                    lane_tstate.reset_slot_(idx_l[neg])
-                sampler.lane_io[idx_l[beg != 0], 11] = 0
-            op_l = lane_tstate.prev_o.index_select(0, sl_d).float().cpu().numpy()   # (synchronises the stream)
-            has_l = (lane_tstate.steps.index_select(0, sl_d) > 0).cpu().numpy() & (rows_l['first'] == 0)
-        got = lane_actor.act(rows_l, pend_l, *((idx_l, None) if (mem_on or t_on) else ()),
-                             **(dict(tdest=dict(lane_tdest, rows=idx_l)) if t_on else {})) \
-            if lane_actor is not None else None
-        h_l = lane_actor.h_used if got is not None and mem_on else None
-        vg_l = lane_actor.vg if got is not None and gtok_on else None
-        o_l = lane_tdest['o'].index_select(0, sl_d).cpu().numpy() if (got is not None and t_on) else None
-        if got is None:   # (no graph, or more records than it holds: eager)
-            tk_l = dict(temporal=dict(mode='step', state=lane_tstate, slot=sl_d)) if t_on else {}
-            with torch.inference_mode():
-                if mem_on:
-                    h_in = mem_rows(lane_table, idx_l, None)
-                    out_l = model.act(to_batch(rows_l, pend_l, device), mem=h_in, need_vg=gtok_on, **tk_l)
-                    hn_l = out_l[3]
-                else:
-                    out_l = model.act(to_batch(rows_l, pend_l, device), need_vg=gtok_on, **tk_l)
-                a_l, lp_l, v_l = out_l[:3]
-            if mem_on:
-                lane_table.index_copy_(0, torch.from_numpy(idx_l).to(device), hn_l)
-                h_l = h_in.cpu().numpy()
-            vg_l = out_l[-1].cpu().numpy() if gtok_on else None
-            if t_on:
-                o_l = tk_l['temporal']['out']['o'].float().cpu().numpy()
-            got = (a_l.cpu().numpy(), lp_l.cpu().numpy(), v_l.cpu().numpy())
-        a_l, lp_l, v_l = got
-        if lane_h is not None:   # the input state of each answer, for the branch's imitation records
-            lane_h[idx_l, :mem_dim] = h_l
-        if t_on and getattr(sampler, 'lane_t', None) is not None:   # B34: the lane step's outputs (imitation records)
-            from isaac_bridge.tok_cf import t_pack
-            sampler.lane_t[idx_l] = t_pack(op_l, has_l, o_l)
-        sampler.lane_io[idx_l, 5:5 + nh] = a_l
-        sampler.lane_out[idx_l, 0], sampler.lane_out[idx_l, 1], sampler.lane_out[idx_l, 2] = v_l, lp_l, version
-        sampler.lane_out[idx_l, 3] = v_l if vg_l is None else vg_l   # B34: value_global (the value without one)
-        sampler.lane_out[idx_l, 4] = sampler.lane_io[idx_l, 10]   # B34: the request's number, written last
-        sampler.reply_lanes(idx_l)
-        lane_stat['calls'] += 1
-        lane_stat['rows'] += len(idx_l)
-        lane_stat['s'] += time.perf_counter() - t_l
-
     def wait_learner():
         # (teacher v2: the lanes are answered meanwhile; their poll releases the GIL)
         while not fresh.wait(0.0 if v2_on else 0.5):
-            if v2_on and sampler.wait_lanes(0.005):
-                serve_lanes()
+            if lanes is not None:   # (B36: a round with its window, to its answer)
+                lanes.serve_wait(0.005)
             if failure or not learner.is_alive():
                 break
+        if lanes is not None:   # (B36: no lane call runs while the weights change)
+            lanes.quiesce()
         take_weights()
 
     aux = sampler.aux   # Phase B2 (branches): the actor's value, log-probability and choice outputs per worker
@@ -3142,11 +3106,13 @@ def main():
             prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=0, calls=0, rows=0, eager=0,
                         act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0, cf_snaps=0)
             while roll.usable() < args.rollout and sampler.live:
-                if v2_on and sampler.lane_ready:   # 2026-10-10 (teacher v2): lane requests the last poll saw
-                    serve_lanes()
+                if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
+                    lanes.tick()        # lane call answered, a round started when its window has ended (no wait)
                 if busy and fresh.is_set():
                     while inflight:
                         finish(prof)
+                    if lanes is not None:   # (B36: no lane call runs while the weights change)
+                        lanes.quiesce()
                     take_weights()
                 ta = time.perf_counter()
                 if inflight:   # a call is running: take what is ready now, else finish the oldest call
@@ -3158,8 +3124,9 @@ def main():
                         prof['poll'] += time.perf_counter() - ta
                         finish(prof)
                         continue
-                else:
-                    idx, slots = sampler.poll_ready(idle=0.05, want=args.poll_want, max_wait=args.poll_wait)
+                else:   # (B36: a short wait while a lane call is in flight or a lane window is open)
+                    idx, slots = sampler.poll_ready(idle=0.05 if lanes is None else lanes.idle(0.05),
+                                                    want=args.poll_want, max_wait=args.poll_wait)
                 tb = time.perf_counter()
                 prof['poll'] += tb - ta
                 prof['polls'] += 1

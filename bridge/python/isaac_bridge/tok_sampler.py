@@ -1294,6 +1294,7 @@ class TokSampler:
         self.main_h = self.lane_h = self.v2_h = None   # 2026-10-11 (memory, with teacher v2)
         self.main_vg = self.cf_snap = self.lane_t = self.v2_t = None   # B34 (the counterfactual teacher)
         self.lane_ready = []
+        self.lane_first_t = self.lane_last_t = 0.0   # B36: when the oldest / newest waiting lane request was read
         self._lanes = {}
         cf_on = bool(getattr(cfg, 'cf', False)) and cfg.mode in ('floor', 'run') and not cfg.eval_seeds
         if (cfg.teacher_v2 or cf_on) and cfg.mode in ('floor', 'run') and not cfg.eval_seeds:
@@ -1390,6 +1391,10 @@ class TokSampler:
         except OSError:
             msg = b''
         if msg in (_MSG0, _MSG1):
+            now = time.perf_counter()   # (B36: the lane service's wait window, tok_lanes.LaneService.due)
+            if not self.lane_ready:
+                self.lane_first_t = now
+            self.lane_last_t = now
             self.lane_ready.append(self._lanes[fd])
             return
         for p in (self._poller, self._lane_poller):
@@ -1409,6 +1414,15 @@ class TokSampler:
                 if fd in self._lanes:
                     self._lane_message(fd)
         return bool(self.lane_ready)
+
+    def poll_lanes(self):
+        """B36: the lane requests already written read now (no wait) into lane_ready; returns how many wait there."""
+        if self._lane_poller is None:
+            return 0
+        for fd, _ in self._lane_poller.poll(0):
+            if fd in self._lanes:
+                self._lane_message(fd)
+        return len(self.lane_ready)
 
     def take_lanes(self):
         """The workers whose lane requests are waiting (int64 array, distinct), lane_ready emptied."""

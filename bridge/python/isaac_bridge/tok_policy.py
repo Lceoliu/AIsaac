@@ -2181,19 +2181,22 @@ class GraphActor:
             self.tstate.reset_()
             torch.cuda.synchronize()
 
-    def submit(self, rows, pending, widx=None, reset=None, tdest=None):
+    def submit(self, rows, pending, widx=None, reset=None, tdest=None, ukeys=None):
         """Start a call (returns at once; False if it does not fit). rows: a C-contiguous ROW array, pending [n, heads]
         int64. The next submit may only follow this call's result(). Memory models: widx [n] the records' rows of the
         state table (distinct), reset [n] bool (None: none) where an episode starts (its state is zero).
         tdest (B31, temporal models; train_tok Rollout.t_dest): dict(kv [rows, L, 2, D], s [rows, D], o [rows', D]
         device tensors, obase (o's row = kv's row + obase), rows [n] int64 numpy: each record's row); None: the step's
-        K / V, s and o are not kept."""
+        K / V, s and o are not kept.
+        ukeys (B36, 2026-10-16, the lanes): (keys [n], t [n]) int64: every record's sampling uniforms are
+        crn_uniforms(keys, t) (counter-based: a record's draw depends on its key and t only, never on the call's other
+        records or its row in the call); None: as before."""
         n = len(rows)
         if n > self.n:
             return False
         self._tdest = tdest if self.t_on else None
         if self.fold:
-            return self._submit_fold(rows, pending, widx, reset)
+            return self._submit_fold(rows, pending, widx, reset, ukeys)
         if self.mem:
             self.widx_np[:n] = widx
             self.keep_np[:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
@@ -2209,7 +2212,11 @@ class GraphActor:
         self.stage_np[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * self.nh)
         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
         sel = None
-        if self.crn and 'crn' in rows.dtype.names:
+        if ukeys is not None:   # (B36) every record's uniforms from its key
+            sel = np.arange(n)
+            self.crn_stage_np[:n] = crn_uniforms(ukeys[0], ukeys[1], self.u.shape[1])
+            self.crn_idx_np[:n] = sel
+        elif self.crn and 'crn' in rows.dtype.names:
             crn = rows['crn']
             if crn.any():
                 sel = np.flatnonzero(crn)
@@ -2243,9 +2250,9 @@ class GraphActor:
         self._n = n
         return True
 
-    def _submit_fold(self, rows, pending, widx, reset):
+    def _submit_fold(self, rows, pending, widx, reset, ukeys=None):
         """submit() with fold (B29): records + control block in, the replay, the outputs out."""
-        g = self._pack_fold(rows, pending, widx, reset)
+        g = self._pack_fold(rows, pending, widx, reset, ukeys)
         n = len(rows)
         r = self.rsizes[int(np.searchsorted(self.rsizes, n))]
         g += self.rsizes.index(r) * len(self.sizes)
@@ -2274,7 +2281,7 @@ class GraphActor:
         td['s'].index_copy_(0, rows, tkv[:n, L2D:].to(td['s'].dtype))
         td['o'].index_copy_(0, rows + int(td.get('obase', 0)), o[:n].to(td['o'].dtype))
 
-    def _pack_fold(self, rows, pending, widx, reset):
+    def _pack_fold(self, rows, pending, widx, reset, ukeys=None):
         """(fold) The records and the control block into the pinned staging buffers; returns the graph to replay."""
         n = len(rows)
         most = int(rows['n_ent'].max())
@@ -2302,6 +2309,9 @@ class GraphActor:
                 self.c_cu[sel] = crn_uniforms(crn[sel], rows['t'][sel], self.u.shape[1])
                 self.c_cf[sel] = 1.0
                 self.crn_rows += len(sel)
+        if ukeys is not None:   # (B36) every record's uniforms from its key (the graph's own draws unused)
+            self.c_cu[:n] = crn_uniforms(ukeys[0], ukeys[1], self.u.shape[1])
+            self.c_cf[:n] = 1.0
         return g
 
     def result(self):
@@ -2320,9 +2330,9 @@ class GraphActor:
                               steps=np.rint(tc[:, 2]).astype(np.int64), stage_prev=np.rint(tc[:, 3]).astype(np.int64))
         return out[:, :nh].astype(np.int64), out[:, nh], out[:, nh + 1]
 
-    def act(self, rows, pending, widx=None, reset=None, tdest=None):
+    def act(self, rows, pending, widx=None, reset=None, tdest=None, ukeys=None):
         """submit + result: (actions, log-probabilities, values), or None if it does not fit."""
-        return self.result() if self.submit(rows, pending, widx, reset, tdest) else None
+        return self.result() if self.submit(rows, pending, widx, reset, tdest, ukeys) else None
 
 
 def _sdpa_math():
