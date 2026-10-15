@@ -7460,6 +7460,21 @@ HPC128 `ws10/runs/c97-drops`（`ws10/hpc_c97.sh run`，10-15 13:1x 起；端口 
 
 **实验结果**（进行中）
 
+### C99 新架构从零训练：无 GRU、无门、观测 v2、反事实分支教师，HPC160（2026-10-16，进行中）
+
+**实验目的**
+
+用户 10-16：新架构（空间 transformer + 时间 transformer 256×4 / W 256 / 房间 token、融合道具 token、全局 token）**从零**训练，不带 GRU、不带任何门（B33），加 B35 的三项观测和 B34 的反事实分支教师，回答"这个架构本身学得快不快、能不能超过继承来的 1.75"。对照：C77 / C87 等从同一条继承线出发的曲线按同游戏小时数比，以及 C96 的终点。奖励沿用 C96（含 heal 0.5 / resource 0.25）。
+
+**实验方法**
+
+HPC160 `ws9/runs/c99-scratch`（沙箱 ws9 = `1ae82d3`；`ws9/hpc_c99.sh run`，10-16 04:24 起；端口 49000 / 评估 49300），64 worker，参数 = C96 去掉记忆三项，加 `--obs-v2 1`、`--cf 1 --cf-points 6 --cf-branches 4 --cf-seconds 180 --cf-target-seconds 20 --cf-margin 0.3 --cf-cap 2 --cf-distill-steps 8 --cf-random 1 --cf-advantage 0`，`--pickup-force 1:0`（底座强制拾取随运行从 1 降到 0）、底座构筑，死亡教师照旧，B29 actor 标志；无 `--resume`，**25,000 小时**（用户：先 25,000），每 1,000 次更新 128 种子。
+- 启动前的真机验证：GPU 测试（cf / temporal / no_gru / obs_v2）全过；8 worker 从零冒烟 0 Traceback，`cf_detected` 189 / 配额跳过 124 / 搜 1 个点 3 支。
+- 三次启动失败（都在 5 分钟内发现）：两次是脚本预建了输出目录（从零运行拒绝已存在的 `--out`，C86 的老教训，已改脚本）；一次是 `train_tok.learn()` 里对 `CF_TRIGGERS` 的重复 import 把它变成了未绑定的局部变量（提交 `1ae82d3` 修）。
+
+**实验结果**（进行中）
+
+- **启动**（04:24）：5 分钟后 540–779×（编译预热和 CF lane 启动期，infer 4–8 ms），update 3.0 s，熵 3.4，ev 0.7–0.8，0 个 Traceback，显存 12 GB。
 ### A27 512 种子定论评估：各主线最终检查点（2026-10-13/14，3090）
 
 **实验目的**
