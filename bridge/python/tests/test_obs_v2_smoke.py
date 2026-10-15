@@ -194,6 +194,9 @@ def part_a():
     if lean_h is None or obs_h is None:
         print('skip (a) HEAD comparison: git HEAD not readable')
         return rows
+    if lean_h.ENTITY.itemsize != 144:   # (git HEAD already has B35: the pre-B35 reference is gone; nothing to compare)
+        print('skip (a) HEAD comparison: git HEAD already carries the 148-byte entity record (B35 committed)')
+        return rows
     check('a HEAD entity record is 144 bytes', lean_h.ENTITY.itemsize == 144)
     dec_h, st_h = lean_h.LeanDecoder(), obs_h.EpisodeState(1000)
     rows_h = np.zeros(len(PAYLOAD_FLAGS), obs_h.ROW)
