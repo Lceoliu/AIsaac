@@ -838,6 +838,35 @@ class TemporalState:
         for t_ in (self.kv, self.steps, self.nroom, self.prev_o, self.prev_stage, self.prev_map):
             t_.zero_()
 
+    def _tensors(self):
+        """(tensor, slot axis) of every per-slot part of the state."""
+        return ((self.kv, 2), (self.steps, 0), (self.nroom, 0), (self.prev_o, 0), (self.prev_stage, 0),
+                (self.prev_map, 0))
+
+    def copy_slot_(self, src, dst, other=None):
+        """B34 (2026-10-16, the counterfactual teacher's lanes): slot(s) src of `other` (a TemporalState of the same
+        model and dtype; None: this one) copied into slot(s) dst of this state, on the device and in place (captured
+        graphs keep their pointers): every layer's K / V ring (rooms and steps), the step and room counts, prev_o,
+        prev_stage, prev_map. src / dst: ints or int64 sequences / tensors of equal length (dst distinct). A step from
+        the copy is the step the source slot would have taken (same values, bit for bit)."""
+        o = self if other is None else other
+        dev = self.kv.device
+        s = torch.as_tensor(src, dtype=torch.int64, device=dev).reshape(-1)
+        d = torch.as_tensor(dst, dtype=torch.int64, device=dev).reshape(-1)
+        if s.shape != d.shape:
+            raise ValueError('TemporalState.copy_slot_: src and dst differ in length')
+        if o.kv.shape[:2] != self.kv.shape[:2] or o.kv.shape[3:] != self.kv.shape[3:] or o.kv.dtype != self.kv.dtype:
+            raise ValueError('TemporalState.copy_slot_: states of other shapes / dtypes')
+        for (t_, ax), (u_, _) in zip(self._tensors(), o._tensors()):
+            t_.index_copy_(ax, d, u_.index_select(ax, s))
+
+    def reset_slot_(self, idx):
+        """B34: slot(s) idx back to the start (zeros: the next record steps as an episode's first step would, without
+        any history)."""
+        d = torch.as_tensor(idx, dtype=torch.int64, device=self.kv.device).reshape(-1)
+        for t_, ax in self._tensors():
+            t_.index_fill_(ax, d, 0)
+
 
 def temporal_out(info):
     """(B31) a step's outputs (TemporalAttention.step) for the rollout (train_tok.store): the counters as numpy
@@ -1149,6 +1178,11 @@ class TokPolicy(nn.Module):
                   bool) for the first k records (chunk-major, the plan's rows), the rest (teacher records) without;
           'stored': dict(mode='stored', o=[k, D] stored o_t, o_prev, has): the stored outputs for the readout (the
                   values recomputed at an update's start).
+          B34 (2026-10-16): 'chunk' / 'stored' may carry tail=dict(o_prev [n - k, D], has [n - k], o [n - k, D],
+                  m [n - k]) for the records past the first k: their history token from o_prev / has and the readout
+                  m x P(o) (stop-grad stored outputs: the counterfactual teacher's imitation records with the lane's
+                  temporal outputs, m = 1; other teacher records m = 0, has = False: as without a tail). 'stored'
+                  may carry m=[k] too: the readout mask of its first k rows (default 1).
         (B31) With a temporal context the history token is one more token (_forward_fused): host plans of a packed
         batch (packed_index / learner_plan) need hist= each record's has (False past the first k)."""
         if need_vg and self.gtok is None:
@@ -1414,7 +1448,11 @@ class TokPolicy(nn.Module):
         elif mode in ('chunk', 'stored'):
             k = temporal['o_prev'].shape[0]
             o_prev, has = temporal['o_prev'].float(), temporal['has'].bool()
-            if k < n:   # (the records after the first k: no temporal context)
+            tail = temporal.get('tail')
+            if k < n and tail is not None:   # (B34: the records after the first k with stored outputs of their own)
+                o_prev = torch.cat([o_prev.to(dev), tail['o_prev'].float().to(dev)])
+                has = torch.cat([has.to(dev), tail['has'].bool().to(dev)])
+            elif k < n:   # (the records after the first k: no temporal context)
                 o_prev = torch.cat([o_prev, o_prev.new_zeros((n - k, o_prev.shape[1]))])
                 has = torch.cat([has, has.new_zeros(n - k)])
             tctx['k'] = k
@@ -1452,8 +1490,15 @@ class TokPolicy(nn.Module):
             else:
                 k = tctx['k']
                 o_k = ta.sequence(s_t[:k], tctx['plan']) if mode == 'chunk' else tctx['o'].float()
-                o = torch.cat([o_k, o_k.new_zeros((n - k, o_k.shape[1]))]) if k < n else o_k
-                m = torch.cat([z.new_ones(k), z.new_zeros(n - k)]) if k < n else z.new_ones(n)
+                tail = tctx.get('tail')
+                if k < n and tail is not None:   # (B34: stored o_t and a readout mask of their own past the first k)
+                    o = torch.cat([o_k, tail['o'].float().to(o_k.device)])
+                    m = torch.cat([z.new_ones(k), tail['m'].float().to(z.device)])
+                else:
+                    o = torch.cat([o_k, o_k.new_zeros((n - k, o_k.shape[1]))]) if k < n else o_k
+                    m = torch.cat([z.new_ones(k), z.new_zeros(n - k)]) if k < n else z.new_ones(n)
+                if mode == 'stored' and tctx.get('m') is not None:   # (B34: a readout mask of the first k rows)
+                    m = torch.cat([tctx['m'].float().to(z.device), m[k:]])
             zr = zr + m[:, None] * ta.read(o)
             out = (self.pi(zr), self.value(zr)[:, 0], self.danger(zr)) + ((zr,) if need_h else ())
             if self.memory and mem is not None:

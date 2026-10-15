@@ -9,6 +9,12 @@
 # 2026-10-16 (B35, user-approved): --obs-v2 1 (pickup prices, heart split, room type; ROW v2). Needs the sandbox's
 # abp_bridge.lua = abp-0.2.18 and a libabp_turbo.so rebuilt from this commit's abp_turbo.c (abp_native_entity_bytes 148,
 # abp_row_encode version 7); with an older library the bridge falls back to the Lua observation and FastRow is off (slow).
+# 2026-10-16 (B34, user-approved, rl/docs/COUNTERFACTUAL_TEACHER.md): the counterfactual branch teacher (--cf 1) with
+# the design's starting values: 6 choice points per worker per game hour, 4 branches x 180 game s (taken, target,
+# 2 sticky high-temperature), margin 0.3, weight cap 2, the improving branch's first 8 records distilled, 1 random
+# point per game hour, no advantage replacement; its points run in forked children of the workers (--teacher-thread 1
+# --teacher-fork 1 above), its records through teacher v2's ring and loss (--teacher-v2-* learner defaults); raise
+# --cf-points to 10-12 once the throughput allows (progress.csv cf_*).
 source /101063/AIsaac/ws9/hpc_env.sh
 R=$ABP_HOME/runs
 COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --epochs 3 --teacher --teacher-queue 12 --archive-size 12 \
@@ -17,7 +23,9 @@ COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items 
   --item-tokens 1 --global-token 1 --item-shared 1 --start-build-prob 0.5 --start-build-max 3 --start-build-mode pedestal \
   --pickup-force 1:0 --reward heal=0.5,resource=0.25 --item-slots 8 \
   --temporal 1 --temporal-width 256 --temporal-layers 4 --temporal-heads 4 --temporal-window 256 --temporal-rooms 128 --temporal-bptt 256 \
-  --obs-v2 1"
+  --obs-v2 1 \
+  --cf 1 --cf-points 6 --cf-branches 4 --cf-seconds 180 --cf-target-seconds 20 --cf-margin 0.3 --cf-cap 2 \
+  --cf-distill-steps 8 --cf-random 1 --cf-advantage 0"
 FAST="--actor-compile default --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
 if [ "$1" = smoke ]; then
   shift

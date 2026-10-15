@@ -139,6 +139,20 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # forced, forced decisions, EV_ITEM while forcing / outside forcing (ordinary episodes), pedestals spawned by
          # pedestal start builds
          'pf_p', 'pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups', 'start_pedestals',
+         # B34 (2026-10-16, the counterfactual teacher, tok_cf.py; tok_floor only, zero unless cfg.cf): triggers found,
+         # points accepted into the episode's pending list and queued at its end, skipped by the quota, replaced by an
+         # unseen trigger type, without a bank row (temporal), dropped (queue full, broken episode, recovery), queued
+         # now; points searched (and per trigger type cf_t_<type>), of them with a branch run (cf_done) or none (the
+         # room's entry record), improving; sums of best - taken (gain0), of the taken scores, of the replicate
+         # spreads; branches, their decisions and logic frames, replicates, imitation records written, improving points
+         # whose best branch was the target branch, lane answers, wall / worker-thread CPU / lane-wait seconds, errors
+         'cf_detected', 'cf_queued', 'cf_skipped', 'cf_replaced', 'cf_nobank', 'cf_dropped', 'cf_queue',
+         'cf_points', 'cf_done', 'cf_nodepth', 'cf_improving', 'cf_gain0', 'cf_taken', 'cf_spread', 'cf_branches',
+         'cf_dec', 'cf_frames', 'cf_reps', 'cf_records', 'cf_target_best', 'cf_lane_calls', 'cf_s', 'cf_cpu',
+         'cf_wait_s', 'cf_errors',
+         'cf_t_heart', 'cf_t_coin', 'cf_t_key', 'cf_t_bomb', 'cf_t_chest', 'cf_t_pill', 'cf_t_card', 'cf_t_trinket',
+         'cf_t_pedestal', 'cf_t_locked', 'cf_t_shop', 'cf_t_treasure', 'cf_t_cleared', 'cf_t_random',
+         # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
          'np_runs', 'np_removed')
@@ -213,6 +227,25 @@ class TokSamplerConfig:
     # 2026-10-11 (train_tok --memory gru): the policy's GRU state size; with teacher_v2 the lanes and the V2 ring then
     # carry states too (tok_teacher2.attach_v2_mem). 0: nothing changes
     memory_dim: int = 0
+    # B34 (2026-10-16, the counterfactual branch teacher, tok_cf.py; floor / run modes, training only, needs
+    # teacher_thread; off = nothing changes): choice points (first sight of pickups / pedestals / locked doors with a
+    # key / shop and treasure doors, a cleared room with >= 2 doors, random records) within a per-worker quota,
+    # branches (taken, target, sticky high-temperature) through the worker's lane (teacher v2's machinery), the
+    # improving branch's first records into the V2 ring
+    cf: bool = False
+    cf_points: float = 6.0                        # choice points per worker per game hour at most (the quota's rate)
+    cf_branches: int = 4                          # K branches a point compares, taken among them
+    cf_seconds: float = 180.0                     # a branch's game-time cap (then gamma^T V_global)
+    cf_target_seconds: float = 20.0               # the target / sticky intents' game-time cap (then the policy)
+    cf_margin: float = 0.3                        # best - taken must exceed this (and the replicate's spread)
+    cf_cap: float = 2.0                           # an imitation record's weight: min(best - taken, this)
+    cf_distill_steps: int = 8                     # the improving branch's first records distilled
+    cf_random: float = 1.0                        # random choice points per game hour of play
+    cf_queue: int = 8                             # choice points waiting per worker (each holds its room's parked entry)
+    cf_gamma: float = 0.999                       # the score's discount (train_tok: --gamma-global with a global token)
+    cf_vglobal: bool = False                      # the cut's bootstrap: value_global (True) or the value
+    cf_sticky_eps: float = 0.25                   # the sticky intents' share of uniform re-picks ("high temperature")
+    temporal_dim: int = 0                         # B34: the temporal transformer's width D (temporal models; 0: none)
     mode: str = 'room'                          # 'room': one room per episode; 'floor' / 'run': tok_floor.py
     items: bool = False                           # 2026-10-06: the bridge's lean_items, ROW's item fields, 5 actions
     run_seconds: float = 1800.0                   # run: an episode's time limit (game seconds)
@@ -1259,9 +1292,11 @@ class TokSampler:
         v2_names = None
         self.lane_rows = self.lane_io = self.lane_out = self.main_value = self.v2_rows = self.v2_meta = None
         self.main_h = self.lane_h = self.v2_h = None   # 2026-10-11 (memory, with teacher v2)
+        self.main_vg = self.cf_snap = self.lane_t = self.v2_t = None   # B34 (the counterfactual teacher)
         self.lane_ready = []
         self._lanes = {}
-        if cfg.teacher_v2 and cfg.mode in ('floor', 'run') and not cfg.eval_seeds:
+        cf_on = bool(getattr(cfg, 'cf', False)) and cfg.mode in ('floor', 'run') and not cfg.eval_seeds
+        if (cfg.teacher_v2 or cf_on) and cfg.mode in ('floor', 'run') and not cfg.eval_seeds:
             from .tok_teacher2 import attach_v2, v2_sizes
             more = [shared_memory.SharedMemory(create=True, size=s) for s in v2_sizes(n)]
             v2_names = [b.name for b in more]
@@ -1282,6 +1317,20 @@ class TokSampler:
                 attached, self.main_h, self.lane_h, self.v2_h = attach_v2_mem(v2_names[6:], n, cfg.memory_dim)
                 self.main_h[:] = 0
                 self.lane_h[:] = 0
+                self.attached += attached
+            t_dim = int(getattr(cfg, 'temporal_dim', 0) or 0)
+            if cf_on or t_dim:   # B34: value_global of the main records, the snapshot requests, the lanes' temporal outputs
+                from .tok_cf import attach_cf, cf_names_offset, cf_sizes
+                more = [shared_memory.SharedMemory(create=True, size=s) for s in cf_sizes(n, t_dim)]
+                assert len(v2_names) == cf_names_offset(cfg)
+                v2_names = v2_names + [b.name for b in more]
+                self.blocks += more
+                attached, self.main_vg, self.cf_snap, self.lane_t, self.v2_t = attach_cf(
+                    v2_names[cf_names_offset(cfg):], n, t_dim)
+                self.main_vg[:] = 0
+                self.cf_snap[:] = 0
+                if self.lane_t is not None:
+                    self.lane_t[:] = 0
                 self.attached += attached
         self.stats[:] = 0
         self.control[:] = 0
@@ -1374,15 +1423,17 @@ class TokSampler:
             except OSError:
                 pass
 
-    def v2_records(self, with_h=False):
+    def v2_records(self, with_h=False, with_t=False):
         """The teacher-v2 imitation records written since the last call: (rows, meta [n, V2_META]); None without.
         with_h (2026-10-11, memory): (rows, meta, h [n, memory_dim] float32: each record's GRU input state; zeros where
-        the ring has none)."""
+        the ring has none). with_t (B34, temporal lanes): one more element last, t [n, 2 D + 2] float32 (each record's
+        lane step outputs o_prev, has, o: tok_cf.t_split; zeros where the ring has none)."""
         if self.v2_rows is None:
             return None
         from .tok_teacher2 import V2_META, V2_RING
-        rows, meta, hs = [], [], []
+        rows, meta, hs, ts = [], [], [], []
         dim = int(self.cfg.memory_dim)
+        tw = self.v2_t.shape[2] if self.v2_t is not None else 0
         for i in range(self.cfg.workers):
             count = int(self.stats[i, ST['v2_records']])
             first = max(int(self.v2_seen[i]), count - V2_RING)
@@ -1391,12 +1442,16 @@ class TokSampler:
                 meta.append(self.v2_meta[i, c % V2_RING].copy())
                 if with_h:
                     hs.append(self.v2_h[i, c % V2_RING].copy() if self.v2_h is not None else np.zeros(dim, np.float32))
+                if with_t:
+                    ts.append(self.v2_t[i, c % V2_RING].copy() if self.v2_t is not None else np.zeros(tw, np.float32))
             self.v2_seen[i] = count
         if not rows:
             out = np.zeros((0,), ROW), np.zeros((0, V2_META), np.float64)
-            return out + (np.zeros((0, dim), np.float32),) if with_h else out
+            out = out + (np.zeros((0, dim), np.float32),) if with_h else out
+            return out + (np.zeros((0, tw), np.float32),) if with_t else out
         out = np.stack(rows), np.stack(meta)
-        return out + (np.stack(hs).astype(np.float32),) if with_h else out
+        out = out + (np.stack(hs).astype(np.float32),) if with_h else out
+        return out + (np.stack(ts).astype(np.float32),) if with_t else out
 
     def _drop(self, c):
         if c in self.live:
@@ -1550,6 +1605,7 @@ class TokSampler:
         self.lab_jobs = self.lab_res = None
         self.lane_rows = self.lane_io = self.lane_out = self.main_value = self.v2_rows = self.v2_meta = None
         self.main_h = self.lane_h = self.v2_h = None
+        self.main_vg = self.cf_snap = self.lane_t = self.v2_t = None
         for b in self.attached:
             b.close()
         for b in self.blocks:

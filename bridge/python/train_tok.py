@@ -93,6 +93,17 @@ Teacher v2 (2026-10-10, isaac_bridge/tok_teacher2.py, rl/docs/SCALING_THESIS.md 
   (v2_improving_share, v2_gain0_mean, v2_spread_mean) and, on the records new to this update before it trains on them,
   v2_prior (mean log pi of the best branch's first move), v2_prior_p, v2_verr (V - G): the acceptance test is v2_prior
   rising and v2_improving_share falling over training.
+Counterfactual branch teacher (B34, 2026-10-16, isaac_bridge/tok_cf.py, rl/docs/COUNTERFACTUAL_TEACHER.md; --cf 1 with
+  --teacher-thread 1, floor / run modes; off by default, then nothing changes): teacher v2's machinery (lanes, the V2
+  ring and its loss, the --teacher-v2-buffer / -batch / -reuse / -coef / -vf / -weight settings) at choice points
+  (first sight of pickups / pedestals / locked doors with a key / shop and treasure doors, a cleared room with >= 2
+  doors, random records; --cf-points per worker per game hour) with the branches taken / target / sticky
+  high-temperature over --cf-seconds, scored with value_global's bootstrap; the improving branch's first
+  --cf-distill-steps records are imitation records (kind KIND_CF), --cf-advantage 1 the first one a clipped
+  policy-gradient term instead. Temporal models (B34 lifts B30's refusal of teacher v2 too): the lanes have a
+  TemporalState of their own, a choice point's branches start from a device copy of the worker's slot before the point's
+  record (the snapshot bank, cf_snap), the lane answers carry (o_{t-1}, has, o_t) and the learner reads the imitation
+  records' readout from them (temporal 'stored' / 'tail'). progress.csv cf_* (cf_prior, cf_improving_share, ...).
 Memory (2026-10-11, --memory gru --memory-dim D --memory-bptt T; off by default, then nothing changes; rl/docs/
   SCALING_THESIS.md S5b; TokPolicy memory): a GRU state per worker carried by the actor (a table on the GPU, zeroed only
   at an episode's first record: not at a room or floor change), the input state of each decision stored in the rollout
@@ -873,6 +884,34 @@ def main():
                    help='how often an imitation record is used in all (as --teach-reuse)')
     p.add_argument('--teacher-v2-buffer', type=int, default=30000,
                    help='imitation records kept (the newest; on the GPU as record bytes, ~20 KB each)')
+    # B34 (2026-10-16, the counterfactual branch teacher, isaac_bridge/tok_cf.py, rl/docs/COUNTERFACTUAL_TEACHER.md;
+    # floor / run modes, needs --teacher-thread 1; teacher v2's lanes, ring and loss (--teacher-v2-buffer / -batch /
+    # -reuse / -coef / -vf / -weight) are reused; --teacher-v2 itself may stay off)
+    p.add_argument('--cf', type=int, default=0,
+                   help='1: the counterfactual branch teacher: at choice points (first sight of pickups / pedestals / '
+                        'locked doors with a key / shop and treasure doors, a cleared room with >= 2 doors, random '
+                        'records) K branches (the episode\'s own, toward the target, sticky high-temperature) from '
+                        'the same state and random numbers; the improving branch\'s first records become weighted '
+                        'imitation records. 0: off, nothing changes')
+    p.add_argument('--cf-points', type=float, default=6.0, help='choice points per worker per game hour at most')
+    p.add_argument('--cf-branches', type=int, default=4, help='branches per point, the episode\'s own (taken) among them')
+    p.add_argument('--cf-seconds', type=float, default=180.0,
+                   help="a branch's game-time cap (then gamma^T V_global; the floor's end comes first)")
+    p.add_argument('--cf-target-seconds', type=float, default=20.0,
+                   help='the target branch walks toward its target this long at most (then the policy); also the '
+                        'sticky branches\' high-temperature span')
+    p.add_argument('--cf-margin', type=float, default=0.3,
+                   help='best - taken (discounted return units) a point needs (and more than its replicate\'s spread)')
+    p.add_argument('--cf-cap', type=float, default=2.0, help="an imitation record's weight: min(best - taken, cap)")
+    p.add_argument('--cf-distill-steps', type=int, default=8,
+                   help="the improving branch's first records that become imitation records")
+    p.add_argument('--cf-random', type=float, default=1.0, help='random choice points per game hour of play')
+    p.add_argument('--cf-advantage', type=int, default=0,
+                   help='1: the first imitation record of an improving point (the choice point itself) gets a clipped '
+                        'policy-gradient term with the constant advantage best - taken instead of the imitation term')
+    p.add_argument('--cf-queue', type=int, default=8, help='choice points waiting per worker (the oldest make room)')
+    p.add_argument('--cf-sticky-eps', type=float, default=0.25,
+                   help="the sticky branches' share of uniform move re-picks (the \"high temperature\")")
     # 2026-10-07: counterfactual branches at decision points (isaac_bridge/tok_branch.py; floor / run modes)
     p.add_argument('--branch-share', type=float, default=0.0,
                    help="share of a worker's wall time spent on branch points (0: off, nothing changes)")
@@ -1149,6 +1188,14 @@ def main():
             p.error('--teacher-v2 needs --mode floor/run')
         if not args.teacher_thread:
             p.error('--teacher-v2 needs --teacher-thread 1 (its searches run in the workers\' search threads)')
+    if args.cf:   # B34 (the counterfactual teacher)
+        if args.mode not in ('floor', 'run'):
+            p.error('--cf needs --mode floor/run')
+        if not args.teacher_thread:
+            p.error('--cf needs --teacher-thread 1 (its points run in a thread of each worker; --teacher-fork 1: in '
+                    'forked children)')
+        if args.cf_branches < 2:
+            p.error('--cf-branches must be >= 2 (taken and at least one more)')
     recompute = args.recompute_values == 'on' or (args.recompute_values == 'auto' and args.overlap)
     if args.switch_interval > 0:
         sys.setswitchinterval(args.switch_interval)
@@ -1250,8 +1297,8 @@ def main():
             p.error('--temporal-bptt must be >= 1')
         if mem_on and (T_t < T_mem or T_t % T_mem):
             p.error('--temporal-bptt must be a multiple of --memory-bptt')
-        if args.branch_share > 0 or args.teacher_v2:
-            p.error('--temporal 1: branches (--branch-share) and teacher v2 are not supported (v1)')
+        if args.branch_share > 0:   # (B34: teacher v2 / --cf run with the lanes' temporal state)
+            p.error('--temporal 1: branches (--branch-share) are not supported (v1)')
         tok_kw.update(temporal=True, temporal_width=args.temporal_width, temporal_layers=args.temporal_layers,
                       temporal_heads=args.temporal_heads, temporal_window=args.temporal_window,
                       temporal_rooms=args.temporal_rooms)
@@ -1338,6 +1385,12 @@ def main():
                            teacher_v2_queue=args.teacher_v2_queue,
                            teacher_v2_depths=tuple(int(v) for v in args.teacher_v2_depths.split(',') if v.strip()),
                            memory_dim=mem_dim,
+                           cf=bool(args.cf) and floor, cf_points=args.cf_points, cf_branches=args.cf_branches,
+                           cf_seconds=args.cf_seconds, cf_target_seconds=args.cf_target_seconds,
+                           cf_margin=args.cf_margin, cf_cap=args.cf_cap, cf_distill_steps=args.cf_distill_steps,
+                           cf_random=args.cf_random, cf_queue=args.cf_queue, cf_sticky_eps=args.cf_sticky_eps,
+                           cf_gamma=args.gamma_global if gtok_on else args.gamma, cf_vglobal=gtok_on,
+                           temporal_dim=int(args.temporal_width) if (t_on and (args.cf or args.teacher_v2)) else 0,
                            bridge_lua=default_bridge_lua(), preload=default_preload(),
                            stub_list=stub if stub and Path(stub).is_file() else '')
     print('instances: stub list', cfg.stub_list or '(the launch mode\'s own)', '| environment',
@@ -1604,10 +1657,30 @@ def main():
     free = list(actors)
     # 2026-10-10 (teacher v2): the workers' lanes are answered by a GraphActor of their own (the actor's weights; the
     # lane records never enter the rollout); the eager path for what it cannot take
-    v2_on = bool(args.teacher_v2) and getattr(sampler, 'lane_rows', None) is not None
+    # B34 (2026-10-16): the lanes, the V2 ring and its loss serve the counterfactual teacher (--cf) too
+    v2_on = bool(args.teacher_v2 or args.cf) and getattr(sampler, 'lane_rows', None) is not None
+    cf_on = bool(args.cf) and v2_on
     lane_table = torch.zeros((n, mem_dim), device=device) if (mem_on and v2_on) else None
+    # B34 (temporal models): the lanes' own temporal state (a slot per worker: a branch starts from a copy of its
+    # point's snapshot, TemporalState.copy_slot_, or a reset state), the bank of the choice points' snapshots (the
+    # worker's main slot before the point's record, copied when the worker asks: cf_snap) and device rows for the lane
+    # steps' outputs (GraphActor tdest: o_t goes back to the worker with o_{t-1} and has for the imitation records)
+    lane_tstate = bank_tstate = lane_tdest = None
+    if t_on and v2_on:
+        t_kdt = torch.bfloat16 if args.temporal_kv == 'bf16' else torch.float32
+        lane_tstate = TemporalState(model, n, device, t_kdt)
+        lane_tdest = dict(kv=torch.zeros((n, args.temporal_layers, 2, args.temporal_width), dtype=t_kdt, device=device),
+                          s=torch.zeros((n, args.temporal_width), dtype=t_kdt, device=device),
+                          o=torch.zeros((n, args.temporal_width), device=device), obase=0)
+        if cf_on:
+            from isaac_bridge.tok_cf import bank_rows
+            bank_tstate = TemporalState(model, n * bank_rows(cfg), device, t_kdt)
+        print(f'lanes (B34): temporal state per lane ({lane_tstate.kv.numel() * lane_tstate.kv.element_size() / 2 ** 20:.0f}'
+              f' MiB)' + (f', choice-point snapshot bank {n} x {bank_rows(cfg)} rows '
+                          f'({bank_tstate.kv.numel() * bank_tstate.kv.element_size() / 2 ** 20:.0f} MiB)'
+                          if bank_tstate is not None else ''), flush=True)
     lane_actor = GraphActor(model, n, g_ents, stream=torch.cuda.Stream(priority=-5), crn=False,
-                            memory=lane_table, **gkw) if v2_on and use_graphs else None
+                            memory=lane_table, temporal=lane_tstate, **gkw) if v2_on and use_graphs else None
 
     def mem_rows(table, idx, reset):
         """(memory) the GRU states of workers idx from a table (zero where reset, a bool array, is set)."""
@@ -1653,13 +1726,18 @@ def main():
                  c_hold=np.zeros(args.choice_buffer, bool),
                  c_boot=np.ones((args.choice_buffer, max(n_choice, 1)), np.float32), noise={})
         crng = np.random.default_rng([args.seed, 77])
-    if args.teacher_v2:   # 2026-10-10 (teacher v2): the imitation records' ring (bytes and per-record targets on the
-        #                   GPU, entity / door counts on the host for the minibatch planning)
+    if args.teacher_v2 or args.cf:   # 2026-10-10 (teacher v2; B34: and the cf's): the imitation records' ring (bytes
+        #                              and per-record targets on the GPU, entity / door counts on the host for the
+        #                              minibatch planning)
         from isaac_bridge.tok_teacher2 import VI as V2I, teacher_v2_loss
         L.update(v2_cnt=np.zeros((args.teacher_v2_buffer,), np.dtype([('n_ent', ROW.fields['n_ent'][0]),
                                                                        ('n_doors', ROW.fields['n_doors'][0])] +
                                                                       ([('n_item', np.int16)] if NI_f else []))),
-                 v2_n=0, v2_at=0, v2_rate=None, v2_raw=None)
+                 v2_n=0, v2_at=0, v2_rate=None, v2_raw=None,
+                 # B34: per record (host) has (the lane's step had an earlier one: the history token of a packed plan)
+                 v2_has=np.zeros(args.teacher_v2_buffer, bool))
+        from isaac_bridge.tok_teacher2 import KIND_CF
+        from isaac_bridge.tok_cf import TRIGGERS as CF_TRIGGERS, t_split
         v2_rng = np.random.default_rng([args.seed, 0x7E2])   # its own: the teacher's draws stay as without
     target_decisions = decisions_total + int(args.game_hours / hours_per_decision)
     start_decisions = decisions_total
@@ -1919,10 +1997,10 @@ def main():
         vacc = torch.zeros(3, device=device)   # teacher v2: mean(-w logp), mean((V - G)^2), mean(logp) (sums)
         v2_steps = 0
         if v2_on and job.get('v2') is not None:
-            if mem_on:   # (memory: and each record's GRU input state, from the lane)
-                v_rows, v_meta, v_hs = job['v2']
-            else:
-                v_rows, v_meta = job['v2']
+            got_v = job['v2']   # (rows, meta[, GRU input states (memory)][, temporal outputs (B34, temporal)])
+            v_rows, v_meta = got_v[:2]
+            v_hs = got_v[2] if mem_on else None
+            v_ts = got_v[-1] if (t_on and got_v[-1].shape[-1] == 2 * args.temporal_width + 2) else None
             v2_new = len(v_rows)
             B_ = args.teacher_v2_buffer
             if v2_new:
@@ -1930,16 +2008,28 @@ def main():
                 act_v = v_meta[:, V2I['act0']:V2I['act0'] + nh].astype(np.int64)
                 G_v = v_meta[:, V2I['ret']].astype(np.float32)
                 first_v = v_meta[:, V2I['j']] == 0
+                is_cf = v_meta[:, V2I['kind']] == KIND_CF   # B34: the counterfactual teacher's records
+                if v_ts is not None:   # B34 (temporal): each record's stored lane outputs (o_prev, has, o, valid)
+                    v_op, v_has, v_o = t_split(v_ts, args.temporal_width)
+                    v_valid = v_ts[:, -1] > 0.5
+                    v_has = v_has & v_valid
                 lp_all, lp_mv, val_v = [], [], []
                 with torch.inference_mode():
                     for at in range(0, v2_new, 512):
                         b_ = to_batch(v_rows[at:at + 512], pend_v[at:at + 512], device)
+                        tk_v = {}
+                        if v_ts is not None:   # (B34: the readout from the lane's stored o, like the actor's)
+                            sl_ = slice(at, at + 512)
+                            tk_v = dict(temporal=dict(mode='stored', o=torch.from_numpy(v_o[sl_] * v_valid[sl_, None]).to(device),
+                                                      o_prev=torch.from_numpy(v_op[sl_]).to(device),
+                                                      has=torch.from_numpy(v_has[sl_]).to(device),
+                                                      m=torch.from_numpy(v_valid[sl_]).to(device)))
                         with autocast():
                             if mem_on:
                                 lg_, vv_, _ = learner_model(b_, packed=bool(args.packed), mem=torch.from_numpy(
-                                    v_hs[at:at + 512]).to(device))[:3]
+                                    v_hs[at:at + 512]).to(device), **tk_v)[:3]
                             else:
-                                lg_, vv_, _ = learner_model(b_, packed=bool(args.packed))
+                                lg_, vv_, _ = learner_model(b_, packed=bool(args.packed), **tk_v)
                         a_ = torch.from_numpy(act_v[at:at + 512]).to(device)
                         lp_all.append(learner_model.log_prob(lg_, learner_model.gate(b_), a_)[0].float())
                         lp_mv.append(torch.log_softmax(lg_.float()[:, :9], -1).gather(-1, a_[:, :1])[:, 0])
@@ -1947,11 +2037,25 @@ def main():
                 lp_all = torch.cat(lp_all).cpu().numpy()
                 lp_mv = torch.cat(lp_mv).cpu().numpy()
                 val_v = torch.cat(val_v).cpu().numpy()
-                if first_v.any():
-                    v2_log.update(v2_prior=float(lp_mv[first_v].mean()), v2_prior_p=float(np.exp(lp_mv[first_v]).mean()),
-                                  v2_prior_all=float(lp_all[first_v].mean()), v2_firsts=int(first_v.sum()),
-                                  v2_new_gain=float(v_meta[first_v, V2I['gain']].mean()),
-                                  v2_new_spread=float(v_meta[first_v, V2I['spread']].mean()))
+                f_v2 = first_v & ~is_cf   # (teacher v2's own points; B34: the cf's apart)
+                if f_v2.any():
+                    v2_log.update(v2_prior=float(lp_mv[f_v2].mean()), v2_prior_p=float(np.exp(lp_mv[f_v2]).mean()),
+                                  v2_prior_all=float(lp_all[f_v2].mean()), v2_firsts=int(f_v2.sum()),
+                                  v2_new_gain=float(v_meta[f_v2, V2I['gain']].mean()),
+                                  v2_new_spread=float(v_meta[f_v2, V2I['spread']].mean()))
+                f_cf = first_v & is_cf   # B34: cf_prior = log pi of the improving branch's first move (rising = taken in)
+                if f_cf.any():
+                    v2_log.update(cf_prior=float(lp_mv[f_cf].mean()), cf_prior_p=float(np.exp(lp_mv[f_cf]).mean()),
+                                  cf_prior_all=float(lp_all[f_cf].mean()), cf_firsts=int(f_cf.sum()),
+                                  cf_new_gain=float(v_meta[f_cf, V2I['gain']].mean()),
+                                  cf_new_spread=float(np.nanmean(v_meta[f_cf, V2I['spread']])),
+                                  cf_new_target=float((v_meta[f_cf, V2I['intent']] == 10).mean()))
+                    for k_t, name_t in enumerate(CF_TRIGGERS):   # (per trigger type: the prior of its points)
+                        m_t = f_cf & (v_meta[:, V2I['trig']] == k_t + 1)
+                        if m_t.any():
+                            v2_log[f'cf_prior/{name_t}'] = float(lp_mv[m_t].mean())
+                if is_cf.any():
+                    v2_log.update(cf_verr=float((val_v[is_cf] - G_v[is_cf]).mean()), cf_new=int(is_cf.sum()))
                 v2_log.update(v2_prior_move_all=float(lp_mv.mean()), v2_verr=float((val_v - G_v).mean()),
                               v2_verr_abs=float(np.abs(val_v - G_v).mean()))
                 at_v = (L['v2_at'] + np.arange(v2_new)) % B_
@@ -1966,7 +2070,28 @@ def main():
                     L['v2_G'] = torch.zeros(B_, dtype=torch.float32, device=device)
                     if mem_on:   # (memory) the records' GRU input states
                         L['v2_h'] = torch.zeros((B_, mem_dim), dtype=torch.float32, device=device)
+                    if t_on:   # B34 (temporal) the records' stored lane outputs: o_prev, o (has and valid on the host)
+                        L['v2_op'] = torch.zeros((B_, args.temporal_width), dtype=torch.float32, device=device)
+                        L['v2_o'] = torch.zeros((B_, args.temporal_width), dtype=torch.float32, device=device)
+                        L['v2_m'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                    # B34 (--cf-advantage 1): the constant advantage of a cf point's first record (0 elsewhere) and
+                    # the learner's log-probability of its action at arrival (the clip's reference)
+                    L['v2_adv'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                    L['v2_lp0'] = torch.zeros(B_, dtype=torch.float32, device=device)
                 at_d = torch.from_numpy(at_v).to(device)
+                if t_on:
+                    if v_ts is not None:
+                        L['v2_op'][at_d] = torch.from_numpy(np.ascontiguousarray(v_op, np.float32)).to(device)
+                        L['v2_o'][at_d] = torch.from_numpy(np.ascontiguousarray(v_o, np.float32)).to(device)
+                        L['v2_m'][at_d] = torch.from_numpy(v_valid.astype(np.float32)).to(device)
+                        L['v2_has'][at_v] = v_has
+                    else:
+                        L['v2_m'][at_d] = 0.0
+                        L['v2_has'][at_v] = False
+                adv_new = np.where(first_v & is_cf, v_meta[:, V2I['gain']], 0.0) if args.cf_advantage else \
+                    np.zeros(v2_new)
+                L['v2_adv'][at_d] = torch.from_numpy(adv_new.astype(np.float32)).to(device)
+                L['v2_lp0'][at_d] = torch.from_numpy(lp_all.astype(np.float32)).to(device)
                 if mem_on:
                     L['v2_h'][at_d] = torch.from_numpy(np.ascontiguousarray(v_hs, np.float32)).to(device)
                 L['v2_raw'][at_d] = torch.from_numpy(
@@ -2178,6 +2303,22 @@ def main():
         def pmean(x, pm, pn):
             """The mean over a part's rows: x.mean() (as before), or (memory) over its trained rows only."""
             return x.mean() if pm is None else (x * pm).sum() / pn
+
+        def v2_terms(lp_v, val_v, vpick_d, v_w, v_G, v_share, adv_std, n_sel):
+            """Teacher v2's loss on drawn imitation records (tok_teacher2.teacher_v2_loss); B34 --cf-advantage 1: the
+            cf points' first records (their v2_adv != 0) get a clipped policy-gradient term with that constant
+            advantage (in the minibatch's advantage units; ratio to the learner's policy at the record's arrival)
+            instead of the imitation term."""
+            if not args.cf_advantage:
+                return teacher_v2_loss(lp_v, val_v, v_w, v_G, v_share, args.teacher_v2_coef, args.teacher_v2_vf)
+            adv_ = L['v2_adv'].index_select(0, vpick_d)
+            use_ = (adv_ != 0).float()
+            vloss_, vstats_ = teacher_v2_loss(lp_v, val_v, v_w * (1.0 - use_), v_G, v_share, args.teacher_v2_coef,
+                                              args.teacher_v2_vf)
+            ratio_ = torch.exp(lp_v.float() - L['v2_lp0'].index_select(0, vpick_d))
+            a_ = adv_ / (adv_std + 1e-8)
+            pg_ = -(use_ * torch.min(ratio_ * a_, torch.clamp(ratio_, 1 - args.clip, 1 + args.clip) * a_)).sum()
+            return vloss_ + args.teacher_v2_weight * pg_ / n_sel, vstats_
         pm = pn = n_sel = None
         t_table = None
         for _ in range(args.epochs):
@@ -2320,8 +2461,11 @@ def main():
                             ni_p = np.concatenate([ni_p, L['v2_cnt']['n_item'][vpick]])
                     if xplan:   # (B24: the real item tokens and the global token in the plans)
                         xplan['n_item'] = ni_p
-                    if t_on:   # (B31: the history token where a previous step exists; none for the teachers' records)
+                    if t_on:   # (B31: the history token where a previous step exists; none for the teachers' records;
+                        #         B34: teacher v2's / the cf's records from their lane's step)
                         xplan['hist'] = np.concatenate([has_h[part_h], np.zeros(len(ne_p) - len(part_h), bool)])
+                        if vmerged:
+                            xplan['hist'][len(ne_p) - len(vpick):] = L['v2_has'][vpick]
                     if args.packed and fast:   # B18: + the entity positions and the attention buckets, one copy
                         plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets, **xplan)
                         hn = ['rec', 'base']
@@ -2368,6 +2512,16 @@ def main():
                                 tk_ = dict(temporal=dict(mode='chunk', plan=temporal_part(
                                     TD, np.asarray(cids_), tch[cids_, 1], t_rows['ep'][part], t_table, dev),
                                     o_prev=t_rows['o_prev'][part], has=t_rows['has'][part]))
+                                if vmerged:   # B34: the imitation records' stored lane outputs (the teacher's: none)
+                                    n_tb = len(pick) if merged else 0
+                                    z_ = torch.zeros((n_tb, args.temporal_width), device=device)
+                                    tk_['temporal']['tail'] = dict(
+                                        o_prev=torch.cat([z_, L['v2_op'].index_select(0, vpick_d)]),
+                                        has=torch.cat([torch.zeros(n_tb, dtype=torch.bool, device=device),
+                                                       dev(L['v2_has'][vpick]).bool()]),
+                                        o=torch.cat([z_, L['v2_o'].index_select(0, vpick_d)]),
+                                        m=torch.cat([torch.zeros(n_tb, device=device),
+                                                     L['v2_m'].index_select(0, vpick_d)]))
                             outs_ = learner_model(mb, packed=bool(args.packed), mem=memd,
                                                   **(dict(need_vg=True) if glob_loss else {}), **tk_)
                         else:
@@ -2408,8 +2562,7 @@ def main():
                         o_ = k_ + (len(pick) if merged else 0)
                         lp_v, _ = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
                             logits_[o_:], learner_model.gate(mb)[o_:], v_act)
-                        vloss, vstats = teacher_v2_loss(lp_v, value_[o_:], v_w, v_G, v_share, args.teacher_v2_coef,
-                                                        args.teacher_v2_vf)
+                        vloss, vstats = v2_terms(lp_v, value_[o_:], vpick_d, v_w, v_G, v_share, adv_std, n_sel)
                         loss = loss + vloss
                     loss.backward()
                     with torch.no_grad():
@@ -2452,11 +2605,16 @@ def main():
                     teach_steps += 1
                     sec('teach')
                 if vb is not None and not args.teach_merge:   # 2026-10-10 (teacher v2): a pass of its own
+                    tk_v = {}
+                    if t_on:   # B34: their stored lane outputs (the readout and the history token)
+                        tk_v = dict(temporal=dict(mode='stored', o=L['v2_o'].index_select(0, vpick_d),
+                                                  o_prev=L['v2_op'].index_select(0, vpick_d),
+                                                  has=dev(L['v2_has'][vpick]).bool(),
+                                                  m=L['v2_m'].index_select(0, vpick_d)))
                     with autocast():
-                        v_logits, v_value, _ = learner_model(vb, packed=bool(args.packed), mem=v_h)[:3]
+                        v_logits, v_value, _ = learner_model(vb, packed=bool(args.packed), mem=v_h, **tk_v)[:3]
                     lp_v, _ = learner_model.log_prob(v_logits, learner_model.gate(vb), v_act)
-                    vloss, vstats = teacher_v2_loss(lp_v, v_value, v_w, v_G, v_share, args.teacher_v2_coef,
-                                                    args.teacher_v2_vf)
+                    vloss, vstats = v2_terms(lp_v, v_value, vpick_d, v_w, v_G, v_share, adv_std, n_sel)
                     vloss.backward()
                     with torch.no_grad():
                         vacc += vstats
@@ -2615,6 +2773,32 @@ def main():
             row['v2_logp'] = vacc_c[2] / v2_steps if v2_steps else ''
             row['v2_lane_calls'], row['v2_lane_rows'] = lane_stat['calls'], lane_stat['rows']
             row['v2_lane_s'] = lane_stat['s']
+        if cf_on:   # B34 (the counterfactual teacher): worker totals, this update's window, the trainer's side
+            from isaac_bridge.tok_cf import TRIGGERS as CF_TRIGGERS
+            keys_c = [k_c for k_c in ST if k_c.startswith('cf_')]
+            tot_c = {k_c: float(stats[:, ST[k_c]].sum()) for k_c in keys_c}
+            prev_c = L.get('cf_prev') or dict.fromkeys(tot_c, 0.0)
+            d_c = {k_c: tot_c[k_c] - prev_c[k_c] for k_c in tot_c}
+            L['cf_prev'] = tot_c
+            for k_c in keys_c:
+                if not k_c.startswith('cf_t_'):
+                    row[k_c] = tot_c[k_c]
+            for name_t in CF_TRIGGERS:   # points searched per trigger type (totals)
+                row[f'cf_points/{name_t}'] = tot_c['cf_t_' + name_t]
+            done_c = d_c['cf_done']
+            row['cf_points_w'] = d_c['cf_points']
+            row['cf_improving_share'] = d_c['cf_improving'] / done_c if done_c > 0 else ''
+            row['cf_gain0_mean'] = d_c['cf_gain0'] / done_c if done_c > 0 else ''
+            row['cf_taken_mean'] = d_c['cf_taken'] / done_c if done_c > 0 else ''
+            row['cf_spread_mean'] = d_c['cf_spread'] / d_c['cf_reps'] if d_c['cf_reps'] > 0 else ''
+            row['cf_cpu_per_point'] = d_c['cf_cpu'] / d_c['cf_points'] if d_c['cf_points'] > 0 else ''
+            row['cf_wait_per_point'] = d_c['cf_wait_s'] / d_c['cf_points'] if d_c['cf_points'] > 0 else ''
+            row['cf_dec_w'] = d_c['cf_dec']   # branch decisions this window (vs the update's own decisions)
+            row['cf_game_hours'] = tot_c['cf_frames'] / 30 / 3600
+            row['cf_snaps'] = prof.get('cf_snaps', 0)
+            for k_v in ('cf_prior', 'cf_prior_p', 'cf_prior_all', 'cf_firsts', 'cf_new_gain', 'cf_new_spread',
+                        'cf_new_target', 'cf_verr', 'cf_new') + tuple(f'cf_prior/{t_}' for t_ in CF_TRIGGERS):
+                row[k_v] = v2_log.get(k_v, '')
         if char_ids:   # 2026-10-08 (characters): floor starts built as non-Isaac (worker totals) and, per character,
             #            this update's finished episodes and their floor clears
             row['char_starts'] = float(stats[:, ST['char_starts']].sum())
@@ -2788,24 +2972,55 @@ def main():
                                        torch.from_numpy(np.ascontiguousarray(lane_h[j_l, :mem_dim])).to(device))
                 torch.cuda.current_stream().synchronize()   # (done before the lane actor's stream reads the table)
                 lane_h[j_l, mem_dim] = 0.0
-        got = lane_actor.act(rows_l, pend_l, *((idx_l, None) if mem_on else ())) if lane_actor is not None else None
+        sl_d = op_l = has_l = None
+        if lane_tstate is not None:   # B34 (temporal): a branch's first request sets the lane's state (the point's
+            #                           snapshot from the bank, or a reset state); o_{t-1} and has before the step
+            sl_d = torch.from_numpy(np.ascontiguousarray(idx_l, np.int64)).to(device)
+            beg = sampler.lane_io[idx_l, 11].astype(np.int64)
+            if (beg != 0).any():
+                pos, neg = beg > 0, beg < 0
+                if pos.any() and bank_tstate is not None:
+                    lane_tstate.copy_slot_(beg[pos] - 1, idx_l[pos], other=bank_tstate)
+                elif pos.any():
+                    lane_tstate.reset_slot_(idx_l[pos])
+                if neg.any():
+                    lane_tstate.reset_slot_(idx_l[neg])
+                sampler.lane_io[idx_l[beg != 0], 11] = 0
+            op_l = lane_tstate.prev_o.index_select(0, sl_d).float().cpu().numpy()   # (synchronises the stream)
+            has_l = (lane_tstate.steps.index_select(0, sl_d) > 0).cpu().numpy() & (rows_l['first'] == 0)
+        got = lane_actor.act(rows_l, pend_l, *((idx_l, None) if (mem_on or t_on) else ()),
+                             **(dict(tdest=dict(lane_tdest, rows=idx_l)) if t_on else {})) \
+            if lane_actor is not None else None
         h_l = lane_actor.h_used if got is not None and mem_on else None
+        vg_l = lane_actor.vg if got is not None and gtok_on else None
+        o_l = lane_tdest['o'].index_select(0, sl_d).cpu().numpy() if (got is not None and t_on) else None
         if got is None:   # (no graph, or more records than it holds: eager)
+            tk_l = dict(temporal=dict(mode='step', state=lane_tstate, slot=sl_d)) if t_on else {}
             with torch.inference_mode():
                 if mem_on:
                     h_in = mem_rows(lane_table, idx_l, None)
-                    a_l, lp_l, v_l, hn_l = model.act(to_batch(rows_l, pend_l, device), mem=h_in)
+                    out_l = model.act(to_batch(rows_l, pend_l, device), mem=h_in, need_vg=gtok_on, **tk_l)
+                    hn_l = out_l[3]
                 else:
-                    a_l, lp_l, v_l = model.act(to_batch(rows_l, pend_l, device))
+                    out_l = model.act(to_batch(rows_l, pend_l, device), need_vg=gtok_on, **tk_l)
+                a_l, lp_l, v_l = out_l[:3]
             if mem_on:
                 lane_table.index_copy_(0, torch.from_numpy(idx_l).to(device), hn_l)
                 h_l = h_in.cpu().numpy()
+            vg_l = out_l[-1].cpu().numpy() if gtok_on else None
+            if t_on:
+                o_l = tk_l['temporal']['out']['o'].float().cpu().numpy()
             got = (a_l.cpu().numpy(), lp_l.cpu().numpy(), v_l.cpu().numpy())
         a_l, lp_l, v_l = got
         if lane_h is not None:   # the input state of each answer, for the branch's imitation records
             lane_h[idx_l, :mem_dim] = h_l
+        if t_on and getattr(sampler, 'lane_t', None) is not None:   # B34: the lane step's outputs (imitation records)
+            from isaac_bridge.tok_cf import t_pack
+            sampler.lane_t[idx_l] = t_pack(op_l, has_l, o_l)
         sampler.lane_io[idx_l, 5:5 + nh] = a_l
         sampler.lane_out[idx_l, 0], sampler.lane_out[idx_l, 1], sampler.lane_out[idx_l, 2] = v_l, lp_l, version
+        sampler.lane_out[idx_l, 3] = v_l if vg_l is None else vg_l   # B34: value_global (the value without one)
+        sampler.lane_out[idx_l, 4] = sampler.lane_io[idx_l, 10]   # B34: the request's number, written last
         sampler.reply_lanes(idx_l)
         lane_stat['calls'] += 1
         lane_stat['rows'] += len(idx_l)
@@ -2854,6 +3069,8 @@ def main():
         sampler.actions[a_idx, :nh] = actions
         if v2_on:   # 2026-10-10 (teacher v2): the value of the record, for the worker's log (before the reply)
             sampler.main_value[a_idx] = value
+            if getattr(sampler, 'main_vg', None) is not None:   # B34: and its value_global (the cf's taken score)
+                sampler.main_vg[a_idx] = value if vg is None else vg
             if h is not None and getattr(sampler, 'main_h', None) is not None:   # (memory: and its input state)
                 sampler.main_h[a_idx] = h
         if aux is not None:   # (written before the reply: the worker reads it after its answer)
@@ -2924,7 +3141,7 @@ def main():
             t0 = time.perf_counter()
             cpu_c0 = cpu_ticks()
             prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=0, calls=0, rows=0, eager=0,
-                        act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0)
+                        act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0, cf_snaps=0)
             while roll.usable() < args.rollout and sampler.live:
                 if v2_on and sampler.lane_ready:   # 2026-10-10 (teacher v2): lane requests the last poll saw
                     serve_lanes()
@@ -2962,6 +3179,15 @@ def main():
                 a_idx = idx[go]
                 sub = rows if go.all() else rows[go]
                 under_way = pending[a_idx]
+                if bank_tstate is not None:   # B34: choice points' snapshots: the workers' temporal slots before these
+                    #                           records' steps into the bank rows they name (no call of theirs runs)
+                    req_s = sampler.cf_snap[a_idx]
+                    if req_s.any():
+                        m_s = req_s > 0
+                        bank_tstate.copy_slot_(a_idx[m_s], req_s[m_s] - 1, other=t_state)
+                        sampler.cf_snap[a_idx[m_s]] = 0
+                        torch.cuda.current_stream().synchronize()
+                        prof['cf_snaps'] += int(m_s.sum())
                 prof['calls'] += 1
                 prof['rows'] += len(a_idx)
                 if busy:
@@ -3053,7 +3279,7 @@ def main():
                        **lab_job,
                        teach=sampler.teacher_records() if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,
-                       v2=(sampler.v2_records(with_h=True) if mem_on else sampler.v2_records()) if v2_on else None,
+                       v2=sampler.v2_records(with_h=mem_on, with_t=t_on) if v2_on else None,
                        branch_finished=book.branch_finished,
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,

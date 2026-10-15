@@ -38,6 +38,7 @@ with the room's visited set and floor of the restore point, the room's starting 
 denominator, from the restore point's first observation) and the episode's stall counter at d (logged per record).
 abplus_probe_teacher_v2.py checks this (a branch replaying the episode's own actions = the episode's records and score).
 """
+import os
 import time
 
 import numpy as np
@@ -54,14 +55,25 @@ V2_RING = 384        # imitation records per worker the trainer may fall behind 
 # log-probability at that record, the replicate's score
 V2_FIELDS = ('pend0', 'pend1', 'pend2', 'pend3', 'pend4', 'act0', 'act1', 'act2', 'act3', 'act4', 'weight', 'ret',
              'gain', 'spread', 'taken', 'best', 'j', 'n', 'depth', 'hold', 'intent', 'kind', 'point', 'worker',
-             'version', 'value', 'logp', 'rep')
+             'version', 'value', 'logp', 'rep',
+             'trig')   # B34: the counterfactual teacher's trigger type (tok_cf.TRIGGERS index + 1; 0: teacher v2's)
 V2_META = len(V2_FIELDS)
 VI = {k: i for i, k in enumerate(V2_FIELDS)}
 KIND_HURT, KIND_FATAL, KIND_RANDOM = 1, 2, 3
+KIND_CF = 4          # B34 (2026-10-16): a counterfactual teacher's choice point (tok_cf.py)
 INTENT_STICKY = 9
+INTENT_TARGET = 10   # B34: the move toward the choice point's target (tok_cf.TargetIntent)
 END_DONE, END_DEATH, END_CAP, END_STOP = 1, 2, 3, 4
-LANE_IO = 10         # lane int32 per worker: the action under way (5, written by the worker), the answer (5, the actor)
-LANE_OUT = 4         # lane float64 per worker: the actor's value and log-probability of the answer, its weights, 0
+END_EXIT = 5         # B34 (ctx.exit_end, run mode): the floor's exit reached (the score bootstraps from that record)
+# lane int32 per worker: the action under way (5, written by the worker), the answer (5, the actor); B34: [10] the
+# request's sequence number (the worker's; the actor echoes it in LANE_OUT [4]: an answer to an older request, e.g.
+# of a search child killed while it waited, is recognised and skipped), [11] the temporal begin (written by the worker
+# before a branch's first request: the bank row + 1 of the snapshot to start from, -1: a reset state; read and cleared
+# by the actor)
+LANE_IO = 12
+# lane float64 per worker: the actor's value and log-probability of the answer, its weights, value_global (B34; the
+# value where the model has no global token), the request's sequence number (B34), 0
+LANE_OUT = 6
 
 
 def v2_sizes(workers):
@@ -104,6 +116,18 @@ def attach_v2_mem(names, workers, dim):
     return blocks, main_h, lane_h, v2_h
 
 
+def gains_of(row):
+    """(health units, coins + bombs + keys) of a record from its player token (train_tok Episodes.cur_gains)."""
+    pl = row['player'][0] if getattr(row, 'shape', ()) == (1,) else row['player']
+    return (float(np.rint(pl[7] * 12.0)),
+            float(np.rint(pl[8] * 10.0) + np.rint(pl[9] * 10.0) + np.rint(pl[10] * 50.0)))
+
+
+def gain_reward(g_prev, g, rw):
+    """B34: the trainer's heal / resource reward between two records' gains (gains only; 0 without the terms)."""
+    return rw.get('heal', 0.0) * max(g[0] - g_prev[0], 0.0) + rw.get('resource', 0.0) * max(g[1] - g_prev[1], 0.0)
+
+
 def parse_ints(text, default=()):
     """'2,4,8' -> (2, 4, 8); '' -> default."""
     out = tuple(int(v) for v in str(text or '').split(',') if v.strip())
@@ -123,28 +147,39 @@ class V2Stop(Exception):
 class V2Log:
     """The episode's per-record values the taken score needs: damage share, half hearts lost, done code, events, the
     stall counter after the record (EpisodeState.progress_t) and the actor's value of the record (answered ones); h
-    (2026-10-11, memory): the GRU input state the actor used for the record (answered ones; empty without memory)."""
-    __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value', 'h')
+    (2026-10-11, memory): the GRU input state the actor used for the record (answered ones; empty without memory);
+    vg (B34): the actor's value_global of the record (answered ones; with the counterfactual teacher only); gain_r
+    (B34, add's rw given): the trainer's heal / resource reward of the step before the record (gain_reward; 0 for the
+    episode's first record)."""
+    __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value', 'h', 'vg', 'gain_r', '_g')
 
     def __init__(self):
         self.damage, self.hurt, self.done, self.events, self.progress, self.value = [], [], [], [], [], []
         self.h = []
+        self.vg = []
+        self.gain_r, self._g = [], None
 
-    def add(self, row, done, progress):
+    def add(self, row, done, progress, rw=None):
         self.damage.append(float(row['damage'][0]))
         self.hurt.append(float(row['hurt'][0]))
         self.done.append(int(done))
         self.events.append(int(row['events'][0]))
         self.progress.append(int(progress))
+        if rw is not None:   # B34: the heal / resource term (train_tok Episodes: gains since the record before)
+            g = gains_of(row)
+            self.gain_r.append(gain_reward(self._g, g, rw) if self._g is not None else 0.0)
+            self._g = g
 
 
 class V2Point:
-    """A queued decision point of teacher v2."""
+    """A queued decision point of teacher v2 (B34: and of the counterfactual teacher, kind KIND_CF: trig its trigger
+    type, target the trigger's target (tok_cf.detect), bank its temporal snapshot's bank row or None)."""
     __slots__ = ('base', 'reseed', 'applied', 'log', 'at', 'offset', 'kind', 'seed', 'episode', 'visited', 'stage0',
-                 'pid', 'version')
+                 'pid', 'version', 'trig', 'target', 'bank')
 
     def __init__(self, **kw):
         self.pid, self.version = 0, 0
+        self.trig, self.target, self.bank = 0, None, None
         for k, v in kw.items():
             setattr(self, k, v)
 
@@ -154,8 +189,10 @@ class Intent:
     policy's sampled move kept for a geometric number of decisions of mean `mean`, from its own rng); the rest of the
     action is always the policy's, and after h decisions the policy's whole action."""
 
-    def __init__(self, kind, move=0, h=4, mean=4.0, seed=0):
+    def __init__(self, kind, move=0, h=4, mean=4.0, seed=0, eps=0.0):
         self.kind, self.move, self.h, self.mean, self.seed = kind, int(move), int(h), float(mean), int(seed)
+        self.eps = float(eps)   # B34 (sticky, the counterfactual teacher's "high temperature"): at each re-pick the
+        #                         move is uniform over the nine with this probability, else the policy's (0: as before)
         self.reset()
 
     @property
@@ -166,14 +203,17 @@ class Intent:
         self.rng = np.random.default_rng([self.seed, 0x51C])
         self.left, self.cur = 0, 0
 
-    def compose(self, j, a):
-        """The applied action of branch step j given the policy's answer a (5-tuple)."""
+    def compose(self, j, a, row=None):
+        """The applied action of branch step j given the policy's answer a (5-tuple) (row: the record answered; B34's
+        intents read it, these do not)."""
         if j >= self.h:
             return a
         if self.kind == 'hold':
             return (self.move,) + a[1:]
         if self.left <= 0:
             self.cur = a[0]
+            if self.eps > 0 and self.rng.random() < self.eps:
+                self.cur = int(self.rng.integers(9))
             self.left = int(self.rng.geometric(1.0 / max(self.mean, 1.0)))
         self.left -= 1
         return (self.cur,) + a[1:]
@@ -191,53 +231,90 @@ def candidates(cfg, rng):
 
 
 class Context:
-    """What the branches of one worker share: settings, the reward terms, the encoder, the record slot."""
+    """What the branches of one worker share: settings, the reward terms, the encoder, the record slot.
+    B34 (2026-10-16, the counterfactual teacher reuses it): seconds (None: cfg.teacher_v2_seconds) the branches' cap,
+    gamma (None: cfg.branch_gamma) the discount, boot_vg: the cap bootstraps from the actor's value_global (LanePolicy.vg)
+    instead of its value, exit_end: a record with EV_EXIT (run mode: the next floor) ends a branch (and the taken
+    window) like a cap: its reward counted, then gamma^T x the bootstrap of that record; gains: the trainer's heal /
+    resource terms are part of the score (branches: gain_reward between records; taken: the log's gain_r)."""
 
-    def __init__(self, cfg, limit, stall, run, fast_fn, group, row, rw):
+    def __init__(self, cfg, limit, stall, run, fast_fn, group, row, rw, seconds=None, gamma=None, boot_vg=False,
+                 exit_end=False, gains=False):
         from .tok_branch import parse_reward
         self.cfg, self.limit, self.stall, self.run, self.fast_fn, self.group = cfg, limit, stall, run, fast_fn, group
         self.row = row                                   # a length-1 ROW view (the lane slot, or a probe's buffer)
         self.address = row.ctypes.data
         self.rw = rw if isinstance(rw, dict) else parse_reward(rw)
-        self.gamma = float(cfg.branch_gamma)
+        self.gamma = float(cfg.branch_gamma if gamma is None else gamma)
         self.fpd, self.items, self.alarm = cfg.frames_per_decision, bool(cfg.items), cfg.clone_alarm
-        self.cap = max(1, int(round(cfg.teacher_v2_seconds * 30 / cfg.frames_per_decision)))
+        sec = cfg.teacher_v2_seconds if seconds is None else seconds
+        self.cap = max(1, int(round(sec * 30 / cfg.frames_per_decision)))
+        self.boot_vg, self.exit_end = bool(boot_vg), bool(exit_end)
+        self.gains = bool(gains) and (self.rw.get('heal', 0.0) != 0 or self.rw.get('resource', 0.0) != 0)
         self.stats = dict(branches=0, decisions=0, frames=0, replicates=0)
 
 
-def taken_score(log, d, cap, gamma, rw, run):
+def taken_score(log, d, cap, gamma, rw, run, values=None, exit_end=False, extra=None):
     """The episode's own continuation from record d over at most cap steps: (discounted return + gamma^m V(record
-    d + m) when that record is not an end, steps m). The value of a record that has none (the log broke off) is 0."""
+    d + m) when that record is not an end, steps m). The value of a record that has none (the log broke off) is 0.
+    values (B34): the bootstrap values per record (None: log.value); exit_end (B34): a record with EV_EXIT ends the
+    window like the cap (its reward counted, then its value); extra (B34): a reward per record added to the step's
+    (the log's gain_r: heal / resource)."""
+    from .tok_obs import EV_EXIT
     n = len(log.done)
+    vals = log.value if values is None else values
     g, disc, m = 0.0, 1.0, 0
     for i in range(1, cap + 1):
         t = d + i
         if t >= n:
             break
-        g += disc * step_reward(log.damage[t], log.hurt[t], log.done[t], log.events[t], rw, run)
+        g += disc * (step_reward(log.damage[t], log.hurt[t], log.done[t], log.events[t], rw, run)
+                     + (extra[t] if extra is not None and t < len(extra) else 0.0))
         disc *= gamma
         m = i
         if log.done[t]:
             return g, m
+        if exit_end and log.events[t] & EV_EXIT:
+            break
     t = d + m
-    v = log.value[t] if t < len(log.value) else 0.0
+    v = vals[t] if t < len(vals) else 0.0
     return g + disc * v, m
+
+
+def returns_to_go(rews, gamma, v_end):
+    """G [n + 1] float64 of a branch's rewards (rews[i]: the reward of the step after record i): G[n] = v_end (the
+    bootstrap at a cut, 0 at an end), G[i] = rews[i] + gamma G[i + 1]; the branch's score is G[0]."""
+    n = len(rews)
+    G = np.zeros(n + 1, np.float64)
+    G[n] = v_end
+    for i in range(n - 1, -1, -1):
+        G[i] = rews[i] + gamma * G[i + 1]
+    return G
 
 
 def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trace=None):
     """One branch from the restored clone S (in the state of record d; S itself is not changed: the branch is a fork):
     the intent composed with the policy's answers, cut at ctx.cap steps. Returns a dict: score (= G[0]), steps n, end
     code, boot (cut by the cap), v_end, and with keep the records 0 .. n-1 (rows: ROW copies, pend, act: 5-tuples,
-    ret: return-to-go, value, logp per record). trace (a list): each record's ROW copy and the reward (probes)."""
+    ret: return-to-go, value, logp per record). trace (a list): each record's ROW copy and the reward (probes).
+    B34: keep may be an int k (True: all): only the first k records are kept (the counterfactual teacher distils
+    those); the intent's compose sees the record it acts on; pt.bank (when set) names the lane's temporal snapshot
+    (policy.tbegin); with ctx.boot_vg the cap's bootstrap is the actor's value_global; with ctx.exit_end a record with
+    EV_EXIT ends the branch (END_EXIT, bootstrapped); 't' (temporal lanes): each kept record's (o_prev, has, o)."""
+    from .tok_obs import EV_EXIT
     from .tok_sampler import applied_action, lean_step, step_action
     B = S.fork(lean=True, alarm=ctx.alarm)
     intent.reset()
     out = dict(score=0.0, n=0, end=END_STOP, boot=False, v_end=0.0, frames=0)
-    rows, pends, acts, vals, lps, rews, hs = [], [], [], [], [], [], []
+    rows, pends, acts, vals, lps, rews, hs, ts = [], [], [], [], [], [], [], []
+    n_keep = (1 << 62) if keep is True else int(keep or 0)
     begin = getattr(policy, 'begin', None)
     if begin is not None:   # 2026-10-11 (memory): the branch's GRU state starts as a copy of the episode's at record d
         log_h = getattr(pt.log, 'h', None) or []
         begin(log_h[d] if d < len(log_h) else None)
+    tbegin = getattr(policy, 'tbegin', None)
+    if tbegin is not None:   # B34 (temporal): the lane's state from the snapshot of record d (None: a reset state)
+        tbegin(getattr(pt, 'bank', None))
     try:
         if reseed is not None:
             B.reseed(reseed)
@@ -264,18 +341,25 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
                 st.progress_t = pt.log.progress[d]
                 if enc is not None:
                     enc.ctx[RC_HP0], enc.ctx[RC_PROGRESS] = hp0, st.progress_t
+                g_prev = gains_of(row) if ctx.gains else None
             else:
                 rews.append(step_reward(float(row['damage'][0]), float(row['hurt'][0]), done,
                                         int(row['events'][0]), ctx.rw, ctx.run))
+                if g_prev is not None:   # B34: the heal / resource terms
+                    g_now = gains_of(row)
+                    rews[-1] += gain_reward(g_prev, g_now, ctx.rw)
+                    g_prev = g_now
             if trace is not None:
                 trace.append((row[0].copy(), rews[-1] if j else 0.0))
             if done:
                 out['end'] = END_DEATH if done == 2 else END_DONE
                 break
             policy.request(row, under)
-            if j >= ctx.cap:   # cut: only this record's value (the bootstrap)
+            exit_now = ctx.exit_end and j > 0 and bool(int(row['events'][0]) & EV_EXIT)
+            if j >= ctx.cap or exit_now:   # cut: only this record's value (the bootstrap)
                 _, v, _ = policy.answer()
-                out['end'], out['boot'], out['v_end'] = END_CAP, True, float(v)
+                v = getattr(policy, 'vg', v) if ctx.boot_vg else v
+                out['end'], out['boot'], out['v_end'] = END_EXIT if exit_now else END_CAP, True, float(v)
                 break
             if enc is not None:   # the step of the action under way, while the policy answers
                 step_action(B, under, ctx.items, ctx.fpd)
@@ -285,14 +369,15 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
                 item = lean_step(B, dec, applied_action(under, ctx.items), ctx.fpd)
                 lf = item.logic_frames
             a, v, lp = policy.answer()
-            act = intent.compose(j, five(a))
-            if keep:
+            act = intent.compose(j, five(a), row)
+            if j < n_keep:
                 rows.append(row[0].copy())
                 pends.append(under)
                 acts.append(act)
                 vals.append(float(v))
                 lps.append(float(lp))
                 hs.append(getattr(policy, 'h_used', None))   # (memory: the answer's GRU input state; else None)
+                ts.append(getattr(policy, 't_used', None))   # (B34, temporal: the lane step's outputs; else None)
             under = act
             t += 1
             j += 1
@@ -302,14 +387,12 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
         except OSError:
             pass
     n = len(rews)
-    G = np.zeros(n + 1, np.float64)
-    G[n] = out['v_end'] if out['boot'] else 0.0
-    for i in range(n - 1, -1, -1):
-        G[i] = rews[i] + ctx.gamma * G[i + 1]
+    G = returns_to_go(rews, ctx.gamma, out['v_end'] if out['boot'] else 0.0)
     out.update(score=float(G[0]), n=n, frames=lf - lf0, rews=rews)
     if keep:
-        out.update(rows=rows[:n], pend=pends[:n], act=acts[:n], ret=G[:n].copy(), value=vals[:n], logp=lps[:n],
-                   h=hs[:n] if hs and hs[0] is not None else None)
+        k = min(n, len(rows))
+        out.update(rows=rows[:k], pend=pends[:k], act=acts[:k], ret=G[:k].copy(), value=vals[:k], logp=lps[:k],
+                   h=hs[:k] if hs and hs[0] is not None else None, t=ts[:k] if ts and ts[0] is not None else None)
     ctx.stats['branches'] += 1
     ctx.stats['decisions'] += n
     ctx.stats['frames'] += lf - lf0
@@ -392,10 +475,13 @@ def search_point(pt, ctx, policy, rng, on_depth=None):
     return res
 
 
-def records_of(res, ctx, pt, worker, cap_w):
-    """The imitation records of an improving point: (rows [n] ROW, meta [n, V2_META] float64)."""
+def records_of(res, ctx, pt, worker, cap_w, steps=None):
+    """The imitation records of an improving point: (rows [n] ROW, meta [n, V2_META] float64). steps (B34): the first
+    that many of the best branch's records only (None: all it kept); meta 'n' stays the branch's length."""
     b = res['best']
-    n = b['n']
+    n = min(b['n'], len(b['rows']))
+    if steps is not None:
+        n = min(n, int(steps))
     rows = np.zeros(n, ROW)
     meta = np.zeros((n, V2_META), np.float64)
     w = min(res['gain'], cap_w)
@@ -407,10 +493,11 @@ def records_of(res, ctx, pt, worker, cap_w):
         m[VI['ret']], m[VI['value']], m[VI['logp']] = b['ret'][j], b['value'][j], b['logp'][j]
         m[VI['j']] = j
     meta[:, VI['weight']] = w
-    meta[:, VI['n']] = n
+    meta[:, VI['n']] = b['n']
     for k, v in (('gain', res['gain']), ('spread', res['spread']), ('taken', res['taken']), ('best', b['score']),
                  ('depth', res['k']), ('hold', b['intent'].h), ('intent', b['intent'].code), ('kind', pt.kind),
-                 ('point', pt.pid), ('worker', worker), ('version', pt.version), ('rep', res['rep'])):
+                 ('point', pt.pid), ('worker', worker), ('version', pt.version), ('rep', res['rep']),
+                 ('trig', int(getattr(pt, 'trig', 0) or 0) + 1 if pt.kind == KIND_CF else 0)):
         meta[:, VI[k]] = v
     return rows, meta
 
@@ -420,13 +507,23 @@ class LanePolicy:
     record is already in the lane slot), answer() waits for its answer (stop(): give up, V2Stop).
     lane_h (2026-10-11, memory; attach_v2_mem's, None without): begin(h0) hands the actor a branch's start state (a copy
     of the episode's at the fork; None: zeros), so the branch never touches the worker's own state; after each answer
-    h_used is the GRU input state the actor used for it."""
+    h_used is the GRU input state the actor used for it.
+    B34 (2026-10-16): every request carries a sequence number (LANE_IO [10], random per request) that the actor echoes
+    (LANE_OUT [4]); an answer with another number belongs to an older request (a search child killed while it waited,
+    a V2Stop) and is skipped (a stand-in actor that echoes nothing leaves 0 there: accepted). After each answer vg is
+    the actor's value_global of the record (its value without a global token). Temporal models: tbegin(row) before a
+    branch's first request names the snapshot the lane's temporal state starts from (bank row; None: a reset state);
+    lane_t (cf_attach's [workers, 2 D + 2] float32, None without): after each answer t_used is (o_prev [D], has, o [D])
+    of the lane's temporal step (the stored outputs of an imitation record)."""
 
-    def __init__(self, conn, lane_io, lane_out, index, stop, lane_h=None):
+    def __init__(self, conn, lane_io, lane_out, index, stop, lane_h=None, lane_t=None):
         self.conn, self.io, self.out, self.i, self.stop = conn, lane_io, lane_out, index, stop
         self.wait_s = 0.0
         self.calls = 0
         self.lane_h, self.h_used = lane_h, None
+        self.lane_t, self.t_used = lane_t, None
+        self.vg = 0.0
+        self.seq = 0
         if lane_h is None:   # (without memory: play_branch finds no begin)
             self.begin = None
 
@@ -435,20 +532,36 @@ class LanePolicy:
         self.lane_h[self.i, :dim] = 0.0 if h0 is None else h0
         self.lane_h[self.i, dim] = 1.0   # (read and cleared by the actor at the branch's first request)
 
+    def tbegin(self, bank_row):
+        """B34: the lane's temporal state at the branch's first request: a copy of the snapshot in bank row bank_row
+        (the parent episode's slot before the point's record), or a reset state (None)."""
+        if self.io.shape[1] > 11:
+            self.io[self.i, 11] = -1 if bank_row is None or bank_row < 0 else int(bank_row) + 1
+
     def request(self, row, under_way):
         self.io[self.i, :5] = under_way
+        if self.io.shape[1] > 10:
+            self.seq = int.from_bytes(os.urandom(4), 'little') & 0x7FFFFFFF or 1
+            self.io[self.i, 10] = self.seq
         self.conn.send_bytes(b'0')
 
     def answer(self):
         t0 = time.perf_counter()
-        while not self.conn.poll(0.05):
-            if self.stop():
-                raise V2Stop()
-        self.conn.recv_bytes()
+        while True:
+            while not self.conn.poll(0.05):
+                if self.stop():
+                    raise V2Stop()
+            self.conn.recv_bytes()
+            echo = int(self.out[self.i, 4]) if self.out.shape[1] > 4 else 0
+            if echo == 0 or echo == self.seq:
+                break
         self.wait_s += time.perf_counter() - t0
         self.calls += 1
         if self.lane_h is not None:   # (memory)
             self.h_used = self.lane_h[self.i, :self.lane_h.shape[1] - 1].copy()
+        if self.lane_t is not None:   # (B34, temporal)
+            self.t_used = self.lane_t[self.i].copy()
+        self.vg = float(self.out[self.i, 3]) if self.out.shape[1] > 3 else float(self.out[self.i, 0])
         return tuple(int(v) for v in self.io[self.i, 5:10]), float(self.out[self.i, 0]), float(self.out[self.i, 1])
 
 

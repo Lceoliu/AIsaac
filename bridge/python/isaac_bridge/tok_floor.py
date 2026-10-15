@@ -36,6 +36,14 @@ change is cloned as with the teacher; the worker logs each record's reward field
 (the sampler's main_value block), queues points (hurts, deaths, random records; tok_teacher2.V2Point) at the episode's
 end, and the search thread runs them (search_point) with the actor answering the branches through the worker's lane;
 an improving point's imitation records go to the worker's V2 ring. With teacher_v2 off nothing of this exists.
+
+The counterfactual teacher (cfg.cf, B34 2026-10-16; tok_cf.py has the definitions; needs cfg.teacher_thread): the same
+lane, log and V2 ring; each record that is not its room's first is checked for a choice point (tok_cf.detect, the
+random points, tok_cf.Quota); an accepted point holds its room's restore point and (temporal models) a bank row the
+actor copies the worker's temporal slot into before the record's step (cf_snap, written right before the record goes
+out); the episode's points are queued at its end (cf_queue) and a thread of their own (cf_loop: one point at a time on
+the lane, in a forked child with cfg.teacher_fork) runs tok_cf.cf_search and writes the improving branch's first
+records into the V2 ring. With cfg.cf off nothing of this exists.
 """
 import dataclasses
 import json
@@ -79,6 +87,7 @@ from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, Searc
 # abplus_probe_memory.py joins them with /proc to give the memory per role. Nothing else changes.
 MEM_LOG = os.environ.get('ISAAC_RL_MEM_LOG', '')
 SEARCH_CHILD_LIMIT = float(os.environ.get('ISAAC_RL_SEARCH_CHILD_LIMIT', '120'))   # s a forked search may take
+CF_CHILD_LIMIT = float(os.environ.get('ISAAC_RL_CF_CHILD_LIMIT', '900'))   # B34: s a forked choice point may take
 MEM_EVERY = float(os.environ.get('ISAAC_RL_MEM_EVERY', '10'))
 
 
@@ -222,6 +231,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     evaluation = bool(cfg.eval_seeds)
     # 2026-10-10 (teacher v2, tok_teacher2.py): off unless cfg.teacher_v2 and the sampler gave this worker a lane
     v2on = bool(cfg.teacher_v2) and v2_names is not None and v2_conn is not None and not evaluation
+    # B34 (2026-10-16, the counterfactual teacher, tok_cf.py): off unless cfg.cf and the sampler gave this worker a lane
+    cfon = bool(getattr(cfg, 'cf', False)) and v2_names is not None and v2_conn is not None and not evaluation
+    laneon = v2on or cfon   # (the lane, the episode's log and the V2 ring: teacher v2's machinery, shared)
     teaching = cfg.teacher and teacher_names is not None and not evaluation
     if teaching:
         teach_blocks, teach_rows, teach_meta = attach_teacher(teacher_names, cfg.workers)
@@ -311,7 +323,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     ep_src = {}
     char_rng = np.random.default_rng([cfg.seed, index, 17])   # its own: the episodes' rng draws stay as without
     # every room change is parked as the restore point of what happens in that room
-    rebase = teaching or branching or v2on
+    rebase = teaching or branching or laneon
     t_begin = time.perf_counter()
     mine = stats[index]
     slots = (rows[2 * index:2 * index + 1], rows[2 * index + 1:2 * index + 2])
@@ -326,10 +338,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     archive = []
     # 2026-10-10 (teacher v2): its points (tok_teacher2.V2Point), searched by the search thread through the lane
     v2_queue = []
-    if v2on:
+    cf_queue = []   # B34: queued choice points (tok_teacher2.V2Point kind KIND_CF)
+    lane_t = v2_t = None   # B34 (temporal models): the lane's / the V2 ring's temporal outputs (tok_cf.attach_cf)
+    if laneon:
         from .tok_obs import RC_PROGRESS
-        from .tok_teacher2 import (KIND_FATAL, KIND_HURT, KIND_RANDOM, V2_RING, Context as V2Context, LanePolicy,
-                                   V2Log, V2Point, V2Stop, attach_v2, records_of, search_point)
+        from .tok_teacher2 import (KIND_CF, KIND_FATAL, KIND_HURT, KIND_RANDOM, V2_RING, Context as V2Context,
+                                   LanePolicy, V2Log, V2Point, V2Stop, attach_v2, records_of, search_point)
         v2_blocks, lane_rows, lane_io, lane_out, main_value, v2_rows, v2_meta = attach_v2(v2_names, cfg.workers)
         blocks = blocks + v2_blocks
         main_h = lane_h = v2_h = None   # 2026-10-11 (memory, cfg.memory_dim): the GRU states (tok_teacher2.attach_v2_mem)
@@ -342,6 +356,33 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         v2_srng = np.random.default_rng([cfg.seed, index, 23])   # the search thread's (candidates, reseeds)
         v2_p = cfg.teacher_v2_random * cfg.frames_per_decision / 30 / 3600   # random points per decision
         v2_n = [0]
+    t_dim = int(getattr(cfg, 'temporal_dim', 0) or 0)
+    if laneon and (cfon or t_dim):   # B34: value_global, snapshot requests, the lanes' temporal outputs (tok_cf)
+        from .tok_cf import attach_cf, cf_names_offset
+        cf_blocks, main_vg, cf_snap, lane_t, v2_t = attach_cf(v2_names[cf_names_offset(cfg):], cfg.workers, t_dim)
+        blocks = blocks + cf_blocks
+    if cfon:   # B34 (tok_cf.py): the choice points' quota, detector state, snapshot bank and branch context
+        from .tok_cf import (TI as CF_TI, TRIGGERS as CF_TRIGGERS, Quota as CfQuota, bank_rows, cf_search,
+                             detect as cf_detect)
+        cfctx = V2Context(cfg, limit, stall, run, fast_fn, group, lane_rows[index:index + 1], cfg.branch_reward,
+                          seconds=cfg.cf_seconds, gamma=cfg.cf_gamma, boot_vg=bool(cfg.cf_vglobal), exit_end=run,
+                          gains=True)
+        cf_quota = CfQuota(cfg.cf_points, cfg.frames_per_decision)
+        cf_rng = np.random.default_rng([cfg.seed, index, 31])   # its own: the episodes' rng draws stay as without
+        cf_p = cfg.cf_random * cfg.frames_per_decision / 30 / 3600   # random points per decision
+        cf_n = [0]
+        cf_B = bank_rows(cfg) if t_dim else 0   # bank rows of this worker: index * cf_B + b
+        cf_bank_free = list(range(cf_B))
+
+        def cf_release(p_):
+            """A choice point's restore point and bank row let go (a pending dict or a queued V2Point)."""
+            base_p = p_['base'] if isinstance(p_, dict) else p_.base
+            bank_p = p_.get('bank') if isinstance(p_, dict) else p_.bank
+            if base_p is not None:
+                base_p.release()
+            if bank_p is not None:
+                with qlock:
+                    cf_bank_free.append(int(bank_p) - index * cf_B)
 
     qlock = threading.RLock()   # 2026-10-10: the queue is shared with the search thread (cfg.teacher_thread)
     search_errors = [0]
@@ -402,6 +443,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
 
     prof_file = open(os.path.join(TEACH_PROF, f'w{index}.jsonl'), 'a') if TEACH_PROF and teaching else None
     gate = SearchSlots(cfg) if (teaching or v2on) else None
+    lane_lock = threading.Lock()   # B34: one branch search at a time on the worker's lane (teacher v2's and the cf's)
 
     def search_gated():
         """The newest queued hurt searched when a search slot is free (cfg.teacher_slots); False when none was."""
@@ -418,12 +460,29 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         return True
 
     # ------------------------------------------------------------------ teacher v2 (tok_teacher2.py, 2026-10-10)
+    def ring_write(rows_, meta_, hs_, ts_):
+        """Imitation records into the worker's V2 ring (teacher v2's and, B34, the cf's; one writer at a time: the
+        lane lock is held), with their GRU input states (memory) and temporal outputs (B34, temporal lanes)."""
+        for j in range(len(rows_)):
+            slot = int(mine[ST['v2_records']]) % V2_RING
+            v2_rows[index, slot] = rows_[j]
+            v2_meta[index, slot] = meta_[j]
+            if v2_h is not None:
+                v2_h[index, slot] = hs_[j] if hs_ is not None else 0.0
+            if v2_t is not None:
+                v2_t[index, slot] = ts_[j] if ts_ is not None else 0.0
+            mine[ST['v2_records']] += 1
+
     def v2_search(pt):
         """One teacher-v2 point (tok_teacher2.search_point through the lane): its imitation records into the ring
         when it improves; the counters."""
+        with lane_lock:   # B34: the lane may be the cf thread's too
+            v2_search_locked(pt)
+
+    def v2_search_locked(pt):
         t0, c0 = time.perf_counter(), time.thread_time()
         policy = LanePolicy(v2_conn, lane_io, lane_out, index, lambda: bool(control[0]) or search_stop.is_set(),
-                            lane_h=lane_h)
+                            lane_h=lane_h, lane_t=lane_t)
         s0 = dict(v2ctx.stats)
         res = None
         try:
@@ -456,14 +515,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             if res['improving']:
                 mine[ST['v2_improving']] += 1
                 rows_, meta_ = records_of(res, v2ctx, pt, index, cfg.teacher_v2_cap)
-                hs_ = res['best'].get('h')   # 2026-10-11 (memory): each record's GRU input state (None without)
-                for j in range(len(rows_)):
-                    slot = int(mine[ST['v2_records']]) % V2_RING
-                    v2_rows[index, slot] = rows_[j]
-                    v2_meta[index, slot] = meta_[j]
-                    if v2_h is not None:
-                        v2_h[index, slot] = hs_[j] if hs_ is not None else 0.0
-                    mine[ST['v2_records']] += 1
+                # 2026-10-11 (memory): each record's GRU input state; B34: its temporal outputs (None without)
+                ring_write(rows_, meta_, res['best'].get('h'), res['best'].get('t'))
         mine[ST['v2_queue']] = len(v2_queue)
         mine[ST['v2_wait_s']] += policy.wait_s
         mine[ST['v2_cpu']] += time.thread_time() - c0
@@ -483,6 +536,141 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             gate.give(j)
         return True
 
+    # ------------------------------------------------------- the counterfactual teacher (tok_cf.py, B34 2026-10-16)
+    def cf_run(pt, child=False):
+        """One choice point (tok_cf.cf_search through the lane): its imitation records into the V2 ring when it
+        improves; the counters (shared memory: a forked child's count too). The restore point is let go here; the bank
+        row by the caller (a child never takes qlock)."""
+        t0, c0 = time.perf_counter(), time.thread_time()
+        policy = LanePolicy(v2_conn, lane_io, lane_out, index, lambda: bool(control[0]) or search_stop.is_set(),
+                            lane_h=lane_h, lane_t=lane_t)
+        s0 = dict(cfctx.stats)
+        rng_p = np.random.default_rng([cfg.seed, index, 37, int(pt.pid) % (2 ** 62)])   # per point (a child's draws
+        res = None                                                                        # never reach the parent)
+        try:
+            res = cf_search(pt, cfctx, policy, rng_p)
+        except V2Stop:
+            pass
+        except (BridgeError, OSError, RuntimeError, ValueError) as exc:
+            mine[ST['errors']] += 1
+            mine[ST['cf_errors']] += 1
+            if search_errors[0] < 5:
+                search_errors[0] += 1
+                print(f'tok floor worker {index}: cf search failed: {type(exc).__name__}: {str(exc)[:200]}',
+                      file=sys.stderr, flush=True)
+        finally:
+            pt.base.release()
+        mine[ST['cf_points']] += 1
+        mine[ST['cf_t_' + CF_TRIGGERS[int(pt.trig)]]] += 1
+        for k_s, name in (('branches', 'cf_branches'), ('decisions', 'cf_dec'), ('frames', 'cf_frames'),
+                          ('replicates', 'cf_reps')):
+            mine[ST[name]] += cfctx.stats[k_s] - s0[k_s]
+        if res is None:
+            mine[ST['cf_nodepth']] += 1
+        else:
+            mine[ST['cf_done']] += 1
+            mine[ST['cf_gain0']] += res['gain0']
+            mine[ST['cf_taken']] += res['taken']
+            if res['spread'] is not None:
+                mine[ST['cf_spread']] += res['spread']
+            if res['improving']:
+                mine[ST['cf_improving']] += 1
+                mine[ST['cf_target_best']] += getattr(res['best']['intent'], 'kind', '') == 'target'
+                rows_, meta_ = records_of(res, cfctx, pt, index, cfg.cf_cap, steps=cfg.cf_distill_steps)
+                ring_write(rows_, meta_, res['best'].get('h'), res['best'].get('t'))
+                mine[ST['cf_records']] += len(rows_)
+        mine[ST['cf_lane_calls']] += policy.calls
+        mine[ST['cf_wait_s']] += policy.wait_s
+        mine[ST['cf_cpu']] += time.thread_time() - c0
+        mine[ST['cf_s']] += time.perf_counter() - t0
+
+    def cf_forked(pt):
+        """cf_run in a forked child of the worker (cfg.teacher_fork, as search_forked: no GIL contention with the
+        episode): a parked copy of the restore point for the child, the parent waits (the lane lock held) with a time
+        limit; the bank row is freed after."""
+        base_ = pt.base
+        try:
+            copy = Parked(base_.fork(tag='search', alarm=0), **base_.info)
+        except (BridgeError, OSError, RuntimeError, ValueError) as exc:
+            mine[ST['errors']] += 1
+            mine[ST['cf_errors']] += 1
+            if search_errors[0] < 5:
+                search_errors[0] += 1
+                print(f'tok floor worker {index}: cf copy failed: {type(exc).__name__}: {str(exc)[:200]}',
+                      file=sys.stderr, flush=True)
+            cf_release(pt)
+            return
+        base_.release()
+        pt.base = copy
+        pid = os.fork()
+        if pid == 0:   # the child: the point on its own copy, records into the shared ring, then gone
+            code = 0
+            try:
+                cf_run(pt, child=True)
+            except BaseException:
+                code = 1
+            finally:
+                os._exit(code)
+        try:   # (the parent: its end of the copy's connection closed without the close command)
+            sock = copy.clone._sock
+            copy.clone._sock = None
+            if sock is not None:
+                sock.close()
+        except (AttributeError, OSError):
+            pass
+        copy.clone = None
+        Parked.live.discard(copy)
+        pt.base = None
+        t_wait = time.perf_counter()
+        status = 0
+        while True:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+            if wpid == pid:
+                break
+            if time.perf_counter() - t_wait > CF_CHILD_LIMIT:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                os.waitpid(pid, 0)
+                status = -1
+                mine[ST['errors']] += 1
+                mine[ST['cf_errors']] += 1
+                if search_errors[0] < 5:
+                    search_errors[0] += 1
+                    print(f'tok floor worker {index}: cf child {pid} killed after {CF_CHILD_LIMIT:.0f} s',
+                          file=sys.stderr, flush=True)
+                break
+            time.sleep(0.01)
+        if status != 0 and status != -1:
+            mine[ST['errors']] += 1
+            mine[ST['cf_errors']] += 1
+        cf_release(pt)   # (the bank row; the base is already None)
+
+    def cf_loop():
+        """The cf thread (B34): the newest queued choice point whenever there is one (its rate is the quota's, not a
+        share of the worker's time), one at a time, on the lane (lane_lock)."""
+        while not search_stop.is_set():
+            if not cf_queue or control[0]:
+                time.sleep(0.02)
+                continue
+            with qlock:
+                pt = cf_queue.pop() if cf_queue else None
+                mine[ST['cf_queue']] = len(cf_queue)
+            if pt is None:
+                continue
+            try:
+                with lane_lock:
+                    if forking:
+                        cf_forked(pt)
+                    else:
+                        cf_run(pt)
+                        cf_release(dict(base=None, bank=pt.bank))
+            except Exception as exc:   # (never the worker's death: logged, the next point)
+                mine[ST['errors']] += 1
+                print(f'tok floor worker {index}: cf thread: {type(exc).__name__}: {str(exc)[:200]}',
+                      file=sys.stderr, flush=True)
+
     def search_time():
         """The search thread's seconds outside the trainer's updates (the teacher's and teacher v2's)."""
         return mine[ST['teach_s']] + mine[ST['v2_s']] if v2on else mine[ST['teach_s']]
@@ -500,7 +688,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     # parked copy of the restore point (one fork command on the shared clone, under its lock), the parent lets go of
     # that copy's connection without closing the clone, the child writes the teacher records into the shared ring
     # (one child per worker at a time: the ring index stays consistent) and _exits; the thread only waits for it.
-    forking = threaded and bool(cfg.teacher_fork)
+    forking = (threaded or (cfon and bool(cfg.teacher_thread))) and bool(cfg.teacher_fork)
 
     def search_forked():
         j = gate.take()
@@ -591,7 +779,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 print(f'tok floor worker {index}: search thread: {type(exc).__name__}: {str(exc)[:200]}',
                       file=sys.stderr, flush=True)
     search_thread = threading.Thread(target=search_loop, name=f'search{index}', daemon=True) if threaded else None
-    if threaded:
+    # B34: the cf thread (needs cfg.teacher_thread like the searches; its children with cfg.teacher_fork)
+    cf_thread = threading.Thread(target=cf_loop, name=f'cf{index}', daemon=True) \
+        if (cfon and bool(cfg.teacher_thread)) else None
+    if threaded or cf_thread is not None:
         # 2026-10-10: the interpreter's default switch interval (5 ms) made the main thread wait that long for the GIL
         # every time the search thread held it (C77 on the HPC: encode 0.2 -> 7 ms per record, throughput 1,800 -> 600x)
         sys.setswitchinterval(float(os.environ.get('ISAAC_RL_SWITCH_INTERVAL', '0.0002')))
@@ -1224,6 +1415,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['dropped']] += len(queue)
             queue.clear()
             mine[ST['queue']] = 0
+            if cfon:   # B34: the queued choice points too
+                for pt in cf_queue:
+                    cf_release(pt)
+                mine[ST['cf_dropped']] += len(cf_queue)
+                cf_queue.clear()
+                mine[ST['cf_queue']] = 0
             if v2on:   # 2026-10-10 (teacher v2): its queued points hold restore points of the instance too
                 for pt in v2_queue:
                     pt.base.release()
@@ -1304,6 +1501,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         builder.start()
         if search_thread is not None:   # 2026-10-10
             search_thread.start()
+        if cf_thread is not None:   # B34
+            cf_thread.start()
         episodes_left, episode_n = 0, 0
         while not stopping():
             mem_dump()
@@ -1431,8 +1630,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             hist = [] if branching else None
             # 2026-10-10 (teacher v2): each record's reward fields, stall counter and the actor's value (the taken
             # score); its points: (record, the restore point then, its reseed, its decision, kind)
-            v2log = V2Log() if v2on else None
+            v2log = V2Log() if laneon else None
             v2_pts = []
+            cf_seen, cf_snap_req = set(), 0   # B34: the room's triggers so far; the snapshot request of the next send
+            if cfon:
+                cf_quota.begin_episode()
             if pf_track:   # 2026-10-13 (B23): this episode's draw (the trainer's p) and its pedestal build
                 pf_ep = pf_on and pf_rng.random() < float(mine[ST['pf_p']])
                 forcer.begin(pf_ep)
@@ -1471,8 +1673,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         mine[ST['np_removed']] += int(removed or 0)
                     if teaching and (hurt or (death_teaching and done == 2)):
                         hurts.append((t_ep, base.hold(), base_reseed, base_t))
+                    if laneon:   # (B34: the log serves the cf's taken score too)
+                        v2log.add(row, done, enc.ctx[RC_PROGRESS] if enc is not None else st.progress_t,
+                                  rw=cfctx.rw if (cfon and cfctx.gains) else None)
                     if v2on:   # 2026-10-10 (teacher v2): the record's log, and a point at a hurt, a death or at random
-                        v2log.add(row, done, enc.ctx[RC_PROGRESS] if enc is not None else st.progress_t)
                         if hurt or done == 2:
                             v2_pts.append((t_ep, base.hold(), base_reseed, base_t, KIND_FATAL if done == 2 else KIND_HURT))
                         elif v2_p > 0 and not done and t_ep > base_t + 1 and room_idx == room_now and \
@@ -1512,6 +1716,41 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                             if mem_file is not None:
                                 mem_dump()
                     room_now = room_idx
+                    if cfon and not done:   # B34: this record's choice point (tok_cf; never a room's first record)
+                        cf_quota.tick(1)
+                        if t_ep == base_t:   # (an episode's or a room's first record: the room's triggers anew)
+                            cf_seen = set()
+                        else:
+                            found = cf_detect(row, cf_seen, cf_rng)
+                            if cf_p > 0 and t_ep > base_t + 1 and not row['events'][0] & EV_EXIT and \
+                                    cf_rng.random() < cf_p:
+                                found.append((CF_TI['random'], None))
+                            if found:
+                                mine[ST['cf_detected']] += len(found)
+                                trig_, target_ = cf_quota.choose(found)
+                                ok_, victim_, fresh_ = cf_quota.offer(trig_)
+                                if victim_ is not None:   # (an older point of the episode of a type seen before)
+                                    cf_release(victim_)
+                                    mine[ST['cf_replaced']] += 1
+                                bank_ = None
+                                if ok_ and cf_B:   # (temporal: a bank row for the snapshot)
+                                    with qlock:
+                                        b_ = cf_bank_free.pop() if cf_bank_free else None
+                                    if b_ is None:   # (the token back; a replaced point stays replaced)
+                                        ok_ = False
+                                        if victim_ is None:
+                                            cf_quota.budget += 1.0
+                                        mine[ST['cf_nobank']] += 1
+                                    else:
+                                        bank_ = index * cf_B + b_
+                                if ok_:
+                                    cf_quota.pending.append(dict(trig=trig_, target=target_, fresh=fresh_, at=t_ep,
+                                                                 base=base.hold(), reseed=base_reseed, offset=base_t,
+                                                                 bank=bank_))
+                                    if bank_ is not None:
+                                        cf_snap_req = bank_ + 1
+                                else:
+                                    mine[ST['cf_skipped']] += 1
                     t1 = time.perf_counter()
                     mine[ST['encode_s']] += t1 - t0
                     if waiting:   # the answer to the record before this one: the action of the step to come
@@ -1520,10 +1759,17 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         if branching:   # Phase B2: the actor's outputs for record t_ep - 1 (hist[t] is record t's)
                             hist.append((float(aux[index, AUX_LOGP]), float(aux[index, AUX_PRED]),
                                          float(aux[index, AUX_UNCERT])))
-                        if v2on:   # 2026-10-10 (teacher v2): the actor's value of record t_ep - 1
+                        if laneon:   # 2026-10-10 (teacher v2): the actor's value of record t_ep - 1
                             v2log.value.append(float(main_value[index]))
                             if main_h is not None:   # 2026-10-11 (memory): and its GRU input state
                                 v2log.h.append(main_h[index].copy())
+                            if cfon:   # B34: and its value_global
+                                v2log.vg.append(float(main_vg[index]))
+                    if cf_snap_req:   # B34: the actor copies this worker's temporal slot into the point's bank row
+                        #             before this record's step (the record before is answered: no other request
+                        #             of this worker is outstanding)
+                        cf_snap[index] = cf_snap_req
+                        cf_snap_req = 0
                     conn.send_bytes(b'1' if t_ep & 1 else b'0')
                     waiting = True
                     if done or control[0]:
@@ -1604,6 +1850,23 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 mine[ST['v2_dropped']] += 1
                             v2_queue[:] = [p_ for j, p_ in enumerate(v2_queue) if j not in set(drop)]
                         mine[ST['v2_queue']] = len(v2_queue)
+                if cfon and cf_quota.pending:   # B34: the episode's choice points (its log is complete now); the
+                    #                             oldest make room
+                    with qlock:
+                        for p_ in cf_quota.pending:
+                            cf_n[0] += 1
+                            cf_queue.append(V2Point(
+                                base=p_['base'], reseed=p_['reseed'], applied=applied, log=v2log, at=p_['at'],
+                                offset=p_['offset'], kind=KIND_CF, seed=seed_now, episode=episode_n,
+                                visited=p_['base'].info.get('visited', ()), stage0=p_['base'].info.get('stage0'),
+                                pid=index * 10 ** 9 + cf_n[0], version=int(control[3]), trig=p_['trig'],
+                                target=p_['target'], bank=p_['bank']))
+                            mine[ST['cf_queued']] += 1
+                        cf_quota.pending = []
+                        while len(cf_queue) > max(1, int(cfg.cf_queue)):
+                            cf_release(cf_queue.pop(0))
+                            mine[ST['cf_dropped']] += 1
+                        mine[ST['cf_queue']] = len(cf_queue)
             except (BridgeError, OSError, RuntimeError, ValueError) as exc:
                 # the server may hold a record of this episode without its end: the next record is a first one
                 mine[ST['errors']] += 1
@@ -1617,6 +1880,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     h[1].release()
                 for h in v2_pts:   # 2026-10-10 (teacher v2)
                     h[1].release()
+                if cfon:   # B34: the episode's choice points go (their taken score needs the whole episode)
+                    for p_ in cf_quota.pending:
+                        cf_release(p_)
+                        mine[ST['cf_dropped']] += 1
+                    cf_quota.pending = []
+                    cf_snap[index] = 0
             finally:
                 try:
                     episode.close()
@@ -1648,7 +1917,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             except OSError:
                 pass
             for parked in [template, base] + archive + [item[0] for item in queue] + \
-                    [pt.base for pt in v2_queue] + \
+                    [pt.base for pt in v2_queue] + [pt.base for pt in cf_queue] + \
                     ([p.base for p in points.items] if branching else []) + \
                     (list(panel.values()) if labbing else []):
                 if parked is not None:
