@@ -145,6 +145,9 @@ the actor. The history token uses the stored o_{t-1} (stop-grad).
 Storage (B31): the rollout's per-decision K / V, s and o stay on the GPU (train_tok.Rollout's device tensors, written
 by GraphActor / the eager step with index_copy_, gathered by temporal_inputs / temporal_part); only counters cross the
 bus (per record: its rollout row in, create / nroom / steps / stage_prev out).
+Without the GRU (B32, 2026-10-15; TokPolicy(memory=0, temporal=True)): the same model minus mem_out(h) and mem_in;
+the learner's chunks are the temporal chunks alone (temporal_chunks(..., T_mem=None)); drop_memory converts a
+memory + temporal checkpoint (the GRU's tensors dropped, every other one exact).
 """
 import contextlib
 import os
@@ -938,7 +941,10 @@ def temporal_chunks(length, mask, T, T_mem):
     chunks, each padded to a multiple of T_mem by repeating its last decision (weight 0; the GRU's chunks of T_mem nest
     inside); chunks without a trained decision are dropped. Returns memory_chunks' dict (pos, weight, start per GRU
     chunk, chunks) plus 'tch': int64 [C, 5] per temporal chunk (row offset, rows, worker, first decision, real
-    decisions); row offsets and counts are multiples of T_mem."""
+    decisions); row offsets and counts are multiples of T_mem.
+    T_mem None (B32, 2026-10-15: a temporal model without the GRU): no GRU chunks nested, no padding: a chunk's rows
+    are its decisions (weight 1 where trained, 0 where the temporal transformer only steps through them, e.g. a
+    worker's open last decision); 'start' holds each temporal chunk's first decision, 'chunks' their number."""
     W, cap = mask.shape
     pos, weight, start, tch = [], [], [], []
     off = 0
@@ -948,12 +954,12 @@ def temporal_chunks(length, mask, T, T_mem):
             e = min(s + T, n)
             if not mask[w, s:e].any():
                 continue
-            rows = -(-(e - s) // T_mem) * T_mem
+            rows = e - s if T_mem is None else -(-(e - s) // T_mem) * T_mem
             m = np.zeros(rows, bool)
             m[:e - s] = mask[w, s:e]
             pos.append(w * cap + np.minimum(s + np.arange(rows), e - 1))
             weight.append(m)
-            start.extend(w * cap + s + np.arange(0, rows, T_mem))
+            start.extend([w * cap + s] if T_mem is None else w * cap + s + np.arange(0, rows, T_mem))
             tch.append((off, rows, w, s, e - s))
             off += rows
     if not pos:
@@ -2557,6 +2563,41 @@ def convert_to_fused(model, state):
     return dict(state), ('item_tokens_fused (B24): every tensor kept as saved; the gates ' + str(gates) + ' are now the '
                          'multipliers of the extra tokens\' value vectors; approximate (one softmax over the old and the '
                          'extra tokens instead of the gated terms)')
+
+
+MEMORY_PREFIXES = ('mem_gru.', 'mem_out.', 'gtok.mem_in.')   # B32: the GRU memory's tensors (B20; B22's mem_in)
+
+
+def drop_memory(model, state):
+    """B32 (2026-10-15): a GRU-memory checkpoint's state dict (B20 --memory gru: mem_gru, mem_out and, with a global
+    token, gtok.mem_in) made loadable into the same model without memory (TokPolicy memory=0; train_tok --resume with
+    --memory off). Exactly those tensors are dropped, every other one is kept as saved. The model then computes the
+    checkpoint's outputs with the GRU's contribution removed: mem_out(h_t) (its weight and its bias) no longer added
+    to the heads' input z and to value_global's input, i.e. the checkpoint's model with mem_out zeroed (mem_in only fed
+    the GRU, whose state reaches the outputs through mem_out alone; tests/test_no_gru_smoke.py (c)). Returns (state,
+    dropped names, a log line), (state, [], None) when there is nothing to drop. Raises ValueError if the model has
+    memory or a dropped name is one of its tensors. The input dict is not changed."""
+    names = [k for k in state if k.startswith(MEMORY_PREFIXES)]
+    if not names:
+        return state, [], None
+    if int(getattr(model, 'memory', 0) or 0):
+        raise ValueError('drop_memory: the model has memory (TokPolicy memory > 0)')
+    own = model.state_dict()
+    clash = [k for k in names if k in own]
+    if clash:
+        raise ValueError(f'drop_memory: {clash[:4]} are tensors of the model')
+    n_par = sum(int(state[k].numel()) for k in names)
+    size = int(state['mem_out.weight'].shape[1]) if 'mem_out.weight' in state else 0
+    mag = ''
+    if 'mem_out.weight' in state and 'mem_out.bias' in state:
+        w_, b_ = state['mem_out.weight'].float(), state['mem_out.bias'].float()
+        mag = (f'; mem_out |W| {float(w_.norm()):.3f} (max row {float(w_.norm(dim=1).max()):.3f}), |b| '
+               f'{float(b_.norm()):.3f}')
+    note = (f'memory (B32): --resume of a GRU checkpoint (size {size}) with --memory off: dropped {len(names)} tensors '
+            f'({n_par / 1e6:.3f}M parameters: {", ".join(names)}) and their Adam state; every other tensor exact. The '
+            'outputs change by exactly what the GRU contributed: they equal the checkpoint\'s with mem_out(h_t) removed '
+            '(mem_out weight and bias zero; mem_in only fed the GRU) from the heads\' and value_global\'s input' + mag)
+    return {k: v for k, v in state.items() if k not in names}, names, note
 
 
 def load_compatible(model, state):

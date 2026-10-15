@@ -44,6 +44,7 @@ SDPA。可与 B29 的 `--actor-compile/--actor-fold/--actor-row-buckets` 共存�
 - 房间 token 在学习器里用存下的（stop-grad，除了 E_room/E_stage/W_r 以外没有梯度 → v1 中 W_r 也只通过"块内创建的房间 token"学：
   块内若发生离开房间，该房间 token 用块内算出的 o 重算，有梯度）。
 - 分块 BPTT 对 GRU 照旧（32 步一块嵌在 256 步的块里）。
+- **B32（10-15）不带 GRU 也能跑**（C98 消融）：学习器只按 `--temporal-bptt` 切段（不嵌 GRU 段、不补齐），时间侧不变；`--resume` 带 GRU 的检查点并显式 `--memory off` 时丢掉 `mem_gru/mem_out/gtok.mem_in`（`drop_memory`，其余逐位不变，输出 = 原模型去掉 mem_out(h)）；测试 `tests/test_no_gru_smoke.py`。
 - **B31（10-15，用户批准）去掉三处多余的拷贝 / 重算，表达能力不变**：(1) rollout 的每步 K/V、s、o 和房间来源留在 GPU（`Rollout`
   的设备张量池，actor 的 step 输出在设备上 `index_copy_` 写进去，学习器在设备上 gather；每步只有计数过总线：写入行号 8 B 进、
   create/nroom/steps/stage_prev 16 B 出）；(2) 历史 token 是融合注意力里的**普通 token**（[…, 道具, 历史, 全局]，一次 softmax），

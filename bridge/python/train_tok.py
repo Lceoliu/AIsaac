@@ -105,6 +105,10 @@ Memory (2026-10-11, --memory gru --memory-dim D --memory-bptt T; off by default,
   at the fork, sent by the worker; tok_teacher2.LanePolicy.begin) and its imitation records carry their input states.
   Approximate: the old teacher's records, the choice correction's records and branch episodes (tok_branch) use a zero
   state. --resume of a memory-free checkpoint starts a fresh GRU (its output projection zero: the same outputs).
+  B32 (2026-10-15): --resume of a memory checkpoint with an explicit --memory off drops the GRU (tok_policy.drop_memory:
+  mem_gru, mem_out, gtok.mem_in and their Adam state; every other tensor exact; the outputs lose mem_out(h)); without
+  --memory the checkpoint's memory is kept as before. A temporal model needs no GRU: its learner chunks are then the
+  temporal chunks alone (--temporal-bptt, no nested GRU chunks).
 Item tokens / global token (2026-10-12, B21 --item-tokens 1 (needs --items), B22 --global-token 1; off by default, then
   nothing changes; TokPolicy item_tokens / global_token, the module docstring of tok_policy has the mechanism): 20 item
   tokens (held collectibles, active, trinkets, pocket) and / or one learned global token per record, reaching the old
@@ -729,6 +733,7 @@ def main():
     from isaac_bridge.tok_policy import (ENTITY_FIELDS, ROW_BYTES, GraphActor, TokPolicy, cat_batch,
                                          crn_uniforms, DEDUP, decode_rows, distinct_ids, first_of, learner_plan,
                                          load_compatible, main_parameter_names, memory_chunks, packed_index,
+                                         drop_memory,
                                          ITEM_SHARED_KEY, share_item_table, item_count,
                                          pad_optimizer_state, plan_tokens, remap_optimizer_state, rows_to_device,
                                          take, to_batch, used_entities, TemporalState, temporal_chunks,
@@ -1077,10 +1082,11 @@ def main():
                         'its host thread, which a busy sibling or a game on the same core slows by ~20%%. '
                         "'' (default): no pinning")
     # 2026-10-11 (memory, rl/docs/SCALING_THESIS.md S5b; see the module docstring)
-    p.add_argument('--memory', default='off', choices=('off', 'gru'),
+    p.add_argument('--memory', default=None, choices=('off', 'gru'),
                    help='gru: a GRU state per worker between the token encoder and the heads, carried through the '
                         'episode (reset only at a new episode) and trained with truncated BPTT; a resumed memory '
-                        'checkpoint keeps its memory. off (default): as before')
+                        'checkpoint keeps its memory unless --memory off is given (B32: then its GRU is dropped, '
+                        'tok_policy.drop_memory). Not given (default): the resumed checkpoint\'s, else off (as before)')
     p.add_argument('--memory-dim', type=int, default=128, help="the GRU state's size (a resumed checkpoint's wins)")
     p.add_argument('--memory-bptt', type=int, default=32,
                    help="decisions per BPTT chunk (a worker's sequence cut into chunks of this many; a minibatch is "
@@ -1114,8 +1120,8 @@ def main():
                         'a resumed checkpoint\'s, else 16 (INV_CAP, as before)')
     # 2026-10-14 (B30; see the module docstring and rl/docs/TEMPORAL_ATTENTION.md)
     p.add_argument('--temporal', type=int, default=0,
-                   help='1 (B30, needs --memory gru; with item / global tokens --item-tokens-fused 1): the temporal '
-                        'transformer over the last --temporal-window decisions and the episode\'s room tokens; gates '
+                   help='1 (B30; with item / global tokens --item-tokens-fused 1; B32: with or without --memory '
+                        'gru): the temporal transformer over the last --temporal-window decisions and the episode\'s room tokens; gates '
                         'zero at the start (the same outputs as without it; a resumed checkpoint without it gets it '
                         'fresh, Adam remapped; one with it keeps it). 0 (default): as before')
     p.add_argument('--temporal-width', type=int, default=256, help="(B30) the temporal transformer's width D")
@@ -1124,8 +1130,8 @@ def main():
     p.add_argument('--temporal-window', type=int, default=256, help='(B30) decisions a step token sees (itself included)')
     p.add_argument('--temporal-rooms', type=int, default=128, help='(B30) room tokens per episode at most')
     p.add_argument('--temporal-bptt', type=int, default=256,
-                   help="(B30) decisions per learner chunk (a multiple of --memory-bptt; a minibatch is --minibatch // "
-                        'this chunks, --micro parts of whole chunks)')
+                   help="(B30) decisions per learner chunk (with memory a multiple of --memory-bptt; a minibatch is "
+                        '--minibatch // this chunks, --micro parts of whole chunks)')
     p.add_argument('--temporal-kv', default='bf16', choices=('bf16', 'fp32'),
                    help="(B30) the stored K / V (actor's cache and the rollout's): bfloat16 (default) or float32")
     p.add_argument('--fused-adam', type=int, default=0,
@@ -1168,10 +1174,12 @@ def main():
     elif args.pchar < 0:
         args.pchar = int(bool(args.characters))
     pchar = bool(args.pchar)
-    mem_fresh = False   # 2026-10-11 (memory): a resumed memory checkpoint keeps its memory and its size
+    mem_fresh = mem_drop = False   # 2026-10-11 (memory): a resumed memory checkpoint keeps its memory and its size
     if args.resume:
         ck_mem = int(torch.load(args.resume, map_location='cpu').get('config', {}).get('memory', 0) or 0)
-        if ck_mem:
+        if ck_mem and args.memory == 'off':   # B32 (2026-10-15): an explicit --memory off drops the checkpoint's GRU
+            mem_drop = True
+        elif ck_mem:
             if args.memory != 'gru' or args.memory_dim != ck_mem:
                 print(f'memory: the resumed checkpoint has a GRU of size {ck_mem}: --memory gru --memory-dim {ck_mem}',
                       flush=True)
@@ -1233,12 +1241,15 @@ def main():
         tok_kw['item_slots'] = item_slots
     t_on = bool(args.temporal)   # 2026-10-14 (B30)
     T_t = int(args.temporal_bptt)
+    # (B32: the learner's decisions in chunks: the GRU's (memory), the temporal ones (temporal; with memory the GRU
+    # chunks nest inside), or none)
+    chunked = mem_on or t_on
     if t_on:
-        if not mem_on:
-            p.error('--temporal 1 needs --memory gru (the learner\'s chunks are the memory chunks, nested)')
         if (itok_on or gtok_on) and not fused_on:
             p.error('--temporal 1 needs --item-tokens-fused 1 with item / global tokens')
-        if T_t < T_mem or T_t % T_mem:
+        if T_t < 1:
+            p.error('--temporal-bptt must be >= 1')
+        if mem_on and (T_t < T_mem or T_t % T_mem):
             p.error('--temporal-bptt must be a multiple of --memory-bptt')
         if args.branch_share > 0 or args.teacher_v2:
             p.error('--temporal 1: branches (--branch-share) and teacher v2 are not supported (v1)')
@@ -1356,6 +1367,10 @@ def main():
     if args.resume:
         ck = torch.load(args.resume, map_location=device)
         ck_model = ck['model']
+        mem_names = []
+        if mem_drop:   # B32 (2026-10-15): the GRU's tensors dropped (and below their Adam state), the rest exact
+            ck_model, mem_names, note_ = drop_memory(learner_model, ck_model)
+            print(note_, flush=True)
         if share_convert:   # 2026-10-13 (B23): the B21 table dropped, the item tokens' first Linear converted
             ck_model, note_ = share_item_table(learner_model, ck_model)
             print(note_, flush=True)
@@ -1373,7 +1388,7 @@ def main():
             copt.load_state_dict(ck['choice_optimizer'])
         osd = ck['optimizer']
         ck_ext = any(k.startswith(('itok.', 'gtok.')) for k in ck['model'])
-        if itok_fresh or gtok_fresh or (mem_fresh and ck_ext) or share_convert or tatt_fresh:
+        if itok_fresh or gtok_fresh or (mem_fresh and ck_ext) or share_convert or tatt_fresh or mem_drop:
             # 2026-10-12 (B21 / B22): new parameters (not necessarily the last ones): Adam's state remapped by name
             # (B23 share_convert: itok.coll's state gone with it, the converted Linear's state starts fresh)
             added = remap_optimizer_state(osd, main_parameter_names(list(ck['model'])),
@@ -1394,7 +1409,8 @@ def main():
                       f'parameters, width {args.temporal_width} x {args.temporal_layers} layers, window '
                       f'{args.temporal_window}, rooms {args.temporal_rooms}) appended fresh, gates g1 / g2 / g3 zero '
                       '(the same outputs as the checkpoint at the start)', flush=True)
-            print(f'--resume: Adam state remapped by parameter name, {added} new tensors without state', flush=True)
+            print(f'--resume: Adam state remapped by parameter name, {added} new tensors without state'
+                  + (f', {len(mem_names)} dropped (the GRU\'s)' if mem_drop else ''), flush=True)
         elif mem_fresh:   # 2026-10-11 (memory): the GRU's parameters are the optimiser's last ones, with no state yet
             added = pad_optimizer_state(osd, len(learner_model.main_parameters()))
             print(f'memory: --resume of a memory-free checkpoint: GRU (size {mem_dim}) initialised fresh, its output '
@@ -1568,7 +1584,8 @@ def main():
     if t_on:
         print(f'temporal (B30): width {args.temporal_width} x {args.temporal_layers} layers x {args.temporal_heads} '
               f'heads, window {args.temporal_window}, rooms {args.temporal_rooms}, learner chunks of {T_t} decisions '
-              f'(GRU chunks of {T_mem} inside), K / V {args.temporal_kv}; actor cache '
+              + (f'(GRU chunks of {T_mem} inside)' if mem_on else '(no GRU: no nested chunks)')
+              + f', K / V {args.temporal_kv}; actor cache '
               f'{t_state.kv.numel() * t_state.kv.element_size() / 2 ** 20:.0f} MiB; gates {learner_model.tatt.gates()}',
               flush=True)
     use_graphs = args.graph_entities > 0 and (bool(args.memory_graph) or not mem_on)
@@ -1790,10 +1807,12 @@ def main():
         if lab_on and not args.lab_ppo:   # 2026-10-08: the lab episodes' decisions left out of PPO
             mask &= rl.rows['lab'] == 0
         sec('gae')
-        lw = None   # (memory) per row of flat: 1 = trained, 0 = only stepped through by the GRU (or padding)
-        if mem_on:   # 2026-10-11 (memory): every worker's decisions in chunks of T_mem (memory_chunks), chunk-major
-            # (B30 temporal: chunks of T_t decisions per worker, each padded to whole GRU chunks of T_mem)
-            mplan = temporal_chunks(rl.length, mask, T_t, T_mem) if t_on else memory_chunks(rl.length, mask, T_mem)
+        lw = None   # (memory / temporal) per row of flat: 1 = trained, 0 = only stepped through (or padding)
+        if chunked:   # 2026-10-11 (memory): every worker's decisions in chunks of T_mem (memory_chunks), chunk-major
+            # (B30 temporal: chunks of T_t decisions per worker, each padded to whole GRU chunks of T_mem; B32 without
+            # the GRU: the temporal chunks alone, unpadded)
+            mplan = temporal_chunks(rl.length, mask, T_t, T_mem if mem_on else None) if t_on else \
+                memory_chunks(rl.length, mask, T_mem)
             flat, lw = mplan['pos'], mplan['weight']
             count = int(lw.sum())
         else:
@@ -1844,12 +1863,13 @@ def main():
         if lw is None:
             stale = float((rl.version.reshape(-1)[flat] < L['update']).mean()) if count else 0.0
             reward_mean = float(rl.reward.reshape(-1)[flat].mean())
-        else:   # (memory: over the trained rows only)
+        else:   # (memory / temporal: over the trained rows only)
             stale = float(((rl.version.reshape(-1)[flat] < L['update']) * lw).sum() / max(count, 1))
             reward_mean = float((rl.reward.reshape(-1)[flat] * lw).sum() / max(count, 1))
             b_w = torch.from_numpy(lw).to(device)
-            b_reset = torch.from_numpy(rl.rows['first'].reshape(-1)[flat] != 0).to(device)
-            b_h0 = torch.from_numpy(rl.h.reshape(-1, mem_dim)[mplan['start']]).to(device)   # each chunk's first state
+            if mem_on:   # (the GRU: episode starts inside its chunks, each chunk's first state)
+                b_reset = torch.from_numpy(rl.rows['first'].reshape(-1)[flat] != 0).to(device)
+                b_h0 = torch.from_numpy(rl.h.reshape(-1, mem_dim)[mplan['start']]).to(device)
             ev_rows = torch.from_numpy(np.flatnonzero(lw > 0)).to(device)
         tch = TD = t_rows = has_h = None
         if t_on:   # 2026-10-14 (B30): per temporal chunk its context, room tokens; per row its stored o_{t-1}, episode
@@ -2185,15 +2205,15 @@ def main():
                 if len(sel_h) < mb_units // 4:
                     continue
                 sel = perm[at:at + mb_units]
-                if mem_on:   # (memory) the chunks' rows, chunk after chunk (the GRU runs along each)
+                if chunked:   # (memory) the chunks' rows, chunk after chunk (the GRU runs along each)
                     if t_on:   # (B30) the temporal chunks' rows; their GRU chunks (row // T_mem: whole ones)
                         tc_h = sel_h
                         sel_h = np.concatenate([np.arange(o_, o_ + c_) for o_, c_ in tch[tc_h, :2]])
-                        ch_h = sel_h[::T_mem] // T_mem
+                        ch_h = sel_h[::T_mem] // T_mem if mem_on else None   # (B32: no GRU chunks without memory)
                     else:
                         ch_h = sel_h
                         sel_h = (ch_h[:, None] * T_mem + np.arange(T_mem)[None]).reshape(-1)
-                    ch_d = dev(ch_h)
+                    ch_d = dev(ch_h) if mem_on else None
                     sel = dev(sel_h)
                     n_sel = max(float(lw[sel_h].sum()), 1.0)   # the minibatch's trained decisions
                     if pf_on:   # (B23: normalised over the decisions PPO trains, forced ones 0)
@@ -2215,7 +2235,7 @@ def main():
                 micro = args.micro or len(sel)
                 if mem_on:   # (memory) parts of whole chunks
                     micro = max(T_mem, micro // T_mem * T_mem)
-                if micro < len(sel) and args.sort_micro and not mem_on:
+                if micro < len(sel) and args.sort_micro and not chunked:
                     # the minibatch's rows ordered by their entity count before they are cut into parts: each part
                     # then pads to fewer entity tokens. The minibatch's gradient is the same sum over its rows
                     # (numpy's stable argsort: the order torch.argsort(stable=True) gives on the device)
@@ -2263,7 +2283,7 @@ def main():
                 for lo_, hi_, cids_ in bounds:   # the minibatch's means, a part at a time
                     part = sel[lo_:hi_]
                     part_h = sel_h[lo_:hi_]
-                    if mem_on:   # (memory) the part's share of the minibatch's trained decisions
+                    if chunked:   # (memory / temporal) the part's share of the minibatch's trained decisions
                         pn = float(lw[part_h].sum())
                         w, pm, pn = pn / n_sel, b_w[part], max(pn, 1.0)
                     else:
@@ -2342,14 +2362,16 @@ def main():
                                                                                    **xplan))
                     k_ = len(part)
                     with autocast():
-                        if mem_on:   # (memory) BPTT over the part's chunks from their stored first states; the
+                        if chunked:   # (memory) BPTT over the part's chunks from their stored first states; the
                             #          teacher's records one step each (the old teacher's from 0, teacher v2's own)
-                            c0 = lo_ // T_mem
-                            tails = ([torch.zeros((len(pick), mem_dim), device=device)] if merged else []) + \
-                                ([v_h] if vmerged else [])
-                            memd = dict(h0=b_h0.index_select(0, ch_d[c0:c0 + k_ // T_mem]), T=T_mem,
-                                        reset=b_reset[part].view(-1, T_mem),
-                                        tail=torch.cat(tails) if len(tails) > 1 else (tails[0] if tails else None))
+                            memd = None   # (B32: a temporal model without the GRU)
+                            if mem_on:
+                                c0 = lo_ // T_mem
+                                tails = ([torch.zeros((len(pick), mem_dim), device=device)] if merged else []) + \
+                                    ([v_h] if vmerged else [])
+                                memd = dict(h0=b_h0.index_select(0, ch_d[c0:c0 + k_ // T_mem]), T=T_mem,
+                                            reset=b_reset[part].view(-1, T_mem),
+                                            tail=torch.cat(tails) if len(tails) > 1 else (tails[0] if tails else None))
                             tk_ = {}
                             if t_on:   # (B30) the temporal transformer over the part's chunks
                                 tk_ = dict(temporal=dict(mode='chunk', plan=temporal_part(
@@ -2479,7 +2501,7 @@ def main():
         L['seconds'] += wall
         upd = L['update']
         acc_c, tacc_c = acc.cpu().numpy(), tacc.cpu().numpy()
-        if mem_on:   # (memory: the trained rows only)
+        if chunked:   # (memory / temporal: the trained rows only)
             b_ret, b_val = b_ret.index_select(0, ev_rows), b_val.index_select(0, ev_rows)
         var = float(b_ret.var())
         ev = 1.0 - float((b_ret - b_val).var()) / var if var > 0 else 0.0
@@ -2541,7 +2563,7 @@ def main():
         if gtok_on:   # (B22) value_global's loss and the explained variance of its update-start values
             row['v_global_loss'] = float(gacc[0]) / steps_ if glob_loss else ''
             if glob_loss:
-                rg_, vg_ = (b_ret_g, b_vg) if not mem_on else (b_ret_g.index_select(0, ev_rows),
+                rg_, vg_ = (b_ret_g, b_vg) if not chunked else (b_ret_g.index_select(0, ev_rows),
                                                                 b_vg.index_select(0, ev_rows))
                 var_g = float(rg_.var())
                 row['v_global_ev'] = 1.0 - float((rg_ - vg_).var()) / var_g if var_g > 0 else 0.0
