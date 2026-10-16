@@ -402,9 +402,13 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
 def restore(pt, d, ctx):
     """The point's state at record d: (S, the room's starting monster HP). S is a lean fork of the parked room entry
     (pt.base: a tok_floor.Parked, forked under its lock), reseeded as the episode was, the episode's actions
-    pt.offset .. d-1 played. The caller closes S."""
+    pt.offset .. d-1 played. The caller closes S. B37 (2026-10-16): S lives as long as the point's branches
+    (ctx.alarm = cfg.clone_alarm real seconds, not 120): the counterfactual teacher forks every branch and the
+    replicate from S one after the other, and under a slow actor (C100: 16 ms calls, 44 s lane wait per point) a
+    point's 4 x 180 game s + replicate outlived the 120-s clone watchdog, the next fork found S gone ("connection
+    closed by game": 231 of 5,190 points lost at u721; C99 at 10 s per point: 0)."""
     from .tok_sampler import play_actions
-    S = pt.base.fork(reseed=pt.reseed, lean=True, alarm=120)
+    S = pt.base.fork(reseed=pt.reseed, lean=True, alarm=(max(int(ctx.alarm), 120) if int(ctx.alarm) > 0 else 0))
     try:
         dec = LeanDecoder()
         S._send({"cmd": "obs"})
