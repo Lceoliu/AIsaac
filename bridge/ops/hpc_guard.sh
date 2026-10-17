@@ -32,7 +32,10 @@ check() {
   done
   # 2026-10-11: forked search children (parent = a worker helper) older than 10 min are stuck (C77 under the pre-fix
   # code: 5 of 6 search slots held for hours, search rate down 4x): ended, the worker's waitpid returns, slot freed
-  for p in $(ps -eo pid,ppid,etimes,cmd | grep "[f]rom multiprocessing" | awk '$3>600 {print $1}'); do
+  # 2026-10-17 (B38 step 5): DISABLED. With a second actor process (--actor-processes 2) the actor-1 process is itself a
+  # multiprocessing child, so its worker helpers matched "parent = a multiprocessing process" and were ended after 10
+  # minutes (C99 hung at u27805, 15:17:50 UTC: 32 workers killed). The B37 clone watchdog covers the stuck-child case.
+  for p in ; do
     pp=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')
     if [ -n "$pp" ] && ps -o cmd= -p "$pp" 2>/dev/null | grep -q "from multiprocessing"; then
       echo "$now stuck search child $p (parent $pp) ended" >> $LOG; kill -KILL "$p" 2>/dev/null
