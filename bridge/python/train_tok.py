@@ -1456,7 +1456,9 @@ def main(argv=None, child=None):
                         "Best with --overlap --decoupled 1 (see the module docstring). '' (default) or the actor's own "
                         'GPU: one GPU, as before. B38 step 3a: a list (cuda:1,cuda:2; needs --learner-process 1): one '
                         "learner process per GPU, each minibatch's parts and the recompute pass split between them, "
-                        'the gradients summed (NCCL); rank 0 publishes the weights, saves, logs')
+                        'the gradients summed (NCCL); rank 0 publishes the weights, saves, logs. Measured (B38 step 3, '
+                        'replay of a C99-size job): no faster than one GPU (each part has a ~50-70 ms fixed cost that '
+                        'every rank pays): not recommended')
     # 2026-10-11 (memory, rl/docs/SCALING_THESIS.md S5b; see the module docstring)
     p.add_argument('--memory', default=None, choices=('off', 'gru'),
                    help='gru: a GRU state per worker between the token encoder and the heads, carried through the '
