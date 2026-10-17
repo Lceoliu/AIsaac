@@ -3453,7 +3453,8 @@ def main(argv=None, child=None):
         cpu_mark, t_mark = time.process_time(), time.perf_counter()
         fail_at = int(os.environ.get('ISAAC_RL_B38_FAIL_AT', '0') or 0)
         dump_dir = os.environ.get('ISAAC_RL_B38_DUMP', '')   # (B38 step 3: save the job of update dump_at)
-        dump_at = int(os.environ.get('ISAAC_RL_B38_DUMP_AT', '5') or 5)
+        dump_at = int(os.environ.get('ISAAC_RL_B38_DUMP_AT', '5') or 5)   # (the dump_at-th job of this process)
+        n_jobs = 0
         print(f'learner process (B38 step 2): pid {os.getpid()}, {ldev}, {len(views)} shared rollouts'
               + (f', rank {lrank} of {lworld}' if lworld > 1 else ''), flush=True)
         try:
@@ -3494,7 +3495,8 @@ def main(argv=None, child=None):
                     if fail_at and L['update'] + 1 == fail_at and lrank == lworld - 1:   # (a test aid)
                         raise RuntimeError(f'ISAAC_RL_B38_FAIL_AT: injected failure before update {fail_at}'
                                            + (f' (rank {lrank})' if lworld > 1 else ''))
-                    if dump_dir and L['update'] + 1 == dump_at and lrank == 0:   # (B38 step 3: a job for the bench)
+                    n_jobs += 1
+                    if dump_dir and n_jobs == dump_at and lrank == 0:   # (B38 step 3: a job for the bench)
                         dump_job(job, v, dump_dir)
                     if ddp is not None:   # (rank 1's memory, for rank 0's log)
                         mem_ = torch.tensor([float(torch.cuda.max_memory_reserved(ldev))], dtype=torch.float64)

@@ -54,9 +54,9 @@ variant() {
     k) echo "--learner-device cuda:1,cuda:0 --learner-process 1 --overlap --decoupled 1" ;;
   esac
 }
-gpumon() {   # GPUs 1 and 2 (physical numbering) and the load every 10 s
+gpumon() {   # our GPUs (physical numbering, B38_SMI) and the load every 10 s
   while true; do
-    echo "$(date +%T) $(nvidia-smi -i 1,2 --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader | tr '\n' ' ')load $(cut -d' ' -f1 /proc/loadavg)"
+    echo "$(date +%T) $(nvidia-smi -i ${B38_SMI:-2,3} --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader | tr '\n' ' ')load $(cut -d' ' -f1 /proc/loadavg)"
     sleep 10
   done
 }
