@@ -18,14 +18,16 @@
 # step 2 (no searches anywhere: no --teacher, --cf 0, as long as C99 runs on this host):
 #        hpc_b38.sh smoke2 [g h a b]  8 workers, 1.5 game hours from scratch
 #        hpc_b38.sh tput3 [a b g]     as tput2 (a second series: a, b and g in one window)
+#        hpc_b38.sh tput4 [g p]       B38 step 4: g and p (= g + --learner-fast 2) in one window
 #        hpc_b38.sh fail              g with ISAAC_RL_B38_FAIL_AT=3: the learner process raises before update 3; the
 #                                     trainer must stop with that error (last.pt by the learner process, no hang)
 #        hpc_b38.sh int               g stopped by SIGINT after 240 s (the learner process finishes, saves last.pt)
 #        hpc_b38.sh kill              g; the trainer (actor) process SIGKILLed after its 3rd update: the learner process
 #                                     must notice, save last.pt and end; the dead trainer's helpers and games are ended
-# a load guard ends a run (SIGINT) when the node's 1-minute load stays above LOADMAX (default 85) for 30 s
+# a load guard ends a run (SIGINT) when the node's 1-minute load stays above LOADMAX (default 90) for 30 s
 source /101063/AIsaac/ws14/hpc_env.sh
-export CUDA_VISIBLE_DEVICES=1,2
+# (since the rebuilt host A, 10-17 evening: ours are GPUs 2 and 3; B38_GPUS / B38_SMI override)
+export CUDA_VISIBLE_DEVICES=${B38_GPUS:-2,3}
 R=$ABP_HOME/runs
 CK=/101063/AIsaac/ws9/runs/c99-scratch/checkpoints/segment1-final.pt
 COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --epochs 3 --teacher --teacher-queue 12 --archive-size 12 \
@@ -49,11 +51,12 @@ variant() {
     f) echo "--learner-device cuda:1 --overlap --decoupled 1 --switch-interval 0.005" ;;
     g) echo "--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1" ;;
     h) echo "--learner-device cuda:1 --learner-process 1" ;;
+    p) echo "--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1 --learner-fast 2" ;;
   esac
 }
 gpumon() {   # GPUs 1 and 2 (physical numbering) and the load every 10 s
   while true; do
-    echo "$(date +%T) $(nvidia-smi -i 1,2 --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader | tr '\n' ' ')load $(cut -d' ' -f1 /proc/loadavg)"
+    echo "$(date +%T) $(nvidia-smi -i ${B38_SMI:-2,3} --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader | tr '\n' ' ')load $(cut -d' ' -f1 /proc/loadavg)"
     sleep 10
   done
 }
@@ -82,9 +85,9 @@ run_one() {   # tag timeout flags...
   while kill -0 $tp 2>/dev/null; do   # (the load guard: SIGINT to timeout, which hands it to the trainer)
     sleep 10
     l=$(cut -d. -f1 /proc/loadavg)
-    if [ "$l" -gt "${LOADMAX:-85}" ]; then high=$((high + 1)); else high=0; fi
+    if [ "$l" -gt "${LOADMAX:-90}" ]; then high=$((high + 1)); else high=0; fi
     if [ $high -ge 3 ]; then
-      echo "$(date +%T) load $l above ${LOADMAX:-85} for 30 s: $tag stopped"; kill -INT $tp; high=-100000
+      echo "$(date +%T) load $l above ${LOADMAX:-90} for 30 s: $tag stopped"; kill -INT $tp; high=-100000
     fi
   done
   wait $tp; rc=$?
@@ -96,8 +99,12 @@ run_one() {   # tag timeout flags...
 }
 mode=$1; shift
 vs=${*:-a b c}
-BASEFLAGS=$COMMON
-case $mode in tput2|tput3|smoke2|fail|int|kill) BASEFLAGS=$LITE ;; esac
+# (no searches unless asked for: the full flags of a second trainer next to C99 are what hurt C99 on 10-17)
+BASEFLAGS=$LITE
+case $mode in tput|smoke)
+  [ "$B38_ALLOW_SEARCHES" = 1 ] || { echo "$mode runs the searches (--teacher, --cf 1): B38_ALLOW_SEARCHES=1 needed"; exit 1; }
+  BASEFLAGS=$COMMON ;;
+esac
 SMOKE="--workers 8 --checkpoint-every 100000 --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1"
 if [ "$mode" = fail ]; then
   export ISAAC_RL_B38_FAIL_AT=3
@@ -140,7 +147,7 @@ for v in $vs; do
   elif [ "$mode" = smoke ]; then
     run_one b38-smoke-$v 1500 --workers 8 --game-hours 1.5 --checkpoint-every 100000 \
       --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1 $(variant $v)
-  elif [ "$mode" = tput ] || [ "$mode" = tput2 ] || [ "$mode" = tput3 ]; then
+  elif [ "$mode" = tput ] || [ "$mode" = tput2 ] || [ "$mode" = tput3 ] || [ "$mode" = tput4 ]; then
     run_one b38-$mode-$v 2700 $FAST --workers 64 --game-hours 73 --checkpoint-every 100000 \
       --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 --resume $CK $(variant $v)
   fi
