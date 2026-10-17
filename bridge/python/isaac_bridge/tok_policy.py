@@ -1370,6 +1370,11 @@ class TokPolicy(nn.Module):
         u = b.get(key + '_u')
         if u is None:
             return seq(self._conv_in(b[key]))
+        pad = getattr(self, 'cnn_bucket', 0)
+        if pad and u.shape[0] % pad:   # (B38 step 4: the distinct grids padded to a multiple of cnn_bucket with copies
+            #                            of the first, outputs never gathered: the convolutions see few batch sizes and
+            #                            reuse their cuDNN plans; the real rows' values and gradients the same)
+            u = torch.cat([u, u[:1].expand(pad - u.shape[0] % pad)])
         return seq(self._conv_in(b[key].index_select(0, u))).index_select(0, b[key + '_i'])
 
     def _blocks_bucketed(self, xp, b):

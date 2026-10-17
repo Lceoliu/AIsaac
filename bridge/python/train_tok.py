@@ -2237,6 +2237,8 @@ def main(argv=None, child=None):
         fparts = set(os.environ.get('ISAAC_RL_LEARNER_PARTS', 'math,ekeep,buckets,nhwc,ln,dedup,logp,raw').split(',')
                      if fast else ())
         learner_model.set_math_attention('math' in fparts, nhwc='nhwc' in fparts, ln='ln' in fparts)
+        if fast2:   # (B38 step 4: the CNNs' distinct grids in batches of a multiple of 64: cuDNN plans reused)
+            learner_model.cnn_bucket = int(os.environ.get('ISAAC_RL_B38_CNN_BUCKET', '64'))
         n_buckets = int(os.environ.get('ISAAC_RL_LEARNER_BUCKETS', '3'))   # (at most; a measurement aid)
         raw_mode = 'raw' in fparts and teach_gpu and bool(args.teach_merge)   # (B18: minibatches gathered as bytes)
         if L['dumped'] < args.dump_rollouts:   # the rollout and the learner's weights before this update
