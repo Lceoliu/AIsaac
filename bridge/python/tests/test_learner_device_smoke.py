@@ -112,7 +112,9 @@ def _child_cuda(q, ev, pid, descs, scals, tdevs, fa):
             tab = m1.tatt.room_table(view.t_o, TP.temporal_inputs(view, plan['tch']))
             out[k] = dict(kv=view.t_kv[:kk].cpu().numpy(), o=view.t_o[:v.t_obase + kk].cpu().numpy(), nb=nb,
                           tab=[(a.cpu().numpy(), b.cpu().numpy()) for a, b in tab])
-    TS.perturb_all(m1, 77)
+    mw = base_model()   # (perturbed on the CPU, as the parent's reference: the CPU generator)
+    TS.perturb_all(mw, 77)
+    m1 = mw.to(d1)
     params = list(m1.parameters()) + list(m1.buffers())
     with torch.no_grad():
         fb = torch.cat([b.detach().reshape(-1).view(torch.uint8) for b in params])
