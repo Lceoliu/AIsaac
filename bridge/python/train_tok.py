@@ -267,6 +267,27 @@ def _filled(alloc):
     return full
 
 
+def allreduce_grads(params, dist, host_group=None):
+    """(B38 step 3a, --learner-device with several GPUs) the ranks' gradients summed in place. Each rank's parts of a
+    minibatch carry their share of the whole minibatch's means (learn(): w = part / minibatch), so the sum is the
+    minibatch's gradient. A parameter keeps no gradient only where no rank produced one (the optimiser then skips it
+    on every rank, as on one); a rank without one where another has it contributes zeros. The pattern is agreed on the
+    host (host_group, gloo: no wait for the GPU); the gradients go in one flat all-reduce of the default group."""
+    import torch
+    has = torch.tensor([p_.grad is not None for p_ in params], dtype=torch.int32)
+    dist.all_reduce(has, op=dist.ReduceOp.MAX, group=host_group)
+    live = [p_ for p_, h_ in zip(params, has.tolist()) if h_]
+    if not live:
+        return
+    for p_ in live:
+        if p_.grad is None:
+            p_.grad = torch.zeros_like(p_)
+    flat = torch.cat([p_.grad.reshape(-1) for p_ in live])
+    dist.all_reduce(flat)
+    torch._foreach_copy_([p_.grad for p_ in live],
+                         [f_.view_as(p_) for f_, p_ in zip(flat.split([p_.numel() for p_ in live]), live)])
+
+
 def ipc_safe_allocator():
     """(B38 step 2) this process's CUDA allocations in ordinary segments (the allocator's default) even where
     PYTORCH_CUDA_ALLOC_CONF asks for expandable ones (the HPC sandboxes): CUDA IPC of an expandable segment needs
@@ -334,6 +355,73 @@ def attach_arrays(pid, desc, keep):
         keep.append(mm)
         out[k] = np.ndarray(shape, dtype, buffer=mm)
     return out
+
+
+class LearnerGroup(list):
+    """(B38 step 3a) the learner processes, used where one process (or the learner thread) was: alive while all are."""
+
+    def start(self):
+        for q_ in self:
+            q_.start()
+
+    def is_alive(self):
+        return all(q_.is_alive() for q_ in self)
+
+    def join(self, timeout=None):
+        t_end = time.perf_counter() + (timeout or 0)
+        for q_ in self:
+            q_.join(None if timeout is None else max(0.1, t_end - time.perf_counter()))
+
+    def terminate(self):
+        for q_ in self:
+            if q_.is_alive():
+                q_.terminate()
+
+
+class FanOut:
+    """(B38 step 3a) put() to every learner rank's queue (each rank gets the whole job)."""
+
+    def __init__(self, queues):
+        self.queues = queues
+
+    def put(self, obj):
+        for q_ in self.queues:
+            q_.put(obj)
+
+
+def free_port():
+    """A free local TCP port (the learner ranks' rendezvous)."""
+    import socket
+    with socket.socket() as s_:
+        s_.bind(('127.0.0.1', 0))
+        return s_.getsockname()[1]
+
+
+def dump_job(job, view, path):
+    """(B38 step 3, a measurement aid: ISAAC_RL_B38_DUMP) a learner job as abplus_b38_replay.py replays it: the
+    rollout's used part (host arrays cut to the longest worker, scalars, the temporal tensors' used rows on the CPU)
+    and the job's host-side fields."""
+    import torch
+    m = int(view.length.max())
+    arr = {}
+    for k, v in vars(view).items():
+        if isinstance(v, np.ndarray):
+            if v.ndim >= 2 and v.shape[0] == view.n and k.startswith('rooms_') and k != 'rooms_n':
+                arr[k] = v[:, :view.tR + m].copy()
+            elif v.ndim >= 2 and v.shape[0] == view.n and k.startswith('t_'):
+                arr[k] = v[:, :view.tP + m].copy()
+            elif v.ndim >= 2 and v.shape[0] == view.n:
+                arr[k] = v[:, :m].copy()
+            else:
+                arr[k] = v.copy()
+    k_ = view.n * view.tP + view.t_used if view.t_kv is not None else 0
+    tens = None if view.t_kv is None else dict(
+        kv=view.t_kv[:k_].cpu(), o=view.t_o[:view.t_obase + k_].cpu(), rows=int(view.t_kv.shape[0]),
+        orows=int(view.t_o.shape[0]))
+    meta = {k: v for k, v in job.items() if k not in ('roll', 'lroll', 'lready', 'lcopy', 'tdev')}
+    Path(path).mkdir(parents=True, exist_ok=True)
+    torch.save(dict(arrays=arr, scal=rollout_scalars(view), tensors=tens, meta=meta, m=m), Path(path) / 'job.pt')
+    print(f'B38: job of update {meta.get("t_put")} dumped to {path}', flush=True)
 
 
 def rollout_scalars(roll):
@@ -1357,7 +1445,9 @@ def main(argv=None, child=None):
                    help='2026-10-17 (B38): the GPU of the learner (learner_model, Adam, every tensor of the update), '
                         'e.g. cuda:1; the actor (inference, lanes, snapshots, rollouts) stays on the first visible GPU. '
                         "Best with --overlap --decoupled 1 (see the module docstring). '' (default) or the actor's own "
-                        'GPU: one GPU, as before')
+                        'GPU: one GPU, as before. B38 step 3a: a list (cuda:1,cuda:2; needs --learner-process 1): one '
+                        "learner process per GPU, each minibatch's parts and the recompute pass split between them, "
+                        'the gradients summed (NCCL); rank 0 publishes the weights, saves, logs')
     # 2026-10-11 (memory, rl/docs/SCALING_THESIS.md S5b; see the module docstring)
     p.add_argument('--memory', default=None, choices=('off', 'gru'),
                    help='gru: a GRU state per worker between the token encoder and the heads, carried through the '
@@ -1639,19 +1729,36 @@ def main(argv=None, child=None):
     # visible one); otherwise ldev is `device` itself and nothing below changes
     ldev, split = device, False
     device_actor = torch.device('cuda', torch.cuda.current_device())   # (`device` with its index: other threads)
-    if args.learner_device:
-        want = torch.device(args.learner_device)
+    # B38 step 3a: one learner GPU per rank (the list's order); this process's rank (0 outside the learner processes)
+    ldevs = [torch.device(x_.strip()) for x_ in args.learner_device.split(',') if x_.strip()]
+    lrank = child['rank'] if child is not None else 0
+    lworld = max(1, len(ldevs))
+    lbench = child is not None and bool(child.get('bench'))   # (abplus_b38_replay.py: no actor GPU to keep apart)
+    # (a test aid, ISAAC_RL_B38_SHARED_GPU=1: a learner rank may share the actor's GPU: the B13 hazard, functional
+    # tests on fewer GPUs only)
+    lshare = os.environ.get('ISAAC_RL_B38_SHARED_GPU') == '1'
+    for want in ldevs:
         if want.type != 'cuda' or (want.index or 0) >= torch.cuda.device_count():
             p.error(f'--learner-device {args.learner_device}: not one of the {torch.cuda.device_count()} visible GPUs')
-        if (want.index or 0) != torch.cuda.current_device():
-            ldev, split = torch.device('cuda', want.index), True
+    if lworld > 1:
+        idx_ = [(w_.index or 0) for w_ in ldevs]
+        if not args.learner_process or len(set(idx_)) < lworld or (torch.cuda.current_device() in idx_ and not (lbench or lshare)):
+            p.error('--learner-device with several GPUs needs --learner-process 1 and distinct GPUs other than the '
+                    "actor's")
+        if not args.teach_merge:
+            p.error('--learner-device with several GPUs needs --teach-merge 1 (the teachers\' records ride in a part)')
+    if ldevs:
+        want = ldevs[lrank]
+        if (want.index or 0) != torch.cuda.current_device() or lbench or (lshare and lworld > 1):
+            ldev, split = torch.device('cuda', want.index or 0), True
     proc = bool(args.learner_process)   # B38 step 2: the learner in a process of its own
     if proc and not split:
         p.error('--learner-process 1 needs --learner-device on another GPU than the actor\'s (two processes on one GPU: '
                 'the B13 crash class)')
     print(f'devices (B38): actor cuda:{torch.cuda.current_device()} ({torch.cuda.get_device_name()}), learner '
-          + (f'{ldev} ({torch.cuda.get_device_name(ldev)})' if split else 'the same GPU')
-          + (', in a process of its own' if proc else ''), flush=True)
+          + (', '.join(f'{d_} ({torch.cuda.get_device_name(d_)})' for d_ in ldevs) if split else 'the same GPU')
+          + (', in a process of its own' if proc and lworld == 1 else
+             f', {lworld} processes (gradients summed)' if proc else ''), flush=True)
     # (B38 step 2: in the actor's process the learner's weights only start the actor's copy: on the actor's GPU)
     lm_dev = device if (proc and child is None) else ldev
     torch.manual_seed(args.seed)
@@ -2059,6 +2166,11 @@ def main(argv=None, child=None):
                         **(dict(choice_optimizer=copt.state_dict()) if copt is not None else {})),
                    path)
 
+    def ddp_sum(t_):
+        """(B38 step 3a) t_ summed over the learner ranks in place (NCCL)."""
+        ddp['dist'].all_reduce(t_)
+        return t_
+
     def learn(job):
         """One PPO update on a full rollout; signals `fresh` as soon as the new weights are final, then logs."""
         # B38: every tensor of the update on the learner's GPU (`device` below is the learner's; the actor's is adev;
@@ -2142,6 +2254,14 @@ def main(argv=None, child=None):
             with torch.inference_mode():
                 chunk = args.micro or args.minibatch
                 for at in range(0, len(all_flat), chunk):
+                    if ddp is not None and (at // chunk) % ddp['world'] != ddp['rank']:
+                        # (B38 step 3a: another rank's chunk: zeros here, the ranks' results summed below)
+                        z_ = torch.zeros(min(at + chunk, len(all_flat)) - at, device=device)
+                        vals.append(z_)
+                        lps.append(z_)
+                        if gtok_on and (recompute or vg_stored is None):
+                            vgs.append(z_)
+                        continue
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
                     if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
                         b_p = take(every, part)
@@ -2158,6 +2278,11 @@ def main(argv=None, child=None):
                                                                    mem=h_all[part] if mem_on else None, **tk_all(part))
                     vals.append(v_)
                     lps.append(lp_)
+                if ddp is not None:   # (B38 step 3a: every chunk computed by one rank, zeros elsewhere: the sums)
+                    vals, lps = [ddp_sum(torch.cat([x_.float() for x_ in vals]))], \
+                        [ddp_sum(torch.cat([x_.float() for x_ in lps]))]
+                    if vgs:
+                        vgs = [ddp_sum(torch.cat([x_.float() for x_ in vgs]))]
             if recompute:
                 value_now.reshape(-1)[all_flat] = torch.cat(vals).cpu().numpy()
             else:
@@ -2649,6 +2774,8 @@ def main(argv=None, child=None):
                     torch.cuda.current_stream().synchronize()
                 U['temporal'] += time.perf_counter() - t_t0
             perm = torch.randperm(n_units, device=device)
+            if ddp is not None:   # (B38 step 3a: every rank the same minibatches)
+                ddp['dist'].broadcast(perm, 0)
             perm_h = perm.cpu().numpy()
             first_step = True
             for at in range(0, n_units, mb_units):
@@ -2726,12 +2853,19 @@ def main(argv=None, child=None):
                     v_h = L['v2_h'].index_select(0, vpick_d) if mem_on else None   # (memory) their input states
                     v_share = args.teacher_v2_weight * v2_step / n_sel
                     sec('teach_build')
+                micro_b = micro   # (B38 step 3a: with several ranks a minibatch is cut into at least one part per rank)
+                if ddp is not None:
+                    micro_b = max(1, micro // ddp['world'])
+                    if mem_on:
+                        micro_b = max(T_mem, micro_b // T_mem * T_mem)
                 if t_on:   # (B30) parts of whole temporal chunks
-                    bounds = temporal_bounds(tch, tc_h, micro)
+                    bounds = temporal_bounds(tch, tc_h, micro_b)
                 else:
-                    bounds = [(lo_, min(lo_ + micro, len(sel)), None) for lo_ in range(0, len(sel), micro)]
+                    bounds = [(lo_, min(lo_ + micro_b, len(sel)), None) for lo_ in range(0, len(sel), micro_b)]
                 last = bounds[-1][0]
-                for lo_, hi_, cids_ in bounds:   # the minibatch's means, a part at a time
+                for i_b, (lo_, hi_, cids_) in enumerate(bounds):   # the minibatch's means, a part at a time
+                    if ddp is not None and i_b % ddp['world'] != ddp['rank']:   # (B38 step 3a: another rank's part)
+                        continue
                     part = sel[lo_:hi_]
                     part_h = sel_h[lo_:hi_]
                     if chunked:   # (memory / temporal) the part's share of the minibatch's trained decisions
@@ -2943,6 +3077,8 @@ def main(argv=None, child=None):
                     L['trace'].append((acc.clone(), tacc.clone(), None if L['trace'] else
                                        [None if q.grad is None else q.grad.clone()
                                         for q in opt.param_groups[0]['params']]))
+                if ddp is not None:   # (B38 step 3a: the minibatch's gradient = the ranks' parts summed)
+                    allreduce_grads(ddp['params'], ddp['dist'], ddp['gloo'])
                 torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                 opt.step()
                 sec('opt')
@@ -2962,8 +3098,21 @@ def main(argv=None, child=None):
         L['last_update_s'], L['last_steps'], L['last_count'], L['last_U'] = update_s, steps, count, U   # (B18 bench)
         # (B38: read before `fresh`: after it the actor may reuse this rollout; logging only)
         t_rooms_new = int(sum(rl.t_rc[w_, rl.tP:rl.tP + rl.length[w_]].sum() for w_ in range(rl.n))) if t_on else 0
+        if ddp is not None:   # (B38 step 3a: the logged sums over every rank's parts; the weights' agreement)
+            red_ = ddp_sum(torch.cat([acc, tacc, vacc, gacc, pacc, ent_heads, corr_stats]))
+            acc, tacc, vacc, gacc, pacc, ent_heads, corr_stats = red_.split([5, 3, 3, 1, 1, nh, 2])
+            cnt_ = torch.tensor([teach_steps, v2_steps, tokens, parts], dtype=torch.float64)
+            ddp['dist'].all_reduce(cnt_, group=ddp['gloo'])
+            teach_steps, v2_steps, tokens, parts = (int(x_) for x_ in cnt_.tolist())
+            with torch.no_grad():
+                chk_ = torch.stack([q_.detach().double().sum() for q_ in ddp['params']]).sum().view(1)
+            spread_ = torch.cat([chk_, -chk_])
+            ddp['dist'].all_reduce(spread_, op=ddp['dist'].ReduceOp.MAX)
+            L['ddp_spread'] = float(spread_[0] + spread_[1])   # (max - min over the ranks: 0 = the same weights)
         if not L.get('bench'):
             fresh.set()                           # the actor may take the new weights now
+        if ddp is not None and ddp['rank'] != 0:   # (B38 step 3a: rank 0 logs, saves and publishes)
+            return
         # ---- logging (the actor is already running on)
         t_end = time.perf_counter()
         wall = t_end - (L['t_end'] if L['t_end'] is not None else job['t_start'])
@@ -3030,6 +3179,9 @@ def main(argv=None, child=None):
             row['handoff_mb'] = job.get('lbytes', 0) / 2 ** 20
             row['handoff_s'] = job.get('lhand_s', 0.0)
             row['take_weights_s'] = L.get('take_s', 0.0)
+        if ddp is not None:   # B38 step 3a: the ranks, the weights' spread over them (0: the same), rank 1's memory
+            row['ddp_ranks'], row['ddp_spread'] = ddp['world'], L.get('ddp_spread', '')
+            row['gpu_reserved_gb_r1'] = L.get('mem_r1', 0.0) / 2 ** 30
         if child is not None:   # B38 step 2: the message's way (actor put -> here), the mirror copy on the GPU, the
             #                     weights' publication (gather + peer copy + sync), this process's cores
             row['handoff_q_s'] = job.get('lq_s', 0.0)
@@ -3224,6 +3376,7 @@ def main(argv=None, child=None):
     jobs = queue.Queue()
     fresh = threading.Event()        # set by the learner when new weights are final
     failure = []
+    ddp = None   # (B38 step 3a, the learner processes: rank, world, the process groups, the parameters)
 
     def learner_loop():
         if split:   # B38: this thread's current GPU is the learner's (CUDA's current device is per thread)
@@ -3258,12 +3411,21 @@ def main(argv=None, child=None):
         before the `fresh` of the update that read it (as with the thread: the next hand-off waits for it), and this
         process reads nothing of a rollout after its `fresh`. An exception: an 'error' message (the actor raises it);
         the stop message (None) or the actor's end: last.pt saved here, a 'done' message."""
-        nonlocal fresh
+        nonlocal fresh, ddp
         import multiprocessing as mp_
         import traceback
         sys.stdout = child_stdout
         torch.cuda.set_device(ldev)
         torch.cuda.set_stream(learner_stream)
+        if lworld > 1:   # B38 step 3a: the learner ranks' groups (NCCL for tensors, gloo for host-side agreement)
+            import torch.distributed as dist_
+            dist_.init_process_group('nccl', init_method=child['dist_url'], rank=lrank, world_size=lworld)
+            ddp = dict(rank=lrank, world=lworld, dist=dist_, gloo=dist_.new_group(backend='gloo'),
+                       params=list(learner_model.parameters()))
+            with torch.no_grad():   # (the same start everywhere: rank 0's weights and buffers)
+                for q_ in list(learner_model.parameters()) + list(learner_model.buffers()):
+                    dist_.broadcast(q_.data, 0)
+            torch.cuda.synchronize()
         if learner_cpus:
             os.sched_setaffinity(0, learner_cpus)
         jobs_q, results_q, ev = child['jobs'], child['results'], child['fresh']
@@ -3285,12 +3447,15 @@ def main(argv=None, child=None):
             results_q.put(('fresh', dict(update=L['update'], decisions=L['decisions'], seconds=L['seconds'],
                                          pf_p=L.get('pf_p'), publish_s=L['publish_s'])))
             ev.set()
-        fresh = types.SimpleNamespace(set=publish)
+        fresh = types.SimpleNamespace(set=publish if lrank == 0 else (lambda: None))
         parent = mp_.parent_process()
         failed = False
         cpu_mark, t_mark = time.process_time(), time.perf_counter()
         fail_at = int(os.environ.get('ISAAC_RL_B38_FAIL_AT', '0') or 0)
-        print(f'learner process (B38 step 2): pid {os.getpid()}, {ldev}, {len(views)} shared rollouts', flush=True)
+        dump_dir = os.environ.get('ISAAC_RL_B38_DUMP', '')   # (B38 step 3: save the job of update dump_at)
+        dump_at = int(os.environ.get('ISAAC_RL_B38_DUMP_AT', '5') or 5)
+        print(f'learner process (B38 step 2): pid {os.getpid()}, {ldev}, {len(views)} shared rollouts'
+              + (f', rank {lrank} of {lworld}' if lworld > 1 else ''), flush=True)
         try:
             while True:
                 try:
@@ -3326,20 +3491,28 @@ def main(argv=None, child=None):
                         e1.record(streams[1])
                         job['lhand_s'] = time.perf_counter() - t_recv
                         job['lcopy'] = (e0, e1)
-                    if fail_at and L['update'] + 1 == fail_at:   # (a test aid: ISAAC_RL_B38_FAIL_AT)
-                        raise RuntimeError(f'ISAAC_RL_B38_FAIL_AT: injected failure before update {fail_at}')
+                    if fail_at and L['update'] + 1 == fail_at and lrank == lworld - 1:   # (a test aid)
+                        raise RuntimeError(f'ISAAC_RL_B38_FAIL_AT: injected failure before update {fail_at}'
+                                           + (f' (rank {lrank})' if lworld > 1 else ''))
+                    if dump_dir and L['update'] + 1 == dump_at and lrank == 0:   # (B38 step 3: a job for the bench)
+                        dump_job(job, v, dump_dir)
+                    if ddp is not None:   # (rank 1's memory, for rank 0's log)
+                        mem_ = torch.tensor([float(torch.cuda.max_memory_reserved(ldev))], dtype=torch.float64)
+                        ddp['dist'].all_reduce(mem_, op=ddp['dist'].ReduceOp.MAX, group=ddp['gloo'])
+                        L['mem_r1'] = float(mem_[0])
                     learn(job)
                 except BaseException:
                     failed = True
                     results_q.put(('error', traceback.format_exc()))
                     ev.set()
         finally:
-            try:
-                torch.cuda.synchronize()
-                save(out / 'checkpoints' / 'last.pt')
-            except BaseException:
-                results_q.put(('error', 'saving last.pt: ' + traceback.format_exc()))
-            results_q.put(('done', dict(update=L['update'], decisions=L['decisions'], seconds=L['seconds'])))
+            if lrank == 0:
+                try:
+                    torch.cuda.synchronize()
+                    save(out / 'checkpoints' / 'last.pt')
+                except BaseException:
+                    results_q.put(('error', 'saving last.pt: ' + traceback.format_exc()))
+                results_q.put(('done', dict(update=L['update'], decisions=L['decisions'], seconds=L['seconds'])))
             results_q.close()
             results_q.join_thread()
 
@@ -3357,10 +3530,14 @@ def main(argv=None, child=None):
             rolls_init[bid] = dict(arrays=shared.describe(r_), scal=rollout_scalars(r_),
                                    tdev=(r_.t_kv, r_.t_o) if r_.t_kv is not None else None)
             sent_gen[bid] = getattr(r_, 't_grown', 0)
-        learner = mpc.Process(target=learner_child_entry, name='learner', daemon=True, args=(
+        rank_jobs = [jobs] + [mpc.Queue() for _ in range(lworld - 1)]   # (B38 step 3a: one queue per learner rank)
+        dist_url = f'tcp://127.0.0.1:{free_port()}'
+        learner = LearnerGroup(mpc.Process(target=learner_child_entry, name=f'learner{r_}', daemon=True, args=(
             list(sys.argv[1:] if argv is None else argv),
             dict(pid=os.getpid(), stats=sampler.stats.copy(), v2_on=v2_on, rolls=rolls_init, fa=wmove['fa'],
-                 sizes=wmove['sizes'], jobs=jobs, results=results, fresh=fresh)))
+                 sizes=wmove['sizes'], jobs=rank_jobs[r_], results=results, fresh=fresh, rank=r_, dist_url=dist_url)))
+            for r_ in range(lworld))
+        jobs = FanOut(rank_jobs)
         sh_mb = sum(nb for d in rolls_init.values() for (_, nb, _, _) in d['arrays'].values()) / 2 ** 20
         print(f'learner process (B38 step 2): rollouts\' host arrays shared ({sh_mb:.0f} MiB of address space, '
               'pages as written), their temporal tensors and the weights\' buffer through CUDA IPC', flush=True)
@@ -3741,7 +3918,8 @@ def main(argv=None, child=None):
     finally:
         jobs.put(None)
         if proc:   # B38 step 2: the learner process finishes its update, saves last.pt and says 'done'
-            t_lim = time.perf_counter() + 900
+            # (a learner rank that failed may leave the others in a collective: then a short wait, then they end)
+            t_lim = time.perf_counter() + (60 if (failure and lworld > 1) else 900)
             while time.perf_counter() < t_lim:
                 try:
                     kind, info = results.get(timeout=1.0)

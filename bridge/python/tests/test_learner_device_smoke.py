@@ -25,6 +25,11 @@ Checks:
       which the parent's foreach copy (weight_mover without a learner side, as take_weights) gives exactly those
       weights. (The failure paths of the process mode, the learner's error message, the actor's end, SIGINT, are
       tested on the real trainer: rl/bridge/ops/hpc_b38.sh fail / kill / smoke.)
+  (f) B38 step 3a (CPU, gloo): train_tok.allreduce_grads over two spawned ranks, each the backward of one part of a
+      minibatch (the parts weighted by their share, the second part also through the danger head, which the first
+      rank never reaches): the summed gradients == one process's accumulated gradients over both parts, bit for bit
+      (including the parameters only one rank reached and the ones none reached: None everywhere), and the Adam step
+      after it gives the same parameters on both ranks and in the one process.
 """
 import copy
 import os
@@ -124,6 +129,44 @@ def _child_cuda(q, ev, pid, descs, scals, tdevs, fa):
     ev.set()
 
 
+CFG_F = dict(TS.SMALL, **TS.BASE)
+
+
+def _f_parts():
+    """(f) the model, one minibatch of 12 records in two parts and their weights (the same in every process)."""
+    torch.manual_seed(11)
+    m = TP.TokPolicy(**CFG_F)
+    FT_ = TS.FT
+    FT_.perturb(m, 12)
+    rng = np.random.default_rng(13)
+    rows = FT_.realistic_rows(rng, 12)
+    pend = M.synth_pending(rng, 12, m.heads)
+    return m, [(rows[:5], pend[:5], 5 / 12, False), (rows[5:], pend[5:], 7 / 12, True)]
+
+
+def _f_loss(m, rows, pend, w, danger):
+    lg, v, dg = m(TP.to_batch(rows, pend, 'cpu'))[:3]
+    loss = (lg.float().pow(2).mean() + v.float().pow(2).mean()) * w
+    if danger:   # (the second part only: the danger head's parameters get a gradient on one rank)
+        loss = loss + dg.float().pow(2).mean() * w
+    return loss
+
+
+def _f_rank(rank, world, url, q):
+    import torch.distributed as dist
+    dist.init_process_group('gloo', init_method=url, rank=rank, world_size=world)
+    m, parts = _f_parts()
+    opt = torch.optim.Adam(m.parameters(), lr=1e-3)
+    opt.zero_grad(set_to_none=True)
+    _f_loss(m, *parts[rank]).backward()
+    params = list(m.parameters())
+    TT.allreduce_grads(params, dist, None)
+    grads = [None if q_.grad is None else q_.grad.clone() for q_ in params]
+    opt.step()
+    q.put((rank, grads, [q_.detach().clone() for q_ in params]))
+    dist.destroy_process_group()
+
+
 def main():
     if sys.platform.startswith('linux') and torch.cuda.is_available() and torch.cuda.device_count() >= 2:
         TT.ipc_safe_allocator()   # (as the trainer with --learner-process 1: shared CUDA tensors in ordinary segments)
@@ -164,6 +207,37 @@ def main():
         worst = max(worst, 0.0 if all(torch.equal(x, y) for x, y in zip(o_r, o_v)) else TS.maxd(o_r, o_v))
     check('(a) one mirror dict across rollouts of other pool sizes (reallocated each time), still exact',
           worst == 0.0 and shapes[0] != shapes[1] and shapes[0] == shapes[2], f'shapes {shapes}')
+
+    # ------------------------------------------------------------ (f) two learner ranks' gradients (gloo, CPU)
+    m_f, parts_f = _f_parts()
+    opt_f = torch.optim.Adam(m_f.parameters(), lr=1e-3)
+    opt_f.zero_grad(set_to_none=True)
+    for part_ in parts_f:
+        _f_loss(m_f, *part_).backward()
+    g_ref = [None if q_.grad is None else q_.grad.clone() for q_ in m_f.parameters()]
+    opt_f.step()
+    p_ref = [q_.detach().clone() for q_ in m_f.parameters()]
+    mpc_f = torch.multiprocessing.get_context('spawn')
+    q_f = mpc_f.Queue()
+    url_f = f'tcp://127.0.0.1:{TT.free_port()}'
+    procs_f = [mpc_f.Process(target=_f_rank, args=(r_, 2, url_f, q_f)) for r_ in range(2)]
+    for pr_ in procs_f:
+        pr_.start()
+    got_f = {}
+    for _ in range(2):
+        r_, g_, p_ = q_f.get(timeout=600)
+        got_f[r_] = (g_, p_)
+    for pr_ in procs_f:
+        pr_.join(60)
+    n_none = sum(g_ is None for g_ in g_ref)
+    n_one = sum(1 for g_, q_ in zip(g_ref, m_f.parameters()) if g_ is not None and 'danger' in
+                next(k_ for k_, v_ in m_f.named_parameters() if v_ is q_))
+    same_g = all(all((a_ is None and b_ is None) or (a_ is not None and b_ is not None and torch.equal(a_, b_))
+                     for a_, b_ in zip(g_ref, got_f[r_][0])) for r_ in (0, 1))
+    same_p = all(all(torch.equal(a_, b_) for a_, b_ in zip(p_ref, got_f[r_][1])) for r_ in (0, 1))
+    check('(f) two ranks, allreduce_grads: the summed gradients == one process over both parts, bit for bit (None '
+          'where no rank reached a parameter); Adam gives the same parameters everywhere', same_g and same_p and
+          n_one > 0, f'{len(g_ref)} parameters, {n_one} reached by one rank only (danger head), {n_none} by none')
 
     # ------------------------------------------------------------ (d) shared rollouts in a spawned process (Linux)
     linux = sys.platform.startswith('linux') and Path('/proc/self/fd').is_dir()

@@ -25,7 +25,9 @@
 #                                     must notice, save last.pt and end; the dead trainer's helpers and games are ended
 # a load guard ends a run (SIGINT) when the node's 1-minute load stays above LOADMAX (default 85) for 30 s
 source /101063/AIsaac/ws14/hpc_env.sh
-export CUDA_VISIBLE_DEVICES=1,2
+# (2026-10-17 evening, the rebuilt host A with 4 GPUs: C99 on GPUs 0 / 1, its watcher on 2 now and then: ours 2 and 3;
+#  B38_GPUS overrides)
+export CUDA_VISIBLE_DEVICES=${B38_GPUS:-2,3}
 R=$ABP_HOME/runs
 CK=/101063/AIsaac/ws9/runs/c99-scratch/checkpoints/segment1-final.pt
 COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --epochs 3 --teacher --teacher-queue 12 --archive-size 12 \
@@ -49,6 +51,7 @@ variant() {
     f) echo "--learner-device cuda:1 --overlap --decoupled 1 --switch-interval 0.005" ;;
     g) echo "--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1" ;;
     h) echo "--learner-device cuda:1 --learner-process 1" ;;
+    k) echo "--learner-device cuda:1,cuda:0 --learner-process 1 --overlap --decoupled 1" ;;
   esac
 }
 gpumon() {   # GPUs 1 and 2 (physical numbering) and the load every 10 s
@@ -82,9 +85,9 @@ run_one() {   # tag timeout flags...
   while kill -0 $tp 2>/dev/null; do   # (the load guard: SIGINT to timeout, which hands it to the trainer)
     sleep 10
     l=$(cut -d. -f1 /proc/loadavg)
-    if [ "$l" -gt "${LOADMAX:-85}" ]; then high=$((high + 1)); else high=0; fi
+    if [ "$l" -gt "${LOADMAX:-90}" ]; then high=$((high + 1)); else high=0; fi
     if [ $high -ge 3 ]; then
-      echo "$(date +%T) load $l above ${LOADMAX:-85} for 30 s: $tag stopped"; kill -INT $tp; high=-100000
+      echo "$(date +%T) load $l above ${LOADMAX:-90} for 30 s: $tag stopped"; kill -INT $tp; high=-100000
     fi
   done
   wait $tp; rc=$?
@@ -96,9 +99,68 @@ run_one() {   # tag timeout flags...
 }
 mode=$1; shift
 vs=${*:-a b c}
-BASEFLAGS=$COMMON
-case $mode in tput2|tput3|smoke2|fail|int|kill) BASEFLAGS=$LITE ;; esac
+# (no searches unless asked for: the full flags of a second trainer next to C99 are what hurt C99 on 10-17)
+BASEFLAGS=$LITE
+case $mode in tput|smoke)
+  [ "$B38_ALLOW_SEARCHES" = 1 ] || { echo "$mode runs the searches (--teacher, --cf 1): B38_ALLOW_SEARCHES=1 needed"; exit 1; }
+  BASEFLAGS=$COMMON ;;
+esac
 SMOKE="--workers 8 --checkpoint-every 100000 --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1"
+# B38 step 3a (two learner ranks; only GPUs 2 and 3 here, so the functional runs put rank 1 on the actor's GPU:
+# ISAAC_RL_B38_SHARED_GPU=1, a test aid; the speed of two ranks is measured without an actor: dump + replay)
+#   hpc_b38.sh smoke3      variant k (ranks on cuda:1 and the actor's cuda:0), 8 workers, 1.5 game hours
+#   hpc_b38.sh fail3       k with ISAAC_RL_B38_FAIL_AT=3 (rank 1 raises)
+#   hpc_b38.sh dump        g with 64 workers, ISAAC_RL_B38_DUMP: the job of update 8 saved to runs/b38-job
+#   hpc_b38.sh replay      abplus_b38_replay.py on that job: 1 rank vs 2 ranks (8 updates each), then the
+#                          one-update weight comparisons (1 rank micro 2048 twice, 2 ranks, 1 rank micro 4096)
+if [ "$mode" = smoke3 ]; then
+  export ISAAC_RL_B38_SHARED_GPU=1
+  run_one b38-smoke3-k 1500 $SMOKE --game-hours 1.5 $(variant k)
+  echo "$(date +%T) done"; exit 0
+fi
+if [ "$mode" = fail3 ]; then
+  export ISAAC_RL_B38_SHARED_GPU=1 ISAAC_RL_B38_FAIL_AT=3
+  run_one b38-fail3-k 900 $SMOKE --game-hours 1.5 $(variant k)
+  unset ISAAC_RL_B38_FAIL_AT
+  grep -n "injected\|^RuntimeError\|^finished\|learner process\|terminated" $R/b38-fail3-k.log | cut -c1-200 | head -n 12
+  ls -la $R/b38-fail3-k/checkpoints/
+  echo "$(date +%T) done"; exit 0
+fi
+if [ "$mode" = dump ]; then
+  export ISAAC_RL_B38_DUMP=$R/b38-job ISAAC_RL_B38_DUMP_AT=8
+  run_one b38-dump-g 1200 $FAST --workers 64 --game-hours 13 --checkpoint-every 100000 \
+    --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 --resume $CK $(variant g)
+  unset ISAAC_RL_B38_DUMP ISAAC_RL_B38_DUMP_AT
+  ls -la $R/b38-job
+  echo "$(date +%T) done"; exit 0
+fi
+if [ "$mode" = replay ]; then
+  RP="--workers 64 --rollout 32768 --minibatch 4096 --learner-fast 1 --resume $CK --learner-process 1 --overlap --decoupled 1"
+  rp() {   # tag reps devices micro
+    [ -e "$R/$1" ] && { echo "$R/$1 exists: skipped"; return; }
+    PYTHONPATH=. timeout -s INT 1200 $PY abplus_b38_replay.py --job $R/b38-job/job.pt --reps $2 -- $BASEFLAGS $RP \
+      --learner-device $3 --micro $4 --name hb38r --port 49850 --out $R/$1 > $R/$1.log 2>&1 < /dev/null
+    echo "$(date +%T) $1: exit $? tracebacks $(grep -c Traceback $R/$1.log)"; grep "^ranks" $R/$1.log | cut -c1-400
+  }
+  rp b38-rep-r1 8 cuda:0 4096
+  rp b38-rep-r2 8 cuda:0,cuda:1 4096
+  rp b38-rep-r1b 8 cuda:1 4096
+  rp b38-eq-1a 1 cuda:0 2048
+  rp b38-eq-1b 1 cuda:0 2048
+  rp b38-eq-2 1 cuda:0,cuda:1 4096
+  rp b38-eq-1c 1 cuda:0 4096
+  PYTHONPATH=. $PY -c "
+import sys, torch
+R = sys.argv[1]
+ck = {t: torch.load(f'{R}/b38-eq-{t}/checkpoints/last.pt', map_location='cpu', weights_only=False)['model'] for t in ('1a', '1b', '2', '1c')}
+def d(a, b):
+    return max(float((ck[a][k].float() - ck[b][k].float()).abs().max()) for k in ck[a] if ck[a][k].is_floating_point())
+base = torch.load('$CK', map_location='cpu', weights_only=False)['model']
+step = max(float((ck['1a'][k].float() - base[k].float()).abs().max()) for k in base if base[k].is_floating_point())
+print(f'one update from the same job: |1 rank micro 2048 - again| {d("1a", "1b"):.3g}, |2 ranks - 1 rank micro 2048| {d("2", "1a"):.3g}, |2 ranks - 1 rank micro 4096| {d("2", "1c"):.3g}, |1 rank 2048 - 4096| {d("1a", "1c"):.3g}; the update itself moved weights by up to {step:.3g}')
+" $R
+  echo "$(date +%T) done"; exit 0
+fi
 if [ "$mode" = fail ]; then
   export ISAAC_RL_B38_FAIL_AT=3
   run_one b38-fail-g 900 $SMOKE --game-hours 1.5 $(variant g)
