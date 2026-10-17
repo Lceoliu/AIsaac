@@ -2106,7 +2106,7 @@ def main(argv=None, child=None):
 
     b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
 
-    def mark(name, prev=None):
+    def pmark(name, prev=None):
         """(B38 step 4, only with ISAAC_RL_B38_TORCHPROF) end the profiler region prev, open one called name."""
         if prev is not None:
             prev.__exit__(None, None, None)
@@ -2196,7 +2196,7 @@ def main(argv=None, child=None):
                 return dict(temporal=dict(mode='stored', o=t_all['o'][part_], o_prev=t_all['o_prev'][part_],
                                           has=t_all['has'][part_])) if t_on else {}
             vals, lps = [], []
-            m_r = mark('b38:recompute')
+            m_r = pmark('b38:recompute')
             with torch.inference_mode():
                 chunk = args.micro or args.minibatch
                 for at in range(0, len(all_flat), chunk):
@@ -2221,7 +2221,7 @@ def main(argv=None, child=None):
             else:
                 value_now = None
             prox_all = torch.cat(lps)
-            mark(None, m_r)
+            pmark(None, m_r)
             sec('recompute')
         if gtok_on and len(all_flat) and vg_stored is not None and not vgs:   # (B24) the actor's values, as stored
             vg_now = vg_stored
@@ -2791,7 +2791,7 @@ def main(argv=None, child=None):
                     bounds = [(lo_, min(lo_ + micro, len(sel)), None) for lo_ in range(0, len(sel), micro)]
                 last = bounds[-1][0]
                 for lo_, hi_, cids_ in bounds:   # the minibatch's means, a part at a time
-                    m_ = mark('b38:part_plan')
+                    m_ = pmark('b38:part_plan')
                     part = sel[lo_:hi_]
                     part_h = sel_h[lo_:hi_]
                     if chunked:   # (memory / temporal) the part's share of the minibatch's trained decisions
@@ -2875,7 +2875,7 @@ def main(argv=None, child=None):
                         mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1],
                                                                                    **xplan))
                     k_ = len(part)
-                    m_ = mark('b38:part_forward', m_)
+                    m_ = pmark('b38:part_forward', m_)
                     with autocast():
                         if chunked:   # (memory) BPTT over the part's chunks from their stored first states; the
                             #          teacher's records one step each (the old teacher's from 0, teacher v2's own)
@@ -2908,7 +2908,7 @@ def main(argv=None, child=None):
                             outs_ = learner_model(mb, packed=bool(args.packed),
                                                   **(dict(need_vg=True) if glob_loss else {}))
                         logits_, value_, danger_ = outs_[:3]
-                    m_ = mark('b38:part_loss', m_)
+                    m_ = pmark('b38:part_loss', m_)
                     logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
                         logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
                     value = value_[:k_].float()
@@ -2945,9 +2945,9 @@ def main(argv=None, child=None):
                             logits_[o_:], learner_model.gate(mb)[o_:], v_act)
                         vloss, vstats = v2_terms(lp_v, value_[o_:], vpick_d, v_w, v_G, v_share, adv_std, n_sel)
                         loss = loss + vloss
-                    m_ = mark('b38:part_backward', m_)
+                    m_ = pmark('b38:part_backward', m_)
                     loss.backward()
-                    m_ = mark('b38:part_stats', m_)
+                    m_ = pmark('b38:part_stats', m_)
                     with torch.no_grad():
                         if pf_on:   # (B23: kl and clip share over the PPO-trained decisions' rows)
                             acc += torch.stack([pg, vf, ent, kl_f, clip_f]) * w
@@ -3007,10 +3007,10 @@ def main(argv=None, child=None):
                     L['trace'].append((acc.clone(), tacc.clone(), None if L['trace'] else
                                        [None if q.grad is None else q.grad.clone()
                                         for q in opt.param_groups[0]['params']]))
-                m_ = mark('b38:clip_opt', m_)
+                m_ = pmark('b38:clip_opt', m_)
                 torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                 opt.step()
-                mark(None, m_)
+                pmark(None, m_)
                 sec('opt')
         learner_model.eval()
         choice_log = train_choice() if branching else {}   # Phase B2 (before the actor takes the new weights)
