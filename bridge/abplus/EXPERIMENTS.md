@@ -7519,6 +7519,7 @@ HPC160 `ws9/runs/c99-scratch`（沙箱 ws9 = `1ae82d3`；`ws9/hpc_c99.sh run`，
 - **u23000**（27,926 小时，主机 A 重建后第一个点）：过层 **1.17**（进三层 40、四层 7、五层 1，boss 清除 1.18），每局拿 1.71 件，受伤 7.2，用时 297 秒，超时 0.42。第二段三点 0.93 / 1.10 / 1.17。
 - **u24000**（29,141 小时）：过层 **1.19**（进三层 44、四层 6，boss 清除 1.19），每局拿 1.41 件，受伤 6.9，超时 0.30（新低）。第二段四点 0.93 / 1.10 / 1.17 / 1.19。
 - **第二段再次停止**（10-17 20:25 本地 / 12:25 UTC，用户重建主机 A 为 128 核 + 4 卡）：`finished 24868 updates 30194.4 game hours 3.71 h`（本次续跑段 2,650 小时、3.7 小时墙钟 ≈ 716×），last.pt = u24868 / 30,194 小时。重建后以 B38 进程模式续跑（见 B38）。
+- **以 B38 进程模式续跑**（10-17 20:3x 本地，重建后的主机 A，4 × H20）：从 u24868 续，**1,415–1,438×**（之前 765×），参数不变加 `--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1`。
 - **第二段停止**（10-17 16:17 本地 / 08:17 UTC，用户：两台主机重建为最佳 CPU/GPU 配置）：SIGINT 停在 `finished 22688 updates 27547.5 game hours 2.83 h`，`checkpoints/last.pt`（u22688，27,548 小时）与 update-022000.pt 均在 `/101063`（inspurfs 共享存储，容器重建不丢）。续跑：`hpc_c99.sh resume <last.pt>`（`--game-hours` 为增量，补到 50,379 小时还需约 22,800 小时）。
 - **在重建后的 HPC160 上续跑**（10-17 16:5x 本地）：新容器 224 核（cgroup 配额 128 核）、3 × H20 96 GB、1.5 TB，`/opt/aisaac-env`（torch 2.7.1+cu128）、gcc、Xvfb 都在；`/101063` 原样。公钥装好后 ws9/src 移到 41c6633（含 B37），8 worker 冒烟通过（0 Traceback），`CUDA_VISIBLE_DEVICES=0 hpc_c99.sh resume last.pt` 从 u22688 续跑，watcher 与守护循环各一个。速度 750× 左右（单任务一块 H20 的上限，见 B38）。
 - **用户 10-17 的要求**：一台主机只跑一个任务，不要三个任务抢 CPU；目标是把**一个任务**的吞吐推到极限（2,000× 以上），允许多卡。由此开 B38（actor / learner 拆到两块卡并重叠）。C100 曾在这台 GPU 1 上独占跑了 15 次更新（**528×**，推理 5.1 ms，对照 HPC128 共用 GPU 时的 222×），按用户要求停下（last.pt = u5371，6,522 小时），等 HPC128 重建后续跑。
@@ -7631,6 +7632,7 @@ C100 日志里 u721 前有 231 条 "cf search failed: BridgeError: connection cl
 - 附带：第一步脚本里 `exit $?` 读到的是 `date` 的退出码（第一步日志里的 "exit 0" 不可信，Traceback 计数可信），已修。/dev/shm 里有 24 个第一步留下的 `abp-teach-hb38-*` 空文件（0 字节，未删）。
 
 - **合入与部署状态**（10-17 20:3x 本地）：分支以 `b1287fc` 合入 abplus-training（`--learner-device`、`--learner-process 1`、测试、`hpc_b38.sh`、`mk_ws14.sh`）。按用户决定：先停 C99（SIGINT，`finished 24868 updates 30194.4 game hours 3.71 h`，last.pt = u24868 / 30,194 小时），用户把主机 A 重建为 128 核 + 4 × H20，然后 C99 用进程模式（actor GPU 0、learner GPU 1）从 last.pt 续跑，先以全配置冒烟验证，再看实际倍速（预计约 1,200×）。第三步（学习器多卡、actor 多卡）待定。
+- **上线**（10-17 20:3x 本地 / 12:3x UTC，重建后的主机 A：128 核配额、4 × H20）：ws9/src 移到 7feb33e；全配置冒烟（`smoke-b38`，8 worker、教师 + 反事实 + lane 开着、learner 进程在 cuda:1）0 Traceback；`resume-b38` 从 last.pt（u24868）续跑，actor cuda:0、learner cuda:1，watcher 在 cuda:2。前 100 次更新 **1,415–1,438×**（collect 2.7–2.9 s、update 3.0–3.1 s、推理 3.7–3.9 ms、worker 空等 0.49–0.54），比同步的 765× 快 **1.85 倍**，高于 1,200× 的估计（全配置下 update 没有像估计的那样再加 0.6 s 重算）。每次更新的 KL 0.025–0.033（同步时 0.012，重叠的一轮陈旧度所致，与测试一致），盯 clip_frac 和 128 种子曲线。显存：actor 卡 3.9 GB、learner 卡 10.9 GB；GPU 2、3 空闲（第三步用）。
 
 
 ### A29 C99 回放在忏悔移植副本上停滞的原因：起手的 D6（2026-10-17，3090 沙箱 b35 + 本机 worker-01）
