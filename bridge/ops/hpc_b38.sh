@@ -24,6 +24,17 @@
 #        hpc_b38.sh int               g stopped by SIGINT after 240 s (the learner process finishes, saves last.pt)
 #        hpc_b38.sh kill              g; the trainer (actor) process SIGKILLed after its 3rd update: the learner process
 #                                     must notice, save last.pt and end; the dead trainer's helpers and games are ended
+# step 5 (--actor-processes 2; variants: p one actor process, q two actor processes on the first visible GPU (a test
+# layout: two CUDA processes on one GPU), t6 two actors on cuda:0 / cuda:2 with the learner on cuda:1):
+#        hpc_b38.sh smoke5 [p q]      8 workers, 1.5 game hours from scratch (q: 2 x 4)
+#        hpc_b38.sh corr5 [p q]       32 workers (q: 2 x 16), 30 updates from segment1-final.pt: the learning numbers
+#        hpc_b38.sh fail5             q, the learner raises before update 3: both actors stop, last.pt saved
+#        hpc_b38.sh int5              q, SIGINT after 240 s
+#        hpc_b38.sh kill5             q, the second actor process SIGKILLed after update 5: the run ends cleanly
+#        hpc_b38.sh tput6 [p6 t6]     the 4-GPU measurement (C99 stopped; B38_GPUS=0,1,2,3 B38_SMI=0,1,2,3
+#                                     B38_C99_STOPPED=1): 64 workers, 60 updates, no searches; p6 = one actor on cuda:0
+#        hpc_b38.sh smoke6-full [t6]  the full C99 flags (searches) with two actors, 8 workers (B38_ALLOW_SEARCHES=1)
+#        hpc_b38.sh tput6-full [t6]   the full C99 flags, 64 workers, 60 updates (B38_ALLOW_SEARCHES=1, C99 stopped)
 # a load guard ends a run (SIGINT) when the node's 1-minute load stays above LOADMAX (default 90) for 30 s
 source /101063/AIsaac/ws14/hpc_env.sh
 # (since the rebuilt host A, 10-17 evening: ours are GPUs 2 and 3; B38_GPUS / B38_SMI override)
@@ -52,6 +63,9 @@ variant() {
     g) echo "--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1" ;;
     h) echo "--learner-device cuda:1 --learner-process 1" ;;
     p) echo "--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1 --learner-fast 2" ;;
+    q) echo "--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1 --learner-fast 2 --actor-processes 2 --actor-devices cuda:0,cuda:0" ;;
+    p6) echo "--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1 --learner-fast 2" ;;
+    t6) echo "--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1 --learner-fast 2 --actor-processes 2 --actor-devices cuda:0,cuda:2" ;;
   esac
 }
 gpumon() {   # GPUs 1 and 2 (physical numbering) and the load every 10 s
@@ -101,11 +115,46 @@ mode=$1; shift
 vs=${*:-a b c}
 # (no searches unless asked for: the full flags of a second trainer next to C99 are what hurt C99 on 10-17)
 BASEFLAGS=$LITE
-case $mode in tput|smoke)
+case $mode in tput|smoke|smoke6-full|tput6-full)
   [ "$B38_ALLOW_SEARCHES" = 1 ] || { echo "$mode runs the searches (--teacher, --cf 1): B38_ALLOW_SEARCHES=1 needed"; exit 1; }
   BASEFLAGS=$COMMON ;;
 esac
+case $mode in tput6|tput6-full)
+  [ "$B38_C99_STOPPED" = 1 ] || { echo "$mode is the 4-GPU measurement: only while C99 is stopped (B38_C99_STOPPED=1, B38_GPUS=0,1,2,3, B38_SMI=0,1,2,3)"; exit 1; }
+esac
 SMOKE="--workers 8 --checkpoint-every 100000 --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1"
+if [ "$mode" = fail5 ]; then
+  export ISAAC_RL_B38_FAIL_AT=3
+  run_one b38-fail5-q 900 $SMOKE --game-hours 1.5 $(variant q)
+  unset ISAAC_RL_B38_FAIL_AT
+  grep -n "injected\|^RuntimeError\|^finished\|actor process\|terminated" $R/b38-fail5-q.log | cut -c1-200 | head -n 12
+  ls -la --time-style=+%T $R/b38-fail5-q/checkpoints/
+  orphans
+  echo "$(date +%T) done"; exit 0
+fi
+if [ "$mode" = int5 ]; then
+  run_one b38-int5-q 240 $SMOKE --game-hours 50 $(variant q)
+  grep -n "^finished\|actor process\|terminated\|did not end" $R/b38-int5-q.log | cut -c1-200 | head -n 12
+  ls -la --time-style=+%T $R/b38-int5-q/checkpoints/
+  orphans
+  echo "$(date +%T) done"; exit 0
+fi
+if [ "$mode" = kill5 ]; then
+  tag=b38-kill5-q
+  [ -e "$R/$tag" ] && { echo "$R/$tag exists"; exit 1; }
+  PYTHONPATH=. timeout -s INT 900 $PY train_tok.py $BASEFLAGS $SMOKE --game-hours 50 $(variant q) --name hb38 \
+    --port 49800 --out $R/$tag > $R/$tag.log 2>&1 < /dev/null &
+  tp=$!
+  for i in $(seq 1 300); do grep -q "^u5 " $R/$tag.log && break; sleep 2; done
+  a1=$(sed -n 's/.*actor process 1 (B38 step 5): pid \([0-9]*\).*/\1/p' $R/$tag.log | head -n 1)
+  echo "$(date +%T) SIGKILL to the second actor process $a1"
+  kill -KILL $a1
+  wait $tp; rc=$?; echo "$(date +%T) trainer exit $rc"
+  grep -n "^RuntimeError\|^finished\|actor process 1 ended\|terminated" $R/$tag.log | cut -c1-200 | head
+  ls -la --time-style=+%T $R/$tag/checkpoints/
+  orphans
+  echo "$(date +%T) done"; exit 0
+fi
 if [ "$mode" = fail ]; then
   export ISAAC_RL_B38_FAIL_AT=3
   run_one b38-fail-g 900 $SMOKE --game-hours 1.5 $(variant g)
@@ -147,6 +196,16 @@ for v in $vs; do
   elif [ "$mode" = smoke ]; then
     run_one b38-smoke-$v 1500 --workers 8 --game-hours 1.5 --checkpoint-every 100000 \
       --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1 $(variant $v)
+  elif [ "$mode" = smoke5 ]; then
+    run_one b38-smoke5-$v 1500 $SMOKE --game-hours 1.5 $(variant $v)
+  elif [ "$mode" = smoke6-full ]; then
+    run_one b38-smoke6full-$v 1500 $SMOKE --game-hours 1.5 $(variant $v)
+  elif [ "$mode" = corr5 ]; then
+    run_one b38-corr5-$v 2400 $FAST --workers 32 --game-hours 36.5 --checkpoint-every 100000 \
+      --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 --resume $CK $(variant $v)
+  elif [ "$mode" = tput6 ] || [ "$mode" = tput6-full ]; then
+    run_one b38-$mode-$v 2700 $FAST --workers 64 --game-hours 73 --checkpoint-every 100000 \
+      --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 --resume $CK $(variant $v)
   elif [ "$mode" = tput ] || [ "$mode" = tput2 ] || [ "$mode" = tput3 ] || [ "$mode" = tput4 ]; then
     run_one b38-$mode-$v${B38_WORKERS:+-w$B38_WORKERS} 2700 $FAST --workers ${B38_WORKERS:-64} --game-hours 73 --checkpoint-every 100000 \
       --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 --resume $CK $(variant $v)
