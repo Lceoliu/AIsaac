@@ -267,6 +267,19 @@ def _filled(alloc):
     return full
 
 
+def memfd(name):
+    """(B38 step 2) an anonymous shared-memory file (memfd_create, close-on-exec); through libc where this Python
+    lacks os.memfd_create (the HPC's conda build)."""
+    if hasattr(os, 'memfd_create'):
+        return os.memfd_create(name, os.MFD_CLOEXEC)
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.memfd_create(name.encode(), 1)   # (MFD_CLOEXEC)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), 'memfd_create')
+    return fd
+
+
 class SharedArrays:
     """(B38 step 2, --learner-process 1) an allocator of zeroed numpy arrays in shared memory (one memfd each: not
     bound by /dev/shm's size; pages are allocated when touched, like numpy's zeros) that the learner process maps
@@ -281,7 +294,7 @@ class SharedArrays:
         dtype = np.dtype(dtype)
         shape = (int(shape),) if np.isscalar(shape) else tuple(int(s) for s in shape)
         nbytes = max(int(np.prod(shape)) * dtype.itemsize, 1)
-        fd = os.memfd_create('b38-rollout', os.MFD_CLOEXEC)
+        fd = memfd('b38-rollout')
         os.ftruncate(fd, nbytes)
         mm = mmap.mmap(fd, nbytes)
         a = np.ndarray(shape, dtype, buffer=mm)

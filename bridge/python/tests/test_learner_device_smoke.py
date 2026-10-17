@@ -162,7 +162,7 @@ def main():
           worst == 0.0 and shapes[0] != shapes[1] and shapes[0] == shapes[2], f'shapes {shapes}')
 
     # ------------------------------------------------------------ (d) shared rollouts in a spawned process (Linux)
-    linux = hasattr(os, 'memfd_create') and Path('/proc/self/fd').is_dir()
+    linux = sys.platform.startswith('linux') and Path('/proc/self/fd').is_dir()
     srolls = None
     if linux:
         sa = TT.SharedArrays()
