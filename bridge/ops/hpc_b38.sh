@@ -12,7 +12,16 @@
 # variants: a one GPU, synchronous (as C99); b two GPUs + --overlap --decoupled 1; c two GPUs, synchronous;
 #           d one GPU + --overlap --decoupled 1 (reference: the B11 / B13 contention);
 #           e two GPUs + --overlap, plain ratio, no recompute pass (--decoupled 0 --recompute-values off);
-#           f as b with Python's default thread switch interval (--switch-interval 0.005)
+#           f as b with Python's default thread switch interval (--switch-interval 0.005);
+#           g (B38 step 2) two GPUs, the learner in its own process (--learner-process 1) + --overlap --decoupled 1;
+#           h (B38 step 2) as g, synchronous
+# step 2 (no searches anywhere: no --teacher, --cf 0, as long as C99 runs on this host):
+#        hpc_b38.sh smoke2 [g h a b]  8 workers, 1.5 game hours from scratch
+#        hpc_b38.sh fail              g with ISAAC_RL_B38_FAIL_AT=3: the learner process raises before update 3; the
+#                                     trainer must stop with that error (last.pt by the learner process, no hang)
+#        hpc_b38.sh int               g stopped by SIGINT after 240 s (the learner process finishes, saves last.pt)
+#        hpc_b38.sh kill              g; the trainer (actor) process SIGKILLed after its 3rd update: the learner process
+#                                     must notice, save last.pt and end; the dead trainer's helpers and games are ended
 # a load guard ends a run (SIGINT) when the node's 1-minute load stays above LOADMAX (default 85) for 30 s
 source /101063/AIsaac/ws14/hpc_env.sh
 export CUDA_VISIBLE_DEVICES=1,2
@@ -37,6 +46,8 @@ variant() {
     d) echo "--overlap --decoupled 1" ;;
     e) echo "--learner-device cuda:1 --overlap --recompute-values off" ;;
     f) echo "--learner-device cuda:1 --overlap --decoupled 1 --switch-interval 0.005" ;;
+    g) echo "--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1" ;;
+    h) echo "--learner-device cuda:1 --learner-process 1" ;;
   esac
 }
 gpumon() {   # GPUs 1 and 2 (physical numbering) and the load every 10 s
@@ -85,9 +96,47 @@ run_one() {   # tag timeout flags...
 mode=$1; shift
 vs=${*:-a b c}
 BASEFLAGS=$COMMON
-[ "$mode" = tput2 ] && BASEFLAGS=$LITE
+case $mode in tput2|smoke2|fail|int|kill) BASEFLAGS=$LITE ;; esac
+SMOKE="--workers 8 --checkpoint-every 100000 --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1"
+if [ "$mode" = fail ]; then
+  export ISAAC_RL_B38_FAIL_AT=3
+  run_one b38-fail-g 900 $SMOKE --game-hours 1.5 $(variant g)
+  unset ISAAC_RL_B38_FAIL_AT
+  grep -n "injected\|^RuntimeError\|Traceback\|^finished\|learner process" $R/b38-fail-g.log | cut -c1-200 | head -n 12
+  ls -la $R/b38-fail-g/checkpoints/
+  echo "$(date +%T) done"; exit 0
+fi
+if [ "$mode" = int ]; then
+  run_one b38-int-g 240 $SMOKE --game-hours 50 $(variant g)
+  grep -n "Traceback\|^finished\|learner process\|KeyboardInterrupt" $R/b38-int-g.log | cut -c1-200 | head -n 12
+  ls -la --time-style=+%T $R/b38-int-g/checkpoints/
+  echo "$(date +%T) done"; exit 0
+fi
+if [ "$mode" = kill ]; then
+  tag=b38-kill-g
+  [ -e "$R/$tag" ] && { echo "$R/$tag exists"; exit 1; }
+  PYTHONPATH=. timeout -s INT 900 $PY train_tok.py $BASEFLAGS $SMOKE --game-hours 50 $(variant g) --name hb38 \
+    --port 49800 --out $R/$tag > $R/$tag.log 2>&1 < /dev/null &
+  tp=$!
+  for i in $(seq 1 300); do grep -q "^u5 " $R/$tag.log && break; sleep 2; done
+  tr_=$(cat /proc/$tp/task/*/children)   # (timeout's child: the trainer)
+  kids=$(cat /proc/$tr_/task/*/children)
+  lp=$(sed -n 's/.*learner process (B38 step 2): pid \([0-9]*\).*/\1/p' $R/$tag.log | head -n 1)
+  echo "$(date +%T) trainer $tr_, learner process $lp, children: $kids; SIGKILL to the trainer"
+  kill -KILL $tr_
+  for i in $(seq 1 60); do [ -e /proc/$lp ] || break; sleep 1; done
+  echo "$(date +%T) learner process $([ -e /proc/$lp ] && echo STILL ALIVE || echo ended)"
+  for k in $kids; do [ "$k" != "$lp" ] && kill -KILL $k 2>/dev/null; done   # (the dead trainer's worker helpers)
+  wait $tp
+  grep -n "trainer is gone\|Traceback\|learner process" $R/$tag.log | cut -c1-200 | head
+  ls -la --time-style=+%T $R/$tag/checkpoints/
+  orphans
+  echo "$(date +%T) done"; exit 0
+fi
 for v in $vs; do
-  if [ "$mode" = smoke ]; then
+  if [ "$mode" = smoke2 ]; then
+    run_one b38-smoke2-$v 1500 $SMOKE --game-hours 1.5 $(variant $v)
+  elif [ "$mode" = smoke ]; then
     run_one b38-smoke-$v 1500 --workers 8 --game-hours 1.5 --checkpoint-every 100000 \
       --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1 $(variant $v)
   elif [ "$mode" = tput ] || [ "$mode" = tput2 ]; then

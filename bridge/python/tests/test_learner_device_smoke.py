@@ -14,9 +14,20 @@ Checks:
       cuda:0 rollout (same kernels, same values);
   (c) two GPUs: train_tok.weight_mover / move_weights (take_weights' flat path): the actor's parameters and buffers
       (cuda:0) equal the learner's (cuda:1) bit for bit after the move, in place (the same tensors), twice in a row
-      (the buffers reused); the per-tensor fallback gives the same.
+      (the buffers reused); the per-tensor fallback gives the same;
+  (d) Linux, B38 step 2 (--learner-process 1): rollouts made with train_tok.SharedArrays (memfd shared memory) hold
+      the same values as numpy's (the alloc hook changes nothing); a spawned process maps them (attach_arrays,
+      rollout_view with the CPU tensors) and its learner chunk forward over them == the parent's, bit for bit; its
+      writes are seen by the parent;
+  (e) Linux, two GPUs, B38 step 2: a spawned process (on cuda:1) receives the rollouts' cuda:0 tensors and the
+      weights' cuda:0 buffer through CUDA IPC: its hand_off to cuda:1 copies the rows exactly and its room tables ==
+      the parent's on cuda:0; it publishes another set of weights into the buffer and sets an interprocess event, after
+      which the parent's foreach copy (weight_mover without a learner side, as take_weights) gives exactly those
+      weights. (The failure paths of the process mode, the learner's error message, the actor's end, SIGINT, are
+      tested on the real trainer: rl/bridge/ops/hpc_b38.sh fail / kill / smoke.)
 """
 import copy
+import os
 import sys
 from pathlib import Path
 
@@ -52,12 +63,68 @@ def expect_bytes(roll):
         (roll.t_obase + k) * roll.t_o[0].numel() * roll.t_o.element_size()
 
 
+CFG_ON = dict(TS.SMALL, memory=TS.DM, **TS.BASE, **TS.FUSED, **TS.TK)
+
+
+def base_model():
+    torch.manual_seed(5)
+    m = TP.TokPolicy(**CFG_ON).eval()
+    TS.perturb_all(m, 6)
+    return m
+
+
+def shared_rolls(model, sa):
+    """test_temporal_smoke.new_rolls with the shared allocator."""
+    ta = model.tatt
+    tcfg = dict(P=ta.W - 1, L=ta.L, D=ta.D, R=ta.R, kv='fp32', device='cpu')
+    return (TT.Rollout(TS.NW, 40, len(model.heads), model.memory, True, dict(tcfg, rows=None), alloc=sa),
+            TT.Rollout(TS.NW, 40, len(model.heads), model.memory, True, dict(tcfg, rows=5), alloc=sa))
+
+
+def _child_cpu(q, pid, descs, scals, tdevs):
+    """(d) in a spawned process: the shared rollouts' learner outputs; a write the parent must see."""
+    keep = []
+    m = base_model()
+    res = {}
+    for k in sorted(descs):
+        v = TT.rollout_view(TT.attach_arrays(pid, descs[k], keep), scals[k], tdevs[k])
+        res[k] = [x.detach().numpy().copy() for x in TS.learner_outputs(m, v, 'fast', TS.TT_CH)[0]]
+        v.reward[0, 0] = 42.0 + k
+    q.put(res)
+
+
+def _child_cuda(q, ev, pid, descs, scals, tdevs, fa):
+    """(e) in a spawned process on cuda:1: hand_off of the IPC rollouts, room tables, weights published into fa."""
+    d1 = torch.device('cuda', 1)
+    torch.cuda.set_device(d1)
+    keep, mirror = [], {}
+    streams = (torch.cuda.Stream(device=0), torch.cuda.Stream(device=d1))
+    ls = torch.cuda.Stream(device=d1)
+    m1 = base_model().to(d1)
+    out = {}
+    for k in sorted(descs):
+        v = TT.rollout_view(TT.attach_arrays(pid, descs[k], keep), scals[k], tdevs[k])
+        view, ev_c, nb = TT.hand_off(v, mirror, d1, streams)
+        kk = v.n * v.tP + v.t_used
+        plan = TP.temporal_chunks(v.length, np.arange(v.cap)[None] < v.length[:, None], TS.TT_CH, TS.TT_MEM)
+        with torch.no_grad(), torch.cuda.stream(ls):
+            ls.wait_event(ev_c)
+            tab = m1.tatt.room_table(view.t_o, TP.temporal_inputs(view, plan['tch']))
+            out[k] = dict(kv=view.t_kv[:kk].cpu().numpy(), o=view.t_o[:v.t_obase + kk].cpu().numpy(), nb=nb,
+                          tab=[(a.cpu().numpy(), b.cpu().numpy()) for a, b in tab])
+    TS.perturb_all(m1, 77)
+    params = list(m1.parameters()) + list(m1.buffers())
+    with torch.no_grad():
+        fb = torch.cat([b.detach().reshape(-1).view(torch.uint8) for b in params])
+        fa.copy_(fb, non_blocking=True)
+    torch.cuda.synchronize(d1)
+    q.put(out)
+    ev.set()
+
+
 def main():
     rng = np.random.default_rng(38)
-    cfg_on = dict(TS.SMALL, memory=TS.DM, **TS.BASE, **TS.FUSED, **TS.TK)
-    torch.manual_seed(5)
-    m = TP.TokPolicy(**cfg_on).eval()
-    TS.perturb_all(m, 6)
+    m = base_model()
     seq = TS.make_seq(rng)
     pend = [M.synth_pending(rng, TS.NW, m.heads) for _ in seq]
     st = TP.TemporalState(m, TS.NW, 'cpu', torch.float32)
@@ -94,8 +161,46 @@ def main():
     check('(a) one mirror dict across rollouts of other pool sizes (reallocated each time), still exact',
           worst == 0.0 and shapes[0] != shapes[1] and shapes[0] == shapes[2], f'shapes {shapes}')
 
+    # ------------------------------------------------------------ (d) shared rollouts in a spawned process (Linux)
+    linux = hasattr(os, 'memfd_create') and Path('/proc/self/fd').is_dir()
+    srolls = None
+    if linux:
+        sa = TT.SharedArrays()
+        srolls = shared_rolls(m, sa)
+        rng_d = np.random.default_rng(38)
+        seq_d = TS.make_seq(rng_d)
+        pend_d = [M.synth_pending(rng_d, TS.NW, m.heads) for _ in seq_d]
+        TS.run_actor(m, seq_d, pend_d, TS.DM, TP.TemporalState(m, TS.NW, 'cpu', torch.float32), srolls)
+        same_arr = all(np.array_equal(getattr(r1, k_), getattr(r2, k_))
+                       for r1, r2 in zip((ra, rb), srolls) for k_, v_ in vars(r1).items() if isinstance(v_, np.ndarray)) \
+            and all(torch.equal(getattr(r1, k_), getattr(r2, k_)) for r1, r2 in zip((ra, rb), srolls)
+                    for k_ in ('t_kv', 't_s', 't_o'))
+        check('(d) rollouts on SharedArrays == on numpy (every array and tensor after the same sequence)', same_arr)
+        mpc = torch.multiprocessing.get_context('spawn')
+        q = mpc.Queue()
+        descs = {k: sa.describe(r) for k, r in enumerate(srolls)}
+        scals = {k: TT.rollout_scalars(r) for k, r in enumerate(srolls)}
+        tdevs = {k: (r.t_kv, r.t_o) for k, r in enumerate(srolls)}
+        pr = mpc.Process(target=_child_cpu, args=(q, os.getpid(), descs, scals, tdevs))
+        pr.start()
+        res = q.get(timeout=600)
+        pr.join(60)
+        d_out = 0.0
+        for k, r in enumerate(srolls):
+            ref = [x.detach().numpy() for x in TS.learner_outputs(m, r, 'fast', TS.TT_CH)[0]]
+            d_out = max([d_out] + [float(np.abs(a - b).max()) if a.shape == b.shape else float('inf')
+                                   for a, b in zip(ref, res[k])])
+        seen = [float(r.reward[0, 0]) for r in srolls]
+        check('(d) spawned process: learner chunks over the mapped rollouts == the parent\'s, bit for bit; its writes '
+              'seen here', d_out == 0.0 and seen == [42.0, 43.0] and pr.exitcode == 0,
+              f'max |diff| {d_out:.1e}, writes {seen}, exit {pr.exitcode}')
+        for r in srolls:
+            r.reward[0, 0] = 0.0
+    else:
+        print('(d) / (e) skipped: not Linux (memfd, /proc)')
+
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        print('(b) / (c) skipped: fewer than two GPUs')
+        print('(b) / (c) / (e) skipped: fewer than two GPUs')
         print('FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed')
         return 1 if FAIL else 0
     d0, d1 = torch.device('cuda', 0), torch.device('cuda', 1)
@@ -161,6 +266,48 @@ def main():
     astream.synchronize()
     check('(c) the per-tensor fallback gives the same', all(torch.equal(a.cpu(), b.cpu()) for a, b in zip(
         list(actor2.parameters()) + list(actor2.buffers()), a_params)))
+
+    # ------------------------------------------------------------ (e) process mode over CUDA IPC (Linux, two GPUs)
+    if srolls is not None:
+        mpc = torch.multiprocessing.get_context('spawn')
+        q, ev = mpc.Queue(), mpc.Event()
+        g_rolls = []
+        for r in srolls:   # (the actor's rollouts on cuda:0, host arrays shared)
+            r.t_kv, r.t_s, r.t_o = r.t_kv.to(d0), r.t_s.to(d0), r.t_o.to(d0)
+            g_rolls.append(r)
+        torch.cuda.synchronize(d0)
+        actor3 = copy.deepcopy(m).to(d0)
+        a3 = list(actor3.parameters()) + list(actor3.buffers())
+        wm3 = TT.weight_mover(a3, None)
+        descs = {k: sa.describe(r) for k, r in enumerate(g_rolls)}
+        scals = {k: TT.rollout_scalars(r) for k, r in enumerate(g_rolls)}
+        tdevs = {k: (r.t_kv, r.t_o) for k, r in enumerate(g_rolls)}
+        pr = mpc.Process(target=_child_cuda, args=(q, ev, os.getpid(), descs, scals, tdevs, wm3['fa']))
+        pr.start()
+        got_ev = ev.wait(600)
+        out = q.get(timeout=60)
+        with torch.no_grad():
+            torch._foreach_copy_(wm3['av'], list(wm3['fa'].split(wm3['sizes'])))
+        torch.cuda.synchronize(d0)
+        pr.join(60)
+        rows_ok, tab_d = True, 0.0
+        for k, r in enumerate(g_rolls):
+            kk = r.n * r.tP + r.t_used
+            rows_ok &= np.array_equal(out[k]['kv'], r.t_kv[:kk].cpu().numpy()) and \
+                np.array_equal(out[k]['o'], r.t_o[:r.t_obase + kk].cpu().numpy()) and out[k]['nb'] == expect_bytes(r)
+            plan = TP.temporal_chunks(r.length, np.arange(r.cap)[None] < r.length[:, None], TS.TT_CH, TS.TT_MEM)
+            with torch.no_grad():
+                t0 = m0.tatt.room_table(r.t_o, TP.temporal_inputs(r, plan['tch']))
+            for (a, b), (c, e) in zip(t0, out[k]['tab']):
+                tab_d = max(tab_d, float(np.abs(a.cpu().numpy() - c).max()), float(np.abs(b.cpu().numpy() - e).max()))
+        check('(e) learner process: hand_off of the IPC rollouts (cuda:0 -> cuda:1) copies the rows exactly; its room '
+              'tables == the parent\'s', rows_ok and tab_d < 1e-6 and pr.exitcode == 0,
+              f'max |diff| {tab_d:.1e}, exit {pr.exitcode}')
+        ref = base_model()
+        TS.perturb_all(ref, 77)
+        w_ok = got_ev and all(torch.equal(a.cpu(), b) for a, b in zip(a3, list(ref.parameters()) + list(ref.buffers())))
+        check('(e) weights published into the IPC buffer, then the event: the actor\'s foreach copy gives them exactly',
+              w_ok, f'{len(a3)} tensors')
     print('FAILED: ' + ', '.join(FAIL) if FAIL else 'all checks passed')
     return 1 if FAIL else 0
 
