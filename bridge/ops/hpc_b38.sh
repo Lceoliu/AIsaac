@@ -60,7 +60,7 @@ orphans() {
   sleep 30
   n=0
   for p in $(games); do   # (environ read with a time limit: a forking game holds its mm lock)
-    w=$(timeout 2 tr '\000' '\012' < /proc/$p/environ 2>/dev/null | sed -n 's/^ABP_WATCH_PID=//p')
+    w=$(timeout 2 cat /proc/$p/environ 2>/dev/null | tr '    w=$(timeout 2 tr '\000' '\012' < /proc/$p/environ 2>/dev/null | sed -n 's/^ABP_WATCH_PID=//p')00' '    w=$(timeout 2 tr '\000' '\012' < /proc/$p/environ 2>/dev/null | sed -n 's/^ABP_WATCH_PID=//p')12' | sed -n 's/^ABP_WATCH_PID=//p')
     if [ -n "$w" ] && ! kill -0 "$w" 2>/dev/null; then kill -KILL $p 2>/dev/null; n=$((n+1)); fi
   done
   echo "$(date +%T) orphan games ended: $n; games left $(games | wc -l)"
@@ -86,8 +86,8 @@ run_one() {   # tag timeout flags...
       echo "$(date +%T) load $l above ${LOADMAX:-85} for 30 s: $tag stopped"; kill -INT $tp; high=-100000
     fi
   done
-  wait $tp
-  echo "$(date +%T) $tag exit $? tracebacks $(grep -c Traceback $R/$tag.log)"
+  wait $tp; rc=$?
+  echo "$(date +%T) $tag exit $rc tracebacks $(grep -c Traceback $R/$tag.log)"
   kill $mon
   grep "^devices\|^learner device\|^finished" $R/$tag.log | cut -c1-250
   grep "^u[0-9]* " $R/$tag.log | tail -n 2 | cut -c1-220
