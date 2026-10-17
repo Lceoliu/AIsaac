@@ -63,6 +63,15 @@ if [ "$1" = resume-b38 ]; then   # (B38: learner in its own process on the secon
   nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader; uptime
   exit 0
 fi
+if [ "$1" = resume-b38x ]; then   # (B38 steps 2+4+5: two actor processes on the 1st and 3rd visible GPUs, the learner
+  # process on the 2nd, --learner-fast 2, overlap + decoupled; CUDA_VISIBLE_DEVICES=<actor0>,<learner>,<actor1>[,<watcher>])
+  CK=$2
+  PYTHONPATH=. nohup $PY train_tok.py $COMMON $FAST --learner-device cuda:1 --learner-process 1 --overlap --decoupled 1     --learner-fast 2 --actor-processes 2 --actor-devices cuda:0,cuda:2     --workers 64 --game-hours 25000 --checkpoint-every 1000 --rollout 32768 --minibatch 4096 --micro 4096     --resume "$CK" --name hc99 --port 49000 --out $R/c99-scratch >> $R/c99-scratch.log 2>&1 < /dev/null &
+  sleep 300
+  date +%T; grep -i "devices (B38)\|actor processes" $R/c99-scratch.log | tail -n 2 | cut -c1-200; tail -n 3 $R/c99-scratch.log | cut -c1-220; echo "tracebacks $(grep -c Traceback $R/c99-scratch.log)"
+  nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader; uptime
+  exit 0
+fi
 if [ "$1" = smoke-b38 ]; then   # (B38 smoke with the full C99 flags: 8 workers, 1.5 h, learner process on cuda:1)
   shift
   tag=${TAG:-smoke-c99-b38}
