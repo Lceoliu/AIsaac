@@ -148,7 +148,7 @@ for v in $vs; do
     run_one b38-smoke-$v 1500 --workers 8 --game-hours 1.5 --checkpoint-every 100000 \
       --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1 $(variant $v)
   elif [ "$mode" = tput ] || [ "$mode" = tput2 ] || [ "$mode" = tput3 ] || [ "$mode" = tput4 ]; then
-    run_one b38-$mode-$v 2700 $FAST --workers 64 --game-hours 73 --checkpoint-every 100000 \
+    run_one b38-$mode-$v${B38_WORKERS:+-w$B38_WORKERS} 2700 $FAST --workers ${B38_WORKERS:-64} --game-hours 73 --checkpoint-every 100000 \
       --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 --resume $CK $(variant $v)
   fi
 done
