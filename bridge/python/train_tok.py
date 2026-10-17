@@ -380,6 +380,69 @@ def profile_learn(learn, job, path):
     print(f'B38: the profile of one update written to {path}', flush=True)
 
 
+def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on):
+    """(B38 step 4, train_tok --learner-fast 2) what the start-of-update pass needs for the B18 fast path's host plans
+    of records at flat positions of a rollout: per record its entity / door / item counts and its history token's
+    presence on the host, and (dedup) its ids among the distinct grids of rows_dev (the records on the device)."""
+    from isaac_bridge.tok_policy import DEDUP, distinct_ids, item_count
+    w_, t_ = flat // roll.cap, flat % roll.cap
+    fr = dict(ne=roll.rows['n_ent'][w_, t_].astype(np.int64), nd=roll.rows['n_doors'][w_, t_].astype(np.int64),
+              ni=item_count(row_fields(roll, flat, ('inv', 'pitem')), item_slots) if n_item_tok else None,
+              hist=(roll.t_step[w_, roll.tP + t_] > 0) if t_on else None, width=rows_dev['ent'].shape[1])
+    fr['dd'] = {k_: distinct_ids(rows_dev[k_]).cpu().numpy() for k_ in DEDUP} if 'dedup' in fparts else {}
+    fr['dd_size'] = {k_: int(v_.max()) + 1 for k_, v_ in fr['dd'].items()}
+    return fr
+
+
+def fast_plan_rows(fr, raw, pend, lo, hi, fparts, n_buckets, n_item_tok, glob_tok, t_on):
+    """(B38 step 4) records lo .. hi of fast_plan_counts' set as forward(packed=True) takes them on the B18 fast
+    path (what the PPO parts build): their bytes decoded (raw [n, >= ROW_BYTES] uint8, pend [n, heads] on the device;
+    a slice: no gather), the host plan (entity positions, attention buckets, the distinct grids) in one copy (pinned
+    on a GPU)."""
+    import torch
+    from isaac_bridge.tok_policy import decode_rows, first_of, learner_plan, plan_tokens, used_entities
+    dev_ = raw.device
+    ne_p, nd_p = fr['ne'][lo:hi], fr['nd'][lo:hi]
+    mb_ = decode_rows(raw[lo:hi], pending=pend[lo:hi], entities=min(fr['width'], used_entities(ne_p)))
+    xp_ = dict(item_tok=n_item_tok, glob=glob_tok) if (n_item_tok or glob_tok or t_on) else {}
+    if xp_:
+        xp_['n_item'] = fr['ni'][lo:hi] if n_item_tok else None
+    if t_on:
+        xp_['hist'] = fr['hist'][lo:hi]
+    plan = learner_plan(ne_p, nd_p, mb_['ent'].shape[1], n_buckets, **xp_)
+    hn = ['rec', 'base']
+    for k_ in fr['dd']:
+        plan[k_ + '_u'], plan[k_ + '_i'] = first_of(fr['dd'][k_][lo:hi], fr['dd_size'][k_])
+        hn += [k_ + '_u', k_ + '_i']
+    bk_ = plan['buckets'] if 'buckets' in fparts else []
+    arrays = [plan[k_].reshape(-1) for k_ in hn] + [c_ for c_, _ in bk_]
+    on = torch.from_numpy(np.concatenate([np.asarray(a_, np.int64) for a_ in arrays]))
+    if dev_.type == 'cuda':
+        on = on.pin_memory()
+    got = list(on.to(dev_, non_blocking=True).split([len(a_) for a_ in arrays]))
+    got[0] = got[0].view(-1, plan['rec'].shape[1])
+    mb_.update(zip(hn[2:], got[2:len(hn)]))
+    tok = plan_tokens(plan, got[0], got[1])
+    pnames = ['keep', 'starts']
+    if 'ekeep' in fparts:
+        pnames.append('ekeep')
+    if 'buckets' in fparts:
+        pnames.append('gpos')
+        if 'ekeep' in fparts:
+            pnames += ['dkeep', 'xperm'] + (['ikeep', 'glast'] if xp_ else [])
+    mb_.update((k_, tok[k_]) for k_ in pnames)
+    if bk_:
+        mb_['buckets'] = [(c_, w_) for c_, (_, w_) in zip(got[len(hn):], bk_)]
+    return mb_
+
+
+def row_fields(roll, flat, names):
+    """(B38 step 4) the fields `names` of a rollout's records at flat positions (w * cap + t), each gathered on its
+    own (a dict: what item_count reads), instead of whole records (20.8 KB each)."""
+    w, t = flat // roll.cap, flat % roll.cap
+    return {k: roll.rows[k][w, t] for k in names}
+
+
 def rollout_scalars(roll):
     """(B38 step 2) a rollout's attributes that are neither arrays nor tensors (counters, sizes; None for the parts
     that are off): what the learner process's view needs per job besides the shared arrays."""
@@ -1384,7 +1447,11 @@ def main(argv=None, child=None):
                         'float32 matrix products, the input mlps on the real tokens, the CNNs on the distinct grids, '
                         'no host sync per step, the fused Adam; learn() in train_tok.py, EXPERIMENTS.md B18). Not '
                         'bit-identical: the same function in another summation order (abplus_bench_learner.py '
-                        '--check, abplus_check_learner_fp64.py). 0: as before')
+                        '--check, abplus_check_learner_fp64.py). 0: as before. 2 (B38 step 4, 2026-10-17): also '
+                        "the start-of-update pass (--recompute-values / --decoupled) on the fast path's host plans "
+                        '(attention buckets, entity positions, the distinct grids: the same values up to summation '
+                        'order), its records staged in pinned memory and kept as bytes, so that the PPO parts gather '
+                        "bytes after it too (B18's raw gather; values identical), the item counts read from the fields")
     p.add_argument('--learner-compile', default='',
                    help="2026-10-17 (B38 step 4, an experiment): torch.compile mode of the learner model's forward in "
                         "the PPO parts and the recompute pass (e.g. default, max-autotune-no-cudagraphs; dynamic "
@@ -2165,6 +2232,7 @@ def main(argv=None, child=None):
         # (no blocking copy per step), the fused Adam. Not bit-identical to 0 (another summation order):
         # abplus_bench_learner.py --check, abplus_check_learner_fp64.py.
         fast = bool(args.learner_fast)
+        fast2 = args.learner_fast >= 2   # (B38 step 4)
         # (ISAAC_RL_LEARNER_PARTS: a subset of the parts, for the bench's attribution; default all)
         fparts = set(os.environ.get('ISAAC_RL_LEARNER_PARTS', 'math,ekeep,buckets,nhwc,ln,dedup,logp,raw').split(',')
                      if fast else ())
@@ -2195,7 +2263,16 @@ def main(argv=None, child=None):
             # the values the advantages need (and with --decoupled the log-probabilities of the stored actions), from
             # the weights at the start of this update
             value_now = rl.value.copy()
-            every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
+            if fast2:   # (B38 step 4: staged in pinned memory, one asynchronous copy, the bytes kept for the parts)
+                if L.get('stage_r') is None or L['stage_r'].shape[0] < len(all_flat):
+                    L['stage_r'] = None
+                    L['stage_r'] = torch.empty((int(len(all_flat) * 1.25) + 64, ROW_BYTES),
+                                               dtype=torch.uint8).pin_memory()
+                every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
+                                                      stage=L['stage_r'], with_raw=True)
+                fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on)
+            else:
+                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
             # (memory: one GRU step from each decision's stored input state)
             h_all = torch.from_numpy(rl.h.reshape(-1, mem_dim)[all_flat]).to(device) if mem_on else None
@@ -2212,8 +2289,10 @@ def main(argv=None, child=None):
                 chunk = args.micro or args.minibatch
                 for at in range(0, len(all_flat), chunk):
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
+                    b_p = fast_plan_rows(fr_, raw_e, pend_e, at, min(at + chunk, len(all_flat)), fparts, n_buckets,
+                                         NI_f, G_f, t_on) if fast2 else None
                     if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
-                        b_p = take(every, part)
+                        b_p = take(every, part) if b_p is None else b_p
                         with autocast():
                             o_ = lm_call(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
                                                need_vg=True, **tk_all(part))
@@ -2222,7 +2301,8 @@ def main(argv=None, child=None):
                         vgs.append(o_[-1].float())
                     else:
                         with autocast():
-                            lp_, _, v_, _ = learner_model.evaluate(take(every, part), acts_all[part],
+                            lp_, _, v_, _ = learner_model.evaluate(take(every, part) if b_p is None else b_p,
+                                                                   acts_all[part],
                                                                    packed=bool(args.packed),
                                                                    mem=h_all[part] if mem_on else None, **tk_all(part))
                     vals.append(v_)
@@ -2280,7 +2360,14 @@ def main(argv=None, child=None):
         lr = args.lr + (args.lr_final - args.lr) * frac
         for g in opt.param_groups:
             g['lr'] = lr
-        if every is not None:   # the decisions with a reward, out of the records already on the device
+        if every is not None and fast2:   # (B38 step 4: the records' bytes from the start-of-update pass)
+            pos = torch.from_numpy(np.searchsorted(all_flat, flat)).to(device)
+            raw_all, pend_all = raw_e.index_select(0, pos), pend_e.index_select(0, pos)
+            batch = decode_rows(raw_all, pend_all)
+            if args.decoupled:
+                prox = prox_all[pos].clone()
+            del every, prox_all, raw_e, pend_e
+        elif every is not None:   # the decisions with a reward, out of the records already on the device
             pos = torch.from_numpy(np.searchsorted(all_flat, flat)).to(device)
             batch = take(every, pos)
             raw_mode = False   # (B18: no record bytes here; the fields are gathered as before)
@@ -2661,7 +2748,8 @@ def main(argv=None, child=None):
         ne_h = rl.rows['n_ent'].reshape(-1)[flat].astype(np.int64)
         nd_h = rl.rows['n_doors'].reshape(-1)[flat].astype(np.int64)
         # (B24) the records' real item tokens; the plans' extra arguments (none without item / global / history tokens)
-        ni_h = item_count(rl.rows.reshape(-1)[flat], item_slots) if NI_f else None
+        ni_h = (item_count(row_fields(rl, flat, ('inv', 'pitem')), item_slots) if fast2 else
+                item_count(rl.rows.reshape(-1)[flat], item_slots)) if NI_f else None
         xplan = dict(item_tok=NI_f, glob=G_f) if (NI_f or G_f or t_on) else {}
 
         def teach_ni(pick_):
