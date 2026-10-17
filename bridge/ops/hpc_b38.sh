@@ -6,8 +6,12 @@
 # usage: hpc_b38.sh smoke [a b c]   8 workers, 1.5 game hours, the C99 recipe from scratch (hpc_c99.sh smoke)
 #        hpc_b38.sh tput  [a b c]   64 workers, ~60 updates (73 game hours), the C99 run flags + FAST, resumed from
 #                                   C99's segment1-final.pt into ws14/runs/b38-tput-<v> (never pre-created)
+#        hpc_b38.sh tput2 [a b c]   the same without the searches (no --teacher, --cf 0): 2026-10-17 09:13-09:33 the
+#                                   full C99 flags (searches in forked children) of a second 64-worker trainer drove the
+#                                   node's load to ~175 and C99 to ~120x until the run was stopped
 # variants: a one GPU, synchronous (as C99); b two GPUs + --overlap --decoupled 1; c two GPUs, synchronous;
 #           d one GPU + --overlap --decoupled 1 (reference: the B11 / B13 contention)
+# a load guard ends a run (SIGINT) when the node's 1-minute load stays above LOADMAX (default 85) for 30 s
 source /101063/AIsaac/ws14/hpc_env.sh
 export CUDA_VISIBLE_DEVICES=1,2
 R=$ABP_HOME/runs
@@ -21,6 +25,7 @@ COMMON="--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items 
   --obs-v2 1 \
   --cf 1 --cf-points 6 --cf-branches 4 --cf-seconds 180 --cf-target-seconds 20 --cf-margin 0.3 --cf-cap 2 \
   --cf-distill-steps 8 --cf-random 1 --cf-advantage 0"
+LITE=$(echo "$COMMON" | sed -e 's/--teacher --teacher-queue 12/--teacher-queue 12/' -e 's/--cf 1 /--cf 0 /')
 FAST="--actor-compile default --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
 variant() {
   case $1 in
@@ -39,11 +44,14 @@ gpumon() {   # GPUs 1 and 2 (physical numbering) and the load every 10 s
 orphans() {
   sleep 30
   n=0
-  for p in $(pgrep isaac.x64); do
-    w=$( (tr '\000' '\012' < /proc/$p/environ) 2>/dev/null | sed -n 's/^ABP_WATCH_PID=//p')
+  for p in $(games); do   # (environ read with a time limit: a forking game holds its mm lock)
+    w=$(timeout 2 tr '\000' '\012' < /proc/$p/environ 2>/dev/null | sed -n 's/^ABP_WATCH_PID=//p')
     if [ -n "$w" ] && ! kill -0 "$w" 2>/dev/null; then kill -KILL $p 2>/dev/null; n=$((n+1)); fi
   done
-  echo "$(date +%T) orphan games ended: $n; games left $(pgrep -c isaac.x64)"
+  echo "$(date +%T) orphan games ended: $n; games left $(games | wc -l)"
+}
+games() {   # game pids from /proc/<pid>/comm (pgrep reads files that block while a process forks)
+  for d in /proc/[0-9]*; do [ "$(cat $d/comm 2>/dev/null)" = isaac.x64 ] && echo ${d#/proc/}; done
 }
 run_one() {   # tag timeout flags...
   tag=$1; to=$2; shift 2
@@ -51,8 +59,19 @@ run_one() {   # tag timeout flags...
   gpumon > $R/$tag.gpu 2>&1 &
   mon=$!
   echo "$(date +%T) start $tag: $*"
-  PYTHONPATH=. timeout -s INT $to $PY train_tok.py $COMMON "$@" --name hb38 --port 49800 --out $R/$tag \
-    > $R/$tag.log 2>&1 < /dev/null
+  PYTHONPATH=. timeout -s INT $to $PY train_tok.py $BASEFLAGS "$@" --name hb38 --port 49800 --out $R/$tag \
+    > $R/$tag.log 2>&1 < /dev/null &
+  tp=$!
+  high=0
+  while kill -0 $tp 2>/dev/null; do   # (the load guard: SIGINT to timeout, which hands it to the trainer)
+    sleep 10
+    l=$(cut -d. -f1 /proc/loadavg)
+    if [ "$l" -gt "${LOADMAX:-85}" ]; then high=$((high + 1)); else high=0; fi
+    if [ $high -ge 3 ]; then
+      echo "$(date +%T) load $l above ${LOADMAX:-85} for 30 s: $tag stopped"; kill -INT $tp; high=-100000
+    fi
+  done
+  wait $tp
   echo "$(date +%T) $tag exit $? tracebacks $(grep -c Traceback $R/$tag.log)"
   kill $mon
   grep "^devices\|^learner device\|^finished" $R/$tag.log | cut -c1-250
@@ -61,12 +80,14 @@ run_one() {   # tag timeout flags...
 }
 mode=$1; shift
 vs=${*:-a b c}
+BASEFLAGS=$COMMON
+[ "$mode" = tput2 ] && BASEFLAGS=$LITE
 for v in $vs; do
   if [ "$mode" = smoke ]; then
     run_one b38-smoke-$v 1500 --workers 8 --game-hours 1.5 --checkpoint-every 100000 \
       --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1 $(variant $v)
-  elif [ "$mode" = tput ]; then
-    run_one b38-tput-$v 2700 $FAST --workers 64 --game-hours 73 --checkpoint-every 100000 \
+  elif [ "$mode" = tput ] || [ "$mode" = tput2 ]; then
+    run_one b38-$mode-$v 2700 $FAST --workers 64 --game-hours 73 --checkpoint-every 100000 \
       --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 --resume $CK $(variant $v)
   fi
 done
