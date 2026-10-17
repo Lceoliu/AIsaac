@@ -60,7 +60,7 @@ orphans() {
   sleep 30
   n=0
   for p in $(games); do   # (environ read with a time limit: a forking game holds its mm lock)
-    w=$(timeout 2 cat /proc/$p/environ 2>/dev/null | tr '    w=$(timeout 2 tr '\000' '\012' < /proc/$p/environ 2>/dev/null | sed -n 's/^ABP_WATCH_PID=//p')00' '    w=$(timeout 2 tr '\000' '\012' < /proc/$p/environ 2>/dev/null | sed -n 's/^ABP_WATCH_PID=//p')12' | sed -n 's/^ABP_WATCH_PID=//p')
+    w=$(timeout 2 cat /proc/$p/environ 2>/dev/null | tr '\000' '\012' | sed -n 's/^ABP_WATCH_PID=//p')
     if [ -n "$w" ] && ! kill -0 "$w" 2>/dev/null; then kill -KILL $p 2>/dev/null; n=$((n+1)); fi
   done
   echo "$(date +%T) orphan games ended: $n; games left $(games | wc -l)"
