@@ -149,7 +149,7 @@ if [ "$mode" = kill5 ]; then
   a1=$(sed -n 's/.*actor process 1 (B38 step 5): pid \([0-9]*\).*/\1/p' $R/$tag.log | head -n 1)
   echo "$(date +%T) SIGKILL to the second actor process $a1"
   kill -KILL $a1
-  wait $tp; echo "$(date +%T) trainer exit $?"
+  wait $tp; rc=$?; echo "$(date +%T) trainer exit $rc"
   grep -n "^RuntimeError\|^finished\|actor process 1 ended\|terminated" $R/$tag.log | cut -c1-200 | head
   ls -la --time-style=+%T $R/$tag/checkpoints/
   orphans
