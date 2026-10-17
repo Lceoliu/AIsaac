@@ -161,9 +161,9 @@ def _f_rank(rank, world, url, q):
     _f_loss(m, *parts[rank]).backward()
     params = list(m.parameters())
     TT.allreduce_grads(params, dist, None)
-    grads = [None if q_.grad is None else q_.grad.clone() for q_ in params]
+    grads = [None if q_.grad is None else q_.grad.numpy().copy() for q_ in params]   # (numpy: sent by value)
     opt.step()
-    q.put((rank, grads, [q_.detach().clone() for q_ in params]))
+    q.put((rank, grads, [q_.detach().numpy().copy() for q_ in params]))
     dist.destroy_process_group()
 
 
@@ -232,9 +232,10 @@ def main():
     n_none = sum(g_ is None for g_ in g_ref)
     n_one = sum(1 for g_, q_ in zip(g_ref, m_f.parameters()) if g_ is not None and 'danger' in
                 next(k_ for k_, v_ in m_f.named_parameters() if v_ is q_))
-    same_g = all(all((a_ is None and b_ is None) or (a_ is not None and b_ is not None and torch.equal(a_, b_))
+    same_g = all(all((a_ is None and b_ is None) or (a_ is not None and b_ is not None and
+                                                      np.array_equal(a_.numpy(), b_))
                      for a_, b_ in zip(g_ref, got_f[r_][0])) for r_ in (0, 1))
-    same_p = all(all(torch.equal(a_, b_) for a_, b_ in zip(p_ref, got_f[r_][1])) for r_ in (0, 1))
+    same_p = all(all(np.array_equal(a_.numpy(), b_) for a_, b_ in zip(p_ref, got_f[r_][1])) for r_ in (0, 1))
     check('(f) two ranks, allreduce_grads: the summed gradients == one process over both parts, bit for bit (None '
           'where no rank reached a parameter); Adam gives the same parameters everywhere', same_g and same_p and
           n_one > 0, f'{len(g_ref)} parameters, {n_one} reached by one rank only (danger head), {n_none} by none')
