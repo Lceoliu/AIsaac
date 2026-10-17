@@ -443,6 +443,141 @@ def row_fields(roll, flat, names):
     return {k: roll.rows[k][w, t] for k in names}
 
 
+def full_from_local(roll, n_total, lo, alloc):
+    """(B38 step 5, the first actor process) every host array of a rollout of the actor's own workers (axis 0) as the
+    rows lo .. lo + roll.n of an array for all n_total workers made by alloc (SharedArrays: the other actor process and
+    the learner process map them); the rollout's attributes become those rows (views: what the actor writes lands in
+    the shared arrays). Returns {name: full array}."""
+    full = {}
+    for k, v in list(vars(roll).items()):
+        if isinstance(v, np.ndarray):
+            f = alloc((n_total,) + v.shape[1:], v.dtype)
+            f[lo:lo + roll.n] = v
+            setattr(roll, k, f[lo:lo + roll.n])
+            full[k] = f
+    return full
+
+
+def slice_into(roll, full, lo):
+    """(B38 step 5, the other actor processes) a rollout of the actor's own workers on rows lo .. lo + roll.n of the
+    shared full arrays (full_from_local): its initial values written there, its attributes those rows."""
+    for k, v in list(vars(roll).items()):
+        if isinstance(v, np.ndarray):
+            f = full[k]
+            f[lo:lo + roll.n] = v
+            setattr(roll, k, f[lo:lo + roll.n])
+
+
+def merge_rollouts(full, parts, mirror, device):
+    """(B38 step 5, the learner) one rollout of all workers from the actor processes' halves: the shared full host
+    arrays (each actor wrote its own workers' rows) and, per actor (parts: [(first worker, its rollout's scalars,
+    its (t_kv, t_o) or None)], in worker order), its temporal pool on its own GPU. The pools are copied one after
+    another into one mirror on `device` (dict `mirror`, reused while the shapes stay): K / V rows [actor 0's rows,
+    actor 1's rows, ...]; o rows [every actor's carried room sources, then the K / V rows' o in the same order], so
+    o's row = K / V's row + t_obase as in one rollout; each actor's row indices in t_row and rooms_src (host copies,
+    the shared arrays untouched) are moved by its offsets. Only the rows in use are copied (the rest of the mirror is
+    never read for a decision). Returns (the rollout view, bytes copied). The copies run on the current stream of
+    `device` (cross-device copy_: ordered against it); the actors synchronised their writes before their hand-off."""
+    import torch
+    n_total = int(full['length'].shape[0])
+    s0 = parts[0][1]
+    view = Rollout.__new__(Rollout)
+    view.__dict__.update(full)
+    view.__dict__.update({k: s0[k] for k in ('cap', 'nh') if k in s0})
+    view.n = n_total
+    view.value_g = full.get('value_g')
+    view.h = full.get('h')
+    if parts[0][2] is None:
+        view.t_kv = None
+        return view, 0
+    P, R = s0['tP'], s0['tR']
+    view.tP, view.tR = P, R
+    rows = [s['n'] * P + s['t_pool'] + 1 for _, s, _ in parts]
+    obase = [s['n'] * R for _, s, _ in parts]
+    used = [s['n'] * P + s['t_used'] for _, s, _ in parts]
+    kv_off = np.concatenate([[0], np.cumsum(rows)[:-1]]).astype(np.int64)
+    c_off = np.concatenate([[0], np.cumsum(obase)[:-1]]).astype(np.int64)
+    obase_m = int(sum(obase))
+    o_off = obase_m + kv_off
+    kv0, o0 = parts[0][2]
+    kv_shape = (int(sum(rows)),) + tuple(kv0.shape[1:])
+    o_shape = (obase_m + int(sum(rows)),) + tuple(o0.shape[1:])
+    dev = torch.device(device)
+    for name, shape, dt in (('kv', kv_shape, kv0.dtype), ('o', o_shape, o0.dtype)):
+        m = mirror.get(name)
+        if m is None or tuple(m.shape) != shape or m.dtype != dt or m.device != dev:
+            mirror[name] = None
+            mirror[name] = torch.zeros(shape, dtype=dt, device=dev)
+    kv_m, o_m = mirror['kv'], mirror['o']
+    t_row, rooms_src = full['t_row'].copy(), full['rooms_src'].copy()
+    nbytes = 0
+    for a, (lo, s, (kv, o)) in enumerate(parts):
+        u, ob, ko, co, oo = used[a], obase[a], int(kv_off[a]), int(c_off[a]), int(o_off[a])
+        kv_m[ko:ko + u].copy_(kv[:u], non_blocking=True)
+        o_m[co:co + ob].copy_(o[:ob], non_blocking=True)
+        o_m[oo:oo + u].copy_(o[ob:ob + u], non_blocking=True)
+        nbytes += u * kv[0].numel() * kv.element_size() + (ob + u) * o[0].numel() * o.element_size()
+        hi = lo + s['n']
+        tr = t_row[lo:hi]
+        t_row[lo:hi] = np.where(tr >= 0, tr + ko, tr)
+        rs = rooms_src[lo:hi]
+        rooms_src[lo:hi] = np.where(rs < ob, rs + co, rs - ob + oo)
+    view.t_row, view.rooms_src = t_row, rooms_src
+    view.t_kv, view.t_o, view.t_s = kv_m, o_m, None
+    view.t_obase = obase_m
+    view.t_pool = int(sum(rows)) - n_total * P - 1
+    view.t_used = int(sum(s['t_used'] for _, s, _ in parts))
+    view.t_grown = 0
+    return view, nbytes
+
+
+def merge_jobs(halves):
+    """(B38 step 5, the learner) one job from the actor processes' half-jobs (in actor order): episode lists and
+    records concatenated, the workers' counters (stats rows, worker seconds, lane counters, the actor calls' counts and
+    seconds) summed or stacked, collect / cycle / wait seconds the slowest actor's, the per-actor collect seconds kept
+    (collect_actors)."""
+    j = dict(halves[0])
+    num = lambda xs: [x for x in xs if x is not None]   # noqa: E731
+
+    def cat_rec(key):
+        got = num([h.get(key) for h in halves])
+        if not got:
+            return None
+        return tuple(np.concatenate([g[i] for g in got]) for i in range(len(got[0])))
+
+    def sum_dict(key):
+        out = {}
+        for h in halves:
+            for k, v in (h.get(key) or {}).items():
+                out[k] = out.get(k, 0) + v
+        return out
+    j['finished'] = [e for h in halves for e in h.get('finished', [])]
+    j['branch_finished'] = [e for h in halves for e in h.get('branch_finished', [])]
+    for k in ('collect_s', 'wait_learner_s', 'cycle_s', 'cycle_wait_s', 'take_s', 't_put'):
+        if k in j:
+            j[k] = max(h.get(k, 0.0) for h in halves)
+    j['t_start'] = min(h.get('t_start', j.get('t_start')) for h in halves)
+    j['collect_actors'] = ' '.join(f"{h.get('collect_s', 0.0):.3f}" for h in halves)
+    j['prof'], j['worker'], j['lane_stat'] = sum_dict('prof'), sum_dict('worker'), sum_dict('lane_stat')
+    j['stats'] = np.concatenate([h['stats'] for h in halves])
+    j['teach'], j['v2'], j['choices'] = cat_rec('teach'), cat_rec('v2'), cat_rec('choices')
+    j['cpu_collect'] = float(np.mean([h.get('cpu_collect', 0.0) for h in halves]))
+    j['proc_cores'] = float(sum(h.get('proc_cores', 0.0) for h in halves))
+    j['dec_min'] = min(h.get('dec_min', 0.0) for h in halves)
+    j['dec_max'] = max(h.get('dec_max', 0.0) for h in halves)
+    j['dec_w'] = ' '.join(h.get('dec_w', '') for h in halves)
+    j['actor_mem'] = halves[0].get('actor_mem', 0)
+    j['actor_mem_all'] = [h.get('actor_mem', 0) for h in halves]
+    return j
+
+
+def actor_child_entry(argv, init):
+    """(B38 step 5, --actor-processes 2) a second actor process: main() for its share of the workers (its own
+    sampler, GraphActors, lanes, temporal state on its GPU), handing its half of every rollout to the learner process.
+    SIGINT ends it like the first one (its sampler closed; the first actor stops the learner)."""
+    main(argv, actor=init)
+
+
 def rollout_scalars(roll):
     """(B38 step 2) a rollout's attributes that are neither arrays nor tensors (counters, sizes; None for the parts
     that are off): what the learner process's view needs per job besides the shared arrays."""
@@ -1026,9 +1161,10 @@ def learner_child_entry(argv, init):
     main(argv, child=init)
 
 
-def main(argv=None, child=None):
+def main(argv=None, child=None, actor=None):
     """argv: the arguments (default sys.argv[1:]). child (B38 step 2): the learner process's start-up data
-    (learner_child_entry); None: the trainer itself."""
+    (learner_child_entry); None: the trainer itself. actor (B38 step 5): a second actor process's start-up data
+    (actor_child_entry)."""
     import signal
     if child is None:
         # started in the background of a non-interactive shell, SIGINT arrives ignored: both signals end the run
@@ -1462,6 +1598,16 @@ def main(argv=None, child=None):
                         'other threads, its workers and their games are kept off them. The fast learner is bound by '
                         'its host thread, which a busy sibling or a game on the same core slows by ~20%%. '
                         "'' (default): no pinning")
+    p.add_argument('--actor-processes', type=int, default=1,
+                   help='2026-10-17 (B38 step 5, needs --learner-process 1): actor processes, each with --workers / N '
+                        'of the workers (its own sampler, GraphActors, lanes, temporal state, searches) on its own GPU '
+                        '(--actor-devices) and --rollout / N decisions of every rollout; the learner process trains '
+                        'on the halves together (one update, the same decisions, the same one-rollout lag). The '
+                        "second process's workers have their own seeds (--seed + 1000003), names and ports "
+                        '(--port + their first worker). 1: one actor (the trainer process), as before')
+    p.add_argument('--actor-devices', default='',
+                   help="(B38 step 5) the actor processes' GPUs, e.g. cuda:0,cuda:2 ('': the first visible GPU for "
+                        'all; two actor processes on one GPU: the B13 hazard, for tests)')
     p.add_argument('--learner-process', type=int, default=0,
                    help='2026-10-17 (B38 step 2, needs --learner-device on another GPU): 1: the learner runs in a '
                         'process of its own (learner_model, the optimisers, learn(), checkpoints, progress.csv), so '
@@ -1528,6 +1674,19 @@ def main(argv=None, child=None):
                    help="Python's thread switch interval (s): how long the actor may wait for the interpreter while "
                         'the learner thread runs Python (default of Python: 0.005)')
     args = p.parse_args(argv)
+    # B38 step 5: actor processes (aid 0: this trainer process; 1 ..: actor_child_entry), each its share of workers
+    n_act = max(1, int(args.actor_processes))
+    aid = int(actor['aid']) if actor is not None else 0
+    if n_act > 1:
+        if not args.learner_process:
+            p.error('--actor-processes > 1 needs --learner-process 1')
+        if args.workers % n_act or args.rollout % n_act:
+            p.error('--actor-processes must divide --workers and --rollout')
+    n_loc = args.workers // n_act   # (this actor's workers: global indices w_lo .. w_lo + n_loc)
+    w_lo = aid * n_loc
+    if actor is not None:   # (a second actor process: its set-up prints nothing; the first one printed it all)
+        actor_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
     if args.learner_process and child is None and ipc_safe_allocator():   # (B38 step 2: before any CUDA allocation)
         print('learner process (B38 step 2): expandable CUDA segments off in the trainer process (CUDA IPC)', flush=True)
     if args.poll_want <= 0:
@@ -1551,7 +1710,7 @@ def main(argv=None, child=None):
     if args.switch_interval > 0:
         sys.setswitchinterval(args.switch_interval)
     out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=bool(args.resume) or child is not None)
+    out.mkdir(parents=True, exist_ok=bool(args.resume) or child is not None or actor is not None)
     (out / 'checkpoints').mkdir(exist_ok=True)
     run = args.mode == 'run'
     floor = args.mode == 'floor' or run
@@ -1699,11 +1858,18 @@ def main(argv=None, child=None):
     lo, hi = (int(v) for v in args.start_hp.split(':'))
     # the instances' stub list: stub_render_h.txt next to the library (B14; else _g), or --stub-list
     stub = args.stub_list or default_stub_list(default_preload())
-    cfg = TokSamplerConfig(workers=args.workers, specs=specs, assign=assign, frames_per_decision=args.frames_per_decision,
+    # (B38 step 5: an actor process's sampler has its workers only; the second one's seeds, names, ports its own; the
+    # search slots shared out)
+    in_actor = child is None
+    cfg = TokSamplerConfig(workers=n_loc if in_actor else args.workers, specs=specs,
+                           assign=assign[w_lo:w_lo + n_loc] if in_actor else assign,
+                           frames_per_decision=args.frames_per_decision,
                            episodes_per_state=args.episodes_per_state, episode_seconds=args.episode_seconds,
-                           start_hp=(lo, hi), seed=args.seed, name=args.name, port=args.port,
+                           start_hp=(lo, hi), seed=args.seed + 1000003 * aid, name=args.name + (f'a{aid}' if aid else ''),
+                           port=args.port + w_lo,
                            teacher=args.teacher, teacher_share=args.teacher_share, teacher_queue=args.teacher_queue,
-                           teacher_slots=args.teacher_slots, teacher_skip_known=bool(args.teacher_skip_known),
+                           teacher_slots=(max(1, args.teacher_slots // n_act) if args.teacher_slots else 0),
+                           teacher_skip_known=bool(args.teacher_skip_known),
                            teacher_pair=bool(args.teacher_pair),
                            teacher_death_depths=tuple(int(v) for v in args.teacher_death_depths.split(',') if v.strip())
                            if floor else (), teacher_death_margin=args.teacher_death_margin, teacher_thread=args.teacher_thread, teacher_fork=args.teacher_fork,
@@ -1749,6 +1915,11 @@ def main(argv=None, child=None):
           apply_instance_defaults(dict(os.environ)), '| teacher_pair', cfg.teacher_pair, flush=True)
     torch.backends.cuda.matmul.allow_tf32 = args.tf32
     torch.backends.cudnn.allow_tf32 = args.tf32
+    adevs = [torch.device(x_.strip()) for x_ in args.actor_devices.split(',') if x_.strip()]
+    if adevs and len(adevs) != n_act:
+        p.error('--actor-devices: one GPU per actor process')
+    if adevs and child is None:   # (B38 step 5: this actor process's GPU, before CUDA's first use)
+        torch.cuda.set_device(adevs[aid].index or 0)
     device = torch.device('cuda')
     # B38 (2026-10-17, --learner-device): the learner's GPU. split: it is another GPU than the actor's (the first
     # visible one); otherwise ldev is `device` itself and nothing below changes
@@ -1770,7 +1941,7 @@ def main(argv=None, child=None):
           + (', in a process of its own' if proc else ''), flush=True)
     # (B38 step 2: in the actor's process the learner's weights only start the actor's copy: on the actor's GPU)
     lm_dev = device if (proc and child is None) else ldev
-    torch.manual_seed(args.seed)
+    torch.manual_seed(args.seed + 1000003 * aid)   # (B38 step 5: the second actor's sampling draws its own)
     branching = cfg.branch_share > 0   # 2026-10-07 (tok_branch): branch episodes and choice records
     if args.choice_heads < 0:   # Phase B2: K choice-value heads with branches (a resumed checkpoint's own count wins)
         args.choice_heads = 4 if branching else 0
@@ -1862,7 +2033,8 @@ def main(argv=None, child=None):
                   record='tok_obs.ROW', sampler='tok_sampler (fork sampler, lean bridge)',
                   recompute_values_resolved=recompute)
     if child is None:
-        (out / 'config.json').write_text(json.dumps(config, indent=1, default=str))
+        if actor is None:
+            (out / 'config.json').write_text(json.dumps(config, indent=1, default=str))
     log_path = out / 'progress.csv'
     log_file = None
 
@@ -1913,7 +2085,7 @@ def main(argv=None, child=None):
         sampler = JobSampler(bench_stats)
     else:
         sampler = TokSampler(cfg)
-    n = args.workers
+    n = n_loc if child is None else args.workers   # (B38 step 5: an actor process's own workers)
     lab = None
     if lab_on:   # 2026-10-08: the build lab's trainer side (tok_lab: LabBook, LabScheduler, LabModel)
         from isaac_bridge.tok_lab import (JI as LAB_JI, LAB_JOBS, LabBook, LabModel, LabScheduler, load_items)
@@ -1986,15 +2158,25 @@ def main(argv=None, child=None):
             out_['lab_twin_n'], out_['lab_twin_same'] = lab['twin']
             out_['lab_model_rows'] = len(m_.rows)
             return out_
-    capacity = args.rollout // n * 4 + 64
+    capacity = args.rollout // args.workers * 4 + 64   # (per worker: the same in the actor and learner processes)
     # (B30; B31: the per-decision K / V, s and o on the device, a pool of --rollout + 4 x workers rows: a rollout ends
     # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
     t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
-                 kv=args.temporal_kv, device=device, rows=args.rollout + 4 * n + 64) if t_on else None
-    shared = SharedArrays() if (proc and child is None) else None   # (B38 step 2: host arrays the learner maps)
+                 kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64) if t_on else None
+    shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
+    #                                                                                   learner maps)
+    full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
     if child is None:
         roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared), \
             Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared)
+        if n_act > 1 and actor is None:   # (the first actor: the shared arrays of all workers, its rows of them)
+            shared_full = SharedArrays()
+            full_rolls = [full_from_local(r_, args.workers, w_lo, shared_full) for r_ in (roll, spare)]
+        elif actor is not None:   # (another actor: its rows of the first one's arrays)
+            keep_full = []
+            full_rolls = [attach_arrays(actor['pid'], actor['full'][bid_], keep_full) for bid_ in range(2)]
+            for bid_, r_ in enumerate((roll, spare)):
+                slice_into(r_, full_rolls[bid_], w_lo)
     else:
         roll = spare = None
 
@@ -3199,6 +3381,9 @@ def main(argv=None, child=None):
             row['handoff_mb'] = job.get('lbytes', 0) / 2 ** 20
             row['handoff_s'] = job.get('lhand_s', 0.0)
             row['take_weights_s'] = L.get('take_s', 0.0)
+        if job.get('collect_actors'):   # B38 step 5: each actor process's collect seconds and memory (GB)
+            row['collect_actors'] = job['collect_actors']
+            row['gpu_reserved_gb_actors'] = ' '.join(f'{m_ / 2 ** 30:.2f}' for m_ in job.get('actor_mem_all', []))
         if child is not None:   # B38 step 2: the message's way (actor put -> here), the mirror copy on the GPU, the
             #                     weights' publication (gather + peer copy + sync), this process's cores
             row['handoff_q_s'] = job.get('lq_s', 0.0)
@@ -3439,8 +3624,19 @@ def main(argv=None, child=None):
         fa, sizes = child['fa'], child['sizes']
         fb = torch.empty(sum(sizes), dtype=torch.uint8, device=ldev)
         keep = []   # (the shared arrays' mappings)
-        views = {bid: rollout_view(attach_arrays(child['pid'], d['arrays'], keep), d['scal'], d['tdev'])
-                 for bid, d in child['rolls'].items()}
+        n_act_l = int(child.get('n_act', 1))
+        # (B38 step 5: per actor its messages, event and weights buffer (the second one's arrives with its start
+        # message); per rollout buffer the shared arrays of all workers, per (actor, buffer) its scalars and tensors)
+        outs = [dict(results=results_q, fresh=ev, fa=fa)] + [dict(o_, fa=None) for o_ in child.get('others') or []]
+        if n_act_l > 1:
+            fulls = {bid: attach_arrays(child['pid'], d['full'], keep) for bid, d in child['rolls'].items()}
+            a_scal = {(0, bid): d['scal'] for bid, d in child['rolls'].items()}
+            a_tdev = {(0, bid): d['tdev'] for bid, d in child['rolls'].items()}
+            halves_by_seq = {}
+            views = fulls
+        else:
+            views = {bid: rollout_view(attach_arrays(child['pid'], d['arrays'], keep), d['scal'], d['tdev'])
+                     for bid, d in child['rolls'].items()}
         streams = (torch.cuda.Stream(device=device_actor), torch.cuda.Stream(device=ldev))
         mirror = {}
 
@@ -3448,12 +3644,14 @@ def main(argv=None, child=None):
             t_p = time.perf_counter()
             with torch.no_grad():
                 torch.cat([b.detach().reshape(-1).view(torch.uint8) for b in learner_params], out=fb)
-                fa.copy_(fb, non_blocking=True)
+                for o_ in outs:   # (B38 step 5: every actor's buffer on its GPU)
+                    o_['fa'].copy_(fb, non_blocking=True)
             torch.cuda.current_stream().synchronize()
             L['publish_s'] = time.perf_counter() - t_p
-            results_q.put(('fresh', dict(update=L['update'], decisions=L['decisions'], seconds=L['seconds'],
-                                         pf_p=L.get('pf_p'), publish_s=L['publish_s'])))
-            ev.set()
+            for o_ in outs:
+                o_['results'].put(('fresh', dict(update=L['update'], decisions=L['decisions'], seconds=L['seconds'],
+                                                 pf_p=L.get('pf_p'), publish_s=L['publish_s'])))
+                o_['fresh'].set()
         fresh = types.SimpleNamespace(set=publish)
         parent = mp_.parent_process()
         failed = False
@@ -3479,15 +3677,41 @@ def main(argv=None, child=None):
                     continue
                 if job is None:
                     break
+                if isinstance(job, tuple) and job[0] == 'actor':   # (B38 step 5: an actor process's start)
+                    _, a_, fa_, tdevs_, scals_ = job
+                    outs[a_]['fa'] = fa_
+                    for bid_ in tdevs_:
+                        a_tdev[(a_, bid_)], a_scal[(a_, bid_)] = tdevs_[bid_], scals_[bid_]
+                    continue
                 if failed:   # (after an error: only the stop message matters)
                     continue
                 try:
                     t_recv = time.perf_counter()
-                    v = views[job['bid']]
-                    v.__dict__.update(job['rscal'])
-                    if job.get('tdev') is not None:   # (the actor's pool grew: its new device tensors)
-                        v.t_kv, v.t_o = job['tdev']
-                    job['roll'] = v
+                    if n_act_l > 1:   # B38 step 5: an actor's half; the update when every actor's is there
+                        halves_by_seq.setdefault(job['seq'], {})[job['aid']] = job
+                        if len(halves_by_seq[job['seq']]) < n_act_l:
+                            continue
+                        halves = [halves_by_seq.pop(job['seq'])[a_] for a_ in range(n_act_l)]
+                        bid_ = halves[0]['bid']
+                        if any(h_['bid'] != bid_ for h_ in halves):
+                            raise RuntimeError(f'B38 step 5: the actors\' halves of hand-off {job["seq"]} are in '
+                                               f'different rollout buffers {[h_["bid"] for h_ in halves]}')
+                        for a_, h_ in enumerate(halves):
+                            a_scal[(a_, bid_)] = h_['rscal']
+                            if h_.get('tdev') is not None:
+                                a_tdev[(a_, bid_)] = h_['tdev']
+                        job = merge_jobs(halves)
+                        v, job['lbytes'] = merge_rollouts(
+                            fulls[bid_], [(a_ * a_scal[(a_, bid_)]['n'], a_scal[(a_, bid_)], a_tdev[(a_, bid_)])
+                                          for a_ in range(n_act_l)], mirror, ldev)
+                        job['roll'] = v
+                        job['lhand_s'] = time.perf_counter() - t_recv
+                    else:
+                        v = views[job['bid']]
+                        v.__dict__.update(job['rscal'])
+                        if job.get('tdev') is not None:   # (the actor's pool grew: its new device tensors)
+                            v.t_kv, v.t_o = job['tdev']
+                        job['roll'] = v
                     job['lq_s'] = t_recv - job['t_put']
                     sampler.stats = job['stats']
                     lane_stat.clear()
@@ -3496,7 +3720,7 @@ def main(argv=None, child=None):
                     now_c, now_t = time.process_time(), time.perf_counter()
                     job['lcores'] = (now_c - cpu_mark) / max(now_t - t_mark, 1e-9)   # (the cycle before this job)
                     cpu_mark, t_mark = now_c, now_t
-                    if t_on:
+                    if t_on and n_act_l == 1:
                         e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                         e0.record(streams[1])
                         job['lroll'], job['lready'], job['lbytes'] = hand_off(v, mirror, ldev, streams)
@@ -3523,8 +3747,10 @@ def main(argv=None, child=None):
                         learn(job)
                 except BaseException:
                     failed = True
-                    results_q.put(('error', traceback.format_exc()))
-                    ev.set()
+                    tb_ = traceback.format_exc()
+                    for o_ in outs:   # (B38 step 5: every actor stops)
+                        o_['results'].put(('error', tb_))
+                        o_['fresh'].set()
         finally:
             try:
                 torch.cuda.synchronize()
@@ -3532,33 +3758,79 @@ def main(argv=None, child=None):
             except BaseException:
                 results_q.put(('error', 'saving last.pt: ' + traceback.format_exc()))
             results_q.put(('done', dict(update=L['update'], decisions=L['decisions'], seconds=L['seconds'])))
-            results_q.close()
-            results_q.join_thread()
+            for o_ in outs:
+                o_['results'].close()
+                o_['results'].join_thread()
 
     if child is not None:   # B38 step 2: this is the learner process
         learner_process()
         return
     results = None   # (B38 step 2) the learner process's messages: ('fresh' | 'error' | 'done', info)
     sent_gen = {}   # (B38 step 2) per shared rollout: the pool generation (t_grown) whose device tensors it has
-    if proc:   # B38 step 2: the learner process (spawned: it builds its own CUDA state); its queues and event
+    actor_b = stop_ev = stop_b = None   # (B38 step 5: the second actor process and its stop event (first actor); the
+    #                                     stop event this actor obeys (a second actor))
+    seq_n = 0   # (B38 step 5: this actor's hand-offs, the learner pairs the actors' halves by it)
+    if actor is not None:   # B38 step 5: a second actor: the learner's queue, its own messages, event and stop
+        import multiprocessing as mp_a
+        jobs, results, fresh, stop_ev = actor['jobs'], actor['results'], actor['fresh'], actor['stop']
+        parent_a = mp_a.parent_process()
+        for bid, r_ in enumerate((roll, spare)):
+            r_.bid = bid
+            sent_gen[bid] = getattr(r_, 't_grown', 0)
+        jobs.put(('actor', aid, wmove['fa'], {r_.bid: (r_.t_kv, r_.t_o) if r_.t_kv is not None else None
+                                             for r_ in (roll, spare)},
+                  {r_.bid: rollout_scalars(r_) for r_ in (roll, spare)}))
+        learner = types.SimpleNamespace(   # (the learner as this actor sees it: alive while the first actor is)
+            start=lambda: None, join=lambda timeout=None: None, terminate=lambda: None,
+            is_alive=lambda: parent_a.is_alive() and not stop_ev.is_set())
+        sys.stdout = actor_stdout
+        print(f'actor process {aid} (B38 step 5): pid {os.getpid()}, {device_actor}, workers {w_lo} .. '
+              f'{w_lo + n - 1}, rollout {args.rollout // n_act} decisions', flush=True)
+    elif proc:   # B38 step 2: the learner process (spawned: it builds its own CUDA state); its queues and event
         mpc = torch.multiprocessing.get_context('spawn')
         jobs, results, fresh = mpc.Queue(), mpc.Queue(), mpc.Event()
         rolls_init = {}
         for bid, r_ in enumerate((roll, spare)):
             r_.bid = bid
-            rolls_init[bid] = dict(arrays=shared.describe(r_), scal=rollout_scalars(r_),
-                                   tdev=(r_.t_kv, r_.t_o) if r_.t_kv is not None else None)
+            if n_act > 1:   # (B38 step 5: the arrays of all workers; the first actor's scalars and tensors)
+                rolls_init[bid] = dict(full=shared_full.describe(types.SimpleNamespace(**full_rolls[bid])),
+                                       scal=rollout_scalars(r_),
+                                       tdev=(r_.t_kv, r_.t_o) if r_.t_kv is not None else None)
+            else:
+                rolls_init[bid] = dict(arrays=shared.describe(r_), scal=rollout_scalars(r_),
+                                       tdev=(r_.t_kv, r_.t_o) if r_.t_kv is not None else None)
             sent_gen[bid] = getattr(r_, 't_grown', 0)
+        others = [dict(results=mpc.Queue(), fresh=mpc.Event()) for _ in range(n_act - 1)]
+        stop_b = mpc.Event() if n_act > 1 else None
         learner = mpc.Process(target=learner_child_entry, name='learner', daemon=True, args=(
             list(sys.argv[1:] if argv is None else argv),
             dict(pid=os.getpid(), stats=sampler.stats.copy(), v2_on=v2_on, rolls=rolls_init, fa=wmove['fa'],
-                 sizes=wmove['sizes'], jobs=jobs, results=results, fresh=fresh)))
-        sh_mb = sum(nb for d in rolls_init.values() for (_, nb, _, _) in d['arrays'].values()) / 2 ** 20
+                 sizes=wmove['sizes'], jobs=jobs, results=results, fresh=fresh, n_act=n_act, others=others)))
+        if n_act > 1:   # B38 step 5: the second actor process (its own sampler, GPU, half of every rollout)
+            actor_b = mpc.Process(target=actor_child_entry, name='actor1', daemon=False, args=(
+                list(sys.argv[1:] if argv is None else argv),
+                dict(aid=1, pid=os.getpid(), jobs=jobs, results=others[0]['results'], fresh=others[0]['fresh'],
+                     stop=stop_b, full={bid: rolls_init[bid]['full'] for bid in rolls_init})))
+        sh_mb = sum(nb for d in rolls_init.values() for (_, nb, _, _) in d.get('arrays', d.get('full')).values()) / 2 ** 20
         print(f'learner process (B38 step 2): rollouts\' host arrays shared ({sh_mb:.0f} MiB of address space, '
-              'pages as written), their temporal tensors and the weights\' buffer through CUDA IPC', flush=True)
+              'pages as written), their temporal tensors and the weights\' buffer through CUDA IPC'
+              + (f'; {n_act} actor processes of {n} workers each' if n_act > 1 else ''), flush=True)
     else:
         learner = threading.Thread(target=learner_loop, name='learner', daemon=True)
     learner.start()
+    if actor_b is not None:
+        actor_b.start()
+
+    def check_actors():
+        """(B38 step 5, the first actor) the second actor process must be alive (else the run ends)."""
+        if actor_b is not None and not actor_b.is_alive() and not failure:
+            failure.append(RuntimeError(f'the actor process 1 ended (exit code {actor_b.exitcode})'))
+        if failure:
+            raise failure[0]
+
+    def stopped():
+        """(B38 step 5, another actor) the first actor asked this one to stop."""
+        return stop_ev is not None and stop_ev.is_set()
 
     def learner_message(timeout=600.0):
         """(B38 step 2) the learner process's next message (kind, info); an 'error' raises here, so does a learner
@@ -3568,8 +3840,10 @@ def main(argv=None, child=None):
             try:
                 kind, info = results.get(timeout=1.0)
             except queue.Empty:
+                check_actors()
                 if not learner.is_alive():
-                    failure.append(RuntimeError('the learner process ended without a message'))
+                    failure.append(RuntimeError('the learner process ended without a message' if actor is None else
+                                                'the first actor stopped this one'))
                     raise failure[-1]
                 if time.perf_counter() > t_lim:
                     failure.append(RuntimeError(f'no message from the learner process in {timeout:.0f} s'))
@@ -3637,7 +3911,7 @@ def main(argv=None, child=None):
         while not fresh.wait(0.0 if v2_on else 0.5):
             if lanes is not None:   # (B36: a round with its window, to its answer)
                 lanes.serve_wait(0.005)
-            if failure or not learner.is_alive():
+            if failure or not learner.is_alive() or (actor_b is not None and not actor_b.is_alive()):
                 break
         if lanes is not None:   # (B36: no lane call runs while the weights change)
             lanes.quiesce()
@@ -3744,13 +4018,16 @@ def main(argv=None, child=None):
             run_bench(dict(learn=learn, job=bench_job, model=learner_model, opt=opt, L=L, args=args,
                            stats=sampler.stats.copy()))
             torch.cuda.set_stream(actor_stream)
-        while handed < target_decisions and sampler.live and not L.get('stop'):
+        # (B38 step 5: each actor process its share of the decisions and of every rollout)
+        target_actor = decisions_total + (target_decisions - decisions_total) // n_act
+        rollout_actor = args.rollout // n_act
+        while handed < target_actor and sampler.live and not L.get('stop') and not stopped():
             # ---- collect
             t0 = time.perf_counter()
             cpu_c0 = cpu_ticks()
             prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=0, calls=0, rows=0, eager=0,
                         act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0, cf_snaps=0)
-            while roll.usable() < args.rollout and sampler.live:
+            while roll.usable() < rollout_actor and sampler.live and not stopped():
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
                     lanes.tick()        # lane call answered, a round started when its window has ended (no wait)
                 if busy and fresh.is_set():
@@ -3863,8 +4140,9 @@ def main(argv=None, child=None):
             while inflight:
                 finish(prof)
             collect_s = time.perf_counter() - t0
-            if not sampler.live:
+            if not sampler.live or stopped():
                 break
+            check_actors()
             # ---- hand the rollout to the learner
             wait_s = 0.0
             if busy:   # --overlap: the update before is still running; the workers wait (and may search)
@@ -3910,6 +4188,8 @@ def main(argv=None, child=None):
                     sent_gen[roll.bid] = roll.t_grown
                 job['stats'], job['lane_stat'] = sampler.stats.copy(), dict(lane_stat)
                 job['take_s'], job['actor_mem'] = L.get('take_s', 0.0), torch.cuda.max_memory_reserved(device)
+                job['aid'], job['seq'] = aid, seq_n   # (B38 step 5: which actor, which of its hand-offs)
+                seq_n += 1
             elif split and t_on:   # B38: its used rows to the learner's GPU (asynchronous: the learner waits on the event)
                 t_h = time.perf_counter()
                 job['lroll'], job['lready'], job['lbytes'] = hand_off(roll, lmirror, ldev, hand_streams)
@@ -3931,8 +4211,13 @@ def main(argv=None, child=None):
             if failure:
                 raise failure[0]
     finally:
-        jobs.put(None)
-        if proc:   # B38 step 2: the learner process finishes its update, saves last.pt and says 'done'
+        if actor is None:
+            jobs.put(None)
+        if stop_b is not None:   # (B38 step 5: the second actor stops too)
+            stop_b.set()
+        if actor is not None:   # (B38 step 5, a second actor: the first one stops the learner)
+            pass
+        elif proc:   # B38 step 2: the learner process finishes its update, saves last.pt and says 'done'
             t_lim = time.perf_counter() + 900
             while time.perf_counter() < t_lim:
                 try:
@@ -3967,8 +4252,14 @@ def main(argv=None, child=None):
         if branching and L.get('choice_n'):   # the choice records' ring as it is at the end (rows + meta)
             np.savez(out / 'choices-last.npz', rows=L['choice_rows'][:L['choice_n']],
                      meta=L['choice_meta'][:L['choice_n']], version=L['choice_version'][:L['choice_n']])
-        print('finished', L['update'], 'updates', round(L['decisions'] * hours_per_decision, 1), 'game hours',
-              round((time.perf_counter() - t_run) / 3600, 2), 'h')
+        if actor_b is not None:   # (B38 step 5: the second actor closes its sampler and ends)
+            actor_b.join(timeout=180)
+            if actor_b.is_alive():
+                print('the actor process 1 did not end; terminated', flush=True)
+                actor_b.terminate()
+        if actor is None:
+            print('finished', L['update'], 'updates', round(L['decisions'] * hours_per_decision, 1), 'game hours',
+                  round((time.perf_counter() - t_run) / 3600, 2), 'h')
         if failure:
             raise failure[0]
 
