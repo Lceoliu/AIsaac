@@ -10,7 +10,9 @@
 #                                   full C99 flags (searches in forked children) of a second 64-worker trainer drove the
 #                                   node's load to ~175 and C99 to ~120x until the run was stopped
 # variants: a one GPU, synchronous (as C99); b two GPUs + --overlap --decoupled 1; c two GPUs, synchronous;
-#           d one GPU + --overlap --decoupled 1 (reference: the B11 / B13 contention)
+#           d one GPU + --overlap --decoupled 1 (reference: the B11 / B13 contention);
+#           e two GPUs + --overlap, plain ratio, no recompute pass (--decoupled 0 --recompute-values off);
+#           f as b with Python's default thread switch interval (--switch-interval 0.005)
 # a load guard ends a run (SIGINT) when the node's 1-minute load stays above LOADMAX (default 85) for 30 s
 source /101063/AIsaac/ws14/hpc_env.sh
 export CUDA_VISIBLE_DEVICES=1,2
@@ -33,6 +35,8 @@ variant() {
     b) echo "--learner-device cuda:1 --overlap --decoupled 1" ;;
     c) echo "--learner-device cuda:1" ;;
     d) echo "--overlap --decoupled 1" ;;
+    e) echo "--learner-device cuda:1 --overlap --recompute-values off" ;;
+    f) echo "--learner-device cuda:1 --overlap --decoupled 1 --switch-interval 0.005" ;;
   esac
 }
 gpumon() {   # GPUs 1 and 2 (physical numbering) and the load every 10 s
