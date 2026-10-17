@@ -3363,6 +3363,7 @@ def main(argv=None, child=None):
         prof_dir = os.environ.get('ISAAC_RL_B38_TORCHPROF', '')
         prof_at = int(os.environ.get('ISAAC_RL_B38_TORCHPROF_AT', '3') or 3)
         n_jobs = 0
+        sync_at = int(os.environ.get('ISAAC_RL_B38_SYNCDEBUG_AT', '0') or 0)   # (the update whose syncs are listed)
         print(f'learner process (B38 step 2): pid {os.getpid()}, {ldev}, {len(views)} shared rollouts', flush=True)
         try:
             while True:
@@ -3406,6 +3407,15 @@ def main(argv=None, child=None):
                         dump_job(job, v, dump_dir)
                     if prof_dir and n_jobs == prof_at:
                         profile_learn(learn, job, prof_dir)
+                    elif sync_at and n_jobs == sync_at:   # (B38 step 4: every host sync of one update, with its line)
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.simplefilter('always')
+                            torch.cuda.set_sync_debug_mode('warn')
+                            try:
+                                learn(job)
+                            finally:
+                                torch.cuda.set_sync_debug_mode('default')
                     else:
                         learn(job)
                 except BaseException:
