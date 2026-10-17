@@ -149,7 +149,7 @@ if [ "$mode" = replay ]; then
   rp b38-eq-1b 1 cuda:0 2048
   rp b38-eq-2 1 cuda:0,cuda:1 4096
   rp b38-eq-1c 1 cuda:0 4096
-  $PY ../ops/b38_compare.py $R $CK
+  $PY ../ops/b38_compare.py $R $CK   # (run from python/: ../ops is src/bridge/ops)
   echo "$(date +%T) done"; exit 0
 fi
 if [ "$mode" = fail ]; then
