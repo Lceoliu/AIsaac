@@ -2239,6 +2239,8 @@ def main(argv=None, child=None):
         learner_model.set_math_attention('math' in fparts, nhwc='nhwc' in fparts, ln='ln' in fparts)
         if fast2:   # (B38 step 4: the CNNs' distinct grids in batches of a multiple of 64: cuDNN plans reused)
             learner_model.cnn_bucket = int(os.environ.get('ISAAC_RL_B38_CNN_BUCKET', '64'))
+            if os.environ.get('ISAAC_RL_B38_CUDNN_BENCH') == '1':   # (a measurement aid: cuDNN's autotuner)
+                torch.backends.cudnn.benchmark = True
         n_buckets = int(os.environ.get('ISAAC_RL_LEARNER_BUCKETS', '3'))   # (at most; a measurement aid)
         raw_mode = 'raw' in fparts and teach_gpu and bool(args.teach_merge)   # (B18: minibatches gathered as bytes)
         if L['dumped'] < args.dump_rollouts:   # the rollout and the learner's weights before this update
