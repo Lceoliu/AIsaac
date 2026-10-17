@@ -17,6 +17,7 @@
 #           h (B38 step 2) as g, synchronous
 # step 2 (no searches anywhere: no --teacher, --cf 0, as long as C99 runs on this host):
 #        hpc_b38.sh smoke2 [g h a b]  8 workers, 1.5 game hours from scratch
+#        hpc_b38.sh tput3 [a b g]     as tput2 (a second series: a, b and g in one window)
 #        hpc_b38.sh fail              g with ISAAC_RL_B38_FAIL_AT=3: the learner process raises before update 3; the
 #                                     trainer must stop with that error (last.pt by the learner process, no hang)
 #        hpc_b38.sh int               g stopped by SIGINT after 240 s (the learner process finishes, saves last.pt)
@@ -96,7 +97,7 @@ run_one() {   # tag timeout flags...
 mode=$1; shift
 vs=${*:-a b c}
 BASEFLAGS=$COMMON
-case $mode in tput2|smoke2|fail|int|kill) BASEFLAGS=$LITE ;; esac
+case $mode in tput2|tput3|smoke2|fail|int|kill) BASEFLAGS=$LITE ;; esac
 SMOKE="--workers 8 --checkpoint-every 100000 --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1"
 if [ "$mode" = fail ]; then
   export ISAAC_RL_B38_FAIL_AT=3
@@ -139,7 +140,7 @@ for v in $vs; do
   elif [ "$mode" = smoke ]; then
     run_one b38-smoke-$v 1500 --workers 8 --game-hours 1.5 --checkpoint-every 100000 \
       --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1 $(variant $v)
-  elif [ "$mode" = tput ] || [ "$mode" = tput2 ]; then
+  elif [ "$mode" = tput ] || [ "$mode" = tput2 ] || [ "$mode" = tput3 ]; then
     run_one b38-$mode-$v 2700 $FAST --workers 64 --game-hours 73 --checkpoint-every 100000 \
       --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1 --resume $CK $(variant $v)
   fi
