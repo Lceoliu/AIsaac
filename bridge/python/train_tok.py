@@ -336,6 +336,50 @@ def attach_arrays(pid, desc, keep):
     return out
 
 
+def dump_job(job, view, path):
+    """(B38 step 3, a measurement aid: ISAAC_RL_B38_DUMP) a learner job as abplus_b38_replay.py replays it: the
+    rollout's used part (host arrays cut to the longest worker, scalars, the temporal tensors' used rows on the CPU)
+    and the job's host-side fields."""
+    import torch
+    m = int(view.length.max())
+    arr = {}
+    for k, v in vars(view).items():
+        if isinstance(v, np.ndarray):
+            if v.ndim >= 2 and v.shape[0] == view.n and k.startswith('rooms_') and k != 'rooms_n':
+                arr[k] = v[:, :view.tR + m].copy()
+            elif v.ndim >= 2 and v.shape[0] == view.n and k.startswith('t_'):
+                arr[k] = v[:, :view.tP + m].copy()
+            elif v.ndim >= 2 and v.shape[0] == view.n:
+                arr[k] = v[:, :m].copy()
+            else:
+                arr[k] = v.copy()
+    k_ = view.n * view.tP + view.t_used if view.t_kv is not None else 0
+    tens = None if view.t_kv is None else dict(
+        kv=view.t_kv[:k_].cpu(), o=view.t_o[:view.t_obase + k_].cpu(), rows=int(view.t_kv.shape[0]),
+        orows=int(view.t_o.shape[0]))
+    meta = {k: v for k, v in job.items() if k not in ('roll', 'lroll', 'lready', 'lcopy', 'tdev')}
+    Path(path).mkdir(parents=True, exist_ok=True)
+    torch.save(dict(arrays=arr, scal=rollout_scalars(view), tensors=tens, meta=meta, m=m), Path(path) / 'job.pt')
+    print(f'B38: a job dumped to {path}', flush=True)
+
+
+def profile_learn(learn, job, path):
+    """(B38 step 4, ISAAC_RL_B38_TORCHPROF) learn(job) under the torch profiler (CPU and CUDA activity): the
+    operator table (by self CPU time and by CUDA time), the regions' times (record_function 'b38:*' marks) and a
+    Chrome trace in path."""
+    from torch.profiler import ProfilerActivity, profile
+    Path(path).mkdir(parents=True, exist_ok=True)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_:
+        learn(job)
+    ka = prof_.key_averages()
+    with open(Path(path) / 'ops.txt', 'w') as f:
+        f.write(ka.table(sort_by='self_cpu_time_total', row_limit=60))
+        f.write('\n\n')
+        f.write(ka.table(sort_by='self_cuda_time_total', row_limit=40))
+    prof_.export_chrome_trace(str(Path(path) / 'trace.json'))
+    print(f'B38: the profile of one update written to {path}', flush=True)
+
+
 def rollout_scalars(roll):
     """(B38 step 2) a rollout's attributes that are neither arrays nor tensors (counters, sizes; None for the parts
     that are off): what the learner process's view needs per job besides the shared arrays."""
@@ -1639,12 +1683,13 @@ def main(argv=None, child=None):
     # visible one); otherwise ldev is `device` itself and nothing below changes
     ldev, split = device, False
     device_actor = torch.device('cuda', torch.cuda.current_device())   # (`device` with its index: other threads)
+    lbench = child is not None and bool(child.get('bench'))   # (abplus_b38_replay.py: no actor GPU to keep apart)
     if args.learner_device:
         want = torch.device(args.learner_device)
         if want.type != 'cuda' or (want.index or 0) >= torch.cuda.device_count():
             p.error(f'--learner-device {args.learner_device}: not one of the {torch.cuda.device_count()} visible GPUs')
-        if (want.index or 0) != torch.cuda.current_device():
-            ldev, split = torch.device('cuda', want.index), True
+        if (want.index or 0) != torch.cuda.current_device() or lbench:
+            ldev, split = torch.device('cuda', want.index or 0), True
     proc = bool(args.learner_process)   # B38 step 2: the learner in a process of its own
     if proc and not split:
         p.error('--learner-process 1 needs --learner-device on another GPU than the actor\'s (two processes on one GPU: '
@@ -2059,6 +2104,18 @@ def main(argv=None, child=None):
                         **(dict(choice_optimizer=copt.state_dict()) if copt is not None else {})),
                    path)
 
+    b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
+
+    def mark(name, prev=None):
+        """(B38 step 4, only with ISAAC_RL_B38_TORCHPROF) end the profiler region prev, open one called name."""
+        if prev is not None:
+            prev.__exit__(None, None, None)
+        if not b38_marks or name is None:
+            return None
+        m__ = torch.profiler.record_function(name)
+        m__.__enter__()
+        return m__
+
     def learn(job):
         """One PPO update on a full rollout; signals `fresh` as soon as the new weights are final, then logs."""
         # B38: every tensor of the update on the learner's GPU (`device` below is the learner's; the actor's is adev;
@@ -2139,6 +2196,7 @@ def main(argv=None, child=None):
                 return dict(temporal=dict(mode='stored', o=t_all['o'][part_], o_prev=t_all['o_prev'][part_],
                                           has=t_all['has'][part_])) if t_on else {}
             vals, lps = [], []
+            m_r = mark('b38:recompute')
             with torch.inference_mode():
                 chunk = args.micro or args.minibatch
                 for at in range(0, len(all_flat), chunk):
@@ -2163,6 +2221,7 @@ def main(argv=None, child=None):
             else:
                 value_now = None
             prox_all = torch.cat(lps)
+            mark(None, m_r)
             sec('recompute')
         if gtok_on and len(all_flat) and vg_stored is not None and not vgs:   # (B24) the actor's values, as stored
             vg_now = vg_stored
@@ -2732,6 +2791,7 @@ def main(argv=None, child=None):
                     bounds = [(lo_, min(lo_ + micro, len(sel)), None) for lo_ in range(0, len(sel), micro)]
                 last = bounds[-1][0]
                 for lo_, hi_, cids_ in bounds:   # the minibatch's means, a part at a time
+                    m_ = mark('b38:part_plan')
                     part = sel[lo_:hi_]
                     part_h = sel_h[lo_:hi_]
                     if chunked:   # (memory / temporal) the part's share of the minibatch's trained decisions
@@ -2815,6 +2875,7 @@ def main(argv=None, child=None):
                         mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1],
                                                                                    **xplan))
                     k_ = len(part)
+                    m_ = mark('b38:part_forward', m_)
                     with autocast():
                         if chunked:   # (memory) BPTT over the part's chunks from their stored first states; the
                             #          teacher's records one step each (the old teacher's from 0, teacher v2's own)
@@ -2847,6 +2908,7 @@ def main(argv=None, child=None):
                             outs_ = learner_model(mb, packed=bool(args.packed),
                                                   **(dict(need_vg=True) if glob_loss else {}))
                         logits_, value_, danger_ = outs_[:3]
+                    m_ = mark('b38:part_loss', m_)
                     logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
                         logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
                     value = value_[:k_].float()
@@ -2883,7 +2945,9 @@ def main(argv=None, child=None):
                             logits_[o_:], learner_model.gate(mb)[o_:], v_act)
                         vloss, vstats = v2_terms(lp_v, value_[o_:], vpick_d, v_w, v_G, v_share, adv_std, n_sel)
                         loss = loss + vloss
+                    m_ = mark('b38:part_backward', m_)
                     loss.backward()
+                    m_ = mark('b38:part_stats', m_)
                     with torch.no_grad():
                         if pf_on:   # (B23: kl and clip share over the PPO-trained decisions' rows)
                             acc += torch.stack([pg, vf, ent, kl_f, clip_f]) * w
@@ -2943,8 +3007,10 @@ def main(argv=None, child=None):
                     L['trace'].append((acc.clone(), tacc.clone(), None if L['trace'] else
                                        [None if q.grad is None else q.grad.clone()
                                         for q in opt.param_groups[0]['params']]))
+                m_ = mark('b38:clip_opt', m_)
                 torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                 opt.step()
+                mark(None, m_)
                 sec('opt')
         learner_model.eval()
         choice_log = train_choice() if branching else {}   # Phase B2 (before the actor takes the new weights)
@@ -3290,6 +3356,13 @@ def main(argv=None, child=None):
         failed = False
         cpu_mark, t_mark = time.process_time(), time.perf_counter()
         fail_at = int(os.environ.get('ISAAC_RL_B38_FAIL_AT', '0') or 0)
+        dump_dir = os.environ.get('ISAAC_RL_B38_DUMP', '')   # (B38 step 3: save the job of update dump_at)
+        dump_at = int(os.environ.get('ISAAC_RL_B38_DUMP_AT', '5') or 5)   # (the dump_at-th job of this process)
+        # (B38 step 4, a measurement aid: ISAAC_RL_B38_TORCHPROF=<dir>: the torch profiler over the k-th update of
+        # this process, ISAAC_RL_B38_TORCHPROF_AT=k (default 3): a table and a Chrome trace in <dir>)
+        prof_dir = os.environ.get('ISAAC_RL_B38_TORCHPROF', '')
+        prof_at = int(os.environ.get('ISAAC_RL_B38_TORCHPROF_AT', '3') or 3)
+        n_jobs = 0
         print(f'learner process (B38 step 2): pid {os.getpid()}, {ldev}, {len(views)} shared rollouts', flush=True)
         try:
             while True:
@@ -3328,7 +3401,13 @@ def main(argv=None, child=None):
                         job['lcopy'] = (e0, e1)
                     if fail_at and L['update'] + 1 == fail_at:   # (a test aid: ISAAC_RL_B38_FAIL_AT)
                         raise RuntimeError(f'ISAAC_RL_B38_FAIL_AT: injected failure before update {fail_at}')
-                    learn(job)
+                    n_jobs += 1
+                    if dump_dir and n_jobs == dump_at:   # (B38 step 3: a job for abplus_b38_replay.py)
+                        dump_job(job, v, dump_dir)
+                    if prof_dir and n_jobs == prof_at:
+                        profile_learn(learn, job, prof_dir)
+                    else:
+                        learn(job)
                 except BaseException:
                     failed = True
                     results_q.put(('error', traceback.format_exc()))
