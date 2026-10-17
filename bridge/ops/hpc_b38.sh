@@ -149,16 +149,7 @@ if [ "$mode" = replay ]; then
   rp b38-eq-1b 1 cuda:0 2048
   rp b38-eq-2 1 cuda:0,cuda:1 4096
   rp b38-eq-1c 1 cuda:0 4096
-  PYTHONPATH=. $PY -c "
-import sys, torch
-R = sys.argv[1]
-ck = {t: torch.load(f'{R}/b38-eq-{t}/checkpoints/last.pt', map_location='cpu', weights_only=False)['model'] for t in ('1a', '1b', '2', '1c')}
-def d(a, b):
-    return max(float((ck[a][k].float() - ck[b][k].float()).abs().max()) for k in ck[a] if ck[a][k].is_floating_point())
-base = torch.load('$CK', map_location='cpu', weights_only=False)['model']
-step = max(float((ck['1a'][k].float() - base[k].float()).abs().max()) for k in base if base[k].is_floating_point())
-print(f'one update from the same job: |1 rank micro 2048 - again| {d("1a", "1b"):.3g}, |2 ranks - 1 rank micro 2048| {d("2", "1a"):.3g}, |2 ranks - 1 rank micro 4096| {d("2", "1c"):.3g}, |1 rank 2048 - 4096| {d("1a", "1c"):.3g}; the update itself moved weights by up to {step:.3g}')
-" $R
+  $PY ../ops/b38_compare.py $R $CK
   echo "$(date +%T) done"; exit 0
 fi
 if [ "$mode" = fail ]; then
