@@ -73,7 +73,7 @@ def main():
     mpc = torch.multiprocessing.get_context('spawn')
     jobs = [mpc.Queue() for _ in range(world)]
     results, fresh = mpc.Queue(), mpc.Event()
-    url = f'tcp://127.0.0.1:{TT.free_port()}'
+    url = TT.rendezvous_url()
     rolls = {0: dict(arrays=sa.describe(obj), scal=scal, tdev=tdev)}
     procs = TT.LearnerGroup(mpc.Process(target=TT.learner_child_entry, name=f'replay{r}', daemon=True, args=(
         targs, dict(pid=os.getpid(), stats=np.asarray(meta['stats']), v2_on=False, rolls=rolls, fa=fa,

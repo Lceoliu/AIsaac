@@ -390,11 +390,20 @@ class FanOut:
 
 
 def free_port():
-    """A free local TCP port (the learner ranks' rendezvous)."""
+    """A free local TCP port."""
     import socket
     with socket.socket() as s_:
         s_.bind(('127.0.0.1', 0))
         return s_.getsockname()[1]
+
+
+def rendezvous_url():
+    """(B38 step 3a) the learner ranks' rendezvous: a new file in /dev/shm (a TCP port picked here could be taken by
+    the time rank 0 listens: EADDRINUSE seen on the HPC node with ~1,300 game processes)."""
+    import tempfile
+    import uuid
+    base = '/dev/shm' if os.path.isdir('/dev/shm') else tempfile.gettempdir()
+    return 'file://' + os.path.join(base, f'b38-ddp-{os.getpid()}-{uuid.uuid4().hex[:12]}').replace(os.sep, '/')
 
 
 def dump_job(job, view, path):
@@ -3533,7 +3542,7 @@ def main(argv=None, child=None):
                                    tdev=(r_.t_kv, r_.t_o) if r_.t_kv is not None else None)
             sent_gen[bid] = getattr(r_, 't_grown', 0)
         rank_jobs = [jobs] + [mpc.Queue() for _ in range(lworld - 1)]   # (B38 step 3a: one queue per learner rank)
-        dist_url = f'tcp://127.0.0.1:{free_port()}'
+        dist_url = rendezvous_url()
         learner = LearnerGroup(mpc.Process(target=learner_child_entry, name=f'learner{r_}', daemon=True, args=(
             list(sys.argv[1:] if argv is None else argv),
             dict(pid=os.getpid(), stats=sampler.stats.copy(), v2_on=v2_on, rolls=rolls_init, fa=wmove['fa'],
