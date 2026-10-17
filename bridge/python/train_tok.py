@@ -24,6 +24,17 @@ actor's (between two of its calls). Two modes:
                          With the plain ratio the stale part starts the update with ratios away from 1 and is clipped
                          earlier (higher clip_frac, slower entropy decrease); --decoupled 1 clips around the weights
                          at the update's start instead and weights by pi_start / pi_behaviour (see its help).
+  --learner-device D     (B38, 2026-10-17) the learner on a GPU of its own (e.g. cuda:1; default: the actor's GPU, as
+                         before): learner_model, Adam and the choice optimiser, every tensor learn() builds (the
+                         batches, the teacher / teacher-v2 rings, the temporal room tables) live there; the actor (its
+                         weights, GraphActors, the lane service, the snapshots, the GRU / temporal state tables, the
+                         rollouts' device tensors) stays on the actor's. At the hand-off the used rows of the rollout's
+                         temporal tensors (K / V and o; s is never read by the learner) are copied to a learner-side
+                         mirror on a copy stream (the learner waits on its event, the actor runs on at once);
+                         take_weights moves the weights as one flat byte buffer. Recommended with --overlap
+                         --decoupled 1: the update of rollout k then runs on its own GPU while the actor collects
+                         rollout k + 1 (no GPU contention, the cause of B11's slower actor calls and B13's crash class
+                         on a shared GPU). Without --overlap it is the synchronous mode with the learner elsewhere.
 Other throughput settings (same results, other speed): --actor-slots (calls in flight), --poll-want / --poll-wait
 (batching of records), --sort-micro (minibatch rows ordered by entity count before the --micro parts), CUDA streams
 (the actor's calls on high-priority streams, the learner's kernels on a low-priority one), --fused-adam; and for the
@@ -676,6 +687,76 @@ def temporal_rows(rl, flat, cap, device):
     return dict(o=o[0], o_prev=o[1], has=torch_from(rl.t_step[w, at] > 0, device), ep=torch_from(rl.t_ep[w, at], device))
 
 
+def mirror_temporal(roll, mirror, device):
+    """(B38, --learner-device) the rollout as the learner on another device reads it: a shallow copy (the host arrays
+    shared, as the job's rollout itself is) whose temporal tensors are `mirror`'s, a dict of device tensors kept
+    between updates and (re)allocated here with the rollout's shapes (a pool that grew: t_grow), holding the rollout's
+    assigned rows: the P context rows per worker and the pool rows used (n * P + t_used rows of t_kv; t_o the same
+    plus its t_obase rows of carried room sources). Rows past them hold an older rollout's values or zeros; no
+    decision of this rollout names them (t_row, rooms_src), the scratch row (the last, same index as the rollout's)
+    is a guard target only. t_s is not copied: the learner never reads it (None in the view). The copies are issued
+    on the caller's current streams (a cross-device copy_ runs on the source device's current stream, ordered against
+    the destination's); the caller records the event the learner waits on. Returns (view, bytes copied)."""
+    import copy as copy_mod
+    import torch
+    k = roll.n * roll.tP + roll.t_used
+    nbytes = 0
+    for name, base in (('t_kv', 0), ('t_o', roll.t_obase)):
+        src = getattr(roll, name)
+        dst = mirror.get(name)
+        if dst is None or dst.shape != src.shape or dst.dtype != src.dtype or dst.device != torch.device(device):
+            mirror[name] = None   # (the old one freed first: no two of them at once)
+            dst = mirror[name] = torch.zeros(src.shape, dtype=src.dtype, device=device)
+        dst[:base + k].copy_(src[:base + k], non_blocking=True)
+        nbytes += (base + k) * src[0].numel() * src.element_size()
+    view = copy_mod.copy(roll)
+    view.t_kv, view.t_o, view.t_s = mirror['t_kv'], mirror['t_o'], None
+    return view, nbytes
+
+
+def hand_off(roll, mirror, device, streams):
+    """(B38) mirror_temporal issued on a stream pair (one on the rollout's GPU: the copies run there, one on the
+    learner's: ordered against it) and an event on the learner's side after them: (view, event, bytes). The caller has
+    synchronised the actor's writes into the rollout; the learner waits on the event before it reads the view."""
+    import torch
+    with torch.cuda.stream(streams[0]), torch.cuda.stream(streams[1]):
+        view, nbytes = mirror_temporal(roll, mirror, device)
+        ev = torch.cuda.Event()
+        ev.record(streams[1])
+    return view, ev, nbytes
+
+
+def weight_mover(actor_params, learner_device):
+    """(B38, --learner-device) the state of move_weights: byte views of the actor's parameters and buffers (in place:
+    the actor's graphs read them where they are), a byte buffer of their total size on each GPU, a stream on the
+    learner's. None when a tensor is not contiguous (or this torch has no _foreach_copy_): per-tensor copies then."""
+    import torch
+    views = [a.detach().reshape(-1).view(torch.uint8) for a in actor_params]
+    if not hasattr(torch, '_foreach_copy_') or \
+            not all(a.is_contiguous() and v.data_ptr() == a.data_ptr() for v, a in zip(views, actor_params)):
+        return None
+    sizes = [v.numel() for v in views]
+    dev_a = actor_params[0].device
+    return dict(av=views, sizes=sizes, fb=torch.empty(sum(sizes), dtype=torch.uint8, device=learner_device),
+                fa=torch.empty(sum(sizes), dtype=torch.uint8, device=dev_a),
+                sb=torch.cuda.Stream(device=learner_device))
+
+
+def move_weights(wm, learner_params, learner_stream):
+    """(B38) the learner's weights (its GPU) into the actor's parameters (weight_mover's views): gathered as bytes
+    into one buffer on the learner's GPU on wm's stream, after the work queued on learner_stream; one peer copy (a
+    cross-device copy_: on the source's current stream, wm's, ordered after the caller's current stream on the actor's
+    GPU and before its next work there); the bytes into the parameters by a foreach copy on that current stream. The
+    caller synchronises its stream before the actor's graphs run again."""
+    import torch
+    sb = wm['sb']
+    with torch.cuda.stream(sb):
+        sb.wait_stream(learner_stream)
+        torch.cat([b.detach().reshape(-1).view(torch.uint8) for b in learner_params], out=wm['fb'])
+        wm['fa'].copy_(wm['fb'], non_blocking=True)
+    torch._foreach_copy_(wm['av'], list(wm['fa'].split(wm['sizes'])))
+
+
 def torch_from(a, device):
     import torch
     return torch.from_numpy(np.ascontiguousarray(a)).to(device)
@@ -1146,6 +1227,11 @@ def main():
                         'other threads, its workers and their games are kept off them. The fast learner is bound by '
                         'its host thread, which a busy sibling or a game on the same core slows by ~20%%. '
                         "'' (default): no pinning")
+    p.add_argument('--learner-device', default='',
+                   help='2026-10-17 (B38): the GPU of the learner (learner_model, Adam, every tensor of the update), '
+                        'e.g. cuda:1; the actor (inference, lanes, snapshots, rollouts) stays on the first visible GPU. '
+                        "Best with --overlap --decoupled 1 (see the module docstring). '' (default) or the actor's own "
+                        'GPU: one GPU, as before')
     # 2026-10-11 (memory, rl/docs/SCALING_THESIS.md S5b; see the module docstring)
     p.add_argument('--memory', default=None, choices=('off', 'gru'),
                    help='gru: a GRU state per worker between the token encoder and the heads, carried through the '
@@ -1420,6 +1506,18 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = args.tf32
     torch.backends.cudnn.allow_tf32 = args.tf32
     device = torch.device('cuda')
+    # B38 (2026-10-17, --learner-device): the learner's GPU. split: it is another GPU than the actor's (the first
+    # visible one); otherwise ldev is `device` itself and nothing below changes
+    ldev, split = device, False
+    device_actor = torch.device('cuda', torch.cuda.current_device())   # (`device` with its index: other threads)
+    if args.learner_device:
+        want = torch.device(args.learner_device)
+        if want.type != 'cuda' or (want.index or 0) >= torch.cuda.device_count():
+            p.error(f'--learner-device {args.learner_device}: not one of the {torch.cuda.device_count()} visible GPUs')
+        if (want.index or 0) != torch.cuda.current_device():
+            ldev, split = torch.device('cuda', want.index), True
+    print(f'devices (B38): actor cuda:{torch.cuda.current_device()} ({torch.cuda.get_device_name()}), learner '
+          + (f'{ldev} ({torch.cuda.get_device_name(ldev)})' if split else 'the same GPU'), flush=True)
     torch.manual_seed(args.seed)
     branching = cfg.branch_share > 0   # 2026-10-07 (tok_branch): branch episodes and choice records
     if args.choice_heads < 0:   # Phase B2: K choice-value heads with branches (a resumed checkpoint's own count wins)
@@ -1428,7 +1526,7 @@ def main():
         args.choice_heads = int(torch.load(args.resume, map_location='cpu').get('config', {}).get('choice', 0)) or             args.choice_heads
     n_choice = int(args.choice_heads)
     learner_model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
-                              ent_ext=ent_ext, pchar=pchar, memory=mem_dim, **tok_kw).to(device)   # the weights PPO updates
+                              ent_ext=ent_ext, pchar=pchar, memory=mem_dim, **tok_kw).to(ldev)   # the weights PPO updates
     nh = len(learner_model.heads)
     fused = bool(args.fused_adam) or bool(args.learner_fast)   # (B18: --learner-fast 1 implies the fused Adam)
     # (Phase B2: the choice heads are not PPO's: main_parameters() is parameters() without them, in the same order)
@@ -1437,9 +1535,9 @@ def main():
     copt = torch.optim.Adam(learner_model.choice.parameters(), lr=args.choice_lr) if n_choice else None
     update, decisions_total, seconds_total = 0, 0, 0.0
     if args.init:
-        print('init', args.init, load_compatible(learner_model, torch.load(args.init, map_location=device)['model']))
+        print('init', args.init, load_compatible(learner_model, torch.load(args.init, map_location=ldev)['model']))
     if args.resume:
-        ck = torch.load(args.resume, map_location=device)
+        ck = torch.load(args.resume, map_location=ldev)
         ck_model = ck['model']
         mem_names = []
         if mem_drop:   # B32 (2026-10-15): the GRU's tensors dropped (and below their Adam state), the rest exact
@@ -1723,9 +1821,29 @@ def main():
                             version=lambda: version, stat=lane_stat)
     inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
     actor_stream = torch.cuda.Stream(priority=-5)
-    learner_stream = torch.cuda.Stream(priority=0)
+    learner_stream = torch.cuda.Stream(device=ldev, priority=0) if split else torch.cuda.Stream(priority=0)
     torch.cuda.synchronize()
+    if split:
+        torch.cuda.synchronize(ldev)
     torch.cuda.set_stream(actor_stream)
+    # B38 (--learner-device): the hand-off's copy of a rollout's temporal tensors to the learner's GPU (mirror_temporal:
+    # issued by the actor thread on a stream pair of its own, the learner waits on the event; the next hand-off comes
+    # only after the update that read the mirror has synchronised its stream, so one mirror suffices) and the weights'
+    # way back (take_weights: the learner's parameters gathered as bytes into one buffer on its GPU, one peer copy, the
+    # actor's parameters written from it by a foreach copy on the actor's stream)
+    lmirror, hand_streams, wmove = {}, None, None
+    if split:
+        hand_streams = (torch.cuda.Stream(device=device), torch.cuda.Stream(device=ldev))
+        wmove = weight_mover(actor_params, ldev)
+        msg = (f'learner device (B38): {ldev}; weights '
+               f'{sum(a.numel() * a.element_size() for a in actor_params) / 2 ** 20:.1f} MiB per take_weights '
+               f'({"one flat peer copy" if wmove else "per-tensor copies"})')
+        if t_on:   # (K / V per layer + o per row; the exact bytes per update: progress.csv handoff_mb)
+            row_b = args.temporal_layers * 2 * args.temporal_width * (2 if args.temporal_kv == 'bf16' else 4) + \
+                4 * args.temporal_width
+            msg += (f'; hand-off {row_b} bytes per temporal row, about '
+                    f'{(args.rollout + n * (args.temporal_window - 1)) * row_b / 2 ** 20:.0f} MiB per update')
+        print(msg, flush=True)
 
     # ------------------------------------------------------------------ learner (its own thread and CUDA stream)
     teach_gpu = bool(args.teach_gpu)
@@ -1782,6 +1900,9 @@ def main():
 
     def learn(job):
         """One PPO update on a full rollout; signals `fresh` as soon as the new weights are final, then logs."""
+        # B38: every tensor of the update on the learner's GPU (`device` below is the learner's; the actor's is adev;
+        # without --learner-device they are one)
+        adev, device = device_actor, ldev
         t0 = time.perf_counter()
         U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
                           (('temporal',) if t_on else ()), 0.0)   # seconds per part of the update (u_* columns)
@@ -1797,6 +1918,11 @@ def main():
             U[name] += now_ - mark[0]
             mark[0] = now_
         rl = job['roll']
+        if job.get('lroll') is not None:   # B38: the rollout's mirror on this GPU; its copy done before any read
+            rl = job['lroll']
+            torch.cuda.current_stream().wait_event(job['lready'])
+        if split and t_on and rl.t_kv.device != device:   # (B38: never; every hand-off makes the mirror)
+            raise RuntimeError(f'--learner-device: the rollout is on {rl.t_kv.device}, the learner on {device}')
         lengths = rl.length
         # 2026-10-10 (B18, --learner-fast 1): the same update with about half the GPU and host work per step
         # (EXPERIMENTS.md B18). math: attention as float32 matrix products, all length buckets of a layer in one
@@ -2735,6 +2861,11 @@ def main():
         }
         if mem_on:   # 2026-10-11 (memory): BPTT chunks and rows of the update (trained decisions: count)
             row['mem_chunks'], row['mem_rows'] = mplan['chunks'], len(flat)
+        if split:   # B38: gpu_reserved_gb is the learner's GPU; the actor's, the hand-off's bytes and its host seconds
+            row['gpu_reserved_gb_actor'] = torch.cuda.max_memory_reserved(adev) / 2 ** 30
+            row['handoff_mb'] = job.get('lbytes', 0) / 2 ** 20
+            row['handoff_s'] = job.get('lhand_s', 0.0)
+            row['take_weights_s'] = L.get('take_s', 0.0)
         if t_on:   # 2026-10-14 (B30): the update's chunks and the room tokens made in the rollout
             row['t_chunks'] = len(tch)
             row['t_rooms_new'] = int(sum(rl.t_rc[w_, rl.tP:rl.tP + rl.length[w_]].sum() for w_ in range(rl.n)))
@@ -2925,6 +3056,8 @@ def main():
     failure = []
 
     def learner_loop():
+        if split:   # B38: this thread's current GPU is the learner's (CUDA's current device is per thread)
+            torch.cuda.set_device(ldev)
         torch.cuda.set_stream(learner_stream)
         if learner_cpus:   # (B18: this thread, and the threads it starts, on --learner-cpus)
             os.sched_setaffinity(0, learner_cpus)
@@ -2971,10 +3104,17 @@ def main():
         fresh.clear()
         if failure:
             raise failure[0]
+        t_w = time.perf_counter()
         with torch.no_grad():
-            for a, b in zip(actor_params, learner_params):
-                a.copy_(b)
+            if wmove is not None:   # B38: from the learner's GPU (its stream synchronised before `fresh`; waited on
+                #                     there too), one peer copy, ordered before the actor's stream (move_weights)
+                move_weights(wmove, learner_params, learner_stream)
+            else:   # (B38 split without the flat path: cross-device copies, each ordered against the actor's stream)
+                for a, b in zip(actor_params, learner_params):
+                    a.copy_(b)
         torch.cuda.current_stream().synchronize()
+        if split:
+            L['take_s'] = time.perf_counter() - t_w
         version += 1
         sampler.control[3] = version   # 2026-10-07: the actor's weights, for the workers' choice records
         if snaps and version % args.branch_snap_every == 0:   # Phase B2: the older snapshot takes these weights
@@ -3258,6 +3398,10 @@ def main():
             handed += roll.usable()
             if t_on:   # (B31) the actor's writes into the rollout's device tensors done before the learner reads them
                 torch.cuda.current_stream().synchronize()
+            if split and t_on:   # B38: its used rows to the learner's GPU (asynchronous: the learner waits on the event)
+                t_h = time.perf_counter()
+                job['lroll'], job['lready'], job['lbytes'] = hand_off(roll, lmirror, ldev, hand_streams)
+                job['lhand_s'] = time.perf_counter() - t_h
             spare.carry(roll)
             roll, spare = spare, roll
             book.finished = []
@@ -3277,6 +3421,8 @@ def main():
         jobs.put(None)
         learner.join(timeout=900)
         torch.cuda.synchronize()
+        if split:   # (B38: the learner's GPU too)
+            torch.cuda.synchronize(ldev)
         save(out / 'checkpoints' / 'last.pt')
         sampler.close()
         if log_file is not None:
