@@ -2301,7 +2301,7 @@ def main(argv=None, child=None, actor=None):
             row_b = args.temporal_layers * 2 * args.temporal_width * (2 if args.temporal_kv == 'bf16' else 4) + \
                 4 * args.temporal_width
             msg += (f'; hand-off {row_b} bytes per temporal row, about '
-                    f'{(args.rollout + n * (args.temporal_window - 1)) * row_b / 2 ** 20:.0f} MiB per update')
+                    f'{(args.rollout + args.workers * (args.temporal_window - 1)) * row_b / 2 ** 20:.0f} MiB per update')
         print(msg, flush=True)
 
     # ------------------------------------------------------------------ learner (its own thread and CUDA stream)
@@ -3691,7 +3691,8 @@ def main(argv=None, child=None, actor=None):
                         halves_by_seq.setdefault(job['seq'], {})[job['aid']] = job
                         if len(halves_by_seq[job['seq']]) < n_act_l:
                             continue
-                        halves = [halves_by_seq.pop(job['seq'])[a_] for a_ in range(n_act_l)]
+                        got_ = halves_by_seq.pop(job['seq'])
+                        halves = [got_[a_] for a_ in range(n_act_l)]
                         bid_ = halves[0]['bid']
                         if any(h_['bid'] != bid_ for h_ in halves):
                             raise RuntimeError(f'B38 step 5: the actors\' halves of hand-off {job["seq"]} are in '
