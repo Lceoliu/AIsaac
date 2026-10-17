@@ -3771,6 +3771,8 @@ def main(argv=None, child=None, actor=None):
     actor_b = stop_ev = stop_b = None   # (B38 step 5: the second actor process and its stop event (first actor); the
     #                                     stop event this actor obeys (a second actor))
     seq_n = 0   # (B38 step 5: this actor's hand-offs, the learner pairs the actors' halves by it)
+    clean_end = False   # (B38 step 5: the actor loop ended by itself, no exception)
+    b_last = None   # (B38 step 5, the first actor: set when the second has handed its last half)
     if actor is not None:   # B38 step 5: a second actor: the learner's queue, its own messages, event and stop
         import multiprocessing as mp_a
         jobs, results, fresh, stop_ev = actor['jobs'], actor['results'], actor['fresh'], actor['stop']
@@ -3803,6 +3805,7 @@ def main(argv=None, child=None, actor=None):
             sent_gen[bid] = getattr(r_, 't_grown', 0)
         others = [dict(results=mpc.Queue(), fresh=mpc.Event()) for _ in range(n_act - 1)]
         stop_b = mpc.Event() if n_act > 1 else None
+        b_last = mpc.Event() if n_act > 1 else None
         learner = mpc.Process(target=learner_child_entry, name='learner', daemon=True, args=(
             list(sys.argv[1:] if argv is None else argv),
             dict(pid=os.getpid(), stats=sampler.stats.copy(), v2_on=v2_on, rolls=rolls_init, fa=wmove['fa'],
@@ -3811,7 +3814,7 @@ def main(argv=None, child=None, actor=None):
             actor_b = mpc.Process(target=actor_child_entry, name='actor1', daemon=False, args=(
                 list(sys.argv[1:] if argv is None else argv),
                 dict(aid=1, pid=os.getpid(), jobs=jobs, results=others[0]['results'], fresh=others[0]['fresh'],
-                     stop=stop_b, full={bid: rolls_init[bid]['full'] for bid in rolls_init})))
+                     stop=stop_b, last=b_last, full={bid: rolls_init[bid]['full'] for bid in rolls_init})))
         sh_mb = sum(nb for d in rolls_init.values() for (_, nb, _, _) in d.get('arrays', d.get('full')).values()) / 2 ** 20
         print(f'learner process (B38 step 2): rollouts\' host arrays shared ({sh_mb:.0f} MiB of address space, '
               'pages as written), their temporal tensors and the weights\' buffer through CUDA IPC'
@@ -4020,9 +4023,11 @@ def main(argv=None, child=None, actor=None):
                            stats=sampler.stats.copy()))
             torch.cuda.set_stream(actor_stream)
         # (B38 step 5: each actor process its share of the decisions and of every rollout)
-        target_actor = decisions_total + (target_decisions - decisions_total) // n_act
+        # (with several actors every one makes the same number of hand-offs: the learner pairs them all; one actor
+        # would make (target - start) / --rollout of them, up to rounding)
+        n_handoffs = -(-(target_decisions - decisions_total) // args.rollout)
         rollout_actor = args.rollout // n_act
-        while handed < target_actor and sampler.live and not L.get('stop') and not stopped():
+        while (handed < target_decisions if n_act == 1 else seq_n < n_handoffs) and sampler.live and                 not L.get('stop') and not stopped():
             # ---- collect
             t0 = time.perf_counter()
             cpu_c0 = cpu_ticks()
@@ -4211,11 +4216,24 @@ def main(argv=None, child=None, actor=None):
                 sync_wait = time.perf_counter() - tw
             if failure:
                 raise failure[0]
+        clean_end = True
+        if actor is not None and not stopped():   # (B38 step 5, a second actor at its end: its last half is handed;
+            #                                       it waits, its workers paused, until the first actor stops it)
+            actor['last'].set()
+            sampler.control[1] = 1
+            while not stop_ev.wait(1.0) and parent_a.is_alive():
+                pass
     finally:
+        if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
+            actor['last'].set()
         if actor is None:
+            if actor_b is not None:   # (B38 step 5: the second actor's last half first, else it stops at once)
+                if clean_end:
+                    while not b_last.wait(1.0) and actor_b.is_alive():
+                        pass
+                else:
+                    stop_b.set()
             jobs.put(None)
-        if stop_b is not None:   # (B38 step 5: the second actor stops too)
-            stop_b.set()
         if actor is not None:   # (B38 step 5, a second actor: the first one stops the learner)
             pass
         elif proc:   # B38 step 2: the learner process finishes its update, saves last.pt and says 'done'
@@ -4236,6 +4254,8 @@ def main(argv=None, child=None, actor=None):
             if learner.is_alive():
                 print('the learner process did not end; terminated', flush=True)
                 learner.terminate()
+            if stop_b is not None:   # (B38 step 5: the learner is done; the second actor ends)
+                stop_b.set()
             torch.cuda.synchronize()
         else:
             learner.join(timeout=900)
