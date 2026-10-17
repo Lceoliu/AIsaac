@@ -119,7 +119,7 @@ if [ "$mode" = kill ]; then
     --port 49800 --out $R/$tag > $R/$tag.log 2>&1 < /dev/null &
   tp=$!
   for i in $(seq 1 300); do grep -q "^u5 " $R/$tag.log && break; sleep 2; done
-  tr_=$(cat /proc/$tp/task/*/children)   # (timeout's child: the trainer)
+  tr_=$(cat /proc/$tp/task/*/children | tr -d " ")   # (timeout's child: the trainer)
   kids=$(cat /proc/$tr_/task/*/children)
   lp=$(sed -n 's/.*learner process (B38 step 2): pid \([0-9]*\).*/\1/p' $R/$tag.log | head -n 1)
   echo "$(date +%T) trainer $tr_, learner process $lp, children: $kids; SIGKILL to the trainer"
