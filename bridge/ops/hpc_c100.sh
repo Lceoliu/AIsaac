@@ -43,6 +43,22 @@ if [ "$1" = resume ]; then   # (B36 restart: same flags, --resume the given chec
   nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader; uptime
   exit 0
 fi
+if [ "$1" = resume-b38 ]; then   # (B38: learner process on the second visible GPU, overlap + decoupled; CUDA_VISIBLE_DEVICES=<actor>,<learner>)
+  CK=$2
+  PYTHONPATH=. nohup $PY train_tok.py $COMMON $FAST --learner-device cuda:1 --learner-process 1 --overlap --decoupled 1     --workers 48 --game-hours 25000 --checkpoint-every 1000 --rollout 32768 --minibatch 4096 --micro 4096 --learner-fast 1     --resume "$CK" --name hc100 --port 48000 --out $R/c100-scale >> $R/c100-scale.log 2>&1 < /dev/null &
+  sleep 300
+  date +%T; grep -i "devices (B38)" $R/c100-scale.log | tail -n 1 | cut -c1-160; tail -n 3 $R/c100-scale.log | cut -c1-220; echo "tracebacks $(grep -c Traceback $R/c100-scale.log)"
+  nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader; uptime
+  exit 0
+fi
+if [ "$1" = smoke-b38 ]; then   # (B38 smoke with the full C100 flags: 8 workers, 1.5 h, learner process on cuda:1)
+  shift
+  tag=${TAG:-smoke-c100-b38}
+  PYTHONPATH=. timeout 1500 $PY train_tok.py $COMMON --learner-device cuda:1 --learner-process 1 --overlap --decoupled 1     --workers 8 --game-hours 1.5 --checkpoint-every 100000 --rollout 8192 --minibatch 2048 --micro 1024 --learner-fast 1 "$@"     --name hsm13 --port 48600 --out $R/$tag > $R/$tag.log 2>&1 < /dev/null
+  echo "tracebacks $(grep -c Traceback $R/$tag.log)"; grep -i "devices (B38)\|temporal" $R/$tag.log | head -n 3 | cut -c1-200
+  grep "^finished\|^u[0-9]* " $R/$tag.log | tail -n 3 | cut -c1-220
+  exit 0
+fi
 if [ "$1" = watch ]; then
   export OMP_NUM_THREADS=4
   mkdir -p $R/c100-scale/evals
