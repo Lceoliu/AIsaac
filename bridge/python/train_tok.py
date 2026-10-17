@@ -267,6 +267,18 @@ def _filled(alloc):
     return full
 
 
+def ipc_safe_allocator():
+    """(B38 step 2) this process's CUDA allocations in ordinary segments (the allocator's default) even where
+    PYTORCH_CUDA_ALLOC_CONF asks for expandable ones (the HPC sandboxes): CUDA IPC of an expandable segment needs
+    pidfd_getfd, which a container without ptrace rights refuses ("pidfd_getfd: Operation not permitted"). Called
+    before the first CUDA allocation of the process whose tensors are shared (the actor's); True if it changed it."""
+    import torch
+    if 'expandable_segments:true' not in os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '').replace(' ', '').lower():
+        return False
+    torch.cuda.memory._set_allocator_settings('expandable_segments:False')
+    return True
+
+
 def memfd(name):
     """(B38 step 2) an anonymous shared-memory file (memfd_create, close-on-exec); through libc where this Python
     lacks os.memfd_create (the HPC's conda build)."""
@@ -1401,6 +1413,8 @@ def main(argv=None, child=None):
                    help="Python's thread switch interval (s): how long the actor may wait for the interpreter while "
                         'the learner thread runs Python (default of Python: 0.005)')
     args = p.parse_args(argv)
+    if args.learner_process and child is None and ipc_safe_allocator():   # (B38 step 2: before any CUDA allocation)
+        print('learner process (B38 step 2): expandable CUDA segments off in the trainer process (CUDA IPC)', flush=True)
     if args.poll_want <= 0:
         args.poll_want = max(1, args.workers // 2)
     if args.teacher_share is None:

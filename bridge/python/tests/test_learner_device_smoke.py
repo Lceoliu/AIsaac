@@ -123,6 +123,8 @@ def _child_cuda(q, ev, pid, descs, scals, tdevs, fa):
 
 
 def main():
+    if sys.platform.startswith('linux') and torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+        TT.ipc_safe_allocator()   # (as the trainer with --learner-process 1: shared CUDA tensors in ordinary segments)
     rng = np.random.default_rng(38)
     m = base_model()
     seq = TS.make_seq(rng)
@@ -284,16 +286,20 @@ def main():
         tdevs = {k: (r.t_kv, r.t_o) for k, r in enumerate(g_rolls)}
         pr = mpc.Process(target=_child_cuda, args=(q, ev, os.getpid(), descs, scals, tdevs, wm3['fa']))
         pr.start()
-        got_ev = ev.wait(600)
-        out = q.get(timeout=60)
+        got_ev = False
+        for _ in range(600):
+            got_ev = ev.wait(1.0)
+            if got_ev or not pr.is_alive():
+                break
+        out = q.get(timeout=60) if got_ev else {k: dict(kv=None, o=None, nb=-1, tab=[]) for k in range(len(g_rolls))}
         with torch.no_grad():
             torch._foreach_copy_(wm3['av'], list(wm3['fa'].split(wm3['sizes'])))
         torch.cuda.synchronize(d0)
         pr.join(60)
-        rows_ok, tab_d = True, 0.0
+        rows_ok, tab_d = got_ev, 0.0
         for k, r in enumerate(g_rolls):
             kk = r.n * r.tP + r.t_used
-            rows_ok &= np.array_equal(out[k]['kv'], r.t_kv[:kk].cpu().numpy()) and \
+            rows_ok &= out[k]['kv'] is not None and np.array_equal(out[k]['kv'], r.t_kv[:kk].cpu().numpy()) and \
                 np.array_equal(out[k]['o'], r.t_o[:r.t_obase + kk].cpu().numpy()) and out[k]['nb'] == expect_bytes(r)
             plan = TP.temporal_chunks(r.length, np.arange(r.cap)[None] < r.length[:, None], TS.TT_CH, TS.TT_MEM)
             with torch.no_grad():
