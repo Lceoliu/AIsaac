@@ -336,6 +336,113 @@ def attach_arrays(pid, desc, keep):
     return out
 
 
+def dump_job(job, view, path):
+    """(B38 step 3, a measurement aid: ISAAC_RL_B38_DUMP) a learner job as abplus_b38_replay.py replays it: the
+    rollout's used part (host arrays cut to the longest worker, scalars, the temporal tensors' used rows on the CPU)
+    and the job's host-side fields."""
+    import torch
+    m = int(view.length.max())
+    arr = {}
+    for k, v in vars(view).items():
+        if isinstance(v, np.ndarray):
+            if v.ndim >= 2 and v.shape[0] == view.n and k.startswith('rooms_') and k != 'rooms_n':
+                arr[k] = v[:, :view.tR + m].copy()
+            elif v.ndim >= 2 and v.shape[0] == view.n and k.startswith('t_'):
+                arr[k] = v[:, :view.tP + m].copy()
+            elif v.ndim >= 2 and v.shape[0] == view.n:
+                arr[k] = v[:, :m].copy()
+            else:
+                arr[k] = v.copy()
+    k_ = view.n * view.tP + view.t_used if view.t_kv is not None else 0
+    tens = None if view.t_kv is None else dict(
+        kv=view.t_kv[:k_].cpu(), o=view.t_o[:view.t_obase + k_].cpu(), rows=int(view.t_kv.shape[0]),
+        orows=int(view.t_o.shape[0]))
+    meta = {k: v for k, v in job.items() if k not in ('roll', 'lroll', 'lready', 'lcopy', 'tdev')}
+    Path(path).mkdir(parents=True, exist_ok=True)
+    torch.save(dict(arrays=arr, scal=rollout_scalars(view), tensors=tens, meta=meta, m=m), Path(path) / 'job.pt')
+    print(f'B38: a job dumped to {path}', flush=True)
+
+
+def profile_learn(learn, job, path):
+    """(B38 step 4, ISAAC_RL_B38_TORCHPROF) learn(job) under the torch profiler (CPU and CUDA activity): the
+    operator table (by self CPU time and by CUDA time), the regions' times (record_function 'b38:*' marks) and a
+    Chrome trace in path."""
+    from torch.profiler import ProfilerActivity, profile
+    Path(path).mkdir(parents=True, exist_ok=True)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_:
+        learn(job)
+    ka = prof_.key_averages()
+    with open(Path(path) / 'ops.txt', 'w') as f:
+        f.write(ka.table(sort_by='self_cpu_time_total', row_limit=60))
+        f.write('\n\n')
+        f.write(ka.table(sort_by='self_cuda_time_total', row_limit=40))
+    prof_.export_chrome_trace(str(Path(path) / 'trace.json'))
+    print(f'B38: the profile of one update written to {path}', flush=True)
+
+
+def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on):
+    """(B38 step 4, train_tok --learner-fast 2) what the start-of-update pass needs for the B18 fast path's host plans
+    of records at flat positions of a rollout: per record its entity / door / item counts and its history token's
+    presence on the host, and (dedup) its ids among the distinct grids of rows_dev (the records on the device)."""
+    from isaac_bridge.tok_policy import DEDUP, distinct_ids, item_count
+    w_, t_ = flat // roll.cap, flat % roll.cap
+    fr = dict(ne=roll.rows['n_ent'][w_, t_].astype(np.int64), nd=roll.rows['n_doors'][w_, t_].astype(np.int64),
+              ni=item_count(row_fields(roll, flat, ('inv', 'pitem')), item_slots) if n_item_tok else None,
+              hist=(roll.t_step[w_, roll.tP + t_] > 0) if t_on else None, width=rows_dev['ent'].shape[1])
+    fr['dd'] = {k_: distinct_ids(rows_dev[k_]).cpu().numpy() for k_ in DEDUP} if 'dedup' in fparts else {}
+    fr['dd_size'] = {k_: int(v_.max()) + 1 for k_, v_ in fr['dd'].items()}
+    return fr
+
+
+def fast_plan_rows(fr, raw, pend, lo, hi, fparts, n_buckets, n_item_tok, glob_tok, t_on):
+    """(B38 step 4) records lo .. hi of fast_plan_counts' set as forward(packed=True) takes them on the B18 fast
+    path (what the PPO parts build): their bytes decoded (raw [n, >= ROW_BYTES] uint8, pend [n, heads] on the device;
+    a slice: no gather), the host plan (entity positions, attention buckets, the distinct grids) in one copy (pinned
+    on a GPU)."""
+    import torch
+    from isaac_bridge.tok_policy import decode_rows, first_of, learner_plan, plan_tokens, used_entities
+    dev_ = raw.device
+    ne_p, nd_p = fr['ne'][lo:hi], fr['nd'][lo:hi]
+    mb_ = decode_rows(raw[lo:hi], pending=pend[lo:hi], entities=min(fr['width'], used_entities(ne_p)))
+    xp_ = dict(item_tok=n_item_tok, glob=glob_tok) if (n_item_tok or glob_tok or t_on) else {}
+    if xp_:
+        xp_['n_item'] = fr['ni'][lo:hi] if n_item_tok else None
+    if t_on:
+        xp_['hist'] = fr['hist'][lo:hi]
+    plan = learner_plan(ne_p, nd_p, mb_['ent'].shape[1], n_buckets, **xp_)
+    hn = ['rec', 'base']
+    for k_ in fr['dd']:
+        plan[k_ + '_u'], plan[k_ + '_i'] = first_of(fr['dd'][k_][lo:hi], fr['dd_size'][k_])
+        hn += [k_ + '_u', k_ + '_i']
+    bk_ = plan['buckets'] if 'buckets' in fparts else []
+    arrays = [plan[k_].reshape(-1) for k_ in hn] + [c_ for c_, _ in bk_]
+    on = torch.from_numpy(np.concatenate([np.asarray(a_, np.int64) for a_ in arrays]))
+    if dev_.type == 'cuda':
+        on = on.pin_memory()
+    got = list(on.to(dev_, non_blocking=True).split([len(a_) for a_ in arrays]))
+    got[0] = got[0].view(-1, plan['rec'].shape[1])
+    mb_.update(zip(hn[2:], got[2:len(hn)]))
+    tok = plan_tokens(plan, got[0], got[1])
+    pnames = ['keep', 'starts']
+    if 'ekeep' in fparts:
+        pnames.append('ekeep')
+    if 'buckets' in fparts:
+        pnames.append('gpos')
+        if 'ekeep' in fparts:
+            pnames += ['dkeep', 'xperm'] + (['ikeep', 'glast'] if xp_ else [])
+    mb_.update((k_, tok[k_]) for k_ in pnames)
+    if bk_:
+        mb_['buckets'] = [(c_, w_) for c_, (_, w_) in zip(got[len(hn):], bk_)]
+    return mb_
+
+
+def row_fields(roll, flat, names):
+    """(B38 step 4) the fields `names` of a rollout's records at flat positions (w * cap + t), each gathered on its
+    own (a dict: what item_count reads), instead of whole records (20.8 KB each)."""
+    w, t = flat // roll.cap, flat % roll.cap
+    return {k: roll.rows[k][w, t] for k in names}
+
+
 def rollout_scalars(roll):
     """(B38 step 2) a rollout's attributes that are neither arrays nor tensors (counters, sizes; None for the parts
     that are off): what the learner process's view needs per job besides the shared arrays."""
@@ -1340,7 +1447,15 @@ def main(argv=None, child=None):
                         'float32 matrix products, the input mlps on the real tokens, the CNNs on the distinct grids, '
                         'no host sync per step, the fused Adam; learn() in train_tok.py, EXPERIMENTS.md B18). Not '
                         'bit-identical: the same function in another summation order (abplus_bench_learner.py '
-                        '--check, abplus_check_learner_fp64.py). 0: as before')
+                        '--check, abplus_check_learner_fp64.py). 0: as before. 2 (B38 step 4, 2026-10-17): also '
+                        "the start-of-update pass (--recompute-values / --decoupled) on the fast path's host plans "
+                        '(attention buckets, entity positions, the distinct grids: the same values up to summation '
+                        'order), its records staged in pinned memory and kept as bytes, so that the PPO parts gather '
+                        "bytes after it too (B18's raw gather; values identical), the item counts read from the fields")
+    p.add_argument('--learner-compile', default='',
+                   help="2026-10-17 (B38 step 4, an experiment): torch.compile mode of the learner model's forward in "
+                        "the PPO parts and the recompute pass (e.g. default, max-autotune-no-cudagraphs; dynamic "
+                        "shapes); '': eager, as before")
     p.add_argument('--learner-cpus', default='',
                    help='2026-10-10 (B18): CPUs for the learner thread alone, e.g. 56-59,168-171 (Linux numbering; '
                         'whole cores with their hyperthread siblings, best on the GPU\'s NUMA node): the trainer\'s '
@@ -1639,12 +1754,13 @@ def main(argv=None, child=None):
     # visible one); otherwise ldev is `device` itself and nothing below changes
     ldev, split = device, False
     device_actor = torch.device('cuda', torch.cuda.current_device())   # (`device` with its index: other threads)
+    lbench = child is not None and bool(child.get('bench'))   # (abplus_b38_replay.py: no actor GPU to keep apart)
     if args.learner_device:
         want = torch.device(args.learner_device)
         if want.type != 'cuda' or (want.index or 0) >= torch.cuda.device_count():
             p.error(f'--learner-device {args.learner_device}: not one of the {torch.cuda.device_count()} visible GPUs')
-        if (want.index or 0) != torch.cuda.current_device():
-            ldev, split = torch.device('cuda', want.index), True
+        if (want.index or 0) != torch.cuda.current_device() or lbench:
+            ldev, split = torch.device('cuda', want.index or 0), True
     proc = bool(args.learner_process)   # B38 step 2: the learner in a process of its own
     if proc and not split:
         p.error('--learner-process 1 needs --learner-device on another GPU than the actor\'s (two processes on one GPU: '
@@ -2059,6 +2175,25 @@ def main(argv=None, child=None):
                         **(dict(choice_optimizer=copt.state_dict()) if copt is not None else {})),
                    path)
 
+    b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
+    # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
+    # --learner-compile, the same module and parameters)
+    lm_call = learner_model
+    if args.learner_compile and (child is not None or not proc):
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = int(os.environ.get('ISAAC_RL_B38_COMPILE_CACHE', '64'))
+        lm_call = torch.compile(learner_model, mode=args.learner_compile, dynamic=True)
+
+    def pmark(name, prev=None):
+        """(B38 step 4, only with ISAAC_RL_B38_TORCHPROF) end the profiler region prev, open one called name."""
+        if prev is not None:
+            prev.__exit__(None, None, None)
+        if not b38_marks or name is None:
+            return None
+        m__ = torch.profiler.record_function(name)
+        m__.__enter__()
+        return m__
+
     def learn(job):
         """One PPO update on a full rollout; signals `fresh` as soon as the new weights are final, then logs."""
         # B38: every tensor of the update on the learner's GPU (`device` below is the learner's; the actor's is adev;
@@ -2097,10 +2232,15 @@ def main(argv=None, child=None):
         # (no blocking copy per step), the fused Adam. Not bit-identical to 0 (another summation order):
         # abplus_bench_learner.py --check, abplus_check_learner_fp64.py.
         fast = bool(args.learner_fast)
+        fast2 = args.learner_fast >= 2   # (B38 step 4)
         # (ISAAC_RL_LEARNER_PARTS: a subset of the parts, for the bench's attribution; default all)
         fparts = set(os.environ.get('ISAAC_RL_LEARNER_PARTS', 'math,ekeep,buckets,nhwc,ln,dedup,logp,raw').split(',')
                      if fast else ())
         learner_model.set_math_attention('math' in fparts, nhwc='nhwc' in fparts, ln='ln' in fparts)
+        if fast2:   # (B38 step 4: the CNNs' distinct grids in batches of a multiple of 64: cuDNN plans reused)
+            learner_model.cnn_bucket = int(os.environ.get('ISAAC_RL_B38_CNN_BUCKET', '64'))
+            if os.environ.get('ISAAC_RL_B38_CUDNN_BENCH') == '1':   # (a measurement aid: cuDNN's autotuner)
+                torch.backends.cudnn.benchmark = True
         n_buckets = int(os.environ.get('ISAAC_RL_LEARNER_BUCKETS', '3'))   # (at most; a measurement aid)
         raw_mode = 'raw' in fparts and teach_gpu and bool(args.teach_merge)   # (B18: minibatches gathered as bytes)
         if L['dumped'] < args.dump_rollouts:   # the rollout and the learner's weights before this update
@@ -2127,7 +2267,16 @@ def main(argv=None, child=None):
             # the values the advantages need (and with --decoupled the log-probabilities of the stored actions), from
             # the weights at the start of this update
             value_now = rl.value.copy()
-            every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
+            if fast2:   # (B38 step 4: staged in pinned memory, one asynchronous copy, the bytes kept for the parts)
+                if L.get('stage_r') is None or L['stage_r'].shape[0] < len(all_flat):
+                    L['stage_r'] = None
+                    L['stage_r'] = torch.empty((int(len(all_flat) * 1.25) + 64, ROW_BYTES),
+                                               dtype=torch.uint8).pin_memory()
+                every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
+                                                      stage=L['stage_r'], with_raw=True)
+                fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on)
+            else:
+                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
             # (memory: one GRU step from each decision's stored input state)
             h_all = torch.from_numpy(rl.h.reshape(-1, mem_dim)[all_flat]).to(device) if mem_on else None
@@ -2139,21 +2288,25 @@ def main(argv=None, child=None):
                 return dict(temporal=dict(mode='stored', o=t_all['o'][part_], o_prev=t_all['o_prev'][part_],
                                           has=t_all['has'][part_])) if t_on else {}
             vals, lps = [], []
+            m_r = pmark('b38:recompute')
             with torch.inference_mode():
                 chunk = args.micro or args.minibatch
                 for at in range(0, len(all_flat), chunk):
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
+                    b_p = fast_plan_rows(fr_, raw_e, pend_e, at, min(at + chunk, len(all_flat)), fparts, n_buckets,
+                                         NI_f, G_f, t_on) if fast2 else None
                     if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
-                        b_p = take(every, part)
+                        b_p = take(every, part) if b_p is None else b_p
                         with autocast():
-                            o_ = learner_model(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
+                            o_ = lm_call(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
                                                need_vg=True, **tk_all(part))
                         lp_ = learner_model.log_prob(o_[0], learner_model.gate(b_p), acts_all[part])[0]
                         v_ = o_[1].float()
                         vgs.append(o_[-1].float())
                     else:
                         with autocast():
-                            lp_, _, v_, _ = learner_model.evaluate(take(every, part), acts_all[part],
+                            lp_, _, v_, _ = learner_model.evaluate(take(every, part) if b_p is None else b_p,
+                                                                   acts_all[part],
                                                                    packed=bool(args.packed),
                                                                    mem=h_all[part] if mem_on else None, **tk_all(part))
                     vals.append(v_)
@@ -2163,6 +2316,7 @@ def main(argv=None, child=None):
             else:
                 value_now = None
             prox_all = torch.cat(lps)
+            pmark(None, m_r)
             sec('recompute')
         if gtok_on and len(all_flat) and vg_stored is not None and not vgs:   # (B24) the actor's values, as stored
             vg_now = vg_stored
@@ -2210,7 +2364,14 @@ def main(argv=None, child=None):
         lr = args.lr + (args.lr_final - args.lr) * frac
         for g in opt.param_groups:
             g['lr'] = lr
-        if every is not None:   # the decisions with a reward, out of the records already on the device
+        if every is not None and fast2:   # (B38 step 4: the records' bytes from the start-of-update pass)
+            pos = torch.from_numpy(np.searchsorted(all_flat, flat)).to(device)
+            raw_all, pend_all = raw_e.index_select(0, pos), pend_e.index_select(0, pos)
+            batch = decode_rows(raw_all, pend_all)
+            if args.decoupled:
+                prox = prox_all[pos].clone()
+            del every, prox_all, raw_e, pend_e
+        elif every is not None:   # the decisions with a reward, out of the records already on the device
             pos = torch.from_numpy(np.searchsorted(all_flat, flat)).to(device)
             batch = take(every, pos)
             raw_mode = False   # (B18: no record bytes here; the fields are gathered as before)
@@ -2591,7 +2752,8 @@ def main(argv=None, child=None):
         ne_h = rl.rows['n_ent'].reshape(-1)[flat].astype(np.int64)
         nd_h = rl.rows['n_doors'].reshape(-1)[flat].astype(np.int64)
         # (B24) the records' real item tokens; the plans' extra arguments (none without item / global / history tokens)
-        ni_h = item_count(rl.rows.reshape(-1)[flat], item_slots) if NI_f else None
+        ni_h = (item_count(row_fields(rl, flat, ('inv', 'pitem')), item_slots) if fast2 else
+                item_count(rl.rows.reshape(-1)[flat], item_slots)) if NI_f else None
         xplan = dict(item_tok=NI_f, glob=G_f) if (NI_f or G_f or t_on) else {}
 
         def teach_ni(pick_):
@@ -2732,6 +2894,7 @@ def main(argv=None, child=None):
                     bounds = [(lo_, min(lo_ + micro, len(sel)), None) for lo_ in range(0, len(sel), micro)]
                 last = bounds[-1][0]
                 for lo_, hi_, cids_ in bounds:   # the minibatch's means, a part at a time
+                    m_ = pmark('b38:part_plan')
                     part = sel[lo_:hi_]
                     part_h = sel_h[lo_:hi_]
                     if chunked:   # (memory / temporal) the part's share of the minibatch's trained decisions
@@ -2815,6 +2978,7 @@ def main(argv=None, child=None):
                         mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1],
                                                                                    **xplan))
                     k_ = len(part)
+                    m_ = pmark('b38:part_forward', m_)
                     with autocast():
                         if chunked:   # (memory) BPTT over the part's chunks from their stored first states; the
                             #          teacher's records one step each (the old teacher's from 0, teacher v2's own)
@@ -2841,12 +3005,13 @@ def main(argv=None, child=None):
                                         o=torch.cat([z_, L['v2_o'].index_select(0, vpick_d)]),
                                         m=torch.cat([torch.zeros(n_tb, device=device),
                                                      L['v2_m'].index_select(0, vpick_d)]))
-                            outs_ = learner_model(mb, packed=bool(args.packed), mem=memd,
+                            outs_ = lm_call(mb, packed=bool(args.packed), mem=memd,
                                                   **(dict(need_vg=True) if glob_loss else {}), **tk_)
                         else:
-                            outs_ = learner_model(mb, packed=bool(args.packed),
+                            outs_ = lm_call(mb, packed=bool(args.packed),
                                                   **(dict(need_vg=True) if glob_loss else {}))
                         logits_, value_, danger_ = outs_[:3]
+                    m_ = pmark('b38:part_loss', m_)
                     logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
                         logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
                     value = value_[:k_].float()
@@ -2883,7 +3048,9 @@ def main(argv=None, child=None):
                             logits_[o_:], learner_model.gate(mb)[o_:], v_act)
                         vloss, vstats = v2_terms(lp_v, value_[o_:], vpick_d, v_w, v_G, v_share, adv_std, n_sel)
                         loss = loss + vloss
+                    m_ = pmark('b38:part_backward', m_)
                     loss.backward()
+                    m_ = pmark('b38:part_stats', m_)
                     with torch.no_grad():
                         if pf_on:   # (B23: kl and clip share over the PPO-trained decisions' rows)
                             acc += torch.stack([pg, vf, ent, kl_f, clip_f]) * w
@@ -2943,8 +3110,10 @@ def main(argv=None, child=None):
                     L['trace'].append((acc.clone(), tacc.clone(), None if L['trace'] else
                                        [None if q.grad is None else q.grad.clone()
                                         for q in opt.param_groups[0]['params']]))
+                m_ = pmark('b38:clip_opt', m_)
                 torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                 opt.step()
+                pmark(None, m_)
                 sec('opt')
         learner_model.eval()
         choice_log = train_choice() if branching else {}   # Phase B2 (before the actor takes the new weights)
@@ -3290,6 +3459,14 @@ def main(argv=None, child=None):
         failed = False
         cpu_mark, t_mark = time.process_time(), time.perf_counter()
         fail_at = int(os.environ.get('ISAAC_RL_B38_FAIL_AT', '0') or 0)
+        dump_dir = os.environ.get('ISAAC_RL_B38_DUMP', '')   # (B38 step 3: save the job of update dump_at)
+        dump_at = int(os.environ.get('ISAAC_RL_B38_DUMP_AT', '5') or 5)   # (the dump_at-th job of this process)
+        # (B38 step 4, a measurement aid: ISAAC_RL_B38_TORCHPROF=<dir>: the torch profiler over the k-th update of
+        # this process, ISAAC_RL_B38_TORCHPROF_AT=k (default 3): a table and a Chrome trace in <dir>)
+        prof_dir = os.environ.get('ISAAC_RL_B38_TORCHPROF', '')
+        prof_at = int(os.environ.get('ISAAC_RL_B38_TORCHPROF_AT', '3') or 3)
+        n_jobs = 0
+        sync_at = int(os.environ.get('ISAAC_RL_B38_SYNCDEBUG_AT', '0') or 0)   # (the update whose syncs are listed)
         print(f'learner process (B38 step 2): pid {os.getpid()}, {ldev}, {len(views)} shared rollouts', flush=True)
         try:
             while True:
@@ -3328,7 +3505,22 @@ def main(argv=None, child=None):
                         job['lcopy'] = (e0, e1)
                     if fail_at and L['update'] + 1 == fail_at:   # (a test aid: ISAAC_RL_B38_FAIL_AT)
                         raise RuntimeError(f'ISAAC_RL_B38_FAIL_AT: injected failure before update {fail_at}')
-                    learn(job)
+                    n_jobs += 1
+                    if dump_dir and n_jobs == dump_at:   # (B38 step 3: a job for abplus_b38_replay.py)
+                        dump_job(job, v, dump_dir)
+                    if prof_dir and n_jobs == prof_at:
+                        profile_learn(learn, job, prof_dir)
+                    elif sync_at and n_jobs == sync_at:   # (B38 step 4: every host sync of one update, with its line)
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.simplefilter('always')
+                            torch.cuda.set_sync_debug_mode('warn')
+                            try:
+                                learn(job)
+                            finally:
+                                torch.cuda.set_sync_debug_mode('default')
+                    else:
+                        learn(job)
                 except BaseException:
                     failed = True
                     results_q.put(('error', traceback.format_exc()))
