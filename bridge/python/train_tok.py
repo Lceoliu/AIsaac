@@ -1385,6 +1385,10 @@ def main(argv=None, child=None):
                         'no host sync per step, the fused Adam; learn() in train_tok.py, EXPERIMENTS.md B18). Not '
                         'bit-identical: the same function in another summation order (abplus_bench_learner.py '
                         '--check, abplus_check_learner_fp64.py). 0: as before')
+    p.add_argument('--learner-compile', default='',
+                   help="2026-10-17 (B38 step 4, an experiment): torch.compile mode of the learner model's forward in "
+                        "the PPO parts and the recompute pass (e.g. default, max-autotune-no-cudagraphs; dynamic "
+                        "shapes); '': eager, as before")
     p.add_argument('--learner-cpus', default='',
                    help='2026-10-10 (B18): CPUs for the learner thread alone, e.g. 56-59,168-171 (Linux numbering; '
                         'whole cores with their hyperthread siblings, best on the GPU\'s NUMA node): the trainer\'s '
@@ -2105,6 +2109,13 @@ def main(argv=None, child=None):
                    path)
 
     b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
+    # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
+    # --learner-compile, the same module and parameters)
+    lm_call = learner_model
+    if args.learner_compile and (child is not None or not proc):
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = int(os.environ.get('ISAAC_RL_B38_COMPILE_CACHE', '64'))
+        lm_call = torch.compile(learner_model, mode=args.learner_compile, dynamic=True)
 
     def pmark(name, prev=None):
         """(B38 step 4, only with ISAAC_RL_B38_TORCHPROF) end the profiler region prev, open one called name."""
@@ -2204,7 +2215,7 @@ def main(argv=None, child=None):
                     if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
                         b_p = take(every, part)
                         with autocast():
-                            o_ = learner_model(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
+                            o_ = lm_call(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
                                                need_vg=True, **tk_all(part))
                         lp_ = learner_model.log_prob(o_[0], learner_model.gate(b_p), acts_all[part])[0]
                         v_ = o_[1].float()
@@ -2902,10 +2913,10 @@ def main(argv=None, child=None):
                                         o=torch.cat([z_, L['v2_o'].index_select(0, vpick_d)]),
                                         m=torch.cat([torch.zeros(n_tb, device=device),
                                                      L['v2_m'].index_select(0, vpick_d)]))
-                            outs_ = learner_model(mb, packed=bool(args.packed), mem=memd,
+                            outs_ = lm_call(mb, packed=bool(args.packed), mem=memd,
                                                   **(dict(need_vg=True) if glob_loss else {}), **tk_)
                         else:
-                            outs_ = learner_model(mb, packed=bool(args.packed),
+                            outs_ = lm_call(mb, packed=bool(args.packed),
                                                   **(dict(need_vg=True) if glob_loss else {}))
                         logits_, value_, danger_ = outs_[:3]
                     m_ = pmark('b38:part_loss', m_)
