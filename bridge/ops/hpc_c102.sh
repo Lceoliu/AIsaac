@@ -20,8 +20,8 @@ R=$ABP_HOME/runs
 CK0=/101063/AIsaac/ws9/runs/c99-scratch/checkpoints/segment2-final.pt
 OUT=$R/c102-noactive
 MB=${MB:-4096}
-GROUPS=../abplus/catalog/scaling2_groups.json
-COMMON="--groups-file $GROUPS --mode run --items --epochs 3 --teacher --teacher-queue 12 --archive-size 12 \
+GRP_FILE=../abplus/catalog/scaling2_groups.json
+COMMON="--groups-file $GRP_FILE --mode run --items --epochs 3 --teacher --teacher-queue 12 --archive-size 12 \
   --lr 1e-4 --lr-final 1e-4 --episodes-per-state 8 --teacher-death-depths 2,4,8,16,32 --teacher-thread 1 --teacher-fork 1 \
   --teacher-share 0.1 --teacher-slots 6 --poll-wait 0.003 \
   --item-tokens 1 --global-token 1 --item-shared 1 --start-build-prob 0.5 --start-build-max 3 --start-build-mode pedestal \
@@ -43,7 +43,7 @@ SMOKE_LAYOUT=${SMOKE_LAYOUT:-"--learner-device cuda:1 --learner-process 1 --over
 eval_track() {
   local ck=$1 dir=$2 name=$3 port=$4 workers=$5
   shift 5
-  PYTHONPATH=. timeout 7200 $PY eval_tok.py --checkpoint "$ck" --groups-file $GROUPS --mode run --items \
+  PYTHONPATH=. timeout 7200 $PY eval_tok.py --checkpoint "$ck" --groups-file $GRP_FILE --mode run --items \
     --workers $workers --seeds 2147490000:128 --name $name --port $port --out "$dir" "$@" > "$dir.log" 2>&1 < /dev/null
 }
 # record <summary dir> <tag> <jsonl>: the summary plus its tag appended to the jsonl (nothing for a failed eval)
@@ -88,7 +88,7 @@ EOF
 fi
 if [ "$1" = probe ]; then
   mkdir -p $R/c102-probe
-  PYTHONPATH=. timeout 1800 $PY abplus_probe_no_active.py --groups-file $GROUPS --seeds 2147490000:2 --chars 0,3,5 \
+  PYTHONPATH=. timeout 1800 $PY abplus_probe_no_active.py --groups-file $GRP_FILE --seeds 2147490000:2 --chars 0,3,5 \
     --name hb39p --port 49690 --out $R/c102-probe > $R/c102-probe.log 2>&1 < /dev/null
   grep "^SUMMARY" $R/c102-probe.log; echo "tracebacks $(grep -c Traceback $R/c102-probe.log)"
   exit 0
