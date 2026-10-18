@@ -2,7 +2,7 @@
 # C104 "control for C103" (user 10-18): the best checkpoint (C99 segment2-final.pt, u48184, 58,506 h) continued with
 # minibatch 8192 and NOTHING else new (no --cf-wall, no --cf-defer-target, stall rule = events), on host B (72-core
 # quota, 2 x H20): B38 two-GPU layout (actor cuda:0, learner process cuda:1, --learner-fast 2, overlap + decoupled),
-# 48 workers, 12,000 game hours. C103 (host A, 4 GPUs, 20,000 h) = the same plus the B40 items; compare the 128-seed
+# 48 workers, 15,000 game hours (user 10-18). C103 (host A, 4 GPUs, 20,000 h) = the same plus the B40 items; compare the 128-seed
 # curves at equal game hours. Sandbox ws15 (B39 commit 35f3f4e: B38 + the start-room restore fix; the B40 flags do not
 # exist there, which is the point). usage: hpc_c104.sh smoke | run [ckpt] | watch   (CUDA_VISIBLE_DEVICES=0,1)
 source /101063/AIsaac/ws15/hpc_env.sh
@@ -26,7 +26,7 @@ if [ "$1" = smoke ]; then
 fi
 if [ "$1" = run ]; then
   CK=${2:-/101063/AIsaac/ws9/runs/c99-scratch/checkpoints/segment2-final.pt}
-  PYTHONPATH=. nohup $PY train_tok.py $COMMON $FAST --learner-device cuda:1 --learner-process 1 --overlap --decoupled 1     --learner-fast 2     --workers 48 --game-hours 12000 --checkpoint-every 1000 --rollout 32768 --minibatch 8192 --micro 8192     --resume "$CK" --name hc104 --port 49150 --out $R/c104-ctrl8192 > $R/c104-ctrl8192.log 2>&1 < /dev/null &
+  PYTHONPATH=. nohup $PY train_tok.py $COMMON $FAST --learner-device cuda:1 --learner-process 1 --overlap --decoupled 1     --learner-fast 2     --workers 48 --game-hours 15000 --checkpoint-every 1000 --rollout 32768 --minibatch 8192 --micro 8192     --resume "$CK" --name hc104 --port 49150 --out $R/c104-ctrl8192 > $R/c104-ctrl8192.log 2>&1 < /dev/null &
   sleep 300
   date +%T; grep -i "devices (B38)" $R/c104-ctrl8192.log | tail -n 1 | cut -c1-160; tail -n 3 $R/c104-ctrl8192.log | cut -c1-220; echo "tracebacks $(grep -c Traceback $R/c104-ctrl8192.log)"
   nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader; uptime
