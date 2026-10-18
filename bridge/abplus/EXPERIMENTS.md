@@ -7975,6 +7975,7 @@ cd /101063/AIsaac/ws16 && CUDA_VISIBLE_DEVICES=0,1 bash hpc_c103.sh smoke
 - `rock` 触发没做（染色石头在 ROW 里不可观测）。
 
 - **合入状态**（10-18 19:xx 本地）：分支 `b40-bomb-trigger` 以 HEAD `8d93604` 合入 abplus-training；三个开关默认关，老运行不受影响。注意原生库的上下文从 40 格扩到 46/48 格，带这段代码的沙箱必须重编 `libabp_turbo.so`（`mk_ws16.sh` 会做），否则回落到慢的 Python 路径。60 次更新的冒烟（`ws16/hpc_c103.sh smoke`）待主机 A 的 C101 结束后做，然后 C103 上线。
+- **冒烟**（10-18 19:3x 本地，重建后的主机 B，8 worker、两卡、全配置、从 segment2-final.pt）：`finished 48245 updates 58524.7 game hours`，0 Traceback，94 个反事实点里 3 个 wall 点（3 次放了炸弹、1 次炸开，候选概率均值 0.65，分支暂未胜出：样本太少），`--stall-progress pickups`、`--cf-defer-target` 路径都走通。
 
 
 ### A30 宝箱房道具值不值、价值头知不知道：反事实双支诊断（2026-10-18，3090 沙箱 b35）
