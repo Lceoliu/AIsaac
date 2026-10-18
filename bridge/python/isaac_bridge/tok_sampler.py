@@ -268,6 +268,10 @@ class TokSamplerConfig:
     run_seconds: float = 1800.0                   # run: an episode's time limit (game seconds)
     floor_seconds: float = 480.0                  # floor: an episode's time limit
     floor_stall_seconds: float = 60.0             # floor: and how long it may go without a new or a cleared room
+    # B40 (2026-10-18): what counts as progress for that rule: 'events' (a new / cleared room, a monster hurt; as
+    # before) or 'pickups' (also a gain in player 0's coins, keys, bombs or health units; tok_obs EpisodeState
+    # stall_pickups, abp_row_encode RC_STALL_MODE). The stall share is a policy input (player column 30).
+    stall_progress: str = 'events'
     archive_size: int = 12                        # floor: parked room-entry states per worker
     archive_prob: float = 0.7                     # floor: share of the episodes that start from one of them
     snapshot_prob: float = 0.5                    # floor: share of the room entries that are parked

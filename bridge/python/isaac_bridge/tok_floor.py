@@ -4,7 +4,8 @@ A worker's root instance resets real Basement I floors (the bridge's reset_mode 
 3 red hearts, 1 bomb, the floor of the seed; floors with Labyrinth, Lost or Maze skipped) and a template clone is
 parked at each floor's start, as in tok_sampler. An episode is a lean clone that plays on through the doors until the
 player dies, the level's stage changes (the trapdoor after the boss: the floor is cleared), the time limit, or
-cfg.floor_stall_seconds without a new room or a cleared one. Protocol, records and the one-decision action lag are
+cfg.floor_stall_seconds without a new room or a cleared one (or a monster hurt; B40, cfg.stall_progress 'pickups':
+or a gain in coins / keys / bombs / health). Protocol, records and the one-decision action lag are
 tok_sampler's; a step during which the room changes ends at the new room's first logic frame (the bridge's rule).
 
 Start-state archive: an episode that enters a room for the first time is cloned there with probability
@@ -357,6 +358,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     run = cfg.mode == 'run'
     limit = int(round((cfg.run_seconds if run else cfg.floor_seconds) * 30 / cfg.frames_per_decision))
     stall = int(round(cfg.floor_stall_seconds * 30 / cfg.frames_per_decision))
+    stall_pk = getattr(cfg, 'stall_progress', 'events') == 'pickups'   # B40: gains count as progress
     queue = []      # hurts to search: (parked base, reseed, applied actions, hurt_at, seed, episode, base's decision)
     archive = []
     # 2026-10-10 (teacher v2): its points (tok_teacher2.V2Point), searched by the search thread through the lane
@@ -929,7 +931,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         records, 'gamma_t' gamma^T, 'v_end' and 'boot' the actor's value of a truncated last record); returns (the end
         code, its EpisodeState). trace (a dict, Phase B2): filled with the records' state digests and the actions
         answered to them."""
-        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items)
+        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk)
         st.visited = set(visited)
         st.stage0 = int(obs.room[5])
         for s in slots:
@@ -1228,7 +1230,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         """One lab episode of panel state k from the clone B (obs: its first observation): records to the trainer
         tagged ROW lab / lab_s / crn, actions from the actor. Ends: death, the room cleared / left, the cap (the last
         three DONE_BRANCH: a truncation), the floor's stall rule. Fills res (tok_lab RES)."""
-        st = EpisodeState(lab_cap + 1, floor=True, stall=stall, run=run, items=cfg.items)
+        st = EpisodeState(lab_cap + 1, floor=True, stall=stall, run=run, items=cfg.items,
+                          stall_pickups=stall_pk)
         st.stage0 = int(obs.room[5])
         st.visited = set()
         for s in slots:
@@ -1680,7 +1683,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['archive_starts']] += from_archive
             episode_n += 1
             seed_now = src.info['seed']
-            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items)
+            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk)
             st.visited, st.stage0 = set(src.info['visited']), src.info['stage0']
             enc = FastRow(fast_fn, st, decoder, episode_n, seed_now, group) if fast_fn is not None else None
             item, lf_now = obs, obs.logic_frames   # with FastRow item is the step's raw payload

@@ -327,7 +327,8 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
         B._send({"cmd": "obs"})
         ob = read_lean(B, dec)
         lf0 = lf = ob.logic_frames
-        st = EpisodeState(ctx.limit, floor=True, stall=ctx.stall, run=ctx.run, items=ctx.items)
+        st = EpisodeState(ctx.limit, floor=True, stall=ctx.stall, run=ctx.run, items=ctx.items,
+                          stall_pickups=getattr(ctx.cfg, 'stall_progress', 'events') == 'pickups')
         st.visited = set(pt.visited)
         st.stage0 = int(pt.stage0) if pt.stage0 is not None else int(ob.room[5])
         st.progress_t = pt.log.progress[d - 1] if d >= 1 else d   # the stall counter before record d

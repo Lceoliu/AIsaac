@@ -6,6 +6,9 @@
 # door targets (--cf-defer-target 1: the target branch of a locked / shop / treasure / cleared door trigger and the
 # bomb_at branch play the policy until the room is cleared, then walk; distilled from there). Control = C99 segment 2
 # (and C102) at equal game hours from the same checkpoint; set DEFER=0 to keep B34's door targets (wall trigger only).
+# Also B40 (user): --stall-progress pickups (a gain in coins / keys / bombs / health resets the floor's 60-s stall timer
+# too, so collecting and bombing are not cut off; the stall share is a policy input; STALL_PROGRESS=events = as C99).
+# The watcher evaluates with EVAL_STALL (default events = C99's rule, comparable curves; pickups = the training rule).
 # B38 4-GPU layout (two actor processes on the 1st and 3rd visible GPUs, the learner process on the 2nd, --learner-fast
 # 2, overlap + decoupled): run with CUDA_VISIBLE_DEVICES=0,1,2,3 (actors 0 and 2, learner 1, watcher 3).
 # Minibatch: MB (default 4096 = C99; set MB=8192 if C101 says so) for --minibatch and --micro.
@@ -31,7 +34,7 @@ COMMON="--groups-file $GRP_FILE --mode run --items --epochs 3 --teacher --teache
   --cf 1 --cf-points 6 --cf-branches 4 --cf-seconds 180 --cf-target-seconds 20 --cf-margin 0.3 --cf-cap 2 \
   --cf-distill-steps 8 --cf-random 1 --cf-advantage 0"
 FAST="--actor-compile default --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
-WALL="--cf-wall 1 --cf-wall-distill 64 --cf-defer-target ${DEFER:-1}"
+WALL="--cf-wall 1 --cf-wall-distill 64 --cf-defer-target ${DEFER:-1} --stall-progress ${STALL_PROGRESS:-pickups}"
 LAYOUT="--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1 --learner-fast 2 --actor-processes 2 --actor-devices cuda:0,cuda:2"
 SMOKE_LAYOUT=${SMOKE_LAYOUT:-"--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1 --learner-fast 2"}
 
@@ -95,7 +98,8 @@ if [ "$1" = watch ]; then   # (each checkpoint on the 128 seeds of C99 / C101 / 
       tag=$(basename "$ck" .pt)
       [ -e "$OUT/evals/$tag" ] && continue
       PYTHONPATH=. timeout 7200 $PY eval_tok.py --checkpoint "$ck" --groups-file $GRP_FILE --mode run --items \
-        --workers 8 --seeds 2147490000:128 --name hc103e --port 49480 --out "$OUT/evals/$tag" \
+        --workers 8 --seeds 2147490000:128 --stall-progress ${EVAL_STALL:-events} --name hc103e --port 49480 \
+        --out "$OUT/evals/$tag" \
         > "$OUT/evals/$tag.log" 2>&1 < /dev/null
       [ -f "$OUT/evals/$tag/summary.json" ] && python3 -c "
 import json,sys

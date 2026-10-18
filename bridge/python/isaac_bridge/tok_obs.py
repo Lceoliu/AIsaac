@@ -201,7 +201,7 @@ def black_half_hearts(soul, mask):
 class EpisodeState:
     """What the encoder keeps between the records of one episode."""
 
-    def __init__(self, limit, floor=False, stall=0, run=False, items=False):
+    def __init__(self, limit, floor=False, stall=0, run=False, items=False, stall_pickups=False):
         self.limit = max(int(limit), 1)
         self.floor = floor or run  # a whole-floor episode: it ends at the floor's exit, not at a room's clear
         self.run = run             # a run (2026-10-06): the floor's exit is an event (EV_EXIT), the episode goes on
@@ -217,6 +217,10 @@ class EpisodeState:
         self.pocket = (0, 0)       # items: (pill color, card) of the last block
         self.stall = int(stall)    # whole floors: decisions without progress (a new room, a cleared room, a monster
         #                            hurt) that end the episode
+        # B40 (2026-10-18, --stall-progress pickups): a gain in player 0's coins, keys, bombs or health units is progress
+        # too; prev_res: those four (floats) at the record before (None: none yet)
+        self.stall_pickups = bool(stall_pickups)
+        self.prev_res = None
         self.stage0 = None
         self.progress_t = 0
         self.hp0 = None
@@ -410,6 +414,11 @@ def encode_row(o, st, row, t):
             st.stage0, st.progress_t = room[5], t
         if events or row['damage'][0] > 0:   # a new room, a cleared room, or a monster hurt during the step
             st.progress_t = t
+        if st.stall_pickups:   # B40: or a resource gained (coins, keys, bombs, health units; abp_row_encode the same)
+            res = (float(p['coins']), float(p['keys']), float(p['bombs']), float(units))
+            if st.prev_res is not None and any(a > b for a, b in zip(res, st.prev_res)):
+                st.progress_t = t
+            st.prev_res = res
         stalled = st.stall > 0 and t - st.progress_t >= st.stall
         done = 2 if o.dead else 1 if (room[5] != st.stage0 and not st.run) else \
             3 if (t >= st.limit or stalled) else 0
@@ -496,8 +505,10 @@ _ROW_VERSION = 7   # abp_row_encode_version's layout (4: 2026-10-07, the 38-doub
 (RC_T, RC_LIMIT, RC_FLOOR, RC_STALL, RC_PROGRESS, RC_STAGE0, RC_HP0, RC_PREV_DMG, RC_PREV_HP, RC_HAVE_PREV, RC_ROOM,
  RC_WAS_CLEAR, RC_ORIGIN_X, RC_ORIGIN_Y, RC_N_EXITS, RC_EXITS) = range(16)
 RC_TVERSION = RC_EXITS + 16
-(RC_TSEEN, RC_HURT, RC_EPISODE, RC_SEED, RC_GROUP, RC_FIRST, RC_RUN, RC_ITEMS, RC_COUNT) = \
-    range(RC_TVERSION + 1, RC_TVERSION + 10)
+(RC_TSEEN, RC_HURT, RC_EPISODE, RC_SEED, RC_GROUP, RC_FIRST, RC_RUN, RC_ITEMS, RC_STALL_MODE, RC_HAVE_RES,
+ RC_PREV_RES) = range(RC_TVERSION + 1, RC_TVERSION + 12)
+RC_COUNT = RC_PREV_RES + 4   # B40 (2026-10-18): RC_STALL_MODE (1: --stall-progress pickups), RC_HAVE_RES, RC_PREV_RES
+#                              .. + 3 (coins, keys, bombs, health units at the record before): abp_turbo.c's RC_COUNT 48
 # player 0's active item and charge, and the room's stage, in a raw lean payload (abplus_lean: header 16, room 48,
 # totals 32, then the player's doubles: active is field 24)
 _PAYLOAD_ACTIVE = struct.Struct('<dd')
@@ -555,6 +566,7 @@ class FastRow:
         self.reasons = {}   # abp_row_encode's hand-back codes: how often
         c = self.ctx
         c[RC_LIMIT], c[RC_FLOOR], c[RC_STALL] = st.limit, float(st.floor), st.stall
+        c[RC_STALL_MODE] = float(st.stall_pickups)   # B40
         self.set_meta(episode, seed, group)
         self._from_st()
 
@@ -606,6 +618,8 @@ class FastRow:
             st.room = int(c[RC_ROOM])
             st.was_clear = bool(c[RC_WAS_CLEAR])
             st.progress_t = int(c[RC_PROGRESS])
+        if c[RC_HAVE_RES]:   # B40
+            st.prev_res = tuple(float(v) for v in c[RC_PREV_RES:RC_PREV_RES + 4])
 
     def _from_st(self):
         c, st = self.ctx, self.st
@@ -614,6 +628,9 @@ class FastRow:
             c[RC_PREV_DMG], c[RC_PREV_HP] = st.previous
             c[RC_ROOM], c[RC_WAS_CLEAR], c[RC_HP0] = st.room, bool(st.was_clear), st.hp0
         c[RC_PROGRESS] = st.progress_t
+        c[RC_HAVE_RES] = st.prev_res is not None   # B40
+        if st.prev_res is not None:
+            c[RC_PREV_RES:RC_PREV_RES + 4] = st.prev_res
         c[RC_STAGE0] = np.nan if st.stage0 is None else st.stage0
         c[RC_RUN] = float(st.run)
         c[RC_ITEMS] = (2.0 if st.blind else 1.0) if st.items else 0.0

@@ -1262,6 +1262,9 @@ def main(argv=None, child=None, actor=None):
                         'resumed checkpoint keeps its own setting, --init pads them with zeros')
     p.add_argument('--floor-seconds', type=float, default=480.0)
     p.add_argument('--floor-stall-seconds', type=float, default=60.0)
+    p.add_argument('--stall-progress', choices=('events', 'pickups'), default='events',
+                   help="B40: what resets the floor's stall timer: 'events' (a new / cleared room, a monster hurt) or "
+                        "'pickups' (also a gain in coins / keys / bombs / health); the stall share is a policy input")
     p.add_argument('--archive-size', type=int, default=12)
     p.add_argument('--archive-prob', type=float, default=0.7)
     p.add_argument('--snapshot-prob', type=float, default=0.5)
@@ -1918,6 +1921,7 @@ def main(argv=None, child=None, actor=None):
                            if floor else (), teacher_death_margin=args.teacher_death_margin, teacher_thread=args.teacher_thread, teacher_fork=args.teacher_fork,
                            mode=args.mode,
                            floor_seconds=args.floor_seconds, floor_stall_seconds=args.floor_stall_seconds,
+                           stall_progress=args.stall_progress,
                            archive_size=args.archive_size, archive_prob=args.archive_prob,
                            snapshot_prob=args.snapshot_prob, archive_boss=args.archive_boss, build_timeout=args.build_timeout,
                            root_anon_mib=args.root_anon_mib, reset_timeout=args.reset_timeout,
