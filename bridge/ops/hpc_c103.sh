@@ -11,7 +11,7 @@
 # The watcher evaluates with EVAL_STALL (default events = C99's rule, comparable curves; pickups = the training rule).
 # B38 4-GPU layout (two actor processes on the 1st and 3rd visible GPUs, the learner process on the 2nd, --learner-fast
 # 2, overlap + decoupled): run with CUDA_VISIBLE_DEVICES=0,1,2,3 (actors 0 and 2, learner 1, watcher 3).
-# Minibatch: MB (default 4096 = C99; set MB=8192 if C101 says so) for --minibatch and --micro.
+# Minibatch: MB (default 8192, user 10-18) for --minibatch and --micro. Budget 20,000 h (user 10-18).
 # Sandbox ws16 (worktree of the b40-bomb-trigger commit; mk_ws16.sh), own --out / name / ports (train 49250, watch
 # 49480, smoke 49660, probe 49695).
 # usage: hpc_c103.sh smoke [extra] | probe | run [ck] | resume <abs ck> | watch
@@ -22,7 +22,7 @@ source /101063/AIsaac/ws16/hpc_env.sh
 R=$ABP_HOME/runs
 CK0=/101063/AIsaac/ws9/runs/c99-scratch/checkpoints/segment2-final.pt
 OUT=$R/c103-wall
-MB=${MB:-4096}
+MB=${MB:-8192}   # 2026-10-18 (user): 8192 (C101 leads 4096 by 0.22 floors at equal hours)
 GRP_FILE=../abplus/catalog/scaling2_groups.json
 COMMON="--groups-file $GRP_FILE --mode run --items --epochs 3 --teacher --teacher-queue 12 --archive-size 12 \
   --lr 1e-4 --lr-final 1e-4 --episodes-per-state 8 --teacher-death-depths 2,4,8,16,32 --teacher-thread 1 --teacher-fork 1 \
@@ -73,7 +73,7 @@ fi
 if [ "$1" = run ]; then
   CK=${2:-$CK0}
   PYTHONPATH=. nohup $PY train_tok.py $COMMON $FAST $WALL $LAYOUT \
-    --workers 64 --game-hours 10000 --checkpoint-every 1000 --rollout 32768 --minibatch $MB --micro $MB \
+    --workers 64 --game-hours 20000 --checkpoint-every 1000 --rollout 32768 --minibatch $MB --micro $MB \
     --resume "$CK" --name hc103 --port 49250 --out $OUT > $OUT.log 2>&1 < /dev/null &
   sleep 300
   date +%T; grep -i "devices (B38)" $OUT.log | tail -n 1 | cut -c1-160; tail -n 3 $OUT.log | cut -c1-220; echo "tracebacks $(grep -c Traceback $OUT.log)"
@@ -83,7 +83,7 @@ fi
 if [ "$1" = resume ]; then   # (a restart: same flags, --resume the given ABSOLUTE checkpoint path into the same --out)
   CK=$2
   PYTHONPATH=. nohup $PY train_tok.py $COMMON $FAST $WALL $LAYOUT \
-    --workers 64 --game-hours 10000 --checkpoint-every 1000 --rollout 32768 --minibatch $MB --micro $MB \
+    --workers 64 --game-hours 20000 --checkpoint-every 1000 --rollout 32768 --minibatch $MB --micro $MB \
     --resume "$CK" --name hc103 --port 49250 --out $OUT >> $OUT.log 2>&1 < /dev/null &
   sleep 300
   date +%T; tail -n 3 $OUT.log | cut -c1-220; echo "tracebacks $(grep -c Traceback $OUT.log)"
