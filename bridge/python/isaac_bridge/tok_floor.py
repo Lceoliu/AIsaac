@@ -4,7 +4,8 @@ A worker's root instance resets real Basement I floors (the bridge's reset_mode 
 3 red hearts, 1 bomb, the floor of the seed; floors with Labyrinth, Lost or Maze skipped) and a template clone is
 parked at each floor's start, as in tok_sampler. An episode is a lean clone that plays on through the doors until the
 player dies, the level's stage changes (the trapdoor after the boss: the floor is cleared), the time limit, or
-cfg.floor_stall_seconds without a new room or a cleared one. Protocol, records and the one-decision action lag are
+cfg.floor_stall_seconds without a new room or a cleared one (or a monster hurt; B40, cfg.stall_progress 'pickups':
+or a gain in coins / keys / bombs / health). Protocol, records and the one-decision action lag are
 tok_sampler's; a step during which the room changes ends at the new room's first logic frame (the bridge's rule).
 
 Start-state archive: an episode that enters a room for the first time is cloned there with probability
@@ -357,6 +358,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     run = cfg.mode == 'run'
     limit = int(round((cfg.run_seconds if run else cfg.floor_seconds) * 30 / cfg.frames_per_decision))
     stall = int(round(cfg.floor_stall_seconds * 30 / cfg.frames_per_decision))
+    stall_pk = getattr(cfg, 'stall_progress', 'events') == 'pickups'   # B40: gains count as progress
     queue = []      # hurts to search: (parked base, reseed, applied actions, hurt_at, seed, episode, base's decision)
     archive = []
     # 2026-10-10 (teacher v2): its points (tok_teacher2.V2Point), searched by the search thread through the lane
@@ -386,7 +388,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         blocks = blocks + cf_blocks
     if cfon:   # B34 (tok_cf.py): the choice points' quota, detector state, snapshot bank and branch context
         from .tok_cf import (TI as CF_TI, TRIGGERS as CF_TRIGGERS, Quota as CfQuota, bank_rows, cf_search,
-                             detect as cf_detect)
+                             consume_wall as cf_consume_wall, detect as cf_detect)
+        cf_wall_on = bool(getattr(cfg, 'cf_wall', False))   # B40: the wall trigger (tok_cf 'wall', BombIntent)
         cfctx = V2Context(cfg, limit, stall, run, fast_fn, group, lane_rows[index:index + 1], cfg.branch_reward,
                           seconds=cfg.cf_seconds, gamma=cfg.cf_gamma, boot_vg=bool(cfg.cf_vglobal), exit_end=run,
                           gains=True)
@@ -596,11 +599,26 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['cf_taken']] += res['taken']
             if res['spread'] is not None:
                 mine[ST['cf_spread']] += res['spread']
+            wall_ = res.get('wall')
+            if wall_ is not None:   # B40: the wall point's bomb_at branch
+                mine[ST['cf_wall_done']] += 1
+                mine[ST['cf_wall_bombed']] += wall_['bombed'] >= 0
+                mine[ST['cf_wall_opened']] += bool(wall_['opened'])
+                mine[ST['cf_wall_gain']] += wall_['gain']
+                mine[ST['cf_wall_best']] += bool(wall_['best'])
+                mine[ST['cf_wall_p']] += wall_['p']
+            defer_ = res.get('defer')
+            if defer_ is not None:   # B40 (cfg.cf_defer_target): the deferred branch's wait for the clear
+                mine[ST['cf_defer_points']] += 1
+                mine[ST['cf_defer_started']] += bool(defer_['started'])
+                mine[ST['cf_defer_wait']] += defer_['wait']
             if res['improving']:
                 mine[ST['cf_improving']] += 1
                 mine[ST['cf_target_best']] += getattr(res['best']['intent'], 'kind', '') == 'target'
-                rows_, meta_ = records_of(res, cfctx, pt, index, cfg.cf_cap, steps=cfg.cf_distill_steps)
-                ring_write(rows_, meta_, res['best'].get('h'), res['best'].get('t'))
+                rows_, meta_ = records_of(res, cfctx, pt, index, cfg.cf_cap,
+                                          steps=res.get('distill', cfg.cf_distill_steps))
+                if len(rows_):   # (B40: a deferred best branch that never started has none)
+                    ring_write(rows_, meta_, res['best'].get('h'), res['best'].get('t'))
                 mine[ST['cf_records']] += len(rows_)
         mine[ST['cf_lane_calls']] += policy.calls
         mine[ST['cf_wait_s']] += policy.wait_s
@@ -913,7 +931,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         records, 'gamma_t' gamma^T, 'v_end' and 'boot' the actor's value of a truncated last record); returns (the end
         code, its EpisodeState). trace (a dict, Phase B2): filled with the records' state digests and the actions
         answered to them."""
-        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items)
+        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk)
         st.visited = set(visited)
         st.stage0 = int(obs.room[5])
         for s in slots:
@@ -1212,7 +1230,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         """One lab episode of panel state k from the clone B (obs: its first observation): records to the trainer
         tagged ROW lab / lab_s / crn, actions from the actor. Ends: death, the room cleared / left, the cap (the last
         three DONE_BRANCH: a truncation), the floor's stall rule. Fills res (tok_lab RES)."""
-        st = EpisodeState(lab_cap + 1, floor=True, stall=stall, run=run, items=cfg.items)
+        st = EpisodeState(lab_cap + 1, floor=True, stall=stall, run=run, items=cfg.items,
+                          stall_pickups=stall_pk)
         st.stage0 = int(obs.room[5])
         st.visited = set()
         for s in slots:
@@ -1664,7 +1683,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['archive_starts']] += from_archive
             episode_n += 1
             seed_now = src.info['seed']
-            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items)
+            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk)
             st.visited, st.stage0 = set(src.info['visited']), src.info['stage0']
             enc = FastRow(fast_fn, st, decoder, episode_n, seed_now, group) if fast_fn is not None else None
             item, lf_now = obs, obs.logic_frames   # with FastRow item is the step's raw payload
@@ -1685,6 +1704,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             v2log = V2Log() if laneon else None
             v2_pts = []
             cf_seen, cf_snap_req = set(), 0   # B34: the room's triggers so far; the snapshot request of the next send
+            cf_walled = set()   # B40: the episode's rooms whose wall trigger was used (tok_cf.room_key)
             if cfon:
                 cf_quota.begin_episode()
             if pf_track:   # 2026-10-13 (B23): this episode's draw (the trainer's p) and its pedestal build
@@ -1773,13 +1793,15 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         if t_ep == base_t:   # (an episode's or a room's first record: the room's triggers anew)
                             cf_seen = set()
                         else:
-                            found = cf_detect(row, cf_seen, cf_rng)
+                            found = cf_detect(row, cf_seen, cf_rng, wall=cf_wall_on, walled=cf_walled)
                             if cf_p > 0 and t_ep > base_t + 1 and not row['events'][0] & EV_EXIT and \
                                     cf_rng.random() < cf_p:
                                 found.append((CF_TI['random'], None))
                             if found:
                                 mine[ST['cf_detected']] += len(found)
                                 trig_, target_ = cf_quota.choose(found)
+                                if trig_ == CF_TI['wall']:   # B40: offered: the room's wall trigger is used up
+                                    cf_consume_wall(cf_seen, cf_walled, target_)
                                 ok_, victim_, fresh_ = cf_quota.offer(trig_)
                                 if victim_ is not None:   # (an older point of the episode of a type seen before)
                                     cf_release(victim_)

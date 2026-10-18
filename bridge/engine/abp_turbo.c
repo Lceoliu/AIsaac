@@ -2612,10 +2612,15 @@ char *getenv(const char *name) {
 // clipped to the int16 range, 0 for the floor's exit tokens), RO_PHEARTS (RE_PHEART_F float32: player 0's black half
 // hearts / 12 (the half hearts of the soul hearts whose slot bit is set in GetBlackHearts' mask), eternal hearts,
 // bone hearts / 6) and RO_ROOM_TYPE (uint8: the room's RoomType clipped to 0 .. RE_N_ROOM_TYPE - 1).
+// B40 (2026-10-18, still version 7, RC_COUNT 40 -> 46: an older Python side sees another version and does not use it):
+// RC_STALL_MODE (1: tok_obs EpisodeState.stall_pickups, train_tok --stall-progress pickups: a gain in player 0's coins,
+// keys, bombs or health units is progress for the floor's stall rule too), RC_HAVE_RES and RC_PREV_RES .. + 3 (those
+// four at the record before), kept in step with encode_row by tok_obs.FastRow.
 enum {
     RC_T, RC_LIMIT, RC_FLOOR, RC_STALL, RC_PROGRESS, RC_STAGE0, RC_HP0, RC_PREV_DMG, RC_PREV_HP, RC_HAVE_PREV, RC_ROOM,
     RC_WAS_CLEAR, RC_ORIGIN_X, RC_ORIGIN_Y, RC_N_EXITS, RC_EXITS, RC_TVERSION = RC_EXITS + 16, RC_TSEEN, RC_HURT,
-    RC_EPISODE, RC_SEED, RC_GROUP, RC_FIRST, RC_RUN, RC_ITEMS, RC_COUNT
+    RC_EPISODE, RC_SEED, RC_GROUP, RC_FIRST, RC_RUN, RC_ITEMS, RC_STALL_MODE, RC_HAVE_RES, RC_PREV_RES,
+    RC_COUNT = RC_PREV_RES + 4
 };
 // offs: byte offsets of the ROW fields in this order
 enum { RO_PLAYER, RO_ENT, RO_ENT_ID, RO_DOORS, RO_PATCH, RO_GRID, RO_MAP, RO_N_ENT, RO_N_DOORS, RO_T, RO_HURT, RO_DAMAGE,
@@ -2910,6 +2915,17 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     int done;
     if (floor_ep) {
         if (events || dmg > 0) ctx[RC_PROGRESS] = (double)t;   // a new or cleared room, or a monster hurt
+        if (ctx[RC_STALL_MODE] != 0) {   // B40: or a resource gained (coins, keys, bombs, health units)
+            double res[4] = {pv[14], pv[16], pv[15], units};
+            if (ctx[RC_HAVE_RES] != 0)
+                for (int i = 0; i < 4; i++)
+                    if (res[i] > ctx[RC_PREV_RES + i]) {
+                        ctx[RC_PROGRESS] = (double)t;
+                        break;
+                    }
+            for (int i = 0; i < 4; i++) ctx[RC_PREV_RES + i] = res[i];
+            ctx[RC_HAVE_RES] = 1;
+        }
         int stalled = stall > 0 && (double)t - ctx[RC_PROGRESS] >= stall;
         done = dead ? 2 : (!run_ep && (double)stage != ctx[RC_STAGE0]) ? 1 : ((double)t >= limit || stalled) ? 3 : 0;
     } else {

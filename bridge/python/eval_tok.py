@@ -150,6 +150,8 @@ def main():
     p.add_argument('--episode-seconds', type=float, default=90.0)
     p.add_argument('--floor-seconds', type=float, default=480.0, help='as in training: the policy sees the share used')
     p.add_argument('--floor-stall-seconds', type=float, default=60.0)
+    p.add_argument('--stall-progress', choices=('events', 'pickups'), default='events',
+                   help="B40: as train_tok's (what resets the floor's stall timer)")
     p.add_argument('--port', type=int, default=28500)
     p.add_argument('--name', default='tke')
     p.add_argument('--stub-list', default='')
@@ -211,6 +213,7 @@ def main():
                            episode_seconds=args.episode_seconds, eval_seeds=eval_seeds, name=args.name, port=args.port,
                            mode=args.mode, floor_seconds=args.floor_seconds,
                            floor_stall_seconds=args.floor_stall_seconds, items=items, run_seconds=args.run_seconds,
+                           stall_progress=args.stall_progress,
                            characters=args.characters if floor else '', no_pedestals=bool(args.no_pedestals),
                            no_active=bool(args.no_active),
                            bridge_lua=default_bridge_lua(), preload=default_preload(),
@@ -248,6 +251,7 @@ def main():
                                                  frames_per_decision=args.frames_per_decision,
                                                  floor_seconds=args.floor_seconds,
                                                  floor_stall_seconds=args.floor_stall_seconds,
+                                                 stall_progress=args.stall_progress,
                                                  episode_seconds=args.episode_seconds, items=items,
                                                  run_seconds=args.run_seconds), n_heads=5 if items else 3)
     nh = 5 if items else 3

@@ -63,6 +63,7 @@ KIND_HURT, KIND_FATAL, KIND_RANDOM = 1, 2, 3
 KIND_CF = 4          # B34 (2026-10-16): a counterfactual teacher's choice point (tok_cf.py)
 INTENT_STICKY = 9
 INTENT_TARGET = 10   # B34: the move toward the choice point's target (tok_cf.TargetIntent)
+INTENT_BOMB = 11     # B40 (2026-10-18): the walk to a candidate secret-room wall and one bomb (tok_cf.BombIntent)
 END_DONE, END_DEATH, END_CAP, END_STOP = 1, 2, 3, 4
 END_EXIT = 5         # B34 (ctx.exit_end, run mode): the floor's exit reached (the score bootstraps from that record)
 # lane int32 per worker: the action under way (5, written by the worker), the answer (5, the actor); B34: [10] the
@@ -300,7 +301,9 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
     B34: keep may be an int k (True: all): only the first k records are kept (the counterfactual teacher distils
     those); the intent's compose sees the record it acts on; pt.bank (when set) names the lane's temporal snapshot
     (policy.tbegin); with ctx.boot_vg the cap's bootstrap is the actor's value_global; with ctx.exit_end a record with
-    EV_EXIT ends the branch (END_EXIT, bootstrapped); 't' (temporal lanes): each kept record's (o_prev, has, o)."""
+    EV_EXIT ends the branch (END_EXIT, bootstrapped); 't' (temporal lanes): each kept record's (o_prev, has, o).
+    B40: an intent with keep_from() (tok_cf.Deferral) has its records kept from its first own decision j0 on (none
+    while it returns None); 'from' = j0 (None: it never started), 'ret' the return-to-go of the kept records."""
     from .tok_obs import EV_EXIT
     from .tok_sampler import applied_action, lean_step, step_action
     B = S.fork(lean=True, alarm=ctx.alarm)
@@ -308,6 +311,8 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
     out = dict(score=0.0, n=0, end=END_STOP, boot=False, v_end=0.0, frames=0)
     rows, pends, acts, vals, lps, rews, hs, ts = [], [], [], [], [], [], [], []
     n_keep = (1 << 62) if keep is True else int(keep or 0)
+    keep_from = getattr(intent, 'keep_from', None)   # B40: a deferred intent's first own decision (None: not yet)
+    kidx = []
     begin = getattr(policy, 'begin', None)
     if begin is not None:   # 2026-10-11 (memory): the branch's GRU state starts as a copy of the episode's at record d
         log_h = getattr(pt.log, 'h', None) or []
@@ -322,7 +327,8 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
         B._send({"cmd": "obs"})
         ob = read_lean(B, dec)
         lf0 = lf = ob.logic_frames
-        st = EpisodeState(ctx.limit, floor=True, stall=ctx.stall, run=ctx.run, items=ctx.items)
+        st = EpisodeState(ctx.limit, floor=True, stall=ctx.stall, run=ctx.run, items=ctx.items,
+                          stall_pickups=getattr(ctx.cfg, 'stall_progress', 'events') == 'pickups')
         st.visited = set(pt.visited)
         st.stage0 = int(pt.stage0) if pt.stage0 is not None else int(ob.room[5])
         st.progress_t = pt.log.progress[d - 1] if d >= 1 else d   # the stall counter before record d
@@ -370,7 +376,9 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
                 lf = item.logic_frames
             a, v, lp = policy.answer()
             act = intent.compose(j, five(a), row)
-            if j < n_keep:
+            k0 = keep_from() if keep_from is not None else 0
+            if k0 is not None and j - k0 < n_keep:
+                kidx.append(j)
                 rows.append(row[0].copy())
                 pends.append(under)
                 acts.append(act)
@@ -388,10 +396,11 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
             pass
     n = len(rews)
     G = returns_to_go(rews, ctx.gamma, out['v_end'] if out['boot'] else 0.0)
-    out.update(score=float(G[0]), n=n, frames=lf - lf0, rews=rews)
+    out.update(score=float(G[0]), n=n, frames=lf - lf0, rews=rews,
+               **{'from': keep_from() if keep_from is not None else 0})
     if keep:
         k = min(n, len(rows))
-        out.update(rows=rows[:k], pend=pends[:k], act=acts[:k], ret=G[:k].copy(), value=vals[:k], logp=lps[:k],
+        out.update(rows=rows[:k], pend=pends[:k], act=acts[:k], ret=G[kidx[:k]].copy(), value=vals[:k], logp=lps[:k],
                    h=hs[:k] if hs and hs[0] is not None else None, t=ts[:k] if ts and ts[0] is not None else None)
     ctx.stats['branches'] += 1
     ctx.stats['decisions'] += n
