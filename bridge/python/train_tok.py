@@ -115,6 +115,15 @@ Counterfactual branch teacher (B34, 2026-10-16, isaac_bridge/tok_cf.py, rl/docs/
   TemporalState of their own, a choice point's branches start from a device copy of the worker's slot before the point's
   record (the snapshot bank, cf_snap), the lane answers carry (o_{t-1}, has, o_t) and the learner reads the imitation
   records' readout from them (temporal 'stored' / 'tail'). progress.csv cf_* (cf_prior, cf_improving_share, ...).
+  B40 (2026-10-18, --cf-wall 1; off by default): one more trigger in the same quota, 'wall' (a cleared room, a bomb
+  held, a wall of the room without a door whose minimap neighbour is unknown: a candidate secret-room wall, ranked by
+  AB+'s secret-room score on the visible minimap), whose branch walks to the wall's middle and places one bomb
+  (tok_cf.BombIntent) before the policy takes over; no reward term: the realised return decides. Its records are
+  distilled through the bomb decision (at most --cf-wall-distill). progress.csv cf_points/wall, cf_prior/wall,
+  cf_wall_opened_share, cf_wall_bombed_share, cf_wall_gain_mean, cf_wall_best_share, cf_wall_p_mean.
+  B40 --cf-defer-target 1 (A30's A2; off by default = B34's behaviour): the target branch of a door trigger (locked /
+  shop / treasure / cleared) and the wall's bomb_at branch play the policy until the room is cleared, then walk;
+  their records are distilled from that point. progress.csv cf_defer_started_share, cf_defer_wait_s.
   B36 (2026-10-16, isaac_bridge/tok_lanes.py LaneService): the lanes (teacher v2's and the cf's) are served in rounds:
   after the first waiting request a window of --cf-lane-wait (ends early after --cf-lane-quiet without a new request,
   or when every lane active lately waits), then ONE lane GraphActor call for all waiting lanes (row buckets
@@ -1377,6 +1386,14 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--cf-queue', type=int, default=8, help='choice points waiting per worker (the oldest make room)')
     p.add_argument('--cf-sticky-eps', type=float, default=0.25,
                    help="the sticky branches' share of uniform move re-picks (the \"high temperature\")")
+    p.add_argument('--cf-wall', type=int, default=0,
+                   help='B40: 1 adds the wall trigger (a candidate secret-room wall of a cleared room while a bomb is '
+                        'held; its branch walks there and places one bomb, then the policy) to --cf')
+    p.add_argument('--cf-defer-target', type=int, default=0,
+                   help="B40 (A30's A2): 1 = door targets' and bomb_at branches play the policy until the room is "
+                        'cleared, then walk to the target (0: walk at once, as B34)')
+    p.add_argument('--cf-wall-distill', type=int, default=64,
+                   help="B40: a bomb_at branch's records distilled through its bomb decision, at most this many")
     # B36 (2026-10-16): the lanes' service (isaac_bridge/tok_lanes.py; teacher v2 and --cf): one call for all waiting
     # lanes after a short window, asynchronous to the workers' records
     p.add_argument('--cf-lane-wait', type=float, default=0.002,
@@ -1726,6 +1743,8 @@ def main(argv=None, child=None, actor=None):
                     'forked children)')
         if args.cf_branches < 2:
             p.error('--cf-branches must be >= 2 (taken and at least one more)')
+    if args.cf_wall and not args.cf:
+        p.error('--cf-wall needs --cf 1')
     recompute = args.recompute_values == 'on' or (args.recompute_values == 'auto' and args.overlap)
     if args.switch_interval > 0:
         sys.setswitchinterval(args.switch_interval)
@@ -1932,6 +1951,8 @@ def main(argv=None, child=None, actor=None):
                            cf_seconds=args.cf_seconds, cf_target_seconds=args.cf_target_seconds,
                            cf_margin=args.cf_margin, cf_cap=args.cf_cap, cf_distill_steps=args.cf_distill_steps,
                            cf_random=args.cf_random, cf_queue=args.cf_queue, cf_sticky_eps=args.cf_sticky_eps,
+                           cf_wall=bool(args.cf_wall), cf_wall_distill=args.cf_wall_distill,
+                           cf_defer_target=bool(args.cf_defer_target),
                            cf_gamma=args.gamma_global if gtok_on else args.gamma, cf_vglobal=gtok_on,
                            temporal_dim=int(args.temporal_width) if (t_on and (args.cf or args.teacher_v2)) else 0,
                            bridge_lua=default_bridge_lua(), preload=default_preload(),
@@ -3520,6 +3541,17 @@ def main(argv=None, child=None, actor=None):
             row['cf_dec_w'] = d_c['cf_dec']   # branch decisions this window (vs the update's own decisions)
             row['cf_game_hours'] = tot_c['cf_frames'] / 30 / 3600
             row['cf_snaps'] = prof.get('cf_snaps', 0)
+            if args.cf_wall:   # B40: the wall points' bomb_at branches in this window
+                wd_c = d_c['cf_wall_done']
+                for k_w in ('opened', 'bombed', 'best'):
+                    row[f'cf_wall_{k_w}_share'] = d_c[f'cf_wall_{k_w}'] / wd_c if wd_c > 0 else ''
+                row['cf_wall_gain_mean'] = d_c['cf_wall_gain'] / wd_c if wd_c > 0 else ''
+                row['cf_wall_p_mean'] = d_c['cf_wall_p'] / wd_c if wd_c > 0 else ''
+            if args.cf_defer_target:   # B40: the deferred branches' starts and waits in this window
+                dp_c = d_c['cf_defer_points']
+                row['cf_defer_started_share'] = d_c['cf_defer_started'] / dp_c if dp_c > 0 else ''
+                row['cf_defer_wait_s'] = d_c['cf_defer_wait'] * args.frames_per_decision / 30 / d_c['cf_defer_started'] \
+                    if d_c['cf_defer_started'] > 0 else ''
             for k_v in ('cf_prior', 'cf_prior_p', 'cf_prior_all', 'cf_firsts', 'cf_new_gain', 'cf_new_spread',
                         'cf_new_target', 'cf_verr', 'cf_new') + tuple(f'cf_prior/{t_}' for t_ in CF_TRIGGERS):
                 row[k_v] = v2_log.get(k_v, '')

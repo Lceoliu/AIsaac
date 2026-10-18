@@ -152,6 +152,13 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          'cf_wait_s', 'cf_errors',
          'cf_t_heart', 'cf_t_coin', 'cf_t_key', 'cf_t_bomb', 'cf_t_chest', 'cf_t_pill', 'cf_t_card', 'cf_t_trinket',
          'cf_t_pedestal', 'cf_t_locked', 'cf_t_shop', 'cf_t_treasure', 'cf_t_cleared', 'cf_t_random',
+         # B40 (2026-10-18, cfg.cf_wall; zero unless on): wall points searched (cf_t_wall), of them with the bomb_at
+         # branch run (cf_wall_done), that branch placed its bomb, opened the wall (the neighbour cell shown / a door
+         # on the bombed wall), sum of its score - taken, it was the best of an improving point, sum of p_vis
+         'cf_t_wall', 'cf_wall_done', 'cf_wall_bombed', 'cf_wall_opened', 'cf_wall_gain', 'cf_wall_best', 'cf_wall_p',
+         # B40 (cfg.cf_defer_target; zero unless on): points with a deferred target / bomb_at branch, of them whose
+         # room was cleared within the branch (the intent started), sum of the decisions waited until then
+         'cf_defer_points', 'cf_defer_started', 'cf_defer_wait',
          # B39 (2026-10-18, cfg.no_active_prob / cfg.no_active; zero unless on): episode starts whose active item was
          # removed (tok_pickup.NO_ACTIVE_LUA), of them with an active item to remove (0 for a character without one)
          'no_actives', 'no_active_removed',
@@ -248,6 +255,13 @@ class TokSamplerConfig:
     cf_gamma: float = 0.999                       # the score's discount (train_tok: --gamma-global with a global token)
     cf_vglobal: bool = False                      # the cut's bootstrap: value_global (True) or the value
     cf_sticky_eps: float = 0.25                   # the sticky intents' share of uniform re-picks ("high temperature")
+    # B40 (2026-10-18, tok_cf 'wall' / BombIntent; off = nothing changes): the wall trigger (a cleared room, a bomb
+    # held, a candidate secret-room wall) within the same quota; its bomb_at branch's records are distilled through
+    # the bomb decision, at most cf_wall_distill
+    cf_wall: bool = False
+    cf_wall_distill: int = 64
+    # B40 (A30's A2): door targets' and bomb_at branches wait for the room's clear (tok_cf.Deferral); off = as before
+    cf_defer_target: bool = False
     temporal_dim: int = 0                         # B34: the temporal transformer's width D (temporal models; 0: none)
     mode: str = 'room'                          # 'room': one room per episode; 'floor' / 'run': tok_floor.py
     items: bool = False                           # 2026-10-06: the bridge's lean_items, ROW's item fields, 5 actions

@@ -386,7 +386,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         blocks = blocks + cf_blocks
     if cfon:   # B34 (tok_cf.py): the choice points' quota, detector state, snapshot bank and branch context
         from .tok_cf import (TI as CF_TI, TRIGGERS as CF_TRIGGERS, Quota as CfQuota, bank_rows, cf_search,
-                             detect as cf_detect)
+                             consume_wall as cf_consume_wall, detect as cf_detect)
+        cf_wall_on = bool(getattr(cfg, 'cf_wall', False))   # B40: the wall trigger (tok_cf 'wall', BombIntent)
         cfctx = V2Context(cfg, limit, stall, run, fast_fn, group, lane_rows[index:index + 1], cfg.branch_reward,
                           seconds=cfg.cf_seconds, gamma=cfg.cf_gamma, boot_vg=bool(cfg.cf_vglobal), exit_end=run,
                           gains=True)
@@ -596,11 +597,26 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['cf_taken']] += res['taken']
             if res['spread'] is not None:
                 mine[ST['cf_spread']] += res['spread']
+            wall_ = res.get('wall')
+            if wall_ is not None:   # B40: the wall point's bomb_at branch
+                mine[ST['cf_wall_done']] += 1
+                mine[ST['cf_wall_bombed']] += wall_['bombed'] >= 0
+                mine[ST['cf_wall_opened']] += bool(wall_['opened'])
+                mine[ST['cf_wall_gain']] += wall_['gain']
+                mine[ST['cf_wall_best']] += bool(wall_['best'])
+                mine[ST['cf_wall_p']] += wall_['p']
+            defer_ = res.get('defer')
+            if defer_ is not None:   # B40 (cfg.cf_defer_target): the deferred branch's wait for the clear
+                mine[ST['cf_defer_points']] += 1
+                mine[ST['cf_defer_started']] += bool(defer_['started'])
+                mine[ST['cf_defer_wait']] += defer_['wait']
             if res['improving']:
                 mine[ST['cf_improving']] += 1
                 mine[ST['cf_target_best']] += getattr(res['best']['intent'], 'kind', '') == 'target'
-                rows_, meta_ = records_of(res, cfctx, pt, index, cfg.cf_cap, steps=cfg.cf_distill_steps)
-                ring_write(rows_, meta_, res['best'].get('h'), res['best'].get('t'))
+                rows_, meta_ = records_of(res, cfctx, pt, index, cfg.cf_cap,
+                                          steps=res.get('distill', cfg.cf_distill_steps))
+                if len(rows_):   # (B40: a deferred best branch that never started has none)
+                    ring_write(rows_, meta_, res['best'].get('h'), res['best'].get('t'))
                 mine[ST['cf_records']] += len(rows_)
         mine[ST['cf_lane_calls']] += policy.calls
         mine[ST['cf_wait_s']] += policy.wait_s
@@ -1685,6 +1701,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             v2log = V2Log() if laneon else None
             v2_pts = []
             cf_seen, cf_snap_req = set(), 0   # B34: the room's triggers so far; the snapshot request of the next send
+            cf_walled = set()   # B40: the episode's rooms whose wall trigger was used (tok_cf.room_key)
             if cfon:
                 cf_quota.begin_episode()
             if pf_track:   # 2026-10-13 (B23): this episode's draw (the trainer's p) and its pedestal build
@@ -1773,13 +1790,15 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         if t_ep == base_t:   # (an episode's or a room's first record: the room's triggers anew)
                             cf_seen = set()
                         else:
-                            found = cf_detect(row, cf_seen, cf_rng)
+                            found = cf_detect(row, cf_seen, cf_rng, wall=cf_wall_on, walled=cf_walled)
                             if cf_p > 0 and t_ep > base_t + 1 and not row['events'][0] & EV_EXIT and \
                                     cf_rng.random() < cf_p:
                                 found.append((CF_TI['random'], None))
                             if found:
                                 mine[ST['cf_detected']] += len(found)
                                 trig_, target_ = cf_quota.choose(found)
+                                if trig_ == CF_TI['wall']:   # B40: offered: the room's wall trigger is used up
+                                    cf_consume_wall(cf_seen, cf_walled, target_)
                                 ok_, victim_, fresh_ = cf_quota.offer(trig_)
                                 if victim_ is not None:   # (an older point of the episode of a type seen before)
                                     cf_release(victim_)
