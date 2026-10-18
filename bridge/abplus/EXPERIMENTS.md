@@ -7866,6 +7866,22 @@ C100 日志里 u721 前有 231 条 "cf search failed: BridgeError: connection cl
 - **上线**（10-17 23:1x 本地）：分支 `b38-actors` 以 `227af43` 合入 abplus-training，`hpc_c99.sh resume-b38x`（actor 卡 0、2，learner 卡 1，`--learner-fast 2`，watcher 卡 3）从 last.pt（u27584 / 33,492 小时）续跑 C99，速度见 C99 条目。
 
 
+### C103 / C104 最好权重 + 小批 8192 的两条续训：炸墙教师三项 vs 对照（2026-10-18/19，进行中）
+
+**实验目的**
+
+用户 10-18：C101 结束后，主机 A 用目前最好的权重（C99 segment2-final，512 定论 1.95）跑"小批 8192 + B40 三项（炸墙触发、门类分支等清房、资源算进展）"，4 卡 20,000 小时；主机 B 跑同一权重 + 小批 8192、不加那三项的对照，2 卡 15,000 小时，两边同时结束。问：B40 三项在同小时数上是否带来过层 / 炸墙 / 道具行为的差别。
+
+**实验方法**
+
+- **C103**（主机 A，ws16，`hpc_c103.sh run`，由 `ws9/c101_end.sh` 在 C101 结束后自动启动）：`--resume segment2-final.pt`，C99 参数 + `--minibatch 8192 --micro 8192` + `--cf-wall 1 --cf-defer-target 1 --stall-progress pickups`，B38 四卡布局（两个 actor 进程 + learner 进程、`--learner-fast 2`），64 worker，20,000 小时；watcher 每 1,000 次更新评 128 种子（评测用旧的停滞规则，与 C99 / C101 可比）。
+- **C104**（主机 B，ws15 = B39 提交 35f3f4e，没有 B40 的开关，`hpc_c104.sh run`）：同一权重，C99 参数 + `--minibatch 8192 --micro 8192`，B38 两卡布局（actor 卡 0、learner 进程卡 1），48 worker，15,000 小时；watcher 同上。10-18 19:2x 本地启动（先以 12,000 小时误启，一分钟后按用户要求改 15,000 重启）：**1,226–1,235×**（collect 3.5 s、update 1.9 s），0 Traceback，预计 10-19 08:00 本地结束。
+- 对比口径：同游戏小时数的 128 种子曲线（两条都从 58,506 小时起）；C103 另看 progress.csv 的 `cf_points/wall`、`cf_wall_opened`、`cf_wall_best_share`、`cf_prior/wall`。用户 10-18：两边确认正常后不再频繁监视。
+
+**实验结果**
+
+（进行中）
+
 ### C101 小批 8192 对照：C99 第一段最终权重续 10,000 小时（2026-10-18，计划）
 
 **实验目的**
