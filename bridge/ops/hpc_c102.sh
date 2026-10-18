@@ -33,6 +33,10 @@ COMMON="--groups-file $GROUPS --mode run --items --epochs 3 --teacher --teacher-
 FAST="--actor-compile default --actor-fold 1 --actor-sdpa-math 1 --graph-entities-extra 16,40 --actor-row-buckets 16,32"
 NOACT="--no-active-prob ${NOACT_P:-0.5}"
 LAYOUT="--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1 --learner-fast 2 --actor-processes 2 --actor-devices cuda:0,cuda:2"
+# B39's starting-room restore point (tok_floor.START_BASE_LEGACY): 0 (default) = every changed start (no-active,
+# pedestal build) restores from the episode itself; 1 = pedestal-build episodes restore from the unchanged start as in
+# C99 (then C102 differs from C99 by the no-active starts only)
+export ISAAC_RL_START_BASE_LEGACY=${START_BASE_LEGACY:-0}
 SMOKE_LAYOUT=${SMOKE_LAYOUT:-"--learner-device cuda:1 --learner-process 1 --overlap --decoupled 1 --learner-fast 2"}
 
 # eval_track <checkpoint> <out dir> <name> <port> <workers> [extra eval_tok args]: one 128-seed run-mode evaluation

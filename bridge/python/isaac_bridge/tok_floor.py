@@ -88,6 +88,11 @@ from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, Searc
 MEM_LOG = os.environ.get('ISAAC_RL_MEM_LOG', '')
 SEARCH_CHILD_LIMIT = float(os.environ.get('ISAAC_RL_SEARCH_CHILD_LIMIT', '120'))   # s a forked search may take
 CF_CHILD_LIMIT = float(os.environ.get('ISAAC_RL_CF_CHILD_LIMIT', '900'))   # B34: s a forked choice point may take
+# B39 (2026-10-18): the starting room's restore point of an episode whose start was changed is the episode itself,
+# parked at its first record (floor_worker_main). ISAAC_RL_START_BASE_LEGACY=1 keeps the pre-B39 restore point (src
+# forked with the episode's reseed: the unchanged start) for start builds and stat augmentations, so a run can differ
+# from a pre-B39 one by its no-active starts only; no-active starts always get the episode's own restore point
+START_BASE_LEGACY = os.environ.get('ISAAC_RL_START_BASE_LEGACY', '0') == '1'
 MEM_EVERY = float(os.environ.get('ISAAC_RL_MEM_EVERY', '10'))
 
 
@@ -1587,14 +1592,14 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             try:
                 reseed = state_seed % (2 ** 31 - 1) + 1 if evaluation else int(rng.integers(1, 2 ** 31 - 1))
                 episode = src.fork(alarm=cfg.clone_alarm, reseed=reseed, lean=True)   # (under its lock, 2026-10-10)
-                start_mod = False   # B39: the episode's start state differs from src's fork (a no-active start, a
-                #                     start build, a stat augmentation): the starting room's restore point below
+                start_mod = 0   # B39: the episode's start state differs from src's fork: 2 a no-active start, 1 a start
+                #                 build or a stat augmentation only; the starting room's restore point below
                 # B39 (2026-10-18): a no-active start (training: floor starts only, like the builds, archive entries
                 # carry their episode's state along; evaluation: every episode); before the build, so a build's active
                 # item stays
                 if na_eval or (na_train and not from_archive and na_rng.random() < cfg.no_active_prob):
                     no_active_start(episode, mine)   # (ValueError: still held -> a failed start)
-                    start_mod = True
+                    start_mod = 2
                 # 2026-10-08: a start build (floor starts only: archive entries carry their episode's build along)
                 bped = ()
                 if building and not from_archive and build_rng.random() < cfg.start_build_prob:
@@ -1604,13 +1609,13 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     else:
                         episode.lua(transplant_lua(random_build()))
                     mine[ST['start_builds']] += 1
-                    start_mod = True
+                    start_mod = max(start_mod, 1)
                 # 2026-10-08: stat augmentation (floor starts only, like the builds; after the build: offsets add to
                 # whatever the build gives, the cache is re-evaluated once)
                 if augmenting and not from_archive and aug_rng.random() < cfg.stat_aug_prob:
                     episode.lua('return AbpSetStats(%s)' % random_stats())
                     mine[ST['stat_augs']] += 1
-                    start_mod = True
+                    start_mod = max(start_mod, 1)
                 decoder = LeanDecoder()
                 episode._send({"cmd": "obs"})
                 obs = read_lean(episode, decoder)
@@ -1621,7 +1626,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 # the D6, dropped a start build, reset augmented stats). With a changed start the episode itself is
                 # parked here instead, as at a room change (reseed None: the fork continues the episode's RNG).
                 # Unchanged starts keep src as before.
-                if rebase and start_mod:
+                if rebase and start_mod > int(START_BASE_LEGACY):
                     start_base = Parked(episode.fork(tag='snap', alarm=0), seed=src.info['seed'],
                                         visited=tuple(src.info['visited']), stage0=src.info['stage0'], uses=0,
                                         boss=False, stage=src.info['stage0'])

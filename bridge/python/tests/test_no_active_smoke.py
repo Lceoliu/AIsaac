@@ -13,7 +13,8 @@ Checks:
   (d) tok_floor's call site: training draws from an rng of its own and only at floor starts (not archive starts),
       evaluation removes at every start; the removal before the start build, the build before the first observation;
       a changed start (no-active, build, stat augmentation) parks the episode as the starting room's restore point
-      (reseed None) when searches are on, an unchanged one keeps src with the episode's reseed;
+      (reseed None) when searches are on, an unchanged one keeps src with the episode's reseed
+      (ISAAC_RL_START_BASE_LEGACY=1: builds / stat augmentations keep src as before B39, no-active starts never);
   (e) train_tok: --no-active-prob reaches TokSamplerConfig (main() up to the config, captured; nothing launched),
       default 0.0, refused outside floor / run modes and outside [0, 1];
   (f) eval_tok: --no-active 1 reaches TokSamplerConfig(no_active=True), off by default, refused in room mode;
@@ -154,7 +155,7 @@ def main():
     i_build = src.find('if building and not from_archive and build_rng.random() < cfg.start_build_prob:', i_fork)
     i_aug = src.find('if augmenting and not from_archive and aug_rng.random() < cfg.stat_aug_prob:', i_fork)
     i_obs = src.find('episode._send({"cmd": "obs"})', i_fork)
-    i_snap = src.find('if rebase and start_mod:', i_fork)
+    i_snap = src.find('if rebase and start_mod > int(START_BASE_LEGACY):', i_fork)
     i_exc = src.find('except (BridgeError, OSError, RuntimeError, ValueError) as exc:', i_fork)
     check('(d) tok_floor: fork -> no-active -> build -> stat aug -> first observation -> start snapshot, in the try',
           0 < i_fork < i_na < i_build < i_aug < i_obs < i_snap < i_exc)
@@ -165,7 +166,10 @@ def main():
           and src.count('default_rng([cfg.seed, index, 41])') == 1
           and 'if na_eval or (na_train and not from_archive and na_rng.random() < cfg.no_active_prob):' in src)
     seg = src[i_fork:i_exc]
-    check('(d) tok_floor: every start change sets start_mod (no-active, build, stat aug)', seg.count('start_mod = True') == 3)
+    check('(d) tok_floor: every start change sets start_mod (no-active 2, build / stat aug 1; the legacy switch keeps '
+          'src for 1 only)', seg.count('start_mod = 2') == 1 and seg.count('start_mod = max(start_mod, 1)') == 2
+          and "START_BASE_LEGACY = os.environ.get('ISAAC_RL_START_BASE_LEGACY', '0') == '1'" in src
+          and TF.START_BASE_LEGACY is False)
     check('(d) tok_floor: a changed start = the episode parked as the starting room\'s base (reseed None); else src',
           'base, base_reseed, base_t = start_base, None, 0' in src
           and 'base, base_reseed, base_t = src.hold(), reseed, 0' in src
