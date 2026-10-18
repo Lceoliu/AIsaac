@@ -508,7 +508,7 @@ RC_TVERSION = RC_EXITS + 16
 (RC_TSEEN, RC_HURT, RC_EPISODE, RC_SEED, RC_GROUP, RC_FIRST, RC_RUN, RC_ITEMS, RC_STALL_MODE, RC_HAVE_RES,
  RC_PREV_RES) = range(RC_TVERSION + 1, RC_TVERSION + 12)
 RC_COUNT = RC_PREV_RES + 4   # B40 (2026-10-18): RC_STALL_MODE (1: --stall-progress pickups), RC_HAVE_RES, RC_PREV_RES
-#                              .. + 3 (coins, keys, bombs, health units at the record before): abp_turbo.c's RC_COUNT 48
+#                              .. + 3 (coins, keys, bombs, health units at the record before): abp_turbo.c's RC_COUNT 46
 # player 0's active item and charge, and the room's stage, in a raw lean payload (abplus_lean: header 16, room 48,
 # totals 32, then the player's doubles: active is field 24)
 _PAYLOAD_ACTIVE = struct.Struct('<dd')

@@ -2612,7 +2612,7 @@ char *getenv(const char *name) {
 // clipped to the int16 range, 0 for the floor's exit tokens), RO_PHEARTS (RE_PHEART_F float32: player 0's black half
 // hearts / 12 (the half hearts of the soul hearts whose slot bit is set in GetBlackHearts' mask), eternal hearts,
 // bone hearts / 6) and RO_ROOM_TYPE (uint8: the room's RoomType clipped to 0 .. RE_N_ROOM_TYPE - 1).
-// B40 (2026-10-18, still version 7, RC_COUNT 42 -> 48: an older Python side sees another version and does not use it):
+// B40 (2026-10-18, still version 7, RC_COUNT 40 -> 46: an older Python side sees another version and does not use it):
 // RC_STALL_MODE (1: tok_obs EpisodeState.stall_pickups, train_tok --stall-progress pickups: a gain in player 0's coins,
 // keys, bombs or health units is progress for the floor's stall rule too), RC_HAVE_RES and RC_PREV_RES .. + 3 (those
 // four at the record before), kept in step with encode_row by tok_obs.FastRow.
