@@ -152,6 +152,9 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          'cf_wait_s', 'cf_errors',
          'cf_t_heart', 'cf_t_coin', 'cf_t_key', 'cf_t_bomb', 'cf_t_chest', 'cf_t_pill', 'cf_t_card', 'cf_t_trinket',
          'cf_t_pedestal', 'cf_t_locked', 'cf_t_shop', 'cf_t_treasure', 'cf_t_cleared', 'cf_t_random',
+         # B39 (2026-10-18, cfg.no_active_prob / cfg.no_active; zero unless on): episode starts whose active item was
+         # removed (tok_pickup.NO_ACTIVE_LUA), of them with an active item to remove (0 for a character without one)
+         'no_actives', 'no_active_removed',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
@@ -322,6 +325,13 @@ class TokSamplerConfig:
     # (type 5, variant 100) removed from the room before the step of each record that shows one (tok_floor,
     # tok_pickup.NO_PEDESTAL_LUA through Bridge.lua's lua command); False: nothing changes
     no_pedestals: bool = False
+    # B39 (2026-10-18; floor / run modes): no_active_prob of the floor-start training episodes (not archive starts,
+    # like the start builds; archive entries carry their episode's state along) begin without player 0's active item
+    # (whatever the character starts with; AB+ Isaac: The D6), removed in the episode's fork before its first
+    # observation and before a start build (tok_pickup.NO_ACTIVE_LUA); no_active (evaluation, eval_tok --no-active 1):
+    # every episode starts without it. 0 / False: nothing changes
+    no_active_prob: float = 0.0
+    no_active: bool = False
 
 
 def attach(names, workers):

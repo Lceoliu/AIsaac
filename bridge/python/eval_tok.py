@@ -36,6 +36,9 @@ A28 (2026-10-14), evaluation-only switches (all off by default: the evaluation i
   --no-pedestals 1 (floor / run modes): every collectible pedestal (type 5, variant 100) removed from the room before
   the step of each record that shows one (tok_floor, tok_pickup.NO_PEDESTAL_LUA through the bridge's lua command), so
   the policy never picks one up. Summary 'no_pedestals', 'pedestal_runs', 'pedestals_removed'.
+B39 (2026-10-18), --no-active 1 (floor / run modes): player 0's active item (AB+ Isaac: The D6) removed at every
+  episode's start, before its first record (tok_floor, tok_pickup.NO_ACTIVE_LUA through the bridge's lua command; the
+  training side is train_tok --no-active-prob). Summary 'no_active', 'no_active_starts', 'no_active_removed'.
 Temporal checkpoints (2026-10-14, B30, train_tok --temporal 1; config 'temporal'): a TemporalState per eval worker on
 the evaluation's device (K / V float32 on the CPU), stepped by every answered record and reset by an episode's first
 record, as the actor's in training (policy_actions). Summary 'temporal': true.
@@ -164,11 +167,15 @@ def main():
                    help='A28: evaluate with the item tokens / the global token / both removed (apply_ablation)')
     p.add_argument('--no-pedestals', type=int, default=0,
                    help='A28, floor / run modes: 1 = every collectible pedestal removed from the rooms entered')
+    p.add_argument('--no-active', type=int, default=0,
+                   help="B39, floor / run modes: 1 = player 0's active item removed at every episode's start")
     args = p.parse_args()
     if args.random and (args.item_slots is not None or args.ablate):
         p.error('--item-slots / --ablate need a checkpoint')
     if args.no_pedestals and args.mode not in ('floor', 'run'):
         p.error('--no-pedestals needs --mode floor or run')
+    if args.no_active and args.mode not in ('floor', 'run'):
+        p.error('--no-active needs --mode floor or run')
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
     run = args.mode == 'run'
@@ -205,6 +212,7 @@ def main():
                            mode=args.mode, floor_seconds=args.floor_seconds,
                            floor_stall_seconds=args.floor_stall_seconds, items=items, run_seconds=args.run_seconds,
                            characters=args.characters if floor else '', no_pedestals=bool(args.no_pedestals),
+                           no_active=bool(args.no_active),
                            bridge_lua=default_bridge_lua(), preload=default_preload(),
                            stub_list=stub if Path(stub).is_file() else '', nice=0)
     # CPU by default: a second CUDA process on the trainer's GPU can crash a trainer that replays CUDA graphs (B12)
@@ -229,6 +237,8 @@ def main():
             info['ablate'] = args.ablate
     if args.no_pedestals:   # A28
         info['no_pedestals'] = True
+    if args.no_active:   # B39
+        info['no_active'] = True
     sampler = TokSampler(cfg)
     n = cfg.workers
     recorder = None
@@ -325,6 +335,9 @@ def main():
         if args.no_pedestals:   # A28: records whose removal ran, pedestals removed (tok_floor)
             summary['pedestal_runs'] = float(sampler.stats[:, ST['np_runs']].sum())
             summary['pedestals_removed'] = float(sampler.stats[:, ST['np_removed']].sum())
+        if args.no_active:   # B39: episode starts whose active item was removed / that held one (tok_floor)
+            summary['no_active_starts'] = float(sampler.stats[:, ST['no_actives']].sum())
+            summary['no_active_removed'] = float(sampler.stats[:, ST['no_active_removed']].sum())
         for name in names:
             eps = [e for e in episodes if e['group'] == name]
             m = max(len(eps), 1)

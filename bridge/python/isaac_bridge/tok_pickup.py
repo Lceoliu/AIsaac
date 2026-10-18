@@ -216,6 +216,34 @@ def no_pedestal_due(r):
     return n >= r['ent_id'].shape[0] or bool(((ids[:, 0] == 5) & (ids[:, 1] == 100)).any())
 
 
+# B39 (2026-10-18, train_tok --no-active-prob p / eval_tok --no-active 1; floor / run modes): player 0's active item
+# removed at an episode's start, whatever the character starts with (AB+ Isaac: The D6, collectible 105, 6 charges;
+# A29: C99 never saw a start without it). Run through Bridge.lua's lua command in the episode's fork by tok_floor before
+# the episode's first observation (and before a start build, whose active item then stays). RemoveCollectible clears the
+# active slot (GetActiveItem 0: ROW player[21] has_active 0, active_ready 0) and the held count (the inventory block's
+# rescan key holds GetActiveItem and GetCollectibleCount: no held-item token, pitem[0] 0, pinv[0..1] 0). Returns
+# "removed id|active after|held count of the removed id after" (0|0|0: the character had no active item).
+NO_ACTIVE_LUA = """
+local p = Isaac.GetPlayer(0)
+local a = p:GetActiveItem()
+if a ~= 0 then p:RemoveCollectible(a) end
+return tostring(a) .. "|" .. tostring(p:GetActiveItem()) .. "|" .. tostring(a ~= 0 and p:GetCollectibleNum(a) or 0)
+"""
+
+
+def parse_no_active(result):
+    """(B39) Bridge.lua's answer to NO_ACTIVE_LUA -> (removed id, active after, held count after). ValueError when the
+    answer is malformed or the player still holds an active item (tok_floor: the episode start fails and is counted
+    as an error, like any other failed start)."""
+    try:
+        removed, after, count = (int(float(v)) for v in str(result).strip().split('|'))
+    except (TypeError, ValueError):
+        raise ValueError(f'no-active: unexpected answer {result!r}') from None
+    if after != 0 or count != 0:
+        raise ValueError(f'no-active: active item {removed} not removed (active {after}, held {count})')
+    return removed, after, count
+
+
 def parse_spawned(result):
     """Bridge.lua's answer to spawn_lua -> [(id, x, y), ...] of the pedestals spawned."""
     out = []
