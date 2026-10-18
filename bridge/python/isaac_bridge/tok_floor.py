@@ -88,6 +88,11 @@ from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, Searc
 MEM_LOG = os.environ.get('ISAAC_RL_MEM_LOG', '')
 SEARCH_CHILD_LIMIT = float(os.environ.get('ISAAC_RL_SEARCH_CHILD_LIMIT', '120'))   # s a forked search may take
 CF_CHILD_LIMIT = float(os.environ.get('ISAAC_RL_CF_CHILD_LIMIT', '900'))   # B34: s a forked choice point may take
+# B39 (2026-10-18): the starting room's restore point of an episode whose start was changed is the episode itself,
+# parked at its first record (floor_worker_main). ISAAC_RL_START_BASE_LEGACY=1 keeps the pre-B39 restore point (src
+# forked with the episode's reseed: the unchanged start) for start builds and stat augmentations, so a run can differ
+# from a pre-B39 one by its no-active starts only; no-active starts always get the episode's own restore point
+START_BASE_LEGACY = os.environ.get('ISAAC_RL_START_BASE_LEGACY', '0') == '1'
 MEM_EVERY = float(os.environ.get('ISAAC_RL_MEM_EVERY', '10'))
 
 
@@ -185,6 +190,17 @@ def row_digest(row):
     for a in parts:
         c = zlib.crc32(np.ascontiguousarray(a).tobytes(), c)
     return c
+
+
+def no_active_start(episode, mine):
+    """B39 (2026-10-18): player 0's active item removed in this episode clone (tok_pickup.NO_ACTIVE_LUA through
+    Bridge.lua's lua command); counted in the worker's stats (no_actives; no_active_removed when it held one). Returns
+    the removed collectible id (0: none held). ValueError when the player still holds an active item afterwards."""
+    from .tok_pickup import NO_ACTIVE_LUA, parse_no_active
+    removed, _, _ = parse_no_active(episode.lua(NO_ACTIVE_LUA))
+    mine[ST['no_actives']] += 1
+    mine[ST['no_active_removed']] += removed != 0
+    return removed
 
 
 class Parked:
@@ -302,6 +318,13 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         forcer = PickupForcer()
         pf_rng = np.random.default_rng([cfg.seed, index, 29])   # its own: the episodes' rng draws stay as without
         pf_counts = dict(steps=0, forced=0, free=0)
+    # B39 (2026-10-18): no-active starts (training: cfg.no_active_prob of the floor-start episodes, drawn from an rng of
+    # their own; evaluation: cfg.no_active, every episode): player 0's active item removed in the episode's fork before
+    # its first observation and before a start build (tok_pickup.NO_ACTIVE_LUA). Off by default: nothing below changes
+    na_train = float(getattr(cfg, 'no_active_prob', 0.0) or 0.0) > 0 and not evaluation
+    na_eval = bool(getattr(cfg, 'no_active', False)) and evaluation
+    if na_train:
+        na_rng = np.random.default_rng([cfg.seed, index, 41])   # its own: the episodes' rng draws stay as without
     # 2026-10-08: stat augmentation (cfg.stat_aug_prob of the floor-start training episodes get random multipliers of
     # the base stats, as AbpSetStats offsets in the episode's clone; user: generalisation of the no-item play)
     augmenting = cfg.stat_aug_prob > 0 and not evaluation
@@ -1565,9 +1588,18 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 if bosses:
                     src = bosses[int(rng.integers(len(bosses)))]
             t0 = time.perf_counter()
+            start_base = None   # B39: the starting room's restore point when the start was changed (below)
             try:
                 reseed = state_seed % (2 ** 31 - 1) + 1 if evaluation else int(rng.integers(1, 2 ** 31 - 1))
                 episode = src.fork(alarm=cfg.clone_alarm, reseed=reseed, lean=True)   # (under its lock, 2026-10-10)
+                start_mod = 0   # B39: the episode's start state differs from src's fork: 2 a no-active start, 1 a start
+                #                 build or a stat augmentation only; the starting room's restore point below
+                # B39 (2026-10-18): a no-active start (training: floor starts only, like the builds, archive entries
+                # carry their episode's state along; evaluation: every episode); before the build, so a build's active
+                # item stays
+                if na_eval or (na_train and not from_archive and na_rng.random() < cfg.no_active_prob):
+                    no_active_start(episode, mine)   # (ValueError: still held -> a failed start)
+                    start_mod = 2
                 # 2026-10-08: a start build (floor starts only: archive entries carry their episode's build along)
                 bped = ()
                 if building and not from_archive and build_rng.random() < cfg.start_build_prob:
@@ -1577,17 +1609,33 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     else:
                         episode.lua(transplant_lua(random_build()))
                     mine[ST['start_builds']] += 1
+                    start_mod = max(start_mod, 1)
                 # 2026-10-08: stat augmentation (floor starts only, like the builds; after the build: offsets add to
                 # whatever the build gives, the cache is re-evaluated once)
                 if augmenting and not from_archive and aug_rng.random() < cfg.stat_aug_prob:
                     episode.lua('return AbpSetStats(%s)' % random_stats())
                     mine[ST['stat_augs']] += 1
+                    start_mod = max(start_mod, 1)
                 decoder = LeanDecoder()
                 episode._send({"cmd": "obs"})
                 obs = read_lean(episode, decoder)
                 if obs.dead:
                     raise ValueError('a start state with a dead player')
+                # B39: the starting room's restore point (searches: death teacher, teacher v2, cf, branches) was src
+                # forked with the episode's reseed, i.e. the start state WITHOUT the changes above (a restore re-added
+                # the D6, dropped a start build, reset augmented stats). With a changed start the episode itself is
+                # parked here instead, as at a room change (reseed None: the fork continues the episode's RNG).
+                # Unchanged starts keep src as before.
+                if rebase and start_mod > int(START_BASE_LEGACY):
+                    start_base = Parked(episode.fork(tag='snap', alarm=0), seed=src.info['seed'],
+                                        visited=tuple(src.info['visited']), stage0=src.info['stage0'], uses=0,
+                                        boss=False, stage=src.info['stage0'])
+                    trim_parked(start_base.clone, cfg, mine)
+                    mine[ST['snaps']] += 1
             except (BridgeError, OSError, RuntimeError, ValueError) as exc:
+                if start_base is not None:
+                    start_base.release()
+                    start_base = None
                 mine[ST['errors']] += 1
                 if search_errors[0] < 5:   # 2026-10-10: the first few per worker are logged
                     search_errors[0] += 1
@@ -1622,7 +1670,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             item, lf_now = obs, obs.logic_frames   # with FastRow item is the step's raw payload
             t_ep, waiting, action = 0, False, (0, 0, 0, 0, 0)
             applied, hurts = [], []     # hurts: (decision, the restore point then, its reseed, its decision)
-            base, base_reseed, base_t = src.hold(), reseed, 0
+            if start_base is not None:   # B39: a changed start: the episode parked at its first record
+                base, base_reseed, base_t = start_base, None, 0
+                start_base = None
+            else:
+                base, base_reseed, base_t = src.hold(), reseed, 0
             room_now = None
             tracker = PedestalTracker() if branching else None
             # Phase B2: copies of the last records and the actor's outputs per record (the points' decision records)

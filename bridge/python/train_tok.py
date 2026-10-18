@@ -170,6 +170,14 @@ Item slots / stored value_global (2026-10-14, B24; tok_policy TokPolicy item_slo
   (newest first, default 16 = INV_CAP; + active, two trinkets, pocket). With --global-token the actor's CUDA graphs
   also output value_global, the rollout stores it (Rollout.value_g) and its returns bootstrap from the stored values
   (from the recomputed ones with --recompute-values on): no pass of its own at the update's start.
+No-active starts (2026-10-18, B39; off by default, then nothing changes): --no-active-prob p: p of the floor-start
+  training episodes (not archive starts, like the start builds) begin without player 0's active item (AB+ Isaac: The
+  D6), removed in the episode's fork before its first record and before a start build (tok_pickup.NO_ACTIVE_LUA; a
+  removal that leaves an active item fails the start). An episode whose start was changed (no-active, start build, stat
+  augmentation) gets its own parked clone as the starting room's restore point for the searches (before: src forked
+  with the episode's reseed = the unchanged start). progress.csv: no_actives, no_active_removed (worker totals),
+  noact/* and act/* (this update's finished episodes by has_active at their first record: episodes, exits, stage,
+  timeout); episodes.jsonl active0. Evaluation: eval_tok --no-active 1.
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
 
@@ -806,6 +814,7 @@ class Episodes:
         self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
         self.stats0 = None                       # 2026-10-08 (stat aug on): worker -> the stats at the first record
         self.char0 = None                        # 2026-10-08 (characters on): worker -> ROW pchar at the first record
+        self.active0 = None                      # B39 (no-active starts on): worker -> has_active at the first record
         # 2026-10-13 (B23, --start-build-mode pedestal / --pickup-force): per worker the episode's pedestal build (ROW
         # bped at the first record), whether it was drawn as forced (pmode) and its forced decisions (pforce > 0)
         self.pick = None
@@ -893,6 +902,9 @@ class Episodes:
         if self.char0 is not None and first.any():   # 2026-10-08 (characters): the episode's character
             for j in np.flatnonzero(first):
                 self.char0[int(idx[j])] = int(rows[j]['pchar'])
+        if self.active0 is not None and first.any():   # B39: ROW player[21] (has_active) at the first record
+            for j in np.flatnonzero(first):
+                self.active0[int(idx[j])] = int(rows[j]['player'][21] > 0)
         if self.pick is not None:   # 2026-10-13 (B23)
             pk = self.pick
             if first.any():
@@ -917,6 +929,8 @@ class Episodes:
                     fin['stats0'] = self.stats0[int(i)]
                 if self.char0 is not None and int(i) in self.char0:   # 2026-10-08 (characters): its PlayerType
                     fin['char0'] = self.char0[int(i)]
+                if self.active0 is not None and int(i) in self.active0:   # B39: an active item at its first record
+                    fin['active0'] = self.active0[int(i)]
                 if self.gains is not None:   # 2026-10-08: health units healed, coins + bombs + keys gathered
                     fin.update(healed=float(self.healed[i]), gathered=float(self.gathered[i]))
                 if self.pick is not None:   # 2026-10-13 (B23): the pedestal build, the forcing draw and its decisions
@@ -1481,6 +1495,12 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--stat-aug', default='',
                    help='multiplier ranges, log-uniform: "damage=0.7:2.5,tears=0.7:2,range=0.8:1.5,shot_speed=0.8:1.3,'
                         'speed=0.9:1.3" (the default; keys speed, damage, shot_speed, tears, range)')
+    # B39 (2026-10-18, isaac_bridge/tok_pickup.NO_ACTIVE_LUA): no-active starts (floor / run modes)
+    p.add_argument('--no-active-prob', type=float, default=0.0,
+                   help="share of the floor-start training episodes that begin without player 0's active item "
+                        '(whatever the character starts with; AB+ Isaac: The D6), removed before the first record and '
+                        'before a start build (0: off; archive starts keep their state). progress.csv no_actives, '
+                        'noact/*, act/*; episodes.jsonl active0')
     # 2026-10-08: character randomisation (floor / run modes): floor starts restart the run as a drawn character
     p.add_argument('--characters', default='',
                    help='PlayerTypes floor starts are built as, with optional weights: "0,1,2,3,5,6,7,8,13,15", '
@@ -1833,6 +1853,10 @@ def main(argv=None, child=None, actor=None):
         p.error('--pickup-force needs --mode floor/run and --items')
     if args.start_build_mode == 'pedestal' and args.start_build_prob <= 0:
         p.error('--start-build-mode pedestal needs --start-build-prob > 0')
+    if not 0.0 <= args.no_active_prob <= 1.0:   # B39
+        p.error('--no-active-prob: a probability in [0, 1] expected')
+    if args.no_active_prob > 0 and not floor:
+        p.error('--no-active-prob needs --mode floor/run')
     if args.stat_aug_prob > 0:
         if not floor:
             p.error('--stat-aug-prob needs --mode floor/run')
@@ -1894,6 +1918,7 @@ def main(argv=None, child=None, actor=None):
                            start_build_items=args.lab_items, archive_deep=args.archive_deep, archive_plr=args.archive_plr,
                            stat_aug_prob=args.stat_aug_prob if floor else 0.0, stat_aug=args.stat_aug,
                            characters=args.characters if floor else '',
+                           no_active_prob=args.no_active_prob if floor else 0.0,
                            start_build_mode=args.start_build_mode, pickup_force=pick_force if floor else (0.0, 0.0),
                            teacher_v2=bool(args.teacher_v2) and floor,
                            teacher_v2_hold=tuple(int(v) for v in args.teacher_v2_hold.split(',') if v.strip()),
@@ -3429,6 +3454,17 @@ def main(argv=None, child=None, actor=None):
                 row['forced_share'] = pf_share   # (forced share of the update's trained decisions)
         if cfg.stat_aug_prob > 0:   # 2026-10-08: stat augmentations applied so far (worker totals)
             row['stat_augs'] = float(stats[:, ST['stat_augs']].sum())
+        if cfg.no_active_prob > 0:   # B39: no-active starts so far (worker totals) and this update's finished episodes
+            #                          by their first record's has_active (archive starts included: their real state)
+            row['no_actives'] = float(stats[:, ST['no_actives']].sum())
+            row['no_active_removed'] = float(stats[:, ST['no_active_removed']].sum())
+            for k_a, a_ in (('noact', 0), ('act', 1)):
+                eps_a = [e for e in finished if e.get('active0') == a_]
+                m_a = max(len(eps_a), 1)
+                row[f'{k_a}/episodes'] = len(eps_a)
+                row[f'{k_a}/exits'] = sum(e.get('exits', 0) for e in eps_a) / m_a
+                row[f'{k_a}/stage'] = sum(e.get('stage', 0) for e in eps_a) / m_a
+                row[f'{k_a}/timeout'] = sum(e['done'] == 3 for e in eps_a) / m_a
         if cfg.archive_plr > 0:   # 2026-10-10: mean score of the last reported episodes
             row['plr_score'] = float(stats[:, ST['plr_score']].mean())
         if cfg.teacher_death_depths:   # 2026-10-09: fatal hurts searched / with a safe move / their seconds (totals)
@@ -3867,6 +3903,8 @@ def main(argv=None, child=None, actor=None):
         book.stats0 = {}
     if char_ids:   # 2026-10-08: the character of every episode into episodes.jsonl (char0)
         book.char0 = {}
+    if cfg.no_active_prob > 0:   # B39: has_active at every episode's first record into episodes.jsonl (active0)
+        book.active0 = {}
     if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): build_pedestals, pickup_forced, forced_steps
         book.pick = dict(bped={}, steps=np.zeros(n, np.int64))
     version = update                                # the actor's weights: updates done
