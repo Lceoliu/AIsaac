@@ -664,7 +664,7 @@ class TemporalAttention(nn.Module):
             self.stage_emb(stage.long().clamp(0, N_STAGE_EMB - 1))
 
     @_no_compile
-    def step(self, st, s, slot, rec):
+    def step(self, st, s, slot, rec, room_source=None):
         """The actor's / evaluator's step for n records, in place on TemporalState st (graph-safe: static shapes, no
         host synchronisation). s [n, D] (float32), slot [n] long (distinct, except the scratch slot), rec: dict(first
         [n], map [n, 8, 13, 13] uint8, events [n], stage [n]). Returns dict(o [n, D], s, kv [n, L, 2, D] (the step
@@ -685,7 +685,8 @@ class TemporalAttention(nn.Module):
         create = (~first) & (steps0 > 0) & moved & (nroom0 < R)
         kroom = nroom0.clamp(max=R - 1)
         stage_prev = st.prev_stage.index_select(0, slot)
-        r = self.room_token(st.prev_o.index_select(0, slot), kroom, stage_prev)
+        src = st.prev_o.index_select(0, slot) if room_source is None else room_source
+        r = self.room_token(src, kroom, stage_prev)
         x = torch.stack([r, s.float()], 1)   # [n, 2 (room query, step query), D]
         pos = R + torch.remainder(steps0, W)
         nroom1 = nroom0 + create.long()
@@ -725,20 +726,22 @@ class TemporalAttention(nn.Module):
         return dict(o=o, s=s, kv=torch.stack(kv_out, 1).to(dt), create=create, nroom=nroom1, steps=steps0,
                     stage_prev=stage_prev)
 
-    def room_table(self, o_store, td):
+    def room_table(self, o_store, td, track_grad=False):
         """(B31, the learner; once per PPO epoch, at its start) every room token of the rollout through the layers
         without gradient, with the current parameters: per (worker, episode) group of temporal_inputs' plan td the room
         tokens r = W_r o_exit + E_room[k] + E_stage[stage] (o_exit: rows r_src of o_store, the rollout's o) in their
         order, each attending to the earlier ones of its group and itself (the actor's room query). Returns
         [(K, V) per layer]: [rooms + 1, heads, dh] each (the last row: the plan's dummy room, the padding target of
         temporal_part's gathers). Run it under the learner's autocast: the values are those the per-chunk recomputation
-        of the rooms made before a chunk gave (B30), up to summation order."""
+        of the rooms made before a chunk gave (B30), up to summation order.
+        track_grad=True is the raw-sequence writer path: call anew for each learner
+        forward, including pre-chunk rooms. It does not change the legacy default."""
         D, H = self.D, self.H
         dh = D // H
         grp = td['r_grp']
         G, Rg = grp.shape
         dev = grp.device
-        with torch.no_grad():
+        with contextlib.nullcontext() if track_grad else torch.no_grad():
             xr = self.room_token(o_store.index_select(0, td['r_src']), td['r_k'], td['r_stage'])
             valid = grp >= 0
             x = xr.index_select(0, grp.clamp(min=0).reshape(-1)).view(G, Rg, D)
@@ -1025,7 +1028,7 @@ class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
                  memory=0, item_tokens=False, global_token=False, item_shared=False, item_slots=INV_CAP, temporal=False,
                  temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128,
-                 obs_prices=False, obs_hearts=False, obs_room_type=False):
+                 obs_prices=False, obs_hearts=False, obs_room_type=False, room_memory=False):
         super().__init__()
         if int(item_slots) != INV_CAP and not item_tokens:
             raise ValueError('TokPolicy: item_slots needs item_tokens=True (B24)')
@@ -1140,6 +1143,28 @@ class TokPolicy(nn.Module):
         if self.obs_room_type:
             self.room_type_emb = nn.Embedding(N_ROOM_TYPE, width)
             nn.init.zeros_(self.room_type_emb.weight)
+
+        # Raw sequence writer is opt-in; legacy parameter order/config stay unchanged.
+        self.room_writer = None
+        if room_memory:
+            if self.tatt is None:
+                raise ValueError('room_memory requires temporal=True')
+            from .room_memory import RoomSequenceWriter
+            self.room_writer = RoomSequenceWriter(self.tatt.D, self.tatt.H)
+            self.config['room_memory'] = True
+
+    def encode_room_sources(self, b):
+        """Current-parameter spatial encoding for raw room observations, without H or a temporal readout.
+
+        This is a separate writer input path; the policy's existing H feedback is unchanged.
+        """
+        return self._forward_fused(b, None, False, False, None, False, dict(mode='room_source'), None)
+
+    def write_room_sequences(self, b, lengths):
+        """One D-wide source per complete causal visit; no cached o_exit and no detach."""
+        if self.room_writer is None:
+            raise ValueError('write_room_sequences requires room_memory=True')
+        return self.room_writer(self.encode_room_sources(b), lengths)
 
     def main_parameters(self):
         """The parameters PPO's optimiser owns: all but the choice heads' (in the order of parameters())."""
@@ -1401,6 +1426,10 @@ class TokPolicy(nn.Module):
     def _heads(self, x0, need_h, mem=None, yg=None, need_vg=False, tctx=None):
         """The final norm and the heads on the player's tokens x0. yg, need_vg (B22): the global token after the blocks
         and whether value_global is appended to the outputs. tctx (B30): the temporal context (forward's)."""
+        if tctx is not None and tctx['mode'] == 'room_source':
+            z = self.norm(x0.float())
+            gn = self.gtok.norm(yg.float()) if yg is not None else None
+            return self.tatt.embed(z, gn)
         if tctx is not None:   # 2026-10-14 (B30; None: the code below, unchanged)
             return self._heads_temporal(x0, need_h, mem, yg, need_vg, tctx)
         if self.memory:   # 2026-10-11 (memory models; without memory the code below, unchanged)
@@ -1442,6 +1471,11 @@ class TokPolicy(nn.Module):
         n = b['player'].shape[0]
         mode = temporal['mode']
         ta = self.tatt
+        if self.room_writer is not None:
+            if mode == 'step' and 'room_source' not in temporal:
+                raise ValueError('raw room memory step requires a causal room_source (RawRoomReplay)')
+            if mode == 'chunk' and not temporal['plan'].get('raw_room_memory', False):
+                raise ValueError('raw room memory chunk requires recomputed raw sources (RawRoomReplay)')
         dev = b['player'].device
         tctx = dict(temporal, user=temporal)
         if mode == 'step':
@@ -1489,7 +1523,7 @@ class TokPolicy(nn.Module):
             n = z.shape[0]
             mode = tctx['mode']
             if mode == 'step':
-                info = ta.step(tctx['state'], s_t, tctx['slot'], tctx['rec'])
+                info = ta.step(tctx['state'], s_t, tctx['slot'], tctx['rec'], tctx.get('room_source'))
                 tctx['user']['out'] = info
                 o, m = info['o'], z.new_ones(n)
             else:
@@ -1978,6 +2012,8 @@ class GraphActor:
         the smallest graph that holds its records instead of always rows_max rows (the same values per record).
         sdpa_math (B29, measurement aid): attention through PyTorch's math SDPA (matrix products under the process's
         TF32 setting) instead of the float32 memory-efficient kernel. All default off: the graphs as before."""
+        if model.room_writer is not None:
+            raise ValueError('room_memory is currently supported by RawRoomReplay, not CUDA GraphActor')
         from .tok_obs import ENT_CAP
         dev = next(model.parameters()).device
         self.model, self.n, self.stream, self._n = model, rows_max, stream, 0
@@ -2488,6 +2524,8 @@ def load_compatible(model, state):
     tensor of another shape is copied into the leading part of the model's (the rest keeps its fresh values, zero
     for added input columns). Returns the names that did not match exactly. (B23: a B21 checkpoint's own item-token
     table into an item_shared model goes through share_item_table first, reported as 'itok.coll.weight (shared: ...)'.)"""
+    if model.room_writer is None and any(k.startswith('room_writer.') for k in state):
+        raise ValueError('room_memory checkpoint requires a room_memory=True model; writer cannot be dropped')
     state, note = share_item_table(model, state)
     own = model.state_dict()
     changed = [] if note is None else ['itok.coll.weight (shared: ' + note + ')']

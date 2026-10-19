@@ -68,3 +68,54 @@ SDPA。可与 B29 的 `--actor-compile/--actor-fold/--actor-row-buckets` 共存�
 - HPC 冒烟：8 worker 1.5 小时，看 `tracebacks`、KL（应与 C95 同量级）、`infer_ms`、`update_s`。
 - C96：HPC160，C95 最终续训，64 worker，12,000 小时，每 1,000 次更新 128 种子；对照 = C95 的曲线与最终。看：速度（目标 ≥ C95 的
   1,100×）、过层、第四层局数、拿道具数（C96 时还看 g1/g2/g3 的走势；B33 起没有门）。
+
+## 6. 2026-10-20：第 1 项房间写入改造，独立候选 / eager 参照
+
+**状态：核心可训练路径已实现，尚未接入现有多 GPU GraphActor / 进程间 rollout 传输和正式训练 CLI。**
+本节不替换上述已部署架构。原 checkout 和旧默认路径保留；新功能显式开启 `TokPolicy(room_memory=True)`。
+只做用户批准的第 1 项：主策略 H 回灌、决策 KV、输入 schema、动作空间不变。第 2 项旧状态一致性仍未解决。
+
+### 实现
+
+- `bridge/python/isaac_bridge/room_memory.py`：`RoomSequenceWriter` 用 PyTorch `MultiheadAttention` 的单个学习查询，结合时间位置编码，把一整次访问的观测序列压成 **1 个 D 维 token**；不添加游戏重要性规则，也不让未来查询参与过去写入。
+- `TokPolicy.encode_room_sources` 复用当前 Spatial 权重及 z/g 投影重新编码原始 ROW 和 pending。此独立写入源路径不读取 H 或旧 `o_exit`；**主策略的 H 路径仍然存在**。
+- `TemporalAttention.step(..., room_source=...)` 从新源写入，同样保留房间 / 层号 embedding 和原来的房间注意力。
+- `room_table(..., track_grad=True)` 供新 learner 每次前向调用。跨 chunk 的旧房间也能从未来 loss 反传到写入查询和早期源编码；旧路径默认 `track_grad=False` 完全保留。
+- `RawRoomReplay.append` 保存只读原始访问序列、写入时间、episode 和 stage，进入新房间的观测不属于刚离开的房间。保持对象即可跨采样批次保存历史，`fork()` 隔离 CF 分支；episode reset 不会把前一局的开放访问写入新局。
+- `RawRoomReplay.chunk(start, stop, model=learner)` 从截至当时可用的源序列重编码，并构造原 Temporal 的因果 chunk 前向。存储 H / 决策 KV 的旧近似有意保留，不能把新房间路径说成全部状态已经新鲜。
+- 现有 128 个访问槽的上限不变；参照的原始历史尚未做容量 / 生命周期优化，不能直接长期开 64 workers。
+
+结构参考：[Set Transformer](https://arxiv.org/abs/1810.00825) 的学习查询池化思想；实现直接使用 PyTorch 多头注意力，不自写 attention kernel。
+
+### 调用边界
+
+```python
+model = TokPolicy(**dict(old_checkpoint['config'], room_memory=True))
+load_compatible(model, old_checkpoint['model'])  # shared layers retained, writer freshly initialized
+history = RawRoomReplay(model)
+out = history.append(one_worker_row, one_worker_pending)  # starts at episode reset
+# Keep history across collection batches. Use a compatible learner model if separate.
+future_outputs = history.chunk(start, stop, model=learner)
+loss.backward()  # future task/PPO loss includes pre-chunk room source/write graph
+```
+
+`room_memory` 写入 checkpoint config，权重可严格往返；旧权重能 warm-start 共享层，但新房间输出不保证与旧策略相同。
+带 writer 的 checkpoint 禁止被 `load_compatible` 静默加载到关闭 writer 的模型。新模型直接走旧 step/chunk 或 CUDA GraphActor 会明确报错，而不是退回旧 `o_exit`。
+本参照不是完整 PPO trainer：采样动作、真实 reward / advantage、old log-prob、优化调度和多 worker 传输仍由训练器负责。
+
+### 已执行与仍未证明
+
+`tests/test_room_memory_smoke.py` 使用真实 TokPolicy / Spatial / Temporal 路径，检查：
+
+1. eager actor 与 chunk 输出对齐，含房间切换、楼层事件、episode reset、跨采集批次和 chunk 边界。
+2. chunk 开始前已写入房间的未来 PPO/value loss，梯度到达最早源帧、writer query 与 Spatial 参数。
+3. 添加未来房间不改变过去 chunk；CF 子分支不修改父历史；末帧不是唯一源；padding 不改变输出，时间编码区分顺序。
+4. writer 参数变化后重新编码、checkpoint 往返、共享权重迁移及禁止静默降级。
+5. 简化延迟二选一：线索只在访问第一帧，末帧与未来观察不含答案；H / 决策 context 在该诊断中屏蔽以隔离房间路径。100 次 Adam 更新后，128 个新 nuisance 样本准确率 100%，遮掉早期线索后 50%。这不是 Isaac 实际评估。
+
+测试开发中的负结果保留：随机完整背景每批变化的更难版本，100 步后仍是 50%，未通过；随后单独使用中性场景加独立 nuisance 的最小因果任务验证可学习性。因此不声称随机复杂场景泛化已经解决。
+首次分类测试还暴露 Windows NumPy 默认 int32 label，已显式改为 int64；checkpoint 降级测试先失败，再加入拒绝静默丢 writer 的检查。
+原有 temporal / no-GRU CPU smoke 均通过，CUDA 项未执行。未连服务器，未启动 Isaac 或正式训练，未测新路径吞吐。
+
+候选与证据根目录：`D:/Projects/fortune/Isaac/temp/room-memory-write-v1/`。
+正式训练前仍需：接入 Raw ROW 历史的多进程传输 / 生命周期、GraphActor 或新的 actor 调度、完整 teacher/CF 链路，以及 GPU 速度和内存评估。
