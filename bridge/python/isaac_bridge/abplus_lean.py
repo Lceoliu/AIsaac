@@ -47,7 +47,8 @@ INV_HEADER = struct.Struct('<BBHHHHHHI')   # n, layout version, active MaxCharge
 #                                           pill effect + 1 when identified (0 unknown / none), card, curses
 INV_ITEM = np.dtype([('id', '<u2'), ('count', 'u1')])
 assert PLAYER.itemsize == 312 and DOOR.itemsize == 16 and ENTITY.itemsize == 148 and MAP_ROOM.itemsize == 5
-assert INV_HEADER.size == 18 and INV_ITEM.itemsize == 3
+INV_HEADER_V2 = struct.Struct('<BBHHHHHHHI')  # marker=0, version=2, uint16 id count, same public fields
+assert INV_HEADER.size == 18 and INV_HEADER_V2.size == 20 and INV_ITEM.itemsize == 3
 _LASER = struct.Struct('<qBddddddq')
 # entity kinds (as format 2) and flag bits
 KIND_TEAR, KIND_PROJECTILE, KIND_LASER, KIND_BOMB, KIND_PICKUP, KIND_NPC = 1, 2, 3, 4, 5, 6
@@ -128,11 +129,22 @@ class LeanDecoder:
             self.map_version += 1
             off += 1 + MAP_ROOM.itemsize * n
         if flags & 16:
-            head = INV_HEADER.unpack_from(payload, off)
+            version = payload[off + 1]
+            if version == 1:
+                header = INV_HEADER
+                head = header.unpack_from(payload, off)
+            elif version == 2:
+                header = INV_HEADER_V2
+                marker, version, n, *rest = header.unpack_from(payload, off)
+                if marker != 0 or n > 1023:
+                    raise ValueError('invalid full-inventory header')
+                head = (n, version, *rest)
+            else:
+                raise ValueError(f'unsupported inventory layout {version}')
             self.inv_head = head
-            self.inv = np.frombuffer(payload, INV_ITEM, head[0], off + INV_HEADER.size)
+            self.inv = np.frombuffer(payload, INV_ITEM, head[0], off + header.size)
             self.inv_version += 1
-            off += INV_HEADER.size + INV_ITEM.itemsize * head[0]
+            off += header.size + INV_ITEM.itemsize * head[0]
         if off != len(payload):
             raise ValueError(f'lean observation has {len(payload) - off} trailing bytes')
         o.terrain, o.grid, o.terrain_version = self.terrain, self.grid, self.terrain_version

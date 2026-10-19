@@ -1492,7 +1492,9 @@ end
 -- connection's first observation and every LEAN_FULL_EVERY logic frames; the block is sent with a connection's first
 -- observation and when its bytes change. ISAAC_RL_INV_CHECK=1 (diagnostic): every decision in between also compares
 -- the cached block with a full scan (ABP_INV.checks / misses) without changing what is sent.
-local INV_CAP = 64
+local INV_FULL = getenv("ISAAC_RL_FULL_INVENTORY") == "1"
+local INV_CAP = INV_FULL and 1023 or 64
+local INV_HEADER_BYTES = INV_FULL and 20 or 18
 local INV = { n = nil, order = {}, counts = {}, key = nil, at = -100000, block = nil, sent = nil, scans = 0,
 	checks = 0, misses = 0, first_miss = nil }
 ABP_INV = INV
@@ -1543,6 +1545,10 @@ local function inv_header(p, level, n)
 			if pool:IsPillIdentified(pill) then effect = (math.tointeger(pool:GetPillEffect(pill)) or -1) + 1 end
 		end)
 	end
+	if INV_FULL then
+		return spack("<BBHHHHHHHI4", 0, 2, n, maxc, p:GetTrinket(0) & 0xFFFF, p:GetTrinket(1) & 0xFFFF, pill & 0xFFFF, effect,
+			p:GetCard(0) & 0xFFFF, level:GetCurses())
+	end
 	return spack("<BBHHHHHHI4", n, 1, maxc, p:GetTrinket(0) & 0xFFFF, p:GetTrinket(1) & 0xFFFF, pill & 0xFFFF, effect,
 		p:GetCard(0) & 0xFFFF, level:GetCurses())
 end
@@ -1569,7 +1575,7 @@ local function lean_inventory(event, here)
 		local held, same = inv_held(p), true
 		for id, c in pairs(held) do if INV.counts[id] ~= c then same = false end end
 		for id, c in pairs(INV.counts) do if held[id] ~= c then same = false end end
-		if inv_header(p, level, math.min(#INV.order, INV_CAP)) ~= INV.block:sub(1, 18) then same = false end
+		if inv_header(p, level, math.min(#INV.order, INV_CAP)) ~= INV.block:sub(1, INV_HEADER_BYTES) then same = false end
 		if not same then
 			INV.misses = INV.misses + 1
 			if INV.first_miss == nil then INV.first_miss = state.logic_frames end

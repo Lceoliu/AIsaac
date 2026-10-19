@@ -69,53 +69,107 @@ SDPA。可与 B29 的 `--actor-compile/--actor-fold/--actor-row-buckets` 共存�
 - C96：HPC160，C95 最终续训，64 worker，12,000 小时，每 1,000 次更新 128 种子；对照 = C95 的曲线与最终。看：速度（目标 ≥ C95 的
   1,100×）、过层、第四层局数、拿道具数（C96 时还看 g1/g2/g3 的走势；B33 起没有门）。
 
-## 6. 2026-10-20：第 1 项房间写入改造，独立候选 / eager 参照
+## 6. 2026-10-20：第 1 项，原始房间序列写入
 
-**状态：核心可训练路径已实现，尚未接入现有多 GPU GraphActor / 进程间 rollout 传输和正式训练 CLI。**
-本节不替换上述已部署架构。原 checkout 和旧默认路径保留；新功能显式开启 `TokPolicy(room_memory=True)`。
-只做用户批准的第 1 项：主策略 H 回灌、决策 KV、输入 schema、动作空间不变。第 2 项旧状态一致性仍未解决。
+**候选分支 `codex/room-memory-write-v1`，默认关闭，`--room-memory 1` 开启。**
+现有 Spatial / Temporal 尺寸、1 token/visit、128 visit 上限、H 回灌、决策 KV、动作空间不变。
+第 2 项（整个策略旧状态的一致性）仍未改动。
 
-### 实现
+### 生产路径
 
-- `bridge/python/isaac_bridge/room_memory.py`：`RoomSequenceWriter` 用 PyTorch `MultiheadAttention` 的单个学习查询，结合时间位置编码，把一整次访问的观测序列压成 **1 个 D 维 token**；不添加游戏重要性规则，也不让未来查询参与过去写入。
-- `TokPolicy.encode_room_sources` 复用当前 Spatial 权重及 z/g 投影重新编码原始 ROW 和 pending。此独立写入源路径不读取 H 或旧 `o_exit`；**主策略的 H 路径仍然存在**。
-- `TemporalAttention.step(..., room_source=...)` 从新源写入，同样保留房间 / 层号 embedding 和原来的房间注意力。
-- `room_table(..., track_grad=True)` 供新 learner 每次前向调用。跨 chunk 的旧房间也能从未来 loss 反传到写入查询和早期源编码；旧路径默认 `track_grad=False` 完全保留。
-- `RawRoomReplay.append` 保存只读原始访问序列、写入时间、episode 和 stage，进入新房间的观测不属于刚离开的房间。保持对象即可跨采样批次保存历史，`fork()` 隔离 CF 分支；episode reset 不会把前一局的开放访问写入新局。
-- `RawRoomReplay.chunk(start, stop, model=learner)` 从截至当时可用的源序列重编码，并构造原 Temporal 的因果 chunk 前向。存储 H / 决策 KV 的旧近似有意保留，不能把新房间路径说成全部状态已经新鲜。
-- 现有 128 个访问槽的上限不变；参照的原始历史尚未做容量 / 生命周期优化，不能直接长期开 64 workers。
+- `RawRoomState` 是 `TemporalState` 的 CPU 部分：保存正在访问房间的只读 ROW/pending。
+  房间变化先关闭旧访问，再加入新房间第一帧；reset 丢弃上一局开放访问。
+  访问关闭后原始数组归 rollout 所有，跨 rollout carry 保留当前局，旧局在 rollout 释放时释放；
+  达到原 128 次写入上限后停止继续积累不可能使用的源。没有抽帧或重要事件规则。
+- `RoomSequenceWriter` 以一个学习查询、时间编码和 PyTorch MultiheadAttention 池化整次访问。
+  `encode_room_sources` 使用当前 Spatial 权重及 z/g 投影，不读 H 或旧 o_exit；主策略 H 不变。
+- GraphActor 在 graph 外编码刚关闭的访问，写入固定形状 room_source 输入；graph 内原 Temporal
+  写入、sampling、fold/row buckets/compile 保留。eager/eval 使用 `TemporalState.step_inputs`。
+- 完整原始访问在 `Rollout.raw_rooms` 中，随 `rollout_scalars` 经过现有 IPC；两 actor 合并时按
+  worker 顺序合并，跨 rollout 与原 rooms_* 元数据同序。CF bank/lanes 的 slot copy/reset 同步复制
+  或清除原始开放访问，分支 append 不污染父状态。teacher 已有 stored-output loss 语义不变。
+- learner 在每个 Adam step 开始，用当前权重重算所需房间的因果前缀。`RoomSourceBatch`
+  在该 step 内缓存源及其梯度，各 PPO micro-part 重建有梯度的房间表；最后重放源编码，应用累计
+  VJP，再执行 gradient clipping/Adam。**缓存不跨权重更新，不把 source detach 当作最终梯度。**
+  `--room-source-micro 2048` 限制 Spatial 编码批量，长房间不截断；Spatial 用 non-reentrant checkpoint。
+- checkpoint 保存 room_memory；原 checkpoint resume 会按参数名保留 Adam 状态并新建 writer 状态；
+  新 checkpoint resume 自动保持 writer。禁止把 writer 权重静默加载到 legacy 模型。
 
-结构参考：[Set Transformer](https://arxiv.org/abs/1810.00825) 的学习查询池化思想；实现直接使用 PyTorch 多头注意力，不自写 attention kernel。
+采用已有[Gradient Cache 思路](https://aclanthology.org/2021.repl4nlp-1.31/)和
+[PyTorch checkpoint](https://docs.pytorch.org/docs/stable/checkpoint)，不添加新的 RL objective。
 
-### 调用边界
+### 正确性证据
 
-```python
-model = TokPolicy(**dict(old_checkpoint['config'], room_memory=True))
-load_compatible(model, old_checkpoint['model'])  # shared layers retained, writer freshly initialized
-history = RawRoomReplay(model)
-out = history.append(one_worker_row, one_worker_pending)  # starts at episode reset
-# Keep history across collection batches. Use a compatible learner model if separate.
-future_outputs = history.chunk(start, stop, model=learner)
-loss.backward()  # future task/PPO loss includes pre-chunk room source/write graph
-```
+`test_room_pipeline_smoke.py` 运行真实 Rollout/store/carry、temporal_inputs/part 和模型：
+- 两个 rollout actor/chunk logits 最大差 2.39e-7；跨边界访问没有丢前半段。
+- IPC pickle、双 actor merge、CF snapshot/reset/独立 append、LaneService、eval dispatch 通过。
+- 完整计算图与分两段累计源梯度的参数梯度最大差 CPU 3.06e-5（同时启用完整库存后 6.11e-5）；writer 与 Spatial 均有梯度；
+  Adam 后源重新计算发生变化。
+- 新主机 GPU GraphActor fold=False/True 均通过固定 uniforms 动作和值对齐；fold=True 值误差 1.50e-7；同时启用完整库存后两种 fold 最大误差 2.09e-7。
+- 旧 no-GRU、temporal、lane-batch、CF CPU smoke 全通过。
 
-`room_memory` 写入 checkpoint config，权重可严格往返；旧权重能 warm-start 共享层，但新房间输出不保证与旧策略相同。
-带 writer 的 checkpoint 禁止被 `load_compatible` 静默加载到关闭 writer 的模型。新模型直接走旧 step/chunk 或 CUDA GraphActor 会明确报错，而不是退回旧 `o_exit`。
-本参照不是完整 PPO trainer：采样动作、真实 reward / advantage、old log-prob、优化调度和多 worker 传输仍由训练器负责。
+先前 `test_room_memory_smoke.py` 的因果/早帧梯度/严格权重往返继续通过。
+最小中性背景延迟线索任务 100 步后 held-out 128 样本准确率 100%，移除早期线索 50%；
+先前每批随机完整背景的困难版本 100 步仍为 50%，未通过。二者均不是游戏评估。
 
-### 已执行与仍未证明
+### 吞吐与验收
 
-`tests/test_room_memory_smoke.py` 使用真实 TokPolicy / Spatial / Temporal 路径，检查：
+新训练主机 dgene / 10.19.136.184:22，3 张 3090、64 workers、双 actor + 独立 learner，
+minibatch/micro 8192、rollout 32768、3 epochs，teacher/CF 等原 full-flags 不变。
+所有测量为同机受限低优先级容器；外部任务不停止，外部负载/可用内存 guard 保留。
 
-1. eager actor 与 chunk 输出对齐，含房间切换、楼层事件、episode reset、跨采集批次和 chunk 边界。
-2. chunk 开始前已写入房间的未来 PPO/value loss，梯度到达最早源帧、writer query 与 Spatial 参数。
-3. 添加未来房间不改变过去 chunk；CF 子分支不修改父历史；末帧不是唯一源；padding 不改变输出，时间编码区分顺序。
-4. writer 参数变化后重新编码、checkpoint 往返、共享权重迁移及禁止静默降级。
-5. 简化延迟二选一：线索只在访问第一帧，末帧与未来观察不含答案；H / 决策 context 在该诊断中屏蔽以隔离房间路径。100 次 Adam 更新后，128 个新 nuisance 样本准确率 100%，遮掉早期线索后 50%。这不是 Isaac 实际评估。
+|版本|结果|实际吞吐 / learner耗时|
+|---|---|---|
+|原始对照|50 updates 正常退出，稳态取后40次|729.714×，median update 4.570s|
+|dense raw，source micro256|2 updates 后因成本主动停掉自己的容器|43.73/39.71×；47.29/104.94s|
+|packed + CPU grid去重，source2048|1 update 后停止，改动已撤销|30.42×；83.70s|
+|dense raw，source2048|2 updates，正常 exit0|51.55/91.98×；20.94/44.23s|
 
-测试开发中的负结果保留：随机完整背景每批变化的更难版本，100 步后仍是 50%，未通过；随后单独使用中性场景加独立 nuisance 的最小因果任务验证可学习性。因此不声称随机复杂场景泛化已经解决。
-首次分类测试还暴露 Windows NumPy 默认 int32 label，已显式改为 int64；checkpoint 降级测试先失败，再加入拒绝静默丢 writer 的检查。
-原有 temporal / no-GRU CPU smoke 均通过，CUDA 项未执行。未连服务器，未启动 Isaac 或正式训练，未测新路径吞吐。
+**接入正确性成立，但速度不合格，保持 opt-in，不启动大训练。** 最后一组只有两次更新，
+不能称为稳态测速；游戏/CF errors 均0，但 CF completed=0（短测期间搜索48，teacher held94），
+CF 完成分支由 LaneService 测试覆盖，不能把这个短测说成所有辅助 loss 已进入稳态。
+完整训练成绩/512 seed eval 未做。原始房间帧重复经过 Spatial、每 Adam step 重编码是当前成本来源；
+不以固定抽帧/重要事件规则掩盖成本，后续需单独设计保持学习信号的高效写入。
+证据与四角色文件沿用 `D:/Projects/fortune/Isaac/temp/room-memory-write-v1/`。
 
-候选与证据根目录：`D:/Projects/fortune/Isaac/temp/room-memory-write-v1/`。
-正式训练前仍需：接入 Raw ROW 历史的多进程传输 / 生命周期、GraphActor 或新的 actor 调度、完整 teacher/CF 链路，以及 GPU 速度和内存评估。
+
+## 7. 2026-10-20：完整持有道具 ID / 数量输入
+
+`--inventory-all 1`，对应 checkpoint config `obs_inventory_all=True`，默认关闭；旧 checkpoint
+可以显式开启而不新增参数，之后 resume/eval 自动沿用。必须搭配 items。与 room-memory 独立开关。
+
+- Lua 旧协议最多64种、ROW最多16种、旧池化忽略重复数量。新 inventory layout2 使用 uint16
+  条目数，支持现有 vocab 的 ID1..1023；物品数量仍沿用 wire uint8 上限255。
+- ROW 保留原20800字节及所有已有字段偏移，追加1024个int16数量和完整标志，共22856字节
+  （增加2056字节/9.88%）。原尾部padding显式命名，防止 NumPy concatenate 在双 actor
+  teacher合并时重排布局。旧序列化ROW需显式迁移，不能当成完整库存使用。
+- Lua→LeanDecoder→EpisodeState→Python/native FastRow后处理→rollout/IPC→GPU decode均贯通。
+  请求完整库存而加载旧Lua时明确报错，不静默使用被截断数据。native C前缀ABI不变。
+- 原道具embedding复用，按全部ID及数量求和进入玩家分支；没有手写重要性排序、没有新增reward。
+  独立道具token仍8个，原recent16顺序保留。**这不是全部道具信息修复**：其他主动/口袋槽、
+  主动充能语义、饰品变体、多身体等未在本轮混改。
+- `test_inventory_all_smoke.py` 覆盖400种ID（跨64/255边界）、数量/移除、v1兼容及拒绝降级、
+  far ID399影响输出并收到梯度、旧分支不变、byte decoder、checkpoint、CUDA Graph。
+- 两种特性同时开启的生产Rollout/IPC/CF/gradient-cache/GPU Graph测试通过。
+- 实际游戏2 seeds、69条记录（63 native fast /6 slow）Python/native逐字节一致；
+  GPU inventory graph最大值差2.24e-8。首次双actor实测因ROW padding重排失败（exit143由guard
+  清理），对应失败测试已复现并修复；失败日志保留，不算成功测速。
+
+**最终 r3 验收：50 updates、正常 exit0、guard未触发，日志无traceback/强制终止。**
+丢弃前10次后40次稳态 **729.874×**，原始对照同样40次 **729.714×**，本次基本持平。
+median learner update4.605s（原4.570s），GPU reserved15.469GiB（原15.238GiB）；
+errors/stalls/CF errors均0，CF completed271、teacher held2118。单次短测、轨迹不同，不作统计显著性结论。
+含启动/编译/清理总391.1s。先前 r2 的49 updates719.353×和退出异常保留在证据账本，不替代最终验收。
+修复后native/Python重测69条仍逐字节一致。实际 room-memory 与两次inventory训练检查点已复制到本地，
+严格读回模型及Adam状态；未做新检查点继续训练的独立实测，不将读回等同于恢复训练验收。
+
+### 双 actor 退出竞态（由实测触发，非额外防御脚手架）
+
+r2 的第二 actor 在 Queue.put 后立即设置 last-half event；但 put 只是放进本进程 feeder 缓冲，
+父 actor 的结束 sentinel 可能先于另一 producer 的最后一份数据到达 learner。结果最后一份数据
+未排空，进程退出卡在 Queue feeder join，最终 no-progress guard 清理；本次不能声称无异常退出。
+在正常结束分支，先 Queue.close()/join_thread() 排空本 producer，再通知 last-half。没有取消
+join/静默丢弃数据，也没有改训练算法。采用 [Python Queue 排空接口](https://docs.python.org/3/library/multiprocessing.html#multiprocessing.Queue.join_thread)。
+`test_actor_shutdown_smoke.py` 从实际 trainer AST 取出结束分支，用4MiB饱和队列复现：
+旧代码 last 早于payload投递（exit1）；修复后先投递再通知，子进程干净退出（exit0）。
+**已完成：** 同配置 r3 50 updates 干净退出，guard无停止原因，确认修复后的真实收尾。

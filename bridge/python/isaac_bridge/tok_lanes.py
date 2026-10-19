@@ -246,7 +246,7 @@ class LaneService:
             if 'op' not in f:
                 f['op'] = self.tstate.prev_o.index_select(0, sl).float().cpu().numpy()
                 f['has'] = (self.tstate.steps.index_select(0, sl) > 0).cpu().numpy() & (rows['first'] == 0)
-            tk = dict(temporal=dict(mode='step', state=self.tstate, slot=sl))
+            tk = dict(temporal=self.tstate.step_inputs(self.model, rows, pend, idx))
         u = torch.from_numpy(lane_uniforms(ukeys[0], ukeys[1], self.cols)).to(dev) if ukeys is not None else None
         h_in = self.table.index_select(0, sl) if self.table is not None else None
         with torch.inference_mode():

@@ -150,12 +150,6 @@ def main():
         check('missing raw source fails instead of using o_exit', 'room_source' in str(exc))
     else:
         raise AssertionError('raw writer silently accepted legacy step')
-    try:
-        TP.GraphActor(twin, 1)
-    except ValueError as exc:
-        check('unsupported graph path fails before CUDA allocation', 'RawRoomReplay' in str(exc))
-    else:
-        raise AssertionError('raw writer unexpectedly accepted CUDA GraphActor')
 
     # Pooling sees sequence order, excludes padding, and can be differentiated through an early frame.
     f = torch.randn(5, 32, requires_grad=True)

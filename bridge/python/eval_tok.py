@@ -117,8 +117,7 @@ def policy_actions(model, rows, pending, act_idx, device, greedy=False, mem_h=No
     from isaac_bridge.tok_policy import to_batch
     kw = {}
     if t_state is not None:
-        kw['temporal'] = dict(mode='step', state=t_state,
-                              slot=torch.tensor(act_idx, dtype=torch.int64, device=t_state.kv.device))
+        kw['temporal'] = t_state.step_inputs(model, rows, pending, act_idx)
     b = to_batch(rows, pending, device)
     with torch.inference_mode():
         if mem_h is not None:   # (memory) the workers' states in, the new ones kept
@@ -242,6 +241,7 @@ def main():
         info['no_pedestals'] = True
     if args.no_active:   # B39
         info['no_active'] = True
+    cfg.inventory_all = bool(model is not None and model.config.get('obs_inventory_all'))
     sampler = TokSampler(cfg)
     n = cfg.workers
     recorder = None

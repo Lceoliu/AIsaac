@@ -1,18 +1,145 @@
-"""Raw room-visit writer and eager replay reference (step 1 only).
+"""Raw room-visit writer, production transport helpers and eager reference (step 1).
 
 One learned query compresses every observed frame in a visit to one D-wide token.
 The learner recomputes those sources, including rooms before its chunk, with a graph.
 Main-policy H and decision KV still use the existing rollout semantics: this module
 does NOT implement the separate state-freshness change.
 
-RawRoomReplay is a single-worker, CPU-archive/eager-device reference, not the existing
-CUDA GraphActor / multiprocessing transport. Keep it alive across rollout boundaries.
+RawRoomState accompanies the actor/CF TemporalState; closed immutable visits travel
+in Rollout's IPC metadata. RoomSourceBatch connects the learner's future PPO loss to
+the raw source encoder. RawRoomReplay remains a small single-worker test reference.
 """
 import math
 import numpy as np
 import torch
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
+
+
+class RawRoomState:
+    """Host half of TemporalState: immutable raw frames for each slot's open visit.
+
+    Closed visits belong to the rollout, not this state. Reset/CF copy operate on the
+    host history together with the device state. No sampling or importance rules.
+    """
+    def __init__(self, slots, capacity):
+        self.capacity = capacity
+        self.frames = [[] for _ in range(slots)]
+        self.pending = [[] for _ in range(slots)]
+        self.maps = np.zeros((slots, 169), np.uint8)
+        self.count = np.zeros(slots, np.int64)
+
+    def reset(self, slots):
+        for s in slots:
+            self.frames[s], self.pending[s] = [], []
+        self.maps[slots] = 0
+        self.count[slots] = 0
+
+    def copy(self, src, dst, other):
+        # Copy all sources before assigning: overlapping slot permutations are legal.
+        frames = [list(other.frames[s]) for s in src]
+        pending = [list(other.pending[s]) for s in src]
+        maps, count = other.maps[src].copy(), other.count[src].copy()
+        for i, d in enumerate(dst):
+            self.frames[d], self.pending[d] = frames[i], pending[i]
+        self.maps[dst], self.count[dst] = maps, count
+
+    def observe(self, rows, pending, slots):
+        from .tok_obs import EV_EXIT, EV_NEW_ROOM
+        closed = [None] * len(rows)
+        for i, s in enumerate(slots):
+            first = bool(rows['first'][i])
+            m = rows['map'][i, 3].reshape(-1)
+            shown = bool(m.any())
+            moved = (shown and not np.array_equal(m, self.maps[s])) or bool(
+                int(rows['events'][i]) & (EV_EXIT | EV_NEW_ROOM))
+            if first:
+                self.reset([s])
+            elif moved and self.frames[s]:
+                closed[i] = (np.concatenate(self.frames[s]), np.concatenate(self.pending[s]))
+                for a in closed[i]:
+                    a.flags.writeable = False
+                self.count[s] += 1
+                self.frames[s], self.pending[s] = [], []
+            if first or shown:
+                self.maps[s] = m
+            # Once the existing room cap is reached no further writes are possible.
+            if self.count[s] < self.capacity:
+                r, p = rows[i:i + 1].copy(), pending[i:i + 1].copy()
+                r.flags.writeable = p.flags.writeable = False
+                self.frames[s].append(r)
+                self.pending[s].append(p)
+        return closed
+
+
+def encode_visits(model, visits, micro=256):
+    """Raw observations -> current Spatial -> learned visit token, in bounded batches.
+
+    Checkpoint the Spatial pass when differentiating: a long room does not retain
+    thousands of Spatial activations. Its observation sequence is never truncated.
+    """
+    from .tok_policy import to_batch
+    from torch.utils.checkpoint import checkpoint
+    dev = next(model.parameters()).device
+    rows = np.concatenate([v[0] for v in visits])
+    pending = np.concatenate([v[1] for v in visits])
+    features = []
+    for lo in range(0, len(rows), micro):
+        b = to_batch(rows[lo:lo + micro], pending[lo:lo + micro], dev)
+        features.append(checkpoint(model.encode_room_sources, b, use_reentrant=False)
+                        if torch.is_grad_enabled() else model.encode_room_sources(b))
+    return model.room_writer(torch.cat(features), [len(v[0]) for v in visits])
+
+
+@torch.no_grad()
+def prepare_room_step(model, state, rows, pending, slots):
+    """Run outside a CUDA graph; its fixed-size source tensor is the graph input."""
+    visits = state.raw_rooms.observe(rows, pending, slots)
+    out = state.prev_o.new_zeros((len(rows), state.D))
+    ids = [i for i, v in enumerate(visits) if v is not None]
+    if ids:
+        out[ids] = encode_visits(model, [visits[i] for i in ids])
+    return out, visits
+
+
+class RoomSourceBatch:
+    """Exact gradient cache for ONE optimiser step (never across weight updates).
+
+    All required causal visit prefixes are encoded with the current weights. PPO
+    parts accumulate dL/dsource in a leaf; backward() replays the raw encoder/writer
+    and applies that VJP before clipping/Adam. This bounds memory without detaching
+    the writer's learning signal or re-encoding every visit for every PPO part.
+    """
+    def __init__(self, model, td, cids, micro=256):
+        self.model, self.micro = model, micro
+        needed = set()
+        for c in cids:
+            needed.update(td['raw_needed'][int(c)])
+        self.groups, group, frames = [], [], 0
+        for i in sorted(needed):
+            n = len(td['raw_visits'][i][0])
+            if group and frames + n > micro:
+                self.groups.append(group)
+                group, frames = [], 0
+            group.append(i)
+            frames += n
+        if group:
+            self.groups.append(group)
+        self.visits = td['raw_visits']
+        dev = next(model.parameters()).device
+        source = torch.zeros((len(self.visits) + 1, model.tatt.D), device=dev)
+        with torch.no_grad():
+            for ids in self.groups:
+                source[ids] = encode_visits(model, [self.visits[i] for i in ids], micro)
+        self.source = source.requires_grad_()
+        self.td = dict(td, o=self.source, r_src=torch.arange(len(source), device=dev), raw_room_memory=True)
+
+    def backward(self):
+        if not self.groups:
+            return
+        for ids in self.groups:
+            values = encode_visits(self.model, [self.visits[i] for i in ids], self.micro)
+            values.backward(self.source.grad[ids])
 
 
 class RoomSequenceWriter(nn.Module):

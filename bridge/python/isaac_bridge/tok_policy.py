@@ -831,6 +831,15 @@ class TemporalState:
         self.prev_o = torch.zeros((S1, ta.D), device=dev)
         self.prev_stage = torch.zeros(S1, dtype=torch.int64, device=dev)
         self.prev_map = torch.zeros((S1, MAP[1] * MAP[2]), dtype=torch.uint8, device=dev)
+        from .room_memory import RawRoomState
+        self.raw_rooms = RawRoomState(S1, ta.R) if getattr(model, 'room_writer', None) is not None else None
+
+    def step_inputs(self, model, rows, pending, slots):
+        kw = dict(mode='step', state=self, slot=torch.as_tensor(slots, dtype=torch.long, device=self.kv.device))
+        if self.raw_rooms is not None:
+            from .room_memory import prepare_room_step
+            kw['room_source'], kw['room_visits'] = prepare_room_step(model, self, rows, pending, slots)
+        return kw
 
     @property
     def dtype(self):
@@ -840,6 +849,8 @@ class TemporalState:
         """Every slot back to the start (in place: captured graphs keep their pointers)."""
         for t_ in (self.kv, self.steps, self.nroom, self.prev_o, self.prev_stage, self.prev_map):
             t_.zero_()
+        if self.raw_rooms is not None:
+            self.raw_rooms.reset(list(range(self.slots + 1)))
 
     def _tensors(self):
         """(tensor, slot axis) of every per-slot part of the state."""
@@ -860,6 +871,8 @@ class TemporalState:
             raise ValueError('TemporalState.copy_slot_: src and dst differ in length')
         if o.kv.shape[:2] != self.kv.shape[:2] or o.kv.shape[3:] != self.kv.shape[3:] or o.kv.dtype != self.kv.dtype:
             raise ValueError('TemporalState.copy_slot_: states of other shapes / dtypes')
+        if self.raw_rooms is not None:
+            self.raw_rooms.copy(s.cpu().tolist(), d.cpu().tolist(), o.raw_rooms)
         for (t_, ax), (u_, _) in zip(self._tensors(), o._tensors()):
             t_.index_copy_(ax, d, u_.index_select(ax, s))
 
@@ -869,6 +882,8 @@ class TemporalState:
         d = torch.as_tensor(idx, dtype=torch.int64, device=self.kv.device).reshape(-1)
         for t_, ax in self._tensors():
             t_.index_fill_(ax, d, 0)
+        if self.raw_rooms is not None:
+            self.raw_rooms.reset(d.cpu().tolist())
 
 
 def temporal_out(info):
@@ -879,7 +894,8 @@ def temporal_out(info):
     c = torch.stack([info['create'].long(), info['nroom'].long(), info['steps'].long(), info['stage_prev'].long()],
                     1).cpu().numpy()
     return dict(create=c[:, 0] != 0, nroom=c[:, 1], steps=c[:, 2], stage_prev=c[:, 3], kv=info['kv'].detach(),
-                s=info['s'].detach().to(info['kv'].dtype), o=info['o'].detach().float())
+                s=info['s'].detach().to(info['kv'].dtype), o=info['o'].detach().float(),
+                **(dict(room_visits=info['room_visits']) if 'room_visits' in info else {}))
 
 
 def temporal_chunks(length, mask, T, T_mem):
@@ -978,7 +994,17 @@ def temporal_inputs(roll, tch):
 
     def t(a):
         return torch.from_numpy(np.ascontiguousarray(a)).to(dev)
-    return dict(kv=roll.t_kv, o=roll.t_o, ctx_rows=t(ctx_rows), ctx_ep=t(ctx_ep), r_src=t(r_src), r_k=t(r_k),
+    raw = {}
+    if getattr(roll, 'raw_rooms', None) is not None:
+        visits = [roll.raw_rooms[w][j_] for w, j_ in zip(wid, j)]
+        needed = []
+        for a, b in zip(pre, inn):
+            ids = set()
+            for i in np.concatenate((a, b)):
+                ids.update(range(int(gstart[gid[i]]), int(i) + 1))
+            needed.append(sorted(ids))
+        raw = dict(raw_visits=visits, raw_needed=needed)
+    return dict(**raw, kv=roll.t_kv, o=roll.t_o, ctx_rows=t(ctx_rows), ctx_ep=t(ctx_ep), r_src=t(r_src), r_k=t(r_k),
                 r_stage=t(r_stage), r_grp=t(grp), r_gpos=t(r_gpos), pre_id=t(pre_id), pre_valid=t(pre_valid),
                 in_id=t(in_id), in_at=t(in_at), in_ep=t(in_ep), in_valid=t(in_valid),
                 pre_n=np.array([len(x) for x in pre], np.int64), in_n=np.array([len(x) for x in inn], np.int64))
@@ -1009,7 +1035,7 @@ def temporal_part(td, cids, counts, qep_rows, table, to_dev=None):
     kv = td['kv']
     P = td['ctx_rows'].shape[1]
     ctx_kv = kv.index_select(0, td['ctx_rows'].index_select(0, ci).reshape(-1)).view(C, P, *kv.shape[1:])
-    tp = dict(imap=imap_t, omap=to_dev(omap), qep=qep_rows.index_select(0, imap_t).view(C, Tc), ctx_kv=ctx_kv,
+    tp = dict(raw_room_memory=td.get('raw_room_memory', False), imap=imap_t, omap=to_dev(omap), qep=qep_rows.index_select(0, imap_t).view(C, Tc), ctx_kv=ctx_kv,
               ctx_ep=td['ctx_ep'].index_select(0, ci))
     pre_id = td['pre_id'].index_select(0, ci)[:, :Rp].reshape(-1)
     tp['pre_valid'] = td['pre_valid'].index_select(0, ci)[:, :Rp]
@@ -1028,7 +1054,7 @@ class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
                  memory=0, item_tokens=False, global_token=False, item_shared=False, item_slots=INV_CAP, temporal=False,
                  temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128,
-                 obs_prices=False, obs_hearts=False, obs_room_type=False, room_memory=False):
+                 obs_prices=False, obs_hearts=False, obs_room_type=False, room_memory=False, obs_inventory_all=False):
         super().__init__()
         if int(item_slots) != INV_CAP and not item_tokens:
             raise ValueError('TokPolicy: item_slots needs item_tokens=True (B24)')
@@ -1052,6 +1078,11 @@ class TokPolicy(nn.Module):
         for key_, on_ in (('obs_prices', obs_prices), ('obs_hearts', obs_hearts), ('obs_room_type', obs_room_type)):
             if on_:
                 self.config[key_] = True
+        self.obs_inventory_all = bool(obs_inventory_all)
+        if obs_inventory_all:
+            if not items:
+                raise ValueError('obs_inventory_all requires items=True')
+            self.config['obs_inventory_all'] = True
         self.items = bool(items)
         self.charge = bool(charge)
         self.ent_ext = bool(ent_ext)
@@ -1292,8 +1323,13 @@ class TokPolicy(nn.Module):
         if self.items:   # appended: load_compatible pads these columns with zeros
             inv = b['inv'].long()
             pit = b['pitem'].long()
+            if self.obs_inventory_all:
+                with torch.autocast('cuda', enabled=False):
+                    held = b['inv_all'].float() @ self.item_emb.weight.float()
+            else:
+                held = self.item_emb(inv[..., 0]).sum(1)
             parts += [F.one_hot(pending[:, 3], N_ITEM).float(), F.one_hot(pending[:, 4], N_PILL).float(),
-                      b['pinv'], self.item_emb(inv[..., 0]).sum(1), self.item_emb(pit[:, 0]),
+                      b['pinv'], held, self.item_emb(pit[:, 0]),
                       self.trinket_emb(pit[:, 1]), self.trinket_emb(pit[:, 2]), self.pill_emb(pit[:, 3]),
                       self.effect_emb(pit[:, 4]), self.card_emb(pit[:, 5])]
         if self.charge:   # appended last: load_compatible pads these columns with zeros
@@ -1473,9 +1509,9 @@ class TokPolicy(nn.Module):
         ta = self.tatt
         if self.room_writer is not None:
             if mode == 'step' and 'room_source' not in temporal:
-                raise ValueError('raw room memory step requires a causal room_source (RawRoomReplay)')
+                raise ValueError('raw room memory step requires room_source; use TemporalState.step_inputs')
             if mode == 'chunk' and not temporal['plan'].get('raw_room_memory', False):
-                raise ValueError('raw room memory chunk requires recomputed raw sources (RawRoomReplay)')
+                raise ValueError('raw room memory chunk requires recomputed raw sources (RoomSourceBatch)')
         dev = b['player'].device
         tctx = dict(temporal, user=temporal)
         if mode == 'step':
@@ -1524,6 +1560,8 @@ class TokPolicy(nn.Module):
             mode = tctx['mode']
             if mode == 'step':
                 info = ta.step(tctx['state'], s_t, tctx['slot'], tctx['rec'], tctx.get('room_source'))
+                if 'room_visits' in tctx:
+                    info['room_visits'] = tctx['room_visits']
                 tctx['user']['out'] = info
                 o, m = info['o'], z.new_ones(n)
             else:
@@ -1686,7 +1724,7 @@ def to_batch(rows, pending, device):
 
     used = min(rows['ent'].shape[1], used_entities(rows['n_ent']))
     b = dict(player=t('player'), doors=t('doors'), patch=t('patch'), grid=t('grid'), map=t('map'), n_ent=t('n_ent'),
-             n_doors=t('n_doors'), bombs=t('bombs'), inv=t('inv'), pitem=t('pitem'), pinv=t('pinv'),
+             n_doors=t('n_doors'), bombs=t('bombs'), inv=t('inv'), inv_all=t('inv_all'), pitem=t('pitem'), pinv=t('pinv'),
              pcharge=t('pcharge'), pchar=t('pchar'),
              first=t('first'), events=t('events'), stage=t('stage'),   # (B30: the temporal step reads them)
              phearts=t('phearts'), room_type=t('room_type'))   # (B35)
@@ -1917,7 +1955,7 @@ def cat_batch(a, b):
 ROW_BYTES = ROW.itemsize          # a multiple of 8 (the record holds int64 fields and is aligned)
 _INPUTS = ('player', 'ent', 'ent_id', 'doors', 'patch', 'grid', 'map', 'n_ent', 'n_doors', 'bombs', 'ent_item', 'inv',
            'pitem', 'pinv', 'pcharge', 'pchar', 'first', 'events', 'stage',   # (B30: the last three)
-           'ent_price', 'phearts', 'room_type')   # (B35)
+           'ent_price', 'phearts', 'room_type', 'inv_all')   # inventory v2
 _TORCH = {np.dtype(np.float32): torch.float32, np.dtype(np.int16): torch.int16, np.dtype(np.int32): torch.int32,
           np.dtype(np.uint8): torch.uint8}
 
@@ -2012,11 +2050,11 @@ class GraphActor:
         the smallest graph that holds its records instead of always rows_max rows (the same values per record).
         sdpa_math (B29, measurement aid): attention through PyTorch's math SDPA (matrix products under the process's
         TF32 setting) instead of the float32 memory-efficient kernel. All default off: the graphs as before."""
-        if model.room_writer is not None:
-            raise ValueError('room_memory is currently supported by RawRoomReplay, not CUDA GraphActor')
         from .tok_obs import ENT_CAP
         dev = next(model.parameters()).device
         self.model, self.n, self.stream, self._n = model, rows_max, stream, 0
+        self.room_source = torch.zeros((rows_max, model.tatt.D), device=dev) if model.room_writer is not None else None
+        self.bf16, self.room_visits = bf16, None
         self.mem = int(getattr(model, 'memory', 0) or 0)   # 2026-10-11 (memory): the GRU state's size, 0 without
         self.h_used = None
         if self.mem:
@@ -2121,6 +2159,8 @@ class GraphActor:
             tdict = None
             if t_on:   # (B30) the temporal step, in place on the state
                 tdict = dict(mode='step', state=self.tstate, slot=tslot)
+                if self.room_source is not None:
+                    tdict['room_source'] = self.room_source[:tslot.shape[0]]
                 kw['temporal'] = tdict
             h_last = None
             with (torch.autocast('cuda', dtype=torch.bfloat16) if bf16 else contextlib.nullcontext()), \
@@ -2236,6 +2276,12 @@ class GraphActor:
         if n > self.n:
             return False
         self._tdest = tdest if self.t_on else None
+        if self.room_source is not None:
+            from .room_memory import prepare_room_step
+            stream = self.stream if self.stream is not None else torch.cuda.current_stream()
+            with torch.cuda.stream(stream), torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.bf16):
+                source, self.room_visits = prepare_room_step(self.model, self.tstate, rows, pending, widx)
+                self.room_source[:n].copy_(source)
         if self.fold:
             return self._submit_fold(rows, pending, widx, reset, ukeys)
         if self.mem:
@@ -2369,6 +2415,8 @@ class GraphActor:
             tc = out[:, at + int(self.vg_on):]
             self.t_out = dict(create=tc[:, 0] > 0.5, nroom=np.rint(tc[:, 1]).astype(np.int64),
                               steps=np.rint(tc[:, 2]).astype(np.int64), stage_prev=np.rint(tc[:, 3]).astype(np.int64))
+            if self.room_source is not None:
+                self.t_out['room_visits'] = self.room_visits
         return out[:, :nh].astype(np.int64), out[:, nh], out[:, nh + 1]
 
     def act(self, rows, pending, widx=None, reset=None, tdest=None, ukeys=None):

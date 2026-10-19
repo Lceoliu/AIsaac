@@ -305,7 +305,8 @@ def part_c(rng):
     same = all(torch.equal(d[k], t[k]) for k in ('ent_price', 'phearts', 'room_type'))
     check('c decode_rows == to_batch for the v2 fields', same and d['ent_price'].shape == t['ent_price'].shape,
           str(tuple(d['ent_price'].shape)))
-    check('c ROW_BYTES = ROW.itemsize', TP.ROW_BYTES == TO.ROW.itemsize == 20800, str(TP.ROW_BYTES))
+    check('c ROW_BYTES = ROW.itemsize (inventory tail, unchanged v2 prefix)',
+          TO.ROW_LEGACY.itemsize == 20800 and TP.ROW_BYTES == TO.ROW.itemsize == 22856, str(TP.ROW_BYTES))
     # cat_batch / take pad and cut ent_price like the other entity fields
     rows2 = v2_rows(rng, 4)
     rows2['n_ent'] = 30

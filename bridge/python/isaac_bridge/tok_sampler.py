@@ -265,6 +265,7 @@ class TokSamplerConfig:
     temporal_dim: int = 0                         # B34: the temporal transformer's width D (temporal models; 0: none)
     mode: str = 'room'                          # 'room': one room per episode; 'floor' / 'run': tok_floor.py
     items: bool = False                           # 2026-10-06: the bridge's lean_items, ROW's item fields, 5 actions
+    inventory_all: bool = False                   # v2 wire inventory, all supported collectible IDs and counts
     run_seconds: float = 1800.0                   # run: an episode's time limit (game seconds)
     floor_seconds: float = 480.0                  # floor: an episode's time limit
     floor_stall_seconds: float = 60.0             # floor: and how long it may go without a new or a cleared room
@@ -1039,6 +1040,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
     spec = cfg.specs[group]
     os.environ.update(FORK_ENV)
     apply_instance_defaults()
+    os.environ['ISAAC_RL_FULL_INVENTORY'] = '1' if cfg.inventory_all else '0'
     if cfg.items:   # the root's bridge (and every clone of it) sends the inventory block
         os.environ['ISAAC_RL_LEAN_ITEMS'] = '1'
     if os.environ.get('ISAAC_RL_WATCH_PID', '1') != '0':   # see tok_sampler.WATCH_NOTE

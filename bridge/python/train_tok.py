@@ -504,6 +504,7 @@ def merge_rollouts(full, parts, mirror, device):
     view.n = n_total
     view.value_g = full.get('value_g')
     view.h = full.get('h')
+    view.raw_rooms = [r for _, s, _ in parts for r in s['raw_rooms']] if s0.get('raw_rooms') is not None else None
     if parts[0][2] is None:
         view.t_kv = None
         return view, 0
@@ -636,6 +637,7 @@ class Rollout:
         zeros = np.zeros if alloc is None else alloc
         full = np.full if alloc is None else _filled(alloc)
         self.n, self.cap, self.nh = workers, capacity, n_heads
+        self.raw_rooms = [[] for _ in range(workers)] if temporal and temporal.get('raw_rooms') else None
         self.t_kv = None   # (B30)
         if temporal:
             import torch
@@ -783,6 +785,8 @@ class Rollout:
                     getattr(self, name)[w, :c_] = getattr(other, name)[w, sel]
                 self.rooms_t[w, :c_] = np.where((other.rooms_t[w, sel] == k_) & (k_ >= 0), 0, -1)
                 self.rooms_n[w] = c_
+                if self.raw_rooms is not None:
+                    self.raw_rooms[w] = [other.raw_rooms[w][j] for j in sel]
                 self.rooms_src[w, :c_] = w * R + np.arange(c_)   # (the carried sources' own rows of t_o)
                 o_src.append(other.rooms_src[w, sel])
                 o_dst.append(self.rooms_src[w, :c_])
@@ -993,7 +997,8 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
         actions, logp, value = actions[ok], logp[ok], value[ok]
         h = h[ok] if h is not None else None
         vg = vg[ok] if vg is not None else None
-        tinfo = {k_: (v_[torch_from(ok, v_.device)] if not isinstance(v_, np.ndarray) else v_[ok])
+        tinfo = {k_: ([v_[i] for i in np.flatnonzero(ok)] if isinstance(v_, list) else
+                     v_[torch_from(ok, v_.device)] if not isinstance(v_, np.ndarray) else v_[ok])
                  for k_, v_ in tinfo.items()} if tinfo is not None else None
     if tinfo is not None and roll.t_kv is not None:   # 2026-10-14 (B30)
         store_temporal(roll, a_idx, kk, rows, tinfo)
@@ -1039,6 +1044,10 @@ def store_temporal(roll, a_idx, kk, rows, t):
         roll.rooms_ep[w, r] = ep[j]
         roll.rooms_t[w, r] = kk[j]
         roll.rooms_n[w] = r + 1
+        if roll.raw_rooms is not None:
+            visit = t['room_visits'][j]
+            assert visit is not None, 'host/device room transition disagrees'
+            roll.raw_rooms[w].append(visit)
 
 
 def temporal_rows(rl, flat, cap, device):
@@ -1700,6 +1709,9 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--temporal-heads', type=int, default=4, help='(B30) its heads')
     p.add_argument('--temporal-window', type=int, default=256, help='(B30) decisions a step token sees (itself included)')
     p.add_argument('--temporal-rooms', type=int, default=128, help='(B30) room tokens per episode at most')
+    p.add_argument('--room-memory', type=int, choices=(0, 1), default=0, help='learn room writes from complete raw visits')
+    p.add_argument('--inventory-all', type=int, choices=(0, 1), default=0, help='all supported inventory IDs/counts through Lua v2 and the pooled item encoder')
+    p.add_argument('--room-source-micro', type=int, default=2048, help='Spatial source encoding batch size; no frame truncation')
     p.add_argument('--temporal-bptt', type=int, default=256,
                    help="(B30) decisions per learner chunk (with memory a multiple of --memory-bptt; a minibatch is "
                         '--minibatch // this chunks, --micro parts of whole chunks)')
@@ -1800,7 +1812,7 @@ def main(argv=None, child=None, actor=None):
         p.error('--memory gru needs --memory-dim > 0')
     # 2026-10-12 (B21 / B22): a resumed checkpoint with item tokens / a global token keeps them; one without them gets
     # them fresh when asked
-    itok_fresh = gtok_fresh = share_convert = tatt_fresh = False
+    itok_fresh = gtok_fresh = share_convert = tatt_fresh = room_fresh = False
     if args.resume:
         ck_cfg = torch.load(args.resume, map_location='cpu').get('config', {})
         for key_, opt_ in (('item_tokens', 'item_tokens'), ('global_token', 'global_token'),
@@ -1822,13 +1834,20 @@ def main(argv=None, child=None, actor=None):
             for key_ in ('width', 'layers', 'heads', 'window', 'rooms'):
                 setattr(args, 'temporal_' + key_, int(ck_cfg['temporal_' + key_]))
         tatt_fresh = bool(args.temporal) and not ck_cfg.get('temporal')
+        if ck_cfg.get('room_memory'):
+            args.room_memory = 1
+        room_fresh = bool(args.room_memory) and not ck_cfg.get('room_memory')
+        if ck_cfg.get('obs_inventory_all'):
+            args.inventory_all = 1
         del ck_cfg
     itok_on, gtok_on = bool(args.item_tokens), bool(args.global_token)
     if itok_on and not items:
         p.error('--item-tokens 1 needs --items (or an items checkpoint)')
     if args.item_shared and not itok_on:
         p.error('--item-shared 1 needs --item-tokens 1')
-    tok_kw = dict(item_tokens=itok_on, global_token=gtok_on)   # (TokPolicy's B21 / B22 options; False: as before)
+    if args.inventory_all and not items:
+        p.error('--inventory-all requires --items')
+    tok_kw = dict(item_tokens=itok_on, global_token=gtok_on, obs_inventory_all=bool(args.inventory_all))   # (TokPolicy's B21 / B22 options; False: as before)
     tok_kw.update({k: True for k, on_ in obs_v2.items() if on_})   # (B35; nothing when off: TokPolicy as before)
     if args.item_shared:   # (B23; the key only when set: TokPolicy's signature as before otherwise)
         tok_kw['item_shared'] = True
@@ -1840,6 +1859,10 @@ def main(argv=None, child=None, actor=None):
             p.error(f'--item-slots must be in 1 .. {INV_CAP}')
         tok_kw['item_slots'] = item_slots
     t_on = bool(args.temporal)   # 2026-10-14 (B30)
+    if args.room_memory:
+        if not t_on or args.room_source_micro < 1:
+            p.error('--room-memory requires temporal and positive --room-source-micro')
+        tok_kw['room_memory'] = True
     T_t = int(args.temporal_bptt)
     # (B32: the learner's decisions in chunks: the GRU's (memory), the temporal ones (temporal; with memory the GRU
     # chunks nest inside), or none)
@@ -1925,7 +1948,7 @@ def main(argv=None, child=None, actor=None):
                            archive_size=args.archive_size, archive_prob=args.archive_prob,
                            snapshot_prob=args.snapshot_prob, archive_boss=args.archive_boss, build_timeout=args.build_timeout,
                            root_anon_mib=args.root_anon_mib, reset_timeout=args.reset_timeout,
-                           trim_parked=bool(args.trim_parked), items=items, run_seconds=args.run_seconds,
+                           trim_parked=bool(args.trim_parked), items=items, inventory_all=bool(args.inventory_all), run_seconds=args.run_seconds,
                            branch_share=args.branch_share if floor else 0.0, branch_seconds=args.branch_seconds,
                            branch_max=args.branch_max, branch_close=args.branch_close, branch_noise=args.branch_noise,
                            branch_queue=args.branch_queue, branch_kinds=args.branch_kinds,
@@ -2021,14 +2044,14 @@ def main(argv=None, child=None, actor=None):
             print(note_, flush=True)
         missing, unexpected = learner_model.load_state_dict(ck_model, strict=False)
         new_ok = (('mem_', 'gtok.mem_in.') if mem_fresh else ()) + (('itok.',) if itok_fresh else ()) + \
-            (('gtok.',) if gtok_fresh else ()) + (('tatt.',) if tatt_fresh else ())   # (B21 / B22 / B30: fresh keys)
+            (('gtok.',) if gtok_fresh else ()) + (('tatt.',) if tatt_fresh else ()) + (('room_writer.',) if room_fresh else ())
         if unexpected or any(not k.startswith('choice.') and not (new_ok and k.startswith(new_ok)) for k in missing):
             raise SystemExit(f'--resume: weights do not match ({missing[:4]} {unexpected[:4]})')
         if copt is not None and ck.get('choice_optimizer'):
             copt.load_state_dict(ck['choice_optimizer'])
         osd = ck['optimizer']
         ck_ext = any(k.startswith(('itok.', 'gtok.', 'tatt.')) for k in ck['model'])   # (registered after the GRU)
-        if itok_fresh or gtok_fresh or (mem_fresh and ck_ext) or share_convert or tatt_fresh or mem_drop:
+        if itok_fresh or gtok_fresh or (mem_fresh and ck_ext) or share_convert or tatt_fresh or mem_drop or room_fresh:
             # 2026-10-12 (B21 / B22): new parameters (not necessarily the last ones): Adam's state remapped by name
             # (B23 share_convert: itok.coll's state gone with it, the converted Linear's state starts fresh)
             added = remap_optimizer_state(osd, main_parameter_names(list(ck['model'])),
@@ -2212,7 +2235,7 @@ def main(argv=None, child=None, actor=None):
     # (B30; B31: the per-decision K / V, s and o on the device, a pool of --rollout + 4 x workers rows: a rollout ends
     # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
     t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
-                 kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64) if t_on else None
+                 kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64, raw_rooms=bool(args.room_memory)) if t_on else None
     shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
@@ -3035,7 +3058,7 @@ def main(argv=None, child=None, actor=None):
         pm = pn = n_sel = None
         t_table = None
         for _ in range(args.epochs):
-            if t_on:   # (B31) the rooms made before each chunk: every room token's K / V once per epoch (stop-grad)
+            if t_on and not args.room_memory:   # legacy epoch cache only; raw sources refresh every optimiser step
                 t_t0 = time.perf_counter()
                 with autocast():
                     t_table = learner_model.tatt.room_table(rl.t_o, TD)
@@ -3077,6 +3100,11 @@ def main(argv=None, child=None, actor=None):
                         adv_std = a_all.std()
                         a_all = (a_all - a_all.mean()) / (a_all.std() + 1e-8)
                 opt.zero_grad(set_to_none=True)
+                room_batch = None
+                if args.room_memory:
+                    from isaac_bridge.room_memory import RoomSourceBatch
+                    with autocast():
+                        room_batch = RoomSourceBatch(learner_model, TD, tc_h, args.room_source_micro)
                 micro = args.micro or len(sel)
                 if mem_on:   # (memory) parts of whole chunks
                     micro = max(T_mem, micro // T_mem * T_mem)
@@ -3224,8 +3252,11 @@ def main(argv=None, child=None, actor=None):
                                             tail=torch.cat(tails) if len(tails) > 1 else (tails[0] if tails else None))
                             tk_ = {}
                             if t_on:   # (B30) the temporal transformer over the part's chunks
+                                part_td = TD if room_batch is None else room_batch.td
+                                if room_batch is not None:
+                                    t_table = learner_model.tatt.room_table(room_batch.source, part_td, track_grad=True)
                                 tk_ = dict(temporal=dict(mode='chunk', plan=temporal_part(
-                                    TD, np.asarray(cids_), tch[cids_, 1], t_rows['ep'][part], t_table, dev),
+                                    part_td, np.asarray(cids_), tch[cids_, 1], t_rows['ep'][part], t_table, dev),
                                     o_prev=t_rows['o_prev'][part], has=t_rows['has'][part]))
                                 if vmerged:   # B34: the imitation records' stored lane outputs (the teacher's: none)
                                     n_tb = len(pick) if merged else 0
@@ -3338,6 +3369,9 @@ def main(argv=None, child=None, actor=None):
                         vacc += vstats
                     v2_steps += 1
                     sec('teach')
+                if room_batch is not None:
+                    with autocast():
+                        room_batch.backward()
                 if L.get('trace') is not None:   # B18 check: the loss sums after each step, the first step's gradient
                     L['trace'].append((acc.clone(), tacc.clone(), None if L['trace'] else
                                        [None if q.grad is None else q.grad.clone()
@@ -4188,8 +4222,7 @@ def main(argv=None, child=None, actor=None):
                 prof['eager'] += 1
                 h_e = t_e = None
                 # (B30) the temporal step on the actor's state, the same as inside the graphs
-                tk_e = dict(temporal=dict(mode='step', state=t_state, slot=torch.from_numpy(
-                    np.ascontiguousarray(a_idx, np.int64)).to(device))) if t_on else {}
+                tk_e = dict(temporal=t_state.step_inputs(model, sub, under_way, a_idx)) if t_on else {}
                 with torch.inference_mode():
                     u_crn = None
                     if args.branch_crn and sub['crn'].any():   # Phase B2: the branch records' common random numbers
@@ -4293,6 +4326,10 @@ def main(argv=None, child=None, actor=None):
         clean_end = True
         if actor is not None and not stopped():   # (B38 step 5, a second actor at its end: its last half is handed;
             #                                       it waits, its workers paused, until the first actor stops it)
+            # Queue.put only enqueues locally. Flush this producer before allowing
+            # actor 0's None sentinel to overtake its last half in the shared pipe.
+            jobs.close()
+            jobs.join_thread()
             actor['last'].set()
             sampler.control[1] = 1
             while not stop_ev.wait(1.0) and parent_a.is_alive():

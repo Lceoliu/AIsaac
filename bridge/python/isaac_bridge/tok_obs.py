@@ -157,6 +157,17 @@ ROW = np.dtype([
     ('phearts', np.float32, (3,)),
     ('room_type', np.uint8),
 ], align=True)
+# Inventory layout 2 appends all observable collectible counts; the legacy byte prefix
+# (including alignment padding) and native encoder offsets are unchanged. Native
+# FastRow delegates inventory updates to _inventory/_items_step, as before.
+ROW_LEGACY = ROW
+# Name the legacy tail padding: NumPy concatenate/result_type otherwise repacks
+# this interior gap and shifts inv_all by 6 bytes in multi-actor teacher jobs.
+ROW = np.dtype(dict(names=list(ROW.names) + ['_inventory_alignment', 'inv_all', 'inv_complete'],
+                    formats=[ROW.fields[k][0] for k in ROW.names] + [(np.uint8, (7,)), (np.int16, (N_COLLECTIBLE,)), np.uint8],
+                    offsets=[ROW.fields[k][1] for k in ROW.names] + [ROW.itemsize - 7, ROW.itemsize, ROW.itemsize + 2 * N_COLLECTIBLE],
+                    itemsize=ROW.itemsize + 2 * N_COLLECTIBLE + 8), align=True)
+
 PHEART_F = 3          # 2026-10-16 (B35): ROW 'phearts'
 PRICE_F = 4           # 2026-10-16 (B35): price_columns() per entity
 N_ROOM_TYPE = 32      # 2026-10-16 (B35): room types the policy's room-type table has room for (AB+ 0 .. 23, Repentance+
@@ -209,6 +220,9 @@ class EpisodeState:
         self.inv_version = None    # items: the decoder's inventory block last taken in
         self.inv_counts = None     # items: {id: count} of that block
         self.inv_arr = np.zeros((INV_CAP, 2), np.int16)
+        self.inv_all = np.zeros(N_COLLECTIBLE, np.int16)
+        self.inv_complete = False
+        self.require_full_inventory = os.environ.get('ISAAC_RL_FULL_INVENTORY') == '1'
         self.pitem = np.zeros(6, np.int16)
         self.pinv = np.zeros(PINV_F, np.float32)
         self.max_charge = 0
@@ -437,7 +451,12 @@ def _inventory(o, st):
         return 0
     first = st.inv_version is None
     st.inv_version = o.inv_version
-    n, _, max_charge, tr0, tr1, pill, effect, card, curses = o.inv_head
+    n, version, max_charge, tr0, tr1, pill, effect, card, curses = o.inv_head
+    if st.require_full_inventory and version != 2:
+        raise ValueError('full inventory requested but bridge sent legacy inventory; update bridge Lua')
+    st.inv_complete = version == 2
+    st.inv_all[:] = 0
+    st.inv_all[o.inv['id']] = o.inv['count']
     counts = {int(i): int(c) for i, c in zip(o.inv['id'], o.inv['count'])}
     events = 0
     if not first:
@@ -477,6 +496,8 @@ def _items_step(st, row, stage, active, charge, events):
     st.pinv[0] = min(charge / st.max_charge, 1.0) if st.max_charge > 0 else 0.0
     st.pinv[7] = stage / 12
     row['inv'] = st.inv_arr
+    row['inv_all'] = st.inv_all
+    row['inv_complete'] = st.inv_complete
     row['pitem'] = st.pitem
     row['pinv'] = st.pinv
     if events:
