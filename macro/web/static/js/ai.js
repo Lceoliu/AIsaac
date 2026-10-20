@@ -6,7 +6,9 @@
 // aiReplay(floor)  its moves on this floor, with the probabilities it saw at each step
 // aiExpected(floor) the bombs and keys it needs on average: exact over the floor's joint posterior
 //                   (each move splits the hypotheses by what it would reveal)
-import { consistent, infer, neighbours, nextBomb, nextRedKey } from './infer.js';
+// playerReplay(floor, moves) a player's own moves (sent with their daily scores) in the same form,
+//                   each with the chance it had of finding a room given what they had seen
+import { GRID, consistent, infer, neighbours, nextBomb, nextRedKey } from './infer.js';
 import { canBomb, hiddenRooms, keyTargets, newPlay, useBomb, useKey } from './play.js';
 
 const COL = { secret: 0, super: 1, ultra: 2 };
@@ -49,6 +51,31 @@ export function aiReplay(floor, rep) {
     steps.push({ tool, cell, p, found: entry.found, added: entry.added, before, after: new Map(play.obs), inf });
   }
   return { steps, bombs: play.bombs, keys: play.keys, final: play.obs, rows };
+}
+
+// moves: [['bomb' | 'key', cell]] in the order played. A move that cannot have been played (a cell
+// already known, a key on Afterbirth+) is skipped. gaveUp: the player gave the floor up afterwards.
+export function playerReplay(floor, moves, rep, gaveUp = false) {
+  const rows = knownJoint(floor);
+  const play = newPlay();
+  const steps = [];
+  for (const [tool, cell] of moves) {
+    if (!Number.isInteger(cell) || cell < 0 || cell >= GRID * GRID) continue;
+    if (play.obs.has(cell) && (tool === 'bomb' || play.obs.get(cell) !== 'empty')) continue;
+    if (tool === 'key' && !rep) continue;
+    const before = new Map(play.obs);
+    const inf = infer(rows, before);
+    let total = 0, hit = 0;
+    for (const r of inf.rows) {
+      total += r[3];
+      if (outcome(tool, cell, r, before).some(([, k]) => k !== 'empty' && k !== 'red')) hit += r[3];
+    }
+    const entry = tool === 'bomb' ? useBomb(floor, play, cell) : useKey(floor, play, cell);
+    steps.push({ tool: entry.tool, cell, p: total ? hit / total : 0, found: entry.found, added: entry.added, before,
+      after: new Map(play.obs), inf });
+  }
+  play.revealed = gaveUp;
+  return { steps, bombs: play.bombs, keys: play.keys, final: play.obs, rows, gaveUp, play };
 }
 
 // what a move reveals under one hypothesis, as a key to group the hypotheses by

@@ -3,6 +3,8 @@
 // still go out; a network failure or a gateway error (no code) keeps everything for later. A board
 // is read in the order points, [time,] who finished first, and a player outside the top rows gets
 // their exact place; a database without the time column yet still takes scores and shows boards.
+// A daily floor's moves wait for the network like the scores but never block them, and a day's
+// replays are handed out only for a token that sent that day's 7 floors (hr_replay's rule).
 // Run by tests/test_js.py.
 const kept = new Map();
 globalThis.localStorage = {
@@ -17,6 +19,8 @@ const sent = [];
 let net = 'up';
 let noMs = false;                      // a database from before the ms column
 let views = [];                        // hr_board_daily's rows
+const moves = [];                      // hr_moves
+let noMovesTable = false;
 
 // ---- a little PostgREST: eq filters, an or=(...) tree of gt/lt/eq/is, order, limit, count=exact
 function parseTree(src) {
@@ -83,6 +87,23 @@ globalThis.fetch = async (url, opts = {}) => {
   if (net === 'badkey') return new Response(JSON.stringify({ message: 'Invalid API key' }), { status: 401 });
   if ((opts.method || 'GET') === 'GET') return serve(url);
   const entry = JSON.parse(opts.body);
+  if (url.endsWith('/hr_moves')) {
+    if (noMovesTable) return new Response(JSON.stringify({ code: 'PGRST205', message: "Could not find the table 'public.hr_moves'" }), { status: 404 });
+    if (moves.some((m) => m.client_id === entry.client_id && m.game === entry.game && m.day === entry.day && m.floor === entry.floor)) {
+      return new Response(JSON.stringify({ code: '23505' }), { status: 409 });
+    }
+    moves.push(entry);
+    return new Response(null, { status: 201 });
+  }
+  if (url.endsWith('/rpc/hr_replay')) {                // the SQL function's rule
+    const at = (m) => m.game === entry.p_game && m.day === entry.p_day;
+    if (moves.filter((m) => at(m) && m.client_id === entry.p_client && m.token === entry.p_token).length < 7) {
+      return new Response(JSON.stringify({ code: 'P0001', message: "finish this day's challenge first" }), { status: 400 });
+    }
+    const out = moves.filter((m) => at(m) && m.client_id === entry.p_player).sort((a, b) => a.floor - b.floor)
+      .map(({ floor, moves: mv, gave_up }) => ({ floor, moves: mv, gave_up }));
+    return new Response(JSON.stringify(out), { status: 200 });
+  }
   if (noMs && 'ms' in entry) {
     return new Response(JSON.stringify({ code: 'PGRST204', message: "Could not find the 'ms' column of 'hr_scores' in the schema cache" }), { status: 400 });
   }
@@ -154,4 +175,34 @@ for (const [day, timed, missing] of [[timedDay, true, false], [oldDay, false, fa
   }
 }
 noMs = false;
-console.log('ok scoreboard queue and boards');
+
+// ---- the moves and the replays
+{
+  const sb = createScoreboard();
+  const day = '2026-10-21';
+  const mv = (client, token, floor) => ({ client_id: client, token, game: 'repplus', day, floor, moves: `b${40 + floor} k${60 + floor}`, gave_up: floor === 6 });
+  const ask = (token) => sb.replay({ game: 'repplus', day, player: 'pro', client: 'me', token });
+  const refused = async (token) => { try { await ask(token); return false; } catch (err) { return !!err.notFinished; } };
+  for (let f = 0; f < 7; f++) sb.queueMoves(mv('pro', 'tp', f));
+  for (let f = 0; f < 6; f++) sb.queueMoves(mv('me', 'tm', f));
+  sb.queueMoves(mv('me', 'tm', 0));                                  // queued once only
+  net = 'down';
+  check(await sb.flushMoves() === 13, 'offline: the moves wait');
+  net = 'up';
+  await sb.flush();
+  check(moves.length === 13 && await sb.flushMoves() === 0, `sent: ${moves.length}`);
+  check(await refused('tm'), 'six floors are not the day');
+  sb.queueMoves(mv('me', 'tm', 6));
+  await sb.flush();
+  check(await refused('nope'), 'another token is not mine');
+  const got = await ask('tm');
+  check(got.length === 7 && got[0].moves === 'b40 k60' && got[6].gave_up === true && got.every((r, i) => r.floor === i), `replay ${JSON.stringify(got)}`);
+  // a database without the table yet: the moves are dropped, the scores behind them still go
+  noMovesTable = true;
+  sb.queueMoves(mv('late', 'tl', 0));
+  const before = sent.length;
+  const r = await sb.submit({ client_id: 'late', player: 'p', game: 'repplus', mode: 'daily', day, seed: 9, floor: 0, points: 50, bombs: 1, keys: 0, hints: false, ms: 1000 });
+  check(r.pending === 0 && sent.length === before + 1 && await sb.flushMoves() === 0, 'no hr_moves table');
+  noMovesTable = false;
+}
+console.log('ok scoreboard queue, boards, moves and replays');

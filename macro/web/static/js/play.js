@@ -121,6 +121,14 @@ export function isComplete(floor, play) {
   return hiddenRooms(floor).every((h) => found.has(h.kind));
 }
 
+// A floor's moves as sent for the replays, "b43 k57 …": the tool each move counted as and its cell
+export function movesText(log) {
+  return log.map((e) => `${e.tool === 'bomb' ? 'b' : 'k'}${e.cell}`).join(' ');
+}
+export function parseMoves(text) {
+  return String(text || '').split(' ').filter((m) => /^[bk]\d{1,3}$/.test(m)).map((m) => [m[0] === 'b' ? 'bomb' : 'key', Number(m.slice(1))]);
+}
+
 // all that is left to find is the ultra secret room: the Red Key's job (the page switches to it)
 export function onlyUltraLeft(floor, play) {
   const found = foundKinds(play);

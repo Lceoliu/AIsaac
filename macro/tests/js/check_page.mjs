@@ -1,8 +1,8 @@
 // Checks of the page's own logic (web/static/js) on floors the generators made: node check_page.mjs FLOORS.json
 // Run by tests/test_js.py.
 import { readFileSync } from 'node:fs';
-import { aiExpected, aiReplay } from '../../web/static/js/ai.js';
-import { hiddenRooms, keyTargets, newPlay, onlyUltraLeft, undo, useBomb, useKey } from '../../web/static/js/play.js';
+import { aiExpected, aiReplay, playerReplay } from '../../web/static/js/ai.js';
+import { hiddenRooms, keyTargets, movesText, newPlay, onlyUltraLeft, parseMoves, undo, useBomb, useKey } from '../../web/static/js/play.js';
 import { floorScore, maxScore, rulesFor, singleLinked } from '../../web/static/js/score.js';
 
 const runs = JSON.parse(readFileSync(process.argv[2], 'utf8'));
@@ -116,4 +116,27 @@ for (const run of runs) {
   }
 }
 check(ultraLeft > 0, 'no floor had an ultra secret room');
-console.log(`ok ${floors} floors, ${keyOnHidden} keys on a secret room, ${ultraLeft} switches to the Red Key`);
+// a player's replay: the AI's own moves, sent as text and played back, give the same floor, and each
+// step's chance is the AI's probability for a bomb (plus any ultra secret room it could hit)
+let replays = 0;
+for (const run of runs) {
+  const rep = run.game === 'repplus';
+  for (const [i, f] of run.floors.entries()) {
+    const ai = aiReplay(f, rep);
+    const text = movesText(ai.steps.map((st) => ({ tool: st.tool, cell: st.cell })));
+    const moves = parseMoves(text);
+    check(moves.length === ai.steps.length && moves.every(([t, c], k) => t === ai.steps[k].tool && c === ai.steps[k].cell), `${f.name_en}: moves text ${text}`);
+    const back = playerReplay(f, [...moves, ['bomb', moves.length ? moves[0][1] : 0], ['bomb', -3], ['key', 999]], rep);   // three that cannot be played
+    check(back.steps.length === ai.steps.length && back.bombs === ai.bombs && back.keys === ai.keys, `${f.name_en}: replay ${back.steps.length}/${ai.steps.length}`);
+    check([...back.final].sort().join() === [...ai.final].sort().join(), `${f.name_en}: the replay's floor`);
+    back.steps.forEach((st, k) => {
+      check(st.found.join() === ai.steps[k].found.join(), `${f.name_en}: step ${k} found`);
+      if (st.tool === 'bomb') check(st.p >= ai.steps[k].p - 1e-9 && st.p <= 1 + 1e-9, `${f.name_en}: step ${k} chance ${st.p} vs ${ai.steps[k].p}`);
+    });
+    check(floorScore(f, back.play, i, v2).complete, `${f.name_en}: the replay finds everything`);
+    replays += 1;
+  }
+}
+const gave = playerReplay(runs[0].floors[0], parseMoves('b0'), false, true);
+check(gave.play.revealed && floorScore(runs[0].floors[0], gave.play, 0, v2).done, 'a floor given up');
+console.log(`ok ${floors} floors, ${keyOnHidden} keys on a secret room, ${ultraLeft} switches to the Red Key, ${replays} player replays`);

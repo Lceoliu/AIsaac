@@ -3,9 +3,14 @@
 // without it they stay in this browser. One score per player, game, seed and floor: the first one.
 // A board is ordered by points; a daily board from TIME_FROM on breaks ties by the time the floors
 // took (ms, summed when every floor has one), and then, like every board, by who finished first.
+// A daily floor's moves go along too (hr_moves), for the replays: a day's moves are handed out only to
+// a player who has finished that day's challenge, proved by the secret token their own moves carry.
 const CONFIG = window.MAPGEN_CONFIG || {};
 const LOCAL = 'hr-scores-v1';
 const OUTBOX = 'hr-outbox-v1';
+const LOCAL_MOVES = 'hr-moves-v1';
+const MOVES_OUT = 'hr-moves-outbox-v1';
+export const DAILY_FLOORS = 7;
 export const TIME_FROM = '2026-10-21';
 export const timedDay = (day) => !!day && day >= TIME_FROM;
 
@@ -16,6 +21,15 @@ function writeJson(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* storage unavailable */ }
 }
 const same = (a, b) => a.client_id === b.client_id && a.game === b.game && a.seed === b.seed && a.floor === b.floor;
+const sameMoves = (a, b) => a.client_id === b.client_id && a.game === b.game && a.day === b.day && a.floor === b.floor;
+const notFinished = () => Object.assign(new Error('这一天的挑战还没完成'), { notFinished: true });
+// a day's moves for one player, if the asker has finished that day: [{floor, moves, gave_up}]
+function movesFor(rows, { game, day, player, client, token }) {
+  const mine = rows.filter((r) => r.game === game && r.day === day && r.client_id === client && r.token === token);
+  if (mine.length < DAILY_FLOORS) throw notFinished();
+  return rows.filter((r) => r.game === game && r.day === day && r.client_id === player).sort((a, b) => a.floor - b.floor)
+    .map(({ floor, moves, gave_up }) => ({ floor, moves, gave_up }));
+}
 
 // rows -> [{client_id, player, points, floors, ms, last_at}] best first; the latest name per player
 function aggregate(rows, timed) {
@@ -61,6 +75,12 @@ function localStore() {
       const all = aggregate(rows, timed);
       return { rows: all.slice(0, limit), total: all.length, all, timed };
     },
+    async submitMoves(entry) {
+      const all = readJson(LOCAL_MOVES, []);
+      if (!all.some((r) => sameMoves(r, entry))) all.push(entry);
+      writeJson(LOCAL_MOVES, all);
+    },
+    async replay(q) { return movesFor(readJson(LOCAL_MOVES, []), q); },
   };
 }
 
@@ -120,9 +140,36 @@ function supabaseStore({ url, key }) {
     }
     return { rows, total, mine: mine || null, rank, timed };
   }
+  // moves: kept for later only when the network failed; anything the server says ends them
+  async function postMoves(entry) {
+    let res;
+    try {
+      res = await fetch(base + 'hr_moves', {
+        method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+        body: JSON.stringify(entry),
+      });
+    } catch (err) {
+      throw Object.assign(err, { network: true });
+    }
+    if (!res.ok && res.status !== 409) throw new Error(`操作记录提交失败（HTTP ${res.status}）`);
+  }
+  async function replay({ game, day, player, client, token }) {
+    const res = await fetch(base + 'rpc/hr_replay', {
+      method: 'POST', headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ p_game: game, p_day: day, p_player: player, p_client: client, p_token: token }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      if (body.code === 'P0001') throw notFinished();
+      throw new Error(`回看读取失败（HTTP ${res.status}）`);
+    }
+    return res.json();
+  }
   return {
     remote: true,
     submit: post,
+    submitMoves: postMoves,
+    replay,
     async board({ scope, game, day, limit = 20, me = null }) {
       try {
         return await read({ scope, game, day, limit, me });
@@ -148,7 +195,7 @@ export function createScoreboard() {
       return { ...out, refused: out.refused.some((r) => same(r, entry)) };
     },
     // send what is queued, in order; one the database refuses is dropped (it would block the rest
-    // forever), anything else stops the round and waits for the next
+    // forever), anything else stops the round and waits for the next. Then the moves.
     async flush() {
       let outbox = readJson(OUTBOX, []);
       let error = null;
@@ -163,8 +210,29 @@ export function createScoreboard() {
         outbox = outbox.filter((r) => !same(r, entry));
         writeJson(OUTBOX, outbox);
       }
+      await store.flushMoves();
       return { pending: outbox.length, error, refused };
     },
+    // a daily floor's moves, queued like the scores
+    queueMoves(entry) {
+      const out = readJson(MOVES_OUT, []);
+      if (!out.some((r) => sameMoves(r, entry))) out.push(entry);
+      writeJson(MOVES_OUT, out);
+    },
+    async flushMoves() {
+      let out = readJson(MOVES_OUT, []);
+      for (const entry of [...out]) {
+        try {
+          await sb.submitMoves(entry);
+        } catch (err) {
+          if (err.network) break;
+        }
+        out = out.filter((r) => !sameMoves(r, entry));
+        writeJson(MOVES_OUT, out);
+      }
+      return out.length;
+    },
+    replay: (q) => sb.replay(q),
     async board(opts) {
       const out = await sb.board(opts);
       if (!sb.remote && opts.me) {

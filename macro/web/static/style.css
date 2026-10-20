@@ -245,12 +245,17 @@ body[data-screen="home"] .me-dot { background: var(--paper-red); box-shadow: non
 .board-card .tabs button { color: var(--ink-3); font: 400 20px/1 var(--display); border-bottom: 3px solid transparent; white-space: nowrap; }
 .board-card .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--paper-red); font-weight: 400; }
 .board-sub { margin: 2px 0 8px; font-size: 12px; color: var(--ink-2); }
+.board-tip { margin: -4px 0 6px; font-size: 12px; color: var(--paper-red); }
+.board-tip:empty { display: none; }
 .board-list { list-style: none; margin: 0; padding: 0; display: grid; align-content: start; gap: 0; min-height: 200px; }
 .board-list li {
   display: grid; grid-template-columns: minmax(34px, max-content) minmax(0, 1fr) auto auto; align-items: center; gap: 8px;
   min-height: 34px; padding: 3px 4px; border-bottom: 1px dashed rgba(42, 29, 27, .25); background: none;
 }
 .board-list li.me { background: rgba(163, 35, 31, .09); box-shadow: none; }
+.board-list li.watch { cursor: pointer; }   /* a finished day: the row opens the player's replay */
+.board-list li.watch:hover, .board-list li.watch:focus-visible { background: rgba(42, 29, 27, .08); outline: none; }
+.board-list li.watch:hover .name, .board-list li.watch:focus-visible .name { text-decoration: underline; text-decoration-color: var(--paper-red); text-underline-offset: 3px; }
 .board-list li.gap { display: block; min-height: 0; padding: 0; border: 0; text-align: center; font: 16px/1.1 var(--display); color: var(--ink-3); }
 .board-list .rank { display: grid; place-items: center; min-width: 28px; height: 28px; padding: 0 2px; font: 14px/1 var(--pixel); color: var(--ink-2); background: none; }
 .board-list .rank.r1, .board-list .rank.r2, .board-list .rank.r3 {
