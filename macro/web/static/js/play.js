@@ -120,3 +120,10 @@ export function isComplete(floor, play) {
   const found = foundKinds(play);
   return hiddenRooms(floor).every((h) => found.has(h.kind));
 }
+
+// all that is left to find is the ultra secret room: the Red Key's job (the page switches to it)
+export function onlyUltraLeft(floor, play) {
+  const found = foundKinds(play);
+  const left = hiddenRooms(floor).filter((h) => !found.has(h.kind));
+  return left.length > 0 && left.every((h) => h.kind === 'ultra');
+}

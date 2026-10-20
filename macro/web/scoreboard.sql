@@ -10,6 +10,11 @@
 -- gives up to 800; a table made before then needs its cap raised once:
 --   alter table public.hr_scores drop constraint hr_scores_points_check;
 --   alter table public.hr_scores add constraint hr_scores_points_check check (points between 0 and 1000);
+--
+-- Since 2026-10-21 a daily board breaks ties by time: each floor's score carries the time it took
+-- (ms, at most an hour), and hr_board_daily sums it. A table made before then needs the column once
+-- (then run the hr_board_daily view below again):
+--   alter table public.hr_scores add column if not exists ms integer check (ms between 0 and 3600000);
 
 create table if not exists public.hr_scores (
   id         bigint generated always as identity primary key,
@@ -24,6 +29,7 @@ create table if not exists public.hr_scores (
   bombs      smallint    not null check (bombs between 0 and 300),
   keys       smallint    not null check (keys between 0 and 300),
   hints      boolean     not null default false,
+  ms         integer     check (ms between 0 and 3600000),     -- the floor's time; null from older pages
   created_at timestamptz not null default now(),
   unique (client_id, game, seed, floor),
   check ((mode = 'daily') = (day is not null))
@@ -42,7 +48,8 @@ create policy "add a score" on public.hr_scores for insert to anon, authenticate
 
 grant select, insert on public.hr_scores to anon, authenticated;
 
--- the boards: one row per player, the latest name they used
+-- the boards: one row per player, the latest name they used; a daily board's time is the sum of the
+-- floors' times when every floor has one
 create or replace view public.hr_board_total with (security_invoker = true) as
   select game, client_id,
          (array_agg(player order by created_at desc))[1] as player,
@@ -53,7 +60,8 @@ create or replace view public.hr_board_total with (security_invoker = true) as
 create or replace view public.hr_board_daily with (security_invoker = true) as
   select day, game, client_id,
          (array_agg(player order by created_at desc))[1] as player,
-         sum(points)::int as points, count(*)::int as floors, max(created_at) as last_at
+         sum(points)::int as points, count(*)::int as floors, max(created_at) as last_at,
+         case when count(ms) = count(*) then sum(ms)::int end as ms
   from public.hr_scores
   where mode = 'daily'
   group by day, game, client_id;

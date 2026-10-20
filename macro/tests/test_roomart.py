@@ -81,6 +81,7 @@ def test_ui_assets(renderer, tmp_path):
     assert (tmp_path / happy['file']).stat().st_size > 0
     assert (ui['redkey']['w'], ui['redkey']['h']) == (27, 14)
     assert (ui['perfect']['w'], ui['perfect']['h']) == (19, 22)          # trinket 145, the "A+" paper
+    assert [(t['w'], t['h']) for t in ui['trophies']] == [(32, 40)] * 3   # the Challenge Trophy: gold, silver, bronze
     assert {'IconSecretRoom', 'IconSuperSecretRoom', 'IconUltraSecretRoom', 'IconBomb'} <= set(ui['icons'])
     assert set(ui['sounds']) == {'secret', 'thumbsup'}
     menu = ui['menu']                              # the home page is built from the game's own menus

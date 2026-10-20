@@ -12,11 +12,11 @@ import {
   tileIcon,
 } from './minimap.js';
 import {
-  canBomb, canKey, foundKinds, hiddenRooms, isComplete, keyTargets, knownCells, newPlay, undo, useBomb, useKey,
+  canBomb, canKey, foundKinds, hiddenRooms, isComplete, keyTargets, knownCells, newPlay, onlyUltraLeft, undo, useBomb, useKey,
 } from './play.js';
 import { loadArt, prepare } from './roomart.js';
 import { MISS_POINTS, floorScore, maxScore, rulesFor, rulesOf, singleLinked, tierOf } from './score.js';
-import { createScoreboard } from './scoreboard.js';
+import { TIME_FROM, createScoreboard } from './scoreboard.js';
 
 const $ = (id) => document.getElementById(id);
 const GAMES = { abplus: '胎衣†', repplus: '忏悔+' };
@@ -31,6 +31,9 @@ const STORE_TEXT = 'isaac-mapgen-text-labels';
 const ONE_COLUMN = window.matchMedia('(max-width: 980px)');   // the panel sits below the map (style.css)
 const FLOORS_OPEN = 'hr-floors-open';
 const COACH = 'hr-coach-room';     // set once the player has opened a room's layout from the map
+const CONFIRM = 'hr-confirm';      // '1' / '0': 二次确认 on or off; without a choice, on for touch screens
+const COARSE = window.matchMedia('(pointer: coarse)');
+const FLOOR_MS = 3600e3;           // a floor's clock stops at an hour (the database's cap)
 const PROFILE = 'hr-profile-v1';
 const PLAYS = 'hr-play-v1:';     // + game:seed:floor -> a ranked floor's play, kept across reloads
 const RUNS = 'hr-run-v1:';       // + game:seed -> {mode, day, points: {floor: points}}
@@ -56,6 +59,9 @@ const state = {
   started: null,    // the day this run was opened, and the scoring rules it plays by (score.js)
   rules: null,
   floorsOpen: false, // in one column the floor thumbnails fold into a row of numbers
+  confirm: false,    // 二次确认: a tap on the map picks the cell, the button (or the same cell again) acts
+  pendingAct: null,  // the cell picked: {cell, tool, floor}
+  nudge: null,       // the tool the page has just switched to, its button pulses once
 };
 
 // ---------------------------------------------------------------------------- small helpers
@@ -211,7 +217,9 @@ function play(i = state.floor) {
     state.plays.set(i, saved ? {
       obs: new Map(saved.obs), bombs: saved.bombs, keys: saved.keys, log: saved.log || [], revealed: !!saved.revealed,
       submitted: !!saved.submitted,
-    } : { ...newPlay(), submitted: false });
+      // the floor's clock (ms); a floor begun before the page kept one has none
+      ms: typeof saved.ms === 'number' ? saved.ms : ((saved.log || []).length || saved.revealed ? null : 0),
+    } : { ...newPlay(), submitted: false, ms: 0 });
   }
   return state.plays.get(i);
 }
@@ -219,7 +227,7 @@ function savePlay(i = state.floor) {
   if (!ranked() || !state.plays.has(i)) return;
   const p = state.plays.get(i);
   writeJson(playKey(i), { obs: [...p.obs], bombs: p.bombs, keys: p.keys, log: p.log, revealed: p.revealed,
-    submitted: p.submitted });
+    submitted: p.submitted, ms: p.ms });
 }
 function recordRun(i, points) {
   const key = runKey(state.data.game, state.data.seed.value);
@@ -254,6 +262,46 @@ function floorDone(i) {
 // the complete map gives the answer away: in a challenge, only once the floor is over
 function mapOpen(i = state.floor) { return !ranked() || floorDone(i); }
 
+// ---------------------------------------------------------------------------- the floor's clock
+// A challenge floor's time, the board's tie-break (scoreboard.js): it runs while the floor is on screen,
+// the page in front and the floor not done, and is kept with the floor's play across reloads. Stopped
+// before the run's data changes (savePlay writes under the run's seed).
+const clock = { i: null, at: 0 };
+function clockWanted() {
+  const on = state.screen === 'play' && !!state.data && ranked() && document.visibilityState === 'visible' && !floorDone(state.floor);
+  return on ? state.floor : null;
+}
+function stopClock() {
+  if (clock.i === null) return;
+  const p = state.plays.get(clock.i);
+  if (p && typeof p.ms === 'number') {
+    p.ms = Math.min(FLOOR_MS, p.ms + (performance.now() - clock.at));
+    savePlay(clock.i);
+  }
+  clock.i = null;
+}
+function syncClock() {
+  const want = clockWanted();
+  if (want === clock.i) return;
+  stopClock();
+  if (want !== null) { clock.i = want; clock.at = performance.now(); }
+}
+function clockText(ms) {
+  const t = Math.round(ms / 1000);
+  const h = Math.floor(t / 3600), m = Math.floor(t / 60) % 60, sec = String(t % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+}
+// the run's time so far: the floors done, when each has a clock
+function runTime() {
+  let total = 0;
+  for (let i = 0; i < state.data.floors.length; i++) {
+    const p = state.plays.get(i) || play(i);
+    if (typeof p.ms !== 'number') return null;
+    total += p.ms;
+  }
+  return total;
+}
+
 // ---------------------------------------------------------------------------- screens and URL
 function showScreen(screen) {
   state.screen = screen;
@@ -262,6 +310,7 @@ function showScreen(screen) {
   $('home').hidden = screen !== 'home';
   $('app').hidden = screen !== 'play';
   hideTip();
+  syncClock();
 }
 function writeUrl(push = false) {
   const q = new URLSearchParams();
@@ -317,10 +366,12 @@ async function askName() {
 }
 async function start(mode, { seed = null, day = null, floorIndex = 0, push = true } = {}) {
   if (MODES[mode].ranked && !state.profile.name && !(await askName())) return;
+  stopClock();
   state.mode = mode;
   state.view = 'find';
   state.tool = 'bomb';
   state.selected = null;
+  state.pendingAct = null;
   state.data = null;
   showScreen('play');
   if (mode === 'practice') {
@@ -358,6 +409,7 @@ async function generate({ seed = null, keepFloor = false, floorIndex = null, pus
   state.progress.set('generate', { state: 'run', text: '生成楼层' });   // listed last
   try {
     const [data, sheet] = await Promise.all([call('run', params), loadSheet(params.game)]);
+    stopClock();
     state.data = data;
     state.rules = runRules();
     state.sheet = sheet;
@@ -368,6 +420,8 @@ async function generate({ seed = null, keepFloor = false, floorIndex = null, pus
     state.selected = null;
     const i = floorIndex !== null ? floorIndex : keepFloor ? state.floor : 0;
     state.floor = Math.max(0, Math.min(data.floors.length - 1, i));
+    state.tool = floorTool();
+    state.pendingAct = null;
     if (state.mode === 'practice') $('seed').value = data.seed.text;
     writeUrl(push);
     render();
@@ -408,6 +462,7 @@ function renderHome() {
   const pts = rec ? Object.values(rec.points).reduce((a, b) => a + b, 0) : 0;
   $('daily-state').textContent = !rec ? '' : done >= MODES.daily.floors ? `今天已完成 · ${pts} 分` : `已完成 ${done}/${MODES.daily.floors} 层 · ${pts} 分，点这里继续`;
   for (const t of $('board').parentElement.querySelectorAll('.tabs button')) t.setAttribute('aria-selected', String(t.dataset.scope === state.scope));
+  $('time-note').textContent = `${today() < TIME_FROM ? `${dayName(TIME_FROM)}起，` : ''}只算页面在前台的时间`;
   renderEngine();
 }
 function drawIcons() {
@@ -451,19 +506,30 @@ async function loadBoard() {
     list.removeAttribute('aria-busy');
   }
 }
+// one row of the board: the top three get the Challenge Trophy (gold, silver, bronze) after the name;
+// a daily board that breaks ties by time shows it
+function boardRow(r, rank, timed) {
+  const li = html('li', { class: r.client_id === state.profile.id ? 'me' : '' });
+  const who = html('span', { class: 'who' });
+  who.appendChild(html('span', { class: 'name' }, r.player));
+  const cup = rank <= 3 && r.points > 0 && ui() && ui().trophies ? ui().trophies[rank - 1] : null;
+  if (cup) who.appendChild(html('img', { src: 'art/' + cup.file, alt: '', class: 'trophy pixel', width: cup.w, height: cup.h }));
+  const meta = timed && typeof r.ms === 'number' ? `${r.floors} 层 · ${clockText(r.ms)}` : `${r.floors} 层`;
+  li.append(html('span', { class: `rank r${rank}` }, String(rank)), who, html('span', { class: 'floors' }, meta),
+    html('b', { class: 'pts num' }, String(r.points)));
+  return li;
+}
 function renderBoardList() {
-  const { rows, mine, rank } = state.board;
+  const { rows, mine, rank, timed } = state.board;
   const list = $('board');
   if (!rows.length) {
     const empty = { today: '今天还没有人上榜，来当第一个。', yesterday: '昨天的今日挑战没有人上榜。' }[state.scope] || '还没有成绩，来当第一个。';
     list.replaceChildren(html('li', { class: 'board-empty' }, empty));
   } else {
-    list.replaceChildren(...rows.map((r, i) => {
-      const li = html('li', { class: r.client_id === state.profile.id ? 'me' : '' });
-      li.append(html('span', { class: `rank r${i + 1}` }, String(i + 1)), html('span', { class: 'who' }, r.player),
-        html('span', { class: 'floors' }, `${r.floors} 层`), html('b', { class: 'pts num' }, String(r.points)));
-      return li;
-    }));
+    const items = rows.map((r, i) => boardRow(r, i + 1, timed));
+    // outside the top rows: my own row at the bottom, after a gap
+    if (mine && rank > rows.length) items.push(html('li', { class: 'gap', 'aria-hidden': 'true' }, '⋮'), boardRow(mine, rank, timed));
+    list.replaceChildren(...items);
   }
   $('board-me').textContent = mine ? `你排第 ${rank} 名 · ${mine.points} 分`
     : !state.profile.name ? '起个名字，成绩就会上榜' : state.scope === 'yesterday' ? '你昨天没有成绩' : '你还没有上榜的成绩';
@@ -484,10 +550,12 @@ function render() {
   $('panel').hidden = !has;
   $('map').style.display = has ? '' : 'none';
   renderPlaybar();
+  syncClock();                                     // first: a floor just done shows its whole time
   if (!has) return;
   if (state.view === 'map' && !mapOpen()) state.view = 'find';
   $('t-text').checked = state.text;
   $('t-text').disabled = !state.sheet;
+  $('t-confirm').checked = state.confirm;
   renderFloors();
   renderFloorbar();
   renderBoard();
@@ -495,6 +563,7 @@ function render() {
   renderMapTools();
   renderLegend();
   prefetchFloor();
+  state.nudge = null;
 }
 function renderPlaybar() {
   const m = MODES[state.mode];
@@ -565,8 +634,10 @@ function redKeyIcon() {
 }
 
 function renderBoard() {
-  for (const el of document.querySelectorAll('.coach')) el.remove();
+  for (const el of document.querySelectorAll('.coach, .confirm')) el.remove();
   const f = floor();
+  const pend = state.pendingAct;
+  if (pend && (pend.floor !== state.floor || pend.tool !== state.tool || state.view !== 'find' || aiShown())) state.pendingAct = null;
   const title = $('floortitle');
   title.replaceChildren(document.createTextNode(f.name), html('small', {}, f.name_en));
   for (const b of document.querySelectorAll('.board-head .tabs button')) {
@@ -591,6 +662,7 @@ function renderBoard() {
   if (aiShown()) { renderAiBoard(f, base); return; }
   const p = play();
   const done = isComplete(f, p) || p.revealed;
+  if (done) state.pendingAct = null;
   const inf = infer(f.joint, p.obs);
   const suggest = hintsOn() && state.hints.next && !done ? {
     bomb: state.tool === 'bomb' ? nextBomb(inf, p.obs, (c) => canBomb(f, p, c)) : null,
@@ -600,9 +672,10 @@ function renderBoard() {
     ...base, view: 'find', obs: p.obs, revealed: p.revealed, selected: state.selected,
     heat: hintsOn() && state.hints.heat && !done && inf.ok ? inf : null, suggest,
     actionable: done ? () => false : (c) => (state.tool === 'bomb' ? canBomb(f, p, c) : canKey(f, p, c)),
-    onCell: act, onRoom: pickRoom,
+    onCell: (c) => act(c), onRoom: pickRoom,
   });
-  renderCoach(f);
+  if (state.pendingAct) renderConfirm(f);
+  else renderCoach(f);
 }
 
 // Folded floors (one column): the floors as a row of numbers, the thumbnails one tap away.
@@ -632,11 +705,16 @@ function renderFloorbar() {
 // The bomb and the Red Key right under the map, so switching needs no scrolling (one column, Rep+;
 // style.css hides it on wide screens, where the panel with the tools is beside the map).
 function toolButton(id, label, count, disabled) {
-  const b = html('button', { type: 'button', 'aria-pressed': String(state.tool === id), title: `${label}（${id === 'bomb' ? 'B' : 'K'}）`, disabled });
+  const b = html('button', { type: 'button', 'aria-pressed': String(state.tool === id), title: `${label}（${id === 'bomb' ? 'B' : 'K'}）`, disabled,
+    class: state.nudge === id ? 'nudge' : false });
   b.appendChild(toolIcon(id));
   b.append(html('span', {}, label), html('b', { class: 'count', title: '已用' }, String(count)));
   b.addEventListener('click', () => { state.tool = id; render(); });
   return b;
+}
+// the tool a floor starts with: the bomb, or the Red Key once only the ultra secret room is left
+function floorTool() {
+  return rep() && onlyUltraLeft(floor(), play()) ? 'key' : 'bomb';
 }
 function renderMapTools() {
   const box = $('maptools');
@@ -676,6 +754,42 @@ function dismissCoach() {
   for (const el of document.querySelectorAll('.coach')) el.remove();
 }
 
+// 二次确认: the picked cell framed on the map, and next to it what will happen with a button to do it.
+// The same cell tapped again does it too; another cell moves the pick; Esc or 取消 drops it.
+function renderConfirm(f) {
+  const pend = state.pendingAct;
+  const map = $('map'), frame = $('frame');
+  const [x, y] = state.geo.pos(pend.cell);
+  const k = state.k, key = pend.tool === 'key';
+  const mark = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+  for (const [a, v] of Object.entries({ x: x + k * 0.4, y: y + k * 0.4, width: state.geo.Sx - k * 0.8, height: state.geo.Sy - k * 0.8,
+    rx: k, 'stroke-width': Math.max(2, k * 0.6), 'stroke-dasharray': `${k * 1.6} ${k}`, class: key ? 'pending key' : 'pending' })) {
+    mark.setAttribute(a, v);
+  }
+  map.appendChild(mark);
+  const box = html('div', { class: 'confirm', role: 'group', 'aria-label': '确认这一步' });
+  const q = html('span', { class: 'q' });
+  q.append(html('b', {}, key ? '用红钥匙开这个门？' : '炸这里？'), html('small', {}, where(pend.cell, f.start)));
+  const no = html('button', { type: 'button' }, '取消');
+  no.addEventListener('click', () => { state.pendingAct = null; renderBoard(); });
+  const yes = html('button', { type: 'button', class: 'primary' }, key ? '开门' : '炸');
+  yes.addEventListener('click', () => act(pend.cell, true));
+  box.append(q, no, yes);
+  frame.appendChild(box);
+  // above the cell, or below it when there is no room above; inside the frame
+  const mr = map.getBoundingClientRect(), fr = frame.getBoundingClientRect();
+  const scale = mr.width / (parseFloat(map.getAttribute('width')) || mr.width);
+  const cx = mr.left - fr.left + (x + state.geo.Sx / 2) * scale;
+  const top = mr.top - fr.top + y * scale, bottom = top + state.geo.Sy * scale;
+  const w = box.offsetWidth, h = box.offsetHeight;
+  const above = top - h - 8 >= 4;
+  box.style.left = `${Math.max(4, Math.min(fr.width - w - 4, cx - w / 2))}px`;
+  box.style.top = `${above ? top - h - 8 : Math.min(fr.height - h - 4, bottom + 8)}px`;
+  box.classList.toggle('below', !above);
+  box.style.setProperty('--arrow', `${Math.max(14, Math.min(w - 14, cx - (parseFloat(box.style.left) || 0)))}px`);
+  yes.focus({ preventScroll: true });
+}
+
 // What a room's door slots show. In the map view every door is known. In the find view a door is
 // seen only into a room the player knows (explored, found, or a red room); with the Red Key in hand,
 // the slots it can open show as red doorways. Nothing else: a slot without a door is wall in the game.
@@ -693,22 +807,46 @@ function doorState(r) {
 }
 
 // ---------------------------------------------------------------------------- find mode
-function act(cell) {
+function act(cell, confirmed = false) {
   if (!state.data || aiShown()) return;         // a map from before a new run, or the AI's replay
   const f = floor();
   const p = play();
   if (p.revealed || isComplete(f, p)) return;
+  const bomb = state.tool === 'bomb';
+  if (bomb ? !canBomb(f, p, cell) : !canKey(f, p, cell)) {
+    flash(bomb ? '这里挨不着任何房间，炸不到。' : '红钥匙只能用在房间的门位外面。');
+    if (state.pendingAct) { state.pendingAct = null; renderBoard(); }
+    return;
+  }
+  // 二次确认: the first tap picks the cell; the button, or the same cell again, does it
+  const pend = state.pendingAct;
+  if (state.confirm && !confirmed && !(pend && pend.cell === cell && pend.tool === state.tool && pend.floor === state.floor)) {
+    state.pendingAct = { cell, tool: state.tool, floor: state.floor };
+    hideTip();
+    renderBoard();
+    return;
+  }
+  state.pendingAct = null;
   let entry, note = null;
-  if (state.tool === 'bomb') {
-    if (!canBomb(f, p, cell)) { flash('这里挨不着任何房间，炸不到。'); return; }
+  if (bomb) {
     entry = useBomb(f, p, cell);
   } else {
-    if (!canKey(f, p, cell)) { flash('红钥匙只能用在房间的门位外面。'); return; }
     entry = useKey(f, p, cell);
-    if (entry.tool === 'bomb') {      // right on a (super) secret room: scored as a bomb (play.js)
-      state.tool = 'bomb';
-      note = `${KIND_NAME[entry.found[0]]}按炸弹算：记一颗炸弹，已换回炸弹`;
+    if (entry.tool === 'bomb') note = `${KIND_NAME[entry.found[0]]}按炸弹算：记一颗炸弹`;   // right on a (super) secret room (play.js)
+  }
+  // the tool for what is left: the Red Key once only the ultra secret room is; else a key that hit a
+  // (super) secret room goes back to the bomb
+  if (entry.found.length && rep() && onlyUltraLeft(f, p)) {
+    if (state.tool !== 'key') {
+      state.tool = 'key';
+      state.nudge = 'key';
+      note = [note, '只剩究极隐藏房了，已换成红钥匙'].filter(Boolean).join('；');
+    } else if (note) {
+      note += '；只剩究极隐藏房了，继续用红钥匙';
     }
+  } else if (entry.tool === 'bomb' && state.tool === 'key') {
+    state.tool = 'bomb';
+    note += '，已换回炸弹';
   }
   savePlay();
   render();
@@ -751,7 +889,7 @@ async function finishFloor() {
     const res = await state.scoreboard.submit({
       client_id: state.profile.id, player: state.profile.name || '无名', game: state.data.game, mode: state.mode,
       day: state.mode === 'daily' ? state.day : null, seed: state.data.seed.value, floor: i, points: sc.total,
-      bombs: p.bombs, keys: p.keys, hints: false,
+      bombs: p.bombs, keys: p.keys, hints: false, ms: typeof p.ms === 'number' ? Math.round(Math.min(FLOOR_MS, p.ms)) : null,
     });
     if (res.refused) flash('这一局已经过了提交期限，这层成绩没有计入排行榜。');
     else if (res.error) flash('成绩先存在本机，下次联网时会自动补交。');
@@ -815,6 +953,7 @@ function scoreLine(f, p) {
   if (sc.linkPts) bits.push(`单连 +${sc.linkPts}`);
   if (sc.clean) bits.push(`一次不空 +${sc.bonus}`);
   bits.push(`满分 ${maxScore(f, state.floor, state.rules)}`);
+  if (ranked() && sc.done && typeof p.ms === 'number') bits.push(`用时 ${clockText(p.ms)}`);
   box.appendChild(html('span', { class: 'bits' }, bits.join(' · ')));
   return box;
 }
@@ -893,7 +1032,7 @@ function renderFindPanel(panel) {
     button('放弃这一层', giveUp, done, '按已经找到的计分，并揭晓答案');
   } else {
     button('撤销', () => { undo(p); render(); }, !p.log.length || p.revealed, '撤销上一步（Z）');
-    button('重来', () => { state.plays.set(state.floor, { ...newPlay(), submitted: false }); render(); }, !p.log.length && !p.revealed);
+    button('重来', () => { state.plays.set(state.floor, { ...newPlay(), submitted: false, ms: 0 }); state.tool = 'bomb'; render(); }, !p.log.length && !p.revealed);
     button('揭晓答案', giveUp, complete || p.revealed);
   }
   panel.appendChild(actions);
@@ -946,8 +1085,12 @@ function winCard(f, p) {
   const used = `你用了 ${p.bombs} 颗炸弹` + (p.keys ? `、${p.keys} 次红钥匙` : '');
   const aiText = ai ? `AI 平均要消耗 ${ai.bombs.toFixed(1)} 颗炸弹${rep() ? `和 ${ai.keys.toFixed(1)} 次红钥匙` : ''}。` : '';
   const perfect = sc.clean ? `（含一次不空 +${sc.bonus}）` : '';
-  win.appendChild(html('p', {}, `${ranked() ? `本层 ${sc.total} 分${perfect}。` : ''}${used}；${aiText}`));
-  if (all) win.appendChild(html('p', { class: 'total' }, `挑战完成！${state.data.floors.length} 层一共 ${runPoints()} 分。`));
+  const took = ranked() && typeof p.ms === 'number' ? `，用时 ${clockText(p.ms)}` : '';
+  win.appendChild(html('p', {}, `${ranked() ? `本层 ${sc.total} 分${perfect}${took}。` : ''}${used}；${aiText}`));
+  if (all) {
+    const time = runTime();
+    win.appendChild(html('p', { class: 'total' }, `挑战完成！${state.data.floors.length} 层一共 ${runPoints()} 分${time !== null ? `，用时 ${clockText(time)}` : ''}。`));
+  }
   const acts = html('div', { class: 'actions' });
   const watch = html('button', { type: 'button' }, '看 AI 怎么找');
   watch.addEventListener('click', () => {
@@ -1049,6 +1192,8 @@ function goFloor(i) {
   stopAi();
   state.floor = i;
   state.selected = null;
+  state.pendingAct = null;
+  state.tool = floorTool();
   writeUrl();
   render();
 }
@@ -1369,6 +1514,8 @@ function init() {
   state.scoreboard = createScoreboard();
   try { state.text = localStorage.getItem(STORE_TEXT) === '1'; } catch { /* storage unavailable */ }
   try { state.floorsOpen = localStorage.getItem(FLOORS_OPEN) === '1'; } catch { /* storage unavailable */ }
+  state.confirm = COARSE.matches;
+  try { const c = localStorage.getItem(CONFIRM); if (c !== null) state.confirm = c === '1'; } catch { /* storage unavailable */ }
   const route = readUrl();
   state.backend = createBackend(onProgress, state.game);
 
@@ -1418,10 +1565,22 @@ function init() {
     try { localStorage.setItem(STORE_TEXT, state.text ? '1' : '0'); } catch { /* storage unavailable */ }
     render();
   });
+  $('t-confirm').addEventListener('change', () => {
+    state.confirm = $('t-confirm').checked;
+    state.pendingAct = null;
+    try { localStorage.setItem(CONFIRM, state.confirm ? '1' : '0'); } catch { /* storage unavailable */ }
+    render();
+  });
+  // the clock stops while the page is in the background, and its time is saved now and then
+  document.addEventListener('visibilitychange', syncClock);
+  window.addEventListener('pagehide', stopClock);
+  window.addEventListener('pageshow', syncClock);
+  setInterval(() => { if (clock.i !== null) { stopClock(); syncClock(); } }, 15000);
   document.addEventListener('keydown', (e) => {
     if (state.screen !== 'play' || !state.data || ['INPUT', 'SELECT', 'TEXTAREA'].includes(document.activeElement.tagName)) return;
     if (document.querySelector('dialog[open]')) return;
     const key = e.key.toLowerCase();
+    if (e.key === 'Escape' && state.pendingAct) { state.pendingAct = null; renderBoard(); return; }
     if (aiShown() && (e.key === 'ArrowRight' || e.key === 'ArrowLeft')) { showAi(state.ai.step + (e.key === 'ArrowRight' ? 1 : -1)); return; }
     if (e.key === 'Escape' && aiShown()) { stopAi(); render(); return; }
     if (e.key === 'ArrowRight' && state.floor < state.data.floors.length - 1) goFloor(state.floor + 1);
@@ -1455,6 +1614,7 @@ function init() {
     loadSounds(art.ui);
     drawBrand();
     if (state.screen === 'play' && state.data) render();
+    if (state.screen === 'home' && state.board) renderBoardList();       // the trophies
   });
   state.scoreboard.flush();
   if (route.screen === 'play') {

@@ -2,7 +2,7 @@
 // Run by tests/test_js.py.
 import { readFileSync } from 'node:fs';
 import { aiExpected, aiReplay } from '../../web/static/js/ai.js';
-import { hiddenRooms, keyTargets, newPlay, undo, useBomb, useKey } from '../../web/static/js/play.js';
+import { hiddenRooms, keyTargets, newPlay, onlyUltraLeft, undo, useBomb, useKey } from '../../web/static/js/play.js';
 import { floorScore, maxScore, rulesFor, singleLinked } from '../../web/static/js/score.js';
 
 const runs = JSON.parse(readFileSync(process.argv[2], 'utf8'));
@@ -95,4 +95,25 @@ check(singleLinked(one).has('secret'), 'a secret room next to one room is single
 check(singleLinked(one).has('ultra'), 'an ultra room next to one door slot is single-linked');      // 56: 55 is its only slot
 const two = { rooms: [room(0, 40), room(1, 42), room(2, 41, 7, true), room(3, 56, 29, true)], door_targets: [55, 57] };   // 41 touches 40 and 42
 check(!singleLinked(two).has('secret') && !singleLinked(two).has('ultra'), 'two links are not single');
-console.log(`ok ${floors} floors, ${keyOnHidden} keys on a secret room`);
+// the page switches to the Red Key when the ultra secret room is all that is left (and only then)
+let ultraLeft = 0;
+for (const run of runs) {
+  for (const f of run.floors) {
+    const hid = hiddenRooms(f);
+    const play = newPlay();
+    check(!onlyUltraLeft(f, play) || hid.every((h) => h.kind === 'ultra'), `${f.name_en}: nothing found yet`);
+    for (const h of hid.filter((x) => x.kind !== 'ultra')) {
+      check(!onlyUltraLeft(f, play), `${f.name_en}: switched before the ${h.kind} room was found`);
+      useBomb(f, play, h.cell);
+    }
+    const ultra = hid.some((h) => h.kind === 'ultra');
+    check(onlyUltraLeft(f, play) === ultra, `${f.name_en}: only the ultra room left ${onlyUltraLeft(f, play)}, has one ${ultra}`);
+    if (ultra) {
+      ultraLeft += 1;
+      useBomb(f, play, hid.find((h) => h.kind === 'ultra').cell);
+      check(!onlyUltraLeft(f, play), `${f.name_en}: nothing left`);
+    }
+  }
+}
+check(ultraLeft > 0, 'no floor had an ultra secret room');
+console.log(`ok ${floors} floors, ${keyOnHidden} keys on a secret room, ${ultraLeft} switches to the Red Key`);

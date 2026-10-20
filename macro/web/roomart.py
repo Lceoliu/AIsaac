@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from isaac_macro.archive import ArchiveSet                                   # noqa: E402
 from isaac_macro.rep.roomconfig import default_archive_path as rep_archive  # noqa: E402
 
-VERSION = 6
+VERSION = 7
 REP_GFX = ('sfx.a', 'music.a', 'graphics.a', 'afterbirth.a', 'afterbirthp.a', 'repentance.a')
 DEFAULT_OUT = Path(__file__).resolve().parents[2] / 'runs' / 'macro' / 'art'
 
@@ -90,6 +90,11 @@ MENU_ART = {  # pieces of the game's own menus for the home page: name -> (sheet
     'stain': ('main menu/splashes.png', (192, 368, 368, 528)),         # GameMenu "Stain"
     'fly': ('main menu/fly.png', None),                                # the title screen's flies
 }
+# The board's top three: the Challenge Trophy (entities2.xml 5.370) as it is for first place, its gold
+# (the pixels of hue 42) turned silver and bronze for second and third: (hue, saturation, value) maps
+TROPHY_TONES = (None,
+                (215, lambda s: 0.08, lambda v: min(1.0, 0.12 + 0.9 * v)),
+                (22, lambda s: min(1.0, s * 0.85), lambda v: v * 0.8))
 SOUNDS = {  # the page's sounds: music.xml track 85 (TryBlowOpen plays it for an unseen secret room,
     # AB+ 0x2FC530) and sounds.xml 268 SOUND_THUMBSUP
     'secret': 'resources/music/JINGLE OGG/secret room find v2_07.ogg',
@@ -181,6 +186,30 @@ def _tint(img: Image.Image, frames: list[dict]) -> Image.Image:
     arr = np.asarray(img, dtype=np.float32) / 255
     arr = np.clip(arr * mul + add, 0, 1)
     return Image.fromarray((arr * 255 + 0.5).astype(np.uint8), 'RGBA')
+
+
+def _retone(img: Image.Image, tone) -> Image.Image:
+    """The trophy's gold in another metal (TROPHY_TONES); its wooden base and outline stay."""
+    if tone is None:
+        return img
+    hue, sat, val = tone
+    rgb = np.asarray(img.convert('RGBA'), dtype=np.float64) / 255
+    r, g, b, a = rgb[..., 0], rgb[..., 1], rgb[..., 2], rgb[..., 3]
+    mx, mn = rgb[..., :3].max(-1), rgb[..., :3].min(-1)
+    s = np.where(mx > 0, (mx - mn) / np.where(mx > 0, mx, 1), 0)
+    d = np.where(mx > mn, mx - mn, 1)
+    h = np.where(mx == r, (g - b) / d % 6, np.where(mx == g, (b - r) / d + 2, (r - g) / d + 4)) * 60
+    gold = (a > 0) & (mx > mn) & (h >= 30) & (h <= 55) & (s >= 0.4)
+    out = np.asarray(img.convert('RGBA')).copy()
+    for y, x in zip(*np.nonzero(gold)):
+        v2, s2 = val(mx[y, x]), sat(s[y, x])
+        c = v2 * s2
+        hh = hue / 60
+        xx = c * (1 - abs(hh % 2 - 1))
+        r2, g2, b2 = [(c, xx, 0), (xx, c, 0), (0, c, xx), (0, xx, c), (xx, 0, c), (c, 0, xx)][int(hh) % 6]
+        m = v2 - c
+        out[y, x, :3] = [round((r2 + m) * 255), round((g2 + m) * 255), round((b2 + m) * 255)]
+    return Image.fromarray(out, 'RGBA')
 
 
 def _place(crop: Image.Image, m: np.ndarray) -> tuple[Image.Image, int, int]:
@@ -498,7 +527,7 @@ def build(out: Path = DEFAULT_OUT, log=print) -> dict:
 
 def build_ui(r: Renderer, out: Path, log=print) -> dict:
     """Isaac's "Happy" animation (the thumbs up) as a strip of equal cells, the Red Key's item sprite,
-    a few minimap icons, and the sounds (the jingle as MP3 when ffmpeg is there: Safari cannot decode
+    the "A+" trinket, the board's three trophies, a few minimap icons, and the sounds (the jingle as MP3 when ffmpeg is there: Safari cannot decode
     Ogg Vorbis)."""
     ui = out / 'ui'
     shutil.rmtree(ui, ignore_errors=True)
@@ -533,6 +562,15 @@ def build_ui(r: Renderer, out: Path, log=print) -> dict:
         box = perfect.getbbox()
         perfect.crop(box).save(ui / 'perfect.png', optimize=True)
         index['perfect'] = dict(file='ui/perfect.png', w=box[2] - box[0], h=box[3] - box[1])
+    trophy = r.anm2('resources/gfx/005.370_trophy.anm2')
+    shot = r.render(trophy, 'Idle', 0, only={0}) if trophy else None      # its body, without the shadow
+    if shot:
+        index['trophies'] = []
+        for place, tone in enumerate(TROPHY_TONES, 1):
+            im = _retone(shot[0], tone)
+            im = im.crop(im.getbbox())
+            im.save(ui / f'trophy-{place}.png', optimize=True)
+            index['trophies'].append(dict(file=f'ui/trophy-{place}.png', w=im.width, h=im.height))
     icons = r.anm2('resources/gfx/ui/minimap_icons.anm2')
     index['icons'] = {}
     for name in UI_ICONS:
@@ -573,6 +611,7 @@ def build_ui(r: Renderer, out: Path, log=print) -> dict:
             ext = 'mp3'
         index['sounds'][name] = f'ui/{name}.{ext}'
     log(f"ui: happy {len(shots)} frames, red key {'yes' if 'redkey' in index else 'no'}, A+ {'yes' if 'perfect' in index else 'no'}, "
+        f"trophies {len(index.get('trophies', []))}, "
         f"{len(index['icons'])} icons, {len(index['menu'])} menu pieces, sounds {sorted(index['sounds'])}")
     return index
 

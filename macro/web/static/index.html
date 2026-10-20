@@ -96,6 +96,7 @@
     <span title="只挨着一个房间的隐藏房">单连隐藏房 <b>+25</b></span><span class="rep-only" title="只有一个门位能开红房间连到它">单连究极隐藏房 <b>+50</b></span>
     <span>空炸一次 <b class="neg">−25</b></span>
     <span>一层不空 <b>+25</b> / <b>+50</b> / <b>+125</b> <span class="note">第 1–2 / 3–5 / 6–7 层</span></span>
+    <span>同分比用时 <span class="note" id="time-note">只算页面在前台的时间</span></span>
   </p>
   <p id="engine" class="engine" role="status" aria-live="polite"></p>
 </main>
@@ -195,7 +196,10 @@
       <div id="maptools" class="tools maptools" role="group" aria-label="工具" hidden></div>
       <div class="board-foot" id="boardfoot" hidden>
         <div id="legend" class="legend"></div>
-        <label class="toggle"><input type="checkbox" id="t-text"> 文字标签</label>
+        <span class="foot-toggles">
+          <label class="toggle" title="开启后，点格子先选中，再点“炸”或“开门”才会用掉。手机上默认开启"><input type="checkbox" id="t-confirm"> 二次确认</label>
+          <label class="toggle"><input type="checkbox" id="t-text"> 文字标签</label>
+        </span>
       </div>
     </div>
 

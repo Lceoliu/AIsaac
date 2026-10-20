@@ -1,9 +1,13 @@
 // Where scores go. With MAPGEN_CONFIG.supabase = {url, key} (the project's URL and publishable key,
 // see web/scoreboard.sql) they go to the shared Supabase table and everyone sees the same boards;
 // without it they stay in this browser. One score per player, game, seed and floor: the first one.
+// A board is ordered by points; a daily board from TIME_FROM on breaks ties by the time the floors
+// took (ms, summed when every floor has one), and then, like every board, by who finished first.
 const CONFIG = window.MAPGEN_CONFIG || {};
 const LOCAL = 'hr-scores-v1';
 const OUTBOX = 'hr-outbox-v1';
+export const TIME_FROM = '2026-10-21';
+export const timedDay = (day) => !!day && day >= TIME_FROM;
 
 function readJson(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key) || '') ?? fallback; } catch { return fallback; }
@@ -13,17 +17,31 @@ function writeJson(key, value) {
 }
 const same = (a, b) => a.client_id === b.client_id && a.game === b.game && a.seed === b.seed && a.floor === b.floor;
 
-// rows -> [{client_id, player, points, floors}] best first; the latest name per player
-function aggregate(rows) {
+// rows -> [{client_id, player, points, floors, ms, last_at}] best first; the latest name per player
+function aggregate(rows, timed) {
   const by = new Map();
   for (const r of rows) {
-    const e = by.get(r.client_id) || { client_id: r.client_id, player: r.player, points: 0, floors: 0, at: '' };
+    const e = by.get(r.client_id) || { client_id: r.client_id, player: r.player, points: 0, floors: 0, ms: 0, last_at: '' };
     e.points += r.points;
     e.floors += 1;
-    if ((r.created_at || '') >= e.at) { e.player = r.player; e.at = r.created_at || ''; }
+    e.ms = e.ms === null || typeof r.ms !== 'number' ? null : e.ms + r.ms;
+    if ((r.created_at || '') >= e.last_at) { e.player = r.player; e.last_at = r.created_at || ''; }
     by.set(r.client_id, e);
   }
-  return [...by.values()].sort((a, b) => b.points - a.points || a.at.localeCompare(b.at));
+  const ms = (e) => (e.ms === null ? Infinity : e.ms);
+  return [...by.values()].sort((a, b) => b.points - a.points || (timed ? ms(a) - ms(b) : 0) || a.last_at.localeCompare(b.last_at));
+}
+
+// The PostgREST filter for the players ahead of `m` on a board ordered points desc, [ms asc nulls
+// last,] last_at asc: their count + 1 is m's place
+export function aheadOf(m, timed) {
+  const at = `last_at.lt."${m.last_at}"`;
+  const tie = (more) => `and(points.eq.${m.points},${more})`;
+  const parts = [`points.gt.${m.points}`];
+  if (!timed) parts.push(tie(at));
+  else if (typeof m.ms === 'number') parts.push(tie(`ms.lt.${m.ms}`), tie(`ms.eq.${m.ms},${at}`));
+  else parts.push(tie('ms.not.is.null'), tie(`ms.is.null,${at}`));
+  return `(${parts.join(',')})`;
 }
 
 function localStore() {
@@ -37,9 +55,11 @@ function localStore() {
       return { duplicate: false };
     },
     async board({ scope, game, day, limit = 20 }) {
-      const rows = readJson(LOCAL, []).filter((r) => r.game === game && (scope === 'total' || (r.mode === 'daily' && r.day === day)));
-      const all = aggregate(rows);
-      return { rows: all.slice(0, limit), total: all.length, all };
+      const daily = scope !== 'total';
+      const timed = daily && timedDay(day);
+      const rows = readJson(LOCAL, []).filter((r) => r.game === game && (!daily || (r.mode === 'daily' && r.day === day)));
+      const all = aggregate(rows, timed);
+      return { rows: all.slice(0, limit), total: all.length, all, timed };
     },
   };
 }
@@ -50,50 +70,67 @@ function supabaseStore({ url, key }) {
   const headers = key.startsWith('sb_') ? { apikey: key } : { apikey: key, Authorization: `Bearer ${key}` };
   async function get(path, extra = {}) {
     const res = await fetch(base + path, { headers: { ...headers, ...extra } });
-    if (!res.ok) throw new Error(`排行榜读取失败（HTTP ${res.status}）`);
+    if (!res.ok) throw Object.assign(new Error(`排行榜读取失败（HTTP ${res.status}）`), { status: res.status });
     return res;
+  }
+  // false once the database turns out not to have the ms column yet (web/scoreboard.sql): scores then
+  // go without it and the boards are read without it
+  let hasMs = true;
+  async function post(entry) {
+    const res = await fetch(base + 'hr_scores', {
+      method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
+      body: JSON.stringify(entry),
+    });
+    if (res.status === 409) return { duplicate: true };
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      if (body.code === 'PGRST204' && 'ms' in entry) {          // no such column (yet)
+        hasMs = false;
+        const { ms, ...rest } = entry;
+        return post(rest);
+      }
+      // an error from the database itself (a SQLSTATE code: a check, or the daily-date rule) refuses
+      // this row for good; anything else (the network, the gateway, a key) may pass later
+      const err = new Error(`分数提交失败（HTTP ${res.status}）`);
+      err.refused = /^[0-9A-Z]{5}$/.test(String(body.code || ''));
+      throw err;
+    }
+    return { duplicate: false };
+  }
+  async function read({ scope, game, day, limit, me }) {
+    const daily = scope !== 'total';          // today's or yesterday's challenge: one day's board
+    const view = daily ? 'hr_board_daily' : 'hr_board_total';
+    const timed = daily && hasMs && timedDay(day);
+    const select = `client_id,player,points,floors,last_at${daily && hasMs ? ',ms' : ''}`;
+    const where = (q) => { q.set('game', `eq.${game}`); if (daily) q.set('day', `eq.${day}`); return q; };
+    const order = timed ? 'points.desc,ms.asc.nullslast,last_at.asc' : 'points.desc,last_at.asc';
+    const res = await get(`${view}?${where(new URLSearchParams({ select, order, limit: String(limit) }))}`, { Prefer: 'count=exact' });
+    const rows = await res.json();
+    const range = res.headers.get('content-range') || '';
+    const total = parseInt(range.split('/')[1], 10) || rows.length;
+    let mine = rows.find((r) => r.client_id === me) || null;
+    let rank = mine ? rows.indexOf(mine) + 1 : null;
+    if (me && !mine) {                     // outside the top rows: my total, then how many are ahead
+      [mine] = await (await get(`${view}?${where(new URLSearchParams({ select, client_id: `eq.${me}` }))}`)).json();
+      if (mine) {
+        const aq = where(new URLSearchParams({ select: 'client_id', or: aheadOf(mine, timed), limit: '1' }));
+        const ahead = await get(`${view}?${aq}`, { Prefer: 'count=exact' });
+        rank = (parseInt((ahead.headers.get('content-range') || '').split('/')[1], 10) || 0) + 1;
+      }
+    }
+    return { rows, total, mine: mine || null, rank, timed };
   }
   return {
     remote: true,
-    async submit(entry) {
-      const res = await fetch(base + 'hr_scores', {
-        method: 'POST', headers: { ...headers, 'Content-Type': 'application/json', Prefer: 'return=minimal' },
-        body: JSON.stringify(entry),
-      });
-      if (res.status === 409) return { duplicate: true };
-      if (!res.ok) {
-        // an error from the database itself (a SQLSTATE code: a check, or the daily-date rule) refuses
-        // this row for good; anything else (the network, the gateway, a key) may pass later
-        const body = await res.json().catch(() => ({}));
-        const err = new Error(`分数提交失败（HTTP ${res.status}）`);
-        err.refused = /^[0-9A-Z]{5}$/.test(String(body.code || ''));
-        throw err;
-      }
-      return { duplicate: false };
-    },
+    submit: post,
     async board({ scope, game, day, limit = 20, me = null }) {
-      const daily = scope !== 'total';          // today's or yesterday's challenge: one day's board
-      const view = daily ? 'hr_board_daily' : 'hr_board_total';
-      const q = new URLSearchParams({ select: 'client_id,player,points,floors', game: `eq.${game}`, order: 'points.desc,last_at.asc', limit: String(limit) });
-      if (daily) q.set('day', `eq.${day}`);
-      const res = await get(`${view}?${q}`, { Prefer: 'count=exact' });
-      const rows = await res.json();
-      const range = res.headers.get('content-range') || '';
-      const total = parseInt(range.split('/')[1], 10) || rows.length;
-      let mine = rows.find((r) => r.client_id === me) || null;
-      let rank = mine ? rows.indexOf(mine) + 1 : null;
-      if (me && !mine) {                     // outside the top rows: my total, then how many are ahead
-        const mq = new URLSearchParams({ select: 'client_id,player,points,floors', game: `eq.${game}`, client_id: `eq.${me}` });
-        if (daily) mq.set('day', `eq.${day}`);
-        [mine] = await (await get(`${view}?${mq}`)).json();
-        if (mine) {
-          const aq = new URLSearchParams({ select: 'client_id', game: `eq.${game}`, points: `gt.${mine.points}`, limit: '1' });
-          if (daily) aq.set('day', `eq.${day}`);
-          const ahead = await get(`${view}?${aq}`, { Prefer: 'count=exact' });
-          rank = (parseInt((ahead.headers.get('content-range') || '').split('/')[1], 10) || 0) + 1;
-        }
+      try {
+        return await read({ scope, game, day, limit, me });
+      } catch (err) {
+        if (!(hasMs && scope !== 'total' && err.status === 400)) throw err;
+        hasMs = false;                     // the daily view has no ms column yet
+        return read({ scope, game, day, limit, me });
       }
-      return { rows, total, mine, rank };
     },
   };
 }
