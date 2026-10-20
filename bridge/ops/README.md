@@ -1,13 +1,28 @@
-# 运维脚本（2026-10-10 起随仓库管理）
+# 部署、资源与实验备份
 
-- `sync_h1.sh <沙箱>` / `sync_to.sh <沙箱>` / `sync_hpc.sh <沙箱>`：把 `bridge/python`、`bridge/abplus/abp_bridge.lua`、`bridge/abplus/catalog` 和 `bridge/engine/` 同步到第一台 / 第二台 / HPC 的 `~/isaac-abplus/<沙箱>`（HPC：`/101063/AIsaac/<沙箱>`）并重新编译 `libabp_turbo.so`。沙箱是某一时刻工作区的快照，正在跑的实验不随工作区变。
-- `c6x–c8x_start.sh`：各次训练的启动脚本（`smoke|run`），参数即实验记录（EXPERIMENTS.md）。
-- `hpc_env.sh` / `hpc_bench.sh` / `hpc_guard.sh` / `hpc_c77.sh`：HPC 节点的环境、吞吐基准、资源守护、十游戏年运行。
-- `run_evals.py`（整局评估表）、`choice_stats.py`（分支记录统计）、`lab_trend.py` / `lab_compare.py`（构筑实验室）。
+更新：2026-10-21。这里的旧主机脚本是特定时期的配置，不代表对应主机、端口或 GPU 现在仍可用。
 
-## git 管理（2026-10-10 起）
+## 脚本职责
 
-- 本地仓库 `rl/`（GitHub `Lceoliu/AIsaac`，分支 `abplus-training` = `main`）。每个里程碑提交并推送。
-- 三处远端各有一个裸仓库 + 工作副本：第一台 `~/isaac-abplus/repo.git` / `repo`，第二台同，HPC `/101063/AIsaac/repo.git` / `repo`（第二台和 HPC 没有外网，从 PC `git push ssh://…/repo.git --all` 推过去，再在远端 `git pull`）。
-- 正在跑的运行用的代码各记成一个快照分支（`snapshot/host1-tv` = C83、`snapshot/host2-lf` = C80/C81/C82、`snapshot/hpc-ws1` = C77），都在 GitHub 上；远端的 `repo` 检出的是各自的快照分支。
-- 新沙箱从今往后用仓库建：`git -C <repo> worktree add <沙箱>/src <分支或提交>`，然后 `ln -s src/bridge/python python; ln -s src/bridge/abplus abplus`，`tools/` 由 `sync_*.sh` 的编译步骤或手动 `gcc -shared -fPIC -O2 -o tools/libabp_turbo.so src/bridge/engine/abp_turbo.c -ldl` 生成；`sync_*.sh` 的 tar 同步仍可用于未提交的工作区。
+- `sync_h1.sh` / `sync_to.sh` / `sync_hpc.sh`：同步 Python、Lua、目录与引擎层到指定沙箱。
+- `c*` / `hpc_c*`：历史实验启动配方；续训前核对 checkpoint、增量游戏小时、开关与代码版本。
+- `hpc_env.sh` / `hpc_bench.sh` / `hpc_guard.sh`：环境、吞吐与资源守护。
+- `run_evals.py`、`choice_stats.py`、`lab_trend.py` / `lab_compare.py`：评估与分支/构筑统计。
+
+具体脚本存在性和参数以当前 checkout 为准；不再将 `snapshot/host1-tv` 等历史分支写成“正在跑”的状态。
+
+## 启动前与共享主机
+
+确认目标主机身份、CPU 配额/绑核、内存、GPU 进程所有者、容器、输出目录和端口。只使用分配给本任务的资源；不停止或迁移其他任务。旧推荐的 64 workers / 1 ms polling 需要在当前负载和模型上复核。
+
+新沙箱固定代码版本；不要在正在运行的工作副本覆盖模型结构、观测布局或引擎库。训练中评估按已验证布局安排，不能任意叠加 GPU 进程。
+
+## 完整实验结束
+
+将以下内容同步到备用 3090：最终/可恢复检查点、运行配置与源码版本、训练 progress/episode 日志、逐种子评估与汇总、必要回放。确认备份文件可读后，才把实验归档为可恢复完成。
+
+现有 C99 与新主机测速的历史位置记录在工作区 `temp/new-host-audit-20261019/BENCHMARK_REPORT.md`。连接前重新确认主机身份与路径，不将那里的旧占用快照当实时状态。
+
+## Git 边界
+
+在当前任务分支提交聚焦的代码/文档修改；主仓、公开 Gym 仓与各快照独立管理，不假定 `abplus-training` 永远等于 `main`。推送、部署和重启不是整理本地文档的隐含步骤。

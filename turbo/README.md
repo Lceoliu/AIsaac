@@ -1,6 +1,8 @@
 # isaac_turbo：J460 原版加速层（L1）的原生部分
 
-设计、证据与实验方案见 [rl/docs/L1_FEASIBILITY_PLAN.md](../docs/L1_FEASIBILITY_PLAN.md)。这里只放构建与文件说明。
+状态（2026-10-21）：历史 J460/Windows 加速层，保留维护与复现；当前 AB+ Linux 训练使用 `bridge/engine`。历史故障结论见[Bridge](../bridge/README.md)。
+
+设计、证据与实验方案见 [rl/docs/L1_FEASIBILITY_PLAN.md](../bridge/README.md)。这里只放构建与文件说明。
 
 ## 做什么
 
@@ -14,7 +16,7 @@
 | 字体绘制 `0x0061BD80`（缓解，`kFlagFontGuard`） | 先查 `KAGE_ColorTextureShader` 是否可用，不可用则跳过本次文本绘制（`ret 0x24`），避免空栈出栈崩溃；不改玩法状态 |
 | KAGE 文件打开 `0x00617EA0`（探针 + 缓解，`kFlagFileRetry`） | 失败时记录路径 / errno / _doserrno / GetLastError；对 `*.a` 归档最多重试 5 次（20–100 ms 退避） |
 
-探针的依据与判据见 [rl/docs/NATIVE_CRASH_ANALYSIS.md](../docs/NATIVE_CRASH_ANALYSIS.md)。`shader_registry.hpp` 是注册表/栈的纯逻辑解析，`tests/registry_test.cpp` 用伪造内存验证哈希、查找和"空栈出栈读 0xC"的算术。
+探针的依据与判据见 [rl/docs/NATIVE_CRASH_ANALYSIS.md](../bridge/README.md)。`shader_registry.hpp` 是注册表/栈的纯逻辑解析，`tests/registry_test.cpp` 用伪造内存验证哈希、查找和"空栈出栈读 0xC"的算术。
 
 不改任何玩法状态、不注入输入、不写游戏目录（日志与探针转储在 `%LOCALAPPDATA%\IsaacRL\turbo\`，可用 `ISAAC_TURBO_LOG_DIR` 改）。宿主不是 J460（PE 时间戳/大小/7 段序言/GLFW 频率任一不符）时不装任何 Hook。
 
