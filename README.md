@@ -1,52 +1,62 @@
-# AIsaac：原版引擎上的完整流程强化学习
+# AIsaac
 
-更新：2026-10-21。
+用强化学习玩《以撒的结合：Afterbirth+》。
 
-## 当前阶段
+AIsaac 直接在原版 Linux 游戏引擎上训练，让同一个策略学习战斗、探索、拾取道具和使用资源。我们想解决的不只是如何打赢一个房间，而是如何在随机生成的地图和道具组合中，把一整局游戏玩下去。
 
-主线是在 **Afterbirth+ 原生 Linux 引擎**上训练一个覆盖战斗、探索、拾取和资源取舍的策略。Rust 模拟器、旧自编规则 v0、COMBAT/GOTO 组合与护盾专家是历史路线，不是当前主线。
+## 工作方式
 
-- 冻结参照：C99 第二段最终权重 `segment2-final.pt`，u48184，累计 58,506.2 游戏小时；512 种子平均过层 **1.953**。这是平均过层数，不是整局通关率。
-- 当前工作：房间记忆的信用分配、训练时旧记忆的使用，以及输入信息缺失。候选实现与验证在工作区 `temp/room-memory-write-v1/`，不能自动视为已合并到本仓库或已通过完整训练验收。
-- 下一版输入结构已讨论并画入修改副本；**文字设计与 Draw.io 的统一另做下一步**。旧设计稿中道具查询池化等方案尚未同步，不能继续当最新定案。
-- C103/C104 的旧“进行中”和 ETA 已撤下；本地总账没有可据以判定最终胜负的完整结果。本次文档整理没有连接远端，也没有启动训练。
+- **原版游戏环境。** 使用 Lua 桥接和原生加速层控制游戏，保留原版的敌人行为、碰撞和道具效果；多个游戏进程并行采样。
+- **结构化观测。** 将玩家状态、房间地形、可见实体、道具和已探索地图编码为 token，不直接使用屏幕图像。
+- **带记忆的 Transformer。** 空间 Transformer 处理当前观察，时间 Transformer 结合近期决策和房间访问摘要，输出移动、射击及道具使用动作。
+- **PPO 与分支搜索。** 策略通过游戏奖励学习，也可以从同一引擎状态 fork 出不同动作分支，把搜索结果用于辅助训练。
 
-## 文档导航
+## 实验结果
 
-| 要查什么 | 唯一主入口 |
-|---|---|
-| 已实现模型、时序状态、教师与 loss 的关系 | [架构](docs/ENV_ARCHITECTURE.md) |
-| 用户确认的可观察性、操作接口与待实现项 | [接口规范](docs/PROJECT_SPEC.md) |
-| 训练、评估、回放与运行产物 | [训练管线](bridge/abplus/README.md) |
-| 各实验的关键条件、结论与数据 | [实验总账](bridge/abplus/EXPERIMENTS.md) |
-| Bitter Lesson、实验设计和验收原则 | [研究原则](docs/SCALING_THESIS.md) |
-| 外部项目和接口经验 | [相关工作](docs/RELATED_WORK.md) |
+C99 第二段最终模型在 512 个评估种子上的结果：
 
-设计入口：[原始结构图](docs/model_structure_versions/20261018/main.drawio)、[修改副本](docs/model_structure_versions/20261020-token-expansion-proposal/main.drawio)、[待同步的下一版文字设计](docs/model_structure_versions/20261018/resources/NEXT_MODEL_DESIGN.md)。
+| 指标 | 结果 |
+| --- | ---: |
+| 每局平均通过的楼层数 | **1.953** |
+| 到达第 4 层及以上 | **147 / 512（28.7%）** |
+| 累计训练游戏时间 | 58,506.2 小时 |
 
-## 代码与工具
+这里的楼层数按完成并离开的楼层计。评估条件及其他实验结果见[实验记录](bridge/abplus/EXPERIMENTS.md)。
 
-| 目录 | 用途 |
-|---|---|
-| `bridge/abplus/` | AB+ Lua 桥接与房间目录 |
-| `bridge/python/` | `train_tok.py`、`eval_tok.py`、策略、采样器、教师和评估工具 |
-| [bridge/engine](bridge/engine/README.md) | 原生加速、fork 克隆与观测编码 |
-| [bridge/ops](bridge/ops/README.md) | 部署、资源隔离、完整实验备份 |
-| [macro](macro/README.md) | 离线生成器、推断与对照工具，不是在线策略的手写控制器 |
-| [bridge](bridge/README.md)、[turbo](turbo/README.md) | 历史 J460 桥接、加速与实机证据 |
-| `isaac_room/`、`sim/` | 历史模拟器与原型；不再作为当前训练主线 |
-| `runs/` | 历史运行、评估及证据；不是当前设计入口 |
+## 运行
 
-公开 Gym 接口在独立的 [isaac-abplus-gym 仓库](../isaac-abplus-gym/README.md)，不要把它与本研究仓的所有实验选项混为一谈。
+训练需要 Linux x86-64、Python 3.10+、支持 CUDA 的 PyTorch，以及自己的 Steam 版 *The Binding of Isaac: Rebirth + Afterbirth+*（Linux v1.06.T1）。游戏需要已登录的 Steam 客户端和 X / OpenGL 环境。
 
-## 验收与状态
+```bash
+git clone https://github.com/Lceoliu/AIsaac.git
+cd AIsaac
+python -m venv .venv
+source .venv/bin/activate
+pip install -r bridge/python/requirements-training.txt
+export PYTHONPATH="$PWD/bridge/python"
+```
 
-只向策略提供玩家可观察的信息；训练教师可用克隆分支产生监督，但正式评估不能读取未来或靠教师代打。按相同种子、检查点、开局分布和终止规则比较；128 种子用于跟踪，512 种子用于候选正式比较，必要时再做多训练种子复验。
+游戏运行目录需另外准备：默认位于 `~/isaac-abplus`，`runtime/` 放置带 Lua 桥接加载入口的游戏副本，`tools/` 放置 `run_instance.sh`、编译好的 `libabp_turbo.so` 和渲染桩表。对应源码在 `bridge/engine/`；Python 依赖安装不会完成这一步。
 
-远端进程、GPU 占用和可用路径必须现场检查；历史主机名、脚本与 ETA 不是当前运行状态。每个完整大实验结束后，将最终/可恢复权重、配置、训练和评估日志、评估结果同步到备用 3090，并确认可读。
+环境配置好后，可以从一个小规模整局训练开始：
 
-## 历史路线与文档整理
+```bash
+python bridge/python/train_tok.py \
+  --groups-file bridge/abplus/catalog/scaling2_groups.json \
+  --mode run --items --item-tokens 1 --global-token 1 --temporal 1 \
+  --workers 8 --game-hours 100 --out runs/example
+```
 
-模拟器 u425 在模拟器上胜率 19.1%、迁移 AB+ 只有 0.4%（A2），因此转向原版引擎训练。已否定的自编规则 v0 不计作以撒能力成果。
+评估保存的模型：
 
-2026-10-21 将 23 份正文整理为 13 份：时序/反事实设计并入架构，旧故障与加速结论并入模块入口，宏观规划与目标条件路线的有效边界并入离线工具文档，重复研究稿并入相关工作；旧阶段计划和专家评审副本删除。原始内容仍可从 Git 历史查阅，不在当前目录再保存一套“完整旧版正文”。
+```bash
+python bridge/python/eval_tok.py \
+  --checkpoint runs/example/checkpoints/last.pt \
+  --groups-file bridge/abplus/catalog/scaling2_groups.json \
+  --mode run --workers 8 --seeds 2147490000:512 \
+  --out runs/example/eval
+```
+
+这是基础训练示例；C99 使用的搜索教师和训练参数可参考 `bridge/ops/hpc_c99.sh`。完整参数通过两个脚本各自的 `--help` 查看。
+
+AIsaac 是非官方研究项目，运行时需要自行提供游戏文件。
