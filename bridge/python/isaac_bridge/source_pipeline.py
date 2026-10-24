@@ -336,7 +336,9 @@ class SourcePipeline:
                     source_detached_frames=detached,
                     source_detached_total=self.horizon_detached['frames'],
                     source_horizon_dropped_grad=dropped,
-                    source_alloc_gib_max=max(allocated, default=0) / 2**30)
+                    source_alloc_gib_max=max(allocated, default=0) / 2**30,
+                    **({'source_worker_graph_frames': sum(m.get('graph_frames', 0) for m in self.remote_memory)}
+                       if self.processes else {}))
 
     def _collect_retired(self, *, wait):
         pending=[]

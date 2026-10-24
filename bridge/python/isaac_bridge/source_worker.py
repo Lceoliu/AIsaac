@@ -74,7 +74,7 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 local.chunks.extend([None]*max(0,cid+1-len(local.chunks)))
                 uids={key[0] for key in keys}
                 local.chunks[cid]=dict(worker=0,future=future,version=version,
-                                       uid=next(iter(uids)) if len(uids)==1 else None)
+                                       uid=next(iter(uids)) if len(uids)==1 else None,rows=len(keys))
                 for offset,key in enumerate(keys): local.frames[key]=(cid,offset)
                 reply=ipc_export({k:v for k,v in result.items() if k!='grads'})
                 exports['encode',cid]=reply
@@ -165,7 +165,8 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                           writes=sum(c is not None for c in local.writes),
                           frames=len(local.frames),versions=len(local.versions),
                           detached_chunks=sum(c is not None and bool(c.get('detached')) for c in local.chunks),
-                          detached_writes=sum(c is not None and bool(c.get('detached')) for c in local.writes))
+                          detached_writes=sum(c is not None and bool(c.get('detached')) for c in local.writes),
+                          graph_frames=sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')))
             if os.environ.get('ISAAC_SOURCE_COMPONENT_GRAPH_CACHE')=='1':
                 component_calls={}
                 for replicas in local.versions.values():
