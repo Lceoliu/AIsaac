@@ -26,6 +26,15 @@ def source_parameter(name):
         'room_type_emb.', 'gtok.norm.', 'reader.inp.', 'reader.writer.', 'reader.writer_norm.'))
 
 
+def _runs(values):
+    """Sorted integers as half-open runs [lo, hi)."""
+    out = []
+    for v in values:
+        if out and out[-1][1] == v: out[-1][1] = v + 1
+        else: out.append([v, v + 1])
+    return out
+
+
 class ImmutableSourceCast(torch.autograd.Function):
     """One immutable BF16 storage, a separate FP32 gradient edge per forward.
 
@@ -53,6 +62,7 @@ class SourcePipeline:
         self.horizon_dropped=None
         self.horizon_detached=dict(chunks=0,writes=0,frames=0,packets=0)
         self.origins={}   # branch uid -> RawHistory.origin: its ancestors' frames are keyed by them
+        self.released_misses=0   # rule 5: requests for frames with neither values nor bytes (an error)
         self.update_rollouts,self.rollouts_since_update=update_rollouts,0
         self.saved_gpu_gb = saved_gpu_gb
         self.saved_cpu_gb = saved_cpu_gb
@@ -648,16 +658,28 @@ class SourcePipeline:
             end = h.length + 1
             self.reused_rows += min(start, end)
             if end <= start: continue
-            at = 0
-            for rows, pend in h.blocks + h.tail:
-                stop = at + len(rows)
-                if stop > start:
-                    rr.append(rows[max(0, start-at):]); pp.append(pend[max(0, start-at):])
-                at = stop
+            # Only frames without a source entry need observation bytes; an
+            # ancestor's frames (a branch's prefix) are read from its values.
+            needed = [t for t in range(start, end - 1) if h.key(t) not in self.frames]
+            self.reused_rows += (end - 1 - start) - len(needed)
+            for lo, hi in _runs(needed):
+                at = 0
+                for rows, pend in h.blocks + h.tail:
+                    stop = at + len(rows)
+                    if stop > lo and at < hi:
+                        a, b = max(lo, at) - at, min(hi, stop) - at
+                        try:
+                            rr.append(rows[a:b]); pp.append(pend[a:b])
+                        except RuntimeError as error:   # rule 5: a released frame has no values either
+                            self.released_misses += 1
+                            raise RuntimeError(f'source frames {h.key(lo + 0)}..{hi - 1} of {uid} have neither values '
+                                               f'nor bytes ({self.released_misses} such requests)') from error
+                    at = stop
             current=np.frombuffer(row.tobytes(),dtype=row.dtype)
             rr.append(current); pp.append(np.array(pending).reshape(1, -1))
-            keys.extend(h.key(t) for t in range(start, end))
-            owners.extend((h.key(t//block*block)[0], t//block) for t in range(start, end))
+            frames = needed + [end - 1]
+            keys.extend(h.key(t) for t in frames)
+            owners.extend((h.key(t//block*block)[0], t//block) for t in frames)
         if keys:
             if not self.schedule(keys,list(zip(rr,pp)),stateless,speculative=speculative,owner_keys=owners):return False
         self.lengths.update((uid,h.length+1) for uid,(h,_,_) in latest.items()

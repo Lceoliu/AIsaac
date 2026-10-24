@@ -140,3 +140,39 @@ class RecordLedger:
 
     def v2_held(self, held):
         return int(self.v2_valid[:held].sum())
+
+
+# ---- rule 5: raw bytes of encoded, consumed frames ----------------------------
+def release_raw(limit, block, slot_lists=(), context_lists=(), context_dicts=()):
+    """Replace released blocks everywhere a process holds raw histories.
+
+    slot_lists: lists of RawHistory (ActorMemory.raw); context_lists: lists of
+    lists of prefixes (Rollout.raw_contexts); context_dicts: {key: RawHistory}.
+    limit(uid): frames of that owner whose bytes nothing will read again."""
+    from .rebuild_memory import released
+    memo = {}
+    for raw in slot_lists:
+        if raw is None: continue
+        for i, h in enumerate(raw): raw[i] = released(h, limit, block, memo)
+    for rows in context_lists:
+        if rows is None: continue
+        for row in rows:
+            for k, h in enumerate(row):
+                if h is not None: row[k] = released(h, limit, block, memo)
+    for table in context_dicts:
+        if table is None: continue
+        for key, h in list(table.items()):
+            if h is not None: table[key] = released(h, limit, block, memo)
+
+
+def lineage(slot_lists=(), context_dicts=()):
+    """Ancestor episodes of branches in flight (lanes, the choice-point bank,
+    contexts awaiting publication): the learner keeps their source values."""
+    out = set()
+    for raw in slot_lists:
+        for h in raw or ():
+            if h is not None and h.length: out.update(a for a, _ in h.origin)
+    for table in context_dicts:
+        for h in (table or {}).values():
+            if h is not None: out.update(a for a, _ in h.origin)
+    return out

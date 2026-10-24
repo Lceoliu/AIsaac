@@ -103,8 +103,14 @@ for t, rows in enumerate(seq):
         req = [(temporal['out']['raw_contexts'][0],rows[0],pending[t])]
         fresh = SourceBatch(actor,req,micro=5,cache=False)
         b = fresh.forward([0],need_vg=True)
-    for x,y in zip(a,b): torch.testing.assert_close(x,y,rtol=2e-4,atol=1e-5)
-print('PASS actor incremental / learner rebuild parity across rooms and parameter refresh')
+    if t < 10:   # same weights: the incremental actor equals a full learner rebuild
+        for x,y in zip(a,b): torch.testing.assert_close(x,y,rtol=2e-4,atol=1e-5)
+    else:
+        # Rule 5 / D1 (2026-10-24): after a weight change the eager actor, like the
+        # graph actor, keeps old source/Writer values and reprojects Reader K/V only
+        # (no raw replay), so it intentionally differs from a fresh current-weight rebuild.
+        assert all(torch.isfinite(x).all() for x in a)
+print('PASS actor incremental / learner rebuild parity across rooms (before the weight change); reprojection after it')
 state.copy_slot_(0,1)
 assert state.rebuild.raw[0].uid != state.rebuild.raw[1].uid
 state.reset_slot_(1)
@@ -124,13 +130,15 @@ for version in range(1, 8):
         assert encode.call_count == 0
     assert lag_state.rebuild.recent[0] is retained
 lagged.invalidate_source_cache()
-lag_state.rebuild.refresh(lagged, [0])
-strict_state = TemporalState(lagged, 1, 'cpu', torch.float32)
-strict_state.rebuild.raw[0] = h
-strict_state.rebuild.refresh(lagged, [0])
-torch.testing.assert_close(lag_state.rebuild.recent[0], strict_state.rebuild.recent[0])
-assert lag_state.rebuild.recent[0] is not retained
-print('PASS bounded refresh: versions 1..7 reuse history, version 8 rebuilds to the current-weight reference')
+with patch.object(lagged, 'encode_rebuild', wraps=lagged.encode_rebuild) as encode:
+    lag_state.rebuild.refresh(lagged, [0])
+    assert encode.call_count == 0, 'refresh replayed raw history (rule 5 / D1)'
+assert lag_state.rebuild.recent[0] is retained   # source values keep their version
+rd_ = lagged.reader
+rt_ = torch.arange(max(0, h.length - rd_.W), h.length)
+expect_ = torch.stack([layer.kv(retained + rd_.position(rt_, retained.dtype)) for layer in rd_.layers], 1)
+torch.testing.assert_close(lag_state.rebuild.recent_kv[0], expect_, rtol=0, atol=0)
+print('PASS bounded refresh: versions 1..7 reuse everything, version 8 reprojects Reader K/V only (no raw replay)')
 
 # Repeated inputs: use identical full components while retaining distinct frame
 # identities. Attribute/charge/item/map changes must invalidate the right source.
@@ -218,9 +226,14 @@ fake.v2_seen=np.zeros(1,np.int64);fake.stats=np.zeros((1,len(ST)))
 fake.stats[0,ST['v2_records']]=1
 selected=TokSampler.v2_records(fake,with_t=True)
 assert selected[-1][0].uid==fake.rebuild_contexts[ref].uid
+# Rule 5 / D1: the lane reads the bank slot's cached values (old source versions
+# from before the weight change at t=10), exactly as the actor's own eager step
+# from a copy of that slot does; a fresh current-weight rebuild intentionally differs.
+check=TemporalState(actor,1,'cpu',torch.float32)
+check.copy_slot_(torch.tensor([0]),torch.tensor([0]),state)
 with torch.no_grad():
-    teacher=SourceBatch(actor,[(selected[-1][0],selected[0][0],pending[-1])],cache=False)
-    expected=teacher.forward([0],need_vg=True)
+    t_check=check.step_inputs(actor,np.array([row]),np.asarray([pending[-1]]),np.array([0]))
+    expected=actor(to_batch(np.array([row]),np.asarray([pending[-1]]),'cpu'),temporal=t_check,need_vg=True)
 np.testing.assert_allclose(fake.lane_out[0,0],expected[1].item(),rtol=1e-4,atol=1e-5)
 print('PASS real CF lane service / selected teacher ring roundtrip carries raw branch prefix')
 

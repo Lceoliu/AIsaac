@@ -106,6 +106,54 @@ class RawHistory:
         return rows,np.concatenate([p for r,p in parts])
 
 
+RELEASE_COUNTS = dict(blocks=0, frames=0)
+
+
+class ReleasedRows:
+    """A released raw block (rule 5): its length and dtype, no bytes.
+
+    Encoded and consumed frames are read through their source values (u/M);
+    nothing may read their observation bytes again. Any such read raises."""
+    __slots__ = ('n', 'dtype', 'shape', '__weakref__')
+
+    def __init__(self, n, dtype, shape=None):
+        self.n, self.dtype, self.shape = n, dtype, shape or (n,)
+
+    def __len__(self):
+        return self.n
+
+    nbytes = 0
+
+    def _fail(self, *a, **k):
+        raise RuntimeError('raw frames were released after encoding; a reader asked for their bytes')
+
+    __getitem__ = view = reshape = tobytes = __array__ = _fail
+
+
+def released(h, limit, block, memo=None):
+    """h with every whole block whose frames one owner has sent / encoded below
+    limit(owner) replaced by ReleasedRows. Open tails and blocks mixing an
+    ancestor's and the branch's frames keep their bytes. memo: blocks tuples
+    already handled in this pass (prefixes of one episode share them)."""
+    if h is None or not h.blocks: return h
+    if memo is not None and id(h.blocks) in memo:
+        blocks = memo[id(h.blocks)][1]
+        return h if blocks is h.blocks else RawHistory(h.uid, blocks, h.tail, h.length, h.origin)
+    out, changed = [], False
+    for b, (rr, pp) in enumerate(h.blocks):
+        if not isinstance(rr, ReleasedRows):
+            lo, hi = b * block, b * block + len(rr) - 1
+            owner = h.key(lo)[0]
+            if owner == h.key(hi)[0] and hi < limit(owner):
+                out.append((ReleasedRows(len(rr), rr.dtype), ReleasedRows(len(pp), pp.dtype, pp.shape)))
+                changed = True; RELEASE_COUNTS['blocks'] += 1; RELEASE_COUNTS['frames'] += len(rr)
+                continue
+        out.append((rr, pp))
+    blocks = tuple(out) if changed else h.blocks
+    if memo is not None: memo[id(h.blocks)] = (h.blocks, blocks)   # (keeps the id valid for this pass)
+    return RawHistory(h.uid, blocks, h.tail, h.length, h.origin) if changed else h
+
+
 def share_prefix(h, donor, block):
     """h with the frames it shares with `donor` (a history holding the same
     owners' frames) referencing donor's arrays instead of its own copies.
@@ -187,7 +235,7 @@ def memory_account(role, step, groups, extra=None):
                 for arr in (r, p):
                     b = base(arr)
                     if id(b) not in seen_base:
-                        seen_base.add(id(b)); acc['raw_bytes'] += b.nbytes if isinstance(b, np.ndarray) else len(b)
+                        seen_base.add(id(b)); acc['raw_bytes'] += b.nbytes if isinstance(b, np.ndarray) else 0 if isinstance(b, ReleasedRows) else len(b)
         elif isinstance(x, np.ndarray):
             b = base(x)
             if id(b) not in seen_base:
@@ -235,7 +283,8 @@ def memory_account(role, step, groups, extra=None):
         except Exception as error:   # (an older runtime without host allocator statistics)
             host = dict(error=repr(error))
     print('MEMORY_ACCOUNT ' + json.dumps(dict(role=role, pid=os.getpid(), step=step, time=time.time(), proc=status,
-                                               torch_host=host, groups=out, census=object_census(),
+                                               torch_host=host, groups=out,
+                                               census=object_census() if os.environ.get('ISAAC_MEMORY_CENSUS', '1') == '1' else None,
                                                **(extra or {}))), flush=True)
 
 
@@ -260,7 +309,7 @@ def object_census():
                     for a in (r, p):
                         while isinstance(a, np.ndarray) and a.base is not None: a = a.base
                         if id(a) not in raw:
-                            raw.add(id(a)); raw_bytes += a.nbytes if isinstance(a, np.ndarray) else len(a)
+                            raw.add(id(a)); raw_bytes += a.nbytes if isinstance(a, np.ndarray) else 0 if isinstance(a, ReleasedRows) else len(a)
         elif name in ('dict', 'tuple', 'list'):
             other[name] = other.get(name, 0) + 1
     return dict(counts=counts, containers=other, raw_episodes=len(episodes), raw_bytes=raw_bytes,
@@ -378,15 +427,22 @@ def unpack_histories(packed, block, *, previous=None, rows=None, pending=None, l
             else:partial=h.tail[:tail]
             result.append((RawHistory(h.uid,h.blocks[:whole],partial,length,h.origin),*divmod(int(loc),refs.shape[1])))
         return result
-    templates = []
+    templates = {}
     for h in histories:
-        tails = []
-        for rr, pp in h.blocks:
-            rr.flags.writeable = pp.flags.writeable = False
-            tails.append(tuple((rr[i:i+1], pp[i:i+1]) for i in range(len(rr))))
-        for rr, pp in h.tail:
-            rr.flags.writeable = pp.flags.writeable = False
-        templates.append(tails + [h.tail])
+        for rr, pp in h.blocks + h.tail:
+            if not isinstance(rr, ReleasedRows): rr.flags.writeable = pp.flags.writeable = False
+
+    def template(index, whole):
+        # One block's rows as per-row views, built only for blocks a prefix
+        # ends inside (released blocks are never split: no decision ends there).
+        if (index, whole) not in templates:
+            h = histories[index]
+            if whole < len(h.blocks):
+                rr, pp = h.blocks[whole]
+                templates[index, whole] = tuple((rr[i:i+1], pp[i:i+1]) for i in range(len(rr)))
+            else:
+                templates[index, whole] = h.tail
+        return templates[index, whole]
     result = []
     prefixes = {}
     for row in refs:
@@ -399,7 +455,8 @@ def unpack_histories(packed, block, *, previous=None, rows=None, pending=None, l
             if key not in prefixes:
                 h = histories[index]
                 whole, tail = divmod(int(length), block)
-                prefixes[key] = RawHistory(h.uid, h.blocks[:whole], templates[index][whole][:tail], int(length), h.origin)
+                prefixes[key] = RawHistory(h.uid, h.blocks[:whole], template(index, whole)[:tail] if tail else (),
+                                           int(length), h.origin)
             out.append(prefixes[key])
         result.append(out)
     return result
@@ -1049,7 +1106,18 @@ class ActorMemory:
         stale = [int(s) for s in slots if self.generation[int(s)] != model.source_generation]
         for s in stale:
             h = self.raw[s]
-            if h.length:
+            if h.length and self.recent[s] is not None:
+                # Like TensorActorMemory.refresh (the graph actor): source and
+                # Writer values keep the version that encoded them; only the
+                # Reader's K/V projections follow the new weights. No raw replay
+                # (rule 5: encoded frames' bytes may be released).
+                rt=torch.arange(max(0,h.length-rd.W),h.length,device=dev)
+                mt=(torch.arange(h.length//rd.block,device=dev)+1).repeat_interleave(rd.tokens)*rd.block-1
+                u=self.recent[s]
+                self.recent_kv[s]=torch.stack([layer.kv(u+rd.position(rt,u.dtype)) for layer in rd.layers],1)
+                mem=self.mem[s] if self.mem[s] is not None else u.new_empty((0,rd.D))
+                self.memory_kv[s]=torch.stack([layer.kv(mem+rd.position(mt,mem.dtype)) for layer in rd.layers],1)
+            elif h.length:   # no values yet (a slot restored from bytes only): encode once from them
                 rows, pending = h.arrays()
                 values=[]
                 for at in range(0,len(rows),512):

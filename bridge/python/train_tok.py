@@ -1739,6 +1739,9 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--source-compile',type=int,choices=(0,1,2),default=0,
                    help='source compilation: 0 off, 1 Spatial stack, 2 tensor encoder after exact component dedup')
     p.add_argument('--source-flash',type=int,choices=(0,1),default=0,help='native CUDA BF16 varlen FlashAttention on source Spatial only')
+    p.add_argument('--release-raw', type=int, choices=(0, 1), default=1,
+                   help='rule 5: drop observation bytes of frames that are encoded and consumed (actors after the '
+                        'hand-off, the learner after its update); their source values stay readable; 0 keeps them')
     p.add_argument('--record-budget-gb', type=float, default=8.0,
                    help='teacher/v2 records: budget of their owned raw frames + source values; oldest v2 records '
                         'are evicted whole above it (record_bytes / record_evicted in progress.csv); 0 off')
@@ -2645,6 +2648,10 @@ def main(argv=None, child=None, actor=None):
             live_uids = {h.uid for h, _, _ in all_requests}
             live_uids.update(h.uid for h in L.get('v2_contexts', []) if h is not None)
             live_uids.update(h.uid for h in L.get('teach_contexts', []) if h is not None)
+            # Ancestors of branches still in flight in the actors keep their source values (rule 5, D2a).
+            L.setdefault('lineage', {})[job.get('aid', 0)] = set(job.get('lineage') or ())
+            in_flight = set().union(*L['lineage'].values())
+            live_uids.update(in_flight)
             if source_pipeline.prefetch_pressure:
                 # Backpressure, not another Adam clock: settle the already
                 # closed packet so dead graphs retire before required inputs.
@@ -2667,13 +2674,17 @@ def main(argv=None, child=None, actor=None):
                 frontier = {}
                 for h, _, _ in all_requests:
                     frontier[h.uid] = min(frontier.get(h.uid, h.length), h.length)
-                return ledger.frontier(frontier, L.get('teach_contexts'), L.get('v2_contexts'))
+                frontier = ledger.frontier(frontier, L.get('teach_contexts'), L.get('v2_contexts'))
+                for uid in in_flight: frontier.setdefault(uid, float('inf'))   # values only, no pending loss
+                return frontier
             if not retire_after_ready:source_pipeline.retain_histories(live_uids,frontiers=horizon_frontiers())
             # Source values are immutable across fast/slow weight updates. Build
             # the rollout's numerical bank once; only Reader graphs are renewed.
             with torch.inference_mode(False), torch.no_grad(), autocast():
                 resident_sources=SourceBatch(learner_model,all_requests,args.room_source_micro,
                                              cache=False,pipeline=source_pipeline)
+            encoded = L.setdefault('encoded_upto', {})   # rule 5: frames encoded (and waited for) per owner
+            for h, _, _ in all_requests: encoded[h.uid] = max(encoded.get(h.uid, 0), h.length + 1)
         value_now = every = prox = None
         vgs, vg_now, ret_g = [], None, None   # (B22) value_global at the update's start, its returns
         # 2026-10-14 (B24): the actor's stored value_global (Rollout.value_g) is used like the stored value: recomputed
@@ -2946,6 +2957,9 @@ def main(argv=None, child=None, actor=None):
                     with torch.inference_mode(False), torch.no_grad(), autocast():
                         v_sources = SourceBatch(learner_model, list(zip(v_contexts, v_rows, pend_v)),
                                                 args.room_source_micro, cache=False,pipeline=source_pipeline)
+                    if source_pipeline is not None:
+                        encoded = L.setdefault('encoded_upto', {})
+                        for h in v_contexts: encoded[h.uid] = max(encoded.get(h.uid, 0), h.length + 1)
                 lp_all, lp_mv, val_v = [], [], []
                 with torch.inference_mode():
                     for at in range(0, v2_new, 512):
@@ -4261,6 +4275,17 @@ def main(argv=None, child=None, actor=None):
                     if os.environ.get('ISAAC_HISTORY_PROFILE') and n_jobs in (4,12,24):
                         from isaac_bridge.rebuild_memory import profile_history_storage
                         profile_history_storage('learner')
+                    if args.rebuild_memory and args.release_raw and source_pipeline is not None:
+                        # rule 5: frames this update encoded and consumed need no bytes here
+                        from isaac_bridge.record_retention import release_raw
+                        encoded_ = L.get('encoded_upto', {})
+                        live_ = set(source_pipeline.lengths) | set().union(*L.get('lineage', {}).values())
+                        for u_ in [u_ for u_ in encoded_ if u_ not in live_]: del encoded_[u_]
+                        ledger_ = L.get('ledger')
+                        release_raw(lambda u_: encoded_.get(u_, 0), args.memory_block,
+                                    slot_lists=[L.get('v2_contexts')],
+                                    context_dicts=list(received_histories.values()) +
+                                                  ([ledger_.donors] if ledger_ is not None else []))
                     if os.environ.get('ISAAC_MEMORY_ACCOUNT') == '1':
                         from isaac_bridge.rebuild_memory import memory_account
                         sp_ = source_pipeline
@@ -4312,6 +4337,7 @@ def main(argv=None, child=None, actor=None):
     seq_n = 0   # (B38 step 5: this actor's hand-offs, the learner pairs the actors' halves by it)
     sent_histories={}
     L_actor_lanes = {}   # (ISAAC_MEMORY_ACCOUNT) weak references to the lane histories of the last hand-off
+    sent_max = {}   # rule 5: frames per episode the learner has received (kept while a branch still needs it)
     clean_end = False   # (B38 step 5: the actor loop ended by itself, no exception)
     b_last = None   # (B38 step 5, the first actor: set when the second has handed its last half)
     if actor is not None:   # B38 step 5: a second actor: the learner's queue, its own messages, event and stop
@@ -4759,6 +4785,22 @@ def main(argv=None, child=None, actor=None):
             if args.rebuild_memory and proc:
                 pack_start = time.perf_counter()
                 job['rscal']['raw_contexts'] = pack_histories(job['rscal']['raw_contexts'],previous=sent_histories,shared=True)
+                if args.release_raw:
+                    # rule 5: frames the learner has received need no bytes in this actor; ancestors of
+                    # branches in flight are reported so the learner keeps their source values (D2a)
+                    from isaac_bridge.record_retention import release_raw, lineage as lineage_of
+                    for u_, n_ in sent_histories.items(): sent_max[u_] = max(sent_max.get(u_, 0), n_)
+                    slots_ = [m_.raw for m_ in (getattr(t_state, 'rebuild', None),
+                              getattr(lane_tstate, 'rebuild', None) if lane_tstate is not None else None,
+                              getattr(bank_tstate, 'rebuild', None) if bank_tstate is not None else None) if m_ is not None]
+                    contexts_ = getattr(sampler, 'rebuild_contexts', None)
+                    records_ = job.get('v2')   # branch records in this hand-off: their ancestors too
+                    records_ = records_[-1] if records_ is not None and len(records_) and isinstance(records_[-1], list) else []
+                    branch_ = lineage_of(slot_lists=slots_[1:] + [records_], context_dicts=[contexts_])
+                    for u_ in [u_ for u_ in sent_max if u_ not in sent_histories and u_ not in branch_]: del sent_max[u_]
+                    release_raw(lambda u_: sent_max.get(u_, 0), args.memory_block, slot_lists=slots_,
+                                context_lists=[roll.raw_contexts, spare.raw_contexts], context_dicts=[contexts_])
+                    job['lineage'] = sorted(branch_)
                 if PROFILE_MEMORY:
                     print('MEMORY_IPC_PLAN ' + json.dumps(dict(aid=aid, seq=job['seq'], plan_s=time.perf_counter()-pack_start)), flush=True)
             if args.rebuild_memory and PROFILE_MEMORY and proc:
