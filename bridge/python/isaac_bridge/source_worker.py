@@ -130,6 +130,19 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                     from .rebuild_memory import trim_host_heap
                     trim_host_heap('source-'+str(device))
                 reply=None
+            elif command=='detach':
+                # Gradient horizon: settled graphs become their exported values.
+                # Later Writer blocks may still read u; nothing is backpropagated.
+                chunks,writes=payload
+                for cid in chunks:
+                    result=local.chunks[cid]['future'].result()
+                    result['u']=exports['encode',cid]['u'];result['y']=None
+                    local.chunks[cid]['detached']=result['_detached']=True
+                for wid in writes:
+                    result=local.writes[wid]['future'].result()
+                    result['mem']=exports['write',wid]['mem']
+                    local.writes[wid]['detached']=result['_detached']=True
+                reply=None
             elif command=='close':
                 local.chunks.clear();local.writes.clear();local.frames.clear();local.versions.clear()
                 gc.collect();connection.send(('ok',None,[],{}));return True
@@ -150,7 +163,9 @@ def source_worker(connection, model, device, options, vjp_connection=None):
             memory.update(chunks=sum(c is not None for c in local.chunks),
                           saved_cpu_bytes=sum(c['future'].result()['saved_cpu_bytes'] for c in local.chunks if c is not None),
                           writes=sum(c is not None for c in local.writes),
-                          frames=len(local.frames),versions=len(local.versions))
+                          frames=len(local.frames),versions=len(local.versions),
+                          detached_chunks=sum(c is not None and bool(c.get('detached')) for c in local.chunks),
+                          detached_writes=sum(c is not None and bool(c.get('detached')) for c in local.writes))
             if os.environ.get('ISAAC_SOURCE_COMPONENT_GRAPH_CACHE')=='1':
                 component_calls={}
                 for replicas in local.versions.values():

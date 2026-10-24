@@ -212,6 +212,7 @@ usage (from the bridge's python dir, PYTHONPATH=.):
 import argparse
 import collections
 import csv
+import itertools
 import json
 import math
 import os
@@ -1738,6 +1739,9 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--source-compile',type=int,choices=(0,1,2),default=0,
                    help='source compilation: 0 off, 1 Spatial stack, 2 tensor encoder after exact component dedup')
     p.add_argument('--source-flash',type=int,choices=(0,1),default=0,help='native CUDA BF16 varlen FlashAttention on source Spatial only')
+    p.add_argument('--memory-horizon', type=int, default=2048,
+                   help='source gradient horizon in decisions per episode: a loss reaches source frames/Writer blocks at '
+                        'most this many decisions older; older graphs become detached values (reads unchanged); 0 unbounded')
     p.add_argument('--source-update-steps', type=int, default=4,
                    help='Reader steps per source update; 0 accumulates the complete rollout and updates once at its end')
     p.add_argument('--source-overlap-rollout',type=int,choices=(0,1),default=0,
@@ -2520,9 +2524,10 @@ def main(argv=None, child=None, actor=None):
             compile_source=args.source_compile, flash_source=bool(args.source_flash),
             update_rollouts=args.source_update_rollouts, shared_devices=shared,
             actor_reserve_gb=args.source_actor_reserve_gb,processes=bool(args.source_processes),
-            defer_backward=bool(args.source_prefetch_records))
+            defer_backward=bool(args.source_prefetch_records),horizon=args.memory_horizon)
         print(f'[source] encoder/Writer={"bf16" if source_pipeline.amp else "fp32"}; '
-              f'Reader={"bf16" if amp else "fp32"}; master/optimizer=fp32; saved_8bit_block={args.source_saved_8bit}', flush=True)
+              f'Reader={"bf16" if amp else "fp32"}; master/optimizer=fp32; saved_8bit_block={args.source_saved_8bit}; '
+              f'gradient_horizon={args.memory_horizon or "unbounded"}', flush=True)
 
     def save(path):
         if source_pipeline is not None:
@@ -2643,7 +2648,15 @@ def main(argv=None, child=None, actor=None):
                 source_pipeline.poll_finish(opt,args.max_grad_norm,wait=True)
                 source_pipeline.prefetch_pressure=False
                 retire_after_ready=False
-            if not retire_after_ready:source_pipeline.retain_histories(live_uids)
+            def horizon_frontiers():
+                # Earliest decision any later loss can still use, per episode:
+                # this rollout's first decision; a stored teacher/v2 record's own.
+                frontier = {}
+                for h in itertools.chain((h for h, _, _ in all_requests), L.get('v2_contexts', []),
+                                         L.get('teach_contexts', [])):
+                    if h is not None: frontier[h.uid] = min(frontier.get(h.uid, h.length), h.length)
+                return frontier
+            if not retire_after_ready:source_pipeline.retain_histories(live_uids,frontiers=horizon_frontiers())
             # Source values are immutable across fast/slow weight updates. Build
             # the rollout's numerical bank once; only Reader graphs are renewed.
             with torch.inference_mode(False), torch.no_grad(), autocast():
@@ -3288,7 +3301,8 @@ def main(argv=None, child=None, actor=None):
                     if was_pending and source_pipeline.pending is None:
                         live_now = live_uids | {h.uid for h in L.get('v2_contexts', []) if h is not None}
                         live_now.update(h.uid for h in L.get('teach_contexts', []) if h is not None)
-                        source_pipeline.retain_histories(live_now,overlap=source_pipeline.defer_backward)
+                        source_pipeline.retain_histories(live_now,overlap=source_pipeline.defer_backward,
+                                                         frontiers=horizon_frontiers())
                 opt.zero_grad(set_to_none=True)
                 room_batch = None
                 if args.room_memory:
@@ -3368,7 +3382,7 @@ def main(argv=None, child=None, actor=None):
                     if retire_after_ready:
                         live_now=live_uids | {h.uid for h in L.get('v2_contexts',[]) if h is not None}
                         live_now.update(h.uid for h in L.get('teach_contexts',[]) if h is not None)
-                        source_pipeline.retain_histories(live_now,overlap=True)
+                        source_pipeline.retain_histories(live_now,overlap=True,frontiers=horizon_frontiers())
                         retire_after_ready=False
                     source_pipeline.dispatch_finish()
                     reader_host_start = time.perf_counter()
@@ -3951,6 +3965,8 @@ def main(argv=None, child=None, actor=None):
                         f'{name}/seconds': sum(e['decisions'] for e in eps) / m * args.frames_per_decision / 30,
                         f'{name}/rooms': sum(e['rooms'] for e in eps) / m,
                         f'{name}/boss': sum(e['boss'] for e in eps) / m})
+        if source_pipeline is not None:   # retained source graphs: bounded by the gradient horizon
+            row.update(source_pipeline.horizon_stats())
         if L['writer'] is None:
             columns = log_columns(list(row))
             L['writer'] = csv.DictWriter(log_file, fieldnames=columns, restval='')

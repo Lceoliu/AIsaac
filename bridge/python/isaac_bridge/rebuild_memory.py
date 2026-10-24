@@ -251,6 +251,62 @@ def unpack_histories(packed, block, *, previous=None, rows=None, pending=None, l
     return result
 
 
+class HorizonAttention(torch.autograd.Function):
+    """Grouped Reader attention whose source cotangents obey a per-pair mask.
+
+    Forward is the unmasked layer's exact op sequence (same values, same SDPA).
+    Backward recomputes P (no saved score matrix, no source replay). Query and
+    Reader K/V weights receive every visible pair's gradient; the source table
+    receives only pairs with grad_valid (decision-to-source age <= horizon).
+    kv must be the K/V projection of the detached source table; src/weight let
+    the masked K/V cotangent reach the sources through that projection.
+    """
+    @staticmethod
+    def forward(ctx, q, kv, src, weight, banks, valid, grad_valid, heads):
+        groups, d = banks.shape[0], q.shape[1]*q.shape[3]
+        bank = F.embedding(banks, kv).to(q.dtype).reshape(groups, banks.shape[1], 2, heads, d // heads)
+        k, v = bank[:, :, 0].transpose(1, 2), bank[:, :, 1].transpose(1, 2)
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=valid[:, None])
+        ctx.save_for_backward(q, kv, src, weight, banks, valid, grad_valid, a)
+        ctx.heads = heads
+        return a
+
+    @staticmethod
+    def backward(ctx, da):
+        q, kv, src, weight, banks, valid, grad_valid, a = ctx.saved_tensors
+        heads = ctx.heads
+        groups, _, count, dh = q.shape
+        n = banks.shape[1]
+        scale = dh ** -.5
+        dq = torch.empty(q.shape, dtype=torch.float32, device=q.device)
+        dbank = torch.empty((groups, n, 2, heads, dh), dtype=torch.float32, device=q.device)
+        dmask = torch.empty_like(dbank)
+        # Bound the transient score matrices; groups are independent banks.
+        step = max(1, 2**26 // max(1, heads*count*n))
+        for lo in range(0, groups, step):
+            hi = min(groups, lo+step)
+            bank = F.embedding(banks[lo:hi], kv).float().reshape(hi-lo, n, 2, heads, dh)
+            k, v = bank[:, :, 0].transpose(1, 2), bank[:, :, 1].transpose(1, 2)
+            qs, do, o = q[lo:hi].float(), da[lo:hi].float(), a[lo:hi].float()
+            s = (qs @ k.transpose(-1, -2)).mul_(scale).masked_fill_(~valid[lo:hi, None], float('-inf'))
+            p = torch.softmax(s, -1); del s
+            ds = (do @ v.transpose(-1, -2)).sub_((do*o).sum(-1, keepdim=True)).mul_(p)
+            dq[lo:hi] = (ds @ k).mul_(scale)
+            dbank[lo:hi, :, 0] = (ds.transpose(-1, -2) @ qs).mul_(scale).transpose(1, 2)
+            dbank[lo:hi, :, 1] = (p.transpose(-1, -2) @ do).transpose(1, 2)
+            g = grad_valid[lo:hi, None].to(p.dtype)
+            dmask[lo:hi, :, 0] = (ds.mul_(g).transpose(-1, -2) @ qs).mul_(scale).transpose(1, 2)
+            dmask[lo:hi, :, 1] = (p.mul_(g).transpose(-1, -2) @ do).transpose(1, 2)
+        flat = banks.reshape(-1)
+        dkv = dsrc = None
+        if ctx.needs_input_grad[1]:
+            dkv = torch.ops.aten.embedding_dense_backward(dbank.reshape(-1, 2*heads*dh), flat, kv.shape[0], -1, False)
+        if ctx.needs_input_grad[2]:
+            dmkv = torch.ops.aten.embedding_dense_backward(dmask.reshape(-1, 2*heads*dh), flat, kv.shape[0], -1, False)
+            dsrc = (dmkv @ weight.detach().float()).to(src.dtype)
+        return dq.to(q.dtype), dkv, dsrc, None, None, None, None, None
+
+
 class ReaderLayer(nn.Module):
     def __init__(self, width, heads):
         super().__init__()
@@ -277,9 +333,13 @@ class ReaderLayer(nn.Module):
             pos, banks = layout['positions'], layout['indices']
             q = projected.new_zeros((groups*count, d)).index_copy(0, pos, projected)
             q = q.reshape(groups, count, self.heads, d//self.heads).transpose(1, 2)
-            bank = F.embedding(banks, kv).to(q.dtype).reshape(groups, banks.shape[1], 2, self.heads, d//self.heads)
-            k, v = bank[:, :, 0].transpose(1, 2), bank[:, :, 1].transpose(1, 2)
-            a = F.scaled_dot_product_attention(q, k, v, attn_mask=layout['valid'][:, None])
+            if layout.get('src') is not None and torch.is_grad_enabled():
+                a = HorizonAttention.apply(q, kv, layout['src'], self.kv.weight, banks,
+                                           layout['valid'], layout['grad_valid'], self.heads)
+            else:
+                bank = F.embedding(banks, kv).to(q.dtype).reshape(groups, banks.shape[1], 2, self.heads, d//self.heads)
+                k, v = bank[:, :, 0].transpose(1, 2), bank[:, :, 1].transpose(1, 2)
+                a = F.scaled_dot_product_attention(q, k, v, attn_mask=layout['valid'][:, None])
             a = a.transpose(1, 2).reshape(groups*count, d).index_select(0, pos)
         x = query + self.out(a)
         return x + self.ff(self.ffnorm(x))
@@ -628,12 +688,16 @@ class SourceBatch:
                 mem = reader.write(self.u[self.block_indices]).flatten(0, 1) if len(self.block_indices) else self.u.new_empty((0, reader.D))
             self.mem = mem.detach().requires_grad_() if cache else mem
         src = self.sources()
+        horizon = pipeline.horizon if pipeline is not None else 0
+        # With a gradient horizon, K/V weights see every read; the masked source
+        # cotangent returns through HorizonAttention (identical K/V values).
+        self.kv_source = src if horizon else None
         with torch.no_grad() if cache else nullcontext(), torch.autocast(
                 dev.type, enabled=torch.is_autocast_enabled(dev.type),
                 dtype=torch.get_autocast_dtype(dev.type), cache_enabled=False):
             # Quantized forward values, FP32 consumer-gradient accumulation. A
             # BF16 leaf loses small contributions when hundreds of reads collide.
-            kvs = [layer.kv(src).float() for layer in reader.layers]
+            kvs = [layer.kv(src.detach() if horizon else src).float() for layer in reader.layers]
         self.kvs = [v.detach().requires_grad_() for v in kvs] if cache else kvs
         stamp = memory_part('source_writer_kv', stamp)
         if pipeline is not None:
@@ -698,7 +762,14 @@ class SourceBatch:
         mask=self.group_present.index_select(0,ids)[:,None] & (
             (banks==0)[:,None] | (recent & (bt<times) & (bt>=times-self.model.reader.W)) |
             (memory & (bt<(times//self.model.reader.block)*self.model.reader.block)))
-        return dict(shape=(ng,count),positions=pos,indices=banks,valid=mask),ix
+        layout=dict(shape=(ng,count),positions=pos,indices=banks,valid=mask)
+        horizon=self.pipeline.horizon
+        if horizon:
+            # Source age per (decision, entry): a frame's own time, a Writer
+            # block's first frame. Reads keep mask; gradients need age <= horizon.
+            start=torch.where(memory,bt-(self.model.reader.block-1),bt)
+            layout.update(src=self.kv_source,grad_valid=mask&((banks==0)[:,None]|(times-start<=horizon)))
+        return layout,ix
 
     def forward(self, indices, need_h=False, need_vg=False):
         if self.pipeline is not None: self.pipeline.check_version(self.source_version)
@@ -1016,7 +1087,9 @@ class SourceView(SourceBatch):
         refs,_,mrefs=parent.pipeline_refs
         self.pipeline_refs=refs,[refs[i] for i in self.unique_query],mrefs
         src=self.sources()
-        self.kvs=[layer.kv(src).float() for layer in self.model.reader.layers]
+        horizon=self.pipeline.horizon
+        self.kv_source=src if horizon else None
+        self.kvs=[layer.kv(src.detach() if horizon else src).float() for layer in self.model.reader.layers]
 
 
 class JoinedSources:

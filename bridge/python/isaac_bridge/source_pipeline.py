@@ -44,8 +44,14 @@ class ImmutableSourceCast(torch.autograd.Function):
 
 
 class SourcePipeline:
-    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False):
+    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0):
         self.model, self.period, self.micro, self.amp = model, period, micro, amp
+        # Gradient horizon in decisions (0: unbounded). Reads are unchanged; a
+        # decision's loss reaches only sources at most `horizon` decisions older.
+        # Graphs no future in-horizon decision can reach become detached values.
+        self.horizon=horizon
+        self.horizon_dropped=None
+        self.horizon_detached=dict(chunks=0,writes=0,frames=0,packets=0)
         self.update_rollouts,self.rollouts_since_update=update_rollouts,0
         self.saved_gpu_gb = saved_gpu_gb
         self.saved_cpu_gb = saved_cpu_gb
@@ -209,9 +215,12 @@ class SourcePipeline:
             self.versions[self.version] = self._replicas()
         return self.versions[self.version]
 
-    def retain_histories(self, uids, *, overlap=False):
+    def retain_histories(self, uids, *, overlap=False, frontiers=None):
         """Retire episodes no longer in the rollout/teacher working set, not
-        representations merely because an optimizer version has advanced."""
+        representations merely because an optimizer version has advanced.
+
+        frontiers: {uid: earliest decision index any future loss may use}. With
+        a horizon, live graphs no such decision can reach become detached values."""
         if self.pending is not None: return
         uids = set(uids).union(*self.prefetch_live.values())
         uids.update(h.uid for batch in self.collected.values() for h,_,_ in batch.requests)
@@ -241,7 +250,10 @@ class SourcePipeline:
         self.owners = {k: v for k, v in self.owners.items() if k[0] in uids}
         self.chunks = [c if i in live_chunks else None for i, c in enumerate(self.chunks)]
         self.writes = [c if i in live_writes else None for i, c in enumerate(self.writes)]
-        versions = {c['version'] for c in self.chunks + self.writes if c is not None}
+        if self.horizon and frontiers:
+            self._detach_horizon(frontiers, overlap)
+        # A detached value no longer needs its immutable weight snapshot.
+        versions = {c['version'] for c in self.chunks + self.writes if c is not None and not c.get('detached')}
         self.versions = {v: r for v, r in self.versions.items() if v in versions or v == self.version}
         if not self.processes:
             for replicas in self.versions.values():
@@ -252,6 +264,74 @@ class SourcePipeline:
                 keep=([i for i,c in enumerate(self.chunks) if c is not None and c['worker']==worker],
                       [i for i,c in enumerate(self.writes) if c is not None and c['worker']==worker],list(self.versions))
                 self.control_futures.append(executor.submit(self._remote,worker,'retire',keep))
+
+    def _detach_horizon(self, frontiers, overlap):
+        """Turn graphs outside every future decision's horizon into values.
+
+        A frame s is reachable by decision t iff t-s <= horizon; a Writer block
+        starting at frame b iff t-b <= horizon (all its frames are then inside).
+        Future decisions of an episode are >= frontiers[uid], so a chunk whose
+        last frame (a write whose last block start) is < frontier-horizon can
+        never receive another cotangent. Credit already accumulated by earlier
+        in-horizon decisions is settled first (same Adam interval, like retired
+        episodes); retain_graph=True because later graphs of the same episode
+        may share its component nodes. The values stay readable."""
+        limit = {uid: f - self.horizon for uid, f in frontiers.items()}
+        def old(c, field):
+            return (c is not None and not c.get('detached') and c.get('uid') in limit
+                    and c[field] < limit[c['uid']] and c['future'].done())
+        chunks = [i for i, c in enumerate(self.chunks) if old(c, 'last')]
+        writes = [i for i, c in enumerate(self.writes) if old(c, 'last_start')]
+        if not chunks and not writes: return
+        packets = []
+        for c in [self.chunks[i] for i in chunks] + [self.writes[i] for i in writes]:
+            result = c['future'].result()
+            if result['grads']:
+                packets.append((c, result['grads'])); result['grads'] = {}
+            c['detached'] = result['_detached'] = True
+        if packets:
+            futures = [w.submit(self._backward, i, packets, True, 'horizon_backward') for i, w in enumerate(self.workers)]
+            self.retired_pending.extend(futures)
+            self._collect_retired(wait=not (overlap and self.processes))
+        for worker, executor in enumerate(self.workers):
+            mine = ([i for i in chunks if self.chunks[i]['worker'] == worker],
+                    [i for i in writes if self.writes[i]['worker'] == worker])
+            if mine[0] or mine[1]:
+                self.control_futures.append(executor.submit(self._detach, worker, *mine))
+        self.horizon_detached['chunks'] += len(chunks); self.horizon_detached['writes'] += len(writes)
+        self.horizon_detached['frames'] += sum(self.chunks[i]['rows'] for i in chunks)
+        self.horizon_detached['packets'] += len(packets)
+
+    def _detach(self, worker, chunks, writes):
+        """Drop graph references after the worker's FIFO VJP; keep values."""
+        if self.processes:
+            return self._remote(worker, 'detach', (chunks, writes))
+        for i in chunks:
+            result = self.chunks[i]['future'].result()
+            result['u'] = result['u'].detach(); result['y'] = None
+        for i in writes:
+            result = self.writes[i]['future'].result()
+            result['mem'] = result['mem'].detach()
+
+    def horizon_stats(self):
+        """Learner-side accounting of retained source graphs (progress.csv)."""
+        per_uid = {}
+        graph = detached = 0
+        for c in self.chunks:
+            if c is None: continue
+            if c.get('detached'): detached += c['rows']; continue
+            graph += c['rows']
+            if c.get('uid') is not None: per_uid[c['uid']] = per_uid.get(c['uid'], 0) + c['rows']
+        dropped = 0. if self.horizon_dropped is None else float(self.horizon_dropped)
+        allocated = [m['allocated'] for m in self.remote_memory] if self.processes else [
+            torch.cuda.memory_allocated(d) if d.type == 'cuda' else 0 for d in self.devices]
+        return dict(source_horizon=self.horizon, source_graph_frames=graph,
+                    source_graph_frames_uid_max=max(per_uid.values(), default=0),
+                    source_graph_writes=sum(c is not None and not c.get('detached') for c in self.writes),
+                    source_detached_frames=detached,
+                    source_detached_total=self.horizon_detached['frames'],
+                    source_horizon_dropped_grad=dropped,
+                    source_alloc_gib_max=max(allocated, default=0) / 2**30)
 
     def _collect_retired(self, *, wait):
         pending=[]
@@ -517,7 +597,8 @@ class SourcePipeline:
                 cid = len(self.chunks)
                 future = self.workers[worker].submit(self._encode, worker, selected, self.version,cid,[keys[i] for i in ix])
                 chunk = dict(worker=worker, future=future, version=self.version, uid=uid,
-                             cost=int(costs[ix].sum()),remote_kind='encode',remote_id=cid)
+                             cost=int(costs[ix].sum()),remote_kind='encode',remote_id=cid,
+                             rows=len(ix),last=max(keys[i][1] for i in ix))
                 self.chunks.append(chunk)
                 for offset, i in enumerate(ix): self.frames[keys[i]] = (cid, offset)
                 self.encoded_rows += len(ix)
@@ -564,7 +645,8 @@ class SourcePipeline:
             self.replicas
             wid = len(self.writes)
             future = self.workers[worker].submit(self._write, worker, keys, self.version,wid)
-            self.writes.append(dict(worker=worker, future=future, version=self.version, uid=uid,remote_kind='write',remote_id=wid))
+            self.writes.append(dict(worker=worker, future=future, version=self.version, uid=uid,remote_kind='write',remote_id=wid,
+                                    last_start=max(block[0][1] for block in keys)))
             for offset,key in enumerate(keys): self.blocks[key] = (wid,offset)
             self.written_blocks += len(keys)
 
@@ -628,6 +710,7 @@ class SourcePipeline:
     def _gather_queries(self, refs):
         grouped={}
         for c,i in refs:grouped.setdefault(c,[]).append(i)
+        assert not any(self.chunks[c].get('detached') for c in grouped), 'query of a detached frame'
         width=max(self.chunks[c]['future'].result()['counts'][indices].max() for c,indices in grouped.items())
         first = self.chunks[refs[0][0]]['future'].result()['y']
         plan=self._credit_plan(refs,self.chunks,'y',width)
@@ -644,6 +727,7 @@ class SourcePipeline:
     def _credit_queries(self, refs, gradient):
         if gradient is None: return
         for result, source, target in self._query_tokens(refs, gradient.shape[1]):
+            assert not result.get('_detached'), 'query of a detached frame'
             value = result['y']
             if 'y' not in result['grads']: result['grads']['y'] = torch.zeros_like(value, dtype=torch.float32)
             part = gradient.flatten(0, 1).index_select(0, torch.as_tensor(target, device=gradient.device))
@@ -716,10 +800,19 @@ class SourcePipeline:
             packed = gradient.index_select(0, take).to(device, non_blocking=True)
             at = 0
             for result, put in parts:
+                if result.get('_detached'):
+                    # Outside every reader's horizon: masked to exact zeros.
+                    self._drop(packed[at:at+len(put)]); at += len(put)
+                    continue
                 if field not in result['grads']:
                     result['grads'][field] = torch.zeros_like(result[field], dtype=torch.float32)
                 result['grads'][field].index_add_(0, put, packed[at:at+len(put)])
                 at += len(put)
+
+    def _drop(self, gradient):
+        # Audit, not a correction: progress.csv must report exactly zero.
+        total = gradient.detach().abs().sum().to(self.device, dtype=torch.float64)
+        self.horizon_dropped = total if self.horizon_dropped is None else self.horizon_dropped + total
 
     @torch.no_grad()
     def _credit(self, refs, chunks, field, gradient):
@@ -728,9 +821,11 @@ class SourcePipeline:
         for src, (cid, offset) in enumerate(refs): grouped.setdefault(cid, []).append((src, offset))
         for cid, entries in grouped.items():
             result = chunks[cid]['future'].result()
+            take = torch.as_tensor([i for i, _ in entries], device=gradient.device)
+            if result.get('_detached'):
+                self._drop(gradient.index_select(0, take)); continue
             value = result[field]
             if field not in result['grads']: result['grads'][field] = torch.zeros_like(value, dtype=torch.float32)
-            take = torch.as_tensor([i for i, _ in entries], device=gradient.device)
             part = gradient.index_select(0, take).to(value.device, non_blocking=True)
             result['grads'][field].index_add_(0, torch.as_tensor([i for _, i in entries], device=value.device), part)
 
@@ -772,7 +867,7 @@ class SourcePipeline:
         optimizer.step()
         self.steps += 1; self.fast_steps += 1
 
-    def _backward(self, worker, packets, retain_graph=True):
+    def _backward(self, worker, packets, retain_graph=True, kind=None):
         if self.processes:
             selected=[(c['remote_kind'],c['remote_id'],g) for c,g in packets if c['worker']==worker]
             if self.devices[worker].type=='cuda':torch.cuda.current_stream(self.devices[worker]).synchronize()
@@ -812,7 +907,7 @@ class SourcePipeline:
             if device.type == 'cuda' and not self.ipc_async: torch.cuda.current_stream(device).synchronize()
             grads={n:shared[n] for n in self.names if n in used}
             for replicas in self.versions.values():replicas[worker].zero_grad(set_to_none=True)
-        self.events.append(dict(kind='source_backward' if retain_graph else 'retired_backward', device=str(device), version=self.version,
+        self.events.append(dict(kind=kind or ('source_backward' if retain_graph else 'retired_backward'), device=str(device), version=self.version,
                                 gradient_buffer_bytes=sum(g.numel()*g.element_size() for g in shared.values()),
                                 serviced_forward_calls=served,forward_service_seconds=service_seconds,
                                 start=started, end=time.perf_counter()))
