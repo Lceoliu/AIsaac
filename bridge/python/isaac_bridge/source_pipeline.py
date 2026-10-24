@@ -280,8 +280,13 @@ class SourcePipeline:
         def old(c, field):
             return (c is not None and not c.get('detached') and c.get('uid') in limit
                     and c[field] < limit[c['uid']] and c['future'].done())
-        chunks = [i for i, c in enumerate(self.chunks) if old(c, 'last')]
         writes = [i for i, c in enumerate(self.writes) if old(c, 'last_start')]
+        # A Writer graph still inside the horizon also holds the encoder graphs
+        # of all its frames. Such chunks stay graphs until that write detaches.
+        leaving = set(writes)
+        pinned = set().union(*(c['chunks'] for i, c in enumerate(self.writes)
+                               if c is not None and not c.get('detached') and i not in leaving))
+        chunks = [i for i, c in enumerate(self.chunks) if old(c, 'last') and i not in pinned]
         if not chunks and not writes: return
         packets = []
         for c in [self.chunks[i] for i in chunks] + [self.writes[i] for i in writes]:
@@ -646,7 +651,8 @@ class SourcePipeline:
             wid = len(self.writes)
             future = self.workers[worker].submit(self._write, worker, keys, self.version,wid)
             self.writes.append(dict(worker=worker, future=future, version=self.version, uid=uid,remote_kind='write',remote_id=wid,
-                                    last_start=max(block[0][1] for block in keys)))
+                                    last_start=max(block[0][1] for block in keys),
+                                    chunks={self.frames[key][0] for block in keys for key in block}))
             for offset,key in enumerate(keys): self.blocks[key] = (wid,offset)
             self.written_blocks += len(keys)
 
