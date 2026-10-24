@@ -4232,6 +4232,20 @@ def main(argv=None, child=None, actor=None):
                     if os.environ.get('ISAAC_HISTORY_PROFILE') and n_jobs in (4,12,24):
                         from isaac_bridge.rebuild_memory import profile_history_storage
                         profile_history_storage('learner')
+                    if os.environ.get('ISAAC_MEMORY_ACCOUNT') == '1':
+                        from isaac_bridge.rebuild_memory import memory_account
+                        sp_ = source_pipeline
+                        memory_account('learner', L['update'], dict(
+                            received_histories=received_histories, learner_state=L, deferred_jobs=deferred_jobs,
+                            source_chunks=sp_.chunks if sp_ is not None else None,
+                            source_writes=sp_.writes if sp_ is not None else None,
+                            source_collected=sp_.collected if sp_ is not None else None),
+                            extra=dict(source_frames=len(sp_.frames) if sp_ is not None else 0,
+                                       source_blocks=len(sp_.blocks) if sp_ is not None else 0,
+                                       source_live_frames=sum(sp_.lengths.values()) if sp_ is not None else 0,
+                                       source_live_episodes=len(sp_.lengths) if sp_ is not None else 0,
+                                       source_prefetch_live=sum(len(v) for v in sp_.prefetch_live.values()) if sp_ is not None else 0,
+                                       source_remote=sp_.remote_memory if sp_ is not None else None))
                     trim_interval=int(os.environ.get('ISAAC_HOST_TRIM_INTERVAL','0'))
                     if trim_interval and n_jobs%trim_interval==0:
                         from isaac_bridge.rebuild_memory import trim_host_heap
@@ -4727,6 +4741,11 @@ def main(argv=None, child=None, actor=None):
             if os.environ.get('ISAAC_HISTORY_PROFILE') and seq_n in (4,12,24):
                 from isaac_bridge.rebuild_memory import profile_history_storage
                 profile_history_storage('actor'+str(aid))
+            if os.environ.get('ISAAC_MEMORY_ACCOUNT') == '1':
+                from isaac_bridge.rebuild_memory import memory_account
+                memory_account('actor'+str(aid), seq_n, dict(
+                    job=job, rollout_a=roll, rollout_b=spare, sent_histories=sent_histories,
+                    actor_memory=getattr(t_state, 'rebuild', None) if t_state is not None else None))
             trim_interval=int(os.environ.get('ISAAC_HOST_TRIM_INTERVAL','0'))
             if trim_interval and seq_n%trim_interval==0:
                 from isaac_bridge.rebuild_memory import trim_host_heap

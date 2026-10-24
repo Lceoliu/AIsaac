@@ -113,6 +113,82 @@ def profile_history_storage(role):
           rss_after_gc=after_gc,unreachable=unreachable,rss_after=after)),flush=True)
 
 
+def memory_account(role, step, groups, extra=None):
+    """Opt-in (ISAAC_MEMORY_ACCOUNT=1) host-memory audit: one MEMORY_ACCOUNT line.
+
+    Walks the named containers (dicts/lists/tuples/objects, bounded depth) and
+    sums distinct numpy bases, CPU tensor storages (pinned separately) and the
+    raw-history arrays of every RawHistory; frames = sum over episodes of the
+    longest prefix seen. Shared arrays are counted once across all groups.
+    No tracemalloc, no gc scan; RSS comes from /proc/self/status."""
+    import json
+    seen_obj, seen_base = set(), set()
+    out = {}
+
+    def base(a):
+        while isinstance(a, np.ndarray) and a.base is not None: a = a.base
+        return a
+
+    def walk(x, acc, depth):
+        if id(x) in seen_obj or depth > 6: return
+        seen_obj.add(id(x))
+        if isinstance(x, RawHistory):
+            acc['episodes'][x.uid] = max(acc['episodes'].get(x.uid, 0), x.length)
+            for r, p in x.blocks + x.tail:
+                for arr in (r, p):
+                    b = base(arr)
+                    if id(b) not in seen_base:
+                        seen_base.add(id(b)); acc['raw_bytes'] += b.nbytes if isinstance(b, np.ndarray) else len(b)
+        elif isinstance(x, np.ndarray):
+            b = base(x)
+            if id(b) not in seen_base:
+                seen_base.add(id(b))
+                acc['numpy_bytes'] += b.nbytes if isinstance(b, np.ndarray) else len(b)
+                if x.dtype == object:
+                    for v in x.reshape(-1): walk(v, acc, depth + 1)
+        elif torch.is_tensor(x):
+            if x.device.type == 'cpu':
+                s = x.untyped_storage()
+                if s.data_ptr() not in seen_base:
+                    seen_base.add(s.data_ptr())
+                    acc['pinned_bytes' if x.is_pinned() else 'cpu_tensor_bytes'] += s.nbytes()
+        elif isinstance(x, dict):
+            acc['container_bytes'] += sys.getsizeof(x)
+            for k, v in x.items(): walk(k, acc, depth + 1); walk(v, acc, depth + 1)
+        elif isinstance(x, (list, tuple, set, frozenset, collections_deque)):
+            acc['container_bytes'] += sys.getsizeof(x)
+            for v in x: walk(v, acc, depth + 1)
+        elif isinstance(x, (bytes, bytearray, memoryview)):
+            acc['bytes_objects'] += len(x)
+        elif hasattr(x, '__dict__') and not isinstance(x, (type, torch.nn.Module)) and not callable(x):
+            walk(vars(x), acc, depth + 1)
+
+    import sys
+    from collections import deque as collections_deque
+    for name, value in groups.items():
+        acc = dict(raw_bytes=0, numpy_bytes=0, cpu_tensor_bytes=0, pinned_bytes=0, container_bytes=0,
+                   bytes_objects=0, episodes={})
+        walk(value, acc, 0)
+        acc['frames'] = sum(acc['episodes'].values()); acc['episodes'] = len(acc['episodes'])
+        out[name] = acc
+    status = {}
+    try:
+        for line in open('/proc/self/status'):
+            key = line.split(':')[0]
+            if key in ('VmRSS', 'RssAnon', 'RssFile', 'RssShmem'): status[key] = int(line.split()[1]) * 1024
+    except OSError:
+        pass
+    host = {}
+    if torch.cuda.is_available() and hasattr(torch.cuda, 'host_memory_stats'):
+        try:
+            stats = torch.cuda.host_memory_stats()
+            host = {k: v for k, v in stats.items() if 'allocated_bytes' in k or 'reserved_bytes' in k}
+        except Exception as error:   # (an older runtime without host allocator statistics)
+            host = dict(error=repr(error))
+    print('MEMORY_ACCOUNT ' + json.dumps(dict(role=role, pid=os.getpid(), step=step, time=time.time(), proc=status,
+                                               torch_host=host, groups=out, **(extra or {}))), flush=True)
+
+
 def trim_host_heap(role):
     """Return already-freed glibc arenas; no live history or activation is dropped."""
     import ctypes
