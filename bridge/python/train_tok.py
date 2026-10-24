@@ -1739,6 +1739,9 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--source-compile',type=int,choices=(0,1,2),default=0,
                    help='source compilation: 0 off, 1 Spatial stack, 2 tensor encoder after exact component dedup')
     p.add_argument('--source-flash',type=int,choices=(0,1),default=0,help='native CUDA BF16 varlen FlashAttention on source Spatial only')
+    p.add_argument('--record-budget-gb', type=float, default=8.0,
+                   help='teacher/v2 records: budget of their owned raw frames + source values; oldest v2 records '
+                        'are evicted whole above it (record_bytes / record_evicted in progress.csv); 0 off')
     p.add_argument('--memory-horizon', type=int, default=2048,
                    help='source gradient horizon in decisions per episode: a loss reaches source frames/Writer blocks at '
                         'most this many decisions older; older graphs become detached values (reads unchanged); 0 unbounded')
@@ -2648,14 +2651,23 @@ def main(argv=None, child=None, actor=None):
                 source_pipeline.poll_finish(opt,args.max_grad_norm,wait=True)
                 source_pipeline.prefetch_pressure=False
                 retire_after_ready=False
+            if 'ledger' not in L:
+                from isaac_bridge.record_retention import RecordLedger
+                L['ledger'] = RecordLedger(args.teach_buffer, args.teacher_v2_buffer, args.record_budget_gb * 2**30
+                                           if args.record_budget_gb else float('inf'), ROW_BYTES, args.memory_block)
+            ledger = L['ledger']
+            ledger.on_rollout(h for h, _, _ in all_requests)
+            ledger.prune(itertools.chain((h for h, _, _ in all_requests), L.get('v2_contexts', []),
+                                         L.get('teach_contexts', [])))
+
             def horizon_frontiers():
                 # Earliest decision any later loss can still use, per episode:
-                # this rollout's first decision; a stored teacher/v2 record's own.
+                # this rollout's first decision; a stored teacher/v2 record's own
+                # (and its ancestors') until the update that consumed its loss.
                 frontier = {}
-                for h in itertools.chain((h for h, _, _ in all_requests), L.get('v2_contexts', []),
-                                         L.get('teach_contexts', [])):
-                    if h is not None: frontier[h.uid] = min(frontier.get(h.uid, h.length), h.length)
-                return frontier
+                for h, _, _ in all_requests:
+                    frontier[h.uid] = min(frontier.get(h.uid, h.length), h.length)
+                return ledger.frontier(frontier, L.get('teach_contexts'), L.get('v2_contexts'))
             if not retire_after_ready:source_pipeline.retain_histories(live_uids,frontiers=horizon_frontiers())
             # Source values are immutable across fast/slow weight updates. Build
             # the rollout's numerical bank once; only Reader graphs are renewed.
@@ -2877,6 +2889,7 @@ def main(argv=None, child=None, actor=None):
                 if args.rebuild_memory:
                     if 'teach_contexts' not in L: L['teach_contexts']=[None]*args.teach_buffer
                     for slot in at_: L['teach_contexts'][slot]=RawHistory.empty()
+                    if 'ledger' in L: L['ledger'].admit_teacher(at_)
                     if source_pipeline is not None and args.teach_merge:
                         # Queue all newly admitted teacher sources before the
                         # closed VJP packet. Sampling a different teacher in a
@@ -2928,6 +2941,8 @@ def main(argv=None, child=None, actor=None):
                     v_has = v_has & v_valid
                 v_sources = None
                 if args.rebuild_memory:
+                    if 'ledger' in L:   # pickled prefix copies -> references to the holders' arrays
+                        v_contexts = L['ledger'].share(v_contexts)
                     with torch.inference_mode(False), torch.no_grad(), autocast():
                         v_sources = SourceBatch(learner_model, list(zip(v_contexts, v_rows, pend_v)),
                                                 args.room_source_micro, cache=False,pipeline=source_pipeline)
@@ -3008,6 +3023,7 @@ def main(argv=None, child=None, actor=None):
                         L['v2_contexts'][at_] = v_contexts[i_]
                     L['v2_host_rows'][at_v] = v_rows
                     L['v2_host_pending'][at_v] = pend_v
+                    if 'ledger' in L: L['ledger'].admit_v2(at_v)
                 at_d = torch.from_numpy(at_v).to(device)
                 if t_on:
                     if v_ts is not None:
@@ -3325,6 +3341,7 @@ def main(argv=None, child=None, actor=None):
                     # the teacher's records of this step (drawn here, before the PPO parts: the same draws as when
                     # they were drawn after them, nothing else uses numpy's generator)
                     pick = np.random.randint(0, teach_n, teach_step)
+                    if 'ledger' in L: L['ledger'].picked(teach=pick)
                     if fast:   # B18: from the meta's copy on the device (no blocking copy)
                         pick_d = dev(pick)
                         meta = t_meta.index_select(0, pick_d)
@@ -3341,8 +3358,10 @@ def main(argv=None, child=None, actor=None):
                         tb = to_batch(teach_rows[pick], teach_pending(teach_meta[pick]), device)
                     sec('teach_build')
                 vb = None   # 2026-10-10 (teacher v2): this step's imitation records (drawn with their own generator)
-                if v2_step >= 8 and v2_on and L['v2_n'] >= 256:
-                    vpick = v2_rng.integers(0, L['v2_n'], v2_step)
+                if v2_step >= 8 and v2_on and (L['ledger'].v2_held(L['v2_n']) if 'ledger' in L else L['v2_n']) >= 256:
+                    vpick = (L['ledger'].sample_v2(v2_rng, L['v2_n'], v2_step) if 'ledger' in L else
+                             v2_rng.integers(0, L['v2_n'], v2_step))
+                    if 'ledger' in L: L['ledger'].picked(v2=vpick)
                     vpick_d = dev(vpick)
                     v_pend, v_act = L['v2_pend'].index_select(0, vpick_d), L['v2_act'].index_select(0, vpick_d)
                     v_w, v_G = L['v2_w'].index_select(0, vpick_d), L['v2_G'].index_select(0, vpick_d)
@@ -3373,7 +3392,10 @@ def main(argv=None, child=None, actor=None):
                             if len(requests)>teacher_start:
                                 extra_sources=SourceBatch(learner_model,requests[teacher_start:],
                                                           args.room_source_micro,cache=False,pipeline=source_pipeline,
-                                                          stateless={h.uid for h,_,_ in requests[teacher_start:v2_start]})
+                                                          stateless={h.uid for h,_,_ in requests[teacher_start:v2_start]},
+                                                          frozen=L['ledger'].frozen(
+                                                              teach=pick if v2_start > teacher_start else None,
+                                                              v2=vpick if vb is not None else None) if 'ledger' in L else ())
                                 source_batch=JoinedSources(source_batch,extra_sources)
                         else:
                             source_batch = SourceBatch(learner_model, requests, args.room_source_micro,
@@ -3654,6 +3676,10 @@ def main(argv=None, child=None, actor=None):
                     source_pipeline.events.append(dict(kind='reader_submit', device='host',
                         start=reader_host_start, end=time.perf_counter()))
         if source_pipeline is not None:
+            if 'ledger' in L:   # this update's losses are consumed; the budget holds over the rings
+                L['ledger'].end_update()
+                if 'v2_contexts' in L:
+                    L['ledger'].enforce(L['v2_contexts'], L['teach_n'], source_pipeline.value_bytes_per_frame())
             if source_pipeline.period==0:
                 source_pipeline.finish_rollout(opt,args.max_grad_norm,overlap=bool(args.source_overlap_rollout))
             else:
@@ -3967,6 +3993,9 @@ def main(argv=None, child=None, actor=None):
                         f'{name}/boss': sum(e['boss'] for e in eps) / m})
         if source_pipeline is not None:   # retained source graphs: bounded by the gradient horizon
             row.update(source_pipeline.horizon_stats())
+            row.update(dict(record_bytes=0, record_raw_bytes=0, record_value_bytes=0, record_own_frames=0,
+                            record_v2_episodes=0, record_v2_live=0, record_evicted=0, record_shared_frames=0,
+                            record_v2_consumed=0, record_teach_consumed=0), **L['ledger'].last if 'ledger' in L else {})
         if L['writer'] is None:
             columns = log_columns(list(row))
             L['writer'] = csv.DictWriter(log_file, fieldnames=columns, restval='')

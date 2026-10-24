@@ -58,10 +58,24 @@ class RawHistory:
     blocks: tuple = ()
     tail: tuple = ()
     length: int = 0
+    # Lineage of a fork, nearest first: ((parent uid, frames shared), ...).
+    # Frame t < shared belongs to that ancestor: sources key it by the
+    # ancestor (one encoding, one graph), never by the branch.
+    origin: tuple = ()
 
     @classmethod
     def empty(cls):
         return cls((os.getpid(), next(_episodes)))
+
+    def key(self, t):
+        """The source key of frame t: (owning episode, t)."""
+        for uid, shared in reversed(self.origin):   # farthest ancestor shares the fewest frames
+            if t < shared: return uid, t
+        return self.uid, t
+
+    def own_start(self):
+        """First frame this episode owns (the frames before it are an ancestor's)."""
+        return self.origin[0][1] if self.origin else 0
 
     def append(self, row, pending, block):
         # Keep one row's bytes, not a view that lets a long-lived episode pin
@@ -80,15 +94,50 @@ class RawHistory:
             pp = np.concatenate([v[1] for v in tail])
             rr.flags.writeable = pp.flags.writeable = False
             blocks, tail = blocks + ((rr, pp),), ()
-        return RawHistory(self.uid, blocks, tail, self.length + 1)
+        return RawHistory(self.uid, blocks, tail, self.length + 1, self.origin)
 
     def fork(self):
-        return RawHistory((os.getpid(), next(_episodes)), self.blocks, self.tail, self.length)
+        return RawHistory((os.getpid(), next(_episodes)), self.blocks, self.tail, self.length,
+                          ((self.uid, self.length),) + self.origin)
 
     def arrays(self):
         parts = self.blocks + self.tail
         rows=np.concatenate([r.view(np.uint8).reshape(len(r),-1) for r,p in parts]).view(parts[0][0].dtype).reshape(-1)
         return rows,np.concatenate([p for r,p in parts])
+
+
+def share_prefix(h, donor, block):
+    """h with the frames it shares with `donor` (a history holding the same
+    owners' frames) referencing donor's arrays instead of its own copies.
+
+    A branch record crossing a process boundary arrives with a pickled copy of
+    its whole prefix. Rows are byte-identical, so only storage changes: whole
+    shared blocks and the shared rows of a still-open tail block. A block that
+    mixes ancestor and own rows stays the record's (at most block-1 rows)."""
+    if donor is None: return h, 0
+    # Leading frames with the same source key are the same owner's frames
+    # (an ancestor's, or this episode's own frames held by an earlier record).
+    limit = min(h.length, donor.length)
+    bounds = sorted({0, limit} | {n for _, n in h.origin + donor.origin if n < limit})
+    shared = 0
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        if h.key(lo) != donor.key(lo) or h.key(hi - 1) != donor.key(hi - 1): break
+        shared = hi
+    if shared == 0: return h, 0
+    whole = min(shared // block, len(h.blocks), len(donor.blocks))
+    blocks = donor.blocks[:whole] + h.blocks[whole:]
+    tail = h.tail
+    referenced = whole * block
+    if whole == len(h.blocks) and shared > whole * block:   # the record's open block holds shared rows
+        n = min(shared - whole * block, len(tail))
+        if whole < len(donor.blocks):
+            rr, pp = donor.blocks[whole]
+            rows = tuple((rr[i:i + 1], pp[i:i + 1]) for i in range(n))
+        else:
+            rows = donor.tail[:n] if len(donor.tail) >= n else None
+        if rows is not None:
+            tail = rows + tail[n:]; referenced += n
+    return RawHistory(h.uid, blocks, tail, h.length, h.origin), referenced
 
 
 def profile_history_storage(role):
@@ -275,7 +324,7 @@ def unpack_histories(packed, block, *, previous=None, rows=None, pending=None, l
                 rr.flags.writeable=pp.flags.writeable=False
                 full=len(rr)//block*block
                 h=RawHistory(uid,prior.blocks+tuple((rr[i:i+block],pp[i:i+block]) for i in range(0,full,block)),
-                             tuple((rr[i:i+1],pp[i:i+1]) for i in range(full,len(rr))),end)
+                             tuple((rr[i:i+1],pp[i:i+1]) for i in range(full,len(rr))),end,prior.origin)
             else:h=prior
             histories.append(h);live[uid]=h
         previous.clear();previous.update(live)
@@ -298,7 +347,7 @@ def unpack_histories(packed, block, *, previous=None, rows=None, pending=None, l
                 rr,pp=h.blocks[whole]
                 partial=tuple((rr[i:i+1],pp[i:i+1]) for i in range(tail))
             else:partial=h.tail[:tail]
-            result.append((RawHistory(h.uid,h.blocks[:whole],partial,length),*divmod(int(loc),refs.shape[1])))
+            result.append((RawHistory(h.uid,h.blocks[:whole],partial,length,h.origin),*divmod(int(loc),refs.shape[1])))
         return result
     templates = []
     for h in histories:
@@ -321,7 +370,7 @@ def unpack_histories(packed, block, *, previous=None, rows=None, pending=None, l
             if key not in prefixes:
                 h = histories[index]
                 whole, tail = divmod(int(length), block)
-                prefixes[key] = RawHistory(h.uid, h.blocks[:whole], templates[index][whole][:tail], int(length))
+                prefixes[key] = RawHistory(h.uid, h.blocks[:whole], templates[index][whole][:tail], int(length), h.origin)
             out.append(prefixes[key])
         result.append(out)
     return result
@@ -651,7 +700,7 @@ class SourceBatch:
     With a pipeline, original source graphs stay on source devices for a complete
     slow update cycle; this batch transports values and accumulated gradients.
     """
-    def __init__(self, model, requests, micro=512, cache=True, pipeline=None, stateless=()):
+    def __init__(self, model, requests, micro=512, cache=True, pipeline=None, stateless=(), frozen=()):
         from .tok_policy import to_batch
         stamp = memory_tick()
         self.model, self.micro, self.cached = model, micro, cache
@@ -685,7 +734,7 @@ class SourceBatch:
                     if pipeline is None:
                         row_parts.append(rr); pending_parts.append(pp)
                     frame_times.extend(range(time_at, time_at + len(rr)))
-                    self.frame_keys.extend((uid, t) for t in range(time_at, time_at + len(rr)))
+                    self.frame_keys.extend(history.key(t) for t in range(time_at, time_at + len(rr)))
                 index_parts.append(identities[key])
                 time_at += len(rr)
             indices = np.concatenate(index_parts)
@@ -703,6 +752,12 @@ class SourceBatch:
         self.memory_times = torch.as_tensor(memory_times,device=dev).repeat_interleave(reader.tokens)
         query_lengths = np.asarray([h.length for h,_,_ in requests],np.int64)
         self.query_times = torch.as_tensor(query_lengths,device=dev)
+        # Records whose loss was consumed in an earlier update: read only, no
+        # source gradient (their own graphs were released, RecordLedger rule 2).
+        self.query_frozen = None
+        if len(frozen):
+            mask = np.zeros(len(requests), bool); mask[np.asarray(list(frozen), np.int64)] = True
+            self.query_frozen = torch.as_tensor(mask, device=dev)
         query = np.array([self.history_frames[h.uid][h.length] for h,_,_ in requests],np.int64)
         if pipeline is not None:
             self.live_frames = recent_frame_union(query, query_lengths, reader.W, n_rows)
@@ -764,7 +819,7 @@ class SourceBatch:
                 mem = reader.write(self.u[self.block_indices]).flatten(0, 1) if len(self.block_indices) else self.u.new_empty((0, reader.D))
             self.mem = mem.detach().requires_grad_() if cache else mem
         src = self.sources()
-        horizon = pipeline.horizon if pipeline is not None else 0
+        horizon = (pipeline.horizon or self.query_frozen is not None) if pipeline is not None else 0
         # With a gradient horizon, K/V weights see every read; the masked source
         # cotangent returns through HorizonAttention (identical K/V values).
         self.kv_source = src if horizon else None
@@ -840,11 +895,18 @@ class SourceBatch:
             (memory & (bt<(times//self.model.reader.block)*self.model.reader.block)))
         layout=dict(shape=(ng,count),positions=pos,indices=banks,valid=mask)
         horizon=self.pipeline.horizon
-        if horizon:
-            # Source age per (decision, entry): a frame's own time, a Writer
-            # block's first frame. Reads keep mask; gradients need age <= horizon.
-            start=torch.where(memory,bt-(self.model.reader.block-1),bt)
-            layout.update(src=self.kv_source,grad_valid=mask&((banks==0)[:,None]|(times-start<=horizon)))
+        if self.kv_source is not None:
+            grad=mask
+            if horizon:
+                # Source age per (decision, entry): a frame's own time, a Writer
+                # block's first frame. Reads keep mask; gradients need age <= horizon.
+                start=torch.where(memory,bt-(self.model.reader.block-1),bt)
+                grad=grad&((banks==0)[:,None]|(times-start<=horizon))
+            if self.query_frozen is not None:
+                frozen=self.query_frozen.index_select(0,ix)
+                frozen=frozen.new_zeros(ng*count).index_copy(0,pos,frozen).reshape(ng,count,1)
+                grad=grad&~frozen
+            layout.update(src=self.kv_source,grad_valid=grad)
         return layout,ix
 
     def forward(self, indices, need_h=False, need_vg=False):
@@ -860,6 +922,10 @@ class SourceBatch:
         yi = self.query_inverse[ix]
         y, pad = self.y[yi], self.pad[yi]
         q = self.u[self.u_query[ix]] + rd.position(self.query_times[ix], self.u.dtype)
+        if self.query_frozen is not None:   # same values; no cotangent to a released source
+            frozen = self.query_frozen[ix]
+            q = torch.where(frozen[:, None], q.detach(), q)
+            y = torch.where(frozen[:, None, None], y.detach(), y)
         o = rd.read_bank(q, self.kvs, None if layout is not None else self.indices[ix],
                         None if layout is not None else self.valid[ix], layout)
         c = rd.fuse(o, y, pad)
@@ -1152,6 +1218,7 @@ class SourceView(SourceBatch):
         self.query=parent.query.index_select(0,ix)
         self.u_query=parent.u_query.index_select(0,ix)
         self.query_times=parent.query_times.index_select(0,ix)
+        self.query_frozen=None if parent.query_frozen is None else parent.query_frozen.index_select(0,ix)
         if self.pipeline.period == 0:
             self.parent=parent
             self.y=parent.y.index_select(0,yi)
@@ -1163,7 +1230,7 @@ class SourceView(SourceBatch):
         refs,_,mrefs=parent.pipeline_refs
         self.pipeline_refs=refs,[refs[i] for i in self.unique_query],mrefs
         src=self.sources()
-        horizon=self.pipeline.horizon
+        horizon=self.pipeline.horizon or self.query_frozen is not None
         self.kv_source=src if horizon else None
         self.kvs=[layer.kv(src.detach() if horizon else src).float() for layer in self.model.reader.layers]
 

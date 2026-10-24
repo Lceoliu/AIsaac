@@ -154,9 +154,24 @@ with torch.no_grad():
     fork = histories[0].fork()
     changed = seq[-1][0].copy(); changed['player'] += .2
     branch_req = [(fork, changed, pending[-1][0])]
+    encoded_branch = pipeline.encoded_rows
     branch = SourceBatch(model, branch_req, cache=False, pipeline=pipeline)
+    # A branch references its parent's frames (keys, values, graphs): only its
+    # own decision frame is encoded (record retention rule 1).
+    assert pipeline.encoded_rows == encoded_branch + 1, (pipeline.encoded_rows, encoded_branch)
+    assert all(fork.key(t) == (histories[0].uid, t) for t in range(fork.length))
+    shared = [i for i, k in enumerate(branch.frame_keys) if k[0] == histories[0].uid]
+    bu = {f: r for r, f in enumerate(branch.u_frames)}
+    compared = 0
+    for i in shared:   # the parent's cached values, unchanged (the parent's encoding version)
+        if i in bu:
+            cid, offset = pipeline.frames[branch.frame_keys[i]]
+            cached = pipeline.chunks[cid]['future'].result()['u'][offset].float()
+            assert torch.equal(branch.u[bu[i]].to(cached.device), cached); compared += 1
+    assert compared, 'no shared parent frame compared'
+    # Its own frame is encoded with the current source weights.
     branch_ref = SourceBatch(model, branch_req, micro=8, cache=False)
-    torch.testing.assert_close(branch.forward([0])[0], branch_ref.forward([0])[0], rtol=5e-4, atol=3e-5)
+    torch.testing.assert_close(branch.y[0][~branch.pad[0]], branch_ref.y[0][~branch_ref.pad[0]], rtol=5e-4, atol=3e-5)
     torch.testing.assert_close(refreshed.forward([0])[0], before_branch, rtol=0, atol=0)
 assert fork.uid != histories[0].uid
 checkpoint = io.BytesIO()

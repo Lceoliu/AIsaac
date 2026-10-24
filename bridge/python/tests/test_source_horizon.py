@@ -153,7 +153,7 @@ def run():
         if c is None: continue
         r = c['future'].result()
         if c.get('detached'):
-            assert c['last'] < limit and r['u'].grad_fn is None and not r['u'].requires_grad and r['y'] is None
+            assert c['last'] < limit and r['u'].grad_fn is None and not r['u'].requires_grad and (r['y'] is None or r['y'].grad_fn is None)
             assert old_u[i]() is None, f'detached chunk {i} graph still referenced'
         else:
             assert r['u'].grad_fn is not None

@@ -52,6 +52,7 @@ class SourcePipeline:
         self.horizon=horizon
         self.horizon_dropped=None
         self.horizon_detached=dict(chunks=0,writes=0,frames=0,packets=0)
+        self.origins={}   # branch uid -> RawHistory.origin: its ancestors' frames are keyed by them
         self.update_rollouts,self.rollouts_since_update=update_rollouts,0
         self.saved_gpu_gb = saved_gpu_gb
         self.saved_cpu_gb = saved_cpu_gb
@@ -224,6 +225,8 @@ class SourcePipeline:
         if self.pending is not None: return
         uids = set(uids).union(*self.prefetch_live.values())
         uids.update(h.uid for batch in self.collected.values() for h,_,_ in batch.requests)
+        # A live branch keeps the ancestor frames it reads (they are keyed by the ancestor).
+        uids.update(a for uid in list(uids) for a, _ in self.origins.get(uid, ()))
         live_chunks = {c for k, (c, _) in self.frames.items() if k[0] in uids}
         live_writes = {c for k, (c, _) in self.blocks.items() if k[0][0] in uids}
         if self.steps:
@@ -247,6 +250,7 @@ class SourcePipeline:
         self.frames = {k: v for k, v in self.frames.items() if k[0] in uids}
         self.blocks = {k: v for k, v in self.blocks.items() if k[0][0] in uids}
         self.lengths = {k: v for k, v in self.lengths.items() if k in uids}
+        self.origins = {k: v for k, v in self.origins.items() if k in uids}
         self.owners = {k: v for k, v in self.owners.items() if k[0] in uids}
         self.chunks = [c if i in live_chunks else None for i, c in enumerate(self.chunks)]
         self.writes = [c if i in live_writes else None for i, c in enumerate(self.writes)]
@@ -278,8 +282,10 @@ class SourcePipeline:
         may share its component nodes. The values stay readable."""
         limit = {uid: f - self.horizon for uid, f in frontiers.items()}
         def old(c, field):
-            return (c is not None and not c.get('detached') and c.get('uid') in limit
-                    and c[field] < limit[c['uid']] and c['future'].done())
+            if c is None or c.get('detached') or not c['future'].done(): return False
+            if c.get('uid') is None and c.get('uids'):   # stateless teacher frames of several records
+                return all(u in limit and c[field] < limit[u] for u in c['uids'])
+            return c.get('uid') in limit and c[field] < limit[c['uid']]
         writes = [i for i, c in enumerate(self.writes) if old(c, 'last_start')]
         # A Writer graph still inside the horizon also holds the encoder graphs
         # of all its frames. Such chunks stay graphs until that write detaches.
@@ -313,10 +319,23 @@ class SourcePipeline:
             return self._remote(worker, 'detach', (chunks, writes))
         for i in chunks:
             result = self.chunks[i]['future'].result()
-            result['u'] = result['u'].detach(); result['y'] = None
+            # A consumed record's own decision frame is still read (frozen): keep y values.
+            result['u'] = result['u'].detach(); result['y'] = result['y'].detach()
         for i in writes:
             result = self.writes[i]['future'].result()
             result['mem'] = result['mem'].detach()
+
+    def value_bytes_per_frame(self):
+        """Mean source value bytes (u and Spatial tokens y) per encoded frame, over
+        the newest completed chunks that still hold both (record byte budget)."""
+        total = rows = 0
+        for c in reversed(self.chunks):
+            if c is None or c.get('detached') or not c['future'].done(): continue
+            r = c['future'].result()
+            if r.get('y') is None or not torch.is_tensor(r['y']): continue
+            total += r['y'].numel() * r['y'].element_size() + r['u'].numel() * r['u'].element_size(); rows += c['rows']
+            if rows >= 4096: break
+        return total / rows if rows else 0.
 
     def horizon_stats(self):
         """Learner-side accounting of retained source graphs (progress.csv)."""
@@ -512,7 +531,7 @@ class SourcePipeline:
             budgets.append(max(1.,capacity/self.devices.count(device)))
         return budgets
 
-    def schedule(self, keys, parts, stateless=(), *, speculative=False):
+    def schedule(self, keys, parts, stateless=(), *, speculative=False, owner_keys=None):
         from .tok_policy import item_count
         missing = {}
         seen = set()
@@ -521,7 +540,9 @@ class SourcePipeline:
                 self.reused_rows += 1
                 continue
             seen.add(key)
-            owner_key = key[0],key[1]//self.model.reader.block
+            # A branch's own frames in a block it shares with its ancestor go
+            # to that block's worker: the Writer reads all its frames locally.
+            owner_key = owner_keys[i] if owner_keys is not None else (key[0],key[1]//self.model.reader.block)
             missing.setdefault(owner_key, []).append(i)
         ni,g=self.model.extra_tokens()
         costs=np.concatenate([np.minimum(r['n_ent'].astype(np.int64),64)+r['n_doors']+3+g for r,p in parts])
@@ -582,9 +603,11 @@ class SourcePipeline:
         # rather than launching an entire encoder once per teacher sample.
         grouped={}; single={}
         for key,indices in missing.items():
-            uid=key[0];worker=self.owners[key]
-            if uid in stateless: single.setdefault(worker,[]).extend(indices)
-            else: grouped.setdefault((uid,worker),[]).extend(indices)
+            worker=self.owners[key]
+            for i in indices:
+                uid=keys[i][0]   # the frame's owner, not the block's: lifetimes follow frames
+                if uid in stateless: single.setdefault(worker,[]).append(i)
+                else: grouped.setdefault((uid,worker),[]).append(i)
         groups=[(uid,worker,indices) for (uid,worker),indices in grouped.items()]
         groups.extend((None,worker,indices) for worker,indices in single.items())
         self.replicas
@@ -606,6 +629,7 @@ class SourcePipeline:
                 chunk = dict(worker=worker, future=future, version=self.version, uid=uid,
                              cost=int(costs[ix].sum()),remote_kind='encode',remote_id=cid,
                              rows=len(ix),last=max(keys[i][1] for i in ix))
+                if uid is None: chunk['uids'] = frozenset(keys[i][0] for i in ix)
                 self.chunks.append(chunk)
                 for offset, i in enumerate(ix): self.frames[keys[i]] = (cid, offset)
                 self.encoded_rows += len(ix)
@@ -616,8 +640,10 @@ class SourcePipeline:
         for h, row, pending in requests:
             if h.uid not in latest or h.length > latest[h.uid][0].length:
                 latest[h.uid] = h, row, pending
-        rr, pp, keys = [], [], []
+        rr, pp, keys, owners = [], [], [], []
+        block = self.model.reader.block
         for uid, (h, row, pending) in latest.items():
+            if h.origin: self.origins[uid] = h.origin
             start = self.lengths.get(uid, 0)
             end = h.length + 1
             self.reused_rows += min(start, end)
@@ -630,14 +656,14 @@ class SourcePipeline:
                 at = stop
             current=np.frombuffer(row.tobytes(),dtype=row.dtype)
             rr.append(current); pp.append(np.array(pending).reshape(1, -1))
-            keys.extend((uid, t) for t in range(start, end))
+            keys.extend(h.key(t) for t in range(start, end))
+            owners.extend((h.key(t//block*block)[0], t//block) for t in range(start, end))
         if keys:
-            if not self.schedule(keys,list(zip(rr,pp)),stateless,speculative=speculative):return False
+            if not self.schedule(keys,list(zip(rr,pp)),stateless,speculative=speculative,owner_keys=owners):return False
         self.lengths.update((uid,h.length+1) for uid,(h,_,_) in latest.items()
                             if h.length+1>self.lengths.get(uid,0))
         if write_ahead:
-            block = self.model.reader.block
-            self._schedule_writes([tuple((uid,t) for t in range(at,at+block))
+            self._schedule_writes([tuple(h.key(t) for t in range(at,at+block))
                 for uid,(h,_,_) in latest.items() for at in range(0,h.length+2-block,block)])
         return True
 
@@ -718,7 +744,8 @@ class SourcePipeline:
     def _gather_queries(self, refs):
         grouped={}
         for c,i in refs:grouped.setdefault(c,[]).append(i)
-        assert not any(self.chunks[c].get('detached') for c in grouped), 'query of a detached frame'
+        # Detached query frames (consumed records, read frozen) keep their y values.
+        assert all(self.chunks[c]['future'].result().get('y') is not None for c in grouped), 'query frame without y'
         width=max(self.chunks[c]['future'].result()['counts'][indices].max() for c,indices in grouped.items())
         first = self.chunks[refs[0][0]]['future'].result()['y']
         plan=self._credit_plan(refs,self.chunks,'y',width)
@@ -735,7 +762,9 @@ class SourcePipeline:
     def _credit_queries(self, refs, gradient):
         if gradient is None: return
         for result, source, target in self._query_tokens(refs, gradient.shape[1]):
-            assert not result.get('_detached'), 'query of a detached frame'
+            if result.get('_detached'):   # frozen read: exact zeros, audited
+                self._drop(gradient.flatten(0, 1).index_select(0, torch.as_tensor(target, device=gradient.device)))
+                continue
             value = result['y']
             if 'y' not in result['grads']: result['grads']['y'] = torch.zeros_like(value, dtype=torch.float32)
             part = gradient.flatten(0, 1).index_select(0, torch.as_tensor(target, device=gradient.device))
