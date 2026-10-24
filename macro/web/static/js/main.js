@@ -33,6 +33,7 @@ const ONE_COLUMN = window.matchMedia('(max-width: 980px)');   // the panel sits 
 const FLOORS_OPEN = 'hr-floors-open';
 const COACH = 'hr-coach-room';     // set once the player has opened a room's layout from the map
 const CONFIRM = 'hr-confirm';      // '1' / '0': 二次确认 on or off; without a choice, on for touch screens
+const REPLAY_PROBS = 'hr-replay-probs';   // '1': a player's replay shows the probabilities they faced
 const COARSE = window.matchMedia('(pointer: coarse)');
 const FLOOR_MS = 3600e3;           // a floor's clock stops at an hour (the database's cap)
 const PROFILE = 'hr-profile-v1';
@@ -64,6 +65,7 @@ const state = {
   pendingAct: null,  // the cell picked: {cell, tool, floor}
   nudge: null,       // the tool the page has just switched to, its button pulses once
   watch: null,       // another player's replay: {id, name, floors: Map(floor -> {moves, gaveUp}), cache, paused}
+  replayProbs: false, // a player's replay shows the probabilities they faced (off: the floor as they saw it)
 };
 
 // ---------------------------------------------------------------------------- small helpers
@@ -705,7 +707,11 @@ function renderBoard() {
     state.geo = drawMap($('map'), f, { ...base, view: 'map', selected: state.selected, onRoom: pickRoom });
     return;
   }
-  if (replayShown()) { renderAiBoard(f, base); return; }
+  if (replayShown()) {
+    if (watching()) renderWatchBoard(f, base);
+    else renderAiBoard(f, base);
+    return;
+  }
   const p = play();
   const done = isComplete(f, p) || p.revealed;
   if (done) state.pendingAct = null;
@@ -901,14 +907,19 @@ function act(cell, confirmed = false) {
   if (isComplete(f, p)) finishFloor();
 }
 
-// the found room pops with Isaac's thumbs up and the jingle; a miss shows what it cost. The status line
-// says what this action alone earned besides (and clears what an earlier one said).
-function feedback(entry, note = null) {
+// a cell's centre on the effects layer (#fx, over the map's frame)
+function fxPoint(cell) {
   const map = $('map'), frame = $('frame');
   const r = map.getBoundingClientRect(), fr = frame.getBoundingClientRect();
   const scale = r.width / (parseFloat(map.getAttribute('width')) || r.width);
-  const [x, y] = state.geo.pos(entry.cell);
-  const px = r.left - fr.left + (x + state.geo.Sx / 2) * scale, py = r.top - fr.top + (y + state.geo.Sy / 2) * scale;
+  const [x, y] = state.geo.pos(cell);
+  return [r.left - fr.left + (x + state.geo.Sx / 2) * scale, r.top - fr.top + (y + state.geo.Sy / 2) * scale];
+}
+
+// the found room pops with Isaac's thumbs up and the jingle; a miss shows what it cost. The status line
+// says what this action alone earned besides (and clears what an earlier one said).
+function feedback(entry, note = null) {
+  const [px, py] = fxPoint(entry.cell);
   const sc = scoreOf(state.floor, play());
   const pts = sc.per[sc.per.length - 1];
   if (entry.found.length) {
@@ -1200,8 +1211,10 @@ function renderMapPanel(panel) {
 
 // ---------------------------------------------------------------------------- the replays
 // After a floor, the AI's way through it (ai.js): the moves the hint policy makes on this floor, with
-// the probabilities it saw, shown on the map one step at a time. A player on a daily board the same
-// way (state.watch): their own moves, each with the chance it had of finding a room.
+// the probabilities it saw, shown on the map one step at a time; step k is the map before its k-th move.
+// A player on a daily board (state.watch) is played back like the floor itself: step k is the map after
+// their first k moves, as they saw it, each move with what it found and scored; the probabilities they
+// faced only on request (state.replayProbs).
 function aiFor(i) {
   if (!state.aiCache.has(i)) {
     const f = state.data.floors[i];
@@ -1228,12 +1241,36 @@ function aiAt() {
   const step = replay.steps[k] || null;
   return { k, step, steps: replay.steps, replay, obs: step ? step.before : replay.final, inf: step ? step.inf : infer(replay.rows, replay.final) };
 }
+// a player's replay: the floor after their first k moves
+function watchAt() {
+  const replay = replayOf(state.floor);
+  const n = replay.steps.length;
+  const k = Math.min(state.ai.step, n);
+  const obs = k ? replay.steps[k - 1].after : new Map();
+  return { k, n, steps: replay.steps, replay, obs, last: k ? replay.steps[k - 1] : null,
+    inf: state.replayProbs && k < n ? infer(replay.rows, obs) : null };
+}
 function showAi(step) {
   const r = replayOf(state.floor);
   const n = r ? r.steps.length : 0;
+  const prev = aiShown() ? state.ai.step : null;
   state.ai = { floor: state.floor, step: Math.max(0, Math.min(n, step)) };
   state.selected = null;
   render();
+  if (watching() && r && prev !== null && state.ai.step === prev + 1) watchFeedback(r, state.ai.step - 1);
+}
+// a player's move played forward: the bomb or the door, then what it found and what it scored
+function watchFeedback(replay, i) {
+  const st = replay.steps[i];
+  playEffect($('map'), state.geo, st.cell, st.found.length > 0 || st.tool === 'key', state.k);
+  const pts = floorScore(floor(), replay.play, state.floor, state.rules).per[i];
+  const [px, py] = fxPoint(st.cell);
+  if (st.found.length) {
+    playSound('secret', 0.5);
+    celebrate($('fx'), ui(), px, py, `+${pts}`);
+  } else {
+    celebrate($('fx'), ui(), px, py, `${pts}`, false);
+  }
 }
 function stopAi() {
   clearInterval(state.aiTimer);
@@ -1283,15 +1320,9 @@ async function watchPlayer(r, day) {
     state.scoreboard.flush();
   }
 }
-function aiStepText(st, f, player = false) {
+function aiStepText(st, f) {
   const at = where(st.cell, f.start);
   const found = st.found.map((k) => KIND_NAME[k]).join('、');
-  if (player) {
-    const chance = `命中的概率 ${pct(st.p)}`;
-    if (st.tool === 'bomb') return [`炸 ${at}`, chance, found ? `找到${found}` : '空的', !!found];
-    if (st.added[0][1] !== 'red') return [`红钥匙 ${at}`, chance, `门后是${found}`, true];
-    return [`红钥匙 ${at}`, chance, found ? `开出红房间，通到${found}` : '开出红房间，没有通到隐藏房', !!found];
-  }
   if (st.tool === 'bomb') return [`炸 ${at}`, `这里有隐藏房的概率 ${pct(st.p)}`, found ? `找到${found}` : '空的', !!found];
   if (st.added[0][1] !== 'red') return [`红钥匙 ${at}`, `通到究极隐藏房的概率 ${pct(st.p)}`, `门后是${found}`, true];
   return [`红钥匙 ${at}`, `通到究极隐藏房的概率 ${pct(st.p)}`, found ? `开出红房间，通到${found}` : '开出红房间，没有通到隐藏房', !!found];
@@ -1306,48 +1337,54 @@ function renderAiBoard(f, base) {
     stepLabels: labels, actionable: () => false, onCell: () => {}, onRoom: null,
   });
 }
-function renderAiPanel(panel) {
-  const f = floor(), p = play();
-  const w = watching() ? state.watch : null;
-  const { expected } = aiFor(state.floor);
-  const replay = replayOf(state.floor);
-  const used = (q, gaveUp) => `${q.bombs} 颗炸弹${rep() ? `、${q.keys} 次红钥匙` : ''}${gaveUp ? '（放弃了）' : ''}`;
-  const exp = expected ? `${expected.bombs.toFixed(1)} 颗炸弹${rep() ? `、${expected.keys.toFixed(1)} 次红钥匙` : ''}` : '—';
-  const mine = ['你', used(p, p.revealed && !isComplete(f, p))];
-  panel.appendChild(html('h3', {}, w ? `${w.name} 怎么找` : 'AI 怎么找'));
-  if (!replay) {                                   // a player with no record of this floor
-    panel.appendChild(html('p', { class: 'advice quiet' }, `没有 ${w.name} 这一层的操作记录（可能是在回看功能上线前玩的）。`));
-    panel.appendChild(kv([mine, ['AI 平均要', exp]]));
-    panel.appendChild(replayExits());
-    return;
-  }
-  const at = aiAt();
-  const n = replay.steps.length;
-  const kinds = hiddenRooms(f).map((h) => KIND_NAME[h.kind]).join('、');
-  const about = html('p', { class: 'advice quiet' }, w
-    ? `${w.name} 在这一层的每一步。地图上的数字是那一步之前按规则推算的概率（挑战里看不到），框出来的是 TA 这一步的选择；"命中的概率"是这一步能找到隐藏房的机会。`
-    : `AI 只看你也能看到的：地图、房间布局和门位，以及这一层藏着${kinds}。`
-      + `它先用炸弹，每次炸最可能有隐藏房的墙${rep() ? '；找完后用红钥匙，每次开最可能通到究极隐藏房的门位' : ''}。地图上的数字是它推算的概率，框出来的是它下一步的选择。`);
-  panel.appendChild(kv(w
-    ? [[w.name, `${used(replay, replay.gaveUp)} · ${floorScore(f, replay.play, state.floor, state.rules).total} 分`], mine, ['AI 平均要', exp]]
-    : [['AI 平均要', exp], ['这一层 AI', used(replay, false)], mine]));
+function renderWatchBoard(f, base) {
+  const at = watchAt();
+  const labels = new Map();
+  at.steps.slice(0, at.k).forEach((st, i) => labels.set(st.cell, String(i + 1)));
+  state.geo = drawMap($('map'), f, {
+    ...base, view: 'find', obs: at.obs, revealed: at.k >= at.n && !!at.replay.gaveUp, selected: null,
+    heat: at.inf && at.inf.ok ? at.inf : null, last: at.last ? at.last.cell : null,
+    stepLabels: labels, actionable: () => false, onCell: () => {}, onRoom: null,
+  });
+}
+function usedText(q, gaveUp) {
+  return `${q.bombs} 颗炸弹${rep() ? `、${q.keys} 次红钥匙` : ''}${gaveUp ? '（放弃了）' : ''}`;
+}
+// ⏮ ◀ ▶ (⏭) and play/pause over a replay at step k of n
+function replayBar(k, n, toEnd = false) {
   const bar = html('div', { class: 'actions aibar' });
   const btn = (label, fn, disabled, title) => {
     const b = html('button', { type: 'button', disabled, title: title || false }, label);
     b.addEventListener('click', fn);
     bar.appendChild(b);
   };
-  btn('⏮', () => showAi(0), at.k === 0, '回到开头');
-  btn('◀ 上一步', () => showAi(at.k - 1), at.k === 0, '←');
-  btn(at.k >= n ? '看完了' : `下一步 ▶`, () => showAi(at.k + 1), at.k >= n, '→');
+  btn('⏮', () => showAi(0), k === 0, '回到开头');
+  btn('◀ 上一步', () => showAi(k - 1), k === 0, '←');
+  btn(k >= n ? '看完了' : `下一步 ▶`, () => showAi(k + 1), k >= n, '→');
+  if (toEnd) btn('⏭', () => showAi(n), k >= n, '直接看结果');
   btn(state.aiTimer ? '暂停' : '自动播放', playAi, n === 0);
-  panel.appendChild(bar);
+  return bar;
+}
+function renderAiPanel(panel) {
+  if (watching()) { renderWatchPanel(panel); return; }
+  const f = floor(), p = play();
+  const { expected } = aiFor(state.floor);
+  const replay = replayOf(state.floor);
+  const exp = expected ? `${expected.bombs.toFixed(1)} 颗炸弹${rep() ? `、${expected.keys.toFixed(1)} 次红钥匙` : ''}` : '—';
+  panel.appendChild(html('h3', {}, 'AI 怎么找'));
+  const at = aiAt();
+  const n = replay.steps.length;
+  const kinds = hiddenRooms(f).map((h) => KIND_NAME[h.kind]).join('、');
+  const about = html('p', { class: 'advice quiet' }, `AI 只看你也能看到的：地图、房间布局和门位，以及这一层藏着${kinds}。`
+    + `它先用炸弹，每次炸最可能有隐藏房的墙${rep() ? '；找完后用红钥匙，每次开最可能通到究极隐藏房的门位' : ''}。地图上的数字是它推算的概率，框出来的是它下一步的选择。`);
+  panel.appendChild(kv([['AI 平均要', exp], ['这一层 AI', usedText(replay, false)], ['你', usedText(p, p.revealed && !isComplete(f, p))]]));
+  panel.appendChild(replayBar(at.k, n));
   const end = replay.gaveUp ? `共 ${n} 步，然后放弃了这一层。` : `共 ${n} 步，全部找到了。`;
   panel.appendChild(html('p', { class: 'aistep' }, at.k >= n ? end : `第 ${at.k + 1} / ${n} 步`));
   panel.appendChild(about);
   const ol = html('ol', { class: 'log ailog' });
   replay.steps.forEach((st, i) => {
-    const [head, prob, result, hit] = aiStepText(st, f, !!w);
+    const [head, prob, result, hit] = aiStepText(st, f);
     const li = html('li', { class: i === at.k ? 'now' : i < at.k ? 'done' : '' });
     li.append(html('b', {}, `${i + 1}. ${head}`), html('span', { class: 'prob' }, prob), html('span', { class: hit ? 'hit' : '' }, ` → ${result}`));
     li.addEventListener('click', () => showAi(i));
@@ -1358,12 +1395,64 @@ function renderAiPanel(panel) {
   const cur = ol.querySelector('.now');   // the list scrolls to it; the page stays where it is
   if (cur) ol.scrollTop = Math.max(0, cur.offsetTop - (ol.clientHeight - cur.offsetHeight) / 2);
 }
+// a player's replay: their moves one by one, in the floor's own log (what each found, what it scored)
+function renderWatchPanel(panel) {
+  const f = floor(), p = play(), w = state.watch;
+  const replay = replayOf(state.floor);
+  const mine = ['你', `${usedText(p, p.revealed && !isComplete(f, p))} · ${scoreOf(state.floor, p).total} 分`];
+  panel.appendChild(html('h3', {}, `回看 · ${w.name}`));
+  if (!replay) {                                   // no record of this floor
+    panel.appendChild(html('p', { class: 'advice quiet' }, `没有 ${w.name} 这一层的操作记录（可能是在回看功能上线前玩的）。`));
+    panel.appendChild(kv([mine]));
+    panel.appendChild(replayExits());
+    return;
+  }
+  const at = watchAt();
+  const { k, n } = at;
+  const score = floorScore(f, replay.play, state.floor, state.rules);
+  panel.appendChild(kv([[w.name, `${usedText(replay, replay.gaveUp)} · ${score.total} 分`], mine]));
+  panel.appendChild(replayBar(k, n, true));
+  const sofar = floorScore(f, { ...newPlay(), obs: at.obs, log: replay.play.log.slice(0, k), revealed: k >= n && replay.gaveUp },
+    state.floor, state.rules).total;
+  const status = k >= n
+    ? (replay.gaveUp ? `${n} 步之后放弃了这一层，得 ${score.total} 分。` : `${n} 步全部找到，得 ${score.total} 分${score.clean ? '，一次不空' : ''}。`)
+    : k === 0 ? `共 ${n} 步。点"下一步"或"自动播放"开始。` : `第 ${k} / ${n} 步 · 到这里 ${sofar} 分`;
+  panel.appendChild(html('p', { class: 'aistep' }, status));
+  const probs = html('input', { type: 'checkbox' });
+  probs.checked = state.replayProbs;
+  probs.addEventListener('change', () => {
+    state.replayProbs = probs.checked;
+    try { localStorage.setItem(REPLAY_PROBS, state.replayProbs ? '1' : '0'); } catch { /* storage unavailable */ }
+    render();
+  });
+  const toggle = html('label', { class: 'toggle', title: 'TA 每走一步之前，按生成规则推算的隐藏房概率（挑战里看不到）' });
+  toggle.append(probs, ' 显示当时的概率');
+  panel.appendChild(toggle);
+  panel.appendChild(html('p', { class: 'advice quiet' }, state.replayProbs
+    ? `格子里是 ${w.name} 走下一步之前、按生成规则推算的概率；每一步下面是 TA 那一步找到隐藏房的机会。`
+    : `${w.name} 这一层的操作，按顺序重放：地图是 TA 当时看到的样子，每一步的得失分和你的规则一样。`));
+  const ol = html('ol', { class: 'log ailog' });
+  replay.steps.slice(0, k).forEach((st, i) => {
+    const [head, result, hit] = logText(st, f);
+    const pts = score.per[i];
+    const li = html('li', { class: i === k - 1 ? 'now' : 'done' });
+    li.append(html('span', { class: pts > 0 ? 'pts up' : 'pts' }, pts > 0 ? `+${pts}` : String(pts)),
+      html('b', {}, `${i + 1}. ${head}`), html('span', { class: hit ? 'hit' : '' }, result));
+    if (state.replayProbs) li.appendChild(html('span', { class: 'prob' }, `命中的机会 ${pct(st.p)}`));
+    li.addEventListener('click', () => showAi(i + 1));
+    ol.appendChild(li);
+  });
+  panel.appendChild(ol);
+  panel.appendChild(replayExits());
+  const cur = ol.querySelector('.now');
+  if (cur) ol.scrollTop = Math.max(0, cur.offsetTop - (ol.clientHeight - cur.offsetHeight) / 2);
+}
 // under a replay: between the player's and the AI's, and back to the floor's own result
 function replayExits() {
   const back = html('div', { class: 'actions' });
   if (state.watch) {
     const w = state.watch;
-    const other = html('button', { type: 'button' }, w.paused ? `看 ${w.name} 怎么找` : '看 AI 怎么找');
+    const other = html('button', { type: 'button' }, w.paused ? `回看 ${w.name}` : '看 AI 怎么找');
     other.addEventListener('click', () => { w.paused = !w.paused; showAi(0); });
     back.appendChild(other);
   }
@@ -1533,7 +1622,7 @@ function showTip(target, e) {
   state.hover = { target, e };
   const p = play();
   const sig = [target.room ? `r${target.room.index}` : `c${target.cell}`, state.floor, state.view, state.tool,
-    state.hints.heat, p.log.length, p.revealed, state.ai ? state.ai.step : '-'].join('|');
+    state.hints.heat, p.log.length, p.revealed, state.ai ? state.ai.step : '-', watching(), state.replayProbs].join('|');
   if (sig === state.tipSig && !tip.hidden) { positionTip(e); return; }
   state.tipSig = sig;
   const f = floor();
@@ -1548,12 +1637,15 @@ function showTip(target, e) {
     const c = target.cell;
     lines.push(['b', where(c, f.start)]);
     if (replayShown()) {
-      const at = aiAt();
+      const w = watching() ? state.watch : null;
+      const at = w ? watchAt() : aiAt();
       const probs = ['secret', 'super'].concat(rep() ? ['ultra'] : []).map((k) => [k, at.inf && at.inf.ok ? at.inf[k].get(c) || 0 : 0])
         .filter(([, q]) => q >= 0.005);
       if (probs.length) lines.push(['p', probs.map(([k, q]) => `${KIND_NAME[k]} ${pct(q)}`).join(' · ')]);
       const i = at.steps.findIndex((st) => st.cell === c);
-      if (i >= 0) lines.push(['', `AI 第 ${i + 1} 步${at.steps[i].tool === 'bomb' ? '炸了这里' : '在这里用了红钥匙'}`]);
+      if (i >= 0 && (!w || i < at.k)) {               // a player's moves only once played back
+        lines.push(['', `${w ? w.name : 'AI'} 第 ${i + 1} 步${at.steps[i].tool === 'bomb' ? '炸了这里' : '在这里用了红钥匙'}`]);
+      }
       if (lines.length === 1) { hideTip(); return; }
     } else if (state.view === 'find' && !p.revealed && !isComplete(f, p)) {
       if (hintsOn() && state.hints.heat) {
@@ -1629,6 +1721,7 @@ function init() {
   try { state.floorsOpen = localStorage.getItem(FLOORS_OPEN) === '1'; } catch { /* storage unavailable */ }
   state.confirm = COARSE.matches;
   try { const c = localStorage.getItem(CONFIRM); if (c !== null) state.confirm = c === '1'; } catch { /* storage unavailable */ }
+  try { state.replayProbs = localStorage.getItem(REPLAY_PROBS) === '1'; } catch { /* storage unavailable */ }
   const route = readUrl();
   state.backend = createBackend(onProgress, state.game);
 

@@ -247,7 +247,14 @@ export function drawMap(svg, floor, v) {
     }
   }
 
-  // the order of the AI's moves (its replay)
+  // the move just played (a player's replay)
+  if (v.last !== null && v.last !== undefined && inside(v.last)) {
+    const [x, y] = pos(v.last);
+    el('rect', { x: x + k * 0.5, y: y + k * 0.5, width: Sx - k, height: Sy - k, rx: k, fill: 'none', stroke: css('--sel'),
+      'stroke-width': Math.max(2, k * 0.55), class: 'lastmove' }, svg);
+  }
+
+  // the order of the moves (a replay)
   if (v.stepLabels) {
     const fs = Math.max(9, Math.round(k * 2));
     for (const [c, label] of v.stepLabels) {
