@@ -4311,6 +4311,7 @@ def main(argv=None, child=None, actor=None):
     #                                     stop event this actor obeys (a second actor))
     seq_n = 0   # (B38 step 5: this actor's hand-offs, the learner pairs the actors' halves by it)
     sent_histories={}
+    L_actor_lanes = {}   # (ISAAC_MEMORY_ACCOUNT) weak references to the lane histories of the last hand-off
     clean_end = False   # (B38 step 5: the actor loop ended by itself, no exception)
     b_last = None   # (B38 step 5, the first actor: set when the second has handed its last half)
     if actor is not None:   # B38 step 5: a second actor: the learner's queue, its own messages, event and stop
@@ -4772,9 +4773,21 @@ def main(argv=None, child=None, actor=None):
                 profile_history_storage('actor'+str(aid))
             if os.environ.get('ISAAC_MEMORY_ACCOUNT') == '1':
                 from isaac_bridge.rebuild_memory import memory_account
+                import weakref
+                lanes_ = getattr(lane_tstate, 'rebuild', None) if lane_tstate is not None else None
+                # Are the CF lanes' histories released once their branch is published? Weak
+                # references to the lane slots' histories at the previous hand-off, still alive now.
+                prev_ = L_actor_lanes.get('refs', [])
+                alive_ = sum(r() is not None for r in prev_)
+                L_actor_lanes['refs'] = [weakref.ref(h) for h in (lanes_.raw if lanes_ is not None else ()) if h.length]
                 memory_account('actor'+str(aid), seq_n, dict(
                     job=job, rollout_a=roll, rollout_b=spare, sent_histories=sent_histories,
-                    actor_memory=getattr(t_state, 'rebuild', None) if t_state is not None else None))
+                    actor_memory=getattr(t_state, 'rebuild', None) if t_state is not None else None,
+                    lane_memory=lanes_,
+                    bank_memory=getattr(bank_tstate, 'rebuild', None) if bank_tstate is not None else None,
+                    rebuild_contexts=getattr(sampler, 'rebuild_contexts', None)),
+                    extra=dict(lane_refs_prev=len(prev_), lane_refs_alive=alive_,
+                               rebuild_contexts=len(getattr(sampler, 'rebuild_contexts', {}) or {})))
             trim_interval=int(os.environ.get('ISAAC_HOST_TRIM_INTERVAL','0'))
             if trim_interval and seq_n%trim_interval==0:
                 from isaac_bridge.rebuild_memory import trim_host_heap

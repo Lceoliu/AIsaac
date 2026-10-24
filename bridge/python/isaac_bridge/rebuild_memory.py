@@ -235,7 +235,36 @@ def memory_account(role, step, groups, extra=None):
         except Exception as error:   # (an older runtime without host allocator statistics)
             host = dict(error=repr(error))
     print('MEMORY_ACCOUNT ' + json.dumps(dict(role=role, pid=os.getpid(), step=step, time=time.time(), proc=status,
-                                               torch_host=host, groups=out, **(extra or {}))), flush=True)
+                                               torch_host=host, groups=out, census=object_census(),
+                                               **(extra or {}))), flush=True)
+
+
+def object_census():
+    """Live objects by type (gc-tracked containers), once per call: what is
+    really retained, as opposed to freed memory the allocator still holds.
+    RawHistory: count, distinct episodes, distinct raw bytes they reach."""
+    import gc
+    types = ('RawHistory', 'ActorMemory', 'TensorActorMemory', 'SourceBatch', 'SourceView', 'JoinedSources',
+             'Parked', 'Future', 'Tensor', 'ndarray')
+    counts = dict.fromkeys(types, 0)
+    raw, episodes, other = set(), set(), {}
+    raw_bytes = 0
+    started = time.perf_counter()
+    for o in gc.get_objects():
+        name = type(o).__name__
+        if name in counts:
+            counts[name] += 1
+            if name == 'RawHistory':
+                episodes.add(o.uid)
+                for r, p in o.blocks + o.tail:
+                    for a in (r, p):
+                        while isinstance(a, np.ndarray) and a.base is not None: a = a.base
+                        if id(a) not in raw:
+                            raw.add(id(a)); raw_bytes += a.nbytes if isinstance(a, np.ndarray) else len(a)
+        elif name in ('dict', 'tuple', 'list'):
+            other[name] = other.get(name, 0) + 1
+    return dict(counts=counts, containers=other, raw_episodes=len(episodes), raw_bytes=raw_bytes,
+                seconds=time.perf_counter() - started)
 
 
 def trim_host_heap(role):

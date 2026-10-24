@@ -125,6 +125,14 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 exports={key:value for key,value in exports.items()
                          if key[1] in (chunks if key[0]=='encode' else writes)}
                 retired+=1
+                if os.environ.get('ISAAC_MEMORY_ACCOUNT')=='1':
+                    from .rebuild_memory import memory_account
+                    memory_account('source-'+str(device),retired,dict(chunks=local.chunks,writes=local.writes,exports=exports),
+                        extra=dict(frames=len(local.frames),saved_cpu_bytes=sum(c['future'].result().get('saved_cpu_bytes',0)
+                                   for c in local.chunks if c is not None),
+                                   live_chunks=sum(c is not None for c in local.chunks),
+                                   graph_frames=sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')),
+                                   cuda_allocated=torch.cuda.memory_allocated(device) if device.type=='cuda' else 0))
                 trim_interval=int(os.environ.get('ISAAC_HOST_TRIM_INTERVAL','4'))
                 if trim_interval and retired%trim_interval==0:
                     from .rebuild_memory import trim_host_heap

@@ -1427,6 +1427,10 @@ def launch_abplus(name: str, port: int, mode: str = "exact", bridge_lua: Optiona
         env["ABP_FIXED_TIME"] = str(fixed_time)
     if extra_env:
         env.update({k: str(v) for k, v in extra_env.items()})
+    # Opt-in diagnostics (memory-chain-v3 allocator A/B): variables the python side
+    # sets for itself only (e.g. LD_PRELOAD of an allocator) never reach the game.
+    for key in filter(None, os.environ.get('ISAAC_GAME_ENV_STRIP', '').split(',')):
+        env.pop(key, None)
     # oom_score_adj 500 (C39 t3 OOM): under memory pressure the kernel kills an AB+ instance (a worker relaunches it) before
     # the trainer; an evaluation raises its own processes to 1000 (abplus_eval). The shell execs, so the pid stays the game's.
     return subprocess.Popen(["sh", "-c", f'echo {OOM_SCORE_ADJ} > /proc/self/oom_score_adj 2>/dev/null; exec "$@"', "sh",
