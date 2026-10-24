@@ -1,0 +1,217 @@
+"""Evaluate hidden-room inference on floors with exact ground truth.
+
+For each floor: hide the secret and super secret rooms, compute P(cell), and count the bombs needed
+when testing cells in that order (tied cells in random order). Methods:
+
+  secret room
+    most_nb        baseline: most neighbouring rooms first (the usual player rule)
+    wall_slot      player rule: walls where a recognised layout has a door slot but no door first
+    rules          exact placement rules, super secret room marginalised (secret.secret_posterior)
+    rules_no_lay   as rules, special-room layouts unknown
+    rules_ss_known as rules, super secret room position known
+    rules+layouts  joint posterior with normal-room layout evidence (secret.hidden_posterior)
+  super secret room
+    ss_rules       depth-weighted candidates (secret.super_secret_prior)
+    ss_nolayout    as ss_rules, normal-room door slots unknown
+    ss+layouts     marginal of the joint posterior with layout evidence
+    ss|secret      joint posterior with layout evidence, secret room already found
+
+With --rep the floors come from the J460 (Repentance+) port and the ultra secret room is hidden too;
+the posteriors are rep/secret.py's (blocked cells, the ultra secret room in the joint):
+    rules, rules+layouts, ss_rules, ss+layouts, ss|secret   as above, J460 model
+    rules+lay(AB+), ss+lay(AB+)   the AB+ joint (no ultra secret room), to see what modelling it adds
+    us_rules       ultra secret room, placement rules only
+    us+layouts     ultra secret room, joint posterior with layout evidence
+    us|secret      ultra secret room once the secret room is found (the joint conditioned on it)
+    us|secret+ss   ultra secret room once both the secret and super secret rooms are found
+    secret|ultra   secret room if the ultra secret room were known
+
+usage: python tools/eval_secret.py [runs] [seed] [--rep]
+       python tools/eval_secret.py --engine <dump.jsonl>   (floors dumped from the engine by
+                                                            rl/bridge/python/abplus_probe_floors.py)
+"""
+import collections
+import json
+import sys
+
+sys.path.insert(0, __file__.rsplit('tools', 1)[0])
+from isaac_macro.floor import Floor, FloorRoom
+from isaac_macro.levelgen import GRID, TRAVEL, index
+from isaac_macro.secret import (LayoutEvidence, condition_joint, expected_bombs, hidden_posterior, hit_within,
+                                joint_marginals, secret_posterior, super_secret_prior, wall_slot_heuristic)
+
+REP = '--rep' in sys.argv
+argv = [a for a in sys.argv[1:] if a != '--rep']
+if REP:
+    from isaac_macro.rep import secret as rep_secret
+    from isaac_macro.rep.dataset import iter_floors
+    from isaac_macro.rep.levelgen import RING2
+    from isaac_macro.rep.roomconfig import default_room_config
+else:
+    from isaac_macro.dataset import iter_floors
+    from isaac_macro.roomconfig import default_room_config
+
+rc = default_room_config()
+_evidence = {}
+
+
+def evidence(floor):
+    labyrinth = REP and bool(floor.curses & 2)
+    key = (floor.stage, floor.stage_type, labyrinth)
+    if key not in _evidence:
+        _evidence[key] = (rep_secret.RepLayoutEvidence(rc, floor.stage, floor.stage_type, labyrinth) if REP
+                          else LayoutEvidence(rc, floor.stage, floor.stage_type))
+    return _evidence[key]
+
+
+def engine_floors(path):
+    for line in open(path):
+        rec = json.loads(line)
+        if rec['stage'] > 8:
+            continue
+        floor = Floor.from_engine_dump(rec, rc)
+        yield dict(secret=[r.safe_grid_index for r in floor.rooms if r.type == 7],
+                   super_secret=[r.safe_grid_index for r in floor.rooms if r.type == 8]), floor
+
+
+def unknown_layouts(floor: Floor, normal_too: bool = False) -> Floor:
+    rooms = [FloorRoom(r.index, r.x, r.y, r.shape, r.type, r.variant, r.subtype,
+                       0xFF if r.type != 1 or normal_too else r.layout_doors) for r in floor.rooms]
+    return Floor(rooms, floor.stage, floor.stage_type, floor.curses, 0, floor.start)
+
+
+def most_neighbours(floor: Floor) -> dict:
+    out = {}
+    for i in range(GRID * GRID):
+        if floor.grid[i] >= 0:
+            continue
+        n = sum(1 for dx, dy in TRAVEL if (j := index(i % GRID + dx, i // GRID + dy)) >= 0 and floor.grid[j] >= 0)
+        if n:
+            out[i] = float(n)
+    return out
+
+
+if len(argv) > 1 and argv[0] == '--engine':
+    if REP:
+        sys.exit('--engine dumps are AB+ floors')
+    source = engine_floors(argv[1])
+else:
+    runs = int(argv[0]) if argv else 300
+    seed = int(argv[1]) if len(argv) > 1 else 2
+    source = iter_floors(rc, runs, seed)
+
+agg = collections.defaultdict(list)
+stats = collections.Counter()
+ring = collections.defaultdict(collections.Counter)    # --rep: rooms around the ultra secret room
+link = collections.Counter()                           # --rep: what the linked model rules out
+calib = collections.defaultdict(lambda: collections.defaultdict(lambda: [0.0, 0, 0]))  # name -> bin -> [sum p, hits, n]
+
+
+def score(name, post, truth):
+    if not post or truth not in post:
+        stats[name + ' miss'] += 1
+        agg[name].append(float('nan'))
+        return
+    agg[name].append(expected_bombs(post, truth))
+    agg[name + '_p'].append(post[truth] / sum(post.values()))
+    agg[name + '_1'].append(hit_within(post, truth, 1))
+    agg[name + '_2'].append(hit_within(post, truth, 2))
+    agg[name + '_3'].append(hit_within(post, truth, 3))
+
+
+def calibrate(name, post, truth):
+    for c, p in post.items():
+        k = min(int(p * 10), 9)
+        calib[name][k][0] += p
+        calib[name][k][1] += c == truth
+        calib[name][k][2] += 1
+
+
+for rec, floor in source:
+    stats['floors'] += 1
+    if len(rec['secret']) != 1 or len(rec['super_secret']) != 1 or (REP and len(rec['ultra_secret']) != 1):
+        stats['skipped (not exactly one of each hidden room)'] += 1
+        continue
+    truth, ss = rec['secret'][0], rec['super_secret'][0]
+    ev = evidence(floor)
+    if REP:
+        us = rec['ultra_secret'][0]
+        vis = floor.visible(rep_secret.HIDDEN_TYPES)
+        sd = rep_secret.strange_door_floor(floor.stage, floor.stage_type, floor.curses)
+        ss_prior = rep_secret.rep_super_secret_prior(vis)
+        rules_s, _, rules_u = joint_marginals(rep_secret.hidden_joint(vis, None, ss_prior, sd), 3)
+        joint = rep_secret.hidden_joint(vis, ev, ss_prior, sd)
+        joint_s, joint_ss, joint_u = joint_marginals(joint, 3)
+        ab_s, ab_ss = hidden_posterior(vis, ev, ss_prior=ss_prior)
+        _, ss_given, us_given = joint_marginals(condition_joint(joint, {0: truth}), 3)
+        score('us|secret', us_given, us)
+        score('us|secret+ss', joint_marginals(condition_joint(joint, {0: truth, 1: ss}), 3)[2], us)
+        score('secret|ultra', joint_marginals(condition_joint(joint, {2: us}), 3)[0], truth)
+        score('most_nb', most_neighbours(vis), truth)
+        score('wall_slot', wall_slot_heuristic(vis), truth)
+        score('rules', rules_s, truth)
+        score('rules+lay(AB+)', ab_s, truth)
+        score('rules+layouts', joint_s, truth)
+        score('ss_rules', ss_prior, ss)
+        score('ss+lay(AB+)', ab_ss, ss)
+        score('ss+layouts', joint_ss, ss)
+        score('ss|secret', ss_given, ss)
+        score('us_rules', rules_u, us)
+        score('us+layouts', joint_u, us)
+        calibrate('rules+layouts', joint_s, truth)
+        calibrate('us+layouts', joint_u, us)
+        # the player rules: the ultra secret room sits among rooms, and it pushes the secret room away
+        rule = rep_secret.UltraSecretRule(vis, rep_secret.blocked_cells(vis, sd))
+        near = [vis.grid[j] for ox, oy in RING2 if (j := index(us % GRID + ox, us // GRID + oy)) >= 0 and vis.grid[j] >= 0]
+        ring['occupied cells at distance 2, true ultra secret room'][min(len(near), 4)] += 1
+        ring['rooms at distance 2, true ultra secret room'][min(len(set(near)), 4)] += 1
+        for u in rule.given(truth, ss):
+            if u is not None:
+                ring['occupied cells at distance 2, every legal cell'][min(rule.cands[u][0], 4)] += 1
+        dropped = [c for c, p in ab_s.items() if p >= 0.10 and joint_s.get(c, 0) < 0.01]
+        halved = [c for c, p in ab_s.items() if p >= 0.10 and joint_s.get(c, 0) < p / 2]
+        link['floors'] += 1
+        link['a >=10% secret candidate (AB+ model) drops below 1%'] += bool(dropped)
+        link['... and it was the secret room'] += truth in dropped
+        link['a >=10% secret candidate (AB+ model) loses half'] += bool(halved)
+        link['... and it was the secret room '] += truth in halved
+        continue
+    vis = floor.visible()
+    joint_s, joint_ss = hidden_posterior(vis, ev)
+    score('most_nb', most_neighbours(vis), truth)
+    score('wall_slot', wall_slot_heuristic(vis), truth)
+    score('rules', secret_posterior(vis), truth)
+    score('rules_no_lay', secret_posterior(unknown_layouts(vis)), truth)
+    score('rules_ss_known', secret_posterior(vis, ss), truth)
+    score('rules+layouts', joint_s, truth)
+    score('ss_rules', super_secret_prior(vis), ss)
+    score('ss_nolayout', super_secret_prior(unknown_layouts(vis, True)), ss)
+    score('ss+layouts', joint_ss, ss)
+    # super secret room once the secret room is known: condition the joint posterior on it
+    _, ss_given = hidden_posterior(vis, ev, secret_cell=truth)
+    score('ss|secret', ss_given, ss)
+    calibrate('rules+layouts', joint_s, truth)
+
+print(dict(stats))
+print(f"{'method':15s} {'floors':>6s} {'P(truth)':>8s} {'1 bomb':>7s} {'<=2':>6s} {'<=3':>6s} {'E[bombs]':>8s}")
+methods = (('most_nb', 'wall_slot', 'rules', 'rules+lay(AB+)', 'rules+layouts', 'secret|ultra', 'ss_rules',
+            'ss+lay(AB+)', 'ss+layouts', 'ss|secret', 'us_rules', 'us+layouts', 'us|secret', 'us|secret+ss') if REP else
+           ('most_nb', 'wall_slot', 'rules_no_lay', 'rules', 'rules_ss_known', 'rules+layouts',
+            'ss_nolayout', 'ss_rules', 'ss+layouts', 'ss|secret'))
+for name in methods:
+    v = [x for x in agg[name] if x == x]
+    if not v:
+        continue
+    m = lambda k: sum(agg[k]) / len(agg[k])
+    print(f"{name:15s} {len(v):6d} {m(name + '_p'):8.3f} {m(name + '_1'):7.3f} {m(name + '_2'):6.3f} "
+          f"{m(name + '_3'):6.3f} {sum(v) / len(v):8.2f}")
+for name, bins in calib.items():
+    print(f'calibration of {name} (bin: mean predicted / observed / cells):')
+    for k in sorted(bins):
+        s, h, n = bins[k]
+        print(f'  [{k / 10:.1f},{(k + 1) / 10:.1f}): {s / n:.3f} / {h / n:.3f} / {n}')
+for name, counts in ring.items():
+    total = sum(counts.values())
+    print(f'{name} (4 = 4+):', {k: f'{v / total:.1%}' for k, v in sorted(counts.items())}, f'n={total}')
+if link:
+    print('linked model vs the AB+ joint:', dict(link))

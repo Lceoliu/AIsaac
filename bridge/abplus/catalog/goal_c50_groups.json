@@ -1,0 +1,17 @@
+{
+ "description": "C50 (10-02, floor-clear mandate): the normal-room specialist, the Basement I normal rooms only (1x1 and the other shapes, 678 train rooms), start half hearts uniform 1-6 (a floor run reaches its later rooms low on HP). The floor runner fights normal rooms with this run and the boss room with the boss specialist.",
+ "groups": [
+  {
+   "name": "combat",
+   "tasks": "goal_rooms_all_train.json",
+   "eval_tasks": "goal_rooms_all.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat",
+   "start_hp": {
+    "min": 1,
+    "max": 6
+   }
+  }
+ ]
+}

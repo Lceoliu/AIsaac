@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>以撒小测试 · 找隐藏房</title>
+<meta name="description" content="以撒小测试：《以撒的结合》的楼层按游戏真实的生成规则出题，炸开墙把藏起来的房间找出来，和大家比积分。">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://cdn.jsdelivr.net" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Silkscreen&family=ZCOOL+KuaiLe&display=swap">
+<link rel="stylesheet" href="style.css">
+<link rel="modulepreload" href="js/main.js">
+<link rel="preload" href="art/art.json" as="fetch" crossorigin>
+<script src="config.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="./" id="brand" aria-label="以撒小测试 首页">
+    <span class="brand-isaac" id="brand-isaac" aria-hidden="true"></span>
+    <span class="brand-text">
+      <span class="eyebrow">找隐藏房</span>
+      <span class="logo">以撒小测试</span>
+    </span>
+  </a>
+  <div class="top-right">
+    <a id="github" class="icon-btn gh" href="https://github.com/Lceoliu/find-Isaac-hiding-rooms" target="_blank" rel="noopener"
+       title="在 GitHub 上看源码，觉得好玩就点个 Star" aria-label="GitHub 仓库">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+    </a>
+    <button type="button" id="mute" class="icon-btn" aria-pressed="false" title="声音" aria-label="声音">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><path class="spk" d="M2 6h3l4-3v10l-4-3H2z"/><path class="wave" d="M11 5.5c1 .8 1 4.2 0 5M12.8 3.8c2 1.8 2 6.6 0 8.4"/><path class="cross" d="M11 6l4 4M15 6l-4 4"/></svg>
+    </button>
+    <button type="button" id="me" class="me-chip" title="改名字"><span class="me-dot" aria-hidden="true"></span><span id="me-name">起个名字</span></button>
+  </div>
+</header>
+
+<main id="home" class="home" hidden>
+  <div class="title-block">
+    <span class="fly" aria-hidden="true"></span>
+    <h1 class="quiz-title">以撒小测试</h1>
+    <span id="hero-isaac" class="hero-isaac" aria-hidden="true"></span>
+    <p class="streak"><span>找隐藏房 · 按游戏真实规则出题</span></p>
+  </div>
+
+  <div class="menu-row">
+    <section class="pinned" aria-label="开始">
+      <div class="pinned-inner">
+        <label class="namefield" for="pname">
+          <span>名字</span>
+          <input id="pname" type="text" maxlength="16" placeholder="写上你的名字" autocomplete="nickname" spellcheck="false">
+        </label>
+        <nav class="menu" aria-label="玩法">
+          <button type="button" class="menu-item" data-start="daily">
+            <b>今日挑战</b><small id="daily-meta">7 层 · 所有人同一局</small><em id="daily-state"></em>
+          </button>
+          <button type="button" class="menu-item" data-start="random">
+            <b>随机挑战</b><small id="random-meta">7 层 · 随机种子 · 计入总榜</small>
+          </button>
+          <button type="button" class="menu-item" data-start="practice">
+            <b>自由练习</b><small>自选种子，有提示和完整地图 · 不计分</small>
+          </button>
+        </nav>
+        <div class="gamepick" id="home-game" role="radiogroup" aria-label="游戏版本">
+          <button type="button" role="radio" data-game="abplus" aria-checked="true">胎衣†</button>
+          <button type="button" role="radio" data-game="repplus" aria-checked="false">忏悔+</button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="board-card" aria-labelledby="board-title">
+      <span class="doodle" aria-hidden="true"></span>
+      <div class="board-top">
+        <h2 id="board-title">排行榜</h2>
+        <div class="tabs" role="tablist" aria-label="排行榜">
+          <button type="button" role="tab" data-scope="today" aria-selected="true">今日</button>
+          <button type="button" role="tab" data-scope="yesterday" aria-selected="false">昨日</button>
+          <button type="button" role="tab" data-scope="total" aria-selected="false">总榜</button>
+        </div>
+      </div>
+      <p class="board-sub" id="board-sub"></p>
+      <ol id="board" class="board-list"></ol>
+      <p id="board-me" class="board-me"></p>
+      <p id="board-note" class="hint"></p>
+    </aside>
+  </div>
+
+  <p class="rules-strip" id="rules-v1" aria-label="计分规则">
+    <span>隐藏房 <b>+100</b></span><span>超级隐藏房 <b>+150</b></span><span class="rep-only">究极隐藏房 <b>+200</b></span>
+    <span>空炸一次 <b class="neg">−25</b></span><span>一次不空全找到 <b>+50</b></span>
+  </p>
+  <p class="rules-strip" id="rules-v2" aria-label="计分规则" hidden>
+    <span>隐藏房 <b>+100</b></span><span>超级隐藏房 <b>+150</b></span><span class="rep-only">究极隐藏房 <b>+200</b></span>
+    <span class="note">第 1、2 层减半</span>
+    <span>每个一次就找到 <b>+25</b> <span class="note">第 6、7 层 +50</span></span>
+    <span title="只挨着一个房间的隐藏房">单连隐藏房 <b>+25</b></span><span class="rep-only" title="只有一个门位能开红房间连到它">单连究极隐藏房 <b>+50</b></span>
+    <span>空炸一次 <b class="neg">−25</b></span>
+    <span>一层不空 <b>+25</b> / <b>+50</b> / <b>+125</b> <span class="note">第 1–2 / 3–5 / 6–7 层</span></span>
+  </p>
+  <p id="engine" class="engine" role="status" aria-live="polite"></p>
+</main>
+
+<main id="app" hidden>
+  <div class="playbar" id="playbar">
+    <button type="button" id="back" class="ghost">← 首页</button>
+    <span class="mode-badge" id="mode-badge"></span>
+    <span class="seed-tag num" id="seed-tag" title="种子"></span>
+    <span class="grow"></span>
+    <span class="run-progress" id="run-progress"></span>
+    <span class="score-chip" id="run-score" hidden><small>本局</small><b class="num" id="run-points">0</b><small>分</small></span>
+  </div>
+
+  <form id="seedform" class="seedbar" autocomplete="off" hidden>
+    <div class="segmented" id="play-game" role="radiogroup" aria-label="游戏版本">
+      <button type="button" role="radio" data-game="abplus" aria-checked="true">胎衣†</button>
+      <button type="button" role="radio" data-game="repplus" aria-checked="false">忏悔+</button>
+    </div>
+    <label class="seed">
+      <span class="visually-hidden">种子</span>
+      <input id="seed" type="text" inputmode="text" placeholder="种子，如 DXNH NZLG" spellcheck="false" maxlength="10">
+    </label>
+    <button type="button" id="dice" class="icon-btn" title="随机种子" aria-label="随机种子">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="1.5" y="1.5" width="13" height="13" rx="2.5"/><circle cx="5" cy="5" r="1.3"/><circle cx="11" cy="5" r="1.3"/><circle cx="8" cy="8" r="1.3"/><circle cx="5" cy="11" r="1.3"/><circle cx="11" cy="11" r="1.3"/></svg>
+    </button>
+    <button type="submit" id="go" class="primary">生成</button>
+    <details class="options" id="options">
+      <summary>选项</summary>
+      <div class="options-panel">
+        <label>开局方式
+          <select id="mode">
+            <option value="normal">正常开局（和游戏里输入种子一样）</option>
+            <option value="debug">调试开局（第一层固定为地下室 I）</option>
+          </select>
+        </label>
+        <label>第 5 章路线
+          <select id="route">
+            <option value="sheol">阴间 → 暗室</option>
+            <option value="cathedral">教堂 → 玩具箱</option>
+          </select>
+        </label>
+        <label>生成到
+          <select id="last">
+            <option value="11">第 11 层</option>
+            <option value="8">第 8 层</option>
+          </select>
+        </label>
+        <fieldset>
+          <legend>进每一层时的资源</legend>
+          <label>硬币<input id="coins" type="number" min="0" max="99" value="0"></label>
+          <label>钥匙<input id="keys" type="number" min="0" max="99" value="0"></label>
+          <label>红心<input id="hearts" type="number" min="0" max="24" value="6"></label>
+          <label>心之容器<input id="max_hearts" type="number" min="0" max="24" value="6"></label>
+          <label>魂心<input id="soul" type="number" min="0" max="24" value="0"></label>
+        </fieldset>
+        <p class="hint">单位是半颗心。硬币、钥匙和血量会影响赌博房、宝库、骰子房、挑战房和卧室会不会出现。</p>
+      </div>
+    </details>
+  </form>
+
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+
+  <div id="floorbar" class="floorbar" hidden></div>
+  <nav id="floors" class="floors" aria-label="楼层" hidden></nav>
+
+  <section class="stage">
+    <div class="board">
+      <div class="board-head" id="boardhead" hidden>
+        <h2 id="floortitle"></h2>
+        <div class="tabs" role="tablist" aria-label="视图">
+          <button type="button" role="tab" id="tab-find" data-view="find" aria-selected="true">找隐藏房</button>
+          <button type="button" role="tab" id="tab-map" data-view="map" aria-selected="false">完整地图</button>
+        </div>
+      </div>
+      <div id="frame" class="frame">
+        <svg id="map" class="map" role="img" aria-label="楼层小地图"></svg>
+        <div id="welcome" class="welcome" hidden>
+          <h2>选一个种子，把藏起来的房间找出来</h2>
+          <ol>
+            <li>选游戏版本，输入种子，或者随机来一局。</li>
+            <li>在小地图上点墙外的格子，用炸弹炸开。忏悔+ 还能用红钥匙开红房间。</li>
+            <li>练习模式不计分，可以随时看完整地图。</li>
+          </ol>
+          <button type="button" id="welcome-random" class="primary">随机来一局</button>
+        </div>
+        <div id="loading" class="loading" hidden>
+          <span class="loading-isaac" id="loading-isaac" aria-hidden="true"></span>
+          <h2>正在准备</h2>
+          <ul id="loading-steps"></ul>
+          <p class="hint">第一次打开要下载约 10 MB，之后浏览器会缓存。</p>
+        </div>
+        <div id="busy" class="busy" hidden><span></span>生成中</div>
+        <div id="tip" class="tip" hidden></div>
+        <div id="fx" class="fx" aria-hidden="true"></div>
+      </div>
+      <div id="maptools" class="tools maptools" role="group" aria-label="工具" hidden></div>
+      <div class="board-foot" id="boardfoot" hidden>
+        <div id="legend" class="legend"></div>
+        <label class="toggle"><input type="checkbox" id="t-text"> 文字标签</label>
+      </div>
+    </div>
+
+    <aside class="panel" id="panel" hidden></aside>
+  </section>
+</main>
+
+<dialog id="namedlg" class="namedlg">
+  <form method="dialog" id="nameform">
+    <h2>起个名字</h2>
+    <p class="hint">排行榜上显示这个名字，1–16 个字。之后可以点右上角改。</p>
+    <input id="dlgname" type="text" maxlength="16" required autocomplete="nickname" spellcheck="false">
+    <p class="dlg-error" id="dlgerror"></p>
+    <div class="actions">
+      <button type="button" id="dlgcancel">取消</button>
+      <button type="submit" value="ok" class="primary">好</button>
+    </div>
+  </form>
+</dialog>
+
+<footer class="foot">
+  <p>楼层按游戏的生成规则离线算出；提示里的概率只用玩家看得见的信息（地图和房间布局）推算。</p>
+  <p>《以撒的结合》的房间数据、图标、贴图和音效来自游戏本体，版权归 Edmund McMillen 和 Nicalis 所有。玩家自制，与官方无关。</p>
+</footer>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

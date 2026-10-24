@@ -1,0 +1,6461 @@
+{
+ "description": "Normal-room classes from the scripted sweep (room_sweep.py, 2026-09-26, invincible, 0 bombs)",
+ "method": "turret: stand at the entrance and shoot along the aim / nearest target axis, 60 s; walker: walk the walking-distance descent to a firing position and shoot, 60 s; idle: 15 s without input, an enemy chases when it comes within 60 px or closes in by 80 px; non_chasing needs at least one starting enemy; spawn_income = (spawned HP / 5 + 0.25 per spawn) per second of the idle run",
+ "rooms": {
+  "0": {
+   "solve": "turret",
+   "turret_s": 26.73,
+   "walker_s": 2.67,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1": {
+   "solve": "turret",
+   "turret_s": 32.93,
+   "walker_s": 3.53,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "3": {
+   "solve": "neither",
+   "turret_s": null,
+   "walker_s": null,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "4": {
+   "solve": "turret",
+   "turret_s": 4.47,
+   "walker_s": 4.73,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "5": {
+   "solve": "turret",
+   "turret_s": 5.27,
+   "walker_s": 4.53,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "6": {
+   "solve": "neither",
+   "turret_s": null,
+   "walker_s": null,
+   "enemies": 8,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "7": {
+   "solve": "turret",
+   "turret_s": 8.87,
+   "walker_s": 5.2,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "8": {
+   "solve": "turret",
+   "turret_s": 2.8,
+   "walker_s": 2.8,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "9": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 4.4,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "10": {
+   "solve": "turret",
+   "turret_s": 1.87,
+   "walker_s": 1.87,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "11": {
+   "solve": "turret",
+   "turret_s": 1.87,
+   "walker_s": 1.87,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "12": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.0,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "13": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.73,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "14": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 4.4,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "15": {
+   "solve": "turret",
+   "turret_s": 5.33,
+   "walker_s": 5.33,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "16": {
+   "solve": "turret",
+   "turret_s": 6.6,
+   "walker_s": 3.87,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "17": {
+   "solve": "turret",
+   "turret_s": 6.27,
+   "walker_s": 4.6,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "18": {
+   "solve": "turret",
+   "turret_s": 1.07,
+   "walker_s": 1.07,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "19": {
+   "solve": "turret",
+   "turret_s": 11.73,
+   "walker_s": 4.13,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "20": {
+   "solve": "turret",
+   "turret_s": 19.2,
+   "walker_s": 8.67,
+   "enemies": 8,
+   "chasers": 8,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "21": {
+   "solve": "turret",
+   "turret_s": 18.87,
+   "walker_s": 6.4,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "22": {
+   "solve": "turret",
+   "turret_s": 14.73,
+   "walker_s": 5.2,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "23": {
+   "solve": "turret",
+   "turret_s": 22.6,
+   "walker_s": 6.33,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "24": {
+   "solve": "turret",
+   "turret_s": 14.4,
+   "walker_s": 2.13,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "25": {
+   "solve": "turret",
+   "turret_s": 17.33,
+   "walker_s": 6.73,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "26": {
+   "solve": "turret",
+   "turret_s": 7.33,
+   "walker_s": 4.27,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "27": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 22.87,
+   "enemies": 8,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "28": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.47,
+   "enemies": 7,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "38": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 4.8,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "40": {
+   "solve": "turret",
+   "turret_s": 46.27,
+   "walker_s": 5.67,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "41": {
+   "solve": "turret",
+   "turret_s": 49.2,
+   "walker_s": 7.2,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "42": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.67,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "43": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.07,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "44": {
+   "solve": "turret",
+   "turret_s": 3.13,
+   "walker_s": 2.8,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "45": {
+   "solve": "turret",
+   "turret_s": 30.47,
+   "walker_s": 4.87,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "46": {
+   "solve": "turret",
+   "turret_s": 1.67,
+   "walker_s": 1.67,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "47": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 4.27,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "48": {
+   "solve": "turret",
+   "turret_s": 5.2,
+   "walker_s": 4.27,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "49": {
+   "solve": "turret",
+   "turret_s": 5.33,
+   "walker_s": 4.6,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "50": {
+   "solve": "turret",
+   "turret_s": 6.87,
+   "walker_s": 5.47,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "51": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.0,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "52": {
+   "solve": "turret",
+   "turret_s": 15.2,
+   "walker_s": 5.53,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "53": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.33,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "54": {
+   "solve": "turret",
+   "turret_s": 16.67,
+   "walker_s": 3.33,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "55": {
+   "solve": "turret",
+   "turret_s": 4.6,
+   "walker_s": 2.53,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "57": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.0,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "58": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 22.73,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "59": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.87,
+   "enemies": 5,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     13,
+     0
+    ],
+    [
+     14,
+     0
+    ],
+    [
+     18,
+     0
+    ]
+   ],
+   "spawn_income": 0.083
+  },
+  "60": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.47,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "61": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 19.87,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "62": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 16.07,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "63": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.87,
+   "enemies": 5,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "64": {
+   "solve": "turret",
+   "turret_s": 4.87,
+   "walker_s": 4.87,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "65": {
+   "solve": "turret",
+   "turret_s": 7.4,
+   "walker_s": 5.13,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "66": {
+   "solve": "turret",
+   "turret_s": 6.33,
+   "walker_s": 4.6,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "67": {
+   "solve": "turret",
+   "turret_s": 4.87,
+   "walker_s": 3.47,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "68": {
+   "solve": "turret",
+   "turret_s": 4.2,
+   "walker_s": 3.8,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "69": {
+   "solve": "turret",
+   "turret_s": 5.0,
+   "walker_s": 3.73,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "70": {
+   "solve": "turret",
+   "turret_s": 14.13,
+   "walker_s": 8.13,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "71": {
+   "solve": "turret",
+   "turret_s": 48.33,
+   "walker_s": 6.13,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "72": {
+   "solve": "turret",
+   "turret_s": 7.53,
+   "walker_s": 4.47,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "73": {
+   "solve": "turret",
+   "turret_s": 11.27,
+   "walker_s": 7.87,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "74": {
+   "solve": "turret",
+   "turret_s": 18.27,
+   "walker_s": 9.27,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "75": {
+   "solve": "turret",
+   "turret_s": 8.2,
+   "walker_s": 9.93,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "76": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.13,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "77": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.2,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "78": {
+   "solve": "turret",
+   "turret_s": 5.93,
+   "walker_s": 5.0,
+   "enemies": 5,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "79": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.47,
+   "enemies": 6,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "80": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.33,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "81": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.2,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "82": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.93,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "83": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.87,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "84": {
+   "solve": "turret",
+   "turret_s": 29.2,
+   "walker_s": 10.87,
+   "enemies": 9,
+   "chasers": 9,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "85": {
+   "solve": "turret",
+   "turret_s": 56.27,
+   "walker_s": 6.0,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "86": {
+   "solve": "turret",
+   "turret_s": 40.13,
+   "walker_s": 3.07,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "87": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.73,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "96": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.0,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "97": {
+   "solve": "turret",
+   "turret_s": 15.33,
+   "walker_s": 6.4,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "98": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 14.4,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "99": {
+   "solve": "turret",
+   "turret_s": 24.27,
+   "walker_s": 6.67,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "101": {
+   "solve": "turret",
+   "turret_s": 1.8,
+   "walker_s": 1.8,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "102": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.47,
+   "enemies": 4,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "103": {
+   "solve": "turret",
+   "turret_s": 3.8,
+   "walker_s": 3.4,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "104": {
+   "solve": "turret",
+   "turret_s": 31.93,
+   "walker_s": 8.33,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "105": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.13,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "106": {
+   "solve": "turret",
+   "turret_s": 6.6,
+   "walker_s": 6.4,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "107": {
+   "solve": "turret",
+   "turret_s": 7.73,
+   "walker_s": 7.07,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "108": {
+   "solve": "turret",
+   "turret_s": 7.0,
+   "walker_s": 6.2,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "109": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.93,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "110": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.13,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "111": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.4,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "112": {
+   "solve": "turret",
+   "turret_s": 7.87,
+   "walker_s": 8.07,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "113": {
+   "solve": "turret",
+   "turret_s": 4.8,
+   "walker_s": 4.8,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "114": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 23.27,
+   "enemies": 5,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "116": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.93,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "117": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 18.6,
+   "enemies": 5,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "118": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.67,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "119": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.47,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "120": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.87,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "121": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.13,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "122": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 14.27,
+   "enemies": 7,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "123": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.0,
+   "enemies": 6,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "124": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 26.07,
+   "enemies": 8,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "125": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.93,
+   "enemies": 8,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "126": {
+   "solve": "turret",
+   "turret_s": 7.6,
+   "walker_s": 9.67,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "127": {
+   "solve": "turret",
+   "turret_s": 47.93,
+   "walker_s": 11.2,
+   "enemies": 7,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     13,
+     0
+    ]
+   ],
+   "spawn_income": 0.083
+  },
+  "128": {
+   "solve": "turret",
+   "turret_s": 34.07,
+   "walker_s": 13.33,
+   "enemies": 8,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     13,
+     0
+    ]
+   ],
+   "spawn_income": 0.017
+  },
+  "129": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 14.4,
+   "enemies": 9,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "130": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 14.47,
+   "enemies": 6,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "131": {
+   "solve": "turret",
+   "turret_s": 24.67,
+   "walker_s": 19.27,
+   "enemies": 8,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 8,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     13,
+     0
+    ],
+    [
+     18,
+     0
+    ]
+   ],
+   "spawn_income": 0.133
+  },
+  "132": {
+   "solve": "turret",
+   "turret_s": 24.07,
+   "walker_s": 11.2,
+   "enemies": 8,
+   "chasers": 8,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "133": {
+   "solve": "turret",
+   "turret_s": 22.33,
+   "walker_s": 10.0,
+   "enemies": 7,
+   "chasers": 7,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "134": {
+   "solve": "turret",
+   "turret_s": 21.53,
+   "walker_s": 8.8,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "135": {
+   "solve": "turret",
+   "turret_s": 18.87,
+   "walker_s": 9.6,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "136": {
+   "solve": "turret",
+   "turret_s": 5.6,
+   "walker_s": 5.6,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "137": {
+   "solve": "turret",
+   "turret_s": 6.8,
+   "walker_s": 5.4,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "138": {
+   "solve": "turret",
+   "turret_s": 7.07,
+   "walker_s": 6.33,
+   "enemies": 8,
+   "chasers": 8,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "139": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 17.47,
+   "enemies": 9,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "140": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.47,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "141": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.2,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "142": {
+   "solve": "turret",
+   "turret_s": 28.73,
+   "walker_s": 5.47,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "143": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.47,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "145": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.13,
+   "enemies": 4,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "146": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.87,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "156": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.67,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 20.0,
+   "spawn_types": [],
+   "spawn_income": 0.267
+  },
+  "157": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.13,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "158": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.27,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "159": {
+   "solve": "turret",
+   "turret_s": 44.4,
+   "walker_s": 10.47,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "160": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.8,
+   "enemies": 6,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 10.0,
+   "spawn_types": [],
+   "spawn_income": 0.133
+  },
+  "161": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.4,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "162": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.33,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "163": {
+   "solve": "turret",
+   "turret_s": 6.33,
+   "walker_s": 3.13,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "164": {
+   "solve": "turret",
+   "turret_s": 13.93,
+   "walker_s": 19.07,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "165": {
+   "solve": "turret",
+   "turret_s": 13.2,
+   "walker_s": 10.47,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "166": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.53,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "167": {
+   "solve": "turret",
+   "turret_s": 15.07,
+   "walker_s": 14.67,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "168": {
+   "solve": "turret",
+   "turret_s": 8.93,
+   "walker_s": 8.13,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "169": {
+   "solve": "turret",
+   "turret_s": 9.33,
+   "walker_s": 11.4,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "170": {
+   "solve": "turret",
+   "turret_s": 39.27,
+   "walker_s": 7.13,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "171": {
+   "solve": "turret",
+   "turret_s": 15.13,
+   "walker_s": 15.87,
+   "enemies": 5,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "172": {
+   "solve": "turret",
+   "turret_s": 39.67,
+   "walker_s": 12.2,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "173": {
+   "solve": "turret",
+   "turret_s": 46.07,
+   "walker_s": 5.33,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "174": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.33,
+   "enemies": 5,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "175": {
+   "solve": "turret",
+   "turret_s": 9.27,
+   "walker_s": 9.27,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "177": {
+   "solve": "turret",
+   "turret_s": 48.4,
+   "walker_s": 7.13,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "178": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.47,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "179": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 2.73,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "180": {
+   "solve": "turret",
+   "turret_s": 29.67,
+   "walker_s": 5.0,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "181": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.4,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "182": {
+   "solve": "turret",
+   "turret_s": 38.73,
+   "walker_s": 6.73,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "183": {
+   "solve": "turret",
+   "turret_s": 3.13,
+   "walker_s": 2.6,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "184": {
+   "solve": "turret",
+   "turret_s": 8.07,
+   "walker_s": 4.2,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "185": {
+   "solve": "turret",
+   "turret_s": 4.2,
+   "walker_s": 4.8,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "186": {
+   "solve": "turret",
+   "turret_s": 4.07,
+   "walker_s": 3.73,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "187": {
+   "solve": "turret",
+   "turret_s": 3.33,
+   "walker_s": 2.67,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "188": {
+   "solve": "turret",
+   "turret_s": 20.6,
+   "walker_s": 5.6,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "189": {
+   "solve": "turret",
+   "turret_s": 54.27,
+   "walker_s": 6.0,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "190": {
+   "solve": "turret",
+   "turret_s": 4.8,
+   "walker_s": 5.2,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "191": {
+   "solve": "turret",
+   "turret_s": 2.8,
+   "walker_s": 3.33,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "192": {
+   "solve": "turret",
+   "turret_s": 6.27,
+   "walker_s": 4.67,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "193": {
+   "solve": "turret",
+   "turret_s": 8.47,
+   "walker_s": 7.53,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "194": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 15.47,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "195": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.13,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.017
+  },
+  "196": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.4,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "197": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.0,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 32.5,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.517
+  },
+  "198": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.53,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 32.5,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.517
+  },
+  "199": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.07,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 10.0,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.217
+  },
+  "200": {
+   "solve": "turret",
+   "turret_s": 6.8,
+   "walker_s": 7.6,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 32.5,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.517
+  },
+  "201": {
+   "solve": "turret",
+   "turret_s": 3.07,
+   "walker_s": 3.33,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "202": {
+   "solve": "turret",
+   "turret_s": 1.4,
+   "walker_s": 1.4,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "203": {
+   "solve": "turret",
+   "turret_s": 3.73,
+   "walker_s": 3.0,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "204": {
+   "solve": "turret",
+   "turret_s": 2.33,
+   "walker_s": 3.0,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "205": {
+   "solve": "turret",
+   "turret_s": 3.33,
+   "walker_s": 2.73,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "206": {
+   "solve": "turret",
+   "turret_s": 3.8,
+   "walker_s": 2.73,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "207": {
+   "solve": "turret",
+   "turret_s": 7.4,
+   "walker_s": 4.4,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "208": {
+   "solve": "turret",
+   "turret_s": 3.53,
+   "walker_s": 3.53,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "209": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.13,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "211": {
+   "solve": "turret",
+   "turret_s": 5.53,
+   "walker_s": 4.8,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "212": {
+   "solve": "turret",
+   "turret_s": 3.4,
+   "walker_s": 2.27,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "213": {
+   "solve": "turret",
+   "turret_s": 48.6,
+   "walker_s": 3.8,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "218": {
+   "solve": "turret",
+   "turret_s": 15.6,
+   "walker_s": 4.33,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "222": {
+   "solve": "turret",
+   "turret_s": 15.87,
+   "walker_s": 8.6,
+   "enemies": 12,
+   "chasers": 12,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "232": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.2,
+   "enemies": 5,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "233": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.53,
+   "enemies": 5,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "234": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.93,
+   "enemies": 6,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "235": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.2,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "236": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.47,
+   "enemies": 5,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "237": {
+   "solve": "turret",
+   "turret_s": 13.4,
+   "walker_s": 7.27,
+   "enemies": 5,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "238": {
+   "solve": "turret",
+   "turret_s": 53.87,
+   "walker_s": 5.93,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "239": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.93,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "240": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.87,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "241": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.87,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "242": {
+   "solve": "turret",
+   "turret_s": 49.93,
+   "walker_s": 8.27,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "243": {
+   "solve": "turret",
+   "turret_s": 4.53,
+   "walker_s": 4.2,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "244": {
+   "solve": "turret",
+   "turret_s": 5.27,
+   "walker_s": 5.2,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "245": {
+   "solve": "turret",
+   "turret_s": 4.53,
+   "walker_s": 4.87,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "246": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.4,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "247": {
+   "solve": "turret",
+   "turret_s": 7.07,
+   "walker_s": 5.6,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "248": {
+   "solve": "turret",
+   "turret_s": 8.47,
+   "walker_s": 4.87,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "249": {
+   "solve": "turret",
+   "turret_s": 25.67,
+   "walker_s": 10.2,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "250": {
+   "solve": "turret",
+   "turret_s": 14.33,
+   "walker_s": 9.6,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "251": {
+   "solve": "turret",
+   "turret_s": 13.4,
+   "walker_s": 9.87,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "252": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.27,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "253": {
+   "solve": "turret",
+   "turret_s": 54.47,
+   "walker_s": 14.07,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "254": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.67,
+   "enemies": 5,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "255": {
+   "solve": "turret",
+   "turret_s": 12.13,
+   "walker_s": 7.2,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "256": {
+   "solve": "turret",
+   "turret_s": 12.13,
+   "walker_s": 6.4,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "257": {
+   "solve": "turret",
+   "turret_s": 26.33,
+   "walker_s": 8.73,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "258": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 21.0,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.017
+  },
+  "259": {
+   "solve": "turret",
+   "turret_s": 7.93,
+   "walker_s": 7.93,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "260": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.67,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 32.5,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.517
+  },
+  "261": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.47,
+   "enemies": 5,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 6.5,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.103
+  },
+  "262": {
+   "solve": "turret",
+   "turret_s": 5.2,
+   "walker_s": 4.2,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "263": {
+   "solve": "turret",
+   "turret_s": 36.0,
+   "walker_s": 7.67,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "264": {
+   "solve": "turret",
+   "turret_s": 5.53,
+   "walker_s": 4.8,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "265": {
+   "solve": "turret",
+   "turret_s": 7.8,
+   "walker_s": 8.13,
+   "enemies": 8,
+   "chasers": 8,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "266": {
+   "solve": "turret",
+   "turret_s": 6.0,
+   "walker_s": 5.27,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "267": {
+   "solve": "turret",
+   "turret_s": 8.67,
+   "walker_s": 5.6,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 5.0,
+   "spawn_types": [],
+   "spawn_income": 0.067
+  },
+  "268": {
+   "solve": "turret",
+   "turret_s": 4.47,
+   "walker_s": 4.07,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "269": {
+   "solve": "turret",
+   "turret_s": 10.33,
+   "walker_s": 4.47,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "270": {
+   "solve": "turret",
+   "turret_s": 11.07,
+   "walker_s": 9.8,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "271": {
+   "solve": "turret",
+   "turret_s": 17.33,
+   "walker_s": 11.8,
+   "enemies": 5,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "272": {
+   "solve": "turret",
+   "turret_s": 9.93,
+   "walker_s": 6.27,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "277": {
+   "solve": "turret",
+   "turret_s": 7.47,
+   "walker_s": 3.6,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "290": {
+   "solve": "turret",
+   "turret_s": 2.93,
+   "walker_s": 2.93,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "293": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.8,
+   "enemies": 6,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "294": {
+   "solve": "turret",
+   "turret_s": 10.4,
+   "walker_s": 7.73,
+   "enemies": 7,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "295": {
+   "solve": "turret",
+   "turret_s": 55.73,
+   "walker_s": 10.73,
+   "enemies": 6,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "296": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.0,
+   "enemies": 8,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "297": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.93,
+   "enemies": 5,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "298": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.47,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "299": {
+   "solve": "turret",
+   "turret_s": 21.67,
+   "walker_s": 6.07,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "300": {
+   "solve": "turret",
+   "turret_s": 40.53,
+   "walker_s": 8.0,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "301": {
+   "solve": "turret",
+   "turret_s": 53.93,
+   "walker_s": 10.87,
+   "enemies": 4,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "302": {
+   "solve": "turret",
+   "turret_s": 5.2,
+   "walker_s": 5.2,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "303": {
+   "solve": "turret",
+   "turret_s": 5.27,
+   "walker_s": 4.53,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "304": {
+   "solve": "turret",
+   "turret_s": 7.07,
+   "walker_s": 5.6,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "305": {
+   "solve": "turret",
+   "turret_s": 36.13,
+   "walker_s": 8.73,
+   "enemies": 7,
+   "chasers": 7,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "306": {
+   "solve": "turret",
+   "turret_s": 8.93,
+   "walker_s": 7.8,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "307": {
+   "solve": "turret",
+   "turret_s": 5.53,
+   "walker_s": 4.53,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "308": {
+   "solve": "turret",
+   "turret_s": 22.73,
+   "walker_s": 5.93,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "309": {
+   "solve": "turret",
+   "turret_s": 8.53,
+   "walker_s": 6.93,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "310": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.8,
+   "enemies": 5,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "311": {
+   "solve": "turret",
+   "turret_s": 13.67,
+   "walker_s": 11.8,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "312": {
+   "solve": "turret",
+   "turret_s": 8.87,
+   "walker_s": 4.87,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "313": {
+   "solve": "turret",
+   "turret_s": 16.67,
+   "walker_s": 9.33,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "314": {
+   "solve": "turret",
+   "turret_s": 15.2,
+   "walker_s": 13.0,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "316": {
+   "solve": "turret",
+   "turret_s": 5.2,
+   "walker_s": 5.2,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "317": {
+   "solve": "turret",
+   "turret_s": 8.6,
+   "walker_s": 6.47,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "318": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.33,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 4,
+   "spawn_hp_15s": 60.0,
+   "spawn_types": [
+    [
+     30,
+     2
+    ]
+   ],
+   "spawn_income": 0.867
+  },
+  "319": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.87,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 19.5,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.31
+  },
+  "320": {
+   "solve": "turret",
+   "turret_s": 5.93,
+   "walker_s": 5.93,
+   "enemies": 8,
+   "chasers": 8,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "321": {
+   "solve": "turret",
+   "turret_s": 8.2,
+   "walker_s": 6.67,
+   "enemies": 8,
+   "chasers": 8,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "322": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.8,
+   "enemies": 6,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "323": {
+   "solve": "turret",
+   "turret_s": 7.47,
+   "walker_s": 7.07,
+   "enemies": 8,
+   "chasers": 8,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "324": {
+   "solve": "turret",
+   "turret_s": 16.8,
+   "walker_s": 10.67,
+   "enemies": 6,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "325": {
+   "solve": "turret",
+   "turret_s": 11.07,
+   "walker_s": 10.0,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "326": {
+   "solve": "turret",
+   "turret_s": 12.13,
+   "walker_s": 11.47,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "327": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.93,
+   "enemies": 5,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "328": {
+   "solve": "turret",
+   "turret_s": 12.6,
+   "walker_s": 9.93,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "329": {
+   "solve": "turret",
+   "turret_s": 13.27,
+   "walker_s": 12.87,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "335": {
+   "solve": "turret",
+   "turret_s": 6.27,
+   "walker_s": 8.6,
+   "enemies": 4,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "340": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 23.93,
+   "enemies": 12,
+   "chasers": 7,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "495": {
+   "solve": "turret",
+   "turret_s": 7.8,
+   "walker_s": 5.33,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "496": {
+   "solve": "turret",
+   "turret_s": 12.67,
+   "walker_s": 14.53,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "497": {
+   "solve": "turret",
+   "turret_s": 5.27,
+   "walker_s": 10.33,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "498": {
+   "solve": "turret",
+   "turret_s": 35.47,
+   "walker_s": 7.8,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "499": {
+   "solve": "turret",
+   "turret_s": 10.0,
+   "walker_s": 6.73,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "500": {
+   "solve": "turret",
+   "turret_s": 18.6,
+   "walker_s": 9.13,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "501": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.13,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "502": {
+   "solve": "turret",
+   "turret_s": 8.87,
+   "walker_s": 4.13,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "505": {
+   "solve": "turret",
+   "turret_s": 37.87,
+   "walker_s": 5.87,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "506": {
+   "solve": "turret",
+   "turret_s": 8.87,
+   "walker_s": 5.27,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "507": {
+   "solve": "turret",
+   "turret_s": 55.0,
+   "walker_s": 9.33,
+   "enemies": 5,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "508": {
+   "solve": "turret",
+   "turret_s": 39.53,
+   "walker_s": 8.47,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 30.0,
+   "spawn_types": [],
+   "spawn_income": 0.4
+  },
+  "509": {
+   "solve": "turret",
+   "turret_s": 22.4,
+   "walker_s": 6.93,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "510": {
+   "solve": "turret",
+   "turret_s": 8.4,
+   "walker_s": 5.47,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "511": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.73,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "512": {
+   "solve": "turret",
+   "turret_s": 20.2,
+   "walker_s": 8.73,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "515": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.2,
+   "enemies": 8,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "516": {
+   "solve": "turret",
+   "turret_s": 14.53,
+   "walker_s": 11.07,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "517": {
+   "solve": "turret",
+   "turret_s": 8.2,
+   "walker_s": 7.4,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "518": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.87,
+   "enemies": 5,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "533": {
+   "solve": "turret",
+   "turret_s": 5.33,
+   "walker_s": 3.73,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "534": {
+   "solve": "turret",
+   "turret_s": 30.6,
+   "walker_s": 11.2,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "535": {
+   "solve": "turret",
+   "turret_s": 19.0,
+   "walker_s": 9.73,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "536": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.27,
+   "enemies": 7,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "537": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.93,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "538": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.27,
+   "enemies": 6,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "539": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 18.13,
+   "enemies": 9,
+   "chasers": 7,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "540": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.0,
+   "enemies": 5,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "547": {
+   "solve": "turret",
+   "turret_s": 7.47,
+   "walker_s": 6.0,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "548": {
+   "solve": "turret",
+   "turret_s": 1.73,
+   "walker_s": 1.73,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "549": {
+   "solve": "turret",
+   "turret_s": 4.93,
+   "walker_s": 3.87,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "550": {
+   "solve": "turret",
+   "turret_s": 8.53,
+   "walker_s": 6.67,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "551": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.0,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "552": {
+   "solve": "turret",
+   "turret_s": 10.4,
+   "walker_s": 6.27,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "553": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.8,
+   "enemies": 6,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "554": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.87,
+   "enemies": 6,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "555": {
+   "solve": "turret",
+   "turret_s": 22.13,
+   "walker_s": 7.87,
+   "enemies": 5,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "556": {
+   "solve": "turret",
+   "turret_s": 47.07,
+   "walker_s": 11.47,
+   "enemies": 4,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "557": {
+   "solve": "turret",
+   "turret_s": 46.6,
+   "walker_s": 10.67,
+   "enemies": 6,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "558": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 30.87,
+   "enemies": 8,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "627": {
+   "solve": "turret",
+   "turret_s": 4.87,
+   "walker_s": 4.87,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "628": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 4.27,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 15.0,
+   "spawn_types": [
+    [
+     256,
+     0
+    ]
+   ],
+   "spawn_income": 0.25
+  },
+  "629": {
+   "solve": "turret",
+   "turret_s": 4.47,
+   "walker_s": 2.6,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "630": {
+   "solve": "turret",
+   "turret_s": 18.0,
+   "walker_s": 3.67,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "631": {
+   "solve": "turret",
+   "turret_s": 4.07,
+   "walker_s": 3.27,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "632": {
+   "solve": "turret",
+   "turret_s": 3.4,
+   "walker_s": 3.07,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "633": {
+   "solve": "turret",
+   "turret_s": 3.0,
+   "walker_s": 3.73,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "634": {
+   "solve": "turret",
+   "turret_s": 5.53,
+   "walker_s": 3.93,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "635": {
+   "solve": "turret",
+   "turret_s": 5.93,
+   "walker_s": 5.53,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "637": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.27,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 5.0,
+   "spawn_types": [
+    [
+     256,
+     0
+    ]
+   ],
+   "spawn_income": 0.083
+  },
+  "638": {
+   "solve": "turret",
+   "turret_s": 8.87,
+   "walker_s": 7.93,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "639": {
+   "solve": "turret",
+   "turret_s": 29.4,
+   "walker_s": 8.93,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "640": {
+   "solve": "turret",
+   "turret_s": 7.4,
+   "walker_s": 7.0,
+   "enemies": 9,
+   "chasers": 9,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "641": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.33,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 15.0,
+   "spawn_types": [
+    [
+     256,
+     0
+    ]
+   ],
+   "spawn_income": 0.25
+  },
+  "642": {
+   "solve": "turret",
+   "turret_s": 5.2,
+   "walker_s": 6.27,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "643": {
+   "solve": "turret",
+   "turret_s": 12.8,
+   "walker_s": 8.6,
+   "enemies": 7,
+   "chasers": 7,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "644": {
+   "solve": "turret",
+   "turret_s": 16.2,
+   "walker_s": 7.47,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "645": {
+   "solve": "turret",
+   "turret_s": 8.27,
+   "walker_s": 5.47,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "646": {
+   "solve": "turret",
+   "turret_s": 8.6,
+   "walker_s": 4.47,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "648": {
+   "solve": "turret",
+   "turret_s": 35.53,
+   "walker_s": 7.47,
+   "enemies": 5,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "649": {
+   "solve": "turret",
+   "turret_s": 7.0,
+   "walker_s": 4.8,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "650": {
+   "solve": "turret",
+   "turret_s": 5.27,
+   "walker_s": 4.87,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "651": {
+   "solve": "turret",
+   "turret_s": 9.8,
+   "walker_s": 9.8,
+   "enemies": 11,
+   "chasers": 10,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "652": {
+   "solve": "turret",
+   "turret_s": 33.93,
+   "walker_s": 11.6,
+   "enemies": 7,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "653": {
+   "solve": "turret",
+   "turret_s": 11.4,
+   "walker_s": 11.4,
+   "enemies": 15,
+   "chasers": 15,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "654": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.6,
+   "enemies": 5,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 5.0,
+   "spawn_types": [
+    [
+     256,
+     0
+    ]
+   ],
+   "spawn_income": 0.083
+  },
+  "655": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 14.73,
+   "enemies": 7,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "656": {
+   "solve": "turret",
+   "turret_s": 10.67,
+   "walker_s": 7.87,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "658": {
+   "solve": "turret",
+   "turret_s": 9.27,
+   "walker_s": 9.67,
+   "enemies": 10,
+   "chasers": 10,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "659": {
+   "solve": "turret",
+   "turret_s": 7.07,
+   "walker_s": 4.8,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "660": {
+   "solve": "turret",
+   "turret_s": 44.07,
+   "walker_s": 5.0,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "661": {
+   "solve": "turret",
+   "turret_s": 9.8,
+   "walker_s": 6.13,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "662": {
+   "solve": "turret",
+   "turret_s": 4.47,
+   "walker_s": 4.53,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "663": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.67,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "664": {
+   "solve": "turret",
+   "turret_s": 10.67,
+   "walker_s": 6.13,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "665": {
+   "solve": "turret",
+   "turret_s": 8.87,
+   "walker_s": 4.07,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "666": {
+   "solve": "turret",
+   "turret_s": 3.07,
+   "walker_s": 2.6,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "667": {
+   "solve": "turret",
+   "turret_s": 5.6,
+   "walker_s": 4.53,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "668": {
+   "solve": "turret",
+   "turret_s": 34.6,
+   "walker_s": 4.87,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 9,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.15
+  },
+  "669": {
+   "solve": "turret",
+   "turret_s": 6.67,
+   "walker_s": 4.27,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "670": {
+   "solve": "turret",
+   "turret_s": 5.47,
+   "walker_s": 7.2,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "671": {
+   "solve": "turret",
+   "turret_s": 4.93,
+   "walker_s": 4.8,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "672": {
+   "solve": "turret",
+   "turret_s": 6.73,
+   "walker_s": 6.07,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "673": {
+   "solve": "turret",
+   "turret_s": 8.53,
+   "walker_s": 8.13,
+   "enemies": 10,
+   "chasers": 10,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "674": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.93,
+   "enemies": 4,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "675": {
+   "solve": "turret",
+   "turret_s": 57.33,
+   "walker_s": 8.8,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 2,
+   "spawn_hp_15s": 10.0,
+   "spawn_types": [
+    [
+     256,
+     0
+    ]
+   ],
+   "spawn_income": 0.167
+  },
+  "676": {
+   "solve": "turret",
+   "turret_s": 17.67,
+   "walker_s": 7.0,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "677": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.13,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "678": {
+   "solve": "turret",
+   "turret_s": 16.27,
+   "walker_s": 5.93,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "679": {
+   "solve": "turret",
+   "turret_s": 10.93,
+   "walker_s": 6.33,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "680": {
+   "solve": "turret",
+   "turret_s": 7.07,
+   "walker_s": 6.53,
+   "enemies": 5,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "681": {
+   "solve": "turret",
+   "turret_s": 17.27,
+   "walker_s": 8.53,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 4.0,
+   "spawn_types": [],
+   "spawn_income": 0.053
+  },
+  "682": {
+   "solve": "turret",
+   "turret_s": 9.93,
+   "walker_s": 5.53,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 20.0,
+   "spawn_types": [],
+   "spawn_income": 0.267
+  },
+  "683": {
+   "solve": "turret",
+   "turret_s": 10.87,
+   "walker_s": 10.73,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "684": {
+   "solve": "turret",
+   "turret_s": 34.53,
+   "walker_s": 5.2,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 25.0,
+   "spawn_types": [
+    [
+     256,
+     0
+    ]
+   ],
+   "spawn_income": 0.417
+  },
+  "685": {
+   "solve": "turret",
+   "turret_s": 14.33,
+   "walker_s": 5.93,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "686": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 14.8,
+   "enemies": 5,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "687": {
+   "solve": "turret",
+   "turret_s": 33.4,
+   "walker_s": 7.53,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 4,
+   "spawn_hp_15s": 20.0,
+   "spawn_types": [
+    [
+     256,
+     0
+    ]
+   ],
+   "spawn_income": 0.333
+  },
+  "688": {
+   "solve": "turret",
+   "turret_s": 13.0,
+   "walker_s": 12.53,
+   "enemies": 15,
+   "chasers": 15,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "689": {
+   "solve": "turret",
+   "turret_s": 7.47,
+   "walker_s": 7.47,
+   "enemies": 9,
+   "chasers": 9,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "690": {
+   "solve": "turret",
+   "turret_s": 20.4,
+   "walker_s": 15.87,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "691": {
+   "solve": "turret",
+   "turret_s": 14.0,
+   "walker_s": 11.8,
+   "enemies": 6,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "692": {
+   "solve": "turret",
+   "turret_s": 12.27,
+   "walker_s": 9.87,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "693": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.8,
+   "enemies": 7,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "694": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.53,
+   "enemies": 5,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "695": {
+   "solve": "turret",
+   "turret_s": 9.27,
+   "walker_s": 9.2,
+   "enemies": 11,
+   "chasers": 11,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "696": {
+   "solve": "turret",
+   "turret_s": 23.47,
+   "walker_s": 11.73,
+   "enemies": 8,
+   "chasers": 8,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "697": {
+   "solve": "turret",
+   "turret_s": 9.2,
+   "walker_s": 14.2,
+   "enemies": 6,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "698": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.2,
+   "enemies": 5,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "699": {
+   "solve": "turret",
+   "turret_s": 5.93,
+   "walker_s": 10.0,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "748": {
+   "solve": "neither",
+   "turret_s": null,
+   "walker_s": null,
+   "enemies": 0,
+   "chasers": 0,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "764": {
+   "solve": "neither",
+   "turret_s": null,
+   "walker_s": null,
+   "enemies": 0,
+   "chasers": 0,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "765": {
+   "solve": "neither",
+   "turret_s": null,
+   "walker_s": null,
+   "enemies": 0,
+   "chasers": 0,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "770": {
+   "solve": "neither",
+   "turret_s": null,
+   "walker_s": null,
+   "enemies": 0,
+   "chasers": 0,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "835": {
+   "solve": "turret",
+   "turret_s": 40.4,
+   "walker_s": 8.73,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "836": {
+   "solve": "turret",
+   "turret_s": 12.4,
+   "walker_s": 10.07,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "837": {
+   "solve": "turret",
+   "turret_s": 27.2,
+   "walker_s": 13.4,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "838": {
+   "solve": "turret",
+   "turret_s": 14.33,
+   "walker_s": 10.73,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "839": {
+   "solve": "turret",
+   "turret_s": 10.33,
+   "walker_s": 5.6,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "840": {
+   "solve": "turret",
+   "turret_s": 5.6,
+   "walker_s": 5.27,
+   "enemies": 7,
+   "chasers": 7,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "841": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 14.0,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "842": {
+   "solve": "turret",
+   "turret_s": 48.47,
+   "walker_s": 10.67,
+   "enemies": 6,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "843": {
+   "solve": "turret",
+   "turret_s": 46.4,
+   "walker_s": 8.0,
+   "enemies": 5,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "844": {
+   "solve": "turret",
+   "turret_s": 22.13,
+   "walker_s": 6.67,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "845": {
+   "solve": "turret",
+   "turret_s": 10.6,
+   "walker_s": 12.33,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "846": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.93,
+   "enemies": 6,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "847": {
+   "solve": "turret",
+   "turret_s": 6.67,
+   "walker_s": 6.0,
+   "enemies": 7,
+   "chasers": 7,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "848": {
+   "solve": "turret",
+   "turret_s": 14.0,
+   "walker_s": 11.8,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "849": {
+   "solve": "turret",
+   "turret_s": 11.13,
+   "walker_s": 10.87,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "850": {
+   "solve": "turret",
+   "turret_s": 20.8,
+   "walker_s": 12.67,
+   "enemies": 5,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "851": {
+   "solve": "turret",
+   "turret_s": 8.13,
+   "walker_s": 8.13,
+   "enemies": 11,
+   "chasers": 11,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "852": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.13,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "853": {
+   "solve": "turret",
+   "turret_s": 6.73,
+   "walker_s": 6.73,
+   "enemies": 9,
+   "chasers": 9,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "854": {
+   "solve": "turret",
+   "turret_s": 39.27,
+   "walker_s": 10.93,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "855": {
+   "solve": "turret",
+   "turret_s": 18.0,
+   "walker_s": 4.33,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 26.5,
+   "spawn_types": [
+    [
+     10,
+     0
+    ],
+    [
+     85,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.403
+  },
+  "856": {
+   "solve": "turret",
+   "turret_s": 11.8,
+   "walker_s": 7.4,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 30.0,
+   "spawn_types": [
+    [
+     29,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.45
+  },
+  "857": {
+   "solve": "turret",
+   "turret_s": 4.07,
+   "walker_s": 4.07,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 2,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     18,
+     0
+    ],
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.068
+  },
+  "858": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.0,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 33.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     29,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.49
+  },
+  "859": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 4.73,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 9.5,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     85,
+     0
+    ],
+    [
+     217,
+     0
+    ]
+   ],
+   "spawn_income": 0.177
+  },
+  "860": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.67,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 2,
+   "spawn_hp_15s": 4.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     18,
+     0
+    ]
+   ],
+   "spawn_income": 0.087
+  },
+  "861": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 3.87,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 26.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.397
+  },
+  "862": {
+   "solve": "turret",
+   "turret_s": 7.0,
+   "walker_s": 4.47,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     10,
+     0
+    ]
+   ],
+   "spawn_income": 0.017
+  },
+  "863": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.13,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 10.0,
+   "spawn_types": [
+    [
+     10,
+     0
+    ],
+    [
+     217,
+     0
+    ]
+   ],
+   "spawn_income": 0.183
+  },
+  "864": {
+   "solve": "turret",
+   "turret_s": 17.07,
+   "walker_s": 7.13,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     217,
+     0
+    ]
+   ],
+   "spawn_income": 0.05
+  },
+  "865": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.6,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 27.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     217,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.41
+  },
+  "866": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.2,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ]
+   ],
+   "spawn_income": 0.017
+  },
+  "867": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.13,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 1.5,
+   "spawn_types": [
+    [
+     18,
+     0
+    ],
+    [
+     85,
+     0
+    ],
+    [
+     217,
+     0
+    ]
+   ],
+   "spawn_income": 0.07
+  },
+  "868": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.27,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 21.5,
+   "spawn_types": [
+    [
+     10,
+     0
+    ],
+    [
+     18,
+     0
+    ],
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.337
+  },
+  "869": {
+   "solve": "turret",
+   "turret_s": 22.6,
+   "walker_s": 7.8,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     29,
+     0
+    ]
+   ],
+   "spawn_income": 0.017
+  },
+  "870": {
+   "solve": "turret",
+   "turret_s": 20.6,
+   "walker_s": 5.93,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 12.5,
+   "spawn_types": [
+    [
+     29,
+     0
+    ],
+    [
+     85,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.217
+  },
+  "871": {
+   "solve": "turret",
+   "turret_s": 6.2,
+   "walker_s": 7.4,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 4,
+   "spawn_hp_15s": 20.0,
+   "spawn_types": [
+    [
+     18,
+     0
+    ],
+    [
+     29,
+     0
+    ],
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.333
+  },
+  "872": {
+   "solve": "turret",
+   "turret_s": 4.4,
+   "walker_s": 2.87,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     18,
+     0
+    ]
+   ],
+   "spawn_income": 0.017
+  },
+  "873": {
+   "solve": "turret",
+   "turret_s": 29.73,
+   "walker_s": 4.13,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 1,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.017
+  },
+  "874": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 4.13,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 19.0,
+   "spawn_types": [
+    [
+     18,
+     0
+    ],
+    [
+     29,
+     0
+    ],
+    [
+     217,
+     0
+    ]
+   ],
+   "spawn_income": 0.303
+  },
+  "876": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.13,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 6,
+   "spawn_hp_15s": 19.0,
+   "spawn_types": [
+    [
+     10,
+     0
+    ],
+    [
+     16,
+     0
+    ],
+    [
+     18,
+     0
+    ],
+    [
+     217,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.353
+  },
+  "877": {
+   "solve": "turret",
+   "turret_s": 31.2,
+   "walker_s": 17.73,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 9.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     18,
+     0
+    ],
+    [
+     217,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.203
+  },
+  "878": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 18.47,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 9,
+   "spawn_hp_15s": 66.5,
+   "spawn_types": [
+    [
+     10,
+     0
+    ],
+    [
+     16,
+     0
+    ],
+    [
+     18,
+     0
+    ],
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 1.037
+  },
+  "879": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 14.73,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 8,
+   "spawn_hp_15s": 24.5,
+   "spawn_types": [
+    [
+     13,
+     0
+    ],
+    [
+     16,
+     0
+    ],
+    [
+     29,
+     0
+    ],
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.46
+  },
+  "880": {
+   "solve": "turret",
+   "turret_s": 54.33,
+   "walker_s": 14.53,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 4,
+   "spawn_hp_15s": 28.5,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     29,
+     0
+    ],
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.447
+  },
+  "881": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.47,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 6,
+   "spawn_hp_15s": 43.0,
+   "spawn_types": [
+    [
+     10,
+     0
+    ],
+    [
+     16,
+     0
+    ],
+    [
+     29,
+     0
+    ],
+    [
+     217,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.673
+  },
+  "882": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.67,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 5,
+   "spawn_hp_15s": 20.0,
+   "spawn_types": [
+    [
+     10,
+     0
+    ],
+    [
+     16,
+     0
+    ],
+    [
+     18,
+     0
+    ],
+    [
+     29,
+     0
+    ]
+   ],
+   "spawn_income": 0.35
+  },
+  "883": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 5.6,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     85,
+     0
+    ],
+    [
+     217,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.05
+  },
+  "884": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 7.47,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 2,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.033
+  },
+  "885": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.6,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     29,
+     0
+    ],
+    [
+     217,
+     0
+    ]
+   ],
+   "spawn_income": 0.05
+  },
+  "886": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.67,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 4,
+   "spawn_hp_15s": 10.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     18,
+     0
+    ],
+    [
+     29,
+     0
+    ]
+   ],
+   "spawn_income": 0.2
+  },
+  "887": {
+   "solve": "turret",
+   "turret_s": 8.2,
+   "walker_s": 8.2,
+   "enemies": 11,
+   "chasers": 11,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "888": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 17.33,
+   "enemies": 8,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "889": {
+   "solve": "turret",
+   "turret_s": 23.2,
+   "walker_s": 9.0,
+   "enemies": 7,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "890": {
+   "solve": "turret",
+   "turret_s": 26.53,
+   "walker_s": 23.47,
+   "enemies": 10,
+   "chasers": 10,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "891": {
+   "solve": "turret",
+   "turret_s": 30.6,
+   "walker_s": 11.67,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "892": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 16.2,
+   "enemies": 9,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "893": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.33,
+   "enemies": 6,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "894": {
+   "solve": "turret",
+   "turret_s": 20.93,
+   "walker_s": 16.27,
+   "enemies": 7,
+   "chasers": 7,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "895": {
+   "solve": "turret",
+   "turret_s": 17.33,
+   "walker_s": 12.53,
+   "enemies": 7,
+   "chasers": 7,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "896": {
+   "solve": "turret",
+   "turret_s": 9.27,
+   "walker_s": 9.27,
+   "enemies": 12,
+   "chasers": 12,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "909": {
+   "solve": "turret",
+   "turret_s": 5.53,
+   "walker_s": 5.2,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "910": {
+   "solve": "turret",
+   "turret_s": 11.4,
+   "walker_s": 4.13,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "911": {
+   "solve": "turret",
+   "turret_s": 24.6,
+   "walker_s": 4.73,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "912": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 21.33,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "913": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 6.07,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "914": {
+   "solve": "turret",
+   "turret_s": 13.67,
+   "walker_s": 13.67,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "915": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 15.67,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "916": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 4.4,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "917": {
+   "solve": "turret",
+   "turret_s": 7.33,
+   "walker_s": 2.93,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "918": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 15.87,
+   "enemies": 1,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "919": {
+   "solve": "turret",
+   "turret_s": 10.0,
+   "walker_s": 6.53,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "920": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.6,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "921": {
+   "solve": "turret",
+   "turret_s": 52.6,
+   "walker_s": 17.67,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "922": {
+   "solve": "turret",
+   "turret_s": 27.73,
+   "walker_s": 12.27,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "923": {
+   "solve": "turret",
+   "turret_s": 23.53,
+   "walker_s": 3.0,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "924": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 34.0,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "925": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.87,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "926": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 8.87,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "927": {
+   "solve": "turret",
+   "turret_s": 10.0,
+   "walker_s": 5.93,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "928": {
+   "solve": "turret",
+   "turret_s": 26.53,
+   "walker_s": 4.8,
+   "enemies": 2,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "929": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 20.0,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "930": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 38.53,
+   "enemies": 8,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "931": {
+   "solve": "turret",
+   "turret_s": 18.33,
+   "walker_s": 14.0,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "932": {
+   "solve": "turret",
+   "turret_s": 28.2,
+   "walker_s": 46.53,
+   "enemies": 5,
+   "chasers": 5,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "933": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 11.87,
+   "enemies": 4,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "934": {
+   "solve": "turret",
+   "turret_s": 27.27,
+   "walker_s": 27.27,
+   "enemies": 4,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 10,
+   "spawn_hp_15s": 7.0,
+   "spawn_types": [
+    [
+     13,
+     0
+    ],
+    [
+     14,
+     0
+    ],
+    [
+     18,
+     0
+    ],
+    [
+     85,
+     0
+    ]
+   ],
+   "spawn_income": 0.26
+  },
+  "935": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.33,
+   "enemies": 6,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "936": {
+   "solve": "turret",
+   "turret_s": 14.07,
+   "walker_s": 10.47,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "937": {
+   "solve": "turret",
+   "turret_s": 18.87,
+   "walker_s": 14.07,
+   "enemies": 3,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "938": {
+   "solve": "turret",
+   "turret_s": 29.13,
+   "walker_s": 33.53,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "939": {
+   "solve": "turret",
+   "turret_s": 22.8,
+   "walker_s": 10.67,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "968": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 12.47,
+   "enemies": 2,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 3,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [
+    [
+     16,
+     0
+    ],
+    [
+     18,
+     0
+    ],
+    [
+     244,
+     0
+    ]
+   ],
+   "spawn_income": 0.05
+  },
+  "1033": {
+   "solve": "turret",
+   "turret_s": 10.67,
+   "walker_s": 13.6,
+   "enemies": 6,
+   "chasers": 6,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1034": {
+   "solve": "turret",
+   "turret_s": 7.0,
+   "walker_s": 6.8,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1037": {
+   "solve": "turret",
+   "turret_s": 3.07,
+   "walker_s": 2.87,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1040": {
+   "solve": "turret",
+   "turret_s": 10.67,
+   "walker_s": 7.4,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1041": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.47,
+   "enemies": 3,
+   "chasers": 0,
+   "non_chasing": true,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1043": {
+   "solve": "turret",
+   "turret_s": 8.93,
+   "walker_s": 6.73,
+   "enemies": 1,
+   "chasers": 1,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1044": {
+   "solve": "turret",
+   "turret_s": 50.27,
+   "walker_s": 7.47,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1045": {
+   "solve": "turret",
+   "turret_s": 21.73,
+   "walker_s": 8.6,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1046": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 9.53,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1047": {
+   "solve": "turret",
+   "turret_s": 28.27,
+   "walker_s": 13.13,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1048": {
+   "solve": "turret",
+   "turret_s": 22.67,
+   "walker_s": 11.8,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1049": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 10.67,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1050": {
+   "solve": "needs_positioning",
+   "turret_s": null,
+   "walker_s": 13.07,
+   "enemies": 4,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1051": {
+   "solve": "turret",
+   "turret_s": 29.67,
+   "walker_s": 9.07,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1052": {
+   "solve": "turret",
+   "turret_s": 15.73,
+   "walker_s": 7.27,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1053": {
+   "solve": "turret",
+   "turret_s": 58.73,
+   "walker_s": 11.07,
+   "enemies": 4,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1054": {
+   "solve": "turret",
+   "turret_s": 13.0,
+   "walker_s": 11.27,
+   "enemies": 5,
+   "chasers": 4,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1070": {
+   "solve": "turret",
+   "turret_s": 9.6,
+   "walker_s": 6.47,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1071": {
+   "solve": "turret",
+   "turret_s": 10.33,
+   "walker_s": 17.87,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1077": {
+   "solve": "turret",
+   "turret_s": 8.73,
+   "walker_s": 10.67,
+   "enemies": 2,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1078": {
+   "solve": "turret",
+   "turret_s": 10.67,
+   "walker_s": 9.67,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1079": {
+   "solve": "turret",
+   "turret_s": 6.6,
+   "walker_s": 8.2,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1080": {
+   "solve": "turret",
+   "turret_s": 21.0,
+   "walker_s": 7.27,
+   "enemies": 4,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1081": {
+   "solve": "turret",
+   "turret_s": 5.93,
+   "walker_s": 5.93,
+   "enemies": 3,
+   "chasers": 2,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  },
+  "1082": {
+   "solve": "turret",
+   "turret_s": 4.53,
+   "walker_s": 4.87,
+   "enemies": 3,
+   "chasers": 3,
+   "non_chasing": false,
+   "spawns_15s": 0,
+   "spawn_hp_15s": 0.0,
+   "spawn_types": [],
+   "spawn_income": 0.0
+  }
+ }
+}

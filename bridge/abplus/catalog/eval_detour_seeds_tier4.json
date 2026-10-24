@@ -1,0 +1,77 @@
+{
+ "description": "Tier-4 detour seeds (EXPERIMENTS.md C26/C27): the first 12 seeds from 2147491600 whose tier-4 episode (mixture_target_tier4.json, its own target arena) is a Horf whose walking distance to a firing position is >= 60 px longer than the straight one (/tmp/asy/detour_seeds.py). Evaluate other tiers' checkpoints with --tasks-file mixture_target_tier4.json --target-from-tasks. walk / straight: px at the start.",
+ "seeds": [
+  {
+   "seed": 2147491621,
+   "room": 120,
+   "walk": 459,
+   "straight": 219
+  },
+  {
+   "seed": 2147491633,
+   "room": 140,
+   "walk": 252,
+   "straight": 189
+  },
+  {
+   "seed": 2147491699,
+   "room": 158,
+   "walk": 339,
+   "straight": 71
+  },
+  {
+   "seed": 2147491726,
+   "room": 77,
+   "walk": 179,
+   "straight": 71
+  },
+  {
+   "seed": 2147491767,
+   "room": 536,
+   "walk": 275,
+   "straight": 152
+  },
+  {
+   "seed": 2147491796,
+   "room": 53,
+   "walk": 389,
+   "straight": 286
+  },
+  {
+   "seed": 2147491929,
+   "room": 74,
+   "walk": 219,
+   "straight": 139
+  },
+  {
+   "seed": 2147492073,
+   "room": 132,
+   "walk": 469,
+   "straight": 345
+  },
+  {
+   "seed": 2147492197,
+   "room": 71,
+   "walk": 235,
+   "straight": 171
+  },
+  {
+   "seed": 2147492284,
+   "room": 7,
+   "walk": 180,
+   "straight": 116
+  },
+  {
+   "seed": 2147492528,
+   "room": 158,
+   "walk": 252,
+   "straight": 110
+  },
+  {
+   "seed": 2147492626,
+   "room": 80,
+   "walk": 259,
+   "straight": 139
+  }
+ ]
+}

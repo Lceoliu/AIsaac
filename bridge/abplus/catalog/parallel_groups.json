@@ -1,0 +1,11 @@
+{
+  "description": "Parallel task groups (user plan 2026-09-28, isaac_bridge/abplus_groups.py): normal-room combat, the obstacle / detour / dead-end aiming arena and the dodging arena trained together. Shares are shares of the collected environment steps (train_abplus --budget steps or slots), a proposal to be decided; tasks are relative to this file.",
+  "groups": [
+    {"name": "normal", "tasks": "mixture_positioning_rooms.json", "share": 0.5, "episode_seconds": 180,
+     "about": "202 positioning / non-chasing Basement I normal rooms with their own enemies (C19, C31, C37)"},
+    {"name": "obstacles", "tasks": "mixture_target_tier8.json", "share": 0.25, "episode_seconds": 30,
+     "about": "aiming arena tier 8: tier-4 mix 40% / detour 30% / dead-end 30% starts, 0-2 extra NPCs (C30)"},
+    {"name": "dodge", "tasks": "mixture_target_dodge.json", "share": 0.25, "episode_seconds": 30,
+     "about": "dodging arena: C22's 63 empty rooms with 1-4 shooters (Horf, Round Worm, Pooter) (C35)"}
+  ]
+}

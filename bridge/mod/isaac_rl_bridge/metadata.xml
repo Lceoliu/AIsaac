@@ -1,0 +1,7 @@
+<metadata>
+	<name>IsaacRLBridge</name>
+	<directory>isaac_rl_bridge</directory>
+	<description>Synchronous TCP bridge for RL research (observation whitelist + input override). Requires --luadebug.</description>
+	<version>0.2.0</version>
+	<visibility>Private</visibility>
+</metadata>

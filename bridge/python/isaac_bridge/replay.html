@@ -1,0 +1,21 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><title>Isaac · 状态回放</title>
+<style>body{background:#171a1e;color:#ddd;font:16px system-ui;max-width:960px;margin:24px auto}canvas{width:100%;background:#302a25}button,input,select{margin:12px 8px 12px 0}input{width:65%}pre{white-space:pre-wrap}a{color:#91bedb}</style>
+<h1>Isaac · 状态回放</h1><canvas id="view" width="960" height="720"></canvas>
+<button id="play">播放 / 暂停</button><input id="seek" type="range" min="0" value="0"><select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option><option>4</option></select>
+<pre id="status"></pre><p>几何状态回放；圆圈是地面碰撞范围，子弹亮点按高度投影。Boss 离地时显示环形阴影；动画名称与帧号来自记录，并非原版精灵动画。</p>
+<script>
+const replay=/*REPLAY_DATA*/;
+const canvas=document.getElementById('view'),ctx=canvas.getContext('2d'),seek=document.getElementById('seek'),status=document.getElementById('status');
+let frame=0,playing=false,last=0;seek.max=replay.rows.length-1;
+function circle(p,r,color,fill=true){ctx.beginPath();ctx.arc(p[0],p[1],Math.max(1,r),0,2*Math.PI);ctx[fill?'fillStyle':'strokeStyle']=color;fill?ctx.fill():ctx.stroke()}
+function draw(){const row=replay.rows[frame],s=row.state;ctx.clearRect(0,0,960,720);ctx.save();ctx.scale(1.5,1.5);
+for(const c of s.terrain.cells){ctx.fillStyle=c[6]?'#141719':c[8]?'#71695c':'#443c31';ctx.fillRect(c[1]-20,c[2]-20,39,39)}
+for(const d of s.doors){ctx.fillStyle=d.open?'#a6c68c':'#99794f';ctx.fillRect(d.pos[0]-12,d.pos[1]-12,24,24)}
+for(const b of s.bosses){circle(b.shadow,b.size,b.airborne?'#ddd':'#141414',!b.airborne);if(b.body_visible)circle([b.pos[0],b.pos[1]-(b.airborne?24:0)],b.size,'#d0919a');ctx.fillStyle='#fff';ctx.font='10px monospace';ctx.fillText(`${b.anim}:${b.frame} HP ${b.hp.toFixed(1)}`,b.pos[0]-50,b.pos[1]+42)}
+for(const [key,color] of [['tears','#83c4ef'],['projectiles','#e27a68']])for(const p of s[key]){circle(p.pos,p.size,color,false);circle([p.pos[0],p.pos[1]+p.height],p.size,color)}
+for(const b of s.bombs)circle(b.pos,b.size,b.dead?'#ecc771':'#161616');circle(s.player.pos,12,'#e9d8b5');ctx.restore();
+seek.value=frame;status.textContent=`Seed ${replay.metadata.seed} | ${frame}/${replay.rows.length-1} | ${(s.frame/30).toFixed(2)} s | HP ${s.hp} | bombs ${s.player.bombs}\nAction ${JSON.stringify(row.action)} | reward ${row.reward.toFixed(4)} | ${row.outcome} | layout ${s.layout}\nCheckpoint ${replay.metadata.checkpoint}`;
+window.replayFrame=frame;}
+document.getElementById('play').onclick=()=>{playing=!playing;last=0};seek.oninput=()=>{frame=+seek.value;draw()};
+function tick(now){if(playing&&now-last>=1000/15/+document.getElementById('speed').value){frame=Math.min(frame+1,replay.rows.length-1);last=now;if(frame===replay.rows.length-1)playing=false;draw()}requestAnimationFrame(tick)}draw();requestAnimationFrame(tick);
+</script></html>

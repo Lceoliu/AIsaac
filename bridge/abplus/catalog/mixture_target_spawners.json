@@ -1,0 +1,619 @@
+{
+ "description": "C39 group 4 (user decision 2026-09-28: a room with at least one Portal / Mulligan / Nest / Baby Long Legs and at most three other monsters, no obstacles): the 63 empty 1x1 Basement I rooms of mixture_target_horf.json; one spawner (one arm per kind, so PLR levels are (room, spawner)) and 0-3 others (uniform), each one of the ten most common monsters of the Basement I rooms that spawn nothing",
+ "sources": {
+  "normal": "mixture_target_horf.json (C22)",
+  "others": "abplus_basement1_rooms.json: most rooms, without shopkeepers, fire places, poop, TNT, Eternal Fly, Stoney, Wall Hugger and the spawners"
+ },
+ "weights": {
+  "arena": 0.0,
+  "normal": 1.0,
+  "boss": 0.0
+ },
+ "normal": [
+  0,
+  8,
+  10,
+  18,
+  26,
+  27,
+  39,
+  48,
+  50,
+  67,
+  90,
+  100,
+  104,
+  129,
+  138,
+  146,
+  147,
+  150,
+  156,
+  160,
+  163,
+  180,
+  183,
+  187,
+  190,
+  191,
+  192,
+  193,
+  195,
+  197,
+  199,
+  201,
+  202,
+  203,
+  204,
+  232,
+  238,
+  243,
+  244,
+  253,
+  258,
+  271,
+  297,
+  309,
+  315,
+  320,
+  325,
+  632,
+  652,
+  792,
+  841,
+  853,
+  855,
+  857,
+  871,
+  872,
+  878,
+  904,
+  912,
+  914,
+  915,
+  923,
+  950
+ ],
+ "boss": [],
+ "target": {
+  "name": "spawner + 0-3 others",
+  "arms": [
+   {
+    "name": "Portal",
+    "weight": 1.0,
+    "rooms": [
+     0,
+     8,
+     10,
+     18,
+     26,
+     27,
+     39,
+     48,
+     50,
+     67,
+     90,
+     100,
+     104,
+     129,
+     138,
+     146,
+     147,
+     150,
+     156,
+     160,
+     163,
+     180,
+     183,
+     187,
+     190,
+     191,
+     192,
+     193,
+     195,
+     197,
+     199,
+     201,
+     202,
+     203,
+     204,
+     232,
+     238,
+     243,
+     244,
+     253,
+     258,
+     271,
+     297,
+     309,
+     315,
+     320,
+     325,
+     632,
+     652,
+     792,
+     841,
+     853,
+     855,
+     857,
+     871,
+     872,
+     878,
+     904,
+     912,
+     914,
+     915,
+     923,
+     950
+    ],
+    "type": 306,
+    "variant": 0,
+    "min_cells": 3,
+    "extras": {
+     "counts": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "types": [
+      {
+       "type": 18,
+       "variant": 0,
+       "name": "Attack Fly"
+      },
+      {
+       "type": 10,
+       "variant": 1,
+       "name": "Gaper"
+      },
+      {
+       "type": 12,
+       "variant": 0,
+       "name": "Horf"
+      },
+      {
+       "type": 208,
+       "variant": 0,
+       "name": "Fatty"
+      },
+      {
+       "type": 10,
+       "variant": 0,
+       "name": "Frowning Gaper"
+      },
+      {
+       "type": 14,
+       "variant": 0,
+       "name": "Pooter"
+      },
+      {
+       "type": 217,
+       "variant": 0,
+       "name": "Dip"
+      },
+      {
+       "type": 305,
+       "variant": 0,
+       "name": "Ministro"
+      },
+      {
+       "type": 29,
+       "variant": 0,
+       "name": "Hopper"
+      },
+      {
+       "type": 244,
+       "variant": 0,
+       "name": "Round Worm"
+      }
+     ],
+     "min_cells": 3,
+     "attempts": 200
+    }
+   },
+   {
+    "name": "Mulligan",
+    "weight": 1.0,
+    "rooms": [
+     0,
+     8,
+     10,
+     18,
+     26,
+     27,
+     39,
+     48,
+     50,
+     67,
+     90,
+     100,
+     104,
+     129,
+     138,
+     146,
+     147,
+     150,
+     156,
+     160,
+     163,
+     180,
+     183,
+     187,
+     190,
+     191,
+     192,
+     193,
+     195,
+     197,
+     199,
+     201,
+     202,
+     203,
+     204,
+     232,
+     238,
+     243,
+     244,
+     253,
+     258,
+     271,
+     297,
+     309,
+     315,
+     320,
+     325,
+     632,
+     652,
+     792,
+     841,
+     853,
+     855,
+     857,
+     871,
+     872,
+     878,
+     904,
+     912,
+     914,
+     915,
+     923,
+     950
+    ],
+    "type": 16,
+    "variant": 0,
+    "min_cells": 3,
+    "extras": {
+     "counts": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "types": [
+      {
+       "type": 18,
+       "variant": 0,
+       "name": "Attack Fly"
+      },
+      {
+       "type": 10,
+       "variant": 1,
+       "name": "Gaper"
+      },
+      {
+       "type": 12,
+       "variant": 0,
+       "name": "Horf"
+      },
+      {
+       "type": 208,
+       "variant": 0,
+       "name": "Fatty"
+      },
+      {
+       "type": 10,
+       "variant": 0,
+       "name": "Frowning Gaper"
+      },
+      {
+       "type": 14,
+       "variant": 0,
+       "name": "Pooter"
+      },
+      {
+       "type": 217,
+       "variant": 0,
+       "name": "Dip"
+      },
+      {
+       "type": 305,
+       "variant": 0,
+       "name": "Ministro"
+      },
+      {
+       "type": 29,
+       "variant": 0,
+       "name": "Hopper"
+      },
+      {
+       "type": 244,
+       "variant": 0,
+       "name": "Round Worm"
+      }
+     ],
+     "min_cells": 3,
+     "attempts": 200
+    }
+   },
+   {
+    "name": "Nest",
+    "weight": 1.0,
+    "rooms": [
+     0,
+     8,
+     10,
+     18,
+     26,
+     27,
+     39,
+     48,
+     50,
+     67,
+     90,
+     100,
+     104,
+     129,
+     138,
+     146,
+     147,
+     150,
+     156,
+     160,
+     163,
+     180,
+     183,
+     187,
+     190,
+     191,
+     192,
+     193,
+     195,
+     197,
+     199,
+     201,
+     202,
+     203,
+     204,
+     232,
+     238,
+     243,
+     244,
+     253,
+     258,
+     271,
+     297,
+     309,
+     315,
+     320,
+     325,
+     632,
+     652,
+     792,
+     841,
+     853,
+     855,
+     857,
+     871,
+     872,
+     878,
+     904,
+     912,
+     914,
+     915,
+     923,
+     950
+    ],
+    "type": 205,
+    "variant": 0,
+    "min_cells": 3,
+    "extras": {
+     "counts": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "types": [
+      {
+       "type": 18,
+       "variant": 0,
+       "name": "Attack Fly"
+      },
+      {
+       "type": 10,
+       "variant": 1,
+       "name": "Gaper"
+      },
+      {
+       "type": 12,
+       "variant": 0,
+       "name": "Horf"
+      },
+      {
+       "type": 208,
+       "variant": 0,
+       "name": "Fatty"
+      },
+      {
+       "type": 10,
+       "variant": 0,
+       "name": "Frowning Gaper"
+      },
+      {
+       "type": 14,
+       "variant": 0,
+       "name": "Pooter"
+      },
+      {
+       "type": 217,
+       "variant": 0,
+       "name": "Dip"
+      },
+      {
+       "type": 305,
+       "variant": 0,
+       "name": "Ministro"
+      },
+      {
+       "type": 29,
+       "variant": 0,
+       "name": "Hopper"
+      },
+      {
+       "type": 244,
+       "variant": 0,
+       "name": "Round Worm"
+      }
+     ],
+     "min_cells": 3,
+     "attempts": 200
+    }
+   },
+   {
+    "name": "Baby Long Legs",
+    "weight": 1.0,
+    "rooms": [
+     0,
+     8,
+     10,
+     18,
+     26,
+     27,
+     39,
+     48,
+     50,
+     67,
+     90,
+     100,
+     104,
+     129,
+     138,
+     146,
+     147,
+     150,
+     156,
+     160,
+     163,
+     180,
+     183,
+     187,
+     190,
+     191,
+     192,
+     193,
+     195,
+     197,
+     199,
+     201,
+     202,
+     203,
+     204,
+     232,
+     238,
+     243,
+     244,
+     253,
+     258,
+     271,
+     297,
+     309,
+     315,
+     320,
+     325,
+     632,
+     652,
+     792,
+     841,
+     853,
+     855,
+     857,
+     871,
+     872,
+     878,
+     904,
+     912,
+     914,
+     915,
+     923,
+     950
+    ],
+    "type": 206,
+    "variant": 0,
+    "min_cells": 3,
+    "extras": {
+     "counts": [
+      0,
+      1,
+      2,
+      3
+     ],
+     "types": [
+      {
+       "type": 18,
+       "variant": 0,
+       "name": "Attack Fly"
+      },
+      {
+       "type": 10,
+       "variant": 1,
+       "name": "Gaper"
+      },
+      {
+       "type": 12,
+       "variant": 0,
+       "name": "Horf"
+      },
+      {
+       "type": 208,
+       "variant": 0,
+       "name": "Fatty"
+      },
+      {
+       "type": 10,
+       "variant": 0,
+       "name": "Frowning Gaper"
+      },
+      {
+       "type": 14,
+       "variant": 0,
+       "name": "Pooter"
+      },
+      {
+       "type": 217,
+       "variant": 0,
+       "name": "Dip"
+      },
+      {
+       "type": 305,
+       "variant": 0,
+       "name": "Ministro"
+      },
+      {
+       "type": 29,
+       "variant": 0,
+       "name": "Hopper"
+      },
+      {
+       "type": 244,
+       "variant": 0,
+       "name": "Round Worm"
+      }
+     ],
+     "min_cells": 3,
+     "attempts": 200
+    }
+   }
+  ]
+ }
+}

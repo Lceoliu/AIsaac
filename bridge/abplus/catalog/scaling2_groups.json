@@ -1,0 +1,33 @@
+{
+ "description": "C41 parallel task groups (user decisions 2026-09-29): four groups 1:1:1:1 by collected steps, each episode 180 s; C39 with the single-Horf and spawner groups replaced by the other room shapes and the boss rooms",
+ "groups": [
+  {
+   "name": "normal",
+   "tasks": "scaling_normal_rooms.json",
+   "share": 0.25,
+   "episode_seconds": 180,
+   "about": "491 real Basement I 1x1 normal rooms with their own enemies (as C39)"
+  },
+  {
+   "name": "normal_big",
+   "tasks": "scaling2_normal_big_rooms.json",
+   "share": 0.25,
+   "episode_seconds": 180,
+   "about": "358 real Basement I normal rooms of the other shapes with their own enemies"
+  },
+  {
+   "name": "horf_rocks",
+   "tasks": "mixture_target_horf_rocks.json",
+   "share": 0.25,
+   "episode_seconds": 180,
+   "about": "1-3 Horfs in 365 rooms with rocks (as C39)"
+  },
+  {
+   "name": "boss",
+   "tasks": "scaling2_boss_rooms.json",
+   "share": 0.25,
+   "episode_seconds": 180,
+   "about": "82 Basement I boss rooms (13 bosses)"
+  }
+ ]
+}

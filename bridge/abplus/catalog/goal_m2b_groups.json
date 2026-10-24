@@ -1,0 +1,47 @@
+{
+ "description": "Goal-conditioned line, GOTO stage 1 continued (C43, user decision 2026-09-30: another 100 h from C42's final): goal_m2_groups.json with GOTO_POSITION goals drawn straight : detour : dead end = 1 : 2 : 2 among the strata a room has (C42's final: straight 0.97-1.00, detour 0.81-0.87, dead end 0.50-0.74 on the held-out rooms); training rooms goal_rooms_train.json, evaluations as in C42 (held-out rooms, the chain on all 491, strata drawn uniformly as in C42)",
+ "groups": [
+  {
+   "name": "gotoempty",
+   "tasks": "goal_rooms_train.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "goto_empty",
+   "goals": 8,
+   "eval_tasks": "goal_rooms_holdout.json",
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   }
+  },
+  {
+   "name": "combatgoto",
+   "tasks": "goal_rooms_train.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat_goto",
+   "goals": 4,
+   "eval_tasks": "goal_rooms_holdout.json",
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   }
+  },
+  {
+   "name": "chain",
+   "tasks": "goal_rooms_train.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "chain",
+   "goals": 1,
+   "eval_tasks": "scaling_normal_rooms.json",
+   "goal_strata": {
+    "straight": 1,
+    "detour": 2,
+    "dead_end": 2
+   }
+  }
+ ]
+}

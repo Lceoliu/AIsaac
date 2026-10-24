@@ -1,0 +1,25 @@
+# Stage D: render-state GL entries that return void and write nothing the game reads, plus
+# queries answered with constants. Everything ANM2::GetTexel -> GetTexelRegion depends on
+# (glBindTexture/glActiveTexture/glTexImage2D uploads, glBindFramebuffer/glFramebufferTexture2D,
+# glReadPixels) stays real, so texel read-backs used by game logic keep their values.
+glVertexAttribPointer
+glEnableVertexAttribArray
+glDisableVertexAttribArray
+glUniformMatrix4fv
+glUniform1i
+glBlendFuncSeparate
+glUseProgram
+glViewport
+glCullFace
+glClearColor
+glGetAttribLocation 0
+glGetUniformLocation 0
+glCheckFramebufferStatus 0x8CD5
+# Only KAGE::Graphics::Manager_GL::create_fbo_depth_renderbuffer queries the depth renderbuffer
+# size (GL_RENDERBUFFER_WIDTH/HEIGHT) to decide whether to recreate it; 4096 always suffices.
+glGetRenderbufferParameteriv *4096
+# Stage E: framebuffer/renderbuffer binding and attachment skipped only while IsaacRender runs
+# (draws there are no-ops); logic-path render-to-texture and texel read-back keep them.
+glBindFramebuffer render
+glFramebufferTexture2D render
+glBindRenderbuffer render

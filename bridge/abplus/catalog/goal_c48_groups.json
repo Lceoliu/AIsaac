@@ -1,0 +1,17 @@
+{
+ "description": "C48 (10-02, floor-clear mandate): the boss specialist, the Basement I boss rooms only, start half hearts uniform 2-6; boss HP start randomisation from the command line. The floor runner fights normal rooms with the C47 policy and the boss room with this one (abplus_floor_run.py --boss-checkpoint).",
+ "groups": [
+  {
+   "name": "boss",
+   "tasks": "scaling2_boss_rooms.json",
+   "eval_tasks": "scaling2_boss_rooms.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat",
+   "start_hp": {
+    "min": 2,
+    "max": 6
+   }
+  }
+ ]
+}

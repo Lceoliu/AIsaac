@@ -1,0 +1,34 @@
+{
+ "groups": [
+  {
+   "name": "single",
+   "tasks": "scaling_normal_rooms.json",
+   "share": 1,
+   "episode_seconds": 180
+  },
+  {
+   "name": "combatgoto",
+   "tasks": "scaling_normal_rooms.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat_goto",
+   "goals": 3
+  },
+  {
+   "name": "gotoempty",
+   "tasks": "scaling_normal_rooms.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "goto_empty",
+   "goals": 4
+  },
+  {
+   "name": "chain",
+   "tasks": "scaling_normal_rooms.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "chain",
+   "goals": 1
+  }
+ ]
+}

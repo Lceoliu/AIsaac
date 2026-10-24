@@ -1,0 +1,302 @@
+[
+  {
+    "case": "low",
+    "tick": 0,
+    "hearts": 5,
+    "projectiles": [
+      {
+        "fall": 0.10000000149012,
+        "age": 1,
+        "flags": "0",
+        "dead": true,
+        "vel": [
+          0.0,
+          0.0
+        ],
+        "scale": 1.0,
+        "pos": [
+          320.0,
+          380.0
+        ],
+        "size": 5.0,
+        "accel": 0.0,
+        "id": 3,
+        "height": -29.89999961853,
+        "offset": [
+          0.0,
+          -29.89999961853
+        ]
+      }
+    ]
+  },
+  {
+    "case": "low",
+    "tick": 1,
+    "hearts": 5,
+    "projectiles": []
+  },
+  {
+    "case": "low",
+    "tick": 2,
+    "hearts": 5,
+    "projectiles": []
+  },
+  {
+    "case": "low",
+    "tick": 3,
+    "hearts": 5,
+    "projectiles": []
+  },
+  {
+    "case": "low",
+    "tick": 4,
+    "hearts": 5,
+    "projectiles": []
+  },
+  {
+    "case": "low",
+    "tick": 5,
+    "hearts": 5,
+    "projectiles": []
+  },
+  {
+    "case": "overhead",
+    "tick": 0,
+    "hearts": 6,
+    "projectiles": [
+      {
+        "fall": 0.10000000149012,
+        "age": 1,
+        "flags": "0",
+        "dead": false,
+        "vel": [
+          0.0,
+          0.0
+        ],
+        "scale": 1.0,
+        "pos": [
+          320.0,
+          380.0
+        ],
+        "size": 5.0,
+        "accel": 0.0,
+        "id": 3,
+        "height": -69.900001525879,
+        "offset": [
+          0.0,
+          -69.900001525879
+        ]
+      }
+    ]
+  },
+  {
+    "case": "overhead",
+    "tick": 1,
+    "hearts": 6,
+    "projectiles": [
+      {
+        "fall": 0.18999999761581,
+        "age": 2,
+        "flags": "0",
+        "dead": false,
+        "vel": [
+          0.0,
+          0.0
+        ],
+        "scale": 1.0,
+        "pos": [
+          320.0,
+          380.0
+        ],
+        "size": 5.0,
+        "accel": 0.0,
+        "id": 3,
+        "height": -69.709999084473,
+        "offset": [
+          0.0,
+          -69.709999084473
+        ]
+      }
+    ]
+  },
+  {
+    "case": "overhead",
+    "tick": 2,
+    "hearts": 6,
+    "projectiles": [
+      {
+        "fall": 0.27099999785423,
+        "age": 3,
+        "flags": "0",
+        "dead": false,
+        "vel": [
+          0.0,
+          0.0
+        ],
+        "scale": 1.0,
+        "pos": [
+          320.0,
+          380.0
+        ],
+        "size": 5.0,
+        "accel": 0.0,
+        "id": 3,
+        "height": -69.438995361328,
+        "offset": [
+          0.0,
+          -69.438995361328
+        ]
+      }
+    ]
+  },
+  {
+    "case": "overhead",
+    "tick": 3,
+    "hearts": 6,
+    "projectiles": [
+      {
+        "fall": 0.34389999508858,
+        "age": 4,
+        "flags": "0",
+        "dead": false,
+        "vel": [
+          0.0,
+          0.0
+        ],
+        "scale": 1.0,
+        "pos": [
+          320.0,
+          380.0
+        ],
+        "size": 5.0,
+        "accel": 0.0,
+        "id": 3,
+        "height": -69.095092773438,
+        "offset": [
+          0.0,
+          -69.095092773438
+        ]
+      }
+    ]
+  },
+  {
+    "case": "overhead",
+    "tick": 4,
+    "hearts": 6,
+    "projectiles": [
+      {
+        "fall": 0.40950998663902,
+        "age": 5,
+        "flags": "0",
+        "dead": false,
+        "vel": [
+          0.0,
+          0.0
+        ],
+        "scale": 1.0,
+        "pos": [
+          320.0,
+          380.0
+        ],
+        "size": 5.0,
+        "accel": 0.0,
+        "id": 3,
+        "height": -68.685585021973,
+        "offset": [
+          0.0,
+          -68.685585021973
+        ]
+      }
+    ]
+  },
+  {
+    "case": "overhead",
+    "tick": 5,
+    "hearts": 6,
+    "projectiles": [
+      {
+        "fall": 0.46855896711349,
+        "age": 6,
+        "flags": "0",
+        "dead": false,
+        "vel": [
+          0.0,
+          0.0
+        ],
+        "scale": 1.0,
+        "pos": [
+          320.0,
+          380.0
+        ],
+        "size": 5.0,
+        "accel": 0.0,
+        "id": 3,
+        "height": -68.217025756836,
+        "offset": [
+          0.0,
+          -68.217025756836
+        ]
+      }
+    ]
+  },
+  {
+    "case": "floor",
+    "tick": 0,
+    "hearts": 6,
+    "projectiles": [
+      {
+        "fall": 0.10000000149012,
+        "age": 1,
+        "flags": "0",
+        "dead": true,
+        "vel": [
+          0.0,
+          0.0
+        ],
+        "scale": 1.0,
+        "pos": [
+          200.0,
+          280.0
+        ],
+        "size": 5.0,
+        "accel": 0.0,
+        "id": 3,
+        "height": -4.9000000953674,
+        "offset": [
+          0.0,
+          -4.9000000953674
+        ]
+      }
+    ]
+  },
+  {
+    "case": "floor",
+    "tick": 1,
+    "hearts": 6,
+    "projectiles": []
+  },
+  {
+    "case": "floor",
+    "tick": 2,
+    "hearts": 6,
+    "projectiles": []
+  },
+  {
+    "case": "floor",
+    "tick": 3,
+    "hearts": 6,
+    "projectiles": []
+  },
+  {
+    "case": "floor",
+    "tick": 4,
+    "hearts": 6,
+    "projectiles": []
+  },
+  {
+    "case": "floor",
+    "tick": 5,
+    "hearts": 6,
+    "projectiles": []
+  }
+]

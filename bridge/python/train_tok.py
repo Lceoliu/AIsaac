@@ -1,0 +1,4806 @@
+"""Training of the token policy on the fork sampler (EXPERIMENTS.md C55 on): PPO, one policy for every group.
+
+One process owns the GPU. Its main thread is the actor: it answers the workers' records (isaac_bridge/tok_sampler.py)
+with sampled actions (GraphActor, the actor's own copy of the weights) and stores the decisions in a rollout; workers
+advance at their own pace, so each has its own number of decisions. A learner thread does the update when a rollout
+holds `--rollout` decisions: generalised advantage estimates per worker, then `--epochs` passes of clipped PPO over
+the stored decisions in minibatches, on the learner's copy of the weights; the new weights are then copied into the
+actor's (between two of its calls). Two modes:
+  synchronous (default)  the actor waits while the learner updates (the workers finish the step they are in and wait;
+                         queued hindsight searches run then) and continues with the new weights: plain PPO, as before.
+  --overlap              the actor keeps answering the workers with the weights it has while the learner updates, and
+                         takes the new weights when the update is done. The decisions collected meanwhile belong to the
+                         next rollout and were sampled with the weights before that update: one update of policy lag
+                         for that part of a rollout (at most). Their stored log-probabilities are the behaviour
+                         policy's (the one that sampled them), which is what PPO's ratio pi_new / pi_behaviour needs:
+                         the clipped objective is then taken around the behaviour policy (its share of the rollout is
+                         the column stale_share, the update is on the newest weights as always). The values that the
+                         advantages need are recomputed with the learner's weights at the start of each update
+                         (--recompute-values, on by default with --overlap), so the advantages are what the
+                         synchronous mode computes from the same decisions. If a rollout is full before the update is
+                         done, the actor waits for it (the workers too; wait_learner_s): the lag never exceeds one
+                         update. The hindsight teacher (--teacher) then gets its time from --teacher-share (default
+                         0.15 with --overlap), since the workers no longer pause during updates.
+                         With the plain ratio the stale part starts the update with ratios away from 1 and is clipped
+                         earlier (higher clip_frac, slower entropy decrease); --decoupled 1 clips around the weights
+                         at the update's start instead and weights by pi_start / pi_behaviour (see its help).
+  --learner-device D     (B38, 2026-10-17) the learner on a GPU of its own (e.g. cuda:1; default: the actor's GPU, as
+                         before): learner_model, Adam and the choice optimiser, every tensor learn() builds (the
+                         batches, the teacher / teacher-v2 rings, the temporal room tables) live there; the actor (its
+                         weights, GraphActors, the lane service, the snapshots, the GRU / temporal state tables, the
+                         rollouts' device tensors) stays on the actor's. At the hand-off the used rows of the rollout's
+                         temporal tensors (K / V and o; s is never read by the learner) are copied to a learner-side
+                         mirror on a copy stream (the learner waits on its event, the actor runs on at once);
+                         take_weights moves the weights as one flat byte buffer. Recommended with --overlap
+                         --decoupled 1: the update of rollout k then runs on its own GPU while the actor collects
+                         rollout k + 1 (no GPU contention, the cause of B11's slower actor calls and B13's crash class
+                         on a shared GPU). Without --overlap it is the synchronous mode with the learner elsewhere.
+Other throughput settings (same results, other speed): --actor-slots (calls in flight), --poll-want / --poll-wait
+(batching of records), --sort-micro (minibatch rows ordered by entity count before the --micro parts), CUDA streams
+(the actor's calls on high-priority streams, the learner's kernels on a low-priority one), --fused-adam; and for the
+learner (2026-10-04, on by default, the same gradient up to summation order): --packed (the Transformer's per-token
+layers on the real tokens only), --teach-merge (a step's teacher records join its last PPO part: one forward and
+backward instead of two), --teach-gpu (the teacher records also held on the GPU), the minibatches planned on the host
+(no wait for the GPU inside an epoch). ISAAC_RL_PROFILE=1 times the update's parts (u_* columns) with GPU syncs.
+Instance defaults (2026-10-05, tok_sampler "Instance defaults"; each proven exact): stub list stub_render_h.txt
+(--stub-list <file> for another), ABP_FAST=3, ISAAC_RL_PU_SKIP=1, ABP_FORK_LITE=1 (a variable already set in the
+environment wins, e.g. ABP_FAST=0), --teacher-pair 1; --build-timeout (60 s, 120 before 2026-10-06) limits a worker's
+first start-state build after a launch, --reset-timeout (20 s, 2026-10-06) a later one; a stalled or failed build is
+retried once with the same seed on the relaunched instance. --root-anon-mib replaces a root above that RssAnon at a state
+boundary (2026-10-06, off by default).
+Mixed precision: --amp bf16 runs the learner's forward passes under bfloat16 autocast (the heads, the losses and the
+input MLPs over raw features stay float32; the actor and the stored log-probabilities stay float32): close to, not
+exactly, the float32 update.
+Actions take effect one decision late (tok_sampler): the action under way is part of the state the policy and the
+value see, and a stored decision's reward is what happens during the step after it.
+
+Reward of a decision (the terms the record carries; no shaping beyond them):
+  + damage   x the share of the room's starting monster HP removed
+  - hurt     x half hearts lost
+  + clear    when the room is cleared;  - death when the player dies;  - timeout at the time limit
+  - time     every decision
+Whole floors (--mode floor, tok_floor.py; episodes run through the doors to the trapdoor after the boss): instead of
+clear, + room for a room with monsters cleared, + explore for a room entered for the first time, + boss on top for the
+boss room, + exit when the next floor is reached; the minimap and the doors' "seen" flags are part of the input.
+--init starts from another run's weights (a room-mode run's: the door input's new columns start at zero).
+Phase A (2026-10-06, both off by default; nothing else changes when they are off):
+  --items        the item-aware observation and the item / pill heads (TokPolicy items, tok_obs ROW's item fields;
+                 the workers' roots run the bridge's lean_items). --init from an items-free checkpoint pads the new
+                 inputs with zeros (load_compatible); --resume of an items checkpoint turns it on by itself.
+  --mode run     whole runs from Basement I (tok_floor with run = True): the floor's exit is an event (EV_EXIT, reward
+                 exit) and the episode goes on on the next floor until death, --run-seconds of game time, or a floor's
+                 own --floor-stall-seconds without progress. Rewards as floor mode. Counters: progress.csv
+                 run/stage_max (deepest stage per episode, mean), run/exits, items_taken, active_uses, pills_used (and
+                 per episode in episodes.jsonl: stage0, stage, exits, items, uses, pills); with --items in floor mode the
+                 item counters too.
+Counterfactual branches (2026-10-07, isaac_bridge/tok_branch.py; floor / run modes, off unless --branch-share > 0):
+  at decision points (an item taken or left behind, a door taken while others lead to unvisited rooms) the workers
+  restore the state, run each option as a branch episode with the current policy (records tagged ROW point / branch,
+  actions from the actor) from common random numbers, and write a choice record (the record before the decision, the
+  options' outcomes) that lands in a host ring (L['choice_*']), choices.jsonl and choices-last.npz. A branch episode
+  ending for its own reasons (cap, floor exit, boss cleared) sends done DONE_BRANCH: that record is evaluated and kept
+  as a boot decision (Rollout.boot) the decision before bootstraps from; it is never trained on. --branch-ppo 0 keeps
+  all branch decisions out of PPO. Branch episodes go to branch_episodes.jsonl, not to the episode statistics. The
+  PPO update is unchanged by the choice records unless --choice-adv-coef > 0 (Phase B2 below).
+  Phase B2 (2026-10-07; tok_branch's second docstring): the branches of a pair share the policy's sampling noise
+  (ROW crn, GraphActor) and are answered with a weight snapshot the point pinned (--branch-snap-every; the actor keeps
+  two); a branch is scored as prefix reward + gamma^prefix (discounted return + gamma^T V(end)) with 60 s branches;
+  pairs are replicated (--branch-noise unconditionally for the noise floor, --branch-replicate-max while the label is
+  ambiguous). The choice heads (TokPolicy choice, K = --choice-heads) learn D = score(take) - score(skip) from the
+  records' pairs on detached player tokens with an optimiser of their own after each PPO update (train_choice; held-out
+  points: --choice-holdout), the trainer pools the noise variance per kind for the workers (aux block), the actor
+  hands the heads' spread at every record to the workers (the point priority's uncertainty, --branch-uncert), and
+  --choice-adv-coef > 0 adds a PPO-clipped correction with the measured own - alternative difference on the choice
+  records' decision records. With --branch-share 0 none of this exists and the run is as before.
+Teacher v2 (2026-10-10, isaac_bridge/tok_teacher2.py, rl/docs/SCALING_THESIS.md S5b; floor / run modes, --teacher-v2 1
+  with --teacher-thread 1; off by default, then nothing changes): the workers' search threads run whole branches from
+  hurts, deaths and --teacher-v2-random points (movement intents x the actor's per-step answers, asked through each
+  worker's lane and answered here by a GraphActor of their own outside the rollout), and every step of a branch that
+  beats the episode's own continuation becomes an imitation record (V2 ring -> job['v2'] -> a GPU ring of
+  --teacher-v2-buffer records). Each minibatch step draws up to --teacher-v2-batch of them (--teacher-v2-reuse) into
+  its last part (or a pass of its own with --teach-merge 0): + share x (--teacher-v2-coef x mean(-w log pi(a|obs)) +
+  --teacher-v2-vf x mean((V(obs) - G)^2)), share = --teacher-v2-weight x b / minibatch (tok_teacher2.teacher_v2_loss).
+  progress.csv v2_*: the workers' totals (points, improving, gains, spreads, records, seconds), this update's window
+  (v2_improving_share, v2_gain0_mean, v2_spread_mean) and, on the records new to this update before it trains on them,
+  v2_prior (mean log pi of the best branch's first move), v2_prior_p, v2_verr (V - G): the acceptance test is v2_prior
+  rising and v2_improving_share falling over training.
+Counterfactual branch teacher (B34, 2026-10-16, isaac_bridge/tok_cf.py, rl/docs/COUNTERFACTUAL_TEACHER.md; --cf 1 with
+  --teacher-thread 1, floor / run modes; off by default, then nothing changes): teacher v2's machinery (lanes, the V2
+  ring and its loss, the --teacher-v2-buffer / -batch / -reuse / -coef / -vf / -weight settings) at choice points
+  (first sight of pickups / pedestals / locked doors with a key / shop and treasure doors, a cleared room with >= 2
+  doors, random records; --cf-points per worker per game hour) with the branches taken / target / sticky
+  high-temperature over --cf-seconds, scored with value_global's bootstrap; the improving branch's first
+  --cf-distill-steps records are imitation records (kind KIND_CF), --cf-advantage 1 the first one a clipped
+  policy-gradient term instead. Temporal models (B34 lifts B30's refusal of teacher v2 too): the lanes have a
+  TemporalState of their own, a choice point's branches start from a device copy of the worker's slot before the point's
+  record (the snapshot bank, cf_snap), the lane answers carry (o_{t-1}, has, o_t) and the learner reads the imitation
+  records' readout from them (temporal 'stored' / 'tail'). progress.csv cf_* (cf_prior, cf_improving_share, ...).
+  B40 (2026-10-18, --cf-wall 1; off by default): one more trigger in the same quota, 'wall' (a cleared room, a bomb
+  held, a wall of the room without a door whose minimap neighbour is unknown: a candidate secret-room wall, ranked by
+  AB+'s secret-room score on the visible minimap), whose branch walks to the wall's middle and places one bomb
+  (tok_cf.BombIntent) before the policy takes over; no reward term: the realised return decides. Its records are
+  distilled through the bomb decision (at most --cf-wall-distill). progress.csv cf_points/wall, cf_prior/wall,
+  cf_wall_opened_share, cf_wall_bombed_share, cf_wall_gain_mean, cf_wall_best_share, cf_wall_p_mean.
+  B40 --cf-defer-target 1 (A30's A2; off by default = B34's behaviour): the target branch of a door trigger (locked /
+  shop / treasure / cleared) and the wall's bomb_at branch play the policy until the room is cleared, then walk;
+  their records are distilled from that point. progress.csv cf_defer_started_share, cf_defer_wait_s.
+  B36 (2026-10-16, isaac_bridge/tok_lanes.py LaneService): the lanes (teacher v2's and the cf's) are served in rounds:
+  after the first waiting request a window of --cf-lane-wait (ends early after --cf-lane-quiet without a new request,
+  or when every lane active lately waits), then ONE lane GraphActor call for all waiting lanes (row buckets
+  --cf-lane-buckets, default the actor's; each row's temporal slot its lane; uniforms keyed by the request's sequence
+  number and lane, --cf-lane-ukeys), asynchronous (--cf-lane-async 1: submitted, answered when its event completed,
+  the workers' records served meanwhile; none in flight across take_weights); the echo is the number read when the
+  request was taken. progress.csv v2_lane_calls / _rows / _s (actor-thread seconds) / _fly_s / _held_s / _eager.
+Memory (2026-10-11, --memory gru --memory-dim D --memory-bptt T; off by default, then nothing changes; rl/docs/
+  SCALING_THESIS.md S5b; TokPolicy memory): a GRU state per worker carried by the actor (a table on the GPU, zeroed only
+  at an episode's first record: not at a room or floor change), the input state of each decision stored in the rollout
+  (Rollout.h). The learner cuts each worker's decisions into chunks of T (tok_policy.memory_chunks; minibatch = a set of
+  chunks, --sort-micro off, --micro rounded to whole chunks) and runs the GRU over each chunk from the stored state of
+  its first decision (stale-h: that state came from the actor's weights then, not the learner's current ones; the
+  usual truncated-BPTT approximation, exact at an update's first step in synchronous PPO) with the usual PPO losses as
+  means over the trained decisions; values recomputed at an update's start (--recompute-values) take one GRU step from
+  each decision's stored state. Teacher v2's lanes keep their own state table (a branch starts from the episode's state
+  at the fork, sent by the worker; tok_teacher2.LanePolicy.begin) and its imitation records carry their input states.
+  Approximate: the old teacher's records, the choice correction's records and branch episodes (tok_branch) use a zero
+  state. --resume of a memory-free checkpoint starts a fresh GRU (its output projection zero: the same outputs).
+  Not given: a resumed checkpoint's, else off (the default model has no GRU).
+  B32 (2026-10-15): --resume of a memory checkpoint with an explicit --memory off drops the GRU (tok_policy.drop_memory:
+  mem_gru, mem_out, gtok.mem_in and their Adam state; every other tensor exact; the outputs lose mem_out(h)); without
+  --memory the checkpoint's memory is kept as before. A temporal model needs no GRU: its learner chunks are then the
+  temporal chunks alone (--temporal-bptt, no nested GRU chunks).
+Item tokens / global token (2026-10-12, B21 --item-tokens 1 (needs --items), B22 --global-token 1; off by default, then
+  nothing changes; TokPolicy item_tokens / global_token, the module docstring of tok_policy has the mechanism): up to
+  20 item tokens (held collectibles, active, trinkets, pocket) and / or one learned global token per record, ordinary
+  tokens of each block's one attention (B24; B33: no gates). --resume of a checkpoint without them: their modules
+  fresh (the outputs change), Adam's state remapped by parameter name, a line is printed; a checkpoint with them keeps
+  them. B22's second value head value_global (on the global token) is trained on
+  lambda-returns with --gamma-global (0.999; GAE's lambda, bootstrapped from value_global itself, which is computed for
+  every stored decision at the update's start, in the --recompute-values pass when there is one, else a pass of its
+  own) as an auxiliary loss --vf-global-coef x 0.5 x mean((value_global - return)^2); PPO's advantages keep using the
+  value head. progress.csv: v_global_loss, v_global_ev (explained variance of the update-start value_global).
+Pedestal builds / forced pickups / shared item table (2026-10-13, B23; isaac_bridge/tok_pickup.py has the mechanism;
+  all off by default, then nothing changes): --start-build-mode pedestal spawns a start build's collectibles as
+  pedestals in the floor's starting room instead of adding them to the inventory (episodes.jsonl build_pedestals);
+  --pickup-force A:B draws each training episode as forced with p going linearly from A to B over the run (the learning
+  rate's fraction); in a forced episode the worker marks the records of clear rooms with a pedestal (ROW pforce = the
+  move toward the nearest one) and answer() below replaces the sampled move with it and the shot with none before the
+  decision is stored and sent; the learner keeps forced decisions in the value loss and the memory chunks, leaves them
+  out of the policy term and the entropy, and trains move and shoot on them as imitation targets
+  (--pickup-force-imitation, tok_pickup.ppo_part_terms). progress.csv: pickup_force_p, pickup_forced_eps,
+  pickup_forced_steps, pickups_forced, pickups_free (this update's worker deltas), start_pedestals (total);
+  pickup_imit (the imitation term), forced_share (forced share of the trained decisions). --item-shared 1 (needs item
+  tokens): the item tokens' collectible table is the policy's item_emb (tok_policy share_item_table: --resume of a B21
+  checkpoint drops its own 32-column table, re-initialises the 16 collectible columns of the item tokens' first
+  Linear, keeps everything else; Adam's state of that Linear starts fresh). Evaluation (eval_tok.py) never forces.
+Item slots / stored value_global (2026-10-14, B24; tok_policy TokPolicy item_slots): the learner's packed layouts plan
+  the real item tokens on the host (item_count) like the entities. B33 (2026-10-16): --item-tokens-fused and the
+  separate gated layout are gone (checkpoints with gates: sandboxes at commit b0a89b9). --item-slots N: held-collectible
+  token slots
+  (newest first, default 16 = INV_CAP; + active, two trinkets, pocket). With --global-token the actor's CUDA graphs
+  also output value_global, the rollout stores it (Rollout.value_g) and its returns bootstrap from the stored values
+  (from the recomputed ones with --recompute-values on): no pass of its own at the update's start.
+No-active starts (2026-10-18, B39; off by default, then nothing changes): --no-active-prob p: p of the floor-start
+  training episodes (not archive starts, like the start builds) begin without player 0's active item (AB+ Isaac: The
+  D6), removed in the episode's fork before its first record and before a start build (tok_pickup.NO_ACTIVE_LUA; a
+  removal that leaves an active item fails the start). An episode whose start was changed (no-active, start build, stat
+  augmentation) gets its own parked clone as the starting room's restore point for the searches (before: src forked
+  with the episode's reseed = the unchanged start). progress.csv: no_actives, no_active_removed (worker totals),
+  noact/* and act/* (this update's finished episodes by has_active at their first record: episodes, exits, stage,
+  timeout); episodes.jsonl active0. Evaluation: eval_tok --no-active 1.
+The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
+bootstraps the one before, and it opens the next rollout.
+
+progress.csv, besides the learning columns: x_real_time = game time trained per wall second (decisions of the update x
+frames per decision / 30 over the wall time since the update before ended); collect_s = the actor's time for the
+rollout, update_s = the learner's; infer_ms = a network call's time from its start to its result (infer_upd_ms: calls
+made while the learner was working); p_* = where the actor loop's time went (poll = waiting for records, book =
+rewards and episode bookkeeping, act = starting calls and waiting for their results, reply = actions out, store = the
+rollout; with --actor-slots 2 a call runs on the GPU while the loop reads and books the next records, so infer_ms can
+exceed the loop's own act time per call); idle_share = the workers' time spent waiting for answers over their wall
+time; w_* = the workers' seconds (summed) in stepping, waiting, encoding, forking and teacher searches over the same
+span; stale_share = share of the update's decisions sampled with weights older than the update's start; ent_tokens =
+entity tokens per micro part. Added 2026-10-04: cpu_collect / cpu_update = busy share of all the machine's CPUs during
+the collect / the update (/proc/stat); c_trainer_cores = CPUs this process used over the cycle; w_overrun = worker
+seconds of searches that ran past the end of the synchronous hold; q_teach = hurts queued for a search; w_state /
+w_close / w_total = worker seconds taking up start states / closing episodes / in all; c_dec_min / c_dec_max / dec_w =
+decisions per worker in the cycle (a worker at 0 is stuck); u_* = seconds of the update's parts (see ISAAC_RL_PROFILE).
+
+usage (from the bridge's python dir, PYTHONPATH=.):
+  python train_tok.py --groups-file ../abplus/catalog/scaling2_groups.json --groups normal:8,boss:5,normal_big:3 \
+      --out <dir> [--game-hours 2000] [--resume <checkpoint.pt>] [--overlap]
+"""
+import argparse
+import collections
+import csv
+import json
+import math
+import os
+import queue
+import sys
+import threading
+import time
+import traceback
+import types
+from pathlib import Path
+
+import numpy as np
+
+from goexplore_abplus import default_bridge_lua, default_preload, load_spec
+from isaac_bridge.tok_obs import DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_PILL, ROW
+from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
+                                      default_stub_list)
+
+
+ROOM_REWARD = 'damage=1,hurt=0.75,clear=1,death=2,timeout=1,time=0.002'
+# whole floors: room = a room with monsters cleared, explore = a room entered for the first time, boss = the boss
+# room cleared (on top of room), exit = the next floor reached
+FLOOR_REWARD = 'damage=1,hurt=0.75,room=1,explore=0.5,boss=2,exit=3,death=2,timeout=1,time=0.002'
+# 2026-10-08 (SCALING_THESIS.md §3, off by default): heal = per half heart of health units gained between two records
+# (red + soul + black + eternal + 2 x bone, the player token's units column; gains only, so a hurt stays the hurt term),
+# resource = per coin / bomb / key gained (the player token's columns, capped there at 50 / 10 / 10); e.g.
+# --reward heal=0.5,resource=0.25 (Episodes.cur_gains; floor / run modes only)
+OVERLAP_TEACHER_SHARE = 0.15
+# ISAAC_RL_PROFILE=1: the learner synchronises the GPU between the parts of an update and logs their seconds (u_*
+# columns); a measurement aid that costs a little speed. Without it the u_* columns hold only host-side times.
+PROFILE = os.environ.get('ISAAC_RL_PROFILE', '0') == '1'
+
+
+def cpu_ticks():
+    """(busy, total) jiffies of all CPUs from /proc/stat ((0, 0) where there is none)."""
+    try:
+        with open('/proc/stat') as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        idle = v[3] + (v[4] if len(v) > 4 else 0)
+        return sum(v) - idle, sum(v)
+    except (OSError, ValueError, IndexError):
+        return 0, 0
+
+
+def cpu_share(a, b):
+    """Busy share of all CPUs between two cpu_ticks() readings."""
+    return (b[0] - a[0]) / max(b[1] - a[1], 1)
+
+
+def parse_groups(text, workers):
+    """'normal:8,boss:5' -> ([name], [worker -> group index]); the counts are scaled to the number of workers."""
+    names, counts = [], []
+    for part in text.split(','):
+        name, _, count = part.partition(':')
+        names.append(name)
+        counts.append(float(count or 1))
+    share = np.array(counts) / sum(counts)
+    assign = []
+    for w in range(workers):   # largest remainder, spread over the worker indices
+        have = np.bincount(assign, minlength=len(names)) if assign else np.zeros(len(names))
+        assign.append(int(np.argmax(share * (w + 1) - have)))
+    return names, assign
+
+
+def _filled(alloc):
+    """(B38 step 2) np.full on an allocator's zeroed arrays."""
+    def full(shape, value, dtype):
+        a = alloc(shape, dtype)
+        a[...] = value
+        return a
+    return full
+
+
+def ipc_safe_allocator():
+    """(B38 step 2) this process's CUDA allocations in ordinary segments (the allocator's default) even where
+    PYTORCH_CUDA_ALLOC_CONF asks for expandable ones (the HPC sandboxes): CUDA IPC of an expandable segment needs
+    pidfd_getfd, which a container without ptrace rights refuses ("pidfd_getfd: Operation not permitted"). Called
+    before the first CUDA allocation of the process whose tensors are shared (the actor's); True if it changed it."""
+    import torch
+    if 'expandable_segments:true' not in os.environ.get('PYTORCH_CUDA_ALLOC_CONF', '').replace(' ', '').lower():
+        return False
+    torch.cuda.memory._set_allocator_settings('expandable_segments:False')
+    return True
+
+
+def memfd(name):
+    """(B38 step 2) an anonymous shared-memory file (memfd_create, close-on-exec); through libc where this Python
+    lacks os.memfd_create (the HPC's conda build)."""
+    if hasattr(os, 'memfd_create'):
+        return os.memfd_create(name, os.MFD_CLOEXEC)
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    fd = libc.memfd_create(name.encode(), 1)   # (MFD_CLOEXEC)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), 'memfd_create')
+    return fd
+
+
+class SharedArrays:
+    """(B38 step 2, --learner-process 1) an allocator of zeroed numpy arrays in shared memory (one memfd each: not
+    bound by /dev/shm's size; pages are allocated when touched, like numpy's zeros) that the learner process maps
+    (attach: /proc/<this pid>/fd/<fd>). describe(obj) -> {attribute: (fd, bytes, shape, dtype)} of an object's arrays
+    made here."""
+
+    def __init__(self):
+        self.made = {}   # data pointer -> (fd, bytes, shape, dtype, mmap)
+
+    def __call__(self, shape, dtype):
+        import mmap
+        dtype = np.dtype(dtype)
+        shape = (int(shape),) if np.isscalar(shape) else tuple(int(s) for s in shape)
+        nbytes = max(int(np.prod(shape)) * dtype.itemsize, 1)
+        fd = memfd('b38-rollout')
+        os.ftruncate(fd, nbytes)
+        mm = mmap.mmap(fd, nbytes)
+        a = np.ndarray(shape, dtype, buffer=mm)
+        self.made[a.ctypes.data] = (fd, nbytes, shape, dtype, mm)
+        return a
+
+    def describe(self, obj):
+        out = {}
+        for k, v in vars(obj).items():
+            if isinstance(v, np.ndarray) and v.ctypes.data in self.made:
+                fd, nbytes, shape, dtype, _ = self.made[v.ctypes.data]
+                out[k] = (fd, nbytes, shape, dtype)
+        return out
+
+
+def attach_arrays(pid, desc, keep):
+    """(B38 step 2, the learner process) the arrays SharedArrays.describe named, mapped from process pid's memfds;
+    the mappings are appended to keep (they must outlive the arrays)."""
+    import mmap
+    out = {}
+    for k, (fd, nbytes, shape, dtype) in desc.items():
+        f = os.open(f'/proc/{pid}/fd/{fd}', os.O_RDWR)
+        mm = mmap.mmap(f, nbytes)
+        os.close(f)
+        keep.append(mm)
+        out[k] = np.ndarray(shape, dtype, buffer=mm)
+    return out
+
+
+def dump_job(job, view, path):
+    """(B38 step 3, a measurement aid: ISAAC_RL_B38_DUMP) a learner job as abplus_b38_replay.py replays it: the
+    rollout's used part (host arrays cut to the longest worker, scalars, the temporal tensors' used rows on the CPU)
+    and the job's host-side fields."""
+    import torch
+    m = int(view.length.max())
+    arr = {}
+    for k, v in vars(view).items():
+        if isinstance(v, np.ndarray):
+            if v.ndim >= 2 and v.shape[0] == view.n and k.startswith('rooms_') and k != 'rooms_n':
+                arr[k] = v[:, :view.tR + m].copy()
+            elif v.ndim >= 2 and v.shape[0] == view.n and k.startswith('t_'):
+                arr[k] = v[:, :view.tP + m].copy()
+            elif v.ndim >= 2 and v.shape[0] == view.n:
+                arr[k] = v[:, :m].copy()
+            else:
+                arr[k] = v.copy()
+    k_ = view.n * view.tP + view.t_used if view.t_kv is not None else 0
+    tens = None if view.t_kv is None else dict(
+        kv=view.t_kv[:k_].cpu(), o=view.t_o[:view.t_obase + k_].cpu(), rows=int(view.t_kv.shape[0]),
+        orows=int(view.t_o.shape[0]))
+    meta = {k: v for k, v in job.items() if k not in ('roll', 'lroll', 'lready', 'lcopy', 'tdev')}
+    Path(path).mkdir(parents=True, exist_ok=True)
+    torch.save(dict(arrays=arr, scal=rollout_scalars(view), tensors=tens, meta=meta, m=m), Path(path) / 'job.pt')
+    print(f'B38: a job dumped to {path}', flush=True)
+
+
+def profile_learn(learn, job, path):
+    """(B38 step 4, ISAAC_RL_B38_TORCHPROF) learn(job) under the torch profiler (CPU and CUDA activity): the
+    operator table (by self CPU time and by CUDA time), the regions' times (record_function 'b38:*' marks) and a
+    Chrome trace in path."""
+    from torch.profiler import ProfilerActivity, profile
+    Path(path).mkdir(parents=True, exist_ok=True)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof_:
+        learn(job)
+    ka = prof_.key_averages()
+    with open(Path(path) / 'ops.txt', 'w') as f:
+        f.write(ka.table(sort_by='self_cpu_time_total', row_limit=60))
+        f.write('\n\n')
+        f.write(ka.table(sort_by='self_cuda_time_total', row_limit=40))
+    prof_.export_chrome_trace(str(Path(path) / 'trace.json'))
+    print(f'B38: the profile of one update written to {path}', flush=True)
+
+
+def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on):
+    """(B38 step 4, train_tok --learner-fast 2) what the start-of-update pass needs for the B18 fast path's host plans
+    of records at flat positions of a rollout: per record its entity / door / item counts and its history token's
+    presence on the host, and (dedup) its ids among the distinct grids of rows_dev (the records on the device)."""
+    from isaac_bridge.tok_policy import DEDUP, distinct_ids, item_count
+    w_, t_ = flat // roll.cap, flat % roll.cap
+    fr = dict(ne=roll.rows['n_ent'][w_, t_].astype(np.int64), nd=roll.rows['n_doors'][w_, t_].astype(np.int64),
+              ni=item_count(row_fields(roll, flat, ('inv', 'pitem')), item_slots) if n_item_tok else None,
+              hist=(roll.t_step[w_, roll.tP + t_] > 0) if t_on else None, width=rows_dev['ent'].shape[1])
+    fr['dd'] = {k_: distinct_ids(rows_dev[k_]).cpu().numpy() for k_ in DEDUP} if 'dedup' in fparts else {}
+    fr['dd_size'] = {k_: int(v_.max()) + 1 for k_, v_ in fr['dd'].items()}
+    return fr
+
+
+def fast_plan_rows(fr, raw, pend, lo, hi, fparts, n_buckets, n_item_tok, glob_tok, t_on):
+    """(B38 step 4) records lo .. hi of fast_plan_counts' set as forward(packed=True) takes them on the B18 fast
+    path (what the PPO parts build): their bytes decoded (raw [n, >= ROW_BYTES] uint8, pend [n, heads] on the device;
+    a slice: no gather), the host plan (entity positions, attention buckets, the distinct grids) in one copy (pinned
+    on a GPU)."""
+    import torch
+    from isaac_bridge.tok_policy import decode_rows, first_of, learner_plan, plan_tokens, used_entities
+    dev_ = raw.device
+    ne_p, nd_p = fr['ne'][lo:hi], fr['nd'][lo:hi]
+    mb_ = decode_rows(raw[lo:hi], pending=pend[lo:hi], entities=min(fr['width'], used_entities(ne_p)))
+    xp_ = dict(item_tok=n_item_tok, glob=glob_tok) if (n_item_tok or glob_tok or t_on) else {}
+    if xp_:
+        xp_['n_item'] = fr['ni'][lo:hi] if n_item_tok else None
+    if t_on:
+        xp_['hist'] = fr['hist'][lo:hi]
+    plan = learner_plan(ne_p, nd_p, mb_['ent'].shape[1], n_buckets, **xp_)
+    hn = ['rec', 'base']
+    for k_ in fr['dd']:
+        plan[k_ + '_u'], plan[k_ + '_i'] = first_of(fr['dd'][k_][lo:hi], fr['dd_size'][k_])
+        hn += [k_ + '_u', k_ + '_i']
+    bk_ = plan['buckets'] if 'buckets' in fparts else []
+    arrays = [plan[k_].reshape(-1) for k_ in hn] + [c_ for c_, _ in bk_]
+    on = torch.from_numpy(np.concatenate([np.asarray(a_, np.int64) for a_ in arrays]))
+    if dev_.type == 'cuda':
+        on = on.pin_memory()
+    got = list(on.to(dev_, non_blocking=True).split([len(a_) for a_ in arrays]))
+    got[0] = got[0].view(-1, plan['rec'].shape[1])
+    mb_.update(zip(hn[2:], got[2:len(hn)]))
+    tok = plan_tokens(plan, got[0], got[1])
+    pnames = ['keep', 'starts']
+    if 'ekeep' in fparts:
+        pnames.append('ekeep')
+    if 'buckets' in fparts:
+        pnames.append('gpos')
+        if 'ekeep' in fparts:
+            pnames += ['dkeep', 'xperm'] + (['ikeep', 'glast'] if xp_ else [])
+    mb_.update((k_, tok[k_]) for k_ in pnames)
+    if bk_:
+        mb_['buckets'] = [(c_, w_) for c_, (_, w_) in zip(got[len(hn):], bk_)]
+    return mb_
+
+
+def row_fields(roll, flat, names):
+    """(B38 step 4) the fields `names` of a rollout's records at flat positions (w * cap + t), each gathered on its
+    own (a dict: what item_count reads), instead of whole records (20.8 KB each)."""
+    w, t = flat // roll.cap, flat % roll.cap
+    return {k: roll.rows[k][w, t] for k in names}
+
+
+def full_from_local(roll, n_total, lo, alloc):
+    """(B38 step 5, the first actor process) every host array of a rollout of the actor's own workers (axis 0) as the
+    rows lo .. lo + roll.n of an array for all n_total workers made by alloc (SharedArrays: the other actor process and
+    the learner process map them); the rollout's attributes become those rows (views: what the actor writes lands in
+    the shared arrays). Returns {name: full array}."""
+    full = {}
+    for k, v in list(vars(roll).items()):
+        if isinstance(v, np.ndarray):
+            f = alloc((n_total,) + v.shape[1:], v.dtype)
+            f[lo:lo + roll.n] = v
+            setattr(roll, k, f[lo:lo + roll.n])
+            full[k] = f
+    return full
+
+
+def slice_into(roll, full, lo):
+    """(B38 step 5, the other actor processes) a rollout of the actor's own workers on rows lo .. lo + roll.n of the
+    shared full arrays (full_from_local): its initial values written there, its attributes those rows."""
+    for k, v in list(vars(roll).items()):
+        if isinstance(v, np.ndarray):
+            f = full[k]
+            f[lo:lo + roll.n] = v
+            setattr(roll, k, f[lo:lo + roll.n])
+
+
+def merge_rollouts(full, parts, mirror, device):
+    """(B38 step 5, the learner) one rollout of all workers from the actor processes' halves: the shared full host
+    arrays (each actor wrote its own workers' rows) and, per actor (parts: [(first worker, its rollout's scalars,
+    its (t_kv, t_o) or None)], in worker order), its temporal pool on its own GPU. The pools are copied one after
+    another into one mirror on `device` (dict `mirror`, reused while the shapes stay): K / V rows [actor 0's rows,
+    actor 1's rows, ...]; o rows [every actor's carried room sources, then the K / V rows' o in the same order], so
+    o's row = K / V's row + t_obase as in one rollout; each actor's row indices in t_row and rooms_src (host copies,
+    the shared arrays untouched) are moved by its offsets. Only the rows in use are copied (the rest of the mirror is
+    never read for a decision). Returns (the rollout view, bytes copied). The copies run on the current stream of
+    `device` (cross-device copy_: ordered against it); the actors synchronised their writes before their hand-off."""
+    import torch
+    n_total = int(full['length'].shape[0])
+    s0 = parts[0][1]
+    view = Rollout.__new__(Rollout)
+    view.__dict__.update(full)
+    view.__dict__.update({k: s0[k] for k in ('cap', 'nh') if k in s0})
+    view.n = n_total
+    view.value_g = full.get('value_g')
+    view.h = full.get('h')
+    view.raw_rooms = [r for _, s, _ in parts for r in s['raw_rooms']] if s0.get('raw_rooms') is not None else None
+    view.raw_contexts = [r for _, s, _ in parts for r in s['raw_contexts']] if s0.get('raw_contexts') is not None else None
+    if parts[0][2] is None:
+        view.t_kv = None
+        return view, 0
+    P, R = s0['tP'], s0['tR']
+    view.tP, view.tR = P, R
+    rows = [s['n'] * P + s['t_pool'] + 1 for _, s, _ in parts]
+    obase = [s['n'] * R for _, s, _ in parts]
+    used = [s['n'] * P + s['t_used'] for _, s, _ in parts]
+    kv_off = np.concatenate([[0], np.cumsum(rows)[:-1]]).astype(np.int64)
+    c_off = np.concatenate([[0], np.cumsum(obase)[:-1]]).astype(np.int64)
+    obase_m = int(sum(obase))
+    o_off = obase_m + kv_off
+    kv0, o0 = parts[0][2]
+    kv_shape = (int(sum(rows)),) + tuple(kv0.shape[1:])
+    o_shape = (obase_m + int(sum(rows)),) + tuple(o0.shape[1:])
+    dev = torch.device(device)
+    for name, shape, dt in (('kv', kv_shape, kv0.dtype), ('o', o_shape, o0.dtype)):
+        m = mirror.get(name)
+        if m is None or tuple(m.shape) != shape or m.dtype != dt or m.device != dev:
+            mirror[name] = None
+            mirror[name] = torch.zeros(shape, dtype=dt, device=dev)
+    kv_m, o_m = mirror['kv'], mirror['o']
+    t_row, rooms_src = full['t_row'].copy(), full['rooms_src'].copy()
+    nbytes = 0
+    for a, (lo, s, (kv, o)) in enumerate(parts):
+        u, ob, ko, co, oo = used[a], obase[a], int(kv_off[a]), int(c_off[a]), int(o_off[a])
+        kv_m[ko:ko + u].copy_(kv[:u], non_blocking=True)
+        o_m[co:co + ob].copy_(o[:ob], non_blocking=True)
+        o_m[oo:oo + u].copy_(o[ob:ob + u], non_blocking=True)
+        nbytes += u * kv[0].numel() * kv.element_size() + (ob + u) * o[0].numel() * o.element_size()
+        hi = lo + s['n']
+        tr = t_row[lo:hi]
+        t_row[lo:hi] = np.where(tr >= 0, tr + ko, tr)
+        rs = rooms_src[lo:hi]
+        rooms_src[lo:hi] = np.where(rs < ob, rs + co, rs - ob + oo)
+    view.t_row, view.rooms_src = t_row, rooms_src
+    view.t_kv, view.t_o, view.t_s = kv_m, o_m, None
+    view.t_obase = obase_m
+    view.t_pool = int(sum(rows)) - n_total * P - 1
+    view.t_used = int(sum(s['t_used'] for _, s, _ in parts))
+    view.t_grown = 0
+    return view, nbytes
+
+
+def merge_jobs(halves):
+    """(B38 step 5, the learner) one job from the actor processes' half-jobs (in actor order): episode lists and
+    records concatenated, the workers' counters (stats rows, worker seconds, lane counters, the actor calls' counts and
+    seconds) summed or stacked, collect / cycle / wait seconds the slowest actor's, the per-actor collect seconds kept
+    (collect_actors)."""
+    j = dict(halves[0])
+    num = lambda xs: [x for x in xs if x is not None]   # noqa: E731
+
+    def cat_rec(key):
+        got = num([h.get(key) for h in halves])
+        if not got:
+            return None
+        return tuple(sum([g[i] for g in got], []) if isinstance(got[0][i], list) else
+                     np.concatenate([g[i] for g in got]) for i in range(len(got[0])))
+
+    def sum_dict(key):
+        out = {}
+        for h in halves:
+            for k, v in (h.get(key) or {}).items():
+                out[k] = out.get(k, 0) + v
+        return out
+    j['finished'] = [e for h in halves for e in h.get('finished', [])]
+    j['branch_finished'] = [e for h in halves for e in h.get('branch_finished', [])]
+    for k in ('collect_s', 'wait_learner_s', 'cycle_s', 'cycle_wait_s', 'take_s', 't_put'):
+        if k in j:
+            j[k] = max(h.get(k, 0.0) for h in halves)
+    j['t_start'] = min(h.get('t_start', j.get('t_start')) for h in halves)
+    j['collect_actors'] = ' '.join(f"{h.get('collect_s', 0.0):.3f}" for h in halves)
+    j['prof'], j['worker'], j['lane_stat'] = sum_dict('prof'), sum_dict('worker'), sum_dict('lane_stat')
+    j['stats'] = np.concatenate([h['stats'] for h in halves])
+    j['teach'], j['v2'], j['choices'] = cat_rec('teach'), cat_rec('v2'), cat_rec('choices')
+    j['cpu_collect'] = float(np.mean([h.get('cpu_collect', 0.0) for h in halves]))
+    j['proc_cores'] = float(sum(h.get('proc_cores', 0.0) for h in halves))
+    j['dec_min'] = min(h.get('dec_min', 0.0) for h in halves)
+    j['dec_max'] = max(h.get('dec_max', 0.0) for h in halves)
+    j['dec_w'] = ' '.join(h.get('dec_w', '') for h in halves)
+    j['actor_mem'] = halves[0].get('actor_mem', 0)
+    j['actor_mem_all'] = [h.get('actor_mem', 0) for h in halves]
+    return j
+
+
+def actor_child_entry(argv, init):
+    """(B38 step 5, --actor-processes 2) a second actor process: main() for its share of the workers (its own
+    sampler, GraphActors, lanes, temporal state on its GPU), handing its half of every rollout to the learner process.
+    SIGINT ends it like the first one (its sampler closed; the first actor stops the learner)."""
+    main(argv, actor=init)
+
+
+def rollout_scalars(roll):
+    """(B38 step 2) a rollout's attributes that are neither arrays nor tensors (counters, sizes; None for the parts
+    that are off): what the learner process's view needs per job besides the shared arrays."""
+    import torch
+    return {k: v for k, v in vars(roll).items() if not isinstance(v, (np.ndarray, torch.Tensor))}
+
+
+def rollout_view(arrays, scalars, tensors):
+    """(B38 step 2, the learner process) a Rollout over shared host arrays, the actor's scalars and its device tensors
+    (t_kv, t_o, received through CUDA IPC; t_s is not shared: the learner never reads it)."""
+    r = Rollout.__new__(Rollout)
+    r.__dict__.update(arrays)
+    r.__dict__.update(scalars)
+    if tensors is not None:
+        r.t_kv, r.t_o, r.t_s = tensors[0], tensors[1], None
+    return r
+
+
+class Rollout:
+    """Decisions per worker, in arrival order.
+    temporal (2026-10-14, B30; dict(P, L, D, R, kv 'bf16' | 'fp32', device, rows)): per decision the temporal step's
+    outputs. B31 (2026-10-15): the tensors stay on the device (the actor's and the learner's GPU; the CPU in tests and
+    without CUDA) in one pool of rows: t_kv [rows, L, 2, D] (the step token's K / V per layer, bfloat16 or float32), t_s
+    [rows, D] (s_t, same dtype), t_o [t_obase + rows, D] float32 (o_t; its first t_obase = workers x R rows hold the
+    carried room tokens' sources); rows = workers x P (the P decisions before this rollout, worker w's at w * P + j:
+    the learner's context of its first chunks, filled by carry) + `rows` pool rows (default workers x capacity; the
+    trainer passes about --rollout + 4 x workers and the pool grows if ever needed: t_grow) + one scratch row (where a
+    decision past capacity goes). The host keeps only integers: t_row [workers, P + capacity] (entry P + k = decision
+    k, entries 0 .. P-1 the decisions before; -1: no row yet) -> the row, t_ep: the worker's episode serial, t_step:
+    the decision's index in its episode, t_rc: a room token made there, t_nroom: the episode's room tokens after it. Per
+    worker the room tokens' sources (rooms_src: the t_o row of o of the last decision in the room left, rooms_stage,
+    rooms_k: index in the episode, rooms_ep, rooms_t: the decision that made it, -1 before this rollout; rooms_n): the
+    rollout's own and the going episode's earlier ones. Rows are assigned when a decision is submitted (t_dest) or
+    stored (store_temporal); the actor writes them on the device (GraphActor tdest / store's index_copy_)."""
+
+    def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False, temporal=None, alloc=None):
+        # B38 step 2: alloc(shape, dtype) -> a zeroed array for every host array (SharedArrays: shared memory the
+        # learner process maps); None: numpy's, as before
+        zeros = np.zeros if alloc is None else alloc
+        full = np.full if alloc is None else _filled(alloc)
+        self.n, self.cap, self.nh = workers, capacity, n_heads
+        self.raw_rooms = [[] for _ in range(workers)] if temporal and temporal.get('raw_rooms') else None
+        self.raw_contexts = [[None] * capacity for _ in range(workers)] if temporal and temporal.get('rebuild_memory') else None
+        self.t_kv = None   # (B30)
+        if temporal:
+            import torch
+            P, L, D, R = (int(temporal[k]) for k in ('P', 'L', 'D', 'R'))
+            kdt = torch.bfloat16 if temporal.get('kv', 'bf16') == 'bf16' else torch.float32
+            dev = torch.device(temporal.get('device') or 'cpu')
+            self.tP, self.tR = P, R
+            self.t_pool = int(temporal.get('rows') or workers * capacity)
+            self.t_obase = workers * R
+            rows = workers * P + self.t_pool + 1
+            self.t_kv = torch.zeros((rows, L, 2, D), dtype=kdt, device=dev)
+            self.t_s = torch.zeros((rows, D), dtype=kdt, device=dev)
+            self.t_o = torch.zeros((self.t_obase + rows, D), device=dev)
+            self.t_row = full((workers, P + capacity), -1, np.int64)
+            self.t_row[:, :P] = np.arange(workers)[:, None] * P + np.arange(P)[None]
+            self.t_used = 0      # pool rows assigned
+            self.t_grown = 0     # times the pool grew
+            self.t_ep = full((workers, P + capacity), -2, np.int64)
+            self.t_step = zeros((workers, P + capacity), np.int64)
+            self.t_rc = zeros((workers, P + capacity), bool)
+            self.t_nroom = zeros((workers, P + capacity), np.int64)
+            rc = R + capacity
+            self.rooms_src = zeros((workers, rc), np.int64)
+            self.rooms_stage = zeros((workers, rc), np.int64)
+            self.rooms_k = zeros((workers, rc), np.int64)
+            self.rooms_ep = full((workers, rc), -3, np.int64)
+            self.rooms_t = zeros((workers, rc), np.int64)
+            self.rooms_n = zeros(workers, np.int64)
+        # 2026-10-14 (B24, global-token models): value_global of each decision, as the actor computed it (None without)
+        self.value_g = zeros((workers, capacity), np.float32) if value_g else None
+        # 2026-10-11 (memory): the GRU's input state of each decision (None without memory)
+        self.h = zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
+        self.rows = zeros((workers, capacity), ROW)
+        self.pending = zeros((workers, capacity, n_heads), np.int64)
+        self.actions = zeros((workers, capacity, n_heads), np.int64)
+        self.logp = zeros((workers, capacity), np.float32)
+        self.value = zeros((workers, capacity), np.float32)
+        self.reward = zeros((workers, capacity), np.float32)
+        self.terminal = zeros((workers, capacity), bool)
+        self.version = zeros((workers, capacity), np.int64)   # the actor's weights (updates done) that sampled it
+        # 2026-10-07 (branches): a branch episode's truncated last record (done DONE_BRANCH), stored only for its value:
+        # the decision before bootstraps from it, it is not trained on (gae)
+        self.boot = zeros((workers, capacity), bool)
+        self.length = zeros(workers, np.int64)
+        self.open = full(workers, -1, np.int64)   # the stored decision still waiting for its reward (the last one)
+
+    def total(self):
+        return int(self.length.sum())
+
+    def usable(self):
+        """Decisions that have their reward (an open decision is always a worker's last one)."""
+        return int(self.length.sum() - (self.open >= 0).sum())
+
+    def reset(self):
+        self.length[:] = 0
+        self.open[:] = -1
+        if self.t_kv is not None:   # (B31) the pool's rows free again
+            self.t_used = 0
+            self.t_row[:, self.tP:] = -1
+
+    def t_free(self):
+        """(B31) pool rows not yet assigned."""
+        return self.t_pool - self.t_used
+
+    def t_scratch(self):
+        """(B31) the scratch row (decisions past capacity; never read)."""
+        return self.t_kv.shape[0] - 1
+
+    def t_grow(self, need=0):
+        """(B31) a larger pool (at least `need` more rows free): new device tensors, the assigned rows copied. Only
+        while no call in flight writes into the old ones (the trainer drains its calls first)."""
+        import torch
+        extra = max(int(need), self.t_pool // 4, 64)
+        keep = self.n * self.tP + self.t_used
+        rows = self.n * self.tP + self.t_pool + extra + 1
+        for name, base in (('t_kv', 0), ('t_s', 0), ('t_o', self.t_obase)):
+            old = getattr(self, name)
+            new = torch.zeros((base + rows,) + tuple(old.shape[1:]), dtype=old.dtype, device=old.device)
+            new[:base + keep] = old[:base + keep]
+            setattr(self, name, new)
+        self.t_pool += extra
+        self.t_grown += 1
+
+    def t_assign(self, a_idx, kk=None):
+        """(B31) the rows of decisions kk (default: the next one, length) of workers a_idx (distinct): assigned from
+        the pool where they have none (t_row), the scratch row past capacity. Returns int64 [n]."""
+        kk = self.length[a_idx] if kk is None else np.asarray(kk, np.int64)
+        P = self.tP
+        out = np.full(len(a_idx), self.t_scratch(), np.int64)
+        ok = kk < self.cap
+        if not ok.any():
+            return out
+        cur = self.t_row[a_idx[ok], P + kk[ok]]
+        new = cur < 0
+        k_new = int(new.sum())
+        if k_new > self.t_free():
+            self.t_grow(k_new - self.t_free())
+        if k_new:
+            cur[new] = self.n * P + self.t_used + np.arange(k_new)
+            self.t_used += k_new
+            self.t_row[a_idx[ok][new], P + kk[ok][new]] = cur[new]
+        out[ok] = cur
+        return out
+
+    def t_dest(self, a_idx):
+        """(B31) GraphActor.submit's tdest for the next decisions of workers a_idx: this rollout's device tensors and
+        the records' rows."""
+        return dict(kv=self.t_kv, s=self.t_s, o=self.t_o, obase=self.t_obase, rows=self.t_assign(a_idx))
+
+    def carry(self, other):
+        """Start this (empty) rollout with the other's open decisions (their rewards are still to come)."""
+        self.reset()
+        if self.raw_contexts is not None:
+            self.raw_contexts = [[None] * self.cap for _ in range(self.n)]
+            for w in np.flatnonzero(other.open >= 0):
+                self.raw_contexts[w][0] = other.raw_contexts[w][other.open[w]]
+        i = np.flatnonzero(other.open >= 0)
+        k = other.open[i]
+        for name in ('rows', 'pending', 'actions', 'logp', 'value', 'version', 'boot'):
+            getattr(self, name)[i, 0] = getattr(other, name)[i, k]
+        if self.h is not None:   # (memory)
+            self.h[i, 0] = other.h[i, k]
+        if self.value_g is not None and other.value_g is not None:   # (B24)
+            self.value_g[i, 0] = other.value_g[i, k]
+        self.length[i], self.open[i] = 1, 0
+        if self.t_kv is not None:   # (B30) the P decisions before this rollout, the open one, the episode's rooms
+            import torch
+            P, R = self.tP, self.tR
+            names = ('t_ep', 't_step', 't_rc', 't_nroom')
+            src, dst, o_src, o_dst = [], [], [], []   # (B31) rows copied on the device: K / V, s, o; room sources
+            for w in range(self.n):
+                k_ = int(other.open[w])
+                end = P + (k_ if k_ >= 0 else int(other.length[w]))
+                for name in names:
+                    a_, b_ = getattr(self, name), getattr(other, name)
+                    a_[w, :P] = b_[w, end - P:end]
+                    if k_ >= 0:
+                        a_[w, P] = b_[w, end]
+                src.append(other.t_row[w, end - P:end])
+                dst.append(self.t_row[w, :P])
+                if k_ >= 0:   # (the open decision: decision 0 here)
+                    src.append(other.t_row[w, end:end + 1])
+                    dst.append(self.t_assign(np.array([w]), np.array([0])))
+                ep_now = other.t_ep[w, end] if k_ >= 0 else other.t_ep[w, end - 1]
+                m_ = int(other.rooms_n[w])
+                sel = np.flatnonzero(other.rooms_ep[w, :m_] == ep_now) if ep_now >= 0 else np.zeros(0, np.int64)
+                c_ = len(sel)   # (<= R: an episode makes at most R room tokens)
+                for name in ('rooms_stage', 'rooms_k', 'rooms_ep'):
+                    getattr(self, name)[w, :c_] = getattr(other, name)[w, sel]
+                self.rooms_t[w, :c_] = np.where((other.rooms_t[w, sel] == k_) & (k_ >= 0), 0, -1)
+                self.rooms_n[w] = c_
+                if self.raw_rooms is not None:
+                    self.raw_rooms[w] = [other.raw_rooms[w][j] for j in sel]
+                self.rooms_src[w, :c_] = w * R + np.arange(c_)   # (the carried sources' own rows of t_o)
+                o_src.append(other.rooms_src[w, sel])
+                o_dst.append(self.rooms_src[w, :c_])
+            src, dst = np.concatenate(src), np.concatenate(dst)
+            src = np.where(src >= 0, src, other.t_scratch())   # (never: every decision before `end` has its row)
+            dev = self.t_kv.device
+            si = torch.from_numpy(src).to(dev)
+            di = torch.from_numpy(dst).to(dev)
+            self.t_kv.index_copy_(0, di, other.t_kv.index_select(0, si).to(self.t_kv.dtype))
+            self.t_s.index_copy_(0, di, other.t_s.index_select(0, si).to(self.t_s.dtype))
+            self.t_o.index_copy_(0, di + self.t_obase, other.t_o.index_select(0, si + other.t_obase))
+            o_src, o_dst = np.concatenate(o_src), np.concatenate(o_dst)
+            if len(o_src):
+                self.t_o.index_copy_(0, torch.from_numpy(o_dst).to(dev),
+                                     other.t_o.index_select(0, torch.from_numpy(o_src).to(dev)))
+
+
+class Episodes:
+    """The actor's bookkeeping of the records that arrive (vectorised over a poll's records): the reward of each
+    worker's open decision, episode ends and their statistics, the action under way."""
+
+    def __init__(self, workers, rw, floor, run=False, items=False):
+        # 2026-10-10 (archive_plr): per worker the actor's value at the episode's first record, its discounted return
+        # and the number of decisions closed; plr = (stats array, ST, gamma) when the trainer reports the scores
+        self.v0, self.gret, self.steps = np.zeros(workers), np.zeros(workers), np.zeros(workers, np.int64)
+        self.plr = None
+        self.rw, self.floor, self.run, self.items = rw, floor or run, run, items
+        self.end_bonus = rw['exit'] if self.floor else rw['clear']
+        self.ret, self.hurt, self.damage = np.zeros(workers), np.zeros(workers), np.zeros(workers)
+        self.rooms, self.boss = np.zeros(workers, np.int64), np.zeros(workers, np.int64)
+        # run / items (2026-10-06): floors reached, collectibles gained, active item and pill / card uses, the stage
+        # at the episode's first record and the deepest one
+        self.extra = np.zeros((workers, 6), np.int64)   # exits, items, uses, pills, stage0, stage_max
+        self.finished = []                       # episodes ended since the last hand-over
+        self.branch_finished = []                # 2026-10-07: branch episodes ended since then (tok_branch)
+        self.lab_finished = []                   # 2026-10-08: lab episodes ended since then (tok_lab)
+        self.seen_inv = None                     # 2026-10-08 (lab on): held collectibles at ordinary episodes' ends
+        self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
+        self.stats0 = None                       # 2026-10-08 (stat aug on): worker -> the stats at the first record
+        self.char0 = None                        # 2026-10-08 (characters on): worker -> ROW pchar at the first record
+        self.active0 = None                      # B39 (no-active starts on): worker -> has_active at the first record
+        # 2026-10-13 (B23, --start-build-mode pedestal / --pickup-force): per worker the episode's pedestal build (ROW
+        # bped at the first record), whether it was drawn as forced (pmode) and its forced decisions (pforce > 0)
+        self.pick = None
+        # 2026-10-08 (heal / resource terms, floor modes): per worker the health units and coins + bombs + keys of the
+        # last record (the deltas' base) and the episode's gains so far
+        self.gains = np.zeros((workers, 2)) if self.floor and (rw.get('heal') or rw.get('resource')) else None
+        self.healed, self.gathered = np.zeros(workers), np.zeros(workers)
+
+    @staticmethod
+    def cur_gains(rows):
+        """[health units, coins + bombs + keys] of each record, from the player token (tok_obs / abp_row_encode
+        columns 7 units / 12, 8 min(bombs, 10) / 10, 9 min(keys, 10) / 10, 10 min(coins, 50) / 50)."""
+        pl = rows['player']
+        return np.stack([np.rint(pl[:, 7] * 12.0), np.rint(pl[:, 8] * 10.0) + np.rint(pl[:, 9] * 10.0)
+                         + np.rint(pl[:, 10] * 50.0)], 1).astype(np.float64)
+
+    def arrive(self, roll, rows, idx, pending):
+        """Records `rows` of workers `idx` (distinct): close the decisions before them, end episodes, reset the action
+        under way where an episode starts or ends. Returns the mask of the records that need an action."""
+        rw = self.rw
+        first = rows['first'] != 0
+        done = rows['done'].astype(np.int64)
+        k = roll.open[idx]
+        broke = first & (k >= 0)   # the episode before broke off (a worker error): end it there
+        if broke.any():
+            roll.reward[idx[broke], k[broke]], roll.terminal[idx[broke], k[broke]] = 0.0, True
+            roll.open[idx[broke]] = -1
+            k = np.where(broke, -1, k)
+        has = k >= 0
+        if has.any():   # the reward of the decision before
+            w, kk, d = idx[has], k[has], done[has]
+            dmg = rows['damage'][has].astype(np.float64)
+            hu = rows['hurt'][has].astype(np.float64)
+            reward = rw['damage'] * dmg - rw['hurt'] * hu - rw['time'] + np.where(
+                d == 1, self.end_bonus, np.where(d == 2, -rw['death'], np.where(d == 3, -rw['timeout'], 0.0)))
+            if self.floor:
+                ev = rows['events'][has].astype(np.int64)
+                reward = reward + (rw['room'] * ((ev & 1) > 0) + rw['explore'] * ((ev & 2) > 0)
+                                   + rw['boss'] * ((ev & 4) > 0))
+                if self.run:   # the next floor reached: the exit reward, and the episode goes on
+                    reward = reward + rw['exit'] * ((ev & EV_EXIT) > 0)
+                self.rooms[w] += (ev & 1) > 0
+                self.boss[w] += (ev & 4) > 0
+                if self.gains is not None:   # 2026-10-08: health units and resources gained since the record before
+                    dl = self.cur_gains(rows)[has] - self.gains[w]
+                    reward = reward + rw['heal'] * np.maximum(dl[:, 0], 0) + rw['resource'] * np.maximum(dl[:, 1], 0)
+                    self.healed[w] += np.maximum(dl[:, 0], 0)
+                    self.gathered[w] += np.maximum(dl[:, 1], 0)
+            if self.run or self.items:
+                ev = rows['events'][has].astype(np.int64)
+                x = self.extra
+                x[w, 0] += (ev & EV_EXIT) > 0
+                x[w, 1] += (ev & EV_ITEM) > 0
+                x[w, 2] += (ev & EV_ACTIVE) > 0
+                x[w, 3] += (ev & EV_PILL) > 0
+                x[w, 5] = np.maximum(x[w, 5], rows['stage'][has])
+            # (a branch's truncated end, DONE_BRANCH: not terminal, the decision bootstraps from the end's value)
+            roll.reward[w, kk], roll.terminal[w, kk] = reward, (d != 0) & (d != DONE_BRANCH)
+            roll.open[w] = -1
+            self.ret[w] += reward
+            if self.plr is not None:   # 2026-10-10 (archive_plr)
+                stats_, ST_, gamma_ = self.plr
+                first_dec = self.steps[w] == 0
+                self.v0[w[first_dec]] = roll.value[w[first_dec], kk[first_dec]]
+                self.gret[w] += (gamma_ ** self.steps[w]) * reward
+                self.steps[w] += 1
+            self.hurt[w] += hu
+            self.damage[w] += dmg
+        if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
+            self.gains[idx] = self.cur_gains(rows)
+        if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
+            st0 = first
+            if st0.any():
+                self.extra[idx[st0], 4] = rows['stage'][st0]
+                self.extra[idx[st0], 5] = rows['stage'][st0]
+                if self.items:
+                    for j in np.flatnonzero(st0):
+                        self.inv0[int(idx[j])] = [int(v) for v, c in rows[j]['inv'] if v > 0 and c > 0]
+                if self.stats0 is not None:   # 2026-10-08 (stat aug): damage, fire delay, shot speed, range, speed
+                    for j in np.flatnonzero(st0):
+                        pl = rows[j]['player']
+                        self.stats0[int(idx[j])] = [round(float(pl[11]) * 10, 3), round(float(pl[12]) * 20, 3),
+                                                    round(float(pl[13]) * 2, 3), round(float(pl[14]) * 500, 1),
+                                                    round(float(pl[15]) * 2, 3)]
+        if self.char0 is not None and first.any():   # 2026-10-08 (characters): the episode's character
+            for j in np.flatnonzero(first):
+                self.char0[int(idx[j])] = int(rows[j]['pchar'])
+        if self.active0 is not None and first.any():   # B39: ROW player[21] (has_active) at the first record
+            for j in np.flatnonzero(first):
+                self.active0[int(idx[j])] = int(rows[j]['player'][21] > 0)
+        if self.pick is not None:   # 2026-10-13 (B23)
+            pk = self.pick
+            if first.any():
+                for j in np.flatnonzero(first):
+                    pk['bped'][int(idx[j])] = [int(v) for v in rows[j]['bped'] if v > 0]
+                pk['steps'][idx[first]] = 0
+            pk['steps'][idx] += rows['pforce'] > 0
+        ended = done != 0
+        if ended.any():
+            for j in np.flatnonzero(ended):
+                i, r = idx[j], rows[j]
+                fin = dict(group=int(r['group']), seed=int(r['seed']), done=int(r['done']),
+                           decisions=int(r['t']), ret=float(self.ret[i]), hurt=float(self.hurt[i]),
+                           damage=float(self.damage[i]), rooms=int(self.rooms[i]), boss=int(self.boss[i]))
+                if self.run or self.items:
+                    x = self.extra[i]
+                    fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]),
+                               stage0=int(x[4]), stage=int(max(x[5], r['stage'])))
+                    if self.inv0.get(int(i)):   # 2026-10-08: the collectibles held at the first record (start builds)
+                        fin['build0'] = self.inv0[int(i)]
+                if self.stats0 is not None and int(i) in self.stats0:   # 2026-10-08 (stat aug): the start stats
+                    fin['stats0'] = self.stats0[int(i)]
+                if self.char0 is not None and int(i) in self.char0:   # 2026-10-08 (characters): its PlayerType
+                    fin['char0'] = self.char0[int(i)]
+                if self.active0 is not None and int(i) in self.active0:   # B39: an active item at its first record
+                    fin['active0'] = self.active0[int(i)]
+                if self.gains is not None:   # 2026-10-08: health units healed, coins + bombs + keys gathered
+                    fin.update(healed=float(self.healed[i]), gathered=float(self.gathered[i]))
+                if self.pick is not None:   # 2026-10-13 (B23): the pedestal build, the forcing draw and its decisions
+                    fin.update(build_pedestals=self.pick['bped'].get(int(i), []), pickup_forced=int(r['pmode']),
+                               forced_steps=int(self.pick['steps'][i]))
+                if r['lab'] != 0:   # 2026-10-08: a lab episode (tok_lab): kept apart from the episode stats
+                    fin.update(lab=int(r['lab']), lab_s=int(r['lab_s']))
+                    self.lab_finished.append(fin)
+                elif r['branch'] != 0:   # 2026-10-07: a branch episode (tok_branch): kept apart from the episode stats
+                    fin.update(point=int(r['point']), branch=int(r['branch']))
+                    self.branch_finished.append(fin)
+                else:
+                    self.finished.append(fin)
+                    if self.seen_inv is not None and self.items:   # the build it ended with
+                        held = [int(v) for v, c in r['inv'] if v > 0 and c > 0]
+                        if held:
+                            self.seen_inv.append(held)
+            e = idx[ended]
+            self.ret[e], self.hurt[e], self.damage[e], self.rooms[e], self.boss[e] = 0.0, 0.0, 0.0, 0, 0
+            self.extra[e] = 0
+            self.healed[e], self.gathered[e] = 0.0, 0.0
+            if self.plr is not None:   # 2026-10-10 (archive_plr): the score of each finished ordinary episode
+                stats_, ST_, gamma_ = self.plr
+                for j in np.flatnonzero(ended):
+                    i, r = int(idx[j]), rows[j]
+                    if r['lab'] == 0 and r['branch'] == 0 and self.steps[i] > 0:
+                        stats_[i, ST_['plr_score']] = abs(float(self.gret[i]) - float(self.v0[i]))
+                        stats_[i, ST_['plr_episode']] = float(r['episode'])
+                self.v0[e], self.gret[e], self.steps[e] = 0.0, 0.0, 0
+            boot = done == DONE_BRANCH
+            pending[idx[ended & ~boot]] = 0   # (a truncated branch end keeps it: its record is evaluated, see below)
+        else:
+            boot = np.zeros(len(idx), bool)
+        # a branch episode's truncated end (DONE_BRANCH, 2026-10-07) is answered like a running record: the actor's
+        # value of it is stored (Rollout.boot) for the decision before to bootstrap from; the next record of the
+        # worker is the next episode's first, which closes it with no reward as a terminal (broke, above)
+        go = ~ended | boot
+        pending[idx[first & go]] = 0
+        return go
+
+
+def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, vg=None, tinfo=None):
+    """Store the decisions just answered (workers a_idx, distinct) as their workers' open ones. h (memory): the GRU's
+    input state of each. vg (B24, global-token models): value_global of each. tinfo (B30, temporal models): the
+    temporal step's outputs of each (GraphActor.t_out's counters, or tok_policy.temporal_out's dict with the step's
+    tensors: store_temporal)."""
+    kk = roll.length[a_idx]
+    ok = kk < roll.cap   # cannot fail with the trainer's capacity; drop rather than overrun
+    if not ok.all():
+        a_idx, kk, rows, under_way = a_idx[ok], kk[ok], rows[ok], under_way[ok]
+        actions, logp, value = actions[ok], logp[ok], value[ok]
+        h = h[ok] if h is not None else None
+        vg = vg[ok] if vg is not None else None
+        tinfo = {k_: ([v_[i] for i in np.flatnonzero(ok)] if isinstance(v_, list) else
+                     v_[torch_from(ok, v_.device)] if not isinstance(v_, np.ndarray) else v_[ok])
+                 for k_, v_ in tinfo.items()} if tinfo is not None else None
+    if tinfo is not None and roll.t_kv is not None:   # 2026-10-14 (B30)
+        store_temporal(roll, a_idx, kk, rows, tinfo)
+    if vg is not None and roll.value_g is not None:   # 2026-10-14 (B24)
+        roll.value_g[a_idx, kk] = vg
+    if h is not None and roll.h is not None:   # 2026-10-11 (memory)
+        roll.h[a_idx, kk] = h
+    roll.rows[a_idx, kk] = rows
+    roll.boot[a_idx, kk] = rows['done'] == DONE_BRANCH   # 2026-10-07 (branches; always False without them)
+    roll.pending[a_idx, kk], roll.actions[a_idx, kk] = under_way, actions
+    roll.logp[a_idx, kk], roll.value[a_idx, kk], roll.version[a_idx, kk] = logp, value, version
+    roll.length[a_idx], roll.open[a_idx] = kk + 1, kk
+
+
+def store_temporal(roll, a_idx, kk, rows, t):
+    """(B30) The temporal step's outputs of decisions kk of workers a_idx into the rollout; a made room token's source
+    (o of the decision before, the room's stage and index, the episode) appended to the worker's room list.
+    B31: t holds the counters (numpy: create, nroom, steps, stage_prev); the K / V, s and o are on the device already
+    (GraphActor tdest) or, from the eager step (tok_policy.temporal_out), tensors in t written here into the decisions'
+    rows (index_copy_ on their device; rows assigned where they have none)."""
+    if roll.raw_contexts is not None:
+        for j, (w, k) in enumerate(zip(a_idx, kk)):
+            roll.raw_contexts[w][k] = t['raw_contexts'][j]
+    P = roll.tP
+    at = P + kk
+    first = rows['first'] != 0
+    ep_prev = roll.t_ep[a_idx, at - 1]
+    ep = np.where(first, np.maximum(ep_prev, -1) + 1, np.maximum(ep_prev, 0))
+    if 'kv' in t:   # (the eager step's tensors)
+        r_ = torch_from(roll.t_assign(a_idx, kk), roll.t_kv.device)
+        roll.t_kv.index_copy_(0, r_, t['kv'].to(roll.t_kv.device, roll.t_kv.dtype))
+        roll.t_s.index_copy_(0, r_, t['s'].to(roll.t_s.device, roll.t_s.dtype))
+        roll.t_o.index_copy_(0, r_ + roll.t_obase, t['o'].to(roll.t_o.device, roll.t_o.dtype))
+    roll.t_ep[a_idx, at] = ep
+    roll.t_step[a_idx, at] = t['steps']
+    roll.t_rc[a_idx, at] = t['create']
+    roll.t_nroom[a_idx, at] = t['nroom']
+    for j in np.flatnonzero(t['create']):
+        w = a_idx[j]
+        r = int(roll.rooms_n[w])
+        if r >= roll.rooms_src.shape[1]:
+            continue
+        roll.rooms_src[w, r] = roll.t_row[w, at[j] - 1] + roll.t_obase
+        roll.rooms_stage[w, r] = t['stage_prev'][j]
+        roll.rooms_k[w, r] = t['nroom'][j] - 1
+        roll.rooms_ep[w, r] = ep[j]
+        roll.rooms_t[w, r] = kk[j]
+        roll.rooms_n[w] = r + 1
+        if roll.raw_rooms is not None:
+            visit = t['room_visits'][j]
+            assert visit is not None, 'host/device room transition disagrees'
+            roll.raw_rooms[w].append(visit)
+
+
+def temporal_rows(rl, flat, cap, device):
+    """(B30, the learner) per decision at flat positions (w * cap + t) of a rollout: its stored o_t, o_{t-1} (B31:
+    gathered on the device from the rollout's t_o), whether it has one (not an episode's first decision) and its
+    episode serial, as tensors on the device."""
+    w, t = flat // cap, flat % cap
+    at = rl.tP + t
+    rows = np.stack([rl.t_row[w, at], rl.t_row[w, at - 1]])
+    rows = torch_from(np.where(rows >= 0, rows, rl.t_scratch()) + rl.t_obase, rl.t_o.device)   # (-1: never; a guard)
+    o = rl.t_o.index_select(0, rows.reshape(-1)).view(2, len(flat), -1).to(device)
+    return dict(o=o[0], o_prev=o[1], has=torch_from(rl.t_step[w, at] > 0, device), ep=torch_from(rl.t_ep[w, at], device))
+
+
+def mirror_temporal(roll, mirror, device):
+    """(B38, --learner-device) the rollout as the learner on another device reads it: a shallow copy (the host arrays
+    shared, as the job's rollout itself is) whose temporal tensors are `mirror`'s, a dict of device tensors kept
+    between updates and (re)allocated here with the rollout's shapes (a pool that grew: t_grow), holding the rollout's
+    assigned rows: the P context rows per worker and the pool rows used (n * P + t_used rows of t_kv; t_o the same
+    plus its t_obase rows of carried room sources). Rows past them hold an older rollout's values or zeros; no
+    decision of this rollout names them (t_row, rooms_src), the scratch row (the last, same index as the rollout's)
+    is a guard target only. t_s is not copied: the learner never reads it (None in the view). The copies are issued
+    on the caller's current streams (a cross-device copy_ runs on the source device's current stream, ordered against
+    the destination's); the caller records the event the learner waits on. Returns (view, bytes copied)."""
+    import copy as copy_mod
+    import torch
+    k = roll.n * roll.tP + roll.t_used
+    nbytes = 0
+    for name, base in (('t_kv', 0), ('t_o', roll.t_obase)):
+        src = getattr(roll, name)
+        dst = mirror.get(name)
+        if dst is None or dst.shape != src.shape or dst.dtype != src.dtype or dst.device != torch.device(device):
+            mirror[name] = None   # (the old one freed first: no two of them at once)
+            dst = mirror[name] = torch.zeros(src.shape, dtype=src.dtype, device=device)
+        dst[:base + k].copy_(src[:base + k], non_blocking=True)
+        nbytes += (base + k) * src[0].numel() * src.element_size()
+    view = copy_mod.copy(roll)
+    view.t_kv, view.t_o, view.t_s = mirror['t_kv'], mirror['t_o'], None
+    return view, nbytes
+
+
+def hand_off(roll, mirror, device, streams):
+    """(B38) mirror_temporal issued on a stream pair (one on the rollout's GPU: the copies run there, one on the
+    learner's: ordered against it) and an event on the learner's side after them: (view, event, bytes). The caller has
+    synchronised the actor's writes into the rollout; the learner waits on the event before it reads the view."""
+    import torch
+    with torch.cuda.stream(streams[0]), torch.cuda.stream(streams[1]):
+        view, nbytes = mirror_temporal(roll, mirror, device)
+        ev = torch.cuda.Event()
+        ev.record(streams[1])
+    return view, ev, nbytes
+
+
+def weight_mover(actor_params, learner_device):
+    """(B38, --learner-device) the state of move_weights: byte views of the actor's parameters and buffers (in place:
+    the actor's graphs read them where they are), a byte buffer of their total size on each GPU, a stream on the
+    learner's (learner_device None, B38 step 2: only the actor's buffer, which the learner process writes). None when
+    a tensor is not contiguous (or this torch has no _foreach_copy_): per-tensor copies then."""
+    import torch
+    views = [a.detach().reshape(-1).view(torch.uint8) for a in actor_params]
+    if not hasattr(torch, '_foreach_copy_') or \
+            not all(a.is_contiguous() and v.data_ptr() == a.data_ptr() for v, a in zip(views, actor_params)):
+        return None
+    sizes = [v.numel() for v in views]
+    dev_a = actor_params[0].device
+    if learner_device is None:   # (B38 step 2: the learner process writes fa; no learner-side part here)
+        return dict(av=views, sizes=sizes, fa=torch.empty(sum(sizes), dtype=torch.uint8, device=dev_a))
+    return dict(av=views, sizes=sizes, fb=torch.empty(sum(sizes), dtype=torch.uint8, device=learner_device),
+                fa=torch.empty(sum(sizes), dtype=torch.uint8, device=dev_a),
+                sb=torch.cuda.Stream(device=learner_device))
+
+
+def move_weights(wm, learner_params, learner_stream):
+    """(B38) the learner's weights (its GPU) into the actor's parameters (weight_mover's views): gathered as bytes
+    into one buffer on the learner's GPU on wm's stream, after the work queued on learner_stream; one peer copy (a
+    cross-device copy_: on the source's current stream, wm's, ordered after the caller's current stream on the actor's
+    GPU and before its next work there); the bytes into the parameters by a foreach copy on that current stream. The
+    caller synchronises its stream before the actor's graphs run again."""
+    import torch
+    sb = wm['sb']
+    with torch.cuda.stream(sb):
+        sb.wait_stream(learner_stream)
+        torch.cat([b.detach().reshape(-1).view(torch.uint8) for b in learner_params], out=wm['fb'])
+        wm['fa'].copy_(wm['fb'], non_blocking=True)
+    torch._foreach_copy_(wm['av'], list(wm['fa'].split(wm['sizes'])))
+
+
+def torch_from(a, device):
+    import torch
+    return torch.from_numpy(np.ascontiguousarray(a)).to(device)
+
+
+def temporal_bounds(tch, chunk_ids, micro):
+    """(B30) a minibatch's parts of whole temporal chunks (each part at least one chunk, at most `micro` rows
+    otherwise): [(first row, end row, chunk ids)] in the minibatch's row order."""
+    bounds, lo, cnt, ids = [], 0, 0, []
+    for c in chunk_ids:
+        r = int(tch[c, 1])
+        if ids and cnt + r > micro:
+            bounds.append((lo, lo + cnt, ids))
+            lo, cnt, ids = lo + cnt, 0, []
+        ids.append(int(c))
+        cnt += r
+    if ids:
+        bounds.append((lo, lo + cnt, ids))
+    return bounds
+
+
+def gae(rollout, gamma, lam, value=None):
+    """(advantages, returns, mask) [workers, capacity] over each worker's decisions that have their reward. value:
+    the values to use (default: the stored ones)."""
+    value = rollout.value if value is None else value
+    adv = np.zeros_like(rollout.reward)
+    mask = np.zeros_like(rollout.terminal)
+    for i in range(rollout.n):
+        last = rollout.length[i] - 1
+        if last < 0:
+            continue
+        usable = last if rollout.open[i] == last else last + 1   # an open decision only bootstraps
+        running, nxt = 0.0, value[i, last] if rollout.open[i] == last else 0.0
+        boot = rollout.boot[i]
+        for t in range(usable - 1, -1, -1):
+            if boot[t]:   # a truncated branch end (2026-10-07): only its value, for the decision before; not trained
+                running, nxt = 0.0, value[i, t]
+                continue
+            live = 0.0 if rollout.terminal[i, t] else 1.0
+            delta = rollout.reward[i, t] + gamma * nxt * live - value[i, t]
+            running = delta + gamma * lam * live * running
+            adv[i, t] = running
+            nxt = value[i, t]
+        mask[i, :usable] = True
+        mask[i, :usable] &= ~boot[:usable]
+    return adv, adv + value, mask
+
+
+def learner_child_entry(argv, init):
+    """(B38 step 2, --learner-process 1) the learner process (spawned by the actor's process): main() with the same
+    arguments in its learner-only form. SIGINT / SIGTERM are ignored here (a Ctrl-C or timeout reaches the whole
+    process group): the actor's process ends the run with its stop message, after which this process saves last.pt."""
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    main(argv, child=init)
+
+
+def main(argv=None, child=None, actor=None):
+    """argv: the arguments (default sys.argv[1:]). child (B38 step 2): the learner process's start-up data
+    (learner_child_entry); None: the trainer itself. actor (B38 step 5): a second actor process's start-up data
+    (actor_child_entry)."""
+    import signal
+    if child is None:
+        # started in the background of a non-interactive shell, SIGINT arrives ignored: both signals end the run
+        # through the finally block below (last.pt is saved, the sampler closed)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
+    else:   # (the learner process: its set-up prints nothing, the trainer printed it all; its updates' lines print)
+        child_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+    # GPU sharing hazard (2026-10-04): on a GPU time-shared with another CUDA process (a second trainer, eval_tok) this
+    # process died now and then with "CUDA error: an illegal memory access" (Xid 31, GPCCLIENT_GCC FAULT_PDE read). The
+    # faulting address lies in the OTHER process's address space (checked against its /proc/<pid>/maps): state of the
+    # other context used by ours, a driver / GPU context-switch fault, not a buffer of ours (535 / 3090 and
+    # 580 / 3080 Ti). It needs the other process (alone on the GPU: no crash in 754 overlap updates) and the actor's
+    # replayed CUDA graphs (eager actor, --graph-entities 0: none in 461 shared updates, at about half the throughput);
+    # --overlap makes it far more frequent than synchronous runs. Mitigation, not a cure: one hardware work queue for
+    # this process's streams (read when the context is created, so set before torch touches the GPU; an explicit
+    # CUDA_DEVICE_MAX_CONNECTIONS in the environment wins) cut the crash rate of the shared stress test about tenfold.
+    # The cure is not sharing the GPU with another CUDA process while training (or NVIDIA MPS).
+    os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+    # torch is imported here, not at the top: the sampler's workers are spawned and import this module too
+    import torch
+    from isaac_bridge.tok_obs import ENT_CAP, INV_CAP
+    from isaac_bridge.tok_pickup import normalise_advantages, parse_pickup_force, pickup_force_p, ppo_part_terms
+    from isaac_bridge.tok_policy import (ENTITY_FIELDS, ROW_BYTES, GraphActor, TokPolicy, cat_batch,
+                                         crn_uniforms, DEDUP, decode_rows, distinct_ids, first_of, learner_plan,
+                                         load_compatible, main_parameter_names, memory_chunks, packed_index,
+                                         drop_memory,
+                                         ITEM_SHARED_KEY, share_item_table, item_count,
+                                         pad_optimizer_state, plan_tokens, remap_optimizer_state, rows_to_device,
+                                         take, to_batch, used_entities, TemporalState, temporal_chunks,
+                                         temporal_inputs, temporal_out, temporal_part)
+    p = argparse.ArgumentParser()
+    p.add_argument('--groups-file', required=True)
+    p.add_argument('--groups', default='normal:8,boss:5,normal_big:3')
+    p.add_argument('--workers', type=int, default=16)
+    p.add_argument('--out', required=True)
+    p.add_argument('--resume', default='')
+    p.add_argument('--game-hours', type=float, default=1000.0)
+    p.add_argument('--frames-per-decision', type=int, default=4)
+    p.add_argument('--episodes-per-state', type=int, default=16)
+    p.add_argument('--episode-seconds', type=float, default=90.0)
+    p.add_argument('--start-hp', default='2:6', help='half hearts at an episode start, lo:hi, uniform per start state')
+    p.add_argument('--rollout', type=int, default=8192, help='decisions per update')
+    p.add_argument('--epochs', type=int, default=2)
+    p.add_argument('--minibatch', type=int, default=2048)
+    p.add_argument('--micro', type=int, default=8192,
+                   help="rows per forward / backward pass: a minibatch's gradient is accumulated over parts of this "
+                        'size (0: the whole minibatch at once). The step is the same, the GPU memory smaller')
+    p.add_argument('--lr', type=float, default=3e-4)
+    p.add_argument('--lr-final', type=float, default=1e-4)
+    p.add_argument('--gamma', type=float, default=0.995)
+    p.add_argument('--lam', type=float, default=0.95)
+    p.add_argument('--clip', type=float, default=0.2)
+    p.add_argument('--ent-coef', type=float, default=0.01)
+    p.add_argument('--vf-coef', type=float, default=0.5)
+    p.add_argument('--max-grad-norm', type=float, default=1.0)
+    p.add_argument('--reward', default='',
+                   help='terms as name=weight,...; the default is ROOM_REWARD, in floor mode FLOOR_REWARD')
+    p.add_argument('--mode', default='room', choices=('room', 'floor', 'run'),
+                   help='floor: whole Basement I floors (isaac_bridge/tok_floor.py); one group, named floor. run '
+                        '(2026-10-06): from Basement I on through the trapdoors (one group, named run)')
+    p.add_argument('--run-seconds', type=float, default=1800.0,
+                   help='run mode: game seconds a run may last (the stall rule of each floor as in floor mode)')
+    p.add_argument('--items', action='store_true',
+                   help='2026-10-06: item-aware observation and the item / pill heads (see the module docstring)')
+    p.add_argument('--charge', type=int, default=1,
+                   help="2026-10-07: the player's charge state (ROW pcharge) as policy input; a resumed checkpoint keeps "
+                        'its own setting')
+    p.add_argument('--ent-ext', type=int, default=1,
+                   help='2026-10-08: the entity flag and laser columns (tok_obs ENT_F0 .. ENT_F) as policy input; a '
+                        'resumed checkpoint keeps its own setting, --init pads them with zeros')
+    p.add_argument('--floor-seconds', type=float, default=480.0)
+    p.add_argument('--floor-stall-seconds', type=float, default=60.0)
+    p.add_argument('--stall-progress', choices=('events', 'pickups'), default='events',
+                   help="B40: what resets the floor's stall timer: 'events' (a new / cleared room, a monster hurt) or "
+                        "'pickups' (also a gain in coins / keys / bombs / health); the stall share is a policy input")
+    p.add_argument('--archive-size', type=int, default=12)
+    p.add_argument('--archive-prob', type=float, default=0.7)
+    p.add_argument('--snapshot-prob', type=float, default=0.5)
+    p.add_argument('--archive-boss', type=float, default=0.0,
+                   help='floor mode: share of the archive starts taken from boss-room entries (they are always parked '
+                        'and evicted last); 0: the archive as before')
+    p.add_argument('--archive-plr', type=float, default=0.0,
+                   help='run / floor modes, 2026-10-10: archive entries drawn by the rank of their learning-potential '
+                        'score (EMA of |discounted return - V(first record)| of the episodes started from them), weight '
+                        'rank^(-value); the lowest score evicted first. 1 = 1/rank; 0 = off (uniform, as before)')
+    p.add_argument('--archive-deep', type=float, default=1.0,
+                   help='run mode: archive entries drawn with weight archive_deep^(floor - 1), the shallowest floor '
+                        'evicted first (1: uniform, as before)')
+    p.add_argument('--init', default='', help='checkpoint whose weights start the run (shapes that differ are padded)')
+    p.add_argument('--width', type=int, default=192)
+    p.add_argument('--layers', type=int, default=4)
+    p.add_argument('--heads', type=int, default=4)
+    p.add_argument('--checkpoint-every', type=int, default=25)
+    p.add_argument('--seed', type=int, default=1000)
+    p.add_argument('--port', type=int, default=28300)
+    p.add_argument('--name', default='tk')
+    p.add_argument('--stub-list', default='')
+    p.add_argument('--tf32', action='store_true', default=True)
+    p.add_argument('--teacher', action='store_true',
+                   help='hindsight search teacher (tok_sampler): the searches run while the workers are held back')
+    p.add_argument('--teacher-share', type=float, default=None,
+                   help="and up to this share of a worker's sampling time right after an episode (default 0; "
+                        f'{OVERLAP_TEACHER_SHARE} with --overlap, where the workers are no longer held back)')
+    p.add_argument('--teach-coef', type=float, default=1.0, help='weight of -log(policy mass on the safe moves)')
+    p.add_argument('--danger-coef', type=float, default=1.0, help='weight of the danger head (which moves got hurt)')
+    p.add_argument('--teach-batch', type=int, default=512, help='teacher records per minibatch step at most')
+    p.add_argument('--teach-reuse', type=float, default=8.0,
+                   help='how often a teacher record is used in all: an update draws this many times the records that '
+                        'arrive per update (a running mean), spread over its minibatch steps')
+    p.add_argument('--teach-weight', type=float, default=8.0,
+                   help='decisions one teacher record counts for: a step with b teacher records and a minibatch of m '
+                        'decisions weights the teacher losses by teach-weight x b / m')
+    p.add_argument('--teach-buffer', type=int, default=60000, help='teacher records kept (the newest)')
+    p.add_argument('--teacher-queue', type=int, default=24, help='hurts waiting to be searched per worker')
+    p.add_argument('--teacher-slots', type=int, default=0,
+                   help='searches running at once over all workers at most (0: no limit; tok_sampler.SearchSlots)')
+    p.add_argument('--teacher-skip-known', type=int, default=0,
+                   help='1: no clone for the move the episode itself held up to the hurt (its danger bit is known to '
+                        'be 1; the teacher record is the same, only that move\'s damage total is not measured)')
+    p.add_argument('--teacher-pair', type=int, default=1,
+                   help="1 (default since 2026-10-05): the queued hurts of one episode are searched together, one "
+                        'restore replay for their first depth (tok_sampler.hindsight_shared; the same records and '
+                        'lost[]); 0: one restore per hurt')
+    # 2026-10-09 (death teacher, SCALING_THESIS.md S5): the fatal hurt always searched, deeper, with its own margin
+    p.add_argument('--teacher-death-depths', default='',
+                   help='floor / run modes: depths (decisions before the fatal step) for the episode-ending hurt, e.g. '
+                        '"2,4,8,16,32"; it is then always searched (never dropped by --teacher-per-episode). '
+                        'Default: off (the fatal hurt is an ordinary hurt)')
+    p.add_argument('--teacher-death-margin', type=int, default=15,
+                   help='decisions after the fatal step a held move must stay unhurt (2 s); 0: --teacher-margin')
+    p.add_argument('--teacher-fork', type=int, default=0,
+                   help='2026-10-10, with --teacher-thread 1: each hurt search runs in a forked child of the worker (no '
+                        'GIL contention with the episode; one child per worker at a time)')
+    p.add_argument('--teacher-thread', type=int, default=0,
+                   help='2026-10-10, floor / run modes: 1 = the searches run in a thread of the worker (its episode '
+                        'never waits for a search; --teacher-share bounds the search time outside the updates); 0 = as '
+                        'before (searches during the updates, and within --teacher-share in the worker loop)')
+    # 2026-10-10 (teacher v2, isaac_bridge/tok_teacher2.py, rl/docs/SCALING_THESIS.md S5b; floor / run modes, needs
+    # --teacher-thread 1; independent of --teacher, both can be on)
+    p.add_argument('--teacher-v2', type=int, default=0,
+                   help='1: teacher v2: at hurts, deaths (and --teacher-v2-random points) whole branches with movement '
+                        'intents x the actor\'s per-step answers; every step of the best branch that beats the episode '
+                        'by more than --teacher-v2-margin and its replicate\'s spread becomes an imitation record '
+                        '(-w log pi(a|obs) over the heads + value regression to the branch\'s return-to-go). 0: off, '
+                        'nothing changes')
+    p.add_argument('--teacher-v2-hold', default='2,4,8',
+                   help='decisions a held-move intent lasts (drawn per move and depth from this list)')
+    p.add_argument('--teacher-v2-sticky', type=float, default=4.0,
+                   help='mean decisions the sticky-policy intent keeps a sampled move (geometric; 0: no such intent)')
+    p.add_argument('--teacher-v2-sticky-n', type=int, default=1, help='sticky-policy intents per depth')
+    p.add_argument('--teacher-v2-seconds', type=float, default=20.0,
+                   help="a branch's game-time cap (the score then bootstraps from the actor's value)")
+    p.add_argument('--teacher-v2-margin', type=float, default=0.3,
+                   help='best - taken (discounted return units) a point needs to count as an improvement')
+    p.add_argument('--teacher-v2-cap', type=float, default=2.0, help="an imitation record's weight: min(gain, cap)")
+    p.add_argument('--teacher-v2-random', type=float, default=0.0,
+                   help='random decision points per game hour of play (0: hurts and deaths only)')
+    p.add_argument('--teacher-v2-queue', type=int, default=8, help='points waiting per worker')
+    p.add_argument('--teacher-v2-depths', default='',
+                   help="hurts' depths (decisions before the hurting step); default the teacher's (--teacher-depths "
+                        'of the sampler: 2,4,8); deaths use --teacher-death-depths when given')
+    p.add_argument('--teacher-v2-coef', type=float, default=1.0, help='weight of -w log pi(a|obs)')
+    p.add_argument('--teacher-v2-vf', type=float, default=0.25,
+                   help="weight of (V(obs) - G)^2 (0.25 = PPO's value term: --vf-coef 0.5 x 0.5)")
+    p.add_argument('--teacher-v2-weight', type=float, default=1.0,
+                   help='decisions one imitation record counts for in a minibatch step (as --teach-weight)')
+    p.add_argument('--teacher-v2-batch', type=int, default=256, help='imitation records per minibatch step at most')
+    p.add_argument('--teacher-v2-reuse', type=float, default=4.0,
+                   help='how often an imitation record is used in all (as --teach-reuse)')
+    p.add_argument('--teacher-v2-buffer', type=int, default=30000,
+                   help='imitation records kept (the newest; on the GPU as record bytes, ~20 KB each)')
+    # B34 (2026-10-16, the counterfactual branch teacher, isaac_bridge/tok_cf.py, rl/docs/COUNTERFACTUAL_TEACHER.md;
+    # floor / run modes, needs --teacher-thread 1; teacher v2's lanes, ring and loss (--teacher-v2-buffer / -batch /
+    # -reuse / -coef / -vf / -weight) are reused; --teacher-v2 itself may stay off)
+    p.add_argument('--cf', type=int, default=0,
+                   help='1: the counterfactual branch teacher: at choice points (first sight of pickups / pedestals / '
+                        'locked doors with a key / shop and treasure doors, a cleared room with >= 2 doors, random '
+                        'records) K branches (the episode\'s own, toward the target, sticky high-temperature) from '
+                        'the same state and random numbers; the improving branch\'s first records become weighted '
+                        'imitation records. 0: off, nothing changes')
+    p.add_argument('--cf-points', type=float, default=6.0, help='choice points per worker per game hour at most')
+    p.add_argument('--cf-branches', type=int, default=4, help='branches per point, the episode\'s own (taken) among them')
+    p.add_argument('--cf-seconds', type=float, default=180.0,
+                   help="a branch's game-time cap (then gamma^T V_global; the floor's end comes first)")
+    p.add_argument('--cf-target-seconds', type=float, default=20.0,
+                   help='the target branch walks toward its target this long at most (then the policy); also the '
+                        'sticky branches\' high-temperature span')
+    p.add_argument('--cf-margin', type=float, default=0.3,
+                   help='best - taken (discounted return units) a point needs (and more than its replicate\'s spread)')
+    p.add_argument('--cf-cap', type=float, default=2.0, help="an imitation record's weight: min(best - taken, cap)")
+    p.add_argument('--cf-distill-steps', type=int, default=8,
+                   help="the improving branch's first records that become imitation records")
+    p.add_argument('--cf-random', type=float, default=1.0, help='random choice points per game hour of play')
+    p.add_argument('--cf-advantage', type=int, default=0,
+                   help='1: the first imitation record of an improving point (the choice point itself) gets a clipped '
+                        'policy-gradient term with the constant advantage best - taken instead of the imitation term')
+    p.add_argument('--cf-queue', type=int, default=8, help='choice points waiting per worker (the oldest make room)')
+    p.add_argument('--cf-sticky-eps', type=float, default=0.25,
+                   help="the sticky branches' share of uniform move re-picks (the \"high temperature\")")
+    p.add_argument('--cf-wall', type=int, default=0,
+                   help='B40: 1 adds the wall trigger (a candidate secret-room wall of a cleared room while a bomb is '
+                        'held; its branch walks there and places one bomb, then the policy) to --cf')
+    p.add_argument('--cf-defer-target', type=int, default=0,
+                   help="B40 (A30's A2): 1 = door targets' and bomb_at branches play the policy until the room is "
+                        'cleared, then walk to the target (0: walk at once, as B34)')
+    p.add_argument('--cf-wall-distill', type=int, default=64,
+                   help="B40: a bomb_at branch's records distilled through its bomb decision, at most this many")
+    # B36 (2026-10-16): the lanes' service (isaac_bridge/tok_lanes.py; teacher v2 and --cf): one call for all waiting
+    # lanes after a short window, asynchronous to the workers' records
+    p.add_argument('--cf-lane-wait', type=float, default=0.002,
+                   help="s the lanes' service waits after the first waiting lane request for more before its call "
+                        '(ends early: --cf-lane-quiet, or every lane active lately waiting); 0: at once')
+    p.add_argument('--cf-lane-quiet', type=float, default=0.0005,
+                   help='the window ends when no new lane request came for this long (0: off)')
+    p.add_argument('--cf-lane-async', type=int, default=1,
+                   help='1: a lane call is submitted and answered when it has completed, the actor serves the workers '
+                        'meanwhile; 0: the actor waits for it (as before)')
+    p.add_argument('--cf-lane-ukeys', type=int, default=1,
+                   help="1: a lane request's sampling uniforms are keyed by its sequence number and lane (the answer "
+                        "does not depend on the call's other lanes); 0: the graphs' own draws")
+    p.add_argument('--cf-lane-buckets', default='',
+                   help="row sizes of the lane actor's graphs (e.g. 8,16,32); '': --actor-row-buckets")
+    # 2026-10-07: counterfactual branches at decision points (isaac_bridge/tok_branch.py; floor / run modes)
+    p.add_argument('--branch-share', type=float, default=0.0,
+                   help="share of a worker's wall time spent on branch points (0: off, nothing changes)")
+    p.add_argument('--branch-seconds', type=float, default=60.0,
+                   help="a branch episode's game-time cap (Phase B2: 60, was 180; the rest is the value bootstrap)")
+    p.add_argument('--branch-max', type=int, default=3, help='options run per point at most (progressive widening)')
+    p.add_argument('--branch-close', type=float, default=0.5,
+                   help="one more option while every |outcome - the episode's own option's| is below this")
+    p.add_argument('--branch-noise', type=float, default=0.0,
+                   help='probability of an unconditional replicate pair (both options again with a new reseed and '
+                        'policy-noise key: the noise floor of a label, pooled by the trainer per kind)')
+    p.add_argument('--branch-queue', type=int, default=4, help='points waiting per worker')
+    p.add_argument('--branch-kinds', default='item,item_left',
+                   help='kinds branched (exit is only counted; door on request, Phase B2)')
+    p.add_argument('--branch-item-back', type=int, default=1,
+                   help='item points: the restore decision is this many decisions before the pickup step')
+    p.add_argument('--branch-walk-seconds', type=float, default=10.0, help='scripted prefix walks at most')
+    p.add_argument('--branch-weights', default='', help='outcome weights (tok_branch.DEFAULT_WEIGHTS when empty)')
+    p.add_argument('--branch-uncert', type=float, default=0.0,
+                   help="weight of the choice heads' spread at a point's decision record in its queue priority")
+    # Phase B2 (2026-10-07, tok_branch's second docstring)
+    p.add_argument('--branch-crn', type=int, default=1,
+                   help='1: common random numbers for the policy in a branch pair (ROW crn, GraphActor); 0: fresh noise')
+    p.add_argument('--branch-twin', type=float, default=0.0,
+                   help='probability of a twin of the first branch (same option, reseed and noise key): the CRN check')
+    p.add_argument('--branch-replicate-max', type=int, default=2,
+                   help='conditional replicate pairs per point at most (while |mean D| < 2 noise s.e.)')
+    p.add_argument('--branch-noise-prior', type=float, default=1.0,
+                   help="a label's noise variance before the trainer has an estimate for the kind")
+    p.add_argument('--branch-snap-every', type=int, default=20,
+                   help='the actor answers branch records with weight snapshots refreshed every this many updates (two '
+                        'kept; a point pins the newest at its start: its branches are played by one policy); 0: the '
+                        'current weights')
+    p.add_argument('--branch-left-back', type=int, default=4,
+                   help='item_left points: restored this many decisions before the step that left the room (Phase B2; '
+                        'at the step itself the player may already be in the door transition)')
+    p.add_argument('--branch-archive', type=int, default=0,
+                   help="1: the take branch's state after the take and its end state (alive) into the archive")
+    p.add_argument('--choice-heads', type=int, default=-1,
+                   help='K choice-value heads (TokPolicy choice; -1: 4 with --branch-share > 0, else 0)')
+    p.add_argument('--choice-lr', type=float, default=1e-3)
+    p.add_argument('--choice-label', default='score', choices=('score', 'score10', 'score20', 'score30'),
+                   help="the branches' score the labels D are taken from: the full branch (score) or bootstrapped "
+                        'after 10 / 20 / 30 s of it (tok_branch.SCORE_HORIZONS; the replicate-widening of the workers '
+                        'always uses score)')
+    p.add_argument('--choice-steps', type=int, default=40, help='choice-head minibatch steps per update')
+    p.add_argument('--choice-batch', type=int, default=256)
+    p.add_argument('--choice-holdout', type=int, default=5,
+                   help='a point whose floor seed hash is 0 mod this is held out of the choice heads training '
+                        '(0: none)')
+    p.add_argument('--choice-adv-coef', type=float, default=0.0,
+                   help="weight of the choice records' advantage correction (0: off until validated)")
+    p.add_argument('--choice-adv-min', type=float, default=0.5,
+                   help='|own - alternative| a choice record needs (and 2 noise s.e.) to correct its decision')
+    p.add_argument('--choice-adv-max', type=float, default=5.0, help='the correction is clipped to this')
+    p.add_argument('--branch-ppo', type=int, default=1,
+                   help='1: the branch episodes\' decisions are PPO samples too (on-policy, legitimate states); 0: masked')
+    p.add_argument('--choice-buffer', type=int, default=5000, help='choice records kept (the newest)')
+    # 2026-10-08: the build lab (isaac_bridge/tok_lab.py; floor / run modes, off unless --lab-share > 0)
+    p.add_argument('--lab-share', type=float, default=0.0,
+                   help="share of a worker's wall time on lab jobs (0: off, nothing changes; >= 1: whenever one waits)")
+    p.add_argument('--lab-panel', default='normal:24,boss:6,normal_big:6',
+                   help='panel states per catalog group (room-mode resets of held-out seeds, tok_lab.parse_panel)')
+    p.add_argument('--lab-seed', type=int, default=2147700000, help='seed of the panel states (tok_lab.parse_panel)')
+    p.add_argument('--lab-seconds', type=float, default=90.0, help="a lab episode's game-time cap")
+    p.add_argument('--lab-costs', default='',
+                   help="an earlier run's lab.jsonl (same panel): its states' mean game seconds balance the states over "
+                        'the workers (tok_lab.assign_panel); default: by group')
+    p.add_argument('--lab-ppo', type=int, default=1, help="1: the lab episodes' decisions are PPO samples; 0: masked")
+    p.add_argument('--lab-items', default='', help='eligible collectibles (default ../abplus/catalog/lab_items.json)')
+    p.add_argument('--lab-mix', default='base=0.08,model=0.15,random=0.1,seen=0.05',
+                   help='shares of the new jobs by kind (the rest: single items, each eligible one in turn)')
+    p.add_argument('--lab-builds', default='', help='a JSON list of builds (lists of ids) benchmarked first')
+    p.add_argument('--lab-noise', type=float, default=0.0,
+                   help='share of the jobs that replicate a recent job (half the same rep: the twin check, half a new '
+                        'rep: the seed noise)')
+    p.add_argument('--lab-inflight', type=int, default=24, help='jobs posted and not yet complete at most')
+    p.add_argument('--lab-timeout', type=float, default=900.0, help='s after which a job with states missing is closed')
+    p.add_argument('--lab-max-items', type=int, default=3, help='collectibles of a model / random build at most')
+    p.add_argument('--lab-model-k', type=int, default=5, help='heads of the build model (ensemble)')
+    p.add_argument('--lab-model-steps', type=int, default=50, help='build-model Adam steps per update')
+    p.add_argument('--lab-pool', type=int, default=512, help='random candidate builds the model ranks per update')
+    # 2026-10-08: start builds (floor / run modes): random builds transplanted into ordinary episodes' start states
+    p.add_argument('--start-build-prob', type=float, default=0.0,
+                   help='share of the floor-start training episodes that begin with a random build (0: off; archive '
+                        'starts keep their build)')
+    p.add_argument('--start-build-max', type=int, default=3, help='collectibles of a start build at most (1 .. max)')
+    # 2026-10-13 (B23, isaac_bridge/tok_pickup.py)
+    p.add_argument('--start-build-mode', default='inventory', choices=('inventory', 'pedestal'),
+                   help='inventory (default): a start build is added to the inventory (AddCollectible); pedestal: its '
+                        'collectibles are spawned as pedestals in the floor\'s starting room')
+    p.add_argument('--pickup-force', default='0:0',
+                   help='A:B: probability of a forced-pickup episode, linear in the run\'s game-hour fraction from A '
+                        '(start) to B (end); in such an episode the move toward the nearest collectible pedestal and '
+                        'no shot are forced in clear rooms (needs --items, floor / run modes). 0:0 (default): off')
+    p.add_argument('--pickup-force-imitation', type=float, default=1.0,
+                   help='weight of the imitation term on the forced decisions\' move and shoot (B23)')
+    # 2026-10-08: stat augmentation (floor / run modes): random multipliers of the base stats at floor starts
+    p.add_argument('--stat-aug-prob', type=float, default=0.0,
+                   help='share of the floor-start training episodes whose base stats get random multipliers (0: off)')
+    p.add_argument('--stat-aug', default='',
+                   help='multiplier ranges, log-uniform: "damage=0.7:2.5,tears=0.7:2,range=0.8:1.5,shot_speed=0.8:1.3,'
+                        'speed=0.9:1.3" (the default; keys speed, damage, shot_speed, tears, range)')
+    # B39 (2026-10-18, isaac_bridge/tok_pickup.NO_ACTIVE_LUA): no-active starts (floor / run modes)
+    p.add_argument('--no-active-prob', type=float, default=0.0,
+                   help="share of the floor-start training episodes that begin without player 0's active item "
+                        '(whatever the character starts with; AB+ Isaac: The D6), removed before the first record and '
+                        'before a start build (0: off; archive starts keep their state). progress.csv no_actives, '
+                        'noact/*, act/*; episodes.jsonl active0')
+    # 2026-10-08: character randomisation (floor / run modes): floor starts restart the run as a drawn character
+    p.add_argument('--characters', default='',
+                   help='PlayerTypes floor starts are built as, with optional weights: "0,1,2,3,5,6,7,8,13,15", '
+                        '"0:4,7:1" or "all" (tok_floor.CHARACTERS_ALL); refused: 10 The Lost, 11 Lazarus II, 12 Black '
+                        'Judas, 16 The Forgotten, 17 The Soul (tok_floor.CHARACTERS_UNSUPPORTED). Default: Isaac only')
+    p.add_argument('--pchar', type=int, default=-1,
+                   help="2026-10-08: the player's PlayerType (ROW pchar, TokPolicy's char_emb table) as policy input; "
+                        '-1: on with --characters; a resumed checkpoint keeps its own setting, --init starts the table '
+                        'at zero (the same outputs as the checkpoint)')
+    p.add_argument('--obs-v2', type=int, default=0,
+                   help='2026-10-16 (B35, observation v2, bridge abp-0.2.18): 1 = the policy also reads the pickups\' '
+                        'prices (ROW ent_price: coins / 15, heart containers, three soul hearts, for sale), the heart '
+                        'split (ROW phearts: black, eternal, bone) and the room type (ROW room_type, a learned table '
+                        'added to the room token): TokPolicy obs_prices, obs_hearts, obs_room_type. A resumed '
+                        'checkpoint keeps its own setting; --init from a checkpoint without them starts the new '
+                        'weights at zero (load_compatible)')
+    p.add_argument('--build-timeout', type=float, default=60.0,
+                   help="s a worker's root instance may take for the first start state after its launch (launch, "
+                        'connect, reset): past it the instance is killed and relaunched and the same seed built once '
+                        'more, then the next (counted in errors and stalls; tok_sampler.StartBuilder). 0: no limit. '
+                        '120 before 2026-10-06')
+    p.add_argument('--reset-timeout', type=float, default=20.0,
+                   help='s a later start state (a reset of a running root, about 0.1 s) may take, the same handling '
+                        '(2026-10-06); 0: --build-timeout')
+    p.add_argument('--root-anon-mib', type=float, default=0.0,
+                   help="2026-10-06: a worker's root instance whose anonymous RSS (RssAnon: its heap, about 250 MiB "
+                        'after the launch) is above this many MiB is replaced at a state '
+                        'boundary, after the new template was forked from it (its clones stay; tok_sampler.recycle_root). '
+                        '0: never')
+    p.add_argument('--trim-parked', type=int, default=1,
+                   help='1 (default since 2026-10-06): every parked clone (a template, a whole-floor room entry) gives '
+                        'its free heap pages back (malloc_trim; tok_sampler.trim_parked; the game from it is the same, '
+                        'abplus_probe_trim.py); 0: as before')
+    p.add_argument('--graph-entities', type=int, default=32,
+                   help='entity tokens of the CUDA-graph actor (0: eager inference); a second graph takes all 64')
+    p.add_argument('--actor-bf16', type=int, default=0,
+                   help='1 (B29): the actor graphs run the network under bfloat16 autocast (input mlps, heads, GRU, '
+                        'value_global and the sampling stay float32; NOT float32-equivalent, see EXPERIMENTS.md B29); '
+                        '0: float32 as before')
+    p.add_argument('--actor-compile', default='',
+                   help="B29: torch.compile mode of the actor graphs' network and sampling (e.g. "
+                        "max-autotune-no-cudagraphs or default; the compiled kernels captured in the graphs; float32 "
+                        "values up to summation order; compiling takes minutes at start); '': eager kernels as before")
+    p.add_argument('--actor-fold', type=int, default=0,
+                   help='1 (B29): the per-call work around the actor graphs moves inside them (uniforms, common random '
+                        'numbers, the GRU state gather / write-back; GraphActor fold): 4 enqueued operations per call '
+                        'instead of ~12 and only the entity rows the graph reads packed; other uniform draws (the same '
+                        'distribution); 0: as before')
+    p.add_argument('--actor-sdpa-math', type=int, default=0,
+                   help="1 (B29): the actor graphs' attention as PyTorch's math SDPA (matrix products under --tf32) "
+                        'instead of the float32 memory-efficient kernel; with --actor-compile the softmax fuses; '
+                        '0: as before')
+    p.add_argument('--actor-row-buckets', default='',
+                   help='B29 (needs --actor-fold 1): more batch sizes of the actor graphs, e.g. 16,32 (a call replays '
+                        "the smallest graph that holds its records instead of always --workers rows); '': as before")
+    p.add_argument('--graph-entities-extra', default='',
+                   help='B29: more entity-token sizes of the actor graphs, e.g. 16,40 (a call replays the smallest '
+                        "graph that holds its records' entities); '': --graph-entities and 64 as before")
+    p.add_argument('--overlap', action='store_true',
+                   help='collect the next rollout while the learner updates (one update of policy lag; see above)')
+    p.add_argument('--recompute-values', default='auto', choices=('auto', 'on', 'off'),
+                   help="recompute the rollout's values with the learner's weights before the advantages (auto: on "
+                        'with --overlap)')
+    p.add_argument('--decoupled', type=int, default=0,
+                   help='1: decoupled PPO objective (Hilton et al. 2021): the ratio is taken to the weights at the '
+                        "update's start (log-probabilities recomputed then) and clipped there; the behaviour policy "
+                        'enters as the importance weight pi_start / pi_behaviour. Synchronous PPO is unchanged by it '
+                        '(the two policies are the same); with --overlap it keeps the clipping where synchronous PPO '
+                        'has it. 0: the plain ratio to the behaviour policy')
+    p.add_argument('--decoupled-max-weight', type=float, default=2.0,
+                   help='upper bound of the decoupled importance weight')
+    p.add_argument('--poll-want', type=int, default=0,
+                   help='records the actor waits for before a call, up to --poll-wait s after the first (0: half the '
+                        'workers, as before); 1: it answers whatever is ready')
+    p.add_argument('--poll-wait', type=float, default=0.0005)
+    p.add_argument('--actor-slots', type=int, default=2,
+                   help='actor calls in flight at once (each its own CUDA graphs and stream): while one runs on the '
+                        'GPU the next records are read, booked and sent; 1: one call at a time')
+    p.add_argument('--sort-micro', type=int, default=1,
+                   help="1: a minibatch's rows are ordered by entity count before they are cut into --micro parts "
+                        '(fewer padded entity tokens; the same gradient up to summation order); 0: as drawn')
+    p.add_argument('--packed', type=int, default=1,
+                   help="1: the learner's Transformer layers run on the real tokens only (TokPolicy packed: padded door "
+                        'and entity tokens skipped; the same values up to summation order); 0: on the padded layout')
+    p.add_argument('--teach-merge', type=int, default=1,
+                   help="1: a step's teacher records join the minibatch's last part (one forward and backward; the "
+                        'gradient is the same sum of the PPO and teacher terms); 0: a pass of their own')
+    p.add_argument('--teach-gpu', type=int, default=1,
+                   help='1: the teacher records are also kept as bytes on the GPU and a step gathers its records there '
+                        '(the same values as from the host copy); 0: from the host copy')
+    p.add_argument('--amp', default='off', choices=('off', 'bf16'),
+                   help="bf16: the learner's forward passes (PPO, teacher, the values recomputed at an update's start) "
+                        'under bfloat16 autocast: matrix products, convolutions and attention in bfloat16; the '
+                        'residual stream, layer norms, the input MLPs over raw float features (entity, player, door), '
+                        'the heads, log-softmax and every loss stay float32 (TokPolicy). The actor (sampling, stored '
+                        'log-probabilities) stays float32. off: float32 throughout (TF32 matrix products with --tf32)')
+    p.add_argument('--learner-fast', type=int, default=0,
+                   help="2026-10-10 (B18): 1: the learner's fast path: the same PPO update (losses, gradients, steps) "
+                        'with about half the GPU and host time per minibatch step (attention per length bucket as '
+                        'float32 matrix products, the input mlps on the real tokens, the CNNs on the distinct grids, '
+                        'no host sync per step, the fused Adam; learn() in train_tok.py, EXPERIMENTS.md B18). Not '
+                        'bit-identical: the same function in another summation order (abplus_bench_learner.py '
+                        '--check, abplus_check_learner_fp64.py). 0: as before. 2 (B38 step 4, 2026-10-17): also '
+                        "the start-of-update pass (--recompute-values / --decoupled) on the fast path's host plans "
+                        '(attention buckets, entity positions, the distinct grids: the same values up to summation '
+                        'order), its records staged in pinned memory and kept as bytes, so that the PPO parts gather '
+                        "bytes after it too (B18's raw gather; values identical), the item counts read from the fields")
+    p.add_argument('--learner-compile', default='',
+                   help="2026-10-17 (B38 step 4, an experiment): torch.compile mode of the learner model's forward in "
+                        "the PPO parts and the recompute pass (e.g. default, max-autotune-no-cudagraphs; dynamic "
+                        "shapes); '': eager, as before")
+    p.add_argument('--learner-cpus', default='',
+                   help='2026-10-10 (B18): CPUs for the learner thread alone, e.g. 56-59,168-171 (Linux numbering; '
+                        'whole cores with their hyperthread siblings, best on the GPU\'s NUMA node): the trainer\'s '
+                        'other threads, its workers and their games are kept off them. The fast learner is bound by '
+                        'its host thread, which a busy sibling or a game on the same core slows by ~20%%. '
+                        "'' (default): no pinning")
+    p.add_argument('--actor-processes', type=int, default=1,
+                   help='2026-10-17 (B38 step 5, needs --learner-process 1): actor processes, each with --workers / N '
+                        'of the workers (its own sampler, GraphActors, lanes, temporal state, searches) on its own GPU '
+                        '(--actor-devices) and --rollout / N decisions of every rollout; the learner process trains '
+                        'on the halves together (one update, the same decisions, the same one-rollout lag). The '
+                        "second process's workers have their own seeds (--seed + 1000003), names and ports "
+                        '(--port + their first worker). 1: one actor (the trainer process), as before')
+    p.add_argument('--actor-devices', default='',
+                   help="(B38 step 5) the actor processes' GPUs, e.g. cuda:0,cuda:2 ('': the first visible GPU for "
+                        'all; two actor processes on one GPU: the B13 hazard, for tests)')
+    p.add_argument('--learner-process', type=int, default=0,
+                   help='2026-10-17 (B38 step 2, needs --learner-device on another GPU): 1: the learner runs in a '
+                        'process of its own (learner_model, the optimisers, learn(), checkpoints, progress.csv), so '
+                        "the actor's and the learner's Python no longer share one interpreter lock; the rollouts' host "
+                        "arrays are shared memory, their device tensors and the weights' buffer CUDA IPC. 0: the "
+                        'learner thread (as before)')
+    p.add_argument('--learner-device', default='',
+                   help='2026-10-17 (B38): the GPU of the learner (learner_model, Adam, every tensor of the update), '
+                        'e.g. cuda:1; the actor (inference, lanes, snapshots, rollouts) stays on the first visible GPU. '
+                        "Best with --overlap --decoupled 1 (see the module docstring). '' (default) or the actor's own "
+                        'GPU: one GPU, as before')
+    # 2026-10-11 (memory, rl/docs/SCALING_THESIS.md S5b; see the module docstring)
+    p.add_argument('--memory', default=None, choices=('off', 'gru'),
+                   help='gru: a GRU state per worker between the token encoder and the heads, carried through the '
+                        'episode (reset only at a new episode) and trained with truncated BPTT; a resumed memory '
+                        'checkpoint keeps its memory unless --memory off is given (B32: then its GRU is dropped, '
+                        'tok_policy.drop_memory). Not given (default): the resumed checkpoint\'s, else off')
+    p.add_argument('--memory-dim', type=int, default=128, help="the GRU state's size (a resumed checkpoint's wins)")
+    p.add_argument('--memory-bptt', type=int, default=32,
+                   help="decisions per BPTT chunk (a worker's sequence cut into chunks of this many; a minibatch is "
+                        '--minibatch // this chunks)')
+    p.add_argument('--memory-graph', type=int, default=1,
+                   help='1: the actor answers through CUDA graphs with the state table (GraphActor memory); 0: eager '
+                        'inference for every call (a fallback)')
+    # 2026-10-12 (B21 / B22; see the module docstring)
+    p.add_argument('--item-tokens', type=int, default=0,
+                   help='1: one Transformer token per held collectible, the active item, each trinket and the pocket '
+                        '(needs --items; a resumed checkpoint with them keeps them). 0 (default): none')
+    p.add_argument('--global-token', type=int, default=0,
+                   help='1: a learned global token and a second value head value_global on it, trained with '
+                        '--gamma-global as an auxiliary loss (a resumed checkpoint with it keeps it). '
+                        '0 (default): none')
+    p.add_argument('--gamma-global', type=float, default=0.999, help="value_global's discount (B22)")
+    p.add_argument('--item-shared', type=int, default=0,
+                   help='1 (B23, needs --item-tokens 1): the item tokens\' collectible table is the policy\'s item_emb '
+                        '(one representation for held and pedestal items; a B21 checkpoint is converted on --resume, '
+                        'tok_policy.share_item_table). 0 (default): their own table, as before')
+    p.add_argument('--vf-global-coef', type=float, default=0.5, help="weight of value_global's loss (B22)")
+    # 2026-10-14 (B24; see the module docstring)
+    p.add_argument('--item-slots', type=int, default=None,
+                   help='B24: held-collectible token slots (newest first; + active, two trinkets, pocket). Default: '
+                        'a resumed checkpoint\'s, else 16 (INV_CAP, as before)')
+    # 2026-10-14 (B30; see the module docstring and rl/docs/TEMPORAL_ATTENTION.md)
+    p.add_argument('--temporal', type=int, default=0,
+                   help='1 (B30; B32: with or without --memory gru): the temporal transformer over the last '
+                        '--temporal-window decisions and the episode\'s room tokens (a resumed checkpoint without it '
+                        'gets it fresh, Adam remapped; one with it keeps it). 0 (default): none')
+    p.add_argument('--temporal-width', type=int, default=256, help="(B30) the temporal transformer's width D")
+    p.add_argument('--temporal-layers', type=int, default=4, help='(B30) its layers')
+    p.add_argument('--temporal-heads', type=int, default=4, help='(B30) its heads')
+    p.add_argument('--temporal-window', type=int, default=256, help='(B30) decisions a step token sees (itself included)')
+    p.add_argument('--temporal-rooms', type=int, default=128, help='(B30) room tokens per episode at most')
+    p.add_argument('--rebuild-memory', type=int, choices=(0, 1), default=0)
+    p.add_argument('--memory-block', type=int, default=64)
+    p.add_argument('--memory-tokens', type=int, default=4)
+    p.add_argument('--source-cache', type=int, choices=(0, 1), default=0)
+    p.add_argument('--source-replay', type=int, choices=(0, 1), default=0,
+                   help='diagnostic memory-saving VJP replay; default keeps the source graph without replay')
+    p.add_argument('--memory-refresh-updates', type=int, default=8,
+                   help='actor source-cache refresh period in received weight versions (1: strict freshness)')
+    p.add_argument('--source-devices', default='', help='source GPUs, e.g. cuda:2,cuda:3; no automatic GPU allocation')
+    p.add_argument('--source-prefetch-records',type=int,default=0,
+                   help='stream immutable shared rollout prefixes to source GPUs every N Actor records; 0 off')
+    p.add_argument('--source-processes',type=int,choices=(0,1),default=0,
+                   help='persistent spawned source process per GPU, with CUDA IPC values and full VJP ownership')
+    p.add_argument('--source-actor-reserve-gb',type=float,default=0,
+                   help='reserve Actor graph-pool capacity on GPUs shared with sources, in addition to source workspace')
+    p.add_argument('--source-compile',type=int,choices=(0,1,2),default=0,
+                   help='source compilation: 0 off, 1 Spatial stack, 2 tensor encoder after exact component dedup')
+    p.add_argument('--source-flash',type=int,choices=(0,1),default=0,help='native CUDA BF16 varlen FlashAttention on source Spatial only')
+    p.add_argument('--source-update-steps', type=int, default=4,
+                   help='Reader steps per source update; 0 accumulates the complete rollout and updates once at its end')
+    p.add_argument('--source-overlap-rollout',type=int,choices=(0,1),default=0,
+                   help='queue rollout source VJP during collection; commit before the next learner rollout or checkpoint')
+    p.add_argument('--source-update-rollouts',type=int,choices=(1,2,4),default=1,
+                   help='complete rollouts per source VJP/Adam interval; requires --source-update-steps 0')
+    p.add_argument('--source-amp', choices=('auto', 'off', 'bf16'), default='auto',
+                   help='source encoder/Writer precision only; auto inherits --amp, Reader is unchanged')
+    p.add_argument('--source-saved-gpu-gb', type=float, default=0,
+                   help='above this source-GPU allocation, save new encoder activations in pinned CPU memory; 0 disables; no encoder replay')
+    p.add_argument('--source-saved-cpu-gb', type=float, default=1,
+                   help='maximum retained pinned activation GiB per source worker; excess stays on GPU')
+    p.add_argument('--source-saved-8bit', type=int, choices=(0,64,128,256,512,1024,2048,4096), default=0,
+                   help='experimental BF16 backward-activation 8-bit block size; 0 disables; forward/weights unchanged; overrides CPU spill')
+    p.add_argument('--room-memory', type=int, choices=(0, 1), default=0, help='learn room writes from complete raw visits')
+    p.add_argument('--inventory-all', type=int, choices=(0, 1), default=0, help='all supported inventory IDs/counts through Lua v2 and the pooled item encoder')
+    p.add_argument('--room-source-micro', type=int, default=2048, help='Spatial source encoding batch size; no frame truncation')
+    p.add_argument('--temporal-bptt', type=int, default=256,
+                   help="(B30) decisions per learner chunk (with memory a multiple of --memory-bptt; a minibatch is "
+                        '--minibatch // this chunks, --micro parts of whole chunks)')
+    p.add_argument('--temporal-kv', default='bf16', choices=('bf16', 'fp32'),
+                   help="(B30) the stored K / V (actor's cache and the rollout's): bfloat16 (default) or float32")
+    p.add_argument('--fused-adam', type=int, default=0,
+                   help='1: Adam as one fused CUDA kernel (the same update rule; float rounding may differ)')
+    p.add_argument('--dump-rollouts', type=int, default=0,
+                   help="save the first K rollouts handed to the learner (records, actions under way, actions, stored "
+                        "log-probabilities and values, rewards) to <out>/rollouts/ (a measurement aid)")
+    p.add_argument('--switch-interval', type=float, default=0.0005,
+                   help="Python's thread switch interval (s): how long the actor may wait for the interpreter while "
+                        'the learner thread runs Python (default of Python: 0.005)')
+    args = p.parse_args(argv)
+    # B38 step 5: actor processes (aid 0: this trainer process; 1 ..: actor_child_entry), each its share of workers
+    n_act = max(1, int(args.actor_processes))
+    aid = int(actor['aid']) if actor is not None else 0
+    if n_act > 1:
+        if not args.learner_process:
+            p.error('--actor-processes > 1 needs --learner-process 1')
+        if args.workers % n_act or args.rollout % n_act:
+            p.error('--actor-processes must divide --workers and --rollout')
+    n_loc = args.workers // n_act   # (this actor's workers: global indices w_lo .. w_lo + n_loc)
+    w_lo = aid * n_loc
+    if actor is not None:   # (a second actor process: its set-up prints nothing; the first one printed it all)
+        actor_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+    if args.learner_process and child is None and ipc_safe_allocator():   # (B38 step 2: before any CUDA allocation)
+        print('learner process (B38 step 2): expandable CUDA segments off in the trainer process (CUDA IPC)', flush=True)
+    if args.poll_want <= 0:
+        args.poll_want = max(1, args.workers // 2)
+    if args.teacher_share is None:
+        args.teacher_share = OVERLAP_TEACHER_SHARE if (args.overlap and args.teacher) else 0.0
+    if args.teacher_v2:   # 2026-10-10 (teacher v2)
+        if args.mode not in ('floor', 'run'):
+            p.error('--teacher-v2 needs --mode floor/run')
+        if not args.teacher_thread:
+            p.error('--teacher-v2 needs --teacher-thread 1 (its searches run in the workers\' search threads)')
+    if args.cf:   # B34 (the counterfactual teacher)
+        if args.mode not in ('floor', 'run'):
+            p.error('--cf needs --mode floor/run')
+        if not args.teacher_thread:
+            p.error('--cf needs --teacher-thread 1 (its points run in a thread of each worker; --teacher-fork 1: in '
+                    'forked children)')
+        if args.cf_branches < 2:
+            p.error('--cf-branches must be >= 2 (taken and at least one more)')
+    if args.cf_wall and not args.cf:
+        p.error('--cf-wall needs --cf 1')
+    recompute = args.recompute_values == 'on' or (args.recompute_values == 'auto' and args.overlap)
+    if args.switch_interval > 0:
+        sys.setswitchinterval(args.switch_interval)
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=bool(args.resume) or child is not None or actor is not None)
+    (out / 'checkpoints').mkdir(exist_ok=True)
+    run = args.mode == 'run'
+    floor = args.mode == 'floor' or run
+    if args.resume and not args.items:   # an items checkpoint keeps its heads
+        args.items = bool(torch.load(args.resume, map_location='cpu').get('config', {}).get('items'))
+    items = bool(args.items)
+    if args.resume:
+        args.charge = int(bool(torch.load(args.resume, map_location='cpu').get('config', {}).get('charge')))
+    charge = bool(args.charge)
+    if args.resume:   # 2026-10-08
+        args.ent_ext = int(bool(torch.load(args.resume, map_location='cpu').get('config', {}).get('ent_ext')))
+    ent_ext = bool(args.ent_ext)
+    if args.resume:   # 2026-10-08 (characters)
+        args.pchar = int(bool(torch.load(args.resume, map_location='cpu').get('config', {}).get('pchar')))
+    elif args.pchar < 0:
+        args.pchar = int(bool(args.characters))
+    pchar = bool(args.pchar)
+    # 2026-10-16 (B35): observation v2 (TokPolicy obs_prices / obs_hearts / obs_room_type); a resumed checkpoint keeps
+    # its own keys
+    obs_v2 = dict.fromkeys(('obs_prices', 'obs_hearts', 'obs_room_type'), bool(args.obs_v2))
+    if args.resume:
+        ck_cfg = torch.load(args.resume, map_location='cpu').get('config', {})
+        ck_v2 = {k: bool(ck_cfg.get(k)) for k in obs_v2}
+        if ck_v2 != obs_v2:
+            print(f'obs-v2: the resumed checkpoint has {ck_v2}: kept', flush=True)
+        obs_v2 = ck_v2
+        args.obs_v2 = int(all(obs_v2.values()))
+        if ck_cfg.get('rebuild_memory'):
+            args.rebuild_memory = 1
+            args.memory_block = ck_cfg['memory_block']
+            args.memory_tokens = ck_cfg['memory_tokens']
+        rebuild_fresh = bool(args.rebuild_memory) and not ck_cfg.get('rebuild_memory')
+        del ck_cfg
+    mem_fresh = mem_drop = False   # 2026-10-11 (memory): a resumed memory checkpoint keeps its memory and its size
+    if args.resume:
+        ck_mem = int(torch.load(args.resume, map_location='cpu').get('config', {}).get('memory', 0) or 0)
+        if ck_mem and args.memory == 'off':   # B32 (2026-10-15): an explicit --memory off drops the checkpoint's GRU
+            mem_drop = True
+        elif ck_mem:
+            if args.memory != 'gru' or args.memory_dim != ck_mem:
+                print(f'memory: the resumed checkpoint has a GRU of size {ck_mem}: --memory gru --memory-dim {ck_mem}',
+                      flush=True)
+            args.memory, args.memory_dim = 'gru', ck_mem
+        else:
+            mem_fresh = args.memory == 'gru'
+    mem_on = args.memory == 'gru'
+    mem_dim = int(args.memory_dim) if mem_on else 0
+    T_mem = max(1, int(args.memory_bptt))
+    if mem_on and args.memory_dim <= 0:
+        p.error('--memory gru needs --memory-dim > 0')
+    # 2026-10-12 (B21 / B22): a resumed checkpoint with item tokens / a global token keeps them; one without them gets
+    # them fresh when asked
+    itok_fresh = gtok_fresh = share_convert = tatt_fresh = room_fresh = rebuild_fresh = False
+    if args.resume:
+        ck_cfg = torch.load(args.resume, map_location='cpu').get('config', {})
+        for key_, opt_ in (('item_tokens', 'item_tokens'), ('global_token', 'global_token'),
+                           ('item_shared', 'item_shared')):
+            if ck_cfg.get(key_):
+                if not getattr(args, opt_):
+                    print(f'{key_}: the resumed checkpoint has them: --{opt_.replace("_", "-")} 1', flush=True)
+                setattr(args, opt_, 1)
+        itok_fresh = bool(args.item_tokens) and not ck_cfg.get('item_tokens')
+        gtok_fresh = bool(args.global_token) and not ck_cfg.get('global_token')
+        # 2026-10-13 (B23): a B21 checkpoint's own item-token table converted into the shared one (share_item_table)
+        share_convert = bool(args.item_shared) and bool(ck_cfg.get('item_tokens')) and not ck_cfg.get('item_shared')
+        if args.item_slots is None and ck_cfg.get('item_slots'):
+            args.item_slots = int(ck_cfg['item_slots'])
+        if ck_cfg.get('temporal'):   # 2026-10-14 (B30): a temporal checkpoint keeps it, with its sizes
+            if not args.temporal:
+                print('temporal: the resumed checkpoint has it: --temporal 1', flush=True)
+            args.temporal = 1
+            for key_ in ('width', 'layers', 'heads', 'window', 'rooms'):
+                setattr(args, 'temporal_' + key_, int(ck_cfg['temporal_' + key_]))
+        tatt_fresh = bool(args.temporal) and not ck_cfg.get('temporal')
+        if ck_cfg.get('room_memory'):
+            args.room_memory = 1
+        room_fresh = bool(args.room_memory) and not ck_cfg.get('room_memory')
+        if ck_cfg.get('obs_inventory_all'):
+            args.inventory_all = 1
+        if ck_cfg.get('rebuild_memory'):
+            args.rebuild_memory = 1
+            args.memory_block = ck_cfg['memory_block']
+            args.memory_tokens = ck_cfg['memory_tokens']
+        rebuild_fresh = bool(args.rebuild_memory) and not ck_cfg.get('rebuild_memory')
+        del ck_cfg
+    itok_on, gtok_on = bool(args.item_tokens), bool(args.global_token)
+    if itok_on and not items:
+        p.error('--item-tokens 1 needs --items (or an items checkpoint)')
+    if args.item_shared and not itok_on:
+        p.error('--item-shared 1 needs --item-tokens 1')
+    if args.inventory_all and not items:
+        p.error('--inventory-all requires --items')
+    tok_kw = dict(item_tokens=itok_on, global_token=gtok_on, obs_inventory_all=bool(args.inventory_all))   # (TokPolicy's B21 / B22 options; False: as before)
+    tok_kw.update({k: True for k, on_ in obs_v2.items() if on_})   # (B35; nothing when off: TokPolicy as before)
+    if args.item_shared:   # (B23; the key only when set: TokPolicy's signature as before otherwise)
+        tok_kw['item_shared'] = True
+    item_slots = INV_CAP if args.item_slots is None else int(args.item_slots)
+    if item_slots != INV_CAP:
+        if not itok_on:
+            p.error('--item-slots needs --item-tokens 1')
+        if not 1 <= item_slots <= INV_CAP:
+            p.error(f'--item-slots must be in 1 .. {INV_CAP}')
+        tok_kw['item_slots'] = item_slots
+    t_on = bool(args.temporal)   # 2026-10-14 (B30)
+    if args.rebuild_memory:
+        if args.source_devices and (args.micro != 8192 or args.source_replay or args.source_update_steps < 0):
+            p.error('source pipeline requires --micro 8192, --source-replay 0 and nonnegative --source-update-steps')
+        if args.source_overlap_rollout and (not args.source_devices or args.source_update_steps != 0):
+            p.error('--source-overlap-rollout requires source devices and --source-update-steps 0')
+        if args.source_update_rollouts!=1 and (not args.source_devices or args.source_update_steps!=0):
+            p.error('--source-update-rollouts requires source devices and --source-update-steps 0')
+        if not t_on or not gtok_on or mem_on or args.room_memory:
+            p.error('--rebuild-memory requires temporal/global tokens and replaces GRU/room-memory')
+        from isaac_bridge.rebuild_memory import (RawHistory, SourceBatch, rollout_requests,
+            PROFILE_MEMORY, MEMORY_TIMES, MEMORY_COUNTS, memory_tick, memory_part, pack_histories, unpack_histories)
+        if args.memory_refresh_updates < 1:
+            p.error('--memory-refresh-updates must be positive')
+        tok_kw.update(rebuild_memory=True, memory_block=args.memory_block,
+                      memory_tokens=args.memory_tokens, source_cache=bool(args.source_cache),
+                      memory_refresh_updates=args.memory_refresh_updates)
+    if args.room_memory:
+        if not t_on or args.room_source_micro < 1:
+            p.error('--room-memory requires temporal and positive --room-source-micro')
+        tok_kw['room_memory'] = True
+    T_t = int(args.temporal_bptt)
+    # (B32: the learner's decisions in chunks: the GRU's (memory), the temporal ones (temporal; with memory the GRU
+    # chunks nest inside), or none)
+    chunked = mem_on or t_on
+    if t_on:
+        if T_t < 1:
+            p.error('--temporal-bptt must be >= 1')
+        if mem_on and (T_t < T_mem or T_t % T_mem):
+            p.error('--temporal-bptt must be a multiple of --memory-bptt')
+        if args.branch_share > 0:   # (B34: teacher v2 / --cf run with the lanes' temporal state)
+            p.error('--temporal 1: branches (--branch-share) are not supported (v1)')
+        tok_kw.update(temporal=True, temporal_width=args.temporal_width, temporal_layers=args.temporal_layers,
+                      temporal_heads=args.temporal_heads, temporal_window=args.temporal_window,
+                      temporal_rooms=args.temporal_rooms)
+    pick_force = parse_pickup_force(args.pickup_force)   # 2026-10-13 (B23)
+    pf_on = max(pick_force) > 0
+    rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0, heal=0.0, resource=0.0)
+    rw.update({k: float(v) for k, v in (kv.split('=') for kv in (FLOOR_REWARD if floor else ROOM_REWARD).split(','))})
+    if args.reward:
+        rw.update({k: float(v) for k, v in (kv.split('=') for kv in args.reward.split(','))})
+    if floor:   # the root instances are launched with the normal group's spec; the floor reset does not use its rooms
+        names, assign = ['run' if run else 'floor'], [0] * args.workers
+        specs = [load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))]
+    else:
+        names, assign = parse_groups(args.groups, args.workers)
+        specs = [load_spec(argparse.Namespace(groups_file=args.groups_file, group=n, tasks='', seconds=0.0))
+                 for n in names]
+    lab_on = floor and args.lab_share > 0   # 2026-10-08 (tok_lab)
+    gains_on = floor and bool(rw.get('heal') or rw.get('resource'))   # (Episodes.gains: the heal / resource terms)
+    if args.start_build_prob > 0 and not (floor and items):
+        p.error('--start-build-prob needs --mode floor/run and --items')
+    if pf_on and not (floor and items):
+        p.error('--pickup-force needs --mode floor/run and --items')
+    if args.start_build_mode == 'pedestal' and args.start_build_prob <= 0:
+        p.error('--start-build-mode pedestal needs --start-build-prob > 0')
+    if not 0.0 <= args.no_active_prob <= 1.0:   # B39
+        p.error('--no-active-prob: a probability in [0, 1] expected')
+    if args.no_active_prob > 0 and not floor:
+        p.error('--no-active-prob needs --mode floor/run')
+    if args.stat_aug_prob > 0:
+        if not floor:
+            p.error('--stat-aug-prob needs --mode floor/run')
+        from isaac_bridge.tok_floor import parse_stat_aug
+        parse_stat_aug(args.stat_aug)   # (a bad spec fails here, not in the workers)
+    char_ids = []   # 2026-10-08 (characters)
+    if args.characters:
+        if not floor:
+            p.error('--characters needs --mode floor/run')
+        from isaac_bridge.tok_floor import parse_characters
+        try:
+            char_ids = [int(c) for c in parse_characters(args.characters)[0]]
+        except ValueError as exc:
+            p.error(str(exc))
+    lab_names, lab_panel, lab_specs, lab_owner = [], [], [], []
+    if lab_on:
+        from isaac_bridge.tok_lab import assign_panel, parse_panel, state_costs_from
+        lab_names, lab_panel = parse_panel(args.lab_panel, args.lab_seed)
+        lab_owner = assign_panel(lab_panel, lab_names, args.workers, state_costs=state_costs_from(
+            args.lab_costs, len(lab_panel)) if args.lab_costs else None)
+        lab_specs = [load_spec(argparse.Namespace(groups_file=args.groups_file, group=nm, tasks='', seconds=0.0))
+                     for nm in lab_names]
+    lo, hi = (int(v) for v in args.start_hp.split(':'))
+    # the instances' stub list: stub_render_h.txt next to the library (B14; else _g), or --stub-list
+    stub = args.stub_list or default_stub_list(default_preload())
+    # (B38 step 5: an actor process's sampler has its workers only; the second one's seeds, names, ports its own; the
+    # search slots shared out)
+    in_actor = child is None
+    cfg = TokSamplerConfig(workers=n_loc if in_actor else args.workers, specs=specs,
+                           assign=assign[w_lo:w_lo + n_loc] if in_actor else assign,
+                           frames_per_decision=args.frames_per_decision,
+                           episodes_per_state=args.episodes_per_state, episode_seconds=args.episode_seconds,
+                           start_hp=(lo, hi), seed=args.seed + 1000003 * aid, name=args.name + (f'a{aid}' if aid else ''),
+                           port=args.port + w_lo,
+                           teacher=args.teacher, teacher_share=args.teacher_share, teacher_queue=args.teacher_queue,
+                           teacher_slots=(max(1, args.teacher_slots // n_act) if args.teacher_slots else 0),
+                           teacher_skip_known=bool(args.teacher_skip_known),
+                           teacher_pair=bool(args.teacher_pair),
+                           teacher_death_depths=tuple(int(v) for v in args.teacher_death_depths.split(',') if v.strip())
+                           if floor else (), teacher_death_margin=args.teacher_death_margin, teacher_thread=args.teacher_thread, teacher_fork=args.teacher_fork,
+                           mode=args.mode,
+                           floor_seconds=args.floor_seconds, floor_stall_seconds=args.floor_stall_seconds,
+                           stall_progress=args.stall_progress,
+                           archive_size=args.archive_size, archive_prob=args.archive_prob,
+                           snapshot_prob=args.snapshot_prob, archive_boss=args.archive_boss, build_timeout=args.build_timeout,
+                           root_anon_mib=args.root_anon_mib, reset_timeout=args.reset_timeout,
+                           trim_parked=bool(args.trim_parked), items=items, inventory_all=bool(args.inventory_all), run_seconds=args.run_seconds,
+                           branch_share=args.branch_share if floor else 0.0, branch_seconds=args.branch_seconds,
+                           branch_max=args.branch_max, branch_close=args.branch_close, branch_noise=args.branch_noise,
+                           branch_queue=args.branch_queue, branch_kinds=args.branch_kinds,
+                           branch_item_back=args.branch_item_back, branch_walk_seconds=args.branch_walk_seconds,
+                           branch_weights=args.branch_weights, branch_uncert=args.branch_uncert,
+                           branch_crn=bool(args.branch_crn), branch_twin=args.branch_twin,
+                           branch_replicate_max=args.branch_replicate_max, branch_noise_prior=args.branch_noise_prior,
+                           branch_reward=','.join(f'{k}={v}' for k, v in rw.items()), branch_gamma=args.gamma,
+                           branch_archive=args.branch_archive, branch_left_back=args.branch_left_back,
+                           lab_share=args.lab_share if lab_on else 0.0, lab_seconds=args.lab_seconds,
+                           lab_specs=lab_specs, lab_panel=lab_panel, lab_owner=lab_owner,
+                           start_build_prob=args.start_build_prob if floor else 0.0, start_build_max=args.start_build_max,
+                           start_build_items=args.lab_items, archive_deep=args.archive_deep, archive_plr=args.archive_plr,
+                           stat_aug_prob=args.stat_aug_prob if floor else 0.0, stat_aug=args.stat_aug,
+                           characters=args.characters if floor else '',
+                           no_active_prob=args.no_active_prob if floor else 0.0,
+                           start_build_mode=args.start_build_mode, pickup_force=pick_force if floor else (0.0, 0.0),
+                           teacher_v2=bool(args.teacher_v2) and floor,
+                           teacher_v2_hold=tuple(int(v) for v in args.teacher_v2_hold.split(',') if v.strip()),
+                           teacher_v2_sticky=args.teacher_v2_sticky, teacher_v2_sticky_n=args.teacher_v2_sticky_n,
+                           teacher_v2_seconds=args.teacher_v2_seconds, teacher_v2_margin=args.teacher_v2_margin,
+                           teacher_v2_cap=args.teacher_v2_cap, teacher_v2_random=args.teacher_v2_random,
+                           teacher_v2_queue=args.teacher_v2_queue,
+                           teacher_v2_depths=tuple(int(v) for v in args.teacher_v2_depths.split(',') if v.strip()),
+                           memory_dim=mem_dim,
+                           cf=bool(args.cf) and floor, cf_points=args.cf_points, cf_branches=args.cf_branches,
+                           cf_seconds=args.cf_seconds, cf_target_seconds=args.cf_target_seconds,
+                           cf_margin=args.cf_margin, cf_cap=args.cf_cap, cf_distill_steps=args.cf_distill_steps,
+                           cf_random=args.cf_random, cf_queue=args.cf_queue, cf_sticky_eps=args.cf_sticky_eps,
+                           cf_wall=bool(args.cf_wall), cf_wall_distill=args.cf_wall_distill,
+                           cf_defer_target=bool(args.cf_defer_target),
+                           cf_gamma=args.gamma_global if gtok_on else args.gamma, cf_vglobal=gtok_on,
+                           temporal_dim=int(args.temporal_width) if (t_on and (args.cf or args.teacher_v2)) else 0,
+                           bridge_lua=default_bridge_lua(), preload=default_preload(),
+                           stub_list=stub if stub and Path(stub).is_file() else '')
+    print('instances: stub list', cfg.stub_list or '(the launch mode\'s own)', '| environment',
+          apply_instance_defaults(dict(os.environ)), '| teacher_pair', cfg.teacher_pair, flush=True)
+    torch.backends.cuda.matmul.allow_tf32 = args.tf32
+    torch.backends.cudnn.allow_tf32 = args.tf32
+    adevs = [torch.device(x_.strip()) for x_ in args.actor_devices.split(',') if x_.strip()]
+    if adevs and len(adevs) != n_act:
+        p.error('--actor-devices: one GPU per actor process')
+    if adevs and child is None:   # (B38 step 5: this actor process's GPU, before CUDA's first use)
+        torch.cuda.set_device(adevs[aid].index or 0)
+    device = torch.device('cuda')
+    # B38 (2026-10-17, --learner-device): the learner's GPU. split: it is another GPU than the actor's (the first
+    # visible one); otherwise ldev is `device` itself and nothing below changes
+    ldev, split = device, False
+    device_actor = torch.device('cuda', torch.cuda.current_device())   # (`device` with its index: other threads)
+    lbench = child is not None and bool(child.get('bench'))   # (abplus_b38_replay.py: no actor GPU to keep apart)
+    if args.learner_device:
+        want = torch.device(args.learner_device)
+        if want.type != 'cuda' or (want.index or 0) >= torch.cuda.device_count():
+            p.error(f'--learner-device {args.learner_device}: not one of the {torch.cuda.device_count()} visible GPUs')
+        if (want.index or 0) != torch.cuda.current_device() or lbench:
+            ldev, split = torch.device('cuda', want.index or 0), True
+    proc = bool(args.learner_process)   # B38 step 2: the learner in a process of its own
+    if proc and not split:
+        p.error('--learner-process 1 needs --learner-device on another GPU than the actor\'s (two processes on one GPU: '
+                'the B13 crash class)')
+    print(f'devices (B38): actor cuda:{torch.cuda.current_device()} ({torch.cuda.get_device_name()}), learner '
+          + (f'{ldev} ({torch.cuda.get_device_name(ldev)})' if split else 'the same GPU')
+          + (', in a process of its own' if proc else ''), flush=True)
+    # (B38 step 2: in the actor's process the learner's weights only start the actor's copy: on the actor's GPU)
+    lm_dev = device if (proc and child is None) else ldev
+    torch.manual_seed(args.seed + 1000003 * aid)   # (B38 step 5: the second actor's sampling draws its own)
+    branching = cfg.branch_share > 0   # 2026-10-07 (tok_branch): branch episodes and choice records
+    if args.choice_heads < 0:   # Phase B2: K choice-value heads with branches (a resumed checkpoint's own count wins)
+        args.choice_heads = 4 if branching else 0
+    if args.resume:
+        args.choice_heads = int(torch.load(args.resume, map_location='cpu').get('config', {}).get('choice', 0)) or             args.choice_heads
+    n_choice = int(args.choice_heads)
+    learner_model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
+                              ent_ext=ent_ext, pchar=pchar, memory=mem_dim, **tok_kw).to(lm_dev)   # the weights PPO updates
+    nh = len(learner_model.heads)
+    fused = bool(args.fused_adam) or bool(args.learner_fast)   # (B18: --learner-fast 1 implies the fused Adam)
+    # (Phase B2: the choice heads are not PPO's: main_parameters() is parameters() without them, in the same order)
+    opt = torch.optim.Adam(learner_model.main_parameters(), lr=args.lr, eps=1e-5,
+                           **(dict(fused=True) if fused else {}))
+    copt = torch.optim.Adam(learner_model.choice.parameters(), lr=args.choice_lr) if n_choice else None
+    update, decisions_total, seconds_total = 0, 0, 0.0
+    source_version = 0
+    if args.init:
+        print('init', args.init, load_compatible(learner_model, torch.load(args.init, map_location=lm_dev)['model']))
+    if args.resume:
+        ck = torch.load(args.resume, map_location=lm_dev)
+        source_version = ck.get('source_version', 0)
+        ck_model = ck['model']
+        mem_names = []
+        if mem_drop:   # B32 (2026-10-15): the GRU's tensors dropped (and below their Adam state), the rest exact
+            ck_model, mem_names, note_ = drop_memory(learner_model, ck_model)
+            print(note_, flush=True)
+        if share_convert:   # 2026-10-13 (B23): the B21 table dropped, the item tokens' first Linear converted
+            ck_model, note_ = share_item_table(learner_model, ck_model)
+            print(note_, flush=True)
+        missing, unexpected = learner_model.load_state_dict(ck_model, strict=False)
+        new_ok = (('mem_', 'gtok.mem_in.') if mem_fresh else ()) + (('itok.',) if itok_fresh else ()) + \
+            (('gtok.',) if gtok_fresh else ()) + (('tatt.',) if tatt_fresh else ()) + (('room_writer.',) if room_fresh else ()) + (('reader.',) if rebuild_fresh else ())
+        if unexpected or any(not k.startswith('choice.') and not (new_ok and k.startswith(new_ok)) for k in missing):
+            raise SystemExit(f'--resume: weights do not match ({missing[:4]} {unexpected[:4]})')
+        if copt is not None and ck.get('choice_optimizer'):
+            copt.load_state_dict(ck['choice_optimizer'])
+        osd = ck['optimizer']
+        ck_ext = any(k.startswith(('itok.', 'gtok.', 'tatt.')) for k in ck['model'])   # (registered after the GRU)
+        if itok_fresh or gtok_fresh or (mem_fresh and ck_ext) or share_convert or tatt_fresh or mem_drop or room_fresh or rebuild_fresh:
+            # 2026-10-12 (B21 / B22): new parameters (not necessarily the last ones): Adam's state remapped by name
+            # (B23 share_convert: itok.coll's state gone with it, the converted Linear's state starts fresh)
+            added = remap_optimizer_state(osd, main_parameter_names(list(ck['model'])),
+                                          main_parameter_names([k for k, _ in learner_model.named_parameters()]),
+                                          drop=(ITEM_SHARED_KEY,) if share_convert else ())
+            for flag_, name_, what_ in ((itok_fresh, 'item tokens', f'{item_slots + 4} item tokens per record'),
+                                        (gtok_fresh, 'global token', 'the global token and value_global')):
+                if flag_:
+                    print(f'{name_}: --resume of a checkpoint without them: {what_} initialised fresh (the outputs '
+                          'change at the start)', flush=True)
+            if mem_fresh:
+                print(f'memory: --resume of a checkpoint without it: GRU (size {mem_dim}) initialised fresh, its '
+                      'output projection zero (the same outputs as the checkpoint at the start)', flush=True)
+            if tatt_fresh:   # 2026-10-14 (B30)
+                n_t = sum(q.numel() for q in learner_model.tatt.parameters())
+                print(f'temporal (B30): --resume of a checkpoint without it: the temporal transformer ({n_t / 1e6:.2f}M '
+                      f'parameters, width {args.temporal_width} x {args.temporal_layers} layers, window '
+                      f'{args.temporal_window}, rooms {args.temporal_rooms}) appended fresh (the outputs change at '
+                      'the start)', flush=True)
+            print(f'--resume: Adam state remapped by parameter name, {added} new tensors without state'
+                  + (f', {len(mem_names)} dropped (the GRU\'s)' if mem_drop else ''), flush=True)
+        elif mem_fresh:   # 2026-10-11 (memory): the GRU's parameters are the optimiser's last ones, with no state yet
+            added = pad_optimizer_state(osd, len(learner_model.main_parameters()))
+            print(f'memory: --resume of a memory-free checkpoint: GRU (size {mem_dim}) initialised fresh, its output '
+                  f'projection zero (the same outputs as the checkpoint at the start); Adam state padded with {added} '
+                  'new tensors', flush=True)
+        for g in osd['param_groups']:   # the checkpoint's groups carry its own implementation choice: this run's wins
+            g['fused'], g['foreach'] = (True, None) if fused else (None, None)
+        opt.load_state_dict(osd)        # (fused: Adam's step counts go to the device, else they stay / go to the CPU)
+        if not fused:
+            for st in opt.state.values():
+                if torch.is_tensor(st.get('step')) and st['step'].is_cuda:
+                    st['step'] = st['step'].cpu()
+        update, decisions_total, seconds_total = ck['update'], ck['decisions'], ck.get('seconds', 0.0)
+    amp = args.amp == 'bf16'
+    if amp and not torch.cuda.is_bf16_supported():
+        raise SystemExit('--amp bf16: this GPU has no bfloat16 support')
+
+    def autocast():
+        """The learner's forward passes (the losses are computed outside, in float32)."""
+        return torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp)
+    model = actor_params = None   # (B38 step 2: the learner process has no actor)
+    if child is None:
+        model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
+                          ent_ext=ent_ext, pchar=pchar, memory=mem_dim, **tok_kw).to(device).eval()   # the actor's copy
+        model.load_state_dict(learner_model.state_dict())
+        actor_params = [t for t in list(model.parameters()) + list(model.buffers())]
+    learner_params = [t for t in list(learner_model.parameters()) + list(learner_model.buffers())]
+    hours_per_decision = args.frames_per_decision / 30 / 3600
+    config = dict(vars(args), groups_resolved=names, assign=assign,
+                  parameters=sum(q.numel() for q in learner_model.parameters()), reward_terms=rw, lag=1,
+                  record='tok_obs.ROW', sampler='tok_sampler (fork sampler, lean bridge)',
+                  recompute_values_resolved=recompute)
+    if child is None:
+        if actor is None:
+            (out / 'config.json').write_text(json.dumps(config, indent=1, default=str))
+    log_path = out / 'progress.csv'
+    log_file = None
+
+    def log_columns(columns):
+        """Open progress.csv for appending with these columns. A file written by an older version with other columns
+        (a resumed run) is moved aside to progress.csv.old<k> and copied into a new file whose header is its own
+        columns followed by the new ones (empty in the old rows), so the file stays one table."""
+        nonlocal log_file
+        header = []
+        if log_path.is_file() and log_path.stat().st_size > 0:
+            with open(log_path, newline='') as f:
+                header = next(csv.reader(f), [])
+        if header and header != columns:
+            merged = header + [c for c in columns if c not in header]
+            k = 0
+            while (out / f'progress.csv.old{k}').exists():
+                k += 1
+            old = out / f'progress.csv.old{k}'
+            os.replace(log_path, old)
+            with open(old, newline='') as f, open(log_path, 'w', newline='') as g:
+                w = csv.DictWriter(g, fieldnames=merged, restval='')
+                w.writeheader()
+                for r in csv.DictReader(f):
+                    w.writerow({c: r.get(c, '') for c in merged})
+            columns = merged
+        log_file = open(log_path, 'a', newline='')
+        return columns
+    episodes_path = open(out / 'episodes.jsonl', 'a')
+    branch_path = open(out / 'branch_episodes.jsonl', 'a') if branching else None
+    choice_path = open(out / 'choices.jsonl', 'a') if branching else None
+    learner_cpus = set()   # 2026-10-10 (B18, --learner-cpus): before the workers start (they inherit the rest)
+    for part_ in filter(None, args.learner_cpus.split(',')):
+        lo_, _, hi_ = part_.partition('-')
+        learner_cpus.update(range(int(lo_), int(hi_ or lo_) + 1))
+    if learner_cpus:
+        os.sched_setaffinity(0, os.sched_getaffinity(0) - learner_cpus)
+    bench_job = None   # 2026-10-10 (B18, abplus_bench_learner.py): a saved rollout instead of the engine
+    if proc and (os.environ.get('ISAAC_RL_LEARNER_BENCH') or lab_on or branching):
+        p.error('--learner-process 1: not with the learner bench, the build lab or branches (their learner side writes '
+                "into the actor's state)")
+    if child is not None:   # (B38 step 2: the learner process reads the workers' counters from each job)
+        sampler = types.SimpleNamespace(stats=child['stats'].copy(), aux=None,
+                                        lane_rows=True if child['v2_on'] else None)
+    elif os.environ.get('ISAAC_RL_LEARNER_BENCH') and Path(os.environ.get('ISAAC_RL_LEARNER_JOB') or '-').is_file():
+        from abplus_bench_learner import JobSampler, load_job
+        bench_job, bench_stats = load_job(os.environ['ISAAC_RL_LEARNER_JOB'], Rollout,
+                                          args.rollout // args.workers * 4 + 64)
+        sampler = JobSampler(bench_stats)
+    else:
+        sampler = TokSampler(cfg)
+    n = n_loc if child is None else args.workers   # (B38 step 5: an actor process's own workers)
+    lab = None
+    if lab_on:   # 2026-10-08: the build lab's trainer side (tok_lab: LabBook, LabScheduler, LabModel)
+        from isaac_bridge.tok_lab import (JI as LAB_JI, LAB_JOBS, LabBook, LabModel, LabScheduler, load_items)
+        lab_items = load_items(args.lab_items or str(Path(__file__).resolve().parent.parent / 'abplus' / 'catalog' /
+                                                     'lab_items.json'))
+        mix = {k: float(v) for k, v in (kv.split('=') for kv in args.lab_mix.split(',') if kv.strip())}
+        first_builds = json.loads(Path(args.lab_builds).read_text()) if args.lab_builds else []
+        lab = dict(book=LabBook(len(lab_panel), args.lab_timeout),
+                   sched=LabScheduler(lab_items, args.seed, mix, first_builds, args.lab_noise, args.lab_max_items),
+                   model=LabModel(k=args.lab_model_k, device='cpu', seed=args.seed),
+                   out=open(out / 'lab.jsonl', 'a'), hist={}, pool_rng=np.random.default_rng([args.seed, 0x900D]),
+                   posted=0, preq=[], twin=[0, 0], loss=None)
+        (out / 'lab_panel.json').write_text(json.dumps(dict(groups=lab_names, states=lab_panel, owner=lab_owner),
+                                                       indent=0))
+
+        def post_lab_jobs():
+            """New jobs into free slots while fewer than --lab-inflight are open (the job id is written last)."""
+            now_ = time.time()
+            while len(lab['book'].open) < args.lab_inflight:
+                row_ = lab['sched'].make_job()
+                slot_ = int(row_[LAB_JI['job']]) % LAB_JOBS
+                if int(sampler.lab_jobs[slot_, 0]) in lab['book'].open:   # (only with --lab-inflight >= LAB_JOBS)
+                    break
+                sampler.lab_jobs[slot_, 1:] = row_[1:]
+                sampler.lab_jobs[slot_, 0] = row_[0]
+                lab['book'].post(row_, now_)
+                lab['posted'] += 1
+
+        def lab_learn(results):
+            """In the learner thread: the new build results (prequential prediction first, the twin check of
+            replicates, then into the model and lab.jsonl), the model's steps and its candidates for the scheduler."""
+            m_ = lab['model']
+            out_ = dict(lab_builds=len(results), lab_complete=sum(bool(r_.get('complete')) for r_ in results))
+            errs = []
+            for r_ in results:
+                pre = m_.prequential(r_)
+                if pre is not None:
+                    r_['pred'], r_['pred_sd'] = pre
+                    errs.append(abs(pre[0] - r_['ret']))
+                if r_['kind'] == 'replicate' and r_['flags'] in lab['hist'] and r_.get('per_state'):
+                    o_ = lab['hist'][r_['flags']]
+                    r_['of'] = dict(job=o_['job'], rep=o_['rep'], ret=o_.get('ret'))
+                    if o_['rep'] == r_['rep']:   # a twin: per state with the same weights the same game
+                        for s_, v_ in r_['per_state'].items():
+                            w_ = o_.get('per_state', {}).get(s_)
+                            if w_ is not None and v_[8] == v_[9] == w_[8] == w_[9]:
+                                lab['twin'][0] += 1
+                                lab['twin'][1] += int(v_[7] == w_[7])
+                m_.add(r_)
+                lab['hist'][r_['job']] = r_
+                lab['out'].write(json.dumps(dict(r_, update=L['update'])) + '\n')
+            if len(lab['hist']) > 6000:
+                for j_ in sorted(lab['hist'])[:1000]:
+                    del lab['hist'][j_]
+            lab['out'].flush()
+            if results:
+                lab['loss'] = m_.train(args.lab_model_steps)
+                sched_ = lab['sched']
+                ids_, act_ = sched_.ids, sched_.actives
+                pool, rng_ = [], lab['pool_rng']
+                while len(pool) < args.lab_pool:
+                    b_ = sorted(int(v) for v in rng_.choice(ids_, size=int(rng_.integers(2, args.lab_max_items + 1)),
+                                                            replace=False))
+                    if sum(i_ in act_ for i_ in b_) <= 1:
+                        pool.append(b_)
+                sched_.candidates = m_.rank(pool)[:64]
+            out_['lab_preq_abs'] = float(np.mean(errs)) if errs else ''
+            out_['lab_model_loss'] = lab['loss'] if lab['loss'] is not None else ''
+            out_['lab_cand_sd'] = lab['sched'].candidates[0][0] if lab['sched'].candidates else ''
+            out_['lab_twin_n'], out_['lab_twin_same'] = lab['twin']
+            out_['lab_model_rows'] = len(m_.rows)
+            return out_
+    capacity = args.rollout // args.workers * 4 + 64   # (per worker: the same in the actor and learner processes)
+    # (B30; B31: the per-decision K / V, s and o on the device, a pool of --rollout + 4 x workers rows: a rollout ends
+    # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
+    t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
+                 kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64, raw_rooms=bool(args.room_memory), rebuild_memory=bool(args.rebuild_memory)) if t_on else None
+    shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
+    #                                                                                   learner maps)
+    full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
+    if child is None:
+        roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared), \
+            Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared)
+        if n_act > 1 and actor is None:   # (the first actor: the shared arrays of all workers, its rows of them)
+            shared_full = SharedArrays()
+            full_rolls = [full_from_local(r_, args.workers, w_lo, shared_full) for r_ in (roll, spare)]
+        elif actor is not None:   # (another actor: its rows of the first one's arrays)
+            keep_full = []
+            full_rolls = [attach_arrays(actor['pid'], actor['full'][bid_], keep_full) for bid_ in range(2)]
+            for bid_, r_ in enumerate((roll, spare)):
+                slice_into(r_, full_rolls[bid_], w_lo)
+    else:
+        roll = spare = None
+
+    def teach_pending(meta):
+        """The action under way of teacher records from their meta (int64 [k, 16], numpy or a tensor): columns 0-2,
+        and with items the item / pill bits kept in column 15."""
+        if nh == 3:
+            return meta[:, :3]
+        if isinstance(meta, np.ndarray):
+            return np.concatenate([meta[:, :3], meta[:, 15:16] & 1, (meta[:, 15:16] >> 1) & 1], 1)
+        return torch.cat([meta[:, :3], meta[:, 15:16] & 1, (meta[:, 15:16] >> 1) & 1], 1)
+    # 2026-10-11 (memory): the GRU state per worker on the device (the actor's, shared by its graphs, the snapshots'
+    # and the eager path; rows zeroed at an episode's first record), and the teacher-v2 lanes' own table
+    mem_table = torch.zeros((n, mem_dim), device=device) if (mem_on and child is None) else None
+    # 2026-10-14 (B30): the temporal state per worker (shared like the GRU table; reset per slot at an episode's first
+    # record by the step itself)
+    t_state = TemporalState(model, n, device, torch.bfloat16 if args.temporal_kv == 'bf16' else torch.float32) \
+        if (t_on and child is None) else None
+    if t_state is not None and args.rebuild_memory:
+        print(f'memory rebuild: H-free Spatial; Reader D={args.temporal_width}, L={args.temporal_layers}; '
+              f'recent={args.temporal_window}, block={args.memory_block}, tokens/block={args.memory_tokens}; '
+              f'all completed blocks retained; source-cache={args.source_cache}; actor eager+incremental KV; '
+              f'actor refresh/{args.memory_refresh_updates} weight versions; '
+              f'learner micro={args.micro}, source-replay={args.source_replay}', flush=True)
+    elif t_state is not None:
+        print(f'temporal (B30): width {args.temporal_width} x {args.temporal_layers} layers x {args.temporal_heads} '
+              f'heads, window {args.temporal_window}, rooms {args.temporal_rooms}, learner chunks of {T_t} decisions '
+              + (f'(GRU chunks of {T_mem} inside)' if mem_on else '(no GRU: no nested chunks)')
+              + f', K / V {args.temporal_kv}; actor cache '
+              f'{t_state.kv.numel() * t_state.kv.element_size() / 2 ** 20:.0f} MiB', flush=True)
+    use_graphs = args.graph_entities > 0 and (bool(args.memory_graph) or not mem_on)
+    if mem_on:
+        print(f'memory: GRU size {mem_dim}, BPTT chunks of {T_mem} decisions (minibatch = {max(1, args.minibatch // T_mem)}'
+              ' chunks, --sort-micro off, --micro in whole chunks), actor inference '
+              + ('through CUDA graphs with the state table (GraphActor memory)' if use_graphs else
+                 'eager (--memory-graph 0 or --graph-entities 0)'), flush=True)
+    if itok_on or gtok_on:   # 2026-10-12 (B21 / B22)
+        print('extra tokens: ' + ', '.join(
+            ([f'item tokens ({item_slots + 4} per record, {item_slots} held slots)'] if itok_on else []) +
+            ([f'global token + value_global (gamma {args.gamma_global}, coef {args.vf_global_coef})']
+             if gtok_on else [])), flush=True)
+    # streams: the actor's calls go first on the GPU, the learner's kernels fill the rest. --actor-slots calls may be
+    # in flight at once, each on its own stream (one GraphActor each)
+    gkw = dict(bf16=bool(args.actor_bf16), compile_mode=args.actor_compile or None, fold=bool(args.actor_fold),
+               sdpa_math=bool(args.actor_sdpa_math),
+               row_sizes=[int(x) for x in args.actor_row_buckets.split(',') if x.strip()] or None)   # (B29; off)
+    g_ents = sorted({args.graph_entities} | {int(x) for x in args.graph_entities_extra.split(',') if x.strip()})
+    g_ents = g_ents[0] if len(g_ents) == 1 else g_ents
+    actors = [GraphActor(model, n, g_ents, stream=torch.cuda.Stream(priority=-5), crn=bool(args.branch_crn),
+                         memory=mem_table, temporal=t_state, **gkw)
+              for _ in range(max(1, args.actor_slots))] if (use_graphs and child is None) else []
+    free = list(actors)
+    # 2026-10-10 (teacher v2): the workers' lanes are answered by a GraphActor of their own (the actor's weights; the
+    # lane records never enter the rollout); the eager path for what it cannot take
+    # B34 (2026-10-16): the lanes, the V2 ring and its loss serve the counterfactual teacher (--cf) too
+    v2_on = bool(args.teacher_v2 or args.cf) and getattr(sampler, 'lane_rows', None) is not None
+    cf_on = bool(args.cf) and v2_on
+    lane_table = torch.zeros((n, mem_dim), device=device) if (mem_on and v2_on and child is None) else None
+    # B34 (temporal models): the lanes' own temporal state (a slot per worker: a branch starts from a copy of its
+    # point's snapshot, TemporalState.copy_slot_, or a reset state), the bank of the choice points' snapshots (the
+    # worker's main slot before the point's record, copied when the worker asks: cf_snap) and device rows for the lane
+    # steps' outputs (GraphActor tdest: o_t goes back to the worker with o_{t-1} and has for the imitation records)
+    lane_tstate = bank_tstate = lane_tdest = None
+    if t_on and v2_on and child is None:
+        t_kdt = torch.bfloat16 if args.temporal_kv == 'bf16' else torch.float32
+        lane_tstate = TemporalState(model, n, device, t_kdt)
+        lane_tdest = dict(kv=torch.zeros((n, args.temporal_layers, 2, args.temporal_width), dtype=t_kdt, device=device),
+                          s=torch.zeros((n, args.temporal_width), dtype=t_kdt, device=device),
+                          o=torch.zeros((n, args.temporal_width), device=device), obase=0)
+        if cf_on:
+            from isaac_bridge.tok_cf import bank_rows
+            bank_tstate = TemporalState(model, n * bank_rows(cfg), device, t_kdt)
+        print(f'lanes (B34): temporal state per lane ({lane_tstate.kv.numel() * lane_tstate.kv.element_size() / 2 ** 20:.0f}'
+              f' MiB)' + (f', choice-point snapshot bank {n} x {bank_rows(cfg)} rows '
+                          f'({bank_tstate.kv.numel() * bank_tstate.kv.element_size() / 2 ** 20:.0f} MiB)'
+                          if bank_tstate is not None else ''), flush=True)
+    lkw = dict(gkw)   # B36: the lane actor's own row buckets (--cf-lane-buckets; '': the actor's)
+    if args.cf_lane_buckets.strip() and gkw['fold']:
+        lkw['row_sizes'] = [int(x) for x in args.cf_lane_buckets.split(',') if x.strip()]
+    lane_actor = GraphActor(model, n, g_ents, stream=torch.cuda.Stream(priority=-5), crn=False,
+                            memory=lane_table, temporal=lane_tstate, **lkw) \
+        if (v2_on and use_graphs and child is None) else None
+
+    def mem_rows(table, idx, reset):
+        """(memory) the GRU states of workers idx from a table (zero where reset, a bool array, is set)."""
+        h = table.index_select(0, torch.from_numpy(np.ascontiguousarray(idx, np.int64)).to(device))
+        if reset is not None and np.any(reset):
+            h = h * torch.from_numpy(~np.asarray(reset, bool)).to(device).float()[:, None]
+        return h
+    lane_stat = dict(calls=0, rows=0, s=0.0, fly_s=0.0, held_s=0.0, eager=0)
+    lanes = None
+    if v2_on and child is None:   # B36: the lanes' service (isaac_bridge/tok_lanes.py): batched, a wait window, asynchronous
+        from isaac_bridge.tok_lanes import LaneService
+        lanes = LaneService(sampler, model, device, nh, actor=lane_actor, table=lane_table, tstate=lane_tstate,
+                            bank=bank_tstate, tdest=lane_tdest, gtok=gtok_on, wait=args.cf_lane_wait,
+                            quiet=args.cf_lane_quiet, ukeys=bool(args.cf_lane_ukeys), async_=bool(args.cf_lane_async),
+                            version=lambda: version, stat=lane_stat)
+    inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
+    actor_stream = torch.cuda.Stream(priority=-5)
+    # (B38 step 2: the actor's process of a learner process never touches the learner's GPU)
+    actor_only = proc and child is None
+    learner_stream = None if actor_only else (torch.cuda.Stream(device=ldev, priority=0) if split else
+                                              torch.cuda.Stream(priority=0))
+    torch.cuda.synchronize()
+    if split and not actor_only:
+        torch.cuda.synchronize(ldev)
+    torch.cuda.set_stream(actor_stream)
+    # B38 (--learner-device): the hand-off's copy of a rollout's temporal tensors to the learner's GPU (mirror_temporal:
+    # issued by the actor thread on a stream pair of its own, the learner waits on the event; the next hand-off comes
+    # only after the update that read the mirror has synchronised its stream, so one mirror suffices) and the weights'
+    # way back (take_weights: the learner's parameters gathered as bytes into one buffer on its GPU, one peer copy, the
+    # actor's parameters written from it by a foreach copy on the actor's stream)
+    # B38 step 2 (--learner-process 1): the learner process writes the weights' bytes into a buffer on the actor's GPU
+    # (wmove['fa'], shared with it through CUDA IPC) and announces them; take_weights copies them into the parameters
+    lmirror, hand_streams, wmove = {}, None, None
+    if split and child is None:
+        if proc:
+            wmove = weight_mover(actor_params, None)
+            if wmove is None:
+                p.error('--learner-process 1: the actor\'s parameters must be contiguous (weight_mover)')
+        else:
+            hand_streams = (torch.cuda.Stream(device=device), torch.cuda.Stream(device=ldev))
+            wmove = weight_mover(actor_params, ldev)
+        msg = (f'learner device (B38): {ldev}; weights '
+               f'{sum(a.numel() * a.element_size() for a in actor_params) / 2 ** 20:.1f} MiB per take_weights '
+               f'({"a buffer the learner process writes" if proc else "one flat peer copy" if wmove else "per-tensor copies"})')
+        if t_on:   # (K / V per layer + o per row; the exact bytes per update: progress.csv handoff_mb)
+            row_b = args.temporal_layers * 2 * args.temporal_width * (2 if args.temporal_kv == 'bf16' else 4) + \
+                4 * args.temporal_width
+            msg += (f'; hand-off {row_b} bytes per temporal row, about '
+                    f'{(args.rollout + args.workers * (args.temporal_window - 1)) * row_b / 2 ** 20:.0f} MiB per update')
+        print(msg, flush=True)
+
+    # ------------------------------------------------------------------ learner (its own thread and CUDA stream)
+    teach_gpu = bool(args.teach_gpu)
+    # 2026-10-06 (host memory): with --teach-gpu 1 the teacher's records are read from their bytes on the GPU, and the
+    # host keeps only their entity and door counts (the minibatch planning reads them); the full host copy (--teach-
+    # buffer x ROW, about 0.85 GB at 60,000) filled up over the first ~1,000 game hours. --teach-gpu 0: as before.
+    # 2026-10-14 (B24): the packed layouts plan the real item tokens on the host from their count (item_count)
+    NI_f, G_f = learner_model.extra_tokens()
+    host_teach = ROW if not teach_gpu else np.dtype([('n_ent', ROW.fields['n_ent'][0]),
+                                                     ('n_doors', ROW.fields['n_doors'][0])] +
+                                                    ([('n_item', np.int16)] if NI_f else []))
+    L = dict(update=update, decisions=decisions_total, seconds=seconds_total, writer=None, t_end=None,
+             teach_rows=np.zeros((args.teach_buffer,), host_teach) if args.teacher else None,
+             teach_meta=np.zeros((args.teach_buffer, 16), np.int64), teach_n=0, teach_at=0, teach_rate=None,
+             dumped=0, teach_raw=None)
+    if branching:   # 2026-10-07: the choice records' ring on the host (the choice-value head will read it)
+        from isaac_bridge.tok_branch import CHOICE_META, decode_meta, parse_weights
+        b_weights = parse_weights(args.branch_weights)
+        L.update(choice_rows=np.zeros((args.choice_buffer,), ROW),
+                 choice_meta=np.zeros((args.choice_buffer, CHOICE_META), np.float64),
+                 choice_version=np.zeros(args.choice_buffer, np.int64), choice_n=0, choice_at=0)
+        # Phase B2: per choice record its labels (tok_branch.take_labels: one D per pair, NaN where none), their
+        # replicate codes, the collectible, the kind, the sign turning D into own - alternative, the held-out flag and
+        # the K heads' bootstrap weights (Poisson(1), drawn at arrival with a generator of their own)
+        from isaac_bridge.tok_branch import BRANCH_MAX, HI as C_HI, KIND_ITEM, KIND_ITEM_LEFT, take_labels
+        PMAX = BRANCH_MAX // 2
+        L.update(c_lab=np.full((args.choice_buffer, PMAX), np.nan, np.float32),
+                 c_rep=np.full((args.choice_buffer, PMAX), -1, np.int8), c_item=np.zeros(args.choice_buffer, np.int64),
+                 c_kind=np.zeros(args.choice_buffer, np.int8), c_sign=np.zeros(args.choice_buffer, np.float32),
+                 c_hold=np.zeros(args.choice_buffer, bool),
+                 c_boot=np.ones((args.choice_buffer, max(n_choice, 1)), np.float32), noise={})
+        crng = np.random.default_rng([args.seed, 77])
+    if args.teacher_v2 or args.cf:   # 2026-10-10 (teacher v2; B34: and the cf's): the imitation records' ring (bytes
+        #                              and per-record targets on the GPU, entity / door counts on the host for the
+        #                              minibatch planning)
+        from isaac_bridge.tok_teacher2 import VI as V2I, teacher_v2_loss
+        L.update(v2_cnt=np.zeros((args.teacher_v2_buffer,), np.dtype([('n_ent', ROW.fields['n_ent'][0]),
+                                                                       ('n_doors', ROW.fields['n_doors'][0])] +
+                                                                      ([('n_item', np.int16)] if NI_f else []))),
+                 v2_n=0, v2_at=0, v2_rate=None, v2_raw=None,
+                 # B34: per record (host) has (the lane's step had an earlier one: the history token of a packed plan)
+                 v2_has=np.zeros(args.teacher_v2_buffer, bool))
+        from isaac_bridge.tok_teacher2 import KIND_CF
+        from isaac_bridge.tok_cf import TRIGGERS as CF_TRIGGERS, t_split
+        v2_rng = np.random.default_rng([args.seed, 0x7E2])   # its own: the teacher's draws stay as without
+    target_decisions = decisions_total + int(args.game_hours / hours_per_decision)
+    start_decisions = decisions_total
+
+    source_pipeline = None
+
+    def ensure_source_pipeline():
+        nonlocal source_pipeline
+        if not args.source_devices or source_pipeline is not None: return
+        from isaac_bridge.source_pipeline import SourcePipeline
+        parts = set(os.environ.get('ISAAC_RL_LEARNER_PARTS', 'math,ekeep,buckets,nhwc,ln,dedup,logp,raw').split(',')) if args.learner_fast else set()
+        learner_model.set_math_attention('math' in parts, nhwc='nhwc' in parts, ln='ln' in parts)
+        source_devices = [torch.device(d.strip()) for d in args.source_devices.split(',')]
+        if device in source_devices:
+            raise ValueError('source GPUs must be separate from learner')
+        shared = args.actor_devices.split(',') if args.actor_devices else [str(device_actor)]
+        source_pipeline = SourcePipeline(learner_model, source_devices, period=args.source_update_steps,
+            micro=args.room_source_micro, amp=amp if args.source_amp == 'auto' else args.source_amp == 'bf16',
+            version=source_version, saved_gpu_gb=args.source_saved_gpu_gb, saved_cpu_gb=args.source_saved_cpu_gb,
+            saved_8bit=args.source_saved_8bit,
+            compile_source=args.source_compile, flash_source=bool(args.source_flash),
+            update_rollouts=args.source_update_rollouts, shared_devices=shared,
+            actor_reserve_gb=args.source_actor_reserve_gb,processes=bool(args.source_processes),
+            defer_backward=bool(args.source_prefetch_records))
+        print(f'[source] encoder/Writer={"bf16" if source_pipeline.amp else "fp32"}; '
+              f'Reader={"bf16" if amp else "fp32"}; master/optimizer=fp32; saved_8bit_block={args.source_saved_8bit}', flush=True)
+
+    def save(path):
+        if source_pipeline is not None:
+            source_pipeline.finish(opt,args.max_grad_norm)
+        torch.save(dict(model=learner_model.state_dict(), optimizer=opt.state_dict(), update=L['update'],
+                        decisions=L['decisions'], seconds=L['seconds'], config=learner_model.config, args=vars(args),
+                        source_version=source_pipeline.version if source_pipeline is not None else source_version,
+                        **(dict(choice_optimizer=copt.state_dict()) if copt is not None else {})),
+                   path)
+
+    b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
+    # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
+    # --learner-compile, the same module and parameters)
+    lm_call = learner_model
+    if args.learner_compile and not args.rebuild_memory and (child is not None or not proc):
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = int(os.environ.get('ISAAC_RL_B38_COMPILE_CACHE', '64'))
+        lm_call = torch.compile(learner_model, mode=args.learner_compile, dynamic=True)
+
+    def pmark(name, prev=None):
+        """(B38 step 4, only with ISAAC_RL_B38_TORCHPROF) end the profiler region prev, open one called name."""
+        if prev is not None:
+            prev.__exit__(None, None, None)
+        if not b38_marks or name is None:
+            return None
+        m__ = torch.profiler.record_function(name)
+        m__.__enter__()
+        return m__
+
+    def learn(job):
+        """One PPO update on a full rollout; signals `fresh` as soon as the new weights are final, then logs."""
+        nonlocal source_pipeline
+        # B38: every tensor of the update on the learner's GPU (`device` below is the learner's; the actor's is adev;
+        # without --learner-device they are one)
+        adev, device = device_actor, ldev
+        t0 = time.perf_counter()
+        if args.rebuild_memory and PROFILE_MEMORY:
+            MEMORY_TIMES.clear(); MEMORY_COUNTS.clear()
+        U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
+                          (('temporal',) if t_on else ()), 0.0)   # seconds per part of the update (u_* columns)
+        if t_on and getattr(job['roll'], 't_kv', None) is None:
+            raise RuntimeError('--temporal 1: the rollout has no temporal arrays (a bench job of a run without it?)')
+        mark = [t0]
+        cpu0 = cpu_ticks()
+
+        def sec(name):
+            if PROFILE:
+                torch.cuda.current_stream().synchronize()
+            now_ = time.perf_counter()
+            U[name] += now_ - mark[0]
+            mark[0] = now_
+        rl = job['roll']
+        if job.get('lroll') is not None:   # B38: the rollout's mirror on this GPU; its copy done before any read
+            rl = job['lroll']
+            torch.cuda.current_stream().wait_event(job['lready'])
+        if split and t_on and rl.t_kv.device != device:   # (B38: never; every hand-off makes the mirror)
+            raise RuntimeError(f'--learner-device: the rollout is on {rl.t_kv.device}, the learner on {device}')
+        lengths = rl.length
+        # 2026-10-10 (B18, --learner-fast 1): the same update with about half the GPU and host work per step
+        # (EXPERIMENTS.md B18). math: attention as float32 matrix products, all length buckets of a layer in one
+        # autograd node (TokPolicy _MathAttention / _BucketAttention); buckets: attention per bucket of records with
+        # similar token counts, each record's real tokens only (learner_plan / plan_tokens: the positions planned per
+        # record on the host, expanded on the GPU); ekeep: the entity and door input mlps on the real tokens only, the
+        # packed tokens built from them; dedup: the room / map / patch CNNs on a minibatch's distinct grids
+        # (distinct_ids once per update); nhwc: channels-last convolutions; ln: the packed layer norms' weight
+        # gradients as column sums; logp: the heads' log-softmax side by side; raw: a minibatch gathered as record
+        # bytes. Always with it: the records staged in a pinned buffer, the teacher's meta read from a copy on the GPU
+        # (no blocking copy per step), the fused Adam. Not bit-identical to 0 (another summation order):
+        # abplus_bench_learner.py --check, abplus_check_learner_fp64.py.
+        fast = bool(args.learner_fast)
+        fast2 = args.learner_fast >= 2   # (B38 step 4)
+        # (ISAAC_RL_LEARNER_PARTS: a subset of the parts, for the bench's attribution; default all)
+        fparts = set(os.environ.get('ISAAC_RL_LEARNER_PARTS', 'math,ekeep,buckets,nhwc,ln,dedup,logp,raw').split(',')
+                     if fast else ())
+        learner_model.set_math_attention('math' in fparts, nhwc='nhwc' in fparts, ln='ln' in fparts)
+        ensure_source_pipeline()
+        if source_pipeline is not None:
+            source_pipeline.events.clear()
+            source_pipeline.reader_events.clear()
+            if source_pipeline.pending is not None:
+                commit_start=time.perf_counter()
+                source_pipeline.poll_finish(opt,args.max_grad_norm)
+                print('SOURCE_COMMIT_POLL '+json.dumps(dict(version=source_pipeline.version,
+                      wait_seconds=time.perf_counter()-commit_start,
+                      worker_seconds={e['device']:e['end']-e['start'] for e in source_pipeline.events
+                                      if e['kind']=='source_backward'})),flush=True)
+        if fast2:   # (B38 step 4: the CNNs' distinct grids in batches of a multiple of 64: cuDNN plans reused)
+            learner_model.cnn_bucket = int(os.environ.get('ISAAC_RL_B38_CNN_BUCKET', '64'))
+            if os.environ.get('ISAAC_RL_B38_CUDNN_BENCH') == '1':   # (a measurement aid: cuDNN's autotuner)
+                torch.backends.cudnn.benchmark = True
+        n_buckets = int(os.environ.get('ISAAC_RL_LEARNER_BUCKETS', '3'))   # (at most; a measurement aid)
+        raw_mode = 'raw' in fparts and teach_gpu and bool(args.teach_merge)   # (B18: minibatches gathered as bytes)
+        if L['dumped'] < args.dump_rollouts:   # the rollout and the learner's weights before this update
+            L['dumped'] += 1
+            m = int(lengths.max())
+            (out / 'rollouts').mkdir(exist_ok=True)
+            stem = out / 'rollouts' / f'rollout-{L["update"]:06d}'
+            np.savez(str(stem) + '.npz', **{k: getattr(rl, k)[:, :m] for k in (
+                'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version')},
+                **({'value_g': rl.value_g[:, :m]} if getattr(rl, 'value_g', None) is not None else {}),
+                length=rl.length, open=rl.open, update=L['update'])
+            torch.save(dict(model=learner_model.state_dict(), config=learner_model.config, update=L['update']),
+                       str(stem) + '.pt')
+            t0 = time.perf_counter()
+            mark[0] = t0
+        all_flat = (np.arange(n)[:, None] * capacity + np.arange(capacity)[None, :])[
+            np.arange(capacity)[None, :] < lengths[:, None]]
+        if source_pipeline is not None:
+            all_requests = rollout_requests(rl, all_flat)
+            retire_after_ready=source_pipeline.defer_backward
+            source_pipeline.prefetch_live.pop(job.get('seq'),None)
+            live_uids = {h.uid for h, _, _ in all_requests}
+            live_uids.update(h.uid for h in L.get('v2_contexts', []) if h is not None)
+            live_uids.update(h.uid for h in L.get('teach_contexts', []) if h is not None)
+            if source_pipeline.prefetch_pressure:
+                # Backpressure, not another Adam clock: settle the already
+                # closed packet so dead graphs retire before required inputs.
+                source_pipeline.poll_finish(opt,args.max_grad_norm,wait=True)
+                source_pipeline.prefetch_pressure=False
+                retire_after_ready=False
+            if not retire_after_ready:source_pipeline.retain_histories(live_uids)
+            # Source values are immutable across fast/slow weight updates. Build
+            # the rollout's numerical bank once; only Reader graphs are renewed.
+            with torch.inference_mode(False), torch.no_grad(), autocast():
+                resident_sources=SourceBatch(learner_model,all_requests,args.room_source_micro,
+                                             cache=False,pipeline=source_pipeline)
+        value_now = every = prox = None
+        vgs, vg_now, ret_g = [], None, None   # (B22) value_global at the update's start, its returns
+        # 2026-10-14 (B24): the actor's stored value_global (Rollout.value_g) is used like the stored value: recomputed
+        # only with --recompute-values; a rollout without it (a bench job) gets a pass of its own, as before
+        vg_stored = getattr(rl, 'value_g', None) if gtok_on else None
+        if (recompute or args.decoupled) and len(all_flat):
+            # the values the advantages need (and with --decoupled the log-probabilities of the stored actions), from
+            # the weights at the start of this update
+            value_now = rl.value.copy()
+            if fast2:   # (B38 step 4: staged in pinned memory, one asynchronous copy, the bytes kept for the parts)
+                if L.get('stage_r') is None or L['stage_r'].shape[0] < len(all_flat):
+                    L['stage_r'] = None
+                    L['stage_r'] = torch.empty((int(len(all_flat) * 1.25) + 64, ROW_BYTES),
+                                               dtype=torch.uint8).pin_memory()
+                every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
+                                                      stage=L['stage_r'], with_raw=True)
+                fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on)
+            else:
+                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
+            acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
+            # (memory: one GRU step from each decision's stored input state)
+            h_all = torch.from_numpy(rl.h.reshape(-1, mem_dim)[all_flat]).to(device) if mem_on else None
+            # (B30: the readout from each decision's stored o_t, the history token from its stored o_{t-1}, as the GRU
+            # from its stored input state)
+            t_all = temporal_rows(rl, all_flat, capacity, device) if t_on else None
+
+            current_sources = None
+            if source_pipeline is not None:current_sources=resident_sources
+            if args.rebuild_memory and source_pipeline is None:
+                with torch.inference_mode(), autocast():
+                    current_sources = SourceBatch(learner_model, rollout_requests(rl, all_flat),
+                                                  args.room_source_micro, cache=False)
+
+            def tk_all(part_):
+                if current_sources is not None:
+                    return dict(temporal=dict(source_batch=current_sources,
+                                source_indices=part_))
+                return dict(temporal=dict(mode='stored', o=t_all['o'][part_], o_prev=t_all['o_prev'][part_],
+                                          has=t_all['has'][part_])) if t_on else {}
+            vals, lps = [], []
+            m_r = pmark('b38:recompute')
+            with torch.inference_mode():
+                chunk = args.micro or args.minibatch
+                for at in range(0, len(all_flat), chunk):
+                    part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
+                    b_p = fast_plan_rows(fr_, raw_e, pend_e, at, min(at + chunk, len(all_flat)), fparts, n_buckets,
+                                         NI_f, G_f, t_on) if fast2 else None
+                    if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
+                        b_p = take(every, part) if b_p is None else b_p
+                        with autocast():
+                            o_ = lm_call(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
+                                               need_vg=True, **tk_all(part))
+                        lp_ = learner_model.log_prob(o_[0], learner_model.gate(b_p), acts_all[part])[0]
+                        v_ = o_[1].float()
+                        vgs.append(o_[-1].float())
+                    else:
+                        with autocast():
+                            lp_, _, v_, _ = learner_model.evaluate(take(every, part) if b_p is None else b_p,
+                                                                   acts_all[part],
+                                                                   packed=bool(args.packed),
+                                                                   mem=h_all[part] if mem_on else None, **tk_all(part))
+                    vals.append(v_)
+                    lps.append(lp_)
+            if recompute:
+                value_now.reshape(-1)[all_flat] = torch.cat(vals).cpu().numpy()
+            else:
+                value_now = None
+            prox_all = torch.cat(lps)
+            pmark(None, m_r)
+            sec('recompute')
+            current_sources = None
+        if gtok_on and len(all_flat) and vg_stored is not None and not vgs:   # (B24) the actor's values, as stored
+            vg_now = vg_stored
+            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now)
+            del adv_g
+        elif gtok_on and len(all_flat):   # 2026-10-12 (B22): value_global of every stored decision, for its returns
+            vg_now = np.zeros_like(rl.value)
+            if not vgs:   # (no recompute pass: one of its own, a chunk of records at a time)
+                with torch.inference_mode():
+                    chunk = args.micro or args.minibatch
+                    for at in range(0, len(all_flat), chunk):
+                        idx_ = all_flat[at:at + chunk]
+                        tk_ = {}
+                        if t_on:   # (B30: from the stored outputs, as the recompute pass)
+                            t_p = temporal_rows(rl, idx_, capacity, device)
+                            tk_ = dict(temporal=dict(mode='stored', o=t_p['o'], o_prev=t_p['o_prev'], has=t_p['has']))
+                        with autocast():
+                            if args.rebuild_memory:
+                                fallback_sources = SourceBatch(learner_model, rollout_requests(rl, idx_),
+                                                               args.room_source_micro, cache=False)
+                                tk_ = dict(temporal=dict(source_batch=fallback_sources, source_indices=np.arange(len(idx_))))
+                            o_ = learner_model(rows_to_device(rl.rows, idx_, rl.pending.reshape(-1, nh)[idx_], device),
+                                               packed=bool(args.packed), need_vg=True,
+                                               mem=torch.from_numpy(rl.h.reshape(-1, mem_dim)[idx_]).to(device)
+                                               if mem_on else None, **tk_)
+                        vgs.append(o_[-1].float())
+            vg_now.reshape(-1)[all_flat] = torch.cat(vgs).cpu().numpy()
+            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now)
+            del adv_g
+            sec('recompute')
+        adv, ret, mask = gae(rl, args.gamma, args.lam, value_now)
+        if branching and not args.branch_ppo:   # 2026-10-07: the branch episodes' decisions left out of PPO
+            mask &= rl.rows['branch'] == 0
+        if lab_on and not args.lab_ppo:   # 2026-10-08: the lab episodes' decisions left out of PPO
+            mask &= rl.rows['lab'] == 0
+        sec('gae')
+        lw = None   # (memory / temporal) per row of flat: 1 = trained, 0 = only stepped through (or padding)
+        if chunked:   # 2026-10-11 (memory): every worker's decisions in chunks of T_mem (memory_chunks), chunk-major
+            # (B30 temporal: chunks of T_t decisions per worker, each padded to whole GRU chunks of T_mem; B32 without
+            # the GRU: the temporal chunks alone, unpadded)
+            mplan = temporal_chunks(rl.length, mask, T_t, T_mem if mem_on else None) if t_on else \
+                memory_chunks(rl.length, mask, T_mem)
+            flat, lw = mplan['pos'], mplan['weight']
+            count = int(lw.sum())
+        else:
+            flat = np.flatnonzero(mask.reshape(-1))
+            count = len(flat)
+        frac = min(1.0, (L['decisions'] - start_decisions) / max(1, target_decisions - start_decisions))
+        lr = args.lr + (args.lr_final - args.lr) * frac
+        for g in opt.param_groups:
+            g['lr'] = lr
+        if every is not None and fast2:   # (B38 step 4: the records' bytes from the start-of-update pass)
+            pos = torch.from_numpy(np.searchsorted(all_flat, flat)).to(device)
+            raw_all, pend_all = raw_e.index_select(0, pos), pend_e.index_select(0, pos)
+            batch = decode_rows(raw_all, pend_all)
+            if args.decoupled:
+                prox = prox_all[pos].clone()
+            del every, prox_all, raw_e, pend_e
+        elif every is not None:   # the decisions with a reward, out of the records already on the device
+            pos = torch.from_numpy(np.searchsorted(all_flat, flat)).to(device)
+            batch = take(every, pos)
+            raw_mode = False   # (B18: no record bytes here; the fields are gathered as before)
+            if args.decoupled:
+                prox = prox_all[pos].clone()
+            del every, prox_all
+        else:
+            stage = None
+            if fast:   # B18: gathered into a pinned buffer kept between updates, copied asynchronously
+                if L.get('stage') is None or L['stage'].shape[0] < len(flat):
+                    L['stage'] = None
+                    L['stage'] = torch.empty((int(len(flat) * 1.25) + 64, ROW_BYTES), dtype=torch.uint8).pin_memory()
+                stage = L['stage']
+            batch = rows_to_device(rl.rows, flat, rl.pending.reshape(-1, nh)[flat], device, stage=stage,
+                                   with_raw=fast)
+            if fast:   # (B18: a minibatch's records are gathered as bytes, the fields are views of them)
+                batch, raw_all, pend_all = batch
+        b_act =torch.from_numpy(rl.actions.reshape(-1, nh)[flat]).to(device)
+        b_logp = torch.from_numpy(rl.logp.reshape(-1)[flat]).to(device)
+        b_adv = torch.from_numpy(adv.reshape(-1)[flat]).to(device)
+        b_ret = torch.from_numpy(ret.reshape(-1)[flat]).to(device)
+        used_value = rl.value if value_now is None else value_now
+        b_val = torch.from_numpy(used_value.reshape(-1)[flat]).to(device)
+        glob_loss = ret_g is not None   # (B22) value_global's returns and its update-start values
+        if glob_loss:
+            b_ret_g = torch.from_numpy(ret_g.reshape(-1)[flat]).to(device)
+            b_vg = torch.from_numpy(vg_now.reshape(-1)[flat]).to(device)
+        gacc = torch.zeros(1, device=device)   # (B22) value_global's loss (sums over steps)
+        # 2026-10-13 (B23): the forced decisions of the batch (ROW pforce > 0; tok_pickup) and the imitation term's sum
+        pf_share = 0.0
+        b_pf = None
+        if pf_on:
+            pf_np = rl.rows['pforce'].reshape(-1)[flat] > 0
+            b_pf = torch.from_numpy(pf_np).to(device)
+            pf_share = float((pf_np * lw).sum() / max(count, 1)) if lw is not None else \
+                (float(pf_np.mean()) if len(pf_np) else 0.0)
+        pacc = torch.zeros(1, device=device)
+        if lw is None:
+            stale = float((rl.version.reshape(-1)[flat] < L['update']).mean()) if count else 0.0
+            reward_mean = float(rl.reward.reshape(-1)[flat].mean())
+        else:   # (memory / temporal: over the trained rows only)
+            stale = float(((rl.version.reshape(-1)[flat] < L['update']) * lw).sum() / max(count, 1))
+            reward_mean = float((rl.reward.reshape(-1)[flat] * lw).sum() / max(count, 1))
+            b_w = torch.from_numpy(lw).to(device)
+            if mem_on:   # (the GRU: episode starts inside its chunks, each chunk's first state)
+                b_reset = torch.from_numpy(rl.rows['first'].reshape(-1)[flat] != 0).to(device)
+                b_h0 = torch.from_numpy(rl.h.reshape(-1, mem_dim)[mplan['start']]).to(device)
+            ev_rows = torch.from_numpy(np.flatnonzero(lw > 0)).to(device)
+        tch = TD = t_rows = has_h = None
+        if t_on:   # 2026-10-14 (B30): per temporal chunk its context, room tokens; per row its stored o_{t-1}, episode
+            # (B31: index plans only; the K / V and o stay on the device where the actor wrote them)
+            t_t0 = time.perf_counter()
+            tch = mplan['tch']
+            TD = temporal_inputs(rl, tch)
+            t_rows = temporal_rows(rl, flat, capacity, device)
+            has_h = rl.t_step[flat // capacity, rl.tP + flat % capacity] > 0   # (the history token's presence, host)
+            if PROFILE:
+                torch.cuda.current_stream().synchronize()
+            U['temporal'] += time.perf_counter() - t_t0
+        sec('batch')
+        acc = torch.zeros(5, device=device)        # pg, vf, ent, kl, clipped (sums over steps, on the GPU)
+        tacc = torch.zeros(3, device=device)       # teach, danger, safe_mass
+        steps = teach_steps = 0
+        teach_new, teach_step, safe_new = 0, 0, 0.0
+        teach_rows, teach_meta = L['teach_rows'], L['teach_meta']
+        if teach_rows is not None:
+            new_rows, new_meta = job['teach']
+            teach_new = len(new_rows)
+            if teach_new:   # the policy's mass on the safe moves of records it has not been trained on
+                with torch.inference_mode():
+                    meta = torch.from_numpy(new_meta.astype(np.int64)).to(device)
+                    with autocast():
+                        lg = learner_model(to_batch(new_rows, teach_pending(new_meta.astype(np.int64)), device),
+                                         packed=bool(args.packed))[0]
+                    mass = torch.logsumexp(torch.log_softmax(lg.float()[:, :9], -1)
+                                           .masked_fill(meta[:, 3:12] > 0, -1e9), -1).exp()
+                    has = meta[:, 14] > 0
+                    safe_new = float((mass * has).sum() / has.sum().clamp(min=1))
+            L['teach_rate'] = teach_new if L['teach_rate'] is None else 0.9 * L['teach_rate'] + 0.1 * teach_new
+            planned = args.epochs * max(1, len(flat) // args.minibatch)
+            teach_step = int(min(args.teach_batch, args.teach_reuse * L['teach_rate'] / planned))
+            at_ = (L['teach_at'] + np.arange(teach_new)) % args.teach_buffer   # the ring positions, in order
+            if teach_new:
+                if args.rebuild_memory:
+                    if 'teach_contexts' not in L: L['teach_contexts']=[None]*args.teach_buffer
+                    for slot in at_: L['teach_contexts'][slot]=RawHistory.empty()
+                    if source_pipeline is not None and args.teach_merge:
+                        # Queue all newly admitted teacher sources before the
+                        # closed VJP packet. Sampling a different teacher in a
+                        # later minibatch must not place Reader's prerequisite
+                        # behind a long historical backward on the same FIFO.
+                        teacher_requests=list(zip((L['teach_contexts'][i] for i in at_),
+                                                  new_rows,teach_pending(new_meta)))
+                        source_pipeline.prefetch(teacher_requests,
+                            stateless={h.uid for h,_,_ in teacher_requests})
+                if teach_gpu:   # (field by field: the host keeps the counts only)
+                    teach_rows['n_ent'][at_], teach_rows['n_doors'][at_] = new_rows['n_ent'], new_rows['n_doors']
+                    if NI_f:   # (B24)
+                        teach_rows['n_item'][at_] = item_count(new_rows, item_slots)
+                else:
+                    teach_rows[at_] = new_rows
+                teach_meta[at_] = new_meta
+                if teach_gpu:   # the same records as bytes on the device (the teacher's minibatches gather there)
+                    if L['teach_raw'] is None:
+                        L['teach_raw'] = torch.zeros((args.teach_buffer, ROW_BYTES), dtype=torch.uint8, device=device)
+                    L['teach_raw'][torch.from_numpy(at_).to(device)] = torch.from_numpy(
+                        np.ascontiguousarray(new_rows).view(np.uint8).reshape(teach_new, ROW_BYTES)).to(device)
+            L['teach_at'] = (L['teach_at'] + teach_new) % args.teach_buffer
+            L['teach_n'] = min(L['teach_n'] + teach_new, args.teach_buffer)
+            sec('teach_new')
+        teach_n = L['teach_n']
+        # 2026-10-10 (teacher v2): the new imitation records into the ring, and what the policy and the value head
+        # say on them before this update trains on them (v2_prior: log pi of the move at a best branch's first record)
+        v2_new, v2_step, v2_log = 0, 0, {}
+        vacc = torch.zeros(3, device=device)   # teacher v2: mean(-w logp), mean((V - G)^2), mean(logp) (sums)
+        v2_steps = 0
+        if v2_on and job.get('v2') is not None:
+            got_v = job['v2']   # (rows, meta[, GRU input states (memory)][, temporal outputs (B34, temporal)])
+            v_contexts = got_v[-1] if args.rebuild_memory else None
+            got_v = got_v[:-1] if args.rebuild_memory else got_v
+            v_rows, v_meta = got_v[:2]
+            v_hs = got_v[2] if mem_on else None
+            v_ts = got_v[-1] if (t_on and got_v[-1].shape[-1] == 2 * args.temporal_width + 2) else None
+            v2_new = len(v_rows)
+            B_ = args.teacher_v2_buffer
+            if v2_new:
+                pend_v = v_meta[:, V2I['pend0']:V2I['pend0'] + nh].astype(np.int64)
+                act_v = v_meta[:, V2I['act0']:V2I['act0'] + nh].astype(np.int64)
+                G_v = v_meta[:, V2I['ret']].astype(np.float32)
+                first_v = v_meta[:, V2I['j']] == 0
+                is_cf = v_meta[:, V2I['kind']] == KIND_CF   # B34: the counterfactual teacher's records
+                if v_ts is not None:   # B34 (temporal): each record's stored lane outputs (o_prev, has, o, valid)
+                    v_op, v_has, v_o = t_split(v_ts, args.temporal_width)
+                    v_valid = v_ts[:, -1] > 0.5
+                    v_has = v_has & v_valid
+                v_sources = None
+                if args.rebuild_memory:
+                    with torch.inference_mode(False), torch.no_grad(), autocast():
+                        v_sources = SourceBatch(learner_model, list(zip(v_contexts, v_rows, pend_v)),
+                                                args.room_source_micro, cache=False,pipeline=source_pipeline)
+                lp_all, lp_mv, val_v = [], [], []
+                with torch.inference_mode():
+                    for at in range(0, v2_new, 512):
+                        b_ = to_batch(v_rows[at:at + 512], pend_v[at:at + 512], device)
+                        tk_v = {}
+                        if v_ts is not None:   # (B34: the readout from the lane's stored o, like the actor's)
+                            sl_ = slice(at, at + 512)
+                            tk_v = dict(temporal=dict(mode='stored', o=torch.from_numpy(v_o[sl_] * v_valid[sl_, None]).to(device),
+                                                      o_prev=torch.from_numpy(v_op[sl_]).to(device),
+                                                      has=torch.from_numpy(v_has[sl_]).to(device),
+                                                      m=torch.from_numpy(v_valid[sl_]).to(device)))
+                        if v_sources is not None:
+                            tk_v = dict(temporal=dict(source_batch=v_sources,
+                                         source_indices=np.arange(at, min(at + 512, v2_new))))
+                        with autocast():
+                            if mem_on:
+                                lg_, vv_, _ = learner_model(b_, packed=bool(args.packed), mem=torch.from_numpy(
+                                    v_hs[at:at + 512]).to(device), **tk_v)[:3]
+                            else:
+                                lg_, vv_, _ = learner_model(b_, packed=bool(args.packed), **tk_v)
+                        a_ = torch.from_numpy(act_v[at:at + 512]).to(device)
+                        lp_all.append(learner_model.log_prob(lg_, learner_model.gate(b_), a_)[0].float())
+                        lp_mv.append(torch.log_softmax(lg_.float()[:, :9], -1).gather(-1, a_[:, :1])[:, 0])
+                        val_v.append(vv_.float())
+                lp_all = torch.cat(lp_all).cpu().numpy()
+                lp_mv = torch.cat(lp_mv).cpu().numpy()
+                val_v = torch.cat(val_v).cpu().numpy()
+                f_v2 = first_v & ~is_cf   # (teacher v2's own points; B34: the cf's apart)
+                if f_v2.any():
+                    v2_log.update(v2_prior=float(lp_mv[f_v2].mean()), v2_prior_p=float(np.exp(lp_mv[f_v2]).mean()),
+                                  v2_prior_all=float(lp_all[f_v2].mean()), v2_firsts=int(f_v2.sum()),
+                                  v2_new_gain=float(v_meta[f_v2, V2I['gain']].mean()),
+                                  v2_new_spread=float(v_meta[f_v2, V2I['spread']].mean()))
+                f_cf = first_v & is_cf   # B34: cf_prior = log pi of the improving branch's first move (rising = taken in)
+                if f_cf.any():
+                    v2_log.update(cf_prior=float(lp_mv[f_cf].mean()), cf_prior_p=float(np.exp(lp_mv[f_cf]).mean()),
+                                  cf_prior_all=float(lp_all[f_cf].mean()), cf_firsts=int(f_cf.sum()),
+                                  cf_new_gain=float(v_meta[f_cf, V2I['gain']].mean()),
+                                  cf_new_spread=float(np.nanmean(v_meta[f_cf, V2I['spread']])),
+                                  cf_new_target=float((v_meta[f_cf, V2I['intent']] == 10).mean()))
+                    for k_t, name_t in enumerate(CF_TRIGGERS):   # (per trigger type: the prior of its points)
+                        m_t = f_cf & (v_meta[:, V2I['trig']] == k_t + 1)
+                        if m_t.any():
+                            v2_log[f'cf_prior/{name_t}'] = float(lp_mv[m_t].mean())
+                if is_cf.any():
+                    v2_log.update(cf_verr=float((val_v[is_cf] - G_v[is_cf]).mean()), cf_new=int(is_cf.sum()))
+                v2_log.update(v2_prior_move_all=float(lp_mv.mean()), v2_verr=float((val_v - G_v).mean()),
+                              v2_verr_abs=float(np.abs(val_v - G_v).mean()))
+                at_v = (L['v2_at'] + np.arange(v2_new)) % B_
+                L['v2_cnt']['n_ent'][at_v], L['v2_cnt']['n_doors'][at_v] = v_rows['n_ent'], v_rows['n_doors']
+                if NI_f:   # (B24)
+                    L['v2_cnt']['n_item'][at_v] = item_count(v_rows, item_slots)
+                if L['v2_raw'] is None:
+                    L['v2_raw'] = torch.zeros((B_, ROW_BYTES), dtype=torch.uint8, device=device)
+                    L['v2_pend'] = torch.zeros((B_, nh), dtype=torch.int64, device=device)
+                    L['v2_act'] = torch.zeros((B_, nh), dtype=torch.int64, device=device)
+                    L['v2_w'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                    L['v2_G'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                    if mem_on:   # (memory) the records' GRU input states
+                        L['v2_h'] = torch.zeros((B_, mem_dim), dtype=torch.float32, device=device)
+                    if t_on:   # B34 (temporal) the records' stored lane outputs: o_prev, o (has and valid on the host)
+                        L['v2_op'] = torch.zeros((B_, args.temporal_width), dtype=torch.float32, device=device)
+                        L['v2_o'] = torch.zeros((B_, args.temporal_width), dtype=torch.float32, device=device)
+                        L['v2_m'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                    # B34 (--cf-advantage 1): the constant advantage of a cf point's first record (0 elsewhere) and
+                    # the learner's log-probability of its action at arrival (the clip's reference)
+                    L['v2_adv'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                    L['v2_lp0'] = torch.zeros(B_, dtype=torch.float32, device=device)
+                if args.rebuild_memory:
+                    if 'v2_contexts' not in L:
+                        L['v2_contexts'] = [None] * B_
+                        L['v2_host_rows'] = np.zeros(B_, dtype=v_rows.dtype)
+                        L['v2_host_pending'] = np.zeros((B_, nh), dtype=np.int64)
+                    for i_, at_ in enumerate(at_v):
+                        L['v2_contexts'][at_] = v_contexts[i_]
+                    L['v2_host_rows'][at_v] = v_rows
+                    L['v2_host_pending'][at_v] = pend_v
+                at_d = torch.from_numpy(at_v).to(device)
+                if t_on:
+                    if v_ts is not None:
+                        L['v2_op'][at_d] = torch.from_numpy(np.ascontiguousarray(v_op, np.float32)).to(device)
+                        L['v2_o'][at_d] = torch.from_numpy(np.ascontiguousarray(v_o, np.float32)).to(device)
+                        L['v2_m'][at_d] = torch.from_numpy(v_valid.astype(np.float32)).to(device)
+                        L['v2_has'][at_v] = v_has
+                    else:
+                        L['v2_m'][at_d] = 0.0
+                        L['v2_has'][at_v] = False
+                adv_new = np.where(first_v & is_cf, v_meta[:, V2I['gain']], 0.0) if args.cf_advantage else \
+                    np.zeros(v2_new)
+                L['v2_adv'][at_d] = torch.from_numpy(adv_new.astype(np.float32)).to(device)
+                L['v2_lp0'][at_d] = torch.from_numpy(lp_all.astype(np.float32)).to(device)
+                if mem_on:
+                    L['v2_h'][at_d] = torch.from_numpy(np.ascontiguousarray(v_hs, np.float32)).to(device)
+                L['v2_raw'][at_d] = torch.from_numpy(
+                    np.ascontiguousarray(v_rows).view(np.uint8).reshape(v2_new, ROW_BYTES)).to(device)
+                L['v2_pend'][at_d] = torch.from_numpy(pend_v).to(device)
+                L['v2_act'][at_d] = torch.from_numpy(act_v).to(device)
+                L['v2_w'][at_d] = torch.from_numpy(v_meta[:, V2I['weight']].astype(np.float32)).to(device)
+                L['v2_G'][at_d] = torch.from_numpy(G_v).to(device)
+            L['v2_rate'] = v2_new if L['v2_rate'] is None else 0.9 * L['v2_rate'] + 0.1 * v2_new
+            planned_v = args.epochs * max(1, len(flat) // args.minibatch)
+            v2_step = int(min(args.teacher_v2_batch, args.teacher_v2_reuse * L['v2_rate'] / planned_v))
+            L['v2_at'] = (L['v2_at'] + v2_new) % B_
+            L['v2_n'] = min(L['v2_n'] + v2_new, B_)
+            sec('teach_new')
+        choice_new = 0
+        if branching and job.get('choices') is not None:   # 2026-10-07: choice records into the ring and choices.jsonl
+            c_rows, c_meta = job['choices']
+            choice_new = len(c_rows)
+            if choice_new:
+                at_c = (L['choice_at'] + np.arange(choice_new)) % args.choice_buffer
+                L['choice_rows'][at_c], L['choice_meta'][at_c] = c_rows, c_meta
+                L['choice_version'][at_c] = L['update']   # the weights when the record arrived (meta: the actor's)
+                L['choice_at'] = (L['choice_at'] + choice_new) % args.choice_buffer
+                L['choice_n'] = min(L['choice_n'] + choice_new, args.choice_buffer)
+                for m_ in c_meta:
+                    choice_path.write(json.dumps(dict(decode_meta(m_, b_weights), update=L['update'])) + '\n')
+                choice_path.flush()
+                # Phase B2: the records' labels (see L's c_* arrays)
+                for j_, m_ in zip(at_c, c_meta):
+                    labs, sign_ = take_labels(m_, args.choice_label)
+                    L['c_lab'][j_], L['c_rep'][j_] = np.nan, -1
+                    for q_, (_, r_, d_) in enumerate(labs[:PMAX]):
+                        L['c_lab'][j_, q_], L['c_rep'][j_, q_] = d_, r_
+                    seed_ = int(m_[C_HI['seed']])
+                    L['c_item'][j_] = min(max(int(m_[C_HI['key']]), 0), 1023)
+                    L['c_kind'][j_], L['c_sign'][j_] = int(m_[C_HI['kind']]), sign_
+                    # held out by the floor's seed: the points of one start state (16 episodes, the archive's room
+                    # entries) are much alike; a split by point would test on situations seen in training
+                    L['c_hold'][j_] = args.choice_holdout > 0 and \
+                        ((seed_ * 2654435761) & 0xFFFFFFFF) % args.choice_holdout == 0
+                    L['c_boot'][j_] = crng.poisson(1.0, L['c_boot'].shape[1])
+            # the pooled noise variance of a label per kind: pairs 1 and the unconditional replicate pair of the same
+            # point, (D1 - D2)^2 / 2; handed to the workers (aux) for their replicate-widening
+            m_n = L['choice_n']
+            lab_, rep_, kind_ = L['c_lab'][:m_n], L['c_rep'][:m_n], L['c_kind'][:m_n]
+            for k_id, k_name in ((KIND_ITEM, 'item'), (KIND_ITEM_LEFT, 'item_left'), (2, 'door')):
+                d1 = np.where(rep_ == 0, lab_, np.nan)
+                d2 = np.where(rep_ == 1, lab_, np.nan)
+                ok_ = (kind_ == k_id) & np.isfinite(d1).any(1) & np.isfinite(d2).any(1)
+                if ok_.sum() >= 5:
+                    v_ = float(np.mean((np.nanmax(d1[ok_], 1) - np.nanmax(d2[ok_], 1)) ** 2) / 2)
+                    L['noise'][k_name] = (v_, int(ok_.sum()))
+                    if sampler.aux is not None:
+                        sampler.aux[n, k_id] = v_
+        L['choice_new'] = choice_new
+        corr_batch = None
+        if branching and choice_new and args.choice_adv_coef > 0:
+            # Phase B2, the exploit path: a new choice record whose own option was worse (or better) than the
+            # alternative by more than --choice-adv-min and 2 noise s.e. corrects the advantage of its decision record
+            # (the action decided there, with the actor's log-probability then): PPO's clipped term with that advantage
+            sel_c = []
+            for j_ in at_c:
+                lab_j = L['c_lab'][j_][np.isfinite(L['c_lab'][j_])]
+                if not len(lab_j) or L['c_kind'][j_] not in (KIND_ITEM, KIND_ITEM_LEFT):
+                    continue
+                kname = 'item' if L['c_kind'][j_] == KIND_ITEM else 'item_left'
+                s2 = L['noise'].get(kname, (args.branch_noise_prior, 0))[0]
+                a_own = float(L['c_sign'][j_] * lab_j.mean())
+                if abs(a_own) >= args.choice_adv_min and abs(lab_j.mean()) > 2 * math.sqrt(s2 / len(lab_j)):
+                    sel_c.append((j_, max(-args.choice_adv_max, min(args.choice_adv_max, a_own))))
+            if sel_c:
+                jj = np.array([j_ for j_, _ in sel_c])
+                mm = L['choice_meta'][jj]
+                c0 = C_HI['pend0']
+                corr_batch = dict(
+                    batch=to_batch(L['choice_rows'][jj], mm[:, c0:c0 + nh].astype(np.int64), device),
+                    act=torch.from_numpy(mm[:, C_HI['act0']:C_HI['act0'] + nh].astype(np.int64)).to(device),
+                    logp=torch.from_numpy(mm[:, C_HI['logp_b']].astype(np.float32)).to(device),
+                    adv=torch.tensor([a_ for _, a_ in sel_c], dtype=torch.float32, device=device))
+        L['corr_n'] = 0 if corr_batch is None else len(corr_batch['adv'])
+        L['corr_abs'] = 0.0 if corr_batch is None else float(corr_batch['adv'].abs().mean())
+
+        def train_choice():
+            """Phase B2: the choice heads on the held choice records (detached player tokens of the learner's
+            weights after this update's PPO steps; Huber on each pair's D, bootstrap weights per head; the held-out
+            points never trained) and their held-out accuracy (sign of the records' mean D), calibration (slope of
+            the mean D on the prediction, correlation) and the noise floor of that comparison."""
+            m_ = L['choice_n']
+            out_ = {}
+            if copt is None or m_ == 0:
+                return out_
+            lab = L['c_lab'][:m_]
+            kind = L['c_kind'][:m_]
+            idx = np.flatnonzero(np.isfinite(lab).any(1) & ((kind == KIND_ITEM) | (kind == KIND_ITEM_LEFT)))
+            out_['choice_labeled'] = len(idx)
+            if len(idx) < 8:
+                return out_
+            meta_ = L['choice_meta'][idx]
+            pend_ = meta_[:, C_HI['pend0']:C_HI['pend0'] + nh].astype(np.int64)
+            feats = []
+            with torch.no_grad():
+                for at in range(0, len(idx), 512):
+                    b_ = to_batch(L['choice_rows'][idx[at:at + 512]], pend_[at:at + 512], device)
+                    with autocast():
+                        feats.append(learner_model(b_, need_h=True)[3].float())
+            H = torch.cat(feats)
+            item_t = torch.from_numpy(L['c_item'][idx]).to(device)
+            lab_i = lab[idx]
+            train_m = ~L['c_hold'][idx]
+            rr, qq = np.nonzero(np.isfinite(lab_i))
+            keep_ = train_m[rr]
+            s_r, s_q = rr[keep_], qq[keep_]
+            noise_all = [v[0] for v in L['noise'].values()]
+            delta = math.sqrt(float(np.mean(noise_all))) if noise_all else math.sqrt(args.branch_noise_prior)
+            out_['choice_train_pairs'] = len(s_r)
+            if len(s_r) >= 8:
+                labels_t = torch.from_numpy(lab_i[s_r, s_q].astype(np.float32)).to(device)
+                rows_t = torch.from_numpy(s_r).to(device)
+                boot_t = torch.from_numpy(L['c_boot'][idx][s_r]).to(device)
+                losses = []
+                learner_model.choice.train()
+                for _ in range(args.choice_steps):
+                    pk = torch.from_numpy(crng.integers(0, len(s_r), min(args.choice_batch, len(s_r)))).to(device)
+                    r_ = rows_t[pk]
+                    pred = learner_model.choice.take_minus_skip(H[r_], item_t[r_])
+                    err = torch.nn.functional.huber_loss(pred, labels_t[pk][:, None].expand_as(pred),
+                                                         reduction='none', delta=delta)
+                    w_ = boot_t[pk]
+                    loss_ = (err * w_).sum() / w_.sum().clamp(min=1.0)
+                    copt.zero_grad(set_to_none=True)
+                    loss_.backward()
+                    copt.step()
+                    losses.append(loss_.detach())
+                copt.zero_grad(set_to_none=True)   # (no stale gradients in PPO's clip_grad_norm_ over parameters())
+                out_['choice_loss'] = float(torch.stack(losses).mean())
+            with torch.no_grad():
+                P = learner_model.choice.take_minus_skip(H, item_t).float()
+                pm, ps = P.mean(1).cpu().numpy(), P.std(1).cpu().numpy()
+            dbar = np.nanmean(lab_i, 1)
+            npair = np.isfinite(lab_i).sum(1)
+            s2 = np.array([L['noise'].get('item' if k == KIND_ITEM else 'item_left', (args.branch_noise_prior, 0))[0]
+                           for k in kind[idx]])
+            sig = np.abs(dbar) > 2 * np.sqrt(s2 / np.maximum(npair, 1))
+            out_['choice_spread'] = float(ps.mean())
+            for name_, sel_ in (('held', ~train_m), ('train', train_m)):
+                nz = sel_ & (dbar != 0)
+                out_[f'choice_{name_}_n'] = int(sel_.sum())
+                if nz.sum() >= 3:
+                    out_[f'choice_{name_}_acc'] = float((np.sign(pm[nz]) == np.sign(dbar[nz])).mean())
+                    out_[f'choice_{name_}_mse'] = float(np.mean((pm[sel_] - dbar[sel_]) ** 2))
+                    out_[f'choice_{name_}_floor'] = float(np.mean(s2[sel_] / np.maximum(npair[sel_], 1)))
+                    if np.std(pm[sel_]) > 0 and np.std(dbar[sel_]) > 0:
+                        out_[f'choice_{name_}_corr'] = float(np.corrcoef(pm[sel_], dbar[sel_])[0, 1])
+                        out_[f'choice_{name_}_slope'] = float(np.polyfit(pm[sel_], dbar[sel_], 1)[0])
+                ns = sel_ & sig
+                out_[f'choice_{name_}_sig_n'] = int(ns.sum())
+                if ns.sum() >= 3:
+                    out_[f'choice_{name_}_acc_sig'] = float((np.sign(pm[ns]) == np.sign(dbar[ns])).mean())
+            return out_
+
+        def teacher_loss(t_logits, t_danger, meta, n_sel):
+            """The teacher's losses on its records (weighted for a minibatch of n_sel decisions) and their stats:
+            the danger head learns which held moves got the player hurt; the move head is pushed to put its mass on
+            the moves that did not (where there was one)."""
+            hurt_bits = meta[:, 3:12].float()
+            danger_loss = torch.nn.functional.binary_cross_entropy_with_logits(t_danger.float(), hurt_bits)
+            move_logp = torch.log_softmax(t_logits.float()[:, :9], -1)
+            has_safe = meta[:, 14] > 0
+            safe_mass = torch.logsumexp(move_logp.masked_fill(hurt_bits > 0, -1e9), -1)
+            teach_loss = -(safe_mass * has_safe).sum() / has_safe.sum().clamp(min=1)
+            share = args.teach_weight * teach_step / n_sel
+            stats_ = torch.stack([teach_loss, danger_loss,
+                                  (safe_mass.exp() * has_safe).sum() / has_safe.sum().clamp(min=1)]).detach()
+            return share * (args.danger_coef * danger_loss + args.teach_coef * teach_loss), stats_
+        ent_heads = torch.zeros(nh, device=device)
+        # the records' entity and door counts on the host: the minibatches are planned here (orders, entity tokens,
+        # packed token positions) and the learner thread never waits for the GPU inside an epoch
+        ne_h = rl.rows['n_ent'].reshape(-1)[flat].astype(np.int64)
+        nd_h = rl.rows['n_doors'].reshape(-1)[flat].astype(np.int64)
+        # (B24) the records' real item tokens; the plans' extra arguments (none without item / global / history tokens)
+        ni_h = (item_count(row_fields(rl, flat, ('inv', 'pitem')), item_slots) if fast2 else
+                item_count(rl.rows.reshape(-1)[flat], item_slots)) if NI_f else None
+        xplan = dict(item_tok=NI_f, glob=G_f) if (NI_f or G_f or t_on) else {}
+
+        def teach_ni(pick_):
+            """(B24) the teacher records' item counts (the host ring keeps them with --teach-gpu 1)."""
+            return teach_rows['n_item'][pick_] if teach_gpu else item_count(teach_rows[pick_], item_slots)
+        width = batch['ent'].shape[1]
+        # B18: the records' ids among the rollout's distinct room grids, level maps and player patches (the CNNs then
+        # run on a minibatch's distinct ones: ~380 of 4,096 rooms and maps, ~2,100 patches in a run-mode rollout)
+        dd = {k_: distinct_ids(batch[k_]).cpu().numpy() for k_ in DEDUP} if 'dedup' in fparts else {}
+        dd_size = {k_: int(v_.max()) + 1 for k_, v_ in dd.items()}
+
+        def dev(a):
+            return torch.from_numpy(np.ascontiguousarray(a, np.int64)).pin_memory().to(device, non_blocking=True)
+
+        def dev_many(arrays):
+            """(B18) int64 arrays to the device in one pinned copy: views of it, in order."""
+            on = torch.from_numpy(np.concatenate([np.asarray(a, np.int64) for a in arrays])).pin_memory()
+            return list(on.to(device, non_blocking=True).split([len(a) for a in arrays]))
+        tokens = parts = 0
+        t_meta = torch.from_numpy(teach_meta[:max(teach_n, 1)]).to(device) if fast else None   # (B18)
+        learner_model.train()
+        corr_stats = torch.zeros(2, device=device)   # Phase B2: the correction's loss and clipped share (sums)
+        # the units a minibatch is drawn in: decisions, or (memory) whole chunks of T_mem decisions
+        n_units, mb_units = (mplan['chunks'], max(1, args.minibatch // T_mem)) if mem_on else (count, args.minibatch)
+        if t_on:   # (B30) whole temporal chunks
+            n_units, mb_units = len(tch), max(1, args.minibatch // T_t)
+
+        def pmean(x, pm, pn):
+            """The mean over a part's rows: x.mean() (as before), or (memory) over its trained rows only."""
+            return x.mean() if pm is None else (x * pm).sum() / pn
+
+        def v2_terms(lp_v, val_v, vpick_d, v_w, v_G, v_share, adv_std, n_sel):
+            """Teacher v2's loss on drawn imitation records (tok_teacher2.teacher_v2_loss); B34 --cf-advantage 1: the
+            cf points' first records (their v2_adv != 0) get a clipped policy-gradient term with that constant
+            advantage (in the minibatch's advantage units; ratio to the learner's policy at the record's arrival)
+            instead of the imitation term."""
+            if not args.cf_advantage:
+                return teacher_v2_loss(lp_v, val_v, v_w, v_G, v_share, args.teacher_v2_coef, args.teacher_v2_vf)
+            adv_ = L['v2_adv'].index_select(0, vpick_d)
+            use_ = (adv_ != 0).float()
+            vloss_, vstats_ = teacher_v2_loss(lp_v, val_v, v_w * (1.0 - use_), v_G, v_share, args.teacher_v2_coef,
+                                              args.teacher_v2_vf)
+            ratio_ = torch.exp(lp_v.float() - L['v2_lp0'].index_select(0, vpick_d))
+            a_ = adv_ / (adv_std + 1e-8)
+            pg_ = -(use_ * torch.min(ratio_ * a_, torch.clamp(ratio_, 1 - args.clip, 1 + args.clip) * a_)).sum()
+            return vloss_ + args.teacher_v2_weight * pg_ / n_sel, vstats_
+        pm = pn = n_sel = None
+        t_table = None
+        for _ in range(args.epochs):
+            if t_on and not args.room_memory and not args.rebuild_memory:   # legacy epoch cache only; raw sources refresh every optimiser step
+                t_t0 = time.perf_counter()
+                with autocast():
+                    t_table = learner_model.tatt.room_table(rl.t_o, TD)
+                if PROFILE:
+                    torch.cuda.current_stream().synchronize()
+                U['temporal'] += time.perf_counter() - t_t0
+            perm = torch.randperm(n_units, device=device)
+            perm_h = perm.cpu().numpy()
+            first_step = True
+            for at in range(0, n_units, mb_units):
+                sel_h = perm_h[at:at + mb_units]
+                if len(sel_h) < mb_units // 4:
+                    continue
+                sel = perm[at:at + mb_units]
+                if chunked:   # (memory) the chunks' rows, chunk after chunk (the GRU runs along each)
+                    if t_on:   # (B30) the temporal chunks' rows; their GRU chunks (row // T_mem: whole ones)
+                        tc_h = sel_h
+                        sel_h = np.concatenate([np.arange(o_, o_ + c_) for o_, c_ in tch[tc_h, :2]])
+                        ch_h = sel_h[::T_mem] // T_mem if mem_on else None   # (B32: no GRU chunks without memory)
+                    else:
+                        ch_h = sel_h
+                        sel_h = (ch_h[:, None] * T_mem + np.arange(T_mem)[None]).reshape(-1)
+                    ch_d = dev(ch_h) if mem_on else None
+                    sel = dev(sel_h)
+                    n_sel = max(float(lw[sel_h].sum()), 1.0)   # the minibatch's trained decisions
+                    if pf_on:   # (B23: normalised over the decisions PPO trains, forced ones 0)
+                        a_all, adv_std = normalise_advantages(b_adv[sel], b_pf[sel], b_w[sel])
+                    else:
+                        a_all, w_all = b_adv[sel], b_w[sel]
+                        mu_ = (a_all * w_all).sum() / n_sel
+                        adv_std = (((a_all - mu_) ** 2 * w_all).sum() / max(n_sel - 1.0, 1.0)).sqrt()
+                        a_all = (a_all - mu_) / (adv_std + 1e-8) * w_all   # (untrained rows and padding: 0)
+                else:
+                    n_sel = len(sel)
+                    if pf_on:   # (B23)
+                        a_all, adv_std = normalise_advantages(b_adv[sel], b_pf[sel])
+                    else:
+                        a_all = b_adv[sel]
+                        adv_std = a_all.std()
+                        a_all = (a_all - a_all.mean()) / (a_all.std() + 1e-8)
+                if source_pipeline is not None:
+                    was_pending = source_pipeline.pending is not None
+                    if 'poll_source_prefetch' in L: L['poll_source_prefetch']()
+                    source_pipeline.poll_finish(opt,args.max_grad_norm)
+                    if was_pending and source_pipeline.pending is None:
+                        live_now = live_uids | {h.uid for h in L.get('v2_contexts', []) if h is not None}
+                        live_now.update(h.uid for h in L.get('teach_contexts', []) if h is not None)
+                        source_pipeline.retain_histories(live_now,overlap=source_pipeline.defer_backward)
+                opt.zero_grad(set_to_none=True)
+                room_batch = None
+                if args.room_memory:
+                    from isaac_bridge.room_memory import RoomSourceBatch
+                    with autocast():
+                        room_batch = RoomSourceBatch(learner_model, TD, tc_h, args.room_source_micro)
+                micro = args.micro or len(sel)
+                if mem_on:   # (memory) parts of whole chunks
+                    micro = max(T_mem, micro // T_mem * T_mem)
+                if micro < len(sel) and args.sort_micro and not chunked:
+                    # the minibatch's rows ordered by their entity count before they are cut into parts: each part
+                    # then pads to fewer entity tokens. The minibatch's gradient is the same sum over its rows
+                    # (numpy's stable argsort: the order torch.argsort(stable=True) gives on the device)
+                    order_h = np.argsort(ne_h[sel_h], kind='stable')
+                    order = dev(order_h)
+                    sel, a_all, sel_h = sel[order], a_all[order], sel_h[order_h]
+                teaching = teach_step >= 8 and teach_n >= 256
+                tb = None
+                if teaching:
+                    # the teacher's records of this step (drawn here, before the PPO parts: the same draws as when
+                    # they were drawn after them, nothing else uses numpy's generator)
+                    pick = np.random.randint(0, teach_n, teach_step)
+                    if fast:   # B18: from the meta's copy on the device (no blocking copy)
+                        pick_d = dev(pick)
+                        meta = t_meta.index_select(0, pick_d)
+                    else:
+                        meta = torch.from_numpy(teach_meta[pick]).to(device)
+                        pick_d = None
+                    if raw_mode:   # (B18: merged as bytes below)
+                        tb = pick_d
+                    elif teach_gpu:
+                        tb = decode_rows(L['teach_raw'].index_select(0, dev(pick) if pick_d is None else pick_d),
+                                         pending=teach_pending(meta).clone(),
+                                         entities=min(ENT_CAP, used_entities(teach_rows['n_ent'][pick])))
+                    else:
+                        tb = to_batch(teach_rows[pick], teach_pending(teach_meta[pick]), device)
+                    sec('teach_build')
+                vb = None   # 2026-10-10 (teacher v2): this step's imitation records (drawn with their own generator)
+                if v2_step >= 8 and v2_on and L['v2_n'] >= 256:
+                    vpick = v2_rng.integers(0, L['v2_n'], v2_step)
+                    vpick_d = dev(vpick)
+                    v_pend, v_act = L['v2_pend'].index_select(0, vpick_d), L['v2_act'].index_select(0, vpick_d)
+                    v_w, v_G = L['v2_w'].index_select(0, vpick_d), L['v2_G'].index_select(0, vpick_d)
+                    v_ent = min(ENT_CAP, used_entities(L['v2_cnt']['n_ent'][vpick]))
+                    vb = vpick_d if raw_mode else decode_rows(L['v2_raw'].index_select(0, vpick_d),
+                                                              pending=v_pend, entities=v_ent)
+                    v_h = L['v2_h'].index_select(0, vpick_d) if mem_on else None   # (memory) their input states
+                    v_share = args.teacher_v2_weight * v2_step / n_sel
+                    sec('teach_build')
+                source_batch = None
+                if args.rebuild_memory:
+                    requests = ([all_requests[i] for i in np.searchsorted(all_flat,flat[sel_h])]
+                                if source_pipeline is not None else rollout_requests(rl,flat[sel_h]))
+                    teacher_start = len(requests)
+                    if tb is not None and args.teach_merge:
+                        selected_teacher_rows = (L['teach_raw'][dev(pick)].cpu().numpy().copy().view(ROW).reshape(-1)
+                                        if teach_gpu else teach_rows[pick])
+                        requests += [(L['teach_contexts'][i_], row, pend) for i_,row,pend in
+                                     zip(pick,selected_teacher_rows,teach_pending(teach_meta[pick]))]
+                    v2_start = len(requests)
+                    if vb is not None:
+                        requests += [(L['v2_contexts'][i_], L['v2_host_rows'][i_], L['v2_host_pending'][i_])
+                                     for i_ in vpick]
+                    with autocast():
+                        if source_pipeline is not None:
+                            from isaac_bridge.rebuild_memory import SourceView,JoinedSources
+                            source_batch=SourceView(resident_sources,np.searchsorted(all_flat,flat[sel_h]))
+                            if len(requests)>teacher_start:
+                                extra_sources=SourceBatch(learner_model,requests[teacher_start:],
+                                                          args.room_source_micro,cache=False,pipeline=source_pipeline,
+                                                          stateless={h.uid for h,_,_ in requests[teacher_start:v2_start]})
+                                source_batch=JoinedSources(source_batch,extra_sources)
+                        else:
+                            source_batch = SourceBatch(learner_model, requests, args.room_source_micro,
+                                                       cache=bool(args.source_replay), pipeline=source_pipeline)
+                if source_pipeline is not None:
+                    if retire_after_ready:
+                        live_now=live_uids | {h.uid for h in L.get('v2_contexts',[]) if h is not None}
+                        live_now.update(h.uid for h in L.get('teach_contexts',[]) if h is not None)
+                        source_pipeline.retain_histories(live_now,overlap=True)
+                        retire_after_ready=False
+                    source_pipeline.dispatch_finish()
+                    reader_host_start = time.perf_counter()
+                    reader_gpu_start = torch.cuda.Event(enable_timing=True)
+                    reader_gpu_end = torch.cuda.Event(enable_timing=True)
+                    reader_gpu_start.record()
+                if t_on:   # (B30) parts of whole temporal chunks
+                    bounds = temporal_bounds(tch, tc_h, micro)
+                else:
+                    bounds = [(lo_, min(lo_ + micro, len(sel)), None) for lo_ in range(0, len(sel), micro)]
+                last = bounds[-1][0]
+                for lo_, hi_, cids_ in bounds:   # the minibatch's means, a part at a time
+                    m_ = pmark('b38:part_plan')
+                    part = sel[lo_:hi_]
+                    part_h = sel_h[lo_:hi_]
+                    if chunked:   # (memory / temporal) the part's share of the minibatch's trained decisions
+                        pn = float(lw[part_h].sum())
+                        w, pm, pn = pn / n_sel, b_w[part], max(pn, 1.0)
+                    else:
+                        w = len(part) / len(sel)
+                    used = min(width, used_entities(ne_h[part_h]))
+                    merged = tb is not None and args.teach_merge and lo_ == last
+                    vmerged = vb is not None and args.teach_merge and lo_ == last   # (teacher v2: after the teacher's)
+                    if raw_mode:
+                        # B18: the part's records (and the teacher's) as bytes, the fields views of them (decode_rows)
+                        rp, pp, e_ = raw_all.index_select(0, part), pend_all.index_select(0, part), used
+                        if merged:
+                            e_ = max(used, min(ENT_CAP, used_entities(teach_rows['n_ent'][pick])))
+                            rp = torch.cat([rp, L['teach_raw'].index_select(0, pick_d)])
+                            pp = torch.cat([pp, teach_pending(meta)])
+                        if vmerged:
+                            e_ = max(e_, v_ent)
+                            rp = torch.cat([rp, L['v2_raw'].index_select(0, vpick_d)])
+                            pp = torch.cat([pp, v_pend])
+                        mb = decode_rows(rp, pending=pp, entities=e_)
+                    elif fast:   # (B18: the entity fields cut before the gather)
+                        mb = {k: (v[:, :used] if k in ENTITY_FIELDS else v)[part] for k, v in batch.items()}
+                    else:
+                        mb = {k: v[part] for k, v in batch.items()}   # take(batch, part), entity tokens from the host
+                        for k_e in ENTITY_FIELDS:
+                            mb[k_e] = mb[k_e][:, :used]
+                    tokens += used
+                    parts += 1
+                    ne_p, nd_p = ne_h[part_h], nd_h[part_h]
+                    ni_p = ni_h[part_h] if NI_f else None
+                    if merged:   # the teacher's records ride along in the last part: one forward and backward
+                        if not raw_mode:
+                            mb = cat_batch(mb, tb)
+                        ne_p = np.concatenate([ne_p, teach_rows['n_ent'][pick]])
+                        nd_p = np.concatenate([nd_p, teach_rows['n_doors'][pick]])
+                        if NI_f:
+                            ni_p = np.concatenate([ni_p, teach_ni(pick)])
+                    if vmerged:   # (teacher v2) its records after the teacher's
+                        if not raw_mode:
+                            mb = cat_batch(mb, vb)
+                        ne_p = np.concatenate([ne_p, L['v2_cnt']['n_ent'][vpick]])
+                        nd_p = np.concatenate([nd_p, L['v2_cnt']['n_doors'][vpick]])
+                        if NI_f:
+                            ni_p = np.concatenate([ni_p, L['v2_cnt']['n_item'][vpick]])
+                    if xplan:   # (B24: the real item tokens and the global token in the plans)
+                        xplan['n_item'] = ni_p
+                    if t_on:   # (B31: the history token where a previous step exists; none for the teachers' records;
+                        #         B34: teacher v2's / the cf's records from their lane's step)
+                        xplan['hist'] = np.concatenate([has_h[part_h], np.zeros(len(ne_p) - len(part_h), bool)])
+                        if vmerged:
+                            xplan['hist'][len(ne_p) - len(vpick):] = L['v2_has'][vpick]
+                    if args.packed and fast:   # B18: + the entity positions and the attention buckets, one copy
+                        plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets, **xplan)
+                        hn = ['rec', 'base']
+                        for k_ in dd:   # the distinct grids of this part (the teacher's records each their own)
+                            u_, i_ = first_of(dd[k_][part_h], dd_size[k_])
+                            if merged or vmerged:
+                                t_ = len(mb['n_ent']) - len(part)
+                                u_, i_ = (np.concatenate([u_, len(part) + np.arange(t_)]),
+                                          np.concatenate([i_, len(u_) + np.arange(t_)]))
+                            plan[k_ + '_u'], plan[k_ + '_i'] = u_, i_
+                            hn += [k_ + '_u', k_ + '_i']
+                        bk_ = plan['buckets'] if 'buckets' in fparts else []
+                        got = dev_many([plan[k_].reshape(-1) for k_ in hn] + [c_ for c_, _ in bk_])
+                        got[0] = got[0].view(-1, plan['rec'].shape[1])
+                        mb.update(zip(hn[2:], got[2:len(hn)]))
+                        tok = plan_tokens(plan, got[0], got[1])
+                        pnames = ['keep', 'starts']
+                        if 'ekeep' in fparts:
+                            pnames.append('ekeep')
+                        if 'buckets' in fparts:
+                            pnames.append('gpos')
+                            if 'ekeep' in fparts:   # the packed tokens built from the real ones (forward's xperm)
+                                pnames += ['dkeep', 'xperm'] + (['ikeep', 'glast'] if xplan else [])
+                        mb.update((k_, tok[k_]) for k_ in pnames)
+                        if bk_:
+                            mb['buckets'] = [(c_, w_) for c_, (_, w_) in zip(got[len(hn):], bk_)]
+                    elif args.packed:
+                        mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1],
+                                                                                   **xplan))
+                    k_ = len(part)
+                    m_ = pmark('b38:part_forward', m_)
+                    with autocast():
+                        if chunked:   # (memory) BPTT over the part's chunks from their stored first states; the
+                            #          teacher's records one step each (the old teacher's from 0, teacher v2's own)
+                            memd = None   # (B32: a temporal model without the GRU)
+                            if mem_on:
+                                c0 = lo_ // T_mem
+                                tails = ([torch.zeros((len(pick), mem_dim), device=device)] if merged else []) + \
+                                    ([v_h] if vmerged else [])
+                                memd = dict(h0=b_h0.index_select(0, ch_d[c0:c0 + k_ // T_mem]), T=T_mem,
+                                            reset=b_reset[part].view(-1, T_mem),
+                                            tail=torch.cat(tails) if len(tails) > 1 else (tails[0] if tails else None))
+                            tk_ = {}
+                            if t_on and not args.rebuild_memory:   # (B30) the temporal transformer over the part's chunks
+                                part_td = TD if room_batch is None else room_batch.td
+                                if room_batch is not None:
+                                    t_table = learner_model.tatt.room_table(room_batch.source, part_td, track_grad=True)
+                                tk_ = dict(temporal=dict(mode='chunk', plan=temporal_part(
+                                    part_td, np.asarray(cids_), tch[cids_, 1], t_rows['ep'][part], t_table, dev),
+                                    o_prev=t_rows['o_prev'][part], has=t_rows['has'][part]))
+                                if vmerged:   # B34: the imitation records' stored lane outputs (the teacher's: none)
+                                    n_tb = len(pick) if merged else 0
+                                    z_ = torch.zeros((n_tb, args.temporal_width), device=device)
+                                    tk_['temporal']['tail'] = dict(
+                                        o_prev=torch.cat([z_, L['v2_op'].index_select(0, vpick_d)]),
+                                        has=torch.cat([torch.zeros(n_tb, dtype=torch.bool, device=device),
+                                                       dev(L['v2_has'][vpick]).bool()]),
+                                        o=torch.cat([z_, L['v2_o'].index_select(0, vpick_d)]),
+                                        m=torch.cat([torch.zeros(n_tb, device=device),
+                                                     L['v2_m'].index_select(0, vpick_d)]))
+                            if source_batch is not None:
+                                source_ix = list(range(lo_, hi_))
+                                if merged:
+                                    source_ix += list(range(teacher_start, teacher_start + len(pick)))
+                                if vmerged:
+                                    source_ix += list(range(v2_start, v2_start + len(vpick)))
+                                tk_ = dict(temporal=dict(source_batch=source_batch, source_indices=source_ix))
+                            outs_ = lm_call(mb, packed=bool(args.packed), mem=memd,
+                                                  **(dict(need_vg=True) if glob_loss else {}), **tk_)
+                        else:
+                            outs_ = lm_call(mb, packed=bool(args.packed),
+                                                  **(dict(need_vg=True) if glob_loss else {}))
+                        logits_, value_, danger_ = outs_[:3]
+                    m_ = pmark('b38:part_loss', m_)
+                    logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
+                        logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
+                    value = value_[:k_].float()
+                    a = a_all[lo_:hi_]
+                    if pf_on:   # 2026-10-13 (B23): forced decisions out of pg and the entropy, imitation on them
+                        pg, vf, ent, imit, ratio, kl_f, clip_f = ppo_part_terms(
+                            logits_[:k_], logp, entropy, b_logp[part], a, value, b_ret[part], b_act[part], b_pf[part],
+                            args.clip, pm, pn, prox[part] if prox is not None else None, args.decoupled_max_weight)
+                        loss = (pg + args.vf_coef * vf - args.ent_coef * ent + args.pickup_force_imitation * imit) * w
+                        pacc += imit.detach() * w
+                    elif prox is None:   # PPO's ratio to the behaviour policy (the one that sampled the action)
+                        ratio = torch.exp(logp - b_logp[part])
+                        pg = -pmean(torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a), pm, pn)
+                    else:   # decoupled: clipped around the weights at the update's start, importance-weighted
+                        ratio = torch.exp(logp - prox[part])
+                        weight = torch.exp(prox[part] - b_logp[part]).clamp(max=args.decoupled_max_weight)
+                        pg = -pmean(weight * torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a),
+                                    pm, pn)
+                    if not pf_on:
+                        vf = 0.5 * pmean((value - b_ret[part]) ** 2, pm, pn)
+                        ent = pmean(entropy.sum(-1), pm, pn)
+                        loss = (pg + args.vf_coef * vf - args.ent_coef * ent) * w
+                    if glob_loss:   # 2026-10-12 (B22): value_global on its own returns (an auxiliary loss)
+                        vgf = 0.5 * pmean((outs_[-1][:k_].float() - b_ret_g[part]) ** 2, pm, pn)
+                        loss = loss + args.vf_global_coef * vgf * w
+                        gacc += vgf.detach() * w
+                    if merged:
+                        t_end = k_ + len(pick) if vmerged else None   # (teacher v2's records follow)
+                        tloss, tstats = teacher_loss(logits_[k_:t_end], danger_[k_:t_end], meta, n_sel)
+                        loss = loss + tloss
+                    if vmerged:   # 2026-10-10 (teacher v2): -w log pi(a | obs) over the heads + (V(obs) - G)^2
+                        o_ = k_ + (len(pick) if merged else 0)
+                        lp_v, _ = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
+                            logits_[o_:], learner_model.gate(mb)[o_:], v_act)
+                        vloss, vstats = v2_terms(lp_v, value_[o_:], vpick_d, v_w, v_G, v_share, adv_std, n_sel)
+                        loss = loss + vloss
+                    m_ = pmark('b38:part_backward', m_)
+                    if args.rebuild_memory:
+                        backward_start = memory_tick()
+                    # Direct source graphs are shared by PPO parts and the optional
+                    # unmerged v2 teacher. Free them after the final consumer, before Adam.
+                    loss.backward(retain_graph=bool(source_batch is not None and not source_batch.cached and
+                                  (lo_ != last or (vb is not None and not args.teach_merge))))
+                    if args.rebuild_memory:
+                        memory_part('reader_loss_backward', backward_start)
+                    m_ = pmark('b38:part_stats', m_)
+                    with torch.no_grad():
+                        if pf_on:   # (B23: kl and clip share over the PPO-trained decisions' rows)
+                            acc += torch.stack([pg, vf, ent, kl_f, clip_f]) * w
+                        else:
+                            acc += torch.stack([pg, vf, ent, pmean(b_logp[part] - logp, pm, pn),
+                                                pmean(((ratio - 1).abs() > args.clip).float(), pm, pn)]) * w
+                        ent_heads += (entropy.mean(0) if pm is None else (entropy * pm[:, None]).sum(0) / pn) * w
+                        if merged:
+                            tacc += tstats
+                            teach_steps += 1
+                        if vmerged:
+                            vacc += vstats
+                            v2_steps += 1
+                if corr_batch is not None and first_step:
+                    # Phase B2: the choice records' correction, once per epoch (its records count as decisions of
+                    # this minibatch, their advantage in the minibatch's units)
+                    with autocast():
+                        lg_c = learner_model(corr_batch['batch'], packed=bool(args.packed))[0]
+                    lp_c, _ = learner_model.log_prob(lg_c, learner_model.gate(corr_batch['batch']), corr_batch['act'])
+                    ratio_c = torch.exp(lp_c - corr_batch['logp'])
+                    a_c = corr_batch['adv'] / (adv_std + 1e-8)
+                    loss_c = -args.choice_adv_coef * torch.min(
+                        ratio_c * a_c, torch.clamp(ratio_c, 1 - args.clip, 1 + args.clip) * a_c).sum() / n_sel
+                    loss_c.backward()
+                    with torch.no_grad():
+                        corr_stats += torch.stack([loss_c.detach(),
+                                                   ((ratio_c - 1).abs() > args.clip).float().mean()])
+                first_step = False
+                steps += 1
+                sec('ppo')
+                if tb is not None and not args.teach_merge:
+                    with autocast():
+                        t_logits, _, t_danger = learner_model(tb, packed=bool(args.packed))
+                    tloss, tstats = teacher_loss(t_logits, t_danger, meta, n_sel)
+                    tloss.backward()
+                    with torch.no_grad():
+                        tacc += tstats
+                    teach_steps += 1
+                    sec('teach')
+                if vb is not None and not args.teach_merge:   # 2026-10-10 (teacher v2): a pass of its own
+                    tk_v = {}
+                    if t_on:   # B34: their stored lane outputs (the readout and the history token)
+                        tk_v = dict(temporal=dict(mode='stored', o=L['v2_o'].index_select(0, vpick_d),
+                                                  o_prev=L['v2_op'].index_select(0, vpick_d),
+                                                  has=dev(L['v2_has'][vpick]).bool(),
+                                                  m=L['v2_m'].index_select(0, vpick_d)))
+                    if source_batch is not None:
+                        tk_v = dict(temporal=dict(source_batch=source_batch,
+                                    source_indices=np.arange(v2_start, v2_start + len(vpick))))
+                    with autocast():
+                        v_logits, v_value, _ = learner_model(vb, packed=bool(args.packed), mem=v_h, **tk_v)[:3]
+                    lp_v, _ = learner_model.log_prob(v_logits, learner_model.gate(vb), v_act)
+                    vloss, vstats = v2_terms(lp_v, v_value, vpick_d, v_w, v_G, v_share, adv_std, n_sel)
+                    vloss.backward()
+                    with torch.no_grad():
+                        vacc += vstats
+                    v2_steps += 1
+                    sec('teach')
+                if room_batch is not None:
+                    with autocast():
+                        room_batch.backward()
+                if source_batch is not None:
+                    with autocast():
+                        source_batch.backward()
+                if L.get('trace') is not None:   # B18 check: the loss sums after each step, the first step's gradient
+                    L['trace'].append((acc.clone(), tacc.clone(), None if L['trace'] else
+                                       [None if q.grad is None else q.grad.clone()
+                                        for q in opt.param_groups[0]['params']]))
+                m_ = pmark('b38:clip_opt', m_)
+                if source_pipeline is None:
+                    torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+                    opt.step()
+                    learner_model.invalidate_source_cache()
+                else:
+                    source_pipeline.fast_step(opt, args.max_grad_norm)
+                    if source_pipeline.period and source_pipeline.steps == source_pipeline.period:
+                        source_pipeline.start_finish(opt, args.max_grad_norm)
+                pmark(None, m_)
+                sec('opt')
+                if source_pipeline is not None:
+                    reader_gpu_end.record()
+                    source_pipeline.reader_events.append((reader_gpu_start, reader_gpu_end))
+                    source_pipeline.events.append(dict(kind='reader_submit', device='host',
+                        start=reader_host_start, end=time.perf_counter()))
+        if source_pipeline is not None:
+            if source_pipeline.period==0:
+                source_pipeline.finish_rollout(opt,args.max_grad_norm,overlap=bool(args.source_overlap_rollout))
+            else:
+                source_pipeline.finish(opt, args.max_grad_norm)
+            source_times = {}
+            for event in source_pipeline.events:
+                key = event['device'] + ':' + event['kind']
+                source_times[key] = source_times.get(key, 0.) + event['end'] - event['start']
+            print('SOURCE_PIPELINE ' + json.dumps(dict(version=source_pipeline.version,
+                  fast_steps=source_pipeline.fast_steps, encoded_rows=source_pipeline.encoded_rows,
+                  reused_rows=source_pipeline.reused_rows, writer_blocks=source_pipeline.written_blocks,
+                  devices=[str(d) for d in source_pipeline.devices], micro=args.micro,
+                  worker_seconds=source_times, cached_frames=len(source_pipeline.frames),
+                  cached_versions=len(source_pipeline.versions),
+                  source_pending=source_pipeline.pending is not None,
+                  source_update_rollouts=source_pipeline.update_rollouts,
+                  source_accumulated_rollouts=source_pipeline.rollouts_since_update)), flush=True)
+        learner_model.eval()
+        choice_log = train_choice() if branching else {}   # Phase B2 (before the actor takes the new weights)
+        torch.cuda.current_stream().synchronize()
+        sec('tail')
+        if source_pipeline is not None:
+            waits = {}
+            for event in source_pipeline.events:
+                if event['device'] == 'host':
+                    waits[event['kind']] = waits.get(event['kind'], 0.) + event['end'] - event['start']
+            print('SOURCE_TIMELINE ' + json.dumps(dict(update=L['update']+1, host_seconds=waits,
+                  live_frames=len(source_pipeline.frames), live_episodes=len(source_pipeline.lengths),
+                  prefetch_sequences=sorted(source_pipeline.prefetch_live),
+                  reader_steps_while_source_backward=source_pipeline.reader_while_backward,
+                  reader_steps_while_retired_backward=source_pipeline.reader_while_retired,
+                  source_forward_service_calls=sum(e.get('serviced_forward_calls',0) for e in source_pipeline.events),
+                  source_forward_service_seconds=sum(e.get('forward_service_seconds',0.) for e in source_pipeline.events),
+                  reader_stream_seconds=sum(a.elapsed_time(b) for a,b in source_pipeline.reader_events)/1000,
+                  source_memory=[dict(device=str(d), allocated_gib=(torch.cuda.memory_allocated(d)+source_pipeline.remote_memory[i]['allocated'])/2**30,
+                    reserved_gib=(torch.cuda.memory_reserved(d)+source_pipeline.remote_memory[i]['reserved'])/2**30,
+                    free_gib=torch.cuda.mem_get_info(d)[0]/2**30,
+                    worker=source_pipeline.remote_memory[i]) for i,d in enumerate(source_pipeline.devices)])),flush=True)
+        update_s = time.perf_counter() - t0
+        if args.rebuild_memory and PROFILE_MEMORY:
+            print('MEMORY_PROFILE ' + json.dumps(dict(update=L['update']+1, update_s=update_s,
+                  seconds=MEMORY_TIMES, counts=MEMORY_COUNTS)), flush=True)
+        cpu_end = cpu_ticks()
+        job['cpu0'] = cpu0
+        L['update'] += 1
+        L['decisions'] += count
+        if pf_on:   # 2026-10-13 (B23): the forcing probability of the episodes to come (the workers read 'pf_p')
+            L['pf_p'] = pickup_force_p(pick_force, (L['decisions'] - start_decisions) /
+                                       max(1, target_decisions - start_decisions))
+            sampler.stats[:, ST['pf_p']] = L['pf_p']
+        L['last_update_s'], L['last_steps'], L['last_count'], L['last_U'] = update_s, steps, count, U   # (B18 bench)
+        # (B38: read before `fresh`: after it the actor may reuse this rollout; logging only)
+        t_rooms_new = int(sum(rl.t_rc[w_, rl.tP:rl.tP + rl.length[w_]].sum() for w_ in range(rl.n))) if t_on else 0
+        if not L.get('bench'):
+            fresh.set()                           # the actor may take the new weights now
+        # ---- logging (the actor is already running on)
+        t_end = time.perf_counter()
+        wall = t_end - (L['t_end'] if L['t_end'] is not None else job['t_start'])
+        L['t_end'] = t_end
+        L['seconds'] += wall
+        upd = L['update']
+        acc_c, tacc_c = acc.cpu().numpy(), tacc.cpu().numpy()
+        if chunked:   # (memory / temporal: the trained rows only)
+            b_ret, b_val = b_ret.index_select(0, ev_rows), b_val.index_select(0, ev_rows)
+        var = float(b_ret.var())
+        ev = 1.0 - float((b_ret - b_val).var()) / var if var > 0 else 0.0
+        steps_ = max(steps, 1)
+        tsteps = max(teach_steps, 1)
+        prof = job['prof']
+        calls = max(prof['calls'], 1)
+        dst = job['worker']
+        stats = sampler.stats
+        finished = job['finished']
+        row = {
+            'update': upd, 'decisions': L['decisions'], 'game_hours': L['decisions'] * hours_per_decision,
+            'x_real_time': count * args.frames_per_decision / 30 / max(wall, 1e-9),
+            'collect_s': job['collect_s'], 'update_s': update_s, 'infer_ms': 1000 * prof['latency'] / calls,
+            'rows_per_call': prof['rows'] / calls, 'eager_calls': prof['eager'], 'lr': lr,
+            'pg': acc_c[0] / steps_, 'vf': acc_c[1] / steps_, 'entropy': acc_c[2] / steps_,
+            'ent_move': float(ent_heads[0]) / steps_, 'ent_shoot': float(ent_heads[1]) / steps_,
+            'ent_bomb': float(ent_heads[2]) / steps_, 'kl': acc_c[3] / steps_,
+            **({'ent_item': float(ent_heads[3]) / steps_, 'ent_pill': float(ent_heads[4]) / steps_} if nh > 3 else {}),
+            'clip_frac': acc_c[4] / steps_, 'explained_variance': ev,
+            'reward_mean': reward_mean, 'episodes': len(finished),
+            'errors': float(stats[:, 5].sum()),
+            'stalls': float(stats[:, ST['stalls']].sum()), 'build_retries': float(stats[:, ST['retries']].sum()),
+            'port_moves': float(stats[:, ST['port_moves']].sum()), 'root_recycles': float(stats[:, ST['recycles']].sum()),
+            'parked_trims': float(stats[:, ST['trims']].sum()),
+            'teach_new': teach_new, 'teach_held': teach_n, 'teach_step': teach_step, 'safe_mass_new': safe_new,
+            'teach_loss': tacc_c[0] / tsteps if teach_steps else 0.0,
+            'danger_loss': tacc_c[1] / tsteps if teach_steps else 0.0,
+            'safe_mass': tacc_c[2] / tsteps if teach_steps else 0.0,
+            'searches': float(stats[:, 18].sum()), 'avoidable': float(stats[:, 19].sum()),
+            'hurts': float(stats[:, 20].sum()), 'teach_s': float(stats[:, 17].sum()),
+            'snaps': float(stats[:, 21].sum()), 'archive': float(stats[:, 22].sum()),
+            'archive_starts': float(stats[:, 23].sum()),
+            'wall_s': wall, 'overlap': int(args.overlap), 'stale_share': stale,
+            'ent_tokens': tokens / max(parts, 1), 'ent_over32': float((ne_h > 32).mean()),
+            'gpu_reserved_gb': torch.cuda.max_memory_reserved() / 2 ** 30,
+            'wait_learner_s': job['wait_learner_s'],
+            'infer_upd_ms': 1000 * prof['act_busy'] / max(prof['calls_busy'], 1), 'calls_upd': prof['calls_busy'],
+            'p_poll': prof['poll'], 'p_book': prof['book'], 'p_act': prof['act'], 'p_reply': prof['reply'],
+            'p_store': prof['store'], 'polls': prof['polls'],
+            'idle_share': dst['wait_s'] / max(n * job['cycle_s'], 1e-9), 'w_step': dst['step_s'],
+            'w_wait': dst['wait_s'], 'w_encode': dst['encode_s'], 'w_fork': dst['fork_s'], 'w_teach': dst['teach_s'],
+            'w_overrun': dst.get('overrun_s', 0.0), 'w_state': dst.get('state_s', 0.0),
+            'w_close': dst.get('close_s', 0.0), 'w_total': n * job['cycle_s'],
+            'q_teach': float(stats[:, ST['queue']].sum()), 'teach_dropped': float(stats[:, ST['dropped']].sum()),
+            'cpu_collect': job.get('cpu_collect', 0.0), 'cpu_update': cpu_share(job['cpu0'], cpu_end),
+            'c_wait_learner': job.get('cycle_wait_s', 0.0), 'c_dec_min': job.get('dec_min', 0.0),
+            'c_dec_max': job.get('dec_max', 0.0), 'dec_w': job.get('dec_w', ''),
+            'c_trainer_cores': job.get('proc_cores', 0.0),
+        }
+        if mem_on:   # 2026-10-11 (memory): BPTT chunks and rows of the update (trained decisions: count)
+            row['mem_chunks'], row['mem_rows'] = mplan['chunks'], len(flat)
+        if split:   # B38: gpu_reserved_gb is the learner's GPU; the actor's, the hand-off's bytes and its host seconds
+            row['gpu_reserved_gb_actor'] = job['actor_mem'] / 2 ** 30 if 'actor_mem' in job else \
+                torch.cuda.max_memory_reserved(adev) / 2 ** 30
+            row['handoff_mb'] = job.get('lbytes', 0) / 2 ** 20
+            row['handoff_s'] = job.get('lhand_s', 0.0)
+            row['take_weights_s'] = L.get('take_s', 0.0)
+        if job.get('collect_actors'):   # B38 step 5: each actor process's collect seconds and memory (GB)
+            row['collect_actors'] = job['collect_actors']
+            row['gpu_reserved_gb_actors'] = ' '.join(f'{m_ / 2 ** 30:.2f}' for m_ in job.get('actor_mem_all', []))
+        if child is not None:   # B38 step 2: the message's way (actor put -> here), the mirror copy on the GPU, the
+            #                     weights' publication (gather + peer copy + sync), this process's cores
+            row['handoff_q_s'] = job.get('lq_s', 0.0)
+            row['handoff_gpu_ms'] = job['lcopy'][0].elapsed_time(job['lcopy'][1]) if job.get('lcopy') else ''
+            row['publish_s'] = L.get('publish_s', 0.0)
+            row['c_learner_cores'] = job.get('lcores', 0.0)
+        if t_on:   # 2026-10-14 (B30): the update's chunks and the room tokens made in the rollout
+            row['t_chunks'] = len(tch)
+            row['t_rooms_new'] = t_rooms_new
+        if gtok_on:   # (B22) value_global's loss and the explained variance of its update-start values
+            row['v_global_loss'] = float(gacc[0]) / steps_ if glob_loss else ''
+            if glob_loss:
+                rg_, vg_ = (b_ret_g, b_vg) if not chunked else (b_ret_g.index_select(0, ev_rows),
+                                                                b_vg.index_select(0, ev_rows))
+                var_g = float(rg_.var())
+                row['v_global_ev'] = 1.0 - float((rg_ - vg_).var()) / var_g if var_g > 0 else 0.0
+            else:
+                row['v_global_ev'] = ''
+        row.update({f'u_{k}': v for k, v in U.items()})
+        row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
+        if run or items:   # 2026-10-06: run / item counters (absent in the other modes: their columns are unchanged)
+            m_all = max(len(finished), 1)
+            row.update({'items_taken': sum(e.get('items', 0) for e in finished),
+                        'active_uses': sum(e.get('uses', 0) for e in finished),
+                        'pills_used': sum(e.get('pills', 0) for e in finished),
+                        'exits': sum(e.get('exits', 0) for e in finished),
+                        'stage_max': max([e.get('stage', 0) for e in finished] or [0]),
+                        'stage_mean': sum(e.get('stage', 0) for e in finished) / m_all})
+            if cfg.start_build_prob > 0:   # 2026-10-08: start builds transplanted so far (worker totals)
+                row['start_builds'] = float(stats[:, ST['start_builds']].sum())
+        if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): this update's worker deltas
+            tot = {k_p: float(stats[:, ST[k_p]].sum()) for k_p in ('pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups')}
+            prev = L.get('pf_prev') or dict.fromkeys(tot, 0.0)
+            L['pf_prev'] = tot
+            row['pickup_force_p'] = L.get('pf_p', pick_force[0]) if pf_on else 0.0
+            row['pickup_forced_eps'] = tot['pf_eps'] - prev['pf_eps']
+            row['pickup_forced_steps'] = tot['pf_steps'] - prev['pf_steps']
+            row['pickups_forced'] = tot['pf_pickups'] - prev['pf_pickups']
+            row['pickups_free'] = tot['free_pickups'] - prev['free_pickups']
+            row['start_pedestals'] = float(stats[:, ST['start_pedestals']].sum())
+            if pf_on:
+                row['pickup_imit'] = float(pacc[0]) / steps_
+                row['forced_share'] = pf_share   # (forced share of the update's trained decisions)
+        if cfg.stat_aug_prob > 0:   # 2026-10-08: stat augmentations applied so far (worker totals)
+            row['stat_augs'] = float(stats[:, ST['stat_augs']].sum())
+        if cfg.no_active_prob > 0:   # B39: no-active starts so far (worker totals) and this update's finished episodes
+            #                          by their first record's has_active (archive starts included: their real state)
+            row['no_actives'] = float(stats[:, ST['no_actives']].sum())
+            row['no_active_removed'] = float(stats[:, ST['no_active_removed']].sum())
+            for k_a, a_ in (('noact', 0), ('act', 1)):
+                eps_a = [e for e in finished if e.get('active0') == a_]
+                m_a = max(len(eps_a), 1)
+                row[f'{k_a}/episodes'] = len(eps_a)
+                row[f'{k_a}/exits'] = sum(e.get('exits', 0) for e in eps_a) / m_a
+                row[f'{k_a}/stage'] = sum(e.get('stage', 0) for e in eps_a) / m_a
+                row[f'{k_a}/timeout'] = sum(e['done'] == 3 for e in eps_a) / m_a
+        if cfg.archive_plr > 0:   # 2026-10-10: mean score of the last reported episodes
+            row['plr_score'] = float(stats[:, ST['plr_score']].mean())
+        if cfg.teacher_death_depths:   # 2026-10-09: fatal hurts searched / with a safe move / their seconds (totals)
+            for k_d in ('death_searches', 'death_avoidable', 'death_s'):
+                row[k_d] = float(stats[:, ST[k_d]].sum())
+        if v2_on:   # 2026-10-10 (teacher v2): worker totals, this update's window, the trainer's side
+            tot = {k_v: float(stats[:, ST[k_v]].sum()) for k_v in (
+                'v2_points', 'v2_random', 'v2_fatal', 'v2_depths', 'v2_improving', 'v2_gain0', 'v2_gain', 'v2_spread',
+                'v2_reps', 'v2_branches', 'v2_dec', 'v2_frames', 'v2_records', 'v2_s', 'v2_cpu', 'v2_wait_s',
+                'v2_errors', 'v2_queue', 'v2_dropped', 'v2_nodepth')}
+            prev = L.get('v2_prev') or dict.fromkeys(tot, 0.0)
+            dlt = {k_v: tot[k_v] - prev[k_v] for k_v in tot}
+            L['v2_prev'] = tot
+            row.update(tot)
+            pts_ = dlt['v2_points'] - dlt['v2_nodepth']   # points with a depth searched in this window
+            row['v2_points_w'] = dlt['v2_points']
+            row['v2_improving_share'] = dlt['v2_improving'] / pts_ if pts_ > 0 else ''
+            row['v2_gain0_mean'] = dlt['v2_gain0'] / pts_ if pts_ > 0 else ''
+            row['v2_spread_mean'] = dlt['v2_spread'] / dlt['v2_reps'] if dlt['v2_reps'] > 0 else ''
+            row['v2_cpu_per_point'] = dlt['v2_cpu'] / dlt['v2_points'] if dlt['v2_points'] > 0 else ''
+            row['v2_game_hours'] = tot['v2_frames'] / 30 / 3600
+            row['v2_new'], row['v2_held'], row['v2_step'] = v2_new, L['v2_n'], v2_step
+            for k_v in ('v2_prior', 'v2_prior_p', 'v2_prior_all', 'v2_firsts', 'v2_new_gain', 'v2_new_spread',
+                        'v2_prior_move_all', 'v2_verr', 'v2_verr_abs'):
+                row[k_v] = v2_log.get(k_v, '')
+            vacc_c = vacc.cpu().numpy()
+            row['v2_loss_pi'] = vacc_c[0] / v2_steps if v2_steps else ''
+            row['v2_loss_vf'] = vacc_c[1] / v2_steps if v2_steps else ''
+            row['v2_logp'] = vacc_c[2] / v2_steps if v2_steps else ''
+            row['v2_lane_calls'], row['v2_lane_rows'] = lane_stat['calls'], lane_stat['rows']
+            row['v2_lane_s'] = lane_stat['s']   # (B36: the actor thread's seconds in the lane service)
+            row['v2_lane_fly_s'], row['v2_lane_held_s'] = lane_stat['fly_s'], lane_stat['held_s']   # (B36)
+            row['v2_lane_eager'] = lane_stat['eager']
+        if cf_on:   # B34 (the counterfactual teacher): worker totals, this update's window, the trainer's side
+            keys_c = [k_c for k_c in ST if k_c.startswith('cf_')]
+            tot_c = {k_c: float(stats[:, ST[k_c]].sum()) for k_c in keys_c}
+            prev_c = L.get('cf_prev') or dict.fromkeys(tot_c, 0.0)
+            d_c = {k_c: tot_c[k_c] - prev_c[k_c] for k_c in tot_c}
+            L['cf_prev'] = tot_c
+            for k_c in keys_c:
+                if not k_c.startswith('cf_t_'):
+                    row[k_c] = tot_c[k_c]
+            for name_t in CF_TRIGGERS:   # points searched per trigger type (totals)
+                row[f'cf_points/{name_t}'] = tot_c['cf_t_' + name_t]
+            done_c = d_c['cf_done']
+            row['cf_points_w'] = d_c['cf_points']
+            row['cf_improving_share'] = d_c['cf_improving'] / done_c if done_c > 0 else ''
+            row['cf_gain0_mean'] = d_c['cf_gain0'] / done_c if done_c > 0 else ''
+            row['cf_taken_mean'] = d_c['cf_taken'] / done_c if done_c > 0 else ''
+            row['cf_spread_mean'] = d_c['cf_spread'] / d_c['cf_reps'] if d_c['cf_reps'] > 0 else ''
+            row['cf_cpu_per_point'] = d_c['cf_cpu'] / d_c['cf_points'] if d_c['cf_points'] > 0 else ''
+            row['cf_wait_per_point'] = d_c['cf_wait_s'] / d_c['cf_points'] if d_c['cf_points'] > 0 else ''
+            row['cf_dec_w'] = d_c['cf_dec']   # branch decisions this window (vs the update's own decisions)
+            row['cf_game_hours'] = tot_c['cf_frames'] / 30 / 3600
+            row['cf_snaps'] = prof.get('cf_snaps', 0)
+            if args.cf_wall:   # B40: the wall points' bomb_at branches in this window
+                wd_c = d_c['cf_wall_done']
+                for k_w in ('opened', 'bombed', 'best'):
+                    row[f'cf_wall_{k_w}_share'] = d_c[f'cf_wall_{k_w}'] / wd_c if wd_c > 0 else ''
+                row['cf_wall_gain_mean'] = d_c['cf_wall_gain'] / wd_c if wd_c > 0 else ''
+                row['cf_wall_p_mean'] = d_c['cf_wall_p'] / wd_c if wd_c > 0 else ''
+            if args.cf_defer_target:   # B40: the deferred branches' starts and waits in this window
+                dp_c = d_c['cf_defer_points']
+                row['cf_defer_started_share'] = d_c['cf_defer_started'] / dp_c if dp_c > 0 else ''
+                row['cf_defer_wait_s'] = d_c['cf_defer_wait'] * args.frames_per_decision / 30 / d_c['cf_defer_started'] \
+                    if d_c['cf_defer_started'] > 0 else ''
+            for k_v in ('cf_prior', 'cf_prior_p', 'cf_prior_all', 'cf_firsts', 'cf_new_gain', 'cf_new_spread',
+                        'cf_new_target', 'cf_verr', 'cf_new') + tuple(f'cf_prior/{t_}' for t_ in CF_TRIGGERS):
+                row[k_v] = v2_log.get(k_v, '')
+        if char_ids:   # 2026-10-08 (characters): floor starts built as non-Isaac (worker totals) and, per character,
+            #            this update's finished episodes and their floor clears
+            row['char_starts'] = float(stats[:, ST['char_starts']].sum())
+            for c_id in char_ids:
+                eps_c = [e for e in finished if e.get('char0') == c_id]
+                row[f'char_{c_id}/episodes'] = len(eps_c)
+                row[f'char_{c_id}/win'] = sum(e['done'] == 1 for e in eps_c) / max(len(eps_c), 1)
+        if gains_on:   # 2026-10-08: heal / resource terms on: per finished episode
+            m_all = max(len(finished), 1)
+            row['healed'] = sum(e.get('healed', 0.0) for e in finished) / m_all
+            row['gathered'] = sum(e.get('gathered', 0.0) for e in finished) / m_all
+            for k_st in range(1, 9):
+                row[f'stage_{k_st}'] = sum(e.get('stage', 0) == k_st for e in finished)
+        if branching:   # 2026-10-07: branch counters (worker totals so far) and this update's branch episodes
+            for k_b in ('bp_item', 'bp_door', 'bp_item_left', 'bp_exit', 'bp_item_far', 'bp_dropped', 'b_points',
+                        'b_branches', 'b_dec', 'b_frames', 'b_s', 'b_cpu', 'b_prep_s', 'b_invalid', 'b_walk_fail',
+                        'b_skip_took', 'b_errors', 'choices', 'b_queue', 'b_replicates', 'b_ped_seen', 'b_game_cpu'):
+                row[k_b] = float(stats[:, ST[k_b]].sum())
+            row['actual_game_hours'] = float(stats[:, ST['frames']].sum()) / 30 / 3600
+            row['branch_game_hours'] = float(stats[:, ST['b_frames']].sum()) / 30 / 3600
+            row['branch_episodes'] = len(job.get('branch_finished', []))
+            row['choices_new'] = L.get('choice_new', 0)
+            row['choices_held'] = L.get('choice_n', 0)
+            for k_b in ('b_shop_skip', 'b_unreach_skip', 'b_twins', 'b_twin_act_diff', 'b_pairs', 'b_noise_pairs',
+                        'b_cond_pairs', 'b_archived'):
+                row[k_b] = float(stats[:, ST[k_b]].sum())
+            for k_n in ('item', 'item_left'):
+                v_n = L['noise'].get(k_n)
+                row[f'noise_var_{k_n}'] = v_n[0] if v_n else ''
+                row[f'noise_n_{k_n}'] = v_n[1] if v_n else 0
+            row['adv_corr_n'], row['adv_corr_abs'] = L.get('corr_n', 0), L.get('corr_abs', 0.0)
+            row['snap_calls'], row['snap_miss'] = prof.get('snap_calls', 0), prof.get('snap_miss', 0)
+            cs_ = corr_stats.cpu().numpy()
+            row['adv_corr_loss'], row['adv_corr_clip'] = float(cs_[0]), float(cs_[1]) / max(args.epochs, 1)
+            for k_c in ('choice_labeled', 'choice_train_pairs', 'choice_loss', 'choice_spread', 'choice_held_n',
+                        'choice_held_acc', 'choice_held_acc_sig', 'choice_held_sig_n', 'choice_held_mse',
+                        'choice_held_floor', 'choice_held_corr', 'choice_held_slope', 'choice_train_n',
+                        'choice_train_acc', 'choice_train_acc_sig', 'choice_train_mse', 'choice_train_floor',
+                        'choice_train_corr', 'choice_train_slope'):
+                row[k_c] = choice_log.get(k_c, '')
+        if lab is not None:   # 2026-10-08: the lab's counters (worker totals so far) and this update's builds
+            for k_l in ('lab_jobs', 'lab_states', 'lab_dec', 'lab_s', 'lab_cpu', 'lab_game_cpu', 'lab_errors',
+                        'lab_results', 'lab_panel', 'lab_panel_s', 'lab_panel_builds'):
+                row[k_l] = float(stats[:, ST[k_l]].sum())
+            row['actual_game_hours'] = float(stats[:, ST['frames']].sum()) / 30 / 3600
+            row['lab_game_hours'] = float(stats[:, ST['lab_frames']].sum()) / 30 / 3600
+            row['lab_episodes'] = len(job.get('lab_finished', []))
+            row['lab_posted'], row['lab_open'] = lab['posted'], len(lab['book'].open)
+            row.update(lab_learn(job.get('lab_results', [])))
+        for gi, name in enumerate(names):
+            eps = [e for e in finished if e['group'] == gi]
+            m = max(len(eps), 1)
+            row.update({f'{name}/episodes': len(eps),
+                        f'{name}/win': sum(e['done'] == 1 for e in eps) / m,
+                        f'{name}/death': sum(e['done'] == 2 for e in eps) / m,
+                        f'{name}/timeout': sum(e['done'] == 3 for e in eps) / m,
+                        f'{name}/hurt': sum(e['hurt'] for e in eps) / m,
+                        f'{name}/nohit_win': sum(e['done'] == 1 and e['hurt'] == 0 for e in eps) / m,
+                        f'{name}/return': sum(e['ret'] for e in eps) / m,
+                        f'{name}/seconds': sum(e['decisions'] for e in eps) / m * args.frames_per_decision / 30,
+                        f'{name}/rooms': sum(e['rooms'] for e in eps) / m,
+                        f'{name}/boss': sum(e['boss'] for e in eps) / m})
+        if L['writer'] is None:
+            columns = log_columns(list(row))
+            L['writer'] = csv.DictWriter(log_file, fieldnames=columns, restval='')
+            if log_file.tell() == 0:
+                L['writer'].writeheader()
+        L['writer'].writerow(row)
+        log_file.flush()
+        for e in finished:
+            episodes_path.write(json.dumps(dict(e, update=upd)) + '\n')
+        episodes_path.flush()
+        if branch_path is not None:
+            for e in job.get('branch_finished', []):
+                branch_path.write(json.dumps(dict(e, update=upd)) + '\n')
+            branch_path.flush()
+        if upd % 5 == 0 or upd == 1:
+            wins = ' '.join(f"{nm} win {row[f'{nm}/win']:.2f} hurt {row[f'{nm}/hurt']:.2f}" for nm in names)
+            print(f"u{upd} {row['game_hours']:.1f} gh {row['x_real_time']:.0f}x collect {job['collect_s']:.1f}s "
+                  f"update {update_s:.1f}s idle {row['idle_share']:.2f} infer {row['infer_ms']:.2f}/"
+                  f"{row['infer_upd_ms']:.2f}ms kl {row['kl']:.4f} ev {ev:.2f} ent {row['entropy']:.2f} | {wins}",
+                  flush=True)
+        t_ck = time.perf_counter()
+        L['log_s'] = t_ck - t_end
+        if upd % args.checkpoint_every == 0:
+            save(out / 'checkpoints' / f'update-{upd:06d}.pt')
+        L['ckpt_s'] = time.perf_counter() - t_ck
+
+    jobs = queue.Queue()
+    fresh = threading.Event()        # set by the learner when new weights are final
+    failure = []
+
+    def learner_loop():
+        if split:   # B38: this thread's current GPU is the learner's (CUDA's current device is per thread)
+            torch.cuda.set_device(ldev)
+        torch.cuda.set_stream(learner_stream)
+        if learner_cpus:   # (B18: this thread, and the threads it starts, on --learner-cpus)
+            os.sched_setaffinity(0, learner_cpus)
+        while True:
+            job = jobs.get()
+            if job is None:
+                return
+            try:
+                if os.environ.get('ISAAC_RL_LEARNER_BENCH') and not L.get('stop'):
+                    # 2026-10-10 (B18): the learner bench on this job (abplus_bench_learner.py), then the run ends
+                    from abplus_bench_learner import run_bench
+                    if run_bench(dict(learn=learn, job=job, model=learner_model, opt=opt, L=L, args=args,
+                                      stats=sampler.stats.copy())):
+                        fresh.set()
+                        continue
+                learn(job)
+            except BaseException as exc:   # handed to the main thread
+                failure.append(exc)
+                fresh.set()
+                return
+
+    def learner_process():
+        """B38 step 2 (--learner-process 1), the learner process's loop: per job message the rollout's view (the
+        actor's shared host arrays, its scalars, its device tensors through CUDA IPC), the copy of its temporal rows to
+        this GPU (hand_off, as the step-1 hand-off), learn(). `fresh` here publishes the weights: their bytes gathered
+        on this GPU, copied into the actor's buffer (wmove['fa'], IPC), this stream synchronised, then the message and
+        the event (the actor copies them into its parameters when it takes them). The actor never rewrites a rollout
+        before the `fresh` of the update that read it (as with the thread: the next hand-off waits for it), and this
+        process reads nothing of a rollout after its `fresh`. An exception: an 'error' message (the actor raises it);
+        the stop message (None) or the actor's end: last.pt saved here, a 'done' message."""
+        nonlocal fresh
+        import multiprocessing as mp_
+        import traceback
+        sys.stdout = child_stdout
+        torch.cuda.set_device(ldev)
+        torch.cuda.set_stream(learner_stream)
+        if learner_cpus:
+            os.sched_setaffinity(0, learner_cpus)
+        jobs_q, results_q, ev = child['jobs'], child['results'], child['fresh']
+        fa, sizes = child['fa'], child['sizes']
+        fb = torch.empty(sum(sizes), dtype=torch.uint8, device=ldev)
+        keep = []   # (the shared arrays' mappings)
+        n_act_l = int(child.get('n_act', 1))
+        # (B38 step 5: per actor its messages, event and weights buffer (the second one's arrives with its start
+        # message); per rollout buffer the shared arrays of all workers, per (actor, buffer) its scalars and tensors)
+        outs = [dict(results=results_q, fresh=ev, fa=fa)] + [dict(o_, fa=None) for o_ in child.get('others') or []]
+        if n_act_l > 1:
+            fulls = {bid: attach_arrays(child['pid'], d['full'], keep) for bid, d in child['rolls'].items()}
+            a_scal = {(0, bid): d['scal'] for bid, d in child['rolls'].items()}
+            a_tdev = {(0, bid): d['tdev'] for bid, d in child['rolls'].items()}
+            halves_by_seq = {}
+            views = fulls
+        else:
+            views = {bid: rollout_view(attach_arrays(child['pid'], d['arrays'], keep), d['scal'], d['tdev'])
+                     for bid, d in child['rolls'].items()}
+        streams = (torch.cuda.Stream(device=device_actor), torch.cuda.Stream(device=ldev))
+        mirror = {}
+
+        def publish():
+            t_p = time.perf_counter()
+            with torch.no_grad():
+                torch.cat([b.detach().reshape(-1).view(torch.uint8) for b in learner_params], out=fb)
+                for o_ in outs:   # (B38 step 5: every actor's buffer on its GPU)
+                    o_['fa'].copy_(fb, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            L['publish_s'] = time.perf_counter() - t_p
+            for o_ in outs:
+                o_['results'].put(('fresh', dict(update=L['update'], decisions=L['decisions'], seconds=L['seconds'],
+                                                 pf_p=L.get('pf_p'), publish_s=L['publish_s'])))
+                o_['fresh'].set()
+        fresh = types.SimpleNamespace(set=publish)
+        parent = mp_.parent_process()
+        failed = False
+        cpu_mark, t_mark = time.process_time(), time.perf_counter()
+        fail_at = int(os.environ.get('ISAAC_RL_B38_FAIL_AT', '0') or 0)
+        dump_dir = os.environ.get('ISAAC_RL_B38_DUMP', '')   # (B38 step 3: save the job of update dump_at)
+        dump_at = int(os.environ.get('ISAAC_RL_B38_DUMP_AT', '5') or 5)   # (the dump_at-th job of this process)
+        # (B38 step 4, a measurement aid: ISAAC_RL_B38_TORCHPROF=<dir>: the torch profiler over the k-th update of
+        # this process, ISAAC_RL_B38_TORCHPROF_AT=k (default 3): a table and a Chrome trace in <dir>)
+        prof_dir = os.environ.get('ISAAC_RL_B38_TORCHPROF', '')
+        prof_at = int(os.environ.get('ISAAC_RL_B38_TORCHPROF_AT', '3') or 3)
+        n_jobs = 0
+        received_histories={a_:{} for a_ in range(n_act_l)}
+        deferred_jobs = collections.deque()
+
+        def restore_histories(job):
+            if args.rebuild_memory and isinstance(job['rscal']['raw_contexts'], tuple):
+                ipc_start = time.perf_counter()
+                if n_act_l>1:
+                    shared=fulls[job['bid']];lo=job['aid']*job['rscal']['n'];hi=lo+job['rscal']['n']
+                    ipc_rows,ipc_pending=shared['rows'][lo:hi],shared['pending'][lo:hi]
+                else:ipc_rows,ipc_pending=views[job['bid']].rows,views[job['bid']].pending
+                job['rscal']['raw_contexts'] = unpack_histories(job['rscal']['raw_contexts'], args.memory_block,
+                    previous=received_histories[job['aid']],rows=ipc_rows,pending=ipc_pending)
+                if PROFILE_MEMORY:
+                    print('MEMORY_IPC_RESTORE ' + json.dumps(dict(aid=job['aid'], seq=job['seq'], restore_s=time.perf_counter()-ipc_start)), flush=True)
+
+        def receive_prefetch(job):
+            t_recv = time.perf_counter()
+            _,aid_,bid_,seq_,n_,packed_,sent_ = job
+            shared_ = fulls[bid_] if n_act_l > 1 else vars(views[bid_])
+            lo_ = aid_*n_ if n_act_l > 1 else 0
+            rr_,pp_ = shared_['rows'][lo_:lo_+n_],shared_['pending'][lo_:lo_+n_]
+            contexts_ = unpack_histories(packed_,args.memory_block,
+                previous=received_histories[aid_],rows=rr_,pending=pp_,latest_only=True)
+            latest_ = {h_.uid:(h_,rr_[w_,t_],pp_[w_,t_]) for h_,w_,t_ in contexts_}
+            decoded_ = time.perf_counter()
+            ensure_source_pipeline()
+            # A finished VJP can commit here while the Actors are
+            # still collecting. An unfinished one never blocks IPC.
+            source_pipeline.poll_finish(opt,args.max_grad_norm)
+            committed_ = time.perf_counter()
+            source_pipeline.prefetch_live.setdefault(seq_,set()).update(latest_)
+            admitted_=source_pipeline.prefetch(list(latest_.values()),write_ahead=True,speculative=True)
+            print('SOURCE_PREFETCH '+json.dumps(dict(aid=aid_,seq=seq_,episodes=len(latest_),
+                queue_age_s=t_recv-sent_,dispatch_s=time.perf_counter()-t_recv,
+                decode_s=decoded_-t_recv,commit_s=committed_-decoded_,enqueue_s=time.perf_counter()-committed_,
+                admitted=admitted_,version=source_pipeline.version,encoded_rows=source_pipeline.encoded_rows)),flush=True)
+
+        def poll_source_prefetch():
+            # At a Reader minibatch boundary, not only after learn() returns.
+            # Process one message per boundary to avoid starving Reader dispatch.
+            try: message = jobs_q.get_nowait()
+            except queue.Empty: return
+            if isinstance(message,tuple) and message[0] == 'source_prefetch':
+                receive_prefetch(message)
+            else:
+                if isinstance(message,dict): restore_histories(message)
+                deferred_jobs.append(message)
+
+        if args.source_prefetch_records: L['poll_source_prefetch'] = poll_source_prefetch
+        sync_at = int(os.environ.get('ISAAC_RL_B38_SYNCDEBUG_AT', '0') or 0)   # (the update whose syncs are listed)
+        print(f'learner process (B38 step 2): pid {os.getpid()}, {ldev}, {len(views)} shared rollouts', flush=True)
+        try:
+            while True:
+                try:
+                    job = deferred_jobs.popleft() if deferred_jobs else jobs_q.get(timeout=1.0)
+                except queue.Empty:
+                    if parent is not None and not parent.is_alive():
+                        print('learner process: the trainer is gone; saving last.pt', flush=True)
+                        break
+                    continue
+                if job is None:
+                    break
+                if isinstance(job, tuple) and job[0] == 'actor':   # (B38 step 5: an actor process's start)
+                    _, a_, fa_, tdevs_, scals_ = job
+                    outs[a_]['fa'] = fa_
+                    for bid_ in tdevs_:
+                        a_tdev[(a_, bid_)], a_scal[(a_, bid_)] = tdevs_[bid_], scals_[bid_]
+                    continue
+                if failed:   # (after an error: only the stop message matters)
+                    continue
+                try:
+                    t_recv = time.perf_counter()
+                    if isinstance(job,tuple) and job[0] == 'source_prefetch':
+                        receive_prefetch(job)
+                        continue
+                    if args.rebuild_memory and PROFILE_MEMORY and isinstance(job['rscal']['raw_contexts'], bytes):
+                        import pickle
+                        payload = job['rscal']['raw_contexts']
+                        job['rscal']['raw_contexts'] = pickle.loads(payload)
+                        print('MEMORY_IPC_RECV ' + json.dumps(dict(aid=job['aid'], seq=job['seq'], bytes=len(payload),
+                              unpack_s=time.perf_counter()-t_recv, queue_age_s=t_recv-job['t_put'])), flush=True)
+                    restore_histories(job)
+                    if n_act_l > 1:   # B38 step 5: an actor's half; the update when every actor's is there
+                        halves_by_seq.setdefault(job['seq'], {})[job['aid']] = job
+                        if len(halves_by_seq[job['seq']]) < n_act_l:
+                            continue
+                        got_ = halves_by_seq.pop(job['seq'])
+                        halves = [got_[a_] for a_ in range(n_act_l)]
+                        bid_ = halves[0]['bid']
+                        if any(h_['bid'] != bid_ for h_ in halves):
+                            raise RuntimeError(f'B38 step 5: the actors\' halves of hand-off {job["seq"]} are in '
+                                               f'different rollout buffers {[h_["bid"] for h_ in halves]}')
+                        for a_, h_ in enumerate(halves):
+                            a_scal[(a_, bid_)] = h_['rscal']
+                            if h_.get('tdev') is not None:
+                                a_tdev[(a_, bid_)] = h_['tdev']
+                        job = merge_jobs(halves)
+                        v, job['lbytes'] = merge_rollouts(
+                            fulls[bid_], [(a_ * a_scal[(a_, bid_)]['n'], a_scal[(a_, bid_)], a_tdev[(a_, bid_)])
+                                          for a_ in range(n_act_l)], mirror, ldev)
+                        job['roll'] = v
+                        job['lhand_s'] = time.perf_counter() - t_recv
+                    else:
+                        v = views[job['bid']]
+                        v.__dict__.update(job['rscal'])
+                        if job.get('tdev') is not None:   # (the actor's pool grew: its new device tensors)
+                            v.t_kv, v.t_o = job['tdev']
+                        job['roll'] = v
+                    job['lq_s'] = t_recv - job['t_put']
+                    sampler.stats = job['stats']
+                    lane_stat.clear()
+                    lane_stat.update(job['lane_stat'])
+                    L['take_s'] = job.get('take_s', 0.0)
+                    now_c, now_t = time.process_time(), time.perf_counter()
+                    job['lcores'] = (now_c - cpu_mark) / max(now_t - t_mark, 1e-9)   # (the cycle before this job)
+                    cpu_mark, t_mark = now_c, now_t
+                    if t_on and n_act_l == 1:
+                        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                        e0.record(streams[1])
+                        job['lroll'], job['lready'], job['lbytes'] = hand_off(v, mirror, ldev, streams)
+                        e1.record(streams[1])
+                        job['lhand_s'] = time.perf_counter() - t_recv
+                        job['lcopy'] = (e0, e1)
+                    if fail_at and L['update'] + 1 == fail_at:   # (a test aid: ISAAC_RL_B38_FAIL_AT)
+                        raise RuntimeError(f'ISAAC_RL_B38_FAIL_AT: injected failure before update {fail_at}')
+                    n_jobs += 1
+                    if dump_dir and n_jobs == dump_at:   # (B38 step 3: a job for abplus_b38_replay.py)
+                        dump_job(job, v, dump_dir)
+                        save(Path(dump_dir) / "start.pt")
+                    if os.environ.get('ISAAC_SOURCE_CPROFILE') and n_jobs == int(os.environ.get('ISAAC_SOURCE_CPROFILE_AT','2')):
+                        import cProfile
+                        profiler = cProfile.Profile()
+                        profiler.runcall(learn, job)
+                        profiler.dump_stats(str(out / f'learner{n_jobs}.pstats'))
+                    elif prof_dir and n_jobs == prof_at:
+                        profile_learn(learn, job, prof_dir)
+                    elif sync_at and n_jobs == sync_at:   # (B38 step 4: every host sync of one update, with its line)
+                        import warnings
+                        with warnings.catch_warnings():
+                            warnings.simplefilter('always')
+                            torch.cuda.set_sync_debug_mode('warn')
+                            try:
+                                learn(job)
+                            finally:
+                                torch.cuda.set_sync_debug_mode('default')
+                    else:
+                        learn(job)
+                    if os.environ.get('ISAAC_HISTORY_PROFILE') and n_jobs in (4,12,24):
+                        from isaac_bridge.rebuild_memory import profile_history_storage
+                        profile_history_storage('learner')
+                    trim_interval=int(os.environ.get('ISAAC_HOST_TRIM_INTERVAL','0'))
+                    if trim_interval and n_jobs%trim_interval==0:
+                        from isaac_bridge.rebuild_memory import trim_host_heap
+                        trim_host_heap('learner')
+                except BaseException:
+                    failed = True
+                    tb_ = traceback.format_exc()
+                    for o_ in outs:   # (B38 step 5: every actor stops)
+                        o_['results'].put(('error', tb_))
+                        o_['fresh'].set()
+                    if source_pipeline is not None and source_pipeline.processes:break
+        finally:
+            try:
+                torch.cuda.synchronize()
+                save(out / 'checkpoints' / 'last.pt')
+            except BaseException:
+                results_q.put(('error', 'saving last.pt: ' + traceback.format_exc()))
+            finally:
+                try:
+                    if source_pipeline is not None and source_pipeline.processes:source_pipeline.close()
+                except BaseException:
+                    results_q.put(('error', 'closing source processes: ' + traceback.format_exc()))
+            results_q.put(('done', dict(update=L['update'], decisions=L['decisions'], seconds=L['seconds'])))
+            for o_ in outs:
+                o_['results'].close()
+                o_['results'].join_thread()
+
+    if child is not None:   # B38 step 2: this is the learner process
+        learner_process()
+        return
+    results = None   # (B38 step 2) the learner process's messages: ('fresh' | 'error' | 'done', info)
+    sent_gen = {}   # (B38 step 2) per shared rollout: the pool generation (t_grown) whose device tensors it has
+    actor_b = stop_ev = stop_b = None   # (B38 step 5: the second actor process and its stop event (first actor); the
+    #                                     stop event this actor obeys (a second actor))
+    seq_n = 0   # (B38 step 5: this actor's hand-offs, the learner pairs the actors' halves by it)
+    sent_histories={}
+    clean_end = False   # (B38 step 5: the actor loop ended by itself, no exception)
+    b_last = None   # (B38 step 5, the first actor: set when the second has handed its last half)
+    if actor is not None:   # B38 step 5: a second actor: the learner's queue, its own messages, event and stop
+        import multiprocessing as mp_a
+        jobs, results, fresh, stop_ev = actor['jobs'], actor['results'], actor['fresh'], actor['stop']
+        parent_a = mp_a.parent_process()
+        for bid, r_ in enumerate((roll, spare)):
+            r_.bid = bid
+            sent_gen[bid] = getattr(r_, 't_grown', 0)
+        jobs.put(('actor', aid, wmove['fa'], {r_.bid: (r_.t_kv, r_.t_o) if r_.t_kv is not None else None
+                                             for r_ in (roll, spare)},
+                  {r_.bid: rollout_scalars(r_) for r_ in (roll, spare)}))
+        learner = types.SimpleNamespace(   # (the learner as this actor sees it: alive while the first actor is)
+            start=lambda: None, join=lambda timeout=None: None, terminate=lambda: None,
+            is_alive=lambda: parent_a.is_alive() and not stop_ev.is_set())
+        sys.stdout = actor_stdout
+        print(f'actor process {aid} (B38 step 5): pid {os.getpid()}, {device_actor}, workers {w_lo} .. '
+              f'{w_lo + n - 1}, rollout {args.rollout // n_act} decisions', flush=True)
+    elif proc:   # B38 step 2: the learner process (spawned: it builds its own CUDA state); its queues and event
+        mpc = torch.multiprocessing.get_context('spawn')
+        jobs, results, fresh = mpc.Queue(), mpc.Queue(), mpc.Event()
+        rolls_init = {}
+        for bid, r_ in enumerate((roll, spare)):
+            r_.bid = bid
+            if n_act > 1:   # (B38 step 5: the arrays of all workers; the first actor's scalars and tensors)
+                rolls_init[bid] = dict(full=shared_full.describe(types.SimpleNamespace(**full_rolls[bid])),
+                                       scal=rollout_scalars(r_),
+                                       tdev=(r_.t_kv, r_.t_o) if r_.t_kv is not None else None)
+            else:
+                rolls_init[bid] = dict(arrays=shared.describe(r_), scal=rollout_scalars(r_),
+                                       tdev=(r_.t_kv, r_.t_o) if r_.t_kv is not None else None)
+            sent_gen[bid] = getattr(r_, 't_grown', 0)
+        others = [dict(results=mpc.Queue(), fresh=mpc.Event()) for _ in range(n_act - 1)]
+        stop_b = mpc.Event() if n_act > 1 else None
+        b_last = mpc.Event() if n_act > 1 else None
+        learner = mpc.Process(target=learner_child_entry, name='learner', daemon=not bool(args.source_processes), args=(
+            list(sys.argv[1:] if argv is None else argv),
+            dict(pid=os.getpid(), stats=sampler.stats.copy(), v2_on=v2_on, rolls=rolls_init, fa=wmove['fa'],
+                 sizes=wmove['sizes'], jobs=jobs, results=results, fresh=fresh, n_act=n_act, others=others)))
+        if n_act > 1:   # B38 step 5: the second actor process (its own sampler, GPU, half of every rollout)
+            actor_b = mpc.Process(target=actor_child_entry, name='actor1', daemon=False, args=(
+                list(sys.argv[1:] if argv is None else argv),
+                dict(aid=1, pid=os.getpid(), jobs=jobs, results=others[0]['results'], fresh=others[0]['fresh'],
+                     stop=stop_b, last=b_last, full={bid: rolls_init[bid]['full'] for bid in rolls_init})))
+        sh_mb = sum(nb for d in rolls_init.values() for (_, nb, _, _) in d.get('arrays', d.get('full')).values()) / 2 ** 20
+        print(f'learner process (B38 step 2): rollouts\' host arrays shared ({sh_mb:.0f} MiB of address space, '
+              'pages as written), their temporal tensors and the weights\' buffer through CUDA IPC'
+              + (f'; {n_act} actor processes of {n} workers each' if n_act > 1 else ''), flush=True)
+    else:
+        learner = threading.Thread(target=learner_loop, name='learner', daemon=True)
+    learner.start()
+    if actor_b is not None:
+        actor_b.start()
+
+    def check_actors():
+        """(B38 step 5, the first actor) the second actor process must be alive (else the run ends)."""
+        if actor_b is not None and not actor_b.is_alive() and not failure:
+            failure.append(RuntimeError(f'the actor process 1 ended (exit code {actor_b.exitcode})'))
+        if failure:
+            raise failure[0]
+
+    def stopped():
+        """(B38 step 5, another actor) the first actor asked this one to stop."""
+        return stop_ev is not None and stop_ev.is_set()
+
+    def learner_message(timeout=600.0):
+        """(B38 step 2) the learner process's next message (kind, info); an 'error' raises here, so does a learner
+        process that ended without one."""
+        t_lim = time.perf_counter() + timeout
+        while True:
+            try:
+                kind, info = results.get(timeout=1.0)
+            except queue.Empty:
+                check_actors()
+                if not learner.is_alive():
+                    failure.append(RuntimeError('the learner process ended without a message' if actor is None else
+                                                'the first actor stopped this one'))
+                    raise failure[-1]
+                if time.perf_counter() > t_lim:
+                    failure.append(RuntimeError(f'no message from the learner process in {timeout:.0f} s'))
+                    raise failure[-1]
+                continue
+            if kind == 'error':
+                failure.append(RuntimeError('learner process:\n' + info))
+                raise failure[-1]
+            return kind, info
+
+    # ------------------------------------------------------------------ actor (the main thread)
+    pending = np.zeros((n, nh), np.int64)            # the action under way per worker
+    book = Episodes(n, rw, floor, run=run, items=items)
+    if cfg.archive_plr > 0:   # 2026-10-10: the trainer reports each episode's learning-potential score to its worker
+        book.plr = (sampler.stats, ST, args.gamma)
+    if cfg.stat_aug_prob > 0:   # 2026-10-08: the start stats of every episode into episodes.jsonl
+        book.stats0 = {}
+    if char_ids:   # 2026-10-08: the character of every episode into episodes.jsonl (char0)
+        book.char0 = {}
+    if cfg.no_active_prob > 0:   # B39: has_active at every episode's first record into episodes.jsonl (active0)
+        book.active0 = {}
+    if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): build_pedestals, pickup_forced, forced_steps
+        book.pick = dict(bped={}, steps=np.zeros(n, np.int64))
+    version = update                                # the actor's weights: updates done
+    busy = False                                     # an update is running on the learner
+    handed = decisions_total
+    wcols = ('step_s', 'wait_s', 'encode_s', 'fork_s', 'teach_s', 'overrun_s', 'state_s', 'close_s')
+    sync_wait = 0.0
+
+    def take_weights():
+        nonlocal version, busy
+        fresh.clear()
+        if failure:
+            raise failure[0]
+        t_w = time.perf_counter()
+        if proc:   # B38 step 2: the learner process's announcement; the bytes are in wmove['fa'] already
+            kind, info = learner_message()
+            if pf_on and info.get('pf_p') is not None:   # (B23: the workers read it from the stats)
+                sampler.stats[:, ST['pf_p']] = info['pf_p']
+            L.update(update=info['update'], decisions=info['decisions'], seconds=info['seconds'])
+        with torch.no_grad():
+            if proc:
+                torch._foreach_copy_(wmove['av'], list(wmove['fa'].split(wmove['sizes'])))
+            elif wmove is not None:   # B38: from the learner's GPU (its stream synchronised before `fresh`; waited on
+                #                     there too), one peer copy, ordered before the actor's stream (move_weights)
+                move_weights(wmove, learner_params, learner_stream)
+            else:   # (B38 split without the flat path: cross-device copies, each ordered against the actor's stream)
+                for a, b in zip(actor_params, learner_params):
+                    a.copy_(b)
+        model.invalidate_source_cache()
+        torch.cuda.current_stream().synchronize()
+        if split:
+            L['take_s'] = time.perf_counter() - t_w
+        version += 1
+        sampler.control[3] = version   # 2026-10-07: the actor's weights, for the workers' choice records
+        if snaps and version % args.branch_snap_every == 0:   # Phase B2: the older snapshot takes these weights
+            e = min(snaps, key=lambda e_: e_['id'])
+            with torch.no_grad():
+                for a, b in zip(e['params'], actor_params):
+                    a.copy_(b)
+            torch.cuda.current_stream().synchronize()
+            e['id'] = version
+            aux[n, AUX_SNAP] = version
+        busy = False
+
+    def wait_learner():
+        # (teacher v2: the lanes are answered meanwhile; their poll releases the GIL)
+        while not fresh.wait(0.0 if v2_on else 0.5):
+            if lanes is not None:   # (B36: a round with its window, to its answer)
+                lanes.serve_wait(0.005)
+            if failure or not learner.is_alive() or (actor_b is not None and not actor_b.is_alive()):
+                break
+        if lanes is not None:   # (B36: no lane call runs while the weights change)
+            lanes.quiesce()
+        take_weights()
+
+    aux = sampler.aux   # Phase B2 (branches): the actor's value, log-probability and choice outputs per worker
+    from isaac_bridge.tok_branch import AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_USED
+    snaps = []   # Phase B2: the weight snapshots the branch records are answered with (tok_branch, aux block)
+    if aux is not None and args.branch_snap_every > 0 and use_graphs:
+        for k_s in range(2):
+            m_s = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
+                            ent_ext=ent_ext, pchar=pchar, memory=mem_dim, **tok_kw).to(device).eval()
+            m_s.load_state_dict(model.state_dict())
+            e_s = dict(id=version if k_s == 0 else -1, model=m_s, actors=[],
+                       params=list(m_s.parameters()) + list(m_s.buffers()))
+            for _ in range(max(1, args.actor_slots)):   # (calls in flight per snapshot, as the actor's own)
+                g_s = GraphActor(m_s, n, g_ents, stream=torch.cuda.Stream(priority=-5),
+                                 crn=bool(args.branch_crn), memory=mem_table, **gkw)
+                g_s.snap, g_s.in_flight = e_s, False
+                e_s['actors'].append(g_s)
+            snaps.append(e_s)
+        aux[n, AUX_SNAP], aux[n, AUX_SNAP_ON] = version, 1
+        torch.cuda.synchronize()
+
+    def answer(prof, a_idx, sub, under_way, actions, logp, value, extra=None, ver=None, h=None, vg=None, t=None):
+        """The actions out to the workers, the decisions into the rollout. ver: the weights that answered (a
+        snapshot's id; None: the actor's own). h (memory): the GRU's input state of each record. vg (B24): value_global
+        of each record (global-token models). t (B30): the temporal step's outputs (temporal models)."""
+        t2 = time.perf_counter()
+        if pf_on:   # 2026-10-13 (B23): a forced record's move is the worker's (ROW pforce), its shoot none; stored so
+            fm = sub['pforce']
+            if fm.any():
+                actions = np.array(actions, copy=True)
+                sel_f = np.flatnonzero(fm)
+                actions[sel_f, 0] = fm[sel_f]
+                actions[sel_f, 1] = 0
+        sampler.actions[a_idx, :nh] = actions
+        if v2_on:   # 2026-10-10 (teacher v2): the value of the record, for the worker's log (before the reply)
+            sampler.main_value[a_idx] = value
+            if getattr(sampler, 'main_vg', None) is not None:   # B34: and its value_global (the cf's taken score)
+                sampler.main_vg[a_idx] = value if vg is None else vg
+            if h is not None and getattr(sampler, 'main_h', None) is not None:   # (memory: and its input state)
+                sampler.main_h[a_idx] = h
+        if aux is not None:   # (written before the reply: the worker reads it after its answer)
+            aux[a_idx, 0], aux[a_idx, 1] = value, logp
+            if extra is not None:
+                aux[a_idx, 2], aux[a_idx, 3] = extra[:, 0], extra[:, 1]
+            else:
+                aux[a_idx, 2:4] = 0.0
+            aux[a_idx, AUX_USED] = version if ver is None else ver
+        sampler.reply(a_idx)
+        t3 = time.perf_counter()
+        prof['reply'] += t3 - t2
+        store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h, vg, t)
+        pending[a_idx] = actions
+        prof['store'] += time.perf_counter() - t3
+        if args.source_prefetch_records and proc:
+            mark_ = getattr(roll,'source_prefetch_mark',0)
+            if roll.usable() - mark_ >= args.source_prefetch_records:
+                roll.source_prefetch_mark = roll.usable()
+                packed_ = pack_histories(roll.raw_contexts,previous=sent_histories,shared=True)
+                jobs.put(('source_prefetch',aid,roll.bid,seq_n,roll.n,packed_,time.perf_counter()))
+
+    def finish(prof):
+        """Wait for the oldest call in flight and answer it."""
+        slot, a_idx, sub, under_way, t_sub, was_busy = inflight.popleft()
+        t = time.perf_counter()
+        actions, logp, value = slot.result()
+        t2 = time.perf_counter()
+        ver = None
+        if getattr(slot, 'snap', None) is not None:   # a snapshot's actor (Phase B2)
+            slot.in_flight = False
+            ver = slot.snap['id']
+        else:
+            free.append(slot)
+        prof['act'] += t2 - t
+        prof['latency'] += t2 - t_sub
+        if was_busy:
+            prof['act_busy'] += t2 - t_sub
+        answer(prof, a_idx, sub, under_way, actions, logp, value, slot.extra, ver, slot.h_used, slot.vg,
+               slot.t_out if t_on else None)
+
+    def submit_snapshots(prof, idx_b, sub_b, uw_b, t1):
+        """Phase B2: branch records to the snapshots their workers ask for (the newest when that one is gone)."""
+        req = aux[idx_b, AUX_REQ].astype(np.int64)
+        for sid in np.unique(req):
+            m_ = req == sid
+            e = next((e_ for e_ in snaps if e_['id'] == sid), None)
+            if e is None:
+                e = max(snaps, key=lambda e_: e_['id'])
+                prof['snap_miss'] += int(m_.sum())
+            while all(g_.in_flight for g_ in e['actors']):
+                finish(prof)
+            g = next(g_ for g_ in e['actors'] if not g_.in_flight)
+            g.submit(sub_b[m_], uw_b[m_], *((idx_b[m_], sub_b[m_]['first'] != 0) if mem_on else ()))
+            g.in_flight = True
+            inflight.append((g, idx_b[m_], sub_b[m_], uw_b[m_], t1, busy))
+            prof['snap_calls'] += 1
+
+    if lab is not None:   # 2026-10-08: the first lab jobs, and the builds ordinary episodes end with
+        book.seen_inv = []
+        post_lab_jobs()
+    t_run = time.perf_counter()
+    t_cycle, w_mark = t_run, sampler.stats.copy()
+    proc_mark = time.process_time()   # this process's CPU seconds (all threads)
+    try:
+        if bench_job is not None:   # B18: the saved job straight to the learner's bench, in this thread (no collection)
+            from abplus_bench_learner import run_bench
+            torch.cuda.set_stream(learner_stream)
+            run_bench(dict(learn=learn, job=bench_job, model=learner_model, opt=opt, L=L, args=args,
+                           stats=sampler.stats.copy()))
+            torch.cuda.set_stream(actor_stream)
+        # (B38 step 5: each actor process its share of the decisions and of every rollout)
+        # (with several actors every one makes the same number of hand-offs: the learner pairs them all; one actor
+        # would make (target - start) / --rollout of them, up to rounding)
+        n_handoffs = -(-(target_decisions - decisions_total) // args.rollout)
+        rollout_actor = args.rollout // n_act
+        while (handed < target_decisions if n_act == 1 else seq_n < n_handoffs) and sampler.live and                 not L.get('stop') and not stopped():
+            # ---- collect
+            t0 = time.perf_counter()
+            cpu_c0 = cpu_ticks()
+            prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=0, calls=0, rows=0, eager=0,
+                        act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0, cf_snaps=0)
+            while roll.usable() < rollout_actor and sampler.live and not stopped():
+                if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
+                    lanes.tick()        # lane call answered, a round started when its window has ended (no wait)
+                if busy and fresh.is_set():
+                    while inflight:
+                        finish(prof)
+                    if lanes is not None:   # (B36: no lane call runs while the weights change)
+                        lanes.quiesce()
+                    take_weights()
+                ta = time.perf_counter()
+                if inflight:   # a call is running: take what is ready now, else finish the oldest call
+                    if not free:
+                        finish(prof)
+                        continue
+                    idx, slots = sampler.poll_ready(idle=0.0)
+                    if not len(idx):
+                        prof['poll'] += time.perf_counter() - ta
+                        finish(prof)
+                        continue
+                else:   # (B36: a short wait while a lane call is in flight or a lane window is open)
+                    idx, slots = sampler.poll_ready(idle=0.05 if lanes is None else lanes.idle(0.05),
+                                                    want=args.poll_want, max_wait=args.poll_wait)
+                tb = time.perf_counter()
+                prof['poll'] += tb - ta
+                prof['polls'] += 1
+                if not len(idx):
+                    continue
+                rows = sampler.rows[slots]
+                go = book.arrive(roll, rows, idx, pending)
+                t1 = time.perf_counter()
+                prof['book'] += t1 - tb
+                if not go.all():   # records that end an episode only need their answer
+                    sampler.reply(idx[~go])
+                if not go.any():
+                    prof['reply'] += time.perf_counter() - t1
+                    continue
+                t1 = time.perf_counter()
+                a_idx = idx[go]
+                sub = rows if go.all() else rows[go]
+                under_way = pending[a_idx]
+                if bank_tstate is not None:   # B34: choice points' snapshots: the workers' temporal slots before these
+                    #                           records' steps into the bank rows they name (no call of theirs runs)
+                    req_s = sampler.cf_snap[a_idx]
+                    if req_s.any():
+                        m_s = req_s > 0
+                        bank_tstate.copy_slot_(a_idx[m_s], req_s[m_s] - 1, other=t_state)
+                        sampler.cf_snap[a_idx[m_s]] = 0
+                        torch.cuda.current_stream().synchronize()
+                        prof['cf_snaps'] += int(m_s.sum())
+                prof['calls'] += 1
+                prof['rows'] += len(a_idx)
+                if busy:
+                    prof['calls_busy'] += 1
+                if snaps:   # Phase B2: branch records go to their point's weight snapshot
+                    is_b = sub['branch'] != 0
+                    if is_b.any():
+                        submit_snapshots(prof, a_idx[is_b], sub[is_b], under_way[is_b], t1)
+                        if is_b.all():
+                            prof['act'] += time.perf_counter() - t1
+                            continue
+                        a_idx, sub, under_way = a_idx[~is_b], sub[~is_b], under_way[~is_b]
+                tdest = None
+                if t_on and free:   # (B31) the decisions' rows of the rollout: the graph's outputs go there on the GPU
+                    if roll.t_free() < len(a_idx):   # (the pool full: never with its size; grow it, no call in flight)
+                        while inflight:
+                            finish(prof)
+                        torch.cuda.synchronize()
+                        roll.t_grow(len(a_idx))
+                        print(f'temporal (B31): the rollout pool grew to {roll.t_pool} rows', flush=True)
+                    tdest = roll.t_dest(a_idx)
+                if free and free[-1].submit(sub, under_way, *((a_idx, sub['first'] != 0) if (mem_on or t_on) else ()),
+                                            **(dict(tdest=tdest) if t_on else {})):
+                    inflight.append((free.pop(), a_idx, sub, under_way, t1, busy))
+                    prof['act'] += time.perf_counter() - t1
+                    continue
+                # no graph (--graph-entities 0) or more records than it holds: the eager path, at once
+                while inflight:
+                    finish(prof)
+                prof['eager'] += 1
+                h_e = t_e = None
+                # (B30) the temporal step on the actor's state, the same as inside the graphs
+                tk_e = dict(temporal=t_state.step_inputs(model, sub, under_way, a_idx)) if t_on else {}
+                with torch.inference_mode():
+                    u_crn = None
+                    if args.branch_crn and sub['crn'].any():   # Phase B2: the branch records' common random numbers
+                        u_crn = torch.rand((len(sub), sum(model.heads)), device=device)
+                        sel_c = np.flatnonzero(sub['crn'])
+                        u_crn[torch.from_numpy(sel_c).to(device)] = torch.from_numpy(
+                            crn_uniforms(sub['crn'][sel_c], sub['t'][sel_c], u_crn.shape[1])).to(device)
+                    if mem_on:   # 2026-10-11 (memory): the workers' states in, the new ones back into the table
+                        h_e = mem_rows(mem_table, a_idx, sub['first'] != 0)
+                        out_e = model.act(to_batch(sub, under_way, device), u=u_crn, mem=h_e, need_vg=gtok_on, **tk_e)
+                        actions, logp, value, hn_e = out_e[:4]
+                    else:
+                        out_e = model.act(to_batch(sub, under_way, device), u=u_crn, need_vg=gtok_on, **tk_e)
+                        actions, logp, value = out_e[:3]
+                    if t_on:   # (B31: the counters to the host; K / V, s and o written into the rollout by store)
+                        t_e = temporal_out(tk_e['temporal']['out'])
+                vg_e = out_e[-1].cpu().numpy() if gtok_on else None   # (B24: value_global, stored like the value)
+                if mem_on:
+                    mem_table.index_copy_(0, torch.from_numpy(np.ascontiguousarray(a_idx, np.int64)).to(device), hn_e)
+                    h_e = h_e.cpu().numpy()
+                actions, logp, value = actions.cpu().numpy(), logp.cpu().numpy(), value.cpu().numpy()
+                t2 = time.perf_counter()
+                prof['act'] += t2 - t1
+                prof['latency'] += t2 - t1
+                if busy:
+                    prof['act_busy'] += t2 - t1
+                answer(prof, a_idx, sub, under_way, actions, logp, value, h=h_e, vg=vg_e, t=t_e)
+            while inflight:
+                finish(prof)
+            collect_s = time.perf_counter() - t0
+            if not sampler.live or stopped():
+                break
+            check_actors()
+            # ---- hand the rollout to the learner
+            wait_s = 0.0
+            if busy:   # --overlap: the update before is still running; the workers wait (and may search)
+                tw = time.perf_counter()
+                sampler.control[1] = 1
+                wait_learner()
+                sampler.control[1] = 0
+                wait_s = time.perf_counter() - tw
+            now = time.perf_counter()
+            wst = sampler.stats.copy()
+            dw = (wst - w_mark).sum(0)
+            dec_w = (wst - w_mark)[:, ST['decisions']]   # decisions per worker in this cycle
+            lab_job = {}
+            if lab is not None:   # 2026-10-08: the lab's results joined per job, the builds seen, new jobs posted
+                lab['book'].add(sampler.lab_records(), time.time())
+                lab_job = dict(lab_results=lab['book'].take(), lab_finished=book.lab_finished)
+                book.lab_finished = []
+                for held in book.seen_inv:
+                    lab['sched'].note_seen(held)
+                book.seen_inv = []
+                post_lab_jobs()
+            job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
+                       **lab_job,
+                       teach=sampler.teacher_records() if args.teacher else None, t_start=t_run,
+                       choices=sampler.choice_records() if branching else None,
+                       v2=sampler.v2_records(with_h=mem_on, with_t=t_on) if v2_on else None,
+                       branch_finished=book.branch_finished,
+                       cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
+                       cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,
+                       dec_min=float(dec_w.min()), dec_max=float(dec_w.max()),
+                       dec_w=' '.join(str(int(v)) for v in dec_w))
+            t_cycle, w_mark = now, wst
+            proc_now = time.process_time()
+            job['proc_cores'] = (proc_now - proc_mark) / max(job['cycle_s'], 1e-9)
+            proc_mark = proc_now
+            handed += roll.usable()
+            if t_on:   # (B31) the actor's writes into the rollout's device tensors done before the learner reads them
+                torch.cuda.current_stream().synchronize()
+            if proc:   # B38 step 2: what the learner process needs of this rollout (its arrays are shared)
+                job['roll'], job['bid'], job['rscal'] = None, roll.bid, rollout_scalars(roll)
+                if t_on and roll.t_grown != sent_gen[roll.bid]:   # (the pool grew: its new device tensors)
+                    job['tdev'] = (roll.t_kv, roll.t_o)
+                    sent_gen[roll.bid] = roll.t_grown
+                job['stats'], job['lane_stat'] = sampler.stats.copy(), dict(lane_stat)
+                job['take_s'], job['actor_mem'] = L.get('take_s', 0.0), torch.cuda.max_memory_reserved(device)
+                job['aid'], job['seq'] = aid, seq_n   # (B38 step 5: which actor, which of its hand-offs)
+                seq_n += 1
+            elif split and t_on:   # B38: its used rows to the learner's GPU (asynchronous: the learner waits on the event)
+                t_h = time.perf_counter()
+                job['lroll'], job['lready'], job['lbytes'] = hand_off(roll, lmirror, ldev, hand_streams)
+                job['lhand_s'] = time.perf_counter() - t_h
+            spare.carry(roll)
+            spare.source_prefetch_mark = 0
+            roll, spare = spare, roll
+            book.finished = []
+            book.branch_finished = []
+            busy = True
+            job['t_put'] = time.perf_counter()
+            if args.rebuild_memory and proc:
+                pack_start = time.perf_counter()
+                job['rscal']['raw_contexts'] = pack_histories(job['rscal']['raw_contexts'],previous=sent_histories,shared=True)
+                if PROFILE_MEMORY:
+                    print('MEMORY_IPC_PLAN ' + json.dumps(dict(aid=aid, seq=job['seq'], plan_s=time.perf_counter()-pack_start)), flush=True)
+            if args.rebuild_memory and PROFILE_MEMORY and proc:
+                import pickle
+                ipc_start = time.perf_counter()
+                payload = pickle.dumps(job['rscal']['raw_contexts'], protocol=5)
+                job['rscal']['raw_contexts'] = payload
+                print('MEMORY_IPC_SEND ' + json.dumps(dict(aid=aid, seq=job['seq'], bytes=len(payload),
+                      pack_s=time.perf_counter()-ipc_start)), flush=True)
+            if os.environ.get('ISAAC_HISTORY_PROFILE') and seq_n in (4,12,24):
+                from isaac_bridge.rebuild_memory import profile_history_storage
+                profile_history_storage('actor'+str(aid))
+            trim_interval=int(os.environ.get('ISAAC_HOST_TRIM_INTERVAL','0'))
+            if trim_interval and seq_n%trim_interval==0:
+                from isaac_bridge.rebuild_memory import trim_host_heap
+                trim_host_heap('actor'+str(aid))
+            jobs.put(job)
+            if not args.overlap:   # synchronous: the workers wait for the new weights (queued searches run)
+                tw = time.perf_counter()
+                sampler.control[1] = 1
+                wait_learner()
+                sampler.control[2] = time.monotonic_ns()
+                sampler.control[1] = 0
+                sync_wait = time.perf_counter() - tw
+            if failure:
+                raise failure[0]
+        clean_end = True
+        if actor is not None and not stopped():   # (B38 step 5, a second actor at its end: its last half is handed;
+            #                                       it waits, its workers paused, until the first actor stops it)
+            # Queue.put only enqueues locally. Flush this producer before allowing
+            # actor 0's None sentinel to overtake its last half in the shared pipe.
+            jobs.close()
+            jobs.join_thread()
+            actor['last'].set()
+            sampler.control[1] = 1
+            while not stop_ev.wait(1.0) and parent_a.is_alive():
+                pass
+    finally:
+        # Preserve the initiating failure before waiting for child shutdown;
+        # otherwise the guard can stop the job before Python prints it.
+        if sys.exc_info()[0] is not None:
+            traceback.print_exc()
+        if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
+            actor['last'].set()
+        if actor is None:
+            if actor_b is not None:   # (B38 step 5: the second actor's last half first, else it stops at once)
+                if clean_end:
+                    while not b_last.wait(1.0) and actor_b.is_alive():
+                        pass
+                else:
+                    stop_b.set()
+            jobs.put(None)
+        if actor is not None:   # (B38 step 5, a second actor: the first one stops the learner)
+            pass
+        elif proc:   # B38 step 2: the learner process finishes its update, saves last.pt and says 'done'
+            t_lim = time.perf_counter() + 900
+            while time.perf_counter() < t_lim:
+                try:
+                    kind, info = results.get(timeout=1.0)
+                except queue.Empty:
+                    if not learner.is_alive():
+                        break
+                    continue
+                if kind == 'error':
+                    failure.append(RuntimeError('learner process:\n' + info))
+                elif kind == 'done':
+                    L.update(update=info['update'], decisions=info['decisions'], seconds=info['seconds'])
+                    break
+            learner.join(timeout=60)
+            if learner.is_alive():
+                print('the learner process did not end; terminated', flush=True)
+                learner.terminate()
+            if stop_b is not None:   # (B38 step 5: the learner is done; the second actor ends)
+                stop_b.set()
+            torch.cuda.synchronize()
+        else:
+            learner.join(timeout=900)
+            torch.cuda.synchronize()
+            if split:   # (B38: the learner's GPU too)
+                torch.cuda.synchronize(ldev)
+            save(out / 'checkpoints' / 'last.pt')
+        sampler.close()
+        if log_file is not None:
+            log_file.close()
+        episodes_path.close()
+        for f_ in (branch_path, choice_path) + ((lab['out'],) if lab is not None else ()):
+            if f_ is not None:
+                f_.close()
+        if branching and L.get('choice_n'):   # the choice records' ring as it is at the end (rows + meta)
+            np.savez(out / 'choices-last.npz', rows=L['choice_rows'][:L['choice_n']],
+                     meta=L['choice_meta'][:L['choice_n']], version=L['choice_version'][:L['choice_n']])
+        if actor_b is not None:   # (B38 step 5: the second actor closes its sampler and ends)
+            actor_b.join(timeout=180)
+            if actor_b.is_alive():
+                print('the actor process 1 did not end; terminated', flush=True)
+                actor_b.terminate()
+        if actor is None:
+            print('finished', L['update'], 'updates', round(L['decisions'] * hours_per_decision, 1), 'game hours',
+                  round((time.perf_counter() - t_run) / 3600, 2), 'h')
+        if failure:
+            raise failure[0]
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,40 @@
+# Pixel-preparation functions that return at once in render-lite mode (stage F).
+# KAGE::Graphics::ImageBase::apply_data builds vertex batches and registers the image for this
+# frame's draw list; it already returns 0 for off-screen quads, so callers handle 0.
+0x870ad0 apply_data ret0
+# KAGE::Graphics::ImageManager::apply_frame_images (0x873200) must NOT be stubbed (2026-09-24, see stub_render_f.txt).
+
+# Stage G (2026-10-03, rl/bridge/abplus/EXPERIMENTS.md B9): Hallucinations::RecordPlayer (see stub_render_g.txt).
+0x718610 RecordPlayer
+
+# Stage H (2026-10-04, frame-cost work): the drawing of an ANM2 sprite. ANM2::Render loops over the two animation states
+# and their layers and calls ANM2::AnimationLayer::RenderFrame for each; RenderFrame (a const method) computes the source
+# and destination quads (GetSourceQuad / GetDestQuad), sets the blend mode (restored at its end) and the shader
+# (LoadShader(0)), and hands the quads to the image's virtual Render (ImagePng vtable +0x40 = ImageBase::Render ->
+# apply_data, already ret0 above), so nothing comes out of it but graphics-manager state for drawing. No global RNG,
+# no Update/Spawn/Remove in their static closure (28 functions); the ANM2::Update calls the render path makes (Entity_NPC::
+# Render, GridEntity_Rock::Render) are in the callers, which keep running. RenderFrame also serves ANM2::RenderLayer and
+# RenderShadowLayer (the latter's own bookkeeping, a temporary colour and the layer's +100 flag, keeps running).
+# 11-12% of a lean clone's main thread (stack profile, normal rooms).
+0x4f2720 4ANM26Render
+0x4f2340 AnimationLayer11RenderFrame
+# GridEntity_Wall::Render and GridEntity_Door::Render are GridEntity::GetRenderPosition() (GetPosition, then the global
+# GetRenderPosition(pos, true): arithmetic on constants and floorf) + Vector2::operator+ + ANM2::Render (the door a
+# second ANM2::Render): nothing but drawing. (GridEntity_Rock::Render is NOT stubbed: it calls ANM2::Update.)
+0x70dc50 15GridEntity_Wall6Render
+0x6fbbb0 15GridEntity_Door6Render
+# ANM2::BeginBatches: for each of the sprite's images not already batching, SetBlendMode / LoadShader and
+# ImageBase::BeginBatch(true) (begin_quad_batch: a RenderBatch from the image's free list, registered in the image
+# manager's transparent list that ImageManager::apply_frame_images drains and recycles every frame, the image's batching
+# flag +0x10 bit 0x20), then the blend mode restored. Only drawing state; ANM2::EndBatches (not stubbed) ends a batch
+# only where the flag is set, so the images a stubbed BeginBatches skipped are left alone.
+0x4f4150 4ANM212BeginBatches
+# Backdrop::RenderWalls / Backdrop::RenderFloor: quads of the room's backdrop images handed to the images' virtual Render
+# (apply_data, ret0 above), ShapeRenderer::FillQuad, blend mode / shader state; their static closures (31 / 40
+# functions) are drawing only (no RNG, no game object written; render_water_quad writes only into the vertex data
+# Render returns, which is null here).
+0x512090 8Backdrop11RenderWalls
+0x50f850 8Backdrop11RenderFloor
+# Rejected for this list (2026-10-04): HUD::Render (writes HUD members that HUD::Update, which draws from the global MT
+# and plays sounds, reads), FXLayers::RenderForeground / RenderBehind (RNG objects in their closure), Room::PreRenderShadows
+# (global MT), GridEntity_Rock::Render and the entities' Render (ANM2::Update).

@@ -1,0 +1,19 @@
+# Pixel-preparation functions that return at once in render-lite mode (stage F).
+# KAGE::Graphics::ImageBase::apply_data builds vertex batches and registers the image for this
+# frame's draw list; it already returns 0 for off-screen quads, so callers handle 0.
+0x870ad0 apply_data ret0
+# KAGE::Graphics::ImageManager::apply_frame_images (0x873200) must NOT be stubbed (2026-09-24).
+# Besides drawing, it drains the transparent-batch list (ImageManager+0x50, filled by
+# ImageBase::BeginBatch -> begin_quad_batch -> set_transparent_batch from entity shadows, text and
+# other Render paths) and returns each RenderBatch to its image's free list (ImageBase+0x78).
+# Stubbed, get_batch allocates a new 0x38-byte batch every frame and the list only grows: the game
+# leaked ~0.27 MiB per played episode and remove_image, which walks the list, made every reset
+# slower. Unstubbed its draws are no-ops under ABP_NULLGL; trajectories stay bit-identical
+# (rl/bridge/python/abplus_probe_leak.py) and the leak is gone.
+
+# Stage G (2026-10-03, rl/bridge/abplus/EXPERIMENTS.md B9): Hallucinations::RecordPlayer, called by
+# Entity_Player::Update every logic frame, appends the player's position to a std::list of up to 900 records and
+# walks the whole list twice to count it (std::list::size() is linear in this libstdc++ ABI): 7-9% of the main
+# thread's time in a room. The list only feeds Hallucinations::Render / InitReplay (a visual replay of the player's
+# path); with the function returning at once the hidden-state digest stays the same (B9).
+0x718610 RecordPlayer

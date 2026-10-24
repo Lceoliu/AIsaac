@@ -1,0 +1,675 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AB+ 训练看板</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uplot@1.6/dist/uPlot.min.css">
+<script src="https://cdn.jsdelivr.net/npm/uplot@1.6/dist/uPlot.iife.min.js"></script>
+<style>
+:root {
+  --bg: #f4f5f7; --panel: #ffffff; --panel-2: #f8f9fb; --text: #1f2328; --muted: #646d78; --faint: #98a1ab;
+  --border: #e1e4e8; --accent: #f5b800; --ok: #16935a; --warn: #c9791f; --bad: #d14343; --grid: rgba(15, 23, 42, .07);
+  --hover: #f1f3f6; --focus: #fff7db;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1014; --panel: #161a20; --panel-2: #1b1f26; --text: #e5e8ec; --muted: #9aa3ae; --faint: #6c7581;
+    --border: #282d35; --grid: rgba(255, 255, 255, .07); --hover: #1f242c; --focus: #2a2616;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1014; --panel: #161a20; --panel-2: #1b1f26; --text: #e5e8ec; --muted: #9aa3ae; --faint: #6c7581;
+  --border: #282d35; --grid: rgba(255, 255, 255, .07); --hover: #1f242c; --focus: #2a2616;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+a { color: inherit; }
+header { position: sticky; top: 0; z-index: 30; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px;
+  padding: 9px 16px; background: var(--panel); border-bottom: 1px solid var(--border); }
+.logo { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 15px; letter-spacing: .2px; }
+.logo i { width: 6px; height: 18px; border-radius: 2px; background: var(--accent); box-shadow: 8px 0 0 var(--accent); margin-right: 8px; }
+.ctrl { display: flex; align-items: center; gap: 6px; color: var(--muted); white-space: nowrap; }
+.ctrl select, .ctrl button, .search { font: inherit; color: var(--text); background: var(--panel-2); border: 1px solid var(--border);
+  border-radius: 6px; padding: 4px 8px; }
+.ctrl button { cursor: pointer; }
+.ctrl button:hover { background: var(--hover); }
+.ctrl input[type=range] { width: 110px; accent-color: var(--accent); }
+.ctrl .val { min-width: 34px; color: var(--text); font-variant-numeric: tabular-nums; }
+.spacer { flex: 1; }
+.stamp { color: var(--muted); font-variant-numeric: tabular-nums; }
+.layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); }
+aside { position: sticky; top: 49px; height: calc(100vh - 49px); overflow: auto; background: var(--panel);
+  border-right: 1px solid var(--border); padding: 12px 10px 24px; }
+aside h3 { margin: 4px 6px 8px; font-size: 11px; font-weight: 600; letter-spacing: .6px; text-transform: uppercase; color: var(--muted); }
+.search { width: 100%; margin-bottom: 8px; }
+.opts { display: flex; gap: 12px; margin: 0 4px 10px; color: var(--muted); font-size: 12px; }
+.run { display: grid; grid-template-columns: 18px 12px minmax(0, 1fr) auto; align-items: center; gap: 6px; padding: 6px;
+  border-radius: 6px; cursor: pointer; }
+.run:hover { background: var(--hover); }
+.run.focus { background: var(--focus); }
+.run input { margin: 0; accent-color: var(--accent); }
+.dot { width: 10px; height: 10px; border-radius: 50%; }
+.run .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.run .sub { grid-column: 3 / 5; color: var(--muted); font-size: 11.5px; display: flex; gap: 8px; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+.badge.running { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.badge.running::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%;
+  background: var(--ok); vertical-align: 1px; animation: pulse 1.6s infinite; }
+.badge.stopped { color: var(--warn); }
+@keyframes pulse { 50% { opacity: .25; } }
+main { min-width: 0; padding: 16px 18px 40px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+.card h2 { margin: 0; font-size: 17px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.card .meta { color: var(--muted); margin-top: 4px; font-size: 12px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin-top: 14px; }
+.kpi { background: var(--panel-2); border: 1px solid var(--border); border-radius: 7px; padding: 9px 11px; }
+.kpi .k { color: var(--muted); font-size: 11.5px; }
+.kpi .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.kpi .s { color: var(--muted); font-size: 11.5px; margin-top: 1px; }
+.bar { height: 4px; border-radius: 2px; background: var(--border); margin-top: 6px; overflow: hidden; }
+.bar b { display: block; height: 100%; background: var(--accent); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+.chip { background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 12px; }
+.chip span { color: var(--muted); margin-right: 5px; }
+details.section { margin-bottom: 14px; }
+details.section > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: 8px; padding: 6px 2px;
+  font-weight: 600; font-size: 13.5px; }
+details.section > summary::-webkit-details-marker { display: none; }
+details.section > summary::before { content: "▸"; color: var(--muted); transition: transform .15s; }
+details.section[open] > summary::before { transform: rotate(90deg); }
+details.section > summary .count { color: var(--muted); font-weight: 400; font-size: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; margin-top: 6px; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 10px 10px 4px; min-width: 0; }
+.panel.empty { display: none; }
+.ph { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin: 0 4px 4px; }
+.pt { font-weight: 600; font-size: 12.5px; }
+.pk { color: var(--faint); font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pc { position: relative; min-height: 190px; }
+.tip { position: absolute; z-index: 10; pointer-events: none; display: none; min-width: 150px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; box-shadow: 0 4px 16px rgba(0, 0, 0, .12); font-size: 12px; }
+.tip-h { color: var(--muted); margin-bottom: 3px; }
+.tip-r { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; gap: 6px; }
+.tip-r i { width: 8px; height: 8px; border-radius: 50%; }
+.tip-r span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tip-r b { font-variant-numeric: tabular-nums; }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.win { color: var(--ok); } td.time_limit { color: var(--warn); } td.death, td.error { color: var(--bad); }
+.scroll { overflow-x: auto; }
+.twocol { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.muted { color: var(--muted); }
+.error { color: var(--bad); }
+pre.json { margin: 8px 0 0; padding: 8px 10px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+  font: 11.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; max-height: 260px; overflow: auto; }
+.u-select { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+  aside { position: static; height: auto; max-height: 45vh; border-right: 0; border-bottom: 1px solid var(--border); }
+  .twocol { grid-template-columns: 1fr; }
+  .grid { grid-template-columns: 1fr; }
+  main { padding: 12px 16px 32px; }
+}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><i></i>AB+ 训练看板</div>
+  <label class="ctrl">横轴
+    <select id="xaxis">
+      <option value="hours">游戏小时</option>
+      <option value="updates">训练轮</option>
+      <option value="wall">墙钟（分钟）</option>
+    </select>
+  </label>
+  <label class="ctrl">平滑 <input id="smooth" type="range" min="0" max="0.99" step="0.01"><span class="val" id="smoothv"></span></label>
+  <label class="ctrl"><input id="auto" type="checkbox"> 自动刷新
+    <select id="interval"><option value="10">10 秒</option><option value="20">20 秒</option><option value="60">60 秒</option></select>
+  </label>
+  <div class="ctrl"><button id="refresh" type="button">刷新</button><button id="theme" type="button" title="切换深浅色">◐</button></div>
+  <div class="spacer"></div>
+  <div class="stamp" id="stamp">加载中…</div>
+</header>
+<div class="layout">
+  <aside>
+    <input id="search" class="search" placeholder="筛选运行">
+    <div class="opts">
+      <label><input id="hidesmoke" type="checkbox"> 隐藏冒烟</label>
+      <label><input id="onlyon" type="checkbox"> 只看勾选的</label>
+    </div>
+    <h3>运行（勾选叠加对比，点名字看详情）</h3>
+    <div id="runs"></div>
+  </aside>
+  <main>
+    <div id="overview" class="card"><span class="muted">加载中…</span></div>
+    <div id="sections"></div>
+    <details class="section" open>
+      <summary>评估 <span class="count" id="evalcount"></span></summary>
+      <div class="card"><div id="evals" class="scroll"></div></div>
+    </details>
+    <details class="section" open>
+      <summary>最近的局 <span class="count" id="epcount"></span></summary>
+      <div class="card"><div id="epsummary" class="chips" style="margin-top:0"></div><div id="episodes" class="scroll" style="margin-top:10px"></div></div>
+    </details>
+    <details class="section" open>
+      <summary>机器状态</summary>
+      <div class="card"><div id="system" class="chips" style="margin-top:0"></div></div>
+    </details>
+  </main>
+</div>
+<script>
+'use strict';
+const PALETTE = ['#5387DD', '#DA4C4C', '#7D54B2', '#E87B9F', '#229487', '#A0C75C', '#EDB732', '#479A5F', '#5BC5DB', '#A46750',
+                 '#E07040', '#3F5D9A', '#C2379B', '#7F8C8D', '#2E86AB'];
+const XAXES = {
+  hours: { key: 'game/hours_this_run', label: '游戏小时', f: v => v },
+  updates: { key: 'time/iterations', label: '训练轮', f: v => v },
+  wall: { key: 'time/time_elapsed', label: '墙钟（分钟）', f: v => v / 60 },
+};
+// section, key, label, format ('pct' | 'num'), optional scale
+const METRICS = [
+  ['结局', 'task/normal/win_rate', '清房率（普通房）', 'pct'],
+  ['结局', 'task/normal/timeout_rate', '超时率（普通房）', 'pct'],
+  ['结局', 'task/normal/death_rate', '死亡率（普通房）', 'pct'],
+  ['结局', 'rollout/ep_rew_mean', '每局回报（×0.1 后）', 'num'],
+  ['结局', 'rollout/ep_len_mean', '每局时长（秒）', 'num', 2 / 30],
+  ['结局', 'task/arena/win_rate', '清房率（竞技场）', 'pct'],
+  ['结局', 'task/boss/win_rate', '清房率（Boss 房）', 'pct'],
+  ['瞄准', 'behavior/hit_rate', '命中率', 'pct'],
+  ['瞄准', 'behavior/shots_per_s', '每秒发射', 'num'],
+  ['瞄准', 'behavior/miss_share', '空发占比', 'pct'],
+  ['瞄准', 'behavior/mode_aim_rate', '模式瞄准率（对齐时取最大的射击方向对了）', 'pct'],
+  ['瞄准', 'behavior/mode_approach_rate', '模式趋近率', 'pct'],
+  ['瞄准', 'behavior/first_hit_s', '第一次命中（秒）', 'num'],
+  ['瞄准', 'behavior/longest_no_hit_s', '最长无命中（秒）', 'num'],
+  ['辅助头', 'aux/aim_accuracy_aligned', '对齐时准确率', 'pct'],
+  ['辅助头', 'aux/aligned_share', '对齐帧占比', 'pct'],
+  ['辅助头', 'aux/aim_accuracy', '总准确率', 'pct'],
+  ['辅助头', 'aux/aim_ce', '瞄准交叉熵', 'num'],
+  ['辅助头', 'aux/distance_mse', '距离均方误差', 'num'],
+  ['奖励分项（每局，未乘 0.1）', 'reward/time', '时间', 'num'],
+  ['奖励分项（每局，未乘 0.1）', 'reward/hit', '击中', 'num'],
+  ['奖励分项（每局，未乘 0.1）', 'reward/kill', '击杀', 'num'],
+  ['奖励分项（每局，未乘 0.1）', 'reward/miss', '空发', 'num'],
+  ['奖励分项（每局，未乘 0.1）', 'reward/align', '走路势', 'num'],
+  ['PPO', 'train/entropy_shoot', '射击头熵（上限 1.61）', 'num'],
+  ['PPO', 'train/entropy_move', '移动头熵（上限 2.20）', 'num'],
+  ['PPO', 'train/explained_variance', '价值解释方差 EV', 'num'],
+  ['PPO', 'train/value_loss', '价值损失', 'num'],
+  ['PPO', 'train/approx_kl', 'approx KL', 'num'],
+  ['PPO', 'train/clip_fraction', 'clip 比例', 'pct'],
+  ['PPO', 'train/hit_advantage_gap', '命中步的优势差（标准差）', 'num'],
+  ['PPO', 'train/lag_kl', '异步滞后 KL', 'num'],
+  ['系统', 'game/speed_x_realtime', '速度（× 实时）', 'num'],
+  ['系统', 'time/fps', '决策 / 秒', 'num'],
+  ['系统', 'async/collect_s', '采样用时（秒 / 轮）', 'num'],
+  ['系统', 'async/update_s', '训练用时（秒 / 轮）', 'num'],
+  ['系统', 'abplus/worker_step_ms', 'worker 单步（ms）', 'num'],
+  ['系统', 'abplus/exchange_ms', '每步交换（ms）', 'num'],
+  ['系统', 'abplus/worker_errors', 'worker 错误', 'num'],
+  ['系统', 'abplus/instance_recycles', '实例回收次数', 'num'],
+  ['系统', 'train/credit_moved', '挪回发射步的奖励（每轮）', 'num'],
+].map(([section, key, label, fmt, scale]) => ({ section, key, label, fmt, scale }));
+const KNOWN = new Set(METRICS.map(m => m.key).concat(Object.values(XAXES).map(x => x.key),
+  ['time/total_timesteps', 'game/hours_total', 'game/decisions_per_s']));
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+function store(key, value) { try { localStorage.setItem('abp.' + key, JSON.stringify(value)); } catch (e) { /* private mode */ } }
+function recall(key, fallback) { try { const v = localStorage.getItem('abp.' + key); return v == null ? fallback : JSON.parse(v); } catch (e) { return fallback; } }
+
+const state = {
+  runs: [], byName: {}, data: {}, charts: {}, evalChart: null,
+  visible: new Set(recall('visible', [])), focus: recall('focus', null), x: recall('x', 'hours'),
+  smooth: recall('smooth', 0.6), auto: recall('auto', true), interval: recall('interval', 20),
+  hideSmoke: recall('hideSmoke', true), onlyOn: recall('onlyOn', false), search: '', timer: null, first: true,
+};
+
+function color(name) {
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return PALETTE[h % PALETTE.length];
+}
+function num(v, digits) {
+  if (v == null || !isFinite(v)) return '—';
+  const a = Math.abs(v);
+  if (digits != null) return v.toFixed(digits);
+  if (a >= 1000) return v.toFixed(0);
+  if (a >= 100) return v.toFixed(1);
+  if (a >= 10) return v.toFixed(2);
+  if (a >= 1) return v.toFixed(3);
+  if (a === 0) return '0';
+  return v.toPrecision(3);
+}
+const pct = v => (v == null || !isFinite(v)) ? '—' : (v * 100).toFixed(Math.abs(v) < 0.1 ? 1 : 0) + '%';
+const fmt = (m, v) => m.fmt === 'pct' ? pct(v) : num(v);
+function axisFmt(m, v) {
+  if (v == null) return '';
+  if (m.fmt === 'pct') return (v * 100).toFixed(Math.abs(v) < 0.1 && v !== 0 ? 1 : 0) + '%';
+  const a = Math.abs(v);
+  if (a >= 10000) return (v / 1000).toFixed(0) + 'k';
+  if (a >= 100) return v.toFixed(0);
+  if (a >= 10) return v.toFixed(1);
+  if (a >= 1) return v.toFixed(2);
+  return a === 0 ? '0' : v.toPrecision(2);
+}
+function dur(s) {
+  if (s == null || !isFinite(s)) return '—';
+  if (s < 90) return Math.round(s) + ' 秒';
+  if (s < 5400) return Math.round(s / 60) + ' 分钟';
+  return (s / 3600).toFixed(1) + ' 小时';
+}
+function clock(t) { return t ? new Date(t * 1000).toLocaleString('zh-CN', { hour12: false, month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : '—'; }
+function ago(t) { return t ? dur(Date.now() / 1000 - t) + '前' : '—'; }
+const STATES = { running: '运行中', finished: '已完成', stopped: '已停止', error: '出错' };
+
+async function getJSON(url) {
+  const r = await fetch(url, { cache: 'no-store' });
+  const body = await r.json();
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  return body;
+}
+
+// ---------------------------------------------------------------- runs sidebar
+function shownRuns() {
+  const q = state.search.trim().toLowerCase();
+  return state.runs.filter(r => (!state.hideSmoke || !r.name.startsWith('smoke') || state.visible.has(r.name))
+    && (!state.onlyOn || state.visible.has(r.name)) && (!q || r.name.toLowerCase().includes(q)));
+}
+function renderRuns() {
+  $('runs').innerHTML = shownRuns().map(r => {
+    const hours = r.game_hours != null ? num(r.game_hours, 1) + (r.target_hours ? ' / ' + num(r.target_hours, 0) : '') + ' 游戏小时' : '';
+    return `<div class="run${r.name === state.focus ? ' focus' : ''}" data-run="${esc(r.name)}">
+      <input type="checkbox" ${state.visible.has(r.name) ? 'checked' : ''} title="在图里显示">
+      <span class="dot" style="background:${color(r.name)}"></span>
+      <span class="name" title="${esc(r.name)}">${esc(r.name)}</span>
+      <span class="badge ${r.state}">${STATES[r.state] || r.state}</span>
+      <span class="sub"><span>${hours}</span><span>${r.config && r.config.reward_profile ? esc(r.config.reward_profile) : ''}</span></span>
+    </div>`;
+  }).join('') || '<div class="muted" style="padding:6px">没有匹配的运行</div>';
+}
+$('runs').addEventListener('click', e => {
+  const row = e.target.closest('.run');
+  if (!row) return;
+  const name = row.dataset.run;
+  if (e.target.matches('input')) {
+    e.target.checked ? state.visible.add(name) : state.visible.delete(name);
+    store('visible', [...state.visible]);
+    refresh(false);
+  } else {
+    state.focus = name;
+    store('focus', name);
+    if (!state.visible.has(name)) { state.visible.add(name); store('visible', [...state.visible]); }
+    refresh(false);
+  }
+});
+
+// ---------------------------------------------------------------- overview
+function renderOverview() {
+  const r = state.byName[state.focus];
+  if (!r) { $('overview').innerHTML = '<span class="muted">左边点一个运行。</span>'; return; }
+  const c = r.config || {};
+  const progress = r.target_hours ? Math.min(1, (r.game_hours || 0) / r.target_hours) : null;
+  const kpi = (k, v, s, bar) => `<div class="kpi"><div class="k">${k}</div><div class="v">${v}</div>${s ? `<div class="s">${s}</div>` : ''}${bar != null ? `<div class="bar"><b style="width:${(bar * 100).toFixed(1)}%"></b></div>` : ''}</div>`;
+  const chip = (k, v) => v == null || v === '' ? '' : `<span class="chip"><span>${k}</span>${esc(v)}</span>`;
+  const armTotal = c.target && c.target.arms ? c.target.arms.reduce((s, a) => s + (a.weight ?? 1), 0) : 0;
+  const target = !c.target ? null : c.target.arms
+    ? c.target.arms.map(a => `${a.name || ''} ${Math.round(100 * (a.weight ?? 1) / armTotal)}%（${(a.types || []).map(t => t.name || t.type).join('、')}，${(a.rooms || []).length} 个房间）`).join('；')
+    : (c.target.types
+    ? c.target.types.map(t => `${t.name || ''}（${t.type}.${t.variant ?? 0}）`).join('、') + `，每局一种，至少隔 ${c.target.min_cells} 格`
+    : `${c.target.name || ''}（类型 ${c.target.type}，变体 ${c.target.variant ?? 0}），至少隔 ${c.target.min_cells} 格`);
+  const bombs = c.start_bombs ? (c.start_bombs.zero_prob >= 1 ? '0' : `${Math.round(c.start_bombs.zero_prob * 100)}% 为 0，否则 1–${c.start_bombs.max}`) : null;
+  $('overview').innerHTML = `
+    <h2><span class="dot" style="background:${color(r.name)};width:12px;height:12px"></span>${esc(r.name)}
+      <span class="badge ${r.state}">${STATES[r.state] || r.state}</span></h2>
+    <div class="meta">开始于 ${clock(r.started)} · 最后更新 ${ago(r.updated)} · ${esc(c.tasks_file || '')}</div>
+    <div class="kpis">
+      ${kpi('游戏小时', num(r.game_hours, 1) + (r.target_hours ? ` <span class="muted" style="font-size:13px">/ ${num(r.target_hours, 0)}</span>` : ''), progress != null ? (progress * 100).toFixed(0) + '%' : '', progress)}
+      ${kpi('速度', r.speed != null ? num(r.speed, 0) + '×' : '—', '相对实时')}
+      ${kpi('预计剩余', r.state === 'running' ? dur(r.eta_s) : '—', r.state === 'running' && r.eta_s != null ? '约 ' + new Date(Date.now() + r.eta_s * 1000).toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' }) + ' 结束' : '')}
+      ${kpi('训练轮', num(r.updates, 0), '')}
+      ${kpi('清房率', pct(r.win_rate), '最近一轮结束的局')}
+      ${kpi('命中率', pct(r.hit_rate), '最近一轮结束的局')}
+      ${kpi('worker 错误', num(r.errors, 0), '')}
+    </div>
+    <div class="chips">
+      ${chip('奖励', c.reward_profile)}${chip('房间', c.rooms ? c.rooms + ' 个普通房' + (c.boss_rooms ? ' + ' + c.boss_rooms + ' 个 Boss 房' : '') : null)}
+      ${chip('目标', target)}${chip('每局上限', c.episode_seconds != null ? c.episode_seconds + ' 秒' : null)}
+      ${chip('选房', c.room_sampling)}${chip('谱系模式', c.lineage_mode)}${chip('空发上限', c.miss_cap)}
+      ${chip('无敌', c.invincible == null ? null : (c.invincible ? '是' : '否'))}${chip('开局炸弹', bombs)}
+      ${chip('熵', c.ent_coef)}${chip('γ', c.gamma)}${chip('学习率', c.learning_rate)}${chip('环境', c.envs)}
+      ${chip('热启动', c.warm_start ? String(c.warm_start).split('/').slice(-2).join('/') : null)}
+      ${chip('续训', c.resume ? String(c.resume).split('/').slice(-2).join('/') : null)}
+      ${chip('辅助头', c.aux)}
+    </div>
+    ${c.reward ? `<details style="margin-top:10px"><summary class="muted" style="cursor:pointer">奖励定义（config.json）</summary><pre class="json">${esc(JSON.stringify(c.reward, null, 2))}</pre></details>` : ''}`;
+}
+
+// ---------------------------------------------------------------- charts
+function ema(ys, a) {
+  if (!(a > 0)) return ys.slice();
+  const out = new Array(ys.length);
+  let s = 0, w = 0;
+  for (let i = 0; i < ys.length; i++) {
+    s = a * s + (1 - a) * ys[i];
+    w = a * w + (1 - a);
+    out[i] = s / w;
+  }
+  return out;
+}
+function points(name, m) {
+  const cols = (state.data[name] || {}).columns || {};
+  const ax = XAXES[state.x], xs0 = cols[ax.key] || [], ys0 = cols[m.key] || [];
+  const xs = [], ys = [];
+  for (let i = 0, n = Math.min(xs0.length, ys0.length); i < n; i++) {
+    const x = xs0[i], y = ys0[i];
+    if (x == null || y == null) continue;
+    const xv = ax.f(x);
+    if (xs.length && xv <= xs[xs.length - 1]) continue;
+    xs.push(xv);
+    ys.push(m.scale ? y * m.scale : y);
+  }
+  return { xs, ys };
+}
+function nearest(xs, x) {
+  if (!xs.length) return -1;
+  const span = (xs[xs.length - 1] - xs[0]) || 1;
+  if (x < xs[0] - 0.02 * span || x > xs[xs.length - 1] + 0.02 * span) return -1;
+  let lo = 0, hi = xs.length - 1;
+  while (hi - lo > 1) { const mid = (lo + hi) >> 1; xs[mid] <= x ? lo = mid : hi = mid; }
+  return Math.abs(xs[lo] - x) <= Math.abs(xs[hi] - x) ? lo : hi;
+}
+function chartData(m) {
+  const tables = [], series = [], runs = [];
+  for (const name of [...state.visible].sort()) {
+    if (!state.data[name]) continue;
+    const { xs, ys } = points(name, m);
+    if (!xs.length) continue;
+    const sm = ema(ys, state.smooth), c = color(name);
+    tables.push([xs, ys, sm]);
+    series.push({ label: name + '（原始）', stroke: c + '38', width: 1, spanGaps: true, points: { show: false } },
+                { label: name, stroke: c, width: 1.8, spanGaps: true, points: { show: false } });
+    runs.push({ name, color: c, xs, ys, sm });
+  }
+  if (!tables.length) return null;
+  return { data: tables.length === 1 ? tables[0] : uPlot.join(tables), series, runs, sig: runs.map(r => r.name).join('|') + '#' + state.x };
+}
+function tooltip(ref, m) {
+  let el;
+  return { hooks: {
+    init: u => { el = document.createElement('div'); el.className = 'tip'; u.over.appendChild(el); },
+    setCursor: u => {
+      const left = u.cursor.left;
+      if (left == null || left < 0 || !ref.runs) { el.style.display = 'none'; return; }
+      const x = u.posToVal(left, 'x');
+      const rows = [];
+      for (const r of ref.runs) {
+        const i = nearest(r.xs, x);
+        if (i >= 0) rows.push({ name: r.name, color: r.color, v: r.sm[i] });
+      }
+      if (!rows.length) { el.style.display = 'none'; return; }
+      rows.sort((a, b) => b.v - a.v);
+      el.innerHTML = `<div class="tip-h">${XAXES[state.x].label} ${num(x, state.x === 'updates' ? 0 : 2)}</div>` +
+        rows.map(r => `<div class="tip-r"><i style="background:${r.color}"></i><span>${esc(r.name)}</span><b>${fmt(m, r.v)}</b></div>`).join('');
+      el.style.display = 'block';
+      const w = el.offsetWidth, W = u.over.clientWidth;
+      el.style.left = (left + 16 + w > W ? Math.max(0, left - w - 16) : left + 16) + 'px';
+      el.style.top = Math.max(0, Math.min(u.over.clientHeight - el.offsetHeight, (u.cursor.top || 0) - 12)) + 'px';
+    },
+  } };
+}
+// y scale: padded, never degenerate (an all-zero series), fractions kept inside [0, 1] when the data is
+function yRange(m) {
+  return (u, lo, hi) => {
+    if (lo == null || hi == null || !isFinite(lo) || !isFinite(hi)) return [0, 1];
+    let min = lo, max = hi;
+    if (max - min < 1e-12) {
+      const pad = Math.max(Math.abs(max) * 0.1, m.fmt === 'pct' ? 0.05 : 0.01);
+      min -= pad; max += pad;
+    } else {
+      const pad = (max - min) * 0.08;
+      min -= pad; max += pad;
+    }
+    if (m.fmt === 'pct') {
+      if (lo >= 0) min = Math.max(0, min);
+      if (hi <= 1) max = Math.min(1, max);
+      if (max - min < 1e-9) max = min + 0.05;
+    }
+    return [min, max];
+  };
+}
+function newChart(body, m, built) {
+  const ref = { runs: built.runs };
+  const axis = { stroke: css('--muted'), grid: { stroke: css('--grid'), width: 1 }, ticks: { show: false }, font: '11px system-ui, sans-serif' };
+  const u = new uPlot({
+    width: Math.max(220, body.clientWidth), height: 190,
+    scales: { x: { time: false }, y: { range: yRange(m) } },
+    series: [{ label: XAXES[state.x].label }, ...built.series],
+    axes: [{ ...axis, size: 26 }, { ...axis, size: 48, values: (u, vals) => vals.map(v => axisFmt(m, v)) }],
+    legend: { show: false },
+    cursor: { sync: { key: 'abp' }, points: { show: false }, drag: { x: true, y: false } },
+    plugins: [tooltip(ref, m)],
+  }, built.data, body);
+  return { u, ref, sig: built.sig };
+}
+function sectionsOf() {
+  const sections = [];
+  const bySection = {};
+  for (const m of METRICS) {
+    if (!bySection[m.section]) { bySection[m.section] = []; sections.push(m.section); }
+    bySection[m.section].push(m);
+  }
+  const extra = new Set();
+  for (const name of state.visible) for (const k of Object.keys((state.data[name] || {}).columns || {})) if (!KNOWN.has(k)) extra.add(k);
+  bySection['其他指标'] = [...extra].sort().map(k => ({ section: '其他指标', key: k, label: k.split('/').slice(-1)[0], fmt: 'num' }));
+  sections.push('其他指标');
+  return { sections, bySection };
+}
+function renderCharts() {
+  const { sections, bySection } = sectionsOf();
+  const root = $('sections');
+  for (const section of sections) {
+    let det = root.querySelector(`details[data-section="${CSS.escape(section)}"]`);
+    if (!det) {
+      det = document.createElement('details');
+      det.className = 'section';
+      det.dataset.section = section;
+      det.open = recall('open:' + section, section !== '其他指标');
+      det.innerHTML = `<summary>${esc(section)} <span class="count"></span></summary><div class="grid"></div>`;
+      det.addEventListener('toggle', () => { store('open:' + section, det.open); if (det.open) renderCharts(); });
+      root.appendChild(det);
+    }
+    const grid = det.querySelector('.grid');
+    let shown = 0;
+    for (const m of bySection[section]) {
+      const id = 'p:' + m.key;
+      let panel = grid.querySelector(`[data-key="${CSS.escape(m.key)}"]`);
+      if (!panel) {
+        panel = document.createElement('div');
+        panel.className = 'panel';
+        panel.dataset.key = m.key;
+        panel.innerHTML = `<div class="ph"><span class="pt">${esc(m.label)}</span><span class="pk">${esc(m.key)}</span></div><div class="pc"></div>`;
+        grid.appendChild(panel);
+      }
+      const built = chartData(m);
+      let entry = state.charts[id];
+      if (!built) {
+        if (entry) { entry.u.destroy(); delete state.charts[id]; }
+        panel.classList.add('empty');
+        continue;
+      }
+      panel.classList.remove('empty');
+      shown++;
+      if (!det.open) continue;
+      if (entry && entry.sig === built.sig) {
+        entry.ref.runs = built.runs;
+        entry.u.setData(built.data);
+      } else {
+        if (entry) entry.u.destroy();
+        state.charts[id] = newChart(panel.querySelector('.pc'), m, built);
+      }
+    }
+    det.querySelector('.count').textContent = shown ? shown + ' 个' : '（选中的运行没有这些指标）';
+  }
+}
+new ResizeObserver(() => {
+  for (const [id, entry] of Object.entries(state.charts)) {
+    const body = entry.u.root.parentElement;
+    if (body && body.clientWidth) entry.u.setSize({ width: Math.max(220, body.clientWidth), height: 190 });
+  }
+  if (state.evalChart) {
+    const body = state.evalChart.root.parentElement;
+    if (body && body.clientWidth) state.evalChart.setSize({ width: Math.max(220, body.clientWidth), height: 200 });
+  }
+}).observe(document.querySelector('main'));
+
+// ---------------------------------------------------------------- evaluations, episodes, system
+function renderEvals(ev) {
+  const rows = (ev && ev.evals) || [];
+  $('evalcount').textContent = rows.length ? `${state.focus} · ${rows.length} 个检查点` : '';
+  if (!rows.length) { $('evals').innerHTML = '<span class="muted">这个运行还没有评估。</span>'; if (state.evalChart) { state.evalChart.destroy(); state.evalChart = null; } return; }
+  const groups = new Set(rows.map(r => r.group));
+  const cell = s => s ? `<td>${s.wins} / ${s.n}</td><td>${s.median_s != null ? num(s.median_s, 1) + ' 秒' : '—'}</td><td>${pct(s.accuracy)}</td>` : '<td>—</td><td>—</td><td>—</td>';
+  const link = r => r.replays ? `<a href="/replay?run=${encodeURIComponent(state.focus)}&eval=${encodeURIComponent(r.group + '/' + r.checkpoint)}" target="_blank" rel="noopener">打开</a>` : '';
+  $('evals').innerHTML = `<div class="twocol"><div class="scroll"><table>
+    <thead><tr><th>检查点</th>${groups.size > 1 ? '<th>评估</th>' : ''}<th>取最大：胜 / 局</th><th>清房中位</th><th>命中率</th><th>采样：胜 / 局</th><th>清房中位</th><th>命中率</th><th>回放</th></tr></thead>
+    <tbody>${rows.map(r => `<tr><td>${r.update != null ? 'u' + r.update : esc(r.checkpoint)}${r.checkpoint.endsWith('final') ? '（最终）' : ''}</td>${groups.size > 1 ? `<td>${esc(r.group)}</td>` : ''}${cell(r.greedy)}${cell(r.sampled)}<td>${link(r)}</td></tr>`).join('')}</tbody></table></div>
+    <div class="panel" style="padding-bottom:4px"><div class="ph"><span class="pt">评估胜率</span><span class="pk">取最大 / 采样</span></div><div class="pc" id="evalplot"></div></div></div>`;
+  const main = rows.filter(r => r.group === 'evaluations' && r.update != null).sort((a, b) => a.update - b.update);
+  if (state.evalChart) { state.evalChart.destroy(); state.evalChart = null; }
+  if (main.length) {
+    const body = $('evalplot'), c = color(state.focus);
+    const rate = s => s && s.n ? s.wins / s.n : null;
+    const axis = { stroke: css('--muted'), grid: { stroke: css('--grid'), width: 1 }, ticks: { show: false }, font: '11px system-ui, sans-serif' };
+    const m = { fmt: 'pct' };
+    const ref = { runs: [{ name: '取最大', color: c, xs: main.map(r => r.update), sm: main.map(r => rate(r.greedy)) },
+                         { name: '采样', color: css('--accent'), xs: main.map(r => r.update), sm: main.map(r => rate(r.sampled)) }] };
+    state.evalChart = new uPlot({
+      width: Math.max(220, body.clientWidth), height: 200, scales: { x: { time: false }, y: { range: [0, 1] } },
+      series: [{ label: '训练轮' }, { label: '取最大', stroke: c, width: 2, points: { show: true, size: 5 }, spanGaps: true },
+               { label: '采样', stroke: css('--accent'), width: 2, dash: [5, 3], points: { show: true, size: 5 }, spanGaps: true }],
+      axes: [{ ...axis, size: 26 }, { ...axis, size: 44, values: (u, v) => v.map(x => axisFmt(m, x)) }],
+      legend: { show: false }, cursor: { points: { show: false } },
+      plugins: [{ hooks: { init: u => { const saved = state.x; u._x = saved; } } }, tooltip(ref, m)],
+    }, [main.map(r => r.update), main.map(r => rate(r.greedy)), main.map(r => rate(r.sampled))], body);
+  }
+}
+function renderEpisodes(ep) {
+  const s = ep && ep.summary;
+  $('epcount').textContent = s ? `${state.focus} · 最近 ${s.n} 局` : '';
+  if (!s) { $('epsummary').innerHTML = '<span class="muted">还没有结束的局。</span>'; $('episodes').innerHTML = ''; return; }
+  const chip = (k, v) => `<span class="chip"><span>${k}</span>${v}</span>`;
+  $('epsummary').innerHTML = chip('清房', `${s.wins} / ${s.n}（${pct(s.wins / s.n)}）`) + chip('超时', s.timeouts) + (s.deaths ? chip('死亡', s.deaths) : '') +
+    chip('清房用时中位', s.median_s != null ? num(s.median_s, 1) + ' 秒' : '—') + chip('p90', s.p90_s != null ? num(s.p90_s, 1) + ' 秒' : '—') +
+    chip('命中率', pct(s.accuracy)) + chip('每秒发射', num(s.shots_per_s, 2)) + chip('平均回报', num(s.mean_return, 2));
+  $('episodes').innerHTML = `<table><thead><tr><th>局</th><th>房间</th><th>结局</th><th>时长</th><th>命中 / 发射</th><th>回报</th><th>分项（未乘 0.1）</th></tr></thead><tbody>${
+    ep.rows.map(r => `<tr><td>${r.episode ?? ''}</td><td>${r.room ?? ''}</td><td class="${esc(r.outcome)}">${({ win: '清房', time_limit: '超时', death: '死亡' })[r.outcome] || esc(r.outcome)}</td>
+      <td>${num(r.seconds, 1)} 秒</td><td>${r.hits ?? '—'} / ${r.shots ?? '—'}</td><td>${num(r.r, 2)}</td>
+      <td class="muted">${r.components ? Object.entries(r.components).map(([k, v]) => `${esc(k)} ${num(v, 1)}`).join(' · ') : ''}</td></tr>`).join('')
+  }</tbody></table>`;
+}
+function renderSystem(sys) {
+  if (!sys) return;
+  const chip = (k, v, cls) => `<span class="chip"${cls ? ` style="color:var(--${cls})"` : ''}><span>${k}</span>${v}</span>`;
+  const g = sys.gpu;
+  $('system').innerHTML =
+    (g ? chip('GPU', `${esc(g.name)} · 占用 ${num(g.util, 0)}% · 显存 ${num(g.mem_used / 1024, 1)} / ${num(g.mem_total / 1024, 1)} GB · ${num(g.temp, 0)}°C`) : chip('GPU', '读不到')) +
+    (sys.load ? chip('CPU 负载', `${sys.load.map(v => num(v, 1)).join(' / ')}（${sys.cpus} 线程）`) : '') +
+    (sys.mem ? chip('内存可用', `${num(sys.mem.available_gb, 1)} / ${num(sys.mem.total_gb, 0)} GB`) : '') +
+    (sys.disk ? chip('磁盘可用', `${num(sys.disk.free_gb, 0)} / ${num(sys.disk.total_gb, 0)} GB`) : '') +
+    chip('Steam', sys.steam ? '在线' : '不在线（重启实例和评估会失败）', sys.steam ? 'ok' : 'bad') +
+    chip('训练进程', sys.training && sys.training.length ? esc(sys.training.join('，')) : '无');
+}
+
+// ---------------------------------------------------------------- refresh
+async function loadProgress(name) {
+  const have = state.data[name];
+  const since = have ? have.n : 0;
+  const r = await getJSON(`/api/run?run=${encodeURIComponent(name)}&since=${since}`);
+  if (have && (r.n < have.n || r.header.join(',') !== have.header.join(','))) {
+    const full = await getJSON(`/api/run?run=${encodeURIComponent(name)}&since=0`);
+    state.data[name] = { n: full.n, header: full.header, columns: full.columns };
+    return;
+  }
+  if (!have) { state.data[name] = { n: r.n, header: r.header, columns: r.columns }; return; }
+  for (const [k, v] of Object.entries(r.columns)) {
+    if (!have.columns[k]) have.columns[k] = new Array(since).fill(null);
+    have.columns[k].push(...v);
+  }
+  for (const k of Object.keys(have.columns)) if (!(k in r.columns)) have.columns[k].push(...new Array(r.n - since).fill(null));
+  have.n = r.n;
+}
+async function refresh(full = true) {
+  try {
+    const runs = await getJSON('/api/runs');
+    state.runs = runs;
+    state.byName = Object.fromEntries(runs.map(r => [r.name, r]));
+    for (const name of [...state.visible]) if (!state.byName[name]) state.visible.delete(name);
+    if (state.first && !state.visible.size) {
+      const running = runs.filter(r => r.state === 'running').map(r => r.name);
+      const other = runs.find(r => r.state !== 'running' && !r.name.startsWith('smoke'));
+      for (const n of running.concat(other ? [other.name] : [])) state.visible.add(n);
+      store('visible', [...state.visible]);
+    }
+    if (!state.byName[state.focus]) {
+      state.focus = (runs.find(r => r.state === 'running') || runs.find(r => state.visible.has(r.name)) || runs[0] || {}).name || null;
+    }
+    state.first = false;
+    renderRuns();
+    await Promise.all([...state.visible].map(loadProgress));
+    renderOverview();
+    renderCharts();
+    if (state.focus) {
+      const [ep, ev] = await Promise.all([getJSON(`/api/episodes?run=${encodeURIComponent(state.focus)}&tail=200`),
+                                          getJSON(`/api/evals?run=${encodeURIComponent(state.focus)}`)]);
+      renderEpisodes(ep);
+      renderEvals(ev);
+    }
+    if (full) renderSystem(await getJSON('/api/system'));
+    $('stamp').textContent = '上次刷新 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    $('stamp').classList.remove('error');
+  } catch (e) {
+    $('stamp').textContent = '刷新失败：' + e.message;
+    $('stamp').classList.add('error');
+  }
+}
+function schedule() {
+  clearInterval(state.timer);
+  if (state.auto) state.timer = setInterval(() => { if (!document.hidden) refresh(); }, state.interval * 1000);
+}
+
+// ---------------------------------------------------------------- controls
+$('xaxis').value = state.x;
+$('smooth').value = state.smooth;
+$('smoothv').textContent = Number(state.smooth).toFixed(2);
+$('auto').checked = state.auto;
+$('interval').value = String(state.interval);
+$('hidesmoke').checked = state.hideSmoke;
+$('onlyon').checked = state.onlyOn;
+const theme = recall('theme', null);
+if (theme) document.documentElement.dataset.theme = theme;
+$('xaxis').onchange = e => { state.x = e.target.value; store('x', state.x); renderCharts(); };
+$('smooth').oninput = e => { state.smooth = Number(e.target.value); $('smoothv').textContent = state.smooth.toFixed(2); store('smooth', state.smooth); renderCharts(); };
+$('auto').onchange = e => { state.auto = e.target.checked; store('auto', state.auto); schedule(); };
+$('interval').onchange = e => { state.interval = Number(e.target.value); store('interval', state.interval); schedule(); };
+$('refresh').onclick = () => refresh();
+$('search').oninput = e => { state.search = e.target.value; renderRuns(); };
+$('hidesmoke').onchange = e => { state.hideSmoke = e.target.checked; store('hideSmoke', state.hideSmoke); renderRuns(); };
+$('onlyon').onchange = e => { state.onlyOn = e.target.checked; store('onlyOn', state.onlyOn); renderRuns(); };
+$('theme').onclick = () => {
+  const dark = document.documentElement.dataset.theme ? document.documentElement.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  document.documentElement.dataset.theme = dark ? 'light' : 'dark';
+  store('theme', document.documentElement.dataset.theme);
+  for (const entry of Object.values(state.charts)) entry.u.destroy();
+  state.charts = {};
+  refresh(false);
+};
+document.addEventListener('visibilitychange', () => { if (!document.hidden && state.auto) refresh(); });
+refresh().then(schedule);
+</script>
+</body>
+</html>

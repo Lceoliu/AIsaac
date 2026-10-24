@@ -1,0 +1,29 @@
+{
+ "description": "C46 (10-01, floor-clear mandate): COMBAT only, the Basement I boss rooms and the normal rooms (1x1 and the other shapes) 1:1 by steps, start half hearts uniform 2-6 (what a floor run brings to a room); boss HP start randomisation from the command line (--boss-hp-prob / --boss-hp-min); navigation is scripted in the floor runner, so no GOTO groups.",
+ "groups": [
+  {
+   "name": "boss",
+   "tasks": "scaling2_boss_rooms.json",
+   "eval_tasks": "scaling2_boss_rooms.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat",
+   "start_hp": {
+    "min": 2,
+    "max": 6
+   }
+  },
+  {
+   "name": "combat",
+   "tasks": "goal_rooms_all_train.json",
+   "eval_tasks": "goal_rooms_all.json",
+   "share": 1,
+   "episode_seconds": 180,
+   "mode": "combat",
+   "start_hp": {
+    "min": 2,
+    "max": 6
+   }
+  }
+ ]
+}
