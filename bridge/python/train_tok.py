@@ -1742,6 +1742,9 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--release-raw', type=int, choices=(0, 1), default=1,
                    help='rule 5: drop observation bytes of frames that are encoded and consumed (actors after the '
                         'hand-off, the learner after its update); their source values stay readable; 0 keeps them')
+    p.add_argument('--release-grace-updates', type=int, default=16,
+                   help='rule 5: an ended episode keeps its source values (not bytes) this many updates, for '
+                        'branches forked from it that are published later')
     p.add_argument('--record-budget-gb', type=float, default=8.0,
                    help='teacher/v2 records: budget of their owned raw frames + source values; oldest v2 records '
                         'are evicted whole above it (record_bytes / record_evicted in progress.csv); 0 off')
@@ -2651,6 +2654,14 @@ def main(argv=None, child=None, actor=None):
             # Ancestors of branches still in flight in the actors keep their source values (rule 5, D2a).
             L.setdefault('lineage', {})[job.get('aid', 0)] = set(job.get('lineage') or ())
             in_flight = set().union(*L['lineage'].values())
+            if args.release_raw:
+                # A branch forked shortly before its parent ended can be published after the
+                # parent left every holder the actors report (a reused bank row, say): keep an
+                # ended episode's source values for a grace period of updates (rule 5, D2a).
+                recent_ = L.setdefault('recent_uids', {})
+                for u_ in itertools.chain((h.uid for h, _, _ in all_requests), in_flight): recent_[u_] = L['update']
+                for u_ in [u_ for u_, t_ in recent_.items() if L['update'] - t_ > args.release_grace_updates]: del recent_[u_]
+                in_flight |= set(recent_)
             live_uids.update(in_flight)
             if source_pipeline.prefetch_pressure:
                 # Backpressure, not another Adam clock: settle the already
@@ -4012,6 +4023,9 @@ def main(argv=None, child=None, actor=None):
             row.update(dict(record_bytes=0, record_raw_bytes=0, record_value_bytes=0, record_own_frames=0,
                             record_v2_episodes=0, record_v2_live=0, record_evicted=0, record_shared_frames=0,
                             record_v2_consumed=0, record_teach_consumed=0), **L['ledger'].last if 'ledger' in L else {})
+            from isaac_bridge.rebuild_memory import RELEASE_COUNTS
+            row.update(raw_released_frames=RELEASE_COUNTS['frames'], raw_grace_episodes=len(L.get('recent_uids', {})),
+                       source_released_misses=source_pipeline.released_misses)
         if L['writer'] is None:
             columns = log_columns(list(row))
             L['writer'] = csv.DictWriter(log_file, fieldnames=columns, restval='')
