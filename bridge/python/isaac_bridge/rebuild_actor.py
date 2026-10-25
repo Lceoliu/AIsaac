@@ -143,8 +143,9 @@ class RebuildGraphActor:
         self.stage=torch.zeros((n,ROW_BYTES+8*self.nh),dtype=torch.uint8,pin_memory=True)
         self.raw=torch.zeros_like(self.stage,device=dev)
         # slot, length and each component's (missing row, destination, gather).
-        # (+ rows 17, 18: the slots and decision indices of the records whose call closes a memory block)
-        self.control_h=torch.zeros((19,n),dtype=torch.long,pin_memory=True)
+        # (+ rows 17, 18: the slots and decision indices of the records whose call closes a memory block;
+        # row 19: the records' rollout rows, tdest)
+        self.control_h=torch.zeros((20,n),dtype=torch.long,pin_memory=True)
         self.control=torch.zeros_like(self.control_h,device=dev)
         self.uniform_h=torch.zeros((n,sum(model.heads)),pin_memory=True)
         self.uniform=torch.zeros_like(self.uniform_h,device=dev)
@@ -339,6 +340,7 @@ class RebuildGraphActor:
             ap.mark('h2d_uniform')
             ctl=self.control_h.numpy();ctl[0,:n]=slots;ctl[1,:n]=times
             ctl[0,n:r]=st.slots+np.arange(r-n);ctl[1,n:r]=0
+            if tdest is not None:ctl[19,:n]=tdest['rows']
             closed=np.flatnonzero((times+1)%rd.block==0)
             wm=next((w for w in self.wsizes if w>=len(closed)),None) if len(closed) else None
             if wm:
@@ -395,7 +397,9 @@ class RebuildGraphActor:
             else:
                 # (the rollout's step K / V stay the zeros they were allocated as: this policy has none,
                 # and the learner reads only o from the temporal pool)
-                ix=torch.as_tensor(tdest['rows'],device=u.device)
+                # (rows from the control block: torch.as_tensor(rows, device) was a pageable copy, i.e. the
+                # host waited here for the replay)
+                ix=self.control[19,:n]
                 tdest['o'].index_copy_(0,ix+tdest['obase'],o.float())
                 if tdest.get('s') is not None:tdest['s'].index_copy_(0,ix,u.to(tdest['s'].dtype))
             if ap.eager_wanted():   # (measurement aid: the network once more, uncompiled, outside the graphs;
