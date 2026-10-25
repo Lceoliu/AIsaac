@@ -1243,10 +1243,12 @@ class RebuildActor:
             stamp=actor_part('start')
             if ukeys is not None:
                 uniforms=torch.as_tensor(crn_uniforms(ukeys[0],ukeys[1],sum(self.model.heads)),device=b['player'].device)
-            elif self.crn and 'crn' in rows.dtype.names:
-                uniforms=torch.as_tensor(crn_uniforms(rows['crn'],rows['t'],sum(self.model.heads)),device=b['player'].device)
-            else:
+            else:   # (common random numbers for branch records only, as GraphActor; 2026-10-25)
                 uniforms=torch.rand((n,sum(self.model.heads)),device=b['player'].device)
+                if self.crn and 'crn' in rows.dtype.names and rows['crn'].any():
+                    sel=np.flatnonzero(rows['crn'])
+                    uniforms[torch.as_tensor(sel,device=uniforms.device)]=torch.as_tensor(
+                        crn_uniforms(rows['crn'][sel],rows['t'][sel],sum(self.model.heads)),device=uniforms.device)
             actions,lp=gumbel_sample(self.model.split(outputs[0].float(),self.model.gate(b)),uniforms)
             self.extra_out=self.extra_fn(b,outputs,None) if self.extra_fn is not None else None
             fields=[actions.float(),lp[:,None],outputs[1].float()[:,None]]
