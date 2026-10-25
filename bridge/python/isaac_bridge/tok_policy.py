@@ -130,6 +130,7 @@ same outputs up to the first Linears' summation order (tests/test_obs_v2_smoke.p
 """
 import contextlib
 import os
+import time
 
 # One hardware work queue per process for the CUDA streams (train_tok sets the same before importing torch; it only
 # takes effect if no CUDA context exists yet): it makes the GPU-sharing crash of replayed GraphActor graphs (illegal
@@ -2391,6 +2392,8 @@ class GraphActor:
         if t_on:   # (B30) the warm-up and capture calls stepped the state: back to the start
             self.tstate.reset_()
             torch.cuda.synchronize()
+        from .actor_profile import ActorProfile
+        self.aprof, self._core_raw = ActorProfile(self, 'graph'), core   # (ISAAC_ACTOR_TORCH_PROFILE only)
 
     def submit(self, rows, pending, widx=None, reset=None, tdest=None, ukeys=None):
         """Start a call (returns at once; False if it does not fit). rows: a C-contiguous ROW array, pending [n, heads]
@@ -2469,21 +2472,36 @@ class GraphActor:
 
     def _submit_fold(self, rows, pending, widx, reset, ukeys=None):
         """submit() with fold (B29): records + control block in, the replay, the outputs out."""
+        ap = self.aprof
+        ap.begin(len(rows))
+        ap.mark('stage_pack')
         g = self._pack_fold(rows, pending, widx, reset, ukeys)
         n = len(rows)
         r = self.rsizes[int(np.searchsorted(self.rsizes, n))]
+        ap.note(r=r, e=self.sizes[g])
         g += self.rsizes.index(r) * len(self.sizes)
         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
         with torch.cuda.stream(stream):
+            ap.mark('h2d_uniform')
             self.raw[:n].copy_(self.stage[:n], non_blocking=True)
             self.ctrl[:r].copy_(self.ctrl_stage[:r], non_blocking=True)
+            ap.mark('core_replay')
             with torch.inference_mode():   # (the graphs draw uniforms: replay advances the RNG state they captured,
                 self.graphs[g].replay()    # an inference tensor since the capture ran in inference mode)
+            ap.mark('d2h')
             self.out_host[:n].copy_(self.outs[g][:n], non_blocking=True)
+            ap.mark('tdest')
             if self._tdest is not None:   # (B31) the step's K / V, s and o into the rollout's rows, on the device
                 a_ = self.c_dest_at
                 self._t_store(g, n, self.ctrl[:n, a_:a_ + 8].view(torch.int64)[:, 0].contiguous())
+            if ap.eager_wanted():   # (measurement aid: the network once more, uncompiled, outside the graphs;
+                #                     its temporal step on the scratch slot, the workers' state untouched)
+                tk_ = self.sizes[g % len(self.sizes)]
+                sl_ = torch.full((r,), self.tstate.scratch, dtype=torch.int64, device=self.raw.device) if self.t_on else None
+                ap.eager(lambda: self._core_raw(decode_rows(self.raw[:r], entities=tk_, n_heads=self.nh), self.u[:r],
+                                                None, tk_, sl_))
             self.done.record()
+        ap.submitted()
         self._n = n
         return True
 
@@ -2533,7 +2551,9 @@ class GraphActor:
 
     def result(self):
         """(actions [n, heads] int64, log-probabilities [n], values [n]) of the submitted call, as numpy arrays."""
+        t_ = time.perf_counter()
         self.done.synchronize()
+        wait_ = time.perf_counter() - t_
         out = self.out_np[:self._n].copy()
         nh = self.nh
         self.extra = out[:, nh + 2:nh + 2 + self.n_extra] if self.n_extra else None
@@ -2547,6 +2567,7 @@ class GraphActor:
                               steps=np.rint(tc[:, 2]).astype(np.int64), stage_prev=np.rint(tc[:, 3]).astype(np.int64))
             if self.room_source is not None:
                 self.t_out['room_visits'] = self.room_visits
+        if hasattr(self, 'aprof'): self.aprof.finished(wait_)
         return out[:, :nh].astype(np.int64), out[:, nh], out[:, nh + 1]
 
     def act(self, rows, pending, widx=None, reset=None, tdest=None, ukeys=None):

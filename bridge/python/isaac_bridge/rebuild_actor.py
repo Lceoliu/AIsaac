@@ -7,10 +7,12 @@ Completed Writer outputs grow geometrically: no history is discarded.
 from collections import OrderedDict
 from contextlib import nullcontext
 import os
+import time
 import numpy as np
 import torch
 from torch.nn import functional as F
 from .rebuild_memory import ComponentCache, PROFILE_ACTOR, ACTOR_TIMES, actor_part
+from .actor_profile import ActorProfile
 from .tok_policy import ROW_BYTES, decode_rows, crn_uniforms, gumbel_sample, _sdpa_math
 from .tok_obs import ROW, ENT_CAP
 
@@ -177,6 +179,7 @@ class RebuildGraphActor:
         if PROFILE_ACTOR:
             import cProfile
             self.profile=cProfile.Profile()
+        self.aprof=ActorProfile(self,'rebuild')   # (ISAAC_ACTOR_TORCH_PROFILE only)
 
     def _capture(self,fn):
         # Independent cuBLAS workspace per actor, as in the legacy GraphActor.
@@ -280,6 +283,7 @@ class RebuildGraphActor:
         if n>self.n:return False
         self._n=n
         self.calls+=1
+        ap=self.aprof;ap.begin(n);ap.mark('reset_prefixes')
         profiling=PROFILE_ACTOR and 257<=self.calls<=384
         if profiling:self.profile.enable()
         stream=self.stream if self.stream is not None else torch.cuda.current_stream()
@@ -291,18 +295,25 @@ class RebuildGraphActor:
                 if first:host.reset(int(s))
             prefixes=[host.raw[s] for s in slots]
             times=np.asarray([h.length for h in prefixes],np.int64)
+            ap.mark('grow_refresh')
+            ap.note(stale=int((st.generations[slots]!=self.model.cache_generation).sum()),capacity=int(st.capacity),
+                    len_max=int(times.max()),len_mean=float(times.mean()))
             st.grow(int((times.max()+1)//rd.block*rd.tokens))
             st.refresh(slots)
             if self.revision!=st.revision:
                 self.graphs.clear();self.revision=st.revision
             stamp=actor_part('graph_refresh',stamp)
+            ap.mark('stage_pack')
             r=next(r for r in self.rsizes if r>=n)
             e=next(e for e in self.esizes if e>=int(rows['n_ent'].max()))
             sn=self.stage.numpy();sn[:n,:ROW_BYTES]=rows.view(np.uint8).reshape(n,ROW_BYTES)
             sn[:n,ROW_BYTES:]=np.ascontiguousarray(pending,np.int64).view(np.uint8).reshape(n,-1)
             sn[n:r]=sn[0]
+            ap.mark('component_keys')
             counts=self._prepare_components(rows,pending)
+            ap.note(r=r,e=e,component_buckets=len(counts),component_rows=sum(m for _,m in counts))
             stamp=actor_part('graph_host_pack_keys',stamp)
+            ap.mark('h2d_uniform')
             ctl=self.control_h.numpy();ctl[0,:n]=slots;ctl[1,:n]=times
             ctl[0,n:r]=st.slots+np.arange(r-n);ctl[1,n:r]=0
             self.raw.copy_(self.stage,non_blocking=True);self.control.copy_(self.control_h,non_blocking=True)
@@ -312,12 +323,15 @@ class RebuildGraphActor:
             if un is None:self.uniform.uniform_()
             else:
                 self.uniform_h.numpy()[:n]=un;self.uniform.copy_(self.uniform_h,non_blocking=True)
+            ap.mark('component_replay')
             for j,m in counts:
                 key=(j,m)
                 if key not in self.component_graphs:self.component_graphs[key]=self._capture(lambda:self.component_fn(j,m))
                 self.component_graphs[key][0].replay()
             stamp=actor_part('graph_components',stamp)
+            ap.mark('core_replay')
             key=(r,e)
+            ap.note(core_capture=key not in self.graphs)
             if key not in self.graphs:
                 # Core mutates the current ring slot only, which the read excludes
                 # until the next decision. Warmup must not expose that new frame.
@@ -326,12 +340,15 @@ class RebuildGraphActor:
                 st.u[slots,times%rd.W]=saved[0];st.kv[slots,times%rd.W]=saved[1];st.tail[slots,times%rd.block]=saved[2]
             graph,out=self.graphs[key];graph.replay()
             stamp=actor_part('graph_core',stamp)
+            ap.mark('d2h')
             cols,u,o,logits=(v[:n] for v in out)
             self.last_logits=logits
             self.n_extra=cols.shape[1]-self.nh-2-int(self.vg_on)
             self.cpu[:cols.numel()].view_as(cols).copy_(cols,non_blocking=True)
+            ap.mark('rawhistory_append')
             for i,s in enumerate(slots):
                 host.raw[s]=prefixes[i].append(rows[i],pending[i],rd.block)
+            ap.mark('state_tstate')
             st.length[slots]=times+1
             sd=self.control[0,:n]
             self.tstate.prev_o.index_copy_(0,sd,o.float())
@@ -339,6 +356,7 @@ class RebuildGraphActor:
             dt,off=ROW.fields['stage'][:2]
             self.tstate.prev_stage.index_copy_(0,sd,self.raw[:n,off].long())
             closed=np.flatnonzero((times+1)%rd.block==0)
+            ap.mark('writer_close');ap.note(closed=len(closed))
             if len(closed):
                 ss=torch.as_tensor(slots[closed],device=u.device)
                 mt=torch.as_tensor(times[closed],device=u.device)
@@ -348,6 +366,7 @@ class RebuildGraphActor:
                 projected=torch.stack([l.kv(values+rd.position(mt,u.dtype)[:,None]) for l in rd.layers],2)
                 st.mkv[ss[:,None],ix]=projected
             stamp=actor_part('graph_append_writer',stamp)
+            ap.mark('tdest')
             self.t_out=dict(create=np.zeros(n,bool),nroom=np.zeros(n,np.int64),steps=times+1,
                             stage_prev=rows['stage'].astype(np.int64),raw_contexts=prefixes)
             dummy=u.new_zeros((n,self.tstate.L,2,self.tstate.D))
@@ -357,7 +376,13 @@ class RebuildGraphActor:
                 tdest['kv'].index_copy_(0,ix,dummy.to(tdest['kv'].dtype))
                 tdest['o'].index_copy_(0,ix+tdest['obase'],o.float())
                 if tdest.get('s') is not None:tdest['s'].index_copy_(0,ix,u.to(tdest['s'].dtype))
+            if ap.eager_wanted():   # (measurement aid: the network once more, uncompiled, outside the graphs;
+                # its ring writes are put back to the replay's values, as after a capture's warm-up)
+                saved=(st.u[slots,times%rd.W].clone(),st.kv[slots,times%rd.W].clone(),st.tail[slots,times%rd.block].clone())
+                with (_sdpa_math() if self.sdpa_math else nullcontext()):ap.eager(lambda:self._core(r,e))
+                st.u[slots,times%rd.W]=saved[0];st.kv[slots,times%rd.W]=saved[1];st.tail[slots,times%rd.block]=saved[2]
             self.done.record(stream)
+            ap.submitted()
             actor_part('graph_output',stamp)
         if profiling:self.profile.disable()
         if PROFILE_ACTOR and self.calls%384==0:
@@ -370,11 +395,14 @@ class RebuildGraphActor:
         return True
 
     def result(self):
+        t=time.perf_counter()
         self.done.synchronize()
+        wait=time.perf_counter()-t
         width=self.nh+2+self.n_extra+int(self.vg_on)
         out=self.cpu[:self._n*width].view(self._n,width).numpy().copy();n=self.nh
         self.extra=out[:,n+2:n+2+self.n_extra] if self.n_extra else None
         self.vg=out[:,-1] if self.vg_on else None
+        self.aprof.finished(wait)
         return out[:,:n].astype(np.int64),out[:,n],out[:,n+1]
 
     def act(self,*args,**kwargs):

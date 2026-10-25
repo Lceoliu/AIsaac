@@ -2386,6 +2386,7 @@ def main(argv=None, child=None, actor=None):
                          memory=mem_table, temporal=t_state, **gkw)
               for _ in range(max(1, args.actor_slots))] if (use_graphs and child is None) else []
     free = list(actors)
+    for a_ in actors: a_.prof_role = 'main'   # (ISAAC_ACTOR_TORCH_PROFILE: these are profiled, lanes / snapshots not)
     # 2026-10-10 (teacher v2): the workers' lanes are answered by a GraphActor of their own (the actor's weights; the
     # lane records never enter the rollout); the eager path for what it cannot take
     # B34 (2026-10-16): the lanes, the V2 ring and its loss serve the counterfactual teacher (--cf) too
@@ -2416,6 +2417,7 @@ def main(argv=None, child=None, actor=None):
     lane_actor = GraphActor(model, n, g_ents, stream=torch.cuda.Stream(priority=-5), crn=False,
                             memory=lane_table, temporal=lane_tstate, **lkw) \
         if (v2_on and use_graphs and child is None) else None
+    if lane_actor is not None: lane_actor.prof_role = 'lane'
 
     def mem_rows(table, idx, reset):
         """(memory) the GRU states of workers idx from a table (zero where reset, a bool array, is set)."""
