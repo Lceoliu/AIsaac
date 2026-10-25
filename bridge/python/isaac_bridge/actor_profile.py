@@ -99,7 +99,7 @@ class ActorProfile:
                 self.prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
                                                                torch.profiler.ProfilerActivity.CUDA])
                 self.prof.__enter__()
-        self.cur = dict(call=self.calls, n=int(n), t_submit=time.perf_counter()) if self.phase == 'window' else None
+        self.cur = dict(call=self.calls, n=int(n), t_submit=time.perf_counter(), c_submit=time.thread_time()) if self.phase == 'window' else None
         return self.cur is not None
 
     def note(self, **kw):
@@ -108,11 +108,12 @@ class ActorProfile:
     def mark(self, name):
         """Close the open host section and open 'h.<name>' (None: close only)."""
         if self.cur is None: return
-        if TIMERS:
-            now = time.perf_counter()
+        if TIMERS:   # (wall time per section, and this thread's CPU time: the difference is waiting for the GIL / a core)
+            now, cpu = time.perf_counter(), time.thread_time()
             if self._open is not None:
                 k = 't.' + self._open[0]; self.cur[k] = self.cur.get(k, 0.0) + now - self._open[1]
-            self._open = (name, now) if name is not None else None
+                k = 'c.' + self._open[0]; self.cur[k] = self.cur.get(k, 0.0) + cpu - self._open[2]
+            self._open = (name, now, cpu) if name is not None else None
             return
         if self._open is not None: self._open.__exit__(None, None, None); self._open = None
         if name is not None:
@@ -122,6 +123,7 @@ class ActorProfile:
         if self.cur is not None:
             self.mark(None)
             self.cur['host_submit_s'] = time.perf_counter() - self.cur['t_submit']
+            self.cur['cpu_submit_s'] = time.thread_time() - self.cur.pop('c_submit')
 
     def finished(self, wait_s):
         """At result's end."""
@@ -134,13 +136,17 @@ class ActorProfile:
             self.phase = 'done'
             wall = time.perf_counter() - self.t0
             keys = sorted({k for r in self.rows for k in r if k.startswith('t.')})
+            ckeys = sorted({k for r in self.rows for k in r if k.startswith('c.')})
             mean = lambda k: 1000 * float(np.mean([r.get(k, 0.0) for r in self.rows]))
             out = dict(kind=self.kind, pid=os.getpid(), calls=COUNT, window_wall_s=wall,
                        process_main_calls_in_window=PROCESS['main'] - PROCESS['window_main0'],
                        latency_ms=dict(mean=mean('latency_s'), median=1000 * float(np.median([r['latency_s'] for r in self.rows]))),
                        host_submit_ms=mean('host_submit_s'), wait_ms=mean('wait_s'),
-                       sections_ms={k[2:]: mean(k) for k in keys},
+                       sections_ms={k[2:]: mean(k) for k in keys}, sections_thread_cpu_ms={k[2:]: mean(k) for k in ckeys},
+                       host_submit_thread_cpu_ms=mean('cpu_submit_s'),
                        rows_mean=float(np.mean([r['n'] for r in self.rows])),
+                       threads=sorted(t.name for t in __import__('threading').enumerate()),
+                       process_cpu_s=time.process_time(),
                        notes={k: float(np.mean([r[k] for r in self.rows if k in r])) for k in ('len_max', 'len_mean', 'capacity', 'closed', 'component_rows', 'stale')
                               if any(k in r for r in self.rows)})
             Path(str(self._base()) + '.timers.json').write_text(json.dumps(out, indent=1))
