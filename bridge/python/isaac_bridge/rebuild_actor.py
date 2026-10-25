@@ -144,11 +144,12 @@ class RebuildGraphActor:
         self.raw=torch.zeros_like(self.stage,device=dev)
         # slot, length and each component's (missing row, destination, gather).
         # (+ rows 17, 18: the slots and decision indices of the records whose call closes a memory block;
-        # row 19: the records' rollout rows, tdest)
-        self.control_h=torch.zeros((20,n),dtype=torch.long,pin_memory=True)
+        # row 19: the records' rollout rows, tdest; row 20: the call's rows with common random numbers)
+        self.control_h=torch.zeros((21,n),dtype=torch.long,pin_memory=True)
         self.control=torch.zeros_like(self.control_h,device=dev)
         self.uniform_h=torch.zeros((n,sum(model.heads)),pin_memory=True)
         self.uniform=torch.zeros_like(self.uniform_h,device=dev)
+        self.crn_u=torch.zeros_like(self.uniform_h,device=dev)   # (the branch records' uniforms, staged)
         # Reserve the maximum width, but each transfer uses a compact view.
         # A [:n,:actual_width] slice of a wider 2-D buffer is non-contiguous:
         # D2H then allocates a pageable temporary despite non_blocking=True.
@@ -346,13 +347,22 @@ class RebuildGraphActor:
             if wm:
                 ctl[17,:len(closed)]=slots[closed];ctl[18,:len(closed)]=times[closed]
                 ctl[17,len(closed):wm]=slots[closed[0]];ctl[18,len(closed):wm]=times[closed[0]]
+            # Common random numbers only for branch records (ROW crn != 0), fresh uniforms for every other record,
+            # as GraphActor (2026-10-25: crn_uniforms(0, t) for all records gave every worker at decision t the
+            # same Gumbel noise); ukeys (the lanes): every record's uniforms from its key, as before
+            sel=None
+            if ukeys is None and self.crn and 'crn' in rows.dtype.names:
+                sel=np.flatnonzero(rows['crn']);ctl[20,:len(sel)]=sel
             self.raw.copy_(self.stage,non_blocking=True);self.control.copy_(self.control_h,non_blocking=True)
-            if ukeys is not None:un=crn_uniforms(ukeys[0],ukeys[1],sum(self.model.heads))
-            elif self.crn and 'crn' in rows.dtype.names:un=crn_uniforms(rows['crn'],rows['t'],sum(self.model.heads))
-            else:un=None
-            if un is None:self.uniform.uniform_()
+            H=sum(self.model.heads)
+            if ukeys is not None:
+                self.uniform_h.numpy()[:n]=crn_uniforms(ukeys[0],ukeys[1],H);self.uniform.copy_(self.uniform_h,non_blocking=True)
             else:
-                self.uniform_h.numpy()[:n]=un;self.uniform.copy_(self.uniform_h,non_blocking=True)
+                self.uniform.uniform_()
+                if sel is not None and len(sel):
+                    k=len(sel);self.uniform_h.numpy()[:k]=crn_uniforms(rows['crn'][sel],rows['t'][sel],H)
+                    self.crn_u.copy_(self.uniform_h,non_blocking=True)
+                    self.uniform.index_copy_(0,self.control[20,:k],self.crn_u[:k])
             ap.mark('component_replay')
             for j,m in counts:
                 key=(j,m)
