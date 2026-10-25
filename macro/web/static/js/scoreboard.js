@@ -5,6 +5,7 @@
 // took (ms, summed when every floor has one), and then, like every board, by who finished first.
 // A daily floor's moves go along too (hr_moves), for the replays: a day's moves are handed out only to
 // a player who has finished that day's challenge, proved by the secret token their own moves carry.
+// A daily floor's standing (floorStanding) counts the others' scores on that floor of the same day.
 const CONFIG = window.MAPGEN_CONFIG || {};
 const LOCAL = 'hr-scores-v1';
 const OUTBOX = 'hr-outbox-v1';
@@ -81,6 +82,11 @@ function localStore() {
       writeJson(LOCAL_MOVES, all);
     },
     async replay(q) { return movesFor(readJson(LOCAL_MOVES, []), q); },
+    async floorStanding({ game, day, floor, points, me }) {
+      const rows = readJson(LOCAL, []).filter((r) => r.game === game && r.mode === 'daily' && r.day === day && r.floor === floor
+        && r.client_id !== me);
+      return { others: rows.length, higher: rows.filter((r) => r.points > points).length, ties: rows.filter((r) => r.points === points).length };
+    },
   };
 }
 
@@ -165,11 +171,23 @@ function supabaseStore({ url, key }) {
     }
     return res.json();
   }
+  // one floor of a daily challenge: how many others played it, how many scored more, how many the same
+  async function floorStanding({ game, day, floor, points, me }) {
+    const count = async (extra = {}) => {
+      const q = new URLSearchParams({ select: 'id', game: `eq.${game}`, mode: 'eq.daily', day: `eq.${day}`, floor: `eq.${floor}`,
+        client_id: `neq.${me}`, limit: '0', ...extra });
+      const res = await get(`hr_scores?${q}`, { Prefer: 'count=exact' });
+      return parseInt((res.headers.get('content-range') || '').split('/')[1], 10) || 0;
+    };
+    const [others, higher, ties] = await Promise.all([count(), count({ points: `gt.${points}` }), count({ points: `eq.${points}` })]);
+    return { others, higher, ties };
+  }
   return {
     remote: true,
     submit: post,
     submitMoves: postMoves,
     replay,
+    floorStanding,
     async board({ scope, game, day, limit = 20, me = null }) {
       try {
         return await read({ scope, game, day, limit, me });
@@ -233,6 +251,7 @@ export function createScoreboard() {
       return out.length;
     },
     replay: (q) => sb.replay(q),
+    floorStanding: (q) => sb.floorStanding(q),
     async board(opts) {
       const out = await sb.board(opts);
       if (!sb.remote && opts.me) {
