@@ -26,6 +26,9 @@ DIR = os.environ.get('ISAAC_ACTOR_TORCH_PROFILE')
 AT = int(os.environ.get('ISAAC_ACTOR_TORCH_PROFILE_AT', '9000'))
 COUNT = int(os.environ.get('ISAAC_ACTOR_TORCH_PROFILE_COUNT', '200'))
 EAGER = int(os.environ.get('ISAAC_ACTOR_TORCH_PROFILE_EAGER', '50'))
+# 'timers': no torch.profiler (its CPU-op tracing inflates host time), the same sections by perf_counter only,
+# no eager pass; <dir>/actor-<kind>-<pid>-<id>.timers.json
+TIMERS = os.environ.get('ISAAC_ACTOR_TORCH_PROFILE_MODE') == 'timers'
 NULL = contextlib.nullcontext()
 PROCESS = dict(owner=None, main=0, window_main0=0, others={})   # (this process's calls by role, the window's owner)
 
@@ -92,9 +95,10 @@ class ActorProfile:
             PROCESS['owner'], PROCESS['window_main0'], self.phase = self, PROCESS['main'] - 1, 'window'
             self.counters0, self.t0 = _dynamo_counters(), time.perf_counter()
             self.extra0 = dict(graphs=self._graph_count())
-            self.prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                           torch.profiler.ProfilerActivity.CUDA])
-            self.prof.__enter__()
+            if not TIMERS:
+                self.prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                                               torch.profiler.ProfilerActivity.CUDA])
+                self.prof.__enter__()
         self.cur = dict(call=self.calls, n=int(n), t_submit=time.perf_counter()) if self.phase == 'window' else None
         return self.cur is not None
 
@@ -104,6 +108,12 @@ class ActorProfile:
     def mark(self, name):
         """Close the open host section and open 'h.<name>' (None: close only)."""
         if self.cur is None: return
+        if TIMERS:
+            now = time.perf_counter()
+            if self._open is not None:
+                k = 't.' + self._open[0]; self.cur[k] = self.cur.get(k, 0.0) + now - self._open[1]
+            self._open = (name, now) if name is not None else None
+            return
         if self._open is not None: self._open.__exit__(None, None, None); self._open = None
         if name is not None:
             self._open = torch.profiler.record_function('h.' + name); self._open.__enter__()
@@ -120,6 +130,22 @@ class ActorProfile:
         cur['wait_s'] = wait_s
         cur['latency_s'] = time.perf_counter() - cur.pop('t_submit')
         self.rows.append(cur)
+        if len(self.rows) == COUNT and TIMERS:
+            self.phase = 'done'
+            wall = time.perf_counter() - self.t0
+            keys = sorted({k for r in self.rows for k in r if k.startswith('t.')})
+            mean = lambda k: 1000 * float(np.mean([r.get(k, 0.0) for r in self.rows]))
+            out = dict(kind=self.kind, pid=os.getpid(), calls=COUNT, window_wall_s=wall,
+                       process_main_calls_in_window=PROCESS['main'] - PROCESS['window_main0'],
+                       latency_ms=dict(mean=mean('latency_s'), median=1000 * float(np.median([r['latency_s'] for r in self.rows]))),
+                       host_submit_ms=mean('host_submit_s'), wait_ms=mean('wait_s'),
+                       sections_ms={k[2:]: mean(k) for k in keys},
+                       rows_mean=float(np.mean([r['n'] for r in self.rows])),
+                       notes={k: float(np.mean([r[k] for r in self.rows if k in r])) for k in ('len_max', 'len_mean', 'capacity', 'closed', 'component_rows', 'stale')
+                              if any(k in r for r in self.rows)})
+            Path(str(self._base()) + '.timers.json').write_text(json.dumps(out, indent=1))
+            print('ACTOR_TIMERS', json.dumps({k: out[k] for k in ('kind', 'pid', 'latency_ms', 'host_submit_ms', 'wait_ms')}), flush=True)
+            return
         if len(self.rows) == COUNT:
             torch.cuda.synchronize()
             self.prof.__exit__(None, None, None)
