@@ -300,7 +300,7 @@ class SourcePipeline:
         self.retain_lag = time.perf_counter() - done if done is not None else float('nan')
         self.vjp_done_at = None
 
-    def _detach_horizon(self, frontiers, overlap, pinned=frozenset()):
+    def _detach_horizon(self, frontiers, overlap, vjp_pinned=frozenset()):
         """Turn graphs outside every future decision's horizon into values.
 
         A frame s is reachable by decision t iff t-s <= horizon; a Writer block
@@ -313,7 +313,9 @@ class SourcePipeline:
         may share its component nodes. The values stay readable."""
         limit = {uid: f - self.horizon for uid, f in frontiers.items()}
         def old(c, field):
-            if c is None or c.get('detached') or not c['future'].done() or id(c) in pinned: return False
+            # (vjp_pinned: ids of the chunks / writes a pending VJP backpropagates; `pinned` below is the
+            # chunk indices a live Writer graph holds)
+            if c is None or c.get('detached') or not c['future'].done() or id(c) in vjp_pinned: return False
             if c.get('uid') is None and c.get('uids'):   # stateless teacher frames of several records
                 return all(u in limit and c[field] < limit[u] for u in c['uids'])
             return c.get('uid') in limit and c[field] < limit[c['uid']]
