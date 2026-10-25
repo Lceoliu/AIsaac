@@ -1765,6 +1765,10 @@ def main(argv=None, child=None, actor=None):
                    help='above this source-GPU allocation, save new encoder activations in pinned CPU memory; 0 disables; no encoder replay')
     p.add_argument('--source-saved-cpu-gb', type=float, default=1,
                    help='maximum retained pinned activation GiB per source worker; excess stays on GPU')
+    p.add_argument('--source-layer-checkpoint', type=int, choices=(0, 1), default=0,
+                   help='opt-in, not the default: Spatial blocks under activation checkpointing in the source workers '
+                        '(each block input saved, its forward recomputed in the VJP); needs --source-compile 1 '
+                        '--source-flash 1')
     p.add_argument('--source-saved-8bit', type=int, choices=(0,64,128,256,512,1024,2048,4096), default=0,
                    help='experimental BF16 backward-activation 8-bit block size; 0 disables; forward/weights unchanged; overrides CPU spill')
     p.add_argument('--room-memory', type=int, choices=(0, 1), default=0, help='learn room writes from complete raw visits')
@@ -2535,6 +2539,7 @@ def main(argv=None, child=None, actor=None):
             version=source_version, saved_gpu_gb=args.source_saved_gpu_gb, saved_cpu_gb=args.source_saved_cpu_gb,
             saved_8bit=args.source_saved_8bit,
             compile_source=args.source_compile, flash_source=bool(args.source_flash),
+            layer_checkpoint=bool(args.source_layer_checkpoint),
             update_rollouts=args.source_update_rollouts, shared_devices=shared,
             actor_reserve_gb=args.source_actor_reserve_gb,processes=bool(args.source_processes),
             defer_backward=bool(args.source_prefetch_records),horizon=args.memory_horizon)

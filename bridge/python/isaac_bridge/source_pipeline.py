@@ -53,8 +53,12 @@ class ImmutableSourceCast(torch.autograd.Function):
 
 
 class SourcePipeline:
-    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0):
+    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False):
         self.model, self.period, self.micro, self.amp = model, period, micro, amp
+        # Opt-in (--source-layer-checkpoint): each Spatial block's output is recomputed in the VJP from its saved
+        # input (torch.utils.checkpoint, non-reentrant) instead of keeping the block's activations. Not the default:
+        # it recomputes the blocks' forward.
+        self.layer_checkpoint = bool(layer_checkpoint)
         # Gradient horizon in decisions (0: unbounded). Reads are unchanged; a
         # decision's loss reaches only sources at most `horizon` decisions older.
         # Graphs no future in-horizon decision can reach become detached values.
@@ -113,7 +117,8 @@ class SourcePipeline:
         if processes:
             from .source_worker import SourceProcess
             options=dict(period=period,micro=micro,amp=amp,version=version,saved_gpu_gb=saved_gpu_gb,saved_cpu_gb=saved_cpu_gb,saved_8bit=saved_8bit,
-                         compile_source=compile_source,flash_source=flash_source,update_rollouts=update_rollouts)
+                         compile_source=compile_source,flash_source=flash_source,update_rollouts=update_rollouts,
+                         layer_checkpoint=layer_checkpoint)
             spill_limits=([min(saved_gpu_gb,max(1.,b-1.)) for b in self._memory_budgets()]
                           if saved_gpu_gb>0 else [0.]*len(self.devices))
             self.remotes=[SourceProcess(self.versions[version][0],d,
@@ -195,12 +200,23 @@ class SourcePipeline:
                 # selective GELU rematerialization never replays encoder GEMMs.
                 method=('encode_rebuild' if self.compile_source==2 else
                         '_blocks_flash' if self.flash_source else '_blocks_bucketed')
-                compiled=torch.compile(getattr(replica,method),dynamic=True)
                 lock=self.compile_lock
-                def source_blocks(*args,fn=compiled):
-                    # Dynamo/FX tracing is process-global in this runtime. Only
-                    # the host dispatch is serialized; CUDA kernels stay async.
-                    with lock:return fn(*args)
+                if self.layer_checkpoint and method=='_blocks_flash':
+                    # One compiled function per block, each under a non-reentrant checkpoint: only the
+                    # block's input is saved, its forward runs again inside the VJP.
+                    from torch.utils.checkpoint import checkpoint
+                    block_fns=[torch.compile(lambda x,cu,ms,block=block:block.forward_packed(
+                        x,None,None,dict(cu_seqlens=cu,max_seqlen=ms)),dynamic=True) for block in replica.blocks]
+                    def source_blocks(xp,cu,ms,fns=block_fns):
+                        with lock:
+                            for fn in fns:xp=checkpoint(fn,xp,cu,ms,use_reentrant=False)
+                            return xp
+                else:
+                    compiled=torch.compile(getattr(replica,method),dynamic=True)
+                    def source_blocks(*args,fn=compiled):
+                        # Dynamo/FX tracing is process-global in this runtime. Only
+                        # the host dispatch is serialized; CUDA kernels stay async.
+                        with lock:return fn(*args)
                 setattr(replica,method,source_blocks)
         if self.processes:
             params=[p for n,p in replicas[0].named_parameters() if source_parameter(n)]
