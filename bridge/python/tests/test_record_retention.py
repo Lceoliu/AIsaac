@@ -86,8 +86,8 @@ def main(horizon=8):
     # 3. consumed: frontier inf for the branch -> its own chunks detach
     slots = np.arange(len(deduped))
     ledger.admit_v2(slots); ledger.picked(v2=slots); ledger.end_update()
-    front = ledger.frontier({parent.uid: 29}, None, list(deduped))
-    assert front[deduped[0].uid] == float('inf')
+    front = ledger.frontier({parent.uid: 29}, None, list(deduped), horizon)
+    assert front[deduped[0].uid] == [], front   # consumed: no reachable frames (values only)
     pipe.retain_histories({parent.uid} | {h.uid for h in deduped}, frontiers=front)
     for f in pipe.control_futures: f.result()
     # (a chunk a live Writer graph still holds stays a graph: at H=0 the parent's
