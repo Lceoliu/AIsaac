@@ -2575,7 +2575,7 @@ def main(argv=None, child=None, actor=None):
         t0 = time.perf_counter()
         if args.rebuild_memory and PROFILE_MEMORY:
             MEMORY_TIMES.clear(); MEMORY_COUNTS.clear()
-        U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
+        U = dict.fromkeys(('rc_prep', 'rc_sources', 'recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
                           (('temporal',) if t_on else ()), 0.0)   # seconds per part of the update (u_* columns)
         if t_on and getattr(job['roll'], 't_kv', None) is None:
             raise RuntimeError('--temporal 1: the rollout has no temporal arrays (a bench job of a run without it?)')
@@ -2689,11 +2689,13 @@ def main(argv=None, child=None, actor=None):
                 for uid in in_flight: frontier.setdefault(uid, float('inf'))   # values only, no pending loss
                 return frontier
             if not retire_after_ready:source_pipeline.retain_histories(live_uids,frontiers=horizon_frontiers())
+            sec('rc_prep')   # (timing only: the recompute pass split into the job's preparation, its sources, the forward)
             # Source values are immutable across fast/slow weight updates. Build
             # the rollout's numerical bank once; only Reader graphs are renewed.
             with torch.inference_mode(False), torch.no_grad(), autocast():
                 resident_sources=SourceBatch(learner_model,all_requests,args.room_source_micro,
                                              cache=False,pipeline=source_pipeline)
+            sec('rc_sources')
             encoded = L.setdefault('encoded_upto', {})   # rule 5: frames encoded (and waited for) per owner
             # (frames before each episode's latest decision: the next rollout may still start
             # with that decision, carried open, whose prefix splits the block holding it)
