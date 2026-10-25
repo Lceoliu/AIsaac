@@ -232,7 +232,11 @@ class SourcePipeline:
 
         frontiers: {uid: earliest decision index any future loss may use}. With
         a horizon, live graphs no such decision can reach become detached values."""
-        if self.pending is not None: return
+        if self.pending is not None:   # (an Adam interval's VJP is still pending: nothing is released now)
+            self.retain_skipped = getattr(self, 'retain_skipped', 0) + 1
+            return
+        graph_rows = lambda: sum(c['rows'] for c in self.chunks if c is not None and not c.get('detached'))
+        before = graph_rows()
         uids = set(uids).union(*self.prefetch_live.values())
         uids.update(h.uid for batch in self.collected.values() for h,_,_ in batch.requests)
         # A live branch keeps the ancestor frames it reads (they are keyed by the ancestor).
@@ -284,6 +288,11 @@ class SourcePipeline:
                 keep=([i for i,c in enumerate(self.chunks) if c is not None and c['worker']==worker],
                       [i for i,c in enumerate(self.writes) if c is not None and c['worker']==worker],list(self.versions))
                 self.control_futures.append(executor.submit(self._remote,worker,'retire',keep))
+        # (accounting: graph frames this call retired or detached; seconds since the last VJP had completed)
+        self.retain_released = before - graph_rows()
+        done = getattr(self, 'vjp_done_at', None)
+        self.retain_lag = time.perf_counter() - done if done is not None else float('nan')
+        self.vjp_done_at = None
 
     def _detach_horizon(self, frontiers, overlap):
         """Turn graphs outside every future decision's horizon into values.
@@ -370,6 +379,10 @@ class SourcePipeline:
                     source_graph_frames_uid_max=max(per_uid.values(), default=0),
                     source_graph_writes=sum(c is not None and not c.get('detached') for c in self.writes),
                     source_pinned_rows=getattr(self, 'pinned_rows', 0),
+                    source_retain_skipped=getattr(self, 'retain_skipped', 0),
+                    source_retain_released=getattr(self, 'retain_released', 0),
+                    source_vjp_to_retain_s=getattr(self, 'retain_lag', float('nan')),
+                    source_vjps=self.version,
                     source_detached_frames=detached,
                     source_detached_total=self.horizon_detached['frames'],
                     source_horizon_dropped_grad=dropped,
@@ -1098,6 +1111,7 @@ class SourcePipeline:
         # observed frames use this new snapshot; old frames keep theirs.
         self.model.invalidate_source_cache()
         self.pending=None
+        self.vjp_done_at = time.perf_counter()
         self.events.extend([
             dict(kind='commit_wait', device='host', start=started, end=ready),
             dict(kind='commit_transfer', device='host', start=ready, end=transferred),
