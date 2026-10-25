@@ -243,6 +243,7 @@ FLOOR_REWARD = 'damage=1,hurt=0.75,room=1,explore=0.5,boss=2,exit=3,death=2,time
 OVERLAP_TEACHER_SHARE = 0.15
 # ISAAC_RL_PROFILE=1: the learner synchronises the GPU between the parts of an update and logs their seconds (u_*
 # columns); a measurement aid that costs a little speed. Without it the u_* columns hold only host-side times.
+TIMELINE = os.environ.get('ISAAC_TIMELINE') == '1'   # (measurement aid: TIMELINE lines, one per update)
 PROFILE = os.environ.get('ISAAC_RL_PROFILE', '0') == '1'
 
 
@@ -580,6 +581,7 @@ def merge_jobs(halves):
             j[k] = max(h.get(k, 0.0) for h in halves)
     j['t_start'] = min(h.get('t_start', j.get('t_start')) for h in halves)
     j['collect_actors'] = ' '.join(f"{h.get('collect_s', 0.0):.3f}" for h in halves)
+    j['tl_actors'] = [h.get('tl') for h in halves]   # (ISAAC_TIMELINE)
     j['prof'], j['worker'], j['lane_stat'] = sum_dict('prof'), sum_dict('worker'), sum_dict('lane_stat')
     j['stats'] = np.concatenate([h['stats'] for h in halves])
     j['teach'], j['v2'], j['choices'] = cat_rec('teach'), cat_rec('v2'), cat_rec('choices')
@@ -2584,12 +2586,15 @@ def main(argv=None, child=None, actor=None):
         mark = [t0]
         cpu0 = cpu_ticks()
 
+        tl_marks = [] if TIMELINE else None   # (ISAAC_TIMELINE: each part's end, for the update's timeline)
+
         def sec(name):
             if PROFILE:
                 torch.cuda.current_stream().synchronize()
             now_ = time.perf_counter()
             U[name] += now_ - mark[0]
             mark[0] = now_
+            if tl_marks is not None: tl_marks.append((name, now_))
         rl = job['roll']
         if job.get('lroll') is not None:   # B38: the rollout's mirror on this GPU; its copy done before any read
             rl = job['lroll']
@@ -3765,6 +3770,13 @@ def main(argv=None, child=None, actor=None):
                     free_gib=torch.cuda.mem_get_info(d)[0]/2**30,
                     worker=source_pipeline.remote_memory[i]) for i,d in enumerate(source_pipeline.devices)])),flush=True)
         update_s = time.perf_counter() - t0
+        if TIMELINE and source_pipeline is not None:
+            # (measurement aid) one update's timeline, every clock time.perf_counter (CLOCK_MONOTONIC: the
+            # same in the learner, actor and source processes): the learner's parts, every source event
+            # this update collected (VJP / encode / Writer per device, the host's waits), the actors' collect
+            print('TIMELINE ' + json.dumps(dict(update=L['update'] + 1, learn_start=t0, learn_end=t0 + update_s,
+                  job_start=job.get('t_learn_ready'), marks=tl_marks, actors=job.get('tl_actors'),
+                  events=[(e['kind'], e['device'], e['start'], e['end']) for e in source_pipeline.events])), flush=True)
         if args.rebuild_memory and PROFILE_MEMORY:
             print('MEMORY_PROFILE ' + json.dumps(dict(update=L['update']+1, update_s=update_s,
                   seconds=MEMORY_TIMES, counts=MEMORY_COUNTS)), flush=True)
@@ -4782,6 +4794,7 @@ def main(argv=None, child=None, actor=None):
                 book.seen_inv = []
                 post_lab_jobs()
             job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
+                       tl=(t0, t0 + collect_s, now),   # (ISAAC_TIMELINE: collect start / end, hand-off)
                        **lab_job,
                        teach=sampler.teacher_records() if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,
