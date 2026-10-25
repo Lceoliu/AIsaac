@@ -24,6 +24,8 @@ kinds = sys.argv[sys.argv.index('--kinds') + 1].split(',') if '--kinds' in sys.a
 for kind, cfg in (('rebuild', dict(base, rebuild_memory=True, memory_block=4, memory_tokens=2, source_cache=True)),
                   ('graph', base)):
     if kind not in kinds: continue
+    import isaac_bridge.actor_profile as AP   # (one window per process: a fresh one for each kind)
+    AP.PROCESS.update(owner=None, main=0, window_main0=0, others={})
     torch.manual_seed(23)
     model = TokPolicy(**cfg).cuda().eval(); twin = copy.deepcopy(model)
     actors = []
