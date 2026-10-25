@@ -627,7 +627,7 @@ class ComponentCache:
         packed=np.empty(len(rows),dtype=cls.layouts[name])
         for f in cls.fields[name]:packed[f]=rows[f]
         if name=='player':packed['_pending']=pending
-        return [r.tobytes() for r in packed]
+        return packed.view(np.dtype((np.void, packed.dtype.itemsize))).tolist()   # (= each row's tobytes(), in C)
 
     def __init__(self):
         self.generation = -1
