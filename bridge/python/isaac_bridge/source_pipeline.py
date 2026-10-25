@@ -59,6 +59,7 @@ class SourcePipeline:
         # decision's loss reaches only sources at most `horizon` decisions older.
         # Graphs no future in-horizon decision can reach become detached values.
         self.horizon=horizon
+        self.pending_chunks=set();self.pending_uids=set()   # (see start_finish / retain_histories)
         self.horizon_dropped=None
         self.horizon_detached=dict(chunks=0,writes=0,frames=0,packets=0)
         self.origins={}   # branch uid -> RawHistory.origin: its ancestors' frames are keyed by them
@@ -232,12 +233,17 @@ class SourcePipeline:
 
         frontiers: {uid: earliest decision index any future loss may use}. With
         a horizon, live graphs no such decision can reach become detached values."""
-        if self.pending is not None:   # (an Adam interval's VJP is still pending: nothing is released now)
-            self.retain_skipped = getattr(self, 'retain_skipped', 0) + 1
-            return
+        # A pending interval's VJP (deferred or running) still needs the graphs of its packets: those
+        # chunks stay graphs, and every episode with a packet stays whole until a later call (its other
+        # chunks may share component nodes with them). Everything else is released as without a VJP.
+        # (Before 2026-10-25 this returned at once: with the deferred VJP of every rollout always pending
+        # here, graphs were released only every 4-6 updates and the source cards ran out of memory.)
+        pinned = self.pending_chunks if self.pending is not None else set()
+        if pinned: self.retain_pinned = getattr(self, 'retain_pinned', 0) + 1
         graph_rows = lambda: sum(c['rows'] for c in self.chunks if c is not None and not c.get('detached'))
         before = graph_rows()
         uids = set(uids).union(*self.prefetch_live.values())
+        if pinned: uids.update(self.pending_uids)
         uids.update(h.uid for batch in self.collected.values() for h,_,_ in batch.requests)
         # A live branch keeps the ancestor frames it reads (they are keyed by the ancestor).
         uids.update(a for uid in list(uids) for a, _ in self.origins.get(uid, ()))
@@ -269,13 +275,13 @@ class SourcePipeline:
         self.chunks = [c if i in live_chunks else None for i, c in enumerate(self.chunks)]
         self.writes = [c if i in live_writes else None for i, c in enumerate(self.writes)]
         if self.horizon and frontiers:
-            self._detach_horizon(frontiers, overlap)
+            self._detach_horizon(frontiers, overlap, pinned)
         elif frontiers:
             # Without a horizon, an episode with no future loss (frontier inf: a consumed
             # record, an in-flight branch's ancestor, an ended episode in its grace period)
             # needs values only (rule 2, rule 5 D2a); its graphs would hold VRAM unused.
             done = {uid: f for uid, f in frontiers.items() if f == float('inf')}
-            if done: self._detach_horizon(done, overlap)
+            if done: self._detach_horizon(done, overlap, pinned)
         # A detached value no longer needs its immutable weight snapshot.
         versions = {c['version'] for c in self.chunks + self.writes if c is not None and not c.get('detached')}
         self.versions = {v: r for v, r in self.versions.items() if v in versions or v == self.version}
@@ -294,7 +300,7 @@ class SourcePipeline:
         self.retain_lag = time.perf_counter() - done if done is not None else float('nan')
         self.vjp_done_at = None
 
-    def _detach_horizon(self, frontiers, overlap):
+    def _detach_horizon(self, frontiers, overlap, pinned=frozenset()):
         """Turn graphs outside every future decision's horizon into values.
 
         A frame s is reachable by decision t iff t-s <= horizon; a Writer block
@@ -307,7 +313,7 @@ class SourcePipeline:
         may share its component nodes. The values stay readable."""
         limit = {uid: f - self.horizon for uid, f in frontiers.items()}
         def old(c, field):
-            if c is None or c.get('detached') or not c['future'].done(): return False
+            if c is None or c.get('detached') or not c['future'].done() or id(c) in pinned: return False
             if c.get('uid') is None and c.get('uids'):   # stateless teacher frames of several records
                 return all(u in limit and c[field] < limit[u] for u in c['uids'])
             return c.get('uid') in limit and c[field] < limit[c['uid']]
@@ -380,6 +386,7 @@ class SourcePipeline:
                     source_graph_writes=sum(c is not None and not c.get('detached') for c in self.writes),
                     source_pinned_rows=getattr(self, 'pinned_rows', 0),
                     source_retain_skipped=getattr(self, 'retain_skipped', 0),
+                    source_retain_pinned=getattr(self, 'retain_pinned', 0),
                     source_retain_released=getattr(self, 'retain_released', 0),
                     source_vjp_to_retain_s=getattr(self, 'retain_lag', float('nan')),
                     source_vjps=self.version,
@@ -1040,6 +1047,10 @@ class SourcePipeline:
                 result=chunk['future'].result()
                 if result['grads']:
                     packets.append((chunk,result['grads']));result['grads']={}
+        # (the chunks / writes this interval's VJP backpropagates, and their episodes: retain_histories keeps them)
+        self.pending_chunks={id(c) for c,_ in packets}
+        self.pending_uids={c['uid'] for c,_ in packets if c.get('uid') is not None}
+        self.pending_uids.update(u for c,_ in packets if c.get('uid') is None for u in c.get('uids',()))
         if defer:
             self.deferred_packets=packets
             futures=[]
@@ -1111,6 +1122,7 @@ class SourcePipeline:
         # observed frames use this new snapshot; old frames keep theirs.
         self.model.invalidate_source_cache()
         self.pending=None
+        self.pending_chunks=set();self.pending_uids=set()
         self.vjp_done_at = time.perf_counter()
         self.events.extend([
             dict(kind='commit_wait', device='host', start=started, end=ready),
