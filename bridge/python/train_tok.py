@@ -2701,6 +2701,7 @@ def main(argv=None, child=None, actor=None):
                 frontier = {}
                 for h, _, _ in all_requests:
                     frontier[h.uid] = min(frontier.get(h.uid, h.length), h.length)
+                source_pipeline.rollout_frontiers = dict(frontier)   # (accounting: hold_reasons)
                 frontier = ledger.frontier(frontier, L.get('teach_contexts'), L.get('v2_contexts'))
                 for uid in in_flight: frontier.setdefault(uid, float('inf'))   # values only, no pending loss
                 return frontier
@@ -4063,6 +4064,7 @@ def main(argv=None, child=None, actor=None):
             row.update(dict(record_bytes=0, record_raw_bytes=0, record_value_bytes=0, record_own_frames=0,
                             record_v2_episodes=0, record_v2_live=0, record_evicted=0, record_shared_frames=0,
                             record_v2_consumed=0, record_teach_consumed=0), **L['ledger'].last if 'ledger' in L else {})
+            if 'ledger' in L: row.update(L['ledger'].wait_stats())
             from isaac_bridge.rebuild_memory import RELEASE_COUNTS
             row.update(raw_released_frames=RELEASE_COUNTS['frames'], raw_grace_episodes=len(L.get('recent_uids', {})),
                        grace_hits=L.get('grace_hits', 0), grace_age_max=L.get('grace_age_max', 0),

@@ -316,11 +316,33 @@ class SourcePipeline:
                 keep=([i for i,c in enumerate(self.chunks) if c is not None and c['worker']==worker],
                       [i for i,c in enumerate(self.writes) if c is not None and c['worker']==worker],list(self.versions))
                 self.control_futures.append(executor.submit(self._remote,worker,'retire',keep))
+        if self.horizon and frontiers and getattr(self, 'rollout_frontiers', None) is not None:
+            self.hold = self.hold_reasons(frontiers, pinned)
         # (accounting: graph frames this call retired or detached; seconds since the last VJP had completed)
         self.retain_released = before - graph_rows()
         done = getattr(self, 'vjp_done_at', None)
         self.retain_lag = time.perf_counter() - done if done is not None else float('nan')
         self.vjp_done_at = None
+
+    def hold_reasons(self, frontiers, vjp_pinned):
+        """(accounting, progress.csv source_hold_*) why each graph frame is still a graph, first reason that
+        applies: inside a live rollout decision's horizon (rollout_frontiers: the rollout's first decision per
+        episode, set by the learner); inside an unconsumed record's or an in-flight branch's (the episode's
+        frontier is earlier than the rollout's); in a pending VJP's packets; held by a live Writer graph; other."""
+        H = self.horizon; R = self.rollout_frontiers
+        writer = getattr(self, 'writer_pinned', set())
+        out = dict(rollout=0, record=0, vjp=0, writer=0, other=0)
+        for i, c in enumerate(self.chunks):
+            if c is None or c.get('detached'): continue
+            uids = [c['uid']] if c.get('uid') is not None else list(c.get('uids', ()))
+            if any(u in R and c['last'] >= R[u] - H for u in uids): k = 'rollout'
+            elif any(u in frontiers and frontiers[u] < R.get(u, float('inf')) and c['last'] >= frontiers[u] - H
+                     for u in uids): k = 'record'
+            elif id(c) in vjp_pinned: k = 'vjp'
+            elif i in writer: k = 'writer'
+            else: k = 'other'
+            out[k] += c['rows']
+        return out
 
     def _detach_horizon(self, frontiers, overlap, vjp_pinned=frozenset()):
         """Turn graphs outside every future decision's horizon into values.
@@ -347,6 +369,7 @@ class SourcePipeline:
         leaving = set(writes)
         pinned = set().union(*(c['chunks'] for i, c in enumerate(self.writes)
                                if c is not None and not c.get('detached') and i not in leaving))
+        self.writer_pinned = pinned   # (accounting: hold_reasons)
         chunks = [i for i, c in enumerate(self.chunks) if old(c, 'last') and i not in pinned]
         self.pinned_rows = sum(self.chunks[i]['rows'] for i in pinned if self.chunks[i] is not None and old(self.chunks[i], 'last'))
         if not chunks and not writes: return
@@ -411,6 +434,7 @@ class SourcePipeline:
                     source_pinned_rows=getattr(self, 'pinned_rows', 0),
                     source_retain_skipped=getattr(self, 'retain_skipped', 0),
                     source_retain_pinned=getattr(self, 'retain_pinned', 0),
+                    **{f'source_hold_{k}': v for k, v in (getattr(self, 'hold', None) or {}).items()},
                     source_retain_released=getattr(self, 'retain_released', 0),
                     source_vjp_to_retain_s=getattr(self, 'retain_lag', float('nan')),
                     source_vjps=self.version,
