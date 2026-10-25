@@ -73,8 +73,8 @@ def main():
             with torch.no_grad(): bank = SourceBatch(model, req_k, cache=False, pipeline=pipe)
             outs[k].append(SourceView(bank, np.arange(len(req))).forward(np.arange(len(req)), need_vg=True)[0].detach())
         # the actor sent everything up to its latest frame; the learner encoded the rollout
-        sent[slot[0].uid] = slot[0].length; encoded[slot[0].uid] = req[-1][0].length + 1
-        learner_hold[slot[0].uid] = req[-1][0]
+        sent[slot[0].uid] = slot[0].length; encoded[slot[0].uid] = req[-1][0].length
+        learner_hold[slot[0].uid] = slot[0]   # the learner's received history runs past the last decision
         release_raw(lambda u: sent.get(u, 0), B, slot_lists=[slot], context_lists=[[prefixes]])
         release_raw(lambda u: encoded.get(u, 0), B, context_dicts=[learner_hold])
         prefixes = [p for p in prefixes[-ROLL:]]   # the actor keeps two rollouts of prefixes
@@ -83,6 +83,13 @@ def main():
     assert raw_bytes(full_slot) / row_bytes >= ROLL * N   # the control really kept every frame
     bound = 3 * (ROLL + B)   # three holders, each at most one rollout + one open block
     assert max(sizes[2:]) <= bound and sizes[-1] <= sizes[3] + B, (sizes, bound)
+    # The next rollout may start with the last decision, carried open: the learner's
+    # unpack splits the block holding it, which must still have its bytes.
+    from isaac_bridge.rebuild_memory import unpack_histories
+    held = learner_hold[slot[0].uid]
+    refs = np.asarray([[[0, encoded[slot[0].uid]]]], np.int32)   # the carried decision's prefix
+    carried = unpack_histories(([held], refs), B)[0][0]
+    assert carried.length == encoded[slot[0].uid] and carried.length % B, carried.length
     last = [(learner_hold[slot[0].uid], seq[ROLL * N - 1][0], pend[ROLL * N - 1])]
     assert all(isinstance(b[0], ReleasedRows) for b in learner_hold[slot[0].uid].blocks[:-1])
     full = full_slot[0]

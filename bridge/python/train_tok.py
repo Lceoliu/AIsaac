@@ -2684,7 +2684,9 @@ def main(argv=None, child=None, actor=None):
                 resident_sources=SourceBatch(learner_model,all_requests,args.room_source_micro,
                                              cache=False,pipeline=source_pipeline)
             encoded = L.setdefault('encoded_upto', {})   # rule 5: frames encoded (and waited for) per owner
-            for h, _, _ in all_requests: encoded[h.uid] = max(encoded.get(h.uid, 0), h.length + 1)
+            # (frames before each episode's latest decision: the next rollout may still start
+            # with that decision, carried open, whose prefix splits the block holding it)
+            for h, _, _ in all_requests: encoded[h.uid] = max(encoded.get(h.uid, 0), h.length)
         value_now = every = prox = None
         vgs, vg_now, ret_g = [], None, None   # (B22) value_global at the update's start, its returns
         # 2026-10-14 (B24): the actor's stored value_global (Rollout.value_g) is used like the stored value: recomputed
@@ -2959,7 +2961,7 @@ def main(argv=None, child=None, actor=None):
                                                 args.room_source_micro, cache=False,pipeline=source_pipeline)
                     if source_pipeline is not None:
                         encoded = L.setdefault('encoded_upto', {})
-                        for h in v_contexts: encoded[h.uid] = max(encoded.get(h.uid, 0), h.length + 1)
+                        for h in v_contexts: encoded[h.uid] = max(encoded.get(h.uid, 0), h.length)
                 lp_all, lp_mv, val_v = [], [], []
                 with torch.inference_mode():
                     for at in range(0, v2_new, 512):
