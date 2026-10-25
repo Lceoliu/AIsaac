@@ -53,12 +53,18 @@ class ImmutableSourceCast(torch.autograd.Function):
 
 
 class SourcePipeline:
-    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False):
+    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False):
         self.model, self.period, self.micro, self.amp = model, period, micro, amp
         # Opt-in (--source-layer-checkpoint): each Spatial block's output is recomputed in the VJP from its saved
         # input (torch.utils.checkpoint, non-reentrant) instead of keeping the block's activations. Not the default:
         # it recomputes the blocks' forward.
         self.layer_checkpoint = bool(layer_checkpoint)
+        # (--source-dispatch-at-close, scheduling only) with defer_backward: a closed interval's VJP starts when it
+        # closes (overlapping the next collection; the workers serve forward requests between its episode groups,
+        # ISAAC_SOURCE_PREEMPT_VJP) instead of after the next Reader's inputs; its commit stays gated until that
+        # same point (dispatch_finish), so the Adam step and the weights later encodes see are as with the delay.
+        self.dispatch_at_close = bool(dispatch_at_close)
+        self.commit_gate = False
         # Gradient horizon in decisions (0: unbounded). Reads are unchanged; a
         # decision's loss reaches only sources at most `horizon` decisions older.
         # Graphs no future in-horizon decision can reach become detached values.
@@ -1083,6 +1089,7 @@ class SourcePipeline:
         new observations that Reader needs, merely renaming commit_wait to
         ready_encode_wait. Snapshot weights and the Adam interval are unchanged.
         """
+        self.commit_gate=False   # (a VJP dispatched at its close may commit from here on, as a deferred one would)
         if self.deferred_packets is None:return
         packets=self.deferred_packets;self.deferred_packets=None
         futures=[w.submit(self._backward,i,packets) for i,w in enumerate(self.backward_workers)]
@@ -1100,7 +1107,9 @@ class SourcePipeline:
         self._flush_collected()
         self.rollouts_since_update+=1
         if self.rollouts_since_update==self.update_rollouts:
-            self.start_finish(optimizer,max_norm,defer=self.defer_backward and overlap)
+            early=self.dispatch_at_close and self.defer_backward and overlap
+            self.start_finish(optimizer,max_norm,defer=self.defer_backward and overlap and not early)
+            if early and self.pending is not None:self.commit_gate=True
             if not overlap:self.poll_finish(optimizer,max_norm,wait=True)
 
     def poll_finish(self, optimizer, max_norm, wait=False):
@@ -1114,6 +1123,9 @@ class SourcePipeline:
         if self.deferred_packets is not None:
             if not wait:return
             self.dispatch_finish()
+        if self.commit_gate:   # (dispatched at its close; committed no earlier than a deferred one would be)
+            if not wait:return
+            self.commit_gate=False
         futures,direct,steps=self.pending
         if not wait and not all(self._backward_ready(f) for f in futures):return
         started = time.perf_counter()
