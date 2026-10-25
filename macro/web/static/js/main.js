@@ -66,6 +66,8 @@ const state = {
   nudge: null,       // the tool the page has just switched to, its button pulses once
   watch: null,       // another player's replay: {id, name, floors: Map(floor -> {moves, gaveUp}), cache, paused}
   replayProbs: false, // a player's replay shows the probabilities they faced (off: the floor as they saw it)
+  standing: new Map(), // game:day:floor|run:i:points -> {ok, v} or {failed}: a daily floor's place, the run's place
+  runGen: 0,         // bumped once a score has gone in: the run's place is asked again (its key has it as i)
 };
 
 // ---------------------------------------------------------------------------- small helpers
@@ -953,6 +955,8 @@ async function finishFloor() {
     else if (res.error) flash('成绩先存在本机，下次联网时会自动补交。');
     else if (state.mode === 'daily' && state.day !== today()) flash(`已过零点：这一局的成绩仍算在 ${dayName(state.day)}的挑战里。`);
     state.board = null;
+    state.runGen += 1;                             // the run's place counts this score only now: ask again
+    if (state.screen === 'play' && state.data) renderPanel();
   } else {
     render();
   }
@@ -1145,9 +1149,13 @@ function winCard(f, p) {
   const perfect = sc.clean ? `（含一次不空 +${sc.bonus}）` : '';
   const took = ranked() && typeof p.ms === 'number' ? `，用时 ${clockText(p.ms)}` : '';
   win.appendChild(html('p', {}, `${ranked() ? `本层 ${sc.total} 分${perfect}${took}。` : ''}${used}；${aiText}`));
+  const place = ranked() && sc.done ? floorStandingText(standingOf('floor', state.floor, sc.total)) : null;
+  if (place) win.appendChild(html('p', { class: 'standing' }, place));
   if (all) {
     const time = runTime();
-    win.appendChild(html('p', { class: 'total' }, `挑战完成！${state.data.floors.length} 层一共 ${runPoints()} 分${time !== null ? `，用时 ${clockText(time)}` : ''}。`));
+    const runPlace = runStandingText(standingOf('run', state.runGen, runPoints()));
+    win.appendChild(html('p', { class: 'total' }, `挑战完成！${state.data.floors.length} 层一共 ${runPoints()} 分${time !== null ? `，用时 ${clockText(time)}` : ''}。`
+      + (runPlace ? `${runPlace}。` : '')));
   }
   const acts = html('div', { class: 'actions' });
   const watch = html('button', { type: 'button' }, '看 AI 怎么找');
@@ -1158,6 +1166,11 @@ function winCard(f, p) {
     if (ONE_COLUMN.matches) $('map').closest('.frame').scrollIntoView({ block: 'start', behavior: 'smooth' });
   });
   acts.appendChild(watch);
+  if (all) {
+    const share = html('button', { type: 'button', title: '复制一段不含答案的战绩，发到群里' }, '分享战绩');
+    share.addEventListener('click', () => shareRun(share));
+    acts.appendChild(share);
+  }
   if (!last) {
     const next = html('button', { type: 'button', class: 'primary' }, '下一层');
     next.addEventListener('click', () => goFloor(state.floor + 1));
@@ -1175,6 +1188,81 @@ function winCard(f, p) {
   }
   win.appendChild(acts);
   return win;
+}
+
+// ---------------------------------------------------------------------------- standing and sharing
+// A daily floor's place among everyone who played it, and the run's place on the day's board: asked for
+// once per score (state.standing), shown on the floor's card when they come back. Only with the shared
+// board; the run's place is asked again once a score has gone in (finishFloor bumps state.runGen).
+function standingOf(kind, i, points) {
+  if (state.mode !== 'daily' || !state.scoreboard.remote) return null;
+  const { game } = state.data, day = state.day, me = state.profile.id;
+  const key = `${game}:${day}:${kind}:${i}:${points}`;
+  if (!state.standing.has(key)) {
+    state.standing.set(key, { ok: false });
+    const job = kind === 'floor'
+      ? state.scoreboard.floorStanding({ game, day, floor: i, points, me })
+      : state.scoreboard.board({ scope: 'today', game, day, limit: 1, me });
+    job.then((v) => state.standing.set(key, { ok: true, v }), () => state.standing.set(key, { failed: true }))
+      .then(() => { if (state.screen === 'play' && state.data && state.data.game === game && state.day === day) renderPanel(); });
+  }
+  return state.standing.get(key);
+}
+function floorStandingText(s) {
+  if (!s || s.failed) return null;
+  if (!s.ok) return '正在统计这一层的排名…';
+  const { others, higher, ties } = s.v;
+  if (!others) return '你是第一个打完这一层的人。';
+  const below = others - higher - ties;
+  return `这一层 ${others + 1} 人里你排第 ${higher + 1}${ties ? `（和 ${ties} 人同分）` : ''}`
+    + `${below > 0 ? `，超过了 ${Math.floor((100 * below) / others)}% 的人` : ''}。`;
+}
+// the run's place, once the board has every one of its scores
+function runStandingText(s) {
+  if (!s || !s.ok || !s.v.mine || !s.v.rank || s.v.mine.points !== runPoints()) return null;
+  return `${dayName(state.day)}挑战榜第 ${s.v.rank} / ${s.v.total} 名`;
+}
+
+// The run as a few lines to paste in a group chat: each floor's tries in order (what each found, or a
+// miss), a flag for a floor given up, a star for one with no miss, its points. No cell is named, so it
+// gives nothing away; the link opens the same challenge.
+const SHARE_MARK = { secret: '🟩', super: '🟦', ultra: '🟥' };
+function shareText() {
+  const d = state.data;
+  const daily = state.mode === 'daily';
+  const time = runTime();
+  const runPlace = daily ? runStandingText(standingOf('run', state.runGen, runPoints())) : null;
+  const lines = [`以撒小测试 · ${GAMES[d.game]} · ${daily ? `${dayName(state.day)}挑战` : `随机挑战 ${d.seed.text}`}`,
+    [`${runPoints()} 分`, time !== null ? `用时 ${clockText(time)}` : null, runPlace].filter(Boolean).join(' · ')];
+  d.floors.forEach((f, i) => {
+    const p = play(i);
+    const sc = scoreOf(i, p);
+    const marks = p.log.map((e) => (e.found.length ? e.found.map((k) => SHARE_MARK[k]).join('') : '⬛')).join('');
+    lines.push(`${i + 1} ${marks || '·'}${p.revealed && !sc.complete ? '🏳️' : ''}${sc.clean ? '⭐' : ''} ${sc.total}`);
+  });
+  lines.push(`🟩隐藏 🟦超级${d.game === 'repplus' ? ' 🟥究极' : ''} ⬛空 ⭐一次不空`);
+  const q = new URLSearchParams({ play: state.mode, game: d.game });
+  if (daily) q.set('day', state.day); else q.set('seed', d.seed.text);
+  lines.push(`${location.origin}${location.pathname}?${q}`);
+  return lines.join('\n');
+}
+// the phone's share sheet, else the clipboard, else the text to copy by hand
+async function shareRun(btn) {
+  const text = shareText();
+  if (navigator.share && COARSE.matches) {
+    try { await navigator.share({ text }); return; } catch (err) { if (err && err.name === 'AbortError') return; }
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    btn.textContent = '已复制 ✓';
+    flash('战绩已复制，粘贴到群里就行。');
+    return;
+  } catch { /* no clipboard here */ }
+  const box = html('textarea', { class: 'sharebox', readonly: true, rows: String(text.split('\n').length) });
+  box.value = text;
+  btn.closest('.win').appendChild(box);
+  box.focus();
+  box.select();
 }
 
 // ---------------------------------------------------------------------------- map mode
