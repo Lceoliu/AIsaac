@@ -5,7 +5,8 @@ consumption, a byte budget. CPU, small model.
    ancestor's arrays afterwards; rows are unchanged byte for byte.
 2. A branch's prefix frames are its parent's source frames: encoding only its
    own frames; an unconsumed record's loss reaches the parent's graphs.
-3. After the consuming update the record's own graphs detach (frontier inf);
+3. After the consuming update the record's own graphs detach (frontier inf), with
+   a horizon and without one (H=0);
    a later read of it is frozen: no source cotangent, zero dropped gradient,
    Reader weights still learn.
 4. RecordLedger budget evicts the oldest records whole; draws are unchanged
@@ -28,7 +29,7 @@ CFG = dict(width=32, layers=1, heads=4, **TS.BASE, **TS.FUSED, temporal=True, te
            temporal_heads=4, temporal_window=4, rebuild_memory=True, memory_block=BLOCK, memory_tokens=2, source_cache=True)
 
 
-def main():
+def main(horizon=8):
     torch.set_num_threads(2); torch.manual_seed(7)
     model = TokPolicy(**CFG).eval()
     rng = np.random.default_rng(7)
@@ -62,7 +63,7 @@ def main():
     deduped = ledger.share([pickle.loads(pickle.dumps(h)) for h in records[-3:]])
     assert ledger.shared_frames >= 3 * 16
     # 2. sources: the branch's prefix is the parent's
-    pipe = SourcePipeline(model, ['cpu', 'cpu'], period=0, micro=8, update_rollouts=1, horizon=8)
+    pipe = SourcePipeline(model, ['cpu', 'cpu'], period=0, micro=8, update_rollouts=1, horizon=horizon)
     opt = torch.optim.Adam(model.main_parameters(), lr=1e-3, eps=1e-5)
     main_req = [(prefixes[t], seq[t][0], pend[t]) for t in range(22, 30)]
     with torch.no_grad(): bank = SourceBatch(model, main_req, cache=False, pipeline=pipe)
@@ -89,8 +90,12 @@ def main():
     assert front[deduped[0].uid] == float('inf')
     pipe.retain_histories({parent.uid} | {h.uid for h in deduped}, frontiers=front)
     for f in pipe.control_futures: f.result()
-    own_chunks = [c for c in pipe.chunks if c is not None and c.get('uid') == deduped[0].uid]
-    assert own_chunks and all(c.get('detached') for c in own_chunks)
+    # (a chunk a live Writer graph still holds stays a graph: at H=0 the parent's
+    # block that mixes parent and branch frames can still receive the parent's loss)
+    pinned = set().union(*(w['chunks'] for w in pipe.writes if w is not None and not w.get('detached')))
+    own_chunks = [(i, c) for i, c in enumerate(pipe.chunks) if c is not None and c.get('uid') == deduped[0].uid]
+    assert own_chunks and all(c.get('detached') or i in pinned for i, c in own_chunks), [(i, c.get('detached')) for i, c in own_chunks]
+    assert any(c.get('detached') for _, c in own_chunks)
     frozen = ledger.frozen(v2=slots)
     assert frozen == list(range(len(slots)))
     again = SourceBatch(model, rec_req, cache=False, pipeline=pipe, frozen=frozen)
@@ -115,10 +120,11 @@ def main():
     assert led.last['record_bytes'] <= 1000 and led.last['record_evicted'] == 5
     draw = led.sample_v2(np.random.default_rng(4), 8, 64)
     assert set(draw) <= {5, 6, 7}
-    print(json.dumps(dict(result='PASS', shared_frames=int(ledger.shared_frames), own_encoded=own,
+    print(json.dumps(dict(result='PASS', horizon=horizon, shared_frames=int(ledger.shared_frames), own_encoded=own,
                           parent_graph_gradient=reached, frozen_dropped=dropped, reader_gradient=reader,
                           evicted=evicted)))
 
 
 if __name__ == '__main__':
-    main()
+    main(8)
+    main(0)   # no horizon: a frontier-inf record still keeps values only

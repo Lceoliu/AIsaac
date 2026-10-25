@@ -2976,6 +2976,14 @@ def main(argv=None, child=None, actor=None):
                 if args.rebuild_memory:
                     if 'ledger' in L:   # pickled prefix copies -> references to the holders' arrays
                         v_contexts = L['ledger'].share(v_contexts)
+                    if 'recent_uids' in L:   # (rule 5 grace, logging only: updates since each record's
+                        # ancestors left every holder; 0 = still a holder this update)
+                        for h in v_contexts:
+                            for a_, _ in h.origin:
+                                age_ = L['update'] - L['recent_uids'][a_] if a_ in L['recent_uids'] else -1
+                                if age_ != 0:
+                                    L['grace_hits'] = L.get('grace_hits', 0) + 1
+                                    L['grace_age_max'] = max(L.get('grace_age_max', 0), age_)
                     with torch.inference_mode(False), torch.no_grad(), autocast():
                         v_sources = SourceBatch(learner_model, list(zip(v_contexts, v_rows, pend_v)),
                                                 args.room_source_micro, cache=False,pipeline=source_pipeline)
@@ -4034,6 +4042,7 @@ def main(argv=None, child=None, actor=None):
                             record_v2_consumed=0, record_teach_consumed=0), **L['ledger'].last if 'ledger' in L else {})
             from isaac_bridge.rebuild_memory import RELEASE_COUNTS
             row.update(raw_released_frames=RELEASE_COUNTS['frames'], raw_grace_episodes=len(L.get('recent_uids', {})),
+                       grace_hits=L.get('grace_hits', 0), grace_age_max=L.get('grace_age_max', 0),
                        source_released_misses=source_pipeline.released_misses)
         if L['writer'] is None:
             columns = log_columns(list(row))

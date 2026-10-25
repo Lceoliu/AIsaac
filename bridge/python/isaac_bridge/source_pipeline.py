@@ -266,6 +266,12 @@ class SourcePipeline:
         self.writes = [c if i in live_writes else None for i, c in enumerate(self.writes)]
         if self.horizon and frontiers:
             self._detach_horizon(frontiers, overlap)
+        elif frontiers:
+            # Without a horizon, an episode with no future loss (frontier inf: a consumed
+            # record, an in-flight branch's ancestor, an ended episode in its grace period)
+            # needs values only (rule 2, rule 5 D2a); its graphs would hold VRAM unused.
+            done = {uid: f for uid, f in frontiers.items() if f == float('inf')}
+            if done: self._detach_horizon(done, overlap)
         # A detached value no longer needs its immutable weight snapshot.
         versions = {c['version'] for c in self.chunks + self.writes if c is not None and not c.get('detached')}
         self.versions = {v: r for v, r in self.versions.items() if v in versions or v == self.version}
