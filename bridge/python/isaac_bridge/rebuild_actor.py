@@ -386,12 +386,8 @@ class RebuildGraphActor:
             self.n_extra=cols.shape[1]-self.nh-2-int(self.vg_on)
             self.cpu[:cols.numel()].view_as(cols).copy_(cols,non_blocking=True)
             ap.mark('rawhistory_append')
-            # One owned copy of the call's records, each history's new row a view of it (RawHistory.append
-            # copied every row by itself; the block that closes still concatenates its rows compactly)
-            own=np.array(rows,copy=True);pend=np.array(pending,copy=True).reshape(n,-1)
-            own.flags.writeable=pend.flags.writeable=False
             for i,s in enumerate(slots):
-                host.raw[s]=prefixes[i].append_owned(own[i:i+1],pend[i:i+1],rd.block)
+                host.raw[s]=prefixes[i].append(rows[i],pending[i],rd.block)
             ap.mark('state_tstate')
             st.length[slots]=times+1
             ap.mark('writer_close');ap.note(closed=len(closed))
