@@ -23,6 +23,10 @@ class RecordLedger:
         self.v2_cons = np.zeros(v2_buffer, bool); self.v2_now = np.zeros(v2_buffer, bool)
         self.v2_valid = np.zeros(v2_buffer, bool); self.v2_stamp = np.zeros(v2_buffer, np.int64)
         self.stamp = 0
+        # (accounting) the update each record was admitted, and the waits of those consumed this update
+        self.updates = 0
+        self.teach_admit = np.zeros(teach_buffer, np.int64); self.v2_admit = np.zeros(v2_buffer, np.int64)
+        self.waits = []
         self.donors = {}   # uid -> the longest known history of that episode (references only)
         self.shared_frames = self.evicted = 0
         self.value_bytes_frame = 0.
@@ -62,10 +66,12 @@ class RecordLedger:
     # ---- rule 2: consumption -----------------------------------------------
     def admit_teacher(self, slots):
         self.teach_cons[slots] = self.teach_now[slots] = False
+        self.teach_admit[slots] = self.updates
 
     def admit_v2(self, slots):
         self.v2_cons[slots] = self.v2_now[slots] = False
         self.v2_valid[slots] = True
+        self.v2_admit[slots] = self.updates
         self.v2_stamp[slots] = self.stamp + np.arange(len(slots)); self.stamp += len(slots)
 
     def picked(self, teach=None, v2=None):
@@ -81,8 +87,26 @@ class RecordLedger:
         return out
 
     def end_update(self):
+        new_t = self.teach_now & ~self.teach_cons; new_v = self.v2_now & ~self.v2_cons
+        self.waits = ([('teach', int(w)) for w in self.updates - self.teach_admit[new_t]] +
+                      [('v2', int(w)) for w in self.updates - self.v2_admit[new_v]])
         self.teach_cons |= self.teach_now; self.teach_now[:] = False
         self.v2_cons |= self.v2_now; self.v2_now[:] = False
+        self.updates += 1
+
+    def wait_stats(self, teach_valid=None):
+        """(accounting) waits (updates from admission to first use) of the records first used in the last
+        update, by kind, and the ages of the valid records still unconsumed."""
+        out = {}
+        for kind in ('teach', 'v2'):
+            w = [x for k, x in self.waits if k == kind]
+            out[f'record_{kind}_wait_median'] = float(np.median(w)) if w else float('nan')
+            out[f'record_{kind}_wait_p90'] = float(np.percentile(w, 90)) if w else float('nan')
+            out[f'record_{kind}_consumed_new'] = len(w)
+        age = self.updates - self.v2_admit[self.v2_valid & ~self.v2_cons]
+        out['record_v2_unconsumed'] = int(len(age))
+        out['record_v2_unconsumed_age_max'] = int(age.max()) if len(age) else 0
+        return out
 
     def frontier(self, frontier, teach_contexts, v2_contexts):
         """Add the records' earliest pending decisions (and their ancestors');
