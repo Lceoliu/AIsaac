@@ -133,7 +133,7 @@ class RebuildGraphActor:
         self.capture=torch.cuda.Stream()
         self.graph_pool=(torch.cuda.graph_pool_handle() if
                          os.environ.get('ISAAC_ACTOR_SHARED_GRAPH_POOL')=='1' else None)
-        self.graphs={};self.component_graphs={};self.writer_graphs={}
+        self.graphs={};self.component_graphs={};self.writer_graphs={}   # writer: closed-count bucket -> graph
         dev=next(model.parameters()).device;n=self.n
         if temporal.rebuild.fast is None:
             temporal.rebuild.fast=TensorActorMemory(model,len(temporal.rebuild.raw),self.n)
@@ -143,7 +143,8 @@ class RebuildGraphActor:
         self.stage=torch.zeros((n,ROW_BYTES+8*self.nh),dtype=torch.uint8,pin_memory=True)
         self.raw=torch.zeros_like(self.stage,device=dev)
         # slot, length and each component's (missing row, destination, gather).
-        self.control_h=torch.zeros((17,n),dtype=torch.long,pin_memory=True)
+        # (+ rows 17, 18: the slots and decision indices of the records whose call closes a memory block)
+        self.control_h=torch.zeros((19,n),dtype=torch.long,pin_memory=True)
         self.control=torch.zeros_like(self.control_h,device=dev)
         self.uniform_h=torch.zeros((n,sum(model.heads)),pin_memory=True)
         self.uniform=torch.zeros_like(self.uniform_h,device=dev)
@@ -163,6 +164,7 @@ class RebuildGraphActor:
         es=[entities] if np.ndim(entities)==0 else list(entities)
         self.esizes=sorted({min(int(e),ENT_CAP) for e in es}|{ENT_CAP})
         self.rsizes=sorted({min(int(r),n) for r in (row_sizes or (16,32))}|{n})
+        self.wsizes=sorted({w for w in (1,2,4,8) if w<n}|set(self.rsizes))
         self.revision=self.state.revision
         self.stage_off=ROW.fields['stage'][1]
         self.sdpa_math=sdpa_math
@@ -216,6 +218,19 @@ class RebuildGraphActor:
         for table,value in zip(self.tables[name],out):
             table.index_copy_(0,self.control[base+1,:m],value.to(table.dtype))
         return out
+
+    def _writer_run(self,m):
+        """Close the memory blocks of control rows 17/18 [:m] (slots, decision indices): the Writer's tokens and
+        their Reader K / V into the ring state (was ~L+4 eager launches per call; padding rows repeat the first
+        closed record: the same values written twice)."""
+        rd=self.model.reader;st=self.state
+        ss=self.control[17,:m];mt=self.control[18,:m]
+        values=rd.write(st.tail.index_select(0,ss))
+        ix=(mt//rd.block)[:,None]*rd.tokens+torch.arange(rd.tokens,device=ss.device)[None]
+        st.mem[ss[:,None],ix]=values
+        projected=torch.stack([l.kv(values+rd.position(mt,self.u_dtype)[:,None]) for l in rd.layers],2)
+        st.mkv[ss[:,None],ix]=projected
+        return (values,)
 
     def _prepare_components(self,rows,pending):
         if self.cache_generation!=self.model.source_generation:
@@ -308,8 +323,8 @@ class RebuildGraphActor:
                     len_max=int(times.max()),len_mean=float(times.mean()))
             st.grow(int((times.max()+1)//rd.block*rd.tokens))
             st.refresh(slots)
-            if self.revision!=st.revision:
-                self.graphs.clear();self.revision=st.revision
+            if self.revision!=st.revision:   # (the ring state's tensors were replaced: every graph recaptures)
+                self.graphs.clear();self.writer_graphs.clear();self.revision=st.revision
             stamp=actor_part('graph_refresh',stamp)
             ap.mark('stage_pack')
             r=next(r for r in self.rsizes if r>=n)
@@ -324,6 +339,11 @@ class RebuildGraphActor:
             ap.mark('h2d_uniform')
             ctl=self.control_h.numpy();ctl[0,:n]=slots;ctl[1,:n]=times
             ctl[0,n:r]=st.slots+np.arange(r-n);ctl[1,n:r]=0
+            closed=np.flatnonzero((times+1)%rd.block==0)
+            wm=next((w for w in self.wsizes if w>=len(closed)),None) if len(closed) else None
+            if wm:
+                ctl[17,:len(closed)]=slots[closed];ctl[18,:len(closed)]=times[closed]
+                ctl[17,len(closed):wm]=slots[closed[0]];ctl[18,len(closed):wm]=times[closed[0]]
             self.raw.copy_(self.stage,non_blocking=True);self.control.copy_(self.control_h,non_blocking=True)
             if ukeys is not None:un=crn_uniforms(ukeys[0],ukeys[1],sum(self.model.heads))
             elif self.crn and 'crn' in rows.dtype.names:un=crn_uniforms(rows['crn'],rows['t'],sum(self.model.heads))
@@ -358,16 +378,11 @@ class RebuildGraphActor:
                 host.raw[s]=prefixes[i].append(rows[i],pending[i],rd.block)
             ap.mark('state_tstate')
             st.length[slots]=times+1
-            closed=np.flatnonzero((times+1)%rd.block==0)
             ap.mark('writer_close');ap.note(closed=len(closed))
-            if len(closed):
-                ss=torch.as_tensor(slots[closed],device=u.device)
-                mt=torch.as_tensor(times[closed],device=u.device)
-                values=rd.write(st.tail.index_select(0,ss))
-                ix=(mt//rd.block)[:,None]*rd.tokens+torch.arange(rd.tokens,device=u.device)[None]
-                st.mem[ss[:,None],ix]=values
-                projected=torch.stack([l.kv(values+rd.position(mt,u.dtype)[:,None]) for l in rd.layers],2)
-                st.mkv[ss[:,None],ix]=projected
+            if wm:
+                self.u_dtype=u.dtype   # (the eager code's position dtype)
+                if wm not in self.writer_graphs:self.writer_graphs[wm]=self._capture(lambda:self._writer_run(wm))
+                self.writer_graphs[wm][0].replay()
             stamp=actor_part('graph_append_writer',stamp)
             ap.mark('tdest')
             self.t_out=dict(create=np.zeros(n,bool),nroom=np.zeros(n,np.int64),steps=times+1,
