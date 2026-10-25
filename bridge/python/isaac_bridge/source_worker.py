@@ -37,6 +37,50 @@ def ipc_export(values):
     return reply
 
 
+def _tensor_bytes(x, seen):
+    """CUDA bytes of the tensors in x (dicts / lists / tuples), each storage once."""
+    if torch.is_tensor(x):
+        if x.device.type != 'cuda': return 0
+        st = x.untyped_storage(); key = st.data_ptr()
+        if key in seen: return 0
+        seen.add(key); return st.nbytes()
+    if isinstance(x, dict): return sum(_tensor_bytes(v, seen) for v in x.values())
+    if isinstance(x, (list, tuple)): return sum(_tensor_bytes(v, seen) for v in x)
+    return 0
+
+
+def memory_breakdown(local, exports, device):
+    """(ISAAC_SOURCE_MEMORY_BREAKDOWN=1) this card's allocation by kind, at a retire (once per update).
+
+    graph_*: what an encode / Writer call left allocated (outputs + saved activations, measured
+    around the call) for chunks / writes that are still graphs; export_*: the compact IPC copies
+    the learner reads, by tensor name, split by graph / detached owner; versions: parameter
+    snapshots' storages; cache: reserved - allocated."""
+    out = dict(graph_chunk_bytes=0, graph_chunk_rows=0, graph_write_bytes=0, detached_chunk_rows=0)
+    for c in local.chunks:
+        if c is None: continue
+        if c.get('detached'): out['detached_chunk_rows'] += c['rows']
+        else: out['graph_chunk_bytes'] += c.get('alloc', 0); out['graph_chunk_rows'] += c['rows']
+    for c in local.writes:
+        if c is not None and not c.get('detached'): out['graph_write_bytes'] += c.get('alloc', 0)
+    seen = set()
+    for (kind, index), values in exports.items():
+        owner = (local.chunks if kind == 'encode' else local.writes)[index] if index < len(
+            local.chunks if kind == 'encode' else local.writes) else None
+        state = 'detached' if owner is not None and owner.get('detached') else 'graph'
+        for name, v in values.items():
+            key = f'export_{state}_{kind}_{name}'
+            out[key] = out.get(key, 0) + _tensor_bytes(v, seen)
+    vs = set()
+    out['versions'] = len(local.versions)
+    out['version_bytes'] = sum(_tensor_bytes(list(r.parameters()) + list(r.buffers()), vs)
+                               for reps in local.versions.values() for r in reps)
+    if device.type == 'cuda':
+        out['allocated'] = torch.cuda.memory_allocated(device); out['reserved'] = torch.cuda.memory_reserved(device)
+        out['cache_bytes'] = out['reserved'] - out['allocated']
+    return out
+
+
 def source_worker(connection, model, device, options, vjp_connection=None):
     from .source_pipeline import SourcePipeline, source_parameter
     if os.environ.get('ISAAC_SOURCE_MPS_PRIORITY'):
@@ -56,8 +100,10 @@ def source_worker(connection, model, device, options, vjp_connection=None):
     gradient_reply=None
     last_cotangents=None
     exports={}
+    breakdown_on=os.environ.get('ISAAC_SOURCE_MEMORY_BREAKDOWN')=='1' and device.type=='cuda'
+    breakdown,vjp={},{}
     def dispatch(connection,message):
-        nonlocal retired,gradient_reply,last_cotangents,exports
+        nonlocal retired,gradient_reply,last_cotangents,exports,breakdown
         command,payload,version,state=message
         try:
             if state is not None and version not in local.versions:
@@ -69,12 +115,14 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 local.versions[version]=local._replicas()
             if command=='encode':
                 cid,parts,keys=payload
+                before=torch.cuda.memory_allocated(device) if breakdown_on else 0
                 result=local._encode(0,parts,version,keys=keys)
+                alloc=torch.cuda.memory_allocated(device)-before if breakdown_on else 0
                 future=Future();future.set_result(result)
                 local.chunks.extend([None]*max(0,cid+1-len(local.chunks)))
                 uids={key[0] for key in keys}
                 local.chunks[cid]=dict(worker=0,future=future,version=version,
-                                       uid=next(iter(uids)) if len(uids)==1 else None,rows=len(keys))
+                                       uid=next(iter(uids)) if len(uids)==1 else None,rows=len(keys),alloc=alloc)
                 for offset,key in enumerate(keys): local.frames[key]=(cid,offset)
                 reply=ipc_export({k:v for k,v in result.items() if k!='grads'})
                 exports['encode',cid]=reply
@@ -86,10 +134,12 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 del result,future
             elif command=='write':
                 wid,keys=payload
+                before=torch.cuda.memory_allocated(device) if breakdown_on else 0
                 result=local._write(0,keys,version)
+                alloc=torch.cuda.memory_allocated(device)-before if breakdown_on else 0
                 future=Future();future.set_result(result)
                 local.writes.extend([None]*max(0,wid+1-len(local.writes)))
-                local.writes[wid]=dict(worker=0,future=future,version=version,uid=keys[0][0][0])
+                local.writes[wid]=dict(worker=0,future=future,version=version,uid=keys[0][0][0],alloc=alloc)
                 reply=ipc_export(dict(mem=result['mem']))
                 exports['write',wid]=reply
                 if os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
@@ -105,7 +155,14 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 last_cotangents=packets
                 decoded=[((local.chunks if kind=='encode' else local.writes)[index],grads)
                          for kind,index,grads in packets]
+                if breakdown_on:
+                    torch.cuda.synchronize(device);vjp_before=torch.cuda.memory_allocated(device)
+                    torch.cuda.reset_peak_memory_stats(device)
                 reply=ipc_export(local._backward(0,decoded,retain))
+                if breakdown_on:   # (the VJP's own peak: synchronized, so the peak is this call's)
+                    torch.cuda.synchronize(device);peak=torch.cuda.max_memory_allocated(device)
+                    if peak>=vjp.get('vjp_peak',0):   # (the largest since the last retire)
+                        vjp.update(vjp_peak=peak,vjp_before=vjp_before,vjp_packets=len(decoded),vjp_retain=bool(retain))
                 if device.type=='cuda':
                     ready=torch.cuda.Event(interprocess=True)
                     ready.record()
@@ -125,6 +182,8 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 exports={key:value for key,value in exports.items()
                          if key[1] in (chunks if key[0]=='encode' else writes)}
                 retired+=1
+                if breakdown_on:
+                    breakdown=dict(memory_breakdown(local,exports,device),retire=retired,**vjp);vjp.clear()
                 if os.environ.get('ISAAC_MEMORY_ACCOUNT')=='1':
                     from .rebuild_memory import memory_account
                     memory_account('source-'+str(device),retired,dict(chunks=local.chunks,writes=local.writes,exports=exports),
@@ -175,6 +234,7 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                           detached_chunks=sum(c is not None and bool(c.get('detached')) for c in local.chunks),
                           detached_writes=sum(c is not None and bool(c.get('detached')) for c in local.writes),
                           graph_frames=sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')))
+            if breakdown_on and breakdown:memory['breakdown']=breakdown
             if os.environ.get('ISAAC_SOURCE_COMPONENT_GRAPH_CACHE')=='1':
                 component_calls={}
                 for replicas in local.versions.values():

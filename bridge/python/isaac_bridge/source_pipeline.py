@@ -309,6 +309,7 @@ class SourcePipeline:
         pinned = set().union(*(c['chunks'] for i, c in enumerate(self.writes)
                                if c is not None and not c.get('detached') and i not in leaving))
         chunks = [i for i, c in enumerate(self.chunks) if old(c, 'last') and i not in pinned]
+        self.pinned_rows = sum(self.chunks[i]['rows'] for i in pinned if self.chunks[i] is not None and old(self.chunks[i], 'last'))
         if not chunks and not writes: return
         packets = []
         for c in [self.chunks[i] for i in chunks] + [self.writes[i] for i in writes]:
@@ -368,6 +369,7 @@ class SourcePipeline:
         return dict(source_horizon=self.horizon, source_graph_frames=graph,
                     source_graph_frames_uid_max=max(per_uid.values(), default=0),
                     source_graph_writes=sum(c is not None and not c.get('detached') for c in self.writes),
+                    source_pinned_rows=getattr(self, 'pinned_rows', 0),
                     source_detached_frames=detached,
                     source_detached_total=self.horizon_detached['frames'],
                     source_horizon_dropped_grad=dropped,
