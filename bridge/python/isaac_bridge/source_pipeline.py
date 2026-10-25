@@ -395,7 +395,9 @@ class SourcePipeline:
                     source_horizon_dropped_grad=dropped,
                     source_alloc_gib_max=max(allocated, default=0) / 2**30,
                     **({'source_worker_graph_frames': sum(m.get('graph_frames', 0) for m in self.remote_memory)}
-                       if self.processes else {}))
+                       if self.processes else {}),
+                    **{f'source_graph_frames_w{i}': sum(c['rows'] for c in self.chunks if c is not None and c['worker'] == i
+                                                        and not c.get('detached')) for i in range(len(self.devices))})
 
     def _collect_retired(self, *, wait):
         pending=[]
@@ -483,12 +485,27 @@ class SourcePipeline:
                 if ni:components['items']=replica._component('items',b,lambda part:replica.itok(part,compact=True))
                 b['_encoded_components']=components
                 del b['_raw_rows'],b['_raw_pending']
-            profiling = bool(os.environ.get('ISAAC_SOURCE_SAVED_PROFILE')) and version == 0 and not self.saved_8bit
+            # ISAAC_SOURCE_SAVED_PROFILE: '1' = the first encode at version 0 (as before); N > 1 = the
+            # N-th to N+3-rd encodes of this worker, with the saving module of each tensor (measurement only)
+            census = os.environ.get('ISAAC_SOURCE_SAVED_PROFILE', '')
+            self._encodes = getattr(self, '_encodes', 0) + 1
+            profiling = bool(census) and not self.saved_8bit and (
+                version == 0 if census == '1' else int(census) <= self._encodes < int(census) + 4)
             saved = {}
+            module_stack, module_hooks = ['(top)'], []
+            if profiling and census != '1':
+                weights_ = {q.untyped_storage().data_ptr() for q in replica.parameters() if not q.is_meta}
+                for name_, mod_ in replica.named_modules():
+                    if not name_: continue
+                    module_hooks.append(mod_.register_forward_pre_hook(lambda m_, i_, n_=name_: module_stack.append(n_)))
+                    module_hooks.append(mod_.register_forward_hook(lambda m_, i_, o_: module_stack.pop() and None))
+            else:
+                weights_ = set()
             def packed(t):
                 storage = t.untyped_storage()
-                saved.setdefault(storage.data_ptr(), (storage.nbytes(), str(t.dtype), tuple(t.shape),
-                                                       type(t.grad_fn).__name__))
+                if storage.data_ptr() not in weights_:
+                    saved.setdefault(storage.data_ptr(), (storage.nbytes(), str(t.dtype), tuple(t.shape),
+                                                           type(t.grad_fn).__name__, module_stack[-1]))
                 return t.detach()
             spill = (self.saved_gpu_gb > 0 and device.type == 'cuda' and
                      torch.cuda.memory_allocated(device) >= self.saved_gpu_gb * 2**30)
@@ -536,11 +553,21 @@ class SourcePipeline:
                 saving = torch.autograd.graph.saved_tensors_hooks(pack_cpu, unpack_cpu)
             with saving, torch.autograd.graph.saved_tensors_hooks(packed, lambda t:t) if profiling else nullcontext():
                 y, pad, u = replica.encode_rebuild(b)
+            for h_ in module_hooks: h_.remove()
             if profiling:
                 import json
-                print('SOURCE_SAVED '+json.dumps(dict(device=str(device), rows=len(rows),
+                by, shp = {}, {}
+                for nbytes_, dtype_, shape_, fn_, mod_ in saved.values():
+                    k_ = (mod_, fn_, dtype_)
+                    n_, c_ = by.get(k_, (0, 0)); by[k_] = (n_ + nbytes_, c_ + 1)
+                    k_ = (mod_, dtype_, str(shape_[1:]))   # (the compiled Spatial stack saves one set per layer)
+                    n_, c_ = shp.get(k_, (0, 0)); shp[k_] = (n_ + nbytes_, c_ + 1)
+                print('SOURCE_SAVED '+json.dumps(dict(device=str(device), rows=len(rows), version=version,
+                      tokens=int(plan['rec'][:, 0].sum()), compile_source=self.compile_source,
                       bytes=sum(v[0] for v in saved.values()),
-                      largest=sorted(saved.values(),reverse=True)[:12])),flush=True)
+                      largest=sorted(saved.values(),reverse=True)[:12],
+                      by_module=sorted(([m, f, d, n, c] for (m, f, d), (n, c) in by.items()), key=lambda x: -x[3]),
+                      by_shape=sorted(([m, d, sh, n, c] for (m, d, sh), (n, c) in shp.items()), key=lambda x: -x[3])[:40])),flush=True)
             if device.type == 'cuda' and not self.ipc_async: torch.cuda.current_stream(device).synchronize()
         self.events.append(dict(kind='encode', device=str(device), version=version,
                                 rows=len(rows), saved_on_cpu=bool(cpu_bytes), saved_cpu_bytes=cpu_bytes,
