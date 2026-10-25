@@ -108,21 +108,35 @@ class RecordLedger:
         out['record_v2_unconsumed_age_max'] = int(age.max()) if len(age) else 0
         return out
 
-    def frontier(self, frontier, teach_contexts, v2_contexts):
-        """Add the records' earliest pending decisions (and their ancestors');
-        a record whose loss was consumed contributes nothing, and an episode
-        only consumed records refer to gets an infinite frontier."""
+    def frontier(self, frontier, teach_contexts, v2_contexts, horizon=0):
+        """Frames each episode's pending losses can still reach, as half-open frame intervals
+        {uid: [(lo, hi), ...]} (2026-10-25, the union of every consumer's reachable range; before: one
+        earliest decision per episode, which kept everything after it).
+
+        frontier: {uid: the rollout's first pending decision F} -> [(F - H, inf)] (H = horizon; 0: [(0, inf)]).
+        An unconsumed record deciding at L = h.length reads, with gradient, frames [L - H, L) of its history:
+        its own frames from its fork on, [max(own start, L - H), L), and of each ancestor only the frames it
+        shares, [L - H, shared count) (empty when the fork lies more than H before L). A consumed record adds
+        nothing; an episode only consumed records refer to gets no interval (values only)."""
+        inf = float('inf')
+        out = {uid: [(f - horizon if horizon else 0, inf)] if f != inf else [] for uid, f in frontier.items()}
         consumed = set()
         for contexts, cons in ((teach_contexts, self.teach_cons), (v2_contexts, self.v2_cons)):
             for slot, h in enumerate(contexts or ()):
                 if h is None: continue
                 if cons[slot]:
                     consumed.add(h.uid); consumed.update(a for a, _ in h.origin); continue
-                for uid in [h.uid] + [a for a, _ in h.origin]:
-                    frontier[uid] = min(frontier.get(uid, h.length), h.length)
+                L = h.length; lo = L - horizon if horizon else 0
+                own = (max(h.own_start(), lo), L)
+                if own[0] < own[1]: out.setdefault(h.uid, []).append(own)
+                else: out.setdefault(h.uid, [])
+                for a, shared in h.origin:
+                    span = (lo, min(shared, L))
+                    if span[0] < span[1]: out.setdefault(a, []).append(span)
+                    else: out.setdefault(a, [])
         for uid in consumed:
-            frontier.setdefault(uid, float('inf'))
-        return frontier
+            out.setdefault(uid, [])
+        return out
 
     # ---- rule 3: byte budget --------------------------------------------------
     def owned(self, v2_contexts, teach_n):

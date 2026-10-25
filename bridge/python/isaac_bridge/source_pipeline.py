@@ -299,10 +299,10 @@ class SourcePipeline:
         if self.horizon and frontiers:
             self._detach_horizon(frontiers, overlap, pinned)
         elif frontiers:
-            # Without a horizon, an episode with no future loss (frontier inf: a consumed
+            # Without a horizon, an episode with no future loss (frontier inf / no interval: a consumed
             # record, an in-flight branch's ancestor, an ended episode in its grace period)
             # needs values only (rule 2, rule 5 D2a); its graphs would hold VRAM unused.
-            done = {uid: f for uid, f in frontiers.items() if f == float('inf')}
+            done = {uid: f for uid, f in frontiers.items() if not self._reach(f)}
             if done: self._detach_horizon(done, overlap, pinned)
         # A detached value no longer needs its immutable weight snapshot.
         versions = {c['version'] for c in self.chunks + self.writes if c is not None and not c.get('detached')}
@@ -325,44 +325,63 @@ class SourcePipeline:
         self.vjp_done_at = None
 
     def hold_reasons(self, frontiers, vjp_pinned):
-        """(accounting, progress.csv source_hold_*) why each graph frame is still a graph, first reason that
-        applies: inside a live rollout decision's horizon (rollout_frontiers: the rollout's first decision per
-        episode, set by the learner); inside an unconsumed record's or an in-flight branch's (the episode's
-        frontier is earlier than the rollout's); in a pending VJP's packets; held by a live Writer graph; other."""
-        H = self.horizon; R = self.rollout_frontiers
+        """(accounting, progress.csv source_hold_*) every reason each graph frame is still a graph, counted at
+        the same moment as the total (multi-label: a frame can count under several): inside a live rollout
+        decision's horizon (rollout_frontiers: the rollout's first decision per episode, set by the learner);
+        inside an unconsumed record's reachable range; in a pending VJP's packets; held by a live Writer graph.
+        total = all graph frames now; none = graph frames under no reason; multi = under more than one."""
+        R = self.rollout_frontiers
         writer = getattr(self, 'writer_pinned', set())
-        out = dict(rollout=0, record=0, vjp=0, writer=0, other=0)
+        out = dict(rollout=0, record=0, vjp=0, writer=0, total=0, none=0, multi=0)
         for i, c in enumerate(self.chunks):
             if c is None or c.get('detached'): continue
             uids = [c['uid']] if c.get('uid') is not None else list(c.get('uids', ()))
-            if any(u in R and c['last'] >= R[u] - H for u in uids): k = 'rollout'
-            elif any(u in frontiers and frontiers[u] < R.get(u, float('inf')) and c['last'] >= frontiers[u] - H
-                     for u in uids): k = 'record'
-            elif id(c) in vjp_pinned: k = 'vjp'
-            elif i in writer: k = 'writer'
-            else: k = 'other'
-            out[k] += c['rows']
+            span = (c.get('first', 0), c['last'])
+            tags = set()
+            for u in uids:
+                ro = self._reach(R[u]) if u in R else []
+                if self._meets(span, ro): tags.add('rollout')
+                if self._meets(span, [iv for iv in self._reach(frontiers.get(u, [])) if iv not in ro]): tags.add('record')
+            if id(c) in vjp_pinned: tags.add('vjp')
+            if i in writer: tags.add('writer')
+            out['total'] += c['rows']
+            for k in tags: out[k] += c['rows']
+            if not tags: out['none'] += c['rows']
+            if len(tags) > 1: out['multi'] += c['rows']
         return out
+
+    def _reach(self, f):
+        """A frontier value as frame intervals: a number F (an earliest pending decision; inf: none) means
+        [(F - horizon, inf)] (no horizon: [(0, inf)]); a list is already [(lo, hi), ...]."""
+        if isinstance(f, (list, tuple)): return list(f)
+        if f == float('inf'): return []
+        return [(f - self.horizon if self.horizon else 0, float('inf'))]
+
+    @staticmethod
+    def _meets(lo_hi, reach):
+        lo, hi = lo_hi
+        return any(lo < b and hi >= a for a, b in reach)
 
     def _detach_horizon(self, frontiers, overlap, vjp_pinned=frozenset()):
         """Turn graphs outside every future decision's horizon into values.
 
         A frame s is reachable by decision t iff t-s <= horizon; a Writer block
         starting at frame b iff t-b <= horizon (all its frames are then inside).
-        Future decisions of an episode are >= frontiers[uid], so a chunk whose
-        last frame (a write whose last block start) is < frontier-horizon can
+        frontiers[uid] gives the frames the episode's pending decisions can still reach (_reach: a number
+        F = [F - horizon, inf), or a list of intervals: the union over the rollout's decisions and every
+        unconsumed record's range); a chunk whose frames (a write whose block starts) meet none of them can
         never receive another cotangent. Credit already accumulated by earlier
         in-horizon decisions is settled first (same Adam interval, like retired
         episodes); retain_graph=True because later graphs of the same episode
         may share its component nodes. The values stay readable."""
-        limit = {uid: f - self.horizon for uid, f in frontiers.items()}
+        reach = {uid: self._reach(f) for uid, f in frontiers.items()}
         def old(c, field):
             # (vjp_pinned: ids of the chunks / writes a pending VJP backpropagates; `pinned` below is the
             # chunk indices a live Writer graph holds)
             if c is None or c.get('detached') or not c['future'].done() or id(c) in vjp_pinned: return False
-            if c.get('uid') is None and c.get('uids'):   # stateless teacher frames of several records
-                return all(u in limit and c[field] < limit[u] for u in c['uids'])
-            return c.get('uid') in limit and c[field] < limit[c['uid']]
+            span = ((c.get('first', 0), c['last']) if field == 'last' else (c.get('first_start', 0), c['last_start']))
+            uids = c['uids'] if c.get('uid') is None and c.get('uids') else [c.get('uid')]   # (stateless: several records)
+            return all(u in reach and not self._meets(span, reach[u]) for u in uids)
         writes = [i for i, c in enumerate(self.writes) if old(c, 'last_start')]
         # A Writer graph still inside the horizon also holds the encoder graphs
         # of all its frames. Such chunks stay graphs until that write detaches.
@@ -741,7 +760,7 @@ class SourcePipeline:
                 future = self.workers[worker].submit(self._encode, worker, selected, self.version,cid,[keys[i] for i in ix])
                 chunk = dict(worker=worker, future=future, version=self.version, uid=uid,
                              cost=int(costs[ix].sum()),remote_kind='encode',remote_id=cid,
-                             rows=len(ix),last=max(keys[i][1] for i in ix))
+                             rows=len(ix),first=min(keys[i][1] for i in ix),last=max(keys[i][1] for i in ix))
                 if uid is None: chunk['uids'] = frozenset(keys[i][0] for i in ix)
                 self.chunks.append(chunk)
                 for offset, i in enumerate(ix): self.frames[keys[i]] = (cid, offset)
@@ -804,7 +823,7 @@ class SourcePipeline:
             wid = len(self.writes)
             future = self.workers[worker].submit(self._write, worker, keys, self.version,wid)
             self.writes.append(dict(worker=worker, future=future, version=self.version, uid=uid,remote_kind='write',remote_id=wid,
-                                    last_start=max(block[0][1] for block in keys),
+                                    first_start=min(block[0][1] for block in keys),last_start=max(block[0][1] for block in keys),
                                     chunks={self.frames[key][0] for block in keys for key in block}))
             for offset,key in enumerate(keys): self.blocks[key] = (wid,offset)
             self.written_blocks += len(keys)
@@ -1036,6 +1055,10 @@ class SourcePipeline:
             return self._remote(worker,'backward',(selected,retain_graph))
         started = time.perf_counter()
         device = self.devices[worker]
+        if not any(c['worker'] == worker for c, _ in packets):
+            # (nothing of this worker's: it may hold no weight version at all once every graph it had was
+            # released, so there is no replica to set gradient buffers on)
+            return {}
         with self._context(worker):
             # Every immutable weight version contributes to the same master
             # gradient. Accumulate directly into one buffer per parameter name,

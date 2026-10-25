@@ -2702,8 +2702,8 @@ def main(argv=None, child=None, actor=None):
                 for h, _, _ in all_requests:
                     frontier[h.uid] = min(frontier.get(h.uid, h.length), h.length)
                 source_pipeline.rollout_frontiers = dict(frontier)   # (accounting: hold_reasons)
-                frontier = ledger.frontier(frontier, L.get('teach_contexts'), L.get('v2_contexts'))
-                for uid in in_flight: frontier.setdefault(uid, float('inf'))   # values only, no pending loss
+                frontier = ledger.frontier(frontier, L.get('teach_contexts'), L.get('v2_contexts'), args.memory_horizon)
+                for uid in in_flight: frontier.setdefault(uid, [])   # values only, no pending loss
                 return frontier
             if not retire_after_ready:source_pipeline.retain_histories(live_uids,frontiers=horizon_frontiers())
             sec('rc_prep')   # (timing only: the recompute pass split into the job's preparation, its sources, the forward)
