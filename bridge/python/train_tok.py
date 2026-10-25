@@ -2785,7 +2785,14 @@ def main(argv=None, child=None, actor=None):
                             t_p = temporal_rows(rl, idx_, capacity, device)
                             tk_ = dict(temporal=dict(mode='stored', o=t_p['o'], o_prev=t_p['o_prev'], has=t_p['has']))
                         with autocast():
-                            if args.rebuild_memory:
+                            if args.rebuild_memory and source_pipeline is not None:
+                                # cached source values (rule 5: no raw bytes are re-read)
+                                with torch.inference_mode(False), torch.no_grad():
+                                    fallback_sources = SourceBatch(learner_model, rollout_requests(rl, idx_),
+                                                                   args.room_source_micro, cache=False,
+                                                                   pipeline=source_pipeline)
+                                tk_ = dict(temporal=dict(source_batch=fallback_sources, source_indices=np.arange(len(idx_))))
+                            elif args.rebuild_memory:
                                 fallback_sources = SourceBatch(learner_model, rollout_requests(rl, idx_),
                                                                args.room_source_micro, cache=False)
                                 tk_ = dict(temporal=dict(source_batch=fallback_sources, source_indices=np.arange(len(idx_))))

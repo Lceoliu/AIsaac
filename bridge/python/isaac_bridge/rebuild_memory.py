@@ -180,7 +180,8 @@ def share_prefix(h, donor, block):
         n = min(shared - whole * block, len(tail))
         if whole < len(donor.blocks):
             rr, pp = donor.blocks[whole]
-            rows = tuple((rr[i:i + 1], pp[i:i + 1]) for i in range(n))
+            # (a released donor block has no rows to share: the record keeps its own <block rows)
+            rows = None if isinstance(rr, ReleasedRows) else tuple((rr[i:i + 1], pp[i:i + 1]) for i in range(n))
         else:
             rows = donor.tail[:n] if len(donor.tail) >= n else None
         if rows is not None:

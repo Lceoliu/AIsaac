@@ -51,6 +51,12 @@ def main():
     assert all(a[0] is b[0] for a, b in zip(shared.blocks[:4], parent.blocks[:4]))
     r0, p0 = records[-1].arrays(); r1, p1 = shared.arrays()
     assert r0.tobytes() == r1.tobytes() and np.array_equal(p0, p1)
+    # a donor whose blocks were released (rule 5): whole blocks share the placeholders,
+    # the record's open-block rows stay its own
+    from isaac_bridge.rebuild_memory import released, ReleasedRows
+    gone = released(parent, lambda u: 10 ** 9, BLOCK)
+    alias, m = share_prefix(pickle.loads(pickle.dumps(records[2])), gone, BLOCK)
+    assert all(isinstance(b[0], ReleasedRows) for b in alias.blocks[:4]) and m == 16, m
     ledger = RecordLedger(16, 16, float('inf'), r0.dtype.itemsize, BLOCK)
     ledger.on_rollout([parent])
     deduped = ledger.share([pickle.loads(pickle.dumps(h)) for h in records[-3:]])
