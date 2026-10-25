@@ -164,6 +164,7 @@ class RebuildGraphActor:
         self.esizes=sorted({min(int(e),ENT_CAP) for e in es}|{ENT_CAP})
         self.rsizes=sorted({min(int(r),n) for r in (row_sizes or (16,32))}|{n})
         self.revision=self.state.revision
+        self.stage_off=ROW.fields['stage'][1]
         self.sdpa_math=sdpa_math
         self.core_fn=self._core
         self.component_fn=self._component_run
@@ -275,6 +276,13 @@ class RebuildGraphActor:
         st.u[slots,times%rd.W]=u
         st.kv[slots,times%rd.W]=frame
         st.tail[slots,times%rd.block]=u
+        # The temporal state's per-slot outputs, in the graph (were three eager index_copy_ after it);
+        # padding rows (slots past the state's) all write its scratch slot.
+        ts=self.tstate
+        tsd=torch.where(slots<=ts.scratch,slots,torch.full_like(slots,ts.scratch))
+        ts.prev_o.index_copy_(0,tsd,o.float())
+        ts.steps.index_copy_(0,tsd,times+1)
+        ts.prev_stage.index_copy_(0,tsd,self.raw[:r,self.stage_off].long())
         return torch.cat(fields,1),u,o,outs[0]
 
     @torch.no_grad()
@@ -350,11 +358,6 @@ class RebuildGraphActor:
                 host.raw[s]=prefixes[i].append(rows[i],pending[i],rd.block)
             ap.mark('state_tstate')
             st.length[slots]=times+1
-            sd=self.control[0,:n]
-            self.tstate.prev_o.index_copy_(0,sd,o.float())
-            self.tstate.steps.index_copy_(0,sd,self.control[1,:n]+1)
-            dt,off=ROW.fields['stage'][:2]
-            self.tstate.prev_stage.index_copy_(0,sd,self.raw[:n,off].long())
             closed=np.flatnonzero((times+1)%rd.block==0)
             ap.mark('writer_close');ap.note(closed=len(closed))
             if len(closed):
@@ -369,11 +372,11 @@ class RebuildGraphActor:
             ap.mark('tdest')
             self.t_out=dict(create=np.zeros(n,bool),nroom=np.zeros(n,np.int64),steps=times+1,
                             stage_prev=rows['stage'].astype(np.int64),raw_contexts=prefixes)
-            dummy=u.new_zeros((n,self.tstate.L,2,self.tstate.D))
-            if tdest is None:self.t_out.update(kv=dummy,s=u,o=o)
+            if tdest is None:self.t_out.update(kv=u.new_zeros((n,self.tstate.L,2,self.tstate.D)),s=u,o=o)
             else:
+                # (the rollout's step K / V stay the zeros they were allocated as: this policy has none,
+                # and the learner reads only o from the temporal pool)
                 ix=torch.as_tensor(tdest['rows'],device=u.device)
-                tdest['kv'].index_copy_(0,ix,dummy.to(tdest['kv'].dtype))
                 tdest['o'].index_copy_(0,ix+tdest['obase'],o.float())
                 if tdest.get('s') is not None:tdest['s'].index_copy_(0,ix,u.to(tdest['s'].dtype))
             if ap.eager_wanted():   # (measurement aid: the network once more, uncompiled, outside the graphs;
