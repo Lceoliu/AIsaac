@@ -91,6 +91,16 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
                for name, extra in (('t8mck', '--source-layer-checkpoint 1 '),
                                    ('t8mck2', '--source-layer-checkpoint 1 --source-checkpoint-blocks 2,3 '),
                                    ('t8mfull', ''))},
+            # --source-streams 2 (with balance, all blocks checkpointed): 4-card short run with the memory breakdown,
+            # the 5-card short run, and table 8 (= table 7's configuration + balance + streams, 62 game hours)
+            t8st4=(1024, 25.0, FOUR1, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
+                   TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 --source-streams 2 ']]),
+            t8st=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
+                  TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 --source-streams 2 ']]),
+            t8bm=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
+                  TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 ']]),
+            t8=(1024, 62.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
+                TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 --source-streams 2 ']]),
             # the same measurements on four cards (GPU2 in others' use): learner cuda:1, actors cuda:0,2, sources cuda:0,2,3
             **{name + '4': (1024, 25.0, FOUR1, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
                       TRIMS + [U1, [' --source-flash 1 ', ' --source-flash ' + flash + ' --source-dispatch-at-close 1 ' + extra]]
@@ -222,6 +232,8 @@ def main():
             gates = {
                 'horizon-cuda': PYV + 'tests/test_source_horizon.py --learner cuda:0 --sources cuda:1,cuda:2',
                 'horizon-bound': PYV + 'tests/test_source_horizon_bound.py && ' + PYV + 'tests/test_source_horizon_bound.py --process',
+                # (--source-streams 2: concurrent VJP thread / streams against the serial schedule, shuffled)
+                'streams-cuda': PYV + 'tests/test_source_streams.py --sources cuda:1,cuda:2',
                 'attention-timing': PYV + 'tests/bench_horizon_attention.py --device cuda:0 --groups 96 --count 128 --bank 1600 --sources 60000',
                 'actor-cuda': ' && '.join(PYV + t for t in [
                     'tests/test_actor_d2h.py', 'tests/test_actor_streams.py',

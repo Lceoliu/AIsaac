@@ -1,0 +1,21 @@
+RUN S
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000706
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000525
+[W1026 14:59:07.317523945 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W1026 14:59:08.481914362 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+RUN C1
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000853
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000842
+[W1026 14:59:14.822961430 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W1026 14:59:15.797600727 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+RUN C2
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000915
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000900
+[W1026 14:59:22.103789776 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+[W1026 14:59:23.082036114 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_source_streams.py", line 99, in <module>
+    main(arg.split(','))
+  File "/bench/workspace/python/tests/test_source_streams.py", line 88, in main
+    assert bitwise if not cuda else diff <= 1e-6, (name, diff)
+AssertionError: ('C1', 3.7416299737487243e-06)

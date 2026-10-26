@@ -1,0 +1,20 @@
+RUN S
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000398
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000415
+RUN C1
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000369
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.001189
+RUN C2
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000429
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000445
+RUN S2
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000376
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000402
+DIFF C1 5.533701359795258e-06 serial-vs-serial 6.027058011768215e-06
+DIFF C2 4.24725564587693e-06 serial-vs-serial 6.027058011768215e-06
+{"result": "PASS", "sources": ["cuda:1", "cuda:2"], "serial_encodes_inside_vjp": 18, "serial_repeat_rel_diff": 6.027058011768215e-06, "C1": {"bitwise": false, "max_rel_param_diff": 5.533701359795258e-06, "encodes_inside_vjp": 11, "vjps": 10}, "C2": {"bitwise": false, "max_rel_param_diff": 4.24725564587693e-06, "encodes_inside_vjp": 11, "vjps": 10}}
+[W1026 15:01:30.776494376 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+
+GATE v3-1e264df-streams-cuda EXIT 0
+
+EXIT 0
