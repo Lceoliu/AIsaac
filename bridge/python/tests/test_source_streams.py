@@ -31,6 +31,8 @@ def main(sources, production=False):
         os.environ.update(ISAAC_SOURCE_COMPONENT_GRAPH_CACHE='1', ISAAC_SOURCE_COMPONENT_STATIC='1',
                           ISAAC_SOURCE_EDGE_EXPORT='1', ISAAC_SOURCE_POINTWISE_COMPONENTS='1',
                           ISAAC_SOURCE_POINTWISE_RECOMPUTE='1')
+        if '--no-component-cache' in sys.argv: os.environ['ISAAC_SOURCE_COMPONENT_GRAPH_CACHE'] = '0'   # (diagnosis)
+        if '--cublas-fixed' in sys.argv: os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'   # (diagnosis)
     cuda = sources[0].startswith('cuda')
     torch.set_num_threads(2); torch.manual_seed(59)
     learner = 'cuda:0' if cuda else 'cpu'
@@ -109,6 +111,7 @@ def main(sources, production=False):
     # (CUDA: the serial schedule run twice; atomics in index_add_ / scatter make it not bitwise reproducible)
     noise = rel(runs['S2'], S) if cuda else 0.
     grad_noise = grad_rel(runs['S2'], S) if cuda else 0.
+    failures = []
     for name in ('C1', 'C2'):
         C = runs[name]
         assert C['versions'] == S['versions'] and C['encoded'] == S['encoded'], (name, C['versions'], S['versions'])
@@ -117,10 +120,10 @@ def main(sources, production=False):
         bitwise = all(torch.equal(a, b) for pa, pb in zip(C['params'], S['params']) for a, b in zip(pa, pb))
         gdiff = grad_rel(C, S)
         print('DIFF', name, 'params', diff, 'source gradients', gdiff, 'serial-vs-serial', noise, grad_noise, flush=True)
-        if cuda: assert gdiff <= 1e-6, (name, gdiff, grad_noise)   # (source gradients within 1e-6)
-        else: assert bitwise and gdiff == 0, (name, diff, gdiff)
+        failures += [] if (gdiff <= 1e-6 if cuda else (bitwise and gdiff == 0)) else [(name, diff, gdiff, grad_noise)]
         assert C['concurrent'] and C['overlap'] > 0, (name, C['concurrent'], C['overlap'])
         report[name] = dict(bitwise=bitwise, max_rel_param_diff=diff, max_rel_source_grad_diff=gdiff, encodes_inside_vjp=C['overlap'], vjps=C['vjps'])
+    assert not failures, failures   # (cpu: bitwise; CUDA: source gradients within 1e-6)
     assert all(r['dropped'] == 0 for r in runs.values()), {k: r['dropped'] for k, r in runs.items()}
     assert not S['concurrent']
     print(json.dumps(dict(result='PASS', sources=sources, production=production, serial_encodes_inside_vjp=S['overlap'],
