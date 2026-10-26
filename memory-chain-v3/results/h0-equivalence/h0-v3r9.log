@@ -1,0 +1,8 @@
+SAVED D:\Projects\fortune\Isaac\temp\memory-chain-v3\results\h0-equivalence\v3r9-local.pt v3 local version 2
+EXIT v3r9-local 0
+BITWISE_EQUAL outputs=8 params=172 source_version=2 encoded_rows=80 (v2 vs v3, local)
+EXIT compare-local 0
+SAVED D:\Projects\fortune\Isaac\temp\memory-chain-v3\results\h0-equivalence\v3r9-process.pt v3 process version 2
+EXIT v3r9-process 0
+BITWISE_EQUAL outputs=8 params=172 source_version=2 encoded_rows=80 (v2 vs v3, process)
+EXIT compare-process 0

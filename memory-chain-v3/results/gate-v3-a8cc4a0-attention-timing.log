@@ -1,0 +1,1 @@
+{"device": "cuda:0", "groups": 96, "count": 128, "bank": 1600, "forward_equal": true, "native_ms": 30.384870944544673, "native_peak_gib": 1.5725603103637695, "horizon_ms": 27.114815078675747, "horizon_peak_gib": 1.9352006912231445}

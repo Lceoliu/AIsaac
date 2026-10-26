@@ -1,0 +1,31 @@
+{
+  "case": "v3-e8930b5-t8s-10260419",
+  "horizon": 1024,
+  "exit_status": 0,
+  "updates": 21,
+  "steady_updates": 11,
+  "steady_x_real_time": 330.0608841246995,
+  "medians": {
+    "x_real_time": 340.1747605687333,
+    "collect_s": 7.549827474867925,
+    "update_s": 10.401551405899227,
+    "wall_s": 12.85496115591377,
+    "gpu_reserved_gb": 21.83203125,
+    "wait_learner_s": 5.397707931930199,
+    "c_learner_cores": 0.8715334564513498,
+    "source_graph_frames": 142107.0,
+    "source_graph_frames_uid_max": 3051.0,
+    "source_alloc_gib_max": 3.482840061187744,
+    "source_detached_frames": 408384.0
+  },
+  "peak_gpu_mib": {
+    "1": 9194.0,
+    "2": 20967.0,
+    "3": 8726.0,
+    "4": 6649.0,
+    "5": 6351.0
+  },
+  "peak_container_memory_gib": 61.14563751220703,
+  "guard_stops": [],
+  "completed": false
+}

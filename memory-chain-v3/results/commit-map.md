@@ -46,6 +46,7 @@
 | 019dda7 | 7ff027e | Accounting: the first dropped gradient's learner-side context (ISAAC_LINEAGE_SOURCES=1) |
 | 9086793 | 1c5c374 | Accounting: per-episode first/last in-flight report per holder, which retain call detached |
 | 258f97a | 753a47a | Fix: merge_jobs keeps both actor processes' in-flight lineage |
+| d345da5 | 8ce8a58 | Audit: count gradient lost through Writer blocks built on released chunks; grace-period late-record test |
 
 crn 基线（exp/memory-chain-v3-crnbase）：
 

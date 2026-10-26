@@ -75,6 +75,12 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
             t7=(1024, 62.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),   # (= t6's configuration; run with the retention fix's code)
                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
+            # table 8 steps: t7's configuration, short (25 game hours, steady rows 10..20), one per step's code
+            t8s=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
+                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
+            # table 8 groundwork: t7 with a cProfile of one steady learner update (ISAAC_SOURCE_CPROFILE_AT = job 16)
+            t7prof=(1024, 22.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_CPROFILE='1', ISAAC_SOURCE_CPROFILE_AT='16'),
+                    TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
             # t7 with the drop's learner-side context (ISAAC_LINEAGE_SOURCES: who reported each ancestor in flight)
             t7d=(1024, 62.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_LINEAGE_SOURCES='1'),
                  TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),

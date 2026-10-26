@@ -1,0 +1,158 @@
+ "end": 1205771.100020518
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1205771.100020518,
+      "end": 1205771.118806479
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1205771.220878333,
+      "end": 1205771.220976003
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1205771.220976003,
+      "end": 1205771.220985311
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1205771.220985311,
+      "end": 1205771.222483328
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1205772.0916848,
+      "end": 1205772.091863094
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1205772.091863094,
+      "end": 1205772.09187467
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1205772.09187467,
+      "end": 1205772.093469899
+    },
+    {
+      "kind": "source_backward",
+      "device": "cuda:1",
+      "version": 0,
+      "gradient_buffer_bytes": 2752768,
+      "serviced_forward_calls": 0,
+      "forward_service_seconds": 0.0,
+      "start": 1205772.638460458,
+      "end": 1205772.818254139
+    },
+    {
+      "kind": "source_backward",
+      "device": "cuda:2",
+      "version": 0,
+      "gradient_buffer_bytes": 2752768,
+      "serviced_forward_calls": 0,
+      "forward_service_seconds": 0.0,
+      "start": 1205772.638214856,
+      "end": 1205772.858925086
+    },
+    {
+      "kind": "commit_wait",
+      "device": "host",
+      "start": 1205772.659534816,
+      "end": 1205772.859075157
+    },
+    {
+      "kind": "commit_transfer",
+      "device": "host",
+      "start": 1205772.859075157,
+      "end": 1205772.902480044
+    },
+    {
+      "kind": "commit_adam",
+      "device": "host",
+      "start": 1205772.902480044,
+      "end": 1205772.912645914
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 1,
+      "rows": 1,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1205773.391765202,
+      "end": 1205773.438817271
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1205773.392913682,
+      "end": 1205773.439053036
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1205773.439053036,
+      "end": 1205773.439091213
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1205773.439091213,
+      "end": 1205773.440697713
+    }
+  ]
+}
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000455
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000431
+{"result": "PASS", "queries": 8192, "source_bf16": true, "saved_8bit_block": 0, "weight_max_abs": 1.4551915228366852e-11, "encoded_rows": [32, 32], "source_updates": 2, "early_retirement": true, "partial_checkpoint": true, "deferred_until_reader_ready": true, "offloaded_encode_calls": 0, "retained_cpu_max_bytes": 0, "spill_limited_bytes": 0}
+{
+  "result": "PASS",
+  "source_precision": "bf16",
+  "reader_precision": "fp32",
+  "optimizer": "fp32",
+  "saved_8bit_block": 0,
+  "queries": 8192,
+  "metrics": {
+    "mixed_dense": {
+      "output_max_abs": 3.738701343536377e-05,
+      "output_relative_l2": 6.065199158911128e-06,
+      "source_grad_max_abs": 0.0004962682723999023,
+      "source_grad_relative_l2": 0.0027925968173075884,
+      "source_grad_cosine": 0.9999961132650454
+    },
+    "fp32": {
+      "output_max_abs": 0.0007308274507522583,
+      "output_relative_l2": 0.00010249304614262655,
+      "source_grad_max_abs": 0.0005597854033112526,
+      "source_grad_relative_l2": 0.0063202467394094415,
+      "source_grad_cosine": 0.9999811032324013
+    }
+  },
+  "encoded_rows_by_cycle": [
+    128,
+    130,
+    132,
+    134,
+    136,
+    138,
+    140
+  ],
+  "versions": 7,
+  "old_room_gradient": 0.00058746337890625,
+  "encoder_replay": 0,
+  "initial_unique_components": {},
+  "offloaded_encode_calls": 0
+}
+
+GATE v3-d345da5-v2-cuda-suite2 EXIT 0
+
+EXIT 0
