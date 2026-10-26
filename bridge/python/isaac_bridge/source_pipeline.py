@@ -53,12 +53,14 @@ class ImmutableSourceCast(torch.autograd.Function):
 
 
 class SourcePipeline:
-    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False):
+    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None):
         self.model, self.period, self.micro, self.amp = model, period, micro, amp
         # Opt-in (--source-layer-checkpoint): each Spatial block's output is recomputed in the VJP from its saved
         # input (torch.utils.checkpoint, non-reentrant) instead of keeping the block's activations. Not the default:
         # it recomputes the blocks' forward.
         self.layer_checkpoint = bool(layer_checkpoint)
+        # (measurement: only these Spatial blocks under checkpoint, the others keep their full graphs; None: all)
+        self.checkpoint_blocks = None if checkpoint_blocks is None else frozenset(int(b) for b in checkpoint_blocks)
         # (--source-dispatch-at-close, scheduling only) with defer_backward: a closed interval's VJP starts when it
         # closes (overlapping the next collection; the workers serve forward requests between its episode groups,
         # ISAAC_SOURCE_PREEMPT_VJP) instead of after the next Reader's inputs; its commit stays gated until that
@@ -97,6 +99,11 @@ class SourcePipeline:
         self.devices = [torch.device(d) for d in devices]
         self.shared_devices = {torch.device(d) for d in shared_devices}
         self.actor_reserve_gb = actor_reserve_gb
+        # (balance: new blocks go where measured source work per update is lowest, within each card's memory
+        # budget; 2026-10-26. Off: by memory budget alone, as before)
+        self.balance = balance
+        self.busy_hist = [[] for _ in self.devices]
+        self.balance_weight = np.ones(len(self.devices))
         self.prefetch_live = {}
         self.prefetch_pressure = False
         self.names = [n for n, _ in model.named_parameters() if source_parameter(n)]
@@ -127,7 +134,7 @@ class SourcePipeline:
             from .source_worker import SourceProcess
             options=dict(period=period,micro=micro,amp=amp,version=version,saved_gpu_gb=saved_gpu_gb,saved_cpu_gb=saved_cpu_gb,saved_8bit=saved_8bit,
                          compile_source=compile_source,flash_source=flash_source,update_rollouts=update_rollouts,
-                         layer_checkpoint=layer_checkpoint)
+                         layer_checkpoint=layer_checkpoint,checkpoint_blocks=checkpoint_blocks)
             spill_limits=([min(saved_gpu_gb,max(1.,b-1.)) for b in self._memory_budgets()]
                           if saved_gpu_gb>0 else [0.]*len(self.devices))
             self.remotes=[SourceProcess(self.versions[version][0],d,
@@ -216,9 +223,11 @@ class SourcePipeline:
                     from torch.utils.checkpoint import checkpoint
                     block_fns=[torch.compile(lambda x,cu,ms,block=block:block.forward_packed(
                         x,None,None,dict(cu_seqlens=cu,max_seqlen=ms)),dynamic=True) for block in replica.blocks]
-                    def source_blocks(xp,cu,ms,fns=block_fns):
+                    under=[self.checkpoint_blocks is None or i in self.checkpoint_blocks for i in range(len(block_fns))]
+                    def source_blocks(xp,cu,ms,fns=block_fns,under=under):
                         with lock:
-                            for fn in fns:xp=checkpoint(fn,xp,cu,ms,use_reentrant=False)
+                            for fn,ck in zip(fns,under):
+                                xp=checkpoint(fn,xp,cu,ms,use_reentrant=False) if ck else fn(xp,cu,ms)
                             return xp
                 else:
                     compiled=torch.compile(getattr(replica,method),dynamic=True)
@@ -489,7 +498,27 @@ class SourcePipeline:
                     **({'source_worker_graph_frames': sum(m.get('graph_frames', 0) for m in self.remote_memory)}
                        if self.processes else {}),
                     **{f'source_graph_frames_w{i}': sum(c['rows'] for c in self.chunks if c is not None and c['worker'] == i
-                                                        and not c.get('detached')) for i in range(len(self.devices))})
+                                                        and not c.get('detached')) for i in range(len(self.devices))},
+                    **{f'source_busy_w{i}': (h[-1] if h else float('nan')) for i, h in enumerate(self.busy_hist)},
+                    **{f'source_balance_w{i}': float(w) for i, w in enumerate(self.balance_weight)})
+
+    def observe_busy(self):
+        """(once per update, before the events are cleared) each source card's work since the last call:
+        encode + writer + source_backward seconds. With balance, the assignment weight of each card follows the
+        ratio of its moving median (last 5 updates) to the cards' mean (integral control, square root step,
+        clamped to [1/4, 4]); returns the seconds per card."""
+        per = {str(d): 0. for d in self.devices}
+        for e in self.events:
+            if e['kind'] in ('encode', 'writer', 'source_backward') and e['device'] in per:
+                per[e['device']] += e['end'] - e['start']
+        for i, d in enumerate(self.devices):
+            self.busy_hist[i] = (self.busy_hist[i] + [per[str(d)]])[-5:]
+        if self.balance and all(len(h) >= 2 for h in self.busy_hist):
+            med = np.asarray([np.median(h) for h in self.busy_hist])
+            if med.mean() > 0:
+                w = self.balance_weight * np.sqrt(np.maximum(med, 1e-3) / med.mean())
+                self.balance_weight = np.clip(w / np.exp(np.log(w).mean()), 0.25, 4.0)
+        return per
 
     def _collect_retired(self, *, wait):
         pending=[]
@@ -743,7 +772,12 @@ class SourcePipeline:
             for lo in range(0,len(block_parts),blocks_per_batch):
                 group=block_parts[lo:lo+blocks_per_batch]
                 incoming=sum(int(costs[indices].sum()) for key,indices in group)
-                worker=int(np.argmin((np.asarray(loads)+incoming)*scales/budgets))
+                frac=(np.asarray(loads)+incoming)*scales/budgets
+                # (balance: the least measured work among the cards whose memory budget still holds the group;
+                # a cpu worker has no budget)
+                fits=(frac<=1)|np.asarray([d.type!='cuda' for d in self.devices])
+                worker=int(np.argmin(np.where(fits,frac*self.balance_weight,np.inf)) if self.balance and fits.any()
+                           else np.argmin(frac))
                 for key,indices in group:
                     assigned[key]=worker
                     loads[worker]+=int(costs[indices].sum())
