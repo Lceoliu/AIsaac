@@ -7,7 +7,7 @@ retain (detach / retire), dispatch_finish, Reader steps with commit polls, close
   S   streams 0: one stream; the VJP serves encodes only between its episode groups (as before)
   C1  streams 2, schedule shuffled (ISAAC_SOURCE_STREAM_SHUFFLE: random host sleeps and, on CUDA, random
   C2  device sleeps on the issuing stream before every encode / Writer and between the VJP's episode groups)
-Checks: parameters after every rollout equal to S's (bitwise; on CUDA within 1e-6 relative), source versions
+Checks: parameters after every rollout and every commit's source gradients equal to S's (cpu: bitwise; CUDA, lr 0: source gradients within 1e-6 relative, S repeated for the run-to-run noise), source versions
 and encoded rows equal, the audit (dropped gradient) exactly zero in all, and in C the VJP ran concurrently
 with encodes (a worker's encode interval inside one of its VJP intervals, the VJP event marked concurrent).
 (The extra workspace per card is measured in the long runs: memory breakdown and nvidia-smi peaks.)
@@ -22,7 +22,7 @@ import numpy as np
 import torch
 from isaac_bridge.tok_policy import TokPolicy
 from isaac_bridge.rebuild_memory import RawHistory, SourceBatch, SourceView
-from isaac_bridge.source_pipeline import SourcePipeline
+from isaac_bridge.source_pipeline import SourcePipeline, source_parameter
 
 
 def main(sources):
@@ -46,7 +46,11 @@ def main(sources):
         model = copy.deepcopy(base)
         pipe = SourcePipeline(model, sources, period=0, micro=8, update_rollouts=1, defer_backward=True,
                               processes=True, horizon=6, dispatch_at_close=True, streams=streams)
-        opt = torch.optim.Adam(model.main_parameters(), lr=1e-3, eps=1e-5)
+        # (CUDA: lr 0, every interval's VJP on the same weights, so its source gradients compare directly;
+        # Adam on CUDA amplifies the atomics' run-to-run noise of the Reader steps into the parameters)
+        opt = (torch.optim.SGD(model.main_parameters(), lr=0.) if cuda else
+               torch.optim.Adam(model.main_parameters(), lr=1e-3, eps=1e-5))
+        grads = []   # (each commit's source gradients)
         hs = [RawHistory.empty() for _ in range(W)]
         params, versions = [], []
         for rollout in range(R):
@@ -63,7 +67,11 @@ def main(sources):
                 out = view.forward(np.arange(len(req)), need_vg=True)
                 (out[0].float().square().mean() + out[1].float().square().mean()).backward()
                 view.backward(); pipe.fast_step(opt, 1e9)
+                before = pipe.version
                 pipe.poll_finish(opt, 1e9, wait=(step == 0))
+                if pipe.version != before:
+                    grads.append({n: q.grad.detach().double().clone() for n, q in model.named_parameters()
+                                  if source_parameter(n) and q.grad is not None})
             pipe.finish_rollout(opt, 1e9, overlap=True)
             params.append([p.detach().double().clone() for p in model.parameters()])
             versions.append(pipe.version)
@@ -73,32 +81,44 @@ def main(sources):
         vjps = [e for e in ev if e['kind'] == 'source_backward']
         overlap = sum(1 for e in ev if e['kind'] in ('encode', 'writer') for v in vjps
                       if v['device'] == e['device'] and v['start'] < e['start'] and e['end'] < v['end'])
-        runs[name] = dict(params=params, versions=versions, encoded=pipe.encoded_rows, overlap=overlap,
+        runs[name] = dict(grads=grads, params=params, versions=versions, encoded=pipe.encoded_rows, overlap=overlap,
                           concurrent=any(v.get('concurrent') for v in vjps), vjps=len(vjps),
                           dropped=float(pipe.horizon_stats()['source_horizon_dropped_grad']))
         pipe.close()
     os.environ.pop('ISAAC_SOURCE_STREAM_SHUFFLE', None)
     S = runs['S']
     report = {}
+    def grad_rel(P, Q):   # (per commit: |g - g_ref| / |g_ref| over all source parameters; the largest)
+        assert len(P['grads']) == len(Q['grads']), (len(P['grads']), len(Q['grads']))
+        out = 0.
+        for a, b in zip(P['grads'], Q['grads']):
+            assert set(a) == set(b)
+            ga = torch.cat([a[n].flatten() for n in sorted(a)]); gb = torch.cat([b[n].flatten() for n in sorted(b)])
+            out = max(out, float((ga - gb).norm() / gb.norm().clamp_min(1e-30)))
+        return out
+
     def rel(P, Q):
         return max(float((a - b).abs().max() / b.abs().max().clamp_min(1e-30))
                    for pa, pb in zip(P['params'], Q['params']) for a, b in zip(pa, pb))
     # (CUDA: the serial schedule run twice; atomics in index_add_ / scatter make it not bitwise reproducible)
     noise = rel(runs['S2'], S) if cuda else 0.
+    grad_noise = grad_rel(runs['S2'], S) if cuda else 0.
     for name in ('C1', 'C2'):
         C = runs[name]
         assert C['versions'] == S['versions'] and C['encoded'] == S['encoded'], (name, C['versions'], S['versions'])
         diff = max(float((a - b).abs().max() / b.abs().max().clamp_min(1e-30))
                    for pa, pb in zip(C['params'], S['params']) for a, b in zip(pa, pb))
         bitwise = all(torch.equal(a, b) for pa, pb in zip(C['params'], S['params']) for a, b in zip(pa, pb))
-        print('DIFF', name, diff, 'serial-vs-serial', noise, flush=True)
-        assert bitwise if not cuda else diff <= max(1e-6, 2 * noise), (name, diff, noise)
+        gdiff = grad_rel(C, S)
+        print('DIFF', name, 'params', diff, 'source gradients', gdiff, 'serial-vs-serial', noise, grad_noise, flush=True)
+        if cuda: assert gdiff <= 1e-6, (name, gdiff, grad_noise)   # (source gradients within 1e-6)
+        else: assert bitwise and gdiff == 0, (name, diff, gdiff)
         assert C['concurrent'] and C['overlap'] > 0, (name, C['concurrent'], C['overlap'])
-        report[name] = dict(bitwise=bitwise, max_rel_param_diff=diff, encodes_inside_vjp=C['overlap'], vjps=C['vjps'])
+        report[name] = dict(bitwise=bitwise, max_rel_param_diff=diff, max_rel_source_grad_diff=gdiff, encodes_inside_vjp=C['overlap'], vjps=C['vjps'])
     assert all(r['dropped'] == 0 for r in runs.values()), {k: r['dropped'] for k, r in runs.items()}
     assert not S['concurrent']
     print(json.dumps(dict(result='PASS', sources=sources, serial_encodes_inside_vjp=S['overlap'],
-                          serial_repeat_rel_diff=noise, **report)))
+                          serial_repeat_rel_diff=noise, serial_repeat_source_grad_diff=grad_noise, **report)))
 
 
 if __name__ == '__main__':
