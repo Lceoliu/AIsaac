@@ -1776,6 +1776,10 @@ def main(argv=None, child=None, actor=None):
                    help='scheduling only (with --source-overlap-rollout 1 and source prefetch): a closed source '
                         'interval\'s VJP is dispatched when the update closes it, overlapping the next collection, '
                         'instead of after the next Reader inputs are ready; its commit is gated to the same point')
+    p.add_argument('--source-balance', type=int, choices=(0, 1), default=0,
+                   help='scheduling only: new source blocks go to the card with the least measured work per update '
+                        '(moving median of encode + writer + VJP seconds) whose memory budget still holds them; '
+                        '0: by memory budget alone')
     p.add_argument('--source-layer-checkpoint', type=int, choices=(0, 1), default=0,
                    help='opt-in, not the default: Spatial blocks under activation checkpointing in the source workers '
                         '(each block input saved, its forward recomputed in the VJP); needs --source-compile 1 '
@@ -2551,6 +2555,7 @@ def main(argv=None, child=None, actor=None):
             saved_8bit=args.source_saved_8bit,
             compile_source=args.source_compile, flash_source=bool(args.source_flash),
             layer_checkpoint=bool(args.source_layer_checkpoint), dispatch_at_close=bool(args.source_dispatch_at_close),
+            balance=bool(args.source_balance),
             update_rollouts=args.source_update_rollouts, shared_devices=shared,
             actor_reserve_gb=args.source_actor_reserve_gb,processes=bool(args.source_processes),
             defer_backward=bool(args.source_prefetch_records),horizon=args.memory_horizon)
@@ -2637,6 +2642,7 @@ def main(argv=None, child=None, actor=None):
         learner_model.set_math_attention('math' in fparts, nhwc='nhwc' in fparts, ln='ln' in fparts)
         ensure_source_pipeline()
         if source_pipeline is not None:
+            source_pipeline.observe_busy()   # (the last update's source work per card: --source-balance, progress.csv)
             source_pipeline.events.clear()
             source_pipeline.reader_events.clear()
             if source_pipeline.pending is not None:
