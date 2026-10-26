@@ -856,6 +856,7 @@ class SourceBatch:
         self.block_keys = [tuple(self.frame_keys[i] for i in block) for block in block_rows]
         self.unique_query, inverse = np.unique(query, return_inverse=True)
         self.query = torch.as_tensor(query, device=dev)
+        self.query_host = query   # (table 8 step 1: a minibatch's query frames by indexing, no per-request lookup)
         self.query_inverse = torch.as_tensor(inverse, device=dev)
         self.unique_query_d = torch.as_tensor(self.unique_query, device=dev)
         if pipeline is not None:
@@ -1312,7 +1313,9 @@ class SourceView(SourceBatch):
         self.source_version=self.pipeline.version
         self.requests=[parent.requests[i] for i in indices]
         self.query_groups=parent.query_groups[indices]
-        query=np.asarray([parent.history_frames[h.uid][h.length] for h,_,_ in self.requests])
+        query=(parent.query_host[np.asarray(indices,np.int64)] if getattr(parent,'query_host',None) is not None else
+               np.asarray([parent.history_frames[h.uid][h.length] for h,_,_ in self.requests]))
+        self.query_host=query
         self.unique_query,inverse=np.unique(query,return_inverse=True)
         ix,self.query_inverse,yi=reader_indices((indices,inverse,np.searchsorted(parent.unique_query,self.unique_query)),parent.u.device)
         self.query=parent.query.index_select(0,ix)
