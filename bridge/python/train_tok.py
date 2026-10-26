@@ -2673,6 +2673,22 @@ def main(argv=None, child=None, actor=None):
             L.setdefault('lineage', {})[job.get('aid', 0)] = {(a_, n_, l_) for a_, n_, l_ in job.get('lineage') or ()}
             in_flight_reach = set().union(*L['lineage'].values())
             in_flight = {a_ for a_, _, _ in in_flight_reach}
+            if os.environ.get('ISAAC_LINEAGE_SOURCES') and source_pipeline is not None:
+                ring_ = L.setdefault('lineage_ring', collections.deque(maxlen=64))
+                ring_.append((source_pipeline.version, L['update'], job.get('aid', 0), job.get('lineage_src')))
+                if getattr(source_pipeline, 'drop_context', None) is None:
+                    def drop_context(uids, L=L):
+                        uids = set(uids); out = dict(reported=[], admitted={})
+                        for version_, update_, aid_, src_ in L.get('lineage_ring', ()):
+                            for k_, items_ in (src_ or {}).items():
+                                for item_ in items_:
+                                    if tuple(item_[0]) in uids:
+                                        out['reported'].append([version_, update_, aid_, k_] + list(item_))
+                        for uid_, at_ in L.get('admitted_v2', {}).items():
+                            if uid_ in uids: out['admitted'][str(uid_)] = at_
+                        out['reported'] = out['reported'][-200:]
+                        return out
+                    source_pipeline.drop_context = drop_context
             if args.release_raw:
                 # A branch forked shortly before its parent ended can be published after the
                 # parent left every holder the actors report (a reused bank row, say): keep an
@@ -3090,6 +3106,13 @@ def main(argv=None, child=None, actor=None):
                     L['v2_host_rows'][at_v] = v_rows
                     L['v2_host_pending'][at_v] = pend_v
                     if 'ledger' in L: L['ledger'].admit_v2(at_v)
+                    if os.environ.get('ISAAC_LINEAGE_SOURCES') and source_pipeline is not None:
+                        adm_ = L.setdefault('admitted_v2', {})   # (measurement: when each record arrived)
+                        for i_ in range(len(at_v)):
+                            if v_contexts[i_] is not None:
+                                adm_[v_contexts[i_].uid] = (source_pipeline.version, L['update'], v_contexts[i_].length)
+                        if len(adm_) > 20000:
+                            for k_ in list(adm_)[:len(adm_) - 20000]: del adm_[k_]
                 at_d = torch.from_numpy(at_v).to(device)
                 if t_on:
                     if v_ts is not None:
@@ -4864,6 +4887,12 @@ def main(argv=None, child=None, actor=None):
                     # (ancestor, frames shared, the branch's length): the learner keeps [length - H, shared)
                     reach_ = lineage_intervals(slot_lists=slots_[1:] + [records_], context_dicts=[contexts_])
                     branch_ = {a_ for a_, _, _ in reach_}
+                    if os.environ.get('ISAAC_LINEAGE_SOURCES'):   # (measurement: which holder reported each ancestor)
+                        held_ = dict(zip(['lanes', 'bank'][:len(slots_) - 1], slots_[1:]))
+                        held_['records'] = records_
+                        job['lineage_src'] = {k_: sorted(lineage_intervals(slot_lists=[v_])) for k_, v_ in held_.items()}
+                        job['lineage_src']['contexts'] = sorted(lineage_intervals(context_dicts=[contexts_]))
+                        job['lineage_src']['main'] = sorted((h_.uid, h_.length) for h_ in slots_[0] if h_ is not None)
                     for u_ in [u_ for u_ in sent_max if u_ not in sent_histories and u_ not in branch_]: del sent_max[u_]
                     release_raw(lambda u_: sent_max.get(u_, 0), args.memory_block, slot_lists=slots_,
                                 context_lists=[roll.raw_contexts, spare.raw_contexts], context_dicts=[contexts_])
