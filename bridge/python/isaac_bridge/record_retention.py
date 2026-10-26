@@ -204,6 +204,32 @@ def release_raw(limit, block, slot_lists=(), context_lists=(), context_dicts=())
             if h is not None: table[key] = released(h, limit, block, memo)
 
 
+def lineage_intervals(slot_lists=(), context_dicts=()):
+    """(ancestor uid, frames it shares, the branch's current length) of branches in flight (lanes, the
+    choice-point bank, contexts awaiting publication): what in_flight_frontier needs."""
+    out = set()
+    for raw in slot_lists:
+        for h in raw or ():
+            if h is not None and h.length: out.update((a, n, h.length) for a, n in h.origin)
+    for table in context_dicts:
+        for h in (table or {}).values():
+            if h is not None: out.update((a, n, h.length) for a, n in h.origin)
+    return out
+
+
+def in_flight_frontier(frontier, lineage, horizon):
+    """(2026-10-26) The frames an in-flight branch's future records can still read of each ancestor: they
+    decide at or after the branch's current length l, so at most [l - H, shared) (no horizon: [0, shared)).
+    Added to frontier's intervals ({uid: [(lo, hi), ...]}); an ancestor with nothing reachable gets no
+    interval (values only), as before."""
+    for a, shared, length in lineage:
+        lo = length - horizon if horizon else 0
+        reach = frontier.setdefault(a, [])
+        if not isinstance(reach, list): reach = frontier[a] = []   # (a stale number: lists only here)
+        if lo < shared and (lo, shared) not in reach: reach.append((lo, shared))
+    return frontier
+
+
 def lineage(slot_lists=(), context_dicts=()):
     """Ancestor episodes of branches in flight (lanes, the choice-point bank,
     contexts awaiting publication): the learner keeps their source values."""
