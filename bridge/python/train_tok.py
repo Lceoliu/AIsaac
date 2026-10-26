@@ -2703,10 +2703,9 @@ def main(argv=None, child=None, actor=None):
                 # A branch forked shortly before its parent ended can be published after the
                 # parent left every holder the actors report (a reused bank row, say): keep an
                 # ended episode's source values for a grace period of updates (rule 5, D2a).
-                recent_ = L.setdefault('recent_uids', {})
-                for u_ in itertools.chain((h.uid for h, _, _ in all_requests), in_flight): recent_[u_] = L['update']
-                for u_ in [u_ for u_, t_ in recent_.items() if L['update'] - t_ > args.release_grace_updates]: del recent_[u_]
-                in_flight |= set(recent_)
+                from isaac_bridge.record_retention import grace_keep
+                in_flight |= grace_keep(L.setdefault('recent_uids', {}), itertools.chain(
+                    (h.uid for h, _, _ in all_requests), in_flight), L['update'], args.release_grace_updates)
             live_uids.update(in_flight)
             if source_pipeline.prefetch_pressure:
                 # Backpressure, not another Adam clock: settle the already
@@ -2727,14 +2726,11 @@ def main(argv=None, child=None, actor=None):
                 # Earliest decision any later loss can still use, per episode:
                 # this rollout's first decision; a stored teacher/v2 record's own
                 # (and its ancestors') until the update that consumed its loss.
-                frontier = {}
-                for h, _, _ in all_requests:
-                    frontier[h.uid] = min(frontier.get(h.uid, h.length), h.length)
-                source_pipeline.rollout_frontiers = dict(frontier)   # (accounting: hold_reasons)
-                frontier = ledger.frontier(frontier, L.get('teach_contexts'), L.get('v2_contexts'), args.memory_horizon)
-                from isaac_bridge.record_retention import in_flight_frontier
-                in_flight_frontier(frontier, in_flight_reach, args.memory_horizon)
-                for uid in in_flight: frontier.setdefault(uid, [])   # (grace: values only, no pending loss)
+                # (+ in-flight branches' ancestors' reachable ranges; values only for the rest of in_flight)
+                from isaac_bridge.record_retention import learner_frontier
+                frontier, source_pipeline.rollout_frontiers = learner_frontier(   # (rollout_frontiers: hold_reasons)
+                    (h for h, _, _ in all_requests), ledger, L.get('teach_contexts'), L.get('v2_contexts'),
+                    in_flight_reach, in_flight, args.memory_horizon)
                 return frontier
             source_pipeline.retain_mark = (L['update'], 'rollout')   # (measurement: which retain call detached)
             if not retire_after_ready:source_pipeline.retain_histories(live_uids,frontiers=horizon_frontiers())

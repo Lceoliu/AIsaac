@@ -110,6 +110,9 @@ class SourcePipeline:
                                for i in range(len(devices))]
                               if processes and os.environ.get('ISAAC_SOURCE_PREEMPT_VJP')=='1' else self.workers)
         self.frames, self.blocks, self.chunks, self.writes, self.owners = {}, {}, [], [], {}
+        # (per-uid keys of frames / blocks / owners: retain_histories drops a retired episode's entries
+        # without scanning every frame of every episode; 2026-10-26, table 8)
+        self.uid_keys = {}
         self.direct_grads = {}
         self.retired_pending = []
         self.collected = {}
@@ -269,8 +272,15 @@ class SourcePipeline:
         uids.update(h.uid for batch in self.collected.values() for h,_,_ in batch.requests)
         # A live branch keeps the ancestor frames it reads (they are keyed by the ancestor).
         uids.update(a for uid in list(uids) for a, _ in self.origins.get(uid, ()))
-        live_chunks = {c for k, (c, _) in self.frames.items() if k[0] in uids}
-        live_writes = {c for k, (c, _) in self.blocks.items() if k[0][0] in uids}
+        # A chunk holds frames of its own uid (stateless teacher chunks: of `uids`), a write the blocks of
+        # its uid (each block keyed by its first frame's uid); both live while one of those uids is live
+        # (the same sets as scanning every frame and block key, without the scan).
+        live_chunks = {i for i, c in enumerate(self.chunks) if c is not None and (
+            c['uid'] in uids if c.get('uid') is not None else not uids.isdisjoint(c.get('uids', ())))}
+        live_writes = {i for i, c in enumerate(self.writes) if c is not None and c.get('uid') in uids}
+        if os.environ.get('ISAAC_RETAIN_CHECK') == '1':   # (test aid: the full scans, compared)
+            assert live_chunks == {c for k, (c, _) in self.frames.items() if k[0] in uids}
+            assert live_writes == {c for k, (c, _) in self.blocks.items() if k[0][0] in uids}
         if self.steps:
             # Closed episodes will never receive another consumer. Settle their
             # complete credit before releasing graphs, but do NOT step Adam.
@@ -289,11 +299,19 @@ class SourcePipeline:
                 # Process workers own these graphs and enqueue retire after
                 # VJP. Reader can run now; Adam must still collect all credit.
                 self._collect_retired(wait=not (overlap and self.processes))
-        self.frames = {k: v for k, v in self.frames.items() if k[0] in uids}
-        self.blocks = {k: v for k, v in self.blocks.items() if k[0][0] in uids}
+        if os.environ.get('ISAAC_RETAIN_CHECK') == '1':
+            expect = ({k: v for k, v in self.frames.items() if k[0] in uids},
+                      {k: v for k, v in self.blocks.items() if k[0][0] in uids},
+                      {k: v for k, v in self.owners.items() if k[0] in uids})
+        for uid in [u for u in self.uid_keys if u not in uids]:
+            frames_, blocks_, owners_ = self.uid_keys.pop(uid)
+            for k in frames_: self.frames.pop(k, None)
+            for k in blocks_: self.blocks.pop(k, None)
+            for k in owners_: self.owners.pop(k, None)
+        if os.environ.get('ISAAC_RETAIN_CHECK') == '1':
+            assert (self.frames, self.blocks, self.owners) == expect
         self.lengths = {k: v for k, v in self.lengths.items() if k in uids}
         self.origins = {k: v for k, v in self.origins.items() if k in uids}
-        self.owners = {k: v for k, v in self.owners.items() if k[0] in uids}
         self.chunks = [c if i in live_chunks else None for i, c in enumerate(self.chunks)]
         self.writes = [c if i in live_writes else None for i, c in enumerate(self.writes)]
         if self.horizon and frontiers:
@@ -450,6 +468,7 @@ class SourcePipeline:
             if c.get('detached'): detached += c['rows']; continue
             graph += c['rows']
             if c.get('uid') is not None: per_uid[c['uid']] = per_uid.get(c['uid'], 0) + c['rows']
+        self._resolve_drops()
         dropped = 0. if self.horizon_dropped is None else float(self.horizon_dropped)
         allocated = [m['allocated'] for m in self.remote_memory] if self.processes else [
             torch.cuda.memory_allocated(d) if d.type == 'cuda' else 0 for d in self.devices]
@@ -736,6 +755,7 @@ class SourcePipeline:
             self.prefetch_pressure=True
             return False
         self.owners.update(assigned)
+        for key in assigned: self.uid_keys.setdefault(key[0], ([], [], []))[2].append(key)
         # Real episode graphs keep independent lifetimes. Ordinary teacher
         # records have no temporal chain: group their single frames by device,
         # rather than launching an entire encoder once per teacher sample.
@@ -769,7 +789,9 @@ class SourcePipeline:
                              rows=len(ix),first=min(keys[i][1] for i in ix),last=max(keys[i][1] for i in ix))
                 if uid is None: chunk['uids'] = frozenset(keys[i][0] for i in ix)
                 self.chunks.append(chunk)
-                for offset, i in enumerate(ix): self.frames[keys[i]] = (cid, offset)
+                for offset, i in enumerate(ix):
+                    self.frames[keys[i]] = (cid, offset)
+                    self.uid_keys.setdefault(keys[i][0], ([], [], []))[0].append(keys[i])
                 self.encoded_rows += len(ix)
         return True
 
@@ -827,17 +849,24 @@ class SourcePipeline:
         for (uid,worker), keys in new.items():
             self.replicas
             wid = len(self.writes)
-            future = self.workers[worker].submit(self._write, worker, keys, self.version,wid)
+            # (audit) blocks built on a released encoder chunk read its values: no cotangent can reach those
+            # frames through this write, so a later in-horizon cotangent on such a block is a lost gradient
+            stale = [o for o, block in enumerate(keys) if any(
+                (self.chunks[self.frames[key][0]] or {}).get('detached') for key in block)]
+            future = self.workers[worker].submit(self._write, worker, keys, self.version,wid,stale)
             self.writes.append(dict(worker=worker, future=future, version=self.version, uid=uid,remote_kind='write',remote_id=wid,
                                     first_start=min(block[0][1] for block in keys),last_start=max(block[0][1] for block in keys),
                                     chunks={self.frames[key][0] for block in keys for key in block}))
-            for offset,key in enumerate(keys): self.blocks[key] = (wid,offset)
+            for offset,key in enumerate(keys):
+                self.blocks[key] = (wid,offset)
+                self.uid_keys.setdefault(key[0][0], ([], [], []))[1].append(key)
             self.written_blocks += len(keys)
 
-    def _write(self, worker, block_keys, version, wid=None):
+    def _write(self, worker, block_keys, version, wid=None, stale=()):
         if self.processes:
             result=self._remote(worker,'write',(wid,block_keys),version)
             result['grads']={}
+            if stale: result['_stale_rows'] = list(stale)
             return result
         started = time.perf_counter()
         replica, device = self.versions[version][worker], self.devices[worker]
@@ -864,7 +893,8 @@ class SourcePipeline:
         self.events.append(dict(kind='writer', device=str(device), version=version,
                                 rows=len(block_keys), start=started, end=time.perf_counter(),
                                 **(saving.stats() if self.saved_8bit else {})))
-        return dict(mem=mem, grads={}, **(saving.stats() if self.saved_8bit else {}))
+        return dict(mem=mem, grads={}, **(saving.stats() if self.saved_8bit else {}),
+                    **(dict(_stale_rows=list(stale)) if stale else {}))
 
     @torch.no_grad()
     def _gather_plan(self, plan, field, size):
@@ -995,16 +1025,38 @@ class SourcePipeline:
                 if field not in result['grads']:
                     result['grads'][field] = torch.zeros_like(result[field], dtype=torch.float32)
                 result['grads'][field].index_add_(0, put, packed[at:at+len(put)])
+                if result.get('_stale_rows'): self._drop_stale(packed[at:at+len(put)], put, result, field)
                 at += len(put)
+
+    def _drop_stale(self, gradient, put, result, field):
+        # (audit) cotangent of Writer blocks that read a released chunk's values: it cannot reach those frames
+        # (no host sync: the rows outside the stale blocks count zero)
+        stale = torch.as_tensor(result['_stale_rows'], device=put.device)
+        hit = torch.isin(put, stale).to(gradient.dtype).reshape((-1,) + (1,) * (gradient.dim() - 1))
+        self._drop(gradient * hit, result, field + '_on_released_input', put)
 
     def _drop(self, gradient, result=None, field=None, put=None):
         # Audit, not a correction: progress.csv must report exactly zero.
         total = gradient.detach().abs().sum().to(self.device, dtype=torch.float64)
         self.horizon_dropped = total if self.horizon_dropped is None else self.horizon_dropped + total
-        if result is not None and not getattr(self, '_drop_logged', False) and float(total) > 0:
-            # (the first non-zero drop: what it hit and which batch read it; printed once)
+        if result is not None and not getattr(self, '_drop_logged', False):
+            # (the first non-zero drop is found at horizon_stats, once per update: no host sync per call;
+            # before 2026-10-26 a float() here synchronised every audited credit)
+            pending = self.__dict__.setdefault('_drop_pending', [])
+            pending.append((total, result, field, put, getattr(self, '_drop_batch', None), self.version))
+            if len(pending) >= 4096: self._resolve_drops()
+
+    def _resolve_drops(self):
+        pending, self._drop_pending = getattr(self, '_drop_pending', []), []
+        if not pending or getattr(self, '_drop_logged', False): return
+        totals = torch.stack([p[0] for p in pending]).cpu()
+        first = int(torch.nonzero(totals > 0)[0, 0]) if bool((totals > 0).any()) else None
+        if first is not None: self._log_drop(*pending[first])
+
+    def _log_drop(self, total, result, field, put, batch, version):
+            # (the first non-zero drop: what it hit and which batch read it; printed once. The chunk keys
+            # are looked up when printed, at the end of the update)
             self._drop_logged = True
-            batch = getattr(self, '_drop_batch', None)
             req = (getattr(batch, 'requests', None) or []) if batch is not None else []
             hit = {tuple(u) for u in (result.get('_detached_meta') or {}).get('uids', [])}
             readers = [dict(uid=list(h.uid), length=h.length, own_start=h.own_start() if h.origin else 0,
@@ -1025,7 +1077,7 @@ class SourcePipeline:
             # each reading record was admitted; set by train_tok, measurement only)
             ask = sorted(hit | {tuple(r['uid']) for r in readers} | {tuple(a) for r in readers for a, _ in r['origin']})
             learner = self.drop_context(ask) if getattr(self, 'drop_context', None) is not None else None
-            print('SOURCE_DROP_FIRST ' + json.dumps(dict(field=field, total=float(total), version=self.version,
+            print('SOURCE_DROP_FIRST ' + json.dumps(dict(field=field, total=float(total), version=version,
                   meta=result.get('_detached_meta'), keys=keys, batch=ctx, learner=learner), default=str), flush=True)
 
     @torch.no_grad()
@@ -1041,7 +1093,9 @@ class SourcePipeline:
             value = result[field]
             if field not in result['grads']: result['grads'][field] = torch.zeros_like(value, dtype=torch.float32)
             part = gradient.index_select(0, take).to(value.device, non_blocking=True)
-            result['grads'][field].index_add_(0, torch.as_tensor([i for _, i in entries], device=value.device), part)
+            put = torch.as_tensor([i for _, i in entries], device=value.device)
+            result['grads'][field].index_add_(0, put, part)
+            if result.get('_stale_rows'): self._drop_stale(part, put, result, field)
 
     def collect(self, batch):
         self.check_version(batch.source_version)
@@ -1269,7 +1323,7 @@ class SourcePipeline:
             if self.backward_workers is not self.workers:
                 for worker in self.backward_workers:worker.shutdown(wait=True)
             if self.processes:
-                self.chunks.clear();self.writes.clear();self.frames.clear();self.blocks.clear();self.collected.clear()
+                self.chunks.clear();self.writes.clear();self.frames.clear();self.blocks.clear();self.collected.clear();self.uid_keys.clear()
                 import gc
                 gc.collect()
             for future in self.control_futures:future.result()
