@@ -28,6 +28,7 @@ import os
 TAG = 'v3-' + (os.environ.get('V3_REF') or subprocess.check_output(['git', '-C', str(HERE / 'candidate'), 'rev-parse', '--short', 'HEAD'], text=True).strip())
 FIVE = ('3,2,1,4,5', None)                       # v2 long-59 device layout
 FOUR = ('3,2,4,5', 'cuda:0,cuda:2,cuda:3')       # GPU1 taken: learner cuda:1, actors cuda:0,2, sources 0,2,3
+FOUR1 = ('3,1,4,5', 'cuda:0,cuda:2,cuda:3')      # (2026-10-26: GPU2 taken by others) the same roles on GPU1
 SPILL0 = [' --source-saved-cpu-gb 0.75 ', ' --source-saved-cpu-gb 0 ']
 TRIMS = []   # a) SPILL0 dropped: every tp run with it hit CUDA OOM in source backward (updates 5-37); b) stays (QUIET)
 U1 = [' --source-update-rollouts 2 ', ' --source-update-rollouts 1 ']
@@ -78,6 +79,28 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
             # table 8 steps: t7's configuration, short (25 game hours, steady rows 10..20), one per step's code
             t8s=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
                  TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
+            # source-card balance by measured work (--source-balance 1), otherwise t8s
+            t8b=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
+                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 '],
+                          [' --source-dispatch-at-close 1 ', ' --source-dispatch-at-close 1 --source-balance 1 ']]),
+            # VJP work measurements (2026-10-26, measurement only): t8b + memory breakdown / saved-tensor census;
+            # ck = every block checkpointed, ck2 = blocks 2,3 only, full = no checkpoint, noflash = no checkpoint, flash off
+            **{name: (1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
+                      TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 ' + extra],
+                               [' --source-dispatch-at-close 1 ', ' --source-dispatch-at-close 1 --source-balance 1 ']])
+               for name, extra in (('t8mck', '--source-layer-checkpoint 1 '),
+                                   ('t8mck2', '--source-layer-checkpoint 1 --source-checkpoint-blocks 2,3 '),
+                                   ('t8mfull', ''))},
+            # the same measurements on four cards (GPU2 in others' use): learner cuda:1, actors cuda:0,2, sources cuda:0,2,3
+            **{name + '4': (1024, 25.0, FOUR1, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
+                      TRIMS + [U1, [' --source-flash 1 ', ' --source-flash ' + flash + ' --source-dispatch-at-close 1 ' + extra]]
+                      + ([[' --source-dispatch-at-close 1 ', ' --source-dispatch-at-close 1 --source-balance 1 ']] if bal else []))
+               for name, flash, extra, bal in (('t8mck', '1', '--source-layer-checkpoint 1 ', True),
+                                               ('t8mckoff', '1', '--source-layer-checkpoint 1 ', False),
+                                               ('t8mck2', '1', '--source-layer-checkpoint 1 --source-checkpoint-blocks 2,3 ', True),
+                                               ('t8mfull', '1', '', True), ('t8mnoflash', '0', '', True))},
+            t8mnoflash=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
+                        TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 0 --source-dispatch-at-close 1 --source-balance 1 ']]),
             # table 8 groundwork: t7 with a cProfile of one steady learner update (ISAAC_SOURCE_CPROFILE_AT = job 16)
             t7prof=(1024, 22.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_CPROFILE='1', ISAAC_SOURCE_CPROFILE_AT='16'),
                     TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
@@ -229,6 +252,10 @@ def main():
             for name, test in gates:
                 bench('gate', f'{TAG}-{name}', TAG, '3,4,5', 'nice -n 10 timeout 1800 bash -c ' + json.dumps(PYV + test),
                       log=f'gate-{TAG}-{name}-dispatch.log')
+        elif step == 'variants':   # (measurement) the source variants bench on one card
+            bench('gate', f'{TAG}-variants', TAG, '3,4,5', 'nice -n 10 timeout 3600 bash -c ' + json.dumps(
+                PYV + 'tests/bench_source_variants_cuda.py --device cuda:0 --frames 1024 --width 192 --layers 4'),
+                  log=f'gate-{TAG}-variants-dispatch.log')
         elif step == 'profgates':   # the profiler's CUDA twin test on both code trees
             for name, tag, shell in [(f'{TAG}-actorprof', TAG, PYV + 'tests/test_actor_profile_cuda.py --compile'),
                                      ('oldprof-4-actorprof', 'oldprof-4', PYV + 'tests/test_actor_profile_cuda.py --compile --kinds graph')]:

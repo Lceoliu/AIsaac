@@ -1,0 +1,26 @@
+{"result": "PASS", "process": false, "horizon": 24, "rollout": 32, "bound": 80, "bounded_graph_uid_max": [32, 64, 64, 64, 64, 64, 64, 64, 64, 64], "unbounded_graph_uid_max": [32, 64, 96, 128, 160, 192, 224, 256, 288, 320], "bounded_detached": [0, 0, 64, 128, 192, 256, 320, 384, 448, 512], "dropped": 0.0}
+HOST_HEAP_TRIM role=source-cpu seconds=0.000263
+HOST_HEAP_TRIM role=source-cpu seconds=0.000239
+HOST_HEAP_TRIM role=source-cpu seconds=0.001454
+HOST_HEAP_TRIM role=source-cpu seconds=0.000953
+HOST_HEAP_TRIM role=source-cpu seconds=0.001787
+HOST_HEAP_TRIM role=source-cpu seconds=0.001157
+HOST_HEAP_TRIM role=source-cpu seconds=0.001614
+HOST_HEAP_TRIM role=source-cpu seconds=0.001824
+HOST_HEAP_TRIM role=source-cpu seconds=0.002194
+HOST_HEAP_TRIM role=source-cpu seconds=0.002159
+HOST_HEAP_TRIM role=source-cpu seconds=0.000176
+HOST_HEAP_TRIM role=source-cpu seconds=0.000166
+HOST_HEAP_TRIM role=source-cpu seconds=0.000242
+HOST_HEAP_TRIM role=source-cpu seconds=0.000179
+HOST_HEAP_TRIM role=source-cpu seconds=0.000250
+HOST_HEAP_TRIM role=source-cpu seconds=0.000257
+HOST_HEAP_TRIM role=source-cpu seconds=0.000163
+HOST_HEAP_TRIM role=source-cpu seconds=0.000146
+HOST_HEAP_TRIM role=source-cpu seconds=0.000219
+HOST_HEAP_TRIM role=source-cpu seconds=0.000245
+{"result": "PASS", "process": true, "horizon": 24, "rollout": 32, "bound": 80, "bounded_graph_uid_max": [32, 64, 64, 64, 64, 64, 64, 64, 64, 64], "unbounded_graph_uid_max": [32, 64, 96, 128, 160, 192, 224, 256, 288, 320], "bounded_detached": [0, 0, 64, 128, 192, 256, 320, 384, 448, 512], "dropped": 0.0}
+
+GATE v3-efeb5bb-horizon-bound EXIT 0
+
+EXIT 0

@@ -1,0 +1,16 @@
+W1026 12:43:51.853000 65 torch/_logging/_internal.py:1130] [0/0] 
+W1026 12:43:51.853000 65 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 12:43:51.853000 65 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 12:43:51.853000 65 torch/_logging/_internal.py:1130] [0/0] 
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+SOURCE_VARIANTS {"frames": 1024, "width": 192, "layers": 4, "blocks": "2,3", "variants": {"full": {"saved_KiB_per_frame": 0.0, "retained_KiB_per_frame": 556.43115234375, "encode_s": 0.2649854470510036, "vjp_s": 0.11084658093750477, "rel_err_vs_full": 0.0, "rel_err_vs_fp32": 0.011480433913212167}, "ckpt_all": {"saved_KiB_per_frame": 0.0, "retained_KiB_per_frame": 198.85693359375, "encode_s": 0.3004647991620004, "vjp_s": 0.15022793412208557, "rel_err_vs_full": 0.0007793788313297825, "rel_err_vs_fp32": 0.011588694430721986}, "ckpt_part": {"saved_KiB_per_frame": 0.0, "retained_KiB_per_frame": 377.64404296875, "encode_s": 0.23755134991370142, "vjp_s": 0.11952321999706328, "rel_err_vs_full": 0.0007811807220054149, "rel_err_vs_fp32": 0.01158896182582218}, "noflash": {"saved_KiB_per_frame": 0.0, "retained_KiB_per_frame": 638.814453125, "encode_s": 0.24520032806321979, "vjp_s": 0.0974935838021338, "rel_err_vs_full": 0.0013011591831928189, "rel_err_vs_fp32": 0.012298859112543593}, "fp32": {"saved_KiB_per_frame": 0.0, "retained_KiB_per_frame": 1174.87744140625, "encode_s": 0.21922109997831285, "vjp_s": 0.09045802406035364, "rel_err_vs_full": 0.011601037446743102, "rel_err_vs_fp32": 0.0}}}
+full       saved     0.0 KiB/f  retained   556.4 KiB/f  encode 0.265 s  vjp 0.111 s  err/full 0.00e+00  err/fp32 1.15e-02
+ckpt_all   saved     0.0 KiB/f  retained   198.9 KiB/f  encode 0.300 s  vjp 0.150 s  err/full 7.79e-04  err/fp32 1.16e-02
+ckpt_part  saved     0.0 KiB/f  retained   377.6 KiB/f  encode 0.238 s  vjp 0.120 s  err/full 7.81e-04  err/fp32 1.16e-02
+noflash    saved     0.0 KiB/f  retained   638.8 KiB/f  encode 0.245 s  vjp 0.097 s  err/full 1.30e-03  err/fp32 1.23e-02
+fp32       saved     0.0 KiB/f  retained  1174.9 KiB/f  encode 0.219 s  vjp 0.090 s  err/full 1.16e-02  err/fp32 0.00e+00
+
+GATE v3-efeb5bb-variants EXIT 0
+
+EXIT 0
