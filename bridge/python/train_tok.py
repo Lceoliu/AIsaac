@@ -585,6 +585,13 @@ def merge_jobs(halves):
     j['prof'], j['worker'], j['lane_stat'] = sum_dict('prof'), sum_dict('worker'), sum_dict('lane_stat')
     j['stats'] = np.concatenate([h['stats'] for h in halves])
     j['teach'], j['v2'], j['choices'] = cat_rec('teach'), cat_rec('v2'), cat_rec('choices')
+    # (rule 5) every actor's branches in flight: their ancestors keep [length - H, shared) (2026-10-26; before,
+    # dict(halves[0]) kept the first actor's report only and the second's ancestors got values only)
+    if any(h.get('lineage') is not None for h in halves):
+        j['lineage'] = sorted({tuple(x) for h in halves for x in h.get('lineage') or ()})
+    if any(h.get('lineage_src') is not None for h in halves):   # (ISAAC_LINEAGE_SOURCES)
+        j['lineage_src'] = {k: sorted({tuple(x) for h in halves for x in (h.get('lineage_src') or {}).get(k, ())})
+                            for k in {k for h in halves for k in (h.get('lineage_src') or {})}}
     j['cpu_collect'] = float(np.mean([h.get('cpu_collect', 0.0) for h in halves]))
     j['proc_cores'] = float(sum(h.get('proc_cores', 0.0) for h in halves))
     j['dec_min'] = min(h.get('dec_min', 0.0) for h in halves)
