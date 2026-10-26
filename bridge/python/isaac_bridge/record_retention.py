@@ -230,6 +230,33 @@ def in_flight_frontier(frontier, lineage, horizon):
     return frontier
 
 
+def grace_keep(recent, uids, update, grace):
+    """(rule 5, D2a) episodes seen in the last `grace` updates (in a rollout or in an actor's lineage report):
+    recent {uid: last update seen} is refreshed with uids and pruned; returns the uids still kept. The learner
+    keeps their source values; the frames a branch can still read come from its lineage report
+    (in_flight_frontier), not from this."""
+    for u in uids: recent[u] = update
+    for u in [u for u, t in recent.items() if update - t > grace]: del recent[u]
+    return set(recent)
+
+
+def learner_frontier(requests, ledger, teach_contexts, v2_contexts, reach, values_only, horizon):
+    """The learner's frontiers for SourcePipeline.retain_histories (2026-10-26, from train_tok's
+    horizon_frontiers): each requested history's first decision in this rollout; the stored records'
+    reachable ranges (RecordLedger.frontier); the in-flight branches' ancestors' ranges (in_flight_frontier,
+    reach = (ancestor, shared, length) triples); an empty interval list (values only) for the other uids in
+    values_only (in-flight ancestors without reachable frames, ended episodes in their grace period).
+    requests: RawHistory objects. Returns (frontiers, the rollout's own {uid: first decision})."""
+    frontier = {}
+    for h in requests:
+        frontier[h.uid] = min(frontier.get(h.uid, h.length), h.length)
+    rollout = dict(frontier)
+    frontier = ledger.frontier(frontier, teach_contexts, v2_contexts, horizon)
+    in_flight_frontier(frontier, reach, horizon)
+    for uid in values_only: frontier.setdefault(uid, [])
+    return frontier, rollout
+
+
 def lineage(slot_lists=(), context_dicts=()):
     """Ancestor episodes of branches in flight (lanes, the choice-point bank,
     contexts awaiting publication): the learner keeps their source values."""
