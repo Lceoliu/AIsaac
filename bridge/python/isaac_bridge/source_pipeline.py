@@ -515,8 +515,8 @@ class SourcePipeline:
     def observe_busy(self):
         """(once per update, before the events are cleared) each source card's work since the last call:
         encode + writer + source_backward seconds. With balance, the assignment weight of each card follows the
-        ratio of its moving median (last 5 updates) to the cards' mean (integral control, square root step,
-        clamped to [1/4, 4]); returns the seconds per card."""
+        ratio of its moving median (last 5 updates) to the cards' mean (integral control, square root step
+        clamped to x[0.8, 1.25] per update, weights clamped to [1/4, 4]); returns the seconds per card."""
         per = {str(d): 0. for d in self.devices}
         for e in self.events:
             if e['kind'] in ('encode', 'writer', 'source_backward') and e['device'] in per:
@@ -526,7 +526,8 @@ class SourcePipeline:
         if self.balance and all(len(h) >= 2 for h in self.busy_hist):
             med = np.asarray([np.median(h) for h in self.busy_hist])
             if med.mean() > 0:
-                w = self.balance_weight * np.sqrt(np.maximum(med, 1e-3) / med.mean())
+                # (each update moves a weight by at most x1.25: a rollout's new blocks are not all pushed onto one card)
+                w = self.balance_weight * np.clip(np.sqrt(np.maximum(med, 1e-3) / med.mean()), 0.8, 1.25)
                 self.balance_weight = np.clip(w / np.exp(np.log(w).mean()), 0.25, 4.0)
         return per
 
@@ -783,9 +784,10 @@ class SourcePipeline:
                 group=block_parts[lo:lo+blocks_per_batch]
                 incoming=sum(int(costs[indices].sum()) for key,indices in group)
                 frac=(np.asarray(loads)+incoming)*scales/budgets
-                # (balance: the least measured work among the cards whose memory budget still holds the group;
+                # (balance: the least measured work among the cards whose memory budget still holds the group with
+                # 20% left for the VJP's transient peak (t8 on f2fe8bb: a card filled to 20 GiB OOMed in its VJP);
                 # a cpu worker has no budget)
-                fits=(frac<=1)|np.asarray([d.type!='cuda' for d in self.devices])
+                fits=(frac<=0.8)|np.asarray([d.type!='cuda' for d in self.devices])
                 worker=int(np.argmin(np.where(fits,frac*self.balance_weight,np.inf)) if self.balance and fits.any()
                            else np.argmin(frac))
                 for key,indices in group:
