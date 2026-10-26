@@ -1021,8 +1021,12 @@ class SourcePipeline:
                 if cid is not None and cid < len(self.chunks):
                     keys = sorted([list(k[0]), int(k[1])] for k, (c_, o_) in self.frames.items() if c_ == cid and o_ in rows)[:12]
             import json
+            # (drop_context: the learner's own history of these episodes: who reported them in flight, when
+            # each reading record was admitted; set by train_tok, measurement only)
+            ask = sorted(hit | {tuple(r['uid']) for r in readers} | {tuple(a) for r in readers for a, _ in r['origin']})
+            learner = self.drop_context(ask) if getattr(self, 'drop_context', None) is not None else None
             print('SOURCE_DROP_FIRST ' + json.dumps(dict(field=field, total=float(total), version=self.version,
-                  meta=result.get('_detached_meta'), keys=keys, batch=ctx), default=str), flush=True)
+                  meta=result.get('_detached_meta'), keys=keys, batch=ctx, learner=learner), default=str), flush=True)
 
     @torch.no_grad()
     def _credit(self, refs, chunks, field, gradient):
