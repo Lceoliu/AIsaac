@@ -125,3 +125,7 @@ if __name__ == '__main__':
     if sys.platform == 'win32': os.environ.setdefault('ISAAC_HOST_TRIM_INTERVAL', '0')
     arg = sys.argv[sys.argv.index('--sources') + 1] if '--sources' in sys.argv else 'cpu,cpu'
     main(arg.split(','))
+    if arg.startswith('cuda'):
+        # (every check has passed and been printed: leave without the interpreter's CUDA / IPC teardown, which
+        # crashed with SIGSEGV after PASS in one gate run, as the source processes' did before they os._exit)
+        sys.stdout.flush(); sys.stderr.flush(); os._exit(0)
