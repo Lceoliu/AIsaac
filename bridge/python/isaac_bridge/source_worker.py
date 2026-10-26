@@ -23,6 +23,14 @@ def ipc_export(values):
     if not tensors or next(iter(tensors.values())).device.type!='cuda':
         return {k:v.detach() if torch.is_tensor(v) else v for k,v in values.items()}
     from train_tok import ipc_safe_allocator
+    with _EXPORT_LOCK:   # (the allocator setting is process-wide: a concurrent VJP thread's export must not interleave)
+        return _ipc_export(values, tensors, ipc_safe_allocator)
+
+
+_EXPORT_LOCK = threading.Lock()
+
+
+def _ipc_export(values, tensors, ipc_safe_allocator):
     restore=ipc_safe_allocator()
     reply=dict(values)
     try:
@@ -83,6 +91,7 @@ def memory_breakdown(local, exports, device):
 
 def source_worker(connection, model, device, options, vjp_connection=None):
     from .source_pipeline import SourcePipeline, source_parameter
+    import faulthandler; faulthandler.enable(all_threads=True)   # (a native crash prints every thread's stack)
     if os.environ.get('ISAAC_SOURCE_MPS_PRIORITY'):
         os.environ['CUDA_MPS_CLIENT_PRIORITY']=os.environ['ISAAC_SOURCE_MPS_PRIORITY']
     torch.set_num_threads(1)
@@ -102,6 +111,34 @@ def source_worker(connection, model, device, options, vjp_connection=None):
     exports={}
     breakdown_on=os.environ.get('ISAAC_SOURCE_MEMORY_BREAKDOWN')=='1' and device.type=='cuda'
     breakdown,vjp={},{}
+    # --source-streams >= 2 (with the separate VJP connection): each VJP runs in its own thread while this one
+    # keeps serving encodes and Writers. CUDA: a pool of streams, the one for new work advancing at every VJP;
+    # autograd runs each backward op on its forward op's stream, so a VJP over the graphs of earlier periods
+    # does not queue behind the encodes of the current one. Explicit dependencies: an encode / Writer records
+    # an event after its export (the default stream waits on it before the IPC send); a Writer's stream waits
+    # on the events of the chunks it reads and records its use of their u (the allocator keeps that storage
+    # until the Writer's stream is past it); a VJP's streams wait on the default stream (the cotangents'
+    # IPC imports) and the default stream waits on all of them before the gradients are exported. Freed VJP
+    # workspace is reused by later work on the same stream only (the caching allocator is per stream).
+    concurrent=int(getattr(local,'streams',0) or 0)>=2 and vjp_connection is not None
+    pool=[torch.cuda.Stream(device) for _ in range(4)] if concurrent and device.type=='cuda' else None
+    period=[0]   # (VJPs received: the stream of new work)
+    events_lock=threading.Lock()
+    vjp_thread=[None]
+    local.concurrent_vjp=concurrent
+    shuffle=None
+    if os.environ.get('ISAAC_SOURCE_STREAM_SHUFFLE'):   # (test aid: random host and device delays at every step)
+        import random, time as time_
+        rng_=random.Random(int(os.environ['ISAAC_SOURCE_STREAM_SHUFFLE']) * 7919 + (device.index or 0))
+        shuffle_lock=threading.Lock()
+        def shuffle():
+            with shuffle_lock: delay,cycles=rng_.uniform(0,.02),rng_.randrange(0,4_000_000)
+            if device.type=='cuda':torch.cuda._sleep(cycles)
+            time_.sleep(delay)
+        local.vjp_group_hook=shuffle
+    def new_work():
+        from contextlib import nullcontext
+        return torch.cuda.stream(pool[period[0]%len(pool)]) if pool is not None else nullcontext()
     def dispatch(connection,message):
         nonlocal retired,gradient_reply,last_cotangents,exports,breakdown
         command,payload,version,state=message
@@ -116,15 +153,20 @@ def source_worker(connection, model, device, options, vjp_connection=None):
             if command=='encode':
                 cid,parts,keys=payload
                 before=torch.cuda.memory_allocated(device) if breakdown_on else 0
-                result=local._encode(0,parts,version,keys=keys)
+                done=None
+                with new_work():
+                    if shuffle is not None:shuffle()
+                    result=local._encode(0,parts,version,keys=keys)
+                    reply=ipc_export({k:v for k,v in result.items() if k!='grads'})
+                    if pool is not None:done=torch.cuda.Event();done.record()
+                if done is not None:torch.cuda.current_stream(device).wait_event(done)
                 alloc=torch.cuda.memory_allocated(device)-before if breakdown_on else 0
                 future=Future();future.set_result(result)
                 local.chunks.extend([None]*max(0,cid+1-len(local.chunks)))
                 uids={key[0] for key in keys}
                 local.chunks[cid]=dict(worker=0,future=future,version=version,
-                                       uid=next(iter(uids)) if len(uids)==1 else None,rows=len(keys),alloc=alloc)
+                                       uid=next(iter(uids)) if len(uids)==1 else None,rows=len(keys),alloc=alloc,event=done)
                 for offset,key in enumerate(keys): local.frames[key]=(cid,offset)
-                reply=ipc_export({k:v for k,v in result.items() if k!='grads'})
                 exports['encode',cid]=reply
                 if os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
                     # Reader uses the compact IPC copy. Preserve the original
@@ -135,12 +177,24 @@ def source_worker(connection, model, device, options, vjp_connection=None):
             elif command=='write':
                 wid,keys=payload
                 before=torch.cuda.memory_allocated(device) if breakdown_on else 0
-                result=local._write(0,keys,version)
+                done=None
+                with new_work():
+                    if shuffle is not None:shuffle()
+                    if pool is not None:
+                        stream=torch.cuda.current_stream(device)
+                        for cid in {local.frames[key][0] for block in keys for key in block}:
+                            chunk=local.chunks[cid]
+                            if chunk.get('event') is not None:stream.wait_event(chunk['event'])
+                            u=chunk['future'].result()['u']
+                            if torch.is_tensor(u):u.record_stream(stream)
+                    result=local._write(0,keys,version)
+                    reply=ipc_export(dict(mem=result['mem']))
+                    if pool is not None:done=torch.cuda.Event();done.record()
+                if done is not None:torch.cuda.current_stream(device).wait_event(done)
                 alloc=torch.cuda.memory_allocated(device)-before if breakdown_on else 0
                 future=Future();future.set_result(result)
                 local.writes.extend([None]*max(0,wid+1-len(local.writes)))
-                local.writes[wid]=dict(worker=0,future=future,version=version,uid=keys[0][0][0],alloc=alloc)
-                reply=ipc_export(dict(mem=result['mem']))
+                local.writes[wid]=dict(worker=0,future=future,version=version,uid=keys[0][0][0],alloc=alloc,event=done)
                 exports['write',wid]=reply
                 if os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
                     result['mem']=torch.autograd.graph.get_gradient_edge(result['mem'])
@@ -158,7 +212,12 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 if breakdown_on:
                     torch.cuda.synchronize(device);vjp_before=torch.cuda.memory_allocated(device)
                     torch.cuda.reset_peak_memory_stats(device)
-                reply=ipc_export(local._backward(0,decoded,retain))
+                if pool is not None:   # (the forward streams the VJP's ops run on see the imported cotangents)
+                    for stream in pool:stream.wait_stream(torch.cuda.current_stream(device))
+                grads=local._backward(0,decoded,retain)
+                if pool is not None:   # (and the gradients are exported after all of them)
+                    for stream in pool:torch.cuda.current_stream(device).wait_stream(stream)
+                reply=ipc_export(grads);del grads
                 if breakdown_on:   # (the VJP's own peak: synchronized, so the peak is this call's)
                     torch.cuda.synchronize(device);peak=torch.cuda.max_memory_allocated(device)
                     if peak>=vjp.get('vjp_peak',0):   # (the largest since the last retire)
@@ -244,8 +303,9 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                                 h,t=component_calls.get(key,(0,0))
                                 component_calls[key]=(h+hits,t+total)
                 memory['component_calls']=component_calls
-            connection.send(('ok',reply,list(local.events),memory))
-            local.events.clear()
+            with events_lock:   # (two threads append; send the ones present, keep any appended meanwhile)
+                sent=list(local.events);del local.events[:len(sent)]
+            connection.send(('ok',reply,sent,memory))
             # Imported cotangents are released before the next request. Keep
             # reply storage alive until the consumer has received its IPC handle.
             del payload,state
@@ -267,16 +327,30 @@ def source_worker(connection, model, device, options, vjp_connection=None):
             dispatch(connection,message)
             served+=1
         return served
-    if vjp_connection is not None:local.service_forward=service_forward
+    if vjp_connection is not None and not concurrent:local.service_forward=service_forward
     while True:
         if deferred:
             channel,message=connection,deferred.popleft()
         else:
             channel=wait([connection,vjp_connection] if vjp_connection is not None else [connection])[0]
             message=channel.recv()
+        if concurrent and channel is vjp_connection and message[0]=='backward':
+            if vjp_thread[0] is not None:vjp_thread[0].join()   # (one interval at a time, as the learner sends)
+            period[0]+=1   # (new encodes / Writers from here on: the next stream of the pool)
+            vjp_thread[0]=threading.Thread(target=dispatch,args=(channel,message),name='source-vjp',daemon=True)
+            vjp_thread[0].start()
+            continue
+        if message[0]=='close' and vjp_thread[0] is not None:vjp_thread[0].join()
         if dispatch(channel,message):break
     local.close();connection.close()
     if vjp_connection is not None:vjp_connection.close()
+    if device.type=='cuda':
+        # (2026-10-26) Everything is settled and replied; leave without the interpreter's teardown. The
+        # CUDA gate runs saw source processes exit with SIGSEGV (-11) after a clean close, without a Python
+        # frame under faulthandler (native teardown of the CUDA context / IPC state), in 2 of 3 runs.
+        import sys
+        torch.cuda.synchronize(device);sys.stdout.flush();sys.stderr.flush()
+        os._exit(0)
 
 
 class SourceProcess:
