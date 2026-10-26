@@ -38,7 +38,8 @@ def main(sources):
     seq = TS.make_seq(rng, nw=W, T=8 * R + 1, changes={(0, 6), (1, 9), (2, 13)}, resets=set(), exits=set())
     pend = [M.synth_pending(rng, W, base.heads) for _ in seq]
     runs = {}
-    for name, streams, shuffle in (('S', 0, None), ('C1', 2, '1'), ('C2', 2, '2')):
+    variants = [('S', 0, None), ('C1', 2, '1'), ('C2', 2, '2')] + ([('S2', 0, None)] if cuda else [])
+    for name, streams, shuffle in variants:
         if shuffle: os.environ['ISAAC_SOURCE_STREAM_SHUFFLE'] = shuffle
         else: os.environ.pop('ISAAC_SOURCE_STREAM_SHUFFLE', None)
         print('RUN', name, flush=True)
@@ -79,18 +80,25 @@ def main(sources):
     os.environ.pop('ISAAC_SOURCE_STREAM_SHUFFLE', None)
     S = runs['S']
     report = {}
+    def rel(P, Q):
+        return max(float((a - b).abs().max() / b.abs().max().clamp_min(1e-30))
+                   for pa, pb in zip(P['params'], Q['params']) for a, b in zip(pa, pb))
+    # (CUDA: the serial schedule run twice; atomics in index_add_ / scatter make it not bitwise reproducible)
+    noise = rel(runs['S2'], S) if cuda else 0.
     for name in ('C1', 'C2'):
         C = runs[name]
         assert C['versions'] == S['versions'] and C['encoded'] == S['encoded'], (name, C['versions'], S['versions'])
         diff = max(float((a - b).abs().max() / b.abs().max().clamp_min(1e-30))
                    for pa, pb in zip(C['params'], S['params']) for a, b in zip(pa, pb))
         bitwise = all(torch.equal(a, b) for pa, pb in zip(C['params'], S['params']) for a, b in zip(pa, pb))
-        assert bitwise if not cuda else diff <= 1e-6, (name, diff)
+        print('DIFF', name, diff, 'serial-vs-serial', noise, flush=True)
+        assert bitwise if not cuda else diff <= max(1e-6, 2 * noise), (name, diff, noise)
         assert C['concurrent'] and C['overlap'] > 0, (name, C['concurrent'], C['overlap'])
         report[name] = dict(bitwise=bitwise, max_rel_param_diff=diff, encodes_inside_vjp=C['overlap'], vjps=C['vjps'])
     assert all(r['dropped'] == 0 for r in runs.values()), {k: r['dropped'] for k, r in runs.items()}
     assert not S['concurrent']
-    print(json.dumps(dict(result='PASS', sources=sources, serial_encodes_inside_vjp=S['overlap'], **report)))
+    print(json.dumps(dict(result='PASS', sources=sources, serial_encodes_inside_vjp=S['overlap'],
+                          serial_repeat_rel_diff=noise, **report)))
 
 
 if __name__ == '__main__':
