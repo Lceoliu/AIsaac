@@ -2674,20 +2674,23 @@ def main(argv=None, child=None, actor=None):
             in_flight_reach = set().union(*L['lineage'].values())
             in_flight = {a_ for a_, _, _ in in_flight_reach}
             if os.environ.get('ISAAC_LINEAGE_SOURCES') and source_pipeline is not None:
-                ring_ = L.setdefault('lineage_ring', collections.deque(maxlen=64))
-                ring_.append((source_pipeline.version, L['update'], job.get('aid', 0), job.get('lineage_src')))
+                # per episode and holder: the first and the last report (source version, update, actor, item)
+                seen_ = L.setdefault('lineage_seen', {})
+                mark_ = (source_pipeline.version, L['update'], job.get('aid', 0))
+                for k_, items_ in (job.get('lineage_src') or {}).items():
+                    for item_ in items_:
+                        e_ = seen_.setdefault(tuple(item_[0]), {}).setdefault(k_, [mark_ + tuple(item_[1:]), None])
+                        e_[1] = mark_ + tuple(item_[1:])
+                if len(seen_) > 50000:
+                    for k_ in list(seen_)[:len(seen_) - 50000]: del seen_[k_]
+                L.setdefault('jobs_seen', []).append(mark_ + (job.get('lineage_src') is not None,))
+                del L['jobs_seen'][:-400]
                 if getattr(source_pipeline, 'drop_context', None) is None:
                     def drop_context(uids, L=L):
-                        uids = set(uids); out = dict(reported=[], admitted={})
-                        for version_, update_, aid_, src_ in L.get('lineage_ring', ()):
-                            for k_, items_ in (src_ or {}).items():
-                                for item_ in items_:
-                                    if tuple(item_[0]) in uids:
-                                        out['reported'].append([version_, update_, aid_, k_] + list(item_))
-                        for uid_, at_ in L.get('admitted_v2', {}).items():
-                            if uid_ in uids: out['admitted'][str(uid_)] = at_
-                        out['reported'] = out['reported'][-200:]
-                        return out
+                        uids = set(uids)
+                        return dict(seen={str(u_): L.get('lineage_seen', {}).get(u_) for u_ in uids},
+                                    admitted={str(u_): a_ for u_, a_ in L.get('admitted_v2', {}).items() if u_ in uids},
+                                    jobs=L.get('jobs_seen', [])[-80:])
                     source_pipeline.drop_context = drop_context
             if args.release_raw:
                 # A branch forked shortly before its parent ended can be published after the
@@ -2726,6 +2729,7 @@ def main(argv=None, child=None, actor=None):
                 in_flight_frontier(frontier, in_flight_reach, args.memory_horizon)
                 for uid in in_flight: frontier.setdefault(uid, [])   # (grace: values only, no pending loss)
                 return frontier
+            source_pipeline.retain_mark = (L['update'], 'rollout')   # (measurement: which retain call detached)
             if not retire_after_ready:source_pipeline.retain_histories(live_uids,frontiers=horizon_frontiers())
             sec('rc_prep')   # (timing only: the recompute pass split into the job's preparation, its sources, the forward)
             # Source values are immutable across fast/slow weight updates. Build
@@ -3406,6 +3410,7 @@ def main(argv=None, child=None, actor=None):
                     if was_pending and source_pipeline.pending is None:
                         live_now = live_uids | {h.uid for h in L.get('v2_contexts', []) if h is not None}
                         live_now.update(h.uid for h in L.get('teach_contexts', []) if h is not None)
+                        source_pipeline.retain_mark = (L['update'], 'after_vjp')
                         source_pipeline.retain_histories(live_now,overlap=source_pipeline.defer_backward,
                                                          frontiers=horizon_frontiers())
                 opt.zero_grad(set_to_none=True)
@@ -3493,6 +3498,7 @@ def main(argv=None, child=None, actor=None):
                     if retire_after_ready:
                         live_now=live_uids | {h.uid for h in L.get('v2_contexts',[]) if h is not None}
                         live_now.update(h.uid for h in L.get('teach_contexts',[]) if h is not None)
+                        source_pipeline.retain_mark = (L['update'], 'after_ready')
                         source_pipeline.retain_histories(live_now,overlap=True,frontiers=horizon_frontiers())
                         retire_after_ready=False
                     source_pipeline.dispatch_finish()
