@@ -207,14 +207,18 @@ def release_raw(limit, block, slot_lists=(), context_lists=(), context_dicts=())
 def lineage_intervals(slot_lists=(), context_dicts=()):
     """(ancestor uid, frames it shares, the branch's current length) of branches in flight (lanes, the
     choice-point bank, contexts awaiting publication): what in_flight_frontier needs."""
-    out = set()
+    # One triple per (ancestor, shared): the shortest branch, i.e. the widest [length - H, shared); the union
+    # over longer branches' ranges is the same interval (2026-10-26: the per-context triples were ~10^5 a hand-off)
+    low = {}
     for raw in slot_lists:
         for h in raw or ():
-            if h is not None and h.length: out.update((a, n, h.length) for a, n in h.origin)
+            if h is not None and h.length:
+                for a, n in h.origin: low[a, n] = min(low.get((a, n), h.length), h.length)
     for table in context_dicts:
         for h in (table or {}).values():
-            if h is not None: out.update((a, n, h.length) for a, n in h.origin)
-    return out
+            if h is not None:
+                for a, n in h.origin: low[a, n] = min(low.get((a, n), h.length), h.length)
+    return {(a, n, l) for (a, n), l in low.items()}
 
 
 def in_flight_frontier(frontier, lineage, horizon):
@@ -222,11 +226,15 @@ def in_flight_frontier(frontier, lineage, horizon):
     decide at or after the branch's current length l, so at most [l - H, shared) (no horizon: [0, shared)).
     Added to frontier's intervals ({uid: [(lo, hi), ...]}); an ancestor with nothing reachable gets no
     interval (values only), as before."""
+    widest = {}   # (several actors may report the same ancestor and shared count: the lowest lo)
     for a, shared, length in lineage:
         lo = length - horizon if horizon else 0
+        if lo < shared: widest[a, shared] = min(widest.get((a, shared), lo), lo)
+        elif a not in frontier: frontier[a] = []
+    for (a, shared), lo in widest.items():
         reach = frontier.setdefault(a, [])
         if not isinstance(reach, list): reach = frontier[a] = []   # (a stale number: lists only here)
-        if lo < shared and (lo, shared) not in reach: reach.append((lo, shared))
+        reach.append((lo, shared))
     return frontier
 
 
