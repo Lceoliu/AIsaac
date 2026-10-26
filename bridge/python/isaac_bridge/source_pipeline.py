@@ -402,7 +402,7 @@ class SourcePipeline:
             uids_ = [c['uid']] if c.get('uid') is not None else sorted(c.get('uids', ()))
             result['_detached_meta'] = dict(kind='write' if 'last_start' in c else 'chunk', uids=[list(u) for u in uids_],
                 span=[c.get('first', c.get('first_start')), c.get('last', c.get('last_start'))], rows=c.get('rows'),
-                encoded_version=c.get('version'), detached_at_version=self.version,
+                encoded_version=c.get('version'), detached_at_version=self.version, retain_mark=getattr(self, 'retain_mark', None),
                 reach={str(u): reach.get(u) for u in uids_})
         if packets:
             futures = [w.submit(self._backward, i, packets, True, 'horizon_backward') for i, w in enumerate(self.workers)]
