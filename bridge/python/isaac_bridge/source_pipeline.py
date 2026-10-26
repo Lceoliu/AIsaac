@@ -827,17 +827,22 @@ class SourcePipeline:
         for (uid,worker), keys in new.items():
             self.replicas
             wid = len(self.writes)
-            future = self.workers[worker].submit(self._write, worker, keys, self.version,wid)
+            # (audit) blocks built on a released encoder chunk read its values: no cotangent can reach those
+            # frames through this write, so a later in-horizon cotangent on such a block is a lost gradient
+            stale = [o for o, block in enumerate(keys) if any(
+                (self.chunks[self.frames[key][0]] or {}).get('detached') for key in block)]
+            future = self.workers[worker].submit(self._write, worker, keys, self.version,wid,stale)
             self.writes.append(dict(worker=worker, future=future, version=self.version, uid=uid,remote_kind='write',remote_id=wid,
                                     first_start=min(block[0][1] for block in keys),last_start=max(block[0][1] for block in keys),
                                     chunks={self.frames[key][0] for block in keys for key in block}))
             for offset,key in enumerate(keys): self.blocks[key] = (wid,offset)
             self.written_blocks += len(keys)
 
-    def _write(self, worker, block_keys, version, wid=None):
+    def _write(self, worker, block_keys, version, wid=None, stale=()):
         if self.processes:
             result=self._remote(worker,'write',(wid,block_keys),version)
             result['grads']={}
+            if stale: result['_stale_rows'] = list(stale)
             return result
         started = time.perf_counter()
         replica, device = self.versions[version][worker], self.devices[worker]
@@ -864,7 +869,8 @@ class SourcePipeline:
         self.events.append(dict(kind='writer', device=str(device), version=version,
                                 rows=len(block_keys), start=started, end=time.perf_counter(),
                                 **(saving.stats() if self.saved_8bit else {})))
-        return dict(mem=mem, grads={}, **(saving.stats() if self.saved_8bit else {}))
+        return dict(mem=mem, grads={}, **(saving.stats() if self.saved_8bit else {}),
+                    **(dict(_stale_rows=list(stale)) if stale else {}))
 
     @torch.no_grad()
     def _gather_plan(self, plan, field, size):
@@ -995,7 +1001,14 @@ class SourcePipeline:
                 if field not in result['grads']:
                     result['grads'][field] = torch.zeros_like(result[field], dtype=torch.float32)
                 result['grads'][field].index_add_(0, put, packed[at:at+len(put)])
+                if result.get('_stale_rows'): self._drop_stale(packed[at:at+len(put)], put, result, field)
                 at += len(put)
+
+    def _drop_stale(self, gradient, put, result, field):
+        # (audit) cotangent of Writer blocks that read a released chunk's values: it cannot reach those frames
+        stale = torch.as_tensor(result['_stale_rows'], device=put.device)
+        hit = torch.isin(put, stale)
+        if bool(hit.any()): self._drop(gradient[hit], result, field + '_on_released_input', put[hit])
 
     def _drop(self, gradient, result=None, field=None, put=None):
         # Audit, not a correction: progress.csv must report exactly zero.
@@ -1041,7 +1054,9 @@ class SourcePipeline:
             value = result[field]
             if field not in result['grads']: result['grads'][field] = torch.zeros_like(value, dtype=torch.float32)
             part = gradient.index_select(0, take).to(value.device, non_blocking=True)
-            result['grads'][field].index_add_(0, torch.as_tensor([i for _, i in entries], device=value.device), part)
+            put = torch.as_tensor([i for _, i in entries], device=value.device)
+            result['grads'][field].index_add_(0, put, part)
+            if result.get('_stale_rows'): self._drop_stale(part, put, result, field)
 
     def collect(self, batch):
         self.check_version(batch.source_version)
