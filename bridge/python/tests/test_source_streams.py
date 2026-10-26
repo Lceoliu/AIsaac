@@ -41,6 +41,7 @@ def main(sources):
     for name, streams, shuffle in (('S', 0, None), ('C1', 2, '1'), ('C2', 2, '2')):
         if shuffle: os.environ['ISAAC_SOURCE_STREAM_SHUFFLE'] = shuffle
         else: os.environ.pop('ISAAC_SOURCE_STREAM_SHUFFLE', None)
+        print('RUN', name, flush=True)
         model = copy.deepcopy(base)
         pipe = SourcePipeline(model, sources, period=0, micro=8, update_rollouts=1, defer_backward=True,
                               processes=True, horizon=6, dispatch_at_close=True, streams=streams)
