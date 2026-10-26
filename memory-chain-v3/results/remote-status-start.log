@@ -1,19 +1,34 @@
- 15:01:59 up 14 days,  3:40,  6 users,  load average: 3.50, 3.84, 3.91
+ 15:54:43 up 14 days,  4:33,  7 users,  load average: 8.67, 9.35, 8.66
                total        used        free      shared  buff/cache   available
-Mem:             125          21          57           0          47         103
+Mem:             125          60          23           6          49          65
 Swap:              7           7           0
-0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 881 MiB, 13 %
-1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
-2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 12036 MiB, 0 %
-3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
-4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
-5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 881 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 2530 MiB, 5 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 807 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 2616 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1027 MiB, 6 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1071 MiB, 6 %
 6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
 7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
 APPS
 GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
 GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 2584001, 540 MiB
-GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 2671212, 12026 MiB
+GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4193352, 30 MiB
+GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 11039, 254 MiB
+GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 11552, 1612 MiB
+GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 82366, 634 MiB
+GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4193352, 30 MiB
+GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 11039, 768 MiB
+GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 4193352, 30 MiB
+GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 4187390, 1630 MiB
+GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 11039, 274 MiB
+GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 82363, 672 MiB
+GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 4193352, 30 MiB
+GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 11039, 254 MiB
+GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 82384, 752 MiB
+GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 4193352, 30 MiB
+GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 11039, 254 MiB
+GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 82401, 794 MiB
 GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
 GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
 GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
@@ -28,6 +43,7 @@ GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
 GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
 GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
 CONTAINERS
+aisaac-bench-memory-v3-v3-efeb5bb-t8b-10260852 Up About a minute
 mouse-lab-model-router Up 2 weeks
 signbridge-api Up 2 weeks
 signbridge-web Up 2 weeks

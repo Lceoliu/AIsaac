@@ -1381,3 +1381,36 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 
 - rl `exp/memory-chain-v3` = 12af01c（合并主线 0053e5d + 快照 4），`exp/memory-chain-v3-timing` = efeb5bb，均已推送。
 - 3090：`memory-chain-v3-20261026-0707.tar.gz`，170,940,203 字节，sha256 `51830af257d4590de9d6e7c4e5d4deffa9e3b02d959cf38c0956c5d49de5a640`（第一次 scp 中途断开，同名的不完整文件已用完整上传覆盖，远端核对一致）；更早的两个 tar 未动。
+
+### 19.9 源卡上 encode 与 VJP 的多 stream 并发（`--source-streams 2`，默认 0；用户已允许）
+
+- 实现（主线 6b84d22 起，到 1cc515a；计时链对应到 f2fe8bb）：源进程里 VJP 在独立线程里跑，主线程继续处理 encode / Writer。原来主线程只在 VJP 的局组之间插队处理，现在不再插队。需要 `ISAAC_SOURCE_PREEMPT_VJP=1` 提供的独立 VJP 连接。
+  - CUDA 上用 4 条 stream 轮换，每来一次 VJP，新工作换到下一条。autograd 让每个反传算子跑在其前向所在的 stream 上，所以 VJP 处理前几个周期的图时，不会排在本周期的编码后面。
+  - 依赖都用事件显式表达：
+    - encode / Writer 导出后 record 事件，默认 stream 先 wait 这个事件，再做 IPC 发送。
+    - Writer 的 stream wait 它读的各块的事件，并对这些块的 u 做 `record_stream`，分配器在 Writer 的 stream 越过之前不会回收这块存储。
+    - VJP 用到的各 stream 先 wait 默认 stream（导入的余切）；VJP 结束后默认 stream wait 全部 stream，再导出梯度。
+    - VJP 释放的工作区只会被同一 stream 上之后的工作复用（缓存分配器按 stream 分池）。
+  - IPC 导出串行化，因为分配器设置是进程级的。
+- 第一次上卡就暴露了两个线程竞争（都已修，并补进门测的 `--production` 变体）：
+  1. checkpoint 块的重算在 VJP 线程里调用编译函数，主线程这时正在 Dynamo 追踪 → 重算改为在同一把（可重入）锁下进行。
+  2. VJP 线程给副本的 `named_parameters()` 设梯度时，并发的 encode 正把这些参数临时换成 BF16 cast（`_cast_context`）→ dtype 错。修法：副本创建时列出真实参数，VJP 用这张表；并发时 encode / Writer 整个调用持锁，重算也拿这把锁。
+- 另外：CUDA 门测里源进程在正常 close 之后偶发 SIGSEGV（-11），串行调度下也有，faulthandler 没有任何 Python 帧，属于原生 teardown。改为 close 回复之后 `os._exit(0)`（1e264df）。测试主进程在打印 PASS 后也有一次 SIGSEGV，同样处理。
+- 测试 `tests/test_source_streams.py`：串行（S）对比并发 + 故意打乱的调度（C1、C2：每次 encode / Writer 之前和 VJP 的每个局组之间，随机 host sleep，CUDA 上再加随机 `torch.cuda._sleep`）；horizon 6 让 detach / retire 在 VJP 进行中到达。
+  - CPU：参数和每次提交的源梯度都**逐位相同**，审计为 0，并确认有编码落在 VJP 区间之内。
+  - CUDA 门测（lr 0，比较每次提交的源梯度）：默认设置下 C 相对 S 是 6.8e-10 / 7.0e-10，S 重跑一遍与自身差 6.6e-10（index_add_ 原子操作的跑间噪声）；`--production`（编译、flash、BF16、checkpoint）下 C 相对 S 是 3.4e-10，S 重跑逐位相同。都在 1e-6 以内，门测通过。
+  - CPU 回归 72 个测试除新增外与上一轮相同；H=0 逐位等价通过（v3r12）。
+- **4 卡短跑（GPU2 仍被占用；均衡开、四块 checkpoint；f2fe8bb `t8st4` 对 efeb5bb `t8mck4`）：没有加速。**
+
+| | 不开并发 | `--source-streams 2` |
+|---|---|---|
+| 墙钟中位 / x_real_time | 13.19 s / 318.3× | 13.71 s / 300.6× |
+| 等源编码 ready_encode_wait | 4.16 s | **3.10 s** |
+| 等 VJP 提交 commit_wait | 0.21 s | **1.43 s** |
+| VJP 最慢一张卡 | 11.97 s | 13.13 s |
+| 三卡忙碌秒（cuda:0/2/3） | 13.9 / 14.7 / 14.0 | 14.7 / 15.5 / 14.4 |
+| 源卡峰值（nvidia-smi，物理卡 3/4/5） | 10.7 / 10.4 / 7.4 GiB | 13.8 / 12.4 / 8.7 GiB（**+1.3 到 +3.0 GiB**，两路工作区同时在） |
+| dropped_grad | 全 0 | 全 0 |
+
+  编码确实不用再排在 VJP 后面（等编码 −1.1 s），但 VJP 也随之变慢、更晚结束，学习器改为等提交（+1.2 s）。源卡在两者并发前就已经算满（忙碌秒大于墙钟），并发只能重新分配算力，不能凭空增加，所以墙钟没有下降（−4%，在单次运行的噪声范围内）。
+- 表 8（表 7 配置 40 次稳态）还没跑：要等 GPU2 空出来，5 卡布局才能起；等待脚本每 10 分钟检查一次，最多 8 小时。由于 4 卡上并发没有收益，表 8 用"均衡开、并发关"（`t8`），并发开另跑一组（`t8x`）对照。

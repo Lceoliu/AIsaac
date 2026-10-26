@@ -1,0 +1,7 @@
+ACTOR_TORCH_PROFILE {"kind": "rebuild", "pid": 66, "per_call": {"latency_ms": 2.134790411219001, "host_submit_ms": 2.0562639692798257, "wait_ms": 0.005534966476261616, "owner_device_ms": 636.1614552, "kernel_ms_all_streams": 638.4959074999947}, "graphs_before": 11, "graphs_after": 14}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "rebuild", "pid": 66, "kernel_ms_per_call": 43.69497733333346}
+PASS rebuild {"per_call": {"latency_ms": 2.134790411219001, "host_submit_ms": 2.0562639692798257, "wait_ms": 0.005534966476261616, "owner_device_ms": 636.1614552, "kernel_ms_all_streams": 638.4959074999947}, "sections": ["h.component_keys", "h.component_replay", "h.core_replay", "h.d2h", "h.grow_refresh", "h.h2d_uniform", "h.rawhistory_append", "h.reset_prefixes", "h.stage_pack", "h.state_tstate", "h.tdest", "h.writer_close"], "kernel_classes": {"other": 637.1780381999993, "gemm": 0.5818725999994241, "triton fused": 0.3368951999976321, "conv": 0.15331700000017354, "copy/memset": 0.1331240999999233, "attention/softmax": 0.05898009999943897, "index/gather/scatter": 0.041436899999657176, "reduce/norm": 0.0122433999995701}, "parts": {"p.core_eager": 39.6738, "m.type_emb": 0.0029, "m.variant_emb": 0.0026, "m.subtype_emb": 0.0026, "m.item_emb": 0.0025, "m.trinket_emb": 0.0025, "m.entity": 1.4503, "m.door": 0.1484, "m.norm": 0.0351, "m.reader_inp": 0.0024, "m.reader_layers": 0.003, "m.reader_ct": 0.7406, "m.pi": 0.0023, "m.value": 0.0974, "m.danger": 0.0028}}
+
+GATE v3-8dc664a-actorprof EXIT 0
+
+EXIT 0
