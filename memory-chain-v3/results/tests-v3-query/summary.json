@@ -1,0 +1,67 @@
+[
+ {
+  "name": "test_cf_smoke",
+  "exit": 0,
+  "seconds": 5.6
+ },
+ {
+  "name": "test_raw_release",
+  "exit": 0,
+  "seconds": 5.3
+ },
+ {
+  "name": "test_rebuild_memory_smoke",
+  "exit": 0,
+  "seconds": 6.0
+ },
+ {
+  "name": "test_record_retention",
+  "exit": 0,
+  "seconds": 5.3
+ },
+ {
+  "name": "test_source_dispatch_at_close",
+  "exit": 0,
+  "seconds": 6.1
+ },
+ {
+  "name": "test_source_horizon",
+  "exit": 0,
+  "seconds": 17.6
+ },
+ {
+  "name": "test_source_horizon_bound",
+  "exit": 0,
+  "seconds": 8.6
+ },
+ {
+  "name": "test_source_pending_horizon",
+  "exit": 0,
+  "seconds": 4.9
+ },
+ {
+  "name": "test_source_pending_release",
+  "exit": 0,
+  "seconds": 5.5
+ },
+ {
+  "name": "test_source_pipeline",
+  "exit": 0,
+  "seconds": 5.8
+ },
+ {
+  "name": "test_source_process",
+  "exit": 0,
+  "seconds": 15.5
+ },
+ {
+  "name": "test_source_reach_intervals",
+  "exit": 0,
+  "seconds": 6.2
+ },
+ {
+  "name": "test_source_record_query",
+  "exit": 0,
+  "seconds": 8.6
+ }
+]

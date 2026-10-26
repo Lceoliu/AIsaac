@@ -1,0 +1,37 @@
+===== actorgates (Mon Oct 26 00:31:23 2026)
+Actor capacity growth compiled graphs: 25 -> 25
+PASS CUDA Graph/eager logits, CRN actions, logp, values; variable batches, wrap, reset, fork, history growth 4.76837158203125e-07
+PASS actor version change reprojects stored values without any source re-encoding; snapshot isolation
+
+GATE v3-1727f71-rebuild-actor EXIT 0
+ 
+[gate v3-1727f71-rebuild-actor] EXIT 0
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1026 07:32:20.941000 66 torch/utils/_sympy/interp.py:176] [4/1] failed while executing pow_by_natural([VR[26, 16777215], VR[-1, -1]])
+PASS RebuildGraphActor temporal state written in the graph: prev_o, steps, prev_stage; other slots and K / V untouched
+
+GATE v3-1727f71-actor-state EXIT 0
+ 
+[gate v3-1727f71-actor-state] EXIT 0
+PASS branch records: crn_uniforms(crn, t); plain records: fresh uniforms (not shared across workers)
+
+GATE v3-1727f71-actor-crn EXIT 0
+ 
+[gate v3-1727f71-actor-crn] EXIT 0
+W1026 07:32:52.054000 66 torch/_logging/_internal.py:1130] [0/0] 
+W1026 07:32:52.054000 66 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 07:32:52.054000 66 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 07:32:52.054000 66 torch/_logging/_internal.py:1130] [0/0] 
+PASS layer checkpoint: source gradients as the full graph {"frames": 512, "gradient_relative_error": 0.0009207396577410866, "worst_tensor_relative_error": 0.007847469157468446, "max_param_difference": 0.0006400831043720245, "saved_bytes_per_frame": {"full": 182827.703125, "checkpoint": 119669.578125}, "retained_bytes_per_frame": {"full": 201873.0, "checkpoint": 108415.0}, "vjp_seconds": {"full": 0.22142378613352776, "checkpoint": 1.2641207510605454}}
+
+GATE v3-1727f71-layer-ckpt EXIT 0
+ 
+[gate v3-1727f71-layer-ckpt] EXIT 0

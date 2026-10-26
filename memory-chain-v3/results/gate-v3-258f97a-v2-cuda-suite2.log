@@ -1,0 +1,569 @@
+Actor capacity growth compiled graphs: 25 -> 25
+PASS CUDA Graph/eager logits, CRN actions, logp, values; variable batches, wrap, reset, fork, history growth 4.76837158203125e-07
+PASS actor version change reprojects stored values without any source re-encoding; snapshot isolation
+{
+  "result": "PASS",
+  "learner": "cuda:0",
+  "sources": "cuda:1,cuda:2",
+  "queries": 8192,
+  "reader_micro": 0,
+  "logits_max_abs": 1.1175870895385742e-08,
+  "source_gradient_max_abs": 1.7173588275909424e-06,
+  "weights_max_abs": 2.5779008865356445e-06,
+  "early_room_gradient": 0.0007586564752273262,
+  "fast_steps": 2,
+  "source_steps": 1,
+  "version": 1,
+  "first_cycle_unique_source_rows": 256,
+  "encoder_replay": 0,
+  "encoded_rows": 257,
+  "reused_rows": 768,
+  "events": [
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203151.761029067,
+      "end": 1203152.393752247
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203151.759815483,
+      "end": 1203152.394464037
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.393998856,
+      "end": 1203152.406899559
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.394678537,
+      "end": 1203152.409956147
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.407021368,
+      "end": 1203152.418519803
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.410148429,
+      "end": 1203152.423870697
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.418694448,
+      "end": 1203152.430254436
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.424014664,
+      "end": 1203152.437350185
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.43038056,
+      "end": 1203152.441575051
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.437517127,
+      "end": 1203152.45033225
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.44169259,
+      "end": 1203152.452720225
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.450490867,
+      "end": 1203152.462915478
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.452891312,
+      "end": 1203152.463942765
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.464104442,
+      "end": 1203152.475309412
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.463033651,
+      "end": 1203152.475388323
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.475554182,
+      "end": 1203152.48716191
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.475646259,
+      "end": 1203152.487676893
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.487271652,
+      "end": 1203152.498974319
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.487849708,
+      "end": 1203152.49952847
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.49909667,
+      "end": 1203152.510635019
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.49969072,
+      "end": 1203152.511413701
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.510729396,
+      "end": 1203152.522045412
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.511515118,
+      "end": 1203152.523397791
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.52213564,
+      "end": 1203152.53394163
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.523658578,
+      "end": 1203152.537016747
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.534077185,
+      "end": 1203152.545231234
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.537156065,
+      "end": 1203152.548669446
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.545349792,
+      "end": 1203152.55623219
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.548807941,
+      "end": 1203152.560483462
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.556349923,
+      "end": 1203152.567823811
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.560622492,
+      "end": 1203152.571504514
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203152.571619485,
+      "end": 1203152.58137248
+    },
+    {
+      "kind": "writer",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 16,
+      "start": 1203152.58148653,
+      "end": 1203152.613085172
+    },
+    {
+      "kind": "writer",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 16,
+      "start": 1203152.568031973,
+      "end": 1203152.613399885
+    },
+    {
+      "kind": "writer",
+      "device": "cuda:1",
+      "version": 0,
+      "rows": 16,
+      "start": 1203152.61315232,
+      "end": 1203152.616135437
+    },
+    {
+      "kind": "writer",
+      "device": "cuda:2",
+      "version": 0,
+      "rows": 16,
+      "start": 1203152.613447903,
+      "end": 1203152.616230891
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1203151.790771288,
+      "end": 1203152.582184324
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1203152.582184324,
+      "end": 1203152.61631226
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1203152.61631226,
+      "end": 1203152.633094056
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1203152.705769879,
+      "end": 1203152.705907575
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1203152.705907575,
+      "end": 1203152.705921409
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1203152.705921409,
+      "end": 1203152.70743749
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1203153.561924356,
+      "end": 1203153.562231152
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1203153.562231152,
+      "end": 1203153.562246499
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1203153.562246499,
+      "end": 1203153.56398491
+    },
+    {
+      "kind": "source_backward",
+      "device": "cuda:1",
+      "version": 0,
+      "gradient_buffer_bytes": 2752768,
+      "serviced_forward_calls": 0,
+      "forward_service_seconds": 0.0,
+      "start": 1203154.12830016,
+      "end": 1203154.331418452
+    },
+    {
+      "kind": "source_backward",
+      "device": "cuda:2",
+      "version": 0,
+      "gradient_buffer_bytes": 2752768,
+      "serviced_forward_calls": 0,
+      "forward_service_seconds": 0.0,
+      "start": 1203154.128464162,
+      "end": 1203154.341338054
+    },
+    {
+      "kind": "commit_wait",
+      "device": "host",
+      "start": 1203154.1486141,
+      "end": 1203154.341454282
+    },
+    {
+      "kind": "commit_transfer",
+      "device": "host",
+      "start": 1203154.341454282,
+      "end": 1203154.385100401
+    },
+    {
+      "kind": "commit_adam",
+      "device": "host",
+      "start": 1203154.385100401,
+      "end": 1203154.395438054
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 1,
+      "rows": 1,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1203154.886280369,
+      "end": 1203154.913931539
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1203154.887542719,
+      "end": 1203154.914086436
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1203154.914086436,
+      "end": 1203154.914104992
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1203154.914104992,
+      "end": 1203154.915455535
+    }
+  ]
+}
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000499
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000665
+{"result": "PASS", "queries": 8192, "source_bf16": true, "saved_8bit_block": 0, "weight_max_abs": 1.4551915228366852e-11, "encoded_rows": [32, 32], "source_updates": 2, "early_retirement": true, "partial_checkpoint": true, "deferred_until_reader_ready": true, "offloaded_encode_calls": 0, "retained_cpu_max_bytes": 0, "spill_limited_bytes": 0}
+{
+  "result": "PASS",
+  "source_precision": "bf16",
+  "reader_precision": "fp32",
+  "optimizer": "fp32",
+  "saved_8bit_block": 0,
+  "queries": 8192,
+  "metrics": {
+    "mixed_dense": {
+      "output_max_abs": 3.738701343536377e-05,
+      "output_relative_l2": 6.065199158911128e-06,
+      "source_grad_max_abs": 0.0004962682723999023,
+      "source_grad_relative_l2": 0.0027925968173075884,
+      "source_grad_cosine": 0.9999961132650454
+    },
+    "fp32": {
+      "output_max_abs": 0.0007308274507522583,
+      "output_relative_l2": 0.00010249304614262655,
+      "source_grad_max_abs": 0.0005597854033112526,
+      "source_grad_relative_l2": 0.006320246739781914,
+      "source_grad_cosine": 0.9999811032323986
+    }
+  },
+  "encoded_rows_by_cycle": [
+    128,
+    130,
+    132,
+    134,
+    136,
+    138,
+    140
+  ],
+  "versions": 7,
+  "old_room_gradient": 0.00058746337890625,
+  "encoder_replay": 0,
+  "initial_unique_components": {},
+  "offloaded_encode_calls": 0
+}

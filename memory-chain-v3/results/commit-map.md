@@ -41,6 +41,11 @@
 | 419fce9 | 8f8a0dc | Scheduling: --source-dispatch-at-close 1 dispatches a closed source VJP when the update closes it |
 | b657026 | 6b5f8e2 | Accounting: why graph frames are held (source_hold_*), record waits (record_*_wait_*) |
 | 208911e | 32263d4 | Retention by reachable frame intervals (option d); multi-label hold accounting |
+| 1727f71 | fc0ad4f | Fix: a waiting record's own query frame stays reachable; record the first non-zero dropped gradient |
+| 187ede3 | c8f356f | Fix: in-flight branches keep their ancestors' reachable graphs [length - H, shared) |
+| 019dda7 | 7ff027e | Accounting: the first dropped gradient's learner-side context (ISAAC_LINEAGE_SOURCES=1) |
+| 9086793 | 1c5c374 | Accounting: per-episode first/last in-flight report per holder, which retain call detached |
+| 258f97a | 753a47a | Fix: merge_jobs keeps both actor processes' in-flight lineage |
 
 crn 基线（exp/memory-chain-v3-crnbase）：
 

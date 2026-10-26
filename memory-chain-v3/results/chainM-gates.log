@@ -1,0 +1,209 @@
+===== status (Mon Oct 26 00:28:52 2026)
+ 07:28:53 up 13 days, 20:07,  5 users,  load average: 1.12, 1.29, 1.53
+               total        used        free      shared  buff/cache   available
+Mem:             125          16          70           0          39         108
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 13 days
+signbridge-api Up 13 days
+signbridge-web Up 13 days
+signbridge-funasr Up 13 days (healthy)
+sl_service_proxy Up 13 days
+signbridge-inference Up 13 days
+signbridge-livekit Up 13 days
+signbridge-redis Up 13 days (healthy)
+woshica_docker Up 13 days
+sl_dev Up 13 days
+zhanghao_workspace Up 13 days
+prometheus Up 13 days
+nodeexporter Up 13 days
+grafana Up 13 days
+caddy Up 13 days
+cadvisor Up 13 days (healthy)
+pushgateway Up 13 days
+alertmanager Up 13 days
+service_base Up 13 days
+
+EXIT 0
+ 
+[status] EXIT 0
+===== gates (Mon Oct 26 00:28:53 2026)
+{"result": "PASS", "learner": "cuda:0", "sources": "cuda:1,cuda:2", "forward_bitwise_equal": true, "masked_visible_pairs": 136, "masked_memory_grad_removed": 2.2038607597351074, "reader_weight_grad_max_abs_vs_unbounded": 1.9073486328125e-06, "per_pair_reference": "PASS", "detached_chunks": 4, "detached_writes": 2, "pinned_by_live_writer": 2, "settled_packets": 4, "graph_frames_uid_max": 32, "graph_frames_reachable_per_uid": 20, "dropped_grad": 0.0, "detach_vs_never_detached_weight_max_abs": 1.4901161193847656e-08, "process_vs_local_weight_max_abs": 4.377216100692749e-08, "process_detached_chunks": 4, "process_detached_writes": 2, "single_decision": {"t": 47, "horizon": 12, "nonzero": [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47], "no_graph": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "graph_zero": [32, 33, 34, 35], "unbounded_nonzero_min": 0}}
+
+GATE v3-1727f71-horizon-cuda EXIT 0
+ 
+[gate v3-1727f71-horizon-cuda] EXIT 0
+{"result": "PASS", "process": false, "horizon": 24, "rollout": 32, "bound": 80, "bounded_graph_uid_max": [32, 64, 64, 64, 64, 64, 64, 64, 64, 64], "unbounded_graph_uid_max": [32, 64, 96, 128, 160, 192, 224, 256, 288, 320], "bounded_detached": [0, 0, 64, 128, 192, 256, 320, 384, 448, 512], "dropped": 0.0}
+HOST_HEAP_TRIM role=source-cpu seconds=0.000198
+HOST_HEAP_TRIM role=source-cpu seconds=0.000201
+HOST_HEAP_TRIM role=source-cpu seconds=0.001421
+HOST_HEAP_TRIM role=source-cpu seconds=0.001515
+HOST_HEAP_TRIM role=source-cpu seconds=0.002398
+HOST_HEAP_TRIM role=source-cpu seconds=0.001236
+HOST_HEAP_TRIM role=source-cpu seconds=0.001970
+HOST_HEAP_TRIM role=source-cpu seconds=0.002138
+HOST_HEAP_TRIM role=source-cpu seconds=0.002479
+HOST_HEAP_TRIM role=source-cpu seconds=0.002417
+HOST_HEAP_TRIM role=source-cpu seconds=0.000201
+HOST_HEAP_TRIM role=source-cpu seconds=0.000187
+HOST_HEAP_TRIM role=source-cpu seconds=0.000240
+HOST_HEAP_TRIM role=source-cpu seconds=0.000209
+HOST_HEAP_TRIM role=source-cpu seconds=0.000255
+HOST_HEAP_TRIM role=source-cpu seconds=0.000336
+HOST_HEAP_TRIM role=source-cpu seconds=0.000253
+HOST_HEAP_TRIM role=source-cpu seconds=0.000225
+HOST_HEAP_TRIM role=source-cpu seconds=0.000251
+HOST_HEAP_TRIM role=source-cpu seconds=0.000256
+{"result": "PASS", "process": true, "horizon": 24, "rollout": 32, "bound": 80, "bounded_graph_uid_max": [32, 64, 64, 64, 64, 64, 64, 64, 64, 64], "unbounded_graph_uid_max": [32, 64, 96, 128, 160, 192, 224, 256, 288, 320], "bounded_detached": [0, 0, 64, 128, 192, 256, 320, 384, 448, 512], "dropped": 0.0}
+
+GATE v3-1727f71-horizon-bound EXIT 0
+ 
+[gate v3-1727f71-horizon-bound] EXIT 0
+{"device": "cuda:0", "groups": 96, "count": 128, "bank": 1600, "forward_equal": true, "native_ms": 29.16450402699411, "native_peak_gib": 1.5725603103637695, "horizon_ms": 27.018305845558643, "horizon_peak_gib": 1.9352006912231445}
+
+GATE v3-1727f71-attention-timing EXIT 0
+ 
+[gate v3-1727f71-attention-timing] EXIT 0
+{"result": "PASS", "measurements": {"strided": {"host_copy_median_seconds": 0.059008053969591856, "returned_before_prior_gpu_work": [false, false, false], "contiguous": false, "pinned": true}, "compact": {"host_copy_median_seconds": 1.3405922800302505e-05, "returned_before_prior_gpu_work": [true, true, true], "contiguous": true, "pinned": true}}}
+PASS growth preserves pending writes from the other actor CUDA stream
+graph_count=6 scratch_reserved_bytes= 48234496
+PASS arbitrary sequential bucket order, persistent outputs, bounded shared scratch
+
+GATE v3-1727f71-actor-cuda EXIT 0
+ 
+[gate v3-1727f71-actor-cuda] EXIT 0
+da:1",
+      "version": 0,
+      "gradient_buffer_bytes": 2752768,
+      "serviced_forward_calls": 0,
+      "forward_service_seconds": 0.0,
+      "start": 1195781.832843126,
+      "end": 1195782.001779334
+    },
+    {
+      "kind": "source_backward",
+      "device": "cuda:2",
+      "version": 0,
+      "gradient_buffer_bytes": 2752768,
+      "serviced_forward_calls": 0,
+      "forward_service_seconds": 0.0,
+      "start": 1195781.832525452,
+      "end": 1195782.064106158
+    },
+    {
+      "kind": "commit_wait",
+      "device": "host",
+      "start": 1195781.849508184,
+      "end": 1195782.064270464
+    },
+    {
+      "kind": "commit_transfer",
+      "device": "host",
+      "start": 1195782.064270464,
+      "end": 1195782.109413655
+    },
+    {
+      "kind": "commit_adam",
+      "device": "host",
+      "start": 1195782.109413655,
+      "end": 1195782.119982775
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 1,
+      "rows": 1,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1195782.599189157,
+      "end": 1195782.64540387
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1195782.600102231,
+      "end": 1195782.645591556
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1195782.645591556,
+      "end": 1195782.645612255
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1195782.645612255,
+      "end": 1195782.647146473
+    }
+  ]
+}
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000521HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000545
+
+{"result": "PASS", "queries": 8192, "source_bf16": true, "saved_8bit_block": 0, "weight_max_abs": 1.4551915228366852e-11, "encoded_rows": [32, 32], "source_updates": 2, "early_retirement": true, "partial_checkpoint": true, "deferred_until_reader_ready": true, "offloaded_encode_calls": 0, "retained_cpu_max_bytes": 0, "spill_limited_bytes": 0}
+{
+  "result": "PASS",
+  "source_precision": "bf16",
+  "reader_precision": "fp32",
+  "optimizer": "fp32",
+  "saved_8bit_block": 0,
+  "queries": 8192,
+  "metrics": {
+    "mixed_dense": {
+      "output_max_abs": 3.738701343536377e-05,
+      "output_relative_l2": 6.065199158911128e-06,
+      "source_grad_max_abs": 0.0004962682723999023,
+      "source_grad_relative_l2": 0.0027925968173075884,
+      "source_grad_cosine": 0.9999961132650454
+    },
+    "fp32": {
+      "output_max_abs": 0.0007308274507522583,
+      "output_relative_l2": 0.00010249304614262655,
+      "source_grad_max_abs": 0.0005597854033112526,
+      "source_grad_relative_l2": 0.006320246739724328,
+      "source_grad_cosine": 0.9999811032323997
+    }
+  },
+  "encoded_rows_by_cycle": [
+    128,
+    130,
+    132,
+    134,
+    136,
+    138,
+    140
+  ],
+  "versions": 7,
+  "old_room_gradient": 0.00058746337890625,
+  "encoder_replay": 0,
+  "initial_unique_components": {},
+  "offloaded_encode_calls": 0
+}
+
+GATE v3-1727f71-v2-cuda-suite2 EXIT 0
+ 
+[gate v3-1727f71-v2-cuda-suite2] EXIT 0

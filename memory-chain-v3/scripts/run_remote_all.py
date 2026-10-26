@@ -75,6 +75,9 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
             t7=(1024, 62.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),   # (= t6's configuration; run with the retention fix's code)
                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
+            # t7 with the drop's learner-side context (ISAAC_LINEAGE_SOURCES: who reported each ancestor in flight)
+            t7d=(1024, 62.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_LINEAGE_SOURCES='1'),
+                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
             # timeline of the source-every-rollout configuration; the same with opt-in layer checkpointing
             tlU1=(2048, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'), TRIMS + [U1]),
             ckU1=(2048, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
@@ -166,6 +169,9 @@ def long_run(step):
         code, text = bench('collect', case, check=False)
         guard = RESULTS / case / 'guard.log'
         if code == 0 and guard.exists() and 'RUNNER_EXIT' in guard.read_text(errors='replace'): break
+        # (the runner can die after writing its result, e.g. docker stop on a container already gone: no RUNNER_EXIT)
+        result = RESULTS / case / 'result.json'
+        if code == 0 and result.exists() and 'exit_status' in result.read_text(errors='replace'): break
     else:
         bench('stop', case, 'run_remote_all deadline (3 h) reached', check=False)
         bench('collect', case, check=False)
@@ -182,7 +188,7 @@ def main():
             busy, _ = status('remote-status-start.log')
             if busy: sys.exit(f'GPUs {busy} busy (others\' work); wait and rerun')
         elif step == 'deploy':
-            bench('deploy', TAG, log=f'deploy-{TAG}.log')
+            bench('deploy', TAG, os.environ.get('V3_REF') or 'HEAD', log=f'deploy-{TAG}.log')   # (the tagged commit, not HEAD)
         elif step == 'gates':
             gates = {
                 'horizon-cuda': PYV + 'tests/test_source_horizon.py --learner cuda:0 --sources cuda:1,cuda:2',

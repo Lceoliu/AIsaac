@@ -1,0 +1,66 @@
+{
+  "case": "memory-v3-v3-9086793-t7d-10260212",
+  "exit_status": 0,
+  "elapsed_seconds": 810.419102191925,
+  "spec": {
+    "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+    "case": "memory-v3-v3-9086793-t7d-10260212",
+    "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+    "code_dir": "memory-v3-code-v3-9086793",
+    "memory": "72g",
+    "timeout": 2400,
+    "horizon": 1024,
+    "hours": 62.0,
+    "gpu_indices": [
+      3,
+      2,
+      1,
+      4,
+      5
+    ],
+    "discard": 10,
+    "source_devices": null,
+    "env": {
+      "ISAAC_SOURCE_CPROFILE": "",
+      "TORCHINDUCTOR_COMPILE_THREADS": "1",
+      "ISAAC_TIMELINE": "1",
+      "ISAAC_LINEAGE_SOURCES": "1"
+    },
+    "train_edits": [
+      [
+        " --source-update-rollouts 2 ",
+        " --source-update-rollouts 1 "
+      ],
+      [
+        " --source-flash 1 ",
+        " --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 "
+      ]
+    ]
+  },
+  "updates": 52,
+  "last": {
+    "update": "48236",
+    "game_hours": "58569.303148148145",
+    "errors": "0.0",
+    "stalls": "0.0",
+    "cf_done": "314.0",
+    "cf_errors": "0.0",
+    "searches": "3069.0",
+    "teach_held": "4403"
+  },
+  "steady_updates": 42,
+  "steady_x_real_time": 314.0540735489366,
+  "medians": {
+    "x_real_time": 319.8422116927644,
+    "collect_s": 7.60373640852049,
+    "update_s": 11.203989970497787,
+    "wall_s": 13.666608554543927,
+    "gpu_reserved_gb": 22.84375,
+    "wait_learner_s": 6.357024922966957,
+    "c_learner_cores": 0.8340137652104206,
+    "source_graph_frames": 160860.0,
+    "source_graph_frames_uid_max": 2765.0,
+    "source_alloc_gib_max": 5.092949390411377,
+    "source_detached_frames": 543263.5
+  }
+}

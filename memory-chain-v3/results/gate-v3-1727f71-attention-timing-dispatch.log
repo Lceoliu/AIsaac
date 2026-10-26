@@ -1,0 +1,5 @@
+{"device": "cuda:0", "groups": 96, "count": 128, "bank": 1600, "forward_equal": true, "native_ms": 29.16450402699411, "native_peak_gib": 1.5725603103637695, "horizon_ms": 27.018305845558643, "horizon_peak_gib": 1.9352006912231445}
+
+GATE v3-1727f71-attention-timing EXIT 0
+
+EXIT 0

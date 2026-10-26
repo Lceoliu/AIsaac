@@ -1,10 +1,10 @@
-容量长测通过（40 次稳态、无 OOM），梯度审计未通过（dropped_grad 非零），速度未达标（320.8× 对 843.4×），待修复实验快照
+容量长测与梯度审计通过（40 次稳态、无 OOM、dropped_grad = 0，v2 loss 7 次），速度未达标（312.5× 对 843.4×）
 
 # exp/memory-chain-v3：memory-chain v3 实验快照（不合并到 abplus-training）
 
 - 本分支历史来自独立的候选仓库（temp/memory-chain-v3/candidate），与 rl 历史**没有共同祖先**，这是有意的：根提交 64ae451 是 memory-chain v2 候选的快照，基线 = room-memory-write-v1 的 b9f04b7 + memory-chain-v2 的 DIFF.patch。
-- 三条分支：`exp/memory-chain-v3`（候选主线，32263d4 及本说明提交）；`exp/memory-chain-v3-timing`（计时链，长测与计时用的 `v3-<hash>` 代码标签大多在这条上，顶端 208911e）；`exp/memory-chain-v3-crnbase`（CRN 修正的计时基线 afd843a）。两条链的对应见 `memory-chain-v3/results/commit-map.md`。
-- 报告：`memory-chain-v3/REPORT.md`（§18 起为 5 卡长测、梯度审计和待修事项）；`memory-chain-v3/results/` 只含小文件（各运行的 progress.csv、summary/result/spec/command json、时间线与对照表、门测日志）；大日志、zip、pt 不在 git 里，完整目录的 tar 在 3090（rhythmo@10.19.131.132）的 ~/isaac-abplus/archive-memory-chain-v3/。
+- 三条分支：`exp/memory-chain-v3`（候选主线，至 753a47a，及本说明/快照提交）；`exp/memory-chain-v3-timing`（计时链，长测与计时用的 `v3-<hash>` 代码标签大多在这条上，顶端 258f97a）；`exp/memory-chain-v3-crnbase`（CRN 修正的计时基线 afd843a）。两条链的对应见 `memory-chain-v3/results/commit-map.md`。
+- 报告：`memory-chain-v3/REPORT.md`（§18 起为 5 卡长测、梯度审计与三处丢梯度原因的修复、验收重跑 1–3）；`memory-chain-v3/results/` 只含小文件（各运行的 progress.csv、summary/result/spec/command json、时间线与对照表、门测日志）；大日志、zip、pt 不在 git 里，完整目录的 tar 在 3090（rhythmo@10.19.131.132）的 ~/isaac-abplus/archive-memory-chain-v3/。
 - 生产版本不替换。
 
 ---
