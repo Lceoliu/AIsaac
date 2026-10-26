@@ -110,6 +110,9 @@ class SourcePipeline:
                                for i in range(len(devices))]
                               if processes and os.environ.get('ISAAC_SOURCE_PREEMPT_VJP')=='1' else self.workers)
         self.frames, self.blocks, self.chunks, self.writes, self.owners = {}, {}, [], [], {}
+        # (per-uid keys of frames / blocks / owners: retain_histories drops a retired episode's entries
+        # without scanning every frame of every episode; 2026-10-26, table 8)
+        self.uid_keys = {}
         self.direct_grads = {}
         self.retired_pending = []
         self.collected = {}
@@ -269,8 +272,15 @@ class SourcePipeline:
         uids.update(h.uid for batch in self.collected.values() for h,_,_ in batch.requests)
         # A live branch keeps the ancestor frames it reads (they are keyed by the ancestor).
         uids.update(a for uid in list(uids) for a, _ in self.origins.get(uid, ()))
-        live_chunks = {c for k, (c, _) in self.frames.items() if k[0] in uids}
-        live_writes = {c for k, (c, _) in self.blocks.items() if k[0][0] in uids}
+        # A chunk holds frames of its own uid (stateless teacher chunks: of `uids`), a write the blocks of
+        # its uid (each block keyed by its first frame's uid); both live while one of those uids is live
+        # (the same sets as scanning every frame and block key, without the scan).
+        live_chunks = {i for i, c in enumerate(self.chunks) if c is not None and (
+            c['uid'] in uids if c.get('uid') is not None else not uids.isdisjoint(c.get('uids', ())))}
+        live_writes = {i for i, c in enumerate(self.writes) if c is not None and c.get('uid') in uids}
+        if os.environ.get('ISAAC_RETAIN_CHECK') == '1':   # (test aid: the full scans, compared)
+            assert live_chunks == {c for k, (c, _) in self.frames.items() if k[0] in uids}
+            assert live_writes == {c for k, (c, _) in self.blocks.items() if k[0][0] in uids}
         if self.steps:
             # Closed episodes will never receive another consumer. Settle their
             # complete credit before releasing graphs, but do NOT step Adam.
@@ -289,11 +299,19 @@ class SourcePipeline:
                 # Process workers own these graphs and enqueue retire after
                 # VJP. Reader can run now; Adam must still collect all credit.
                 self._collect_retired(wait=not (overlap and self.processes))
-        self.frames = {k: v for k, v in self.frames.items() if k[0] in uids}
-        self.blocks = {k: v for k, v in self.blocks.items() if k[0][0] in uids}
+        if os.environ.get('ISAAC_RETAIN_CHECK') == '1':
+            expect = ({k: v for k, v in self.frames.items() if k[0] in uids},
+                      {k: v for k, v in self.blocks.items() if k[0][0] in uids},
+                      {k: v for k, v in self.owners.items() if k[0] in uids})
+        for uid in [u for u in self.uid_keys if u not in uids]:
+            frames_, blocks_, owners_ = self.uid_keys.pop(uid)
+            for k in frames_: self.frames.pop(k, None)
+            for k in blocks_: self.blocks.pop(k, None)
+            for k in owners_: self.owners.pop(k, None)
+        if os.environ.get('ISAAC_RETAIN_CHECK') == '1':
+            assert (self.frames, self.blocks, self.owners) == expect
         self.lengths = {k: v for k, v in self.lengths.items() if k in uids}
         self.origins = {k: v for k, v in self.origins.items() if k in uids}
-        self.owners = {k: v for k, v in self.owners.items() if k[0] in uids}
         self.chunks = [c if i in live_chunks else None for i, c in enumerate(self.chunks)]
         self.writes = [c if i in live_writes else None for i, c in enumerate(self.writes)]
         if self.horizon and frontiers:
@@ -737,6 +755,7 @@ class SourcePipeline:
             self.prefetch_pressure=True
             return False
         self.owners.update(assigned)
+        for key in assigned: self.uid_keys.setdefault(key[0], ([], [], []))[2].append(key)
         # Real episode graphs keep independent lifetimes. Ordinary teacher
         # records have no temporal chain: group their single frames by device,
         # rather than launching an entire encoder once per teacher sample.
@@ -770,7 +789,9 @@ class SourcePipeline:
                              rows=len(ix),first=min(keys[i][1] for i in ix),last=max(keys[i][1] for i in ix))
                 if uid is None: chunk['uids'] = frozenset(keys[i][0] for i in ix)
                 self.chunks.append(chunk)
-                for offset, i in enumerate(ix): self.frames[keys[i]] = (cid, offset)
+                for offset, i in enumerate(ix):
+                    self.frames[keys[i]] = (cid, offset)
+                    self.uid_keys.setdefault(keys[i][0], ([], [], []))[0].append(keys[i])
                 self.encoded_rows += len(ix)
         return True
 
@@ -836,7 +857,9 @@ class SourcePipeline:
             self.writes.append(dict(worker=worker, future=future, version=self.version, uid=uid,remote_kind='write',remote_id=wid,
                                     first_start=min(block[0][1] for block in keys),last_start=max(block[0][1] for block in keys),
                                     chunks={self.frames[key][0] for block in keys for key in block}))
-            for offset,key in enumerate(keys): self.blocks[key] = (wid,offset)
+            for offset,key in enumerate(keys):
+                self.blocks[key] = (wid,offset)
+                self.uid_keys.setdefault(key[0][0], ([], [], []))[1].append(key)
             self.written_blocks += len(keys)
 
     def _write(self, worker, block_keys, version, wid=None, stale=()):
@@ -1300,7 +1323,7 @@ class SourcePipeline:
             if self.backward_workers is not self.workers:
                 for worker in self.backward_workers:worker.shutdown(wait=True)
             if self.processes:
-                self.chunks.clear();self.writes.clear();self.frames.clear();self.blocks.clear();self.collected.clear()
+                self.chunks.clear();self.writes.clear();self.frames.clear();self.blocks.clear();self.collected.clear();self.uid_keys.clear()
                 import gc
                 gc.collect()
             for future in self.control_futures:future.result()
