@@ -1,0 +1,25 @@
+{
+  "case": "v3-2ef8ed8-timOld-10250547",
+  "horizon": null,
+  "exit_status": 0,
+  "updates": 19,
+  "steady_updates": 9,
+  "steady_x_real_time": 919.3327045256415,
+  "medians": {
+    "x_real_time": 915.1492650162652,
+    "collect_s": 4.872672077966854,
+    "update_s": 4.452092881780118,
+    "wall_s": 4.777217044029385,
+    "gpu_reserved_gb": 15.1796875,
+    "wait_learner_s": 0.0,
+    "c_learner_cores": 0.9083745099806706
+  },
+  "peak_gpu_mib": {
+    "2": 16081.0,
+    "3": 2251.0,
+    "4": 2231.0
+  },
+  "peak_container_memory_gib": 53.209800720214844,
+  "guard_stops": [],
+  "completed": false
+}

@@ -1,0 +1,52 @@
+[
+ {
+  "name": "test_cf_smoke",
+  "exit": 0,
+  "seconds": 5.1
+ },
+ {
+  "name": "test_memory_smoke",
+  "exit": 0,
+  "seconds": 5.9
+ },
+ {
+  "name": "test_raw_release",
+  "exit": 0,
+  "seconds": 5.0
+ },
+ {
+  "name": "test_rebuild_memory_smoke",
+  "exit": 0,
+  "seconds": 5.4
+ },
+ {
+  "name": "test_record_retention",
+  "exit": 0,
+  "seconds": 4.5
+ },
+ {
+  "name": "test_source_dispatch_at_close",
+  "exit": 0,
+  "seconds": 5.2
+ },
+ {
+  "name": "test_source_horizon",
+  "exit": 0,
+  "seconds": 15.3
+ },
+ {
+  "name": "test_source_pending_horizon",
+  "exit": 0,
+  "seconds": 4.4
+ },
+ {
+  "name": "test_source_pending_release",
+  "exit": 0,
+  "seconds": 5.0
+ },
+ {
+  "name": "test_source_process",
+  "exit": 0,
+  "seconds": 13.8
+ }
+]

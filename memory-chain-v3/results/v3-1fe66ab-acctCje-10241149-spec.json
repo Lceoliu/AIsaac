@@ -1,0 +1,26 @@
+{
+  "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+  "case": "memory-v3-v3-1fe66ab-acctCje-10241149",
+  "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+  "code_dir": "memory-v3-code-v3-1fe66ab",
+  "memory": "72g",
+  "timeout": 2400,
+  "horizon": 2048,
+  "hours": 24.0,
+  "gpu_indices": [
+    3,
+    2,
+    4,
+    5
+  ],
+  "discard": 10,
+  "source_devices": "cuda:0,cuda:2,cuda:3",
+  "env": {
+    "ISAAC_MEMORY_ACCOUNT": "1",
+    "ISAAC_RL_MEM_LOG": "/bench/runs/memory-v3-v3-1fe66ab-acctCje-10241149/memlog",
+    "ISAAC_RL_MEM_EVERY": "10",
+    "LD_PRELOAD": "/bench/v3/lib/libjemalloc.so.2",
+    "ISAAC_GAME_ENV_STRIP": "LD_PRELOAD"
+  },
+  "train_edits": null
+}

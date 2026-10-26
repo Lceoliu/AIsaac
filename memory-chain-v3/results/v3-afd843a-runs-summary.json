@@ -1,0 +1,33 @@
+[
+  {
+    "case": "v3-afd843a-timNew-10250640",
+    "horizon": 2048,
+    "exit_status": 0,
+    "updates": 19,
+    "steady_updates": 9,
+    "steady_x_real_time": 318.0699619506753,
+    "medians": {
+      "x_real_time": 349.0775667946782,
+      "collect_s": 11.052812449866906,
+      "update_s": 7.134267108980566,
+      "wall_s": 12.525964854983613,
+      "gpu_reserved_gb": 19.822265625,
+      "wait_learner_s": 2.578338387887925,
+      "c_learner_cores": 0.7998349658669038,
+      "source_graph_frames": 139099.0,
+      "source_graph_frames_uid_max": 3335.0,
+      "source_alloc_gib_max": 12.412312507629395,
+      "source_detached_frames": 353942.0
+    },
+    "peak_gpu_mib": {
+      "1": 16816.0,
+      "2": 22535.0,
+      "3": 16856.0,
+      "4": 20739.0,
+      "5": 21333.0
+    },
+    "peak_container_memory_gib": 57.59068298339844,
+    "guard_stops": [],
+    "completed": false
+  }
+]

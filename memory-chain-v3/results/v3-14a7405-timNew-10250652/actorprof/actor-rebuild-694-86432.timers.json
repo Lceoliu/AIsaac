@@ -1,0 +1,56 @@
+{
+ "kind": "rebuild",
+ "pid": 694,
+ "calls": 1000,
+ "window_wall_s": 21.800505928928033,
+ "process_main_calls_in_window": 2007,
+ "latency_ms": {
+  "mean": 19.30804436793551,
+  "median": 6.66089600417763
+ },
+ "host_submit_ms": 4.310548932058737,
+ "wait_ms": 0.020118384389206767,
+ "sections_ms": {
+  "component_keys": 0.39149064128287137,
+  "component_replay": 0.04418365308083594,
+  "core_replay": 2.605463622836396,
+  "d2h": 0.06862299353815615,
+  "grow_refresh": 0.08749672933481634,
+  "h2d_uniform": 0.13293989258818328,
+  "rawhistory_append": 0.5483936052769423,
+  "reset_prefixes": 0.11149097583256662,
+  "stage_pack": 0.12353724497370422,
+  "state_tstate": 0.013761959271505475,
+  "tdest": 0.15934602869674563,
+  "writer_close": 0.011608089320361614
+ },
+ "sections_thread_cpu_ms": {
+  "component_keys": 0.3919106080002166,
+  "component_replay": 0.04300681399982409,
+  "core_replay": 2.6052843949996145,
+  "d2h": 0.06886679600032153,
+  "grow_refresh": 0.08478658900051528,
+  "h2d_uniform": 0.1315136210002663,
+  "rawhistory_append": 0.5487002470002551,
+  "reset_prefixes": 0.11198154099977842,
+  "stage_pack": 0.12309130199921015,
+  "state_tstate": 0.012983380999088467,
+  "tdest": 0.16011620000020343,
+  "writer_close": 0.011555240000518552
+ },
+ "host_submit_thread_cpu_ms": 4.3026901960004125,
+ "rows_mean": 13.589,
+ "threads": [
+  "MainThread",
+  "QueueFeederThread"
+ ],
+ "process_cpu_s": 200.086169212,
+ "notes": {
+  "len_max": 1933.294,
+  "len_mean": 797.1191749304845,
+  "capacity": 256.0,
+  "closed": 0.201,
+  "component_rows": 38.112,
+  "stale": 0.0
+ }
+}

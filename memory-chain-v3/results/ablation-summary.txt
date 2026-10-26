@@ -1,0 +1,56 @@
+== results/v3-05e7cde-ablA-10241012: updates 10, anon slope (updates 2..) 0.778 GiB/update
+   1 anon  35.12 shmem  7.26 games  276 archive    49 teach_held     0 v2_held    0 src_eps 118 learnerAnon 2.85 trainer=5.78 learner=5.86 source=4.84 actor=5.38 worker=4.23
+   2 anon  35.99 shmem  7.27 games  285 archive    81 teach_held     0 v2_held    0 src_eps 95 learnerAnon 2.91 trainer=5.91 learner=6.06 source=5.26 actor=5.69 worker=4.23
+   3 anon  39.62 shmem  7.28 games  339 archive   115 teach_held     0 v2_held    0 src_eps 179 learnerAnon 4.36 trainer=6.14 learner=7.35 source=5.48 actor=5.57 worker=4.24
+   4 anon  40.22 shmem  7.30 games  363 archive   147 teach_held     0 v2_held    0 src_eps 104 learnerAnon 4.33 trainer=6.80 learner=7.42 source=5.50 actor=6.12 worker=4.24
+   5 anon  41.26 shmem  7.31 games  407 archive   179 teach_held     0 v2_held    0 src_eps 161 learnerAnon 4.79 trainer=6.84 learner=7.49 source=5.55 actor=6.21 worker=4.24
+   6 anon  41.94 shmem  7.33 games  442 archive   215 teach_held     0 v2_held    0 src_eps 115 learnerAnon 4.89 trainer=6.98 learner=7.47 source=5.60 actor=6.12 worker=4.24
+   7 anon  42.51 shmem  7.33 games  472 archive   250 teach_held     0 v2_held    0 src_eps 155 learnerAnon 4.91 trainer=7.12 learner=7.71 source=5.63 actor=5.61 worker=4.24
+   8 anon  43.51 shmem  7.35 games  499 archive   280 teach_held     0 v2_held    0 src_eps 108 learnerAnon 4.93 trainer=6.99 learner=7.93 source=5.62 actor=6.13 worker=4.24
+   9 anon  44.09 shmem  7.35 games  543 archive   313 teach_held     0 v2_held    0 src_eps 158 learnerAnon 5.31 trainer=6.35 learner=8.14 source=5.65 actor=5.43 worker=4.24
+  10 anon  42.35 shmem  7.35 games  543 archive   351 teach_held     0 v2_held    0 src_eps 105 learnerAnon 5.11 trainer=6.35 learner=7.25 source=5.56 actor=5.43 worker=4.24
+== results/v3-05e7cde-ablB-10241017: updates 10, anon slope (updates 2..) 0.894 GiB/update
+   1 anon  35.45 shmem  7.26 games  323 archive    51 teach_held    54 v2_held    0 src_eps 173 learnerAnon 2.71 trainer=5.77 learner=5.94 source=4.79 actor=5.36 worker=4.24
+   2 anon  36.53 shmem  7.27 games  326 archive    87 teach_held   158 v2_held    0 src_eps 263 learnerAnon 2.96 trainer=6.06 learner=6.08 source=5.19 actor=5.68 worker=4.24
+   3 anon  39.98 shmem  7.29 games  368 archive   120 teach_held   239 v2_held    0 src_eps 434 learnerAnon 4.41 trainer=6.14 learner=7.43 source=5.47 actor=6.05 worker=4.24
+   4 anon  40.62 shmem  7.31 games  395 archive   150 teach_held   447 v2_held    0 src_eps 577 learnerAnon 4.54 trainer=6.68 learner=7.55 source=5.52 actor=6.19 worker=4.24
+   5 anon  42.10 shmem  7.33 games  469 archive   191 teach_held   547 v2_held    0 src_eps 722 learnerAnon 4.87 trainer=6.53 learner=7.98 source=5.61 actor=5.91 worker=4.24
+   6 anon  43.15 shmem  8.57 games  493 archive   227 teach_held   651 v2_held    0 src_eps 854 learnerAnon 4.92 trainer=6.40 learner=7.86 source=6.94 actor=5.66 worker=4.24
+   7 anon  44.11 shmem 10.47 games  528 archive   263 teach_held   735 v2_held    0 src_eps 947 learnerAnon 4.99 trainer=6.36 learner=8.10 source=8.86 actor=5.69 worker=4.24
+   8 anon  45.16 shmem 10.50 games  564 archive   295 teach_held   843 v2_held    0 src_eps 961 learnerAnon 5.17 trainer=6.39 learner=8.16 source=8.86 actor=5.73 worker=4.24
+   9 anon  44.52 shmem 10.50 games  592 archive   331 teach_held   925 v2_held    0 src_eps 1066 learnerAnon 5.32 trainer=6.55 learner=8.42 source=8.88 actor=5.75 worker=4.24
+  10 anon  43.77 shmem 10.52 games  592 archive   360 teach_held  1005 v2_held    0 src_eps 1106 learnerAnon 5.35 trainer=6.55 learner=7.66 source=8.72 actor=5.75 worker=4.24
+== results/v3-05e7cde-ablC-10241022: updates 10, anon slope (updates 2..) 0.842 GiB/update
+   1 anon  35.21 shmem  7.35 games  322 archive    51 teach_held    54 v2_held    0 src_eps 160 learnerAnon 2.53 trainer=5.77 learner=5.53 source=4.76 actor=5.41 worker=4.24
+   2 anon  37.67 shmem  7.35 games  337 archive    87 teach_held   152 v2_held    0 src_eps 261 learnerAnon 3.16 trainer=6.42 learner=6.44 source=5.30 actor=5.86 worker=4.24
+   3 anon  38.73 shmem  7.37 games  378 archive   120 teach_held   267 v2_held    0 src_eps 447 learnerAnon 4.28 trainer=6.15 learner=7.46 source=5.48 actor=5.60 worker=4.25
+   4 anon  40.47 shmem  7.39 games  394 archive   150 teach_held   420 v2_held    0 src_eps 556 learnerAnon 4.56 trainer=6.80 learner=7.56 source=5.50 actor=6.14 worker=4.25
+   5 anon  41.69 shmem  7.40 games  434 archive   173 teach_held   532 v2_held    0 src_eps 705 learnerAnon 4.89 trainer=6.85 learner=7.78 source=5.59 actor=6.25 worker=4.25
+   6 anon  41.46 shmem  7.42 games  448 archive   204 teach_held   607 v2_held    0 src_eps 713 learnerAnon 4.98 trainer=6.48 learner=8.02 source=5.63 actor=5.85 worker=4.25
+   7 anon  43.20 shmem  7.44 games  484 archive   232 teach_held   690 v2_held    0 src_eps 808 learnerAnon 5.02 trainer=6.98 learner=7.97 source=5.65 actor=6.36 worker=4.26
+   8 anon  43.61 shmem  7.44 games  501 archive   251 teach_held   751 v2_held    0 src_eps 857 learnerAnon 4.96 trainer=6.93 learner=7.88 source=5.63 actor=6.30 worker=4.26
+   9 anon  44.91 shmem  7.45 games  571 archive   284 teach_held   823 v2_held    0 src_eps 960 learnerAnon 5.24 trainer=7.19 learner=7.92 source=5.68 actor=6.48 worker=4.73
+  10 anon  43.72 shmem  7.86 games  585 archive   316 teach_held   906 v2_held    0 src_eps 998 learnerAnon 5.28 trainer=6.61 learner=7.76 source=6.00 actor=5.84 worker=4.78
+== results/v3-05e7cde-ab4h2048acct-10240954: updates 23, anon slope (updates 2..) 1.138 GiB/update
+   1 anon  35.61 shmem  7.31 games  324 archive    51 teach_held    53 v2_held    0 src_eps 178 learnerAnon 2.9 trainer=5.72 learner=5.88 source=4.85 actor=5.71 worker=4.24
+   2 anon  36.22 shmem  7.31 games  324 archive    85 teach_held   155 v2_held    0 src_eps 260 learnerAnon 2.97 trainer=6.01 learner=5.96 source=5.21 actor=5.59 worker=4.24
+   3 anon  40.16 shmem  7.33 games  385 archive   117 teach_held   241 v2_held    0 src_eps 426 learnerAnon 4.43 trainer=6.22 learner=7.45 source=5.50 actor=5.62 worker=4.25
+   4 anon  40.15 shmem  7.34 games  399 archive   159 teach_held   385 v2_held    0 src_eps 493 learnerAnon 4.42 trainer=6.54 learner=7.44 source=5.54 actor=6.05 worker=4.25
+   5 anon  42.15 shmem  7.37 games  477 archive   201 teach_held   502 v2_held    0 src_eps 676 learnerAnon 4.92 trainer=6.58 learner=8.11 source=5.62 actor=5.84 worker=4.25
+   6 anon  42.00 shmem  7.89 games  505 archive   239 teach_held   594 v2_held    0 src_eps 704 learnerAnon 5.06 trainer=6.48 learner=7.99 source=6.14 actor=5.62 worker=4.26
+   7 anon  44.17 shmem  7.91 games  531 archive   265 teach_held   669 v2_held    0 src_eps 803 learnerAnon 5.16 trainer=7.07 learner=8.18 source=6.20 actor=6.19 worker=4.26
+   8 anon  44.38 shmem  7.92 games  552 archive   295 teach_held   783 v2_held    0 src_eps 904 learnerAnon 5.15 trainer=6.93 learner=7.77 source=6.14 actor=6.18 worker=4.26
+   9 anon  44.65 shmem  7.93 games  601 archive   320 teach_held   862 v2_held    0 src_eps 1005 learnerAnon 5.12 trainer=7.14 learner=7.82 source=6.19 actor=5.95 worker=4.61
+  10 anon  47.73 shmem  8.60 games  679 archive   358 teach_held   974 v2_held    8 src_eps 1081 learnerAnon 5.17 trainer=6.76 learner=8.07 source=6.89 actor=6.83 worker=5.07
+  11 anon  50.11 shmem  8.62 games  738 archive   392 teach_held  1015 v2_held   32 src_eps 1128 learnerAnon 5.32 trainer=7.87 learner=8.40 source=6.87 actor=7.29 worker=5.60
+  12 anon  51.20 shmem  8.63 games  770 archive   425 teach_held  1105 v2_held   40 src_eps 1219 learnerAnon 5.41 trainer=8.16 learner=7.94 source=6.85 actor=7.80 worker=5.73
+  13 anon  52.93 shmem  8.63 games  795 archive   464 teach_held  1171 v2_held   64 src_eps 1313 learnerAnon 5.4 trainer=8.61 learner=8.24 source=6.92 actor=8.08 worker=5.79
+  14 anon  53.36 shmem  9.85 games  819 archive   497 teach_held  1248 v2_held   88 src_eps 1352 learnerAnon 5.61 trainer=8.86 learner=8.26 source=8.02 actor=8.13 worker=5.68
+  15 anon  55.60 shmem  9.88 games  829 archive   524 teach_held  1307 v2_held  112 src_eps 1428 learnerAnon 5.74 trainer=9.42 learner=8.67 source=8.23 actor=8.76 worker=5.23
+  16 anon  54.53 shmem  9.88 games  835 archive   549 teach_held  1387 v2_held  112 src_eps 1499 learnerAnon 5.79 trainer=9.03 learner=8.48 source=8.12 actor=8.19 worker=4.93
+  17 anon  54.81 shmem  9.89 games  834 archive   572 teach_held  1442 v2_held  136 src_eps 1578 learnerAnon 5.88 trainer=9.04 learner=8.59 source=8.20 actor=7.77 worker=4.76
+  18 anon  56.00 shmem 11.20 games  881 archive   591 teach_held  1548 v2_held  160 src_eps 1659 learnerAnon 5.96 trainer=9.46 learner=8.70 source=9.33 actor=7.94 worker=4.94
+  19 anon  57.95 shmem 11.25 games  904 archive   607 teach_held  1598 v2_held  184 src_eps 1728 learnerAnon 6.36 trainer=8.57 learner=9.44 source=9.57 actor=7.26 worker=4.95
+  20 anon  57.57 shmem 11.26 games  930 archive   627 teach_held  1642 v2_held  216 src_eps 1751 learnerAnon 6.44 trainer=9.61 learner=9.48 source=9.40 actor=8.07 worker=5.48
+  21 anon  59.65 shmem 11.27 games  957 archive   648 teach_held  1725 v2_held  248 src_eps 1867 learnerAnon 6.67 trainer=9.97 learner=9.15 source=9.55 actor=8.48 worker=5.48
+  22 anon  58.88 shmem 11.31 games  957 archive   663 teach_held  1815 v2_held  288 src_eps 1941 learnerAnon 6.65 trainer=9.66 learner=9.82 source=9.54 actor=8.39 worker=5.25

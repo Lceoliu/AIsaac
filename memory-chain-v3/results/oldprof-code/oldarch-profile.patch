@@ -1,0 +1,92 @@
+--- hostws/isaac_bridge/tok_policy.py	2026-10-25 03:35:35.539347300 -0700
++++ oldprof/isaac_bridge/tok_policy.py	2026-10-25 03:35:58.279901100 -0700
+@@ -130,6 +130,7 @@
+ """
+ import contextlib
+ import os
++import time
+ 
+ # One hardware work queue per process for the CUDA streams (train_tok sets the same before importing torch; it only
+ # takes effect if no CUDA context exists yet): it makes the GPU-sharing crash of replayed GraphActor graphs (illegal
+@@ -2185,6 +2186,8 @@
+         if t_on:   # (B30) the warm-up and capture calls stepped the state: back to the start
+             self.tstate.reset_()
+             torch.cuda.synchronize()
++        from .actor_profile import ActorProfile
++        self.aprof, self._core_raw = ActorProfile(self, 'graph'), core   # (ISAAC_ACTOR_TORCH_PROFILE only)
+ 
+     def submit(self, rows, pending, widx=None, reset=None, tdest=None, ukeys=None):
+         """Start a call (returns at once; False if it does not fit). rows: a C-contiguous ROW array, pending [n, heads]
+@@ -2257,21 +2260,36 @@
+ 
+     def _submit_fold(self, rows, pending, widx, reset, ukeys=None):
+         """submit() with fold (B29): records + control block in, the replay, the outputs out."""
++        ap = self.aprof
++        ap.begin(len(rows))
++        ap.mark('stage_pack')
+         g = self._pack_fold(rows, pending, widx, reset, ukeys)
+         n = len(rows)
+         r = self.rsizes[int(np.searchsorted(self.rsizes, n))]
++        ap.note(r=r, e=self.sizes[g])
+         g += self.rsizes.index(r) * len(self.sizes)
+         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
+         with torch.cuda.stream(stream):
++            ap.mark('h2d_uniform')
+             self.raw[:n].copy_(self.stage[:n], non_blocking=True)
+             self.ctrl[:r].copy_(self.ctrl_stage[:r], non_blocking=True)
++            ap.mark('core_replay')
+             with torch.inference_mode():   # (the graphs draw uniforms: replay advances the RNG state they captured,
+                 self.graphs[g].replay()    # an inference tensor since the capture ran in inference mode)
++            ap.mark('d2h')
+             self.out_host[:n].copy_(self.outs[g][:n], non_blocking=True)
++            ap.mark('tdest')
+             if self._tdest is not None:   # (B31) the step's K / V, s and o into the rollout's rows, on the device
+                 a_ = self.c_dest_at
+                 self._t_store(g, n, self.ctrl[:n, a_:a_ + 8].view(torch.int64)[:, 0].contiguous())
++            if ap.eager_wanted():   # (measurement aid: the network once more, uncompiled, outside the graphs;
++                #                     its temporal step on the scratch slot, the workers' state untouched)
++                tk_ = self.sizes[g % len(self.sizes)]
++                sl_ = torch.full((r,), self.tstate.scratch, dtype=torch.int64, device=self.raw.device) if self.t_on else None
++                ap.eager(lambda: self._core_raw(decode_rows(self.raw[:r], entities=tk_, n_heads=self.nh), self.u[:r],
++                                                None, tk_, sl_))
+             self.done.record()
++        ap.submitted()
+         self._n = n
+         return True
+ 
+@@ -2321,7 +2339,9 @@
+ 
+     def result(self):
+         """(actions [n, heads] int64, log-probabilities [n], values [n]) of the submitted call, as numpy arrays."""
++        t_ = time.perf_counter()
+         self.done.synchronize()
++        wait_ = time.perf_counter() - t_
+         out = self.out_np[:self._n].copy()
+         nh = self.nh
+         self.extra = out[:, nh + 2:nh + 2 + self.n_extra] if self.n_extra else None
+@@ -2333,6 +2353,7 @@
+             tc = out[:, at + int(self.vg_on):]
+             self.t_out = dict(create=tc[:, 0] > 0.5, nroom=np.rint(tc[:, 1]).astype(np.int64),
+                               steps=np.rint(tc[:, 2]).astype(np.int64), stage_prev=np.rint(tc[:, 3]).astype(np.int64))
++        if hasattr(self, 'aprof'): self.aprof.finished(wait_)
+         return out[:, :nh].astype(np.int64), out[:, nh], out[:, nh + 1]
+ 
+     def act(self, rows, pending, widx=None, reset=None, tdest=None, ukeys=None):
+--- hostws/train_tok.py	2026-10-25 03:35:35.502537300 -0700
++++ oldprof/train_tok.py	2026-10-25 03:35:58.281095200 -0700
+@@ -2273,6 +2273,7 @@
+                          memory=mem_table, temporal=t_state, **gkw)
+               for _ in range(max(1, args.actor_slots))] if (use_graphs and child is None) else []
+     free = list(actors)
++    for a_ in actors: a_.prof_role = 'main'   # (ISAAC_ACTOR_TORCH_PROFILE: these are profiled, lanes / snapshots not)
+     # 2026-10-10 (teacher v2): the workers' lanes are answered by a GraphActor of their own (the actor's weights; the
+     # lane records never enter the rollout); the eager path for what it cannot take
+     # B34 (2026-10-16): the lanes, the V2 ring and its loss serve the counterfactual teacher (--cf) too
+@@ -2303,6 +2304,7 @@
+     lane_actor = GraphActor(model, n, g_ents, stream=torch.cuda.Stream(priority=-5), crn=False,
+                             memory=lane_table, temporal=lane_tstate, **lkw) \
+         if (v2_on and use_graphs and child is None) else None
++    if lane_actor is not None: lane_actor.prof_role = 'lane'
+ 
+     def mem_rows(table, idx, reset):
+         """(memory) the GRU states of workers idx from a table (zero where reset, a bool array, is set)."""

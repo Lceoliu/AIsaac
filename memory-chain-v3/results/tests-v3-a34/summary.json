@@ -1,0 +1,47 @@
+[
+ {
+  "name": "test_actor_snapshot_storage",
+  "exit": 0,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_crosscycle_cache",
+  "exit": 0,
+  "seconds": 5.2
+ },
+ {
+  "name": "test_patch_cache",
+  "exit": 0,
+  "seconds": 4.2
+ },
+ {
+  "name": "test_raw_release",
+  "exit": 0,
+  "seconds": 4.5
+ },
+ {
+  "name": "test_rebuild_memory_smoke",
+  "exit": 0,
+  "seconds": 4.9
+ },
+ {
+  "name": "test_rebuild_state_storage",
+  "exit": 0,
+  "seconds": 4.2
+ },
+ {
+  "name": "test_record_retention",
+  "exit": 0,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_source_component_parity",
+  "exit": 2,
+  "seconds": 4.1
+ },
+ {
+  "name": "test_source_pipeline",
+  "exit": 0,
+  "seconds": 4.6
+ }
+]

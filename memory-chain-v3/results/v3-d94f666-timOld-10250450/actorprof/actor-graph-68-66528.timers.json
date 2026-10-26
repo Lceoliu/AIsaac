@@ -1,0 +1,22 @@
+{
+ "kind": "graph",
+ "pid": 68,
+ "calls": 1000,
+ "window_wall_s": 5.995218388037756,
+ "process_main_calls_in_window": 2000,
+ "latency_ms": {
+  "mean": 2.867078771116212,
+  "median": 2.7584945783019066
+ },
+ "host_submit_ms": 0.7301489736419171,
+ "wait_ms": 0.010991235729306936,
+ "sections_ms": {
+  "core_replay": 0.08867380954325199,
+  "d2h": 0.04599555442109704,
+  "h2d_uniform": 0.10292614903301,
+  "stage_pack": 0.1799148533027619,
+  "tdest": 0.3076005238108337
+ },
+ "rows_mean": 9.637,
+ "notes": {}
+}

@@ -1,0 +1,36 @@
+{
+ "kind": "graph",
+ "pid": 685,
+ "calls": 1000,
+ "window_wall_s": 6.620276249945164,
+ "process_main_calls_in_window": 1996,
+ "latency_ms": {
+  "mean": 2.919134224532172,
+  "median": 2.828649478033185
+ },
+ "host_submit_ms": 0.7560819545760751,
+ "wait_ms": 0.014370388584211469,
+ "sections_ms": {
+  "core_replay": 0.09749757614918053,
+  "d2h": 0.05080025549978018,
+  "h2d_uniform": 0.10409017326310277,
+  "stage_pack": 0.17728825635276735,
+  "tdest": 0.30518929101526737
+ },
+ "sections_thread_cpu_ms": {
+  "core_replay": 0.09589918899991545,
+  "d2h": 0.04976810900009809,
+  "h2d_uniform": 0.10209340899998409,
+  "stage_pack": 0.17693189800002074,
+  "tdest": 0.3041439250000053
+ },
+ "host_submit_thread_cpu_ms": 0.7402092549999111,
+ "rows_mean": 10.276,
+ "threads": [
+  "MainThread",
+  "QueueFeederThread",
+  "Thread-1 (_read_thread)"
+ ],
+ "process_cpu_s": 62.714905437,
+ "notes": {}
+}

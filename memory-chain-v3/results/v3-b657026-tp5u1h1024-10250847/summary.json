@@ -1,0 +1,33 @@
+{
+  "case": "v3-b657026-tp5u1h1024-10250847",
+  "horizon": 1024,
+  "exit_status": 137,
+  "updates": 28,
+  "steady_updates": 18,
+  "steady_x_real_time": 301.67671509971024,
+  "medians": {
+    "x_real_time": 307.54681184250114,
+    "collect_s": 6.884113038540818,
+    "update_s": 12.388600408914499,
+    "wall_s": 14.21106553717982,
+    "gpu_reserved_gb": 20.6103515625,
+    "wait_learner_s": 7.8009878125740215,
+    "c_learner_cores": 0.684809278671087,
+    "source_graph_frames": 170219.5,
+    "source_graph_frames_uid_max": 3653.0,
+    "source_alloc_gib_max": 16.972867965698242,
+    "source_detached_frames": 438280.5
+  },
+  "peak_gpu_mib": {
+    "1": 22370.0,
+    "2": 21489.0,
+    "3": 20084.0,
+    "4": 24095.0,
+    "5": 23999.0
+  },
+  "peak_container_memory_gib": 67.02197265625,
+  "guard_stops": [
+    "no_progress_in_180_seconds"
+  ],
+  "completed": false
+}

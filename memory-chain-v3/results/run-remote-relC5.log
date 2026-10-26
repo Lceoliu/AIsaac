@@ -1,0 +1,263 @@
+===== deploy (Sat Oct 24 22:37:55 2026)
+156
+
+DEPLOY v3-e5ce72e e5ce72e93603171a481e53aabdec7236af2c68f7 EXIT 0
+ 
+[deploy v3-e5ce72e] EXIT 0
+===== relC (Sat Oct 24 22:37:57 2026)
+{"container": "sl_dev", "seconds": 60, "time": "Sat Oct 24 22:38:58 2026", "read_mb_s": 0.0, "write_mb_s": 0.10703125}
+EXIT 0
+ 
+[io sl_dev] EXIT 0
+ 05:38:59 up 12 days, 18:17,  6 users,  load average: 1.55, 3.04, 3.74
+               total        used        free      shared  buff/cache   available
+Mem:             125          18          61           0          47         107
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 12 days
+signbridge-api Up 12 days
+signbridge-web Up 12 days
+signbridge-funasr Up 12 days (healthy)
+sl_service_proxy Up 12 days
+signbridge-inference Up 12 days
+signbridge-livekit Up 12 days
+signbridge-redis Up 12 days (healthy)
+woshica_docker Up 12 days
+sl_dev Up 12 days
+zhanghao_workspace Up 12 days
+prometheus Up 12 days
+nodeexporter Up 12 days
+grafana Up 12 days
+caddy Up 12 days
+cadvisor Up 12 days (healthy)
+pushgateway Up 12 days
+alertmanager Up 12 days
+service_base Up 12 days
+
+EXIT 0
+ 
+[status] EXIT 0
+STARTED 3592046
+
+LAUNCH v3-e5ce72e-relC-10242237 EXIT 0
+ 
+[launch v3-e5ce72e-relC-10242237] EXIT 0
+command.json 9293
+config.json 6097
+dispatch.json 812
+episodes.jsonl 31921
+guard.jsonl 28168
+guard.log 249
+learner2.pstats 124249
+memory.jsonl 70957
+progress.csv 10408
+telemetry.jsonl 3285
+train.log 45799
+xvfb.log 0
+ 
+[collect v3-e5ce72e-relC-10242237] EXIT 0
+command.json 9293
+config.json 6097
+dispatch.json 812
+episodes.jsonl 146203
+guard.jsonl 56360
+guard.log 249
+learner2.pstats 124249
+memory.jsonl 416188
+progress.csv 33806
+telemetry.jsonl 6695
+train.log 169362
+xvfb.log 0
+ 
+[collect v3-e5ce72e-relC-10242237] EXIT 0
+command.json 9293
+config.json 6097
+dispatch.json 812
+episodes.jsonl 211947
+guard.jsonl 84610
+guard.log 249
+learner2.pstats 124249
+memory.jsonl 624428
+progress.csv 54967
+telemetry.jsonl 10123
+train.log 262936
+xvfb.log 0
+ 
+[collect v3-e5ce72e-relC-10242237] EXIT 0
+command.json 9293
+config.json 6097
+dispatch.json 812
+episodes.jsonl 266627
+guard.jsonl 112709
+guard.log 1629
+learner2.pstats 124249
+memory.jsonl 832716
+progress.csv 70235
+result.json 1585
+telemetry.jsonl 13238
+train.log 331588
+xvfb.log 0
+{
+  "case": "memory-v3-v3-e5ce72e-relC-10242237",
+  "exit_status": 0,
+  "elapsed_seconds": 483.18397068977356,
+  "spec": {
+    "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+    "case": "memory-v3-v3-e5ce72e-relC-10242237",
+    "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+    "code_dir": "memory-v3-code-v3-e5ce72e",
+    "memory": "72g",
+    "timeout": 2400,
+    "horizon": 2048,
+    "hours": 28.0,
+    "gpu_indices": [
+      3,
+      2,
+      4,
+      5
+    ],
+    "discard": 10,
+    "source_devices": "cuda:0,cuda:2,cuda:3",
+    "env": {
+      "ISAAC_MEMORY_ACCOUNT": "1",
+      "ISAAC_MEMORY_CENSUS": "0",
+      "ISAAC_RL_MEM_LOG": "/bench/runs/memory-v3-v3-e5ce72e-relC-10242237/memlog",
+      "ISAAC_RL_MEM_EVERY": "10"
+    },
+    "train_edits": null
+  },
+  "updates": 24,
+  "last": {
+    "update": "48208",
+    "game_hours": "58535.298814814814",
+    "errors": "0.0",
+    "stalls": "0.0",
+    "cf_done": "115.0",
+    "cf_errors": "0.0",
+    "searches": "1498.0",
+    "teach_held": "2161"
+  },
+  "steady_updates": 14,
+  "steady_x_real_time": 238.11368203284036,
+  "medians": {
+    "x_real_time": 231.36239035289202,
+    "collect_s": 10.053233615471981,
+    "update_s": 14.189034651499242,
+    "wall_s": 18.90688502753619,
+    "gpu_reserved_gb": 21.859375,
+    "wait_learner_s": 6.313173287548125,
+    "c_learner_cores": 0.5875235336245728,
+    "source_graph_frames": 104345.5,
+    "source_graph_frames_uid_max": 2973.5,
+    "source_alloc_gib_max": 16.404446840286255,
+    "source_detached_frames": 475891.5
+  }
+}
+ 
+[collect v3-e5ce72e-relC-10242237] EXIT 0
+{
+  "case": "v3-e5ce72e-relC-10242237",
+  "horizon": 2048,
+  "exit_status": 0,
+  "updates": 24,
+  "steady_updates": 14,
+  "steady_x_real_time": 238.11368203284036,
+  "medians": {
+    "x_real_time": 231.36239035289202,
+    "collect_s": 10.053233615471981,
+    "update_s": 14.189034651499242,
+    "wall_s": 18.90688502753619,
+    "gpu_reserved_gb": 21.859375,
+    "wait_learner_s": 6.313173287548125,
+    "c_learner_cores": 0.5875235336245728,
+    "source_graph_frames": 104345.5,
+    "source_graph_frames_uid_max": 2973.5,
+    "source_alloc_gib_max": 16.404446840286255,
+    "source_detached_frames": 475891.5
+  },
+  "peak_gpu_mib": {
+    "2": 22767.0,
+    "3": 22762.0,
+    "4": 23238.0,
+    "5": 24026.0
+  },
+  "peak_container_memory_gib": 63.80317306518555,
+  "guard_stops": [],
+  "completed": false
+}
+===== final (Sat Oct 24 22:47:09 2026)
+ 05:47:09 up 12 days, 18:25,  6 users,  load average: 8.02, 11.73, 8.25
+               total        used        free      shared  buff/cache   available
+Mem:             125          17          69           0          39         107
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 12 days
+signbridge-api Up 12 days
+signbridge-web Up 12 days
+signbridge-funasr Up 12 days (healthy)
+sl_service_proxy Up 12 days
+signbridge-inference Up 12 days
+signbridge-livekit Up 12 days
+signbridge-redis Up 12 days (healthy)
+woshica_docker Up 12 days
+sl_dev Up 12 days
+zhanghao_workspace Up 12 days
+prometheus Up 12 days
+nodeexporter Up 12 days
+grafana Up 12 days
+caddy Up 12 days
+cadvisor Up 12 days (healthy)
+pushgateway Up 12 days
+alertmanager Up 12 days
+service_base Up 12 days
+
+EXIT 0
+ 
+[status] EXIT 0
+no memory-v3 container left

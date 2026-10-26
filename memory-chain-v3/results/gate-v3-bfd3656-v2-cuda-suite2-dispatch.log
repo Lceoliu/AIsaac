@@ -1,0 +1,163 @@
+ 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1053891.075742803,
+      "end": 1053891.100502486
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 1,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1053891.098787612,
+      "end": 1053891.121512721
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 1,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1053891.101536157,
+      "end": 1053891.124411769
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 1,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1053891.12174728,
+      "end": 1053891.143616835
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 1,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1053891.124745289,
+      "end": 1053891.145627895
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 1,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1053891.143788918,
+      "end": 1053891.163979292
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:2",
+      "version": 1,
+      "rows": 8,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1053891.146343528,
+      "end": 1053891.166462103
+    },
+    {
+      "kind": "writer",
+      "device": "cuda:2",
+      "version": 1,
+      "rows": 16,
+      "start": 1053891.166716122,
+      "end": 1053891.170743249
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 1,
+      "rows": 1,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1053891.164158169,
+      "end": 1053891.193046486
+    },
+    {
+      "kind": "writer",
+      "device": "cuda:1",
+      "version": 1,
+      "rows": 16,
+      "start": 1053891.19313398,
+      "end": 1053891.195401647
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1053890.962917347,
+      "end": 1053891.193285803
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1053891.193285803,
+      "end": 1053891.195522287
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1053891.195522287,
+      "end": 1053891.198734182
+    }
+  ]
+}
+{"result": "PASS", "queries": 8192, "source_bf16": true, "saved_8bit_block": 0, "weight_max_abs": 1.4551915228366852e-11, "encoded_rows": [32, 32], "source_updates": 2, "early_retirement": true, "partial_checkpoint": true, "deferred_until_reader_ready": true, "offloaded_encode_calls": 0, "retained_cpu_max_bytes": 0, "spill_limited_bytes": 0}
+{
+  "result": "PASS",
+  "source_precision": "bf16",
+  "reader_precision": "fp32",
+  "optimizer": "fp32",
+  "saved_8bit_block": 0,
+  "queries": 8192,
+  "metrics": {
+    "mixed_dense": {
+      "output_max_abs": 3.738701343536377e-05,
+      "output_relative_l2": 6.065199158911128e-06,
+      "source_grad_max_abs": 0.0004962682723999023,
+      "source_grad_relative_l2": 0.0027925968173075884,
+      "source_grad_cosine": 0.9999961132650454
+    },
+    "fp32": {
+      "output_max_abs": 0.0007308274507522583,
+      "output_relative_l2": 0.00010249304614262655,
+      "source_grad_max_abs": 0.0005597854033112526,
+      "source_grad_relative_l2": 0.006320246740321993,
+      "source_grad_cosine": 0.9999811032323949
+    }
+  },
+  "encoded_rows_by_cycle": [
+    128,
+    130,
+    132,
+    134,
+    136,
+    138,
+    140
+  ],
+  "versions": 7,
+  "old_room_gradient": 0.00058746337890625,
+  "encoder_replay": 0,
+  "initial_unique_components": {},
+  "offloaded_encode_calls": 0
+}
+
+GATE v3-bfd3656-v2-cuda-suite2 EXIT 0
+
+EXIT 0

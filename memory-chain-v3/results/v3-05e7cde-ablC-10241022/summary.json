@@ -1,0 +1,18 @@
+{
+  "case": "v3-05e7cde-ablC-10241022",
+  "horizon": 2048,
+  "exit_status": 0,
+  "updates": 10,
+  "steady_updates": null,
+  "steady_x_real_time": null,
+  "medians": null,
+  "peak_gpu_mib": {
+    "2": 19159.0,
+    "3": 17436.0,
+    "4": 17536.0,
+    "5": 21366.0
+  },
+  "peak_container_memory_gib": 52.24449157714844,
+  "guard_stops": [],
+  "completed": false
+}

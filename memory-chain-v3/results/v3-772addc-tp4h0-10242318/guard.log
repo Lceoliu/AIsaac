@@ -1,0 +1,6 @@
+DISPATCH ["python3", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/run_v3_case.py", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/specs/v3-772addc-tp4h0-10242318.json"] pid 3796398
+START memory-v3-v3-772addc-tp4h0-10242318 pid 3796404
+STOP_OWN_ONLY aisaac-bench-memory-v3-v3-772addc-tp4h0-10242318 no_progress_in_180_seconds
+aisaac-bench-memory-v3-v3-772addc-tp4h0-10242318
+{"case": "memory-v3-v3-772addc-tp4h0-10242318", "exit_status": 137, "elapsed_seconds": 357.2898235321045, "spec": {"root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide", "case": "memory-v3-v3-772addc-tp4h0-10242318", "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json", "code_dir": "memory-v3-code-v3-772addc", "memory": "72g", "timeout": 2400, "horizon": 0, "hours": 62.0, "gpu_indices": [3, 2, 4, 5], "discard": 10, "source_devices": "cuda:0,cuda:2,cuda:3", "env": {"ISAAC_SOURCE_CPROFILE": "", "TORCHINDUCTOR_COMPILE_THREADS": "1"}, "train_edits": [[" --source-saved-cpu-gb 0.75 ", " --source-saved-cpu-gb 0 "]]}, "updates": 5, "last": {"update": "48189", "game_hours": "58512.230407407405", "errors": "0.0", "stalls": "0.0", "cf_done": "0.0", "cf_errors": "0.0", "searches": "335.0", "teach_held": "485"}}
+RUNNER_EXIT 137

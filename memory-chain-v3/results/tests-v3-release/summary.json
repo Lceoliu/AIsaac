@@ -1,0 +1,42 @@
+[
+ {
+  "name": "test_raw_release",
+  "exit": 0,
+  "seconds": 4.5
+ },
+ {
+  "name": "test_record_retention",
+  "exit": 0,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_source_horizon",
+  "exit": 0,
+  "seconds": 14.1
+ },
+ {
+  "name": "test_source_horizon_bound",
+  "exit": 0,
+  "seconds": 6.8
+ },
+ {
+  "name": "test_source_pipeline",
+  "exit": 0,
+  "seconds": 4.6
+ },
+ {
+  "name": "test_source_preempt",
+  "exit": 0,
+  "seconds": 14.9
+ },
+ {
+  "name": "test_source_process",
+  "exit": 0,
+  "seconds": 12.8
+ },
+ {
+  "name": "test_source_rollout_interval",
+  "exit": 0,
+  "seconds": 4.7
+ }
+]

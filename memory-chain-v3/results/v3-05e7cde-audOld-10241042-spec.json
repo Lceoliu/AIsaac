@@ -1,0 +1,22 @@
+{
+  "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+  "case": "memory-v3-v3-05e7cde-audOld-10241042",
+  "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-oldarch-baseline-command.json",
+  "code_dir": null,
+  "memory": "72g",
+  "timeout": 2400,
+  "horizon": null,
+  "hours": 12.0,
+  "gpu_indices": [
+    3,
+    2,
+    4
+  ],
+  "discard": 10,
+  "source_devices": null,
+  "env": {
+    "ISAAC_RL_MEM_LOG": "/bench/runs/memory-v3-v3-05e7cde-audOld-10241042/memlog",
+    "ISAAC_RL_MEM_EVERY": "10"
+  },
+  "train_edits": null
+}

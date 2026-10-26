@@ -1,0 +1,37 @@
+[
+ {
+  "name": "test_raw_release",
+  "exit": 0,
+  "seconds": 4.4
+ },
+ {
+  "name": "test_record_retention",
+  "exit": 0,
+  "seconds": 4.4
+ },
+ {
+  "name": "test_source_horizon",
+  "exit": 0,
+  "seconds": 13.8
+ },
+ {
+  "name": "test_source_horizon_bound",
+  "exit": 0,
+  "seconds": 6.7
+ },
+ {
+  "name": "test_source_pipeline",
+  "exit": 0,
+  "seconds": 4.7
+ },
+ {
+  "name": "test_source_preempt",
+  "exit": 0,
+  "seconds": 14.8
+ },
+ {
+  "name": "test_source_process",
+  "exit": 0,
+  "seconds": 13.0
+ }
+]

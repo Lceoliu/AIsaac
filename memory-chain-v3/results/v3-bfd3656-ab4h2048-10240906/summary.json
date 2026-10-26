@@ -1,0 +1,20 @@
+{
+  "case": "v3-bfd3656-ab4h2048-10240906",
+  "horizon": 2048,
+  "exit_status": 137,
+  "updates": 4,
+  "steady_updates": null,
+  "steady_x_real_time": null,
+  "medians": null,
+  "peak_gpu_mib": {
+    "2": 18897.0,
+    "3": 13792.0,
+    "4": 13726.0,
+    "5": 16424.0
+  },
+  "peak_container_memory_gib": 47.01763916015625,
+  "guard_stops": [
+    "host_memory_pressure"
+  ],
+  "completed": false
+}

@@ -1,0 +1,320 @@
+===== status (Sun Oct 25 06:38:43 2026)
+ 13:38:44 up 13 days,  2:17,  6 users,  load average: 4.25, 4.98, 4.85
+               total        used        free      shared  buff/cache   available
+Mem:             125          18          65           0          43         106
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 13 days
+signbridge-api Up 13 days
+signbridge-web Up 13 days
+signbridge-funasr Up 13 days (healthy)
+sl_service_proxy Up 13 days
+signbridge-inference Up 13 days
+signbridge-livekit Up 13 days
+signbridge-redis Up 13 days (healthy)
+woshica_docker Up 13 days
+sl_dev Up 13 days
+zhanghao_workspace Up 13 days
+prometheus Up 13 days
+nodeexporter Up 13 days
+grafana Up 13 days
+caddy Up 13 days
+cadvisor Up 13 days (healthy)
+pushgateway Up 13 days
+alertmanager Up 13 days
+service_base Up 13 days
+
+EXIT 0
+ 
+[status] EXIT 0
+===== actorgates (Sun Oct 25 06:38:44 2026)
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1025 13:39:25.794000 66 torch/utils/_sympy/interp.py:176] [4/1] failed while executing pow_by_natural([VR[26, int_oo], VR[-1, -1]])
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1025 13:39:39.897000 66 torch/utils/_sympy/interp.py:176] [4/2] failed while executing pow_by_natural([VR[26, 16777215], VR[-1, -1]])
+Actor capacity growth compiled graphs: 25 -> 25
+PASS CUDA Graph/eager logits, CRN actions, logp, values; variable batches, wrap, reset, fork, history growth 4.76837158203125e-07
+PASS actor version change reprojects stored values without any source re-encoding; snapshot isolation
+
+GATE v3-afd843a-rebuild-actor EXIT 0
+ 
+[gate v3-afd843a-rebuild-actor] EXIT 0
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1025 13:40:22.316000 66 torch/utils/_sympy/interp.py:176] [4/1] failed while executing pow_by_natural([VR[26, int_oo], VR[-1, -1]])
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1025 13:40:35.957000 66 torch/utils/_sympy/interp.py:176] [4/2] failed while executing pow_by_natural([VR[26, 16777215], VR[-1, -1]])
+ACTOR_TORCH_PROFILE {"kind": "rebuild", "pid": 66, "per_call": {"latency_ms": 3.285684040747583, "host_submit_ms": 3.206513007171452, "wait_ms": 0.004958943463861942, "owner_device_ms": 1282.9286494999997, "kernel_ms_all_streams": 1285.1215496999994}, "graphs_before": 11, "graphs_after": 14}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "rebuild", "pid": 66, "kernel_ms_per_call": 61.31352999999964}
+PASS rebuild {"per_call": {"latency_ms": 3.285684040747583, "host_submit_ms": 3.206513007171452, "wait_ms": 0.004958943463861942, "owner_device_ms": 1282.9286494999997, "kernel_ms_all_streams": 1285.1215496999994}, "sections": ["h.component_keys", "h.component_replay", "h.core_replay", "h.d2h", "h.grow_refresh", "h.h2d_uniform", "h.rawhistory_append", "h.reset_prefixes", "h.stage_pack", "h.state_tstate", "h.tdest", "h.writer_close"], "kernel_classes": {"other": 1283.862022499998, "gemm": 0.5689687999965694, "triton fused": 0.33629720000374635, "conv": 0.15310450000309056, "copy/memset": 0.10916949999879562, "attention/softmax": 0.055939299998804926, "index/gather/scatter": 0.033362999999988825, "reduce/norm": 0.0026849000001326205}, "parts": {"p.core_eager": 56.7816, "m.type_emb": 0.0029, "m.variant_emb": 0.0026, "m.subtype_emb": 0.0026, "m.item_emb": 0.0026, "m.trinket_emb": 0.0026, "m.entity": 1.9408, "m.door": 0.1478, "m.norm": 0.032, "m.reader_inp": 0.0024, "m.reader_layers": 0.003, "m.reader_ct": 0.7674, "m.pi": 0.0023, "m.value": 0.09, "m.danger": 0.0028}}
+
+GATE v3-afd843a-actorprof EXIT 0
+ 
+[gate v3-afd843a-actorprof] EXIT 0
+PASS branch records: crn_uniforms(crn, t); plain records: fresh uniforms (not shared across workers)
+
+GATE v3-afd843a-actor-crn EXIT 0
+ 
+[gate v3-afd843a-actor-crn] EXIT 0
+===== timNew (Sun Oct 25 06:40:58 2026)
+{"container": "sl_dev", "seconds": 60, "time": "Sun Oct 25 06:42:00 2026", "read_mb_s": 0.0, "write_mb_s": 0.10533854166666666}
+EXIT 0
+ 
+[io sl_dev] EXIT 0
+ 13:42:01 up 13 days,  2:20,  6 users,  load average: 2.88, 4.63, 4.79
+               total        used        free      shared  buff/cache   available
+Mem:             125          18          65           0          43         106
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 13 days
+signbridge-api Up 13 days
+signbridge-web Up 13 days
+signbridge-funasr Up 13 days (healthy)
+sl_service_proxy Up 13 days
+signbridge-inference Up 13 days
+signbridge-livekit Up 13 days
+signbridge-redis Up 13 days (healthy)
+woshica_docker Up 13 days
+sl_dev Up 13 days
+zhanghao_workspace Up 13 days
+prometheus Up 13 days
+nodeexporter Up 13 days
+grafana Up 13 days
+caddy Up 13 days
+cadvisor Up 13 days (healthy)
+pushgateway Up 13 days
+alertmanager Up 13 days
+service_base Up 13 days
+
+EXIT 0
+ 
+[status] EXIT 0
+STARTED 1431758
+
+LAUNCH v3-afd843a-timNew-10250640 EXIT 0
+ 
+[launch v3-afd843a-timNew-10250640] EXIT 0
+command.json 9483
+config.json 6106
+dispatch.json 816
+episodes.jsonl 0
+guard.jsonl 28275
+guard.log 253
+memory.jsonl 0
+telemetry.jsonl 3281
+train.log 9149
+xvfb.log 0
+ 
+[collect v3-afd843a-timNew-10250640] EXIT 0
+actorprof dir
+command.json 9483
+config.json 6106
+dispatch.json 816
+episodes.jsonl 108102
+guard.jsonl 56489
+guard.log 253
+memory.jsonl 15784
+progress.csv 28447
+telemetry.jsonl 6720
+train.log 57079
+xvfb.log 0
+ 
+[collect v3-afd843a-timNew-10250640] EXIT 0
+actorprof dir
+command.json 9483
+config.json 6106
+dispatch.json 816
+episodes.jsonl 197429
+guard.jsonl 84703
+guard.log 253
+memory.jsonl 30007
+progress.csv 55784
+telemetry.jsonl 10225
+train.log 99110
+xvfb.log 0
+ 
+[collect v3-afd843a-timNew-10250640] EXIT 0
+actorprof dir
+command.json 9483
+config.json 6106
+dispatch.json 816
+episodes.jsonl 197429
+guard.jsonl 90136
+guard.log 1704
+memory.jsonl 30007
+progress.csv 55784
+result.json 1668
+telemetry.jsonl 10789
+train.log 99315
+xvfb.log 0
+{
+  "case": "memory-v3-v3-afd843a-timNew-10250640",
+  "exit_status": 0,
+  "elapsed_seconds": 389.87141394615173,
+  "spec": {
+    "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+    "case": "memory-v3-v3-afd843a-timNew-10250640",
+    "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+    "code_dir": "memory-v3-code-v3-afd843a",
+    "memory": "72g",
+    "timeout": 2400,
+    "horizon": 2048,
+    "hours": 22.0,
+    "gpu_indices": [
+      3,
+      2,
+      1,
+      4,
+      5
+    ],
+    "discard": 10,
+    "source_devices": null,
+    "env": {
+      "ISAAC_SOURCE_CPROFILE": "",
+      "TORCHINDUCTOR_COMPILE_THREADS": "1",
+      "ISAAC_ACTOR_TORCH_PROFILE": "/bench/runs/memory-v3-v3-afd843a-timNew-10250640/actorprof",
+      "ISAAC_ACTOR_TORCH_PROFILE_MODE": "timers",
+      "ISAAC_ACTOR_TORCH_PROFILE_COUNT": "1000"
+    },
+    "train_edits": null
+  },
+  "updates": 19,
+  "last": {
+    "update": "48203",
+    "game_hours": "58529.229148148144",
+    "errors": "0.0",
+    "stalls": "0.0",
+    "cf_done": "63.0",
+    "cf_errors": "0.0",
+    "searches": "1079.0",
+    "teach_held": "1523"
+  },
+  "steady_updates": 9,
+  "steady_x_real_time": 318.0699619506753,
+  "medians": {
+    "x_real_time": 349.0775667946782,
+    "collect_s": 11.052812449866906,
+    "update_s": 7.134267108980566,
+    "wall_s": 12.525964854983613,
+    "gpu_reserved_gb": 19.822265625,
+    "wait_learner_s": 2.578338387887925,
+    "c_learner_cores": 0.7998349658669038,
+    "source_graph_frames": 139099.0,
+    "source_graph_frames_uid_max": 3335.0,
+    "source_alloc_gib_max": 12.412312507629395,
+    "source_detached_frames": 353942.0
+  }
+}
+ 
+[collect v3-afd843a-timNew-10250640] EXIT 0
+{
+  "case": "v3-afd843a-timNew-10250640",
+  "horizon": 2048,
+  "exit_status": 0,
+  "updates": 19,
+  "steady_updates": 9,
+  "steady_x_real_time": 318.0699619506753,
+  "medians": {
+    "x_real_time": 349.0775667946782,
+    "collect_s": 11.052812449866906,
+    "update_s": 7.134267108980566,
+    "wall_s": 12.525964854983613,
+    "gpu_reserved_gb": 19.822265625,
+    "wait_learner_s": 2.578338387887925,
+    "c_learner_cores": 0.7998349658669038,
+    "source_graph_frames": 139099.0,
+    "source_graph_frames_uid_max": 3335.0,
+    "source_alloc_gib_max": 12.412312507629395,
+    "source_detached_frames": 353942.0
+  },
+  "peak_gpu_mib": {
+    "1": 16816.0,
+    "2": 22535.0,
+    "3": 16856.0,
+    "4": 20739.0,
+    "5": 21333.0
+  },
+  "peak_container_memory_gib": 57.59068298339844,
+  "guard_stops": [],
+  "completed": false
+}

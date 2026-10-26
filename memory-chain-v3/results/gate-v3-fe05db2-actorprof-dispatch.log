@@ -1,0 +1,25 @@
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1025 12:26:00.807000 64 torch/utils/_sympy/interp.py:176] [4/1] failed while executing pow_by_natural([VR[26, int_oo], VR[-1, -1]])
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1025 12:26:14.741000 64 torch/utils/_sympy/interp.py:176] [4/2] failed while executing pow_by_natural([VR[26, 16777215], VR[-1, -1]])
+ACTOR_TORCH_PROFILE {"kind": "rebuild", "pid": 64, "per_call": {"latency_ms": 2.9820145573467016, "host_submit_ms": 2.906796056777239, "wait_ms": 0.004888046532869339, "owner_device_ms": 1319.5076296000007, "kernel_ms_all_streams": 1326.5263311000176}, "graphs_before": 11, "graphs_after": 14}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "rebuild", "pid": 64, "kernel_ms_per_call": 59.775174333333176}
+PASS rebuild {"per_call": {"latency_ms": 2.9820145573467016, "host_submit_ms": 2.906796056777239, "wait_ms": 0.004888046532869339, "owner_device_ms": 1319.5076296000007, "kernel_ms_all_streams": 1326.5263311000176}, "sections": ["h.component_keys", "h.component_replay", "h.core_replay", "h.d2h", "h.grow_refresh", "h.h2d_uniform", "h.rawhistory_append", "h.reset_prefixes", "h.stage_pack", "h.state_tstate", "h.tdest", "h.writer_close"], "kernel_classes": {"other": 1325.149070400003, "gemm": 0.5690478000073804, "triton fused": 0.4684683000079259, "conv": 0.15340319999698113, "copy/memset": 0.10564610000078725, "attention/softmax": 0.05602960000149906, "index/gather/scatter": 0.022006500000535743, "reduce/norm": 0.002659200000017881}, "parts": {"p.core_eager": 55.8217, "m.type_emb": 0.0029, "m.variant_emb": 0.0025, "m.subtype_emb": 0.0026, "m.item_emb": 0.0025, "m.trinket_emb": 0.0026, "m.entity": 1.3726, "m.door": 0.1438, "m.norm": 0.0313, "m.reader_inp": 0.0024, "m.reader_layers": 0.003, "m.reader_ct": 0.7593, "m.pi": 0.0023, "m.value": 0.0901, "m.danger": 0.0027}}
+
+GATE v3-fe05db2-actorprof EXIT 0
+
+EXIT 0

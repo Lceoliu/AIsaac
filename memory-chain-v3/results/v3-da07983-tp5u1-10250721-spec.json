@@ -1,0 +1,29 @@
+{
+  "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+  "case": "memory-v3-v3-da07983-tp5u1-10250721",
+  "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+  "code_dir": "memory-v3-code-v3-da07983",
+  "memory": "72g",
+  "timeout": 2400,
+  "horizon": 2048,
+  "hours": 62.0,
+  "gpu_indices": [
+    3,
+    2,
+    1,
+    4,
+    5
+  ],
+  "discard": 10,
+  "source_devices": null,
+  "env": {
+    "ISAAC_SOURCE_CPROFILE": "",
+    "TORCHINDUCTOR_COMPILE_THREADS": "1"
+  },
+  "train_edits": [
+    [
+      " --source-update-rollouts 2 ",
+      " --source-update-rollouts 1 "
+    ]
+  ]
+}

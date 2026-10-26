@@ -1,0 +1,17 @@
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1025 12:38:16.362000 65 torch/utils/_sympy/interp.py:176] [4/2] failed while executing pow_by_natural([VR[26, 16777215], VR[-1, -1]])
+ACTOR_TORCH_PROFILE {"kind": "rebuild", "pid": 65, "per_call": {"latency_ms": 2.1238914923742414, "host_submit_ms": 2.051813411526382, "wait_ms": 0.005143578164279461, "owner_device_ms": 1338.3969211999995, "kernel_ms_all_streams": 1340.9000727000152}, "graphs_before": 11, "graphs_after": 14}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "rebuild", "pid": 65, "kernel_ms_per_call": 42.828792333333276}
+PASS rebuild {"per_call": {"latency_ms": 2.1238914923742414, "host_submit_ms": 2.051813411526382, "wait_ms": 0.005143578164279461, "owner_device_ms": 1338.3969211999995, "kernel_ms_all_streams": 1340.9000727000152}, "sections": ["h.component_keys", "h.component_replay", "h.core_replay", "h.d2h", "h.grow_refresh", "h.h2d_uniform", "h.rawhistory_append", "h.reset_prefixes", "h.stage_pack", "h.state_tstate", "h.tdest", "h.writer_close"], "kernel_classes": {"other": 1339.5811127000009, "gemm": 0.5821151000036763, "triton fused": 0.3367884000043977, "conv": 0.15330299999935051, "copy/memset": 0.13407770000595928, "attention/softmax": 0.05897920000068844, "index/gather/scatter": 0.04144659999968717, "reduce/norm": 0.012250000000558793}, "parts": {"p.core_eager": 39.3463, "m.type_emb": 0.0029, "m.variant_emb": 0.0026, "m.subtype_emb": 0.0026, "m.item_emb": 0.0025, "m.trinket_emb": 0.0026, "m.entity": 0.9236, "m.door": 0.1482, "m.norm": 0.0308, "m.reader_inp": 0.0024, "m.reader_layers": 0.003, "m.reader_ct": 0.7298, "m.pi": 0.0023, "m.value": 0.1032, "m.danger": 0.0027}}
+
+GATE v3-3c100d5-actorprof EXIT 0
+
+EXIT 0

@@ -1,0 +1,5 @@
+W1026 05:38:35.602000 66 torch/_logging/_internal.py:1130] [0/0] 
+W1026 05:38:35.602000 66 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 05:38:35.602000 66 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 05:38:35.602000 66 torch/_logging/_internal.py:1130] [0/0] 
+PASS layer checkpoint: source gradients as the full graph {"frames": 512, "gradient_relative_error": 0.0009341370910945689, "worst_tensor_relative_error": 0.007708872482675918, "max_param_difference": 0.0006400831043720245, "saved_bytes_per_frame": {"full": 182827.703125, "checkpoint": 119669.578125}, "retained_bytes_per_frame": {"full": 201873.0, "checkpoint": 108415.0}, "vjp_seconds": {"full": 0.2067252618726343, "checkpoint": 1.2591489769984037}}

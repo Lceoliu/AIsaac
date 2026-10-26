@@ -1,0 +1,22 @@
+CUDA VJP PASS bf16 False logits max_abs 3.725290298461914e-09 gradient max_abs 5.7220458984375e-06 gradient relative_L2 1.1375640225901144e-07
+CUDA direct shared graph PASS bf16 False gradient relative_L2 6.838566026226828e-08
+CUDA VJP PASS bf16 True logits max_abs 0.00013116700574755669 gradient max_abs 0.3125 gradient relative_L2 0.004350464736393888
+CUDA direct shared graph PASS bf16 True gradient relative_L2 0.0020779054972665328
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_rebuild_memory_cuda.py", line 86, in <module>
+    assert actor.submit(row,pd,widx=np.array([0]),ukeys=(np.array([t]),np.array([0])))
+  File "/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 325, in submit
+    self.graphs[key]=self._capture(lambda:self.core_fn(r,e))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 185, in _capture
+    for _ in range(3):out=fn()
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 325, in <lambda>
+    self.graphs[key]=self._capture(lambda:self.core_fn(r,e))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 272, in _core
+    st.u[slots,times%rd.W]=u
+RuntimeError: Index put requires the source and destination dtypes match, got Float for the destination and BFloat16 for the source.
+
+GATE v3-bfd3656-v2-cuda-suite EXIT 1
+
+EXIT 1

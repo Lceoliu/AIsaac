@@ -1,0 +1,32 @@
+[
+ {
+  "name": "test_raw_release",
+  "exit": 0,
+  "seconds": 4.7
+ },
+ {
+  "name": "test_record_retention",
+  "exit": 0,
+  "seconds": 4.6
+ },
+ {
+  "name": "test_source_horizon",
+  "exit": 0,
+  "seconds": 15.2
+ },
+ {
+  "name": "test_source_pending_release",
+  "exit": 0,
+  "seconds": 5.3
+ },
+ {
+  "name": "test_source_pipeline",
+  "exit": 0,
+  "seconds": 5.3
+ },
+ {
+  "name": "test_source_process",
+  "exit": 0,
+  "seconds": 14.1
+ }
+]

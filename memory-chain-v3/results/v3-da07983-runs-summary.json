@@ -1,0 +1,21 @@
+[
+  {
+    "case": "v3-da07983-tp5u1-10250721",
+    "horizon": 2048,
+    "exit_status": 1,
+    "updates": 1,
+    "steady_updates": null,
+    "steady_x_real_time": null,
+    "medians": null,
+    "peak_gpu_mib": {
+      "1": 5078.0,
+      "2": 16159.0,
+      "3": 5128.0,
+      "4": 6337.0,
+      "5": 4725.0
+    },
+    "peak_container_memory_gib": 36.64490509033203,
+    "guard_stops": [],
+    "completed": false
+  }
+]

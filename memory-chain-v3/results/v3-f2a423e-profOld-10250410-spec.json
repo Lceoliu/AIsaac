@@ -1,0 +1,21 @@
+{
+  "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+  "case": "memory-v3-v3-f2a423e-profOld-10250410",
+  "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-oldarch-baseline-command.json",
+  "code_dir": "memory-v3-code-oldprof-2",
+  "memory": "72g",
+  "timeout": 2400,
+  "horizon": null,
+  "hours": 22.0,
+  "gpu_indices": [
+    3,
+    2,
+    4
+  ],
+  "discard": 10,
+  "source_devices": null,
+  "env": {
+    "ISAAC_ACTOR_TORCH_PROFILE": "/bench/runs/memory-v3-v3-f2a423e-profOld-10250410/actorprof"
+  },
+  "train_edits": null
+}

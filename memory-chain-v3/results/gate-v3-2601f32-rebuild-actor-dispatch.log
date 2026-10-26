@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\bench_v3.py", line 187, in <module>
+    main()
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\bench_v3.py", line 169, in main
+    assert not busy & set(selected), ('selected GPU busy', busy & set(selected))
+AssertionError: ('selected GPU busy', {'GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12', 'GPU-607afe31-2f98-e891-2806-61d5654ffe1a', 'GPU-9a49bc46-f76b-dba0-6370-1b9030e16648'})
+
+EXIT 1

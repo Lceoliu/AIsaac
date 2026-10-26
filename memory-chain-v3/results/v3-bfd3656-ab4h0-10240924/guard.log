@@ -1,0 +1,6 @@
+DISPATCH ["python3", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/run_v3_case.py", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/specs/v3-bfd3656-ab4h0-10240924.json"] pid 1331002
+START memory-v3-v3-bfd3656-ab4h0-10240924 pid 1331009
+STOP_OWN_ONLY aisaac-bench-memory-v3-v3-bfd3656-ab4h0-10240924 external_swap_or_oom_increase
+aisaac-bench-memory-v3-v3-bfd3656-ab4h0-10240924
+{"case": "memory-v3-v3-bfd3656-ab4h0-10240924", "exit_status": 137, "elapsed_seconds": 205.28137731552124, "spec": {"root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide", "case": "memory-v3-v3-bfd3656-ab4h0-10240924", "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json", "code_dir": "memory-v3-code-v3-bfd3656", "memory": "72g", "timeout": 2400, "horizon": 0, "hours": null, "gpu_indices": [3, 2, 4, 5], "discard": 10, "source_devices": "cuda:0,cuda:2,cuda:3"}, "updates": 9, "last": {"update": "48193", "game_hours": "58517.08666666666", "errors": "0.0", "stalls": "0.0", "cf_done": "0.0", "cf_errors": "0.0", "searches": "615.0", "teach_held": "857"}}
+RUNNER_EXIT 137

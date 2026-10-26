@@ -1,0 +1,22 @@
+ACTOR_TORCH_PROFILE {"kind": "rebuild", "pid": 65, "per_call": {"latency_ms": 3.1357399420812726, "host_submit_ms": 3.064212971366942, "wait_ms": 0.005075475201010704, "kernel_ms_all_streams": 589.1097535000029}, "graphs_before": 11, "graphs_after": 14}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "rebuild", "pid": 65, "kernel_ms_per_call": 67.10345666666653}
+PASS rebuild {"per_call": {"latency_ms": 3.1357399420812726, "host_submit_ms": 3.064212971366942, "wait_ms": 0.005075475201010704, "kernel_ms_all_streams": 589.1097535000029}, "sections": ["h.component_keys", "h.component_replay", "h.core_replay", "h.d2h", "h.grow_refresh", "h.h2d_uniform", "h.rawhistory_append", "h.reset_prefixes", "h.stage_pack", "h.state_tstate", "h.tdest", "h.writer_close"], "kernel_classes": {"other": 587.8493631999994, "gemm": 0.5690766000019954, "triton fused": 0.33632399999896995, "conv": 0.15325160000102778, "copy/memset": 0.10954320000001061, "attention/softmax": 0.056197800000570716, "index/gather/scatter": 0.03330900000038673, "reduce/norm": 0.0026881000000983477}, "parts": {"p.core_eager": 57.0923, "m.type_emb": 0.0029, "m.variant_emb": 0.0025, "m.subtype_emb": 0.0026, "m.item_emb": 0.0025, "m.trinket_emb": 0.0026, "m.entity": 1.9908, "m.door": 0.1488, "m.norm": 0.0317, "m.reader_inp": 0.0024, "m.reader_layers": 0.003, "m.reader_ct": 0.739, "m.pi": 0.0023, "m.value": 0.0957, "m.danger": 0.0027, "h.reset_prefixes": 0.0, "h.grow_refresh": 0.0, "h.stage_pack": 0.0, "h.component_keys": 0.0, "h.h2d_uniform": 0.1028, "h.component_replay": 0.1384, "h.core_replay": 0.1625, "h.d2h": 0.0011, "h.rawhistory_append": 0.0, "h.state_tstate": 0.0795, "h.writer_close": 0.7625, "h.tdest": 4.2056}}
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+ACTOR_TORCH_PROFILE {"kind": "graph", "pid": 65, "per_call": {"latency_ms": 1.707914867438376, "host_submit_ms": 1.150464522652328, "wait_ms": 0.5175365367904305, "kernel_ms_all_streams": 2.6126913000000096}, "graphs_before": 6, "graphs_after": 6}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "graph", "pid": 65, "kernel_ms_per_call": 66.2870586666668}
+PASS graph {"per_call": {"latency_ms": 1.707914867438376, "host_submit_ms": 1.150464522652328, "wait_ms": 0.5175365367904305, "kernel_ms_all_streams": 2.6126913000000096}, "sections": ["h.core_replay", "h.d2h", "h.h2d_uniform", "h.stage_pack", "h.tdest"], "kernel_classes": {"other": 1.4640741000000042, "gemm": 0.5175720000000023, "conv": 0.1778251999999996, "triton fused": 0.15840710000000507, "index/gather/scatter": 0.1429419999999983, "copy/memset": 0.09242740000000095, "reduce/norm": 0.039181100000001697, "attention/softmax": 0.02026239999999798}, "parts": {"p.core_eager": 44.7088, "m.type_emb": 0.0031, "m.variant_emb": 0.0026, "m.subtype_emb": 0.0026, "m.item_emb": 0.0172, "m.trinket_emb": 0.0105, "m.entity": 0.0926, "m.patch": 7.4669, "m.pill_emb": 0.0041, "m.effect_emb": 0.0047, "m.card_emb": 0.004, "m.char_emb": 0.0037, "m.room": 6.0488, "m.map": 1.398, "m.itok": 3.3253, "m.door": 0.1509, "m.norm": 0.0279, "m.pi": 0.0027, "m.value": 0.098, "m.danger": 0.0027, "h.stage_pack": 0.0, "h.h2d_uniform": 0.0212, "h.core_replay": 0.9018, "h.d2h": 0.0011, "h.tdest": 0.0009}}

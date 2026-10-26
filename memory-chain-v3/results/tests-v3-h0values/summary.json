@@ -1,0 +1,77 @@
+[
+ {
+  "name": "test_cf_smoke",
+  "exit": 0,
+  "seconds": 4.9
+ },
+ {
+  "name": "test_lane_batch_smoke",
+  "exit": 0,
+  "seconds": 5.7
+ },
+ {
+  "name": "test_learner_fast2_smoke",
+  "exit": 0,
+  "seconds": 4.6
+ },
+ {
+  "name": "test_memory_smoke",
+  "exit": 0,
+  "seconds": 5.1
+ },
+ {
+  "name": "test_raw_release",
+  "exit": 0,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_rebuild_memory_smoke",
+  "exit": 0,
+  "seconds": 4.8
+ },
+ {
+  "name": "test_record_retention",
+  "exit": 0,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_source_horizon",
+  "exit": 0,
+  "seconds": 13.6
+ },
+ {
+  "name": "test_source_horizon_bound",
+  "exit": 0,
+  "seconds": 7.1
+ },
+ {
+  "name": "test_source_lifetime",
+  "exit": 0,
+  "seconds": 4.2
+ },
+ {
+  "name": "test_source_pipeline",
+  "exit": 0,
+  "seconds": 4.6
+ },
+ {
+  "name": "test_source_process",
+  "exit": 0,
+  "seconds": 12.8
+ },
+ {
+  "name": "test_source_rollout_interval",
+  "exit": 0,
+  "seconds": 4.6
+ },
+ {
+  "name": "test_stateless_teacher_batch",
+  "exit": 0,
+  "seconds": 4.2
+ },
+ {
+  "name": "test_teacher_context_lifetime",
+  "exit": 0,
+  "seconds": 4.0
+ }
+]

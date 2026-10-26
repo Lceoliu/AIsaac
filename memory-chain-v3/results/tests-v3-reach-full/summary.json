@@ -1,0 +1,327 @@
+[
+ {
+  "name": "test_actor_crn_cuda",
+  "exit": 1,
+  "seconds": 4.2
+ },
+ {
+  "name": "test_actor_d2h",
+  "exit": 1,
+  "seconds": 2.2
+ },
+ {
+  "name": "test_actor_graph_pool",
+  "exit": 1,
+  "seconds": 2.2
+ },
+ {
+  "name": "test_actor_processes_smoke",
+  "exit": 0,
+  "seconds": 6.3
+ },
+ {
+  "name": "test_actor_profile_cuda",
+  "exit": 1,
+  "seconds": 4.1
+ },
+ {
+  "name": "test_actor_reader_version",
+  "exit": 0,
+  "seconds": 4.1
+ },
+ {
+  "name": "test_actor_shutdown_smoke",
+  "exit": 0,
+  "seconds": 0.7
+ },
+ {
+  "name": "test_actor_snapshot_storage",
+  "exit": 0,
+  "seconds": 4.0
+ },
+ {
+  "name": "test_actor_streams",
+  "exit": 1,
+  "seconds": 4.1
+ },
+ {
+  "name": "test_cf_smoke",
+  "exit": 0,
+  "seconds": 5.0
+ },
+ {
+  "name": "test_cf_wall_smoke",
+  "exit": 0,
+  "seconds": 4.1
+ },
+ {
+  "name": "test_crosscycle_cache",
+  "exit": 0,
+  "seconds": 5.7
+ },
+ {
+  "name": "test_eval_ablate_smoke",
+  "exit": 0,
+  "seconds": 4.7
+ },
+ {
+  "name": "test_fused_tokens_smoke",
+  "exit": 0,
+  "seconds": 23.6
+ },
+ {
+  "name": "test_incremental_ipc",
+  "exit": 0,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_inventory_all_smoke",
+  "exit": 0,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_item_global_smoke",
+  "exit": 0,
+  "seconds": 8.9
+ },
+ {
+  "name": "test_lane_batch_smoke",
+  "exit": 0,
+  "seconds": 6.6
+ },
+ {
+  "name": "test_learner_device_smoke",
+  "exit": 0,
+  "seconds": 6.2
+ },
+ {
+  "name": "test_learner_fast2_smoke",
+  "exit": 0,
+  "seconds": 5.1
+ },
+ {
+  "name": "test_memory_smoke",
+  "exit": 0,
+  "seconds": 5.7
+ },
+ {
+  "name": "test_no_active_smoke",
+  "exit": 0,
+  "seconds": 4.4
+ },
+ {
+  "name": "test_no_gru_smoke",
+  "exit": 0,
+  "seconds": 11.1
+ },
+ {
+  "name": "test_obs_v2_smoke",
+  "exit": 0,
+  "seconds": 5.5
+ },
+ {
+  "name": "test_patch_cache",
+  "exit": 0,
+  "seconds": 4.1
+ },
+ {
+  "name": "test_pickup_smoke",
+  "exit": 0,
+  "seconds": 5.5
+ },
+ {
+  "name": "test_raw_release",
+  "exit": 0,
+  "seconds": 4.6
+ },
+ {
+  "name": "test_reader_indices",
+  "exit": 0,
+  "seconds": 2.2
+ },
+ {
+  "name": "test_rebuild_actor_cuda",
+  "exit": 1,
+  "seconds": 4.0
+ },
+ {
+  "name": "test_rebuild_actor_state_cuda",
+  "exit": 1,
+  "seconds": 4.1
+ },
+ {
+  "name": "test_rebuild_memory_cuda",
+  "exit": 1,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_rebuild_memory_smoke",
+  "exit": 0,
+  "seconds": 5.3
+ },
+ {
+  "name": "test_rebuild_state_storage",
+  "exit": 0,
+  "seconds": 4.4
+ },
+ {
+  "name": "test_recent_frame_union",
+  "exit": 0,
+  "seconds": 4.0
+ },
+ {
+  "name": "test_record_retention",
+  "exit": 0,
+  "seconds": 4.6
+ },
+ {
+  "name": "test_room_memory_smoke",
+  "exit": 0,
+  "seconds": 11.8
+ },
+ {
+  "name": "test_room_pipeline_smoke",
+  "exit": 0,
+  "seconds": 5.2
+ },
+ {
+  "name": "test_saved_activation",
+  "exit": 1,
+  "seconds": 2.5
+ },
+ {
+  "name": "test_saved_activation_compile",
+  "exit": 1,
+  "seconds": 3.8
+ },
+ {
+  "name": "test_source_async",
+  "exit": 0,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_source_compile_versions",
+  "exit": 0,
+  "seconds": 16.8
+ },
+ {
+  "name": "test_source_component_parity",
+  "exit": 2,
+  "seconds": 4.0
+ },
+ {
+  "name": "test_source_dispatch_at_close",
+  "exit": 0,
+  "seconds": 4.6
+ },
+ {
+  "name": "test_source_export_edge",
+  "exit": 0,
+  "seconds": 3.3
+ },
+ {
+  "name": "test_source_gradient_buffers",
+  "exit": 0,
+  "seconds": 4.2
+ },
+ {
+  "name": "test_source_horizon",
+  "exit": 0,
+  "seconds": 14.0
+ },
+ {
+  "name": "test_source_horizon_bound",
+  "exit": 0,
+  "seconds": 7.3
+ },
+ {
+  "name": "test_source_layer_checkpoint_cuda",
+  "exit": 1,
+  "seconds": 4.1
+ },
+ {
+  "name": "test_source_lifetime",
+  "exit": 0,
+  "seconds": 6.9
+ },
+ {
+  "name": "test_source_pending_horizon",
+  "exit": 0,
+  "seconds": 6.7
+ },
+ {
+  "name": "test_source_pending_release",
+  "exit": 0,
+  "seconds": 5.9
+ },
+ {
+  "name": "test_source_pipeline",
+  "exit": 0,
+  "seconds": 6.3
+ },
+ {
+  "name": "test_source_pointwise",
+  "exit": 0,
+  "seconds": 13.8
+ },
+ {
+  "name": "test_source_precision",
+  "exit": 0,
+  "seconds": 11.4
+ },
+ {
+  "name": "test_source_precision_checkpoint",
+  "exit": 2,
+  "seconds": 4.2
+ },
+ {
+  "name": "test_source_preempt",
+  "exit": 0,
+  "seconds": 16.5
+ },
+ {
+  "name": "test_source_process",
+  "exit": 0,
+  "seconds": 13.9
+ },
+ {
+  "name": "test_source_reach_intervals",
+  "exit": 0,
+  "seconds": 6.6
+ },
+ {
+  "name": "test_source_rollout_interval",
+  "exit": 0,
+  "seconds": 5.1
+ },
+ {
+  "name": "test_source_shared_cast",
+  "exit": 0,
+  "seconds": 4.4
+ },
+ {
+  "name": "test_source_streaming",
+  "exit": 0,
+  "seconds": 5.5
+ },
+ {
+  "name": "test_stall_progress_smoke",
+  "exit": 0,
+  "seconds": 4.3
+ },
+ {
+  "name": "test_stateless_teacher_batch",
+  "exit": 0,
+  "seconds": 4.6
+ },
+ {
+  "name": "test_teacher_context_lifetime",
+  "exit": 0,
+  "seconds": 4.2
+ },
+ {
+  "name": "test_temporal_smoke",
+  "exit": 0,
+  "seconds": 14.9
+ }
+]

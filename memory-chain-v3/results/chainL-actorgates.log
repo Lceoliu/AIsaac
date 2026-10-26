@@ -1,0 +1,27 @@
+===== actorgates (Sun Oct 25 22:37:14 2026)
+Actor capacity growth compiled graphs: 25 -> 25
+PASS CUDA Graph/eager logits, CRN actions, logp, values; variable batches, wrap, reset, fork, history growth 4.76837158203125e-07
+PASS actor version change reprojects stored values without any source re-encoding; snapshot isolation
+
+GATE v3-208911e-rebuild-actor EXIT 0
+ 
+[gate v3-208911e-rebuild-actor] EXIT 0
+PASS RebuildGraphActor temporal state written in the graph: prev_o, steps, prev_stage; other slots and K / V untouched
+
+GATE v3-208911e-actor-state EXIT 0
+ 
+[gate v3-208911e-actor-state] EXIT 0
+PASS branch records: crn_uniforms(crn, t); plain records: fresh uniforms (not shared across workers)
+
+GATE v3-208911e-actor-crn EXIT 0
+ 
+[gate v3-208911e-actor-crn] EXIT 0
+W1026 05:38:35.602000 66 torch/_logging/_internal.py:1130] [0/0] 
+W1026 05:38:35.602000 66 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 05:38:35.602000 66 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 05:38:35.602000 66 torch/_logging/_internal.py:1130] [0/0] 
+PASS layer checkpoint: source gradients as the full graph {"frames": 512, "gradient_relative_error": 0.0009341370910945689, "worst_tensor_relative_error": 0.007708872482675918, "max_param_difference": 0.0006400831043720245, "saved_bytes_per_frame": {"full": 182827.703125, "checkpoint": 119669.578125}, "retained_bytes_per_frame": {"full": 201873.0, "checkpoint": 108415.0}, "vjp_seconds": {"full": 0.2067252618726343, "checkpoint": 1.2591489769984037}}
+
+GATE v3-208911e-layer-ckpt EXIT 0
+ 
+[gate v3-208911e-layer-ckpt] EXIT 0

@@ -1,0 +1,38 @@
+{
+  "case": "memory-v3-v3-05e7cde-ablC-10241022",
+  "exit_status": 0,
+  "elapsed_seconds": 224.94821667671204,
+  "spec": {
+    "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+    "case": "memory-v3-v3-05e7cde-ablC-10241022",
+    "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+    "code_dir": "memory-v3-code-v3-05e7cde",
+    "memory": "72g",
+    "timeout": 2400,
+    "horizon": 2048,
+    "hours": 12.0,
+    "gpu_indices": [
+      3,
+      2,
+      4,
+      5
+    ],
+    "discard": 10,
+    "source_devices": "cuda:0,cuda:2,cuda:3",
+    "env": {
+      "ISAAC_MEMORY_ACCOUNT": "1"
+    },
+    "train_edits": null
+  },
+  "updates": 10,
+  "last": {
+    "update": "48194",
+    "game_hours": "58518.29959259259",
+    "errors": "0.0",
+    "stalls": "0.0",
+    "cf_done": "1.0",
+    "cf_errors": "0.0",
+    "searches": "624.0",
+    "teach_held": "906"
+  }
+}

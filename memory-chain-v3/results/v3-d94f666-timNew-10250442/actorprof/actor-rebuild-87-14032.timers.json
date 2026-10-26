@@ -1,0 +1,36 @@
+{
+ "kind": "rebuild",
+ "pid": 87,
+ "calls": 1000,
+ "window_wall_s": 18.305775427026674,
+ "process_main_calls_in_window": 2001,
+ "latency_ms": {
+  "mean": 15.370273075066507,
+  "median": 12.262220028787851
+ },
+ "host_submit_ms": 3.425832729320973,
+ "wait_ms": 0.011780187720432878,
+ "sections_ms": {
+  "component_keys": 0.4955461192876101,
+  "component_replay": 0.045981440460309386,
+  "core_replay": 0.02279757778160274,
+  "d2h": 0.07481534988619387,
+  "grow_refresh": 0.10381049592979252,
+  "h2d_uniform": 0.286916789598763,
+  "rawhistory_append": 0.6267518477980047,
+  "reset_prefixes": 0.13356034248135984,
+  "stage_pack": 0.1452105618081987,
+  "state_tstate": 0.23613997432403266,
+  "tdest": 0.6833926560357213,
+  "writer_close": 0.5660241458099335
+ },
+ "rows_mean": 14.573,
+ "notes": {
+  "len_max": 2619.061,
+  "len_mean": 985.2622122845149,
+  "capacity": 256.0,
+  "closed": 0.231,
+  "component_rows": 39.856,
+  "stale": 0.029
+ }
+}

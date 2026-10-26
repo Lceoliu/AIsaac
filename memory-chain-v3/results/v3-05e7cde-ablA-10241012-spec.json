@@ -1,0 +1,31 @@
+{
+  "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+  "case": "memory-v3-v3-05e7cde-ablA-10241012",
+  "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+  "code_dir": "memory-v3-code-v3-05e7cde",
+  "memory": "72g",
+  "timeout": 2400,
+  "horizon": 2048,
+  "hours": 12.0,
+  "gpu_indices": [
+    3,
+    2,
+    4,
+    5
+  ],
+  "discard": 10,
+  "source_devices": "cuda:0,cuda:2,cuda:3",
+  "env": {
+    "ISAAC_MEMORY_ACCOUNT": "1"
+  },
+  "train_edits": [
+    [
+      " --teacher --teacher-queue",
+      " --teacher-queue"
+    ],
+    [
+      " --cf 1 ",
+      " --cf 0 "
+    ]
+  ]
+}

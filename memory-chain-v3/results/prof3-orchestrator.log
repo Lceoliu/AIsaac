@@ -1,0 +1,504 @@
+===== status (Sun Oct 25 04:21:25 2026)
+ 11:21:25 up 13 days, 0 min,  5 users,  load average: 1.38, 5.53, 8.50
+               total        used        free      shared  buff/cache   available
+Mem:             125          18          68           0          40         107
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 13 days
+signbridge-api Up 13 days
+signbridge-web Up 13 days
+signbridge-funasr Up 13 days (healthy)
+sl_service_proxy Up 13 days
+signbridge-inference Up 13 days
+signbridge-livekit Up 13 days
+signbridge-redis Up 13 days (healthy)
+woshica_docker Up 13 days
+sl_dev Up 13 days
+zhanghao_workspace Up 13 days
+prometheus Up 13 days
+nodeexporter Up 13 days
+grafana Up 13 days
+caddy Up 13 days
+cadvisor Up 13 days (healthy)
+pushgateway Up 13 days
+alertmanager Up 13 days
+service_base Up 13 days
+
+EXIT 0
+ 
+[status] EXIT 0
+===== profgates (Sun Oct 25 04:21:25 2026)
+ACTOR_TORCH_PROFILE {"kind": "rebuild", "pid": 66, "per_call": {"latency_ms": 3.194988355971873, "host_submit_ms": 3.1256608199328184, "wait_ms": 0.004991423338651657, "owner_device_ms": 587.2373644000002, "kernel_ms_all_streams": 589.3552575000039}, "graphs_before": 11, "graphs_after": 14}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "rebuild", "pid": 66, "kernel_ms_per_call": 60.304318999999595}
+PASS rebuild {"per_call": {"latency_ms": 3.194988355971873, "host_submit_ms": 3.1256608199328184, "wait_ms": 0.004991423338651657, "owner_device_ms": 587.2373644000002, "kernel_ms_all_streams": 589.3552575000039}, "sections": ["h.component_keys", "h.component_replay", "h.core_replay", "h.d2h", "h.grow_refresh", "h.h2d_uniform", "h.rawhistory_append", "h.reset_prefixes", "h.stage_pack", "h.state_tstate", "h.tdest", "h.writer_close"], "kernel_classes": {"other": 588.0951572000006, "gemm": 0.5690221999990632, "triton fused": 0.33621910000246824, "conv": 0.15322720000033532, "copy/memset": 0.10937689999959092, "attention/softmax": 0.05618140000067652, "index/gather/scatter": 0.03338850000078091, "reduce/norm": 0.0026850000001490118}, "parts": {"p.core_eager": 55.6842, "m.type_emb": 0.0029, "m.variant_emb": 0.0026, "m.subtype_emb": 0.0026, "m.item_emb": 0.0025, "m.trinket_emb": 0.0026, "m.entity": 2.0194, "m.door": 0.147, "m.norm": 0.0311, "m.reader_inp": 0.0024, "m.reader_layers": 0.003, "m.reader_ct": 0.7686, "m.pi": 0.0023, "m.value": 0.0992, "m.danger": 0.0028}}
+ACTOR_TORCH_PROFILE {"kind": "graph", "pid": 66, "per_call": {"latency_ms": 1.6710589407011867, "host_submit_ms": 1.1059389216825366, "wait_ms": 0.5292556015774608, "owner_device_ms": 1.3703064000000014, "kernel_ms_all_streams": 2.685529300000019}, "graphs_before": 6, "graphs_after": 6}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "graph", "pid": 66, "kernel_ms_per_call": 54.71340466666636}
+PASS graph {"per_call": {"latency_ms": 1.6710589407011867, "host_submit_ms": 1.1059389216825366, "wait_ms": 0.5292556015774608, "owner_device_ms": 1.3703064000000014, "kernel_ms_all_streams": 2.685529300000019}, "sections": ["h.core_replay", "h.d2h", "h.h2d_uniform", "h.stage_pack", "h.tdest"], "kernel_classes": {"other": 1.5372736000000118, "gemm": 0.5172631000000053, "conv": 0.17768839999999472, "triton fused": 0.15823770000000312, "index/gather/scatter": 0.1431482000000029, "copy/memset": 0.09255199999999922, "reduce/norm": 0.03914560000000029, "attention/softmax": 0.020220700000001125}, "parts": {"p.core_eager": 37.2184, "m.type_emb": 0.0031, "m.variant_emb": 0.0027, "m.subtype_emb": 0.0026, "m.item_emb": 0.0173, "m.trinket_emb": 0.0105, "m.entity": 0.1172, "m.patch": 5.2839, "m.pill_emb": 0.0042, "m.effect_emb": 0.0046, "m.card_emb": 0.004, "m.char_emb": 0.0037, "m.room": 5.0981, "m.map": 1.3419, "m.itok": 3.3333, "m.door": 0.1511, "m.norm": 0.0297, "m.pi": 0.0027, "m.value": 0.0915, "m.danger": 0.0027}}
+
+GATE v3-61a2ea3-actorprof EXIT 0
+ 
+[gate v3-61a2ea3-actorprof] EXIT 0
+ACTOR_TORCH_PROFILE {"kind": "graph", "pid": 66, "per_call": {"latency_ms": 1.677304389886558, "host_submit_ms": 1.1144925374537706, "wait_ms": 0.5329275736585259, "owner_device_ms": 1.361649999999999, "kernel_ms_all_streams": 2.6731146000000026}, "graphs_before": 6, "graphs_after": 6}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "graph", "pid": 66, "kernel_ms_per_call": 79.23881199999995}
+PASS graph {"per_call": {"latency_ms": 1.677304389886558, "host_submit_ms": 1.1144925374537706, "wait_ms": 0.5329275736585259, "owner_device_ms": 1.361649999999999, "kernel_ms_all_streams": 2.6731146000000026}, "sections": ["h.core_replay", "h.d2h", "h.h2d_uniform", "h.stage_pack", "h.tdest"], "kernel_classes": {"other": 1.528278499999994, "gemm": 0.5169376999999983, "conv": 0.1775848000000067, "triton fused": 0.15900689999999923, "index/gather/scatter": 0.14300810000000175, "copy/memset": 0.09195290000000482, "reduce/norm": 0.03907539999999944, "attention/softmax": 0.017270299999998136}, "parts": {"p.core_eager": 60.9699, "m.type_emb": 0.003, "m.variant_emb": 0.0026, "m.subtype_emb": 0.0026, "m.item_emb": 0.0174, "m.trinket_emb": 0.0106, "m.entity": 0.1052, "m.patch": 5.4352, "m.pill_emb": 0.0042, "m.effect_emb": 0.0047, "m.card_emb": 0.0041, "m.char_emb": 0.0036, "m.room": 5.352, "m.map": 1.4309, "m.itok": 3.5478, "m.door": 0.235, "m.norm": 0.0282, "m.pi": 0.0026, "m.value": 0.0895, "m.danger": 0.0023}}
+
+GATE oldprof-4-actorprof EXIT 0
+ 
+[gate oldprof-4-actorprof] EXIT 0
+===== profNew (Sun Oct 25 04:22:53 2026)
+{"container": "sl_dev", "seconds": 60, "time": "Sun Oct 25 04:23:53 2026", "read_mb_s": 0.0, "write_mb_s": 0.11796875}
+EXIT 0
+ 
+[io sl_dev] EXIT 0
+ 11:23:55 up 13 days, 2 min,  6 users,  load average: 1.07, 3.82, 7.41
+               total        used        free      shared  buff/cache   available
+Mem:             125          18          68           0          40         106
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 13 days
+signbridge-api Up 13 days
+signbridge-web Up 13 days
+signbridge-funasr Up 13 days (healthy)
+sl_service_proxy Up 13 days
+signbridge-inference Up 13 days
+signbridge-livekit Up 13 days
+signbridge-redis Up 13 days (healthy)
+woshica_docker Up 13 days
+sl_dev Up 13 days
+zhanghao_workspace Up 13 days
+prometheus Up 13 days
+nodeexporter Up 13 days
+grafana Up 13 days
+caddy Up 13 days
+cadvisor Up 13 days (healthy)
+pushgateway Up 13 days
+alertmanager Up 13 days
+service_base Up 13 days
+
+EXIT 0
+ 
+[status] EXIT 0
+STARTED 780252
+
+LAUNCH v3-61a2ea3-profNew-10250422 EXIT 0
+ 
+[launch v3-61a2ea3-profNew-10250422] EXIT 0
+command.json 9282
+config.json 6107
+dispatch.json 818
+episodes.jsonl 33014
+guard.jsonl 28252
+guard.log 253
+memory.jsonl 4720
+progress.csv 10696
+telemetry.jsonl 3312
+train.log 17879
+xvfb.log 0
+ 
+[collect v3-61a2ea3-profNew-10250422] EXIT 0
+actorprof dir
+command.json 9282
+config.json 6107
+dispatch.json 818
+episodes.jsonl 110884
+guard.jsonl 56539
+guard.log 253
+memory.jsonl 14180
+progress.csv 25704
+telemetry.jsonl 6766
+train.log 47582
+xvfb.log 0
+ 
+[collect v3-61a2ea3-profNew-10250422] EXIT 0
+actorprof dir
+command.json 9282
+config.json 6107
+dispatch.json 818
+episodes.jsonl 192309
+guard.jsonl 84792
+guard.log 253
+memory.jsonl 26831
+progress.csv 50062
+telemetry.jsonl 10254
+train.log 85125
+xvfb.log 0
+ 
+[collect v3-61a2ea3-profNew-10250422] EXIT 0
+actorprof dir
+command.json 9282
+config.json 6107
+dispatch.json 818
+episodes.jsonl 211167
+guard.jsonl 95875
+guard.log 1620
+memory.jsonl 29992
+progress.csv 55834
+result.json 1572
+telemetry.jsonl 11670
+train.log 94103
+xvfb.log 0
+{
+  "case": "memory-v3-v3-61a2ea3-profNew-10250422",
+  "exit_status": 0,
+  "elapsed_seconds": 420.7769227027893,
+  "spec": {
+    "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+    "case": "memory-v3-v3-61a2ea3-profNew-10250422",
+    "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+    "code_dir": "memory-v3-code-v3-61a2ea3",
+    "memory": "72g",
+    "timeout": 2400,
+    "horizon": 2048,
+    "hours": 22.0,
+    "gpu_indices": [
+      3,
+      2,
+      1,
+      4,
+      5
+    ],
+    "discard": 10,
+    "source_devices": null,
+    "env": {
+      "ISAAC_SOURCE_CPROFILE": "",
+      "TORCHINDUCTOR_COMPILE_THREADS": "1",
+      "ISAAC_ACTOR_TORCH_PROFILE": "/bench/runs/memory-v3-v3-61a2ea3-profNew-10250422/actorprof"
+    },
+    "train_edits": null
+  },
+  "updates": 19,
+  "last": {
+    "update": "48203",
+    "game_hours": "58529.227296296296",
+    "errors": "0.0",
+    "stalls": "0.0",
+    "cf_done": "63.0",
+    "cf_errors": "0.0",
+    "searches": "1179.0",
+    "teach_held": "1679"
+  },
+  "steady_updates": 9,
+  "steady_x_real_time": 299.60948830325657,
+  "medians": {
+    "x_real_time": 361.5730272674658,
+    "collect_s": 12.128845501923934,
+    "update_s": 7.746039789868519,
+    "wall_s": 12.086447283858433,
+    "gpu_reserved_gb": 23.162109375,
+    "wait_learner_s": 3.1169414569158107,
+    "c_learner_cores": 0.8106506361511546,
+    "source_graph_frames": 129261.0,
+    "source_graph_frames_uid_max": 3368.0,
+    "source_alloc_gib_max": 12.74531078338623,
+    "source_detached_frames": 350214.0
+  }
+}
+ 
+[collect v3-61a2ea3-profNew-10250422] EXIT 0
+{
+  "case": "v3-61a2ea3-profNew-10250422",
+  "horizon": 2048,
+  "exit_status": 0,
+  "updates": 19,
+  "steady_updates": 9,
+  "steady_x_real_time": 299.60948830325657,
+  "medians": {
+    "x_real_time": 361.5730272674658,
+    "collect_s": 12.128845501923934,
+    "update_s": 7.746039789868519,
+    "wall_s": 12.086447283858433,
+    "gpu_reserved_gb": 23.162109375,
+    "wait_learner_s": 3.1169414569158107,
+    "c_learner_cores": 0.8106506361511546,
+    "source_graph_frames": 129261.0,
+    "source_graph_frames_uid_max": 3368.0,
+    "source_alloc_gib_max": 12.74531078338623,
+    "source_detached_frames": 350214.0
+  },
+  "peak_gpu_mib": {
+    "1": 17348.0,
+    "2": 24101.0,
+    "3": 17438.0,
+    "4": 19771.0,
+    "5": 19877.0
+  },
+  "peak_container_memory_gib": 61.10235595703125,
+  "guard_stops": [],
+  "completed": false
+}
+===== profOld (Sun Oct 25 04:32:08 2026)
+{"container": "sl_dev", "seconds": 60, "time": "Sun Oct 25 04:33:08 2026", "read_mb_s": 0.0, "write_mb_s": 0.11627604166666666}
+EXIT 0
+ 
+[io sl_dev] EXIT 0
+ 11:33:10 up 13 days, 11 min,  6 users,  load average: 1.58, 7.10, 8.33
+               total        used        free      shared  buff/cache   available
+Mem:             125          18          68           0          40         106
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 13 days
+signbridge-api Up 13 days
+signbridge-web Up 13 days
+signbridge-funasr Up 13 days (healthy)
+sl_service_proxy Up 13 days
+signbridge-inference Up 13 days
+signbridge-livekit Up 13 days
+signbridge-redis Up 13 days (healthy)
+woshica_docker Up 13 days
+sl_dev Up 13 days
+zhanghao_workspace Up 13 days
+prometheus Up 13 days
+nodeexporter Up 13 days
+grafana Up 13 days
+caddy Up 13 days
+cadvisor Up 13 days (healthy)
+pushgateway Up 13 days
+alertmanager Up 13 days
+service_base Up 13 days
+
+EXIT 0
+ 
+[status] EXIT 0
+STARTED 831420
+
+LAUNCH v3-61a2ea3-profOld-10250432 EXIT 0
+ 
+[launch v3-61a2ea3-profOld-10250432] EXIT 0
+actorprof dir
+command.json 6896
+config.json 5425
+dispatch.json 818
+episodes.jsonl 26272
+guard.jsonl 28216
+guard.log 253
+memory.jsonl 9431
+progress.csv 16473
+telemetry.jsonl 3259
+train.log 1678
+xvfb.log 0
+ 
+[collect v3-61a2ea3-profOld-10250432] EXIT 0
+actorprof dir
+command.json 6896
+config.json 5425
+dispatch.json 818
+episodes.jsonl 110469
+guard.jsonl 50598
+guard.log 253
+memory.jsonl 29985
+progress.csv 51218
+telemetry.jsonl 6599
+train.log 2753
+xvfb.log 0
+ 
+[collect v3-61a2ea3-profOld-10250432] EXIT 0
+actorprof dir
+command.json 6896
+config.json 5425
+dispatch.json 818
+episodes.jsonl 110469
+guard.jsonl 50598
+guard.log 1384
+memory.jsonl 29985
+progress.csv 51218
+result.json 1296
+telemetry.jsonl 6599
+train.log 2753
+xvfb.log 0
+{
+  "case": "memory-v3-v3-61a2ea3-profOld-10250432",
+  "exit_status": 0,
+  "elapsed_seconds": 245.4166944026947,
+  "spec": {
+    "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+    "case": "memory-v3-v3-61a2ea3-profOld-10250432",
+    "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-oldarch-baseline-command.json",
+    "code_dir": "memory-v3-code-oldprof-4",
+    "memory": "72g",
+    "timeout": 2400,
+    "horizon": null,
+    "hours": 22.0,
+    "gpu_indices": [
+      3,
+      2,
+      4
+    ],
+    "discard": 10,
+    "source_devices": null,
+    "env": {
+      "ISAAC_ACTOR_TORCH_PROFILE": "/bench/runs/memory-v3-v3-61a2ea3-profOld-10250432/actorprof"
+    },
+    "train_edits": null
+  },
+  "updates": 19,
+  "last": {
+    "update": "48203",
+    "game_hours": "58529.22907407407",
+    "errors": "0.0",
+    "stalls": "0.0",
+    "cf_done": "54.0",
+    "cf_errors": "0.0",
+    "searches": "574.0",
+    "teach_held": "759"
+  },
+  "steady_updates": 9,
+  "steady_x_real_time": 834.3843382431533,
+  "medians": {
+    "x_real_time": 821.1177812508238,
+    "collect_s": 5.318476689048111,
+    "update_s": 4.3036311499308795,
+    "wall_s": 5.322013601195067,
+    "gpu_reserved_gb": 14.279296875,
+    "wait_learner_s": 0.0,
+    "c_learner_cores": 0.8227468135811217
+  }
+}
+ 
+[collect v3-61a2ea3-profOld-10250432] EXIT 0
+{
+  "case": "v3-61a2ea3-profOld-10250432",
+  "horizon": null,
+  "exit_status": 0,
+  "updates": 19,
+  "steady_updates": 9,
+  "steady_x_real_time": 834.3843382431533,
+  "medians": {
+    "x_real_time": 821.1177812508238,
+    "collect_s": 5.318476689048111,
+    "update_s": 4.3036311499308795,
+    "wall_s": 5.322013601195067,
+    "gpu_reserved_gb": 14.279296875,
+    "wait_learner_s": 0.0,
+    "c_learner_cores": 0.8227468135811217
+  },
+  "peak_gpu_mib": {
+    "2": 15879.0,
+    "3": 2313.0,
+    "4": 2295.0
+  },
+  "peak_container_memory_gib": 55.911991119384766,
+  "guard_stops": [],
+  "completed": false
+}
+===== final (Sun Oct 25 04:39:20 2026)
+ 11:39:20 up 13 days, 18 min,  6 users,  load average: 11.96, 21.19, 14.75
+               total        used        free      shared  buff/cache   available
+Mem:             125          19          66           0          40         105
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 13 days
+signbridge-api Up 13 days
+signbridge-web Up 13 days
+signbridge-funasr Up 13 days (healthy)
+sl_service_proxy Up 13 days
+signbridge-inference Up 13 days
+signbridge-livekit Up 13 days
+signbridge-redis Up 13 days (healthy)
+woshica_docker Up 13 days
+sl_dev Up 13 days
+zhanghao_workspace Up 13 days
+prometheus Up 13 days
+nodeexporter Up 13 days
+grafana Up 13 days
+caddy Up 13 days
+cadvisor Up 13 days (healthy)
+pushgateway Up 13 days
+alertmanager Up 13 days
+service_base Up 13 days
+
+EXIT 0
+ 
+[status] EXIT 0
+no memory-v3 container left

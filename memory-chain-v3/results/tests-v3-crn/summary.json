@@ -1,0 +1,27 @@
+[
+ {
+  "name": "test_actor_processes_smoke",
+  "exit": 0,
+  "seconds": 5.8
+ },
+ {
+  "name": "test_cf_smoke",
+  "exit": 0,
+  "seconds": 5.1
+ },
+ {
+  "name": "test_lane_batch_smoke",
+  "exit": 0,
+  "seconds": 6.0
+ },
+ {
+  "name": "test_memory_smoke",
+  "exit": 0,
+  "seconds": 5.4
+ },
+ {
+  "name": "test_rebuild_memory_smoke",
+  "exit": 0,
+  "seconds": 5.2
+ }
+]

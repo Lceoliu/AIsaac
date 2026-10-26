@@ -1,0 +1,57 @@
+===== deploy (Sat Oct 24 08:09:40 2026)
+156
+
+DEPLOY v3-bfd3656 bfd3656a6072cd1204060033641b71a8be13d224 EXIT 0
+ 
+[deploy v3-bfd3656] EXIT 0
+===== gates (Sat Oct 24 08:09:42 2026)
+{"result": "PASS", "learner": "cuda:0", "sources": "cuda:1,cuda:2", "forward_bitwise_equal": true, "masked_visible_pairs": 136, "masked_memory_grad_removed": 2.2038607597351074, "reader_weight_grad_max_abs_vs_unbounded": 1.9073486328125e-06, "per_pair_reference": "PASS", "detached_chunks": 4, "detached_writes": 2, "pinned_by_live_writer": 2, "settled_packets": 4, "graph_frames_uid_max": 32, "graph_frames_reachable_per_uid": 20, "dropped_grad": 0.0, "detach_vs_never_detached_weight_max_abs": 1.4901161193847656e-08, "process_vs_local_weight_max_abs": 4.377216100692749e-08, "process_detached_chunks": 4, "process_detached_writes": 2, "single_decision": {"t": 47, "horizon": 12, "nonzero": [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47], "no_graph": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "graph_zero": [32, 33, 34, 35], "unbounded_nonzero_min": 0}}
+
+GATE v3-bfd3656-horizon-cuda EXIT 0
+ 
+[gate v3-bfd3656-horizon-cuda] EXIT 0
+{"result": "PASS", "process": false, "horizon": 24, "rollout": 32, "bound": 80, "bounded_graph_uid_max": [32, 64, 64, 64, 64, 64, 64, 64, 64, 64], "unbounded_graph_uid_max": [32, 64, 96, 128, 160, 192, 224, 256, 288, 320], "bounded_detached": [0, 0, 64, 128, 192, 256, 320, 384, 448, 512], "dropped": 0.0}
+HOST_HEAP_TRIM role=source-cpu seconds=0.000147
+HOST_HEAP_TRIM role=source-cpu seconds=0.000173
+HOST_HEAP_TRIM role=source-cpu seconds=0.001125
+HOST_HEAP_TRIM role=source-cpu seconds=0.001647
+HOST_HEAP_TRIM role=source-cpu seconds=0.001529
+HOST_HEAP_TRIM role=source-cpu seconds=0.001826
+HOST_HEAP_TRIM role=source-cpu seconds=0.001996
+HOST_HEAP_TRIM role=source-cpu seconds=0.001928
+HOST_HEAP_TRIM role=source-cpu seconds=0.002439
+HOST_HEAP_TRIM role=source-cpu seconds=0.002006
+HOST_HEAP_TRIM role=source-cpu seconds=0.000161
+HOST_HEAP_TRIM role=source-cpu seconds=0.000162
+HOST_HEAP_TRIM role=source-cpu seconds=0.000225
+HOST_HEAP_TRIM role=source-cpu seconds=0.000193
+HOST_HEAP_TRIM role=source-cpu seconds=0.000258
+HOST_HEAP_TRIM role=source-cpu seconds=0.000257
+HOST_HEAP_TRIM role=source-cpu seconds=0.000228
+HOST_HEAP_TRIM role=source-cpu seconds=0.000192
+HOST_HEAP_TRIM role=source-cpu seconds=0.000196
+HOST_HEAP_TRIM role=source-cpu seconds=0.000234
+{"result": "PASS", "process": true, "horizon": 24, "rollout": 32, "bound": 80, "bounded_graph_uid_max": [32, 64, 64, 64, 64, 64, 64, 64, 64, 64], "unbounded_graph_uid_max": [32, 64, 96, 128, 160, 192, 224, 256, 288, 320], "bounded_detached": [0, 0, 64, 128, 192, 256, 320, 384, 448, 512], "dropped": 0.0}
+
+GATE v3-bfd3656-horizon-bound EXIT 0
+ 
+[gate v3-bfd3656-horizon-bound] EXIT 0
+{"device": "cuda:0", "groups": 96, "count": 128, "bank": 1600, "forward_equal": true, "native_ms": 30.3053620737046, "native_peak_gib": 1.5725603103637695, "horizon_ms": 27.03971299342811, "horizon_peak_gib": 1.9352006912231445}
+
+GATE v3-bfd3656-attention-timing EXIT 0
+ 
+[gate v3-bfd3656-attention-timing] EXIT 0
+{"result": "PASS", "measurements": {"strided": {"host_copy_median_seconds": 0.0589973209425807, "returned_before_prior_gpu_work": [false, false, false], "contiguous": false, "pinned": true}, "compact": {"host_copy_median_seconds": 1.693214289844036e-05, "returned_before_prior_gpu_work": [true, true, true], "contiguous": true, "pinned": true}}}
+PASS growth preserves pending writes from the other actor CUDA stream
+graph_count=6 scratch_reserved_bytes= 48234496
+PASS arbitrary sequential bucket order, persistent outputs, bounded shared scratch
+graph_count=6 scratch_reserved_bytes= 266338304
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_actor_graph_pool.py", line 32, in <module>
+    assert reserved < 3 * x.nbytes, 'Each Actor graph still retains its own large scratch pool'
+AssertionError: Each Actor graph still retains its own large scratch pool
+
+GATE v3-bfd3656-actor-cuda EXIT 1
+ 
+[gate v3-bfd3656-actor-cuda] EXIT 1
+step failed: ('gate', 'v3-bfd3656-actor-cuda', 'v3-bfd3656', '3,4,5', 'nice -n 10 timeout 1800 bash -c "/bench/home/isaac-abplus/.venv/bin/python -u tests/test_actor_d2h.py && /bench/home/isaac-abplus/.venv/bin/python -u tests/test_actor_streams.py && /bench/home/isaac-abplus/.venv/bin/python -u tests/test_actor_graph_pool.py && /bench/home/isaac-abplus/.venv/bin/python -u tests/test_actor_graph_pool.py --separate"')

@@ -1,0 +1,34 @@
+[
+  {
+    "case": "v3-83cf114-retC-10241124",
+    "horizon": 2048,
+    "exit_status": 137,
+    "updates": 18,
+    "steady_updates": 8,
+    "steady_x_real_time": 274.90047746603494,
+    "medians": {
+      "x_real_time": 288.9300092669454,
+      "collect_s": 11.961184988496825,
+      "update_s": 8.708195086102933,
+      "wall_s": 15.322617448517121,
+      "gpu_reserved_gb": 21.6171875,
+      "wait_learner_s": 0.37739153602160513,
+      "c_learner_cores": 0.6360621029388324,
+      "source_graph_frames": 127241.0,
+      "source_graph_frames_uid_max": 3203.5,
+      "source_alloc_gib_max": 15.754717350006104,
+      "source_detached_frames": 8743.0
+    },
+    "peak_gpu_mib": {
+      "2": 19243.0,
+      "3": 19486.0,
+      "4": 19280.0,
+      "5": 24100.0
+    },
+    "peak_container_memory_gib": 67.18349075317383,
+    "guard_stops": [
+      "host_memory_pressure"
+    ],
+    "completed": false
+  }
+]

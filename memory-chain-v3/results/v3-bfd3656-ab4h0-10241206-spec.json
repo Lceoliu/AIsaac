@@ -1,0 +1,20 @@
+{
+  "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+  "case": "memory-v3-v3-bfd3656-ab4h0-10241206",
+  "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+  "code_dir": "memory-v3-code-v3-bfd3656",
+  "memory": "72g",
+  "timeout": 2400,
+  "horizon": 0,
+  "hours": null,
+  "gpu_indices": [
+    3,
+    2,
+    4,
+    5
+  ],
+  "discard": 10,
+  "source_devices": "cuda:0,cuda:2,cuda:3",
+  "env": {},
+  "train_edits": null
+}

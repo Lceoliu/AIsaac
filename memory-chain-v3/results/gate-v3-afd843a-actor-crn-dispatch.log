@@ -1,0 +1,5 @@
+PASS branch records: crn_uniforms(crn, t); plain records: fresh uniforms (not shared across workers)
+
+GATE v3-afd843a-actor-crn EXIT 0
+
+EXIT 0

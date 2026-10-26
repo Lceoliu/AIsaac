@@ -1,0 +1,27 @@
+[
+ {
+  "name": "test_actor_processes_smoke",
+  "exit": 0,
+  "seconds": 6.3
+ },
+ {
+  "name": "test_cf_smoke",
+  "exit": 0,
+  "seconds": 4.9
+ },
+ {
+  "name": "test_learner_device_smoke",
+  "exit": 0,
+  "seconds": 6.1
+ },
+ {
+  "name": "test_learner_fast2_smoke",
+  "exit": 0,
+  "seconds": 5.0
+ },
+ {
+  "name": "test_memory_smoke",
+  "exit": 0,
+  "seconds": 5.6
+ }
+]

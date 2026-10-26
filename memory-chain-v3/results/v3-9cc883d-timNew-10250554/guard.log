@@ -1,0 +1,15 @@
+DISPATCH ["python3", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/run_v3_case.py", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/specs/v3-9cc883d-timNew-10250554.json"] pid 1273664
+START memory-v3-v3-9cc883d-timNew-10250554 pid 1273671
+aisaac-bench-memory-v3-v3-9cc883d-timNew-10250554
+{"case": "memory-v3-v3-9cc883d-timNew-10250554", "exit_status": 0, "elapsed_seconds": 318.0657043457031, "spec": {"root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide", "case": "memory-v3-v3-9cc883d-timNew-10250554", "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json", "code_dir": "memory-v3-code-v3-9cc883d", "memory": "72g", "timeout": 2400, "horizon": 2048, "hours": 22.0, "gpu_indices": [3, 2, 1, 4, 5], "discard": 10, "source_devices": null, "env": {"ISAAC_SOURCE_CPROFILE": "", "TORCHINDUCTOR_COMPILE_THREADS": "1", "ISAAC_ACTOR_TORCH_PROFILE": "/bench/runs/memory-v3-v3-9cc883d-timNew-10250554/actorprof", "ISAAC_ACTOR_TORCH_PROFILE_MODE": "timers", "ISAAC_ACTOR_TORCH_PROFILE_COUNT": "1000"}, "train_edits": null}, "updates": 19, "last": {"update": "48203", "game_hours": "58529.228074074075", "errors": "0.0", "stalls": "0.0", "cf_done": "64.0", "cf_errors": "0.0", "searches": "1222.0", "teach_held": "1721"}, "steady_updates": 9, "steady_x_real_time": 386.3298461789256, "medians": {"x_real_time": 388.26667597438944, "collect_s": 9.6464816799853, "update_s": 8.62980508315377, "wall_s": 11.265109620057046, "gpu_reserved_gb": 21.87109375, "wait_learner_s": 1.9947951149661094, "c_learner_cores": 0.8504008329274267, "source_graph_frames": 125132.0, "source_graph_frames_uid_max": 3312.0, "source_alloc_gib_max": 11.983834743499756, "source_detached_frames": 364202.0}}
+Traceback (most recent call last):
+  File "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/guard_v3.py", line 170, in <module>
+    stats=dict(line.split() for line in (cg/'memory.stat').read_text().splitlines())
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 1029, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/pathlib.py", line 1015, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/sys/fs/cgroup/docker/969c381bded561543dbb98c9b744db5561431bec6735bbe4a14e696d8be40fe5/memory.stat'

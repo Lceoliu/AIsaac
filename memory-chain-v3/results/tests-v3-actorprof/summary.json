@@ -1,0 +1,42 @@
+[
+ {
+  "name": "test_actor_processes_smoke",
+  "exit": 0,
+  "seconds": 5.7
+ },
+ {
+  "name": "test_actor_shutdown_smoke",
+  "exit": 0,
+  "seconds": 0.8
+ },
+ {
+  "name": "test_cf_smoke",
+  "exit": 0,
+  "seconds": 4.8
+ },
+ {
+  "name": "test_fused_tokens_smoke",
+  "exit": 0,
+  "seconds": 15.9
+ },
+ {
+  "name": "test_lane_batch_smoke",
+  "exit": 0,
+  "seconds": 5.9
+ },
+ {
+  "name": "test_learner_fast2_smoke",
+  "exit": 0,
+  "seconds": 4.7
+ },
+ {
+  "name": "test_rebuild_memory_smoke",
+  "exit": 0,
+  "seconds": 5.0
+ },
+ {
+  "name": "test_temporal_smoke",
+  "exit": 0,
+  "seconds": 10.8
+ }
+]

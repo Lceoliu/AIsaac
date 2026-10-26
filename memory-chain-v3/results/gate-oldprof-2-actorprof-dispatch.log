@@ -1,0 +1,23 @@
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+ACTOR_TORCH_PROFILE {"kind": "graph", "pid": 66, "per_call": {"latency_ms": 1.5775045612826943, "host_submit_ms": 1.021127449348569, "wait_ms": 0.5134670063853264, "kernel_ms_all_streams": 2.5809308000000235}, "graphs_before": 6, "graphs_after": 6}
+ACTOR_TORCH_PROFILE_EAGER {"kind": "graph", "pid": 66, "kernel_ms_per_call": 78.65784966666668}
+PASS graph {"per_call": {"latency_ms": 1.5775045612826943, "host_submit_ms": 1.021127449348569, "wait_ms": 0.5134670063853264, "kernel_ms_all_streams": 2.5809308000000235}, "sections": ["h.core_replay", "h.d2h", "h.h2d_uniform", "h.stage_pack", "h.tdest"], "kernel_classes": {"other": 1.435516800000008, "gemm": 0.5170630999999976, "conv": 0.17767540000000343, "triton fused": 0.15907950000000876, "index/gather/scatter": 0.14314730000000456, "copy/memset": 0.09188250000000503, "reduce/norm": 0.03925109999999622, "attention/softmax": 0.017315100000000166}, "parts": {"p.core_eager": 59.979, "m.type_emb": 0.0029, "m.variant_emb": 0.0026, "m.subtype_emb": 0.0026, "m.item_emb": 0.0174, "m.trinket_emb": 0.0108, "m.entity": 0.1024, "m.patch": 5.1198, "m.pill_emb": 0.0044, "m.effect_emb": 0.0047, "m.card_emb": 0.0041, "m.char_emb": 0.0036, "m.room": 5.3864, "m.map": 1.3993, "m.itok": 3.5207, "m.door": 0.1606, "m.norm": 0.0293, "m.pi": 0.0027, "m.value": 0.091, "m.danger": 0.0023, "h.stage_pack": 0.0, "h.h2d_uniform": 0.021, "h.core_replay": 0.7988, "h.d2h": 0.0011, "h.tdest": 0.0009}}
+
+GATE oldprof-2-actorprof EXIT 0
+
+EXIT 0

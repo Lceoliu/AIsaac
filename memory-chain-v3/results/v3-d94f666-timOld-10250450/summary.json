@@ -1,0 +1,25 @@
+{
+  "case": "v3-d94f666-timOld-10250450",
+  "horizon": null,
+  "exit_status": 0,
+  "updates": 19,
+  "steady_updates": 9,
+  "steady_x_real_time": 912.2729037173009,
+  "medians": {
+    "x_real_time": 939.5951901670868,
+    "collect_s": 4.716022677952424,
+    "update_s": 4.451641429914162,
+    "wall_s": 4.650513376109302,
+    "gpu_reserved_gb": 15.919921875,
+    "wait_learner_s": 0.0,
+    "c_learner_cores": 0.9024912047160359
+  },
+  "peak_gpu_mib": {
+    "2": 16659.0,
+    "3": 2251.0,
+    "4": 2231.0
+  },
+  "peak_container_memory_gib": 52.51685333251953,
+  "guard_stops": [],
+  "completed": false
+}

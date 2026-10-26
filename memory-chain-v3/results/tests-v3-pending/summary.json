@@ -1,0 +1,72 @@
+[
+ {
+  "name": "test_raw_release",
+  "exit": 0,
+  "seconds": 4.7
+ },
+ {
+  "name": "test_rebuild_memory_smoke",
+  "exit": 0,
+  "seconds": 5.1
+ },
+ {
+  "name": "test_record_retention",
+  "exit": 0,
+  "seconds": 4.4
+ },
+ {
+  "name": "test_source_async",
+  "exit": 0,
+  "seconds": 4.4
+ },
+ {
+  "name": "test_source_horizon",
+  "exit": 0,
+  "seconds": 14.3
+ },
+ {
+  "name": "test_source_horizon_bound",
+  "exit": 0,
+  "seconds": 7.7
+ },
+ {
+  "name": "test_source_lifetime",
+  "exit": 0,
+  "seconds": 4.2
+ },
+ {
+  "name": "test_source_pipeline",
+  "exit": 0,
+  "seconds": 4.9
+ },
+ {
+  "name": "test_source_preempt",
+  "exit": 0,
+  "seconds": 16.2
+ },
+ {
+  "name": "test_source_process",
+  "exit": 0,
+  "seconds": 13.3
+ },
+ {
+  "name": "test_source_rollout_interval",
+  "exit": 0,
+  "seconds": 4.9
+ },
+ {
+  "name": "test_source_streaming",
+  "exit": 0,
+  "seconds": 5.4
+ },
+ {
+  "name": "test_stateless_teacher_batch",
+  "exit": 0,
+  "seconds": 4.5
+ },
+ {
+  "name": "test_teacher_context_lifetime",
+  "exit": 0,
+  "seconds": 4.1
+ }
+]

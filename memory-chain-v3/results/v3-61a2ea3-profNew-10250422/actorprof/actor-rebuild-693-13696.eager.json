@@ -1,0 +1,97 @@
+{
+ "kind": "rebuild",
+ "eager_calls": 50,
+ "parts_ms_per_call": {
+  "p.core_eager": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 22.920306479999937
+  },
+  "m.type_emb": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.003155399999943875
+  },
+  "m.variant_emb": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.002713200000049128
+  },
+  "m.subtype_emb": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.0027752999999791613
+  },
+  "m.item_emb": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.0026843200000219443
+  },
+  "m.trinket_emb": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.002590940000031169
+  },
+  "m.entity": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.29481289999999616
+  },
+  "m.room_type_emb": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.007289579999952984
+  },
+  "m.door": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.27658255999999354
+  },
+  "m.norm": {
+   "count": 100,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.04286071999995999
+  },
+  "m.reader_inp": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.012898780000012775
+  },
+  "m.reader_layers": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.0032534200000128477
+  },
+  "m.reader_ct": {
+   "count": 250,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.9953923199999906
+  },
+  "m.pi": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.007491079999961657
+  },
+  "m.value": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.12035285999998246
+  },
+  "m.danger": {
+   "count": 50,
+   "cpu_ms_per_call": 0.0,
+   "device_ms_per_call": 0.006981040000018256
+  }
+ },
+ "kernel_classes_ms_per_call": {
+  "other": 25.165403840000454,
+  "gemm": 2.9057914400007614,
+  "triton fused": 1.3058654199993296,
+  "copy/memset": 1.0181326999999731,
+  "index/gather/scatter": 0.39859280000018005,
+  "attention/softmax": 0.22297616000012088,
+  "reduce/norm": 0.1855469999997242,
+  "conv": 0.07555692000002892
+ },
+ "kernel_ms_per_call": 31.277866280000566
+}

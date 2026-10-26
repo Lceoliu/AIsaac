@@ -1,0 +1,18 @@
+===== actorgates (Sun Oct 25 08:32:29 2026)
+Actor capacity growth compiled graphs: 25 -> 25
+PASS CUDA Graph/eager logits, CRN actions, logp, values; variable batches, wrap, reset, fork, history growth 4.76837158203125e-07
+PASS actor version change reprojects stored values without any source re-encoding; snapshot isolation
+
+GATE v3-419fce9-rebuild-actor EXIT 0
+ 
+[gate v3-419fce9-rebuild-actor] EXIT 0
+PASS RebuildGraphActor temporal state written in the graph: prev_o, steps, prev_stage; other slots and K / V untouched
+
+GATE v3-419fce9-actor-state EXIT 0
+ 
+[gate v3-419fce9-actor-state] EXIT 0
+PASS branch records: crn_uniforms(crn, t); plain records: fresh uniforms (not shared across workers)
+
+GATE v3-419fce9-actor-crn EXIT 0
+ 
+[gate v3-419fce9-actor-crn] EXIT 0

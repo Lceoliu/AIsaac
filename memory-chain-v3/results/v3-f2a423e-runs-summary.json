@@ -1,0 +1,90 @@
+[
+  {
+    "case": "v3-f2a423e-memB4-10250349",
+    "horizon": 2048,
+    "exit_status": 137,
+    "updates": 17,
+    "steady_updates": 7,
+    "steady_x_real_time": 306.44665654254356,
+    "medians": {
+      "x_real_time": 286.7291553603219,
+      "collect_s": 10.353393939090893,
+      "update_s": 9.515049658948556,
+      "wall_s": 15.240398769965395,
+      "gpu_reserved_gb": 23.08984375,
+      "wait_learner_s": 3.273658889112994,
+      "c_learner_cores": 0.7346678442484373,
+      "source_graph_frames": 105781.0,
+      "source_graph_frames_uid_max": 3143.0,
+      "source_alloc_gib_max": 15.193020820617676,
+      "source_detached_frames": 358657.0
+    },
+    "peak_gpu_mib": {
+      "2": 24027.0,
+      "3": 19156.0,
+      "4": 20284.0,
+      "5": 23955.0
+    },
+    "peak_container_memory_gib": 58.850894927978516,
+    "guard_stops": [
+      "no_progress_in_180_seconds"
+    ],
+    "completed": false
+  },
+  {
+    "case": "v3-f2a423e-profNew-10250403",
+    "horizon": 2048,
+    "exit_status": 0,
+    "updates": 19,
+    "steady_updates": 9,
+    "steady_x_real_time": 378.2622057043333,
+    "medians": {
+      "x_real_time": 368.11296801829786,
+      "collect_s": 11.199574179947376,
+      "update_s": 8.274876010837033,
+      "wall_s": 11.874615620123222,
+      "gpu_reserved_gb": 21.552734375,
+      "wait_learner_s": 0.38746441109105945,
+      "c_learner_cores": 0.8908971772310159,
+      "source_graph_frames": 128038.0,
+      "source_graph_frames_uid_max": 3321.0,
+      "source_alloc_gib_max": 11.89704942703247,
+      "source_detached_frames": 363632.0
+    },
+    "peak_gpu_mib": {
+      "1": 18598.0,
+      "2": 18745.0,
+      "3": 18964.0,
+      "4": 22911.0,
+      "5": 23139.0
+    },
+    "peak_container_memory_gib": 61.42878341674805,
+    "guard_stops": [],
+    "completed": false
+  },
+  {
+    "case": "v3-f2a423e-profOld-10250410",
+    "horizon": null,
+    "exit_status": 1,
+    "updates": 17,
+    "steady_updates": 7,
+    "steady_x_real_time": 887.0541577866128,
+    "medians": {
+      "x_real_time": 889.065227136223,
+      "collect_s": 4.9162668499629945,
+      "update_s": 4.2803890879731625,
+      "wall_s": 4.916924577904865,
+      "gpu_reserved_gb": 13.962890625,
+      "wait_learner_s": 0.0,
+      "c_learner_cores": 0.8639087979768778
+    },
+    "peak_gpu_mib": {
+      "2": 15355.0,
+      "3": 2263.0,
+      "4": 2243.0
+    },
+    "peak_container_memory_gib": 55.92190170288086,
+    "guard_stops": [],
+    "completed": false
+  }
+]

@@ -1,0 +1,4 @@
+v3-61a2ea3-profNew-10250422 actor-rebuild-693-13696: host section total 5.11 ms/call; core_replay 0.754, rawhistory_append 0.747, writer_close 0.736, component_keys 0.561, tdest 0.536, h2d_uniform 0.400, state_tstate 0.378, component_replay 0.246, reset_prefixes 0.246, stage_pack 0.195, grow_refresh 0.156, d2h 0.152
+v3-61a2ea3-profNew-10250422 actor-rebuild-87-38992: host section total 5.22 ms/call; writer_close 0.767, tdest 0.755, rawhistory_append 0.683, core_replay 0.668, component_keys 0.559, h2d_uniform 0.408, state_tstate 0.379, component_replay 0.282, reset_prefixes 0.228, stage_pack 0.207, grow_refresh 0.147, d2h 0.141
+v3-61a2ea3-profOld-10250432 actor-graph-686-21856: host section total 2.39 ms/call; core_replay 1.343, tdest 0.450, stage_pack 0.284, h2d_uniform 0.201, d2h 0.108
+v3-61a2ea3-profOld-10250432 actor-graph-70-10912: host section total 2.55 ms/call; core_replay 1.423, tdest 0.507, stage_pack 0.292, h2d_uniform 0.207, d2h 0.120

@@ -1,0 +1,57 @@
+{
+  "case": "memory-v3-v3-1fe66ab-acctCje-10241149",
+  "exit_status": 0,
+  "elapsed_seconds": 410.3970150947571,
+  "spec": {
+    "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+    "case": "memory-v3-v3-1fe66ab-acctCje-10241149",
+    "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+    "code_dir": "memory-v3-code-v3-1fe66ab",
+    "memory": "72g",
+    "timeout": 2400,
+    "horizon": 2048,
+    "hours": 24.0,
+    "gpu_indices": [
+      3,
+      2,
+      4,
+      5
+    ],
+    "discard": 10,
+    "source_devices": "cuda:0,cuda:2,cuda:3",
+    "env": {
+      "ISAAC_MEMORY_ACCOUNT": "1",
+      "ISAAC_RL_MEM_LOG": "/bench/runs/memory-v3-v3-1fe66ab-acctCje-10241149/memlog",
+      "ISAAC_RL_MEM_EVERY": "10",
+      "LD_PRELOAD": "/bench/v3/lib/libjemalloc.so.2",
+      "ISAAC_GAME_ENV_STRIP": "LD_PRELOAD"
+    },
+    "train_edits": null
+  },
+  "updates": 20,
+  "last": {
+    "update": "48204",
+    "game_hours": "58530.44140740741",
+    "errors": "0.0",
+    "stalls": "0.0",
+    "cf_done": "72.0",
+    "cf_errors": "0.0",
+    "searches": "1225.0",
+    "teach_held": "1717"
+  },
+  "steady_updates": 10,
+  "steady_x_real_time": 266.7654328189705,
+  "medians": {
+    "x_real_time": 287.02626276686556,
+    "collect_s": 10.09716088406276,
+    "update_s": 6.8367448669159785,
+    "wall_s": 15.231038265977986,
+    "gpu_reserved_gb": 22.9453125,
+    "wait_learner_s": 0.49166769650764763,
+    "c_learner_cores": 0.8151893312676592,
+    "source_graph_frames": 121092.5,
+    "source_graph_frames_uid_max": 3240.0,
+    "source_alloc_gib_max": 14.114140033721924,
+    "source_detached_frames": 5088.0
+  }
+}

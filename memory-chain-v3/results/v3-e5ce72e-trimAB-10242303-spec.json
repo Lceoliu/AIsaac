@@ -1,0 +1,31 @@
+{
+  "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+  "case": "memory-v3-v3-e5ce72e-trimAB-10242303",
+  "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+  "code_dir": "memory-v3-code-v3-e5ce72e",
+  "memory": "72g",
+  "timeout": 2400,
+  "horizon": 2048,
+  "hours": 14.0,
+  "gpu_indices": [
+    3,
+    2,
+    4,
+    5
+  ],
+  "discard": 10,
+  "source_devices": "cuda:0,cuda:2,cuda:3",
+  "env": {
+    "ISAAC_MEMORY_ACCOUNT": "1",
+    "ISAAC_MEMORY_CENSUS": "0",
+    "ISAAC_RL_MEM_LOG": "/bench/runs/memory-v3-v3-e5ce72e-trimAB-10242303/memlog",
+    "ISAAC_RL_MEM_EVERY": "10",
+    "TORCHINDUCTOR_COMPILE_THREADS": "1"
+  },
+  "train_edits": [
+    [
+      " --source-saved-cpu-gb 0.75 ",
+      " --source-saved-cpu-gb 0 "
+    ]
+  ]
+}

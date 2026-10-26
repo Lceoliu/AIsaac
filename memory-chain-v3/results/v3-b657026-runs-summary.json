@@ -1,0 +1,33 @@
+[
+  {
+    "case": "v3-b657026-t6-10250950",
+    "horizon": 1024,
+    "exit_status": 0,
+    "updates": 52,
+    "steady_updates": 42,
+    "steady_x_real_time": 334.71459339192205,
+    "medians": {
+      "x_real_time": 343.2259612419989,
+      "collect_s": 7.340400414541364,
+      "update_s": 10.941475138417445,
+      "wall_s": 12.737969308975153,
+      "gpu_reserved_gb": 22.78125,
+      "wait_learner_s": 5.706650742562488,
+      "c_learner_cores": 0.8708972288531472,
+      "source_graph_frames": 140311.5,
+      "source_graph_frames_uid_max": 2306.0,
+      "source_alloc_gib_max": 4.66586446762085,
+      "source_detached_frames": 572920.0
+    },
+    "peak_gpu_mib": {
+      "1": 11824.0,
+      "2": 23713.0,
+      "3": 12136.0,
+      "4": 9087.0,
+      "5": 8983.0
+    },
+    "peak_container_memory_gib": 67.54528045654297,
+    "guard_stops": [],
+    "completed": true
+  }
+]

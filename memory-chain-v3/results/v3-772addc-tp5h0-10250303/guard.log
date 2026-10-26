@@ -1,0 +1,6 @@
+DISPATCH ["python3", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/run_v3_case.py", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/specs/v3-772addc-tp5h0-10250303.json"] pid 392480
+START memory-v3-v3-772addc-tp5h0-10250303 pid 392485
+STOP_OWN_ONLY aisaac-bench-memory-v3-v3-772addc-tp5h0-10250303 no_progress_in_180_seconds
+aisaac-bench-memory-v3-v3-772addc-tp5h0-10250303
+{"case": "memory-v3-v3-772addc-tp5h0-10250303", "exit_status": 137, "elapsed_seconds": 388.576523065567, "spec": {"root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide", "case": "memory-v3-v3-772addc-tp5h0-10250303", "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json", "code_dir": "memory-v3-code-v3-772addc", "memory": "72g", "timeout": 2400, "horizon": 0, "hours": 62.0, "gpu_indices": [3, 2, 1, 4, 5], "discard": 10, "source_devices": null, "env": {"ISAAC_SOURCE_CPROFILE": "", "TORCHINDUCTOR_COMPILE_THREADS": "1"}, "train_edits": null}, "updates": 8, "last": {"update": "48192", "game_hours": "58515.873185185184", "errors": "0.0", "stalls": "0.0", "cf_done": "0.0", "cf_errors": "0.0", "searches": "541.0", "teach_held": "805"}}
+RUNNER_EXIT 137
