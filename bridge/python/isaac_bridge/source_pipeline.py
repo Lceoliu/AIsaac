@@ -53,12 +53,14 @@ class ImmutableSourceCast(torch.autograd.Function):
 
 
 class SourcePipeline:
-    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False):
+    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None):
         self.model, self.period, self.micro, self.amp = model, period, micro, amp
         # Opt-in (--source-layer-checkpoint): each Spatial block's output is recomputed in the VJP from its saved
         # input (torch.utils.checkpoint, non-reentrant) instead of keeping the block's activations. Not the default:
         # it recomputes the blocks' forward.
         self.layer_checkpoint = bool(layer_checkpoint)
+        # (measurement: only these Spatial blocks under checkpoint, the others keep their full graphs; None: all)
+        self.checkpoint_blocks = None if checkpoint_blocks is None else frozenset(int(b) for b in checkpoint_blocks)
         # (--source-dispatch-at-close, scheduling only) with defer_backward: a closed interval's VJP starts when it
         # closes (overlapping the next collection; the workers serve forward requests between its episode groups,
         # ISAAC_SOURCE_PREEMPT_VJP) instead of after the next Reader's inputs; its commit stays gated until that
@@ -132,7 +134,7 @@ class SourcePipeline:
             from .source_worker import SourceProcess
             options=dict(period=period,micro=micro,amp=amp,version=version,saved_gpu_gb=saved_gpu_gb,saved_cpu_gb=saved_cpu_gb,saved_8bit=saved_8bit,
                          compile_source=compile_source,flash_source=flash_source,update_rollouts=update_rollouts,
-                         layer_checkpoint=layer_checkpoint)
+                         layer_checkpoint=layer_checkpoint,checkpoint_blocks=checkpoint_blocks)
             spill_limits=([min(saved_gpu_gb,max(1.,b-1.)) for b in self._memory_budgets()]
                           if saved_gpu_gb>0 else [0.]*len(self.devices))
             self.remotes=[SourceProcess(self.versions[version][0],d,
@@ -221,9 +223,11 @@ class SourcePipeline:
                     from torch.utils.checkpoint import checkpoint
                     block_fns=[torch.compile(lambda x,cu,ms,block=block:block.forward_packed(
                         x,None,None,dict(cu_seqlens=cu,max_seqlen=ms)),dynamic=True) for block in replica.blocks]
-                    def source_blocks(xp,cu,ms,fns=block_fns):
+                    under=[self.checkpoint_blocks is None or i in self.checkpoint_blocks for i in range(len(block_fns))]
+                    def source_blocks(xp,cu,ms,fns=block_fns,under=under):
                         with lock:
-                            for fn in fns:xp=checkpoint(fn,xp,cu,ms,use_reentrant=False)
+                            for fn,ck in zip(fns,under):
+                                xp=checkpoint(fn,xp,cu,ms,use_reentrant=False) if ck else fn(xp,cu,ms)
                             return xp
                 else:
                     compiled=torch.compile(getattr(replica,method),dynamic=True)
