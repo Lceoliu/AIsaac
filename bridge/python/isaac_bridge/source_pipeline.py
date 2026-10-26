@@ -251,6 +251,9 @@ class SourcePipeline:
                     param.data=value.view_as(param)
             replicas[0]._source_snapshot_flat=flat
             return replicas*len(self.devices)
+        # (the parameters themselves, listed once: an encode swaps a replica's parameters for their BF16 casts while
+        # it runs (_cast_context), and with --source-streams 2 a VJP thread can look at the replica meanwhile)
+        for replica in replicas: replica._source_named = list(replica.named_parameters())
         return replicas
 
     def _remote(self, worker, command, payload, version=None):
@@ -1196,10 +1199,11 @@ class SourcePipeline:
             # rather than allocating and then adding N version-sized gradients.
             # create_graph=False keeps AccumulateGrad in-place on this stream.
             used=self.touched[worker];used.clear()
+            named=lambda r: getattr(r,'_source_named',None) or list(r.named_parameters())
             first=next(iter(self.versions.values()))[worker]
-            shared={n:torch.zeros_like(p) for n,p in first.named_parameters() if source_parameter(n)}
+            shared={n:torch.zeros_like(p) for n,p in named(first) if source_parameter(n)}
             for replicas in self.versions.values():
-                for name,param in replicas[worker].named_parameters():
+                for name,param in named(replicas[worker]):
                     param.grad=shared[name] if name in shared else None
             groups={}
             for chunk, grads in packets:
@@ -1224,7 +1228,8 @@ class SourcePipeline:
                     service_seconds+=time.perf_counter()-service_start
             if device.type == 'cuda' and not self.ipc_async: torch.cuda.current_stream(device).synchronize()
             grads={n:shared[n] for n in self.names if n in used}
-            for replicas in self.versions.values():replicas[worker].zero_grad(set_to_none=True)
+            for replicas in self.versions.values():
+                for _,param in named(replicas[worker]):param.grad=None
         self.events.append(dict(kind=kind or ('source_backward' if retain_graph else 'retired_backward'), device=str(device), version=self.version,
                                 gradient_buffer_bytes=sum(g.numel()*g.element_size() for g in shared.values()),
                                 serviced_forward_calls=served,forward_service_seconds=service_seconds,
