@@ -1776,6 +1776,10 @@ def main(argv=None, child=None, actor=None):
                    help='scheduling only (with --source-overlap-rollout 1 and source prefetch): a closed source '
                         'interval\'s VJP is dispatched when the update closes it, overlapping the next collection, '
                         'instead of after the next Reader inputs are ready; its commit is gated to the same point')
+    p.add_argument('--source-streams', type=int, default=0,
+                   help='>= 2: in each source process the VJP runs in its own thread, concurrent with encodes and '
+                        'Writers, on separate CUDA streams with explicit event dependencies (needs '
+                        'ISAAC_SOURCE_PREEMPT_VJP=1 for the separate VJP connection); 0: one stream, as before')
     p.add_argument('--source-checkpoint-blocks', default='',
                    help='measurement: with --source-layer-checkpoint 1, only these Spatial blocks (comma indices) '
                         'under checkpoint, the others keep their full graphs; empty: all blocks')
@@ -2560,6 +2564,7 @@ def main(argv=None, child=None, actor=None):
             layer_checkpoint=bool(args.source_layer_checkpoint), dispatch_at_close=bool(args.source_dispatch_at_close),
             balance=bool(args.source_balance),
             checkpoint_blocks=[int(b) for b in args.source_checkpoint_blocks.split(',')] if args.source_checkpoint_blocks else None,
+            streams=args.source_streams,
             update_rollouts=args.source_update_rollouts, shared_devices=shared,
             actor_reserve_gb=args.source_actor_reserve_gb,processes=bool(args.source_processes),
             defer_backward=bool(args.source_prefetch_records),horizon=args.memory_horizon)
