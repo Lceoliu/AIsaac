@@ -585,6 +585,13 @@ def merge_jobs(halves):
     j['prof'], j['worker'], j['lane_stat'] = sum_dict('prof'), sum_dict('worker'), sum_dict('lane_stat')
     j['stats'] = np.concatenate([h['stats'] for h in halves])
     j['teach'], j['v2'], j['choices'] = cat_rec('teach'), cat_rec('v2'), cat_rec('choices')
+    # (rule 5) every actor's branches in flight: their ancestors keep [length - H, shared) (2026-10-26; before,
+    # dict(halves[0]) kept the first actor's report only and the second's ancestors got values only)
+    if any(h.get('lineage') is not None for h in halves):
+        j['lineage'] = sorted({tuple(x) for h in halves for x in h.get('lineage') or ()})
+    if any(h.get('lineage_src') is not None for h in halves):   # (ISAAC_LINEAGE_SOURCES)
+        j['lineage_src'] = {k: sorted({tuple(x) for h in halves for x in (h.get('lineage_src') or {}).get(k, ())})
+                            for k in {k for h in halves for k in (h.get('lineage_src') or {})}}
     j['cpu_collect'] = float(np.mean([h.get('cpu_collect', 0.0) for h in halves]))
     j['proc_cores'] = float(sum(h.get('proc_cores', 0.0) for h in halves))
     j['dec_min'] = min(h.get('dec_min', 0.0) for h in halves)
@@ -2668,8 +2675,30 @@ def main(argv=None, child=None, actor=None):
             live_uids.update(h.uid for h in L.get('v2_contexts', []) if h is not None)
             live_uids.update(h.uid for h in L.get('teach_contexts', []) if h is not None)
             # Ancestors of branches still in flight in the actors keep their source values (rule 5, D2a).
-            L.setdefault('lineage', {})[job.get('aid', 0)] = set(job.get('lineage') or ())
-            in_flight = set().union(*L['lineage'].values())
+            # (2026-10-26: with the frames each branch can still read of them, [length - H, shared): a
+            # record forked from a lane reads its ancestor's graphs there, published or not yet)
+            L.setdefault('lineage', {})[job.get('aid', 0)] = {(a_, n_, l_) for a_, n_, l_ in job.get('lineage') or ()}
+            in_flight_reach = set().union(*L['lineage'].values())
+            in_flight = {a_ for a_, _, _ in in_flight_reach}
+            if os.environ.get('ISAAC_LINEAGE_SOURCES') and source_pipeline is not None:
+                # per episode and holder: the first and the last report (source version, update, actor, item)
+                seen_ = L.setdefault('lineage_seen', {})
+                mark_ = (source_pipeline.version, L['update'], job.get('aid', 0))
+                for k_, items_ in (job.get('lineage_src') or {}).items():
+                    for item_ in items_:
+                        e_ = seen_.setdefault(tuple(item_[0]), {}).setdefault(k_, [mark_ + tuple(item_[1:]), None])
+                        e_[1] = mark_ + tuple(item_[1:])
+                if len(seen_) > 50000:
+                    for k_ in list(seen_)[:len(seen_) - 50000]: del seen_[k_]
+                L.setdefault('jobs_seen', []).append(mark_ + (job.get('lineage_src') is not None,))
+                del L['jobs_seen'][:-400]
+                if getattr(source_pipeline, 'drop_context', None) is None:
+                    def drop_context(uids, L=L):
+                        uids = set(uids)
+                        return dict(seen={str(u_): L.get('lineage_seen', {}).get(u_) for u_ in uids},
+                                    admitted={str(u_): a_ for u_, a_ in L.get('admitted_v2', {}).items() if u_ in uids},
+                                    jobs=L.get('jobs_seen', [])[-80:])
+                    source_pipeline.drop_context = drop_context
             if args.release_raw:
                 # A branch forked shortly before its parent ended can be published after the
                 # parent left every holder the actors report (a reused bank row, say): keep an
@@ -2703,8 +2732,11 @@ def main(argv=None, child=None, actor=None):
                     frontier[h.uid] = min(frontier.get(h.uid, h.length), h.length)
                 source_pipeline.rollout_frontiers = dict(frontier)   # (accounting: hold_reasons)
                 frontier = ledger.frontier(frontier, L.get('teach_contexts'), L.get('v2_contexts'), args.memory_horizon)
-                for uid in in_flight: frontier.setdefault(uid, [])   # values only, no pending loss
+                from isaac_bridge.record_retention import in_flight_frontier
+                in_flight_frontier(frontier, in_flight_reach, args.memory_horizon)
+                for uid in in_flight: frontier.setdefault(uid, [])   # (grace: values only, no pending loss)
                 return frontier
+            source_pipeline.retain_mark = (L['update'], 'rollout')   # (measurement: which retain call detached)
             if not retire_after_ready:source_pipeline.retain_histories(live_uids,frontiers=horizon_frontiers())
             sec('rc_prep')   # (timing only: the recompute pass split into the job's preparation, its sources, the forward)
             # Source values are immutable across fast/slow weight updates. Build
@@ -3085,6 +3117,13 @@ def main(argv=None, child=None, actor=None):
                     L['v2_host_rows'][at_v] = v_rows
                     L['v2_host_pending'][at_v] = pend_v
                     if 'ledger' in L: L['ledger'].admit_v2(at_v)
+                    if os.environ.get('ISAAC_LINEAGE_SOURCES') and source_pipeline is not None:
+                        adm_ = L.setdefault('admitted_v2', {})   # (measurement: when each record arrived)
+                        for i_ in range(len(at_v)):
+                            if v_contexts[i_] is not None:
+                                adm_[v_contexts[i_].uid] = (source_pipeline.version, L['update'], v_contexts[i_].length)
+                        if len(adm_) > 20000:
+                            for k_ in list(adm_)[:len(adm_) - 20000]: del adm_[k_]
                 at_d = torch.from_numpy(at_v).to(device)
                 if t_on:
                     if v_ts is not None:
@@ -3378,6 +3417,7 @@ def main(argv=None, child=None, actor=None):
                     if was_pending and source_pipeline.pending is None:
                         live_now = live_uids | {h.uid for h in L.get('v2_contexts', []) if h is not None}
                         live_now.update(h.uid for h in L.get('teach_contexts', []) if h is not None)
+                        source_pipeline.retain_mark = (L['update'], 'after_vjp')
                         source_pipeline.retain_histories(live_now,overlap=source_pipeline.defer_backward,
                                                          frontiers=horizon_frontiers())
                 opt.zero_grad(set_to_none=True)
@@ -3465,6 +3505,7 @@ def main(argv=None, child=None, actor=None):
                     if retire_after_ready:
                         live_now=live_uids | {h.uid for h in L.get('v2_contexts',[]) if h is not None}
                         live_now.update(h.uid for h in L.get('teach_contexts',[]) if h is not None)
+                        source_pipeline.retain_mark = (L['update'], 'after_ready')
                         source_pipeline.retain_histories(live_now,overlap=True,frontiers=horizon_frontiers())
                         retire_after_ready=False
                     source_pipeline.dispatch_finish()
@@ -4338,7 +4379,7 @@ def main(argv=None, child=None, actor=None):
                         # rule 5: frames this update encoded and consumed need no bytes here
                         from isaac_bridge.record_retention import release_raw
                         encoded_ = L.get('encoded_upto', {})
-                        live_ = set(source_pipeline.lengths) | set().union(*L.get('lineage', {}).values())
+                        live_ = set(source_pipeline.lengths) | {a_ for a_, _, _ in set().union(*L.get('lineage', {}).values())}
                         for u_ in [u_ for u_ in encoded_ if u_ not in live_]: del encoded_[u_]
                         ledger_ = L.get('ledger')
                         release_raw(lambda u_: encoded_.get(u_, 0), args.memory_block,
@@ -4848,7 +4889,7 @@ def main(argv=None, child=None, actor=None):
                 if args.release_raw:
                     # rule 5: frames the learner has received need no bytes in this actor; ancestors of
                     # branches in flight are reported so the learner keeps their source values (D2a)
-                    from isaac_bridge.record_retention import release_raw, lineage as lineage_of
+                    from isaac_bridge.record_retention import release_raw, lineage_intervals
                     for u_, n_ in sent_histories.items(): sent_max[u_] = max(sent_max.get(u_, 0), n_)
                     slots_ = [m_.raw for m_ in (getattr(t_state, 'rebuild', None),
                               getattr(lane_tstate, 'rebuild', None) if lane_tstate is not None else None,
@@ -4856,11 +4897,19 @@ def main(argv=None, child=None, actor=None):
                     contexts_ = getattr(sampler, 'rebuild_contexts', None)
                     records_ = job.get('v2')   # branch records in this hand-off: their ancestors too
                     records_ = records_[-1] if records_ is not None and len(records_) and isinstance(records_[-1], list) else []
-                    branch_ = lineage_of(slot_lists=slots_[1:] + [records_], context_dicts=[contexts_])
+                    # (ancestor, frames shared, the branch's length): the learner keeps [length - H, shared)
+                    reach_ = lineage_intervals(slot_lists=slots_[1:] + [records_], context_dicts=[contexts_])
+                    branch_ = {a_ for a_, _, _ in reach_}
+                    if os.environ.get('ISAAC_LINEAGE_SOURCES'):   # (measurement: which holder reported each ancestor)
+                        held_ = dict(zip(['lanes', 'bank'][:len(slots_) - 1], slots_[1:]))
+                        held_['records'] = records_
+                        job['lineage_src'] = {k_: sorted(lineage_intervals(slot_lists=[v_])) for k_, v_ in held_.items()}
+                        job['lineage_src']['contexts'] = sorted(lineage_intervals(context_dicts=[contexts_]))
+                        job['lineage_src']['main'] = sorted((h_.uid, h_.length) for h_ in slots_[0] if h_ is not None)
                     for u_ in [u_ for u_ in sent_max if u_ not in sent_histories and u_ not in branch_]: del sent_max[u_]
                     release_raw(lambda u_: sent_max.get(u_, 0), args.memory_block, slot_lists=slots_,
                                 context_lists=[roll.raw_contexts, spare.raw_contexts], context_dicts=[contexts_])
-                    job['lineage'] = sorted(branch_)
+                    job['lineage'] = sorted(reach_)
                 if PROFILE_MEMORY:
                     print('MEMORY_IPC_PLAN ' + json.dumps(dict(aid=aid, seq=job['seq'], plan_s=time.perf_counter()-pack_start)), flush=True)
             if args.rebuild_memory and PROFILE_MEMORY and proc:

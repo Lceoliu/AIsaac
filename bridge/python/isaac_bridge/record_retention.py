@@ -114,8 +114,9 @@ class RecordLedger:
         earliest decision per episode, which kept everything after it).
 
         frontier: {uid: the rollout's first pending decision F} -> [(F - H, inf)] (H = horizon; 0: [(0, inf)]).
-        An unconsumed record deciding at L = h.length reads, with gradient, frames [L - H, L) of its history:
-        its own frames from its fork on, [max(own start, L - H), L), and of each ancestor only the frames it
+        An unconsumed record deciding at L = h.length reads, with gradient, frames [L - H, L] of its history
+        and its current observation (frame L: the query, encoded with the record, possibly a chunk of its own):
+        its own frames from its fork on, [max(own start, L - H), L + 1), and of each ancestor only the frames it
         shares, [L - H, shared count) (empty when the fork lies more than H before L). A consumed record adds
         nothing; an episode only consumed records refer to gets no interval (values only)."""
         inf = float('inf')
@@ -127,7 +128,7 @@ class RecordLedger:
                 if cons[slot]:
                     consumed.add(h.uid); consumed.update(a for a, _ in h.origin); continue
                 L = h.length; lo = L - horizon if horizon else 0
-                own = (max(h.own_start(), lo), L)
+                own = (max(h.own_start(), lo), L + 1)   # (frame L: the record's own query, 2026-10-26)
                 if own[0] < own[1]: out.setdefault(h.uid, []).append(own)
                 else: out.setdefault(h.uid, [])
                 for a, shared in h.origin:
@@ -201,6 +202,32 @@ def release_raw(limit, block, slot_lists=(), context_lists=(), context_dicts=())
         if table is None: continue
         for key, h in list(table.items()):
             if h is not None: table[key] = released(h, limit, block, memo)
+
+
+def lineage_intervals(slot_lists=(), context_dicts=()):
+    """(ancestor uid, frames it shares, the branch's current length) of branches in flight (lanes, the
+    choice-point bank, contexts awaiting publication): what in_flight_frontier needs."""
+    out = set()
+    for raw in slot_lists:
+        for h in raw or ():
+            if h is not None and h.length: out.update((a, n, h.length) for a, n in h.origin)
+    for table in context_dicts:
+        for h in (table or {}).values():
+            if h is not None: out.update((a, n, h.length) for a, n in h.origin)
+    return out
+
+
+def in_flight_frontier(frontier, lineage, horizon):
+    """(2026-10-26) The frames an in-flight branch's future records can still read of each ancestor: they
+    decide at or after the branch's current length l, so at most [l - H, shared) (no horizon: [0, shared)).
+    Added to frontier's intervals ({uid: [(lo, hi), ...]}); an ancestor with nothing reachable gets no
+    interval (values only), as before."""
+    for a, shared, length in lineage:
+        lo = length - horizon if horizon else 0
+        reach = frontier.setdefault(a, [])
+        if not isinstance(reach, list): reach = frontier[a] = []   # (a stale number: lists only here)
+        if lo < shared and (lo, shared) not in reach: reach.append((lo, shared))
+    return frontier
 
 
 def lineage(slot_lists=(), context_dicts=()):
