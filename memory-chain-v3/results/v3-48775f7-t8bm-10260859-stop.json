@@ -1,0 +1,14 @@
+{
+  "command": [
+    "docker",
+    "stop",
+    "--timeout",
+    "30",
+    "aisaac-bench-memory-v3-v3-48775f7-t8bm-10260859"
+  ],
+  "stdout": "aisaac-bench-memory-v3-v3-48775f7-t8bm-10260859\n",
+  "stderr": "",
+  "exit_status": 0,
+  "reason": "orphaned chain (48775f7) after TaskStop; superseded",
+  "time": "Mon Oct 26 09:05:27 2026"
+}

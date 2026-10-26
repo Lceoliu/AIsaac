@@ -37,5 +37,9 @@ for spec in [a for a in sys.argv[1:] if '=' in a and not a.startswith('--')]:
     for i, (dv, o) in enumerate(out.items()):
         print(f"| {dv} | {o['busy']:.2f} | {o['encode']:.2f} | {o['writer']:.2f} | {o['source_backward']:.2f} | "
               f"{frames[i] if i < len(frames) else float('nan'):.0f} | {weights[i] if i < len(weights) else float('nan'):.2f} |")
+    per_update = np.asarray([[sum(p.get(dv, {}).values()) for dv in devs] for p in per])
+    upd_max = per_update.max(1); upd_spread = (per_update.max(1) - per_update.min(1)) / per_update.mean(1)
+    print(f'per update: busiest card median {np.median(upd_max):.2f} s (q75 {np.percentile(upd_max, 75):.2f}); '
+          f'spread median {np.median(upd_spread):.1%}')
     print(f'spread (max - min) / mean of busy: {(busy.max() - busy.min()) / busy.mean():.1%}; '
           f'max {busy.max():.2f} s; wall median {np.median([float(r["wall_s"]) for r in rows]):.2f} s\n')

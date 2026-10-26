@@ -1,0 +1,45 @@
+6:15.120000 954 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:15.120000 954 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:15.120000 954 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000781
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000702
+RUN C1
+W1026 17:06:33.399000 1024 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:33.399000 1024 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:33.399000 1024 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:33.399000 1024 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:33.455000 1023 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:33.455000 1023 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:33.455000 1023 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:33.455000 1023 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000887
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000966
+RUN C2
+W1026 17:06:51.943000 1099 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:51.943000 1099 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:51.943000 1099 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:51.943000 1099 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:51.971000 1100 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:51.971000 1100 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:51.971000 1100 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:51.971000 1100 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000808
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001068
+RUN S2
+W1026 17:07:10.286000 1176 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:07:10.286000 1176 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:07:10.286000 1176 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:07:10.286000 1176 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:07:10.298000 1175 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:07:10.298000 1175 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:07:10.298000 1175 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:07:10.298000 1175 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000506
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000558
+DIFF C1 params 0.0 source gradients 0.0 serial-vs-serial 0.0 0.0
+DIFF C2 params 0.0 source gradients 0.0 serial-vs-serial 0.0 0.0
+{"result": "PASS", "sources": ["cuda:1", "cuda:2"], "production": true, "serial_encodes_inside_vjp": 22, "serial_repeat_rel_diff": 0.0, "serial_repeat_source_grad_diff": 0.0, "C1": {"bitwise": true, "max_rel_param_diff": 0.0, "max_rel_source_grad_diff": 0.0, "encodes_inside_vjp": 18, "vjps": 10}, "C2": {"bitwise": true, "max_rel_param_diff": 0.0, "max_rel_source_grad_diff": 0.0, "encodes_inside_vjp": 22, "vjps": 10}}
+
+GATE v3-bc138f5-streams-diag EXIT 0
+
+EXIT 0

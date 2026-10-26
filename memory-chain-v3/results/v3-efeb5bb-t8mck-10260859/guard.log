@@ -1,0 +1,3 @@
+DISPATCH ["python3", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/run_v3_case.py", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/specs/v3-efeb5bb-t8mck-10260859.json"] pid 701393
+Selected GPU is occupied; no benchmark launched.
+RUNNER_EXIT 1

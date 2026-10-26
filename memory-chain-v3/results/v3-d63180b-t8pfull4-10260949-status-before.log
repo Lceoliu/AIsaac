@@ -1,0 +1,52 @@
+ 16:51:00 up 14 days,  5:29,  7 users,  load average: 2.30, 7.51, 11.43
+               total        used        free      shared  buff/cache   available
+Mem:             125          20          73           0          33         104
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 881 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 2584001, 540 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 2 weeks
+signbridge-api Up 2 weeks
+signbridge-web Up 2 weeks
+signbridge-funasr Up 2 weeks (healthy)
+sl_service_proxy Up 2 weeks
+signbridge-inference Up 2 weeks
+signbridge-livekit Up 2 weeks
+signbridge-redis Up 2 weeks (healthy)
+woshica_docker Up 2 weeks
+sl_dev Up 2 weeks
+zhanghao_workspace Up 2 weeks
+prometheus Up 2 weeks
+nodeexporter Up 2 weeks
+grafana Up 2 weeks
+caddy Up 2 weeks
+cadvisor Up 2 weeks (healthy)
+pushgateway Up 2 weeks
+alertmanager Up 2 weeks
+service_base Up 2 weeks
+
+EXIT 0
+
+EXIT 0

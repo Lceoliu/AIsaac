@@ -1,0 +1,194 @@
+RUN S
+W1026 17:02:21.097000 75 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:02:21.097000 75 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:02:21.097000 75 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:02:21.097000 75 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:02:21.267000 76 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:02:21.267000 76 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:02:21.267000 76 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:02:21.267000 76 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000598
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000708
+RUN C1
+W1026 17:02:39.770000 146 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:02:39.770000 146 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:02:39.770000 146 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:02:39.770000 146 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:02:39.798000 145 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:02:39.798000 145 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:02:39.798000 145 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:02:39.798000 145 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.001038
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001257
+RUN C2
+W1026 17:02:57.950000 222 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:02:57.950000 222 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:02:57.950000 222 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:02:57.950000 222 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:02:58.013000 221 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:02:58.013000 221 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:02:58.013000 221 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:02:58.013000 221 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000954
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000933
+RUN S2
+W1026 17:03:16.330000 297 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:03:16.330000 297 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:03:16.330000 297 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:03:16.330000 297 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:03:16.355000 298 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:03:16.355000 298 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:03:16.355000 298 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:03:16.355000 298 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001000
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000716
+DIFF C1 params 0.0 source gradients 1.4087414083528452e-06 serial-vs-serial 0.0 0.0
+DIFF C2 params 0.0 source gradients 0.0 serial-vs-serial 0.0 0.0
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_source_streams.py", line 136, in <module>
+    main(arg.split(','), '--production' in sys.argv)
+  File "/bench/workspace/python/tests/test_source_streams.py", line 126, in main
+    assert not failures, failures   # (cpu: bitwise; CUDA: source gradients within 1e-6)
+AssertionError: [('C1', 0.0, 1.4087414083528452e-06, 0.0)]
+[W1026 17:03:31.914150953 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+RUN S
+W1026 17:03:38.392000 368 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:03:38.392000 368 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:03:38.392000 368 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:03:38.392000 368 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:03:38.506000 369 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:03:38.506000 369 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:03:38.506000 369 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:03:38.506000 369 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000631
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000616
+RUN C1
+W1026 17:03:57.125000 438 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:03:57.125000 438 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:03:57.125000 438 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:03:57.125000 438 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:03:57.145000 439 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:03:57.145000 439 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:03:57.145000 439 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:03:57.145000 439 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000911
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000976
+RUN C2
+W1026 17:04:15.259000 515 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:04:15.259000 515 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:04:15.259000 515 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:04:15.259000 515 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:04:15.323000 514 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:04:15.323000 514 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:04:15.323000 514 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:04:15.323000 514 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000884
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000983
+RUN S2
+W1026 17:04:33.468000 590 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:04:33.468000 590 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:04:33.468000 590 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:04:33.468000 590 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:04:33.539000 591 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:04:33.539000 591 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:04:33.539000 591 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:04:33.539000 591 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000582
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000680
+DIFF C1 params 0.0 source gradients 0.0 serial-vs-serial 0.0 0.0
+DIFF C2 params 0.0 source gradients 0.0 serial-vs-serial 0.0 0.0
+{"result": "PASS", "sources": ["cuda:1", "cuda:2"], "production": true, "serial_encodes_inside_vjp": 20, "serial_repeat_rel_diff": 0.0, "serial_repeat_source_grad_diff": 0.0, "C1": {"bitwise": true, "max_rel_param_diff": 0.0, "max_rel_source_grad_diff": 0.0, "encodes_inside_vjp": 18, "vjps": 10}, "C2": {"bitwise": true, "max_rel_param_diff": 0.0, "max_rel_source_grad_diff": 0.0, "encodes_inside_vjp": 18, "vjps": 10}}
+RUN S
+W1026 17:04:54.633000 662 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:04:54.633000 662 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:04:54.633000 662 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:04:54.633000 662 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:04:54.816000 661 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:04:54.816000 661 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:04:54.816000 661 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:04:54.816000 661 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001249
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000629
+RUN C1
+W1026 17:05:14.281000 732 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:05:14.281000 732 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:05:14.281000 732 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:05:14.281000 732 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:05:14.306000 731 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:05:14.306000 731 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:05:14.306000 731 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:05:14.306000 731 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000915
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001144
+RUN C2
+W1026 17:05:33.122000 808 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:05:33.122000 808 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:05:33.122000 808 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:05:33.122000 808 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:05:33.128000 807 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:05:33.128000 807 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:05:33.128000 807 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:05:33.128000 807 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000912
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001015
+RUN S2
+W1026 17:05:52.399000 884 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:05:52.399000 884 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:05:52.399000 884 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:05:52.399000 884 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:05:52.421000 883 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:05:52.421000 883 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:05:52.421000 883 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:05:52.421000 883 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000773
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000736
+DIFF C1 params 0.0 source gradients 1.368044229850243e-07 serial-vs-serial 0.0 0.0
+DIFF C2 params 0.0 source gradients 0.0 serial-vs-serial 0.0 0.0
+{"result": "PASS", "sources": ["cuda:1", "cuda:2"], "production": true, "serial_encodes_inside_vjp": 14, "serial_repeat_rel_diff": 0.0, "serial_repeat_source_grad_diff": 0.0, "C1": {"bitwise": true, "max_rel_param_diff": 0.0, "max_rel_source_grad_diff": 1.368044229850243e-07, "encodes_inside_vjp": 14, "vjps": 10}, "C2": {"bitwise": true, "max_rel_param_diff": 0.0, "max_rel_source_grad_diff": 0.0, "encodes_inside_vjp": 19, "vjps": 10}}
+RUN S
+W1026 17:06:15.001000 953 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:15.001000 953 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:15.001000 953 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:15.001000 953 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:15.120000 954 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:15.120000 954 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:15.120000 954 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:15.120000 954 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000781
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000702
+RUN C1
+W1026 17:06:33.399000 1024 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:33.399000 1024 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:33.399000 1024 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:33.399000 1024 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:33.455000 1023 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:33.455000 1023 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:33.455000 1023 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:33.455000 1023 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000887
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000966
+RUN C2
+W1026 17:06:51.943000 1099 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:51.943000 1099 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:51.943000 1099 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:51.943000 1099 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:51.971000 1100 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:06:51.971000 1100 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:06:51.971000 1100 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:06:51.971000 1100 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000808
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001068
+RUN S2
+W1026 17:07:10.286000 1176 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:07:10.286000 1176 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:07:10.286000 1176 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:07:10.286000 1176 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:07:10.298000 1175 torch/_logging/_internal.py:1130] [0/0] 
+W1026 17:07:10.298000 1175 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 17:07:10.298000 1175 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 17:07:10.298000 1175 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000506
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000558
+DIFF C1 params 0.0 source gradients 0.0 serial-vs-serial 0.0 0.0
+DIFF C2 params 0.0 source gradients 0.0 serial-vs-serial 0.0 0.0
+{"result": "PASS", "sources": ["cuda:1", "cuda:2"], "production": true, "serial_encodes_inside_vjp": 22, "serial_repeat_rel_diff": 0.0, "serial_repeat_source_grad_diff": 0.0, "C1": {"bitwise": true, "max_rel_param_diff": 0.0, "max_rel_source_grad_diff": 0.0, "encodes_inside_vjp": 18, "vjps": 10}, "C2": {"bitwise": true, "max_rel_param_diff": 0.0, "max_rel_source_grad_diff": 0.0, "encodes_inside_vjp": 22, "vjps": 10}}

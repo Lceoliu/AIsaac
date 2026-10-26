@@ -1,0 +1,50 @@
+t context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:58:47.994000 217 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:58:47.994000 217 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000738
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000729
+RUN C1
+W1026 16:59:06.913000 287 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:06.913000 287 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:06.913000 287 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:06.913000 287 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:06.955000 286 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:06.955000 286 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:06.955000 286 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:06.955000 286 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000733
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001627
+RUN C2
+W1026 16:59:25.432000 362 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:25.432000 362 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:25.432000 362 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:25.432000 362 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:25.575000 363 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:25.575000 363 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:25.575000 363 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:25.575000 363 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001064
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000994
+RUN S2
+W1026 16:59:44.284000 439 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:44.284000 439 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:44.284000 439 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:44.284000 439 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:44.288000 438 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:44.288000 438 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:44.288000 438 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:44.288000 438 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000577
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000619
+DIFF C1 params 0.0 source gradients 1.4087414083528452e-06 serial-vs-serial 0.0 0.0
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_source_streams.py", line 133, in <module>
+    main(arg.split(','), '--production' in sys.argv)
+  File "/bench/workspace/python/tests/test_source_streams.py", line 120, in main
+    if cuda: assert gdiff <= 1e-6, (name, gdiff, grad_noise)   # (source gradients within 1e-6)
+AssertionError: ('C1', 1.4087414083528452e-06, 0.0)
+[W1026 16:59:58.600317387 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+
+GATE v3-31b1470-streams-cuda EXIT 1
+
+EXIT 1

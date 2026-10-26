@@ -1,0 +1,133 @@
+===== status (Mon Oct 26 09:57:26 2026)
+ 16:57:26 up 14 days,  5:36,  7 users,  load average: 11.27, 13.21, 12.96
+               total        used        free      shared  buff/cache   available
+Mem:             125          20          73           0          33         104
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 881 MiB, 5 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6096 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 2584001, 540 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420080, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420074, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420090, 528 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420088, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3419652, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420076, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420072, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420086, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420089, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420082, 528 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3420091, 528 MiB
+CONTAINERS
+mouse-lab-model-router Up 2 weeks
+signbridge-api Up 2 weeks
+signbridge-web Up 2 weeks
+signbridge-funasr Up 2 weeks (healthy)
+sl_service_proxy Up 2 weeks
+signbridge-inference Up 2 weeks
+signbridge-livekit Up 2 weeks
+signbridge-redis Up 2 weeks (healthy)
+woshica_docker Up 2 weeks
+sl_dev Up 2 weeks
+zhanghao_workspace Up 2 weeks
+prometheus Up 2 weeks
+nodeexporter Up 2 weeks
+grafana Up 2 weeks
+caddy Up 2 weeks
+cadvisor Up 2 weeks (healthy)
+pushgateway Up 2 weeks
+alertmanager Up 2 weeks
+service_base Up 2 weeks
+
+EXIT 0
+ 
+[status] EXIT 0
+===== deploy (Mon Oct 26 09:57:27 2026)
+156
+
+DEPLOY v3-31b1470 31b1470395c42b32ccaa9c0fd64ff2b1be3b02bb EXIT 0
+ 
+[deploy v3-31b1470] EXIT 0
+===== gates (Mon Oct 26 09:57:28 2026)
+{"result": "PASS", "learner": "cuda:0", "sources": "cuda:1,cuda:2", "forward_bitwise_equal": true, "masked_visible_pairs": 136, "masked_memory_grad_removed": 2.2038607597351074, "reader_weight_grad_max_abs_vs_unbounded": 1.9073486328125e-06, "per_pair_reference": "PASS", "detached_chunks": 4, "detached_writes": 2, "pinned_by_live_writer": 2, "settled_packets": 4, "graph_frames_uid_max": 32, "graph_frames_reachable_per_uid": 20, "dropped_grad": 0.0, "detach_vs_never_detached_weight_max_abs": 1.4901161193847656e-08, "process_vs_local_weight_max_abs": 4.377216100692749e-08, "process_detached_chunks": 4, "process_detached_writes": 2, "single_decision": {"t": 47, "horizon": 12, "nonzero": [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47], "no_graph": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], "graph_zero": [32, 33, 34, 35], "unbounded_nonzero_min": 0}}
+[W1026 16:57:41.337054614 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+
+GATE v3-31b1470-horizon-cuda EXIT 0
+ 
+[gate v3-31b1470-horizon-cuda] EXIT 0
+{"result": "PASS", "process": false, "horizon": 24, "rollout": 32, "bound": 80, "bounded_graph_uid_max": [32, 64, 64, 64, 64, 64, 64, 64, 64, 64], "unbounded_graph_uid_max": [32, 64, 96, 128, 160, 192, 224, 256, 288, 320], "bounded_detached": [0, 0, 64, 128, 192, 256, 320, 384, 448, 512], "dropped": 0.0}
+HOST_HEAP_TRIM role=source-cpu seconds=0.000240
+HOST_HEAP_TRIM role=source-cpu seconds=0.000184
+HOST_HEAP_TRIM role=source-cpu seconds=0.000813
+HOST_HEAP_TRIM role=source-cpu seconds=0.001013
+HOST_HEAP_TRIM role=source-cpu seconds=0.001646
+HOST_HEAP_TRIM role=source-cpu seconds=0.002296
+HOST_HEAP_TRIM role=source-cpu seconds=0.001622
+HOST_HEAP_TRIM role=source-cpu seconds=0.001256
+HOST_HEAP_TRIM role=source-cpu seconds=0.003042
+HOST_HEAP_TRIM role=source-cpu seconds=0.002324
+HOST_HEAP_TRIM role=source-cpu seconds=0.000154
+HOST_HEAP_TRIM role=source-cpu seconds=0.000136
+HOST_HEAP_TRIM role=source-cpu seconds=0.000184
+HOST_HEAP_TRIM role=source-cpu seconds=0.000194
+HOST_HEAP_TRIM role=source-cpu seconds=0.000256
+HOST_HEAP_TRIM role=source-cpu seconds=0.000247
+HOST_HEAP_TRIM role=source-cpu seconds=0.000212
+HOST_HEAP_TRIM role=source-cpu seconds=0.000191
+HOST_HEAP_TRIM role=source-cpu seconds=0.000235
+HOST_HEAP_TRIM role=source-cpu seconds=0.000177
+{"result": "PASS", "process": true, "horizon": 24, "rollout": 32, "bound": 80, "bounded_graph_uid_max": [32, 64, 64, 64, 64, 64, 64, 64, 64, 64], "unbounded_graph_uid_max": [32, 64, 96, 128, 160, 192, 224, 256, 288, 320], "bounded_detached": [0, 0, 64, 128, 192, 256, 320, 384, 448, 512], "dropped": 0.0}
+
+GATE v3-31b1470-horizon-bound EXIT 0
+ 
+[gate v3-31b1470-horizon-bound] EXIT 0
+nder torch.compile.
+W1026 16:59:06.955000 286 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:06.955000 286 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000733
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001627
+RUN C2
+W1026 16:59:25.432000 362 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:25.432000 362 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:25.432000 362 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:25.432000 362 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:25.575000 363 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:25.575000 363 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:25.575000 363 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:25.575000 363 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001064
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000994
+RUN S2
+W1026 16:59:44.284000 439 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:44.284000 439 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:44.284000 439 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:44.284000 439 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:44.288000 438 torch/_logging/_internal.py:1130] [0/0] 
+W1026 16:59:44.288000 438 torch/_logging/_internal.py:1130] [0/0] Detected that context_fn is passed to torch.utils.checkpoint under torch.compile.
+W1026 16:59:44.288000 438 torch/_logging/_internal.py:1130] [0/0] Please make sure the checkpointed region does not contain in-place ops (e.g. torch.relu_).
+W1026 16:59:44.288000 438 torch/_logging/_internal.py:1130] [0/0] 
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000577
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000619
+DIFF C1 params 0.0 source gradients 1.4087414083528452e-06 serial-vs-serial 0.0 0.0
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_source_streams.py", line 133, in <module>
+    main(arg.split(','), '--production' in sys.argv)
+  File "/bench/workspace/python/tests/test_source_streams.py", line 120, in main
+    if cuda: assert gdiff <= 1e-6, (name, gdiff, grad_noise)   # (source gradients within 1e-6)
+AssertionError: ('C1', 1.4087414083528452e-06, 0.0)
+[W1026 16:59:58.600317387 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+
+GATE v3-31b1470-streams-cuda EXIT 1
+ 
+[gate v3-31b1470-streams-cuda] EXIT 1
+step failed: ('gate', 'v3-31b1470-streams-cuda', 'v3-31b1470', '3,4,5', 'nice -n 10 timeout 1800 bash -c "/bench/home/isaac-abplus/.venv/bin/python -u tests/test_source_streams.py --sources cuda:1,cuda:2 && /bench/home/isaac-abplus/.venv/bin/python -u tests/test_source_streams.py --sources cuda:1,cuda:2 --production"')
+EXITR 1

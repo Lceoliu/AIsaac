@@ -79,8 +79,8 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
             # table 8 steps: t7's configuration, short (25 game hours, steady rows 10..20), one per step's code
             t8s=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
                  TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 ']]),
-            # source-card balance by measured work (--source-balance 1), otherwise t8s
-            t8b=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
+            # source-card balance by measured work (--source-balance 1), otherwise t8s (short; was 't8b' before 10-26 late)
+            t8bal=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
                  TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 '],
                           [' --source-dispatch-at-close 1 ', ' --source-dispatch-at-close 1 --source-balance 1 ']]),
             # VJP work measurements (2026-10-26, measurement only): t8b + memory breakdown / saved-tensor census;
@@ -99,11 +99,16 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
                   TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 --source-streams 2 ']]),
             t8bm=(1024, 25.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
                   TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 ']]),
-            # (table 8: balance only; streams gave no gain on 4 cards, t8st4 vs t8mck4, so they are measured separately: t8x)
+            # table 8 (the coordinator's configuration, 2026-10-26): 5 cards, balance on, streams off; t8 = only Spatial
+            # blocks 2,3 checkpointed (main), t8b = all four blocks (comparable to table 7); 40 steady each
             t8=(1024, 62.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
-                TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 ']]),
-            t8x=(1024, 62.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
-                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 --source-streams 2 ']]),
+                TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-checkpoint-blocks 2,3 --source-balance 1 ']]),
+            t8b=(1024, 62.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
+                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 ']]),
+            # VJP kernel profile (ISAAC_SOURCE_VJP_PROFILE = the n-th source VJP of each source process), 4 cards
+            **{name: (1024, 18.0, FOUR1, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_VJP_PROFILE='10'),
+                      TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 ' + extra + '--source-balance 1 ']])
+               for name, extra in (('t8pck4', '--source-layer-checkpoint 1 '), ('t8pfull4', ''))},
             # the same measurements on four cards (GPU2 in others' use): learner cuda:1, actors cuda:0,2, sources cuda:0,2,3
             **{name + '4': (1024, 25.0, FOUR1, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_MEMORY_BREAKDOWN='1', ISAAC_SOURCE_SAVED_PROFILE='30'),
                       TRIMS + [U1, [' --source-flash 1 ', ' --source-flash ' + flash + ' --source-dispatch-at-close 1 ' + extra]]

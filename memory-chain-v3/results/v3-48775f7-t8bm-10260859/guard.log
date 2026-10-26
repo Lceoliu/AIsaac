@@ -1,0 +1,2 @@
+DISPATCH ["python3", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/run_v3_case.py", "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/specs/v3-48775f7-t8bm-10260859.json"] pid 682465
+START memory-v3-v3-48775f7-t8bm-10260859 pid 683288

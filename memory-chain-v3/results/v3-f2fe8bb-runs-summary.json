@@ -1,32 +1,66 @@
 [
   {
-    "case": "v3-f2fe8bb-t8st4-10260841",
+    "case": "v3-f2fe8bb-t8-10260907",
     "horizon": 1024,
-    "exit_status": 0,
-    "updates": 21,
-    "steady_updates": 11,
-    "steady_x_real_time": 311.0994862905413,
+    "exit_status": 137,
+    "updates": 36,
+    "steady_updates": 26,
+    "steady_x_real_time": 295.64993248792956,
     "medians": {
-      "x_real_time": 321.732214469068,
-      "collect_s": 7.9110301218461245,
-      "update_s": 11.815337972948328,
-      "wall_s": 13.589355173986405,
-      "gpu_reserved_gb": 22.19140625,
-      "wait_learner_s": 6.414313134970143,
-      "c_learner_cores": 0.7080223304615929,
-      "source_graph_frames": 168952.0,
-      "source_graph_frames_uid_max": 3513.0,
-      "source_alloc_gib_max": 4.648022651672363,
-      "source_detached_frames": 355508.0
+      "x_real_time": 299.83200238771235,
+      "collect_s": 7.934257498476654,
+      "update_s": 12.292510851984844,
+      "wall_s": 14.575631799525581,
+      "gpu_reserved_gb": 21.248046875,
+      "wait_learner_s": 6.615530070615932,
+      "c_learner_cores": 0.730887651751146,
+      "source_graph_frames": 161027.0,
+      "source_graph_frames_uid_max": 3382.5,
+      "source_alloc_gib_max": 10.723993301391602,
+      "source_detached_frames": 485084.0
     },
     "peak_gpu_mib": {
-      "1": 21229.0,
-      "3": 13752.0,
-      "4": 12378.0,
-      "5": 8743.0
+      "1": 20648.0,
+      "2": 22141.0,
+      "3": 20230.0,
+      "4": 24117.0,
+      "5": 17781.0
     },
-    "peak_container_memory_gib": 58.81876754760742,
-    "guard_stops": [],
+    "peak_container_memory_gib": 68.32545852661133,
+    "guard_stops": [
+      "no_progress_in_180_seconds"
+    ],
     "completed": false
+  },
+  {
+    "case": "v3-f2fe8bb-t8b-10260923",
+    "horizon": 1024,
+    "exit_status": 0,
+    "updates": 52,
+    "steady_updates": 42,
+    "steady_x_real_time": 265.6593046995158,
+    "medians": {
+      "x_real_time": 260.0426474853879,
+      "collect_s": 7.1737290089949965,
+      "update_s": 14.027386547066271,
+      "wall_s": 16.814197535044514,
+      "gpu_reserved_gb": 22.904296875,
+      "wait_learner_s": 9.78030119894538,
+      "c_learner_cores": 0.6081058992065587,
+      "source_graph_frames": 189540.5,
+      "source_graph_frames_uid_max": 3335.0,
+      "source_alloc_gib_max": 6.3466637134552,
+      "source_detached_frames": 530275.5
+    },
+    "peak_gpu_mib": {
+      "1": 16066.0,
+      "2": 21957.0,
+      "3": 15572.0,
+      "4": 11009.0,
+      "5": 13285.0
+    },
+    "peak_container_memory_gib": 67.5947036743164,
+    "guard_stops": [],
+    "completed": true
   }
 ]
