@@ -450,6 +450,7 @@ class SourcePipeline:
             if c.get('detached'): detached += c['rows']; continue
             graph += c['rows']
             if c.get('uid') is not None: per_uid[c['uid']] = per_uid.get(c['uid'], 0) + c['rows']
+        self._resolve_drops()
         dropped = 0. if self.horizon_dropped is None else float(self.horizon_dropped)
         allocated = [m['allocated'] for m in self.remote_memory] if self.processes else [
             torch.cuda.memory_allocated(d) if d.type == 'cuda' else 0 for d in self.devices]
@@ -1006,18 +1007,33 @@ class SourcePipeline:
 
     def _drop_stale(self, gradient, put, result, field):
         # (audit) cotangent of Writer blocks that read a released chunk's values: it cannot reach those frames
+        # (no host sync: the rows outside the stale blocks count zero)
         stale = torch.as_tensor(result['_stale_rows'], device=put.device)
-        hit = torch.isin(put, stale)
-        if bool(hit.any()): self._drop(gradient[hit], result, field + '_on_released_input', put[hit])
+        hit = torch.isin(put, stale).to(gradient.dtype).reshape((-1,) + (1,) * (gradient.dim() - 1))
+        self._drop(gradient * hit, result, field + '_on_released_input', put)
 
     def _drop(self, gradient, result=None, field=None, put=None):
         # Audit, not a correction: progress.csv must report exactly zero.
         total = gradient.detach().abs().sum().to(self.device, dtype=torch.float64)
         self.horizon_dropped = total if self.horizon_dropped is None else self.horizon_dropped + total
-        if result is not None and not getattr(self, '_drop_logged', False) and float(total) > 0:
-            # (the first non-zero drop: what it hit and which batch read it; printed once)
+        if result is not None and not getattr(self, '_drop_logged', False):
+            # (the first non-zero drop is found at horizon_stats, once per update: no host sync per call;
+            # before 2026-10-26 a float() here synchronised every audited credit)
+            pending = self.__dict__.setdefault('_drop_pending', [])
+            pending.append((total, result, field, put, getattr(self, '_drop_batch', None), self.version))
+            if len(pending) >= 4096: self._resolve_drops()
+
+    def _resolve_drops(self):
+        pending, self._drop_pending = getattr(self, '_drop_pending', []), []
+        if not pending or getattr(self, '_drop_logged', False): return
+        totals = torch.stack([p[0] for p in pending]).cpu()
+        first = int(torch.nonzero(totals > 0)[0, 0]) if bool((totals > 0).any()) else None
+        if first is not None: self._log_drop(*pending[first])
+
+    def _log_drop(self, total, result, field, put, batch, version):
+            # (the first non-zero drop: what it hit and which batch read it; printed once. The chunk keys
+            # are looked up when printed, at the end of the update)
             self._drop_logged = True
-            batch = getattr(self, '_drop_batch', None)
             req = (getattr(batch, 'requests', None) or []) if batch is not None else []
             hit = {tuple(u) for u in (result.get('_detached_meta') or {}).get('uids', [])}
             readers = [dict(uid=list(h.uid), length=h.length, own_start=h.own_start() if h.origin else 0,
@@ -1038,7 +1054,7 @@ class SourcePipeline:
             # each reading record was admitted; set by train_tok, measurement only)
             ask = sorted(hit | {tuple(r['uid']) for r in readers} | {tuple(a) for r in readers for a, _ in r['origin']})
             learner = self.drop_context(ask) if getattr(self, 'drop_context', None) is not None else None
-            print('SOURCE_DROP_FIRST ' + json.dumps(dict(field=field, total=float(total), version=self.version,
+            print('SOURCE_DROP_FIRST ' + json.dumps(dict(field=field, total=float(total), version=version,
                   meta=result.get('_detached_meta'), keys=keys, batch=ctx, learner=learner), default=str), flush=True)
 
     @torch.no_grad()
