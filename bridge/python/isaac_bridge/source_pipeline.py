@@ -398,6 +398,12 @@ class SourcePipeline:
             if result['grads']:
                 packets.append((c, result['grads'])); result['grads'] = {}
             c['detached'] = result['_detached'] = True
+            # (audit context for a later non-zero drop: what was released, when, and why)
+            uids_ = [c['uid']] if c.get('uid') is not None else sorted(c.get('uids', ()))
+            result['_detached_meta'] = dict(kind='write' if 'last_start' in c else 'chunk', uids=[list(u) for u in uids_],
+                span=[c.get('first', c.get('first_start')), c.get('last', c.get('last_start'))], rows=c.get('rows'),
+                encoded_version=c.get('version'), detached_at_version=self.version,
+                reach={str(u): reach.get(u) for u in uids_})
         if packets:
             futures = [w.submit(self._backward, i, packets, True, 'horizon_backward') for i, w in enumerate(self.workers)]
             self.retired_pending.extend(futures)
@@ -907,7 +913,8 @@ class SourcePipeline:
         if gradient is None: return
         for result, source, target in self._query_tokens(refs, gradient.shape[1]):
             if result.get('_detached'):   # frozen read: exact zeros, audited
-                self._drop(gradient.flatten(0, 1).index_select(0, torch.as_tensor(target, device=gradient.device)))
+                self._drop(gradient.flatten(0, 1).index_select(0, torch.as_tensor(target, device=gradient.device)),
+                           result, 'y')
                 continue
             value = result['y']
             if 'y' not in result['grads']: result['grads']['y'] = torch.zeros_like(value, dtype=torch.float32)
@@ -983,17 +990,39 @@ class SourcePipeline:
             for result, put in parts:
                 if result.get('_detached'):
                     # Outside every reader's horizon: masked to exact zeros.
-                    self._drop(packed[at:at+len(put)]); at += len(put)
+                    self._drop(packed[at:at+len(put)], result, field, put); at += len(put)
                     continue
                 if field not in result['grads']:
                     result['grads'][field] = torch.zeros_like(result[field], dtype=torch.float32)
                 result['grads'][field].index_add_(0, put, packed[at:at+len(put)])
                 at += len(put)
 
-    def _drop(self, gradient):
+    def _drop(self, gradient, result=None, field=None, put=None):
         # Audit, not a correction: progress.csv must report exactly zero.
         total = gradient.detach().abs().sum().to(self.device, dtype=torch.float64)
         self.horizon_dropped = total if self.horizon_dropped is None else self.horizon_dropped + total
+        if result is not None and not getattr(self, '_drop_logged', False) and float(total) > 0:
+            # (the first non-zero drop: what it hit and which batch read it; printed once)
+            self._drop_logged = True
+            batch = getattr(self, '_drop_batch', None)
+            req = (getattr(batch, 'requests', None) or []) if batch is not None else []
+            hit = {tuple(u) for u in (result.get('_detached_meta') or {}).get('uids', [])}
+            readers = [dict(uid=list(h.uid), length=h.length, own_start=h.own_start() if h.origin else 0,
+                            origin=[[list(a), n] for a, n in h.origin]) for h, _, _ in req
+                       if h is not None and (h.uid in hit or any(a in hit for a, _ in h.origin))][:20]
+            ctx = dict(type=type(batch).__name__, requests=len(req), frozen=len(getattr(batch, 'frozen', ()) or ()),
+                       query_frozen=int(batch.query_frozen.sum()) if getattr(batch, 'query_frozen', None) is not None else None,
+                       readers=readers)
+            keys = []
+            if put is not None:
+                cid = next((i for i, c in enumerate(self.chunks + self.writes) if c is not None and c['future'].done()
+                            and c['future'].result() is result), None)
+                rows = set(int(x) for x in put.detach().cpu().reshape(-1).tolist())
+                if cid is not None and cid < len(self.chunks):
+                    keys = sorted([list(k[0]), int(k[1])] for k, (c_, o_) in self.frames.items() if c_ == cid and o_ in rows)[:12]
+            import json
+            print('SOURCE_DROP_FIRST ' + json.dumps(dict(field=field, total=float(total), version=self.version,
+                  meta=result.get('_detached_meta'), keys=keys, batch=ctx), default=str), flush=True)
 
     @torch.no_grad()
     def _credit(self, refs, chunks, field, gradient):
@@ -1004,7 +1033,7 @@ class SourcePipeline:
             result = chunks[cid]['future'].result()
             take = torch.as_tensor([i for i, _ in entries], device=gradient.device)
             if result.get('_detached'):
-                self._drop(gradient.index_select(0, take)); continue
+                self._drop(gradient.index_select(0, take), result, field); continue
             value = result[field]
             if field not in result['grads']: result['grads'][field] = torch.zeros_like(value, dtype=torch.float32)
             part = gradient.index_select(0, take).to(value.device, non_blocking=True)
@@ -1022,6 +1051,8 @@ class SourcePipeline:
         self._collect_batch(batch)
 
     def _collect_batch(self, batch):
+        # (audit context for _drop: the batch whose cotangents are credited now)
+        self._drop_batch = batch
         refs, queries, mrefs = batch.pipeline_refs
         up, mp = batch.pipeline_plans
         self._credit_packed(up, 'u', batch.u.grad)
@@ -1031,6 +1062,7 @@ class SourcePipeline:
         grad = batch.mem.grad
         self._credit_packed(mp, 'mem', None if grad is None else
                             grad.reshape(-1, self.model.reader.tokens, self.model.reader.D))
+        self._drop_batch = None
 
     def fast_step(self, optimizer, max_norm):
         if any(not self._backward_ready(f) for f in self.retired_pending):
