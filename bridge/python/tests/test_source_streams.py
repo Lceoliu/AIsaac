@@ -11,7 +11,7 @@ Checks: parameters after every rollout and every commit's source gradients equal
 and encoded rows equal, the audit (dropped gradient) exactly zero in all, and in C the VJP ran concurrently
 with encodes (a worker's encode interval inside one of its VJP intervals, the VJP event marked concurrent).
 (The extra workspace per card is measured in the long runs: memory breakdown and nvidia-smi peaks.)
-  python tests/test_source_streams.py [--sources cpu,cpu | cuda:1,cuda:2]
+  python tests/test_source_streams.py [--sources cpu,cpu | cuda:1,cuda:2] [--production]
 """
 import copy, json, os, sys
 from pathlib import Path
@@ -25,8 +25,12 @@ from isaac_bridge.rebuild_memory import RawHistory, SourceBatch, SourceView
 from isaac_bridge.source_pipeline import SourcePipeline, source_parameter
 
 
-def main(sources):
+def main(sources, production=False):
     os.environ['ISAAC_SOURCE_PREEMPT_VJP'] = '1'
+    if production:   # (and the long runs' source environment)
+        os.environ.update(ISAAC_SOURCE_COMPONENT_GRAPH_CACHE='1', ISAAC_SOURCE_COMPONENT_STATIC='1',
+                          ISAAC_SOURCE_EDGE_EXPORT='1', ISAAC_SOURCE_POINTWISE_COMPONENTS='1',
+                          ISAAC_SOURCE_POINTWISE_RECOMPUTE='1')
     cuda = sources[0].startswith('cuda')
     torch.set_num_threads(2); torch.manual_seed(59)
     learner = 'cuda:0' if cuda else 'cpu'
@@ -44,8 +48,10 @@ def main(sources):
         else: os.environ.pop('ISAAC_SOURCE_STREAM_SHUFFLE', None)
         print('RUN', name, flush=True)
         model = copy.deepcopy(base)
+        # (production: the long runs' source settings: compiled, varlen flash, BF16, every block checkpointed)
+        extra = dict(compile_source=1, flash_source=True, amp=True, layer_checkpoint=True) if production else {}
         pipe = SourcePipeline(model, sources, period=0, micro=8, update_rollouts=1, defer_backward=True,
-                              processes=True, horizon=6, dispatch_at_close=True, streams=streams)
+                              processes=True, horizon=6, dispatch_at_close=True, streams=streams, **extra)
         # (CUDA: lr 0, every interval's VJP on the same weights, so its source gradients compare directly;
         # Adam on CUDA amplifies the atomics' run-to-run noise of the Reader steps into the parameters)
         opt = (torch.optim.SGD(model.main_parameters(), lr=0.) if cuda else
@@ -117,14 +123,14 @@ def main(sources):
         report[name] = dict(bitwise=bitwise, max_rel_param_diff=diff, max_rel_source_grad_diff=gdiff, encodes_inside_vjp=C['overlap'], vjps=C['vjps'])
     assert all(r['dropped'] == 0 for r in runs.values()), {k: r['dropped'] for k, r in runs.items()}
     assert not S['concurrent']
-    print(json.dumps(dict(result='PASS', sources=sources, serial_encodes_inside_vjp=S['overlap'],
+    print(json.dumps(dict(result='PASS', sources=sources, production=production, serial_encodes_inside_vjp=S['overlap'],
                           serial_repeat_rel_diff=noise, serial_repeat_source_grad_diff=grad_noise, **report)))
 
 
 if __name__ == '__main__':
     if sys.platform == 'win32': os.environ.setdefault('ISAAC_HOST_TRIM_INTERVAL', '0')
     arg = sys.argv[sys.argv.index('--sources') + 1] if '--sources' in sys.argv else 'cpu,cpu'
-    main(arg.split(','))
+    main(arg.split(','), '--production' in sys.argv)
     if arg.startswith('cuda'):
         # (every check has passed and been printed: leave without the interpreter's CUDA / IPC teardown, which
         # crashed with SIGSEGV after PASS in one gate run, as the source processes' did before they os._exit)
