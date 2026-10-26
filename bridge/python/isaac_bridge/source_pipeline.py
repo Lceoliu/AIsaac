@@ -53,12 +53,15 @@ class ImmutableSourceCast(torch.autograd.Function):
 
 
 class SourcePipeline:
-    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None):
+    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None, streams=0):
         self.model, self.period, self.micro, self.amp = model, period, micro, amp
         # Opt-in (--source-layer-checkpoint): each Spatial block's output is recomputed in the VJP from its saved
         # input (torch.utils.checkpoint, non-reentrant) instead of keeping the block's activations. Not the default:
         # it recomputes the blocks' forward.
         self.layer_checkpoint = bool(layer_checkpoint)
+        # (source processes with a separate VJP connection: streams >= 2 runs each VJP in its own thread, concurrent
+        # with encodes / Writers, on CUDA streams that the cross-stream dependencies wait on; 0: one stream, as before)
+        self.streams = int(streams or 0)
         # (measurement: only these Spatial blocks under checkpoint, the others keep their full graphs; None: all)
         self.checkpoint_blocks = None if checkpoint_blocks is None else frozenset(int(b) for b in checkpoint_blocks)
         # (--source-dispatch-at-close, scheduling only) with defer_backward: a closed interval's VJP starts when it
@@ -134,7 +137,7 @@ class SourcePipeline:
             from .source_worker import SourceProcess
             options=dict(period=period,micro=micro,amp=amp,version=version,saved_gpu_gb=saved_gpu_gb,saved_cpu_gb=saved_cpu_gb,saved_8bit=saved_8bit,
                          compile_source=compile_source,flash_source=flash_source,update_rollouts=update_rollouts,
-                         layer_checkpoint=layer_checkpoint,checkpoint_blocks=checkpoint_blocks)
+                         layer_checkpoint=layer_checkpoint,checkpoint_blocks=checkpoint_blocks,streams=streams)
             spill_limits=([min(saved_gpu_gb,max(1.,b-1.)) for b in self._memory_budgets()]
                           if saved_gpu_gb>0 else [0.]*len(self.devices))
             self.remotes=[SourceProcess(self.versions[version][0],d,
@@ -1207,7 +1210,9 @@ class SourcePipeline:
                     for name, grad in grads.items():
                         outputs.append(result[name]); gradients.append(grad)
             served=0;service_seconds=0.
+            hook=getattr(self,'vjp_group_hook',None)   # (test aid: a shuffled schedule between episode groups)
             for outputs,gradients in groups.values():
+                if hook is not None:hook()
                 if outputs:torch.autograd.backward(outputs,gradients,retain_graph=retain_graph)
                 if retain_graph and hasattr(self,'service_forward'):
                     service_start=time.perf_counter()
@@ -1219,6 +1224,7 @@ class SourcePipeline:
         self.events.append(dict(kind=kind or ('source_backward' if retain_graph else 'retired_backward'), device=str(device), version=self.version,
                                 gradient_buffer_bytes=sum(g.numel()*g.element_size() for g in shared.values()),
                                 serviced_forward_calls=served,forward_service_seconds=service_seconds,
+                                concurrent=bool(getattr(self,'concurrent_vjp',False)),
                                 start=started, end=time.perf_counter()))
         return grads
 
