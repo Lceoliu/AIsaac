@@ -344,6 +344,13 @@ def source_worker(connection, model, device, options, vjp_connection=None):
         if dispatch(channel,message):break
     local.close();connection.close()
     if vjp_connection is not None:vjp_connection.close()
+    if device.type=='cuda':
+        # (2026-10-26) Everything is settled and replied; leave without the interpreter's teardown. The
+        # CUDA gate runs saw source processes exit with SIGSEGV (-11) after a clean close, without a Python
+        # frame under faulthandler (native teardown of the CUDA context / IPC state), in 2 of 3 runs.
+        import sys
+        torch.cuda.synchronize(device);sys.stdout.flush();sys.stderr.flush()
+        os._exit(0)
 
 
 class SourceProcess:
