@@ -91,6 +91,7 @@ def memory_breakdown(local, exports, device):
 
 def source_worker(connection, model, device, options, vjp_connection=None):
     from .source_pipeline import SourcePipeline, source_parameter
+    import faulthandler; faulthandler.enable(all_threads=True)   # (a native crash prints every thread's stack)
     if os.environ.get('ISAAC_SOURCE_MPS_PRIORITY'):
         os.environ['CUDA_MPS_CLIENT_PRIORITY']=os.environ['ISAAC_SOURCE_MPS_PRIORITY']
     torch.set_num_threads(1)
