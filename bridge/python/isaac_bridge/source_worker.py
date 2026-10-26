@@ -136,9 +136,16 @@ def source_worker(connection, model, device, options, vjp_connection=None):
             if device.type=='cuda':torch.cuda._sleep(cycles)
             time_.sleep(delay)
         local.vjp_group_hook=shuffle
+    from contextlib import ExitStack, nullcontext
+    # (an encode / Writer swaps its replica's parameters for their BF16 casts while it runs: with a concurrent VJP
+    # it holds the replica lock throughout, which a layer-checkpoint recompute in the VJP also takes, so the
+    # recompute never sees another call's swapped parameters)
+    replica_lock=getattr(local,'compile_lock',None) or threading.RLock()
     def new_work():
-        from contextlib import nullcontext
-        return torch.cuda.stream(pool[period[0]%len(pool)]) if pool is not None else nullcontext()
+        stack=ExitStack()
+        if concurrent:stack.enter_context(replica_lock)
+        if pool is not None:stack.enter_context(torch.cuda.stream(pool[period[0]%len(pool)]))
+        return stack
     def dispatch(connection,message):
         nonlocal retired,gradient_reply,last_cotangents,exports,breakdown
         command,payload,version,state=message
