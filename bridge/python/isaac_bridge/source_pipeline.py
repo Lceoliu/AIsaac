@@ -227,10 +227,14 @@ class SourcePipeline:
                     block_fns=[torch.compile(lambda x,cu,ms,block=block:block.forward_packed(
                         x,None,None,dict(cu_seqlens=cu,max_seqlen=ms)),dynamic=True) for block in replica.blocks]
                     under=[self.checkpoint_blocks is None or i in self.checkpoint_blocks for i in range(len(block_fns))]
+                    def locked(x,cu,ms,fn):
+                        # (the recompute runs inside a VJP; with --source-streams 2 that is another thread, and
+                        # Dynamo refuses to run a compiled function while this one traces: same lock as the forward)
+                        with lock:return fn(x,cu,ms)
                     def source_blocks(xp,cu,ms,fns=block_fns,under=under):
                         with lock:
                             for fn,ck in zip(fns,under):
-                                xp=checkpoint(fn,xp,cu,ms,use_reentrant=False) if ck else fn(xp,cu,ms)
+                                xp=checkpoint(locked,xp,cu,ms,fn,use_reentrant=False) if ck else fn(xp,cu,ms)
                             return xp
                 else:
                     compiled=torch.compile(getattr(replica,method),dynamic=True)
