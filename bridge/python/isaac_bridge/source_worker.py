@@ -89,6 +89,55 @@ def memory_breakdown(local, exports, device):
     return out
 
 
+def vjp_profile_summary(prof, decoded, wall_s, device, index):
+    """(ISAAC_SOURCE_VJP_PROFILE, measurement only) kernel-level statistics of one profiled VJP."""
+    import json
+    import numpy as np
+    from torch.autograd import DeviceType
+    events = prof.events()
+    gpu = [e for e in events if e.device_type == DeviceType.CUDA]
+    kernels = [e for e in gpu if not e.name.startswith(('Memcpy', 'Memset'))]
+    copies = [e for e in gpu if e.name.startswith(('Memcpy', 'Memset'))]
+    spans = sorted((e.time_range.start, e.time_range.end) for e in gpu)
+    busy, cur_s, cur_e = 0., None, None
+    for a, b in spans:   # (union of the device intervals)
+        if cur_e is None or a > cur_e:
+            if cur_e is not None: busy += cur_e - cur_s
+            cur_s, cur_e = a, b
+        else: cur_e = max(cur_e, b)
+    if cur_e is not None: busy += cur_e - cur_s
+    window = (spans[-1][1] - spans[0][0]) if spans else 0.
+    by_name = {}
+    for e in kernels:
+        n = e.name[:120]
+        c, t = by_name.get(n, (0, 0.))
+        by_name[n] = (c + 1, t + e.time_range.elapsed_us())
+    top = sorted(by_name.items(), key=lambda kv: -kv[1][1])[:10]
+    nodes = [e for e in events if e.device_type == DeviceType.CPU and e.name.startswith('autograd::engine::evaluate_function')]
+    node_kinds = {}
+    for e in nodes:
+        k = e.name.split(':', 4)[-1].strip()[:60]
+        node_kinds[k] = node_kinds.get(k, 0) + 1
+    chunks = [c for c, _ in decoded if 'rows' in c]
+    rows = np.asarray([c['rows'] for c in chunks] or [0])
+    owners = {c.get('uid') for c, _ in decoded}
+    durations = np.asarray([e.time_range.elapsed_us() for e in kernels] or [0.])
+    frames = int(rows.sum())
+    out = dict(device=str(device), vjp=index, wall_s=wall_s, frames=frames, packets=len(decoded), encode_chunks=len(chunks),
+               writes=len(decoded) - len(chunks), backward_calls=len(owners),
+               frames_per_chunk=dict(min=int(rows.min()), median=float(np.median(rows)), mean=float(rows.mean()), max=int(rows.max())),
+               frames_per_backward_call=frames / max(1, len(owners)),
+               kernels=len(kernels), kernels_per_1k_frames=1000. * len(kernels) / max(1, frames),
+               kernel_us_mean=float(durations.mean()), kernel_us_median=float(np.median(durations)),
+               kernel_us_p90=float(np.percentile(durations, 90)), kernel_s_total=float(durations.sum()) / 1e6,
+               copies=len(copies), copy_s_total=sum(e.time_range.elapsed_us() for e in copies) / 1e6,
+               gpu_window_s=window / 1e6, gpu_busy_s=busy / 1e6, gpu_idle_share=1. - busy / window if window else None,
+               autograd_nodes=len(nodes), autograd_nodes_per_1k_frames=1000. * len(nodes) / max(1, frames),
+               top_kernels=[dict(name=n, count=c, s=t / 1e6) for n, (c, t) in top],
+               top_nodes=sorted(node_kinds.items(), key=lambda kv: -kv[1])[:12])
+    print('SOURCE_VJP_PROFILE ' + json.dumps(out), flush=True)
+
+
 def source_worker(connection, model, device, options, vjp_connection=None):
     from .source_pipeline import SourcePipeline, source_parameter
     import faulthandler; faulthandler.enable(all_threads=True)   # (a native crash prints every thread's stack)
@@ -125,6 +174,8 @@ def source_worker(connection, model, device, options, vjp_connection=None):
     period=[0]   # (VJPs received: the stream of new work)
     events_lock=threading.Lock()
     vjp_thread=[None]
+    vjp_index=[0]   # (source VJPs so far: ISAAC_SOURCE_VJP_PROFILE profiles the n-th, measurement only)
+    profile_at=int(os.environ.get('ISAAC_SOURCE_VJP_PROFILE','0') or 0)
     local.concurrent_vjp=concurrent
     shuffle=None
     if os.environ.get('ISAAC_SOURCE_STREAM_SHUFFLE'):   # (test aid: random host and device delays at every step)
@@ -221,7 +272,19 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                     torch.cuda.reset_peak_memory_stats(device)
                 if pool is not None:   # (the forward streams the VJP's ops run on see the imported cotangents)
                     for stream in pool:stream.wait_stream(torch.cuda.current_stream(device))
-                grads=local._backward(0,decoded,retain)
+                if retain:vjp_index[0]+=1
+                if retain and profile_at and vjp_index[0]==profile_at and device.type=='cuda':
+                    import time as time_
+                    from torch.profiler import profile as profile_, ProfilerActivity
+                    torch.cuda.synchronize(device);started_=time_.perf_counter()
+                    serve_=local.__dict__.pop('service_forward',None)   # (the VJP alone: no encodes served inside it)
+                    with profile_(activities=[ProfilerActivity.CPU,ProfilerActivity.CUDA]) as prof_:
+                        grads=local._backward(0,decoded,retain);torch.cuda.synchronize(device)
+                    if serve_ is not None:local.service_forward=serve_
+                    vjp_profile_summary(prof_,decoded,time_.perf_counter()-started_,device,vjp_index[0])
+                    del prof_
+                else:
+                    grads=local._backward(0,decoded,retain)
                 if pool is not None:   # (and the gradients are exported after all of them)
                     for stream in pool:torch.cuda.current_stream(device).wait_stream(stream)
                 reply=ipc_export(grads);del grads
