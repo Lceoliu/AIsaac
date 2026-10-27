@@ -1,0 +1,19 @@
+{
+  "command": [
+    "python3",
+    "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/run_v3_case.py",
+    "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/specs/v3-2120139-t8qb2-10262308.json"
+  ],
+  "case": "memory-v3-v3-2120139-t8qb2-10262308",
+  "guard": {
+    "available_gib_min": 24,
+    "memory_early_stop_gib": 26,
+    "memory_poll_seconds": 0.25,
+    "external_cpu_cores_max_sustained": 9,
+    "sustained_samples": 3,
+    "memory_pressure_rule": "external cgroup full avg10 >10% for three samples (v3; v2 used 1%); host pswpin >1000 pages/s for three samples; external swap growth since start >1 GiB; external memory.events oom/oom_kill increase stops at once; own host PSI logged separately",
+    "interval_seconds": 20,
+    "no_first_progress_seconds": 900,
+    "no_progress_seconds": 180
+  }
+}

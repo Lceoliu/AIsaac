@@ -1,0 +1,21 @@
+Launch overhead: --source-vjp-merge, --source-fused-cast (opt-in); encode kernel profile
+
+The VJP kernel profile (REPORT 19.10) showed the source VJP launch-bound:
+56-84 autograd.backward calls per card and VJP (one per episode group), with
+an AccumulateGrad per parameter per call, and one ImmutableSourceCast node per
+parameter per encode chunk.
+- --source-vjp-merge 1: one autograd.backward per card and VJP over all its
+  episode groups (the engine sums each parameter's incoming gradients before
+  one AccumulateGrad); retain_graph and the pinned / settled bookkeeping are
+  unchanged. Same gradients up to float summation order.
+- --source-fused-cast 1: ImmutableSourceCastFused, one cast node per encode
+  for all its BF16 parameter aliases, each gradient still converted to FP32
+  before it is accumulated (one flat conversion). Same values.
+- ISAAC_SOURCE_ENCODE_PROFILE=first:count: one profiler over those encodes,
+  summarised as SOURCE_ENCODE_PROFILE (measurement only).
+tests/test_source_vjp_merge.py (cpu threads with per-episode grouping, cpu
+processes; CUDA gate): source gradients within 1e-6 of the defaults (merge
+4.6e-9, fused 0), audit 0; cpu counts: engine calls 44 -> 16, AccumulateGrad
+4212 -> 1092, cast backward calls 1920 -> 120.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>

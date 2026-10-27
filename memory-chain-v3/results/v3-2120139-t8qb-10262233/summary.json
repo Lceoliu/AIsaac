@@ -1,0 +1,30 @@
+{
+  "case": "v3-2120139-t8qb-10262233",
+  "horizon": 1024,
+  "exit_status": 0,
+  "updates": 21,
+  "steady_updates": 11,
+  "steady_x_real_time": 340.76825084496807,
+  "medians": {
+    "x_real_time": 361.35745032583134,
+    "collect_s": 8.0853678539861,
+    "update_s": 10.177316666115075,
+    "wall_s": 12.093288781121373,
+    "gpu_reserved_gb": 22.365234375,
+    "wait_learner_s": 5.802922384813428,
+    "c_learner_cores": 0.7066482448596257,
+    "source_graph_frames": 180528.0,
+    "source_graph_frames_uid_max": 4288.0,
+    "source_alloc_gib_max": 4.375200271606445,
+    "source_detached_frames": 362378.0
+  },
+  "peak_gpu_mib": {
+    "1": 23285.0,
+    "3": 11506.0,
+    "4": 11452.0,
+    "5": 8159.0
+  },
+  "peak_container_memory_gib": 59.46766662597656,
+  "guard_stops": [],
+  "completed": false
+}

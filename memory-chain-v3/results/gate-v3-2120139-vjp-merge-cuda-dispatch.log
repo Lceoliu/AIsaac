@@ -1,0 +1,15 @@
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000644
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.001011
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000586
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000483
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000564
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000451
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000648
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000702
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000406
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000665
+{"result": "PASS", "processes": true, "sources": ["cuda:1", "cuda:2"], "base_counts": {"accumulate": 0, "cast": 0, "calls": 0}, "merge": {"source_grad_rel_diff": 2.3188823005860055e-08, "counts": {"accumulate": 0, "cast": 0, "calls": 0}}, "pack": {"source_grad_rel_diff": 1.650032796959615e-08, "counts": {"accumulate": 0, "cast": 0, "calls": 0}}, "fused": {"source_grad_rel_diff": 0.0, "counts": {"accumulate": 0, "cast": 0, "calls": 0}}, "both": {"source_grad_rel_diff": 2.3188823005860055e-08, "counts": {"accumulate": 0, "cast": 0, "calls": 0}}}
+
+GATE v3-2120139-vjp-merge-cuda EXIT 0
+
+EXIT 0

@@ -1,0 +1,8 @@
+{"result": "PASS", "measurements": {"strided": {"host_copy_median_seconds": 0.05902509996667504, "returned_before_prior_gpu_work": [false, false, false], "contiguous": false, "pinned": true}, "compact": {"host_copy_median_seconds": 1.439894549548626e-05, "returned_before_prior_gpu_work": [true, true, true], "contiguous": true, "pinned": true}}}
+PASS growth preserves pending writes from the other actor CUDA stream
+graph_count=6 scratch_reserved_bytes= 48234496
+PASS arbitrary sequential bucket order, persistent outputs, bounded shared scratch
+
+GATE v3-ac21ba9-actor-cuda EXIT 0
+
+EXIT 0

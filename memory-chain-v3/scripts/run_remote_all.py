@@ -105,6 +105,20 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-checkpoint-blocks 2,3 --source-balance 1 ']]),
             t8b=(1024, 62.0, FIVE, dict(QUIET, ISAAC_TIMELINE='1'),
                  TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 ']]),
+            # launch overhead, 2026-10-27: VJP (10th) and encode (200..239) kernel profiles on four cards, all blocks
+            # checkpointed, balance on: defaults (t8pb4) and --source-vjp-merge 1 --source-fused-cast 1 (t8pmf4)
+            **{name: (1024, 18.0, FOUR1, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_VJP_PROFILE='10', ISAAC_SOURCE_ENCODE_PROFILE='200:40'),
+                      TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 ' + extra]])
+               for name, extra in (('t8pb4', ''), ('t8pmf4', '--source-vjp-merge 1 --source-fused-cast 1 '),
+                                   ('t8pm4', '--source-vjp-merge 1 '), ('t8pf4', '--source-fused-cast 1 '))},
+            # packed engine calls (2026-10-27): 4 cards, all blocks checkpointed, balance on, 25 game hours, no profiler
+            **{name: (1024, 25.0, FOUR1, dict(QUIET, ISAAC_TIMELINE='1'),
+                      TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 ' + extra]])
+               for name, extra in (('t8qb', ''), ('t8qb2', ''), ('t8qp2k', '--source-vjp-merge 2048 --source-fused-cast 1 '),
+                                   ('t8qp4k', '--source-vjp-merge 4096 --source-fused-cast 1 '),
+                                   ('t8qm', '--source-vjp-merge 1 --source-fused-cast 1 '),
+                                   ('t8qp512', '--source-vjp-merge 512 '), ('t8qp1k', '--source-vjp-merge 1024 '),
+                                   ('t8qb3', ''))},
             # VJP kernel profile (ISAAC_SOURCE_VJP_PROFILE = the n-th source VJP of each source process), 4 cards
             **{name: (1024, 18.0, FOUR1, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_VJP_PROFILE='10'),
                       TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 ' + extra + '--source-balance 1 ']])
@@ -240,9 +254,9 @@ def main():
             gates = {
                 'horizon-cuda': PYV + 'tests/test_source_horizon.py --learner cuda:0 --sources cuda:1,cuda:2',
                 'horizon-bound': PYV + 'tests/test_source_horizon_bound.py && ' + PYV + 'tests/test_source_horizon_bound.py --process',
-                # (--source-streams 2: concurrent VJP thread / streams against the serial schedule, shuffled)
-                'streams-cuda': PYV + 'tests/test_source_streams.py --sources cuda:1,cuda:2 && ' + PYV +
-                                'tests/test_source_streams.py --sources cuda:1,cuda:2 --production',
+                # (--source-vjp-merge / --source-fused-cast against the defaults: source gradients within 1e-6)
+                'vjp-merge-cuda': PYV + 'tests/test_source_vjp_merge.py --sources cuda:1,cuda:2',
+                # (--source-streams 2 stays off; its gate (intermittent 1.4e-6, REPORT 19.9) is no longer in the default set)
                 'attention-timing': PYV + 'tests/bench_horizon_attention.py --device cuda:0 --groups 96 --count 128 --bank 1600 --sources 60000',
                 'actor-cuda': ' && '.join(PYV + t for t in [
                     'tests/test_actor_d2h.py', 'tests/test_actor_streams.py',
