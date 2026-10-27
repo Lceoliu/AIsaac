@@ -201,6 +201,47 @@ def source_worker(connection, model, device, options, vjp_connection=None):
         if concurrent:stack.enter_context(replica_lock)
         if pool is not None:stack.enter_context(torch.cuda.stream(pool[period[0]%len(pool)]))
         return stack
+    def encode_one(cid,parts,keys,version):
+        # (one encode: its graph registered as chunk cid, its compact IPC export returned)
+        before=torch.cuda.memory_allocated(device) if breakdown_on else 0
+        done=None
+        encode_index[0]+=1
+        first_,count_=encode_profile
+        if count_ and encode_index[0]==first_ and device.type=='cuda':
+            import time as time_
+            from torch.profiler import profile as profile_, ProfilerActivity
+            torch.cuda.synchronize(device)
+            encode_prof[0]=profile_(activities=[ProfilerActivity.CPU,ProfilerActivity.CUDA]);encode_prof[0].__enter__()
+            encode_prof[2]=time_.perf_counter()
+        with new_work():
+            if shuffle is not None:shuffle()
+            result=local._encode(0,parts,version,keys=keys)
+            reply=ipc_export({k:v for k,v in result.items() if k!='grads'})
+            if pool is not None:done=torch.cuda.Event();done.record()
+        if done is not None:torch.cuda.current_stream(device).wait_event(done)
+        alloc=torch.cuda.memory_allocated(device)-before if breakdown_on else 0
+        future=Future();future.set_result(result)
+        local.chunks.extend([None]*max(0,cid+1-len(local.chunks)))
+        uids={key[0] for key in keys}
+        local.chunks[cid]=dict(worker=0,future=future,version=version,
+                               uid=next(iter(uids)) if len(uids)==1 else None,rows=len(keys),alloc=alloc,event=done)
+        for offset,key in enumerate(keys): local.frames[key]=(cid,offset)
+        exports['encode',cid]=reply
+        if encode_prof[0] is not None:
+            encode_prof[1].append((dict(rows=len(keys),uid=local.chunks[cid]['uid']),{}))
+            if encode_index[0]==first_+count_-1:
+                import time as time_
+                torch.cuda.synchronize(device);encode_prof[0].__exit__(None,None,None)
+                vjp_profile_summary(encode_prof[0],encode_prof[1],time_.perf_counter()-encode_prof[2],device,
+                                    f'encode {first_}..{first_+count_-1}',tag='SOURCE_ENCODE_PROFILE')
+                encode_prof[0]=None
+        if os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
+            # Reader uses the compact IPC copy. Preserve the original
+            # autograd edge, not a second copy of every Spatial output.
+            # u stays a Tensor: future Writer blocks still consume it.
+            result['y']=torch.autograd.graph.get_gradient_edge(result['y'])
+        del result,future
+        return reply
     def dispatch(connection,message):
         nonlocal retired,gradient_reply,last_cotangents,exports,breakdown
         command,payload,version,state=message
@@ -212,46 +253,10 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                         param.copy_(value.view_as(param))
                 local.version=version
                 local.versions[version]=local._replicas()
-            if command=='encode':
-                cid,parts,keys=payload
-                before=torch.cuda.memory_allocated(device) if breakdown_on else 0
-                done=None
-                encode_index[0]+=1
-                first_,count_=encode_profile
-                if count_ and encode_index[0]==first_ and device.type=='cuda':
-                    import time as time_
-                    from torch.profiler import profile as profile_, ProfilerActivity
-                    torch.cuda.synchronize(device)
-                    encode_prof[0]=profile_(activities=[ProfilerActivity.CPU,ProfilerActivity.CUDA]);encode_prof[0].__enter__()
-                    encode_prof[2]=time_.perf_counter()
-                with new_work():
-                    if shuffle is not None:shuffle()
-                    result=local._encode(0,parts,version,keys=keys)
-                    reply=ipc_export({k:v for k,v in result.items() if k!='grads'})
-                    if pool is not None:done=torch.cuda.Event();done.record()
-                if done is not None:torch.cuda.current_stream(device).wait_event(done)
-                alloc=torch.cuda.memory_allocated(device)-before if breakdown_on else 0
-                future=Future();future.set_result(result)
-                local.chunks.extend([None]*max(0,cid+1-len(local.chunks)))
-                uids={key[0] for key in keys}
-                local.chunks[cid]=dict(worker=0,future=future,version=version,
-                                       uid=next(iter(uids)) if len(uids)==1 else None,rows=len(keys),alloc=alloc,event=done)
-                for offset,key in enumerate(keys): local.frames[key]=(cid,offset)
-                exports['encode',cid]=reply
-                if encode_prof[0] is not None:
-                    encode_prof[1].append((dict(rows=len(keys),uid=local.chunks[cid]['uid']),{}))
-                    if encode_index[0]==first_+count_-1:
-                        import time as time_
-                        torch.cuda.synchronize(device);encode_prof[0].__exit__(None,None,None)
-                        vjp_profile_summary(encode_prof[0],encode_prof[1],time_.perf_counter()-encode_prof[2],device,
-                                            f'encode {first_}..{first_+count_-1}',tag='SOURCE_ENCODE_PROFILE')
-                        encode_prof[0]=None
-                if os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
-                    # Reader uses the compact IPC copy. Preserve the original
-                    # autograd edge, not a second copy of every Spatial output.
-                    # u stays a Tensor: future Writer blocks still consume it.
-                    result['y']=torch.autograd.graph.get_gradient_edge(result['y'])
-                del result,future
+            if command in ('encode','encode_many'):
+                # ('encode_many', --source-encode-batch: the encodes of one schedule() call in one message)
+                if command=='encode':reply=encode_one(*payload,version)
+                else:reply=[encode_one(cid,parts,keys,version) for cid,parts,keys in payload]
             elif command=='write':
                 wid,keys=payload
                 before=torch.cuda.memory_allocated(device) if breakdown_on else 0
@@ -411,7 +416,7 @@ def source_worker(connection, model, device, options, vjp_connection=None):
         # VJP. Drain that forward burst, including the short RPC turnaround.
         while connection.poll(.01 if served else 0):
             message=connection.recv()
-            if message[0] not in ('encode','write'):
+            if message[0] not in ('encode','encode_many','write'):
                 deferred.append(message)
                 break
             dispatch(connection,message)
