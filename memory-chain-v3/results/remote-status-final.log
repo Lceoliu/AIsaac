@@ -1,8 +1,8 @@
- 13:54:06 up 15 days,  2:32,  7 users,  load average: 6.87, 14.41, 13.73
+ 14:28:33 up 15 days,  3:07,  7 users,  load average: 8.04, 13.17, 11.94
                total        used        free      shared  buff/cache   available
-Mem:             125          23          68           0          35         101
+Mem:             125          23          67           0          35         101
 Swap:              7           7           0
-0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 881 MiB, 5 %
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 881 MiB, 0 %
 1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
 2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 12002 MiB, 0 %
 3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %

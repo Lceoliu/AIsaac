@@ -1756,3 +1756,79 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 - 步骤 4（短跑）：replay 组学习器中位没有低于 replay=0。能跑的 replay=0（四块 checkpoint）更快；不开 checkpoint 的 replay=0 会 OOM。
 - 按发起会话的条件（"只有 2、3、4 都通过且 replay 组学习器中位明显低于 replay=0 时才跑表 10"），**表 10 不跑**。
 - 原因：replay 解决了显存和 launch 次数，但 VJP 时间没有下降。时间转到了 host 上的按批重建：原始行组批、token 规划、H2D、带梯度前向，加上 Writer 梯度带来的额外重算行。均衡在 replay 下也不稳定。若继续这条线，下一步应先拆分 replay VJP 的 host 时间（例如对 `backward_replay` 做 cProfile），再决定是缓存组批计划还是把 `to_batch` 挪进编码 worker 预先做好。
+
+### 23.6 备份
+
+- rl：`exp/memory-chain-v3` = fa4c58f（报告至 §23.5 与全部小结果文件），`exp/memory-chain-v3-replay` = 9e9cf04（候选仓库分支 `replay-v1`），`exp/memory-chain-v3-timing` = 1c4fc72；均已推送。
+- 3090：`~/isaac-abplus/archive-memory-chain-v3/memory-chain-v3-20261027-0700.tar.gz`，255,693,765 字节，sha256 `d03d5720f9d8a9d0b6809b952b1dfd898bd0c28c7644e4c9fa25607670db03f9`（远端核对一致；不含两个工作树 `wt-a`、`wt-replay`，它们的提交都在 `candidate/.git` 里）。
+- 主机上没有我们的容器，本机没有残留的链脚本。
+
+## 24 源进程 host 时间的 cProfile 拆分（2c918a6；只测量，不改实现，不开新实验）
+
+### 24.1 做法
+
+- 提交 2c918a6（`replay-v1`，脚本 `scripts/patches/patch_cprofile.py`）：源进程里加两个只读开关。`ISAAC_SOURCE_VJP_CPROFILE=10` 对第 10 次保留 VJP 单独做 cProfile（期间摘掉 service_forward，前后各 `cuda.synchronize`）。`ISAAC_SOURCE_ENCODE_CPROFILE=100:20` 对第 100–119 次编码请求做 cProfile（只在请求内开启，请求之间的等待不计）。每次打印一行 `SOURCE_CPROFILE`，内容是累计和自身时间各前 25 的函数，以及指定函数的累计秒数。
+- 两次运行都在 4 卡（物理 3,1,4,5）、18 游戏小时、均衡开、micro 8192、H=1024 下完成，exit 0，结束后主机上没有我们的容器：
+  - `r11p` = replay（`--source-replay 1`）
+  - `r11s` = stored（replay 0，`--source-layer-checkpoint 1`）
+- 原始行在 `results/v3-2c918a6-r11{p,s}-*/train.log`，渲染结果在 `results/cprofile-2c918a6.md`（`scripts/cprofile_table.py`）。
+- 打开 cProfile 会让 Python 函数调用变慢，所以本节的 µs 只能用来比较占比，不是真实耗时。这两次的 ×实时（294 / 360）也不作计时结论。
+- cProfile 只记录开启它的那个线程。autograd 在 CUDA 设备线程上执行，所以 `run_backward` 是黑盒，里面包括 C++ 引擎调度、checkpoint 重算和等待 GPU。
+
+### 24.2 replay VJP（r11p 第 10 次 VJP；cuda:0 36,493 行 3.172 s，cuda:2 37,798 行 3.405 s）
+
+各项按调用树互斥切分，加起来等于总数（µs/帧，cuda:0 / cuda:2）：
+
+| 类别 | 内容 | µs/帧 |
+|---|---|---|
+| 行拼接 | `_encode` 自身时间，主要是 `np.concatenate(parts)` 拼原始行（numpy 的 C 函数没有单独计入，这一项是推断） | 14.4 / 17.0 |
+| to_batch：原始行解码 | `np.ascontiguousarray(rows[field])`，即结构化数组按字段做跨步拷贝（168/192 次） | 10.9 / 11.3 |
+| to_batch：H2D | `to_batch` 里的 `.to(device)`（pageable 内存） | ≈6.0 / ≈5.6 |
+| token 规划：布局 | `plan_tokens` + `learner_plan` + `item_count` | 3.4 / 3.1 |
+| token 规划：组件去重 | `rebuild_memory.encode` 自身 + `payload_keys`（含 `tolist`）。按原始键给 player/grid/map/items 去重，属于 StepComponents 的簿记，执行位置在带梯度前向里面 | 20.4 / 18.7 |
+| 带梯度前向（除去去重） | `encode_rebuild` 其余部分：CNN 和 attention 的 torch/Dynamo 调度（`_cnn` 累计 0.50 / 0.56 s） | 11.4 / 12.6 |
+| `_cast_context` | 参数 cast 上下文 | 1.2 / 1.5 |
+| backward | `_engine_run_backward`（C++，黑盒） | 11.2 / 11.7 |
+| Writer 重算 | `rebuild_memory.write` | 0.3 / 0.3 |
+| 其它 Python 簿记 | `backward_replay` 里除上面各项之外的部分（`_packed_indices`、梯度装配、`as_tensor` 小拷贝等） | 6.8 / 7.7 |
+| **合计** | | **86.9 / 90.1** |
+
+- 其中"原始行 → 张量"（to_batch 整体）：17.4 / 17.4 µs/帧。纯解码约 11 µs，H2D 约 6 µs。如果把行拼接也算进来，"原始行到张量"一共约 31–34 µs/帧，占 VJP 的 36–38%。
+- 两项最大的成本都不是 to_batch：
+  - 组件去重的 Python 簿记：19–20 µs
+  - 带梯度前向的模块调度：11–13 µs
+  - 后者加 backward 一共 23–24 µs
+- 对照：同一个 `to_batch` 在本机不开 cProfile、只用 CPU（合成 2,560 帧，没有 H2D）时是 4.9–6.7 µs/帧，这说明 cProfile 加上主机负载会放大 Python 部分的耗时。
+- cuda:3 的第 10 次 VJP 是空的（0 行），不计入。
+
+### 24.3 stored 编码与 VJP（r11s；第 100–119 次编码请求，第 10 次 VJP）
+
+| | cuda:3 | cuda:2 | cuda:0 |
+|---|---|---|---|
+| 编码帧数（20 个请求） | 4,175 | 2,952 | 2,545 |
+| 编码 host 合计 µs/帧 | 156.8 | 330.1 | 398.5 |
+| 其中 to_batch | 14.0 | 18.2 | 14.5 |
+| 其中 token 规划（plan/learner_plan/item_count） | 6.8 | 12.6 | 8.9 |
+| 其中 `_cast_context` | 13.8 | 30.1 | 18.6 |
+| 其中 `encode_rebuild`（带梯度前向，含 checkpoint 包装和组件去重） | 107.1 | 239.3 | 336.2 |
+| 其中 `ipc_export` | 1.1 | 2.8 | 1.8 |
+| VJP 行数 | 16,580 | 19,976 | 16,163 |
+| VJP host µs/帧 | 365.1 | 316.5 | 338.0 |
+| 其中 `run_backward`（黑盒） | 363.1 | 314.9 | 336.1 |
+
+- stored 编码每个请求只有约 130–210 帧，所以每次调用的固定开销被摊到很少的帧上，µs/帧不能直接和 replay VJP 里每次约 5,200 帧的重建比较。cuda:3 每个请求约 33 ms。
+- cuda:0 的 `encode_rebuild` 里有一次 Dynamo 重新编译（`convert_frame._compile` 0.47 s，占这 20 个请求的 47%）。这是一次性的，不属于稳态。cuda:3 没有重编译：模块调度、Dynamo/AOT 包装和 checkpoint 包装合计约 0.44 s / 4,175 帧，组件去重本身约 10 µs/帧，因为每个请求的帧少、键也少。
+- stored VJP 的 host 时间几乎全部是 `run_backward`（C++ 引擎，加上 layer checkpoint 在设备线程上的重算），Python 侧可以忽略。
+- replay 模式的无梯度编码（缓存原始行的那一步）没有采到：r11p 在 18 小时里批量编码请求不到 100 次，日志里只有 stored 的编码行。它的组成和 24.2 里重建的前向部分相同，但不带梯度。
+
+### 24.4 to_batch 输出缓存的每帧字节
+
+- 在本机用 `to_batch(entities=64)` 测输出：24 个张量，共 **22,818 B/帧**。主要是 `ent`（float32 [64,56]）14,336 B、`grid` 3,136 B、`inv_all` 2,048 B、`map` 1,352 B。
+- 原始行是 22,856 B/帧（另有 pending 64 B）。所以缓存补零后的张量和缓存原始行占用相同。如果按 `n_ent` 截断实体，`ent` 这部分会随实际实体数缩小，但这次没有测实际的 `n_ent` 分布。
+- r11p 每个源记录的 `source_replay_raw_bytes` 峰值是 0.59–1.37 GB。把同样大小的张量放到 GPU 上缓存，每个源大约多占这么多显存。省下的是"行拼接 + to_batch"，约 31–34 µs/帧（replay VJP 的 36–38%）。组件去重、模块调度和 backward 不变（合计约 50 µs/帧）。
+- 如果改成向量化/native 的行解码，只能省"解码 + 拼接"这一段（约 25–28 µs/帧；H2D 约 6 µs 还在，除非改用 pinned 内存）。上限和缓存方案接近，但不需要额外显存。
+- 以上两种方案都不会碰到最大的单项，也就是组件去重的 Python 簿记（约 19–20 µs/帧）。这一项应该另外评估。
+
+### 24.5 备份
+
+- 见本节提交后的 `exp/memory-chain-v3`（报告至 §24、`results/cprofile-2c918a6.md`、两次运行的小结果文件）和 `exp/memory-chain-v3-replay` = 2c918a6。3090 的 tar 这次没有更新，仍然是 §23.6 那一份。

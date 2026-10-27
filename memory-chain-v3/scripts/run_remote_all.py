@@ -125,6 +125,12 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
                    ('r10r2', 25.0, {}, [[' --source-replay 0 ', ' --source-replay 1 '], [' --room-source-micro 2048 ', ' --room-source-micro 8192 ']]),
                    ('r10p', 18.0, dict(ISAAC_SOURCE_VJP_PROFILE='10', ISAAC_SOURCE_ENCODE_PROFILE='200:40'),
                     [[' --source-replay 0 ', ' --source-replay 1 '], [' --room-source-micro 2048 ', ' --room-source-micro 8192 ']]))},
+            # host-time cProfile in the source processes (2026-10-27, measurement only): replay (r11p) and stored with all
+            # blocks checkpointed (r11s), 4 cards, balance on; the 10th source VJP and encode requests 100..119
+            **{name: (1024, 18.0, FOUR1, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_SOURCE_VJP_CPROFILE='10', ISAAC_SOURCE_ENCODE_CPROFILE='100:20'),
+                      TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-balance 1 ' + ck]] + extra)
+               for name, ck, extra in (('r11p', '', [[' --source-replay 0 ', ' --source-replay 1 '], [' --room-source-micro 2048 ', ' --room-source-micro 8192 ']]),
+                                       ('r11s', '--source-layer-checkpoint 1 ', []))},
             # table 9 (2026-10-27): the fastest combination measured, 40 steady: two source processes per card, merge 1,
             # fused cast, all four blocks checkpointed, balance on, streams off, no batched RPC; 5 cards (t9t) or 4 (t9t4)
             t9t=(1024, 62.0, FIVEx2, dict(QUIET, ISAAC_TIMELINE='1'),
