@@ -1,10 +1,10 @@
- 06:54:33 up 14 days, 19:33,  7 users,  load average: 7.54, 15.26, 14.29
+ 08:13:07 up 14 days, 20:51,  7 users,  load average: 4.56, 12.54, 14.47
                total        used        free      shared  buff/cache   available
-Mem:             125          20          63           0          43         105
+Mem:             125          22          66           0          38         103
 Swap:              7           7           0
-0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 875 MiB, 8 %
 1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
-2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 12002 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 12002 MiB, 11 %
 3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
 4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
 5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
@@ -12,6 +12,7 @@ Swap:              7           7           0
 7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12396 MiB, 0 %
 APPS
 GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 6480, 326 MiB
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 2967346, 534 MiB
 GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 2506575, 11992 MiB
 GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3419651, 3420 MiB
 GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3420084, 528 MiB

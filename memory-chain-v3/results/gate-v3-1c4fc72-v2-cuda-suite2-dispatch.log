@@ -1,0 +1,151 @@
+   "device": "host",
+      "start": 1281744.477885289,
+      "end": 1281744.477980534
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1281744.477980534,
+      "end": 1281744.477990522
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1281744.477990522,
+      "end": 1281744.479504434
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1281745.384570189,
+      "end": 1281745.384741297
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1281745.384741297,
+      "end": 1281745.384753174
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1281745.384753174,
+      "end": 1281745.386345489
+    },
+    {
+      "kind": "source_backward",
+      "device": "cuda:2",
+      "version": 0,
+      "gradient_buffer_bytes": 2752768,
+      "serviced_forward_calls": 0,
+      "forward_service_seconds": 0.0,
+      "concurrent": false,
+      "start": 1281745.935545929,
+      "end": 1281746.107103999
+    },
+    {
+      "kind": "source_backward",
+      "device": "cuda:1",
+      "version": 0,
+      "gradient_buffer_bytes": 2752768,
+      "serviced_forward_calls": 0,
+      "forward_service_seconds": 0.0,
+      "concurrent": false,
+      "start": 1281745.935677224,
+      "end": 1281746.146235053
+    },
+    {
+      "kind": "commit_wait",
+      "device": "host",
+      "start": 1281745.94899753,
+      "end": 1281746.146360792
+    },
+    {
+      "kind": "commit_transfer",
+      "device": "host",
+      "start": 1281746.146360792,
+      "end": 1281746.18292961
+    },
+    {
+      "kind": "commit_adam",
+      "device": "host",
+      "start": 1281746.18292961,
+      "end": 1281746.192722093
+    },
+    {
+      "kind": "encode",
+      "device": "cuda:1",
+      "version": 1,
+      "rows": 1,
+      "saved_on_cpu": false,
+      "saved_cpu_bytes": 0,
+      "spill_limited_bytes": 0,
+      "start": 1281746.659314993,
+      "end": 1281746.705103723
+    },
+    {
+      "kind": "ready_encode_wait",
+      "device": "host",
+      "start": 1281746.660528841,
+      "end": 1281746.705285118
+    },
+    {
+      "kind": "ready_writer_wait",
+      "device": "host",
+      "start": 1281746.705285118,
+      "end": 1281746.705301241
+    },
+    {
+      "kind": "plan_transport",
+      "device": "host",
+      "start": 1281746.705301241,
+      "end": 1281746.706693958
+    }
+  ]
+}
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000493
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000935
+{"result": "PASS", "queries": 8192, "source_bf16": true, "saved_8bit_block": 0, "weight_max_abs": 1.4551915228366852e-11, "encoded_rows": [32, 32], "source_updates": 2, "early_retirement": true, "partial_checkpoint": true, "deferred_until_reader_ready": true, "offloaded_encode_calls": 0, "retained_cpu_max_bytes": 0, "spill_limited_bytes": 0}
+[W1027 07:23:54.768099480 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+{
+  "result": "PASS",
+  "source_precision": "bf16",
+  "reader_precision": "fp32",
+  "optimizer": "fp32",
+  "saved_8bit_block": 0,
+  "queries": 8192,
+  "metrics": {
+    "mixed_dense": {
+      "output_max_abs": 3.738701343536377e-05,
+      "output_relative_l2": 6.065199158911128e-06,
+      "source_grad_max_abs": 0.0004962682723999023,
+      "source_grad_relative_l2": 0.0027925968173075884,
+      "source_grad_cosine": 0.9999961132650454
+    },
+    "fp32": {
+      "output_max_abs": 0.0007308274507522583,
+      "output_relative_l2": 0.00010249304614262655,
+      "source_grad_max_abs": 0.0005597854033112526,
+      "source_grad_relative_l2": 0.006320246739831007,
+      "source_grad_cosine": 0.9999811032323982
+    }
+  },
+  "encoded_rows_by_cycle": [
+    128,
+    130,
+    132,
+    134,
+    136,
+    138,
+    140
+  ],
+  "versions": 7,
+  "old_room_gradient": 0.00058746337890625,
+  "encoder_replay": 0,
+  "initial_unique_components": {},
+  "offloaded_encode_calls": 0
+}
+
+GATE v3-1c4fc72-v2-cuda-suite2 EXIT 0
+
+EXIT 0
