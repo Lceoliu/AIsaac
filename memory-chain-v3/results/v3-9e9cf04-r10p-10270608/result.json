@@ -1,0 +1,74 @@
+{
+  "case": "memory-v3-v3-9e9cf04-r10p-10270608",
+  "exit_status": 0,
+  "elapsed_seconds": 387.4206259250641,
+  "spec": {
+    "root": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide",
+    "case": "memory-v3-v3-9e9cf04-r10p-10270608",
+    "template": "/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/v3/template-long-59-command.json",
+    "code_dir": "memory-v3-code-v3-9e9cf04",
+    "memory": "72g",
+    "timeout": 2400,
+    "horizon": 1024,
+    "hours": 18.0,
+    "gpu_indices": [
+      3,
+      1,
+      4,
+      5
+    ],
+    "discard": 10,
+    "source_devices": "cuda:0,cuda:2,cuda:3",
+    "env": {
+      "ISAAC_SOURCE_CPROFILE": "",
+      "TORCHINDUCTOR_COMPILE_THREADS": "1",
+      "ISAAC_TIMELINE": "1",
+      "ISAAC_SOURCE_VJP_PROFILE": "10",
+      "ISAAC_SOURCE_ENCODE_PROFILE": "200:40"
+    },
+    "train_edits": [
+      [
+        " --source-update-rollouts 2 ",
+        " --source-update-rollouts 1 "
+      ],
+      [
+        " --source-flash 1 ",
+        " --source-flash 1 --source-dispatch-at-close 1 --source-balance 1 "
+      ],
+      [
+        " --source-replay 0 ",
+        " --source-replay 1 "
+      ],
+      [
+        " --room-source-micro 2048 ",
+        " --room-source-micro 8192 "
+      ]
+    ]
+  },
+  "updates": 15,
+  "last": {
+    "update": "48199",
+    "game_hours": "58524.36996296296",
+    "errors": "0.0",
+    "stalls": "0.0",
+    "cf_done": "57.0",
+    "cf_errors": "0.0",
+    "searches": "925.0",
+    "teach_held": "1340"
+  },
+  "steady_updates": 5,
+  "steady_x_real_time": 227.77867831602873,
+  "medians": {
+    "x_real_time": 279.6943238012335,
+    "collect_s": 8.024543977109715,
+    "update_s": 14.113305261125788,
+    "wall_s": 15.629443627083674,
+    "gpu_reserved_gb": 21.66015625,
+    "wait_learner_s": 10.420485642971471,
+    "c_learner_cores": 0.5150152590142206,
+    "source_graph_frames": 0.0,
+    "source_graph_frames_uid_max": 0.0,
+    "source_alloc_gib_max": 1.6961369514465332,
+    "source_detached_frames": 312588.0
+  }
+}
