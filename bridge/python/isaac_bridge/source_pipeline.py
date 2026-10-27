@@ -86,6 +86,17 @@ class SourcePipeline:
         # Value-only history: rebuild short-lived, cross-episode training batches.
         # Parameter versions and the gradient horizon retain their existing meaning.
         self.replay = bool(replay)
+        if self.replay:
+            # (guards, 2026-10-27) replay keeps no long-lived graph: layer checkpointing would recompute a second
+            # time inside the replay, 8-bit saved activations have nothing to save, and the VJP's engine calls and
+            # streams are the replay's own (version-grouped micro batches, one thread): forced off / ignored.
+            notes = [n for n, on in (('--source-layer-checkpoint', layer_checkpoint),
+                                     ('--source-checkpoint-blocks', checkpoint_blocks is not None),
+                                     ('--source-saved-8bit', saved_8bit), ('--source-vjp-merge', vjp_merge),
+                                     ('--source-streams', streams)) if on]
+            if notes:
+                print('[source] replay=1: ' + ', '.join(notes) + ' forced off / ignored', flush=True)
+            layer_checkpoint, checkpoint_blocks, saved_8bit, vjp_merge, streams = False, None, 0, 0, 0
         # Opt-in (--source-layer-checkpoint): each Spatial block's output is recomputed in the VJP from its saved
         # input (torch.utils.checkpoint, non-reentrant) instead of keeping the block's activations. Not the default:
         # it recomputes the blocks' forward.
@@ -511,6 +522,18 @@ class SourcePipeline:
             result['mem'] = result['mem'].detach()
             result.pop('_replay_refs', None)
 
+    def replay_raw_bytes(self):
+        """(replay) bytes of the raw rows and pending kept for replay: in the source processes (their last memory
+        reply) or, with worker threads, in this process."""
+        if not self.replay: return 0
+        if self.processes: return int(sum(m.get('replay_raw_bytes', 0) for m in self.remote_memory))
+        total = 0
+        for c in self.chunks:
+            if c is None or not c['future'].done(): continue
+            r = c['future'].result()
+            total += sum(r[k].nbytes for k in ('_replay_rows', '_replay_pending') if k in r)
+        return int(total)
+
     def value_bytes_per_frame(self):
         """Mean source value bytes (u and Spatial tokens y) per encoded frame, over
         the newest completed chunks that still hold both (record byte budget)."""
@@ -538,6 +561,7 @@ class SourcePipeline:
             torch.cuda.memory_allocated(d) if d.type == 'cuda' else 0 for d in self.devices]
         return dict(source_horizon=self.horizon, source_graph_frames=0 if self.replay else graph,
                     source_replay=int(self.replay), source_replay_frames=graph if self.replay else 0,
+                    source_replay_raw_bytes=self.replay_raw_bytes(),
                     source_graph_frames_uid_max=0 if self.replay else max(per_uid.values(), default=0),
                     source_graph_writes=0 if self.replay else sum(c is not None and not c.get('detached') for c in self.writes),
                     source_pinned_rows=getattr(self, 'pinned_rows', 0),

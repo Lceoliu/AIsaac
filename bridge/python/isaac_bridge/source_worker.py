@@ -398,7 +398,8 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                           detached_chunks=sum(c is not None and bool(c.get('detached')) for c in local.chunks),
                           detached_writes=sum(c is not None and bool(c.get('detached')) for c in local.writes),
                           graph_frames=0 if local.replay else sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')),
-                          replay_frames=sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')) if local.replay else 0)
+                          replay_frames=sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')) if local.replay else 0,
+                          replay_raw_bytes=local.replay_raw_bytes() if local.replay else 0)
             if breakdown_on and breakdown:memory['breakdown']=breakdown
             if os.environ.get('ISAAC_SOURCE_COMPONENT_GRAPH_CACHE')=='1':
                 component_calls={}

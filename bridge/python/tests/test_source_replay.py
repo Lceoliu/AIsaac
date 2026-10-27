@@ -20,6 +20,12 @@ p.add_argument('--horizon', type=int, default=0)
 p.add_argument('--bf16', action='store_true')
 p.add_argument('--process', action='store_true')
 p.add_argument('--retire-before-update', action='store_true')
+# (2026-10-27, CUDA gate) the learner and source devices, the long runs' source settings, and the gradient threshold
+p.add_argument('--device', default='cpu', help='learner device; sources on --sources')
+p.add_argument('--sources', default='cpu')
+p.add_argument('--flash', action='store_true')
+p.add_argument('--compile', action='store_true')
+p.add_argument('--grad-threshold', type=float, default=None, help='relative L2 of the source gradients (replay vs stored)')
 a = p.parse_args()
 root = a.checkout / 'bridge' / 'python'
 sys.path.insert(0, str(root)); sys.path.insert(0, str(root / 'tests'))
@@ -35,9 +41,9 @@ from isaac_bridge.source_pipeline import SourcePipeline, source_parameter
 def run(base, seq, pend, replay):
     model = copy.deepcopy(base)
     options = dict(period=0, micro=a.micro, update_rollouts=1, amp=a.bf16,
-                   horizon=a.horizon, processes=a.process)
+                   horizon=a.horizon, processes=a.process, flash_source=a.flash, compile_source=int(a.compile))
     if replay: options['replay'] = True
-    pipe = SourcePipeline(model, ['cpu'], **options)
+    pipe = SourcePipeline(model, a.sources.split(','), **options)
     opt = torch.optim.Adam(model.main_parameters(), lr=1e-4, eps=1e-5)
     histories = [RawHistory.empty() for _ in range(6)]
     outputs, gradients, versions = [], [], []
@@ -109,7 +115,7 @@ def main():
     cfg = dict(width=32, layers=1, heads=4, **TS.BASE, **TS.FUSED, temporal=True,
                temporal_width=32, temporal_layers=2, temporal_heads=4, temporal_window=4,
                rebuild_memory=True, memory_block=4, memory_tokens=2, source_cache=True)
-    model = TokPolicy(**cfg).eval()
+    model = TokPolicy(**cfg).to(a.device).eval()
     rng = np.random.default_rng(71)
     seq = TS.make_seq(rng, nw=6, T=32, changes={(0,6),(1,9),(2,13),(4,3)}, resets=set(), exits=set())
     # Ragged packed-token offsets must survive cross-episode regrouping.
@@ -134,7 +140,7 @@ def main():
     print(json.dumps(dict(baseline=old[0], modified=new[0], logits_max_abs=error,
                          gradients_max_abs=grad_abs, gradients_relative_l2=grad_rel, weights_max_abs=weight)))
     # BF16 re-batching changes reduction rounding, unlike the FP32 reference.
-    assert grad_rel < (0.02 if a.bf16 else 1e-5), grad_rel
+    assert grad_rel < (a.grad_threshold if a.grad_threshold is not None else (0.02 if a.bf16 else 1e-5)), grad_rel
     assert error < (0.02 if a.bf16 else 1e-5), error
     assert weight < (0.002 if a.bf16 else 2e-5), weight
     print('PASS: cross-room/versioned VJP parity; value-only cache; unchanged reuse; micro=8192')
