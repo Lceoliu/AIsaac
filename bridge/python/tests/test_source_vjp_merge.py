@@ -4,7 +4,8 @@ The long runs' learner order (dispatch at close, deferred VJP, update every roll
 happen), BF16 sources (amp: the BF16 parameter casts exist), several episodes per source worker so a VJP has
 several episode groups. Variants on the same weights and records:
   base     one autograd.backward per episode group, one cast node per parameter (the default)
-  merge    --source-vjp-merge: one autograd.backward per worker and VJP
+  merge    --source-vjp-merge 1: one autograd.backward per worker and VJP
+  pack     --source-vjp-merge 24: episode groups packed into calls of >= 24 encoded frames
   fused    --source-fused-cast: one cast node per encode
   both
 Checks against base, every commit: source gradients within 1e-6 relative (float summation order only; lr 0 so
@@ -57,7 +58,7 @@ def main(processes, sources):
     seq = TS.make_seq(rng, nw=W, T=8 * R + 1, changes={(0, 6), (1, 9), (2, 13), (4, 3)}, resets=set(), exits=set())
     pend = [M.synth_pending(rng, W, base.heads) for _ in seq]
     runs = {}
-    for name, merge, fused in (('base', False, False), ('merge', True, False), ('fused', False, True), ('both', True, True)):
+    for name, merge, fused in (('base', 0, False), ('merge', 1, False), ('pack', 24, False), ('fused', 0, True), ('both', 1, True)):
         model = copy.deepcopy(base)
         pipe = SourcePipeline(model, sources, period=0, micro=8, update_rollouts=1, defer_backward=True, amp=True,
                               processes=processes, horizon=6, dispatch_at_close=True, vjp_merge=merge, fused_cast=fused)
@@ -108,7 +109,7 @@ def main(processes, sources):
     B = runs['base']
     assert B['grads'], 'no commit with source gradients'
     report = {}
-    for name in ('merge', 'fused', 'both'):
+    for name in ('merge', 'pack', 'fused', 'both'):
         C = runs[name]
         assert C['versions'] == B['versions'] and C['encoded'] == B['encoded'], (name, C['versions'], B['versions'])
         assert len(C['grads']) == len(B['grads'])
@@ -122,7 +123,9 @@ def main(processes, sources):
     assert all(r['dropped'] == 0 for r in runs.values()), {k: r['dropped'] for k, r in runs.items()}
     if not processes:
         b, m, f = B['counts'], runs['merge']['counts'], runs['fused']['counts']
+        p_ = runs['pack']['counts']
         assert m['accumulate'] < b['accumulate'] and f['cast'] < b['cast'], (b, m, f)
+        assert m['calls'] <= p_['calls'] < b['calls'], (b, p_, m)
     print(json.dumps(dict(result='PASS', processes=processes, sources=sources, base_counts=B['counts'], **report)))
 
 

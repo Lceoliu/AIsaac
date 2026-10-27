@@ -1776,9 +1776,10 @@ def main(argv=None, child=None, actor=None):
                    help='scheduling only (with --source-overlap-rollout 1 and source prefetch): a closed source '
                         'interval\'s VJP is dispatched when the update closes it, overlapping the next collection, '
                         'instead of after the next Reader inputs are ready; its commit is gated to the same point')
-    p.add_argument('--source-vjp-merge', type=int, choices=(0, 1), default=0,
-                   help='1: one autograd.backward per source card and VJP over all its episode groups (0: one per '
-                        'episode); the same gradients up to float summation order')
+    p.add_argument('--source-vjp-merge', type=int, default=0,
+                   help='1: one autograd.backward per source card and VJP over all its episode groups; N > 1: episode '
+                        'groups packed into calls of at least N encoded frames (waiting encodes are served between '
+                        'calls); 0: one call per episode. The same gradients up to float summation order')
     p.add_argument('--source-fused-cast', type=int, choices=(0, 1), default=0,
                    help='1: one BF16-cast autograd node per encode for all its parameters (0: one per parameter); '
                         'the same per-forward FP32 gradient conversion')
@@ -2570,7 +2571,7 @@ def main(argv=None, child=None, actor=None):
             layer_checkpoint=bool(args.source_layer_checkpoint), dispatch_at_close=bool(args.source_dispatch_at_close),
             balance=bool(args.source_balance),
             checkpoint_blocks=[int(b) for b in args.source_checkpoint_blocks.split(',')] if args.source_checkpoint_blocks else None,
-            streams=args.source_streams, vjp_merge=bool(args.source_vjp_merge), fused_cast=bool(args.source_fused_cast),
+            streams=args.source_streams, vjp_merge=args.source_vjp_merge, fused_cast=bool(args.source_fused_cast),
             update_rollouts=args.source_update_rollouts, shared_devices=shared,
             actor_reserve_gb=args.source_actor_reserve_gb,processes=bool(args.source_processes),
             defer_backward=bool(args.source_prefetch_records),horizon=args.memory_horizon)
