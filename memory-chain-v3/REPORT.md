@@ -1831,4 +1831,4 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 
 ### 24.5 备份
 
-- 见本节提交后的 `exp/memory-chain-v3`（报告至 §24、`results/cprofile-2c918a6.md`、两次运行的小结果文件）和 `exp/memory-chain-v3-replay` = 2c918a6。3090 的 tar 这次没有更新，仍然是 §23.6 那一份。
+- 见本节提交后的 `exp/memory-chain-v3`（报告至 §24、`results/cprofile-2c918a6.md`、两次运行的小结果文件）和 `exp/memory-chain-v3-replay` = 2c918a6。3090：`~/isaac-abplus/archive-memory-chain-v3/memory-chain-v3-20261027-0741.tar.gz`，257,417,663 字节，sha256 `81be994724772c6c8eef81019882319cfe8fcb01f4e567df1456ac76a7716c4d`。远端 `sha256sum -c`、`gzip -t`、`tar -tzf` 都通过，共 8,417 个条目，包含 §23、§24、`candidate/.git` 里的 `replay-v1` 分支（2c918a6）以及 r11p/r11s 的小结果文件。和以前一样不含 `wt-a`、`wt-replay` 两个工作树，旧 tar 都保留。tar 里的 REPORT 还是写这一句之前的版本。
