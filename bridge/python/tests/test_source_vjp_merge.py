@@ -8,6 +8,7 @@ several episode groups. Variants on the same weights and records:
   pack     --source-vjp-merge 24: episode groups packed into calls of >= 24 encoded frames
   fused    --source-fused-cast: one cast node per encode
   both
+  batch    (source processes) both + --source-encode-batch: one RPC per process and scheduling call
 Checks against base, every commit: source gradients within 1e-6 relative (float summation order only; lr 0 so
 every interval runs on the same weights), the audit exactly zero, the same source versions and encoded rows;
 and the counts (from a profiler around each VJP: threads mode only) of AccumulateGrad and cast nodes drop.
@@ -58,10 +59,13 @@ def main(processes, sources):
     seq = TS.make_seq(rng, nw=W, T=8 * R + 1, changes={(0, 6), (1, 9), (2, 13), (4, 3)}, resets=set(), exits=set())
     pend = [M.synth_pending(rng, W, base.heads) for _ in seq]
     runs = {}
-    for name, merge, fused in (('base', 0, False), ('merge', 1, False), ('pack', 24, False), ('fused', 0, True), ('both', 1, True)):
+    variants = [('base', 0, False, False), ('merge', 1, False, False), ('pack', 24, False, False), ('fused', 0, True, False),
+                ('both', 1, True, False)] + ([('batch', 1, True, True)] if processes else [])
+    for name, merge, fused, batch in variants:
         model = copy.deepcopy(base)
         pipe = SourcePipeline(model, sources, period=0, micro=8, update_rollouts=1, defer_backward=True, amp=True,
-                              processes=processes, horizon=6, dispatch_at_close=True, vjp_merge=merge, fused_cast=fused)
+                              processes=processes, horizon=6, dispatch_at_close=True, vjp_merge=merge, fused_cast=fused,
+                              encode_batch=batch)
         if not processes and not cuda: pipe.ipc_async = True   # (cpu threads: group by episode as a source process does)
         opt = torch.optim.SGD(model.main_parameters(), lr=0.)
         counts = dict(accumulate=0, cast=0, calls=0); COUNTS = counts
@@ -103,13 +107,13 @@ def main(processes, sources):
             pipe.finish_rollout(opt, 1e9, overlap=True)
             versions.append(pipe.version)
         pipe.poll_finish(opt, 1e9, wait=True)
-        runs[name] = dict(grads=grads, versions=versions, encoded=pipe.encoded_rows, counts=counts,
+        runs[name] = dict(requests=pipe.encode_requests, grads=grads, versions=versions, encoded=pipe.encoded_rows, counts=counts,
                           dropped=float(pipe.horizon_stats()['source_horizon_dropped_grad']))
         pipe.close()
     B = runs['base']
     assert B['grads'], 'no commit with source gradients'
     report = {}
-    for name in ('merge', 'pack', 'fused', 'both'):
+    for name in [v[0] for v in variants[1:]]:
         C = runs[name]
         assert C['versions'] == B['versions'] and C['encoded'] == B['encoded'], (name, C['versions'], B['versions'])
         assert len(C['grads']) == len(B['grads'])
@@ -120,6 +124,8 @@ def main(processes, sources):
             rel = max(rel, float((ga - gb).norm() / gb.norm().clamp_min(1e-30)))
         assert rel <= 1e-6, (name, rel)
         report[name] = dict(source_grad_rel_diff=rel, counts=C['counts'])
+    if processes: assert runs['batch']['requests'] < runs['both']['requests'], (runs['batch']['requests'], runs['both']['requests'])
+    if processes: report['encode_requests'] = {k: r['requests'] for k, r in runs.items()}
     assert all(r['dropped'] == 0 for r in runs.values()), {k: r['dropped'] for k, r in runs.items()}
     if not processes:
         b, m, f = B['counts'], runs['merge']['counts'], runs['fused']['counts']
