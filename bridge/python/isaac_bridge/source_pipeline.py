@@ -79,7 +79,7 @@ class ImmutableSourceCastFused(torch.autograd.Function):
 
 
 class SourcePipeline:
-    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None, streams=0, vjp_merge=False, fused_cast=False):
+    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None, streams=0, vjp_merge=False, fused_cast=False, encode_batch=False):
         self.model, self.period, self.micro, self.amp = model, period, micro, amp
         # Opt-in (--source-layer-checkpoint): each Spatial block's output is recomputed in the VJP from its saved
         # input (torch.utils.checkpoint, non-reentrant) instead of keeping the block's activations. Not the default:
@@ -95,6 +95,10 @@ class SourcePipeline:
         # fused_cast: one cast node per encode for all its BF16 parameter aliases (default: one per parameter)
         self.vjp_merge = int(vjp_merge or 0)
         self.fused_cast = bool(fused_cast)
+        # encode_batch (source processes): the encodes one schedule() call gives a process go in one RPC, not one
+        # request and reply each (the same encodes, in the same order)
+        self.encode_batch = bool(encode_batch) and bool(processes)
+        self.encode_requests = 0   # (accounting: encode requests sent to source processes)
         # (measurement: only these Spatial blocks under checkpoint, the others keep their full graphs; None: all)
         self.checkpoint_blocks = None if checkpoint_blocks is None else frozenset(int(b) for b in checkpoint_blocks)
         # (--source-dispatch-at-close, scheduling only) with defer_backward: a closed interval's VJP starts when it
@@ -171,7 +175,7 @@ class SourcePipeline:
             options=dict(period=period,micro=micro,amp=amp,version=version,saved_gpu_gb=saved_gpu_gb,saved_cpu_gb=saved_cpu_gb,saved_8bit=saved_8bit,
                          compile_source=compile_source,flash_source=flash_source,update_rollouts=update_rollouts,
                          layer_checkpoint=layer_checkpoint,checkpoint_blocks=checkpoint_blocks,streams=streams,
-                         vjp_merge=vjp_merge,fused_cast=fused_cast)
+                         vjp_merge=vjp_merge,fused_cast=fused_cast,encode_batch=False)
             spill_limits=([min(saved_gpu_gb,max(1.,b-1.)) for b in self._memory_budgets()]
                           if saved_gpu_gb>0 else [0.]*len(self.devices))
             self.remotes=[SourceProcess(self.versions[version][0],d,
@@ -604,6 +608,7 @@ class SourcePipeline:
 
     def _encode(self, worker, parts, version, cid=None, keys=None):
         if self.processes:
+            self.encode_requests+=1
             result=self._remote(worker,'encode',(cid,parts,keys),version)
             result['grads']={}
             return result
@@ -854,6 +859,7 @@ class SourcePipeline:
         groups=[(uid,worker,indices) for (uid,worker),indices in grouped.items()]
         groups.extend((None,worker,indices) for worker,indices in single.items())
         self.replicas
+        batches={}   # (encode_batch: worker -> [(cid, parts, keys, the chunk's future)])
         for uid,worker,indices in groups:
             for lo in range(0, len(indices), self.micro):
                 ix = indices[lo:lo+self.micro]
@@ -868,7 +874,11 @@ class SourcePipeline:
                     else:
                         selected.append((r.view(np.uint8).reshape(len(r),-1)[local].view(r.dtype).reshape(-1),p[local]))
                 cid = len(self.chunks)
-                future = self.workers[worker].submit(self._encode, worker, selected, self.version,cid,[keys[i] for i in ix])
+                if self.encode_batch:
+                    from concurrent.futures import Future
+                    future=Future();batches.setdefault(worker,[]).append((cid,selected,[keys[i] for i in ix],future))
+                else:
+                    future = self.workers[worker].submit(self._encode, worker, selected, self.version,cid,[keys[i] for i in ix])
                 chunk = dict(worker=worker, future=future, version=self.version, uid=uid,
                              cost=int(costs[ix].sum()),remote_kind='encode',remote_id=cid,
                              rows=len(ix),first=min(keys[i][1] for i in ix),last=max(keys[i][1] for i in ix))
@@ -878,7 +888,22 @@ class SourcePipeline:
                     self.frames[keys[i]] = (cid, offset)
                     self.uid_keys.setdefault(keys[i][0], ([], [], []))[0].append(keys[i])
                 self.encoded_rows += len(ix)
+        for worker,items in batches.items():
+            batch=self.workers[worker].submit(self._encode_many,worker,[(c,p,k) for c,p,k,_ in items],self.version)
+            def settle(done,futures=[f for *_,f in items]):
+                try:
+                    for f,r in zip(futures,done.result()):f.set_result(r)
+                except BaseException as error:
+                    for f in futures:
+                        if not f.done():f.set_exception(error)
+            batch.add_done_callback(settle)
         return True
+
+    def _encode_many(self, worker, items, version):
+        self.encode_requests+=1
+        results=self._remote(worker,'encode_many',items,version)
+        for result in results:result['grads']={}
+        return results
 
     def prefetch(self, requests, stateless=(), *, write_ahead=False, speculative=False):
         latest = {}
