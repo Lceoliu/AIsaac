@@ -90,7 +90,7 @@ def memory_breakdown(local, exports, device):
     return out
 
 
-def vjp_profile_summary(prof, decoded, wall_s, device, index, tag='SOURCE_VJP_PROFILE'):
+def vjp_profile_summary(prof, decoded, wall_s, device, index, tag='SOURCE_VJP_PROFILE', extra=None):
     """(ISAAC_SOURCE_VJP_PROFILE, measurement only) kernel-level statistics of one profiled VJP."""
     import json
     import numpy as np
@@ -136,6 +136,7 @@ def vjp_profile_summary(prof, decoded, wall_s, device, index, tag='SOURCE_VJP_PR
                autograd_nodes=len(nodes), autograd_nodes_per_1k_frames=1000. * len(nodes) / max(1, frames),
                top_kernels=[dict(name=n, count=c, s=t / 1e6) for n, (c, t) in top],
                top_nodes=sorted(node_kinds.items(), key=lambda kv: -kv[1])[:12])
+    out.update(extra or {})
     print(tag + ' ' + json.dumps(out), flush=True)
 
 
@@ -314,7 +315,11 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                     with profile_(activities=[ProfilerActivity.CPU,ProfilerActivity.CUDA]) as prof_:
                         grads=local._backward(0,decoded,retain);torch.cuda.synchronize(device)
                     if serve_ is not None:local.service_forward=serve_
-                    vjp_profile_summary(prof_,decoded,time_.perf_counter()-started_,device,vjp_index[0])
+                    replay_=[e for e in local.events if e.get('replay')]   # (replay: the batches of this VJP)
+                    vjp_profile_summary(prof_,decoded,time_.perf_counter()-started_,device,vjp_index[0],
+                                        extra=dict(replay_encoder_batches=replay_[-1]['encoder_batches'],
+                                                   replay_writer_batches=replay_[-1]['writer_batches'],
+                                                   replay_rows=replay_[-1]['replayed_rows']) if replay_ else None)
                     del prof_
                 else:
                     grads=local._backward(0,decoded,retain)
