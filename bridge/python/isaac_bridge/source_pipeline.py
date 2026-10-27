@@ -52,8 +52,34 @@ class ImmutableSourceCast(torch.autograd.Function):
         return gradient.to(ctx.dtype),None
 
 
+class ImmutableSourceCastFused(torch.autograd.Function):
+    """(--source-fused-cast) ImmutableSourceCast for all of an encode's parameters in one node.
+
+    The same per-forward FP32 edges (each parameter's BF16 gradient converted to its FP32 snapshot before it is
+    accumulated), but one backward node and one flat conversion per encode instead of one node per parameter.
+    Outputs that receive no gradient stay None (no zero tensors)."""
+    @staticmethod
+    def forward(ctx, n, *tensors):
+        ctx.n = n
+        ctx.dtypes = [t.dtype for t in tensors[:n]]
+        ctx.set_materialize_grads(False)
+        return tuple(tensors[n:])
+
+    @staticmethod
+    def backward(ctx, *grads):
+        out = [None] * ctx.n
+        present = [i for i, g in enumerate(grads) if g is not None]
+        by_dtype = {}
+        for i in present: by_dtype.setdefault(ctx.dtypes[i], []).append(i)
+        for dtype, index in by_dtype.items():
+            flat = torch.cat([grads[i].reshape(-1) for i in index]).to(dtype)
+            for i, part in zip(index, flat.split([grads[i].numel() for i in index])):
+                out[i] = part.view(grads[i].shape)
+        return (None, *out, *([None] * ctx.n))
+
+
 class SourcePipeline:
-    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None, streams=0):
+    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None, streams=0, vjp_merge=False, fused_cast=False):
         self.model, self.period, self.micro, self.amp = model, period, micro, amp
         # Opt-in (--source-layer-checkpoint): each Spatial block's output is recomputed in the VJP from its saved
         # input (torch.utils.checkpoint, non-reentrant) instead of keeping the block's activations. Not the default:
@@ -62,6 +88,11 @@ class SourcePipeline:
         # (source processes with a separate VJP connection: streams >= 2 runs each VJP in its own thread, concurrent
         # with encodes / Writers, on CUDA streams that the cross-stream dependencies wait on; 0: one stream, as before)
         self.streams = int(streams or 0)
+        # (launch overhead, 2026-10-27; both opt-in, same gradients up to float summation order)
+        # vjp_merge: one autograd.backward per card and VJP over every episode group (default: one per episode);
+        # fused_cast: one cast node per encode for all its BF16 parameter aliases (default: one per parameter)
+        self.vjp_merge = bool(vjp_merge)
+        self.fused_cast = bool(fused_cast)
         # (measurement: only these Spatial blocks under checkpoint, the others keep their full graphs; None: all)
         self.checkpoint_blocks = None if checkpoint_blocks is None else frozenset(int(b) for b in checkpoint_blocks)
         # (--source-dispatch-at-close, scheduling only) with defer_backward: a closed interval's VJP starts when it
@@ -137,7 +168,8 @@ class SourcePipeline:
             from .source_worker import SourceProcess
             options=dict(period=period,micro=micro,amp=amp,version=version,saved_gpu_gb=saved_gpu_gb,saved_cpu_gb=saved_cpu_gb,saved_8bit=saved_8bit,
                          compile_source=compile_source,flash_source=flash_source,update_rollouts=update_rollouts,
-                         layer_checkpoint=layer_checkpoint,checkpoint_blocks=checkpoint_blocks,streams=streams)
+                         layer_checkpoint=layer_checkpoint,checkpoint_blocks=checkpoint_blocks,streams=streams,
+                         vjp_merge=vjp_merge,fused_cast=fused_cast)
             spill_limits=([min(saved_gpu_gb,max(1.,b-1.)) for b in self._memory_budgets()]
                           if saved_gpu_gb>0 else [0.]*len(self.devices))
             self.remotes=[SourceProcess(self.versions[version][0],d,
@@ -560,6 +592,11 @@ class SourcePipeline:
     def _cast_context(self, replica):
         if not self.amp:return nullcontext()
         params=dict(replica.named_parameters())
+        if self.fused_cast and replica._source_cast_values:
+            names=list(replica._source_cast_values)
+            casts=ImmutableSourceCastFused.apply(len(names),*[params[n] for n in names],
+                                                 *[replica._source_cast_values[n] for n in names])
+            return _reparametrize_module(replica,dict(zip(names,casts)))
         return _reparametrize_module(replica,{n:ImmutableSourceCast.apply(params[n],value)
             for n,value in replica._source_cast_values.items()})
 
@@ -1221,6 +1258,8 @@ class SourcePipeline:
                         outputs.append(result[name]); gradients.append(grad)
             served=0;service_seconds=0.
             hook=getattr(self,'vjp_group_hook',None)   # (test aid: a shuffled schedule between episode groups)
+            if self.vjp_merge and len(groups)>1:   # (one engine call over every episode group of this card)
+                groups={None:([o for os_,_ in groups.values() for o in os_],[g for _,gs in groups.values() for g in gs])}
             for outputs,gradients in groups.values():
                 if hook is not None:hook()
                 if outputs:torch.autograd.backward(outputs,gradients,retain_graph=retain_graph)
