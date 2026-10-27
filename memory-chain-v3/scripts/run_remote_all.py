@@ -30,6 +30,7 @@ FIVE = ('3,2,1,4,5', None)                       # v2 long-59 device layout
 FOUR = ('3,2,4,5', 'cuda:0,cuda:2,cuda:3')       # GPU1 taken: learner cuda:1, actors cuda:0,2, sources 0,2,3
 FOUR1 = ('3,1,4,5', 'cuda:0,cuda:2,cuda:3')      # (2026-10-26: GPU2 taken by others) the same roles on GPU1
 FOUR1x2 = ('3,1,4,5', 'cuda:0,cuda:0,cuda:2,cuda:2,cuda:3,cuda:3')   # (2026-10-27) two source processes per source card
+FIVEx2 = ('3,2,1,4,5', 'cuda:0,cuda:0,cuda:2,cuda:2,cuda:3,cuda:3,cuda:4,cuda:4')   # (5 cards, two per source card)
 SPILL0 = [' --source-saved-cpu-gb 0.75 ', ' --source-saved-cpu-gb 0 ']
 TRIMS = []   # a) SPILL0 dropped: every tp run with it hit CUDA OOM in source backward (updates 5-37); b) stays (QUIET)
 U1 = [' --source-update-rollouts 2 ', ' --source-update-rollouts 1 ']
@@ -112,6 +113,12 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
                       TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 ' + extra]])
                for name, extra in (('t8pb4', ''), ('t8pmf4', '--source-vjp-merge 1 --source-fused-cast 1 '),
                                    ('t8pm4', '--source-vjp-merge 1 '), ('t8pf4', '--source-fused-cast 1 '))},
+            # table 9 (2026-10-27): the fastest combination measured, 40 steady: two source processes per card, merge 1,
+            # fused cast, all four blocks checkpointed, balance on, streams off, no batched RPC; 5 cards (t9t) or 4 (t9t4)
+            t9t=(1024, 62.0, FIVEx2, dict(QUIET, ISAAC_TIMELINE='1'),
+                 TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 --source-vjp-merge 1 --source-fused-cast 1 ']]),
+            t9t4=(1024, 62.0, FOUR1x2, dict(QUIET, ISAAC_TIMELINE='1'),
+                  TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 --source-vjp-merge 1 --source-fused-cast 1 ']]),
             # decoupling (2026-10-27): 4 cards, all blocks checkpointed, balance on, 25 game hours, each twice:
             # defaults on 3 source processes (t9b), 2 processes per card + merge 1 + fused (t9p), + batched encode RPC (t9pb)
             **{name + rep: (1024, 25.0, layout, dict(QUIET, ISAAC_TIMELINE='1'),
