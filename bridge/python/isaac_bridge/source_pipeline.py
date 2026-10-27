@@ -89,9 +89,11 @@ class SourcePipeline:
         # with encodes / Writers, on CUDA streams that the cross-stream dependencies wait on; 0: one stream, as before)
         self.streams = int(streams or 0)
         # (launch overhead, 2026-10-27; both opt-in, same gradients up to float summation order)
-        # vjp_merge: one autograd.backward per card and VJP over every episode group (default: one per episode);
+        # vjp_merge: 1 = one autograd.backward per card and VJP over every episode group, N > 1 = episode groups
+        # packed into calls of at least N encoded frames (between calls the VJP still serves waiting encodes);
+        # 0 (default) = one call per episode group;
         # fused_cast: one cast node per encode for all its BF16 parameter aliases (default: one per parameter)
-        self.vjp_merge = bool(vjp_merge)
+        self.vjp_merge = int(vjp_merge or 0)
         self.fused_cast = bool(fused_cast)
         # (measurement: only these Spatial blocks under checkpoint, the others keep their full graphs; None: all)
         self.checkpoint_blocks = None if checkpoint_blocks is None else frozenset(int(b) for b in checkpoint_blocks)
@@ -1244,7 +1246,7 @@ class SourcePipeline:
             for replicas in self.versions.values():
                 for name,param in named(replicas[worker]):
                     param.grad=shared[name] if name in shared else None
-            groups={}
+            groups={};frames={}
             for chunk, grads in packets:
                 if chunk['worker'] == worker:
                     # Encoder chunks and their Writers have one episode owner.
@@ -1253,13 +1255,20 @@ class SourcePipeline:
                     # transient activation gradients live in one engine call.
                     owner=chunk.get('uid') if self.ipc_async else None
                     outputs,gradients=groups.setdefault(owner,([],[]))
+                    frames[owner]=frames.get(owner,0)+chunk.get('rows',0)
                     result = chunk['future'].result()
                     for name, grad in grads.items():
                         outputs.append(result[name]); gradients.append(grad)
             served=0;service_seconds=0.
             hook=getattr(self,'vjp_group_hook',None)   # (test aid: a shuffled schedule between episode groups)
-            if self.vjp_merge and len(groups)>1:   # (one engine call over every episode group of this card)
-                groups={None:([o for os_,_ in groups.values() for o in os_],[g for _,gs in groups.values() for g in gs])}
+            if self.vjp_merge and len(groups)>1:   # (fewer engine calls: whole episode groups packed together)
+                limit=float('inf') if self.vjp_merge==1 else self.vjp_merge
+                packed,cur,n=[],([],[]),0
+                for owner,(os_,gs) in groups.items():
+                    cur[0].extend(os_);cur[1].extend(gs);n+=frames.get(owner,0)
+                    if n>=limit:packed.append(cur);cur,n=([],[]),0
+                if cur[0]:packed.append(cur)
+                groups=dict(enumerate(packed))
             for outputs,gradients in groups.values():
                 if hook is not None:hook()
                 if outputs:torch.autograd.backward(outputs,gradients,retain_graph=retain_graph)
