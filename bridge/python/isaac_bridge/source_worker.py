@@ -89,7 +89,7 @@ def memory_breakdown(local, exports, device):
     return out
 
 
-def vjp_profile_summary(prof, decoded, wall_s, device, index):
+def vjp_profile_summary(prof, decoded, wall_s, device, index, tag='SOURCE_VJP_PROFILE'):
     """(ISAAC_SOURCE_VJP_PROFILE, measurement only) kernel-level statistics of one profiled VJP."""
     import json
     import numpy as np
@@ -135,7 +135,7 @@ def vjp_profile_summary(prof, decoded, wall_s, device, index):
                autograd_nodes=len(nodes), autograd_nodes_per_1k_frames=1000. * len(nodes) / max(1, frames),
                top_kernels=[dict(name=n, count=c, s=t / 1e6) for n, (c, t) in top],
                top_nodes=sorted(node_kinds.items(), key=lambda kv: -kv[1])[:12])
-    print('SOURCE_VJP_PROFILE ' + json.dumps(out), flush=True)
+    print(tag + ' ' + json.dumps(out), flush=True)
 
 
 def source_worker(connection, model, device, options, vjp_connection=None):
@@ -176,6 +176,10 @@ def source_worker(connection, model, device, options, vjp_connection=None):
     vjp_thread=[None]
     vjp_index=[0]   # (source VJPs so far: ISAAC_SOURCE_VJP_PROFILE profiles the n-th, measurement only)
     profile_at=int(os.environ.get('ISAAC_SOURCE_VJP_PROFILE','0') or 0)
+    # (ISAAC_SOURCE_ENCODE_PROFILE=first:count, measurement only: the encodes first .. first+count-1 under one
+    # profiler, summarised like a VJP: kernels, idle share, autograd-free)
+    encode_profile=[int(x) for x in os.environ.get('ISAAC_SOURCE_ENCODE_PROFILE','0:0').split(':')]
+    encode_index=[0];encode_prof=[None,[],0.]
     local.concurrent_vjp=concurrent
     shuffle=None
     if os.environ.get('ISAAC_SOURCE_STREAM_SHUFFLE'):   # (test aid: random host and device delays at every step)
@@ -212,6 +216,14 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 cid,parts,keys=payload
                 before=torch.cuda.memory_allocated(device) if breakdown_on else 0
                 done=None
+                encode_index[0]+=1
+                first_,count_=encode_profile
+                if count_ and encode_index[0]==first_ and device.type=='cuda':
+                    import time as time_
+                    from torch.profiler import profile as profile_, ProfilerActivity
+                    torch.cuda.synchronize(device)
+                    encode_prof[0]=profile_(activities=[ProfilerActivity.CPU,ProfilerActivity.CUDA]);encode_prof[0].__enter__()
+                    encode_prof[2]=time_.perf_counter()
                 with new_work():
                     if shuffle is not None:shuffle()
                     result=local._encode(0,parts,version,keys=keys)
@@ -226,6 +238,14 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                                        uid=next(iter(uids)) if len(uids)==1 else None,rows=len(keys),alloc=alloc,event=done)
                 for offset,key in enumerate(keys): local.frames[key]=(cid,offset)
                 exports['encode',cid]=reply
+                if encode_prof[0] is not None:
+                    encode_prof[1].append((dict(rows=len(keys),uid=local.chunks[cid]['uid']),{}))
+                    if encode_index[0]==first_+count_-1:
+                        import time as time_
+                        torch.cuda.synchronize(device);encode_prof[0].__exit__(None,None,None)
+                        vjp_profile_summary(encode_prof[0],encode_prof[1],time_.perf_counter()-encode_prof[2],device,
+                                            f'encode {first_}..{first_+count_-1}',tag='SOURCE_ENCODE_PROFILE')
+                        encode_prof[0]=None
                 if os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
                     # Reader uses the compact IPC copy. Preserve the original
                     # autograd edge, not a second copy of every Spatial output.
