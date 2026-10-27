@@ -1,8 +1,9 @@
-"""Persistent source graphs behind torch.multiprocessing CUDA IPC.
+"""Versioned source workers behind torch.multiprocessing CUDA IPC.
 
 Only detached values and cotangents cross the process boundary. The producer
 owns the immutable parameters, saved activations and autograd graph until the
-learner retires their identities. No encoder replay or distributed autograd.
+learner retires their identities. In replay mode it owns only numerical values,
+raw inputs and weight versions; each VJP rebuilds and releases packed graphs.
 """
 import copy
 import gc
@@ -201,7 +202,7 @@ def source_worker(connection, model, device, options, vjp_connection=None):
         if concurrent:stack.enter_context(replica_lock)
         if pool is not None:stack.enter_context(torch.cuda.stream(pool[period[0]%len(pool)]))
         return stack
-    def encode_one(cid,parts,keys,version):
+    def encode_one(cid,parts,keys,version,prepared=None,ready=None):
         # (one encode: its graph registered as chunk cid, its compact IPC export returned)
         before=torch.cuda.memory_allocated(device) if breakdown_on else 0
         done=None
@@ -215,8 +216,9 @@ def source_worker(connection, model, device, options, vjp_connection=None):
             encode_prof[2]=time_.perf_counter()
         with new_work():
             if shuffle is not None:shuffle()
-            result=local._encode(0,parts,version,keys=keys)
-            reply=ipc_export({k:v for k,v in result.items() if k!='grads'})
+            if ready is not None:torch.cuda.current_stream(device).wait_event(ready)
+            result=local._encode(0,parts,version,keys=keys) if prepared is None else prepared
+            reply=ipc_export({k:v for k,v in result.items() if k!='grads' and not k.startswith('_replay_')})
             if pool is not None:done=torch.cuda.Event();done.record()
         if done is not None:torch.cuda.current_stream(device).wait_event(done)
         alloc=torch.cuda.memory_allocated(device)-before if breakdown_on else 0
@@ -235,7 +237,7 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 vjp_profile_summary(encode_prof[0],encode_prof[1],time_.perf_counter()-encode_prof[2],device,
                                     f'encode {first_}..{first_+count_-1}',tag='SOURCE_ENCODE_PROFILE')
                 encode_prof[0]=None
-        if os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
+        if not local.replay and os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
             # Reader uses the compact IPC copy. Preserve the original
             # autograd edge, not a second copy of every Spatial output.
             # u stays a Tensor: future Writer blocks still consume it.
@@ -256,6 +258,12 @@ def source_worker(connection, model, device, options, vjp_connection=None):
             if command in ('encode','encode_many'):
                 # ('encode_many', --source-encode-batch: the encodes of one schedule() call in one message)
                 if command=='encode':reply=encode_one(*payload,version)
+                elif local.replay:
+                    prepared=local._encode_many(0,payload,version)
+                    ready=None
+                    if device.type=='cuda':ready=torch.cuda.Event();ready.record()
+                    reply=[encode_one(cid,parts,keys,version,value,ready)
+                           for (cid,parts,keys),value in zip(payload,prepared)]
                 else:reply=[encode_one(cid,parts,keys,version) for cid,parts,keys in payload]
             elif command=='write':
                 wid,keys=payload
@@ -279,7 +287,7 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                 local.writes.extend([None]*max(0,wid+1-len(local.writes)))
                 local.writes[wid]=dict(worker=0,future=future,version=version,uid=keys[0][0][0],alloc=alloc,event=done)
                 exports['write',wid]=reply
-                if os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
+                if not local.replay and os.environ.get('ISAAC_SOURCE_EDGE_EXPORT')=='1':
                     result['mem']=torch.autograd.graph.get_gradient_edge(result['mem'])
                 del result,future
             elif command=='backward':
@@ -344,7 +352,7 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                         extra=dict(frames=len(local.frames),saved_cpu_bytes=sum(c['future'].result().get('saved_cpu_bytes',0)
                                    for c in local.chunks if c is not None),
                                    live_chunks=sum(c is not None for c in local.chunks),
-                                   graph_frames=sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')),
+                                   graph_frames=0 if local.replay else sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')),
                                    cuda_allocated=torch.cuda.memory_allocated(device) if device.type=='cuda' else 0))
                 trim_interval=int(os.environ.get('ISAAC_HOST_TRIM_INTERVAL','4'))
                 if trim_interval and retired%trim_interval==0:
@@ -359,10 +367,12 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                     result=local.chunks[cid]['future'].result()
                     result['u']=exports['encode',cid]['u'];result['y']=None
                     local.chunks[cid]['detached']=result['_detached']=True
+                    result.pop('_replay_rows',None);result.pop('_replay_pending',None)
                 for wid in writes:
                     result=local.writes[wid]['future'].result()
                     result['mem']=exports['write',wid]['mem']
                     local.writes[wid]['detached']=result['_detached']=True
+                    result.pop('_replay_refs',None)
                 reply=None
             elif command=='close':
                 local.chunks.clear();local.writes.clear();local.frames.clear();local.versions.clear()
@@ -387,7 +397,8 @@ def source_worker(connection, model, device, options, vjp_connection=None):
                           frames=len(local.frames),versions=len(local.versions),
                           detached_chunks=sum(c is not None and bool(c.get('detached')) for c in local.chunks),
                           detached_writes=sum(c is not None and bool(c.get('detached')) for c in local.writes),
-                          graph_frames=sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')))
+                          graph_frames=0 if local.replay else sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')),
+                          replay_frames=sum(c['rows'] for c in local.chunks if c is not None and not c.get('detached')) if local.replay else 0)
             if breakdown_on and breakdown:memory['breakdown']=breakdown
             if os.environ.get('ISAAC_SOURCE_COMPONENT_GRAPH_CACHE')=='1':
                 component_calls={}

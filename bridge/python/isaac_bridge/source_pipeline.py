@@ -1,4 +1,4 @@
-"""Versioned source graphs on dedicated devices; no forward replay.
+"""Versioned source values on dedicated devices, with two training backends.
 
 Reader updates consume detached transport leaves, not detached training history.
 Cached graphs and immutable forward-weight snapshots survive source updates; new
@@ -6,6 +6,8 @@ observations alone use the new snapshot. Later-room cotangents return to their
 original graphs. Applying those gradients to the current master is delayed-gradient
 optimization, not a claim of current-weight gradient equivalence. CUDA work uses
 one worker per source GPU, allowing lookahead encoding alongside the Reader.
+With replay=True only values and raw inputs persist; version-grouped temporary
+Encoder/Writer graphs replace the long-lived graphs without changing the horizon.
 """
 import copy
 import os
@@ -79,8 +81,11 @@ class ImmutableSourceCastFused(torch.autograd.Function):
 
 
 class SourcePipeline:
-    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None, streams=0, vjp_merge=False, fused_cast=False, encode_batch=False):
+    def __init__(self, model, devices, *, period=4, micro=2048, amp=False, version=0, saved_gpu_gb=0, saved_cpu_gb=1, saved_8bit=0, compile_source=False, flash_source=False, update_rollouts=1, shared_devices=(), actor_reserve_gb=0, processes=False, defer_backward=False, horizon=0, layer_checkpoint=False, dispatch_at_close=False, balance=False, checkpoint_blocks=None, streams=0, vjp_merge=False, fused_cast=False, encode_batch=False, replay=False):
         self.model, self.period, self.micro, self.amp = model, period, micro, amp
+        # Value-only history: rebuild short-lived, cross-episode training batches.
+        # Parameter versions and the gradient horizon retain their existing meaning.
+        self.replay = bool(replay)
         # Opt-in (--source-layer-checkpoint): each Spatial block's output is recomputed in the VJP from its saved
         # input (torch.utils.checkpoint, non-reentrant) instead of keeping the block's activations. Not the default:
         # it recomputes the blocks' forward.
@@ -97,7 +102,7 @@ class SourcePipeline:
         self.fused_cast = bool(fused_cast)
         # encode_batch (source processes): the encodes one schedule() call gives a process go in one RPC, not one
         # request and reply each (the same encodes, in the same order)
-        self.encode_batch = bool(encode_batch) and bool(processes)
+        self.encode_batch = self.replay or (bool(encode_batch) and bool(processes))
         self.encode_requests = 0   # (accounting: encode requests sent to source processes)
         # (measurement: only these Spatial blocks under checkpoint, the others keep their full graphs; None: all)
         self.checkpoint_blocks = None if checkpoint_blocks is None else frozenset(int(b) for b in checkpoint_blocks)
@@ -175,7 +180,7 @@ class SourcePipeline:
             options=dict(period=period,micro=micro,amp=amp,version=version,saved_gpu_gb=saved_gpu_gb,saved_cpu_gb=saved_cpu_gb,saved_8bit=saved_8bit,
                          compile_source=compile_source,flash_source=flash_source,update_rollouts=update_rollouts,
                          layer_checkpoint=layer_checkpoint,checkpoint_blocks=checkpoint_blocks,streams=streams,
-                         vjp_merge=vjp_merge,fused_cast=fused_cast,encode_batch=False)
+                         vjp_merge=vjp_merge,fused_cast=fused_cast,encode_batch=False,replay=replay)
             spill_limits=([min(saved_gpu_gb,max(1.,b-1.)) for b in self._memory_budgets()]
                           if saved_gpu_gb>0 else [0.]*len(self.devices))
             self.remotes=[SourceProcess(self.versions[version][0],d,
@@ -500,9 +505,11 @@ class SourcePipeline:
             result = self.chunks[i]['future'].result()
             # A consumed record's own decision frame is still read (frozen): keep y values.
             result['u'] = result['u'].detach(); result['y'] = result['y'].detach()
+            result.pop('_replay_rows', None); result.pop('_replay_pending', None)
         for i in writes:
             result = self.writes[i]['future'].result()
             result['mem'] = result['mem'].detach()
+            result.pop('_replay_refs', None)
 
     def value_bytes_per_frame(self):
         """Mean source value bytes (u and Spatial tokens y) per encoded frame, over
@@ -529,9 +536,10 @@ class SourcePipeline:
         dropped = 0. if self.horizon_dropped is None else float(self.horizon_dropped)
         allocated = [m['allocated'] for m in self.remote_memory] if self.processes else [
             torch.cuda.memory_allocated(d) if d.type == 'cuda' else 0 for d in self.devices]
-        return dict(source_horizon=self.horizon, source_graph_frames=graph,
-                    source_graph_frames_uid_max=max(per_uid.values(), default=0),
-                    source_graph_writes=sum(c is not None and not c.get('detached') for c in self.writes),
+        return dict(source_horizon=self.horizon, source_graph_frames=0 if self.replay else graph,
+                    source_replay=int(self.replay), source_replay_frames=graph if self.replay else 0,
+                    source_graph_frames_uid_max=0 if self.replay else max(per_uid.values(), default=0),
+                    source_graph_writes=0 if self.replay else sum(c is not None and not c.get('detached') for c in self.writes),
                     source_pinned_rows=getattr(self, 'pinned_rows', 0),
                     source_retain_skipped=getattr(self, 'retain_skipped', 0),
                     source_retain_pinned=getattr(self, 'retain_pinned', 0),
@@ -543,9 +551,9 @@ class SourcePipeline:
                     source_detached_total=self.horizon_detached['frames'],
                     source_horizon_dropped_grad=dropped,
                     source_alloc_gib_max=max(allocated, default=0) / 2**30,
-                    **({'source_worker_graph_frames': sum(m.get('graph_frames', 0) for m in self.remote_memory)}
+                    **({'source_worker_graph_frames': 0 if self.replay else sum(m.get('graph_frames', 0) for m in self.remote_memory)}
                        if self.processes else {}),
-                    **{f'source_graph_frames_w{i}': sum(c['rows'] for c in self.chunks if c is not None and c['worker'] == i
+                    **{f'source_graph_frames_w{i}': 0 if self.replay else sum(c['rows'] for c in self.chunks if c is not None and c['worker'] == i
                                                         and not c.get('detached')) for i in range(len(self.devices))},
                     **{f'source_busy_w{i}': (h[-1] if h else float('nan')) for i, h in enumerate(self.busy_hist)},
                     **{f'source_balance_w{i}': float(w) for i, w in enumerate(self.balance_weight)})
@@ -606,7 +614,7 @@ class SourcePipeline:
         return _reparametrize_module(replica,{n:ImmutableSourceCast.apply(params[n],value)
             for n,value in replica._source_cast_values.items()})
 
-    def _encode(self, worker, parts, version, cid=None, keys=None):
+    def _encode(self, worker, parts, version, cid=None, keys=None, *, recompute=False):
         if self.processes:
             self.encode_requests+=1
             result=self._remote(worker,'encode',(cid,parts,keys),version)
@@ -620,11 +628,11 @@ class SourcePipeline:
         rows=np.concatenate([r.view(np.uint8).reshape(len(r),-1) for r,p in parts]).view(parts[0][0].dtype).reshape(-1)
         pending=np.concatenate([p for r,p in parts])
         replica, device = self.versions[version][worker], self.devices[worker]
-        with self._context(worker), torch.enable_grad(), self._cast_context(replica), torch.autocast(
+        with self._context(worker), torch.set_grad_enabled(not self.replay or recompute), self._cast_context(replica), torch.autocast(
                 device.type, dtype=torch.bfloat16, enabled=self.amp):
             b = to_batch(rows, pending, device, entities=64)
             b['_raw_rows'], b['_raw_pending'], b['_source_packed'] = rows, pending, True
-            if os.environ.get('ISAAC_SOURCE_COMPONENT_GRAPH_CACHE')=='1' and keys is not None:
+            if not self.replay and os.environ.get('ISAAC_SOURCE_COMPONENT_GRAPH_CACHE')=='1' and keys is not None:
                 uids={key[0] for key in keys}
                 if len(uids)==1:b['_source_component_uid']=next(iter(uids))
             b['_source_bf16'] = self.amp
@@ -745,7 +753,7 @@ class SourcePipeline:
                       by_module=sorted(([m, f, d, n, c] for (m, f, d), (n, c) in by.items()), key=lambda x: -x[3]),
                       by_shape=sorted(([m, d, sh, n, c] for (m, d, sh), (n, c) in shp.items()), key=lambda x: -x[3])[:40])),flush=True)
             if device.type == 'cuda' and not self.ipc_async: torch.cuda.current_stream(device).synchronize()
-        self.events.append(dict(kind='encode', device=str(device), version=version,
+        self.events.append(dict(kind='replay_encode' if recompute else 'encode', device=str(device), version=version,
                                 rows=len(rows), saved_on_cpu=bool(cpu_bytes), saved_cpu_bytes=cpu_bytes,
                                 spill_limited_bytes=limited_bytes, start=started, end=time.perf_counter(),
                                 **(saving.stats() if self.saved_8bit else {})))
@@ -753,6 +761,7 @@ class SourcePipeline:
             self.profilers[worker].disable()
             self.profilers[worker].dump_stats(f'{self.profile_path}/source-worker-{worker}.pstats')
         return dict(y=y, u=u, starts=plan['rec'][:, 1], counts=plan['rec'][:, 0], grads={},saved_cpu_bytes=cpu_bytes,
+                    **(dict(_replay_rows=rows,_replay_pending=pending) if self.replay and not recompute else {}),
                     **(saving.stats() if self.saved_8bit else {}))
 
     def _memory_budgets(self):
@@ -901,6 +910,9 @@ class SourcePipeline:
 
     def _encode_many(self, worker, items, version):
         self.encode_requests+=1
+        if self.replay and not self.processes:
+            from .source_replay import encode_values
+            return encode_values(self, worker, items, version)
         results=self._remote(worker,'encode_many',items,version)
         for result in results:result['grads']={}
         return results
@@ -980,7 +992,7 @@ class SourcePipeline:
             return result
         started = time.perf_counter()
         replica, device = self.versions[version][worker], self.devices[worker]
-        with self._context(worker), torch.enable_grad(), self._cast_context(replica), torch.autocast(
+        with self._context(worker), torch.set_grad_enabled(not self.replay), self._cast_context(replica), torch.autocast(
                 device.type, dtype=torch.bfloat16, enabled=self.amp):
             grouped = {}
             for dst, key in enumerate(key for block in block_keys for key in block):
@@ -1004,6 +1016,7 @@ class SourcePipeline:
                                 rows=len(block_keys), start=started, end=time.perf_counter(),
                                 **(saving.stats() if self.saved_8bit else {})))
         return dict(mem=mem, grads={}, **(saving.stats() if self.saved_8bit else {}),
+                    **(dict(_replay_refs=np.asarray([self.frames[key] for block in block_keys for key in block],np.int64)) if self.replay else {}),
                     **(dict(_stale_rows=list(stale)) if stale else {}))
 
     @torch.no_grad()
@@ -1253,6 +1266,9 @@ class SourcePipeline:
             selected=[(c['remote_kind'],c['remote_id'],g) for c,g in packets if c['worker']==worker]
             if self.devices[worker].type=='cuda':torch.cuda.current_stream(self.devices[worker]).synchronize()
             return self._remote(worker,'backward',(selected,retain_graph))
+        if self.replay:
+            from .source_replay import backward_replay
+            return backward_replay(self, worker, packets, retain_graph, kind)
         started = time.perf_counter()
         device = self.devices[worker]
         if not any(c['worker'] == worker for c, _ in packets):

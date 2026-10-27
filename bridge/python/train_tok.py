@@ -1735,7 +1735,7 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--memory-tokens', type=int, default=4)
     p.add_argument('--source-cache', type=int, choices=(0, 1), default=0)
     p.add_argument('--source-replay', type=int, choices=(0, 1), default=0,
-                   help='diagnostic memory-saving VJP replay; default keeps the source graph without replay')
+                   help='with source devices: value-only history and version-grouped Encoder/Writer VJP batches; without them: legacy batch-local replay; no gradient truncation')
     p.add_argument('--memory-refresh-updates', type=int, default=8,
                    help='actor source-cache refresh period in received weight versions (1: strict freshness)')
     p.add_argument('--source-devices', default='', help='source GPUs, e.g. cuda:2,cuda:3; no automatic GPU allocation')
@@ -1964,8 +1964,8 @@ def main(argv=None, child=None, actor=None):
         tok_kw['item_slots'] = item_slots
     t_on = bool(args.temporal)   # 2026-10-14 (B30)
     if args.rebuild_memory:
-        if args.source_devices and (args.micro != 8192 or args.source_replay or args.source_update_steps < 0):
-            p.error('source pipeline requires --micro 8192, --source-replay 0 and nonnegative --source-update-steps')
+        if args.source_devices and (args.micro != 8192 or args.source_update_steps < 0):
+            p.error('source pipeline requires --micro 8192 and nonnegative --source-update-steps')
         if args.source_overlap_rollout and (not args.source_devices or args.source_update_steps != 0):
             p.error('--source-overlap-rollout requires source devices and --source-update-steps 0')
         if args.source_update_rollouts!=1 and (not args.source_devices or args.source_update_steps!=0):
@@ -2575,13 +2575,14 @@ def main(argv=None, child=None, actor=None):
             balance=bool(args.source_balance),
             checkpoint_blocks=[int(b) for b in args.source_checkpoint_blocks.split(',')] if args.source_checkpoint_blocks else None,
             streams=args.source_streams, vjp_merge=args.source_vjp_merge, fused_cast=bool(args.source_fused_cast),
-            encode_batch=bool(args.source_encode_batch),
+            encode_batch=bool(args.source_encode_batch), replay=bool(args.source_replay),
             update_rollouts=args.source_update_rollouts, shared_devices=shared,
             actor_reserve_gb=args.source_actor_reserve_gb,processes=bool(args.source_processes),
             defer_backward=bool(args.source_prefetch_records),horizon=args.memory_horizon)
         print(f'[source] encoder/Writer={"bf16" if source_pipeline.amp else "fp32"}; '
               f'Reader={"bf16" if amp else "fp32"}; master/optimizer=fp32; saved_8bit_block={args.source_saved_8bit}; '
-              f'gradient_horizon={args.memory_horizon or "unbounded"}', flush=True)
+              f'gradient_horizon={args.memory_horizon or "unbounded"}; '
+              f'history={"values+batched-replay" if source_pipeline.replay else "retained-graphs"}', flush=True)
 
     def save(path):
         if source_pipeline is not None:
@@ -3522,7 +3523,7 @@ def main(argv=None, child=None, actor=None):
                                 source_batch=JoinedSources(source_batch,extra_sources)
                         else:
                             source_batch = SourceBatch(learner_model, requests, args.room_source_micro,
-                                                       cache=bool(args.source_replay), pipeline=source_pipeline)
+                                                       cache=bool(args.source_replay) and source_pipeline is None, pipeline=source_pipeline)
                 if source_pipeline is not None:
                     if retire_after_ready:
                         live_now=live_uids | {h.uid for h in L.get('v2_contexts',[]) if h is not None}
