@@ -1,0 +1,17 @@
+NUMERICAL_ONLY: rtol=1e-6 atol=1e-7; not a bitwise pass
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_source_replay_lifetime.py", line 33, in <module>
+    runpy.run_path(str(test), run_name='__main__')
+  File "/usr/lib/python3.10/runpy.py", line 289, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/usr/lib/python3.10/runpy.py", line 96, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/bench/workspace/python/tests/test_source_pipeline.py", line 80, in <module>
+    early = pipeline.chunks[0]['future'].result()['u']; early.retain_grad()
+RuntimeError: can't retain_grad on Tensor that has requires_grad=False
+
+GATE v3-6eacc63-replay-source-pipeline-numerical EXIT 1
+
+EXIT 1

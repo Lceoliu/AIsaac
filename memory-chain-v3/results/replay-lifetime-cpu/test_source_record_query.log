@@ -1,0 +1,11 @@
+Traceback (most recent call last):
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\wt-replay\bridge\python\tests\test_source_replay_lifetime.py", line 33, in <module>
+    runpy.run_path(str(test), run_name='__main__')
+  File "<frozen runpy>", line 291, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\wt-replay\bridge\python\tests\test_source_record_query.py", line 114, in <module>
+    main('--process' in sys.argv)
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\wt-replay\bridge\python\tests\test_source_record_query.py", line 95, in main
+    assert torch.equal(oA[r], oR[r]), f'Reader outputs differ in rollout {r}'
+AssertionError: Reader outputs differ in rollout 7

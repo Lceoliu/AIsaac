@@ -1,0 +1,2 @@
+NUMERICAL_ONLY: rtol=1e-6 atol=1e-7; not a bitwise pass
+{"result": "PASS", "processes": false, "max_param_diff": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.4901161193847656e-08, 1.1920928955078125e-07], "held_frames_A": [0, 8, 8, 10, 10, 10, 10, 8], "held_frames_R": [0, 8, 16, 24, 32, 40, 48, 56]}

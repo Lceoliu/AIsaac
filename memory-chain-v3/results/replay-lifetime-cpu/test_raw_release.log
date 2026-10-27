@@ -1,0 +1,1 @@
+{"result": "PASS", "live_raw_frames_per_rollout": [16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0, 16.0], "bound": 60, "record_own_frames": 7, "released_misses": 1}

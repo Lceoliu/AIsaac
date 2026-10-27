@@ -1,0 +1,7 @@
+{"baseline": {"mode": "stored", "micro": 8192, "horizon": 0, "bf16": false, "processes": false, "updates": [1, 2, 3, 4], "audit": 0.0, "cached_graph_outputs": 182, "encoded_rows": 193, "value_encoder_batches": 25, "replayed_rows": 0, "replay_encoder_batches": 0, "replay_writer_batches": 0, "seconds": 2.392}, "modified": {"mode": "replay", "micro": 8192, "horizon": 0, "bf16": false, "processes": false, "updates": [1, 2, 3, 4], "audit": 0.0, "cached_graph_outputs": 0, "encoded_rows": 193, "value_encoder_batches": 4, "replayed_rows": 481, "replay_encoder_batches": 10, "replay_writer_batches": 10, "seconds": 1.0844}, "logits_max_abs": 2.16066837310791e-06, "gradients_max_abs": 1.0029471013695002e-06, "gradients_relative_l2": 3.2220821594819427e-05, "weights_max_abs": 1.687556505203247e-06}
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_source_replay.py", line 151, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_source_replay.py", line 143, in main
+    assert grad_rel < (a.grad_threshold if a.grad_threshold is not None else (0.02 if a.bf16 else 1e-5)), grad_rel
+AssertionError: 3.2220821594819427e-05

@@ -1,0 +1,12 @@
+SOURCE_DROP_FIRST {"field": "mem", "total": 0.00041929216240532696, "version": 6, "meta": {"kind": "write", "uids": [[36780, 4]], "span": [8, 8], "rows": null, "encoded_version": 4, "detached_at_version": 5, "retain_mark": null, "reach": {"(36780, 4)": [[34, Infinity]]}}, "keys": [], "batch": {"type": "SourceBatch", "requests": 9, "frozen": 0, "query_frozen": null, "readers": [{"uid": [36780, 4], "length": 48, "own_start": 0, "origin": []}, {"uid": [36780, 4], "length": 49, "own_start": 0, "origin": []}, {"uid": [36780, 4], "length": 50, "own_start": 0, "origin": []}, {"uid": [36780, 4], "length": 51, "own_start": 0, "origin": []}, {"uid": [36780, 4], "length": 52, "own_start": 0, "origin": []}, {"uid": [36780, 4], "length": 53, "own_start": 0, "origin": []}, {"uid": [36780, 4], "length": 54, "own_start": 0, "origin": []}, {"uid": [36780, 4], "length": 55, "own_start": 0, "origin": []}, {"uid": [36780, 5], "length": 14, "own_start": 10, "origin": [[[36780, 4], 10]]}]}, "learner": null}
+Traceback (most recent call last):
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\wt-replay\bridge\python\tests\test_source_replay_lifetime.py", line 33, in <module>
+    runpy.run_path(str(test), run_name='__main__')
+  File "<frozen runpy>", line 291, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\wt-replay\bridge\python\tests\test_source_inflight_branch.py", line 115, in <module>
+    main('--process' in sys.argv)
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\wt-replay\bridge\python\tests\test_source_inflight_branch.py", line 105, in main
+    assert torch.equal(oA[r], oR[r]), f'Reader outputs differ in rollout {r}'
+AssertionError: Reader outputs differ in rollout 7

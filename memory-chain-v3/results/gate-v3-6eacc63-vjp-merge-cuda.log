@@ -1,0 +1,13 @@
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000837
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000377
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000543
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000491
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000511
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000497
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000336
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000407
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000459
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000621
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000659
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000484
+{"result": "PASS", "processes": true, "sources": ["cuda:1", "cuda:2"], "base_counts": {"accumulate": 0, "cast": 0, "calls": 0}, "merge": {"source_grad_rel_diff": 2.3188823005860055e-08, "counts": {"accumulate": 0, "cast": 0, "calls": 0}}, "pack": {"source_grad_rel_diff": 1.650032796959615e-08, "counts": {"accumulate": 0, "cast": 0, "calls": 0}}, "fused": {"source_grad_rel_diff": 0.0, "counts": {"accumulate": 0, "cast": 0, "calls": 0}}, "both": {"source_grad_rel_diff": 2.3188823005860055e-08, "counts": {"accumulate": 0, "cast": 0, "calls": 0}}, "batch": {"source_grad_rel_diff": 2.3188823005860055e-08, "counts": {"accumulate": 0, "cast": 0, "calls": 0}}, "encode_requests": {"base": 24, "merge": 24, "pack": 24, "fused": 24, "both": 24, "batch": 8}}

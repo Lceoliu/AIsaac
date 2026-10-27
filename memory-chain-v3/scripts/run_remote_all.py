@@ -25,6 +25,7 @@ BENCH = [PY, '-X', 'utf8', str(HERE / 'bench_v3.py')]
 RESULTS = HERE / 'results'
 FREE = [1, 2, 3, 4, 5]          # GPUs 0, 6, 7 belong to others
 import os
+GATE_GPUS = os.environ.get('V3_GATE_GPUS', '3,4,5')   # (gates' GPUs; 2026-10-27: GPU3 at times in others' use)
 TAG = 'v3-' + (os.environ.get('V3_REF') or subprocess.check_output(['git', '-C', str(HERE / 'candidate'), 'rev-parse', '--short', 'HEAD'], text=True).strip())
 FIVE = ('3,2,1,4,5', None)                       # v2 long-59 device layout
 FOUR = ('3,2,4,5', 'cuda:0,cuda:2,cuda:3')       # GPU1 taken: learner cuda:1, actors cuda:0,2, sources 0,2,3
@@ -113,6 +114,17 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
                       TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-layer-checkpoint 1 --source-balance 1 ' + extra]])
                for name, extra in (('t8pb4', ''), ('t8pmf4', '--source-vjp-merge 1 --source-fused-cast 1 '),
                                    ('t8pm4', '--source-vjp-merge 1 '), ('t8pf4', '--source-fused-cast 1 '))},
+            # replay-v1 (GPT's --source-replay 1, 2026-10-27): 4 cards, table 7's configuration without layer checkpoint
+            # (replay forces it off), balance on, streams off, H=1024; stored (r10s) vs replay with micro 8192 (r10r), twice;
+            # r10p = replay with the VJP / encode kernel profiles
+            **{name: (1024, hours, FOUR1, dict(QUIET, ISAAC_TIMELINE='1', **env),
+                      TRIMS + [U1, [' --source-flash 1 ', ' --source-flash 1 --source-dispatch-at-close 1 --source-balance 1 ']] + extra)
+               for name, hours, env, extra in (
+                   ('r10s', 25.0, {}, []), ('r10s2', 25.0, {}, []),
+                   ('r10r', 25.0, {}, [[' --source-replay 0 ', ' --source-replay 1 '], [' --room-source-micro 2048 ', ' --room-source-micro 8192 ']]),
+                   ('r10r2', 25.0, {}, [[' --source-replay 0 ', ' --source-replay 1 '], [' --room-source-micro 2048 ', ' --room-source-micro 8192 ']]),
+                   ('r10p', 18.0, dict(ISAAC_SOURCE_VJP_PROFILE='10', ISAAC_SOURCE_ENCODE_PROFILE='200:40'),
+                    [[' --source-replay 0 ', ' --source-replay 1 '], [' --room-source-micro 2048 ', ' --room-source-micro 8192 ']]))},
             # table 9 (2026-10-27): the fastest combination measured, 40 steady: two source processes per card, merge 1,
             # fused cast, all four blocks checkpointed, balance on, streams off, no batched RPC; 5 cards (t9t) or 4 (t9t4)
             t9t=(1024, 62.0, FIVEx2, dict(QUIET, ISAAC_TIMELINE='1'),
@@ -289,8 +301,37 @@ def main():
                 done = RESULTS / f'gate-{TAG}-{name}.exit'
                 if done.exists() and done.read_text().strip() == '0':
                     print('gate already passed:', name, flush=True); continue
-                bench('gate', f'{TAG}-{name}', TAG, '3,4,5', 'nice -n 10 timeout 1800 bash -c ' + json.dumps(shell),
+                bench('gate', f'{TAG}-{name}', TAG, GATE_GPUS, 'nice -n 10 timeout 1800 bash -c ' + json.dumps(shell),
                       log=f'gate-{TAG}-{name}-dispatch.log')
+        elif step == 'replaygates':   # (replay-v1, 2026-10-27) the source gates under --source-replay 1, and replay vs stored
+            wrap = lambda t: PYV + 'tests/test_source_replay_lifetime.py ' + t   # (SourcePipeline forced to replay=True)
+            gates = [
+                ('replay-grad-fp32', PYV + 'tests/test_source_replay.py --mode compare --device cuda:0 --sources cuda:1 --grad-threshold 1e-6'),
+                ('replay-grad-fp32-process', PYV + 'tests/test_source_replay.py --mode compare --device cuda:0 --sources cuda:1 --process --grad-threshold 1e-6'),
+                # (FP32 without TF32: cuDNN convolutions default to TF32 on Ampere, which is not FP32 arithmetic)
+                ('replay-grad-fp32-notf32', 'NVIDIA_TF32_OVERRIDE=0 ' + PYV + 'tests/test_source_replay.py --mode compare --device cuda:0 --sources cuda:1 --grad-threshold 1e-6'),
+                ('replay-grad-fp32-notf32-process', 'NVIDIA_TF32_OVERRIDE=0 ' + PYV + 'tests/test_source_replay.py --mode compare --device cuda:0 --sources cuda:1 --process --grad-threshold 1e-6'),
+                # (the stored path against itself, FP32 with TF32: the run-to-run floor of the comparison)
+                # (BF16 production settings: the threshold is the BF16 noise floor, REPORT 19.6: ~1.2e-2 relative L2)
+                ('replay-grad-bf16', PYV + 'tests/test_source_replay.py --mode compare --device cuda:0 --sources cuda:1 --bf16 --flash --compile --grad-threshold 2e-2'),
+                ('replay-horizon-cuda', wrap('test_source_horizon --learner cuda:0 --sources cuda:1,cuda:2')),
+                ('replay-horizon-bound', wrap('test_source_horizon_bound') + ' && ' + wrap('test_source_horizon_bound --process')),
+                ('replay-source-pipeline', wrap('test_source_pipeline --resident --joined --sparse --rollout-clock --overlap-rollout --learner cuda:0 --sources cuda:1,cuda:2 --queries 8192 --length 128')),
+                ('replay-source-process', wrap('test_source_process --learner cuda:0 --sources cuda:1,cuda:2 --queries 8192 --bf16 --defer --shared')),
+                ('replay-source-precision', wrap('test_source_precision --learner cuda:0 --sources cuda:1,cuda:2 --queries 8192')),
+                ('replay-vjp-merge', wrap('test_source_vjp_merge --sources cuda:1,cuda:2')),
+            ]
+            only = os.environ.get('V3_GATES')
+            for name, shell in gates:
+                if only and name not in only.split(','): continue
+                code, _ = bench('gate', f'{TAG}-{name}', TAG, GATE_GPUS, 'nice -n 10 timeout 1800 bash -c ' + json.dumps(shell),
+                                log=f'gate-{TAG}-{name}-dispatch.log', check=False)
+                if code and name.startswith('replay-') and not name.startswith('replay-grad'):
+                    # (a bitwise comparison inside the original test failing under replay: rerun it numerically,
+                    # rtol 1e-6 atol 1e-7, labelled; the strict result is kept)
+                    numeric = shell.replace('tests/test_source_replay_lifetime.py ', 'tests/test_source_replay_lifetime.py --numerical ')
+                    bench('gate', f'{TAG}-{name}-numerical', TAG, GATE_GPUS, 'nice -n 10 timeout 1800 bash -c ' + json.dumps(numeric),
+                          log=f'gate-{TAG}-{name}-numerical-dispatch.log', check=False)
         elif step == 'actorgates':   # the actor's CUDA tests on TAG (graph/eager logits, state writes, profiler twin)
             gates = [('rebuild-actor', 'tests/test_rebuild_actor_cuda.py --compile'),
                      ('actor-state', 'tests/test_rebuild_actor_state_cuda.py --compile'),
@@ -300,10 +341,10 @@ def main():
             only = os.environ.get('V3_GATES')   # (comma names; default: all but actor-crn unless V3_CRN_GATE)
             gates = [g for g in gates if (g[0] in only.split(',')) if only] if only else                 [g for g in gates if g[0] != 'actor-crn' or os.environ.get('V3_CRN_GATE')]
             for name, test in gates:
-                bench('gate', f'{TAG}-{name}', TAG, '3,4,5', 'nice -n 10 timeout 1800 bash -c ' + json.dumps(PYV + test),
+                bench('gate', f'{TAG}-{name}', TAG, GATE_GPUS, 'nice -n 10 timeout 1800 bash -c ' + json.dumps(PYV + test),
                       log=f'gate-{TAG}-{name}-dispatch.log')
         elif step == 'variants':   # (measurement) the source variants bench on one card
-            bench('gate', f'{TAG}-variants', TAG, '3,4,5', 'nice -n 10 timeout 3600 bash -c ' + json.dumps(
+            bench('gate', f'{TAG}-variants', TAG, GATE_GPUS, 'nice -n 10 timeout 3600 bash -c ' + json.dumps(
                 PYV + 'tests/bench_source_variants_cuda.py --device cuda:0 --frames 1024 --width 192 --layers 4'),
                   log=f'gate-{TAG}-variants-dispatch.log')
         elif step == 'profgates':   # the profiler's CUDA twin test on both code trees

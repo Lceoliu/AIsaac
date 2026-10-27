@@ -1,0 +1,13 @@
+NUMERICAL_ONLY: rtol=1e-6 atol=1e-7; not a bitwise pass
+Traceback (most recent call last):
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\wt-replay\bridge\python\tests\test_source_replay_lifetime.py", line 33, in <module>
+    runpy.run_path(str(test), run_name='__main__')
+  File "<frozen runpy>", line 291, in run_path
+  File "<frozen runpy>", line 98, in _run_module_code
+  File "<frozen runpy>", line 88, in _run_code
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\wt-replay\bridge\python\tests\test_record_retention.py", line 129, in <module>
+    main(8)
+  File "D:\Projects\fortune\Isaac\temp\memory-chain-v3\wt-replay\bridge\python\tests\test_record_retention.py", line 78, in main
+    u = pipe.chunks[cid]['future'].result()['u']; u.retain_grad(); keep[cid] = u
+                                                  ^^^^^^^^^^^^^^^
+RuntimeError: can't retain_grad on Tensor that has requires_grad=False

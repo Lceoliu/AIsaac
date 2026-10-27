@@ -1,0 +1,6 @@
+{"baseline": {"mode": "stored", "micro": 8192, "horizon": 0, "bf16": true, "processes": false, "updates": [1, 2, 3, 4], "audit": 0.0, "cached_graph_outputs": 182, "encoded_rows": 193, "value_encoder_batches": 25, "replayed_rows": 0, "replay_encoder_batches": 0, "replay_writer_batches": 0, "seconds": 5.9853}, "modified": {"mode": "replay", "micro": 8192, "horizon": 0, "bf16": true, "processes": false, "updates": [1, 2, 3, 4], "audit": 0.0, "cached_graph_outputs": 0, "encoded_rows": 193, "value_encoder_batches": 4, "replayed_rows": 481, "replay_encoder_batches": 10, "replay_writer_batches": 10, "seconds": 2.8004}, "logits_max_abs": 0.0015619024634361267, "gradients_max_abs": 0.0004341220483183861, "gradients_relative_l2": 0.008426666259765625, "weights_max_abs": 0.00012509524822235107}
+PASS: cross-room/versioned VJP parity; value-only cache; unchanged reuse; micro=8192
+
+GATE v3-6eacc63-replay-grad-bf16 EXIT 0
+
+EXIT 0

@@ -1,0 +1,36 @@
+NUMERICAL_ONLY: rtol=1e-6 atol=1e-7; not a bitwise pass
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000555
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000547
+[source] replay=1: --source-vjp-merge forced off / ignored
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000947
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000784
+[source] replay=1: --source-vjp-merge forced off / ignored
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.001076
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000677
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000857
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000749
+[source] replay=1: --source-vjp-merge forced off / ignored
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000657
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000906
+[source] replay=1: --source-vjp-merge forced off / ignored
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000731
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000883
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_source_replay_lifetime.py", line 33, in <module>
+    runpy.run_path(str(test), run_name='__main__')
+  File "/usr/lib/python3.10/runpy.py", line 289, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/usr/lib/python3.10/runpy.py", line 96, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/bench/workspace/python/tests/test_source_vjp_merge.py", line 141, in <module>
+    main('--process' in sys.argv or arg.startswith('cuda'), arg.split(','))
+  File "/bench/workspace/python/tests/test_source_vjp_merge.py", line 127, in main
+    if processes: assert runs['batch']['requests'] < runs['both']['requests'], (runs['batch']['requests'], runs['both']['requests'])
+AssertionError: (8, 8)
+[W1027 12:00:12.643022067 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+
+GATE v3-6eacc63-replay-vjp-merge-numerical EXIT 1
+
+EXIT 1

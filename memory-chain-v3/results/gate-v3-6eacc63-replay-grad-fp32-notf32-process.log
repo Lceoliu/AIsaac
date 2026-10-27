@@ -1,0 +1,5 @@
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000368
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000824
+{"baseline": {"mode": "stored", "micro": 8192, "horizon": 0, "bf16": false, "processes": true, "updates": [1, 2, 3, 4], "audit": 0.0, "cached_graph_outputs": 0, "encoded_rows": 193, "value_encoder_batches": 25, "replayed_rows": 0, "replay_encoder_batches": 0, "replay_writer_batches": 0, "seconds": 5.6277}, "modified": {"mode": "replay", "micro": 8192, "horizon": 0, "bf16": false, "processes": true, "updates": [1, 2, 3, 4], "audit": 0.0, "cached_graph_outputs": 0, "encoded_rows": 193, "value_encoder_batches": 4, "replayed_rows": 481, "replay_encoder_batches": 10, "replay_writer_batches": 10, "seconds": 4.5933}, "logits_max_abs": 2.384185791015625e-07, "gradients_max_abs": 1.885928213596344e-08, "gradients_relative_l2": 4.49107034228291e-07, "weights_max_abs": 5.960464477539063e-08}
+PASS: cross-room/versioned VJP parity; value-only cache; unchanged reuse; micro=8192
+[W1027 12:05:27.511832227 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]

@@ -1662,3 +1662,50 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 - 候选仓库：master = 66d9521，a-chain = 1c4fc72（两者 `bridge/python` 逐字节相同）；计时链工作树在 `temp/memory-chain-v3/wt-a`。
 - 3090 上的 tar：`rhythmo@10.19.131.132:~/isaac-abplus/archive-memory-chain-v3/memory-chain-v3-20261027-0425.tar.gz`，245,977,559 字节，sha256 `1aec59df144c29bccec776fafbc243b882796ddfa8cede64a14058d9abceb56d`（远端核对一致；不含计时链工作树 `wt-a`，其提交都在 `candidate/.git` 里；第一次 scp 断开后重传覆盖同名不完整文件）。更早的四个 tar 未动。
 - 主机：暂停时确认没有我们的容器，也没有我们的残留进程。表 9 的等待脚本已停，表 9 未启动。
+
+## 23 GPT 的 replay-v1 验证（`--source-replay 1` 配合源卡；发起会话 10-27 的步骤 1–5）
+
+### 23.1 提交（候选仓库新分支 `replay-v1`，工作树 `temp/memory-chain-v3/wt-replay`；主线 master 未动）
+
+| 提交 | 内容 |
+|---|---|
+| 6e49896 | GPT 的补丁原样（`five-replay/DIFF_FILE.patch`，打在 66d9521 上，`core.autocrlf=false`）。文档那一块对 LF 检出打不上，改为从 `five-replay/candidate` 取 `docs/TEMPORAL_ATTENTION.md` 并转成 LF，内容与补丁一致。另外 6 个文件与 `five-replay/candidate` 逐字节相同。 |
+| 6eacc63 | 三条保护：replay=1 时强制关闭 `--source-layer-checkpoint`、`--source-checkpoint-blocks`、`--source-saved-8bit`，忽略 `--source-vjp-merge`、`--source-streams`，并打印说明；`horizon_stats` 新增 `source_replay_raw_bytes`（源进程为 replay 保留的原始行 + pending 字节，实测每帧 22,896 字节）；新测试 `tests/test_source_replay_guards.py`（线程、进程）；`tests/test_source_replay.py` 加 `--device/--sources/--flash/--compile/--grad-threshold`，供 CUDA 门测用。 |
+| 9e9cf04 | VJP 剖析行里记下这次 VJP 的 replay 批次（编码器 / Writer 批数、重算行数），只做测量。 |
+
+- CPU 回归（76 个测试）：除新增的 `test_source_replay`、`test_source_replay_guards` 通过外与上一轮相同。`test_source_replay_lifetime` 是包装器，需要传测试名，单独运行时按设计报参数缺失。
+- **H=0 与 v2 逐位等价（replay 关）**：本地与进程两种模式都逐位相同（replay1）。
+
+### 23.2 门测（6eacc63，门测 GPU 用物理卡 1、4、5，因为 GPU3 当时被别人占用）
+
+**replay 关时的现有门测**：horizon-cuda、horizon-bound、vjp-merge-cuda、attention-timing、actor-cuda、v2-cuda-suite2 全部通过。
+
+**replay 对 stored 的源梯度一致性**（`tests/test_source_replay.py --mode compare`，6 局、4 次源更新、变长 token、晚到分支，micro 8192）：
+
+| 门 | 设置 | 源梯度相对 L2 | logits 最大差 | 门限 | 结果 |
+|---|---|---|---|---|---|
+| replay-grad-fp32-notf32 | FP32，关 TF32，线程 | **4.2e-7** | 4.8e-7 | 1e-6 | 通过 |
+| replay-grad-fp32-notf32-process | 同上，源进程 | **4.5e-7** | 2.4e-7 | 1e-6 | 通过 |
+| replay-grad-fp32 | FP32，默认（cuDNN 卷积用 TF32） | 3.2e-5 | 2.2e-6 | 1e-6 | 未通过（TF32 不是 FP32 运算；关 TF32 后通过） |
+| replay-grad-fp32-process | 同上，源进程 | 3.2e-5 | — | 1e-6 | 同上 |
+| **replay-grad-bf16** | 生产设置：BF16、flash、编译 | **8.4e-3** | 1.6e-3 | 2e-2 | 通过 |
+
+- BF16 门限按 §19.6 的 BF16 噪声底（BF16 对 FP32 的相对 L2 约 1.2e-2）定为 2e-2。**这是 BF16 级别的一致，不是 1e-6 等价**：replay 重新分批以后，BF16 的归约次序不同。
+- 所有门测和用例里，审计 `source_horizon_dropped_grad` 都是 0。
+
+**现有门测在 replay=1 下**（用 `test_source_replay_lifetime.py` 包装器强制 replay；严格版失败时再跑数值版 rtol 1e-6）：
+
+| 门 | 严格 | 数值 | 说明 |
+|---|---|---|---|
+| source-process | 通过 | — | |
+| horizon-cuda | 失败 | 失败 | 断言 `u.grad_fn is not None`：检查的是保留图本身，replay 设计上没有长寿命图，不适用 |
+| horizon-bound | 失败 | 失败 | 断言保留的带图帧数等于 T；replay 恒为 0，不适用 |
+| source-pipeline、source-precision | 失败 | 失败 | 对保留的 u 调 `retain_grad()`；replay 的 u 没有梯度，不适用 |
+| vjp-merge | 失败 | 失败 | 梯度比较都通过；失败在"批量 RPC 请求数少于不批量"这一条，replay 下所有变体都强制批量，不适用 |
+
+- CPU 上用同一包装器跑保留与迟到记录的用例：
+  - grace（线程、进程）、pending_horizon、pending_release、reach_intervals、raw_release 严格通过；
+  - inflight_branch、record_query 只有数值版通过（Reader 输出不再逐位相同，rtol 1e-6 内）；
+  - record_retention 不适用（也是 `retain_grad`）。
+  - 审计全为 0，与 GPT 的 CPU 结果一致。
+- 判断：凡是检验梯度或审计的门都通过；失败的都是检查保留图内部结构的断言，replay 下不适用。等价性的结论是"FP32 在 1e-6 内（关 TF32），BF16 在噪声底内"。

@@ -1,0 +1,1 @@
+{"result": "PASS", "processes": false, "max_param_diff": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "held_frames_A": [0, 8, 8, 16, 16, 16, 16, 8], "held_frames_R": [0, 8, 16, 24, 32, 40, 48, 56]}

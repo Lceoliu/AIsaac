@@ -1,0 +1,35 @@
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000631
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000914
+[source] replay=1: --source-vjp-merge forced off / ignored
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000631
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000945
+[source] replay=1: --source-vjp-merge forced off / ignored
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000687
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000667
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000680
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000803
+[source] replay=1: --source-vjp-merge forced off / ignored
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000641
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000609
+[source] replay=1: --source-vjp-merge forced off / ignored
+HOST_HEAP_TRIM role=source-cuda:2 seconds=0.000649
+HOST_HEAP_TRIM role=source-cuda:1 seconds=0.000890
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_source_replay_lifetime.py", line 33, in <module>
+    runpy.run_path(str(test), run_name='__main__')
+  File "/usr/lib/python3.10/runpy.py", line 289, in run_path
+    return _run_module_code(code, init_globals, run_name,
+  File "/usr/lib/python3.10/runpy.py", line 96, in _run_module_code
+    _run_code(code, mod_globals, init_globals,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/bench/workspace/python/tests/test_source_vjp_merge.py", line 141, in <module>
+    main('--process' in sys.argv or arg.startswith('cuda'), arg.split(','))
+  File "/bench/workspace/python/tests/test_source_vjp_merge.py", line 127, in main
+    if processes: assert runs['batch']['requests'] < runs['both']['requests'], (runs['batch']['requests'], runs['both']['requests'])
+AssertionError: (8, 8)
+[W1027 11:59:26.745105001 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]
+
+GATE v3-6eacc63-replay-vjp-merge EXIT 1
+
+EXIT 1
