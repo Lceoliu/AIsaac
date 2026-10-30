@@ -1958,3 +1958,29 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 - **回归**（CPU）：`test_temporal_smoke`、`test_rebuild_memory_smoke`、`test_learner_device_smoke`、`test_no_gru_smoke` 全部退出码 0。
 - **还没验证**：图 actor（CUDA）的 `t_m` 写入路径和双 actor 合并，放到第 4 天的 CUDA 门测。
 - **备份**：rl 分支 `exp/memory-chain-v3-truncated` = dfc7a02，`exp/memory-chain-v3` = dc89a42，均已推送。3090 上新增 `~/isaac-abplus/archive-memory-chain-v3/memory-chain-v3-20261030-0859.tar.gz`，386,645,221 字节，sha256 `1e19a721d504dba5bd6e461f87412637c201dc6f88894ad954da6c8dbdb26a9f`，远端 `sha256sum -c` 和 `gzip -t` 都通过，旧 tar 未动。tar 不含 `wt-*` 工作树，它们的提交在 `candidate/.git` 里。tar 比上一份大，主要是目录里的 `five-replay`（553 MB 未压缩）。
+
+### 26.2 N3 + N4 + N7（提交 8f90f40）
+
+- **`TruncatedBatch`**（`isaac_bridge/truncated_memory.py`）：
+  - 每次更新，每个 worker 的整个 rollout 为一个块，行序与 `all_flat` 相同。rollout 前的 u 和 Writer token 只取一次，为 float32 常数。
+  - `part(workers)` 为若干整块建 Reader 布局：每段局（rollout 内开新局时分段）一个组。bank 依次是零项、携带 u、本部分决策的 u、携带 token、新块 token。因果掩码与 actor 相同：最近 W 帧，加上当前块之前已闭合的块。
+- **`TruncatedPart.forward`**：
+  1. Spatial 带梯度；两种布局都支持，紧凑布局用 `pad_compact` 补齐给 fusion。
+  2. rollout 内闭合的块带梯度重算 Writer。跨边界块是混合输入：rollout 前的帧为常数，rollout 内的帧带梯度。
+  3. Reader 和各个头。
+  4. 部分之后的行：旧教师记录走无上下文路径（只有零项）。v2/CF 记录用 `record_constants` 得到常数上下文。这是 M1 的近似：用当前权重从原始历史无梯度重编码，M2 换成车道算好的值。
+- **N4**：value 重算由 `bounds(micro)` 按整块切分，无梯度前向。
+- **N7 审计**：`constants()` 列出所有常数，用于统计 `memory_constant_grad_count`（必须为 0）。`window()` 给出每个决策的有效梯度窗口，用于算均值。
+- **测试**（`tests/test_truncated_batch.py`，CPU FP32，3 个 worker、40 步、4 个 rollout，退出码 0）：
+
+| 项 | 结果 |
+|---|---|
+| 1. actor 逐步 = 学习器批量（单部分、逐块、`bounds(8)` 分部分、紧凑布局） | 最大误差 4.77e-7（紧凑布局 3.28e-7），门限 1e-5 |
+| 2. 未来帧不泄漏 | 12 次检查，逐位相同；改动确实改变了未来输出 |
+| 3. 梯度窗口 | 直接读 10 个 worker 有梯度；经 Writer 到 rollout 首帧 10 个，其中跨边界块 6 个；Writer 参数有梯度；常数不需要梯度、也没有梯度，`memory_constant_grad_count` = 0 |
+| 窗口 | 每个决策都在 [0, n) 内，4 个 rollout 的均值 4.2–5.2（rollout 只有 11–13 步） |
+| 6. 部分之后的记录 | 2 条教师记录等于无上下文 forward；30 条 v2 记录等于源路径 SourceBatch |
+| 不一致数 | 0 |
+
+- **变异检查**：把携带的 Writer token 或 rollout 前的 u 置零后，测试 1 分别以误差 0.106 和 0.102 失败，说明测试能抓到常数错误。
+- 回归：测试 4 再跑一次仍然通过。
