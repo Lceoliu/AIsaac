@@ -1317,6 +1317,8 @@ class TokPolicy(nn.Module):
         if self.rebuild_memory:
             if temporal is not None and temporal.get('source_batch') is not None:
                 return temporal['source_batch'].forward(temporal['source_indices'], need_h, need_vg)
+            if temporal is not None and temporal.get('truncated') is not None:   # (truncated_memory.TruncatedPart)
+                return temporal['truncated'].forward(self, b, need_h, need_vg)
             if temporal is not None and temporal['mode'] == 'step':
                 return temporal['state'].rebuild.forward(self, b, temporal, need_h, need_vg)
             if temporal is not None:
