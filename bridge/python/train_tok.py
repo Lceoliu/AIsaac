@@ -510,7 +510,7 @@ def merge_rollouts(full, parts, mirror, device):
     view.raw_rooms = [r for _, s, _ in parts for r in s['raw_rooms']] if s0.get('raw_rooms') is not None else None
     view.raw_contexts = [r for _, s, _ in parts for r in s['raw_contexts']] if s0.get('raw_contexts') is not None else None
     if parts[0][2] is None:
-        view.t_kv = None
+        view.t_kv = view.t_m = None
         return view, 0
     P, R = s0['tP'], s0['tR']
     view.tP, view.tR = P, R
@@ -521,11 +521,17 @@ def merge_rollouts(full, parts, mirror, device):
     c_off = np.concatenate([[0], np.cumsum(obase)[:-1]]).astype(np.int64)
     obase_m = int(sum(obase))
     o_off = obase_m + kv_off
-    kv0, o0 = parts[0][2]
+    kv0, o0 = parts[0][2][:2]
+    trunc = len(parts[0][2]) > 2   # (truncated memory training: the source values t_s and Writer tokens t_m too)
     kv_shape = (int(sum(rows)),) + tuple(kv0.shape[1:])
     o_shape = (obase_m + int(sum(rows)),) + tuple(o0.shape[1:])
     dev = torch.device(device)
-    for name, shape, dt in (('kv', kv_shape, kv0.dtype), ('o', o_shape, o0.dtype)):
+    shapes = [('kv', kv_shape, kv0.dtype), ('o', o_shape, o0.dtype)]
+    if trunc:
+        s0_, m0_ = parts[0][2][2:]
+        shapes += [('s', (kv_shape[0],) + tuple(s0_.shape[1:]), s0_.dtype),
+                   ('m', (kv_shape[0],) + tuple(m0_.shape[1:]), m0_.dtype)]
+    for name, shape, dt in shapes:
         m = mirror.get(name)
         if m is None or tuple(m.shape) != shape or m.dtype != dt or m.device != dev:
             mirror[name] = None
@@ -533,9 +539,14 @@ def merge_rollouts(full, parts, mirror, device):
     kv_m, o_m = mirror['kv'], mirror['o']
     t_row, rooms_src = full['t_row'].copy(), full['rooms_src'].copy()
     nbytes = 0
-    for a, (lo, s, (kv, o)) in enumerate(parts):
+    for a, (lo, s, tens) in enumerate(parts):
+        kv, o = tens[:2]
         u, ob, ko, co, oo = used[a], obase[a], int(kv_off[a]), int(c_off[a]), int(o_off[a])
         kv_m[ko:ko + u].copy_(kv[:u], non_blocking=True)
+        if trunc:
+            mirror['s'][ko:ko + u].copy_(tens[2][:u], non_blocking=True)
+            mirror['m'][ko:ko + u].copy_(tens[3][:u], non_blocking=True)
+            nbytes += u * (tens[2][0].numel() * tens[2].element_size() + tens[3][0].numel() * tens[3].element_size())
         o_m[co:co + ob].copy_(o[:ob], non_blocking=True)
         o_m[oo:oo + u].copy_(o[ob:ob + u], non_blocking=True)
         nbytes += u * kv[0].numel() * kv.element_size() + (ob + u) * o[0].numel() * o.element_size()
@@ -546,6 +557,9 @@ def merge_rollouts(full, parts, mirror, device):
         rooms_src[lo:hi] = np.where(rs < ob, rs + co, rs - ob + oo)
     view.t_row, view.rooms_src = t_row, rooms_src
     view.t_kv, view.t_o, view.t_s = kv_m, o_m, None
+    view.t_m = None
+    if trunc:
+        view.t_s, view.t_m = mirror['s'], mirror['m']
     view.t_obase = obase_m
     view.t_pool = int(sum(rows)) - n_total * P - 1
     view.t_used = int(sum(s['t_used'] for _, s, _ in parts))
@@ -616,6 +630,14 @@ def rollout_scalars(roll):
     return {k: v for k, v in vars(roll).items() if not isinstance(v, (np.ndarray, torch.Tensor))}
 
 
+def rollout_tdev(roll):
+    """The rollout's device tensors the learner process receives through CUDA IPC: (t_kv, t_o), and with truncated
+    memory training (t_m) also (t_s, t_m); None without the temporal pool."""
+    if roll.t_kv is None:
+        return None
+    return (roll.t_kv, roll.t_o) + ((roll.t_s, roll.t_m) if roll.t_m is not None else ())
+
+
 def rollout_view(arrays, scalars, tensors):
     """(B38 step 2, the learner process) a Rollout over shared host arrays, the actor's scalars and its device tensors
     (t_kv, t_o, received through CUDA IPC; t_s is not shared: the learner never reads it)."""
@@ -624,6 +646,9 @@ def rollout_view(arrays, scalars, tensors):
     r.__dict__.update(scalars)
     if tensors is not None:
         r.t_kv, r.t_o, r.t_s = tensors[0], tensors[1], None
+        r.t_m = None
+        if len(tensors) > 2:   # (truncated memory training: the source values and Writer tokens)
+            r.t_s, r.t_m = tensors[2], tensors[3]
     return r
 
 
@@ -653,6 +678,7 @@ class Rollout:
         self.raw_rooms = [[] for _ in range(workers)] if temporal and temporal.get('raw_rooms') else None
         self.raw_contexts = [[None] * capacity for _ in range(workers)] if temporal and temporal.get('rebuild_memory') else None
         self.t_kv = None   # (B30)
+        self.t_m = None    # (truncated memory training)
         if temporal:
             import torch
             P, L, D, R = (int(temporal[k]) for k in ('P', 'L', 'D', 'R'))
@@ -663,7 +689,11 @@ class Rollout:
             self.t_obase = workers * R
             rows = workers * P + self.t_pool + 1
             self.t_kv = torch.zeros((rows, L, 2, D), dtype=kdt, device=dev)
-            self.t_s = torch.zeros((rows, D), dtype=kdt, device=dev)
+            # (--memory-train truncated: t_s holds the actor's source value u of each decision exactly (float32), t_m
+            # the Writer tokens [tokens, D] of the memory block a decision closes; the learner reads both as constants)
+            self.t_s = torch.zeros((rows, D), dtype=torch.float32 if temporal.get('truncated') else kdt, device=dev)
+            if temporal.get('truncated'):
+                self.t_m = torch.zeros((rows, int(temporal['tokens']), D), dtype=torch.float32, device=dev)
             self.t_o = torch.zeros((self.t_obase + rows, D), device=dev)
             self.t_row = full((workers, P + capacity), -1, np.int64)
             self.t_row[:, :P] = np.arange(workers)[:, None] * P + np.arange(P)[None]
@@ -727,8 +757,10 @@ class Rollout:
         extra = max(int(need), self.t_pool // 4, 64)
         keep = self.n * self.tP + self.t_used
         rows = self.n * self.tP + self.t_pool + extra + 1
-        for name, base in (('t_kv', 0), ('t_s', 0), ('t_o', self.t_obase)):
+        for name, base in (('t_kv', 0), ('t_s', 0), ('t_o', self.t_obase), ('t_m', 0)):
             old = getattr(self, name)
+            if old is None:
+                continue
             new = torch.zeros((base + rows,) + tuple(old.shape[1:]), dtype=old.dtype, device=old.device)
             new[:base + keep] = old[:base + keep]
             setattr(self, name, new)
@@ -759,7 +791,8 @@ class Rollout:
     def t_dest(self, a_idx):
         """(B31) GraphActor.submit's tdest for the next decisions of workers a_idx: this rollout's device tensors and
         the records' rows."""
-        return dict(kv=self.t_kv, s=self.t_s, o=self.t_o, obase=self.t_obase, rows=self.t_assign(a_idx))
+        return dict(kv=self.t_kv, s=self.t_s, o=self.t_o, obase=self.t_obase, rows=self.t_assign(a_idx),
+                    **(dict(m=self.t_m) if self.t_m is not None else {}))
 
     def carry(self, other):
         """Start this (empty) rollout with the other's open decisions (their rewards are still to come)."""
@@ -815,6 +848,8 @@ class Rollout:
             di = torch.from_numpy(dst).to(dev)
             self.t_kv.index_copy_(0, di, other.t_kv.index_select(0, si).to(self.t_kv.dtype))
             self.t_s.index_copy_(0, di, other.t_s.index_select(0, si).to(self.t_s.dtype))
+            if self.t_m is not None:   # (truncated: the open decision's closed block, read after the next update)
+                self.t_m.index_copy_(0, di, other.t_m.index_select(0, si))
             self.t_o.index_copy_(0, di + self.t_obase, other.t_o.index_select(0, si + other.t_obase))
             o_src, o_dst = np.concatenate(o_src), np.concatenate(o_dst)
             if len(o_src):
@@ -1050,6 +1085,9 @@ def store_temporal(roll, a_idx, kk, rows, t):
         roll.t_kv.index_copy_(0, r_, t['kv'].to(roll.t_kv.device, roll.t_kv.dtype))
         roll.t_s.index_copy_(0, r_, t['s'].to(roll.t_s.device, roll.t_s.dtype))
         roll.t_o.index_copy_(0, r_ + roll.t_obase, t['o'].to(roll.t_o.device, roll.t_o.dtype))
+        if roll.t_m is not None and t.get('mclosed') is not None and t['mclosed'].any():
+            j_ = torch_from(np.flatnonzero(t['mclosed']), roll.t_m.device)
+            roll.t_m.index_copy_(0, r_.index_select(0, j_), t['mtok'].to(roll.t_m.device, roll.t_m.dtype).index_select(0, j_))
     roll.t_ep[a_idx, at] = ep
     roll.t_step[a_idx, at] = t['steps']
     roll.t_rc[a_idx, at] = t['create']
@@ -1097,7 +1135,9 @@ def mirror_temporal(roll, mirror, device):
     import torch
     k = roll.n * roll.tP + roll.t_used
     nbytes = 0
-    for name, base in (('t_kv', 0), ('t_o', roll.t_obase)):
+    # (truncated memory training: the source values t_s and Writer tokens t_m too, the learner's constants)
+    names = (('t_kv', 0), ('t_o', roll.t_obase)) + ((('t_s', 0), ('t_m', 0)) if roll.t_m is not None else ())
+    for name, base in names:
         src = getattr(roll, name)
         dst = mirror.get(name)
         if dst is None or dst.shape != src.shape or dst.dtype != src.dtype or dst.device != torch.device(device):
@@ -1107,6 +1147,8 @@ def mirror_temporal(roll, mirror, device):
         nbytes += (base + k) * src[0].numel() * src.element_size()
     view = copy_mod.copy(roll)
     view.t_kv, view.t_o, view.t_s = mirror['t_kv'], mirror['t_o'], None
+    if roll.t_m is not None:
+        view.t_s, view.t_m = mirror['t_s'], mirror['t_m']
     return view, nbytes
 
 
@@ -1760,6 +1802,11 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--memory-horizon', type=int, default=2048,
                    help='source gradient horizon in decisions per episode: a loss reaches source frames/Writer blocks at '
                         'most this many decisions older; older graphs become detached values (reads unchanged); 0 unbounded')
+    p.add_argument('--memory-train', default='source', choices=('source', 'truncated'),
+                   help='rebuild-memory training (2026-10-30): source = the source path (SourcePipeline / SourceBatch '
+                        'over whole episodes); truncated = losses reach only the current rollout frames and Writer blocks '
+                        'of each worker, older source values and Writer tokens are constants (the actor values) '
+                        '(stop-gradient), carried across rollouts (isaac_bridge/truncated_memory.py)')
     p.add_argument('--source-update-steps', type=int, default=4,
                    help='Reader steps per source update; 0 accumulates the complete rollout and updates once at its end')
     p.add_argument('--source-overlap-rollout',type=int,choices=(0,1),default=0,
@@ -2356,7 +2403,11 @@ def main(argv=None, child=None, actor=None):
     capacity = args.rollout // args.workers * 4 + 64   # (per worker: the same in the actor and learner processes)
     # (B30; B31: the per-decision K / V, s and o on the device, a pool of --rollout + 4 x workers rows: a rollout ends
     # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
-    t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
+    trunc_on = bool(args.rebuild_memory) and args.memory_train == 'truncated'
+    # (truncated: P = the Reader's whole recent window before a rollout, the actor's source values exact, the Writer
+    # tokens of closed blocks per decision)
+    t_cfg = dict(P=args.temporal_window - (0 if trunc_on else 1), truncated=trunc_on, tokens=args.memory_tokens,
+                 L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
                  kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64, raw_rooms=bool(args.room_memory), rebuild_memory=bool(args.rebuild_memory)) if t_on else None
     shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
     #                                                                                   learner maps)
@@ -4353,7 +4404,9 @@ def main(argv=None, child=None, actor=None):
                         v = views[job['bid']]
                         v.__dict__.update(job['rscal'])
                         if job.get('tdev') is not None:   # (the actor's pool grew: its new device tensors)
-                            v.t_kv, v.t_o = job['tdev']
+                            v.t_kv, v.t_o = job['tdev'][:2]
+                            if len(job['tdev']) > 2:
+                                v.t_s, v.t_m = job['tdev'][2:]
                         job['roll'] = v
                     job['lq_s'] = t_recv - job['t_put']
                     sampler.stats = job['stats']
@@ -4469,7 +4522,7 @@ def main(argv=None, child=None, actor=None):
         for bid, r_ in enumerate((roll, spare)):
             r_.bid = bid
             sent_gen[bid] = getattr(r_, 't_grown', 0)
-        jobs.put(('actor', aid, wmove['fa'], {r_.bid: (r_.t_kv, r_.t_o) if r_.t_kv is not None else None
+        jobs.put(('actor', aid, wmove['fa'], {r_.bid: rollout_tdev(r_)
                                              for r_ in (roll, spare)},
                   {r_.bid: rollout_scalars(r_) for r_ in (roll, spare)}))
         learner = types.SimpleNamespace(   # (the learner as this actor sees it: alive while the first actor is)
@@ -4487,10 +4540,10 @@ def main(argv=None, child=None, actor=None):
             if n_act > 1:   # (B38 step 5: the arrays of all workers; the first actor's scalars and tensors)
                 rolls_init[bid] = dict(full=shared_full.describe(types.SimpleNamespace(**full_rolls[bid])),
                                        scal=rollout_scalars(r_),
-                                       tdev=(r_.t_kv, r_.t_o) if r_.t_kv is not None else None)
+                                       tdev=rollout_tdev(r_))
             else:
                 rolls_init[bid] = dict(arrays=shared.describe(r_), scal=rollout_scalars(r_),
-                                       tdev=(r_.t_kv, r_.t_o) if r_.t_kv is not None else None)
+                                       tdev=rollout_tdev(r_))
             sent_gen[bid] = getattr(r_, 't_grown', 0)
         others = [dict(results=mpc.Queue(), fresh=mpc.Event()) for _ in range(n_act - 1)]
         stop_b = mpc.Event() if n_act > 1 else None
@@ -4888,7 +4941,7 @@ def main(argv=None, child=None, actor=None):
             if proc:   # B38 step 2: what the learner process needs of this rollout (its arrays are shared)
                 job['roll'], job['bid'], job['rscal'] = None, roll.bid, rollout_scalars(roll)
                 if t_on and roll.t_grown != sent_gen[roll.bid]:   # (the pool grew: its new device tensors)
-                    job['tdev'] = (roll.t_kv, roll.t_o)
+                    job['tdev'] = rollout_tdev(roll)
                     sent_gen[roll.bid] = roll.t_grown
                 job['stats'], job['lane_stat'] = sampler.stats.copy(), dict(lane_stat)
                 job['take_s'], job['actor_mem'] = L.get('take_s', 0.0), torch.cuda.max_memory_reserved(device)

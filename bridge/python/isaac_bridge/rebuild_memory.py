@@ -1172,18 +1172,20 @@ class ActorMemory:
                          yg=y[:,-1]+rd.read_g(o)+rd.fusion_g(c),need_vg=need_vg)
         stamp=actor_part('reader_heads',stamp)
         frame_kv=torch.stack([layer.kv(u+rd.position(qt,u.dtype)) for layer in rd.layers],1)
-        closed=[]
+        closed=[];closed_i=[]
+        mtok=u.new_zeros((n,rd.tokens,rd.D))
         for i,s in enumerate(slots):
             self.raw[s]=self.raw[s].append(rows[i],pending[i],rd.block)
             self.recent[s]=u[i:i+1] if self.recent[s] is None else torch.cat([self.recent[s],u[i:i+1]])[-rd.W:]
             self.recent_kv[s]=frame_kv[i:i+1] if self.recent_kv[s] is None else torch.cat([self.recent_kv[s],frame_kv[i:i+1]])[-rd.W:]
             self.tail[s].append(u[i])
-            if len(self.tail[s])==rd.block:closed.append(int(s))
+            if len(self.tail[s])==rd.block:closed.append(int(s));closed_i.append(i)
         if closed:
             memories=rd.write(torch.stack([torch.stack(self.tail[s]) for s in closed]))
             times=torch.as_tensor([self.raw[s].length-1 for s in closed],device=u.device).repeat_interleave(rd.tokens)
             mkv=torch.stack([layer.kv(memories.flatten(0,1)+rd.position(times,u.dtype)) for layer in rd.layers],1)
             mkv=mkv.reshape(len(closed),rd.tokens,len(rd.layers),2*rd.D)
+            mtok[torch.as_tensor(closed_i,device=u.device)]=memories.to(mtok.dtype)
             for i,s in enumerate(closed):
                 self.mem[s]=memories[i] if self.mem[s] is None else torch.cat([self.mem[s],memories[i]])
                 self.memory_kv[s]=mkv[i] if self.memory_kv[s] is None else torch.cat([self.memory_kv[s],mkv[i]])
@@ -1197,7 +1199,9 @@ class ActorMemory:
         temporal['out']=dict(create=torch.zeros(n,dtype=torch.bool,device=u.device),
                             nroom=torch.zeros(n,dtype=torch.long,device=u.device),steps=qt+1,
                             stage_prev=stage,kv=u.new_zeros((n,state.L,2,state.D)),s=u,o=o,
-                            raw_contexts=prefixes)
+                            raw_contexts=prefixes,
+                            # (truncated training: the Writer tokens of the blocks these records close)
+                            mtok=mtok,mclosed=np.isin(np.arange(n),closed_i))
         if self.fast is not None:self.fast.load(self,slots)
         actor_part('temporal_out',stamp)
         return outs

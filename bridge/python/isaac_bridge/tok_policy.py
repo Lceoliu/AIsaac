@@ -923,8 +923,11 @@ def temporal_out(info):
     dtype, o [n, D] float32): store writes them into the rollout's device tensors (no copy to the host)."""
     c = torch.stack([info['create'].long(), info['nroom'].long(), info['steps'].long(), info['stage_prev'].long()],
                     1).cpu().numpy()
+    # (rebuild memory, 'mtok' present: s as computed, the rollout casts it to its own dtype; else the state's dtype)
     return dict(create=c[:, 0] != 0, nroom=c[:, 1], steps=c[:, 2], stage_prev=c[:, 3], kv=info['kv'].detach(),
-                s=info['s'].detach().to(info['kv'].dtype), o=info['o'].detach().float(),
+                s=info['s'].detach() if 'mtok' in info else info['s'].detach().to(info['kv'].dtype),
+                o=info['o'].detach().float(),
+                **(dict(mtok=info['mtok'].detach(), mclosed=info['mclosed']) if 'mtok' in info else {}),
                 **(dict(room_visits=info['room_visits']) if 'room_visits' in info else {}),
                 **(dict(raw_contexts=info['raw_contexts']) if 'raw_contexts' in info else {}))
 

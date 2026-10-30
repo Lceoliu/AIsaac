@@ -144,8 +144,9 @@ class RebuildGraphActor:
         self.raw=torch.zeros_like(self.stage,device=dev)
         # slot, length and each component's (missing row, destination, gather).
         # (+ rows 17, 18: the slots and decision indices of the records whose call closes a memory block;
-        # row 19: the records' rollout rows, tdest; row 20: the call's rows with common random numbers)
-        self.control_h=torch.zeros((21,n),dtype=torch.long,pin_memory=True)
+        # row 19: the records' rollout rows, tdest; row 20: the call's rows with common random numbers;
+        # row 21: the rollout rows of the records whose call closes a block, for tdest['m'] (truncated training))
+        self.control_h=torch.zeros((22,n),dtype=torch.long,pin_memory=True)
         self.control=torch.zeros_like(self.control_h,device=dev)
         self.uniform_h=torch.zeros((n,sum(model.heads)),pin_memory=True)
         self.uniform=torch.zeros_like(self.uniform_h,device=dev)
@@ -346,6 +347,7 @@ class RebuildGraphActor:
             wm=next((w for w in self.wsizes if w>=len(closed)),None) if len(closed) else None
             if wm:
                 ctl[17,:len(closed)]=slots[closed];ctl[18,:len(closed)]=times[closed]
+                if tdest is not None and tdest.get('m') is not None:ctl[21,:len(closed)]=tdest['rows'][closed]
                 ctl[17,len(closed):wm]=slots[closed[0]];ctl[18,len(closed):wm]=times[closed[0]]
             # Common random numbers only for branch records (ROW crn != 0), fresh uniforms for every other record,
             # as GraphActor (2026-10-25: crn_uniforms(0, t) for all records gave every worker at decision t the
@@ -395,6 +397,11 @@ class RebuildGraphActor:
                 self.u_dtype=u.dtype   # (the eager code's position dtype)
                 if wm not in self.writer_graphs:self.writer_graphs[wm]=self._capture(lambda:self._writer_run(wm))
                 self.writer_graphs[wm][0].replay()
+                if tdest is not None and tdest.get('m') is not None:
+                    # (truncated training) the closed blocks' Writer tokens, exactly the ring state's values, into
+                    # the rollout rows of the decisions that closed them: the learner's constants after this rollout
+                    k=len(closed)
+                    tdest['m'].index_copy_(0,self.control[21,:k],self.writer_graphs[wm][1][0][:k].to(tdest['m'].dtype))
             stamp=actor_part('graph_append_writer',stamp)
             ap.mark('tdest')
             self.t_out=dict(create=np.zeros(n,bool),nroom=np.zeros(n,np.int64),steps=times+1,
