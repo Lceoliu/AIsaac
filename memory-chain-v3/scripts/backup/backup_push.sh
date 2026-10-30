@@ -12,6 +12,8 @@ git merge-base --is-ancestor exp/memory-chain-v3-timing memory-chain-v3-candidat
 git branch -f exp/memory-chain-v3-timing memory-chain-v3-candidate/a-chain
 git branch -f exp/memory-chain-v3-replay memory-chain-v3-candidate/replay-v1 2>/dev/null || git branch exp/memory-chain-v3-replay memory-chain-v3-candidate/replay-v1
 git branch --unset-upstream exp/memory-chain-v3-replay 2>/dev/null || true
+git branch -f exp/memory-chain-v3-truncated memory-chain-v3-candidate/truncated-v1 2>/dev/null || git branch exp/memory-chain-v3-truncated memory-chain-v3-candidate/truncated-v1
+git branch --unset-upstream exp/memory-chain-v3-truncated 2>/dev/null || true
 git branch --unset-upstream exp/memory-chain-v3-timing 2>/dev/null || true
 git worktree add -q $W exp/memory-chain-v3
 cd $W
@@ -28,6 +30,6 @@ git log --oneline -3
 cd D:/Projects/fortune/Isaac/rl
 git worktree remove $W
 git remote remove memory-chain-v3-candidate
-timeout 600 git push origin exp/memory-chain-v3 exp/memory-chain-v3-timing exp/memory-chain-v3-replay 2>&1 | tail -3
+timeout 600 git push origin exp/memory-chain-v3 exp/memory-chain-v3-timing exp/memory-chain-v3-replay exp/memory-chain-v3-truncated 2>&1 | tail -3
 git ls-remote origin "refs/heads/exp/memory-chain-v3*"
 git branch --show-current; git status --short | wc -l

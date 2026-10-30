@@ -1937,3 +1937,23 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 5. **之后（M2，约 2.5–3 天）**：v2/CF 的 value 日志、延迟线索窗口内版本、5 卡布局、删除源路径代码。
 
 每一步完成后推送备份，生产版本不替换，新开关默认关。
+
+## 26 实施 M1：rollout 内截断梯度（候选仓库分支 `truncated-v1`，工作树 `temp/memory-chain-v3/wt-trunc`；主线 master 未动）
+
+新开关 `--memory-train truncated`，默认 `source`，默认下行为不变。
+
+### 26.1 N1 + N2（提交 dfc7a02）
+
+- **rollout 带上 actor 的常数**：
+  - `t_s` 改为 float32，逐位保存 actor 写进环的 u。
+  - 新增 `t_m [rows, tokens, D]`：某个决策闭合一个块时，存下 actor 算出的 Writer token。
+  - 携带的上下文行数 P = W = 256（原来是 W − 1，因为 Reader 读的是当前帧之前的 256 帧）。
+  - 图 actor 通过 control 第 21 行写 `t_m`，eager actor 通过 `mtok` / `mclosed` 写。`Rollout.carry` 把未结束决策的 `t_m` 一起带过去。
+- **交到学习器**：IPC 张量（`rollout_tdev`）、学习器镜像（`mirror_temporal`）、双 actor 合并（`merge_rollouts`）都带上 `t_s` / `t_m`。
+- **`isaac_bridge/truncated_memory.py`**：
+  - `LearnerCarry`：每个 worker 当前局在下一个 rollout 之前已闭合块的 token，由 rollout 自身累积；只延续 rollout 里的最后一局。
+  - `worker_context`：携带行里的 rollout 前 u。
+  - 两者都计不一致数（`mismatch`），必须为 0。
+- **测试 4**（`tests/test_truncated_carry.py`，CPU，eager actor）：3 个 worker、40 步、含两次中途开新局、3 次交接。学习器重建的 rollout 前 u 和 Writer token，与 actor 在该决策时刻的状态**逐位相同**，9 个上下文全部一致，mismatch 0，退出码 0。
+- **回归**（CPU）：`test_temporal_smoke`、`test_rebuild_memory_smoke`、`test_learner_device_smoke`、`test_no_gru_smoke` 全部退出码 0。
+- **还没验证**：图 actor（CUDA）的 `t_m` 写入路径和双 actor 合并，放到第 4 天的 CUDA 门测。
