@@ -1832,3 +1832,108 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 ### 24.5 备份
 
 - 见本节提交后的 `exp/memory-chain-v3`（报告至 §24、`results/cprofile-2c918a6.md`、两次运行的小结果文件）和 `exp/memory-chain-v3-replay` = 2c918a6。3090：`~/isaac-abplus/archive-memory-chain-v3/memory-chain-v3-20261027-0741.tar.gz`，257,417,663 字节，sha256 `81be994724772c6c8eef81019882319cfe8fcb01f4e567df1456ac76a7716c4d`。远端 `sha256sum -c`、`gzip -t`、`tar -tzf` 都通过，共 8,417 个条目，包含 §23、§24、`candidate/.git` 里的 `replay-v1` 分支（2c918a6）以及 r11p/r11s 的小结果文件。和以前一样不含 `wt-a`、`wt-replay` 两个工作树，旧 tar 都保留。tar 里的 REPORT 还是写这一句之前的版本。
+
+## 25 估算：改为 rollout 内截断梯度（用户 10-30 决定；只做估算，不改代码）
+
+本节的依据是读候选主线 66d9521 的代码，以及 §15、§17、§24 的实测数。所有时间和工作日都是估计，没有新的测量。
+
+### 25.1 设计落到代码上的样子
+
+- **推理不变**：actor 的 `ActorMemory` / `TensorActorMemory` 照旧维护每个槽的 `recent`（最近 256 帧 u）和 `mem`（已完成块的 4 个 token），Reader 读整局记忆。
+- **训练（新）**：学习器把每个 worker 的 512 个决策当作一个块，相当于把旧架构的 `memory_chunks` / `temporal_bounds` 的 T 从 256 改成 512。一个 minibatch 8192 行等于 16 个 worker 的完整 rollout，按 micro 8192 一次处理。块内：
+  1. Spatial `encode_rebuild` 带梯度编码 512 帧，得到 u、y、pad。这和旧架构学习器的 Spatial 前向加反传是同一份工作量。
+  2. Writer 对所有在本 rollout 内闭合的块带梯度重算。跨边界块的输入是 [rollout 前的 u 常数 | rollout 内带梯度的 u]，所以 rollout 内的那部分帧也能收到 Writer 梯度。
+  3. 每个决策的 Reader bank = [零向量, 最近 256 帧（rollout 前为常数，rollout 内带梯度）, 已闭合块（rollout 前闭合的为常数，rollout 内闭合的带梯度）]。用 `grouped_layout` 做法，每个 worker 一个共享 bank，按决策加因果掩码。
+  4. 接 PPO 损失。
+- **常数从哪来**：actor 每个决策随 rollout 回传本帧 u（D=256，bf16 512 B），块闭合时再回传 4 个 mem token。学习器从 rollout 流里自己维护每个 worker 的携带状态（滚动 256 帧 u、本局全部 mem、本局帧号），遇到 `first` 就清零。
+  - 旧架构有先例：它已经用 CUDA IPC 回传每个决策的 `t_kv` / `t_o`。
+  - 回传量约 16 MB/rollout，现有原始行回传是 750 MB/rollout，可以忽略。
+  - 这样 rollout 前的常数和 actor 当时读到的值逐位相同。
+- **位置与对齐**：位置编码用本局帧号，现在由 actor 的 `h.length` 给出，学习器从携带的帧号加块内偏移得到。块按本局帧号的 64 对齐，和 rollout 边界无关，所以一般会有一个跨边界块。
+
+### 25.2 代码范围与工作日
+
+**退出主路径**（首个里程碑只把它们断开，不删文件；删除放到 M2，降低回归风险）：
+- `source_pipeline.py`（1453 行）、`source_worker.py`（485 行）、`source_replay.py`（只在 replay-v1 上）
+- `SourceBatch` 的 pipeline 分支与 `JoinedSources` / `SourceView`
+- `HorizonAttention` 的 `grad_valid` 路径、`retain_histories` / `horizon_frontiers`、版本化图、detach / 宽限期
+- `RecordLedger` 的可达区间规则、学习器侧的规则 5 原始字节释放
+- `--source-*` 一族开关（均衡、merge、fused、streams、encode-batch、replay、MPS）
+- `train_tok` 里等源和交接的分段（`u_rc_sources` 等）
+
+**保留**：
+- `TokPolicy.encode_rebuild`（Spatial 与组件去重）、`MemoryReader`（Writer/Reader 模块不变）
+- actor 侧全部：`RebuildActor`、`ActorMemory` / `TensorActorMemory`、CRN 修正、A1/A2/A4/A1b 优化
+- teacher v2 / CF 的车道与记录机制、PPO / CF / 教师损失、rollout 存储、`memory_chunks` / `temporal_bounds`
+
+| # | 新写或改动 | 内容 | 工作日 |
+|---|---|---|---|
+| N1 | actor 回传 u/mem | 两个 actor 进程，含 `TensorActorMemory` 快路径；块闭合时附带 mem；车道（v2/CF）同样回传 | 1.0–1.5 |
+| N2 | 学习器携带状态 | 每个 worker 的滚动 256 帧 u、本局 mem、帧号；`first` 清零；`--resume` 时各局从头开始，所以不进 checkpoint | 0.5 |
+| N3 | rollout 内批量前向与反传（`TruncatedBatch`） | 512 帧块计划；Spatial 带梯度；Writer 含跨边界块；grouped bank 与因果掩码；块内开新局 | 2.0–2.5 |
+| N4 | 学习器起点的 value 重算 | `--recompute-values` 改用 N3 的无梯度前向 | 0.5 |
+| N5 | 记录批（教师 / v2 / CF） | 旧教师记录本来就是空历史（`teach_contexts` = `RawHistory.empty()`），不用改。v2/CF 记录：M1 先用学习器无梯度重编码它们的原始上下文得到常数（复用 `SourceBatch` 非 pipeline 路径加 `no_grad`，只在被采样时付费）；M2 换成每局的 value 日志（u 每帧 512 B + mem 每帧 32 B，按 uid 共享前缀，CF 分支在分叉点共享），由车道回传 | M1 0.5，M2 1.5–2 |
+| N6 | `train_tok` 主路径切换 | 新开关（如 `--memory-train truncated`），不构造 SourcePipeline；progress.csv 换成新统计；退出码与守护不变 | 1.0 |
+| N7 | 审计 | "窗口外梯度恒为 0"：常数在构造时就不带梯度；测试里用 hook 断言常数的 grad 是 None，窗口内的源 grad 非零 | 0.5 |
+| N8 | 测试（见 25.3） | CPU 全套与 CUDA 门测 | 2.0 |
+| N9 | 部署与长跑 | 短跑一次，40 次稳态长跑一次 | 1.0 |
+| M2 | 清理 | 删除源路径代码与开关，旧测试归档 | 1.0 |
+
+合计：M1（到首组 40 次长跑）约 **9–10 个工作日的工作量**。按下面 25.6 的顺序压缩并行，日历上约 **5 天**，前提是不出现大的意外。M2 再加 2.5–3 天。
+
+### 25.3 语义与验收
+
+**有效梯度窗口**：设 k 为决策距本 rollout 起点的步数；如果本局在 rollout 内开始，则取距本局起点的步数。
+- 新做法：k ∈ [0, 511]。局长大于 rollout 时 k 均匀分布，均值约 256；局短于 512 时均值更小。
+  - 直接读的 256 帧里，有 min(k, 256) 帧带梯度。
+  - 经 Writer，rollout 内闭合的块（含跨边界块 rollout 内的部分）带梯度，最远约 k 帧。
+- 旧架构（843×，`--temporal-bptt 256`，`memory_chunks`）：每个 worker 按 256 切块，块前的 K/V 和 o 是 actor 存的常数，所以 k ∈ [0, 255]，均值约 128。
+- 结论：新做法平均梯度距离约为旧架构的 2 倍，最远 511 对 255。rollout 前的帧照样可读，只是没有梯度。
+
+**必须通过的测试**：
+1. **actor 与学习器一致**：同一参数、同一历史，跨至少 3 个 rollout，覆盖块内开新局、块恰好在 rollout 起点闭合、跨边界块、256 窗口跨 rollout 边界。学习器批量输出与 actor 逐步输出：FP32（关 TF32）≤1e-6，BF16 在噪声底内。这一项替代原来的"H=0 与 v2 逐位等价"。
+2. **未来帧不泄漏**：改动 t' > t 的帧，t 的输出逐位不变。
+3. **窗口外梯度恒为 0**：rollout 前的常数梯度为 None 或 0；窗口内的帧和跨边界块的 rollout 内部分，梯度非零。生产上的审计从 `source_horizon_dropped_grad` 改成"常数带梯度的个数 = 0"。
+4. **携带状态正确**：学习器从 rollout 流重建的每个 worker 状态，与 actor 在 rollout 起点的 `ActorMemory` 逐位相同。
+5. **记录**：v2/CF 记录的 bank 与产生它的车道在记录时刻的 bank 一致。M1 的重编码常数用当前参数算，只能做到 FP 容差，要单独说明。
+6. **延迟线索测试的窗口内版本**：线索距离 d < 512 时能学会，并区分直接读和 Writer 两条路；d 超出 rollout 起点时，读得到但梯度为 0。
+7. 原有测试中与源路径无关的部分全部重跑，并补 CUDA 门测。
+
+**H=0 等价不再适用**：新做法的前向（rollout 前的常数来自 actor 当时的参数）和梯度（截断）都和 v2 不同，所以不再以 v2 为参照，改用第 1 项"actor 与学习器一致"。
+
+### 25.4 吞吐估算（尚未测量）
+
+每次更新约 4,100–4,400 游戏秒（843.4×5.22 s、337×12.2 s 两种算法）。
+
+| 学习器分段（s/次更新） | 旧架构实测（§15） | 新做法估算 | 依据 |
+|---|---|---|---|
+| value 重算 | 0.90 | 1.1–1.3 | 加一遍 Reader 无梯度前向：约 Reader 2.6 s ÷ 3 epoch ÷ 前反约 3 倍 |
+| PPO（Spatial 前反 + 时序 + 头） | 2.93 | 4.6–5.1 | 去掉旧时序 transformer（0.5–1.0，没有单独测过），加 Reader 前反 2.63（§15 的 v3 实测 GPU 流时间） |
+| Writer 重算与反传 | — | 0.1–0.2 | 每个 minibatch 128 块，计算量很小，主要是 launch |
+| 记录批 | 0.32 | 0.4–0.6 | 记录自己的帧带梯度，bank 是常数；v2 被采样时加重编码 |
+| gae / batch / opt / tail | 0.48 | 0.5 | |
+| **合计** | **4.56** | **约 6.7–7.7** | |
+
+- 显存：Spatial 激活按 micro 8192 分批，与旧架构学习器相同（旧架构 3 卡运行的 gpu_reserved 15.5 GB）。Reader 的 bank 已经在 v3 学习器上跑过。估计单卡 24 GB 够用。
+- 主机内存：学习器不再持有历史原始行（22.8 KB/帧），改为 value 日志（约 0.5 KB/帧），§9–§14 的主机内存问题大部分消失。
+- **3 卡布局**（学习器 1 卡，actor 2 卡）：采集 7.3 s（现上限），学习器 6.7–7.7 s，并行重叠。墙钟约 7.3–7.9 s，即约 **520–600×**。
+- **5 卡布局**：多出的 2 卡给 actor（每卡一个 actor 进程）。§17.4 显示 actor 已开始受 GPU 限制，采集可能降到约 6–7 s，但学习器还是单卡 6.7–7.7 s，墙钟约 6.7–7.7 s，即约 **530–660×**。要再往上，需要学习器多卡数据并行（另估约 2 天）或把记录批移到第二张卡，不在 M1 范围内。
+- 以上都是估计。M1 的短跑会先给出实测拆分，再决定 5 卡怎么分配。
+
+### 25.5 风险
+
+1. **rollout 边界效应**：rollout 起点附近的决策梯度窗口接近 0。这和旧架构每 256 帧的块起点一样，是截断的固有性质。跨边界块：按 25.1 的混合输入重算，rollout 内部分有梯度。另一种做法是把它整体当常数，更简单但丢掉一部分梯度，默认不用。帧号和块号差 1 的错误由测试 1、4 覆盖。
+2. **常数的版本**：rollout 前的 u/mem 是 actor 当时的参数算的，长局里可能落后很多次更新。这和 v3 里 horizon 外的语义、旧架构的 K/V 常数一样。Reader 的 K/V 仍按当前权重投影（与 actor 的 refresh 相同）。
+3. **记录批**：去掉源路径后，v2/CF 记录需要历史常数。M1 用学习器无梯度重编码。按 §18.10，测速窗口里 v2 几乎不被采样，所以对测速影响小，但被采样时会有尖峰（长上下文的 Spatial 前向）。M2 改为 value 日志后消失。CF 分支的前缀共享在 value 日志里需要 fork 语义（RawHistory 已有先例）。
+4. **显存**：rollout 内全部帧的 Spatial 激活按 micro 8192 分批，与旧架构相同；Reader 每个 worker 一个 bank，最多 256 + 512 帧加 mem token。估计风险低，M1 短跑会确认。
+5. **训练效果未知**：梯度从"rollout 外 horizon 1024"缩到"rollout 内 0–511"，对学习的影响要由长跑和评测决定，这里不做结论。
+
+### 25.6 实施顺序与里程碑（预计 3–5 天出首组 40 次长跑）
+
+1. **第 1 天**：N1 + N2 + 测试 4（携带状态逐位一致），CPU。
+2. **第 2–3 天**：N3 + N4 + 测试 1、2、3（CPU）。N7 审计同时完成。
+3. **第 4 天**：N6 主路径切换，N5 的 M1 版本（v2 重编码），CPU 全套回归，CUDA 门测（只用空闲卡，遵守原有的 GPU 规则）。
+4. **第 5 天**：3 卡 25 游戏小时短跑（拆分学习器各段，核对 25.4），然后 40 次稳态长跑，报 x_real_time 与游戏小时、审计、显存、容器内存。
+5. **之后（M2，约 2.5–3 天）**：v2/CF 的 value 日志、延迟线索窗口内版本、5 卡布局、删除源路径代码。
+
+每一步完成后推送备份，生产版本不替换，新开关默认关。
