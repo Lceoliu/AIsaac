@@ -443,6 +443,7 @@ def fast_plan_rows(fr, raw, pend, lo, hi, fparts, n_buckets, n_item_tok, glob_to
     got[0] = got[0].view(-1, plan['rec'].shape[1])
     mb_.update(zip(hn[2:], got[2:len(hn)]))
     tok = plan_tokens(plan, got[0], got[1])
+    mb_['_rec'] = plan['rec']   # (the host plan's [counts, starts]: truncated memory pads the compact encode)
     pnames = ['keep', 'starts']
     if 'ekeep' in fparts:
         pnames.append('ekeep')
@@ -2031,6 +2032,10 @@ def main(argv=None, child=None, actor=None):
             p.error('--room-memory requires temporal and positive --room-source-micro')
         tok_kw['room_memory'] = True
     T_t = int(args.temporal_bptt)
+    trunc_on = bool(args.rebuild_memory) and args.memory_train == 'truncated'
+    if trunc_on and (args.source_devices or not args.teach_merge or args.branch_share > 0 or args.room_memory):
+        p.error('--memory-train truncated: no --source-devices (the source path is off), --teach-merge 1, '
+                'no branch episodes, no room memory')
     # (B32: the learner's decisions in chunks: the GRU's (memory), the temporal ones (temporal; with memory the GRU
     # chunks nest inside), or none)
     chunked = mem_on or t_on
@@ -2403,12 +2408,11 @@ def main(argv=None, child=None, actor=None):
     capacity = args.rollout // args.workers * 4 + 64   # (per worker: the same in the actor and learner processes)
     # (B30; B31: the per-decision K / V, s and o on the device, a pool of --rollout + 4 x workers rows: a rollout ends
     # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
-    trunc_on = bool(args.rebuild_memory) and args.memory_train == 'truncated'
     # (truncated: P = the Reader's whole recent window before a rollout, the actor's source values exact, the Writer
     # tokens of closed blocks per decision)
     t_cfg = dict(P=args.temporal_window - (0 if trunc_on else 1), truncated=trunc_on, tokens=args.memory_tokens,
                  L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
-                 kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64, raw_rooms=bool(args.room_memory), rebuild_memory=bool(args.rebuild_memory)) if t_on else None
+                 kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64, raw_rooms=bool(args.room_memory), rebuild_memory=bool(args.rebuild_memory) and not trunc_on) if t_on else None
     shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
@@ -2672,7 +2676,7 @@ def main(argv=None, child=None, actor=None):
         if args.rebuild_memory and PROFILE_MEMORY:
             MEMORY_TIMES.clear(); MEMORY_COUNTS.clear()
         U = dict.fromkeys(('rc_prep', 'rc_sources', 'recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
-                          (('temporal',) if t_on else ()), 0.0)   # seconds per part of the update (u_* columns)
+                          (('temporal',) if t_on else ()) + (('trunc_plan',) if trunc_on else ()), 0.0)   # seconds per part of the update (u_* columns)
         if t_on and getattr(job['roll'], 't_kv', None) is None:
             raise RuntimeError('--temporal 1: the rollout has no temporal arrays (a bench job of a run without it?)')
         mark = [t0]
@@ -2744,6 +2748,19 @@ def main(argv=None, child=None, actor=None):
             mark[0] = t0
         all_flat = (np.arange(n)[:, None] * capacity + np.arange(capacity)[None, :])[
             np.arange(capacity)[None, :] < lengths[:, None]]
+        trunc = None
+        if trunc_on and len(all_flat):   # (truncated memory: this update's plan and constants, then the carry)
+            from isaac_bridge.truncated_memory import LearnerCarry, TruncatedBatch, record_constants
+            if 'carry' not in L:
+                L['carry'] = LearnerCarry(n, args.memory_block, args.memory_tokens, args.temporal_width, device)
+            with torch.no_grad():
+                trunc = TruncatedBatch(learner_model, rl, L['carry'], device)
+            L['carry'].advance(rl)
+            L['trunc_mismatch'] = L.get('trunc_mismatch', 0) + trunc.mismatch
+            pr_ = os.environ.get('ISAAC_TRUNC_PROFILE')   # (measurement 'first:count': the PPO parts' CUDA events)
+            if pr_ and int(pr_.split(':')[0]) <= L['update'] < sum(int(x_) for x_ in pr_.split(':')):
+                trunc.prof = []
+            sec('trunc_plan')
         if source_pipeline is not None:
             all_requests = rollout_requests(rl, all_flat)
             retire_after_ready=source_pipeline.defer_backward
@@ -2838,7 +2855,7 @@ def main(argv=None, child=None, actor=None):
                                                dtype=torch.uint8).pin_memory()
                 every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
                                                       stage=L['stage_r'], with_raw=True)
-                fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on)
+                fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on and not trunc_on)
             else:
                 every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
@@ -2850,12 +2867,14 @@ def main(argv=None, child=None, actor=None):
 
             current_sources = None
             if source_pipeline is not None:current_sources=resident_sources
-            if args.rebuild_memory and source_pipeline is None:
+            if args.rebuild_memory and source_pipeline is None and not trunc_on:
                 with torch.inference_mode(), autocast():
                     current_sources = SourceBatch(learner_model, rollout_requests(rl, all_flat),
                                                   args.room_source_micro, cache=False)
 
-            def tk_all(part_):
+            def tk_all(part_, ws_=None):
+                if trunc is not None:   # (truncated memory: the chunks of the workers ws_)
+                    return dict(temporal=dict(truncated=trunc.part(ws_)))
                 if current_sources is not None:
                     return dict(temporal=dict(source_batch=current_sources,
                                 source_indices=part_))
@@ -2865,15 +2884,17 @@ def main(argv=None, child=None, actor=None):
             m_r = pmark('b38:recompute')
             with torch.inference_mode():
                 chunk = args.micro or args.minibatch
-                for at in range(0, len(all_flat), chunk):
-                    part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
-                    b_p = fast_plan_rows(fr_, raw_e, pend_e, at, min(at + chunk, len(all_flat)), fparts, n_buckets,
-                                         NI_f, G_f, t_on) if fast2 else None
+                ranges_ = trunc.bounds(chunk) if trunc is not None else \
+                    [(a_, min(a_ + chunk, len(all_flat)), None) for a_ in range(0, len(all_flat), chunk)]
+                for at, hi_r, ws_r in ranges_:
+                    part = torch.arange(at, hi_r, device=device)
+                    b_p = fast_plan_rows(fr_, raw_e, pend_e, at, hi_r, fparts, n_buckets,
+                                         NI_f, G_f, t_on and not trunc_on) if fast2 else None
                     if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
                         b_p = take(every, part) if b_p is None else b_p
                         with autocast():
                             o_ = lm_call(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
-                                               need_vg=True, **tk_all(part))
+                                               need_vg=True, **tk_all(part, ws_r))
                         lp_ = learner_model.log_prob(o_[0], learner_model.gate(b_p), acts_all[part])[0]
                         v_ = o_[1].float()
                         vgs.append(o_[-1].float())
@@ -2882,7 +2903,7 @@ def main(argv=None, child=None, actor=None):
                             lp_, _, v_, _ = learner_model.evaluate(take(every, part) if b_p is None else b_p,
                                                                    acts_all[part],
                                                                    packed=bool(args.packed),
-                                                                   mem=h_all[part] if mem_on else None, **tk_all(part))
+                                                                   mem=h_all[part] if mem_on else None, **tk_all(part, ws_r))
                     vals.append(v_)
                     lps.append(lp_)
             if recompute:
@@ -2899,6 +2920,14 @@ def main(argv=None, child=None, actor=None):
             del adv_g
         elif gtok_on and len(all_flat):   # 2026-10-12 (B22): value_global of every stored decision, for its returns
             vg_now = np.zeros_like(rl.value)
+            if not vgs and trunc is not None:   # (truncated memory: whole worker chunks)
+                with torch.inference_mode():
+                    for lo_r, hi_r, ws_r in trunc.bounds(args.micro or args.minibatch):
+                        idx_ = all_flat[lo_r:hi_r]
+                        with autocast():
+                            o_ = learner_model(rows_to_device(rl.rows, idx_, rl.pending.reshape(-1, nh)[idx_], device),
+                                               need_vg=True, temporal=dict(truncated=trunc.part(ws_r)))
+                        vgs.append(o_[-1].float())
             if not vgs:   # (no recompute pass: one of its own, a chunk of records at a time)
                 with torch.inference_mode():
                     chunk = args.micro or args.minibatch
@@ -2939,7 +2968,7 @@ def main(argv=None, child=None, actor=None):
         if chunked:   # 2026-10-11 (memory): every worker's decisions in chunks of T_mem (memory_chunks), chunk-major
             # (B30 temporal: chunks of T_t decisions per worker, each padded to whole GRU chunks of T_mem; B32 without
             # the GRU: the temporal chunks alone, unpadded)
-            mplan = temporal_chunks(rl.length, mask, T_t, T_mem if mem_on else None) if t_on else \
+            mplan = temporal_chunks(rl.length, mask, capacity if trunc_on else T_t, T_mem if mem_on else None) if t_on else \
                 memory_chunks(rl.length, mask, T_mem)
             flat, lw = mplan['pos'], mplan['weight']
             count = int(lw.sum())
@@ -3007,7 +3036,11 @@ def main(argv=None, child=None, actor=None):
                 b_h0 = torch.from_numpy(rl.h.reshape(-1, mem_dim)[mplan['start']]).to(device)
             ev_rows = torch.from_numpy(np.flatnonzero(lw > 0)).to(device)
         tch = TD = t_rows = has_h = None
-        if t_on:   # 2026-10-14 (B30): per temporal chunk its context, room tokens; per row its stored o_{t-1}, episode
+        if t_on and trunc_on:   # (truncated memory: one chunk per worker rollout; no stored temporal outputs)
+            tch = mplan['tch']
+            L['trunc_window'] = float(np.average(trunc.window()[np.searchsorted(all_flat, flat)], weights=lw)) \
+                if trunc is not None and lw.sum() > 0 else 0.0
+        elif t_on:   # 2026-10-14 (B30): per temporal chunk its context, room tokens; per row its stored o_{t-1}, episode
             # (B31: index plans only; the K / V and o stay on the device where the actor wrote them)
             t_t0 = time.perf_counter()
             tch = mplan['tch']
@@ -3419,6 +3452,8 @@ def main(argv=None, child=None, actor=None):
         n_units, mb_units = (mplan['chunks'], max(1, args.minibatch // T_mem)) if mem_on else (count, args.minibatch)
         if t_on:   # (B30) whole temporal chunks
             n_units, mb_units = len(tch), max(1, args.minibatch // T_t)
+            if trunc_on:   # (truncated memory: whole worker rollouts, about --minibatch decisions)
+                mb_units = max(1, args.minibatch // max(1, args.rollout // args.workers))
 
         def pmean(x, pm, pn):
             """The mean over a part's rows: x.mean() (as before), or (memory) over its trained rows only."""
@@ -3546,7 +3581,13 @@ def main(argv=None, child=None, actor=None):
                     v_share = args.teacher_v2_weight * v2_step / n_sel
                     sec('teach_build')
                 source_batch = None
-                if args.rebuild_memory:
+                v2_rec = None
+                if trunc_on and vb is not None:   # (M1, an approximation: re-encoded constant contexts)
+                    with torch.no_grad(), autocast():
+                        v2_rec = record_constants(learner_model, [(L['v2_contexts'][i_], L['v2_host_rows'][i_],
+                                                                   L['v2_host_pending'][i_]) for i_ in vpick],
+                                                  args.room_source_micro)
+                if args.rebuild_memory and not trunc_on:
                     requests = ([all_requests[i] for i in np.searchsorted(all_flat,flat[sel_h])]
                                 if source_pipeline is not None else rollout_requests(rl,flat[sel_h]))
                     teacher_start = len(requests)
@@ -3641,7 +3682,7 @@ def main(argv=None, child=None, actor=None):
                             ni_p = np.concatenate([ni_p, L['v2_cnt']['n_item'][vpick]])
                     if xplan:   # (B24: the real item tokens and the global token in the plans)
                         xplan['n_item'] = ni_p
-                    if t_on:   # (B31: the history token where a previous step exists; none for the teachers' records;
+                    if t_on and not trunc_on:   # (B31: the history token where a previous step exists; none for the teachers' records;
                         #         B34: teacher v2's / the cf's records from their lane's step)
                         xplan['hist'] = np.concatenate([has_h[part_h], np.zeros(len(ne_p) - len(part_h), bool)])
                         if vmerged:
@@ -3662,6 +3703,7 @@ def main(argv=None, child=None, actor=None):
                         got[0] = got[0].view(-1, plan['rec'].shape[1])
                         mb.update(zip(hn[2:], got[2:len(hn)]))
                         tok = plan_tokens(plan, got[0], got[1])
+                        mb['_rec'] = plan['rec']   # (truncated memory: pads the compact encode)
                         pnames = ['keep', 'starts']
                         if 'ekeep' in fparts:
                             pnames.append('ekeep')
@@ -3706,6 +3748,10 @@ def main(argv=None, child=None, actor=None):
                                         o=torch.cat([z_, L['v2_o'].index_select(0, vpick_d)]),
                                         m=torch.cat([torch.zeros(n_tb, device=device),
                                                      L['v2_m'].index_select(0, vpick_d)]))
+                            if trunc is not None:   # (truncated memory: the part's worker chunks, records after)
+                                tk_ = dict(temporal=dict(truncated=trunc.part(
+                                    tch[cids_, 2], n_teach=len(pick) if merged else 0,
+                                    records=v2_rec if vmerged else None)))
                             if source_batch is not None:
                                 source_ix = list(range(lo_, hi_))
                                 if merged:
@@ -3763,6 +3809,8 @@ def main(argv=None, child=None, actor=None):
                     # unmerged v2 teacher. Free them after the final consumer, before Adam.
                     loss.backward(retain_graph=bool(source_batch is not None and not source_batch.cached and
                                   (lo_ != last or (vb is not None and not args.teach_merge))))
+                    if trunc is not None and trunc.prof:   # (measurement: this part's backward ends here)
+                        trunc.mark('bwd_end')
                     if args.rebuild_memory:
                         memory_part('reader_loss_backward', backward_start)
                     m_ = pmark('b38:part_stats', m_)
@@ -4173,6 +4221,18 @@ def main(argv=None, child=None, actor=None):
                         f'{name}/seconds': sum(e['decisions'] for e in eps) / m * args.frames_per_decision / 30,
                         f'{name}/rooms': sum(e['rooms'] for e in eps) / m,
                         f'{name}/boss': sum(e['boss'] for e in eps) / m})
+        if trunc is not None and trunc.prof:   # (measurement: seconds per section over the PPO parts)
+            tp_ = trunc.profile()
+            print('TRUNC_PROFILE ' + json.dumps(dict(update=L['update'], **tp_)), flush=True)
+        if trunc_on:   # (truncated memory: the audit, the gradient window; the source path's columns 0 for old tables)
+            # (after the update's backward passes: no constant may require or have a gradient)
+            row.update(memory_constant_grad_count=sum(int(c_.requires_grad or c_.grad is not None)
+                                                      for c_ in trunc.constants()) if trunc is not None else 0,
+                       memory_grad_window_mean=L.get('trunc_window', 0.0),
+                       memory_carry_mismatch=L.get('trunc_mismatch', 0),
+                       **dict.fromkeys(('source_horizon', 'source_graph_frames', 'source_graph_frames_uid_max',
+                                        'source_graph_writes', 'source_detached_frames', 'source_detached_total',
+                                        'source_horizon_dropped_grad', 'source_alloc_gib_max'), 0))
         if source_pipeline is not None:   # retained source graphs: bounded by the gradient horizon
             row.update(source_pipeline.horizon_stats())
             row.update(dict(record_bytes=0, record_raw_bytes=0, record_value_bytes=0, record_own_frames=0,
@@ -4717,7 +4777,7 @@ def main(argv=None, child=None, actor=None):
         store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h, vg, t)
         pending[a_idx] = actions
         prof['store'] += time.perf_counter() - t3
-        if args.source_prefetch_records and proc:
+        if args.source_prefetch_records and proc and not trunc_on:
             mark_ = getattr(roll,'source_prefetch_mark',0)
             if roll.usable() - mark_ >= args.source_prefetch_records:
                 roll.source_prefetch_mark = roll.usable()
@@ -4958,7 +5018,7 @@ def main(argv=None, child=None, actor=None):
             book.branch_finished = []
             busy = True
             job['t_put'] = time.perf_counter()
-            if args.rebuild_memory and proc:
+            if args.rebuild_memory and proc and not trunc_on:   # (truncated memory: no raw contexts to send)
                 pack_start = time.perf_counter()
                 job['rscal']['raw_contexts'] = pack_histories(job['rscal']['raw_contexts'],previous=sent_histories,shared=True)
                 if args.release_raw:

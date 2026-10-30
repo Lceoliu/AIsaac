@@ -157,6 +157,29 @@ class TruncatedBatch:
         self.pre_off = np.cumsum([0] + [m['m'] for m in self.meta])
         self.mem_off = np.cumsum([0] + [0 if m['mem'] is None else len(m['mem']) for m in self.meta])
         self.debug = None   # (tests: a dict that receives each part's in-graph tensors)
+        self.prof = None    # (measurement, train_tok ISAAC_TRUNC_PROFILE: a list receiving each part's CUDA events)
+
+    def mark(self, name):
+        """(measurement) a CUDA event on the current stream in the last part's record (e.g. the backward's end)."""
+        if self.prof:
+            e = torch.cuda.Event(enable_timing=True); e.record(); self.prof[-1][name] = e
+
+    def profile(self):
+        """(measurement) seconds per section summed over the profiled parts (synchronises): Spatial / Writer / Reader
+        (+ fusion and heads) forward, heads / Reader / Writer / Spatial backward."""
+        if not self.prof:
+            return {}
+        torch.cuda.synchronize()
+        order = [('spatial_fwd', 'start', 'spatial'), ('writer_fwd', 'spatial', 'writer'), ('reader_fwd', 'writer', 'end'),
+                 ('heads_bwd', 'end', 'g_o'), ('reader_bwd', 'g_o', 'g_src'), ('writer_bwd', 'g_src', 'g_U'),
+                 ('spatial_bwd', 'g_U', 'bwd_end')]
+        out = dict.fromkeys([k for k, _, _ in order], 0.0)
+        for rec in self.prof:
+            for k, a, b in order:
+                if a in rec and b in rec:
+                    out[k] += rec[a].elapsed_time(rec[b]) / 1000.0
+        out['parts'] = len(self.prof)
+        return out
 
     def constants(self):
         """The constant tensors (audit memory_constant_grad_count: none may require a gradient)."""
@@ -260,22 +283,41 @@ class TruncatedPart:
         rd = model.reader
         dev = next(model.parameters()).device
         B, W = self.batch.B, self.batch.W
+        prof = self.batch.prof is not None and torch.is_grad_enabled() and dev.type == 'cuda'
+        ev = {}
+
+        def mark(name):
+            if prof:
+                ev[name] = torch.cuda.Event(enable_timing=True); ev[name].record()
+
+        def hook(t, name):
+            if prof and t.requires_grad:
+                t.register_hook(lambda g: (mark(name), g)[1])
+        mark('start')
+        if b.get('xperm') is not None and b.get('glast') is not None:   # (the learner's fast compact plan)
+            b = dict(b, _source_packed=True, _source_compact=True)
+        elif b.get('keep') is not None:   # (a packed plan: padded back by the encode)
+            b = dict(b, _source_packed=True)
         y, pad, u = model.encode_rebuild(b)
         if pad is None:
             y, pad = pad_compact(y, b['_rec'])
         h = {k: torch.as_tensor(v, device=dev) for k, v in self.host.items()}
         n = self.n_main
         uf = u.float()
+        mark('spatial')
         outs_o = []
         if n:
             U = torch.cat([self.batch.const_u.index_select(0, h['pre_idx']), uf[:n]])
+            hook(U, 'g_U')
             if self.nb:
                 new = rd.write(U.index_select(0, h['block_idx'].reshape(-1)).reshape(-1, B, rd.D)).flatten(0, 1).float()
             else:
                 new = U.new_zeros((0, rd.D))
             M = torch.cat([self.batch.const_m.index_select(0, h['mem_idx']), new])
+            mark('writer')
             src = torch.cat([U.new_zeros((1, rd.D)), U + rd.position(h['u_t'], U.dtype),
                              M + rd.position(h['mem_t'], M.dtype)])
+            hook(src, 'g_src')
             kvs = [layer.kv(src).float() for layer in rd.layers]
             G, count = self.shape
             qt = h['qt'][:, :, None]
@@ -289,9 +331,14 @@ class TruncatedPart:
         if len(u) > n:
             outs_o.append(self._extra(model, uf[n:], dev))
         o = torch.cat(outs_o)
+        hook(o, 'g_o')
         c = rd.fuse(o, y, pad)
-        return model._heads(y[:, 0] + rd.read(o) + c, need_h,
-                            yg=y[:, -1] + rd.read_g(o) + rd.fusion_g(c), need_vg=need_vg)
+        out = model._heads(y[:, 0] + rd.read(o) + c, need_h,
+                           yg=y[:, -1] + rd.read_g(o) + rd.fusion_g(c), need_vg=need_vg)
+        mark('end')
+        if prof:
+            self.batch.prof.append(ev)
+        return out
 
     def _extra(self, model, ue, dev):
         rd = model.reader
