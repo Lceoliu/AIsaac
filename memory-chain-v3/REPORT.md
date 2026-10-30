@@ -1957,3 +1957,4 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 - **测试 4**（`tests/test_truncated_carry.py`，CPU，eager actor）：3 个 worker、40 步、含两次中途开新局、3 次交接。学习器重建的 rollout 前 u 和 Writer token，与 actor 在该决策时刻的状态**逐位相同**，9 个上下文全部一致，mismatch 0，退出码 0。
 - **回归**（CPU）：`test_temporal_smoke`、`test_rebuild_memory_smoke`、`test_learner_device_smoke`、`test_no_gru_smoke` 全部退出码 0。
 - **还没验证**：图 actor（CUDA）的 `t_m` 写入路径和双 actor 合并，放到第 4 天的 CUDA 门测。
+- **备份**：rl 分支 `exp/memory-chain-v3-truncated` = dfc7a02，`exp/memory-chain-v3` = dc89a42，均已推送。3090 上新增 `~/isaac-abplus/archive-memory-chain-v3/memory-chain-v3-20261030-0859.tar.gz`，386,645,221 字节，sha256 `1e19a721d504dba5bd6e461f87412637c201dc6f88894ad954da6c8dbdb26a9f`，远端 `sha256sum -c` 和 `gzip -t` 都通过，旧 tar 未动。tar 不含 `wt-*` 工作树，它们的提交在 `candidate/.git` 里。tar 比上一份大，主要是目录里的 `five-replay`（553 MB 未压缩）。
