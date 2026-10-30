@@ -32,6 +32,9 @@ FOUR = ('3,2,4,5', 'cuda:0,cuda:2,cuda:3')       # GPU1 taken: learner cuda:1, a
 FOUR1 = ('3,1,4,5', 'cuda:0,cuda:2,cuda:3')      # (2026-10-26: GPU2 taken by others) the same roles on GPU1
 FOUR1x2 = ('3,1,4,5', 'cuda:0,cuda:0,cuda:2,cuda:2,cuda:3,cuda:3')   # (2026-10-27) two source processes per source card
 FIVEx2 = ('3,2,1,4,5', 'cuda:0,cuda:0,cuda:2,cuda:2,cuda:3,cuda:3,cuda:4,cuda:4')   # (5 cards, two per source card)
+TRUNC3 = ('3,2,4', None)   # (truncated memory, 2026-10-30) learner cuda:1, actors cuda:0,2, no source cards
+TRUNC_EDITS = [[' --source-devices cuda:0,cuda:2,cuda:3,cuda:4 ', ' --memory-train truncated '],
+               [' --source-processes 1 ', ' '], [' --source-prefetch-records 8192 ', ' ']]
 SPILL0 = [' --source-saved-cpu-gb 0.75 ', ' --source-saved-cpu-gb 0 ']
 TRIMS = []   # a) SPILL0 dropped: every tp run with it hit CUDA OOM in source backward (updates 5-37); b) stays (QUIET)
 U1 = [' --source-update-rollouts 2 ', ' --source-update-rollouts 1 ']
@@ -185,6 +188,8 @@ RUNS = dict(h0=(0, 15.0, FIVE), h2048=(2048, None, FIVE), h1024=(1024, None, FIV
                                            ISAAC_ACTOR_TORCH_PROFILE_COUNT='1000'), TRIMS),
             timOld=(None, 22.0, ('3,2,4', None), dict(ISAAC_ACTOR_TORCH_PROFILE='RUNDIR/actorprof', ISAAC_ACTOR_TORCH_PROFILE_MODE='timers',
                                                       ISAAC_ACTOR_TORCH_PROFILE_COUNT='1000', _oldcode='oldprof-6'), []),
+            # truncated memory (2026-10-30): a functional smoke (about 5 updates) on the 3-card layout
+            trs=(1024, 6.0, TRUNC3, dict(QUIET, ISAAC_TIMELINE='1', ISAAC_TRUNC_PROFILE='3:2'), TRUNC_EDITS),
             acctCje=(2048, 24.0, FOUR, {'ISAAC_MEMORY_ACCOUNT': '1', 'ISAAC_RL_MEM_LOG': 'MEMLOG', 'ISAAC_RL_MEM_EVERY': '10',
                                         'LD_PRELOAD': '/bench/v3/lib/libjemalloc.so.2', 'ISAAC_GAME_ENV_STRIP': 'LD_PRELOAD'}, []))
 PYV = '/bench/home/isaac-abplus/.venv/bin/python -u '
@@ -338,6 +343,22 @@ def main():
                     numeric = shell.replace('tests/test_source_replay_lifetime.py ', 'tests/test_source_replay_lifetime.py --numerical ')
                     bench('gate', f'{TAG}-{name}-numerical', TAG, GATE_GPUS, 'nice -n 10 timeout 1800 bash -c ' + json.dumps(numeric),
                           log=f'gate-{TAG}-{name}-numerical-dispatch.log', check=False)
+        elif step == 'truncgates':   # (truncated memory, 2026-10-30) CPU tests on the host, the graph actor's values on CUDA
+            T_ = 'NVIDIA_TF32_OVERRIDE=0 ' + PYV + 'tests/test_truncated_actor_cuda.py '
+            gates = [('trunc-cpu', ' && '.join(PYV + 'tests/' + t for t in (
+                         'test_truncated_carry.py', 'test_truncated_batch.py', 'test_truncated_two_actors.py'))),
+                     ('trunc-actor-fp32', T_ + '--actors cuda:0 --learner cuda:0 --threshold 1e-6'),
+                     ('trunc-actor-fp32-x', T_ + '--actors cuda:0 --learner cuda:1 --threshold 1e-6'),
+                     ('trunc-actor-two', T_ + '--actors cuda:0,cuda:1 --learner cuda:2 --threshold 1e-6'),
+                     ('trunc-actor-bf16', PYV + 'tests/test_truncated_actor_cuda.py --bf16 --actors cuda:0 --learner cuda:1'),
+                     ('trunc-actor-bf16-two', PYV + 'tests/test_truncated_actor_cuda.py --bf16 --actors cuda:0,cuda:1 --learner cuda:2'),
+                     ('rebuild-actor', PYV + 'tests/test_rebuild_actor_cuda.py --compile'),
+                     ('actor-state', PYV + 'tests/test_rebuild_actor_state_cuda.py --compile')]
+            only = os.environ.get('V3_GATES')
+            for name, shell in gates:
+                if only and name not in only.split(','): continue
+                bench('gate', f'{TAG}-{name}', TAG, GATE_GPUS, 'nice -n 10 timeout 1800 bash -c ' + json.dumps(shell),
+                      log=f'gate-{TAG}-{name}-dispatch.log', check=False)
         elif step == 'actorgates':   # the actor's CUDA tests on TAG (graph/eager logits, state writes, profiler twin)
             gates = [('rebuild-actor', 'tests/test_rebuild_actor_cuda.py --compile'),
                      ('actor-state', 'tests/test_rebuild_actor_state_cuda.py --compile'),

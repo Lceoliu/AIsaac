@@ -1985,3 +1985,33 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 - **变异检查**：把携带的 Writer token 或 rollout 前的 u 置零后，测试 1 分别以误差 0.106 和 0.102 失败，说明测试能抓到常数错误。
 - 回归：测试 4 再跑一次仍然通过。
 - **备份**：rl 分支 `exp/memory-chain-v3-truncated` = 8f90f40，`exp/memory-chain-v3` = c1bf71f，均已推送。3090 上新增 `memory-chain-v3-20261030-0906.tar.gz`，386,731,173 字节，sha256 `0b9d4f537990f9765e4bd794693edf93d5b103beeeec32501b4586486642fe0b`，远端 `sha256sum -c` 和 `gzip -t` 都通过。
+
+### 26.3 N6 + N5：接入 train_tok 主路径（提交 1455191）
+
+- **开关与限制**：`--memory-train truncated`。不构造 SourcePipeline；同时给 `--source-devices` 直接报错。另外要求 `--teach-merge 1`，并且不能开分支局或房间记忆。
+- **每次更新**：
+  1. 用学习器的 rollout 视图建 `TruncatedBatch`，然后执行 `LearnerCarry.advance`，新增计时段 `u_trunc_plan`。
+  2. value 重算和 PPO 小批都按整个 worker rollout 切：每个 worker 一个块，一个小批约 `--minibatch` 个决策，也就是 16 个 worker。
+  3. 学习器计划带上主机端 rec，供 `pad_compact` 使用。在截断模式下，计划里不再加历史 token。
+- **记录批（N5，M1）**：
+  - 旧教师记录没有上下文。
+  - v2/CF 记录的常数上下文用 `record_constants` 得到：在被采样时，用当前权重从原始历史无梯度重编码。**这是近似**，M2 换成车道算好的值。
+  - v2 记录到达时的先验评估沿用非 pipeline 的 SourceBatch，同样是无梯度全量重编码。
+- **actor 侧**：rollout 不再保存原始上下文，也不再预发送（source prefetch）。
+- **风险**：交接时 rule 5 的原始字节释放依赖源路径，截断模式下不再执行。因此 actor 会保留在世局的原始字节，学习器的 v2 上下文也保留原始字节。主机内存要在短跑里盯住。
+- **progress.csv**：
+  - 新增 `memory_constant_grad_count`（每次更新所有反传之后统计，必须为 0）、`memory_grad_window_mean`（受训决策的有效梯度窗口均值）、`memory_carry_mismatch`（累计，必须为 0）。
+  - 原来的 `source_*` 列保留，全部填 0，便于和旧表对照。
+- **计量**：`ISAAC_TRUNC_PROFILE=first:count` 只做测量。在 PPO 各部分打 CUDA 事件，打印 `TRUNC_PROFILE` 行，分 Spatial / Writer / Reader 的前向，以及 heads / Reader / Writer / Spatial 的反向。短跑开在第 3–4 次更新。
+- **新测试**：
+  - `tests/test_truncated_two_actors.py`（CPU）：双 actor 的 `merge_rollouts`，以及单 actor 学习器进程用的 `mirror_temporal`。
+    - 合并视图上，18 个上下文的 u 和 Writer token 与各自 actor 的状态逐位相同。
+    - 8 个合并或镜像的 rollout 上，actor 与学习器的最大误差 2.53e-7；不一致数 0。
+  - `tests/test_truncated_actor_cuda.py`：图 actor 的 CUDA 门测，待在主机上跑。
+- **CPU 全套回归**（本机，tests 下 70 个非 CUDA 测试，在 N6 计量补丁之前跑）：
+  - 62 个退出码 0。
+  - 7 个失败都是环境原因：5 个需要 CUDA（`test_actor_d2h`、`test_actor_streams`、`test_saved_activation`、`test_saved_activation_compile`，以及因缺 gymnasium 而失败的 `test_actor_graph_pool`），2 个需要 `--job` / `--checkpoint` 参数（`test_source_component_parity`、`test_source_precision_checkpoint`）。
+  - `test_lineage_compact` 缺 PYTHONPATH，补上后通过。
+  - 计量补丁之后，三个截断测试重跑仍然通过。
+- **CUDA 门测**：链脚本 `scripts/chain_trunc_gates.sh`。等 GPU 3、4、5 空出来后跑 `truncgates`：主机上的 CPU 截断测试、图 actor FP32 关 TF32 的三种布局（同卡、跨卡、双 actor 跨卡）且门限 1e-6、BF16 单 actor 与双 actor、`test_rebuild_actor_cuda`、`test_rebuild_actor_state_cuda`。然后等 GPU 2、3、4 空出来，跑 3 卡功能冒烟 `trs`（6 游戏小时，约 5 次更新，双 actor 进程）。
+  - 截至写本节时（10-30 09:27），GPU 1–5 全被别人占用，链脚本按 10 分钟间隔等待，最长 12 小时。

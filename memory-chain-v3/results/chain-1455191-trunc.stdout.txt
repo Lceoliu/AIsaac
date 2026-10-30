@@ -1,0 +1,62 @@
++ cd D:/Projects/fortune/Isaac/temp/memory-chain-v3
++ python -X utf8 scripts/wait_then_run.py --allow 1,2 --hours 12 1455191 deploy truncgates
+ 16:27:33 up 18 days,  5:06, 11 users,  load average: 10.42, 12.53, 13.04
+               total        used        free      shared  buff/cache   available
+Mem:             125          33          25           0          68          92
+Swap:              7           1           6
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 336 MiB, 0 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 532 MiB, 7 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 2096 MiB, 97 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 464 MiB, 5 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 508 MiB, 7 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 576 MiB, 2 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6086 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12384 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 3999205, 326 MiB
+GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 2693329, 522 MiB
+GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 4002276, 2086 MiB
+GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1819403, 454 MiB
+GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 3310718, 498 MiB
+GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 2053343, 566 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3995642, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996203, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996192, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996197, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996201, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996205, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3995643, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996194, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996199, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996190, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996204, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996202, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996206, 526 MiB
+CONTAINERS
+mouse-r005-full-sam-v1 Up 25 minutes
+mouse-r004-full-features-v2 Up 2 hours
+mouse-r004-full-motion-v2 Up 2 hours
+mouse-lab-model-router Up 5 hours
+signbridge-api Up 5 hours
+signbridge-web Up 5 hours
+signbridge-funasr Up 5 hours (healthy)
+sl_service_proxy Up 5 hours
+signbridge-inference Up 5 hours
+signbridge-livekit Up 5 hours
+signbridge-redis Up 5 hours (healthy)
+woshica_docker Up 5 hours
+sl_dev Up 5 hours
+zhanghao_workspace Up 5 hours
+prometheus Up 5 hours
+nodeexporter Up 5 hours
+grafana Up 5 hours
+caddy Up 5 hours
+cadvisor Up 5 hours (healthy)
+pushgateway Up 5 hours
+alertmanager Up 5 hours
+service_base Up 5 hours
+
+EXIT 0
+ 
+[status] EXIT 0
+Fri Oct 30 09:27:33 2026 busy [1, 2, 3, 4, 5]
