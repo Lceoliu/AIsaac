@@ -1984,3 +1984,4 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 
 - **变异检查**：把携带的 Writer token 或 rollout 前的 u 置零后，测试 1 分别以误差 0.106 和 0.102 失败，说明测试能抓到常数错误。
 - 回归：测试 4 再跑一次仍然通过。
+- **备份**：rl 分支 `exp/memory-chain-v3-truncated` = 8f90f40，`exp/memory-chain-v3` = c1bf71f，均已推送。3090 上新增 `memory-chain-v3-20261030-0906.tar.gz`，386,731,173 字节，sha256 `0b9d4f537990f9765e4bd794693edf93d5b103beeeec32501b4586486642fe0b`，远端 `sha256sum -c` 和 `gzip -t` 都通过。
