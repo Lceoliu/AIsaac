@@ -37,6 +37,7 @@ PED_K = 8
 N_CLASS = 9
 PRIV_S = 6 + 3 * N_CLASS
 HP_SCALE = 50.0
+CNN_BUCKET = 64
 BOSS_SCALE = 500.0
 PRIV = np.dtype([('map', np.uint8, PRIV_MAP), ('map_ver', np.uint32), ('hp', np.float32, (NPC_K,)),
                  ('scal', np.float32, (PRIV_S,)), ('items', np.int16, (PED_K,)), ('missing', np.uint8)], align=True)
@@ -188,6 +189,8 @@ def make_critic(width, p_dim=128):
         def encode(self, b, idx):
             """p_t [n, p_dim] of records idx of a PrivBatch; the CNN on their distinct maps."""
             u, inv = torch.unique(b.ids.index_select(0, idx), return_inverse=True)
+            if u.shape[0] % CNN_BUCKET:   # (padded with copies, never gathered: cuDNN reuses its plans, as TokPolicy._cnn)
+                u = torch.cat([u, u[:1].expand(CNN_BUCKET - u.shape[0] % CNN_BUCKET)])
             m = self.map(b.maps.index_select(0, u).float()).index_select(0, inv)
             it = self.item(b.items.index_select(0, idx)).sum(1)
             r = self.rest(torch.cat([b.hp.index_select(0, idx), b.scal.index_select(0, idx), it,
