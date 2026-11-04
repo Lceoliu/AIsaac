@@ -157,6 +157,9 @@ def main():
     p.add_argument('--stub-list', default='')
     p.add_argument('--out', required=True)
     p.add_argument('--dump-final', action='store_true', help="save each episode's last record (final_rows.npy)")
+    p.add_argument('--dump-memory', default='',
+                   help='2026-11-04 (abplus_delay_probe.py): temporal checkpoints: per episode, in this directory, every '
+                        'decision\'s o_t (float16) and what its record showed (the delayed-cue probe\'s input)')
     p.add_argument('--record', default='', help='save every record of every episode (and the actions decided) to '
                                                 'this directory, one compressed npz per episode (tok_record.py)')
     p.add_argument('--characters', default='',
@@ -280,6 +283,14 @@ def main():
     room_moves = np.zeros((n, 2), np.int64)
     episodes = []
     finals = []
+    # 2026-11-04 (--dump-memory): per eval worker the episode's lists (o_t, the record's fields)
+    mem_dump = None
+    if args.dump_memory:
+        if t_state is None:
+            raise SystemExit('--dump-memory needs a temporal checkpoint')
+        from isaac_bridge.tok_aux import state_rows
+        Path(args.dump_memory).mkdir(parents=True, exist_ok=True)
+        mem_dump = [[] for _ in range(n)]
     t0 = time.perf_counter()
     try:
         while sampler.live:
@@ -297,6 +308,8 @@ def main():
                     char0[i] = int(r['pchar'])
                     room_now[i], room_before[i] = None, None
                     room_moves[i] = 0
+                    if mem_dump is not None:
+                        mem_dump[i] = []
                 m3_ = r['map'][3]
                 if m3_.any():   # (a floor under Curse of the Lost shows none: no moves counted there)
                     key_ = (int(r['stage']), int(m3_.argmax()))
@@ -326,6 +339,11 @@ def main():
                         episodes[-1]['char0'] = int(char0[i])
                     if recorder is not None:
                         recorder.finish(i, episodes[-1])
+                    if mem_dump is not None and mem_dump[i]:
+                        d_ = mem_dump[i]
+                        np.savez_compressed(Path(args.dump_memory) / f"ep-{int(r['seed'])}.npz",
+                                            o=np.stack([x[0] for x in d_]), **{k_: np.array([x[1][k_] for x in d_]) for k_ in d_[0][1]})
+                        mem_dump[i] = []
                     continue
                 act_idx.append(i)
                 act_rows.append(j)
@@ -336,6 +354,18 @@ def main():
                 else:   # (memory: the workers' GRU states; B30 temporal: their temporal slots)
                     actions = policy_actions(model, rows[act_rows], pending[act_idx], act_idx, device, args.greedy,
                                              mem_h, mem_reset, t_state)
+                if mem_dump is not None:
+                    o_d = t_state.prev_o.index_select(0, torch.tensor(act_idx, dtype=torch.int64, device=t_state.prev_o.device))
+                    o_d = o_d.float().cpu().numpy().astype(np.float16)
+                    rs_ = rows[act_rows]
+                    st_ = state_rows(rs_)
+                    for j, i in enumerate(act_idx):
+                        r_ = rs_[j]
+                        m_ = r_['map'][3]
+                        mem_dump[i].append((o_d[j], dict(
+                            state=st_[j], stage=int(r_['stage']), room=int(m_.argmax()) if m_.any() else 255, n_doors=int(r_['n_doors']),
+                            w=float(r_['player'][26]), h=float(r_['player'][27]), npc=float(st_[j, 10]), room_type=int(r_['room_type']),
+                            t=int(r_['t']))))
                 for j, i in enumerate(act_idx):
                     pending[i] = actions[j]
                     sampler.actions[i, :nh] = actions[j]
