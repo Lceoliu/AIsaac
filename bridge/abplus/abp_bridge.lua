@@ -159,7 +159,9 @@ Protocol (one JSON object per line), identical to 0.2.0 plus "lua", "format" and
 -- containers, -3 three soul hearts, -1000 free; 0 = not for sale and for every other entity). The native obs is used
 -- only with a libabp_turbo.so that writes the same records (abp_native_entity_bytes == 148). Everything else as
 -- abp-0.2.17.
-local VERSION = "abp-0.2.18"
+-- abp-0.2.19 (2026-11-03, the privileged critic): the `priv` command and its frame (see priv_payload). The lean observation
+-- is not touched; with the switch off (every connection's start) nothing else changes.
+local VERSION = "abp-0.2.19"
 local mod = RegisterMod("AbpRLBridge", 1)
 
 -- The game ships LuaSocket for both architectures; make sure the 64-bit core is found.
@@ -249,6 +251,7 @@ local state = {
 	goal = nil, nav = { hit = false, changed = false, min = -1 },
 	stop_clear = false, was_clear = false,
 	lean = false,            -- abp-0.2.14: lean mode (pack_lean)
+	priv = false,            -- abp-0.2.19: this connection's privileged frames (priv_payload)
 	native_input = false,    -- abp-0.2.14: abp_turbo answers the engine's input queries (lean mode)
 	-- 2026-10-06 (items, Phase A; same VERSION, hello says items = true): the lean observation's inventory block (flag 16,
 	-- see pack_lean) and the run-mode map rules. Off unless ISAAC_RL_LEAN_ITEMS=1 at launch or the `lean_items` command
@@ -2039,9 +2042,132 @@ local function send_raw(data)
 	return true
 end
 
+-- abp-0.2.19 (2026-11-03, rl/docs/PREDICTIVE_MEMORY_DESIGN.md section 4, the privileged critic): the `priv` command
+-- ({"cmd":"priv","enabled":true}) makes THIS connection's lean observations follow a frame "P <bytes>\n<payload>" with what
+-- the policy may not see (python/isaac_bridge/tok_priv.py decodes it). The lean observation itself is the same bytes.
+-- A clone starts with it off (fork_clone), so parked states and searches never build it. Read-only: no RNG, no game call
+-- that changes anything. Payload:
+--   <IBBfHH9H  magic "PRIV", flags (1: a layout block follows), Curse of the Blind, the room's total monster HP, monsters
+--              sent (at most 32), pedestals sent, the room's pickups per class (PRIV_CLASS, 9)
+--   n x <ffB   a monster's HitPoints, MaxHitPoints, is a boss
+--   m x <H     a pedestal's collectible id (under Curse of the Blind only, at most 8)
+--   layout (flag 1, when the floor, the room or its clear state changed; the connection's first frame has it):
+--   <B, r x <BBBB  every room of the level's list (found or not, GridIndex in 0 .. 168): GridIndex, Shape, Type, bits
+--              1 visited, 2 clear, 4 the player's room
+--   <18H       pickups per class: in the other visited rooms as they were left (since this connection asked); in the
+--              unvisited rooms by their layouts' spawn lists (each spawn's first entry: a coarse count)
+local PRIV_MAGIC = 0x56495250
+local PRIV_CLASS = { [10] = 0, [20] = 1, [30] = 2, [40] = 3, [50] = 4, [51] = 4, [52] = 4, [53] = 4, [54] = 4, [55] = 4,
+	[60] = 4, [360] = 4, [70] = 6, [300] = 6, [350] = 7, [100] = 8 }   -- anything else: 5 (other)
+local PRIV = { key = nil, floor = nil, here = nil, last = nil, left = {}, spawns = nil }
+
+local function priv_reset()
+	PRIV.key, PRIV.floor, PRIV.here, PRIV.last, PRIV.spawns = nil, nil, nil, nil, nil
+	PRIV.left = {}
+end
+
+-- room SafeGridIndex -> pickups per class of its layout's spawn list (once per floor)
+local function priv_floor_spawns(rooms)
+	local out = {}
+	for i = 0, rooms.Size - 1 do
+		local r = rooms:Get(i)
+		local counts = { 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+		local ok = pcall(function()
+			local sp = r.Data.Spawns
+			for j = 0, sp.Size - 1 do
+				local e = sp:Get(j):PickEntry(0)
+				if e.Type == 5 then
+					local c = (PRIV_CLASS[e.Variant] or 5) + 1
+					counts[c] = counts[c] + 1
+				end
+			end
+		end)
+		out[r.SafeGridIndex] = ok and counts or nil
+	end
+	return out
+end
+
+local function priv_layout(rooms, here)
+	local recs, left, unv = {}, { 0, 0, 0, 0, 0, 0, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+	for i = 0, rooms.Size - 1 do
+		local r = rooms:Get(i)
+		local gi, safe = r.GridIndex, r.SafeGridIndex
+		local visited = r.VisitedCount > 0
+		if gi >= 0 and gi < 169 then
+			local d = r.Data
+			recs[#recs + 1] = spack("<BBBB", gi, d.Shape & 255, d.Type & 255,
+				(visited and 1 or 0) + (r.Clear and 2 or 0) + (safe == here and 4 or 0))
+		end
+		local counts
+		if visited then
+			counts = safe ~= here and PRIV.left[safe] or nil
+			if counts then for c = 1, 9 do left[c] = left[c] + counts[c] end end
+		else
+			counts = PRIV.spawns[safe]
+			if counts then for c = 1, 9 do unv[c] = unv[c] + counts[c] end end
+		end
+	end
+	return spack("<B", #recs) .. table.concat(recs) .. spack("<" .. string.rep("H", 18), left[1], left[2], left[3], left[4], left[5], left[6],
+		left[7], left[8], left[9], unv[1], unv[2], unv[3], unv[4], unv[5], unv[6], unv[7], unv[8], unv[9])
+end
+
+local function priv_payload()
+	local game = Game()
+	local level = game:GetLevel()
+	local blind = (level:GetCurses() & 64) ~= 0
+	local npcs, peds, counts = {}, {}, { 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+	local total, n_npc, n_ped = 0, 0, 0
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		local t = e.Type
+		if t == 5 then
+			local v = e.Variant
+			local c = (PRIV_CLASS[v] or 5) + 1
+			counts[c] = counts[c] + 1
+			if blind and v == 100 and e.SubType > 0 and n_ped < 8 then
+				n_ped = n_ped + 1
+				peds[n_ped] = spack("<H", e.SubType)
+			end
+		elseif t >= 10 and t < 1000 and e:ToNPC() and e.HitPoints > 0 and is_monster(e) then
+			total = total + e.HitPoints
+			if n_npc < 32 then
+				n_npc = n_npc + 1
+				npcs[n_npc] = spack("<ffB", e.HitPoints, e.MaxHitPoints, e:IsBoss() and 1 or 0)
+			end
+		end
+	end
+	local here, stage = lean_room_index(level), level:GetStage()
+	local key = stage * 1000000 + here * 2 + (game:GetRoom():IsClear() and 1 or 0)
+	local layout, flags = "", 0
+	if key ~= PRIV.key then
+		local rooms = level:GetRooms()
+		if stage ~= PRIV.floor then
+			PRIV.floor, PRIV.here, PRIV.last, PRIV.left = stage, nil, nil, {}
+			PRIV.spawns = priv_floor_spawns(rooms)
+		end
+		if PRIV.here ~= nil and PRIV.here ~= here then PRIV.left[PRIV.here] = PRIV.last end
+		PRIV.here, PRIV.key = here, key
+		layout, flags = priv_layout(rooms, here), 1
+	end
+	PRIV.last = counts
+	return spack("<IBBfHHHHHHHHHHH", PRIV_MAGIC, flags, blind and 1 or 0, total, n_npc, n_ped, counts[1], counts[2], counts[3],
+		counts[4], counts[5], counts[6], counts[7], counts[8], counts[9]) .. table.concat(npcs) .. table.concat(peds)
+		.. layout
+end
+
+-- The frame before a lean observation of a connection that asked; a failure is logged and the record goes without one.
+local function send_priv()
+	local ok, payload = pcall(priv_payload)
+	if not ok then
+		log("priv pack failed: " .. tostring(payload))
+		return
+	end
+	send_raw("P " .. #payload .. "\n" .. payload)
+end
+
 local function send_obs_now(event)
 	state.seq = state.seq + 1
 	if state.lean then
+		if state.priv then send_priv() end
 		local ok, payload = pcall(pack_lean, event)
 		if not ok then
 			log("lean pack failed: " .. tostring(payload))
@@ -2150,6 +2276,7 @@ local function fork_clone(cmd)
 	-- reseed: the clone's global MT starts anew, so clones of one state differ in the game's later random draws
 	if tonumber(cmd.reseed) then getenv("ABP_RESEED:" .. math.floor(tonumber(cmd.reseed))) end
 	if cmd.lean ~= nil then state.lean = cmd.lean == true end
+	state.priv = false   -- abp-0.2.19: a clone's client asks for itself
 	-- 2026-10-04 (frame-cost work, off by default): ISAAC_RL_LUA_GCPAUSE=<n> sets the Lua collector's pause in a lean
 	-- clone (collectgarbage "setpause"; Lua's default 200 = a cycle each time the heap doubles). A clone lives about an
 	-- episode and makes ~8 KB of Lua garbage per decision on a ~2 MB heap; a larger pause means fewer marking passes over
@@ -2371,6 +2498,10 @@ local function handle_command(line)
 			set_native_input(state.lean)
 			state.terrain_dirty = true
 			send({ type = "ok", cmd = "lean", enabled = state.lean })
+		elseif cmd.cmd == "priv" then   -- abp-0.2.19 (see priv_payload)
+			state.priv = cmd.enabled ~= false
+			priv_reset()
+			send({ type = "ok", cmd = "priv", enabled = state.priv })
 		elseif cmd.cmd == "lean_items" then   -- 2026-10-06 (items, Phase A): the inventory block and run-mode map rules
 			if cmd.enabled ~= nil then
 				state.lean_items = cmd.enabled == true
@@ -2539,6 +2670,7 @@ local function native_step_obs()
 	state.terrain_dirty = false
 	state.seq = state.seq + 1
 	state.credits = {}
+	if state.priv then send_priv() end   -- abp-0.2.19: before the observation, whichever way that one goes out
 	local s = ABP_NATIVE_STEP
 	local consecutive = s.consecutive
 	s.consecutive = false

@@ -148,11 +148,15 @@ def read_lean(bridge, decoder):
 
 
 def read_lean_raw(bridge):
-    """The next lean observation's payload, not decoded (tok_obs.FastRow takes it as it is)."""
+    """The next lean observation's payload, not decoded (tok_obs.FastRow takes it as it is). A privileged frame before it
+    (abp-0.2.19, only on a connection that asked: the `priv` command) is left in bridge.priv_frame (tok_priv)."""
     while True:
         line = bridge._read_line()
         if line.startswith(b'L '):
             return bridge._read_exact(int(line.split(b' ')[1]))
+        if line.startswith(b'P '):
+            bridge.priv_frame = bridge._read_exact(int(line.split(b' ')[1]))
+            continue
         msg = json.loads(line.decode('utf-8'))
         if msg.get('type') == 'error':
             raise RuntimeError(msg.get('msg', 'error'))

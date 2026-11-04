@@ -193,7 +193,17 @@ Predictive auxiliary loss (2026-11-03, rl/docs/PREDICTIVE_MEMORY_DESIGN.md secti
   the return over them; --aux-coef x L_aux joins each part's loss. The actor, its graphs and the checkpoint's 'model' are
   untouched (the head, its Adam and the normalisation are the checkpoint's 'aux'). progress.csv: aux_reg_k, aux_ev_k,
   aux_ret_k, aux_room_ce_k, aux_loss, aux_ms_k / aux_me_k (masked shares of the trained rows), aux_ev0_k (the base rates' BCE),
-  aux_rate_* / aux_bce_* per event, aux_grad_norm, u_aux (the tables' host seconds).
+  aux_rate_* / aux_bce_* per event, grad_norm (before the clip, also with ISAAC_RL_LOG_GRAD_NORM=1), u_aux (the tables'
+  host seconds).
+Privileged critic (2026-11-03, rl/docs/PREDICTIVE_MEMORY_DESIGN.md section 4, isaac_bridge/tok_priv.py has the mechanism;
+  off by default, then nothing changes, and nothing privileged is built or sent): --priv-critic 1 (needs --temporal 1,
+  --global-token 1, --mode floor / run) has the workers' episode connections ask for the bridge's privileged frames
+  (never ROW: the actor's inputs stay the same bytes), stores them next to the decisions, and trains two value heads on
+  [zr ; p_t] and [zg ; p_t]; PPO's advantages and value_global's returns come from them (--recompute-values is forced on:
+  the actor has no p_t). The policy's own value heads (the actor's graphs and the counterfactual lanes read them) stay
+  trained, on the same returns, from a stopped gradient: they no longer drive the shared layers. Teacher records have
+  no p_t: zeros and a missing flag. The encoder, its heads and their Adam are the checkpoint's 'priv'; progress.csv
+  priv_missing, priv_plain_vf, priv_plain_vg, u_priv.
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
 
@@ -638,7 +648,8 @@ class Rollout:
     rollout's own and the going episode's earlier ones. Rows are assigned when a decision is submitted (t_dest) or
     stored (store_temporal); the actor writes them on the device (GraphActor tdest / store's index_copy_)."""
 
-    def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False, temporal=None, alloc=None, close=False):
+    def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False, temporal=None, alloc=None, close=False,
+                 priv=None):
         # B38 step 2: alloc(shape, dtype) -> a zeroed array for every host array (SharedArrays: shared memory the
         # learner process maps); None: numpy's, as before
         zeros = np.zeros if alloc is None else alloc
@@ -692,6 +703,8 @@ class Rollout:
         self.close_hurt = zeros((workers, capacity), np.float32) if close else None
         self.close_done = zeros((workers, capacity), np.uint8) if close else None
         self.close_ev = zeros((workers, capacity), np.uint8) if close else None
+        # 2026-11-03 (--priv-critic, tok_priv): each decision's privileged record (priv: its dtype). None without it
+        self.priv = zeros((workers, capacity), priv) if priv is not None else None
         self.length = zeros(workers, np.int64)
         self.open = full(workers, -1, np.int64)   # the stored decision still waiting for its reward (the last one)
 
@@ -769,6 +782,8 @@ class Rollout:
             self.h[i, 0] = other.h[i, k]
         if self.value_g is not None and other.value_g is not None:   # (B24)
             self.value_g[i, 0] = other.value_g[i, k]
+        if self.priv is not None:   # 2026-11-03 (--priv-critic)
+            self.priv[i, 0] = other.priv[i, k]
         self.length[i], self.open[i] = 1, 0
         if self.t_kv is not None:   # (B30) the P decisions before this rollout, the open one, the episode's rooms
             import torch
@@ -999,7 +1014,7 @@ class Episodes:
         return go
 
 
-def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, vg=None, tinfo=None):
+def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, vg=None, tinfo=None, priv=None):
     """Store the decisions just answered (workers a_idx, distinct) as their workers' open ones. h (memory): the GRU's
     input state of each. vg (B24, global-token models): value_global of each. tinfo (B30, temporal models): the
     temporal step's outputs of each (GraphActor.t_out's counters, or tok_policy.temporal_out's dict with the step's
@@ -1011,6 +1026,7 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
         actions, logp, value = actions[ok], logp[ok], value[ok]
         h = h[ok] if h is not None else None
         vg = vg[ok] if vg is not None else None
+        priv = priv[ok] if priv is not None else None
         tinfo = {k_: (v_[torch_from(ok, v_.device)] if not isinstance(v_, np.ndarray) else v_[ok])
                  for k_, v_ in tinfo.items()} if tinfo is not None else None
     if tinfo is not None and roll.t_kv is not None:   # 2026-10-14 (B30)
@@ -1019,6 +1035,8 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
         roll.value_g[a_idx, kk] = vg
     if h is not None and roll.h is not None:   # 2026-10-11 (memory)
         roll.h[a_idx, kk] = h
+    if priv is not None:   # 2026-11-03 (--priv-critic)
+        roll.priv[a_idx, kk] = priv
     roll.rows[a_idx, kk] = rows
     roll.boot[a_idx, kk] = rows['done'] == DONE_BRANCH   # 2026-10-07 (branches; always False without them)
     roll.pending[a_idx, kk], roll.actions[a_idx, kk] = under_way, actions
@@ -1729,6 +1747,9 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--aux-horizons', default='1,8,64,256',
                    help='--aux-predict: the scales, in decisions (4 frames each: 0.13 s, 1.1 s, 8.5 s, 34 s)')
     p.add_argument('--aux-coef', type=float, default=0.1, help='--aux-predict: the weight of L_aux in the loss')
+    p.add_argument('--priv-critic', type=int, default=0, choices=(0, 1),
+                   help='2026-11-03 (tok_priv, PREDICTIVE_MEMORY_DESIGN.md section 4): 1 = the value heads also read the '
+                        'bridge\'s privileged record (true layout, monster HP, the floor\'s pickups); the policy never')
     p.add_argument('--fused-adam', type=int, default=0,
                    help='1: Adam as one fused CUDA kernel (the same update rule; float rounding may differ)')
     p.add_argument('--dump-rollouts', type=int, default=0,
@@ -1890,6 +1911,17 @@ def main(argv=None, child=None, actor=None):
             aux_h = parse_horizons(args.aux_horizons)
         except ValueError as exc:
             p.error(str(exc))
+    priv_on = bool(args.priv_critic)   # 2026-11-03 (tok_priv)
+    if priv_on:
+        from isaac_bridge.tok_priv import PRIV as PRIV_DTYPE, PrivBatch, make_critic
+        if not t_on or not args.global_token or args.mode not in ('floor', 'run'):
+            p.error('--priv-critic 1 needs --temporal 1, --global-token 1 and --mode floor / run')
+        if args.learner_compile:
+            p.error('--priv-critic 1: not with --learner-compile (the forward hands zr, zg back through its context)')
+        if not args.teach_merge:
+            p.error('--priv-critic 1 needs --teach-merge 1 (the teachers\' records through the heads in one forward)')
+        recompute = True   # (the actor has no p_t: every value from the learner's pass)
+    gn_on = aux_on or priv_on or bool(os.environ.get('ISAAC_RL_LOG_GRAD_NORM'))
     pick_force = parse_pickup_force(args.pickup_force)   # 2026-10-13 (B23)
     pf_on = max(pick_force) > 0
     rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0, heal=0.0, resource=0.0)
@@ -1995,6 +2027,7 @@ def main(argv=None, child=None, actor=None):
                            cf_defer_target=bool(args.cf_defer_target),
                            cf_gamma=args.gamma_global if gtok_on else args.gamma, cf_vglobal=gtok_on,
                            temporal_dim=int(args.temporal_width) if (t_on and (args.cf or args.teacher_v2)) else 0,
+                           priv=priv_on and floor,
                            bridge_lua=default_bridge_lua(), preload=default_preload(),
                            stub_list=stub if stub and Path(stub).is_file() else '')
     print('instances: stub list', cfg.stub_list or '(the launch mode\'s own)', '| environment',
@@ -2049,6 +2082,12 @@ def main(argv=None, child=None, actor=None):
         aux_head = make_head(args.temporal_width, len(aux_h)).to(lm_dev)
         aopt = torch.optim.Adam(aux_head.parameters(), lr=args.lr, eps=1e-5, **(dict(fused=True) if fused else {}))
         aux_norm = AuxNorm(len(AUX_REG), len(aux_h))
+    # 2026-11-03 (--priv-critic): where the updates run: the privileged encoder and value heads, their Adam; not parameters
+    # of learner_model (as the aux head)
+    pcritic = popt = None
+    if priv_on and (child is not None or not proc):
+        pcritic = make_critic(args.width).to(lm_dev)
+        popt = torch.optim.Adam(pcritic.parameters(), lr=args.lr, eps=1e-5, **(dict(fused=True) if fused else {}))
     update, decisions_total, seconds_total = 0, 0, 0.0
     if args.init:
         print('init', args.init, load_compatible(learner_model, torch.load(args.init, map_location=lm_dev)['model']))
@@ -2116,6 +2155,18 @@ def main(argv=None, child=None, actor=None):
                 aopt.load_state_dict(a_osd)
             else:
                 print('aux: --resume of a checkpoint without the head: it starts fresh', flush=True)
+    if pcritic is not None:   # 2026-11-03: a checkpoint with it: as saved; otherwise its value heads start as the policy's
+        ck_p = ck.get('priv') if args.resume else None
+        if ck_p:
+            pcritic.load_state_dict(ck_p['model'])
+            p_osd = ck_p['opt']
+            for g in p_osd['param_groups']:
+                g['fused'], g['foreach'] = (True, None) if fused else (None, None)
+            popt.load_state_dict(p_osd)
+        else:
+            pcritic.init_from(learner_model)
+        print(f'privileged critic (tok_priv): p_t {pcritic.p_dim}, {sum(q.numel() for q in pcritic.parameters()) / 1e6:.2f}M '
+              f'parameters, ' + ('resumed' if ck_p else 'value heads from the policy\'s (the new columns zero)'), flush=True)
     if aux_head is not None:
         print(f'aux (tok_aux): horizons {aux_h}, coef {args.aux_coef}, input o_t ({args.temporal_width}), '
               f'{sum(q.numel() for q in aux_head.parameters()) / 1e6:.2f}M parameters, {len(AUX_STATE)} state + '
@@ -2274,8 +2325,9 @@ def main(argv=None, child=None, actor=None):
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
     if child is None:
-        roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, close=aux_on), \
-            Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, close=aux_on)
+        r_kw = dict(close=aux_on, priv=PRIV_DTYPE if priv_on else None)
+        roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw), \
+            Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw)
         if n_act > 1 and actor is None:   # (the first actor: the shared arrays of all workers, its rows of them)
             shared_full = SharedArrays()
             full_rolls = [full_from_local(r_, args.workers, w_lo, shared_full) for r_ in (roll, spare)]
@@ -2463,7 +2515,9 @@ def main(argv=None, child=None, actor=None):
                         decisions=L['decisions'], seconds=L['seconds'], config=learner_model.config, args=vars(args),
                         **(dict(choice_optimizer=copt.state_dict()) if copt is not None else {}),
                         **(dict(aux=dict(head=aux_head.state_dict(), opt=aopt.state_dict(), norm=aux_norm.state()))
-                           if aux_head is not None else {})),
+                           if aux_head is not None else {}),
+                        **(dict(priv=dict(model=pcritic.state_dict(), opt=popt.state_dict()))
+                           if pcritic is not None else {})),
                    path)
 
     b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
@@ -2492,7 +2546,7 @@ def main(argv=None, child=None, actor=None):
         adev, device = device_actor, ldev
         t0 = time.perf_counter()
         U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
-                          (('temporal',) if t_on else ()) + (('aux',) if aux_on else ()),
+                          (('temporal',) if t_on else ()) + (('aux',) if aux_on else ()) + (('priv',) if priv_on else ()),
                           0.0)   # seconds per part of the update (u_* columns)
         if t_on and getattr(job['roll'], 't_kv', None) is None:
             raise RuntimeError('--temporal 1: the rollout has no temporal arrays (a bench job of a run without it?)')
@@ -2580,6 +2634,7 @@ def main(argv=None, child=None, actor=None):
                 return dict(temporal=dict(mode='stored', o=t_all['o'][part_], o_prev=t_all['o_prev'][part_],
                                           has=t_all['has'][part_])) if t_on else {}
             vals, lps = [], []
+            pv_all = PrivBatch(rl, all_flat, device) if priv_on else None   # 2026-11-03 (tok_priv)
             m_r = pmark('b38:recompute')
             with torch.inference_mode():
                 chunk = args.micro or args.minibatch
@@ -2589,12 +2644,20 @@ def main(argv=None, child=None, actor=None):
                                          NI_f, G_f, t_on) if fast2 else None
                     if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
                         b_p = take(every, part) if b_p is None else b_p
+                        tk_p = tk_all(part)
+                        if priv_on:   # 2026-11-03 (tok_priv): the values from the privileged heads
+                            tk_p['temporal']['keep_z'] = True
                         with autocast():
                             o_ = lm_call(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
-                                               need_vg=True, **tk_all(part))
+                                               need_vg=True, **tk_p)
                         lp_ = learner_model.log_prob(o_[0], learner_model.gate(b_p), acts_all[part])[0]
-                        v_ = o_[1].float()
-                        vgs.append(o_[-1].float())
+                        if priv_on:
+                            zr_p, zg_p = tk_p['temporal'].pop('z_out')
+                            v_, vg_p = pcritic(zr_p, zg_p, pcritic.encode(pv_all, part))
+                            vgs.append(vg_p.float())
+                        else:
+                            v_ = o_[1].float()
+                            vgs.append(o_[-1].float())
                     else:
                         with autocast():
                             lp_, _, v_, _ = learner_model.evaluate(take(every, part) if b_p is None else b_p,
@@ -2658,6 +2721,9 @@ def main(argv=None, child=None, actor=None):
             g['lr'] = lr
         if aux_on:
             for g in aopt.param_groups:
+                g['lr'] = lr
+        if priv_on:
+            for g in popt.param_groups:
                 g['lr'] = lr
         if every is not None and fast2:   # (B38 step 4: the records' bytes from the start-of-update pass)
             pos = torch.from_numpy(np.searchsorted(all_flat, flat)).to(device)
@@ -2726,13 +2792,18 @@ def main(argv=None, child=None, actor=None):
             if PROFILE:
                 torch.cuda.current_stream().synchronize()
             U['temporal'] += time.perf_counter() - t_t0
+        pv_b = None
+        if priv_on:   # 2026-11-03 (tok_priv): the rows' privileged records, on the device
+            t_p0 = time.perf_counter()
+            pv_b = PrivBatch(rl, flat, device)
+            pacc2 = torch.zeros(2, device=device)   # the policy's own value heads' losses (sums over steps)
+            U['priv'] += time.perf_counter() - t_p0
         aux_t = None
         if aux_on:   # 2026-11-03 (tok_aux): the update's targets, on the device (read from the rollout before `fresh`)
             t_a0 = time.perf_counter()
             aux_t, aux_log = build_targets(rl, flat, lw, aux_h, aux_norm, device)
             aux_acc = torch.zeros((4, len(aux_h)), device=device)
             aux_acc_ev = torch.zeros((len(aux_h), len(AUX_EVENTS)), device=device)
-            aux_gn = torch.zeros(1, device=device)
             U['aux'] += time.perf_counter() - t_a0
         sec('batch')
         acc = torch.zeros(5, device=device)        # pg, vf, ent, kl, clipped (sums over steps, on the GPU)
@@ -3105,6 +3176,7 @@ def main(argv=None, child=None, actor=None):
             return vloss_ + args.teacher_v2_weight * pg_ / n_sel, vstats_
         pm = pn = n_sel = None
         t_table = None
+        gn_acc = torch.zeros(1, device=device) if gn_on else None
         for _ in range(args.epochs):
             if t_on:   # (B31) the rooms made before each chunk: every room token's K / V once per epoch (stop-grad)
                 t_t0 = time.perf_counter()
@@ -3148,6 +3220,8 @@ def main(argv=None, child=None, actor=None):
                         adv_std = a_all.std()
                         a_all = (a_all - a_all.mean()) / (a_all.std() + 1e-8)
                 opt.zero_grad(set_to_none=True)
+                if priv_on:
+                    popt.zero_grad(set_to_none=True)
                 if aux_on:   # 2026-11-03 (tok_aux): its means' denominators over this minibatch's valid trained rows
                     aopt.zero_grad(set_to_none=True)
                     aux_den = minibatch_den(aux_t, sel, b_w)
@@ -3313,12 +3387,20 @@ def main(argv=None, child=None, actor=None):
                                                      L['v2_m'].index_select(0, vpick_d)]))
                             if aux_on:   # 2026-11-03 (tok_aux): the forward hands o_t back (its rows: the part's)
                                 tk_['temporal']['keep_o'] = True
+                            if priv_on:   # 2026-11-03 (tok_priv): and zr, zg (every row, the teachers' too)
+                                tk_['temporal']['keep_z'] = True
                             outs_ = lm_call(mb, packed=bool(args.packed), mem=memd,
                                                   **(dict(need_vg=True) if glob_loss else {}), **tk_)
                         else:
                             outs_ = lm_call(mb, packed=bool(args.packed),
                                                   **(dict(need_vg=True) if glob_loss else {}))
                         logits_, value_, danger_ = outs_[:3]
+                    if priv_on:   # 2026-11-03 (tok_priv): the values from [zr ; p_t], [zg ; p_t]; teachers' rows: missing
+                        zr_q, zg_q = tk_['temporal'].pop('z_out')
+                        p_q = pcritic.encode(pv_b, part)
+                        if len(zr_q) > k_:
+                            p_q = torch.cat([p_q, pcritic.missing(len(zr_q) - k_, p_q)])
+                        value_, vg_all = pcritic(zr_q, zg_q, p_q)
                     m_ = pmark('b38:part_loss', m_)
                     logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
                         logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
@@ -3343,9 +3425,15 @@ def main(argv=None, child=None, actor=None):
                         ent = pmean(entropy.sum(-1), pm, pn)
                         loss = (pg + args.vf_coef * vf - args.ent_coef * ent) * w
                     if glob_loss:   # 2026-10-12 (B22): value_global on its own returns (an auxiliary loss)
-                        vgf = 0.5 * pmean((outs_[-1][:k_].float() - b_ret_g[part]) ** 2, pm, pn)
+                        vgf = 0.5 * pmean(((vg_all if priv_on else outs_[-1])[:k_].float() - b_ret_g[part]) ** 2, pm, pn)
                         loss = loss + args.vf_global_coef * vgf * w
                         gacc += vgf.detach() * w
+                    if priv_on:   # 2026-11-03 (tok_priv): the policy's own value heads, from a stopped gradient, on the
+                        #             same returns (the actor's graphs and the counterfactual lanes read them)
+                        pl_v = 0.5 * pmean((learner_model.value(zr_q[:k_].detach())[:, 0] - b_ret[part]) ** 2, pm, pn)
+                        pl_g = 0.5 * pmean((learner_model.gtok.value(zg_q[:k_].detach())[:, 0] - b_ret_g[part]) ** 2, pm, pn)
+                        loss = loss + (args.vf_coef * pl_v + args.vf_global_coef * pl_g) * w
+                        pacc2 += torch.stack([pl_v.detach(), pl_g.detach()]) * w
                     if aux_on:   # 2026-11-03 (tok_aux): the part's share of the minibatch's L_aux
                         aloss, astats, aevs = part_loss(aux_head, tk_['temporal'].pop('o_seq'), aux_t, part, pm, aux_den)
                         loss = loss + args.aux_coef * aloss
@@ -3424,10 +3512,14 @@ def main(argv=None, child=None, actor=None):
                                        [None if q.grad is None else q.grad.clone()
                                         for q in opt.param_groups[0]['params']]))
                 m_ = pmark('b38:clip_opt', m_)
+                if priv_on:   # (the privileged encoder's and heads' norm apart: their gradient is the critic's alone)
+                    torch.nn.utils.clip_grad_norm_(pcritic.parameters(), args.max_grad_norm)
+                    popt.step()
                 if aux_on:   # (the policy's norm as ever, aux's share included; the head's apart: not PPO's scale)
-                    aux_gn += torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                     torch.nn.utils.clip_grad_norm_(aux_head.parameters(), args.max_grad_norm)
                     aopt.step()
+                if gn_on:   # (progress.csv grad_norm: how far the clip scales the policy's gradient)
+                    gn_acc += torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                 else:
                     torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                 opt.step()
@@ -3538,8 +3630,14 @@ def main(argv=None, child=None, actor=None):
                 row['v_global_ev'] = 1.0 - float((rg_ - vg_).var()) / var_g if var_g > 0 else 0.0
             else:
                 row['v_global_ev'] = ''
+        if priv_on:   # 2026-11-03 (tok_priv)
+            row['priv_missing'] = pv_b.missing_share
+            row['priv_plain_vf'], row['priv_plain_vg'] = float(pacc2[0]) / steps_, float(pacc2[1]) / steps_
+        if gn_on:   # 2026-11-03: the policy's gradient norm before the clip, mean over the steps (ISAAC_RL_LOG_GRAD_NORM=1:
+            #         without the switches too, the controls' comparison; the column only then)
+            row['grad_norm'] = float(gn_acc[0]) / steps_
         if aux_on:   # 2026-11-03 (tok_aux)
-            row.update(log_row(aux_acc.cpu().numpy(), aux_acc_ev.cpu().numpy(), steps_, aux_h, float(aux_gn[0])))
+            row.update(log_row(aux_acc.cpu().numpy(), aux_acc_ev.cpu().numpy(), steps_, aux_h))
             row.update(aux_log)
         row.update({f'u_{k}': v for k, v in U.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
@@ -4103,6 +4201,8 @@ def main(argv=None, child=None, actor=None):
         aux[n, AUX_SNAP], aux[n, AUX_SNAP_ON] = version, 1
         torch.cuda.synchronize()
 
+    priv_pending = np.zeros(n, PRIV_DTYPE) if (priv_on and child is None) else None   # (tok_priv)
+
     def answer(prof, a_idx, sub, under_way, actions, logp, value, extra=None, ver=None, h=None, vg=None, t=None):
         """The actions out to the workers, the decisions into the rollout. ver: the weights that answered (a
         snapshot's id; None: the actor's own). h (memory): the GRU's input state of each record. vg (B24): value_global
@@ -4132,7 +4232,8 @@ def main(argv=None, child=None, actor=None):
         sampler.reply(a_idx)
         t3 = time.perf_counter()
         prof['reply'] += t3 - t2
-        store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h, vg, t)
+        store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h, vg, t,
+              priv_pending[a_idx] if priv_pending is not None else None)
         pending[a_idx] = actions
         prof['store'] += time.perf_counter() - t3
 
@@ -4224,6 +4325,8 @@ def main(argv=None, child=None, actor=None):
                 if not len(idx):
                     continue
                 rows = sampler.rows[slots]
+                if priv_pending is not None:   # 2026-11-03 (tok_priv): one record per worker is outstanding at a time
+                    priv_pending[idx] = sampler.priv[slots]
                 go = book.arrive(roll, rows, idx, pending)
                 t1 = time.perf_counter()
                 prof['book'] += t1 - tb

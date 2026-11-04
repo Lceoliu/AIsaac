@@ -263,6 +263,10 @@ class TokSamplerConfig:
     # B40 (A30's A2): door targets' and bomb_at branches wait for the room's clear (tok_cf.Deferral); off = as before
     cf_defer_target: bool = False
     temporal_dim: int = 0                         # B34: the temporal transformer's width D (temporal models; 0: none)
+    # 2026-11-03 (tok_priv, floor / run modes, training only): each main-episode record's privileged record, in a block of
+    # its own (TokSampler.priv, named priv_block for the workers); never in ROW
+    priv: bool = False
+    priv_block: str = ''
     mode: str = 'room'                          # 'room': one room per episode; 'floor' / 'run': tok_floor.py
     items: bool = False                           # 2026-10-06: the bridge's lean_items, ROW's item fields, 5 actions
     run_seconds: float = 1800.0                   # run: an episode's time limit (game seconds)
@@ -1279,6 +1283,14 @@ class TokSampler:
         self.blocks = [shared_memory.SharedMemory(create=True, size=s) for s in sizes]
         names = [b.name for b in self.blocks]
         self.attached, self.rows, self.actions, self.stats, self.control = attach(names, n)
+        self.priv = None   # 2026-11-03 (tok_priv): PRIV [2 x workers], the rows' slots
+        if getattr(cfg, 'priv', False):
+            from .tok_priv import PRIV
+            pb = shared_memory.SharedMemory(create=True, size=PRIV.itemsize * 2 * n)
+            self.blocks.append(pb)
+            cfg.priv_block = pb.name
+            self.priv = np.ndarray((2 * n,), PRIV, buffer=pb.buf)
+            self.priv['missing'] = 1
         teacher_names = None
         self.teach_rows = self.teach_meta = None
         if cfg.teacher and not cfg.eval_seeds:

@@ -328,7 +328,7 @@ def part_loss(head, o, tg, part, w, den):
     return (l_reg + l_ev + l_ret).mean(), torch.stack([l_reg, l_ev, l_ret, l_room]).detach(), per_ev.detach()
 
 
-def log_row(acc, acc_ev, steps, horizons, grad_norm):
+def log_row(acc, acc_ev, steps, horizons):
     """progress.csv's columns of an update from the parts' summed shares (acc [4, K], acc_ev [K, E], numpy)."""
     row = {}
     for ki, h in enumerate(horizons):
@@ -337,5 +337,4 @@ def log_row(acc, acc_ev, steps, horizons, grad_norm):
         for j, name in enumerate(EVENTS):
             row[f'aux_bce_{name}_{h}'] = float(acc_ev[ki, j]) / steps
     row['aux_loss'] = float(acc[:3].sum(0).mean()) / steps
-    row['aux_grad_norm'] = float(grad_norm) / steps   # (the policy's gradient norm before clipping, aux included)
     return row

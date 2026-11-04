@@ -504,7 +504,8 @@ for _, e in ipairs(Isaac.GetRoomEntities()) do
 end
 return table.concat(s, ",")
 """
-BRIDGE_VERSION = "abp-0.2.18"   # 2026-10-16 (B35): lean entity records with a pickup's price (abplus_lean; abp-0.2.17:
+BRIDGE_VERSION = "abp-0.2.19"   # 2026-11-03: the `priv` command and its frame (tok_priv; nothing else); 2026-10-16 (B35,
+#                                 abp-0.2.18): lean entity records with a pickup's price (abplus_lean; abp-0.2.17:
 #                                 lean player records with the PlayerType; abp-0.2.16: lean entity records with flag
 #                                 word and laser geometry)
 # 2026-10-04: send steps as the bridge's step line when its hello offers it (AbplusTrainingEnv.step_line); 0 = JSON

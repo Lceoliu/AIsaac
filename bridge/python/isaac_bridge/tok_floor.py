@@ -353,6 +353,17 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     slots = (rows[2 * index:2 * index + 1], rows[2 * index + 1:2 * index + 2])
     slot_address = (slots[0].ctypes.data, slots[1].ctypes.data)
     fast_fn = fast_row_function(row_library(cfg))   # None: LeanDecoder + encode_row as before
+    # 2026-11-03 (tok_priv, cfg.priv): this worker's slots of the privileged records and its map version counter
+    priv_on = bool(getattr(cfg, 'priv', False)) and not evaluation
+    priv_slots = priv_ver = priv_dec = None
+    if priv_on:
+        from multiprocessing import shared_memory as shm_
+        from .tok_priv import PRIV, PrivDecoder
+        priv_block = shm_.SharedMemory(name=cfg.priv_block)
+        blocks = blocks + [priv_block]
+        priv_all = np.ndarray((2 * cfg.workers,), PRIV, buffer=priv_block.buf)
+        priv_slots = (priv_all[2 * index:2 * index + 1], priv_all[2 * index + 1:2 * index + 2])
+        priv_ver = PrivDecoder().versions
     group = cfg.assign[index]
     spec = cfg.specs[group]
     run = cfg.mode == 'run'
@@ -1636,6 +1647,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     mine[ST['stat_augs']] += 1
                     start_mod = max(start_mod, 1)
                 decoder = LeanDecoder()
+                if priv_on:   # (only this episode's connection: its clones never build the frame)
+                    priv_dec = PrivDecoder(priv_ver)
+                    episode.priv_frame = None
+                    episode._send({"cmd": "priv", "enabled": True})
                 episode._send({"cmd": "obs"})
                 obs = read_lean(episode, decoder)
                 if obs.dead:
@@ -1825,6 +1840,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                         cf_snap_req = bank_ + 1
                                 else:
                                     mine[ST['cf_skipped']] += 1
+                    if priv_on:   # 2026-11-03 (tok_priv): the record's privileged record, in its slot's place
+                        priv_dec.decode(episode.priv_frame, priv_slots[t_ep & 1])
+                        episode.priv_frame = None
                     t1 = time.perf_counter()
                     mine[ST['encode_s']] += t1 - t0
                     if waiting:   # the answer to the record before this one: the action of the step to come

@@ -589,7 +589,7 @@ def case_g_h_i():
               not same_tensors(r_off['weights'], r_on['weights']))
         row = r_on['progress'][-1]
         cols = [f'aux_{x}_{h}' for x in ('reg', 'ev', 'ret', 'room_ce', 'ms', 'me', 'ev0') for h in (1, 4, 16)] + \
-            ['aux_loss', 'aux_grad_norm', 'u_aux'] + [f'aux_rate_{e}_{h}' for e in A.EVENTS for h in (1, 4, 16)] + \
+            ['aux_loss', 'grad_norm', 'u_aux'] + [f'aux_rate_{e}_{h}' for e in A.EVENTS for h in (1, 4, 16)] + \
             [f'aux_bce_{e}_{h}' for e in A.EVENTS for h in (1, 4, 16)]
         missing = [c for c in cols if c not in row or row[c] == '']
         check(f'(h) on [--learner-fast {fast}]: progress.csv has the aux columns', not missing, str(missing[:6]))

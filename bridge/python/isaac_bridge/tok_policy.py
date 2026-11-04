@@ -1515,6 +1515,8 @@ class TokPolicy(nn.Module):
                 zg = gn + mo if self.memory else gn
                 zg = zg + m[:, None] * ta.read_g(o)
                 out = out + (self.gtok.value(zg)[:, 0],)
+                if tctx.get('keep_z'):   # 2026-11-03 (train_tok --priv-critic): what the privileged value heads read
+                    tctx['user']['z_out'] = (zr, zg)
             return out
 
     def recur(self, z, mem):

@@ -12,6 +12,7 @@ usage: python aux_learn_driver.py --tree <dir with bridge/python> --out <dir> [-
 """
 import argparse
 import csv
+import hashlib
 import os
 import sys
 import time
@@ -87,6 +88,9 @@ def main():
     a.add_argument('--resume', default='')
     a.add_argument('--decoupled', type=int, default=1)
     a.add_argument('--steps', type=int, default=64)
+    a.add_argument('--priv', type=int, default=0)
+    a.add_argument('--priv-seed', type=int, default=21)
+    a.add_argument('--extra', default='', help='more train_tok arguments, comma-separated')
     o = a.parse_args()
     py = Path(o.tree) / 'bridge' / 'python'
     sys.path.insert(0, str(py / 'tests'))
@@ -119,6 +123,10 @@ def main():
             '--name', 'auxcpu', '--port', '49990', '--out', str(run_dir)]
     if o.aux:
         argv += ['--aux-predict', '1', '--aux-horizons', o.horizons, '--aux-coef', str(o.coef)]
+    if o.priv:
+        argv += ['--priv-critic', '1']
+    if o.extra:
+        argv += o.extra.split(',')
     if o.resume:
         argv += ['--resume', o.resume]
     res = {}
@@ -147,6 +155,13 @@ def main():
         tcfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
                     kv=args.temporal_kv, device='cpu', rows=args.rollout + 4 * W + 64)
         kw = dict(close=True) if o.aux else {}
+        p_rng = np.random.default_rng(o.priv_seed)
+        p_rows = None
+        if o.priv:   # (random privileged records: a stand-in for the bridge's, per decision)
+            from isaac_bridge.tok_priv import PRIV
+            kw['priv'] = PRIV
+            p_rows = np.zeros(W, PRIV)
+        actor_hash = hashlib.sha1()
         roll = TT.Rollout(W, capacity, len(model.heads), 0, True, tcfg, **kw)
         book = TT.Episodes(W, rw, True, run=True, items=True)
         pend = np.zeros((W, len(model.heads)), np.int64)
@@ -160,13 +175,27 @@ def main():
             if not len(a_):
                 continue
             b = TP.to_batch(sub, pend[a_], 'cpu')
+            for k_ in sorted(b):   # every tensor the actor's forward takes, byte by byte
+                actor_hash.update(k_.encode())
+                actor_hash.update(b[k_].numpy().tobytes())
             td = dict(mode='step', state=st, slot=torch.from_numpy(a_))
             with torch.no_grad():
                 acts, logp, v, vg = model.act(b, need_vg=True, temporal=td)
             acts_n = acts.numpy()
+            actor_hash.update(logp.numpy().tobytes())
+            actor_hash.update(acts_n.tobytes())
+            s_kw = {}
+            if o.priv:
+                p_rows['map'] = (p_rng.random((W,) + p_rows['map'].shape[1:]) < 0.02) * 1
+                p_rows['map_ver'] = np.arange(W) * 0 + rows['t'][0] // 8
+                p_rows['hp'] = p_rng.random(p_rows['hp'].shape)
+                p_rows['scal'] = p_rng.random(p_rows['scal'].shape)
+                p_rows['items'] = p_rng.integers(0, 1024, p_rows['items'].shape)
+                s_kw['priv'] = p_rows[a_]
             TT.store(roll, a_, sub, pend[a_], acts_n, logp.numpy(), v.numpy(), 0, None, vg.numpy(),
-                     TP.temporal_out(td['out']))
+                     TP.temporal_out(td['out']), **s_kw)
             pend[a_] = acts_n
+        res['actor_hash'] = actor_hash.hexdigest()
         prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=1, calls=1, rows=1, eager=0, act_busy=0.0,
                     calls_busy=1, latency=0.0, snap_calls=0, snap_miss=0, cf_snaps=0)
         worker = dict(wait_s=0.0, step_s=0.0, encode_s=0.0, fork_s=0.0, teach_s=0.0)
