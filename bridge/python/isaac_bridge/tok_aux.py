@@ -53,13 +53,13 @@ def parse_horizons(text):
     return out
 
 
-def state_rows(rows):
+def state_rows(rows, npc_column=NPC_COLUMN):
     """float32 [n, len(STATE)]: the explicit state of records `rows` (a ROW array, no copy of its entity tables)."""
     n = len(rows)
     pl = rows['player']
     ph = rows['phearts']
     # the visible NPCs among the record's real entity tokens (columns past n_ent hold older values)
-    npc = (rows['ent'][:, :, NPC_COLUMN] > 0) & (np.arange(rows['ent'].shape[1])[None] < rows['n_ent'][:, None])
+    npc = (rows['ent'][:, :, npc_column] > 0) & (np.arange(rows['ent'].shape[1])[None] < rows['n_ent'][:, None])
     out = np.empty((n, len(STATE)), np.float32)
     out[:, :4] = pl[:, _PLAYER_COLS]
     out[:, 4:7] = ph

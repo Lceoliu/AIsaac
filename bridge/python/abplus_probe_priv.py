@@ -9,8 +9,10 @@ game. Checks, with a JSON line per seed and a summary:
     minimap does not show), the map's current room == the lean map's, the frame's total HP == the lean totals' monsters_hp,
     NPC HP plausible against a Lua query, pedestals' true ids under Curse of the Blind (the curse added, a pedestal
     spawned), a layout block at each room change and none in between, leftovers remembered when a room is left;
-  - the time: frame bytes, the worker's decode, and the step's wall time with / without frames (decisions per second of one
-    clone, the same actions).
+  - frames only on a change (the first after the command always): the record kept without a frame still agrees with a Lua
+    query at every record of a fight, a pickup spawned shows, frames per record reported;
+  - the time: frame bytes, the worker's decode, and a worker's step (step, read, FastRow-like decode, the record) with / without
+    frames, alternating, the same actions: --fight of them with monsters spawned (the costly case), the walk's share without.
 usage (bridge's python dir, PYTHONPATH=.): python abplus_probe_priv.py --groups-file ../abplus/catalog/scaling2_groups.json --seeds 2147600000:4 --out <dir>
 """
 import argparse
@@ -26,7 +28,7 @@ from isaac_bridge.abplus import FORK_ENV, action_code  # noqa: F401
 from isaac_bridge.abplus_goexplore import GxConfig, Instance
 from isaac_bridge.abplus_lean import LeanDecoder, read_lean_raw
 from isaac_bridge.tok_obs import SHAPE_CELLS
-from isaac_bridge.tok_priv import PRIV, PrivDecoder
+from isaac_bridge.tok_priv import PRIV, PrivDecoder, priv_record
 from isaac_bridge.tok_sampler import step_action
 
 MOVES = {(0, 0): 0, (0, -1): 1, (1, -1): 2, (1, 0): 3, (1, 1): 4, (0, 1): 5, (-1, 1): 6, (-1, 0): 7, (-1, -1): 8}
@@ -39,6 +41,8 @@ NPC_LUA = ("local r = Game():GetRoom() local p = Isaac.GetPlayer(0) for k = 1, 3
            "p.Position + Vector(0, -120), 0) Isaac.Spawn(20, 0, 0, pos, Vector(0, 0), nil) return 'ok'")
 BLIND_LUA = ("Game():GetLevel():AddCurse(64, false) local p = Isaac.GetPlayer(0) local pos = Game():GetRoom():FindFreeTilePosition("
              "p.Position + Vector(80, 0), 0) Isaac.Spawn(5, 100, 33, pos, Vector(0, 0), nil) return 'ok'")
+FIGHT_LUA = ("local r = Game():GetRoom() local p = Isaac.GetPlayer(0) p:AddHearts(24) for k = 1, 8 do local pos = r:FindFreeTilePosition(p.Position + "
+             "Vector(60 * k - 270, 160), 0) Isaac.Spawn(10, 0, 0, pos, Vector(0, 0), nil) end return 'ok'")
 PICKUP_LUA = ("local p = Isaac.GetPlayer(0) local pos = Game():GetRoom():FindFreeTilePosition(p.Position + Vector(0, 120), 0) "
               "Isaac.Spawn(5, 20, 1, pos, Vector(0, 0), nil) return 'ok'")
 
@@ -78,6 +82,34 @@ def run_clone(template, reseed, acts, priv, rep=4):
     return raws, frames, dt
 
 
+def worker_steps(template, reseed, acts, priv, spawn=None, rep=4):
+    """(seconds, decisions, frames): what a worker does per decision: step, read, decode, the privileged record."""
+    c = template.fork(alarm=300, reseed=reseed, lean=True)
+    if spawn:
+        c.lua(spawn)
+    lean = LeanDecoder()
+    lean.decode(start(c, priv))
+    dec, slots = PrivDecoder(), np.zeros(2, PRIV)
+    views = (slots[:1], slots[1:2])
+    priv_record(dec, c.priv_frame, views, 0) if priv else None
+    c.priv_frame = None
+    n, frames = 0, 0
+    t0 = time.perf_counter()
+    for t, a in enumerate(acts):
+        step_action(c, a, True, rep)
+        o = lean.decode(read_lean_raw(c))
+        if priv:
+            frames += c.priv_frame is not None
+            priv_record(dec, c.priv_frame, views, t + 1)
+            c.priv_frame = None
+        n += 1
+        if o.players['dead'][0]:
+            break
+    dt = time.perf_counter() - t0
+    c.close()
+    return dt, n, frames
+
+
 def door_walk(o, target):
     pl = o.players[0]
     sx = 0 if abs(target[0] - pl['x']) < 6 else (1 if target[0] > pl['x'] else -1)
@@ -95,6 +127,7 @@ def walk_rooms(template, reseed, dec_rows, rec, steps=400):
     pd.decode(c.priv_frame, row)
     c.priv_frame = None
     v0 = int(row['map_ver'][0])
+    no_frame = 0
     c.lua(PICKUP_LUA)   # a coin left behind in the start room
     changes, layouts, room0 = 0, 0, o.room[4]
     room, clear = o.room[4], o.clear
@@ -113,7 +146,10 @@ def walk_rooms(template, reseed, dec_rows, rec, steps=400):
         raw = read_lean_raw(c)
         o = lean.decode(raw)
         ver_before = int(row['map_ver'][0])
-        pd.decode(c.priv_frame, row)
+        if c.priv_frame is not None:
+            pd.decode(c.priv_frame, row)
+        else:
+            no_frame += 1
         c.priv_frame = None
         moved = o.room[4] != room or o.clear != clear
         layouts += int(row['map_ver'][0]) != ver_before
@@ -131,7 +167,7 @@ def walk_rooms(template, reseed, dec_rows, rec, steps=400):
         clear = o.clear
         if o.players['dead'][0]:
             break
-    rec['walk'] = dict(room_changes=changes, layouts=layouts, map_versions=int(row['map_ver'][0]) - v0, left_seen=round(left_seen, 2),
+    rec['walk'] = dict(steps_without_frame=no_frame, room_changes=changes, layouts=layouts, map_versions=int(row['map_ver'][0]) - v0, left_seen=round(left_seen, 2),
                        current_room_matches_lean_map=bool(maps_equal))
     c.close()
 
@@ -141,6 +177,8 @@ def main():
     p.add_argument('--groups-file', required=True)
     p.add_argument('--seeds', default='2147600000:4')
     p.add_argument('--steps', type=int, default=400)
+    p.add_argument('--fight', type=int, default=150)
+    p.add_argument('--repeat', type=int, default=4)
     p.add_argument('--out', required=True)
     p.add_argument('--port', type=int, default=33720)
     a = p.parse_args()
@@ -156,6 +194,7 @@ def main():
     s0, n = (int(v) for v in a.seeds.split(':'))
     all_ok = True
     times = []
+    times_w = []
     try:
         for seed in range(s0, s0 + n):
             inst.env.bridge.reset_mode = 'floor'
@@ -168,6 +207,7 @@ def main():
             r_off2, f_off2, t_off2 = run_clone(template, seed % 1000 + 1, acts, False)
             rec['frames_off'] = sum(f is not None for f in f_off) + sum(f is not None for f in f_off2)
             rec['frames_on'] = sum(f is not None for f in f_on)
+            rec['first_has_frame'] = f_on[0] is not None
             rec['records'] = len(r_on)
             rec['lean_equal'] = r_on == r_off and r_off2 == r_off
             rec['first_diff'] = next((i for i, (x, y) in enumerate(zip(r_on, r_off)) if x != y), None)
@@ -206,17 +246,20 @@ def main():
             for _ in range(2):
                 step_action(c, (0, 0, 0, 0, 0), True, 4)
                 raw = read_lean_raw(c)
-                pd.decode(c.priv_frame, row)
+                if c.priv_frame is not None:
+                    pd.decode(c.priv_frame, row)
                 c.priv_frame = None
             rec['blind'] = dict(items=row['items'][0].tolist()[:3], blind_flag=float(row['scal'][0][5]))
             # monsters: Gapers and a boss spawned; the frame's HP against the lean totals and a Lua query, as they fight
             c.lua(NPC_LUA)
-            bad_hp, seen = 0, 0
+            bad_hp, seen, fight_frames = 0, 0, 0
             for k_ in range(30):
                 step_action(c, (0, int(k_ % 4) + 1, 0, 0, 0), True, 4)
                 raw = read_lean_raw(c)
                 lean = lean_dec.decode(raw)
-                pd.decode(c.priv_frame, row)
+                fight_frames += c.priv_frame is not None
+                if c.priv_frame is not None:
+                    pd.decode(c.priv_frame, row)
                 c.priv_frame = None
                 if lean.monsters_hp > 0:
                     seen += 1
@@ -224,19 +267,46 @@ def main():
                     got = (row['hp'][0] * 50.0).tolist()[:len(hp_lua)]
                     bad_hp += abs(float(row['scal'][0][0]) * 50 - lean.monsters_hp) > 0.01 or \
                         any(abs(x - y) > 0.01 for x, y in zip(got, hp_lua))
-            rec['hp_fight'] = dict(records=seen, mismatches=int(bad_hp), last_total=round(float(row['scal'][0][0]) * 50, 2),
+            coins0 = float(row['scal'][0][7])
+            c.lua(PICKUP_LUA)
+            for _ in range(2):
+                step_action(c, (0, 0, 0, 0, 0), True, 4)
+                raw = read_lean_raw(c)
+                if c.priv_frame is not None:
+                    pd.decode(c.priv_frame, row)
+                c.priv_frame = None
+            rec['pickup_shows'] = bool(float(row['scal'][0][7]) > coins0)
+            rec['hp_fight'] = dict(records=seen, frames=int(fight_frames), mismatches=int(bad_hp), last_total=round(float(row['scal'][0][0]) * 50, 2),
                                    monsters=round(float(row['scal'][0][1]) * 16), boss_hp=round(float(row['scal'][0][2]) * 500, 1),
                                    boss_max=round(float(row['scal'][0][3]) * 500, 1), hp=[round(float(v) * 50, 1) for v in row['hp'][0][:4]])
             c.close()
             walk_rooms(template, seed % 1000 + 2, row, rec)
             sizes = [len(f) for f in f_on if f is not None]
-            rec['frame_bytes'] = dict(mean=round(float(np.mean(sizes)), 1), max=int(np.max(sizes)))
+            rec['frame_bytes'] = dict(mean=round(float(np.mean(sizes)), 1), max=int(np.max(sizes)), per_record=round(len(sizes) / len(f_on), 3))
             t0 = time.perf_counter()
             dec = PrivDecoder()
             for f in f_on:
-                dec.decode(f, row)
-            rec['decode_us'] = round(1e6 * (time.perf_counter() - t0) / max(len(f_on), 1), 1)
-            ok = rec['frames_off'] == 0 and rec['frames_on'] == rec['records'] and rec['lean_equal'] and not rec['clone_of_asked_has_frame'] \
+                if f is not None:
+                    dec.decode(f, row)
+            rec['decode_us'] = round(1e6 * (time.perf_counter() - t0) / max(len(sizes), 1), 1)
+            # the worker's cost, alternating: a walk's actions (mostly quiet rooms), and with monsters spawned
+            t_w = {False: [], True: []}
+            t_f = {False: [], True: []}
+            fr_w = fr_f = 0
+            for k_ in range(a.repeat):
+                for on_ in ((False, True) if k_ % 2 == 0 else (True, False)):
+                    dt_, n_, f_ = worker_steps(template, seed % 1000 + 1, acts, on_)
+                    t_w[on_].append(dt_ / max(n_, 1))
+                    fr_w = f_ / max(n_, 1) if on_ else fr_w
+                    dt_, n_, f_ = worker_steps(template, seed % 1000 + 1, acts[:a.fight], on_, FIGHT_LUA)
+                    t_f[on_].append(dt_ / max(n_, 1))
+                    fr_f = f_ / max(n_, 1) if on_ else fr_f
+            rec['worker_ms'] = dict(quiet_off=round(1000 * float(np.median(t_w[False])), 4), quiet_on=round(1000 * float(np.median(t_w[True])), 4),
+                                    quiet_frames=round(fr_w, 3), fight_off=round(1000 * float(np.median(t_f[False])), 4),
+                                    fight_on=round(1000 * float(np.median(t_f[True])), 4), fight_frames=round(fr_f, 3))
+            times_w.append((rec['worker_ms']['quiet_off'], rec['worker_ms']['quiet_on'], rec['worker_ms']['fight_off'], rec['worker_ms']['fight_on']))
+            ok = rec['frames_off'] == 0 and rec['first_has_frame'] and 0 < rec['frames_on'] <= rec['records'] and rec['lean_equal'] and not rec['clone_of_asked_has_frame'] \
+                and rec['pickup_shows'] \
                 and rec['rooms']['on_map'] == rec['rooms']['listed'] and rec['blind']['items'][0] == 33 and rec['blind']['blind_flag'] == 1.0 \
                 and abs(rec['hp']['frame_total'] - rec['hp']['lean_total']) < 0.01 and not rec.get('layout_mismatch') \
                 and rec['hp_fight']['records'] > 0 and rec['hp_fight']['mismatches'] == 0
@@ -245,8 +315,11 @@ def main():
             print(json.dumps(rec), flush=True)
             template.close()
         t = np.array(times)
+        w = np.array(times_w)
         print(json.dumps(dict(summary=True, all_ok=bool(all_ok), off_s=round(float(t[:, :2].mean()), 3), on_s=round(float(t[:, 2].mean()), 3),
-                              ratio=round(float(t[:, 2].mean() / t[:, :2].mean()), 4))), flush=True)
+                              ratio=round(float(t[:, 2].mean() / t[:, :2].mean()), 4),
+                              worker_quiet_ratio=round(float(w[:, 1].sum() / w[:, 0].sum()), 4),
+                              worker_fight_ratio=round(float(w[:, 3].sum() / w[:, 2].sum()), 4))), flush=True)
     finally:
         inst.close()
     raise SystemExit(0 if all_ok else 1)

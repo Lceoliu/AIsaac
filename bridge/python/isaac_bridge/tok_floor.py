@@ -358,7 +358,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     priv_slots = priv_ver = priv_dec = None
     if priv_on:
         from multiprocessing import shared_memory as shm_
-        from .tok_priv import PRIV, PrivDecoder
+        from .tok_priv import PRIV, PrivDecoder, priv_record
         priv_block = shm_.SharedMemory(name=cfg.priv_block)
         blocks = blocks + [priv_block]
         priv_all = np.ndarray((2 * cfg.workers,), PRIV, buffer=priv_block.buf)
@@ -1841,7 +1841,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 else:
                                     mine[ST['cf_skipped']] += 1
                     if priv_on:   # 2026-11-03 (tok_priv): the record's privileged record, in its slot's place
-                        priv_dec.decode(episode.priv_frame, priv_slots[t_ep & 1])
+                        priv_record(priv_dec, episode.priv_frame, priv_slots, t_ep)
                         episode.priv_frame = None
                     t1 = time.perf_counter()
                     mine[ST['encode_s']] += t1 - t0

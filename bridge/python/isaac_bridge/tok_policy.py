@@ -1487,6 +1487,8 @@ class TokPolicy(nn.Module):
             else:
                 zr = z
             s_t = ta.embed(z, gn)
+            if tctx.get('keep_zg'):   # 2026-11-03 (train_tok --log-stream): the spatial representations of the records
+                tctx['user']['zg_in'] = (z, gn)
             n = z.shape[0]
             mode = tctx['mode']
             if mode == 'step':

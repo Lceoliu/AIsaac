@@ -11,6 +11,7 @@ usage: python aux_learn_driver.py --tree <dir with bridge/python> --out <dir> [-
        [--horizons 1,4,16] [--coef 0.1] [--resume <ck>] [--decoupled 1]
 """
 import argparse
+import copy
 import csv
 import hashlib
 import os
@@ -91,6 +92,7 @@ def main():
     a.add_argument('--priv', type=int, default=0)
     a.add_argument('--priv-seed', type=int, default=21)
     a.add_argument('--extra', default='', help='more train_tok arguments, comma-separated')
+    a.add_argument('--dump-z', type=int, default=0, help='also: the policy\'s z, gn of the first update\'s start vs its stream log')
     o = a.parse_args()
     py = Path(o.tree) / 'bridge' / 'python'
     sys.path.insert(0, str(py / 'tests'))
@@ -154,7 +156,7 @@ def main():
                   heal=0.5, resource=0.25, clear=1.0)
         tcfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
                     kv=args.temporal_kv, device='cpu', rows=args.rollout + 4 * W + 64)
-        kw = dict(close=True) if o.aux else {}
+        kw = dict(close=True) if (o.aux or '--log-stream' in o.extra) else {}
         p_rng = np.random.default_rng(o.priv_seed)
         p_rows = None
         if o.priv:   # (random privileged records: a stand-in for the bridge's, per decision)
@@ -202,6 +204,23 @@ def main():
         return dict(roll=roll, prof=prof, worker=worker, finished=list(book.finished), t_start=time.perf_counter(),
                     collect_s=0.0, cycle_s=1.0, wait_learner_s=0.0, teach=(np.zeros(0, TT.ROW), np.zeros((0, 16))))
 
+    def z_ref(m, roll, args):
+        """The start-of-update pass's z, gn per (worker, decision), from the update's start weights."""
+        out_ = {}
+        cap = roll.cap
+        for w in range(roll.n):
+            L_ = int(roll.length[w])
+            flat = w * cap + np.arange(L_, dtype=np.int64)
+            t_r = TT.temporal_rows(roll, flat, cap, 'cpu')
+            b = TP.to_batch(roll.rows[w, :L_], roll.pending[w, :L_], 'cpu')
+            d_ = dict(mode='stored', o=t_r['o'], o_prev=t_r['o_prev'], has=t_r['has'], keep_zg=True)
+            with torch.no_grad():
+                m(b, need_vg=True, temporal=d_)
+            z_, g_ = d_['zg_in']
+            for t in range(L_):
+                out_[(w, int(roll.rows[w, t]['t']), int(roll.rows[w, t]['episode']))] = (z_[t].numpy().copy(), g_[t].numpy().copy())
+        return out_
+
     def fake_run_bench(d):
         model, args = d['model'], d['args']
         job = collect(model, args, args.rollout // args.workers * 4 + 64)
@@ -212,6 +231,7 @@ def main():
             if getattr(job['roll'], name, None) is not None:
                 res['rollout'][name] = getattr(job['roll'], name).copy()
         # (the rollout's arrays stay as they are: learn() reads them only)
+        model0 = copy.deepcopy(model).eval() if o.dump_z else None
         torch.manual_seed(13)
         np.random.seed(13)
         t0 = time.perf_counter()
@@ -219,6 +239,8 @@ def main():
             d['learn'](job)
         res['learn_s'] = (time.perf_counter() - t0) / o.updates
         res['weights'] = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        if o.dump_z:
+            res['z_ref'] = z_ref(model0, job['roll'], args)
         res['opt'] = d['opt'].state_dict()
         d['L']['stop'] = True
         return True

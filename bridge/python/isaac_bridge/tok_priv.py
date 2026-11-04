@@ -1,11 +1,12 @@
 """Privileged critic (train_tok --priv-critic 1; rl/docs/PREDICTIVE_MEMORY_DESIGN.md section 4): what the value heads may
 read and the policy never does.
 
-Way of the data. The bridge (abp_bridge.lua, `priv` command, abp-0.2.19) sends a frame "P <bytes>\\n" before each lean
-observation of the one connection that asked; the lean observation itself is not touched, so ROW and everything the
-actor's graphs read are the same bytes with the switch on or off, and a clone never inherits the switch. The worker
-(tok_floor) decodes the frame into a PRIV record in a shared slot of its own; the trainer keeps it per worker
-(arrival) and stores it next to the decision (Rollout.priv). The learner alone reads it: PrivBatch / PrivCritic here.
+Way of the data. The bridge (abp_bridge.lua, `priv` command, abp-0.2.19) sends a frame "P <bytes>\\n" before a lean
+observation of the one connection that asked, when its content changed (no frame: the last one still holds); the lean
+observation itself is not touched, so ROW and everything the actor's graphs read are the same bytes with the switch on or
+off, and a clone never inherits the switch. The worker (tok_floor) decodes the frame into a PRIV record in a shared slot of
+its own (priv_record); the trainer keeps it per worker (arrival) and stores it next to the decision (Rollout.priv). The
+learner alone reads it: PrivBatch / PrivCritic here.
 
 PRIV record:
   map [PRIV_MAP]: the floor's true layout on the 13 x 13 grid: every room, found or not. Channels: room, visited, clear,
@@ -131,6 +132,16 @@ class PrivDecoder:
         row['items'][0] = it
         row['missing'] = 0
         return True
+
+
+def priv_record(decoder, frame, slots, t):
+    """The worker's record t into slots[t & 1] (two PRIV rows, as the ROW slots): from its frame, or as the record before when
+    the bridge sent none (nothing changed). A connection's first record without a frame: missing."""
+    row = slots[t & 1]
+    if frame is None and decoder.layout:
+        row[0] = slots[(t - 1) & 1][0]
+    else:
+        decoder.decode(frame, row)
 
 
 class PrivBatch:

@@ -2043,8 +2043,9 @@ local function send_raw(data)
 end
 
 -- abp-0.2.19 (2026-11-03, rl/docs/PREDICTIVE_MEMORY_DESIGN.md section 4, the privileged critic): the `priv` command
--- ({"cmd":"priv","enabled":true}) makes THIS connection's lean observations follow a frame "P <bytes>\n<payload>" with what
--- the policy may not see (python/isaac_bridge/tok_priv.py decodes it). The lean observation itself is the same bytes.
+-- ({"cmd":"priv","enabled":true}) has THIS connection's lean observations preceded by a frame "P <bytes>\n<payload>" with
+-- what the policy may not see (python/isaac_bridge/tok_priv.py decodes it), when it changed: no frame = the last one
+-- still holds (the first after the command always goes). The lean observation itself is the same bytes.
 -- A clone starts with it off (fork_clone), so parked states and searches never build it. Read-only: no RNG, no game call
 -- that changes anything. Payload:
 --   <IBBfHH9H  magic "PRIV", flags (1: a layout block follows), Curse of the Blind, the room's total monster HP, monsters
@@ -2059,10 +2060,13 @@ end
 local PRIV_MAGIC = 0x56495250
 local PRIV_CLASS = { [10] = 0, [20] = 1, [30] = 2, [40] = 3, [50] = 4, [51] = 4, [52] = 4, [53] = 4, [54] = 4, [55] = 4,
 	[60] = 4, [360] = 4, [70] = 6, [300] = 6, [350] = 7, [100] = 8 }   -- anything else: 5 (other)
-local PRIV = { key = nil, floor = nil, here = nil, last = nil, left = {}, spawns = nil }
+local PRIV = { key = nil, floor = nil, here = nil, last = nil, left = {}, spawns = nil, sig = nil, sig2 = nil, sig3 = nil,
+	sent = 0, skipped = 0 }
+ABP_PRIV = PRIV
 
 local function priv_reset()
 	PRIV.key, PRIV.floor, PRIV.here, PRIV.last, PRIV.spawns = nil, nil, nil, nil, nil
+	PRIV.sig, PRIV.sig2, PRIV.sig3 = nil, nil, nil
 	PRIV.left = {}
 end
 
@@ -2111,13 +2115,46 @@ local function priv_layout(rooms, here)
 		left[7], left[8], left[9], unv[1], unv[2], unv[3], unv[4], unv[5], unv[6], unv[7], unv[8], unv[9])
 end
 
-local function priv_payload()
+-- nil when nothing changed since the last frame. here, clear: the room's index and clear state (the native terrain check's
+-- when the caller has them, nil otherwise). The first pass over the room's entities only sums (no strings, no packing);
+-- the records are built on a change.
+local function priv_payload(here, clear)
 	local game = Game()
 	local level = game:GetLevel()
 	local blind = (level:GetCurses() & 64) ~= 0
+	local ents = Isaac.GetRoomEntities()
+	local hp_sig, pick_sig, total, n_mon = 0.0, 0, 0.0, 0
+	for i = 1, #ents do
+		local e = ents[i]
+		local t = e.Type
+		if t == 5 then
+			-- (per class a digit of 64; a pedestal's id under the curse on top: a room's pickups fit)
+			pick_sig = pick_sig + (1 << (6 * (PRIV_CLASS[e.Variant] or 5)))
+			if blind and e.Variant == 100 then pick_sig = pick_sig ~ (e.SubType << 54) end
+		elseif t >= 10 and t < 1000 and e:ToNPC() then
+			local hp = e.HitPoints
+			if hp > 0 and is_monster(e) then
+				n_mon = n_mon + 1
+				total = total + hp
+				hp_sig = hp_sig + hp * n_mon
+			end
+		end
+	end
+	if here == nil then
+		here, clear = lean_room_index(level), game:GetRoom():IsClear()
+	end
+	local stage = level:GetStage()
+	local key = stage * 1000000 + here * 2 + (clear and 1 or 0)
+	if key == PRIV.key and hp_sig == PRIV.sig and pick_sig == PRIV.sig2 and n_mon == PRIV.sig3 then
+		PRIV.skipped = PRIV.skipped + 1
+		return nil
+	end
+	PRIV.sig, PRIV.sig2, PRIV.sig3 = hp_sig, pick_sig, n_mon
+	PRIV.sent = PRIV.sent + 1
 	local npcs, peds, counts = {}, {}, { 0, 0, 0, 0, 0, 0, 0, 0, 0 }
-	local total, n_npc, n_ped = 0, 0, 0
-	for _, e in ipairs(Isaac.GetRoomEntities()) do
+	local n_npc, n_ped = 0, 0
+	for i = 1, #ents do
+		local e = ents[i]
 		local t = e.Type
 		if t == 5 then
 			local v = e.Variant
@@ -2127,16 +2164,11 @@ local function priv_payload()
 				n_ped = n_ped + 1
 				peds[n_ped] = spack("<H", e.SubType)
 			end
-		elseif t >= 10 and t < 1000 and e:ToNPC() and e.HitPoints > 0 and is_monster(e) then
-			total = total + e.HitPoints
-			if n_npc < 32 then
-				n_npc = n_npc + 1
-				npcs[n_npc] = spack("<ffB", e.HitPoints, e.MaxHitPoints, e:IsBoss() and 1 or 0)
-			end
+		elseif t >= 10 and t < 1000 and e:ToNPC() and e.HitPoints > 0 and is_monster(e) and n_npc < 32 then
+			n_npc = n_npc + 1
+			npcs[n_npc] = spack("<ffB", e.HitPoints, e.MaxHitPoints, e:IsBoss() and 1 or 0)
 		end
 	end
-	local here, stage = lean_room_index(level), level:GetStage()
-	local key = stage * 1000000 + here * 2 + (game:GetRoom():IsClear() and 1 or 0)
 	local layout, flags = "", 0
 	if key ~= PRIV.key then
 		local rooms = level:GetRooms()
@@ -2155,13 +2187,14 @@ local function priv_payload()
 end
 
 -- The frame before a lean observation of a connection that asked; a failure is logged and the record goes without one.
-local function send_priv()
-	local ok, payload = pcall(priv_payload)
+local function send_priv(here, clear)
+	local ok, payload = pcall(priv_payload, here, clear)
 	if not ok then
 		log("priv pack failed: " .. tostring(payload))
+		priv_reset()   -- (the next one complete)
 		return
 	end
-	send_raw("P " .. #payload .. "\n" .. payload)
+	if payload ~= nil then send_raw("P " .. #payload .. "\n" .. payload) end
 end
 
 local function send_obs_now(event)
@@ -2501,7 +2534,7 @@ local function handle_command(line)
 		elseif cmd.cmd == "priv" then   -- abp-0.2.19 (see priv_payload)
 			state.priv = cmd.enabled ~= false
 			priv_reset()
-			send({ type = "ok", cmd = "priv", enabled = state.priv })
+			send({ type = "ok", cmd = "priv", enabled = state.priv, sent = PRIV.sent, skipped = PRIV.skipped })
 		elseif cmd.cmd == "lean_items" then   -- 2026-10-06 (items, Phase A): the inventory block and run-mode map rules
 			if cmd.enabled ~= nil then
 				state.lean_items = cmd.enabled == true
@@ -2670,7 +2703,7 @@ local function native_step_obs()
 	state.terrain_dirty = false
 	state.seq = state.seq + 1
 	state.credits = {}
-	if state.priv then send_priv() end   -- abp-0.2.19: before the observation, whichever way that one goes out
+	if state.priv then send_priv(here, clear) end   -- abp-0.2.19: before the observation, whichever way that one goes out
 	local s = ABP_NATIVE_STEP
 	local consecutive = s.consecutive
 	s.consecutive = false

@@ -65,6 +65,18 @@ def frame(npcs=(), peds=(), counts=(0,) * 9, blind=0, total=None, layout=None):
 def case_a():
     row = np.zeros(1, P.PRIV)
     d = P.PrivDecoder()
+    s2 = np.zeros(2, P.PRIV)
+    v2 = (s2[:1], s2[1:2])
+    P.priv_record(P.PrivDecoder(), None, v2, 0)
+    check('(a) priv_record: a connection\'s first record without a frame is missing', s2['missing'][0] == 1)
+    d0 = P.PrivDecoder()
+    P.priv_record(d0, frame(npcs=[(7.0, 9.0, 0)], layout=([(84, 1, 1, 7)], [0] * 9, [0] * 9)), v2, 0)
+    P.priv_record(d0, None, v2, 1)
+    check('(a) priv_record: no frame = the record before, every field', s2[0].tobytes() == s2[1].tobytes() and s2['missing'][1] == 0 and
+          abs(float(s2['hp'][1][0]) - 7.0 / P.HP_SCALE) < 1e-6)
+    P.priv_record(d0, frame(npcs=[(5.0, 9.0, 0)]), v2, 2)
+    check('(a) priv_record: the next frame in the other slot, the layout kept', abs(float(s2['hp'][0][0]) - 5.0 / P.HP_SCALE) < 1e-6 and
+          s2['map_ver'][0] == 1 and s2['map'][0].sum() > 0)
     # the start room (visited, clear, here), a boss, a secret, a super secret, a treasure, a shop, a 1x2 normal room (shape 4
     # covers its GridIndex and the cell below), a curse room (type 10: another special room)
     rooms = [(84, 1, 1, 1 + 2 + 4), (95, 1, 5, 0), (98, 1, 7, 0), (45, 1, 8, 0), (123, 1, 4, 0), (86, 1, 2, 0), (72, 4, 1, 0),

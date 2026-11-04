@@ -12,14 +12,16 @@ for round in $(seq 1 ${ROUNDS:-2}); do
       a1) sw="--aux-predict 1" ;;
       a2) sw="--priv-critic 1" ;;
       a3) sw="--aux-predict 1 --priv-critic 1" ;;
+      l0) sw="--log-stream 1" ;;
+      l3) sw="--aux-predict 1 --priv-critic 1 --log-stream 1" ;;
     esac
     HOURS=${HOURS:-6} WORKERS=8 PORT=49700 ops/host2_pred_smoke.sh "$label-$arm-$round" --minibatch 4096 --micro 4096 ${EXTRA:-} $sw | head -n 1
   done
 done
 cat > /tmp/pred_cmp.py <<EOF
 import csv, glob, statistics as s
-keys = ("update_s", "u_ppo", "u_batch", "u_recompute", "u_opt", "u_aux", "u_priv", "collect_s", "x_real_time")
-for arm in ("a0", "a1", "a2", "a3"):
+keys = ("update_s", "u_ppo", "u_batch", "u_recompute", "u_opt", "u_aux", "u_priv", "u_log", "log_write_s", "log_raw_gb", "log_dropped", "collect_s", "x_real_time")
+for arm in ("a0", "a1", "a2", "a3", "l0", "l3"):
     rows = []
     for f in sorted(glob.glob("runs/$label-%s-*/progress.csv" % arm)):
         rows += list(csv.DictReader(open(f)))[3:]   # (the first updates: graphs, plans)

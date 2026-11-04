@@ -204,6 +204,12 @@ Privileged critic (2026-11-03, rl/docs/PREDICTIVE_MEMORY_DESIGN.md section 4, is
   trained, on the same returns, from a stopped gradient: they no longer drive the shared layers. Teacher records have
   no p_t: zeros and a missing flag. The encoder, its heads and their Adam are the checkpoint's 'priv'; progress.csv
   priv_missing, priv_plain_vf, priv_plain_vg, u_priv.
+Decision stream log (2026-11-03, rl/docs/PREDICTIVE_MEMORY_DESIGN.md section 5.1, the format: rl/docs/STREAM_LOG_FORMAT.md,
+  isaac_bridge/tok_stream.py; off by default, then nothing changes; needs zstandard): --log-stream 1 writes, for
+  --log-stream-rate of the episodes, every decision's z_t, g_t (bfloat16, from the start-of-update pass) with its state,
+  action, reward and events, and for --log-row-rate of them the whole ROW, to <out>/stream/ (one zstd stream per worker, an
+  asynchronous writer; a full queue drops a job, counted). The numbers trained on do not change. progress.csv log_rows,
+  log_row_rows, log_raw_gb, log_dropped, log_queue, log_write_s, log_error, u_log.
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
 
@@ -1750,6 +1756,11 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--priv-critic', type=int, default=0, choices=(0, 1),
                    help='2026-11-03 (tok_priv, PREDICTIVE_MEMORY_DESIGN.md section 4): 1 = the value heads also read the '
                         'bridge\'s privileged record (true layout, monster HP, the floor\'s pickups); the policy never')
+    p.add_argument('--log-stream', type=int, default=0, choices=(0, 1),
+                   help='2026-11-03 (tok_stream, PREDICTIVE_MEMORY_DESIGN.md section 5.1): 1 = the decision stream log in <out>/stream')
+    p.add_argument('--log-stream-rate', type=float, default=0.25, help='--log-stream: the share of episodes logged')
+    p.add_argument('--log-row-rate', type=float, default=0.02,
+                   help='--log-stream: the share of episodes whose whole ROW is logged too (a subset of the logged ones)')
     p.add_argument('--fused-adam', type=int, default=0,
                    help='1: Adam as one fused CUDA kernel (the same update rule; float rounding may differ)')
     p.add_argument('--dump-rollouts', type=int, default=0,
@@ -1922,6 +1933,15 @@ def main(argv=None, child=None, actor=None):
             p.error('--priv-critic 1 needs --teach-merge 1 (the teachers\' records through the heads in one forward)')
         recompute = True   # (the actor has no p_t: every value from the learner's pass)
     gn_on = aux_on or priv_on or bool(os.environ.get('ISAAC_RL_LOG_GRAD_NORM'))
+    log_on = bool(args.log_stream)   # 2026-11-03 (tok_stream)
+    if log_on:
+        if not t_on or not args.global_token or not recompute:
+            p.error('--log-stream 1 needs --temporal 1, --global-token 1 and the start-of-update pass (--overlap or '
+                    '--recompute-values on): z_t, g_t come from it')
+        if args.learner_compile:
+            p.error('--log-stream 1: not with --learner-compile (the forward hands z_t, g_t back through its context)')
+        if not 0.0 <= args.log_row_rate <= args.log_stream_rate <= 1.0:
+            p.error('--log-row-rate <= --log-stream-rate <= 1 expected')
     pick_force = parse_pickup_force(args.pickup_force)   # 2026-10-13 (B23)
     pf_on = max(pick_force) > 0
     rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0, heal=0.0, resource=0.0)
@@ -2088,6 +2108,10 @@ def main(argv=None, child=None, actor=None):
     if priv_on and (child is not None or not proc):
         pcritic = make_critic(args.width).to(lm_dev)
         popt = torch.optim.Adam(pcritic.parameters(), lr=args.lr, eps=1e-5, **(dict(fused=True) if fused else {}))
+    slog = None   # 2026-11-03 (tok_stream)
+    if log_on and (child is not None or not proc):
+        from isaac_bridge.tok_stream import StreamLog
+        slog = StreamLog(out, args.width, nh, args.log_stream_rate, args.log_row_rate)
     update, decisions_total, seconds_total = 0, 0, 0.0
     if args.init:
         print('init', args.init, load_compatible(learner_model, torch.load(args.init, map_location=lm_dev)['model']))
@@ -2325,7 +2349,7 @@ def main(argv=None, child=None, actor=None):
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
     if child is None:
-        r_kw = dict(close=aux_on, priv=PRIV_DTYPE if priv_on else None)
+        r_kw = dict(close=aux_on or log_on, priv=PRIV_DTYPE if priv_on else None)
         roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw), \
             Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw)
         if n_act > 1 and actor is None:   # (the first actor: the shared arrays of all workers, its rows of them)
@@ -2546,7 +2570,8 @@ def main(argv=None, child=None, actor=None):
         adev, device = device_actor, ldev
         t0 = time.perf_counter()
         U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
-                          (('temporal',) if t_on else ()) + (('aux',) if aux_on else ()) + (('priv',) if priv_on else ()),
+                          (('temporal',) if t_on else ()) + (('aux',) if aux_on else ()) + (('priv',) if priv_on else ()) +
+                          (('log',) if log_on else ()),
                           0.0)   # seconds per part of the update (u_* columns)
         if t_on and getattr(job['roll'], 't_kv', None) is None:
             raise RuntimeError('--temporal 1: the rollout has no temporal arrays (a bench job of a run without it?)')
@@ -2635,6 +2660,11 @@ def main(argv=None, child=None, actor=None):
                                           has=t_all['has'][part_])) if t_on else {}
             vals, lps = [], []
             pv_all = PrivBatch(rl, all_flat, device) if priv_on else None   # 2026-11-03 (tok_priv)
+            s_plan = None
+            if slog is not None:   # 2026-11-03 (tok_stream): the rows to log, their z_t, g_t from this pass
+                t_l0 = time.perf_counter()
+                s_plan = slog.plan(rl, all_flat, device)
+                U['log'] += time.perf_counter() - t_l0
             m_r = pmark('b38:recompute')
             with torch.inference_mode():
                 chunk = args.micro or args.minibatch
@@ -2647,10 +2677,14 @@ def main(argv=None, child=None, actor=None):
                         tk_p = tk_all(part)
                         if priv_on:   # 2026-11-03 (tok_priv): the values from the privileged heads
                             tk_p['temporal']['keep_z'] = True
+                        if s_plan is not None:
+                            tk_p['temporal']['keep_zg'] = True
                         with autocast():
                             o_ = lm_call(b_p, packed=bool(args.packed), mem=h_all[part] if mem_on else None,
                                                need_vg=True, **tk_p)
                         lp_ = learner_model.log_prob(o_[0], learner_model.gate(b_p), acts_all[part])[0]
+                        if s_plan is not None:
+                            slog.part(s_plan, at, at + len(part), *tk_p['temporal'].pop('zg_in'))
                         if priv_on:
                             zr_p, zg_p = tk_p['temporal'].pop('z_out')
                             v_, vg_p = pcritic(zr_p, zg_p, pcritic.encode(pv_all, part))
@@ -2673,6 +2707,9 @@ def main(argv=None, child=None, actor=None):
             prox_all = torch.cat(lps)
             pmark(None, m_r)
             sec('recompute')
+            if s_plan is not None:   # (the host's records now: the rollout is the actor's again after `fresh`)
+                slog.gather(s_plan, rl, L['update'])
+                sec('log')
         if gtok_on and len(all_flat) and vg_stored is not None and not vgs:   # (B24) the actor's values, as stored
             vg_now = vg_stored
             adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now)
@@ -3529,6 +3566,9 @@ def main(argv=None, child=None, actor=None):
         choice_log = train_choice() if branching else {}   # Phase B2 (before the actor takes the new weights)
         torch.cuda.current_stream().synchronize()
         sec('tail')
+        if slog is not None and s_plan is not None:   # 2026-11-03 (tok_stream): the job to the writer (never waits)
+            slog.submit(s_plan)
+            sec('log')
         update_s = time.perf_counter() - t0
         cpu_end = cpu_ticks()
         job['cpu0'] = cpu0
@@ -3630,7 +3670,14 @@ def main(argv=None, child=None, actor=None):
                 row['v_global_ev'] = 1.0 - float((rg_ - vg_).var()) / var_g if var_g > 0 else 0.0
             else:
                 row['v_global_ev'] = ''
+        if slog is not None:   # 2026-11-03 (tok_stream)
+            row.update(slog.columns())
         if priv_on:   # 2026-11-03 (tok_priv)
+            # (M2 review: what share of the episode starts are parked mid-floor states: their rooms' leftovers are unknown)
+            fk_ = float(stats[:, ST['forks']].sum()) if 'forks' in ST else 0.0
+            as_ = float(stats[:, ST['archive_starts']].sum())
+            row['priv_archive_share'] = (as_ - L.get('pa_as', 0.0)) / max(fk_ - L.get('pa_fk', 0.0), 1.0)
+            L['pa_as'], L['pa_fk'] = as_, fk_
             row['priv_missing'] = pv_b.missing_share
             row['priv_plain_vf'], row['priv_plain_vg'] = float(pacc2[0]) / steps_, float(pacc2[1]) / steps_
         if gn_on:   # 2026-11-03: the policy's gradient norm before the clip, mean over the steps (ISAAC_RL_LOG_GRAD_NORM=1:
@@ -4015,6 +4062,8 @@ def main(argv=None, child=None, actor=None):
             try:
                 torch.cuda.synchronize()
                 save(out / 'checkpoints' / 'last.pt')
+                if slog is not None:
+                    slog.close()
             except BaseException:
                 results_q.put(('error', 'saving last.pt: ' + traceback.format_exc()))
             results_q.put(('done', dict(update=L['update'], decisions=L['decisions'], seconds=L['seconds'])))
@@ -4529,6 +4578,8 @@ def main(argv=None, child=None, actor=None):
             if split:   # (B38: the learner's GPU too)
                 torch.cuda.synchronize(ldev)
             save(out / 'checkpoints' / 'last.pt')
+            if slog is not None:
+                slog.close()
         sampler.close()
         if log_file is not None:
             log_file.close()
