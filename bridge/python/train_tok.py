@@ -792,7 +792,8 @@ class Rollout:
     def t_dest(self, a_idx):
         """(B31) GraphActor.submit's tdest for the next decisions of workers a_idx: this rollout's device tensors and
         the records' rows."""
-        return dict(kv=self.t_kv, s=self.t_s, o=self.t_o, obase=self.t_obase, rows=self.t_assign(a_idx),
+        rows = self.t_assign(a_idx)   # (first: a pool that grows here gets new tensors, which the dict must name)
+        return dict(kv=self.t_kv, s=self.t_s, o=self.t_o, obase=self.t_obase, rows=rows,
                     **(dict(m=self.t_m) if self.t_m is not None else {}))
 
     def carry(self, other):

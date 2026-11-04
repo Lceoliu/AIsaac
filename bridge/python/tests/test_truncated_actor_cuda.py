@@ -12,7 +12,7 @@ actors -> merge_rollouts (both actors' pools, cross-device). Checks:
           learner under BF16 autocast): max abs <= 2 x the BF16 noise floor (the BF16 actor against the FP32 learner
           on the same constants) + 1e-6;
   no context mismatch, no constant with a gradient.
-  python tests/test_truncated_actor_cuda.py [--bf16] [--actors cuda:0[,cuda:1]] [--learner cuda:2] [--threshold 1e-6]
+  python tests/test_truncated_actor_cuda.py [--bf16 --compile] [--actors cuda:0[,cuda:1]] [--learner cuda:2] [--threshold 1e-6]
 """
 import argparse
 import sys
@@ -40,6 +40,8 @@ def main():
     ap.add_argument('--actors', default='cuda:0')
     ap.add_argument('--learner', default='cuda:0')
     ap.add_argument('--threshold', type=float, default=1e-6)
+    ap.add_argument('--compile', action='store_true', help='the actor compiled as in production (--actor-compile '
+                    'default, math SDPA); the eager graph actor cannot write BF16 values into its float32 rings')
     args = ap.parse_args()
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -71,7 +73,8 @@ def main():
         with torch.cuda.device(d):
             states.append(TP.TemporalState(models[a], NW, d, torch.float32))
             actors.append(RebuildGraphActor(models[a], NW, entities=[8, 16], temporal=states[a], row_sizes=[NW],
-                                            bf16=args.bf16))
+                                            bf16=args.bf16, compile_mode='default' if args.compile else None,
+                                            sdpa_math=args.compile))
     fulls = None
     if A > 1:
         fulls = [TT.full_from_local(r, A * NW, 0, np.zeros) for r in rolls[0]]
