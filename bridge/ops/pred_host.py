@@ -54,31 +54,40 @@ def pick(allowed, n=3):
     free = [g for g in allowed if idx[str(g)] not in apps]
     return (free[:n], None) if len(free) >= n else (None, f'free {free} of {allowed}')
 queue = list(chain['cases'])
-settled = False   # (the chain holds the host: within it no second wait)
-def ready(c):
-    gpus, why = pick(c.get('gpus') or chain['gpus'])
-    if why is None and chain.get('max_busy_cores'):   # (a measurement: only on a quiet host, the guard's own rule)
-        if host_cores() > chain['max_busy_cores']:
-            why = f'host busy, more than {chain["max_busy_cores"]} cores'
-    return gpus, why
+settled = False   # (a steady window was seen and nothing of ours has been stopped since: within it no second window)
+MEAN, SPREAD, MINUTES = chain.get('external_mean_max', 16.0), chain.get('external_spread_max', 3.0), chain.get('window_minutes', 15)
+def steady_window(c):
+    """The start rule (2026-11-05): over the last MINUTES one-minute samples, with three GPUs free and no aisaac container all along (so the host's busy CPUs
+    are the others'): mean <= MEAN cores and largest - smallest <= SPREAD cores. Comparisons are relative within this load, so a steady load is fair; a burst is not."""
+    window, last, noted = [], None, 0.0
+    while True:
+        gpus, why = pick(c.get('gpus') or chain['gpus'])
+        if why is not None:
+            window = []
+            time.sleep(60)
+        else:
+            window = (window + [host_cores(60)])[-MINUTES:]
+            if len(window) == MINUTES:
+                mean, spread = sum(window) / MINUTES, max(window) - min(window)
+                if mean <= MEAN and spread <= SPREAD:
+                    note(event='steady window', case=c['case'], gpus=gpus, external_mean=round(mean, 1), external_spread=round(spread, 1))
+                    return gpus
+                why = f'external mean {mean:.1f} spread {spread:.1f}'
+        key = why.split(' mean')[0] if why else None
+        if why and (key != last or time.time() - noted > 1800):   # (a change, or every half hour)
+            note(event='wait', case=c['case'], why=why)
+            last, noted = key, time.time()
 while queue:
     c = queue.pop(0)
     if (root / 'pred' / 'STOP').exists(): note(event='stop file'); break
-    last = None
-    while True:
-        gpus, why = ready(c)
-        if why is None and not settled and chain.get('settle_s'):
-            # quiet: the other line on the host may be seeing the same window; wait and look again before taking it
-            note(event='quiet, settling', case=c['case'], seconds=chain['settle_s'])
-            time.sleep(chain['settle_s'])
-            gpus, why = ready(c)
-            if why is not None: why = 'after settling: ' + why
-            else: settled = True
-        if why is None: break
-        if why != last:   # (only a change is noted)
-            note(event='wait', case=c['case'], why=why)
-            last = why
-        time.sleep(60)
+    gpus = None
+    if settled:   # (between the chain's cases: a look, not a new window, unless the load has moved past the mean)
+        gpus, why = pick(c.get('gpus') or chain['gpus'])
+        if why is not None or host_cores(60) > MEAN:
+            gpus, settled = None, False
+    if not settled:
+        gpus = steady_window(c)
+        settled = True
     free = int(subprocess.check_output(['df', '--output=avail', '-B1G', str(root)], text=True).split()[1])
     if free < chain.get('min_disk_gb', 200):
         note(event='disk', free=free); break
@@ -151,6 +160,13 @@ def deploy():
     old = "runner = ['python3', str(root/'v3'/'run_v3_case.py'), spec_path]"
     assert guard_src.count(old) == 1
     guard_src = guard_src.replace(old, "runner = ['python3', str(root/'pred'/'run_pred_case.py'), spec_path]")
+    # the CPU rule of these relative measurements (2026-11-05): others' load above 20 cores for 3 minutes (9 samples of 20 s); every other stop rule is unchanged
+    for old, new in (("'external_cpu_cores_max_sustained':9,'sustained_samples':3,", "'external_cpu_cores_max_sustained':20,'external_cpu_sustained_samples':9,'sustained_samples':3,"),
+                     ("busy_samples = busy_samples+1 if external>9 else 0", "busy_samples = busy_samples+1 if external>20 else 0"),
+                     ("elif busy_samples>=3:", "elif busy_samples>=9:"),
+                     ("reason='other_workload_cpu_exceeds_9_cores_sustained'", "reason='other_workload_cpu_exceeds_20_cores_for_3_minutes'")):
+        assert guard_src.count(old) == 1, old
+        guard_src = guard_src.replace(old, new)
     tpl = (ISAAC / 'temp' / 'memory-chain-v2' / 'baseline-command.json').read_text(encoding='utf-8')
     for name, text in (('run_pred_case.py', run_src), ('guard_pred.py', guard_src), ('template.json', tpl), ('run_chain.py', CHAIN)):
         with s.open(f'{ROOT}/pred/{name}', 'w') as f:
@@ -234,6 +250,11 @@ for d in sorted(glob.glob(root + '/runs/' + sys.argv[1] + '*')):
     tl = d + '/train.log'
     if os.path.exists(tl):
         out['tracebacks'] = sum('Traceback' in l for l in open(tl, errors='replace'))
+    gl = root + '/logs/' + case + '.guard.jsonl'
+    if os.path.exists(gl):
+        v = [json.loads(l).get('external_cpu_cores') for l in open(gl, errors='replace')]
+        v = sorted(x for x in v if x is not None)
+        if v: out['ext_cores_med'] = round(v[len(v) // 2], 1); out['ext_cores_max'] = round(v[-1], 1)
     s = d + '/stream'
     if os.path.isdir(s):
         out['stream_gb'] = round(sum(os.path.getsize(os.path.join(s, f)) for f in os.listdir(s)) / 2**30, 3)
