@@ -1,0 +1,45 @@
+ench/workspace/python/tests/test_truncated_actor_cuda.py", line 159, in main
+    act, lp, val = actors[a].result()
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 438, in result
+    self.done.synchronize()
+  File "/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/cuda/streams.py", line 227, in synchronize
+    super().synchronize()
+RuntimeError: CUDA error: device-side assert triggered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+terminate called after throwing an instance of 'c10::Error'
+  what():  CUDA error: device-side assert triggered
+CUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.
+For debugging consider passing CUDA_LAUNCH_BLOCKING=1
+Compile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.
+
+Exception raised from c10_cuda_check_implementation at /pytorch/c10/cuda/CUDAException.cpp:43 (most recent call first):
+frame #0: c10::Error::Error(c10::SourceLocation, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >) + 0x98 (0x7c6a1cd785e8 in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #1: c10::detail::torchCheckFail(char const*, char const*, unsigned int, std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> > const&) + 0xe0 (0x7c6a1cd0d4a2 in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #2: c10::cuda::c10_cuda_check_implementation(int, char const*, char const*, int, bool) + 0x3c2 (0x7c6a1d21c422 in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libc10_cuda.so)
+frame #3: <unknown function> + 0xb45e21 (0x7c69b2145e21 in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #4: <unknown function> + 0xb41ffb (0x7c69b2141ffb in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #5: <unknown function> + 0xb49714 (0x7c69b2149714 in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libtorch_cuda.so)
+frame #6: <unknown function> + 0x457242 (0x7c6a0f657242 in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #7: c10::TensorImpl::~TensorImpl() + 0x9 (0x7c6a1cd52f39 in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libc10.so)
+frame #8: <unknown function> + 0x7186d8 (0x7c6a0f9186d8 in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #9: <unknown function> + 0x718af1 (0x7c6a0f918af1 in /bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/lib/libtorch_python.so)
+frame #10: <unknown function> + 0x1698b3 (0x5c26c001f8b3 in /bench/home/isaac-abplus/.venv/bin/python)
+frame #11: <unknown function> + 0x20dff1 (0x5c26c00c3ff1 in /bench/home/isaac-abplus/.venv/bin/python)
+frame #12: <unknown function> + 0x15d1cd (0x5c26c00131cd in /bench/home/isaac-abplus/.venv/bin/python)
+frame #13: <unknown function> + 0x285b60 (0x5c26c013bb60 in /bench/home/isaac-abplus/.venv/bin/python)
+frame #14: <unknown function> + 0x285226 (0x5c26c013b226 in /bench/home/isaac-abplus/.venv/bin/python)
+frame #15: Py_FinalizeEx + 0x148 (0x5c26c0137df8 in /bench/home/isaac-abplus/.venv/bin/python)
+frame #16: Py_RunMain + 0x173 (0x5c26c012ad63 in /bench/home/isaac-abplus/.venv/bin/python)
+frame #17: Py_BytesMain + 0x2d (0x5c26c0104f4d in /bench/home/isaac-abplus/.venv/bin/python)
+frame #18: <unknown function> + 0x29d90 (0x7c6a217b4d90 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #19: __libc_start_main + 0x80 (0x7c6a217b4e40 in /lib/x86_64-linux-gnu/libc.so.6)
+frame #20: _start + 0x25 (0x5c26c0104e45 in /bench/home/isaac-abplus/.venv/bin/python)
+
+timeout: the monitored command dumped core
+
+GATE v3-1455191-trunc-actor-fp32-x EXIT 134
+
+EXIT 134

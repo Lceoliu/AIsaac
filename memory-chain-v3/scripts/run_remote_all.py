@@ -32,9 +32,10 @@ FOUR = ('3,2,4,5', 'cuda:0,cuda:2,cuda:3')       # GPU1 taken: learner cuda:1, a
 FOUR1 = ('3,1,4,5', 'cuda:0,cuda:2,cuda:3')      # (2026-10-26: GPU2 taken by others) the same roles on GPU1
 FOUR1x2 = ('3,1,4,5', 'cuda:0,cuda:0,cuda:2,cuda:2,cuda:3,cuda:3')   # (2026-10-27) two source processes per source card
 FIVEx2 = ('3,2,1,4,5', 'cuda:0,cuda:0,cuda:2,cuda:2,cuda:3,cuda:3,cuda:4,cuda:4')   # (5 cards, two per source card)
-TRUNC3 = ('3,2,4', None)   # (truncated memory, 2026-10-30) learner cuda:1, actors cuda:0,2, no source cards
+TRUNC3 = ('3,1,4', None)   # (truncated memory, 2026-10-30) learner cuda:1, actors cuda:0,2 (physical 3,1,4: GPU2 in others' use), no source cards
 TRUNC_EDITS = [[' --source-devices cuda:0,cuda:2,cuda:3,cuda:4 ', ' --memory-train truncated '],
-               [' --source-processes 1 ', ' '], [' --source-prefetch-records 8192 ', ' ']]
+               [' --source-processes 1 ', ' '], [' --source-prefetch-records 8192 ', ' '],
+               [' --source-update-rollouts 2 ', ' --source-update-rollouts 1 '], [' --source-overlap-rollout 1 ', ' ']]
 SPILL0 = [' --source-saved-cpu-gb 0.75 ', ' --source-saved-cpu-gb 0 ']
 TRIMS = []   # a) SPILL0 dropped: every tp run with it hit CUDA OOM in source backward (updates 5-37); b) stays (QUIET)
 U1 = [' --source-update-rollouts 2 ', ' --source-update-rollouts 1 ']
@@ -350,8 +351,9 @@ def main():
                      ('trunc-actor-fp32', T_ + '--actors cuda:0 --learner cuda:0 --threshold 1e-6'),
                      ('trunc-actor-fp32-x', T_ + '--actors cuda:0 --learner cuda:1 --threshold 1e-6'),
                      ('trunc-actor-two', T_ + '--actors cuda:0,cuda:1 --learner cuda:2 --threshold 1e-6'),
-                     ('trunc-actor-bf16', PYV + 'tests/test_truncated_actor_cuda.py --bf16 --actors cuda:0 --learner cuda:1'),
-                     ('trunc-actor-bf16-two', PYV + 'tests/test_truncated_actor_cuda.py --bf16 --actors cuda:0,cuda:1 --learner cuda:2'),
+                     ('trunc-actor-fp32-compile', T_ + '--compile --actors cuda:0 --learner cuda:1 --threshold 1e-6'),
+                     ('trunc-actor-bf16', PYV + 'tests/test_truncated_actor_cuda.py --bf16 --compile --actors cuda:0 --learner cuda:1'),
+                     ('trunc-actor-bf16-two', PYV + 'tests/test_truncated_actor_cuda.py --bf16 --compile --actors cuda:0,cuda:1 --learner cuda:2'),
                      ('rebuild-actor', PYV + 'tests/test_rebuild_actor_cuda.py --compile'),
                      ('actor-state', PYV + 'tests/test_rebuild_actor_state_cuda.py --compile')]
             only = os.environ.get('V3_GATES')

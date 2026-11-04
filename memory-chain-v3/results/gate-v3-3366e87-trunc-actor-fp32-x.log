@@ -1,0 +1,2 @@
+truncated CUDA (FP32, TF32 off; compiled actor False; actors cuda:0, learner cuda:1): 9 worker contexts == the graph actor's state bit for bit; 4 rollouts: FP32 actor = learner max_abs 4.768e-07 (limit 1.0e-06); mismatches 0
+PASS

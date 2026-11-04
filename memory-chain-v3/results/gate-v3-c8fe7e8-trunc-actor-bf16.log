@@ -1,0 +1,33 @@
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1104 06:20:29.220000 65 torch/utils/_sympy/interp.py:176] [4/1] failed while executing pow_by_natural([VR[26, 1073741843], VR[-1, -1]])
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 178, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 161, in main
+    assert actors[a].submit(rows, pends[a][t], widx=np.arange(NW), tdest=tdest)
+  File "/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 398, in submit
+    if wm not in self.writer_graphs:self.writer_graphs[wm]=self._capture(lambda:self._writer_run(wm))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 194, in _capture
+    for _ in range(3):out=fn()
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 398, in <lambda>
+    if wm not in self.writer_graphs:self.writer_graphs[wm]=self._capture(lambda:self._writer_run(wm))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 235, in _writer_run
+    st.mkv[ss[:,None],ix]=projected
+RuntimeError: Index put requires the source and destination dtypes match, got Float for the destination and BFloat16 for the source.

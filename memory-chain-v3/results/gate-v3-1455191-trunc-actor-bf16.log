@@ -1,0 +1,16 @@
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 175, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 158, in main
+    assert actors[a].submit(rows, pends[a][t], widx=np.arange(NW), tdest=tdest)
+  File "/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 381, in submit
+    self.graphs[key]=self._capture(lambda:self.core_fn(r,e))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 194, in _capture
+    for _ in range(3):out=fn()
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 381, in <lambda>
+    self.graphs[key]=self._capture(lambda:self.core_fn(r,e))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 294, in _core
+    st.u[slots,times%rd.W]=u
+RuntimeError: Index put requires the source and destination dtypes match, got Float for the destination and BFloat16 for the source.

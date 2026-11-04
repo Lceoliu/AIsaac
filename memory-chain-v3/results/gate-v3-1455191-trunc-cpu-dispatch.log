@@ -1,0 +1,7 @@
+PASS truncated carry: 9 worker contexts at 3 hand-overs equal the actor state (source values and Writer tokens bit for bit), mismatches 0
+PASS truncated batch over 4 rollouts: actor = learner max_abs 4.77e-07 (compact plan 4.77e-07); future leak checks 12 (bit for bit); gradient: direct 10, Writer 10 (block begun before the rollout 6); memory_constant_grad_count 0; window means [4.5, 5.23, 4.2, 4.5]; mismatches 0; records 32 (teacher context-free, imitation re-encoded)
+PASS truncated two actors: 18 merged worker contexts == their actor's state bit for bit; 8 merged / mirrored rollouts: actor = learner max_abs 2.53e-07; mismatches 0
+
+GATE v3-1455191-trunc-cpu EXIT 0
+
+EXIT 0

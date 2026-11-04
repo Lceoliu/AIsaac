@@ -1,0 +1,219 @@
++ cd D:/Projects/fortune/Isaac/temp/memory-chain-v3
++ python -X utf8 scripts/wait_then_run.py --allow 1,2 --hours 12 c8fe7e8 deploy truncgates
+ 06:18:13 up 22 days, 18:57,  8 users,  load average: 16.12, 14.61, 13.68
+               total        used        free      shared  buff/cache   available
+Mem:             125          26           2           0          98          99
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 7838 MiB, 31 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 2010 MiB, 0 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6086 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12384 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 3999205, 326 MiB
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 1682501, 662 MiB
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 1682484, 6160 MiB
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 1682495, 662 MiB
+GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 1682523, 662 MiB
+GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 1682681, 664 MiB
+GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 1682655, 664 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3995642, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996203, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996192, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996197, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996201, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996205, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3995643, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996194, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996199, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996190, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996204, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996202, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996206, 526 MiB
+CONTAINERS
+mouse-lab-model-router Up 4 days
+signbridge-api Up 4 days
+signbridge-web Up 4 days
+signbridge-funasr Up 4 days (healthy)
+sl_service_proxy Up 4 days
+signbridge-inference Up 4 days
+signbridge-livekit Up 4 days
+signbridge-redis Up 4 days (healthy)
+woshica_docker Up 4 days
+sl_dev Up 4 days
+zhanghao_workspace Up 4 days
+prometheus Up 4 days
+nodeexporter Up 4 days
+grafana Up 4 days
+caddy Up 4 days
+cadvisor Up 4 days (healthy)
+pushgateway Up 4 days
+alertmanager Up 4 days
+service_base Up 4 days
+
+EXIT 0
+ 
+[status] EXIT 0
+Tue Nov  3 22:18:14 2026 busy [2]
+===== deploy (Tue Nov  3 22:18:14 2026)
+156
+
+DEPLOY v3-c8fe7e8 c8fe7e8179b1eb003824f7f5cd39abba9a717874 EXIT 0
+ 
+[deploy v3-c8fe7e8] EXIT 0
+===== truncgates (Tue Nov  3 22:18:15 2026)
+PASS truncated carry: 9 worker contexts at 3 hand-overs equal the actor state (source values and Writer tokens bit for bit), mismatches 0
+PASS truncated batch over 4 rollouts: actor = learner max_abs 4.77e-07 (compact plan 4.77e-07); future leak checks 12 (bit for bit); gradient: direct 10, Writer 10 (block begun before the rollout 6); memory_constant_grad_count 0; window means [4.5, 5.23, 4.2, 4.5]; mismatches 0; records 32 (teacher context-free, imitation re-encoded)
+PASS truncated two actors: 18 merged worker contexts == their actor's state bit for bit; 8 merged / mirrored rollouts: actor = learner max_abs 2.53e-07; mismatches 0
+
+GATE v3-c8fe7e8-trunc-cpu EXIT 0
+ 
+[gate v3-c8fe7e8-trunc-cpu] EXIT 0
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 178, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 142, in main
+    assert length == t0, (t, w, length, t0)
+AssertionError: (31, 2, 30, 0)
+
+GATE v3-c8fe7e8-trunc-actor-fp32 EXIT 1
+ 
+[gate v3-c8fe7e8-trunc-actor-fp32] EXIT 1
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 178, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 142, in main
+    assert length == t0, (t, w, length, t0)
+AssertionError: (31, 2, 30, 0)
+
+GATE v3-c8fe7e8-trunc-actor-fp32-x EXIT 1
+ 
+[gate v3-c8fe7e8-trunc-actor-fp32-x] EXIT 1
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 178, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 142, in main
+    assert length == t0, (t, w, length, t0)
+AssertionError: (31, 2, 30, 0)
+
+GATE v3-c8fe7e8-trunc-actor-two EXIT 1
+ 
+[gate v3-c8fe7e8-trunc-actor-two] EXIT 1
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1104 06:19:39.662000 65 torch/utils/_sympy/interp.py:176] [4/1] failed while executing pow_by_natural([VR[26, 1073741843], VR[-1, -1]])
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 178, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 142, in main
+    assert length == t0, (t, w, length, t0)
+AssertionError: (31, 2, 30, 0)
+
+GATE v3-c8fe7e8-trunc-actor-fp32-compile EXIT 1
+ 
+[gate v3-c8fe7e8-trunc-actor-fp32-compile] EXIT 1
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1104 06:20:29.220000 65 torch/utils/_sympy/interp.py:176] [4/1] failed while executing pow_by_natural([VR[26, 1073741843], VR[-1, -1]])
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 178, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 161, in main
+    assert actors[a].submit(rows, pends[a][t], widx=np.arange(NW), tdest=tdest)
+  File "/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 398, in submit
+    if wm not in self.writer_graphs:self.writer_graphs[wm]=self._capture(lambda:self._writer_run(wm))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 194, in _capture
+    for _ in range(3):out=fn()
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 398, in <lambda>
+    if wm not in self.writer_graphs:self.writer_graphs[wm]=self._capture(lambda:self._writer_run(wm))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 235, in _writer_run
+    st.mkv[ss[:,None],ix]=projected
+RuntimeError: Index put requires the source and destination dtypes match, got Float for the destination and BFloat16 for the source.
+
+GATE v3-c8fe7e8-trunc-actor-bf16 EXIT 1
+ 
+[gate v3-c8fe7e8-trunc-actor-bf16] EXIT 1
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/compile_fx.py:236: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1104 06:21:10.267000 65 torch/utils/_sympy/interp.py:176] [4/1] failed while executing pow_by_natural([VR[26, 1073741843], VR[-1, -1]])
+/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/_inductor/lowering.py:7007: UserWarning: 
+Online softmax is disabled on the fly since Inductor decides to
+split the reduction. Cut an issue to PyTorch if this is an
+important use case and you want to speed it up with online
+softmax.
+
+  warnings.warn(
+W1104 06:21:26.204000 65 torch/utils/_sympy/interp.py:176] [4/2] failed while executing pow_by_natural([VR[26, 1073741843], VR[-1, -1]])
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 178, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 161, in main
+    assert actors[a].submit(rows, pends[a][t], widx=np.arange(NW), tdest=tdest)
+  File "/bench/home/isaac-abplus/.venv/lib/python3.10/site-packages/torch/utils/_contextlib.py", line 116, in decorate_context
+    return func(*args, **kwargs)
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 398, in submit
+    if wm not in self.writer_graphs:self.writer_graphs[wm]=self._capture(lambda:self._writer_run(wm))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 194, in _capture
+    for _ in range(3):out=fn()
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 398, in <lambda>
+    if wm not in self.writer_graphs:self.writer_graphs[wm]=self._capture(lambda:self._writer_run(wm))
+  File "/bench/workspace/python/isaac_bridge/rebuild_actor.py", line 235, in _writer_run
+    st.mkv[ss[:,None],ix]=projected
+RuntimeError: Index put requires the source and destination dtypes match, got Float for the destination and BFloat16 for the source.
+
+GATE v3-c8fe7e8-trunc-actor-bf16-two EXIT 1
+ 
+[gate v3-c8fe7e8-trunc-actor-bf16-two] EXIT 1
+Actor capacity growth compiled graphs: 25 -> 25
+PASS CUDA Graph/eager logits, CRN actions, logp, values; variable batches, wrap, reset, fork, history growth 4.76837158203125e-07
+PASS actor version change reprojects stored values without any source re-encoding; snapshot isolation
+
+GATE v3-c8fe7e8-rebuild-actor EXIT 0
+ 
+[gate v3-c8fe7e8-rebuild-actor] EXIT 0
+PASS RebuildGraphActor temporal state written in the graph: prev_o, steps, prev_stage; other slots and K / V untouched
+
+GATE v3-c8fe7e8-actor-state EXIT 0
+ 
+[gate v3-c8fe7e8-actor-state] EXIT 0
+EXIT 0

@@ -1,0 +1,6 @@
+Traceback (most recent call last):
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 178, in <module>
+    main()
+  File "/bench/workspace/python/tests/test_truncated_actor_cuda.py", line 142, in main
+    assert length == t0, (t, w, length, t0)
+AssertionError: (31, 2, 30, 0)

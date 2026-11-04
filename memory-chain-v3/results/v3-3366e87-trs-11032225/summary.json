@@ -1,0 +1,17 @@
+{
+  "case": "v3-3366e87-trs-11032225",
+  "horizon": 1024,
+  "exit_status": 2,
+  "updates": null,
+  "steady_updates": null,
+  "steady_x_real_time": null,
+  "medians": null,
+  "peak_gpu_mib": {
+    "1": 4.0,
+    "3": 1.0,
+    "4": 1.0
+  },
+  "peak_container_memory_gib": null,
+  "guard_stops": [],
+  "completed": false
+}

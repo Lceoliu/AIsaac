@@ -1,0 +1,58 @@
+ 06:32:49 up 22 days, 19:11,  8 users,  load average: 18.35, 16.38, 15.13
+               total        used        free      shared  buff/cache   available
+Mem:             125          26          32           0          67          98
+Swap:              7           7           0
+0, GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 2342 MiB, 1 %
+1, GPU-2513e209-0d19-c482-1133-1e2ee2267fc0, 4 MiB, 0 %
+2, GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 7386 MiB, 29 %
+3, GPU-616fe76a-91d3-ed7f-019d-0342b96dbb12, 1 MiB, 0 %
+4, GPU-607afe31-2f98-e891-2806-61d5654ffe1a, 1 MiB, 0 %
+5, GPU-9a49bc46-f76b-dba0-6370-1b9030e16648, 1 MiB, 0 %
+6, GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 6086 MiB, 0 %
+7, GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 12384 MiB, 0 %
+APPS
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 3999205, 326 MiB
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 1682501, 662 MiB
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 1682484, 664 MiB
+GPU-caba020d-8c98-532b-c3a9-f257bc0f95be, 1682495, 662 MiB
+GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 1682523, 664 MiB
+GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 1682681, 6040 MiB
+GPU-7f733ad8-f881-06f7-c7c2-360e50dc64a7, 1682655, 662 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3995642, 3420 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996203, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996192, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996197, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996201, 526 MiB
+GPU-1d894077-117d-e928-1ab2-176ecf7191dd, 3996205, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3995643, 9186 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996194, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996199, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996190, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996204, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996202, 526 MiB
+GPU-674a5b71-0df7-8318-9c34-a6f689b12d7e, 3996206, 526 MiB
+CONTAINERS
+mouse-lab-model-router Up 4 days
+signbridge-api Up 4 days
+signbridge-web Up 4 days
+signbridge-funasr Up 4 days (healthy)
+sl_service_proxy Up 4 days
+signbridge-inference Up 4 days
+signbridge-livekit Up 4 days
+signbridge-redis Up 4 days (healthy)
+woshica_docker Up 4 days
+sl_dev Up 4 days
+zhanghao_workspace Up 4 days
+prometheus Up 4 days
+nodeexporter Up 4 days
+grafana Up 4 days
+caddy Up 4 days
+cadvisor Up 4 days (healthy)
+pushgateway Up 4 days
+alertmanager Up 4 days
+service_base Up 4 days
+
+EXIT 0
+ 
+[status] EXIT 0
+Tue Nov  3 22:32:49 2026 busy [2] load [18.35, 16.38, 15.13]
