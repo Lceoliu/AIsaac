@@ -8,7 +8,7 @@ login is read at run time from temp/memory-chain-v2/host_status.py (nothing of i
   python -X utf8 pred_host.py get <remote> <local> a file
 
 Chain file: {"cases": [{"case": ..., "arm": a0|a1|a2|a3|l0|l3 ..., "hours": 60, "env": {...}, ...}], "gpus": [3, 1, 4, 5, 2]}. A case runs when
-no aisaac-* container is up and three of the allowed GPUs have no compute process (first come first served with the other
+no aisaac-* container (ours or the other line's: they are never touched) is up and three of the allowed GPUs have no compute process (first come first served with the other
 sessions on the host, nothing of theirs is touched; the third of the three is the second actor's); inside: the 843x baseline's docker command (memory-chain-v2 baseline-command.json) with
 this code, minibatch / micro 4096, the arm's switches, and guard_v3's rules (they stop our own container only).
 """
@@ -54,16 +54,26 @@ def pick(allowed, n=3):
     free = [g for g in allowed if idx[str(g)] not in apps]
     return (free[:n], None) if len(free) >= n else (None, f'free {free} of {allowed}')
 queue = list(chain['cases'])
+settled = False   # (the chain holds the host: within it no second wait)
+def ready(c):
+    gpus, why = pick(c.get('gpus') or chain['gpus'])
+    if why is None and chain.get('max_busy_cores'):   # (a measurement: only on a quiet host, the guard's own rule)
+        if host_cores() > chain['max_busy_cores']:
+            why = f'host busy, more than {chain["max_busy_cores"]} cores'
+    return gpus, why
 while queue:
     c = queue.pop(0)
     if (root / 'pred' / 'STOP').exists(): note(event='stop file'); break
     last = None
     while True:
-        gpus, why = pick(c.get('gpus') or chain['gpus'])
-        if why is None and chain.get('max_busy_cores'):   # (a measurement: only on a quiet host, the guard's own rule)
-            cores = host_cores()
-            if cores > chain['max_busy_cores']:
-                why = f'host busy, more than {chain["max_busy_cores"]} cores'
+        gpus, why = ready(c)
+        if why is None and not settled and chain.get('settle_s'):
+            # quiet: the other line on the host may be seeing the same window; wait and look again before taking it
+            note(event='quiet, settling', case=c['case'], seconds=chain['settle_s'])
+            time.sleep(chain['settle_s'])
+            gpus, why = ready(c)
+            if why is not None: why = 'after settling: ' + why
+            else: settled = True
         if why is None: break
         if why != last:   # (only a change is noted)
             note(event='wait', case=c['case'], why=why)
@@ -87,6 +97,7 @@ while queue:
             again = dict(c, case=c.get('base', c['case']) + f"-r{c.get('retry', 0) + 1}", base=c.get('base', c['case']), retry=c.get('retry', 0) + 1)
             again['env'] = {k: v.replace(c['case'], again['case']) for k, v in (c.get('env') or {}).items()}
             queue.insert(0, again)
+            settled = False
             note(event='retry', case=c['case'], next=again['case'])
             continue
         note(event='chain stopped', case=c['case'], rc=rc)
