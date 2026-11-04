@@ -8,9 +8,9 @@ actors -> merge_rollouts (both actors' pools, cross-device). Checks:
   test 4: every worker's carried source values (t_s) and LearnerCarry's Writer tokens (t_m) == the graph actor's
           TensorActorMemory (ring values, closed blocks) before the rollout's first decision, bit for bit;
   test 1: the learner's batched outputs over each finished rollout == the actor's outputs of the same decisions
-          (logits, value, value_global): FP32 with TF32 off: max abs <= --threshold (default 1e-6); --bf16 (actor and
-          learner under BF16 autocast): max abs <= 2 x the BF16 noise floor (the BF16 actor against the FP32 learner
-          on the same constants) + 1e-6;
+          (logits, value, value_global): FP32 with TF32 off: max abs <= --threshold (default 1e-6); --bf16 (the
+          production setting: the actor FP32, the learner under BF16 autocast): the FP32 learner still within
+          --threshold, the BF16 learner's relative L2 error per output <= --rel (default 2e-2, BF16 rounding scale);
   no context mismatch, no constant with a gradient.
   python tests/test_truncated_actor_cuda.py [--bf16 --compile] [--actors cuda:0[,cuda:1]] [--learner cuda:2] [--threshold 1e-6]
 """
@@ -40,6 +40,7 @@ def main():
     ap.add_argument('--actors', default='cuda:0')
     ap.add_argument('--learner', default='cuda:0')
     ap.add_argument('--threshold', type=float, default=1e-6)
+    ap.add_argument('--rel', type=float, default=2e-2)
     ap.add_argument('--compile', action='store_true', help='the actor compiled as in production (--actor-compile '
                     'default, math SDPA); the eager graph actor cannot write BF16 values into its float32 rings')
     args = ap.parse_args()
@@ -73,7 +74,7 @@ def main():
         with torch.cuda.device(d):
             states.append(TP.TemporalState(models[a], NW, d, torch.float32))
             actors.append(RebuildGraphActor(models[a], NW, entities=[8, 16], temporal=states[a], row_sizes=[NW],
-                                            bf16=args.bf16, compile_mode='default' if args.compile else None,
+                                            bf16=False, compile_mode='default' if args.compile else None,
                                             sdpa_math=args.compile))
     fulls = None
     if A > 1:
@@ -85,7 +86,7 @@ def main():
     logs = [dict(logits=[], value=[], vg=[]) for _ in range(A)]
     mirror = {}
     bid, start, snaps = 0, 0, None
-    st = dict(ctx=0, err=0.0, floor=0.0, rollouts=0)
+    st = dict(ctx=0, err=0.0, floor=0.0, rollouts=0, d2=np.zeros(3), e2=np.zeros(3))
     amp = torch.autocast('cuda', dtype=torch.bfloat16) if args.bf16 else nullcontext()
 
     def view_of(b):
@@ -124,11 +125,13 @@ def main():
                 n = int(v_.length[w])
                 a, ww = divmod(w, NW)
                 steps = start + np.arange(n)
-                for j, key in ((0, 'logits'), (1, 'value'), (-1, 'vg')):
+                for i, (j, key) in enumerate(((0, 'logits'), (1, 'value'), (-1, 'vg'))):
                     exp = torch.stack([logs[a][key][s][ww] for s in steps]).to(ldev).float()
-                    st['err'] = max(st['err'], float((out[j][at:at + n].float() - exp).abs().max()))
-                    if ref32 is not None:
-                        st['floor'] = max(st['floor'], float((ref32[j][at:at + n].float() - exp).abs().max()))
+                    fp32 = out if ref32 is None else ref32
+                    st['err'] = max(st['err'], float((fp32[j][at:at + n].float() - exp).abs().max()))
+                    if ref32 is not None:   # (BF16: relative L2 of the BF16 learner against the FP32 actor)
+                        st['d2'][i] += float(((out[j][at:at + n].float() - exp) ** 2).sum())
+                        st['e2'][i] += float((exp ** 2).sum())
                 at += n
             st['rollouts'] += 1
             if t < T:   # test 4 on the next buffer's carried context
@@ -139,6 +142,10 @@ def main():
                     ep0, t0, values, ok = worker_context(nxt, w, W)
                     assert ok, (t, w)
                     u_ring, mem, length = snaps[a][ww]
+                    if t0 == 0:   # (decision 0 starts an episode: no context)
+                        assert values.shape[0] == 0 and carry.memory(w, ep0, t0).shape[0] == 0, (t, w)
+                        st['ctx'] += 1
+                        continue
                     assert length == t0, (t, w, length, t0)
                     m = min(t0, W)
                     if m:
@@ -164,13 +171,16 @@ def main():
             logs[a]['value'].append(torch.as_tensor(val, device=devs[a]))
             logs[a]['vg'].append(torch.as_tensor(actors[a].vg, device=devs[a]))
             TT.store(roll, np.arange(NW), rows, pends[a][t], act, lp, val, 0, None, actors[a].vg, actors[a].t_out)
-    limit = 2 * st['floor'] + 1e-6 if args.bf16 else args.threshold
-    print(f"truncated CUDA ({'BF16' if args.bf16 else 'FP32, TF32 off'}; actors {args.actors}, learner {args.learner}): "
-          f"{st['ctx']} worker contexts == the graph actor's state bit for bit; {st['rollouts']} rollouts: actor = "
-          f"learner max_abs {st['err']:.3e}" + (f" (BF16 floor {st['floor']:.3e}, limit {limit:.3e})" if args.bf16 else
-                                                 f" (limit {limit:.1e})") + f"; mismatches {carry.mismatch}", flush=True)
+    rel = np.sqrt(st['d2'] / np.maximum(st['e2'], 1e-30))
+    print(f"truncated CUDA ({'BF16 learner, FP32 actor' if args.bf16 else 'FP32, TF32 off'}; compiled actor "
+          f"{args.compile}; actors {args.actors}, learner {args.learner}): {st['ctx']} worker contexts == the graph "
+          f"actor's state bit for bit; {st['rollouts']} rollouts: FP32 actor = learner max_abs {st['err']:.3e} (limit "
+          f"{args.threshold:.1e})" + (f"; BF16 learner relative L2 logits / value / value_global "
+          f"{rel[0]:.2e} / {rel[1]:.2e} / {rel[2]:.2e} (limit {args.rel:.0e})" if args.bf16 else '') +
+          f"; mismatches {carry.mismatch}", flush=True)
     assert carry.mismatch == 0
-    assert st['err'] <= limit, (st, limit)
+    assert st['err'] <= args.threshold, st
+    assert not args.bf16 or (rel <= args.rel).all(), rel
     print('PASS')
 
 
