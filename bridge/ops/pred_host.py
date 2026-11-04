@@ -7,9 +7,9 @@ login is read at run time from temp/memory-chain-v2/host_status.py (nothing of i
   python -X utf8 pred_host.py table <prefix>       per case: x_real_time, medians, memory, the switches' columns
   python -X utf8 pred_host.py get <remote> <local> a file
 
-Chain file: {"cases": [{"case": ..., "arm": a0|a1|a2|a3|l0|l3 ..., "hours": 60, "env": {...}, ...}], "gpus": [3, 1, 4]}. A case runs when no
-aisaac-* container is up and its GPUs have no compute process (first come first served with the other sessions on the
-host, nothing of theirs is touched); inside: the 843x baseline's docker command (memory-chain-v2 baseline-command.json) with
+Chain file: {"cases": [{"case": ..., "arm": a0|a1|a2|a3|l0|l3 ..., "hours": 60, "env": {...}, ...}], "gpus": [3, 1, 4, 5, 2]}. A case runs when
+no aisaac-* container is up and three of the allowed GPUs have no compute process (first come first served with the other
+sessions on the host, nothing of theirs is touched; the third of the three is the second actor's); inside: the 843x baseline's docker command (memory-chain-v2 baseline-command.json) with
 this code, minibatch / micro 4096, the arm's switches, and guard_v3's rules (they stop our own container only).
 """
 import json
@@ -37,20 +37,23 @@ chain = json.loads(pathlib.Path(sys.argv[1]).read_text())
 state = root / 'pred' / (pathlib.Path(sys.argv[1]).stem + '.state')
 def note(**k):
     with state.open('a') as f: f.write(json.dumps(dict(k, time=time.strftime('%F %T'))) + '\n')
-def busy(gpus):
-    if subprocess.run("docker ps --format '{{.Names}}' | grep -q '^aisaac-'", shell=True).returncode == 0: return 'an aisaac container is up'
+def pick(allowed, n=3):
+    """The first n of the allowed GPUs without a compute process, or (None, why). (In order: actor 0, learner, actor 1.)"""
+    if subprocess.run("docker ps --format '{{.Names}}' | grep -q '^aisaac-'", shell=True).returncode == 0: return None, 'an aisaac container is up'
     idx = dict(l.strip().split(', ') for l in subprocess.check_output(['nvidia-smi', '--query-gpu=index,uuid', '--format=csv,noheader'], text=True).splitlines())
     apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid', '--format=csv,noheader'], text=True).split()
-    used = [g for g in gpus if idx[str(g)] in apps]
-    return f'GPUs {used} in use' if used else None
+    free = [g for g in allowed if idx[str(g)] not in apps]
+    return (free[:n], None) if len(free) >= n else (None, f'free {free} of {allowed}')
 for c in chain['cases']:
     if (root / 'pred' / 'STOP').exists(): note(event='stop file'); break
-    gpus = c.get('gpus') or chain['gpus']
+    last = None
     while True:
-        why = busy(gpus)
+        gpus, why = pick(c.get('gpus') or chain['gpus'])
         if why is None: break
-        note(event='wait', case=c['case'], why=why)
-        time.sleep(120)
+        if why != last:   # (only a change is noted)
+            note(event='wait', case=c['case'], why=why)
+            last = why
+        time.sleep(60)
     free = int(subprocess.check_output(['df', '--output=avail', '-B1G', str(root)], text=True).split()[1])
     if free < chain.get('min_disk_gb', 200):
         note(event='disk', free=free); break
@@ -59,7 +62,7 @@ for c in chain['cases']:
                 discard=c.get('discard', 10), horizon=None, source_devices=None)
     p = root / 'pred' / f"{c['case']}.spec.json"
     p.write_text(json.dumps(spec, indent=1))
-    note(event='start', case=c['case'])
+    note(event='start', case=c['case'], gpus=gpus)
     with (root / 'logs' / f"{c['case']}.dispatch.log").open('w') as log:
         rc = subprocess.call(['python3', str(root / 'pred' / 'guard_pred.py'), str(p)], stdout=log, stderr=subprocess.STDOUT)
     note(event='done', case=c['case'], rc=rc)
@@ -140,7 +143,7 @@ def edits_for(arm, base, extra=()):
 def chain(path):
     ch = json.loads(Path(path).read_text(encoding='utf-8'))
     ch.setdefault('code_dir', (Path(__file__).parent / '.pred_code').read_text().strip())
-    ch.setdefault('gpus', [3, 1, 4])
+    ch.setdefault('gpus', [3, 1, 4, 5, 2])
     for k in ch['cases']:
         k['edits'] = edits_for(k['arm'], ch.get('edits') or [], k.get('edits') or [])
     c = client()
@@ -148,7 +151,11 @@ def chain(path):
     name = Path(path).name
     with s.open(f'{ROOT}/pred/{name}', 'w') as f:
         f.write(json.dumps(ch, indent=1))
-    print(run(c, f'cd {ROOT}/pred && setsid nohup python3 run_chain.py {ROOT}/pred/{name} > {name}.out 2>&1 < /dev/null & echo started')[1], end='')
+    # (the channel closes at once: nothing of the chain's holds it)
+    c.exec_command(f'cd {ROOT}/pred && setsid nohup python3 run_chain.py {ROOT}/pred/{name} > {name}.out 2>&1 < /dev/null &')
+    import time
+    time.sleep(3)
+    print(run(c, "pgrep -af '[r]un_chain' | cut -c1-120")[1], end='')
     c.close()
 
 

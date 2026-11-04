@@ -274,6 +274,10 @@ def main():
     events = np.zeros((n, 3), np.int64)   # rooms cleared, rooms entered, boss rooms cleared
     extra = np.zeros((n, 6), np.int64)    # run / items: exits, collectibles, active uses, pill uses, stage0, deepest
     char0 = np.zeros(n, np.int64)         # 2026-10-08: ROW pchar at the episode's first record
+    # 2026-11-03 (PREDICTIVE_MEMORY_DESIGN.md section 2): per worker the last two rooms (stage, the player's minimap cell),
+    # room changes and round trips (a change back to the room before the last one: A -> B -> A)
+    room_now, room_before = [None] * n, [None] * n
+    room_moves = np.zeros((n, 2), np.int64)
     episodes = []
     finals = []
     t0 = time.perf_counter()
@@ -291,6 +295,16 @@ def main():
                     mem_reset[i] = True
                     extra[i, 4] = extra[i, 5] = int(r['stage'])
                     char0[i] = int(r['pchar'])
+                    room_now[i], room_before[i] = None, None
+                    room_moves[i] = 0
+                m3_ = r['map'][3]
+                if m3_.any():   # (a floor under Curse of the Lost shows none: no moves counted there)
+                    key_ = (int(r['stage']), int(m3_.argmax()))
+                    if key_ != room_now[i]:
+                        if room_now[i] is not None:
+                            room_moves[i, 0] += 1
+                            room_moves[i, 1] += key_ == room_before[i]
+                        room_before[i], room_now[i] = room_now[i], key_
                 if recorder is not None:
                     recorder.add(i, r)
                 hurt[i] += float(r['hurt'])
@@ -303,7 +317,8 @@ def main():
                         finals.append(r.copy())
                     episodes.append(dict(group=names[int(r['group'])], seed=int(r['seed']), done=int(r['done']),
                                          decisions=int(r['t']), hurt=float(hurt[i]), rooms=int(events[i, 0]),
-                                         entered=int(events[i, 1]), boss=int(events[i, 2])))
+                                         entered=int(events[i, 1]), boss=int(events[i, 2]),
+                                         room_changes=int(room_moves[i, 0]), round_trips=int(room_moves[i, 1])))
                     if run or items:
                         episodes[-1].update(exits=int(extra[i, 0]), items=int(extra[i, 1]), uses=int(extra[i, 2]),
                                             pills=int(extra[i, 3]), stage0=int(extra[i, 4]), stage=int(extra[i, 5]))
@@ -357,6 +372,7 @@ def main():
                                  for k in sorted(set(e['stage'] for e in deaths))},
                     rooms_cleared=sum(e['rooms'] for e in eps) / m, boss_clear=sum(e['boss'] for e in eps) / m,
                     hurt_per_run=sum(e['hurt'] for e in eps) / m,
+                    room_changes=sum(e['room_changes'] for e in eps) / m, round_trips=sum(e['round_trips'] for e in eps) / m,
                     seconds=sum(e['decisions'] for e in eps) / m * args.frames_per_decision / 30,
                     items_taken=sum(e['items'] for e in eps) / m, active_uses=sum(e['uses'] for e in eps) / m,
                     pills_used=sum(e['pills'] for e in eps) / m)
