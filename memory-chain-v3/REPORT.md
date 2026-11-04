@@ -2023,7 +2023,7 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 | 门测 | 代码 | 退出码 | 结果 |
 |---|---|---|---|
 | trunc-cpu（主机上的三个 CPU 截断测试） | 1455191、c8fe7e8 | 0 | 与本机相同（误差 ≤4.77e-7，逐位一致，不一致数 0） |
-| trunc-actor-*（图 actor，第一轮） | 1455191 | 134 | `index_copy_` 越界：`Rollout.t_dest` 在 `t_assign` 让池子增长**之前**就取了池张量，增长后行号写进了旧的、更小的张量。这是早已存在的顺序错误（旧架构也是同一写法），训练时池子很少增长，所以没暴露。c8fe7e8 修正：先分配行，再取张量 |
+| trunc-actor-*（图 actor，第一轮） | 1455191 | 134 | `index_copy_` 越界：`Rollout.t_dest` 在 `t_assign` 让池子增长**之前**就取了池张量，增长后行号写进了旧的、更小的张量。这是 B31 引入 `t_dest` 时就有的顺序错误，训练里池子很少增长，所以一直没暴露。c8fe7e8 修正：先分配行，再取张量 |
 | trunc-actor-*（第二轮） | c8fe7e8 | 1 | FP32 三种布局都在第 31 步交接处失败：worker 2 恰好在新 rollout 的首个决策开新局（t0 = 0），测试仍按旧局长度比较。这是测试本身的错，3366e87 修正。BF16 失败原因是 eager 图 actor 在 BF16 下不能写 float32 环（v2 起就有的已知问题，§8.1）；生产 actor 是 FP32（`--actor-bf16` 默认 0）、只有学习器用 BF16 autocast，所以 BF16 门测改成与生产一致：actor FP32、学习器 BF16 |
 | rebuild-actor、actor-state（原有图 actor 测试，`--compile`） | 1455191、c8fe7e8 | 0 | control 第 21 行的改动不影响原有行为 |
 
@@ -2046,3 +2046,4 @@ cProfile 下学习器 11.25 s（含剖析开销，只看相对大小）。与表
 - 第一次（11-03 22:25）退出码 2：train_tok 的参数检查要求 `--source-overlap-rollout` 和 `--source-update-rollouts 2` 必须配合源设备。截断模式的参数修改里补上了"去掉 `--source-overlap-rollout`、`--source-update-rollouts` 设为 1"。
 - 第二次（22:29）启动正常，actor 编译完成，但约 112 秒后被守护按规则停掉：`other_workload_cpu_exceeds_9_cores_sustained`。主机上别人的进程持续占 11–12 个核，守护规则没改。
 - 现在用 `scripts/wait_quiet_then_run.py` 等待：GPU 空闲，并且 1 分钟和 5 分钟负载都低于 7 时才启动，每 10 分钟查一次，最长 24 小时。22:32 时负载是 18.4 / 16.4 / 15.1。
+- **备份**：rl 分支 `exp/memory-chain-v3-truncated` = 3366e87，`exp/memory-chain-v3` 随本节推送。3090 上新增 `memory-chain-v3-20261103-2233.tar.gz`，391,198,829 字节，sha256 `053f34da1e04b90885f53c4a29db9056c9bff1cf418c3e5d5c0a9e0be689a23c`，远端 `sha256sum -c` 和 `gzip -t` 都通过。
