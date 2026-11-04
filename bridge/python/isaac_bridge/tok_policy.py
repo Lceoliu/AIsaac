@@ -1176,6 +1176,7 @@ class TokPolicy(nn.Module):
                   layers' K / V, room flags) are left in temporal['out'];
           'chunk': the learner: dict(mode='chunk', plan=temporal_part(...), o_prev=[k, D] stored o_{t-1}, has=[k]
                   bool) for the first k records (chunk-major, the plan's rows), the rest (teacher records) without;
+                  keep_o=True (2026-11-03, --aux-predict): the first k rows' o_t, with gradient, left in temporal['o_seq'];
           'stored': dict(mode='stored', o=[k, D] stored o_t, o_prev, has): the stored outputs for the readout (the
                   values recomputed at an update's start).
           B34 (2026-10-16): 'chunk' / 'stored' may carry tail=dict(o_prev [n - k, D], has [n - k], o [n - k, D],
@@ -1495,6 +1496,8 @@ class TokPolicy(nn.Module):
             else:
                 k = tctx['k']
                 o_k = ta.sequence(s_t[:k], tctx['plan']) if mode == 'chunk' else tctx['o'].float()
+                if tctx.get('keep_o'):   # 2026-11-03 (train_tok --aux-predict): o_t of the first k rows, with gradient
+                    tctx['user']['o_seq'] = o_k
                 tail = tctx.get('tail')
                 if k < n and tail is not None:   # (B34: stored o_t and a readout mask of their own past the first k)
                     o = torch.cat([o_k, tail['o'].float().to(o_k.device)])

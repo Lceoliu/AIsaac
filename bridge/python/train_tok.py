@@ -187,6 +187,13 @@ No-active starts (2026-10-18, B39; off by default, then nothing changes): --no-a
   with the episode's reseed = the unchanged start). progress.csv: no_actives, no_active_removed (worker totals),
   noact/* and act/* (this update's finished episodes by has_active at their first record: episodes, exits, stage,
   timeout); episodes.jsonl active0. Evaluation: eval_tok --no-active 1.
+Predictive auxiliary loss (2026-11-03, rl/docs/PREDICTIVE_MEMORY_DESIGN.md section 3, isaac_bridge/tok_aux.py has the
+  mechanism; off by default, then nothing changes): --aux-predict 1 (needs --temporal 1) adds a learner-only head on the
+  temporal transformer's o_t that predicts, per --aux-horizons k, the explicit state at t + k, the events in between and
+  the return over them; --aux-coef x L_aux joins each part's loss. The actor, its graphs and the checkpoint's 'model' are
+  untouched (the head, its Adam and the normalisation are the checkpoint's 'aux'). progress.csv: aux_reg_k, aux_ev_k,
+  aux_ret_k, aux_loss, aux_ms_k / aux_me_k (masked shares of the trained rows), aux_ev0_k (the base rates' BCE),
+  aux_rate_* / aux_bce_* per event, aux_grad_norm, u_aux (the tables' host seconds).
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
 
@@ -225,6 +232,7 @@ from pathlib import Path
 import numpy as np
 
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec
+from isaac_bridge.tok_aux import CLOSE_BROKE
 from isaac_bridge.tok_obs import DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_PILL, ROW
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
                                       default_stub_list)
@@ -630,7 +638,7 @@ class Rollout:
     rollout's own and the going episode's earlier ones. Rows are assigned when a decision is submitted (t_dest) or
     stored (store_temporal); the actor writes them on the device (GraphActor tdest / store's index_copy_)."""
 
-    def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False, temporal=None, alloc=None):
+    def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False, temporal=None, alloc=None, close=False):
         # B38 step 2: alloc(shape, dtype) -> a zeroed array for every host array (SharedArrays: shared memory the
         # learner process maps); None: numpy's, as before
         zeros = np.zeros if alloc is None else alloc
@@ -679,6 +687,11 @@ class Rollout:
         # 2026-10-07 (branches): a branch episode's truncated last record (done DONE_BRANCH), stored only for its value:
         # the decision before bootstraps from it, it is not trained on (gae)
         self.boot = zeros((workers, capacity), bool)
+        # 2026-11-03 (--aux-predict, tok_aux): what closed each decision (the next record's hurt, done and events; the
+        # last record of an episode is never stored as a decision). None without it
+        self.close_hurt = zeros((workers, capacity), np.float32) if close else None
+        self.close_done = zeros((workers, capacity), np.uint8) if close else None
+        self.close_ev = zeros((workers, capacity), np.uint8) if close else None
         self.length = zeros(workers, np.int64)
         self.open = full(workers, -1, np.int64)   # the stored decision still waiting for its reward (the last one)
 
@@ -850,6 +863,9 @@ class Episodes:
         broke = first & (k >= 0)   # the episode before broke off (a worker error): end it there
         if broke.any():
             roll.reward[idx[broke], k[broke]], roll.terminal[idx[broke], k[broke]] = 0.0, True
+            if roll.close_hurt is not None:   # 2026-11-03 (--aux-predict): an end of unknown outcome
+                roll.close_hurt[idx[broke], k[broke]], roll.close_ev[idx[broke], k[broke]] = 0.0, 0
+                roll.close_done[idx[broke], k[broke]] = CLOSE_BROKE
             roll.open[idx[broke]] = -1
             k = np.where(broke, -1, k)
         has = k >= 0
@@ -857,6 +873,8 @@ class Episodes:
             w, kk, d = idx[has], k[has], done[has]
             dmg = rows['damage'][has].astype(np.float64)
             hu = rows['hurt'][has].astype(np.float64)
+            if roll.close_hurt is not None:   # 2026-11-03 (--aux-predict): what closes these decisions
+                roll.close_hurt[w, kk], roll.close_done[w, kk], roll.close_ev[w, kk] = hu, d, rows['events'][has]
             reward = rw['damage'] * dmg - rw['hurt'] * hu - rw['time'] + np.where(
                 d == 1, self.end_bonus, np.where(d == 2, -rw['death'], np.where(d == 3, -rw['timeout'], 0.0)))
             if self.floor:
@@ -1705,6 +1723,12 @@ def main(argv=None, child=None, actor=None):
                         '--minibatch // this chunks, --micro parts of whole chunks)')
     p.add_argument('--temporal-kv', default='bf16', choices=('bf16', 'fp32'),
                    help="(B30) the stored K / V (actor's cache and the rollout's): bfloat16 (default) or float32")
+    p.add_argument('--aux-predict', type=int, default=0, choices=(0, 1),
+                   help='2026-11-03 (tok_aux, PREDICTIVE_MEMORY_DESIGN.md section 3): 1 = a learner-only head on the '
+                        'temporal output o_t predicts the state, the events and the return at --aux-horizons')
+    p.add_argument('--aux-horizons', default='1,8,64,256',
+                   help='--aux-predict: the scales, in decisions (4 frames each: 0.13 s, 1.1 s, 8.5 s, 34 s)')
+    p.add_argument('--aux-coef', type=float, default=0.1, help='--aux-predict: the weight of L_aux in the loss')
     p.add_argument('--fused-adam', type=int, default=0,
                    help='1: Adam as one fused CUDA kernel (the same update rule; float rounding may differ)')
     p.add_argument('--dump-rollouts', type=int, default=0,
@@ -1854,6 +1878,18 @@ def main(argv=None, child=None, actor=None):
         tok_kw.update(temporal=True, temporal_width=args.temporal_width, temporal_layers=args.temporal_layers,
                       temporal_heads=args.temporal_heads, temporal_window=args.temporal_window,
                       temporal_rooms=args.temporal_rooms)
+    aux_on = bool(args.aux_predict)   # 2026-11-03 (tok_aux)
+    if aux_on:
+        from isaac_bridge.tok_aux import (AuxNorm, EVENTS as AUX_EVENTS, STATE as AUX_STATE, build_targets, log_row,
+                                          make_head, minibatch_den, parse_horizons, part_loss)
+        if not t_on:
+            p.error('--aux-predict 1 needs --temporal 1 (it reads the temporal output o_t)')
+        if args.learner_compile:
+            p.error('--aux-predict 1: not with --learner-compile (the forward hands o_t back through its context)')
+        try:
+            aux_h = parse_horizons(args.aux_horizons)
+        except ValueError as exc:
+            p.error(str(exc))
     pick_force = parse_pickup_force(args.pickup_force)   # 2026-10-13 (B23)
     pf_on = max(pick_force) > 0
     rw = dict(room=0.0, explore=0.0, boss=0.0, exit=0.0, heal=0.0, resource=0.0)
@@ -2006,6 +2042,13 @@ def main(argv=None, child=None, actor=None):
     opt = torch.optim.Adam(learner_model.main_parameters(), lr=args.lr, eps=1e-5,
                            **(dict(fused=True) if fused else {}))
     copt = torch.optim.Adam(learner_model.choice.parameters(), lr=args.choice_lr) if n_choice else None
+    # 2026-11-03 (--aux-predict): where the updates run: the head, its Adam and the targets' normalisation; not parameters
+    # of learner_model (the actor's copy, the weights' hand-over and the checkpoint's 'model' stay as they are)
+    aux_head = aopt = aux_norm = None
+    if aux_on and (child is not None or not proc):
+        aux_head = make_head(args.temporal_width, len(aux_h)).to(lm_dev)
+        aopt = torch.optim.Adam(aux_head.parameters(), lr=args.lr, eps=1e-5, **(dict(fused=True) if fused else {}))
+        aux_norm = AuxNorm(len(AUX_STATE), len(aux_h))
     update, decisions_total, seconds_total = 0, 0, 0.0
     if args.init:
         print('init', args.init, load_compatible(learner_model, torch.load(args.init, map_location=lm_dev)['model']))
@@ -2063,6 +2106,20 @@ def main(argv=None, child=None, actor=None):
                 if torch.is_tensor(st.get('step')) and st['step'].is_cuda:
                     st['step'] = st['step'].cpu()
         update, decisions_total, seconds_total = ck['update'], ck['decisions'], ck.get('seconds', 0.0)
+        if aux_head is not None:   # 2026-11-03: a checkpoint without the head (C99's): fresh, the policy exact
+            if ck.get('aux'):
+                aux_head.load_state_dict(ck['aux']['head'])
+                aux_norm.load(ck['aux']['norm'])
+                a_osd = ck['aux']['opt']
+                for g in a_osd['param_groups']:
+                    g['fused'], g['foreach'] = (True, None) if fused else (None, None)
+                aopt.load_state_dict(a_osd)
+            else:
+                print('aux: --resume of a checkpoint without the head: it starts fresh', flush=True)
+    if aux_head is not None:
+        print(f'aux (tok_aux): horizons {aux_h}, coef {args.aux_coef}, input o_t ({args.temporal_width}), '
+              f'{sum(q.numel() for q in aux_head.parameters()) / 1e6:.2f}M parameters, {len(AUX_STATE)} state + '
+              f'{len(AUX_EVENTS)} events + return per scale', flush=True)
     amp = args.amp == 'bf16'
     if amp and not torch.cuda.is_bf16_supported():
         raise SystemExit('--amp bf16: this GPU has no bfloat16 support')
@@ -2217,8 +2274,8 @@ def main(argv=None, child=None, actor=None):
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
     if child is None:
-        roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared), \
-            Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared)
+        roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, close=aux_on), \
+            Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, close=aux_on)
         if n_act > 1 and actor is None:   # (the first actor: the shared arrays of all workers, its rows of them)
             shared_full = SharedArrays()
             full_rolls = [full_from_local(r_, args.workers, w_lo, shared_full) for r_ in (roll, spare)]
@@ -2404,7 +2461,9 @@ def main(argv=None, child=None, actor=None):
     def save(path):
         torch.save(dict(model=learner_model.state_dict(), optimizer=opt.state_dict(), update=L['update'],
                         decisions=L['decisions'], seconds=L['seconds'], config=learner_model.config, args=vars(args),
-                        **(dict(choice_optimizer=copt.state_dict()) if copt is not None else {})),
+                        **(dict(choice_optimizer=copt.state_dict()) if copt is not None else {}),
+                        **(dict(aux=dict(head=aux_head.state_dict(), opt=aopt.state_dict(), norm=aux_norm.state()))
+                           if aux_head is not None else {})),
                    path)
 
     b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
@@ -2433,7 +2492,8 @@ def main(argv=None, child=None, actor=None):
         adev, device = device_actor, ldev
         t0 = time.perf_counter()
         U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
-                          (('temporal',) if t_on else ()), 0.0)   # seconds per part of the update (u_* columns)
+                          (('temporal',) if t_on else ()) + (('aux',) if aux_on else ()),
+                          0.0)   # seconds per part of the update (u_* columns)
         if t_on and getattr(job['roll'], 't_kv', None) is None:
             raise RuntimeError('--temporal 1: the rollout has no temporal arrays (a bench job of a run without it?)')
         mark = [t0]
@@ -2596,6 +2656,9 @@ def main(argv=None, child=None, actor=None):
         lr = args.lr + (args.lr_final - args.lr) * frac
         for g in opt.param_groups:
             g['lr'] = lr
+        if aux_on:
+            for g in aopt.param_groups:
+                g['lr'] = lr
         if every is not None and fast2:   # (B38 step 4: the records' bytes from the start-of-update pass)
             pos = torch.from_numpy(np.searchsorted(all_flat, flat)).to(device)
             raw_all, pend_all = raw_e.index_select(0, pos), pend_e.index_select(0, pos)
@@ -2663,6 +2726,14 @@ def main(argv=None, child=None, actor=None):
             if PROFILE:
                 torch.cuda.current_stream().synchronize()
             U['temporal'] += time.perf_counter() - t_t0
+        aux_t = None
+        if aux_on:   # 2026-11-03 (tok_aux): the update's targets, on the device (read from the rollout before `fresh`)
+            t_a0 = time.perf_counter()
+            aux_t, aux_log = build_targets(rl, flat, lw, aux_h, aux_norm, device)
+            aux_acc = torch.zeros((3, len(aux_h)), device=device)
+            aux_acc_ev = torch.zeros((len(aux_h), len(AUX_EVENTS)), device=device)
+            aux_gn = torch.zeros(1, device=device)
+            U['aux'] += time.perf_counter() - t_a0
         sec('batch')
         acc = torch.zeros(5, device=device)        # pg, vf, ent, kl, clipped (sums over steps, on the GPU)
         tacc = torch.zeros(3, device=device)       # teach, danger, safe_mass
@@ -3077,6 +3148,9 @@ def main(argv=None, child=None, actor=None):
                         adv_std = a_all.std()
                         a_all = (a_all - a_all.mean()) / (a_all.std() + 1e-8)
                 opt.zero_grad(set_to_none=True)
+                if aux_on:   # 2026-11-03 (tok_aux): its means' denominators over this minibatch's valid trained rows
+                    aopt.zero_grad(set_to_none=True)
+                    aux_den = minibatch_den(aux_t, sel, b_w)
                 micro = args.micro or len(sel)
                 if mem_on:   # (memory) parts of whole chunks
                     micro = max(T_mem, micro // T_mem * T_mem)
@@ -3237,6 +3311,8 @@ def main(argv=None, child=None, actor=None):
                                         o=torch.cat([z_, L['v2_o'].index_select(0, vpick_d)]),
                                         m=torch.cat([torch.zeros(n_tb, device=device),
                                                      L['v2_m'].index_select(0, vpick_d)]))
+                            if aux_on:   # 2026-11-03 (tok_aux): the forward hands o_t back (its rows: the part's)
+                                tk_['temporal']['keep_o'] = True
                             outs_ = lm_call(mb, packed=bool(args.packed), mem=memd,
                                                   **(dict(need_vg=True) if glob_loss else {}), **tk_)
                         else:
@@ -3270,6 +3346,11 @@ def main(argv=None, child=None, actor=None):
                         vgf = 0.5 * pmean((outs_[-1][:k_].float() - b_ret_g[part]) ** 2, pm, pn)
                         loss = loss + args.vf_global_coef * vgf * w
                         gacc += vgf.detach() * w
+                    if aux_on:   # 2026-11-03 (tok_aux): the part's share of the minibatch's L_aux
+                        aloss, astats, aevs = part_loss(aux_head, tk_['temporal'].pop('o_seq'), aux_t, part, pm, aux_den)
+                        loss = loss + args.aux_coef * aloss
+                        aux_acc += astats
+                        aux_acc_ev += aevs
                     if merged:
                         t_end = k_ + len(pick) if vmerged else None   # (teacher v2's records follow)
                         tloss, tstats = teacher_loss(logits_[k_:t_end], danger_[k_:t_end], meta, n_sel)
@@ -3343,7 +3424,12 @@ def main(argv=None, child=None, actor=None):
                                        [None if q.grad is None else q.grad.clone()
                                         for q in opt.param_groups[0]['params']]))
                 m_ = pmark('b38:clip_opt', m_)
-                torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+                if aux_on:   # (the policy's norm as ever, aux's share included; the head's apart: not PPO's scale)
+                    aux_gn += torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(aux_head.parameters(), args.max_grad_norm)
+                    aopt.step()
+                else:
+                    torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                 opt.step()
                 pmark(None, m_)
                 sec('opt')
@@ -3452,6 +3538,9 @@ def main(argv=None, child=None, actor=None):
                 row['v_global_ev'] = 1.0 - float((rg_ - vg_).var()) / var_g if var_g > 0 else 0.0
             else:
                 row['v_global_ev'] = ''
+        if aux_on:   # 2026-11-03 (tok_aux)
+            row.update(log_row(aux_acc.cpu().numpy(), aux_acc_ev.cpu().numpy(), steps_, aux_h, float(aux_gn[0])))
+            row.update(aux_log)
         row.update({f'u_{k}': v for k, v in U.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
         if run or items:   # 2026-10-06: run / item counters (absent in the other modes: their columns are unchanged)
