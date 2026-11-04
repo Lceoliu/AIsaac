@@ -2686,9 +2686,11 @@ def main(argv=None, child=None, actor=None):
                         if s_plan is not None:
                             slog.part(s_plan, at, at + len(part), *tk_p['temporal'].pop('zg_in'))
                         if priv_on:
+                            m_rp = pmark('b38:recompute_priv')
                             zr_p, zg_p = tk_p['temporal'].pop('z_out')
                             v_, vg_p = pcritic(zr_p, zg_p, pcritic.encode(pv_all, part))
                             vgs.append(vg_p.float())
+                            pmark(None, m_rp)
                         else:
                             v_ = o_[1].float()
                             vgs.append(o_[-1].float())
@@ -3433,6 +3435,7 @@ def main(argv=None, child=None, actor=None):
                                                   **(dict(need_vg=True) if glob_loss else {}))
                         logits_, value_, danger_ = outs_[:3]
                     if priv_on:   # 2026-11-03 (tok_priv): the values from [zr ; p_t], [zg ; p_t]; teachers' rows: missing
+                        m_ = pmark('b38:part_priv', m_)
                         zr_q, zg_q = tk_['temporal'].pop('z_out')
                         p_q = pcritic.encode(pv_b, part)
                         if len(zr_q) > k_:
@@ -3472,6 +3475,7 @@ def main(argv=None, child=None, actor=None):
                         loss = loss + (args.vf_coef * pl_v + args.vf_global_coef * pl_g) * w
                         pacc2 += torch.stack([pl_v.detach(), pl_g.detach()]) * w
                     if aux_on:   # 2026-11-03 (tok_aux): the part's share of the minibatch's L_aux
+                        m_ = pmark('b38:part_aux', m_)
                         aloss, astats, aevs = part_loss(aux_head, tk_['temporal'].pop('o_seq'), aux_t, part, pm, aux_den)
                         loss = loss + args.aux_coef * aloss
                         aux_acc += astats
