@@ -192,7 +192,7 @@ Predictive auxiliary loss (2026-11-03, rl/docs/PREDICTIVE_MEMORY_DESIGN.md secti
   temporal transformer's o_t that predicts, per --aux-horizons k, the explicit state at t + k, the events in between and
   the return over them; --aux-coef x L_aux joins each part's loss. The actor, its graphs and the checkpoint's 'model' are
   untouched (the head, its Adam and the normalisation are the checkpoint's 'aux'). progress.csv: aux_reg_k, aux_ev_k,
-  aux_ret_k, aux_loss, aux_ms_k / aux_me_k (masked shares of the trained rows), aux_ev0_k (the base rates' BCE),
+  aux_ret_k, aux_room_ce_k, aux_loss, aux_ms_k / aux_me_k (masked shares of the trained rows), aux_ev0_k (the base rates' BCE),
   aux_rate_* / aux_bce_* per event, aux_grad_norm, u_aux (the tables' host seconds).
 The last stored decision of a worker has no reward yet when the rollout ends: it is kept out of the update, its value
 bootstraps the one before, and it opens the next rollout.
@@ -1880,8 +1880,8 @@ def main(argv=None, child=None, actor=None):
                       temporal_rooms=args.temporal_rooms)
     aux_on = bool(args.aux_predict)   # 2026-11-03 (tok_aux)
     if aux_on:
-        from isaac_bridge.tok_aux import (AuxNorm, EVENTS as AUX_EVENTS, STATE as AUX_STATE, build_targets, log_row,
-                                          make_head, minibatch_den, parse_horizons, part_loss)
+        from isaac_bridge.tok_aux import (AuxNorm, EVENTS as AUX_EVENTS, REG_COLS as AUX_REG, STATE as AUX_STATE,
+                                          build_targets, log_row, make_head, minibatch_den, parse_horizons, part_loss)
         if not t_on:
             p.error('--aux-predict 1 needs --temporal 1 (it reads the temporal output o_t)')
         if args.learner_compile:
@@ -2048,7 +2048,7 @@ def main(argv=None, child=None, actor=None):
     if aux_on and (child is not None or not proc):
         aux_head = make_head(args.temporal_width, len(aux_h)).to(lm_dev)
         aopt = torch.optim.Adam(aux_head.parameters(), lr=args.lr, eps=1e-5, **(dict(fused=True) if fused else {}))
-        aux_norm = AuxNorm(len(AUX_STATE), len(aux_h))
+        aux_norm = AuxNorm(len(AUX_REG), len(aux_h))
     update, decisions_total, seconds_total = 0, 0, 0.0
     if args.init:
         print('init', args.init, load_compatible(learner_model, torch.load(args.init, map_location=lm_dev)['model']))
@@ -2730,7 +2730,7 @@ def main(argv=None, child=None, actor=None):
         if aux_on:   # 2026-11-03 (tok_aux): the update's targets, on the device (read from the rollout before `fresh`)
             t_a0 = time.perf_counter()
             aux_t, aux_log = build_targets(rl, flat, lw, aux_h, aux_norm, device)
-            aux_acc = torch.zeros((3, len(aux_h)), device=device)
+            aux_acc = torch.zeros((4, len(aux_h)), device=device)
             aux_acc_ev = torch.zeros((len(aux_h), len(AUX_EVENTS)), device=device)
             aux_gn = torch.zeros(1, device=device)
             U['aux'] += time.perf_counter() - t_a0

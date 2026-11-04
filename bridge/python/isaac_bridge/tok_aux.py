@@ -20,15 +20,17 @@ Targets of decision t at scale k (a horizon of k decisions; rl/docs/PREDICTIVE_M
     masked. progress.csv reports the masked shares (aux_ms_k, aux_me_k).
 
 Normalisation: state fields by their running mean and standard deviation over every stored record seen so far (AuxNorm,
-saved in the checkpoint), clipped to +-CLIP; a return by the running standard deviation of its scale. Loss: MSE on the
-state, BCE on the events, Huber on the return, each mean over its valid rows and its columns, equal weight per scale:
-L_aux = mean_k (reg_k + ev_k + ret_k); the trainer adds --aux-coef x L_aux to the part's loss. The gradient reaches the
+saved in the checkpoint), clipped to +-CLIP; a return by the running standard deviation of its scale. The room type is a
+class, not a number: N_ROOM_TYPE-way cross-entropy in place of that column's MSE (M1 review, 2026-11-03), counting as one
+column of the state's mean (reg_k = (sum of the other columns' MSE + CE) / len(STATE); progress.csv aux_room_ce_k holds
+the CE alone). Loss: the state as above, BCE on the events, Huber on the return, each mean over its valid rows, equal
+weight per scale: L_aux = mean_k (reg_k + ev_k + ret_k); the trainer adds --aux-coef x L_aux to the part's loss. The gradient reaches the
 head, the temporal transformer and the spatial encoder through o_t as PPO's does (--temporal-bptt's chunks), and never
 passes through an advantage.
 """
 import numpy as np
 
-from .tok_obs import EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, KIND_COLUMN
+from .tok_obs import EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, KIND_COLUMN, N_ROOM_TYPE
 
 # Rollout close_done of a decision closed by the next episode's first record (a worker error): the end is not a real one
 CLOSE_BROKE = 255
@@ -36,6 +38,8 @@ EVENTS = ('hurt', 'clear', 'room', 'new_room', 'pickup', 'floor', 'death')
 # (red and soul half hearts are ROW player columns 4, 5; phearts holds black, eternal, bone)
 STATE = ('x', 'y', 'hearts', 'soul', 'black', 'eternal', 'bone', 'coins', 'bombs', 'keys', 'enemies', 'room_type',
          'stage')
+ROOM_COL = STATE.index('room_type')
+REG_COLS = tuple(i for i in range(len(STATE)) if i != ROOM_COL)   # the regressed columns
 _PLAYER_COLS = (0, 1, 4, 5)
 NPC_COLUMN = KIND_COLUMN + 6
 CLIP = 10.0
@@ -247,11 +251,13 @@ def build_targets(roll, flat, weight, horizons, norm, device):
     array. Returns (tensors dict for part_loss, log dict of plain numbers)."""
     import torch
     tb = rollout_tables(roll, horizons)
-    norm.update(tb['state_raw'], tb['ret'], tb['m_ev'])
+    norm.update(tb['state_raw'][:, REG_COLS], tb['ret'], tb['m_ev'])
     w_, t_ = flat // roll.cap, flat % roll.cap
     m_state, m_ev = tb['m_state'][w_, t_], tb['m_ev'][w_, t_]
     ev = tb['ev'][w_, t_]
-    state = np.clip((tb['state'][w_, t_] - norm.mean.astype(np.float32)) / norm.state_std().astype(np.float32),
+    raw = tb['state'][w_, t_]
+    room = raw[..., ROOM_COL].astype(np.int64)
+    state = np.clip((raw[..., REG_COLS] - norm.mean.astype(np.float32)) / norm.state_std().astype(np.float32),
                     -CLIP, CLIP) * m_state[..., None]
     ret = (tb['ret'][w_, t_] / norm.ret_std()).astype(np.float32) * m_ev
     log = {}
@@ -269,23 +275,25 @@ def build_targets(roll, flat, weight, horizons, norm, device):
     def to(a, dt=None):
         x = torch.from_numpy(np.ascontiguousarray(a))
         return (x if dt is None else x.to(dt)).to(device)
-    return dict(state=to(state), m_state=to(m_state, torch.float32), ev=to(ev, torch.float32), ret=to(ret),
+    return dict(state=to(state), room=to(room), m_state=to(m_state, torch.float32), ev=to(ev, torch.float32), ret=to(ret),
                 m_ev=to(m_ev, torch.float32)), log
 
 
 def make_head(d_in, n_scales, hidden=256):
-    """The prediction head: o_t -> [K, S + E + 1] (state, event logits, return per scale)."""
+    """The prediction head: o_t -> [K, R + N_ROOM_TYPE + E + 1] (regressed state, room-type logits, event logits, return
+    per scale)."""
     from torch import nn
 
     class AuxHead(nn.Module):
         def __init__(self):
             super().__init__()
-            self.K, self.S, self.E = int(n_scales), len(STATE), len(EVENTS)
+            self.K, self.R, self.E = int(n_scales), len(REG_COLS), len(EVENTS)
+            self.out = self.R + N_ROOM_TYPE + self.E + 1
             self.net = nn.Sequential(nn.Linear(d_in, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU(),
-                                     nn.Linear(hidden, self.K * (self.S + self.E + 1)))
+                                     nn.Linear(hidden, self.K * self.out))
 
         def forward(self, o):
-            return self.net(o.float()).view(o.shape[0], self.K, self.S + self.E + 1)
+            return self.net(o.float()).view(o.shape[0], self.K, self.out)
     return AuxHead()
 
 
@@ -298,31 +306,36 @@ def minibatch_den(tg, sel, w):
 
 def part_loss(head, o, tg, part, w, den):
     """A part's share of the minibatch's L_aux: o [n, D] (with gradient), part [n] its rows in tg, w [n] the rows' weight,
-    den: minibatch_den. Returns (L_aux's share, detached [3, K] reg / ev / ret shares, detached [K, E] per-event BCE
-    shares). Shares of the minibatch's parts add up to its means."""
+    den: minibatch_den. Returns (L_aux's share, detached [4, K] reg / ev / ret / room CE shares, detached [K, E] per-event
+    BCE shares). Shares of the minibatch's parts add up to its means."""
     from torch.nn import functional as F
     p = head(o)
-    S, E = head.S, head.E
+    R, E = head.R, head.E
+    Rc = R + N_ROOM_TYPE
     ms = tg['m_state'].index_select(0, part) * w[:, None]
     me = tg['m_ev'].index_select(0, part) * w[:, None]
-    reg = (p[..., :S] - tg['state'].index_select(0, part)).pow(2).mean(-1)
-    bce = F.binary_cross_entropy_with_logits(p[..., S:S + E], tg['ev'].index_select(0, part), reduction='none')
-    ret = F.huber_loss(p[..., S + E], tg['ret'].index_select(0, part), reduction='none', delta=1.0)
+    room = tg['room'].index_select(0, part)
+    ce = F.cross_entropy(p[..., R:Rc].reshape(-1, N_ROOM_TYPE), room.reshape(-1), reduction='none').view(room.shape)
+    reg = ((p[..., :R] - tg['state'].index_select(0, part)).pow(2).sum(-1) + ce) / (R + 1)   # (the CE: one column)
+    bce = F.binary_cross_entropy_with_logits(p[..., Rc:Rc + E], tg['ev'].index_select(0, part), reduction='none')
+    ret = F.huber_loss(p[..., Rc + E], tg['ret'].index_select(0, part), reduction='none', delta=1.0)
     l_reg = (reg * ms).sum(0) / den['state']
+    l_room = (ce * ms).sum(0) / den['state']
     l_ev = (bce.mean(-1) * me).sum(0) / den['ev']
     l_ret = (ret * me).sum(0) / den['ev']
     per_ev = (bce * me[..., None]).sum(0) / den['ev'][:, None]
     import torch
-    return (l_reg + l_ev + l_ret).mean(), torch.stack([l_reg, l_ev, l_ret]).detach(), per_ev.detach()
+    return (l_reg + l_ev + l_ret).mean(), torch.stack([l_reg, l_ev, l_ret, l_room]).detach(), per_ev.detach()
 
 
 def log_row(acc, acc_ev, steps, horizons, grad_norm):
-    """progress.csv's columns of an update from the parts' summed shares (acc [3, K], acc_ev [K, E], numpy)."""
+    """progress.csv's columns of an update from the parts' summed shares (acc [4, K], acc_ev [K, E], numpy)."""
     row = {}
     for ki, h in enumerate(horizons):
-        row[f'aux_reg_{h}'], row[f'aux_ev_{h}'], row[f'aux_ret_{h}'] = (float(acc[j, ki]) / steps for j in range(3))
+        row[f'aux_reg_{h}'], row[f'aux_ev_{h}'], row[f'aux_ret_{h}'], row[f'aux_room_ce_{h}'] = (
+            float(acc[j, ki]) / steps for j in range(4))
         for j, name in enumerate(EVENTS):
             row[f'aux_bce_{name}_{h}'] = float(acc_ev[ki, j]) / steps
-    row['aux_loss'] = float(acc.sum(0).mean()) / steps
+    row['aux_loss'] = float(acc[:3].sum(0).mean()) / steps
     row['aux_grad_norm'] = float(grad_norm) / steps   # (the policy's gradient norm before clipping, aux included)
     return row

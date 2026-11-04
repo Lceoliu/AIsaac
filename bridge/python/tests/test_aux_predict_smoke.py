@@ -43,7 +43,7 @@ import torch   # noqa: E402
 
 from isaac_bridge import tok_aux as A   # noqa: E402
 from isaac_bridge import tok_policy as TP   # noqa: E402
-from isaac_bridge.tok_obs import EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, KIND_COLUMN, ROW   # noqa: E402
+from isaac_bridge.tok_obs import EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, KIND_COLUMN, N_ROOM_TYPE, ROW   # noqa: E402
 
 FAIL = []
 EV = {n: i for i, n in enumerate(A.EVENTS)}
@@ -298,7 +298,7 @@ def case_d():
     rng = np.random.default_rng(5)
     H = (1, 4)
     a, b = random_roll(rng), random_roll(rng)
-    norm = A.AuxNorm(len(A.STATE), len(H))
+    norm = A.AuxNorm(len(A.REG_COLS), len(H))
     device = 'cpu'
     all_raw, all_ret = [], [[] for _ in H]
     for r in (a, b):
@@ -309,7 +309,7 @@ def case_d():
         for ki in range(len(H)):
             all_ret[ki].append(tb['ret'][..., ki][tb['m_ev'][..., ki]])
         tg, log = A.build_targets(r, flat, weight, H, norm, device)
-    raw = np.concatenate(all_raw).astype(np.float64)
+    raw = np.concatenate(all_raw).astype(np.float64)[:, A.REG_COLS]
     check('(d) running mean / std == the batch statistics over both rollouts',
           np.allclose(norm.mean, raw.mean(0), atol=1e-6) and
           np.allclose(norm.state_std(), np.sqrt(np.maximum(raw.var(0), 1e-4)), atol=1e-6))
@@ -324,10 +324,11 @@ def case_d():
 
 def case_e():
     torch.manual_seed(9)
-    K, S, E, n = 3, len(A.STATE), len(A.EVENTS), 40
+    K, S, E, n = 3, len(A.REG_COLS), len(A.EVENTS), 40
     head = A.make_head(8, K, hidden=16)
     o = torch.randn(n, 8)
-    tg = dict(state=torch.randn(n, K, S), m_state=(torch.rand(n, K) < 0.7).float(), ev=(torch.rand(n, K, E) < 0.3).float(),
+    tg = dict(state=torch.randn(n, K, S), room=torch.randint(0, N_ROOM_TYPE, (n, K)), m_state=(torch.rand(n, K) < 0.7).float(),
+              ev=(torch.rand(n, K, E) < 0.3).float(),
               ret=torch.randn(n, K) * 3, m_ev=(torch.rand(n, K) < 0.8).float())
     w = (torch.rand(n) < 0.9).float()
     sel = torch.arange(n)
@@ -342,6 +343,7 @@ def case_e():
           float((st1 - st2).abs().max()) < 1e-5 and float((ev1 - ev2).abs().max()) < 1e-5)
     tg2 = {k: v.clone() for k, v in tg.items()}
     tg2['state'] = tg2['state'] + 100 * (1 - tg['m_state'])[..., None] * (1 - 0)
+    tg2['room'] = torch.where(tg['m_state'] > 0, tg2['room'], (tg2['room'] + 1) % N_ROOM_TYPE)
     tg2['ret'] = tg2['ret'] + 100 * (1 - tg['m_ev'])
     tg2['ev'] = torch.where(tg['m_ev'][..., None] > 0, tg2['ev'], 1 - tg2['ev'])
     l2, _, _ = A.part_loss(head, o, tg2, sel, w, den)
@@ -354,16 +356,20 @@ def case_e():
     zero = A.make_head(8, 1, hidden=4)
     for q in zero.parameters():
         torch.nn.init.zeros_(q)
-    t1 = dict(state=torch.full((2, 1, S), 2.0), m_state=torch.tensor([[1.0], [0.0]]), ev=torch.zeros((2, 1, E)),
+    t1 = dict(state=torch.full((2, 1, S), 2.0), room=torch.tensor([[5], [7]]), m_state=torch.tensor([[1.0], [0.0]]),
+              ev=torch.zeros((2, 1, E)),
               ret=torch.tensor([[3.0], [0.5]]), m_ev=torch.ones(2, 1))
     t1['ev'][0, 0, 0] = 1.0
     w1 = torch.ones(2)
     d1 = A.minibatch_den(t1, torch.arange(2), w1)
     _, s1, e1 = A.part_loss(zero, torch.zeros(2, 8), t1, torch.arange(2), w1, d1)
     want_ret = (0.5 * 0.25 + (3.0 - 0.5)) / 2   # Huber(delta 1): 0.5 r^2 below 1, |r| - 0.5 above
-    check('(e) hand values: MSE, BCE at logit 0, Huber', abs(float(s1[0, 0]) - 4.0) < 1e-5 and
-          abs(float(s1[1, 0]) - np.log(2.0)) < 1e-5 and abs(float(s1[2, 0]) - want_ret) < 1e-5,
-          f'{s1[:, 0].tolist()} want 4, {np.log(2.0):.4f}, {want_ret}')
+    ce0 = float(np.log(N_ROOM_TYPE))
+    want_reg = (S * 4.0 + ce0) / (S + 1)   # 12 columns of MSE 4, the room type's CE at uniform logits as the 13th
+    check('(e) hand values: state mean with the room type\'s CE as one column, BCE at logit 0, Huber, the CE logged alone',
+          abs(float(s1[0, 0]) - want_reg) < 1e-5 and abs(float(s1[1, 0]) - np.log(2.0)) < 1e-5 and
+          abs(float(s1[2, 0]) - want_ret) < 1e-5 and abs(float(s1[3, 0]) - ce0) < 1e-5,
+          f'{s1[:, 0].tolist()} want {want_reg:.4f}, {np.log(2.0):.4f}, {want_ret}, {ce0:.4f}')
     check('(e) per-event BCE shares average to the events\' mean', abs(float(e1.mean()) - float(s1[1, 0])) < 1e-5)
 
 
@@ -414,8 +420,8 @@ def case_f():
     m.zero_grad(set_to_none=True)
     _, d2 = chunk(True)
     n = len(flat)
-    tg = dict(state=torch.randn(n, 2, len(A.STATE)), m_state=torch.ones(n, 2), ev=torch.zeros(n, 2, len(A.EVENTS)),
-              ret=torch.randn(n, 2), m_ev=torch.ones(n, 2))
+    tg = dict(state=torch.randn(n, 2, len(A.REG_COLS)), room=torch.randint(0, N_ROOM_TYPE, (n, 2)), m_state=torch.ones(n, 2),
+              ev=torch.zeros(n, 2, len(A.EVENTS)), ret=torch.randn(n, 2), m_ev=torch.ones(n, 2))
     w = torch.ones(n)
     idx = torch.arange(n)
     L, _, _ = A.part_loss(head, d2['o_seq'], tg, idx, w, A.minibatch_den(tg, idx, w))
@@ -433,8 +439,8 @@ def case_f():
     # learnable targets (a fixed function of each worker and step): the loss through o_t, the temporal transformer and
     # the spatial encoder falls far below the targets' variance
     g = torch.Generator().manual_seed(4)
-    tg = dict(state=torch.randn(TS.NW, 2, len(A.STATE), generator=g)[np.asarray(flat // ra.cap)],
-              m_state=torch.ones(n, 2), ev=(torch.rand(TS.NW, 2, len(A.EVENTS), generator=g) < 0.5).float()[np.asarray(flat // ra.cap)],
+    tg = dict(state=torch.randn(TS.NW, 2, len(A.REG_COLS), generator=g)[np.asarray(flat // ra.cap)],
+              room=torch.randint(0, N_ROOM_TYPE, (TS.NW, 2), generator=g)[np.asarray(flat // ra.cap)], m_state=torch.ones(n, 2), ev=(torch.rand(TS.NW, 2, len(A.EVENTS), generator=g) < 0.5).float()[np.asarray(flat // ra.cap)],
               ret=torch.randn(TS.NW, 2, generator=g)[np.asarray(flat // ra.cap)], m_ev=torch.ones(n, 2))
     opt = torch.optim.Adam(list(head.parameters()) + list(m.parameters()), lr=2e-3)
     den = A.minibatch_den(tg, idx, w)
@@ -445,10 +451,11 @@ def case_f():
         L, st_, _ = A.part_loss(head, d3['o_seq'], tg, idx, w, den)
         L.backward()
         opt.step()
-        hist.append([float(x) for x in st_.sum(1)])
+        hist.append([float(x) for x in st_[:3].sum(1)] + [float(st_[3].sum())])
     a_, b_ = np.array(hist[0]), np.array(hist[-1])
-    check('(f) learnable targets: state MSE, events\' BCE and return all fall clearly through o_t',
-          b_[0] < 0.5 * a_[0] and b_[1] < 0.7 * a_[1] and b_[2] < 0.5 * a_[2], f'{a_.round(3)} -> {b_.round(3)}')
+    check('(f) learnable targets: state, events\' BCE, return and the room type\'s CE all fall clearly through o_t',
+          b_[0] < 0.5 * a_[0] and b_[1] < 0.7 * a_[1] and b_[2] < 0.5 * a_[2] and b_[3] < 0.5 * a_[3],
+          f'{a_.round(3)} -> {b_.round(3)}')
 
 
 def case_arrays():
@@ -581,7 +588,7 @@ def case_g_h_i():
         check(f'(h) on [--learner-fast {fast}]: the policy is trained differently from off',
               not same_tensors(r_off['weights'], r_on['weights']))
         row = r_on['progress'][-1]
-        cols = [f'aux_{x}_{h}' for x in ('reg', 'ev', 'ret', 'ms', 'me', 'ev0') for h in (1, 4, 16)] + \
+        cols = [f'aux_{x}_{h}' for x in ('reg', 'ev', 'ret', 'room_ce', 'ms', 'me', 'ev0') for h in (1, 4, 16)] + \
             ['aux_loss', 'aux_grad_norm', 'u_aux'] + [f'aux_rate_{e}_{h}' for e in A.EVENTS for h in (1, 4, 16)] + \
             [f'aux_bce_{e}_{h}' for e in A.EVENTS for h in (1, 4, 16)]
         missing = [c for c in cols if c not in row or row[c] == '']
