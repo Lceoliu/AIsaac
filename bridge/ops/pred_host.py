@@ -31,12 +31,21 @@ SWITCHES = dict(a0='', a1=' --aux-predict 1', a2=' --priv-critic 1', a3=' --aux-
 
 CHAIN = r'''#!/usr/bin/env python3
 """On the host: run a chain's cases one after another under the guard. usage: run_chain.py <chain.json>"""
-import json, pathlib, subprocess, sys, time
+import json, os, pathlib, subprocess, sys, time
 root = pathlib.Path('/home/runaiwusheng/aisaac-bench-20261019/cpu-wide')
 chain = json.loads(pathlib.Path(sys.argv[1]).read_text())
 state = root / 'pred' / (pathlib.Path(sys.argv[1]).stem + '.state')
 def note(**k):
     with state.open('a') as f: f.write(json.dumps(dict(k, time=time.strftime('%F %T'))) + '\n')
+def host_cores(seconds=30):
+    """Busy CPUs of the whole host over a little while."""
+    def read():
+        v = [int(x) for x in pathlib.Path('/proc/stat').read_text().splitlines()[0].split()[1:9]]
+        return sum(v) - v[3] - v[4], time.time()
+    a, t0 = read()
+    time.sleep(seconds)
+    b, t1 = read()
+    return (b - a) / os.sysconf('SC_CLK_TCK') / (t1 - t0)
 def pick(allowed, n=3):
     """The first n of the allowed GPUs without a compute process, or (None, why). (In order: actor 0, learner, actor 1.)"""
     if subprocess.run("docker ps --format '{{.Names}}' | grep -q '^aisaac-'", shell=True).returncode == 0: return None, 'an aisaac container is up'
@@ -44,11 +53,17 @@ def pick(allowed, n=3):
     apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid', '--format=csv,noheader'], text=True).split()
     free = [g for g in allowed if idx[str(g)] not in apps]
     return (free[:n], None) if len(free) >= n else (None, f'free {free} of {allowed}')
-for c in chain['cases']:
+queue = list(chain['cases'])
+while queue:
+    c = queue.pop(0)
     if (root / 'pred' / 'STOP').exists(): note(event='stop file'); break
     last = None
     while True:
         gpus, why = pick(c.get('gpus') or chain['gpus'])
+        if why is None and chain.get('max_busy_cores'):   # (a measurement: only on a quiet host, the guard's own rule)
+            cores = host_cores()
+            if cores > chain['max_busy_cores']:
+                why = f'host busy, more than {chain["max_busy_cores"]} cores'
         if why is None: break
         if why != last:   # (only a change is noted)
             note(event='wait', case=c['case'], why=why)
@@ -66,7 +81,16 @@ for c in chain['cases']:
     with (root / 'logs' / f"{c['case']}.dispatch.log").open('w') as log:
         rc = subprocess.call(['python3', str(root / 'pred' / 'guard_pred.py'), str(p)], stdout=log, stderr=subprocess.STDOUT)
     note(event='done', case=c['case'], rc=rc)
-    if rc != 0 and not c.get('keep_going', True): break
+    if rc != 0:
+        text = (root / 'logs' / f"{c['case']}.dispatch.log").read_text(errors='replace')
+        if 'other_workload' in text and c.get('retry', 0) < chain.get('retries', 6):   # (someone else's burst: the case again)
+            again = dict(c, case=c.get('base', c['case']) + f"-r{c.get('retry', 0) + 1}", base=c.get('base', c['case']), retry=c.get('retry', 0) + 1)
+            again['env'] = {k: v.replace(c['case'], again['case']) for k, v in (c.get('env') or {}).items()}
+            queue.insert(0, again)
+            note(event='retry', case=c['case'], next=again['case'])
+            continue
+        note(event='chain stopped', case=c['case'], rc=rc)
+        break
 note(event='chain done')
 '''
 
