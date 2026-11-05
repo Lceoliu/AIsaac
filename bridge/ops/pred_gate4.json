@@ -1,0 +1,12 @@
+{"gpus": [3, 1, 4, 5, 2], "memory": "72g", "external_mean_max": 16.0, "external_spread_max": 3.0, "window_minutes": 15, "cases": [
+ {"case": "pred-gate4-r1-a0", "arm": "a0", "hours": 60, "env": {"ISAAC_RL_LOG_GRAD_NORM": "1"}},
+ {"case": "pred-gate4-r1-a1", "arm": "a1", "hours": 60},
+ {"case": "pred-gate4-r1-a2", "arm": "a2", "hours": 60},
+ {"case": "pred-gate4-r1-a3", "arm": "a3", "hours": 60},
+ {"case": "pred-gate4-r2-a0", "arm": "a0", "hours": 60, "env": {"ISAAC_RL_LOG_GRAD_NORM": "1"}},
+ {"case": "pred-gate4-r2-a1", "arm": "a1", "hours": 60},
+ {"case": "pred-gate4-r2-a2", "arm": "a2", "hours": 60},
+ {"case": "pred-gate4-r2-a3", "arm": "a3", "hours": 60},
+ {"case": "pred-gate4-h1", "arm": "a0", "hours": 18, "discard": 3, "env": {"ISAAC_RL_LOG_GRAD_NORM": "1", "ISAAC_RL_B38_TORCHPROF": "/bench/runs/pred-gate4-h1/prof", "ISAAC_RL_B38_TORCHPROF_AT": "10"}},
+ {"case": "pred-gate4-h2", "arm": "a0", "hours": 18, "discard": 3, "env": {"ISAAC_RL_LOG_GRAD_NORM": "1", "ISAAC_RL_B38_TORCHPROF": "/bench/runs/pred-gate4-h2/prof", "ISAAC_RL_B38_TORCHPROF_AT": "10"}}
+]}

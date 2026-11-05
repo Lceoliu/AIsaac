@@ -53,27 +53,34 @@ def parse_horizons(text):
     return out
 
 
+def npc_count(rows, npc_column=NPC_COLUMN):
+    """int64 [n]: the visible NPCs among each record's real entity tokens. Only those tokens are read (a record is 20 KB and
+    its entity slots span most of it: a walk over every slot was the tables' largest cost; slots past n_ent hold older values)."""
+    n = len(rows)
+    ne = np.minimum(rows['n_ent'].astype(np.int64), rows['ent'].shape[1])
+    at = np.repeat(np.arange(n), ne)
+    slot = np.arange(len(at)) - np.repeat(np.cumsum(ne) - ne, ne)
+    return np.bincount(at[rows['ent'][at, slot, npc_column] > 0], minlength=n)
+
+
 def state_rows(rows, npc_column=NPC_COLUMN):
     """float32 [n, len(STATE)]: the explicit state of records `rows` (a ROW array, no copy of its entity tables)."""
     n = len(rows)
-    pl = rows['player']
-    ph = rows['phearts']
-    # the visible NPCs among the record's real entity tokens (columns past n_ent hold older values)
-    npc = (rows['ent'][:, :, npc_column] > 0) & (np.arange(rows['ent'].shape[1])[None] < rows['n_ent'][:, None])
+    pl = np.array(rows['player'])   # (one pass over the records; everything below on the compact copy)
     out = np.empty((n, len(STATE)), np.float32)
     out[:, :4] = pl[:, _PLAYER_COLS]
-    out[:, 4:7] = ph
+    out[:, 4:7] = rows['phearts']
     out[:, 7], out[:, 8], out[:, 9] = pl[:, 10], pl[:, 8], pl[:, 9]
-    out[:, 10] = npc.sum(1)
+    out[:, 10] = npc_count(rows, npc_column)
     out[:, 11], out[:, 12] = rows['room_type'], rows['stage']
     return out
 
 
 def _gains(rows):
     """[n, 2]: health units and coins + bombs + keys of records (train_tok Episodes.cur_gains' columns)."""
-    pl = rows['player']
-    return np.stack([np.rint(pl[:, 7] * 12.0),
-                     np.rint(pl[:, 8] * 10.0) + np.rint(pl[:, 9] * 10.0) + np.rint(pl[:, 10] * 50.0)], 1)
+    pl = np.array(rows['player'][:, 7:11])
+    return np.stack([np.rint(pl[:, 0] * 12.0),
+                     np.rint(pl[:, 1] * 10.0) + np.rint(pl[:, 2] * 10.0) + np.rint(pl[:, 3] * 50.0)], 1)
 
 
 def event_rows(rows, n_closed, hurt, done, ev, boundary):
@@ -116,15 +123,16 @@ def event_rows(rows, n_closed, hurt, done, ev, boundary):
     return out
 
 
-def worker_tables(length, open_k, terminal, boot, first, reward, close_done, events, state, horizons):
+def worker_tables(length, open_k, terminal, boot, first, reward, close_done, events, state, horizons, into=None):
     """One worker's targets (the module docstring). length: its stored decisions; open_k: the open one (-1: none);
     terminal, boot, first, reward, close_done: its arrays; events: event_rows; state: state_rows. Returns dict of
-    arrays [length, K, ...]: state, m_state, ev, ret, m_ev."""
+    arrays [length, K, ...]: state, m_state, ev, ret, m_ev (into: those arrays, zero, to fill in place)."""
     L, K = int(length), len(horizons)
     U = L - 1 if (L and open_k == L - 1) else L   # the decisions with their step closed
     S, E = state.shape[1], events.shape[1]
-    out = dict(state=np.zeros((L, K, S), np.float32), m_state=np.zeros((L, K), bool), ev=np.zeros((L, K, E), bool),
-               ret=np.zeros((L, K), np.float64), m_ev=np.zeros((L, K), bool))
+    out = into if into is not None else dict(
+        state=np.zeros((L, K, S), np.float32), m_state=np.zeros((L, K), bool), ev=np.zeros((L, K, E), bool),
+        ret=np.zeros((L, K), np.float64), m_ev=np.zeros((L, K), bool))
     if U <= 0:
         return out
     next_first = np.zeros(U, bool)
@@ -183,15 +191,13 @@ def rollout_tables(roll, horizons):
             continue
         rows = roll.rows[w, :L]
         U = L - 1 if roll.open[w] == L - 1 else L
-        first = rows['first']
+        first = np.array(rows['first'])
         bnd = boundaries(L, roll.terminal[w], roll.boot[w], first)
         st = state_rows(rows)
         raws.append(st)
         evs = event_rows(rows, U, roll.close_hurt[w], roll.close_done[w], roll.close_ev[w], bnd)
-        t = worker_tables(L, roll.open[w], roll.terminal[w], roll.boot[w], first, roll.reward[w], roll.close_done[w],
-                          evs, st, horizons)
-        for k_, v_ in t.items():
-            out[k_][w, :L] = v_
+        worker_tables(L, roll.open[w], roll.terminal[w], roll.boot[w], first, roll.reward[w], roll.close_done[w],
+                      evs, st, horizons, into={k_: v_[w, :L] for k_, v_ in out.items()})
     out['state_raw'] = np.concatenate(raws) if raws else np.zeros((0, S), np.float32)
     return out
 
@@ -245,12 +251,13 @@ def base_bce(p):
     return -(q * np.log(q) + (1 - q) * np.log(1 - q))
 
 
-def build_targets(roll, flat, weight, horizons, norm, device):
+def build_targets(roll, flat, weight, horizons, norm, device, tables=None):
     """The update's targets at the rows of `flat` (the learner's flat positions, weight: 1 = trained): the norm updated
     first (the first rollout normalises by its own statistics), everything normalised, on the device in one copy per
-    array. Returns (tensors dict for part_loss, log dict of plain numbers)."""
+    array (tables: rollout_tables(roll, horizons) when already built). Returns (tensors dict for part_loss, log dict of
+    plain numbers)."""
     import torch
-    tb = rollout_tables(roll, horizons)
+    tb = rollout_tables(roll, horizons) if tables is None else tables
     norm.update(tb['state_raw'][:, REG_COLS], tb['ret'], tb['m_ev'])
     w_, t_ = flat // roll.cap, flat % roll.cap
     m_state, m_ev = tb['m_state'][w_, t_], tb['m_ev'][w_, t_]
@@ -272,9 +279,12 @@ def build_targets(roll, flat, weight, horizons, norm, device):
         for j, name in enumerate(EVENTS):
             log[f'aux_rate_{name}_{h}'] = float(rate[j])
 
+    pinned = torch.device(device).type == 'cuda'   # (no blocking copy: the parts' kernels follow them on the stream)
+
     def to(a, dt=None):
         x = torch.from_numpy(np.ascontiguousarray(a))
-        return (x if dt is None else x.to(dt)).to(device)
+        x = x if dt is None else x.to(dt)
+        return x.pin_memory().to(device, non_blocking=True) if pinned else x.to(device)
     return dict(state=to(state), room=to(room), m_state=to(m_state, torch.float32), ev=to(ev, torch.float32), ret=to(ret),
                 m_ev=to(m_ev, torch.float32)), log
 

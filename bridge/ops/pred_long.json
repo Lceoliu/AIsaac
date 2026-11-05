@@ -1,0 +1,6 @@
+{"long": true, "gpus": [3, 1, 4, 5, 2], "memory": "72g", "restart_wait_s": 600, "max_resumes": 30, "cases": [
+ {"case": "pred-long-a0", "arm": "l0", "hours": 10000, "env": {"ISAAC_RL_LOG_GRAD_NORM": "1"}, "edits": [[" --checkpoint-every 100000 ", " --checkpoint-every 1000 "]]},
+ {"case": "pred-long-a3", "arm": "l3", "hours": 10000, "env": {"ISAAC_RL_LOG_GRAD_NORM": "1"}, "edits": [[" --checkpoint-every 100000 ", " --checkpoint-every 1000 "]]},
+ {"case": "pred-long-a1", "arm": "l1", "hours": 10000, "env": {"ISAAC_RL_LOG_GRAD_NORM": "1"}, "edits": [[" --checkpoint-every 100000 ", " --checkpoint-every 1000 "]]},
+ {"case": "pred-long-a2", "arm": "l2", "hours": 10000, "env": {"ISAAC_RL_LOG_GRAD_NORM": "1"}, "edits": [[" --checkpoint-every 100000 ", " --checkpoint-every 1000 "]]}
+]}

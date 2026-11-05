@@ -7,7 +7,9 @@ login is read at run time from temp/memory-chain-v2/host_status.py (nothing of i
   python -X utf8 pred_host.py table <prefix>       per case: x_real_time, medians, memory, the switches' columns
   python -X utf8 pred_host.py get <remote> <local> a file
 
-Chain file: {"cases": [{"case": ..., "arm": a0|a1|a2|a3|l0|l3 ..., "hours": 60, "env": {...}, ...}], "gpus": [3, 1, 4, 5, 2]}. A case runs when
+Chain file: {"cases": [{"case": ..., "arm": a0|a1|a2|a3|l0|l3 ..., "hours": 60, "env": {...}, ...}], "gpus": [3, 1, 4, 5, 2]}. "long": true: long runs (only the user's stop
+rules, no external-load rule; a stopped run resumes from its newest good checkpoint as <case>-c<n> until the arm's game hours are reached; runs/<case>/COMPLETE then names the final
+checkpoint). A case runs when
 no aisaac-* container (ours or the other line's: they are never touched) is up and three of the allowed GPUs have no compute process (first come first served with the other
 sessions on the host, nothing of theirs is touched; the third of the three is the second actor's); inside: the 843x baseline's docker command (memory-chain-v2 baseline-command.json) with
 this code, minibatch / micro 4096, the arm's switches, and guard_v3's rules (they stop our own container only).
@@ -53,6 +55,81 @@ def pick(allowed, n=3):
     apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid', '--format=csv,noheader'], text=True).split()
     free = [g for g in allowed if idx[str(g)] not in apps]
     return (free[:n], None) if len(free) >= n else (None, f'free {free} of {allowed}')
+LONG = bool(chain.get('long'))
+HPD = 4 / 30 / 3600   # (game hours per decision)
+def ck_info(path):
+    """{'update', 'decisions'} of a checkpoint (a host path), or None when it does not load: torch.load in the image, a small container."""
+    p = subprocess.run(['docker', 'run', '--rm', '--name', f'aisaac-ckinfo-{os.getpid()}', '--network', 'none', '--cpus', '2', '--memory', '6g', '--read-only', '--tmpfs', '/tmp', '-e', 'OMP_NUM_THREADS=1',
+                        '-v', f'{root}:/bench:ro', '--entrypoint', '/bench/home/isaac-abplus/.venv/bin/python', 'aisaac-bench:20261019', '/bench/pred/ck_info.py', str(path).replace(str(root), '/bench')],
+                       capture_output=True, text=True, timeout=300)
+    try:
+        return json.loads(p.stdout.strip().splitlines()[-1]) if p.returncode == 0 else None
+    except (IndexError, ValueError):
+        return None
+def mem_available():
+    return int(next(x for x in pathlib.Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemAvailable:')).split()[1]) / 1024**2
+def free_now(c):
+    """Long runs: a look at the GPUs and the aisaac-* containers (and room for the container's memory above the guard's line), no CPU rule."""
+    last, noted = None, 0.0
+    while True:
+        gpus, why = pick(c.get('gpus') or chain['gpus'])
+        if why is None and mem_available() < chain.get('start_mem_gib', 84):
+            why = 'host memory: less available than the container needs above the guard line'
+        if why is None:
+            return gpus
+        if why != last or time.time() - noted > 1800:
+            note(event='wait', case=c['case'], why=why)
+            last, noted = why, time.time()
+        time.sleep(60)
+def run_long(c):
+    """One arm: runs until its game hours are reached, each new one from the newest good checkpoint of the last. True when complete."""
+    base, start = c['case'], c.get('resume', '/bench/checkpoints/c99-segment2-final.pt')
+    first = ck_info(start.replace('/bench', str(root)))
+    if first is None:
+        note(event='arm stopped', case=base, why='the start checkpoint does not load'); return False
+    target = first['decisions'] + int(c['hours'] / HPD)
+    margin = 2 * chain.get('rollout', 32768)   # (a run ends at a rollout's end, with the one in hand unfinished)
+    best, resume, n, stuck = first['decisions'], None, 0, 0
+    while True:
+        if (root / 'pred' / 'STOP').exists():
+            note(event='stop file', case=base); return False
+        free = int(subprocess.check_output(['df', '--output=avail', '-B1G', str(root)], text=True).split()[1])
+        if free < chain.get('min_disk_gb', 200):
+            note(event='disk', free=free, case=base); return False
+        gpus = free_now(c)
+        case = base if n == 0 else f'{base}-c{n}'
+        edits = list(c['edits']) + ([[f' --resume {start} ', f' --resume {resume} ']] if resume else [])
+        left = (target - best) * HPD
+        spec = dict(root=str(root), case=case, template=str(root / 'pred' / 'template.json'), code_dir=chain['code_dir'], gpu_indices=gpus, memory=chain.get('memory', '72g'),
+                    timeout=c.get('timeout', 1209600), hours=round(left, 4), train_edits=edits, env=c.get('env') or {}, discard=c.get('discard', 10), horizon=None, source_devices=None,
+                    external_cpu_cores=1e9)
+        p = root / 'pred' / f'{case}.spec.json'
+        p.write_text(json.dumps(spec, indent=1))
+        note(event='start', case=case, gpus=gpus, hours=round(left, 2), resume=resume, external_cores=round(host_cores(20), 1))
+        with (root / 'logs' / f'{case}.dispatch.log').open('w') as log:
+            rc = subprocess.call(['python3', str(root / 'pred' / 'guard_pred.py'), str(p)], stdout=log, stderr=subprocess.STDOUT)
+        stop = [l.strip() for l in (root / 'logs' / f'{case}.dispatch.log').read_text(errors='replace').splitlines() if 'STOP_OWN' in l]
+        note(event='done', case=case, rc=rc, stop=stop[-1] if stop else None)
+        info, good = None, None
+        for f in sorted((root / 'runs' / case / 'checkpoints').glob('*.pt'), key=lambda x: x.stat().st_mtime, reverse=True):   # (a killed save does not load: the one before)
+            info = ck_info(f)
+            if info is not None:
+                good = f
+                break
+        if info is not None and info['decisions'] > best:
+            best, resume, stuck = info['decisions'], str(good).replace(str(root), '/bench'), 0
+        else:
+            stuck += 1
+        if best >= target - margin:
+            (root / 'runs' / base / 'COMPLETE').write_text(json.dumps(dict(path=str(good), update=info['update'], decisions=info['decisions'], game_hours=info['decisions'] * HPD,
+                                                                          start_game_hours=first['decisions'] * HPD, resumes=n, last_case=case, last_rc=rc)))
+            note(event='arm complete', case=base, resumes=n, final=str(good), update=info['update'], game_hours=round((info['decisions'] - first['decisions']) * HPD, 1))
+            return True
+        if stuck >= chain.get('max_stuck', 3) or n >= chain.get('max_resumes', 30):
+            note(event='arm stopped', case=base, why=f'{stuck} runs without a newer checkpoint, {n} resumes'); return False
+        n += 1
+        note(event='resume', case=base, next=f'{base}-c{n}', checkpoint=resume, hours_done=round((best - first['decisions']) * HPD, 1))
+        time.sleep(chain.get('restart_wait_s', 600))
 queue = list(chain['cases'])
 settled = False   # (a steady window was seen and nothing of ours has been stopped since: within it no second window)
 MEAN, SPREAD, MINUTES = chain.get('external_mean_max', 16.0), chain.get('external_spread_max', 3.0), chain.get('window_minutes', 15)
@@ -80,6 +157,10 @@ def steady_window(c):
 while queue:
     c = queue.pop(0)
     if (root / 'pred' / 'STOP').exists(): note(event='stop file'); break
+    if LONG:
+        if not run_long(c):
+            note(event='chain stopped', case=c['case']); break
+        continue
     gpus = None
     if settled:   # (between the chain's cases: a look, not a new window, unless the load has moved past the mean)
         gpus, why = pick(c.get('gpus') or chain['gpus'])
@@ -112,6 +193,13 @@ while queue:
         note(event='chain stopped', case=c['case'], rc=rc)
         break
 note(event='chain done')
+'''
+
+
+CK_INFO = r'''
+import json, sys, torch
+d = torch.load(sys.argv[1], map_location='cpu')
+print(json.dumps(dict(update=int(d['update']), decisions=int(d['decisions']), params=sum(v.numel() for v in d['model'].values()))))
 '''
 
 
@@ -162,13 +250,13 @@ def deploy():
     guard_src = guard_src.replace(old, "runner = ['python3', str(root/'pred'/'run_pred_case.py'), spec_path]")
     # the CPU rule of these relative measurements (2026-11-05): others' load above 20 cores for 3 minutes (9 samples of 20 s); every other stop rule is unchanged
     for old, new in (("'external_cpu_cores_max_sustained':9,'sustained_samples':3,", "'external_cpu_cores_max_sustained':20,'external_cpu_sustained_samples':9,'sustained_samples':3,"),
-                     ("busy_samples = busy_samples+1 if external>9 else 0", "busy_samples = busy_samples+1 if external>20 else 0"),
+                     ("busy_samples = busy_samples+1 if external>9 else 0", "busy_samples = busy_samples+1 if external>float(spec.get('external_cpu_cores', 20)) else 0"),
                      ("elif busy_samples>=3:", "elif busy_samples>=9:"),
                      ("reason='other_workload_cpu_exceeds_9_cores_sustained'", "reason='other_workload_cpu_exceeds_20_cores_for_3_minutes'")):
         assert guard_src.count(old) == 1, old
         guard_src = guard_src.replace(old, new)
     tpl = (ISAAC / 'temp' / 'memory-chain-v2' / 'baseline-command.json').read_text(encoding='utf-8')
-    for name, text in (('run_pred_case.py', run_src), ('guard_pred.py', guard_src), ('template.json', tpl), ('run_chain.py', CHAIN)):
+    for name, text in (('run_pred_case.py', run_src), ('guard_pred.py', guard_src), ('template.json', tpl), ('run_chain.py', CHAIN), ('ck_info.py', CK_INFO)):
         with s.open(f'{ROOT}/pred/{name}', 'w') as f:
             f.write(text)
     # zstandard: the wheel unpacked into the container's venv (one new package, nothing else touched)

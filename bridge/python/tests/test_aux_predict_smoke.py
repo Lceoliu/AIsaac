@@ -294,6 +294,32 @@ def case_c():
           all(abs(s[ST_[k]] - v) < 1e-6 for k, v in want_s.items()), str(s.tolist()))
 
 
+def case_npc():
+    # npc_count (real tokens only, read token by token) == the plain count over every slot
+    rng = np.random.default_rng(5)
+    x = np.zeros(200, ROW)
+    x['n_ent'] = rng.integers(0, x['ent'].shape[1] + 1, 200)
+    x['n_ent'][:3] = (0, 1, x['ent'].shape[1])
+    x['ent'][..., A.NPC_COLUMN] = rng.random(x['ent'].shape[:2]) < 0.4
+    plain = ((x['ent'][:, :, A.NPC_COLUMN] > 0) & (np.arange(x['ent'].shape[1])[None] < x['n_ent'][:, None])).sum(1)
+    check('(c) npc_count == the count over every slot', np.array_equal(A.npc_count(x), plain))
+    check('(c) npc_count of no records', A.npc_count(x[:0]).shape == (0,))
+    # rollout_tables fills worker_tables' arrays in place: the same as a table per worker
+    r = random_roll(rng)
+    tb = A.rollout_tables(r, (1, 8, 64))
+    same = True
+    for w in range(r.n):
+        L = int(r.length[w])
+        if not L:
+            continue
+        rows, first = r.rows[w, :L], r.rows[w, :L]['first']
+        U = L - 1 if r.open[w] == L - 1 else L
+        evs = A.event_rows(rows, U, r.close_hurt[w], r.close_done[w], r.close_ev[w], A.boundaries(L, r.terminal[w], r.boot[w], first))
+        t = A.worker_tables(L, r.open[w], r.terminal[w], r.boot[w], first, r.reward[w], r.close_done[w], evs, A.state_rows(rows), (1, 8, 64))
+        same = same and all(np.array_equal(tb[k_][w, :L], v_) for k_, v_ in t.items())
+    check('(b) rollout_tables (in place) == worker_tables per worker', same)
+
+
 def case_d():
     rng = np.random.default_rng(5)
     H = (1, 4)
@@ -308,7 +334,12 @@ def case_d():
         all_raw.append(tb['state_raw'])
         for ki in range(len(H)):
             all_ret[ki].append(tb['ret'][..., ki][tb['m_ev'][..., ki]])
+        norm_before = norm.state()
         tg, log = A.build_targets(r, flat, weight, H, norm, device)
+        norm_t = A.AuxNorm(len(A.REG_COLS), len(H))
+        norm_t.load(norm_before)
+        tg_t, _ = A.build_targets(r, flat, weight, H, norm_t, device, tables=A.rollout_tables(r, H))
+        check('(d) build_targets: given tables == its own', all(torch.equal(tg[k_], tg_t[k_]) for k_ in tg))
     raw = np.concatenate(all_raw).astype(np.float64)[:, A.REG_COLS]
     check('(d) running mean / std == the batch statistics over both rollouts',
           np.allclose(norm.mean, raw.mean(0), atol=1e-6) and
@@ -644,6 +675,7 @@ def main():
     case_a()
     case_b()
     case_c()
+    case_npc()
     case_d()
     case_e()
     case_f()

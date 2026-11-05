@@ -175,13 +175,26 @@ def case_b():
     check('(b) value heads from the policy\'s: its values, whatever p is (zero columns: rounding only)', e_ < 1e-5, f'max |diff| {e_:.1e}')
     roll, flat = fake_batch()
     b = P.PrivBatch(roll, flat, 'cpu')
-    check('(b) PrivBatch: one copy of each distinct map', b.maps.shape[0] == 4 * 3 and len(b) == 32, f'{b.maps.shape[0]} maps for 32 records')
+    check('(b) PrivBatch: one copy of each distinct map (and the no-data one)', b.maps.shape[0] == 4 * 3 + 1 and len(b) == 32, f'{b.maps.shape[0]} maps for 32 records')
     idx = torch.arange(32)
     w, t = flat // roll.cap, flat % roll.cap
-    check('(b) each record\'s id gives its own map', np.array_equal(b.maps[b.ids].numpy(), roll.priv['map'][w, t]))
+    check('(b) each record\'s id gives its own map', np.array_equal(b.maps[b.ids[:len(b)]].numpy(), roll.priv['map'][w, t]))
     p_all = c.encode(b, idx)
     p_part = torch.cat([c.encode(b, idx[:7]), c.encode(b, idx[7:])])
     check('(b) encoding in parts == at once', float((p_all - p_part).abs().max()) < 1e-5)
+    # the learner's way: the host's plan (no unique on the device), the teachers' row in the same batch
+    pl_ = b.plan(np.arange(32))
+    check('(b) the host plan: same records, the same p as the device\'s unique', torch.equal(pl_[0], idx)
+          and torch.equal(c.encode(b, pl_[0], pl_[1:]), p_all))
+    for n_ in (1, 7, 31):
+        pick_ = np.random.default_rng(n_).choice(32, n_, replace=False)
+        px_ = b.plan(pick_)
+        check(f'(b) the host plan, {n_} records in any order', px_[1].shape[0] % P.CNN_BUCKET == 0
+              and torch.equal(c.encode(b, px_[0], px_[1:]), c.encode(b, torch.from_numpy(pick_))))
+    px_ = b.plan(np.append(np.arange(9), len(b)))
+    p_x = c.encode(b, px_[0], px_[1:])
+    check('(b) the no-data record == missing(), the others unchanged', torch.allclose(p_x[9:], c.missing(1, p_all), atol=1e-6)
+          and torch.allclose(p_x[:9], p_all[:9], atol=1e-6) and float(b.missing[len(b)]) == 1.0)
     mf = c.missing(3, p_all)
     roll0 = type('R', (), dict(cap=1, priv=np.zeros((1, 1), P.PRIV)))()
     roll0.priv['missing'] = 1

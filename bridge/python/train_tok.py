@@ -241,6 +241,7 @@ import os
 import queue
 import sys
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 import types
 from pathlib import Path
@@ -1913,7 +1914,8 @@ def main(argv=None, child=None, actor=None):
     aux_on = bool(args.aux_predict)   # 2026-11-03 (tok_aux)
     if aux_on:
         from isaac_bridge.tok_aux import (AuxNorm, EVENTS as AUX_EVENTS, REG_COLS as AUX_REG, STATE as AUX_STATE,
-                                          build_targets, log_row, make_head, minibatch_den, parse_horizons, part_loss)
+                                          build_targets, log_row, make_head, minibatch_den, parse_horizons, part_loss,
+                                          rollout_tables)
         if not t_on:
             p.error('--aux-predict 1 needs --temporal 1 (it reads the temporal output o_t)')
         if args.learner_compile:
@@ -2629,6 +2631,11 @@ def main(argv=None, child=None, actor=None):
             mark[0] = t0
         all_flat = (np.arange(n)[:, None] * capacity + np.arange(capacity)[None, :])[
             np.arange(capacity)[None, :] < lengths[:, None]]
+        aux_tables = None
+        if aux_on:   # 2026-11-03 (tok_aux): the targets' tables, next to the pass below (host arrays nothing writes before `fresh`)
+            if L.get('aux_pool') is None:
+                L['aux_pool'] = ThreadPoolExecutor(1, thread_name_prefix='aux-tables')
+            aux_tables = L['aux_pool'].submit(rollout_tables, rl, aux_h)
         value_now = every = prox = None
         vgs, vg_now, ret_g = [], None, None   # (B22) value_global at the update's start, its returns
         # 2026-10-14 (B24): the actor's stored value_global (Rollout.value_g) is used like the stored value: recomputed
@@ -2688,7 +2695,8 @@ def main(argv=None, child=None, actor=None):
                         if priv_on:
                             m_rp = pmark('b38:recompute_priv')
                             zr_p, zg_p = tk_p['temporal'].pop('z_out')
-                            v_, vg_p = pcritic(zr_p, zg_p, pcritic.encode(pv_all, part))
+                            idx_p, *plan_p = pv_all.plan(np.arange(at, at + len(part)))
+                            v_, vg_p = pcritic(zr_p, zg_p, pcritic.encode(pv_all, idx_p, plan_p))
                             vgs.append(vg_p.float())
                             pmark(None, m_rp)
                         else:
@@ -2840,7 +2848,7 @@ def main(argv=None, child=None, actor=None):
         aux_t = None
         if aux_on:   # 2026-11-03 (tok_aux): the update's targets, on the device (read from the rollout before `fresh`)
             t_a0 = time.perf_counter()
-            aux_t, aux_log = build_targets(rl, flat, lw, aux_h, aux_norm, device)
+            aux_t, aux_log = build_targets(rl, flat, lw, aux_h, aux_norm, device, tables=aux_tables.result())
             aux_acc = torch.zeros((4, len(aux_h)), device=device)
             aux_acc_ev = torch.zeros((len(aux_h), len(AUX_EVENTS)), device=device)
             U['aux'] += time.perf_counter() - t_a0
@@ -3437,9 +3445,12 @@ def main(argv=None, child=None, actor=None):
                     if priv_on:   # 2026-11-03 (tok_priv): the values from [zr ; p_t], [zg ; p_t]; teachers' rows: missing
                         m_ = pmark('b38:part_priv', m_)
                         zr_q, zg_q = tk_['temporal'].pop('z_out')
-                        p_q = pcritic.encode(pv_b, part)
-                        if len(zr_q) > k_:
-                            p_q = torch.cat([p_q, pcritic.missing(len(zr_q) - k_, p_q)])
+                        # (the teachers' rows: the no-data record, one row of the same batch)
+                        n_x = len(zr_q) - k_
+                        idx_q, *plan_q = pv_b.plan(np.append(part_h, len(pv_b)) if n_x else part_h)
+                        p_q = pcritic.encode(pv_b, idx_q, plan_q)
+                        if n_x:
+                            p_q = torch.cat([p_q[:k_], p_q[k_:].expand(n_x, -1)])
                         value_, vg_all = pcritic(zr_q, zg_q, p_q)
                     m_ = pmark('b38:part_loss', m_)
                     logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
@@ -4545,6 +4556,10 @@ def main(argv=None, child=None, actor=None):
     finally:
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
+            # (2026-11-05: past this point nobody needs what is still unsent: a clean end has seen the stop, which comes after
+            # the learner's end; else the run is failing. A half the learner never read, larger than the pipe, held the exit
+            # in the Queue's finalizer, joining its feeder thread, until the trainer's join timed out)
+            jobs.cancel_join_thread()
         if actor is None:
             if actor_b is not None:   # (B38 step 5: the second actor's last half first, else it stops at once)
                 if clean_end:

@@ -1,12 +1,14 @@
 """Relay of the four arms' checkpoints: 8-card host -> this PC -> host 2's evaluation queue (host2_pred_evalq.sh). The two hosts do not reach each other; nothing is stored
 on the PC, the bytes go through a pipe. A file appears on host 2 under its final name only when complete.
 
-  python -X utf8 pred_evalq.py <case,case,...> [--every S]     keep relaying (new update-*.pt of each case; last.pt as final.pt after the case's result.json exists)
+  python -X utf8 pred_evalq.py <case,case,...> [--every S]     keep relaying (new update-*.pt of each arm and its resumes <case>-c<n>; the final checkpoint as final.pt when runs/<case>/COMPLETE exists)
   python -X utf8 pred_evalq.py <case,case,...> --once          one pass
+  ... --no-final                                               no final.pt (a test: 512 seeds are about two hours of host 2)
   python -X utf8 pred_evalq.py --table <case,case,...>         the results so far, per case and checkpoint
 """
 import argparse
 import json
+import re
 import subprocess
 import time
 
@@ -39,30 +41,33 @@ def copy(sftp, remote, case, name):
     return rc == 0
 
 
-def one_pass(cases):
+def one_pass(cases, final=True):
     c = H.client()
     s = c.open_sftp()
+    runs = s.listdir(f'{H.ROOT}/runs')
     for case in cases:
-        d = f'{H.ROOT}/runs/{case}'
-        try:
-            names = s.listdir(f'{d}/checkpoints')
-        except FileNotFoundError:
-            continue
         have = set(host2(f'ls {Q}/{case} 2>/dev/null').stdout.split())
-        for name in sorted(n for n in names if n.startswith('update-') and n.endswith('.pt')):
-            if name not in have and name + '.failed' not in have:
-                # (a checkpoint being written: only one that has stopped growing)
-                a = s.stat(f'{d}/checkpoints/{name}').st_size
-                time.sleep(5)
-                if s.stat(f'{d}/checkpoints/{name}').st_size == a:
-                    copy(s, f'{d}/checkpoints/{name}', case, name)
-        if 'final.pt' not in have and 'last.pt' in names:
+        # (a resume's run goes on the same arm: its checkpoints under the arm's name, update numbers go on)
+        for run_ in sorted(r for r in runs if r == case or re.fullmatch(re.escape(case) + r'-c\d+', r)):
+            d = f'{H.ROOT}/runs/{run_}/checkpoints'
             try:
-                r = s.stat(f'{d}/result.json')
+                names = s.listdir(d)
             except FileNotFoundError:
-                r = None
-            if r is not None:
-                copy(s, f'{d}/checkpoints/last.pt', case, 'final.pt')
+                continue
+            for name in sorted(n for n in names if n.startswith('update-') and n.endswith('.pt')):
+                if name not in have and name + '.failed' not in have:
+                    # (a checkpoint being written: only one that has stopped growing)
+                    a = s.stat(f'{d}/{name}').st_size
+                    time.sleep(5)
+                    if s.stat(f'{d}/{name}').st_size == a and copy(s, f'{d}/{name}', case, name):
+                        have.add(name)
+        if final and 'final.pt' not in have and 'final.pt.failed' not in have:
+            try:
+                with s.open(f'{H.ROOT}/runs/{case}/COMPLETE', 'r') as f:
+                    done = json.loads(f.read())
+            except FileNotFoundError:
+                continue
+            copy(s, done['path'], case, 'final.pt')
     c.close()
 
 
@@ -83,6 +88,7 @@ def main():
     a.add_argument('cases', nargs='?')
     a.add_argument('--once', action='store_true')
     a.add_argument('--every', type=int, default=600)
+    a.add_argument('--no-final', action='store_true')
     a.add_argument('--table')
     args = a.parse_args()
     if args.table:
@@ -92,7 +98,7 @@ def main():
     cases = args.cases.split(',')
     while True:
         try:
-            one_pass(cases)
+            one_pass(cases, final=not args.no_final)
         except Exception as e:   # (a connection's hiccup: the next pass)
             print(time.strftime('%F %T'), 'pass failed:', repr(e), flush=True)
         if args.once:

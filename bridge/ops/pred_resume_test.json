@@ -1,0 +1,3 @@
+{"long": true, "gpus": [3, 1, 4, 5, 2], "memory": "72g", "restart_wait_s": 30, "max_resumes": 3, "cases": [
+ {"case": "pred-rt-l3", "arm": "l3", "hours": 80, "discard": 3, "env": {"ISAAC_RL_LOG_GRAD_NORM": "1"}, "timeout": 7200, "edits": [[" --checkpoint-every 100000 ", " --checkpoint-every 20 "]]}
+]}

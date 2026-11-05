@@ -146,24 +146,48 @@ def priv_record(decoder, frame, slots, t):
 
 class PrivBatch:
     """(the learner) the PRIV records of decisions at flat positions of a rollout, on the device: one copy of each
-    distinct map (per worker and map_ver) with each record's id, the other fields per record."""
+    distinct map (per worker and map_ver) with each record's id, the other fields per record. Record len(self) is the
+    no-data record (zeros and the missing flag; map: the last of `maps`): a teachers' row reads that one (PrivCritic.encode)."""
 
     def __init__(self, roll, flat, device):
         import torch
+        self.device = torch.device(device)
         w, t = flat // roll.cap, flat % roll.cap
         pv = roll.priv
+        self.n = len(flat)
         key = (w.astype(np.int64) << 33) | pv['map_ver'][w, t].astype(np.int64)
         _, first, inv = np.unique(key, return_index=True, return_inverse=True)
-        self.maps = torch.from_numpy(np.ascontiguousarray(pv['map'][w[first], t[first]])).to(device)
-        self.ids = torch.from_numpy(inv.reshape(-1).astype(np.int64)).to(device)
-        self.hp = torch.from_numpy(np.ascontiguousarray(pv['hp'][w, t])).to(device)
-        self.scal = torch.from_numpy(np.ascontiguousarray(pv['scal'][w, t])).to(device)
-        self.items = torch.from_numpy(np.ascontiguousarray(pv['items'][w, t].astype(np.int64))).to(device)
-        self.missing = torch.from_numpy(np.ascontiguousarray(pv['missing'][w, t])).to(device).float()
-        self.missing_share = float(pv['missing'][w, t].mean()) if len(flat) else 0.0
+        maps = pv['map'][w[first], t[first]]
+        self.maps = torch.from_numpy(np.concatenate([maps, np.zeros((1,) + PRIV_MAP, maps.dtype)])).to(device)
+        self.ids_h = np.append(inv.reshape(-1).astype(np.int64), len(first))
+        self.ids = torch.from_numpy(self.ids_h).to(device)
+        miss = pv['missing'][w, t]
+        fl = np.zeros((self.n + 1, NPC_K + PRIV_S + 1), np.float32)   # (one array: one gather per part)
+        fl[:self.n, :NPC_K], fl[:self.n, NPC_K:NPC_K + PRIV_S], fl[:self.n, -1] = pv['hp'][w, t], pv['scal'][w, t], miss
+        fl[self.n, -1] = 1.0
+        self.fl = torch.from_numpy(fl).to(device)
+        self.hp, self.scal, self.missing = self.fl[:, :NPC_K], self.fl[:, NPC_K:NPC_K + PRIV_S], self.fl[:, -1]
+        items = np.zeros((self.n + 1, PED_K), np.int64)
+        items[:self.n] = pv['items'][w, t]
+        self.items = torch.from_numpy(items).to(device)
+        self.missing_share = float(miss.mean()) if self.n else 0.0
 
     def __len__(self):
-        return self.hp.shape[0]
+        return self.n
+
+    def plan(self, idx_h):
+        """(idx, u, inv) on the device for the records idx_h (host array, a part's rows): u, the distinct maps, padded with
+        copies to a multiple of CNN_BUCKET (cuDNN reuses its plans, as TokPolicy._cnn), and inv: each record's in u. From the
+        host in one pinned copy: no torch.unique (a variable-size result, a sync per part) and no blocking copy."""
+        import torch
+        idx_h = np.asarray(idx_h, np.int64)
+        u, inv = np.unique(self.ids_h[idx_h], return_inverse=True)
+        if len(u) % CNN_BUCKET:
+            u = np.concatenate([u, np.full(CNN_BUCKET - len(u) % CNN_BUCKET, u[0])])
+        on = torch.from_numpy(np.concatenate([idx_h, u, inv.reshape(-1).astype(np.int64)]))
+        if self.device.type == 'cuda':
+            on = on.pin_memory().to(self.device, non_blocking=True)
+        return on.split([len(idx_h), len(u), len(idx_h)])
 
 
 def make_critic(width, p_dim=128):
@@ -197,15 +221,19 @@ def make_critic(width, p_dim=128):
                 mine[2].weight.copy_(old[2].weight)
                 mine[2].bias.copy_(old[2].bias)
 
-        def encode(self, b, idx):
-            """p_t [n, p_dim] of records idx of a PrivBatch; the CNN on their distinct maps."""
-            u, inv = torch.unique(b.ids.index_select(0, idx), return_inverse=True)
-            if u.shape[0] % CNN_BUCKET:   # (padded with copies, never gathered: cuDNN reuses its plans, as TokPolicy._cnn)
-                u = torch.cat([u, u[:1].expand(CNN_BUCKET - u.shape[0] % CNN_BUCKET)])
+        def encode(self, b, idx, plan=None):
+            """p_t [n, p_dim] of records idx of a PrivBatch; the CNN on their distinct maps. plan: PrivBatch.plan's (u, inv)
+            of idx (the learner's parts); without it, found here on the device."""
+            if plan is None:
+                u, inv = torch.unique(b.ids.index_select(0, idx), return_inverse=True)
+                if u.shape[0] % CNN_BUCKET:
+                    u = torch.cat([u, u[:1].expand(CNN_BUCKET - u.shape[0] % CNN_BUCKET)])
+            else:
+                u, inv = plan
             m = self.map(b.maps.index_select(0, u).float()).index_select(0, inv)
             it = self.item(b.items.index_select(0, idx)).sum(1)
-            r = self.rest(torch.cat([b.hp.index_select(0, idx), b.scal.index_select(0, idx), it,
-                                     b.missing.index_select(0, idx)[:, None]], -1))
+            f = b.fl.index_select(0, idx)
+            r = self.rest(torch.cat([f[:, :-1], it, f[:, -1:]], -1))
             return self.join(torch.cat([m, r], -1))
 
         def missing(self, n, like):
