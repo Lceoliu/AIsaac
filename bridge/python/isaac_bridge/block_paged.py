@@ -667,10 +667,10 @@ def _to(x, device):
     return x.to(device)
 
 
-# Spatial microbatch of the paged learner: large enough that kernel launches stop dominating
-# (512 split a --micro 8192 batch into 16 Spatial calls, ~1.4k ops each, plus checkpoint replay);
-# no-grad passes run up to 8192 rows at once. Same math at any size.
-SPATIAL_MICRO_TRAIN, SPATIAL_MICRO_EVAL = 2048, 8192
+# Spatial microbatch of the paged learner. No-grad passes run up to 8192 rows at once.
+# With gradients 2048 rows OOMed the shared 24 GB 4090 in checkpoint recompute (B42 prof-d,
+# u5), so training stays at 512 (~1.4k ops per call: launch-bound; see B42). Same math at any size.
+SPATIAL_MICRO_TRAIN, SPATIAL_MICRO_EVAL = 512, 8192
 
 
 def forward_chunks_paged(model, chunks, generator=None, train_history=True, version=0, spatial_micro=None,

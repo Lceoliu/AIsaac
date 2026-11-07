@@ -8583,3 +8583,38 @@ CF分支单独计费/计算量：r8 90296dec/3.344296小时；r1 126554/4.687185
 - aligned：同目录`architecture-alignment/FINAL_ACCEPTANCE-aligned.json`。
 - native：同目录`native-learner-optimization/native-{torch,python,compact,rejected}.csv`、`native-rejected-{actor,learner}.txt`；中断事件`analysis/model-design-20261106/cloud-4090/prepare-20261107/nativelearner-26-drain-and-release.json`。
 
+
+### B42 A1 GPU slot执行层接入生产 + 同4090旧→新正式速度对比（2026-11-07）
+
+#### 实验目的
+
+1. A1：把记忆状态从Python对象（EpisodeMemory/RawHistory/Snapshot、LZ4快照）换成GPU常驻slot张量与分页快照，接入actor、教师分支、rollout、learner取批，并用固定权重等价门证明数值不变。
+2. A2：在同一台RTX4090上用同一口径先测旧架构c45a583得X_old(4090)，再测新block-memory模型得X_new(4090)，目标X_new≥X_old；不靠减输入、减模型、减教师预算、改rollout/micro换速度。
+
+#### 实验方法
+
+- 口径（双方相同）：fresh随机初始化，16 worker，`--mode run --items`，rollout 32768、minibatch 8192、micro 8192、epochs 3，`--cf-points 6 --cf-seconds 180 --teacher-share 0.1`，teacher-queue 12/archive 12/teacher-slots 6/死亡深度2,4,8,16,32，起始构筑pedestal 0.5×≤3、pickup-force 1:0、reward heal=0.5,resource=0.25、item-slots 8；伤害教师batch 512/reuse 8/weight 8/buffer 60000/coef 1/danger 1，CF记录batch 256/reuse 4/weight 1/coef 1/vf 0.25/buffer 30000，CF branches 4/target 20 s/margin 0.3/cap 2/distill 8/random 1；`--aux-predict 1 --aux-horizons 1,8 --aux-coef 0.1 --priv-critic 1`；overlap+decoupled、amp bf16、learner-process 0、actor-processes 1、seed 1000。只有架构参数不同：旧为temporal/obs-v2及其actor编译选项、learner-fast 2；新为block-memory v1（visible-v2）、`--block-slots 1 --actor-bf16 1 --graph-entities 128 --learner-fast 0`。脚本：`bridge/ops/b42_xold.sh`、`bridge/ops/b42_xnew.sh`；稳态汇总`bridge/ops/b42_summary.py`（共同教师=teach_step>0且v2_step>0且teach_loss>0；先跳过前40个共同教师update，再取40个update窗口）。
+- 游戏小时=主轨迹decisions/27000；×实时=decisions/(Σwall_s×7.5)。CF分支不计入分子。
+- A1实现（`isaac_bridge/block_paged.py`，提交e5d113a）：SlotBlockActor每步对所有活跃slot一次gather→一次Reader（CUDA graph）→commit；主actor与教师代actor共享一个PagedStore，可合并成一次调用。每个决策的detached K/V+latent、每个完整块的值、每个原始观测（visible帧字节+pending）只写一次；快照=PagedSnapshot(EpisodeLog, step)，O(1)获取/fork/交给learner，restore从页物化一行slot。租约：每个rollout一次mark/sweep（弱引用追踪的存活快照+活跃slot），只释放没有任何rollout/教师缓冲/搜索点/lane/slot能读到的页。learner：`forward_chunks`对分页快照分派到`forward_chunks_paged`，前缀/bank/尾部从唯一页行一次gather，历史块重算用与`historical_blocks`相同的随机数调用。
+- 等价门（`tests/test_block_slot_integration.py`）：逐步actor输出与状态（含episode reset、换房不reset、FIFO回绕）、fork/restore兄弟分支与主轨迹隔离、主+lane合并批、learner PPO/CF/injury loss与全部参数梯度、跨rollout延续、租约不提前释放、微批checkpoint Spatial、CUDA graph FP32/BF16。
+- A2过程中的必要修复（03f25cc）：新ROW为152 KB（128 KiB可见帧），learner把整个rollout和60000/30000教师GPU字节环按全ROW放上GPU导致首个update OOM；改为learner批只带20.8 KB行头，可见帧只在chunk组内解码（门控与观测无关）。另：Spatial按token排序紧凑填充+checkpoint微批；update内缓存解码帧；learner在forward组之间让出graph capture（此前教师代actor的graph从未capture，全走eager）。
+- 后续步骤：第1步（ee0fd59）训练Spatial微批2048在prof-d第5个update GPU OOM（与actor共卡），已退回512，只保留无梯度8192；第3步（eee599f）actor实体桶{16,32,64,128}（128上限与优先级截断不变）。
+
+#### 实验结果
+
+| 运行 | 命令/日志（4090 `/home/linux/isaac-block-memory-v1/reports/b42-speed/`） | 总量 | 稳态窗口 | ×实时 | collect / update 中位 | actor infer（全部/更新期） | idle |
+|---|---|---|---|---:|---|---|---|
+| X_old c45a583 | `xold-c45a583.command.txt`、`.stdout`、`xold-c45a583/progress.csv` | 103 update，3,375,538 dec / 125.02 h | 正式窗u44–u83：1,310,897 dec / 48.55 h | **427.12** | 10.42 s / 3.97 s | 3.79 / 6.07 ms | 0.76 |
+| X_old 同窗 | 同上 | — | u22–u41：655,430 dec / 24.28 h | 427.54 | 10.46 s / 3.93 s | 3.86 / 6.01 ms | 0.76 |
+| X_new A1（03f25cc） | `xnew-a1.command.txt`、`.stdout`、`xnew-a1/progress.csv` | 41 update，1,343,809 dec / 49.77 h；**u41主动SIGINT（host内存耗尽），未到u44–u83正式窗** | u22–u41：655,514 dec / 24.28 h | **44.45** | 66.1 s / 97.2 s | 27.1 / 27.1 ms | 0.83 |
+
+- **结论：X_new/X_old = 44.45/427.54 = 0.104（同窗），未达到X_new≥X_old。** 正式40+40窗口无法在新模型上完成：host内存（47 GB）在u40时45 GB已用、swap满。两边首个共同教师update均为u4，教师行为一致（teach_step、v2_step、CF点数相同量级）。
+- 失败/中间运行（保留在`failed/`）：`xnew-a1-oom`（全ROW上GPU，u1后OOM）、`xnew-a1-stale-code`（误用旧代码，手动停止）、`xnew-a1-oom2`（rollout全量解码OOM）、`xnew-a1-preopt`（u3约56×，手动停止）。
+- 内存驻留（u40，PagedStore）：K/V页345,692行×(16 KB bf16 K/V+4 KB fp32 latent)≈7.1 GB；原始观测531,975条×约10.6 KB（visible帧+pending，未压缩）≈5.6 GB；块值15,303×8 KB≈0.12 GB。u21→u40每增加1条伤害教师记录约增40.5行K/V（0.83 MB）+65条原始观测（0.69 MB），即约1.5 MB/记录；teach-buffer 60000上限≈90 GB。原因是每条教师记录要保留128步窗口K/V和最近256块的原始源（历史重算），页共享已把128行/记录降到约40行。瘦身方向（未实现）：原始观测LZ4（预计2–3×）并落NVMe mmap（60000条约41 GB），K/V页也需落盘或分级（约50 GB）；learner每个update随机读约3 GB。
+- 短profile（GPU同步计时，5–6个update，`prof-{b,c,d,e}.stdout`的`B42 timing`行，单个rollout）：
+  - actor每次调用（约4–5k次/rollout，含教师lane合并）：解码+Spatial 3.5–5.4 ms，slot gather+Reader graph+commit 4.4–5.6 ms，heads+采样2.6–2.9 ms，页写入1.25–1.4 ms；host解码本身0.21 ms/16行（本地CPU），不是瓶颈。
+  - learner每次update前向（约13.3万主行+11万历史行）：主批解码6–7.5 s，主Spatial 8.5–10.6 s，Reader+heads 6.5–7.6 s，页gather/prefix/bank 6.5–7.6 s，历史行组装2.8 s，历史Spatial+Writer 9–11.7 s，其余为反向（含checkpoint重算）；每行实际token约40.5，批内填充后61–87。nvidia-smi GPU利用率约31%，有效算力约2–3 TFLOPs：瓶颈是launch/Python而非算力。本地CPU算子计数（生产尺寸）：encode_block约1,360个aten算子/次，Reader约1,200个/次，2个chunk前向+反向约1.5万个；512行Spatial微批下每个8192行micro约7万个launch。
+  - 历史重算价格（prof-e，`--block-history-blocks 0`，仅诊断）：update 55–60 s，对比4块的prof-c 87–89 s，即默认4块约占update的30%（约25–30 s/update）。
+  - 第1步（训练微批2048）update 77–85 s，收益小且OOM，已退回；第3步实体桶在同卡竞争下未见actor单次时延下降（graph capture数20→42）。
+- 等价门：本地CPU全部测试115 passed / 29 skipped（新增10项CPU+2项CUDA）；4090 150 passed、0 skipped（每次代码上卡前重跑）。
+- 未完成：Spatial/Writer/Reader chunk的torch.compile固定桶快路径、varlen打包、actor slot gather/scatter纳入graph、教师记录内存瘦身（LZ4+NVMe）均未实现；X_new正式40+40窗口未完成。4090已空闲。

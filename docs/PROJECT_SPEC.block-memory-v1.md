@@ -422,7 +422,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 - C5–C8已接观测→协议→Spatial：schema为`isaac-visible-prlmens-g-v2`、版本2026110702，P=80维；stage、32位curse、5类溢出计数进入每个P。E优先互动物/出口→怪物→随从→弹幕→其他，类内按距最近身体排序，稳定保留128；R中的门/地形出口本来不受E上限约束。N/S仍完整。取消新输入全部use存在性/充能mask。L以9×9卷积、展平投影保留布局，仍每身体一个token。Unknown健康遮蔽通过非零健康的开/关对照验证。
 - 最新本地`pytest tests`：105通过、27硬件/平台跳过；4090组件GPU单测覆盖slot核心、相对偏置/Flex/SDPA及梯度、graph/replay/publish、输入修正。GPU初次失败包含fixture的head维8低于Flex最小16，以及跨backend BF16误差0.00817超过初设0.004；修正fixture并分离backend舍入与同backend平移不变门，保留FP32严格门与原梯度阈值。所有失败及重测保留在review-unit事件与XML，不当作速度提升。
 - A1仅完成`BlockSlotState`张量执行核心：GPU bank/KV/partial、索引reset/fork、先读后Writer提交、源版本保存；固定权重CPU逐步/FIFO/fork对照已通过。**尚未替换线上BlockActor/BlockLaneService、不可变分页快照、源租约和learner rollout取批；RawHistory.append与对象reference仍在生产路径。不能称A1完成，也不能用核心单测推断200×。**
-- A2正式比较固定单4090、同worker、rollout32768、minibatch8192/micro8192、CF6点/180秒、teacher-share0.1，先旧c45a583后新模型，全随机初始化；双方其余teacher batch/reuse/weight、epochs、aux、critic、起始分布也须显式一致。旧smoke加载C99，旧pred_host还会把8192改成4096，均不能复用。官方X_old(4090)尚未测出。
+- A2正式比较固定单4090、同worker、rollout32768、minibatch8192/micro8192、CF6点/180秒、teacher-share0.1，先旧c45a583后新模型，全随机初始化；双方其余teacher batch/reuse/weight、epochs、aux、critic、起始分布也须显式一致。旧smoke加载C99，旧pred_host还会把8192改成4096，均不能复用。官方X_old(4090)=427.12×（B42）；X_new同窗44.45×，未达标，见B42。
 - D9：原候选已提交并推送到`exp/block-memory-v1`，基底提交`f3264e0a5850892fb97bbed7ea997923d12a301b`；本段新增审核修改单独提交，不改变生产树。D10：`bridge/abplus/EXPERIMENTS.md` B41统一归档全部4090结果、游戏小时、失败及口径，压力×实时数不作为正式A2比较。
 - 验收顺序：先完成A1生产集成与状态/梯度等价门，再同口径旧→新对照；组件GPU单测不冒充完整回归、两次冒烟、离线50或在线40稳态。所有未完成项目保留，禁止重启已退出130的旧native压力门。
 
@@ -436,9 +436,18 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 ```json
 {
   "design_id": "block_memory_v1",
-  "status": "review_components_verified_A1_integration_and_A2_speed_pending",
-  "slot_tensor_core_integrated_in_production": false,
-  "formal_same_4090_speed_result": null,
+  "status": "A1_integrated_equivalence_passed_A2_speed_failed",
+  "slot_tensor_core_integrated_in_production": true,
+  "formal_same_4090_speed_result": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B42",
+    "gpu": "RTX4090 24GB, 16 cores, 47GB host",
+    "config": "16 workers, rollout 32768, minibatch 8192, micro 8192, epochs 3, cf-points 6, cf-seconds 180, teacher-share 0.1, fresh init",
+    "x_old_c45a583": {"window": "u44-u83", "decisions": 1310897, "game_hours": 48.552, "x_real_time": 427.12, "median_collect_s": 10.42, "median_update_s": 3.97},
+    "x_old_same_window": {"window": "u22-u41", "x_real_time": 427.54},
+    "x_new_block_memory": {"window": "u22-u41", "decisions": 655514, "game_hours": 24.278, "x_real_time": 44.45, "median_collect_s": 66.1, "median_update_s": 97.2, "formal_40_plus_40_window_reached": false, "stopped": "u41 SIGINT, host memory exhausted by teacher-record page leases"},
+    "x_new_over_x_old": 0.104,
+    "meets_target": false
+  },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
   "spatial": {
