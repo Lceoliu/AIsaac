@@ -249,12 +249,17 @@ class SpatialEncoderGraph:
                     return source,self.model.encode_block(source,packed=False)
             try:
                 if len(self.graphs)>=128:self.graphs.pop(next(iter(self.graphs)))
-                static={k:v.new_zeros(shapes[k]) for k,v in source.items()}
-                for k,v in source.items():
-                    static[k][tuple(slice(0,s) for s in v.shape)].copy_(v)
-                with torch.autocast('cuda',dtype=torch.bfloat16,enabled=self.bf16,cache_enabled=False):
+                with torch.inference_mode(False):   # B42: normal tensors (compiled Spatial guards dispatch keys)
+                    static={k:v.new_zeros(shapes[k]) for k,v in source.items()}
+                    for k,v in source.items():
+                        static[k][tuple(slice(0,s) for s in v.shape)].copy_(v)
+                # B42: the autocast cache is cleared before capture (casts recorded inside the
+                # graph) rather than disabled: a disabled cache is a different dynamo global state
+                # (the compiled Spatial recompiled for this context).
+                with torch.autocast('cuda',dtype=torch.bfloat16,enabled=self.bf16):
                     for _ in range(3):self.model.encode_block(static,packed=False)
                     torch.cuda.synchronize(self.device)
+                    torch.clear_autocast_cache()
                     graph=torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph,stream=self.capture):
                         z=self.model.encode_block(static,packed=False)

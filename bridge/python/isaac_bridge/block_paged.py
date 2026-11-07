@@ -884,7 +884,7 @@ def encode_sorted(model, batch, micro, counts=None):
     counts (B42): the host real counts [n,5] (host_counts of the host-decoded dict): no
     device->host synchronisation. None: counted on the device (one sync)."""
     from torch.utils.checkpoint import checkpoint
-    from .structured_input import bucket_width
+    from .structured_input import bucket_width, packed_rows_batch
     n = len(batch['v_body'])
     dev = batch['v_body'].device
     if counts is None:
@@ -899,6 +899,13 @@ def encode_sorted(model, batch, micro, counts=None):
     grad = torch.is_grad_enabled() and n > micro
     out = []
     for begin in range(0, n, micro):
+        if SPATIAL_PACKED:
+            # B42 glue 4: row-packed microbatch, one compiled graph per row-total bucket.
+            m = len(order_h[begin:begin+micro])
+            part = packed_rows_batch(batch, order_h[begin:begin+micro], counts_h[begin:begin+micro], dev)
+            zp = checkpoint(model.encode_block, part, use_reentrant=False) if grad else model.encode_block(part)
+            out.append(zp[:m])
+            continue
         idx = order[begin:begin+micro]
         width = counts_h[begin:begin+micro].max(0)
         part = {}
@@ -928,6 +935,8 @@ def _to(x, device):
 # With gradients 2048 rows OOMed the shared 24 GB 4090 in checkpoint recompute (B42 prof-d,
 # u5), so training stays at 512 (~1.4k ops per call: launch-bound; see B42). Same math at any size.
 SPATIAL_MICRO_TRAIN, SPATIAL_MICRO_EVAL = 512, 8192
+# B42 glue 4: the learner's Spatial on row-packed microbatches (ISAAC_SPATIAL_PACKED=0: off).
+SPATIAL_PACKED = os.environ.get('ISAAC_SPATIAL_PACKED', '1') == '1'
 
 
 def forward_chunks_paged(model, chunks, generator=None, train_history=True, version=0, spatial_micro=None,

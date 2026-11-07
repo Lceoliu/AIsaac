@@ -484,3 +484,38 @@ def test_actor_step_graph_matches_eager_slot_actor(bf16):
         _, ke = el.decisions(max(el.offset, hi-8), hi)
         torch.testing.assert_close(g.store.kv(kg).float(), e.store.kv(ke).float(), **tol)
         torch.testing.assert_close(g.store.z(kg).float(), e.store.z(ke).float(), **tol)
+
+
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_packed_learner_spatial_matches_padded(device):
+    """B42 glue 4 gate: encode_sorted with packed Transformer layers (real tokens only) ==
+    padded layers: outputs and every gradient (FP32 <= 1e-5; CUDA runs the compiled path)."""
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA unavailable')
+    from isaac_bridge import block_paged
+    from isaac_bridge.tok_policy import TokPolicy
+    from isaac_bridge.structured_input import decode_frame_host, from_host, host_counts
+    torch.manual_seed(5)
+    m = TokPolicy(64, 2, 4, items=True, item_tokens=True, global_token=True, block_memory=True,
+                  block_config=dict(width=64, layers=2, heads=4, latent_width=64)).to(device).train()
+    rows = _visible_rows([(1, 3, 20, 5), (1, 0, 0, 0), (2, 40, 7, 3), (1, 17, 31, 16), (4, 128, 12, 9),
+                          (3, 70, 1, 2), (1, 9, 2, 1)], seed=9)
+    d = decode_frame_host(rows, packed=device == 'cuda')
+    d['pending'] = synth_pending(np.random.default_rng(2), len(rows), m.heads)
+    d['first'] = np.asarray(rows['first'])
+    res = []
+    old = block_paged.SPATIAL_PACKED
+    try:
+        for packed in (False, True):
+            block_paged.SPATIAL_PACKED = packed
+            m.zero_grad(set_to_none=True)
+            z = block_paged.encode_sorted(m, from_host(d, device), 3, host_counts(d))
+            z.square().mean().backward()
+            res.append((z.detach(), {k: p.grad.clone() for k, p in m.named_parameters() if p.grad is not None}))
+    finally:
+        block_paged.SPATIAL_PACKED = old
+    (za, ga), (zb, gb) = res
+    assert (za-zb).abs().max().item() <= 1e-5
+    assert ga.keys() == gb.keys()
+    for k in ga:
+        torch.testing.assert_close(gb[k], ga[k], rtol=1e-4, atol=1e-5, msg=k)

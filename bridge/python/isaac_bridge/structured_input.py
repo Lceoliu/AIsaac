@@ -152,6 +152,70 @@ def from_rows(rows, device, pending=None):
     return from_host(b,device)
 
 
+# B42 glue 4: attention layout buckets by a row's total real tokens (30 + 2 per body + entities
+# + items + slots). Early-training rows have 36-67 tokens (B42 prof-f0/f1 dumps), late-game
+# rows up to ~200. Past the set: doubling (never truncation).
+T_BUCKETS=(40,48,64,96,128,192,256,512)
+PACKED_KEYS=('room','map','pending','body','body_row','local','entity','inventory','slots','d_body','d_room',
+             'd_local','d_map','d_entity','d_inventory','d_slots','d_global','keep','rows_valid')
+
+
+def t_bucket(m):
+    for w in T_BUCKETS:
+        if m<=w:return w
+    w=T_BUCKETS[-1]
+    while w<m:w*=2
+    return w
+
+
+def packed_rows_batch(batch,rows,counts,device):
+    """A row-packed StructuredSpatial batch (StructuredSpatial.forward_rows) of `rows` of a
+    decoded batch. batch: a from_host dict (typed, left-aligned ragged slots); rows: host int64
+    row indices; counts: their host real counts [n,5] (host_counts order). All index arithmetic
+    is on the host (one H2D of all indices); the device only gathers. Lists are padded to >= 2
+    entries (destination: the trash row) and a 1-row batch to 2 rows (a duplicate), so no
+    dimension is 0 or 1 (dynamo would specialise it); keep the first len(rows) outputs."""
+    rows=np.asarray(rows,np.int64);counts=np.asarray(counts,np.int64)
+    if len(rows)==1:rows,counts=np.repeat(rows,2),np.repeat(counts,2,0)
+    n=len(rows);p,pl,e,ni,sl=counts.T
+    if np.any(p!=pl):raise ValueError('visible-v2 has one local patch per body')
+    tot=30+p+pl+e+ni+sl;T=t_bucket(int(tot.max()));trash=n*T
+    base=np.arange(n,dtype=np.int64)*T
+    off={'body':np.zeros(n,np.int64),'local':p+28,'entity':p+pl+29,'inventory':p+pl+29+e,'slots':p+pl+29+e+ni}
+    idx,src={},{}
+    for name,c in (('body',p),('local',pl),('entity',e),('inventory',ni),('slots',sl)):
+        W=batch['v_'+name].shape[1];k=int(c.sum())
+        rr=np.repeat(np.arange(n,dtype=np.int64),c);j=np.arange(k)-np.repeat(np.cumsum(c)-c,c)
+        sv=np.repeat(rows,c)*W+j;dv=base[rr]+off[name][rr]+j
+        if k<2:
+            sv=np.concatenate((sv,np.zeros(2-k,np.int64)));dv=np.concatenate((dv,np.full(2-k,trash)))
+            rr=np.concatenate((rr,np.zeros(2-k,np.int64)))
+        src[name]=sv;idx['d_'+name]=dv
+        if name=='body':idx['body_row']=rr
+    idx['d_room']=((base+p)[:,None]+np.arange(28)).reshape(-1)
+    idx['d_map']=base+2*p+28
+    idx['d_global']=base+tot-1
+    at=np.arange(T)[None,:]
+    idx['keep']=(base[:,None]+at)[at<tot[:,None]]
+    idx['rows']=rows;idx['tot']=tot
+    for name in src:idx['s_'+name]=src[name]
+    names=list(idx);sizes=[len(idx[k]) for k in names]
+    flat=torch.from_numpy(np.concatenate([idx[k] for k in names]).astype(np.int64))
+    device=torch.device(device)
+    if device.type=='cuda':flat=flat.pin_memory()
+    flat=flat.to(device,non_blocking=True)
+    d=dict(zip(names,flat.split(sizes)))
+    out={k:d[k] for k in ('body_row','d_body','d_local','d_entity','d_inventory','d_slots','d_room','d_map',
+                          'd_global','keep')}
+    out['rows_valid']=torch.arange(T,device=device)[None,:]<d['tot'][:,None]
+    rd=d['rows']
+    out['room']=batch['v_room'].index_select(0,rd);out['map']=batch['v_map'].index_select(0,rd)
+    out['pending']=batch['pending'].index_select(0,rd)
+    for name in src:
+        v=batch['v_'+name];out[name]=v.reshape(-1,v.shape[-1]).index_select(0,d['s_'+name])
+    return out
+
+
 def host_counts(b):
     """Real (body, local, entity, inventory, slots) token counts [n,5] of a host-decoded dict."""
     return np.stack([b['v_'+k+'_mask'].sum(1) for k in RAGGED],1).astype(np.int64)
@@ -374,6 +438,20 @@ def prioritize_entities(entities,players):
     return entities[order],overflow
 
 
+def compile_inputs(b,keys):
+    """The compiled Spatial's inputs: contiguous (static strides), offset-0, normal tensors (dynamo
+    guards on dispatch keys and storage offsets: an inference-mode tensor or a slab view
+    recompiled every variant)."""
+    out={}
+    with torch.inference_mode(False):
+        for k in keys:
+            v=b[k]
+            # a view's storage offset is guarded too (0/1-specialised): fresh offset-0 storage
+            out[k]=(v.clone(memory_format=torch.contiguous_format) if v.is_inference() or v.storage_offset()
+                    else v.contiguous())
+    return out
+
+
 SPATIAL_KEYS=('v_body','v_body_mask','v_room','v_local','v_local_mask','v_map','v_entity','v_entity_mask',
               'v_inventory','v_inventory_mask','v_slots','v_slots_mask','pending')
 SPATIAL_COMPILE=__import__('os').environ.get('ISAAC_SPATIAL_COMPILE','1')=='1'
@@ -403,8 +481,16 @@ class StructuredSpatial(nn.Module):
         self.register_buffer('coordinates',torch.stack((x,y),-1).reshape(28,2))
 
     def forward(self,b):
+        if 'rows_valid' in b:
+            # B42 glue 4 (learner): row-packed batch (packed_rows_batch): every per-token part on
+            # real tokens only, attention per row-total bucket T. One compiled graph per T.
+            x=compile_inputs(b,PACKED_KEYS)
+            if SPATIAL_COMPILE and x['room'].is_cuda:
+                from .block_compile import spatial_rows_compiled
+                return spatial_rows_compiled()(self,x)
+            return self.forward_rows(x)
         if 'v_body' not in b:raise ValueError('new Spatial requires visible-v2 input; legacy input rejected')
-        x={k:b[k].contiguous() for k in SPATIAL_KEYS}   # static strides: no stride-keyed recompiles
+        x=compile_inputs(b,SPATIAL_KEYS)
         # B42 glue 3: on the GPU the whole forward is one compiled graph per (entity, body)
         # bucket and execution mode (grad/no-grad, autocast): the clone/masked_fill/cat/
         # one_hot/log1p/kind-bias/mask glue fuses in Inductor, linear layers stay cuBLAS.
@@ -447,6 +533,47 @@ class StructuredSpatial(nn.Module):
         bias=x.new_zeros((batch,1,1,x.shape[1])).masked_fill(~valid[:,None,None,:],float('-inf'))
         for block in self.blocks:x=block(x,bias)
         return x,~valid
+
+    def forward_rows(self,x):
+        """forward_eager on a row-packed batch (packed_rows_batch): the same per-token functions
+        applied to real bodies/local patches/entities/items/slots only (each list padded to >=2
+        entries whose destination is a trash row), each row's tokens compacted to the front of
+        a [n, T] layout (T: its row-total bucket), the Transformer's per-token layers on the real
+        tokens (Block.forward_packed), attention in [n, T] with the padded keys masked. The
+        attention and the resampler do not depend on token order: same values up to summation
+        order. Returns ([n, T, width], padding mask)."""
+        valid=x['rows_valid'];n,T=valid.shape
+        bodies=x['body'].clone()
+        bodies[:,5:12]=bodies[:,5:12].masked_fill(bodies[:,40:41]==0,0)
+        bodies[:,38]=bodies[:,38].masked_fill(bodies[:,39]==0,0)
+        bodies[:,36]=bodies[:,36].masked_fill(bodies[:,37]==0,-1)
+        bodies[:,30:33]=0
+        pending=torch.cat([F.one_hot(x['pending'][:,i].long(),k) for i,k in enumerate((9,5,2,2,2))],-1).float()
+        p=self.body(bodies)+self.pending(pending).index_select(0,x['body_row'])*(bodies[:,36:37]==0)
+        r=self.room_project(self.room(x['room']).flatten(2).transpose(1,2))+self.position(self.coordinates)
+        l=self.local(x['local'].reshape(-1,RC,9,9))+self.owner(bodies[:,35:36])
+        e=x['entity'];eknown=e[:,47:48]>0
+        ids=e[:,:3].long();ids=torch.cat((ids[:,:2],ids[:,2:].masked_fill(~eknown,0)),1)
+        e=e.clone();e[:,2:3]=e[:,2:3].masked_fill(~eknown,0)
+        e=self.entity(torch.cat((e/64,self.identity(ids).flatten(1)),1))
+        q=x['inventory'].clone();q[:,1]=q[:,1].masked_fill(q[:,3]==0,0)
+        nt=self.inventory(torch.cat((torch.sign(q)*torch.log1p(q.abs()),self.identity(q[:,1].long())),1))
+        s=x['slots'].clone();s[:,3]=s[:,3].masked_fill(s[:,8]==0,0)
+        s[:,5]=s[:,5].masked_fill(s[:,9]==0,0)
+        s[:,6:8]=s[:,6:8].masked_fill(s[:,10:11]==0,0)
+        s[:,12]=s[:,12].masked_fill(s[:,10]==0,0)
+        st=self.slots(torch.cat((torch.sign(s)*torch.log1p(s.abs()),self.identity(s[:,3].long())),1))
+        pieces=(p,r.flatten(0,1),l,self.minimap(x['map']),e,nt,st,self.global_query[0].expand(n,-1))
+        vals=[v+self.kind[i] for i,v in enumerate(pieces)]
+        flat=vals[0].new_zeros((n*T+1,vals[0].shape[-1]))      # last row: trash
+        for v,k in zip(vals,('d_body','d_room','d_local','d_map','d_entity','d_inventory','d_slots','d_global')):
+            flat=flat.index_copy(0,x[k],v.to(flat.dtype))
+        flat=flat[:n*T]
+        bias=flat.new_zeros((n,1,1,T)).masked_fill(~valid[:,None,None,:],float('-inf'))
+        keep=x['keep']
+        xp=flat.index_select(0,keep)
+        for block in self.blocks:xp=block.forward_packed(xp,bias,keep,(n,T))
+        return xp.new_zeros((n*T,xp.shape[-1])).index_copy(0,keep,xp).view(n,T,-1),~valid
 
 
 def action_gate(b):

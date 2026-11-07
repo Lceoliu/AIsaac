@@ -2381,6 +2381,21 @@ def main(argv=None, child=None, actor=None):
     if proc and (os.environ.get('ISAAC_RL_LEARNER_BENCH') or lab_on or branching):
         p.error('--learner-process 1: not with the learner bench, the build lab or branches (their learner side writes '
                 "into the actor's state)")
+    if block_on and child is None and device.type=='cuda':
+        # B42 glue 3/4: every bucket of the compiled visible-v2 encoder (actor (entity, body)
+        # buckets, learner row-total buckets, canvas decoder) before any game starts (a cold
+        # Inductor cache takes ~20 min: games waiting that long close their connections);
+        # later compiles count as steady recompiles.
+        from isaac_bridge import block_compile
+        from isaac_bridge.structured_input import SPATIAL_COMPILE
+        if SPATIAL_COMPILE:
+            t_w=time.perf_counter()
+            n_w=block_compile.warm_spatial(learner_model,(model,),bf16=amp or args.actor_bf16)
+            block_compile.mark_steady()
+            print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s',flush=True)
+    if os.name != 'nt':   # B42: SIGUSR1 dumps every thread's Python stack to stderr (hang diagnosis)
+        import faulthandler, signal as signal_
+        faulthandler.register(signal_.SIGUSR1, all_threads=True)
     if child is not None:   # (B38 step 2: the learner process reads the workers' counters from each job)
         sampler = types.SimpleNamespace(stats=child['stats'].copy(), aux=None,
                                         lane_rows=True if child['v2_on'] else None)
@@ -2515,16 +2530,6 @@ def main(argv=None, child=None, actor=None):
             block_actor = SlotBlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
         else:
             block_actor = BlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
-        if device.type=='cuda':
-            # B42 glue 3: every (entity, body) bucket of the compiled visible-v2 encoder (and the
-            # canvas decoder) before the first decision; later compiles count as steady recompiles.
-            from isaac_bridge import block_compile
-            from isaac_bridge.structured_input import SPATIAL_COMPILE
-            if SPATIAL_COMPILE:
-                t_w=time.perf_counter()
-                n_w=block_compile.warm_spatial(learner_model,(model,),bf16=amp or args.actor_bf16)
-                block_compile.mark_steady()
-                print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s',flush=True)
     use_graphs = args.graph_entities > 0 and (bool(args.memory_graph) or not mem_on) and not block_on and bench_job is None
     if mem_on:
         print(f'memory: GRU size {mem_dim}, BPTT chunks of {T_mem} decisions (minibatch = {max(1, args.minibatch // T_mem)}'
