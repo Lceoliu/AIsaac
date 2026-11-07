@@ -231,8 +231,11 @@ class SpatialEncoderGraph:
             shape=list(v.shape);shape[0]=capacity
             if k in ragged or k.removesuffix('_mask') in ragged:
                 shape[1]=1<<(shape[1]-1).bit_length()
-                minimum={'v_entity':self.entities,'v_inventory':32,'v_slots':16}.get(k.removesuffix('_mask'),1)
+                # B42: entity bucket {16,32,64,...,entities}, not always the 128 cap: a typical
+                # row has ~10 real entities, and E=128 tripled the actor's Spatial tokens.
+                minimum={'v_entity':min(16,self.entities),'v_inventory':32,'v_slots':16}.get(k.removesuffix('_mask'),1)
                 shape[1]=max(shape[1],minimum)
+                if k.removesuffix('_mask')=='v_entity':shape[1]=min(shape[1],max(self.entities,v.shape[1]))
             shapes[k]=tuple(shape)
         padded_tokens=30+sum(shapes[k][1] for k in ragged)
         if padded_tokens>1024:
@@ -245,7 +248,7 @@ class SpatialEncoderGraph:
                 with torch.autocast('cuda',dtype=torch.bfloat16,enabled=self.bf16):
                     return source,self.model.encode_block(source,packed=False)
             try:
-                if len(self.graphs)>=32:self.graphs.pop(next(iter(self.graphs)))
+                if len(self.graphs)>=128:self.graphs.pop(next(iter(self.graphs)))
                 static={k:v.new_zeros(shapes[k]) for k,v in source.items()}
                 for k,v in source.items():
                     static[k][tuple(slice(0,s) for s in v.shape)].copy_(v)
