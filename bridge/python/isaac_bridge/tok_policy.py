@@ -1991,7 +1991,7 @@ _TORCH = {np.dtype(np.float32): torch.float32, np.dtype(np.int16): torch.int16, 
           np.dtype(np.uint8): torch.uint8}
 
 
-def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True):
+def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True, counts=None):
     """The policy's inputs as views into ROW records held as bytes on the device: raw uint8 [n, >= ROW_BYTES]. The
     values are the records' own bits (what to_batch copies field by field). pending: the actions under way [n, heads]
     (a tensor), or None when raw carries them as n_heads int64 right after the record (GraphActor's layout).
@@ -2017,12 +2017,14 @@ def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True):
         # rows; these batches only need the record fields and the (observation-free) gate.
         b['v_gate'] = torch.ones((n, 3), dtype=torch.bool, device=raw.device)
         return b
-    if visible and bool(versions.any()):
+    # counts (B42): the records' host (p,e,n,s), already checked on the host (check_frames): the
+    # visible frame decodes without reading device memory back (fixed buckets, no sync).
+    if visible and (counts is not None or bool(versions.any())):
         from .structured_input import decode_frame, FRAME_BYTES
         off=ROW.fields['visible_frame'][1]
         sz=ROW.fields['visible_bytes'][1]
         sizes=raw[:,sz:sz+4].contiguous().view(torch.int32)[:,0]
-        b.update(decode_frame(raw[:,off:off+FRAME_BYTES],sizes,versions))
+        b.update(decode_frame(raw[:,off:off+FRAME_BYTES],sizes,versions,counts))
     return b
 
 
@@ -2048,7 +2050,16 @@ def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, hea
         dev_raw = raw.index_select(0, index_t).to(device, non_blocking=False)
     pend = torch.from_numpy(np.ascontiguousarray(pending, np.int64)).to(device)
     vis = 'gate' if head else True
-    return (decode_rows(dev_raw, pend, visible=vis), dev_raw, pend) if with_raw else decode_rows(dev_raw, pend, visible=vis)
+    counts = None
+    if not head:
+        from .structured_input import check_headers, VERSION, HEADER
+        flat = rows.reshape(-1)
+        schema = flat['visible_schema'][index]
+        if np.all(schema == VERSION):   # header bytes only: never a copy of the 128-KiB frames
+            counts = check_headers(schema, flat['visible_frame'].reshape(len(flat), -1)[:, :HEADER*4][index],
+                                   flat['visible_bytes'][index])
+    out = decode_rows(dev_raw, pend, visible=vis, counts=counts)
+    return (out, dev_raw, pend) if with_raw else out
 
 
 class GraphActor:

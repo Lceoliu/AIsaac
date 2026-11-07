@@ -142,13 +142,19 @@ def test_new_math_path_and_no_legacy_parameters():
 
 @pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA collation parity')
 def test_one_copy_collation_matches_device_decode():
-    from isaac_bridge.structured_input import decode_frame
+    from isaac_bridge.structured_input import decode_frame,check_frames
     r=synth_rows(4)
     a=from_rows(r,'cuda')
-    b=decode_frame(torch.from_numpy(r['visible_frame'].copy()).cuda(),
-                   torch.from_numpy(r['visible_bytes'].copy()).cuda(),
-                   torch.from_numpy(r['visible_schema'].copy()).cuda())
+    args=[torch.from_numpy(r[k].copy()).cuda() for k in ('visible_frame','visible_bytes','visible_schema')]
+    # B42: host counts -> the same fixed buckets as the host decode (no device sync);
+    # the checked legacy device path (exact buckets) on its own narrower slots.
+    b=decode_frame(*args,counts=check_frames(r))
     for k in a:torch.testing.assert_close(a[k],b[k],rtol=1e-6,atol=1e-7)
+    legacy=decode_frame(*args)
+    for k in legacy:
+        common=tuple(slice(0,min(x,y)) for x,y in zip(a[k].shape,legacy[k].shape))
+        torch.testing.assert_close(a[k][common],legacy[k][common],rtol=1e-6,atol=1e-7)
+        if k.endswith('_mask'):assert int(a[k].sum())==int(legacy[k].sum())
 
 
 def test_log_rejects_missing_schema_and_wrong_row_layout(tmp_path):

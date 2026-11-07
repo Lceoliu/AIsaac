@@ -10,7 +10,7 @@ import torch
 from test_visible_input import components, synth_rows
 from test_block_training import history_actor
 from test_block_lanes import ring_sampler
-from isaac_bridge.structured_input import pack_frame,write_frame,from_rows,decode_frame
+from isaac_bridge.structured_input import pack_frame,write_frame,from_rows,decode_frame,check_frames
 from isaac_bridge.tok_obs import ROW
 from isaac_bridge.block_training import move_snapshots,BlockActor,SpatialEncoderGraph,pack_snapshots,unpack_snapshots
 from isaac_bridge.block_lanes import BlockLaneService,decode_reference
@@ -112,12 +112,19 @@ def test_host_decode_complete_ragged_and_dtypes(device):
         rows['visible_frame'][i,int(rows['visible_bytes'][i]):]=255
     pending=np.arange(15,dtype=np.int64).reshape(3,5)
     got=from_rows(rows,device,pending)
-    ref=decode_frame(torch.from_numpy(rows['visible_frame'].copy()).to(device),
-                     torch.from_numpy(rows['visible_bytes'].copy()).to(device),
-                     torch.from_numpy(rows['visible_schema'].copy()).to(device))
+    args=[torch.from_numpy(rows[k].copy()).to(device) for k in ('visible_frame','visible_bytes','visible_schema')]
+    # B42: device decode with host header counts (fixed buckets, no sync) == host decode; the
+    # checked legacy device decode (exact buckets) == the same values on its narrower slots.
+    ref=decode_frame(*args,counts=check_frames(rows))
+    legacy=decode_frame(*args)
     for name,value in ref.items():
         assert got[name].dtype==value.dtype,name
         torch.testing.assert_close(got[name],value,rtol=1e-6,atol=1e-7)
+        old=legacy[name]
+        common=tuple(slice(0,min(x,y)) for x,y in zip(got[name].shape,old.shape))
+        torch.testing.assert_close(got[name][common],old[common],rtol=1e-6,atol=1e-7)
+        if name.endswith('_mask'):assert int(got[name].sum())==int(old.sum())
+    assert got['v_entity'].shape[1]==128 and got['v_body'].shape[1]==8 and got['v_slots'].shape[1]==32
     assert got['pending'].dtype==torch.int64
     assert got['first'].dtype==torch.uint8
     assert got['v_inventory_mask'].sum().item()==4497

@@ -76,23 +76,57 @@ def write_frame(row, payload):
     row['visible_schema'] = VERSION
 
 
-def decode_frame(raw, sizes, versions):
-    """Device-native typed gather; CPU decisions only choose bucket shapes before capture."""
-    if not bool((versions == VERSION).all()):
-        raise ValueError('missing/old visible input schema; legacy observations are not accepted')
+# B42 glue: fixed token buckets. Every ragged width is one of a few shapes chosen on the host
+# from the record headers (never by reading device memory): bodies/local patches {1,2,4},
+# entities {16,32,64,128} (pack_frame caps at 128), inventory/slots one upper bucket. Counts
+# past a fixed set double (never truncate); the published schema keeps them that small.
+BUCKETS = {'body':(1,2,4),'local':(1,2,4),'entity':(16,32,64,128),'inventory':(32,),'slots':(16,)}
+
+
+def bucket_width(name, m):
+    for w in BUCKETS[name]:
+        if m <= w:
+            return w
+    w = BUCKETS[name][-1]
+    while w < m:
+        w *= 2
+    return w
+
+
+def frame_counts(frames):
+    """Host (p,e,n,s) [n,4] int64 from the header of complete visible-v2 frames (uint8 [n,>=24])."""
+    return np.ascontiguousarray(frames[:, :HEADER*4]).view('<f4')[:, 2:6].astype(np.int64)
+
+
+def decode_frame(raw, sizes, versions, counts=None):
+    """Device-native typed gather. counts (B42): the host (p,e,n,s) of the rows (frame_counts of
+    the same records, checked on the host when written/decoded): fixed buckets, no device->host
+    synchronisation and no device-side checks. None: the checked legacy path (exact buckets)."""
     f = raw.contiguous().view(torch.float32)
-    counts = f[:, 2:6].long()
-    p,e,n,s = counts.unbind(1)
-    expected = FIXED + p*(PF+324) + e*EF+n*NF+s*SF
-    if not bool(((f[:,0] == 61107) & (f[:,1] == expected) & (sizes == expected*4) &
-                 (p > 0) & (e <= 128) & (counts >= 0).all(1) & (sizes <= FRAME_BYTES)).all()):
-        raise ValueError('invalid visible-v2 complete frame length/counts')
+    if counts is None:
+        if not bool((versions == VERSION).all()):
+            raise ValueError('missing/old visible input schema; legacy observations are not accepted')
+        counts_d = f[:, 2:6].long()
+        p,e,n,s = counts_d.unbind(1)
+        expected = FIXED + p*(PF+324) + e*EF+n*NF+s*SF
+        if not bool(((f[:,0] == 61107) & (f[:,1] == expected) & (sizes == expected*4) &
+                     (p > 0) & (e <= 128) & (counts_d >= 0).all(1) & (sizes <= FRAME_BYTES)).all()):
+            raise ValueError('invalid visible-v2 complete frame length/counts')
+        widths = [max(1, (int(c.max())+3)//4*4) for c in (p,p,e,n,s)]
+    else:
+        counts = np.asarray(counts, np.int64)
+        widths = [bucket_width(k, int(counts[:, j].max()) if len(counts) else 1)
+                  for k, j in zip(RAGGED, (0,0,1,2,3))]
+        counts_d = torch.from_numpy(counts)
+        if f.device.type == 'cuda':
+            counts_d = counts_d.pin_memory()
+        counts_d = counts_d.to(f.device, non_blocking=True)
+        p,e,n,s = counts_d.unbind(1)
     b = {'v_room': unpack_room(f[:,HEADER:HEADER+1792]).transpose(1,2).reshape(-1,RC,16,28),
          'v_map': unpack_canvas(f[:,HEADER+1792:FIXED],(1,)*8,(1,)*8).transpose(1,2).reshape(-1,8,13,13)}
     offset = torch.full_like(p, FIXED)
-    for name, count in zip(RAGGED, (p,p,e,n,s)):
+    for name, count, bucket in zip(RAGGED, (p,p,e,n,s), widths):
         width = RAGGED[name]
-        bucket = max(1, (int(count.max())+3)//4*4)
         at = torch.arange(bucket,device=f.device)[None,:]
         valid = at < count[:,None]
         idx = offset[:,None,None]+at[:,:,None]*width+torch.arange(width,device=f.device)
@@ -113,6 +147,11 @@ def from_rows(rows, device, pending=None):
         b['pending']=np.asarray(pending,dtype=np.int64)
         b['first']=rows['first']
     return from_host(b,device)
+
+
+def host_counts(b):
+    """Real (body, local, entity, inventory, slots) token counts [n,5] of a host-decoded dict."""
+    return np.stack([b['v_'+k+'_mask'].sum(1) for k in RAGGED],1).astype(np.int64)
 
 
 def merge_host(parts):
@@ -163,6 +202,10 @@ def expand_canvases(room,local,minimap):
 @lru_cache(maxsize=1)
 def canvas_decoder():
     # Shape-polymorphic Inductor kernels; no CUDA-graph-owned output buffers.
+    # The FX-tracing flag is process-global: a compile in the learner thread made the actor
+    # thread's compiled call raise (B42 prof-f0). Nested calls then run eagerly instead.
+    import torch._dynamo
+    torch._dynamo.config.error_on_nested_fx_trace=False
     return torch.compile(expand_canvases,fullgraph=True,dynamic=True)
 
 
@@ -179,16 +222,31 @@ def _unpack_room_host(x):
     return result
 
 
+def check_frames(rows):
+    """Host validity check of complete visible-v2 frames (ROW records); returns (p,e,n,s) [n,4].
+    Reads only the 24-byte headers; the device decoders never check (or synchronise) again."""
+    head=rows['visible_frame'].reshape(len(rows),-1)[:,:HEADER*4]
+    return check_headers(rows['visible_schema'],head,rows['visible_bytes'])
+
+
+def check_headers(schema,head,size):
+    """check_frames on the record fields only: schema [n], frame header bytes [n,24], sizes [n]."""
+    if not np.all(np.asarray(schema)==VERSION):
+        raise ValueError('missing/old visible input schema; legacy observations are not accepted')
+    h=np.ascontiguousarray(head).view('<f4')
+    counts=h[:,2:6].astype(np.int64);p,e,n,s=counts.T
+    expected=FIXED+p*(PF+324)+e*EF+n*NF+s*SF
+    size=np.asarray(size).reshape(-1)
+    if not np.all((h[:,0]==61107)&(h[:,1]==expected)&(size==expected*4)&
+                  (p>0)&(e<=128)&(counts>=0).all(1)&(size<=FRAME_BYTES)):
+        raise ValueError('invalid visible-v2 complete frame length/counts')
+    return counts
+
+
 def decode_frame_host(rows,packed=False):
     """Same contract as decode_frame; strided ROW views remain zero-copy on input."""
-    if not np.all(rows['visible_schema']==VERSION):
-        raise ValueError('missing/old visible input schema; legacy observations are not accepted')
     f=rows['visible_frame'].view('<f4')
-    counts=f[:,2:6].astype(np.int64);p,e,n,s=counts.T
-    expected=FIXED+p*(PF+324)+e*EF+n*NF+s*SF
-    if not np.all((f[:,0]==61107)&(f[:,1]==expected)&(rows['visible_bytes']==expected*4)&
-                  (p>0)&(e<=128)&(counts>=0).all(1)&(rows['visible_bytes']<=FRAME_BYTES)):
-        raise ValueError('invalid visible-v2 complete frame length/counts')
+    counts=check_frames(rows);p,e,n,s=counts.T
     room=f[:,HEADER:HEADER+1792]
     minimap=f[:,HEADER+1792:FIXED]
     if not packed:
@@ -198,7 +256,7 @@ def decode_frame_host(rows,packed=False):
     b={'v_room':room,'v_map':minimap}
     offset=np.full_like(p,FIXED)
     for name,count in zip(RAGGED,(p,p,e,n,s)):
-        width=RAGGED[name];bucket=max(1,(int(count.max())+3)//4*4)
+        width=RAGGED[name];bucket=bucket_width(name,int(count.max()))
         at=np.arange(bucket)[None,:];valid=at<count[:,None]
         idx=offset[:,None,None]+at[:,:,None]*width+np.arange(width)
         values=f[np.arange(len(rows))[:,None,None],np.minimum(idx,f.shape[1]-1)]

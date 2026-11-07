@@ -67,6 +67,21 @@ def count(name, value):
         TIMING[name] = TIMING.get(name, 0)+value
 
 
+DUMP_DIR = os.environ.get('ISAAC_BLOCK_DUMP', '')
+_DUMPED = set()
+
+
+def dump_inputs(name, rows, pending):
+    """Measurement only (ISAAC_BLOCK_DUMP=dir): save one real input batch (ROW records + actions
+    under way) once per name, for the standalone kernel-count profile (bridge/ops/b42_kernels.py)."""
+    if not DUMP_DIR or name in _DUMPED:
+        return
+    _DUMPED.add(name)
+    os.makedirs(DUMP_DIR, exist_ok=True)
+    np.save(os.path.join(DUMP_DIR, name+'_rows.npy'), np.asarray(rows))
+    np.save(os.path.join(DUMP_DIR, name+'_pending.npy'), np.asarray(pending, np.int64))
+
+
 def timing_report(reset=True):
     out = dict(TIMING)
     if reset:
@@ -488,6 +503,12 @@ class SlotBlockActor:
         ctx = {'memory_call': slot_call, 'version': version, 'reset_done': True}
         clock.mark('prepare')
         count('actor.calls', 1); count('actor.rows', len(rows))
+        if DUMP_DIR and len(rows) >= 16:
+            if 'actor' not in _DUMPED:
+                os.makedirs(DUMP_DIR, exist_ok=True)
+                torch.save(dict(model=self.model.state_dict(), config=self.model.config),
+                           os.path.join(DUMP_DIR, 'model.pt'))
+            dump_inputs('actor', rows, pending)
         if self.encoder is None:
             b = from_rows(rows, device, pending)
         else:
@@ -629,36 +650,48 @@ def dense_memory_forward(memory, z, steps, prefixes, kp, old_vals, n_old, old_en
 RAGGED = ('v_body', 'v_local', 'v_entity', 'v_inventory', 'v_slots')
 
 
-def encode_sorted(model, batch, micro):
+def encode_sorted(model, batch, micro, counts=None):
     """Spatial over a decoded batch in token-sorted microbatches with tight padding.
 
-    Rows are ordered by their real token count and each microbatch keeps only as many
-    ragged slots as its longest row (masks are left-aligned), so padding attention is
-    not computed. Identical math to one padded call; with gradients enabled each
-    microbatch is a non-reentrant checkpoint (bounded activations)."""
+    Rows are ordered by their real token count and each microbatch keeps only the fixed
+    token bucket (structured_input.BUCKETS) of its longest row (masks are left-aligned), so
+    padding attention is mostly not computed. Identical math to one padded call; with
+    gradients enabled each microbatch is a non-reentrant checkpoint (bounded activations).
+    counts (B42): the host real counts [n,5] (host_counts of the host-decoded dict): no
+    device->host synchronisation. None: counted on the device (one sync)."""
     from torch.utils.checkpoint import checkpoint
+    from .structured_input import bucket_width
     n = len(batch['v_body'])
-    counts = torch.stack([batch[k+'_mask'].sum(1) for k in RAGGED], 1)       # [n, 5]
-    tokens = counts.sum(1)
-    order = torch.argsort(tokens, stable=True)
-    counts_h = counts.index_select(0, order).cpu().numpy()
+    dev = batch['v_body'].device
+    if counts is None:
+        counts = torch.stack([batch[k+'_mask'].sum(1) for k in RAGGED], 1).cpu().numpy()
+    counts = np.asarray(counts, np.int64)
+    order_h = np.argsort(counts.sum(1), kind='stable')
+    counts_h = counts[order_h]
+    order = torch.from_numpy(order_h)
+    if dev.type == 'cuda':
+        order = order.pin_memory()
+    order = order.to(dev, non_blocking=True)
     grad = torch.is_grad_enabled() and n > micro
     out = []
     for begin in range(0, n, micro):
         idx = order[begin:begin+micro]
-        width = np.maximum(counts_h[begin:begin+micro].max(0), 1)
+        width = counts_h[begin:begin+micro].max(0)
         part = {}
         for k, v in batch.items():
             v = v.index_select(0, idx)
             base = k[:-5] if k.endswith('_mask') else k
             if base in RAGGED:
-                v = v[:, :int(width[RAGGED.index(base)])]
+                v = v[:, :min(v.shape[1], bucket_width(base[2:], int(width[RAGGED.index(base)])))]
             part[k] = v
         out.append(checkpoint(model.encode_block, part, use_reentrant=False) if grad else model.encode_block(part))
     z = torch.cat(out)
-    inverse = torch.empty_like(order)
-    inverse[order] = torch.arange(n, device=order.device)
-    return z.index_select(0, inverse)
+    inverse = np.empty_like(order_h)
+    inverse[order_h] = np.arange(n)
+    inverse = torch.from_numpy(inverse)
+    if dev.type == 'cuda':
+        inverse = inverse.pin_memory()
+    return z.index_select(0, inverse.to(dev, non_blocking=True))
 
 
 def _to(x, device):
@@ -721,13 +754,16 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
         for k in sel:
             unique.setdefault(int(p['bid'][k]), len(unique))
     def encode_sources(rows, pending):
-        return encode_sorted(model, from_rows(rows, device, pending), spatial_micro)
+        from .structured_input import decode_frame_host, from_host, host_counts
+        d = decode_frame_host(rows, packed=device.type == 'cuda')
+        d['pending'] = np.asarray(pending, np.int64); d['first'] = np.asarray(rows['first'])
+        return encode_sorted(model, from_host(d, device), spatial_micro, host_counts(d))
     hist_written = None
     hist_rows = 0
     if unique:
         clock.mark('select')
         ub = np.fromiter(unique.keys(), np.int64, len(unique))
-        from .structured_input import decode_frame_host, merge_host, from_host
+        from .structured_input import decode_frame_host, merge_host, from_host, host_counts
         packed = device.type == 'cuda'
         hosts = []
         for bid in ub.tolist():
@@ -740,7 +776,8 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
             hosts.append(d)
         hist_rows = len(ub)*cfg.block_steps
         clock.mark('hist_host_rows')
-        zh = encode_sorted(model, from_host(merge_host(hosts), device), spatial_micro)
+        merged = merge_host(hosts)
+        zh = encode_sorted(model, from_host(merged, device), spatial_micro, host_counts(merged))
         hist_written = memory.writer(zh.reshape(len(ub), cfg.block_steps, cfg.latents, cfg.latent_width))
         clock.mark('hist_spatial_writer')
         count('learn.hist_rows', hist_rows)
@@ -825,15 +862,20 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
                 object.__setattr__(c, '_host', h)
         hosts.append(h[1])
     rows = chunks[0].rows if len(chunks) == 1 else None
-    batch = from_host(merge_host(hosts), device)
+    if DUMP_DIR and torch.is_grad_enabled() and B*length >= 512:
+        dump_inputs('learner', np.concatenate([np.asarray(c.rows) for c in chunks])[:SPATIAL_MICRO_TRAIN],
+                    np.concatenate([np.asarray(c.pending, np.int64) for c in chunks])[:SPATIAL_MICRO_TRAIN])
+    from .structured_input import host_counts
+    merged = merge_host(hosts)
+    batch = from_host(merged, device)
     clock.mark('main_decode')
     if TIMING_ON:
         keys = ('v_body_mask', 'v_local_mask', 'v_entity_mask', 'v_inventory_mask', 'v_slots_mask')
-        count('learn.tokens_real', sum(int(batch[k].sum()) for k in keys)+30*B*length)
+        count('learn.tokens_real', int(host_counts(merged).sum())+30*B*length)
         count('learn.tokens_padded', B*length*(30+sum(batch[k].shape[1] for k in keys)))
     # Same bounded-activation, token-sorted Spatial as the historical sources
     # (identical math; required at --micro 8192 on a 24 GB GPU).
-    encoded = encode_sorted(model, batch, spatial_micro)
+    encoded = encode_sorted(model, batch, spatial_micro, host_counts(merged))
 
     def call(z):
         return dense_memory_forward(memory, z.reshape(B, length, *z.shape[1:]), steps, prefixes, kp,
