@@ -134,29 +134,46 @@ class BlockSlotState:
     @torch.no_grad()
     def commit(self,memory,host,ids,steps,z,current,version=0,source_ids=None):
         """Write the new step. current: [layers,2,b,heads,latents,dh]. Returns completed-block info."""
+        self.commit_device(ids,steps,z,current,version,source_ids)
+        return self.commit_blocks(memory,host,ids,steps,z.dtype,version)
+
+    @torch.no_grad()
+    def commit_device(self,ids,steps,z,current,version=0,source_ids=None):
+        """The per-step device writes of commit (capturable: no host reads). version: an int
+        or a 0-d long device tensor (B42 glue 5: the actor step graph)."""
         c=self.config;phase=steps%c.block_steps
         columns=(steps[:,None]*c.latents+self.latent_axis)%len(self.kv_axis)
         # Only the four new positions are written; never clone a 512-token
         # destination cache merely to scatter four entries back into it.
         self.kv[:,:,ids[:,None],:,columns,:]=current.permute(2,4,0,1,3,5).to(self.kv_dtype)
-        for name,values in (('kv_steps',steps[:,None].expand(-1,c.latents)),
-                            ('kv_versions',torch.full_like(columns,int(version)))):
+        ver=(torch.full_like(columns,int(version)) if not isinstance(version,torch.Tensor)
+             else version.expand_as(columns))
+        for name,values in (('kv_steps',steps[:,None].expand(-1,c.latents)),('kv_versions',ver)):
             getattr(self,name)[ids[:,None],columns]=values
         self.partial[ids,phase]=z.to(self.dtype)
-        self.partial_versions[ids,phase]=int(version)
-        self.partial_sources[ids,phase]=(-1 if source_ids is None else torch.as_tensor(source_ids,device=self.device,dtype=torch.long))
+        self.partial_versions[ids,phase]=(torch.full_like(phase,int(version)) if not isinstance(version,torch.Tensor)
+                                          else version.expand_as(phase))
+        # Device-side fill values (a Python scalar here is a host->device copy, illegal in capture).
+        self.partial_sources[ids,phase]=(torch.full_like(phase,-1) if source_ids is None
+                                         else torch.as_tensor(source_ids,device=self.device,dtype=torch.long))
+        self.steps.index_copy_(0,ids,steps+1)
+
+    @torch.no_grad()
+    def commit_blocks(self,memory,host,ids,steps,dtype,version=0):
+        """The completed-block part of commit (host-decided Writer call), then the host step."""
+        c=self.config
         completed=np.flatnonzero((self.step_host[host]+1)%c.block_steps==0)
         written=None
         if len(completed):
             _,positions=self._ids(completed);done=ids.index_select(0,positions)
-            written=memory.writer(self.partial.index_select(0,done).to(z.dtype))
+            written=memory.writer(self.partial.index_select(0,done).to(dtype))
             end=steps.index_select(0,positions);column=torch.div(end,c.block_steps,rounding_mode='floor')%c.memory_blocks
             self.bank[done,column]=written.to(self.dtype)
             self.bank_ends[done,column]=end;self.bank_versions[done,column]=int(version)
             self.bank_sources[done,column]=self.partial_sources.index_select(0,done)
             self.bank_source_versions[done,column]=self.partial_versions.index_select(0,done)
             self.partial_sources.index_fill_(0,done,-1);self.partial_versions.index_fill_(0,done,-1)
-        self.step_host[host]+=1;self.steps.index_copy_(0,ids,steps+1)
+        self.step_host[host]+=1
         return completed,written
 
     @torch.no_grad()

@@ -359,7 +359,10 @@ def test_graph_slot_actor_matches_object_graph_actor(bf16):
             torch.testing.assert_close(x.float(), y.float(), **tol)
         if not bf16:
             torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
-    assert new.reader.replays == 12
+    if new.step_graph is not None:   # B42 glue 5: the whole step is one graph (Reader inside)
+        assert new.step_graph.replays == 12
+    else:
+        assert new.reader.replays == 12
 
 
 def test_microbatched_checkpointed_spatial_matches_reference_gradients():
@@ -428,3 +431,56 @@ def test_compiled_spatial_matches_eager_fp32_and_bf16():
         torch.testing.assert_close(yc16.float(), ye16.float(), rtol=.02, atol=.02)
     assert block_compile.STATS['compiles'] > 0
 
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='actor step graph (CUDA)')
+@pytest.mark.parametrize('bf16', [False, True])
+def test_actor_step_graph_matches_eager_slot_actor(bf16):
+    """B42 glue 5 gate: whole-step CUDA graph == eager slot step (FP32 <= 1e-5, BF16 graph-test
+    tolerance): outputs, arena rows, pages; resets, block boundaries (Writer), mixed replay
+    masks, fork/restore."""
+    from isaac_bridge import block_paged
+    if not block_paged.STEP_GRAPH:
+        pytest.skip('ISAAC_BLOCK_STEP_GRAPH=0')
+    torch.manual_seed(77)
+    m = make_policy('cuda').eval()
+    g = SlotBlockActor(m, 4, graph_entities=128, bf16=bf16)
+    e = SlotBlockActor(m, 4, graph_entities=128, bf16=bf16)
+    e.step_graph = None
+    assert g.step_graph is not None
+    rng = np.random.default_rng(77)
+    tol = dict(rtol=.02, atol=.02) if bf16 else dict(rtol=1e-5, atol=1e-5)
+    cfg = m.block_memory.config
+    T = 70
+    snaps = None
+    for t in range(T):
+        n = 3 if t % 5 == 4 else 4
+        slots = list(range(n))
+        first = np.array([int(t == 0 or (t == 17 and i == 1)) for i in slots])
+        rows = frame(rng, n, t, np.arange(n)+1, first)
+        pending = synth_pending(rng, n, m.heads)
+        keys = (np.full(n, t), np.arange(n))
+        replay = np.array([t % 7 == 3 and i == 2 for i in slots])
+        if t == 30:
+            snaps = [g.snapshot(0), e.snapshot(0)]
+        if t == 45:
+            g.restore(3, snaps[0]); e.restore(3, snaps[1])
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+            a = g.step(rows, pending, slots, ukeys=keys, evaluate=replay)
+            b = e.step(rows, pending, slots, ukeys=keys, evaluate=replay)
+        torch.testing.assert_close(a[0], b[0], rtol=0, atol=0) if not bf16 else None
+        for x, y in zip(a[1:], b[1:]):
+            torch.testing.assert_close(x.float(), y.float(), **tol)
+        np.testing.assert_allclose(g.host_output, e.host_output, **tol)
+    assert g.step_graph.replays > 0 and g.step_graph.captures > 0
+    for slot in range(4):
+        assert g.state.step_host[slot] == e.state.step_host[slot]
+        ga, ea = g.state.gather(g.state._ids([slot])[1]), e.state.gather(e.state._ids([slot])[1])
+        for k in ('kv', 'bank', 'partial', 'kv_steps', 'ends', 'bank_versions', 'partial_versions'):
+            torch.testing.assert_close(ga[k].float(), ea[k].float(), **tol, msg=k)
+        gl, el = g.logs[slot], e.logs[slot]
+        assert gl.nb == el.nb and gl.n == el.n
+        hi = int(g.state.step_host[slot])
+        _, kg = gl.decisions(max(gl.offset, hi-8), hi)
+        _, ke = el.decisions(max(el.offset, hi-8), hi)
+        torch.testing.assert_close(g.store.kv(kg).float(), e.store.kv(ke).float(), **tol)
+        torch.testing.assert_close(g.store.z(kg).float(), e.store.z(ke).float(), **tol)
