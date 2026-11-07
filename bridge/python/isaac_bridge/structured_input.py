@@ -374,6 +374,11 @@ def prioritize_entities(entities,players):
     return entities[order],overflow
 
 
+SPATIAL_KEYS=('v_body','v_body_mask','v_room','v_local','v_local_mask','v_map','v_entity','v_entity_mask',
+              'v_inventory','v_inventory_mask','v_slots','v_slots_mask','pending')
+SPATIAL_COMPILE=__import__('os').environ.get('ISAAC_SPATIAL_COMPILE','1')=='1'
+
+
 class StructuredSpatial(nn.Module):
     def __init__(self,width,layers,heads):
         super().__init__()
@@ -399,6 +404,16 @@ class StructuredSpatial(nn.Module):
 
     def forward(self,b):
         if 'v_body' not in b:raise ValueError('new Spatial requires visible-v2 input; legacy input rejected')
+        x={k:b[k].contiguous() for k in SPATIAL_KEYS}   # static strides: no stride-keyed recompiles
+        # B42 glue 3: on the GPU the whole forward is one compiled graph per (entity, body)
+        # bucket and execution mode (grad/no-grad, autocast): the clone/masked_fill/cat/
+        # one_hot/log1p/kind-bias/mask glue fuses in Inductor, linear layers stay cuBLAS.
+        if SPATIAL_COMPILE and x['v_body'].is_cuda:
+            from .block_compile import spatial_compiled
+            return spatial_compiled()(self,x)
+        return self.forward_eager(x)
+
+    def forward_eager(self,b):
         b=dict(b)
         for name in RAGGED:
             b['v_'+name]=b['v_'+name].masked_fill(~b['v_'+name+'_mask'][:,:,None],0)

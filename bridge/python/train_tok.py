@@ -2515,6 +2515,16 @@ def main(argv=None, child=None, actor=None):
             block_actor = SlotBlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
         else:
             block_actor = BlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
+        if device.type=='cuda':
+            # B42 glue 3: every (entity, body) bucket of the compiled visible-v2 encoder (and the
+            # canvas decoder) before the first decision; later compiles count as steady recompiles.
+            from isaac_bridge import block_compile
+            from isaac_bridge.structured_input import SPATIAL_COMPILE
+            if SPATIAL_COMPILE:
+                t_w=time.perf_counter()
+                n_w=block_compile.warm_spatial(learner_model,(model,),bf16=amp or args.actor_bf16)
+                block_compile.mark_steady()
+                print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s',flush=True)
     use_graphs = args.graph_entities > 0 and (bool(args.memory_graph) or not mem_on) and not block_on and bench_job is None
     if mem_on:
         print(f'memory: GRU size {mem_dim}, BPTT chunks of {T_mem} decisions (minibatch = {max(1, args.minibatch // T_mem)}'
@@ -4002,6 +4012,9 @@ def main(argv=None, child=None, actor=None):
                 row['block_mixed_replay_calls']=lane_stat.get('block_mixed_replay_calls',0)
                 for k_b in ('block_gc_s','block_kv_rows','block_blocks','block_raw_rows'):
                     row[k_b]=lane_stat.get(k_b,0)
+                from isaac_bridge.block_compile import STATS as cstat_b
+                row['block_compiles'],row['block_steady_compiles']=cstat_b['compiles'],cstat_b['steady_compiles']
+                row['block_compiled_calls']=cstat_b['calls']
         if cf_on:   # B34 (the counterfactual teacher): worker totals, this update's window, the trainer's side
             keys_c = [k_c for k_c in ST if k_c.startswith('cf_')]
             tot_c = {k_c: float(stats[:, ST[k_c]].sum()) for k_c in keys_c}

@@ -96,3 +96,77 @@ def compile_batch_dynamic(fn):
         return unpad(out) if one else out
     call.compiled = compiled
     return call
+
+
+def _spatial(module, x):
+    return module.forward_eager(x)
+
+
+_SPATIAL = []
+
+
+def spatial_compiled():
+    """StructuredSpatial.forward_eager compiled (module passed as an argument: the parameters
+    are graph inputs, so the learner, actor and teacher copies share one compiled set)."""
+    if not _SPATIAL:
+        _SPATIAL.append(compile_batch_dynamic(_spatial))
+    return _SPATIAL[0]
+
+
+def synthetic_visible(n, body, entities, device, inventory=32, slots=32 // 2):
+    """A decoded visible-v2 batch of the given buckets (one real slot each, rest padding)."""
+    from .structured_input import PF, EF, NF, SF, RC
+    f = dict(device=device)
+
+    def ragged(name, width, k):
+        mask = torch.zeros((n, k), dtype=torch.bool, **f)
+        mask[:, 0] = True
+        return {'v_'+name: torch.zeros((n, k, width), **f), 'v_'+name+'_mask': mask}
+    b = {'v_room': torch.zeros((n, RC, 16, 28), **f), 'v_map': torch.zeros((n, 8, 13, 13), **f),
+         'pending': torch.zeros((n, 5), dtype=torch.long, **f)}
+    b.update(ragged('body', PF, body))
+    b.update(ragged('local', RC*81, body))
+    b.update(ragged('entity', EF, entities))
+    b.update(ragged('inventory', NF, inventory))
+    b.update(ragged('slots', SF, slots))
+    return b
+
+
+def warm_spatial(learner=None, actors=(), bf16=True):
+    """Compile every (entity, body) bucket before training: the learner's training mode with
+    gradients (forward+backward) and without, the actors' bf16 inference mode. Returns the
+    number of compiles it caused; afterwards mark_steady() counts any further compile."""
+    from .structured_input import BUCKETS, canvas_decoder
+    before = STATS['compiles']
+    combos = [(p, e) for e in BUCKETS['entity'] for p in BUCKETS['body']]
+    model0 = learner if learner is not None else (actors[0] if actors else None)
+    if model0 is not None:
+        dev = next(model0.parameters()).device
+        with torch.inference_mode(False), torch.no_grad(), torch.autocast('cuda', enabled=False):
+            for p in BUCKETS['body']:
+                for n in (2, 5):
+                    canvas_decoder()(torch.zeros((n, 1792), device=dev), torch.zeros((n, p, 324), device=dev),
+                                     torch.zeros((n, 169), device=dev))
+    if learner is not None:
+        dev = next(learner.parameters()).device
+        was = learner.training
+        learner.train()
+        for p, e in combos:
+            for n in (2, 5):
+                b = synthetic_visible(n, p, e, dev)
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+                    x, _ = learner.structured_spatial(b)
+                x.float().sum().backward()
+                with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+                    learner.structured_spatial(b)
+        learner.zero_grad(set_to_none=True)
+        learner.train(was)
+    for model in actors:
+        dev = next(model.parameters()).device
+        for p, e in combos:
+            for n in (2, 5):
+                b = synthetic_visible(n, p, e, dev)
+                with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+                    model.structured_spatial(b)
+    torch.cuda.synchronize()
+    return STATS['compiles']-before

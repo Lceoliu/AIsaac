@@ -379,3 +379,52 @@ def test_microbatched_checkpointed_spatial_matches_reference_gradients():
     for name in pa:
         if pa[name].grad is not None or pb[name].grad is not None:
             torch.testing.assert_close(pa[name].grad, pb[name].grad, rtol=1e-4, atol=5e-6, msg=name)
+
+
+def _visible_rows(spec, seed=0):
+    from isaac_bridge.tok_obs import ROW
+    from isaac_bridge.structured_input import pack_frame, write_frame
+    from test_visible_input import components
+    rows = np.zeros(len(spec), ROW)
+    for i, args in enumerate(spec):
+        write_frame(rows[i:i+1], pack_frame(*components(*args, seed=seed+i)))
+    return rows
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='compiled Spatial (CUDA)')
+def test_compiled_spatial_matches_eager_fp32_and_bf16():
+    """B42 glue 3 gate: compiled fixed-bucket Spatial == eager (FP32 <= 1e-5, gradients too;
+    BF16 within the graph-test tolerance) at every body bucket and several entity buckets."""
+    from isaac_bridge.tok_policy import TokPolicy
+    from isaac_bridge.structured_input import from_rows, SPATIAL_KEYS
+    from isaac_bridge import block_compile
+    torch.manual_seed(3)
+    m = TokPolicy(192, 4, 4, items=True, item_tokens=True, global_token=True, block_memory=True,
+                  block_config=dict(width=256, layers=4, heads=4)).cuda().train()
+    specs = [[(1, 3, 20, 5), (1, 0, 0, 0), (1, 9, 2, 1)],
+             [(2, 40, 7, 3), (1, 17, 31, 16), (2, 1, 0, 0)],
+             [(4, 128, 12, 9), (3, 70, 1, 2)],
+             [(1, 5, 3, 3)]]
+    for spec in specs:
+        rows = _visible_rows(spec, seed=len(spec))
+        pending = synth_pending(np.random.default_rng(1), len(rows), m.heads)
+        b = from_rows(rows, 'cuda', pending)
+        x = {k: b[k] for k in SPATIAL_KEYS}
+        outs = []
+        for compiled in (False, True):
+            m.zero_grad(set_to_none=True)
+            y, pad = m.structured_spatial(x) if compiled else m.structured_spatial.forward_eager(x)
+            (y.masked_fill(pad[..., None], 0).square().mean()).backward()
+            outs.append((y.detach(), pad, {k: p.grad.clone() for k, p in m.named_parameters() if p.grad is not None}))
+        (ye, pe, ge), (yc, pc, gc_) = outs
+        assert torch.equal(pe, pc)
+        assert (ye-yc).abs().max().item() <= 1e-5
+        assert ge.keys() == gc_.keys()
+        for k in ge:
+            torch.testing.assert_close(gc_[k], ge[k], rtol=1e-4, atol=1e-5, msg=k)
+        with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+            ye16, _ = m.structured_spatial.forward_eager(x)
+            yc16, _ = m.structured_spatial(x)
+        torch.testing.assert_close(yc16.float(), ye16.float(), rtol=.02, atol=.02)
+    assert block_compile.STATS['compiles'] > 0
+
