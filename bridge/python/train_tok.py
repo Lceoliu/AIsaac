@@ -1754,6 +1754,9 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--actor-devices', default='',
                    help="(B38 step 5) the actor processes' GPUs, e.g. cuda:0,cuda:2 ('': the first visible GPU for "
                         'all; two actor processes on one GPU: the B13 hazard, for tests)')
+    p.add_argument('--block-slots',type=int,choices=(0,1),default=1,
+                   help='A1 (B42): block-memory actor on dense GPU slots with paged snapshots/source leases '
+                        '(1, production); 0: the object reference path (EpisodeMemory/RawHistory snapshots)')
     p.add_argument('--shared-gpu-mps',type=int,choices=(0,1),default=0,
                    help='experimental same-GPU learner process; requires verified NVIDIA MPS client registration')
     p.add_argument('--learner-process', type=int, default=0,
@@ -1995,6 +1998,9 @@ def main(argv=None, child=None, actor=None):
         args.temporal_bptt = 128
         if args.learner_compile:
             p.error('block-memory uses its attention backend, not whole-policy compile')
+    if block_on and args.block_slots and (args.learner_process or args.actor_processes!=1):
+        p.error('--block-slots 1 keeps paged snapshots in the actor process: use --learner-process 0 '
+                '--actor-processes 1, or --block-slots 0')
     if args.steady_updates and (not block_on or args.actor_processes!=1):
         p.error('--steady-updates is the single-actor-process block-memory verification gate')
     t_on = bool(args.temporal)   # 2026-10-14 (B30)
@@ -2502,7 +2508,13 @@ def main(argv=None, child=None, actor=None):
               + (f'(GRU chunks of {T_mem} inside)' if mem_on else '(no GRU: no nested chunks)')
               + f', K / V {args.temporal_kv}; actor cache '
               f'{t_state.kv.numel() * t_state.kv.element_size() / 2 ** 20:.0f} MiB', flush=True)
-    block_actor = BlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16) if block_on and child is None and bench_job is None else None
+    block_actor = None
+    if block_on and child is None and bench_job is None:
+        if args.block_slots:
+            from isaac_bridge.block_paged import SlotBlockActor
+            block_actor = SlotBlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
+        else:
+            block_actor = BlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
     use_graphs = args.graph_entities > 0 and (bool(args.memory_graph) or not mem_on) and not block_on and bench_job is None
     if mem_on:
         print(f'memory: GRU size {mem_dim}, BPTT chunks of {T_mem} decisions (minibatch = {max(1, args.minibatch // T_mem)}'
@@ -3980,6 +3992,8 @@ def main(argv=None, child=None, actor=None):
                 row['block_graph_replays']=lane_stat.get('block_graph_replays',0)
                 row['block_teacher_forward_calls']=lane_stat.get('block_teacher_forward_calls',0)
                 row['block_mixed_replay_calls']=lane_stat.get('block_mixed_replay_calls',0)
+                for k_b in ('block_gc_s','block_kv_rows','block_blocks','block_raw_rows'):
+                    row[k_b]=lane_stat.get(k_b,0)
         if cf_on:   # B34 (the counterfactual teacher): worker totals, this update's window, the trainer's side
             keys_c = [k_c for k_c in ST if k_c.startswith('cf_')]
             tot_c = {k_c: float(stats[:, ST[k_c]].sum()) for k_c in keys_c}
@@ -4800,6 +4814,12 @@ def main(argv=None, child=None, actor=None):
             job['proc_cores'] = (proc_now - proc_mark) / max(job['cycle_s'], 1e-9)
             proc_mark = proc_now
             handed += roll.usable()
+            if block_actor is not None and hasattr(block_actor,'store'):
+                # A1 leases: free page rows/sources no rollout, teacher buffer, point, lane or slot can read.
+                t_gc = time.perf_counter()
+                gc_b = block_actor.store.collect()
+                lane_stat['block_gc_s'] = time.perf_counter()-t_gc
+                lane_stat['block_kv_rows'], lane_stat['block_blocks'], lane_stat['block_raw_rows'] =                     gc_b['kv'], gc_b['blocks'], gc_b['raw']
             if t_on:   # (B31) the actor's writes into the rollout's device tensors done before the learner reads them
                 torch.cuda.current_stream().synchronize()
             if proc:   # B38 step 2: what the learner process needs of this rollout (its arrays are shared)

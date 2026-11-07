@@ -1,18 +1,25 @@
 """Dense active-slot state kernels for block memory.
 
 This is the tensor execution core. Pool/lease ownership and the actor/rollout
-integration are separate: callers reserve destination slots before fork/copy.
-No EpisodeMemory or RawHistory object is constructed by step().
+integration live in block_paged (PagedStore / SlotBlockActor). No EpisodeMemory
+or RawHistory object is constructed by step().
+
+A step is split into read_inputs (gather, before the Reader) and commit (write
+the four new KV positions, the latent tail and, on a completed block, one Writer
+call), so several arenas (main actor, teacher generations) can share one Reader
+call. Bank and tail latents are float32 (Writer/LayerNorm outputs are float32 even
+under autocast); only K/V use kv_dtype, which is lossless for BF16-produced K/V.
 """
 import numpy as np
 import torch
 
 
 class BlockSlotState:
-    def __init__(self,config,slots,device='cpu',dtype=torch.float32):
+    def __init__(self,config,slots,device='cpu',dtype=torch.float32,kv_dtype=None):
         self.config,self.device,self.dtype=config,torch.device(device),dtype
-        c=config;self.step_host=np.zeros(slots,np.int64)
-        self.kv=torch.zeros((c.layers,2,slots,c.heads,c.window*c.latents,c.width//c.heads),device=device,dtype=dtype)
+        self.kv_dtype=dtype if kv_dtype is None else kv_dtype
+        c=config;self.slots=int(slots);self.step_host=np.zeros(slots,np.int64)
+        self.kv=torch.zeros((c.layers,2,slots,c.heads,c.window*c.latents,c.width//c.heads),device=device,dtype=self.kv_dtype)
         self.bank=torch.zeros((slots,c.memory_blocks,c.memory_tokens,c.latent_width),device=device,dtype=dtype)
         self.partial=torch.zeros((slots,c.block_steps,c.latents,c.latent_width),device=device,dtype=dtype)
         self.steps=torch.zeros(slots,device=device,dtype=torch.long)
@@ -31,7 +38,7 @@ class BlockSlotState:
                     'partial_sources','partial_versions','bank_sources','bank_source_versions')
 
     def _ids(self,slots):
-        host=np.asarray(slots,dtype=np.int64)
+        host=np.asarray(slots,dtype=np.int64).reshape(-1)
         ids=torch.from_numpy(host)
         if self.device.type=='cuda':ids=ids.pin_memory().to(self.device,non_blocking=True)
         return host,ids
@@ -51,6 +58,47 @@ class BlockSlotState:
         for name in self._rows:
             value=getattr(self,name);value.index_copy_(0,dst,value.index_select(0,src))
 
+    @torch.no_grad()
+    def load(self,slot,step,kv,kv_steps,kv_versions,partial,partial_versions,partial_sources,
+             bank,bank_ends,bank_versions,bank_sources,bank_source_versions):
+        """Materialise one slot from paged storage (restore of an arbitrary snapshot).
+
+        kv [n,layers,2,heads,latents,dh] for decisions kv_steps (host, ascending, n<=window);
+        partial [p,latents,latent_width] for the open tail; bank [m,tokens,latent_width] for
+        complete blocks ending at bank_ends (host, ascending, m<=memory_blocks)."""
+        c=self.config;slot=int(slot);step=int(step)
+        self.reset([slot])
+        dev=self.device
+        def put(x,dtype=None):
+            x=torch.as_tensor(x)
+            if dev.type=='cuda' and x.device.type=='cpu':x=x.pin_memory()
+            return x.to(dev,dtype=dtype,non_blocking=True)
+        n=len(kv_steps)
+        if n:
+            steps=np.asarray(kv_steps,np.int64)
+            columns=(steps[:,None]*c.latents+np.arange(c.latents))%(c.window*c.latents)
+            col=put(columns.reshape(-1))
+            values=put(kv,self.kv_dtype)                       # [n,L,2,H,lat,dh]
+            values=values.permute(1,2,3,0,4,5).reshape(c.layers,2,c.heads,n*c.latents,c.width//c.heads)
+            self.kv[:,:,slot].index_copy_(3,col,values)
+            self.kv_steps[slot].index_copy_(0,col,put(np.repeat(steps,c.latents)))
+            self.kv_versions[slot].index_copy_(0,col,put(np.repeat(np.asarray(kv_versions,np.int64),c.latents)))
+        p=len(partial_versions)
+        if p:
+            self.partial[slot,:p]=put(partial,self.dtype)
+            self.partial_versions[slot,:p]=put(np.asarray(partial_versions,np.int64))
+            self.partial_sources[slot,:p]=put(np.asarray(partial_sources,np.int64))
+        m=len(bank_ends)
+        if m:
+            ends=np.asarray(bank_ends,np.int64)
+            col=put((ends//c.block_steps)%c.memory_blocks)
+            self.bank[slot].index_copy_(0,col,put(bank,self.dtype))
+            self.bank_ends[slot].index_copy_(0,col,put(ends))
+            self.bank_versions[slot].index_copy_(0,col,put(np.asarray(bank_versions,np.int64)))
+            self.bank_sources[slot].index_copy_(0,col,put(np.asarray(bank_sources,np.int64)))
+            self.bank_source_versions[slot].index_copy_(0,col,put(np.asarray(bank_source_versions,np.int64)))
+        self.step_host[slot]=step;self.steps[slot]=step
+
     def gather(self,ids,metadata=True):
         """One batched tensor view, with chronological ring order and padding."""
         c=self.config;b=len(ids);steps=self.steps.index_select(0,ids)
@@ -64,8 +112,7 @@ class BlockSlotState:
                   ends=self.bank_ends.index_select(0,ids).gather(1,bi))
         if not metadata:return read
         read.update(
-                    kv_versions=self.kv_versions.index_select(0,ids).gather(1,ki),bank=bank,
-                    ends=self.bank_ends.index_select(0,ids).gather(1,bi),
+                    kv_versions=self.kv_versions.index_select(0,ids).gather(1,ki),
                     bank_versions=self.bank_versions.index_select(0,ids).gather(1,bi),
                     bank_sources=self.bank_sources.index_select(0,ids).gather(1,bi[:,:,None].expand(-1,-1,c.block_steps)),
                     bank_source_versions=self.bank_source_versions.index_select(0,ids).gather(1,bi[:,:,None].expand(-1,-1,c.block_steps)),
@@ -73,22 +120,25 @@ class BlockSlotState:
                     partial_versions=self.partial_versions.index_select(0,ids))
         return read
 
-    @torch.no_grad()
-    def step(self,memory,z,slots,version=0,source_ids=None,reader=None):
-        c=self.config;host,ids=self._ids(slots);b=len(host)
-        previous=self.gather(ids,metadata=False);steps=previous['steps'];phase=steps%c.block_steps
-        bank=(previous['bank'].to(z.dtype)+memory.memory_slot_embedding).flatten(1,2)
+    def read_inputs(self,memory,ids,dtype):
+        """Reader inputs for these slots: (steps, prefixes, bank, ends, kv_steps)."""
+        c=self.config
+        previous=self.gather(ids,metadata=False)
+        bank=(previous['bank'].to(dtype)+memory.memory_slot_embedding).flatten(1,2)
         # Read before commit: the current block is causally invisible, so do not
         # append it (2056 tokens would round ReaderStepGraph up to 4096).
         ends=previous['ends'].repeat_interleave(c.memory_tokens,1)
         prefixes=tuple((previous['kv'][layer,0],previous['kv'][layer,1]) for layer in range(c.layers))
-        hidden,tokens,current,allowed,mask=(memory.read if reader is None else reader)(
-            z[:,None],steps[:,None],prefixes,bank,ends,previous['kv_steps'])
+        return previous['steps'],prefixes,bank,ends,previous['kv_steps']
+
+    @torch.no_grad()
+    def commit(self,memory,host,ids,steps,z,current,version=0,source_ids=None):
+        """Write the new step. current: [layers,2,b,heads,latents,dh]. Returns completed-block info."""
+        c=self.config;phase=steps%c.block_steps
         columns=(steps[:,None]*c.latents+self.latent_axis)%len(self.kv_axis)
-        current=torch.stack([torch.stack(pair) for pair in current])
         # Only the four new positions are written; never clone a 512-token
         # destination cache merely to scatter four entries back into it.
-        self.kv[:,:,ids[:,None],:,columns,:]=current.permute(2,4,0,1,3,5).to(self.dtype)
+        self.kv[:,:,ids[:,None],:,columns,:]=current.permute(2,4,0,1,3,5).to(self.kv_dtype)
         for name,values in (('kv_steps',steps[:,None].expand(-1,c.latents)),
                             ('kv_versions',torch.full_like(columns,int(version)))):
             getattr(self,name)[ids[:,None],columns]=values
@@ -96,6 +146,7 @@ class BlockSlotState:
         self.partial_versions[ids,phase]=int(version)
         self.partial_sources[ids,phase]=(-1 if source_ids is None else torch.as_tensor(source_ids,device=self.device,dtype=torch.long))
         completed=np.flatnonzero((self.step_host[host]+1)%c.block_steps==0)
+        written=None
         if len(completed):
             _,positions=self._ids(completed);done=ids.index_select(0,positions)
             written=memory.writer(self.partial.index_select(0,done).to(z.dtype))
@@ -106,4 +157,15 @@ class BlockSlotState:
             self.bank_source_versions[done,column]=self.partial_versions.index_select(0,done)
             self.partial_sources.index_fill_(0,done,-1);self.partial_versions.index_fill_(0,done,-1)
         self.step_host[host]+=1;self.steps.index_copy_(0,ids,steps+1)
-        return dict(hidden=hidden,tokens=tokens,local_mask=allowed,memory_mask=mask,positions=steps[:,None])
+        return completed,written
+
+    @torch.no_grad()
+    def step(self,memory,z,slots,version=0,source_ids=None,reader=None):
+        c=self.config;host,ids=self._ids(slots)
+        steps,prefixes,bank,ends,kp=self.read_inputs(memory,ids,z.dtype)
+        hidden,tokens,current,allowed,mask=(memory.read if reader is None else reader)(
+            z[:,None],steps[:,None],prefixes,bank,ends,kp)
+        current=torch.stack([torch.stack(pair) for pair in current])
+        completed,written=self.commit(memory,host,ids,steps,z,current,version,source_ids)
+        return dict(hidden=hidden,tokens=tokens,local_mask=allowed,memory_mask=mask,positions=steps[:,None],
+                    current_kv=current,completed=completed,written=written)

@@ -211,6 +211,9 @@ class BlockLaneService(LaneService):
         self.points[int(bank_index)] = (snapshot.fork(), generation, version, token)
         # A recycled generation's policy object is reused, but all branch state is
         # restored explicitly at begin; no preceding candidate's state is inherited.
+        if generation not in self.actors and hasattr(self.main_actor,'lane_actor'):
+            # A1: teacher generations share the main actor's page store; branch state is a slot row.
+            self.actors[generation] = self.main_actor.lane_actor(teacher, len(self.s.lane_io))
         if generation not in self.actors:
             self.actors[generation] = BlockActor(teacher, len(self.s.lane_io),
                 graph_entities=self.main_actor.graph_entities if self.main_actor is not None else 0,

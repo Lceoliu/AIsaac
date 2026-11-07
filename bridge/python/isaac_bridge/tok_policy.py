@@ -1413,24 +1413,28 @@ class TokPolicy(nn.Module):
         return self.block_memory.resampler(x,pad)
 
     def _forward_block(self, b, entities, packed, need_h, need_vg, temporal):
-        if temporal is None or 'states' not in temporal:
+        if temporal is None or ('states' not in temporal and 'memory_call' not in temporal):
             raise ValueError('block-memory forward requires explicit episode states; old stored-o contexts are not valid')
         z = temporal['encoded'] if 'encoded' in temporal else self.encode_block(b, entities, packed)
-        length = int(temporal.get('length', 1))
-        states = temporal['states']
-        if len(z) != len(states) * length:
-            raise ValueError('block-memory rows must be sequence-major: batch times length')
-        if not temporal.get('reset_done',False):
-            first = b['first'].reshape(len(states), length).bool()
-            if length > 1 and bool(first[:, 1:].any()):
-                raise ValueError('split block-memory training chunks at episode boundaries')
-            states = [self.block_memory.empty(z.device, z.dtype, s.episode) if first[i, 0] else s
-                      for i, s in enumerate(states)]
-        result = self.block_memory(z.reshape(len(states), length, *z.shape[1:]), states,
-                                   version=temporal.get('version', 0),
-                                   replacements=temporal.get('replacements'),
-                                   source_prefixes=temporal.get('source_prefixes'),reader=temporal.get('reader'),
-                                   require_next_state=temporal.get('require_next_state',True))
+        if 'memory_call' in temporal:
+            # A1 slot/paged path: dense actor slots or dense learner batch tensors.
+            result = temporal['memory_call'](z)
+        else:
+            length = int(temporal.get('length', 1))
+            states = temporal['states']
+            if len(z) != len(states) * length:
+                raise ValueError('block-memory rows must be sequence-major: batch times length')
+            if not temporal.get('reset_done',False):
+                first = b['first'].reshape(len(states), length).bool()
+                if length > 1 and bool(first[:, 1:].any()):
+                    raise ValueError('split block-memory training chunks at episode boundaries')
+                states = [self.block_memory.empty(z.device, z.dtype, s.episode) if first[i, 0] else s
+                          for i, s in enumerate(states)]
+            result = self.block_memory(z.reshape(len(states), length, *z.shape[1:]), states,
+                                       version=temporal.get('version', 0),
+                                       replacements=temporal.get('replacements'),
+                                       source_prefixes=temporal.get('source_prefixes'),reader=temporal.get('reader'),
+                                       require_next_state=temporal.get('require_next_state',True))
         o = result['hidden'].flatten(0, 1)
         with torch.autocast(o.device.type, enabled=False):
             zr, zg = self.block_to_spatial(o.float()), self.block_global(o.float())
@@ -1439,7 +1443,7 @@ class TokPolicy(nn.Module):
                 out += (zr,)
             if need_vg:
                 out += (self.gtok.value(zg)[:, 0],)
-        temporal['states_out'] = result['states']
+        temporal['states_out'] = result.get('states',[])
         temporal['block_result'] = result
         temporal['o_seq'], temporal['z_out'] = o, (zr, zg)
         return out

@@ -23,6 +23,7 @@ from .tok_obs import ROW
 from .tok_pickup import ppo_part_terms
 from .tok_teacher2 import teacher_v2_loss
 from .structured_input import from_rows, FRAME_BYTES, VERSION
+from .block_paged import PagedSnapshot, PagedPayload, forward_chunks_paged
 
 CUDA_CAPTURE_ADMISSION = threading.RLock()
 
@@ -502,6 +503,8 @@ def move_snapshots(snapshots, device, materialize=True):
 
 def pack_snapshots(snapshots):
     """Trusted internal IPC/checkpoint payload; references are deduplicated by pickle."""
+    if snapshots and all(isinstance(s,PagedSnapshot) for s in snapshots):
+        return PagedPayload(snapshots)   # in-process hand-off: descriptors, no serialisation
     import lz4.frame
     stream = io.BytesIO()
     from .structured_input import SCHEMA
@@ -515,6 +518,8 @@ def pack_snapshots(snapshots):
 
 def unpack_snapshots(payload, device):
     # Only accept payloads emitted by this training job, not arbitrary user files.
+    if isinstance(payload,PagedPayload):
+        return list(payload)
     from .structured_input import SCHEMA
     if payload.startswith(b'\x04\x22\x4d\x18'):
         import lz4.frame
@@ -633,6 +638,10 @@ def forward_chunks(model, chunks, generator=None, train_history=True, version=0,
     """
     if not chunks:
         raise ValueError("forward_chunks requires a nonempty batch")
+    if isinstance(chunks[0].snapshot,PagedSnapshot):
+        return forward_chunks_paged(model,chunks,generator=generator,train_history=train_history,version=version,
+                                    spatial_micro=spatial_micro,require_next_state=require_next_state,
+                                    deduplicate_sources=deduplicate_sources)
     length = len(chunks[0].rows)
     if any(len(c.rows) != length for c in chunks):
         raise ValueError("bucket chunks by decision length before forward_chunks")

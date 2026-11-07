@@ -1,0 +1,381 @@
+"""A1 equivalence gates: production slot/paged path against the object reference.
+
+Fixed weights and fixed random numbers. The object path (BlockActor / Snapshot /
+forward_chunks over EpisodeMemory) is the reference; SlotBlockActor / PagedSnapshot /
+forward_chunks_paged is the production path.
+"""
+import copy
+import gc
+
+import numpy as np
+import pytest
+import torch
+
+from test_block_memory import make_policy
+from test_visible_input import synth_rows, synth_pending
+from isaac_bridge.block_training import (BlockActor, Chunk, forward_chunks, forward_bucketed, ppo_loss, cf_loss,
+                                         injury_loss, pack_snapshots, unpack_snapshots)
+from isaac_bridge.block_paged import SlotBlockActor, PagedSnapshot, PagedPayload
+from train_tok import Rollout, store, gae
+
+DEV = ['cpu'] + (['cuda'] if torch.cuda.is_available() else [])
+TOL = dict(rtol=2e-5, atol=2e-6)
+
+
+def pair(device='cpu', slots=4, seed=7, graph=0, bf16=False):
+    torch.manual_seed(seed)
+    m = make_policy(device).eval()
+    ref = copy.deepcopy(m)
+    return m, ref, SlotBlockActor(m, slots, graph_entities=graph, bf16=bf16), BlockActor(ref, slots, graph_entities=graph, bf16=bf16)
+
+
+def frame(rng, n, t, episode, first):
+    rows = synth_rows(rng, n)
+    rows['first'] = first
+    rows['episode'] = episode
+    rows['t'] = t
+    rows['done'] = 0
+    return rows
+
+
+def compare_state(new, old, slot, nslot=None):
+    """Arena row vs object EpisodeMemory: step, short K/V, bank, open tail."""
+    nslot = slot if nslot is None else nslot
+    mem = old.memory[slot]
+    st = new.state
+    g = st.gather(st._ids([nslot])[1])
+    assert int(st.step_host[nslot]) == mem.step
+    n = len(mem.kv_steps)
+    torch.testing.assert_close(g['kv_steps'][0, :n].cpu(), mem.kv_steps.cpu(), rtol=0, atol=0)
+    assert (g['kv_steps'][0, n:] == -1).all()
+    for layer in range(len(mem.kv)):
+        for j in (0, 1):
+            torch.testing.assert_close(g['kv'][layer, j, 0, :, :n].float().cpu(), mem.kv[layer][j].float().cpu(), **TOL)
+    for k, block in enumerate(mem.blocks):
+        assert int(g['ends'][0, k]) == block.end_step
+        torch.testing.assert_close(g['bank'][0, k].cpu(), block.value.float().cpu(), **TOL)
+    assert (g['ends'][0, len(mem.blocks):] == -1).all()
+    p = len(mem.partial)
+    torch.testing.assert_close(g['partial'][0, :p].cpu(), mem.partial.float().cpu(), **TOL)
+
+
+def compare_result(a, b):
+    for x, y in zip(a, b):
+        torch.testing.assert_close(x.float(), y.float(), **TOL)
+
+
+@pytest.mark.parametrize('device', DEV)
+def test_stepwise_actor_outputs_states_reset_room_change_and_fifo(device):
+    m, ref, new, old = pair(device)
+    rng = np.random.default_rng(3)
+    episodes = np.array([1, 1, 1, 1])
+    blocks_seen = 0
+    for t in range(23):
+        first = np.zeros(4, np.int64)
+        if t == 0:
+            first[:] = 1
+        if t == 9:            # one episode reset mid-stream
+            first[2] = 1; episodes[2] += 1
+        rows = frame(rng, 4, t, episodes, first)
+        if t == 13:           # room change inside an episode: memory continues
+            rows['room_type'] = rows['room_type'] + 1
+        pending = synth_pending(rng, 4, m.heads)
+        keys = (np.full(4, t), np.arange(4))
+        compare_result(new.step(rows, pending, range(4), ukeys=keys), old.step(rows, pending, range(4), ukeys=keys))
+        np.testing.assert_allclose(new.host_output, old.host_output, rtol=2e-5, atol=2e-6)
+        for s in range(4):
+            compare_state(new, old, s)
+            np.testing.assert_array_equal(new.pending[s], old.pending[s])
+        blocks_seen = max(blocks_seen, len(old.memory[0].blocks))
+    cfg = m.block_memory.config
+    # FIFO wrapped: more blocks completed than the bank holds.
+    assert old.memory[0].step // cfg.block_steps > cfg.memory_blocks and blocks_seen == cfg.memory_blocks
+    # Snapshots are paged descriptors; contexts are pre-observation states.
+    ctx = new.last_contexts[0]
+    assert isinstance(ctx, PagedSnapshot) and ctx.step == old.last_contexts[0].memory.step
+
+
+@pytest.mark.parametrize('device', DEV)
+def test_fork_restore_siblings_and_main_isolation(device):
+    m, ref, new, old = pair(device, slots=2, seed=11)
+    lane_new = new.lane_actor(m, 3)
+    lane_old = BlockActor(ref, 3)
+    rng = np.random.default_rng(5)
+    for t in range(7):
+        rows = frame(rng, 2, t, np.array([1, 1]), int(t == 0))
+        pending = synth_pending(rng, 2, m.heads)
+        new.step(rows, pending, [0, 1]); old.step(rows, pending, [0, 1])
+    snap_new, snap_old = new.snapshot(0).fork(), old.snapshot(0).fork()
+    for lane in range(3):
+        lane_new.restore(lane, snap_new); lane_old.restore(lane, snap_old)
+        compare_state(lane_new, lane_old, lane)
+    for t in range(9):
+        # siblings get different observations; main keeps going
+        rows = frame(rng, 3, 100+t, np.array([1, 1, 1]), 0)
+        pending = synth_pending(rng, 3, m.heads)
+        keys = (np.full(3, t), np.arange(3))
+        compare_result(lane_new.step(rows, pending, [0, 1, 2], ukeys=keys),
+                       lane_old.step(rows, pending, [0, 1, 2], ukeys=keys))
+        rows = frame(rng, 2, 7+t, np.array([1, 1]), 0)
+        pending = synth_pending(rng, 2, m.heads)
+        keys = (np.full(2, 50+t), np.arange(2))
+        compare_result(new.step(rows, pending, [0, 1], ukeys=keys), old.step(rows, pending, [0, 1], ukeys=keys))
+        for lane in range(3):
+            compare_state(lane_new, lane_old, lane)
+        compare_state(new, old, 0)
+    # A sibling replayed alone from the same snapshot gives the same answer: no cross-sibling leakage.
+    solo = new.lane_actor(m, 1)
+    solo.restore(0, snap_new)
+    rows = frame(rng, 1, 0, np.array([1]), 0)
+    pending = synth_pending(rng, 1, m.heads)
+    lane_new.restore(1, snap_new)
+    a = solo.step(rows, pending, [0], ukeys=(np.array([9]), np.array([0])))
+    b = lane_new.step(rows, pending, [1], ukeys=(np.array([9]), np.array([0])))
+    compare_result(a, b)
+
+
+@pytest.mark.parametrize('device', DEV)
+def test_merged_main_and_lane_batch_matches_separate_calls(device):
+    m, ref, new, old = pair(device, slots=2, seed=13)
+    lane_new = new.lane_actor(m, 2)
+    lane_old = BlockActor(ref, 2)
+    rng = np.random.default_rng(13)
+    for t in range(5):
+        rows = frame(rng, 2, t, np.array([1, 1]), int(t == 0))
+        pending = synth_pending(rng, 2, m.heads)
+        new.step(rows, pending, [0, 1]); old.step(rows, pending, [0, 1])
+    lane_new.restore(0, new.snapshot(1)); lane_new.restore(1, new.snapshot(0))
+    lane_old.restore(0, old.snapshot(1)); lane_old.restore(1, old.snapshot(0))
+    for t in range(6):
+        rows = frame(rng, 4, 10+t, np.array([1, 1, 1, 1]), 0)
+        pending = synth_pending(rng, 4, m.heads)
+        u = torch.rand((4, sum(m.heads)), device=device)
+        # interleaved owner order exercises the permutation path
+        order = [0, 2, 1, 3]
+        slots = [0, 0, 1, 1]
+        owners_n = [new, lane_new, new, lane_new]
+        owners_o = [old, lane_old, old, lane_old]
+        r, p = rows[order], pending[order]
+        compare_result(new.step(r, p, slots, owners=owners_n, uniform=u[order]),
+                       old.step(r, p, slots, owners=owners_o, uniform=u[order]))
+        np.testing.assert_allclose(new.host_output, old.host_output, rtol=2e-5, atol=2e-6)
+        np.testing.assert_allclose(lane_new.host_output, lane_old.host_output, rtol=2e-5, atol=2e-6)
+        for s in range(2):
+            compare_state(new, old, s); compare_state(lane_new, lane_old, s)
+
+
+def _collect_rollout(device, n=29, seed=21):
+    m, ref, new, old = pair(device, slots=2, seed=seed)
+    rng = np.random.default_rng(seed)
+    rolls = [Rollout(2, 40, 5, value_g=True, block_steps=4) for _ in range(2)]
+    episodes = np.array([1, 1])
+    for t in range(n):
+        first = np.array([int(t == 0), int(t == 0)])
+        if t == 11:
+            first[1] = 1; episodes[1] += 1
+        rows = frame(rng, 2, t, episodes, first)
+        pending = synth_pending(rng, 2, m.heads)
+        keys = (np.full(2, t), np.arange(2))
+        for actor, roll in ((new, rolls[0]), (old, rolls[1])):
+            result = actor.step(rows, pending, [0, 1], ukeys=keys)
+            action, lp, v, vg = [x.float().cpu().numpy() for x in result]
+            store(roll, np.array([0, 1]), rows, pending, action.astype(np.int64), lp, v, 0, vg=vg,
+                  block_context=actor.last_contexts)
+            roll.reward[:, t] = .1
+    return m, ref, new, old, rolls
+
+
+def _losses(model, out, batch, rng_seed):
+    g = torch.Generator().manual_seed(rng_seed)
+    n = len(out[0])
+    actions = torch.stack([torch.randint(0, k, (n,), generator=g) for k in model.heads], 1).to(out[0].device)
+    adv = torch.randn(n, generator=g).to(out[0].device)
+    ret = torch.randn(n, generator=g).to(out[0].device)
+    blp = -torch.rand(n, generator=g).to(out[0].device)
+    loss, _ = ppo_loss(model, out, batch, actions, blp, adv, ret, global_returns=ret)
+    return loss
+
+
+@pytest.mark.parametrize('device', DEV)
+def test_learner_rollout_chunks_ppo_loss_and_all_gradients(device):
+    m, ref, new, old, rolls = _collect_rollout(device)
+    _, _, mask = gae(rolls[0], .99, .95)
+    plans = [r.block.plan(r, mask) for r in rolls]
+    assert [len(c.rows) for c in plans[0]['chunks']] == [len(c.rows) for c in plans[1]['chunks']]
+    assert all(isinstance(c.snapshot, PagedSnapshot) for c in plans[0]['chunks'])
+    m.train(); ref.train()
+    outs = []
+    for model, plan in ((m, plans[0]), (ref, plans[1])):
+        out, ctx = forward_bucketed(model, plan['chunks'], generator=torch.Generator().manual_seed(5))
+        rows = np.concatenate([c.rows for c in plan['chunks']])
+        pend = np.concatenate([c.pending for c in plan['chunks']])
+        from isaac_bridge.structured_input import from_rows
+        batch = from_rows(rows, device, pend)
+        loss = _losses(model, out, batch, 3)
+        loss.backward()
+        outs.append((loss.detach(), out, ctx['recompute_stats']))
+    torch.testing.assert_close(outs[0][0], outs[1][0], rtol=1e-5, atol=1e-6)
+    for x, y in zip(outs[0][1], outs[1][1]):
+        torch.testing.assert_close(x.detach(), y.detach(), rtol=1e-5, atol=2e-6)
+    assert outs[0][2]['selected_blocks'] == outs[1][2]['selected_blocks'] > 0
+    # values the learner recomputes equal the actor's stored values
+    torch.testing.assert_close(outs[0][1][1].detach().cpu(), torch.from_numpy(rolls[0].value.reshape(-1)[plans[0]['pos']]),
+                               rtol=3e-5, atol=3e-6)
+    pa, pb = dict(m.named_parameters()), dict(ref.named_parameters())
+    touched = 0
+    for name in pa:
+        ga, gb = pa[name].grad, pb[name].grad
+        assert (ga is None) == (gb is None), name
+        if ga is not None:
+            torch.testing.assert_close(ga, gb, rtol=1e-4, atol=5e-6, msg=name)
+            touched += int(ga.abs().sum() > 0)
+    assert pa['block_memory.writer.queries'].grad.abs().sum() > 0
+    assert pa['structured_spatial.body.0.weight'].grad.abs().sum() > 0
+    assert touched > 20
+
+
+@pytest.mark.parametrize('device', DEV)
+@pytest.mark.parametrize('kind', ['cf', 'injury'])
+def test_learner_teacher_records_cf_injury_loss_and_gradients(device, kind):
+    m, ref, new, old = pair(device, slots=3, seed=31)
+    rng = np.random.default_rng(31)
+    chunks = ([], [])
+    for t in range(19):
+        rows = frame(rng, 3, t, np.array([1, 1, 1]), int(t == 0))
+        pending = synth_pending(rng, 3, m.heads)
+        if t >= 6:   # one-row teacher records at assorted phases (incl. ones that complete a block)
+            for i in range(3):
+                chunks[0].append(Chunk(rows[i:i+1].copy(), pending[i:i+1].copy(), new.snapshot(i)))
+                chunks[1].append(Chunk(rows[i:i+1].copy(), pending[i:i+1].copy(), old.snapshot(i)))
+        new.step(rows, pending, range(3)); old.step(rows, pending, range(3))
+    # IPC hand-off: in-process descriptors, never serialised
+    packed = pack_snapshots([c.snapshot for c in chunks[0]])
+    assert isinstance(packed, PagedPayload) and unpack_snapshots(packed, 'cpu')[0] is chunks[0][0].snapshot
+    m.train(); ref.train()
+    losses = []
+    for model, cs in ((m, chunks[0]), (ref, chunks[1])):
+        out, _ = forward_bucketed(model, cs, max_rows=8, generator=torch.Generator().manual_seed(17))
+        n = len(cs)
+        g = torch.Generator().manual_seed(2)
+        if kind == 'cf':
+            actions = torch.stack([torch.randint(0, k, (n,), generator=g) for k in model.heads], 1).to(device)
+            rows = np.concatenate([c.rows for c in cs]); pend = np.concatenate([c.pending for c in cs])
+            from isaac_bridge.structured_input import from_rows
+            batch = from_rows(rows, device, pend)
+            loss = cf_loss(model, out, batch, actions, torch.rand(n, generator=g).to(device),
+                           torch.randn(n, generator=g).to(device), .4, 1., .25)
+            loss = loss[0] if isinstance(loss, tuple) else loss
+        else:
+            meta = torch.randint(0, 2, (n, 16), generator=g).to(device)
+            loss = injury_loss(out[0], out[2], meta, .4, 1., 1.)
+        loss.backward()
+        losses.append(loss.detach())
+    torch.testing.assert_close(losses[0], losses[1], rtol=1e-5, atol=1e-6)
+    pa, pb = dict(m.named_parameters()), dict(ref.named_parameters())
+    for name in pa:
+        if pa[name].grad is not None or pb[name].grad is not None:
+            torch.testing.assert_close(pa[name].grad, pb[name].grad, rtol=1e-4, atol=5e-6, msg=name)
+    assert pa['block_memory.writer.queries'].grad.abs().sum() > 0
+
+
+def test_cross_rollout_carry_keeps_pre_observation_snapshot():
+    m, ref, new, old, rolls = _collect_rollout('cpu', n=13)
+    carries = []
+    for roll in rolls:
+        carry = Rollout(2, 40, 5, value_g=True, block_steps=4)
+        carry.carry(roll)
+        carries.append(carry)
+    for w in range(2):
+        a, b = carries[0].block.starts[w][0], carries[1].block.starts[w][0]
+        assert a is rolls[0].block.open[w][1] and a.step == b.memory.step
+    mask = np.zeros((2, 40), bool); mask[:, 0] = True
+    outs = []
+    for model, carry in ((m, carries[0]), (ref, carries[1])):
+        plan = carry.block.plan(carry, mask)
+        with torch.no_grad():
+            outs.append(forward_bucketed(model, plan['chunks'], train_history=False)[0])
+    compare_result(outs[0], outs[1])
+    torch.testing.assert_close(outs[0][1], torch.from_numpy(carries[0].value[:, 0]), rtol=3e-5, atol=3e-6)
+
+
+def test_leases_keep_referenced_history_and_free_the_rest():
+    m, ref, new, old = pair('cpu', slots=2, seed=41)
+    rng = np.random.default_rng(41)
+    held_new = held_old = None
+    for t in range(40):
+        rows = frame(rng, 2, t, np.array([1, 1]), int(t == 0))
+        pending = synth_pending(rng, 2, m.heads)
+        if t == 12:
+            held_new, held_old = new.snapshot(0), old.snapshot(0)
+            held_rows, held_pending = rows[:1].copy(), pending[:1].copy()
+        new.step(rows, pending, [0, 1]); old.step(rows, pending, [0, 1])
+        if t % 5 == 4:
+            gc.collect(); new.store.collect()
+    gc.collect()
+    stats = new.store.collect()
+    cfg = m.block_memory.config
+    # Far more decisions were made than are kept: only live windows/banks/sources survive.
+    assert new.store.next_decision == 80 and stats['kv'] < 80 and stats['freed_kv'] + new.store.freed['kv'] > 0
+    # The held snapshot (FIFO long since wrapped on the live slot) is still exact.
+    chunk_n = [Chunk(held_rows, held_pending, held_new)]
+    chunk_o = [Chunk(held_rows, held_pending, held_old)]
+    with torch.no_grad():
+        a = forward_chunks(m, chunk_n, generator=torch.Generator().manual_seed(1))[0]
+        b = forward_chunks(ref, chunk_o, generator=torch.Generator().manual_seed(1))[0]
+    compare_result(a, b)
+    lane = new.lane_actor(m, 1); lane.restore(0, held_new)
+    lane_o = BlockActor(ref, 1); lane_o.restore(0, held_old)
+    compare_state(lane, lane_o, 0)
+    before = new.store.stats()['kv_rows']
+    del chunk_n, held_new, lane
+    gc.collect()
+    after = new.store.collect()
+    assert after['kv'] < before and after['freed_raw'] > 0
+
+
+def test_object_and_paged_reject_mixed_stores():
+    m, ref, new, old = pair('cpu', slots=1)
+    other = SlotBlockActor(m, 1)
+    rows = frame(np.random.default_rng(1), 1, 0, np.array([1]), 1)
+    new.step(rows, synth_pending(np.random.default_rng(1), 1, m.heads), [0])
+    with pytest.raises(ValueError):
+        other.restore(0, new.snapshot(0))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA graph slot path')
+@pytest.mark.parametrize('bf16', [False, True])
+def test_graph_slot_actor_matches_object_graph_actor(bf16):
+    m, ref, new, old = pair('cuda', slots=4, seed=51, graph=128, bf16=bf16)
+    rng = np.random.default_rng(51)
+    tol = dict(rtol=.02, atol=.02) if bf16 else TOL
+    for t in range(12):
+        rows = frame(rng, 4, t, np.array([1, 1, 1, 1]), int(t == 0))
+        pending = synth_pending(rng, 4, m.heads)
+        keys = (np.full(4, t), np.arange(4))
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+            a = new.step(rows, pending, range(4), ukeys=keys)
+            b = old.step(rows, pending, range(4), ukeys=keys)
+        for x, y in zip(a[1:], b[1:]):
+            torch.testing.assert_close(x.float(), y.float(), **tol)
+        if not bf16:
+            torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
+    assert new.reader.replays == 12
+
+
+def test_microbatched_checkpointed_spatial_matches_reference_gradients():
+    m, ref, new, old, rolls = _collect_rollout('cpu', n=21, seed=61)
+    _, _, mask = gae(rolls[0], .99, .95)
+    plans = [r.block.plan(r, mask) for r in rolls]
+    m.train(); ref.train()
+    res = []
+    for model, plan, micro in ((m, plans[0], 3), (ref, plans[1], 512)):
+        out, _, _, _ = forward_chunks(model, [c for c in plan['chunks'] if len(c.rows) == 4],
+                                      generator=torch.Generator().manual_seed(8), spatial_micro=micro)
+        loss = out[1].square().mean()+out[0].float().logsumexp(-1).mean()
+        loss.backward()
+        res.append(loss.detach())
+    torch.testing.assert_close(res[0], res[1], rtol=1e-5, atol=1e-6)
+    pa, pb = dict(m.named_parameters()), dict(ref.named_parameters())
+    for name in pa:
+        if pa[name].grad is not None or pb[name].grad is not None:
+            torch.testing.assert_close(pa[name].grad, pb[name].grad, rtol=1e-4, atol=5e-6, msg=name)
