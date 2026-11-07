@@ -36,9 +36,10 @@ def pack_canvas(x,bits,scales):
 
 
 def unpack_canvas(x,bits,scales):
-    shifts=x.new_tensor(np.cumsum((0,)+tuple(bits[:-1])),dtype=torch.int64)
-    masks=x.new_tensor([2**n-1 for n in bits],dtype=torch.int64)
-    return ((x.long()[...,None]>>shifts)&masks).float()/x.new_tensor(scales)
+    # Python-int shifts/masks/scales: no host tensor constants (their host->device copy is not
+    # allowed inside a CUDA graph capture); Inductor fuses the per-channel stack (B42 glue 2).
+    w=x.long()
+    return torch.stack([((w>>sum(bits[:i]))&(2**bits[i]-1)).float()/float(scales[i]) for i in range(len(bits))],-1)
 
 
 def pack_room(x):
@@ -122,8 +123,7 @@ def decode_frame(raw, sizes, versions, counts=None):
             counts_d = counts_d.pin_memory()
         counts_d = counts_d.to(f.device, non_blocking=True)
         p,e,n,s = counts_d.unbind(1)
-    b = {'v_room': unpack_room(f[:,HEADER:HEADER+1792]).transpose(1,2).reshape(-1,RC,16,28),
-         'v_map': unpack_canvas(f[:,HEADER+1792:FIXED],(1,)*8,(1,)*8).transpose(1,2).reshape(-1,8,13,13)}
+    b = {}
     offset = torch.full_like(p, FIXED)
     for name, count, bucket in zip(RAGGED, (p,p,e,n,s), widths):
         width = RAGGED[name]
@@ -134,7 +134,10 @@ def decode_frame(raw, sizes, versions, counts=None):
         b['v_'+name] = values.masked_fill(~valid[:,:,None],0)
         b['v_'+name+'_mask'] = valid
         offset = offset+count*width
-    b['v_local']=unpack_room(b['v_local']).transpose(2,3).flatten(2)
+    # B42: the same fused per-bucket bitplane expansion as the host-decoded path (from_host).
+    with torch.inference_mode(False),torch.no_grad(),torch.autocast(f.device.type,enabled=False):
+        b['v_room'],b['v_local'],b['v_map'] = canvas_decoder()(
+            f[:,HEADER:HEADER+1792].contiguous(),b['v_local'],f[:,HEADER+1792:FIXED].contiguous())
     return b
 
 
@@ -201,12 +204,15 @@ def expand_canvases(room,local,minimap):
 
 @lru_cache(maxsize=1)
 def canvas_decoder():
-    # Shape-polymorphic Inductor kernels; no CUDA-graph-owned output buffers.
-    # The FX-tracing flag is process-global: a compile in the learner thread made the actor
-    # thread's compiled call raise (B42 prof-f0). Nested calls then run eagerly instead.
-    import torch._dynamo
-    torch._dynamo.config.error_on_nested_fx_trace=False
-    return torch.compile(expand_canvases,fullgraph=True,dynamic=True)
+    # B42: one fused Inductor kernel set per body bucket {1,2,4} (static token shapes, batch
+    # symbolic): the room/local/minimap bitplane unpack of every decoder. No CUDA-graph-owned
+    # output buffers. Off the GPU (CPU tests) the eager expansion.
+    from .block_compile import compile_batch_dynamic
+    compiled=compile_batch_dynamic(expand_canvases)
+    def call(room,local,minimap):
+        if room.device.type!='cuda':return expand_canvases(room,local,minimap)
+        return compiled(room,local,minimap)
+    return call
 
 
 def _unpack_room_host(x):
