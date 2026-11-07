@@ -232,7 +232,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 
 新输入与块记忆共同构成本轮模型。所有权重（包括Spatial、输出头、Reader、Writer、aux与priv）及优化器从随机零步初始化；禁止C99及其任何派生initial.pt/checkpoint。只允许同一新schema训练产生的严格续训。保留PPO、反事实搜索与伤害教师。
 
-- **正确性**：按9.13.3–9.13.4使用128步chunk、独立32步Writer块和最多2个历史块重算；逐步actor与并行learner同历史输出对齐，未来不泄漏，选中源块有正确Spatial/Writer梯度，未选缓存detach；reset/分支恢复不串状态。
+- **正确性**：按9.13.3–9.13.4使用128步chunk、独立32步Writer块和默认4个窗外历史块重算（4/8可配置）；逐步actor与并行learner同历史输出对齐，未来不泄漏，选中源块有正确Spatial/Writer梯度，未选缓存detach；reset/分支恢复不串状态。
 - **缓存等价性**：缓存开/关的前向和梯度一致；逐项变化 ID/count/owner/charge/map/door/known mask 等会触发相应失效；不可见隐藏字段变化不影响 actor；测试重复源多消费者的梯度求和。目标是被缓存的模块少算，不是省略当前信息。
 - **记忆能力**：覆盖长于 256 步、跨 rollout、长房间与超过 128 次访问；沿用此前随机背景下失败的延迟线索任务，再测试真实游戏回头交互。非零梯度和简单线索成功不是正式游戏能力证明。
 - **速度**：固定硬件/并发、输入分布与完整训练机制，按既有基准跑足稳态；计入采集、IPC、缓存查询/失效、actor 权重刷新、历史重算和教师成本。分别报告组件命中率×编码耗时、Spatial/Writer/Reader 时间、FPS、actor p50/p95、峰值显存及原始历史存储。命中率本身不是提速率。
@@ -300,7 +300,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 保持现有PPO目标、奖励、behavior log-prob、value/bootstrap、GAE／截断语义、优化步数和有界overlap。新训练chunk固定128决策步；逻辑batch、优化器步数和采样预算在对照中保持一致。
 
 - 样本包括当前观察、历史块引用、短期上下文、episode／位置和版本。保留历史原始观察引用；只有旧latent不能训练Spatial来源。
-- 128步chunk内部按当前参数重算；chunk前的短期逐层KV直接作为detached输入，不做无界burn-in。跨chunk边界的32步Writer块用原始观察补齐，归为本chunk完成的块，不占额外历史重算预算。每个chunk另重算最多2个历史块：chunk开始前最近的可用完整块＋其余更老可用块中均匀抽取1个，无放回；不足时使用实际存在的块。
+- 128步chunk内部按当前参数重算；chunk前的短期逐层KV直接作为detached输入，不做无界burn-in。跨chunk边界的32步Writer块用原始观察补齐，归为本chunk完成的块，不占额外历史重算预算。每个chunk另从短窗外（end_step <= chunk_start - window）均匀无放回重算历史块；`--block-history-blocks` 默认4，保留4/8消融，预算不足时取全部。取消必选最新块，避免把预算花在短窗已可见的内容上。
 - 被选块用当前Spatial→Writer重算、替换对应摘要并接入当前loss；其他历史摘要detach。每个query仍执行时间和FIFO可见mask。更新时重新采样，不用attention Top-K垄断梯度选择。
 - 同一逻辑minibatch中重复源可去重编码并累积梯度；优化器步后不复用带图结果。不保留跨更新源图，不执行旧v3式延迟源梯度。
 - 这是固定预算、截断历史的梯度近似，不是全历史完整或无偏梯度。独立Writer允许直接重算远期块，无需展开其到当前之间的所有时间状态。
@@ -321,7 +321,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 - 分叉快照在当前观察尚未消费前取得，包含环境恢复身份、短期KV、完整bank、未完成32步块的latent和源引用、episode/时间/块位置、mask、在途动作以及模型／缓存版本。
 - 保留一拍动作延迟：分支第一步执行已在途动作，新选择从下一步生效。
 - 已完成历史块只读共享；短期状态、未完成块和新增摘要为分支私有尾部。复跑必须从同一快照恢复，不能承接上个候选状态。假想未来不得进入主轨迹或兄弟分支记忆。
-- 搜索目标可来自未来回报，但选择点的输入不得包含搜索未来观察或摘要。搜索过程无梯度；learner重算Reader并按2块预算重算历史，使教师loss可训练Writer和Spatial。
+- 搜索目标可来自未来回报，但选择点的输入不得包含搜索未来观察或摘要。搜索过程无梯度；learner重算Reader并按可配置窗外历史预算重算，使教师loss可训练Writer和Spatial。
 - 教师记录新增快照和历史源引用；不能仅存旧o_prev/o就认为完成接线。同一起点的胜出短轨迹合组处理，避免每条教师记录复制bank。
 - 保留GPU lane动态合批、异步回复、请求序号验证与批次无关随机数。同lane有序，不同分支可混批；游戏RNG复跑与策略采样随机流分别管理。
 
@@ -331,7 +331,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 
 全部参数从随机零步初始化，旧Spatial也禁止迁移。`--init`在新模型入口明确拒绝；checkpoint/job/snapshot必须带新schema，旧格式拒绝。初始记忆、rollout、双教师buffer和Adam为空，不混入旧PPO数据。
 
-以下为实施验收要求。**第1–5项和第6项的本轮单4090稳定性/速度测量已完成；同条件旧主干性能比较、多GPU和第7项长期学习收益尚未验收，不自动替换生产**：
+以下为实施验收要求。**旧输入v1的r8/r2/aligned功能结果已完成并保留于下文；11-07审核修订的输入v2/相对位置/窗外历史预算不能沿用它们的验收结论。新一轮端到端验收、同条件旧主干性能比较、多GPU和第7项长期学习收益尚未完成，不自动替换生产**：
 1. 固定权重与相同历史缓存下，逐步actor／并行learner／搜索分支对齐；未来观察改变不影响过去输出，空bank无非有限值。
 2. 32步块边界、128步短窗、256块FIFO、episode reset、换房不reset、跨rollout块延续正确。
 3. fork/restore与无fork重放在状态、动作延迟和随机流上一致；分支不互相污染，batch顺序不改变请求随机数。
@@ -416,6 +416,16 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 
 成熟learner补充证据：`D:/Projects/fortune/Isaac/analysis/model-design-20261106/new-input-20261107/performance-fix/native-learner-optimization`；`ROLLBACK.sh --native-learner`恢复到本轮修改之前。
 
+**11-07 Claude 审核落实（组件阶段，不是新一轮速度验收）：**
+
+- B3/B4已接生产调用：默认4个短窗外均匀历史块；Reader不再使用绝对时间正弦，短窗采用可学习决策距离bias，长期memory_age保留；Writer只保留块内位置。任意共同时间平移不改变输出、KV、mask；CPU梯度精确不变，GPU Flex的memory_age原子累积采用独立舍入容差（同输入重复已观察到4.55e-13差异），不套用跨backend BF16宽容差。旧v1权重不做隐式迁移。
+- C5–C8已接观测→协议→Spatial：schema为`isaac-visible-prlmens-g-v2`、版本2026110702，P=80维；stage、32位curse、5类溢出计数进入每个P。E优先互动物/出口→怪物→随从→弹幕→其他，类内按距最近身体排序，稳定保留128；R中的门/地形出口本来不受E上限约束。N/S仍完整。取消新输入全部use存在性/充能mask。L以9×9卷积、展平投影保留布局，仍每身体一个token。Unknown健康遮蔽通过非零健康的开/关对照验证。
+- 最新本地`pytest tests`：105通过、27硬件/平台跳过；4090组件GPU单测覆盖slot核心、相对偏置/Flex/SDPA及梯度、graph/replay/publish、输入修正。GPU初次失败包含fixture的head维8低于Flex最小16，以及跨backend BF16误差0.00817超过初设0.004；修正fixture并分离backend舍入与同backend平移不变门，保留FP32严格门与原梯度阈值。所有失败及重测保留在review-unit事件与XML，不当作速度提升。
+- A1仅完成`BlockSlotState`张量执行核心：GPU bank/KV/partial、索引reset/fork、先读后Writer提交、源版本保存；固定权重CPU逐步/FIFO/fork对照已通过。**尚未替换线上BlockActor/BlockLaneService、不可变分页快照、源租约和learner rollout取批；RawHistory.append与对象reference仍在生产路径。不能称A1完成，也不能用核心单测推断200×。**
+- A2正式比较固定单4090、同worker、rollout32768、minibatch8192/micro8192、CF6点/180秒、teacher-share0.1，先旧c45a583后新模型，全随机初始化；双方其余teacher batch/reuse/weight、epochs、aux、critic、起始分布也须显式一致。旧smoke加载C99，旧pred_host还会把8192改成4096，均不能复用。官方X_old(4090)尚未测出。
+- D9：原候选已提交并推送到`exp/block-memory-v1`，基底提交`f3264e0a5850892fb97bbed7ea997923d12a301b`；本段新增审核修改单独提交，不改变生产树。D10：`bridge/abplus/EXPERIMENTS.md` B41统一归档全部4090结果、游戏小时、失败及口径，压力×实时数不作为正式A2比较。
+- 验收顺序：先完成A1生产集成与状态/梯度等价门，再同口径旧→新对照；组件GPU单测不冒充完整回归、两次冒烟、离线50或在线40稳态。所有未完成项目保留，禁止重启已退出130的旧native压力门。
+
 #### 9.13.7 依据与机器可读定案
 
 - [Perceiver IO](https://arxiv.org/html/2107.14795)：learned queries读取变长输入。四槽／八槽是本项目选型，不是论文最优结论。
@@ -492,8 +502,9 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "decision_chunk_steps": 128,
     "prefix_kv": "stored_detached",
     "cross_boundary_writer_source": "complete_from_raw_observations",
-    "historical_recompute_blocks_per_chunk": 2,
-    "history_sampling": "one_recent_one_uniform_older",
+    "historical_recompute_blocks_per_chunk": 4,
+    "history_sampling": "uniform_without_replacement_end_step_le_chunk_start_minus_window",
+    "history_budget_cli": "--block-history-blocks; ablate 4/8",
     "full_episode_bptt": false,
     "persistent_source_graph": false,
     "new_compression_loss": false
@@ -534,17 +545,19 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
   },
   "initialization": "all_random_zero_step_no_C99_or_derivatives",
   "observation": {
-    "schema": "isaac-visible-prlmens-g-v1",
-    "P": "per body, visible only, no inventory/patch pooling",
+    "schema": "isaac-visible-prlmens-g-v2",
+    "version": 2026110702,
+    "P": "per body, 80 fields, stage + 32 curse bits + 5 entity-overflow counts",
     "R": 28,
-    "L": "one per body",
+    "L": "one per body, 9x9 convolution + flatten projection; no global average pooling",
     "M": "legal visible map",
     "E": 128,
     "N": "all distinct owner/item/count records",
     "S": "all actual slots including secondary active/battery",
     "G": "learned query",
     "transport_bytes": 131072,
-    "overflow": "reject whole frame; never truncate N/S"
+    "overflow": "E priority+distance to128 with category counts; never truncate N/S; reject transport byte overflow",
+    "use_action_masks": "none"
   }
 }
 ```

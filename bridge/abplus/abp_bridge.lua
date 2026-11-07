@@ -1946,8 +1946,8 @@ end
 -- with the same total count cannot hide behind the legacy inventory cache.
 function visible_input_block()
 	local game, config = Game(), Isaac.GetItemConfig()
-	local result = { schema = "isaac-visible-prlmens-g-v1", bodies = {}, inventory = {}, slots = {},
-		curses = game:GetLevel():GetCurses(), capabilities = 1 }
+	local result = { schema = "isaac-visible-prlmens-g-v2", bodies = {}, inventory = {}, slots = {},
+		curses = game:GetLevel():GetCurses(), stage = game:GetLevel():GetStage(), capabilities = 1 }
 	local pool = game:GetItemPool()
 	local animations = { "WalkDown", "WalkUp", "WalkLeft", "WalkRight", "HeadDown", "HeadUp",
 		"HeadLeft", "HeadRight", "Hit", "Death", "Appear", "TeleportUp", "TeleportDown", "Trapdoor" }

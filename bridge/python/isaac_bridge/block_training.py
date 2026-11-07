@@ -628,7 +628,7 @@ def forward_chunks(model, chunks, generator=None, train_history=True, version=0,
                    require_next_state=True,deduplicate_sources=True):
     """Same-length chunks are one batch; caller buckets variable lengths.
 
-    At most two old blocks per chunk are differentiable. The raw cross-boundary
+    A configured budget of window-external blocks is differentiable. The raw cross-boundary
     Writer tail is separately re-encoded, and does not consume that budget.
     """
     if not chunks:
@@ -642,7 +642,7 @@ def forward_chunks(model, chunks, generator=None, train_history=True, version=0,
     for i,chunk in enumerate(chunks):
         if chunk.rows['first'][0]:
             states[i]=model.block_memory.empty(device=device,episode=states[i].episode)
-    selected = [historical_blocks(s, generator) if train_history else () for s in states]
+    selected = [historical_blocks(s,generator,config=model.block_memory.config) if train_history else () for s in states]
     unique = {}
     source_keys={}
     for blocks in selected:

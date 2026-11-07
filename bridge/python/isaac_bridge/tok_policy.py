@@ -2307,7 +2307,7 @@ class GraphActor:
         # This legacy graph has a fixed input layout. Validate on the host,
         # not with a data-dependent device bool inside CUDA graph capture.
         if np.any(rows['visible_schema']):
-            raise ValueError('visible-v1 requires BlockActor, not the legacy GraphActor')
+            raise ValueError('visible-v2 requires BlockActor, not the legacy GraphActor')
         n = len(rows)
         if n > self.n:
             return False
@@ -2601,7 +2601,7 @@ def load_compatible(model, state):
     for added input columns). Returns the names that did not match exactly. (B23: a B21 checkpoint's own item-token
     table into an item_shared model goes through share_item_table first, reported as 'itok.coll.weight (shared: ...)'.)"""
     if getattr(model,'block_memory',None) is not None:
-        raise ValueError('visible-v1 forbids compatible weight migration; use an exact-schema strict checkpoint')
+        raise ValueError('visible-v2 forbids compatible weight migration; use an exact-schema strict checkpoint')
     state, note = share_item_table(model, state)
     own = model.state_dict()
     changed = [] if note is None else ['itok.coll.weight (shared: ' + note + ')']

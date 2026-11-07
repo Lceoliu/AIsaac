@@ -43,7 +43,7 @@ def model():
 def test_block_rejects_compatible_weight_migration():
     from isaac_bridge.tok_policy import load_compatible
     m=model()
-    with pytest.raises(ValueError,match='visible-v1'):
+    with pytest.raises(ValueError,match='visible-v2'):
         load_compatible(m,m.state_dict())
 
 
@@ -63,7 +63,7 @@ def test_auto_resume_rejects_legacy_schema_before_runtime(monkeypatch,tmp_path,c
     with pytest.raises(SystemExit) as exc:
         train_tok.main(['--resume','old-block.pt','--groups-file','unused','--out',str(tmp_path)])
     assert exc.value.code==2
-    assert 'exact visible-v1 checkpoint' in capsys.readouterr().err
+    assert 'exact visible-v2 checkpoint' in capsys.readouterr().err
 
 
 def test_complete_inventory_owner_slots_and_entities():

@@ -141,7 +141,8 @@ def test_real_historical_gradient_budget_and_no_cache_mutation():
     raw={block.end_step:torch.randn(2,4,16,requires_grad=True) for block in old.blocks}
     cached=[b.value.clone() for b in old.blocks]
     replacements,selected=recompute_history(m,[old],lambda b:raw[b.end_step],torch.Generator().manual_seed(5))
-    assert len(selected[0])==2 and selected[0][0].end_step==7
+    assert {b.end_step for b in selected[0]}=={1,3,5}
+    assert all(b.end_step<=old.step-m.config.window for b in selected[0])
     out=m(torch.randn(1,1,4,16),[old],replacements=replacements)
     # Actual CF loss: no current raw encoder in this graph can explain past-source gradients.
     readout=torch.nn.Linear(16,6)

@@ -20,7 +20,7 @@ def plan(allowed,query_steps,end_steps,age_weights,block_steps):
     def score(value,batch,head,q,k):
         qs=query_steps[batch,q.clamp(max=qn-1)]
         end=end_steps[batch,k.clamp(max=kn-1)]
-        age=(qs//block_steps-1-end//block_steps).clamp(0,age_weights.shape[1]-1)
+        age=((qs-end-1)//block_steps).clamp(0,age_weights.shape[1]-1)
         return value+age_weights[head,age]
 
     block_mask=create_block_mask(mask,B=b,H=None,Q_LEN=qn,KV_LEN=kn,device=str(allowed.device),

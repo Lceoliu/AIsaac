@@ -8538,3 +8538,48 @@ C92 在 11,660 小时内对 C91 领先 0.06 层且门还在打开（`item_gate` 
 - **第十点**（u68000，约 11,300 小时入）：过层 **1.66**（到第四层 7，每局拿 1.85 件，受伤 6.8，用时 363 秒）。十点均值 1.56，后五点 1.63 / 1.64 / 1.55 / 1.50 / 1.66 ≈ 1.60。
 - **结束**（10-15 04:55，`finished 68684 updates 74387.7 game hours 11.24 h`：净 12,000 小时 **1,068×**，0 个 Traceback）。十个 128 种子点 1.41 / 1.83 / 1.41 / 1.45 / 1.50 / 1.63 / 1.64 / 1.55 / 1.50 / 1.66，均值 1.56；对照 C94 终点（128 种子 1.57 / 512 种子 1.46）。**最终 512 种子**（3090 `b24/runs/ev512/c95-final`，05:01–13:2x，512 局）：过层 **1.69**，进三层 330 局（64%）、到第四层 55、第五层 10，死亡 74%、超时 26%，受伤 7.2 半心，用时 361 秒，清房 13.1，拿道具 1.85，用主动道具 3.2。**所有运行里最高的 512 种子定论**（此前 C91 最终 1.57、C94 终点 1.46、C93 最终 1.445）：从 C94 终点再 12,000 小时 +0.23 层，深层局数从 42 到 65。
 
+<a id="b41"></a>
+### B41 新输入四-latent / Block Memory：4090验收与性能修复（2026-11-07）
+
+#### 实验目的
+
+全新随机初始化的P/R/L/M/E/N/S/G输入与Spatial→4 latent→128步Reader、32步Writer→256×8长期bank，保留反事实搜索和伤害教师，找出成熟双教师learner的真实瓶颈。目标至少200×，不通过减输入、模型或教师预算达标；不是恢复C99权重。
+
+#### 实验方法
+
+- 同一云容器RTX4090；单GPU actor＋learner线程，CPU原生游戏workers；BF16、overlap/decoupled。游戏小时=主轨迹decisions/27000；×实时=主轨迹decisions/(wall_s×7.5)，4帧/decision、30fps。CF分支另列，不加主轨迹分子；离线重放也不算新增游戏小时。
+- 下表r8/r1/r2/aligned/native均为**教师功能压力门**：rollout2048、CF3600点/游戏小时、random1800、4分支、10秒/干预3秒、distill32、share0.4，injury/CF batch32。r8为4worker、min512/micro128；r1/r2为16worker、1024/512；aligned/native为16worker、1024/1024。压力门各代不同配置不能当正式旧新速度比。
+- 新正式同比锁定：同4090/同worker，rollout32768、minibatch8192/micro8192、CF6点/180秒、teacher-share0.1，先旧predictive-aux c45a583再新模型，均fresh。其余教师batch/reuse/weight、epochs、aux、critic、构筑/奖励必须对齐。旧smoke硬编码C99、pred_host把8192替成4096，不能直接使用。**X_old(4090)与新架构正式同比未执行。**
+- profiled update及启动阶段不充当稳态数字；正式验收需40次实际共同教师成熟更新。失败/中断与通过分开，原始记录不覆盖。
+
+#### 实验结果
+
+| 运行 | 回归 / 冒烟 / 离线 | 在线主decisions / 游戏小时 | 稳态末40（主decisions / 游戏小时 / 压力×实时） | 结论 |
+|---|---|---:|---|---|
+| 早期旧输入4090离线r1 |49项；一次smoke2含2更新，并非两次独立冒烟；离线50=25600重放rows，19次共同教师loss|验收新增0；源采集512 / 0.018963|无在线40|仅旧输入历史证据，不是c45a583正式基线|
+| 新输入r8 |GPU63；两次各2更新离线冒烟（各1026rows）；离线50=25650重放rows|127071 / 4.706333|u23–62：81983 / 3.036407 / 8.9683×|62更新、41共同教师；功能门通过，性能不达标|
+| perf-r1 |GPU70；两次真实冒烟2050dec / 0.075926小时；离线50通过|131677 / 4.876926|u25–64：82298 / 3.048074 / 14.6437×|在线4错误，exit130；失败，不晋升|
+| perf-r2 |GPU77；两次真实冒烟2052dec / 0.076小时；离线50通过|137854 / 5.105704|u28–67：82298 / 3.048074 / 21.3695×|67更新、42共同教师，exit0；功能通过，性能不达标|
+| aligned |GPU115；两次真实冒烟2051dec / 0.075963小时；离线50通过|129600 / 4.800000|u24–63：82303 / 3.048259 / 30.546×|63更新、42共同教师；功能通过，性能不达标|
+| native-torch profile |36更新，exit0|74042 / 2.742296|无40窗口|共同教师u30–36；u31：370块/11840历史rows，8.841秒|
+| native-python profile |36更新，exit0|74050 / 2.742593|无40窗口|共同教师u27–36；u31：335块/10720rows，7.671秒（profile7.679）|
+| native-compact profile |36更新，exit0|74027 / 2.741741|无40窗口|共同教师u25–36；u31：304块/9728rows，5.584秒；非同样本严格配对|
+| native中间态（已弃用）|GPU由7失败→4失败修复后120通过；两次2更新冒烟、离线50通过|111131 / 4.115963|实际u15–54：82307 / 3.048407 / 33.4962×，含profile污染，**不计验收**|原定80仅54更新、32共同教师；主动SIGINT，训练/总门exit130。actor32历史入库3.100秒，说明cold-tail存档回归|
+
+其他已完成小规模pilot：micro1024=74040dec/2.742222小时、12共同教师；提前主回复=74056/2.742815、14共同教师；actor-profile=74037/2.742111、13共同教师；均36更新exit0，无40稳态结论。r8独立fresh-capture-r5另6078dec/0.225111小时，job8仅513rows来源，不重复计入50次离线重放。
+
+CF分支单独计费/计算量：r8 90296dec/3.344296小时；r1 126554/4.687185；r2 116096/4.299852；aligned 91586/3.392074；native-torch/python/compact/rejected分别43383/1.606778、41212/1.526370、35724/1.323111、50246/1.860963。这些均不进入主采样×实时分子。
+
+成熟profile结论：LZ4解压、历史观测解码/拷贝、对象状态拼装占主要CPU时间，不能继续只调batch。已修复为仅保存模型有效payload（不存旧ROW/cold tail）、流式Spatial历史重算、融合GPU canvas解码，保留全部有效输入。曾发生compile上下文变体超限、非对齐NumPy stride，修后GPU回归通过；随后发现actor归档回归，已停掉中间态门并停止私有MPS。修正版本没有借用中间态120项GPU结果。
+
+11-07审核改动：默认4个窗外均匀历史块（4/8消融）、纯相对Reader、输入v2/P80的stage+curse+溢出计数、E优先近者截断、取消use gate、L9×9保留布局已实现。GPU slot张量核心已做逐步/FIFO/fork配对；**A1生产actor/lane/分页快照/源租约/learner张量取批尚未接通，不能宣称性能修复完成。**不在这之前启动下一轮端到端验收。原候选已推送exp/block-memory-v1（基底f3264e0），生产树不替换。
+
+审核组件测试：本地完整tests为105 passed / 27 skipped；4090的slot、相对位置与Flex梯度、输入、graph/publish专项15项通过（不是整轮GPU验收）。先保留fixture dh8不受Flex支持、BF16 backend容差、Flex age梯度原子累积的失败及修正记录，再重测；不把容差调整当性能修复。A1完整生产接线和A2速度仍未完成。
+
+证据索引（本地项目根D:/Projects/fortune/Isaac）：
+- 早期离线：`analysis/model-design-20261106/cloud-4090/offline-validation-20261107-r1/REPORT.md`。
+- r8：`analysis/model-design-20261106/new-input-20261107/remote-results/RESULTS.json`及`fresh-capture-r5/summary.json`。
+- r1/r2：`analysis/model-design-20261106/new-input-20261107/performance-fix/FAILED_ACCEPTANCE_R1.json`、`FINAL_ACCEPTANCE-r2.json`。
+- aligned：同目录`architecture-alignment/FINAL_ACCEPTANCE-aligned.json`。
+- native：同目录`native-learner-optimization/native-{torch,python,compact,rejected}.csv`、`native-rejected-{actor,learner}.txt`；中断事件`analysis/model-design-20261106/cloud-4090/prepare-20261107/nativelearner-26-drain-and-release.json`。
+

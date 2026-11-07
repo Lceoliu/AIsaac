@@ -9,14 +9,16 @@ from functools import lru_cache
 from torch import nn
 from torch.nn import functional as F
 
-SCHEMA = 'isaac-visible-p r l m e n s-g-v1'.replace(' ', '')
-VERSION = 20261107
+SCHEMA = 'isaac-visible-p r l m e n s-g-v2'.replace(' ', '')
+VERSION = 2026110702
 FRAME_BYTES = 131072
 P_FIELDS = ('x','y','vx','vy','size','hearts','max_hearts','soul','black','bone','eternal',
             'golden','lives','coins','bombs','keys','damage','fire_delay_max','shot_speed',
             'range','speed','luck','can_fly','invulnerable','controls','head_dir','fire_dir',
             'move_dir','aframe','dead','unknown_fire_delay','unknown_damage_cooldown','unknown_charge','weapons','ptype')
-PF, EF, NF, SF, RC = 42, 48, 4, 13, 16
+STAGE_INDEX,CURSE_START,OVERFLOW_START = 42,43,75
+ENTITY_CLASSES=('interactable','monster','familiar','projectile','other')
+PF, EF, NF, SF, RC = 80, 48, 4, 13, 16
 HEADER = 8
 FIXED = HEADER + 16*28*4 + 13*13
 RAGGED = {'body':PF, 'local':9*9*4, 'entity':EF, 'inventory':NF, 'slots':SF}
@@ -55,20 +57,20 @@ def unpack_room(x):
 def pack_frame(body, room, local, minimap, entity, inventory, slots):
     counts = (len(body), len(entity), len(inventory), len(slots))
     if not counts[0] or counts[1] > 128:
-        raise ValueError('visible-v1 requires bodies and at most 128 visible entities')
+        raise ValueError('visible-v2 requires bodies and at most 128 visible entities')
     arrays = [np.asarray(x, dtype='<f4').reshape(-1) for x in
               (pack_room(room),pack_canvas(minimap,(1,)*8,(1,)*8),body,
                pack_room(local),entity,inventory,slots)]
     size = HEADER + sum(a.size for a in arrays)
     if size*4 > FRAME_BYTES:
-        raise ValueError(f'complete visible-v1 frame needs {size*4} bytes; transport budget {FRAME_BYTES}; no truncation')
+        raise ValueError(f'complete visible-v2 frame needs {size*4} bytes; transport budget {FRAME_BYTES}; no truncation')
     # Float header magic is exactly representable; the separate ROW version is int32.
     return np.concatenate((np.array([61107, size, *counts, 1, 0], '<f4'), *arrays)).tobytes()
 
 
 def write_frame(row, payload):
     if len(payload) > FRAME_BYTES:
-        raise ValueError('visible-v1 frame exceeds transport byte budget')
+        raise ValueError('visible-v2 frame exceeds transport byte budget')
     row['visible_bytes'] = len(payload)
     row['visible_frame'][0, :len(payload)] = np.frombuffer(payload, np.uint8)
     row['visible_schema'] = VERSION
@@ -84,7 +86,7 @@ def decode_frame(raw, sizes, versions):
     expected = FIXED + p*(PF+324) + e*EF+n*NF+s*SF
     if not bool(((f[:,0] == 61107) & (f[:,1] == expected) & (sizes == expected*4) &
                  (p > 0) & (e <= 128) & (counts >= 0).all(1) & (sizes <= FRAME_BYTES)).all()):
-        raise ValueError('invalid visible-v1 complete frame length/counts')
+        raise ValueError('invalid visible-v2 complete frame length/counts')
     b = {'v_room': unpack_room(f[:,HEADER:HEADER+1792]).transpose(1,2).reshape(-1,RC,16,28),
          'v_map': unpack_canvas(f[:,HEADER+1792:FIXED],(1,)*8,(1,)*8).transpose(1,2).reshape(-1,8,13,13)}
     offset = torch.full_like(p, FIXED)
@@ -166,7 +168,7 @@ def decode_frame_host(rows,packed=False):
     expected=FIXED+p*(PF+324)+e*EF+n*NF+s*SF
     if not np.all((f[:,0]==61107)&(f[:,1]==expected)&(rows['visible_bytes']==expected*4)&
                   (p>0)&(e<=128)&(counts>=0).all(1)&(rows['visible_bytes']<=FRAME_BYTES)):
-        raise ValueError('invalid visible-v1 complete frame length/counts')
+        raise ValueError('invalid visible-v2 complete frame length/counts')
     room=f[:,HEADER:HEADER+1792]
     minimap=f[:,HEADER+1792:FIXED]
     if not packed:
@@ -190,15 +192,15 @@ def decode_frame_host(rows,packed=False):
 def observation_frame(o):
     """Only public raw bridge fields. Reward/privileged totals never enter this path."""
     if o.visible is None:
-        raise ValueError('bridge did not send visible-v1 extension')
+        raise ValueError('bridge did not send visible-v2 extension')
     ext=o.visible
     if ext['schema'] != SCHEMA or len(ext['bodies']) != len(o.players):
-        raise ValueError('bridge visible-v1 schema/body mismatch')
+        raise ValueError('bridge visible-v2 schema/body mismatch')
     body=np.zeros((len(o.players),PF),np.float32)
     room=np.zeros((RC,16,28),np.float32)
     terrain=o.terrain
     if terrain is None:
-        raise ValueError('visible-v1 requires room terrain')
+        raise ValueError('visible-v2 requires room terrain')
     width,height=terrain['width'],terrain['height']
     if width>28 or height>16: raise ValueError('room canvas overflow')
     positions=[]
@@ -228,8 +230,10 @@ def observation_frame(o):
         known=not(ext['curses'] & 8)
         if not known: values[health]=0
         body[i,:35]=values/scales
-        body[i,35:]=(i,meta['controller'],meta['controller_known'],meta['animation']/32,
+        body[i,35:42]=(i,meta['controller'],meta['controller_known'],meta['animation']/32,
                        meta['animation_known'],float(known),ext['capabilities'])
+        body[i,STAGE_INDEX]=ext['stage']/16
+        body[i,CURSE_START:OVERFLOW_START]=[(int(ext['curses'])>>bit)&1 for bit in range(32)]
         iy,ix=cell(p['x'],p['y'])
         padded=np.pad(room,((0,0),(4,4),(4,4)))
         local[i]=padded[:,iy:iy+9,ix:ix+9]
@@ -243,11 +247,8 @@ def observation_frame(o):
             if 0<=j<169:
                 y,x=divmod(j,13);kind=int(m['type']);flags=int(m['flags'])
                 minimap[:,y,x]=(1,flags&1,(flags>>1)&1,idx==o.room[4],kind==5,kind==4,kind==2,kind not in (1,2,4,5))
-    entities=o.entities
-    if len(entities)>128:
-        # Contract E is nearest 128 visible entities, unlike uncapped inventory/slots.
-        distances=np.min(np.stack([(entities['x']-p['x'])**2+(entities['y']-p['y'])**2 for p in o.players]),0)
-        entities=entities[np.argsort(distances,kind='stable')[:128]]
+    entities,overflow=prioritize_entities(o.entities,o.players)
+    body[:,OVERFLOW_START:]=overflow/128
     ef=('type','variant','subtype','x','y','vx','vy','size','size_mx','size_my','coll','gcoll','cdmg',
         'aframe','age','kind','flags','anim','flip','champion','hp','height','fall','scale',
         'l_cos','l_sin','l_len','l_ex','l_ey','l_radius','l_circle','price')
@@ -268,6 +269,27 @@ def observation_frame(o):
     return pack_frame(body,room,local,minimap,entity,inv,slots)
 
 
+def prioritize_entities(entities,players):
+    """Keep interaction targets before combat traffic; count every discarded class.
+
+    Doors/grid exits already live in uncapped R channels. Entity-form exits use
+    the existing bridge synthetic identity1023, and receive the same top priority.
+    Type values follow the AB+ EntityType enum; kind/flags are lean protocol enums.
+    """
+    kind,etype=entities['kind'],entities['type']
+    priority=np.full(len(entities),4,dtype=np.int64)
+    priority[np.isin(kind,(1,2,3,4))|np.isin(etype,(2,4,7,8,9))|
+             ((etype==1000)&(entities['cdmg']>0))]=3
+    priority[etype==3]=2
+    priority[(kind==6)|((entities['flags']&1)!=0)]=1
+    priority[(kind==5)|np.isin(etype,(5,6,1022,1023))]=0
+    distances=np.min(np.stack([(entities['x']-p['x'])**2+(entities['y']-p['y'])**2
+                              for p in players]),axis=0)
+    order=np.lexsort((np.arange(len(entities)),distances,priority))[:128]
+    overflow=np.bincount(priority,minlength=len(ENTITY_CLASSES))-np.bincount(priority[order],minlength=len(ENTITY_CLASSES))
+    return entities[order],overflow
+
+
 class StructuredSpatial(nn.Module):
     def __init__(self,width,layers,heads):
         super().__init__()
@@ -276,7 +298,8 @@ class StructuredSpatial(nn.Module):
         self.room=nn.Sequential(nn.Conv2d(RC,32,3,2,1),nn.GELU(),nn.Conv2d(32,64,3,2,1),nn.GELU())
         self.room_project=nn.Linear(64,width)
         self.position=nn.Linear(2,width,bias=False)
-        self.local=nn.Sequential(nn.Conv2d(RC,32,3,2,1),nn.GELU(),nn.AdaptiveAvgPool2d(1),nn.Flatten(),nn.Linear(32,width))
+        self.local=nn.Sequential(nn.Conv2d(RC,32,3,1,1),nn.GELU(),nn.Conv2d(32,32,3,1,1),
+                                 nn.GELU(),nn.Flatten(),nn.Linear(32*9*9,width))
         self.minimap=nn.Sequential(nn.Conv2d(8,32,3,2,1),nn.GELU(),nn.Flatten(),nn.Linear(32*7*7,width))
         self.identity=nn.Embedding(65536,24,padding_idx=0)
         self.entity=nn.Linear(EF+72,width)
@@ -291,7 +314,7 @@ class StructuredSpatial(nn.Module):
         self.register_buffer('coordinates',torch.stack((x,y),-1).reshape(28,2))
 
     def forward(self,b):
-        if 'v_body' not in b:raise ValueError('new Spatial requires visible-v1 input; legacy input rejected')
+        if 'v_body' not in b:raise ValueError('new Spatial requires visible-v2 input; legacy input rejected')
         b=dict(b)
         for name in RAGGED:
             b['v_'+name]=b['v_'+name].masked_fill(~b['v_'+name+'_mask'][:,:,None],0)
@@ -328,14 +351,5 @@ class StructuredSpatial(nn.Module):
 
 
 def action_gate(b):
-    p,s=b['v_body'],b['v_slots']
-    controlled=(p[:,:,36]==0)&(p[:,:,37]>0)&b['v_body_mask']
-    bombs=((p[:,:,14]>0)&controlled).any(1)
-    owners=p[:,:,35].long()
-    owned=((s[:,:,0,None].long()==owners[:,None,:])&controlled[:,None,:]).any(2)
-    occupied=(s[:,:,4]>0)&b['v_slots_mask']&owned
-    # An action is supported when a selected active exists. Readiness is learned
-    # from visible S, not a hidden/generalized charge rule for special actives.
-    active=(s[:,:,1]==1)&occupied&(s[:,:,5]>0)&(s[:,:,9]>0)
-    pocket=((s[:,:,1]==3)|(s[:,:,1]==4))&occupied&(s[:,:,5]>0)&(s[:,:,9]>0)
-    return torch.stack((bombs,active.any(1),pocket.any(1)),1)
+    # Bomb/active/pocket availability and readiness are observations, not rules.
+    return torch.ones((len(b['v_body']),3),dtype=torch.bool,device=b['v_body'].device)

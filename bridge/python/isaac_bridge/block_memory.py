@@ -29,6 +29,7 @@ class BlockConfig:
     writer_layers: int = 2
     writer_heads: int = 4
     attention: str = 'sdpa'
+    history_recompute_blocks: int = 4
 
     def __post_init__(self):
         if self.attention not in ('sdpa','flex'):
@@ -59,9 +60,7 @@ def short_mask(query_steps, key_steps, window):
 def long_mask(query_steps, end_steps, block_steps, blocks):
     delta = query_steps[..., :, None] - end_steps[..., None, :]
     # A complete block first becomes visible on its following decision.
-    newest = torch.div(query_steps, block_steps, rounding_mode="floor") - 1
-    block_id = torch.div(end_steps, block_steps, rounding_mode="floor")
-    age = newest[..., :, None] - block_id[..., None, :]
+    age = torch.div(delta-1,block_steps,rounding_mode='floor')
     return (end_steps[..., None, :] >= 0) & (delta > 0) & (age >= 0) & (age < blocks)
 
 
@@ -196,13 +195,15 @@ class ReaderLayer(nn.Module):
         self.n2 = nn.LayerNorm(c.width)
         self.ff = nn.Sequential(nn.Linear(c.width, 4 * c.width), nn.GELU(), nn.Linear(4 * c.width, c.width))
 
-    def forward(self, x, prefix, allowed, bank, bank_allowed, bank_bias,bank_flex=None):
+    def forward(self, x, prefix, allowed, bank, bank_allowed, bank_bias,bank_flex=None,short_bias=None):
         b, n, d = x.shape
         q, k, v = self.qkv(self.n1(x)).reshape(b, n, 3, self.heads, self.dh).unbind(2)
         q, k, v = (a.transpose(1, 2) for a in (q, k, v))
         pk, pv = (a.to(k.dtype) for a in prefix)
         y = F.scaled_dot_product_attention(q, torch.cat((pk, k), 2), torch.cat((pv, v), 2),
-                                          attn_mask=allowed[:, None], dropout_p=0.0)
+                                          attn_mask=(allowed[:,None] if short_bias is None else
+                                              short_bias.to(q.dtype).masked_fill(~allowed[:,None],float('-inf'))),
+                                          dropout_p=0.0)
         x = x + self.out(y.transpose(1, 2).reshape(b, n, d))
         if self.memory is not None:
             x = x + self.memory(self.n_memory(x), bank, bank_allowed, bias=bank_bias,flex=bank_flex)
@@ -219,6 +220,7 @@ class BlockMemory(nn.Module):
         self.slot_embedding = nn.Parameter(torch.randn(c.latents, c.width) * 0.02)
         self.memory_slot_embedding = nn.Parameter(torch.randn(c.memory_tokens, c.latent_width) * 0.02)
         self.memory_age = nn.Parameter(torch.zeros(c.heads, c.memory_blocks))
+        self.short_relative = nn.Parameter(torch.zeros(c.heads,c.window))
         self.layers = nn.ModuleList(ReaderLayer(c, i in c.cross_layers) for i in range(c.layers))
         self.norm = nn.LayerNorm(c.width)
         self.pool = QueryReadout(c.width, c.width, 1, c.heads)
@@ -239,22 +241,24 @@ class BlockMemory(nn.Module):
         c=self.config
         b,t=z.shape[:2]
         qt=position.repeat_interleave(c.latents,1)
-        bank=bank+time_encoding(ends.clamp_min(0),c.latent_width,bank.dtype)
         bm=long_mask(qt,ends,c.block_steps,c.memory_blocks)
         bank_flex=bank_bias=None
         if c.attention=='flex' and z.is_cuda and t==c.window and t>1:
             from .block_attention import plan
             bank_flex=plan(bm,qt,ends,self.memory_age,c.block_steps)
         else:
-            age=(torch.div(qt,c.block_steps,rounding_mode='floor')[:,:,None]-1
-                 -torch.div(ends,c.block_steps,rounding_mode='floor')[:,None]).clamp(0,c.memory_blocks-1)
+            age=torch.div(qt[:,:,None]-ends[:,None]-1,c.block_steps,
+                          rounding_mode='floor').clamp(0,c.memory_blocks-1)
             bank_bias=self.memory_age[:,age].permute(1,0,2,3)
-        allowed=short_mask(qt,torch.cat((kp,qt),1),c.window)
-        x=self.input(z)+self.slot_embedding[None,None]+time_encoding(position,c.width,z.dtype)[:,:,None]
+        keys=torch.cat((kp,qt),1)
+        allowed=short_mask(qt,keys,c.window)
+        distance=(qt[:,:,None]-keys[:,None]).clamp(0,c.window-1)
+        short_bias=self.short_relative[:,distance].permute(1,0,2,3)
+        x=self.input(z)+self.slot_embedding[None,None]
         x=x.flatten(1,2)
         current_kv=[]
         for layer,prefix in zip(self.layers,prefixes):
-            x,kv=layer(x,prefix,allowed,bank,bm,bank_bias,bank_flex)
+            x,kv=layer(x,prefix,allowed,bank,bm,bank_bias,bank_flex,short_bias)
             current_kv.append(kv)
         tokens=self.norm(x).reshape(b,t,c.latents,c.width)
         hidden=self.pool(tokens.flatten(0,1)).reshape(b,t,c.width)
@@ -390,15 +394,14 @@ class BlockMemory(nn.Module):
         return result
 
 
-def historical_blocks(state, generator=None):
-    """Fixed budget: newest complete source block plus one uniformly older block."""
-    if not state.blocks:
+def historical_blocks(state, generator=None,config=None):
+    """Uniform without replacement, wholly outside the chunk-start short window."""
+    config=BlockConfig() if config is None else config
+    eligible=[b for b in state.blocks if b.end_step<=state.step-config.window]
+    if not eligible or config.history_recompute_blocks==0:
         return ()
-    recent = len(state.blocks) - 1
-    if recent == 0:
-        return (state.blocks[recent],)
-    older = int(torch.randint(recent, (1,), generator=generator).item())
-    return state.blocks[recent], state.blocks[older]
+    selected=torch.randperm(len(eligible),generator=generator)[:config.history_recompute_blocks].tolist()
+    return tuple(eligible[i] for i in selected)
 
 
 def recompute_history(model, states, encode_source, generator=None):
@@ -407,7 +410,7 @@ def recompute_history(model, states, encode_source, generator=None):
     encode_source receives a MemoryBlock with a retained raw-source reference and
     returns [block_steps, slots, latent_width]. Cached context is never mutated.
     """
-    selected = [historical_blocks(s, generator) for s in states]
+    selected = [historical_blocks(s, generator,config=model.config) for s in states]
     unique = {}
     for chosen in selected:
         for block in chosen:

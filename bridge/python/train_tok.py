@@ -1331,6 +1331,8 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--block-memory', type=int, default=0, choices=(0,1))
     p.add_argument('--block-size', default='v1', choices=('v1','m','l'))
     p.add_argument('--block-attention',default='sdpa',choices=('sdpa','flex'))
+    p.add_argument('--block-history-blocks',type=int,default=None,
+                   help='Window-external historical Writer blocks per chunk; default4, use8 for ablation')
     p.add_argument('--frames-per-decision', type=int, default=4)
     p.add_argument('--episodes-per-state', type=int, default=16)
     p.add_argument('--episode-seconds', type=float, default=90.0)
@@ -1839,10 +1841,10 @@ def main(argv=None, child=None, actor=None):
     if args.block_memory or resume_input_config.get('block_config') is not None:
         from isaac_bridge.structured_input import SCHEMA
         if args.init:
-            p.error('new visible-v1 model must initialize from zero; --init/C99 is forbidden')
+            p.error('new visible-v2 model must initialize from zero; --init/C99 is forbidden')
         if args.resume:
             if resume_input_config.get('input_schema') != SCHEMA:
-                p.error('resume requires an exact visible-v1 checkpoint, not legacy/C99 weights')
+                p.error('resume requires an exact visible-v2 checkpoint, not legacy/C99 weights')
     # B38 step 5: actor processes (aid 0: this trainer process; 1 ..: actor_child_entry), each its share of workers
     n_act = max(1, int(args.actor_processes))
     aid = int(actor['aid']) if actor is not None else 0
@@ -1984,6 +1986,9 @@ def main(argv=None, child=None, actor=None):
             p.error('block-memory requires item tokens and the global value head')
         width_b,layers_b,heads_b = {'v1':(256,4,4),'m':(384,6,6),'l':(512,8,8)}[args.block_size]
         block_cfg = block_cfg or dict(width=width_b,layers=layers_b,heads=heads_b,attention=args.block_attention)
+        args.block_history_blocks=(block_cfg.get('history_recompute_blocks',4)
+            if args.block_history_blocks is None else args.block_history_blocks)
+        block_cfg=dict(block_cfg,history_recompute_blocks=args.block_history_blocks)
         tok_kw.update(block_memory=True,block_config=block_cfg)
         args.temporal = 0
         args.temporal_width = block_cfg['width']
@@ -2505,7 +2510,7 @@ def main(argv=None, child=None, actor=None):
               + ('through CUDA graphs with the state table (GraphActor memory)' if use_graphs else
                  'eager (--memory-graph 0 or --graph-entities 0)'), flush=True)
     if block_on:
-        print('visible-v1: P per body, R28, L per body, M, E128, full ragged N/S, learned G; all-new random input encoder',flush=True)
+        print('visible-v2: P per body, R28, L per body, M, E128, full ragged N/S, learned G; all-new random input encoder',flush=True)
     elif itok_on or gtok_on:   # legacy B21 / B22 only
         print('extra tokens: ' + ', '.join(
             ([f'item tokens ({item_slots + 4} per record, {item_slots} held slots)'] if itok_on else []) +

@@ -60,13 +60,13 @@ def test_teacher_all_32_phases_loss_only_preserves_losses_and_all_gradients(devi
     torch.manual_seed(211)
     rng=np.random.default_rng(211)
     model=TokPolicy(width=32,layers=1,heads=4,items=True,item_tokens=True,global_token=True,
-                    block_memory=True,block_config=asdict(small(block_steps=32,window=128,memory_blocks=4))).to(device)
+                    block_memory=True,block_config=asdict(small(block_steps=32,window=128,memory_blocks=8))).to(device)
     actor=BlockActor(model,1)
     chunks=[]
-    for step in range(96):
+    for step in range(288):
         rows=synth_rows(rng,1);rows['first']=int(step==0);rows['episode']=3
         pending=synth_pending(rng,1,model.heads)
-        if step>=64:chunks.append(Chunk(rows,pending,actor.snapshot(0)))
+        if step>=256:chunks.append(Chunk(rows,pending,actor.snapshot(0)))
         actor.step(rows,pending,[0])
     # Cached tail latents deliberately predate the learner's current parameters.
     with torch.no_grad():model.structured_spatial.body[0].weight.add_(.007)
@@ -84,7 +84,7 @@ def test_teacher_all_32_phases_loss_only_preserves_losses_and_all_gradients(devi
         meta=torch.zeros((32,16),dtype=torch.long,device=device);meta[:,3]=1;meta[:,14]=8
         injury=injury_loss(out[0],out[2],meta,.4,.2,.1)
         (cf+injury).backward()
-        assert all(len(x)==2 for x in selected)
+        assert all(len(x)==4 for x in selected)
         assert m.block_memory.writer.queries.grad.abs().sum()>0
         results.append((out,cf.detach(),injury.detach(),sum(encoded),ctx))
     for a,b in zip(results[0][0],results[1][0]):torch.testing.assert_close(a,b,atol=3e-6,rtol=3e-5)
@@ -126,8 +126,8 @@ def test_same_writer_inputs_across_ipc_share_recompute_not_loss_budget(monkeypat
     a=unpack_snapshots(pack_snapshots([snap]),'cpu')[0]
     b=unpack_snapshots(pack_snapshots([snap]),'cpu')[0]
     assert a.history.blocks[0] is not b.history.blocks[0]
-    # Fix the same legal newest + older selection, independent of RNG draw order.
-    monkeypatch.setattr(training,'historical_blocks',lambda s,g:(s.blocks[-1],s.blocks[0]))
+    # Fix the same two available window-external blocks, independent of draw order.
+    monkeypatch.setattr(training,'historical_blocks',lambda s,g,config:(s.blocks[0],s.blocks[1]))
     rows=synth_rows(rng,2);rows['first']=0;rows['episode']=4
     pending=synth_pending(rng,2,model.heads)
     chunks=[Chunk(rows[i:i+1],pending[i:i+1],s) for i,s in enumerate((a,b))]
