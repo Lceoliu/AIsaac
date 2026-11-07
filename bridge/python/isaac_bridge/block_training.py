@@ -662,7 +662,7 @@ def forward_bucketed(model, chunks, max_rows=None, **kwargs):
     return output,ctx
 
 
-def forward_chunks(model, chunks, generator=None, train_history=True, version=0, spatial_micro=512,
+def forward_chunks(model, chunks, generator=None, train_history=True, version=0, spatial_micro=None,
                    require_next_state=True,deduplicate_sources=True):
     """Same-length chunks are one batch; caller buckets variable lengths.
 
@@ -675,6 +675,7 @@ def forward_chunks(model, chunks, generator=None, train_history=True, version=0,
         return forward_chunks_paged(model,chunks,generator=generator,train_history=train_history,version=version,
                                     spatial_micro=spatial_micro,require_next_state=require_next_state,
                                     deduplicate_sources=deduplicate_sources)
+    spatial_micro = 512 if spatial_micro is None else spatial_micro
     length = len(chunks[0].rows)
     if any(len(c.rows) != length for c in chunks):
         raise ValueError("bucket chunks by decision length before forward_chunks")

@@ -667,7 +667,13 @@ def _to(x, device):
     return x.to(device)
 
 
-def forward_chunks_paged(model, chunks, generator=None, train_history=True, version=0, spatial_micro=512,
+# Spatial microbatch of the paged learner: large enough that kernel launches stop dominating
+# (512 split a --micro 8192 batch into 16 Spatial calls, ~1.4k ops each, plus checkpoint replay);
+# no-grad passes run up to 8192 rows at once. Same math at any size.
+SPATIAL_MICRO_TRAIN, SPATIAL_MICRO_EVAL = 2048, 8192
+
+
+def forward_chunks_paged(model, chunks, generator=None, train_history=True, version=0, spatial_micro=None,
                          require_next_state=True, deduplicate_sources=True):
     """forward_chunks for chunks whose snapshots are PagedSnapshot (learner thread)."""
     from .block_training import source_rows
@@ -680,6 +686,8 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     if any(len(c.rows) != length for c in chunks):
         raise ValueError('bucket chunks by decision length before forward_chunks')
     device = next(model.parameters()).device
+    if spatial_micro is None:
+        spatial_micro = SPATIAL_MICRO_TRAIN if torch.is_grad_enabled() else SPATIAL_MICRO_EVAL
     clock = _Clock('learn.', device)
     memory = model.block_memory
     cfg = memory.config
