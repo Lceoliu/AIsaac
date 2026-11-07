@@ -28,6 +28,6 @@ CMD="$ROOT/.venv/bin/python -u train_tok.py --groups-file ../abplus/catalog/scal
  --actor-bf16 1 --graph-entities 128 \
  --workers 16 --rollout 32768 --minibatch 8192 --micro 8192 --game-hours $HOURS --checkpoint-every 1000 \
  --overlap --decoupled 1 --learner-fast 0 --actor-processes 1 --learner-process 0 --amp bf16 \
- --port 39200 --name b42new --seed 1000 --out $OUT"
+ --port 39200 --name b42new --seed 1000 --out $OUT $EXTRA"
 echo "$CMD" > $OUT.command.txt
 exec xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" timeout --signal=INT --kill-after=60s $LIMIT $CMD > $OUT.stdout 2> $OUT.stderr

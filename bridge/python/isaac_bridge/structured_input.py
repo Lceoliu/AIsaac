@@ -112,6 +112,26 @@ def from_rows(rows, device, pending=None):
     if pending is not None:
         b['pending']=np.asarray(pending,dtype=np.int64)
         b['first']=rows['first']
+    return from_host(b,device)
+
+
+def merge_host(parts):
+    """Concatenate decode_frame_host dicts (same packing), padding ragged slots."""
+    if len(parts)==1:return dict(parts[0])
+    out={}
+    for k in parts[0]:
+        xs=[q[k] for q in parts]
+        base=k[2:-5] if k.endswith('_mask') else k[2:]
+        if k.startswith('v_') and base in RAGGED and len({x.shape[1] for x in xs})>1:
+            w=max(x.shape[1] for x in xs)
+            xs=[np.pad(x,[(0,0),(0,w-x.shape[1])]+[(0,0)]*(x.ndim-2)) for x in xs]
+        out[k]=np.concatenate(xs)
+    return out
+
+
+def from_host(b, device):
+    """Upload a decode_frame_host dict (plus pending/first) and finish canvas decoding."""
+    device=torch.device(device)
     if device.type=='cpu':return {k:torch.from_numpy(v) for k,v in b.items()}
     # A dtype-preserving byte slab needs one H2D and no GPU float->mask/int casts.
     layout={};offset=0
@@ -352,4 +372,5 @@ class StructuredSpatial(nn.Module):
 
 def action_gate(b):
     # Bomb/active/pocket availability and readiness are observations, not rules.
-    return torch.ones((len(b['v_body']),3),dtype=torch.bool,device=b['v_body'].device)
+    x=b['v_body'] if 'v_body' in b else b['v_gate']
+    return torch.ones((len(x),3),dtype=torch.bool,device=x.device)

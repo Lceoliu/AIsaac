@@ -1634,7 +1634,7 @@ class TokPolicy(nn.Module):
     def gate(b):
         """[B, 3] bool from a batch: may the bomb head say "bomb" (a bomb held), the item head "use" (the active item
         ready: ROW player column 22), the pill head "use" (a pill or a card in pocket slot 0: pinv columns 2, 4)."""
-        if 'v_body' in b:
+        if 'v_body' in b or 'v_gate' in b:
             from .structured_input import action_gate
             return action_gate(b)
         bombs = b['bombs'] > 0
@@ -2012,6 +2012,11 @@ def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True):
     if visible:
         dt,off=ROW.fields['visible_schema'][:2]
         versions=raw[:,off:off+4].contiguous().view(torch.int32)[:,0]
+    if visible == 'gate':
+        # B42: block-memory learner batches. The model input is decoded from the chunks' own
+        # rows; these batches only need the record fields and the (observation-free) gate.
+        b['v_gate'] = torch.ones((n, 3), dtype=torch.bool, device=raw.device)
+        return b
     if visible and bool(versions.any()):
         from .structured_input import decode_frame, FRAME_BYTES
         off=ROW.fields['visible_frame'][1]
@@ -2021,7 +2026,11 @@ def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True):
     return b
 
 
-def rows_to_device(rows, index, pending, device, stage=None, with_raw=False):
+ROW_HEAD = ROW.fields['visible_bytes'][1]   # B42: every record field before the 128-KiB visible frame
+assert ROW_HEAD % 8 == 0
+
+
+def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, head=False):
     """to_batch for a large set of records without numpy copies: rows a ROW array (any shape, C-contiguous), index the
     flat positions to take (numpy int64), pending [len(index), heads] int64. The gather runs in torch (no GIL held), one
     copy goes to the device and the fields are views of it (decode_rows). Same values as
@@ -2030,13 +2039,16 @@ def rows_to_device(rows, index, pending, device, stage=None, with_raw=False):
     copied asynchronously (the caller must not reuse it before the copy is done: a later sync of the device).
     with_raw (B18): also return the records' bytes on the device and the actions under way: (batch, bytes, pending)."""
     raw = torch.from_numpy(rows.reshape(-1).view(np.uint8).reshape(-1, ROW_BYTES))
+    if head:   # B42 (block memory): the record head only, never the visible frame's padding
+        raw, stage = raw[:, :ROW_HEAD], None
     index_t = torch.from_numpy(np.ascontiguousarray(index, np.int64))
     if stage is not None:
         dev_raw = torch.index_select(raw, 0, index_t, out=stage[:len(index)]).to(device, non_blocking=True)
     else:
         dev_raw = raw.index_select(0, index_t).to(device, non_blocking=False)
     pend = torch.from_numpy(np.ascontiguousarray(pending, np.int64)).to(device)
-    return (decode_rows(dev_raw, pend), dev_raw, pend) if with_raw else decode_rows(dev_raw, pend)
+    vis = 'gate' if head else True
+    return (decode_rows(dev_raw, pend, visible=vis), dev_raw, pend) if with_raw else decode_rows(dev_raw, pend, visible=vis)
 
 
 class GraphActor:

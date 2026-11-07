@@ -35,6 +35,45 @@ from .block_slots import BlockSlotState
 from .structured_input import from_rows
 
 
+# ----------------------------------------------------------------------------- timing (ISAAC_BLOCK_TIMING=1)
+
+TIMING_ON = os.environ.get('ISAAC_BLOCK_TIMING', '0') == '1'
+TIMING = {}
+
+
+class _Clock:
+    """Phase timer; with ISAAC_BLOCK_TIMING=1 it synchronises the GPU at each mark (measurement only)."""
+    def __init__(self, prefix, device):
+        self.prefix, self.cuda = prefix, torch.device(device).type == 'cuda'
+        self.t = self._now()
+
+    def _now(self):
+        import time
+        if TIMING_ON and self.cuda:
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def mark(self, name):
+        if not TIMING_ON:
+            return
+        t = self._now()
+        key = self.prefix+name
+        TIMING[key] = TIMING.get(key, 0.0)+t-self.t
+        self.t = t
+
+
+def count(name, value):
+    if TIMING_ON:
+        TIMING[name] = TIMING.get(name, 0)+value
+
+
+def timing_report(reset=True):
+    out = dict(TIMING)
+    if reset:
+        TIMING.clear()
+    return out
+
+
 # ----------------------------------------------------------------------------- logs / snapshots
 
 class EpisodeLog:
@@ -136,6 +175,7 @@ class PagedStore:
         self.b_used = np.zeros(0, bool)
         self.b_free = np.empty(0, np.int64)
         self.raw = {}                                   # decision id -> (first, schema, frame bytes, pending)
+        self.decoded = {}                               # learner cache: (block id, packed) -> host frames; per rollout
         self.next_decision = 0
         self.snaps = weakref.WeakSet()
         self.roots = []                                 # weak methods -> iterable of (log, step) still live
@@ -303,6 +343,7 @@ class PagedStore:
         dead_r = keys[~np.isin(keys, live_raw)]
         for k in dead_r.tolist():
             del self.raw[k]
+        self.decoded = {}
         self.collections += 1
         self.freed['kv'] += len(dead); self.freed['blocks'] += len(dead_b); self.freed['raw'] += len(dead_r)
         return dict(kv=int(self.d_used.sum()), blocks=int(self.b_used.sum()), raw=len(self.raw),
@@ -395,6 +436,7 @@ class SlotBlockActor:
                 owner.logs[slot] = EpisodeLog((os.getpid(), slot, int(rows['episode'][i])))
             owner.pending[slot] = pending[i:i+1].copy()
         contexts = [owner.snapshot(slot) for owner, slot in zip(owners, slots)]
+        clock = _Clock('actor.', device)
         groups = {}
         for i, owner in enumerate(owners):
             groups.setdefault(id(owner), (owner, []))[1].append(i)
@@ -405,6 +447,7 @@ class SlotBlockActor:
         record = {}
 
         def slot_call(z):
+            clock.mark('decode_spatial')
             perm, parts, hosts = [], [], []
             for owner, positions in groups:
                 host, ids = owner.state._ids([slots[i] for i in positions])
@@ -438,9 +481,13 @@ class SlotBlockActor:
                 hidden, tokens, allowed, mask = (x.index_select(0, inv) for x in (hidden, tokens, allowed, mask))
             record['perm'] = perm
             positions = steps[:, None] if inv is None else steps.index_select(0, inv)[:, None]
+            clock.mark('reader_slot')
+            count('actor.writer_rows', sum(len(record[id(o)][1]) for o, _ in groups))
             return dict(hidden=hidden, tokens=tokens, local_mask=allowed, memory_mask=mask, positions=positions)
 
         ctx = {'memory_call': slot_call, 'version': version, 'reset_done': True}
+        clock.mark('prepare')
+        count('actor.calls', 1); count('actor.rows', len(rows))
         if self.encoder is None:
             b = from_rows(rows, device, pending)
         else:
@@ -465,8 +512,10 @@ class SlotBlockActor:
                 result = (torch.where(mask[:, None], b['pending'], result[0]),
                           result[1].masked_fill(mask, 0), *result[2:])
         self.last_result = ctx.get('block_result')
+        clock.mark('heads_sample')
         # One host transfer for actions plus this step's pages (same stream: ordered).
         host = torch.cat((result[0].float(), *(x[:, None].float() for x in result[1:])), 1).cpu().numpy()
+        clock.mark('host_sync')
         perm = record['perm']
         cur, zc = record['current'], record['z']
         n = len(perm)
@@ -501,6 +550,7 @@ class SlotBlockActor:
             owner.last_contexts = [contexts[i] for i in positions]
         for i, (owner, slot) in enumerate(zip(owners, slots)):
             owner.pending[slot] = host[i:i+1, :len(self.model.heads)].astype(np.int64)
+        clock.mark('pages')
         return result
 
 
@@ -576,6 +626,41 @@ def dense_memory_forward(memory, z, steps, prefixes, kp, old_vals, n_old, old_en
                 positions=position, current_kv=current_kv, written_count=len(block_index))
 
 
+RAGGED = ('v_body', 'v_local', 'v_entity', 'v_inventory', 'v_slots')
+
+
+def encode_sorted(model, batch, micro):
+    """Spatial over a decoded batch in token-sorted microbatches with tight padding.
+
+    Rows are ordered by their real token count and each microbatch keeps only as many
+    ragged slots as its longest row (masks are left-aligned), so padding attention is
+    not computed. Identical math to one padded call; with gradients enabled each
+    microbatch is a non-reentrant checkpoint (bounded activations)."""
+    from torch.utils.checkpoint import checkpoint
+    n = len(batch['v_body'])
+    counts = torch.stack([batch[k+'_mask'].sum(1) for k in RAGGED], 1)       # [n, 5]
+    tokens = counts.sum(1)
+    order = torch.argsort(tokens, stable=True)
+    counts_h = counts.index_select(0, order).cpu().numpy()
+    grad = torch.is_grad_enabled() and n > micro
+    out = []
+    for begin in range(0, n, micro):
+        idx = order[begin:begin+micro]
+        width = np.maximum(counts_h[begin:begin+micro].max(0), 1)
+        part = {}
+        for k, v in batch.items():
+            v = v.index_select(0, idx)
+            base = k[:-5] if k.endswith('_mask') else k
+            if base in RAGGED:
+                v = v[:, :int(width[RAGGED.index(base)])]
+            part[k] = v
+        out.append(checkpoint(model.encode_block, part, use_reentrant=False) if grad else model.encode_block(part))
+    z = torch.cat(out)
+    inverse = torch.empty_like(order)
+    inverse[order] = torch.arange(n, device=order.device)
+    return z.index_select(0, inverse)
+
+
 def _to(x, device):
     if torch.device(device).type == 'cuda' and x.device.type == 'cpu':
         return x.pin_memory().to(device, non_blocking=True)
@@ -595,10 +680,12 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     if any(len(c.rows) != length for c in chunks):
         raise ValueError('bucket chunks by decision length before forward_chunks')
     device = next(model.parameters()).device
+    clock = _Clock('learn.', device)
     memory = model.block_memory
     cfg = memory.config
     store = chunks[0].snapshot.store
     B = len(chunks)
+    count('learn.calls', 1); count('learn.chunks', B); count('learn.rows', B*length)
     parts = []
     for chunk in chunks:
         snap = chunk.snapshot
@@ -626,22 +713,29 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
         for k in sel:
             unique.setdefault(int(p['bid'][k]), len(unique))
     def encode_sources(rows, pending):
-        from torch.utils.checkpoint import checkpoint
-        encoded = []
-        total = len(rows)
-        for begin in range(0, total, spatial_micro):
-            batch = from_rows(rows[begin:begin+spatial_micro], device, pending[begin:begin+spatial_micro])
-            encoded.append(checkpoint(model.encode_block, batch, use_reentrant=False)
-                           if torch.is_grad_enabled() and total > spatial_micro else model.encode_block(batch))
-        return torch.cat(encoded)
+        return encode_sorted(model, from_rows(rows, device, pending), spatial_micro)
     hist_written = None
     hist_rows = 0
     if unique:
+        clock.mark('select')
         ub = np.fromiter(unique.keys(), np.int64, len(unique))
-        rows_h, pend_h = store.source_rows(store.b_src[ub].reshape(-1))
-        hist_rows = len(rows_h)
-        zh = encode_sources(rows_h, pend_h)
+        from .structured_input import decode_frame_host, merge_host, from_host
+        packed = device.type == 'cuda'
+        hosts = []
+        for bid in ub.tolist():
+            d = store.decoded.get((bid, packed))
+            if d is None:
+                rows_b, pend_b = store.source_rows(store.b_src[bid])
+                d = decode_frame_host(rows_b, packed=packed)
+                d['pending'] = pend_b; d['first'] = np.asarray(rows_b['first'])
+                store.decoded[(bid, packed)] = d
+            hosts.append(d)
+        hist_rows = len(ub)*cfg.block_steps
+        clock.mark('hist_host_rows')
+        zh = encode_sorted(model, from_host(merge_host(hosts), device), spatial_micro)
         hist_written = memory.writer(zh.reshape(len(ub), cfg.block_steps, cfg.latents, cfg.latent_width))
+        clock.mark('hist_spatial_writer')
+        count('learn.hist_rows', hist_rows)
     # ---- open tails: re-encoded raw sources when a new block becomes visible / continuation needed
     tails = [None]*B
     tail_rows = 0
@@ -654,6 +748,8 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
         at = 0
         for i in enc:
             n = len(parts[i]['pdec']); tails[i] = zt[at:at+n]; at += n
+    clock.mark('tails')
+    count('learn.tail_rows', tail_rows)
     rest = [i for i in range(B) if tails[i] is None]
     pk_all = np.concatenate([parts[i]['pkvs'] for i in rest]) if rest else np.empty(0, np.int64)
     if len(pk_all):
@@ -705,21 +801,31 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
                     source[at+k] = len(ubid)+unique[int(p['bid'][k])]
                 at += len(p['bid'])
         old_vals = pool[torch.from_numpy(source).to(device)]
-    rows = source_rows([c.rows for c in chunks])
-    pending = np.concatenate([c.pending for c in chunks])
-    batch = from_rows(rows, device, pending)
-    encoded = None
-    if len(rows) > spatial_micro:
-        # Same bounded-activation Spatial as the historical sources: microbatch-sized
-        # slices of the decoded batch, recomputed in backward (non-reentrant
-        # checkpoint). Identical math; required at --micro 8192 on a 24 GB GPU.
-        from torch.utils.checkpoint import checkpoint
-        zs = []
-        for begin in range(0, len(rows), spatial_micro):
-            part = {k: v[begin:begin+spatial_micro] for k, v in batch.items()}
-            zs.append(checkpoint(model.encode_block, part, use_reentrant=False)
-                      if torch.is_grad_enabled() else model.encode_block(part))
-        encoded = torch.cat(zs)
+    clock.mark('pages_prefix_bank')
+    # Host-decoded frames are cached on each chunk: the same rollout chunk is read by
+    # the start-of-update pass and every epoch (decode once, upload per use).
+    from .structured_input import decode_frame_host, merge_host, from_host
+    packed = device.type == 'cuda'
+    hosts = []
+    for c in chunks:
+        h = c.__dict__.get('_host')
+        if h is None or h[0] != packed:
+            d = decode_frame_host(c.rows, packed=packed)
+            d['pending'] = np.asarray(c.pending, dtype=np.int64); d['first'] = np.asarray(c.rows['first'])
+            h = (packed, d)
+            if len(c.rows) > 1:
+                object.__setattr__(c, '_host', h)
+        hosts.append(h[1])
+    rows = chunks[0].rows if len(chunks) == 1 else None
+    batch = from_host(merge_host(hosts), device)
+    clock.mark('main_decode')
+    if TIMING_ON:
+        keys = ('v_body_mask', 'v_local_mask', 'v_entity_mask', 'v_inventory_mask', 'v_slots_mask')
+        count('learn.tokens_real', sum(int(batch[k].sum()) for k in keys)+30*B*length)
+        count('learn.tokens_padded', B*length*(30+sum(batch[k].shape[1] for k in keys)))
+    # Same bounded-activation, token-sorted Spatial as the historical sources
+    # (identical math; required at --micro 8192 on a 24 GB GPU).
+    encoded = encode_sorted(model, batch, spatial_micro)
 
     def call(z):
         return dense_memory_forward(memory, z.reshape(B, length, *z.shape[1:]), steps, prefixes, kp,
@@ -731,5 +837,7 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
                                     tail_rows=int(tail_rows)))
     if encoded is not None:
         ctx['encoded'] = encoded
+        clock.mark('main_spatial')
     outputs = model(batch, need_vg=True, temporal=ctx)
+    clock.mark('reader_heads')
     return outputs, batch, ctx, selected

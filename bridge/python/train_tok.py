@@ -1310,7 +1310,7 @@ def main(argv=None, child=None, actor=None):
     import torch
     from isaac_bridge.tok_obs import ENT_CAP, INV_CAP
     from isaac_bridge.tok_pickup import normalise_advantages, parse_pickup_force, pickup_force_p, ppo_part_terms
-    from isaac_bridge.tok_policy import (ENTITY_FIELDS, ROW_BYTES, GraphActor, TokPolicy, cat_batch,
+    from isaac_bridge.tok_policy import (ENTITY_FIELDS, ROW_BYTES, ROW_HEAD, GraphActor, TokPolicy, cat_batch,
                                          crn_uniforms, DEDUP, decode_rows, distinct_ids, first_of, learner_plan,
                                          load_compatible, main_parameter_names, memory_chunks, packed_index,
                                          drop_memory,
@@ -2788,7 +2788,7 @@ def main(argv=None, child=None, actor=None):
             all_mask = np.arange(capacity)[None,:] < lengths[:,None]
             rp_b = rl.block.plan(rl,all_mask)
             assert np.array_equal(rp_b['pos'],all_flat)
-            every = rows_to_device(rl.rows,all_flat,rl.pending.reshape(-1,nh)[all_flat],device,with_raw=fast2)
+            every = rows_to_device(rl.rows,all_flat,rl.pending.reshape(-1,nh)[all_flat],device,with_raw=fast2,head=True)
             if fast2:
                 every,raw_e,pend_e = every
             value_now = rl.value.copy() if recompute else None
@@ -2972,7 +2972,7 @@ def main(argv=None, child=None, actor=None):
                     L['stage'] = torch.empty((int(len(flat) * 1.25) + 64, ROW_BYTES), dtype=torch.uint8).pin_memory()
                 stage = L['stage']
             batch = rows_to_device(rl.rows, flat, rl.pending.reshape(-1, nh)[flat], device, stage=stage,
-                                   with_raw=fast)
+                                   with_raw=fast, head=block_on)
             if fast:   # (B18: a minibatch's records are gathered as bytes, the fields are views of them)
                 batch, raw_all, pend_all = batch
         b_act =torch.from_numpy(rl.actions.reshape(-1, nh)[flat]).to(device)
@@ -3074,9 +3074,11 @@ def main(argv=None, child=None, actor=None):
                 teach_meta[at_] = new_meta
                 if teach_gpu:   # the same records as bytes on the device (the teacher's minibatches gather there)
                     if L['teach_raw'] is None:
-                        L['teach_raw'] = torch.zeros((args.teach_buffer, ROW_BYTES), dtype=torch.uint8, device=device)
+                        L['teach_raw'] = torch.zeros((args.teach_buffer, ROW_HEAD if block_on else ROW_BYTES),
+                                                     dtype=torch.uint8, device=device)
                     L['teach_raw'][torch.from_numpy(at_).to(device)] = torch.from_numpy(
-                        np.ascontiguousarray(new_rows).view(np.uint8).reshape(teach_new, ROW_BYTES)).to(device)
+                        np.ascontiguousarray(new_rows).view(np.uint8).reshape(teach_new, ROW_BYTES)
+                        [:, :L['teach_raw'].shape[1]]).to(device)
             L['teach_at'] = (L['teach_at'] + teach_new) % args.teach_buffer
             L['teach_n'] = min(L['teach_n'] + teach_new, args.teach_buffer)
             sec('teach_new')
@@ -3162,7 +3164,7 @@ def main(argv=None, child=None, actor=None):
                 if NI_f:   # (B24)
                     L['v2_cnt']['n_item'][at_v] = item_count(v_rows, item_slots)
                 if L['v2_raw'] is None:
-                    L['v2_raw'] = torch.zeros((B_, ROW_BYTES), dtype=torch.uint8, device=device)
+                    L['v2_raw'] = torch.zeros((B_, ROW_HEAD if block_on else ROW_BYTES), dtype=torch.uint8, device=device)
                     L['v2_pend'] = torch.zeros((B_, nh), dtype=torch.int64, device=device)
                     L['v2_act'] = torch.zeros((B_, nh), dtype=torch.int64, device=device)
                     L['v2_w'] = torch.zeros(B_, dtype=torch.float32, device=device)
@@ -3194,7 +3196,8 @@ def main(argv=None, child=None, actor=None):
                 if mem_on:
                     L['v2_h'][at_d] = torch.from_numpy(np.ascontiguousarray(v_hs, np.float32)).to(device)
                 L['v2_raw'][at_d] = torch.from_numpy(
-                    np.ascontiguousarray(v_rows).view(np.uint8).reshape(v2_new, ROW_BYTES)).to(device)
+                    np.ascontiguousarray(v_rows).view(np.uint8).reshape(v2_new, ROW_BYTES)
+                    [:, :L['v2_raw'].shape[1]]).to(device)
                 L['v2_pend'][at_d] = torch.from_numpy(pend_v).to(device)
                 L['v2_act'][at_d] = torch.from_numpy(act_v).to(device)
                 L['v2_w'][at_d] = torch.from_numpy(v_meta[:, V2I['weight']].astype(np.float32)).to(device)
@@ -3497,7 +3500,8 @@ def main(argv=None, child=None, actor=None):
                     elif teach_gpu:
                         tb = decode_rows(L['teach_raw'].index_select(0, dev(pick) if pick_d is None else pick_d),
                                          pending=teach_pending(meta).clone(),
-                                         entities=min(ENT_CAP, used_entities(teach_rows['n_ent'][pick])))
+                                         entities=min(ENT_CAP, used_entities(teach_rows['n_ent'][pick])),
+                                         visible='gate' if block_on else True)
                     else:
                         tb = to_batch(teach_rows[pick], teach_pending(teach_meta[pick]), device)
                     sec('teach_build')
@@ -3509,7 +3513,8 @@ def main(argv=None, child=None, actor=None):
                     v_w, v_G = L['v2_w'].index_select(0, vpick_d), L['v2_G'].index_select(0, vpick_d)
                     v_ent = min(ENT_CAP, used_entities(L['v2_cnt']['n_ent'][vpick]))
                     vb = vpick_d if raw_mode else decode_rows(L['v2_raw'].index_select(0, vpick_d),
-                                                              pending=v_pend, entities=v_ent)
+                                                              pending=v_pend, entities=v_ent,
+                                                              visible='gate' if block_on else True)
                     v_h = L['v2_h'].index_select(0, vpick_d) if mem_on else None   # (memory) their input states
                     v_share = args.teacher_v2_weight * v2_step / n_sel
                     sec('teach_build')
@@ -3519,6 +3524,9 @@ def main(argv=None, child=None, actor=None):
                     bounds = [(lo_, min(lo_ + micro, len(sel)), None) for lo_ in range(0, len(sel), micro)]
                 last = bounds[-1][0]
                 for lo_, hi_, cids_ in bounds:   # the minibatch's means, a part at a time
+                    if block_on:   # (B42: let a waiting actor graph capture in between parts)
+                        from isaac_bridge.block_training import capture_yield
+                        capture_yield()
                     m_ = pmark('b38:part_plan')
                     part = sel[lo_:hi_]
                     part_h = sel_h[lo_:hi_]
@@ -4819,7 +4827,16 @@ def main(argv=None, child=None, actor=None):
                 t_gc = time.perf_counter()
                 gc_b = block_actor.store.collect()
                 lane_stat['block_gc_s'] = time.perf_counter()-t_gc
-                lane_stat['block_kv_rows'], lane_stat['block_blocks'], lane_stat['block_raw_rows'] =                     gc_b['kv'], gc_b['blocks'], gc_b['raw']
+                lane_stat['block_kv_rows'], lane_stat['block_blocks'], lane_stat['block_raw_rows'] = (
+                    gc_b['kv'], gc_b['blocks'], gc_b['raw'])
+                from isaac_bridge import block_paged as bp_t
+                if bp_t.TIMING_ON:
+                    enc_t=[g for a_t in [block_actor,*lanes.actors.values()] for g in (a_t.encoder,a_t.reader)
+                           if g is not None]
+                    print('B42 timing', json.dumps(dict(bp_t.timing_report(),
+                        graph_captures=sum(e.captures for e in enc_t),graph_replays=sum(e.replays for e in enc_t),
+                        encoder_busy_misses=sum(getattr(e,'busy_misses',0) for e in enc_t),
+                        gc_s=lane_stat['block_gc_s'],**gc_b)),flush=True)
             if t_on:   # (B31) the actor's writes into the rollout's device tensors done before the learner reads them
                 torch.cuda.current_stream().synchronize()
             if proc:   # B38 step 2: what the learner process needs of this rollout (its arrays are shared)

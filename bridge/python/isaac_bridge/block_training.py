@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 import io
 import os
 import threading
+import time
 import hashlib
 from functools import cached_property, lru_cache
 from contextlib import contextmanager
@@ -26,6 +27,8 @@ from .structured_input import from_rows, FRAME_BYTES, VERSION
 from .block_paged import PagedSnapshot, PagedPayload, forward_chunks_paged
 
 CUDA_CAPTURE_ADMISSION = threading.RLock()
+CAPTURE_WAITING = threading.Event()
+_CAPTURE_RETRY = {}
 
 
 @contextmanager
@@ -33,6 +36,34 @@ def learner_cuda_activity():
     """No CUDA capture may overlap submissions from the learner thread."""
     with CUDA_CAPTURE_ADMISSION:
         yield
+
+
+def capture_yield():
+    """Learner thread, between forward groups (no CUDA call in progress): if an actor
+    graph is waiting to be captured, hand it the admission and take it back after.
+    Without this a learner busy for the whole update kept every graph key first seen
+    during learning (all teacher-generation actors) on the eager path."""
+    if CAPTURE_WAITING.is_set() and CUDA_CAPTURE_ADMISSION._is_owned():
+        state=CUDA_CAPTURE_ADMISSION._release_save()
+        time.sleep(0.002)
+        CUDA_CAPTURE_ADMISSION._acquire_restore(state)
+
+
+def capture_admission(key):
+    """Actor thread: admission to capture a new graph key (bounded wait, spaced retries)."""
+    if CUDA_CAPTURE_ADMISSION.acquire(blocking=False):
+        return True
+    now=time.monotonic()
+    if now<_CAPTURE_RETRY.get(key,0.0):
+        return False
+    CAPTURE_WAITING.set()
+    try:
+        got=CUDA_CAPTURE_ADMISSION.acquire(timeout=0.5)
+    finally:
+        CAPTURE_WAITING.clear()
+    if not got:
+        _CAPTURE_RETRY[key]=now+10.0
+    return got
 
 
 @dataclass(frozen=True)
@@ -209,7 +240,7 @@ class SpatialEncoderGraph:
                 return source,self.model.encode_block(source,packed=False)
         key=tuple((k,shapes[k],v.dtype) for k,v in source.items())
         if key not in self.graphs:
-            if not CUDA_CAPTURE_ADMISSION.acquire(blocking=False):
+            if not capture_admission((id(self),key)):
                 self.busy_misses+=1
                 with torch.autocast('cuda',dtype=torch.bfloat16,enabled=self.bf16):
                     return source,self.model.encode_block(source,packed=False)
@@ -260,7 +291,8 @@ class ReaderStepGraph:
         prefix_dtype=torch.bfloat16 if self.bf16 else prefixes[0][0].dtype
         key=(batch,bank_size,z.dtype,bank.dtype,prefix_dtype)
         if key not in self.graphs:
-            if not CUDA_CAPTURE_ADMISSION.acquire(blocking=False):
+            if not capture_admission((id(self),key)):
+                self.busy_misses=getattr(self,'busy_misses',0)+1
                 return self.memory.read(z,position,prefixes,bank,ends,kp)
             try:
                 sz=z.new_zeros((batch,*z.shape[1:]))
@@ -615,6 +647,7 @@ def forward_bucketed(model, chunks, max_rows=None, **kwargs):
     for length, group in by_length.items():
         size = len(group) if max_rows is None else max(1,int(max_rows)//length)
         for at in range(0,len(group),size):
+            capture_yield()
             indices = group[at:at+size]
             output, _, ctx, _ = forward_chunks(model,[chunks[i] for i in indices],**kwargs)
             for key,value in ctx['recompute_stats'].items():stats[key]+=value
