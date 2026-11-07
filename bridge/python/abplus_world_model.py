@@ -101,8 +101,13 @@ def prep(args):
     n = 0
     width = heads = None
     action_max = None
+    input_contract=None
     for ri, root in enumerate(args.roots):
         fmt = json.loads((Path(root) / 'format.json').read_text())
+        contract=(fmt.get('input_schema'),fmt.get('feature_semantics'))
+        if input_contract is None:input_contract=contract
+        elif contract!=input_contract:
+            raise ValueError('cannot mix different observation/feature schemas in one world-model dataset')
         width, heads = fmt['width'], fmt['heads']
         by_worker = {}
         for w, rec in iter_records(root, 'stream'):

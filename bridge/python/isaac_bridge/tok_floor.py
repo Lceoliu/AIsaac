@@ -393,10 +393,16 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         v2_p = cfg.teacher_v2_random * cfg.frames_per_decision / 30 / 3600   # random points per decision
         v2_n = [0]
     t_dim = int(getattr(cfg, 'temporal_dim', 0) or 0)
+    block_on=bool(cfg.block_memory)
+    block_arrays=None
     if laneon and (cfon or t_dim):   # B34: value_global, snapshot requests, the lanes' temporal outputs (tok_cf)
         from .tok_cf import attach_cf, cf_names_offset
         cf_blocks, main_vg, cf_snap, lane_t, v2_t = attach_cf(v2_names[cf_names_offset(cfg):], cfg.workers, t_dim)
         blocks = blocks + cf_blocks
+    if block_on:
+        from .block_protocol import attach as attach_block,write_injury_jobs,shapes as block_shapes
+        b_blocks,block_arrays=attach_block(v2_names[-len(block_shapes(cfg)):],cfg)
+        blocks=blocks+b_blocks
     if cfon:   # B34 (tok_cf.py): the choice points' quota, detector state, snapshot bank and branch context
         from .tok_cf import (TI as CF_TI, TRIGGERS as CF_TRIGGERS, Quota as CfQuota, bank_rows, cf_search,
                              consume_wall as cf_consume_wall, detect as cf_detect)
@@ -410,6 +416,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         cf_n = [0]
         cf_B = bank_rows(cfg) if t_dim else 0   # bank rows of this worker: index * cf_B + b
         cf_bank_free = list(range(cf_B))
+        cf_bank_releasing=set()
 
         def cf_release(p_):
             """A choice point's restore point and bank row let go (a pending dict or a queued V2Point)."""
@@ -419,9 +426,19 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 base_p.release()
             if bank_p is not None:
                 with qlock:
-                    cf_bank_free.append(int(bank_p) - index * cf_B)
+                    local_b=int(bank_p)-index*cf_B
+                    if block_on:
+                        block_arrays[0][index,local_b]=3
+                        cf_bank_releasing.add(local_b)
+                    else:
+                        cf_bank_free.append(local_b)
 
     qlock = threading.RLock()   # 2026-10-10: the queue is shared with the search thread (cfg.teacher_thread)
+    injury_active=[]
+
+    def sync_injury_jobs():
+        if block_on:
+            write_injury_jobs(block_arrays,index,queue,injury_active)
     search_errors = [0]
 
     def search(item, pair=True):
@@ -432,6 +449,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 while cfg.teacher_pair and queue and queue[-1][0] is base_ and queue[-1][2] is applied_ and \
                         queue[-1][7] == fatal:   # (a fatal hurt is searched on its own: other depths and margin)
                     items.append(queue.pop())
+                injury_active.extend(items)
+                sync_injury_jobs()
         t0 = time.perf_counter()
         held = control[1]
         prof = [] if prof_file is not None else None
@@ -466,14 +485,23 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             n_found += len(found)
             for k, at, under_way, lost, taken in found:
                 slot = int(mine[ST['teach']]) % TEACH_RING
+                if block_on:
+                    block_arrays[5][index,slot]=0
                 trow = teach_rows[index, slot:slot + 1]
                 encode_row(at, EpisodeState(limit, floor=True, run=run, items=cfg.items), trow, it[3] - 1 - k)
                 trow['episode'], trow['seed'], trow['group'], trow['first'] = it[5], it[4], group, 0
                 safe = [m for m in range(9) if lost[m] == 0]
                 teach_meta[index, slot] = teach_meta_row(under_way, lost, taken, k, safe)
+                if block_on:
+                    block_arrays[5][index,slot]=int(mine[ST['teach']])+1
                 mine[ST['teach']] += 1
                 mine[ST['avoidable']] += bool(safe)
         mine[ST['teach_s']] += time.perf_counter() - t0
+        if pair:
+            with qlock:
+                for it in items:
+                    injury_active.remove(it)
+                sync_injury_jobs()
         if prof is not None:
             prof_write(prof_file, prof, t0, t_enc, c0, held, int(control[1]), len(applied_) - offset, hurt_at - offset,
                        n_found, len(queue), len(items))
@@ -502,12 +530,16 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         lane lock is held), with their GRU input states (memory) and temporal outputs (B34, temporal lanes)."""
         for j in range(len(rows_)):
             slot = int(mine[ST['v2_records']]) % V2_RING
+            if block_on:
+                v2_t[index,slot,-1]=0
             v2_rows[index, slot] = rows_[j]
             v2_meta[index, slot] = meta_[j]
             if v2_h is not None:
                 v2_h[index, slot] = hs_[j] if hs_ is not None else 0.0
             if v2_t is not None:
                 v2_t[index, slot] = ts_[j] if ts_ is not None else 0.0
+            if block_on:
+                v2_t[index,slot,-1]=int(mine[ST['v2_records']])+1
             mine[ST['v2_records']] += 1
 
     def v2_search(pt):
@@ -519,7 +551,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     def v2_search_locked(pt):
         t0, c0 = time.perf_counter(), time.thread_time()
         policy = LanePolicy(v2_conn, lane_io, lane_out, index, lambda: bool(control[0]) or search_stop.is_set(),
-                            lane_h=lane_h, lane_t=lane_t)
+                            lane_h=lane_h, lane_t=lane_t,block_mode=block_arrays[1] if block_on else None)
         s0 = dict(v2ctx.stats)
         res = None
         try:
@@ -580,7 +612,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         row by the caller (a child never takes qlock)."""
         t0, c0 = time.perf_counter(), time.thread_time()
         policy = LanePolicy(v2_conn, lane_io, lane_out, index, lambda: bool(control[0]) or search_stop.is_set(),
-                            lane_h=lane_h, lane_t=lane_t)
+                            lane_h=lane_h, lane_t=lane_t,block_mode=block_arrays[1] if block_on else None,
+                            block_keep=block_arrays[4] if block_on else None)
         s0 = dict(cfctx.stats)
         rng_p = np.random.default_rng([cfg.seed, index, 37, int(pt.pid) % (2 ** 62)])   # per point (a child's draws
         res = None                                                                        # never reach the parent)
@@ -625,6 +658,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 mine[ST['cf_defer_wait']] += defer_['wait']
             if res['improving']:
                 mine[ST['cf_improving']] += 1
+                if block_on:
+                    pt.version=policy.fixed_version
                 mine[ST['cf_target_best']] += getattr(res['best']['intent'], 'kind', '') == 'target'
                 rows_, meta_ = records_of(res, cfctx, pt, index, cfg.cf_cap,
                                           steps=res.get('distill', cfg.cf_distill_steps))
@@ -635,6 +670,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         mine[ST['cf_wait_s']] += policy.wait_s
         mine[ST['cf_cpu']] += time.thread_time() - c0
         mine[ST['cf_s']] += time.perf_counter() - t0
+        if block_on:
+            block_arrays[4][index]=0
 
     def cf_forked(pt):
         """cf_run in a forked child of the worker (cfg.teacher_fork, as search_forked: no GIL contention with the
@@ -697,6 +734,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         if status != 0 and status != -1:
             mine[ST['errors']] += 1
             mine[ST['cf_errors']] += 1
+        if block_on:   # the child may have been killed before its Python finally
+            block_arrays[1][index]=0
+            block_arrays[4][index]=0
         cf_release(pt)   # (the bank row; the base is already None)
 
     def cf_loop():
@@ -746,9 +786,13 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         j = gate.take()
         if j is None:
             return False
+        item=None
         try:
             with qlock:
                 item = queue.pop() if queue else None
+                if item is not None:
+                    injury_active.append(item)
+                    sync_injury_jobs()
             if item is None:
                 return True
             base_ = item[0]
@@ -808,6 +852,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             if status != 0 and status != -1:
                 mine[ST['errors']] += 1
         finally:
+            if item is not None:
+                with qlock:
+                    injury_active.remove(item)
+                    sync_injury_jobs()
             gate.give(j)
         return True
 
@@ -1467,6 +1515,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 item[0].release()
             mine[ST['dropped']] += len(queue)
             queue.clear()
+            sync_injury_jobs()
             mine[ST['queue']] = 0
             if cfon:   # B34: the queued choice points too
                 for pt in cf_queue:
@@ -1824,6 +1873,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 bank_ = None
                                 if ok_ and cf_B:   # (temporal: a bank row for the snapshot)
                                     with qlock:
+                                        if block_on:
+                                            acknowledged={b for b in cf_bank_releasing if block_arrays[0][index,b]==0}
+                                            cf_bank_free.extend(acknowledged)
+                                            cf_bank_releasing.difference_update(acknowledged)
                                         b_ = cf_bank_free.pop() if cf_bank_free else None
                                     if b_ is None:   # (the token back; a replaced point stays replaced)
                                         ok_ = False
@@ -1835,7 +1888,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 if ok_:
                                     cf_quota.pending.append(dict(trig=trig_, target=target_, fresh=fresh_, at=t_ep,
                                                                  base=base.hold(), reseed=base_reseed, offset=base_t,
-                                                                 bank=bank_))
+                                                                 bank=bank_,charged=victim_ is None))
                                     if bank_ is not None:
                                         cf_snap_req = bank_ + 1
                                 else:
@@ -1857,6 +1910,19 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 v2log.h.append(main_h[index].copy())
                             if cfon:   # B34: and its value_global
                                 v2log.vg.append(float(main_vg[index]))
+                        if block_on:
+                            for point_b in list(cf_quota.pending):
+                                bank_b=point_b['bank']
+                                if bank_b is not None and block_arrays[0].flat[bank_b]==-1:
+                                    cf_quota.pending.remove(point_b)
+                                    if point_b['charged']:
+                                        cf_quota.budget=min(cf_quota.burst,cf_quota.budget+1.0)
+                                    cf_release(point_b)
+                                    mine[ST['cf_nobank']]+=1
+                                    mine[ST['cf_skipped']]+=1
+                    if block_on:
+                        v2log.rows.append(row.copy())
+                        v2log.pending.append(tuple(action))
                     if cf_snap_req:   # B34: the actor copies this worker's temporal slot into the point's bank row
                         #             before this record's step (the record before is answered: no other request
                         #             of this worker is outstanding)
@@ -1911,6 +1977,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 mine[ST['dropped']] += 1
                             queue[:] = [it for j, it in enumerate(queue) if j not in set(drop)]
                         mine[ST['queue']] = len(queue)
+                        sync_injury_jobs()
                     while queue and not threaded and not control[0] and \
                             mine[ST['teach_s']] < cfg.teacher_share * (time.perf_counter() - t_begin):
                         if not search_gated():

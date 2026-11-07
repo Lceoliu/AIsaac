@@ -1,0 +1,341 @@
+"""Visible-input v1. Ragged P/E/N/S, objective room cells, independent local patches.
+
+The inline transport budget is bytes, not an inventory/slot token limit. A whole
+oversized frame fails before publication. No legacy field is an actor input.
+"""
+import numpy as np
+import torch
+from functools import lru_cache
+from torch import nn
+from torch.nn import functional as F
+
+SCHEMA = 'isaac-visible-p r l m e n s-g-v1'.replace(' ', '')
+VERSION = 20261107
+FRAME_BYTES = 131072
+P_FIELDS = ('x','y','vx','vy','size','hearts','max_hearts','soul','black','bone','eternal',
+            'golden','lives','coins','bombs','keys','damage','fire_delay_max','shot_speed',
+            'range','speed','luck','can_fly','invulnerable','controls','head_dir','fire_dir',
+            'move_dir','aframe','dead','unknown_fire_delay','unknown_damage_cooldown','unknown_charge','weapons','ptype')
+PF, EF, NF, SF, RC = 42, 48, 4, 13, 16
+HEADER = 8
+FIXED = HEADER + 16*28*4 + 13*13
+RAGGED = {'body':PF, 'local':9*9*4, 'entity':EF, 'inventory':NF, 'slots':SF}
+ROOM_BITS = (1,3,1,1,1,1,1,1,1,5,1,1,1)
+ROOM_SCALES = (1,6,1,1,1,1,1,1,1,30,1,1,1)
+
+
+def pack_canvas(x,bits,scales):
+    values=np.moveaxis(np.asarray(x),-3,-1)*np.asarray(scales)
+    integer=np.rint(values).astype(np.int64)
+    if not np.allclose(values,integer,atol=1e-5) or np.any(integer<0) or np.any(integer>=2**np.array(bits)):
+        raise ValueError('canvas values are outside the lossless visible terrain schema')
+    shifts=np.cumsum((0,)+tuple(bits[:-1]))
+    return (integer<<shifts).sum(-1).astype('<f4')
+
+
+def unpack_canvas(x,bits,scales):
+    shifts=x.new_tensor(np.cumsum((0,)+tuple(bits[:-1])),dtype=torch.int64)
+    masks=x.new_tensor([2**n-1 for n in bits],dtype=torch.int64)
+    return ((x.long()[...,None]>>shifts)&masks).float()/x.new_tensor(scales)
+
+
+def pack_room(x):
+    # Thirteen discrete public channels packed losslessly, plus explicit visible
+    # grid type/variant/state. Four float32 words per cell rather than sixteen.
+    x=np.asarray(x)
+    return np.concatenate((pack_canvas(x[...,:13,:,:],ROOM_BITS,ROOM_SCALES)[...,None],
+                           np.moveaxis(x[...,13:,:,:],-3,-1)),axis=-1)
+
+
+def unpack_room(x):
+    x=x.reshape(*x.shape[:-1],-1,4)
+    return torch.cat((unpack_canvas(x[...,0],ROOM_BITS,ROOM_SCALES),x[...,1:]),-1)
+
+
+def pack_frame(body, room, local, minimap, entity, inventory, slots):
+    counts = (len(body), len(entity), len(inventory), len(slots))
+    if not counts[0] or counts[1] > 128:
+        raise ValueError('visible-v1 requires bodies and at most 128 visible entities')
+    arrays = [np.asarray(x, dtype='<f4').reshape(-1) for x in
+              (pack_room(room),pack_canvas(minimap,(1,)*8,(1,)*8),body,
+               pack_room(local),entity,inventory,slots)]
+    size = HEADER + sum(a.size for a in arrays)
+    if size*4 > FRAME_BYTES:
+        raise ValueError(f'complete visible-v1 frame needs {size*4} bytes; transport budget {FRAME_BYTES}; no truncation')
+    # Float header magic is exactly representable; the separate ROW version is int32.
+    return np.concatenate((np.array([61107, size, *counts, 1, 0], '<f4'), *arrays)).tobytes()
+
+
+def write_frame(row, payload):
+    if len(payload) > FRAME_BYTES:
+        raise ValueError('visible-v1 frame exceeds transport byte budget')
+    row['visible_bytes'] = len(payload)
+    row['visible_frame'][0, :len(payload)] = np.frombuffer(payload, np.uint8)
+    row['visible_schema'] = VERSION
+
+
+def decode_frame(raw, sizes, versions):
+    """Device-native typed gather; CPU decisions only choose bucket shapes before capture."""
+    if not bool((versions == VERSION).all()):
+        raise ValueError('missing/old visible input schema; legacy observations are not accepted')
+    f = raw.contiguous().view(torch.float32)
+    counts = f[:, 2:6].long()
+    p,e,n,s = counts.unbind(1)
+    expected = FIXED + p*(PF+324) + e*EF+n*NF+s*SF
+    if not bool(((f[:,0] == 61107) & (f[:,1] == expected) & (sizes == expected*4) &
+                 (p > 0) & (e <= 128) & (counts >= 0).all(1) & (sizes <= FRAME_BYTES)).all()):
+        raise ValueError('invalid visible-v1 complete frame length/counts')
+    b = {'v_room': unpack_room(f[:,HEADER:HEADER+1792]).transpose(1,2).reshape(-1,RC,16,28),
+         'v_map': unpack_canvas(f[:,HEADER+1792:FIXED],(1,)*8,(1,)*8).transpose(1,2).reshape(-1,8,13,13)}
+    offset = torch.full_like(p, FIXED)
+    for name, count in zip(RAGGED, (p,p,e,n,s)):
+        width = RAGGED[name]
+        bucket = max(1, (int(count.max())+3)//4*4)
+        at = torch.arange(bucket,device=f.device)[None,:]
+        valid = at < count[:,None]
+        idx = offset[:,None,None]+at[:,:,None]*width+torch.arange(width,device=f.device)
+        values = f.gather(1, idx.clamp_max(f.shape[1]-1).reshape(len(f),-1)).reshape(len(f),bucket,width)
+        b['v_'+name] = values.masked_fill(~valid[:,:,None],0)
+        b['v_'+name+'_mask'] = valid
+        offset = offset+count*width
+    b['v_local']=unpack_room(b['v_local']).transpose(2,3).flatten(2)
+    return b
+
+
+def from_rows(rows, device, pending=None):
+    # NumPy views decode the host wire without copying its 128-KiB padding or
+    # dispatching hundreds of tiny Torch CPU operations for every history batch.
+    device=torch.device(device)
+    b=decode_frame_host(rows,packed=device.type=='cuda')
+    if pending is not None:
+        b['pending']=np.asarray(pending,dtype=np.int64)
+        b['first']=rows['first']
+    if device.type=='cpu':return {k:torch.from_numpy(v) for k,v in b.items()}
+    # A dtype-preserving byte slab needs one H2D and no GPU float->mask/int casts.
+    layout={};offset=0
+    for name,value in b.items():
+        offset=(offset+7)//8*8
+        layout[name]=(offset,value.nbytes,value.shape,torch.from_numpy(np.empty((),dtype=value.dtype)).dtype)
+        offset+=value.nbytes
+    slab=np.empty(offset,dtype=np.uint8)
+    for name,value in b.items():
+        np.ndarray(value.shape,dtype=value.dtype,buffer=slab,offset=layout[name][0])[...]=value
+    # Data decoding never needs autograd or autocast. A single execution context
+    # avoids recompiling identical bitfields for actor/learner and FP32/BF16.
+    with torch.inference_mode(False),torch.no_grad(),torch.autocast('cuda',enabled=False):
+        flat=torch.from_numpy(slab).pin_memory().to(device,non_blocking=True)
+        b={name:flat.narrow(0,start,size).view(dtype).reshape(shape)
+           for name,(start,size,shape,dtype) in layout.items()}
+        b['v_room'],b['v_local'],b['v_map']=canvas_decoder()(b['v_room'],b['v_local'],b['v_map'])
+    return b
+
+
+def expand_canvases(room,local,minimap):
+    """Tensor-only expansion: upload packed cells, fuse their bitfield decoding."""
+    room=unpack_room(room).transpose(1,2).reshape(-1,RC,16,28)
+    local=unpack_room(local).transpose(2,3).flatten(2)
+    minimap=unpack_canvas(minimap,(1,)*8,(1,)*8).transpose(1,2).reshape(-1,8,13,13)
+    return room,local,minimap
+
+
+@lru_cache(maxsize=1)
+def canvas_decoder():
+    # Shape-polymorphic Inductor kernels; no CUDA-graph-owned output buffers.
+    return torch.compile(expand_canvases,fullgraph=True,dynamic=True)
+
+
+def _unpack_room_host(x):
+    x=x.reshape(*x.shape[:-1],-1,4)
+    shifts=np.cumsum((0,)+ROOM_BITS[:-1],dtype=np.uint32)[:,None]
+    masks=((np.uint32(1)<<np.asarray(ROOM_BITS,dtype=np.uint32))-np.uint32(1))[:,None]
+    bits=np.right_shift(x[...,0].astype(np.uint32)[...,None,:],shifts)
+    np.bitwise_and(bits,masks,out=bits)
+    result=np.empty((*x.shape[:-2],16,x.shape[-2]),dtype=np.float32)
+    np.divide(bits,np.asarray(ROOM_SCALES,dtype=np.float32)[:,None],
+              out=result[...,:13,:],dtype=np.float32)
+    result[...,13:,:]=np.moveaxis(x[...,1:],-1,-2)
+    return result
+
+
+def decode_frame_host(rows,packed=False):
+    """Same contract as decode_frame; strided ROW views remain zero-copy on input."""
+    if not np.all(rows['visible_schema']==VERSION):
+        raise ValueError('missing/old visible input schema; legacy observations are not accepted')
+    f=rows['visible_frame'].view('<f4')
+    counts=f[:,2:6].astype(np.int64);p,e,n,s=counts.T
+    expected=FIXED+p*(PF+324)+e*EF+n*NF+s*SF
+    if not np.all((f[:,0]==61107)&(f[:,1]==expected)&(rows['visible_bytes']==expected*4)&
+                  (p>0)&(e<=128)&(counts>=0).all(1)&(rows['visible_bytes']<=FRAME_BYTES)):
+        raise ValueError('invalid visible-v1 complete frame length/counts')
+    room=f[:,HEADER:HEADER+1792]
+    minimap=f[:,HEADER+1792:FIXED]
+    if not packed:
+        room=_unpack_room_host(room).reshape(-1,RC,16,28)
+        minimap=((minimap.astype(np.int64)[...,None]>>np.arange(8))&1).astype(np.float32)
+        minimap=minimap.transpose(0,2,1).reshape(-1,8,13,13)
+    b={'v_room':room,'v_map':minimap}
+    offset=np.full_like(p,FIXED)
+    for name,count in zip(RAGGED,(p,p,e,n,s)):
+        width=RAGGED[name];bucket=max(1,(int(count.max())+3)//4*4)
+        at=np.arange(bucket)[None,:];valid=at<count[:,None]
+        idx=offset[:,None,None]+at[:,:,None]*width+np.arange(width)
+        values=f[np.arange(len(rows))[:,None,None],np.minimum(idx,f.shape[1]-1)]
+        values[~valid]=0
+        b['v_'+name]=values;b['v_'+name+'_mask']=valid
+        offset+=count*width
+    if not packed:b['v_local']=_unpack_room_host(b['v_local']).reshape(len(rows),-1,RC*81)
+    return b
+
+
+def observation_frame(o):
+    """Only public raw bridge fields. Reward/privileged totals never enter this path."""
+    if o.visible is None:
+        raise ValueError('bridge did not send visible-v1 extension')
+    ext=o.visible
+    if ext['schema'] != SCHEMA or len(ext['bodies']) != len(o.players):
+        raise ValueError('bridge visible-v1 schema/body mismatch')
+    body=np.zeros((len(o.players),PF),np.float32)
+    room=np.zeros((RC,16,28),np.float32)
+    terrain=o.terrain
+    if terrain is None:
+        raise ValueError('visible-v1 requires room terrain')
+    width,height=terrain['width'],terrain['height']
+    if width>28 or height>16: raise ValueError('room canvas overflow')
+    positions=[]
+    for index,x,y,collision,inside,walkable,pit,hazard,solid,destructible in terrain['cells']:
+        iy,ix=divmod(index,width)
+        # Objective grid collision; never player-0 CanFly/size-dependent pathfinding.
+        room[:6,iy,ix]=(inside,collision/6,solid,pit,destructible,hazard)
+        positions.append((index,x,y))
+    def cell(x,y):
+        index,_,_=min(positions,key=lambda c:(c[1]-x)**2+(c[2]-y)**2)
+        return divmod(index,width)
+    for d in o.doors:
+        iy,ix=cell(d['x'],d['y'])
+        room[6:12,iy,ix]=(1,d['open'],d['locked'],d['target_type']/30,int(d['seen'])&1,(int(d['seen'])>>1)&1)
+    for g in o.grid or ():
+        iy,ix=cell(g[5],g[6])
+        room[13:16,iy,ix]=(g[1]/32,g[2]/256,g[3]/256)
+        if g[1] in (17,18):
+            iy,ix=cell(g[5],g[6]);room[12,iy,ix]=1
+    local=np.zeros((len(body),RC,9,9),np.float32)
+    scales=np.array([520,280,10,10,20,12,12,12,65535,6,2,2,4,100,100,100,10,20,2,500,2,5,
+                     1,1,1,4,4,4,60,1,20,60,60,2048,32],np.float32)
+    health=[P_FIELDS.index(k) for k in ('hearts','max_hearts','soul','black','bone','eternal','golden')]
+    for i,(p,meta) in enumerate(zip(o.players,ext['bodies'])):
+        values=np.array([0 if k.startswith('unknown_') else p[k] for k in P_FIELDS],np.float32)
+        values[0]-=o.room[8];values[1]-=o.room[9]
+        known=not(ext['curses'] & 8)
+        if not known: values[health]=0
+        body[i,:35]=values/scales
+        body[i,35:]=(i,meta['controller'],meta['controller_known'],meta['animation']/32,
+                       meta['animation_known'],float(known),ext['capabilities'])
+        iy,ix=cell(p['x'],p['y'])
+        padded=np.pad(room,((0,0),(4,4),(4,4)))
+        local[i]=padded[:,iy:iy+9,ix:ix+9]
+    # Legal minimap only, never room descriptors that the player has not seen.
+    minimap=np.zeros((8,13,13),np.float32)
+    from .tok_obs import SHAPE_CELLS
+    for m in o.map:
+        idx=int(m['idx'])
+        for delta in (0,)+SHAPE_CELLS.get(int(m['shape']),()):
+            j=idx+delta
+            if 0<=j<169:
+                y,x=divmod(j,13);kind=int(m['type']);flags=int(m['flags'])
+                minimap[:,y,x]=(1,flags&1,(flags>>1)&1,idx==o.room[4],kind==5,kind==4,kind==2,kind not in (1,2,4,5))
+    entities=o.entities
+    if len(entities)>128:
+        # Contract E is nearest 128 visible entities, unlike uncapped inventory/slots.
+        distances=np.min(np.stack([(entities['x']-p['x'])**2+(entities['y']-p['y'])**2 for p in o.players]),0)
+        entities=entities[np.argsort(distances,kind='stable')[:128]]
+    ef=('type','variant','subtype','x','y','vx','vy','size','size_mx','size_my','coll','gcoll','cdmg',
+        'aframe','age','kind','flags','anim','flip','champion','hp','height','fall','scale',
+        'l_cos','l_sin','l_len','l_ex','l_ey','l_radius','l_circle','price')
+    entity=np.zeros((len(entities),EF),np.float32)
+    for i,en in enumerate(entities):
+        vals=np.array([en[k] for k in ef],np.float32)
+        identity_known=not(ext['curses']&64 and en['type']==5 and en['variant']==100)
+        if not identity_known:vals[2]=0
+        vals[3]=(vals[3]-o.room[8])/520;vals[4]=(vals[4]-o.room[9])/280
+        vals[5:10]/=20;vals[13:15]/=60;vals[20]=vals[20] if int(en['flags'])&4 else 0
+        vals[21:24]/=30;vals[26:30]/=520;vals[31]/=100
+        entity[i,:32]=vals
+        word=int(en['tflags'])
+        entity[i,32:47]=[(word>>k)&1 for k in (0,1,2,3,4,5,6,7,8,10,12,13,16,19,22)]
+        entity[i,47]=identity_known
+    inv=np.asarray(ext['inventory'],np.float32).reshape(-1,NF)
+    slots=np.asarray(ext['slots'],np.float32).reshape(-1,SF)
+    return pack_frame(body,room,local,minimap,entity,inv,slots)
+
+
+class StructuredSpatial(nn.Module):
+    def __init__(self,width,layers,heads):
+        super().__init__()
+        from .tok_policy import Block
+        self.body=nn.Sequential(nn.Linear(PF,width),nn.GELU(),nn.Linear(width,width))
+        self.room=nn.Sequential(nn.Conv2d(RC,32,3,2,1),nn.GELU(),nn.Conv2d(32,64,3,2,1),nn.GELU())
+        self.room_project=nn.Linear(64,width)
+        self.position=nn.Linear(2,width,bias=False)
+        self.local=nn.Sequential(nn.Conv2d(RC,32,3,2,1),nn.GELU(),nn.AdaptiveAvgPool2d(1),nn.Flatten(),nn.Linear(32,width))
+        self.minimap=nn.Sequential(nn.Conv2d(8,32,3,2,1),nn.GELU(),nn.Flatten(),nn.Linear(32*7*7,width))
+        self.identity=nn.Embedding(65536,24,padding_idx=0)
+        self.entity=nn.Linear(EF+72,width)
+        self.inventory=nn.Linear(NF+24,width)
+        self.slots=nn.Linear(SF+24,width)
+        self.owner=nn.Linear(1,width,bias=False)
+        self.pending=nn.Linear(20,width,bias=False)
+        self.kind=nn.Parameter(torch.randn(8,width)*.02)
+        self.global_query=nn.Parameter(torch.randn(1,1,width)*.02)
+        self.blocks=nn.ModuleList(Block(width,heads) for _ in range(layers))
+        y,x=torch.meshgrid(torch.linspace(-1,1,4),torch.linspace(-1,1,7),indexing='ij')
+        self.register_buffer('coordinates',torch.stack((x,y),-1).reshape(28,2))
+
+    def forward(self,b):
+        if 'v_body' not in b:raise ValueError('new Spatial requires visible-v1 input; legacy input rejected')
+        b=dict(b)
+        for name in RAGGED:
+            b['v_'+name]=b['v_'+name].masked_fill(~b['v_'+name+'_mask'][:,:,None],0)
+        bodies=b['v_body'].clone();batch=len(bodies)
+        bodies[:,:,5:12]=bodies[:,:,5:12].masked_fill(bodies[:,:,40:41]==0,0)
+        bodies[:,:,38]=bodies[:,:,38].masked_fill(bodies[:,:,39]==0,0)
+        bodies[:,:,36]=bodies[:,:,36].masked_fill(bodies[:,:,37]==0,-1)
+        bodies[:,:,30:33]=0  # no hidden engine cooldown/charge counters
+        pending=torch.cat([F.one_hot(b['pending'][:,i].long(),n) for i,n in enumerate((9,5,2,2,2))],-1).float()
+        p=self.body(bodies)+self.pending(pending)[:,None,:]*(bodies[:,:,36:37]==0)
+        r=self.room_project(self.room(b['v_room']).flatten(2).transpose(1,2))+self.position(self.coordinates)
+        l=b['v_local'];l=self.local(l.reshape(-1,RC,9,9)).reshape(batch,l.shape[1],-1)
+        l=l+self.owner(bodies[:,:,35:36])
+        e=b['v_entity'];eknown=e[:,:,47:48]>0
+        ids=e[:,:,:3].long();ids=torch.cat((ids[:,:,:2],ids[:,:,2:].masked_fill(~eknown,0)),2)
+        e=e.clone();e[:,:,2:3]=e[:,:,2:3].masked_fill(~eknown,0)
+        e=self.entity(torch.cat((e/64,self.identity(ids).flatten(2)),2))
+        n=b['v_inventory'].clone();n[:,:,1]=n[:,:,1].masked_fill(n[:,:,3]==0,0)
+        nt=self.inventory(torch.cat((torch.sign(n)*torch.log1p(n.abs()),self.identity(n[:,:,1].long())),2))
+        s=b['v_slots'].clone();s[:,:,3]=s[:,:,3].masked_fill(s[:,:,8]==0,0)
+        s[:,:,5]=s[:,:,5].masked_fill(s[:,:,9]==0,0)
+        s[:,:,6:8]=s[:,:,6:8].masked_fill(s[:,:,10:11]==0,0)
+        s[:,:,12]=s[:,:,12].masked_fill(s[:,:,10]==0,0)
+        st=self.slots(torch.cat((torch.sign(s)*torch.log1p(s.abs()),self.identity(s[:,:,3].long())),2))
+        chunks=(p,r,l,self.minimap(b['v_map'])[:,None],e,nt,st,self.global_query.expand(batch,-1,-1))
+        x=torch.cat([v+self.kind[i] for i,v in enumerate(chunks)],1)
+        valid=torch.cat((b['v_body_mask'],torch.ones((batch,28),device=x.device,dtype=torch.bool),
+                         b['v_local_mask'],torch.ones((batch,1),device=x.device,dtype=torch.bool),
+                         b['v_entity_mask'],b['v_inventory_mask'],b['v_slots_mask'],
+                         torch.ones((batch,1),device=x.device,dtype=torch.bool)),1)
+        bias=x.new_zeros((batch,1,1,x.shape[1])).masked_fill(~valid[:,None,None,:],float('-inf'))
+        for block in self.blocks:x=block(x,bias)
+        return x,~valid
+
+
+def action_gate(b):
+    p,s=b['v_body'],b['v_slots']
+    controlled=(p[:,:,36]==0)&(p[:,:,37]>0)&b['v_body_mask']
+    bombs=((p[:,:,14]>0)&controlled).any(1)
+    owners=p[:,:,35].long()
+    owned=((s[:,:,0,None].long()==owners[:,None,:])&controlled[:,None,:]).any(2)
+    occupied=(s[:,:,4]>0)&b['v_slots_mask']&owned
+    # An action is supported when a selected active exists. Readiness is learned
+    # from visible S, not a hidden/generalized charge rule for special actives.
+    active=(s[:,:,1]==1)&occupied&(s[:,:,5]>0)&(s[:,:,9]>0)
+    pocket=((s[:,:,1]==3)|(s[:,:,1]==4))&occupied&(s[:,:,5]>0)&(s[:,:,9]>0)
+    return torch.stack((bombs,active.any(1),pocket.any(1)),1)

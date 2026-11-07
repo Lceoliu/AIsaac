@@ -35,6 +35,7 @@ from pathlib import Path
 import numpy as np
 
 JOB_KEYS = ('rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version', 'boot')
+OPTIONAL_KEYS = ('value_g', 'close_hurt', 'close_done', 'close_ev', 'priv')
 
 
 class JobSampler:
@@ -45,6 +46,7 @@ class JobSampler:
         self.aux = None
         self.control = np.zeros(4, np.int64)
         self.live = True
+        self.lane_rows = True
 
     def close(self):
         pass
@@ -60,14 +62,18 @@ def save_job(path, job, stats, model, opt, L):
     rl = job['roll']
     m = int(rl.length.max())
     roll = {k: np.ascontiguousarray(getattr(rl, k)[:, :m]) for k in JOB_KEYS}
+    roll.update({k: np.ascontiguousarray(getattr(rl,k)[:,:m]) for k in OPTIONAL_KEYS if getattr(rl,k) is not None})
+    if rl.block is not None:
+        roll['block_payload'] = rl.block.payload()
     roll.update(length=rl.length.copy(), open=rl.open.copy(), n=rl.n, cap=rl.cap, nh=rl.nh)
     out = {k: v for k, v in job.items() if k != 'roll'}
     out['roll'], out['stats'] = roll, np.array(stats)
+    out['input_schema'] = model.config.get('input_schema')
     lst = {k: L[k] for k in L_KEYS if k in L}
     if L.get('teach_raw') is not None:
         lst['teach_raw'] = L['teach_raw'][:max(L['teach_n'], 1)].cpu()
         lst['teach_raw_len'] = L['teach_raw'].shape[0]
-    out['learner'] = dict(model={k: v.detach().cpu() for k, v in model.state_dict().items()},
+    out['learner'] = dict(input_schema=model.config.get('input_schema'),model={k: v.detach().cpu() for k, v in model.state_dict().items()},
                           opt=torch.utils._pytree.tree_map(lambda v: v.cpu() if torch.is_tensor(v) else v,
                                                            opt.state_dict()), L=lst)
     tmp = str(path) + '.tmp'
@@ -82,19 +88,29 @@ def load_job(path, rollout_cls, capacity):
     """(job, sampler counters) from save_job's file; the rollout rebuilt with this run's capacity."""
     with open(path, 'rb') as f:
         job = pickle.load(f)
+    from isaac_bridge.structured_input import SCHEMA
+    if job.get('input_schema') != SCHEMA:
+        raise ValueError('offline job is not visible-v1; recollect from the new random model')
     r = job['roll']
-    rl = rollout_cls(r['n'], capacity, r['nh'])
+    from isaac_bridge.block_training import BlockRollout
+    rl = rollout_cls(r['n'], capacity, r['nh'], value_g='value_g' in r,
+                     close='close_hurt' in r, priv=r['priv'].dtype if 'priv' in r else None,
+                     block_steps=128 if 'block_payload' in r else 0)
     m = r['rows'].shape[1]
-    for k in JOB_KEYS:
+    for k in JOB_KEYS + tuple(k for k in OPTIONAL_KEYS if k in r):
         getattr(rl, k)[:, :m] = r[k]
     rl.length[:], rl.open[:] = r['length'], r['open']
     job['roll'] = rl
+    if 'block_payload' in r:
+        rl.block = BlockRollout.from_payloads([(0,r['block_payload'])])
     return job, job.pop('stats')
 
 
 def restore_learner(saved, model, opt, L):
     """The learner's state saved with a job (save_job) into this run's model, optimiser and L."""
     import torch
+    if saved.get('input_schema') != model.config.get('input_schema'):
+        raise ValueError('offline learner input schema mismatch')
     model.load_state_dict(saved['model'])
     osd = saved['opt']
     fused = bool(opt.param_groups[0].get('fused'))
@@ -167,6 +183,21 @@ def run_bench(ctx):
         if path and not Path(path).is_file():
             save_job(path, job, ctx['stats'], model, opt, L)
     repeat = int(os.environ.get('ISAAC_RL_LEARNER_BENCH', '1'))
+    if os.environ.get('ISAAC_RL_LEARNER_SEQUENTIAL') == '1':
+        # Exercise the actual production update without resetting Adam, teacher rings or weights.
+        paths = [path] + list(job.pop('next_jobs', []))
+        for i in range(repeat):
+            if i:
+                job, stats = load_job(paths[i % len(paths)], type(job['roll']), job['roll'].cap)
+                job.pop('learner', None)
+                ctx['stats'][:] = stats
+            job['t_start'] = time.perf_counter()
+            learn(job)
+            torch.cuda.synchronize()
+            print(f'native learner update {L["update"]}: {L["last_count"]} rows, '
+                  f'{L["last_steps"]} optimizer steps, {L["last_update_s"]:.3f}s', flush=True)
+        L['stop'] = True
+        return True
     check = os.environ.get('ISAAC_RL_LEARNER_CHECK', '0') == '1'
     profile = os.environ.get('ISAAC_RL_LEARNER_PROFILE', '0') == '1'
     paths = [int(v) for v in os.environ.get('ISAAC_RL_LEARNER_PATHS', '0,1').split(',')]
@@ -297,6 +328,7 @@ def main():
     p.add_argument('--check', action='store_true', help='compare the losses / gradient / weights of the two paths')
     p.add_argument('--profile', action='store_true', help='torch.profiler over one update per path')
     p.add_argument('--paths', default='0,1', help='--learner-fast values to run (first = the reference)')
+    p.add_argument('--sequential', action='store_true', help='advance the production learner instead of resetting each trial')
     p.add_argument('rest', nargs=argparse.REMAINDER, help='-- and the train_tok.py arguments')
     a = p.parse_args()
     rest = a.rest[1:] if a.rest[:1] == ['--'] else a.rest
@@ -305,6 +337,7 @@ def main():
     os.environ['ISAAC_RL_LEARNER_CHECK'] = '1' if a.check else '0'
     os.environ['ISAAC_RL_LEARNER_PROFILE'] = '1' if a.profile else '0'
     os.environ['ISAAC_RL_LEARNER_PATHS'] = a.paths
+    os.environ['ISAAC_RL_LEARNER_SEQUENTIAL'] = str(int(a.sequential))
     sys.argv = ['train_tok.py'] + rest
     import train_tok
     train_tok.main()

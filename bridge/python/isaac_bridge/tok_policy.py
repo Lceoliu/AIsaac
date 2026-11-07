@@ -674,6 +674,8 @@ class TemporalAttention(nn.Module):
         n, D, H, W, R = s.shape[0], self.D, self.H, self.W, self.R
         dh = D // H
         dev = s.device
+        # CUDA callers may supply int32 slot ids; index_copy requires int64.
+        slot = slot.to(device=dev, dtype=torch.int64)
         first = rec['first'] != 0
         zero = torch.zeros_like(slot)
         steps0 = torch.where(first, zero, st.steps.index_select(0, slot))
@@ -1025,7 +1027,8 @@ class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
                  memory=0, item_tokens=False, global_token=False, item_shared=False, item_slots=INV_CAP, temporal=False,
                  temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128,
-                 obs_prices=False, obs_hearts=False, obs_room_type=False):
+                 obs_prices=False, obs_hearts=False, obs_room_type=False, block_memory=False, block_config=None,
+                 input_schema=None):
         super().__init__()
         if int(item_slots) != INV_CAP and not item_tokens:
             raise ValueError('TokPolicy: item_slots needs item_tokens=True (B24)')
@@ -1127,7 +1130,7 @@ class TokPolicy(nn.Module):
         # 2026-10-14 (B30): the temporal transformer, registered after everything else (module docstring); the config
         # keys only when on
         self.tatt = None
-        if temporal:
+        if temporal and not block_memory:
             self.config.update(temporal=True, temporal_width=int(temporal_width), temporal_layers=int(temporal_layers),
                                temporal_heads=int(temporal_heads), temporal_window=int(temporal_window),
                                temporal_rooms=int(temporal_rooms))
@@ -1140,6 +1143,30 @@ class TokPolicy(nn.Module):
         if self.obs_room_type:
             self.room_type_emb = nn.Embedding(N_ROOM_TYPE, width)
             nn.init.zeros_(self.room_type_emb.weight)
+        self.block_memory = None
+        if block_memory:
+            if self.memory:
+                raise ValueError('block memory replaces the GRU; use memory=0')
+            from dataclasses import asdict
+            from .block_memory import BlockMemory
+            self.block_memory = BlockMemory(width, block_config)
+            self.block_to_spatial = nn.Linear(self.block_memory.config.width, width)
+            self.block_global = nn.Linear(self.block_memory.config.width, width)
+            self.config.update(block_memory=True, block_config=asdict(self.block_memory.config))
+            from .structured_input import SCHEMA, StructuredSpatial
+            if input_schema not in (None, SCHEMA):
+                raise ValueError('old input schema is not a new-model checkpoint')
+            self.config['input_schema'] = SCHEMA
+            self.structured_spatial = StructuredSpatial(width,layers,heads)
+            # New checkpoints contain no dormant C99 input encoder/ItemTokens.
+            for name in ('type_emb','variant_emb','subtype_emb','item_emb','trinket_emb','pill_emb',
+                         'effect_emb','card_emb','entity','patch','player','room','door','map','kind',
+                         'blocks','norm','char_emb','room_type_emb','itok'):
+                if hasattr(self,name):delattr(self,name)
+            self.itok,self.room_type_emb=None,None
+            value_global=self.gtok.value if self.gtok is not None else mlp(width,width,1)
+            self.gtok=nn.Module()
+            self.gtok.value=value_global
 
     def main_parameters(self):
         """The parameters PPO's optimiser owns: all but the choice heads' (in the order of parameters())."""
@@ -1150,7 +1177,8 @@ class TokPolicy(nn.Module):
         nhwc: the convolutions' inputs in channels-last layout (cuDNN's TF32 kernels work in it: no layout conversions
         of the activations before and after every convolution; the same convolutions); ln: the packed layer norms as
         _LayerNorm (the same function)."""
-        for block in self.blocks:
+        blocks=self.structured_spatial.blocks if self.block_memory is not None else self.blocks
+        for block in blocks:
             block.math = bool(on)
             block.ln_fast = bool(on) if ln is None else bool(ln)
         self.nhwc = bool(on) if nhwc is None else bool(nhwc)
@@ -1188,6 +1216,8 @@ class TokPolicy(nn.Module):
         batch (packed_index / learner_plan) need hist= each record's has (False past the first k)."""
         if need_vg and self.gtok is None:
             raise ValueError('TokPolicy.forward: need_vg needs a global-token model (global_token=True)')
+        if self.block_memory is not None:
+            return self._forward_block(b, entities, packed, need_h, need_vg, temporal)
         tctx = hist = None
         if temporal is not None and self.tatt is not None:   # 2026-10-14 (B30)
             tctx, hist = self._temporal_in(b, temporal)
@@ -1293,6 +1323,7 @@ class TokPolicy(nn.Module):
 
     def extra_tokens(self):
         """(B24) (item tokens per record, global tokens per record) appended to the old ones ((0, 0) without them)."""
+        if self.block_memory is not None:return 0,1
         return (self.itok.n_tok if self.itok is not None else 0), (1 if self.gtok is not None else 0)
 
     def _forward_fused(self, b, entities, packed, need_h, mem, need_vg, tctx=None, hist=None):
@@ -1321,6 +1352,8 @@ class TokPolicy(nn.Module):
             if G:
                 src.append(self.gtok.tok.view(1, -1).expand(n, -1))
             xp = self._blocks_bucketed(torch.cat(src).index_select(0, b['xperm']), b)
+            if tctx is not None and tctx.get('block_encode'):
+                return self._block_packed_readout(xp, b['starts'])
             return self._heads(xp.index_select(0, b['starts']), need_h, mem,
                                xp.index_select(0, b['glast']) if G else None, need_vg, tctx)
         door = embed(self.door, b['doors']) + self.kind[2]
@@ -1358,11 +1391,58 @@ class TokPolicy(nn.Module):
             else:
                 for block in self.blocks:
                     xp = block.forward_packed(xp, bias, keep, (n, t))
+            if tctx is not None and tctx.get('block_encode'):
+                return self._block_packed_readout(xp, starts)
             return self._heads(xp.index_select(0, starts), need_h, mem, xp.index_select(0, last) if G else None,
                                need_vg, tctx)
         for block in self.blocks:
             x = block(x, bias)
+        if tctx is not None and tctx.get('block_encode'):
+            return self.block_memory.resampler(x, pad)
         return self._heads(x[:, 0], need_h, mem, x[:, -1] if G else None, need_vg, tctx)
+
+    def _block_packed_readout(self, xp, starts):
+        counts = torch.cat((starts[1:], starts.new_tensor([len(xp)]))) - starts
+        at = torch.arange(int(counts.max()), device=xp.device)[None]
+        indices = (starts[:, None] + at).clamp_max(len(xp) - 1)
+        return self.block_memory.resampler(xp[indices], at >= counts[:, None])
+
+    def encode_block(self, b, entities=None, packed=False):
+        """Independent current-observation encoding, before any temporal read."""
+        x,pad = self.structured_spatial(b)
+        return self.block_memory.resampler(x,pad)
+
+    def _forward_block(self, b, entities, packed, need_h, need_vg, temporal):
+        if temporal is None or 'states' not in temporal:
+            raise ValueError('block-memory forward requires explicit episode states; old stored-o contexts are not valid')
+        z = temporal['encoded'] if 'encoded' in temporal else self.encode_block(b, entities, packed)
+        length = int(temporal.get('length', 1))
+        states = temporal['states']
+        if len(z) != len(states) * length:
+            raise ValueError('block-memory rows must be sequence-major: batch times length')
+        if not temporal.get('reset_done',False):
+            first = b['first'].reshape(len(states), length).bool()
+            if length > 1 and bool(first[:, 1:].any()):
+                raise ValueError('split block-memory training chunks at episode boundaries')
+            states = [self.block_memory.empty(z.device, z.dtype, s.episode) if first[i, 0] else s
+                      for i, s in enumerate(states)]
+        result = self.block_memory(z.reshape(len(states), length, *z.shape[1:]), states,
+                                   version=temporal.get('version', 0),
+                                   replacements=temporal.get('replacements'),
+                                   source_prefixes=temporal.get('source_prefixes'),reader=temporal.get('reader'),
+                                   require_next_state=temporal.get('require_next_state',True))
+        o = result['hidden'].flatten(0, 1)
+        with torch.autocast(o.device.type, enabled=False):
+            zr, zg = self.block_to_spatial(o.float()), self.block_global(o.float())
+            out = (self.pi(zr), self.value(zr)[:, 0], self.danger(zr))
+            if need_h:
+                out += (zr,)
+            if need_vg:
+                out += (self.gtok.value(zg)[:, 0],)
+        temporal['states_out'] = result['states']
+        temporal['block_result'] = result
+        temporal['o_seq'], temporal['z_out'] = o, (zr, zg)
+        return out
 
     def _cnn(self, seq, b, key):
         """A grid input's CNN; with b[key + '_u'] / b[key + '_i'] (B18, the learner's fast path: the distinct grids of
@@ -1550,6 +1630,9 @@ class TokPolicy(nn.Module):
     def gate(b):
         """[B, 3] bool from a batch: may the bomb head say "bomb" (a bomb held), the item head "use" (the active item
         ready: ROW player column 22), the pill head "use" (a pill or a card in pocket slot 0: pinv columns 2, 4)."""
+        if 'v_body' in b:
+            from .structured_input import action_gate
+            return action_gate(b)
         bombs = b['bombs'] > 0
         if 'pinv' not in b:
             return torch.stack([bombs, bombs, bombs], -1)
@@ -1666,6 +1749,9 @@ def to_batch(rows, pending, device):
     for k in ENTITY_FIELDS:
         b[k] = torch.from_numpy(np.ascontiguousarray(rows[k][:, :used])).to(device, non_blocking=True)
     b['pending'] = torch.from_numpy(np.ascontiguousarray(pending)).to(device, non_blocking=True).long()
+    if np.any(rows['visible_schema']):
+        from .structured_input import from_rows
+        b.update(from_rows(rows,device))
     return b
 
 
@@ -1880,6 +1966,12 @@ def cat_batch(a, b):
     out = {}
     for k, x in a.items():
         y = b[k]
+        if k.startswith('v_') and k not in ('v_room','v_map'):
+            size=max(x.shape[1],y.shape[1])
+            padding=(0,size-x.shape[1]) if x.ndim==2 else (0,0,0,size-x.shape[1])
+            x=F.pad(x,padding)
+            padding=(0,size-y.shape[1]) if y.ndim==2 else (0,0,0,size-y.shape[1])
+            y=F.pad(y,padding)
         if k in ENTITY_FIELDS:
             x = F.pad(x, (0, 0, 0, e - x.shape[1])) if x.shape[1] < e else x
             y = F.pad(y, (0, 0, 0, e - y.shape[1])) if y.shape[1] < e else y
@@ -1895,7 +1987,7 @@ _TORCH = {np.dtype(np.float32): torch.float32, np.dtype(np.int16): torch.int16, 
           np.dtype(np.uint8): torch.uint8}
 
 
-def decode_rows(raw, pending=None, entities=None, n_heads=3):
+def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True):
     """The policy's inputs as views into ROW records held as bytes on the device: raw uint8 [n, >= ROW_BYTES]. The
     values are the records' own bits (what to_batch copies field by field). pending: the actions under way [n, heads]
     (a tensor), or None when raw carries them as n_heads int64 right after the record (GraphActor's layout).
@@ -1913,6 +2005,15 @@ def decode_rows(raw, pending=None, entities=None, n_heads=3):
         entities = min(b['ent'].shape[1], max(8, -(-int(b['n_ent'].max()) // 8) * 8))
     for k in ENTITY_FIELDS:
         b[k] = b[k][:, :entities]
+    if visible:
+        dt,off=ROW.fields['visible_schema'][:2]
+        versions=raw[:,off:off+4].contiguous().view(torch.int32)[:,0]
+    if visible and bool(versions.any()):
+        from .structured_input import decode_frame, FRAME_BYTES
+        off=ROW.fields['visible_frame'][1]
+        sz=ROW.fields['visible_bytes'][1]
+        sizes=raw[:,sz:sz+4].contiguous().view(torch.int32)[:,0]
+        b.update(decode_frame(raw[:,off:off+FRAME_BYTES],sizes,versions))
     return b
 
 
@@ -2147,11 +2248,11 @@ class GraphActor:
 
         def run(tokens, r=None):
             if not self.fold:
-                b = decode_rows(self.raw, entities=tokens, n_heads=nh)
+                b = decode_rows(self.raw, entities=tokens, n_heads=nh, visible=False)
                 out, self._h_last, self.extra_out, self._t_last = fn(b, self.u, self.h_in if self.mem else None, tokens,
                                                                      self.tslot if t_on else None)
                 return out
-            b = decode_rows(self.raw[:r], entities=tokens, n_heads=nh)
+            b = decode_rows(self.raw[:r], entities=tokens, n_heads=nh, visible=False)
             c = self.ctrl[:r]   # (B29 fold: the control block decoded on the device, the per-call work inside the graph)
             widx, keep, dup, cf = (c[:, 0:8].view(torch.int64)[:, 0], c[:, 8:12].view(torch.float32)[:, 0],
                                    c[:, 12:16].view(torch.float32)[:, 0], c[:, 16:20].view(torch.float32)[:, 0])
@@ -2203,6 +2304,10 @@ class GraphActor:
         ukeys (B36, 2026-10-16, the lanes): (keys [n], t [n]) int64: every record's sampling uniforms are
         crn_uniforms(keys, t) (counter-based: a record's draw depends on its key and t only, never on the call's other
         records or its row in the call); None: as before."""
+        # This legacy graph has a fixed input layout. Validate on the host,
+        # not with a data-dependent device bool inside CUDA graph capture.
+        if np.any(rows['visible_schema']):
+            raise ValueError('visible-v1 requires BlockActor, not the legacy GraphActor')
         n = len(rows)
         if n > self.n:
             return False
@@ -2495,6 +2600,8 @@ def load_compatible(model, state):
     tensor of another shape is copied into the leading part of the model's (the rest keeps its fresh values, zero
     for added input columns). Returns the names that did not match exactly. (B23: a B21 checkpoint's own item-token
     table into an item_shared model goes through share_item_table first, reported as 'itok.coll.weight (shared: ...)'.)"""
+    if getattr(model,'block_memory',None) is not None:
+        raise ValueError('visible-v1 forbids compatible weight migration; use an exact-schema strict checkpoint')
     state, note = share_item_table(model, state)
     own = model.state_dict()
     changed = [] if note is None else ['itok.coll.weight (shared: ' + note + ')']

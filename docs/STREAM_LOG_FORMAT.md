@@ -1,4 +1,12 @@
-# 决策数据流日志格式（`train_tok --log-stream 1`）
+# 当前 block-memory visible-v1 输入（2026-11-07）
+
+新 block 模型的 z/g 是 Temporal hidden 的 zr/zg 投影，不是旧 player/global 输入token。
+原始记录保留legacy统计字段，但actor只读取 `visible_schema/visible_bytes/visible_frame`；完整新帧字节预算131072，P/E/N/S实际长度解码，无背包16项/槽4项截断。R/L无损离散格点编码；记录布局由 `tok_obs.ROW` 决定，不再是20800 B。
+checkpoint、offline job、snapshot和共享内存均绑定 `isaac-visible-prlmens-g-v1`，旧schema拒绝，不隐式转换。下文20800 B及player token描述只适用于历史legacy日志。
+
+当前format.json版本为2，记录input_schema、feature_semantics与ROW布局。Reader检查schema、dtype/record长度；合并world-model数据不得混用表示语义。原始ROW固定151880 B，其中visible_frame预算131072 B；有效帧长度由visible_bytes给出。z/g语义为temporal-zr-zg，只有单条ROW不足以重现时序表示，须配套对应历史/snapshot。
+
+# 历史legacy日志格式（下文旧z/g与20,800 B数字不适用于visible-v1）
 
 配套设计：`PREDICTIVE_MEMORY_DESIGN.md` §5.1。代码：`bridge/python/isaac_bridge/tok_stream.py`。读取用 `tok_stream.iter_records`，它能容忍崩溃截断的分片。依赖 `zstandard`（`requirements-training.txt`）。
 
@@ -89,6 +97,18 @@ ROW 的布局随 `tok_obs.py` 变化，`format.json` 的 `row_fields` 记录了�
 ## progress.csv 列
 
 `log_rows`、`log_row_rows`（累计记录数）、`log_raw_gb`（累计未压缩 GiB）、`log_dropped`（累计丢弃行）、`log_queue`、`log_write_s`（写入线程累计秒数）、`log_error`、`u_log`（学习器线程在日志上的秒数）。
+
+### visible-v1 / block-memory 并行诊断（2026-11-07）
+
+新模型使用 `isaac-visible-prlmens-g-v1`，完整ROW长度以本次 `format.json` / `tok_obs.ROW` 为准。下面的C99体量估算仅是历史数据，不代表新输入布局，也不授权加载旧权重。
+
+- `block_main_ready_ms`：主请求进入 `step_main` 到主结果就绪回调的平均墙时；不等旧版本教师组全部完成。不是纯CUDA kernel时间。
+- `block_control_s`：本采集轮 `capture_main` 的累计墙时，含控制处理和选择点快照，不包含所有 `tick/serve_wait` 控制调用。
+- `infer_ms`：整个 `step_main` 服务调用平均墙时，现含主回复回调和后续教师服务；不能与 `block_main_ready_ms` 混用。
+- `block_teacher_forward_calls`：累计教师generation网络批次数，包含与主请求合并的批次；不同generation始终分开。
+- `block_mixed_replay_calls`：上述教师子批中同时含正常搜索与replay的累计批次数。
+- `block_ppo_selected_blocks / unique_objects / encoded_blocks / historical_rows / tail_rows`：本次PPO＋合并教师路径各forward的累计重算计数；分别是选中块、对象去重块、实际编码来源块、历史行、尾部行。不是跨optimizer step全局去重，也不覆盖独立教师优化路径。
+- `idle_share`：worker等待答案的统计比例，不是GPU空闲率；`collect_s`与`update_s`存在重叠。在线速度使用相邻learner完成时间的 `wall_s` 与决策数差，按4帧/decision÷30fps换算。
 
 ## 体量估算
 

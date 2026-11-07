@@ -1942,6 +1942,57 @@ local function lean_handles()
 	return game, game:GetRoom(), game:GetLevel(), Isaac.GetPlayer(0)
 end
 
+-- New visible contract: full per-body inventory on every decision. A changed item
+-- with the same total count cannot hide behind the legacy inventory cache.
+function visible_input_block()
+	local game, config = Game(), Isaac.GetItemConfig()
+	local result = { schema = "isaac-visible-prlmens-g-v1", bodies = {}, inventory = {}, slots = {},
+		curses = game:GetLevel():GetCurses(), capabilities = 1 }
+	local pool = game:GetItemPool()
+	local animations = { "WalkDown", "WalkUp", "WalkLeft", "WalkRight", "HeadDown", "HeadUp",
+		"HeadLeft", "HeadRight", "Hit", "Death", "Appear", "TeleportUp", "TeleportDown", "Trapdoor" }
+	for i = 0, game:GetNumPlayers() - 1 do
+		local p, animation = Isaac.GetPlayer(i), 0
+		local sprite = p:GetSprite()
+		for k, name in ipairs(animations) do
+			if sprite:IsPlaying(name) or sprite:IsFinished(name) then animation = k; break end
+		end
+		-- ControllerIndex is a public AB+ property; absent binding is unknown, not player 0.
+		local controller = p.ControllerIndex
+		result.bodies[#result.bodies+1] = { controller = controller or -1,
+			controller_known = controller ~= nil and 1 or 0, animation = animation,
+			animation_known = animation ~= 0 and 1 or 0 }
+		for id = 1, config:GetCollectibles().Size - 1 do
+			local count = p:GetCollectibleNum(id)
+			if count > 0 then result.inventory[#result.inventory+1] = { i, id, count, 1 } end
+		end
+		local active, charge = p:GetActiveItem(), p:GetActiveCharge()
+		local ac = active ~= 0 and config:GetCollectible(active) or nil
+		local maxcharge = ac and ac.MaxCharges or 0
+		result.slots[#result.slots+1] = {i,1,0,active,active ~= 0 and 1 or 0,1,charge,maxcharge,1,1,1,0,p:GetBatteryCharge()}
+		local secondary = p.SecondaryActiveItem
+		if p:HasCollectible(534) or secondary.Item ~= 0 then -- Schoolbag, AB+ catalog ID 534
+			local id = secondary.Item
+			local desc = id ~= 0 and config:GetCollectible(id) or nil
+			result.slots[#result.slots+1] = {i,1,1,id,id ~= 0 and 1 or 0,0,secondary.Charge,
+				desc and desc.MaxCharges or 0,1,1,1,0,secondary.BatteryCharge}
+		end
+		for slot = 0, p:GetMaxTrinkets()-1 do
+			local id = p:GetTrinket(slot)
+			result.slots[#result.slots+1] = {i,2,slot,id,id ~= 0 and 1 or 0,0,0,0,1,1,0,0,0}
+		end
+		for slot = 0, p:GetMaxPoketItems()-1 do
+			local pill, card = p:GetPill(slot), p:GetCard(slot)
+			local identified = pill ~= 0 and pool:IsPillIdentified(pill)
+			local effect = identified and (pool:GetPillEffect(pill)+1) or 0
+			-- AB+ has two real pocket records; only slot 0 is selected for use.
+			result.slots[#result.slots+1] = {i,card ~= 0 and 4 or 3,slot,card ~= 0 and card or effect,
+				(pill ~= 0 or card ~= 0) and 1 or 0,slot == 0 and 1 or 0,0,0,(pill == 0 or identified) and 1 or 0,1,0,pill,0}
+		end
+	end
+	return spack("<s4", json.encode(result))
+end
+
 function pack_lean(event)
 	local mode = native_lean ~= nil and state.native_obs or 0
 	local force = event ~= "step" or state.terrain_dirty
@@ -1961,9 +2012,9 @@ function pack_lean(event)
 		resend, here, clear = lr, lh, lc
 	end
 	state.terrain_dirty = false
-	local terrain, map, inv = lean_blocks(event, resend, here, clear)
-	return lean_fixed(mode, here, (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) .. terrain
-		.. map .. inv
+	local terrain, map, inv, visible = lean_blocks(event, resend, here, clear)
+	return lean_fixed(mode, here, 32 + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) .. terrain
+		.. map .. inv .. visible
 end
 
 -- The terrain block (when the terrain check says resend) and the map block (when it is due and changed) of a lean
@@ -2007,7 +2058,7 @@ function lean_blocks(event, resend, here, clear)
 		end
 	end
 	local inv = state.lean_items and lean_inventory(event, here) or ""
-	return terrain, map, inv
+	return terrain, map, inv, visible_input_block()
 end
 
 -- The fixed part of a lean observation (header .. entities .. lasers): native in mode 1 / 2 when it can, else Lua.
@@ -2707,13 +2758,13 @@ local function native_step_obs()
 	local s = ABP_NATIVE_STEP
 	local consecutive = s.consecutive
 	s.consecutive = false
-	local ok, terrain, map, inv = pcall(lean_blocks, "step", resend, here, clear)
-	if not ok or terrain ~= "" or map ~= "" or inv ~= "" then   -- a block goes with it: built and sent as pack_lean does
+	local ok, terrain, map, inv, visible = pcall(lean_blocks, "step", resend, here, clear)
+	if not ok or terrain ~= "" or map ~= "" or inv ~= "" or visible ~= "" then
 		s.blocks = s.blocks + 1
 		local sent = send_lean_payload(function()
 			if not ok then error(terrain) end
-			return lean_fixed(1, here, (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) ..
-				terrain .. map .. inv
+			return lean_fixed(1, here, 32 + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) ..
+				terrain .. map .. inv .. visible
 		end)
 		if sent then wait_command() end
 		return true

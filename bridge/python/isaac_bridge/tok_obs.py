@@ -156,6 +156,11 @@ ROW = np.dtype([
     ('ent_price', np.int16, (ENT_CAP, 1)),
     ('phearts', np.float32, (3,)),
     ('room_type', np.uint8),
+    # Full new visible contract, independently versioned. Legacy fields above are
+    # kept for old policies and reward/statistics only; new Spatial never reads them.
+    ('visible_schema', np.int32),
+    ('visible_bytes', np.int32),
+    ('visible_frame', np.uint8, (131072,)),
 ], align=True)
 PHEART_F = 3          # 2026-10-16 (B35): ROW 'phearts'
 PRICE_F = 4           # 2026-10-16 (B35): price_columns() per entity
@@ -277,6 +282,11 @@ def _minimap(o, st):
 def encode_row(o, st, row, t):
     """Write the lean observation `o` into row (a length-1 view of a ROW array). Sets everything but episode, seed,
     group and first. Returns the done code."""
+    if getattr(o,'visible',None) is not None:
+        from .structured_input import observation_frame, write_frame
+        write_frame(row,observation_frame(o))
+    else:
+        row['visible_schema'] = 0
     p = o.players[0]
     px, py = float(p['x']), float(p['y'])
     room = o.room
@@ -523,6 +533,9 @@ def _address(b):
 
 def fast_row_function(path):
     """abp_row_encode of the libabp_turbo.so at path (ctypes), None when off, missing or of another layout."""
+    # Native row v7 cannot carry the new complete frame. The native fixed
+    # observation collector remains enabled; only the obsolete row encoder is off.
+    return None
     if not FAST_ROW or not path or not os.path.isfile(path):
         return None
     if path not in _LIBS:

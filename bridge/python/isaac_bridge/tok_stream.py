@@ -98,18 +98,22 @@ class _Shards:
 
 
 class StreamLog:
-    def __init__(self, out, width, heads, rate=0.25, row_rate=0.02, depth=8):
+    def __init__(self, out, width, heads, rate=0.25, row_rate=0.02, depth=8,
+                 input_schema='legacy-tok-row-v7'):
         import zstandard  # noqa: F401  (refused at the start, not in the writer thread)
         self.root = Path(out) / 'stream'
         self.root.mkdir(parents=True, exist_ok=True)
         self.width, self.heads = int(width), int(heads)
         self.dt, self.dt_row = stream_dtype(width, heads), row_dtype(heads)
         self.cut, self.cut_row = int(round(rate * SCALE)), int(round(row_rate * SCALE))
-        fmt = dict(version=1, width=width, heads=heads, rate=rate, row_rate=row_rate, state=list(STATE), scale=SCALE,
+        fmt = dict(version=2, input_schema=input_schema,
+                   feature_semantics='temporal-zr-zg' if input_schema!='legacy-tok-row-v7' else 'legacy-spatial-z-g',
+                   diagnostic_state_semantics='legacy public/reward diagnostics; not actor input tokens',
+                   width=width, heads=heads, rate=rate, row_rate=row_rate, state=list(STATE), scale=SCALE,
                    stream=[list(map(str, f)) if len(f) == 2 else [f[0], str(f[1]), list(f[2])] for f in self.dt.descr],
                    record=self.dt.itemsize, record_row=self.dt_row.itemsize, row_itemsize=ROW.itemsize,
                    row_fields=ROW.descr.__repr__())
-        (self.root / 'format.json').write_text(json.dumps(fmt, indent=1))
+        (self.root / 'format.json').write_text(json.dumps(fmt, indent=1),encoding='utf-8')
         self.stream, self.rows = _Shards(self.root, 'stream'), _Shards(self.root, 'row')
         self.q = queue.Queue(maxsize=depth)
         self.dropped_jobs = self.dropped_rows = 0
@@ -176,7 +180,9 @@ class StreamLog:
             rec['worker'], rec['t'], rec['episode'], rec['seed'] = ws, sub['t'], sub['episode'], sub['seed']
             rec['update'] = update
         pr = plan['pos_row']
-        full = np.empty(len(pr), self.dt_row)
+        # Structured assignment copies declared fields, not NumPy alignment gaps.
+        # Canonical zero padding avoids emitting unrelated allocator contents.
+        full = np.zeros(len(pr), self.dt_row)
         if len(pr):
             wr, tr = w[pr], t[pr]
             full['row'] = roll.rows[wr, tr]
@@ -250,7 +256,13 @@ def iter_records(root, kind='stream', worker=None):
     crash: its whole records up to there."""
     import zstandard
     root = Path(root)
-    fmt = json.loads((root / 'format.json').read_text())
+    fmt = json.loads((root / 'format.json').read_text(encoding='utf-8'))
+    from .structured_input import SCHEMA
+    if fmt.get('version')!=2 or fmt.get('input_schema') not in (SCHEMA,'legacy-tok-row-v7'):
+        raise ValueError('stream input schema is missing or unsupported; implicit legacy conversion forbidden')
+    if (fmt.get('row_itemsize')!=ROW.itemsize or fmt.get('row_fields')!=repr(ROW.descr)
+            or fmt.get('record_row')!=row_dtype(fmt['heads']).itemsize):
+        raise ValueError('stream ROW layout does not match this decoder')
     dt = stream_dtype(fmt['width'], fmt['heads']) if kind == 'stream' else row_dtype(fmt['heads'])
     pat = f'{kind}-w{worker:03d}-*.zst' if worker is not None else f'{kind}-w*.zst'
     for path in sorted(root.glob(pat)):
@@ -267,4 +279,9 @@ def iter_records(root, kind='stream', worker=None):
                 pass
         data = b''.join(chunks)
         n = len(data) // dt.itemsize
-        yield int(path.name.split('-w')[1][:3]), np.frombuffer(data, dt, n)
+        records=np.frombuffer(data,dt,n)
+        if kind=='row' and fmt['input_schema']==SCHEMA:
+            from .structured_input import VERSION
+            if not np.all(records['row']['visible_schema']==VERSION):
+                raise ValueError('new stream contains a missing/old visible frame')
+        yield int(path.name.split('-w')[1][:3]), records

@@ -1958,7 +1958,7 @@ static const char *obs_fixed(long long lf, int extra, size_t *len) {
     if (why) goto give_up;
     // header, room, totals
     int clear = gbool(FN(R_CLEAR), room);
-    int flags = (clear ? 1 : 0) + (extra & 26) + (gbool(FN(G_PAUSED), (const void *)game) ? 4 : 0);   // 16: items
+    int flags = (clear ? 1 : 0) + (extra & 58) + (gbool(FN(G_PAUSED), (const void *)game) ? 4 : 0);   // 16: items
     PUT(0, (uint32_t)LEAN_MAGIC);
     PUT(4, (uint32_t)lf);
     PUT(8, (uint32_t)game_frame);

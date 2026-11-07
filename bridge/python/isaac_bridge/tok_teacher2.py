@@ -152,13 +152,14 @@ class V2Log:
     vg (B34): the actor's value_global of the record (answered ones; with the counterfactual teacher only); gain_r
     (B34, add's rw given): the trainer's heal / resource reward of the step before the record (gain_reward; 0 for the
     episode's first record)."""
-    __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value', 'h', 'vg', 'gain_r', '_g')
+    __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value', 'h', 'vg', 'gain_r', '_g','rows','pending')
 
     def __init__(self):
         self.damage, self.hurt, self.done, self.events, self.progress, self.value = [], [], [], [], [], []
         self.h = []
         self.vg = []
         self.gain_r, self._g = [], None
+        self.rows,self.pending=[],[]
 
     def add(self, row, done, progress, rw=None):
         self.damage.append(float(row['damage'][0]))
@@ -386,6 +387,8 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
                 lps.append(float(lp))
                 hs.append(getattr(policy, 'h_used', None))   # (memory: the answer's GRU input state; else None)
                 ts.append(getattr(policy, 't_used', None))   # (B34, temporal: the lane step's outputs; else None)
+                if getattr(policy,'block_mode',None) is not None:
+                    policy.keep_context()
             under = act
             t += 1
             j += 1
@@ -529,7 +532,7 @@ class LanePolicy:
     lane_t (cf_attach's [workers, 2 D + 2] float32, None without): after each answer t_used is (o_prev [D], has, o [D])
     of the lane's temporal step (the stored outputs of an imitation record)."""
 
-    def __init__(self, conn, lane_io, lane_out, index, stop, lane_h=None, lane_t=None):
+    def __init__(self, conn, lane_io, lane_out, index, stop, lane_h=None, lane_t=None,block_mode=None,block_keep=None):
         self.conn, self.io, self.out, self.i, self.stop = conn, lane_io, lane_out, index, stop
         self.wait_s = 0.0
         self.calls = 0
@@ -537,6 +540,10 @@ class LanePolicy:
         self.lane_t, self.t_used = lane_t, None
         self.vg = 0.0
         self.seq = 0
+        self.block_mode=block_mode
+        self.fixed_version=None
+        self.block_keep=block_keep
+        self.kept=0
         if lane_h is None:   # (without memory: play_branch finds no begin)
             self.begin = None
 
@@ -558,6 +565,26 @@ class LanePolicy:
             self.io[self.i, 10] = self.seq
         self.conn.send_bytes(b'0')
 
+    def replay_value(self,log,start,end,bank,row_buffer,global_value=True):
+        """Read a recorded continuation, never choose replacement actions."""
+        self.tbegin(bank)
+        self.block_mode[self.i]=1
+        try:
+            for step in range(start,end+1):
+                row_buffer[:]=log.rows[step]
+                self.request(row_buffer,log.pending[step])
+                _,value,_=self.answer()
+            return self.vg if global_value else value
+        finally:
+            self.block_mode[self.i]=0
+
+    def keep_context(self):
+        from .block_protocol import decode_reference
+        if self.kept>=self.block_keep.shape[1]:
+            raise RuntimeError('CF kept-context budget exceeded')
+        self.block_keep[self.i,self.kept]=decode_reference(self.t_used)
+        self.kept+=1
+
     def answer(self):
         t0 = time.perf_counter()
         while True:
@@ -570,6 +597,14 @@ class LanePolicy:
                 break
         self.wait_s += time.perf_counter() - t0
         self.calls += 1
+        if self.block_mode is not None:
+            if self.out[self.i,5]<0:
+                raise V2Stop()
+            version=int(self.out[self.i,2])
+            if self.fixed_version is None:
+                self.fixed_version=version
+            elif self.fixed_version!=version:
+                raise RuntimeError('teacher generation changed during a comparison')
         if self.lane_h is not None:   # (memory)
             self.h_used = self.lane_h[self.i, :self.lane_h.shape[1] - 1].copy()
         if self.lane_t is not None:   # (B34, temporal)

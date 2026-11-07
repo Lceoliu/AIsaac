@@ -198,8 +198,10 @@ def case_c(tmp):
             key = (int(r['worker']), int(r['row']['t']), int(r['row']['episode']))
             w, t = by_key[key]
             n_r += 1
-            ok_r = ok_r and r['row'].tobytes() == rl['rows'][w, t].tobytes() and np.array_equal(r['action'], rl['actions'][w, t])
-        check(f'(c) [--learner-fast {fast}] the ROW records, byte for byte, of the 1/4 episodes (a subset)', bool(ok_r) and n_r == sum(h < 2500 for _, _, h in want), f'{n_r} records')
+            # NumPy copy/concatenate does not preserve anonymous alignment gaps.
+            # Check every declared field byte-for-byte, including full visible_frame.
+            ok_r = ok_r and all(r['row'][k].tobytes()==rl['rows'][w,t][k].tobytes() for k in L.ROW.names) and np.array_equal(r['action'], rl['actions'][w, t])
+        check(f'(c) [--learner-fast {fast}] all ROW fields byte-for-byte (alignment padding excluded)', bool(ok_r) and n_r == sum(h < 2500 for _, _, h in want), f'{n_r} records')
         del rec_t
         # z, g against the policy's own at the update's start (padded and packed paths: float rounding, then bfloat16's)
         mz, mg, n_z = 0.0, 0.0, 0

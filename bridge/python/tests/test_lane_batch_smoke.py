@@ -42,6 +42,7 @@ import test_temporal_smoke as TS   # noqa: E402
 
 import numpy as np   # noqa: E402
 import torch   # noqa: E402
+import pytest
 
 from isaac_bridge import tok_lanes as TL   # noqa: E402
 from isaac_bridge import tok_policy as TP   # noqa: E402
@@ -434,6 +435,7 @@ def test_source():
           'self.c_cu[:n] = crn_uniforms(ukeys[0], ukeys[1]' in pol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA GraphActor requires CUDA')
 def test_cuda():
     """(f) CUDA only: the lane GraphActor through the service (asynchronous: submit, then the answer at the event) ==
     the service's eager path on the same requests (keyed uniforms: the same actions), fold off / on with row buckets;

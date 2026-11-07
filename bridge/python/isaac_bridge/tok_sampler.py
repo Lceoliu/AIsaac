@@ -205,6 +205,7 @@ class TokSamplerConfig:
     teacher_share: float = 0.0                    # and, beyond that, up to this share of a worker's sampling time
     teacher_queue: int = 24                       # hurts waiting to be searched per worker (the newest are kept)
     teacher_depths: tuple = (2, 4, 8)             # decisions before the hurting step, tried in this order
+    block_memory: bool = False
     teacher_margin: int = 4                       # decisions after the hurting step that must stay unhurt too
     teacher_per_episode: int = 2                  # hurts searched per episode at most
     teacher_slots: int = 0                        # searches running at once over all workers at most (0: no limit)
@@ -356,7 +357,7 @@ class TokSamplerConfig:
     no_active: bool = False
 
 
-def attach(names, workers):
+def attach(names, workers, initialize=False):
     """(blocks, rows [2 x workers], actions, stats, control) from the shared-memory names. Two rows per worker: it
     writes its next record while the server may still read the one before."""
     blocks = [shared_memory.SharedMemory(name=n) for n in names]
@@ -364,6 +365,11 @@ def attach(names, workers):
     actions = np.ndarray((workers, ACTION_F), np.int32, buffer=blocks[1].buf)
     stats = np.ndarray((workers, len(STATS)), np.float64, buffer=blocks[2].buf)
     control = np.ndarray((4,), np.int64, buffer=blocks[3].buf)   # [0] stop, [1] the trainer is updating
+    from .structured_input import VERSION
+    schema=(VERSION<<32)|ROW.itemsize
+    if initialize:control[3]=schema
+    elif int(control[3])!=schema:
+        raise ValueError('sampler shared-memory visible schema/ROW size mismatch')
     return blocks, rows, actions, stats, control
 
 
@@ -1282,7 +1288,7 @@ class TokSampler:
         sizes = (ROW.itemsize * 2 * n, 4 * ACTION_F * n, 8 * len(STATS) * n, 8 * 4)
         self.blocks = [shared_memory.SharedMemory(create=True, size=s) for s in sizes]
         names = [b.name for b in self.blocks]
-        self.attached, self.rows, self.actions, self.stats, self.control = attach(names, n)
+        self.attached, self.rows, self.actions, self.stats, self.control = attach(names, n, initialize=True)
         self.priv = None   # 2026-11-03 (tok_priv): PRIV [2 x workers], the rows' slots
         if getattr(cfg, 'priv', False):
             from .tok_priv import PRIV
@@ -1373,8 +1379,17 @@ class TokSampler:
                 if self.lane_t is not None:
                     self.lane_t[:] = 0
                 self.attached += attached
+            if cfg.block_memory:
+                from .block_protocol import sizes as block_sizes,attach as block_attach
+                more=[shared_memory.SharedMemory(create=True,size=s) for s in block_sizes(cfg)]
+                self.blocks += more
+                v2_names += [b.name for b in more]
+                attached,self.block_arrays=block_attach([b.name for b in more],cfg)
+                for a in self.block_arrays: a[:]=0
+                self.block_arrays[2][:]=-1
+                self.attached += attached
         self.stats[:] = 0
-        self.control[:] = 0
+        self.control[:3] = 0  # slot 3 is the immutable schema/record-size handshake
         if max(getattr(cfg, 'pickup_force', (0.0, 0.0)) or (0.0, 0.0)) > 0:   # 2026-10-13 (B23): the run's first p
             self.stats[:, ST['pf_p']] = float(cfg.pickup_force[0])        # (the trainer rewrites it after each update)
         # 2026-10-06: one decoded-PNG cache for all the instances of this sampler (abp_turbo ABP_PNG_CACHE_FILE) instead
@@ -1477,7 +1492,7 @@ class TokSampler:
             except OSError:
                 pass
 
-    def v2_records(self, with_h=False, with_t=False):
+    def v2_records(self, with_h=False, with_t=False, with_block=False):
         """The teacher-v2 imitation records written since the last call: (rows, meta [n, V2_META]); None without.
         with_h (2026-10-11, memory): (rows, meta, h [n, memory_dim] float32: each record's GRU input state; zeros where
         the ring has none). with_t (B34, temporal lanes): one more element last, t [n, 2 D + 2] float32 (each record's
@@ -1485,27 +1500,46 @@ class TokSampler:
         if self.v2_rows is None:
             return None
         from .tok_teacher2 import V2_META, V2_RING
-        rows, meta, hs, ts = [], [], [], []
+        rows, meta, hs, ts, contexts = [], [], [], [], []
         dim = int(self.cfg.memory_dim)
         tw = self.v2_t.shape[2] if self.v2_t is not None else 0
         for i in range(self.cfg.workers):
             count = int(self.stats[i, ST['v2_records']])
             first = max(int(self.v2_seen[i]), count - V2_RING)
             for c in range(first, count):
-                rows.append(self.v2_rows[i, c % V2_RING].copy())
-                meta.append(self.v2_meta[i, c % V2_RING].copy())
+                if with_block and self.v2_t[i,c%V2_RING,-1]!=c+1:
+                    continue
+                row=self.v2_rows[i,c%V2_RING].copy()
+                record_meta=self.v2_meta[i,c%V2_RING].copy()
+                record_t=self.v2_t[i,c%V2_RING].copy() if (with_block or with_t) and self.v2_t is not None else None
+                record_h=self.v2_h[i,c%V2_RING].copy() if with_h and self.v2_h is not None else None
+                if with_block and (record_t[-1]!=c+1 or self.v2_t[i,c%V2_RING,-1]!=c+1):
+                    continue
+                rows.append(row)
+                meta.append(record_meta)
                 if with_h:
-                    hs.append(self.v2_h[i, c % V2_RING].copy() if self.v2_h is not None else np.zeros(dim, np.float32))
+                    hs.append(record_h if record_h is not None else np.zeros(dim,np.float32))
                 if with_t:
-                    ts.append(self.v2_t[i, c % V2_RING].copy() if self.v2_t is not None else np.zeros(tw, np.float32))
+                    ts.append(record_t if record_t is not None else np.zeros(tw,np.float32))
+                if with_block:
+                    from .block_protocol import decode_reference
+                    ident = decode_reference(record_t)
+                    contexts.append(self.block_contexts.get(ident))
             self.v2_seen[i] = count
+        if with_block:
+            from .block_lanes import decode_reference
+            live = {decode_reference(t) for t in self.v2_t.reshape(-1, tw)}
+            live.update(decode_reference(t) for t in self.lane_t)
+            self.block_contexts.retire(live)
         if not rows:
             out = np.zeros((0,), ROW), np.zeros((0, V2_META), np.float64)
             out = out + (np.zeros((0, dim), np.float32),) if with_h else out
-            return out + (np.zeros((0, tw), np.float32),) if with_t else out
+            out = out + (np.zeros((0, tw), np.float32),) if with_t else out
+            return out + (contexts,) if with_block else out
         out = np.stack(rows), np.stack(meta)
         out = out + (np.stack(hs).astype(np.float32),) if with_h else out
-        return out + (np.stack(ts).astype(np.float32),) if with_t else out
+        out = out + (np.stack(ts).astype(np.float32),) if with_t else out
+        return out + (contexts,) if with_block else out
 
     def _drop(self, c):
         if c in self.live:
@@ -1589,21 +1623,28 @@ class TokSampler:
                 first = time.perf_counter()
         return idx, slots
 
-    def teacher_records(self):
+    def teacher_records(self,with_block=False):
         """The teacher records written since the last call: (rows, meta [n, TEACH_META]); None without a teacher."""
         if self.teach_rows is None:
             return None
-        rows, meta = [], []
+        rows, meta, contexts = [], [], []
         for i in range(self.cfg.workers):
             count = int(self.stats[i, ST['teach']])
             first = max(int(self.teach_seen[i]), count - TEACH_RING)
             for c in range(first, count):
-                rows.append(self.teach_rows[i, c % TEACH_RING].copy())
-                meta.append(self.teach_meta[i, c % TEACH_RING].copy())
+                if with_block and self.block_arrays[5][i,c%TEACH_RING]!=c+1:
+                    continue
+                row=self.teach_rows[i,c%TEACH_RING].copy()
+                record_meta=self.teach_meta[i,c%TEACH_RING].copy()
+                if with_block and self.block_arrays[5][i,c%TEACH_RING]!=c+1:
+                    continue
+                rows.append(row)
+                meta.append(record_meta)
+                if with_block:
+                    contexts.append(self.block_lane_service.injury_context(i,int(row['episode']),int(row['t'])))
             self.teach_seen[i] = count
-        if not rows:
-            return np.zeros((0,), ROW), np.zeros((0, TEACH_META), np.int32)
-        return np.stack(rows), np.stack(meta)
+        out=(np.stack(rows),np.stack(meta)) if rows else (np.zeros((0,),ROW),np.zeros((0,TEACH_META),np.int32))
+        return out+(contexts,) if with_block else out
 
     def choice_records(self):
         """The choice records written since the last call: (rows, meta [n, CHOICE_META]); None without branches."""

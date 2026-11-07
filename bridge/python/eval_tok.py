@@ -63,11 +63,18 @@ def build_eval_model(ck, items, device, item_slots=None):
     TokPolicy(**config, items) + load_compatible; item_slots: the held-item token slots (needs item_tokens)."""
     from isaac_bridge.tok_policy import TokPolicy, load_compatible
     cfg = dict(ck['config'], items=items)
+    if cfg.get('block_memory'):
+        from isaac_bridge.structured_input import SCHEMA
+        if cfg.get('input_schema') != SCHEMA:
+            raise ValueError('block evaluation requires exact visible-v1 input schema; legacy weights forbidden')
     if item_slots is not None:
         if not cfg.get('item_tokens'):
             raise ValueError('--item-slots needs an item-token checkpoint')
         cfg['item_slots'] = int(item_slots)
     model = TokPolicy(**cfg).to(device).eval()
+    if model.block_memory is not None:
+        model.load_state_dict(ck['model'],strict=True)
+        return model, []
     return model, load_compatible(model, ck['model'])
 
 
@@ -81,6 +88,8 @@ def apply_ablation(model, what):
     import torch
     if what not in ABLATE:
         raise ValueError(f'--ablate {what!r}: one of {ABLATE[1:]}')
+    if what and model.block_memory is not None:
+        raise ValueError('legacy item/global ablations do not implement visible-v1 token ablation')
     if what in ('items', 'both'):
         it = getattr(model, 'itok', None)
         if it is None:
@@ -108,7 +117,8 @@ def apply_ablation(model, what):
             block.forward, block.forward_packed = fwd, packed
 
 
-def policy_actions(model, rows, pending, act_idx, device, greedy=False, mem_h=None, mem_reset=None, t_state=None):
+def policy_actions(model, rows, pending, act_idx, device, greedy=False, mem_h=None, mem_reset=None, t_state=None,
+                   block_state=None):
     """The policy's actions [k, heads] (numpy) for records `rows` of workers act_idx (a list, distinct) with their
     actions under way: memory checkpoints read and update the workers' GRU states mem_h (zero where mem_reset, which is
     then cleared); temporal checkpoints (B30) step the workers' slots of t_state (TemporalState; an episode's first
@@ -121,6 +131,12 @@ def policy_actions(model, rows, pending, act_idx, device, greedy=False, mem_h=No
                               slot=torch.tensor(act_idx, dtype=torch.int64, device=t_state.kv.device))
     b = to_batch(rows, pending, device)
     with torch.inference_mode():
+        if block_state is not None:
+            ctx = dict(states=[block_state[int(i)] for i in act_idx])
+            result = model.act(b, greedy=greedy, temporal=ctx)
+            for worker,state in zip(act_idx,ctx['states_out']):
+                block_state[int(worker)] = state
+            return result[0].cpu().numpy()
         if mem_h is not None:   # (memory) the workers' states in, the new ones kept
             ai = torch.tensor(act_idx, dtype=torch.int64, device=device)
             h_in = mem_h.index_select(0, ai) * torch.from_numpy(~mem_reset[act_idx]).float().to(device)[:, None]
@@ -268,6 +284,11 @@ def main():
         info['memory'] = mem_dim
         print(f'memory: GRU state of size {mem_dim} per worker, reset at each episode start', flush=True)
     t_state = None   # 2026-10-14 (B30): the temporal state per eval worker
+    block_state = None
+    if model is not None and model.block_memory is not None:
+        block_state = [model.block_memory.empty(device=device) for _ in range(n)]
+        info['block_memory'] = True
+        info['block_config'] = dict(model.config['block_config'])
     if model is not None and getattr(model, 'tatt', None) is not None:
         from isaac_bridge.tok_policy import TemporalState
         t_state = TemporalState(model, n, device, torch.float32 if device.type == 'cpu' else None)
@@ -353,7 +374,7 @@ def main():
                                        + [np.zeros(len(act_idx), np.int64)] * (nh - 2), 1)
                 else:   # (memory: the workers' GRU states; B30 temporal: their temporal slots)
                     actions = policy_actions(model, rows[act_rows], pending[act_idx], act_idx, device, args.greedy,
-                                             mem_h, mem_reset, t_state)
+                                             mem_h, mem_reset, t_state, block_state)
                 if mem_dump is not None:
                     o_d = t_state.prev_o.index_select(0, torch.tensor(act_idx, dtype=torch.int64, device=t_state.prev_o.device))
                     o_d = o_d.float().cpu().numpy().astype(np.float16)
