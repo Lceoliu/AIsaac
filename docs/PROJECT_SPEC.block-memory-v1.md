@@ -436,7 +436,9 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 ```json
 {
   "design_id": "block_memory_v1",
-  "status": "functional_passed_performance_gate_failed",
+  "status": "review_components_verified_A1_integration_and_A2_speed_pending",
+  "slot_tensor_core_integrated_in_production": false,
+  "formal_same_4090_speed_result": null,
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
   "spatial": {
