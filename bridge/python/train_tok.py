@@ -1335,6 +1335,15 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--block-attention',default='sdpa',choices=('sdpa','flex'))
     p.add_argument('--block-history-blocks',type=int,default=None,
                    help='Window-external historical Writer blocks per chunk; default4, use8 for ablation')
+    p.add_argument('--block-history-mode',default='random',choices=('random','detach','gradreplay'),
+                   help='B43 history ablation: random (B/D arms: --block-history-blocks random blocks re-encoded, '
+                        'used differentiably by the Reader), detach (A arm: none), gradreplay (C arm: block values '
+                        'are gradient leaves; per chunk 1 max-|g| + random blocks re-encoded with the auxiliary '
+                        'loss sum_j sg(g_j).f(o_j))')
+    p.add_argument('--block-history-aux-coef',type=float,default=1.0,help='B43 C arm: auxiliary loss coefficient')
+    p.add_argument('--block-history-replay',default='raw',choices=('raw','latent'),
+                   help='B43 C arm: re-encode raw observations (Spatial+Writer) or stored latents (Writer only; '
+                        'not wired yet)')
     p.add_argument('--frames-per-decision', type=int, default=4)
     p.add_argument('--episodes-per-state', type=int, default=16)
     p.add_argument('--episode-seconds', type=float, default=90.0)
@@ -1993,6 +2002,14 @@ def main(argv=None, child=None, actor=None):
         block_cfg = block_cfg or dict(width=width_b,layers=layers_b,heads=heads_b,attention=args.block_attention)
         args.block_history_blocks=(block_cfg.get('history_recompute_blocks',4)
             if args.block_history_blocks is None else args.block_history_blocks)
+        if args.block_history_mode=='detach':   # B43 A arm: no historical recompute at all
+            if args.block_history_blocks not in (0,None) and args.block_history_blocks!=block_cfg.get('history_recompute_blocks',4):
+                p.error('--block-history-mode detach recomputes no block (leave --block-history-blocks unset or 0)')
+            args.block_history_blocks=0
+        if args.block_history_mode=='gradreplay' and not args.block_slots:
+            p.error('--block-history-mode gradreplay needs the paged slot path (--block-slots 1)')
+        if args.block_history_replay=='latent':
+            p.error('--block-history-replay latent is not wired yet (B43: raw-observation replay only)')
         block_cfg=dict(block_cfg,history_recompute_blocks=args.block_history_blocks)
         tok_kw.update(block_memory=True,block_config=block_cfg)
         args.temporal = 0
@@ -3660,7 +3677,7 @@ def main(argv=None, child=None, actor=None):
                                 chunks_b += [L['v2_chunks'][i] for i in vpick]
                             with bpt.GpuSpan('learn_fwd_part'):
                                 outs_,ctx_b = forward_bucketed(learner_model,chunks_b,max_rows=args.micro or args.minibatch,
-                                                              version=L['update'])
+                                                              version=L['update'],history_mode=args.block_history_mode)
                             for key_b,value_b in ctx_b['recompute_stats'].items():
                                 block_ppo_counts[key_b]+=value_b
                             tk_ = dict(temporal=ctx_b)

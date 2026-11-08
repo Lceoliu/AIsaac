@@ -613,3 +613,34 @@ def test_precaptured_actor_graphs_cover_steps_and_keep_values():
         for x, y in zip(a[1:], b[1:]):
             torch.testing.assert_close(x.float(), y.float(), rtol=1e-5, atol=1e-5)
     assert (g.step_graph.captures, g.encoder.captures, g.reader.captures) == before
+
+
+def test_history_mode_detach_equals_no_history_and_random_unchanged():
+    """B43 A arm: history_mode='detach' == no historical recompute (history_recompute_blocks 0),
+    loss and every gradient bit-identical; 'random' (B/D arms) is the default path."""
+    import dataclasses
+    m, ref, new, old, rolls = _collect_rollout('cpu', n=21, seed=61)
+    _, _, mask = gae(rolls[0], .99, .95)
+    plan = rolls[0].block.plan(rolls[0], mask)
+    chunks = [c for c in plan['chunks'] if len(c.rows) == 4]
+    cfg = m.block_memory.config
+    res = []
+    for mode, blocks in (('detach', cfg.history_recompute_blocks), ('random', 0),
+                         ('random', cfg.history_recompute_blocks), (None, cfg.history_recompute_blocks)):
+        m.block_memory.config = dataclasses.replace(cfg, history_recompute_blocks=blocks)
+        m.zero_grad(set_to_none=True)
+        kw = {} if mode is None else dict(history_mode=mode)
+        out, _, ctx, _ = forward_chunks(m, chunks, generator=torch.Generator().manual_seed(8), **kw)
+        loss = out[1].square().mean()+out[0].float().logsumexp(-1).mean()
+        loss.backward()
+        res.append((loss.detach(), {k: p.grad.clone() for k, p in m.named_parameters() if p.grad is not None},
+                    ctx['recompute_stats']['selected_blocks']))
+    m.block_memory.config = cfg
+    (la, ga, sa), (lb, gb, sb), (lc, gc_, sc), (ld, gd, sd) = res
+    assert sa == sb == 0 and sc == sd > 0
+    torch.testing.assert_close(la, lb, rtol=0, atol=0)
+    for k in ga:
+        torch.testing.assert_close(ga[k], gb[k], rtol=0, atol=0, msg=k)
+    torch.testing.assert_close(lc, ld, rtol=0, atol=0)
+    for k in gc_:
+        torch.testing.assert_close(gc_[k], gd[k], rtol=0, atol=0, msg=k)

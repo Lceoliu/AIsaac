@@ -1139,9 +1139,43 @@ SPATIAL_MICRO_TRAIN, SPATIAL_MICRO_EVAL = 512, 8192
 SPATIAL_PACKED = os.environ.get('ISAAC_SPATIAL_PACKED', '1') == '1'
 
 
+HISTORY_MODES = ('random', 'detach', 'gradreplay')
+
+
+def encode_blocks(model, store, bids, device, spatial_micro):
+    """Current Spatial + Writer on the raw sources of complete blocks `bids` (host int64): their
+    block values [len(bids), memory_tokens, latent_width], differentiable. Host decodes are
+    cached in the page store. Returns (values, rows encoded)."""
+    from .structured_input import decode_frame_host, merge_host, from_host, host_counts
+    cfg = model.block_memory.config
+    packed = torch.device(device).type == 'cuda'
+    hosts = []
+    for bid in np.asarray(bids, np.int64).tolist():
+        d = store.decoded.get((bid, packed))
+        ucount('learn_hist_decode_rows_fresh' if d is None else 'learn_hist_decode_rows_cached', cfg.block_steps)
+        if d is None:
+            rows_b, pend_b = store.source_rows(store.b_src[bid])
+            d = decode_frame_host(rows_b, packed=packed)
+            d['pending'] = pend_b; d['first'] = np.asarray(rows_b['first'])
+            store.decoded[(bid, packed)] = d
+        hosts.append(d)
+    merged = merge_host(hosts)
+    zh = encode_sorted(model, from_host(merged, device), spatial_micro, host_counts(merged))
+    values = model.block_memory.writer(zh.reshape(len(hosts), cfg.block_steps, cfg.latents, cfg.latent_width))
+    return values, len(hosts)*cfg.block_steps
+
+
 def forward_chunks_paged(model, chunks, generator=None, train_history=True, version=0, spatial_micro=None,
-                         require_next_state=True, deduplicate_sources=True):
-    """forward_chunks for chunks whose snapshots are PagedSnapshot (learner thread)."""
+                         require_next_state=True, deduplicate_sources=True, history_mode='random'):
+    """forward_chunks for chunks whose snapshots are PagedSnapshot (learner thread).
+
+    history_mode (B43): 'random' -- history_recompute_blocks random window-external blocks per
+    chunk re-encoded and used differentiably by the Reader (B and D arms); 'detach' -- none (A arm,
+    = history_recompute_blocks 0); 'gradreplay' -- none in this forward: every window-external
+    block value is a requires_grad leaf so the PPO backward yields g_j = dL/dM_j, and
+    grad_replay_aux (after that backward) re-encodes a few blocks with an auxiliary loss (C arm)."""
+    if history_mode not in HISTORY_MODES:
+        raise ValueError(f'history_mode {history_mode!r}: one of {HISTORY_MODES}')
     from .block_training import source_rows
     if not chunks:
         raise ValueError('forward_chunks requires a nonempty batch')
@@ -1175,7 +1209,7 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     # ---- historical selection (same generator calls as historical_blocks)
     selected = []
     for p in parts:
-        if not train_history:
+        if not train_history or history_mode != 'random':
             selected.append(np.empty(0, np.int64)); continue
         eligible = np.flatnonzero(p['ends'] <= p['step']-cfg.window)
         if not len(eligible) or cfg.history_recompute_blocks == 0:
@@ -1197,23 +1231,7 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     if unique:
         clock.mark('select')
         ub = np.fromiter(unique.keys(), np.int64, len(unique))
-        from .structured_input import decode_frame_host, merge_host, from_host, host_counts
-        packed = device.type == 'cuda'
-        hosts = []
-        for bid in ub.tolist():
-            d = store.decoded.get((bid, packed))
-            ucount('learn_hist_decode_rows_fresh' if d is None else 'learn_hist_decode_rows_cached', cfg.block_steps)
-            if d is None:
-                rows_b, pend_b = store.source_rows(store.b_src[bid])
-                d = decode_frame_host(rows_b, packed=packed)
-                d['pending'] = pend_b; d['first'] = np.asarray(rows_b['first'])
-                store.decoded[(bid, packed)] = d
-            hosts.append(d)
-        hist_rows = len(ub)*cfg.block_steps
-        clock.mark('hist_host_rows')
-        merged = merge_host(hosts)
-        zh = encode_sorted(model, from_host(merged, device), spatial_micro, host_counts(merged))
-        hist_written = memory.writer(zh.reshape(len(ub), cfg.block_steps, cfg.latents, cfg.latent_width))
+        hist_written, hist_rows = encode_blocks(model, store, ub, device, spatial_micro)
         clock.mark('hist_spatial_writer')
         count('learn.hist_rows', hist_rows)
     # ---- open tails: re-encoded raw sources when a new block becomes visible / continuation needed

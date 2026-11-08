@@ -712,7 +712,7 @@ def forward_bucketed(model, chunks, max_rows=None, **kwargs):
 
 
 def forward_chunks(model, chunks, generator=None, train_history=True, version=0, spatial_micro=None,
-                   require_next_state=True,deduplicate_sources=True):
+                   require_next_state=True,deduplicate_sources=True,history_mode='random'):
     """Same-length chunks are one batch; caller buckets variable lengths.
 
     A configured budget of window-external blocks is differentiable. The raw cross-boundary
@@ -723,7 +723,11 @@ def forward_chunks(model, chunks, generator=None, train_history=True, version=0,
     if isinstance(chunks[0].snapshot,PagedSnapshot):
         return forward_chunks_paged(model,chunks,generator=generator,train_history=train_history,version=version,
                                     spatial_micro=spatial_micro,require_next_state=require_next_state,
-                                    deduplicate_sources=deduplicate_sources)
+                                    deduplicate_sources=deduplicate_sources,history_mode=history_mode)
+    if history_mode!='random':
+        if history_mode!='detach':
+            raise ValueError('history_mode gradreplay needs the paged slot path (--block-slots 1)')
+        train_history=False   # A arm: no historical recompute (= history_recompute_blocks 0)
     spatial_micro = 512 if spatial_micro is None else spatial_micro
     length = len(chunks[0].rows)
     if any(len(c.rows) != length for c in chunks):
