@@ -2410,8 +2410,15 @@ def main(argv=None, child=None, actor=None):
         if SPATIAL_COMPILE:
             t_w=time.perf_counter()
             n_w=block_compile.warm_spatial(learner_model,(model,),bf16=amp or args.actor_bf16)
-            block_compile.mark_steady()
             print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s',flush=True)
+            if args.block_slots:   # B44 packed learner: the Flex Reader kernels (ISAAC_PACKED_READER=flex)
+                from isaac_bridge import block_learner
+                if block_learner.PACKED:
+                    c_r=block_compile.STATS['compiles']
+                    s_r=block_learner.warm_reader(learner_model,bf16=bool(amp))
+                    print(f'B44 Flex Reader warm-up: {block_compile.STATS["compiles"]-c_r} graphs in {s_r:.1f} s',
+                          flush=True)
+            block_compile.mark_steady()
         # B42: everything alive now (models, compiled code, buffers) leaves the collector's
         # generations; later collections scan only what the run allocates afterwards.
         import gc as gc_
@@ -2766,6 +2773,8 @@ def main(argv=None, child=None, actor=None):
             import resource as resource_
             from isaac_bridge import block_paged as bpt
             bpt.clear_decode_cache()   # (B42 fix 3: decoded rollout chunks live for one update)
+            from isaac_bridge import learner_dump
+            learner_dump.begin(L['update'], learner_model)   # (B44 ISAAC_LEARNER_DUMP: measurement only)
             bpt.ucount('update_t0', time.time())
             ru0 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))
         U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
@@ -3873,6 +3882,8 @@ def main(argv=None, child=None, actor=None):
                     opt.step()
                 pmark(None, m_)
                 sec('opt')
+        if block_on:
+            learner_dump.end(learner_model)   # (B44 ISAAC_LEARNER_DUMP: measurement only)
         learner_model.eval()
         choice_log = train_choice() if branching else {}   # Phase B2 (before the actor takes the new weights)
         torch.cuda.current_stream().synchronize()

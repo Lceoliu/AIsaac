@@ -95,7 +95,12 @@ UPD_KEYS = ('learn_fwd_part_wall_s', 'learn_fwd_part_gpu_s', 'learn_bwd_wall_s',
             'learn_main_decode_calls', 'learn_main_decode_rows_fresh', 'learn_main_decode_rows_cached',
             'learn_hist_decode_rows_fresh', 'learn_hist_decode_rows_cached', 'learn_tail_decode_rows',
             'learn_nvcsw', 'learn_nivcsw', 'learn_cpu_s', 'gc_collect_s', 'gc_collect_calls', 'update_t0', 'update_t1',
-            'gpu_reserved_now_gb')
+            'gpu_reserved_now_gb',
+            # B44 packed learner: calls per update, Spatial tokens (real / padded layout), Reader rows
+            'learn_paged_calls', 'learn_packed_calls', 'learn_reader_calls', 'learn_reader_rows_real',
+            'learn_reader_rows_padded', 'learn_spatial_calls', 'learn_spatial_tokens_real',
+            'learn_spatial_tokens_padded', 'learn_writer_calls', 'learn_packed_host_s', 'learn_staged_mb',
+            'gpu_peak_allocated_gb')
 LEARNER_ACTIVE = [False]
 
 
@@ -374,6 +379,10 @@ class PagedPayload(list):
 
 # ----------------------------------------------------------------------------- store
 
+# B44: decoded historical block sources kept across rollouts (~0.5 MB each compact): at most this many.
+DECODED_CAP = int(os.environ.get('ISAAC_BLOCK_DECODED_CAP', '6000'))
+
+
 class PagedStore:
     def __init__(self, config, nh, kv_dtype=torch.float32, page=4096):
         c = self.config = config
@@ -391,7 +400,7 @@ class PagedStore:
         self.b_used = np.zeros(0, bool)
         self.b_free = np.empty(0, np.int64)
         self.raw = {}                                   # decision id -> (first, schema, frame bytes, pending)
-        self.decoded = {}                               # learner cache: (block id, packed) -> host frames; per rollout
+        self.decoded = {}                               # learner cache: (block id, packed) -> host frames
         self.next_decision = 0
         self.snaps = weakref.WeakSet()
         self.roots = []                                 # weak methods -> iterable of (log, step) still live
@@ -440,9 +449,9 @@ class PagedStore:
             m = np.flatnonzero(pg == p)
             pages[p][torch.from_numpy(off[m])] = values[torch.from_numpy(m)].to(pages[p].dtype)
 
-    def _gather(self, pages, ids, shape, dtype):
+    def _gather(self, pages, ids, shape, dtype, out=None):
         ids = np.asarray(ids, np.int64)
-        out = torch.empty((len(ids), *shape), dtype=dtype)
+        out = torch.empty((len(ids), *shape), dtype=dtype) if out is None else out
         if not len(ids):
             return out
         P = self.page
@@ -479,14 +488,14 @@ class PagedStore:
         return bid
 
     # ---- reads
-    def kv(self, kvs):
-        return self._gather(self.kv_pages, kvs, self.kv_shape, self.kv_dtype)
+    def kv(self, kvs, out=None):
+        return self._gather(self.kv_pages, kvs, self.kv_shape, self.kv_dtype, out)
 
-    def z(self, kvs):
-        return self._gather(self.z_pages, kvs, self.z_shape, torch.float32)
+    def z(self, kvs, out=None):
+        return self._gather(self.z_pages, kvs, self.z_shape, torch.float32, out)
 
-    def blocks(self, bid):
-        return self._gather(self.b_pages, bid, self.b_shape, torch.float32)
+    def blocks(self, bid, out=None):
+        return self._gather(self.b_pages, bid, self.b_shape, torch.float32, out)
 
     def source_rows(self, decisions):
         """(rows, pending) for raw decision ids, assembled as one input-only source batch."""
@@ -559,11 +568,20 @@ class PagedStore:
         dead_r = keys[~np.isin(keys, live_raw)]
         for k in dead_r.tolist():
             del self.raw[k]
-        self.decoded = {}
+        # (B44) decoded block sources stay cached while their block lives (a freed id is reused)
+        dead_set = set(dead_b.tolist())
+        self.decoded = {k: v for k, v in list(self.decoded.items()) if k[0] not in dead_set}
         self.collections += 1
         self.freed['kv'] += len(dead); self.freed['blocks'] += len(dead_b); self.freed['raw'] += len(dead_r)
         return dict(kv=int(self.d_used.sum()), blocks=int(self.b_used.sum()), raw=len(self.raw),
                     freed_kv=len(dead), freed_blocks=len(dead_b), freed_raw=len(dead_r))
+
+    def cache_decoded(self, key, value):
+        """Learner cache of decoded block sources (key (block id, tag)); oldest entries dropped past
+        DECODED_CAP blocks (host memory bound)."""
+        self.decoded[key] = value
+        while len(self.decoded) > DECODED_CAP:
+            del self.decoded[next(iter(self.decoded))]
 
     def stats(self):
         return dict(kv_rows=int(self.d_used.sum()), kv_capacity=len(self.d_used), blocks=int(self.b_used.sum()),
@@ -1129,8 +1147,10 @@ def dense_memory_forward(memory, z, steps, prefixes, kp, old_vals, n_old, old_en
         for j in range(int(complete[i])):
             block_index.append(seq[j*bs:(j+1)*bs]); new_rows.append(i); new_ends.append(first_end+j*bs)
     written = None
+    ucount('learn_reader_calls', 1); ucount('learn_reader_rows_real', b*t); ucount('learn_reader_rows_padded', b*t)
     if block_index:
         idx = torch.from_numpy(np.stack(block_index)).to(dev)
+        ucount('learn_writer_calls', 1)
         written = memory.writer(pool[idx])
     counts = n_old+complete
     max_m = max(1, int(counts.max())*mt)
@@ -1205,6 +1225,9 @@ def encode_sorted(model, batch, micro, counts=None):
             # B42 glue 4: row-packed microbatch, one compiled graph per row-total bucket.
             m = len(order_h[begin:begin+micro])
             part = packed_rows_batch(batch, order_h[begin:begin+micro], counts_h[begin:begin+micro], dev)
+            ucount('learn_spatial_calls', 1)
+            ucount('learn_spatial_tokens_real', int(counts_h[begin:begin+micro].sum())+30*m)
+            ucount('learn_spatial_tokens_padded', int(part['rows_valid'].numel()))
             zp = checkpoint(model.encode_block, part, use_reentrant=False) if grad else model.encode_block(part)
             out.append(zp[:m])
             continue
@@ -1260,10 +1283,11 @@ def encode_blocks(model, store, bids, device, spatial_micro):
             rows_b, pend_b = store.source_rows(store.b_src[bid])
             d = decode_frame_host(rows_b, packed=packed)
             d['pending'] = pend_b; d['first'] = np.asarray(rows_b['first'])
-            store.decoded[(bid, packed)] = d
+            store.cache_decoded((bid, packed), d)
         hosts.append(d)
     merged = merge_host(hosts)
     zh = encode_sorted(model, from_host(merged, device), spatial_micro, host_counts(merged))
+    ucount('learn_writer_calls', 1)
     values = model.block_memory.writer(zh.reshape(len(hosts), cfg.block_steps, cfg.latents, cfg.latent_width))
     return values, len(hosts)*cfg.block_steps
 
@@ -1297,6 +1321,7 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     store = chunks[0].snapshot.store
     B = len(chunks)
     count('learn.calls', 1); count('learn.chunks', B); count('learn.rows', B*length)
+    ucount('learn_paged_calls', 1)
     parts = []
     for chunk in chunks:
         snap = chunk.snapshot

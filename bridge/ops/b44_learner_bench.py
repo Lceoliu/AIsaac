@@ -1,0 +1,207 @@
+"""B44 fixed-input learner benchmark: one real update's learner work, replayed without games.
+
+Input: <dir>/learner_inputs.pt from a short run with ISAAC_LEARNER_DUMP=<dir> (isaac_bridge/learner_dump.py):
+every forward_bucketed call of that update (its chunks, grad mode, keyword arguments), the referenced
+page store and the weights the update started from.
+
+  python b44_learner_bench.py <learner_inputs.pt> --mode old|packed [--reps 2] [--json out.json]
+  python b44_learner_bench.py <learner_inputs.pt> --equiv [--calls 3]
+
+Replay (each rep): the calls in their recorded order; a no-grad / inference call is a forward
+(bf16 autocast, as the learner); a grad call is forward + a fixed surrogate loss over every output
+(the same for both paths: fixed random weights on logits, value, danger, value_global) + backward
++ clip_grad_norm_(0.5) + Adam step (the run's optimizer: lr 1e-4, eps 1e-5). Every segment is
+GPU-synchronised (wall = GPU-finished time). The first rep compiles; reported: the last rep.
+--mode old: the per-length path (ISAAC_PACKED_LEARNER=0); packed: one execution per call.
+--equiv: the first grad calls on both paths from the same weights (same history draws): max |diff|
+of every output, the loss and every parameter gradient.
+"""
+import argparse
+import json
+import os
+import statistics
+import sys
+import time
+
+os.environ.setdefault('ISAAC_BLOCK_TIMING', '1')
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'python'))
+import numpy as np
+import torch
+
+from isaac_bridge import block_learner, block_paged as bp, learner_dump
+from isaac_bridge.block_training import forward_bucketed
+from isaac_bridge.tok_policy import TokPolicy
+
+
+def surrogate(out, gen_cache):
+    loss = 0.0
+    for i, o in enumerate(out):
+        o = o.float()
+        key = (i, o.shape[1:] if o.dim() > 1 else ())
+        if key not in gen_cache:
+            g = torch.Generator(device='cpu').manual_seed(100+i)
+            gen_cache[key] = torch.randn(o.shape[1:] if o.dim() > 1 else (1,), generator=g).to(o.device)
+        w = gen_cache[key]
+        loss = loss+((o*w).mean() if o.dim() > 1 else (o*w[0]).mean()+o.square().mean()*1e-3)
+    return loss
+
+
+def sync():
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def fresh(calls):
+    """A new update's state: no host decode cached on the chunks or in the page store (a real
+    update decodes its new rollout once; DECODE_CACHE is cleared at its start)."""
+    for c in calls:
+        for ch in c['chunks']:
+            ch.__dict__.pop('_host', None)
+            ch.snapshot.store.decoded = {}
+    bp.clear_decode_cache()
+
+
+def replay(model, opt, calls, packed, seed=0):
+    block_learner.PACKED = packed
+    fresh(calls)
+    bp.UPD.clear()
+    torch.manual_seed(seed)
+    cache = {}
+    t = dict(fwd_grad=0.0, fwd_nograd=0.0, bwd=0.0, opt=0.0)
+    n_grad = 0
+    torch.cuda.reset_peak_memory_stats()
+    t_all = sync()
+    for c in calls:
+        kw = dict(c['kwargs'])
+        if c['grad']:
+            n_grad += 1
+            model.train()
+            t0 = sync()
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                out, ctx = forward_bucketed(model, c['chunks'], **kw)
+            t1 = sync(); t['fwd_grad'] += t1-t0
+            loss = surrogate(out, cache)
+            loss.backward()
+            t2 = sync(); t['bwd'] += t2-t1
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            opt.step(); opt.zero_grad(set_to_none=True)
+            t['opt'] += sync()-t2
+            del out, ctx, loss
+        else:
+            t0 = sync()
+            mode = torch.inference_mode() if c['inference'] else torch.no_grad()
+            with mode, torch.autocast('cuda', dtype=torch.bfloat16):
+                out, ctx = forward_bucketed(model, c['chunks'], **kw)
+            t['fwd_nograd'] += sync()-t0
+            del out, ctx
+    t['total'] = sync()-t_all
+    bp.GpuSpan.drain()
+    upd = dict(bp.UPD)
+    bp.clear_decode_cache()
+    keys = ('learn_paged_calls', 'learn_packed_calls', 'learn_reader_calls', 'learn_reader_rows_real',
+            'learn_reader_rows_padded', 'learn_spatial_calls', 'learn_spatial_tokens_real', 'learn_spatial_tokens_padded',
+            'learn_writer_calls', 'learn_packed_host_s', 'learn_staged_mb', 'learn_main_decode_rows_fresh',
+            'learn_hist_decode_rows_fresh', 'learn_tail_decode_rows')
+    r = {k: round(v, 3) for k, v in t.items()}
+    r.update({k: upd.get(k, 0) for k in keys})
+    r['grad_calls'] = n_grad
+    r['calls'] = len(calls)
+    r['peak_allocated_gb'] = round(torch.cuda.max_memory_allocated()/2**30, 2)
+    r['peak_reserved_gb'] = round(torch.cuda.max_memory_reserved()/2**30, 2)
+    return r
+
+
+def load_model(ck, dev):
+    model = TokPolicy(**ck['config']).to(dev)
+    model.load_state_dict(ck['model'])
+    opt = torch.optim.Adam(model.main_parameters(), lr=1e-4, eps=1e-5)
+    return model, opt
+
+
+def equiv(ck, calls, dev, n, fp32=False):
+    grads = [c for c in calls if c['grad']][:n]
+    rep = []
+    for k, c in enumerate(grads):
+        res = []
+        for packed in (False, True):
+            model, _ = load_model(ck, dev)
+            model.train()
+            block_learner.PACKED = packed
+            fresh([c])
+            torch.manual_seed(1234+k)
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=not fp32):
+                out, ctx = forward_bucketed(model, c['chunks'], **c['kwargs'])
+            loss = surrogate(out, {})
+            loss.backward()
+            res.append(([o.detach().float() for o in out], float(loss), {n_: p.grad.float() for n_, p in
+                                                                       model.named_parameters() if p.grad is not None},
+                        ctx['recompute_stats']))
+        (oa, la, ga, sa), (ob, lb, gb, sb) = res
+        names = ('logits', 'value', 'danger', 'value_global')
+        r = dict(call=k, rows=int(sum(len(x.rows) for x in c['chunks'])), chunks=len(c['chunks']),
+                 loss_old=la, loss_packed=lb, loss_abs_diff=abs(la-lb),
+                 out_max_abs_diff={names[i] if i < len(names) else str(i): float((x-y).abs().max())
+                                   for i, (x, y) in enumerate(zip(oa, ob))},
+                 out_max_abs={names[i] if i < len(names) else str(i): float(x.abs().max()) for i, x in enumerate(oa)},
+                 grad_max_abs_diff=max(float((ga[n_]-gb[n_]).abs().max()) for n_ in ga),
+                 grad_max_rel_diff=max(float((ga[n_]-gb[n_]).norm()/(ga[n_].norm()+1e-12)) for n_ in ga),
+                 grad_keys_equal=ga.keys() == gb.keys(), stats_old=sa, stats_packed=sb, fp32=fp32,
+                 grad_total_rel_diff=float(torch.sqrt(sum(((ga[n_]-gb[n_])**2).sum() for n_ in ga)) /
+                                          torch.sqrt(sum((ga[n_]**2).sum() for n_ in ga))),
+                 grad_worst=sorted(((float((ga[n_]-gb[n_]).norm()/(ga[n_].norm()+1e-12)), n_, float(ga[n_].norm()))
+                                    for n_ in ga), reverse=True)[:6])
+        print(json.dumps(r), flush=True)
+        rep.append(r)
+    return rep
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('path')
+    p.add_argument('--mode', choices=('old', 'packed'), default='packed')
+    p.add_argument('--reps', type=int, default=2)
+    p.add_argument('--json', default='')
+    p.add_argument('--equiv', action='store_true')
+    p.add_argument('--calls', type=int, default=3)
+    p.add_argument('--fp32', action='store_true', help='--equiv without autocast (FP32 everywhere)')
+    p.add_argument('--cprofile', action='store_true', help='cProfile of the last rep (host time by function)')
+    a = p.parse_args()
+    dev = torch.device('cuda')
+    from isaac_bridge import block_compile
+    block_compile.configure()
+    t = time.perf_counter()
+    ck, store, chunks, calls, extra = learner_dump.load(a.path)
+    lens = [len(c.rows) for c in chunks]
+    info = dict(calls=len(calls), grad_calls=sum(c['grad'] for c in calls), chunks=len(chunks),
+                rows_per_call=[int(sum(len(x.rows) for x in c['chunks'])) for c in calls],
+                chunk_len_hist=np.bincount(lens).tolist(), load_s=round(time.perf_counter()-t, 1),
+                torch=torch.__version__)
+    print(json.dumps(info), flush=True)
+    if a.equiv:
+        out = dict(info=info, equiv=equiv(ck, calls, dev, a.calls, a.fp32))
+    else:
+        model, opt = load_model(ck, dev)
+        reps = []
+        for i in range(a.reps):
+            prof = None
+            if a.cprofile and i == a.reps-1:
+                import cProfile
+                prof = cProfile.Profile(); prof.enable()
+            r = replay(model, opt, calls, a.mode == 'packed', seed=i)
+            if prof is not None:
+                import pstats, io
+                prof.disable()
+                for key in ('tottime', 'cumulative'):
+                    buf = io.StringIO()
+                    pstats.Stats(prof, stream=buf).sort_stats(key).print_stats(35)
+                    print(buf.getvalue(), flush=True)
+            print(json.dumps(dict(rep=i, mode=a.mode, **r)), flush=True)
+            reps.append(r)
+        out = dict(info=info, mode=a.mode, reps=reps, env={k: v for k, v in os.environ.items() if k.startswith('ISAAC_')})
+    if a.json:
+        with open(a.json, 'w') as f:
+            json.dump(out, f, indent=1)
+
+
+if __name__ == '__main__':
+    main()

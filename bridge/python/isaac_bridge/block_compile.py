@@ -59,6 +59,12 @@ def _backend(gm, example_inputs):
         STATS['compiles'] += 1
         if _STEADY[0]:
             STATS['steady_compiles'] += 1
+            # B44: which compiled call recompiled, with its input shapes (diagnosis only)
+            import traceback
+            where = [f'{f.filename.rsplit("/", 1)[-1]}:{f.lineno} {f.name}' for f in traceback.extract_stack()
+                     if 'isaac_bridge' in f.filename or 'train_tok' in f.filename][-4:]
+            shapes = [tuple(x.shape) if hasattr(x, 'shape') else x for x in example_inputs[:8]]
+            print('B44 steady compile', where, shapes, flush=True)
     from torch._inductor.compile_fx import compile_fx
     return compile_fx(gm, example_inputs)
 

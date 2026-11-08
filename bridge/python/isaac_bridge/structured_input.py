@@ -175,6 +175,20 @@ def packed_rows_batch(batch,rows,counts,device):
     is on the host (one H2D of all indices); the device only gathers. Lists are padded to >= 2
     entries (destination: the trash row) and a 1-row batch to 2 rows (a duplicate), so no
     dimension is 0 or 1 (dynamo would specialise it); keep the first len(rows) outputs."""
+    idx,T=packed_rows_plan({k:batch['v_'+k].shape[1] for k in RAGGED},rows,counts)
+    names=list(idx);sizes=[len(idx[k]) for k in names]
+    flat=torch.from_numpy(np.concatenate([idx[k] for k in names]).astype(np.int64))
+    device=torch.device(device)
+    if device.type=='cuda':flat=flat.pin_memory()
+    flat=flat.to(device,non_blocking=True)
+    return packed_rows_apply(batch,dict(zip(names,flat.split(sizes))),T)
+
+
+def packed_rows_plan(widths,rows,counts,starts=None):
+    """packed_rows_batch's host part: (index arrays (host int64), T). widths: the decoded batch's
+    ragged slot widths {name: width}. starts (B44, compact lists, decode_frame_compact): {name:
+    (first entry of each batch row [n], index of the zero entry)}; then sources index the compact
+    [K+1, width] arrays."""
     rows=np.asarray(rows,np.int64);counts=np.asarray(counts,np.int64)
     if len(rows)==1:rows,counts=np.repeat(rows,2),np.repeat(counts,2,0)
     n=len(rows);p,pl,e,ni,sl=counts.T
@@ -184,11 +198,15 @@ def packed_rows_batch(batch,rows,counts,device):
     off={'body':np.zeros(n,np.int64),'local':p+28,'entity':p+pl+29,'inventory':p+pl+29+e,'slots':p+pl+29+e+ni}
     idx,src={},{}
     for name,c in (('body',p),('local',pl),('entity',e),('inventory',ni),('slots',sl)):
-        W=batch['v_'+name].shape[1];k=int(c.sum())
+        W=widths[name] if starts is None else 0;k=int(c.sum())
         rr=np.repeat(np.arange(n,dtype=np.int64),c);j=np.arange(k)-np.repeat(np.cumsum(c)-c,c)
-        sv=np.repeat(rows,c)*W+j;dv=base[rr]+off[name][rr]+j
+        if starts is None:
+            sv=np.repeat(rows,c)*W+j;pad=0
+        else:
+            sv=np.repeat(starts[name][0][rows],c)+j;pad=starts[name][1]
+        dv=base[rr]+off[name][rr]+j
         if k<2:
-            sv=np.concatenate((sv,np.zeros(2-k,np.int64)));dv=np.concatenate((dv,np.full(2-k,trash)))
+            sv=np.concatenate((sv,np.full(2-k,pad,np.int64)));dv=np.concatenate((dv,np.full(2-k,trash)))
             rr=np.concatenate((rr,np.zeros(2-k,np.int64)))
         src[name]=sv;idx['d_'+name]=dv
         if name=='body':idx['body_row']=rr
@@ -199,19 +217,18 @@ def packed_rows_batch(batch,rows,counts,device):
     idx['keep']=(base[:,None]+at)[at<tot[:,None]]
     idx['rows']=rows;idx['tot']=tot
     for name in src:idx['s_'+name]=src[name]
-    names=list(idx);sizes=[len(idx[k]) for k in names]
-    flat=torch.from_numpy(np.concatenate([idx[k] for k in names]).astype(np.int64))
-    device=torch.device(device)
-    if device.type=='cuda':flat=flat.pin_memory()
-    flat=flat.to(device,non_blocking=True)
-    d=dict(zip(names,flat.split(sizes)))
+    return idx,T
+
+
+def packed_rows_apply(batch,d,T):
+    """packed_rows_batch's device part: d holds packed_rows_plan's arrays on the device."""
     out={k:d[k] for k in ('body_row','d_body','d_local','d_entity','d_inventory','d_slots','d_room','d_map',
                           'd_global','keep')}
-    out['rows_valid']=torch.arange(T,device=device)[None,:]<d['tot'][:,None]
+    out['rows_valid']=torch.arange(T,device=d['tot'].device)[None,:]<d['tot'][:,None]
     rd=d['rows']
     out['room']=batch['v_room'].index_select(0,rd);out['map']=batch['v_map'].index_select(0,rd)
     out['pending']=batch['pending'].index_select(0,rd)
-    for name in src:
+    for name in RAGGED:
         v=batch['v_'+name];out[name]=v.reshape(-1,v.shape[-1]).index_select(0,d['s_'+name])
     return out
 
@@ -335,6 +352,57 @@ def decode_frame_host(rows,packed=False):
         offset+=count*width
     if not packed:b['v_local']=_unpack_room_host(b['v_local']).reshape(len(rows),-1,RC*81)
     return b
+
+
+def decode_frame_compact(rows,packed=False):
+    """decode_frame_host's values without bucket padding (B44 packed learner): v_room / v_map as
+    decode_frame_host; each ragged list as 'c_<name>' [K, width]: the K real entries of all rows in
+    row order (row r's from the cumulative count of the rows before it); 'counts' [n,5] (body,
+    local, entity, inventory, slots). Host work and staged bytes follow the real entries."""
+    return decode_frames_compact([rows],packed)[0]
+
+
+def decode_frames_compact(parts,packed=False):
+    """decode_frame_compact of several ROW arrays at once (one set of index computations, one
+    fancy-index gather per array and list); returns one dict per array (views of shared arrays)."""
+    parts=[r for r in parts]
+    lens=np.array([len(r) for r in parts],np.int64)
+    m=int(lens.sum())
+    fs=[r['visible_frame'].view('<f4') for r in parts]
+    counts=np.concatenate([check_frames(r) for r in parts]) if parts else np.zeros((0,4),np.int64)
+    p,e,n,s_=counts.T
+    counts=np.stack((p,p,e,n,s_),1).astype(np.int64)
+    row_at=np.concatenate(([0],np.cumsum(lens)))
+    room=np.empty((m,1792),np.float32);minimap=np.empty((m,169),np.float32)
+    for i,f in enumerate(fs):
+        room[row_at[i]:row_at[i+1]]=f[:,HEADER:HEADER+1792];minimap[row_at[i]:row_at[i+1]]=f[:,HEADER+1792:FIXED]
+    if not packed:
+        room=_unpack_room_host(room).reshape(-1,RC,16,28)
+        minimap=((minimap.astype(np.int64)[...,None]>>np.arange(8))&1).astype(np.float32)
+        minimap=minimap.transpose(0,2,1).reshape(-1,8,13,13)
+    offset=np.full(m,FIXED,np.int64)
+    lists,ent_at={},{}
+    for k,name in enumerate(RAGGED):
+        width=RAGGED[name];c=counts[:,k];K=int(c.sum())
+        out=np.empty((K,width),np.float32)
+        cum=np.concatenate(([0],np.cumsum(c)))
+        if K:
+            rr=np.repeat(np.arange(m),c);j=np.arange(K)-np.repeat(cum[:-1],c)
+            col=(offset[rr]+j*width)[:,None]+np.arange(width)
+            for i,f in enumerate(fs):
+                a,b=cum[row_at[i]],cum[row_at[i+1]]
+                if b>a:out[a:b]=f[rr[a:b,None]-row_at[i],col[a:b]]
+        if name=='local' and not packed:out=_unpack_room_host(out).reshape(K,RC*81)
+        lists[name]=out;ent_at[name]=cum
+        offset+=c*width
+    res=[]
+    for i in range(len(parts)):
+        lo,hi=row_at[i],row_at[i+1]
+        d={'v_room':room[lo:hi],'v_map':minimap[lo:hi],'counts':counts[lo:hi]}
+        for name in RAGGED:
+            cum=ent_at[name];d['c_'+name]=lists[name][cum[lo]:cum[hi]]
+        res.append(d)
+    return res
 
 
 def observation_frame(o):

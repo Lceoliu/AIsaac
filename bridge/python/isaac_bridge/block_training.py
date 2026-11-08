@@ -688,6 +688,12 @@ def forward_bucketed(model, chunks, max_rows=None, **kwargs):
     """Parallelise equal-length chunks; restore the caller's exact decision order."""
     # This interface returns representations/loss inputs, never continuation state.
     kwargs.setdefault('require_next_state',False)
+    if chunks and isinstance(chunks[0].snapshot,PagedSnapshot):
+        from . import learner_dump
+        learner_dump.record(chunks,dict(kwargs,max_rows=max_rows))   # (B44 fixed-input benchmark; measurement only)
+        from . import block_learner
+        if block_learner.PACKED:   # B44: one execution per part (ISAAC_PACKED_LEARNER=0: per exact length)
+            return block_learner.forward_packed(model,chunks,max_rows=max_rows,**kwargs)
     by_length = {}
     for index, chunk in enumerate(chunks):
         by_length.setdefault(len(chunk.rows), []).append(index)
