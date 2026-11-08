@@ -14,7 +14,7 @@ import torch
 
 from test_block_memory import make_policy
 from test_visible_input import synth_rows, synth_pending
-from isaac_bridge.block_training import (BlockActor, Chunk, forward_chunks, forward_bucketed, ppo_loss, cf_loss,
+from isaac_bridge.block_training import (BlockActor, Chunk, forward_chunks, forward_bucketed, ppo_loss, cf_loss, source_rows,
                                          injury_loss, pack_snapshots, unpack_snapshots)
 from isaac_bridge.block_paged import SlotBlockActor, PagedSnapshot, PagedPayload
 from train_tok import Rollout, store, gae
@@ -208,7 +208,7 @@ def test_learner_rollout_chunks_ppo_loss_and_all_gradients(device):
     outs = []
     for model, plan in ((m, plans[0]), (ref, plans[1])):
         out, ctx = forward_bucketed(model, plan['chunks'], generator=torch.Generator().manual_seed(5))
-        rows = np.concatenate([c.rows for c in plan['chunks']])
+        rows = source_rows([c.framed() for c in plan["chunks"]])
         pend = np.concatenate([c.pending for c in plan['chunks']])
         from isaac_bridge.structured_input import from_rows
         batch = from_rows(rows, device, pend)
@@ -260,7 +260,7 @@ def test_learner_teacher_records_cf_injury_loss_and_gradients(device, kind):
         g = torch.Generator().manual_seed(2)
         if kind == 'cf':
             actions = torch.stack([torch.randint(0, k, (n,), generator=g) for k in model.heads], 1).to(device)
-            rows = np.concatenate([c.rows for c in cs]); pend = np.concatenate([c.pending for c in cs])
+            rows = source_rows([c.framed() for c in cs]); pend = np.concatenate([c.pending for c in cs])
             from isaac_bridge.structured_input import from_rows
             batch = from_rows(rows, device, pend)
             loss = cf_loss(model, out, batch, actions, torch.rand(n, generator=g).to(device),

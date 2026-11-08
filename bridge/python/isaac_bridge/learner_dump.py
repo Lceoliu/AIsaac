@@ -95,8 +95,8 @@ def end(model, extra=None):
     for c in chunk_list:
         r = np.asarray(c.rows)
         key = (r.__array_interface__['data'][0], r.shape, r.strides)
-        if key not in rows_by_key:
-            rows_by_key[key] = len(rows_out); rows_out.append(_rows_blob(r))
+        if key not in rows_by_key:   # (B45: compact records' frames from their arena)
+            rows_by_key[key] = len(rows_out); rows_out.append(_rows_blob(c.framed()))
         s = c.snapshot
         chunk_out.append(dict(rows=rows_by_key[key], pending=np.asarray(c.pending, np.int64).copy(),
                               log=log_ids[id(s.log)], step=s.step, spending=np.asarray(s.pending).copy(),

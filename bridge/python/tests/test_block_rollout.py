@@ -32,7 +32,7 @@ def test_spawned_memfd_visible_rows_and_history():
     if not sys.platform.startswith('linux'):
         pytest.skip('Linux memfd /proc mapping')
     torch.set_num_threads(1)
-    model,_,roll,_=collect()
+    model,_,roll,_=collect(alloc=np.zeros)   # (B38's learner process shares ROW records)
     allocator=SharedArrays()
     for key,value in list(vars(roll).items()):
         if isinstance(value,np.ndarray):
@@ -51,9 +51,11 @@ def test_spawned_memfd_visible_rows_and_history():
     assert roll.reward[0,0]==42.
 
 
-def collect(n=11):
+def collect(n=11,alloc=None):
+    # alloc (B38's shared arrays; here np.zeros): ROW records, as the learner-process hand-off keeps them (B45: an
+    # in-process block rollout stores compact records with a frame arena)
     model,actor,rng=history_actor(steps=0)
-    roll=Rollout(2,20,5,value_g=True,block_steps=4)
+    roll=Rollout(2,20,5,value_g=True,block_steps=4,alloc=alloc)
     values=[]
     for t in range(n):
         rows=synth_rows(rng,2);rows["first"]=int(t==0);rows["episode"]=1
@@ -107,7 +109,7 @@ def test_open_decision_carry_has_pre_observation_state():
 
 
 def test_single_and_two_actor_native_ipc():
-    model,actor,roll,_=collect()
+    model,actor,roll,_=collect(alloc=np.zeros)
     arrays={k:v for k,v in vars(roll).items() if isinstance(v,np.ndarray)}
     scalars=rollout_scalars(roll)
     one=rollout_view(arrays,scalars,None)
@@ -145,7 +147,7 @@ def test_bucketed_loss_reaches_all_lengths_and_history():
 
 
 def test_legacy_rollout_like_object_without_block_attribute():
-    model,actor,roll,_=collect(1)
+    model,actor,roll,_=collect(1,alloc=np.zeros)
     legacy=SimpleNamespace(**{k:v for k,v in vars(roll).items() if k!='block'})
     assert 'block_payload' not in rollout_scalars(legacy)
     store(legacy,np.array([0]),roll.rows[0,:1],roll.pending[0,:1],roll.actions[0,:1],

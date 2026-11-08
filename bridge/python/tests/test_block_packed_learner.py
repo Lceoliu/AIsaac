@@ -8,7 +8,7 @@ import torch
 from test_block_slot_integration import pair, frame, _collect_rollout, _losses, _loss, DEV
 from test_visible_input import synth_pending
 from isaac_bridge import block_learner
-from isaac_bridge.block_training import Chunk, forward_bucketed
+from isaac_bridge.block_training import Chunk, forward_bucketed, source_rows
 from isaac_bridge.structured_input import from_rows, FIXED
 from train_tok import gae
 
@@ -87,7 +87,7 @@ def test_packed_matches_per_length_path_outputs_loss_and_every_gradient(device, 
         finally:
             bp.TIMING_ON = on
         calls = dict(bp.UPD)
-        rows = np.concatenate([c.rows for c in batch_chunks]); pend = np.concatenate([c.pending for c in batch_chunks])
+        rows = source_rows([c.framed() for c in batch_chunks]); pend = np.concatenate([c.pending for c in batch_chunks])
         loss = _losses(m, out, from_rows(rows, device, pend), 3)
         loss.backward()
         res.append((loss.detach(), [x.detach() for x in out], ctx['recompute_stats'], _grads(m), calls))
@@ -141,7 +141,7 @@ def test_no_decision_reads_later_inputs_or_later_memory(monkeypatch):
     bs = m.block_memory.config.block_steps
     assert n > 2*bs
     k = bs+1   # a block completes after decision k (inside the chunk), written partly from changed rows
-    rows = np.array(c.rows, copy=True)
+    rows = np.array(c.framed(), copy=True)   # (B45: compact rollout records: their frames inline here)
     f = rows['visible_frame'].view('<f4')
     f[k:, FIXED:FIXED+2] += 0.75   # the player's position (the first body fields)
     c2 = Chunk(rows, c.pending, c.snapshot)

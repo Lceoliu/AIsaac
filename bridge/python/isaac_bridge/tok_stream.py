@@ -185,7 +185,9 @@ class StreamLog:
         full = np.zeros(len(pr), self.dt_row)
         if len(pr):
             wr, tr = w[pr], t[pr]
-            full['row'] = roll.rows[wr, tr]
+            from .tok_obs import expand_rows   # (B45: compact rollout records with their frames)
+            frames = getattr(roll, 'frames', None)
+            full['row'] = expand_rows(roll.rows[wr, tr], frames.buf if frames is not None else None)
             full['action'], full['pending'] = roll.actions[wr, tr], roll.pending[wr, tr]
             full['worker'], full['update'] = wr, update
         plan['rec'], plan['full'] = rec, full

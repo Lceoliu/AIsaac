@@ -288,8 +288,9 @@ def _np_dtype(t):
 
 
 def _compact(rows, pending, packed):
-    from .structured_input import decode_frame_compact
-    d = decode_frame_compact(rows, packed=packed)
+    """Compact decode of records (or a (records, frame arena) pair) with their actions under way."""
+    from .structured_input import decode_frames_compact
+    d = decode_frames_compact([rows], packed=packed)[0]
     d['pending'] = np.asarray(pending, dtype=np.int64)
     return d
 
@@ -319,7 +320,10 @@ def _host_decode(chunks, packed):
         if hosts[i] is not None:
             bp.ucount('learn_main_decode_rows_cached', len(chunks[i].rows))
     if fresh:
-        ds = decode_frames_compact([chunks[i].rows for i in fresh], packed)
+        t0 = time.perf_counter()
+        # (B45: compact rollout records are read from their frame arena directly)
+        ds = decode_frames_compact([(chunks[i].rows, chunks[i].frames) if chunks[i].frames is not None
+                                    else chunks[i].rows for i in fresh], packed)
         for i, key, d in zip(fresh, keys, ds):
             c = chunks[i]
             bp.ucount('learn_main_decode_rows_fresh', len(c.rows))
@@ -328,6 +332,7 @@ def _host_decode(chunks, packed):
             if key is not None:
                 bp.DECODE_CACHE[key] = d
                 object.__setattr__(c, '_host', (tag, d))
+        bp.ucount('learn_main_decode_s', time.perf_counter()-t0)
     return hosts
 
 
@@ -342,13 +347,16 @@ def _block_decode(store, bids, packed, block_steps):
     fresh = [i for i, h in enumerate(hosts) if h is None]
     bp.ucount('learn_hist_decode_rows_cached', (len(bids)-len(fresh))*block_steps)
     if fresh:
+        t0 = time.perf_counter()
         bp.ucount('learn_hist_decode_rows_fresh', len(fresh)*block_steps)
-        rows_b, pend_b = store.source_rows(np.concatenate([store.b_src[bids[i]] for i in fresh]))
-        parts = [rows_b[j*block_steps:(j+1)*block_steps] for j in range(len(fresh))]
+        # (B45: the raw frames joined into one byte array, decoded in place)
+        rows_b, buf_b, pend_b = store.source_arena(np.concatenate([store.b_src[bids[i]] for i in fresh]))
+        parts = [(rows_b[j*block_steps:(j+1)*block_steps], buf_b) for j in range(len(fresh))]
         for j, (i, d) in enumerate(zip(fresh, decode_frames_compact(parts, packed))):
             d['pending'] = pend_b[j*block_steps:(j+1)*block_steps]
             hosts[i] = d
             store.cache_decoded((bids[i], tag), d)
+        bp.ucount('learn_hist_decode_s', time.perf_counter()-t0)
     return hosts
 
 
@@ -454,8 +462,8 @@ def forward_packed(model, chunks, generator=None, train_history=True, version=0,
     enc = [i for i, p in enumerate(parts) if len(p['pdec']) and lens[i]+len(p['pdec']) > bs]
     tail_hosts, n_tail = [], 0
     if enc:
-        rows_t, pend_t = store.source_rows(np.concatenate([parts[i]['pdec'] for i in enc]))
-        tail_hosts, n_tail = [_compact(rows_t, pend_t, packed)], len(rows_t)
+        rows_t, buf_t, pend_t = store.source_arena(np.concatenate([parts[i]['pdec'] for i in enc]))
+        tail_hosts, n_tail = [_compact((rows_t, buf_t), pend_t, packed)], len(rows_t)
         bp.ucount('learn_tail_decode_rows', n_tail)
     all_hosts = hosts+hist_hosts+tail_hosts
     n_rows = n_main+n_hist+n_tail

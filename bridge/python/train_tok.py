@@ -251,7 +251,8 @@ import numpy as np
 
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
-from isaac_bridge.tok_obs import DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_PILL, ROW
+from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_PILL, ROW, ROWC, FrameArena,
+                                  compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
                                       default_stub_list)
 
@@ -724,7 +725,11 @@ class Rollout:
         self.value_g = zeros((workers, capacity), np.float32) if value_g else None
         # 2026-10-11 (memory): the GRU's input state of each decision (None without memory)
         self.h = zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
-        self.rows = zeros((workers, capacity), ROW)
+        # B45: block-memory rollouts store compact records (ROWC) and their visible frames in a byte arena (~11 KB each
+        # instead of 128 KiB); others (and B38's shared-memory learner process) keep ROW
+        compact = bool(block_steps) and alloc is None
+        self.rows = zeros((workers, capacity), ROWC if compact else ROW)
+        self.frames = FrameArena(workers * capacity * 12288) if compact else None
         self.pending = zeros((workers, capacity, n_heads), np.int64)
         self.actions = zeros((workers, capacity, n_heads), np.int64)
         self.logp = zeros((workers, capacity), np.float32)
@@ -755,6 +760,8 @@ class Rollout:
     def reset(self):
         self.length[:] = 0
         self.open[:] = -1
+        if self.frames is not None:
+            self.frames.reset()
         if self.block is not None:
             self.block.reset()
         if self.t_kv is not None:   # (B31) the pool's rows free again
@@ -819,6 +826,11 @@ class Rollout:
             self.block.carry(other.block,i,k)
         for name in ('rows', 'pending', 'actions', 'logp', 'value', 'version', 'boot'):
             getattr(self, name)[i, 0] = getattr(other, name)[i, k]
+        if self.frames is not None:   # (B45) the open decisions' frames into this rollout's arena
+            if other.frames is None:
+                raise ValueError('carry: a compact rollout needs a compact source')
+            self.rows['visible_off'][i, 0] = self.frames.append_from(
+                other.frames.buf, other.rows['visible_off'][i, k], other.rows['visible_bytes'][i, k])
         if self.h is not None:   # (memory)
             self.h[i, 0] = other.h[i, k]
         if self.value_g is not None and other.value_g is not None:   # (B24)
@@ -1055,6 +1067,12 @@ class Episodes:
         return go
 
 
+def _ccopy(rows, pending, snapshot):
+    """(B45) Chunk arguments of one teacher record: compact record, actions under way, snapshot, its frame bytes."""
+    rc, frames = compact_copy(rows)
+    return rc, pending, snapshot, frames
+
+
 def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, vg=None, tinfo=None, priv=None,
           block_context=None):
     """Store the decisions just answered (workers a_idx, distinct) as their workers' open ones. h (memory): the GRU's
@@ -1085,7 +1103,7 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
         roll.h[a_idx, kk] = h
     if priv is not None:   # 2026-11-03 (--priv-critic)
         roll.priv[a_idx, kk] = priv
-    roll.rows[a_idx, kk] = rows
+    roll.rows[a_idx, kk] = compact_rows(rows, roll.frames) if roll.rows.dtype == ROWC else rows   # (B45)
     roll.boot[a_idx, kk] = rows['done'] == DONE_BRANCH   # 2026-10-07 (branches; always False without them)
     roll.pending[a_idx, kk], roll.actions[a_idx, kk] = under_way, actions
     roll.logp[a_idx, kk], roll.value[a_idx, kk], roll.version[a_idx, kk] = logp, value, version
@@ -2400,6 +2418,11 @@ def main(argv=None, child=None, actor=None):
     if proc and (os.environ.get('ISAAC_RL_LEARNER_BENCH') or lab_on or branching):
         p.error('--learner-process 1: not with the learner bench, the build lab or branches (their learner side writes '
                 "into the actor's state)")
+    if block_on:   # B45: the workers' C visible-frame encoder, built once here (the workers find it in the cache)
+        from isaac_bridge import visible_native
+        lib_v = visible_native.load()
+        print('B45 visible frame encoder:', lib_v.path if lib_v is not None else 'reference (Python observation_frame)',
+              flush=True)
     if block_on and child is None and device.type=='cuda':
         # B42 glue 3/4: every bucket of the compiled visible-v2 encoder (actor (entity, body)
         # buckets, learner row-total buckets, canvas decoder) before any game starts (a cold
@@ -2775,6 +2798,11 @@ def main(argv=None, child=None, actor=None):
             bpt.clear_decode_cache()   # (B42 fix 3: decoded rollout chunks live for one update)
             from isaac_bridge import learner_dump
             learner_dump.begin(L['update'], learner_model)   # (B44 ISAAC_LEARNER_DUMP: measurement only)
+            rl_ = job['roll']   # B45: record bytes (head + frame) of this rollout
+            n_rl_ = max(rl_.total(), 1)
+            arena_ = rl_.frames.used if getattr(rl_, 'frames', None) is not None else 0
+            job['rollout_mb'] = (rl_.total() * rl_.rows.dtype.itemsize + arena_) / 2 ** 20
+            job['rec_bytes'] = job['rollout_mb'] * 2 ** 20 / n_rl_
             bpt.ucount('update_t0', time.time())
             ru0 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))
         U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
@@ -3106,7 +3134,8 @@ def main(argv=None, child=None, actor=None):
             new_rows, new_meta = job['teach'][:2]
             if block_on:
                 new_contexts = unpack_snapshots(job['teach'][2],'cpu')
-                new_teach_chunks = [Chunk(new_rows[i:i+1].copy(),teach_pending(new_meta[i:i+1].astype(np.int64)),s)
+                # (B45: kept as compact records with their own frame bytes, not 148-KiB ROW copies)
+                new_teach_chunks = [Chunk(*_ccopy(new_rows[i:i+1],teach_pending(new_meta[i:i+1].astype(np.int64)),s))
                                     for i,s in enumerate(new_contexts)]
             teach_new = len(new_rows)
             if teach_new:   # the policy's mass on the safe moves of records it has not been trained on
@@ -3162,7 +3191,7 @@ def main(argv=None, child=None, actor=None):
                 pend_v = v_meta[:, V2I['pend0']:V2I['pend0'] + nh].astype(np.int64)
                 if block_on:
                     vc_b = unpack_snapshots(got_v[2],'cpu')
-                    new_v2_chunks = [Chunk(v_rows[i:i+1].copy(),pend_v[i:i+1].copy(),s) for i,s in enumerate(vc_b)]
+                    new_v2_chunks = [Chunk(*_ccopy(v_rows[i:i+1],pend_v[i:i+1].copy(),s)) for i,s in enumerate(vc_b)]
                 act_v = v_meta[:, V2I['act0']:V2I['act0'] + nh].astype(np.int64)
                 G_v = v_meta[:, V2I['ret']].astype(np.float32)
                 first_v = v_meta[:, V2I['j']] == 0
@@ -3964,6 +3993,8 @@ def main(argv=None, child=None, actor=None):
             'c_wait_learner': job.get('cycle_wait_s', 0.0), 'c_dec_min': job.get('dec_min', 0.0),
             'c_dec_max': job.get('dec_max', 0.0), 'dec_w': job.get('dec_w', ''),
             'c_trainer_cores': job.get('proc_cores', 0.0),
+            # B45: bytes per stored decision (record + its frame) and of the whole rollout's records
+            'rec_bytes': job.get('rec_bytes', 0.0), 'rollout_mb': job.get('rollout_mb', 0.0),
         }
         if mem_on:   # 2026-10-11 (memory): BPTT chunks and rows of the update (trained decisions: count)
             row['mem_chunks'], row['mem_rows'] = mplan['chunks'], len(flat)

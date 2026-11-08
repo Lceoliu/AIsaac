@@ -362,20 +362,52 @@ def decode_frame_compact(rows,packed=False):
     return decode_frames_compact([rows],packed)[0]
 
 
+class _Frames:
+    """Float32 reader of a part's frames: ROW-like records (visible_frame inline) or (B45) compact records with
+    their frame arena ((rows, arena bytes): the frame of row r starts at byte rows['visible_off'][r])."""
+
+    def __init__(self, part):
+        if isinstance(part, tuple):
+            rows, buf = part
+            buf = np.asarray(buf, np.uint8)
+            self.f = buf[:len(buf)//4*4].view('<f4')
+            self.base = np.asarray(rows['visible_off'], np.int64)//4
+            head = buf[np.asarray(rows['visible_off'], np.int64)[:, None]+np.arange(HEADER*4)]
+            self.counts = check_headers(rows['visible_schema'], head, rows['visible_bytes'])
+            self.n = len(rows)
+        else:
+            self.f = part['visible_frame'].view('<f4')
+            self.base = None
+            self.counts = check_frames(part)
+            self.n = len(part)
+
+    def take(self, r, col):
+        """f[r, col] (r: rows of this part [k], col [k, w])."""
+        if self.base is None:
+            return self.f[r[:, None] if col.ndim == 2 else r, col]
+        return self.f[self.base[r][:, None]+col if col.ndim == 2 else self.base[r]+col]
+
+    def block(self, lo, hi):
+        """f[:, lo:hi] of every row."""
+        if self.base is None:
+            return self.f[:, lo:hi]
+        return self.f[self.base[:, None]+np.arange(lo, hi)]
+
+
 def decode_frames_compact(parts,packed=False):
-    """decode_frame_compact of several ROW arrays at once (one set of index computations, one
-    fancy-index gather per array and list); returns one dict per array (views of shared arrays)."""
-    parts=[r for r in parts]
-    lens=np.array([len(r) for r in parts],np.int64)
+    """decode_frame_compact of several record arrays at once (one set of index computations, one
+    fancy-index gather per array and list); returns one dict per array (views of shared arrays).
+    A part is a ROW-like record array or (B45) a (compact records, frame arena) pair."""
+    fr=[_Frames(r) for r in parts]
+    lens=np.array([x.n for x in fr],np.int64)
     m=int(lens.sum())
-    fs=[r['visible_frame'].view('<f4') for r in parts]
-    counts=np.concatenate([check_frames(r) for r in parts]) if parts else np.zeros((0,4),np.int64)
+    counts=np.concatenate([x.counts for x in fr]) if fr else np.zeros((0,4),np.int64)
     p,e,n,s_=counts.T
     counts=np.stack((p,p,e,n,s_),1).astype(np.int64)
     row_at=np.concatenate(([0],np.cumsum(lens)))
     room=np.empty((m,1792),np.float32);minimap=np.empty((m,169),np.float32)
-    for i,f in enumerate(fs):
-        room[row_at[i]:row_at[i+1]]=f[:,HEADER:HEADER+1792];minimap[row_at[i]:row_at[i+1]]=f[:,HEADER+1792:FIXED]
+    for i,x in enumerate(fr):
+        room[row_at[i]:row_at[i+1]]=x.block(HEADER,HEADER+1792);minimap[row_at[i]:row_at[i+1]]=x.block(HEADER+1792,FIXED)
     if not packed:
         room=_unpack_room_host(room).reshape(-1,RC,16,28)
         minimap=((minimap.astype(np.int64)[...,None]>>np.arange(8))&1).astype(np.float32)
@@ -389,9 +421,9 @@ def decode_frames_compact(parts,packed=False):
         if K:
             rr=np.repeat(np.arange(m),c);j=np.arange(K)-np.repeat(cum[:-1],c)
             col=(offset[rr]+j*width)[:,None]+np.arange(width)
-            for i,f in enumerate(fs):
+            for i,x in enumerate(fr):
                 a,b=cum[row_at[i]],cum[row_at[i+1]]
-                if b>a:out[a:b]=f[rr[a:b,None]-row_at[i],col[a:b]]
+                if b>a:out[a:b]=x.take(rr[a:b]-row_at[i],col[a:b])
         if name=='local' and not packed:out=_unpack_room_host(out).reshape(K,RC*81)
         lists[name]=out;ent_at[name]=cum
         offset+=c*width

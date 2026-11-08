@@ -100,7 +100,9 @@ UPD_KEYS = ('learn_fwd_part_wall_s', 'learn_fwd_part_gpu_s', 'learn_bwd_wall_s',
             'learn_paged_calls', 'learn_packed_calls', 'learn_reader_calls', 'learn_reader_rows_real',
             'learn_reader_rows_padded', 'learn_spatial_calls', 'learn_spatial_tokens_real',
             'learn_spatial_tokens_padded', 'learn_writer_calls', 'learn_packed_host_s', 'learn_staged_mb',
-            'gpu_peak_allocated_gb')
+            'gpu_peak_allocated_gb',
+            # B45: host decode seconds of the learner's main rows / historical block sources
+            'learn_main_decode_s', 'learn_hist_decode_s')
 LEARNER_ACTIVE = [False]
 
 
@@ -509,6 +511,22 @@ class PagedStore:
             rows['visible_frame'][i, :len(frame)] = np.frombuffer(frame, np.uint8)
             pending[i] = pend
         return rows, pending
+
+    SOURCE = np.dtype([('first', 'u1'), ('visible_schema', '<i4'), ('visible_bytes', '<i4'), ('visible_off', '<i8')])
+
+    def source_arena(self, decisions):
+        """(B45) source_rows without building padded records: (records with first / visible_schema / visible_bytes /
+        visible_off, the frames joined into one byte array (each frame a multiple of 4 bytes), pending)."""
+        entries = [self.raw[int(d)] for d in decisions]
+        rows = np.zeros(len(entries), self.SOURCE)
+        sizes = np.fromiter((len(e[2]) for e in entries), np.int64, len(entries))
+        rows['first'] = np.fromiter((e[0] for e in entries), np.uint8, len(entries))
+        rows['visible_schema'] = np.fromiter((e[1] for e in entries), np.int32, len(entries))
+        rows['visible_bytes'] = sizes
+        rows['visible_off'] = np.concatenate(([0], np.cumsum(sizes)[:-1])) if len(sizes) else sizes
+        buf = np.frombuffer(b''.join(e[2] for e in entries), np.uint8)
+        pending = np.stack([e[3] for e in entries]).reshape(len(entries), self.nh) if entries else             np.zeros((0, self.nh), np.int64)
+        return rows, buf, pending
 
     # ---- leases
     def live_pairs(self):
@@ -1471,7 +1489,7 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
             d = DECODE_CACHE.get(key) if key is not None else None
             if d is None:
                 ucount('learn_main_decode_rows_fresh', len(c.rows))
-                d = decode_frame_host(c.rows, packed=packed)
+                d = decode_frame_host(c.framed(), packed=packed)
                 d['pending'] = np.asarray(c.pending, dtype=np.int64); d['first'] = np.asarray(c.rows['first'])
                 if key is not None:
                     DECODE_CACHE[key] = d
@@ -1485,7 +1503,8 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
         hosts.append(h[1])
     rows = chunks[0].rows if len(chunks) == 1 else None
     if DUMP_DIR and torch.is_grad_enabled() and B*length >= 512:
-        dump_inputs('learner', np.concatenate([np.asarray(c.rows) for c in chunks])[:SPATIAL_MICRO_TRAIN],
+        from .block_training import source_rows as _source_rows
+        dump_inputs('learner', _source_rows([c.framed() for c in chunks])[:SPATIAL_MICRO_TRAIN],
                     np.concatenate([np.asarray(c.pending, np.int64) for c in chunks])[:SPATIAL_MICRO_TRAIN])
     from .structured_input import host_counts
     merged = merge_host(hosts)

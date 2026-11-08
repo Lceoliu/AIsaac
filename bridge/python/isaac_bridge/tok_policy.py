@@ -2040,9 +2040,12 @@ def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, hea
     stage (2026-10-10, B18): a pinned uint8 tensor [>= len(index), ROW_BYTES]: the records are gathered into it and
     copied asynchronously (the caller must not reuse it before the copy is done: a later sync of the device).
     with_raw (B18): also return the records' bytes on the device and the actions under way: (batch, bytes, pending)."""
-    raw = torch.from_numpy(rows.reshape(-1).view(np.uint8).reshape(-1, ROW_BYTES))
+    # (B45: compact ROWC records share ROW's head layout; their own record size)
+    raw = torch.from_numpy(rows.reshape(-1).view(np.uint8).reshape(-1, rows.dtype.itemsize))
     if head:   # B42 (block memory): the record head only, never the visible frame's padding
         raw, stage = raw[:, :ROW_HEAD], None
+    elif rows.dtype.itemsize != ROW_BYTES:
+        raise ValueError('rows_to_device: compact records carry no frame (head=True only)')
     index_t = torch.from_numpy(np.ascontiguousarray(index, np.int64))
     if stage is not None:
         dev_raw = torch.index_select(raw, 0, index_t, out=stage[:len(index)]).to(device, non_blocking=True)

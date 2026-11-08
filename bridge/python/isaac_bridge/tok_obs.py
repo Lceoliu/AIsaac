@@ -162,6 +162,90 @@ ROW = np.dtype([
     ('visible_bytes', np.int32),
     ('visible_frame', np.uint8, (131072,)),
 ], align=True)
+# B45 (2026-11-09): compact records. ROW keeps a 128-KiB visible_frame budget (the workers' shared-memory slots and
+# rings); stored decisions use ROWC: every ROW field but visible_frame at the same offset, plus visible_off, the byte
+# offset of the record's frame (visible_bytes long) in a FrameArena. A rollout's ~11 KB frames then cost ~11 KB each,
+# not 128 KiB (B42: 151,880-byte records, ~5 GB per 32,768-decision rollout).
+ROW_FRAME_AT = ROW.fields['visible_frame'][1]
+ROWC = np.dtype([(name, ROW.fields[name][0]) for name in ROW.names if name != 'visible_frame'] +
+                [('visible_off', np.int64)], align=True)
+assert all(ROWC.fields[n][1] == ROW.fields[n][1] for n in ROW.names if n != 'visible_frame')
+assert ROWC.fields['visible_off'][1] >= ROW_FRAME_AT
+
+
+class FrameArena:
+    """Append-only byte store of visible frames (8-byte aligned starts); grows by reallocation. Records hold their
+    frame's offset (ROWC visible_off). Readers take .buf once the writer is done (a rollout's chunks: after it)."""
+    ALIGN = 8
+
+    def __init__(self, nbytes=1 << 20):
+        self.buf = np.zeros(max(int(nbytes), 1024), np.uint8)
+        self.used = 0
+
+    def reset(self):
+        self.used = 0
+
+    def append(self, rows):
+        """Frames of ROW records `rows` (their visible_bytes) appended; returns their offsets (int64)."""
+        sizes = np.asarray(rows['visible_bytes'], np.int64)
+        padded = (sizes+self.ALIGN-1)//self.ALIGN*self.ALIGN
+        offs = self.used+np.concatenate(([0], np.cumsum(padded)[:-1])).astype(np.int64)
+        need = self.used+int(padded.sum())
+        if need > len(self.buf):
+            grown = np.zeros(max(need, int(len(self.buf)*1.5)), np.uint8)
+            grown[:self.used] = self.buf[:self.used]
+            self.buf = grown
+        frames = rows['visible_frame']
+        for i in range(len(sizes)):
+            n = int(sizes[i])
+            if n:
+                self.buf[offs[i]:offs[i]+n] = frames[i, :n]
+        self.used = need
+        return offs
+
+
+    def append_from(self, buf, offs, sizes):
+        """Frames of another arena's records (their offsets / sizes in buf) appended; returns the new offsets."""
+        sizes = np.asarray(sizes, np.int64)
+        padded = (sizes+self.ALIGN-1)//self.ALIGN*self.ALIGN
+        new = self.used+np.concatenate(([0], np.cumsum(padded)[:-1])).astype(np.int64)
+        need = self.used+int(padded.sum())
+        if need > len(self.buf):
+            grown = np.zeros(max(need, int(len(self.buf)*1.5)), np.uint8)
+            grown[:self.used] = self.buf[:self.used]
+            self.buf = grown
+        for o, n, d in zip(np.asarray(offs, np.int64), sizes, new):
+            self.buf[d:d+n] = buf[o:o+n]
+        self.used = need
+        return new
+
+
+def compact_rows(rows, arena):
+    """ROW records -> ROWC records whose frames are appended to `arena` (a FrameArena)."""
+    rows = np.ascontiguousarray(rows)
+    out = np.zeros(len(rows), ROWC)
+    out.view(np.uint8).reshape(len(rows), ROWC.itemsize)[:, :ROW_FRAME_AT] =         rows.view(np.uint8).reshape(len(rows), ROW.itemsize)[:, :ROW_FRAME_AT]
+    out['visible_off'] = arena.append(rows)
+    return out
+
+
+def compact_copy(rows):
+    """(ROWC records, their own frame bytes) of ROW records: a self-contained compact copy (teacher records)."""
+    arena = FrameArena(int(np.asarray(rows['visible_bytes'], np.int64).sum())+64)
+    return compact_rows(rows, arena), arena.buf[:arena.used]
+
+
+def expand_rows(rows, frames):
+    """ROW records of ROWC records `rows` and their frame bytes `frames` (tok_stream, tools); ROW records pass."""
+    if 'visible_frame' in rows.dtype.names:
+        return rows
+    out = np.zeros(len(rows), ROW)
+    out.view(np.uint8).reshape(len(rows), ROW.itemsize)[:, :ROW_FRAME_AT] =         np.ascontiguousarray(rows).view(np.uint8).reshape(len(rows), ROWC.itemsize)[:, :ROW_FRAME_AT]
+    for i, (o, n) in enumerate(zip(rows['visible_off'], rows['visible_bytes'])):
+        out['visible_frame'][i, :n] = frames[o:o+n]
+    return out
+
+
 PHEART_F = 3          # 2026-10-16 (B35): ROW 'phearts'
 PRICE_F = 4           # 2026-10-16 (B35): price_columns() per entity
 N_ROOM_TYPE = 32      # 2026-10-16 (B35): room types the policy's room-type table has room for (AB+ 0 .. 23, Repentance+
@@ -283,8 +367,9 @@ def encode_row(o, st, row, t):
     """Write the lean observation `o` into row (a length-1 view of a ROW array). Sets everything but episode, seed,
     group and first. Returns the done code."""
     if getattr(o,'visible',None) is not None:
-        from .structured_input import observation_frame, write_frame
-        write_frame(row,observation_frame(o))
+        from .structured_input import write_frame
+        from .visible_native import frame   # B45: the C encoder (observation_frame's bytes) when available
+        write_frame(row,frame(o))
     else:
         row['visible_schema'] = 0
     p = o.players[0]

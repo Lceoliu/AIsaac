@@ -152,6 +152,22 @@ def source_rows(sources):
     return rows
 
 
+def frame_rows(rows, frames=None):
+    """rows as they are when they hold visible_frame; compact ROWC rows (B45) as source_dtype records (first,
+    visible_schema, visible_bytes, visible_frame) read from the frame bytes `frames`."""
+    if 'visible_frame' in rows.dtype.names:
+        return rows
+    if frames is None:
+        raise ValueError('compact records need their frame arena')
+    size = np.asarray(rows['visible_bytes'], np.int64)
+    out = np.zeros(len(rows), dtype=source_dtype(max(4, int(size.max()) if len(size) else 4), True))
+    for name in ('first', 'visible_schema', 'visible_bytes'):
+        out[name] = rows[name]
+    for i, (o, n) in enumerate(zip(np.asarray(rows['visible_off'], np.int64), size)):
+        out['visible_frame'][i, :n] = frames[o:o+n]
+    return out
+
+
 @dataclass(frozen=True)
 class RawBlock:
     end_step: int
@@ -488,10 +504,16 @@ class BlockActor:
 
 @dataclass(frozen=True)
 class Chunk:
-    """One episode, contiguous decisions, snapshot before its first observation."""
+    """One episode, contiguous decisions, snapshot before its first observation. rows: ROW records, or (B45) compact
+    ROWC records whose frames are in `frames` (a byte array: the rollout's FrameArena buffer)."""
     rows: np.ndarray
     pending: np.ndarray
     snapshot: Snapshot
+    frames: object = None
+
+    def framed(self):
+        """Records with their frames inline (ROW, or source_dtype records for compact rows)."""
+        return frame_rows(self.rows, self.frames)
 
     def __post_init__(self):
         if len(self.rows) != len(self.pending):
@@ -675,7 +697,9 @@ class BlockRollout:
                     continue
                 if end-begin > self.chunk_steps:
                     raise ValueError("missing chunk-start snapshot in rollout")
-                chunks.append(Chunk(rollout.rows[worker,begin:end],rollout.pending[worker,begin:end],starts[begin]))
+                arena=getattr(rollout,'frames',None)   # (B45: compact records' frames)
+                chunks.append(Chunk(rollout.rows[worker,begin:end],rollout.pending[worker,begin:end],starts[begin],
+                                    arena.buf if arena is not None else None))
                 positions.extend(range(worker*rollout.cap+begin,worker*rollout.cap+end))
                 weights.extend(mask[worker,begin:end])
                 table.append((offset,end-begin,worker,begin))
@@ -812,7 +836,7 @@ def forward_chunks(model, chunks, generator=None, train_history=True, version=0,
             prefixes.append(encoded_tails[id(snap.history.tail)])
         else:
             prefixes.append(snap.memory.partial.detach())
-    rows = source_rows([c.rows for c in chunks])
+    rows = source_rows([c.framed() for c in chunks])
     pending = np.concatenate([c.pending for c in chunks])
     batch = from_rows(rows, device, pending)
     ctx = dict(states=states, length=length, replacements=replacements,
