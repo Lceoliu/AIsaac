@@ -8968,3 +8968,99 @@ BF16下单个参数相对差最大的是Writer `self_attn.q`（梯度范数约1e
   - Flex探针和逐桶、逐行排查日志（含块表未初始化时的崩溃与错值）已移到`reports/b42-speed/failed/b44-flex-debug/`。
   - 崩溃过的bench变体修复后用同名重跑，日志被覆盖。
   - 4090已空闲（guard：0个train_tok、0个isaac进程，显存12 MiB）。
+
+### B45 速度改造第2步：C端紧凑帧与记录瘦身（2026-11-09）
+
+#### 实验目的
+
+prof-f4与xold同配置对比：worker侧编码16进程合计173.5 s/update，旧架构为11.5 s；每个决策5.3 ms，旧架构0.35 ms。新架构的ROW记录151,880 B，旧架构20,800 B，其中visible_frame固定预算128 KiB，实际中位只用约10.4 KB。一个rollout在shm、pinned和GPU之间要搬约5 GB，旧架构0.68 GB。本步把visible-v2帧改由C写出，并把记录瘦身到按实际帧长存储；学习侧解码批量化。不训练，不做四臂，不改输入、模型和教师预算，micro仍为8192。验收门：
+- w_encode < 1 ms/决策（16进程合计 < 33 s/update）；
+- 平均记录 ≤ 40 KB，rollout搬运 ≤ 1.3 GB；
+- learner主批解码 < 2 s；
+- 全部测试绿；
+- 完整短profile的×实时不低于B44c的94，collect不升。
+
+#### 实验方法
+
+- 先测清编码时间花在哪：
+  - 写了`abplus_probe_visible_frame.py`，用真实游戏克隆按房间、boss房和跨2–3层的items run播放，逐条保存lean payload流，便于离线复放。
+  - 对录下的3,539个决策profile：decode 0.04 ms，legacy `encode_row` 0.25 ms，`observation_frame` 9.6 ms。后者97%在最近格查找，每帧约113次Python `min()`，每次扫约450个房间格。
+  - 结论：只有visible帧值得进C；legacy字段的Python编码只有0.25 ms，不重启旧的fast row C路径，避免引入新风险。
+- C帧编码`bridge/engine/abp_visible.c`（`abp_visible_encode`，schema 2026110702）：
+  - 输入是LeanDecoder已解好的记录数组（players、doors、entities、map，以及地形的cells/grid）。visible扩展里的JSON小字段（bodies、inventory、slots）由Python转成小数组传入。
+  - 计算按NumPy 2的语义逐运算复刻：NEP 50下float32与Python float的运算保持float32，float64记录仍走float64。门格最近查找用float32，玩家和grid用float64，取第一个最小值。实体按(priority, distance, index)稳定排序后取前128。canvas做无损打包，范围或整数性校验失败时返回错误码，由Python参照实现抛出同样的异常。
+  - 该库不进游戏的preload，不重编译`libabp_turbo.so`，也不碰游戏、Steam目录。由`isaac_bridge/visible_native.py`在首次使用时用gcc（`-O2 -ffp-contract=off`）编译到`~/.cache/isaac-visible/`，按源码hash命名、原子替换。train_tok开局先编译一次，worker直接加载。
+  - `encode_row`改调`visible_native.frame(o)`；Python的`observation_frame`/`pack_frame`保留，作为参照和工具。无gcc或`ISAAC_VISIBLE_NATIVE=0`时回退到参照实现。
+- 记录瘦身：
+  - 新增`ROWC`：ROW除visible_frame外的全部字段，偏移不变，另加`visible_off`。帧写入`FrameArena`字节区，8字节对齐，按实际长度存储。
+  - block模式的Rollout存ROWC和arena，store时只复制记录头和实际帧字节。
+  - 教师和v2 chunk改为紧凑记录加自带帧字节（原先每条是一份148 KiB的ROW拷贝，最多6万+3万条）。carry会复制帧。
+  - worker的shm槽和各环仍是满ROW（每worker 2槽），不影响搬运量。
+  - B38的learner子进程共享内存路径仍用ROW。
+- 解码：
+  - `decode_frames_compact`可以直接按arena偏移读帧，一个part新出现的chunk一次联合gather。
+  - 历史块和开放尾巴的源帧用`PagedStore.source_arena`（一次`b''.join`）拼成字节区后同路径解码，不再逐行组装补齐记录。
+  - 旧的逐长度路径、对象路径、learner_dump和tok_stream通过`Chunk.framed()`、`expand_rows`读紧凑记录。
+- 单测：
+  - `tests/test_visible_native.py`：
+    - 合成边界：
+      - 260个实体、每类溢出、距离并列；
+      - 空房间：无实体、门、grid、地图、背包、slots；
+      - 两个body，带未知和失明诅咒；
+      - 满尺寸28×16房间；
+      - 单格房间；
+    - 300个随机观测；
+    - 越界值抛出与参照相同的异常；
+    - 录制的真实payload流逐字节比对。
+  - `tests/test_compact_records.py`：
+    - 紧凑记录与ROW逐字节往返；
+    - arena解码与内联解码相等；
+    - learner在紧凑chunk与内联chunk上输出完全相等（atol 0）。
+
+#### 实验结果
+
+C帧逐字节等价（硬门）：
+
+| 来源 | 决策数 | 相等 | Python参照 ms/决策 | C路径 ms/决策（含decode） |
+|---|---:|---:|---:|---:|
+| 录制流（6个room种子、4个run种子） | 3,539 | 3,539 | 3.3–15.4 | — |
+| 在线：40个room种子（含价格） | 4,151 | 4,151 | 3.52 | 0.21 |
+| 在线：10个boss房种子 | 2,779 | 2,779 | 3.36 | 0.18 |
+| 在线：10个items run种子，跨3层 | 10,085 | 10,085 | 5.19 | 0.21 |
+| 合成边界和随机观测（`test_visible_native.py`） | 305 | 305 | — | — |
+
+- 在线录到的实体最多40个；满实体（260个、每类溢出）的边界由合成用例覆盖。
+- 训练路径：两种编码的帧字节相同，模型输入因此完全一致。另有单测验证：同一组chunk以紧凑记录和内联记录喂给learner，输出完全相等（atol 0）。
+
+完整短profile（prof-f4口径：16 workers、rollout 32768、micro 8192、cf 6/180、teacher share 0.1；各16个update；窗口u2–u14）：
+
+| | prof-f4 | B44c | **B45最终（prof-b45b）** | B45中间（prof-b45） |
+|---|---:|---:|---:|---:|
+| ×实时 | 47.6 | 93.5 | **97.5** | 99.6 |
+| 游戏小时（窗口内） | 15.78 | 15.78 | 15.78 | 15.78 |
+| collect_s中位 | 48.0 | 46.3 | 46.9 | 44.0 |
+| update_s中位（最大） | 94.9 | 22.2（24.5） | 24.0（25.1） | 22.1（23.6） |
+| w_encode s/update（16进程合计） | 173.5 | 197.3 | **27.8** | 27.6 |
+| 每决策w_encode | 5.3 ms | 6.0 ms | **0.85 ms** | 0.84 ms |
+| w_step / w_wait s | 59.6 / 1175 | 65.3 / 467 | 50.3 / 687 | 50.7 / 633 |
+| p_act s（actor忙时） | 45.4 | 43.8 | 45.8 | 42.3 |
+| 平均记录（头+帧） | 151,880 B | 151,880 B | **31,352 B** | 31,221 B |
+| rollout记录总量 | ~4.98 GB | ~4.98 GB | **981 MB** | 976 MB |
+| learner主批解码 s | 12.5（B42口径） | — | **1.13** | 1.09 |
+| learner历史块解码 s | — | — | 0.92 | 1.04 |
+| 显存保留中位 | 20.1 GB | 20.2 GB | 19.3 GB | 20.3 GB |
+
+- 验收门：
+  - w_encode 27.8 s < 33 s，0.85 ms/决策 < 1 ms；
+  - 平均记录31.4 KB ≤ 40 KB，rollout 981 MB ≤ 1.3 GB；
+  - 主批解码1.13 s < 2 s；
+  - 测试4090 186 passed / 0 failed，本地134 passed；
+  - ×实时97.5 ≥ 94；
+  - collect 46.9 s对B44c的46.3 s持平（中间版本44.0 s），未上升。
+  - 全部**过门**。
+- collect几乎没降，因为collect现在由actor决定：p_act（42–46 s）≈ collect（44–47 s），worker大部分时间在等actor（w_wait 630–690 s/16进程）。w_encode省下的约170 s是worker进程的CPU时间，不在collect的关键路径上；这留给第3步（lane进编译路径、Writer和写页进graph）。
+- 每决策0.85 ms是16个worker与16个游戏进程在16核上争用下的在线值（含legacy `encode_row`约0.25 ms），离线C路径约0.2 ms。
+- update两次运行为22.1和24.0 s中位，波动约2 s，与第1步记录的上升趋势一致；本步没有处理（第3、4步）。
+- 中间版本prof-b45与最终版只差历史块和尾巴的源解码（`source_arena`）和一处测试修正。中间版本的GPU门有1个失败（B38 learner子进程的共享内存测试需要用ROW rollout），已修正。
+- 代码：8669625。
+- 失败或中间运行：无失败运行。prof-b45是完整的中间版本，保留作对照。录制的payload在`reports/b42-speed/b45-payloads*`，作为等价性语料。4090已空闲（guard：0个train_tok、0个isaac进程，显存12 MiB）。
