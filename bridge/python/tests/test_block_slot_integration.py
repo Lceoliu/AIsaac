@@ -519,3 +519,34 @@ def test_packed_learner_spatial_matches_padded(device):
     assert ga.keys() == gb.keys()
     for k in ga:
         torch.testing.assert_close(gb[k], ga[k], rtol=1e-4, atol=1e-5, msg=k)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='actor step graph (CUDA)')
+def test_step_graph_capture_refused_falls_back_to_eager(monkeypatch):
+    """B42 fix 1: a step whose graph cannot be captured (admission refused) runs the eager slot
+    path with the same outputs; once admitted, the graph (captured without gc/empty_cache)
+    replays identically."""
+    from isaac_bridge import block_paged, block_training
+    if not block_paged.STEP_GRAPH:
+        pytest.skip('ISAAC_BLOCK_STEP_GRAPH=0')
+    torch.manual_seed(5)
+    m = make_policy('cuda').eval()
+    g = SlotBlockActor(m, 3, graph_entities=128)
+    e = SlotBlockActor(m, 3, graph_entities=128)
+    e.step_graph = None
+    rng = np.random.default_rng(5)
+    refuse = [True]
+    real = block_training.capture_admission
+    monkeypatch.setattr(block_training, 'capture_admission', lambda key: False if refuse[0] else real(key))
+    for t in range(9):
+        refuse[0] = t < 4
+        rows = frame(rng, 3, t, np.arange(3)+1, int(t == 0))
+        pending = synth_pending(rng, 3, m.heads)
+        keys = (np.full(3, t), np.arange(3))
+        a = g.step(rows, pending, range(3), ukeys=keys)
+        b = e.step(rows, pending, range(3), ukeys=keys)
+        torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
+        for x, y in zip(a[1:], b[1:]):
+            torch.testing.assert_close(x.float(), y.float(), rtol=1e-5, atol=1e-5)
+        assert g.step_graph.captures == (0 if t < 4 else 1)
+    assert g.step_graph.busy_misses >= 4 and g.step_graph.replays == 5

@@ -94,7 +94,8 @@ UPD_KEYS = ('learn_fwd_part_wall_s', 'learn_fwd_part_gpu_s', 'learn_bwd_wall_s',
             'actor_eager_calls', 'actor_eager_merged_calls', 'actor_eager_s', 'actor_eager_overlap_s',
             'learn_main_decode_calls', 'learn_main_decode_rows_fresh', 'learn_main_decode_rows_cached',
             'learn_hist_decode_rows_fresh', 'learn_hist_decode_rows_cached', 'learn_tail_decode_rows',
-            'learn_nvcsw', 'learn_nivcsw', 'learn_cpu_s', 'gc_collect_s', 'gc_collect_calls', 'update_t0', 'update_t1')
+            'learn_nvcsw', 'learn_nivcsw', 'learn_cpu_s', 'gc_collect_s', 'gc_collect_calls', 'update_t0', 'update_t1',
+            'gpu_reserved_now_gb')
 LEARNER_ACTIVE = [False]
 
 
@@ -573,7 +574,8 @@ class ActorStepGraph:
             # (cache_enabled=False instead changed dynamo's global state: recompiles.)
             torch.clear_autocast_cache()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=self.capture):
+            from .block_training import graph_capture
+            with graph_capture(graph, self.capture):   # B42: no full gc.collect / empty_cache per capture
                 out, current, z = self._body(st, greedy)
             back = (torch.empty(out.shape, dtype=out.dtype).pin_memory(),
                     torch.empty(current.shape, dtype=current.dtype).pin_memory(),

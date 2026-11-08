@@ -2395,6 +2395,10 @@ def main(argv=None, child=None, actor=None):
             n_w=block_compile.warm_spatial(learner_model,(model,),bf16=amp or args.actor_bf16)
             block_compile.mark_steady()
             print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s',flush=True)
+        # B42: everything alive now (models, compiled code, buffers) leaves the collector's
+        # generations; later collections scan only what the run allocates afterwards.
+        import gc as gc_
+        gc_.collect(); gc_.freeze()
     if os.name != 'nt':   # B42: SIGUSR1 dumps every thread's Python stack to stderr (hang diagnosis)
         import faulthandler, signal as signal_
         faulthandler.register(signal_.SIGUSR1, all_threads=True)
@@ -4142,6 +4146,7 @@ def main(argv=None, child=None, actor=None):
             bpt.ucount('learn_nvcsw', ru1.ru_nvcsw-ru0.ru_nvcsw); bpt.ucount('learn_nivcsw', ru1.ru_nivcsw-ru0.ru_nivcsw)
             bpt.ucount('learn_cpu_s', (ru1.ru_utime+ru1.ru_stime)-(ru0.ru_utime+ru0.ru_stime))
             bpt.ucount('update_t1', time.time())
+            bpt.ucount('gpu_reserved_now_gb', torch.cuda.memory_reserved() / 2 ** 30 if torch.cuda.is_available() else 0.0)
             row.update(bpt.update_report())
             good=teach_steps>0 and v2_steps>0 and all(np.isfinite(float(row[k])) and float(row[k])>0
                   for k in ('teach_loss','danger_loss','v2_loss_pi'))

@@ -59,6 +59,23 @@ def capture_yield():
         ucount('learn_yield_wait_s',time.perf_counter()-t);ucount('learn_yields_given',1)
 
 
+@contextmanager
+def graph_capture(graph,stream):
+    """torch.cuda.graph(graph, stream=stream) without its gc.collect() and empty_cache().
+
+    B42 prof-f3: the full collection over this process's Python objects (page store, logs,
+    rollouts) took ~5.7 s per capture while the learner, which had yielded the capture
+    admission, waited. The admission protocol is unchanged: no other CUDA work is submitted
+    while this capture runs. The caching allocator keeps its blocks (no empty_cache)."""
+    torch.cuda.synchronize()
+    with torch.cuda.stream(stream):
+        graph.capture_begin(capture_error_mode='global')
+        try:
+            yield graph
+        finally:
+            graph.capture_end()
+
+
 def capture_admission(key):
     """Actor thread: admission to capture a new graph key (bounded wait, spaced retries)."""
     if CUDA_CAPTURE_ADMISSION.acquire(blocking=False):
@@ -275,12 +292,13 @@ class SpatialEncoderGraph:
                     torch.cuda.synchronize(self.device)
                     torch.clear_autocast_cache()
                     graph=torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph,stream=self.capture):
+                    t_cap=time.perf_counter()
+                    with graph_capture(graph,self.capture):
                         z=self.model.encode_block(static,packed=False)
                 self.graphs[key]=(static,graph,z)
                 self.captures+=1
                 from .block_paged import ucount
-                ucount('actor_captures_other',1)
+                ucount('actor_captures_other',1);ucount('actor_capture_other_s',time.perf_counter()-t_cap)
             finally:
                 CUDA_CAPTURE_ADMISSION.release()
         static,graph,z=self.graphs[key]
@@ -330,13 +348,14 @@ class ReaderStepGraph:
                     for _ in range(3):self.memory.read(sz,sp,spr,sb,se,sk)
                     torch.cuda.synchronize(z.device)
                     graph=torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(graph,stream=self.capture):
+                    t_cap=time.perf_counter()
+                    with graph_capture(graph,self.capture):
                         result=self.memory.read(sz,sp,spr,sb,se,sk)
                 if len(self.graphs)>=32:self.graphs.pop(next(iter(self.graphs)))
                 self.graphs[key]=(sz,sp,spr,sb,se,sk,graph,result)
                 self.captures+=1
                 from .block_paged import ucount
-                ucount('actor_captures_other',1)
+                ucount('actor_captures_other',1);ucount('actor_capture_other_s',time.perf_counter()-t_cap)
             finally:
                 CUDA_CAPTURE_ADMISSION.release()
         sz,sp,spr,sb,se,sk,graph,result=self.graphs[key]
