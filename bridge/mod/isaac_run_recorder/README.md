@@ -1,6 +1,6 @@
 # Isaac Run Recorder（忏悔 J746 整局被动录制）
 
-更新：2026-11-08（recorder 0.3.2：phase8-mouse 回放还原鼠标流，见第 8 节"鼠标还原"与第 9 节；格式不变 `isaac-run-v1`）。需求与决定见 `experiments/run-recorder/DESIGN_BRIEF.md` §6（D1–D12）与 §7（E1–E8），第一阶段实测见 `experiments/run-recorder/INVESTIGATION.md`，DLL 的依据见 `experiments/run-recorder/mt-probe/MT_PROBE.md`，验收结果见 `experiments/run-recorder/phase2/ACCEPTANCE.md`、`experiments/run-recorder/phase3/ACCEPTANCE.md`。
+更新：2026-11-08（recorder 0.3.2：phase8-mouse 回放还原鼠标流，见第 8 节"鼠标还原"与第 9 节；格式不变 `isaac-run-v1`。phase9-robust：长暂停/小退/大退的实测与截断局的读取、比较、`session.json.game_exit`，见第 3、4、8.5 节；mod 未改）。需求与决定见 `experiments/run-recorder/DESIGN_BRIEF.md` §6（D1–D12）与 §7（E1–E8），第一阶段实测见 `experiments/run-recorder/INVESTIGATION.md`，DLL 的依据见 `experiments/run-recorder/mt-probe/MT_PROBE.md`，验收结果见 `experiments/run-recorder/phase2/ACCEPTANCE.md`、`experiments/run-recorder/phase3/ACCEPTANCE.md`。
 
 ## 1. 它做什么、不做什么
 
@@ -47,13 +47,14 @@
 | `options` | `before`（会话前全部键值）、`forced`（`EnableDebugConsole=0`）、`forced_before`、`restored`（会话后还原的键） |
 | `save_pre`、`save_post`、`init_save_from` | 存档快照清单 |
 | `launches` | 每次启动尝试：tag、pid、`use_dll`、`boot_s`（mod 加载用时）、`result`（ok/failed）、失败原因（注入器失败、进程退出码、log 洪水、mod 未加载）、版本行、`mod_mt`（mod 加载时的 MT 状态：available/reason/DLL 信息）、`dll_status`（DLL 日志里最后的状态行）、`dll_log` |
-| `runs[]` | 每局：`file`、`lua_name`、`raw_bytes`/`zst_bytes`、`raw_sha256`/`zst_sha256`、`verified`、`validation`（帧数、首末 gf、header 摘要、end 摘要、事件计数、`truncated`、`errors`、`game_hours`）、`save_snapshot`（该局开局快照路径与信号）、`console_used`、`end_signal` |
+| `runs[]` | 每局：`file`、`lua_name`、`raw_bytes`/`zst_bytes`、`raw_sha256`/`zst_sha256`、`verified`、`validation`（帧数、首末 gf、header 摘要、end 摘要、事件计数、`truncated`、`bad_json`/`last_line_partial`（末尾不完整行，见第 4 节）、`errors`、`game_hours`）、`save_snapshot`（该局开局快照路径与信号）、`console_used`、`end_signal`；截断局另有 `note`（含游戏进程退出码） |
+| `game_exit` | （phase9-robust 起）最后一个游戏进程怎么结束的：`exit_code`/`exit_hex`、`abnormal`（退出码非 0：被任务管理器/`TerminateProcess` 结束是 `0x00000001`，崩溃是 `0xC0000005`/`0xC0000409` 等）、`wm_close_sent`、`forced_by_recorder`（录制端发 WM_CLOSE 8 s 没退出后自己结束的）、`seconds`；同样写进对应启动记录的 `exit`，`summary` 有 `game_exit_hex`/`game_exit_abnormal`。以前只在 `game/<tag>.exit.json` 里 |
 | `console` | 会话期间 `cmd_history.txt` 的新增行（D8；有新增则本会话所有局 `console_used=true`） |
 | `summary` | 与 summary.txt 相同的统计 |
 
 ## 4. run 文件（`isaac-run-v1`）
 
-JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文件以二进制模式写（LF 换行），`setvbuf("full", 256 KB)`，进房、暂停、每 300 帧 flush 一次，所以进程崩溃时最多丢最后约 10 秒且文件没有 `end` 行（归档时标 `truncated`）。
+JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文件以二进制模式写（LF 换行），`setvbuf("full", 256 KB)`，进房、暂停、每 300 帧 flush 一次，所以进程崩溃时最多丢最后约 10 秒且文件没有 `end` 行（归档时标 `truncated`）。两次 flush 之间写满 256 KB 时 C 库会自己写出，可能停在一行中间（phase9-robust c2-kill：Boss 战中被强杀，最后一行是半个帧行）：归档校验记 `bad_json=1, last_line_partial=true`（不算错误）；`load_run.read_lines` 丢掉"没有换行结尾且解析不了"的最后一行，记在 `Run.partial_tail`（以前这行被当成一帧，`Run.frames` 多 1、重建/回放/查看器在这一帧上 JSON 解析失败）。
 
 **通用规则**
 
@@ -206,7 +207,7 @@ python rl/bridge/python/replay_run.py RUN.jsonl.zst --name rep1 --report rep1.js
 python rl/bridge/python/replay_run.py RUN.jsonl.zst --continue-save SNAPSHOT_DIR   # 续局回放（快照含 gamestate1.dat）
 python rl/bridge/python/replay_run.py RUN_A --compare RUN_B          # 只比较两个文件
 ```
-新进程（默认带 DLL，存档在副本 `profile/`；`--no-dll` 不带）→ 进菜单 → harness 执行 `seed <录制种子>`（续局：把快照拷进存档目录，菜单 Enter 续上的第一局就是回放局）→ mod 在录制 `header.mt.reseeds` 的同一时机用**录制的 salt** reseed 全局 MT（录制里没有的时机不 reseed）、在 `MC_INPUT_ACTION` 按 (帧, tick) 注入录制的 12 个动作（全局查询不注入；唯一例外是真人菜单暂停帧的开菜单，见 8.2）、在 `MC_PRE_ENTITY_SPAWN` 按「(gf, type.variant.subtype, 帧内第几次)」钉回生成种子、在同帧重放 harness 脚本命令 → 回放局完整录下 → 逐帧**按数值**比对 MT `[cursor, hash]` 与 `dg` 三层，输出每层首个分歧帧、分歧帧数、首个分歧帧上解码后哪些字段不同、两边 `header.mt.reseeds` 是否逐项相同（`mt.reseeds_match`：时机、seeded_with、reseed 前后的 MT），以及回放局记录的有效输入是否与录制一致（`first_tick_mismatch`）。`exact = true` 表示三层 + MT 全部 0 分歧、MT 每帧都有、同长度、结束方式相容（`end_compatible`：相同；或录制由退出/重开结束、回放在同一帧数被帧上限截止）、reseed 记录一致。
+新进程（默认带 DLL，存档在副本 `profile/`；`--no-dll` 不带）→ 进菜单 → harness 执行 `seed <录制种子>`（续局：把快照拷进存档目录，菜单 Enter 续上的第一局就是回放局）→ mod 在录制 `header.mt.reseeds` 的同一时机用**录制的 salt** reseed 全局 MT（录制里没有的时机不 reseed）、在 `MC_INPUT_ACTION` 按 (帧, tick) 注入录制的 12 个动作（全局查询不注入；唯一例外是真人菜单暂停帧的开菜单，见 8.2）、在 `MC_PRE_ENTITY_SPAWN` 按「(gf, type.variant.subtype, 帧内第几次)」钉回生成种子、在同帧重放 harness 脚本命令 → 回放局完整录下 → 逐帧**按数值**比对 MT `[cursor, hash]` 与 `dg` 三层，输出每层首个分歧帧、分歧帧数、首个分歧帧上解码后哪些字段不同、两边 `header.mt.reseeds` 是否逐项相同（`mt.reseeds_match`：时机、seeded_with、reseed 前后的 MT），以及回放局记录的有效输入是否与录制一致（`first_tick_mismatch`）。`exact = true` 表示三层 + MT 全部 0 分歧、MT 每帧都有、同长度、结束方式相容（`end_compatible`：相同；或录制由退出/重开结束、或录制截断（没有 `end` 行，进程被杀/崩溃；`record_truncated`、`record_partial_tail`，phase9-robust 起）、回放在同一帧数被帧上限截止）、reseed 记录一致。
 
 **续局回放的出生位置**（phase7-continue，recorder 0.3.1）：续局时引擎在进开局房之后、`MC_POST_GAME_STARTED` 之前用全局 MT 抽 1 次随机数给玩家选出生位置（实测四个门口 (320,160)/(80,280)/(560,280)/(320,400) 之一），0.3.0 及以前的续局录制只在 `POST_GAME_STARTED` reseed，这次抽取来不及控制。所以 `replay_run.py` 对 `header.continued` 的录制在回放表里写 `start_players = {[num] = {x100=…, y100=…}}`（录制第 1 帧各玩家位置的定点原值，`continue_start_players()`），`replay.lua` 的 `R.apply_start_pos()` 在续局的 `MC_POST_GAME_STARTED`（reseed 与开局行之后、第一次更新之前）把玩家放到该位置、速度清零，计入 `end.replay.start_pos_pinned`（钉了几个玩家）/ `start_pos_moved`（其中原位置不同的个数）。非续局的回放表没有这个字段，行为不变。0.3.1 起的续局录制另在读档后第一个 `MC_POST_PLAYER_INIT` reseed（第 10 节），出生位置本身就由 salt 决定，钉回只是不改变位置的保险。
 
@@ -272,6 +273,13 @@ python rl/bridge/python/replay_run.py RUN.jsonl.zst --capture OUT.mp4 --copy exp
 - **做法**：`RR_MT_CAPTURE=1` 时，DLL 在每次 `SwapBuffers` 前用 PBO 环把默认帧缓冲的后台缓冲异步读回（BGRA）。Lua 在每个 `MC_POST_UPDATE` 调 `RRW_Mark(n)`，DLL 把"最近一次读回"作为第 n-1 帧写进 ffmpeg 的 stdin。ffmpeg 由 DLL 自己 `CreateProcess` 启动（`-f rawvideo -pix_fmt bgra -framerate 30 -vf vflip`），默认 `h264_nvenc`（可用时），否则 `libx264`。最后一帧（第 N 帧）在下一次逻辑更新时写出；若之后不再有逻辑更新（human1 以死亡后的结算画面结束，回放局关掉后游戏不再更新），就在它的第 2 次呈现时写出（正常每个逻辑帧 2 次渲染）并关 ffmpeg。两次 Mark 之间没有新渲染时计一次 `dups`。ffmpeg 来自 PATH，没有就用 `imageio-ffmpeg`。
 - **为什么是 clock 不是 gate**：gate 不提交绘制，后台缓冲里没有画面。导出时虚拟时钟不限速、每次渲染都提交绘制，只把真正的 SwapBuffers 节流到每 250 ms 一次（窗口里能看到进度），`capture_mode = "clock"`。
 - 实测（human1）与校验方法见 `experiments/run-recorder/phase6-watch/REPORT.md`。
+
+### 8.5 长暂停、小退、大退（phase9-robust）
+
+机器人在 game-rec-03 上的实测（`experiments/run-recorder/phase9-robust/NOTES.md`，31 次回放全部 `exact`）：
+- **长时间 Esc 暂停**（暂停 5–150 s、7,794/8,986 个渲染，期间在暂停菜单上下翻、进选项把 SFX 加一格再减回，一局暂停两次）：录制是同一帧里 `pause`→`unpause`，开菜单 tick 有 `TRIGGERED MENUBACK`，`menu_pauses` 全部认出；回放按 8.2 注入。暂停段在回放里：原速 34 个渲染 / 约 565 ms，`--turbo gate` 44–74 个渲染 / 15–24 ms（Python 10 ms 轮询 `pausectl.txt` 后发 Esc，加速下这段时延折成更多渲染，相对对齐吸收），每次暂停只发 1 次 Esc、没有重发。选项菜单在离开时写 `options.ini`（会话结束照常还原强制键）。
+- **小退**（Esc → EXIT GAME → 主菜单 → Enter）：暂停菜单默认光标在 RESUME GAME，下一项 EXIT GAME；回到菜单后第一下 Enter 就续局。录制里是同一进程的两局：第一局 `end.reason = exit_save`，最后是本局帧号 +1 上的 `ev pause`（没有 `unpause`）紧接 `ev exit [true]`（关窗口退出只有 `exit [true]`、没有前面那个 `pause`，以此区分）；第二局 `continued = true`，header `gf` = 第一局最后的 gf，帧计数接着走。引擎在退出时写 `gamestate1.dat`，续局时**不**重写，所以 Python 给第二局拍的 `save/run-…` 里的 `gamestate1.dat` 与退出时的存档逐字节相同，用它 `--continue-save` 回放 exact。续上后**当前房间重置**：敌人按房间初始布局满血重生（例：小退时 3 只残血、续上 9 只满血），玩家放在一个门口位置（续局出生位置，0.3.1 起由 salt 决定、回放再钉回），心、钱、炸弹、道具保留；已清的房间（宝箱房）续上仍是已清。
+- **大退**（`TerminateProcess`，不给游戏保存机会）：录制会话的 Python（真人入口 CLI）在约 2.4 s 内发现进程退出并照常归档：被杀的局没有 `end` 行（`truncated`），丢掉最后一次 flush 之后的帧（实测 34、49 帧），可能留下半行（见第 4 节），`session.json` 的 `game_exit` 记 `0x00000001 abnormal`。被截断的局用它自己的开局快照回放到最后一帧 exact。引擎只在**开局、换层、退出**时写 `gamestate1.dat`（进房间、进 Boss 房都不写；死亡时删除），所以大退后 Continue **回到本层开始时的状态**（第 1 层 = 开局：同种子同布局、gf 从 1 重新数、道具台/敌人全部还原，玩家在开局房的一个门口），被杀前这一层的进度全部丢失。新会话的 `save/pre` 就是这份存档 = 续局基线，`--continue-save <新会话>/save/pre` 回放 exact。
 
 ## 9. 已知局限
 

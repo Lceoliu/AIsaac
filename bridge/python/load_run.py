@@ -51,8 +51,10 @@ def repair_line(ln):
         return fixed, True
 
 
-def read_lines(path, repaired=None):
-    """repaired：可选列表，收集被 repair_line 修过的行号。"""
+def read_lines(path, repaired=None, partial=None):
+    """repaired：可选列表，收集被 repair_line 修过的行号。
+    partial：可选列表；文件最后一行没有换行且解析不了（进程被强杀/崩溃时 mod 的 256 KB 写缓冲恰好在行中间写出，
+    phase9-robust c2-kill 实测）时丢掉这一行，并把 dict(line=行号, bytes=字节数, kind=行种类或 None) 放进来。"""
     path = Path(path)
     data = path.read_bytes()
     if path.suffix == '.zst':
@@ -61,6 +63,16 @@ def read_lines(path, repaired=None):
     lines = data.split(b'\n')
     if lines and lines[-1] == b'':
         lines.pop()
+    elif lines and len(lines) > 1:
+        # 没有换行结尾 = 最后一行可能被截断：解析得了（含 0x 修复）就保留，否则丢掉
+        tail = lines[-1].rstrip(b'\r')
+        try:
+            json.loads(repair_line(tail)[0])
+        except ValueError:
+            m = _K_RE.match(tail)
+            if partial is not None:
+                partial.append(dict(line=len(lines) - 1, bytes=len(lines[-1]), kind=m.group(1).decode() if m else None))
+            lines.pop()
     if lines and lines[0].endswith(b'\r'):  # 文本模式写出的 CRLF（mod 早期测试文件）
         lines = [ln[:-1] if ln.endswith(b'\r') else ln for ln in lines]
     for i, ln in enumerate(lines):
@@ -238,7 +250,8 @@ class Run:
     def __init__(self, path):
         self.path = Path(path)
         self.repaired_lines = []   # 读取时修过 "0x" 数字损坏的行号（见 repair_line）
-        self.lines = read_lines(path, self.repaired_lines)
+        self.partial_tail = []     # 截断局（进程被杀/崩溃）末尾被丢掉的不完整行（见 read_lines）；正常文件为空
+        self.lines = read_lines(path, self.repaired_lines, self.partial_tail)
         if not self.lines:
             raise ValueError('空文件')
         self.header = json.loads(self.lines[0])

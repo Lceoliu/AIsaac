@@ -343,3 +343,76 @@ def test_sparse_bare_int_tolerated():
     prev = {5: [5] + [1] * 25, 9: [9] + [2] * 25}
     rows, cur = load_run.expand_sparse([[5, [[3, 4]]], 9], prev, [5, 9])
     assert rows[0][3] == 5 and rows[1] == prev[9]
+
+
+# ---------------------------------------------------------------- phase9-robust（强杀/崩溃截断的局）
+def _mt_lines():
+    """_v2_lines 加 MT：header.mt 可用、每帧 mt（compare 判 exact 需要）。"""
+    lines = _v2_lines()
+    hdr = json.loads(lines[0])
+    hdr['mt'] = {'available': True, 'reseeds': [{'at': 'POST_PLAYER_INIT', 'seeded_with': 5, 'after': [624, 1]},
+                                                {'at': 'POST_GAME_STARTED', 'seeded_with': 5, 'before': [30, 2], 'after': [624, 1]}]}
+    hdr['meta'] = {'seeds': {'start_seed_string': 'ABCD EFGH'}}
+    lines[0] = json.dumps(hdr, separators=(',', ':'))
+    for i in (2, 3, 4):
+        f = json.loads(lines[i])
+        f['mt'] = [100 + i, 7 * i]
+        lines[i] = json.dumps(f, separators=(',', ':'), ensure_ascii=False)
+    return lines
+
+
+def test_partial_tail_dropped(tmp_path):
+    """进程被强杀时 mod 的 256 KB 写缓冲可能停在行中间（c2-kill 实测）：最后一行没有换行且解析不了 -> 读取时丢掉并记在
+    Run.partial_tail；帧数 = 完整帧行数，顺序重建不出错；会话校验报 last_line_partial、不报错误。"""
+    lines = _mt_lines()
+    p = tmp_path / 'run-cut.jsonl'
+    cut = lines[4][:len(lines[4]) // 2]
+    p.write_bytes(('\n'.join(lines[:4]) + '\n' + cut).encode('utf-8'))
+    run = load_run.Run(p)
+    assert run.frames == 2 and run.end is None
+    assert run.partial_tail == [{'line': 4, 'bytes': len(cut.encode('utf-8')), 'kind': 'f'}]
+    assert [fs.n for fs in run.iter_frames()] == [1, 2]
+    st = rr.validate_lines(rr.iter_lines_raw(p))
+    assert st['frames'] == 2 and st['truncated'] and st['last_line_partial'] and st['bad_json'] == 1 and not st['errors']
+    # 最后一行完整但缺换行（恰好在行尾截断）：保留
+    q = tmp_path / 'run-nonl.jsonl'
+    q.write_bytes('\n'.join(lines).encode('utf-8'))
+    r2 = load_run.Run(q)
+    assert r2.frames == 3 and r2.partial_tail == []
+    # 正常文件不受影响
+    n = tmp_path / 'run-ok.jsonl'
+    n.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    assert load_run.Run(n).frames == 3 and load_run.Run(n).partial_tail == []
+
+
+def test_compare_truncated_record(tmp_path):
+    """录制截断（没有 end 行）+ 回放在同一帧数被帧上限截止（frames）：三层 + MT 全同时 exact = True（以前 end_compatible
+    只认 exit/exit_save/restart 等结束方式，截断局永远 exact = False）。长度不同仍不相容。"""
+    lines = _mt_lines()
+    rec = tmp_path / 'rec.jsonl'
+    rec.write_bytes(('\n'.join(lines[:4]) + '\n' + lines[4][:20]).encode('utf-8'))   # 第 3 帧被截断（不完整行）
+    rep = tmp_path / 'rep.jsonl'
+    rep.write_text('\n'.join(lines[:4] + ['{"k":"end","n":2,"reason":"frames","frames":2}']) + '\n', encoding='utf-8')
+    c = replay_run.compare(rec, rep)
+    assert c['record_truncated'] and c['record_partial_tail'] and c['end_compatible'] and c['exact']
+    assert c['record_frames'] == c['replay_frames'] == 2
+    rep3 = tmp_path / 'rep3.jsonl'
+    rep3.write_text('\n'.join(lines + ['{"k":"end","n":3,"reason":"frames","frames":3}']) + '\n', encoding='utf-8')
+    c3 = replay_run.compare(rec, rep3)
+    assert not c3['same_length'] and not c3['end_compatible'] and not c3['exact']
+    # 有 end 行的录制：record_truncated = False，规则不变
+    full = tmp_path / 'full.jsonl'
+    full.write_text('\n'.join(lines + ['{"k":"end","n":3,"reason":"exit_save","frames":3}']) + '\n', encoding='utf-8')
+    cf = replay_run.compare(full, rep3)
+    assert cf['record_truncated'] is False and cf['end_compatible'] and cf['exact']
+
+
+def test_process_exit_summary():
+    """session.json 的 game_exit（phase9-robust）：TerminateProcess(1) = 异常；正常关窗口 = 0；录制端自己强制结束另有标记。"""
+    assert rr.process_exit_summary(None) is None
+    killed = rr.process_exit_summary({'pid': 5, 'exit_code': 1, 'exit_hex': '0x00000001', 'seconds': 70.04})
+    assert killed == dict(pid=5, exit_code=1, exit_hex='0x00000001', wm_close_sent=False, forced_by_recorder=False,
+                          seconds=70.0, abnormal=True)
+    ok = rr.process_exit_summary({'pid': 6, 'exit_code': 0, 'exit_hex': '0x00000000', 'wm_close': True, 'forced': False, 'seconds': 3})
+    assert ok['abnormal'] is False and ok['wm_close_sent'] is True
+    assert '0x00000001' in rr.truncated_note(killed) and '退出码' not in rr.truncated_note(ok) and rr.truncated_note(None)

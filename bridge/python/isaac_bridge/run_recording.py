@@ -717,6 +717,27 @@ def validate_lines(lines):
     return st
 
 
+def process_exit_summary(closed):
+    """GameProcess.close() 的记录 -> session.json 的 game_exit（phase9-robust：以前只在 game/<tag>.exit.json 里）。
+    abnormal = 退出码非 0（被任务管理器/TerminateProcess 结束是 1，崩溃是 0xC0000005/0xC0000409 等）；
+    forced_by_recorder = 我们发 WM_CLOSE 后等不到退出、自己 TerminateProcess(0xDEAD) 的。"""
+    if not closed:
+        return None
+    code = closed.get('exit_code')
+    return dict(pid=closed.get('pid'), exit_code=code, exit_hex=closed.get('exit_hex'),
+                wm_close_sent=bool(closed.get('wm_close')), forced_by_recorder=bool(closed.get('forced')),
+                seconds=round(closed.get('seconds') or 0, 1), abnormal=code not in (0, None))
+
+
+def truncated_note(game_exit):
+    """截断局（没有 end 行）的说明：带上游戏进程的退出码（若知道）。mod 每 300 帧、进房、暂停时 flush，
+    另外 256 KB 写缓冲满了也会写出（可能停在行中间，读取时丢掉，见 load_run.read_lines），所以最多丢约 10 秒。"""
+    s = '没有 end 行：进程异常结束，缓冲区里最后最多 10 秒的数据丢失'
+    if game_exit and game_exit.get('abnormal'):
+        s += f'（游戏进程退出码 {game_exit.get("exit_hex")}）'
+    return s
+
+
 def compress_and_verify(raw, dst, level=19):
     """jsonl -> .zst（zstd level 19，带内容校验和），解压回读逐字节比较 sha256，并逐行解析校验。"""
     raw, dst = Path(raw), Path(dst)
@@ -1032,6 +1053,14 @@ class Session:
             self.watcher.stop_flag = True
         if self.g is not None and self.g.closed is None:
             self.g.close()
+        # 游戏进程怎么结束的（phase9-robust：强杀/崩溃时以前只有 game/<tag>.exit.json 记了退出码）
+        if self.g is not None and self.g.closed is not None:
+            ex = process_exit_summary(self.g.closed)
+            self.info['game_exit'] = ex
+            for L in self.info['launches']:
+                for att in L.get('attempts') or []:
+                    if att.get('pid') == self.g.pid and att.get('result') == 'ok':
+                        att['exit'] = ex
         time.sleep(1.0)
         sd = self.save_dir
         self.info['save_post'] = snapshot_save(self.dir / 'save/post', sd)
@@ -1081,7 +1110,7 @@ class Session:
                 rec['console_note'] = '本会话 cmd_history.txt 有新增行，无法定位到具体局，会话内所有局都标记'
             v = rec.get('validation') or {}
             if v.get('truncated'):
-                rec['note'] = '没有 end 行：进程异常结束，缓冲区里最后最多 10 秒的数据丢失'
+                rec['note'] = truncated_note(self.info.get('game_exit'))
             if self.raw_policy == 'stage' and rec.get('verified'):
                 rec['raw_staged_to'] = stage_raw(raw, self.out_root / '_raw_staging', self.name)
             else:
@@ -1102,6 +1131,8 @@ class Session:
                     archive_errors=sum(1 for r in runs if 'archive_error' in r),
                     launch_attempts=len(launches), launch_failures=sum(1 for a in launches if a.get('result') != 'ok'),
                     use_dll=self.use_dll,
+                    game_exit_hex=(self.info.get('game_exit') or {}).get('exit_hex'),
+                    game_exit_abnormal=(self.info.get('game_exit') or {}).get('abnormal'),
                     mt_runs=sum(1 for r in runs if (((r.get('validation') or {}).get('header') or {}).get('mt') or {}).get('available')),
                     real_documents_galaxy_appeared=(self.info.get('real_documents_watch') or {}).get('appeared_during_session'))
 
@@ -1110,7 +1141,8 @@ class Session:
         lines = [f'会话 {self.name}', f'局数 {s["runs"]}（续局 {s["continued_runs"]}，截断 {s["truncated_runs"]}）',
                  f'逻辑帧 {s["frames"]}，游戏时间 {s["game_hours"]:.4f} 小时（{s["frames"] / LOGIC_HZ:.1f} 秒）',
                  f'压缩后 {s["zst_mb"]:.3f} MB（原始 {s["raw_mb"]:.3f} MB），{s["zst_mb_per_hour"]} MB/小时',
-                 f'启动 {s["launch_attempts"]} 次，失败 {s["launch_failures"]} 次',
+                 f'启动 {s["launch_attempts"]} 次，失败 {s["launch_failures"]} 次；游戏进程退出码 {s.get("game_exit_hex")}'
+                 + ('（异常退出）' if s.get('game_exit_abnormal') else ''),
                  f'DLL {"开" if s.get("use_dll") else "关（-NoDll）"}；有 MT reseed 的局 {s.get("mt_runs")}；存档目录 {self.save_dir}',
                  f'会话期间真实 Documents 出现 (Galaxy) 目录：{s.get("real_documents_galaxy_appeared")}', '']
         for r in self.info['runs']:

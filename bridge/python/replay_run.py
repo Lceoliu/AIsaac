@@ -437,8 +437,13 @@ def compare(rec_path, rep_path):
     res['player_room_identical_whole_run'] = firsts['player_room'] is None and same_len
     # 结束方式相容：相同；或录制由玩家退出/重开结束（exit / exit_save / restart，这些是菜单/按键操作，回放不注入），
     # 回放在同一帧数被 harness 帧上限截止（frames）
+    # 录制截断（没有 end 行：进程被强杀/崩溃，phase9-robust 场景 C）时，录下的最后一帧之后没有可比的东西，
+    # 回放在同一帧数被帧上限截止同样算相容；record_partial_tail = 读取时丢掉的末尾不完整行
+    res['record_truncated'] = A.end is None
+    res['record_partial_tail'] = A.partial_tail or None
     res['end_compatible'] = res['same_end'] or (same_len and res['replay_end'] == 'frames'
-                                                and res['record_end'] in ('exit', 'exit_save', 'restart', 'frames', 'stop'))
+                                                and (res['record_end'] in ('exit', 'exit_save', 'restart', 'frames', 'stop')
+                                                     or res['record_truncated']))
     # E6：三层 + MT 全部 0 分歧、同长度、结束方式相容、MT 每帧都有、reseed 记录一致
     res['exact'] = (all(firsts[k] is None for k in LAYERS) and mt_first is None and mt_missing == 0 and same_len
                     and res['end_compatible'] and res['mt']['reseeds_match'] is True)
