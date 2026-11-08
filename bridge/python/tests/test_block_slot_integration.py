@@ -582,3 +582,34 @@ def test_rollout_chunks_decoded_once_per_update():
         for k in grads:
             torch.testing.assert_close(grads[k], res[0][1][k], rtol=0, atol=0, msg=k)
     block_paged.clear_decode_cache()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='actor graph pre-capture (CUDA)')
+def test_precaptured_actor_graphs_cover_steps_and_keep_values():
+    """B42 fix 2: after precapture_actor the common keys need no new capture, and the replayed
+    pre-captured graphs give the eager slot step's outputs."""
+    from isaac_bridge import block_paged
+    if not block_paged.STEP_GRAPH:
+        pytest.skip('ISAAC_BLOCK_STEP_GRAPH=0')
+    torch.manual_seed(9)
+    m = make_policy('cuda').eval()
+    g = SlotBlockActor(m, 4, graph_entities=128)
+    e = SlotBlockActor(m, 4, graph_entities=128)
+    e.step_graph = None
+    made, _ = block_paged.precapture_actor(g)
+    assert made == g.step_graph.captures + g.encoder.captures + g.reader.captures > 0
+    before = (g.step_graph.captures, g.encoder.captures, g.reader.captures)
+    rng = np.random.default_rng(9)
+    for t in range(6):
+        n = (4, 3, 2, 1, 4, 4)[t]
+        rows = frame(rng, n, t, np.arange(n)+1, int(t == 0))
+        rows['visible_frame'][:] = block_paged.synthetic_rows(n, 5)['visible_frame']
+        rows['visible_bytes'][:] = block_paged.synthetic_rows(n, 5)['visible_bytes']
+        pending = synth_pending(rng, n, m.heads)
+        keys = (np.full(n, t), np.arange(n))
+        a = g.step(rows, pending, range(n), ukeys=keys)
+        b = e.step(rows, pending, range(n), ukeys=keys)
+        torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
+        for x, y in zip(a[1:], b[1:]):
+            torch.testing.assert_close(x.float(), y.float(), rtol=1e-5, atol=1e-5)
+    assert (g.step_graph.captures, g.encoder.captures, g.reader.captures) == before

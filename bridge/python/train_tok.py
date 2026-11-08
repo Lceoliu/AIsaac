@@ -2536,6 +2536,15 @@ def main(argv=None, child=None, actor=None):
             block_actor = SlotBlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
         else:
             block_actor = BlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
+        from isaac_bridge import block_paged as bp_pre
+        if args.block_slots and bp_pre.PRECAPTURE and device.type=='cuda':
+            # B42 fix 2: the main actor's common graph keys (whole step, merged-call Spatial and
+            # Reader) before the first decision; later new keys are printed as late captures
+            n_pre,s_pre = bp_pre.precapture_actor(block_actor)
+            bp_pre.PRECAPTURED[0] = True
+            import gc as gc_
+            gc_.collect(); gc_.freeze()
+            print(f'B42 actor pre-capture: {n_pre} graphs in {s_pre:.1f} s',flush=True)
     use_graphs = args.graph_entities > 0 and (bool(args.memory_graph) or not mem_on) and not block_on and bench_job is None
     if mem_on:
         print(f'memory: GRU size {mem_dim}, BPTT chunks of {T_mem} decisions (minibatch = {max(1, args.minibatch // T_mem)}'

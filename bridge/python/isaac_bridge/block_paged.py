@@ -483,6 +483,68 @@ class PagedStore:
 
 # ----------------------------------------------------------------------------- actor
 
+# B42 fix 2: start-up pre-capture of the actor graphs (ISAAC_BLOCK_PRECAPTURE=0: off).
+PRECAPTURE = os.environ.get('ISAAC_BLOCK_PRECAPTURE', '1') == '1'
+PRECAPTURE_CAPS = (1, 2, 4, 8, 16)            # rows of a main-only / lane-only call (16 workers)
+PRECAPTURE_MERGED_CAPS = (2, 4, 8, 16, 32)    # rows of a merged main + teacher-lane call
+PRECAPTURE_ENTITIES = (16, 32, 64, 128)       # structured_input.BUCKETS['entity']
+PRECAPTURED = [False]
+
+
+def late_capture(kind, key):
+    """After the start-up pre-capture, every new graph key is printed (ISAAC_BLOCK_TIMING=1)."""
+    if TIMING_ON and PRECAPTURED[0]:
+        print('B42 late capture', kind, key, flush=True)
+
+
+def synthetic_rows(n, entities, body=1, inventory=0, slots=0):
+    """n ROW records holding one all-zero complete visible-v2 frame with these counts."""
+    from .tok_obs import ROW
+    from .structured_input import pack_frame, write_frame, PF, EF, NF, SF, RC
+    payload = pack_frame(np.zeros((body, PF), np.float32), np.zeros((RC, 16, 28), np.float32),
+                         np.zeros((body, RC, 9, 9), np.float32), np.zeros((8, 13, 13), np.float32),
+                         np.zeros((entities, EF), np.float32), np.zeros((inventory, NF), np.float32),
+                         np.zeros((slots, SF), np.float32))
+    rows = np.zeros(n, ROW)
+    for i in range(n):
+        write_frame(rows[i:i+1], payload)
+    return rows
+
+
+@torch.inference_mode()
+def precapture_actor(actor, merged=True):
+    """B42 fix 2: capture an actor's common graph keys before they are first needed: its whole-step
+    graph for (rows {1..16}, entity bucket), and with merged=True (the main actor) the Spatial
+    encoder and Reader graphs a merged main + teacher-lane call replays (rows {2..32}). One body,
+    fixed inventory/slot buckets (the prof-f2/f3 actor batches); other keys stay lazy and are
+    printed as late captures. Runs in the actor's autocast context. Returns (graphs, seconds)."""
+    import time as time_
+    t = time_.perf_counter()
+    made = 0
+    with torch.autocast('cuda', dtype=torch.bfloat16, enabled=actor.bf16):
+        if actor.step_graph is not None:
+            for cap in PRECAPTURE_CAPS:
+                for e in PRECAPTURE_ENTITIES:
+                    made += int(actor.step_graph.precapture(cap, e))
+        if merged and actor.encoder is not None:
+            memory = actor.model.block_memory
+            scratch = actor.state.slots-1
+            nh = len(actor.model.heads)
+            for cap in PRECAPTURE_MERGED_CAPS:
+                for e in PRECAPTURE_ENTITIES:
+                    before = actor.encoder.captures
+                    _, z = actor.encoder(synthetic_rows(cap, e), np.zeros((cap, nh), np.int64))
+                    made += actor.encoder.captures-before
+                if actor.reader is not None:
+                    ids = torch.full((cap,), scratch, dtype=torch.long, device=z.device)
+                    steps, prefixes, bank, ends, kp = actor.state.read_inputs(memory, ids, z.dtype)
+                    before = actor.reader.captures
+                    actor.reader(z[:, None], steps[:, None], prefixes, bank, ends, kp)
+                    made += actor.reader.captures-before
+    torch.cuda.synchronize()
+    return made, time_.perf_counter()-t
+
+
 # B42 glue 5: a whole single-arena actor step as one CUDA graph (ISAAC_BLOCK_STEP_GRAPH=0: off).
 STEP_GRAPH = os.environ.get('ISAAC_BLOCK_STEP_GRAPH', '1') == '1'
 _STEP_KEYS = ('v_room', 'v_map', 'v_body', 'v_body_mask', 'v_local', 'v_local_mask', 'v_entity', 'v_entity_mask',
@@ -600,9 +662,26 @@ class ActorStepGraph:
             self.graphs[key] = (flat, host, hv, graph, out, current, z, back)
             self.captures += 1
             ucount('actor_captures_step', 1); ucount('actor_capture_step_s', time_.perf_counter()-t_cap)
+            late_capture('step', key)
             return self.graphs[key]
         finally:
             CUDA_CAPTURE_ADMISSION.release()
+
+    def precapture(self, n, entities, greedy=False):
+        """B42 fix 2: capture the graph of an n-row step whose frames have `entities` entities
+        (one body, no items/slots: inventory/slot widths are their fixed buckets) without
+        replaying it, in the caller's inference/autocast context. True when captured now."""
+        from .structured_input import decode_frame_host
+        host = decode_frame_host(synthetic_rows(n, entities), packed=True)
+        host['pending'] = np.zeros((n, len(self.actor.model.heads)), np.int64)
+        cap = 1 << (n-1).bit_length()
+        auto = torch.is_autocast_enabled('cuda')
+        key = (cap, tuple(host[k].shape[1] for k in ('v_body', 'v_entity', 'v_inventory', 'v_slots')),
+               auto, torch.get_autocast_dtype('cuda') if auto else None, bool(greedy))
+        if key in self.graphs:
+            return False
+        layout, size = self._layout(host, cap, sum(self.actor.model.heads))
+        return self._capture(key, layout, size, greedy) is not None
 
     def __call__(self, host, rows_ids, u, replay, version, greedy):
         """host: decode_frame_host(rows, packed=True) plus 'pending'; rows_ids: arena rows [n];
@@ -678,7 +757,14 @@ class SlotBlockActor:
 
     def lane_actor(self, model, slots):
         """A teacher-generation actor sharing this actor's page store (merged batches allowed)."""
-        return SlotBlockActor(model, slots, graph_entities=self.graph_entities, bf16=self.bf16, store=self.store)
+        lane = SlotBlockActor(model, slots, graph_entities=self.graph_entities, bf16=self.bf16, store=self.store)
+        if PRECAPTURE and lane.step_graph is not None:
+            # B42 fix 2: its lane-only step graphs now (a capture refused while the learner holds
+            # the admission stays lazy)
+            n, sec = precapture_actor(lane, merged=False)
+            if TIMING_ON:
+                print(f'B42 lane pre-capture: {n} graphs in {sec:.1f} s', flush=True)
+        return lane
 
     def snapshot(self, slot):
         return PagedSnapshot(self.store, self.logs[slot], self.state.step_host[slot], self.pending[slot].copy(),

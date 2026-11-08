@@ -299,6 +299,8 @@ class SpatialEncoderGraph:
                 self.captures+=1
                 from .block_paged import ucount
                 ucount('actor_captures_other',1);ucount('actor_capture_other_s',time.perf_counter()-t_cap)
+                from .block_paged import late_capture
+                late_capture('spatial',(n,)+tuple((k,s_) for k,s_,_ in key if k in ('v_body','v_entity')))
             finally:
                 CUDA_CAPTURE_ADMISSION.release()
         static,graph,z=self.graphs[key]
@@ -356,6 +358,8 @@ class ReaderStepGraph:
                 self.captures+=1
                 from .block_paged import ucount
                 ucount('actor_captures_other',1);ucount('actor_capture_other_s',time.perf_counter()-t_cap)
+                from .block_paged import late_capture
+                late_capture('reader',key)
             finally:
                 CUDA_CAPTURE_ADMISSION.release()
         sz,sp,spr,sb,se,sk,graph,result=self.graphs[key]
