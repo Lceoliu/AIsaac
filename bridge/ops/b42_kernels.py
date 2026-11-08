@@ -174,6 +174,21 @@ def main():
         z = lf()
         z.float().square().mean().backward()
     part(out, 'learn.spatial.fwdbwd', lfb)
+    # The learner's production call: token-sorted microbatches (encode_sorted; row-packed when
+    # the code has B42 glue 4), from the host counts.
+    from isaac_bridge import block_paged
+    from isaac_bridge.structured_input import decode_frame_host, host_counts
+    hl = decode_frame_host(lr, packed=True)
+    lcounts = host_counts(hl)
+
+    def lsf():
+        with torch.autocast(**bf16):
+            return block_paged.encode_sorted(learner, lb, 512, lcounts)
+    part(out, 'learn.encode_sorted.fwd', lsf)
+
+    def lsfb():
+        lsf().float().square().mean().backward()
+    part(out, 'learn.encode_sorted.fwdbwd', lsfb)
     hb = torch.randn((16, cfg.block_steps, cfg.latents, cfg.latent_width), device=dev, requires_grad=True)
 
     def lw():
