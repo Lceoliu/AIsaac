@@ -94,8 +94,28 @@ UPD_KEYS = ('learn_fwd_part_wall_s', 'learn_fwd_part_gpu_s', 'learn_bwd_wall_s',
             'actor_eager_calls', 'actor_eager_merged_calls', 'actor_eager_s', 'actor_eager_overlap_s',
             'learn_main_decode_calls', 'learn_main_decode_rows_fresh', 'learn_main_decode_rows_cached',
             'learn_hist_decode_rows_fresh', 'learn_hist_decode_rows_cached', 'learn_tail_decode_rows',
-            'learn_nvcsw', 'learn_nivcsw', 'learn_cpu_s', 'update_t0', 'update_t1')
+            'learn_nvcsw', 'learn_nivcsw', 'learn_cpu_s', 'gc_collect_s', 'gc_collect_calls', 'update_t0', 'update_t1')
 LEARNER_ACTIVE = [False]
+
+
+def _time_gc():
+    """Measurement only (ISAAC_BLOCK_TIMING=1): time every gc.collect() (torch.cuda.graph's __enter__
+    runs one before each capture, in a process holding the page store's Python objects)."""
+    import gc
+    import time
+    collect = gc.collect
+
+    def timed(*a, **k):
+        t = time.perf_counter()
+        try:
+            return collect(*a, **k)
+        finally:
+            ucount('gc_collect_s', time.perf_counter()-t); ucount('gc_collect_calls', 1)
+    gc.collect = timed
+
+
+if TIMING_ON:
+    _time_gc()
 
 
 def ucount(name, value):
