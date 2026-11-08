@@ -82,6 +82,67 @@ def dump_inputs(name, rows, pending):
     np.save(os.path.join(DUMP_DIR, name+'_pending.npy'), np.asarray(pending, np.int64))
 
 
+# B42 spike localisation: per-update counters (ISAAC_BLOCK_TIMING=1), drained into progress.csv by
+# the learner after each update (update_report); both threads add to them.
+UPD = {}
+UPD_KEYS = ('learn_fwd_part_wall_s', 'learn_fwd_part_gpu_s', 'learn_bwd_wall_s', 'learn_bwd_gpu_s', 'learn_bwd_calls',
+            'learn_zero_wall_s', 'learn_clip_wall_s', 'learn_clip_gpu_s', 'learn_opt_wall_s', 'learn_opt_gpu_s',
+            'learn_admission_wait_s', 'learn_yield_wait_s', 'learn_yields_given',
+            'actor_admission_wait_s', 'actor_admission_misses',
+            'actor_captures_step', 'actor_capture_step_s', 'actor_captures_other', 'actor_capture_other_s',
+            'actor_graph_calls', 'actor_graph_s', 'actor_graph_overlap_s',
+            'actor_eager_calls', 'actor_eager_merged_calls', 'actor_eager_s', 'actor_eager_overlap_s',
+            'learn_main_decode_calls', 'learn_main_decode_rows_fresh', 'learn_main_decode_rows_cached',
+            'learn_hist_decode_rows_fresh', 'learn_hist_decode_rows_cached', 'learn_tail_decode_rows',
+            'learn_nvcsw', 'learn_nivcsw', 'learn_cpu_s', 'update_t0', 'update_t1')
+LEARNER_ACTIVE = [False]
+
+
+def ucount(name, value):
+    if TIMING_ON:
+        UPD[name] = UPD.get(name, 0)+value
+
+
+class GpuSpan:
+    """Wall time and CUDA-event time of a region (events read at drain(): no synchronisation)."""
+    PENDING = []
+
+    def __init__(self, name):
+        self.name = name
+
+    def __enter__(self):
+        if TIMING_ON:
+            import time
+            self.t = time.perf_counter()
+            if torch.cuda.is_available():
+                self.e0 = torch.cuda.Event(enable_timing=True); self.e0.record()
+        return self
+
+    def __exit__(self, *exc):
+        if TIMING_ON:
+            import time
+            ucount(self.name+'_wall_s', time.perf_counter()-self.t)
+            if torch.cuda.is_available():
+                e1 = torch.cuda.Event(enable_timing=True); e1.record()
+                GpuSpan.PENDING.append((self.name+'_gpu_s', self.e0, e1))
+        return False
+
+    @staticmethod
+    def drain():
+        for name, a, b in GpuSpan.PENDING:
+            b.synchronize()
+            ucount(name, a.elapsed_time(b)/1e3)
+        GpuSpan.PENDING.clear()
+
+
+def update_report():
+    """The per-update counters as progress.csv columns (all present on every row)."""
+    GpuSpan.drain()
+    out = {'b42_'+k: UPD.get(k, 0) for k in UPD_KEYS}
+    UPD.clear()
+    return out
+
+
 def timing_report(reset=True):
     out = dict(TIMING)
     if reset:
@@ -468,6 +529,8 @@ class ActorStepGraph:
         if not capture_admission((id(self), key)):
             self.busy_misses += 1
             return None
+        import time as time_
+        t_cap = time_.perf_counter()
         try:
             if len(self.graphs) >= self.limit:
                 self.graphs.popitem(last=False)
@@ -497,6 +560,7 @@ class ActorStepGraph:
                     torch.empty(z.shape, dtype=z.dtype).pin_memory())
             self.graphs[key] = (flat, host, hv, graph, out, current, z, back)
             self.captures += 1
+            ucount('actor_captures_step', 1); ucount('actor_capture_step_s', time_.perf_counter()-t_cap)
             return self.graphs[key]
         finally:
             CUDA_CAPTURE_ADMISSION.release()
@@ -624,13 +688,21 @@ class SlotBlockActor:
         version = self.version
         steps_host = np.array([owner.state.step_host[slot] for owner, slot in zip(owners, slots)], np.int64)
         record = {}
+        import time as time_
+        t_call, active = time_.perf_counter(), LEARNER_ACTIVE[0]
         if self.step_graph is not None and all(owner is self for owner in owners):
             done = self._graph_step(rows, pending, slots, ukeys, greedy, evaluate, uniform, steps_host, record, clock)
             if done is not None:
                 result, host, kv_host, z_host = done
                 self._pages(rows, pending, slots, owners, groups, record, host, kv_host, z_host, steps_host, contexts)
                 clock.mark('pages')
+                if TIMING_ON:
+                    dt = time_.perf_counter()-t_call
+                    ucount('actor_graph_calls', 1); ucount('actor_graph_s', dt)
+                    ucount('actor_graph_overlap_s', dt if active or LEARNER_ACTIVE[0] else 0.0)
                 return result
+        if TIMING_ON:
+            ucount('actor_eager_calls', 1); ucount('actor_eager_merged_calls', int(len(groups) > 1))
 
         def slot_call(z):
             clock.mark('decode_spatial')
@@ -714,6 +786,9 @@ class SlotBlockActor:
         z_host = zc.float().to('cpu')
         self._pages(rows, pending, slots, owners, groups, record, host, kv_host, z_host, steps_host, contexts)
         clock.mark('pages')
+        if TIMING_ON:
+            dt = time_.perf_counter()-t_call
+            ucount('actor_eager_s', dt); ucount('actor_eager_overlap_s', dt if active or LEARNER_ACTIVE[0] else 0.0)
         return result
 
 
@@ -989,6 +1064,7 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     def encode_sources(rows, pending):
         from .structured_input import decode_frame_host, from_host, host_counts
         d = decode_frame_host(rows, packed=device.type == 'cuda')
+        ucount('learn_tail_decode_rows', len(rows))
         d['pending'] = np.asarray(pending, np.int64); d['first'] = np.asarray(rows['first'])
         return encode_sorted(model, from_host(d, device), spatial_micro, host_counts(d))
     hist_written = None
@@ -1001,6 +1077,7 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
         hosts = []
         for bid in ub.tolist():
             d = store.decoded.get((bid, packed))
+            ucount('learn_hist_decode_rows_fresh' if d is None else 'learn_hist_decode_rows_cached', cfg.block_steps)
             if d is None:
                 rows_b, pend_b = store.source_rows(store.b_src[bid])
                 d = decode_frame_host(rows_b, packed=packed)
@@ -1085,8 +1162,11 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     from .structured_input import decode_frame_host, merge_host, from_host
     packed = device.type == 'cuda'
     hosts = []
+    ucount('learn_main_decode_calls', 1)
     for c in chunks:
         h = c.__dict__.get('_host')
+        ucount('learn_main_decode_rows_fresh' if h is None or h[0] != packed else 'learn_main_decode_rows_cached',
+               len(c.rows))
         if h is None or h[0] != packed:
             d = decode_frame_host(c.rows, packed=packed)
             d['pending'] = np.asarray(c.pending, dtype=np.int64); d['first'] = np.asarray(c.rows['first'])

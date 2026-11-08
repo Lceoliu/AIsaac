@@ -34,8 +34,15 @@ _CAPTURE_RETRY = {}
 @contextmanager
 def learner_cuda_activity():
     """No CUDA capture may overlap submissions from the learner thread."""
+    from .block_paged import ucount, LEARNER_ACTIVE
+    t=time.perf_counter()
     with CUDA_CAPTURE_ADMISSION:
-        yield
+        ucount('learn_admission_wait_s',time.perf_counter()-t)
+        LEARNER_ACTIVE[0]=True
+        try:
+            yield
+        finally:
+            LEARNER_ACTIVE[0]=False
 
 
 def capture_yield():
@@ -44,25 +51,32 @@ def capture_yield():
     Without this a learner busy for the whole update kept every graph key first seen
     during learning (all teacher-generation actors) on the eager path."""
     if CAPTURE_WAITING.is_set() and CUDA_CAPTURE_ADMISSION._is_owned():
+        from .block_paged import ucount
+        t=time.perf_counter()
         state=CUDA_CAPTURE_ADMISSION._release_save()
         time.sleep(0.002)
         CUDA_CAPTURE_ADMISSION._acquire_restore(state)
+        ucount('learn_yield_wait_s',time.perf_counter()-t);ucount('learn_yields_given',1)
 
 
 def capture_admission(key):
     """Actor thread: admission to capture a new graph key (bounded wait, spaced retries)."""
     if CUDA_CAPTURE_ADMISSION.acquire(blocking=False):
         return True
+    from .block_paged import ucount
     now=time.monotonic()
     if now<_CAPTURE_RETRY.get(key,0.0):
+        ucount('actor_admission_misses',1)
         return False
     CAPTURE_WAITING.set()
     try:
         got=CUDA_CAPTURE_ADMISSION.acquire(timeout=0.5)
     finally:
         CAPTURE_WAITING.clear()
+    ucount('actor_admission_wait_s',time.monotonic()-now)
     if not got:
         _CAPTURE_RETRY[key]=now+10.0
+        ucount('actor_admission_misses',1)
     return got
 
 
@@ -265,6 +279,8 @@ class SpatialEncoderGraph:
                         z=self.model.encode_block(static,packed=False)
                 self.graphs[key]=(static,graph,z)
                 self.captures+=1
+                from .block_paged import ucount
+                ucount('actor_captures_other',1)
             finally:
                 CUDA_CAPTURE_ADMISSION.release()
         static,graph,z=self.graphs[key]
@@ -319,6 +335,8 @@ class ReaderStepGraph:
                 if len(self.graphs)>=32:self.graphs.pop(next(iter(self.graphs)))
                 self.graphs[key]=(sz,sp,spr,sb,se,sk,graph,result)
                 self.captures+=1
+                from .block_paged import ucount
+                ucount('actor_captures_other',1)
             finally:
                 CUDA_CAPTURE_ADMISSION.release()
         sz,sp,spr,sb,se,sk,graph,result=self.graphs[key]

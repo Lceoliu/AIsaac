@@ -234,6 +234,7 @@ usage (from the bridge's python dir, PYTHONPATH=.):
 """
 import argparse
 import collections
+import contextlib
 import csv
 import json
 import math
@@ -428,7 +429,8 @@ def profile_learn(learn, job, path):
         f.write(ka.table(sort_by='self_cpu_time_total', row_limit=60))
         f.write('\n\n')
         f.write(ka.table(sort_by='self_cuda_time_total', row_limit=40))
-    prof_.export_chrome_trace(str(Path(path) / 'trace.json'))
+    if os.environ.get('ISAAC_RL_B38_TORCHPROF_TRACE', '1') != '0':
+        prof_.export_chrome_trace(str(Path(path) / 'trace.json'))
     print(f'B38: the profile of one update written to {path}', flush=True)
 
 
@@ -2729,6 +2731,11 @@ def main(argv=None, child=None, actor=None):
         # without --learner-device they are one)
         adev, device = device_actor, ldev
         t0 = time.perf_counter()
+        if block_on:   # B42 spike localisation (ISAAC_BLOCK_TIMING=1): this update's window and thread usage
+            import resource as resource_
+            from isaac_bridge import block_paged as bpt
+            bpt.ucount('update_t0', time.time())
+            ru0 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))
         U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
                           (('temporal',) if t_on else ()) + (('aux',) if aux_on else ()) + (('priv',) if priv_on else ()) +
                           (('log',) if log_on else ()),
@@ -3482,7 +3489,10 @@ def main(argv=None, child=None, actor=None):
                         a_all = b_adv[sel]
                         adv_std = a_all.std()
                         a_all = (a_all - a_all.mean()) / (a_all.std() + 1e-8)
+                t_z = time.perf_counter()
                 opt.zero_grad(set_to_none=True)
+                if block_on:
+                    bpt.ucount('learn_zero_wall_s', time.perf_counter()-t_z)
                 if priv_on:
                     popt.zero_grad(set_to_none=True)
                 if aux_on:   # 2026-11-03 (tok_aux): its means' denominators over this minibatch's valid trained rows
@@ -3634,8 +3644,9 @@ def main(argv=None, child=None, actor=None):
                                 chunks_b += [L['teach_chunks'][i] for i in pick]
                             if vmerged:
                                 chunks_b += [L['v2_chunks'][i] for i in vpick]
-                            outs_,ctx_b = forward_bucketed(learner_model,chunks_b,max_rows=args.micro or args.minibatch,
-                                                          version=L['update'])
+                            with bpt.GpuSpan('learn_fwd_part'):
+                                outs_,ctx_b = forward_bucketed(learner_model,chunks_b,max_rows=args.micro or args.minibatch,
+                                                              version=L['update'])
                             for key_b,value_b in ctx_b['recompute_stats'].items():
                                 block_ppo_counts[key_b]+=value_b
                             tk_ = dict(temporal=ctx_b)
@@ -3734,7 +3745,12 @@ def main(argv=None, child=None, actor=None):
                         vloss, vstats = v2_terms(lp_v, value_[o_:], vpick_d, v_w, v_G, v_share, adv_std, n_sel)
                         loss = loss + vloss
                     m_ = pmark('b38:part_backward', m_)
-                    loss.backward()
+                    if block_on:
+                        bpt.ucount('learn_bwd_calls', 1)
+                        with bpt.GpuSpan('learn_bwd'):
+                            loss.backward()
+                    else:
+                        loss.backward()
                     m_ = pmark('b38:part_stats', m_)
                     with torch.no_grad():
                         if pf_on:   # (B23: kl and clip share over the PPO-trained decisions' rows)
@@ -3804,11 +3820,13 @@ def main(argv=None, child=None, actor=None):
                 if aux_on:   # (the policy's norm as ever, aux's share included; the head's apart: not PPO's scale)
                     torch.nn.utils.clip_grad_norm_(aux_head.parameters(), args.max_grad_norm)
                     aopt.step()
-                if gn_on:   # (progress.csv grad_norm: how far the clip scales the policy's gradient)
-                    gn_acc += torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
-                else:
-                    torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
-                opt.step()
+                with (bpt.GpuSpan('learn_clip') if block_on else contextlib.nullcontext()):
+                    if gn_on:   # (progress.csv grad_norm: how far the clip scales the policy's gradient)
+                        gn_acc += torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+                with (bpt.GpuSpan('learn_opt') if block_on else contextlib.nullcontext()):
+                    opt.step()
                 pmark(None, m_)
                 sec('opt')
         learner_model.eval()
@@ -4120,6 +4138,11 @@ def main(argv=None, child=None, actor=None):
                         f'{name}/boss': sum(e['boss'] for e in eps) / m})
         if block_on:
             row.update({'block_ppo_'+key:value for key,value in block_ppo_counts.items()})
+            ru1 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))
+            bpt.ucount('learn_nvcsw', ru1.ru_nvcsw-ru0.ru_nvcsw); bpt.ucount('learn_nivcsw', ru1.ru_nivcsw-ru0.ru_nivcsw)
+            bpt.ucount('learn_cpu_s', (ru1.ru_utime+ru1.ru_stime)-(ru0.ru_utime+ru0.ru_stime))
+            bpt.ucount('update_t1', time.time())
+            row.update(bpt.update_report())
             good=teach_steps>0 and v2_steps>0 and all(np.isfinite(float(row[k])) and float(row[k])>0
                   for k in ('teach_loss','danger_loss','v2_loss_pi'))
             L['steady_updates']=L.get('steady_updates',0)+1 if good else 0
@@ -4175,7 +4198,12 @@ def main(argv=None, child=None, actor=None):
                                       stats=sampler.stats.copy())):
                         fresh.set()
                         continue
-                learn(job)
+                prof_dir_t = os.environ.get('ISAAC_RL_B38_TORCHPROF', '')
+                if prof_dir_t and L['update']+1 == int(os.environ.get('ISAAC_RL_B38_TORCHPROF_AT', '3') or 3):
+                    # B42 spike localisation: the torch profiler over update k of the learner thread
+                    profile_learn(learn, job, prof_dir_t)
+                else:
+                    learn(job)
             except BaseException as exc:   # handed to the main thread
                 failure.append(exc)
                 fresh.set()
