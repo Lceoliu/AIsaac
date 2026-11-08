@@ -173,6 +173,51 @@ def clear_decode_cache():
     DECODE_CACHE.clear()
 
 
+# B43 history-ablation diagnostics, every update in block mode (progress.csv hist_* columns).
+HIST = dict(age=[], g_max=[], g_rand=[], rows=0, blocks=0, aux=0.0, spans=[])
+
+
+class HistSpan:
+    """Seconds of the historical recompute (CUDA events when on the GPU: no synchronisation)."""
+    def __init__(self, device):
+        self.cuda = torch.device(device).type == 'cuda'
+
+    def __enter__(self):
+        import time
+        self.t = time.perf_counter()
+        if self.cuda:
+            self.e0 = torch.cuda.Event(enable_timing=True); self.e0.record()
+        return self
+
+    def __exit__(self, *exc):
+        import time
+        if self.cuda:
+            e1 = torch.cuda.Event(enable_timing=True); e1.record()
+            HIST['spans'].append((self.e0, e1))
+        else:
+            HIST['spans'].append(time.perf_counter()-self.t)
+        return False
+
+
+def hist_report():
+    """This update's history diagnostics (fixed keys; drained)."""
+    secs = 0.0
+    for s in HIST['spans']:
+        if isinstance(s, tuple):
+            s[1].synchronize(); secs += s[0].elapsed_time(s[1])/1e3
+        else:
+            secs += s
+
+    def q(v, f):
+        return float(f(v)) if len(v) else 0.0
+    out = dict(hist_rows=HIST['rows'], hist_blocks=HIST['blocks'], hist_s=secs, hist_aux_loss=HIST['aux'],
+               hist_age_median=q(HIST['age'], np.median), hist_age_max=q(HIST['age'], np.max),
+               hist_g_max_max=q(HIST['g_max'], np.max), hist_g_max_median=q(HIST['g_max'], np.median),
+               hist_g_rand_median=q(HIST['g_rand'], np.median))
+    HIST.update(age=[], g_max=[], g_rand=[], rows=0, blocks=0, aux=0.0, spans=[])
+    return out
+
+
 def grad_replay_aux(model, replays, coef=1.0, autocast=None):
     """B43 C arm, after the PPO backward of the batches whose forward_chunks_paged contexts gave
     `replays` (their 'replay' dicts): per chunk choose 1 window-external block of largest
@@ -219,11 +264,14 @@ def grad_replay_aux(model, replays, coef=1.0, autocast=None):
         return stats
     bids = np.fromiter(chosen.keys(), np.int64, len(chosen))
     G = torch.stack([chosen[int(b)] for b in bids]).detach().float()
-    with (autocast() if autocast is not None else contextlib.nullcontext()):
-        f, rows = encode_blocks(model, store, bids, device, micro)
-    aux = coef*(G*f.float()).sum()
-    aux.backward()
+    with HistSpan(device):
+        with (autocast() if autocast is not None else contextlib.nullcontext()):
+            f, rows = encode_blocks(model, store, bids, device, micro)
+        aux = coef*(G*f.float()).sum()
+        aux.backward()
     stats.update(aux=float(aux.detach()), rows=rows, blocks=len(bids))
+    HIST['age'] += stats['age']; HIST['g_max'] += stats['g_max']; HIST['g_rand'] += stats['g_rand']
+    HIST['rows'] += rows; HIST['blocks'] += len(bids); HIST['aux'] += stats['aux']
     return stats
 
 
@@ -1271,6 +1319,8 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
             selected.append(np.empty(0, np.int64)); continue
         pick = torch.randperm(len(eligible), generator=generator)[:cfg.history_recompute_blocks].numpy()
         selected.append(eligible[pick])
+        if torch.is_grad_enabled():
+            HIST['age'] += ((p['step']-p['ends'][eligible[pick]])//cfg.block_steps).tolist()
     unique = {}
     for p, sel in zip(parts, selected):
         for k in sel:
@@ -1286,7 +1336,12 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     if unique:
         clock.mark('select')
         ub = np.fromiter(unique.keys(), np.int64, len(unique))
-        hist_written, hist_rows = encode_blocks(model, store, ub, device, spatial_micro)
+        if torch.is_grad_enabled():
+            with HistSpan(device):
+                hist_written, hist_rows = encode_blocks(model, store, ub, device, spatial_micro)
+            HIST['rows'] += hist_rows; HIST['blocks'] += len(ub)
+        else:
+            hist_written, hist_rows = encode_blocks(model, store, ub, device, spatial_micro)
         clock.mark('hist_spatial_writer')
         count('learn.hist_rows', hist_rows)
     # ---- open tails: re-encoded raw sources when a new block becomes visible / continuation needed

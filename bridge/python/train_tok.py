@@ -2761,6 +2761,7 @@ def main(argv=None, child=None, actor=None):
         # without --learner-device they are one)
         adev, device = device_actor, ldev
         t0 = time.perf_counter()
+        hist_gn, hist_gn_steps = None, 0   # (B43 history diagnostics)
         if block_on:   # B42 spike localisation (ISAAC_BLOCK_TIMING=1): this update's window and thread usage
             import resource as resource_
             from isaac_bridge import block_paged as bpt
@@ -3857,6 +3858,12 @@ def main(argv=None, child=None, actor=None):
                 if aux_on:   # (the policy's norm as ever, aux's share included; the head's apart: not PPO's scale)
                     torch.nn.utils.clip_grad_norm_(aux_head.parameters(), args.max_grad_norm)
                     aopt.step()
+                if block_on:   # B43: the Writer's and Spatial's gradient norms of this step
+                    gn_ws_ = [torch.linalg.vector_norm(torch.stack([q.grad.float().norm() for q in mod_.parameters()
+                                                                    if q.grad is not None] or [torch.zeros((), device=device)]))
+                              for mod_ in (learner_model.block_memory.writer, learner_model.structured_spatial)]
+                    hist_gn = gn_ws_ if hist_gn is None else [a_+b_ for a_, b_ in zip(hist_gn, gn_ws_)]
+                    hist_gn_steps += 1
                 with (bpt.GpuSpan('learn_clip') if block_on else contextlib.nullcontext()):
                     if gn_on:   # (progress.csv grad_norm: how far the clip scales the policy's gradient)
                         gn_acc += torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
@@ -4182,6 +4189,10 @@ def main(argv=None, child=None, actor=None):
             bpt.ucount('update_t1', time.time())
             bpt.ucount('gpu_reserved_now_gb', torch.cuda.memory_reserved() / 2 ** 30 if torch.cuda.is_available() else 0.0)
             row.update(bpt.update_report())
+            row.update(bpt.hist_report())   # B43 history-ablation diagnostics
+            row['hist_mode'] = args.block_history_mode
+            row['hist_writer_grad_norm'] = float(hist_gn[0]) / hist_gn_steps if hist_gn_steps else 0.0
+            row['hist_spatial_grad_norm'] = float(hist_gn[1]) / hist_gn_steps if hist_gn_steps else 0.0
             good=teach_steps>0 and v2_steps>0 and all(np.isfinite(float(row[k])) and float(row[k])>0
                   for k in ('teach_loss','danger_loss','v2_loss_pi'))
             L['steady_updates']=L.get('steady_updates',0)+1 if good else 0
