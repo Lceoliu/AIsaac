@@ -9,3 +9,8 @@ turbo/build/
 *.log
 .env
 .env.*
+# 二进制构建产物（如 bridge/engine/j746_rec 的 rr_mt.dll / rr_launch.exe，构建到游戏副本里，不进 git）
+*.dll
+*.exe
+*.pdb
+*.lib

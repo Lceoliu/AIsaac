@@ -1,0 +1,8 @@
+<metadata>
+	<name>Isaac Run Recorder</name>
+	<directory>isaac_run_recorder</directory>
+	<id>isaac_run_recorder</id>
+	<description>Passive whole-run recorder for Repentance v1.7.8a.J746 (requires --luadebug). Does not change game rules, inputs or RNG.</description>
+	<version>0.2.0</version>
+	<visibility>Private</visibility>
+</metadata>
