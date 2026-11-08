@@ -8702,3 +8702,65 @@ CF分支单独计费/计算量：r8 90296dec/3.344296小时；r1 126554/4.687185
   - `prof-f2-recompile`：learner inference_mode变体没有预热，u1里持续编译；
   - `prof-f2-midcompile`：教师代冻结参数、slab视图offset、SpatialEncoderGraph的autocast缓存导致运行中重编译，共7次。
 - 4090已空闲。
+
+##### prof-f3 尖峰定位（2026-11-08）
+
+###### 实验目的
+
+找出prof-f2里u2（update 145.7 s）和u4（183.6 s）两次update尖峰的来源。本节只做定位和计时，不加优化项，不改输入、模型和教师预算。
+
+###### 实验方法
+
+- 计时代码（ea1ee16、2cf3815，只在`ISAAC_BLOCK_TIMING=1`下生效），每个update在progress.csv写一组`b42_*`列：
+  - learner：分part前向与反向的墙钟和CUDA event时间，zero_grad、clip、optimizer.step各自计时；进入learn时等许可的时间；`capture_yield`让出许可后等待取回的时间与次数。
+  - actor：等许可的时间与失败次数；新键graph捕获的次数与秒数；整步graph调用与eager合并批调用各自的次数、秒数，以及与learner update的重叠秒数。
+  - 其他：主批、历史、尾部解码的行数（新解码还是命中缓存）；learner线程的自愿/非自愿上下文切换和CPU秒；每次`gc.collect()`的耗时；update时间窗，用来把1 Hz的nvidia-smi采样切到每个update（`bridge/ops/b42_prof.py --per-update`）。
+- prof-f3：与prof-f2同配置（`candidate-t3` = 8b0795b + 计时代码），跑14个update，共458,849 decisions、16.99游戏小时。跑前GPU门155 passed。
+- prof-f3p：用torch.profiler（CPU+CUDA）录u2。update本身跑完（挂着profiler 258.5 s），但事件聚合超过了2400 s的运行上限，没有产出表，移到`failed/prof-f3p-profiler-timeout`。
+- prof-f3g：改用cProfile只profile learner线程的u2，同时开`gc.collect`计时，跑4个update。
+
+###### 实验结果
+
+| u | update_s | ×实时 | 前向part（墙钟） | 反向 墙钟/GPU | 优化器 | learner等许可 / 让出次数 | 新捕获 | eager合并批 次数 / 秒（与update重叠） | update内GPU利用率 | CF窗口（lane调用） |
+|---|---:|---:|---:|---:|---:|---|---:|---|---:|---:|
+| 1 | 78.3 | 33.3 | 46.0 | 24.3/24.3 | 0.19 | 19.4 s / 4 | 9 | 1 / 10.5 | 26.0% | 0 |
+| **2** | **193.9** | 22.5 | 107.6 | 38.2/38.2 | 0.29 | **100.6 s / 17** | 17 | 1494 / 113.8 | 15.1% | 4825 |
+| 3 | 89.5 | 48.7 | 38.0 | 34.0/34.0 | 0.21 | 7.2 s / 1 | 1 | 0 / 0 | 25.8% | 110 |
+| **4** | **170.2** | 25.6 | 104.6 | 40.2/40.2 | 0.31 | **71.0 s / 12** | 12 | 1214 / 43.2 | 17.2% | 5399 |
+| 5 | 89.8 | 48.4 | 41.2 | 37.2/37.2 | 0.27 | 0 | 0 | 859 / 18.3 | 28.8% | 3626 |
+| 6 | 96.1 | 45.3 | 45.1 | 39.8/39.8 | 0.31 | 0 | 0 | 992 / 22.2 | 31.1% | 4641 |
+| 7 | 96.4 | 45.2 | 45.0 | 39.5/39.5 | 0.31 | 0 | 0 | 821 / 17.7 | 27.8% | 6327 |
+| 8 | 105.4 | 41.3 | 53.8 | 40.6/40.6 | 0.30 | 0 | 0 | 628 / 13.6 | 27.6% | 4677 |
+| 9 | 98.9 | 44.0 | 46.1 | 41.4/41.4 | 0.30 | 0 | 0 | 1476 / 29.8 | 30.6% | 6232 |
+| **10** | **126.4** | 34.5 | 70.8 | 38.4/38.4 | 0.28 | **31.2 s / 5** | 5 | 462 / 33.0 | 22.7% | 4696 |
+| 11 | 107.9 | 40.4 | 53.6 | 43.1/43.1 | 0.33 | 0 | 0 | 1552 / 32.4 | 30.1% | 8983 |
+| 12 | 98.3 | 44.3 | 47.4 | 40.1/40.1 | 0.32 | 0 | 0 | 212 / 3.6 | 30.3% | 6219 |
+| 13 | 105.3 | 41.3 | 52.2 | 42.4/42.4 | 0.35 | 0 | 0 | 1685 / 37.8 | 30.2% | 7187 |
+| 14 | 81.8 | 53.1 | 42.4 | 32.1/32.1 | 0.21 | 0 | 0 | 0 / 0 | 22.9% | 0 |
+
+（“前向part”里包含了learner在`capture_yield`里等待的时间：capture_yield是在forward_bucketed的分组之间调用的。）
+
+- **尖峰在f3里复现，但不是按奇偶出现。** 尖峰在u2、u4、u10，每次都恰好是actor为新键捕获CUDA graph的update（捕获数17、12、5）。捕获数为0的update全部落在82–108 s。超出部分基本等于learner等许可的时间：u2 194−97≈97 s，对应等待100.6 s；u4 73 s对应71.0 s；u10 29 s对应31.2 s。CF窗口本身不造成尖峰：u5–u9、u11–u13同样有大量lane调用，却没有尖峰。f2里collect的奇偶交替在f3里没有复现（50–63 s，只有u3是111.7 s，紧跟在u2尖峰之后）。
+- **为什么每次捕获要约6 s：** `torch.cuda.graph`在`__enter__`里会依次执行`synchronize()`、全量`gc.collect()`和`empty_cache()`。训练进程里Python对象很多：页存储的原始观测dict、EpisodeLog、rollout缓冲等。prof-f3g实测u2共20次`gc.collect()`，合计114.6 s，平均5.7 s一次；同一update里learner让出许可20次，等待116.2 s，两者一一对应。u1的59次gc合计45.8 s，大多发生在learner开始之前。同样的捕获在小进程里只要0.25 s（`capture_timing.py`）。
+- **cProfile（prof-f3g的u2，learner线程，209 s）前5项：**
+  1. `capture_yield` → `RLock._acquire_restore`：116.2 s，20次。属于等待：actor捕获graph前的全量gc。
+  2. `forward_chunks_paged`：52.9 s，其中host侧自身5.4 s。属于前向。
+  3. `run_backward`：37.3 s，15次。属于反向，GPU一直在忙：CUDA event时间与墙钟相等，各update都是24–43 s。
+  4. `encode_sorted`：18.7 s，含编译后的Spatial 13.5 s。属于前向。
+  5. `dense_memory_forward`：7.3 s，页gather 5.1 s。属于前向。
+
+  优化器每update只有0.2–0.35 s，可以忽略。
+- **其他度量：**
+  - learner线程每update的非自愿上下文切换只有600–1,100次，自愿切换10万–26万次（锁和同步）。说明learner没有被游戏worker大量抢核，时间主要花在等待上。
+  - 主批原始观测每update新解码约67,500行、命中缓存约65,600行：每个rollout行被新解码了两次，一次在update开头的recompute，一次在PPO第1个epoch（两边用的是不同的Chunk对象）。第2、3个epoch命中缓存。只记数，没有改。
+  - CF期间的合并批eager调用每次约21 ms，与update重叠14–38 s/update，属于GPU争用。
+  - 无尖峰的update，GPU利用率为28–31%；尖峰update为15–17%。
+- 整体：u2–u14共426,078 decisions、1,464.7 s，×实时38.8。扣掉learner等许可的210 s后约45×，仍远低于X_old 427×。
+- **建议修法（未实施）：**
+  1. 捕获时跳过全量gc和empty_cache：用`torch.cuda.CUDAGraph`手动`capture_begin`/`capture_end`，或在启动预热后`gc.freeze()`，让长寿命对象不再参与回收。预计尖峰update回到约97 s，u2–u14总墙钟省约210 s（约14%），×实时约38.8→45。
+  2. 把常见actor键（行容量×实体桶）也放进开局预热，减少运行中的捕获。
+  3. 合并批（主+教师lane）也走整步graph（共享arena），去掉每update 14–38 s的eager重叠。
+  4. 去掉recompute和PPO第1个epoch之间的重复解码。
+
+  前三项只解决尖峰和争用；无尖峰时update仍有约97 s（前向约47 s + 反向约40 s + recompute约9 s），与X_old差一个数量级的主要来源没有变。
+- 4090已空闲。
