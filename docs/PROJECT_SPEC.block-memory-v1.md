@@ -468,7 +468,19 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
       "actor_whole_step_graph_body": 489,
       "actor_step_ms_standalone": {"before": 7.20, "after": 4.05}
     },
-    "still_far_from_x_old": true
+    "still_far_from_x_old": true,
+    "spike_localisation_f3": {"cause": "torch.cuda.graph __enter__ full gc.collect (~5.7 s per capture) while the learner waited for the capture admission",
+                              "x_real_time_u2_u14": 38.8, "spike_updates": [2, 4, 10]},
+    "fixes_f4": {
+      "commits": {"capture_without_gc": "094ef89", "decode_once_per_update": "8238a3a", "precapture_actor_keys": "6f11102"},
+      "equivalence_gates": {"local_cpu": "117 passed / 35 skipped", "rtx4090": "158 passed / 0 failed"},
+      "capture_seconds_each": {"before": 5.7, "after": 0.05},
+      "learner_capture_wait_s_per_update_max": {"before": 100.6, "after": 1.08},
+      "main_decode_fresh_rows_per_update": {"before": 67500, "after": 34500},
+      "gpu_reserved_gb_peak": {"before": 20.77, "after": 20.06},
+      "u2_u14": {"median_collect_s": 48.0, "median_update_s": 94.9, "x_real_time": 47.6, "decisions": 458869, "game_hours": 17.0},
+      "merged_lane_graph": "not done (fix 4 deferred)"
+    }
   },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
