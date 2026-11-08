@@ -482,6 +482,24 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
       "merged_lane_graph": "not done (fix 4 deferred)"
     }
   },
+  "history_ablation": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B43",
+    "switch": "--block-history-mode random|detach|gradreplay (--block-history-blocks, --block-history-aux-coef 1.0, --block-history-replay raw; latent not wired)",
+    "arms": {"A": "detach", "B": "random, 2 blocks", "C": "gradreplay, 2 blocks (1 max ||g_j|| + 1 random, aux loss sum_j sg(g_j).f(o_j))", "D": "random, 4 blocks (default, unchanged)"},
+    "commits": {"switch_ABD": "01bf1b3", "gradreplay": "c8fabb7", "diagnostics": "3391278", "memory_clear_eval": "9edbf01"},
+    "equivalence_gates": {"local_cpu": "121 passed / 35 skipped", "rtx4090": "162 passed / 0 failed",
+                          "C_gj_finite_difference": "passed", "C_aux_equals_D_reader_gradient_all_blocks": "passed",
+                          "A_equals_history_blocks_0": "bit-identical"},
+    "short_profile_u2_u7": {
+      "A": {"median_update_s": 69.3, "x_real_time": 63.5, "history_rows": 0, "gpu_reserved_gb": 17.55},
+      "B": {"median_update_s": 85.7, "x_real_time": 52.6, "history_rows": 55088, "gpu_reserved_gb": 18.35},
+      "C": {"median_update_s": 84.1, "x_real_time": 52.5, "history_rows": 51168, "gpu_reserved_gb": 18.27},
+      "D": {"median_update_s": 92.7, "x_real_time": 48.1, "history_rows": 101888, "gpu_reserved_gb": 20.3}
+    },
+    "history_cost_over_A_s": {"B": 16.4, "C": 14.8, "D": 23.4},
+    "memory_clear_eval": "eval_tok.py --memory-clear older:K|recent:K --memory-clear-fill zero|random; bridge/ops/b43_memclear_compare.py (not run)",
+    "training_runs": "none yet (budgets being decided)"
+  },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
   "spatial": {

@@ -8816,3 +8816,47 @@ CF分支单独计费/计算量：r8 90296dec/3.344296小时；r1 126554/4.687185
 - ×实时47.6，达到预估的约45×。无尖峰的update仍在74–103 s：前向part 34–49 s，反向32–43 s（GPU一直忙），recompute约9 s。与X_old 427×的差距主要还在learner的前向和反向，以及合并批eager路径的争用（第四条未做）。
 - 附带事件：推送时发现主仓库对象库里刚生成的pack（git自动维护的geometric repack生成）损坏，坏的是这三个新提交中`train_tok.py`的3个blob。我按工作树内容加修法差异重建了这三个blob，sha1逐个核对一致后写成loose对象再推送。随后git自动重打的pack用`verify-pack`校验全部正常。没有删除或改写任何已有对象。
 - 4090已空闲。
+
+### B43 历史块重算四臂开关 + Memory Gradient Replay：实现与短profile（2026-11-08）
+
+#### 实验目的
+
+`--block-history-blocks 4`（现状）每个chunk随机挑4个窗口外老块，用当前参数重新编码，让Reader的梯度传到Writer。代价约占update的30%，还要为此保留最近256块的原始观测。本轮实现GPT提出、用户采纳的Memory Gradient Replay，并把历史重算做成四臂可切换，只做实现、等价门和短profile，不跑训练。四臂的训练预算另定。
+
+#### 实验方法
+
+- 开关（01bf1b3）：`--block-history-mode random|detach|gradreplay`，默认random即现状。
+  - A臂：`detach`，不重算任何块，等于history_recompute_blocks 0。
+  - B臂：`random --block-history-blocks 2`。
+  - C臂：`gradreplay --block-history-blocks 2`。
+  - D臂：`random --block-history-blocks 4`，现状。
+  - 另有`--block-history-aux-coef`（默认1.0）；`--block-history-replay raw|latent`，latent本轮未接通，指定时会拒绝。
+  - 随机路径的块重编码挪进了`encode_blocks()`，代码不变；A、B、D三臂都走原路径。
+- C臂（c8fabb7）：
+  - PPO前向里，窗口外读取的缓存块值是一份新的requires_grad叶子（页面的设备副本）。块仍在chunk K/V窗口内的读取用detach副本，因此g_j与D臂的含义一致。PPO反向顺带得到g_j = ∂L/∂M_j，不需要再跑一次Reader，也不会保活KV页或块历史。
+  - 每个PPO part反向之后，`grad_replay_aux`在每个chunk里选1块‖g_j‖最大的，再随机选history_recompute_blocks−1块（torch RNG）。用当前Spatial+Writer对这些块的原始观测重新编码得到f_j，再反传coef·Σ_j sg(g_j)·f_j；g_j在读取同一块的多个batch上求和。
+  - 单测：g_j与损失对叶子值的中心有限差分一致（相对误差≤1%）；当所有可选块都被选中时，PPO加辅助损失后每个参数（含Writer和Spatial）的梯度，与D臂让Reader读重编码块时的梯度逐值一致（1e-4/1e-5）。前提是在固定权重下，缓存块值与重编码值一致（实测差5.96e-7）。
+- 诊断量（3391278），block模式下每个update写进progress.csv：
+  - hist_mode；Writer和Spatial梯度范数（update内各optimizer step、clip之前的均值）；hist_aux_loss；
+  - ‖g_j‖：每chunk最大块的max/median，以及随机块的median；
+  - 被选块的年龄中位/最大（距chunk的块数）；重算的行数/块数；
+  - hist_s：random臂是前向内重编码的时间，C臂是重编码加辅助反向的时间，用CUDA event计时、不同步。
+- 记忆清除评估钩子（9edbf01，本轮未跑）：
+  - `eval_tok.py --memory-clear older:K|recent:K [--memory-clear-fill zero|random]`：每次动作读到的状态中，把最新K块之外的块（older）或最新K块（recent）换成零或固定随机块，存储的记忆保留原值。
+  - 用法：同一组`--seeds`各跑一次不清除、`older:K`、`recent:K`，再用`python bridge/ops/b43_memclear_compare.py runs/full runs/older8 runs/recent8`按group输出clear/death/clear_without_hit及与基线的差。
+- 等价门：本地121 passed / 35 skipped；4090完整GPU门162 passed、0 failed（`tests-h.log`）。四个提交分开推送。
+- 短profile：与prof-f4同配置（`candidate-h` = 9edbf01 + 计时），每臂7个update（8.50游戏小时），取u2–u7。
+
+#### 实验结果
+
+| 臂 | update_s中位 | collect_s中位 | ×实时（u2–u7） | 历史重算行/块（中位/update） | hist_s中位 | 与A臂相比update多出 | 显存峰值 gpu_reserved_gb | Writer / Spatial 梯度范数中位 | 被选块年龄 中位/最大 |
+|---|---:|---:|---:|---|---:|---:|---:|---|---|
+| A detach | 69.3 | 59.4 | **63.5** | 0 | 0 | — | 17.55 | 0.0105 / 0.0452 | — |
+| B random×2 | 85.7 | 48.6 | 52.6 | 55,088 / 1,721 | 8.94（仅前向） | +16.4 s | 18.35 | 0.0100 / 0.0212 | 6 / 45 |
+| C gradreplay×2 | 84.1 | 51.0 | 52.5 | 51,168 / 1,599 | 10.84（前向+辅助反向） | +14.8 s | 18.27 | 0.0143 / 0.0369 | 7 / 42 |
+| D random×4（现状） | 92.7 | 49.7 | 48.1 | 101,888 / 3,184 | 13.24（仅前向） | +23.4 s | 20.30 | 0.0094 / 0.0190 | 7 / 69 |
+
+- C臂的重算行数是D臂的一半（51k对102k）。按“比A臂多出的update时间”计，C的历史代价是D的63%（14.8 s对23.4 s），与B臂（16.4 s）同量级，没有完全减半。原因是C多了一次辅助反向，而且主反向里也要算块值叶子的梯度。hist_s两类臂口径不同：random臂只计前向重编码，其反向含在PPO反向里；C臂包含辅助反向。所以用“比A臂多出的时间”来比较。
+- A臂update 63–73 s，中位69.3 s，比B42 prof-e旧代码的`--block-history-blocks 0`（55–60 s）略高；本轮代码多了胶水层与计时。显存峰值A 17.6 GB、B/C 18.3 GB、D 20.3 GB，C臂的叶子没有增加显存。
+- C臂诊断：‖g_j‖很小，每chunk最大块的中位为1.5–2.0e−7，update内最大值在2.8e−6到1.0e−5之间（u2–u7）；随机块的中位（1.4–2.0e−7）与最大块的中位几乎相同，说明块间梯度分布较均匀，“按最大梯度选块”与随机选块在这些早期update里差别很小。hist_aux_loss在±2e−3量级，Writer梯度范数中位0.0143（D为0.0094）。这些只是6个update的早期数值，不代表训练效果。
+- 失败或中间运行：无。4090已空闲。
