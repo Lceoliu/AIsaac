@@ -692,6 +692,7 @@ def forward_bucketed(model, chunks, max_rows=None, **kwargs):
     for index, chunk in enumerate(chunks):
         by_length.setdefault(len(chunk.rows), []).append(index)
     results, contexts = {}, {}
+    replays = []
     stats=dict.fromkeys(('selected_blocks','unique_objects','encoded_blocks','historical_rows','tail_rows'),0)
     for length, group in by_length.items():
         size = len(group) if max_rows is None else max(1,int(max_rows)//length)
@@ -700,6 +701,7 @@ def forward_bucketed(model, chunks, max_rows=None, **kwargs):
             indices = group[at:at+size]
             output, _, ctx, _ = forward_chunks(model,[chunks[i] for i in indices],**kwargs)
             for key,value in ctx['recompute_stats'].items():stats[key]+=value
+            if ctx.get('replay') is not None:replays.append(ctx['replay'])
             for j,index in enumerate(indices):
                 results[index] = tuple(x[j*length:(j+1)*length] for x in output)
                 contexts[index] = dict(o=ctx["o_seq"][j*length:(j+1)*length],
@@ -707,7 +709,7 @@ def forward_bucketed(model, chunks, max_rows=None, **kwargs):
     output = tuple(torch.cat([results[i][k] for i in range(len(chunks))]) for k in range(len(results[0])))
     ctx = dict(o_seq=torch.cat([contexts[i]["o"] for i in range(len(chunks))]),
                z_out=tuple(torch.cat([contexts[i]["z"][k] for i in range(len(chunks))]) for k in range(2)),
-               recompute_stats=stats)
+               recompute_stats=stats,replay=replays)
     return output,ctx
 
 

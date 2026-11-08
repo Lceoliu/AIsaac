@@ -644,3 +644,77 @@ def test_history_mode_detach_equals_no_history_and_random_unchanged():
     torch.testing.assert_close(lc, ld, rtol=0, atol=0)
     for k in gc_:
         torch.testing.assert_close(gc_[k], gd[k], rtol=0, atol=0, msg=k)
+
+
+def _replay_setup():
+    m, ref, new, old, rolls = _collect_rollout('cpu', n=21, seed=61)
+    _, _, mask = gae(rolls[0], .99, .95)
+    plan = rolls[0].block.plan(rolls[0], mask)
+    return m, [c for c in plan['chunks'] if len(c.rows) == 4]
+
+
+def _loss(out):
+    return out[1].square().mean()+out[0].float().logsumexp(-1).mean()
+
+
+def _sum_loss(out):
+    # a larger-magnitude loss for the FP32 finite difference (the mean's change is near 1 ulp)
+    return (out[1]*torch.linspace(-2, 3, len(out[1]))).sum()+out[0].float().logsumexp(-1).sum()
+
+
+def test_gradreplay_block_gradient_matches_finite_difference():
+    """B43 C arm: g_j (pool.grad after the PPO backward) is dL/dM_j: a central finite difference
+    of the loss along a random direction of every cached block value matches sum_j g_j . d_j."""
+    m, chunks = _replay_setup()
+    out, _, ctx, _ = forward_chunks(m, chunks, generator=torch.Generator().manual_seed(8), history_mode='gradreplay')
+    rp = ctx['replay']
+    assert rp is not None and sum(len(u) for u, _ in rp['chunks']) > 0
+    _sum_loss(out).backward()
+    g = rp['pool'].grad.double()
+    from isaac_bridge import block_paged
+    d = torch.randn(rp['pool'].shape, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
+    eps = 2e-2
+    ls = []
+    try:
+        if True:   # (grad enabled: the leaf path exists only in a training forward)
+            for e in (eps, -eps):
+                block_paged._LEAF_HOOK[0] = lambda ubid, v, e=e: v+e*d.to(v.dtype)
+                o, _, _, _ = forward_chunks(m, chunks, generator=torch.Generator().manual_seed(8),
+                                            history_mode='gradreplay')
+                ls.append(float(_sum_loss(o).double()))
+    finally:
+        block_paged._LEAF_HOOK[0] = None
+    fd = (ls[0]-ls[1])/(2*eps)
+    an = float((g*d).sum())
+    assert abs(an) > 1e-3 and abs(fd-an) <= 1e-2*abs(an), (fd, an)
+
+
+def test_gradreplay_aux_gradient_equals_reader_gradient_through_recomputed_blocks():
+    """B43 C arm: with every eligible block chosen (budget >= eligible), the PPO backward with
+    cached leaves + the auxiliary loss sum_j sg(g_j).f_j gives every parameter (Writer and
+    Spatial included) the gradient of the D-arm path where the Reader reads the re-encoded f_j:
+    the cached values equal f_j at fixed weights, so sg(g_j)^T df_j/dtheta is that gradient."""
+    import dataclasses
+    from isaac_bridge.block_paged import grad_replay_aux
+    m, chunks = _replay_setup()
+    cfg = m.block_memory.config
+    m.block_memory.config = dataclasses.replace(cfg, history_recompute_blocks=64)
+    try:
+        grads = []
+        for mode in ('random', 'gradreplay'):
+            m.zero_grad(set_to_none=True)
+            out, _, ctx, _ = forward_chunks(m, chunks, generator=torch.Generator().manual_seed(8), history_mode=mode)
+            _loss(out).backward()
+            if mode == 'gradreplay':
+                st = grad_replay_aux(m, [ctx['replay']], coef=1.0)
+                assert st['blocks'] > 0 and st['rows'] == st['blocks']*cfg.block_steps
+            else:
+                assert ctx['recompute_stats']['selected_blocks'] > 0
+            grads.append({k: p.grad.clone() for k, p in m.named_parameters() if p.grad is not None})
+    finally:
+        m.block_memory.config = cfg
+    gd, gc_ = grads
+    assert gd.keys() == gc_.keys()
+    assert any(k.startswith('block_memory.writer') for k in gd)
+    for k in gd:
+        torch.testing.assert_close(gc_[k], gd[k], rtol=1e-4, atol=1e-5, msg=k)

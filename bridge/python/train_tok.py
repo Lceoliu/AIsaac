@@ -3780,6 +3780,12 @@ def main(argv=None, child=None, actor=None):
                         bpt.ucount('learn_bwd_calls', 1)
                         with bpt.GpuSpan('learn_bwd'):
                             loss.backward()
+                        if args.block_history_mode == 'gradreplay':
+                            # B43 C arm: g_j from this backward; re-encode the chosen blocks with the
+                            # auxiliary loss sum_j sg(g_j).f(o_j) (no second Reader pass)
+                            hist_ = bpt.grad_replay_aux(learner_model, ctx_b.get('replay'),
+                                                        args.block_history_aux_coef, autocast)
+                            ctx_b = tk_ = None
                     else:
                         loss.backward()
                     m_ = pmark('b38:part_stats', m_)

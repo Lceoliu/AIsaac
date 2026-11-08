@@ -173,6 +173,60 @@ def clear_decode_cache():
     DECODE_CACHE.clear()
 
 
+def grad_replay_aux(model, replays, coef=1.0, autocast=None):
+    """B43 C arm, after the PPO backward of the batches whose forward_chunks_paged contexts gave
+    `replays` (their 'replay' dicts): per chunk choose 1 window-external block of largest
+    ||g_j|| (g_j = dL/dM_j, the gradient the Reader sent to its cached value) and
+    history_recompute_blocks-1 others at random (torch's RNG); re-encode the chosen blocks' raw
+    observations with the current Spatial + Writer (f_j) and backpropagate
+    coef * sum_j sg(g_j) . f_j (g summed over the batches that read the block): the first-order
+    gradient the Writer/Spatial would have received had the Reader read f_j, without a second
+    Reader pass. autocast: a context factory for the re-encoding forward.
+    Returns diagnostics: aux value, rows, ||g|| of the max and random picks, picks' ages (blocks)."""
+    import contextlib
+    stats = dict(aux=0.0, rows=0, blocks=0, g_max=[], g_rand=[], age=[])
+    if not replays:
+        return stats
+    model_cfg = model.block_memory.config
+    k = int(model_cfg.history_recompute_blocks)
+    if k <= 0:
+        return stats
+    chosen = {}                                                    # bid -> summed g
+    store = device = micro = None
+    for rp in replays:
+        g = rp['pool'].grad
+        if g is None:
+            continue
+        store, device, micro = rp['store'], g.device, rp['spatial_micro']
+        norms = g.detach().float().flatten(1).norm(dim=1).cpu().numpy()
+        picks = set()
+        for uidx, ages in rp['chunks']:
+            if not len(uidx):
+                continue
+            first = int(np.argmax(norms[uidx]))
+            pick = [first]
+            rest = np.delete(np.arange(len(uidx)), first)
+            if k > 1 and len(rest):
+                pick += rest[torch.randperm(len(rest))[:k-1].numpy()].tolist()
+            stats['g_max'].append(float(norms[uidx[first]]))
+            stats['g_rand'] += [float(norms[uidx[j]]) for j in pick[1:]]
+            stats['age'] += [int(ages[j]) for j in pick]
+            picks.update(int(uidx[j]) for j in pick)
+        for j in sorted(picks):
+            bid = int(rp['ubid'][j])
+            chosen[bid] = chosen[bid]+g[j] if bid in chosen else g[j].clone()
+    if not chosen:
+        return stats
+    bids = np.fromiter(chosen.keys(), np.int64, len(chosen))
+    G = torch.stack([chosen[int(b)] for b in bids]).detach().float()
+    with (autocast() if autocast is not None else contextlib.nullcontext()):
+        f, rows = encode_blocks(model, store, bids, device, micro)
+    aux = coef*(G*f.float()).sum()
+    aux.backward()
+    stats.update(aux=float(aux.detach()), rows=rows, blocks=len(bids))
+    return stats
+
+
 def update_report():
     """The per-update counters as progress.csv columns (all present on every row)."""
     GpuSpan.drain()
@@ -1140,6 +1194,7 @@ SPATIAL_PACKED = os.environ.get('ISAAC_SPATIAL_PACKED', '1') == '1'
 
 
 HISTORY_MODES = ('random', 'detach', 'gradreplay')
+_LEAF_HOOK = [None]
 
 
 def encode_blocks(model, store, bids, device, spatial_micro):
@@ -1285,12 +1340,33 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     # ---- old bank values (detached pages) with differentiable historical replacements
     n_old = np.array([len(p['bid']) for p in parts], np.int64)
     old_vals = None
+    replay = None
     old_ends = np.concatenate([p['ends'] for p in parts]) if B else np.empty(0, np.int64)
     if n_old.sum():
         all_bid = np.concatenate([p['bid'] for p in parts])
         ubid, binv = np.unique(all_bid, return_inverse=True)
         pool = _to(store.blocks(ubid), device)
         source = binv.copy()
+        if history_mode == 'gradreplay' and train_history and torch.is_grad_enabled():
+            # B43 C arm: every window-external block value of this batch is a gradient leaf (a
+            # fresh device copy of the pages: nothing else is kept alive); the PPO backward
+            # leaves g_j = dL/dM_j in pool.grad for grad_replay_aux.
+            # Only window-external reads (the blocks the random arms may re-encode) go through the
+            # leaf, so g_j has the D arm's meaning; reads of a block still inside a chunk's K/V
+            # window use the detached copy.
+            leaf = pool.detach()
+            if _LEAF_HOOK[0] is not None:   # (tests: finite differences on the leaf values only)
+                leaf = _LEAF_HOOK[0](ubid, leaf)
+            leaf = leaf.detach().requires_grad_(True)
+            groups, at = [], 0
+            for p in parts:
+                nb = len(p['bid'])
+                elig = np.flatnonzero(p['ends'] <= p['step']-cfg.window)
+                groups.append((binv[at+elig], (p['step']-p['ends'][elig])//cfg.block_steps))
+                source[at+elig] += len(ubid)
+                at += nb
+            pool = torch.cat((pool.detach(), leaf))
+            replay = dict(pool=leaf, ubid=ubid, store=store, chunks=groups, spatial_micro=spatial_micro)
         if hist_written is not None:
             pool = torch.cat((pool.to(hist_written.dtype), hist_written))
             at = 0
@@ -1354,6 +1430,8 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     if encoded is not None:
         ctx['encoded'] = encoded
         clock.mark('main_spatial')
+    if replay is not None:
+        ctx['replay'] = replay
     outputs = model(batch, need_vg=True, temporal=ctx)
     clock.mark('reader_heads')
     return outputs, batch, ctx, selected
