@@ -448,6 +448,28 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "x_new_over_x_old": 0.104,
     "meets_target": false
   },
+  "glue_layer_result": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B42续",
+    "commits": ["b577374", "1b0ab07", "2bd8bf7", "2a92e9f", "17947e9"],
+    "equivalence_gates": {"local_cpu": "116 passed / 33 skipped", "rtx4090": "155 passed / 0 failed / 0 skipped", "fp32_tolerance": 1e-5},
+    "steady_recompiles": 0,
+    "warm_up": {"graphs": 51, "seconds": 599, "before_games": true},
+    "short_profile_u2_u6_median": {
+      "before_f0": {"collect_s": 56.0, "update_s": 93.6, "x_real_time": 48.4, "infer_ms": 21.8, "learner_spatial_main_plus_history_s": 22.0, "gpu_util": 0.287},
+      "item1_only_f1": {"collect_s": 57.0, "update_s": 94.5, "x_real_time": 48.5, "infer_ms": 22.7, "learner_spatial_main_plus_history_s": 22.1, "gpu_util": 0.333},
+      "all_glue_f2": {"collect_s": 42.9, "update_s": 82.7, "x_real_time": 38.8, "infer_ms": 15.8, "learner_spatial_main_plus_history_s": 16.4, "gpu_util": 0.186,
+                      "note": "u2/u4 update spikes (146 s, 184 s) not yet located; not recompiles"}
+    },
+    "gpu_kernels_per_call": {
+      "actor_spatial": {"before": 300, "after": 156},
+      "learner_spatial_512_fwd": {"before": 299, "after": 156},
+      "learner_spatial_512_fwd_bwd": {"before": 750, "after": 565},
+      "reader_step": 203, "writer": 91, "heads_sampling": 80,
+      "actor_whole_step_graph_body": 489,
+      "actor_step_ms_standalone": {"before": 7.20, "after": 4.05}
+    },
+    "still_far_from_x_old": true
+  },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
   "spatial": {

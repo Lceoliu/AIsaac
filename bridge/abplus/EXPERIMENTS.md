@@ -8613,8 +8613,92 @@ CF分支单独计费/计算量：r8 90296dec/3.344296小时；r1 126554/4.687185
 - 内存驻留（u40，PagedStore）：K/V页345,692行×(16 KB bf16 K/V+4 KB fp32 latent)≈7.1 GB；原始观测531,975条×约10.6 KB（visible帧+pending，未压缩）≈5.6 GB；块值15,303×8 KB≈0.12 GB。u21→u40每增加1条伤害教师记录约增40.5行K/V（0.83 MB）+65条原始观测（0.69 MB），即约1.5 MB/记录；teach-buffer 60000上限≈90 GB。原因是每条教师记录要保留128步窗口K/V和最近256块的原始源（历史重算），页共享已把128行/记录降到约40行。瘦身方向（未实现）：原始观测LZ4（预计2–3×）并落NVMe mmap（60000条约41 GB），K/V页也需落盘或分级（约50 GB）；learner每个update随机读约3 GB。
 - 短profile（GPU同步计时，5–6个update，`prof-{b,c,d,e}.stdout`的`B42 timing`行，单个rollout）：
   - actor每次调用（约4–5k次/rollout，含教师lane合并）：解码+Spatial 3.5–5.4 ms，slot gather+Reader graph+commit 4.4–5.6 ms，heads+采样2.6–2.9 ms，页写入1.25–1.4 ms；host解码本身0.21 ms/16行（本地CPU），不是瓶颈。
-  - learner每次update前向（约13.3万主行+11万历史行）：主批解码6–7.5 s，主Spatial 8.5–10.6 s，Reader+heads 6.5–7.6 s，页gather/prefix/bank 6.5–7.6 s，历史行组装2.8 s，历史Spatial+Writer 9–11.7 s，其余为反向（含checkpoint重算）；每行实际token约40.5，批内填充后61–87。nvidia-smi GPU利用率约31%，有效算力约2–3 TFLOPs：瓶颈是launch/Python而非算力。本地CPU算子计数（生产尺寸）：encode_block约1,360个aten算子/次，Reader约1,200个/次，2个chunk前向+反向约1.5万个；512行Spatial微批下每个8192行micro约7万个launch。
+  - learner每次update前向（约13.3万主行+11万历史行）：主批解码6–7.5 s，主Spatial 8.5–10.6 s，Reader+heads 6.5–7.6 s，页gather/prefix/bank 6.5–7.6 s，历史行组装2.8 s，历史Spatial+Writer 9–11.7 s，其余为反向（含checkpoint重算）；每行实际token约40.5，批内填充后61–87。nvidia-smi GPU利用率约31%，有效算力约2–3 TFLOPs：瓶颈是launch/Python而非算力。4090实测GPU kernel数（B42续，`b42_kernels.py`，真实输入）：actor encode_block 300个/次（bf16，16行），learner 512行Spatial微批前向299、前向+反向750，Reader单步203，Writer 91，heads+采样80；此前写的本地CPU aten算子计数（1,360/1,200）是CPU侧op估算，以此为准。
   - 历史重算价格（prof-e，`--block-history-blocks 0`，仅诊断）：update 55–60 s，对比4块的prof-c 87–89 s，即默认4块约占update的30%（约25–30 s/update）。
   - 第1步（训练微批2048）update 77–85 s，收益小且OOM，已退回；第3步实体桶在同卡竞争下未见actor单次时延下降（graph capture数20→42）。
 - 等价门：本地CPU全部测试115 passed / 29 skipped（新增10项CPU+2项CUDA）；4090 150 passed、0 skipped（每次代码上卡前重跑）。
 - 未完成：Spatial/Writer/Reader chunk的torch.compile固定桶快路径、varlen打包、actor slot gather/scatter纳入graph、教师记录内存瘦身（LZ4+NVMe）均未实现；X_new正式40+40窗口未完成。4090已空闲。
+
+#### B42续：新编码器胶水层（静态形状、无host同步、算子融合，2026-11-08）
+
+##### 实验目的
+
+新输入每行token数不比旧模型多，慢在实现：learner Spatial按FLOP约3 s/update、实测约22 s；actor单次推理约16 ms里大半是kernel launch与Python。本段把StructuredSpatial路径做到旧路径的实现标准（静态形状、无host同步、算子融合），不动历史块重算（默认4块），不改任何输入/模型/教师预算，不重启正式整跑。
+
+##### 实验方法
+
+- 五项各自单独提交（`exp/block-memory-v1`）：
+  1. b577374：解码去同步+固定桶。生产路径（actor与learner）实际走host解码`decode_frame_host`→`from_host`；GPU `decode_frame`不在生产路径上，也一并改成接收host计数、不读回设备。桶集body/local {1,2,4}、实体{16,32,64,128}、库存32、槽位16，超过集合时翻倍，从不截断。合法性检查只在host读24字节帧头（`check_frames`/`check_headers`）。`encode_sorted`改用host计数排序分桶，去掉`.cpu()`。另修了一个潜在崩溃：FX-tracing标志是进程全局的，learner线程编译时actor线程的已编译调用会报错（prof-f0首跑在u2崩溃，见`failed/prof-f0-fxrace`），改为`error_on_nested_fx_trace=False`。
+  2. 1b0ab07：位平面解包按body桶用`torch.compile(dynamic=False, fullgraph=True)`编译，只有batch维是符号维。GPU解码也走这个解码器。
+  3. 2bd8bf7：StructuredSpatial整体编译，每个模式12个变体（实体4桶×body 3桶）；线性层仍走cuBLAS。
+  4. 17947e9（按协调方追加要求重做）：learner改为逐行打包，详见下文“逐行打包”一条。
+  5. 2a92e9f：actor整步进一张CUDA graph，键为（行容量, 各类宽度, autocast, greedy），LRU 128。graph内包含解码、编译后的Spatial、slot gather、Reader、本步K/V/latent写入、heads和Gumbel采样（含replay掩码）。输入一次H2D，输出一次同步读回。Writer（完成块）、reset和写页由host决定，留在graph外。多arena合并批（主+教师lane）仍走原路径。
+- 逐行打包（第4项）：
+  - 每个token排序后的微批改成逐行打包，所有索引算术在host上做，一次H2D。
+  - 逐token部分只算真实token：body MLP、local conv、实体/库存/槽位线性层与嵌入、LayerNorm、qkv、proj、ff。
+  - 注意力布局按每行真实token总数T分桶，T ∈ {40,48,64,96,128,192,256,512}，超过时翻倍；早期rollout每行T在36–67之间。learner编译变体数等于T桶数。
+  - 各列表补到≥2项（落到垃圾行），批补到≥2行，避免dynamo把0或1特化成常量。
+- 稳态0重编译所需的修正（都在4/5里）：
+  - 关闭FX graph cache：缓存的图带着预热batch的范围守卫，例如2≤batch≤19。
+  - 关闭inductor shape_padding：pad_mm会加193≤batch之类的守卫。
+  - 编译输入一律是连续、offset为0的普通张量：dynamo会守卫dispatch key和storage offset。
+  - 捕获前清autocast缓存，而不是用cache_enabled=False：后者会改变dynamo的全局状态。
+  - 预热覆盖learner的grad / no_grad / inference_mode三种模式，以及actor参数在活跃和冻结（教师代参数）两种状态下的变体。
+  - 预热放在启动游戏之前：首个冷预热用了20分钟，游戏因此断开连接，进程挂起，见`failed/prof-f2-hang`。
+- 等价门：
+  - FP32编译/graph对eager ≤1e-5（输出和全部梯度），BF16用现有graph测试容差。新增三个测试：`test_compiled_spatial_matches_eager_fp32_and_bf16`、`test_actor_step_graph_matches_eager_slot_actor`（70步，含reset、块边界、混合replay、fork/restore，比较输出、arena行和页）、`test_packed_learner_spatial_matches_padded`。
+  - 两项旧测试的期望随桶集更新，没有放宽容差：`test_one_copy_collation_matches_device_decode` 和 `test_host_decode_complete_ragged_and_dtypes`。现在与旧精确桶的设备解码在公共槽位上逐值比较，并比较掩码总数。
+  - `test_cuda_policy_heads_fp32_and_training` 原先因batch被特化成常量而触发约束错误，改用`maybe_mark_dynamic`修复。
+  - 结果：本地116 passed / 33 skipped；4090上完整胶水树155 passed、0 failed、0 skipped（`tests-f2.log`）。
+- 度量：
+  - 4090短profile与B42 prof-b..e同口径：`ISAAC_BLOCK_TIMING=1`，6个update，单rollout，汇总脚本`bridge/ops/b42_prof.py`，取u2–u6的中位数。各列分别是：
+    - prof-f0：修前（6491108，加了FX修复和dump钩子）；
+    - prof-f1：只加第1项；
+    - prof-f2：全部胶水。
+  - kernel数：`bridge/ops/b42_kernels.py`在模型单独运行时测，不带游戏，输入为prof-f0保存的真实actor 16行和learner 512行。每部分先单独预热，再在torch.profiler下数一次调用的CUDA kernel，时间取20次同步调用的中位数。graph回放部分在它所捕获的body上数kernel：直接profile回放会让CUPTI卡住数分钟。
+  - 稳态重编译用`steady_check.py`在4090上核对：actor 1/3/5/9/16行、教师lane、合并路径、learner 7/100/512行微批，三种模式全部0次。
+
+##### 实验结果
+
+| 指标 | 修前 f0 | 第1项 f1 | 全部胶水 f2 |
+|---|---:|---:|---:|
+| collect_s 中位 | 56.0 | 57.0 | 42.9 |
+| update_s 中位 | 93.6 | 94.5 | 82.7 |
+| ×实时（u2–u6） | 48.4 | 48.5 | 38.8 |
+| actor infer_ms 中位 | 21.8 | 22.7 | 15.8 |
+| learner 主Spatial s/update | 11.3 | 10.8 | 8.6 |
+| learner 历史Spatial+Writer s/update | 10.7 | 11.3 | 7.8 |
+| learner 主批解码 s/update | 10.7 | 11.1 | 11.6 |
+| actor单次分段 ms | 解码+Spatial 5.4 / slot+Reader 6.0 / heads 2.9 / 页 1.5 | 5.6 / 6.2 / 3.1 / 1.6 | host解码1.3 / 整步graph 2.3–2.5 / Writer+commit 1.9–2.0 / 页 1.5–1.9（稳态u4、u6）；合并批走原eager路径时每次17–34 ms |
+| GPU利用率（后60%采样均值） | 28.7% | 33.3% | 18.6% |
+| 稳态重编译 | — | — | 0（预热51张图，600 s，在游戏启动前） |
+
+| kernel / 次（4090，真实输入） | f0 | f1 | f2 |
+|---|---:|---:|---:|
+| actor Spatial（bf16推理，16行） | 300（2.57 ms） | 290 | 156（2.43 ms） |
+| learner Spatial 512行 前向 | 299（8.48 ms） | 289（9.25 ms） | 156（6.38 ms） |
+| learner Spatial 512行 前向+反向 | 750（19.5 ms） | 778（24.3 ms） | 565（15.6 ms） |
+| learner 生产路径 encode_sorted 前向 / 前向+反向 | 与上行相同 | 与上行相同 | 188（7.40 ms）/ 608（16.2 ms）（逐行打包） |
+| Reader 单步 | 203（1.32 ms，graph） | 203 | 203（已在整步graph内） |
+| Writer | 91（2.24 ms，eager） | 91 | 91（eager，graph外） |
+| heads+采样 | 80（1.47 ms，eager） | 80 | 80（已在整步graph内） |
+| actor整步 | eager+Spatial/Reader两张graph（7.20 ms） | 7.22 ms | 一张graph回放489个kernel（4.05 ms） |
+
+- 逐update数据（`prof-f2/progress.csv`）：update为59.8 / 145.7 / 79.8 / 183.6 / 82.7 / 70.1 s。u2和u4的update尖峰（u_ppo 119 s、173 s）不是重编译（block_steady_compiles全程为0），也不在已计时的前向阶段（这两个update的前向阶段合计30.5 s和43.1 s，均低于f0的约50 s）。尚未定位，嫌疑点：
+  - 反向；
+  - actor为新键捕获graph时learner在等capture许可（捕获数0→5→8→18）；
+  - CF搜索期间合并批走eager路径，单次17–34 ms，且与learner争GPU。
+
+  没有尖峰的u6：collect 39.6 s、update 70.1 s、62.0×，与f0的u6（70.3 s、61.9×）持平。
+- 结论：
+  - 胶水层把kernel数砍掉约一半（Spatial 300→156，learner前向+反向750→565），actor整步从约16 ms降到约7 ms，learner的Spatial前向（主批+历史）从约22 s/update降到约16 s/update。
+  - 6个update的短profile总体×实时从48.4变成38.8，被u2/u4两次未定位的update尖峰拉低。与X_old 427×仍差一个数量级。按协调方要求不再加项，先报告。
+  - 第1项单独对learner为负（固定桶补位让每行token从54增到96，fwd+bwd +25%），由第4项的逐行打包收回。
+  - learner主批解码（约11 s/update，host侧）和历史重算（约30%）这次没有动。
+- 失败/中间运行（`failed/`）：
+  - `prof-f0-nodir`：dump目录未建；
+  - `prof-f0-fxrace`：FX全局标志竞态，u2崩溃；
+  - `prof-f2-hang`：20分钟冷预热后游戏断连，进程挂起；
+  - `prof-f2-recompile`：learner inference_mode变体没有预热，u1里持续编译；
+  - `prof-f2-midcompile`：教师代冻结参数、slab视图offset、SpatialEncoderGraph的autocast缓存导致运行中重编译，共7次。
+- 4090已空闲。
