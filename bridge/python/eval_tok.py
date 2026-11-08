@@ -118,7 +118,7 @@ def apply_ablation(model, what):
 
 
 def policy_actions(model, rows, pending, act_idx, device, greedy=False, mem_h=None, mem_reset=None, t_state=None,
-                   block_state=None):
+                   block_state=None, memory_clear='', memory_clear_fill='zero'):
     """The policy's actions [k, heads] (numpy) for records `rows` of workers act_idx (a list, distinct) with their
     actions under way: memory checkpoints read and update the workers' GRU states mem_h (zero where mem_reset, which is
     then cleared); temporal checkpoints (B30) step the workers' slots of t_state (TemporalState; an episode's first
@@ -132,10 +132,14 @@ def policy_actions(model, rows, pending, act_idx, device, greedy=False, mem_h=No
     b = to_batch(rows, pending, device)
     with torch.inference_mode():
         if block_state is not None:
-            ctx = dict(states=[block_state[int(i)] for i in act_idx])
+            from isaac_bridge.block_memory import clear_memory_blocks, restore_memory_blocks
+            original = [block_state[int(i)] for i in act_idx]
+            # B43 --memory-clear: the action reads cleared blocks; the stored state keeps the originals
+            read = [clear_memory_blocks(s, memory_clear, memory_clear_fill) for s in original]
+            ctx = dict(states=read)
             result = model.act(b, greedy=greedy, temporal=ctx)
-            for worker,state in zip(act_idx,ctx['states_out']):
-                block_state[int(worker)] = state
+            for worker, state, r_, o_ in zip(act_idx, ctx['states_out'], read, original):
+                block_state[int(worker)] = restore_memory_blocks(r_, state, o_)
             return result[0].cpu().numpy()
         if mem_h is not None:   # (memory) the workers' states in, the new ones kept
             ai = torch.tensor(act_idx, dtype=torch.int64, device=device)
@@ -184,6 +188,12 @@ def main():
                         'tok_floor.character_of_seed). Default: Isaac')
     p.add_argument('--item-slots', type=int, default=None,
                    help="A28: held-item token slots of the evaluated model (default: the checkpoint's)")
+    p.add_argument('--memory-clear', default='',
+                   help='B43 block-memory checkpoints: older:K clears every complete block older than the newest K '
+                        'at each action, recent:K the newest K (the stored memory is kept; only what the action '
+                        'reads). Compare two evaluations of the same --seeds with bridge/ops/b43_memclear_compare.py')
+    p.add_argument('--memory-clear-fill', default='zero', choices=('zero', 'random'),
+                   help='B43: cleared blocks become zero, or a fixed random block (N(0, std of the value))')
     p.add_argument('--ablate', default='', choices=ABLATE,
                    help='A28: evaluate with the item tokens / the global token / both removed (apply_ablation)')
     p.add_argument('--no-pedestals', type=int, default=0,
@@ -289,6 +299,10 @@ def main():
         block_state = [model.block_memory.empty(device=device) for _ in range(n)]
         info['block_memory'] = True
         info['block_config'] = dict(model.config['block_config'])
+        info['memory_clear'] = args.memory_clear
+        info['memory_clear_fill'] = args.memory_clear_fill
+    elif args.memory_clear:
+        raise SystemExit('--memory-clear needs a block-memory checkpoint')
     if model is not None and getattr(model, 'tatt', None) is not None:
         from isaac_bridge.tok_policy import TemporalState
         t_state = TemporalState(model, n, device, torch.float32 if device.type == 'cpu' else None)
@@ -374,7 +388,8 @@ def main():
                                        + [np.zeros(len(act_idx), np.int64)] * (nh - 2), 1)
                 else:   # (memory: the workers' GRU states; B30 temporal: their temporal slots)
                     actions = policy_actions(model, rows[act_rows], pending[act_idx], act_idx, device, args.greedy,
-                                             mem_h, mem_reset, t_state, block_state)
+                                             mem_h, mem_reset, t_state, block_state,
+                                             args.memory_clear, args.memory_clear_fill)
                 if mem_dump is not None:
                     o_d = t_state.prev_o.index_select(0, torch.tensor(act_idx, dtype=torch.int64, device=t_state.prev_o.device))
                     o_d = o_d.float().cpu().numpy().astype(np.float16)

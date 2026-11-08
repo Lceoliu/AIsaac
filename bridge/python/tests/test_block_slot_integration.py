@@ -5,6 +5,7 @@ forward_chunks over EpisodeMemory) is the reference; SlotBlockActor / PagedSnaps
 forward_chunks_paged is the production path.
 """
 import copy
+from dataclasses import replace as dataclasses_replace
 import gc
 
 import numpy as np
@@ -718,3 +719,25 @@ def test_gradreplay_aux_gradient_equals_reader_gradient_through_recomputed_block
     assert any(k.startswith('block_memory.writer') for k in gd)
     for k in gd:
         torch.testing.assert_close(gc_[k], gd[k], rtol=1e-4, atol=1e-5, msg=k)
+
+
+def test_memory_clear_reads_cleared_blocks_and_keeps_stored_ones():
+    """B43 eval hook: older:K / recent:K clear what an action reads (zero or a fixed random block);
+    the stored state keeps the original values and any block written by the step."""
+    from isaac_bridge.block_memory import MemoryBlock, clear_memory_blocks, restore_memory_blocks
+    m = make_policy('cpu').eval()
+    st = m.block_memory.empty()
+    blocks = tuple(MemoryBlock(end_step=10*i+9, value=torch.full((2, 3), float(i+1)), writer_version=0,
+                               source_versions=()) for i in range(5))
+    st = dataclasses_replace(st, blocks=blocks)
+    older = clear_memory_blocks(st, 'older:2')
+    assert [float(b.value.abs().sum()) for b in older.blocks] == [0, 0, 0, 24, 30]
+    recent = clear_memory_blocks(st, 'recent:2')
+    assert [float(b.value.abs().sum()) for b in recent.blocks] == [6, 12, 18, 0, 0]
+    rnd = clear_memory_blocks(st, 'recent:1', 'random')
+    assert torch.equal(rnd.blocks[-1].value, clear_memory_blocks(st, 'recent:1', 'random').blocks[-1].value)
+    assert not torch.equal(rnd.blocks[-1].value, blocks[-1].value)
+    assert clear_memory_blocks(st, '') is st
+    new = dataclasses_replace(older, blocks=older.blocks+(MemoryBlock(59, torch.full((2, 3), 9.), 0, ()),))
+    kept = restore_memory_blocks(older, new, st)
+    assert [float(b.value[0, 0]) for b in kept.blocks] == [1, 2, 3, 4, 5, 9]

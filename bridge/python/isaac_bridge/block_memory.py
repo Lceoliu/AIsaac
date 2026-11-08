@@ -464,6 +464,44 @@ class TeacherGenerations:
         self.refs[slot] -= 1
 
 
+def clear_memory_blocks(state, spec, fill='zero'):
+    """B43 memory-clearing evaluation: the state an action reads with some complete blocks' values
+    replaced (the stored state is not changed). spec 'older:K': every block older than the newest
+    K; 'recent:K': the newest K. fill 'zero' or 'random' (a fixed N(0, std of the value) draw
+    seeded by the block's end step, the same in every run). Returns state when spec is empty."""
+    if not spec:
+        return state
+    kind, _, k = spec.partition(':')
+    k = int(k)
+    if kind not in ('older', 'recent') or k < 0:
+        raise ValueError(f'memory clear {spec!r}: older:K or recent:K')
+    if fill not in ('zero', 'random'):
+        raise ValueError(f'memory clear fill {fill!r}: zero or random')
+    n = len(state.blocks)
+    cut = set(range(0, max(0, n-k))) if kind == 'older' else set(range(max(0, n-k), n))
+    if not cut:
+        return state
+
+    def cleared(i, b):
+        if i not in cut:
+            return b
+        if fill == 'zero':
+            return replace(b, value=torch.zeros_like(b.value))
+        g = torch.Generator(device='cpu').manual_seed(int(b.end_step) + 1)
+        noise = torch.randn(b.value.shape, generator=g, dtype=torch.float32)
+        return replace(b, value=(noise * b.value.float().std()).to(device=b.value.device, dtype=b.value.dtype))
+    return replace(state, blocks=tuple(cleared(i, b) for i, b in enumerate(state.blocks)))
+
+
+def restore_memory_blocks(read_state, new_state, original):
+    """After an action read a cleared state, the stored state keeps the original values of the blocks
+    it read (matched by end step); a block written by this step is kept as written."""
+    if new_state is None or read_state is original:
+        return new_state
+    by_end = {int(b.end_step): b for b in original.blocks}
+    return replace(new_state, blocks=tuple(by_end.get(int(b.end_step), b) for b in new_state.blocks))
+
+
 def warm_start_spatial(model, old_state):
     raise ValueError('visible-v1 requires fresh random initialization; C99/legacy warm-start is forbidden')
 
