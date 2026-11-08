@@ -8860,3 +8860,111 @@ CF分支单独计费/计算量：r8 90296dec/3.344296小时；r1 126554/4.687185
 - A臂update 63–73 s，中位69.3 s，比B42 prof-e旧代码的`--block-history-blocks 0`（55–60 s）略高；本轮代码多了胶水层与计时。显存峰值A 17.6 GB、B/C 18.3 GB、D 20.3 GB，C臂的叶子没有增加显存。
 - C臂诊断：‖g_j‖很小，每chunk最大块的中位为1.5–2.0e−7，update内最大值在2.8e−6到1.0e−5之间（u2–u7）；随机块的中位（1.4–2.0e−7）与最大块的中位几乎相同，说明块间梯度分布较均匀，“按最大梯度选块”与随机选块在这些早期update里差别很小。hist_aux_loss在±2e−3量级，Writer梯度范数中位0.0143（D为0.0094）。这些只是6个update的早期数值，不代表训练效果。
 - 失败或中间运行：无。4090已空闲。
+
+### B44 速度改造第1步 Packed Learner：learner按part执行（2026-11-09）
+
+#### 实验目的
+
+同配置4090上，旧架构c45a583每个update 3.9 s，新架构prof-f4为94.9 s。多出的约91 s中，约八成来自实现层：learner按chunk精确长度分组，每个update约360次forward_chunks_paged，一个8192行的part被拆成约27次调用，每次都重复host工作，还要在零碎的小批上跑Spatial、Writer和Reader。本步把learner改成按part执行：episode和chunk的时间边界只用掩码与元数据表达，不再决定Python调用次数。不改输入、模型定义和教师预算，micro仍为8192，不做训练、四臂消融或Memory Gradient Replay。验收门：固定输入update < 25 s，完整短profile的update中位数 < 25 s。
+
+#### 实验方法
+
+- 新路径`isaac_bridge/block_learner.py`的`forward_packed`：train_tok每次forward_bucketed（PPO part、开头的value重算、教师target）对应一次执行。`ISAAC_PACKED_LEARNER=0`回到逐长度旧路径，旧路径作为等价性对照。
+  - host每个part只做一次：chunk快照、历史块选择（生成器的调用顺序与旧路径相同）、帧解码、Spatial打包表、页gather（窗口K/V、开放尾巴latent、块值）、Writer和Reader的全部索引与元数据，一起写进一块持久pinned staging，一次H2D拷贝。staging为两块交替复用的buffer，按需扩容，调用内不再pin_memory()新分配。
+  - 帧解码只取真实条目（compact，不按桶补齐）。主行每个update解码一次，与B42 fix 3相同；同一part的新块一次联合解码。历史块的源解码跨rollout缓存，块被释放时剔除，上限6000块。
+  - Spatial：主行、历史重算块的源行、开放尾巴源行并成一批，按行的真实token总数分桶，每桶一次编译调用。
+  - Writer：历史块和各chunk新写出的块一次调用完成。
+  - Reader：chunk长度pad到T∈{1,32,64,128}，每个part最多4次Reader调用。
+  - 反向仍然是每个part一次。B43的gradreplay/detach在新路径上做了等价测试，过门以random（默认）进行。
+- 注意力：T>1的桶用FlexAttention。4090上的torch是2.7.1，没有varlen和flash_attn，未升级torch。
+  - 文档掩码：每个chunk是batch中的独立一行，有自己的K/V前缀、bank和步号，同桶不同片段互不可见。padding位置的步号晚于该行所有真实步，因果步掩码已对真实query隐藏它们。padding位置不写块，其输出丢弃。
+  - 块可见表：每行bank token的块结束步，query只读结束步早于自己、且在memory_blocks块以内的块，与long_mask相同，未来记忆不会暴露给过去的决策。
+  - 短窗口的相对位置偏置和bank的年龄偏置在kernel内按(行, query, key)计算。原SDPA路径要物化[B,H,Q,K]偏置及其梯度，这是旧反向的主要开销。
+  - SDPA路径保留（`ISAAC_PACKED_READER=sdpa`）作为对照。
+- Flex在torch 2.7.1/4090上的三处处理：
+  - Triton tile改小：默认head dim 64的tile要约115 KB共享内存，超过4090的101 KB。
+  - 不用`create_block_mask(_compile=True)`：形状变化后它返回未初始化的块计数（kv_num_blocks为9.4亿、负的full计数），导致读错值，有时非法访存。BlockMask改为由稠密掩码在128×128 tile级用普通张量运算构建（`BlockMask.from_kv_blocks`）。
+  - 前缀和bank长度向上取整到128的倍数，单行桶补成2行，避免反复特化编译。Flex kernel在开局前预热（4个形状×3种模式）。
+- Spatial checkpoint：先关掉checkpoint测试，一个part的主行加历史行约1.6万行、约70万token，在第一个训练part就OOM（已分配23.04 GB）。因此改为每次编译调用最多4096行，各自做非重入checkpoint。2048行和8192行的速度只差约1–1.5 s，显存分别为5.5 GB和12.3 GB，取4096。
+- 固定输入：在prof-b44-old运行中（旧路径，代码与本步相同）用`ISAAC_LEARNER_DUMP`保存第3个update全部learner输入，包括21次forward_bucketed调用、1,221个chunk、引用到的页存储和起始权重。`bridge/ops/b44_learner_bench.py`回放这些输入：
+  - 不带梯度的调用只做前向；带梯度的调用做前向、固定替代loss、反向、clip和Adam。
+  - 每段都做GPU同步，每个rep都像新update一样重新解码，取第2和第3个rep。
+  - 两条路径用同一份输入，排除episode长度分布的差异。
+- 完整短profile：与prof-f4同配置，16 workers、rollout 32768、micro 8192、cf 6/180、teacher share 0.1，代码为packed默认。
+
+#### 实验结果
+
+固定输入learner-only（同一个dump：21次调用、15个带梯度的part、132,966个Reader行；GPU同步计时，取rep 1–2）：
+
+| 路径 | update合计 s | 带梯度前向 | 不带梯度前向 | 反向 | clip+opt | 其中host打包 | Reader/Spatial/Writer调用 | 峰值显存（已分配/保留） |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| 旧：逐长度（B42） | **45.4** | 19.7 | 3.0 | 22.4 | 0.18 | — | 303 / 813 / 427 | 10.7 / 11.8 GB |
+| packed，SDPA Reader，checkpoint 4096 | 24.5 | 6.8 | 1.4 | 16.1 | 0.16 | 5.5 | 75 / 131 / 21 | — |
+| packed，Flex，不checkpoint | OOM | | | | | | | 23.04 GB已分配 |
+| packed，Flex，checkpoint 2048 | 13.6–14.2 | 7.2 | 1.5 | 4.8 | 0.16 | 5.6 | 75 / 183 / 21 | 5.5 / 7.8 GB |
+| packed，Flex，checkpoint 4096 | 13.0–13.7 | 6.6 | 1.5 | 4.7 | 0.15 | 5.5 | 75 / 131 / 21 | 7.7 / 12.7 GB |
+| packed，Flex，checkpoint 8192 | 12.1 | 6.0 | 1.4 | 4.6 | 0.14 | 5.1 | 75 / 99 / 21 | 12.3 / 15.6 GB |
+| **最终：packed，Flex，checkpoint 4096，compact解码** | **10.5–11.0** | 4.7 | 1.0 | 4.7–5.1 | 0.14 | 2.9–3.2 | 75 / 131 / 21 | 7.4 / 11.6 GB |
+
+- 固定输入门：10.5–11.0 s < 25 s，**过门**，约为旧路径的1/4。
+- SDPA与Flex的差别几乎全在反向（16.1 s对4.7 s）：旧反向的主要开销是`memory_age[:,age]`和`short_relative[:,distance]`这两张[B,H,Q,K]偏置及其梯度。
+- 每个8192行part最多4次Reader调用（T=1/32/64/128）。整个update共21次forward_bucketed调用（4次开头value重算、15个PPO/教师合并part、2次教师target），Reader合计75次，低于每update 303次，但高于你提的15–30次目标：桶数×调用数下限约为21×3.6。
+- padding：Spatial注意力布局的token由13.90M降到10.98M（真实token 10.1M，padded/real 1.35→1.09）；Reader行132,966→143,802（1.08）。B42口径的`tokens_padded/real 2.63`统计的是合批后按最宽行补齐的宽度，新路径不再构造这种补齐批，所以该口径不再适用。
+
+等价性（同一dump的前3个训练part，同一起始权重，同一组历史抽样；旧路径先跑，两者同进程）：
+
+| 精度 | 输出max abs diff（logits / value / danger / value_global） | loss diff | 全部梯度相对差（L2） |
+|---|---|---:|---:|
+| FP32，packed Flex对旧 | 2.4e-7 / 6.0e-7 / 1.5e-7 / 2.7e-7 | ≤6e-8 | 6.2e-7 |
+| FP32，packed SDPA对旧 | 2.4e-7 / 4.8e-7 / 1.5e-7 / 2.7e-7 | 0 | 6.2e-7 |
+| BF16（训练精度），packed Flex对旧 | 3.4e-4 / 1.3e-3 / 2.7e-4 / 7.8e-4 | ≤7.6e-6 | 1.8–2.0e-3 |
+
+BF16下单个参数相对差最大的是Writer `self_attn.q`（梯度范数约1e-5，几乎为零的参数，BF16量级噪声），SDPA对照的表现相同。
+
+完整短profile（prof-b44c，代码同最终，16个update，19.42游戏小时）：
+
+| | 旧（prof-f4，u2–u14） | 旧同代码（prof-b44-old，u2–u6） | **新（prof-b44c，u2–u14）** |
+|---|---:|---:|---:|
+| update_s中位 | 94.9 | 95.5 | **22.2**（u2–u16：23.0，最大24.5） |
+| collect_s中位 | 48.0 | 53.4 | 46.3 |
+| 每轮wall中位 | 95.3 | 95.9 | 47.9 |
+| ×实时 | 47.6 | 46.7 | **93.5** |
+| 游戏小时（窗口内） | 15.78 | 6.07 | 15.78 |
+| u_ppo / 前向 / 反向GPU | — / — / — | 84.4 / 47.6 / 36.0 | 16.4 / 9.9 / 8.5 |
+| u_recompute | — | 9.6 | 3.2 |
+| learner线程CPU s | — | 43.4 | 13.0 |
+| 其中host打包 s | — | — | 8.2 |
+| Reader / Spatial / Writer调用 | — | 356 / 880 / 472 | 75 / 107 / 21 |
+| Spatial token padded/real | — | 1.35 | 1.09 |
+| 显存保留（中位/最大） | 20.06（峰值） | 20.4 / 20.7 | 20.2 / 21.2 |
+| steady重编译 | 0 | 0 | 0 |
+
+- 完整profile门：update中位22.2 s（u2–u14），u2–u16为23.0 s，**过门**。现在每轮由collect决定（46 s），×实时由47.6提到93.5。
+- 余量不大且有上升趋势：u3–u7为20–22 s，u11–u16为23–24.5 s。历史重算行和host打包时间随episode变长缓慢增长（host打包5.7→8.9 s）。
+- 在线情况下的update约是固定输入的2倍：learner和actor线程在同一进程里争GIL和GPU。在线的host打包8.2 s，而固定输入只有3 s，所以剩下的主要杠杆在host侧。
+- 中间版本：
+  - 未做compact解码时，在线update中位约28 s（prof-b44，12个update）。
+  - compact解码后约25–26 s（prof-b44b，13个update）。
+  - 再把历史块源解码跨rollout缓存、同一part联合解码后，降到22 s。历史块的新解码行从30–54k降到约18k。
+- 这一步发现并修了5个问题：
+  - Flex默认tile超过共享内存；
+  - `create_block_mask(_compile=True)`的块表未初始化，导致数值错误和非法访存；
+  - 单行桶会特化编译；
+  - 空前缀桶的Flex形状没有预热，原先在u7/u8各重编译一次，现已预热；
+  - compact解码缓存键与旧路径冲突，只影响同进程跑两条路径的测试。
+- 测试：本地131 passed / 37 skipped；4090完整GPU门175 passed、0 failed（`tests-b44-full.log`）。新增`tests/test_block_packed_learner.py`，覆盖：
+  - 新旧路径的输出、loss和全部梯度（含教师单行chunk和随机历史）；
+  - 同桶片段隔离、单chunk桶补行；
+  - 改动后段观测不影响前段决策（含块内新写的块）；
+  - detach和gradreplay等价；
+  - Flex对SDPA（CUDA）；
+  - 稠密掩码构建的BlockMask表；
+  - compact解码对补齐解码；
+  - 解码缓存在块释放时剔除；
+  - staging复用。
+- 代码：23e1f98。
+- 失败或中间运行：
+  - prof-b44（packed初版，在线约28 s）和prof-b44b（compact解码，约25–26 s）是完整的中间版本，保留在reports/b42-speed作对照。
+  - Flex探针和逐桶、逐行排查日志（含块表未初始化时的崩溃与错值）已移到`reports/b42-speed/failed/b44-flex-debug/`。
+  - 崩溃过的bench变体修复后用同名重跑，日志被覆盖。
+  - 4090已空闲（guard：0个train_tok、0个isaac进程，显存12 MiB）。
