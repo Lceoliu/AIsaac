@@ -2738,6 +2738,7 @@ def main(argv=None, child=None, actor=None):
         if block_on:   # B42 spike localisation (ISAAC_BLOCK_TIMING=1): this update's window and thread usage
             import resource as resource_
             from isaac_bridge import block_paged as bpt
+            bpt.clear_decode_cache()   # (B42 fix 3: decoded rollout chunks live for one update)
             bpt.ucount('update_t0', time.time())
             ru0 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))
         U = dict.fromkeys(('recompute', 'gae', 'batch', 'teach_new', 'ppo', 'teach_build', 'teach', 'opt', 'tail') +
@@ -4145,6 +4146,7 @@ def main(argv=None, child=None, actor=None):
             ru1 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))
             bpt.ucount('learn_nvcsw', ru1.ru_nvcsw-ru0.ru_nvcsw); bpt.ucount('learn_nivcsw', ru1.ru_nivcsw-ru0.ru_nivcsw)
             bpt.ucount('learn_cpu_s', (ru1.ru_utime+ru1.ru_stime)-(ru0.ru_utime+ru0.ru_stime))
+            bpt.clear_decode_cache()
             bpt.ucount('update_t1', time.time())
             bpt.ucount('gpu_reserved_now_gb', torch.cuda.memory_reserved() / 2 ** 30 if torch.cuda.is_available() else 0.0)
             row.update(bpt.update_report())

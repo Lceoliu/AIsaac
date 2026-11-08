@@ -550,3 +550,35 @@ def test_step_graph_capture_refused_falls_back_to_eager(monkeypatch):
             torch.testing.assert_close(x.float(), y.float(), rtol=1e-5, atol=1e-5)
         assert g.step_graph.captures == (0 if t < 4 else 1)
     assert g.step_graph.busy_misses >= 4 and g.step_graph.replays == 5
+
+
+def test_rollout_chunks_decoded_once_per_update():
+    """B42 fix 3: the start-of-update pass and a PPO epoch plan different Chunk objects over the
+    same rollout rows; the second reuses the first's host decode (same dict), and outputs, loss
+    and every gradient are identical to decoding twice."""
+    from isaac_bridge import block_paged
+    m, ref, new, old, rolls = _collect_rollout('cpu', n=21, seed=61)
+    _, _, mask = gae(rolls[0], .99, .95)
+    block_paged.clear_decode_cache()
+    res = []
+    for cached in (False, True, True):
+        if not cached:
+            block_paged.clear_decode_cache()
+        plan = rolls[0].block.plan(rolls[0], mask)
+        chunks = [c for c in plan['chunks'] if len(c.rows) == 4]
+        m.zero_grad(set_to_none=True)
+        out, _, _, _ = forward_chunks(m, chunks, generator=torch.Generator().manual_seed(8))
+        loss = out[1].square().mean()+out[0].float().logsumexp(-1).mean()
+        loss.backward()
+        res.append((loss.detach(), {k: p.grad.clone() for k, p in m.named_parameters() if p.grad is not None},
+                    [c.__dict__['_host'][1] for c in chunks]))
+        if not cached:
+            n_cached = len(block_paged.DECODE_CACHE)
+            assert n_cached == len(chunks)
+    assert len(block_paged.DECODE_CACHE) == n_cached
+    assert all(a is b for a, b in zip(res[1][2], res[2][2]))
+    for loss, grads, _ in res[1:]:
+        torch.testing.assert_close(loss, res[0][0], rtol=0, atol=0)
+        for k in grads:
+            torch.testing.assert_close(grads[k], res[0][1][k], rtol=0, atol=0, msg=k)
+    block_paged.clear_decode_cache()

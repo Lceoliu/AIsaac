@@ -156,6 +156,23 @@ class GpuSpan:
         GpuSpan.PENDING.clear()
 
 
+# B42 fix 3: host-decoded rollout chunks of one update, keyed by the rows' memory (pointer, shape,
+# strides) and the actions under way. The learner clears it at the start and end of each update
+# (the rollout buffers are reused by later rollouts).
+DECODE_CACHE = {}
+
+
+def rows_key(rows, pending, packed):
+    def k(a):
+        a = np.asarray(a)
+        return (a.__array_interface__['data'][0], a.shape, a.strides, a.dtype.str)
+    return k(rows)+k(pending)+(bool(packed),)
+
+
+def clear_decode_cache():
+    DECODE_CACHE.clear()
+
+
 def update_report():
     """The per-update counters as progress.csv columns (all present on every row)."""
     GpuSpan.drain()
@@ -1187,14 +1204,24 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
     ucount('learn_main_decode_calls', 1)
     for c in chunks:
         h = c.__dict__.get('_host')
-        ucount('learn_main_decode_rows_fresh' if h is None or h[0] != packed else 'learn_main_decode_rows_cached',
-               len(c.rows))
         if h is None or h[0] != packed:
-            d = decode_frame_host(c.rows, packed=packed)
-            d['pending'] = np.asarray(c.pending, dtype=np.int64); d['first'] = np.asarray(c.rows['first'])
+            # B42 fix 3: rollout chunks of the start-of-update pass and of the PPO epochs are
+            # different Chunk objects over the same rollout rows: decode once per update.
+            key = rows_key(c.rows, c.pending, packed) if len(c.rows) > 1 else None
+            d = DECODE_CACHE.get(key) if key is not None else None
+            if d is None:
+                ucount('learn_main_decode_rows_fresh', len(c.rows))
+                d = decode_frame_host(c.rows, packed=packed)
+                d['pending'] = np.asarray(c.pending, dtype=np.int64); d['first'] = np.asarray(c.rows['first'])
+                if key is not None:
+                    DECODE_CACHE[key] = d
+            else:
+                ucount('learn_main_decode_rows_cached', len(c.rows))
             h = (packed, d)
             if len(c.rows) > 1:
                 object.__setattr__(c, '_host', h)
+        else:
+            ucount('learn_main_decode_rows_cached', len(c.rows))
         hosts.append(h[1])
     rows = chunks[0].rows if len(chunks) == 1 else None
     if DUMP_DIR and torch.is_grad_enabled() and B*length >= 512:
