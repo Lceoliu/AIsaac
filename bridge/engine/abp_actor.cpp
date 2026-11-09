@@ -11,6 +11,15 @@
 // Invariant (B52 condition 3): the driver replies, writes the pages, then enqueues the record, all on its thread;
 // every read of a decision's pages (snapshot / restore / learner gather) is reached from a record the consumer took
 // from the queue, so no reader can see a page row before it is complete.
+//
+// B54: the lane rounds (CF / teacher-v2 branches) run on the driver thread too. The consumer restores the lanes'
+// arena rows (snapshot restore, lineage ring: set_ring) and queues one job per teacher generation (submit_lanes);
+// the driver merges the jobs of the main policy's version into its next main batch (main rows first, as the Python
+// path's merged call) and runs every other job as a lane-only call through that generation's lane graph. Order in a
+// merged batch: main rows replied -> main pages -> main record -> lane pages -> lane record (kind 4); the consumer
+// answers the lanes from the kind 4 records (LaneService.finish). Lane rows take the CRN uniforms of their (request
+// sequence, lane) or 0.5 on replayed rows, never the driver's RNG, so the main rows' uniforms are the same with or
+// without lanes.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAStream.h>
@@ -290,7 +299,10 @@ struct GraphEntry {
 };
 
 struct Record {
-  int kind;                                  // 0 step, 1 capture needed, 2 python path needed (invalid frame / too wide)
+  int kind;                                  // 0 step, 1 capture needed, 2 python path needed (invalid frame / too wide),
+                                             // 3 error, 4 lane rows stepped (B54), 5 a lane job Python must step (B54)
+  i64 job = -1, owner = 0;                   // (kinds 1, 4, 5) the lane job, the graph owner (1: main or lane)
+  uint8_t merged = 0;                        // (kind 4) the rows went with a main batch
   std::vector<i64> workers, slots;
   std::vector<uint8_t> go;
   at::Tensor rows;                           // uint8 [n_all * stride] (header + used frame bytes copied)
@@ -301,6 +313,37 @@ struct Record {
   i64 version = 0;
   i64 cap = 0, wb = 0, we = 0, wn = 0, ws = 0;   // (kind 1)
   double t_poll = 0, t_sync = 0, t_reply = 0, t_pages = 0, t_done = 0;   // driver clock (s) of the step's phases
+  double t_main_reply = 0;                   // (kind 4 of a merged batch) when the batch's main rows were replied
+};
+
+// tok_policy.crn_uniforms, bit for bit: element (key, t, c) = splitmix64 output t * 256 + c + 1 of the stream seeded with
+// mix(key * golden + 0x632BE59BD9B4E019); its top 23 bits k give (k + 0.5) / 2^23 as float32
+static inline uint64_t mix64(uint64_t z) {
+  z = (z ^ (z >> 30))*0xBF58476D1CE4E5B9ULL; z = (z ^ (z >> 27))*0x94D049BB133111EBULL; return z ^ (z >> 31);
+}
+static void crn_row(i64 key, i64 t, i64 columns, float *out) {
+  const uint64_t G = 0x9E3779B97F4A7C15ULL;
+  uint64_t seed = mix64((uint64_t)key*G+0x632BE59BD9B4E019ULL);
+  for (i64 c = 0; c < columns; c++) {
+    uint64_t ctr = ((uint64_t)t << 8)+(uint64_t)c+1;
+    uint64_t z = mix64(seed+ctr*G);
+    out[c] = (float)(((double)(z >> 41)+0.5)/8388608.0);
+  }
+}
+static at::Tensor crn_uniforms(at::Tensor keys, at::Tensor t, i64 columns) {
+  keys = keys.to(at::kLong).contiguous(); t = t.to(at::kLong).contiguous();
+  i64 n = keys.numel();
+  TORCH_CHECK(t.numel() == n, "crn_uniforms: keys and t of one length");
+  at::Tensor out = at::empty({n, columns}, at::kFloat);
+  for (i64 i = 0; i < n; i++) crn_row(keys.data_ptr<i64>()[i], t.data_ptr<i64>()[i], columns, out.data_ptr<float>()+i*columns);
+  return out;
+}
+
+struct LaneJob {   // (B54) one teacher generation's rows of a lane round, queued by the consumer
+  i64 job = 0, owner = 0, version = 0, n = 0;
+  std::vector<uint8_t> rows;                 // n x row_stride (ROW records: header + frame)
+  std::vector<i64> pend, ids, seq, lane;     // pending [n x nh], arena rows, CRN keys (request sequence, lane)
+  std::vector<uint8_t> replay;               // evaluate rows (uniform 0.5)
 };
 
 struct Xoshiro {   // xoshiro256**, seeded through splitmix64
@@ -361,9 +404,15 @@ struct ActorDriver {
   std::atomic<i64> version{0};
   std::vector<i64> ready_w, ready_s;   // a batch the driver could not step (capture needed): retried after resume
   std::string error;
+  // (B54) lane jobs
+  std::deque<std::shared_ptr<LaneJob>> lane_q; std::mutex lmu;
+  bool lane_merge = true;              // (tests / ISAAC_BLOCK_LANE_MERGE=0) merge jobs of the main version into main batches
   // counters
   std::atomic<i64> n_steps{0}, n_calls{0}, n_rows{0}, n_terminal{0};
   std::atomic<double> t_sync_s{0}, t_pages_s{0}, t_host_s{0};
+  std::atomic<i64> n_lane_jobs{0}, n_lane_rows{0}, n_merged_rows{0}, n_merged_calls{0}, n_lane_calls{0}, n_captures{0},
+      n_lane_python{0}, n_pauses{0};
+  std::atomic<double> t_pause_s{0};
 
   explicit ActorDriver(std::shared_ptr<PageStore> s) : store(std::move(s)) {}
   ~ActorDriver() { stop(); }
@@ -408,6 +457,44 @@ struct ActorDriver {
   at::Tensor get_pending() {
     at::Tensor t = at::empty({n_workers, nh}, at::kLong);
     memcpy(t.data_ptr<i64>(), pending_cur.data(), pending_cur.size()*sizeof(i64));
+    return t;
+  }
+  // (B54) a lane job: rows uint8 [n * row_stride], pending int64 [n * nh], ids / seq / lane int64 [n], replay uint8 [n]
+  void submit_lanes(i64 job, i64 owner, i64 ver, at::Tensor rows, i64 n, at::Tensor pending, at::Tensor ids, at::Tensor seq,
+                    at::Tensor lane, at::Tensor replay) {
+    auto jb = std::make_shared<LaneJob>();
+    jb->job = job; jb->owner = owner; jb->version = ver; jb->n = n;
+    rows = rows.contiguous(); pending = pending.to(at::kLong).contiguous(); ids = ids.to(at::kLong).contiguous();
+    seq = seq.to(at::kLong).contiguous(); lane = lane.to(at::kLong).contiguous(); replay = replay.to(at::kByte).contiguous();
+    TORCH_CHECK(rows.scalar_type() == at::kByte && rows.numel() == n*row_stride, "submit_lanes: rows uint8 [n * row_stride]");
+    TORCH_CHECK(pending.numel() == n*nh && ids.numel() == n && seq.numel() == n && lane.numel() == n && replay.numel() == n,
+                "submit_lanes: shapes");
+    jb->rows.assign(rows.data_ptr<uint8_t>(), rows.data_ptr<uint8_t>()+n*row_stride);
+    jb->pend.assign(pending.data_ptr<i64>(), pending.data_ptr<i64>()+n*nh);
+    jb->ids.assign(ids.data_ptr<i64>(), ids.data_ptr<i64>()+n); jb->seq.assign(seq.data_ptr<i64>(), seq.data_ptr<i64>()+n);
+    jb->lane.assign(lane.data_ptr<i64>(), lane.data_ptr<i64>()+n); jb->replay.assign(replay.data_ptr<uint8_t>(), replay.data_ptr<uint8_t>()+n);
+    std::lock_guard<std::mutex> g(lmu);
+    lane_q.push_back(jb);
+  }
+  i64 lane_queue_size() { std::lock_guard<std::mutex> g(lmu); return (i64)lane_q.size(); }
+  bool drop_lane_job(i64 job) {   // (after a kind 5 record: Python stepped the job itself)
+    std::lock_guard<std::mutex> g(lmu);
+    for (auto it = lane_q.begin(); it != lane_q.end(); ++it) if ((*it)->job == job) { lane_q.erase(it); return true; }
+    return false;
+  }
+  void set_lane_merge(bool on) { lane_merge = on; }
+  // (B54) a restored lane row's lineage ring: the decisions of its last block_steps steps (step s at position s % bs;
+  // -1 where the branch has none). Only for rows with no lane job in flight (the consumer restores idle lanes).
+  void set_ring(i64 row, at::Tensor dec, at::Tensor kv, i64 n) {
+    dec = dec.to(at::kLong).contiguous(); kv = kv.to(at::kLong).contiguous();
+    TORCH_CHECK(row >= 0 && row < arena_rows && dec.numel() == block_steps && kv.numel() == block_steps, "set_ring: row / shapes");
+    memcpy(&ring_dec[row*block_steps], dec.data_ptr<i64>(), block_steps*8);
+    memcpy(&ring_kv[row*block_steps], kv.data_ptr<i64>(), block_steps*8);
+    ring_n[row] = n;
+  }
+  at::Tensor get_ring(i64 row) {
+    at::Tensor t = at::empty({2, block_steps}, at::kLong);
+    memcpy(t.data_ptr<i64>(), &ring_dec[row*block_steps], block_steps*8); memcpy(t.data_ptr<i64>()+block_steps, &ring_kv[row*block_steps], block_steps*8);
     return t;
   }
   void register_graph(std::vector<i64> key, at::Tensor host_flat, at::Tensor dev_flat, std::shared_ptr<at::cuda::CUDAGraph> graph,
@@ -523,6 +610,7 @@ struct ActorDriver {
     d["first"] = r->first; d["complete"] = r->complete; d["dec"] = r->dec; d["kvs"] = r->kvs; d["bid"] = r->bid; d["version"] = r->version;
     d["cap"] = r->cap; d["widths"] = py::make_tuple(r->wb, r->we, r->wn, r->ws);
     d["t_poll"] = r->t_poll; d["t_sync"] = r->t_sync; d["t_reply"] = r->t_reply; d["t_pages"] = r->t_pages; d["t_done"] = r->t_done;
+    d["job"] = r->job; d["owner"] = r->owner; d["merged"] = (int)r->merged; d["t_main_reply"] = r->t_main_reply;
     return d;
   }
   i64 queue_size() { std::lock_guard<std::mutex> g(qmu); return (i64)queue.size(); }
@@ -530,6 +618,9 @@ struct ActorDriver {
     py::dict d;
     d["steps"] = n_steps.load(); d["calls"] = n_calls.load(); d["rows"] = n_rows.load(); d["terminal"] = n_terminal.load();
     d["sync_s"] = t_sync_s.load(); d["pages_s"] = t_pages_s.load(); d["host_s"] = t_host_s.load();
+    d["lane_jobs"] = n_lane_jobs.load(); d["lane_rows"] = n_lane_rows.load(); d["merged_rows"] = n_merged_rows.load();
+    d["merged_calls"] = n_merged_calls.load(); d["lane_calls"] = n_lane_calls.load(); d["captures"] = n_captures.load();
+    d["lane_python"] = n_lane_python.load(); d["pauses"] = n_pauses.load(); d["pause_s"] = t_pause_s.load();
     return d;
   }
 
@@ -543,10 +634,12 @@ struct ActorDriver {
     qcv.notify_all();
   }
   void wait_paused() {
+    double t0 = now();
     std::unique_lock<std::mutex> lk(cmu);
     paused = true; ccv.notify_all();
     while (pause_req && !stop_req) ccv.wait_for(lk, std::chrono::milliseconds(2));
     paused = false;
+    t_pause_s = t_pause_s+(now()-t0); n_pauses++;
   }
   void reset_rows(const std::vector<i64> &rows) {
     at::Tensor ids = at::from_blob((void *)rows.data(), {(i64)rows.size()}, at::kLong).to(reset.tensors[0].device());
@@ -563,10 +656,11 @@ struct ActorDriver {
       std::vector<i64> ws, ss;   // the batch: workers and row slots
       while (!stop_req) {
         if (pause_req) { wait_paused(); continue; }
+        bool lanes_waiting = lane_queue_size() > 0;
         if (ready_w.empty()) {
           for (size_t i = 0; i < fds.size(); i++) { pfds[i].fd = fds[i]; pfds[i].events = fds[i] >= 0 ? POLLIN : 0; pfds[i].revents = 0; }
-          int k = ::poll(pfds.data(), (nfds_t)pfds.size(), 1);
-          if (k <= 0) continue;
+          int k = ::poll(pfds.data(), (nfds_t)pfds.size(), lanes_waiting ? 0 : 1);
+          if (k <= 0) { if (lanes_waiting) run_lanes(); continue; }
           ws.clear(); ss.clear();
           for (size_t i = 0; i < fds.size(); i++) {
             if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
@@ -577,29 +671,115 @@ struct ActorDriver {
               fds[i] = -1;   // the worker ended (or something unexpected): its pipe leaves the poll; Python notices through its own bookkeeping
             }
           }
-          if (ws.empty()) continue;
+          if (ws.empty()) { if (lanes_waiting) run_lanes(); continue; }
         } else { ws = ready_w; ss = ready_s; ready_w.clear(); ready_s.clear(); }
         step_batch(ws, ss);
+        if (!pause_req) run_lanes();   // (the other generations' jobs after the main reply, as the Python path)
       }
     } catch (const std::exception &ex) {
       error = ex.what();
       std::lock_guard<std::mutex> g(cmu); paused = true; ccv.notify_all();
-      auto r = std::make_shared<Record>(); r->kind = 3; push_record(r);
+      auto r = std::make_shared<Record>(); r->kind = 3; finish_empty(*r); push_record(r);
     }
     running = false;
+  }
+
+  // a record's frame header: (body, entity, inventory, slot) counts; false when the frame is not a valid visible-v2 frame
+  bool frame_counts(const uint8_t *src, i64 &p, i64 &e, i64 &nn, i64 &s) {
+    const float *f = (const float *)(src+f_frame);
+    i64 schema = read_int(src+f_schema, 4), size = read_int(src+f_bytes, 4);
+    p = (i64)f[2]; e = (i64)f[3]; nn = (i64)f[4]; s = (i64)f[5];
+    i64 expected = frame_fixed+p*(80+324)+e*48+nn*4+s*13;
+    return !(schema != schema_version || f[0] != (float)magic || f[1] != (float)expected || size != expected*4 || p <= 0 || e > 128 ||
+             nn < 0 || s < 0 || size > frame_bytes);
+  }
+  // widths of rows [0, n) of a contiguous batch; false when a frame is invalid or the batch too wide for a graph
+  bool batch_widths(const uint8_t *rows, i64 n, i64 &wb, i64 &we, i64 &wn, i64 &wsl) {
+    i64 pm = 0, em = 0, nm = 0, sm = 0; bool valid = true;
+    for (i64 j = 0; j < n; j++) {
+      i64 p, e, nn, s;
+      valid &= frame_counts(rows+j*row_stride, p, e, nn, s);
+      pm = std::max(pm, p); em = std::max(em, e); nm = std::max(nm, nn); sm = std::max(sm, s);
+    }
+    wb = bucket(bk_body, pm); we = bucket(bk_entity, em); wn = bucket(bk_inventory, nm); wsl = bucket(bk_slots, sm);
+    bool too_wide = wb < 0 || we < 0 || wn < 0 || wsl < 0 || 30+2*wb+we+wn+wsl > 1024;
+    return valid && !too_wide;
+  }
+  GraphEntry *find_graph(const std::vector<i64> &key) {
+    std::lock_guard<std::mutex> g(gmu); auto it = graphs.find(key); return it == graphs.end() ? nullptr : &it->second;
+  }
+  // the pages of batch rows [o, o + k): decisions (K/V, z, raw frame), lineage ring, completed blocks, step counters;
+  // the record's dec / kvs / bid
+  void write_part(GraphEntry &e, const uint8_t *rows, i64 o, i64 k, const std::vector<i64> &ids, const std::vector<i64> &steps_before,
+                  const std::vector<uint8_t> &complete, const std::vector<uint8_t> &first, const i64 *pend, i64 ver, Record &r) {
+    r.dec = at::empty({k}, at::kLong); r.kvs = at::empty({k}, at::kLong); r.bid = at::full({k}, -1, at::kLong);
+    if (k == 0) return;
+    i64 kv_bytes = store->kv_elems*store->kv_itemsize;
+    {
+      std::vector<const uint8_t *> fr(k); std::vector<i64> nb(k), st(k); std::vector<uint8_t> fi(k); std::vector<int32_t> sc(k);
+      for (i64 j = 0; j < k; j++) {
+        const uint8_t *src = rows+(o+j)*row_stride;
+        fr[j] = src+f_frame; nb[j] = read_int(src+f_bytes, 4); st[j] = steps_before[o+j]; fi[j] = first[o+j]; sc[j] = (int32_t)read_int(src+f_schema, 4);
+      }
+      store->write_decisions_raw(k, (const uint8_t *)e.bc.data_ptr()+o*kv_bytes, kv_bytes, e.bz.data_ptr<float>()+o*store->z_elems, store->z_elems,
+                                 st.data(), ver, fi.data(), sc.data(), fr.data(), nb.data(), pend, r.dec.data_ptr<i64>(), r.kvs.data_ptr<i64>());
+    }
+    i64 *dec = r.dec.data_ptr<i64>(), *kvs = r.kvs.data_ptr<i64>();
+    const i64 *dmeta = store->d_meta.data_ptr<i64>();
+    std::vector<i64> ends, src, srcver, done_rows;
+    for (i64 j = 0; j < k; j++) {
+      i64 row = ids[o+j];
+      i64 *rd = &ring_dec[row*block_steps], *rk = &ring_kv[row*block_steps];
+      i64 pos = steps_before[o+j] % block_steps;
+      rd[pos] = dec[j]; rk[pos] = kvs[j]; ring_n[row] = std::min<i64>(ring_n[row]+1, block_steps);
+      if (complete[o+j]) {   // the block's block_steps decisions end at this step: positions 0..bs-1 in step order
+        done_rows.push_back(j); ends.push_back(steps_before[o+j]);
+        for (i64 q = 0; q < block_steps; q++) { src.push_back(rd[q]); srcver.push_back(rd[q] >= 0 ? dmeta[2*rk[q]+1] : -1); }
+      }
+      step_host[row] += 1;
+    }
+    if (!done_rows.empty()) {
+      i64 m = (i64)done_rows.size();
+      std::vector<float> vals(m*store->b_elems);
+      const float *bw = e.bw.data_ptr<float>();   // (every row of the graph; the complete rows in row order)
+      for (i64 q = 0; q < m; q++) memcpy(&vals[q*store->b_elems], bw+(o+done_rows[q])*store->b_elems, store->b_elems*sizeof(float));
+      std::vector<i64> bid(m);
+      store->write_blocks_raw(m, vals.data(), store->b_elems, ends.data(), ver, src.data(), srcver.data(), bid.data());
+      for (i64 q = 0; q < m; q++) r.bid.data_ptr<i64>()[done_rows[q]] = bid[q];
+    }
+  }
+  // the lane rows' uniforms: 0.5 on replayed rows, else the CRN of (request sequence, lane)
+  void lane_uniforms(const LaneJob &jb, float *u) {
+    for (i64 j = 0; j < jb.n; j++) {
+      if (jb.replay[j]) { for (i64 c = 0; c < heads; c++) u[j*heads+c] = .5f; }
+      else crn_row(jb.seq[j], jb.lane[j], heads, u+j*heads);
+    }
+  }
+  // a lane record's per-row fields from batch rows [o, o + k)
+  void lane_record(Record &r, const LaneJob &jb, GraphEntry &e, i64 o, const std::vector<i64> &steps_before, const std::vector<uint8_t> &first,
+                   const std::vector<uint8_t> &complete, i64 ver) {
+    i64 k = jb.n, ow = nh+3;
+    r.kind = 4; r.job = jb.job; r.owner = jb.owner; r.version = ver;
+    r.out = at::empty({k, ow}, at::kFloat); memcpy(r.out.data_ptr<float>(), e.bo.data_ptr<float>()+o*ow, k*ow*sizeof(float));
+    r.actions = at::empty({k, nh}, at::kLong);
+    for (i64 j = 0; j < k; j++) for (i64 h = 0; h < nh; h++) r.actions.data_ptr<i64>()[j*nh+h] = (i64)r.out.data_ptr<float>()[j*ow+h];
+    r.pending_before = at::empty({k, nh}, at::kLong); memcpy(r.pending_before.data_ptr<i64>(), jb.pend.data(), k*nh*8);
+    r.step_before = at::empty({k}, at::kLong); memcpy(r.step_before.data_ptr<i64>(), &steps_before[o], k*8);
+    r.first = at::empty({k}, at::kByte); memcpy(r.first.data_ptr<uint8_t>(), &first[o], k);
+    r.complete = at::empty({k}, at::kByte); memcpy(r.complete.data_ptr<uint8_t>(), &complete[o], k);
+    r.rows = at::empty({0}, at::kByte); r.priv = at::empty({0}, at::kByte);
   }
 
   void step_batch(const std::vector<i64> &ws, const std::vector<i64> &ss) {
     double t0 = now();
     i64 n_all = (i64)ws.size();
     auto r = std::make_shared<Record>();
-    r->kind = 0; r->workers = ws; r->slots = ss; r->go.assign(n_all, 0); r->cf_snap.assign(n_all, 0); r->t_poll = t0;
+    r->kind = 0; r->owner = owner_main; r->workers = ws; r->slots = ss; r->go.assign(n_all, 0); r->cf_snap.assign(n_all, 0); r->t_poll = t0;
     // the records: header + used frame bytes copied (the worker may rewrite this slot after two more replies)
     r->rows = at::empty({n_all*row_stride}, at::kByte);
     uint8_t *rc = r->rows.data_ptr<uint8_t>();
     if (priv) r->priv = at::empty({n_all*priv_itemsize}, at::kByte); else r->priv = at::empty({0}, at::kByte);
     std::vector<i64> go_idx; go_idx.reserve(n_all);
-    std::vector<i64> firsts;
     for (i64 i = 0; i < n_all; i++) {
       const uint8_t *src = rows_base+ss[i]*row_stride;
       i64 nbytes = read_int(src+f_bytes, 4);
@@ -624,63 +804,80 @@ struct ActorDriver {
       push_record(r); n_calls++;
       return;
     }
-    // frame headers -> widths, validity; the graph key
-    i64 pm = 0, em = 0, nm = 0, sm = 0;
-    bool valid = true;
-    for (i64 j = 0; j < n; j++) {
-      const uint8_t *src = rows_base+ss[go_idx[j]]*row_stride;
-      const float *f = (const float *)(src+f_frame);
-      i64 schema = read_int(src+f_schema, 4), size = read_int(src+f_bytes, 4);
-      i64 p = (i64)f[2], e = (i64)f[3], nn = (i64)f[4], s = (i64)f[5];
-      i64 expected = frame_fixed+p*(80+324)+e*48+nn*4+s*13;
-      if (schema != schema_version || f[0] != (float)magic || f[1] != (float)expected || size != expected*4 || p <= 0 || e > 128 ||
-          nn < 0 || s < 0 || size > frame_bytes) valid = false;
-      pm = std::max(pm, p); em = std::max(em, e); nm = std::max(nm, nn); sm = std::max(sm, s);
+    // the batch's rows, contiguous: the go rows of the copied records, then (B54) the merged lane jobs' rows
+    std::vector<std::shared_ptr<LaneJob>> merged;
+    if (lane_merge) {
+      std::lock_guard<std::mutex> g(lmu);
+      for (auto it = lane_q.begin(); it != lane_q.end();) {
+        if ((*it)->version == version.load()) { merged.push_back(*it); it = lane_q.erase(it); } else ++it;
+      }
     }
-    i64 wb = bucket(bk_body, pm), we = bucket(bk_entity, em), wn = bucket(bk_inventory, nm), wsl = bucket(bk_slots, sm);
-    i64 cap = 1; while (cap < n) cap <<= 1;
-    bool too_wide = wb < 0 || we < 0 || wn < 0 || wsl < 0 || 30+2*wb+we+wn+wsl > 1024;
-    if (!valid || too_wide) {   // Python handles this batch (it raises the same error, or takes the eager path)
+    i64 n_lane = 0; for (auto &jb : merged) n_lane += jb->n;
+    std::vector<uint8_t> packed;
+    const uint8_t *rows_ptr;
+    auto pack = [&](bool with_lanes) {
+      i64 tot = n+(with_lanes ? n_lane : 0);
+      if (tot == n_all && n == n_all) { rows_ptr = rc; return; }
+      packed.resize(tot*row_stride);
+      for (i64 j = 0; j < n; j++) memcpy(&packed[j*row_stride], rc+go_idx[j]*row_stride, row_stride);
+      if (with_lanes) { i64 o = n; for (auto &jb : merged) { memcpy(&packed[o*row_stride], jb->rows.data(), jb->n*row_stride); o += jb->n; } }
+      rows_ptr = packed.data();
+    };
+    auto put_back = [&]() {   // (the merged jobs return to the front of the queue, in order)
+      std::lock_guard<std::mutex> g(lmu);
+      for (auto it = merged.rbegin(); it != merged.rend(); ++it) lane_q.push_front(*it);
+      merged.clear(); n_lane = 0;
+    };
+    pack(!merged.empty());
+    i64 wb, we, wn, wsl;
+    bool ok = batch_widths(rows_ptr, n+n_lane, wb, we, wn, wsl);
+    if (!ok && !merged.empty()) {   // the lanes would make the batch invalid / too wide: main rows alone
+      put_back(); pack(false); ok = batch_widths(rows_ptr, n, wb, we, wn, wsl);
+    }
+    i64 n_tot = n+n_lane;
+    i64 cap = 1; while (cap < n_tot) cap <<= 1;
+    if (!ok) {   // Python handles this batch (it raises the same error, or takes the eager path)
       r->kind = 2; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
       hand_to_python(r, ws, ss);
       return;
     }
     std::vector<i64> key{owner_main, cap, wb, we, wn, wsl};
-    GraphEntry *e = nullptr;
-    { std::lock_guard<std::mutex> g(gmu); auto it = graphs.find(key); if (it != graphs.end()) e = &it->second; }
+    GraphEntry *e = find_graph(key);
     if (!e) {   // not captured yet: Python captures (needs the GIL and the capture admission); the batch is retried
+      put_back();
       r->kind = 1; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
+      n_captures++;
       hand_to_python(r, ws, ss);
       return;
     }
-    // the step's inputs
-    std::vector<i64> ids(n), pend(n*nh), steps_before(n); std::vector<uint8_t> replay(n, 0), complete(n), first(n);
-    std::vector<float> u(n*heads);
+    // the step's inputs: main rows [0, n), lane rows [n, n_tot)
+    std::vector<i64> ids(n_tot), pend(n_tot*nh), steps_before(n_tot); std::vector<uint8_t> replay(n_tot, 0), complete(n_tot), first(n_tot);
+    std::vector<float> u(n_tot*heads);
     std::vector<i64> to_reset;
     for (i64 j = 0; j < n; j++) {
-      i64 i = go_idx[j], w = ws[i];
-      const uint8_t *src = rows_base+ss[i]*row_stride;
-      first[j] = read_int(src+f_first, s_first) != 0;
+      i64 w = ws[go_idx[j]];
       ids[j] = base+w;
-      if (first[j]) to_reset.push_back(ids[j]);
       memcpy(&pend[j*nh], &pending_cur[w*nh], nh*8);
+    }
+    { i64 o = n; for (auto &jb : merged) { for (i64 q = 0; q < jb->n; q++) { ids[o+q] = jb->ids[q]; replay[o+q] = jb->replay[q]; }
+        memcpy(&pend[o*nh], jb->pend.data(), jb->n*nh*8); o += jb->n; } }
+    for (i64 j = 0; j < n_tot; j++) {
+      first[j] = read_int(rows_ptr+j*row_stride+f_first, s_first) != 0;
+      if (first[j]) to_reset.push_back(ids[j]);
     }
     if (!to_reset.empty()) reset_rows(to_reset);   // (device ops on the actor stream; before the graph)
     bool any_complete = false;
-    for (i64 j = 0; j < n; j++) {
+    for (i64 j = 0; j < n_tot; j++) {
       steps_before[j] = step_host[ids[j]];
       complete[j] = (steps_before[j]+1) % block_steps == 0; any_complete |= complete[j];
     }
-    for (auto &x : u) x = fixed_u >= 0 ? (float)fixed_u : rng.uniform();
-    // the rows of the batch, contiguous for the unpack: pointers into the copied records (same stride)
-    std::vector<uint8_t> packed;   // only when go rows are not all rows (rare): gather them
-    const uint8_t *rows_ptr; i64 stride = row_stride;
-    if (n == n_all) rows_ptr = rc;
-    else { packed.resize(n*row_stride); for (i64 j = 0; j < n; j++) memcpy(&packed[j*row_stride], rc+go_idx[j]*row_stride, row_stride); rows_ptr = packed.data(); }
+    for (i64 x = 0; x < n*heads; x++) u[x] = fixed_u >= 0 ? (float)fixed_u : rng.uniform();
+    { i64 o = n; for (auto &jb : merged) { lane_uniforms(*jb, &u[o*heads]); o += jb->n; } }
     double t_host0 = now();
-    fill_and_run(*e, n, rows_ptr, stride, pend.data(), ids.data(), u.data(), replay.data(), complete.data(), version.load(), any_complete);
+    i64 ver = version.load();
+    fill_and_run(*e, n_tot, rows_ptr, row_stride, pend.data(), ids.data(), u.data(), replay.data(), complete.data(), ver, any_complete);
     double t1 = now(); r->t_sync = t1; t_sync_s = t_sync_s+(t1-t_host0);
-    // outputs -> actions (pforce), shared arrays, reply
+    // main outputs -> actions (pforce), shared arrays, reply
     const float *bo = e->bo.data_ptr<float>(); i64 ow = nh+3;   // (the step's outputs: actions [nh], logp, value, vg)
     r->out = at::empty({n, ow}, at::kFloat); memcpy(r->out.data_ptr<float>(), bo, n*ow*sizeof(float));
     r->actions = at::empty({n, nh}, at::kLong); i64 *act = r->actions.data_ptr<i64>();
@@ -688,7 +885,7 @@ struct ActorDriver {
     r->step_before = at::empty({n}, at::kLong); memcpy(r->step_before.data_ptr<i64>(), steps_before.data(), n*8);
     r->first = at::empty({n}, at::kByte); memcpy(r->first.data_ptr<uint8_t>(), first.data(), n);
     r->complete = at::empty({n}, at::kByte); memcpy(r->complete.data_ptr<uint8_t>(), complete.data(), n);
-    r->version = version.load();
+    r->version = ver;
     for (i64 j = 0; j < n; j++) {
       i64 i = go_idx[j], w = ws[i];
       const uint8_t *src = rows_base+ss[i]*row_stride;
@@ -704,47 +901,82 @@ struct ActorDriver {
     for (i64 i = 0; i < n_all; i++) if (cf_snap && r->cf_snap[i]) cf_snap[ws[i]] = 0;
     reply_rows(ws);
     double t2 = now(); r->t_reply = t2;
-    // pages: decisions (K/V, z, raw frame) and completed blocks, lineage ring, step counters
-    r->dec = at::empty({n}, at::kLong); r->kvs = at::empty({n}, at::kLong); r->bid = at::full({n}, -1, at::kLong);
-    {
-      std::vector<const uint8_t *> fr(n); std::vector<i64> nb(n), st(n); std::vector<uint8_t> fi(n); std::vector<int32_t> sc(n);
-      for (i64 j = 0; j < n; j++) {
-        const uint8_t *src = rows_ptr+j*stride;
-        fr[j] = src+f_frame; nb[j] = read_int(src+f_bytes, 4); st[j] = steps_before[j]; fi[j] = first[j]; sc[j] = (int32_t)read_int(src+f_schema, 4);
-      }
-      store->write_decisions_raw(n, (const uint8_t *)e->bc.data_ptr(), store->kv_elems*store->kv_itemsize, e->bz.data_ptr<float>(), store->z_elems,
-                                 st.data(), r->version, fi.data(), sc.data(), fr.data(), nb.data(), pend.data(), r->dec.data_ptr<i64>(),
-                                 r->kvs.data_ptr<i64>());
-    }
-    i64 *dec = r->dec.data_ptr<i64>(), *kvs = r->kvs.data_ptr<i64>();
-    const i64 *dmeta = store->d_meta.data_ptr<i64>();
-    std::vector<i64> ends, src, srcver, done_rows;
-    for (i64 j = 0; j < n; j++) {
-      i64 row = ids[j];
-      i64 *rd = &ring_dec[row*block_steps], *rk = &ring_kv[row*block_steps];
-      i64 pos = steps_before[j] % block_steps;
-      rd[pos] = dec[j]; rk[pos] = kvs[j]; ring_n[row] = std::min<i64>(ring_n[row]+1, block_steps);
-      if (complete[j]) {   // the block's block_steps decisions end at this step: positions 0..bs-1 in step order
-        done_rows.push_back(j); ends.push_back(steps_before[j]);
-        for (i64 q = 0; q < block_steps; q++) { src.push_back(rd[q]); srcver.push_back(rd[q] >= 0 ? dmeta[2*rk[q]+1] : -1); }
-      }
-      step_host[row] += 1;
-    }
-    if (!done_rows.empty()) {
-      i64 m = (i64)done_rows.size();
-      std::vector<float> vals(m*store->b_elems);
-      // the Writer's output rows: bw holds every row of the graph; the complete rows in row order
-      const float *bw = e->bw.data_ptr<float>();
-      for (i64 q = 0; q < m; q++) memcpy(&vals[q*store->b_elems], bw+done_rows[q]*store->b_elems, store->b_elems*sizeof(float));
-      std::vector<i64> bid(m);
-      store->write_blocks_raw(m, vals.data(), store->b_elems, ends.data(), r->version, src.data(), srcver.data(), bid.data());
-      for (i64 q = 0; q < m; q++) r->bid.data_ptr<i64>()[done_rows[q]] = bid[q];
-    }
+    // the main rows' pages, then their record (the lanes' pages and records only after it: B54 condition a)
+    write_part(*e, rows_ptr, 0, n, ids, steps_before, complete, first, pend.data(), ver, *r);
     double t3 = now(); r->t_pages = t3; r->t_done = t3; t_pages_s = t_pages_s+(t3-t2); t_host_s = t_host_s+(t3-t0)-(t1-t_host0);
     n_steps++; n_calls++; n_rows = n_rows+n;
     push_record(r);
+    if (!merged.empty()) {
+      n_merged_calls++;
+      i64 o = n;
+      for (auto &jb : merged) {
+        auto lr = std::make_shared<Record>();
+        lr->t_poll = t0; lr->t_sync = t1; lr->t_main_reply = t2; lr->merged = 1;
+        lane_record(*lr, *jb, *e, o, steps_before, first, complete, ver);
+        lr->t_reply = now();
+        write_part(*e, rows_ptr, o, jb->n, ids, steps_before, complete, first, jb->pend.data(), ver, *lr);
+        lr->t_pages = lr->t_done = now();
+        n_lane_jobs++; n_lane_rows = n_lane_rows+jb->n; n_merged_rows = n_merged_rows+jb->n;
+        push_record(lr);
+        o += jb->n;
+      }
+    }
+  }
+  // (B54) the queued lane jobs, each a lane-only call through its generation's graph, until the queue is empty or the
+  // driver paused itself (a capture / a job Python must step)
+  void run_lanes() {
+    while (!pause_req && !stop_req) {
+      std::shared_ptr<LaneJob> jb;
+      { std::lock_guard<std::mutex> g(lmu); if (lane_q.empty()) return; jb = lane_q.front(); }
+      if (!run_lane_job(*jb)) return;   // (the job stays at the front: retried after resume, or dropped by Python)
+      std::lock_guard<std::mutex> g(lmu);
+      if (!lane_q.empty() && lane_q.front() == jb) lane_q.pop_front();
+    }
+  }
+  bool run_lane_job(LaneJob &jb) {
+    double t0 = now();
+    i64 k = jb.n;
+    const uint8_t *rows_ptr = jb.rows.data();
+    i64 wb, we, wn, wsl;
+    bool ok = batch_widths(rows_ptr, k, wb, we, wn, wsl);
+    i64 cap = 1; while (cap < k) cap <<= 1;
+    auto pause_with = [&](int kind) {
+      auto r = std::make_shared<Record>(); r->kind = kind; r->job = jb.job; r->owner = jb.owner; r->version = jb.version;
+      r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl; finish_empty(*r);
+      pause_req = true; push_record(r);
+    };
+    if (!ok) { n_lane_python++; pause_with(5); return false; }
+    std::vector<i64> key{jb.owner, cap, wb, we, wn, wsl};
+    GraphEntry *e = find_graph(key);
+    if (!e) { n_captures++; pause_with(1); return false; }
+    std::vector<i64> steps_before(k); std::vector<uint8_t> complete(k), first(k);
+    std::vector<i64> to_reset;
+    for (i64 j = 0; j < k; j++) {
+      first[j] = read_int(rows_ptr+j*row_stride+f_first, s_first) != 0;
+      if (first[j]) to_reset.push_back(jb.ids[j]);
+    }
+    if (!to_reset.empty()) reset_rows(to_reset);
+    bool any_complete = false;
+    for (i64 j = 0; j < k; j++) {
+      steps_before[j] = step_host[jb.ids[j]];
+      complete[j] = (steps_before[j]+1) % block_steps == 0; any_complete |= complete[j];
+    }
+    std::vector<float> u(k*heads);
+    lane_uniforms(jb, u.data());
+    fill_and_run(*e, k, rows_ptr, row_stride, jb.pend.data(), jb.ids.data(), u.data(), jb.replay.data(), complete.data(), jb.version, any_complete);
+    auto r = std::make_shared<Record>();
+    r->t_poll = t0; r->t_sync = now();
+    lane_record(*r, jb, *e, 0, steps_before, first, complete, jb.version);
+    r->t_reply = now();
+    write_part(*e, rows_ptr, 0, k, jb.ids, steps_before, complete, first, jb.pend.data(), jb.version, *r);
+    r->t_pages = r->t_done = now();
+    n_lane_jobs++; n_lane_calls++; n_lane_rows = n_lane_rows+k;
+    push_record(r);
+    return true;
   }
   void finish_empty(Record &r) {
+    if (!r.rows.defined()) r.rows = at::empty({0}, at::kByte);
+    if (!r.priv.defined()) r.priv = at::empty({0}, at::kByte);
     r.out = at::empty({0, nh+3}, at::kFloat); r.actions = at::empty({0, nh}, at::kLong); r.pending_before = at::empty({0, nh}, at::kLong);
     r.step_before = at::empty({0}, at::kLong); r.first = at::empty({0}, at::kByte); r.complete = at::empty({0}, at::kByte);
     r.dec = at::empty({0}, at::kLong); r.kvs = at::empty({0}, at::kLong); r.bid = at::empty({0}, at::kLong); r.version = version.load();
@@ -774,6 +1006,7 @@ struct ActorDriver {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("visible_version", [] { return abp_visible_version(); });
+  m.def("crn_uniforms", &crn_uniforms, py::arg("keys"), py::arg("t"), py::arg("columns"));
   py::class_<PageStore, std::shared_ptr<PageStore>>(m, "PageStore")
       .def(py::init<i64, i64, bool, i64, i64, i64, i64, i64, i64>(), py::arg("page"), py::arg("kv_elems"), py::arg("kv_bf16"), py::arg("z_elems"),
            py::arg("b_elems"), py::arg("block_steps"), py::arg("nh"), py::arg("max_pages_d"), py::arg("max_pages_b"))
@@ -802,5 +1035,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("resume", &ActorDriver::resume).def("is_paused", &ActorDriver::is_paused).def("last_error", &ActorDriver::last_error)
       .def("next_record", &ActorDriver::next_record).def("queue_size", &ActorDriver::queue_size).def("counters", &ActorDriver::counters)
       .def("drop_pending_batch", &ActorDriver::drop_pending_batch)
+      .def("submit_lanes", &ActorDriver::submit_lanes).def("lane_queue_size", &ActorDriver::lane_queue_size)
+      .def("drop_lane_job", &ActorDriver::drop_lane_job).def("set_lane_merge", &ActorDriver::set_lane_merge)
+      .def("set_ring", &ActorDriver::set_ring).def("get_ring", &ActorDriver::get_ring)
       .def_property_readonly("running", [](ActorDriver &d) { return d.running.load(); });
 }
