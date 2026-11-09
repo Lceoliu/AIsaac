@@ -2585,6 +2585,7 @@ def main(argv=None, child=None, actor=None):
             lanes_b = bool(args.cf or args.teacher_v2) and args.mode in ('floor','run')
             block_actor = SlotBlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16,
                                          lane_slots=n if lanes_b else 0)
+            block_actor.device_result = False   # (B47: answers are read from host_output)
         else:
             block_actor = BlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
         from isaac_bridge import block_paged as bp_pre
@@ -4828,9 +4829,7 @@ def main(argv=None, child=None, actor=None):
                     lanes.capture_main(a_idx,sub,under_way)
                     prof['control']+=time.perf_counter()-control_started
                     inference_started=time.perf_counter()
-                    # (B47: may run at a later pass (ISAAC_B47_MAIN_ASYNC): this call's values bound here)
-                    def answer_block(host_b,contexts,a_idx=a_idx,sub=sub,under_way=under_way,
-                                     inference_started=inference_started,prof=prof):
+                    def answer_block(host_b,contexts):
                         prof['main_ready']+=time.perf_counter()-inference_started
                         actions=host_b[:,:nh].astype(np.int64)
                         logp,value,vg=host_b[:,nh],host_b[:,nh+1],host_b[:,nh+2]
@@ -4929,10 +4928,6 @@ def main(argv=None, child=None, actor=None):
                 answer(prof, a_idx, sub, under_way, actions, logp, value, h=h_e, vg=vg_e, t=t_e)
             while inflight:
                 finish(prof)
-            if block_actor is not None and lanes is not None:   # (B47: launched steps answered before the hand-off)
-                t_k = time.perf_counter()
-                lanes.complete_all()
-                prof['tick'] += time.perf_counter() - t_k
             if actor_profile is not None:
                 import pstats
                 actor_profile.disable()
