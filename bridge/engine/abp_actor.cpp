@@ -90,10 +90,9 @@ struct PageStore {
     kv_pages.push_back(at::zeros({page, kv_elems}, at::TensorOptions().dtype(kv_dtype)));
     z_pages.push_back(at::zeros({page, z_elems}, at::kFloat));
     i64 base = p*page;
-    for (i64 i = page-1; i >= 0; i--) d_free.push_back(base+i);   // (Python's order: the lowest ids leave first)
-    std::reverse(d_free.end()-page, d_free.end());
-    // d_free is a stack popped from the back: put the new page's ids below the existing free ids, like
-    // np.concatenate((new descending, old)) with pops from the front of the old array in Python
+    // Python: d_free = np.concatenate((np.arange(base+P-1, base-1, -1), d_free)): the new page's ids, descending,
+    // in front of the old free ids; _alloc takes the array's last n ids reversed (our pops from the back)
+    for (i64 i = page-1; i >= 0; i--) d_free.push_back(base+i);
     std::rotate(d_free.begin(), d_free.end()-page, d_free.end());
   }
   void grow_b_locked() {
@@ -102,7 +101,6 @@ struct PageStore {
     b_pages.push_back(at::zeros({page, b_elems}, at::kFloat));
     i64 base = p*page;
     for (i64 i = page-1; i >= 0; i--) b_free.push_back(base+i);
-    std::reverse(b_free.end()-page, b_free.end());
     std::rotate(b_free.begin(), b_free.end()-page, b_free.end());
   }
   // Python's _alloc: ids = pool[len-n:][::-1] (the n ids at the end of the free array, reversed), pool = pool[:-n].
