@@ -134,6 +134,7 @@ def main():
     ap.add_argument('--fx-cache', choices=('on', 'off'), required=True)
     ap.add_argument('--steady', action='store_true')
     ap.add_argument('--why-miss', action='store_true', help='B56 P1b: log why AOT cache hits miss their FX graphs')
+    ap.add_argument('--no-reader', action='store_true', help='skip the Flex Reader warm-up (Spatial only)')
     a = ap.parse_args()
     if a.why_miss:
         why_miss()
@@ -157,11 +158,14 @@ def main():
     rec['spatial_s'] = round(time.perf_counter()-t0, 1)
     print(f"B55 spatial warm-up: {rec['spatial_graphs']} graphs in {rec['spatial_s']} s", flush=True)
     rec['spatial'] = metrics()
-    c0 = block_compile.STATS['compiles']
-    rec['reader_s'] = round(block_learner.warm_reader(learner, bf16=True), 1)
-    rec['reader_graphs'] = block_compile.STATS['compiles']-c0
-    print(f"B55 Flex Reader warm-up: {rec['reader_graphs']} graphs in {rec['reader_s']} s", flush=True)
-    rec['after_reader'] = metrics()
+    if not a.no_reader:
+        c0 = block_compile.STATS['compiles']
+        rec['reader_s'] = round(block_learner.warm_reader(learner, bf16=True), 1)
+        rec['reader_graphs'] = block_compile.STATS['compiles']-c0
+        print(f"B55 Flex Reader warm-up: {rec['reader_graphs']} graphs in {rec['reader_s']} s", flush=True)
+        rec['after_reader'] = metrics()
+    with open(a.out, 'w') as f:   # (written again at the end; a timeout keeps the warm-up record)
+        json.dump(rec, f, indent=1)
     block_compile.mark_steady()
     if a.steady:
         t1 = time.perf_counter()
