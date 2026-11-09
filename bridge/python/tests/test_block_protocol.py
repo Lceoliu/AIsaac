@@ -25,6 +25,8 @@ def production(steps=8):
     s.teach_seen=np.zeros(2,np.int64)
     lanes=BlockLaneService(s,model,'cpu',wait=0,distill_steps=1,main_actor=actor)
     lanes.RECLAIM_S=0   # (B46: production reclaims at most every 0.1 s; here at every call)
+    # (B47: these checks follow one round to its answers within step_main / tick: synchronous)
+    lanes.lanes_async=lanes.main_async=lanes.lane_batch=False
     return model,actor,rng,s,lanes
 
 
@@ -226,3 +228,65 @@ def test_throttled_reclamation_only_delays_release_and_never_reuses_ids():
     assert len(lanes.contexts.values)>2                   # nothing released inside the window
     lanes._reclaimed_t=-1e9;lanes.service_control()      # the window over: released, the kept one stays
     assert kept in lanes.contexts.values and len(lanes.contexts.values)<=2
+
+
+def _slot_lanes(lanes_async):
+    """B47: the production lane service on a CUDA SlotBlockActor (step graphs, lanes in its arena)."""
+    from test_block_memory import make_policy
+    from test_block_slot_integration import frame
+    from isaac_bridge.block_paged import SlotBlockActor
+    _,_,_,s,_=production()
+    torch.manual_seed(43)
+    model=make_policy('cuda').eval()
+    actor=SlotBlockActor(model,2,graph_entities=128,lane_slots=2)
+    rng=np.random.default_rng(43)
+    for t in range(6):
+        actor.step(frame(rng,2,t,np.array([4,4]),int(t==0)),synth_pending(rng,2,model.heads),[0,1],
+                   ukeys=(np.array([t,t]),np.array([0,1])))
+    lanes=BlockLaneService(s,model,'cuda',wait=0,distill_steps=1,main_actor=actor)
+    lanes.RECLAIM_S=0
+    lanes.lanes_async=lanes.main_async=lanes.lane_batch=bool(lanes_async)
+    return model,actor,rng,s,lanes,frame
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),reason='CUDA graphs')
+def test_async_lane_rounds_and_main_answers_equal_sync(monkeypatch):
+    """B47: the same request sequence (same lanes, sequence numbers = CRN keys, main rows, host
+    draw order) through the lane service with every step answered at once (B46) and with lane
+    rounds / main answers launched and answered at later passes gives bit-identical lane answers
+    (actions, value, logp, version, value_global, echo) and main answers; an old-generation lane
+    (lane-only step) and a current-generation lane (merged into the main step) both covered."""
+    from isaac_bridge import block_paged
+    monkeypatch.setattr(block_paged,'PRECAPTURE',False)   # (lane graphs captured on first use)
+    results=[]
+    for lanes_async in (False,True):
+        model,actor,rng,s,lanes,frame=_slot_lanes(lanes_async)
+        answers={};mains=[];deferred=0
+        def on_reply(idx):
+            for i in idx:
+                answers[int(s.lane_io[i,10])]=(s.lane_io[i,5:10].copy(),s.lane_out[i,:5].copy())
+        s.on_reply=on_reply
+        assert lanes.capture_point(0,actor.snapshot(0),model,0)   # generation of version 0
+        actor.version=1
+        assert lanes.capture_point(1,actor.snapshot(1),model,1)   # generation of the current version
+        torch.manual_seed(7)   # (the main rows' host uniforms: same draws in both runs)
+        for r in range(8):
+            lane=r%2
+            s.request(lane,frame(rng,1,20+r,np.array([9]),0)[0],synth_pending(rng,1,model.heads)[0],
+                      300+r,tbegin=lane+1 if r<2 else 0)
+            main=frame(rng,1,6+r,np.array([4]),0)
+            lanes.step_main(main,synth_pending(rng,1,model.heads),[r%2],
+                            on_main_ready=lambda h,c:mains.append(h.copy()))
+            deferred+=len(lanes.work)
+        lanes.complete_all()
+        assert not lanes.work and not actor.state.inflight
+        assert sorted(answers)==list(range(300,308)) and len(mains)==8
+        assert (deferred>0)==lanes_async
+        assert lanes.stat.get('merged_main_rows',0)>0
+        results.append((answers,mains))
+    (a0,m0),(a1,m1)=results
+    for k in a0:
+        np.testing.assert_array_equal(a0[k][0],a1[k][0])
+        np.testing.assert_array_equal(a0[k][1],a1[k][1])
+    for x,y in zip(m0,m1):
+        np.testing.assert_array_equal(x,y)
