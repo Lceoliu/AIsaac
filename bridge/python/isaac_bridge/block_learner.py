@@ -44,6 +44,89 @@ PACKED = os.environ.get('ISAAC_PACKED_LEARNER', '1') == '1'
 # fixed-input benchmark: OOM in the first training part); 4096-row checkpoints peak at 7.7 GB.
 SPATIAL_CKPT = int(os.environ.get('ISAAC_LEARN_SPATIAL_CKPT', '1'))
 SPATIAL_ROWS = int(os.environ.get('ISAAC_LEARN_SPATIAL_ROWS', '4096'))
+
+
+PREP_LOCK = __import__('threading').Lock()   # (B48: one host preparation at a time: page store caches, staging)
+PREFETCH_ON = os.environ.get('ISAAC_LEARN_PREFETCH', '1') == '1'
+
+
+class Prefetch:
+    """B48: the next learner part's host preparation (_prepare_packed) on a background thread while the
+    current part runs on the GPU. submit(model, chunks, **kwargs) starts it (grad mode: True, the PPO
+    parts); forward_packed takes it when called with the same chunks (by identity) and arguments, else
+    it is dropped (its staging buffer freed). The thread does host work only (numpy decodes and index
+    arithmetic, the pinned slab fill); the parts' draws stay in the parts' order (one preparation at a
+    time: PREP_LOCK)."""
+    def __init__(self):
+        self.job = None
+        self.hits = self.misses = 0
+
+    @staticmethod
+    def _key(chunks, kw, grad):
+        return (tuple(id(c) for c in chunks), tuple(sorted((k, v) for k, v in kw.items() if k != 'generator')),
+                id(kw.get('generator')), bool(grad))
+
+    def submit(self, model, chunks, **kw):
+        import threading
+        self.drop()
+        if not PREFETCH_ON or not chunks:
+            return
+        full = dict(generator=None, train_history=True, version=0, spatial_micro=None, require_next_state=False,
+                    deduplicate_sources=True, history_mode='random', max_rows=None)
+        full.update(kw)
+        box = {}
+
+        def work():
+            with PREP_LOCK:
+                t0 = time.perf_counter()
+                try:
+                    box['P'] = _prepare_packed(model, chunks, True, **full)
+                    bp.ucount('learn_prefetch_host_s', time.perf_counter()-t0)
+                except BaseException as e:   # (re-raised by the caller that takes it)
+                    box['error'] = e
+        th = threading.Thread(target=work, name='learner-prefetch', daemon=True)
+        th.start()
+        self.job = (self._key(chunks, full, True), th, box, list(chunks))
+
+    def take(self, chunks, kw, grad):
+        """The prepared part for exactly these chunks / arguments (waited for), else None: another call
+        (e.g. a no-grad forward between two PPO parts) leaves the prepared part for its own call."""
+        if self.job is None:
+            return None
+        key, th, box, _ = self.job
+        if key != self._key(chunks, kw, grad):
+            bp.ucount('learn_prefetch_other_calls', 1)
+            return None
+        self.job = None
+        t0 = time.perf_counter()
+        th.join()
+        bp.ucount('learn_prefetch_wait_s', time.perf_counter()-t0)
+        if 'error' in box:
+            raise box['error']
+        self.hits += 1
+        bp.ucount('learn_prefetch_hits', 1)
+        return box['P']
+
+    @staticmethod
+    def _free(box):
+        P = box.get('P')
+        if P is not None and P['slab'].cuda:
+            STAGING.drop(P['slab'].k)
+
+    def drop(self):
+        """The prepared part, unused, given up (its staging buffer freed)."""
+        if self.job is not None:
+            _, th, box, _ = self.job
+            self.job = None
+            th.join()
+            self._free(box)
+            self.misses += 1
+            bp.ucount('learn_prefetch_dropped', 1)
+
+
+PREFETCH = Prefetch()
+
+
 # Reader attention of the T > 1 buckets: 'flex' (FlexAttention, masks and the learnable relative /
 # age biases evaluated inside the kernel: no [B,H,Q,K] bias tensors or their gradients) or 'sdpa'
 # (BlockMemory.read itself: the equivalence reference).
@@ -218,30 +301,51 @@ def chunk_bucket(n):
 
 
 class Staging:
-    """Persistent pinned host slabs for the learner's per-part upload. Two buffers alternate; a
-    buffer is rewritten only after the copy that last read it has finished (its event), and is
-    reallocated only when a part needs more bytes (x1.25 headroom)."""
+    """Persistent pinned host slabs for the learner's per-part upload. A buffer is taken by acquire and
+    given back by release (after the upload: its copy's event) or drop (never uploaded); it is rewritten
+    only once free and its last copy has finished. B48: a pool, not two alternating buffers (a part
+    prepared ahead by the prefetch thread holds its buffer until it runs); a buffer is reallocated only
+    when a part needs more bytes (x1.25 headroom)."""
     ALIGN = 256
 
     def __init__(self):
-        self.buf, self.event, self.i, self.allocs = [None, None], [None, None], 0, 0
+        import threading
+        self.bufs = []   # [buffer, event of its last copy, busy]
+        self.lock = threading.Lock()
+        self.allocs = 0
 
     def acquire(self, n):
-        i = self.i
-        self.i ^= 1
-        if self.event[i] is not None:
-            self.event[i].synchronize()
-            self.event[i] = None
-        if self.buf[i] is None or self.buf[i].numel() < n:
-            self.buf[i] = None
-            self.buf[i] = torch.empty(int(n*1.25)+self.ALIGN, dtype=torch.uint8, pin_memory=True)
+        with self.lock:
+            free = [i for i, b in enumerate(self.bufs) if not b[2]]
+            fit = [i for i in free if self.bufs[i][0].numel() >= n]
+            done = [i for i in fit if self.bufs[i][1] is None or self.bufs[i][1].query()]
+            i = (done or fit or free or [None])[0]
+            if i is None:
+                self.bufs.append([None, None, False])
+                i = len(self.bufs)-1
+            self.bufs[i][2] = True
+            ev = self.bufs[i][1]
+        if ev is not None:
+            ev.synchronize()
+        b = self.bufs[i]
+        b[1] = None
+        if b[0] is None or b[0].numel() < n:
+            b[0] = None
+            b[0] = torch.empty(int(n*1.25)+self.ALIGN, dtype=torch.uint8, pin_memory=True)
             self.allocs += 1
-        return i, self.buf[i]
+        return i, b[0]
 
     def release(self, i):
         ev = torch.cuda.Event()
         ev.record()
-        self.event[i] = ev
+        with self.lock:
+            self.bufs[i][1] = ev
+            self.bufs[i][2] = False
+
+    def drop(self, i):
+        """A buffer whose slab was never uploaded (a prefetched part not used)."""
+        with self.lock:
+            self.bufs[i][2] = False
 
 
 STAGING = Staging()
@@ -401,10 +505,26 @@ def _fill_merged(hosts, shapes, host_views):
 def forward_packed(model, chunks, generator=None, train_history=True, version=0, spatial_micro=None,
                    require_next_state=False, deduplicate_sources=True, history_mode='random', max_rows=None):
     """forward_bucketed(model, chunks) for paged chunks in one execution (module docstring).
-    Returns (outputs in the chunks' decision order, ctx with o_seq, z_out, recompute_stats, replay)."""
-    from torch.utils.checkpoint import checkpoint
-    from .structured_input import (packed_rows_plan, packed_rows_apply, t_bucket, RAGGED,
-                                   canvas_decoder)
+    Returns (outputs in the chunks' decision order, ctx with o_seq, z_out, recompute_stats, replay).
+    B48: the host preparation (_prepare_packed) is the one PREFETCH made ahead for these chunks and
+    arguments when there is one (the same work, done earlier on the prefetch thread), else done here."""
+    grad = torch.is_grad_enabled()
+    kw = dict(generator=generator, train_history=train_history, version=version, spatial_micro=spatial_micro,
+              require_next_state=require_next_state, deduplicate_sources=deduplicate_sources,
+              history_mode=history_mode, max_rows=max_rows)
+    P = PREFETCH.take(chunks, kw, grad)
+    if P is None:
+        with PREP_LOCK:
+            P = _prepare_packed(model, chunks, grad, **kw)
+    return _run_packed(model, P)
+
+
+def _prepare_packed(model, chunks, grad, generator=None, train_history=True, version=0, spatial_micro=None,
+                    require_next_state=False, deduplicate_sources=True, history_mode='random', max_rows=None):
+    """B48: forward_packed's host part (history draw, decodes, plans, index arrays, the filled staging
+    slab); touches no parameter and no CUDA stream (runs on the prefetch thread). grad: the run's
+    autograd mode (thread-local, so passed in)."""
+    from .structured_input import packed_rows_plan, t_bucket
     if history_mode not in bp.HISTORY_MODES:
         raise ValueError(f'history_mode {history_mode!r}: one of {bp.HISTORY_MODES}')
     if not chunks:
@@ -412,14 +532,13 @@ def forward_packed(model, chunks, generator=None, train_history=True, version=0,
     t0 = time.perf_counter()
     device = next(model.parameters()).device
     if spatial_micro is None:
-        spatial_micro = bp.SPATIAL_MICRO_TRAIN if torch.is_grad_enabled() else bp.SPATIAL_MICRO_EVAL
+        spatial_micro = bp.SPATIAL_MICRO_TRAIN if grad else bp.SPATIAL_MICRO_EVAL
     memory = model.block_memory
     cfg = memory.config
     bs, mt, lat, lw = cfg.block_steps, cfg.memory_tokens, cfg.latents, cfg.latent_width
     store = chunks[0].snapshot.store
     B = len(chunks)
     lens = np.array([len(c.rows) for c in chunks], np.int64)
-    grad = torch.is_grad_enabled()
     bp.ucount('learn_packed_calls', 1)
     bp.count('learn.calls', 1); bp.count('learn.chunks', B); bp.count('learn.rows', int(lens.sum()))
     parts = []
@@ -623,6 +742,25 @@ def forward_packed(model, chunks, generator=None, train_history=True, version=0,
     if sizes_i:
         np.concatenate([np.asarray(ints[k], np.int64) for k in names_i], out=slab.host['ints'].numpy())
     bp.ucount('learn_packed_host_s', time.perf_counter()-t0)
+    return dict(bs=bs, cfg=cfg, device=device, grad=grad, lat=lat, lw=lw, memory=memory, n_hist=n_hist,
+                n_main=n_main, n_new=n_new, n_old_total=n_old_total, n_tail=n_tail, names_i=names_i, packed=packed,
+                pk_all=pk_all, plans=plans, rbuckets=rbuckets, replay_host=replay_host, selected=selected,
+                sizes_i=sizes_i, slab=slab, spatial_micro=spatial_micro, store=store, ub=ub, ubid=ubid,
+                unique=unique, version=version)
+
+
+def _run_packed(model, P):
+    """B48: forward_packed's device part on a prepared part P (_prepare_packed): one upload, Spatial,
+    Writer, Reader and heads."""
+    from torch.utils.checkpoint import checkpoint
+    from .structured_input import packed_rows_apply, RAGGED, canvas_decoder
+    (bs, cfg, device, grad, lat, lw, memory, n_hist, n_main, n_new, n_old_total, n_tail, names_i, packed, pk_all,
+     plans, rbuckets, replay_host, selected, sizes_i, slab, spatial_micro, store, ub, ubid, unique, version) = (
+        P[k] for k in ('bs', 'cfg', 'device', 'grad', 'lat', 'lw', 'memory', 'n_hist', 'n_main', 'n_new',
+                       'n_old_total', 'n_tail', 'names_i', 'packed', 'pk_all', 'plans', 'rbuckets', 'replay_host',
+                       'selected', 'sizes_i', 'slab', 'spatial_micro', 'store', 'ub', 'ubid', 'unique', 'version'))
+    if grad != torch.is_grad_enabled():
+        raise RuntimeError('a learner part prepared for another autograd mode')
     with torch.inference_mode(False), torch.no_grad():
         dev = slab.upload()
         di = dict(zip(names_i, dev['ints'].split(sizes_i)))

@@ -116,7 +116,11 @@ UPD_KEYS = ('learn_fwd_part_wall_s', 'learn_fwd_part_gpu_s', 'learn_bwd_wall_s',
             'actor_graph_host_s', 'actor_graph_wait_s', 'actor_pages_s', 'actor_step_s', 'actor_steps_main',
             'actor_steps_merged', 'actor_steps_lane', 'actor_steps_eager', 'actor_rows_main', 'actor_rows_lane',
             'lane_call_s', 'lane_answer_s', 'lane_calls', 'lane_rows', 'lane_rows_merged', 'lane_rows_graph',
-            'lane_rows_eager')
+            'lane_rows_eager',
+            # B48: learner parts prepared ahead on the prefetch thread: used / other calls in between / dropped,
+            # their host seconds, the PPO thread's wait for them
+            'learn_prefetch_hits', 'learn_prefetch_other_calls', 'learn_prefetch_dropped', 'learn_prefetch_host_s',
+            'learn_prefetch_wait_s')
 LEARNER_ACTIVE = [False]
 
 
@@ -140,9 +144,13 @@ if TIMING_ON:
     _time_gc()
 
 
+_UPD_LOCK = threading.Lock()
+
+
 def ucount(name, value):
     if TIMING_ON:
-        UPD[name] = UPD.get(name, 0)+value
+        with _UPD_LOCK:   # (B48: the learner's prefetch thread counts too)
+            UPD[name] = UPD.get(name, 0)+value
 
 
 class GpuSpan:

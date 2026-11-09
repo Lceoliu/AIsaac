@@ -3525,6 +3525,39 @@ def main(argv=None, child=None, actor=None):
         pm = pn = n_sel = None
         t_table = None
         gn_acc = torch.zeros(1, device=device) if gn_on else None
+        if block_on:
+            from isaac_bridge import block_learner as blearn
+
+        def next_ppo_chunks(at_, lo_, bounds_, last_, tb_, vb_, pick_, vpick_):
+            """B48: the chunks of the PPO part after (minibatch at_, part lo_) in this epoch (its teacher / v2 draws
+            made now, in order, and kept for its minibatch), [] at the epoch's end."""
+            los_ = [b_[0] for b_ in bounds_]
+            k_ = los_.index(lo_)
+            if k_ + 1 < len(bounds_):   # the minibatch's next part (the same draws)
+                lo2, _, cids2 = bounds_[k_ + 1]
+                m2, vm2, p2, vp2 = tb_ is not None, vb_ is not None, pick_, vpick_
+            else:
+                later = [a_ for a_ in mb_ats if a_ > at_]
+                if not later:
+                    return []
+                at2 = later[0]
+                tc2 = perm_h[at2:at2 + mb_units]
+                b2 = temporal_bounds(tch, tc2, args.micro or int(tch[tc2, 1].sum()))
+                lo2, _, cids2 = b2[0]
+                last_ = b2[-1][0]
+                m2 = teach_step >= 8 and teach_n >= 256
+                vm2 = v2_step >= 8 and v2_on and L['v2_n'] >= 256
+                p2 = vp2 = None
+                if m2:
+                    p2 = pre_pick[at2] = np.random.randint(0, teach_n, teach_step)
+                if vm2:
+                    vp2 = pre_vpick[at2] = v2_rng.integers(0, L['v2_n'], v2_step)
+            out_ = [mplan['chunks'][i] for i in cids2]
+            if m2 and args.teach_merge and lo2 == last_:
+                out_ += [L['teach_chunks'][i] for i in p2]
+            if vm2 and args.teach_merge and lo2 == last_:
+                out_ += [L['v2_chunks'][i] for i in vp2]
+            return out_
         for _ in range(args.epochs):
             if t_on:   # (B31) the rooms made before each chunk: every room token's K / V once per epoch (stop-grad)
                 t_t0 = time.perf_counter()
@@ -3536,6 +3569,10 @@ def main(argv=None, child=None, actor=None):
             perm = torch.randperm(n_units, device=device)
             perm_h = perm.cpu().numpy()
             first_step = True
+            # B48 (block learner prefetch): the minibatches this epoch runs, and the teacher / teacher-v2 draws a
+            # prefetch made ahead for one of them (drawn in the minibatches' order: the same draws)
+            mb_ats = [a_ for a_ in range(0, n_units, mb_units) if len(perm_h[a_:a_ + mb_units]) >= mb_units // 4]
+            pre_pick, pre_vpick = {}, {}
             for at in range(0, n_units, mb_units):
                 sel_h = perm_h[at:at + mb_units]
                 if len(sel_h) < mb_units // 4:
@@ -3591,7 +3628,7 @@ def main(argv=None, child=None, actor=None):
                 if teaching:
                     # the teacher's records of this step (drawn here, before the PPO parts: the same draws as when
                     # they were drawn after them, nothing else uses numpy's generator)
-                    pick = np.random.randint(0, teach_n, teach_step)
+                    pick = pre_pick.pop(at) if at in pre_pick else np.random.randint(0, teach_n, teach_step)
                     if fast:   # B18: from the meta's copy on the device (no blocking copy)
                         pick_d = dev(pick)
                         meta = t_meta.index_select(0, pick_d)
@@ -3610,7 +3647,7 @@ def main(argv=None, child=None, actor=None):
                     sec('teach_build')
                 vb = None   # 2026-10-10 (teacher v2): this step's imitation records (drawn with their own generator)
                 if v2_step >= 8 and v2_on and L['v2_n'] >= 256:
-                    vpick = v2_rng.integers(0, L['v2_n'], v2_step)
+                    vpick = pre_vpick.pop(at) if at in pre_vpick else v2_rng.integers(0, L['v2_n'], v2_step)
                     vpick_d = dev(vpick)
                     v_pend, v_act = L['v2_pend'].index_select(0, vpick_d), L['v2_act'].index_select(0, vpick_d)
                     v_w, v_G = L['v2_w'].index_select(0, vpick_d), L['v2_G'].index_select(0, vpick_d)
@@ -3728,6 +3765,12 @@ def main(argv=None, child=None, actor=None):
                             for key_b,value_b in ctx_b['recompute_stats'].items():
                                 block_ppo_counts[key_b]+=value_b
                             tk_ = dict(temporal=ctx_b)
+                            if blearn.PREFETCH_ON and not mem_on:   # B48: the next PPO part's host preparation now
+                                blearn.PREFETCH.submit(learner_model, next_ppo_chunks(at, lo_, bounds, last, tb, vb,
+                                                       pick if tb is not None else None,
+                                                       vpick if vb is not None else None),
+                                                       max_rows=args.micro or args.minibatch, version=L['update'],
+                                                       history_mode=args.block_history_mode)
                         elif chunked:   # (memory) BPTT over the part's chunks from their stored first states; the
                             #          teacher's records one step each (the old teacher's from 0, teacher v2's own)
                             memd = None   # (B32: a temporal model without the GRU)
@@ -3920,6 +3963,7 @@ def main(argv=None, child=None, actor=None):
                 pmark(None, m_)
                 sec('opt')
         if block_on:
+            blearn.PREFETCH.drop()   # (B48: a part prepared for nothing left: its staging buffer freed)
             learner_dump.end(learner_model)   # (B44 ISAAC_LEARNER_DUMP: measurement only)
         learner_model.eval()
         choice_log = train_choice() if branching else {}   # Phase B2 (before the actor takes the new weights)
