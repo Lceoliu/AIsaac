@@ -61,14 +61,15 @@ def main():
     pid = actor_tid >> 24   # globalTid = (pid << 24) | tid on Linux targets
     rows = c.execute("select globalTid, count(*) from NVTX_EVENTS where text like 'learner.%' group by globalTid").fetchall()
     learner_tid = max(rows, key=lambda r: r[1])[0] if rows else None
-    # ---- the capture window: first to last event of the process
-    lo, hi = c.execute("select min(start), max(coalesce(end, start)) from NVTX_EVENTS where (globalTid >> 24) = ?",
-                       (pid,)).fetchone()
-    if 'CUPTI_ACTIVITY_KIND_RUNTIME' in T:
-        lo2, hi2 = c.execute("select min(start), max(end) from CUPTI_ACTIVITY_KIND_RUNTIME where (globalTid >> 24) = ?",
-                             (pid,)).fetchone()
-        if lo2:
-            lo, hi = min(lo, lo2), max(hi, hi2)
+    # ---- the capture window: the B50window range (block_nvtx.profiler_mark) when present, else every event
+    row = c.execute("select start, end from NVTX_EVENTS where text = 'B50window' and end is not null order by start limit 1").fetchone()
+    if row:
+        lo, hi = row
+        print('window: the B50window range')
+    else:
+        lo, hi = c.execute("select min(start), max(coalesce(end, start)) from NVTX_EVENTS where (globalTid >> 24) = ?",
+                           (pid,)).fetchone()
+        print('window: every event of the process (no B50window range)')
     win = hi-lo
     print(f'process pid {pid}: capture window {win/1e9:.2f} s; actor tid {actor_tid & 0xffffff}, '
           f'learner tid {learner_tid & 0xffffff if learner_tid else None}')
@@ -79,7 +80,14 @@ def main():
                         (actor_tid, lo, hi)).fetchone()[0]
     n_upd = c.execute("select count(*) from NVTX_EVENTS where text = 'learner.update' and start >= ? and end <= ?",
                       (lo, hi)).fetchone()[0]
-    print(f'in the window: {n_calls} main calls, {n_steps} step graph syncs, {n_upd} complete learner updates')
+    n_rounds = c.execute("select count(*) from NVTX_EVENTS where globalTid = ? and text = 'lane.eager' and start >= ? and end <= ?",
+                         (actor_tid, lo, hi)).fetchone()[0]
+    n_coll = c.execute("select count(*) from NVTX_EVENTS where globalTid = ? and text = 'actor.weights' and start >= ? and end <= ?",
+                       (actor_tid, lo, hi)).fetchone()[0]
+    print(f'in the window: {n_calls} main calls, {n_steps} step graph syncs, {n_rounds} lane rounds '
+          f'(lane-only steps {n_steps-n_calls}, rounds merged into a main call {n_rounds-(n_steps-n_calls)}), '
+          f'{n_upd} complete learner updates, {n_coll} weight takes (collects)')
+    per = max(n_coll, 1)
 
     def clipped_sum(table, where, params):
         """sum of (min(end,hi)-max(start,lo)) over ranges of a table."""
@@ -131,6 +139,7 @@ def main():
         ev = c.execute("select start, end, text from NVTX_EVENTS where globalTid = ? and text is not null and end is not null "
                        "and domainId = 0 and start >= ? and end <= ? order by start, end desc", (tid, lo, hi)).fetchall()
         incl, excl, cnt = defaultdict(int), defaultdict(int), defaultdict(int)
+        ctx_sum, ctx_cnt = defaultdict(int), defaultdict(int)   # g.sync by context: under lane.eager or not
         stack = []
         for s, e, t in ev:
             while stack and stack[-1][1] <= s:
@@ -140,9 +149,17 @@ def main():
             excl[t] += d
             if stack:
                 excl[stack[-1][2]] -= d
+            if t == 'g.sync':
+                k = 'lane round (lane-only or merged)' if any(x[2] == 'lane.eager' for x in stack) else 'main-only call'
+                ctx_sum[k] += d; ctx_cnt[k] += 1
             stack.append((s, e, t))
+        for k in ctx_sum:
+            print(f'  {name:8s} g.sync in {k:36s} {ctx_cnt[k]:8d} {ctx_sum[k]/1e9:9.3f} s  {ms(ctx_sum[k])/ctx_cnt[k]:7.3f} ms/step'
+                  f'   per collect {ctx_sum[k]/1e9/per:7.3f}')
+        print(f'  ({name}: inclusive / exclusive also per collect, over {per} collects)')
         for t in sorted(incl, key=lambda k: -incl[k]):
-            print(f'  {name:8s} {t:26s} {cnt[t]:8d} {incl[t]/1e9:9.3f} {excl[t]/1e9:9.3f} {ms(incl[t])/max(cnt[t],1):8.3f}')
+            print(f'  {name:8s} {t:26s} {cnt[t]:8d} {incl[t]/1e9:9.3f} {excl[t]/1e9:9.3f} {ms(incl[t])/max(cnt[t],1):8.3f}'
+                  f'   per collect {incl[t]/1e9/per:7.3f} / {excl[t]/1e9/per:7.3f}')
 
     # ---- GIL waits attributed to the innermost block_nvtx range they start in (actor thread), GIL percentiles
     if gil_ids:
@@ -184,6 +201,19 @@ def main():
         for t in sorted(by, key=lambda k: -sum(by[k])):
             ds = sorted(by[t]); n = len(ds)
             print(f'  {name:8s} {t:26s} {n:8d} {ms(ds[n//2]):8.3f} {ms(pct(ds, .9)):8.3f} {ms(pct(ds, .99)):8.3f} {ms(ds[-1]):8.3f}')
+
+    # ---- g.sync tail: the GPU wait split by duration (a step graph alone takes about 2 ms on the idle 4090)
+    ds = sorted(e_-s_ for s_, e_ in c.execute("select start, end from NVTX_EVENTS where globalTid = ? and text = 'g.sync' "
+                                               "and end is not null and start >= ? and end <= ?", (actor_tid, lo, hi)))
+    if ds:
+        print('\n== g.sync (GPU wait at the step graph sync) by duration bucket: bucket, syncs, total s, share')
+        tot = sum(ds)
+        for a, b in ((0, 2.5e6), (2.5e6, 5e6), (5e6, 10e6), (10e6, 50e6), (50e6, 1e12)):
+            sel = [d for d in ds if a <= d < b]
+            if sel:
+                print(f'  {a/1e6:5.1f}-{min(b, 1e9)/1e6:6.1f} ms {len(sel):8d} {sum(sel)/1e9:9.3f} {100*sum(sel)/tot:6.1f}%')
+        base = 2.0e6*len(ds)
+        print(f'  if every sync took 2.0 ms (idle graph time): {base/1e9:.2f} s; excess over that: {(tot-base)/1e9:.2f} s')
 
     # ---- GPU: kernels / graphs per stream (window), utilisation (cuda trace only)
     if 'CUPTI_ACTIVITY_KIND_KERNEL' in T:
