@@ -96,6 +96,8 @@ class BlockLaneService(LaneService):
         self.driver=None
         self.drv_jobs={}
         self.job_serial=0
+        self.py_mode=False      # (B54: serve_wait with the driver paused steps rounds on the Python path)
+        self.ring_dirty=set()   # (B54: (generation, lane) rows the Python path stepped: their ring re-set before a job)
 
     def attach_driver(self, driver):
         """(B54) The lane rounds' steps go to the C++ driver: _begin restores here (and sets the restored rows'
@@ -260,7 +262,23 @@ class BlockLaneService(LaneService):
 
     def serve_wait(self,timeout):
         self.service_control()
-        return super().serve_wait(timeout)
+        if self.driver is None:
+            return super().serve_wait(timeout)
+        # (B54: the actor waits for the learner with the driver paused (and drained): the round in flight, its jobs
+        # still queued on the driver, stepped here; the waiting rounds on the Python path, as before B54)
+        if self.fly is not None and not self.fly['ready']:
+            for job in sorted(self.fly['jobs']):
+                if not self.driver.drop_lane_job(job):
+                    raise RuntimeError(f'lane job {job}: not queued on the paused driver (its record unconsumed?)')
+                self._python_job(job)
+        if self.fly is not None and self.fly['ready']:
+            self.finish()
+            return True
+        driver, self.driver, self.py_mode = self.driver, None, True
+        try:
+            return super().serve_wait(timeout)
+        finally:
+            self.driver, self.py_mode = driver, False
 
     def capture_point(self, bank_index, snapshot, actor_model, model_version):
         """Before consuming the selection-point observation. False = backpressure."""
@@ -353,6 +371,9 @@ class BlockLaneService(LaneService):
             replays[j]=bool(self.s.block_arrays[1][lane]) if self.main_actor is not None else False
             groups.setdefault(generation, []).append(j)
         group_items=list(groups.items())
+        if self.py_mode:
+            for generation, positions in group_items:
+                self.ring_dirty.update((generation, int(idx[j])) for j in positions)
         if self.main_request is not None:
             matching=[generation for generation in groups
                       if self.actors[generation].version==self.main_actor.version]
@@ -498,6 +519,10 @@ class BlockLaneService(LaneService):
             positions = np.asarray(positions, np.int64)
             actor = self.actors[generation]
             lanes = idx[positions]
+            for lane in lanes.tolist():   # (rows the Python path stepped meanwhile: the driver's ring from the log)
+                if (generation, lane) in self.ring_dirty:
+                    self.ring_dirty.discard((generation, lane))
+                    driver_ring(self.driver, actor, lane)
             sub = np.ascontiguousarray(rows[positions])
             self.job_serial += 1
             job = self.job_serial
@@ -565,6 +590,11 @@ class BlockLaneService(LaneService):
         """(B54) A kind 5 record: a job the driver cannot replay (an invalid / too wide frame); the driver is paused.
         Stepped here on the lane actor (its eager path, as _eager would), the rings set again, the job dropped."""
         job = int(rec['job'])
+        self.driver.drop_lane_job(job)
+        self._python_job(job)
+
+    def _python_job(self, job):
+        """(B54) A queued job stepped here on its lane actor (the driver paused), its rings re-set, answered."""
         generation, positions, version, lanes, rows, pend, keys, replay = self.drv_jobs.pop(job)
         f = self.fly
         actor = self.actors[generation]
@@ -573,7 +603,6 @@ class BlockLaneService(LaneService):
         f['eager_calls'] += int(getattr(actor, 'last_path', 'eager') == 'eager')
         for lane in lanes.tolist():
             self._set_ring(actor, lane)
-        self.driver.drop_lane_job(job)
         self._answer_rows(f, generation, positions, version, actor.host_output, actor.last_contexts, replay)
         f['jobs'].discard(job)
         if not f['jobs']:
