@@ -9198,3 +9198,156 @@ actor线程墙钟分解（prof-b46f，u2–u14中位，host秒/rollout；各段�
 - prof-b46c是完整的中间版本，保留作对照。
 - 收尾时一个A8脚本误带了旧的pytest和profile段，3分钟内停掉。它截断了`tests-b46c-full.log`（该次结果191 passed已在前面记录），prof-b46c的数据未受影响。A8随后单独重跑。
 - 4090已空闲（guard：0个train_tok、0个isaac进程，显存12 MiB）。
+
+### B47 速度改造第3b步：actor侧剩余手段（异步lane、流水化、写页、host热点）（2026-11-09）
+
+#### 实验目的
+
+B46之后collect中位28.7 s，update 21.7 s，×实时144.9，collect < 25 s和×实时 ≥ 150两门未过。用户的硬门槛是 ≥ 200×才有训练意义。按 ×实时 ≈ 4369/max(collect, update)，200×要求collect和update都 ≤ 22 s。
+
+本步门槛：
+- collect ≤ 22 s，最低线 < 25 s，冲刺 ≤ 20 s；
+- update ≤ 22.0 s，不得比b46f的21.7 s差超过0.5 s；
+- ×实时 ≥ 150，冲刺 ≥ 200。
+
+预算不动：CF配额6/180、lane窗口、teacher share、输入、模型、micro 8192。不训练。
+
+#### 实验方法
+
+先按收益逐项实现，每项单独计量，再按实测收口。各项都在16个update的短profile上比较（prof-f4口径，取u2–u14中位）；8个update的run只用于筛选。
+
+- 延迟step机制（各项异步的基础，最终未保留）：
+  - `SlotBlockActor.step(defer=True)`返回票据，`complete`按发起顺序完成同一arena上的step。
+  - 每个graph有多组pinned主机缓冲，同一graph可以有多次调用同时在途。
+  - 等价测试：同一arena行背靠背发起两次step，与同步graph逐位相等，与eager在graph测试容差内相等；异步lane服务与同步服务逐位相等（同一请求序列和CRN键）。两项测试都在4090上通过。
+- 第1项，主应答之后的lane轮次异步（`ISAAC_B47_LANES_ASYNC`）。
+- 第2项，主调用流水化（`ISAAC_B47_MAIN_ASYNC`）。
+- 第3项，一轮内各代lane的step一次同步（`ISAAC_B47_LANE_BATCH`）。
+- lane轮次合并（`ISAAC_B47_LANE_HOLD`，4 ms）：lane-only轮次等最老请求满4 ms才发，主调用仍收下全部等待的lane。
+- 计数器：lane轮次从哪里起（并入主调用 / 只有其他版本的lane / tick / serve_wait）及其行数；step graph的GPU时长和host等待的分位数，按learner忙闲分开。
+- 修法1（写页，保留）：
+  - 1a：step graph直接输出行优先的K/V `[n,L,2,H,lat,dh]`和float32的z，host从pinned D2H缓冲按owner切片直接写页。去掉了每个owner一次的`index_select`拷贝。
+  - 1b：每步只做一次动作类型转换。按owner推log做不到，每行各自扩展自己slot的lineage。
+- 修法3（host热点）：
+  - C helper：帧头计数和检查`abp_visible_counts`、CRN uniform`abp_crn_uniforms`、FrameArena帧拷贝`abp_copy_frames`，与参照逐位相等，见`test_b47_native.py`。
+  - 输出打包：graph内把四个输出拼成一个字节缓冲，每次调用只做一次D2H。
+  - 设备端结果按需：`device_result=False`时graph step不再把结果拷回GPU，train_tok的actor只读`host_output`。
+- 修法2（按块落页）跳过。1a之后K/V已是单次拷贝，写页剩下的是逐行Python（raw帧dict约0.14 ms/16行，log push），按块落页省不掉这些，不值四个读者的按需flush。1c（raw帧字节arena）也跳过：每rollout约0.3–0.4 s，需要随`collect`做arena压缩，风险大于收益。
+- 测量工具：
+  - 固定输入host基准`b47-host-bench.py`：16行真实dump，600个同步step，GPU空闲；
+  - actor线程在线cProfile（rollout 3），用`b47-segments.py`汇总；
+  - 对照run：B46代码在同一会话重跑（ctl、ctl16）。
+
+#### 实验结果
+
+逐项筛选（8个update，窗口u2–u8；同代码两次run之间update差约2 s，2 s以内的差异不下结论）：
+
+| run | ×实时 | collect | update | lane轮次 | merged步 | learner前向GPU s | learner自愿切换 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| prof-b46f | 141.4 | 29.5 | 21.5 | 1,786 | 609 | 8.65 | 43k |
+| ctl（B46代码重跑） | 142.3 | 30.9 | 23.3 | 1,765 | 610 | 9.56 | 41k |
+| i1（lane异步） | 155.5 | 26.8 | 23.8 | 2,343 | 392 | 10.4 | 60k |
+| i1c（+合并） | 149.7 | 28.3 | 26.5 | 2,014 | 269 | 10.9 | 52k |
+| i12（+主调用流水化） | 153.5 | 28.2 | 26.9 | 2,543 | 1,196 | 11.7 | 80k |
+| i12c（+合并） | 150.8 | 27.4 | 27.2 | 2,338 | 713 | 11.65 | 78k |
+| i3（一轮一次同步） | 142.4 | 31.1 | 24.2 | 1,751 | 541 | 10.1 | 47k |
+
+- 异步只是把actor的GPU工作挪进learner的时间：collect少的部分，update和learner的切换数几乎同量增加。
+- 主调用流水化没有可重叠的host工作：worker在等应答，poll常常取不到新记录，actor每rollout约9.6 s在tick里补完在途的调用，每次调用的行数也从15.3降到12.1。
+- 合并没有达到要求的轮次 ≤ 1,786且merged ≥ 609。
+
+merged份额的解释（prof-b47-f13的起点计数，每update）：
+- lane轮次全部在step_main里起，tick和serve_wait为0；
+- 373轮（2,147行，lane行的24%）与主调用合并；
+- 1,110轮（4,826行，54%）只含落后于主版本的teacher代，无法合并；
+- 同代码两次run之间合并份额也在11%–19%之间波动。
+
+所以合并份额由teacher代的版本结构决定，不是窗口问题。“lane行等下一次主调用”的方案只有在大量同版本lane行被单独起轮时才有用，计数显示没有这种情况，未做。
+
+每步host分解（actor线程cProfile，含profiler开销；左为修法前b47c，后两列为修法1+3的b47e）：
+
+| 段 | 修法前（lane异步） | 修法后（lane异步） | 修法后（同步） |
+|---|---:|---:|---:|
+| GPU等待 | 1.92 ms/步，7.85 s | 2.00 ms/步，9.36 s | 3.33 ms/步，14.25 s |
+| 写页 | 1.18 ms/步 | 0.85 ms/步 | 0.85 ms/步 |
+| graph发起准备 | 0.93 ms/步 | 0.81 ms/步 | 0.77 ms/步 |
+| step其余准备 | 0.28 ms/步 | 0.48 ms/步 | 0.27 ms/步 |
+| 完成 | 0.36 ms/步 | 0.16 ms/步 | 0.17 ms/步 |
+| 应答（store + reply） | 1.06 ms/调用 | 0.87 ms/调用 | 0.81 ms/调用 |
+| book.arrive | 0.43 ms/调用 | 0.42 ms/调用 | 0.39 ms/调用 |
+| capture_main / control | 0.65 ms/调用 | 0.60 ms/调用 | 0.65 ms/调用 |
+| lane轮次组装 | 1.30 ms/轮 | 1.38 ms/轮 | 1.17 ms/轮 |
+
+固定输入基准（16行，ms/步）：
+
+| 代码 | 写页 | 发起准备 | 整步 |
+|---|---:|---:|---:|
+| B46机制（b47c） | 0.96 | 0.36 | 3.68 |
+| 1a | 0.39 | 0.35 | 3.10 |
+| 1a+1b | 0.37 | 0.35 | 3.07 |
+| +修法3 | 0.38 | 0.25 | 2.85 |
+
+拆分（16个update，u2–u14，同一会话依次跑）：
+
+| run | 内容 | ×实时 | collect | update | learner反向GPU s | learner Spatial调用 | 显存保留峰值GB |
+|---|---|---:|---:|---:|---:|---:|---:|
+| ctl16 | B46代码 | 140.6 | 30.43 | 22.96 | 8.69 | 110 | 15.9 |
+| bc | 延迟机制（开关全关） | 129.5 | 33.96 | 23.31 | 8.67 | — | 16.1 |
+| bd | 延迟机制 + 修法1 | 142.6 | 30.18 | 22.92 | 8.72 | — | 15.0 |
+| f13 / f13b | + 修法3 | 146.4 / 144.1 | 29.05 / 29.69 | 25.05 / 25.75 | 10.01 / 10.22 | 133 / 136 | 18.4 / 19.7 |
+| sclean | B46 + 修法1（无延迟机制） | 145.6 | 28.90 | 23.03 | 8.75 | 114 | 17.3 |
+| sch | sclean + C helper | 141.4 | 31.47 | 24.72 | 10.06 | 137 | 17.2 |
+| spk | sclean + 输出打包 | 145.0 | 30.28 | 22.47 | 8.33 | 111 | 19.3 |
+| **slz** | **sclean + 设备端结果按需（正式版）** | **148.8** | **27.86** | **22.91** | 8.57 | 110 | 17.3 |
+
+- 延迟机制即使开关全关也让collect慢了约3.5 s（bc对ctl16，infer_ms 12.5 → 14.8），所以整体拿掉，async代码不进正式版。代码保留在本地ref `refs/b47/b47c–b47e`和WIP提交37b18a1，作为失败记录。
+- update慢2–3 s来自修法3里的C helper。带C helper的三次run（sch、f13、f13b），learner的Spatial调用都是133–137次/update，不带的是110–114次，token只多约3%，反向GPU时间多1.3–1.5 s。
+  - C helper对参照逐位相等（`test_b47_native.py`）。learner自己的计数路径（arena帧走`check_headers`）也不经过它们。机制未查明。
+  - 正式版不收C helper。
+- 输出打包对update中性，但显存保留峰值多约2 GB，collect也没有改善，不收。
+- 正式版收设备端结果按需：collect 27.86 s，update 22.91 s，与同会话的ctl16持平。
+
+最终版（b47-lz，提交见下）与prof-b46f对比（u2–u14中位）：
+
+| | prof-b46f | ctl16（B46重跑） | **B47最终（prof-b47-slz）** | CF关（prof-b47-nocf，u2–u8） |
+|---|---:|---:|---:|---:|
+| ×实时 | 144.9 | 140.6 | **148.8** | 207.2 |
+| 游戏小时（窗口内） | 15.78 | 15.78 | 15.78 | 8.50 |
+| collect_s中位 | 28.74 | 30.43 | **27.86** | 20.55 |
+| update_s中位（最大） | 21.68（23.62） | 22.96（25.46） | **22.91（24.45）** | 21.09（21.40） |
+| u_ppo s | 15.0 | 16.4 | 16.0 | 14.6 |
+| infer_ms | 11.9 | 12.5 | 11.3 | 7.6 |
+| p_act s | 26.6 | 28.4 | 25.8 | 18.3 |
+| w_wait s（16进程合计） | 382 | 411 | 371 | 255 |
+| w_encode s（16进程合计） | 27.8 | 28.3 | 27.3 | 27.1 |
+| 写页 s/update | 3.99 | 4.51 | 3.20 | — |
+| GPU等待 s/update | 13.45 | 13.92 | 13.59 | — |
+| lane轮次 / merged步 | 1,724 / 609 | 1,683 / 589 | 1,977 / 1,089 | — |
+| learner前向 / 反向GPU s | 9.25 / 8.28 | 9.95 / 8.69 | 9.72 / 8.57 | — |
+| learner自愿切换 | 44k | 44k | 44k | — |
+| 显存保留中位 / 峰值GB | 15.8 / 16.7 | 15.9 / 15.9 | 17.3 / 17.3 | 13.6 / 13.6 |
+
+- CF的边际成本（同窗u2–u8）：
+  - prof-b47-slz：collect 26.79 s，update 22.18 s，×实时150.6；
+  - CF关：collect 20.55 s，update 21.09 s，×实时207.2；
+  - CF约占6.2 s collect，B46为8.5 s。
+- 验收门：
+  - collect 27.86 s，**未过**22 s（差5.9 s），也未过最低线25 s；
+  - update 22.91 s，**未过**22.0 s；与同会话B46重跑的22.96 s持平（变化-0.05 s），对b46f原始的21.68 s差1.2 s，在run间噪声范围内；
+  - ×实时148.8，**未过**150（差1.2）。
+- 等价与测试：4090全量门191 passed / 0 failed（b47-lz）；加入`test_step_graph_without_device_result_keeps_host_outputs_and_pages`后，`test_block_slot_integration.py`在4090上35 passed；本地135 passed / 50 skipped；A8 play 8/8 ok，play与step的digest相同。
+- 第5项（只量不改）：
+  - learner并发下step graph的GPU时长p50为2.1–2.2 ms、p90为3.2–4.1 ms；空闲时p50为1.9–2.1 ms。
+  - 同步等待p50为2.0 ms、p90为3.9 ms。
+  - actor stream的优先级已生效：设备范围(0, -3)，actor请求-5被截到最高级-3，learner为0。
+- 32 worker不可行：
+  - 4090主机16个物理核（Xeon Gold 6530，无SMT），47 GB内存。
+  - 16 worker的稳态：CPU约43–52%忙（7–8核）；内存已用27.4 GB，可用18 GB；含CF分支fork共294个游戏进程。
+  - 翻倍worker和游戏进程约需多20 GB内存，超出可用量。
+  - 每决策CPU总量不变，瓶颈是内存，不是CPU。
+- 瓶颈在哪：collect 27.9 s中，step合计19.5 s，其中GPU等待13.6 s，写页3.2 s，发起准备1.7 s。
+  - 每update约3,700次同步step调用。learner并发时每次等GPU约3.3 ms，空闲时每步GPU约2.0 ms，基本是固定开销。
+  - teacher代的版本结构让54%的lane行只能单独起step。
+  - 剩余手段都在设计层：每决策更少的step（teacher代版本），或更便宜的step（actor graph的kernel数和固定开销）。异步重叠只会把这部分时间转成learner的争用（本节筛选表）。
+- 代码：9629495（B46 + 修法1 + 设备端结果按需，对B46净改3个文件）；WIP提交37b18a1带异步机制，已被9629495移除。
+- 失败或中间运行：prof-b47-i1/i1c/i12/i12c/i3/prof/prof2/prof3/ctl/ctl16/bc/bd/f13/f13b/sclean/sch/spk都保留作对照（本节表格的数据来源），没有失败的运行。4090已空闲（guard：0个train_tok、0个isaac进程，显存12 MiB）。
