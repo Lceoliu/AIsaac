@@ -485,7 +485,8 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
   "history_ablation": {
     "entry": "bridge/abplus/EXPERIMENTS.md B43",
     "switch": "--block-history-mode random|detach|gradreplay (--block-history-blocks, --block-history-aux-coef 1.0, --block-history-replay raw; latent not wired)",
-    "arms": {"A": "detach", "B": "random, 2 blocks", "C": "gradreplay, 2 blocks (1 max ||g_j|| + 1 random, aux loss sum_j sg(g_j).f(o_j))", "D": "random, 4 blocks (default, unchanged)"},
+    "arms": {"A": "detach", "B": "random, 2 blocks, history_scale unbiased (B51: gradient x N_i/2)", "C": "gradreplay, 2 blocks (1 max ||g_j|| + 1 random, aux loss sum_j sg(g_j).f(o_j); aux unscaled)", "D": "random, 4 blocks, history_scale unbiased (default since B51: gradient x N_i/4)"},
+    "history_scale": "B51 --block-history-scale unbiased (default) | none (B48 and earlier: unscaled); k = 1-2 with N/k pending a late-checkpoint B49 re-measure",
     "commits": {"switch_ABD": "01bf1b3", "gradreplay": "c8fabb7", "diagnostics": "3391278", "memory_clear_eval": "9edbf01"},
     "equivalence_gates": {"local_cpu": "121 passed / 35 skipped", "rtx4090": "162 passed / 0 failed",
                           "C_gj_finite_difference": "passed", "C_aux_equals_D_reader_gradient_all_blocks": "passed",
@@ -666,6 +667,19 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "norm_ratio_unscaled": 0.202, "rows": {"4_blocks": 128, "all": 660},
     "conclusion": "not concentrated; per-block contributions nearly parallel; the unscaled rules keep ~4/N of the history gradient's magnitude; Random-k x N/k is closest; gradient-guided picks no better",
     "ablation_suggestion": "add Random-k x N/k arms (k=4 and 1-2); re-measure on a late checkpoint dump before deciding"
+  },
+  "history_scale_b51": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B51", "commit": "1522d03",
+    "switch": "--block-history-scale unbiased|none (BlockConfig.history_scale, default unbiased; old configs load as unbiased)",
+    "rule": "random arm: each chunk's selected re-encoded block value v -> v.detach() + s_i*(v - v.detach()), s_i = N_i/|selected_i| (1 if N_i <= |selected_i|), per (chunk, block) occurrence; forward bit-identical; k = 4",
+    "unaffected": "detach arm; gradreplay aux term (coef 1.0; per-chunk aux scaling would need per-chunk leaves: optional, not implemented)",
+    "basis": "B49 (early checkpoint, surrogate loss, first-order proxy): Random4xN/4 cos 0.9994 vs full",
+    "tests": {"forward": "bit-identical", "writer_output_grad": "exactly N/k x (2e-7)", "param_history_grad": "N/k x within 1e-5 (FP32 cancellation, common part ~31x)",
+              "shared_block": "per-chunk scales (1e-5, one thread)", "rtx4090": "202 passed + B51 file 5/5 after the tolerance fix", "a8": "8/8"},
+    "learner_bench_s": {"none": [11.05, 12.49], "unbiased": [11.09, 11.11]},
+    "short_profile_u2_u5": {"none": {"update_s": 17.8, "collect_s": 26.9, "grad_norm": 0.34, "grad_clip_frac": 0.0, "ppo_clip_frac": 0.011},
+                            "unbiased": {"update_s": 17.1, "collect_s": 26.9, "grad_norm": 0.43, "grad_clip_frac": 0.0, "ppo_clip_frac": 0.020},
+                            "max_grad_norm": 1.0}
   },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},

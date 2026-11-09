@@ -9581,3 +9581,80 @@ random臂每个chunk从窗口外块里均匀抽4个历史块，重编码后可�
 - 4090，GPU_LOCK下运行（排在cpp-actor的B50 nsys之后），3分钟，之后锁已释放。
 - 运行期间另一个会话启动了train_tok：本测量是梯度值，不受时间干扰。
 - 代码：ea63627（测量脚本）。
+
+### B51 random臂默认改为无偏历史梯度（Random-k × N/k，直通缩放）（2026-11-09）
+
+#### 实验目的
+
+B49测得：在早期checkpoint、代理损失下，一个chunk里各窗口外块的历史梯度贡献几乎同向（任取4块，历史部分cos 0.998）。但不加缩放的4块规则只给出约4/N的量级（≈20%），按N/4缩放后，与完整一阶梯度的总梯度cos为0.9994。
+
+用户决定：random臂改为无偏缩放作为默认（语义改动）。目标是前向数值不变、k仍为4，只把历史块重编码路径的梯度从“按k/N缩水”改为对全量历史梯度无偏。
+
+B49的两个限定照样适用：
+- 早期checkpoint（第6个update）；
+- 代理损失和一阶代理。
+
+不改k，不改detach / gradreplay的默认，不训练。
+
+#### 实验方法
+
+- 实现（三条learner路径：packed、逐长度paged、对象路径）：
+  - 组装每个chunk的bank值时，对该chunk选中并重编码的块值v做直通缩放：v' = v.detach() + s_i·(v − v.detach())。
+  - s_i = N_i / |selected_i|，N_i为该chunk窗口外可抽样块数（eligible）；N_i ≤ |selected_i|时s_i = 1。
+  - 缩放按(chunk, 块)的每次出现分别计算：同一块被多个chunk选中时仍只重编码一次，各chunk用自己的s_i。
+  - 前向数值：v + 0，逐位不变。
+- 开关：`--block-history-scale unbiased|none`，默认unbiased，写进block_cfg（`BlockConfig.history_scale`）。
+  - 旧checkpoint的config没有这一字段，加载后按默认unbiased。
+  - detach臂不受影响。
+  - gradreplay臂的aux项不变（coef 1.0）。它的叶子梯度在一次调用里按块对chunk求和，要做逐chunk缩放需要逐chunk的叶子，作为可选扩展记下，默认不启用、未实现。
+- 计量：progress.csv新增`grad_clip_frac`（PPO步中被clip缩放的比例）。
+- 测试（`tests/test_b51_history_scale.py`；测试模型用memory_blocks 8、k = 2，使N_i > k）：
+  - (a) none与unbiased的前向输出、loss逐位相同。
+  - (b) 单chunk、固定选中集合：
+    - 到达重编码块Writer输出处的梯度，unbiased恰为none的N/k倍（相对误差 ≤ 2e-7）。
+    - Spatial和Writer参数上历史路径的梯度（与“缩放为0”之差，即与只走共同部分的梯度之差）为none的N/k倍，相对误差 ≤ 1e-5。
+    - 精度说明：这一项是两个FP32参数梯度之差，测试模型里共同部分（主行、新块）约是历史部分的31倍，FP32抵消的极限在1e-6量级（实测packed路径2.5e-6，逐长度路径0.9e-6），所以容差取1e-5；精确的N/k关系由上一条（Writer输出处）验证。
+    - 其他参数（Reader、heads）的梯度逐位不变。
+  - (c) 两个chunk（N_i不同）共享同一个选中块时，批的历史梯度等于两个chunk各自单独（同一组抽样）的历史梯度之和（相对误差 ≤ 1e-5，单线程）。另有一个单元测试，验证`history_scales`的逐出现缩放向量。
+  - (d) 因果隔离测试、packed ≡ 逐长度的等价测试在unbiased下通过。
+- 4090：
+  - 全量门、A8；
+  - 固定输入learner基准（`b51_scale_bench.py`，B48 dump，none / unbiased交替各2次）；
+  - 4个update以上的短profile两次（none、unbiased各5个update，窗口u2–u5），对比grad norm与clip。
+
+#### 实验结果
+
+- 测试：
+  - 4090全量门 1 failed / 202 passed。失败的是(c)的旧版本：逐元素比较参数梯度之差（atol 1e-7），同时受FP32抵消和多线程CPU index累加非确定性的影响，与B51的实现无关。改为单线程、整体相对误差 ≤ 1e-5之后，该文件在4090和本地都是5/5。
+  - 本地143 passed。
+  - A8 8/8，digest不变（actor未改动）。
+- 固定输入learner基准（同一份dump，第2遍，s）：none 11.05、12.49（host侧离群），unbiased 11.09、11.11，无可测差别。
+- 短profile（5个update，u2–u5中位）：
+
+| | none | unbiased |
+|---|---:|---:|
+| update s | 17.8 | 17.1 |
+| collect s | 26.9 | 26.9 |
+| 总grad norm（clip前，每步平均） | 0.34 | 0.43（+27%） |
+| `grad_clip_frac` | 0 | 0 |
+| PPO clip_frac | 0.011 | 0.020 |
+| hist_writer_grad_norm | 0.0066 | 0.0084 |
+| hist_spatial_grad_norm | 0.0149 | 0.0132 |
+
+- 总梯度范数上升约27%，与“历史路径放大约N/4倍”的预期方向一致。
+- `max_grad_norm`为1.0，每步范数在0.3–0.6之间，两边都没有触发clip。PPO比率的clip比例由1.1%升到2.0%。
+- 两次run是不同的轨迹；B48的prof-b48-pf（相当于none）在同窗的grad norm为0.45，run间差别不小，量级判断只作参考。
+- update / collect的差别在噪声内。
+
+结论：
+- 无偏缩放已作为random臂默认上线，前向不变，速度不变。
+- 训练中总梯度范数上升约四分之一，clip尚未触发。
+- 减块方案（k = 1–2再按N/k缩放）等用后期checkpoint的dump复测B49之后再定。
+
+四臂消融定义更新（见PROJECT_SPEC `history_ablation`）：
+- B臂：random，2块，unbiased缩放；
+- D臂：random，4块，unbiased缩放（默认）；
+- A（detach）、C（gradreplay）不变。
+- 要复现B48及以前的不缩放语义，用`--block-history-scale none`。
+
+代码：1522d03。
