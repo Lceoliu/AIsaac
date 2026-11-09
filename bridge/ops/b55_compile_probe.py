@@ -40,8 +40,10 @@ def why_miss():
     keep = ('evaluating guards', 'cache miss', 'cache hit', 'unable to load', 'Bypassing', 'Writing')
 
     class Keep(logging.Filter):
+        # on the unformatted template: formatting the cache-key debug records (hash details of every
+        # input and config) cost minutes in the first B56 run
         def filter(self, r):
-            return any(k in r.getMessage() for k in keep)
+            return isinstance(r.msg, str) and any(k in r.msg for k in keep)
     h = logging.StreamHandler(sys.stdout)
     h.setFormatter(logging.Formatter('B56 log %(name)s: %(message)s'))
     h.addFilter(Keep())
@@ -49,6 +51,9 @@ def why_miss():
         lg = logging.getLogger(name)
         lg.setLevel(logging.DEBUG)
         lg.addHandler(h)
+        # only this filtered handler: torch's own handlers on the parent loggers printed every DEBUG
+        # record (82k lines, the first B56 P1b run timed out)
+        lg.propagate = False
     from torch._functorch._aot_autograd import autograd_cache as ac
     inner = ac.FXGraphCacheLoadable.load
 
