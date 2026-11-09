@@ -9821,6 +9821,7 @@ Spatial预热的分解（s，dynamo_timed嵌套计时）：
 - **剩下的243.5 s中，145 s来自8个learner grad模式图（每个T桶1个）**：它们的AOT缓存条目在载入时guard不成立（`autograd_cache_guard_miss` 8次），于是AOT和Inductor的fw+bw全部重做。其余43个图命中，只花Dynamo时间加约20 s载入。
 - **B42担心的范围守卫没有复现**：缓存命中的图在新batch大小下（actor 5 / 16 / 40，learner到700行，三种模式）稳态重编译为0。B42当时同时有pad_mm守卫，现在`shape_padding`已关。
 - **Flex Reader冷跑116.8 s**（生产约29 s）：全新Inductor目录里没有Flex模板的编译产物；热跑恢复到26.9 s。生产目录已有这些产物，所以首次打开缓存时Flex不会变慢。
+- 提交时，本机共享仓库`.git`里EXPERIMENTS.md的新blob写坏了（loose object校验失败，推送被拒）。处理：坏对象移到scratchpad备份，从工作区重新写入，`git fsck --no-dangling`干净后推送。以后每次提交前先跑一次`git fsck --no-dangling`。
 - **限定**：
   - 稳态检查是合成输入，覆盖Spatial和解码器；Flex Reader的稳态没有合成检查。最终门仍是带游戏的短profile中`block_steady_compiles = 0`。
   - 模型或编译相关代码一改，缓存就失效，回到约533 s（仍比关缓存少约80 s）。
@@ -9832,3 +9833,40 @@ Spatial预热的分解（s，dynamo_timed嵌套计时）：
 - 并行预热或mega-cache只对冷缓存有用，暂不需要。
 
 代码：`bridge/ops/b55_compile_probe.py`（只测量）。产物：4090 `reports/b42-speed/b55/`（`on-cold.json` / `.log`、`on-warm.json` / `.log`）、`b55.log`；FX缓存目录`~/.cache/isaac-b55-fxprobe`（探针专用，生产不读）。
+
+### B56 ISAAC_FX_CACHE开关：跨进程FX graph / AOTAutograd缓存（P1）与8个grad图guard miss诊断（P1b）（2026-11-10，GPU验证未运行）
+
+#### 实验目的
+
+B55测得：打开FX graph cache与AOTAutogradCache后，缓存热时Spatial预热从约610 s降到243.5 s，合成输入的稳态重编译为0。剩下的时间里，145 s来自8个learner grad模式图：它们的AOT缓存条目在载入内层FX图时失败（`autograd_cache_guard_miss`），fw+bw全部重编。
+
+本实验：
+- P1：把缓存做成开关，默认保持现状（关）。用带游戏的短profile确认稳态重编译为0（覆盖Flex Reader和真实batch）、速度不退化，之后再单独提交改默认。
+- P1b：在同一把锁里，诊断这8次guard miss的原因。修法先报给协调方，确认后再改。
+
+不做P2（去冻结变体、duck shape）。
+
+#### 实验方法
+
+- 开关：`ISAAC_FX_CACHE=1`时，`block_compile.configure()`打开`inductor_config.fx_graph_cache`和`torch._functorch.config.enable_autograd_cache`；默认（未设或0）与B42–B55相同，即关闭。
+  - 缓存目录不变（`TORCHINDUCTOR_CACHE_DIR`默认`~/.cache/isaac-b42-inductor`，Triton缓存在同一目录下）。
+  - train_tok的预热行附带`(B56 fx cache on|off)`。
+  - 测试`tests/test_b56_fx_cache.py`：子进程里检查默认 / 0 / 1三种取值下的配置值。
+- P1b诊断：`b55_compile_probe.py --why-miss`。
+  - 包装`FXGraphCacheLoadable.load`，每次内层FX图载入打印：前向还是反向、FX key、该key目录是否存在及候选条目数、输入个数与前几个形状、成败。
+  - 只保留`torch._inductor.codecache`与AOTAutograd cache日志中的关键行：guard求值（`evaluating guards [...] with values ... => hit`）、hit / miss、载入失败、写入、bypass。
+  - 用来区分三种可能：
+    - 反向（或前向）的FX条目根本没写入；
+    - 条目在，但guard在新进程的hint下不成立（打印guard表达式与hint值）；
+    - 条目载入时出错。
+  - 选这个办法而不用`TORCH_LOGS=aot_autograd`：后者不打印FX层的guard表达式与hint，而且输出量大。
+- GPU验证：`CODE=<候选> sh bridge/ops/b56_verify.sh`，排在cpp-actor B54链之后，锁空闲才取，总时长≤30分钟。
+  1. 开关打开的短profile（prof2.sh，`prof-b56-fx`，生产缓存目录）：progress.csv满6个update后SIGINT（硬上限1500 s）。这一次FX缓存为冷，预热约533 s。
+     - 看`block_steady_compiles = 0`；
+     - update / collect / ×实时与同树的prof-b51-unb、prof-b52-py同口径（u2–u6中位）。
+  2. 同一锁内，在已写满的生产缓存上（热）跑`b55_compile_probe.py --fx-cache on --steady --why-miss`，时长取剩余时间，最多480 s。
+- 验证通过后，再单独提交把开关默认改为开。
+
+#### 实验结果
+
+未运行（GPU验证排在cpp-actor B54链之后）。
