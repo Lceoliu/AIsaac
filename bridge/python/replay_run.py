@@ -101,10 +101,15 @@ def menu_pauses(run):
     plan = dict(n, open='i<jp>', open_action, close, close_action, pause_rs, unpause_rs, paused_renders)。
     判定：同一帧里 pause -> unpause，且 pause 前一个 tick（序号 = pause 渲染序号 - 1）有 TRIGGERED MENUBACK/PAUSE（实体 nil）=1。
     换房过场、捡道具弹窗、活板门换层这些引擎自己的暂停没有这个按键，回放会自己暂停，不注入。
+    控制台暂停（phase10，recorder 0.4.0 的 --allow-console 录制）：同一帧 pause -> unpause 之间有玩家提交的控制台命令
+    （ev cmd src=console，r = 暂停开始的渲染序号）也按菜单暂停注入（console=True）：回放里没人开控制台，用同一 tick 的菜单暂停
+    复现"这一次轮询起暂停"的 tick 结构，命令在暂停中执行（replay.lua console_render），再由 Python 发 Esc 关菜单。
     旧录制的 pause 事件没有第三个参数（渲染序号）：解除暂停的渲染序号 = 本帧最后一个中间 tick 序号 - 1（解除暂停后固定 2 次轮询）。"""
     plans, skipped = [], []
     for n, idxs in sorted(run.event_lines.items()):
         evs = [json.loads(run.lines[i]) for i in idxs]
+        cons_r = {e.get('r') for e in evs if e.get('k') == 'ev' and e.get('ev') == 'cmd' and e.get('src') == 'console'}
+        # （暂停跨过本帧更新的控制台命令没有本帧的 unpause，下面的 pause/unpause 配对自然不会把它当成菜单暂停）
         evs = [e for e in evs if e.get('k') == 'ev' and e.get('ev') in ('pause', 'unpause')]
         if not evs or n not in run.frame_line:
             continue
@@ -135,6 +140,10 @@ def menu_pauses(run):
             rec = dict(n=n, pause_rs=prs, unpause_rs=U, paused_renders=P, open_tick=jp, last_tick=kmax)
             if trig and jp >= 1:
                 rec.update(open=f'i{jp}', open_action=trig[0][1])
+                plans.append(rec)
+            elif prs in cons_r and jp >= 1:
+                # 控制台暂停：开控制台的按键不经过 MC_INPUT_ACTION（没有 MENUBACK），用 MENUBACK 注入同一 tick 的菜单暂停
+                rec.update(open=f'i{jp}', open_action=MENU_OPEN_ACTIONS[0], console=True)
                 plans.append(rec)
             else:
                 skipped.append(rec)
@@ -188,9 +197,120 @@ def mouse_table_lines(run: load_run.Run):
                        mouse_buttons_pressed=sum(1 for v in per.values() for e in v if e[3]))
 
 
+# ---------------------------------------------------------------------------------------------- 第三方 mod 的调用（api 行）
+# recorder 0.4.0（phase10-mods-console）：录制里别的 mod（GoodTrip 小地图传送等）调用的被监视方法（README §4.7 api 行、§8.6）。
+# 回放时把这些 mod 临时禁用（副本 mods/<目录>/disable.it，回放结束后挪进回放会话目录，不删），由 mod 的 replay.lua 在录制的
+# 同一位置原样调用。结束本局的命令（restart / seed …）不回放（录制以它结束，回放由帧上限在同一帧数截止）。
+API_ENDS_RUN = ('restart', 'seed', 'challenge', 'quit', 'exit')
+
+
+def api_records(run: load_run.Run, replayed=False):
+    """api 行（dict 列表，按文件顺序）；replayed=True 只取回放局里 replay.lua 执行的（rp），False 只取录制下来的。"""
+    out = []
+    for i in getattr(run, 'api_lines', ()):
+        d = json.loads(run.lines[i])
+        if bool(d.get('rp')) == replayed:
+            out.append(d)
+    return out
+
+
+def api_mods(run: load_run.Run):
+    """录制里有 api 调用的 mod 目录名（来源不明的 "?" 除外）= 回放时要禁用、由 replay.lua 代为调用的 mod。"""
+    return sorted({d.get('src') for d in api_records(run) if d.get('src') not in (None, '?')})
+
+
+class Unreplayable(ValueError):
+    pass
+
+
+def api_arg_lua(v):
+    """api 行里的一个参数（JSON）-> replay.lua 的 {类型, 值} 表（api.lua 的 dec）。"""
+    if v is None:
+        return '{"n"}'
+    if isinstance(v, bool):
+        return '{"b",' + lua_value(v) + '}'
+    if isinstance(v, int):
+        return '{"i",' + str(v) + '}'
+    if isinstance(v, str):
+        return '{"s",' + lua_value(v) + '}'
+    if isinstance(v, dict):
+        if 'f' in v and v['f'] is not None:
+            return '{"f",' + repr(float(v['f'])) + '}'
+        if 'p' in v and v['p'] is not None:
+            return '{"p",' + str(int(v['p'])) + '}'
+        if 'ref' in v:
+            r = v['ref']
+            if r is None:
+                return '{"ref"}'
+            if isinstance(r, dict) and r.get('p') is not None:
+                return '{"ref",' + str(int(r['p'])) + '}'
+        if 'v' in v and isinstance(v['v'], list) and len(v['v']) == 2 and None not in v['v']:
+            return '{"v",' + repr(float(v['v'][0])) + ',' + repr(float(v['v'][1])) + '}'
+    raise Unreplayable(f'参数无法回放：{v!r}')
+
+
+def api_table_lines(run: load_run.Run, mods):
+    """回放表的 api 段：只含 mods（回放时禁用的 mod）的调用。返回 (lines, info)。"""
+    mods = set(mods or ())
+    per, skipped, foreign = {}, [], 0
+    for d in api_records(run):
+        if d.get('src') not in mods:
+            foreign += 1
+            continue
+        f = [f'id={int(d["id"])}', f'ph={lua_value(d.get("ph"))}', f'm={lua_value(d.get("m"))}',
+             f'src={lua_value(d.get("src"))}']
+        for k in ('r', 'af', 'rc'):
+            if d.get(k) is not None:
+                f.append(f'{k}={int(d[k])}')
+        if d.get('set'):
+            f.append('set=1')
+        if isinstance(d.get('self'), dict) and d['self'].get('p') is not None:
+            f.append(f'self={int(d["self"]["p"])}')
+        if d.get('in') is not None:
+            f.append(f'parent={int(d["in"])}')
+        skip = None
+        try:
+            args = [api_arg_lua(a) for a in d.get('a') or []]
+        except Unreplayable as e:
+            args, skip = [], str(e)
+        if d.get('m') == 'Isaac.ExecuteCommand' and d.get('a') and isinstance(d['a'][0], str):
+            word = d['a'][0].strip().split(' ')[0].lower()
+            if word in API_ENDS_RUN:
+                skip = f'结束本局的命令（{word}）：录制以它结束，回放由帧上限截止'
+        if skip:
+            f.append(f'skip={lua_value(skip)}')
+            skipped.append(dict(id=d['id'], n=d['n'], m=d.get('m'), reason=skip))
+        f.append('a={' + ','.join(args) + '}')
+        per.setdefault(int(d['n']), []).append('{' + ','.join(f) + '}')
+    if not per:
+        return [], dict(api_calls=0, api_mods=sorted(mods), api_skipped=skipped, api_other_mods_calls=foreign)
+    lines = ['api = {']
+    for n, lst in sorted(per.items()):
+        lines.append(f'[{n}]={{' + ','.join(lst) + '},')
+    lines.append('},')
+    return lines, dict(api_calls=sum(len(v) for v in per.values()), api_frames=len(per), api_mods=sorted(mods),
+                       api_skipped=skipped, api_other_mods_calls=foreign)
+
+
+def console_commands(run: load_run.Run):
+    """录制里玩家在调试控制台提交的命令（recorder 0.4.0，ev cmd src=console）：[(n, r, line, paused, same_frame), ...]。
+    same_frame = 控制台暂停在同一帧里就解除了（pause 与 unpause 都在第 n 帧；回放按菜单暂停注入，见 menu_pauses）；
+    False = 暂停跨过了第 n 帧的逻辑更新（关控制台与更新在同一次迭代，unpause 记在第 n+1 帧，con4 实测）。"""
+    out = []
+    for n, idxs in sorted(run.event_lines.items()):
+        evs = [json.loads(run.lines[i]) for i in idxs]
+        for k, d in enumerate(evs):
+            if d.get('k') == 'ev' and d.get('ev') == 'cmd' and d.get('src') == 'console':
+                same = any(e.get('k') == 'ev' and e.get('ev') == 'unpause' for e in evs[k + 1:])
+                out.append((int(d['n']), int(d.get('r') or 0), d.get('line') or ' '.join(d.get('a') or []), d.get('paused'),
+                            same))
+    return out
+
+
 def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_engine_pauses=True, inject_extras=False,
-                       mouse=True):
-    """mouse：把录制的鼠标流写进回放表（mod 经 rr_mt.dll 的 RRMT_SetMouse 还原给引擎，phase8-mouse）。"""
+                       mouse=True, api=None):
+    """mouse：把录制的鼠标流写进回放表（mod 经 rr_mt.dll 的 RRMT_SetMouse 还原给引擎，phase8-mouse）。
+    api：回放时禁用、由 replay.lua 代为调用的 mod 目录名（api_mods(run)）；None/空 = 回放表没有 api 段。"""
     h = run.header
     seed = h['meta']['seeds']['start_seed_string']
     salts = mt_salts(h)
@@ -278,13 +398,31 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
         ml, mouse_info = mouse_table_lines(run)
         mouse_info['mouse'] = bool(ml)
         lines.extend(ml)
+    cons = console_commands(run)
+    if cons:
+        # 控制台命令（phase10）：同一帧窗口里经 Isaac.ExecuteCommand 执行。暂停在本帧内解除的：第 r 次渲染（回放在同一 tick
+        # 注入菜单暂停，命令在暂停中执行）；暂停跨过本帧更新的：不注入暂停，在第 min(r, 2) 次渲染之后执行（普通帧窗口在更新前
+        # 只有 2 次渲染；con4 实测 r=3 的 spawn 与 r=2 的 giveitem 都要在第 2 次渲染之后、紧接着本帧更新之前）
+        lines.append('console = {')
+        per = {}
+        for n, r, ln, _p, same in cons:
+            per.setdefault(n, []).append(f'{{r={r if same else min(r, 2)},line={lua_value(ln)}}}')
+        for n, lst in sorted(per.items()):
+            lines.append(f'[{n}]={{' + ','.join(lst) + '},')
+        lines.append('},')
+    api_info = dict(api_calls=0, console_cmds=[dict(n=n, r=r, line=ln, paused=p, pause_same_frame=same)
+                                                for n, r, ln, p, same in cons])
+    if api:
+        al, ai = api_table_lines(run, api)
+        api_info.update(ai)
+        lines.extend(al)
     lines.append('}')
     Path(path_out).write_text('\n'.join(lines) + '\n', encoding='utf-8')
     return dict(start=start, frames=run.frames, tick_changes=n_tick_changes, spawns=len(spawns),
                 cmds={str(k): v for k, v in cmds.items()}, mt_salts=salts, continued=bool(h.get('continued')),
                 start_players=[dict(num=num, x=x100 / 100, y=y100 / 100) for num, x100, y100 in start_players],
                 inject_pauses=inject_pauses, menu_pauses=plans, engine_pauses=len(skipped), engine_pauses_aligned=len(engine),
-                inject_extras=inject_extras, extra_ticks=sum(len(v) for v in extras.values()), **mouse_info)
+                inject_extras=inject_extras, extra_ticks=sum(len(v) for v in extras.values()), **mouse_info, **api_info)
 
 
 def replayability(run: load_run.Run, continue_save=None):
@@ -303,6 +441,14 @@ def replayability(run: load_run.Run, continue_save=None):
         issues.append('角色不是 Isaac：`seed` 命令沿用当前角色，未实现角色切换')
     if (m.get('options') or {}).get('MouseControl'):
         issues.append('MouseControl 开启：鼠标射击绕过 MC_INPUT_ACTION，无法注入')
+    cons = console_commands(run)
+    if cons:
+        issues.append(f'{len(cons)} 条控制台命令（ev cmd src=console）：回放在同一帧窗口执行，控制台暂停用同一 tick 的菜单暂停'
+                      '复现（README §8.7；--no-menu-pause 时不复现，控制台在本应做逻辑更新的那次轮询打开的帧会分歧）')
+    unknown = [d for d in api_records(run) if d.get('src') in (None, '?')]
+    if unknown:
+        issues.append(f'{len(unknown)} 个来源不明的第三方调用（api 行 src="?"，例如 {unknown[0].get("m")}，'
+                      f'{unknown[0].get("srcfile")}）：不回放')
     return issues
 
 
@@ -448,7 +594,34 @@ def compare(rec_path, rep_path):
     res['exact'] = (all(firsts[k] is None for k in LAYERS) and mt_first is None and mt_missing == 0 and same_len
                     and res['end_compatible'] and res['mt']['reseeds_match'] is True)
     res['pause_report'] = pause_report(A, B, firsts, mt_first)
+    res['api'] = api_report(A, B)
     return res
+
+
+def api_report(A, B):
+    """第三方 mod 调用（api 行）的对照（诊断，不进 exact）：录制下来的调用、回放局里 replay.lua 实际执行的（rp，按录制 id
+    对上），执行位置（帧、ph、渲染序号）与录制不同的，以及回放局里没被禁用的 mod 自己发起的调用（live）。"""
+    ra = api_records(A)
+    if not ra and not getattr(B, 'api_lines', None):
+        return None
+    rb = api_records(B, replayed=True)
+    live = api_records(B)
+    done = {d.get('id'): d for d in rb}
+    moved = []
+    for d in ra:
+        e = done.get(d.get('id'))
+        if e and (e.get('n') != d.get('n') or e.get('ph') != d.get('ph') or e.get('r') != d.get('r')
+                  or e.get('m') != d.get('m')):
+            moved.append(dict(id=d['id'], m=d.get('m'), record=[d.get('n'), d.get('ph'), d.get('r'), d.get('af')],
+                              replay=[e.get('n'), e.get('ph'), e.get('r'), e.get('af'), e.get('where')]))
+    by_m = {}
+    for d in ra:
+        by_m[d.get('m')] = by_m.get(d.get('m'), 0) + 1
+    return dict(record_calls=len(ra), record_by_method=by_m, record_mods=sorted({d.get('src') for d in ra}),
+                replay_executed=len(rb), replay_live_calls=len(live),
+                not_executed=[d['id'] for d in ra if d.get('id') not in done][:50],
+                position_changed=moved[:20], position_changed_count=len(moved),
+                replay_stats=((B.end or {}).get('replay') or {}).get('api'))
 
 
 def pause_report(A, B, firsts, mt_first):
@@ -462,7 +635,7 @@ def pause_report(A, B, firsts, mt_first):
             rep_pauses[n] = [e['a'] for e in evs if e.get('k') == 'ev' and e.get('ev') in ('pause', 'unpause')]
     items = []
     for p in plans:
-        items.append(dict(frame=p['n'], open_tick=p['open'], paused_renders=p['paused_renders'],
+        items.append(dict(frame=p['n'], open_tick=p['open'], paused_renders=p['paused_renders'], console=bool(p.get('console')),
                           replay_paused=p['n'] in rep_pauses, replay_pause_events=rep_pauses.get(p['n'])))
     cands = [x for x in list(firsts.values()) + [mt_first] if x is not None]
     first = min(cands) if cands else None
@@ -529,15 +702,41 @@ def replay_env(turbo, mouse, affinity=None):
     return env
 
 
+def disable_mods_in_copy(copy: rr.GameCopy, mods):
+    """回放前给副本 mods/<目录> 放空的 disable.it（目录不存在或已禁用的跳过）。返回实际放了的目录名列表。"""
+    placed = []
+    for m in sorted(set(mods or ())):
+        d = copy.mods / m
+        if d.is_dir() and not (d / 'disable.it').exists():
+            (d / 'disable.it').write_bytes(b'')
+            placed.append(m)
+    return placed
+
+
+def restore_disabled_mods(copy: rr.GameCopy, placed, keep_dir):
+    """回放后把放进去的 disable.it 挪到 keep_dir/<目录>/disable.it（不删除），mod 恢复启用。返回挪动记录。"""
+    out = []
+    for m in placed:
+        src = copy.mods / m / 'disable.it'
+        if src.exists():
+            dst = Path(keep_dir) / m
+            dst.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src), str(dst / 'disable.it'))
+            out.append(dict(mod=m, moved_to=str(dst / 'disable.it')))
+    return out
+
+
 def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=True, continue_save=None,
                copy_root=rr.DEFAULT_COPY, turbo=None, init_save=None, forced_options=None, inject_pauses=True,
-               align_engine_pauses=True, inject_extras=False, mouse=True, affinity='auto'):
+               align_engine_pauses=True, inject_extras=False, mouse=True, affinity='auto', disable_mods='auto'):
     """mouse：还原录制的鼠标流（phase8-mouse；需要带 RRMT_SetMouse 的 rr_mt.dll，进程环境 RR_MT_MOUSE=1）。
     affinity：回放进程的 CPU 亲和（默认 'auto' = 一个核；'0' = 不限制；见 affinity_mask），只在带 DLL 时生效。
     continue_save：续局回放用的存档快照目录（含 gamestate1.dat），拷进本会话的存档目录后菜单 Enter 续局。
     copy_root：隔离副本（默认 game-rec-01）。turbo：None（原速，默认）/ 'gate' / 'clock'（见 turbo_env，需要 DLL）。
     init_save：非续局回放时先把这个存档快照（例如录制会话 save/run-...，含 persistentgamedata*.dat 与 options.ini）
-    拷进副本存档目录，使解锁/道具池与录制开局时相同；不拷 gamestate1.dat（否则菜单 Enter 会先续上旧局）。"""
+    拷进副本存档目录，使解锁/道具池与录制开局时相同；不拷 gamestate1.dat（否则菜单 Enter 会先续上旧局）。
+    disable_mods：'auto'（默认）= 录制里有 api 调用的第三方 mod（api_mods）；'none' = 不禁用（这些 mod 的调用也不代为执行）；
+    或目录名列表。回放期间给这些 mod 放 disable.it，结束后挪进回放会话目录 disabled-mods/（README §8.6）。"""
     if turbo and not use_dll:
         raise ValueError('--turbo 需要 rr_mt.dll（不能与 --no-dll 同用）')
     turbo_env(turbo)  # 模式名不对就在启动前报错
@@ -552,7 +751,19 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
     sess = rr.Session(name, out_root, copy_root=copy_root, raw_policy='keep', use_dll=use_dll,
                       init_save_from=init_from, init_save_exclude=exclude, extra_env=replay_env(turbo, mouse and use_dll, affinity if use_dll else None),
                       forced_options=forced_options or dict(rr.FORCED_OPTIONS, PauseOnFocusLost='0'))
-    sess.prepare()
+    if disable_mods == 'auto':
+        api_set = api_mods(run)
+    elif disable_mods in (None, 'none', ''):
+        api_set = []
+    else:
+        api_set = [x for x in (disable_mods if isinstance(disable_mods, (list, tuple, set))
+                               else str(disable_mods).split(',')) if x]
+    placed = disable_mods_in_copy(sess.copy, api_set)
+    try:
+        sess.prepare()
+    except Exception:
+        restore_disabled_mods(sess.copy, placed, sess.dir / 'disabled-mods')
+        raise
     # 录制以死亡结束时多给 90 帧，让回放局自己走到 MC_POST_GAME_END（比较"是否同帧死亡"）
     limit_frames = run.frames + (90 if (run.end or {}).get('reason') == 'death' else 0)
     ctl = dict(purpose='replay', source=str(rec_path))
@@ -563,13 +774,14 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
     info = dict(source=str(rec_path), issues=issues, use_dll=use_dll, frame_limit=limit_frames,
                 affinity=hex(affinity_mask(affinity)) if use_dll and affinity_mask(affinity) else None,
                 continue_save=str(continue_save) if continue_save else None, copy=str(sess.copy.root),
-                turbo=turbo or 'off', init_save=str(init_save) if init_save and not continued else None)
+                turbo=turbo or 'off', init_save=str(init_save) if init_save and not continued else None,
+                api_mods=list(api_set), mods_disabled=placed)
     stall_s = STALL_S['turbo' if turbo else 'off']
     try:
         # 放在 try 里：建表失败也要走 finish()（还原 options.ini、停监视线程、写 session.json）
         table = build_replay_table(run, sess.irr_dir / 'irr_replay.lua', inject_pauses=inject_pauses,
                                    align_engine_pauses=align_engine_pauses, inject_extras=inject_extras,
-                                   mouse=mouse)
+                                   mouse=mouse, api=api_set)
         info['table'] = table
         # 进菜单之后、回放局开出来之前进程崩溃（例如 0xC0000409）或超时：同样算一次启动失败，换新进程重试并计数
         info['start_failures'] = []
@@ -661,7 +873,11 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
         info['error'] = repr(e)
     finally:
         sess.info['replay'] = info
-        sess.finish()
+        try:
+            sess.finish()
+        finally:
+            # 回放结束（无论成败）：挪走临时放的 disable.it，第三方 mod 恢复启用
+            info['mods_restored'] = restore_disabled_mods(sess.copy, placed, sess.dir / 'disabled-mods')
     rep_file = None
     for r in sess.info['runs']:
         if r.get('lua_name') == info.get('replay_run'):
@@ -881,8 +1097,15 @@ def run_watch(rec_path, name, out_root, copy_root=rr.DEFAULT_COPY, init_save=Non
         capture = dict(out=str(capture_out), ffmpeg=ff, vargs=vargs, encoder=enc)
     sess = rr.Session(name, out_root, copy_root=copy_root, raw_policy='keep', use_dll=True, init_save_from=init_save,
                       init_save_exclude=('gamestate1.dat',), extra_env=env, forced_options=WATCH_FORCED_OPTIONS)
-    sess.prepare()
-    info = dict(source=str(rec_path), mode=mode, issues=issues, copy=str(sess.copy.root),
+    # phase10：录制里有 api 调用的第三方 mod（GoodTrip 等）观战/导出时同样禁用、由 mod 代为执行（与 run_replay 相同）
+    api_set = api_mods(run)
+    placed = disable_mods_in_copy(sess.copy, api_set)
+    try:
+        sess.prepare()
+    except Exception:
+        restore_disabled_mods(sess.copy, placed, sess.dir / 'disabled-mods')
+        raise
+    info = dict(source=str(rec_path), mode=mode, issues=issues, copy=str(sess.copy.root), api_mods=api_set, mods_disabled=placed,
                 init_save=str(init_save) if init_save else None, capture=capture, launches=[], rewinds=[], events=[],
                 menu_pause_esc=[], memory=[])
     t_session = time.time()
@@ -897,7 +1120,7 @@ def run_watch(rec_path, name, out_root, copy_root=rr.DEFAULT_COPY, init_save=Non
     try:
         info['resources'] = install_watch_resources(sess.copy)
         rr.write_control(sess.irr_dir, dict(purpose=mode, source=str(rec_path)))
-        table = build_replay_table(run, sess.irr_dir / 'irr_replay.lua')
+        table = build_replay_table(run, sess.irr_dir / 'irr_replay.lua', api=api_set)
         info['table'] = {k: v for k, v in table.items() if k != 'cmds'}
         info['timeline'] = build_watch_timeline(run, sess.irr_dir / 'irr_watch_timeline.lua')
         # 观战：帧上限 = 录制帧数（到头 mod 自己停住）；导出：同 run_replay（死亡局多 90 帧让回放走到 GAME_END）
@@ -1104,7 +1327,10 @@ def run_watch(rec_path, name, out_root, copy_root=rr.DEFAULT_COPY, init_save=Non
         info['traceback'] = traceback.format_exc()
     finally:
         sess.info['watch'] = info
-        sess.finish()
+        try:
+            sess.finish()
+        finally:
+            info['mods_restored'] = restore_disabled_mods(sess.copy, placed, sess.dir / 'disabled-mods')
     # 每个回放进程的回放局都与录制比较（往回跳之前的那些是前缀，跳帧重跑的是从第 1 帧开始的完整重跑）
     reps = []
     for L in info['launches']:
@@ -1161,6 +1387,9 @@ def main(argv=None):
                     help='不还原录制的鼠标流（旧行为；phase8-mouse 之前的回放不还原，光标一直不动）')
     ap.add_argument('--init-save', default=None,
                     help='非续局回放：先把这个存档快照（录制会话 save/run-...）拷进副本存档目录（不拷 gamestate1.dat）')
+    ap.add_argument('--disable-mods', default='auto',
+                    help='回放时禁用、由 mod 代为执行其调用（api 行）的第三方 mod：auto（默认，录制里有 api 调用的）、none、'
+                         '或逗号分隔的目录名（README §8.6）')
     ap.add_argument('--watch', action='store_true',
                     help='观战模式（README §8.3）：真实游戏画面 + 热键（暂停/变速/单帧/跳房间/跳帧/自由镜头）；需带观战钩子的 DLL')
     ap.add_argument('--watch-speed', type=float, default=1, choices=WATCH_SPEEDS, help='观战初始倍速')
@@ -1206,7 +1435,8 @@ def main(argv=None):
         sess, info = run_replay(a.run, name, a.out_root, use_dll=not a.no_dll, continue_save=a.continue_save,
                                 copy_root=a.copy, turbo=a.turbo, init_save=a.init_save,
                                 inject_pauses=not a.no_menu_pause, align_engine_pauses=not a.no_pause_align,
-                                inject_extras=a.inject_extras, mouse=not a.no_mouse, affinity=a.affinity)
+                                inject_extras=a.inject_extras, mouse=not a.no_mouse, affinity=a.affinity,
+                                disable_mods=a.disable_mods)
         res = dict(replay_session=str(sess.dir), info=info)
         if info.get('replay_file'):
             res['compare'] = compare(a.run, info['replay_file'])

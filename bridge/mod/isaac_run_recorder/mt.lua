@@ -80,6 +80,28 @@ function M.mouse_init()
 	return true
 end
 
+-- phase10-mods-console：控制台命令。rr_mt.dll 在环境变量 RR_MT_CONSOLE=1（录制会话 --allow-console）且身份门 + 代码签名
+-- 通过时挂引擎的 Console::SubmitInput，把玩家在调试控制台提交的输入行排队；RRMT_ConsoleTake() 取走一条（line, k, 剩余数）。
+-- 返回是否可用；原因记在 M.console_reason。
+function M.console_init()
+	if M.console_checked then return M.console_ok end
+	M.console_checked = true
+	M.console_ok = false
+	if not M.dll or not package or not package.loadlib then M.console_reason = "no_dll"; return false end
+	local ok1, takef = pcall(package.loadlib, M.dll, "RRMT_ConsoleTake")
+	local ok2, infof = pcall(package.loadlib, M.dll, "RRMT_ConsoleInfo")
+	if not (ok1 and takef and ok2 and infof) then M.console_reason = "dll has no RRMT_ConsoleTake (old build)"; return false end
+	local ok3, on = pcall(infof)
+	if not ok3 or on ~= 1 then
+		M.console_reason = "console hook not installed (RR_MT_CONSOLE!=1, identity gate or code signature)"
+		return false
+	end
+	M.console_take, M.console_info = takef, infof
+	M.console_ok = true
+	M.console_reason = "ok"
+	return true
+end
+
 -- 每局随机的 32 位 salt（非 0）
 function M.new_salt()
 	M.counter = M.counter + 1

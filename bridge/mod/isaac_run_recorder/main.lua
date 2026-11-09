@@ -7,7 +7,7 @@
 -- 每局一个文件 run-<proc>-<NNNN>.jsonl：MC_POST_GAME_STARTED 开、MC_PRE_GAME_EXIT / 死亡 / 下一局开始时关。
 -- 格式见 README.md。
 local mod = RegisterMod("Isaac Run Recorder", 1)
-local VERSION = "0.3.2"
+local VERSION = "0.4.0"
 local SCHEMA = "isaac-run-v1"
 local game = Game()
 local concat = table.concat
@@ -29,6 +29,8 @@ end
 local ST = load_module("state")
 local IN = load_module("inputs")
 IN.player_num = ST.player_num
+-- 0.4.0（phase10）：第三方 mod 的"效果"调用（api 行，api.lua）。IRR_API=0 不装包装
+local API = load_module("api")
 
 -- 读状态时引擎内部可能再触发 MC_INPUT_ACTION（例如某些 getter 会查询输入），IN.reading 让这些查询被忽略
 local function quiet(fn, ...)
@@ -135,6 +137,9 @@ local function write_status()
 		',"runs":', tostring(S.runs), ',"ack":', tostring(H and H.ack or 0), ',"errors":', tostring(S.errors),
 		',"err":', ST.jstr(S.err), ',"dead":', tostring(R ~= nil and Isaac.GetPlayer(0):IsDead()),
 		',"seed":', ST.jstr(R and R.seed), ',"replay":', RP and RP.stats_json() or "null",
+		-- 0.4.0：当前房间号与是否已清（测试驱动用；只读）
+		',"room":', tostring(R and game:GetLevel():GetCurrentRoomIndex() or "null"),
+		',"clear":', tostring(R ~= nil and game:GetRoom():IsClear()),
 		'}')
 	fh:close()
 	S.last_status = Isaac.GetTime()
@@ -143,6 +148,17 @@ end
 local function signal(name, kind, extra)
 	local fh = io.open(OUT .. "/signal-" .. name .. "." .. kind .. ".json", "w")
 	if fh then fh:write(extra); fh:close() end
+end
+
+-- 第三方 mod 的效果调用（api.lua）：替换 Game/Level/EntityPlayer/SFXManager 实例元表的 __index（Level 另有 __newindex）、
+-- Isaac.ExecuteCommand；别的 mod 调用被监视的方法时写 api 行。本 mod 自己的命令（harness）经 API.exec_raw，不记录
+local API_ON = getenv("IRR_API") ~= "0"
+-- 控制台命令（phase10）：RR_MT_CONSOLE=1（录制会话 --allow-console）时 DLL 挂 Console::SubmitInput，这里每次渲染取走
+pcall(MT.console_init)
+if API_ON and S.writable then
+	local ok, e = pcall(API.install, {run = function() return R end, line = line, jstr = ST.jstr,
+		recording = function() return S.writable end, self_dir = SRC and SRC:match("([^/\\]+)$") or "isaac_run_recorder"})
+	if not ok then fail("api_install", e) end
 end
 
 ------------------------------------------------------------------ 开销统计
@@ -166,6 +182,8 @@ local function close_run(reason)
 		.. ',"frames":' .. r.n .. ',"renders":' .. r.renders .. ',"errors":' .. r.errors .. ',"cost":' .. cost_json(r.cost)
 		.. ',"missing_player_fields":' .. ST.jval(fields) .. ',"mt_unstable_reads":' .. ST.jval(MT.unstable_reads())
 		.. ',"fmt_repairs":' .. r.fmt_repairs .. ',"fmt_examples":' .. ST.jval(r.fmt_examples)
+		.. ',"api":' .. ST.jval(API.counts)
+		.. ',"console_cmds":' .. tostring(S.console_cmds or 0)
 		.. ',"replay":' .. (r.replay and RP.stats_json() or "null") .. '}')
 	r.fh:close()
 	if r.replay and H and RP.pinlog_json then
@@ -203,6 +221,7 @@ local function open_run(continued, mt_header)
 		IN.replay = RP; RP.active = true
 	end
 	local meta = quiet(ST.meta)
+	pcall(API.verify)
 	local session = read_file(OUT .. "/irr_session.json")
 	local pre = S.prespawn
 	S.prespawn = {}
@@ -212,6 +231,8 @@ local function open_run(continued, mt_header)
 		',"gf":', game:GetFrameCount(), ',"t":', Isaac.GetTime(),
 		',"ifc":', Isaac.GetFrameCount(), ',"os_time":', os.time(), ',"os_date":', ST.jstr(os.date("!%Y-%m-%dT%H:%M:%SZ")),
 		',"meta":', ST.jval(meta),
+		',"api":', ST.jval(API.header()),
+		',"console":', ST.jval({hook = MT.console_ok == true, reason = MT.console_reason}),
 		',"harness":', hinfo and ST.jval({start = hinfo.start, bot = hinfo.bot, bot_seed = hinfo.bot_seed, frames = hinfo.frames,
 			cmds = hinfo.cmds, replay = hinfo.replay}) or "null",
 		',"replay_of":', is_replay and ST.jstr(RP.tbl.source) or "null",
@@ -232,6 +253,8 @@ local function open_run(continued, mt_header)
 	line(quiet(ST.room_line, 1))
 	local il = quiet(ST.items_lines, 1, true)
 	if il then for _, s in ipairs(il) do line(s) end end
+	for _, s in ipairs(API.on_run_open()) do line(s) end
+	S.console_cmds = 0
 	signal(name, "start", '{"run":' .. ST.jstr(name) .. ',"continued":' .. tostring(continued == true) .. ',"seed":'
 		.. ST.jstr(R.seed) .. ',"t":' .. Isaac.GetTime() .. ',"os_time":' .. os.time() .. '}')
 	S.paused = game:IsPaused()
@@ -241,6 +264,28 @@ end
 local function ev(name, args)
 	if not R then return end
 	line('{"k":"ev","n":' .. (R.n + 1) .. ',"gf":' .. game:GetFrameCount() .. ',"ev":"' .. name .. '","a":' .. args .. '}')
+end
+
+-- 玩家在调试控制台提交的命令（phase10；DLL 钩子排队，MT.console_take 取走）。写成 ev cmd：a = [命令, 参数]（与 MC_EXECUTE_CMD
+-- 的 cmd 事件相同的拆法），src = "console"，line = 原文，r = 本帧窗口里暂停开始的那次渲染序号（控制台打开 = 暂停；
+-- 命令在暂停期间执行，回放在这次渲染之后执行），paused = 取走时是否暂停中。局外（菜单里）提交的写进 errors.jsonl。
+local function take_console()
+	if not MT.console_ok then return end
+	for _ = 1, 16 do
+		local okc, text, k, left = pcall(MT.console_take)
+		if not okc or text == nil then return end
+		local cmd, params = text:match("^%s*(%S+)%s*(.-)%s*$")
+		if R then
+			local paused = game:IsPaused()
+			local r = (paused and S.pause_rs) or IN.renders_since_update()
+			line('{"k":"ev","n":' .. (R.n + 1) .. ',"gf":' .. game:GetFrameCount() .. ',"ev":"cmd","a":[' .. ST.jstr(cmd or "")
+				.. "," .. ST.jstr(params or "") .. '],"src":"console","line":' .. ST.jstr(text) .. ',"r":' .. r
+				.. ',"paused":' .. tostring(paused) .. ',"k_console":' .. tostring(k) .. "}")
+			S.console_cmds = (S.console_cmds or 0) + 1
+		else
+			fail("console_outside_run", text)
+		end
+	end
 end
 
 ------------------------------------------------------------------ 每逻辑帧
@@ -299,6 +344,8 @@ local function frame()
 	-- tick 分类状态无论如何都要推进，否则后续 tick 全部错类
 	IN.on_update(gf)
 	IN.n_next = n + 1
+	API.mark("U", 0)
+	R.room_last = game:GetLevel():GetCurrentRoomIndex()
 	if not ok then fail("frame", err) end
 	if n % 300 == 0 then R.fh:flush() end
 	local ms = math.floor((os.clock() - t0) * 1000 + 0.5)
@@ -315,6 +362,7 @@ end
 ------------------------------------------------------------------ 回调
 mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, function(_, entity, hook, action)
 	if not R or IN.reading then return nil end
+	if API.mk ~= "Q" then API.mark("Q", IN.renders_since_update()) end
 	local ok, ret = pcall(IN.on_query, entity, hook, action)
 	if ok then return ret end
 	IN.reading = false
@@ -339,7 +387,12 @@ mod:AddCallback(ModCallbacks.MC_PRE_ENTITY_SPAWN, function(_, t, v, s, pos, vel,
 end)
 
 mod:AddCallback(ModCallbacks.MC_POST_UPDATE, guarded("post_update", function()
+	-- 回放：录制里第 n 帧逻辑更新期间（本 mod 的 MC_POST_UPDATE 之前）别的 mod 的调用、以及没赶上渲染的调用（api 行）
+	if R and R.replay and RP.api_update_start then RP.api_update_start(R.n + 1) end
+	if R and R.replay and RP.console_update_start then RP.console_update_start(R.n + 1) end
 	if R then frame() end
+	-- 回放：录制里排在本 mod 的 MC_POST_UPDATE 之后（同一次迭代）的调用
+	if R and R.replay and RP.api_update_end then RP.api_update_end(R.n) end
 	-- 回放：录制里"下一帧第 1 次渲染"读到的鼠标在这里还原（phase8-mouse；replay.lua 的鼠标一节）
 	if R and R.replay and RP.mouse_on_update then
 		local okm, em = pcall(RP.mouse_on_update, R.n)
@@ -359,13 +412,18 @@ mod:AddCallback(ModCallbacks.MC_POST_RENDER, guarded("post_render", function()
 	if W and W.skipped_render() then W.on_render(); return end
 	S.renders = S.renders + 1
 	if R then
+		-- 回放：录制里本次渲染（排在本 mod 的渲染回调之前）别的 mod 的调用（api 行）。在本 mod 自己的渲染计数之前执行：
+		-- 与录制时一样，调用期间引擎若查询输入（例如 ChangeRoom 里），tick 序号仍是"上一次渲染"的
+		if R.replay and RP.api_render then RP.api_render(R.n + 1, IN.renders_since_update() + 1, false) end
 		IN.on_render()
+		API.mark("R", IN.renders_since_update())
 		R.renders = R.renders + 1
 		R.perf_renders = R.perf_renders + 1
 		local paused = game:IsPaused()
 		if paused ~= S.paused then
 			S.paused = paused
 			ev(paused and "pause" or "unpause", "[" .. Isaac.GetFrameCount() .. "," .. Isaac.GetTime() .. "," .. IN.renders_since_update() .. "]")
+			if paused then S.pause_rs = IN.renders_since_update() end
 			if paused then R.fh:flush() end
 			if R.replay then RP.on_pause_flip(IN.n_next, paused, IN.renders_since_update()) end
 		end
@@ -378,6 +436,9 @@ mod:AddCallback(ModCallbacks.MC_POST_RENDER, guarded("post_render", function()
 				if fh then fh:write(req); fh:close() end
 			end
 		end
+		take_console()
+		-- 回放：录制里玩家在控制台提交的命令（ev cmd src=console），在同一帧窗口、暂停开始的那次渲染之后执行
+		if R.replay and RP.console_render then RP.console_render(R.n + 1, IN.renders_since_update()) end
 		local okm, em = pcall(quiet, sample_mouse)
 		if not okm and not R.mouse_err then R.mouse_err = true; fail("mouse", em) end
 		-- 回放：采样之后设置录制里"下一次渲染"读到的鼠标（phase8-mouse）
@@ -390,6 +451,8 @@ mod:AddCallback(ModCallbacks.MC_POST_RENDER, guarded("post_render", function()
 			local a = (R.renders < 120) and 1.0 or 0.75
 			pcall(Isaac.RenderScaledText, "REC", 4, 2, 1.0, 1.0, 1.0, 0.15, 0.15, a)
 		end
+		-- 回放：录制里排在本 mod 渲染回调之后的调用（af = 1）
+		if R and R.replay and RP.api_render then RP.api_render(R.n + 1, IN.renders_since_update(), true) end
 	end
 	if H then H.on_render(S.renders) end
 	if W then W.on_render() end
@@ -479,6 +542,8 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, guarded("game_started", funct
 	local okm, mth = pcall(mt_on_game_started, continued)
 	if not okm then fail("mt_reseed", mth); mth = nil end
 	open_run(continued, mth)
+	-- 回放：录制里开局前（局外）别的 mod 的调用（ph = gs）
+	if R and R.replay and RP.api_game_started then RP.api_game_started() end
 	-- 回放局：启用鼠标还原（rr_mt.dll 的 RRMT_SetMouse，需 RR_MT_MOUSE=1），开局光标位置无声设置（phase8-mouse）
 	if R and R.replay and RP.mouse_start then
 		local okm, em = pcall(RP.mouse_start, MT)
@@ -511,6 +576,8 @@ mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, guarded("new_room", function()
 	if H and not R then diag("new_room_no_run", nil) end
 	-- gf 变小 = 新局已在生成（例如按住 R 重开且没有先触发 PRE_GAME_EXIT）：不写进旧局
 	if R and R.n > 0 and game:GetFrameCount() >= R.gf_last then
+		-- 回放：换房期间别的 mod 的调用（父调用执行中的嵌套子调用 / 本帧更新里换房之后的调用）
+		if R.replay and RP.api_new_room then RP.api_new_room(R.n + 1) end
 		line(quiet(ST.room_line, R.n + 1))
 		R.force_kf = true
 		R.fh:flush()
@@ -549,7 +616,7 @@ end))
 ------------------------------------------------------------------ harness / replay（只在测试时）
 local ctx = {
 	out = OUT, jstr = ST.jstr, jval = ST.jval, fx = ST.fx, fail = fail, status = write_status, load_module = load_module,
-	line = line,
+	line = line, exec = API.exec_raw, api = API,
 	run = function() return R end,
 	close_run = close_run,
 	bench = function(n)
@@ -589,7 +656,7 @@ if S.writable then
 		local rpath = OUT .. "/irr_replay.lua"
 		if read_file(rpath) then
 			local ok2, rp = pcall(function() return load_module("replay").load(rpath) end)
-			if ok2 and rp then RP = rp; ctx.replay_obj = rp else fail("replay_load", rp) end
+			if ok2 and rp then RP = rp; ctx.replay_obj = rp; if rp.set_api then rp.set_api(API, fail, line) end else fail("replay_load", rp) end
 		end
 		-- 观战模式 / 实录导出（replay_run.py --watch / --capture 放置 irr_watch.json）：只在回放时加载
 		local wcfg = RP and read_file(OUT .. "/irr_watch.json")

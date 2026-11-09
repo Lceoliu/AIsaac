@@ -11,6 +11,8 @@
     options.ini 的强制与还原都对"本会话的存档目录"做；
   * 会话期间只读监视真实 Documents\\My Games\\ 下是否出现 (Galaxy) 目录，结果写进 session.json（real_documents_watch）；
   * 录制会话强制 options.ini 的 EnableDebugConsole=0（D8），结束后还原该键；MouseControl 保留用户值（D6，mod 记 mouse 流）；
+    allow_console=True（record_run.ps1 -AllowConsole，phase10）时不强制，并给游戏进程设 RR_MT_CONSOLE=1：rr_mt.dll 挂引擎的
+    Console::SubmitInput，玩家在控制台提交的每条命令由 mod 写成 ev cmd（src = console，带帧号），回放时在同一帧窗口执行；
   * 启动游戏（--luadebug），自动重试启动失败并计数（注入器失败、进程崩溃、log 洪水、mod 未加载），
     log 洪水检测（只认 mtime 晚于本次启动的 log.txt）；DLL 自己的 rr_mt.<pid>.log 直接写进会话 game/ 目录；
   * 退出后把每局 jsonl 压成 .zst（zstd-19）并逐字节校验、逐行解析校验；写 session.json 与会话摘要。
@@ -85,6 +87,8 @@ LOG_FLOOD_BYTES = 20 * 1024 * 1024
 # PostMessage 鼠标消息，所以 mod 另记 mouse 流（帧行 "ms"），MouseControl 保留用户值（=1 时射击来自鼠标，
 # 回放无法注入鼠标，replay_run.py 会标出）。录制会话只强制关闭调试控制台（D8）。
 FORCED_OPTIONS = {'EnableDebugConsole': '0'}
+# phase10：--allow-console 会话的强制项（不再强制关控制台；控制台命令由 DLL 钩子记录，README §8.7）
+FORCED_OPTIONS_CONSOLE = {}
 
 
 # ---------------------------------------------------------------------------------------------- 小工具
@@ -628,6 +632,9 @@ def launch_with_retry(copy, irr_dir, log_dir, attempts=6, boot_timeout=90, settl
                     txt = dl.read_text(encoding='utf-8', errors='replace')
                     st = re.findall(r'status=\d+ (.*)', txt)
                     rec['dll_status'] = st[-1] if st else None
+                    cl = re.findall(r'console: (?:hook installed|OFF).*', txt)
+                    if cl:
+                        rec['console_hook'] = cl[-1].strip()
                     # CPU 亲和（phase8-mouse）：要求设了 RR_MT_AFFINITY 时 DLL 日志里有成功的 affinity: 行
                     want = (extra_env or {}).get('RR_MT_AFFINITY')
                     rec['affinity'] = dict(requested=want, dll=dll_affinity_line(txt))
@@ -657,7 +664,7 @@ def iter_lines_raw(path):
 def validate_lines(lines):
     """逐行解析并检查结构：header 在首行、帧号连续、end 行（无则标记 truncated）。返回统计。"""
     st = dict(lines=0, frames=0, header=None, end=None, kinds={}, events={}, first_gf=None, last_gf=None, errors=[],
-              truncated=False, bad_json=0, last_line_partial=False, mt_frames=0, repaired_lines=0)
+              truncated=False, bad_json=0, last_line_partial=False, mt_frames=0, repaired_lines=0, console_cmds=0, api_lines=0)
     expect_n = 1
     for i, raw in enumerate(lines):
         st['lines'] += 1
@@ -707,6 +714,10 @@ def validate_lines(lines):
             st['last_gf'] = o['gf']
         elif k == 'ev':
             st['events'][o['ev']] = st['events'].get(o['ev'], 0) + 1
+            if o.get('src') == 'console':
+                st['console_cmds'] += 1
+        elif k == 'api':
+            st['api_lines'] += 1
         elif k == 'end':
             st['end'] = dict(reason=o.get('reason'), frames=o.get('frames'), cost=o.get('cost'), errors=o.get('errors'))
             if o.get('frames') != st['frames']:
@@ -882,7 +893,7 @@ class Session:
 
     def __init__(self, name, out_root, copy_root=DEFAULT_COPY, init_save_from=None, raw_policy='stage', harness=None,
                  enforce_options=True, use_dll=True, extra_env=None, forced_options=None, init_save_exclude=(),
-                 affinity=DEFAULT_AFFINITY):
+                 affinity=DEFAULT_AFFINITY, allow_console=False):
         self.name = name
         self.out_root = Path(out_root).resolve()  # 绝对路径：IRR_DIR 交给游戏进程（工作目录是副本 game/），相对路径会落空
         self.dir = self.out_root / name
@@ -907,10 +918,17 @@ class Session:
         self.raw_policy = raw_policy
         self.harness = harness
         self.enforce_options = enforce_options
-        self.forced_options = dict(forced_options) if forced_options is not None else dict(FORCED_OPTIONS)
+        # phase10：allow_console 时不强制 EnableDebugConsole=0，并让 DLL 挂控制台提交函数（RR_MT_CONSOLE=1）
+        self.allow_console = bool(allow_console)
+        default_forced = FORCED_OPTIONS_CONSOLE if self.allow_console else FORCED_OPTIONS
+        self.forced_options = dict(forced_options) if forced_options is not None else dict(default_forced)
+        if self.allow_console:
+            if not use_dll:
+                raise ValueError('--allow-console 需要 rr_mt.dll（控制台命令由 DLL 钩子记录）')
+            self.extra_env.setdefault('RR_MT_CONSOLE', '1')
         self.info = dict(schema='isaac-run-session-v1', name=name, created=now_iso(), host=host_info(),
                          session_dir=str(self.dir), save_dir=str(self.save_dir), use_dll=use_dll,
-                         affinity=self.affinity, launches=[], runs=[], notes=[])
+                         affinity=self.affinity, allow_console=self.allow_console, launches=[], runs=[], notes=[])
         if self.extra_env:
             self.info['extra_env'] = self.extra_env
         self.snapshots = {}
@@ -984,7 +1002,7 @@ class Session:
                    game_version=version, mods=mods, options_forced=self.forced_options if self.enforce_options else {},
                    launch_command=([str(self.copy.launcher), '--launch', str(self.copy.dll)] if self.use_dll else [])
                    + [str(self.copy.exe), '--luadebug'], host=self.info['host']['hostname'],
-                   save_dir=str(self.save_dir), use_dll=self.use_dll,
+                   save_dir=str(self.save_dir), use_dll=self.use_dll, allow_console=self.allow_console,
                    dll=dict(sha256=self.info['dll'].get('dll_sha256'), launcher_sha256=self.info['dll'].get('launcher_sha256'),
                             source='rl/bridge/engine/j746_rec') if self.use_dll else None)
         write_json(self.irr_dir / 'irr_session.json', obj, compact=True)
@@ -1076,7 +1094,10 @@ class Session:
         after = hist.read_text(encoding='utf-8', errors='replace').splitlines() if hist.exists() else []
         n0 = len(self.cmd_history_before)
         new = after[n0:] if after[:n0] == self.cmd_history_before else after
-        self.info['console'] = dict(cmd_history_new_lines=new, note='内建控制台命令只出现在退出时写的 cmd_history.txt（无帧号）')
+        self.info['console'] = dict(cmd_history_new_lines=new, allow_console=self.allow_console,
+                                    note=('--allow-console：控制台命令由 DLL 钩子逐条记进 run 文件（ev cmd src=console，带帧号）；'
+                                          'cmd_history.txt 只在退出时写、没有帧号，这里仅作对照') if self.allow_console else
+                                    '内建控制台命令只出现在退出时写的 cmd_history.txt（无帧号）')
         for lg in sorted(self.game_logs.glob('*.log.txt')):
             v = game_version_from_log(lg)
             if v:
@@ -1105,8 +1126,12 @@ class Session:
             sig_end = read_json(self.irr_dir / f'signal-{name}.end.json')
             rec['end_signal'] = sig_end
             rec['save_snapshot'] = self.snapshots.get(name)
-            rec['console_used'] = console_used
-            if console_used:
+            cc = (rec.get('validation') or {}).get('console_cmds', 0)
+            rec['console_cmds'] = cc
+            rec['console_used'] = console_used or bool(cc)
+            if cc:
+                rec['console_note'] = f'本局 {cc} 条控制台命令（ev cmd src=console，带帧号，回放时同帧执行）'
+            elif console_used and not self.allow_console:
                 rec['console_note'] = '本会话 cmd_history.txt 有新增行，无法定位到具体局，会话内所有局都标记'
             v = rec.get('validation') or {}
             if v.get('truncated'):
@@ -1246,18 +1271,22 @@ def main(argv=None):
     ap.add_argument('--attempts', type=int, default=6)
     ap.add_argument('--no-dll', action='store_true', help='不注入 rr_mt.dll（第二阶段行为：真实 Documents 存档、无 MT reseed）')
     ap.add_argument('--obs', choices=['full', 'keyframe'], default='full', help='观测模式（E5；默认 full = 每帧完整观测）')
+    ap.add_argument('--allow-console', action='store_true',
+                    help='不强制关闭调试控制台；DLL 记录每条控制台命令（ev cmd src=console），回放时同帧执行（README §8.7）')
     ap.add_argument('--affinity', default=DEFAULT_AFFINITY,
                     help='游戏进程的 CPU 亲和掩码（phase8-mouse §H4；默认 auto = 逻辑 CPU 0 一个核，录下的局才可能精确回放；'
                          '0 = 不限制；0x… = 指定掩码；只在带 DLL 时生效）')
     a = ap.parse_args(argv)
     extra_env = {'IRR_OBS': 'keyframe'} if a.obs == 'keyframe' else None
     sess = Session(a.session, a.out_root, a.copy, a.init_save_from, raw_policy=a.raw, use_dll=not a.no_dll,
-                   extra_env=extra_env, affinity=a.affinity)
+                   extra_env=extra_env, affinity=a.affinity, allow_console=a.allow_console)
     print(f'[录制] 会话目录 {sess.dir}', flush=True)
     sess.prepare()
     print(f'[录制] {"带 DLL（MT reseed、存档在副本 profile/）" if sess.use_dll else "不带 DLL（-NoDll）"}；存档目录 {sess.save_dir}',
           flush=True)
     print(f'[录制] CPU 亲和 {sess.affinity or "不限制（回放将无法保证精确）"}', flush=True)
+    if sess.allow_console:
+        print('[录制] 允许调试控制台：每条控制台命令记进 run 文件（ev cmd src=console），回放时同帧执行', flush=True)
     print(f'[录制] 存档快照 {len(sess.info["save_pre"]["files"])} 个文件；启动游戏…', flush=True)
     try:
         if a.auto_seconds > 0:

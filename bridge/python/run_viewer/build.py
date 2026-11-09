@@ -6,7 +6,7 @@
   JSON 会到几十 MB；保持差分形式 gzip 后约 5 MB，浏览器展开一个关键帧段（≤300 帧）只要几毫秒。
 - rooms / levels / items：每行附 at = 它生效的第一帧的数组下标（= 文件里它前面的 f 行数），与 load_run.py
   按"行号先后"取最近一行的口径相同。
-- events：ev / hcmd / mark 行，按其 n 归帧（与 load_run 相同）。
+- events：ev / hcmd / mark / api 行，按其 n 归帧（与 load_run 相同）。
 - names / icons：可选名称表与道具图标（names.py）。
 """
 from __future__ import annotations
@@ -86,7 +86,8 @@ def build(path, res_dir=None, with_names=True, log=print):
             {'room': rooms, 'level': levels, 'items': items}[k].append(d)
             if k == 'items':
                 item_ids.update(it[0] for it in o['items'])
-        elif k in ('ev', 'hcmd', 'mark'):
+        elif k in ('ev', 'hcmd', 'mark', 'api'):
+            # api：第三方 mod 的效果调用（recorder 0.4.0），与 load_run 一样进 events（查看器在时间轴上不画高频的那几种）
             events.append(o)
         elif k == 'end':
             end = o

@@ -14,6 +14,11 @@
 --            之前的随机数决定（phase7-continue），main.lua 在续局的 MC_POST_GAME_STARTED 里钉回（R.apply_start_pos）
 --   mouse  = {[n] = {{r, sx100, sy100, buttons}, ...}}   录制的鼠标流（ms，屏幕坐标 x100 与按键位），mouse_init = {sx100, sy100, buttons}
 --            （phase8-mouse：回放按"第 r-1 次渲染之后"把光标还原给引擎，见下面"鼠标"一节；--no-mouse 时没有这两个字段）
+--   console = {[n] = {{r=渲染序号, line="giveitem c1"}, ...}}   录制里玩家在调试控制台提交的命令（ev cmd src=console，recorder 0.4.0）：
+--            同一帧窗口里第 r 次渲染（录制里控制台打开、暂停开始的那次）的 MC_POST_RENDER 里经 Isaac.ExecuteCommand 执行
+--   api    = {[n] = {{id=, ph="r", r=3, af=1, rc=1, m="Game.StartRoomTransition", self=0, set=1, a={{"i",5},{"p",0},...},
+--             src="goodtrip_1630477831", parent=id, skip="原因"}, ...}}   第三方 mod 的效果调用（recorder 0.4.0，api 行；只含回放时
+--            被禁用的那些 mod 的调用），在录制的同一位置原样调用（见下面"第三方 mod 的调用"一节）
 -- 注入覆盖玩家实体的 12 个动作；全局查询只在菜单暂停的开菜单 tick 注入一次（R.global）。
 local M = {}
 
@@ -287,6 +292,155 @@ function M.load(path)
 		return k
 	end
 
+	------------------------------------------------------------------ 第三方 mod 的调用（recorder 0.4.0，phase10-mods-console）
+	-- 录制里别的 mod（例如 GoodTrip 小地图传送）调用的被监视方法（api 行），回放时该 mod 被禁用，由这里在同一位置调用：
+	--   ph "r"（第 r 次渲染；af = 1 在本 mod 渲染回调之后）：本 mod 的 MC_POST_RENDER 里，渲染序号按 tick 的同一映射（eff_index）
+	--   ph "q"（第 r 次渲染之后的输入轮询里）：第 r+1 次渲染开头（近似）
+	--   ph "u"（第 n 帧逻辑更新里）：本 mod 的 MC_POST_UPDATE 开头；rc = 1（更新里已换房）则在换房的 MC_POST_NEW_ROOM 里
+	--   ph "p"（本 mod 的 MC_POST_UPDATE 之后）：上一帧 MC_POST_UPDATE 的末尾
+	--   ph "gs"（开局前）：回放局 MC_POST_GAME_STARTED 末尾
+	--   嵌套（parent）：父调用执行期间的 MC_POST_NEW_ROOM 里；父调用返回时还没执行的子调用随即补上（late）
+	-- 本帧该执行而没赶上的（回放的渲染比录制少）在本帧 MC_POST_UPDATE 开头补上（late）。
+	local API, fail_fn = nil, nil
+	R.api_stats = {executed = 0, late = 0, failed = 0, skipped = 0, nested = 0, first_error = nil}
+	local api_done = {}
+	local api_children = {}
+	local api_nested = {}
+	if tbl.api then
+		local ids = {}
+		for _, lst in pairs(tbl.api) do for _, e in ipairs(lst) do ids[e.id] = e end end
+		for _, lst in pairs(tbl.api) do
+			for _, e in ipairs(lst) do
+				if e.parent and ids[e.parent] then
+					api_nested[e.id] = true
+					local c = api_children[e.parent]
+					if not c then c = {}; api_children[e.parent] = c end
+					c[#c + 1] = e
+				end
+			end
+		end
+	end
+	function R.set_api(api, fail, line) API, fail_fn, R.console_line = api, fail, line end
+
+	local api_exec
+	local function api_children_run(pid, where)
+		local ch = api_children[pid]
+		if not ch then return end
+		for _, c in ipairs(ch) do
+			if not api_done[c.id] then
+				R.api_stats.nested = R.api_stats.nested + 1
+				api_exec(c, where)
+			end
+		end
+	end
+	api_exec = function(e, where, late)
+		if api_done[e.id] then return end
+		api_done[e.id] = true
+		if e.skip then R.api_stats.skipped = R.api_stats.skipped + 1; return end
+		if not API then R.api_stats.failed = R.api_stats.failed + 1; return end
+		if late then R.api_stats.late = R.api_stats.late + 1 end
+		local ok, err = API.replay_call(e, where)
+		if ok then R.api_stats.executed = R.api_stats.executed + 1
+		else
+			R.api_stats.failed = R.api_stats.failed + 1
+			if not R.api_stats.first_error then R.api_stats.first_error = tostring(e.id) .. ": " .. tostring(err) end
+			if fail_fn then fail_fn("api_replay", tostring(e.m) .. ": " .. tostring(err)) end
+		end
+		-- 父调用期间没在回调里执行到的子调用（例如嵌套在别的回调里）：随即补上
+		if api_children[e.id] then
+			for _, c in ipairs(api_children[e.id]) do
+				if not api_done[c.id] then
+					R.api_stats.nested = R.api_stats.nested + 1
+					api_exec(c, "after_parent", true)
+				end
+			end
+		end
+	end
+
+	local function api_each(n, pred, where, late)
+		local lst = tbl.api and tbl.api[n]
+		if not lst then return end
+		for _, e in ipairs(lst) do
+			if not api_done[e.id] and not api_nested[e.id] and pred(e) then api_exec(e, where, late) end
+		end
+	end
+
+	-- main.lua MC_POST_RENDER：n = 下一个逻辑帧号，rs = 本帧窗口内第几次渲染，after = 本 mod 渲染回调末尾
+	function R.api_render(n, rs, after)
+		if not (tbl.api and tbl.api[n]) then return end
+		if after then
+			api_each(n, function(e) return e.ph == "r" and e.af == 1 and eff_index(n, e.r) <= rs end, "render_after")
+		else
+			api_each(n, function(e)
+				if e.ph == "r" then
+					local j = eff_index(n, e.r)
+					return (e.af ~= 1 and j <= rs) or (e.af == 1 and j < rs)
+				end
+				return e.ph == "q" and eff_index(n, e.r + 1) <= rs
+			end, "render")
+		end
+	end
+
+	-- main.lua MC_POST_UPDATE 开头（第 n 帧刚更新完、帧行还没写）
+	function R.api_update_start(n)
+		if not (tbl.api and tbl.api[n]) then return end
+		api_each(n, function(e) return e.ph == "u" end, "update")
+		api_each(n, function(e) return e.ph == "r" or e.ph == "q" end, "update_late", true)
+	end
+
+	-- main.lua MC_POST_UPDATE 末尾（第 n 帧写完）：录制里排在本 mod 的 MC_POST_UPDATE 之后的调用属于第 n+1 帧窗口
+	function R.api_update_end(n)
+		if tbl.api and tbl.api[n + 1] then api_each(n + 1, function(e) return e.ph == "p" end, "post_update") end
+	end
+
+	-- main.lua MC_POST_NEW_ROOM（局内、写进房行之前）：父调用执行中 → 它的子调用；否则本帧更新里换房之后的调用（rc = 1）
+	function R.api_new_room(n)
+		if not API then return end
+		local pid = API.current_parent()
+		if pid then api_children_run(pid, "new_room_nested"); return end
+		if tbl.api and tbl.api[n] then api_each(n, function(e) return e.ph == "u" and e.rc == 1 end, "new_room") end
+	end
+
+	-- main.lua MC_POST_GAME_STARTED 末尾（回放局已开）
+	function R.api_game_started()
+		if tbl.api and tbl.api[1] then api_each(1, function(e) return e.ph == "gs" end, "game_started") end
+	end
+
+	------------------------------------------------------------------ 控制台命令（phase10）
+	R.console_stats = {executed = 0, late = 0}
+	local console_done = {}
+	local function console_exec(n, e, late)
+		if not API then return end
+		console_done[e] = true
+		API.exec_raw(e.line)
+		R.console_stats.executed = R.console_stats.executed + 1
+		if late then R.console_stats.late = R.console_stats.late + 1 end
+		if R.console_line then
+			R.console_line('{"k":"hcmd","n":' .. (n - 1) .. ',"gf":' .. Game():GetFrameCount() .. ',"tag":"console","cmd":"'
+				.. (e.line:gsub('[%c"\\]', "?")) .. '"' .. (late and ',"late":1' or '') .. '}')
+		end
+	end
+	function R.console_render(n, rs)
+		local lst = tbl.console and tbl.console[n]
+		if not lst then return end
+		for _, e in ipairs(lst) do
+			if not console_done[e] and rs >= e.r then console_exec(n, e, false) end
+		end
+	end
+	function R.console_update_start(n)
+		local lst = tbl.console and tbl.console[n]
+		if not lst then return end
+		for _, e in ipairs(lst) do
+			if not console_done[e] then console_exec(n, e, true) end
+		end
+	end
+
+	local function api_stats_json()
+		local s = R.api_stats
+		return '{"executed":' .. s.executed .. ',"late":' .. s.late .. ',"failed":' .. s.failed .. ',"skipped":' .. s.skipped
+			.. ',"nested":' .. s.nested .. ',"first_error":' .. (s.first_error and ('"' .. (s.first_error:gsub('[%c"\\]', "?")) .. '"') or "null") .. "}"
+	end
+
 	function R.stats_json()
 		return '{"pinned":' .. R.pinned .. ',"unpinned":' .. R.unpinned .. ',"folded":' .. R.folded
 			.. ',"remapped":' .. R.remapped .. ',"pause_opens":' .. R.pause_opens .. ',"close_requests":' .. R.close_requests
@@ -295,7 +449,10 @@ function M.load(path)
 			.. (R.extras_injected and (',"extras_injected":' .. R.extras_injected) or '')
 			.. ',"mouse":{"available":' .. tostring(R.mouse_stats.available) .. ',"reason":"' .. tostring(R.mouse_stats.reason):gsub('[%c"\\]', "?")
 			.. '","init":' .. R.mouse_stats.init .. ',"applied":' .. R.mouse_stats.applied .. ',"folded":' .. R.mouse_stats.folded
-			.. ',"failed":' .. R.mouse_stats.failed .. '}}'
+			.. ',"failed":' .. R.mouse_stats.failed .. '}'
+			.. (tbl.api and (',"api":' .. api_stats_json()) or '')
+			.. (tbl.console and (',"console":{"executed":' .. R.console_stats.executed .. ',"late":' .. R.console_stats.late .. '}') or '')
+			.. '}'
 	end
 
 	function R.cmds_at(n) return tbl.cmds and tbl.cmds[n] end
@@ -321,6 +478,10 @@ function M.load(path)
 		R.mouse_done = {}
 		mouse_dll = nil
 		pstate = {}
+		R.api_stats = {executed = 0, late = 0, failed = 0, skipped = 0, nested = 0, first_error = nil}
+		api_done = {}
+		R.console_stats = {executed = 0, late = 0}
+		console_done = {}
 	end
 	return R
 end

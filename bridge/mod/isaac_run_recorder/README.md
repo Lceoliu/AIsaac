@@ -1,18 +1,18 @@
 # Isaac Run Recorder（忏悔 J746 整局被动录制）
 
-更新：2026-11-08（recorder 0.3.2：phase8-mouse 回放还原鼠标流，见第 8 节"鼠标还原"与第 9 节；格式不变 `isaac-run-v1`。phase9-robust：长暂停/小退/大退的实测与截断局的读取、比较、`session.json.game_exit`，见第 3、4、8.5 节；mod 未改）。需求与决定见 `experiments/run-recorder/DESIGN_BRIEF.md` §6（D1–D12）与 §7（E1–E8），第一阶段实测见 `experiments/run-recorder/INVESTIGATION.md`，DLL 的依据见 `experiments/run-recorder/mt-probe/MT_PROBE.md`，验收结果见 `experiments/run-recorder/phase2/ACCEPTANCE.md`、`experiments/run-recorder/phase3/ACCEPTANCE.md`。
+更新：2026-11-08（recorder 0.4.0，phase10-mods-console：第三方 mod 对游戏状态的调用记成 api 行、回放时禁用该 mod 并由本 mod 原样调用，第 8.6 节；`--allow-console` 会话里玩家在调试控制台提交的命令由 DLL 钩子带帧号记成 `ev cmd`（src = console），回放同帧执行，第 8.7 节；run 文件只新增行种类与键，`format` 仍是 2，旧文件读法不变。之前：recorder 0.3.2：phase8-mouse 回放还原鼠标流，见第 8 节"鼠标还原"与第 9 节；格式不变 `isaac-run-v1`。phase9-robust：长暂停/小退/大退的实测与截断局的读取、比较、`session.json.game_exit`，见第 3、4、8.5 节；mod 未改）。需求与决定见 `experiments/run-recorder/DESIGN_BRIEF.md` §6（D1–D12）与 §7（E1–E8），第一阶段实测见 `experiments/run-recorder/INVESTIGATION.md`，DLL 的依据见 `experiments/run-recorder/mt-probe/MT_PROBE.md`，验收结果见 `experiments/run-recorder/phase2/ACCEPTANCE.md`、`experiments/run-recorder/phase3/ACCEPTANCE.md`。
 
 ## 1. 它做什么、不做什么
 
 - 目标构建：Repentance v1.7.8a.J746（本地离线 GOG/Galaxy x86），隔离副本 `experiments/run-recorder/game-rec-01`，游戏以 `--luadebug` 启动（mod 需要 `io`/`os`/`package.loadlib`）。
 - **默认带最小 DLL**（E1，第 10 节）：经挂起式注入器加载 `rr_mt.dll`，存档重定向到副本内 `profile/`（E2），mod 每局开局用随机 salt reseed 引擎全局 MT 并逐帧记录 MT 校验值（E3/E4），于是"种子 + salt + 每 tick 输入 + 脚本命令"可以**精确**回放（E6）。`rl/record_run.ps1 -NoDll` 回退到第二阶段行为（不注入、真实 Documents 存档、回放只能近似）。
 - **恢复依据是记录本身**（D1）：每个逻辑帧写完整可读状态（玩家、全部实体、房间头、网格/门的变化），每个 60 Hz tick 写引擎实际消费的输入，另记生成种子流、鼠标流、事件。回放只是分层一致性检查（第 8 节）。
-- **被动**：不改规则、不冻结、不无敌、不禁控制、不执行控制台命令、不消耗游戏 RNG。唯一的例外是带 DLL 时每局开局 1–2 次 MT reseed（第 10 节）：它不改变游戏规则，只是让这一局的随机数流由 StartSeed xor salt 决定（原版由开机时间决定），salt 每局随机，所以同种子的两局照样不同。`MC_INPUT_ACTION` 只读并返回 `nil`；`MC_PRE_ENTITY_SPAWN` 只记录不改种子；读状态时用标志位把引擎内部再触发的输入查询忽略掉。画面上录制期间左上角常驻一个半大小的暗红 "REC"（每局前 2 秒更亮；环境变量 `IRR_HUD=0` 关闭）。
+- **被动**：不改规则、不冻结、不无敌、不禁控制、不执行控制台命令、不消耗游戏 RNG。0.4.0 起加载时替换 Game/Level/EntityPlayer/SFXManager 实例元表的 `__index`（Level 另有 `__newindex`）与 `Isaac.ExecuteCommand`，只为记下别的 mod 对几个方法的调用（第 8.6 节），调用照原样转发、行为不变（环境变量 `IRR_API=0` 不装）。唯一的例外是带 DLL 时每局开局 1–2 次 MT reseed（第 10 节）：它不改变游戏规则，只是让这一局的随机数流由 StartSeed xor salt 决定（原版由开机时间决定），salt 每局随机，所以同种子的两局照样不同。`MC_INPUT_ACTION` 只读并返回 `nil`；`MC_PRE_ENTITY_SPAWN` 只记录不改种子；读状态时用标志位把引擎内部再触发的输入查询忽略掉。画面上录制期间左上角常驻一个半大小的暗红 "REC"（每局前 2 秒更亮；环境变量 `IRR_HUD=0` 关闭）。
 - 三种模式：
   - `record`（默认）：人类会话就是这个模式。
   - harness：仅当输出目录里有 `irr_control.json`（测试脚本放的）才加载 `harness.lua`：文件 IPC、`seed` 开局、测试机器人（`bot.lua`）、在指定帧执行脚本化控制台命令、帧数上限、开销基准、鼠标探针。harness 执行的一切命令都写进 run 文件（`hcmd` 行 / `header.harness`）。
   - `replay`：harness 之外再有 `irr_replay.lua`（`replay_run.py` 生成）时，harness 开出的局按记录注入输入、钉回生成种子，并把回放局本身完整录下。
-- 文件：`main.lua`（回调、分局、写文件）、`state.lua`（状态快照与 digest）、`inputs.lua`（tick 输入）、`mt.lua`（DLL 导出函数、salt、reseed）、`harness.lua`、`replay.lua`、`bot.lua`（后三个只在测试时加载）。
+- 文件：`main.lua`（回调、分局、写文件）、`state.lua`（状态快照与 digest）、`inputs.lua`（tick 输入）、`mt.lua`（DLL 导出函数、salt、reseed、控制台命令队列）、`api.lua`（第三方 mod 调用的截获与回放调用，0.4.0）、`harness.lua`、`replay.lua`、`bot.lua`（后三个只在测试时加载）。
 
 ## 2. 会话目录
 
@@ -44,12 +44,13 @@
 | `mod` | 安装到副本的 recorder 文件及 sha256 |
 | `mods` | 副本 `mods/` 下每个 mod：目录、`metadata.xml` 的 name/id/version、是否有 `disable.it`、全部文件 sha256 |
 | `game_version` | 游戏 log 里的版本行（`Binding of Isaac: Repentance v1.7.8a.J746`） |
-| `options` | `before`（会话前全部键值）、`forced`（`EnableDebugConsole=0`）、`forced_before`、`restored`（会话后还原的键） |
+| `options` | `before`（会话前全部键值）、`forced`（`EnableDebugConsole=0`；`--allow-console` 会话为空）、`forced_before`、`restored`（会话后还原的键） |
+| `allow_console` | （0.4.0）`record_run.ps1 -AllowConsole` / `--allow-console`：不强制关控制台，游戏进程设 `RR_MT_CONSOLE=1`，DLL 记录每条控制台命令（第 8.7 节） |
 | `save_pre`、`save_post`、`init_save_from` | 存档快照清单 |
-| `launches` | 每次启动尝试：tag、pid、`use_dll`、`boot_s`（mod 加载用时）、`result`（ok/failed）、失败原因（注入器失败、进程退出码、log 洪水、mod 未加载）、版本行、`mod_mt`（mod 加载时的 MT 状态：available/reason/DLL 信息）、`dll_status`（DLL 日志里最后的状态行）、`dll_log` |
+| `launches` | 每次启动尝试：tag、pid、`use_dll`、`boot_s`（mod 加载用时）、`result`（ok/failed）、失败原因（注入器失败、进程退出码、log 洪水、mod 未加载）、版本行、`mod_mt`（mod 加载时的 MT 状态：available/reason/DLL 信息）、`dll_status`（DLL 日志里最后的状态行）、`dll_log`；`console_hook`（0.4.0，`--allow-console` 时 DLL 日志的 `console: hook installed …` / `console: OFF …` 行） |
 | `runs[]` | 每局：`file`、`lua_name`、`raw_bytes`/`zst_bytes`、`raw_sha256`/`zst_sha256`、`verified`、`validation`（帧数、首末 gf、header 摘要、end 摘要、事件计数、`truncated`、`bad_json`/`last_line_partial`（末尾不完整行，见第 4 节）、`errors`、`game_hours`）、`save_snapshot`（该局开局快照路径与信号）、`console_used`、`end_signal`；截断局另有 `note`（含游戏进程退出码） |
 | `game_exit` | （phase9-robust 起）最后一个游戏进程怎么结束的：`exit_code`/`exit_hex`、`abnormal`（退出码非 0：被任务管理器/`TerminateProcess` 结束是 `0x00000001`，崩溃是 `0xC0000005`/`0xC0000409` 等）、`wm_close_sent`、`forced_by_recorder`（录制端发 WM_CLOSE 8 s 没退出后自己结束的）、`seconds`；同样写进对应启动记录的 `exit`，`summary` 有 `game_exit_hex`/`game_exit_abnormal`。以前只在 `game/<tag>.exit.json` 里 |
-| `console` | 会话期间 `cmd_history.txt` 的新增行（D8；有新增则本会话所有局 `console_used=true`） |
+| `console` | 会话期间 `cmd_history.txt` 的新增行（D8；有新增则本会话所有局 `console_used=true`）、`allow_console`；`--allow-console` 会话里命令另有带帧号的 `ev cmd`（第 8.7 节），`cmd_history.txt` 只作对照。`runs[]` 另有 `console_cmds`（本局控制台命令条数，0.4.0）；`runs[].validation` 有 `console_cmds`、`api_lines` |
 | `summary` | 与 summary.txt 相同的统计 |
 
 ## 4. run 文件（`isaac-run-v1`）
@@ -85,6 +86,8 @@ JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文�
 | `replay_of` | 回放局：被回放的录制文件路径 |
 | `fields` | 各种数组行的列名（见下），以及 `fixed_x100`（定点字段）、`entity_extra_types`（附加字段类别对应的实体类型） |
 | `prestart_spawns` | 本局 `MC_POST_GAME_STARTED` 之前（上一局结束之后）发生的生成 `[type, variant, subtype, seed, gf]`，最多 4096 条 |
+| `api` | （0.4.0）第三方 mod 调用的截获：`version`、`installed`（装上的方法/属性/全局函数，如 `Game.StartRoomTransition`、`Level.EnterDoor=`、`Isaac.ExecuteCommand`）、`failed`、`metatables_match`（开局时核对：按类表取到的实例元表与真实实例的元表相同） |
+| `console` | （0.4.0）`hook`（DLL 控制台钩子是否可用）、`reason` |
 
 ### 4.2 level（开局与每次 `MC_POST_NEW_LEVEL`）
 
@@ -143,11 +146,12 @@ JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文�
 | 行 | 字段 |
 |---|---|
 | `items` | 道具清单：开局必写；道具数或主动槽 0 变化时、以及每个关键帧重扫，清单与上次不同才写。`p`（玩家编号）、`count`（`GetCollectibleCount`）、`items`：`[[道具 id, 数量], ...]`（对全部道具 id 调 `GetCollectibleNum(id, true)`） |
-| `ev` | 事件：`ev` 名称 + 参数 `a`：`damage` [玩家, 伤害×100, DamageFlags, 来源 type, 来源 variant, 无敌帧]；`use_item` [道具 id]（`MC_PRE_USE_ITEM`）；`use_card` [卡 id]；`use_pill` [药效 id]；`cmd` [命令, 参数]（`MC_EXECUTE_CMD`，只对游戏不认识的自定义命令触发，内建命令见 D8）；`pause` / `unpause` [Isaac.GetFrameCount, Isaac.GetTime, 本逻辑帧窗口内第几次渲染]（第三个数 2026-11-07 起才有，= 翻转之后第一个中间 tick 的序号；`MC_POST_RENDER` 里 `IsPaused()` 翻转；暂停菜单、控制台、**以及每次换房过场约 18 个渲染帧**都会出现；Tab 地图不暂停，不记）；`game_end` [是否 game over]；`exit` [shouldSave] |
-| `hcmd` | harness 执行的控制台命令：`tag`（script = 脚本命令，回放时同帧重放；exec = 测试驱动的其它命令）、`cmd` |
+| `ev` | 事件：`ev` 名称 + 参数 `a`：`damage` [玩家, 伤害×100, DamageFlags, 来源 type, 来源 variant, 无敌帧]；`use_item` [道具 id]（`MC_PRE_USE_ITEM`）；`use_card` [卡 id]；`use_pill` [药效 id]；`cmd` [命令, 参数]（`MC_EXECUTE_CMD`，只对游戏不认识的自定义命令触发，内建命令见 D8；0.4.0 起 `--allow-console` 会话里玩家在调试控制台提交的每条命令也写成 `cmd`，另带 `src:"console"`、`line`（原文）、`r`（暂停开始的那次渲染序号；控制台打开 = 暂停）、`paused`、`k_console`，第 8.7 节）；`pause` / `unpause` [Isaac.GetFrameCount, Isaac.GetTime, 本逻辑帧窗口内第几次渲染]（第三个数 2026-11-07 起才有，= 翻转之后第一个中间 tick 的序号；`MC_POST_RENDER` 里 `IsPaused()` 翻转；暂停菜单、控制台、**以及每次换房过场约 18 个渲染帧**都会出现；Tab 地图不暂停，不记）；`game_end` [是否 game over]；`exit` [shouldSave] |
+| `hcmd` | harness 执行的控制台命令：`tag`（script = 脚本命令，回放时同帧重放；exec = 测试驱动的其它命令；console = 回放局里 replay.lua 执行的录制控制台命令，0.4.0）、`cmd` |
+| `api` | （0.4.0）别的 mod 调用被监视的方法（第 8.6 节）：`n`（所属帧窗口：第 n 帧的更新或它之前的渲染）、`gf`、`ph`（帧内位置：`r` = 上次更新之后第 `r` 次渲染、`af:1` = 在本 mod 的渲染回调之后；`u` = 第 n 帧逻辑更新期间（本 mod 的 `MC_POST_UPDATE` 之前，`rc:1` = 本次更新里已换房）；`p` = 本 mod 的 `MC_POST_UPDATE` 之后同一次迭代；`q` = 第 `r` 次渲染之后的输入轮询；`gs` = 开局前，写在 header 后、`n=1`）、`id`（本局调用序号）、`m`（`类.方法`，属性写入为 `类.属性` + `set:1`）、`self`（EntityPlayer 方法的 `{"p":玩家编号}`）、`a`（参数：整数原样，浮点 `{"f":x}`（`%.17g`），字符串，布尔，null，玩家 `{"p":k}`，EntityRef `{"ref":{"p":k}}`/`{"ref":null}`，Vector `{"v":[x,y]}`，其它实体 `{"e":[type,variant,index]}`，无法表示的 `{"u":"类型名"}`）、`src`（调用栈上第一个 `mods/<目录>/` 的目录名；找不到为 `"?"`，另有 `srcfile`）、`in`（嵌套：在另一个被记录调用执行期间发生时，父调用的 `id`）。回放局里 replay.lua 执行的调用也写 api 行，另带 `rp:1`、`where`（实际执行点），没有 `a`；行写在所属帧的 `f` 行之前 |
 | `mark` | harness 的时间标记：`label`、`t`、`ifc` |
 | `perf` | 每 150 帧一次：`dt_ms`、`renders`（这 150 帧内的渲染次数）、`cost`（每帧 Lua 耗时直方图，毫秒，`os.clock` 1 ms 分辨率：`hist_ms[i]` = 耗时 i ms 的帧数，最后一格是 ≥31 ms） |
-| `end` | 局结束：`reason`（`death` = `MC_POST_GAME_END(true)`；`exit_save` / `exit` = `MC_PRE_GAME_EXIT(shouldSave)`；`restart` = 没有退出回调就开了新局；`frames` / `stop` = harness）、`frames`、`renders`、`errors`、`cost`（整局耗时直方图）、`missing_player_fields`（本构建上读不到的玩家字段）、`mt_unstable_reads`（DLL 进程内 MT 两份拷贝不一致的累计次数；无 DLL 为 null）、`fmt_repairs`/`fmt_examples`（本局写出前修掉的数字格式损坏次数与前 5 个片段，片段里的 0x 写成 "0 x"，见 4.9）、`replay`（回放局的钉种子计数） |
+| `end` | 局结束：`reason`（`death` = `MC_POST_GAME_END(true)`；`exit_save` / `exit` = `MC_PRE_GAME_EXIT(shouldSave)`；`restart` = 没有退出回调就开了新局；`frames` / `stop` = harness）、`frames`、`renders`、`errors`、`cost`（整局耗时直方图）、`missing_player_fields`（本构建上读不到的玩家字段）、`mt_unstable_reads`（DLL 进程内 MT 两份拷贝不一致的累计次数；无 DLL 为 null）、`fmt_repairs`/`fmt_examples`（本局写出前修掉的数字格式损坏次数与前 5 个片段，片段里的 0x 写成 "0 x"，见 4.9）、`api`（0.4.0：本局各方法的 api 行数）、`console_cmds`（0.4.0：本局控制台命令条数）、`replay`（回放局的钉种子计数；0.4.0 起另有 `api`：executed/late/failed/skipped/nested/first_error，`console`：executed/late） |
 
 ### 4.9 数字格式损坏的修复
 
@@ -279,23 +283,50 @@ python rl/bridge/python/replay_run.py RUN.jsonl.zst --capture OUT.mp4 --copy exp
 机器人在 game-rec-03 上的实测（`experiments/run-recorder/phase9-robust/NOTES.md`，31 次回放全部 `exact`）：
 - **长时间 Esc 暂停**（暂停 5–150 s、7,794/8,986 个渲染，期间在暂停菜单上下翻、进选项把 SFX 加一格再减回，一局暂停两次）：录制是同一帧里 `pause`→`unpause`，开菜单 tick 有 `TRIGGERED MENUBACK`，`menu_pauses` 全部认出；回放按 8.2 注入。暂停段在回放里：原速 34 个渲染 / 约 565 ms，`--turbo gate` 44–74 个渲染 / 15–24 ms（Python 10 ms 轮询 `pausectl.txt` 后发 Esc，加速下这段时延折成更多渲染，相对对齐吸收），每次暂停只发 1 次 Esc、没有重发。选项菜单在离开时写 `options.ini`（会话结束照常还原强制键）。
 - **小退**（Esc → EXIT GAME → 主菜单 → Enter）：暂停菜单默认光标在 RESUME GAME，下一项 EXIT GAME；回到菜单后第一下 Enter 就续局。录制里是同一进程的两局：第一局 `end.reason = exit_save`，最后是本局帧号 +1 上的 `ev pause`（没有 `unpause`）紧接 `ev exit [true]`（关窗口退出只有 `exit [true]`、没有前面那个 `pause`，以此区分）；第二局 `continued = true`，header `gf` = 第一局最后的 gf，帧计数接着走。引擎在退出时写 `gamestate1.dat`，续局时**不**重写，所以 Python 给第二局拍的 `save/run-…` 里的 `gamestate1.dat` 与退出时的存档逐字节相同，用它 `--continue-save` 回放 exact。续上后**当前房间重置**：敌人按房间初始布局满血重生（例：小退时 3 只残血、续上 9 只满血），玩家放在一个门口位置（续局出生位置，0.3.1 起由 salt 决定、回放再钉回），心、钱、炸弹、道具保留；已清的房间（宝箱房）续上仍是已清。
-- **大退**（`TerminateProcess`，不给游戏保存机会）：录制会话的 Python（真人入口 CLI）在约 2.4 s 内发现进程退出并照常归档：被杀的局没有 `end` 行（`truncated`），丢掉最后一次 flush 之后的帧（实测 34、49 帧），可能留下半行（见第 4 节），`session.json` 的 `game_exit` 记 `0x00000001 abnormal`。被截断的局用它自己的开局快照回放到最后一帧 exact。引擎只在**开局、换层、退出**时写 `gamestate1.dat`（进房间、进 Boss 房都不写；死亡时删除），所以大退后 Continue **回到本层开始时的状态**（第 1 层 = 开局：同种子同布局、gf 从 1 重新数、道具台/敌人全部还原，玩家在开局房的一个门口），被杀前这一层的进度全部丢失。新会话的 `save/pre` 就是这份存档 = 续局基线，`--continue-save <新会话>/save/pre` 回放 exact。
+- **Boss 房里小退**（phase10-scenarios，用皇帝卡进本层 Boss 房；`goto s.boss` 不带变体号在 J746 上不生效，log 里 `variant 0 not found`）：Boss 活着时小退再续，Boss 房按初始布局重置（Boss 满血回原位、房间仍未清、玩家在门口）；Boss 打死后小退再续，仍算已清、Boss 不重生、道具台和活板门都在。两种情况续局快照里的 `gamestate1.dat` 都与退出时逐字节相同，两局分别用 `--init-save`/`--continue-save` 回放 exact。用 `goto s.boss.1013` 进的调试房（房号 −3）里小退后 Continue 必崩（`0xC0000005`，与 DLL/早期 reseed 无关，9/9），录制会话会把它当成启动失败反复重试（见第 9 节）。
+- **harness 命令**（`hcmd script`）：`goto` 等于下一帧的一次普通换房（带约 212 个渲染的暂停，没有多余 reseed）；`stage` 在执行当下同步换层（room/level 行写在 hcmd 行之前，没有暂停、没有 reseed、不写存档）。42 次回放里录制和回放的命令列表逐条相同。
+- **大退**（`TerminateProcess`，不给游戏保存机会）：录制会话的 Python（真人入口 CLI）在约 2.4 s 内发现进程退出并照常归档：被杀的局没有 `end` 行（`truncated`），丢掉最后一次 flush 之后的帧（实测 34、49 帧），可能留下半行（见第 4 节），`session.json` 的 `game_exit` 记 `0x00000001 abnormal`。被截断的局用它自己的开局快照回放到最后一帧 exact。引擎只在**开局、真正过层（活板门/梯子）、退出**时写 `gamestate1.dat`（进房间、进 Boss 房、打死 Boss 都不写；控制台 `stage N` 换层也**不写**；死亡时删除），所以大退后 Continue **回到本层开始时的状态**（第 1 层 = 开局：同种子同布局、gf 从 1 重新数、道具台/敌人全部还原，玩家在开局房的一个门口；走活板门到第 2 层后被杀 = 回到 Basement II 开局房，gf 等于进层时的值，心和道具回到进层时的，第 2 层里拿到的东西丢失；`stage 2` 后被杀 = 回到第 1 层开局），被杀前这一层的进度全部丢失（phase10-scenarios）。新会话的 `save/pre` 就是这份存档 = 续局基线，`--continue-save <新会话>/save/pre` 回放 exact。
+
+### 8.6 第三方 mod 操作（recorder 0.4.0，phase10-mods-console）
+
+问题：第三方 mod 可以在玩家操作之外改游戏状态。例：GoodTrip（小地图传送，`mods/goodtrip_1630477831/scripts/gtrep.lua`）在 `MC_POST_RENDER` 里读地图键（ButtonAction 12，不在回放注入的 12 个动作里）、鼠标与射击键，满足条件时调用 `Game():StartRoomTransition(目标, -1, 1, player, -1)`（隐藏房路径先 `Game():ChangeRoom(入口房, -1)`、诅咒房路径 `player:TakeDamage(1, …)`），并改 `level.EnterDoor/LeaveDoor = -1`、`Level:RemoveCurses/AddCurse`（迷宫诅咒），按住地图键用方向键挪光标时每次渲染 `player:SetShootingCooldown(2)`，Tab+R 时 `Isaac.ExecuteCommand("restart")`。回放进程里没有这些输入，mod 不会再做一遍，回放从第一次调用起分歧（实测：不代为调用时第 927 帧起分歧——挪光标期间按着射击键，录制里被射击冷却压住没发泪弹）。
+
+做法 = 录"效果"不录 mod 的输入：
+- **截获**（`api.lua`）：照游戏自己 `resources/scripts_rep/main.lua` 的 BeginClass/EndClass，替换 Game/Level/EntityPlayer/SFXManager 实例元表的 `__index`（被监视的键返回包装函数，其余转给原 `__index`）、Level 的 `__newindex`（`EnterDoor`/`LeaveDoor`）、`Isaac.ExecuteCommand`。J746 实测：别的 mod 的 `Game():ChangeRoom(...)`、`player:SetShootingCooldown(2)`、`level.EnterDoor = -1`、`Isaac.ExecuteCommand(...)` 都是每次调用时动态查找，全部走到包装（与 mod 加载先后无关）；**不能**把 Lua 函数 `rawset` 进 C 类元表（下一次查找时引擎 `oldIndex` 断言 "Bad Index!" 后崩溃）。监视表：Game `ChangeRoom StartRoomTransition`；Level `ChangeRoom RemoveCurses AddCurse SetStage` 与属性 `EnterDoor LeaveDoor`；EntityPlayer `SetShootingCooldown TakeDamage AddControlsCooldown UseActiveItem UseCard UsePill AnimateTeleport`；SFXManager `Play`；`Isaac.ExecuteCommand`。本 mod 自己的调用（harness 命令经 `API.exec_raw`、回放执行）不记录。
+- **帧内位置**：调用时比较 Game 帧计数与本 mod 最后一次自己回调的标记（`Isaac.GetFrameCount()` 在每次迭代的输入轮询/逻辑更新之后、渲染之前 +1，实测），得到 4.7 节 api 行的 `ph`/`r`/`af`。J746 的 mod 加载顺序不是按目录名（实测是 goodtrip → 本 mod → 后建的目录，像是按目录建立先后），位置判定不依赖回调先后。
+- **回放**（`replay_run.py --disable-mods auto`，默认）：录制里有 api 行的 mod（`src`）在回放期间给副本 `mods/<目录>/` 放 `disable.it`，结束后（无论成败）挪进回放会话目录 `disabled-mods/<目录>/disable.it`（不删，mod 恢复启用）；`session.json.replay` 记 `api_mods`、`mods_disabled`、`mods_restored`。回放表 `api` 段只含这些 mod 的调用，replay.lua 在同一位置原样调用：`r` 在本 mod 的 `MC_POST_RENDER` 里（`af=0` 的在本 mod 自己的渲染计数之前执行，调用期间引擎若查询输入，tick 序号与录制相同；渲染序号按菜单/引擎暂停的同一映射），`u` 在 `MC_POST_UPDATE` 开头（`rc=1` 的在换房的 `MC_POST_NEW_ROOM` 里），`p` 在上一帧 `MC_POST_UPDATE` 末尾，嵌套的子调用在父调用执行期间的 `MC_POST_NEW_ROOM` 里；没赶上的在本帧 `MC_POST_UPDATE` 开头补（`late`）。结束本局的命令（`restart`/`seed`…）不回放（录制以它结束，回放由帧上限在同一帧数截止）。`compare` 另报 `api`（录制条数、按方法计数、回放执行条数、执行位置与录制不同的、回放局里未禁用的 mod 自己发起的 `live` 条数；诊断，不进 `exact`）。`--disable-mods none` 不禁用也不代为调用；观战/导出（8.3/8.4）同样处理。
+- 实测（`experiments/run-recorder/phase10-mods-console/NOTES.md`）：GoodTrip 键盘模式传送（跨 2–4 格、从隐藏房传出 = `ChangeRoom` + `StartRoomTransition`）、按住地图键挪光标的射击冷却、Tab+R 重开，`--turbo gate` 与原速回放全部 `exact`。
+
+为什么不选"注入地图键/鼠标让 GoodTrip 自己复现"：GoodTrip 的状态（`tele_cd` 每次渲染减 1、鼠标按下沿、拖动过的辅助地图位置、钉住状态、回收站关掉的 `keyboardmap`、`gtconfig.lua`）跨局留在进程里，回放进程是新进程；它在 `MC_POST_RENDER` 里推进，依赖每帧渲染次数（暂停长度不同时不同）；地图键要注入全局查询（现在只为菜单暂停注入 MENUBACK）。录效果只依赖调用本身，与 mod 的内部状态、配置、版本无关。
+
+### 8.7 控制台命令（recorder 0.4.0，`--allow-console`）
+
+- **录制**：`rl/record_run.ps1 -AllowConsole`（`run_recording --allow-console`）不再强制 `EnableDebugConsole=0`（用户自己的设置生效），给游戏进程设 `RR_MT_CONSOLE=1`。`rr_mt.dll` 于是挂引擎的 `Console::SubmitInput`（RVA 0x258AB0：玩家在控制台敲回车时调用，把输入行推进历史并调命令执行函数 RVA 0x25E160；Lua 的 `Isaac.ExecuteCommand` 走 RVA 0x4015C0 直接调 0x25E160，不经过这里，所以 harness 命令与第三方 mod 的命令不会混进来），把输入行排队；mod 每次渲染用 `RRMT_ConsoleTake()` 取走，写 `ev cmd`（4.7 节，`src:"console"`、`line`、`r`、`paused`）。身份门 + 3 处代码签名（函数头、读输入行的指令、调命令执行函数的 call）不符时只记 DLL 日志 `console: OFF …`，`header.console.hook=false`，其它照常。`cmd_history.txt` 仍按 D8 记进 `session.json`（只在退出时写、无帧号），作对照。
+- **回放**：回放表 `console` 段；replay.lua 在同一帧窗口经 `Isaac.ExecuteCommand` 执行（回放局写 `hcmd tag=console` 行）。控制台打开 = 游戏暂停（没有 MENUBACK）。暂停在同一帧里解除的：`replay_run.menu_pauses` 把它当菜单暂停注入（`console=True`；同一 tick 注入 MENUBACK 打开暂停菜单，暂停中第 `r` 次渲染执行命令，Python 发 Esc 关菜单，解除暂停后 tick 相对对齐，8.2 节），复现"从这一次轮询起暂停"的 tick 结构；暂停跨过本帧更新的（关控制台与第 n 帧更新在同一次迭代，unpause 记在第 n+1 帧；实测用 Esc 关控制台时会出现）：不注入暂停，命令在第 `min(r, 2)` 次渲染之后执行。
+- 实测：同帧解除的控制台暂停（在 i1 或 i2 打开）回放 `exact`（`giveitem`、`spawn`、`goto s.treasure`，加速与原速）；跨更新、在第 3 次渲染打开（i2）的 `spawn 10` exact；跨更新、在第 2 次渲染打开（i1）的两例从该帧起玩家浮点位在 0.01 以下不同，MT 不分歧（第 9 节）。
+- `repeat`/`macro` 这类依赖控制台历史的命令：回放经 `Isaac.ExecuteCommand` 执行时没有同一份历史，未测、不保证。
 
 ## 9. 已知局限
 
 - MT reseed 的时机（第一个 `POST_PLAYER_INIT` 先于开局房实体）只在单人以撒、普通难度、第 1 层开局上验证过（MT_PROBE §5.1、phase3 验收）；其他角色（Jacob&Esau、Lazarus、Tainted）、挑战、贪婪、困难模式：未测。续局早期 reseed 只在单人以撒、Basement II 续局存档上验证过（phase7-continue）。
 - 续局真人录制 human2b 的加速回放（钉回出生位置后）从第 6911 帧起分歧：开局房起始位置、前 6910 帧的三层 digest、MT、全部玩家/实体行与外观行都一致，第 6911 帧一只 TINY_BUG 特效（1000.21）贴底墙时速度不同，第 6939 帧起 MT 随之分歧。5 次回放（加速 ×4，含注入 extra 输入；原速 ×1）结果完全相同，未查明录制进程里的哪个隐藏状态不同（phase7-continue/REPORT §3）。
   phase8-mouse（`experiments/run-recorder/phase8-mouse/FINDINGS.md`）逐一实测排除了鼠标（真实/PostMessage/DLL 还原录制的 ms 流，回放的 ms 与录制逐字相同仍在 6911 分歧）、窗口尺寸、焦点与 PauseOnFocusLost、Lua/引擎共用堆的布局、MXCSR/x87 控制字；并发现**引擎对 1000.x 环境特效（TINY_BUG、WISP、POOP_PARTICLE 等）本身偶发不确定**：同一条件的重复回放里，偶尔有一次在随机帧出现特效速度/位置不同（human2b 回放第 3400 帧 WISP、第 3686 帧 POOP_PARTICLE），另有只持续一帧、0.01 定点下看不出的 full 层 digest 毛刺（第 390、672、696、2220 帧等）。human2b 第 6911 帧与 human2 第 10599 帧的分歧是录制进程里发生的同类偶发事件，回放进程绝大多数时候不发生，所以看起来"稳定"。这类事件不由任何录制下来的输入决定，回放无法复现；它多数只影响外观特效（full 层），偶尔经特效的后续行为改变全局 MT 消耗而影响玩法（human2b 第 6939 帧）。
-- 内建控制台命令（`giveitem`、`spawn`、`debug`…）抓不到（`MC_EXECUTE_CMD` 不触发），录制会话强制 `EnableDebugConsole=0`，会话结束把 `cmd_history.txt` 新增行写进 session（D8）。
+- 内建控制台命令（`giveitem`、`spawn`、`debug`…）`MC_EXECUTE_CMD` 不触发：默认录制会话仍强制 `EnableDebugConsole=0`，会话结束把 `cmd_history.txt` 新增行写进 session（D8）；`--allow-console` 会话由 DLL 钩子逐条带帧号记录并回放（8.7 节）。已知不精确：控制台暂停跨过本帧更新且在第 2 次渲染（i1 轮询）打开时，回放（不暂停）比录制多一次更新前的 60 Hz 子步，玩家浮点位从该帧起在 0.01 以下不同（phase10 实测 2 例，MT 不分歧、几十帧后可能收敛也可能不收敛）；菜单暂停的复现办法（关菜单后固定还有 2 次轮询）对它不适用。`repeat`/`macro` 未测。
+- 第三方 mod（8.6 节）：只截获监视表里的方法；mod 若在加载时把方法存成局部变量（`local f = Game().ChangeRoom`）就绕过了包装；监视表外的改动（`Isaac.Spawn`、改实体属性、自己的 RNG 等）不记录，这类 mod 回放时必须照常加载（`--disable-mods` 不要列它）。被禁用的 mod 在回放里不画东西（只影响画面）。来源判定靠调用栈上的 `mods/<目录>/` 路径，找不到时 `src="?"`、不回放（`replayability` 报出）。GoodTrip 的鼠标点击小地图路径没有实测（键盘模式与鼠标模式调用的是同一个 `teleport_to_grid_index`，截获的是它的效果）。
 - 解锁/收集无法从 Lua 读（`Isaac.GetPersistentGameData` 不存在），只能靠存档快照。
 - 手柄模拟量、多人、Jacob&Esau 只做了格式支持，未实测。
 - 网格新增/墙变门最多晚 15 帧记录；道具数与主动槽都不变的道具替换（例如 D4 重随）最多晚 300 帧（下一个关键帧）出现在 `items` 行。
+- 续局必崩的存档（例如在 `goto s.boss.1013` 调试房里小退留下的）：录制会话把"读档后开局前进程退出"当成启动失败，`launch_and_enter` 最多重试 6×6 次、每次留一个 minidump，最后 0 局结束，不会告诉玩家"这份存档续不了"。真人遇到时需要手动删除/换存档（phase10-scenarios）。
+- 强杀/崩溃丢失的不只是"最后 10 秒"：flush 只在进房、暂停、每 300 帧，一场在同一房间里打了 300 帧以内的 Boss 战可能整场连同 Boss 死亡都不在文件里（phase10-scenarios s2-k4：录下 420 帧，强杀在约 503 帧）。要缩小就改 `main.lua` 的 flush 周期（代价是 IO）。
+- 录制结束在换房/换层过场里时，最后一帧之后那条 room/level 行回放不会产生，`compare` 也不看它（新层布局没被校验，无害）。
+- `debug` 等进程级开关不在存档里：开着不关就小退，续局回放预计分歧（未实测；实验里每次小退前都关掉了）。
 
 ## 10. 最小 DLL、salt 与 `-NoDll`（第三阶段，E1–E8）
 
 **组成**（源码与构建脚本 `rl/bridge/engine/j746_rec/`，来自 `experiments/run-recorder/mt-probe/src/` 的最小版，去掉了 OpenAL 与 trace）：
 - `rr_mt.dll`：① 挂 `userenv!GetUserProfileDirectoryA`，返回环境变量 `RR_MT_PROFILE`（= `<副本>\profile`），存档因此落在副本内；② 导出 Lua C 函数 `RRMT_Seed(seed)`（调用引擎自己的 `GlobalMT_Seed`，RVA 0x2BA260）、`RRMT_State()`（只读 MT 的 [cursor, FNV-1a32(624 字 + cursor)]，不推进；状态拷两份一致才返回，第三个返回值是读的次数，不一致时把不同的字记进 DLL 日志 `unstable MT read`）、`RRMT_Info()`、`RRMT_UnstableReads()`（进程内两份不一致的次数，写进 `end.mt_unstable_reads`）；③ 建 `IsaacTurbo.<pid>` 控制块供注入器判断。身份门：PE 时间戳 0x624393F6、SizeOfImage 8540160、两处 MT 指令的立即数；**身份门只管 MT 导出**：不通过时存档重定向照常安装、游戏照常运行，`RRMT_Seed/RRMT_State` 不返回值（E7）。没有任何其它钩子。测试开关 `RR_MT_TEST_IDENTITY_FAIL=1` 假装身份门不通过。
 - `rr_mt.dll` 的鼠标导出（phase8-mouse，只给回放用）：环境变量 `RR_MT_MOUSE=1` 且 J746 身份门与 4 处代码签名（RVA 0x4014C6/0x4014F4 Lua `GetMousePosition` 读 GLFW 窗口 +0x48、0x499D6E/0x499DD1 `Manager::Update` 的光标闲置计数）通过时，`RRMT_SetMouse(x, y, buttons, mode)` 写 `[base+0x7A15D8]`（GLFW 主窗口）的 +0x48/+0x50（double 虚拟光标）与 +0x5C（按键 char[8]）；mode 1 同时改 Manager（`[base+0x7C768C]`）+0x1EA970/974 的"上次光标位置"使这次改动不触发闲置计数，mode 2 再把 +0x1EA978 的计数清 0；第一次调用时子类化窗口（+0x218 的 HWND）丢掉 `WM_MOUSEFIRST..WM_MOUSELAST`、`WM_MOUSELEAVE`。`RRMT_GetMouse()` 返回 x、y、按键、闲置计数、上次位置、丢掉的消息数、设置次数。录制会话不设 `RR_MT_MOUSE`，这两个函数不返回值，进程里没有子类化。环境变量 `RR_MT_AFFINITY=<掩码>`（十进制或 0x）时 DLL 初始化即把整个进程限制到这些 CPU（回放与带 DLL 的录制会话都默认设 0x1）。诊断导出 `RRMT_Fpu(mxcsr, x87cw)`（-1 = 不改；返回并记日志当前 MXCSR 与 x87 控制字），只在 phase8 的实验脚本里用。
+- `rr_mt.dll` 的控制台钩子（phase10，只在 `--allow-console` 录制会话）：环境变量 `RR_MT_CONSOLE=1` 且身份门与 3 处代码签名（RVA 0x258AB0 函数头 16 字节、0x258AEE `mov esi,ecx; mov edx,[esi+30h]; lea edi,[esi+1Ch]`、0x258BB5 `call 0x25E160`）通过时，MinHook 挂 `Console::SubmitInput`（thiscall + 1 个哑栈参数、`ret 4`，按 `__fastcall(this, edx, int)` 挂），把输入行（this+0x1C 的 MSVC std::string）排队；导出 `RRMT_ConsoleTake()`（line, 序号, 剩余数；空队列不返回值）、`RRMT_ConsoleInfo()`（on, submits, dropped）。DLL 日志 `console: hook installed …` / `console: submit #k "…"`；控制块状态文字带 `; CONSOLE`。
 - `rr_launch.exe --launch <dll> <exe> --luadebug`：以挂起方式建进程、注入、等控制块 Active 后才恢复主线程（存档钩子在游戏第一次查询用户目录前就绪），打印 `PASS launched pid=<pid>`；窗口不隐藏。
 - 构建：`python rl/bridge/engine/j746_rec/build.py`（zig 0.16 x86，MinHook 从 `third_party/minhook` 源码编译），产物在 `<副本>/rec/`（`rr_mt.dll`、`rr_launch.exe`、`build.json`），不进 git（`rl/.gitignore` 排除 `*.dll *.exe *.pdb *.lib`）。
 

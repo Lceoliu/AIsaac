@@ -280,6 +280,7 @@ class Run:
         self.level_lines = []
         self.items_lines = []     # (行号, n, p)
         self.event_lines = {}     # n -> [行号]
+        self.api_lines = []       # api 行的行号（recorder 0.4.0；旧文件为空）
         self.change_frames = []   # 有 g/dr 的帧号（升序）
         self.end = None
         self.other = []
@@ -307,8 +308,11 @@ class Run:
                 self.level_lines.append((i, n))
             elif k == 'items':
                 self.items_lines.append((i, n, json.loads(ln)['p']))
-            elif k in ('ev', 'hcmd', 'mark'):
+            elif k in ('ev', 'hcmd', 'mark', 'api'):
+                # api：第三方 mod 的效果调用（recorder 0.4.0，README §4.7）；与 ev 一样按 n 归帧
                 self.event_lines.setdefault(n, []).append(i)
+                if k == 'api':
+                    self.api_lines.append(i)
             elif k == 'end':
                 self.end = json.loads(ln)
             else:
@@ -512,7 +516,7 @@ class Run:
             elif k == 'items':
                 d = json.loads(ln)
                 items[d['p']] = {it[0]: it[1] for it in d['items']}
-            elif k in ('ev', 'hcmd', 'mark'):
+            elif k in ('ev', 'hcmd', 'mark', 'api'):
                 d = json.loads(ln)
                 events.setdefault(d['n'], []).append(d)
             elif k == 'f':

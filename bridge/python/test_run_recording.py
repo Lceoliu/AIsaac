@@ -416,3 +416,157 @@ def test_process_exit_summary():
     ok = rr.process_exit_summary({'pid': 6, 'exit_code': 0, 'exit_hex': '0x00000000', 'wm_close': True, 'forced': False, 'seconds': 3})
     assert ok['abnormal'] is False and ok['wm_close_sent'] is True
     assert '0x00000001' in rr.truncated_note(killed) and '退出码' not in rr.truncated_note(ok) and rr.truncated_note(None)
+
+
+# ---------------------------------------------------------------- phase10-mods-console（第三方 mod 调用、控制台命令）
+GT = 'goodtrip_1630477831'
+
+
+def _api_lines():
+    """_mt_lines 加 api 行（GoodTrip 一次传送 + 一次射击冷却 + 结束本局的 restart）、另一个 mod 的调用、来源不明的调用。"""
+    lines = _mt_lines()
+    api = [
+        {'k': 'api', 'n': 2, 'gf': 1, 'ph': 'r', 'r': 2, 'id': 1, 'm': 'EntityPlayer.SetShootingCooldown', 'self': {'p': 0},
+         'a': [2], 'src': GT},
+        {'k': 'api', 'n': 2, 'gf': 1, 'ph': 'r', 'r': 2, 'id': 2, 'm': 'Level.EnterDoor', 'set': 1, 'a': [-1], 'src': GT},
+        {'k': 'api', 'n': 2, 'gf': 1, 'ph': 'r', 'r': 2, 'id': 3, 'm': 'Game.ChangeRoom', 'a': [84, -1], 'src': GT},
+        {'k': 'api', 'n': 2, 'gf': 1, 'ph': 'u', 'rc': 1, 'id': 4, 'm': 'Level.AddCurse', 'a': [2, False], 'src': GT, 'in': 3},
+        {'k': 'api', 'n': 2, 'gf': 1, 'ph': 'r', 'r': 2, 'id': 5, 'm': 'Game.StartRoomTransition',
+         'a': [86, -1, 1, {'p': 0}, -1], 'src': GT},
+        {'k': 'api', 'n': 3, 'gf': 2, 'ph': 'r', 'r': 1, 'af': 1, 'id': 6, 'm': 'EntityPlayer.TakeDamage', 'self': {'p': 0},
+         'a': [{'f': 1.5}, 268435456, {'ref': {'p': 0}}, 0], 'src': GT},
+        {'k': 'api', 'n': 3, 'gf': 2, 'ph': 'p', 'r': 0, 'id': 7, 'm': 'Isaac.ExecuteCommand', 'a': ['restart'], 'src': GT},
+        {'k': 'api', 'n': 3, 'gf': 2, 'ph': 'r', 'r': 1, 'id': 8, 'm': 'Game.ChangeRoom', 'a': [70, -1], 'src': 'other_mod'},
+        {'k': 'api', 'n': 3, 'gf': 2, 'ph': 'r', 'r': 1, 'id': 9, 'm': 'Isaac.ExecuteCommand', 'a': ['giveitem c1'], 'src': '?',
+         'srcfile': '=(console)'},
+    ]
+    # api 行写在所属帧的 f 行之前（lines[3] = 第 2 帧，lines[4] = 第 3 帧）
+    out = lines[:3] + [json.dumps(a, separators=(',', ':')) for a in api[:5]] + [lines[3]] + \
+        [json.dumps(a, separators=(',', ':')) for a in api[5:]] + lines[4:]
+    return out
+
+
+def test_api_lines_indexed_and_roundtrip(tmp_path):
+    """recorder 0.4.0 的 api 行：load_run 按 n 归进帧事件、另记 Run.api_lines；帧重建与 round-trip 不受影响；会话校验计数。"""
+    p = tmp_path / 'run-api.jsonl'
+    p.write_text('\n'.join(_api_lines()) + '\n', encoding='utf-8')
+    run = load_run.Run(p)
+    assert run.frames == 3 and len(run.api_lines) == 9
+    fs = run.frame(2)
+    assert [e['id'] for e in fs.events if e['k'] == 'api'] == [1, 2, 3, 4, 5]
+    assert [e['id'] for f in run.iter_frames() for e in (f.events or []) if e.get('k') == 'api'] == list(range(1, 10))
+    assert replay_run.api_mods(run) == [GT, 'other_mod']
+    st = rr.validate_lines(rr.iter_lines_raw(p))
+    assert st['api_lines'] == 9 and st['kinds']['api'] == 9 and not st['errors']
+    assert load_run.roundtrip(p, sample_every=1, verbose=False)
+
+
+def test_api_replay_table(tmp_path):
+    """回放表 api 段：只含被禁用的 mod 的调用；参数按类型编码（整数/浮点/玩家/EntityRef/布尔/字符串）；嵌套调用带 parent；
+    结束本局的命令（restart）标 skip；来源不明的调用进 issues。"""
+    p = tmp_path / 'run-api.jsonl'
+    p.write_text('\n'.join(_api_lines()) + '\n', encoding='utf-8')
+    run = load_run.Run(p)
+    out = tmp_path / 'irr_replay.lua'
+    t = replay_run.build_replay_table(run, out, api=[GT])
+    text = out.read_text(encoding='utf-8')
+    assert t['api_calls'] == 7 and t['api_other_mods_calls'] == 2 and t['api_mods'] == [GT]
+    assert [x['id'] for x in t['api_skipped']] == [7]
+    assert '{id=1,ph="r",m="EntityPlayer.SetShootingCooldown",src="goodtrip_1630477831",r=2,self=0,a={{"i",2}}}' in text
+    assert '{id=2,ph="r",m="Level.EnterDoor",src="goodtrip_1630477831",r=2,set=1,a={{"i",-1}}}' in text
+    assert 'id=4,ph="u",m="Level.AddCurse",src="goodtrip_1630477831",rc=1,parent=3,a={{"i",2},{"b",false}}}' in text
+    assert 'a={{"i",86},{"i",-1},{"i",1},{"p",0},{"i",-1}}' in text
+    assert 'a={{"f",1.5},{"i",268435456},{"ref",0},{"i",0}}' in text and 'af=1' in text
+    assert 'skip="结束本局的命令（restart）' in text and 'other_mod' not in text
+    assert replay_run.build_replay_table(run, out)['api_calls'] == 0 and 'api = {' not in out.read_text(encoding='utf-8')
+    assert any('来源不明' in x for x in replay_run.replayability(run))
+    with pytest.raises(replay_run.Unreplayable):
+        replay_run.api_arg_lua({'u': 'GridEntity'})
+    assert replay_run.api_arg_lua({'v': [1.5, -2.0]}) == '{"v",1.5,-2.0}' and replay_run.api_arg_lua({'ref': None}) == '{"ref"}'
+    assert replay_run.api_arg_lua('restart') == '{"s","restart"}' and replay_run.api_arg_lua(None) == '{"n"}'
+
+
+def test_api_compare_report(tmp_path):
+    """compare 的 api 对照（诊断，不进 exact）：回放局里 rp 行按录制 id 对上，执行位置不同的列出。"""
+    lines = _api_lines()
+    rec = tmp_path / 'rec.jsonl'
+    rec.write_text('\n'.join(lines + ['{"k":"end","n":3,"reason":"exit","frames":3}']) + '\n', encoding='utf-8')
+    rep_lines = [ln for ln in lines if '"k":"api"' not in ln]
+    rp = [{'k': 'api', 'n': 2, 'gf': 1, 'ph': 'r', 'r': 2, 'id': 5, 'm': 'Game.StartRoomTransition', 'src': GT, 'rp': 1,
+           'where': 'render'},
+          {'k': 'api', 'n': 2, 'gf': 1, 'ph': 'q', 'r': 2, 'id': 3, 'm': 'Game.ChangeRoom', 'src': GT, 'rp': 1, 'where': 'render'}]
+    rep_lines = rep_lines[:3] + [json.dumps(x, separators=(',', ':')) for x in rp] + rep_lines[3:]
+    rep = tmp_path / 'rep.jsonl'
+    rep.write_text('\n'.join(rep_lines + ['{"k":"end","n":3,"reason":"frames","frames":3}']) + '\n', encoding='utf-8')
+    c = replay_run.compare(rec, rep)
+    assert c['exact'] and c['api']['record_calls'] == 9 and c['api']['replay_executed'] == 2
+    assert c['api']['position_changed_count'] == 1 and c['api']['position_changed'][0]['id'] == 3
+    assert 1 in c['api']['not_executed'] and c['api']['replay_live_calls'] == 0
+
+
+def test_disable_and_restore_mods(tmp_path):
+    """回放前给要禁用的 mod 放 disable.it（已禁用/不存在的跳过），回放后挪进回放会话目录（不删）。"""
+    copy = rr.GameCopy(tmp_path / 'copy')
+    for m in (GT, 'already_off'):
+        (copy.mods / m).mkdir(parents=True)
+    (copy.mods / 'already_off' / 'disable.it').write_bytes(b'')
+    placed = replay_run.disable_mods_in_copy(copy, [GT, 'already_off', 'missing_mod'])
+    assert placed == [GT] and (copy.mods / GT / 'disable.it').exists()
+    moved = replay_run.restore_disabled_mods(copy, placed, tmp_path / 'sess' / 'disabled-mods')
+    assert not (copy.mods / GT / 'disable.it').exists() and (copy.mods / 'already_off' / 'disable.it').exists()
+    assert moved == [dict(mod=GT, moved_to=str(tmp_path / 'sess' / 'disabled-mods' / GT / 'disable.it'))]
+    assert (tmp_path / 'sess' / 'disabled-mods' / GT / 'disable.it').exists()
+
+
+def _console_lines(spanning=False):
+    """_mt_lines 加一次控制台暂停：第 2 帧第 3 次渲染打开（ev pause 第三参数 3）、提交 giveitem c1、同帧解除（spanning=True 时
+    unpause 记在第 3 帧：关控制台与第 2 帧的更新在同一次迭代）。"""
+    lines = _mt_lines()
+    f2 = json.loads(lines[3])
+    f2['tk'] = ['i1-2', ['i2', [], [[1, 0, -1, 1]]], 'i3-40', 'u'] if not spanning else ['i1-40', 'u']
+    lines[3] = json.dumps(f2, separators=(',', ':'), ensure_ascii=False)
+    evs = [{'k': 'ev', 'n': 2, 'gf': 1, 'ev': 'pause', 'a': [100, 5000, 3]},
+           {'k': 'ev', 'n': 2, 'gf': 1, 'ev': 'cmd', 'a': ['giveitem', 'c1'], 'src': 'console', 'line': 'giveitem c1', 'r': 3,
+            'paused': True, 'k_console': 1}]
+    unp = {'k': 'ev', 'n': 2, 'gf': 1, 'ev': 'unpause', 'a': [138, 5600, 39]}
+    if spanning:
+        unp = {'k': 'ev', 'n': 3, 'gf': 2, 'ev': 'unpause', 'a': [138, 5600, 1]}
+        return lines[:3] + [json.dumps(e, separators=(',', ':')) for e in evs] + [lines[3]] + \
+            [json.dumps(unp, separators=(',', ':'))] + lines[4:]
+    return lines[:3] + [json.dumps(e, separators=(',', ':')) for e in evs + [unp]] + lines[3:]
+
+
+def test_console_commands_replay_table(tmp_path):
+    """控制台命令（ev cmd src=console）：同帧解除的控制台暂停按菜单暂停注入（console=True，open = 暂停开始渲染序号 - 1 的 tick），
+    命令在第 r 次渲染执行；暂停跨过本帧更新的不注入暂停，命令在第 min(r, 2) 次渲染执行。会话校验计数。"""
+    for spanning in (False, True):
+        p = tmp_path / f'run-con-{int(spanning)}.jsonl'
+        p.write_text('\n'.join(_console_lines(spanning)) + '\n', encoding='utf-8')
+        run = load_run.Run(p)
+        assert replay_run.console_commands(run) == [(2, 3, 'giveitem c1', True, not spanning)]
+        plans, _ = replay_run.menu_pauses(run)
+        out = tmp_path / f'irr_replay-{int(spanning)}.lua'
+        t = replay_run.build_replay_table(run, out)
+        text = out.read_text(encoding='utf-8')
+        if spanning:
+            assert plans == [] and '[2]={{r=2,line="giveitem c1"}},' in text
+        else:
+            assert len(plans) == 1 and plans[0]['console'] and plans[0]['open'] == 'i2' and plans[0]['open_action'] == 15
+            assert '[2]={{r=3,line="giveitem c1"}},' in text and 'open="i2",open_action=15' in text
+        assert t['console_cmds'][0]['pause_same_frame'] is (not spanning)
+        assert any('控制台命令' in x for x in replay_run.replayability(run))
+        st = rr.validate_lines(rr.iter_lines_raw(p))
+        assert st['console_cmds'] == 1 and st['events']['cmd'] == 1
+
+
+def test_session_allow_console(tmp_path):
+    """--allow-console：不强制 EnableDebugConsole=0，游戏进程环境多 RR_MT_CONSOLE=1（DLL 挂控制台提交函数）；默认会话不变；
+    不带 DLL 时拒绝。"""
+    s0 = rr.Session('plain', tmp_path, copy_root=tmp_path / 'copy')
+    assert s0.forced_options == {'EnableDebugConsole': '0'} and 'RR_MT_CONSOLE' not in s0.extra_env and not s0.allow_console
+    s1 = rr.Session('con', tmp_path, copy_root=tmp_path / 'copy', allow_console=True)
+    assert s1.forced_options == {} and s1.extra_env.get('RR_MT_CONSOLE') == '1' and s1.info['allow_console'] is True
+    s2 = rr.Session('con2', tmp_path, copy_root=tmp_path / 'copy', allow_console=True, forced_options={'PauseOnFocusLost': '0'})
+    assert s2.forced_options == {'PauseOnFocusLost': '0'}
+    with pytest.raises(ValueError):
+        rr.Session('con3', tmp_path, copy_root=tmp_path / 'copy', allow_console=True, use_dll=False)

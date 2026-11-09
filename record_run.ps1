@@ -4,6 +4,7 @@
 #   .\rl\record_run.ps1 -SessionName 20261106-evening
 #   .\rl\record_run.ps1 -SessionName first-try -InitSaveFrom D:\backup\my-galaxy-save
 #   .\rl\record_run.ps1 -SessionName old-way -NoDll          # 回退到第二阶段行为（不注入 DLL）
+#   .\rl\record_run.ps1 -SessionName with-console -AllowConsole   # 允许调试控制台（命令逐条记录，回放同帧执行；README §8.7）
 #
 # 流程（DESIGN_BRIEF §5 末条、§6 D5/D6/D11、§7 E1/E2）：
 #   1. 检查/复用隔离副本，安装最新 rl\bridge\mod\isaac_run_recorder；默认经挂起式注入器
@@ -15,7 +16,8 @@
 #      录制时发生过就无法精确回放；-Affinity 0 不限制）；
 #      -NoDll：不注入，存档在真实 %USERPROFILE%\Documents\My Games\Binding of Isaac Repentance (Galaxy)\，回放只能近似；
 #   2. 可选：-InitSaveFrom 把一份存档目录拷贝进本会话的存档目录（上面两者之一；只拷贝，不写回来源）；
-#   3. 会话前快照存档目录（排除 *.dmp、log.txt）；options.ini 强制 EnableDebugConsole=0（会话后还原），
+#   3. 会话前快照存档目录（排除 *.dmp、log.txt）；options.ini 强制 EnableDebugConsole=0（会话后还原；-AllowConsole 时不强制，
+#      DLL 挂引擎的控制台提交函数，每条命令带帧号记进 run 文件），
 #      MouseControl 保留你的设置（mod 另记鼠标流）；
 #   4. 启动游戏，启动失败（约 20–25%：崩溃、log 洪水、mod 未加载）自动重试并计数；
 #   5. 正常玩：mod 每局一个文件，开局时 Python 再快照一次存档；画面左上角录制期间常驻一个小 "REC"；
@@ -31,6 +33,7 @@ param(
     [double]$AutoSeconds = 0,  # >0：脚本自动按键进游戏、随机玩、按住 R 重开、关窗口（只用于测试）
     [switch]$NoDll,            # 不注入 rr_mt.dll（第二阶段行为）
     [ValidateSet('full', 'keyframe')][string]$Obs = 'full',  # 观测模式：full = 每帧完整（默认）；keyframe = 实体只在关键帧写
+    [switch]$AllowConsole,     # 允许调试控制台：不强制 EnableDebugConsole=0，控制台命令逐条记录（需要 DLL）
     [string]$Affinity = 'auto'  # 游戏进程 CPU 亲和：auto = 逻辑 CPU 0 一个核（默认，录下的局才可能精确回放）；0 = 不限制；0x… = 掩码
 )
 $ErrorActionPreference = 'Stop'
@@ -53,5 +56,6 @@ if ($AutoSeconds -gt 0) { $Arguments += @('--auto-seconds', "$AutoSeconds") }
 if ($NoDll) { $Arguments += @('--no-dll') }
 if ($Obs -ne 'full') { $Arguments += @('--obs', $Obs) }
 if ($Affinity -ne 'auto') { $Arguments += @('--affinity', $Affinity) }
+if ($AllowConsole) { $Arguments += @('--allow-console') }
 & python @Arguments
 exit $LASTEXITCODE

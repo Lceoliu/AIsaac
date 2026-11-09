@@ -92,6 +92,14 @@
     const a = ev.a || [];
     if (ev.k === 'hcmd') return `控制台(${ev.tag}) ${ev.cmd}`;
     if (ev.k === 'mark') return `标记 ${ev.label}`;
+    if (ev.k === 'api') {
+      // 第三方 mod 的效果调用（recorder 0.4.0）：参数里 {"p":k} = 玩家 k，{"f":x} = 浮点，{"ref":...} = EntityRef
+      const fmt = (v) => (v && typeof v === 'object') ? (v.p !== undefined ? `玩家${v.p}` : v.f !== undefined ? String(v.f)
+        : v.ref !== undefined ? `ref(${v.ref && v.ref.p !== undefined ? '玩家' + v.ref.p : JSON.stringify(v.ref)})` : JSON.stringify(v)) : JSON.stringify(v);
+      const m = String(ev.m || '');
+      const args = (ev.a || []).map(fmt).join(', ');
+      return `mod(${ev.src || '?'}) ${ev.set ? m + ' = ' + args : m + '(' + args + ')'}${ev.rp ? '（回放执行）' : ''}`;
+    }
     switch (ev.ev) {
       case 'damage': {
         const src = a[3] ? (entName(a[3], a[4], 0) || `${a[3]}.${a[4]}`) : '无来源/环境';
@@ -108,7 +116,8 @@
       default: return `${ev.ev} ${JSON.stringify(a)}`;
     }
   }
-  const EV_COLORS = { damage: '#ff4d4d', use_item: '#4fc3f7', use_card: '#c77dff', use_pill: '#7bd88f', game_end: '#ffffff', exit: '#ffffff', cmd: '#ffb74d', hcmd: '#ffb74d', mark: '#ffb74d' };
+  const API_QUIET = new Set(['EntityPlayer.SetShootingCooldown', 'EntityPlayer.AddControlsCooldown', 'SFXManager.Play']);
+  const EV_COLORS = { api: '#26c6da', damage: '#ff4d4d', use_item: '#4fc3f7', use_card: '#c77dff', use_pill: '#7bd88f', game_end: '#ffffff', exit: '#ffffff', cmd: '#ffb74d', hcmd: '#ffb74d', mark: '#ffb74d' };
 
   // ------------------------------------------------------------------ 房间几何
   // 门槽 -> 网格坐标（由 human1/机器人录制里门槽与门格的对应关系核对过，见 REPORT.md）
@@ -551,6 +560,7 @@
     markers = [];
     for (const ev of D.events) {
       if (ev.ev === 'pause' || ev.ev === 'unpause') continue;
+      if (ev.k === 'api' && API_QUIET.has(ev.m)) continue;   // 每次渲染都调用的那几种（按住地图键时的射击冷却、音效）不上时间轴
       markers.push({ i: ev.n - 1, kind: ev.ev || ev.k, label: eventText(ev), color: EV_COLORS[ev.ev || ev.k] || '#bbb' });
     }
     markers.sort((a, b) => a.i - b.i);

@@ -11,6 +11,11 @@
 //   4.（phase8-mouse）环境变量 RR_MT_AFFINITY=<掩码> 时启动即把进程限制到这些 CPU（回放的确定性，见 initThread）。
 //   3.（phase8-mouse，只给回放用）环境变量 RR_MT_MOUSE=1 时导出 RRMT_SetMouse/RRMT_GetMouse：直接写 GLFW 的虚拟光标位置与
 //      鼠标按键（引擎的鼠标只来自这里），并子类化窗口过程丢掉真实鼠标消息。录制会话不设这个变量，行为不变。见文件后部。
+//   5.（phase10-mods-console，只在录制会话 --allow-console 时）环境变量 RR_MT_CONSOLE=1 时挂引擎的"控制台提交输入"函数
+//      Console::SubmitInput（RVA 0x258AB0，thiscall + 1 个哑栈参数，ret 4；玩家在调试控制台敲回车时调用，内部把输入行
+//      推进历史并调用命令执行函数 RVA 0x25E160；Lua 的 Isaac.ExecuteCommand 走 RVA 0x4015C0 直接调 0x25E160，不经过这里），
+//      把输入行（this+0x1C 的 std::string）排队，mod 用 RRMT_ConsoleTake() 取走写成 ev cmd（src = console）。身份门 +
+//      3 处代码签名不符时只记日志、不装（不影响其它功能）。
 // 默认没有 turbo / 虚拟时钟 / 跳渲染 / GPU gate / 文件重试 / OpenAL 等任何其他钩子。
 // 唯一例外（phase4-turbo，只给回放验证用）：环境变量 RR_MT_TURBO=1 时另外安装 rr_turbo.cpp 的虚拟时钟
 // （glfwGetTime + Manager::Update 两个钩子），RR_MT_TURBO_GPU_GATE=1 时再加 GPU 提交门控；录制会话不设这两个变量，
@@ -34,6 +39,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <string>
 
 #include "MinHook.h"
 #include "rr_turbo.hpp"
@@ -199,6 +206,78 @@ void openLog(DWORD pid) {
   if (gBlock) std::snprintf(gBlock->log_path, sizeof(gBlock->log_path), "%s", path);
 }
 
+// ---- phase10-mods-console：控制台命令（RR_MT_CONSOLE=1 才安装）
+// 静态分析（experiments/run-recorder/phase10-mods-console/NOTES.md §2）：控制台对象的输入行是 this+0x1C 的 MSVC std::string
+// （SSO 缓冲/指针在 +0x1C，长度 +0x2C，容量 +0x30）。Console::SubmitInput（RVA 0x258AB0）在输入非空白时把它推进历史、清空
+// 输入行并以 thiscall 调命令执行函数（RVA 0x25E160，调用点 RVA 0x258BB5）。两个调用点（RVA 0x25CFF8、0x25D280）都先
+// push ecx 作哑参数，函数以 ret 4 返回，所以钩子按 __fastcall(this, edx, int) 声明（被调方清 4 字节，与 ret 4 一致）。
+constexpr std::uint32_t kRvaConsoleSubmit = 0x258AB0;
+constexpr std::uint32_t kRvaConsoleRunCmd = 0x25E160;
+constexpr std::uint32_t kConsoleInput = 0x1C;
+using ConsoleSubmitFn = void(__fastcall*)(void*, void*, int);
+ConsoleSubmitFn gOrigConsoleSubmit = nullptr;
+CRITICAL_SECTION gConsoleLock;
+std::deque<std::string> gConsoleQueue;
+volatile LONG gConsoleOn = 0;
+volatile LONG gConsoleSubmits = 0;
+volatile LONG gConsoleDropped = 0;
+
+bool consoleCodeIs(std::uint32_t rva, const std::uint8_t* want, std::size_t n) {
+  return std::memcmp(gBase + rva, want, n) == 0;
+}
+
+std::string consoleReadInput(const std::uint8_t* self) {
+  const std::uint8_t* s = self + kConsoleInput;
+  const std::uint32_t size = *reinterpret_cast<const std::uint32_t*>(s + 0x10);
+  const std::uint32_t cap = *reinterpret_cast<const std::uint32_t*>(s + 0x14);
+  const char* data = cap > 15 ? *reinterpret_cast<const char* const*>(s) : reinterpret_cast<const char*>(s);
+  if (!data || size > 4096) return std::string();
+  return std::string(data, size);
+}
+
+void __fastcall hookConsoleSubmit(void* self, void* edx, int arg) {
+  std::string line;
+  bool blank = true;
+  if (self) line = consoleReadInput(static_cast<const std::uint8_t*>(self));
+  for (char c : line) if (c != ' ') { blank = false; break; }
+  if (!blank) {
+    const LONG k = InterlockedIncrement(&gConsoleSubmits);
+    EnterCriticalSection(&gConsoleLock);
+    if (gConsoleQueue.size() < 256) gConsoleQueue.push_back(line);
+    else InterlockedIncrement(&gConsoleDropped);
+    LeaveCriticalSection(&gConsoleLock);
+    logf("console: submit #%ld \"%s\"", k, line.c_str());
+  }
+  gOrigConsoleSubmit(self, edx, arg);
+}
+
+bool consoleInstall(char* why, std::size_t whyLen) {
+  if (gTimeStamp != 0x624393F6 || gImageSize != 8540160) {
+    std::snprintf(why, whyLen, "EXE is not J746");
+    return false;
+  }
+  // 函数头（栈对齐帧）、读输入行的 3 条指令、调用命令执行函数的 call
+  static const std::uint8_t head[16] = {0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4, 0xF8, 0x83, 0xC4, 0x04, 0x55, 0x8B, 0x6B, 0x04};
+  static const std::uint8_t input[8] = {0x8B, 0xF1, 0x8B, 0x56, 0x30, 0x8D, 0x7E, 0x1C};  // mov esi,ecx; mov edx,[esi+30]; lea edi,[esi+1C]
+  std::uint8_t call[5] = {0xE8};
+  const std::int32_t rel = static_cast<std::int32_t>(kRvaConsoleRunCmd) - static_cast<std::int32_t>(0x258BB5 + 5);
+  std::memcpy(call + 1, &rel, 4);
+  if (!consoleCodeIs(kRvaConsoleSubmit, head, sizeof(head)) || !consoleCodeIs(0x258AEE, input, sizeof(input)) ||
+      !consoleCodeIs(0x258BB5, call, sizeof(call))) {
+    std::snprintf(why, whyLen, "console code signature mismatch");
+    return false;
+  }
+  InitializeCriticalSection(&gConsoleLock);
+  void* target = gBase + kRvaConsoleSubmit;
+  MH_STATUS st = MH_CreateHook(target, reinterpret_cast<void*>(&hookConsoleSubmit), reinterpret_cast<void**>(&gOrigConsoleSubmit));
+  if (st != MH_OK) { std::snprintf(why, whyLen, "MH_CreateHook %d", static_cast<int>(st)); return false; }
+  st = MH_EnableHook(target);
+  if (st != MH_OK) { std::snprintf(why, whyLen, "MH_EnableHook %d", static_cast<int>(st)); return false; }
+  InterlockedExchange(&gConsoleOn, 1);
+  std::snprintf(why, whyLen, "Console::SubmitInput RVA 0x%X", kRvaConsoleSubmit);
+  return true;
+}
+
 DWORD WINAPI initThread(LPVOID) {
   const DWORD pid = GetCurrentProcessId();
   const bool shm = openControlBlock(pid);
@@ -263,6 +342,13 @@ DWORD WINAPI initThread(LPVOID) {
     }
     mask |= gBlock->hooks_mask;
   }
+  // phase10：控制台命令钩子（录制会话 --allow-console 才设 RR_MT_CONSOLE=1）；装不上只记日志
+  bool consoleOn = false;
+  if (envOn("RR_MT_CONSOLE")) {
+    char cwhy[128] = {};
+    consoleOn = consoleInstall(cwhy, sizeof(cwhy));
+    logf("console: %s (%s)", consoleOn ? "hook installed" : "OFF", cwhy);
+  }
   if (mtOk) {
     std::uint32_t cursor = 0;
     const std::uint32_t h = mtHash(&cursor);
@@ -274,9 +360,9 @@ DWORD WINAPI initThread(LPVOID) {
   }
   gBlock->hooks_mask = mask;
   char text[128];
-  std::snprintf(text, sizeof(text), "OK j746_rec profile-redirect; MT exports %s%s%s%s", mtOk ? "ready" : "OFF (identity)",
+  std::snprintf(text, sizeof(text), "OK j746_rec profile-redirect; MT exports %s%s%s%s%s", mtOk ? "ready" : "OFF (identity)",
                 turbo ? (gate ? "; TURBO virtual-clock + GPU gate" : "; TURBO virtual-clock") : "",
-                topt.watch ? "; WATCH" : "", topt.capture ? "; CAPTURE" : "");
+                topt.watch ? "; WATCH" : "", topt.capture ? "; CAPTURE" : "", consoleOn ? "; CONSOLE" : "");
   setStatus(kStatusActive, text);
   return 0;
 }
@@ -498,6 +584,32 @@ extern "C" __declspec(dllexport) int RRMT_GetMouse(void* L) {
   gLua.pushinteger(L, gMouseDropped);
   gLua.pushinteger(L, gMouseSets);
   return 8;
+}
+
+// ---- phase10：控制台命令
+// Lua: line, k, pending = RRMT_ConsoleTake()   取走最早一条玩家在控制台提交的输入行（k = 第几条，pending = 取走后还剩几条）；
+// 没有排队的（或钩子没装）不返回值
+extern "C" __declspec(dllexport) int RRMT_ConsoleTake(void* L) {
+  if (!loadLua() || !gConsoleOn) return 0;
+  EnterCriticalSection(&gConsoleLock);
+  if (gConsoleQueue.empty()) { LeaveCriticalSection(&gConsoleLock); return 0; }
+  const std::string line = gConsoleQueue.front();
+  gConsoleQueue.pop_front();
+  const long long left = static_cast<long long>(gConsoleQueue.size());
+  LeaveCriticalSection(&gConsoleLock);
+  gLua.pushlstring(L, line.data(), line.size());
+  gLua.pushinteger(L, gConsoleSubmits - left);
+  gLua.pushinteger(L, left);
+  return 3;
+}
+
+// Lua: on, submits, dropped = RRMT_ConsoleInfo()
+extern "C" __declspec(dllexport) int RRMT_ConsoleInfo(void* L) {
+  if (!loadLua()) return 0;
+  gLua.pushinteger(L, gConsoleOn ? 1 : 0);
+  gLua.pushinteger(L, gConsoleSubmits);
+  gLua.pushinteger(L, gConsoleDropped);
+  return 3;
 }
 
 // ---- phase8-mouse 诊断：主线程浮点环境。Lua: mxcsr, x87cw = RRMT_Fpu(set_mxcsr, set_x87cw)（参数 -1 = 不改）

@@ -12,8 +12,10 @@ return function(ctx, cfg_text)
 	H.cfg = cfg
 	local bot = nil
 
+	-- 0.4.0：经 ctx.exec（api.lua 的 exec_raw）执行，不被第三方 mod 调用的包装记成 api 行（hcmd 行已记）
+	local run_cmd = ctx.exec or Isaac.ExecuteCommand
 	local function exec(command, n, tag)
-		Isaac.ExecuteCommand(command)
+		run_cmd(command)
 		ctx.line('{"k":"hcmd","n":' .. (n or -1) .. ',"gf":' .. game:GetFrameCount() .. ',"tag":' .. ctx.jstr(tag or "exec")
 			.. ',"cmd":' .. ctx.jstr(command) .. '}')
 	end
@@ -25,7 +27,7 @@ return function(ctx, cfg_text)
 			if c.seed_num and not c.start then c.start = "seed " .. Seeds.Seed2String(c.seed_num) end
 			H.pending = {start = c.start, bot = c.bot, bot_seed = c.bot_seed, frames = c.frames, cmds = c.cmds or {},
 				replay = c.replay, script = c.script, pausewatch = c.pausewatch}
-			if c.start then Isaac.ExecuteCommand(c.start) end
+			if c.start then run_cmd(c.start) end
 		elseif c.cmd == "exec" then
 			exec(c.command, ctx.run() and ctx.run().n or -1, c.tag)
 		elseif c.cmd == "stop" then
