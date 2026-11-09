@@ -9869,4 +9869,29 @@ B55测得：打开FX graph cache与AOTAutogradCache后，缓存热时Spatial预�
 
 #### 实验结果
 
-未运行（GPU验证排在cpp-actor B54链之后）。
+4090，B54链因smoke失败停止后由一次性等待脚本自动启动（06:31:27），GPU_LOCK持有到06:51:59，共1232 s（≤30分钟），前后guard干净（guard里的“1 probe”是启动等待脚本那条bash命令行，不是探针进程）。
+
+- 短profile `prof-b56-fx`（开关打开，生产缓存目录，FX缓存首次写入）：
+  - 6个update后SIGINT。16个worker在退出时打印了KeyboardInterrupt traceback：这是我的停止方式造成的（pkill的匹配也命中了xvfb-run / timeout的命令行），不是run出错，6个update的数据完整。
+  - 预热：Spatial 504.8 s（51图），比关缓存的599–621 s少约105 s（进程内重复图命中）；Flex Reader 35.1 s。
+  - `block_compiles` 72（与关缓存相同），`block_steady_compiles`在6个update里全部为0：带游戏、Flex Reader和真实batch都没有稳态重编译。
+
+| 每update（s） | u1 | u2 | u3 | u4 | u5 | u6 |
+|---|---:|---:|---:|---:|---:|---:|
+| collect prof-b56-fx | 15.7 | 20.0 | 32.9 | 28.9 | 26.7 | 32.6 |
+| collect prof-b51-unb | 15.8 | 19.4 | 32.2 | 28.9 | 24.9 | – |
+| update prof-b56-fx | 15.7 | 15.3 | 19.5 | 20.0 | 19.9 | 19.5 |
+| update prof-b51-unb | 14.0 | 14.5 | 17.3 | 19.2 | 16.8 | – |
+| update prof-b52-py | 13.7 | 16.8 | 17.1 | 19.6 | 18.7 | 18.6 |
+| update prof-b48-pf | 13.8 | 14.6 | 17.7 | 18.4 | 18.7 | 18.0 |
+
+  - u2–u6中位：collect 28.88 s，update 19.53 s，×实时147.6。prof-b51-unb（只有u2–u5）为26.89 / 17.08 / 166.3，prof-b52-py为27.06 / 18.56 / 165.7。
+  - collect：逐update与prof-b51-unb几乎一样（collect按update交替在27和32 s左右，b51-unb没有u6这个高值，所以中位低）；没有退化。
+  - update：u3–u6为19.5–20.0 s，同窗的b51 / b52-py / b48-pf为16.8–19.6 s，高约1 s。这在跨run的范围之内（b48-pf后段u7–u16为17.8–21.7 s），但处在上沿。开缓存不会改变kernel（同一份Inductor产物），没有预期的机制，因此不能确定是退化还是run间差别。
+- P1b（`--why-miss`，热缓存）：没有结果。
+  - 480 s超时（rc 124），预热没跑完。原因是日志：我只在叶子logger上设了DEBUG并加了过滤handler，记录仍会传到torch自己在父logger上的handler，打印了全部DEBUG（82,356行，包括每个图的缓存key明细），拖慢了进程。已修：叶子logger `propagate=False`，过滤按未格式化的模板做（不触发明细格式化），本地已确认只剩guard求值行。
+  - 已跑到的部分也不能说明问题：探针在生产缓存上大多是AOT **key** 未命中（不是guard miss），说明探针构造的模型与train_tok的learner编译出的图不完全相同。所以P1b应当像B55那样，让探针先在自己的缓存目录里冷跑一次，再热跑`--why-miss`。
+- 结论：
+  - P1的安全性（稳态重编译为0）已在带游戏的profile中确认。
+  - 速度：collect不退化；update高约1 s，尚不能定性。
+  - 默认值未改。建议再做一次：缓存热的profile（同时验证生产中热预热的实际节省），再加上P1b按B55方式重跑，约25分钟。是否做、何时做，由协调方定。
