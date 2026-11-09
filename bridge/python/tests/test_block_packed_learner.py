@@ -200,7 +200,8 @@ def test_staging_reuses_pinned_buffers_on_cuda():
         s.host['x'][...] = 2.0
         assert float(s.upload()['x'].sum()) == 2000.0
     assert st.allocs-before <= 2
-    assert all(b is None or b.is_pinned() for b in st.buf)
+    assert all(b[0] is None or b[0].is_pinned() for b in st.bufs)
+    assert not any(b[2] for b in st.bufs)   # (B48: every buffer given back after its upload)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA (FlexAttention)')
