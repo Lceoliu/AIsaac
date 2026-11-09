@@ -9762,3 +9762,73 @@ B49的两个限定照样适用：
 - 每臂建议在末段用`DUMP_AT`留一份dump，供后期B49复测。
 
 代码与配置：见本节提交（`bridge/ops/b53/`）。
+
+### B55 Spatial冷编译610 s的分解：FX graph / AOTAutograd缓存能省多少（P0测量，2026-11-10）
+
+#### 实验目的
+
+每个训练进程启动时，Spatial编译预热都要599–621 s（51个图，25个run几乎不变），Flex Reader另需约29 s。每次profile、每臂启动都白等十分钟。
+
+静态诊断的结论（只读检查4090缓存目录与日志）：
+- Triton kernel缓存（`~/.cache/isaac-b42-inductor/triton`）已跨进程命中。
+- `block_compile.configure()`显式关闭了FX graph cache（B42，为避免缓存图带入预热batch的范围守卫）。依赖它的AOTAutogradCache也随之失效。
+- 因此每个进程都对51个图重做Dynamo、AOT autograd和Inductor。
+
+本实验测两件事：
+- 610 s在Dynamo、AOT、Inductor之间怎么分；
+- 打开FX和AOT缓存后，冷、热两种情况各要多久，稳态重编译是否仍为0。
+
+只测量，不改`block_compile`的默认值。
+
+#### 实验方法
+
+- 脚本：`bridge/ops/b55_compile_probe.py`。
+  - 按eval_tok的方式从checkpoint构造actor和learner模型（prof-b48-pf `last.pt`，B48–B53同一结构），然后依次跑生产预热：`warm_spatial`、`warm_reader`。
+  - 记录`torch._dynamo.utils.compilation_time_metrics`（各阶段的总秒数和调用次数）和`counters`（fxgraph / autograd cache的hit、miss）。
+  - `--fx-cache on`只在本进程打开`fx_graph_cache`和`enable_autograd_cache`。
+  - `--steady`：`mark_steady()`之后，用预热时没出现过的batch大小逐类调用已编译的图，`steady_compiles`必须为0。覆盖范围：
+    - canvas解码器，n = 5 / 16 / 40；
+    - actor的12个(entity, body)桶，参数活跃和冻结两种状态，n = 5 / 16 / 40；
+    - learner的8个逐行打包T桶，grad / no_grad / inference三种模式，n = 5 / 37 / ≤700。
+- 4090上依次跑两次（GPU_LOCK `a1 … B55 spatial compile_times`，总计965 s，前后guard干净）：
+  1. **缓存开、冷**：全新的`TORCHINDUCTOR_CACHE_DIR`，Triton缓存仍指向生产目录（`TRITON_CACHE_DIR=…/isaac-b42-inductor/triton/0`），相当于“生产配置 + 打开缓存”的第一次。
+  2. **缓存开、热**：同一目录，并做`--steady`。
+- 缓存关的基线不重跑。它与冷跑做的是同样的编译工作（冷跑只多写缓存），而25个生产run已给出599–621 s；在20分钟预算内也跑不下第三次。
+
+#### 实验结果
+
+| | 生产（缓存关） | 缓存开、冷 | 缓存开、热 |
+|---|---:|---:|---:|
+| Spatial预热（51图）s | 599–621 | 533.2 | 243.5 |
+| Flex Reader预热（21图）s | 29–30 | 116.8 | 26.9 |
+| fxgraph cache hit / miss | – | 20 / 39 | 51 / 24 |
+| AOT autograd cache hit / miss | – | 8 / 43 | 43 / 8（8次都是guard_miss） |
+| 稳态重编译（--steady） | – | – | 0 |
+
+Spatial预热的分解（s，dynamo_timed嵌套计时）：
+
+| 阶段 | 缓存开、冷 | 缓存开、热 |
+|---|---:|---:|
+| Dynamo trace与guard（compile_inner − call_user_compiler） | 76 | 76 |
+| AOT autograd本身（joint trace、functionalize、partition） | ≈ 210 | ≈ 50（只有8个未命中的图） |
+| Inductor（compile_fx_inner：lowering、scheduler、codegen） | 205 | 94（只有8个图的fw+bw） |
+| 其中Triton配置autotune基准 | 31.5 | 0.9 |
+| 缓存载入（43个命中的图） | – | ≈ 20 |
+| 图外eager执行（前向、反向、解码） | 33 | 2 |
+
+- **610 s的构成**：AOT约210 s，Inductor约205 s，Dynamo约76 s，eager约33 s。冷跑比生产少约80 s，是因为同一进程内有重复的图（例如actor活跃和冻结两种状态在AOT之后相同）：开缓存后进程内也能命中（fxgraph 20次、AOT 8次）；缓存关时每个都重编。
+- **热缓存把Spatial预热从约610 s降到243.5 s（−60%）**；Flex Reader回到26.9 s。合计约640 s → 270 s。
+- **剩下的243.5 s中，145 s来自8个learner grad模式图（每个T桶1个）**：它们的AOT缓存条目在载入时guard不成立（`autograd_cache_guard_miss` 8次），于是AOT和Inductor的fw+bw全部重做。其余43个图命中，只花Dynamo时间加约20 s载入。
+- **B42担心的范围守卫没有复现**：缓存命中的图在新batch大小下（actor 5 / 16 / 40，learner到700行，三种模式）稳态重编译为0。B42当时同时有pad_mm守卫，现在`shape_padding`已关。
+- **Flex Reader冷跑116.8 s**（生产约29 s）：全新Inductor目录里没有Flex模板的编译产物；热跑恢复到26.9 s。生产目录已有这些产物，所以首次打开缓存时Flex不会变慢。
+- **限定**：
+  - 稳态检查是合成输入，覆盖Spatial和解码器；Flex Reader的稳态没有合成检查。最终门仍是带游戏的短profile中`block_steady_compiles = 0`。
+  - 模型或编译相关代码一改，缓存就失效，回到约533 s（仍比关缓存少约80 s）。
+
+结论与建议（P1 / P2的代码改动待确认后再做）：
+- **P1（推荐）**：用开关（例如`ISAAC_FX_CACHE=1`）打开FX graph cache与AOTAutogradCache，用短profile确认`block_steady_compiles = 0`后再改为默认。预期每个进程启动省约370 s。
+- **P1b**：查清8个learner grad图的AOT guard miss（用`TORCH_LOGS=aot_autograd`看载入时失败的guard）。修好后热预热预计再省约120 s，降到约120–130 s。
+- **P2暂不做**：开缓存后，Dynamo的76 s是剩下的下限。去掉12个冻结变体最多省约20 s，duck shape收益不明，都不值得改动语义邻近的代码。
+- 并行预热或mega-cache只对冷缓存有用，暂不需要。
+
+代码：`bridge/ops/b55_compile_probe.py`（只测量）。产物：4090 `reports/b42-speed/b55/`（`on-cold.json` / `.log`、`on-warm.json` / `.log`）、`b55.log`；FX缓存目录`~/.cache/isaac-b55-fxprobe`（探针专用，生产不读）。
