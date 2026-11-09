@@ -681,6 +681,16 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
                             "unbiased": {"update_s": 17.1, "collect_s": 26.9, "grad_norm": 0.43, "grad_clip_frac": 0.0, "ppo_clip_frac": 0.020},
                             "max_grad_norm": 1.0}
   },
+  "compile_cache_b56": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B55, B56", "default_on_since": "ed6b2a0",
+    "switch": "ISAAC_FX_CACHE (default 1: Inductor fx_graph_cache + functorch enable_autograd_cache; 0: off as in B42-B55); cache dir TORCHINDUCTOR_CACHE_DIR, default ~/.cache/isaac-b42-inductor",
+    "cold_breakdown_b55_s": {"aot_autograd": 210, "inductor": 205, "dynamo": 76, "eager": 33},
+    "spatial_warmup_s": {"cache_off": "599-621", "on_cold_production": 504.8, "on_warm_production": 151.4, "flex_reader_warm": 26.2},
+    "steady_compiles": "0 (prof-b56-fx cold, prof-b56-fxw warm, 6 updates each; synthetic unseen batch sizes)",
+    "speed": "u2-u6 update 19.4-19.5 s vs 17.1-18.6 s cache off: workload (+12-16% learner Spatial calls), backward GPU per call unchanged",
+    "known_miss": "torch 2.7.1: the 8 learner grad graphs' backward FX entries fail their guards on reload (symint order differs); not fixed; train_tok prints cache counters after the warm-up",
+    "probe": "bridge/ops/b55_compile_probe.py (--fx-cache, --steady, --why-miss, --no-reader)"
+  },
   "ablation_b53": {
     "entry": "bridge/abplus/EXPERIMENTS.md B53", "status": "run-ready; arms not run (hours per arm: user decision)",
     "config": "bridge/ops/b53/arms.json (common = xnew2 profile args + --checkpoint-every 25, seed 1000; arms A detach / B random-2 unbiased / C gradreplay-2 / D random-4 unbiased; ports 39300/39400/39500/39600)",

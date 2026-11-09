@@ -9834,7 +9834,7 @@ Spatial预热的分解（s，dynamo_timed嵌套计时）：
 
 代码：`bridge/ops/b55_compile_probe.py`（只测量）。产物：4090 `reports/b42-speed/b55/`（`on-cold.json` / `.log`、`on-warm.json` / `.log`）、`b55.log`；FX缓存目录`~/.cache/isaac-b55-fxprobe`（探针专用，生产不读）。
 
-### B56 ISAAC_FX_CACHE开关：跨进程FX graph / AOTAutograd缓存（P1）与8个grad图guard miss诊断（P1b）（2026-11-10，GPU验证未运行）
+### B56 ISAAC_FX_CACHE开关：跨进程FX graph / AOTAutograd缓存（P1）与8个grad图guard miss诊断（P1b）（2026-11-10）
 
 #### 实验目的
 
@@ -9924,3 +9924,5 @@ B55测得：打开FX graph cache与AOTAutogradCache后，缓存热时Spatial预�
   - P1可以改为默认开：稳态重编译为0（两次带游戏的profile，冷、热各一次），热预热约178 s对约640 s，update的差别是工作量而不是缓存。
   - P1b不修。可选：在train_tok预热行后打印一次fxgraph / autograd cache的hit / miss计数（一行，只观测），以后可以直接看生产是否命中。
   - 默认值仍未改，等协调方确认。
+
+默认值自ed6b2a0起为开（`ISAAC_FX_CACHE`未设或为1时开，设0时关）。同一提交里，train_tok在预热之后打印一行`B56 compile cache after warm-up: {...}`（fxgraph与AOTAutograd缓存的hit / miss / guard_miss / bypass计数，只观测），以后可以直接看生产中那8个backward图是否命中。P1b不修，归因见上。
