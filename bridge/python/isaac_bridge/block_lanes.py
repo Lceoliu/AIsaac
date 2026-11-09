@@ -530,8 +530,10 @@ class BlockLaneService(LaneService):
             sub = np.ascontiguousarray(rows[positions])
             self.job_serial += 1
             job = self.job_serial
+            # (the points' context owners now: a cancellation may release a point while its job is in flight)
+            tokens = [self.points[self.lane_point[int(q)]][3] for q in lanes]
             self.drv_jobs[job] = (generation, positions, int(self.generations.versions[generation]), lanes, sub,
-                                  pend[positions].copy(), (ukeys[0][positions], ukeys[1][positions]), replays[positions])
+                                  pend[positions].copy(), (ukeys[0][positions], ukeys[1][positions]), replays[positions], tokens)
             jobs.append(job)
             owner = actor.step_graph.owner if actor.step_graph is not None else id(actor)   # (CPU actors: no graphs)
             self.driver.submit_lanes(job, int(owner), int(actor.version),
@@ -544,7 +546,7 @@ class BlockLaneService(LaneService):
         f['jobs'] = set(jobs)
         f['ready'] = not jobs
 
-    def _answer_rows(self, f, generation, positions, version, out, contexts, replay):
+    def _answer_rows(self, f, generation, positions, version, out, contexts, replay, tokens):
         """(B54) _eager's per-row answers of one generation's rows (outputs, version, context refs, lane steps)."""
         nh = self.nh
         f['a'][positions] = out[:, :nh].astype(np.int64)
@@ -552,11 +554,8 @@ class BlockLaneService(LaneService):
         f['version'][positions] = version
         for k, j in enumerate(positions):
             lane = int(f['idx'][j])
-            token = self.points[self.lane_point[lane]][3]
-            if not replay[k]:
-                ident = self.contexts.put(token, contexts[k])
-                f['block_refs'][j, 0], f['block_refs'][j, 1] = ident & 65535, ident >> 16
-                f['block_refs'][j, -1] = 1.0
+            if not replay[k]:   # (registered in _finish, right before lane_t: see there)
+                f.setdefault('puts', []).append((j, tokens[k], contexts[k]))
             self.lane_steps[lane] += 1
         self.stat['block_teacher_forward_calls'] = self.stat.get('block_teacher_forward_calls', 0)+1
         self.stat['block_mixed_replay_calls'] = self.stat.get('block_mixed_replay_calls', 0)+int(replay.any() and not replay.all())
@@ -565,7 +564,7 @@ class BlockLaneService(LaneService):
         """(B54) A kind 4 record: the lane rows' lineage (logs, contexts, as SlotBlockActor._pages), the answers."""
         from .block_paged import PagedSnapshot, EpisodeLog
         job = int(rec['job'])
-        generation, positions, version, lanes, rows, pend, keys, replay = self.drv_jobs.pop(job)
+        generation, positions, version, lanes, rows, pend, keys, replay, tokens = self.drv_jobs.pop(job)
         f = self.fly
         actor = self.actors[generation]
         out = rec['out'].numpy()
@@ -586,7 +585,7 @@ class BlockLaneService(LaneService):
         actor.last_contexts = contexts
         if int(rec['merged']):
             self.stat['merged_lane_rows'] = self.stat.get('merged_lane_rows', 0)+len(lanes)
-        self._answer_rows(f, generation, positions, version, out, contexts, replay)
+        self._answer_rows(f, generation, positions, version, out, contexts, replay, tokens)
         f['jobs'].discard(job)
         if not f['jobs']:
             f['ready'] = True
@@ -600,7 +599,7 @@ class BlockLaneService(LaneService):
 
     def _python_job(self, job):
         """(B54) A queued job stepped here on its lane actor (the driver paused), its rings re-set, answered."""
-        generation, positions, version, lanes, rows, pend, keys, replay = self.drv_jobs.pop(job)
+        generation, positions, version, lanes, rows, pend, keys, replay, tokens = self.drv_jobs.pop(job)
         f = self.fly
         actor = self.actors[generation]
         with torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=actor.bf16):
@@ -608,7 +607,7 @@ class BlockLaneService(LaneService):
         f['eager_calls'] += int(getattr(actor, 'last_path', 'eager') == 'eager')
         for lane in lanes.tolist():
             self._set_ring(actor, lane)
-        self._answer_rows(f, generation, positions, version, actor.host_output, actor.last_contexts, replay)
+        self._answer_rows(f, generation, positions, version, actor.host_output, actor.last_contexts, replay, tokens)
         f['jobs'].discard(job)
         if not f['jobs']:
             f['ready'] = True
@@ -621,6 +620,15 @@ class BlockLaneService(LaneService):
             nv_pop()
 
     def _finish(self):
+        if self.fly is not None and self.fly.get('puts'):
+            # B54: the driver path's contexts go into the registry here, just before their refs reach lane_t: between
+            # a kind 4 record and this answer the control's reclamation (retire, transient) runs and would drop an
+            # ident no lane_t / v2_t row names yet (the Python path registers and answers in one call)
+            f=self.fly
+            for j,token,ctx in f.pop('puts'):
+                ident=self.contexts.put(token,ctx)
+                f['block_refs'][j,0],f['block_refs'][j,1]=ident & 65535,ident >> 16
+                f['block_refs'][j,-1]=1.0
         if self.fly is not None:
             f=self.fly
             for j,lane in enumerate(f['idx']):

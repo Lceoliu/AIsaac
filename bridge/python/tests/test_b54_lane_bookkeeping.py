@@ -7,9 +7,10 @@ counter deltas), each found only after a 10-minute compile on the 4090. These ru
   histogram a list), two collects, the hand-off's pause excluded, the Python-path lane counters and their share,
   every DRV_FIELDS column written by csv.DictWriter;
 - BlockLaneService in driver mode with a fake driver (the lane actors stepped on CPU by the fake, records as the
-  driver's kind 4): tick (submit, no wait, answers from the records), serve_wait with the round in flight (dropped from
-  the driver, stepped on the Python path) and with new rounds (the Python path, the rings re-set before the next driver
-  job), the counters; every answer equal to the same requests served by a service without a driver.
+  driver's kind 4): tick (submit, no wait, answers from the records), the control's context reclamation between the
+  records and the answer (B54 smoke 3: an ident retired before lane_t named it), serve_wait with the round in flight
+  (dropped from the driver, stepped on the Python path) and with new rounds (the Python path, the rings re-set before
+  the next driver job), the counters; every answer equal to the same requests served by a service without a driver.
 """
 import csv
 import io
@@ -99,7 +100,7 @@ class FakeDriver:
         recs = []
         while self.queue:
             j = self.queue.pop(0)
-            gen, positions, version, lanes, rows, pend, keys, replay = self.service.drv_jobs[j['job']]
+            gen, positions, version, lanes, rows, pend, keys, replay = self.service.drv_jobs[j['job']][:8]
             actor = next(a for a in self.service.actors.values() if id(a) == j['owner'])
             bs = actor.model.block_memory.config.block_steps
             step_b = np.array([int(actor.state.step_host[actor.base+q]) for q in lanes])
@@ -159,6 +160,15 @@ def script(m, n_rounds=7):
     return out
 
 
+def reclaim(s, svc):
+    """BlockLaneService._service_control's context reclamation: idents no lane_t / v2_t row names are retired."""
+    live = set()
+    for records in (s.lane_t, s.v2_t):
+        pairs = np.array(records[..., :2], dtype=np.uint32, copy=True).reshape(-1, 2)
+        live.update((pairs[:, 0] | (pairs[:, 1] << 16)).tolist())
+    svc.contexts.retire(live, transient=True)
+
+
 def answers(s, lanes):
     return s.lane_io[lanes, 5:10].copy(), s.lane_out[lanes, :5].copy()
 
@@ -185,7 +195,12 @@ def test_lane_service_driver_mode_matches_python_path_with_fallbacks():
             assert svc.fly is not None and not svc.fly['ready'] and len(fake.queue) >= 1
             assert not svc.tick()                  # (never waits for the driver)
             assert fake.run() >= 1 and svc.fly['ready']
+            reclaim(s, svc)   # (the control's reclamation between the records and the answer, as in train_tok)
             assert svc.tick() is not None and svc.fly is None
+        for lane in lanes:   # every context a lane's answer names is still registered (the v2 ring reads it later)
+            if s.lane_t[lane, -1] == 1.0:
+                pair_ = np.array(s.lane_t[lane, :2], np.uint32)
+                assert int(pair_[0] | (pair_[1] << 16)) in svc.contexts.values, f'round {k} lane {lane}'
         a_ref, o_ref = answers(s_ref, lanes)
         a, o = answers(s, lanes)
         np.testing.assert_array_equal(a, a_ref, err_msg=f'round {k}')
@@ -195,3 +210,18 @@ def test_lane_service_driver_mode_matches_python_path_with_fallbacks():
     # the rows the Python path stepped got their rings back before the next driver job
     gen_actor = next(iter(svc.actors.values()))
     assert {gen_actor.base, gen_actor.base+1} <= set(fake.rings) and not svc.ring_dirty
+
+
+def test_lane_service_driver_mode_point_released_while_in_flight():
+    """A cancellation (the control releases the lane's point) between the submit and the job's record: the answer
+    still goes out (the context owner taken at the submit), nothing raises."""
+    m, main, s, svc, fake = setup(True)
+    rng = np.random.default_rng(63)
+    rows = synth_rows(rng, 1); rows['first'] = 0
+    s.request(0, rows[0], synth_pending(rng, 1, m.heads)[0], seq=77, tbegin=1)
+    assert svc.tick() and svc.fly is not None and not svc.fly['ready']
+    svc.release_point(0)
+    assert fake.run() == 1 and svc.fly['ready']
+    reclaim(s, svc)
+    svc.tick()
+    assert svc.fly is None and s.lane_out[0, 4] == 77
