@@ -4986,7 +4986,8 @@ def main(argv=None, child=None, actor=None):
                 print(f"B54 driver collect: paused {lane_stat['drv_pause_s']:.2f} s ({d_['pauses']} pauses), lane jobs "
                       f"{d_['lane_jobs']} ({d_['lane_rows']} rows: {d_['merged_rows']} merged in {d_['merged_calls']} main "
                       f"batches, {d_['lane_calls']} lane-only calls), run-time captures {d_['captures']}, "
-                      f"lane jobs stepped in Python {d_['lane_python']}", flush=True)
+                      f"lane jobs stepped in Python {d_['lane_python']}; graphs registered {cpp_driver.n_graphs()}; "
+                      f"pages {block_actor.store.native.n_pages_d()} decision / {block_actor.store.native.n_pages_b()} block", flush=True)
                 lane_stat['block_step_graph_replays']=sum(a.step_graph.replays for a in
                     [block_actor,*lanes.actors.values()] if getattr(a,'step_graph',None) is not None)
                 lane_stat.update({'driver_'+k_: v_ for k_, v_ in cpp_driver.counters().items()})
