@@ -814,6 +814,15 @@ def forward_chunks(model, chunks, generator=None, train_history=True, version=0,
         written = model.block_memory.writer(z.reshape(len(keys), cfg.block_steps, cfg.latents, cfg.latent_width))
         encoded_blocks = dict(zip(keys, written.unbind()))
     replacements = [{b.end_step: encoded_blocks[source_keys[id(b.source)]] for b in blocks} for blocks in selected]
+    # B51 (history_scale 'unbiased'): each chunk's replacements pass the gradient back x N_i / |selected_i|
+    from .block_memory import scaled_history, history_scale_factor
+    cfg_h = model.block_memory.config
+    for i, (state, blocks) in enumerate(zip(states, selected)):
+        if blocks and torch.is_grad_enabled():
+            n_e = sum(1 for b in state.blocks if b.end_step <= state.step-cfg_h.window)
+            s_i = history_scale_factor(n_e, len(blocks), cfg_h)
+            if s_i != 1.0:
+                replacements[i] = {k: scaled_history(v, s_i) for k, v in replacements[i].items()}
     # A block ending on the final query is still causally invisible. Loss-only
     # single-step teachers therefore need no tail re-encoding. Preserve the two
     # selected old blocks and use the detached tail for the invisible write.

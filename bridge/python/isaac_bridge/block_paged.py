@@ -1497,6 +1497,24 @@ HISTORY_MODES = ('random', 'detach', 'gradreplay')
 _LEAF_HOOK = [None]
 
 
+def history_scales(parts, selected, cfg):
+    """B51: per old bank entry (the chunks' parts['bid'] concatenated) the gradient scale of its value:
+    N_i / |selected_i| on chunk i's selected (re-encoded) blocks under history_scale 'unbiased', else 1.
+    None when nothing is scaled."""
+    from .block_memory import history_scale_factor
+    n = sum(len(p['bid']) for p in parts)
+    out, at, any_ = np.ones(n, np.float32), 0, False
+    for p, sel in zip(parts, selected):
+        if len(sel):
+            n_e = int(np.count_nonzero(p['ends'] <= p['step']-cfg.window))
+            s = history_scale_factor(n_e, len(sel), cfg)
+            if s != 1.0:
+                out[at+np.asarray(sel, np.int64)] = s
+                any_ = True
+        at += len(p['bid'])
+    return out if any_ else None
+
+
 def encode_blocks(model, store, bids, device, spatial_micro):
     """Current Spatial + Writer on the raw sources of complete blocks `bids` (host int64): their
     block values [len(bids), memory_tokens, latent_width], differentiable. Host decodes are
@@ -1676,6 +1694,7 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
                 at += nb
             pool = torch.cat((pool.detach(), leaf))
             replay = dict(pool=leaf, ubid=ubid, store=store, chunks=groups, spatial_micro=spatial_micro)
+        scale_h = None
         if hist_written is not None:
             pool = torch.cat((pool.to(hist_written.dtype), hist_written))
             at = 0
@@ -1683,7 +1702,11 @@ def forward_chunks_paged(model, chunks, generator=None, train_history=True, vers
                 for k in sel:
                     source[at+k] = len(ubid)+unique[int(p['bid'][k])]
                 at += len(p['bid'])
+            scale_h = history_scales(parts, selected, cfg) if torch.is_grad_enabled() else None
         old_vals = pool[torch.from_numpy(source).to(device)]
+        if scale_h is not None:   # (B51: unbiased history gradient, straight through)
+            from .block_memory import scaled_history
+            old_vals = scaled_history(old_vals, torch.from_numpy(scale_h).to(device, old_vals.dtype)[:, None, None])
     clock.mark('pages_prefix_bank')
     # Host-decoded frames are cached on each chunk: the same rollout chunk is read by
     # the start-of-update pass and every epoch (decode once, upload per use).
