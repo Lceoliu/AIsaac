@@ -1,6 +1,6 @@
 """B55: where the ~610 s compiled-Spatial warm-up goes, and whether the FX graph / AOTAutograd caches help.
 
-  python b55_compile_probe.py <checkpoint> <out.json> --fx-cache on|off [--steady]
+  python b55_compile_probe.py <checkpoint> <out.json> --fx-cache on|off [--steady] [--why-miss]
 
 Builds the actor and learner models of a block-memory checkpoint (as eval_tok / train_tok do), runs the production
 warm-up (block_compile.warm_spatial, then block_learner.warm_reader) and records:
@@ -29,6 +29,47 @@ def metrics():
     t = {k: dict(s=round(float(sum(v)), 2), n=len(v)) for k, v in compilation_time_metrics.items()}
     c = {k: dict(v) for k, v in counters.items() if v}
     return dict(time=dict(sorted(t.items(), key=lambda kv: -kv[1]['s'])), counters=c)
+
+
+def why_miss():
+    """B56 P1b: why an AOTAutograd cache hit fails on its inner FX graph (counters autograd_cache_guard_miss): per
+    FX load, forward / backward, the key, whether the key's directory exists and how many candidates it holds, the
+    input shapes; FXGraphCache's guard evaluation ('evaluating guards [...] with values ... => hit') and the caches'
+    hit / miss / load-error lines. Lines start with 'B56'."""
+    import logging
+    keep = ('evaluating guards', 'cache miss', 'cache hit', 'unable to load', 'Bypassing', 'Writing')
+
+    class Keep(logging.Filter):
+        def filter(self, r):
+            return any(k in r.getMessage() for k in keep)
+    h = logging.StreamHandler(sys.stdout)
+    h.setFormatter(logging.Formatter('B56 log %(name)s: %(message)s'))
+    h.addFilter(Keep())
+    for name in ('torch._inductor.codecache', 'torch._functorch._aot_autograd.autograd_cache'):
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.DEBUG)
+        lg.addHandler(h)
+    from torch._functorch._aot_autograd import autograd_cache as ac
+    inner = ac.FXGraphCacheLoadable.load
+
+    def load(self, example_inputs, fx_config):
+        key = self.fx_graph_cache_key
+        try:
+            from torch._inductor.runtime.cache_dir_utils import cache_dir
+            d = os.path.join(cache_dir(), 'fxgraph', key[1:3], key)
+            cands = len(os.listdir(d)) if os.path.isdir(d) else 0
+        except Exception as e:  # (diagnosis only)
+            d, cands = f'? {e}', -1
+        shapes = [tuple(x.shape) if hasattr(x, 'shape') else x for x in list(example_inputs)[:6]]
+        try:
+            out = inner(self, example_inputs, fx_config)
+            print(f'B56 fx load ok backward={self.is_backward()} key={key} candidates={cands}', flush=True)
+            return out
+        except Exception as e:
+            print(f'B56 fx load MISS backward={self.is_backward()} key={key} dir_exists={cands > 0} '
+                  f'candidates={cands} inputs={len(example_inputs)} first={shapes} err={type(e).__name__}', flush=True)
+            raise
+    ac.FXGraphCacheLoadable.load = load
 
 
 def steady(learner, model, bf16=True):
@@ -87,7 +128,10 @@ def main():
     ap.add_argument('out')
     ap.add_argument('--fx-cache', choices=('on', 'off'), required=True)
     ap.add_argument('--steady', action='store_true')
+    ap.add_argument('--why-miss', action='store_true', help='B56 P1b: log why AOT cache hits miss their FX graphs')
     a = ap.parse_args()
+    if a.why_miss:
+        why_miss()
     from isaac_bridge import block_compile, block_learner
     block_compile.configure()
     if a.fx_cache == 'on':

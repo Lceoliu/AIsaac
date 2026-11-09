@@ -2438,7 +2438,8 @@ def main(argv=None, child=None, actor=None):
         if SPATIAL_COMPILE:
             t_w=time.perf_counter()
             n_w=block_compile.warm_spatial(learner_model,(model,),bf16=amp or args.actor_bf16)
-            print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s',flush=True)
+            print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s'
+                  f' (B56 fx cache {"on" if block_compile.FX_CACHE else "off"})',flush=True)
             if args.block_slots:   # B44 packed learner: the Flex Reader kernels (ISAAC_PACKED_READER=flex)
                 from isaac_bridge import block_learner
                 if block_learner.PACKED:

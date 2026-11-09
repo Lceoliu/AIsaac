@@ -17,6 +17,8 @@ STATS = dict(compiles=0, steady_compiles=0, calls=0)
 _LOCK = threading.Lock()
 _STEADY = [False]
 _CONFIGURED = [False]
+# B56: Inductor FX graph cache + AOTAutograd cache across processes (ISAAC_FX_CACHE=1; default off)
+FX_CACHE = os.environ.get('ISAAC_FX_CACHE', '0') == '1'
 
 
 def configure():
@@ -36,10 +38,16 @@ def configure():
     if hasattr(torch._dynamo.config, 'accumulated_cache_size_limit'):
         torch._dynamo.config.accumulated_cache_size_limit = max(
             torch._dynamo.config.accumulated_cache_size_limit, 1024)
-    # FX graph cache off: a cached graph carries the size ranges of the compile that produced it
-    # (B42 steady check: guards like 2 <= batch <= 19 from a warm-up batch), so every real batch
-    # size recompiled; it also saved only ~9% of the cold warm-up (1118 vs 1225 s).
-    inductor_config.fx_graph_cache = False
+    # FX graph cache (and the AOTAutograd cache, which needs it): ISAAC_FX_CACHE=1 on, default off.
+    # B42 turned it off: a cached graph then carried the size ranges of the compile that produced it
+    # (guards like 2 <= batch <= 19 from a warm-up batch; pad_mm, off below, also bounded the batch).
+    # B55: with both caches on, a warm cache cut the Spatial warm-up ~610 -> 243.5 s, and cache-hit
+    # graphs on unseen batch sizes caused 0 steady compiles. B56: default stays off until a game
+    # profile confirms block_steady_compiles = 0 with the caches on.
+    inductor_config.fx_graph_cache = FX_CACHE
+    if FX_CACHE:
+        import torch._functorch.config as functorch_config
+        functorch_config.enable_autograd_cache = True
     # pad_mm decides per matmul size whether to pad, which bounds the symbolic batch (guards like
     # 193 <= batch, B42 steady check): every other size recompiled.
     inductor_config.shape_padding = False
