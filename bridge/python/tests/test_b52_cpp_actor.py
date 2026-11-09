@@ -208,9 +208,9 @@ def collect_records(d, n_steps, timeout=30.0):
 ACTOR = [None]
 
 
-def run_driver(actor, W, K, make_rows, delay=0.0, fixed_u=0.5, reader=None):
+def run_driver(actor, W, K, make_rows, delay=0.0, fixed_u=0.5, reader=None, seed=5):
     s = fake_sampler(W, len(actor.model.heads))
-    d = make_driver_for(actor, s)
+    d = make_driver_for(actor, s, seed)
     d.set_fixed_uniform(fixed_u)
     d.set_version(3)
     ACTOR[0] = actor
@@ -390,3 +390,53 @@ def test_driver_pressure_pages_complete_before_records():
     before = store.stats()['kv_rows']
     st = store.collect()
     assert st['kv'] <= before
+
+def test_driver_same_seed_reproducible_sampling():
+    """Condition 4(b): the sampled path (no fixed uniforms) is reproducible under the same seed on both sides. Two
+    drivers seeded alike (their own xoshiro RNG, seeded from Python) on the same frames: identical actions, outputs
+    and K/V pages; a different seed: different actions somewhere (they really are sampled). The Python step under
+    torch.manual_seed: identical outputs across two runs."""
+    torch.manual_seed(41)
+    m = make_policy('cuda').eval()
+    rng = np.random.default_rng(41)
+    K = 40
+    script = {}
+    for k in range(K):
+        script[k] = frame(rng, 1, k, np.array([1 + (k >= 23)]), np.array([int(k in (0, 23))]), seed=700+k)
+    nh = len(m.heads)
+
+    def run(seed):
+        a = SlotBlockActor(m, 1, graph_entities=128, bf16=True, lane_slots=0)
+        s, d, recs, workers = run_driver(a, 1, K, lambda w, k: script[k], fixed_u=-1.0, seed=seed)
+        outs = np.stack([r['out'].numpy()[0] for r in recs])
+        acts = np.stack(workers[0].got)
+        kv = a.store.kv(np.array([int(r['kvs'][0]) for r in recs])).cpu().clone()
+        return outs, acts, kv
+
+    o1, a1, k1 = run(77)
+    o2, a2, k2 = run(77)
+    o3, a3, _ = run(78)
+    np.testing.assert_array_equal(o1, o2)
+    np.testing.assert_array_equal(a1, a2)
+    torch.testing.assert_close(k1, k2, rtol=0, atol=0)
+    assert not np.array_equal(a1[:, :nh], a3[:, :nh]), 'a different seed sampled the same actions at every step'
+
+    def run_py(seed):
+        b = SlotBlockActor(m, 1, graph_entities=128, bf16=True, lane_slots=0)
+        b.version = 3
+        torch.manual_seed(seed)
+        pending = np.zeros((1, nh), np.int64)
+        outs = []
+        for k in range(K):
+            rows = script[k]
+            if rows['first'][0]:
+                pending[:] = 0
+            with torch.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+                b.step(rows, pending.copy(), [0])
+            outs.append(b.host_output.copy())
+            pending = b.host_output[:, :nh].astype(np.int64)
+        return np.stack(outs)
+
+    p1, p2 = run_py(77), run_py(77)
+    np.testing.assert_array_equal(p1, p2)
+
