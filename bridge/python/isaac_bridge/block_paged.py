@@ -466,7 +466,7 @@ class PagedStore:
         self.b_free = np.empty(0, np.int64)
         self.raw = {}                                   # decision id -> (first, schema, frame bytes, pending)
         self.decoded = {}                               # learner cache: (block id, packed) -> host frames
-        self.next_decision = 0
+        self._next_decision = 0                         # (native: the C++ store's counter, see next_decision)
         self.snaps = weakref.WeakSet()
         self.roots = []                                 # weak methods -> iterable of (log, step) still live
         self.lock = threading.Lock()
@@ -492,6 +492,19 @@ class PagedStore:
             self.b_meta, self.b_src = self.native.b_meta.numpy(), self.native.b_src.numpy()
             self.b_srcver, self.b_used = self.native.b_srcver.numpy(), self.native.b_used.numpy()
             self.raw = _NativeRaw(self.native)
+
+    @property
+    def next_decision(self):
+        n = getattr(self, 'native', None)
+        return int(n.next_decision) if n is not None else self._next_decision
+
+    @next_decision.setter
+    def next_decision(self, v):
+        n = getattr(self, 'native', None)
+        if n is not None:
+            n.next_decision = int(v)
+        else:
+            self._next_decision = int(v)
 
     def track(self, snap):
         self.snaps.add(snap)

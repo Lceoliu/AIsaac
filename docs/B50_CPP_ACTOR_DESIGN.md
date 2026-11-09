@@ -140,7 +140,7 @@ update 侧：learner 每 update 4.4–5.2 s 的 GIL 等待随 actor 离开 GIL �
 - **随机数（条件 4）**：driver 用自己的 xoshiro256**（种子 `args.seed + 1000003*aid + 0xB52`，splitmix64 展开），uniform 取高 24 位，
   分辨率与 torch.rand 相同；lane 行继续 CRN（阶段 2 进 C++）。等价测试两层：(a) `set_fixed_uniform(0.5)` 下 driver 与 Python
   `step(uniform=0.5)` 的动作 / logp / 价值 / vg / 页 / 块 / 元数据 / arena 行逐位相等（`test_driver_single_worker_matches_python_step_with_fixed_uniforms`）；
-  run_graph 中段在任意 uniform 下与 Python 中段逐位相等（`test_run_graph_middle_matches_python_middle`，fp32 与 bf16）；(b) 整条路径各自可复现由 A8 8/8 覆盖。
+  run_graph 中段在任意 uniform 下与 Python 中段逐位相等（`test_run_graph_middle_matches_python_middle`，fp32 与 bf16）；(b) 同种子可复现：`test_driver_same_seed_reproducible_sampling`（两个同种子 driver 的采样动作 / 输出 / K/V 页逐位相等，异种子的动作不同；Python 路径在 `torch.manual_seed` 下两次输出相等），整条训练路径的复现由 A8 8/8 覆盖。
 - **消费者的 GIL 账（条件 2，预估，待 nsys 回填）**：留在 Python 主线程的每主调用工作 ≈ book 0.8 + snapshot/谱系/record_main/CF 0.5 + store 0.9
   ≈ 2.2 ms，×2,130 ≈ 4.7 s/collect；阶段 1 的 lane 轮次（组装 3.8 s + lane 步的 Python 外壳 1.3 s）≈ 5 s/collect。合计约 10 s 的 Python
   对比原来 actor 线程约 18 s 的 Python 墙钟（持有 GIL 11.4 s）——learner 的 GIL 等待预计从 4.4–5.2 s/update 降到约 2.5–3 s，不会归零；
