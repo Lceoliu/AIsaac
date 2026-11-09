@@ -5,10 +5,12 @@ push / pop / span are no-ops. Names are dotted: actor.* (the main loop's phases)
 g.* (ActorStepGraph.__call__), pages.* (PagedStore writes from _pages), lane.* (the lane service), learner.*.
 
 ISAAC_NSYS_RANGE=a:b (hand-off counts of the actor loop): the capture window from the a-th collect's start to the
-b-th's. ISAAC_NSYS_TRIGGER=nvtx (default): an NVTX start/end range named B50window in the default domain, for
-`nsys profile --capture-range=nvtx --nvtx-capture=B50window` (no CUPTI: on the 4090 nsys 2023.4's libcupti 12.4
-segfaults in train_tok at cudaProfilerStart, prof-b50m / prof-b50m3); ISAAC_NSYS_TRIGGER=cupti: cudaProfilerStart /
-Stop for --capture-range=cudaProfilerApi. Without ISAAC_NSYS_RANGE nothing is called.
+b-th's. ISAAC_NSYS_TRIGGER=nvtx (default): an NVTX push/pop range named B50window in the default domain (on the actor
+thread, pushed at hand-off a and popped at hand-off b), for `nsys profile --capture-range=nvtx
+--nvtx-capture=B50window -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0` (the env var: nsys otherwise waits for a registered
+string; no CUPTI: on the 4090 nsys 2023.4's libcupti 12.4 segfaults in train_tok at cudaProfilerStart, prof-b50m /
+prof-b50m3); ISAAC_NSYS_TRIGGER=cupti: cudaProfilerStart / Stop for --capture-range=cudaProfilerApi. Without
+ISAAC_NSYS_RANGE nothing is called.
 With ISAAC_BLOCK_NVTX=1 the cyclic garbage collector's passes are ranges too ('gc.collect', gc.callbacks, on the
 thread that triggered the pass). (Measurement only: nothing here changes what the actor or learner compute.)
 """
@@ -69,14 +71,14 @@ def profiler_mark(handoffs, window):
         if TRIGGER == 'cupti':
             torch.cuda.cudart().cudaProfilerStart()
         else:
-            _WINDOW[0] = torch.cuda.nvtx.range_start('B50window')
+            torch.cuda.nvtx.range_push('B50window'); _WINDOW[0] = 1
         print(f'B50 nsys: capture window opens at hand-off {handoffs} ({TRIGGER})', flush=True)
         return 'start'
     if handoffs == window[1]:
         if TRIGGER == 'cupti':
             torch.cuda.cudart().cudaProfilerStop()
         elif _WINDOW[0]:
-            torch.cuda.nvtx.range_end(_WINDOW[0])
+            torch.cuda.nvtx.range_pop(); _WINDOW[0] = 0
         print(f'B50 nsys: capture window closes at hand-off {handoffs} ({TRIGGER})', flush=True)
         return 'stop'
     return None
