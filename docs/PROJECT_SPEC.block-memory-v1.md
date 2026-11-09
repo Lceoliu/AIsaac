@@ -499,7 +499,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     },
     "history_cost_over_A_s": {"B": 16.4, "C": 14.8, "D": 23.4},
     "memory_clear_eval": "eval_tok.py --memory-clear older:K|recent:K --memory-clear-fill zero|random; bridge/ops/b43_memclear_compare.py (not run)",
-    "training_runs": "none yet (budgets being decided)"
+    "training_runs": "none yet (budgets being decided); run-ready configuration, eval protocol and resource plan: ablation_b53"
   },
   "packed_learner": {
     "entry": "bridge/abplus/EXPERIMENTS.md B44",
@@ -680,6 +680,19 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "short_profile_u2_u5": {"none": {"update_s": 17.8, "collect_s": 26.9, "grad_norm": 0.34, "grad_clip_frac": 0.0, "ppo_clip_frac": 0.011},
                             "unbiased": {"update_s": 17.1, "collect_s": 26.9, "grad_norm": 0.43, "grad_clip_frac": 0.0, "ppo_clip_frac": 0.020},
                             "max_grad_norm": 1.0}
+  },
+  "ablation_b53": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B53", "status": "run-ready; arms not run (hours per arm: user decision)",
+    "config": "bridge/ops/b53/arms.json (common = xnew2 profile args + --checkpoint-every 25, seed 1000; arms A detach / B random-2 unbiased / C gradreplay-2 / D random-4 unbiased; ports 39300/39400/39500/39600)",
+    "launch": "CODE=<dir> sh bridge/ops/b53/b53_run_arm.sh <arm> <total_game_hours> [limit_s]; rerun = resume (b53_arm.py: --resume last.pt, remaining hours, LR schedule continued); DUMP_AT=<update> for a learner dump; GPU_LOCK b53-arm-<arm>",
+    "eval": {"script": "bridge/ops/b53/b53_eval.sh + b53_eval_summary.py", "seeds": "2147600000:512 (held out; disjoint from training < 2**31, A8 2147500000, lab 2147700000)",
+             "mode": "run, 1800 s, normal:16, sampled actions, floor stall 60 s", "metrics": "floor clear rate, floors / rooms cleared, hurt, death per run, game hours, x real time; bootstrap CI; MDE"},
+    "variance_b48pf_u16": {"repeats": 3, "episodes": 512, "rooms_cleared": [0.125, 0.084, 0.092], "hurt": [2.73, 2.54, 2.44], "death": [0.400, 0.381, 0.363],
+                           "floor_clear": [0.0, 0.002, 0.0], "repeat_sd_vs_episode_se": "consistent (variance ratio 2.5 / 2.5 / 0.75, df 2)",
+                           "mde_512_per_arm": {"rooms": 0.054, "hurt": 0.37, "death": 0.085, "floor_clear_p0.1": 0.053, "floor_clear_p0.5": 0.088},
+                           "eval_cost": "~10x real time (object-path eval_tok), ~55 min per 512 episodes at ~65 s per episode; grows with episode length"},
+    "resources": "serial recommended: per arm G/X wall hours (1000 h: 6.7 h at 150x, 5.0 h at 200x); two arms in parallel infeasible (GPU 2x15.2 GB, host RAM) and no throughput gain (collect-bound)",
+    "late_b49": "CODE=<dir> sh bridge/ops/b53/b53_b49_late.sh <arm> [advance]"
   },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
