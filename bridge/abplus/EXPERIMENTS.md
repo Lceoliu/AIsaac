@@ -9351,3 +9351,139 @@ merged份额的解释（prof-b47-f13的起点计数，每update）：
   - 剩余手段都在设计层：每决策更少的step（teacher代版本），或更便宜的step（actor graph的kernel数和固定开销）。异步重叠只会把这部分时间转成learner的争用（本节筛选表）。
 - 代码：9629495（B46 + 修法1 + 设备端结果按需，对B46净改3个文件）；WIP提交37b18a1带异步机制，已被9629495移除。
 - 失败或中间运行：prof-b47-i1/i1c/i12/i12c/i3/prof/prof2/prof3/ctl/ctl16/bc/bd/f13/f13b/sclean/sch/spk都保留作对照（本节表格的数据来源），没有失败的运行。4090已空闲（guard：0个train_tok、0个isaac进程，显存12 MiB）。
+
+### B48 速度改造第4步：learner侧（分解、历史块共享池评估、host打包流水化）（2026-11-09）
+
+#### 实验目的
+
+B47之后update中位22.9 s（prof-b47-slz）。collect与update并发：learner忙时，actor每次step的GPU等待约3.3 ms，空闲时约2.0 ms，所以update变短也会连带影响collect。
+
+目标update ≤ 15 s（冲刺 ≤ 12 s）。不改输入、模型定义、teacher预算、micro 8192，不改历史块数（4）和任何消融臂的语义，不训练。
+
+#### 实验方法
+
+- A. 测清：
+  - 在B47代码上跑一个短run，把一个真实update（第6个）的learner输入dump下来（`ISAAC_LEARNER_DUMP`，3.2 GB）。
+  - 离线重放用`bridge/ops/b48_learner_profile.py`：GPU空闲，每段同步。CUDA事件给出各模块的前向、checkpoint重算和反向时间；同时统计按行类型（主行 / 历史 / tail）的行数，以及Spatial每个T桶的真实与填充token。
+  - 两个变体：不重编码历史块（`train_history=False`）；关掉Spatial checkpoint。
+  - host部分用cProfile（`b44_learner_bench.py --cprofile`）。
+- B. 历史块按segment共享抽样池（`ISAAC_LEARN_HISTORY_POOL`=K，只在random模式生效，默认关）：
+  - 同一调用里同一episode（segment）的chunk，从一个大小为K的窗口外块池里抽各自的4块；池里不够的从自己的可抽块里补。
+  - 单测证明：每个chunk的边际分布仍是从自己的窗口外块里均匀抽min(4, eligible)块；共享编码一次与逐chunk编码相比，输出、loss和全部梯度FP32 atol 1e-6一致；因果隔离测试通过。
+  - 先用dump模拟预期收益（`--pool-sim`），再决定是否上线。
+- 方案1，learner host打包流水化（`ISAAC_LEARN_PREFETCH`，默认开）：
+  - `forward_packed`拆成host准备`_prepare_packed`（历史块抽样、帧解码、Spatial和Reader的计划、索引数组、pinned staging槽的填充）和设备执行`_run_packed`。
+  - PPO循环在第k个part前向之后，在后台线程准备第k+1个part，与第k个part的反向重叠。
+  - 下一个minibatch的teacher和teacher-v2抽取提前到这时按顺序做，抽取序列不变：循环里没有其他地方用这两个生成器。
+  - 准备一次只做一个（`PREP_LOCK`），历史块抽样的顺序和串行相同。
+  - 线程只做host工作，不碰模型参数和CUDA流，也不读第k次更新后才确定的东西：准备只依赖chunk、页存储和抽样。
+  - staging从两块交替的缓冲改为带占用标记的池，预取好的槽在被用掉之前不会被别的调用覆盖。
+  - 中间插入的其他调用（no-grad前向）不取走、也不破坏预取的part。
+- 等价测试（`tests/test_b48_prefetch.py`）：连续三个part，中间做optimizer step，可选在中间插一次no-grad调用。
+  - 每个part上传的host字节逐位相同。
+  - CPU：输出、loss和全部梯度atol 0相同。需要单线程：多线程CPU下串行路径自身的index累加反向（memory_age、short_relative）每次运行都不逐位相同。
+  - CUDA（确定性算法 + `CUBLAS_WORKSPACE_CONFIG`）：串行与预取之差等于串行两次之差（7.3e-12、3.6e-12，原子累加的顺序）。
+- C/D/E：checkpoint、T桶填充、C helper机制，用A的数据判断。
+
+#### 实验结果
+
+A. 一个真实update的learner时间（dump重放，GPU空闲，第2遍）：
+
+| | 全部 | 不重编码历史块 | 差 |
+|---|---:|---:|---:|
+| learner合计 s | 10.95 | 6.85 | −4.1（−37%） |
+| 有梯度前向（含host打包） s | 4.92 | 2.91 | −2.0 |
+| 反向 s | 4.80 | 2.67 | −2.1 |
+| 无梯度前向 s | 1.05 | 1.09 | 0 |
+| host打包 s | 3.52 | 2.14 | −1.4 |
+| 显存保留峰值 GB | 11.3 | 7.5 | |
+
+- 模块GPU时间（全部）：
+  - Spatial：前向1.08 s，checkpoint重算1.32 s，反向约2.67 s，合计约5.1 s；
+  - Reader：前向0.60 s，反向0.74 s；
+  - Writer：小于0.1 s；heads可忽略。
+- 有梯度前向的4.92 s里，GPU约1.7 s，其余是host打包。
+- host打包的cProfile（22次调用，含profiler开销）：
+  - 帧解码`decode_frames_compact` 1.76 s（逐行take 0.53 s，block 0.31 s）；
+  - slab填充0.48 s；
+  - 源字节拼接0.38 s；
+  - 页gather 0.40 s；
+  - 头检查0.20 s；
+  - 计划0.18 s。
+- 行数：每update主行约133k；历史行从u2的94k涨到u13–u16的108–112k（随episode变长约+15%）；tail约2k。历史行约占Spatial行的44%。
+
+B. 共享池的预期收益（dump模拟，15次梯度调用）：
+
+| 抽样 | 不同块 | 历史行 |
+|---|---:|---:|
+| 现在（逐chunk） | 3,379 | 108,128 |
+| K=8，每次调用一个池 | 3,315 | 106,080（−2%） |
+| K=16，每次调用一个池 | 3,362 | 107,593 |
+| K=8，整个update一个池（离线） | 3,290 | 105,289（−2.6%） |
+
+- 原因：一次调用里每个segment平均只有1.21个chunk（中位1，最大5；15次调用共817个segment出现，update里共210个segment）。块只能在一次前向内共享，权重在调用之间会变。
+- 结论：B不上线。代码留在本地ref `refs/b48/b48b-with-pool`，不进正式版。
+- “按segment组minibatch”会改变minibatch的组成（SGD统计），记为将来的消融候选，未做。
+
+C. 关掉Spatial checkpoint在全部历史行下OOM（23.6 GB），保留checkpoint。
+
+D. Spatial token真实/填充为0.92：40、48两个桶占90%的token，真实比例分别为96%和90%。加桶最多省几百毫秒，不改。
+
+E. 这份dump来自不带C helper的代码，Spatial调用也有135–136次；prof-b47-slz里各update也在102–126次之间。调用数随数据变化，不是C helper的特征。C helper让反向变慢的机制仍未查明，留作开放问题。
+
+历史梯度的覆盖率（同一份dump，只读统计，`b48_coverage.py`）：
+
+| 项 | 数值 |
+|---|---|
+| chunk长度桶（1 / 32 / 64 / 128） | 1,455 / 69 / 81 / 777（共2,382个，1行的是teacher / CF记录） |
+| 每chunk新完成块（0 / 1 / 2 / 3 / 4） | 1,456 / 134 / 105 / 39 / 648 |
+| 可见旧块n_old分位（25 / 50 / 75 / 90 / 最大） | 1 / 4 / 10 / 16 / 124 |
+| 窗口外可抽eligible分位（50 / 75 / 90 / 最大） | 0 / 6 / 12 / 120；eligible为0的chunk 1,396个 |
+| 实际选中（0 / 1 / 2 / 3 / 4） | 1,396 / 49 / 58 / 40 / 839 |
+| bank条目 | 旧14,725（窗口内来自页、无梯度5,757；窗口外8,968）+ 新3,053；选中3,641 |
+| 本次前向带梯度的bank条目 | (3,641 + 3,053) / 17,778 = 37.7%；旧块中24.7% |
+| 选中概率，按块龄（距chunk起点的块数） | 0–3：0（窗口内）；4–7：0.59；8–15：0.34；16–31：0.17；32–63：0.09；64–127：0.03 |
+| update内至少被选中一次的块 | 1,421 / 3,298个被引用的块（43%）；窗口外可抽的块中占68% |
+| 一个被选中的块在update内被重编码的次数（1 / 2 / 3 / 4 / 5 / >5） | 557 / 283 / 220 / 141 / 88 / 121（共3,641次，按调用去重后为3,379次编码） |
+
+- 从代码确认：chunk起点前窗口（≤128步）的K/V来自页，无梯度；窗口内（end > step − window）的块值也来自页，无梯度。
+- 带梯度的只有两类：chunk内新完成的块（经Writer）和被选中重编码的窗口外块。
+- 开放尾巴：只有在chunk用它完成一个块时才经Spatial重编码（带梯度），否则其latent也来自页。
+
+方案1（host打包流水化）的完整短profile（16个update，u2–u14中位）：
+
+| | prof-b47-slz（B47） | **prof-b48-pf（预取）** | CF关（prof-b48-nocf，u2–u8） |
+|---|---:|---:|---:|
+| ×实时 | 148.8 | **150.2** | 205.3 |
+| 游戏小时（窗口内） | 15.78 | 15.78 | 8.50 |
+| collect_s中位 | 27.86 | 28.86 | 21.87 |
+| update_s中位（最大） | 22.91（24.45） | **18.85（21.70）** | 20.18（20.90） |
+| u_ppo s | 16.0 | 12.3 | 13.8 |
+| u_recompute s | 3.38 | 3.43 | — |
+| learner前向part墙钟 s | 9.72 | 4.72 | — |
+| learner反向GPU s | 8.57 | 9.09 | — |
+| 历史行 / update | ~105k | ~105k | — |
+| infer_ms | 11.3 | 11.5 | 8.1 |
+| actor GPU等待 s/update | 13.59 | 13.62 | — |
+| learner自愿切换 | 44.3k | 37.2k | — |
+| learner线程CPU s | 13.5 | 9.7 | — |
+| 显存保留峰值 GB | 17.3 | 15.2 | 13.9 |
+
+- host打包藏住了多少：每update的host打包8.05 s里，预取线程完成4.76 s，PPO线程等待0 s（12次命中，0次丢弃），这部分全部被藏住。
+- 剩下的3.3 s在主线程：每个epoch的第一个PPO part（3次，不能跨epoch预取：下一个epoch的排列在GPU上生成），以及约7次无梯度调用（旧值重算、新teacher记录）。
+- CF的边际成本（同窗u2–u8）：
+  - prof-b48-pf：collect 29.59 s，update 18.40 s，×实时147.6；
+  - CF关：collect 21.87 s，update 20.18 s，×实时205.3；
+  - CF约占7.7 s collect。CF关时actor更快，与update重叠的GPU工作更多，update反而更长（20.2 s）。
+- 验收门：
+  - update 18.85 s ≤ 19 s，**过**；冲刺17 s未达；目标15 s未达；
+  - collect 28.86 s，比slz的27.86 s高1.0 s，在允许的2 s噪声内，**过**；
+  - actor的每step GPU等待（13.6 s/update）和infer_ms都不变；learner线程切换减少16%，没有出现GIL争用。
+  - ×实时150.2，过了第3步的150门。
+- 等价与测试：4090全量门198 passed / 0 failed（b48-final，确定性cuBLAS配置）；本地138 passed / 51 skipped；A8 8/8 ok，play与step的digest相同。
+- 要到15 s，需要在流水化之外真正减少历史行（块数或重算语义），这是语义决定，未做。
+- 代码：75784d4（流水化与测量工具；历史块共享池B不在其中，见refs/b48/b48b-with-pool）。
+- 失败或中间运行：
+  - prof-b48-dump（dump下标8超出run长度，没有写出文件；按update 6重跑为prof-b48-dump2）；
+  - b48-prof-nockpt（OOM，即C的结论）。
+  - 都保留作记录。4090已空闲。
