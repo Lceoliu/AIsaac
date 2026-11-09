@@ -9750,6 +9750,7 @@ B47 之后 collect 27.9 s、update 22.9 s、×实时 149–151，用户门槛 ×
 | learner | 11.5 s | 12.5 s | **2.50 s** | 61 µs / 861 µs / 2.29 ms / 51 ms | 17.3 / 21.3 / 4.4–5.2 |
 | driver（C++） | 0 | 0 | 0 | — | — |
 
+- prof-b52m 本身是 nsys 采集用的运行（candidate-b52，C++ driver，`--game-hours 10.3`，9 个 update、10.93 游戏小时），不是速度对照：python-gil 追踪每次 GIL 切换都加钩子，u2–u9 中位 collect 25.83 s、update 18.55 s、×实时 161.6；u7 的 ×实时 55.6 与 u8 的 collect 83.2 s 是采集窗口在第 7 次 hand-off 结束时 nsys 停止并写报告（121 MB）造成的停顿。速度结论只用上面的 prof-b52-cpp / py / nocf。
 - 主线程的 GIL 等待按所在段：段外（消费者循环、`next_record` 返回后）7.47 s、lane.finish 1.00、lane.control 0.58、g.native 0.58、其余 < 0.25。
 - lane 步（g.native）p50 1.75 ms、p99 77 ms、最长 207 ms：长尾仍在，跟着 learner 的 PPO 段走（与 B50 的 g.sync 长尾同形）。
 
