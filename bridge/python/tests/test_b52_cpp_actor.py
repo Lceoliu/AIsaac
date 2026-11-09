@@ -245,6 +245,7 @@ def test_driver_single_worker_matches_python_step_with_fixed_uniforms():
     for k in range(K):
         first = 1 if k in (0, 19) else 0
         script[k] = frame(rng, 1, k, np.array([1 + (k >= 19)]), np.array([first]), seed=300+k)
+    b.version = 3   # (the driver steps at version 3: set_version in run_driver)
     s, d, recs, workers = run_driver(a, 1, K, lambda w, k: script[k])
     assert len(recs) == K and len(workers[0].got) == K
     heads = sum(m.heads); nh = len(m.heads)
@@ -264,7 +265,8 @@ def test_driver_single_worker_matches_python_step_with_fixed_uniforms():
         acts = out[:, :nh].astype(np.int64)
         np.testing.assert_array_equal(rec['actions'].numpy(), acts)
         np.testing.assert_array_equal(workers[0].got[k][:nh], acts[0])
-        assert s.main_value[0] == out[0, nh+1] and s.main_vg[0] == out[0, nh+2]
+        if k == K-1:   # (the shared arrays hold the last step's values)
+            assert s.main_value[0] == out[0, nh+1] and s.main_vg[0] == out[0, nh+2]
         assert int(rec['step_before'][0]) == int(b.state.step_host[0])-1
         assert bool(rec['first'][0]) == bool(rows['first'][0])
         kvs = int(rec['kvs'][0]); dec = int(rec['dec'][0])

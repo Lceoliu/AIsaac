@@ -15,6 +15,7 @@
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/core/InferenceMode.h>
 
 #include <poll.h>
 #include <unistd.h>
@@ -555,6 +556,7 @@ struct ActorDriver {
 
   void loop() {
     try {
+      c10::InferenceMode inference;   // (the graphs' pinned buffers were made under inference mode: writes to them need it)
       auto stream = c10::cuda::CUDAStream::unpack3(stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
       c10::cuda::CUDAStreamGuard guard(stream);
       std::vector<struct pollfd> pfds(fds.size());
@@ -679,7 +681,7 @@ struct ActorDriver {
     fill_and_run(*e, n, rows_ptr, stride, pend.data(), ids.data(), u.data(), replay.data(), complete.data(), version.load(), any_complete);
     double t1 = now(); r->t_sync = t1; t_sync_s = t_sync_s+(t1-t_host0);
     // outputs -> actions (pforce), shared arrays, reply
-    const float *bo = e->bo.data_ptr<float>(); i64 ow = heads+3;
+    const float *bo = e->bo.data_ptr<float>(); i64 ow = nh+3;   // (the step's outputs: actions [nh], logp, value, vg)
     r->out = at::empty({n, ow}, at::kFloat); memcpy(r->out.data_ptr<float>(), bo, n*ow*sizeof(float));
     r->actions = at::empty({n, nh}, at::kLong); i64 *act = r->actions.data_ptr<i64>();
     r->pending_before = at::empty({n, nh}, at::kLong); memcpy(r->pending_before.data_ptr<i64>(), pend.data(), n*nh*8);
@@ -710,7 +712,7 @@ struct ActorDriver {
         const uint8_t *src = rows_ptr+j*stride;
         fr[j] = src+f_frame; nb[j] = read_int(src+f_bytes, 4); st[j] = steps_before[j]; fi[j] = first[j]; sc[j] = (int32_t)read_int(src+f_schema, 4);
       }
-      store->write_decisions_raw(n, e->bc.data_ptr<uint8_t>(), store->kv_elems*store->kv_itemsize, e->bz.data_ptr<float>(), store->z_elems,
+      store->write_decisions_raw(n, (const uint8_t *)e->bc.data_ptr(), store->kv_elems*store->kv_itemsize, e->bz.data_ptr<float>(), store->z_elems,
                                  st.data(), r->version, fi.data(), sc.data(), fr.data(), nb.data(), pend.data(), r->dec.data_ptr<i64>(),
                                  r->kvs.data_ptr<i64>());
     }
@@ -743,7 +745,7 @@ struct ActorDriver {
     push_record(r);
   }
   void finish_empty(Record &r) {
-    r.out = at::empty({0, heads+3}, at::kFloat); r.actions = at::empty({0, nh}, at::kLong); r.pending_before = at::empty({0, nh}, at::kLong);
+    r.out = at::empty({0, nh+3}, at::kFloat); r.actions = at::empty({0, nh}, at::kLong); r.pending_before = at::empty({0, nh}, at::kLong);
     r.step_before = at::empty({0}, at::kLong); r.first = at::empty({0}, at::kByte); r.complete = at::empty({0}, at::kByte);
     r.dec = at::empty({0}, at::kLong); r.kvs = at::empty({0}, at::kLong); r.bid = at::empty({0}, at::kLong); r.version = version.load();
   }
