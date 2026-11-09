@@ -9064,3 +9064,137 @@ C帧逐字节等价（硬门）：
 - 中间版本prof-b45与最终版只差历史块和尾巴的源解码（`source_arena`）和一处测试修正。中间版本的GPU门有1个失败（B38 learner子进程的共享内存测试需要用ROW rollout），已修正。
 - 代码：8669625。
 - 失败或中间运行：无失败运行。prof-b45是完整的中间版本，保留作对照。录制的payload在`reports/b42-speed/b45-payloads*`，作为等价性语料。4090已空闲（guard：0个train_tok、0个isaac进程，显存12 MiB）。
+
+### B46 速度改造第3步：actor侧（lane进step graph、Writer进图、帧在C中解进graph槽）（2026-11-09）
+
+#### 实验目的
+
+prof-b45b的collect中位46.9 s，p_act 45.0 s，二者几乎相等：worker大部分时间在等actor（w_wait 16进程合计675 s）。本步把actor线程的工作降下来，不改输入、模型定义和教师预算，micro仍为8192，不训练。
+
+验收门（完整短profile，prof-f4口径，≥14个update，取u2–u14中位）：
+- collect < 25 s，冲刺 < 20 s；
+- ×实时 ≥ 150；
+- update不高于prof-b45b的24.0 s。
+
+另报CF关闭时的边际成本。
+
+#### 实验方法
+
+- 先测清时间花在哪：用`ISAAC_BLOCK_ACTOR_PROFILE`对一个rollout的actor线程做在线cProfile。改前一个rollout合计51 s（含cProfile开销），主要几项：
+  - **测量假象**：计时时钟每个mark都调一次`torch.cuda.synchronize()`，一个rollout 27,175次，5.4 s。此前B42–B45的profile都带着它。
+  - **merged全走eager**：主actor与teacher lane的合并批全部走eager，485次，5.8 s。原因是step graph只在所有行都属于主actor时启用。
+  - step graph内，Writer逐调用跑在host决定的已完成块上，4.4 s；graph输入的host解码`decode_frame_host` 3.35 s。
+  - 写页5.8 s，其中逐页的torch CPU index_put占2.8 s。
+  - lane服务的回收扫描`service_control`：每次调用都要扫一遍全部worker的环，约3 ms一次，5.9 s。
+- 改动：
+  1. lane进arena：主actor的arena多留`lane_generations × lane_slots`行（2代×16 lane）。teacher代的lane actor共用这块arena，从偏移处起（`lane_actor(..., generation=g)`）。main+lane合并批是同一arena上的一次调用，重放主actor的step graph（版本一致时用主权重，与原eager merged语义相同）；lane单独的调用重放该代lane actor自己的graph。主actor额外预录合并容量（2–32行）的step graph；不再预录eager merged所用的独立Spatial/Reader graph。
+  2. Writer进step graph：graph内对每行的open block跑Writer，块写入（bank/ends/versions/sources，partial的sources和versions复位）只保留在host标记为complete的行（`torch.where`）。graph只返回complete行的Writer输出，其他行的pinned缓冲是旧内容，不交出。
+  3. graph输入在C中解包：`abp_visible_unpack`（`bridge/engine/abp_visible.c`）把帧按桶宽直接写进graph的pinned输入槽，替代`decode_frame_host`加一次槽拷贝。graph的键与布局改按桶宽计算。
+  4. 写页：`PagedStore._scatter`改为在页的numpy视图上做花式赋值。视图按页缓存；页是CPU张量，只追加、不重分配，每次取视图都断言数据指针未变。
+  5. `BlockLaneService.service_control`里的上下文和injury源回收最多每0.1 s跑一次。取消和释放（status 3）仍每次处理。ContextRegistry的id单调递增、从不复用，节流只推迟释放。
+  6. 计时时钟不再synchronize：各phase是host墙钟，GPU等待记在同步点（graph结果拷回处）。`ISAAC_BLOCK_TIMING_SYNC=1`可回到旧方式。
+  7. 结果张量从pinned输出缓冲非阻塞拷到GPU（原为pageable同步拷贝，3.3 s/rollout）。merged调用的uniform在host上生成（原为GPU生成再拷回）。
+  8. 全部actor step graph共用一个显存池，并用一个常驻的单算子keepalive graph保活：
+     - 每个graph一个私有池时，私有池合计约5 GB，prof-b46d在u5的一次新键捕获中OOM（14.8 GiB已保留未分配）；
+     - 共享池起初没有保活，所有graph释放后池随之失效，再次捕获触发分配器断言，GPU门有12个测试失败；
+     - 两次失败的运行都已移入`failed/`。
+- 计数器：
+  - actor线程每update的墙钟分解：graph host准备、GPU等待、写页、step其余部分；main/merged/lane各类step数和行数。
+  - lane轮次的耗时，lane行按merged/graph/eager分计。原`v2_lane_eager`统计的是`_eager`方法的调用次数，不是eager路径，已改为真实路径。
+  - `block_step_graph_replays`。原`block_graph_replays`只计eager merged用的独立Spatial/Reader graph，因此从约7k降到35。
+  - 主循环新增p_tick、p_control、p_weights、p_main_ready。
+- 测试：
+  - merged main+lane graph与分arena的eager merged调用比对（FP32/BF16）：输出、host输出、arena行、页。
+  - Writer进图与host的`commit_blocks`比对，跨过多个块边界：
+    - bank_ends、bank_versions、bank_sources、bank_source_versions、partial_sources、partial_versions和host步计数完全相等；
+    - bank值不是逐位相等：FP32下≤1e-6，BF16下≤0.02。graph里的Writer对全部行做一批，host只对complete行做一批，矩阵乘的批形状不同；上游的Reader输出也来自graph，graph≡eager本来就只在BF16量级。
+    - graph只交出complete行的Writer输出。
+  - 回收节流：频繁取消下id不复用；被环引用的上下文保留，窗口过后未引用的被释放。
+  - 原有的step graph≡eager测试仍在。
+  - A8 play校验（`abplus_probe_play.py`，8个seed）：play与step的digest相同。
+  - Writer成本：在空闲4090上，对同一组行分别计时step graph整图重放和单独Writer的CUDA graph（`reports/b42-speed/b46-writer-bench.py`）。
+
+#### 实验结果
+
+完整短profile（prof-f4口径：16 workers、rollout 32768、micro 8192、cf 6/180、teacher share 0.1）。prof-b46f跑16个update，窗口u2–u14。CF关闭对照prof-b46f-nocf（`--cf-points 0`：CF配额永不填满，没有CF点和lane）跑8个update，窗口u2–u8，所以另列prof-b46f的u2–u8做同窗对比。游戏小时 = 决策数/27000，×实时 = 决策数/(墙钟秒×7.5)。
+
+| | prof-b45b（基线） | **B46最终（prof-b46f）** | prof-b46f u2–u8 | CF关（prof-b46f-nocf）u2–u8 | B46中间（prof-b46c） |
+|---|---:|---:|---:|---:|---:|
+| ×实时 | 97.5 | **144.9** | 141.4 | 204.7 | 140.4 |
+| 游戏小时（窗口内） | 15.78 | 15.78 | 8.50 | 8.50 | 15.78 |
+| collect_s中位 | 46.9 | **28.7** | 29.5 | 21.0 | 31.8 |
+| update_s中位（最大） | 24.0（25.1） | **21.7（23.6）** | 21.5 | 19.9（21.9） | 24.5 |
+| u_ppo s | 17.7 | 15.0 | 14.9 | 13.6 | 17.8 |
+| infer_ms（每次主调用墙钟） | 18.2 | 11.9 | 12.0 | 7.9 | 13.5 |
+| 主调用至应答 ms（block_main_ready_ms） | 12.0 | 7.5 | — | 7.0 | 6.8 |
+| p_act s | 45.0 | 26.6 | 27.6 | 18.9 | 29.8 |
+| w_wait s（16进程合计） | 675 | 382 | 395 | 260 | 432 |
+| w_encode s（16进程合计） | 27.8 | 27.8 | 28.1 | 27.4 | 27.6 |
+| eager step / update | 1,107（merged） | **0** | 0 | 0 | 0 |
+| 显存保留中位 / 峰值 GB | 19.3 / 19.4 | 15.8 / **16.7** | — | 14.0 / 14.0 | 21.4 / 21.7 |
+
+actor线程墙钟分解（prof-b46f，u2–u14中位，host秒/rollout；各段相加≈collect）：
+
+| 段 | CF开 | CF关 |
+|---|---:|---:|
+| poll（等worker记录） | 0.38 | 0.38 |
+| book（入账） | 1.50 | 1.55 |
+| control（`capture_main`：lane控制、CF捕获） | 1.34 | 0.76 |
+| 主调用至应答（main_ready，含合进主调用的lane行） | 15.46 | 15.99 |
+| 主应答之后（剩余lane轮次 + answer里的reply/store 1.6–1.9） | 9.86 | 2.16 |
+| 换权重 + 其余 | 0.10 | 0.09 |
+| **合计 / collect中位** | **28.64 / 28.74** | **20.94 / 20.97** |
+
+同一时间按`SlotBlockActor.step`横切（每update，host秒；B46计数器）：
+
+| | CF开 | CF关 |
+|---|---:|---:|
+| step调用总数（main / merged / lane-only） | 3,603（1,382 / 609 / 1,724） | 2,338（全为main） |
+| step合计 | 20.90 | 15.47 |
+| 其中GPU等待（graph结果同步点） | 13.45（3.7 ms/次） | 10.62（4.3 ms/次） |
+| 其中graph host准备（C解包、布局、uniform、H2D） | 1.60 | 1.05 |
+| 其中写页 | 3.99 | 2.60 |
+| 其中step其余（arena记账、结果拷回） | 1.83 | 1.20 |
+| step之外（poll、book、control、answer、lane轮次组装） | 7.84 | 5.50 |
+
+- 主调用：每rollout约2,140次，每次15.3行。b45b约2,080次、15.8行，主调用次数基本没变。
+- lane：每update 1,724个lane轮次，共10,260行，全部走graph（lane_rows_graph = lane_rows，lane_rows_eager = 0），其中1,475行合进主调用。一个lane轮次墙钟中位13.0 ms，包括约1.35次graph step（每次3.7 ms GPU等待）和轮次组装。
+- Writer进图的成本：空闲4090上，step graph整图重放在8/16/32行时分别为1.62/2.03/3.06 ms，单独的Writer为0.14/0.16/0.18 ms（占5.7–8.7%）。每update约3,600次调用，约0.6 s GPU时间，计在GPU等待里。graph从约2 ms到3.1 ms的变化来自合并批的容量（主行加lane行，到32行），不是Writer。
+- 计数器口径：
+  - `block_graph_replays`只计eager merged用的独立Spatial/Reader graph，是累计值：b45b在16个update内累计25,674，b46c停在预录的25，b46f为0（不再预录）。
+  - step graph的重放看新增的`block_step_graph_replays`，也是累计值：b46f共61,285次，约3,600次/update，等于`actor.graph_calls`。
+  - `eager_calls`（主线程的eager计数）在b45b与b46都是0，原先的eager merged只出现在`b42_actor_eager_merged_calls`（b45b 1,107/update）；B46的`b42_actor_steps_eager`和`b42_lane_rows_eager`都是0。
+  - 旧的`v2_lane_eager`等于`v2_lane_calls`，因为它数的是`_eager`方法的调用次数；B46按真实路径计。
+- calls_upd：只数learner忙时（update与collect重叠期间）的主调用。B46主调用总数与b45b相近（约2,140对2,080/rollout），但collect缩到28.7 s，update 21.7 s占其约75%（b45b约51%），落在忙时的主调用就多了：中位1,383对672。所以它的变化不是调用变多。
+- update与GIL：update中位21.7 s，b45b为24.0 s；u_ppo 15.0对17.7 s；learner线程自愿切换（nvcsw）44k对62k。actor的Python时间少了，与learner的GIL争用也少，update没有因为actor变快而变慢。
+- CF的边际成本（同窗u2–u8）：collect 29.5 → 21.0 s（CF占8.5 s，29%），×实时141.4 → 204.7，update 21.5 → 19.9 s，显存峰值16.7 → 14.0 GB。CF的8.5 s里约7.7 s是主应答之后的lane轮次，0.6 s在control。
+- 显存：保留峰值16.7 GB，4090 24 GB，余量约7.3 GB。b45b为19.4 GB；中间版本b46c每个step graph一个私有池，到21.7 GB，b46d因此在u5 OOM。共享池使峰值降到16.7 GB。
+- 各phase与actor分解都是host墙钟（计时不再同步GPU）。GPU时间只在同步点体现为“GPU等待”。
+- 验收门：
+  - collect 28.7 s，**未过**25 s门（差3.7 s），冲刺20 s也未达；
+  - ×实时144.9，**未过**150（差5.1）；
+  - update 21.7 s ≤ 24.0 s，**过**；
+  - eager step 0，**过**；lane轮次13.0 ms，未达2 ms；
+  - 写页加Writer约4.6 s/update，未达1.5 s；
+  - graph host准备（含C解包）1.6 s/update，未达1 s（解包本身没有单独计时）；
+  - 每次step的host开销（step减GPU等待）2.1 ms，过6 ms；
+  - 等价：graph ≡ eager（含merged）、Writer进图 ≡ host `commit_blocks`（元数据atol 0，bank见上）、A8 8/8 digest相同、测试4090 191 passed / 0 failed，本地135 passed / 49 skipped，**过**。
+- 瓶颈在哪：collect 28.7 s里，step 20.9 s，其中GPU等待13.5 s。
+  - actor每update同步发出约3,600次graph调用，每次在learner并发下要等3.7 ms GPU（空闲时16行2.0 ms）。
+  - 余下是写页4.0 s、host准备1.6 s、step其余1.8 s，以及step之外的7.8 s（book 1.5、control 1.3、answer 1.6、lane轮次组装约3）。
+  - CF关闭后collect仍有21.0 s，其中主调用至应答16.0 s（约2,100次 × 7.0 ms）。也就是说，即使不算CF，主调用同步串行本身就接近20 s的冲刺线。
+- 还剩的手段（都不降输入、模型、teacher预算）：
+  1. actor调用流水化：第k次调用的GPU计算与第k+1次的C解包、第k次的写页重叠（step graph双缓冲），可藏起写页和host准备的大部分（约4–5 s）。
+  2. lane轮次异步：主应答之后的lane轮次（9.9 s）放到单独的stream或线程，不挡下一次poll。CF的8.5 s大部分可以与主调用重叠。
+  3. 减少lane-only调用：1,724次lane-only对609次merged，原因是lane的代版本与主版本不一致。允许一个调用里跑两套权重（两代各自的step graph在同一arena上连续replay、一次同步），可把每轮的同步次数减半。
+  4. 加宽lane窗口，让更多lane行合进主调用（需要先核对CF预算和延迟）。
+  5. learner并发下每次step的GPU等待是空闲时的1.8倍。actor stream已是高优先级，再降需要限制learner的kernel占用，会拖慢update。
+- 代码：ba24d9b（候选树candidate-b46f，tree 72a1932）。
+- 失败或中间运行，都已移入`reports/b42-speed/failed/`：
+  - prof-b46b；
+  - prof-b46c-nocf（`--cf 0`在block模式下不可用：block_arrays和lane shm只随CF/v2创建，改用`--cf-points 0`）；
+  - prof-b46d及其nocf（u5 OOM，每graph一个私有池）；
+  - prof-b46e及其nocf（共享池无保活，分配器断言）。
+- prof-b46c是完整的中间版本，保留作对照。
+- 收尾时一个A8脚本误带了旧的pytest和profile段，3分钟内停掉。它截断了`tests-b46c-full.log`（该次结果191 passed已在前面记录），prof-b46c的数据未受影响。A8随后单独重跑。
+- 4090已空闲（guard：0个train_tok、0个isaac进程，显存12 MiB）。
