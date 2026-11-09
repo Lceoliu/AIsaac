@@ -25,9 +25,18 @@ return function(ctx, cfg_text)
 		if c.cmd == "start" then
 			-- 下一次 MC_POST_GAME_STARTED 开出的局是 harness 局（机器人/脚本命令/帧上限对它生效）
 			if c.seed_num and not c.start then c.start = "seed " .. Seeds.Seed2String(c.seed_num) end
-			H.pending = {start = c.start, bot = c.bot, bot_seed = c.bot_seed, frames = c.frames, cmds = c.cmds or {},
+			local desc = {start = c.start, pre = c.pre, bot = c.bot, bot_seed = c.bot_seed, frames = c.frames, cmds = c.cmds or {},
 				replay = c.replay, script = c.script, pausewatch = c.pausewatch}
-			if c.start then run_cmd(c.start) end
+			if c.pre then
+				-- 0.4.1 选角色：pre（例如 "restart 7"）先开一局"预备局"（普通局，不是 harness 局；restart <角色> 换角色、
+				-- 随机种子），预备局的第一次 MC_POST_UPDATE 再执行 start（seed 命令沿用当前局的角色与难度），
+				-- 之后开出的那一局才是 harness 局。见 README §8.8
+				H.pre = {desc = desc, started = false}
+				run_cmd(c.pre)
+			else
+				H.pending = desc
+				if c.start then run_cmd(c.start) end
+			end
 		elseif c.cmd == "exec" then
 			exec(c.command, ctx.run() and ctx.run().n or -1, c.tag)
 		elseif c.cmd == "stop" then
@@ -94,6 +103,17 @@ return function(ctx, cfg_text)
 
 	-- 每个 MC_POST_UPDATE（无论是否在录）：执行队列里的一条命令
 	function H.on_any_update()
+		-- 预备局（start 的 pre）已开出：在它的第一次更新里执行真正的 start，下一个开出的局是 harness 局
+		local p = H.pre
+		if p and p.started then
+			H.pre = nil
+			H.pending = p.desc
+			if p.desc.start then
+				local ok, e = pcall(run_cmd, p.desc.start)
+				if not ok then ctx.fail("harness start after pre", e) end
+			end
+			return
+		end
 		if #H.queue > 0 then
 			local c = table.remove(H.queue, 1)
 			local ok, e = pcall(do_command, c)
@@ -117,6 +137,12 @@ return function(ctx, cfg_text)
 
 	-- 新局开始：若有待定的 harness 局则激活，返回写进 header 的 harness 描述
 	function H.on_game_started(continued)
+		-- start 的 pre 开出的预备局：普通局（不激活任何 harness 描述）
+		if H.pre and not H.pre.started then
+			H.pre.started = true
+			H.active = nil
+			return nil
+		end
 		if not H.pending and menu_desc() then
 			H.menu_used = true
 			local m = cfg.menu_run
@@ -131,6 +157,16 @@ return function(ctx, cfg_text)
 			bot.reset(H.active.bot_seed or 12345)
 		end
 		return H.active
+	end
+
+	-- 新局 header/level/room 行写完、回放的开局设置做完之后（main.lua 的 MC_POST_GAME_STARTED）：帧上限 0 的局
+	-- （录制 0 帧就被重开的局，例如按住 R 在第一次逻辑更新之前）当场关局，回放也是 0 帧
+	function H.on_run_opened()
+		local a = H.active
+		if a and a.frames == 0 then
+			H.active = nil
+			ctx.close_run("frames")
+		end
 	end
 
 	-- 录制中的每帧（帧行写完之后）

@@ -570,3 +570,155 @@ def test_session_allow_console(tmp_path):
     assert s2.forced_options == {'PauseOnFocusLost': '0'}
     with pytest.raises(ValueError):
         rr.Session('con3', tmp_path, copy_root=tmp_path / 'copy', allow_console=True, use_dll=False)
+
+
+def _meta_run(tmp_path, name, meta, continued=False, n_frames=3, end=None):
+    """_mt_lines 的变体：header.meta 换成给定内容，只留前 n_frames 帧，可加 end 行。"""
+    lines = _mt_lines()
+    hdr = json.loads(lines[0])
+    hdr['meta'] = dict({'seeds': {'start_seed_string': 'ABCD EFGH'}}, **meta)
+    hdr['continued'] = continued
+    lines[0] = json.dumps(hdr, separators=(',', ':'))
+    out = lines[:2 + n_frames]
+    if end:
+        out.append(json.dumps(dict({'k': 'end', 'n': n_frames, 'frames': n_frames}, reason=end), separators=(',', ':')))
+    p = tmp_path / f'{name}.jsonl'
+    p.write_text('\n'.join(out) + '\n', encoding='utf-8')
+    return p
+
+
+def test_start_character_and_issues(tmp_path):
+    """phase11-human3：回放开局按录制的角色 `restart <玩家 0 角色>` 开预备局再 `seed`（表里 pre 字段）；续局没有 pre；
+    Jacob & Esau（19/20）不算多玩家；合作多玩家、贪婪、困难各有 issue（困难的 issue 说明沿用存档里的难度）。"""
+    p = _meta_run(tmp_path, 'aza', {'players': [{'type': 7}], 'difficulty': 1, 'challenge': 0})
+    run = load_run.Run(p)
+    assert replay_run.start_character(run) == 'restart 7'
+    t = replay_run.build_replay_table(run, tmp_path / 'irr_replay.lua')
+    assert t['pre'] == 'restart 7' and t['start'] == 'seed ABCD EFGH'
+    issues = replay_run.replayability(run)
+    assert any(s.startswith('难度 1') and '--init-save' in s for s in issues)
+    assert not any('角色' in s or '多玩家' in s for s in issues)
+    cont = load_run.Run(_meta_run(tmp_path, 'cont', {'players': [{'type': 7}]}, continued=True))
+    assert replay_run.start_character(cont) is None
+    assert replay_run.build_replay_table(cont, tmp_path / 'irr_replay2.lua')['pre'] is None
+    je = load_run.Run(_meta_run(tmp_path, 'je', {'players': [{'type': 19}, {'type': 20}]}))
+    assert replay_run.start_character(je) == 'restart 19'
+    assert not any('多玩家' in s for s in replay_run.replayability(je))
+    coop = load_run.Run(_meta_run(tmp_path, 'coop', {'players': [{'type': 0}, {'type': 7}], 'greed_mode': True}))
+    iss = replay_run.replayability(coop)
+    assert any('多玩家' in s for s in iss) and any('贪婪' in s for s in iss)
+    assert replay_run.start_character(load_run.Run(_meta_run(tmp_path, 'nometa', {}))) is None
+
+
+def test_start_target_and_name():
+    """回放局名预先算：已开局数 + 1，有 pre（预备局）再 + 1。"""
+    assert replay_run.start_target(1, None) == 2 and replay_run.start_target(1, 'restart 7') == 3
+    assert replay_run.start_target(None, None) == 1
+    assert replay_run.replay_run_name('p1-01', 3) == 'run-p1-01-0003'
+
+
+class _FakeGame:
+    """start_replay_run 用的假游戏进程：command 之后按脚本给出 status 序列（模拟极短回放局在轮询前就结束）。"""
+
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+        self.sent = []
+        self.cur = self.statuses.pop(0)
+
+    def status(self):
+        return self.cur
+
+    def command(self, **c):
+        self.sent.append(c)
+        return len(self.sent)
+
+    def wait_ack(self, cid, timeout=30):
+        return self.cur
+
+    def wait(self, pred, timeout, poll=0.1):
+        while True:
+            if self.cur is not None and pred(self.cur):
+                return self.cur
+            if not self.statuses:
+                raise TimeoutError(f'等待超时，最后状态 {self.cur!r}')
+            self.cur = self.statuses.pop(0)
+
+
+def test_start_replay_run_short_run_already_ended():
+    """phase11-human3 的 7 局：回放局（9 帧）在 Python 看到 in_game 之前就结束了（status：in_game False、run None、
+    runs 已 +1）。新逻辑按 runs 计数认出回放局（名字预先算好），不再超时重试；带 pre 时目标序号再 +1。"""
+    base = {'proc': 'p1-01', 'in_game': True, 'run': 'run-p1-01-0001', 'runs': 1}
+    g = _FakeGame([base, dict(base, in_game=False, run=None, runs=2)])
+    name, st = replay_run.start_replay_run(g, {'start': 'seed ABCD EFGH', 'pre': None}, 9)
+    assert name == 'run-p1-01-0002' and st['runs'] == 2
+    assert g.sent == [{'cmd': 'start', 'start': 'seed ABCD EFGH', 'replay': True, 'frames': 9}]
+    # 带 pre：预备局（runs=2）不算，等到 runs=3
+    g2 = _FakeGame([base, dict(base, run='run-p1-01-0002', runs=2), dict(base, in_game=True, run='run-p1-01-0003', runs=3)])
+    name2, st2 = replay_run.start_replay_run(g2, {'start': 'seed ABCD EFGH', 'pre': 'restart 7'}, 100)
+    assert name2 == 'run-p1-01-0003' and st2['in_game']
+    assert g2.sent[0]['pre'] == 'restart 7'
+    # 一直没开出来：照旧超时（外层换进程重试）
+    g3 = _FakeGame([base, dict(base)])
+    with pytest.raises(TimeoutError):
+        replay_run.start_replay_run(g3, {'start': 'seed ABCD EFGH', 'pre': None}, 9)
+
+
+def test_compare_zero_frame_record(tmp_path):
+    """录制 0 帧（按住 R 在第一次逻辑更新前重开，human3 run-0025/0031）：回放 0 帧（0.4.1）或 1 帧（0.4.0）且被帧上限截止
+    （frames）都算等长、exact（只比 MT reseed 与开局元数据）；回放 2 帧、或 1 帧但不是帧上限截止的，不相容。"""
+    meta = {'players': [{'type': 7}], 'difficulty': 1}
+    rec = _meta_run(tmp_path, 'rec0', meta, n_frames=0, end='exit')
+    for k in (0, 1):
+        c = replay_run.compare(rec, _meta_run(tmp_path, f'rep{k}', meta, n_frames=k, end='frames'))
+        assert c['zero_frame_record'] and c['compared'] == 0 and c['same_length'] and c['end_compatible'] and c['exact'], k
+    c2 = replay_run.compare(rec, _meta_run(tmp_path, 'rep2', meta, n_frames=2, end='frames'))
+    assert not c2['same_length'] and not c2['exact']
+    cd = replay_run.compare(rec, _meta_run(tmp_path, 'repd', meta, n_frames=1, end='death'))
+    assert not cd['exact']
+    # 角色不同（回放开成了 Isaac）：没有帧可比也判不精确
+    ci = replay_run.compare(rec, _meta_run(tmp_path, 'repi', {'players': [{'type': 0}], 'difficulty': 1}, n_frames=0, end='frames'))
+    assert not ci['start_meta_match'] and not ci['exact']
+    assert ci['start_meta']['record']['players'] == [7] and ci['start_meta']['replay']['players'] == [0]
+
+
+def test_custom_run_flag(tmp_path):
+    """phase11-human3：录制是自然局（is_custom_run = false）时回放表写 custom_run = false（回放局在楼层生成前清标记）；
+    自定义种子局写 true；续局 / 没有字段时不写。compare 的 start_meta 带 is_custom_run，不同则不 exact。"""
+    def seeds(v):
+        return {'seeds': {'start_seed_string': 'ABCD EFGH', 'is_custom_run': v}, 'players': [{'type': 7}]}
+    for v in (False, True):
+        run = load_run.Run(_meta_run(tmp_path, f'c{int(v)}', seeds(v)))
+        out = tmp_path / f'irr_replay-c{int(v)}.lua'
+        t = replay_run.build_replay_table(run, out)
+        assert t['custom_run'] is v and replay_run.record_custom_run(run) is v
+        assert f'custom_run = {"true" if v else "false"},' in out.read_text(encoding='utf-8')
+    cont = load_run.Run(_meta_run(tmp_path, 'cc', seeds(False), continued=True))
+    out = tmp_path / 'irr_replay-cc.lua'
+    assert replay_run.build_replay_table(cont, out)['custom_run'] is None
+    assert 'custom_run =' not in out.read_text(encoding='utf-8')
+    rec = _meta_run(tmp_path, 'rec-nat', seeds(False), n_frames=3, end='exit')
+    c = replay_run.compare(rec, _meta_run(tmp_path, 'rep-cust', seeds(True), n_frames=3, end='frames'))
+    assert not c['start_meta_match'] and not c['exact'] and c['start_meta']['replay']['is_custom_run'] is True
+    assert replay_run.compare(rec, _meta_run(tmp_path, 'rep-nat', seeds(False), n_frames=3, end='frames'))['exact']
+
+
+def test_inject_restart_extras(tmp_path):
+    """phase11-human3：按住 R 重开的局，录制最后一帧的更新里重开已经触发；回放默认注入 ACTION_RESTART（16）的全局查询
+    （extra），其它 extra（地图键 13 等）不注入；inject_restart=False 时不注入；inject_extras=True 时全部注入。"""
+    lines = _mt_lines()
+    for i, extra in ((2, [[0, 16, -1, 1], [0, 13, -1, 1]]), (3, [[0, 13, -1, 1]])):
+        f = json.loads(lines[i])
+        f['tk'] = [['i1', [], extra], 'u']
+        lines[i] = json.dumps(f, separators=(',', ':'), ensure_ascii=False)
+    p = tmp_path / 'run-r.jsonl'
+    p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    run = load_run.Run(p)
+    out = tmp_path / 'irr_replay.lua'
+    t = replay_run.build_replay_table(run, out)
+    text = out.read_text(encoding='utf-8')
+    assert t['inject_restart'] and t['extra_ticks'] == 1
+    assert 'extras = {' in text and '[1]={["i1"]={{0,16,-1,1}}},' in text and '13,-1' not in text
+    t0 = replay_run.build_replay_table(run, out, inject_restart=False)
+    assert t0['extra_ticks'] == 0 and 'extras = {' not in out.read_text(encoding='utf-8')
+    ta = replay_run.build_replay_table(run, out, inject_extras=True)
+    assert ta['extra_ticks'] == 2 and '{0,13,-1,1}' in out.read_text(encoding='utf-8')

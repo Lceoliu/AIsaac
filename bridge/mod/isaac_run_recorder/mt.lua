@@ -102,6 +102,18 @@ function M.console_init()
 	return true
 end
 
+-- phase11-human3：写 Seeds 的"自定义种子局"标记（rr_mt.dll 的 RRMT_SetCustomRun；回放自然局的录制时把 `seed` 命令
+-- 开出的局改回自然局）。返回 ok(1/0), 旧值, 说明；旧 DLL 没有这个导出时 ok = 0
+function M.set_custom_run(seeds, start_seed, value)
+	if not M.dll or not package or not package.loadlib then return 0, -1, "no_dll" end
+	if M.setcr == nil then
+		local ok, f = pcall(package.loadlib, M.dll, "RRMT_SetCustomRun")
+		M.setcr = (ok and f) or false
+	end
+	if not M.setcr then return 0, -1, "dll has no RRMT_SetCustomRun (old build)" end
+	return M.setcr(seeds, start_seed, value)
+end
+
 -- 每局随机的 32 位 salt（非 0）
 function M.new_salt()
 	M.counter = M.counter + 1

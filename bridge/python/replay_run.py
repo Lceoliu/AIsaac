@@ -87,6 +87,7 @@ def mt_salts(header):
 # 所以暂停 MENU_CLOSE_AFTER 个渲染后 mod 写 pausectl.txt 请求，本进程发一次真实 Esc；解除暂停后的 tick 按"相对解除暂停"对齐。
 MENU_OPEN_ACTIONS = (15, 12)   # MENUBACK（Esc）、PAUSE
 MENU_CLOSE_AFTER = 10          # 回放开菜单后过多少个渲染请求 Esc
+ACTION_RESTART = 16            # ButtonAction.ACTION_RESTART（R 键重开）：默认注入它的全局查询（build_replay_table inject_restart）
 MENU_CLOSE_RETRY_S = 1.5       # 发了 Esc 仍在暂停时多久重发
 
 
@@ -307,8 +308,38 @@ def console_commands(run: load_run.Run):
     return out
 
 
+def start_character(run: load_run.Run):
+    """回放开局的角色（phase11-human3）：非续局时返回预备命令 `restart <录制的玩家 0 角色>`（harness start 的 pre），
+    `seed` 命令沿用当前局的角色与难度，所以先用 restart 换成录制的角色、再 seed。续局 / 录制没有玩家信息时返回 None。
+    Jacob & Esau（19/20）：restart 19 开出的就是两人；其它多玩家（合作）不支持，见 replayability 的 issue。"""
+    h = run.header
+    if h.get('continued'):
+        return None
+    players = (h.get('meta') or {}).get('players') or []
+    if not players or players[0].get('type') is None:
+        return None
+    return f'restart {int(players[0]["type"])}'
+
+
+def record_custom_run(run: load_run.Run):
+    """录制是否自定义种子局（header.meta.seeds.is_custom_run）；续局 / 没有这个字段时 None（回放不动标记）。"""
+    h = run.header
+    if h.get('continued'):
+        return None
+    v = ((h.get('meta') or {}).get('seeds') or {}).get('is_custom_run')
+    return None if v is None else bool(v)
+
+
+def start_meta(header):
+    """开局元数据里与回放开局有关的部分：难度、挑战、贪婪、各玩家角色、是否自定义种子局（compare 对照录制/回放用）。"""
+    m = (header or {}).get('meta') or {}
+    return dict(difficulty=m.get('difficulty'), challenge=m.get('challenge'), greed_mode=m.get('greed_mode'),
+                players=[p.get('type') for p in m.get('players') or []],
+                is_custom_run=((m.get('seeds') or {}).get('is_custom_run')))
+
+
 def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_engine_pauses=True, inject_extras=False,
-                       mouse=True, api=None):
+                       mouse=True, api=None, inject_restart=True):
     """mouse：把录制的鼠标流写进回放表（mod 经 rr_mt.dll 的 RRMT_SetMouse 还原给引擎，phase8-mouse）。
     api：回放时禁用、由 replay.lua 代为调用的 mod 目录名（api_mods(run)）；None/空 = 回放表没有 api 段。"""
     h = run.header
@@ -319,6 +350,11 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
              f'source = {lua_value(str(run.path))},']
     if salts:
         lines.append('mt = {' + ','.join(f'{k} = {int(v)}' for k, v in sorted(salts.items())) + '},')
+    custom = record_custom_run(run)
+    if custom is not None:
+        # phase11-human3：录制是不是自定义种子局；false 时回放局（`seed` 命令开出，引擎记为自定义种子局）在楼层生成前
+        # 经 rr_mt.dll 把标记清掉（replay.lua R.fix_custom_run；自定义种子局商店不刷捐款机）
+        lines.append(f'custom_run = {lua_value(custom)},')
     start_players = continue_start_players(run)
     if start_players:
         # 续局：引擎给玩家选出生位置用的是 reseed 之前的随机数（phase7-continue/REPORT），回放在续局的
@@ -334,10 +370,16 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
     for n in range(1, run.frames + 1):
         o = json.loads(run.lines[run.frame_line[n]])
         per = []
-        if inject_extras:
-            for e in o['tk']:
-                if isinstance(e, list) and len(e) > 2 and e[2]:
+        for e in o['tk']:
+            if isinstance(e, list) and len(e) > 2 and e[2]:
+                if inject_extras:
                     extras.setdefault(n, {}).setdefault(e[0], []).extend(e[2])
+                elif inject_restart:
+                    # phase11-human3：按住 R 重开（ACTION_RESTART 的全局查询）也注入，录制最后一帧（重开在这一帧的更新里
+                    # 触发）才能复现；其它 extra（地图键、菜单键…）仍不注入
+                    rs = [x for x in e[2] if x[1] == ACTION_RESTART]
+                    if rs:
+                        extras.setdefault(n, {}).setdefault(e[0], []).extend(rs)
         for e in o['tk']:
             if isinstance(e, list) and e[1]:
                 pl = []
@@ -372,7 +414,7 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
     for n, lst in sorted(cmds.items()):
         lines.append(f'[{n}]={{' + ','.join(lua_value(c) for c in lst) + '},')
     lines.append('},')
-    if inject_extras:
+    if extras:
         lines.append('extras = {')
         for n, per in sorted(extras.items()):
             lines.append(f'[{n}]={{' + ','.join(f'["{k}"]={{' + ','.join(
@@ -418,11 +460,12 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
         lines.extend(al)
     lines.append('}')
     Path(path_out).write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    return dict(start=start, frames=run.frames, tick_changes=n_tick_changes, spawns=len(spawns),
+    return dict(start=start, pre=start_character(run), custom_run=custom, frames=run.frames, tick_changes=n_tick_changes, spawns=len(spawns),
                 cmds={str(k): v for k, v in cmds.items()}, mt_salts=salts, continued=bool(h.get('continued')),
                 start_players=[dict(num=num, x=x100 / 100, y=y100 / 100) for num, x100, y100 in start_players],
                 inject_pauses=inject_pauses, menu_pauses=plans, engine_pauses=len(skipped), engine_pauses_aligned=len(engine),
-                inject_extras=inject_extras, extra_ticks=sum(len(v) for v in extras.values()), **mouse_info, **api_info)
+                inject_extras=inject_extras, inject_restart=inject_restart and not inject_extras,
+                extra_ticks=sum(len(v) for v in extras.values()), **mouse_info, **api_info)
 
 
 def replayability(run: load_run.Run, continue_save=None):
@@ -434,11 +477,17 @@ def replayability(run: load_run.Run, continue_save=None):
     if not (h.get('mt') or {}).get('available'):
         issues.append('录制没有全局 MT reseed（-NoDll 或 DLL 不可用）：回放只能近似，不期望 0 分歧')
     if m.get('difficulty') not in (0, None):
-        issues.append(f'难度 {m.get("difficulty")}：回放开局只实现了 `seed` 命令（普通难度）')
+        # phase11-human3：难度没有控制台命令可选；`restart`/`seed` 沿用当前局的难度，菜单开出的第一局用存档里记住的上次选择，
+        # 所以 --init-save 给录制会话的存档快照时与录制相同（README §8.8）；回放后 compare 的 start_meta 核对
+        issues.append(f'难度 {m.get("difficulty")}：不能用命令指定，回放沿用副本存档（--init-save）里上次选的难度；'
+                      'compare 的 start_meta_match 核对')
     if m.get('challenge') not in (0, None):
         issues.append(f'挑战 {m.get("challenge")}：未实现')
-    if any(p.get('type') != 0 for p in m.get('players', [])):
-        issues.append('角色不是 Isaac：`seed` 命令沿用当前角色，未实现角色切换')
+    if m.get('greed_mode'):
+        issues.append('贪婪模式：未实现（回放开局沿用存档里上次的模式）')
+    types = [p.get('type') for p in m.get('players', [])]
+    if len(types) > 1 and sorted(types) != [19, 20]:
+        issues.append(f'多玩家 {types}：回放开局只按玩家 0 的角色 `restart`，合作玩家未实现')
     if (m.get('options') or {}).get('MouseControl'):
         issues.append('MouseControl 开启：鼠标射击绕过 MC_INPUT_ACTION，无法注入')
     cons = console_commands(run)
@@ -518,12 +567,24 @@ def explain(fa, fb, layer):
     return ex
 
 
+def zero_frame_compatible(rec_frames, rep_frames, rep_end):
+    """录制 0 帧的局（按住 R 在第一次逻辑更新之前就重开，human3 run-0025/0031）：0.4.1 起回放也是 0 帧（harness 帧上限 0
+    当场关局）；0.4.0 的回放会多跑 1 帧才被帧上限截止。两种都算与录制等长（没有可比的帧，只比 header 的 MT reseed）。"""
+    return rec_frames == 0 and rep_frames <= 1 and rep_end == 'frames'
+
+
 def compare(rec_path, rep_path):
     A, B = load_run.Run(rec_path), load_run.Run(rep_path)
-    n = min(A.frames, B.frames)
+    zero = zero_frame_compatible(A.frames, B.frames, (B.end or {}).get('reason'))
+    n = 0 if zero else min(A.frames, B.frames)
     res = dict(record=str(rec_path), replay=str(rep_path), record_frames=A.frames, replay_frames=B.frames, compared=n,
                record_end=(A.end or {}).get('reason'), replay_end=(B.end or {}).get('reason'),
                replay_pins=(B.end or {}).get('replay'))
+    # 开局元数据（角色、难度…）：回放开局选错角色/难度时第 1 帧就分歧，这里直接给出原因
+    sa, sb = start_meta(A.header), start_meta(B.header)
+    res['start_meta'] = dict(record=sa, replay=sb)
+    res['start_meta_match'] = sa == sb
+    res['zero_frame_record'] = A.frames == 0
     firsts = {k: None for k in LAYERS}
     counts = {k: 0 for k in LAYERS}
     mt_first, mt_count, mt_missing = None, 0, 0
@@ -577,7 +638,7 @@ def compare(rec_path, rep_path):
     res['first_tick_mismatch'] = tick_diff
     res['first_dead_frame'] = death  # 玩家 0 的 dead 字段第一次为真的帧（比较范围内）
     res['same_death_frame'] = death['record'] is not None and death['record'] == death['replay']
-    same_len = A.frames == B.frames
+    same_len = A.frames == B.frames or zero
     res['same_length'] = same_len
     res['same_end'] = same_len and res['record_end'] == res['replay_end']
     res['player_room_identical_whole_run'] = firsts['player_room'] is None and same_len
@@ -591,8 +652,9 @@ def compare(rec_path, rep_path):
                                                 and (res['record_end'] in ('exit', 'exit_save', 'restart', 'frames', 'stop')
                                                      or res['record_truncated']))
     # E6：三层 + MT 全部 0 分歧、同长度、结束方式相容、MT 每帧都有、reseed 记录一致
+    # phase11：开局元数据（角色/难度/挑战/贪婪）也要相同（0 帧局没有帧可比，角色选错也查得出来）
     res['exact'] = (all(firsts[k] is None for k in LAYERS) and mt_first is None and mt_missing == 0 and same_len
-                    and res['end_compatible'] and res['mt']['reseeds_match'] is True)
+                    and res['end_compatible'] and res['mt']['reseeds_match'] is True and res['start_meta_match'])
     res['pause_report'] = pause_report(A, B, firsts, mt_first)
     res['api'] = api_report(A, B)
     return res
@@ -726,9 +788,43 @@ def restore_disabled_mods(copy: rr.GameCopy, placed, keep_dir):
     return out
 
 
+def replay_run_name(proc, index):
+    """mod 给第 index 个开出的局起的名字（main.lua open_run：run-<proc>-<NNNN>）。"""
+    return f'run-{proc}-{int(index):04d}'
+
+
+def start_target(runs0, pre):
+    """回放局在本进程里的序号：已开局数 + 1；有 pre（restart <角色>）时预备局再占一个序号。"""
+    return int(runs0 or 0) + (2 if pre else 1)
+
+
+def start_replay_run(g, table, limit_frames, timeout=30):
+    """发 harness start（table['pre'] 非空时先 restart <角色> 开预备局，再 seed），等回放局开出来；返回 (回放局名, 状态)。
+    回放局名预先算好（start_target）；等待条件是 status.runs 到了这个序号——即回放局已经开过，不要求还在局里：
+    极短的局（录制 2–9 帧，turbo 下几十毫秒就跑完回到"没有局"的状态）在 Python 轮询到 in_game 之前就结束了
+    （phase11-human3 第一轮 7 局因此误判为没开出来、重试 6 次），这种情况直接进入收尾。"""
+    s0 = None
+    for _ in range(50):
+        s0 = g.status()
+        if s0 is not None:
+            break
+        time.sleep(0.02)
+    if s0 is None:
+        raise TimeoutError('读不到 status.json')
+    target = start_target(s0.get('runs'), table.get('pre'))
+    cmd = dict(cmd='start', start=table['start'], replay=True, frames=limit_frames)
+    if table.get('pre'):
+        cmd['pre'] = table['pre']
+    cid = g.command(**cmd)
+    g.wait_ack(cid, timeout)
+    st = g.wait(lambda st: int(st.get('runs') or 0) >= target, timeout)
+    return replay_run_name(st.get('proc') or s0.get('proc'), target), st
+
+
 def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=True, continue_save=None,
                copy_root=rr.DEFAULT_COPY, turbo=None, init_save=None, forced_options=None, inject_pauses=True,
-               align_engine_pauses=True, inject_extras=False, mouse=True, affinity='auto', disable_mods='auto'):
+               align_engine_pauses=True, inject_extras=False, mouse=True, affinity='auto', disable_mods='auto',
+               inject_restart=True):
     """mouse：还原录制的鼠标流（phase8-mouse；需要带 RRMT_SetMouse 的 rr_mt.dll，进程环境 RR_MT_MOUSE=1）。
     affinity：回放进程的 CPU 亲和（默认 'auto' = 一个核；'0' = 不限制；见 affinity_mask），只在带 DLL 时生效。
     continue_save：续局回放用的存档快照目录（含 gamestate1.dat），拷进本会话的存档目录后菜单 Enter 续局。
@@ -781,7 +877,7 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
         # 放在 try 里：建表失败也要走 finish()（还原 options.ini、停监视线程、写 session.json）
         table = build_replay_table(run, sess.irr_dir / 'irr_replay.lua', inject_pauses=inject_pauses,
                                    align_engine_pauses=align_engine_pauses, inject_extras=inject_extras,
-                                   mouse=mouse, api=api_set)
+                                   mouse=mouse, api=api_set, inject_restart=inject_restart)
         info['table'] = table
         # 进菜单之后、回放局开出来之前进程崩溃（例如 0xC0000409）或超时：同样算一次启动失败，换新进程重试并计数
         info['start_failures'] = []
@@ -791,12 +887,8 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
                 rep_run = s.get('run')
                 break
             try:
-                menu_run = s.get('run')
                 time.sleep(1.0)
-                cid = g.command(cmd='start', start=table['start'], replay=True, frames=limit_frames)
-                g.wait_ack(cid, 30)
-                g.wait(lambda st: st.get('run') not in (None, menu_run) and st.get('in_game'), 30)
-                rep_run = (g.status() or {}).get('run')
+                rep_run, _st = start_replay_run(g, table, limit_frames)
                 break
             except (rr.LaunchFailed, TimeoutError) as e:
                 info['start_failures'].append(dict(pid=g.pid, error=repr(e)))
@@ -1157,12 +1249,8 @@ def run_watch(rec_path, name, out_root, copy_root=rr.DEFAULT_COPY, init_save=Non
             for a in range(attempts):
                 g, s0 = sess.launch_and_enter(attempts=attempts)
                 try:
-                    menu_run = s0.get('run')
                     time.sleep(1.0)
-                    cid = g.command(cmd='start', start=table['start'], replay=True, frames=limit_frames)
-                    g.wait_ack(cid, 30)
-                    g.wait(lambda st: st.get('run') not in (None, menu_run) and st.get('in_game'), 30)
-                    rep_run = (g.status() or {}).get('run')
+                    rep_run, _st = start_replay_run(g, table, limit_frames)
                     break
                 except (rr.LaunchFailed, TimeoutError) as e:
                     launch.setdefault('start_failures', []).append(dict(pid=g.pid, error=repr(e)))
@@ -1251,16 +1339,12 @@ def run_watch(rec_path, name, out_root, copy_root=rr.DEFAULT_COPY, init_save=Non
                             # 进程内倒带：同一进程再发一次 start（seed 命令），等新的回放局开出来
                             nreq = len(list(sess.irr_dir.glob('watchreq-done-*.txt'))) + 1
                             wr.replace(sess.irr_dir / f'watchreq-done-{nreq:03d}.txt')
-                            old = rep_run
-                            cid = g.command(cmd='start', start=table['start'], replay=True, frames=limit_frames)
                             try:
-                                g.wait_ack(cid, 30)
-                                g.wait(lambda s_: s_.get('run') not in (None, old) and s_.get('in_game'), 30)
+                                rep_run, _st = start_replay_run(g, table, limit_frames)
                             except (rr.LaunchFailed, TimeoutError) as e:
                                 info['error'] = f'进程内倒带没能开出新回放局：{e!r}'
                                 ended = 'inproc_rewind_failed'
                                 break
-                            rep_run = (g.status() or {}).get('run')
                             launch.setdefault('replay_runs', [launch['replay_run']]).append(rep_run)
                             pending_rewind['t_new_run_open'] = time.time()
                             if T <= 1:
@@ -1381,6 +1465,8 @@ def main(argv=None):
                     help='引擎自己的暂停（换房/弹窗/换层）解除后不做 tick 相对对齐（旧行为）')
     ap.add_argument('--inject-extras', action='store_true',
                     help='实验：把录制里非玩家 12 动作的非零输入查询（tick 的 extra：地图键、菜单左右/确认等）也按 (帧, tick) 注入')
+    ap.add_argument('--no-inject-restart', action='store_true',
+                    help='不注入录制里按住 R 重开（ACTION_RESTART）的全局查询（phase11 之前的行为；以重开结束的局最后一帧会分歧）')
     ap.add_argument('--affinity', default='auto',
                     help="回放进程的 CPU 亲和：auto（默认，一个核；多核时引擎特效偶发不确定）、0 = 不限制、或掩码如 0x8000")
     ap.add_argument('--no-mouse', action='store_true',
@@ -1436,7 +1522,7 @@ def main(argv=None):
                                 copy_root=a.copy, turbo=a.turbo, init_save=a.init_save,
                                 inject_pauses=not a.no_menu_pause, align_engine_pauses=not a.no_pause_align,
                                 inject_extras=a.inject_extras, mouse=not a.no_mouse, affinity=a.affinity,
-                                disable_mods=a.disable_mods)
+                                disable_mods=a.disable_mods, inject_restart=not a.no_inject_restart)
         res = dict(replay_session=str(sess.dir), info=info)
         if info.get('replay_file'):
             res['compare'] = compare(a.run, info['replay_file'])

@@ -435,6 +435,31 @@ function M.load(path)
 		end
 	end
 
+	-- phase11-human3：回放局由 `seed` 命令开出，引擎把它当"自定义种子局"（Seeds:IsCustomRun() = true；这种局商店不刷
+	-- 捐款机 6.8 等，human3 run-0001 第 2212 帧起分歧）。录制是自然局（回放表 custom_run = false）时，main.lua 在回放局的
+	-- 第一个 MC_POST_PLAYER_INIT（gf = 0，楼层生成之前）调这里，经 rr_mt.dll 把标记清 0。结果进 end.replay.custom_run
+	R.custom = nil
+	function R.fix_custom_run(mt)
+		if tbl.custom_run ~= false then return end
+		local seeds = Game():GetSeeds()
+		local st = {before = seeds:IsCustomRun(), ok = false}
+		if st.before then
+			local ok, w, old, how = pcall(mt.set_custom_run, seeds, seeds:GetStartSeed(), 0)
+			st.ok = ok and w == 1
+			st.how = ok and tostring(how) or tostring(w)
+		end
+		st.after = seeds:IsCustomRun()
+		R.custom = st
+	end
+	local function custom_json()
+		local c = R.custom
+		if not c then return "" end
+		local now = nil
+		pcall(function() now = Game():GetSeeds():IsCustomRun() end)
+		return ',"custom_run":{"before":' .. tostring(c.before) .. ',"ok":' .. tostring(c.ok) .. ',"after":' .. tostring(c.after)
+			.. ',"at_end":' .. tostring(now) .. ',"how":"' .. tostring(c.how or ""):gsub('[%c"\\]', "?") .. '"}'
+	end
+
 	local function api_stats_json()
 		local s = R.api_stats
 		return '{"executed":' .. s.executed .. ',"late":' .. s.late .. ',"failed":' .. s.failed .. ',"skipped":' .. s.skipped
@@ -447,6 +472,7 @@ function M.load(path)
 			.. ',"pause_unpauses":' .. R.pause_unpauses .. ',"engine_pauses":' .. R.engine_pauses
 			.. ',"start_pos_pinned":' .. R.start_pos_pinned .. ',"start_pos_moved":' .. R.start_pos_moved
 			.. (R.extras_injected and (',"extras_injected":' .. R.extras_injected) or '')
+			.. custom_json()
 			.. ',"mouse":{"available":' .. tostring(R.mouse_stats.available) .. ',"reason":"' .. tostring(R.mouse_stats.reason):gsub('[%c"\\]', "?")
 			.. '","init":' .. R.mouse_stats.init .. ',"applied":' .. R.mouse_stats.applied .. ',"folded":' .. R.mouse_stats.folded
 			.. ',"failed":' .. R.mouse_stats.failed .. '}'
@@ -456,6 +482,7 @@ function M.load(path)
 	end
 
 	function R.cmds_at(n) return tbl.cmds and tbl.cmds[n] end
+
 
 	-- 诊断输出（main.lua 在回放局结束时写 irr_pinlog.json）：{"stat":{"t.v.s":[钉回, 相同, 表里没有]}, "log":[...]}
 	function R.pinlog_json()

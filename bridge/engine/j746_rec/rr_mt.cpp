@@ -442,6 +442,61 @@ extern "C" __declspec(dllexport) int RRMT_State(void* L) {
   return 3;
 }
 
+// ---- phase11-human3：自定义种子局标记。`seed` 命令开出的局 Seeds::_isCustomRun = 1（自然局为 0）；引擎在这种局里不刷
+// 捐款机（6.8）等，回放自然局的录制时从商店起分歧。Lua 没有能清掉它的方法（ClearStartSeed 只把种子清 0），所以这里直接写：
+// Seeds 布局（REPENTOGON libzhl Seeds.zhl；AB+ Seeds::IsCustomRun 同为 `return *(bool*)this`）：+0 bool _isCustomRun，
+// +4 uint32 _gameStartSeed。Seeds* 从 Lua 的 Seeds 用户数据里取（LuaBridge 式块：[vtable][Seeds*] 或 [Seeds*]），
+// 身份门：候选指针所指内存可读、+4 处等于 Lua 传入的 GetStartSeed()、+0 处是 0/1，才写。
+// Lua: ok, old, how = RRMT_SetCustomRun(seeds_userdata, start_seed, value)   （ok = 1 写了；0 = 没通过门，how 说明）
+namespace {
+bool readable(const void* p, std::size_t n) {
+  MEMORY_BASIC_INFORMATION mbi;
+  if (!p || VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+  if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+  const DWORD rw = PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+  if (!(mbi.Protect & rw)) return false;
+  const auto end = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+  return reinterpret_cast<std::uintptr_t>(p) + n <= end;
+}
+}  // namespace
+
+extern "C" __declspec(dllexport) int RRMT_SetCustomRun(void* L) {
+  if (!loadLua()) return 0;
+  static void*(__cdecl* touserdata)(void*, int) = nullptr;
+  if (!touserdata) {
+    HMODULE api = GetModuleHandleA("Lua5.3.3r.dll");
+    if (api) touserdata = reinterpret_cast<void*(__cdecl*)(void*, int)>(GetProcAddress(api, "lua_touserdata"));
+  }
+  auto fail = [&](const char* how) {
+    logf("RRMT_SetCustomRun: %s", how);
+    gLua.pushinteger(L, 0);
+    gLua.pushinteger(L, -1);
+    gLua.pushlstring(L, how, std::strlen(how));
+    return 3;
+  };
+  if (!touserdata) return fail("no lua_touserdata");
+  const auto seed = static_cast<std::uint32_t>(gLua.checkinteger(L, 2));
+  const auto value = static_cast<std::uint8_t>(gLua.checkinteger(L, 3) != 0 ? 1 : 0);
+  auto* ud = static_cast<std::uint8_t*>(touserdata(L, 1));
+  if (!ud || !readable(ud, 8)) return fail("userdata not readable");
+  for (int off = 0; off <= 4; off += 4) {
+    auto* p = *reinterpret_cast<std::uint8_t**>(ud + off);
+    if (!readable(p, 8)) continue;
+    const std::uint32_t s = *reinterpret_cast<std::uint32_t*>(p + 4);
+    const std::uint8_t old = *p;
+    if (s != seed || old > 1) continue;
+    *p = value;
+    logf("RRMT_SetCustomRun: Seeds*=%p (userdata+%d) start_seed=%u custom %u -> %u", static_cast<void*>(p), off, s, old, value);
+    gLua.pushinteger(L, 1);
+    gLua.pushinteger(L, old);
+    char how[32];
+    std::snprintf(how, sizeof(how), "userdata+%d", off);
+    gLua.pushlstring(L, how, std::strlen(how));
+    return 3;
+  }
+  return fail("identity gate failed (start seed not found at Seeds+4)");
+}
+
 // Lua: n = RRMT_UnstableReads()   （进程启动以来两份拷贝不一致的次数）
 extern "C" __declspec(dllexport) int RRMT_UnstableReads(void* L) {
   if (!loadLua()) return 0;

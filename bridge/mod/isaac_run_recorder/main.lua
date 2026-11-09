@@ -7,7 +7,7 @@
 -- 每局一个文件 run-<proc>-<NNNN>.jsonl：MC_POST_GAME_STARTED 开、MC_PRE_GAME_EXIT / 死亡 / 下一局开始时关。
 -- 格式见 README.md。
 local mod = RegisterMod("Isaac Run Recorder", 1)
-local VERSION = "0.4.0"
+local VERSION = "0.4.1"
 local SCHEMA = "isaac-run-v1"
 local game = Game()
 local concat = table.concat
@@ -233,7 +233,7 @@ local function open_run(continued, mt_header)
 		',"meta":', ST.jval(meta),
 		',"api":', ST.jval(API.header()),
 		',"console":', ST.jval({hook = MT.console_ok == true, reason = MT.console_reason}),
-		',"harness":', hinfo and ST.jval({start = hinfo.start, bot = hinfo.bot, bot_seed = hinfo.bot_seed, frames = hinfo.frames,
+		',"harness":', hinfo and ST.jval({start = hinfo.start, pre = hinfo.pre, bot = hinfo.bot, bot_seed = hinfo.bot_seed, frames = hinfo.frames,
 			cmds = hinfo.cmds, replay = hinfo.replay}) or "null",
 		',"replay_of":', is_replay and ST.jstr(RP.tbl.source) or "null",
 		',"session":', (session and session:match("^%s*{") and session) or "null",
@@ -490,6 +490,12 @@ local EARLY_CONTINUE = getenv("IRR_MT_EARLY_CONTINUE") ~= "0"
 
 mod:AddCallback(ModCallbacks.MC_POST_PLAYER_INIT, guarded("player_init", function()
 	if H then diag("player_init", nil) end
+	-- phase11：回放局（录制是自然局）在楼层生成之前清掉"自定义种子局"标记（replay.lua R.fix_custom_run）
+	if H and RP and RP.fix_custom_run and not S.custom_fixed and game:GetFrameCount() == 0 and H.next_is_replay() then
+		S.custom_fixed = true
+		local okc, ec = pcall(RP.fix_custom_run, MT)
+		if not okc then fail("fix_custom_run", ec) end
+	end
 	if MT.early_done or not MT.available then return end
 	local gf = game:GetFrameCount()
 	local continuing = gf ~= 0 and R == nil
@@ -538,6 +544,7 @@ end
 
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, guarded("game_started", function(_, continued)
 	if H then diag("game_started", continued == true) end
+	S.custom_fixed = false
 	-- reseed 必须在本回调里任何其它工作之前
 	local okm, mth = pcall(mt_on_game_started, continued)
 	if not okm then fail("mt_reseed", mth); mth = nil end
@@ -554,6 +561,8 @@ mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, guarded("game_started", funct
 		local k = RP.apply_start_pos()
 		if H and k > 0 then diag("start_pos_pinned", k) end
 	end
+	-- 帧上限 0 的 harness 局（录制 0 帧的局的回放）：开局设置做完就关局（harness.lua 的 on_run_opened）
+	if R and H and H.on_run_opened then H.on_run_opened() end
 end))
 
 mod:AddCallback(ModCallbacks.MC_POST_GAME_END, guarded("game_end", function(_, over)

@@ -82,7 +82,7 @@ JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文�
 | `meta.options` | Lua `Options` 表能读到的键（J746 实测 24 个，含 `MouseControl`、`PauseOnFocusLost`）；完整 `options.ini` 见会话目录 |
 | `meta.lua_version` | `Lua 5.3` |
 | `session` | Python 写的 `irr_session.json` 原样（单行 JSON）：会话名、EXE sha256、三个二进制的 sha256、游戏版本行、mods 清单（含 `disable.it`）、强制的 options、启动命令、主机名、存档目录 |
-| `harness` | 测试局才有：开局命令、机器人、帧上限、脚本命令列表、是否回放；人类局为 `null` |
+| `harness` | 测试局才有：开局命令（`start`）、预备命令（`pre`，0.4.1：例如 `restart 7`，见 8.8）、机器人、帧上限、脚本命令列表、是否回放；人类局为 `null` |
 | `replay_of` | 回放局：被回放的录制文件路径 |
 | `fields` | 各种数组行的列名（见下），以及 `fixed_x100`（定点字段）、`entity_extra_types`（附加字段类别对应的实体类型） |
 | `prestart_spawns` | 本局 `MC_POST_GAME_STARTED` 之前（上一局结束之后）发生的生成 `[type, variant, subtype, seed, gf]`，最多 4096 条 |
@@ -204,6 +204,8 @@ python rl/bridge/python/load_run.py RUN.jsonl.zst --roundtrip         # round-tr
 
 每帧工作都在 `MC_POST_UPDATE` 里，字符串拼接后一次写入；`MC_INPUT_ACTION` 每次查询只做一次原生读取并存进当前 tick。网格只比已知格、每 15 帧全扫；道具清单只在道具数变化时全扫。实测数字见 ACCEPTANCE.md 第 2、3 项。
 
+开销与房间里的实体数（含 1000.x 特效）成正比（phase11-human3-replays/NOTES.md §4，`perf` 行每 150 帧对窗口内平均实体数做线性拟合）：v1 格式（0.2.0，human1）约 0.24 ms + 14 µs/实体；v2 格式（外观行，0.3.0 起）约 0.2–0.4 ms + 20–23 µs/实体，即 30 个实体约 0.9–1.1 ms/帧、70 个约 1.7–2.0 ms/帧。0.4.0 的 api.lua 包装（替换 Game/Level/EntityPlayer/SFXManager 实例元表的 `__index`）实测不可分辨：同一机器人种子开/关（`IRR_API=0`）的 `bench` 在开局房 41/42 个实体时 1.02 / 1.06 ms/帧。human3 比 human1 贵约 2.6 倍 = 实体多约 2.1 倍（Azazel 困难模式的局平均 42 个、后期 70+）× v2 外观约 1.5 倍。
+
 ## 8. 回放检查：`rl/bridge/python/replay_run.py`（回归测试）
 
 ```
@@ -211,7 +213,7 @@ python rl/bridge/python/replay_run.py RUN.jsonl.zst --name rep1 --report rep1.js
 python rl/bridge/python/replay_run.py RUN.jsonl.zst --continue-save SNAPSHOT_DIR   # 续局回放（快照含 gamestate1.dat）
 python rl/bridge/python/replay_run.py RUN_A --compare RUN_B          # 只比较两个文件
 ```
-新进程（默认带 DLL，存档在副本 `profile/`；`--no-dll` 不带）→ 进菜单 → harness 执行 `seed <录制种子>`（续局：把快照拷进存档目录，菜单 Enter 续上的第一局就是回放局）→ mod 在录制 `header.mt.reseeds` 的同一时机用**录制的 salt** reseed 全局 MT（录制里没有的时机不 reseed）、在 `MC_INPUT_ACTION` 按 (帧, tick) 注入录制的 12 个动作（全局查询不注入；唯一例外是真人菜单暂停帧的开菜单，见 8.2）、在 `MC_PRE_ENTITY_SPAWN` 按「(gf, type.variant.subtype, 帧内第几次)」钉回生成种子、在同帧重放 harness 脚本命令 → 回放局完整录下 → 逐帧**按数值**比对 MT `[cursor, hash]` 与 `dg` 三层，输出每层首个分歧帧、分歧帧数、首个分歧帧上解码后哪些字段不同、两边 `header.mt.reseeds` 是否逐项相同（`mt.reseeds_match`：时机、seeded_with、reseed 前后的 MT），以及回放局记录的有效输入是否与录制一致（`first_tick_mismatch`）。`exact = true` 表示三层 + MT 全部 0 分歧、MT 每帧都有、同长度、结束方式相容（`end_compatible`：相同；或录制由退出/重开结束、或录制截断（没有 `end` 行，进程被杀/崩溃；`record_truncated`、`record_partial_tail`，phase9-robust 起）、回放在同一帧数被帧上限截止）、reseed 记录一致。
+新进程（默认带 DLL，存档在副本 `profile/`；`--no-dll` 不带）→ 进菜单 → harness 执行 `restart <录制的角色>` 再 `seed <录制种子>`（8.8；续局：把快照拷进存档目录，菜单 Enter 续上的第一局就是回放局）→ mod 在录制 `header.mt.reseeds` 的同一时机用**录制的 salt** reseed 全局 MT（录制里没有的时机不 reseed）、在 `MC_INPUT_ACTION` 按 (帧, tick) 注入录制的 12 个动作（全局查询不注入；唯一例外是真人菜单暂停帧的开菜单，见 8.2）、在 `MC_PRE_ENTITY_SPAWN` 按「(gf, type.variant.subtype, 帧内第几次)」钉回生成种子、在同帧重放 harness 脚本命令 → 回放局完整录下 → 逐帧**按数值**比对 MT `[cursor, hash]` 与 `dg` 三层，输出每层首个分歧帧、分歧帧数、首个分歧帧上解码后哪些字段不同、两边 `header.mt.reseeds` 是否逐项相同（`mt.reseeds_match`：时机、seeded_with、reseed 前后的 MT），以及回放局记录的有效输入是否与录制一致（`first_tick_mismatch`）。`exact = true` 表示三层 + MT 全部 0 分歧、MT 每帧都有、同长度、结束方式相容（`end_compatible`：相同；或录制由退出/重开结束、或录制截断（没有 `end` 行，进程被杀/崩溃；`record_truncated`、`record_partial_tail`，phase9-robust 起）、回放在同一帧数被帧上限截止）、reseed 记录一致。
 
 **续局回放的出生位置**（phase7-continue，recorder 0.3.1）：续局时引擎在进开局房之后、`MC_POST_GAME_STARTED` 之前用全局 MT 抽 1 次随机数给玩家选出生位置（实测四个门口 (320,160)/(80,280)/(560,280)/(320,400) 之一），0.3.0 及以前的续局录制只在 `POST_GAME_STARTED` reseed，这次抽取来不及控制。所以 `replay_run.py` 对 `header.continued` 的录制在回放表里写 `start_players = {[num] = {x100=…, y100=…}}`（录制第 1 帧各玩家位置的定点原值，`continue_start_players()`），`replay.lua` 的 `R.apply_start_pos()` 在续局的 `MC_POST_GAME_STARTED`（reseed 与开局行之后、第一次更新之前）把玩家放到该位置、速度清零，计入 `end.replay.start_pos_pinned`（钉了几个玩家）/ `start_pos_moved`（其中原位置不同的个数）。非续局的回放表没有这个字段，行为不变。0.3.1 起的续局录制另在读档后第一个 `MC_POST_PLAYER_INIT` reseed（第 10 节），出生位置本身就由 salt 决定，钉回只是不改变位置的保险。
 
@@ -306,15 +308,26 @@ python rl/bridge/python/replay_run.py RUN.jsonl.zst --capture OUT.mp4 --copy exp
 - 实测：同帧解除的控制台暂停（在 i1 或 i2 打开）回放 `exact`（`giveitem`、`spawn`、`goto s.treasure`，加速与原速）；跨更新、在第 3 次渲染打开（i2）的 `spawn 10` exact；跨更新、在第 2 次渲染打开（i1）的两例从该帧起玩家浮点位在 0.01 以下不同，MT 不分歧（第 9 节）。
 - `repeat`/`macro` 这类依赖控制台历史的命令：回放经 `Isaac.ExecuteCommand` 执行时没有同一份历史，未测、不保证。
 
+### 8.8 回放开局：角色、难度、极短局（recorder 0.4.1，phase11-human3-replays）
+
+- **角色**：`seed <种子>` 沿用当前局的角色（和难度），菜单 Enter 开出的第一局是以撒，所以 0.4.0 及以前的回放把非以撒的录制都开成了以撒（human3：Azazel，第 1 帧就分歧）。现在回放表带 `pre = "restart <header.meta.players[0].type>"`（`replay_run.start_character`；续局没有），harness 的 `start` 命令带 `pre` 时：先执行 `pre` 开出一局"预备局"（普通局，有自己的 run 文件、不是 harness 局；`restart <id>` 换角色，种子随机或沿用），在预备局的第一次 `MC_POST_UPDATE` 再执行 `start`（`seed …`），之后开出的那一局才是 harness/回放局（header `harness.pre` 记下预备命令）。所以回放进程里依次是：菜单局（以撒）→ 预备局（录制的角色）→ 回放局。实测 `restart` 接受 0–40（含受污染角色：21 受污染以撒、40 The Soul（受污染遗骸的魂）），19 开出的是 Jacob & Esau 两个玩家；机器人录制的 Azazel（7，困难，死亡结束）、21、40、19&20、0 各一局回放 exact（phase11-human3-replays/NOTES.md §2）。
+- **难度**：没有控制台命令能选难度。实测 `restart <id>` 与 `seed` 都沿用当前局的难度；菜单开出的第一局用存档里记住的上次选择（同一副本：用 human3 存档快照 `--init-save` 时菜单局是困难，用 phase9 的存档快照时是普通）。所以非续局回放必须 `--init-save` 录制会话里该局的存档快照（`save/run-…`），难度才与录制相同。`compare` 输出 `start_meta`（录制/回放的难度、挑战、贪婪、各玩家角色）与 `start_meta_match`，后者进 `exact`。
+- **极短局**：0.4.0 的 `run_replay` 等"`status.run` 变成新局且 `in_game`"，加速回放里 2–9 帧的局在 Python 第一次轮询之前就跑完、回到"没有局"的状态，于是被当成没开出来、换进程重试 6 次（human3 第一轮 7 局报告为空）。现在回放局名预先算出（`start_target`：本进程已开局数 + 1，有 `pre` 再 + 1），等 `status.runs` 到这个序号即可，局已结束的直接进入收尾（`start_replay_run`；观战的两处开局同样改用它）。
+- **0 帧局**：录制 0 帧的局（按住 R 在第一次逻辑更新之前就重开，human3 run-0025/0031）：harness 帧上限为 0 时在开局 `MC_POST_GAME_STARTED` 的设置做完后当场关局（`H.on_run_opened`），回放也是 0 帧；`compare` 对"录制 0 帧 + 回放 ≤1 帧且被帧上限截止"判等长（`zero_frame_record`；0.4.0 的回放会多跑 1 帧），只比 MT reseed 与开局元数据。
+- **自定义种子局标记**：`seed` 命令开出的局引擎记为自定义种子局（`Seeds:IsCustomRun() = true`，header `meta.seeds.is_custom_run`），这种局商店不刷捐款机（6.8）。真人录制是自然局，所以 0.4.0 的回放从第一次进有捐款机的商店起分歧（human3 run-0001 第 2212 帧，之后第 6967 帧金币不同；MT 全程一致）。Lua 里清不掉这个标记（`Seeds:ClearStartSeed()` 只把种子清 0、标记仍为 true；`SetStartSeed` 在自然局里能设种子但楼层已生成，`restart` 又会换随机种子——phase11 探针 seedprobe1–3）。现在回放表带 `custom_run = false/true`（录制的值；续局不写），录制是自然局时 main.lua 在回放局第一个 `MC_POST_PLAYER_INIT`（gf = 0，楼层生成之前——探针实测此时 `GetRooms().Size = 0`）调 `replay.lua` 的 `R.fix_custom_run`，经 `rr_mt.dll` 的 `RRMT_SetCustomRun(seeds, start_seed, 0)` 把 `Seeds+0`（`_isCustomRun`，REPENTOGON libzhl Seeds.zhl 的布局；AB+ 的 `Seeds::IsCustomRun` 同为 `return *(bool*)this`）写成 0；Seeds 指针从 Lua 用户数据块取（实测在 +4），身份门是 `Seeds+4 == GetStartSeed()` 且 `+0` 为 0/1。结果写进 `end.replay.custom_run`（before/ok/after/at_end/how）。`start_meta` 带 `is_custom_run`，录制与回放不同则不 `exact`。没有这个导出的旧 DLL：`ok=false`、回放照旧（自定义种子局）。
+- **按住 R 重开**：真人按住 R 重开的局，录制最后一帧的更新里重开已经触发（tick 里有 `[0,16,-1,1]` 这种 ACTION_RESTART 的全局查询），回放不按 R，最后一帧的特效与 MT 不同（human3 run 2–12、14–22 全部只在最后一帧分歧）。现在回放表默认把录制里 ACTION_RESTART（16）的全局查询放进 `extras` 注入（`inject_restart`，`--no-inject-restart` 关；其它 extra 仍只在 `--inject-extras` 时注入）。GoodTrip 的 Tab+R（`Isaac.ExecuteCommand("restart")`，api 行）结束的局不受影响。
+- 未实现（`replayability` 报 issue）：合作多玩家（只按玩家 0 的角色 restart）、挑战、贪婪模式。
+
 ## 9. 已知局限
 
-- MT reseed 的时机（第一个 `POST_PLAYER_INIT` 先于开局房实体）只在单人以撒、普通难度、第 1 层开局上验证过（MT_PROBE §5.1、phase3 验收）；其他角色（Jacob&Esau、Lazarus、Tainted）、挑战、贪婪、困难模式：未测。续局早期 reseed 只在单人以撒、Basement II 续局存档上验证过（phase7-continue）。
+- MT reseed 的时机（第一个 `POST_PLAYER_INIT` 先于开局房实体）只在单人以撒、普通难度、第 1 层开局上验证过（MT_PROBE §5.1、phase3 验收）；phase11 起另有困难模式的 Azazel（真人 human3 34 局、机器人）以及机器人的受污染以撒、The Soul、Jacob&Esau 短局回放（8.8）；Lazarus、挑战、贪婪：未测。续局早期 reseed 只在单人以撒、Basement II 续局存档上验证过（phase7-continue）。
 - 续局真人录制 human2b 的加速回放（钉回出生位置后）从第 6911 帧起分歧：开局房起始位置、前 6910 帧的三层 digest、MT、全部玩家/实体行与外观行都一致，第 6911 帧一只 TINY_BUG 特效（1000.21）贴底墙时速度不同，第 6939 帧起 MT 随之分歧。5 次回放（加速 ×4，含注入 extra 输入；原速 ×1）结果完全相同，未查明录制进程里的哪个隐藏状态不同（phase7-continue/REPORT §3）。
   phase8-mouse（`experiments/run-recorder/phase8-mouse/FINDINGS.md`）逐一实测排除了鼠标（真实/PostMessage/DLL 还原录制的 ms 流，回放的 ms 与录制逐字相同仍在 6911 分歧）、窗口尺寸、焦点与 PauseOnFocusLost、Lua/引擎共用堆的布局、MXCSR/x87 控制字；并发现**引擎对 1000.x 环境特效（TINY_BUG、WISP、POOP_PARTICLE 等）本身偶发不确定**：同一条件的重复回放里，偶尔有一次在随机帧出现特效速度/位置不同（human2b 回放第 3400 帧 WISP、第 3686 帧 POOP_PARTICLE），另有只持续一帧、0.01 定点下看不出的 full 层 digest 毛刺（第 390、672、696、2220 帧等）。human2b 第 6911 帧与 human2 第 10599 帧的分歧是录制进程里发生的同类偶发事件，回放进程绝大多数时候不发生，所以看起来"稳定"。这类事件不由任何录制下来的输入决定，回放无法复现；它多数只影响外观特效（full 层），偶尔经特效的后续行为改变全局 MT 消耗而影响玩法（human2b 第 6939 帧）。
 - 内建控制台命令（`giveitem`、`spawn`、`debug`…）`MC_EXECUTE_CMD` 不触发：默认录制会话仍强制 `EnableDebugConsole=0`，会话结束把 `cmd_history.txt` 新增行写进 session（D8）；`--allow-console` 会话由 DLL 钩子逐条带帧号记录并回放（8.7 节）。已知不精确：控制台暂停跨过本帧更新且在第 2 次渲染（i1 轮询）打开时，回放（不暂停）比录制多一次更新前的 60 Hz 子步，玩家浮点位从该帧起在 0.01 以下不同（phase10 实测 2 例，MT 不分歧、几十帧后可能收敛也可能不收敛）；菜单暂停的复现办法（关菜单后固定还有 2 次轮询）对它不适用。`repeat`/`macro` 未测。
 - 第三方 mod（8.6 节）：只截获监视表里的方法；mod 若在加载时把方法存成局部变量（`local f = Game().ChangeRoom`）就绕过了包装；监视表外的改动（`Isaac.Spawn`、改实体属性、自己的 RNG 等）不记录，这类 mod 回放时必须照常加载（`--disable-mods` 不要列它）。被禁用的 mod 在回放里不画东西（只影响画面）。来源判定靠调用栈上的 `mods/<目录>/` 路径，找不到时 `src="?"`、不回放（`replayability` 报出）。GoodTrip 的鼠标点击小地图路径没有实测（键盘模式与鼠标模式调用的是同一个 `teleport_to_grid_index`，截获的是它的效果）。
 - 解锁/收集无法从 Lua 读（`Isaac.GetPersistentGameData` 不存在），只能靠存档快照。
-- 手柄模拟量、多人、Jacob&Esau 只做了格式支持，未实测。
+- 手柄模拟量、多人只做了格式支持，未实测；Jacob&Esau 只有机器人录制的 90 帧短局回放过（8.8）。
+- 回放开局（8.8）：难度只能靠 `--init-save` 的存档快照对上（没有命令可选）；合作多玩家、挑战、贪婪模式的开局未实现。自然局的回放靠 DLL 直接写 `Seeds._isCustomRun`（布局取自 REPENTOGON/AB+，J746 上由身份门 `Seeds+4 == StartSeed` 兜底，human3 全部局实测写成功）；它只在楼层生成之前写一次，自定义种子局对引擎其它地方的影响（成就、每日等）没有逐项核对。phase11 之前的自然局回放（human1 等）都是自定义种子局，没进过有捐款机的商店才 exact。
 - 网格新增/墙变门最多晚 15 帧记录；道具数与主动槽都不变的道具替换（例如 D4 重随）最多晚 300 帧（下一个关键帧）出现在 `items` 行。
 - 续局必崩的存档（例如在 `goto s.boss.1013` 调试房里小退留下的）：录制会话把"读档后开局前进程退出"当成启动失败，`launch_and_enter` 最多重试 6×6 次、每次留一个 minidump，最后 0 局结束，不会告诉玩家"这份存档续不了"。真人遇到时需要手动删除/换存档（phase10-scenarios）。
 - 强杀/崩溃丢失的不只是"最后 10 秒"：flush 只在进房、暂停、每 300 帧，一场在同一房间里打了 300 帧以内的 Boss 战可能整场连同 Boss 死亡都不在文件里（phase10-scenarios s2-k4：录下 420 帧，强杀在约 503 帧）。要缩小就改 `main.lua` 的 flush 周期（代价是 IO）。
@@ -327,6 +340,7 @@ python rl/bridge/python/replay_run.py RUN.jsonl.zst --capture OUT.mp4 --copy exp
 - `rr_mt.dll`：① 挂 `userenv!GetUserProfileDirectoryA`，返回环境变量 `RR_MT_PROFILE`（= `<副本>\profile`），存档因此落在副本内；② 导出 Lua C 函数 `RRMT_Seed(seed)`（调用引擎自己的 `GlobalMT_Seed`，RVA 0x2BA260）、`RRMT_State()`（只读 MT 的 [cursor, FNV-1a32(624 字 + cursor)]，不推进；状态拷两份一致才返回，第三个返回值是读的次数，不一致时把不同的字记进 DLL 日志 `unstable MT read`）、`RRMT_Info()`、`RRMT_UnstableReads()`（进程内两份不一致的次数，写进 `end.mt_unstable_reads`）；③ 建 `IsaacTurbo.<pid>` 控制块供注入器判断。身份门：PE 时间戳 0x624393F6、SizeOfImage 8540160、两处 MT 指令的立即数；**身份门只管 MT 导出**：不通过时存档重定向照常安装、游戏照常运行，`RRMT_Seed/RRMT_State` 不返回值（E7）。没有任何其它钩子。测试开关 `RR_MT_TEST_IDENTITY_FAIL=1` 假装身份门不通过。
 - `rr_mt.dll` 的鼠标导出（phase8-mouse，只给回放用）：环境变量 `RR_MT_MOUSE=1` 且 J746 身份门与 4 处代码签名（RVA 0x4014C6/0x4014F4 Lua `GetMousePosition` 读 GLFW 窗口 +0x48、0x499D6E/0x499DD1 `Manager::Update` 的光标闲置计数）通过时，`RRMT_SetMouse(x, y, buttons, mode)` 写 `[base+0x7A15D8]`（GLFW 主窗口）的 +0x48/+0x50（double 虚拟光标）与 +0x5C（按键 char[8]）；mode 1 同时改 Manager（`[base+0x7C768C]`）+0x1EA970/974 的"上次光标位置"使这次改动不触发闲置计数，mode 2 再把 +0x1EA978 的计数清 0；第一次调用时子类化窗口（+0x218 的 HWND）丢掉 `WM_MOUSEFIRST..WM_MOUSELAST`、`WM_MOUSELEAVE`。`RRMT_GetMouse()` 返回 x、y、按键、闲置计数、上次位置、丢掉的消息数、设置次数。录制会话不设 `RR_MT_MOUSE`，这两个函数不返回值，进程里没有子类化。环境变量 `RR_MT_AFFINITY=<掩码>`（十进制或 0x）时 DLL 初始化即把整个进程限制到这些 CPU（回放与带 DLL 的录制会话都默认设 0x1）。诊断导出 `RRMT_Fpu(mxcsr, x87cw)`（-1 = 不改；返回并记日志当前 MXCSR 与 x87 控制字），只在 phase8 的实验脚本里用。
 - `rr_mt.dll` 的控制台钩子（phase10，只在 `--allow-console` 录制会话）：环境变量 `RR_MT_CONSOLE=1` 且身份门与 3 处代码签名（RVA 0x258AB0 函数头 16 字节、0x258AEE `mov esi,ecx; mov edx,[esi+30h]; lea edi,[esi+1Ch]`、0x258BB5 `call 0x25E160`）通过时，MinHook 挂 `Console::SubmitInput`（thiscall + 1 个哑栈参数、`ret 4`，按 `__fastcall(this, edx, int)` 挂），把输入行（this+0x1C 的 MSVC std::string）排队；导出 `RRMT_ConsoleTake()`（line, 序号, 剩余数；空队列不返回值）、`RRMT_ConsoleInfo()`（on, submits, dropped）。DLL 日志 `console: hook installed …` / `console: submit #k "…"`；控制块状态文字带 `; CONSOLE`。
+- `rr_mt.dll` 的 `RRMT_SetCustomRun(seeds, start_seed, value)`（phase11，只给回放用，8.8）：从 Lua `Seeds` 用户数据块的 +0/+4 取候选 `Seeds*`，所指内存可写可读、`+4 == start_seed`、`+0` 为 0/1 时把 `+0`（`_isCustomRun`）写成 value，返回 (1, 旧值, "userdata+N")；否则返回 (0, -1, 原因)。DLL 日志 `RRMT_SetCustomRun: …`。无环境变量开关（只有回放表 `custom_run = false` 的回放局会调用）。
 - `rr_launch.exe --launch <dll> <exe> --luadebug`：以挂起方式建进程、注入、等控制块 Active 后才恢复主线程（存档钩子在游戏第一次查询用户目录前就绪），打印 `PASS launched pid=<pid>`；窗口不隐藏。
 - 构建：`python rl/bridge/engine/j746_rec/build.py`（zig 0.16 x86，MinHook 从 `third_party/minhook` 源码编译），产物在 `<副本>/rec/`（`rr_mt.dll`、`rr_launch.exe`、`build.json`），不进 git（`rl/.gitignore` 排除 `*.dll *.exe *.pdb *.lib`）。
 
