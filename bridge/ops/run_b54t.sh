@@ -15,7 +15,7 @@ if false; then
   (cd $ROOT/b54-probe && $PY probe_test.py > $R/b54-holder-probe.log 2>&1; echo "$(date +%T) holder probe rc=$? $(grep -E 'PROBE|iterations' $R/b54-holder-probe.log | tr '\n' ' ')" >> $LOG)
 fi
 cd $ROOT/$CODE/bridge/python
-ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 1500 $PY -m pytest tests/test_b52_cpp_actor.py tests/test_b54_driver_lanes.py tests/test_block_slot_integration.py tests/test_block_lanes.py -q -p no:cacheprovider -x $2 > $R/tests-b54t.log 2>&1
+ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 1500 $PY -m pytest tests/test_b54_lane_bookkeeping.py tests/test_b52_cpp_actor.py tests/test_b54_driver_lanes.py tests/test_block_slot_integration.py tests/test_block_lanes.py -q -p no:cacheprovider -x $2 > $R/tests-b54t.log 2>&1
 echo "$(date +%T) b54t tests rc=$? $(tail -1 $R/tests-b54t.log)" >> $LOG
 guard
 rm -f $R/GPU_LOCK

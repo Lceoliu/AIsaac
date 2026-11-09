@@ -87,3 +87,36 @@ def precapture_lane_generations(lanes, model):
 def record_rows(rec, ROW):
     """The ROW records of a driver record (header + used frame bytes copied by the driver)."""
     return rec['rows'].numpy().view(ROW)
+
+
+# (B54) the driver's per-collect counters: their progress.csv columns, the deltas, the stdout line
+DRV_FIELDS = ('drv_pause_s', 'drv_pauses', 'drv_lane_jobs', 'drv_lane_rows', 'drv_merged_rows', 'drv_merged_calls',
+              'drv_lane_calls', 'drv_captures', 'drv_lane_python', 'drv_lane_s', 'drv_lane_hist',
+              'drv_py_lane_rounds', 'drv_py_lane_rows', 'drv_py_lane_flushed_rows', 'drv_py_lane_share')
+
+
+def collect_counters(c0, c1, handoff, stat, py_mark):
+    """(B54) One collect's counters into stat (the lane_stat dict train_tok writes to progress.csv): c0 / c1 the
+    driver's counters() at the collect's start / end, handoff the seconds the driver was paused for the hand-off
+    before this collect (excluded from the paused seconds), py_mark a one-element list holding the Python-path lane
+    counters at the last collect's end. Returns the stdout line's counter part."""
+    d = {k: c1[k]-c0[k] for k in c1 if not isinstance(c1[k], (list, tuple))}
+    stat['drv_pause_s'] = max(0.0, d['pause_s']-handoff)
+    stat['drv_pauses'] = d['pauses']
+    for k in ('lane_jobs', 'lane_rows', 'merged_rows', 'merged_calls', 'lane_calls', 'captures', 'lane_python', 'lane_s'):
+        stat['drv_'+k] = d[k]
+    stat['drv_lane_hist'] = '/'.join(str(b-a) for a, b in zip(c0['lane_hist'], c1['lane_hist']))
+    # the lane rows the Python path stepped since the last collect (the actor waiting for the learner: rounds on the
+    # Python path, the round in flight flushed), their share of all lane rows
+    now = {k: stat.get(k, 0) for k in ('py_lane_rounds', 'py_lane_rows', 'py_lane_flushed_rows')}
+    for k, v in now.items():
+        stat['drv_'+k] = v-py_mark[0].get(k, 0)
+    py_mark[0] = now
+    py_rows = stat['drv_py_lane_rows']+stat['drv_py_lane_flushed_rows']
+    stat['drv_py_lane_share'] = py_rows/max(py_rows+d['lane_rows'], 1)
+    return (f"paused {stat['drv_pause_s']:.2f} s ({d['pauses']} pauses), lane jobs {d['lane_jobs']} ({d['lane_rows']} rows: "
+            f"{d['merged_rows']} merged in {d['merged_calls']} main batches, {d['lane_calls']} lane-only calls), run-time "
+            f"captures {d['captures']}, lane jobs stepped in Python {d['lane_python']}; lane-only {d['lane_s']:.2f} s, rows "
+            f"histogram 1/2/3-4/5-8/9-16/>16 {stat['drv_lane_hist']}; Python path while waiting for the learner "
+            f"{stat['drv_py_lane_rounds']} rounds {stat['drv_py_lane_rows']} rows + {stat['drv_py_lane_flushed_rows']} flushed "
+            f"({100*stat['drv_py_lane_share']:.1f}% of lane rows)")

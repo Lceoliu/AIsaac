@@ -4194,9 +4194,8 @@ def main(argv=None, child=None, actor=None):
                 row['block_step_graph_replays']=lane_stat.get('block_step_graph_replays',0)
                 row['block_teacher_forward_calls']=lane_stat.get('block_teacher_forward_calls',0)
                 row['block_mixed_replay_calls']=lane_stat.get('block_mixed_replay_calls',0)
-                for k_d in ('drv_pause_s','drv_pauses','drv_lane_jobs','drv_lane_rows','drv_merged_rows','drv_merged_calls',
-                            'drv_lane_calls','drv_captures','drv_lane_python','drv_lane_s','drv_lane_hist',
-                            'drv_py_lane_rounds','drv_py_lane_rows','drv_py_lane_flushed_rows','drv_py_lane_share'):   # (B54: the driver's counters of the collect)
+                from isaac_bridge.block_driver import DRV_FIELDS
+                for k_d in DRV_FIELDS:   # (B54: the driver's counters of the collect)
                     row[k_d]=lane_stat.get(k_d,'')
                 for k_b in ('block_gc_s','block_kv_rows','block_blocks','block_raw_rows'):
                     row[k_b]=lane_stat.get(k_b,0)
@@ -4980,27 +4979,8 @@ def main(argv=None, child=None, actor=None):
                 drv_paused_at[0] = time.perf_counter()
                 # B54 counters of this collect: the driver's paused seconds (the hand-off's pause before this collect's
                 # resume excluded), lane jobs / rows, merged rows and calls, lane-only calls, run-time captures
-                d_ = {k_: c1_[k_]-c0_[k_] for k_ in c1_ if k_ != 'lane_hist'}   # (the histogram: lane_hist below)
-                lane_stat['drv_pause_s'] = max(0.0, d_['pause_s']-handoff_)
-                lane_stat['drv_pauses'] = d_['pauses']
-                for k_ in ('lane_jobs', 'lane_rows', 'merged_rows', 'merged_calls', 'lane_calls', 'captures', 'lane_python', 'lane_s'):
-                    lane_stat['drv_'+k_] = d_[k_]
-                lane_stat['drv_lane_hist'] = '/'.join(str(b_-a_) for a_, b_ in zip(c0_['lane_hist'], c1_['lane_hist']))
-                # the lane rows the Python path stepped since the last collect (the actor waiting for the learner: rounds
-                # on the Python path, the round in flight flushed), their share of all lane rows
-                py_now_ = {k_: lane_stat.get(k_, 0) for k_ in ('py_lane_rounds', 'py_lane_rows', 'py_lane_flushed_rows')}
-                for k_, v_ in py_now_.items():
-                    lane_stat['drv_'+k_] = v_-py_mark[0].get(k_, 0)
-                py_mark[0] = py_now_
-                py_rows_ = lane_stat['drv_py_lane_rows']+lane_stat['drv_py_lane_flushed_rows']
-                lane_stat['drv_py_lane_share'] = py_rows_/max(py_rows_+d_['lane_rows'], 1)
-                print(f"B54 driver collect: paused {lane_stat['drv_pause_s']:.2f} s ({d_['pauses']} pauses), lane jobs "
-                      f"{d_['lane_jobs']} ({d_['lane_rows']} rows: {d_['merged_rows']} merged in {d_['merged_calls']} main "
-                      f"batches, {d_['lane_calls']} lane-only calls), run-time captures {d_['captures']}, "
-                      f"lane jobs stepped in Python {d_['lane_python']}; lane-only {d_['lane_s']:.2f} s, rows histogram "
-                      f"1/2/3-4/5-8/9-16/>16 {lane_stat['drv_lane_hist']}; Python path while waiting for the learner "
-                      f"{lane_stat['drv_py_lane_rounds']} rounds {lane_stat['drv_py_lane_rows']} rows + "
-                      f"{lane_stat['drv_py_lane_flushed_rows']} flushed ({100*lane_stat['drv_py_lane_share']:.1f}% of lane rows); "
+                line_ = bdrv.collect_counters(c0_, c1_, handoff_, lane_stat, py_mark)
+                print(f"B54 driver collect: {line_}; "
                       f"graphs registered {cpp_driver.n_graphs()}; "
                       f"pages {block_actor.store.native.n_pages_d()} decision / {block_actor.store.native.n_pages_b()} block", flush=True)
                 lane_stat['block_step_graph_replays']=sum(a.step_graph.replays for a in

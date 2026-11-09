@@ -533,7 +533,8 @@ class BlockLaneService(LaneService):
             self.drv_jobs[job] = (generation, positions, int(self.generations.versions[generation]), lanes, sub,
                                   pend[positions].copy(), (ukeys[0][positions], ukeys[1][positions]), replays[positions])
             jobs.append(job)
-            self.driver.submit_lanes(job, int(actor.step_graph.owner), int(actor.version),
+            owner = actor.step_graph.owner if actor.step_graph is not None else id(actor)   # (CPU actors: no graphs)
+            self.driver.submit_lanes(job, int(owner), int(actor.version),
                                      torch.from_numpy(sub.view(np.uint8).reshape(-1)), len(positions),
                                      torch.from_numpy(np.ascontiguousarray(pend[positions], np.int64).reshape(-1)),
                                      torch.from_numpy((actor.base+lanes).astype(np.int64)),
