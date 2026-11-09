@@ -4,13 +4,19 @@ ISAAC_BLOCK_NVTX=1 turns the ranges on (torch.cuda.nvtx.range_push / range_pop, 
 push / pop / span are no-ops. Names are dotted: actor.* (the main loop's phases), step.* (SlotBlockActor.step),
 g.* (ActorStepGraph.__call__), pages.* (PagedStore writes from _pages), lane.* (the lane service), learner.*.
 
-ISAAC_NSYS_RANGE=a:b (hand-off counts of the actor loop): cudaProfilerStart() when the a-th collect begins,
-cudaProfilerStop() when the b-th begins, for `nsys profile --capture-range=cudaProfilerApi`. Without it nothing is
-called. (Measurement only: nothing here changes what the actor or learner compute.)
+ISAAC_NSYS_RANGE=a:b (hand-off counts of the actor loop): the capture window from the a-th collect's start to the
+b-th's. ISAAC_NSYS_TRIGGER=nvtx (default): an NVTX start/end range named B50window in the default domain, for
+`nsys profile --capture-range=nvtx --nvtx-capture=B50window` (no CUPTI: on the 4090 nsys 2023.4's libcupti 12.4
+segfaults in train_tok at cudaProfilerStart, prof-b50m / prof-b50m3); ISAAC_NSYS_TRIGGER=cupti: cudaProfilerStart /
+Stop for --capture-range=cudaProfilerApi. Without ISAAC_NSYS_RANGE nothing is called.
+With ISAAC_BLOCK_NVTX=1 the cyclic garbage collector's passes are ranges too ('gc.collect', gc.callbacks, on the
+thread that triggered the pass). (Measurement only: nothing here changes what the actor or learner compute.)
 """
 import os
 
 ON = os.environ.get('ISAAC_BLOCK_NVTX', '0') == '1'
+TRIGGER = os.environ.get('ISAAC_NSYS_TRIGGER', 'nvtx')
+_WINDOW = [0]
 
 if ON:
     import torch
@@ -53,20 +59,39 @@ def profiler_window():
 
 
 def profiler_mark(handoffs, window):
-    """Called at the start of every collect with the hand-offs done so far: starts / stops the CUDA profiler at the
-    window's bounds (nsys --capture-range=cudaProfilerApi). Returns 'start', 'stop' or None."""
+    """Called at the start of every collect with the hand-offs done so far: opens / closes the capture window at
+    its bounds (the B50window NVTX range, or cudaProfilerStart / Stop with ISAAC_NSYS_TRIGGER=cupti). Returns
+    'start', 'stop' or None."""
     if window is None:
         return None
     import torch
     if handoffs == window[0]:
-        torch.cuda.cudart().cudaProfilerStart()
-        print(f'B50 nsys: cudaProfilerStart at hand-off {handoffs}', flush=True)
+        if TRIGGER == 'cupti':
+            torch.cuda.cudart().cudaProfilerStart()
+        else:
+            _WINDOW[0] = torch.cuda.nvtx.range_start('B50window')
+        print(f'B50 nsys: capture window opens at hand-off {handoffs} ({TRIGGER})', flush=True)
         return 'start'
     if handoffs == window[1]:
-        torch.cuda.cudart().cudaProfilerStop()
-        print(f'B50 nsys: cudaProfilerStop at hand-off {handoffs}', flush=True)
+        if TRIGGER == 'cupti':
+            torch.cuda.cudart().cudaProfilerStop()
+        elif _WINDOW[0]:
+            torch.cuda.nvtx.range_end(_WINDOW[0])
+        print(f'B50 nsys: capture window closes at hand-off {handoffs} ({TRIGGER})', flush=True)
         return 'stop'
     return None
+
+
+def _gc_callback(phase, info):
+    if phase == 'start':
+        _push('gc.collect')
+    else:
+        _pop()
+
+
+if ON:
+    import gc as _gc
+    _gc.callbacks.append(_gc_callback)
 
 
 def start(name):

@@ -2,13 +2,12 @@
 
 usage: python3 b50_nsys.py <report.nsys-rep | report.sqlite> [--nsys /usr/local/cuda/bin/nsys]
 
-The report comes from `nsys profile -t cuda,nvtx,python-gil --cpuctxsw=process-tree --sample=process-tree
---python-sampling=true --capture-range=cudaProfilerApi` of train_tok.py run with ISAAC_BLOCK_NVTX=1 and
-ISAAC_NSYS_RANGE=a:b (isaac_bridge/block_nvtx.py). Prints, for the actor (main) thread and the learner thread of
-the train_tok process over the capture window: GIL held / GIL waited (python-gil ranges), CUDA synchronisation
-waits (CUPTI runtime API cudaStreamSynchronize / cudaEventSynchronize / cudaDeviceSynchronize), running / blocked
-time (sched events), and the NVTX ranges of block_nvtx (inclusive and exclusive sums, per-call ms). Only the
-standard library is used (sqlite3)."""
+The report comes from `nsys profile -t nvtx,python-gil[,cuda] --capture-range=cudaProfilerApi` of train_tok.py run
+with ISAAC_BLOCK_NVTX=1 and ISAAC_NSYS_RANGE=a:b (isaac_bridge/block_nvtx.py). Prints, for the actor (main) thread
+and the learner thread of the train_tok process over the capture window: GIL held / GIL waited (python-gil ranges),
+CUDA synchronisation waits (CUPTI runtime API, when cuda was traced), running / blocked time (sched events, when
+available), the NVTX ranges of block_nvtx (inclusive and exclusive sums, per-call ms, percentiles) and the GIL
+waits attributed to the range they start in. Only the standard library is used (sqlite3)."""
 import os
 import subprocess
 import sqlite3
@@ -41,6 +40,10 @@ def ms(ns):
     return ns/1e6
 
 
+def pct(ds, q):
+    return ds[min(len(ds)-1, int(len(ds)*q))]
+
+
 def main():
     nsys = '/usr/local/cuda/bin/nsys'
     args = [a for a in sys.argv[1:]]
@@ -70,6 +73,13 @@ def main():
     print(f'process pid {pid}: capture window {win/1e9:.2f} s; actor tid {actor_tid & 0xffffff}, '
           f'learner tid {learner_tid & 0xffffff if learner_tid else None}')
     threads = [('actor', actor_tid)] + ([('learner', learner_tid)] if learner_tid else [])
+    n_calls = c.execute("select count(*) from NVTX_EVENTS where globalTid = ? and text = 'actor.step_main' and start >= ? and end <= ?",
+                        (actor_tid, lo, hi)).fetchone()[0]
+    n_steps = c.execute("select count(*) from NVTX_EVENTS where globalTid = ? and text = 'g.sync' and start >= ? and end <= ?",
+                        (actor_tid, lo, hi)).fetchone()[0]
+    n_upd = c.execute("select count(*) from NVTX_EVENTS where text = 'learner.update' and start >= ? and end <= ?",
+                      (lo, hi)).fetchone()[0]
+    print(f'in the window: {n_calls} main calls, {n_steps} step graph syncs, {n_upd} complete learner updates')
 
     def clipped_sum(table, where, params):
         """sum of (min(end,hi)-max(start,lo)) over ranges of a table."""
@@ -92,7 +102,6 @@ def main():
                                   f"globalTid = ? and nameId in ({','.join(map(str, sync_ids))})", (tid,))
         run = blk = 0.0
         if 'SCHED_EVENTS' in T:
-            # SCHED_EVENTS: start, cpu, isSchedIn, globalTid: a thread runs from a sched-in to its next sched-out
             ev = c.execute("select start, isSchedIn from SCHED_EVENTS where globalTid = ? order by start", (tid,)).fetchall()
             last_in = None
             for t, sin in ev:
@@ -135,14 +144,54 @@ def main():
         for t in sorted(incl, key=lambda k: -incl[k]):
             print(f'  {name:8s} {t:26s} {cnt[t]:8d} {incl[t]/1e9:9.3f} {excl[t]/1e9:9.3f} {ms(incl[t])/max(cnt[t],1):8.3f}')
 
-    # ---- GPU: kernels / graphs / memcpy per stream (window), utilisation
+    # ---- GIL waits attributed to the innermost block_nvtx range they start in (actor thread), GIL percentiles
+    if gil_ids:
+        print('\n== GIL waits by the block_nvtx range they start in (actor thread): range, waits, total s, mean us, p90 us')
+        rng = c.execute("select start, end, text from NVTX_EVENTS where globalTid = ? and text is not null and end is not null "
+                        "and domainId = 0 and start >= ? and end <= ? order by start, end desc", (actor_tid, lo, hi)).fetchall()
+        waits = c.execute("select start, end from NVTX_EVENTS where globalTid = ? and textId = ? and end is not null "
+                          "and start >= ? and end <= ? order by start", (actor_tid, gil_ids['Waiting for GIL'], lo, hi)).fetchall()
+        by = defaultdict(list)
+        stack, j = [], 0
+        for s_, e_ in waits:
+            while j < len(rng) and rng[j][0] <= s_:
+                while stack and stack[-1][1] <= rng[j][0]:
+                    stack.pop()
+                stack.append(rng[j]); j += 1
+            while stack and stack[-1][1] <= s_:
+                stack.pop()
+            by[stack[-1][2] if stack else '(outside ranges)'].append(e_-s_)
+        for t in sorted(by, key=lambda k: -sum(by[k])):
+            ds = sorted(by[t]); n = len(ds)
+            print(f'  {t:26s} {n:8d} {sum(ds)/1e9:9.3f} {sum(ds)/n/1e3:9.1f} {pct(ds, .9)/1e3:9.1f}')
+        for name, tid in threads:
+            for label, key in (('waits', 'Waiting for GIL'), ('holds', 'Holding GIL')):
+                ds = sorted(e_-s_ for s_, e_ in c.execute(
+                    "select start, end from NVTX_EVENTS where globalTid = ? and textId = ? and end is not null and start >= ? and end <= ?",
+                    (tid, gil_ids[key], lo, hi)))
+                if ds:
+                    n = len(ds)
+                    print(f'  {name} GIL {label}: n {n}, p50 {ds[n//2]/1e3:.1f} us, p90 {pct(ds, .9)/1e3:.1f} us, '
+                          f'p99 {pct(ds, .99)/1e3:.1f} us, max {ds[-1]/1e6:.2f} ms, total {sum(ds)/1e9:.2f} s')
+
+    print('\n== range duration percentiles (ms): range, n, p50, p90, p99, max')
+    for name, tid in threads:
+        rows = c.execute("select text, end - start from NVTX_EVENTS where globalTid = ? and text is not null and end is not null "
+                         "and domainId = 0 and start >= ? and end <= ?", (tid, lo, hi)).fetchall()
+        by = defaultdict(list)
+        for t, d in rows:
+            by[t].append(d)
+        for t in sorted(by, key=lambda k: -sum(by[k])):
+            ds = sorted(by[t]); n = len(ds)
+            print(f'  {name:8s} {t:26s} {n:8d} {ms(ds[n//2]):8.3f} {ms(pct(ds, .9)):8.3f} {ms(pct(ds, .99)):8.3f} {ms(ds[-1]):8.3f}')
+
+    # ---- GPU: kernels / graphs per stream (window), utilisation (cuda trace only)
     if 'CUPTI_ACTIVITY_KIND_KERNEL' in T:
         print('\n== GPU kernels per stream (window): stream, launches, busy s (sum of durations), share of window')
         rows = c.execute("select streamId, count(*), sum(min(end, ?) - max(start, ?)) from CUPTI_ACTIVITY_KIND_KERNEL "
                          "where start < ? and end > ? group by streamId order by 3 desc", (hi, lo, hi, lo)).fetchall()
         for sid, n, tot in rows:
             print(f'  stream {sid:4d} {n:9d} {tot/1e9:9.3f} {100*tot/win:6.1f}%')
-        # union of all kernels (GPU busy at all)
         ev = c.execute("select start, end from CUPTI_ACTIVITY_KIND_KERNEL where start < ? and end > ? order by start",
                        (hi, lo)).fetchall()
         busy, cur_s, cur_e = 0, None, None
@@ -167,8 +216,8 @@ def main():
         for sid, ds in sorted(by.items(), key=lambda kv: -len(kv[1])):
             ds.sort()
             n = len(ds)
-            print(f'  stream {sid:4d} {n:7d} {ms(ds[n//2]):7.3f} {ms(ds[int(n*.9)]):7.3f} {ms(sum(ds)/n):7.3f}')
-    # ---- step graph: launch to sync (the actor's g.replay start to g.sync end) vs GPU duration
+            print(f'  stream {sid:4d} {n:7d} {ms(ds[n//2]):7.3f} {ms(pct(ds, .9)):7.3f} {ms(sum(ds)/n):7.3f}')
+    # ---- step graph: replay call to sync end (the actor's g.replay start to g.sync end)
     ev = c.execute("select start, end, text from NVTX_EVENTS where globalTid = ? and text in ('g.replay','g.sync') "
                    "and end is not null and start >= ? and end <= ? order by start", (actor_tid, lo, hi)).fetchall()
     spans = []
@@ -180,16 +229,8 @@ def main():
             spans.append(e-t_rep); t_rep = None
     if spans:
         spans.sort(); n = len(spans)
-        print(f'\n== actor step: replay call to sync end (ms): n {n}, p50 {ms(spans[n//2]):.3f}, p90 {ms(spans[int(n*.9)]):.3f}, '
+        print(f'\n== actor step: replay call to sync end (ms): n {n}, p50 {ms(spans[n//2]):.3f}, p90 {ms(pct(spans, .9)):.3f}, '
               f'mean {ms(sum(spans)/n):.3f}')
-    # ---- Python sampling: top frames per thread (domain 'Python Backtrace' events carry a jsonText callchain)
-    if 'SAMPLING_CALLCHAINS' in T and 'COMPOSITE_EVENTS' in T:
-        print('\n== CPU samples per thread (window): count')
-        rows = c.execute("select globalTid, count(*) from COMPOSITE_EVENTS where start >= ? and start <= ? and (globalTid >> 24) = ? "
-                         "group by globalTid order by 2 desc limit 6", (lo, hi, pid)).fetchall()
-        for tid, n in rows:
-            tag = {actor_tid: 'actor', learner_tid: 'learner'}.get(tid, '')
-            print(f'  tid {tid & 0xffffff:8d} {tag:8s} {n:8d}')
 
 
 if __name__ == '__main__':

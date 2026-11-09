@@ -24,7 +24,8 @@ cd $ROOT/$CODE/bridge/python
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 export ABP_HOME=$ROOT/formal/abplus ABP_BRIDGE_LUA=$ROOT/candidate-a1/bridge/abplus/abp_bridge.lua
 export LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null
-export ISAAC_BLOCK_TIMING=1 ISAAC_BLOCK_NVTX=1 ISAAC_NSYS_RANGE=${NSYS_RANGE:-2:7}
+export ISAAC_BLOCK_TIMING=1 ISAAC_BLOCK_NVTX=1 ISAAC_NSYS_RANGE=${NSYS_RANGE:-2:7} ISAAC_NSYS_TRIGGER=${TRIGGER:-nvtx}
+if [ "${TRIGGER:-nvtx}" = cupti ]; then CAP="--capture-range=cudaProfilerApi"; else CAP="--capture-range=nvtx --nvtx-capture=B50window"; fi
 CMD="$PY -u train_tok.py --groups-file ../abplus/catalog/scaling2_groups.json --mode run --items \
  --epochs 3 --teacher --teacher-queue 12 --archive-size 12 --lr 1e-4 --lr-final 1e-4 --episodes-per-state 8 \
  --teacher-death-depths 2,4,8,16,32 --teacher-thread 1 --teacher-fork 1 --teacher-share 0.1 --teacher-slots 6 --poll-wait 0.001 \
@@ -39,9 +40,10 @@ CMD="$PY -u train_tok.py --groups-file ../abplus/catalog/scaling2_groups.json --
  --workers 16 --rollout 32768 --minibatch 8192 --micro 8192 --game-hours $HOURS --checkpoint-every 1000 \
  --overlap --decoupled 1 --learner-fast 0 --actor-processes 1 --learner-process 0 --amp bf16 \
  --port 39200 --name b42new --seed 1000 --out $OUT $EXTRA"
-NS="$NSYS profile -t $TRACE --python-sampling=true --python-sampling-frequency=${PYSAMP:-250} \
- --sample=process-tree --cpuctxsw=process-tree --cuda-graph-trace=${GRAPH_TRACE:-graph} \
- --capture-range=cudaProfilerApi --capture-range-end=stop -o $R/$TAG.nsys-rep --force-overwrite true"
+PYS=${PYS-"--python-sampling=true --python-sampling-frequency=${PYSAMP:-250}"}   # PYS="" : no Python sampling
+NS="$NSYS profile -t $TRACE $PYS \
+ --sample=none --cpuctxsw=none --cuda-graph-trace=${GRAPH_TRACE:-graph} \
+ $CAP --capture-range-end=stop -o $R/$TAG.nsys-rep --force-overwrite true"
 echo "$NS $CMD" > $OUT.command.txt
 nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used --format=csv,noheader -l 1 > $R/$TAG.gpu &
 SMI=$!

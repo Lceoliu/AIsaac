@@ -430,15 +430,18 @@ class PagedStore:
     # ---- allocation
     def _grow_d(self):
         P = self.page
+        nv_push('pages.grow')
         self.kv_pages.append(torch.zeros((P, *self.kv_shape), dtype=self.kv_dtype))
         self.z_pages.append(torch.zeros((P, *self.z_shape), dtype=torch.float32))
         base = len(self.d_used)
         self.d_meta = np.concatenate((self.d_meta, np.full((P, 2), -1, np.int64)))
         self.d_used = np.concatenate((self.d_used, np.zeros(P, bool)))
         self.d_free = np.concatenate((np.arange(base+P-1, base-1, -1, dtype=np.int64), self.d_free))
+        nv_pop()
 
     def _grow_b(self):
         P = self.page
+        nv_push('pages.grow')
         self.b_pages.append(torch.zeros((P, *self.b_shape), dtype=torch.float32))
         base = len(self.b_used)
         bs = self.config.block_steps
@@ -447,6 +450,7 @@ class PagedStore:
         self.b_srcver = np.concatenate((self.b_srcver, np.full((P, bs), -1, np.int64)))
         self.b_used = np.concatenate((self.b_used, np.zeros(P, bool)))
         self.b_free = np.concatenate((np.arange(base+P-1, base-1, -1, dtype=np.int64), self.b_free))
+        nv_pop()
 
     def _alloc(self, n, kind):
         free = 'd_free' if kind == 'd' else 'b_free'
