@@ -4952,6 +4952,10 @@ def main(argv=None, child=None, actor=None):
                 lane_stat['block_step_graph_replays']=sum(a.step_graph.replays for a in
                     [block_actor,*lanes.actors.values()] if getattr(a,'step_graph',None) is not None)
                 lane_stat.update({'driver_'+k_: v_ for k_, v_ in cpp_driver.counters().items()})
+                if len(cpp_started) == 1:   # (the B52 entry gate reads this line: the thread ran, workers were answered)
+                    c_ = cpp_driver.counters(); cpp_started.append(True)
+                    print(f"B52 driver first collect: thread started, {c_['calls']} replies, {c_['rows']} rows, "
+                          f"{c_['steps']} steps", flush=True)
 
             if cpp_driver is not None:
                 run_driver_collect(prof)

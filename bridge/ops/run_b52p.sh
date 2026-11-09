@@ -11,6 +11,7 @@ LOG=$R/b52.log
 guard() { echo "$(date +%T) guard: $(pgrep -fc '[t]rain_tok.py') train_tok, $(pgrep -c isaac) isaac, $(pgrep -fc '[p]ytest') pytest, $(pgrep -fc '[a]bplus_probe') probe, gpu $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)" >> $LOG; }
 want() { { [ "$WHICH" = all ] && [ "$1" != smoke ]; } || [ "$WHICH" = "$1" ]; }
 if [ -f $R/GPU_LOCK ]; then echo "LOCKED: $(cat $R/GPU_LOCK)"; exit 2; fi
+if [ "$WHICH" != smoke ] && [ -f $R/b52-gate.failed ]; then echo "$(date +%T) b52p $WHICH refused: the full gate failed ($(tr '\n' ' ' < $R/b52-gate.failed))" >> $LOG; exit 3; fi
 echo "cpp-actor $(date '+%Y-%m-%d %H:%M:%S') B52 profiles ($CODE, $WHICH): cpp 16 upd, python 16 upd, CF off 8 upd, nsys GIL, learner kernels" > $R/GPU_LOCK
 echo "$(date +%T) b52p start ($CODE, $WHICH)" >> $LOG
 guard
