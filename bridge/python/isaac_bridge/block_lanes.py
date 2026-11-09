@@ -113,6 +113,16 @@ class BlockLaneService(LaneService):
                 status.flat[point]=2 if accepted else -1
                 self.s.cf_snap[worker]=0
 
+    def capture_deferred(self, workers, requests, snapshots):
+        """(B52) capture_main's CF point capture from the driver's record: the pre-step snapshots the consumer
+        rebuilt, the workers' requests the driver read (and zeroed) before replying."""
+        status = self.s.block_arrays[0]
+        for worker, request, snap in zip(workers, requests, snapshots):
+            if request:
+                point = int(request)-1
+                accepted = self.capture_point(point, snap, self.model, self.main_actor.version)
+                status.flat[point] = 2 if accepted else -1
+
     def service_control(self):
         nv_push('lane.control')
         try:
