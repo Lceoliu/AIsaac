@@ -657,6 +657,16 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
                                  "cf_on_same_window": {"median_collect_s": 29.59, "median_update_s": 18.4, "x_real_time": 147.6}},
                       "gates": {"update_le_19s": true, "update_le_17s": false, "update_le_15s": false, "collect_within_2s_of_b47": true}}
   },
+  "grad_stats_b49": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B49", "tool": "bridge/ops/b49_grad_stats.py", "commit": "ea63627",
+    "input": "B48 learner dump (update 6 of a fresh run, 15 grad calls); surrogate loss; FP32; first-order proxy",
+    "concentration": {"top1_share_sum_norms": 0.218, "top4_share_sum_norms": 0.646, "within_chunk_cv_median": 0.0032, "update_top10pct_share_sum_sq": 0.555},
+    "rules_cos_total_mean": {"Detach": 0.823, "Random4": 0.891, "Random4xN/4": 0.9994, "Top1+Random3": 0.891, "Top2+Random2": 0.891, "Top4": 0.891, "All": 1.0},
+    "rules_cos_hist_mean": {"Random4": 0.998, "Top1+Random3": 0.998, "Top2+Random2": 0.997, "Top4": 0.993},
+    "norm_ratio_unscaled": 0.202, "rows": {"4_blocks": 128, "all": 660},
+    "conclusion": "not concentrated; per-block contributions nearly parallel; the unscaled rules keep ~4/N of the history gradient's magnitude; Random-k x N/k is closest; gradient-guided picks no better",
+    "ablation_suggestion": "add Random-k x N/k arms (k=4 and 1-2); re-measure on a late checkpoint dump before deciding"
+  },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
   "spatial": {
