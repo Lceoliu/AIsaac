@@ -666,6 +666,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "norm_ratio_unscaled": 0.202, "rows": {"4_blocks": 128, "all": 660},
     "conclusion": "not concentrated; per-block contributions nearly parallel; the unscaled rules keep ~4/N of the history gradient's magnitude; Random-k x N/k is closest; gradient-guided picks no better",
     "ablation_suggestion": "add Random-k x N/k arms (k=4 and 1-2); re-measure on a late checkpoint dump before deciding"
+  },
   "actor_b50": {
     "entry": "bridge/abplus/EXPERIMENTS.md B50 (phase 0: measurement and design); design docs/B50_CPP_ACTOR_DESIGN.md",
     "step": "speed refactor step 5: actor scheduling hot path to C++ (phase 0 done; phase 1 = main step loop, phase 2 = lanes / CF)",
@@ -684,6 +685,96 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
                "fallback": "ISAAC_BLOCK_CPP_ACTOR=0 or build failure: the Python path",
                "estimate_collect_s": {"phase1_main_loop": 21, "phase2_lanes": 19, "floor_from_gpu_tail": "about 5 s per collect of >10 ms waits stay"}},
     "failed_runs": ["prof-b50m (libcupti segfault)", "prof-b50m2 (operator error)", "prof-b50m3 (libcupti segfault, 246 calls partial)", "prof-b50m4 (no report: unregistered NVTX capture range)"]
+  },
+  "actor_b52": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B52 (phase 1: main step loop in C++); design docs/B50_CPP_ACTOR_DESIGN.md section 8",
+    "branch": "exp/block-memory-v1-cpp-actor (worktree temp/wt-cpp-actor), merged B48/B49 at 8e3ee26",
+    "code": [
+      "bridge/engine/abp_actor.cpp (PageStore, graph registry, run_graph, ActorDriver thread)",
+      "isaac_bridge/actor_native.py (g++ build, source-hash cache ~/.cache/isaac-actor, ISAAC_BLOCK_CPP_ACTOR=0 or failure -> Python)",
+      "isaac_bridge/block_driver.py",
+      "block_paged.py native PagedStore backend",
+      "train_tok.py run_driver_collect / consume_record"
+    ],
+    "gates": {
+      "cpp_tests": "47 passed",
+      "entry_gate": "tests/test_b52_entry.py 2 passed (driver on / off through train_tok)",
+      "full_tests": "204 passed, 2 skipped",
+      "a8": "8/8"
+    },
+    "profiles_u2_u14_median": {
+      "prof-b47-slz": {
+        "collect_s": 27.86,
+        "update_s": 22.91
+      },
+      "prof-b48-pf": {
+        "collect_s": 28.86,
+        "update_s": 18.85
+      },
+      "prof-b52-py": {
+        "collect_s": 28.82,
+        "update_s": 18.72,
+        "infer_ms": 11.7,
+        "x_real_time": 151.6
+      },
+      "prof-b52-cpp": {
+        "collect_s": 27.17,
+        "update_s": 17.1,
+        "infer_ms": 3.6,
+        "x_real_time": 160.8
+      },
+      "prof-b52-nocf": {
+        "collect_s": 11.52,
+        "update_s": 17.5,
+        "wait_learner_s": 6.5
+      }
+    },
+    "gate_result": {
+      "collect_le_22": false,
+      "update_le_19_and_le_python": true,
+      "x_real_time_ge_200": false
+    },
+    "nsys_prof-b52m": {
+      "window_s": 130.2,
+      "collects": 5,
+      "main_thread": {
+        "gil_held_s": 36.4,
+        "gil_wait_s": 10.3,
+        "wait_per_collect_s": 2.06
+      },
+      "learner": {
+        "gil_held_s": 11.5,
+        "gil_wait_s": 12.5,
+        "wait_per_update_s": 2.5
+      },
+      "lane_tick_driver_paused_per_collect_s": 10.3,
+      "lane_step_g_native_p50_p99_ms": [
+        1.75,
+        77
+      ]
+    },
+    "why_collect_stays": "lane / CF rounds still in Python and each pauses the driver (shared arena / stream); they are no longer merged into the main step graph call as on the Python path: p_tick 12.1 s per collect, lane held 9 -> 66 s",
+    "stalls": {
+      "lane_generation_precapture": "both generations at start-up (2 x 20 graphs, 1.1 s each), 0 mid-run; u3 collect 24.7 s vs b48-pf 32.3",
+      "page_growth": "native store preallocates 48 decision pages + 12 block pages; peak 116,300 rows / 4,765 blocks; 0 growths"
+    },
+    "learner_kernels": {
+      "method": "bridge/ops/b52_learner_kernels.py on reports/b42-speed/b48-dump/learner_inputs.pt, torch profiler in the main thread (kineto refused the learner thread in train_tok)",
+      "kernels": 138067,
+      "gpu_s": 5.84,
+      "p99_ms": 0.51,
+      "max_ms": 16.2,
+      "over_10ms": "15, all Memcpy HtoD pinned->device in fwd_grad (228 ms per update); no compute kernel >= 10 ms (longest triton_tem_fused_zeros_2 5.4 ms)"
+    },
+    "failures": [
+      "cpp gate 1: pressure test restore during capture (cuda_lock in the test)",
+      "cpp gate 2: PagedStore.next_decision not following the native counter (85df376)",
+      "smoke 1: train_tok never called driver.start() (2df7346, entry gate a8c1fd1)",
+      "smoke 2 passed, chain's u2-line check wrong",
+      "prof-b52-kern: kineto init in the learner thread hung; learner_dump.load on native pages (9bc71fa)",
+      "every run spends 603-615 s in the compiled Spatial warm-up (also B47/B48/B51): inductor cache not reused across processes"
+    ],
+    "next": "phase 2: lane requests into the driver's batches (merged with main steps in one graph call), Python keeps lane control and CF bookkeeping; estimate collect about 18-19 s"
   },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},

@@ -151,3 +151,13 @@ update 侧：learner 每 update 4.4–5.2 s 的 GIL 等待随 actor 离开 GIL �
   holder 假设由扩展本身验证：`register_graph` 收 `std::shared_ptr<at::cuda::CUDAGraph>`，driver 线程 `replay()` 与 Python 重放逐位一致。
 - **4090 门里修掉的三处**：driver 线程要在 `c10::InferenceMode` 下工作（graph 的 pinned 缓冲是 inference 张量）；bf16 缓冲用无类型指针；
   输出行宽是 nh+3（动作数 + logp/value/vg），不是 sum(heads)+3。
+
+- **阶段 1 实测（B52，2026-11-10，详见 EXPERIMENTS.md B52）**：门全过（cpp 47、入口门 2、全量 204、A8 8/8）。u2–u14 中位：collect 27.17 s
+  （同树 Python 28.82，门槛 22：不过），update 17.10 s（同树 Python 18.72，门槛 19：过），×实时 160.8。主调用延迟 11.7 → 3.6 ms，
+  learner GIL 等待 4.4–5.2 → 2.50 s/update（与本节预估 2.5–3 一致），主线程 GIL 等待 2.06 s/collect。
+- **预估错在 lane 轮次**：第 6 节把阶段 1 的 lane 成本按 B50 记为 ≈ 5 s 且能与主步重叠；实际 lane 与主 actor 共用 arena 与流，driver 必须
+  为每个 lane 轮次 `pause()`，lane 行也不再像 Python 路径那样并进主调用，actor.tick（driver 暂停）10.3 s/collect、p_tick 12.1 s，collect 基本
+  不降。CF 关时 collect 11.5 s（其中 6.5 s 在等 learner）。阶段 2 的首要目标因此是“lane 请求进 driver 的批、与主步合并进同一次 graph 调用”，
+  而不是 Episodes.arrive / EpisodeLog.push 下沉（消费者 GIL 等待已只有 2 s/collect）；按 B52 数字估 collect ≈ 18–19 s。
+- **learner 长 kernel（条件 6）**：B48 dump 固定输入重放（主线程 torch profiler）没有 ≥ 10 ms 的计算 kernel（最长 5.4 ms），≥ 10 ms 的只有
+  15 次 packed 输入的 HtoD 上传（10–16 ms，228 ms/update）。第 1 节“长尾来自 learner 长 kernel”的解释需要修正为“排队 / 拷贝引擎”，待 CUDA 追踪确认。

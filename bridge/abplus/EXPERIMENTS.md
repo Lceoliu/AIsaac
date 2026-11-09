@@ -9686,3 +9686,104 @@ B47 之后 collect 27.9 s、update 22.9 s、×实时 149–151，用户门槛 ×
 - 这台机器 `--sample` 与 `--cpuctxsw` 不可用（perf 权限），所以没有线程运行/阻塞时间。
 - 4090 在 22:06:56 释放锁（guard：0 train_tok、0 isaac、显存 12 MiB）；之后由 A1 的 B51 接手。
 - 提交：22c7b46（NVTX 分段、nsys 脚本）、66a534d（NVTX 触发、gc/页增长分段、分析脚本）、fa75338（push/pop 窗口），文档提交见下。
+
+### B52 阶段 1：actor 主 step 循环迁 C++（ActorDriver 线程 + 原生页存储 + Python 消费者）（2026-11-09/10）
+
+#### 实验目的
+
+按 B50 设计稿的 B′ 方案做阶段 1：graph 仍在 Python 里捕获，由一条不持 GIL 的 C++ 线程（`ActorDriver`）轮询 worker 管道、拼批、解包、生成 uniform、H2D / replay / D2H / 同步、写共享数组并应答、写页、入队记录；Python 主线程只做消费者（Episodes.arrive、snapshot、EpisodeLog、CF 捕获、store 入 rollout）和 lane 服务。模型计算、批组成、CF / teacher 语义、预算都不变。门槛：collect ≤ 22 s（对 prof-b47-slz 27.86）、update ≤ 19 s 且不差于同一棵树的纯 Python 路径（对 prof-b48-pf 18.85），报告实测 ×实时（4369 / max(collect, update)）。设计与条件对应见 `docs/B50_CPP_ACTOR_DESIGN.md` 第 8 节。
+
+#### 实验方法
+
+- 代码：origin/exp/block-memory-v1 头（B48 learner 预取 + B49 梯度统计）合入 `exp/block-memory-v1-cpp-actor`（8e3ee26）后加：`bridge/engine/abp_actor.cpp`（PageStore、graph 注册表、run_graph、ActorDriver 线程；pybind11 用 torch 自带头），`isaac_bridge/actor_native.py`（g++ 直接编译、源码哈希缓存 `~/.cache/isaac-actor/`，无 CUDA / 无 g++ / 编译失败 / `ISAAC_BLOCK_CPP_ACTOR=0` → None，整条回退 Python），`isaac_bridge/block_driver.py`（make_driver、两代 lane actor 启动预录、记录行解包），`block_paged.py`（PagedStore 原生后端、`ActorStepGraph.attach_driver` / `_register`、lane 步的 C++ 中段 `g.native`），`block_lanes.capture_deferred`，`train_tok.py` 的 `run_driver_collect` / `consume_record`。候选树 candidate-b52（4090）。
+- 门（GPU_LOCK 协议 + guard，每段自取自放锁）：`bridge/ops/run_b52t.sh`（cpp actor 测试 + slot 集成 + lane 测试），`run_b52g.sh`（生产入口门 `tests/test_b52_entry.py` + 全量测试 + A8 8 种子；任一项不过写 `b52-gate.failed`，profile 拒跑），`run_b52p.sh`（prof-b52-smoke 2.5 gh；prof-b52-cpp 16 upd；prof-b52-py 同树 `ISAAC_BLOCK_CPP_ACTOR=0` 16 upd；prof-b52-nocf `--cf-points 0` 8 upd；prof-b52m nsys `-t nvtx,python-gil`，hand-off 2–7；prof-b52-kern），`run_b52k.sh`（learner kernel 时长，见条件 6）。完整短 profile 配置同 B47/B48（16 worker、rollout 32768、micro 8192、cf 6/180、teacher share 0.1），中位数取 u2–u14。
+- 等价测试 `tests/test_b52_cpp_actor.py`（无扩展时整体 skip）：原生 PageStore 与 Python 数组逐位一致（ids 顺序、元数据、页、raw）；run_graph 中段 == Python 中段（fp32 / bf16）；单 worker 固定 uniform 下 driver 与 `SlotBlockActor.step` 的动作 / logp / 价值 / vg / 页 / 块 / 谱系 / arena 行逐位相等；同种子可复现（两 driver 同种子逐位相等、异种子动作不同；Python 路径 manual_seed 两次相等）；压力测试（6 个假 worker + 读线程 gather / restore 与 driver 并发，页在记录之前完成）。`tests/test_b52_entry.py`：train_tok 真实构造路径跑 1 个 update，driver 开时断言线程启动且应答过 worker，`ISAAC_BLOCK_CPP_ACTOR=0` 时同一路径走 Python。
+
+#### 实验结果
+
+**门表**
+
+| 项 | 门槛 | 实测 | 结果 |
+|---|---|---|---|
+| cpp actor 门（run_b52t） | 全过 | 47 passed（02:59） | 过 |
+| 生产入口门（driver 开 / 关） | 2 passed | 2 passed（1353 s，两次冷编译） | 过 |
+| 全量测试（4090，CUBLAS 确定性） | 全过 | 204 passed、2 skipped | 过 |
+| A8 play digest | 8/8 | 8/8 | 过 |
+| collect（u2–u14 中位） | ≤ 22 s | **27.17 s** | **不过** |
+| update（u2–u14 中位） | ≤ 19 s，且 ≤ 同树 Python 路径 | **17.10 s**（Python 路径 18.72） | 过 |
+| ×实时（4369 / max） | ≥ 200 | **160.8** | **不过** |
+
+**同口径对照（16 updates，u2–u14 中位，ISAAC_BLOCK_TIMING=1）**
+
+| run | 代码 | collect_s | update_s | 主调用延迟 infer_ms | ×实时（公式） | ×实时（progress 中位） |
+|---|---|---:|---:|---:|---:|---:|
+| prof-b47-slz | B47 最终 | 27.86 | 22.91 | 11.3 | 156.8 | 148.7 |
+| prof-b48-pf | B48 最终 | 28.86 | 18.85 | 11.5 | 151.4 | 154.4 |
+| prof-b52-py | 合并树，Python 路径 | 28.82 | 18.72 | 11.7 | 151.6 | 149.5 |
+| prof-b52-cpp | 合并树，C++ driver | **27.17** | **17.10** | **3.6** | **160.8** | 155.2 |
+| prof-b52-nocf | C++ driver，CF 关（8 upd） | 11.52 | 17.50 | 2.7 | 249.7 | 248.0 |
+
+- 主路径确实变快了：主调用（poll → 应答）延迟 11.7 → 3.6 ms，learner 忙时 16.4 → 5.4 ms；actor step 墙钟（b42_actor_step_s）18.9 → 10.4 s/collect。CF 关时 collect 11.5 s 里有 6.5 s 是 actor 在等 learner（wait_learner_s），即主路径本身每个 rollout 约 5 s。
+- collect 没降的原因是 **lane 轮次**：Python 路径把 lane 行并进主调用一起跑（block_merged_main_rows 63,850 / merged lane rows 13,900 每 collect），C++ 路径的 lane 轮次仍在 Python 里、且每轮都要先 `pause()` driver（lane 与主 actor 共用 arena 与流）。每 collect 的 `p_tick`（driver 暂停、跑 lane 轮次）12.1 s，nsys 的 actor.tick 10.3 s/collect；lane 请求的等待（v2_lane_held_s）9.2 → 66.2 s。主步与 lane 步从“合并”变成了“串行交替”。
+- update 变快来自 learner 的 GIL 等待减半（下表）：forward_packed 段 4.87 → 4.09 s/update（b42_learn_fwd_part_wall_s），反向 6.40 → 6.09 s。
+
+**每步分解：预估 vs 实测（progress 计数 + nsys prof-b52m）**
+
+| 项 | B50 实测（Python） | 阶段 1 预估（设计稿 §6/§8） | 阶段 1 实测 |
+|---|---:|---:|---:|
+| 主调用延迟（poll → 应答，含 GPU 等待）ms | 11.6（均值） | ≈ 3.5 + 0.5 | **3.6** |
+| driver 每步墙钟（poll → 记录入队）ms | — | ≈ 4 | 2.5（p_act 9.25 s / 约 3,700 步） |
+| 写页 ms/步 | 0.89 | ≈ 0.1 | 主步在 C++（未单独计时）；lane 步的 Python 写页 0.20 ms |
+| 每主调用 Python 记账（消费者）ms | 2.6（在延迟路径上） | ≈ 2.2，移出延迟路径 | 移出；p_book + p_control + p_store ≈ 4.1 s/collect ≈ 1.1 ms/记录 |
+| lane 轮次 s/collect | 2.75 组装 + 1.04 submit/finish，合并进主调用 | ≈ 5（阶段 2 才动） | **10.3（actor.tick，driver 暂停）**；其中 g.native（lane 步 GPU）6.3，lane.eager 不含子 1.3，lane.control 1.0 |
+| 主线程 GIL 等待 s/collect | 2.6 | 消费者另计 | 2.06 |
+| learner GIL 等待 s/update | 4.4–5.2 | 2.5–3 | **2.50** |
+| collect s | 27.9 | ≈ 21 | **27.2** |
+
+预估错在第 5 行：设计稿假设 lane 轮次的成本与 B50 相同（≈ 5 s，且仍能和主步重叠），实际 driver 必须为每个 lane 轮次停下，lane 轮次又不再并入主调用，成本翻倍且完全串行。
+
+**nsys（prof-b52m，同 B50 方法：-t nvtx,python-gil，hand-off 2–7，窗口 130.2 s，5 个 collect，每 collect 26.0 s）**
+
+| 线程 | 持有 GIL | 等待 GIL | 每 collect/update 等待 | GIL 等待 p50 / p90 / p99 / max | B50 对照（持有 / 等待 / 每次） |
+|---|---:|---:|---:|---|---|
+| 主线程（消费者 + lane） | 36.4 s（28%） | 10.3 s | 2.06 s | 38 µs / 328 µs / 1.69 ms / 75 ms | 56.8 / 12.9 / 2.6 |
+| learner | 11.5 s | 12.5 s | **2.50 s** | 61 µs / 861 µs / 2.29 ms / 51 ms | 17.3 / 21.3 / 4.4–5.2 |
+| driver（C++） | 0 | 0 | 0 | — | — |
+
+- 主线程的 GIL 等待按所在段：段外（消费者循环、`next_record` 返回后）7.47 s、lane.finish 1.00、lane.control 0.58、g.native 0.58、其余 < 0.25。
+- lane 步（g.native）p50 1.75 ms、p99 77 ms、最长 207 ms：长尾仍在，跟着 learner 的 PPO 段走（与 B50 的 g.sync 长尾同形）。
+
+**两处停顿（分开计）**
+
+- 第 2 代 lane actor 的 graph 预录（B50：actor 线程上 9.17 s，u3 collect 34.2 s）：启动时两代一起预录（`precapture_lane_generations`，每代 20 张 1.1 s），运行中 0 次 lane 预录。u3 collect：b52-cpp 24.7 s、b52-py 25.0 s（Python 路径同样受益），对比 b48-pf 32.3 s、b47-slz 33.4 s。
+- 页分配（B50：窗口内 19 × 44 ms）：原生 PageStore 启动预分配 48 个决策页（196,608 行）+ 12 个块页（49,152 块），本次峰值 116,300 决策行 / 4,765 块，运行中 0 次扩页；nsys 窗口内没有 pages.grow 段。
+
+**learner kernel（条件 6，交 A1）**
+
+prof-b52-kern（train_tok 里 learner 线程上的 torch profiler）没有产出：kineto 报 “External init callback must run in same thread as registerClient” 后挂住，被 1500 s 时限杀掉。改用 B48 的 learner dump（`reports/b42-speed/b48-dump/learner_inputs.pt`，一个真实 update 的 22 次 forward_bucketed 调用）在主线程固定输入重放（`bridge/ops/b52_learner_kernels.py`，编译后的 Spatial、packed learner、bf16；每段 GPU 同步，GPU 上没有 actor），第 2 次热重放 11.7 s，第 3 次在 profiler 下：
+
+| 项 | 值 |
+|---|---|
+| kernel 数 / GPU 时间 | 138,067 / 5.84 s |
+| 时长 p50 / p90 / p99 / p99.9 / max | 0.003 / 0.10 / 0.51 / 1.51 / 16.2 ms |
+| ≥ 10 ms 的 | **15 个，全是 `Memcpy HtoD (Pinned -> Device)`**（fwd_grad 段，packed 输入的整块上传，10–16 ms，共 228 ms / update）；**没有任何计算 kernel ≥ 10 ms** |
+| 最长的计算 kernel | `triton_tem_fused_zeros_2` 5.4 ms；cutlass bf16 GEMM 1.1 ms；mem-efficient attention 反向 0.8 ms |
+| 按段 GPU 时间 | 反向 3.98 s（autograd 线程上的 kernel 不带 record_function 标注，记为 “-”），fwd_grad 1.58 s，fwd_nograd 0.28 s，opt 0.002 s |
+
+结论（交 A1）：B50 的假设“actor 的 >10 ms GPU 等待来自 learner 的单个长计算 kernel”在孤立重放下不成立；唯一 ≥ 10 ms 的是 learner 的 HtoD 上传（拷贝引擎不看流优先级，actor 的 H2D 会排在它后面）。actor 侧 50–200 ms 的等待更像是 learner 一次排入大量 kernel 时的排队，需要 CUDA 追踪才能定位，而这台机器的 CUPTI 在 train_tok 里不可用（B50 失败记录）。
+
+**失败记录**
+
+- 4090 cpp 门（第一次，11-09 23:28）：1 failed / 4 passed，压力测试的读线程在 driver 捕获 graph 时做 restore，CUDA 报 “operation failed due to a previous error during capture”；测试里用 `cuda_lock` 串行化 restore 与捕获（对应 learner 的捕获准入），之后通过（003672e）。
+- 4090 cpp 门（第二次，02:15）：1 failed / 19 passed，`test_block_slot_integration.py::test_leases_keep_referenced_history_and_free_the_rest` 读到 `next_decision == 0`（期望 80）。原因：原生页存储开着时 `PagedStore.next_decision` 仍是 Python 侧变量，决策 id 由 C++ 分配，计数不跟随。修法：改为代理 `native.next_decision` 的 property（85df376）。
+- prof-b52-smoke（第一次，02:26–02:46）：driver 建好（64 张图、两代 lane 预建），1200 s 内 0 个 update，GPU 利用率 0%，16 个 worker 停在 `recv_bytes` 等应答，主线程停在 `next_record`。原因：train_tok 建 driver 后只调 `resume()`，从未调 `start()`；单元门测试都是测试自己 `start()`，没有走生产入口。修法：第一次 collect 时启动线程（2df7346）；补生产入口门 `tests/test_b52_entry.py` 放进 `run_b52g.sh`（a8c1fd1）。产物移入 `reports/b42-speed/failed/nostart-*`。
+- prof-b52-smoke（第二次，03:00–03:12）其实通过（3 个 update，首次 collect 4,387 次应答 / 32,789 行），链却停了：链脚本要求 stdout 出现 u2 行，而 train_tok 只打印 u1（后面的 update 只进 progress.csv）。链脚本的检查写错，改为从全量门续跑后半段。
+- 冷编译：每个新进程的 `B42 compiled Spatial warm-up: 51 graphs` 都是 608–615 s（smoke、入口门两次、cpp、py 各一次）。这不是 B52 引入的：prof-b47-slz 603 s、prof-b48-pf 614 s、prof-b51-none 612 s 同样如此，inductor 缓存在进程之间没有复用。不计入 collect / update，但每次运行多 10 分钟（smoke 的 1200 s 时限因此被吃掉一半，已提到 1800 s）；值得单独查缓存目录 / 键（交 A1）。
+- prof-b52-kern：kineto 在 learner 线程上初始化失败后挂住（见上）；第一次 run_b52k 因 `learner_dump.load` 建的 PagedStore 走了原生后端（`'_NativePages' object has no attribute 'append'`）失败，改为 `native=False`（9bc71fa）。
+- b50_nsys.py 第一次解析 prof-b52m 无输出：它靠 actor.poll 段找 actor 线程，driver 路径没有这个段；改为退到 lane.* / actor.* 段（9bc71fa）。
+- 4090 锁：链 05:24:23 释放；run_b52k 两次各约 1 / 6 分钟，05:38:47 释放；每段前后 guard 均为 0 train_tok、0 pytest、显存 12 MiB。
+- 提交：a5bf9de、dc5b06d、0f687e0、4d96398、003672e、3abac1f、85df376、2df7346、a8c1fd1、9bc71fa（代码 / 测试 / 脚本），文档提交见下。
+
+#### 结论与下一步
+
+阶段 1 的门：update 过（17.10 s，比同树 Python 快 1.6 s，learner GIL 等待 4.4–5.2 → 2.5 s），collect 不过（27.2 s，只比同树 Python 快 1.6 s），×实时 160.8。主路径的 C++ 化本身达到了预估（主调用 3.6 ms），但 lane / CF 轮次在 Python 里、且必须暂停 driver，成了 collect 的主体（≈ 10–12 s/collect）。要过 22 s，必须让 lane 轮次不再暂停主步：阶段 2（lane 请求进 driver 的批，像 Python 路径那样与主步合并进同一次 graph 调用，Python 只保留 lane 的控制与 CF 记账），按本节数字估 collect ≈ 27.2 − 10.3 + 合并后的 lane 增量（Python 路径约 1–2 s）≈ 18–19 s。
