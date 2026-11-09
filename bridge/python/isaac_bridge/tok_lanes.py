@@ -233,7 +233,8 @@ class LaneService:
         if not got:
             self._eager(f, rows, pend, idx, ukeys)
             f['ready'] = True
-            self.stat['eager'] += 1
+            # (B46: a subclass whose calls may run graphs reports how many took the eager path)
+            self.stat['eager'] += f.get('eager_calls', 1)
         self.stat['s'] += time.perf_counter() - t0
         return True
 

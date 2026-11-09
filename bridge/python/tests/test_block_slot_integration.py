@@ -741,3 +741,106 @@ def test_memory_clear_reads_cleared_blocks_and_keeps_stored_ones():
     new = dataclasses_replace(older, blocks=older.blocks+(MemoryBlock(59, torch.full((2, 3), 9.), 0, ()),))
     kept = restore_memory_blocks(older, new, st)
     assert [float(b.value[0, 0]) for b in kept.blocks] == [1, 2, 3, 4, 5, 9]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA graphs')
+@pytest.mark.parametrize('bf16', [False, True])
+def test_merged_main_and_lane_call_replays_the_step_graph(bf16):
+    """B46: lanes in the main actor's arena (lane_slots): a merged main + lane call (owners
+    interleaved) runs the main step graph, Writer included, and equals the eager merged call of
+    separate arenas: outputs, host outputs, arena rows, pages; across block boundaries."""
+    from isaac_bridge import block_paged
+    if not block_paged.STEP_GRAPH:
+        pytest.skip('ISAAC_BLOCK_STEP_GRAPH=0')
+    torch.manual_seed(91)
+    m = make_policy('cuda').eval()
+    g = SlotBlockActor(m, 2, graph_entities=128, bf16=bf16, lane_slots=2)
+    e = SlotBlockActor(m, 2, graph_entities=128, bf16=bf16)
+    e.step_graph = None
+    lg, le = g.lane_actor(m, 2, generation=1), e.lane_actor(m, 2)
+    le.step_graph = None
+    assert lg.state is g.state and lg.base == 2+2 and le.state is not e.state
+    rng = np.random.default_rng(91)
+    tol = dict(rtol=.02, atol=.02) if bf16 else dict(rtol=1e-5, atol=1e-5)
+    for t in range(5):
+        rows = frame(rng, 2, t, np.array([1, 1]), int(t == 0))
+        pending = synth_pending(rng, 2, m.heads)
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+            g.step(rows, pending, [0, 1]); e.step(rows, pending, [0, 1])
+    lg.restore(0, g.snapshot(1)); lg.restore(1, g.snapshot(0))
+    le.restore(0, e.snapshot(1)); le.restore(1, e.snapshot(0))
+    replays = g.step_graph.replays
+    for t in range(9):
+        rows = frame(rng, 4, 10+t, np.array([1, 1, 1, 1]), 0)
+        pending = synth_pending(rng, 4, m.heads)
+        u = torch.rand((4, sum(m.heads)), device='cuda')
+        order, slots = [0, 2, 1, 3], [0, 0, 1, 1]
+        r, p = rows[order], pending[order]
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+            a = g.step(r, p, slots, owners=[g, lg, g, lg], uniform=u[order])
+            b = e.step(r, p, slots, owners=[e, le, e, le], uniform=u[order])
+        for x, y in zip(a, b):
+            torch.testing.assert_close(x.float(), y.float(), **tol)
+        np.testing.assert_allclose(g.host_output, e.host_output, **tol)
+        np.testing.assert_allclose(lg.host_output, le.host_output, **tol)
+    assert g.step_graph.replays == replays+9
+    for actor_g, actor_e in ((g, e), (lg, le)):
+        for slot in range(2):
+            ga = actor_g.state.gather(actor_g.state._ids([actor_g.base+slot])[1])
+            ea = actor_e.state.gather(actor_e.state._ids([actor_e.base+slot])[1])
+            for k in ('kv', 'bank', 'partial', 'kv_steps', 'ends', 'bank_versions', 'partial_versions'):
+                torch.testing.assert_close(ga[k].float(), ea[k].float(), **tol, msg=k)
+            gl, el = actor_g.logs[slot], actor_e.logs[slot]
+            assert gl.nb == el.nb and gl.n == el.n
+            if gl.nb:
+                torch.testing.assert_close(g.store.blocks(gl.blk[:gl.nb]), e.store.blocks(el.blk[:el.nb]), **tol)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA graphs')
+@pytest.mark.parametrize('bf16', [False, True])
+def test_writer_in_graph_equals_host_commit_blocks(bf16):
+    """B46: the step graph's device Writer + masked block writes equal the host-decided
+    BlockSlotState.commit_blocks of the eager step over 3+ block boundaries: bank_ends,
+    bank_versions, bank_sources, bank_source_versions, partial_sources, partial_versions and the
+    host step counters exactly; bank values exactly in FP32 / to BF16 tolerance (the Writer runs on
+    every row in the graph, on the completed ones only on the host); the graph hands out the
+    Writer output of the completed rows only."""
+    from isaac_bridge import block_paged
+    if not block_paged.STEP_GRAPH:
+        pytest.skip('ISAAC_BLOCK_STEP_GRAPH=0')
+    torch.manual_seed(5)
+    m = make_policy('cuda').eval()
+    g = SlotBlockActor(m, 3, graph_entities=128, bf16=bf16)
+    e = SlotBlockActor(m, 3, graph_entities=128, bf16=bf16)
+    e.step_graph = None
+    call = g.step_graph.__call__
+    seen = []
+
+    def checked(rows, pending, ids, u, replay, complete, version, greedy):
+        out = call(rows, pending, ids, u, replay, complete, version, greedy)
+        if out is not None:
+            w = out[4]
+            assert (w is None) == (not complete.any()) and (w is None or len(w) == int(complete.sum()))
+            seen.append(int(complete.sum()))
+        return out
+    g.step_graph = type('W', (), dict(__call__=lambda self, *a: checked(*a), graphs=g.step_graph.graphs,
+                                      replays=0, precapture=g.step_graph.precapture))()
+    rng = np.random.default_rng(5)
+    bs = m.block_memory.config.block_steps
+    for t in range(4*bs+3):
+        rows = frame(rng, 3, t, np.arange(3)+1, np.array([int(t == 0)]*3))
+        pending = synth_pending(rng, 3, m.heads)
+        keys = (np.full(3, t), np.arange(3))
+        with torch.autocast('cuda', dtype=torch.bfloat16, enabled=bf16):
+            g.step(rows, pending, [0, 1, 2], ukeys=keys); e.step(rows, pending, [0, 1, 2], ukeys=keys)
+    assert sum(seen) > 0
+    np.testing.assert_array_equal(g.state.step_host[:3], e.state.step_host[:3])
+    for name in ('bank_ends', 'bank_versions', 'bank_sources', 'bank_source_versions', 'partial_sources',
+                 'partial_versions'):
+        torch.testing.assert_close(getattr(g.state, name)[:3], getattr(e.state, name)[:3], rtol=0, atol=0, msg=name)
+    tol = dict(rtol=.02, atol=.02) if bf16 else dict(rtol=0, atol=1e-6)
+    torch.testing.assert_close(g.state.bank[:3].float(), e.state.bank[:3].float(), **tol)
+    for s_ in range(3):
+        gl, el = g.logs[s_], e.logs[s_]
+        assert gl.nb == el.nb > 0
+        torch.testing.assert_close(g.store.blocks(gl.blk[:gl.nb]), e.store.blocks(el.blk[:el.nb]), **tol)

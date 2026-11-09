@@ -24,6 +24,7 @@ Production replacement of the object path (EpisodeMemory / RawHistory / Snapshot
 
 Single-process only (learner thread in the actor process): pages are process-local.
 """
+import ctypes
 import os
 import threading
 import weakref
@@ -41,15 +42,21 @@ TIMING_ON = os.environ.get('ISAAC_BLOCK_TIMING', '0') == '1'
 TIMING = {}
 
 
+# B46: the phase clock no longer synchronises the GPU at each mark (27k syncs per rollout cost the
+# profiled actor ~5 s, B46 in-situ cProfile): host wall time per phase; GPU waits show up in the
+# phase that synchronises (the step graph's result copy). ISAAC_BLOCK_TIMING_SYNC=1: the old way.
+_CLOCK_SYNC = os.environ.get('ISAAC_BLOCK_TIMING_SYNC', '0') == '1'
+
+
 class _Clock:
-    """Phase timer; with ISAAC_BLOCK_TIMING=1 it synchronises the GPU at each mark (measurement only)."""
+    """Phase timer (ISAAC_BLOCK_TIMING=1): host wall time between marks (measurement only)."""
     def __init__(self, prefix, device):
         self.prefix, self.cuda = prefix, torch.device(device).type == 'cuda'
         self.t = self._now()
 
     def _now(self):
         import time
-        if TIMING_ON and self.cuda:
+        if TIMING_ON and self.cuda and _CLOCK_SYNC:
             torch.cuda.synchronize()
         return time.perf_counter()
 
@@ -102,7 +109,13 @@ UPD_KEYS = ('learn_fwd_part_wall_s', 'learn_fwd_part_gpu_s', 'learn_bwd_wall_s',
             'learn_spatial_tokens_padded', 'learn_writer_calls', 'learn_packed_host_s', 'learn_staged_mb',
             'gpu_peak_allocated_gb',
             # B45: host decode seconds of the learner's main rows / historical block sources
-            'learn_main_decode_s', 'learn_hist_decode_s')
+            'learn_main_decode_s', 'learn_hist_decode_s',
+            # B46: actor thread wall time (host seconds) per update: step graph host prep / its GPU wait, pages,
+            # the rest of SlotBlockActor.step; graph / eager step calls (main-only, merged, lane-only)
+            'actor_graph_host_s', 'actor_graph_wait_s', 'actor_pages_s', 'actor_step_s', 'actor_steps_main',
+            'actor_steps_merged', 'actor_steps_lane', 'actor_steps_eager', 'actor_rows_main', 'actor_rows_lane',
+            'lane_call_s', 'lane_answer_s', 'lane_calls', 'lane_rows', 'lane_rows_merged', 'lane_rows_graph',
+            'lane_rows_eager')
 LEARNER_ACTIVE = [False]
 
 
@@ -444,12 +457,41 @@ class PagedStore:
         (self.d_used if kind == 'd' else self.b_used)[ids] = True
         return ids
 
+    @staticmethod
+    def _np(t):
+        """A numpy view of a CPU tensor (bfloat16 as its 16-bit pattern)."""
+        return (t.view(torch.int16) if t.dtype == torch.bfloat16 else t).numpy()
+
+    def _page_np(self, pages, p):
+        """(B46) cached numpy views of the pages: pages are CPU tensors, appended, never
+        reallocated or replaced (_grow_d / _grow_b), so a view stays the page's memory."""
+        cache = self.__dict__.setdefault('_np_pages', {})
+        key = (id(pages), p)
+        v = cache.get(key)
+        t = pages[p]
+        if v is None:
+            assert t.device.type == 'cpu' and t.is_contiguous()
+            v = cache[key] = (t.data_ptr(), self._np(t))
+        assert v[0] == t.data_ptr(), 'a page was replaced: its cached view is stale'
+        return v[1]
+
     def _scatter(self, pages, ids, values):
+        # B46: numpy fancy assignment on views of the pages (torch's CPU index_put cost ~0.2 ms a call)
         P = self.page
+        ids = np.asarray(ids, np.int64)
+        if not len(ids):
+            return
+        values = torch.as_tensor(values)
+        if values.dtype != pages[0].dtype:
+            values = values.to(pages[0].dtype)
+        vals = self._np(values.contiguous())
         pg, off = ids//P, ids % P
+        if pg.min() == pg.max():
+            self._page_np(pages, int(pg[0]))[off] = vals
+            return
         for p in np.unique(pg):
             m = np.flatnonzero(pg == p)
-            pages[p][torch.from_numpy(off[m])] = values[torch.from_numpy(m)].to(pages[p].dtype)
+            self._page_np(pages, int(p))[off[m]] = vals[m]
 
     def _gather(self, pages, ids, shape, dtype, out=None):
         ids = np.asarray(ids, np.int64)
@@ -661,10 +703,14 @@ def precapture_actor(actor, merged=True):
     made = 0
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=actor.bf16):
         if actor.step_graph is not None:
-            for cap in PRECAPTURE_CAPS:
+            # B46: a merged main + lane call (up to main + lane rows) replays the step graph too
+            caps = sorted(set(PRECAPTURE_CAPS) | (set(PRECAPTURE_MERGED_CAPS) if merged and actor.lane_slots else set()))
+            for cap in caps:
                 for e in PRECAPTURE_ENTITIES:
                     made += int(actor.step_graph.precapture(cap, e))
-        if merged and actor.encoder is not None:
+        # (B46: with lanes in the main arena merged calls replay the step graph: the separate
+        # Spatial / Reader graphs of the eager merged path are not pre-captured -- their own pools)
+        if merged and actor.encoder is not None and not (actor.step_graph is not None and actor.lane_slots):
             memory = actor.model.block_memory
             scratch = actor.state.slots-1
             nh = len(actor.model.heads)
@@ -689,16 +735,54 @@ _STEP_KEYS = ('v_room', 'v_map', 'v_body', 'v_body_mask', 'v_local', 'v_local_ma
               'v_inventory', 'v_inventory_mask', 'v_slots', 'v_slots_mask', 'pending')
 
 
+_STEP_FLOAT = {'v_room': (1792,), 'v_map': (169,), 'v_body': (None, 80), 'v_local': (None, 324),
+               'v_entity': (None, 48), 'v_inventory': (None, 4), 'v_slots': (None, 13)}
+_STEP_WIDTH = {'v_body': 0, 'v_body_mask': 0, 'v_local': 0, 'v_local_mask': 0, 'v_entity': 1, 'v_entity_mask': 1,
+               'v_inventory': 2, 'v_inventory_mask': 2, 'v_slots': 3, 'v_slots_mask': 3}
+_UNPACK_KEYS = ('v_room', 'v_map', 'v_body', 'v_body_mask', 'v_local', 'v_local_mask', 'v_entity', 'v_entity_mask',
+                'v_inventory', 'v_inventory_mask', 'v_slots', 'v_slots_mask')
+
+
+_STEP_POOLS = {}
+
+
+def _step_pool(device, stream):
+    """(B46) The actor step graphs' shared memory pool of a device. A pool lives while a graph
+    using it does: a one-op keepalive graph is captured into it first and kept, so the pool
+    survives every step graph being dropped (LRU, a discarded actor) and later captures reuse it."""
+    key = str(device)
+    if key not in _STEP_POOLS:
+        from .block_training import graph_capture
+        pool = torch.cuda.graph_pool_handle()
+        with torch.inference_mode(False):
+            x = torch.zeros(1, device=device)
+        keep = torch.cuda.CUDAGraph()
+        with graph_capture(keep, stream, pool):
+            x.add_(1)
+        _STEP_POOLS[key] = (pool, keep, x)
+    return _STEP_POOLS[key][0]
+
+
+def step_widths(counts):
+    """The step graph's ragged widths (body, entity, inventory, slots) of records with these
+    header counts [n,4] (p,e,n,s): decode_frame_host's buckets."""
+    from .structured_input import bucket_width
+    counts = np.asarray(counts, np.int64)
+    return tuple(bucket_width(name, int(counts[:, j].max()) if len(counts) else 1)
+                 for name, j in (('body', 0), ('entity', 1), ('inventory', 2), ('slots', 3)))
+
+
 class ActorStepGraph:
     """One CUDA graph per (row capacity, ragged buckets, autocast, greedy) replaying a whole
-    actor step of one arena: bitplane canvas expansion, compiled Spatial + resampler, slot
-    gather, Reader, the step's K/V/latent/step-counter writes (commit_device), heads and
-    Gumbel-max sampling with the replay mask. The inputs (host-decoded frames, actions under
-    way, arena rows, uniforms, replay mask, policy version) go in one pinned slab -> one H2D
-    copy into the graph's static slab; the outputs come back in three D2H copies and one
-    synchronisation. Host-decided work stays outside: episode resets, the Writer on completed
-    blocks, pages. Padded rows address the arena's scratch row (never a live slot). LRU of
-    128 graphs."""
+    actor step on one arena: bitplane canvas expansion, compiled Spatial + resampler, slot
+    gather, Reader, the step's K/V/latent/step-counter writes (commit_device), B46: the Writer on
+    every row with the completed-block writes kept only on the rows the host marks complete,
+    heads and Gumbel-max sampling with the replay mask. The inputs (frames unpacked into the
+    graph's pinned slab -- in C, abp_visible_unpack, when available --, actions under way, arena
+    rows, uniforms, replay and complete masks, policy version) go in one H2D copy; the outputs
+    come back in up to four D2H copies and one synchronisation. Host-decided work stays outside:
+    episode resets, pages. Padded rows address the arena's scratch row (never a live slot).
+    LRU of 128 graphs."""
     def __init__(self, actor, limit=128):
         from collections import OrderedDict
         self.actor, self.limit = actor, int(limit)
@@ -706,15 +790,24 @@ class ActorStepGraph:
         self.captures = self.replays = self.busy_misses = 0
         self.device = next(actor.model.parameters()).device
         self.capture = torch.cuda.Stream(device=self.device)
+        from .visible_native import load
+        self.native = load()
 
-    def _layout(self, host, cap, heads):
+    def _layout(self, widths, cap, heads, nh):
         shapes = {}
         for k in _STEP_KEYS:
-            v = host[k]
-            shapes[k] = ((cap,)+tuple(v.shape[1:]), np.dtype(v.dtype))
+            if k == 'pending':
+                shapes[k] = ((cap, nh), np.dtype(np.int64))
+            elif k.endswith('_mask'):
+                shapes[k] = ((cap, widths[_STEP_WIDTH[k]]), np.dtype(bool))
+            else:
+                tail = _STEP_FLOAT[k]
+                tail = tail if tail[0] is not None else (widths[_STEP_WIDTH[k]], tail[1])
+                shapes[k] = ((cap,)+tail, np.dtype(np.float32))
         shapes['ids'] = ((cap,), np.dtype(np.int64))
         shapes['u'] = ((cap, heads), np.dtype(np.float32))
         shapes['replay'] = ((cap,), np.dtype(bool))
+        shapes['complete'] = ((cap,), np.dtype(bool))
         shapes['version'] = ((1,), np.dtype(np.int64))
         layout, at = {}, 0
         for k, (shape, dt) in shapes.items():
@@ -739,11 +832,12 @@ class ActorStepGraph:
         from .structured_input import canvas_decoder
         actor = self.actor
         model, memory, state = actor.model, actor.model.block_memory, actor.state
+        c = memory.config
         with torch.inference_mode(False), torch.no_grad(), torch.autocast('cuda', enabled=False):
             room, local, minimap = canvas_decoder()(st['v_room'], st['v_local'], st['v_map'])
         b = {k: st[k] for k in _STEP_KEYS}
         b['v_room'], b['v_local'], b['v_map'] = room, local, minimap
-        ids, version = st['ids'], st['version'][0]
+        ids, version, done = st['ids'], st['version'][0], st['complete']
         keep = {}
 
         def call(z):
@@ -751,7 +845,23 @@ class ActorStepGraph:
             hidden, tokens, current, allowed, mask = memory.read(z[:, None], steps[:, None], prefixes, bank, ends, kp)
             current = torch.stack([torch.stack(pair) for pair in current])
             state.commit_device(ids, steps, z, current, version)
-            keep['current'], keep['z'] = current, z
+            # B46: BlockSlotState.commit_blocks on the device: the Writer on every row's open block
+            # (this step's latent included), its writes kept only where the host marked the block
+            # complete (padded rows: the scratch row, never complete)
+            written = memory.writer(state.partial.index_select(0, ids).to(z.dtype))
+            column = torch.div(steps, c.block_steps, rounding_mode='floor') % c.memory_blocks
+            d1 = done[:, None]
+            state.bank[ids, column] = torch.where(done[:, None, None], written.to(state.dtype),
+                                                  state.bank[ids, column])
+            state.bank_ends[ids, column] = torch.where(done, steps, state.bank_ends[ids, column])
+            state.bank_versions[ids, column] = torch.where(done, version.expand_as(steps),
+                                                           state.bank_versions[ids, column])
+            src, srcv = state.partial_sources.index_select(0, ids), state.partial_versions.index_select(0, ids)
+            state.bank_sources[ids, column] = torch.where(d1, src, state.bank_sources[ids, column])
+            state.bank_source_versions[ids, column] = torch.where(d1, srcv, state.bank_source_versions[ids, column])
+            state.partial_sources[ids] = torch.where(d1, torch.full_like(src, -1), src)
+            state.partial_versions[ids] = torch.where(d1, torch.full_like(srcv, -1), srcv)
+            keep['current'], keep['z'], keep['written'] = current, z, written
             return dict(hidden=hidden, tokens=tokens, local_mask=allowed, memory_mask=mask, positions=steps[:, None])
         ctx = {'memory_call': call, 'reset_done': True}
         result = model.act(b, u=None if greedy else st['u'], greedy=greedy, need_vg=True, temporal=ctx)
@@ -760,7 +870,7 @@ class ActorStepGraph:
         logp = result[1].masked_fill(replay, 0)
         out = torch.cat((actions.float(), logp[:, None].float(), result[2][:, None].float(),
                          result[3][:, None].float()), 1)
-        return out, keep['current'], keep['z']
+        return out, keep['current'], keep['z'], keep['written']
 
     def _capture(self, key, layout, size, greedy):
         from .block_training import CUDA_CAPTURE_ADMISSION, capture_admission
@@ -773,15 +883,18 @@ class ActorStepGraph:
             if len(self.graphs) >= self.limit:
                 self.graphs.popitem(last=False)
             dev = self.device
+            scratch = self.actor.state.slots-1
             # Normal (not inference-mode) tensors, as from_host makes: the compiled decoder and
             # Spatial guard on the dispatch keys (an inference tensor recompiled them).
             with torch.inference_mode(False):
                 flat = torch.zeros(size, dtype=torch.uint8, device=dev)
                 st = self._views(flat, layout, True)
-                st['ids'].fill_(self.actor.state.slots-1)       # the arena's scratch row
+                st['ids'].fill_(scratch)                       # the arena's scratch row
                 st['u'].fill_(.5)
             host = torch.zeros(size, dtype=torch.uint8).pin_memory()
             hv = self._views(host.numpy(), layout, False)
+            hv['ids'][:] = scratch
+            hv['u'][:] = .5
             for _ in range(3):
                 self._body(st, greedy)
             torch.cuda.synchronize(dev)
@@ -792,12 +905,15 @@ class ActorStepGraph:
             torch.clear_autocast_cache()
             graph = torch.cuda.CUDAGraph()
             from .block_training import graph_capture
-            with graph_capture(graph, self.capture):   # B42: no full gc.collect / empty_cache per capture
-                out, current, z = self._body(st, greedy)
-            back = (torch.empty(out.shape, dtype=out.dtype).pin_memory(),
-                    torch.empty(current.shape, dtype=current.dtype).pin_memory(),
-                    torch.empty(z.shape, dtype=z.dtype).pin_memory())
-            self.graphs[key] = (flat, host, hv, graph, out, current, z, back)
+            # B46: one memory pool for every actor step graph of this device (main, merged and
+            # lane-generation graphs replay one at a time on the actor's stream, their outputs stay
+            # referenced): a private pool per graph held ~5 GB and a late capture ran the 4090 out
+            # of memory (prof-b46d u5)
+            pool = _step_pool(dev, self.capture)
+            with graph_capture(graph, self.capture, pool):   # B42: no full gc.collect / empty_cache per capture
+                out, current, z, written = self._body(st, greedy)
+            back = tuple(torch.empty(x.shape, dtype=x.dtype).pin_memory() for x in (out, current, z, written))
+            self.graphs[key] = (flat, host, hv, graph, out, current, z, written, back, [0])
             self.captures += 1
             ucount('actor_captures_step', 1); ucount('actor_capture_step_s', time_.perf_counter()-t_cap)
             late_capture('step', key)
@@ -805,69 +921,107 @@ class ActorStepGraph:
         finally:
             CUDA_CAPTURE_ADMISSION.release()
 
+    def _key(self, cap, widths, greedy):
+        auto = torch.is_autocast_enabled('cuda')
+        return (cap, tuple(int(w) for w in widths), auto, torch.get_autocast_dtype('cuda') if auto else None,
+                bool(greedy))
+
     def precapture(self, n, entities, greedy=False):
         """B42 fix 2: capture the graph of an n-row step whose frames have `entities` entities
         (one body, no items/slots: inventory/slot widths are their fixed buckets) without
         replaying it, in the caller's inference/autocast context. True when captured now."""
-        from .structured_input import decode_frame_host
-        host = decode_frame_host(synthetic_rows(n, entities), packed=True)
-        host['pending'] = np.zeros((n, len(self.actor.model.heads)), np.int64)
+        from .structured_input import check_frames
+        rows = synthetic_rows(n, entities)
         cap = 1 << (n-1).bit_length()
-        auto = torch.is_autocast_enabled('cuda')
-        key = (cap, tuple(host[k].shape[1] for k in ('v_body', 'v_entity', 'v_inventory', 'v_slots')),
-               auto, torch.get_autocast_dtype('cuda') if auto else None, bool(greedy))
+        widths = step_widths(check_frames(rows))
+        key = self._key(cap, widths, greedy)
         if key in self.graphs:
             return False
-        layout, size = self._layout(host, cap, sum(self.actor.model.heads))
+        layout, size = self._layout(widths, cap, sum(self.actor.model.heads), len(self.actor.model.heads))
         return self._capture(key, layout, size, greedy) is not None
 
-    def __call__(self, host, rows_ids, u, replay, version, greedy):
-        """host: decode_frame_host(rows, packed=True) plus 'pending'; rows_ids: arena rows [n];
-        u: uniforms [n, heads] (numpy or tensor; None when greedy); replay: bool [n].
-        Returns (out [n, heads+3] numpy, current K/V [L,2,n,H,lat,dh] cpu, z [n,lat,w] cpu,
-        z dtype), or None when not captured (capture admission busy / over 1024 tokens)."""
+    def __call__(self, rows, pending, rows_ids, u, replay, complete, version, greedy):
+        """rows: ROW records (frames inline; header-checked here); pending [n, heads] int64;
+        rows_ids: arena rows [n]; u: uniforms [n, heads] (numpy or tensor; None when greedy);
+        replay / complete: bool [n]. Returns (out [n, heads+3] numpy, current K/V
+        [L,2,n,H,lat,dh] cpu, z [n,lat,w] cpu, z dtype, written [n,tokens,w] cpu: valid on the
+        complete rows), or None when not captured (capture admission busy / over 1024 tokens)."""
+        from .structured_input import check_frames
+        import time as time_
+        t_call = time_.perf_counter()
         n = len(rows_ids)
         cap = 1 << (n-1).bit_length()
         heads = sum(self.actor.model.heads)
-        widths = tuple(host[k].shape[1] for k in ('v_body', 'v_entity', 'v_inventory', 'v_slots'))
+        widths = step_widths(check_frames(rows))
         if 30+2*widths[0]+sum(widths[1:]) > 1024:
             return None
-        auto = torch.is_autocast_enabled('cuda')
-        adt = torch.get_autocast_dtype('cuda') if auto else None
-        key = (cap, widths, auto, adt, bool(greedy))
+        key = self._key(cap, widths, greedy)
         entry = self.graphs.get(key)
         if entry is None:
-            layout, size = self._layout(host, cap, heads)
+            layout, size = self._layout(widths, cap, heads, len(self.actor.model.heads))
             entry = self._capture(key, layout, size, greedy)
             if entry is None:
                 return None
         else:
             self.graphs.move_to_end(key)
-        flat, hbuf, hv, graph, out, current, z, back = entry
-        hbuf.numpy()[:] = 0
-        for k in _STEP_KEYS:
-            hv[k][:n] = host[k]
-        hv['ids'][:] = self.actor.state.slots-1
+        flat, hbuf, hv, graph, out, current, z, written, back, filled = entry
+        lib = self.native
+        if lib is not None and 'visible_frame' in rows.dtype.names:
+            # B46: frames unpacked in C straight into the pinned slab (rows past n: zeroed below)
+            rows = np.ascontiguousarray(rows)
+            at = rows.dtype.fields['visible_frame'][1]
+            rc = lib.unpack(rows.ctypes.data+at, rows.dtype.itemsize, n, widths,
+                            [hv[k].ctypes.data for k in _UNPACK_KEYS])
+            if rc != 0:
+                raise ValueError('abp_visible_unpack: a count exceeds its bucket width')
+        else:
+            from .structured_input import decode_frame_host
+            host = decode_frame_host(rows, packed=True)
+            for k in _UNPACK_KEYS:
+                hv[k][:n] = host[k]
+        hv['pending'][:n] = pending
+        m = filled[0]   # rows past n held another call's rows: zero them
+        if m > n:
+            for k in _STEP_KEYS:
+                hv[k][n:m] = 0
+        filled[0] = n
+        hv['ids'][n:] = self.actor.state.slots-1
         hv['ids'][:n] = rows_ids
         hv['u'][:] = .5
         if u is not None:
             hv['u'][:n] = u.float().cpu().numpy() if isinstance(u, torch.Tensor) else u
+        hv['replay'][:] = False
         hv['replay'][:n] = replay
+        hv['complete'][:] = False
+        hv['complete'][:n] = complete
         hv['version'][0] = int(version)
         flat.copy_(hbuf, non_blocking=True)
         graph.replay()
         self.replays += 1
-        bo, bc, bz = back
+        bo, bc, bz, bw = back
         bo.copy_(out, non_blocking=True)
         bc.copy_(current, non_blocking=True)
         bz.copy_(z, non_blocking=True)
+        done = np.flatnonzero(complete)
+        if len(done):
+            bw.copy_(written, non_blocking=True)
+        t_wait = time_.perf_counter()
         torch.cuda.current_stream(self.device).synchronize()
-        return bo.numpy()[:n], bc[:, :, :n], bz[:n], z.dtype
+        ucount('actor_graph_host_s', t_wait-t_call); ucount('actor_graph_wait_s', time_.perf_counter()-t_wait)
+        # the Writer ran on every row; only the complete rows' blocks are handed out (the other rows of
+        # the pinned buffer hold another call's values): [len(done), tokens, width], in row order
+        written_c = bw.index_select(0, torch.from_numpy(done)) if len(done) else None
+        return bo.numpy()[:n], bc[:, :, :n], bz[:n], z.dtype, written_c, bo[:n]
 
 
 class SlotBlockActor:
     """BlockActor's interface on dense GPU slots and paged snapshots."""
-    def __init__(self, model, slots, graph_entities=0, bf16=False, store=None):
+    def __init__(self, model, slots, graph_entities=0, bf16=False, store=None, arena=None, base=0, lane_slots=0,
+                 lane_generations=2):
+        """B46: lane_slots > 0 (the main actor): its arena also holds lane_generations x lane_slots
+        rows for the teacher-generation lane actors (lane_actor), so a merged main + lane call is
+        one arena call (the main actor's step graph). arena / base: a lane actor's rows in the
+        main actor's arena start at base."""
         if model.block_memory is None:
             raise ValueError('SlotBlockActor requires a block-memory policy')
         from .block_training import SpatialEncoderGraph, ReaderStepGraph
@@ -880,22 +1034,36 @@ class SlotBlockActor:
         kv_dtype = torch.bfloat16 if self.bf16 else torch.float32
         self.store = PagedStore(cfg, len(model.heads), kv_dtype) if store is None else store
         graph_step = bool(graph_entities) and STEP_GRAPH and device.type == 'cuda'
-        # B42 glue 5: one extra arena row (the scratch row padded graph rows address).
-        self.state = BlockSlotState(cfg, slots+int(graph_step), device=device, kv_dtype=kv_dtype)
+        self.n_slots, self.base = int(slots), int(base)
+        if arena is None:
+            # B42 glue 5: one extra arena row (the scratch row padded graph rows address).
+            self.lane_slots, self.lane_generations = int(lane_slots), int(lane_generations)
+            total = slots+self.lane_slots*self.lane_generations+int(graph_step)
+            self.state = BlockSlotState(cfg, total, device=device, kv_dtype=kv_dtype)
+        else:
+            self.lane_slots, self.lane_generations = 0, 0
+            self.state = arena
         self.step_graph = ActorStepGraph(self) if graph_step else None
         self.logs = [EpisodeLog(None) for _ in range(slots)]
         self.store.roots.append(weakref.WeakMethod(self._live))
         self.version = 0
         self.last_contexts = []
         self.last_result = None
+        self.last_path = None   # (B46: 'graph' / 'eager': the path of the last step)
         self.pending = [np.zeros((1, len(model.heads)), dtype=np.int64) for _ in range(slots)]
 
     def _live(self):
-        return [(log, int(step)) for log, step in zip(self.logs, self.state.step_host)]
+        return [(log, int(step)) for log, step in zip(self.logs, self.state.step_host[self.base:self.base+self.n_slots])]
 
-    def lane_actor(self, model, slots):
-        """A teacher-generation actor sharing this actor's page store (merged batches allowed)."""
-        lane = SlotBlockActor(model, slots, graph_entities=self.graph_entities, bf16=self.bf16, store=self.store)
+    def lane_actor(self, model, slots, generation=None):
+        """A teacher-generation actor sharing this actor's page store (merged batches allowed). B46:
+        with room in this actor's arena (lane_slots), generation g's lanes are its rows
+        n_slots + g * lane_slots + lane: a merged main + lane call replays the main step graph."""
+        arena = base = None
+        if generation is not None and 0 <= int(generation) < self.lane_generations and slots <= self.lane_slots:
+            arena, base = self.state, self.base+self.n_slots+int(generation)*self.lane_slots
+        lane = SlotBlockActor(model, slots, graph_entities=self.graph_entities, bf16=self.bf16, store=self.store,
+                              arena=arena, base=base or 0)
         if PRECAPTURE and lane.step_graph is not None:
             # B42 fix 2: its lane-only step graphs now (a capture refused while the learner holds
             # the admission stays lazy)
@@ -905,7 +1073,7 @@ class SlotBlockActor:
         return lane
 
     def snapshot(self, slot):
-        return PagedSnapshot(self.store, self.logs[slot], self.state.step_host[slot], self.pending[slot].copy(),
+        return PagedSnapshot(self.store, self.logs[slot], self.state.step_host[self.base+slot], self.pending[slot].copy(),
                              self.version)
 
     def restore(self, slot, snapshot):
@@ -913,7 +1081,7 @@ class SlotBlockActor:
             raise ValueError('slot actors restore paged snapshots of their own store')
         st, parts = self.store, self.store.snapshot_parts(snapshot)
         meta = st.d_meta
-        self.state.load(slot, parts['step'], st.kv(parts['kvs']), parts['kv_steps'], meta[parts['kvs'], 1],
+        self.state.load(self.base+slot, parts['step'], st.kv(parts['kvs']), parts['kv_steps'], meta[parts['kvs'], 1],
                         st.z(parts['pkvs']), meta[parts['pkvs'], 1], parts['pdec'],
                         st.blocks(parts['bid']), parts['ends'], st.b_meta[parts['bid'], 1],
                         st.b_src[parts['bid']], st.b_srcver[parts['bid']])
@@ -938,7 +1106,7 @@ class SlotBlockActor:
         memory = self.model.block_memory
         for i, (owner, slot) in enumerate(zip(owners, slots)):
             if rows['first'][i]:
-                owner.state.reset([slot])
+                owner.state.reset([owner.base+slot])
                 owner.logs[slot] = EpisodeLog((os.getpid(), slot, int(rows['episode'][i])))
             owner.pending[slot] = pending[i:i+1].copy()
         contexts = [owner.snapshot(slot) for owner, slot in zip(owners, slots)]
@@ -949,21 +1117,37 @@ class SlotBlockActor:
         groups = list(groups.values())
         reader = self.reader
         version = self.version
-        steps_host = np.array([owner.state.step_host[slot] for owner, slot in zip(owners, slots)], np.int64)
+        steps_host = np.array([owner.state.step_host[owner.base+slot] for owner, slot in zip(owners, slots)], np.int64)
         record = {}
         import time as time_
         t_call, active = time_.perf_counter(), LEARNER_ACTIVE[0]
-        if self.step_graph is not None and all(owner is self for owner in owners):
-            done = self._graph_step(rows, pending, slots, ukeys, greedy, evaluate, uniform, steps_host, record, clock)
+        # B46: a merged main + lane call on one arena replays this actor's step graph too (one
+        # policy version: the lanes' rows through this actor's weights, as the eager merged call)
+        n_self = sum(owner is self for owner in owners)
+        kind = 'main' if n_self == len(owners) and self.lane_slots else (
+            'lane' if n_self == len(owners) else 'merged')
+        if self.step_graph is not None and all(owner.state is self.state for owner in owners):
+            done = self._graph_step(rows, pending, slots, owners, groups, ukeys, greedy, evaluate, uniform, steps_host,
+                                    record, clock)
             if done is not None:
+                self.last_path = 'graph'
                 result, host, kv_host, z_host = done
+                t_pages = time_.perf_counter()
                 self._pages(rows, pending, slots, owners, groups, record, host, kv_host, z_host, steps_host, contexts)
                 clock.mark('pages')
+                if TIMING_ON:
+                    t_end = time_.perf_counter()
+                    ucount('actor_pages_s', t_end-t_pages); ucount('actor_step_s', t_end-t_call)
+                    ucount('actor_steps_'+kind, 1)
+                    ucount('actor_rows_main' if kind != 'lane' else 'actor_rows_lane', n_self)
+                    if kind == 'merged':
+                        ucount('actor_rows_lane', len(owners)-n_self)
                 if TIMING_ON:
                     dt = time_.perf_counter()-t_call
                     ucount('actor_graph_calls', 1); ucount('actor_graph_s', dt)
                     ucount('actor_graph_overlap_s', dt if active or LEARNER_ACTIVE[0] else 0.0)
                 return result
+        self.last_path = 'eager'
         if TIMING_ON:
             ucount('actor_eager_calls', 1); ucount('actor_eager_merged_calls', int(len(groups) > 1))
 
@@ -971,7 +1155,7 @@ class SlotBlockActor:
             clock.mark('decode_spatial')
             perm, parts, hosts = [], [], []
             for owner, positions in groups:
-                host, ids = owner.state._ids([slots[i] for i in positions])
+                host, ids = owner.state._ids([owner.base+slots[i] for i in positions])
                 parts.append((owner, host, ids, owner.state.read_inputs(memory, ids, z.dtype)))
                 perm.extend(positions)
             if len(parts) == 1:
@@ -991,7 +1175,7 @@ class SlotBlockActor:
                 n = len(host)
                 completed, written = owner.state.commit(memory, host, ids, inp[0], zp[at:at+n],
                                                         current[:, :, at:at+n], version)
-                record[id(owner)] = (at, completed, written)
+                record[id(owner)] = (np.arange(at, at+n), completed, written)
                 at += n
             record['current'], record['z'] = current, zp
             inv = None
@@ -1030,6 +1214,8 @@ class SlotBlockActor:
             if replay.any() and uniform is None and not greedy:
                 uniform = torch.full((len(rows), sum(self.model.heads)), .5, device=device)
                 uniform[np.flatnonzero(~replay).tolist()] = torch.rand((int((~replay).sum()), sum(self.model.heads)), device=device)
+            if isinstance(uniform, torch.Tensor) and uniform.device != device:   # (B46: host uniforms)
+                uniform = uniform.to(device)
             result = self.model.act(b, u=uniform, greedy=greedy, need_vg=True, temporal=ctx)
             if replay.any():
                 mask = torch.from_numpy(replay.copy())
@@ -1051,18 +1237,18 @@ class SlotBlockActor:
         clock.mark('pages')
         if TIMING_ON:
             dt = time_.perf_counter()-t_call
+            ucount('actor_step_s', dt)
             ucount('actor_eager_s', dt); ucount('actor_eager_overlap_s', dt if active or LEARNER_ACTIVE[0] else 0.0)
         return result
 
 
-    def _graph_step(self, rows, pending, slots, ukeys, greedy, evaluate, uniform, steps_host, record, clock):
-        """B42 glue 5: the step through ActorStepGraph (None: not captured; the eager path runs)."""
-        from .structured_input import decode_frame_host
+    def _graph_step(self, rows, pending, slots, owners, groups, ukeys, greedy, evaluate, uniform, steps_host, record,
+                    clock):
+        """B42 glue 5 / B46: the step through ActorStepGraph, the Writer included (None: not
+        captured; the eager path runs). Rows may belong to several owners of this arena."""
         from .tok_policy import crn_uniforms
         n = len(slots)
         heads = sum(self.model.heads)
-        host = decode_frame_host(rows, packed=True)
-        host['pending'] = np.asarray(pending, np.int64)
         replay = np.broadcast_to(np.asarray(evaluate, dtype=bool), (n,)).copy()
         u = None
         if not greedy:
@@ -1075,30 +1261,31 @@ class SlotBlockActor:
                 # torch uniforms is the same categorical distribution (the graph needs uniforms).
                 u = torch.rand((n, heads)).numpy()
             u = np.where(replay[:, None], np.float32(.5), u.float().cpu().numpy() if isinstance(u, torch.Tensor) else u)
+        ids = np.array([owner.base+slot for owner, slot in zip(owners, slots)], np.int64)
+        bs = self.model.block_memory.config.block_steps
+        complete = (steps_host+1) % bs == 0
         clock.mark('decode_host')
-        out = self.step_graph(host, np.asarray(slots, np.int64), u, replay, self.version, greedy)
+        out = self.step_graph(rows, np.asarray(pending, np.int64), ids, u, replay, complete, self.version, greedy)
         if out is None:
             return None
-        out, cur, zc, zdtype = out
+        out, cur, zc, zdtype, written, out_t = out
         clock.mark('graph')
         count('actor.graph_calls', 1)
-        memory = self.model.block_memory
-        bs = memory.config.block_steps
-        ids = steps = None
-        if np.any((steps_host+1) % bs == 0):
-            ids = self.state._ids(slots)[1]
-            steps = torch.from_numpy(steps_host)
-            if ids.device.type == 'cuda':
-                steps = steps.pin_memory()
-            steps = steps.to(ids.device, non_blocking=True)
-        completed, written = self.state.commit_blocks(memory, np.asarray(slots, np.int64), ids, steps, zdtype,
-                                                      self.version)
+        self.state.step_host[ids] += 1
+        rank = np.cumsum(complete)-1   # (row -> its row of `written`, the complete rows only)
+        for owner, positions in groups:
+            pos = np.asarray(positions, np.int64)
+            done = np.flatnonzero(complete[pos])
+            assert complete[pos[done]].all()
+            record[id(owner)] = (pos, done, written.index_select(0, torch.from_numpy(rank[pos[done]]))
+                                 if len(done) else None)
         clock.mark('writer')
-        count('actor.writer_rows', len(completed))
-        record[id(self)] = (0, completed, written)
+        count('actor.writer_rows', int(complete.sum()))
         dev = next(self.model.parameters()).device
         nh = len(self.model.heads)
-        res = torch.as_tensor(out).to(dev)
+        # (B46: from the pinned output buffer, asynchronously: the next replay's copy into it is
+        # ordered after this one on the same stream; callers read host_output)
+        res = out_t.to(dev, non_blocking=True)
         result = (res[:, :nh].long(), res[:, nh], res[:, nh+1], res[:, nh+2])
         self.last_result = None
         return result, out.copy(), cur.permute(2, 0, 1, 3, 4, 5), zc.float()
@@ -1108,11 +1295,11 @@ class SlotBlockActor:
         memory = self.model.block_memory
         version = self.version
         for owner, positions in groups:
-            at, completed, written = record[id(owner)]
-            k = len(positions)
+            at, completed, written = record[id(owner)]   # (at: the owner's rows of kv_host / z_host)
             sub = np.asarray(positions)
-            dec, kvs = self.store.write_decisions(rows[sub], pending[sub], kv_host[at:at+k], z_host[at:at+k],
-                                                  steps_host[sub], version)
+            at_t = torch.from_numpy(np.asarray(at, np.int64))
+            dec, kvs = self.store.write_decisions(rows[sub], pending[sub], kv_host.index_select(0, at_t),
+                                                  z_host.index_select(0, at_t), steps_host[sub], version)
             if len(completed):
                 values = written.float().cpu()
                 srcs, srcver, ends, logs = [], [], [], []

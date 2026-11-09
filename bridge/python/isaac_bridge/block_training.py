@@ -60,16 +60,17 @@ def capture_yield():
 
 
 @contextmanager
-def graph_capture(graph,stream):
+def graph_capture(graph,stream,pool=None):
     """torch.cuda.graph(graph, stream=stream) without its gc.collect() and empty_cache().
 
     B42 prof-f3: the full collection over this process's Python objects (page store, logs,
     rollouts) took ~5.7 s per capture while the learner, which had yielded the capture
     admission, waited. The admission protocol is unchanged: no other CUDA work is submitted
-    while this capture runs. The caching allocator keeps its blocks (no empty_cache)."""
+    while this capture runs. The caching allocator keeps its blocks (no empty_cache). pool (B46):
+    a graph_pool_handle shared with other graphs that never replay concurrently."""
     torch.cuda.synchronize()
     with torch.cuda.stream(stream):
-        graph.capture_begin(capture_error_mode='global')
+        graph.capture_begin(pool=pool,capture_error_mode='global')
         try:
             yield graph
         finally:

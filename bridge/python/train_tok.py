@@ -2580,7 +2580,11 @@ def main(argv=None, child=None, actor=None):
     if block_on and child is None and bench_job is None:
         if args.block_slots:
             from isaac_bridge.block_paged import SlotBlockActor
-            block_actor = SlotBlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
+            # B46: room for the teacher-generation lanes (one per worker, two generations) in the
+            # main arena: merged main + lane calls replay the main step graph
+            lanes_b = bool(args.cf or args.teacher_v2) and args.mode in ('floor','run')
+            block_actor = SlotBlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16,
+                                         lane_slots=n if lanes_b else 0)
         else:
             block_actor = BlockActor(model,n,graph_entities=args.graph_entities,bf16=args.actor_bf16)
         from isaac_bridge import block_paged as bp_pre
@@ -3983,6 +3987,10 @@ def main(argv=None, child=None, actor=None):
             'wait_learner_s': job['wait_learner_s'],
             'infer_upd_ms': 1000 * prof['act_busy'] / max(prof['calls_busy'], 1), 'calls_upd': prof['calls_busy'],
             'p_poll': prof['poll'], 'p_book': prof['book'], 'p_act': prof['act'], 'p_reply': prof['reply'],
+            # B46: the rest of the actor thread's collect wall time (lane rounds outside main calls, control,
+            # weight swaps, the main answers inside the calls)
+            'p_tick': prof.get('tick', 0.0), 'p_control': prof.get('control', 0.0),
+            'p_weights': prof.get('weights', 0.0), 'p_main_ready': prof.get('main_ready', 0.0),
             'p_store': prof['store'], 'polls': prof['polls'],
             'idle_share': dst['wait_s'] / max(n * job['cycle_s'], 1e-9), 'w_step': dst['step_s'],
             'w_wait': dst['wait_s'], 'w_encode': dst['encode_s'], 'w_fork': dst['fork_s'], 'w_teach': dst['teach_s'],
@@ -4117,6 +4125,7 @@ def main(argv=None, child=None, actor=None):
                 row['block_merged_lane_rows']=lane_stat.get('merged_lane_rows',0)
                 row['block_graph_captures']=lane_stat.get('block_graph_captures',0)
                 row['block_graph_replays']=lane_stat.get('block_graph_replays',0)
+                row['block_step_graph_replays']=lane_stat.get('block_step_graph_replays',0)
                 row['block_teacher_forward_calls']=lane_stat.get('block_teacher_forward_calls',0)
                 row['block_mixed_replay_calls']=lane_stat.get('block_mixed_replay_calls',0)
                 for k_b in ('block_gc_s','block_kv_rows','block_blocks','block_raw_rows'):
@@ -4749,7 +4758,12 @@ def main(argv=None, child=None, actor=None):
             cpu_c0 = cpu_ticks()
             prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=0, calls=0, rows=0, eager=0,
                         act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0, cf_snaps=0,
-                        main_ready=0.0, control=0.0)
+                        main_ready=0.0, control=0.0, tick=0.0, weights=0.0)
+
+            def _lane_tick(prof_):   # (B46: the actor thread's lane rounds outside a main call, timed)
+                t_k = time.perf_counter()
+                lanes.tick()
+                prof_['tick'] += time.perf_counter() - t_k
             actor_profile_path=os.environ.get('ISAAC_BLOCK_ACTOR_PROFILE','')
             actor_profile=None
             if actor_profile_path and sent_handoffs==int(os.environ.get('ISAAC_BLOCK_ACTOR_PROFILE_AT','20')):
@@ -4759,7 +4773,7 @@ def main(argv=None, child=None, actor=None):
             while roll.usable() < rollout_actor and sampler.live and not stopped():
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
                     if block_actor is None:
-                        lanes.tick()
+                        _lane_tick(prof)
                     else:
                         sampler.poll_lanes()  # capture_main/tick handles control once; defer inference to batching.
                 if busy and fresh.is_set():
@@ -4767,7 +4781,9 @@ def main(argv=None, child=None, actor=None):
                         finish(prof)
                     if lanes is not None:   # (B36: no lane call runs while the weights change)
                         lanes.quiesce()
+                    t_w = time.perf_counter()
                     take_weights()
+                    prof['weights'] += time.perf_counter() - t_w
                 ta = time.perf_counter()
                 if inflight:   # a call is running: take what is ready now, else finish the oldest call
                     if not free:
@@ -4786,7 +4802,7 @@ def main(argv=None, child=None, actor=None):
                 prof['polls'] += 1
                 if not len(idx):
                     if block_actor is not None:
-                        lanes.tick()
+                        _lane_tick(prof)
                     continue
                 rows = sampler.rows[slots]
                 if priv_pending is not None:   # 2026-11-03 (tok_priv): one record per worker is outstanding at a time
@@ -4801,7 +4817,7 @@ def main(argv=None, child=None, actor=None):
                 if not go.any():
                     prof['reply'] += time.perf_counter() - t1
                     if block_actor is not None:
-                        lanes.tick()
+                        _lane_tick(prof)
                     continue
                 t1 = time.perf_counter()
                 a_idx = idx[go]
@@ -4831,6 +4847,10 @@ def main(argv=None, child=None, actor=None):
                               for g in (a.encoder,a.reader) if g is not None]
                     lane_stat['block_graph_captures']=sum(e.captures for e in encoders)
                     lane_stat['block_graph_replays']=sum(e.replays for e in encoders)
+                    # (B46: whole-step graphs, main and lane actors: the replays that serve every step now;
+                    # block_graph_replays above counts only the separate Spatial / Reader graphs of eager steps)
+                    lane_stat['block_step_graph_replays']=sum(a.step_graph.replays for a in
+                        [block_actor,*lanes.actors.values()] if getattr(a,'step_graph',None) is not None)
                     prof['calls'] += 1
                     prof['rows'] += len(a_idx)
                     prof['act'] += time.perf_counter()-t1

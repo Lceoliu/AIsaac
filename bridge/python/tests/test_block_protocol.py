@@ -24,6 +24,7 @@ def production(steps=8):
     s.teach_meta=np.zeros((2,TEACH_RING,TEACH_META),np.int32)
     s.teach_seen=np.zeros(2,np.int64)
     lanes=BlockLaneService(s,model,'cpu',wait=0,distill_steps=1,main_actor=actor)
+    lanes.RECLAIM_S=0   # (B46: production reclaims at most every 0.1 s; here at every call)
     return model,actor,rng,s,lanes
 
 
@@ -199,3 +200,29 @@ def test_same_generation_replay_and_search_use_one_forward_with_identical_answer
         for (ak,av),(bk,bv) in zip(a.kv,b.kv):
             torch.testing.assert_close(ak,bk,atol=3e-6,rtol=3e-5)
             torch.testing.assert_close(av,bv,atol=3e-6,rtol=3e-5)
+
+
+def test_throttled_reclamation_only_delays_release_and_never_reuses_ids():
+    """B46: service_control's context / injury-source reclamation runs at most every RECLAIM_S
+    seconds. Releases (status 3), cancellations and new contexts are handled at every call;
+    context ids are never reused (monotonic), a context a ring still references survives every
+    reclamation, and an unreferenced one is released at the next one that runs."""
+    model,actor,rng,s,lanes=production()
+    lanes.RECLAIM_S=1e9
+    lanes._reclaimed_t=-1e9   # the first call reclaims, later ones within the window do not
+    snap=actor.snapshot(0);assert lanes.capture_point(0,snap,model,0)
+    ids=[]
+    for j in range(40):
+        row=synth_rows(rng,1);row['first']=0
+        s.request(0,row[0],snap.pending[0],j+10,tbegin=1 if j==0 else 0)
+        lanes.tick()
+        ids.append(decode_reference(s.lane_t[0]))
+        if j%7==3:   # a cancellation / release every few requests (handled at once, not throttled)
+            s.block_arrays[0][0,0]=3;lanes.service_control()
+            assert s.block_arrays[0][0,0]==0
+            assert lanes.capture_point(0,snap,model,0)
+    assert len(set(ids))==len(ids) and ids==sorted(ids)   # never reused
+    kept=ids[-1];s.block_arrays[4][0,0]=kept
+    assert len(lanes.contexts.values)>2                   # nothing released inside the window
+    lanes._reclaimed_t=-1e9;lanes.service_control()      # the window over: released, the kept one stays
+    assert kept in lanes.contexts.values and len(lanes.contexts.values)<=2

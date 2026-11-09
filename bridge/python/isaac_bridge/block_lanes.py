@@ -47,6 +47,7 @@ class ContextRegistry:
 
 
 class BlockLaneService(LaneService):
+    RECLAIM_S=0.1   # B46: at most this often the context / injury-source reclamation (service_control)
     def __init__(self, sampler, model, device, wait=.002, quiet=.0005, distill_steps=8,main_actor=None,stat=None):
         super().__init__(sampler, model, device, len(model.heads), gtok=True,
                          wait=wait, quiet=quiet, async_=False,stat=stat)
@@ -128,6 +129,14 @@ class BlockLaneService(LaneService):
             if int(point) in self.points:
                 self.release_point(int(point))
             status.flat[point]=0
+        # B46: the context / injury-source reclamation below scans every worker's rings (~3 ms);
+        # it only frees memory, so it runs at most every RECLAIM_S seconds (cancellations above:
+        # every call).
+        import time as time_
+        now=time_.perf_counter()
+        if now-getattr(self,'_reclaimed_t',-1e9)<self.RECLAIM_S:
+            return
+        self._reclaimed_t=now
         # Read kept refs BEFORE rings: worker publishes ring records before
         # clearing these pins, so neither side of the transfer can disappear.
         live_context=set(map(int,kept.reshape(-1).copy()))
@@ -213,7 +222,8 @@ class BlockLaneService(LaneService):
         # restored explicitly at begin; no preceding candidate's state is inherited.
         if generation not in self.actors and hasattr(self.main_actor,'lane_actor'):
             # A1: teacher generations share the main actor's page store; branch state is a slot row.
-            self.actors[generation] = self.main_actor.lane_actor(teacher, len(self.s.lane_io))
+            # (B46: generation g's lanes in the main actor's arena: merged calls replay its step graph)
+            self.actors[generation] = self.main_actor.lane_actor(teacher, len(self.s.lane_io), generation=generation)
         if generation not in self.actors:
             self.actors[generation] = BlockActor(teacher, len(self.s.lane_io),
                 graph_entities=self.main_actor.graph_entities if self.main_actor is not None else 0,
@@ -249,6 +259,13 @@ class BlockLaneService(LaneService):
             self.s.lane_io[lane, 11] = 0
 
     def _eager(self, f, rows, pend, idx, ukeys):
+        """The lane round (block memory): per generation one SlotBlockActor.step -- merged with the
+        main request when versions match --, which replays a step graph when it can. B46 counters:
+        f['eager_calls'] (steps on the eager path), lane rows merged / graph / eager, seconds."""
+        import time as time_
+        from .block_paged import ucount
+        t_call = time_.perf_counter()
+        f['eager_calls'] = 0
         n = len(idx)
         a = pend.copy()
         lp, value, vg = (np.zeros(n, np.float32) for _ in range(3))
@@ -289,22 +306,30 @@ class BlockLaneService(LaneService):
                     dev=torch.device(self.device)
                     # Main rows get fresh random uniforms; branch rows retain the
                     # original (request sequence, lane ID) CRN, not batch positions.
-                    main_u=torch.rand((len(mr),sum(actor.model.heads)),device=dev)
+                    # (B46: the uniforms on the host: the step graph's input slab is host memory)
+                    main_u=torch.rand((len(mr),sum(actor.model.heads)))
                     if keys is not None:
-                        lane_u=torch.as_tensor(crn_uniforms(*keys,sum(actor.model.heads)),device=dev)
+                        lane_u=torch.as_tensor(crn_uniforms(*keys,sum(actor.model.heads)))
                     else:
-                        lane_u=torch.full((len(lanes),sum(actor.model.heads)),.5,device=dev)
-                        lane_u[np.flatnonzero(~replay).tolist()]=torch.rand((int((~replay).sum()),sum(actor.model.heads)),device=dev)
+                        lane_u=torch.full((len(lanes),sum(actor.model.heads)),.5)
+                        lane_u[np.flatnonzero(~replay).tolist()]=torch.rand((int((~replay).sum()),sum(actor.model.heads)))
                     self.main_actor.step(np.concatenate((mr,rows[positions])),
                         np.concatenate((mp,pend[positions])),ms+list(lanes),
                         owners=[self.main_actor]*len(mr)+[actor]*len(lanes),
                         uniform=torch.cat((main_u,lane_u)),
                         evaluate=np.concatenate((np.zeros(len(mr),bool),replay)))
+                    t_ans=time_.perf_counter()
                     self._reply_main()
+                    ucount('lane_answer_s',time_.perf_counter()-t_ans)
+                    ucount('lane_rows_merged',len(lanes))
                     self.stat['merged_main_rows']=self.stat.get('merged_main_rows',0)+len(mr)
                     self.stat['merged_lane_rows']=self.stat.get('merged_lane_rows',0)+len(lanes)
+                    path=getattr(self.main_actor,'last_path','eager')
                 else:
                     actor.step(rows[positions], pend[positions], lanes, ukeys=keys,evaluate=replay)
+                    path=getattr(actor,'last_path','eager')
+                f['eager_calls']+=int(path=='eager')
+                ucount('lane_rows_graph' if path=='graph' else 'lane_rows_eager',len(lanes))
             self.stat['block_teacher_forward_calls']=self.stat.get('block_teacher_forward_calls',0)+1
             self.stat['block_mixed_replay_calls']=self.stat.get('block_mixed_replay_calls',0)+int(replay.any() and not replay.all())
             host=actor.host_output
@@ -321,6 +346,7 @@ class BlockLaneService(LaneService):
                     refs[j, -1] = 1.0
                 self.lane_steps[lane] += 1
         f.update(a=a, lp=lp, v=value, vg=vg, version=versions, block_refs=refs,cancelled=cancelled)
+        ucount('lane_call_s',time_.perf_counter()-t_call);ucount('lane_calls',1);ucount('lane_rows',n)
 
     def finish(self):
         if self.fly is not None:

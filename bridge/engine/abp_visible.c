@@ -348,3 +348,37 @@ long abp_visible_encode(const unsigned char *players, int n_players, double room
 #undef R
     return size * 4;
 }
+
+// B46: structured_input.decode_frame_host(rows, packed=True) for the actor's step graph, written straight into its
+// fixed-width input slab: n visible-v2 frames (frame r at frames + r * stride, already header-checked by the caller:
+// check_frames) into room [n][1792], map [n][169] and per ragged list (body / local share the body count) values
+// [n][w][width] + masks [n][w] (uint8), entries past a row's count zero. Returns 0, or -1 when a count exceeds its
+// width (the caller's bucket widths are wrong).
+int abp_visible_unpack(const unsigned char *frames, long stride, int n, int wb, int we, int wn, int ws, float *room,
+                       float *map, float *body, unsigned char *body_mask, float *local, unsigned char *local_mask,
+                       float *ent, unsigned char *ent_mask, float *inv, unsigned char *inv_mask, float *slots,
+                       unsigned char *slots_mask) {
+    static const int RAG_W[5] = {PF, 324, EF, NF, SF};
+    for (int r = 0; r < n; r++) {
+        const float *f = (const float *)(frames + (long)r * stride);   // frames are 4-byte aligned in ROW
+        int counts[5] = {(int)f[2], (int)f[2], (int)f[3], (int)f[4], (int)f[5]};
+        memcpy(room + (long)r * 1792, f + HEADER, sizeof(float) * 1792);
+        memcpy(map + (long)r * 169, f + HEADER + 1792, sizeof(float) * 169);
+        long offset = HEADER + 1792 + 169;
+        float *vals[5] = {body, local, ent, inv, slots};
+        unsigned char *masks[5] = {body_mask, local_mask, ent_mask, inv_mask, slots_mask};
+        int widths[5] = {wb, wb, we, wn, ws};
+        for (int k = 0; k < 5; k++) {
+            int w = widths[k], c = counts[k], width = RAG_W[k];
+            if (c > w) return -1;
+            float *v = vals[k] + (long)r * w * width;
+            unsigned char *m = masks[k] + (long)r * w;
+            if (c) memcpy(v, f + offset, sizeof(float) * width * c);
+            if (w > c) memset(v + (long)c * width, 0, sizeof(float) * width * (w - c));
+            memset(m, 1, c);
+            if (w > c) memset(m + c, 0, w - c);
+            offset += (long)c * width;
+        }
+    }
+    return 0;
+}

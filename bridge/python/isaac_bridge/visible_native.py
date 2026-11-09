@@ -63,6 +63,15 @@ class Library:
         fn.argtypes = [P, I, D, D, L, P, I, P, I, P, I, P, I, P, I, I, I, P, P, I, P, I, L, L, D, P, L]
         fn.restype = L
         self.fn, self.path = fn, path
+        up = lib.abp_visible_unpack   # B46: the actor step graph's frame unpack
+        up.argtypes = [P, L, I, I, I, I, I] + [P]*12
+        up.restype = I
+        self._unpack = up
+
+    def unpack(self, frames, stride, n, widths, outs):
+        """abp_visible_unpack: n frames (address `frames`, record stride) into the 12 output
+        addresses (room, map, then values / mask of body, local, entity, inventory, slots)."""
+        return self._unpack(frames, stride, n, *[int(w) for w in widths], *outs)
 
     def encoder(self):
         return Encoder(self)
