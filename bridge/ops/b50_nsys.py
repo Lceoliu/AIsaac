@@ -55,6 +55,9 @@ def main():
     S = strings(c)
     # ---- the train_tok process: the one with NVTX block_nvtx ranges (domain 0, text 'actor.poll')
     rows = c.execute("select globalTid, count(*) from NVTX_EVENTS where text='actor.poll' group by globalTid").fetchall()
+    if not rows:   # (B52: the C++ driver polls; the Python main thread is the consumer with the lane service's ranges)
+        rows = c.execute("select globalTid, count(*) from NVTX_EVENTS where text like 'lane.%' or text like 'actor.%' "
+                         "group by globalTid").fetchall()
     if not rows:
         print('no actor.poll NVTX ranges: was ISAAC_BLOCK_NVTX=1 set?'); return
     actor_tid = max(rows, key=lambda r: r[1])[0]
