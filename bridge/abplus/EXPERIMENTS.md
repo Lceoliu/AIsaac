@@ -9351,3 +9351,109 @@ merged份额的解释（prof-b47-f13的起点计数，每update）：
   - 剩余手段都在设计层：每决策更少的step（teacher代版本），或更便宜的step（actor graph的kernel数和固定开销）。异步重叠只会把这部分时间转成learner的争用（本节筛选表）。
 - 代码：9629495（B46 + 修法1 + 设备端结果按需，对B46净改3个文件）；WIP提交37b18a1带异步机制，已被9629495移除。
 - 失败或中间运行：prof-b47-i1/i1c/i12/i12c/i3/prof/prof2/prof3/ctl/ctl16/bc/bd/f13/f13b/sclean/sch/spk都保留作对照（本节表格的数据来源），没有失败的运行。4090已空闲（guard：0个train_tok、0个isaac进程，显存12 MiB）。
+
+### B50 阶段 0：actor 调度热路径迁 C++ 之前的测量与设计（Nsight Systems + python-gil）（2026-11-09）
+
+#### 实验目的
+
+B47 之后 collect 27.9 s、update 22.9 s、×实时 149–151，用户门槛 ×实时 ≥ 200（collect 与 update 都 ≤ 22 s）。B47 节的分解是 cProfile 口径（带 profiler 开销，看不见 GIL），其结论“actor 是一条 Python 串行链，每 update 约 3,700 次同步 step graph 调用，GPU 等待 13.6 s”需要在不改变程序行为的测量下确认，并补上 cProfile 看不到的三项：actor / learner 线程各自持有 GIL 和等待 GIL 的时间、GPU 等待里有多少是排队而不是计算、actor 一次 step 各阶段的真实毫秒。这些数字决定 C++ 迁移（B50 阶段 1/2）的边界与收益预估。设计稿见 `docs/B50_CPP_ACTOR_DESIGN.md`。
+
+#### 实验方法
+
+- 代码：faef2c8（B47 最终）+ 测量用 NVTX 分段 `isaac_bridge/block_nvtx.py`（`ISAAC_BLOCK_NVTX=1` 才开，否则空操作；范围：主循环 actor.poll / book / control / step_main / answer / tick / weights；`SlotBlockActor.step` 的 step.setup / prep / after / pages，`ActorStepGraph.__call__` 的 g.unpack / h2d / replay / d2h / sync；页写 pages.write_dec / write_blk / grow；lane 服务 lane.control / submit / eager / finish / reply_main；learner.update / forward_packed / host_decode 与 `sec()` 各段；`gc.callbacks` 的 gc.collect）。采集窗口 `ISAAC_NSYS_RANGE=2:7`：第 2 次 hand-off 的 collect 开始到第 7 次开始，5 个 rollout。候选树 candidate-b50m。
+- nsys 2023.4.4（CUDA 12.4 自带），`-t nvtx,python-gil --capture-range=nvtx --nvtx-capture=B50window -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0 --capture-range-end=stop`，不做 CPU 采样（这台机器 perf 不可用：“CPU IP/backtrace sampling not supported”）、不做 Python 采样、**不做 CUDA 追踪**（原因见失败记录）。配置为完整短 profile（16 worker、rollout 32768、micro 8192、cf 6/180、teacher share 0.1），跑 9 个 update（`--game-hours 10.3`）。脚本 `bridge/ops/run_b50m.sh`（GPU_LOCK 协议 + guard），分析 `bridge/ops/b50_nsys.py`（sqlite：按线程算 GIL 持有/等待、各 NVTX 段含子/不含子的总和、分位数、GIL 等待按所在段归因、g.sync 按时长分桶）。
+- 对照：B47 节的 cProfile 分解（prof-b47-prof，含 profiler 开销）。
+- 测量开销：python-gil 追踪在每次 GIL 切换上加钩子（窗口内 actor 线程 282 万次持有、learner 158 万次），所以本节的 collect / update 比 prof-b47-slz 慢，各段的比例可比，绝对值偏大。
+
+#### 实验结果
+
+运行 prof-b50m5（报告 121 MB，sqlite 484 MB，分析文本 `reports/b42-speed/prof-b50m5.nsys-analysis.txt`）。窗口 154.4 s，5 个 collect，163,840 决策 = 6.07 游戏小时，窗口内 ×实时 141.5（含追踪开销）。各 update（progress.csv）：
+
+| update | collect_s | update_s | infer_ms | 备注 |
+|---|---:|---:|---:|---|
+| u2 | 19.8 | 20.6 | 7.0 | 窗口开始 |
+| u3 | 34.2 | 26.7 | 9.4 | 含第 2 代 lane actor 创建 + 预录 9.2 s |
+| u4 | 31.4 | 27.8 | 13.2 | |
+| u5 | 30.4 | 25.4 | 12.4 | |
+| u6 | 29.3 | 27.4 | 12.1 | |
+| u7 | 27.9 | 26.0 | 11.1 | 窗口结束于其 collect 开始 |
+
+与 prof-b47-slz（27.9 / 22.9）比：追踪开销约 +2.5 s collect、+4 s update。
+
+**1. 两条线程的 GIL（窗口 154.4 s，5 个 collect / 5 个 update）**
+
+| 线程 | 持有 GIL | 等待 GIL | 每 collect/update 等待 | GIL 等待 p50 / p90 / p99 / max | 持有次数 |
+|---|---:|---:|---:|---|---:|
+| actor（主线程） | 56.8 s（37%） | 12.9 s（8.4%） | 2.6 s | 36 µs / 222 µs / 1.12 ms / 44.9 ms | 2,819k |
+| learner | 17.3 s（11%） | 21.3 s（13.8%） | 4.3 s（稳态 update 4.4–5.2 s） | 76 µs / 619 µs / 1.65 ms / 34.1 ms | 1,584k |
+
+- 窗口里其余持有 GIL 的线程都是 worker 进程自己的主线程（各自的 GIL，每个约 12 s），与主进程无关。主进程的 GIL 被 actor + learner 占用约 74 s / 154 s。
+- actor 的 GIL 等待按所在段：answer（store 入 rollout + reply）3.87 s、pages.write_dec 1.71、g.sync 之后重新拿 GIL 1.03（3,163 次，平均 324 µs）、poll 1.00、lane.control 0.83、lane.finish 0.71、lane.eager 组装 0.70、g.d2h 0.60、book 0.47，其余 < 0.4。超过 1 ms 的等待 1,568 次共 2.94 s。
+- learner 的 GIL 等待几乎都在 forward_packed 内（15.75 s，67,754 次；torch 算子分发每次释放再获取 GIL）和 host_decode（3.58 s）。learner 每 update：wall 25.4–27.8 s，forward_packed 14–15.3 s（22 次），host_decode 2.4–2.8 s，持有 GIL 3.5–3.6 s，**等待 GIL 4.4–5.2 s**。B47 说“learner host 打包并发下 7.8 s、孤立 3.5 s”，差额就是这里的 GIL 等待。
+- CUDA 同步：没有 CUDA 追踪，actor 侧用 g.sync 段（`torch.cuda.current_stream().synchronize()` 的 host 墙钟）代替；learner 侧的同步等待无法单独拆出（在 forward_packed / 反向段里）。
+
+**2. actor 一次 step 的各阶段（窗口内 18,027 次 step graph 调用；lane-only 7,392，主调用 10,635，lane 轮次 9,631，其中 2,239 轮并入主调用）**
+
+| 阶段 | 次数 | 合计 s | 每 collect s | ms/次 p50 | ms/次 均值 | B47 cProfile（同步） |
+|---|---:|---:|---:|---:|---:|---:|
+| g.sync（GPU 等待） | 18,027 | 62.53 | 12.51 | 2.03 | 3.47 | 3.33 ms/步，14.25 s |
+| step.pages（写页，含 write_dec/blk） | 18,027 | 16.07 | 3.21 | 0.62 | 0.89 | 0.85 ms/步 |
+| ├ pages.write_dec | 22,745 | 10.21 | 2.04 | 0.30 | 0.45 | — |
+| ├ pages.grow（新页 torch.zeros） | 19 | 0.82 | 0.16 | 44.2 | 43.0 | — |
+| └ 其余（逐行 raw dict、log push） | | 5.19 | 1.04 | | 0.29 | — |
+| g.unpack（C 解包 + 槽填充） | 18,027 | 2.37 | 0.47 | 0.10 | 0.13 | 发起准备合计 0.77 ms/步 |
+| g.h2d | 18,027 | 1.25 | 0.25 | 0.045 | 0.07 | |
+| g.replay（cudaGraphLaunch） | 18,027 | 0.99 | 0.20 | 0.030 | 0.055 | |
+| g.d2h | 18,027 | 1.62 | 0.32 | 0.049 | 0.09 | |
+| step.prep（uniform、ids、complete） | 18,027 | 2.62 | 0.52 | 0.14 | 0.15 | |
+| step.setup（重置、snapshot、分组） | 18,027 | 2.97 | 0.59 | 0.14 | 0.17 | step 其余 0.27 ms/步 |
+| step.after（step_host、record） | 18,027 | 2.17 | 0.43 | 0.10 | 0.12 | 完成 0.17 ms/步 |
+| **step 内 host 合计（不含 sync）** | | 30.1 | 6.0 | | **1.67 ms/步** | 2.06 ms/步 |
+| actor.answer（store + reply，每主调用） | 10,635 | 11.42 | 2.28 | 0.68 | 1.07 | 0.81 ms/调用 |
+| actor.book（Episodes.arrive） | 10,635 | 8.58 | 1.72 | 0.71 | 0.81 | 0.39 ms/调用 |
+| actor.control（capture_main，不含 9.2 s 预录停顿） | 10,635 | 7.47 | 1.49 | 0.11 | 0.70 | 0.65 ms/调用 |
+| ├ lane.control（service_control） | 10,635 | 5.77 | 1.15 | 0.08 | 0.54 | — |
+| lane.eager 不含子（lane 轮次组装） | 9,631 | 13.76 | 2.75 | — | 1.43 ms/轮 | 1.17 ms/轮 |
+| lane.submit / finish 不含子 | 9,631 | 5.20 | 1.04 | | 0.54 ms/轮 | — |
+| actor.poll | 10,635 | 2.49 | 0.50 | 0.13 | 0.23 | — |
+| gc.collect（actor 线程） | 598 | 0.38 | 0.08 | 0.26 | 0.64（max 34 ms） | — |
+
+- 主调用（actor.step_main，从进入 lane 服务到应答完成）p50 8.7 ms、p90 15.0 ms、均值 11.6 ms；learner 忙时 p50 9.35 / 均值 12.6 ms，learner 闲时 p50 7.26 / 均值 8.2 ms。
+- 与 B47 cProfile 对照：GPU 等待、写页、step 其余、lane 组装、control 的量级一致；cProfile 高估了发起准备（0.77 对 0.45 ms/步，profiler 对小函数的开销），本次 book 偏高（0.81 对 0.39，GIL 追踪对 numpy 小算子多的段开销大）。结构性结论不变：**每步 host 1.67 ms + GPU 等待 3.47 ms，加上每主调用 2.5–3 ms 的 Python 记账，再加 lane 轮次组装。**
+
+**3. GPU 等待的构成（g.sync 按时长分桶，18,027 次，共 62.5 s）**
+
+| 时长 | 次数 | 合计 s | 份额 | learner 当时所在段 |
+|---|---:|---:|---:|---|
+| < 2.5 ms | 12,865 | 22.1 | 35% | — |
+| 2.5–5 ms | 4,242 | 13.5 | 22% | forward_packed 2,320 次 8.1 s，PPO 前向/反向段 1,404 次 5.2 s，learner 空闲 538 次 1.6 s |
+| 5–10 ms | 368 | 2.5 | 4% | |
+| 10–50 ms | 403 | 7.1 | 11% | PPO 前向/反向段（after_teach_build）328 次 17.7 s |
+| 50–200 ms | 149 | 17.3 | 28% | forward_packed 186 次 2.8 s，ppo/opt 38 次 3.8 s |
+
+- 若每次同步都是空闲时的 2.0 ms，5 个 collect 共 36.1 s；实际 62.5 s，**多出 26.5 s（每 collect 5.3 s）**，其中 24.4 s 来自 552 次 > 10 ms 的等待（每 collect 约 125 次、平均 44 ms），且它们几乎都发生在 learner 的 PPO 前向/反向段：actor 流优先级再高，也要等 learner 当前正在跑的长 kernel 结束。这部分与 Python/C++ 无关，是 learner kernel 粒度决定的下限（除非拆 learner 的 kernel 或把 learner 挪走）。
+- 按 collect：稳态（u4–u6）每 collect 3,700–4,300 次同步，g.sync 13.2–13.6 s，其中 > 10 ms 的 5.0–6.0 s。
+
+**4. 停顿**
+
+- actor.control 一次 9.17 s（窗口 +1.0 s，u3 的 collect 开头）：第 2 个 teacher generation 首次出现，`capture_point → lane_actor() → precapture_actor` 在 actor 线程上录 9 张 lane graph（stdout “B42 lane pre-capture: 9 graphs in 9.0 s”），16 个 worker 全部等 9 s。另一次 1.28 s（+21.3 s）。这是 u3 collect 34.2 s 的主要原因。修法（阶段 1 顺带）：启动时把两代 lane actor 的 graph 一起预录。
+- pages.grow：19 次新页分配（`torch.zeros` 50 MB + z 页），每次 44 ms，共 0.82 s；C++ 页存储预分配即可去掉。
+- gc.collect：actor 线程 598 次共 0.38 s（最长 34 ms），learner 987 次 0.53 s；不是主要问题。
+
+**5. 对设计与预估的影响（详见设计稿第 1、6 节）**
+
+- C++ driver 线程不持 GIL：actor 侧省 GIL 等待 2.6 s/collect；learner 侧省 4.4–5.2 s/update 的 GIL 等待（forward_packed 分发重获 GIL），这是 update ≤ 22 s 的主要来源。
+- step 内 host 1.67 ms/步 → C++ 约 0.3 ms：每 collect 省约 5 s（含写页 3.2 s）。
+- 每主调用的 Python 记账（book 0.8 + control 0.7 + answer 1.1 ≈ 2.6 ms）必须离开 worker 可见的延迟路径（应答在写页之前由 C++ 发出，记账在 Python 消费者线程做），否则阶段 1 只能到约 22–24 s。
+- GPU 等待里的长尾（每 collect 5–6 s）不随迁移消失；按均值 3.47 ms/步估，阶段 2 的主调用周期 ≈ 3.5（主步）+ 0.7×3.5（lane-only 步分摊）+ 0.5（driver host）+ 2.5（游戏）≈ 8.9 ms，collect ≈ 2,130 × 8.9 ≈ 19 s；阶段 1（lane 仍在 Python）≈ 9.9 ms，≈ 21 s。要稳过 22 s 需要阶段 2，或 learner 侧把 kernel 切短。
+- 长尾的进一步定位需要 CUDA 追踪，本机 nsys 的 CUPTI 不可用（下），阶段 1 用 CUDA event 在 learner 的 PPO 段内记录 kernel 时长代替。
+
+**失败记录（都已移入 `reports/b42-speed/failed/`）**
+
+- prof-b50m（`-t cuda,nvtx,python-gil` + Python 采样 + `--capture-range=cudaProfilerApi`）：`cudaProfilerStart` 后约 2 分钟主进程段错误（rc 139），dmesg：`segfault ... in libcupti.so.12.4`。nsys 2023.4 自带的 CUPTI 12.4 注入 torch 2.7.1+cu118 进程，在这个多线程多流的程序里崩；单独的小程序（graph 捕获/重放 + 线程 + 同一组 flag）全部正常。
+- prof-b50m2：重跑时误把 Python 采样留着，未到窗口即手动停止。
+- prof-b50m3（`-t nvtx,python-gil` + `--capture-range=cudaProfilerApi`）：仍崩在 libcupti（cudaProfilerApi 触发本身要走 CUPTI），崩前留下 246 次主调用的局部数据（learner 处于 host_decode：g.sync p50 2.0 ms，actor GIL 等待约 4%）。
+- prof-b50m4（`--capture-range=nvtx --nvtx-capture=B50window`，start/end 范围）：程序正常跑完，nsys 没有生成报告：nsys 默认只认“注册字符串”的 NVTX 范围，需要 `-e NSYS_NVTX_PROFILER_REGISTER_ONLY=0`，且用 push/pop 范围（/tmp/b50_cap.py 验证）。
+- 这台机器 `--sample` 与 `--cpuctxsw` 不可用（perf 权限），所以没有线程运行/阻塞时间。
+- 4090 在 22:06:56 释放锁（guard：0 train_tok、0 isaac、显存 12 MiB）；之后由 A1 的 B51 接手。
+- 提交：22c7b46（NVTX 分段、nsys 脚本）、66a534d（NVTX 触发、gc/页增长分段、分析脚本）、fa75338（push/pop 窗口），文档提交见下。

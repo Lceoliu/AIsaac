@@ -632,6 +632,25 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
                       "gates": {"collect_le_22s": false, "collect_lt_25s": false, "update_le_22s": false, "update_within_0_5s_of_same_session_b46": true, "x_real_time_ge_150": false},
                       "bottleneck": "~3,700 synchronous step graph calls per update at ~3.3 ms GPU wait under the learner (~2.0 ms idle, mostly fixed cost); 54% of lane rows are teacher generations behind the main version (separate steps)"}
   },
+  "actor_b50": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B50 (phase 0: measurement and design); design docs/B50_CPP_ACTOR_DESIGN.md",
+    "step": "speed refactor step 5: actor scheduling hot path to C++ (phase 0 done; phase 1 = main step loop, phase 2 = lanes / CF)",
+    "branch": "exp/block-memory-v1-cpp-actor (worktree temp/wt-cpp-actor)",
+    "measurement": {"tool": "nsys 2023.4 -t nvtx,python-gil, --capture-range=nvtx (NSYS_NVTX_PROFILER_REGISTER_ONLY=0); CUPTI 12.4 segfaults in train_tok so no cuda trace",
+                    "instrumentation": "isaac_bridge/block_nvtx.py (ISAAC_BLOCK_NVTX=1, ISAAC_NSYS_RANGE=a:b, ISAAC_NSYS_TRIGGER=nvtx|cupti), no-op by default",
+                    "scripts": ["bridge/ops/run_b50m.sh", "bridge/ops/b50_nsys.py"], "run": "prof-b50m5 (candidate-b50m, hand-offs 2-7, 5 collects, 154.4 s, 6.07 game hours, x 141.5 under tracing)"},
+    "gil_window_154s": {"actor": {"held_s": 56.8, "wait_s": 12.9, "wait_per_collect_s": 2.6}, "learner": {"held_s": 17.3, "wait_s": 21.3, "wait_per_update_s": "4.4-5.2 (forward_packed dispatch 15.75 s, host_decode 3.58 s)"}},
+    "actor_step_ms": {"g_sync_p50": 2.03, "g_sync_mean": 3.47, "host_in_step_mean": 1.67, "pages": 0.89, "g_unpack": 0.13, "g_h2d": 0.07, "g_replay": 0.055, "g_d2h": 0.09, "setup": 0.17, "prep": 0.15, "after": 0.12,
+                      "per_main_call_ms": {"answer": 1.07, "book": 0.81, "control": 0.70, "lane_round_assembly_per_round": 1.43}, "main_call_p50_ms": 8.7, "main_call_mean_ms": 11.6},
+    "gpu_wait_tail": {"syncs_over_10ms_per_collect": 125, "their_time_per_collect_s": "5.0-6.0", "excess_over_2ms_per_collect_s": 5.3, "where": "learner PPO forward/backward segment (after_teach_build): long learner kernels block the actor stream"},
+    "stalls": {"lane_actor_precapture_in_actor_thread_s": 9.17, "pages_grow_ms_each": 44, "gc_collect_per_collect_s": 0.08},
+    "design": {"graph_trigger": "B-prime: graphs captured in Python, replayed from a C++ thread via the pybind11 shared_ptr<at::cuda::CUDAGraph> without the GIL",
+               "driver": "independent native thread: poll worker fds -> batch -> abp_visible_unpack into the pinned slab -> at::rand / CRN uniforms -> H2D -> replay -> D2H -> sync -> reply (before pages) -> pages memcpy -> record queue to a Python consumer (book / store / logs / snapshots / CF capture)",
+               "build": "g++ against torch's headers (own pybind11), CUDA 11.8 headers from the venv's nvidia/*/include, source-hash cached .so; no ninja / pybind11 pip",
+               "fallback": "ISAAC_BLOCK_CPP_ACTOR=0 or build failure: the Python path",
+               "estimate_collect_s": {"phase1_main_loop": 21, "phase2_lanes": 19, "floor_from_gpu_tail": "about 5 s per collect of >10 ms waits stay"}},
+    "failed_runs": ["prof-b50m (libcupti segfault)", "prof-b50m2 (operator error)", "prof-b50m3 (libcupti segfault, 246 calls partial)", "prof-b50m4 (no report: unregistered NVTX capture range)"]
+  },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
   "spatial": {
