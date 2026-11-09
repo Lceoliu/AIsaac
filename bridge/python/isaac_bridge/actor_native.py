@@ -55,10 +55,14 @@ def build(verbose=False):
     nv = glob.glob(str(torch_dir.parent / 'nvidia' / '*' / 'include'))
     inc = [torch_dir / 'include', torch_dir / 'include' / 'torch' / 'csrc' / 'api' / 'include', torch_dir / 'include' / 'TH',
            torch_dir / 'include' / 'THC', sysconfig.get_paths()['include']] + nv
-    cmd = ['g++', '-O2', '-shared', '-fPIC', '-std=c++17', '-fvisibility=hidden',
+    # (the pip CUDA headers lack crt/host_defines.h: the system CUDA's include comes last, for that only)
+    cuda_home = os.environ.get('CUDA_HOME', '/usr/local/cuda')
+    if os.path.isdir(os.path.join(cuda_home, 'include')):
+        inc.append(os.path.join(cuda_home, 'include'))
+    cmd = ['g++', '-O2', '-shared', '-fPIC', '-fvisibility=hidden',
            f'-D_GLIBCXX_USE_CXX11_ABI={int(torch._C._GLIBCXX_USE_CXX11_ABI)}', f'-DTORCH_EXTENSION_NAME={name}',
            '-DTORCH_API_INCLUDE_EXTENSION_H', '-DUSE_CUDA'] + [f'-I{p}' for p in inc]
-    cmd += ['-x', 'c', '-ffp-contract=off', str(SOURCES[1]), '-x', 'c++', str(SOURCES[0])]
+    cmd += ['-x', 'c', '-ffp-contract=off', str(SOURCES[1]), '-x', 'c++', '-std=c++17', str(SOURCES[0])]
     try:
         cache.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(suffix='.so', dir=str(cache))

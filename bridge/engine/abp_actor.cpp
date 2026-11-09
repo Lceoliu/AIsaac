@@ -354,6 +354,7 @@ struct ActorDriver {
   i64 frame_fixed = 1969, frame_bytes = 131072, schema_version = 0; double magic = 61107;
   // rng
   Xoshiro rng{1};
+  double fixed_u = -1;   // (tests) >= 0: every uniform of the driver's steps is this value
   // driver thread
   std::thread th; std::atomic<bool> running{false}, stop_req{false}, pause_req{false}, paused{false};
   std::mutex cmu; std::condition_variable ccv;
@@ -373,6 +374,7 @@ struct ActorDriver {
   // ---- configuration (Python, before start)
   void set_stream(i64 sid, i64 dev) { stream_id = sid; device_index = dev; have_stream = true; }
   void set_seed(i64 seed) { rng = Xoshiro((uint64_t)seed); }
+  void set_fixed_uniform(double v) { fixed_u = v; }
   void set_version(i64 v) { version = v; }
   void set_buckets(std::vector<i64> body, std::vector<i64> entity, std::vector<i64> inventory, std::vector<i64> slots, i64 fixed,
                    i64 fbytes, i64 schema) {
@@ -669,7 +671,7 @@ struct ActorDriver {
       steps_before[j] = step_host[ids[j]];
       complete[j] = (steps_before[j]+1) % block_steps == 0; any_complete |= complete[j];
     }
-    for (auto &x : u) x = rng.uniform();
+    for (auto &x : u) x = fixed_u >= 0 ? (float)fixed_u : rng.uniform();
     // the rows of the batch, contiguous for the unpack: pointers into the copied records (same stride)
     std::vector<uint8_t> packed;   // only when go rows are not all rows (rare): gather them
     const uint8_t *rows_ptr; i64 stride = row_stride;
@@ -791,6 +793,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<ActorDriver, std::shared_ptr<ActorDriver>>(m, "ActorDriver")
       .def(py::init<std::shared_ptr<PageStore>>())
       .def("set_stream", &ActorDriver::set_stream).def("set_seed", &ActorDriver::set_seed).def("set_version", &ActorDriver::set_version)
+      .def("set_fixed_uniform", &ActorDriver::set_fixed_uniform)
       .def("set_buckets", &ActorDriver::set_buckets).def("set_sampler", &ActorDriver::set_sampler).def("set_arena", &ActorDriver::set_arena)
       .def("set_pending", &ActorDriver::set_pending).def("get_pending", &ActorDriver::get_pending)
       .def("register_graph", &ActorDriver::register_graph).def("has_graph", &ActorDriver::has_graph).def("n_graphs", &ActorDriver::n_graphs)
