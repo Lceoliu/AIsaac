@@ -311,17 +311,19 @@ def test_replay_table_mouse_stream(tmp_path):
 
 
 def test_replay_env_mouse():
-    """回放进程环境：mouse=True 时多 RR_MT_MOUSE=1（rr_mt.dll 才导出可用的 RRMT_SetMouse），其余同 turbo_env。"""
-    assert replay_run.replay_env(None, False) == {}
-    assert replay_run.replay_env(None, True) == {'RR_MT_MOUSE': '1'}
-    assert replay_run.replay_env('gate', True) == {'RR_MT_TURBO': '1', 'RR_MT_TURBO_GPU_GATE': '1', 'RR_MT_MOUSE': '1'}
+    """回放进程环境：mouse=True 时多 RR_MT_MOUSE=1（rr_mt.dll 才导出可用的 RRMT_SetMouse），其余同 turbo_env；
+    phase12 起总有 RR_MT_FORCEPAUSE=1（装 Game::IsPaused 钩子，只在 start_paused 的局开局窗口由 mod 打开）。"""
+    fp = {'RR_MT_FORCEPAUSE': '1'}
+    assert replay_run.replay_env(None, False) == fp
+    assert replay_run.replay_env(None, True) == dict(fp, RR_MT_MOUSE='1')
+    assert replay_run.replay_env('gate', True) == dict(fp, RR_MT_TURBO='1', RR_MT_TURBO_GPU_GATE='1', RR_MT_MOUSE='1')
 
 def test_affinity_mask():
     """回放进程 CPU 亲和（phase8-mouse §H4）：auto = 逻辑 CPU 0；0/off/None = 不限制（不设 RR_MT_AFFINITY）；其它按掩码解析。"""
     assert replay_run.affinity_mask('auto') == 1
     assert replay_run.affinity_mask('0') == 0 and replay_run.affinity_mask('off') == 0 and replay_run.affinity_mask(None) == 0
     assert replay_run.affinity_mask('0x10') == 16 and replay_run.affinity_mask('3') == 3
-    assert replay_run.replay_env(None, False, '0x10') == {'RR_MT_AFFINITY': '0x10'}
+    assert replay_run.replay_env(None, False, '0x10') == {'RR_MT_AFFINITY': '0x10', 'RR_MT_FORCEPAUSE': '1'}
     assert 'RR_MT_AFFINITY' not in replay_run.replay_env('gate', True, '0')
 
 
@@ -722,3 +724,88 @@ def test_inject_restart_extras(tmp_path):
     assert t0['extra_ticks'] == 0 and 'extras = {' not in out.read_text(encoding='utf-8')
     ta = replay_run.build_replay_table(run, out, inject_extras=True)
     assert ta['extra_ticks'] == 2 and '{0,13,-1,1}' in out.read_text(encoding='utf-8')
+
+
+def _paused_run(tmp_path, name, header_paused=None, events=(), end=None, mt_shift=False):
+    """_mt_lines 的变体：reseed 记录可带 paused（recorder 0.4.2），可在帧后插 ev 行 (n, ev)，可加 end 行（dict），
+    mt_shift = 第 2 帧 MT 不同（模拟分歧）。"""
+    lines = _mt_lines()
+    hdr = json.loads(lines[0])
+    hdr['continued'] = True
+    if header_paused is not None:
+        for r in hdr['mt']['reseeds']:
+            r['paused'] = header_paused
+    lines[0] = json.dumps(hdr, separators=(',', ':'))
+    if mt_shift:
+        f = json.loads(lines[3])
+        f['mt'] = [999, 999]
+        lines[3] = json.dumps(f, separators=(',', ':'), ensure_ascii=False)
+    out = lines[:]
+    for n, ev in events:
+        out.append(json.dumps({'k': 'ev', 'n': n, 'gf': n, 'ev': ev, 'a': [0, 0, 1]}, separators=(',', ':')))
+    if end:
+        out.append(json.dumps(dict({'k': 'end', 'n': 3, 'frames': 3}, **end), separators=(',', ':')))
+    p = tmp_path / f'{name}.jsonl'
+    p.write_text('\n'.join(out) + '\n', encoding='utf-8')
+    return p
+
+
+def test_record_start_paused(tmp_path):
+    """phase12-human4：录制开局时是否暂停。0.4.2 起看 header.mt.reseeds[0].paused；更早的录制按事件推断（本局第一条
+    pause/unpause 是 unpause = 开局时已暂停，控制台 rewind 续上的局）。为真时回放表写 start_paused = true。"""
+    cases = [('h1', dict(header_paused=True), (True, 'header')),
+             ('h0', dict(header_paused=False, events=[(2, 'unpause')]), (False, 'header')),
+             ('e1', dict(events=[(2, 'unpause'), (5, 'pause')]), (True, 'events')),
+             ('e0', dict(events=[(2, 'pause'), (2, 'unpause')]), (False, 'events')),
+             ('none', dict(), (None, None))]
+    for name, kw, want in cases:
+        run = load_run.Run(_paused_run(tmp_path, name, **kw))
+        assert replay_run.record_start_paused(run) == want, name
+        out = tmp_path / f'irr_replay-{name}.lua'
+        t = replay_run.build_replay_table(run, out)
+        assert t['start_paused'] == want[0] and t['start_paused_from'] == want[1]
+        assert ('start_paused = true,' in out.read_text(encoding='utf-8')) == bool(want[0]), name
+
+
+def test_compare_start_paused(tmp_path):
+    """compare 的 start_paused 报告；录制开局暂停、回放没有强制暂停（旧 DLL）且不精确 → first_divergence_category =
+    start_paused_not_replayed；回放强制暂停了（end.replay.start_paused.ok）但仍分歧 → 不归这一类；精确时类别为 None。"""
+    rec = _paused_run(tmp_path, 'rec', header_paused=True, end=dict(reason='exit_save'))
+    forced = {'replay': {'start_paused': {'ok': True, 'hits': 27, 'left_on': False}}}
+    ok = replay_run.compare(rec, _paused_run(tmp_path, 'rep-ok', header_paused=True, end=dict(reason='frames', **forced)))
+    assert ok['exact'] and ok['first_divergence_category'] is None
+    assert ok['start_paused'] == dict(record=True, record_from='header', replay=True, replay_forced=True,
+                                      replay_stats=forced['replay']['start_paused'])
+    bad = replay_run.compare(rec, _paused_run(tmp_path, 'rep-old', header_paused=False, mt_shift=True, end=dict(reason='frames')))
+    assert not bad['exact'] and not bad['start_paused']['replay_forced']
+    assert bad['first_divergence_category'] == 'start_paused_not_replayed'
+    bad2 = replay_run.compare(rec, _paused_run(tmp_path, 'rep-forced', header_paused=True, mt_shift=True,
+                                               end=dict(reason='frames', **forced)))
+    assert not bad2['exact'] and bad2['first_divergence_category'] != 'start_paused_not_replayed'
+    # 录制开局没暂停：不归这一类
+    rec0 = _paused_run(tmp_path, 'rec0', header_paused=False, end=dict(reason='exit_save'))
+    c0 = replay_run.compare(rec0, _paused_run(tmp_path, 'rep0', header_paused=False, mt_shift=True, end=dict(reason='frames')))
+    assert not c0['exact'] and c0['first_divergence_category'] != 'start_paused_not_replayed'
+
+
+def test_replay_lua_start_pause(tmp_path):
+    """replay.lua（Lua 5.3，lupa）：回放表 start_paused = true 时 start_pause_on/off 各调一次 mt.force_pause(true/false)，
+    stats_json 的 start_paused 带 ok、强制次数 hits、left_on；表里没有 start_paused 时不调用、stats 里没有这一项。"""
+    lupa = pytest.importorskip('lupa.lua53')
+    mod = Path(__file__).resolve().parents[1] / 'mod' / 'isaac_run_recorder' / 'replay.lua'
+    for paused in (True, False):
+        tbl = tmp_path / f'tbl{int(paused)}.lua'
+        tbl.write_text('return {start = "menu:continue", frames = 3' + (', start_paused = true' if paused else '') + '}\n',
+                       encoding='utf-8')
+        rt = lupa.LuaRuntime()
+        R = rt.execute(f'return dofile([[{mod}]])').load(str(tbl).replace('\\', '/'))
+        calls = []
+        mt = rt.eval('''function(log) local h = 100
+            return {force_pause = function(on) log(on); if not on then h = h + 27 end; return true, 0, h end} end''')(calls.append)
+        R.start_pause_on(mt)
+        R.start_pause_off(mt)
+        st = json.loads(R.stats_json()).get('start_paused')
+        if paused:
+            assert calls == [True, False] and st == {'ok': True, 'hits': 27, 'left_on': False}
+        else:
+            assert calls == [] and st is None

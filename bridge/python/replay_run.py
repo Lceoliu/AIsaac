@@ -79,6 +79,27 @@ def mt_salts(header):
     return out
 
 
+def record_start_paused(run: load_run.Run):
+    """录制开局时游戏是否暂停（phase12-human4，README §8.9）。返回 (值, 来源)：
+    recorder 0.4.2 起 header.mt.reseeds[0].paused（第一次 reseed 当时的 game:IsPaused()）→ ('header')；
+    更早的录制按事件推断：本局第一条 pause/unpause 事件是 unpause（没有 pause 就先解除了暂停 = 开局时已暂停，典型是
+    玩家在控制台敲 rewind，续上的局开局时控制台还开着）→ True，是 pause → False（'events'）；都没有 → (None, None)。"""
+    rs = ((run.header.get('mt') or {}).get('reseeds') or [])
+    if rs and 'paused' in rs[0]:
+        return bool(rs[0]['paused']), 'header'
+    for n in sorted(run.event_lines):
+        for i in run.event_lines[n]:
+            ln = run.lines[i]
+            if b'"k":"ev"' not in ln[:12]:
+                continue
+            e = json.loads(ln)
+            if e.get('ev') == 'unpause':
+                return True, 'events'
+            if e.get('ev') == 'pause':
+                return False, 'events'
+    return None, None
+
+
 # ---------------------------------------------------------------------------------------------- 菜单暂停
 # 真人按 Esc（TRIGGERED MENUBACK，实体 nil）打开暂停菜单的那一帧：录制的 tick 序列是 开菜单前的中间 tick + 暂停期间每个渲染一个
 # tick（玩家输入冻结）+ 解除暂停后 2 次轮询 + 更新 tick。开菜单落在 i2（本应同时做逻辑更新的那次轮询）时，这一帧玩家多走
@@ -355,6 +376,11 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
         # phase11-human3：录制是不是自定义种子局；false 时回放局（`seed` 命令开出，引擎记为自定义种子局）在楼层生成前
         # 经 rr_mt.dll 把标记清掉（replay.lua R.fix_custom_run；自定义种子局商店不刷捐款机）
         lines.append(f'custom_run = {lua_value(custom)},')
+    start_paused, start_paused_src = record_start_paused(run)
+    if start_paused:
+        # phase12：录制开局时游戏暂停（控制台开着）→ 回放局从早期 reseed 到 POST_GAME_STARTED 经 rr_mt.dll 让
+        # Game::IsPaused 返回 true（replay.lua R.start_pause_on/off），开局前那一轮实体预更新与录制相同
+        lines.append('start_paused = true,')
     start_players = continue_start_players(run)
     if start_players:
         # 续局：引擎给玩家选出生位置用的是 reseed 之前的随机数（phase7-continue/REPORT），回放在续局的
@@ -460,7 +486,8 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
         lines.extend(al)
     lines.append('}')
     Path(path_out).write_text('\n'.join(lines) + '\n', encoding='utf-8')
-    return dict(start=start, pre=start_character(run), custom_run=custom, frames=run.frames, tick_changes=n_tick_changes, spawns=len(spawns),
+    return dict(start=start, pre=start_character(run), custom_run=custom, start_paused=start_paused,
+                start_paused_from=start_paused_src, frames=run.frames, tick_changes=n_tick_changes, spawns=len(spawns),
                 cmds={str(k): v for k, v in cmds.items()}, mt_salts=salts, continued=bool(h.get('continued')),
                 start_players=[dict(num=num, x=x100 / 100, y=y100 / 100) for num, x100, y100 in start_players],
                 inject_pauses=inject_pauses, menu_pauses=plans, engine_pauses=len(skipped), engine_pauses_aligned=len(engine),
@@ -656,8 +683,23 @@ def compare(rec_path, rep_path):
     res['exact'] = (all(firsts[k] is None for k in LAYERS) and mt_first is None and mt_missing == 0 and same_len
                     and res['end_compatible'] and res['mt']['reseeds_match'] is True and res['start_meta_match'])
     res['pause_report'] = pause_report(A, B, firsts, mt_first)
+    # phase12：录制开局时暂停（控制台开着）而回放没能在开局窗口暂停（旧 DLL 没有 RRMT_ForcePause 等）→ 已知类别
+    res['start_paused'] = start_paused_report(A, B)
+    if not res['exact'] and res['start_paused']['record'] and not res['start_paused']['replay_forced']:
+        res['pause_report']['first_divergence_category'] = 'start_paused_not_replayed'
+    res['first_divergence_category'] = res['pause_report']['first_divergence_category'] if not res['exact'] else None
     res['api'] = api_report(A, B)
     return res
+
+
+def start_paused_report(A, B):
+    """录制开局时是否暂停（record_start_paused）、回放局第一次 reseed 当时是否暂停（header，0.4.2 起）、回放有没有经
+    RRMT_ForcePause 在开局窗口强制暂停（end.replay.start_paused.ok）。诊断；不进 exact（结果已由 MT/digest 比较体现）。"""
+    rec, src = record_start_paused(A)
+    rs = ((B.header.get('mt') or {}).get('reseeds') or [])
+    rep_paused = rs[0].get('paused') if rs else None
+    st = ((B.end or {}).get('replay') or {}).get('start_paused')
+    return dict(record=rec, record_from=src, replay=rep_paused, replay_forced=bool(st and st.get('ok')), replay_stats=st)
 
 
 def api_report(A, B):
@@ -761,6 +803,8 @@ def replay_env(turbo, mouse, affinity=None):
     m = affinity_mask(affinity)
     if m:
         env['RR_MT_AFFINITY'] = hex(m)
+    # phase12：装 Game::IsPaused 钩子（只在回放表 start_paused = true 的局、开局窗口里由 mod 打开；其余时候不起作用）
+    env['RR_MT_FORCEPAUSE'] = '1'
     return env
 
 
@@ -1172,7 +1216,7 @@ def run_watch(rec_path, name, out_root, copy_root=rr.DEFAULT_COPY, init_save=Non
     if run.header.get('continued'):
         raise ValueError('观战/导出暂不支持续局录制')
     issues = replayability(run)
-    env = {'IRR_HUD': '0', 'RR_MT_MOUSE': '1'}  # phase8-mouse：观战/导出同样还原录制的鼠标
+    env = {'IRR_HUD': '0', 'RR_MT_MOUSE': '1', 'RR_MT_FORCEPAUSE': '1'}  # phase8-mouse：观战/导出同样还原录制的鼠标；phase12 开局暂停
     capture = None
     if mode == 'watch':
         env['RR_MT_WATCH'] = '1'

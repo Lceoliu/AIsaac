@@ -114,6 +114,30 @@ function M.set_custom_run(seeds, start_seed, value)
 	return M.setcr(seeds, start_seed, value)
 end
 
+-- phase12-human4（诊断）：rr_mt.dll 在 RR_MT_TRACE=1 时挂 GlobalMT_Next，RRMT_Trace() 取走自上次以来主线程每次取数的
+-- 调用者 RVA（十六进制、空格分隔）。没有这个导出或没装钩子时 trace_ok = false。只给 harness 诊断（irr_diag.jsonl）用。
+function M.trace_init()
+	if M.trace_checked then return M.trace_ok end
+	M.trace_checked = true
+	M.trace_ok = false
+	if not M.dll or not package or not package.loadlib then return false end
+	local ok, f = pcall(package.loadlib, M.dll, "RRMT_Trace")
+	if not (ok and f) then return false end
+	local ok2, s = pcall(f)
+	if not ok2 or s == nil then return false end
+	M.trace_fn = f
+	M.trace_ok = true
+	return true
+end
+
+-- 返回 (rva 串, 其它线程取数累计, 丢失条数, 总取数累计)；不可用时 nil
+function M.trace_take()
+	if not M.trace_ok then return nil end
+	local ok, s, other, _, lost, total = pcall(M.trace_fn)
+	if not ok then return nil end
+	return s, other, lost, total
+end
+
 -- 每局随机的 32 位 salt（非 0）
 function M.new_salt()
 	M.counter = M.counter + 1
@@ -126,13 +150,30 @@ function M.new_salt()
 end
 
 -- reseed 一次：值 = StartSeed xor salt。返回记录（写进 header.mt.reseeds）
+-- paused（recorder 0.4.2，phase12）：reseed 当时引擎是否认为游戏暂停（game:IsPaused()）。玩家在控制台敲 rewind/restart 时，
+-- 下一局开局时控制台还开着 = 暂停；开局前那一轮实体预更新里 Entity::IsFrame 因此恒为 false，回放要照样暂停（replay.lua）
 function M.reseed(at, salt, replayed)
 	local start = game:GetSeeds():GetStartSeed()
 	local value = (start ~ salt) & 0xFFFFFFFF
+	local paused = game:IsPaused()
 	local c0, h0 = M.state_fn()
 	local c1, h1 = M.seed_fn(value)
 	return {at = at, gf = game:GetFrameCount(), ifc = Isaac.GetFrameCount(), t = Isaac.GetTime(), start_seed = start,
-		salt = salt, seeded_with = value, before = {c0, h0}, after = {c1, h1}, from_replay = replayed or false}
+		salt = salt, seeded_with = value, before = {c0, h0}, after = {c1, h1}, from_replay = replayed or false, paused = paused}
+end
+
+-- phase12：回放开局窗口强制暂停（rr_mt.dll 在 RR_MT_FORCEPAUSE=1 时挂 Game::IsPaused、导出 RRMT_ForcePause）。
+-- 返回 (ok, 之前的状态, 累计强制次数)；没有这个导出 / 没装钩子时 ok = false
+function M.force_pause(on)
+	if not M.dll or not package or not package.loadlib then return false, nil, nil end
+	if M.fp_fn == nil then
+		local ok, f = pcall(package.loadlib, M.dll, "RRMT_ForcePause")
+		M.fp_fn = (ok and f) or false
+	end
+	if not M.fp_fn then return false, nil, nil end
+	local ok, prev, hits = pcall(M.fp_fn, on and 1 or 0)
+	if not ok or prev == nil then return false, nil, nil end
+	return true, prev, hits
 end
 
 -- header.mt 的公共部分

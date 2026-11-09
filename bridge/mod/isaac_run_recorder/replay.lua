@@ -460,6 +460,31 @@ function M.load(path)
 			.. ',"at_end":' .. tostring(now) .. ',"how":"' .. tostring(c.how or ""):gsub('[%c"\\]', "?") .. '"}'
 	end
 
+	-- phase12-human4：录制开局时游戏是暂停的（玩家在控制台敲 rewind 等，下一局开局时控制台还开着；回放表 start_paused =
+	-- true），而回放局由菜单 Continue / seed 命令开出、不暂停。引擎在 POST_GAME_STARTED 之前对开局房的实体做一轮预更新，
+	-- 其中 Entity::IsFrame（暂停时恒 false）决定跟班是否取随机数换方向（Lil Harbingers 等），两边不同就让跟班初速不同、
+	-- reseed 前的 MT 游标不同（human4 run-0003）。main.lua 在早期 reseed 之前调 start_pause_on、在 POST_GAME_STARTED 开头
+	-- 调 start_pause_off：期间经 rr_mt.dll 的 RRMT_ForcePause 让 Game::IsPaused 返回 true。结果进 end.replay.start_paused
+	R.start_pause = nil
+	function R.start_pause_on(mt)
+		if tbl.start_paused ~= true or R.start_pause then return end
+		local ok, prev, hits = mt.force_pause(true)
+		R.start_pause = {ok = ok, hits0 = hits, on = ok}
+	end
+	function R.start_pause_off(mt)
+		local st = R.start_pause
+		if not st or not st.on then return end
+		local ok, prev, hits = mt.force_pause(false)
+		st.on = false
+		st.hits = (ok and hits and st.hits0) and (hits - st.hits0) or nil
+	end
+	local function start_pause_json()
+		local st = R.start_pause
+		if tbl.start_paused ~= true then return "" end
+		if not st then return ',"start_paused":{"ok":false,"reason":"not_applied"}' end
+		return ',"start_paused":{"ok":' .. tostring(st.ok) .. ',"hits":' .. tostring(st.hits) .. ',"left_on":' .. tostring(st.on) .. '}'
+	end
+
 	local function api_stats_json()
 		local s = R.api_stats
 		return '{"executed":' .. s.executed .. ',"late":' .. s.late .. ',"failed":' .. s.failed .. ',"skipped":' .. s.skipped
@@ -473,6 +498,7 @@ function M.load(path)
 			.. ',"start_pos_pinned":' .. R.start_pos_pinned .. ',"start_pos_moved":' .. R.start_pos_moved
 			.. (R.extras_injected and (',"extras_injected":' .. R.extras_injected) or '')
 			.. custom_json()
+			.. start_pause_json()
 			.. ',"mouse":{"available":' .. tostring(R.mouse_stats.available) .. ',"reason":"' .. tostring(R.mouse_stats.reason):gsub('[%c"\\]', "?")
 			.. '","init":' .. R.mouse_stats.init .. ',"applied":' .. R.mouse_stats.applied .. ',"folded":' .. R.mouse_stats.folded
 			.. ',"failed":' .. R.mouse_stats.failed .. '}'

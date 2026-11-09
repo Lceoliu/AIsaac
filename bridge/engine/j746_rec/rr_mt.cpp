@@ -16,6 +16,15 @@
 //      推进历史并调用命令执行函数 RVA 0x25E160；Lua 的 Isaac.ExecuteCommand 走 RVA 0x4015C0 直接调 0x25E160，不经过这里），
 //      把输入行（this+0x1C 的 std::string）排队，mod 用 RRMT_ConsoleTake() 取走写成 ev cmd（src = console）。身份门 +
 //      3 处代码签名不符时只记日志、不装（不影响其它功能）。
+//   7.（phase12-human4，只给回放用）环境变量 RR_MT_FORCEPAUSE=1 时挂 Game::IsPaused（RVA 0x2C5950），导出 RRMT_ForcePause(on)：
+//      打开期间 IsPaused 一律返回 true。录制里开局时控制台还开着（续局由控制台 rewind 触发等）→ 开局两次 reseed 之间引擎那一轮
+//      实体预更新里 Entity::IsFrame（RVA 0x27BFC0，暂停时恒 false）全是 false；回放局由菜单开出、不暂停，跟班的 IsFrame 分支
+//      会多取随机数（phase12-human4-replays/NOTES.md）。mod 只在录制"开局时暂停"的回放局、从早期 reseed 到 POST_GAME_STARTED
+//      打开它。身份门（J746）+ 函数头 10 字节签名不符时只记日志、不装。录制会话不设，进程里没有这个钩子。
+//   6.（phase12-human4，只给诊断用）环境变量 RR_MT_TRACE=1 且 MT 身份门通过时挂 GlobalMT_Next（RVA 0x2BA2A0），记录每次取数的
+//      调用者 RVA（返回地址 - 模块基址；移植自 mt-probe/src/rr_mt3.cpp）。主线程（第一次调用 RRMT_Trace 的线程；之前的取数都算
+//      主线程）的取数进缓冲区（65536 条，满了只计数），别的线程只计数并记最后一个调用者。mod 用 RRMT_Trace() 取走。
+//      录制/回放默认不设，进程里没有这个钩子。
 // 默认没有 turbo / 虚拟时钟 / 跳渲染 / GPU gate / 文件重试 / OpenAL 等任何其他钩子。
 // 唯一例外（phase4-turbo，只给回放验证用）：环境变量 RR_MT_TURBO=1 时另外安装 rr_turbo.cpp 的虚拟时钟
 // （glfwGetTime + Manager::Update 两个钩子），RR_MT_TURBO_GPU_GATE=1 时再加 GPU 提交门控；录制会话不设这两个变量，
@@ -278,6 +287,99 @@ bool consoleInstall(char* why, std::size_t whyLen) {
   return true;
 }
 
+// ---- phase12-human4：开局窗口强制暂停（RR_MT_FORCEPAUSE=1 才安装；见文件头第 7 项）
+constexpr std::uint32_t kRvaIsPaused = 0x2C5950;
+using IsPausedFn = bool(__fastcall*)(void*, void*);
+IsPausedFn gOrigIsPaused = nullptr;
+volatile LONG gForcePause = 0;
+volatile LONG gForcePauseHits = 0;
+
+bool __fastcall hookIsPaused(void* self, void* edx) {
+  if (gForcePause) {
+    InterlockedIncrement(&gForcePauseHits);
+    return true;
+  }
+  return gOrigIsPaused(self, edx);
+}
+
+bool forcePauseInstall(char* why, std::size_t whyLen) {
+  if (gTimeStamp != 0x624393F6 || gImageSize != 8540160) {
+    std::snprintf(why, whyLen, "EXE is not J746");
+    return false;
+  }
+  // cmp dword ptr [ecx+0x1BB60], 0 ; jne +0x5F
+  static const std::uint8_t head[9] = {0x83, 0xB9, 0x60, 0xBB, 0x01, 0x00, 0x00, 0x75, 0x5F};
+  if (std::memcmp(gBase + kRvaIsPaused, head, sizeof(head)) != 0) {
+    std::snprintf(why, whyLen, "Game::IsPaused code signature mismatch");
+    return false;
+  }
+  MH_STATUS st = MH_CreateHook(gBase + kRvaIsPaused, reinterpret_cast<void*>(&hookIsPaused), reinterpret_cast<void**>(&gOrigIsPaused));
+  if (st != MH_OK) { std::snprintf(why, whyLen, "MH_CreateHook %d", static_cast<int>(st)); return false; }
+  st = MH_EnableHook(gBase + kRvaIsPaused);
+  if (st != MH_OK) { std::snprintf(why, whyLen, "MH_EnableHook %d", static_cast<int>(st)); return false; }
+  std::snprintf(why, whyLen, "Game::IsPaused RVA 0x%X", kRvaIsPaused);
+  return true;
+}
+
+// ---- phase12-human4：GlobalMT_Next 调用者 trace（诊断，RR_MT_TRACE=1 才安装）
+constexpr int kTraceCap = 1 << 16;
+std::uint32_t gTrace[kTraceCap];
+std::uint32_t gTrace1[kTraceCap];   // 再上一层调用者（启发式扫栈；0 = 没找到）
+std::uintptr_t gTextLo = 0, gTextHi = 0;
+volatile LONG gTraceN = 0, gTraceLost = 0, gTraceOther = 0, gTraceOtherLast = 0, gTraceTotal = 0;
+volatile DWORD gTraceTid = 0;
+using MtNextFn = std::uint32_t(__cdecl*)();
+MtNextFn gOrigMtNext = nullptr;
+
+// v 像不像返回地址：落在代码段里，且前面紧挨着一条 call（E8 rel32 / FF 15 [imm32] / FF D0..D7 / FF 50..57 disp8 / FF 90..97 disp32）
+bool looksLikeReturn(std::uintptr_t v) {
+  if (v < gTextLo + 8 || v >= gTextHi) return false;
+  const auto* p = reinterpret_cast<const std::uint8_t*>(v);
+  if (p[-5] == 0xE8) return true;
+  if (p[-6] == 0xFF && (p[-5] == 0x15 || (p[-5] >= 0x90 && p[-5] <= 0x97))) return true;
+  if (p[-2] == 0xFF && p[-1] >= 0xD0 && p[-1] <= 0xD7) return true;
+  if (p[-3] == 0xFF && p[-2] >= 0x50 && p[-2] <= 0x57) return true;
+  return false;
+}
+
+__attribute__((noinline)) std::uint32_t __cdecl hookMtNext() {
+  const auto ret = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0));
+  const auto rva = static_cast<std::uint32_t>(ret - reinterpret_cast<std::uintptr_t>(gBase));
+  std::uint32_t rva1 = 0;
+  {
+    // 帧指针：[fp] = 旧 ebp，[fp+4] = ret0，[fp+8..] = 调用者的栈
+    const auto* fp = static_cast<const std::uintptr_t*>(__builtin_frame_address(0));
+    for (int i = 2; i < 34 && gTextHi; ++i) {
+      const std::uintptr_t v = fp[i];
+      if (looksLikeReturn(v)) { rva1 = static_cast<std::uint32_t>(v - reinterpret_cast<std::uintptr_t>(gBase)); break; }
+    }
+  }
+  InterlockedIncrement(&gTraceTotal);
+  if (gTraceTid && GetCurrentThreadId() != gTraceTid) {
+    InterlockedIncrement(&gTraceOther);
+    InterlockedExchange(&gTraceOtherLast, static_cast<LONG>(rva));
+  } else {
+    const LONG k = InterlockedIncrement(&gTraceN) - 1;
+    if (k < kTraceCap) { gTrace[k] = rva; gTrace1[k] = rva1; } else InterlockedIncrement(&gTraceLost);
+  }
+  return gOrigMtNext();
+}
+
+bool traceInstall(char* why, std::size_t whyLen) {
+  {
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(gBase);
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(gBase + dos->e_lfanew);
+    gTextLo = reinterpret_cast<std::uintptr_t>(gBase) + nt->OptionalHeader.BaseOfCode;
+    gTextHi = gTextLo + nt->OptionalHeader.SizeOfCode;
+  }
+  MH_STATUS st = MH_CreateHook(gBase + kRvaNext, reinterpret_cast<void*>(&hookMtNext), reinterpret_cast<void**>(&gOrigMtNext));
+  if (st != MH_OK) { std::snprintf(why, whyLen, "MH_CreateHook %d", static_cast<int>(st)); return false; }
+  st = MH_EnableHook(gBase + kRvaNext);
+  if (st != MH_OK) { std::snprintf(why, whyLen, "MH_EnableHook %d", static_cast<int>(st)); return false; }
+  std::snprintf(why, whyLen, "GlobalMT_Next RVA 0x%X", kRvaNext);
+  return true;
+}
+
 DWORD WINAPI initThread(LPVOID) {
   const DWORD pid = GetCurrentProcessId();
   const bool shm = openControlBlock(pid);
@@ -349,6 +451,20 @@ DWORD WINAPI initThread(LPVOID) {
     consoleOn = consoleInstall(cwhy, sizeof(cwhy));
     logf("console: %s (%s)", consoleOn ? "hook installed" : "OFF", cwhy);
   }
+  // phase12：回放开局窗口强制暂停（RR_MT_FORCEPAUSE=1 才装；装不上只记日志，Lua 侧 RRMT_ForcePause 不返回值）
+  bool fpOn = false;
+  if (envOn("RR_MT_FORCEPAUSE")) {
+    char fwhy[128] = {};
+    fpOn = forcePauseInstall(fwhy, sizeof(fwhy));
+    logf("forcepause: %s (%s)", fpOn ? "hook installed" : "OFF", fwhy);
+  }
+  // phase12：MT 取数 trace（诊断；RR_MT_TRACE=1 且身份门通过才装；装不上只记日志）
+  bool traceOn = false;
+  if (mtOk && envOn("RR_MT_TRACE")) {
+    char twhy2[128] = {};
+    traceOn = traceInstall(twhy2, sizeof(twhy2));
+    logf("trace: %s (%s)", traceOn ? "hook installed" : "OFF", twhy2);
+  }
   if (mtOk) {
     std::uint32_t cursor = 0;
     const std::uint32_t h = mtHash(&cursor);
@@ -360,14 +476,49 @@ DWORD WINAPI initThread(LPVOID) {
   }
   gBlock->hooks_mask = mask;
   char text[128];
-  std::snprintf(text, sizeof(text), "OK j746_rec profile-redirect; MT exports %s%s%s%s%s", mtOk ? "ready" : "OFF (identity)",
+  std::snprintf(text, sizeof(text), "OK j746_rec profile-redirect; MT exports %s%s%s%s%s%s%s", mtOk ? "ready" : "OFF (identity)",
                 turbo ? (gate ? "; TURBO virtual-clock + GPU gate" : "; TURBO virtual-clock") : "",
-                topt.watch ? "; WATCH" : "", topt.capture ? "; CAPTURE" : "", consoleOn ? "; CONSOLE" : "");
+                topt.watch ? "; WATCH" : "", topt.capture ? "; CAPTURE" : "", consoleOn ? "; CONSOLE" : "",
+                traceOn ? "; TRACE" : "", fpOn ? "; FORCEPAUSE" : "");
   setStatus(kStatusActive, text);
   return 0;
 }
 
 }  // namespace
+
+// Lua: prev, hits = RRMT_ForcePause(on)   （phase12 回放；on = 1 打开 / 0 关闭；hits = 打开期间被强制返回 true 的次数累计；
+// 没装钩子时不返回值）
+extern "C" __declspec(dllexport) int RRMT_ForcePause(void* L) {
+  if (!loadLua() || !gOrigIsPaused) return 0;
+  const auto on = gLua.checkinteger(L, 1);
+  const LONG prev = InterlockedExchange(&gForcePause, on ? 1 : 0);
+  logf("RRMT_ForcePause(%d) prev=%ld hits=%ld", on ? 1 : 0, prev, gForcePauseHits);
+  gLua.pushinteger(L, prev);
+  gLua.pushinteger(L, gForcePauseHits);
+  return 2;
+}
+
+// Lua: s, other, other_last_rva, lost, total = RRMT_Trace()   （phase12 诊断；没装 trace 钩子时不返回值）
+// s = 上一次调用以来主线程每次取数的调用者 RVA（十六进制，空格分隔；"ret0<ret1" = 再上一层调用者，启发式扫栈得到）；
+// 第一次调用把调用线程定为主线程
+extern "C" __declspec(dllexport) int RRMT_Trace(void* L) {
+  if (!loadLua() || !gOrigMtNext) return 0;
+  if (!gTraceTid) gTraceTid = GetCurrentThreadId();
+  const LONG n = InterlockedExchange(&gTraceN, 0);
+  static char buf[kTraceCap * 18 + 16];
+  int p = 0;
+  for (LONG i = 0; i < n && i < kTraceCap; ++i) {
+    if (gTrace1[i]) p += std::snprintf(buf + p, sizeof(buf) - p, "%s%x<%x", i ? " " : "", gTrace[i], gTrace1[i]);
+    else p += std::snprintf(buf + p, sizeof(buf) - p, "%s%x", i ? " " : "", gTrace[i]);
+  }
+  buf[p] = 0;
+  gLua.pushlstring(L, buf, static_cast<std::size_t>(p));
+  gLua.pushinteger(L, gTraceOther);
+  gLua.pushinteger(L, gTraceOtherLast);
+  gLua.pushinteger(L, InterlockedExchange(&gTraceLost, 0));
+  gLua.pushinteger(L, gTraceTotal);
+  return 5;
+}
 
 // Lua: cursor, hash = RRMT_Seed(seed)        （身份门没过：不返回值）
 extern "C" __declspec(dllexport) int RRMT_Seed(void* L) {

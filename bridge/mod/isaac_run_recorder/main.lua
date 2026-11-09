@@ -7,7 +7,7 @@
 -- 每局一个文件 run-<proc>-<NNNN>.jsonl：MC_POST_GAME_STARTED 开、MC_PRE_GAME_EXIT / 死亡 / 下一局开始时关。
 -- 格式见 README.md。
 local mod = RegisterMod("Isaac Run Recorder", 1)
-local VERSION = "0.4.1"
+local VERSION = "0.4.2"
 local SCHEMA = "isaac-run-v1"
 local game = Game()
 local concat = table.concat
@@ -391,6 +391,8 @@ mod:AddCallback(ModCallbacks.MC_POST_UPDATE, guarded("post_update", function()
 	if R and R.replay and RP.api_update_start then RP.api_update_start(R.n + 1) end
 	if R and R.replay and RP.console_update_start then RP.console_update_start(R.n + 1) end
 	if R then frame() end
+	-- phase12 诊断：trace 开着时每帧写一条（只在 harness 下）
+	if S.diag_update then S.diag_update() end
 	-- 回放：录制里排在本 mod 的 MC_POST_UPDATE 之后（同一次迭代）的调用
 	if R and R.replay and RP.api_update_end then RP.api_update_end(R.n) end
 	-- 回放：录制里"下一帧第 1 次渲染"读到的鼠标在这里还原（phase8-mouse；replay.lua 的鼠标一节）
@@ -477,10 +479,42 @@ local function diag(what, arg)
 	end
 	local c, h = nil, nil
 	if MT.available then c, h = MT.state() end
+	-- phase12：RR_MT_TRACE=1 时带上自上一次 diag 以来主线程 MT 取数的调用者 RVA（rr_mt.dll RRMT_Trace）
+	local tr = ""
+	if MT.available and MT.trace_init() then
+		local s, other, lost, total = MT.trace_take()
+		if s then tr = ',"trace":' .. ST.jstr(s) .. ',"trace_other":' .. tostring(other) .. ',"trace_lost":' .. tostring(lost)
+			.. ',"trace_total":' .. tostring(total) end
+	end
 	append_file("irr_diag.jsonl", '{"what":' .. ST.jstr(what) .. ',"arg":' .. ST.jval(arg) .. ',"gf":' .. game:GetFrameCount()
-		.. ',"ifc":' .. Isaac.GetFrameCount() .. ',"in_run":' .. tostring(R ~= nil) .. ',"room":' .. game:GetLevel():GetCurrentRoomIndex()
+		.. ',"ifc":' .. Isaac.GetFrameCount() .. ',"in_run":' .. tostring(R ~= nil) .. ',"n":' .. tostring(R and R.n or -1)
+		.. ',"room":' .. game:GetLevel():GetCurrentRoomIndex()
 		.. ',"start_seed":' .. tostring(game:GetSeeds():GetStartSeed())
-		.. ',"players":[' .. concat(parts, ",") .. '],"mt":[' .. tostring(c) .. ',' .. tostring(h) .. ']}')
+		.. ',"players":[' .. concat(parts, ",") .. '],"mt":[' .. tostring(c) .. ',' .. tostring(h) .. ']' .. tr .. '}')
+end
+
+-- phase12（诊断，只在 harness 下；harness 加载之后由文件末尾调 S.register_diag 注册，录制会话里没有这些回调）：
+-- 开局前（没有打开的局）与局内前 2 帧的实体初始化，记类型、位置、速度、InitSeed、当时的 MT 与这之前的取数 trace
+-- （rr_mt.dll 在 RR_MT_TRACE=1 时才有）；trace 开着时另每帧写一条（局内前 IRR_TRACE_FRAMES 帧，默认 3000）。
+-- 用来把开局两次 reseed 之间的取数归到具体实体（phase12-human4-replays/NOTES.md）。
+local function diag_init(kind, e)
+	if not (H and (R == nil or R.n < 2)) then return end
+	diag(kind, {e.Type, e.Variant, e.SubType, e.Index, e.InitSeed, ST.fx(e.Position.X), ST.fx(e.Position.Y),
+		ST.fx(e.Velocity.X), ST.fx(e.Velocity.Y), e.FrameCount})
+end
+S.register_diag = function()
+	for _, cb in ipairs({{ModCallbacks.MC_FAMILIAR_INIT, "familiar_init"}, {ModCallbacks.MC_POST_EFFECT_INIT, "effect_init"},
+			{ModCallbacks.MC_POST_NPC_INIT, "npc_init"}, {ModCallbacks.MC_POST_PICKUP_INIT, "pickup_init"}}) do
+		local kind = cb[2]
+		mod:AddCallback(cb[1], function(_, e)
+			if H then pcall(diag_init, kind, e) end
+		end)
+	end
+	local trace_frames = tonumber(getenv("IRR_TRACE_FRAMES") or "") or 3000
+	-- MC_POST_UPDATE 的回调定义在 diag 之前，经 S 调用
+	S.diag_update = function()
+		if H and R and R.n <= trace_frames and MT.available and MT.trace_init() then diag("update", R.n) end
+	end
 end
 
 -- 续局的早期 reseed（phase7-continue）：续局时第一个 MC_POST_PLAYER_INIT 发生在读档之后、进开局房与引擎给玩家选出生位置之前
@@ -506,6 +540,11 @@ mod:AddCallback(ModCallbacks.MC_POST_PLAYER_INIT, guarded("player_init", functio
 	local salt
 	if rs then salt = rs.POST_PLAYER_INIT else salt = MT.new_salt() end
 	if not salt then return end
+	-- phase12：录制开局时游戏暂停（控制台开着）的回放局，从这里到 POST_GAME_STARTED 让引擎认为暂停（replay.lua）
+	if rs and RP and RP.start_pause_on then
+		local okp, ep = pcall(RP.start_pause_on, MT)
+		if not okp then fail("start_pause_on", ep) end
+	end
 	MT.pending = {rec = MT.reseed("POST_PLAYER_INIT", salt, rs ~= nil)}
 	MT.pending.rec.continuing = continuing
 end))
@@ -545,6 +584,11 @@ end
 mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, guarded("game_started", function(_, continued)
 	if H then diag("game_started", continued == true) end
 	S.custom_fixed = false
+	-- phase12：开局窗口的强制暂停到此为止（录制里控制台之后才关；局内的暂停对齐照旧由 replay.lua 处理）
+	if RP and RP.start_pause_off then
+		local okp, ep = pcall(RP.start_pause_off, MT)
+		if not okp then fail("start_pause_off", ep) end
+	end
 	-- reseed 必须在本回调里任何其它工作之前
 	local okm, mth = pcall(mt_on_game_started, continued)
 	if not okm then fail("mt_reseed", mth); mth = nil end
@@ -662,6 +706,7 @@ if S.writable then
 	if ctl then
 		local ok, h = pcall(function() return load_module("harness")(ctx, ctl) end)
 		if ok then H = h else fail("harness_load", h) end
+		if H and S.register_diag then S.register_diag() end
 		local rpath = OUT .. "/irr_replay.lua"
 		if read_file(rpath) then
 			local ok2, rp = pcall(function() return load_module("replay").load(rpath) end)
