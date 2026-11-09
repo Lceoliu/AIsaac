@@ -25,6 +25,7 @@ from .tok_pickup import ppo_part_terms
 from .tok_teacher2 import teacher_v2_loss
 from .structured_input import from_rows, FRAME_BYTES, VERSION
 from .block_paged import PagedSnapshot, PagedPayload, forward_chunks_paged
+from .block_nvtx import span as nv_span
 
 CUDA_CAPTURE_ADMISSION = threading.RLock()
 CAPTURE_WAITING = threading.Event()
@@ -718,7 +719,8 @@ def forward_bucketed(model, chunks, max_rows=None, **kwargs):
         learner_dump.record(chunks,dict(kwargs,max_rows=max_rows))   # (B44 fixed-input benchmark; measurement only)
         from . import block_learner
         if block_learner.PACKED:   # B44: one execution per part (ISAAC_PACKED_LEARNER=0: per exact length)
-            return block_learner.forward_packed(model,chunks,max_rows=max_rows,**kwargs)
+            with nv_span('learner.forward_packed'):
+                return block_learner.forward_packed(model,chunks,max_rows=max_rows,**kwargs)
     by_length = {}
     for index, chunk in enumerate(chunks):
         by_length.setdefault(len(chunk.rows), []).append(index)

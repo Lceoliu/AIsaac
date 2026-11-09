@@ -251,6 +251,7 @@ import numpy as np
 
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
+from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
 from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
@@ -2818,6 +2819,7 @@ def main(argv=None, child=None, actor=None):
             raise RuntimeError('--temporal 1: the rollout has no temporal arrays (a bench job of a run without it?)')
         mark = [t0]
         cpu0 = cpu_ticks()
+        nv_seg = [nv.start('learner.after_start')]   # (B50: the segment that follows each sec() mark)
 
         def sec(name):
             if PROFILE:
@@ -2825,6 +2827,7 @@ def main(argv=None, child=None, actor=None):
             now_ = time.perf_counter()
             U[name] += now_ - mark[0]
             mark[0] = now_
+            nv.end(nv_seg[0]); nv_seg[0] = nv.start('learner.after_'+name)
         rl = job['roll']
         if job.get('lroll') is not None:   # B38: the rollout's mirror on this GPU; its copy done before any read
             rl = job['lroll']
@@ -4305,7 +4308,11 @@ def main(argv=None, child=None, actor=None):
                     # B42 spike localisation: the torch profiler over update k of the learner thread
                     profile_learn(learn, job, prof_dir_t)
                 else:
-                    learn(job)
+                    nv.push('learner.update')
+                    try:
+                        learn(job)
+                    finally:
+                        nv.pop()
             except BaseException as exc:   # handed to the main thread
                 failure.append(exc)
                 fresh.set()
@@ -4753,9 +4760,11 @@ def main(argv=None, child=None, actor=None):
         n_handoffs = -(-(target_decisions - decisions_total) // args.rollout)
         sent_handoffs = 0
         rollout_actor = args.rollout // n_act
+        nsys_win = nv.profiler_window()
         while (handed < target_decisions if n_act == 1 and not args.max_updates else sent_handoffs < n_handoffs) and sampler.live and                 not L.get('stop') and not stopped():
             # ---- collect
             t0 = time.perf_counter()
+            nv.profiler_mark(sent_handoffs, nsys_win)
             cpu_c0 = cpu_ticks()
             prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=0, calls=0, rows=0, eager=0,
                         act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0, cf_snaps=0,
@@ -4763,7 +4772,9 @@ def main(argv=None, child=None, actor=None):
 
             def _lane_tick(prof_):   # (B46: the actor thread's lane rounds outside a main call, timed)
                 t_k = time.perf_counter()
+                nv.push('actor.tick')
                 lanes.tick()
+                nv.pop()
                 prof_['tick'] += time.perf_counter() - t_k
             actor_profile_path=os.environ.get('ISAAC_BLOCK_ACTOR_PROFILE','')
             actor_profile=None
@@ -4783,21 +4794,27 @@ def main(argv=None, child=None, actor=None):
                     if lanes is not None:   # (B36: no lane call runs while the weights change)
                         lanes.quiesce()
                     t_w = time.perf_counter()
+                    nv.push('actor.weights')
                     take_weights()
+                    nv.pop()
                     prof['weights'] += time.perf_counter() - t_w
                 ta = time.perf_counter()
+                nv.push('actor.poll')
                 if inflight:   # a call is running: take what is ready now, else finish the oldest call
                     if not free:
+                        nv.pop()
                         finish(prof)
                         continue
                     idx, slots = sampler.poll_ready(idle=0.0)
                     if not len(idx):
                         prof['poll'] += time.perf_counter() - ta
+                        nv.pop()
                         finish(prof)
                         continue
                 else:   # (B36: a short wait while a lane call is in flight or a lane window is open)
                     idx, slots = sampler.poll_ready(idle=0.05 if lanes is None else lanes.idle(0.05),
                                                     want=args.poll_want, max_wait=args.poll_wait)
+                nv.pop()
                 tb = time.perf_counter()
                 prof['poll'] += tb - ta
                 prof['polls'] += 1
@@ -4805,6 +4822,7 @@ def main(argv=None, child=None, actor=None):
                     if block_actor is not None:
                         _lane_tick(prof)
                     continue
+                nv.push('actor.book')
                 rows = sampler.rows[slots]
                 if priv_pending is not None:   # 2026-11-03 (tok_priv): one record per worker is outstanding at a time
                     priv_pending[idx] = sampler.priv[slots]
@@ -4813,6 +4831,7 @@ def main(argv=None, child=None, actor=None):
                 go = book.arrive(roll, rows, idx, pending)
                 t1 = time.perf_counter()
                 prof['book'] += t1 - tb
+                nv.pop()
                 if not go.all():   # records that end an episode only need their answer
                     sampler.reply(idx[~go])
                 if not go.any():
@@ -4826,10 +4845,13 @@ def main(argv=None, child=None, actor=None):
                 under_way = pending[a_idx]
                 if block_actor is not None:
                     control_started=time.perf_counter()
+                    nv.push('actor.control')
                     lanes.capture_main(a_idx,sub,under_way)
+                    nv.pop()
                     prof['control']+=time.perf_counter()-control_started
                     inference_started=time.perf_counter()
                     def answer_block(host_b,contexts):
+                        nv.push('actor.answer')
                         prof['main_ready']+=time.perf_counter()-inference_started
                         actions=host_b[:,:nh].astype(np.int64)
                         logp,value,vg=host_b[:,nh],host_b[:,nh+1],host_b[:,nh+2]
@@ -4838,7 +4860,10 @@ def main(argv=None, child=None, actor=None):
                         # Preserve the actually issued action, including forced moves.
                         for w_b in a_idx:
                             block_actor.pending[int(w_b)]=pending[w_b:w_b+1].copy()
+                        nv.pop()
+                    nv.push('actor.step_main')
                     lanes.step_main(sub,under_way,a_idx,on_main_ready=answer_block)
+                    nv.pop()
                     inference_s=time.perf_counter()-inference_started
                     prof['latency']+=inference_s
                     if busy:

@@ -13,6 +13,7 @@ from .tok_policy import crn_uniforms
 from .block_training import BlockActor
 from .tok_lanes import LaneService
 from .block_protocol import decode_reference
+from .block_nvtx import push as nv_push, pop as nv_pop
 
 
 class ContextRegistry:
@@ -113,6 +114,13 @@ class BlockLaneService(LaneService):
                 self.s.cf_snap[worker]=0
 
     def service_control(self):
+        nv_push('lane.control')
+        try:
+            return self._service_control()
+        finally:
+            nv_pop()
+
+    def _service_control(self):
         if self.main_actor is None:
             return
         from .tok_sampler import ST,TEACH_RING
@@ -193,7 +201,9 @@ class BlockLaneService(LaneService):
         callback=self.main_request[3]
         self.main_request=None
         if callback is not None:
+            nv_push('lane.reply_main')
             callback(self.main_actor.host_output,self.main_actor.last_contexts)
+            nv_pop()
 
     def _step_main_only(self):
         rows,pending,slots,_=self.main_request
@@ -265,6 +275,7 @@ class BlockLaneService(LaneService):
         import time as time_
         from .block_paged import ucount
         t_call = time_.perf_counter()
+        nv_push('lane.eager')
         f['eager_calls'] = 0
         n = len(idx)
         a = pend.copy()
@@ -346,9 +357,17 @@ class BlockLaneService(LaneService):
                     refs[j, -1] = 1.0
                 self.lane_steps[lane] += 1
         f.update(a=a, lp=lp, v=value, vg=vg, version=versions, block_refs=refs,cancelled=cancelled)
+        nv_pop()
         ucount('lane_call_s',time_.perf_counter()-t_call);ucount('lane_calls',1);ucount('lane_rows',n)
 
     def finish(self):
+        nv_push('lane.finish')
+        try:
+            return self._finish()
+        finally:
+            nv_pop()
+
+    def _finish(self):
         if self.fly is not None:
             f=self.fly
             for j,lane in enumerate(f['idx']):

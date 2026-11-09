@@ -34,6 +34,7 @@ import torch
 
 from .block_slots import BlockSlotState
 from .structured_input import from_rows
+from .block_nvtx import push as nv_push, pop as nv_pop
 
 
 # ----------------------------------------------------------------------------- timing (ISAAC_BLOCK_TIMING=1)
@@ -509,6 +510,7 @@ class PagedStore:
     def write_decisions(self, rows, pending, kv, z, steps, version):
         """kv [n,L,2,H,lat,dh] cpu, z [n,lat,lw] cpu. Returns (decision ids, K/V slots)."""
         n = len(steps)
+        nv_push('pages.write_dec')
         with self.lock:
             kvs = self._alloc(n, 'd')
             dec = np.arange(self.next_decision, self.next_decision+n, dtype=np.int64)
@@ -521,14 +523,17 @@ class PagedStore:
         for i in range(n):
             self.raw[int(dec[i])] = (int(first[i]), int(schema[i]), frames[i, :int(nbytes[i])].tobytes(),
                                      np.array(pending[i], np.int64))
+        nv_pop()
         return dec, kvs
 
     def write_blocks(self, values, ends, version, src, srcver):
+        nv_push('pages.write_blk')
         with self.lock:
             bid = self._alloc(len(ends), 'b')
         self._scatter(self.b_pages, bid, values)
         self.b_meta[bid, 0] = ends; self.b_meta[bid, 1] = int(version)
         self.b_src[bid] = src; self.b_srcver[bid] = srcver
+        nv_pop()
         return bid
 
     # ---- reads
@@ -968,6 +973,7 @@ class ActorStepGraph:
         else:
             self.graphs.move_to_end(key)
         flat, hbuf, hv, graph, out, current, z, written, back, filled = entry
+        nv_push('g.unpack')
         lib = self.native
         if lib is not None and 'visible_frame' in rows.dtype.names:
             # B46: frames unpacked in C straight into the pinned slab (rows past n: zeroed below)
@@ -998,9 +1004,12 @@ class ActorStepGraph:
         hv['complete'][:] = False
         hv['complete'][:n] = complete
         hv['version'][0] = int(version)
+        nv_pop(); nv_push('g.h2d')
         flat.copy_(hbuf, non_blocking=True)
+        nv_pop(); nv_push('g.replay')
         graph.replay()
         self.replays += 1
+        nv_pop(); nv_push('g.d2h')
         bo, bc, bz, bw = back
         bo.copy_(out, non_blocking=True)
         bc.copy_(current, non_blocking=True)
@@ -1008,8 +1017,10 @@ class ActorStepGraph:
         done = np.flatnonzero(complete)
         if len(done):
             bw.copy_(written, non_blocking=True)
+        nv_pop(); nv_push('g.sync')
         t_wait = time_.perf_counter()
         torch.cuda.current_stream(self.device).synchronize()
+        nv_pop()
         ucount('actor_graph_host_s', t_wait-t_call); ucount('actor_graph_wait_s', time_.perf_counter()-t_wait)
         # the Writer ran on every row; only the complete rows' blocks are handed out (the other rows of
         # the pinned buffer hold another call's values): [len(done), tokens, width], in row order
@@ -1101,6 +1112,7 @@ class SlotBlockActor:
     @torch.inference_mode()
     def step(self, rows, pending, slots, ukeys=None, greedy=False, evaluate=False, owners=None, uniform=None):
         from .tok_policy import crn_uniforms
+        nv_push('step.setup')
         slots = list(map(int, slots))
         owners = [self]*len(slots) if owners is None else owners
         if any(owner.version != self.version for owner in owners):
@@ -1131,6 +1143,7 @@ class SlotBlockActor:
         n_self = sum(owner is self for owner in owners)
         kind = 'main' if n_self == len(owners) and self.lane_slots else (
             'lane' if n_self == len(owners) else 'merged')
+        nv_pop()
         if self.step_graph is not None and all(owner.state is self.state for owner in owners):
             done = self._graph_step(rows, pending, slots, owners, groups, ukeys, greedy, evaluate, uniform, steps_host,
                                     record, clock)
@@ -1138,7 +1151,9 @@ class SlotBlockActor:
                 self.last_path = 'graph'
                 result, host, kv_host, z_host = done
                 t_pages = time_.perf_counter()
+                nv_push('step.pages')
                 self._pages(rows, pending, slots, owners, groups, record, host, kv_host, z_host, steps_host, contexts)
+                nv_pop()
                 clock.mark('pages')
                 if TIMING_ON:
                     t_end = time_.perf_counter()
@@ -1153,6 +1168,7 @@ class SlotBlockActor:
                     ucount('actor_graph_overlap_s', dt if active or LEARNER_ACTIVE[0] else 0.0)
                 return result
         self.last_path = 'eager'
+        nv_push('step.eager')
         if TIMING_ON:
             ucount('actor_eager_calls', 1); ucount('actor_eager_merged_calls', int(len(groups) > 1))
 
@@ -1244,6 +1260,7 @@ class SlotBlockActor:
             dt = time_.perf_counter()-t_call
             ucount('actor_step_s', dt)
             ucount('actor_eager_s', dt); ucount('actor_eager_overlap_s', dt if active or LEARNER_ACTIVE[0] else 0.0)
+        nv_pop()
         return result
 
 
@@ -1252,6 +1269,7 @@ class SlotBlockActor:
         """B42 glue 5 / B46: the step through ActorStepGraph, the Writer included (None: not
         captured; the eager path runs). Rows may belong to several owners of this arena."""
         from .tok_policy import crn_uniforms
+        nv_push('step.prep')
         n = len(slots)
         heads = sum(self.model.heads)
         replay = np.broadcast_to(np.asarray(evaluate, dtype=bool), (n,)).copy()
@@ -1270,10 +1288,12 @@ class SlotBlockActor:
         bs = self.model.block_memory.config.block_steps
         complete = (steps_host+1) % bs == 0
         clock.mark('decode_host')
+        nv_pop()
         out = self.step_graph(rows, np.asarray(pending, np.int64), ids, u, replay, complete, self.version, greedy)
         if out is None:
             return None
         out, cur, zc, zdtype, written, out_t = out
+        nv_push('step.after')
         clock.mark('graph')
         count('actor.graph_calls', 1)
         self.state.step_host[ids] += 1
@@ -1295,6 +1315,7 @@ class SlotBlockActor:
             res = out_t.to(dev, non_blocking=True)
             result = (res[:, :nh].long(), res[:, nh], res[:, nh+1], res[:, nh+2])
         self.last_result = None
+        nv_pop()
         return result, out.copy(), cur, zc   # (B47 fix 1a: rows-first K/V, float32 z: views of the pinned buffer)
 
     def _pages(self, rows, pending, slots, owners, groups, record, host, kv_host, z_host, steps_host, contexts):

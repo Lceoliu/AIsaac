@@ -33,6 +33,7 @@ import numpy as np
 import torch
 
 from .tok_policy import crn_uniforms, to_batch
+from .block_nvtx import push as nv_push, pop as nv_pop
 
 ACTIVE_S = 0.05   # s a lane counts as active after its last request (the window's "every active lane is waiting")
 
@@ -185,6 +186,13 @@ class LaneService:
 
     def submit(self):
         """Take every waiting request and start one call for them. True when there were any."""
+        nv_push('lane.submit')
+        try:
+            return self._submit()
+        finally:
+            nv_pop()
+
+    def _submit(self):
         if self.fly is not None:   # (one call in flight at a time)
             self.finish()
         s = self.s
