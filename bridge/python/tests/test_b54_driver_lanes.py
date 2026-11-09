@@ -393,3 +393,80 @@ def test_driver_lanes_pressure_restores_and_jobs_while_workers_step():
     assert c['lane_jobs'] >= sum(lane_recs)
     for w in range(W):
         assert int(a.state.step_host[w]) == K
+
+
+def test_driver_python_switch_matches_driver_only():
+    """The driver <-> Python switch of serve_wait (the actor waiting for the learner): rounds stepped on the Python
+    path in the middle of a lane's run, the rings re-set from the logs (driver_ring), then back on the driver. Same
+    scripted rounds with and without the switch: outputs, decision ids, pages, blocks and their sources, arena rows
+    bit for bit."""
+    torch.manual_seed(57)
+    m = make_policy('cuda').eval()
+    lm = copy.deepcopy(m)
+    nh = len(m.heads)
+    rng = np.random.default_rng(57)
+    K = 30
+    script = []
+    for k in range(K):
+        lanes = [0] if k < 10 else [0, 1]
+        rows = frame(rng, len(lanes), k, np.ones(len(lanes), np.int64), np.array([int(k == 0)]*len(lanes)), seed=8000+k)
+        script.append((lanes, rows, synth_pending(rng, len(lanes), m.heads), np.array([500+k+10*q for q in lanes]),
+                       np.array([k % 6 == 4 and q == 0 for q in lanes])))
+
+    def run(python_steps):
+        a = SlotBlockActor(m, 1, graph_entities=128, bf16=True, lane_slots=2, lane_generations=1)
+        la = a.lane_actor(lm, 2, generation=0)
+        la.version = 5
+        s = fake_sampler(1, nh)
+        d = make_driver_for(a, s)
+        la.step_graph.attach_driver(d)
+        d.set_version(3)
+        d.start()
+        outs, decs, kvs, bids = [], [], [], []
+        snap = None
+        for k, (lanes, rows, pend, seq, rep) in enumerate(script):
+            if k == 10:   # lane 1: a branch of lane 0 restored from its step-9 context
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+                    la.restore(1, snap)
+                driver_ring(d, la, 1)
+            if k in python_steps:
+                d.pause()
+                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+                    la.step(rows, pend, lanes, ukeys=(seq, np.array(lanes)), evaluate=rep)
+                out = la.host_output.copy()
+                dec = np.array([la.logs[q].dec[la.logs[q].n-1] for q in lanes])
+                kv = np.array([la.logs[q].kvs[la.logs[q].n-1] for q in lanes])
+                bid = np.array([la.logs[q].blk[la.logs[q].nb-1] if la.logs[q].nb and la.logs[q].blk_end[la.logs[q].nb-1] == int(a.state.step_host[la.base+q])-1
+                                else -1 for q in lanes])
+                ctx = la.last_contexts
+                for q in lanes:
+                    driver_ring(d, la, q)
+                d.resume()
+            else:
+                submit(d, k+1, la, rows, pend, lanes, seq, rep, 5)
+                r = wait_kind(d, (4,), [a, la])
+                ctx = mirror(la, la.logs, r, lanes, rows, 5)
+                out, dec, kv, bid = r['out'].numpy().copy(), r['dec'].numpy().copy(), r['kvs'].numpy().copy(), r['bid'].numpy().copy()
+            if k == 9:
+                snap = ctx[0]
+            outs.append(out); decs.append(dec); kvs.append(kv); bids.append(bid)
+        d.pause(); d.stop()
+        assert d.last_error() == ''
+        return a, la, outs, decs, kvs, bids
+
+    a1, l1, o1, d1, k1, b1 = run(set())
+    a2, l2, o2, d2, k2, b2 = run({12, 13, 14, 15, 16, 17, 25})
+    bs = m.block_memory.config.block_steps
+    for k in range(K):
+        np.testing.assert_array_equal(o1[k], o2[k], err_msg=f'step {k}')
+        np.testing.assert_array_equal(d1[k], d2[k]); np.testing.assert_array_equal(k1[k], k2[k])
+        same_pages(a1.store, a2.store, k1[k], k2[k])
+        np.testing.assert_array_equal(b1[k] >= 0, b2[k] >= 0, err_msg=f'step {k}: blocks')
+        for x, y in zip(b1[k], b2[k]):
+            if x >= 0:
+                same_block(a1.store, a2.store, int(x), int(y))
+    assert sum(int((b >= 0).sum()) for b in b1) >= K//bs   # (blocks completed on both sides of the switch)
+    ids = torch.tensor([l1.base, l1.base+1], device='cuda')
+    g1, g2 = a1.state.gather(ids), a2.state.gather(ids)
+    for k_ in ('kv', 'bank', 'partial', 'kv_steps', 'ends', 'bank_versions', 'partial_versions'):
+        torch.testing.assert_close(g1[k_], g2[k_], rtol=0, atol=0, msg=k_)

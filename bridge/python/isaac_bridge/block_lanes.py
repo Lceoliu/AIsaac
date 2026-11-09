@@ -270,6 +270,7 @@ class BlockLaneService(LaneService):
             for job in sorted(self.fly['jobs']):
                 if not self.driver.drop_lane_job(job):
                     raise RuntimeError(f'lane job {job}: not queued on the paused driver (its record unconsumed?)')
+                self.stat['py_lane_flushed_rows'] = self.stat.get('py_lane_flushed_rows', 0)+len(self.drv_jobs[job][3])
                 self._python_job(job)
         if self.fly is not None and self.fly['ready']:
             self.finish()
@@ -374,6 +375,9 @@ class BlockLaneService(LaneService):
         if self.py_mode:
             for generation, positions in group_items:
                 self.ring_dirty.update((generation, int(idx[j])) for j in positions)
+            # (B54 counters: the rounds / rows the Python path steps while the actor waits for the learner)
+            self.stat['py_lane_rounds'] = self.stat.get('py_lane_rounds', 0)+int(bool(group_items))
+            self.stat['py_lane_rows'] = self.stat.get('py_lane_rows', 0)+sum(len(pos) for _, pos in group_items)
         if self.main_request is not None:
             matching=[generation for generation in groups
                       if self.actors[generation].version==self.main_actor.version]

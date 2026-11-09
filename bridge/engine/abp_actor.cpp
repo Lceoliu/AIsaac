@@ -413,6 +413,8 @@ struct ActorDriver {
   std::atomic<i64> n_lane_jobs{0}, n_lane_rows{0}, n_merged_rows{0}, n_merged_calls{0}, n_lane_calls{0}, n_captures{0},
       n_lane_python{0}, n_pauses{0};
   std::atomic<double> t_pause_s{0};
+  std::atomic<double> t_lane_s{0};                 // (B54) seconds in lane-only calls (fill, replay, pages, record)
+  std::atomic<i64> lane_hist[6] = {};              // (B54) lane-only calls by rows: 1, 2, 3-4, 5-8, 9-16, > 16
 
   explicit ActorDriver(std::shared_ptr<PageStore> s) : store(std::move(s)) {}
   ~ActorDriver() { stop(); }
@@ -621,6 +623,8 @@ struct ActorDriver {
     d["lane_jobs"] = n_lane_jobs.load(); d["lane_rows"] = n_lane_rows.load(); d["merged_rows"] = n_merged_rows.load();
     d["merged_calls"] = n_merged_calls.load(); d["lane_calls"] = n_lane_calls.load(); d["captures"] = n_captures.load();
     d["lane_python"] = n_lane_python.load(); d["pauses"] = n_pauses.load(); d["pause_s"] = t_pause_s.load();
+    d["lane_s"] = t_lane_s.load();
+    py::list h; for (auto &x : lane_hist) h.append(x.load()); d["lane_hist"] = h;
     return d;
   }
 
@@ -972,6 +976,8 @@ struct ActorDriver {
     r->t_pages = r->t_done = now();
     n_lane_jobs++; n_lane_calls++; n_lane_rows = n_lane_rows+k;
     push_record(r);
+    lane_hist[k <= 1 ? 0 : k <= 2 ? 1 : k <= 4 ? 2 : k <= 8 ? 3 : k <= 16 ? 4 : 5]++;
+    t_lane_s = t_lane_s+(now()-t0);
     return true;
   }
   void finish_empty(Record &r) {
