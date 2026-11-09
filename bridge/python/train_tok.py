@@ -2683,6 +2683,7 @@ def main(argv=None, child=None, actor=None):
     torch.cuda.set_stream(actor_stream)
     cpp_driver = None   # B52: the actor's scheduling hot path in C++ (ISAAC_BLOCK_CPP_ACTOR=0: the Python loop)
     cpp_started = [False]   # (B52: the driver thread starts at the first collect, then pauses / resumes)
+    drv_paused_at = [0.0]   # (B54: when the driver was paused for the hand-off)
     if block_actor is not None and lanes is not None and child is None:
         from isaac_bridge import block_driver as bdrv
         from isaac_bridge.block_paged import PagedSnapshot, EpisodeLog   # (consume_record)
@@ -2693,6 +2694,8 @@ def main(argv=None, child=None, actor=None):
             for la_ in lanes.actors.values():   # (the pre-created lane actors' graphs: their middle in C++ too)
                 if la_.step_graph is not None:
                     la_.step_graph.attach_driver(cpp_driver)
+            if os.environ.get('ISAAC_BLOCK_DRIVER_LANES', '1') == '1':
+                lanes.attach_driver(cpp_driver)   # B54: the lane rounds' steps on the driver thread too
         print(f'B52 cpp actor driver: {"on, %d graphs registered" % cpp_driver.n_graphs() if cpp_driver is not None else "off (%s)" % bdrv.reason()}'
               f'; lane generations pre-created: {made_g}', flush=True)
     # B38 (--learner-device): the hand-off's copy of a rollout's temporal tensors to the learner's GPU (mirror_temporal:
@@ -4190,6 +4193,9 @@ def main(argv=None, child=None, actor=None):
                 row['block_step_graph_replays']=lane_stat.get('block_step_graph_replays',0)
                 row['block_teacher_forward_calls']=lane_stat.get('block_teacher_forward_calls',0)
                 row['block_mixed_replay_calls']=lane_stat.get('block_mixed_replay_calls',0)
+                for k_d in ('drv_pause_s','drv_pauses','drv_lane_jobs','drv_lane_rows','drv_merged_rows','drv_merged_calls',
+                            'drv_lane_calls','drv_captures','drv_lane_python'):   # (B54: the driver's counters of the collect)
+                    row[k_d]=lane_stat.get(k_d,'')
                 for k_b in ('block_gc_s','block_kv_rows','block_blocks','block_raw_rows'):
                     row[k_b]=lane_stat.get(k_b,0)
                 from isaac_bridge.block_compile import STATS as cstat_b
@@ -4861,11 +4867,26 @@ def main(argv=None, child=None, actor=None):
                     raise ValueError('invalid visible-v2 complete frame length/counts (cpp actor driver)')
                 if kind == 1:   # a graph the driver has no capture of: captured here (the admission may be busy), then retried
                     t_c = time.perf_counter()
-                    with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=block_actor.bf16):
-                        while block_actor.step_graph.capture_key(rec['cap'], rec['widths']) is None:
+                    # (B54: the main actor's graph or a teacher generation's lane graph: the record names its owner)
+                    own_ = next((a_ for a_ in [block_actor, *lanes.actors.values()]
+                                 if a_.step_graph is not None and a_.step_graph.owner == int(rec['owner'])), block_actor)
+                    with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=own_.bf16):
+                        while own_.step_graph.capture_key(rec['cap'], rec['widths']) is None:
                             time.sleep(0.001)
+                    print(f"B54 run-time capture: owner {'main' if own_ is block_actor else 'lane'}, cap {int(rec['cap'])}, "
+                          f"widths {tuple(rec['widths'])}", flush=True)
                     prof_['control'] += time.perf_counter() - t_c
                     return   # (the loop resumes the driver once it is paused with an empty queue)
+                if kind == 4:   # B54: a lane job's rows stepped by the driver (merged with a main batch or lane-only)
+                    t_l = time.perf_counter()
+                    lanes.on_lane_record(rec)
+                    prof_['tick'] += time.perf_counter() - t_l
+                    return
+                if kind == 5:   # B54: a lane job the driver cannot replay: stepped here (the driver paused itself)
+                    t_l = time.perf_counter()
+                    lanes.on_lane_python(rec)
+                    prof_['tick'] += time.perf_counter() - t_l
+                    return
                 tb_ = time.perf_counter()
                 idx_r = rec['workers'].numpy()
                 go_r = rec['go'].numpy().astype(bool)
@@ -4923,6 +4944,8 @@ def main(argv=None, child=None, actor=None):
                 """(B52) One collect with the driver: records consumed, lane rounds and weight takes with the driver
                 paused; the driver is left paused (drained) for the hand-off."""
                 cpp_driver.set_version(version)   # (take_weights may have run at the hand-off)
+                c0_ = cpp_driver.counters()
+                handoff_ = time.perf_counter()-drv_paused_at[0] if drv_paused_at[0] else 0.0
                 if not cpp_started[0]:   # (the first collect starts the thread; it is paused between collects)
                     cpp_driver.start(); cpp_started[0] = True
                 cpp_driver.resume()
@@ -4942,13 +4965,28 @@ def main(argv=None, child=None, actor=None):
                     prof_['poll'] += time.perf_counter() - ta_
                     if rec_ is not None:
                         consume_record(rec_, prof_)
-                    if sampler.poll_lanes() or lanes.in_flight:   # (lane rounds on the shared arena: the driver paused)
+                    if lanes.driver is not None:   # B54: the lane rounds go to the driver; the tick never pauses it
+                        _lane_tick(prof_)
+                    elif sampler.poll_lanes() or lanes.in_flight:   # (B52: lane rounds on the shared arena: the driver paused)
                         cpp_driver.pause(); drain_driver(prof_)
                         _lane_tick(prof_)
                         cpp_driver.resume()
-                    elif rec_ is None and cpp_driver.is_paused() and cpp_driver.queue_size() == 0:
-                        cpp_driver.resume()   # (a capture request was answered)
+                    if rec_ is None and cpp_driver.is_paused() and cpp_driver.queue_size() == 0:
+                        cpp_driver.resume()   # (a capture request / a Python-stepped lane job was answered)
+                c1_ = cpp_driver.counters()
                 cpp_driver.pause(); drain_driver(prof_)
+                drv_paused_at[0] = time.perf_counter()
+                # B54 counters of this collect: the driver's paused seconds (the hand-off's pause before this collect's
+                # resume excluded), lane jobs / rows, merged rows and calls, lane-only calls, run-time captures
+                d_ = {k_: c1_[k_]-c0_[k_] for k_ in c1_}
+                lane_stat['drv_pause_s'] = max(0.0, d_['pause_s']-handoff_)
+                lane_stat['drv_pauses'] = d_['pauses']
+                for k_ in ('lane_jobs', 'lane_rows', 'merged_rows', 'merged_calls', 'lane_calls', 'captures', 'lane_python'):
+                    lane_stat['drv_'+k_] = d_[k_]
+                print(f"B54 driver collect: paused {lane_stat['drv_pause_s']:.2f} s ({d_['pauses']} pauses), lane jobs "
+                      f"{d_['lane_jobs']} ({d_['lane_rows']} rows: {d_['merged_rows']} merged in {d_['merged_calls']} main "
+                      f"batches, {d_['lane_calls']} lane-only calls), run-time captures {d_['captures']}, "
+                      f"lane jobs stepped in Python {d_['lane_python']}", flush=True)
                 lane_stat['block_step_graph_replays']=sum(a.step_graph.replays for a in
                     [block_actor,*lanes.actors.values()] if getattr(a,'step_graph',None) is not None)
                 lane_stat.update({'driver_'+k_: v_ for k_, v_ in cpp_driver.counters().items()})
