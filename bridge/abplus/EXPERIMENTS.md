@@ -9895,3 +9895,32 @@ B55测得：打开FX graph cache与AOTAutogradCache后，缓存热时Spatial预�
   - P1的安全性（稳态重编译为0）已在带游戏的profile中确认。
   - 速度：collect不退化；update高约1 s，尚不能定性。
   - 默认值未改。建议再做一次：缓存热的profile（同时验证生产中热预热的实际节省），再加上P1b按B55方式重跑，约25分钟。是否做、何时做，由协调方定。
+
+第二次（协调方批准，≤25分钟）：B54链07:09因smoke失败停止，一次性等待脚本07:11:47启动`b56_verify2.sh`，锁持有到07:32:10，共1223 s，前后guard干净。
+
+- 缓存热的短profile `prof-b56-fxw`（开关打开，生产缓存目录已由prof-b56-fx写入）：
+  - 预热：**Spatial 151.4 s**（关缓存599–621 s，−75%），Flex Reader 26.2 s；合计约178 s，原来约640 s。
+  - `block_steady_compiles`在6个update里全为0，`block_compiles` 72。
+  - 只给train_tok主进程发SIGINT：worker不再打印traceback；只有lane线程在主进程退出时打印了1个KeyboardInterrupt，是正常的停止。
+
+| u2–u6中位 | collect s | update s | ×实时 |
+|---|---:|---:|---:|
+| prof-b56-fxw（缓存开，热） | 28.5 | 19.4 | 144.9 |
+| prof-b56-fx（缓存开，冷） | 28.9 | 19.5 | 147.6 |
+| prof-b48-pf（关） | 29.6 | 18.0 | 142.9 |
+| prof-b52-py（关） | 27.1 | 18.6 | 165.7 |
+| prof-b51-unb（关，只有u2–u5） | 26.9 | 17.05 | 166.3 |
+
+  - 两次缓存开的update都比关缓存的同窗高约1 s。逐项计时：u2–u5的learner Spatial调用次数缓存开为113.5 / 117次，关为约101次（b51-unb与b48-pf的平均），多了12–16%；backward GPU时间9.55 / 9.34 s对8.53 s，按每次调用算是0.084 / 0.080 s对0.085 s，不比关缓存慢。
+  - 所以多出来的约1 s来自工作量（这几次run的轨迹给learner的Spatial调用更多），不是缓存让kernel变慢。这与缓存用的是同一份Inductor产物一致。
+  - collect与×实时处在关缓存几次run的范围内。
+- P1b（探针：先在自己的新目录冷跑538.4 s，再热跑`--why-miss` 252.0 s，只编Spatial）：
+  - 51次FX载入中，失败的8次**全部是learner grad模式图（8个T桶各1个）的backward图**。
+  - 三类归因中属于第2类：缓存条目存在（key目录在，候选1个），但guard在新进程里求值为False。
+  - 失败的方式：guard表达式里有`L['t10'] == 28*L['t2']`、`L['t11'] == 40*L['t0']`（T=40；T=48 / 64时是48 / 64倍）。新进程给出的hint列表有17个值，其中恰好有84（= 28·3）和120（= 40·3），但不在t10、t11的位置上。也就是说，backward图的symint输入顺序（以及个数）在写入和载入时不一致，guard按位置取值才失败，形状关系本身是成立的。
+  - 这是torch 2.7.1中AOTAutogradCache / FXGraphCache对动态形状backward图的问题，项目代码这边没有不改torch的修法。
+  - 生产里的热预热只要151.4 s，比探针的252 s少约100 s，约等于这8个backward重编的时间。生产很可能没有触发这个miss（train_tok没有打印缓存计数，无法确认）。所以修好它的收益最多约100 s，很可能为0。
+- 结论与建议：
+  - P1可以改为默认开：稳态重编译为0（两次带游戏的profile，冷、热各一次），热预热约178 s对约640 s，update的差别是工作量而不是缓存。
+  - P1b不修。可选：在train_tok预热行后打印一次fxgraph / autograd cache的hit / miss计数（一行，只观测），以后可以直接看生产是否命中。
+  - 默认值仍未改，等协调方确认。
