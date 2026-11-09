@@ -4980,7 +4980,7 @@ def main(argv=None, child=None, actor=None):
                 drv_paused_at[0] = time.perf_counter()
                 # B54 counters of this collect: the driver's paused seconds (the hand-off's pause before this collect's
                 # resume excluded), lane jobs / rows, merged rows and calls, lane-only calls, run-time captures
-                d_ = {k_: c1_[k_]-c0_[k_] for k_ in c1_}
+                d_ = {k_: c1_[k_]-c0_[k_] for k_ in c1_ if k_ != 'lane_hist'}   # (the histogram: lane_hist below)
                 lane_stat['drv_pause_s'] = max(0.0, d_['pause_s']-handoff_)
                 lane_stat['drv_pauses'] = d_['pauses']
                 for k_ in ('lane_jobs', 'lane_rows', 'merged_rows', 'merged_calls', 'lane_calls', 'captures', 'lane_python', 'lane_s'):
