@@ -2688,6 +2688,10 @@ def main(argv=None, child=None, actor=None):
         made_g = bdrv.precapture_lane_generations(lanes, model)   # (both teacher generations' lane graphs now)
         cpp_driver = bdrv.make_driver(block_actor, sampler, actor_stream, args.seed + 1000003 * aid + 0xB52, pf_on,
                                       getattr(sampler, 'aux', None))
+        if cpp_driver is not None:
+            for la_ in lanes.actors.values():   # (the pre-created lane actors' graphs: their middle in C++ too)
+                if la_.step_graph is not None:
+                    la_.step_graph.attach_driver(cpp_driver)
         print(f'B52 cpp actor driver: {"on, %d graphs registered" % cpp_driver.n_graphs() if cpp_driver is not None else "off (%s)" % bdrv.reason()}'
               f'; lane generations pre-created: {made_g}', flush=True)
     # B38 (--learner-device): the hand-off's copy of a rollout's temporal tensors to the learner's GPU (mirror_temporal:
@@ -4860,8 +4864,7 @@ def main(argv=None, child=None, actor=None):
                         while block_actor.step_graph.capture_key(rec['cap'], rec['widths']) is None:
                             time.sleep(0.001)
                     prof_['control'] += time.perf_counter() - t_c
-                    cpp_driver.resume()
-                    return
+                    return   # (the loop resumes the driver once it is paused with an empty queue)
                 tb_ = time.perf_counter()
                 idx_r = rec['workers'].numpy()
                 go_r = rec['go'].numpy().astype(bool)
@@ -4918,6 +4921,7 @@ def main(argv=None, child=None, actor=None):
             def run_driver_collect(prof_):
                 """(B52) One collect with the driver: records consumed, lane rounds and weight takes with the driver
                 paused; the driver is left paused (drained) for the hand-off."""
+                cpp_driver.set_version(version)   # (take_weights may have run at the hand-off)
                 cpp_driver.resume()
                 while roll.usable() < rollout_actor and sampler.live and not stopped():
                     if busy and fresh.is_set():

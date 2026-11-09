@@ -128,3 +128,26 @@ update 侧：learner 每 update 4.4–5.2 s 的 GIL 等待随 actor 离开 GIL �
    阻塞（本次按时长分桶 + learner 段归因）。
 6. “加 worker 到 32”：内存不够（B47）。
 7. “两代 lane 一次同步”：只有在 lane 组装进 C++ 后才可能有收益（阶段 2 评估），每轮的主要成本现在是组装，不是同步次数。
+
+## 8. 阶段 1（B52）实现记录与条件对应
+
+- **顺序不变量（条件 3）**：`ActorDriver::step_batch` 在 driver 线程内依次：同步 → 写共享数组 → `reply_rows` → `PageStore::write_decisions_raw` /
+  `write_blocks_raw`（页 + 元数据 + raw 帧，持 store 互斥锁）→ `step_host` 递增 → `push_record`（队列互斥锁）。消费者只从队列拿记录，
+  snapshot（`PagedSnapshot(store, log, step_before, pending_before, version)`）、`EpisodeLog.push`、CF 捕获（`capture_deferred`）、
+  lane 的 `restore` 都由记录触发；learner 的 gather 只读 `d_meta` 里已写的 id。队列互斥锁的 release/acquire 给出写页 → 读页的
+  happens-before。测试 `test_driver_pressure_pages_complete_before_records`：6 个假 worker 随机延迟，一条读线程持续 gather 记录过的页、
+  用记录重建的 snapshot 做 lane restore，driver 同时在跑；校验 d_meta、raw、b_src/b_srcver 与消费者侧 EpisodeLog 一致。
+- **随机数（条件 4）**：driver 用自己的 xoshiro256**（种子 `args.seed + 1000003*aid + 0xB52`，splitmix64 展开），uniform 取高 24 位，
+  分辨率与 torch.rand 相同；lane 行继续 CRN（阶段 2 进 C++）。等价测试两层：(a) `set_fixed_uniform(0.5)` 下 driver 与 Python
+  `step(uniform=0.5)` 的动作 / logp / 价值 / vg / 页 / 块 / 元数据 / arena 行逐位相等（`test_driver_single_worker_matches_python_step_with_fixed_uniforms`）；
+  run_graph 中段在任意 uniform 下与 Python 中段逐位相等（`test_run_graph_middle_matches_python_middle`，fp32 与 bf16）；(b) 整条路径各自可复现由 A8 8/8 覆盖。
+- **消费者的 GIL 账（条件 2，预估，待 nsys 回填）**：留在 Python 主线程的每主调用工作 ≈ book 0.8 + snapshot/谱系/record_main/CF 0.5 + store 0.9
+  ≈ 2.2 ms，×2,130 ≈ 4.7 s/collect；阶段 1 的 lane 轮次（组装 3.8 s + lane 步的 Python 外壳 1.3 s）≈ 5 s/collect。合计约 10 s 的 Python
+  对比原来 actor 线程约 18 s 的 Python 墙钟（持有 GIL 11.4 s）——learner 的 GIL 等待预计从 4.4–5.2 s/update 降到约 2.5–3 s，不会归零；
+  归零要靠阶段 2（lane 进 driver）和把 `Episodes.arrive` / `EpisodeLog.push` 的热部分下沉。
+- **回退（条件 7）**：`ISAAC_BLOCK_CPP_ACTOR=0`、无 CUDA torch、无 g++、编译/加载失败 → `actor_native.load()` 返回 None，PagedStore 用 Python 数组，
+  train_tok 走原循环；测试文件整体 skip。构建：g++ 直接编译 `abp_visible.c`（-x c）+ `abp_actor.cpp`（-x c++ -std=c++17），torch 自带 pybind11 头，
+  venv 的 `nvidia/*/include`（CUDA 11.8）在前、系统 CUDA 的 include 在后（只为 `crt/host_defines.h`），按源码 + torch 版本哈希缓存 .so，原子替换。
+  holder 假设由扩展本身验证：`register_graph` 收 `std::shared_ptr<at::cuda::CUDAGraph>`，driver 线程 `replay()` 与 Python 重放逐位一致。
+- **4090 门里修掉的三处**：driver 线程要在 `c10::InferenceMode` 下工作（graph 的 pinned 缓冲是 inference 张量）；bf16 缓冲用无类型指针；
+  输出行宽是 nh+3（动作数 + logp/value/vg），不是 sum(heads)+3。

@@ -312,6 +312,7 @@ def test_driver_pressure_pages_complete_before_records():
     seen = []            # (kvs, dec, step, version) of records consumed so far
     seen_lock = threading.Lock()
     reader_checks = [0, 0]
+    cuda_lock = threading.Lock()   # (as the learner's capture admission: no other CUDA work during a graph capture)
 
     def reader(stop):
         """gathers + restores from what has been recorded, while the driver runs"""
@@ -327,8 +328,9 @@ def test_driver_pressure_pages_complete_before_records():
             reader_checks[0] += 1
             snap = items[-1][4]
             if snap is not None:
-                with torch.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+                with cuda_lock, torch.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                     lane.restore(0, snap)
+                    torch.cuda.current_stream().synchronize()
                 reader_checks[1] += 1
 
     # a consumer mirror of the records: EpisodeLogs per worker (lineage), snapshots as train_tok builds them
@@ -355,7 +357,7 @@ def test_driver_pressure_pages_complete_before_records():
                 raise workers[[bool(wk.error) for wk in workers].index(True)].error
             continue
         if r['kind'] == 1:
-            with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=True):
+            with cuda_lock, torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=True):
                 assert a.step_graph.capture_key(r['cap'], r['widths']) is not None
             d.resume(); continue
         assert r['kind'] == 0, d.last_error()
