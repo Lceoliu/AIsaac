@@ -2447,6 +2447,7 @@ def main(argv=None, child=None, actor=None):
                     s_r=block_learner.warm_reader(learner_model,bf16=bool(amp))
                     print(f'B44 Flex Reader warm-up: {block_compile.STATS["compiles"]-c_r} graphs in {s_r:.1f} s',
                           flush=True)
+            print(f'B56 compile cache after warm-up: {block_compile.cache_counters()}',flush=True)
             block_compile.mark_steady()
         # B42: everything alive now (models, compiled code, buffers) leaves the collector's
         # generations; later collections scan only what the run allocates afterwards.

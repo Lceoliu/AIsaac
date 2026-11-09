@@ -17,8 +17,18 @@ STATS = dict(compiles=0, steady_compiles=0, calls=0)
 _LOCK = threading.Lock()
 _STEADY = [False]
 _CONFIGURED = [False]
-# B56: Inductor FX graph cache + AOTAutograd cache across processes (ISAAC_FX_CACHE=1; default off)
-FX_CACHE = os.environ.get('ISAAC_FX_CACHE', '0') == '1'
+# B56: Inductor FX graph cache + AOTAutograd cache across processes (default on; ISAAC_FX_CACHE=0 off)
+FX_CACHE = os.environ.get('ISAAC_FX_CACHE', '1') == '1'
+
+
+def cache_counters():
+    """B56 (observation only): the Inductor FX graph cache and AOTAutograd cache hit / miss counts so far."""
+    from torch._dynamo.utils import counters
+    ind, aot = counters['inductor'], counters['aot_autograd']
+    return dict(fxgraph_hit=ind['fxgraph_cache_hit'], fxgraph_miss=ind['fxgraph_cache_miss'],
+                fxgraph_bypass=ind['fxgraph_cache_bypass'], aot_hit=aot['autograd_cache_hit'],
+                aot_miss=aot['autograd_cache_miss'], aot_guard_miss=aot['autograd_cache_guard_miss'],
+                aot_bypass=aot['autograd_cache_bypass'])
 
 
 def configure():
@@ -38,12 +48,13 @@ def configure():
     if hasattr(torch._dynamo.config, 'accumulated_cache_size_limit'):
         torch._dynamo.config.accumulated_cache_size_limit = max(
             torch._dynamo.config.accumulated_cache_size_limit, 1024)
-    # FX graph cache (and the AOTAutograd cache, which needs it): ISAAC_FX_CACHE=1 on, default off.
+    # FX graph cache (and the AOTAutograd cache, which needs it): on by default, ISAAC_FX_CACHE=0 off.
     # B42 turned it off: a cached graph then carried the size ranges of the compile that produced it
     # (guards like 2 <= batch <= 19 from a warm-up batch; pad_mm, off below, also bounded the batch).
-    # B55: with both caches on, a warm cache cut the Spatial warm-up ~610 -> 243.5 s, and cache-hit
-    # graphs on unseen batch sizes caused 0 steady compiles. B56: default stays off until a game
-    # profile confirms block_steady_compiles = 0 with the caches on.
+    # B55: cache-hit graphs on unseen batch sizes caused 0 steady compiles. B56: two game profiles
+    # (cold, warm cache) with block_steady_compiles = 0; a warm cache cut the production Spatial
+    # warm-up ~610 -> 151.4 s. Known torch 2.7.1 miss: the learner grad graphs' backward FX entries
+    # can fail their guards on reload (symint order), recompiling those 8 backward graphs.
     inductor_config.fx_graph_cache = FX_CACHE
     if FX_CACHE:
         import torch._functorch.config as functorch_config
