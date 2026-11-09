@@ -2682,6 +2682,7 @@ def main(argv=None, child=None, actor=None):
         torch.cuda.synchronize(ldev)
     torch.cuda.set_stream(actor_stream)
     cpp_driver = None   # B52: the actor's scheduling hot path in C++ (ISAAC_BLOCK_CPP_ACTOR=0: the Python loop)
+    cpp_started = [False]   # (B52: the driver thread starts at the first collect, then pauses / resumes)
     if block_actor is not None and lanes is not None and child is None:
         from isaac_bridge import block_driver as bdrv
         from isaac_bridge.block_paged import PagedSnapshot, EpisodeLog   # (consume_record)
@@ -4922,6 +4923,8 @@ def main(argv=None, child=None, actor=None):
                 """(B52) One collect with the driver: records consumed, lane rounds and weight takes with the driver
                 paused; the driver is left paused (drained) for the hand-off."""
                 cpp_driver.set_version(version)   # (take_weights may have run at the hand-off)
+                if not cpp_started[0]:   # (the first collect starts the thread; it is paused between collects)
+                    cpp_driver.start(); cpp_started[0] = True
                 cpp_driver.resume()
                 while roll.usable() < rollout_actor and sampler.live and not stopped():
                     if busy and fresh.is_set():

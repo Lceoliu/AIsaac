@@ -16,7 +16,7 @@ echo "$(date +%T) b52p start ($CODE, $WHICH)" >> $LOG
 guard
 cd $ROOT
 if want smoke; then   # 2 updates with the driver: does the integration run at all
-  CODE=$CODE ./prof2.sh prof-b52-smoke 1200 2.5
+  CODE=$CODE ./prof2.sh prof-b52-smoke 1800 2.5
   echo "$(date +%T) prof-b52-smoke done rc=$? $(grep -m1 'B52 cpp actor driver' $R/prof-b52-smoke.stdout | cut -c1-120); $(grep -E '^u[0-9]+ ' $R/prof-b52-smoke.stdout | tail -1 | cut -c1-100)" >> $LOG
   sleep 5; guard
 fi
