@@ -111,6 +111,9 @@ def decode(parts):
             rows, buf = part
             buf = np.ascontiguousarray(np.asarray(buf, np.uint8))
             off = np.asarray(rows['visible_off'], np.int64)
+            if len(off) and (off % 4).any():   # (the reference reads such a frame's header at off, its floats at
+                #                                 off // 4 * 4: the whole batch to the reference)
+                return si.decode_frames_compact(parts, packed=True)
             a = np.int64(_addr(buf)) if len(buf) else np.int64(0)
             heads.append(a+off)
             datas.append(a+off//4*4)

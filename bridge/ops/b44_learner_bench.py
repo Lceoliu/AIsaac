@@ -181,7 +181,9 @@ def replay(model, opt, calls, packed, seed=0, pipeline=False, ops=None):
             'learn_writer_calls', 'learn_packed_host_s', 'learn_staged_mb', 'learn_main_decode_rows_fresh',
             'learn_hist_decode_rows_fresh', 'learn_tail_decode_rows', 'learn_main_decode_s', 'learn_hist_decode_s',
             'learn_prefetch_host_s', 'learn_prefetch_cpu_s', 'learn_prefetch_wait_s', 'learn_prefetch_hits',
-            'learn_prefetch_dropped', 'learn_prefetch_other_calls', 'learn_prefetch_submitted')
+            'learn_prefetch_dropped', 'learn_prefetch_other_calls', 'learn_prefetch_submitted',
+            'learn_prefetch_wait_grad_s', 'learn_prefetch_wait_nograd_s', 'learn_prefetch_skip_wait_s',
+            'learn_pack_crit_s')
     r = {k: round(v, 3) for k, v in t.items()}
     r.update({k: upd.get(k, 0) for k in keys})
     r['grad_calls'] = n_grad

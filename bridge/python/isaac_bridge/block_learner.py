@@ -177,16 +177,21 @@ class Prefetch:
         if at is None:
             bp.ucount('learn_prefetch_other_calls', 1)
             return None
-        for _ in range(at):   # (queued ahead of this call and skipped by the caller: given up)
+        for _ in range(at):   # (queued ahead of this call and skipped by the caller: given up; should not happen on
+            #                     the learner's paths, its wait counted apart when it does)
             _, box_, ev_ = self.jobs.popleft()
+            t0 = time.perf_counter()
             ev_.wait()
+            bp.ucount('learn_prefetch_skip_wait_s', time.perf_counter()-t0)
             self._free(box_)
             self.misses += 1
             bp.ucount('learn_prefetch_dropped', 1)
         key, box, ev = self.jobs.popleft()
         t0 = time.perf_counter()
         ev.wait()
-        bp.ucount('learn_prefetch_wait_s', time.perf_counter()-t0)
+        w = time.perf_counter()-t0
+        bp.ucount('learn_prefetch_wait_s', w)
+        bp.ucount('learn_prefetch_wait_grad_s' if grad else 'learn_prefetch_wait_nograd_s', w)   # (B60: PPO / recompute)
         if 'error' in box:
             raise box['error']
         self.hits += 1

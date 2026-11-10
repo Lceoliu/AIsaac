@@ -2934,16 +2934,17 @@ def main(argv=None, child=None, actor=None):
                 # Chunk groups are bounded in decisions, just as the PPO microbatches.
                 rgroups_b = list(temporal_bounds(rp_b['tch'],np.arange(len(rp_b['chunks'])),args.micro or args.minibatch))
                 pre_b = blearn_r.PREFETCH_ON and not mem_on
-                if pre_b and rgroups_b:   # B60: each group's host preparation one group ahead (the first one now)
+                if pre_b and rgroups_b:   # B60: the first group's host preparation now
                     blearn_r.PREFETCH.submit(learner_model,[rp_b['chunks'][i] for i in rgroups_b[0][2]],grad=False,
                                              train_history=False,version=L['update'])
                 for g_b,(lo_b,hi_b,ids_b) in enumerate(rgroups_b):
+                    if pre_b and g_b+1 < len(rgroups_b):   # (B60: the next group's before this one's forward: its
+                        #                                       preparation overlaps this group's host dispatch)
+                        blearn_r.PREFETCH.submit(learner_model,[rp_b['chunks'][i] for i in rgroups_b[g_b+1][2]],
+                                                 grad=False,train_history=False,version=L['update'])
                     with autocast():
                         out_b,ctx_b = forward_bucketed(learner_model,[rp_b['chunks'][i] for i in ids_b],
                             train_history=False,version=L['update'])
-                    if pre_b and g_b+1 < len(rgroups_b):
-                        blearn_r.PREFETCH.submit(learner_model,[rp_b['chunks'][i] for i in rgroups_b[g_b+1][2]],
-                                                 grad=False,train_history=False,version=L['update'])
                     bb = take(every,torch.arange(lo_b,hi_b,device=device))
                     act_b = torch.from_numpy(rl.actions.reshape(-1,nh)[all_flat[lo_b:hi_b]]).to(device)
                     lp_parts.append(learner_model.log_prob(out_b[0],learner_model.gate(bb),act_b)[0])

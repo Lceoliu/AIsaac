@@ -95,6 +95,28 @@ def _same(a, b):
         assert x.tobytes() == y.tobytes(), k
 
 
+def _same_value(x, y, where):
+    """Recursive equality of prepared-part values (numpy arrays and tensors by dtype, shape and bytes)."""
+    if isinstance(x, np.ndarray) or isinstance(y, np.ndarray):
+        x, y = np.asarray(x), np.asarray(y)
+        assert x.dtype == y.dtype and x.shape == y.shape and x.tobytes() == y.tobytes(), where
+    elif isinstance(x, torch.Tensor):
+        assert isinstance(y, torch.Tensor) and x.dtype == y.dtype and x.shape == y.shape, where
+        assert torch.equal(x, y), where
+    elif isinstance(x, dict):
+        assert isinstance(y, dict) and x.keys() == y.keys(), where
+        for k in x:
+            _same_value(x[k], y[k], f'{where}.{k}')
+    elif isinstance(x, (list, tuple)):
+        assert type(x) is type(y) and len(x) == len(y), where
+        for i, (a, b) in enumerate(zip(x, y)):
+            _same_value(a, b, f'{where}[{i}]')
+    elif isinstance(x, torch.device):
+        assert x == y, where
+    else:
+        assert x == y and type(x) is type(y), where
+
+
 def _parts(seed):
     rng = np.random.default_rng(seed)
     rows = [synth_rows(rng, n) for n in (5, 1, 3)]
@@ -184,10 +206,15 @@ def test_prepared_part_equals_reference_byte_for_byte(lib, monkeypatch):
     assert ra.keys() == rb.keys() and len(ra) > 8
     for k in ra:
         assert ra[k] == rb[k], k
-    for k in ('names_i', 'sizes_i', 'n_main', 'n_hist', 'n_tail', 'n_new', 'n_old_total', 'plans'):
-        assert pa[k] == pb[k], k
-    norm = (lambda rb: [(r[0], np.asarray(r[1]).tolist(), *r[2:]) for r in rb])
-    assert norm(pa['rbuckets']) == norm(pb['rbuckets'])
+    # every field of the prepared part outside the slab: plans, shapes, indices, counts, draws, scales
+    assert pa.keys() == pb.keys()
+    for k in pa:
+        if k == 'slab':
+            continue
+        if k in ('cfg', 'memory', 'store'):
+            assert pa[k] is pb[k], k
+            continue
+        _same_value(pa[k], pb[k], k)
     assert pa['n_hist'] > 0 and pa['n_tail'] >= 0
 
 
@@ -363,3 +390,48 @@ def test_update_parameters_bit_identical_native_on_off(monkeypatch):
             assert torch.equal(pa[k], pb[k]), k
     finally:
         torch.set_num_threads(threads)
+
+
+def test_unaligned_arena_offsets_fall_back_to_the_reference(lib, monkeypatch):
+    """An arena frame whose offset is not a multiple of 4 (the reference reads its header at the offset and its
+    floats at offset // 4 * 4): the whole batch is decoded by the reference."""
+    rows, compact = _parts(6)
+    recs, buf = compact[0]
+    shifted = recs.copy()
+    shifted['visible_off'][1] += 2
+    pad = np.zeros(len(buf)+8, np.uint8)
+    pad[:len(buf)] = buf
+    calls = []
+    ref = si.decode_frames_compact
+
+    def spy(parts, packed=False):
+        calls.append(len(parts))
+        return ref(parts, packed)
+    monkeypatch.setattr(si, 'decode_frames_compact', spy)
+    try:
+        want = ref([(shifted, pad), compact[1]], True)
+    except ValueError as e:   # (the shifted frame's header is then garbage: the reference's own error)
+        with pytest.raises(ValueError, match=str(e)[:20]):
+            learn_native.decode([(shifted, pad), compact[1]])
+        assert calls == [2]
+        return
+    got = learn_native.decode([(shifted, pad), compact[1]])
+    assert calls == [2]
+    for a, b in zip(want, got):
+        _same(a, b)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA')
+def test_small_cuda_randperm_draws_from_the_default_cpu_generator():
+    """B60 EpochPerms premise: torch.randperm(n < 30000, device=cuda) is drawn on the CPU from the default CPU
+    generator (the history draws' generator), not from the CUDA generator."""
+    torch.manual_seed(7)
+    cpu0, cuda0 = torch.get_rng_state(), torch.cuda.get_rng_state()
+    torch.randperm(2400, device='cuda')
+    torch.cuda.synchronize()
+    assert not torch.equal(torch.get_rng_state(), cpu0)
+    assert torch.equal(torch.cuda.get_rng_state(), cuda0)
+    torch.manual_seed(7)
+    a = torch.randperm(2400, device='cuda').cpu()
+    torch.manual_seed(7)
+    assert torch.equal(a, torch.randperm(2400))
