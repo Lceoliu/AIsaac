@@ -99,6 +99,7 @@ class BlockLaneService(LaneService):
         self.job_serial=0
         self.py_mode=False      # (B54: serve_wait with the driver paused steps rounds on the Python path)
         self.deferred_begin={}  # (B54: lane -> when its branch request first waited for its point's capture)
+        self.lanes_only=False   # (B54: the driver runs lanes only while the actor waits for the learner)
         self.ring_dirty=set()   # (B54: (generation, lane) rows the Python path stepped: their ring re-set before a job)
 
     def attach_driver(self, driver):
@@ -266,22 +267,45 @@ class BlockLaneService(LaneService):
         self.service_control()
         if self.driver is None:
             return super().serve_wait(timeout)
-        # (B54: the actor waits for the learner with the driver paused (and drained): the round in flight, its jobs
-        # still queued on the driver, stepped here; the waiting rounds on the Python path, as before B54)
-        if self.fly is not None and not self.fly['ready']:
-            for job in sorted(self.fly['jobs']):
-                if not self.driver.drop_lane_job(job):
-                    raise RuntimeError(f'lane job {job}: not queued on the paused driver (its record unconsumed?)')
-                self.stat['py_lane_flushed_rows'] = self.stat.get('py_lane_flushed_rows', 0)+len(self.drv_jobs[job][3])
-                self._python_job(job)
-        if self.fly is not None and self.fly['ready']:
-            self.finish()
-            return True
-        driver, self.driver, self.py_mode = self.driver, None, True
-        try:
-            return super().serve_wait(timeout)
-        finally:
-            self.driver, self.py_mode = driver, False
+        # (B54: the actor waits for the learner: the driver runs the lane jobs only (main_hold: the workers' records
+        # wait), the rounds go on as in a collect, their records consumed here; quiesce ends it)
+        import time as time_
+        if not self.lanes_only:
+            self.driver.set_main_hold(True)
+            self.driver.resume()
+            self.lanes_only=True
+        end=time_.perf_counter()+timeout
+        did=False
+        while True:
+            rec=self.driver.next_record(0.0005)
+            if rec is not None:
+                self.driver_record(rec)
+                did=True
+            did=bool(self.tick()) or did
+            if time_.perf_counter()>=end:
+                return did
+
+    def driver_record(self, rec, resume=True):
+        """(B54) A record of the driver while it runs lanes only: lane rows (kind 4), a job for the Python path (5), a
+        lane graph to capture (1: captured on its owner's graph, the driver resumed unless resume=False)."""
+        import time as time_
+        kind=int(rec['kind'])
+        if kind==4:
+            return self.on_lane_record(rec)
+        if kind==5:
+            return self.on_lane_python(rec)
+        if kind==1:
+            owners=[self.main_actor,*self.actors.values()]
+            own=next(a for a in owners if a.step_graph is not None and a.step_graph.owner==int(rec['owner']))
+            with torch.inference_mode(), torch.autocast(torch.device(self.device).type,dtype=torch.bfloat16,enabled=own.bf16):
+                while own.step_graph.capture_key(rec['cap'],rec['widths']) is None:
+                    time_.sleep(0.001)
+            if resume:
+                self.driver.resume()
+            return None
+        if kind==3:
+            raise RuntimeError('cpp actor driver: '+self.driver.last_error())
+        raise RuntimeError(f'cpp actor driver: a record of kind {kind} while it runs lanes only')
 
     def capture_point(self, bank_index, snapshot, actor_model, model_version):
         """Before consuming the selection-point observation. False = backpressure."""
@@ -464,6 +488,15 @@ class BlockLaneService(LaneService):
     def quiesce(self):
         if self.driver is None:
             return super().quiesce()
+        if self.lanes_only:   # (B54: back from the learner wait: the driver paused, its lane records consumed)
+            self.driver.pause()
+            while True:
+                rec=self.driver.next_record(0.0)
+                if rec is None:
+                    break
+                self.driver_record(rec, resume=False)
+            self.driver.set_main_hold(False)
+            self.lanes_only=False
         # (the main weights change with the driver paused; the queued jobs keep their generation's own weights and
         # merge with a main batch only at an equal version: nothing to wait for)
         if self.fly is not None and self.fly['ready']:

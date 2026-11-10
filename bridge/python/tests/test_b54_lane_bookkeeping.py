@@ -8,9 +8,9 @@ counter deltas), each found only after a 10-minute compile on the 4090. These ru
   every DRV_FIELDS column written by csv.DictWriter;
 - BlockLaneService in driver mode with a fake driver (the lane actors stepped on CPU by the fake, records as the
   driver's kind 4): tick (submit, no wait, answers from the records), the control's context reclamation between the
-  records and the answer (B54 smoke 3: an ident retired before lane_t named it), serve_wait with the round in flight
-  (dropped from the driver, stepped on the Python path) and with new rounds (the Python path, the rings re-set before
-  the next driver job), the counters; every answer equal to the same requests served by a service without a driver.
+  records and the answer (B54 smoke 3: an ident retired before lane_t named it), serve_wait while the actor waits for
+  the learner (the driver runs lanes only, its records consumed there; a round in flight and new rounds) and quiesce,
+  the counters; every answer equal to the same requests served by a service without a driver.
 """
 import csv
 import io
@@ -96,9 +96,29 @@ class FakeDriver:
     def resume(self):
         pass
 
+    def set_main_hold(self, on):
+        self.hold = on
+
+    def capture_done(self, workers):
+        pass
+
+    def last_error(self):
+        return ''
+
+    def next_record(self, timeout):
+        """(serve_wait's lanes-only mode) the next queued job stepped now, its record"""
+        recs = self.step(1)
+        return recs[0] if recs else None
+
     def run(self):
+        recs = self.step(len(self.queue))
+        for r in recs:
+            self.service.on_lane_record(r)
+        return len(recs)
+
+    def step(self, k):
         recs = []
-        while self.queue:
+        while self.queue and len(recs) < k:
             j = self.queue.pop(0)
             gen, positions, version, lanes, rows, pend, keys, replay = self.service.drv_jobs[j['job']][:8]
             actor = next(a for a in self.service.actors.values() if id(a) == j['owner'])
@@ -122,9 +142,7 @@ class FakeDriver:
                              first=torch.from_numpy(first), complete=torch.from_numpy(((step_b+1) % bs == 0).astype(np.uint8)),
                              dec=torch.tensor(dec), kvs=torch.tensor(kvs), bid=torch.tensor(bid),
                              pending_before=torch.from_numpy(pend.copy())))
-        for r in recs:
-            self.service.on_lane_record(r)
-        return len(recs)
+        return recs
 
 
 def setup(driver):
@@ -184,12 +202,18 @@ def test_lane_service_driver_mode_matches_python_path_with_fallbacks():
             s.request(lane, row, pend, seq=seq, tbegin=begin)
         assert ref.tick()
         if k in (3, 4):
-            # the actor waits for the learner (driver paused): k = 3 a round already queued on the driver (flushed to
-            # the Python path), k = 4 a new round on the Python path
+            # the actor waits for the learner: the driver runs lanes only (serve_wait consumes their records): k = 3 a
+            # round already queued, k = 4 a new round; then quiesce (back to the collect)
             if k == 3:
                 assert svc.tick() and svc.fly is not None and not svc.fly['ready'] and fake.queue
-            assert svc.serve_wait(0.0)
-            assert svc.fly is None
+            for _ in range(5):
+                reclaim(s, svc)
+                svc.serve_wait(0.0)
+                if svc.fly is None:
+                    break
+            assert svc.fly is None and svc.lanes_only and fake.hold
+            svc.quiesce()
+            assert not svc.lanes_only and not fake.hold
         else:
             assert svc.tick()                      # (submitted: the answers wait for the records)
             assert svc.fly is not None and not svc.fly['ready'] and len(fake.queue) >= 1
@@ -206,10 +230,10 @@ def test_lane_service_driver_mode_matches_python_path_with_fallbacks():
         np.testing.assert_array_equal(a, a_ref, err_msg=f'round {k}')
         np.testing.assert_array_equal(o, o_ref, err_msg=f'round {k}')
     st = svc.stat
-    assert fake.dropped and st['py_lane_flushed_rows'] == 2 and st['py_lane_rounds'] == 1 and st['py_lane_rows'] == 2
-    # the rows the Python path stepped got their rings back before the next driver job
+    # (no round went to the Python path: the learner waits ran on the driver)
+    assert not fake.dropped and st.get('py_lane_rounds', 0) == 0 and st.get('py_lane_flushed_rows', 0) == 0
     gen_actor = next(iter(svc.actors.values()))
-    assert {gen_actor.base, gen_actor.base+1} <= set(fake.rings) and not svc.ring_dirty
+    assert gen_actor.base in set(fake.rings) and not svc.ring_dirty
 
 
 def test_lane_service_driver_mode_point_released_while_in_flight():

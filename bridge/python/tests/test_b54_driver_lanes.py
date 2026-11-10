@@ -470,3 +470,58 @@ def test_driver_python_switch_matches_driver_only():
     g1, g2 = a1.state.gather(ids), a2.state.gather(ids)
     for k_ in ('kv', 'bank', 'partial', 'kv_steps', 'ends', 'bank_versions', 'partial_versions'):
         torch.testing.assert_close(g1[k_], g2[k_], rtol=0, atol=0, msg=k_)
+
+
+def test_driver_holds_a_worker_until_its_capture_and_runs_lanes_only_on_hold():
+    """B54: (1) a record asking for a CF capture (cf_snap): the worker's next record waits until Python reports the
+    capture done (capture_done), as the Python path captures before replying; (2) main_hold: lane jobs run, worker
+    records wait until the hold ends."""
+    import socket as socket_
+    torch.manual_seed(58)
+    m = make_policy('cuda').eval()
+    nh = len(m.heads)
+    a = SlotBlockActor(m, 1, graph_entities=128, bf16=True, lane_slots=2, lane_generations=1)
+    la = a.lane_actor(copy.deepcopy(m), 2, generation=0)
+    la.version = 7
+    rng = np.random.default_rng(58)
+    s = fake_sampler(1, nh)
+    d = make_driver_for(a, s)
+    la.step_graph.attach_driver(d)
+    d.set_fixed_uniform(.5); d.set_version(3)
+    d.start()
+    sock = s._pairs[0][1]
+
+    def send(k):
+        s.rows[k & 1] = frame(rng, 1, k, np.array([1]), np.array([int(k == 0)]), seed=11000+k)[0]
+        sock.sendall(MSG[k & 1])
+
+    def reply(timeout):
+        sock.settimeout(timeout)
+        try:
+            return sock.recv(5)
+        except socket_.timeout:
+            return None
+        finally:
+            sock.settimeout(None)
+
+    s.cf_snap[0] = 4
+    send(0)
+    r0 = wait_kind(d, (0,), [a, la])
+    assert int(r0['cf_snap'][0]) == 4 and s.cf_snap[0] == 0 and reply(5) is not None
+    send(1)
+    assert reply(0.3) is None and d.queue_size() == 0   # (held: the capture is not done)
+    d.capture_done([0])
+    r1 = wait_kind(d, (0,), [a, la])
+    assert reply(5) is not None and int(r1['step_before'][0]) == 1 and d.counters()['cap_holds'] >= 1
+    # lanes only
+    d.set_main_hold(True)
+    send(2)
+    rows = frame(rng, 1, 0, np.array([1]), np.array([1]), seed=12000)
+    submit(d, 1, la, rows, synth_pending(rng, 1, m.heads), [0], np.array([5]), np.array([False]), 7)
+    r4 = wait_kind(d, (4,), [a, la])
+    assert int(r4['job']) == 1 and reply(0.3) is None   # (the lane job ran, the worker's record waits)
+    d.set_main_hold(False)
+    r2 = wait_kind(d, (0,), [a, la])
+    assert reply(5) is not None and int(r2['step_before'][0]) == 2
+    d.pause(); d.stop()
+    assert d.last_error() == ''

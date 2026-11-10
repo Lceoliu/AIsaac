@@ -407,11 +407,15 @@ struct ActorDriver {
   // (B54) lane jobs
   std::deque<std::shared_ptr<LaneJob>> lane_q; std::mutex lmu;
   bool lane_merge = true;              // (tests / ISAAC_BLOCK_LANE_MERGE=0) merge jobs of the main version into main batches
+  std::atomic<bool> main_hold{false};  // (B54) lanes only: the workers' records wait (the actor waits for the learner)
+  // (B54) per worker: its last record asked for a CF capture Python has not made yet; its next record waits for it, so
+  // the worker never runs ahead of the capture's status (as with the Python path, which captures before replying)
+  std::unique_ptr<std::atomic<uint8_t>[]> cap_wait;
   // counters
   std::atomic<i64> n_steps{0}, n_calls{0}, n_rows{0}, n_terminal{0};
   std::atomic<double> t_sync_s{0}, t_pages_s{0}, t_host_s{0};
   std::atomic<i64> n_lane_jobs{0}, n_lane_rows{0}, n_merged_rows{0}, n_merged_calls{0}, n_lane_calls{0}, n_captures{0},
-      n_lane_python{0}, n_pauses{0};
+      n_lane_python{0}, n_pauses{0}, n_cap_holds{0};
   std::atomic<double> t_pause_s{0};
   std::atomic<double> t_lane_s{0};                 // (B54) seconds in lane-only calls (fill, replay, pages, record)
   std::atomic<i64> lane_hist[6] = {};              // (B54) lane-only calls by rows: 1, 2, 3-4, 5-8, 9-16, > 16
@@ -443,7 +447,12 @@ struct ActorDriver {
     f_schema = f("visible_schema", dummy); f_bytes = f("visible_bytes", dummy); f_frame = f("visible_frame", dummy);
     reply = reply_; done_branch = done_branch_; pf_on = pf_on_;
     pending_cur.assign(workers*nh, 0);
+    cap_wait.reset(new std::atomic<uint8_t>[workers]);
+    for (i64 w = 0; w < workers; w++) cap_wait[w] = 0;
   }
+  // (B54) Python made (or refused) the CF captures the workers' last records asked for: their next records may go
+  void capture_done(std::vector<i64> workers) { for (i64 w : workers) if (w >= 0 && w < n_workers) cap_wait[w] = 0; }
+  void set_main_hold(bool on) { main_hold = on; }
   void set_arena(std::vector<at::Tensor> tensors, std::vector<i64> dims, std::vector<double> fills, i64 scratch, i64 base_, i64 step_host_ptr,
                  i64 heads_, i64 nh_, i64 block_steps_, i64 arena_rows_, i64 owner) {
     reset.tensors = tensors; reset.dims = dims; reset.fills = fills; scratch_row = scratch; base = base_; step_host = (i64 *)step_host_ptr;
@@ -623,7 +632,7 @@ struct ActorDriver {
     d["lane_jobs"] = n_lane_jobs.load(); d["lane_rows"] = n_lane_rows.load(); d["merged_rows"] = n_merged_rows.load();
     d["merged_calls"] = n_merged_calls.load(); d["lane_calls"] = n_lane_calls.load(); d["captures"] = n_captures.load();
     d["lane_python"] = n_lane_python.load(); d["pauses"] = n_pauses.load(); d["pause_s"] = t_pause_s.load();
-    d["lane_s"] = t_lane_s.load();
+    d["lane_s"] = t_lane_s.load(); d["cap_holds"] = n_cap_holds.load();
     py::list h; for (auto &x : lane_hist) h.append(x.load()); d["lane_hist"] = h;
     return d;
   }
@@ -658,19 +667,29 @@ struct ActorDriver {
       c10::cuda::CUDAStreamGuard guard(stream);
       std::vector<struct pollfd> pfds(fds.size());
       std::vector<i64> ws, ss;   // the batch: workers and row slots
+      std::vector<i64> held_w, held_s;   // (B54) messages waiting for their worker's CF capture (cap_wait)
       while (!stop_req) {
         if (pause_req) { wait_paused(); continue; }
         bool lanes_waiting = lane_queue_size() > 0;
+        if (main_hold) {   // (B54) lanes only
+          if (lanes_waiting) run_lanes(); else std::this_thread::sleep_for(std::chrono::microseconds(300));
+          continue;
+        }
         if (ready_w.empty()) {
-          for (size_t i = 0; i < fds.size(); i++) { pfds[i].fd = fds[i]; pfds[i].events = fds[i] >= 0 ? POLLIN : 0; pfds[i].revents = 0; }
-          int k = ::poll(pfds.data(), (nfds_t)pfds.size(), lanes_waiting ? 0 : 1);
-          if (k <= 0) { if (lanes_waiting) run_lanes(); continue; }
           ws.clear(); ss.clear();
-          for (size_t i = 0; i < fds.size(); i++) {
+          for (size_t q = 0; q < held_w.size();) {   // held messages whose capture is done join the batch
+            if (!cap_wait[held_w[q]]) { ws.push_back(held_w[q]); ss.push_back(held_s[q]); held_w.erase(held_w.begin()+q); held_s.erase(held_s.begin()+q); }
+            else q++;
+          }
+          for (size_t i = 0; i < fds.size(); i++) { pfds[i].fd = fds[i]; pfds[i].events = fds[i] >= 0 ? POLLIN : 0; pfds[i].revents = 0; }
+          int k = ::poll(pfds.data(), (nfds_t)pfds.size(), (lanes_waiting || !ws.empty()) ? 0 : 1);
+          for (size_t i = 0; k > 0 && i < fds.size(); i++) {
             if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
             unsigned char msg[5]; ssize_t got = ::read(fds[i], msg, 5);
             if (got == 5 && msg[0] == 0 && msg[1] == 0 && msg[2] == 0 && msg[3] == 1 && (msg[4] == '0' || msg[4] == '1')) {
-              ws.push_back((i64)i); ss.push_back(2*(i64)i+(msg[4] == '1'));
+              i64 slot = 2*(i64)i+(msg[4] == '1');
+              if (cap_wait[i]) { held_w.push_back((i64)i); held_s.push_back(slot); n_cap_holds++; }
+              else { ws.push_back((i64)i); ss.push_back(slot); }
             } else {
               fds[i] = -1;   // the worker ended (or something unexpected): its pipe leaves the poll; Python notices through its own bookkeeping
             }
@@ -794,7 +813,7 @@ struct ActorDriver {
       bool ended = done != 0, boot = done == done_branch;
       bool go = !ended || boot;
       r->go[i] = go;
-      if (cf_snap) { r->cf_snap[i] = cf_snap[ws[i]]; }
+      if (cf_snap) { r->cf_snap[i] = cf_snap[ws[i]]; if (r->cf_snap[i]) cap_wait[ws[i]] = 1; }   // (before the reply)
       if (ended && !boot) memset(&pending_cur[ws[i]*nh], 0, nh*8);   // Episodes.arrive: pending[idx[ended & ~boot]] = 0
       if (first && go) memset(&pending_cur[ws[i]*nh], 0, nh*8);      //                  pending[idx[first & go]] = 0
       if (go) go_idx.push_back(i); else n_terminal++;
@@ -1044,5 +1063,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("submit_lanes", &ActorDriver::submit_lanes).def("lane_queue_size", &ActorDriver::lane_queue_size)
       .def("drop_lane_job", &ActorDriver::drop_lane_job).def("set_lane_merge", &ActorDriver::set_lane_merge)
       .def("set_ring", &ActorDriver::set_ring).def("get_ring", &ActorDriver::get_ring)
+      .def("capture_done", &ActorDriver::capture_done).def("set_main_hold", &ActorDriver::set_main_hold)
       .def_property_readonly("running", [](ActorDriver &d) { return d.running.load(); });
 }

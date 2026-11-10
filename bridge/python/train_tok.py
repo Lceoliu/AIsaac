@@ -4900,7 +4900,10 @@ def main(argv=None, child=None, actor=None):
                     raise RuntimeError('cpp actor driver: the go mask differs from Episodes.arrive')
                 prof_['book'] += time.perf_counter() - tb_
                 prof_['polls'] += 1
+                cap_w_ = idx_r[rec['cf_snap'].numpy() != 0]   # (B54: workers whose next record waits for this capture)
                 if not go_r.any():
+                    if len(cap_w_):
+                        cpp_driver.capture_done(cap_w_.tolist())
                     return
                 t1_ = time.perf_counter()
                 a_r = idx_r[go_r]
@@ -4917,6 +4920,8 @@ def main(argv=None, child=None, actor=None):
                     contexts.append(PagedSnapshot(block_actor.store, block_actor.logs[w_], int(step_b[j_]), under_r[j_:j_+1].copy(), ver_r))
                 lanes.service_control()
                 lanes.capture_deferred(a_r, rec['cf_snap'].numpy()[go_r], contexts)
+                if len(cap_w_):   # (the captures made or refused: those workers' next records may go)
+                    cpp_driver.capture_done(cap_w_.tolist())
                 lanes.record_main(a_r, sub_r, contexts)
                 for j_, w_ in enumerate(a_r.tolist()):
                     log_ = block_actor.logs[w_]
