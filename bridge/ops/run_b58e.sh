@@ -25,7 +25,7 @@ timeout 900 $PY -c "
 from isaac_bridge import actor_native as a
 p=a.build(True); print('BUILD', p); print(str(a.REASON)[-4000:] if p is None else '')
 " > $R/b58e-build.log 2>&1
-timeout 900 $PY -m pytest tests/test_b58e_batch.py -v -p no:cacheprovider -p no:logging > $R/tests-b58e-new.log 2>&1
+timeout 900 $PY -m pytest tests/test_b58e_batch.py -v --tb=long -p no:cacheprovider -p no:logging > $R/tests-b58e-new.log 2>&1
 echo "$(date +%T) b58e new tests: $(tail -1 $R/tests-b58e-new.log | cut -c1-100)" >> $LOG
 if ! passed $R/tests-b58e-new.log; then rm -f $R/GPU_LOCK; echo "$(date +%T) b58e stops: new tests failed" >> $LOG; exit 1; fi
 ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 2400 $PY -m pytest tests/test_b52_entry.py tests/test_b58d_lanes.py tests/test_b58c_lineage.py tests/test_b54_driver_lanes.py tests/test_b52_cpp_actor.py tests/test_b58_native_consumer.py tests/test_b58_lifetime.py tests/test_b54_lane_bookkeeping.py -q -p no:cacheprovider -p no:logging > $R/tests-b58e-drv.log 2>&1

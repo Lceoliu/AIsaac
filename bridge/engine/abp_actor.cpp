@@ -1260,8 +1260,8 @@ struct ActorDriver {
     running = true;
     th = std::thread([this] { loop(); });
   }
-  void stop() {
-    if (!running) return;
+  void stop() {   // (B58e: a thread that ended on an error is joined too: a joinable std::thread destroyed aborts)
+    if (!running && !th.joinable()) return;
     stop_req = true;
     { std::lock_guard<std::mutex> g(cmu); ccv.notify_all(); }
     if (th.joinable()) th.join();
