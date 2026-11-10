@@ -5,6 +5,7 @@
 #   .\rl\record_run.ps1 -SessionName first-try -InitSaveFrom D:\backup\my-galaxy-save
 #   .\rl\record_run.ps1 -SessionName old-way -NoDll          # 回退到第二阶段行为（不注入 DLL）
 #   .\rl\record_run.ps1 -SessionName with-console -AllowConsole   # 允许调试控制台（命令逐条记录，回放同帧执行；README §8.7）
+#   .\rl\record_run.ps1 -Recover D:\...\sessions\20261110-evening  # 收尾一个没收尾的会话（本窗口被关/电脑重启之后；先关游戏）
 #
 # 流程（DESIGN_BRIEF §5 末条、§6 D5/D6/D11、§7 E1/E2）：
 #   1. 检查/复用隔离副本，安装最新 rl\bridge\mod\isaac_run_recorder；默认经挂起式注入器
@@ -23,9 +24,13 @@
 #   5. 正常玩：mod 每局一个文件，开局时 Python 再快照一次存档；画面左上角录制期间常驻一个小 "REC"；
 #   6. 关闭游戏窗口后：会话后快照、每局压成 .zst 并逐字节校验、写 session.json 与 summary.txt
 #      （局数、帧数、小时、MB）。原始 jsonl 校验后移到 <OutRoot>\_raw_staging\<会话名>\，确认无误后可自行删除。
+#   7. 本窗口被关、Python 被结束或电脑重启（会话没收尾：session.json 不完整、options.ini 的 EnableDebugConsole 没还原）：
+#      关掉游戏后运行 -Recover <会话目录>：归档已录的局（截断局照常标出）、补写 session.json（state = recovered）、还原 options.ini。
+#      新会话开始时若发现 OutRoot 下有没收尾的会话会打印一行提示。
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)][string]$SessionName,
+    [string]$SessionName = '',
+    [string]$Recover = '',     # 收尾一个没收尾的会话目录（见上面第 7 条）
     [string]$InitSaveFrom = '',
     [string]$OutRoot = '',
     [ValidateSet('stage', 'keep')][string]$Raw = 'stage',
@@ -42,6 +47,11 @@ $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONPATH = "$PSScriptRoot\bridge\python"
 if (-not $OutRoot) { $OutRoot = Join-Path (Split-Path $PSScriptRoot -Parent) 'experiments\run-recorder\sessions' }
 $OutRoot = [IO.Path]::GetFullPath($OutRoot)
+if ($Recover) {
+    & python -m isaac_bridge.run_recording --recover ([IO.Path]::GetFullPath($Recover))
+    exit $LASTEXITCODE
+}
+if (-not $SessionName) { throw '需要 -SessionName（或用 -Recover <会话目录> 收尾旧会话）' }
 if ($InitSaveFrom -and -not (Test-Path -LiteralPath $InitSaveFrom -PathType Container)) {
     throw "InitSaveFrom 不是目录：$InitSaveFrom"
 }

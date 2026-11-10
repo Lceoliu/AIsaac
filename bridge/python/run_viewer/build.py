@@ -67,6 +67,10 @@ def build(path, res_dir=None, with_names=True, log=print):
             for sid, sv in o['sd']:
                 strings[sid] = sv
         if k == 'f':
+            if o.get('err'):
+                # recorder 0.5.0 的退化帧（观测构建出错，只有输入/MT）：画成空帧（没有玩家/实体），当关键帧处理（不从它向后
+                # 差分；mod 保证下一帧本来就是关键帧），房间头沿用上一帧。不拿上一帧的玩家/实体冒充
+                o = dict(o, kf=1, p=[], e=[], r=frames[-1][5] if frames else [0, 0, 0, -1])
             e = o.get('e')
             float_cells += _float_cells(o['p']) + (_float_cells(e) if e else 0)
             frames.append([o['n'], o['gf'], o['t'], 1 if o.get('kf') == 1 else 0, o['tk'], o['r'], o['p'],

@@ -131,11 +131,47 @@ def junction_target(path):
 
 
 # ---------------------------------------------------------------------------------------------- 存档目录
-def snapshot_save(dest, save_dir):
-    """复制整个存档目录（排除 *.dmp、log.txt）到 dest，返回清单（文件名、字节、mtime、sha256）。"""
+# 0.5.0（phase13 P2）：mod 在 MC_POST_GAME_STARTED 里把这些文件原样拷到 IRR_DIR（savecopy-<run>-<文件名>）。phase13 实测
+# （NOTES §P2）：游戏在开局回调之前 3–5 ms 写完 gamestate1.dat 与 persistentgamedata1.dat（每次开局都写；退出/死亡时也写），
+# 所以开局回调里读到的就是"这一局开局时的存档"。回放需要的是 persistentgamedataN.dat（新局 --init-save：解锁/道具池/难度记忆）
+# 与 gamestateN.dat（续局 --continue-save）；options.ini 一并拷（回放会强制若干选项）。日期前缀的备份文件、崩溃日志不需要。
+SAVE_COPY_FILES = ('gamestate1.dat', 'gamestate2.dat', 'gamestate3.dat', 'persistentgamedata1.dat', 'persistentgamedata2.dat',
+                   'persistentgamedata3.dat', 'options.ini')
+# 判断 Python 侧快照是否"晚了"时只看游戏在开局/退出时写的文件（options.ini 可能被选项菜单在局中改写）
+LATE_CHECK_PREFIXES = ('gamestate', 'persistentgamedata')
+BLOB_DIR = 'blobs'
+
+
+def store_blob(blobs_dir, src, sha=None):
+    """按内容去重存储：blobs_dir/<sha256>（同一内容只存一份）。返回 sha256。"""
+    blobs_dir = Path(blobs_dir)
+    sha = sha or sha256_file(src)
+    dst = blobs_dir / sha
+    if not dst.exists():
+        blobs_dir.mkdir(parents=True, exist_ok=True)
+        tmp = dst.with_suffix('.tmp')
+        shutil.copyfile(src, tmp)
+        if sha256_file(tmp) != sha:   # 拷的同时源文件被改写：不入库
+            os.replace(tmp, blobs_dir / f'{sha}.mismatch-{int(time.time() * 1000)}')
+            raise OSError(f'拷贝时内容变化：{src}')
+        os.replace(tmp, dst)
+    return sha
+
+
+def _blob_ref(dest, blobs_dir, sha):
+    return os.path.relpath(Path(blobs_dir) / sha, Path(dest)).replace('\\', '/')
+
+
+def snapshot_save(dest, save_dir, blobs=None):
+    """复制整个存档目录（排除 *.dmp、log.txt）到 dest，返回清单（文件名、字节、mtime、sha256）。
+    blobs（0.5.0）：给了就按内容去重存进 blobs/<sha256>，dest 里只写 manifest.json（files[名].blob = 相对 dest 的路径）；
+    读取一律用 snapshot_files()（新旧两种布局都认）。"""
     dest, save_dir = Path(dest), Path(save_dir)
-    man = dict(source=str(save_dir), dest=str(dest), time=now_iso(), exists=save_dir.exists(), files={}, skipped=[])
+    man = dict(source=str(save_dir), dest=str(dest), time=now_iso(), time_epoch=time.time(), exists=save_dir.exists(),
+               files={}, skipped=[], layout='blobs' if blobs else 'files')
     if not save_dir.exists():
+        dest.mkdir(parents=True, exist_ok=True)
+        write_json(dest / 'manifest.json', man)
         return man
     dest.mkdir(parents=True, exist_ok=True)
     for f in sorted(save_dir.iterdir()):
@@ -146,15 +182,64 @@ def snapshot_save(dest, save_dir):
             continue
         for _ in range(5):  # 游戏可能正在写
             try:
-                shutil.copy2(f, dest / f.name)
                 st = f.stat()
-                man['files'][f.name] = dict(bytes=st.st_size, mtime=st.st_mtime, sha256=sha256_file(dest / f.name))
+                if blobs:
+                    sha = store_blob(blobs, f)
+                    man['files'][f.name] = dict(bytes=st.st_size, mtime=st.st_mtime, sha256=sha, blob=_blob_ref(dest, blobs, sha))
+                else:
+                    shutil.copy2(f, dest / f.name)
+                    man['files'][f.name] = dict(bytes=st.st_size, mtime=st.st_mtime, sha256=sha256_file(dest / f.name))
                 break
             except OSError as e:
                 man.setdefault('retries', []).append([f.name, repr(e)])
                 time.sleep(0.2)
     write_json(dest / 'manifest.json', man)
     return man
+
+
+def snapshot_files(snap_dir):
+    """存档快照目录 -> {文件名: 实际文件路径}。新布局（0.5.0：manifest.json 的 files[名].blob 指向 save/blobs/<sha256>）
+    与旧布局（文件直接放在快照目录里）都认；不含 manifest.json、*.dmp、log.txt。"""
+    snap_dir = Path(snap_dir)
+    man = read_json(snap_dir / 'manifest.json') or {}
+    files = man.get('files') or {}
+    if any(isinstance(v, dict) and v.get('blob') for v in files.values()):
+        out = {}
+        for name, v in sorted(files.items()):
+            if v.get('blob'):
+                path = (snap_dir / v['blob']).resolve()
+                if not path.exists():
+                    raise FileNotFoundError(f'快照 {snap_dir} 的 {name} 指向的 {path} 不存在')
+                out[name] = path
+        return out
+    return {f.name: f for f in sorted(snap_dir.iterdir())
+            if f.is_file() and f.suffix.lower() != '.dmp' and f.name.lower() not in ('log.txt', 'manifest.json')}
+
+
+def snapshot_status(snap_dir):
+    """快照是不是"这一局开局时"的存档（phase13 P2）。返回 dict(source, late（True/False/None=无法判断）, reasons, checked)。
+    0.5.0 的快照在 manifest 里有 late 字段；旧会话按同一规则从会话的开局信号推断：快照里 gamestate*/persistentgamedata* 的
+    mtime 晚于本局开局信号文件的 mtime（游戏在开局回调之前写完这两类文件，之后再写就是退出/后来的局/局中存档）。"""
+    snap_dir = Path(snap_dir)
+    man = read_json(snap_dir / 'manifest.json') or {}
+    if 'late' in man:
+        return dict(source=man.get('kind', 'python'), late=man['late'], reasons=man.get('late_reasons') or [], checked='manifest')
+    sess_dir, run = snap_dir.parent.parent, snap_dir.name
+    sig = sess_dir / 'lua' / f'signal-{run}.start.json'
+    if not sig.exists() or not man.get('files'):
+        return dict(source='python', late=None, reasons=['无法判断：找不到开局信号或快照清单'], checked='none')
+    t_sig = sig.stat().st_mtime
+    reasons = late_reasons(man['files'], t_sig)
+    return dict(source='python', late=bool(reasons), reasons=reasons, checked='inferred (pre-0.5.0 session)', signal_mtime=t_sig)
+
+
+def late_reasons(files, t_sig, margin=0.05):
+    """files = manifest.files；t_sig = 本局开局信号的 mtime。返回"快照内容晚于开局"的理由列表（空 = 不晚）。"""
+    out = []
+    for name, v in sorted(files.items()):
+        if name.lower().startswith(LATE_CHECK_PREFIXES) and (v.get('mtime') or 0) > t_sig + margin:
+            out.append(f'{name} 的 mtime 晚于开局 {v["mtime"] - t_sig:.3f} s（开局之后又被写过）')
+    return out
 
 
 def wait_save_quiet(save_dir, quiet_s=1.0, max_s=6.0):
@@ -302,6 +387,33 @@ k32.WaitForSingleObject.argtypes = [W.HANDLE, W.DWORD]
 k32.GetExitCodeProcess.argtypes = [W.HANDLE, C.POINTER(W.DWORD)]
 k32.GetProcessTimes.argtypes = [W.HANDLE] + [C.POINTER(W.FILETIME)] * 4
 k32.CloseHandle.argtypes = [W.HANDLE]
+k32.QueryFullProcessImageNameW.argtypes = [W.HANDLE, W.DWORD, W.LPWSTR, C.POINTER(W.DWORD)]
+_psapi = C.WinDLL('psapi', use_last_error=True)
+_psapi.EnumProcesses.argtypes = [C.POINTER(W.DWORD), W.DWORD, C.POINTER(W.DWORD)]
+
+
+def pids_of_exe(exe):
+    """正在运行、映像路径等于 exe 的进程 pid 列表（只读：EnumProcesses + QueryFullProcessImageNameW）。"""
+    want = os.path.normcase(os.path.abspath(str(exe)))
+    arr = (W.DWORD * 4096)()
+    got = W.DWORD()
+    if not _psapi.EnumProcesses(arr, C.sizeof(arr), C.byref(got)):
+        return []
+    out = []
+    for pid in arr[:got.value // C.sizeof(W.DWORD)]:
+        if not pid:
+            continue
+        h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            continue
+        try:
+            buf = C.create_unicode_buffer(1024)
+            n = W.DWORD(1024)
+            if k32.QueryFullProcessImageNameW(h, 0, buf, C.byref(n)) and os.path.normcase(buf.value) == want:
+                out.append(int(pid))
+        finally:
+            k32.CloseHandle(h)
+    return out
 
 # vk, scancode, extended（默认按键绑定）
 KEYS = {
@@ -339,8 +451,12 @@ class GameProcess:
         # 不带 DLL 时这些重定向对存档无效（INVESTIGATION §2），只影响显卡缓存等；带 DLL 时存档由 RR_MT_PROFILE 重定向
         env.update(USERPROFILE=str(prof), APPDATA=str(prof / 'AppData/Roaming'), LOCALAPPDATA=str(prof / 'AppData/Local'),
                    TEMP=str(copy.root / 'temp'), TMP=str(copy.root / 'temp'),
-                   IRR_DIR=str(self.irr_dir).replace('\\', '/'), IRR_PROC=proc_tag)
-        env_keys = ['USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'IRR_DIR', 'IRR_PROC']
+                   IRR_DIR=str(self.irr_dir).replace('\\', '/'), IRR_PROC=proc_tag,
+                   # 0.5.0（P2）：mod 在开局回调里把这些存档文件原样拷到 IRR_DIR
+                   IRR_SAVE_DIR=str(self.save_dir).replace('\\', '/'), IRR_SAVE_FILES=','.join(SAVE_COPY_FILES))
+        env_keys = ['USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'IRR_DIR', 'IRR_PROC', 'IRR_SAVE_DIR', 'IRR_SAVE_FILES']
+        # 测试用故障注入只在调用方显式给出时生效（不从外层环境继承，免得回放进程也注入）
+        env.pop('IRR_FAULT', None)
         if use_dll:
             env.update(RR_MT_PROFILE=str(prof), RR_MT_LOG_DIR=str(self.log_dir), IRR_MT_DLL=str(copy.dll).replace('\\', '/'))
             env_keys += ['RR_MT_PROFILE', 'RR_MT_LOG_DIR', 'IRR_MT_DLL']
@@ -664,7 +780,8 @@ def iter_lines_raw(path):
 def validate_lines(lines):
     """逐行解析并检查结构：header 在首行、帧号连续、end 行（无则标记 truncated）。返回统计。"""
     st = dict(lines=0, frames=0, header=None, end=None, kinds={}, events={}, first_gf=None, last_gf=None, errors=[],
-              truncated=False, bad_json=0, last_line_partial=False, mt_frames=0, repaired_lines=0, console_cmds=0, api_lines=0)
+              truncated=False, bad_json=0, last_line_partial=False, mt_frames=0, repaired_lines=0, console_cmds=0, api_lines=0,
+              degraded_frames=[], input_missing_frames=[], frame_gaps=[], resync_rooms=0, last_n=0)
     expect_n = 1
     for i, raw in enumerate(lines):
         st['lines'] += 1
@@ -697,7 +814,8 @@ def validate_lines(lines):
                 st['errors'].append('首行不是 isaac-run-v1 header')
             st['header'] = dict(run=o.get('run'), mode=o.get('mode'), continued=o.get('continued'), gf=o.get('gf'),
                                 seed=((o.get('meta') or {}).get('seeds') or {}).get('start_seed_string'),
-                                harness=o.get('harness') is not None, obs=o.get('obs'),
+                                harness=o.get('harness') is not None, obs=o.get('obs'), recorder=o.get('recorder'),
+                                flush_every=o.get('flush_every'), fault=o.get('fault'), save_copy=o.get('save_copy'),
                                 mt=dict(available=(o.get('mt') or {}).get('available'), salt=(o.get('mt') or {}).get('salt'),
                                         reason=(o.get('mt') or {}).get('reason'),
                                         reseeds=[r.get('at') for r in ((o.get('mt') or {}).get('reseeds') or [])]))
@@ -706,8 +824,15 @@ def validate_lines(lines):
                 st['mt_frames'] = st.get('mt_frames', 0) + 1
             if o['n'] != expect_n:
                 st['errors'].append(f'帧号不连续：期望 {expect_n} 得到 {o["n"]}')
+                st['frame_gaps'].append([expect_n - 1, o['n']])
                 expect_n = o['n']
             expect_n += 1
+            st['last_n'] = o['n']
+            if o.get('err'):
+                # 0.5.0 退化帧：观测构建出错（"err":1，输入照写）/ 连输入也没有（"err":2）
+                st['degraded_frames'].append(o['n'])
+                if o.get('err') != 1:
+                    st['input_missing_frames'].append(o['n'])
             st['frames'] += 1
             if st['first_gf'] is None:
                 st['first_gf'] = o['gf']
@@ -718,14 +843,46 @@ def validate_lines(lines):
                 st['console_cmds'] += 1
         elif k == 'api':
             st['api_lines'] += 1
+        elif k == 'room' and o.get('resync'):
+            st['resync_rooms'] += 1
         elif k == 'end':
-            st['end'] = dict(reason=o.get('reason'), frames=o.get('frames'), cost=o.get('cost'), errors=o.get('errors'))
+            st['end'] = dict(reason=o.get('reason'), frames=o.get('frames'), cost=o.get('cost'), errors=o.get('errors'),
+                             write_errors=o.get('write_errors'), err_frames=o.get('err_frames'),
+                             room_errors=o.get('room_errors'), flush_every=o.get('flush_every'))
             if o.get('frames') != st['frames']:
                 st['errors'].append(f'end.frames={o.get("frames")} 与帧行数 {st["frames"]} 不符')
     if st['end'] is None:
         st['truncated'] = True
     st['game_hours'] = st['frames'] / LOGIC_HZ / 3600
     return st
+
+
+def data_issues(st, end_signal=None):
+    """一局数据是否可信（0.5.0，phase13 P1）：返回问题列表（空 = 没发现问题）。`verified` 只表示压缩逐字节校验，
+    这里看内容：end.errors>0（mod 在本局记过错误）、写失败、退化帧、帧号缺口、end.frames 与帧行数不符、行间不完整行。
+    截断（没有 end 行）本身不算数据错误（已录的帧仍然可信），由 truncated 字段表示。"""
+    out = []
+    end = st.get('end') or {}
+    if st.get('input_missing_frames'):
+        out.append(f'输入缺失帧 {len(st["input_missing_frames"])}（回放不可能精确）：{st["input_missing_frames"][:10]}')
+    if st.get('degraded_frames'):
+        out.append(f'退化帧 {len(st["degraded_frames"])}（观测缺省，输入完整）：{st["degraded_frames"][:10]}')
+    if st.get('frame_gaps'):
+        out.append(f'帧号缺口 {len(st["frame_gaps"])}：{st["frame_gaps"][:10]}')
+    if end and end.get('frames') is not None and end.get('frames') != st.get('frames'):
+        out.append(f'end.frames={end.get("frames")} 与帧行数 {st.get("frames")} 不符')
+    if (end.get('errors') or 0) > 0:
+        out.append(f'end.errors={end.get("errors")}（见会话 lua/errors.jsonl）')
+    if (end.get('write_errors') or 0) > 0:
+        out.append(f'end.write_errors={end.get("write_errors")}')
+    sig = end_signal or {}
+    if not end and (sig.get('write_errors') or 0) > 0:
+        out.append(f'结束信号 write_errors={sig.get("write_errors")}（end 行没写出）')
+    if not end and (sig.get('errors') or 0) > 0:
+        out.append(f'结束信号 errors={sig.get("errors")}')
+    if any('之前有不完整的行' in e for e in st.get('errors') or []):
+        out.append('文件中间有不完整的行')
+    return out
 
 
 def process_exit_summary(closed):
@@ -740,10 +897,17 @@ def process_exit_summary(closed):
                 seconds=round(closed.get('seconds') or 0, 1), abnormal=code not in (0, None))
 
 
-def truncated_note(game_exit):
-    """截断局（没有 end 行）的说明：带上游戏进程的退出码（若知道）。mod 每 300 帧、进房、暂停时 flush，
-    另外 256 KB 写缓冲满了也会写出（可能停在行中间，读取时丢掉，见 load_run.read_lines），所以最多丢约 10 秒。"""
-    s = '没有 end 行：进程异常结束，缓冲区里最后最多 10 秒的数据丢失'
+def truncated_note(game_exit, end_signal=None, flush_every=None):
+    """截断局（没有 end 行）的说明：带上游戏进程的退出码（若知道）。mod 每 flush_every 帧（0.5.0 默认 30 帧 ≈ 1 秒；0.4.x
+    是 300 帧 ≈ 10 秒）、进房、暂停时 flush，另外 256 KB 写缓冲满了也会写出（可能停在行中间，读取时丢掉，见
+    load_run.read_lines）。有结束信号（mod 关了局）却没有 end 行 = end 行没写出去（磁盘满/写失败），不是进程异常结束。"""
+    if end_signal:
+        if (end_signal.get('write_errors') or 0) > 0:
+            return (f'没有 end 行，但 mod 已关局（结束信号 reason={end_signal.get("reason")}）且记了 '
+                    f'{end_signal.get("write_errors")} 次写失败：磁盘满/写失败，不是进程异常结束')
+        return f'没有 end 行，但 mod 已关局（结束信号 reason={end_signal.get("reason")}）：end 行没写到文件里（写失败？）'
+    secs = '约 1 秒' if (flush_every or 300) <= 30 else '约 10 秒'
+    s = f'没有 end 行：进程异常结束，缓冲区里最后{secs}（最后一次 flush 之后）的数据丢失'
     if game_exit and game_exit.get('abnormal'):
         s += f'（游戏进程退出码 {game_exit.get("exit_hex")}）'
     return s
@@ -797,30 +961,126 @@ def stage_raw(raw, staging_root, session_name):
 
 # ---------------------------------------------------------------------------------------------- 会话
 class SaveWatcher(threading.Thread):
-    """监视 mod 的开局信号文件，每局开始时快照存档目录。"""
+    """监视 mod 的开局信号文件，记录每局开局时的存档（phase13 P2 重写）。
 
-    def __init__(self, irr_dir, save_root, records, save_dir):
+    主快照：mod 在开局回调里同步拷出的文件（信号里的 save_copy；kind = "mod"，不会晚）。按内容去重存进 save/blobs/<sha256>，
+    save/<run>/manifest.json 只记清单。拍不到 mod 拷贝（旧 mod / 拷贝失败）时退回 Python 快照（等存档目录安静后复制），并检测
+    是否"晚了"：拍完时已有更新的开局信号，或 gamestate*/persistentgamedata* 的 mtime 晚于本局开局信号（late_reasons）。
+    check=True 时对有 mod 拷贝的局另做一次 Python 核对快照（只记哈希与是否一致，内容也去重入库），用来证明两者相同；已有更新的
+    开局信号时不做（会晚）。所有新信号先处理 mod 拷贝（毫秒级），再做核对，所以按住 R 连续重开也不会排队拍错。"""
+
+    def __init__(self, irr_dir, save_root, records, save_dir, check=True):
         super().__init__(daemon=True)
         self.irr_dir = Path(irr_dir)
         self.save_root = Path(save_root)
+        self.blobs = self.save_root / BLOB_DIR
         self.save_dir = Path(save_dir)
         self.records = records
         self.seen = set()
         self.stop_flag = False
+        self.check = check
+        self.pending_check = []
+
+    def _signals(self):
+        out = []
+        for sig in self.irr_dir.glob('signal-*.start.json'):
+            try:
+                out.append((sig.stat().st_mtime, sig))
+            except OSError:
+                pass
+        out.sort()
+        return out
+
+    def ingest_mod_copy(self, run, sc, t_sig):
+        """mod 的开局拷贝 -> blobs + 清单。返回清单 dict；拷贝不可用时返回 None。"""
+        files = sc.get('files') if isinstance(sc, dict) else None
+        if not isinstance(files, dict):
+            return None
+        dest = self.save_root / run
+        man = dict(kind='mod', run=run, time=now_iso(), signal_mtime=t_sig, source=str(self.save_dir), dest=str(dest),
+                   files={}, absent=[], errors=[], copy_ms=sc.get('ms'), copy_cpu_ms=sc.get('cpu_ms'), copy_bytes=sc.get('bytes'),
+                   layout='blobs', late=False, late_reasons=[],
+                   note='mod 在 MC_POST_GAME_STARTED 里同步拷出（开局那一刻的存档）')
+        for name, v in sorted(files.items()):
+            if v is None:
+                man['absent'].append(name)
+                continue
+            src = self.irr_dir / f'savecopy-{run}-{name}'
+            if v == -1 or not src.exists():
+                man['errors'].append(f'{name}: mod 写副本失败')
+                continue
+            if src.stat().st_size != v:
+                man['errors'].append(f'{name}: 大小 {src.stat().st_size} 与 mod 报告的 {v} 不符')
+                continue
+            sha = store_blob(self.blobs, src)
+            man['files'][name] = dict(bytes=v, sha256=sha, blob=_blob_ref(dest, self.blobs, sha), copied_from=src.name)
+        if man['errors']:
+            return man   # 有错误也返回（记进 session.json），调用方据此退回 Python 快照
+        dest.mkdir(parents=True, exist_ok=True)
+        write_json(dest / 'manifest.json', man)
+        return man
+
+    def python_snapshot(self, run, t_sig, dest_name='manifest.json', as_check=False):
+        """Python 侧快照（等安静 -> 去重复制）。返回清单（含 late / late_reasons）。"""
+        dest = self.save_root / run
+        n_before = len(self._signals())
+        waited = wait_save_quiet(self.save_dir)
+        tmp_dir = dest / ('python-check' if as_check else '')
+        man = snapshot_save(tmp_dir, self.save_dir, blobs=self.blobs)
+        reasons = late_reasons(man['files'], t_sig)
+        newer = [sg.name for mt, sg in self._signals() if mt > t_sig + 1e-6]
+        if newer:
+            reasons.append(f'拍快照时已有更新的开局信号 {newer[:3]}（共 {len(newer)} 个）')
+        man.update(kind='python', run=run, signal_mtime=t_sig, waited_quiet_s=round(waited, 2), late=bool(reasons),
+                   late_reasons=reasons, signals_before=n_before)
+        write_json(tmp_dir / 'manifest.json', man)
+        return man
 
     def poll_once(self):
-        for sig in sorted(self.irr_dir.glob('signal-*.start.json')):
+        new = []
+        for t_sig, sig in self._signals():
             if sig.name in self.seen:
                 continue
             self.seen.add(sig.name)
             run = sig.name[len('signal-'):-len('.start.json')]
-            info = read_json(sig, {})
-            t_sig = time.time()
-            waited = wait_save_quiet(self.save_dir)
-            man = snapshot_save(self.save_root / run, self.save_dir)
-            self.records[run] = dict(signal=info, signal_seen=now_iso(), waited_quiet_s=round(waited, 2),
-                                     snapshot=str(self.save_root / run), files=sorted(man['files']),
-                                     snapshot_delay_s=round(time.time() - t_sig, 2))
+            info = read_json(sig, {}) or {}
+            rec = dict(signal=info, signal_seen=now_iso(), signal_mtime=t_sig, snapshot=str(self.save_root / run))
+            try:
+                man = self.ingest_mod_copy(run, info.get('save_copy'), t_sig)
+            except Exception as e:   # 不让监视线程死掉
+                man = dict(kind='mod', errors=[repr(e)])
+            if man is not None and not man.get('errors'):
+                rec.update(kind='mod', late=False, late_reasons=[], files=sorted(man['files']), absent=man['absent'],
+                           copy_ms=man.get('copy_ms'), copy_bytes=man.get('copy_bytes'))
+                if self.check:
+                    self.pending_check.append(run)
+            else:
+                rec['mod_copy_errors'] = (man or {}).get('errors') if man else 'no save_copy in signal (recorder < 0.5.0?)'
+                new.append(run)
+            self.records[run] = rec
+        # 没有 mod 拷贝的局：Python 快照（可能晚，检测并标记）
+        for run in new:
+            rec = self.records[run]
+            man = self.python_snapshot(run, rec['signal_mtime'])
+            rec.update(kind='python', late=man['late'], late_reasons=man['late_reasons'], files=sorted(man['files']),
+                       waited_quiet_s=man.get('waited_quiet_s'), snapshot_delay_s=round(time.time() - rec['signal_mtime'], 2))
+        # 有 mod 拷贝的局：Python 核对快照（已有更新的开局信号就不做）
+        while self.pending_check:
+            run = self.pending_check.pop(0)
+            rec = self.records[run]
+            newer = [sg for mt, sg in self._signals() if mt > rec['signal_mtime'] + 1e-6]
+            if newer:
+                rec['python_check'] = dict(skipped='已有更新的开局信号（核对快照会晚）')
+                continue
+            chk = self.python_snapshot(run, rec['signal_mtime'], as_check=True)
+            mod_files = (read_json(self.save_root / run / 'manifest.json') or {}).get('files') or {}
+            common = sorted(set(mod_files) & set(chk['files']))
+            diff = [n for n in common if mod_files[n]['sha256'] != chk['files'][n]['sha256']]
+            only_check = sorted(n for n in set(chk['files']) - set(mod_files)
+                                if n.lower() in SAVE_COPY_FILES)
+            rec['python_check'] = dict(late=chk['late'], late_reasons=chk['late_reasons'], compared=common, differing=diff,
+                                       only_in_python=only_check, same_as_mod=not diff and not only_check,
+                                       waited_quiet_s=chk.get('waited_quiet_s'))
 
     def run(self):
         while not self.stop_flag:
@@ -828,7 +1088,7 @@ class SaveWatcher(threading.Thread):
                 self.poll_once()
             except Exception as e:  # 不让监视线程死掉
                 self.records.setdefault('_errors', []).append(repr(e))
-            time.sleep(0.5)
+            time.sleep(0.25)
 
 
 class RealDocsWatcher(threading.Thread):
@@ -967,15 +1227,16 @@ class Session:
                         shutil.move(str(f), str(ddir / f.name))
                         displaced.append(f.name)
             copied = []
-            for f in sorted(self.init_save_from.iterdir()):
-                if (f.is_file() and f.suffix.lower() != '.dmp' and f.name.lower() not in ('log.txt', 'manifest.json')
-                        and f.name.lower() not in self.init_save_exclude):
-                    shutil.copy2(f, sd / f.name)
-                    copied.append(f.name)
+            # snapshot_files：0.5.0 的去重布局（manifest 指向 save/blobs/<sha256>）与旧布局都认
+            for name, f in snapshot_files(self.init_save_from).items():
+                if name.lower() not in self.init_save_exclude:
+                    shutil.copy2(f, sd / name)
+                    copied.append(name)
             self.info['init_save_from'] = dict(source=str(self.init_save_from), dest=str(sd), files=copied,
                                                excluded=sorted(self.init_save_exclude), displaced=displaced,
+                                               status=snapshot_status(self.init_save_from),
                                                note='只拷贝进本会话的存档目录，会话结束不写回来源')
-        self.info['save_pre'] = snapshot_save(self.dir / 'save/pre', sd)
+        self.info['save_pre'] = snapshot_save(self.dir / 'save/pre', sd, blobs=self.dir / 'save' / BLOB_DIR)
         opt = sd / 'options.ini'
         odir = self.dir / 'options'
         odir.mkdir()
@@ -992,6 +1253,23 @@ class Session:
         hist = sd / 'cmd_history.txt'
         self.cmd_history_before = hist.read_text(encoding='utf-8', errors='replace').splitlines() if hist.exists() else []
         self.write_session_file(exe_sha, None)
+        self.write_recover_state('recording')
+        self.write_partial()
+
+    # ---- 异常结束的恢复（phase13 P3）
+    def write_recover_state(self, state):
+        """recover.json：启动器被杀/PowerShell 被关/重启之后，`--recover <会话目录>` 靠它知道还原什么、归档到哪。"""
+        write_json(self.dir / 'recover.json', dict(
+            schema='isaac-run-recover-v1', state=state, updated=now_iso(), name=self.name, session_dir=str(self.dir),
+            out_root=str(self.out_root), copy=str(self.copy.root), save_dir=str(self.save_dir), use_dll=self.use_dll,
+            raw_policy=self.raw_policy, allow_console=self.allow_console, launcher_pid=os.getpid(),
+            options_file=str(self.save_dir / 'options.ini'), forced_before=self.forced_before,
+            forced=self.forced_options if self.enforce_options else {}, cmd_history_before=self.cmd_history_before))
+
+    def write_partial(self):
+        """会话进行中先写一份不完整的 session.json（state = recording），finish 时覆盖。"""
+        write_json(self.dir / 'session.json', dict(self.info, state='recording',
+                                                   note='未收尾：录制进行中，或启动器异常结束（可用 --recover 收尾）'))
 
     def write_session_file(self, exe_sha, version):
         """mod 在每局开局时把这个文件原样拼进 run header 的 session 字段（必须单行 JSON）。"""
@@ -1030,6 +1308,7 @@ class Session:
             self.watcher = SaveWatcher(self.irr_dir, self.dir / 'save', self.snapshots, self.save_dir)
             self.watcher.start()
         self.g = g
+        self.write_partial()
         return g
 
     def mark_menu_failure(self, g, reason):
@@ -1065,10 +1344,14 @@ class Session:
         raise LaunchFailed(f'{attempts} 次都没能进入游戏：{last!r}')
 
     # ---- 会话后
-    def finish(self):
+    def finish(self, recovered=None):
+        """recovered（phase13 P3）：--recover 收尾时的说明 dict（启动器已不在、游戏进程已结束）。"""
         if self.watcher:
-            self.watcher.poll_once()
             self.watcher.stop_flag = True
+            try:
+                self.watcher.poll_once()
+            except Exception as e:  # noqa: BLE001
+                self.snapshots.setdefault('_errors', []).append(repr(e))
         if self.g is not None and self.g.closed is None:
             self.g.close()
         # 游戏进程怎么结束的（phase9-robust：强杀/崩溃时以前只有 game/<tag>.exit.json 记了退出码）
@@ -1081,9 +1364,10 @@ class Session:
                         att['exit'] = ex
         time.sleep(1.0)
         sd = self.save_dir
-        self.info['save_post'] = snapshot_save(self.dir / 'save/post', sd)
+        self.info['save_post'] = snapshot_save(self.dir / 'save/post', sd, blobs=self.dir / 'save' / BLOB_DIR)
         opt = sd / 'options.ini'
         if opt.exists():
+            (self.dir / 'options').mkdir(exist_ok=True)
             shutil.copy2(opt, self.dir / 'options/options.after-game.ini')
             if self.forced_before:
                 restore = {k: v for k, v in self.forced_before.items() if v is not None}
@@ -1105,10 +1389,15 @@ class Session:
         self.archive_runs(console_used=bool(new))
         if self.docs_watcher is not None:
             self.info['real_documents_watch'] = self.docs_watcher.result()
+        if recovered:
+            self.info['recovered'] = recovered
+        self.info['save_snapshot_errors'] = self.snapshots.get('_errors')
+        self.info['state'] = 'recovered' if recovered else 'finished'
         self.info['finished'] = now_iso()
         self.info['summary'] = self.summary()
         write_json(self.dir / 'session.json', self.info)
         (self.dir / 'summary.txt').write_text(self.summary_text(), encoding='utf-8')
+        self.write_recover_state('recovered' if recovered else 'finished')
         return self.info
 
     def archive_runs(self, console_used=False):
@@ -1135,9 +1424,24 @@ class Session:
                 rec['console_note'] = '本会话 cmd_history.txt 有新增行，无法定位到具体局，会话内所有局都标记'
             v = rec.get('validation') or {}
             if v.get('truncated'):
-                rec['note'] = truncated_note(self.info.get('game_exit'))
+                rec['note'] = truncated_note(self.info.get('game_exit'), sig_end, (v.get('header') or {}).get('flush_every'))
+            # 0.5.0（phase13）：内容是否可信（verified 只表示压缩逐字节校验）
+            issues = data_issues(v, sig_end) if v else [f'归档失败：{rec.get("archive_error")}']
+            snap = rec['save_snapshot']
+            if not snap:
+                issues.append('没有开局存档快照')
+            elif snap.get('late'):
+                issues.append('开局存档快照晚了（可能含后来的局写过的存档）：' + '；'.join(snap.get('late_reasons') or []))
+            elif snap.get('late') is None and snap.get('kind') != 'mod':
+                issues.append('开局存档快照无法判断是否晚了')
+            rec['data_ok'] = not issues
+            rec['data_issues'] = issues
             if self.raw_policy == 'stage' and rec.get('verified'):
                 rec['raw_staged_to'] = stage_raw(raw, self.out_root / '_raw_staging', self.name)
+                # mod 的开局存档拷贝已去重入库（save/blobs），原件同样挪到暂存目录（不删）
+                for sc in sorted(self.irr_dir.glob(f'savecopy-{name}-*')):
+                    if snap and snap.get('kind') == 'mod':
+                        stage_raw(sc, self.out_root / '_raw_staging', self.name + '/savecopy')
             else:
                 rec['raw_kept'] = str(raw)
             self.info['runs'].append(rec)
@@ -1159,6 +1463,13 @@ class Session:
                     game_exit_hex=(self.info.get('game_exit') or {}).get('exit_hex'),
                     game_exit_abnormal=(self.info.get('game_exit') or {}).get('abnormal'),
                     mt_runs=sum(1 for r in runs if (((r.get('validation') or {}).get('header') or {}).get('mt') or {}).get('available')),
+                    # 0.5.0（phase13）：内容有问题的局、晚了的存档快照、退化帧、写失败
+                    data_issue_runs=sum(1 for r in runs if r.get('data_ok') is False),
+                    late_snapshots=sum(1 for r in runs if (r.get('save_snapshot') or {}).get('late')),
+                    mod_snapshots=sum(1 for r in runs if (r.get('save_snapshot') or {}).get('kind') == 'mod'),
+                    degraded_frames=sum(len((r.get('validation') or {}).get('degraded_frames') or []) for r in runs),
+                    write_errors=sum(((r.get('validation') or {}).get('end') or {}).get('write_errors') or 0 for r in runs),
+                    state=self.info.get('state'), recovered=bool(self.info.get('recovered')),
                     real_documents_galaxy_appeared=(self.info.get('real_documents_watch') or {}).get('appeared_during_session'))
 
     def summary_text(self):
@@ -1169,13 +1480,17 @@ class Session:
                  f'启动 {s["launch_attempts"]} 次，失败 {s["launch_failures"]} 次；游戏进程退出码 {s.get("game_exit_hex")}'
                  + ('（异常退出）' if s.get('game_exit_abnormal') else ''),
                  f'DLL {"开" if s.get("use_dll") else "关（-NoDll）"}；有 MT reseed 的局 {s.get("mt_runs")}；存档目录 {self.save_dir}',
-                 f'会话期间真实 Documents 出现 (Galaxy) 目录：{s.get("real_documents_galaxy_appeared")}', '']
+                 f'会话期间真实 Documents 出现 (Galaxy) 目录：{s.get("real_documents_galaxy_appeared")}',
+                 f'数据有问题的局 {s.get("data_issue_runs")}；开局存档快照：mod 拷贝 {s.get("mod_snapshots")} 局，晚了 '
+                 f'{s.get("late_snapshots")} 局；退化帧 {s.get("degraded_frames")}；写失败 {s.get("write_errors")}'
+                 + ('；本会话由 --recover 收尾' if s.get('recovered') else ''), '']
         for r in self.info['runs']:
             v = r.get('validation') or {}
             h = v.get('header') or {}
             lines.append(f'{r["file"]}: 帧 {v.get("frames")} 种子 {h.get("seed")} 续局 {h.get("continued")} '
                          f'结束 {(v.get("end") or {}).get("reason")} zst {r.get("zst_bytes")} B 校验 {r.get("verified")} '
-                         f'MT {(h.get("mt") or {}).get("available")} salt {(h.get("mt") or {}).get("salt")}')
+                         f'MT {(h.get("mt") or {}).get("available")} salt {(h.get("mt") or {}).get("salt")} '
+                         f'数据 {"OK" if r.get("data_ok") else "有问题：" + "；".join(r.get("data_issues") or [])}')
         return '\n'.join(lines) + '\n'
 
 
@@ -1259,10 +1574,92 @@ def run_auto_play(sess: Session, seconds=40, restart=True, seed=7, entered=False
     return g.close(wm_close=True)
 
 
+def find_unfinished(out_root, exclude=None):
+    """out_root 下没有收尾的会话目录（recover.json 的 state 不是 finished/recovered）。"""
+    out = []
+    try:
+        dirs = sorted(Path(out_root).iterdir())
+    except OSError:
+        return out
+    for d in dirs:
+        if not d.is_dir() or (exclude and d.resolve() == Path(exclude).resolve()):
+            continue
+        rec = read_json(d / 'recover.json')
+        if rec and rec.get('state') not in ('finished', 'recovered'):
+            out.append(d)
+    return out
+
+
+def recover_session(sess_dir, force=False):
+    """phase13 P3：启动器（本模块）被杀、PowerShell 被关、电脑重启之后收尾一个会话：
+    归档 <会话>/lua/ 里的原始 run 文件（截断局照常标 truncated）、把 mod 的开局存档拷贝入库、补写 session.json（state =
+    recovered，recovered 字段说明）、按 recover.json 还原 options.ini 被强制的键。游戏进程还在运行时拒绝（先关游戏）。"""
+    sess_dir = Path(sess_dir).resolve()
+    rec = read_json(sess_dir / 'recover.json')
+    if not rec:
+        raise RuntimeError(f'{sess_dir} 没有 recover.json（不是 0.5.0 起的录制会话目录？）')
+    if rec.get('state') in ('finished', 'recovered') and not force:
+        raise RuntimeError(f'{sess_dir} 已收尾（state={rec.get("state")}）；确需重做加 --force')
+    copy = GameCopy(rec['copy'])
+    pids = pids_of_exe(copy.exe)
+    if pids:
+        raise RuntimeError(f'副本 {copy.root} 的游戏进程仍在运行（pid {pids}）：先正常关掉游戏窗口，再运行 --recover')
+    partial = read_json(sess_dir / 'session.json') or {}
+    sess = object.__new__(Session)   # 不走 __init__（会话目录已存在）；只设 finish/archive/summary 用到的属性
+    sess.name = rec['name']
+    sess.out_root = Path(rec['out_root'])
+    sess.dir = sess_dir
+    sess.irr_dir = sess_dir / 'lua'
+    sess.game_logs = sess_dir / 'game'
+    sess.copy = copy
+    sess.use_dll = rec.get('use_dll', True)
+    sess.save_dir = Path(rec['save_dir'])
+    sess.raw_policy = rec.get('raw_policy', 'stage')
+    sess.allow_console = bool(rec.get('allow_console'))
+    sess.forced_before = rec.get('forced_before')
+    sess.forced_options = rec.get('forced') or {}
+    sess.enforce_options = bool(rec.get('forced'))
+    sess.cmd_history_before = rec.get('cmd_history_before') or []
+    sess.info = dict(partial)
+    sess.info.pop('state', None)
+    sess.info.pop('note', None)
+    sess.info.setdefault('runs', [])
+    sess.info['runs'] = []
+    sess.info.setdefault('launches', [])
+    sess.info.setdefault('notes', [])
+    sess.info.setdefault('options', dict(before=None))
+    sess.snapshots = {}
+    # 已由在线监视线程入库的快照：清单还在 save/<run>/manifest.json；重新扫描开局信号（mod 拷贝入库是幂等的），
+    # 不做 Python 核对快照（游戏早已不在开局时刻）
+    sess.watcher = SaveWatcher(sess.irr_dir, sess_dir / 'save', sess.snapshots, sess.save_dir, check=False)
+    for t_sig, sig in sess.watcher._signals():
+        run = sig.name[len('signal-'):-len('.start.json')]
+        man = read_json(sess_dir / 'save' / run / 'manifest.json')
+        if man and 'late' in man:
+            sess.watcher.seen.add(sig.name)
+            sess.snapshots[run] = dict(signal=read_json(sig, {}), signal_mtime=t_sig, snapshot=str(sess_dir / 'save' / run),
+                                       kind=man.get('kind'), late=man['late'], late_reasons=man.get('late_reasons') or [],
+                                       files=sorted(man.get('files') or {}), from_manifest=True)
+    sess.docs_watcher = None
+    sess.g = None
+    raws = sorted(sess.irr_dir.glob('run-*.jsonl'))
+    sess.info['real_documents_watch'] = dict(note='--recover：启动器异常结束，会话后半段没有监视')
+    info = sess.finish(recovered=dict(
+        time=now_iso(), launcher_pid=rec.get('launcher_pid'), raw_runs_found=[r.name for r in raws],
+        options_restored_from='recover.json forced_before',
+        note='启动器（Python）没能正常收尾（被结束/PowerShell 被关/电脑重启）；本记录由 --recover 补写：game_exit 未知，'
+             '没有 end 行的局标为截断；开局存档以 mod 的开局拷贝为准（没有的局退回到 Python 当时的快照或缺失）'))
+    return sess, info
+
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description='整局录制会话（人类会话入口；rl/record_run.ps1 调用）')
-    ap.add_argument('--session', required=True)
+    ap.add_argument('--session', default=None, help='会话名（录制时必填）')
+    ap.add_argument('--recover', default=None, metavar='SESSION_DIR',
+                    help='收尾一个没收尾的会话（启动器被杀/PowerShell 被关/重启之后）：归档原始 run 文件、补写 session.json、还原 options.ini')
+    ap.add_argument('--force', action='store_true', help='与 --recover 一起：会话已收尾也重做')
+    ap.add_argument('--fault', default=None, help=argparse.SUPPRESS)   # 测试用：IRR_FAULT（frame:<n>,room:<k>,write:<n>）
     ap.add_argument('--out-root', default=str(ISAAC_ROOT / 'experiments/run-recorder/sessions'))
     ap.add_argument('--copy', default=str(DEFAULT_COPY))
     ap.add_argument('--init-save-from', default=None)
@@ -1277,7 +1674,23 @@ def main(argv=None):
                     help='游戏进程的 CPU 亲和掩码（phase8-mouse §H4；默认 auto = 逻辑 CPU 0 一个核，录下的局才可能精确回放；'
                          '0 = 不限制；0x… = 指定掩码；只在带 DLL 时生效）')
     a = ap.parse_args(argv)
+    if a.recover:
+        try:
+            sess, info = recover_session(a.recover, force=a.force)
+        except RuntimeError as e:
+            print(f'[恢复] {e}', flush=True)
+            return 3
+        print(sess.summary_text(), flush=True)
+        print(f'[恢复] 已收尾：{sess.dir / "session.json"}（state = recovered）', flush=True)
+        return 0 if not info['summary']['archive_errors'] else 2
+    if not a.session:
+        ap.error('录制需要 --session')
+    for d in find_unfinished(a.out_root):
+        print(f'[录制] 提示：会话 {d} 上次没有收尾（启动器被结束/重启？）。关掉游戏后可运行 '
+              f'python -m isaac_bridge.run_recording --recover "{d}"（或 record_run.ps1 -Recover）', flush=True)
     extra_env = {'IRR_OBS': 'keyframe'} if a.obs == 'keyframe' else None
+    if a.fault:
+        extra_env = dict(extra_env or {}, IRR_FAULT=a.fault)
     sess = Session(a.session, a.out_root, a.copy, a.init_save_from, raw_policy=a.raw, use_dll=not a.no_dll,
                    extra_env=extra_env, affinity=a.affinity, allow_console=a.allow_console)
     print(f'[录制] 会话目录 {sess.dir}', flush=True)

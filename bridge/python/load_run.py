@@ -13,6 +13,10 @@ IRR_OBS=keyframe 录制的文件在非关键帧没有 e 行，这些帧的 Frame
 v2（recorder 0.3.0，header.format = 2，schema 字符串仍是 isaac-run-v1）：另有外观行 pa/ea（稀疏差分）、字符串字典 sd、
 网格/门精灵 room.grid_spr/door_spr 与帧行 gs/ds（README 4.10）。旧字段（p/e/g/dr/dg…）与 v1 完全相同；v1 文件照常读，
 外观相关字段为 None。
+0.5.0（重建安全，phase13）：观测构建出错的帧是"退化帧"（帧行带 "err":1，只有 tk/sp/ms/mt 等回放必需字段，没有 r/p/e/dg；
+"err":2 = 连输入也没取到），其后 mod 强制关键帧并补写一条 "resync":1 的完整 room 行。读取端：Run.degraded_frames /
+input_missing_frames / frame_gaps（帧号缺口）/ suspect_frames（差分基准断了、到下一个关键帧之前解出来的值不可信的帧；0.5.0 的
+文件应为空）；FrameState.degraded / suspect 标记受影响的帧，退化帧的 players/entities/digest 等为 None，绝不静默返回错值。
 """
 from __future__ import annotations
 
@@ -244,6 +248,10 @@ class FrameState:
     entity_appearance: list = None
     pa_rows: list = None
     ea_rows: list = None
+    # 0.5.0：退化帧（观测缺省；players/entities/room_frame/digest 为 None）；suspect = 本帧解码值不可信的原因列表
+    # （差分基准经过了退化帧/帧号缺口、网格基准断了还没有补写 room 行…）；正常帧为 False / None
+    degraded: bool = False
+    suspect: list = None
 
 
 class Run:
@@ -282,6 +290,11 @@ class Run:
         self.event_lines = {}     # n -> [行号]
         self.api_lines = []       # api 行的行号（recorder 0.4.0；旧文件为空）
         self.change_frames = []   # 有 g/dr 的帧号（升序）
+        # 0.5.0：数据完整性（README §4.4 退化帧）
+        self.degraded_frames = []       # 观测缺省的帧（"err":1 或 2）
+        self.input_missing_frames = []  # 连 tick 输入也没有的帧（"err":2；回放不可能精确）
+        self.frame_gaps = []            # 帧号缺口 [(上一帧, 下一帧)]（帧行没写出：写失败、进程中途…）
+        self.resync_rooms = []          # "resync":1 的 room 行（行号, n）：不是换房，只为重置网格/门基准
         self.end = None
         self.other = []
         for i, ln in enumerate(self.lines[1:], 1):
@@ -296,12 +309,19 @@ class Run:
                 self.frame_line[n] = i
                 if b',"kf":1' in ln[:80]:
                     self.keyframes.append(n)
+                if b',"err":' in ln[:90]:
+                    em = re.search(rb',"err":(\d+)', ln[:90])
+                    self.degraded_frames.append(n)
+                    if em and em.group(1) != b'1':
+                        self.input_missing_frames.append(n)
                 if b',"g":[' in ln or b',"dr":[' in ln or b',"gs":[' in ln or b',"ds":[' in ln:
                     self.change_frames.append(n)
                 if b',"sd":[' in ln:
                     self._add_strings(json.loads(ln).get('sd'))
             elif k == 'room':
                 self.room_lines.append((i, n))
+                if b',"resync":1' in ln[:120]:
+                    self.resync_rooms.append((i, n))
                 if b',"sd":[' in ln:
                     self._add_strings(json.loads(ln).get('sd'))
             elif k == 'level':
@@ -318,7 +338,64 @@ class Run:
             else:
                 self.other.append(i)
         self.frames = len(self.frame_line)
+        self.last_n = max(self.frame_line, default=0)   # 最后一帧的帧号（有帧号缺口时 != frames）
         self._tick_cache = {}
+        ns = sorted(self.frame_line)
+        prev = 0
+        for n in ns:
+            if n != prev + 1:
+                self.frame_gaps.append((prev, n))
+            prev = n
+        self.suspect_frames = self._find_suspect()
+        self._suspect_set = set(self.suspect_frames)
+
+    def _find_suspect(self):
+        """差分基准断了（退化帧、帧号缺口）之后解码值不可信的帧：玩家/实体/外观到下一个关键帧为止；网格/门/精灵到下一条
+        room 行为止。按文件行序扫（room 行写在所属帧的帧行之前）。0.5.0 的 mod 在出错后的下一帧强制关键帧并在它之前补写
+        room 行，所以正常应为空。"""
+        bad = set(self.degraded_frames)
+        kfs = set(self.keyframes)
+        events = sorted([(i, 'f', n) for n, i in self.frame_line.items()] + [(i, 'room', n) for i, n in self.room_lines])
+        out = []
+        obs_broken = grid_broken = False
+        prev, room_since = 0, False
+        for _i, k, n in events:
+            if k == 'room':
+                grid_broken = False
+                room_since = True
+                continue
+            if n != prev + 1:
+                obs_broken = True
+                if not room_since:
+                    grid_broken = True
+            prev, room_since = n, False
+            if n in bad:
+                obs_broken = grid_broken = True
+                continue
+            if n in kfs:
+                obs_broken = False
+            if obs_broken or grid_broken:
+                out.append(n)
+        return out
+
+    def data_issues(self):
+        """本局数据完整性问题（字符串列表；空 = 没发现问题）。"""
+        out = []
+        if self.input_missing_frames:
+            out.append(f'输入缺失帧 {len(self.input_missing_frames)}（"err":2，回放不可能精确）：{self.input_missing_frames[:10]}')
+        if self.degraded_frames:
+            out.append(f'退化帧 {len(self.degraded_frames)}（观测缺省）：{self.degraded_frames[:10]}')
+        if self.frame_gaps:
+            out.append(f'帧号缺口 {len(self.frame_gaps)}：{self.frame_gaps[:10]}')
+        if self.suspect_frames:
+            out.append(f'解码不可信帧 {len(self.suspect_frames)}：{self.suspect_frames[:10]}')
+        if self.end is not None and self.end.get('frames') is not None and self.end.get('frames') != max(self.frame_line, default=0):
+            out.append(f'end.frames={self.end.get("frames")} 与最后一帧 {max(self.frame_line, default=0)} 不符')
+        if self.end is not None and (self.end.get('errors') or 0) > 0:
+            out.append(f'end.errors={self.end.get("errors")}')
+        if self.end is not None and (self.end.get('write_errors') or 0) > 0:
+            out.append(f'end.write_errors={self.end.get("write_errors")}')
+        return out
 
     def frame_obj(self, n):
         return json.loads(self.lines[self.frame_line[n]])
@@ -416,7 +493,8 @@ class Run:
         """第 1..n 帧的全部 tick（完整状态）。"""
         state, out = {}, []
         for k in range(1, n + 1):
-            out.extend(self.expand_ticks(k, self.frame_obj(k)['tk'], state))
+            if k in self.frame_line:   # 帧号缺口：那一帧的输入没有（frame_gaps）
+                out.extend(self.expand_ticks(k, self.frame_obj(k).get('tk', []), state))
         return out
 
     def _input_state_before(self, n):
@@ -425,11 +503,13 @@ class Run:
             start = max([b for b in self._tick_cache if b < base], default=0)
             state = dict(self._tick_cache.get(start, {}))
             for k in range(start + 1, base + 1):
-                self.expand_ticks(k, self.frame_obj(k)['tk'], state)
+                if k in self.frame_line:
+                    self.expand_ticks(k, self.frame_obj(k).get('tk', []), state)
             self._tick_cache[base] = dict(state)
         state = dict(self._tick_cache[base])
         for k in range(base + 1, n):
-            self.expand_ticks(k, self.frame_obj(k)['tk'], state)
+            if k in self.frame_line:
+                self.expand_ticks(k, self.frame_obj(k).get('tk', []), state)
         return state
 
     # ------------------------------------------------------------------ 帧重建
@@ -439,10 +519,18 @@ class Run:
         i = bisect.bisect_left(keys, line_no) - 1
         return lst[i] if i >= 0 else None
 
-    def _make_state(self, o, room, level, items, prows, erows, events, ticks, parows=None, earows=None):
+    def _make_state(self, o, room, level, items, prows, erows, events, ticks, parows=None, earows=None, suspect=None):
+        if o.get('err'):
+            # 退化帧（0.5.0）：只有回放必需字段；观测一律 None，不拿上一帧的值冒充
+            return FrameState(n=o['n'], gf=o['gf'], t=o['t'], keyframe=False, header=self.header, level=level, room=None,
+                              room_frame=None, players=None, entities=None, items=items, spawns=o.get('sp', []),
+                              mouse=[[m[0]] + [_fix(x) for x in m[1:5]] + [m[5]] for m in o.get('ms', [])],
+                              events=events, ticks=ticks, digest=None, raw=o, mt=o.get('mt'), degraded=True,
+                              suspect=['degraded' if o.get('err') == 1 else 'input_missing'])
         fs = FrameState(n=o['n'], gf=o['gf'], t=o['t'], keyframe=o.get('kf') == 1, header=self.header, level=level,
                         room=room, room_frame=dict(zip(self.header['fields']['room_frame'], o['r'])),
-                        players=[self.decode_player(p) for p in prows],
+                        suspect=suspect or None,
+                        players=None if prows is None else [self.decode_player(p) for p in prows],
                         entities=None if erows is None else [self.decode_entity(e) for e in erows],
                         items=items, spawns=o.get('sp', []),
                         mouse=[[m[0]] + [_fix(x) for x in m[1:5]] + [m[5]] for m in o.get('ms', [])],
@@ -451,7 +539,7 @@ class Run:
         if self.app_names:
             fs.pa_rows = parows
             fs.ea_rows = earows
-            fs.player_appearance = [self.decode_appearance(r, player=True) for r in parows]
+            fs.player_appearance = None if parows is None else [self.decode_appearance(r, player=True) for r in parows]
             fs.entity_appearance = None if earows is None else [self.decode_appearance(r) for r in earows]
         return fs
 
@@ -470,16 +558,29 @@ class Run:
         if n not in self.frame_line:
             raise KeyError(f'没有第 {n} 帧（共 {self.frames} 帧）')
         li = self.frame_line[n]
-        k0 = self.keyframes[bisect.bisect_right(self.keyframes, n) - 1]
+        ki = bisect.bisect_right(self.keyframes, n) - 1
+        k0 = self.keyframes[ki] if ki >= 0 else min(self.frame_line)
         pp, pe, ppa, pea = {}, {}, {}, {}
-        for k in range(k0, n + 1):
-            o = self.frame_obj(k)
-            prows, pp = expand_rows(o['p'], {} if k == k0 else pp, self.pcol_p)
-            if 'e' in o:
-                erows, pe = expand_rows(o['e'], {} if k == k0 else pe, self.pcol_e)
-            else:  # IRR_OBS=keyframe 的非关键帧
-                erows = None
-            parows, earows, ppa, pea = self._expand_app(o, prows, erows, ppa, pea, k == k0)
+        prows = erows = parows = earows = None
+        o = self.frame_obj(n)
+        if not o.get('err'):
+            for k in range(k0, n + 1):
+                if k not in self.frame_line:
+                    continue
+                ok_ = self.frame_obj(k) if k != n else o
+                if ok_.get('err'):
+                    continue   # 退化帧没有观测；之后的值由 suspect_frames 标出
+                try:
+                    prows, pp = expand_rows(ok_['p'], {} if k == k0 else pp, self.pcol_p)
+                    if 'e' in ok_:
+                        erows, pe = expand_rows(ok_['e'], {} if k == k0 else pe, self.pcol_e)
+                    else:  # IRR_OBS=keyframe 的非关键帧
+                        erows = None
+                    parows, earows, ppa, pea = self._expand_app(ok_, prows, erows, ppa, pea, k == k0)
+                except (KeyError, IndexError):
+                    # 差分引用了基准里没有的对象（基准断了）：本帧观测不可用
+                    prows = erows = parows = earows = None
+                    pp, pe, ppa, pea = {}, {}, {}, {}
         rl = self._latest(self.room_lines, li)
         room = self.decode_room(json.loads(self.lines[rl[0]])) if rl else None
         lv = self._latest(self.level_lines, li)
@@ -496,8 +597,9 @@ class Run:
             if i < li:
                 items[p] = {it[0]: it[1] for it in json.loads(self.lines[i])['items']}
         events = [json.loads(self.lines[i]) for i in self.event_lines.get(n, [])]
-        ticks = self.expand_ticks(n, o['tk'], self._input_state_before(n))
-        fs = self._make_state(o, room, level, items, prows, erows, events, ticks, parows, earows)
+        ticks = self.expand_ticks(n, o.get('tk', []), self._input_state_before(n))
+        fs = self._make_state(o, room, level, items, prows, erows, events, ticks, parows, earows,
+                              self._suspect_reasons(n, prows))
         if with_inputs:
             fs.inputs_before = self.ticks_until(n)
         return fs
@@ -522,23 +624,48 @@ class Run:
             elif k == 'f':
                 o = json.loads(ln)
                 kf = o.get('kf') == 1
-                prows, pp = expand_rows(o['p'], {} if kf else pp, self.pcol_p)
-                if 'e' in o:
-                    erows, pe = expand_rows(o['e'], {} if kf else pe, self.pcol_e)
-                else:  # IRR_OBS=keyframe 的非关键帧
-                    erows = None
-                parows, earows, ppa, pea = self._expand_app(o, prows, erows, ppa, pea, kf)
+                ticks = self.expand_ticks(o['n'], o.get('tk', []), state)
+                if o.get('err'):
+                    # 退化帧：观测缺省；差分基准保持上一帧（之后的帧若不是关键帧会被标成 suspect）
+                    yield self._make_state(o, None, level, {p: dict(v) for p, v in items.items()},
+                                           None, None, events.pop(o['n'], []), ticks)
+                    continue
+                try:
+                    prows, pp = expand_rows(o['p'], {} if kf else pp, self.pcol_p)
+                    if 'e' in o:
+                        erows, pe = expand_rows(o['e'], {} if kf else pe, self.pcol_e)
+                    else:  # IRR_OBS=keyframe 的非关键帧
+                        erows = None
+                    parows, earows, ppa, pea = self._expand_app(o, prows, erows, ppa, pea, kf)
+                except (KeyError, IndexError):
+                    prows = erows = parows = earows = None
+                    pp, pe, ppa, pea = {}, {}, {}, {}
                 if room is not None:
                     apply_changes(room, o)
-                ticks = self.expand_ticks(o['n'], o['tk'], state)
                 yield self._make_state(o, _copy_room(room), level, {p: dict(v) for p, v in items.items()},
-                                       prows, erows, events.pop(o['n'], []), ticks, parows, earows)
+                                       prows, erows, events.pop(o['n'], []), ticks, parows, earows,
+                                       self._suspect_reasons(o['n'], prows))
+
+    def _suspect_reasons(self, n, prows):
+        out = []
+        if n in self._suspect_set:
+            out.append('base_broken')
+        if prows is None:
+            out.append('undecodable')
+        return out or None
 
     # ------------------------------------------------------------------ 编码（round-trip）
     def encode_frame_line(self, fs: FrameState, prev_p, prev_e, app_prev=None):
         """app_prev（v2）：{'pa': {...}, 'ea': {...}} 上一帧外观完整行，就地更新。"""
         o = fs.raw
         out = {'k': 'f', 'n': fs.n, 'gf': fs.gf, 't': fs.t}
+        if fs.degraded:
+            # 退化帧（0.5.0）：键序 = mod 的写法 n, gf, t, err, tk, sp, ms, mt, sd；差分基准不变（下一帧是关键帧）
+            out['err'] = o['err']
+            for k in ('tk', 'sp', 'ms', 'mt', 'sd'):
+                if k in o:
+                    out[k] = o[k]
+            return json.dumps(out, separators=(',', ':'), ensure_ascii=False).encode('utf-8'), prev_p, prev_e
         if fs.keyframe:
             out['kf'] = 1
         out['tk'] = o['tk']
@@ -662,7 +789,8 @@ def roundtrip(path, sample_every=97, verbose=True):
     3) tick 展开后按"只写变化"规则压回与原 tk 一致。"""
     run = Run(path)
     res = dict(file=str(path), frames=run.frames, keyframes=len(run.keyframes), line_mismatch=0,
-               random_access_mismatch=0, tick_mismatch=0, checked_random=0, first_mismatch=None)
+               random_access_mismatch=0, tick_mismatch=0, checked_random=0, first_mismatch=None,
+               degraded_frames=len(run.degraded_frames), suspect_frames=len(run.suspect_frames), frame_gaps=len(run.frame_gaps))
     seq = {}
     prev_state, prev_p, prev_e, app_prev = {}, {}, {}, {}
     for fs in run.iter_frames():
@@ -674,7 +802,7 @@ def roundtrip(path, sample_every=97, verbose=True):
                 i = next((i for i in range(min(len(enc), len(orig))) if enc[i] != orig[i]), min(len(enc), len(orig)))
                 res['first_mismatch'] = dict(n=fs.n, at=i, orig=orig[max(0, i - 80):i + 80].decode(errors='replace'),
                                              enc=enc[max(0, i - 80):i + 80].decode(errors='replace'))
-        if recompress_ticks(fs.ticks, prev_state) != fs.raw['tk']:
+        if recompress_ticks(fs.ticks, prev_state) != fs.raw.get('tk', []):
             res['tick_mismatch'] += 1
         if fs.ticks:
             prev_state = dict(fs.ticks[-1].inputs)

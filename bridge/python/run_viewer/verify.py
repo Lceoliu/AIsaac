@@ -116,6 +116,8 @@ def pick_frames(run, js_meta, samples, seed):
     edges += [n - 1 for n in rng.sample(sorted(run.event_lines), min(60, len(run.event_lines)))]
     rng.shuffle(edges)
     pick.update(i for i in edges[:max(60, samples // 2)] if 0 <= i < N)
+    # recorder 0.5.0 的退化帧没有观测（查看器画成空帧、load_run 给 None），不参与逐帧对照
+    pick -= {n - 1 for n in getattr(run, 'degraded_frames', ())}
     return sorted(pick)
 
 

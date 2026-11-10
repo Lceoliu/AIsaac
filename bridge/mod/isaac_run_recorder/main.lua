@@ -7,7 +7,7 @@
 -- 每局一个文件 run-<proc>-<NNNN>.jsonl：MC_POST_GAME_STARTED 开、MC_PRE_GAME_EXIT / 死亡 / 下一局开始时关。
 -- 格式见 README.md。
 local mod = RegisterMod("Isaac Run Recorder", 1)
-local VERSION = "0.4.2"
+local VERSION = "0.5.0"
 local SCHEMA = "isaac-run-v1"
 local game = Game()
 local concat = table.concat
@@ -60,7 +60,65 @@ local function read_file(path)
 	return s
 end
 
-local S = {runs = 0, renders = 0, paused = false, last_status = -1e9, err = nil, errors = 0, prespawn = {}, writable = false}
+local S = {runs = 0, renders = 0, paused = false, last_status = -1e9, err = nil, errors = 0, prespawn = {}, writable = false,
+	write_errors = 0, write_err = nil}
+
+-- 0.5.0：每多少逻辑帧 flush 一次 run 文件（进房、暂停、局结束另外 flush）。0.4.x 是 300 帧（进程被杀最多丢约 10 秒），
+-- 现在默认 30 帧（约 1 秒；phase13 实测开销见 README 第 4 节）。IRR_FLUSH_EVERY 只给开销对照用
+local FLUSH_EVERY = math.max(1, math.floor(tonumber(getenv("IRR_FLUSH_EVERY") or "") or 30))
+
+-- 0.5.0：测试用故障注入（只在设了环境变量 IRR_FAULT 时生效；录制会话默认不设）。逗号分隔：
+--   frame:<n>  第 n 帧的观测构建在全部差分基准更新之后抛错（每局都在第 n 帧）
+--   room:<k>   本局第 k 次拼 room 行（room_emit，开局那条算第 1 次）时抛错（扫描已完成）
+--   roomscan:<k> 本局第 k 次扫描房间（room_scan）末尾抛错
+--   write:<n>  第 n 帧的帧行当作写失败（不写出、计入 write_errors；模拟磁盘满）
+local FAULT_SPEC = getenv("IRR_FAULT")
+local FAULT = nil
+if FAULT_SPEC and FAULT_SPEC ~= "" then
+	FAULT = {frame = {}, room = {}, roomscan = {}, write = {}}
+	for kind, num in FAULT_SPEC:gmatch("(%a+):(%d+)") do
+		if FAULT[kind] then FAULT[kind][tonumber(num)] = true end
+	end
+else
+	FAULT_SPEC = nil
+end
+
+-- 0.5.0（P2）：开局那一刻的存档原样拷出。Python 经 IRR_SAVE_DIR 给出本会话的存档目录（正斜杠）、IRR_SAVE_FILES 给出
+-- 文件名列表（逗号分隔）。phase13 实测：游戏在 MC_POST_GAME_STARTED 之前 3–5 ms 写完 gamestate1.dat 与
+-- persistentgamedata1.dat，所以这里读到的就是这一局开局时的存档。只读存档、写到 IRR_DIR，不改游戏状态。
+local SAVE_DIR = getenv("IRR_SAVE_DIR")
+if SAVE_DIR == "" then SAVE_DIR = nil end
+local SAVE_FILES = {}
+for f in (getenv("IRR_SAVE_FILES") or "gamestate1.dat,gamestate2.dat,gamestate3.dat,persistentgamedata1.dat,"
+		.. "persistentgamedata2.dat,persistentgamedata3.dat,options.ini"):gmatch("[^,]+") do
+	SAVE_FILES[#SAVE_FILES + 1] = f
+end
+-- 返回 JSON：files = {文件名: 字节数 / null（不存在）/ -1（读到了但写副本失败）}、bytes、ms（墙钟）、cpu_ms
+local function save_copy(name)
+	if not SAVE_DIR then return "null" end
+	local t0, c0 = Isaac.GetTime(), os.clock()
+	local parts, bytes = {}, 0
+	for _, f in ipairs(SAVE_FILES) do
+		local v = "null"
+		local fh = io.open(SAVE_DIR .. "/" .. f, "rb")
+		if fh then
+			local data = fh:read("a")
+			fh:close()
+			v = "-1"
+			if data then
+				local out = io.open(OUT .. "/savecopy-" .. name .. "-" .. f, "wb")
+				if out then
+					local okw = out:write(data)
+					local okc = out:close()
+					if okw and okc then v = tostring(#data); bytes = bytes + #data end
+				end
+			end
+		end
+		parts[#parts + 1] = ST.jstr(f) .. ":" .. v
+	end
+	return '{"files":{' .. concat(parts, ",") .. '},"bytes":' .. bytes .. ',"ms":' .. (Isaac.GetTime() - t0)
+		.. ',"cpu_ms":' .. math.floor((os.clock() - c0) * 1000 + 0.5) .. '}'
+end
 local R = nil -- 当前局
 local H = nil -- harness
 local RP = nil -- replay 对象
@@ -119,11 +177,29 @@ local function repair(r, s)
 	return fixed
 end
 
-local function line(s)
+-- 0.5.0：写失败（磁盘满等）计数，体现在 status.json、end 行与结束信号里；前 3 次另记 errors.jsonl
+local function write_failed(r, e)
+	r.write_errors = r.write_errors + 1
+	S.write_errors = S.write_errors + 1
+	S.write_err = tostring(e)
+	if r.write_errors <= 3 then fail("write", e) end
+end
+
+-- simulate_fail：只给 IRR_FAULT=write:<n> 用
+local function line(s, simulate_fail)
 	if R then
 		if s:find("0x", 1, true) then s = repair(R, s) end
-		R.fh:write(s, "\n")
+		if simulate_fail then write_failed(R, "IRR_FAULT simulated write failure"); return false end
+		local ok, e = R.fh:write(s, "\n")
+		if not ok then write_failed(R, e); return false end
+		return true
 	end
+	return false
+end
+
+local function flush_run(r)
+	local ok, e = r.fh:flush()
+	if not ok then write_failed(r, e) end
 end
 
 local function write_status()
@@ -140,6 +216,8 @@ local function write_status()
 		-- 0.4.0：当前房间号与是否已清（测试驱动用；只读）
 		',"room":', tostring(R and game:GetLevel():GetCurrentRoomIndex() or "null"),
 		',"clear":', tostring(R ~= nil and game:GetRoom():IsClear()),
+		-- 0.5.0：本进程 run 文件写失败的累计次数与最后一次的错误信息
+		',"write_errors":', tostring(S.write_errors), ',"write_err":', ST.jstr(S.write_err),
 		'}')
 	fh:close()
 	S.last_status = Isaac.GetTime()
@@ -159,6 +237,24 @@ if API_ON and S.writable then
 	local ok, e = pcall(API.install, {run = function() return R end, line = line, jstr = ST.jstr,
 		recording = function() return S.writable end, self_dir = SRC and SRC:match("([^/\\]+)$") or "isaac_run_recorder"})
 	if not ok then fail("api_install", e) end
+end
+
+-- 0.5.0：进房/开局的 room 行（state.lua 的 room_scan + room_emit）。扫描出错 -> 下一帧重新扫描再写（room_dirty = "scan"）；
+-- 扫描成功、拼行出错 -> 下一帧只补写（"emit"，基准与没出错时相同）。都写成 "retry":1。成功时清掉待补的 resync。
+local function room_entry(n)
+	ST.begin_frame()
+	local oks, es = pcall(quiet, ST.room_scan, n)
+	if not oks then
+		R.room_dirty = "scan"; R.room_errors = R.room_errors + 1; R.force_kf = true; ST.requeue_taken(); fail("room", es)
+		return
+	end
+	local ok, s = pcall(quiet, ST.room_emit, n)
+	if ok then
+		line(s)
+		R.room_dirty = nil
+	else
+		R.room_dirty = "emit"; R.room_errors = R.room_errors + 1; R.force_kf = true; ST.requeue_taken(); fail("room", s)
+	end
 end
 
 ------------------------------------------------------------------ 开销统计
@@ -184,8 +280,13 @@ local function close_run(reason)
 		.. ',"fmt_repairs":' .. r.fmt_repairs .. ',"fmt_examples":' .. ST.jval(r.fmt_examples)
 		.. ',"api":' .. ST.jval(API.counts)
 		.. ',"console_cmds":' .. tostring(S.console_cmds or 0)
+		-- 0.5.0：写失败次数（不含 end 行自己）、观测出错的退化帧数、room 行构建出错次数、flush 间隔
+		.. ',"write_errors":' .. r.write_errors .. ',"err_frames":' .. r.err_frames .. ',"room_errors":' .. r.room_errors
+		.. ',"flush_every":' .. FLUSH_EVERY
 		.. ',"replay":' .. (r.replay and RP.stats_json() or "null") .. '}')
-	r.fh:close()
+	flush_run(r)
+	local okc, ec = r.fh:close()
+	if not okc then write_failed(r, ec) end
 	if r.replay and H and RP.pinlog_json then
 		local fh = io.open(OUT .. "/irr_pinlog-" .. r.name .. ".json", "w")
 		if fh then fh:write(RP.pinlog_json()); fh:close() end
@@ -193,7 +294,8 @@ local function close_run(reason)
 	R = nil
 	IN.replay = nil
 	signal(r.name, "end", '{"run":' .. ST.jstr(r.name) .. ',"reason":' .. ST.jstr(reason) .. ',"frames":' .. r.n .. ',"t":'
-		.. Isaac.GetTime() .. ',"os_time":' .. os.time() .. '}')
+		.. Isaac.GetTime() .. ',"os_time":' .. os.time() .. ',"write_errors":' .. r.write_errors .. ',"err_frames":' .. r.err_frames
+		.. ',"errors":' .. r.errors .. '}')
 	write_status()
 end
 
@@ -205,6 +307,9 @@ local function open_run(continued, mt_header)
 	local fh = io.open(OUT .. "/" .. name .. ".jsonl", "wb")
 	if not fh then fail("open_run", "cannot open " .. name); return end
 	fh:setvbuf("full", 1 << 18)
+	-- 0.5.0（P2）：开局那一刻的存档拷贝（在写 header 之前；结果进 header.save_copy 与开局信号）
+	local oks, sc = pcall(save_copy, name)
+	if not oks then fail("save_copy", sc); sc = '{"error":' .. ST.jstr(tostring(sc)) .. '}' end
 	ST.reset_run()
 	ST.refresh_players()
 	IN.reset(game:GetFrameCount())
@@ -214,7 +319,9 @@ local function open_run(continued, mt_header)
 	R = {fh = fh, name = name, n = 0, renders = 0, errors = 0, spawns = {}, cost = new_cost(), perf = new_cost(),
 		perf_renders = 0, perf_t = Isaac.GetTime(), gf_last = game:GetFrameCount(), perf_ifc = Isaac.GetFrameCount(), hud = HUD,
 		replay = is_replay, seed = game:GetSeeds():GetStartSeedString(), force_kf = true, mouse = {}, mouse_r = 0,
-		mouse_last = nil, fmt_repairs = 0, fmt_examples = {}}
+		mouse_last = nil, fmt_repairs = 0, fmt_examples = {},
+		-- 0.5.0：写失败、退化帧、room 行出错的计数；room_dirty = "retry"/"resync"（下一帧补写 room 行）；level_dirty 同理
+		write_errors = 0, err_frames = 0, room_errors = 0, room_calls = 0, room_dirty = nil, level_dirty = false, building = nil}
 	if is_replay then
 		-- 同一进程里的第二个回放局（观战的进程内倒带）：先清掉上一局的回放状态
 		if RP.active and RP.reset then RP.reset() end
@@ -236,6 +343,8 @@ local function open_run(continued, mt_header)
 		',"harness":', hinfo and ST.jval({start = hinfo.start, pre = hinfo.pre, bot = hinfo.bot, bot_seed = hinfo.bot_seed, frames = hinfo.frames,
 			cmds = hinfo.cmds, replay = hinfo.replay}) or "null",
 		',"replay_of":', is_replay and ST.jstr(RP.tbl.source) or "null",
+		-- 0.5.0：开局存档拷贝结果（P2）、测试用故障注入串（没设为 null）、flush 间隔
+		',"save_copy":', sc, ',"fault":', ST.jstr(FAULT_SPEC), ',"flush_every":', FLUSH_EVERY,
 		',"session":', (session and session:match("^%s*{") and session) or "null",
 		',"fields":', ST.jval({player = ST.PLAYER_FIELD_NAMES, entity = ST.ENTITY_FIELD_NAMES, entity_extra = ST.ENTITY_EXTRA_NAMES,
 			grid = ST.GRID_FIELD_NAMES, door = ST.DOOR_FIELD_NAMES, room_desc = ST.ROOMDESC_FIELD_NAMES,
@@ -249,14 +358,20 @@ local function open_run(continued, mt_header)
 			appearance_fixed_x100 = ST.APPEARANCE_FIXED, appearance_string_columns = ST.APPEARANCE_STRING_COLUMNS,
 			grid_sprite = ST.GRID_SPRITE_FIELD_NAMES, door_sprite = ST.DOOR_SPRITE_FIELD_NAMES}),
 		',"prestart_spawns":[', concat(pre, ","), ']}'}))
-	line(quiet(ST.level_line, 1))
-	line(quiet(ST.room_line, 1))
-	local il = quiet(ST.items_lines, 1, true)
-	if il then for _, s in ipairs(il) do line(s) end end
+	-- 0.5.0：level/room/道具行各自保护：出错时下一帧补写（level_dirty / room_dirty = "retry"），不让整个开局回调失败
+	local okl, ll = pcall(quiet, ST.level_line, 1)
+	if okl then line(ll) else R.level_dirty = true; fail("level", ll) end
+	room_entry(1)
+	local oki, il = pcall(quiet, ST.items_lines, 1, true)
+	if oki then
+		if il then for _, s in ipairs(il) do line(s) end end
+	else
+		ST.invalidate(); R.force_kf = true; fail("items", il)
+	end
 	for _, s in ipairs(API.on_run_open()) do line(s) end
 	S.console_cmds = 0
 	signal(name, "start", '{"run":' .. ST.jstr(name) .. ',"continued":' .. tostring(continued == true) .. ',"seed":'
-		.. ST.jstr(R.seed) .. ',"t":' .. Isaac.GetTime() .. ',"os_time":' .. os.time() .. '}')
+		.. ST.jstr(R.seed) .. ',"t":' .. Isaac.GetTime() .. ',"os_time":' .. os.time() .. ',"save_copy":' .. sc .. '}')
 	S.paused = game:IsPaused()
 	write_status()
 end
@@ -289,18 +404,22 @@ local function take_console()
 end
 
 ------------------------------------------------------------------ 每逻辑帧
+-- 0.5.0（重建安全）：回放必需的部分（tick 输入 tk、生成种子 sp、鼠标 ms、MT 校验 mt）先取出；观测（玩家/实体/外观/网格/门/
+-- digest/道具）在单独的 pcall 里构建。观测出错时这一帧照样写一行"退化帧"：{"k":"f","n":..,"gf":..,"t":..,"err":1,"tk":..,
+-- "sp":..,"ms":..,"mt":..[,"sd":..]}（没有 kf/r/p/e/dg 等观测字段），并让下一帧成为关键帧、在它之前补写一条完整的 room 行
+-- （"resync":1），于是全部差分基准（玩家/实体/外观、网格/门/精灵、道具清单、字符串字典）在下一帧重新从完整行开始。
 local function build_frame(n, gf)
-	-- 关键帧：本局第 1 帧、进房后第一帧、每 300 帧（玩家/实体行写完整行；其余帧写差分行）
+	-- 关键帧：本局第 1 帧、进房后第一帧、每 300 帧、观测出错之后的第一帧（玩家/实体行写完整行；其余帧写差分行）
 	local kf = n == 1 or n % 300 == 1 or R.force_kf
 	R.force_kf = false
-	local buf = {'{"k":"f","n":', tostring(n), ',"gf":', tostring(gf), ',"t":', tostring(Isaac.GetTime()),
-		kf and ',"kf":1' or '', ',"tk":[', IN.take_ticks(), ']'}
+	local pre = '{"k":"f","n":' .. n .. ',"gf":' .. gf .. ',"t":' .. Isaac.GetTime()
+	local head = {',"tk":[', IN.take_ticks(), ']'}
 	if #R.spawns > 0 then
-		buf[#buf + 1] = ',"sp":[' .. concat(R.spawns, ",") .. "]"
+		head[#head + 1] = ',"sp":[' .. concat(R.spawns, ",") .. "]"
 		R.spawns = {}
 	end
 	if #R.mouse > 0 then
-		buf[#buf + 1] = ',"ms":[' .. concat(R.mouse, ",") .. "]"
+		head[#head + 1] = ',"ms":[' .. concat(R.mouse, ",") .. "]"
 		R.mouse = {}
 	end
 	-- E4：全局 MT 的 (cursor, hash)，只读不推进
@@ -308,17 +427,62 @@ local function build_frame(n, gf)
 		local c, h, reads = MT.state()
 		if c then
 			-- 第三个数只在 DLL 读了不止一次才稳定时出现（两份拷贝不一致，见 rr_mt.cpp stableSnapshot）
-			if reads and reads > 1 then buf[#buf + 1] = ',"mt":[' .. c .. "," .. h .. "," .. reads .. "]"
-			else buf[#buf + 1] = ',"mt":[' .. c .. "," .. h .. "]" end
+			if reads and reads > 1 then head[#head + 1] = ',"mt":[' .. c .. "," .. h .. "," .. reads .. "]"
+			else head[#head + 1] = ',"mt":[' .. c .. "," .. h .. "]" end
 		end
 	end
-	ST.refresh_players()
-	ST.frame_parts(n, buf, kf, OBS == "keyframe" and not kf)
-	buf[#buf + 1] = "}"
-	local il = ST.items_lines(n, false, kf)
-	if il then for _, s in ipairs(il) do line(s) end end
-	line(concat(buf))
-	R.mouse_r = 0
+	head = concat(head)
+	-- 补写 level / room 行（上一次构建出错）：写在本帧帧行之前，n = 本帧
+	if R.level_dirty then
+		local okl, ll = pcall(ST.level_line, n)
+		if okl then line(ll); R.level_dirty = false else fail("level_retry", ll) end
+	end
+	ST.begin_frame()
+	if R.room_dirty then
+		-- "scan"：进房扫描出错，重新扫描（这时的网格可能比进房时新，最多 15 帧内 digest 第 3 层可能与回放不同，见 README §4.4）；
+		-- "emit"：只补写进房行；"resync"：上一帧观测出错，只 emit 当前基准（不重新扫描、不改 rescan 相位）
+		local d = R.room_dirty
+		local okr, rl = true, nil
+		if d == "scan" then
+			okr, rl = pcall(ST.room_scan, n)
+			if okr then d = "emit"; R.room_dirty = "emit" end
+		end
+		if okr then okr, rl = pcall(ST.room_emit, n, d == "resync" and "resync" or "retry") end
+		if okr then line(rl); R.room_dirty = nil; ST.begin_frame()
+		else R.room_errors = R.room_errors + 1; ST.requeue_taken(); fail("room_retry", rl) end
+		kf = true
+	end
+	local obs, il = {}, nil
+	R.building = n
+	local ok, err = pcall(function()
+		ST.refresh_players()
+		ST.frame_parts(n, obs, kf, OBS == "keyframe" and not kf)
+		il = ST.items_lines(n, false, kf)
+	end)
+	R.building = nil
+	if ok then
+		if il then for _, s in ipairs(il) do line(s) end end
+		if not line(pre .. (kf and ',"kf":1' or '') .. head .. concat(obs) .. "}", FAULT and FAULT.write[n]) then
+			-- 帧行没写出去（写失败）：读取端的差分基准断了 -> 与观测出错相同，下一帧强制关键帧并补写 resync room 行。
+			-- 这一帧的输入也丢了（帧号缺口，回放不可能精确），由读取端/归档校验标出
+			R.force_kf = true
+			R.room_dirty = R.room_dirty or "resync"
+			ST.invalidate()
+			ST.requeue_taken()   -- 这一行里新定义的字符串字典条目放回待写队列
+		end
+		R.wrote_n = n
+		return
+	end
+	-- 退化帧：本帧已取走、没写出的字符串字典条目放进这一行（否则后面引用这些 id 的行解不出字符串）
+	R.err_frames = R.err_frames + 1
+	ST.requeue_taken()
+	local sd = ST.take_sd()
+	line(pre .. ',"err":1' .. head .. (sd and (',"sd":[' .. sd .. ']') or '') .. "}")
+	R.wrote_n = n
+	R.force_kf = true
+	R.room_dirty = R.room_dirty or "resync"
+	ST.invalidate()
+	error(err, 0)
 end
 
 -- 鼠标流（D6：实测 Input.IsMouseBtnPressed / GetMousePosition 能读到真实鼠标）：每个渲染帧读一次，
@@ -341,13 +505,24 @@ local function frame()
 	local gf = game:GetFrameCount()
 	R.gf_last = gf
 	local ok, err = pcall(quiet, build_frame, n, gf)
+	R.building = nil
+	R.mouse_r = 0
+	-- 连输入部分都没能写出（take_ticks / MT 读数出错，从未见过）：至少写一条带帧号的行（"err":2 = 本帧输入缺失），
+	-- 让读取端看到这里断了，而不是帧号缺口；下一帧强制关键帧 + room 补写
+	if not ok and R.wrote_n ~= n then
+		line('{"k":"f","n":' .. n .. ',"gf":' .. gf .. ',"t":' .. Isaac.GetTime() .. ',"err":2}')
+		R.err_frames = R.err_frames + 1
+		R.force_kf = true
+		R.room_dirty = R.room_dirty or "resync"
+		ST.invalidate()
+	end
 	-- tick 分类状态无论如何都要推进，否则后续 tick 全部错类
 	IN.on_update(gf)
 	IN.n_next = n + 1
 	API.mark("U", 0)
 	R.room_last = game:GetLevel():GetCurrentRoomIndex()
 	if not ok then fail("frame", err) end
-	if n % 300 == 0 then R.fh:flush() end
+	if n % FLUSH_EVERY == 0 then flush_run(R) end
 	local ms = math.floor((os.clock() - t0) * 1000 + 0.5)
 	add_cost(R.cost, ms)
 	add_cost(R.perf, ms)
@@ -426,7 +601,7 @@ mod:AddCallback(ModCallbacks.MC_POST_RENDER, guarded("post_render", function()
 			S.paused = paused
 			ev(paused and "pause" or "unpause", "[" .. Isaac.GetFrameCount() .. "," .. Isaac.GetTime() .. "," .. IN.renders_since_update() .. "]")
 			if paused then S.pause_rs = IN.renders_since_update() end
-			if paused then R.fh:flush() end
+			if paused then flush_run(R) end
 			if R.replay then RP.on_pause_flip(IN.n_next, paused, IN.renders_since_update()) end
 		end
 		-- 回放的菜单暂停：Lua 关不掉菜单，向 Python（replay_run）请求发一次真实 Esc（pausectl.txt = 请求标识，空 = 无请求）
@@ -611,7 +786,7 @@ end))
 
 mod:AddCallback(ModCallbacks.MC_POST_GAME_END, guarded("game_end", function(_, over)
 	ev("game_end", "[" .. tostring(over == true) .. "]")
-	if R then R.fh:flush() end
+	if R then flush_run(R) end
 	if over then close_run("death") end
 end))
 
@@ -622,7 +797,10 @@ mod:AddCallback(ModCallbacks.MC_PRE_GAME_EXIT, guarded("game_exit", function(_, 
 end))
 
 mod:AddCallback(ModCallbacks.MC_POST_NEW_LEVEL, guarded("new_level", function()
-	if R and R.n > 0 and game:GetFrameCount() >= R.gf_last then line(quiet(ST.level_line, R.n + 1)) end
+	if R and R.n > 0 and game:GetFrameCount() >= R.gf_last then
+		local ok, s = pcall(quiet, ST.level_line, R.n + 1)
+		if ok then line(s) else R.level_dirty = true; fail("level", s) end
+	end
 end))
 
 mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, guarded("new_room", function()
@@ -631,9 +809,10 @@ mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, guarded("new_room", function()
 	if R and R.n > 0 and game:GetFrameCount() >= R.gf_last then
 		-- 回放：换房期间别的 mod 的调用（父调用执行中的嵌套子调用 / 本帧更新里换房之后的调用）
 		if R.replay and RP.api_new_room then RP.api_new_room(R.n + 1) end
-		line(quiet(ST.room_line, R.n + 1))
+		-- 0.5.0：room 行构建出错时下一帧补写（"retry":1），见 room_entry
+		room_entry(R.n + 1)
 		R.force_kf = true
-		R.fh:flush()
+		flush_run(R)
 	end
 end))
 
@@ -665,6 +844,22 @@ end))
 mod:AddCallback(ModCallbacks.MC_USE_PILL, guarded("use_pill", function(_, effect)
 	ev("use_pill", "[" .. tostring(effect) .. "]")
 end))
+
+------------------------------------------------------------------ 测试用故障注入（IRR_FAULT）
+if FAULT then
+	ST.fault = function(kind)
+		if not R then return end
+		if kind == "frame" then
+			if R.building and FAULT.frame[R.building] then error("IRR_FAULT injected: frame " .. R.building, 0) end
+		elseif kind == "room" then
+			R.room_calls = R.room_calls + 1
+			if FAULT.room[R.room_calls] then error("IRR_FAULT injected: room #" .. R.room_calls, 0) end
+		elseif kind == "roomscan" then
+			R.scan_calls = (R.scan_calls or 0) + 1
+			if FAULT.roomscan[R.scan_calls] then error("IRR_FAULT injected: roomscan #" .. R.scan_calls, 0) end
+		end
+	end
+end
 
 ------------------------------------------------------------------ harness / replay（只在测试时）
 local ctx = {

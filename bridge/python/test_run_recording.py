@@ -809,3 +809,285 @@ def test_replay_lua_start_pause(tmp_path):
             assert calls == [True, False] and st == {'ok': True, 'hits': 27, 'left_on': False}
         else:
             assert calls == [] and st is None
+
+
+# ---------------------------------------------------------------------------------------------- phase13：重建安全（recorder 0.5.0）
+def _deg_lines():
+    """_mt_lines 改成：第 2 帧是退化帧（"err":1，只有 tk/mt/sd），其后补写 resync room 行，第 3 帧是关键帧（完整行）。"""
+    lines = _mt_lines()
+    f2 = json.loads(lines[3])
+    deg = {'k': 'f', 'n': 2, 'gf': 2, 't': 33, 'err': 1, 'tk': f2['tk'], 'mt': f2['mt'], 'sd': f2['sd']}
+    room0 = json.loads(lines[1])
+    room0.pop('sd', None)
+    room = {'k': 'room', 'n': 3, 'gf': 3, 'resync': 1}   # mod 把 resync 标记写在 gf 之后
+    room.update({k: v for k, v in room0.items() if k not in ('k', 'n', 'gf')})
+    f30 = json.loads(lines[4])
+    f1 = json.loads(lines[2])
+    f3 = {'k': 'f', 'n': 3, 'gf': 3, 't': f30['t'], 'kf': 1}   # 键序同 mod：kf 在 t 之后
+    f3.update({k: v for k, v in f30.items() if k not in f3})
+    f3.update(p=[[0, 32000, 38000, 0, 0, 'WalkDown']], pa=[f1['pa'][0]])
+    def mod_order(d):   # 帧行键序同 mod（round-trip 逐字节比较要求）
+        head = ['k', 'n', 'gf', 't', 'kf', 'err', 'tk', 'sp', 'ms', 'mt', 'r', 'p', 'e', 'sd', 'pa', 'ea', 'g', 'dr', 'gs', 'ds', 'dg']
+        o = {k: d[k] for k in head if k in d}
+        o.update({k: v for k, v in d.items() if k not in o})
+        return json.dumps(o, separators=(',', ':'), ensure_ascii=False)
+    return [lines[0], lines[1], mod_order(f1), mod_order(deg),
+            json.dumps(room, separators=(',', ':'), ensure_ascii=False), mod_order(f3)]
+
+
+def test_degraded_frame_decode(tmp_path):
+    """0.5.0 退化帧：读取端标 degraded（观测为 None，不拿上一帧冒充），输入/MT 照常；resync room 行之后关键帧解码正常、
+    不标 suspect；round-trip 逐字节；会话校验报 data_issues。"""
+    p = tmp_path / 'deg.jsonl'
+    end = json.dumps({'k': 'end', 'n': 3, 'reason': 'exit', 'frames': 3, 'errors': 1, 'err_frames': 1, 'write_errors': 0},
+                     separators=(',', ':'))
+    p.write_text('\n'.join(_deg_lines() + [end]) + '\n', encoding='utf-8')
+    run = load_run.Run(p)
+    assert run.degraded_frames == [2] and run.input_missing_frames == [] and run.frame_gaps == [] and run.suspect_frames == []
+    assert run.resync_rooms and run.resync_rooms[0][1] == 3
+    d = run.frame(2)
+    assert d.degraded and d.players is None and d.entities is None and d.digest is None and d.room_frame is None
+    assert d.mt == [103, 21] and len(d.ticks) == 1 and d.suspect == ['degraded']
+    f3 = run.frame(3)
+    assert not f3.degraded and f3.suspect is None and f3.players[0]['x'] == 320.0 and f3.room['grid'][22][0] == 22
+    seq = list(run.iter_frames())
+    assert [s.degraded for s in seq] == [False, True, False] and seq[2].players == f3.players
+    assert run.strings[7] == 'HeadLeft'          # 退化帧里的字典条目照样收
+    res = load_run.roundtrip(p, sample_every=1, verbose=False)
+    assert res['ok'] and res['degraded_frames'] == 1, res
+    st = rr.validate_lines(rr.iter_lines_raw(p))
+    assert st['degraded_frames'] == [2] and st['resync_rooms'] == 1 and not st['errors']
+    issues = rr.data_issues(st)
+    assert any('退化帧' in x for x in issues) and any('end.errors=1' in x for x in issues)
+    assert any('退化帧' in x for x in run.data_issues())
+
+
+def test_gap_marks_suspect_frames(tmp_path):
+    """帧号缺口（帧行没写出）且之后不是关键帧：缺口之后到下一个关键帧/room 行之前的帧标 suspect（解不出就给 None），
+    不静默返回错值；归档校验报帧号缺口与 end.frames 不符。"""
+    lines = _mt_lines()
+    end = json.dumps({'k': 'end', 'n': 3, 'reason': 'exit', 'frames': 3, 'errors': 0, 'write_errors': 1}, separators=(',', ':'))
+    p = tmp_path / 'gap.jsonl'
+    p.write_text('\n'.join([lines[0], lines[1], lines[2], lines[4], end]) + '\n', encoding='utf-8')   # 缺第 2 帧
+    run = load_run.Run(p)
+    assert run.frame_gaps == [(1, 3)] and run.suspect_frames == [3] and run.last_n == 3 and run.frames == 2
+    f3 = run.frame(3)
+    assert f3.suspect and 'base_broken' in f3.suspect
+    assert [s.suspect is not None for s in run.iter_frames()] == [False, True]
+    st = rr.validate_lines(rr.iter_lines_raw(p))
+    assert st['frame_gaps'] == [[1, 3]]
+    issues = rr.data_issues(st)
+    assert any('帧号缺口' in x for x in issues) and any('end.frames=3' in x for x in issues) and any('write_errors' in x for x in issues)
+
+
+def test_compare_skips_degraded_frames(tmp_path):
+    """录制里的退化帧没有 digest：compare 跳过这些帧的三层比较（MT 照比），其余全同 -> exact，degraded_skipped 列出；
+    录制有帧号缺口 -> exact 一律 False。"""
+    rec = tmp_path / 'rec.jsonl'
+    rec.write_text('\n'.join(_deg_lines() + ['{"k":"end","n":3,"reason":"exit","frames":3}']) + '\n', encoding='utf-8')
+    lines = _mt_lines()
+    f3 = json.loads(lines[4])
+    rep_lines = list(lines[:4]) + [json.dumps(f3, separators=(',', ':'), ensure_ascii=False),
+                                   '{"k":"end","n":3,"reason":"frames","frames":3}']
+    rep = tmp_path / 'rep.jsonl'
+    rep.write_text('\n'.join(rep_lines) + '\n', encoding='utf-8')
+    c = replay_run.compare(rec, rep)
+    assert c['exact'] and c['degraded_skipped'] == [2] and c['exact_note']
+    # MT 在退化帧上不同 -> 不 exact
+    bad = _deg_lines()
+    d = json.loads(bad[3])
+    d['mt'] = [1, 1]
+    bad[3] = json.dumps(d, separators=(',', ':'))
+    rec2 = tmp_path / 'rec2.jsonl'
+    rec2.write_text('\n'.join(bad + ['{"k":"end","n":3,"reason":"exit","frames":3}']) + '\n', encoding='utf-8')
+    assert not replay_run.compare(rec2, rep)['exact']
+    gap = tmp_path / 'gap.jsonl'
+    gap.write_text('\n'.join([lines[0], lines[1], lines[2], lines[4], '{"k":"end","n":3,"reason":"exit","frames":3}']) + '\n',
+                   encoding='utf-8')
+    assert not replay_run.compare(gap, rep)['exact']
+
+
+def test_replay_table_with_degraded_frame(tmp_path):
+    """退化帧的 tk 照样进回放表；帧上限 = 最后帧号；replayability 报退化帧（不阻止回放）。"""
+    p = tmp_path / 'deg.jsonl'
+    p.write_text('\n'.join(_deg_lines()) + '\n', encoding='utf-8')
+    run = load_run.Run(p)
+    info = replay_run.build_replay_table(run, tmp_path / 'irr_replay.lua', mouse=False)
+    text = (tmp_path / 'irr_replay.lua').read_text(encoding='utf-8')
+    assert info['frames'] == 3 and 'frames = 3,' in text
+    assert any('退化帧' in x for x in replay_run.replayability(run))
+
+
+def test_truncated_note_write_failure():
+    """有结束信号却没有 end 行 = end 行没写出去（写失败），不是进程异常结束；flush 间隔决定"丢多少"的措辞。"""
+    n = rr.truncated_note({'abnormal': True, 'exit_hex': '0xC0000005'}, {'reason': 'exit', 'write_errors': 3})
+    assert '写失败' in n and '异常结束' not in n.split('不是')[0]
+    assert '约 1 秒' in rr.truncated_note(None, None, 30) and '约 10 秒' in rr.truncated_note(None, None, None)
+    assert '0xC0000005' in rr.truncated_note({'abnormal': True, 'exit_hex': '0xC0000005'})
+
+
+def test_snapshot_blobs_dedup_and_old_layout(tmp_path):
+    """快照按内容去重存 save/blobs/<sha256>（两份同内容快照共用一个 blob），snapshot_files 新旧布局都认，
+    replay_run.restore_init_save 从去重布局拷回存档目录。"""
+    sd = tmp_path / 'savedir'
+    sd.mkdir()
+    (sd / 'persistentgamedata1.dat').write_bytes(b'P1' * 100)
+    (sd / 'gamestate1.dat').write_bytes(b'G' * 50)
+    (sd / 'log.txt').write_text('log')
+    blobs = tmp_path / 'save' / 'blobs'
+    m1 = rr.snapshot_save(tmp_path / 'save' / 'run-a', sd, blobs=blobs)
+    m2 = rr.snapshot_save(tmp_path / 'save' / 'run-b', sd, blobs=blobs)
+    assert m1['files']['gamestate1.dat']['sha256'] == m2['files']['gamestate1.dat']['sha256']
+    assert len(list(blobs.iterdir())) == 2 and not (tmp_path / 'save' / 'run-a' / 'gamestate1.dat').exists()
+    fa = rr.snapshot_files(tmp_path / 'save' / 'run-a')
+    assert sorted(fa) == ['gamestate1.dat', 'persistentgamedata1.dat'] and fa['gamestate1.dat'].read_bytes() == b'G' * 50
+    old = tmp_path / 'old'
+    rr.snapshot_save(old, sd)          # 旧布局：文件直接放在快照目录
+    fo = rr.snapshot_files(old)
+    assert sorted(fo) == ['gamestate1.dat', 'persistentgamedata1.dat'] and fo['gamestate1.dat'].parent == old
+
+    class FakeSess:
+        pass
+    s = FakeSess()
+    s.save_dir = tmp_path / 'target'
+    s.save_dir.mkdir()
+    (s.save_dir / 'gamestate1.dat').write_bytes(b'old')
+    s.dir = tmp_path / 'replaysess'
+    s.init_save_from = tmp_path / 'save' / 'run-a'
+    s.init_save_exclude = {'gamestate1.dat'}
+    s.enforce_options = False
+    r = replay_run.restore_init_save(s, 1)
+    assert r['copied'] == ['persistentgamedata1.dat'] and r['moved'] == ['gamestate1.dat']
+    assert (s.save_dir / 'persistentgamedata1.dat').read_bytes() == b'P1' * 100
+
+
+def _write_signal(irr, run, save_copy, mtime=None):
+    p = irr / f'signal-{run}.start.json'
+    p.write_text(json.dumps({'run': run, 'continued': False, 'save_copy': save_copy}), encoding='utf-8')
+    if mtime is not None:
+        import os
+        os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_savewatcher_mod_copy_and_rapid_restarts(tmp_path):
+    """mod 的开局拷贝（信号 save_copy + savecopy-<run>-<文件>）直接入库为该局快照（kind=mod、不会晚），连续 3 个开局信号
+    一次处理、内容各自正确；同内容去重。"""
+    irr, save_root, sd = tmp_path / 'lua', tmp_path / 'save', tmp_path / 'savedir'
+    irr.mkdir()
+    sd.mkdir()
+    for k, content in enumerate([b'A' * 10, b'B' * 10, b'A' * 10], 1):
+        run = f'run-p1-01-{k:04d}'
+        (irr / f'savecopy-{run}-gamestate1.dat').write_bytes(content)
+        (irr / f'savecopy-{run}-persistentgamedata1.dat').write_bytes(b'P')
+        _write_signal(irr, run, {'files': {'gamestate1.dat': 10, 'persistentgamedata1.dat': 1, 'gamestate2.dat': None},
+                                 'bytes': 11, 'ms': 1})
+    recs = {}
+    w = rr.SaveWatcher(irr, save_root, recs, sd, check=False)
+    w.poll_once()
+    assert sorted(recs) == ['run-p1-01-0001', 'run-p1-01-0002', 'run-p1-01-0003']
+    for run, content in (('run-p1-01-0001', b'A' * 10), ('run-p1-01-0002', b'B' * 10), ('run-p1-01-0003', b'A' * 10)):
+        assert recs[run]['kind'] == 'mod' and recs[run]['late'] is False and recs[run]['absent'] == ['gamestate2.dat']
+        assert rr.snapshot_files(save_root / run)['gamestate1.dat'].read_bytes() == content
+        assert rr.snapshot_status(save_root / run)['late'] is False
+    assert len(list((save_root / 'blobs').iterdir())) == 3   # A、B、P
+
+
+def test_savewatcher_python_fallback_detects_late(tmp_path):
+    """没有 mod 拷贝（旧 mod）时退回 Python 快照：存档文件 mtime 晚于本局开局信号 = late，并写进清单；
+    snapshot_status 对旧会话（清单里没有 late）按开局信号推断出同样结论。"""
+    import os
+    import time as _t
+    irr, save_root, sd = tmp_path / 'lua', tmp_path / 'save', tmp_path / 'savedir'
+    irr.mkdir()
+    sd.mkdir()
+    now = _t.time()
+    (sd / 'gamestate1.dat').write_bytes(b'later')
+    os.utime(sd / 'gamestate1.dat', (now, now))
+    _write_signal(irr, 'run-p1-01-0001', None, mtime=now - 5)
+    recs = {}
+    w = rr.SaveWatcher(irr, save_root, recs, sd, check=False)
+    rr_wait = rr.wait_save_quiet
+    try:
+        rr.wait_save_quiet = lambda *a, **k: 0.0
+        w.poll_once()
+    finally:
+        rr.wait_save_quiet = rr_wait
+    rec = recs['run-p1-01-0001']
+    assert rec['kind'] == 'python' and rec['late'] and rec['late_reasons']
+    assert rr.snapshot_status(save_root / 'run-p1-01-0001')['late'] is True
+    # 旧会话布局：清单里没有 late 字段 -> 按 lua/signal-<run>.start.json 推断
+    old = tmp_path / 'oldsess'
+    (old / 'lua').mkdir(parents=True)
+    _write_signal(old / 'lua', 'run-x', None, mtime=now - 5)
+    _write_signal(old / 'lua', 'run-y', None, mtime=now + 5)
+    for run in ('run-x', 'run-y'):
+        rr.snapshot_save(old / 'save' / run, sd)
+        man = json.loads((old / 'save' / run / 'manifest.json').read_text(encoding='utf-8'))
+        assert 'late' not in man
+    assert rr.snapshot_status(old / 'save' / 'run-x')['late'] is True
+    assert rr.snapshot_status(old / 'save' / 'run-y')['late'] is False
+
+
+def test_recover_session(tmp_path):
+    """启动器被杀之后 --recover：归档 lua/ 里的原始 run 文件（截断局标出）、mod 开局拷贝入库、session.json 补成
+    state=recovered、按 recover.json 还原 options.ini；已收尾的会话拒绝重做；find_unfinished 找得到未收尾的会话。"""
+    out_root = tmp_path / 'sessions'
+    sdir = out_root / 'kill1'
+    (sdir / 'lua').mkdir(parents=True)
+    (sdir / 'game').mkdir()
+    copy = tmp_path / 'copy'
+    save_dir = copy / 'profile' / rr.SAVE_SUBDIR
+    save_dir.mkdir(parents=True)
+    (save_dir / 'options.ini').write_text('[Options]\nEnableDebugConsole=0\nPauseOnFocusLost=1\n', encoding='utf-8')
+    (save_dir / 'persistentgamedata1.dat').write_bytes(b'P' * 7)
+    rec = dict(schema='isaac-run-recover-v1', state='recording', name='kill1', session_dir=str(sdir), out_root=str(out_root),
+               copy=str(copy), save_dir=str(save_dir), use_dll=True, raw_policy='stage', allow_console=False,
+               launcher_pid=1, options_file=str(save_dir / 'options.ini'), forced_before={'EnableDebugConsole': '1'},
+               forced={'EnableDebugConsole': '0'}, cmd_history_before=[])
+    (sdir / 'recover.json').write_text(json.dumps(rec), encoding='utf-8')
+    (sdir / 'session.json').write_text(json.dumps(dict(schema='isaac-run-session-v1', name='kill1', state='recording',
+                                                       launches=[], runs=[], notes=[],
+                                                       options=dict(before={'EnableDebugConsole': '1'}))), encoding='utf-8')
+    lines = _mt_lines()
+    (sdir / 'lua' / 'run-p1-01-0001.jsonl').write_bytes(('\n'.join(lines[:4]) + '\n' + lines[4][:30]).encode('utf-8'))
+    (sdir / 'lua' / 'savecopy-run-p1-01-0001-persistentgamedata1.dat').write_bytes(b'P' * 7)
+    _write_signal(sdir / 'lua', 'run-p1-01-0001', {'files': {'persistentgamedata1.dat': 7, 'gamestate1.dat': None}})
+    assert rr.find_unfinished(out_root) == [sdir]
+    sess, info = rr.recover_session(sdir)
+    assert info['state'] == 'recovered' and info['recovered']['raw_runs_found'] == ['run-p1-01-0001.jsonl']
+    r = info['runs'][0]
+    assert r['verified'] and r['validation']['truncated'] and r['validation']['frames'] == 2 and r['data_ok'] is True
+    assert r['save_snapshot']['kind'] == 'mod' and '异常结束' in r['note']
+    assert 'EnableDebugConsole=1' in (save_dir / 'options.ini').read_text(encoding='utf-8')
+    assert info['options']['restored'] == {'EnableDebugConsole': '1'}
+    assert json.loads((sdir / 'recover.json').read_text(encoding='utf-8'))['state'] == 'recovered'
+    assert json.loads((sdir / 'session.json').read_text(encoding='utf-8'))['state'] == 'recovered'
+    assert (sdir / 'runs' / 'run-0001.jsonl.zst').exists() and not (sdir / 'lua' / 'run-p1-01-0001.jsonl').exists()
+    assert rr.find_unfinished(out_root) == []
+    with pytest.raises(RuntimeError):
+        rr.recover_session(sdir)
+
+
+def test_game_process_env_drops_fault(monkeypatch):
+    """IRR_FAULT 只在调用方显式给出时传给游戏进程（不从外层环境继承，免得回放进程也注入）；IRR_SAVE_DIR/FILES 总是给。"""
+    captured = {}
+
+    class Boom(Exception):
+        pass
+
+    def fake_popen(cmd, cwd=None, env=None, stdout=None, stderr=None):
+        captured['env'] = env
+        raise Boom()
+    monkeypatch.setenv('IRR_FAULT', 'frame:1')
+    monkeypatch.setattr(rr.subprocess, 'Popen', fake_popen)
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    copy = rr.GameCopy(d / 'copy')
+    with pytest.raises(Boom):
+        rr.GameProcess(copy, d / 'irr', 'p1', d / 'logs', use_dll=False, save_dir=d / 'save')
+    env = captured['env']
+    assert 'IRR_FAULT' not in env and env['IRR_SAVE_DIR'].endswith('/save') and 'gamestate1.dat' in env['IRR_SAVE_FILES']
+    with pytest.raises(Boom):
+        rr.GameProcess(copy, d / 'irr', 'p2', d / 'logs', use_dll=False, save_dir=d / 'save', extra_env={'IRR_FAULT': 'room:2'})
+    assert captured['env']['IRR_FAULT'] == 'room:2'

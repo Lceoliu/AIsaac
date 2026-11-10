@@ -1,5 +1,7 @@
 # Isaac Run Recorder（忏悔 J746 整局被动录制）
 
+更新：2026-11-10（recorder 0.5.0，phase13-rebuild-safety：重建安全。①观测构建出错的帧照样写一行"退化帧"（输入/生成种子/鼠标/MT 照写，`"err":1`），下一帧强制关键帧并补写 `"resync":1` 的 room 行，读取端标出受影响的帧（4.4、6 节）；`fh:write`/`flush` 失败计数（`write_errors`）；②每局开局时 mod 在开局回调里同步拷出存档（`header.save_copy`），会话存档快照按内容去重（`save/blobs/<sha256>` + 每局清单），晚了的旧快照被检测并标记（2、3、8.10 节）；③每 30 帧 flush（被杀最多丢约 1 秒）、`--recover` 收尾异常结束的会话（8.10 节）。格式只加键，`format` 仍是 2，旧文件读法不变）
+
 更新：2026-11-09（recorder 0.4.2，phase12-human4-replays：录制开局时游戏处于暂停（玩家在控制台敲 `rewind`/`restart`，下一局开局时控制台还开着）的局，回放在开局窗口经 DLL 让 `Game::IsPaused` 返回 true，与录制相同，第 8.9 节；`header.mt.reseeds[i].paused` 记录 reseed 当时是否暂停）
 
 更新：2026-11-08（recorder 0.4.0，phase10-mods-console：第三方 mod 对游戏状态的调用记成 api 行、回放时禁用该 mod 并由本 mod 原样调用，第 8.6 节；`--allow-console` 会话里玩家在调试控制台提交的命令由 DLL 钩子带帧号记成 `ev cmd`（src = console），回放同帧执行，第 8.7 节；run 文件只新增行种类与键，`format` 仍是 2，旧文件读法不变。之前：recorder 0.3.2：phase8-mouse 回放还原鼠标流，见第 8 节"鼠标还原"与第 9 节；格式不变 `isaac-run-v1`。phase9-robust：长暂停/小退/大退的实测与截断局的读取、比较、`session.json.game_exit`，见第 3、4、8.5 节；mod 未改）。需求与决定见 `experiments/run-recorder/DESIGN_BRIEF.md` §6（D1–D12）与 §7（E1–E8），第一阶段实测见 `experiments/run-recorder/INVESTIGATION.md`，DLL 的依据见 `experiments/run-recorder/mt-probe/MT_PROBE.md`，验收结果见 `experiments/run-recorder/phase2/ACCEPTANCE.md`、`experiments/run-recorder/phase3/ACCEPTANCE.md`。
@@ -25,8 +27,9 @@
 | `session.json` | 会话元数据（第 3 节） |
 | `summary.txt` | 会话摘要：局数、续局/截断局数、逻辑帧、游戏小时、MB、MB/小时、启动次数/失败次数、每局一行 |
 | `runs/run-NNNN.jsonl.zst` | 每局一个文件，zstd-19 压缩，按开局顺序编号 |
-| `lua/` | mod 的输出目录（环境变量 `IRR_DIR`）：原始 `run-<proc>-<NNNN>.jsonl`（`raw=keep` 时保留；默认校验后移到 `<OutRoot>/_raw_staging/<会话名>/`，不删除）、`signal-*.start/end.json`、`status.json`、`irr_boot.json`、`irr_session.json`、`errors.jsonl`（有错误才有） |
-| `save/pre/`、`save/<run>/`、`save/post/` | 存档目录快照：会话前、每局开局后（mod 写开局信号 → Python 等存档目录静止 1 s 后复制）、会话后。每个快照有 `manifest.json`（文件名、字节、mtime、sha256）。排除 `*.dmp`、`log.txt` |
+| `lua/` | mod 的输出目录（环境变量 `IRR_DIR`）：原始 `run-<proc>-<NNNN>.jsonl`（`raw=keep` 时保留；默认校验后移到 `<OutRoot>/_raw_staging/<会话名>/`，不删除）、`savecopy-<run>-<文件名>`（0.5.0：开局存档拷贝，入库后同样移到暂存目录 `savecopy/`）、`signal-*.start/end.json`、`status.json`、`irr_boot.json`、`irr_session.json`、`errors.jsonl`（有错误才有） |
+| `save/pre/`、`save/<run>/`、`save/post/`、`save/blobs/` | 存档快照：会话前、每局开局时、会话后。0.5.0 起按内容去重：文件内容只在 `save/blobs/<sha256>` 存一份，各快照目录里只有 `manifest.json`（`files[名] = {bytes, sha256, blob: 相对路径, mtime}`）。**每局开局快照**（`kind = "mod"`）= mod 在 `MC_POST_GAME_STARTED` 里同步拷出的 `gamestate1-3.dat`、`persistentgamedata1-3.dat`、`options.ini`（`absent` 列出当时不存在的），不会晚；另有 `python-check/manifest.json`：Python 在存档目录静止 1 s 后再拍一次作核对（已有更新的开局信号时不拍）。mod 拷贝不可用（旧 mod / 拷贝失败）时退回 Python 快照（`kind = "python"`）并检测是否晚了（`late`、`late_reasons`，8.10）。旧会话（0.4.x）的快照目录里直接放文件，`run_recording.snapshot_files` 两种布局都认 |
+| `recover.json` | （0.5.0）会话进行中的待还原项：副本、存档目录、`options.ini` 被强制前的值（`forced_before`）、`cmd_history.txt` 原有行、`state`（recording / finished / recovered）。`--recover` 靠它收尾（8.10） |
 | `options/` | `options.before.ini`（会话前原样）、`options.effective.ini`（强制后）、`options.after-game.ini`（游戏退出时写回的） |
 | `game/` | 每次启动的命令行与环境（`<tag>.command.json`，带 DLL 时含注入器的退出码与输出）、stdout/stderr（带 DLL 时是注入器的输出）、退出码（`<tag>.exit.json`）、游戏自己的 `log.txt` 副本、DLL 自己的日志 `rr_mt.<pid>.log`（身份门、存档重定向、每次 reseed） |
 
@@ -37,6 +40,7 @@
 | 字段 | 含义 |
 |---|---|
 | `schema` | `isaac-run-session-v1` |
+| `state` | （0.5.0）`recording`（会话进行中先写一份不完整的 session.json；启动器异常结束时就停在这里）/ `finished` / `recovered`（由 `--recover` 补写，另有 `recovered` 字段：时间、找到的原始 run 文件、说明；`game_exit` 未知） |
 | `name`、`created`、`finished` | 会话名、开始/结束时间（本地时区 ISO） |
 | `host` | 主机名、平台、CPU、Python 版本 |
 | `copy` | 副本路径；`binaries`：EXE、`Galaxy.dll`、`Lua5.3.3r.dll` 的字节数与 sha256；`resources` junction 目标 |
@@ -50,14 +54,14 @@
 | `allow_console` | （0.4.0）`record_run.ps1 -AllowConsole` / `--allow-console`：不强制关控制台，游戏进程设 `RR_MT_CONSOLE=1`，DLL 记录每条控制台命令（第 8.7 节） |
 | `save_pre`、`save_post`、`init_save_from` | 存档快照清单 |
 | `launches` | 每次启动尝试：tag、pid、`use_dll`、`boot_s`（mod 加载用时）、`result`（ok/failed）、失败原因（注入器失败、进程退出码、log 洪水、mod 未加载）、版本行、`mod_mt`（mod 加载时的 MT 状态：available/reason/DLL 信息）、`dll_status`（DLL 日志里最后的状态行）、`dll_log`；`console_hook`（0.4.0，`--allow-console` 时 DLL 日志的 `console: hook installed …` / `console: OFF …` 行） |
-| `runs[]` | 每局：`file`、`lua_name`、`raw_bytes`/`zst_bytes`、`raw_sha256`/`zst_sha256`、`verified`、`validation`（帧数、首末 gf、header 摘要、end 摘要、事件计数、`truncated`、`bad_json`/`last_line_partial`（末尾不完整行，见第 4 节）、`errors`、`game_hours`）、`save_snapshot`（该局开局快照路径与信号）、`console_used`、`end_signal`；截断局另有 `note`（含游戏进程退出码） |
+| `runs[]` | 每局：`file`、`lua_name`、`raw_bytes`/`zst_bytes`、`raw_sha256`/`zst_sha256`、`verified`、`validation`（帧数、首末 gf、header 摘要、end 摘要、事件计数、`truncated`、`bad_json`/`last_line_partial`（末尾不完整行，见第 4 节）、`errors`、`game_hours`）、`save_snapshot`（该局开局快照：`snapshot` 路径、`kind`（mod / python）、`late`、`late_reasons`、`files`、`absent`、`copy_ms`、`python_check`（核对快照与 mod 拷贝是否逐字节相同 `same_as_mod`）、信号）、`console_used`、`end_signal`；截断局另有 `note`（含游戏进程退出码；有结束信号却没有 `end` 行时说明是写失败而不是进程异常结束）；**`data_ok` / `data_issues`**（0.5.0：内容是否可信。`verified` 只表示压缩逐字节校验；`data_issues` 列出 `end.errors>0`、写失败、退化帧、输入缺失帧、帧号缺口、`end.frames` 不符、文件中间的不完整行、开局快照晚了/没有）。`summary` 另有 `data_issue_runs`、`late_snapshots`、`mod_snapshots`、`degraded_frames`、`write_errors`、`state`、`recovered` |
 | `game_exit` | （phase9-robust 起）最后一个游戏进程怎么结束的：`exit_code`/`exit_hex`、`abnormal`（退出码非 0：被任务管理器/`TerminateProcess` 结束是 `0x00000001`，崩溃是 `0xC0000005`/`0xC0000409` 等）、`wm_close_sent`、`forced_by_recorder`（录制端发 WM_CLOSE 8 s 没退出后自己结束的）、`seconds`；同样写进对应启动记录的 `exit`，`summary` 有 `game_exit_hex`/`game_exit_abnormal`。以前只在 `game/<tag>.exit.json` 里 |
 | `console` | 会话期间 `cmd_history.txt` 的新增行（D8；有新增则本会话所有局 `console_used=true`）、`allow_console`；`--allow-console` 会话里命令另有带帧号的 `ev cmd`（第 8.7 节），`cmd_history.txt` 只作对照。`runs[]` 另有 `console_cmds`（本局控制台命令条数，0.4.0）；`runs[].validation` 有 `console_cmds`、`api_lines` |
 | `summary` | 与 summary.txt 相同的统计 |
 
 ## 4. run 文件（`isaac-run-v1`）
 
-JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文件以二进制模式写（LF 换行），`setvbuf("full", 256 KB)`，进房、暂停、每 300 帧 flush 一次，所以进程崩溃时最多丢最后约 10 秒且文件没有 `end` 行（归档时标 `truncated`）。两次 flush 之间写满 256 KB 时 C 库会自己写出，可能停在一行中间（phase9-robust c2-kill：Boss 战中被强杀，最后一行是半个帧行）：归档校验记 `bad_json=1, last_line_partial=true`（不算错误）；`load_run.read_lines` 丢掉"没有换行结尾且解析不了"的最后一行，记在 `Run.partial_tail`（以前这行被当成一帧，`Run.frames` 多 1、重建/回放/查看器在这一帧上 JSON 解析失败）。
+JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文件以二进制模式写（LF 换行），`setvbuf("full", 256 KB)`，进房、暂停、局结束、每 30 帧（0.5.0；0.4.x 是 300 帧）flush 一次，所以进程崩溃/被杀时最多丢最后约 1 秒（0.4.x 约 10 秒）且文件没有 `end` 行（归档时标 `truncated`）；flush 间隔写在 `header.flush_every`、`end.flush_every`（环境变量 `IRR_FLUSH_EVERY` 只给开销对照用）。开销实测见第 7 节。每次 `fh:write`/`flush`/`close` 的返回值都检查（0.5.0）：失败计入 `write_errors`（`status.json`、`end` 行、结束信号），前 3 次另写 `errors.jsonl`；帧行写失败时下一帧同样强制关键帧 + resync（4.4）。两次 flush 之间写满 256 KB 时 C 库会自己写出，可能停在一行中间（phase9-robust c2-kill：Boss 战中被强杀，最后一行是半个帧行）：归档校验记 `bad_json=1, last_line_partial=true`（不算错误）；`load_run.read_lines` 丢掉"没有换行结尾且解析不了"的最后一行，记在 `Run.partial_tail`（以前这行被当成一帧，`Run.frames` 多 1、重建/回放/查看器在这一帧上 JSON 解析失败）。
 
 **通用规则**
 
@@ -84,6 +88,8 @@ JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文�
 | `meta.options` | Lua `Options` 表能读到的键（J746 实测 24 个，含 `MouseControl`、`PauseOnFocusLost`）；完整 `options.ini` 见会话目录 |
 | `meta.lua_version` | `Lua 5.3` |
 | `session` | Python 写的 `irr_session.json` 原样（单行 JSON）：会话名、EXE sha256、三个二进制的 sha256、游戏版本行、mods 清单（含 `disable.it`）、强制的 options、启动命令、主机名、存档目录 |
+| `save_copy` | （0.5.0）开局存档拷贝结果：`files`（文件名 → 字节数；`null` = 当时不存在；`-1` = 读到了但写副本失败）、`bytes`、`ms`（墙钟）、`cpu_ms`；没设 `IRR_SAVE_DIR` 为 `null`（8.10） |
+| `fault`、`flush_every` | （0.5.0）测试用故障注入串（`IRR_FAULT`，没设为 `null`，8.10）；flush 间隔（帧） |
 | `harness` | 测试局才有：开局命令（`start`）、预备命令（`pre`，0.4.1：例如 `restart 7`，见 8.8）、机器人、帧上限、脚本命令列表、是否回放；人类局为 `null` |
 | `replay_of` | 回放局：被回放的录制文件路径 |
 | `fields` | 各种数组行的列名（见下），以及 `fixed_x100`（定点字段）、`entity_extra_types`（附加字段类别对应的实体类型） |
@@ -100,13 +106,15 @@ JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文�
 
 `room_index`、`desc`（当前房间的 RoomDescriptor，同上列）、`seeds`（[SpawnSeed, DecorationSeed, AwardSeed]）、`type`、`shape`、`gw`/`gh`（网格宽高）、`top_left`/`bottom_right`（×100）、`clear`、`room_frame`、`backdrop`、`stage`、`stage_type`、`curses`，
 `grid`：房间里全部网格实体（含墙、门格），每格 `[index, type, variant, state, collision, var_data]`；`doors`：8 个门槽里存在的门，每个 `[slot, target_room_index, target_room_type, open, locked, state, variant]`。进房后第一帧强制为关键帧。
+0.5.0：room 行分两步构建（`state.lua` 的 `room_scan` 更新网格/门/精灵差分基准，`room_emit` 只读基准拼行）。`gf` 之后可有标记：`"retry":1` = 进房那次没写出、在下一帧（`n` 相同）补写的进房行（拼行出错只补拼，基准与没出错时相同；扫描本身出错才重新扫描，见第 9 节）；`"resync":1` = 上一帧观测出错/帧行写失败后补写的**同一房间**完整行（不是换房：只 emit 录制端当前的差分基准，不重新扫描、不改每 15 帧全扫的相位，所以录制端 digest 与没出错时逐位相同；读取端从这里重置网格/门/精灵）。
 
 ### 4.4 f（每逻辑帧一行，`MC_POST_UPDATE`）
 
 | 键 | 含义 |
 |---|---|
 | `n`、`gf`、`t` | 见通用规则 |
-| `kf` | `1` = 关键帧（本局第 1 帧、进房后第一帧、每 300 帧）：`p`/`e` 全部写完整行 |
+| `kf` | `1` = 关键帧（本局第 1 帧、进房后第一帧、每 300 帧、观测出错/帧行写失败之后的第一帧）：`p`/`e` 全部写完整行 |
+| `err` | （0.5.0）退化帧：`1` = 观测构建出错（mod 内部异常、引擎调用抛错），这一行只有 `n gf t err tk sp ms mt`（以及本帧新定义的字典条目 `sd`），没有 `kf r p e pa ea g dr gs ds dg`；`2` = 连输入部分都没取到（只有 `n gf t err`，从未见过）。回放必需的输入/生成种子/鼠标/MT 照写，所以退化帧不影响精确回放；下一帧强制关键帧，并在它之前写 `"resync":1` 的 room 行、道具清单在下一关键帧重写，于是全部差分基准从完整行重新开始 |
 | `tk` | 本帧的 60 Hz tick 输入（4.5） |
 | `sp` | 本帧的生成种子流（`MC_PRE_ENTITY_SPAWN`，D4）：`[type, variant, subtype, seed, gf]`，`gf` 是生成时的帧计数（中间 tick 里发生的生成 gf = 上一帧）。回放局里是钉回后的实际种子 |
 | `mt` | 全局 MT 校验（E4）：`[cursor, hash]`，`RRMT_State()` 在本帧 `MC_POST_UPDATE` 时只读（hash = 624 个状态字 + cursor 的 FNV-1a32，整数）；只在 `header.mt.available` 时有。DLL 把状态拷两份、两份一致才算数；若第一次两份不一致（读的同时内存被改），行里多一个第三数 = 读的次数（`[cursor, hash, reads]`），比较时只比前两个 |
@@ -153,7 +161,7 @@ JSONL，每行一个 JSON 对象，第一个键总是 `k`（行种类）。文�
 | `api` | （0.4.0）别的 mod 调用被监视的方法（第 8.6 节）：`n`（所属帧窗口：第 n 帧的更新或它之前的渲染）、`gf`、`ph`（帧内位置：`r` = 上次更新之后第 `r` 次渲染、`af:1` = 在本 mod 的渲染回调之后；`u` = 第 n 帧逻辑更新期间（本 mod 的 `MC_POST_UPDATE` 之前，`rc:1` = 本次更新里已换房）；`p` = 本 mod 的 `MC_POST_UPDATE` 之后同一次迭代；`q` = 第 `r` 次渲染之后的输入轮询；`gs` = 开局前，写在 header 后、`n=1`）、`id`（本局调用序号）、`m`（`类.方法`，属性写入为 `类.属性` + `set:1`）、`self`（EntityPlayer 方法的 `{"p":玩家编号}`）、`a`（参数：整数原样，浮点 `{"f":x}`（`%.17g`），字符串，布尔，null，玩家 `{"p":k}`，EntityRef `{"ref":{"p":k}}`/`{"ref":null}`，Vector `{"v":[x,y]}`，其它实体 `{"e":[type,variant,index]}`，无法表示的 `{"u":"类型名"}`）、`src`（调用栈上第一个 `mods/<目录>/` 的目录名；找不到为 `"?"`，另有 `srcfile`）、`in`（嵌套：在另一个被记录调用执行期间发生时，父调用的 `id`）。回放局里 replay.lua 执行的调用也写 api 行，另带 `rp:1`、`where`（实际执行点），没有 `a`；行写在所属帧的 `f` 行之前 |
 | `mark` | harness 的时间标记：`label`、`t`、`ifc` |
 | `perf` | 每 150 帧一次：`dt_ms`、`renders`（这 150 帧内的渲染次数）、`cost`（每帧 Lua 耗时直方图，毫秒，`os.clock` 1 ms 分辨率：`hist_ms[i]` = 耗时 i ms 的帧数，最后一格是 ≥31 ms） |
-| `end` | 局结束：`reason`（`death` = `MC_POST_GAME_END(true)`；`exit_save` / `exit` = `MC_PRE_GAME_EXIT(shouldSave)`；`restart` = 没有退出回调就开了新局；`frames` / `stop` = harness）、`frames`、`renders`、`errors`、`cost`（整局耗时直方图）、`missing_player_fields`（本构建上读不到的玩家字段）、`mt_unstable_reads`（DLL 进程内 MT 两份拷贝不一致的累计次数；无 DLL 为 null）、`fmt_repairs`/`fmt_examples`（本局写出前修掉的数字格式损坏次数与前 5 个片段，片段里的 0x 写成 "0 x"，见 4.9）、`api`（0.4.0：本局各方法的 api 行数）、`console_cmds`（0.4.0：本局控制台命令条数）、`replay`（回放局的钉种子计数；0.4.0 起另有 `api`：executed/late/failed/skipped/nested/first_error，`console`：executed/late） |
+| `end` | 局结束：`reason`（`death` = `MC_POST_GAME_END(true)`；`exit_save` / `exit` = `MC_PRE_GAME_EXIT(shouldSave)`；`restart` = 没有退出回调就开了新局；`frames` / `stop` = harness）、`frames`、`renders`、`errors`、`cost`（整局耗时直方图）、`missing_player_fields`（本构建上读不到的玩家字段）、`mt_unstable_reads`（DLL 进程内 MT 两份拷贝不一致的累计次数；无 DLL 为 null）、`fmt_repairs`/`fmt_examples`（本局写出前修掉的数字格式损坏次数与前 5 个片段，片段里的 0x 写成 "0 x"，见 4.9）、`api`（0.4.0：本局各方法的 api 行数）、`console_cmds`（0.4.0：本局控制台命令条数）、`write_errors`/`err_frames`/`room_errors`/`flush_every`（0.5.0：写失败次数（不含 end 行自己，结束信号里的含）、退化帧数、room 行构建出错次数、flush 间隔）、`replay`（回放局的钉种子计数；0.4.0 起另有 `api`：executed/late/failed/skipped/nested/first_error，`console`：executed/late） |
 
 ### 4.9 数字格式损坏的修复
 
@@ -191,7 +199,7 @@ v2 只**新增**键，旧字段（`p`/`e`/`g`/`dr`/`r`/`tk`/`mt`/`dg`、room/lev
 
 ## 5. 压缩与校验
 
-`run_recording.compress_and_verify`：`zstandard` level 19（带 zstd 内容校验和与原始长度）→ 解压回读，sha256 与原始 jsonl 逐字节一致才算 `verified`；再逐行解析，检查首行是 `isaac-run-v1` header、帧号连续、`end.frames` 与帧行数一致，没有 `end` 行标 `truncated`。结果写进 `session.json` 的 `runs[].validation`。
+`run_recording.compress_and_verify`：`zstandard` level 19（带 zstd 内容校验和与原始长度）→ 解压回读，sha256 与原始 jsonl 逐字节一致才算 `verified`；再逐行解析，检查首行是 `isaac-run-v1` header、帧号连续、`end.frames` 与帧行数一致，没有 `end` 行标 `truncated`。结果写进 `session.json` 的 `runs[].validation`（0.5.0 另有 `degraded_frames`、`input_missing_frames`、`frame_gaps`、`resync_rooms`）。`verified` 只说明压缩无损；内容是否可信看 `data_ok`/`data_issues`（`run_recording.data_issues`，第 3 节）。
 
 ## 6. 读取：`rl/bridge/python/load_run.py`
 
@@ -200,6 +208,7 @@ python rl/bridge/python/load_run.py RUN.jsonl.zst --frame 1234        # 摘要
 python rl/bridge/python/load_run.py RUN.jsonl.zst --frame 1234 --json # 全部字段
 python rl/bridge/python/load_run.py RUN.jsonl.zst --roundtrip         # round-trip 测试
 ```
+0.5.0：`Run.degraded_frames`（退化帧）、`input_missing_frames`（`"err":2`）、`frame_gaps`（帧号缺口 `[(上一帧, 下一帧)]`）、`suspect_frames`（差分基准经过退化帧/缺口之后、下一个关键帧（玩家/实体/外观）或下一条 room 行（网格/门/精灵）之前的帧：解出来的值不可信；0.5.0 的文件应为空）、`resync_rooms`、`last_n`、`data_issues()`。`FrameState.degraded`（退化帧：`players`/`entities`/`room`/`room_frame`/`digest` 为 `None`，`ticks`/`spawns`/`mouse`/`mt` 照常）、`FrameState.suspect`（原因列表：`degraded`/`input_missing`/`base_broken`/`undecodable`；差分引用了基准里没有的对象时观测为 `None`）。不会拿上一帧的值冒充。
 `Run(path).frame(n, with_inputs=True)` 返回 `FrameState`：该帧之前（含）的全部 tick 输入（`inputs_before`，完整状态）+ 该帧状态（玩家/实体已还原差分并把定点解码为 float，网格/门已应用变化，道具、楼层、房间、生成、鼠标、事件）。`Run.iter_frames()` 顺序重建全部帧。round-trip：每帧 解码→重新编码（含差分）与原始行逐字节相同、随机访问与顺序重建一致、tick 展开后压回与原 `tk` 一致。单元测试 `rl/bridge/python/test_run_recording.py`。
 
 ## 7. 开销控制
@@ -207,6 +216,8 @@ python rl/bridge/python/load_run.py RUN.jsonl.zst --roundtrip         # round-tr
 每帧工作都在 `MC_POST_UPDATE` 里，字符串拼接后一次写入；`MC_INPUT_ACTION` 每次查询只做一次原生读取并存进当前 tick。网格只比已知格、每 15 帧全扫；道具清单只在道具数变化时全扫。实测数字见 ACCEPTANCE.md 第 2、3 项。
 
 开销与房间里的实体数（含 1000.x 特效）成正比（phase11-human3-replays/NOTES.md §4，`perf` 行每 150 帧对窗口内平均实体数做线性拟合）：v1 格式（0.2.0，human1）约 0.24 ms + 14 µs/实体；v2 格式（外观行，0.3.0 起）约 0.2–0.4 ms + 20–23 µs/实体，即 30 个实体约 0.9–1.1 ms/帧、70 个约 1.7–2.0 ms/帧。0.4.0 的 api.lua 包装（替换 Game/Level/EntityPlayer/SFXManager 实例元表的 `__index`）实测不可分辨：同一机器人种子开/关（`IRR_API=0`）的 `bench` 在开局房 41/42 个实体时 1.02 / 1.06 ms/帧。human3 比 human1 贵约 2.6 倍 = 实体多约 2.1 倍（Azazel 困难模式的局平均 42 个、后期 70+）× v2 外观约 1.5 倍。
+
+0.5.0（phase13）：开局存档拷贝（约 64–76 KB）在开局回调里做，game-rec-03 上 18 次实测 3–15 ms（中位 4 ms，`cpu_ms` 与墙钟相同，只发生在开局回调里一次）。每 30 帧 flush：同一机器人场景（种子 4WHM NS6C，1641–3000 帧）0.4.2 / 0.5.0 flush 300 / 0.5.0 flush 30 的平均每帧 Lua 开销分别为 0.527–0.616、0.553–0.585、0.557–0.651 ms，最大 2–4、2、2 ms（1 ms 分辨率），看不出差别（phase13 NOTES 表 2）。
 
 ## 8. 回放检查：`rl/bridge/python/replay_run.py`（回归测试）
 
@@ -330,6 +341,22 @@ python rl/bridge/python/replay_run.py RUN.jsonl.zst --capture OUT.mp4 --copy exp
 - **实测**（`experiments/run-recorder/phase12-human4-replays/NOTES.md`）：human4 9 局全部 `exact`（run-0003 的 reseed 前 MT = 录制的 [136, 4284843295]）；机器人 rewind 续局（含"回车后立刻 Esc"）、控制台 `restart` 新局、带 4 种跟班的小退续局全部 `exact`。
 - **诊断工具**（只在 harness 下）：`RR_MT_TRACE=1` 时 `rr_mt.dll` 挂 `GlobalMT_Next` 记每次取数的调用者 RVA（再加一层启发式扫栈的调用者，`ret0<ret1`），mod 把它写进 `irr_diag.jsonl`（开局各回调、开局窗口与局内前 2 帧的实体 init、trace 开着时每帧一条，`IRR_TRACE_FRAMES` 默认 3000）。录制会话不设这个变量，也不加载 harness，录制路径里没有这些钩子和回调。
 
+### 8.10 重建安全（recorder 0.5.0，phase13-rebuild-safety）
+
+**退化帧**（4.4）：观测构建（玩家/实体/外观/网格/门/digest/道具）在单独的 `pcall` 里；出错时这一帧照样写出输入、生成种子、鼠标、MT，`"err":1`，下一帧强制关键帧 + `"resync":1` 的 room 行。`compare` 跳过录制里退化帧的三层 digest（这些帧没有），MT 与 tick 照比，列在 `degraded_skipped`、`exact_note`；录制有帧号缺口/输入缺失时 `exact` 一律为 false（输入不全）。`replayability` 报出退化帧与输入缺失。phase13 实测：注入 `frame:150,frame:600,room:2` 的 2 局机器人录制，回放 `exact = true`（三层在其余全部帧 0 分歧、MT 全程一致、退化帧 2 个被跳过）。
+
+**开局存档快照**（2 节）：phase13 实测游戏在每次开局时、`MC_POST_GAME_STARTED` 之前 3–5 ms 写完 `gamestate1.dat` 与 `persistentgamedata1.dat`，退出/死亡时再写（死亡删除 `gamestate1.dat`），所以 mod 在开局回调里同步读到的就是"这一局开局时的存档"。0.4.x 由 Python 串行地"等存档目录静止 1 s 再复制"，连续快速重开（按住 R）时排队，快照拍到后来的局写过的存档：human3 34 局里按 mtime 规则有 23 局的快照晚了（其中 20 局拍时下一局已经开局，另 3 局拍到了本局退出时的写入；第 10–13 局的 `gamestate1.dat` sha256 相同就是这个原因，phase13 NOTES §P2）。`run_recording.snapshot_status(<快照目录>)` 对 0.5.0 的快照读清单里的 `late`；对旧会话按"快照里 `gamestate*`/`persistentgamedata*` 的 mtime 晚于本局开局信号文件的 mtime"推断。`replay_run.py --init-save/--continue-save` 给的快照晚了时打印警告、写进报告的 `info.save_snapshot_status` 与 `issues`（不阻止回放；phase11 用这些晚了的快照回放 human3 全部 34 局仍 exact，晚掉的内容对它们无影响，但不保证普遍如此）。
+
+**异常结束与恢复**：启动器（Python）被结束、PowerShell 窗口被关、电脑重启后，原始 jsonl 留在 `<会话>/lua/`，`session.json` 停在 `state = recording`，`options.ini` 的 `EnableDebugConsole=0` 没还原。先关掉游戏，再运行
+
+```
+python -m isaac_bridge.run_recording --recover <会话目录>      # PYTHONPATH=rl/bridge/python
+.\rl\record_run.ps1 -Recover <会话目录>
+```
+它拒绝在该副本的游戏进程还在运行时执行；归档全部原始 run 文件（截断局照常标出）、把 mod 的开局拷贝入库、补写 `session.json`（`state = recovered`、`recovered`）、按 `recover.json` 还原 `options.ini`、原始文件照常移到暂存目录。新会话开始时若 `--out-root` 下有没收尾的会话，打印一行提示。已收尾的会话要重做加 `--force`。
+
+**测试用故障注入**（只在设了环境变量 `IRR_FAULT` 时生效；录制 CLI 的隐藏参数 `--fault`；`GameProcess` 不从外层环境继承它，回放进程不会注入）：`frame:<n>`（第 n 帧观测构建在全部差分基准更新之后抛错）、`room:<k>`（本局第 k 次拼 room 行时抛错）、`roomscan:<k>`（第 k 次扫描房间末尾抛错）、`write:<n>`（第 n 帧的帧行当作写失败）。
+
 ## 9. 已知局限
 
 - MT reseed 的时机（第一个 `POST_PLAYER_INIT` 先于开局房实体）只在单人以撒、普通难度、第 1 层开局上验证过（MT_PROBE §5.1、phase3 验收）；phase11 起另有困难模式的 Azazel（真人 human3 34 局、机器人）以及机器人的受污染以撒、The Soul、Jacob&Esau 短局回放（8.8）；Lazarus、挑战、贪婪：未测。续局早期 reseed 只在单人以撒、Basement II 续局存档上验证过（phase7-continue）。
@@ -342,7 +369,9 @@ python rl/bridge/python/replay_run.py RUN.jsonl.zst --capture OUT.mp4 --copy exp
 - 回放开局（8.8）：难度只能靠 `--init-save` 的存档快照对上（没有命令可选）；合作多玩家、挑战、贪婪模式的开局未实现。自然局的回放靠 DLL 直接写 `Seeds._isCustomRun`（布局取自 REPENTOGON/AB+，J746 上由身份门 `Seeds+4 == StartSeed` 兜底，human3 全部局实测写成功）；它只在楼层生成之前写一次，自定义种子局对引擎其它地方的影响（成就、每日等）没有逐项核对。phase11 之前的自然局回放（human1 等）都是自定义种子局，没进过有捐款机的商店才 exact。
 - 网格新增/墙变门最多晚 15 帧记录；道具数与主动槽都不变的道具替换（例如 D4 重随）最多晚 300 帧（下一个关键帧）出现在 `items` 行。
 - 续局必崩的存档（例如在 `goto s.boss.1013` 调试房里小退留下的）：录制会话把"读档后开局前进程退出"当成启动失败，`launch_and_enter` 最多重试 6×6 次、每次留一个 minidump，最后 0 局结束，不会告诉玩家"这份存档续不了"。真人遇到时需要手动删除/换存档（phase10-scenarios）。
-- 强杀/崩溃丢失的不只是"最后 10 秒"：flush 只在进房、暂停、每 300 帧，一场在同一房间里打了 300 帧以内的 Boss 战可能整场连同 Boss 死亡都不在文件里（phase10-scenarios s2-k4：录下 420 帧，强杀在约 503 帧）。要缩小就改 `main.lua` 的 flush 周期（代价是 IO）。
+- 强杀/崩溃丢失最后一次 flush 之后的数据：0.5.0 起每 30 帧 flush，最多约 1 秒（0.4.x 每 300 帧，phase10-scenarios s2-k4 录下 420 帧、强杀在约 503 帧）；另外 256 KB 写缓冲满了时 C 库自己写出，可能留半行（第 4 节）。
+- 进房扫描（`room_scan`）本身出错时，下一帧重新扫描：这时网格可能比进房时新，在下一次每 15 帧全扫之前，录制端 digest 第 3 层（含网格签名）可能与回放不同（phase13 实测见 NOTES）；拼行出错、观测出错、帧行写失败都没有这个问题。帧行写失败（磁盘满等）会丢掉那一帧的输入（帧号缺口），这一局不可能精确回放，`data_ok = false`。
+- 开局存档拷贝只拷 `gamestate1-3.dat`、`persistentgamedata1-3.dat`、`options.ini`（`IRR_SAVE_FILES` 可改）；日期前缀的备份文件、崩溃日志不拷（回放不读它们）。`--recover` 补写的会话没有 `game_exit`（游戏怎么结束的不知道），已死的启动器在线做的 Python 核对快照若没写进清单就没有。
 - 录制结束在换房/换层过场里时，最后一帧之后那条 room/level 行回放不会产生，`compare` 也不看它（新层布局没被校验，无害）。
 - 开局暂停（8.9）只复现"开局窗口里引擎认为暂停"这一点；它假定录制里从读档到 `MC_POST_GAME_STARTED` 一直暂停（控制台开着）。只在这段时间的一部分暂停（例如加载中途关掉控制台）的情况不能表达，未见到也未测。机器人"回车后 50 ms 就按 Esc"的 rewind 续局实测仍是开局暂停。
 - 同一帧窗口里有两次控制台暂停（phase12 e3-familiars run-0001：开局后第一次逻辑更新之前连敲两条 `giveitem`）：回放没有复现第二次，第 1 帧分歧（`menu_pause_not_replayed`）。与开局暂停无关，未处理。

@@ -224,8 +224,38 @@ local function take_snew()
 	if #C.snew == 0 then return nil end
 	local s = concat(C.snew, ",")
 	C.snew = {}
+	-- 0.5.0：记下本次（一帧/一条 room 行）取走的条目；这一行最终没写出（构建出错）时由 requeue_taken 放回
+	local t = C.sd_taken
+	if t then t[#t + 1] = s end
 	return s
 end
+-- 0.5.0（重建安全）：每次构建一条可能出错的行之前调用（清空"已取走"记录）
+function M.begin_frame() C.sd_taken = {} end
+-- 构建出错：本次已取走、但所在行没写出的字典条目放回待写队列（下一条写出的行里给出），否则后面引用这些 id 的行解不出字符串
+function M.requeue_taken()
+	local t = C.sd_taken or {}
+	if #t > 0 then
+		local q = {}
+		for _, s in ipairs(t) do q[#q + 1] = s end
+		for _, s in ipairs(C.snew) do q[#q + 1] = s end
+		C.snew = q
+	end
+	C.sd_taken = {}
+end
+-- 退化帧行用：取走全部待写条目（concat 后的串或 nil）
+function M.take_sd()
+	local s = take_snew()
+	C.sd_taken = {}
+	return s
+end
+-- 出错之后：道具清单的"上次写出"记录作废（下一关键帧重写全部玩家的道具行）。玩家/实体/外观由强制关键帧重置，
+-- 网格/门/精灵由补写的 room 行（resync）重置
+function M.invalidate()
+	C.items_list = {}
+	C.items_sig = {}
+end
+-- 测试用故障注入点（main.lua 在设了 IRR_FAULT 时赋值；kind = "frame" / "room"）
+M.fault = nil
 
 local function q100(v)
 	if v == nil or v ~= v or v > 1e13 or v < -1e13 then return nil end
@@ -433,10 +463,15 @@ function M.level_line(n)
 		',"rooms":[', concat(rows, ","), ']}'})
 end
 
-function M.room_line(n)
-	local room, level = game:GetRoom(), game:GetLevel()
-	local function g(fn) local ok, v = pcall(fn); if ok then return v end return nil end
-	local desc = g(function() return level:GetCurrentRoomDesc() end)
+-- room 行分两步（0.5.0）：
+--   room_scan(n)：扫描房间，更新网格/门/精灵的差分基准（C.grid、C.doors、签名、rescan_at、C.gspr/dspr）——进房时做一次；
+--   room_emit(n, tag)：只读这些基准 + 房间元数据，拼出 room 行（不改基准）。
+-- tag：nil = 进房/开局时写的 room 行；"retry" = 进房那次没写出、下一帧补写的进房行（扫描成功只补 emit，基准与没出错时完全相同；
+-- 扫描本身出错才在下一帧重新扫描）；"resync" = 上一帧观测出错后补写的同一房间完整行：只 emit 当前基准（不重新扫描、不改
+-- rescan 相位），于是读取端的网格/门/精灵基准与录制端内部基准一致，录制端的 digest 与没出错时逐位相同。
+-- 普通 room 行的字节与 0.4.x 相同。
+function M.room_scan(n)
+	local room = game:GetRoom()
 	C.grid = grid_scan(room)
 	C.grid_keys = {}
 	for i, r in pairs(C.grid) do
@@ -447,7 +482,6 @@ function M.room_line(n)
 	C.doors = door_rows(room)
 	C.grid_sig = sig_of(C.grid)
 	C.door_sig = sig_of(C.doors)
-	local tl, br = room:GetTopLeftPos(), room:GetBottomRightPos()
 	-- v2：网格精灵与门精灵（进房时全量；之后只写变化，见 frame_parts 的 gs/ds）
 	C.gspr, C.dspr, C.dpre = {}, {}, {}
 	local gidx = {}
@@ -455,9 +489,19 @@ function M.room_line(n)
 	table.sort(gidx)
 	grid_spr_scan(room, gidx)
 	door_spr_changes(room, true)
+	if M.fault then M.fault("roomscan") end
+end
+
+function M.room_emit(n, tag)
+	local room, level = game:GetRoom(), game:GetLevel()
+	local function g(fn) local ok, v = pcall(fn); if ok then return v end return nil end
+	local desc = g(function() return level:GetCurrentRoomDesc() end)
+	local tl, br = room:GetTopLeftPos(), room:GetBottomRightPos()
 	local gs_rows, ds_rows = sorted_rows(C.gspr), sorted_rows(C.dspr)
 	local sd = take_snew()
+	if M.fault then M.fault("room") end
 	return concat({'{"k":"room","n":', n, ',"gf":', game:GetFrameCount(),
+		tag and (',"' .. tag .. '":1') or '',
 		',"room_index":', level:GetCurrentRoomIndex(),
 		',"desc":', desc and desc_row(desc) or "null",
 		',"seeds":[', room:GetSpawnSeed(), ',', room:GetDecorationSeed(), ',', room:GetAwardSeed(), ']',
@@ -471,6 +515,11 @@ function M.room_line(n)
 		',"doors":[', concat(sorted_rows(C.doors), ","), ']',
 		sd and (',"sd":[' .. sd .. ']') or '',
 		',"grid_spr":[', concat(gs_rows, ","), '],"door_spr":[', concat(ds_rows, ","), ']}'})
+end
+
+function M.room_line(n, tag)
+	M.room_scan(n)
+	return M.room_emit(n, tag)
 end
 
 ------------------------------------------------------------------ 道具清单
@@ -705,7 +754,7 @@ local function copy_tbl(t) local o = {}; for k, v in pairs(t) do o[k] = v end; r
 function M.frame_parts(n, buf, kf, omit_e, dry)
 	local saved = nil
 	if dry then
-		saved = {sdict = copy_tbl(C.sdict), snext = C.snext, snew = copy_tbl(C.snew), prev_pa = C.prev_pa, prev_ea = C.prev_ea,
+		saved = {sdict = copy_tbl(C.sdict), snext = C.snext, snew = copy_tbl(C.snew), sd_taken = copy_tbl(C.sd_taken or {}), prev_pa = C.prev_pa, prev_ea = C.prev_ea,
 			fcache = copy_tbl(C.fcache), pfcache = copy_tbl(C.pfcache), gspr = copy_tbl(C.gspr), dspr = copy_tbl(C.dspr), dpre = copy_tbl(C.dpre)}
 	end
 	M.frame_parts_inner(n, buf, kf, omit_e)
@@ -846,6 +895,8 @@ function M.frame_parts_inner(n, buf, kf, omit_e)
 	if gsc then buf[#buf + 1] = ',"gs":[' .. concat(gsc, ",") .. "]" end
 	if dsc then buf[#buf + 1] = ',"ds":[' .. concat(dsc, ",") .. "]" end
 	L3[#L3 + 1] = spack("<jj", C.grid_sig, C.door_sig)
+	-- 测试用故障注入（IRR_FAULT=frame:<n>）：放在全部差分基准（玩家/实体/外观/网格/门/精灵/字典）都已更新之后，是最坏情况
+	if M.fault then M.fault("frame") end
 
 	local d1 = hash(concat(L1))
 	local d2 = hash(concat(L2), d1)

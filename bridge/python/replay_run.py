@@ -138,7 +138,7 @@ def menu_pauses(run):
         o = run.frame_obj(n)
         ticks = {}
         kmax = 0
-        for e in o['tk']:
+        for e in o.get('tk', []):
             kind = e if isinstance(e, str) else e[0]
             j = tick_index(kind)
             if j is not None:
@@ -181,7 +181,10 @@ def continue_start_players(run: load_run.Run):
     names = (run.header.get('fields') or {}).get('player') or []
     ix, iy = (names.index('x'), names.index('y')) if 'x' in names and 'y' in names else (None, None)
     out = []
-    for p in run.frame(1).players:
+    f1 = run.frame(1) if 1 in run.frame_line else None
+    if f1 is None or f1.players is None:   # 第 1 帧是退化帧（0.5.0）：没有位置可钉
+        return []
+    for p in f1.players:
         raw = p.get('_raw')
         if raw is not None and ix is not None:
             x100, y100 = int(raw[ix]), int(raw[iy])   # 玩家行的整数原值（定点 x100）
@@ -196,7 +199,7 @@ def mouse_stream(run: load_run.Run):
     mod 的 ms 只在变化时记，第一条总会记），per_frame = {n: [[r, sx100, sy100, buttons], ...]}（其余条目，坐标为定点原值）。
     没有任何 ms 条目时返回 (None, {})。"""
     init, per = None, {}
-    for n in range(1, run.frames + 1):
+    for n in sorted(run.frame_line):
         o = json.loads(run.lines[run.frame_line[n]])
         for m in o.get('ms') or ():
             e = [int(m[0]), int(m[1]), int(m[2]), int(m[5])]
@@ -367,7 +370,7 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
     seed = h['meta']['seeds']['start_seed_string']
     salts = mt_salts(h)
     start = 'menu:continue' if h.get('continued') else 'seed ' + seed
-    lines = ['return {', f'start = {lua_value(start)},', f'frames = {run.frames},',
+    lines = ['return {', f'start = {lua_value(start)},', f'frames = {run.last_n},',
              f'source = {lua_value(str(run.path))},']
     if salts:
         lines.append('mt = {' + ','.join(f'{k} = {int(v)}' for k, v in sorted(salts.items())) + '},')
@@ -393,10 +396,10 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
     occ_gf, occ = None, {}
     cmds = {}
     extras = {}  # 实验（--inject-extras）：录制里非玩家 12 动作的非零查询 {n: {kind: [[hook, action, who, value], ...]}}
-    for n in range(1, run.frames + 1):
+    for n in sorted(run.frame_line):
         o = json.loads(run.lines[run.frame_line[n]])
         per = []
-        for e in o['tk']:
+        for e in o.get('tk', []):
             if isinstance(e, list) and len(e) > 2 and e[2]:
                 if inject_extras:
                     extras.setdefault(n, {}).setdefault(e[0], []).extend(e[2])
@@ -406,7 +409,7 @@ def build_replay_table(run: load_run.Run, path_out, inject_pauses=True, align_en
                     rs = [x for x in e[2] if x[1] == ACTION_RESTART]
                     if rs:
                         extras.setdefault(n, {}).setdefault(e[0], []).extend(rs)
-        for e in o['tk']:
+        for e in o.get('tk', []):
             if isinstance(e, list) and e[1]:
                 pl = []
                 for pnum, triples in e[1]:
@@ -521,6 +524,11 @@ def replayability(run: load_run.Run, continue_save=None):
     if cons:
         issues.append(f'{len(cons)} 条控制台命令（ev cmd src=console）：回放在同一帧窗口执行，控制台暂停用同一 tick 的菜单暂停'
                       '复现（README §8.7；--no-menu-pause 时不复现，控制台在本应做逻辑更新的那次轮询打开的帧会分歧）')
+    # 0.5.0（phase13）：输入缺失/帧号缺口 = 那几帧的输入没有，回放不可能精确；退化帧只缺观测，输入完整
+    if run.input_missing_frames or run.frame_gaps:
+        issues.append(f'输入不完整：输入缺失帧 {run.input_missing_frames[:5]}、帧号缺口 {run.frame_gaps[:5]}，回放不可能精确')
+    if run.degraded_frames:
+        issues.append(f'退化帧 {len(run.degraded_frames)}（观测缺省、输入完整）：比较时跳过这些帧的 digest，MT 照比')
     unknown = [d for d in api_records(run) if d.get('src') in (None, '?')]
     if unknown:
         issues.append(f'{len(unknown)} 个来源不明的第三方调用（api 行 src="?"，例如 {unknown[0].get("m")}，'
@@ -621,8 +629,11 @@ def compare(rec_path, rep_path):
     tick_diff = None
     death = dict(record=None, replay=None)
     mouse_first, mouse_count = None, 0   # phase8-mouse：回放局自己读到的鼠标流与录制逐帧比较（诊断，不进 exact）
+    degraded_skipped, misaligned = [], 0
     for _ in range(n):
         fa, fb = next(ia), next(ib)
+        if fa.n != fb.n:
+            misaligned += 1   # 录制有帧号缺口（0.5.0 的 frame_gaps）：逐帧配对错位
         if fa.mt is None or fb.mt is None:
             mt_missing += 1
         elif [int(x) for x in fa.mt[:2]] != [int(x) for x in fb.mt[:2]]:  # 第三个数（读的次数）不比
@@ -630,6 +641,13 @@ def compare(rec_path, rep_path):
             if mt_first is None:
                 mt_first = fa.n
                 examples['mt'] = dict(frame=fa.n, record=fa.mt, replay=fb.mt)
+        if fa.degraded or fb.degraded or fa.digest is None or fb.digest is None:
+            # 退化帧（0.5.0：观测构建出错，输入/MT 照写）：没有 digest 可比，只比 MT 与 tick
+            degraded_skipped.append(fa.n)
+            if tick_diff is None and [(t.kind, t.inputs) for t in fa.ticks] != [(t.kind, t.inputs) for t in fb.ticks]:
+                tick_diff = dict(frame=fa.n, record=[t.kind for t in fa.ticks][:14], replay=[t.kind for t in fb.ticks][:14],
+                                 n_record=len(fa.ticks), n_replay=len(fb.ticks))
+            continue
         for li, layer in enumerate(LAYERS):
             if int(fa.digest[li]) != int(fb.digest[li]):
                 counts[layer] += 1
@@ -637,7 +655,7 @@ def compare(rec_path, rep_path):
                     firsts[layer] = fa.n
                     examples[layer] = dict(frame=fa.n, gf_record=fa.gf, gf_replay=fb.gf, diff=explain(fa, fb, layer))
         # 0.01 定点口径（解码后）：玩家与房间
-        if fixed_first['player_room'] is None and (fa.room_frame != fb.room_frame or
+        if fixed_first['player_room'] is None and fa.players is not None and fb.players is not None and (fa.room_frame != fb.room_frame or
                                                   [strip(p) for p in fa.players] != [strip(p) for p in fb.players]):
             fixed_first['player_room'] = fa.n
         if fa.mouse != fb.mouse:
@@ -680,8 +698,17 @@ def compare(rec_path, rep_path):
                                                      or res['record_truncated']))
     # E6：三层 + MT 全部 0 分歧、同长度、结束方式相容、MT 每帧都有、reseed 记录一致
     # phase11：开局元数据（角色/难度/挑战/贪婪）也要相同（0 帧局没有帧可比，角色选错也查得出来）
+    # 0.5.0（phase13）：录制里的退化帧没有 digest，这些帧只比 MT 与 tick（degraded_skipped 列出）；录制有帧号缺口/输入缺失时
+    # 逐帧配对错位或输入不全，exact 一律 False
+    res['degraded_skipped'] = degraded_skipped
+    res['record_data'] = dict(degraded_frames=A.degraded_frames, input_missing_frames=A.input_missing_frames,
+                              frame_gaps=A.frame_gaps, suspect_frames=A.suspect_frames[:50])
+    res['misaligned_frames'] = misaligned
     res['exact'] = (all(firsts[k] is None for k in LAYERS) and mt_first is None and mt_missing == 0 and same_len
-                    and res['end_compatible'] and res['mt']['reseeds_match'] is True and res['start_meta_match'])
+                    and res['end_compatible'] and res['mt']['reseeds_match'] is True and res['start_meta_match']
+                    and misaligned == 0 and not A.input_missing_frames and not A.frame_gaps)
+    res['exact_note'] = (f'录制有 {len(degraded_skipped)} 个退化帧：这些帧没有 digest，只比了 MT 与 tick'
+                         if degraded_skipped and res['exact'] else None)
     res['pause_report'] = pause_report(A, B, firsts, mt_first)
     # phase12：录制开局时暂停（控制台开着）而回放没能在开局窗口暂停（旧 DLL 没有 RRMT_ForcePause 等）→ 已知类别
     res['start_paused'] = start_paused_report(A, B)
@@ -887,6 +914,15 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
         init_from, exclude = continue_save, ()
     else:
         init_from, exclude = init_save, ('gamestate1.dat',)
+    # phase13 P2：快照是不是"这一局开局时"的存档（0.5.0 的快照看 manifest；旧会话按开局信号推断）
+    snap_status = rr.snapshot_status(init_from) if init_from else None
+    if snap_status and snap_status.get('late'):
+        msg = ('[回放] 警告：开局存档快照晚了（可能是后来的局写过的存档，回放可能分歧）：'
+               + '；'.join(snap_status.get('reasons') or []))
+        print(msg, flush=True)
+        issues.append(msg)
+    elif snap_status and snap_status.get('late') is None:
+        print('[回放] 提示：无法判断开局存档快照是否晚了：' + '；'.join(snap_status.get('reasons') or []), flush=True)
     # 回放进程没人看着：失焦暂停会让回放停住（真人会话 20261106-human1 的第一次回放在第 1068 帧因此被判 stalled），所以强制关掉
     sess = rr.Session(name, out_root, copy_root=copy_root, raw_policy='keep', use_dll=use_dll,
                       init_save_from=init_from, init_save_exclude=exclude, extra_env=replay_env(turbo, mouse and use_dll, affinity if use_dll else None),
@@ -905,7 +941,7 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
         restore_disabled_mods(sess.copy, placed, sess.dir / 'disabled-mods')
         raise
     # 录制以死亡结束时多给 90 帧，让回放局自己走到 MC_POST_GAME_END（比较"是否同帧死亡"）
-    limit_frames = run.frames + (90 if (run.end or {}).get('reason') == 'death' else 0)
+    limit_frames = run.last_n + (90 if (run.end or {}).get('reason') == 'death' else 0)
     ctl = dict(purpose='replay', source=str(rec_path))
     if continued:
         # 续局：本进程第一个开出的局（菜单 Enter 续上的局）就是回放局
@@ -915,7 +951,7 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
                 affinity=hex(affinity_mask(affinity)) if use_dll and affinity_mask(affinity) else None,
                 continue_save=str(continue_save) if continue_save else None, copy=str(sess.copy.root),
                 turbo=turbo or 'off', init_save=str(init_save) if init_save and not continued else None,
-                api_mods=list(api_set), mods_disabled=placed)
+                api_mods=list(api_set), mods_disabled=placed, save_snapshot_status=snap_status)
     stall_s = STALL_S['turbo' if turbo else 'off']
     try:
         # 放在 try 里：建表失败也要走 finish()（还原 options.ini、停监视线程、写 session.json）
@@ -1061,6 +1097,8 @@ def build_watch_timeline(run: load_run.Run, path_out):
         levels.append(dict(n=n, stage=o.get('stage'), stage_type=o.get('stage_type'), name=o.get('name') or ''))
     for ln, n in run.room_lines:
         o = json.loads(run.lines[ln])
+        if o.get('resync'):   # 0.5.0：出错后补写的同一房间完整行，不是换房
+            continue
         desc = o.get('desc') or []
         rooms.append(dict(n=n, idx=o.get('room_index'), type=o.get('type'), shape=o.get('shape'),
                           name=desc[10] if len(desc) > 10 and isinstance(desc[10], str) else ''))
@@ -1117,11 +1155,10 @@ def restore_init_save(sess, k):
             shutil.move(str(f), str(disp / f.name))
             moved.append(f.name)
     if sess.init_save_from:
-        for f in sorted(sess.init_save_from.iterdir()):
-            if (f.is_file() and f.suffix.lower() != '.dmp' and f.name.lower() not in ('log.txt', 'manifest.json')
-                    and f.name.lower() not in sess.init_save_exclude):
-                shutil.copy2(f, sd / f.name)
-                copied.append(f.name)
+        for nm, f in rr.snapshot_files(sess.init_save_from).items():   # 新（save/blobs 去重）旧两种布局
+            if nm.lower() not in sess.init_save_exclude:
+                shutil.copy2(f, sd / nm)
+                copied.append(nm)
     opt = sd / 'options.ini'
     if opt.exists() and sess.enforce_options:
         rr.set_options(opt, sess.forced_options)
