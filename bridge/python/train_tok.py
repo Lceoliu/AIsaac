@@ -3572,20 +3572,19 @@ def main(argv=None, child=None, actor=None):
         if block_on:
             from isaac_bridge import block_learner as blearn
 
-        # B60: every epoch's permutation drawn before the first epoch (the only CUDA generator draws of the update,
-        # consecutive as before), so the next epoch's first PPO part can be prepared while this epoch's last one
-        # runs; the teacher / teacher-v2 draws a prefetch makes ahead are kept per epoch (pre_by_ep), still drawn in
-        # the minibatches' order (nothing else draws from numpy's generator or v2_rng in between)
+        # B60: the next epoch's first PPO part prepared while this epoch's last one runs: its permutation drawn then
+        # (EpochPerms: the same place relative to the history draws on the default CPU generator as before), the
+        # teacher / teacher-v2 draws a prefetch makes ahead kept per epoch (pre_by_ep), still drawn in the
+        # minibatches' order (nothing else draws from numpy's generator or v2_rng in between)
         ahead_ = block_on and blearn.PREFETCH_ON and not mem_on
-        perms_ = [torch.randperm(n_units, device=device) for _ in range(args.epochs)] if ahead_ else None
-        perms_h_ = [p_.cpu().numpy() for p_ in perms_] if ahead_ else None
+        eperms = blearn.EpochPerms(n_units, device) if ahead_ else None
         pre_by_ep = {}
         ep_now = [0]
 
         def first_part(ep2, at2):
             """B60: (lo, last, chunk ids, merged?, v2 merged?, picks, v2 picks) of minibatch at2's first part in
             epoch ep2; its teacher / v2 draws made now and kept for that minibatch."""
-            ph_ = perms_h_[ep2] if perms_h_ is not None else perm_h
+            ph_ = eperms.get(ep2)[1] if eperms is not None else perm_h
             tc2 = ph_[at2:at2 + mb_units]
             b2 = temporal_bounds(tch, tc2, args.micro or int(tch[tc2, 1].sum()))
             lo2, _, cids2 = b2[0]
@@ -3619,11 +3618,11 @@ def main(argv=None, child=None, actor=None):
             later = [a_ for a_ in mb_ats if a_ > at_]
             if later:
                 return part_chunks(*first_part(ep_now[0], later[0]))
-            if perms_h_ is not None and ep_now[0] + 1 < args.epochs and mb_ats:
+            if eperms is not None and ep_now[0] + 1 < args.epochs and mb_ats:
                 return part_chunks(*first_part(ep_now[0] + 1, mb_ats[0]))
             return []
         if ahead_ and n_units:   # B60: the update's first PPO part prepared before the first epoch starts
-            mb_ats = [a_ for a_ in range(0, n_units, mb_units) if len(perms_h_[0][a_:a_ + mb_units]) >= mb_units // 4]
+            mb_ats = [a_ for a_ in range(0, n_units, mb_units) if len(eperms.get(0)[1][a_:a_ + mb_units]) >= mb_units // 4]
             if mb_ats:
                 blearn.PREFETCH.submit(learner_model, part_chunks(*first_part(0, mb_ats[0])),
                                        max_rows=args.micro or args.minibatch, version=L['update'],
@@ -3637,8 +3636,8 @@ def main(argv=None, child=None, actor=None):
                 if PROFILE:
                     torch.cuda.current_stream().synchronize()
                 U['temporal'] += time.perf_counter() - t_t0
-            if perms_ is not None:   # (B60: drawn before the first epoch)
-                perm, perm_h = perms_[ep_], perms_h_[ep_]
+            if eperms is not None:   # (B60: drawn here, or at the previous epoch's last part)
+                perm, perm_h = eperms.get(ep_)
             else:
                 perm = torch.randperm(n_units, device=device)
                 perm_h = perm.cpu().numpy()

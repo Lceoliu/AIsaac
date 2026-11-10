@@ -5,8 +5,11 @@ loops that hold the GIL, competing with the learner thread and the rollout consu
 in C, called through ctypes.CDLL (the GIL is released for the whole call):
 
 * decode(parts)            structured_input.decode_frames_compact(parts, packed=True), byte for byte;
-* concat(pieces, out, ...) block_learner._fill_merged's concatenation into the pinned staging slab;
-* pages(store_pages, ids, out) PagedStore._gather's page rows.
+* concat(pieces, out, ...) block_learner._fill_merged's concatenation into the pinned staging slab.
+
+Page gathers (N3) stay in Python here: on the cpp-actor line the page store is native (abp_actor.cpp owns the pages);
+N3 is written against it after that line is merged, with the invariant that the pages a learner part reads are
+immutable and not recycled for the whole update.
 
 ISAAC_BLOCK_NATIVE_PACK=0 (or no gcc) keeps the Python reference everywhere. The library is built from the
 repository's source on first use into a per-user cache keyed by the source's hash (as visible_native).
@@ -23,7 +26,7 @@ import numpy as np
 
 SOURCE = Path(__file__).resolve().parents[2] / 'engine' / 'abp_learn.c'
 ENABLED = os.environ.get('ISAAC_BLOCK_NATIVE_PACK', '1') != '0'
-VERSION = 6001
+VERSION = 6002
 _LIB = {}
 _LOCK = threading.Lock()
 P, L = ctypes.c_void_p, ctypes.c_long
@@ -74,9 +77,6 @@ class Library:
         self.concat_ = lib.abp_learn_concat
         self.concat_.argtypes = [L, P, P, P, L]
         self.concat_.restype = None
-        self.pages_ = lib.abp_learn_pages
-        self.pages_.argtypes = [L, P, L, L, P, L, P]
-        self.pages_.restype = L
         self.path = path
 
 
@@ -188,21 +188,3 @@ def concat(pieces, out, zero_rows=0):
     if int(nb.sum())+zero_rows*row > out.nbytes:
         raise ValueError('concat: pieces larger than the destination')
     lib.concat_(n, _addr(src), _addr(nb), _addr(out), zero_rows*row)
-
-
-def pages(page_tensors, ids, rows_per_page, out):
-    """PagedStore._gather into out (a contiguous CPU tensor [len(ids), ...]); False when the library is unavailable
-    (the caller runs the reference)."""
-    lib = load()
-    if lib is None or not out.is_contiguous() or any(not p.is_contiguous() or p.dtype != out.dtype or
-                                                     p.shape[1:] != out.shape[1:] for p in page_tensors):
-        return False
-    ids = np.ascontiguousarray(ids, np.int64)
-    if not len(ids):
-        return True
-    ptrs = np.fromiter((p.data_ptr() for p in page_tensors), np.uint64, len(page_tensors))
-    row = out.element_size()*int(np.prod(out.shape[1:], dtype=np.int64))
-    bad = lib.pages_(len(ids), _addr(ids), int(rows_per_page), len(page_tensors), _addr(ptrs), row, out.data_ptr())
-    if bad >= 0:
-        raise IndexError(f'page row {int(ids[bad])} outside the store')
-    return True

@@ -1,9 +1,9 @@
 """B60: the learner's host packing in C (learn_native, bridge/engine/abp_learn.c) gives the Python reference's bytes:
 frame decodes (ROW records and frame arenas, several parts, one-row parts, empty lists), invalid headers (the
-reference's error), the slab concatenation (other dtypes, strided pieces), page gathers, and a whole prepared learner
+reference's error), the slab concatenation (other dtypes, strided pieces), and a whole prepared learner
 part (_prepare_packed: every slab region byte for byte, and the same plans / index metadata).
 
-Each test runs on the compiled library when gcc is available ('c') and on an emulation of its four functions in
+Each test runs on the compiled library when gcc is available ('c') and on an emulation of its functions in
 Python over the same addresses ('emulated': checks the wrapper's address and size arithmetic where no compiler is)."""
 import ctypes
 import types
@@ -23,7 +23,7 @@ def _i64(addr, n):
 
 
 class Emulated:
-    """abp_learn.c's four functions in Python, reading and writing the same addresses."""
+    """abp_learn.c's functions in Python, reading and writing the same addresses."""
     path = 'emulated'
 
     def scan(self, m, head, schema, size, avail, version, fixed, pf, pl, ef, nf, sf, frame_bytes, counts):
@@ -70,15 +70,6 @@ class Emulated:
             at += int(nbytes[i])
         if zero > 0:
             ctypes.memset(at, 0, zero)
-
-    def pages_(self, n, ids, rows_per_page, n_pages, pages, row_bytes, out):
-        ids, pages = _i64(ids, n), _i64(pages, n_pages)
-        for i in range(n):
-            if ids[i] < 0 or ids[i]//rows_per_page >= n_pages:
-                return i
-            ctypes.memmove(out+i*row_bytes, int(pages[ids[i]//rows_per_page])+int(ids[i] % rows_per_page)*row_bytes,
-                           row_bytes)
-        return -1
 
 
 def _variants():
@@ -166,22 +157,6 @@ def test_concat_equals_reference_assignment(lib):
         learn_native.concat([np.zeros((4, 7), np.float32)], np.zeros((3, 7), np.float32))
 
 
-@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
-def test_pages_equal_store_gather(lib, dtype):
-    P = 8
-    pages = [torch.randn(P, 3, 5).to(dtype) for _ in range(4)]
-    ids = np.array([0, 31, 9, 9, 17, 2, 24], np.int64)
-    ref = torch.empty((len(ids), 3, 5), dtype=dtype)
-    bp.PagedStore._gather(types.SimpleNamespace(page=P), pages, ids, (3, 5), dtype, ref)
-    got = torch.empty_like(ref)
-    assert learn_native.pages(pages, ids, P, got)
-    assert got.view(torch.uint8).numpy().tobytes() == ref.view(torch.uint8).numpy().tobytes()
-    assert learn_native.pages(pages, ids[:0], P, got[:0])
-    with pytest.raises(IndexError):
-        learn_native.pages(pages, np.array([32]), P, got[:1])
-    assert not learn_native.pages(pages, ids, P, torch.empty((len(ids), 3, 5), dtype=torch.float64))
-
-
 def _fresh(chunks):
     for c in chunks:
         c.__dict__.pop('_host', None)
@@ -199,8 +174,9 @@ def test_prepared_part_equals_reference_byte_for_byte(lib, monkeypatch):
         monkeypatch.setattr(block_learner, 'NATIVE_PACK', native)
         _fresh(batch)
         gen = torch.Generator().manual_seed(11)
-        P = block_learner._prepare_packed(m, batch, True, generator=gen, version=2, history_mode='random',
-                                          max_rows=4096, packed=True)
+        with block_learner.PREP_LOCK:
+            P = block_learner._prepare_packed(m, batch, True, generator=gen, version=2, history_mode='random',
+                                              max_rows=4096, packed=True)
         raw = P['slab'].base.numpy()
         regions = {k: bytes(raw[at:at+n]) for k, (at, n, _, _) in P['slab'].layout.items()}
         preps.append((P, regions))
@@ -240,3 +216,150 @@ def test_prefetch_queue_order_skips_and_drop(monkeypatch):
     assert Q.submit(m, a, **kw)
     Q.drop()
     assert Q.job is None and Q.misses-d0 == 2
+
+
+def test_decode_outside_prep_lock_is_refused():
+    from test_block_packed_learner import _rollout_and_teacher
+    _, chunks, _ = _rollout_and_teacher('cpu', seed=44)
+    _fresh(chunks)
+    with pytest.raises(RuntimeError, match='PREP_LOCK'):
+        block_learner._host_decode(chunks, True)
+    with block_learner.PREP_LOCK:
+        assert len(block_learner._host_decode(chunks, True)) == len(chunks)
+
+
+def test_cache_eviction_during_fill_keeps_the_bytes(lib, monkeypatch):
+    """The decode caches dropped (as PagedStore.collect / a new update do, from other threads) right before each
+    C concatenation: the preparation's own references keep every array alive, the slab is the reference's."""
+    import gc
+    from test_block_packed_learner import _rollout_and_teacher
+    m, chunks, teach = _rollout_and_teacher('cpu', seed=45)
+    m.train()
+    batch = chunks+teach
+    store = batch[0].snapshot.store
+    concat = learn_native.concat
+
+    def evicting(pieces, out, zero_rows=0):
+        store.decoded = {}
+        bp.clear_decode_cache()
+        for c in batch:
+            c.__dict__.pop('_host', None)
+        gc.collect()
+        return concat(pieces, out, zero_rows)
+    got = []
+    for native in (False, True):
+        monkeypatch.setattr(block_learner, 'NATIVE_PACK', native)
+        monkeypatch.setattr(learn_native, 'concat', evicting if native else concat)
+        _fresh(batch)
+        with block_learner.PREP_LOCK:
+            P = block_learner._prepare_packed(m, batch, True, generator=torch.Generator().manual_seed(3), version=2,
+                                              max_rows=4096, packed=True)
+        raw = P['slab'].base.numpy()
+        got.append({k: bytes(raw[at:at+n]) for k, (at, n, _, _) in P['slab'].layout.items()})
+    assert got[0] == got[1]
+
+
+def test_epoch_permutations_and_history_draws_equal_the_serial_order(monkeypatch):
+    """B60 EpochPerms with the prefetch queue running (the next epoch's first part queued while this epoch's last part
+    runs, the update's first part before the first epoch): with a fixed seed, the three permutations and every part's
+    history draws (both from the default CPU generator, as torch.randperm(n < 30000, device=cuda) is) equal the
+    serial learner's, element for element."""
+    from test_block_packed_learner import _rollout_and_teacher
+    from isaac_bridge.block_training import forward_bucketed
+    m, chunks, _ = _rollout_and_teacher('cpu', seed=43)
+    m.train()
+    monkeypatch.setattr(block_learner, 'PACKED', True)
+    units = list(chunks)
+    n = len(units)
+    mb = max(2, n//3)
+    rec = []
+    orig = block_learner._prepare_packed
+
+    def spy(*a, **k):
+        P = orig(*a, **k)
+        rec.append([x.tolist() for x in P['selected']])
+        return P
+    monkeypatch.setattr(block_learner, '_prepare_packed', spy)
+    kw = dict(version=1, max_rows=4096)
+
+    def parts_of(ph):
+        return [[units[i] for i in ph[a:a+mb]] for a in range(0, n, mb)]
+
+    def run(ahead):
+        rec.clear()
+        torch.manual_seed(5)
+        perms = []
+        Q = block_learner.PREFETCH
+        if not ahead:
+            for e in range(3):
+                p_ = torch.randperm(n)
+                perms.append(p_.tolist())
+                for part in parts_of(p_.numpy()):
+                    forward_bucketed(m, part, **kw)
+        else:
+            ep = block_learner.EpochPerms(n, 'cpu')
+            h0 = Q.hits
+            Q.submit(m, parts_of(ep.get(0)[1])[0], **kw)
+            for e in range(3):
+                p_, ph = ep.get(e)
+                perms.append(p_.tolist())
+                ps = parts_of(ph)
+                for k, part in enumerate(ps):
+                    forward_bucketed(m, part, **kw)
+                    if k+1 < len(ps):
+                        Q.submit(m, ps[k+1], **kw)
+                    elif e+1 < 3:
+                        Q.submit(m, parts_of(ep.get(e+1)[1])[0], **kw)
+            assert Q.job is None and Q.hits-h0 == 3*len(parts_of(ph))
+        return perms, [list(r) for r in rec]
+    serial, queued = run(False), run(True)
+    assert serial[0] == queued[0]
+    assert serial[1] == queued[1] and any(any(len(x) for x in r) for r in serial[1])
+
+
+def test_update_parameters_bit_identical_native_on_off(monkeypatch):
+    """B60 equivalence (B44 / B48 standard): a fixed-input update (three parts, loss, backward, Adam step each, on
+    one CPU thread) with the packed host layout gives bit-identical losses and parameters with the C packing on
+    and off."""
+    from test_block_packed_learner import _rollout_and_teacher
+    from test_block_slot_integration import _losses
+    from isaac_bridge.block_training import forward_bucketed, source_rows
+    from isaac_bridge.structured_input import from_rows
+    if learn_native.load() is None:   # (the emulation is checked by the slab tests; this one runs the real C)
+        monkeypatch.setitem(learn_native._LIB, 'lib', Emulated())
+        monkeypatch.setattr(learn_native, 'ENABLED', True)
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    monkeypatch.setattr(block_learner, 'PACKED', True)
+    monkeypatch.setattr(block_learner, 'HOST_PACKED', True)
+    try:
+        res = []
+        for native in (False, True):
+            monkeypatch.setattr(block_learner, 'NATIVE_PACK', native)
+            m_, ch_, te_ = _rollout_and_teacher('cpu', seed=46)
+            batch = ch_+te_
+            _fresh(batch)
+            idx = np.array_split(np.arange(len(batch)), 3)
+            parts = [[batch[i] for i in ix] for ix in idx]
+            m_.train()
+            torch.manual_seed(0)
+            opt = torch.optim.Adam(m_.main_parameters(), lr=1e-3)
+            gen = torch.Generator().manual_seed(9)
+            losses = []
+            for part in parts:
+                out, _ = forward_bucketed(m_, part, generator=gen, version=3, max_rows=4096)
+                rows = source_rows([c.framed() for c in part]); pend = np.concatenate([c.pending for c in part])
+                loss = _losses(m_, out, from_rows(rows, 'cpu', pend), 3)
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+                opt.step()
+                losses.append(loss.detach().clone())
+            res.append((losses, {k: v.detach().clone() for k, v in m_.state_dict().items()}))
+        (la, pa), (lb, pb) = res
+        for x, y in zip(la, lb):
+            torch.testing.assert_close(x, y, rtol=0, atol=0)
+        assert pa.keys() == pb.keys()
+        for k in pa:
+            assert torch.equal(pa[k], pb[k]), k
+    finally:
+        torch.set_num_threads(threads)

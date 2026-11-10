@@ -2,8 +2,10 @@
 # B60 GPU stages, each <= 15 min under its own GPU_LOCK (taken only after the lock has been free, with no cpp-actor
 # chain / run script, train_tok, pytest or eval_tok, for 2 minutes in a row):
 #   A  the B60 CPU tests on this host (the compiled C library) + the fixed-input learner bench (b48 dump) variants
-#      n0p0b0 (Python packing, serial: the 10.95 s reference) n0p0b1 (+1 busy Python thread) n1p0b0 (C packing)
-#      n1p1b0 (C packing, pipelined as the learner) n1p1b1 (+1 busy thread), then one op-counting rep;
+#      n0p0b0 (Python packing, serial: the 10.95 s reference) n0p0b1 (+1 busy Python thread) n0p1b0 (Python,
+#      pipelined) n1p0b0 (C packing)
+#      n1p1b0 (C packing, pipelined as the learner) n1p1b1 (+1 busy thread) n1p1b1i100 (switch interval 100 us,
+#      diagnosis; the others 500 us as train_tok), then one op-counting rep;
 #   B  the full test gate;
 #   C  a 6-update short profile (prof2.sh) with ISAAC_LEARN_OPCOUNT=0: the learner's prefetch hits / drops across
 #      recompute groups and epochs, and the uc_* (thread CPU) columns; SIGINT to the train_tok main process only.
@@ -37,7 +39,7 @@ for S in "$@"; do
     echo "$(date '+%F %T') A tests rc=$? $(tail -1 $R/tests-b60-native.log)" >> $LOG
     cd $ROOT/$CODE/bridge/ops
     timeout 780 $PY b44_learner_bench.py $R/b48-dump/learner_inputs.pt --mode packed --reps 2 \
-      --variants n0p0b0,n0p0b1,n1p0b0,n1p1b0,n1p1b1 --pipeline --opcount --json $OUT/bench.json > $OUT/bench.log 2>&1
+      --variants n0p0b0,n0p0b1,n0p1b0,n1p0b0,n1p1b0,n1p1b1,n1p1b1i100 --pipeline --opcount --json $OUT/bench.json > $OUT/bench.log 2>&1
     echo "$(date '+%F %T') A bench rc=$?" >> $LOG
     ;;
   B)

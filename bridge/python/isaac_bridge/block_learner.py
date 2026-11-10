@@ -45,28 +45,64 @@ SPATIAL_CKPT = int(os.environ.get('ISAAC_LEARN_SPATIAL_CKPT', '1'))
 SPATIAL_ROWS = int(os.environ.get('ISAAC_LEARN_SPATIAL_ROWS', '4096'))
 
 
-PREP_LOCK = __import__('threading').Lock()   # (B48: one host preparation at a time: page store caches, staging)
+class _PrepLock:
+    """B48: one host preparation at a time (page store caches, staging); B60: knows its holder, so the decode paths
+    can check they run inside it (held_here())."""
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self.owner = None
+
+    def __enter__(self):
+        import threading
+        self._lock.acquire()
+        self.owner = threading.get_ident()
+        return self
+
+    def __exit__(self, *exc):
+        self.owner = None
+        self._lock.release()
+
+    def held_here(self):
+        import threading
+        return self.owner == threading.get_ident()
+
+
+# B60 lifecycle rules of the host preparation (the prefetch worker's and the learner thread's):
+# * every host decode (_host_decode, _block_decode, the open tails) runs inside PREP_LOCK: the prefetch worker
+#   prepares under it, and the learner thread prepares a part itself (a queue miss: forward_packed) only under it,
+#   so the two never decode or publish at once (_decode_compact checks it);
+# * DECODE_CACHE / a chunk's _host / store.decoded entries are published only after the decode that made them has
+#   returned, i.e. after the C gather filled every array (learn_native.decode returns only then);
+# * every numpy array handed to a C call is referenced from Python for the whole call: decode keeps the frame
+#   buffers and its index arrays alive across both calls; _fill_merged's pieces come from `hosts` lists that the
+#   preparation holds until the slab is filled, so a cache eviction on another thread (PagedStore.collect prunes
+#   store.decoded from the driver thread) only drops the cache's reference, never the arrays being copied.
+PREP_LOCK = _PrepLock()
 PREFETCH_ON = os.environ.get('ISAAC_LEARN_PREFETCH', '1') == '1'
-# B60: the host preparation's byte moving (frame decodes, slab fill, page gathers) in C outside the GIL
+# B60 test hook: the host decode layout when _prepare_packed is not told (None: packed on CUDA devices, as always;
+# True on the CPU runs the packed / C path there, for the CPU equivalence tests)
+HOST_PACKED = None
+# B60: the learner thread's wait for host packing on its critical path, per call (a prefetched part's remaining
+# preparation, or a part prepared on the learner thread itself); CRIT_LOG collects (grad, seconds, prefetched)
+# per forward_packed call when it is a list (benchmarks), else nothing is kept
+CRIT_LOG = None
+# B60: the host preparation's byte moving (frame decodes, slab fill) in C outside the GIL
 # (learn_native; ISAAC_BLOCK_NATIVE_PACK=0: the Python reference). Packed (CUDA) decodes only.
 from . import learn_native   # noqa: E402
 NATIVE_PACK = learn_native.ENABLED
 
 
 def _decode_compact(parts, packed):
-    """decode_frames_compact(parts, packed); B60: in C for packed decodes (the same bytes)."""
+    """decode_frames_compact(parts, packed); B60: in C for packed decodes (the same bytes). Inside PREP_LOCK only
+    (the lifecycle rules above)."""
+    if not PREP_LOCK.held_here():
+        raise RuntimeError('learner host decode outside PREP_LOCK')
     if packed and NATIVE_PACK:
         return learn_native.decode(parts)
     from .structured_input import decode_frames_compact
     return decode_frames_compact(parts, packed)
 
-
-def _pages(store, which, ids, out):
-    """store.kv / store.z / store.blocks (which) of ids into out; B60: in C (the same bytes)."""
-    if NATIVE_PACK and learn_native.pages(list(getattr(store, which+'_pages' if which != 'blocks' else 'b_pages')),
-                                          ids, store.page, out):
-        return out
-    return getattr(store, which)(ids, out=out)
 
 
 class Prefetch:
@@ -179,6 +215,25 @@ class Prefetch:
 
 
 PREFETCH = Prefetch()
+
+
+class EpochPerms:
+    """B60: the PPO epochs' minibatch permutations, drawn in epoch order, each at the latest when first needed:
+    get(e) draws every epoch up to e not drawn yet. torch.randperm(n, device=cuda) with n < 30000 (n_units is ~2,400)
+    runs on the CPU from the default CPU generator -- the generator the parts' history draws use as well (the
+    learner passes no generator) -- so an epoch's permutation must be drawn exactly where the serial learner drew it
+    relative to those draws: after the previous epoch's last part was prepared and before this epoch's first part
+    is. The learner calls get(e+1) right after the previous epoch's last part ran, before queueing epoch e+1's first
+    part (nothing draws from that generator in between: B60 test), and get(0) before the first part of the update."""
+    def __init__(self, n, device):
+        self.n, self.device, self.perms = int(n), device, []
+
+    def get(self, e):
+        """(permutation on the device, its host copy) of epoch e."""
+        while len(self.perms) <= e:
+            p_ = torch.randperm(self.n, device=self.device)
+            self.perms.append((p_, p_.cpu().numpy()))
+        return self.perms[e]
 
 
 # Reader attention of the T > 1 buckets: 'flex' (FlexAttention, masks and the learnable relative /
@@ -567,10 +622,16 @@ def forward_packed(model, chunks, generator=None, train_history=True, version=0,
     kw = dict(generator=generator, train_history=train_history, version=version, spatial_micro=spatial_micro,
               require_next_state=require_next_state, deduplicate_sources=deduplicate_sources,
               history_mode=history_mode, max_rows=max_rows)
+    t0 = time.perf_counter()
     P = PREFETCH.take(chunks, kw, grad)
+    hit = P is not None
     if P is None:
         with PREP_LOCK:
             P = _prepare_packed(model, chunks, grad, **kw)
+    wait = time.perf_counter()-t0   # (B60: host packing on the learner's critical path)
+    bp.ucount('learn_pack_crit_s', wait)
+    if CRIT_LOG is not None:
+        CRIT_LOG.append((bool(grad), wait, hit))
     return _run_packed(model, P)
 
 
@@ -631,7 +692,9 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
             unique.setdefault(int(p['bid'][k]), len(unique))
     ub = np.fromiter(unique.keys(), np.int64, len(unique))
     # ---- host decodes: main rows | historical block sources | open-tail sources
-    packed = device.type == 'cuda' if packed is None else bool(packed)
+    if packed is None:
+        packed = device.type == 'cuda' if HOST_PACKED is None else bool(HOST_PACKED)
+    packed = bool(packed)
     hosts = _host_decode(chunks, packed)
     n_main = int(lens.sum())
     hist_hosts = _block_decode(store, ub, packed, bs) if len(ub) else []
@@ -788,12 +851,12 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
     slab = Slab(specs, device)
     _fill_merged(all_hosts, shapes, slab.host)
     if len(ukv):
-        _pages(store, 'kv', ukv, slab.host['kv'][:len(ukv)])
+        store.kv(ukv, out=slab.host['kv'][:len(ukv)])
     slab.host['kv'][len(ukv):] = 0
     if len(pk_all):
-        _pages(store, 'z', pk_all, slab.host['zpage'])
+        store.z(pk_all, out=slab.host['zpage'])
     if len(ubid):
-        _pages(store, 'blocks', ubid, slab.host['blocks'])
+        store.blocks(ubid, out=slab.host['blocks'])
     if sizes_i:
         np.concatenate([np.asarray(ints[k], np.int64) for k in names_i], out=slab.host['ints'].numpy())
     # B51: the old bank entries' gradient scales (history_scale 'unbiased'; None: nothing scaled)

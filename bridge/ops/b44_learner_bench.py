@@ -124,6 +124,7 @@ def replay(model, opt, calls, packed, seed=0, pipeline=False, ops=None):
     def phase(name):
         if ops is not None:
             ops.phase = name
+    block_learner.CRIT_LOG = []
     t_all = sync()
     cpu0 = time.thread_time()
     queue(0)
@@ -160,6 +161,18 @@ def replay(model, opt, calls, packed, seed=0, pipeline=False, ops=None):
     t['total'] = sync()-t_all
     t['learner_thread_cpu'] = time.thread_time()-cpu0
     block_learner.PREFETCH.drop()
+    crit = block_learner.CRIT_LOG
+    block_learner.CRIT_LOG = None
+    # B60: host packing on the learner's critical path, per forward call (prefetched part's remaining wait, or a
+    # part prepared on the learner thread)
+    t['pack_crit_s'] = sum(w for _, w, _ in crit)
+    t['pack_crit_grad_s'] = sum(w for g, w, _ in crit if g)
+    t['pack_crit_nograd_s'] = sum(w for g, w, _ in crit if not g)
+    t['pack_crit_max_s'] = max((w for _, w, _ in crit), default=0.0)
+    t['pack_crit_prefetched'] = sum(1 for _, _, h in crit if h)
+    t['pack_crit_per_call'] = [round(w, 4) for _, w, _ in crit]
+    t['staging_buffers'] = len(block_learner.STAGING.bufs)
+    t['staging_pinned_mb'] = sum(b[0].numel() for b in block_learner.STAGING.bufs if b[0] is not None)/2**20
     bp.GpuSpan.drain()
     upd = dict(bp.UPD)
     bp.clear_decode_cache()
@@ -235,8 +248,10 @@ def main():
     p.add_argument('--pipeline', action='store_true', help='B60: host preparations queued one call ahead (learner)')
     p.add_argument('--busy', type=int, default=0, help='B60: pure-Python busy threads during the reps')
     p.add_argument('--opcount', action='store_true', help='B60: one extra rep counting Python-level torch calls')
-    p.add_argument('--variants', default='', help='B60: n<0|1>p<0|1>b<N>,... (native, pipeline, busy threads)')
+    p.add_argument('--variants', default='',
+                   help='B60: n<0|1>p<0|1>b<N>[i<us>],... (native, pipeline, busy threads, switch interval)')
     a = p.parse_args()
+    sys.setswitchinterval(5e-4)   # (B60: train_tok's --switch-interval default)
     dev = torch.device('cuda')
     from isaac_bridge import block_compile
     block_compile.configure()
@@ -255,11 +270,17 @@ def main():
         reps = []
         # B60 --variants n<0|1>p<0|1>b<N>,...: host packing in C (n), pipelined preparations (p), N busy threads (b),
         # each a.reps reps in one process (the first rep of the first variant compiles)
-        variants = [(int(v[1]), int(v[3]), int(v[5:])) for v in a.variants.split(',')] if a.variants else \
-            [(int(block_learner.NATIVE_PACK), int(a.pipeline), a.busy)]
-        for native_v, pipe_v, busy_v in variants:
+        # (an optional i<microseconds> suffix: sys.setswitchinterval for that variant; default 500 us, train_tok's
+        # --switch-interval default)
+        def parse(v):
+            b_, _, i_ = v[5:].partition('i')
+            return int(v[1]), int(v[3]), int(b_), int(i_ or 500)
+        variants = [parse(v) for v in a.variants.split(',')] if a.variants else \
+            [(int(block_learner.NATIVE_PACK), int(a.pipeline), a.busy, 500)]
+        for native_v, pipe_v, busy_v, sw_v in variants:
             block_learner.NATIVE_PACK = bool(native_v)
-            tag = f'n{native_v}p{pipe_v}b{busy_v}'
+            sys.setswitchinterval(sw_v*1e-6)
+            tag = f'n{native_v}p{pipe_v}b{busy_v}i{sw_v}'
             for i in range(a.reps):
                 prof = None
                 if a.cprofile and i == a.reps-1:
