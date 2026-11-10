@@ -920,7 +920,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "switch": "ISAAC_BLOCK_CPP_CONSUMER=0 returns to the B54 Python consumer (driver unchanged)",
     "test": "tests/test_b58_native_consumer.py (Python vs native consumer byte-equal on one record stream incl. a hand-off; page vectors reallocs 0)",
     "gate": "tests 60 passed; smoke 4 updates native consumer on; entry 2 passed, full 242 passed / 2 skipped, A8 8/8",
-    "capture_fix": "f370e1d: cyclic GC off during graph capture (one flaky capture error, 3 clean reruns incl. ISAAC_FX_CACHE=0)",
+    "capture_fix": "f370e1d: cyclic GC off during graph capture, an unconfirmed mitigation (one flaky capture error; 3 clean reruns incl. ISAAC_FX_CACHE=0, before the fix as well); the full gate runs -v and keeps a failed log in reports/b42-speed/failed/",
     "gil_per_cycle_s_held_wait": {
       "main": [5.01, 3.07],
       "learner": [2.01, 3.10],

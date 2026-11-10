@@ -12,7 +12,15 @@
 // Threads: the driver writes (alloc, pages, consumer); the Python main thread collects (begin_collect / free_rows) and
 // reads published rows; the learner reads rows of a handed rollout and pages of its job's snapshots. Every shared
 // structure is under PageCore::mu or the arena mutex, or written once before its publication (a record / a hand-off).
-// tests/core/test_abp_core.cpp runs it under -fsanitize=thread with random interleavings.
+// bridge/engine/core_tests/test_abp_core.cpp runs it under -fsanitize=thread with random interleavings
+// (bridge/ops/run_core_tsan.sh -> reports/b42-speed/core-tsan.log).
+//
+// Lifetimes (B58c): the wrapper holds the PageCore in a shared_ptr and every tensor view of its memory (pages, meta,
+// used, src) carries a copy of it in its deleter, so a view outlives the store (a learner snapshot holding a page
+// after the store's owner went away reads the page, never freed memory). Arena buffers are shared_ptr too: a view of
+// a buffer (Python's frames) keeps it alive across the arena's growth and reset. The rollout arrays a consumer slot
+// points at are Python's (numpy, owned by train_tok's Rollout objects): Python keeps them alive while the slot is set
+// and re-sets the slot (set_rollout) before it replaces or drops them; the driver is stopped before they go.
 #pragma once
 #include <algorithm>
 #include <atomic>
@@ -178,18 +186,19 @@ struct PageCore {
 
 // ---------------------------------------------------------------------------------------------------------- Arena
 struct Arena {
-  std::unique_ptr<uint8_t[]> cur;
-  std::vector<std::unique_ptr<uint8_t[]>> retired;   // buffers outgrown since the last reset (readers may hold views)
+  std::shared_ptr<uint8_t[]> cur;                    // (shared: a reader's view keeps its buffer alive, see Lifetimes)
+  std::vector<std::shared_ptr<uint8_t[]>> retired;   // buffers outgrown since the last reset (readers may hold views)
   i64 cap = 0, used = 0, grown = 0;
   void ensure(i64 bytes) {
     if (bytes <= cap) return;
+    if (cur) retired.push_back(cur);
     cur.reset(new uint8_t[bytes]()); cap = bytes; used = 0;
   }
   i64 append(const uint8_t *src, i64 n) {   // FrameArena.append's rule: 8-byte aligned starts, grow by 1.5
     i64 padded = (n+7)/8*8, at = used;
     if (at+padded > cap) {
       i64 nc = std::max<i64>(at+padded, (i64)(cap*1.5));
-      std::unique_ptr<uint8_t[]> g(new uint8_t[nc]());
+      std::shared_ptr<uint8_t[]> g(new uint8_t[nc]());
       if (at) memcpy(g.get(), cur.get(), at);
       retired.push_back(std::move(cur)); cur = std::move(g); cap = nc; grown++;
     }

@@ -10479,7 +10479,7 @@ B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都�
 
 **门**：门测试 60 passed；smoke 4 个 update、4.86 游戏小时，原生消费者 on；全量门 entry 2 passed、full 242 passed / 2 skipped、A8 8/8。
 
-**第一次链的失败（已修）**：第一次（合并前的树）全量门里一项捕获测试报“operation failed due to a previous error during capture”，出在编译后的 Spatial Triton 启动里。原样重跑 2 次、`ISAAC_FX_CACHE=0` 重跑 1 次，三次都通过，和 B56 的 FX 缓存无关。判断为捕获期间自动触发的循环 GC 释放了之前测试遗留对象（graph 或钉住的缓冲）上的 CUDA 资源。修法 f370e1d：block_training.graph_capture 在捕获期间关掉循环 GC，结束后恢复。合并树上的这次链全部通过。
+**第一次链的失败（已修）**：第一次（合并前的树）全量门里一项捕获测试报“operation failed due to a previous error during capture”，出在编译后的 Spatial Triton 启动里。原样重跑 2 次、`ISAAC_FX_CACHE=0` 重跑 1 次，三次都通过，和 B56 的 FX 缓存无关。推测是捕获期间自动触发的循环 GC 释放了之前测试遗留对象（graph 或钉住的缓冲）上的 CUDA 资源。这个原因没有被证实：修之前的 3 次重跑也全部通过。f370e1d（block_training.graph_capture 在捕获期间关掉循环 GC，结束后恢复）保留，算作未证实的缓解。合并树上的这次链全部通过。再出现时：run_b54g.sh 现在用 -v 跑全量测试（日志里有测试顺序），失败的全量日志带时间戳存到 reports/b42-speed/failed/。
 
 **每线程 GIL（每周期 s，持有 / 等待）**
 

@@ -73,8 +73,12 @@ struct PageStore {
   int kv_itemsize;
   at::ScalarType kv_dtype;
   i64 cap_d, cap_b;
-  std::unique_ptr<abpc::PageCore> core;
+  std::shared_ptr<abpc::PageCore> core;   // (every view below holds a copy in its deleter: abp_core.h, Lifetimes)
   at::Tensor d_meta, d_used, b_meta, b_src, b_srcver, b_used;   // views of the core's arrays (never reallocated)
+  at::Tensor view(void *p, at::IntArrayRef sizes, at::TensorOptions o) {
+    std::shared_ptr<abpc::PageCore> keep = core;
+    return at::from_blob(p, sizes, [keep](void *) {}, o);
+  }
 
   PageStore(i64 page_, i64 kv_elems_, bool kv_bf16, i64 z_elems_, i64 b_elems_, i64 block_steps, i64 nh_, i64 max_pages_d,
             i64 max_pages_b)
@@ -84,13 +88,13 @@ struct PageStore {
     core.reset(new abpc::PageCore(page, kv_elems*kv_itemsize, z_elems, b_elems, bs, nh, max_pages_d, max_pages_b));
     cap_d = core->cap_d; cap_b = core->cap_b;
     auto L = at::TensorOptions().dtype(at::kLong), B = at::TensorOptions().dtype(at::kBool);
-    d_meta = at::from_blob(core->d_meta.get(), {cap_d, 2}, L); d_used = at::from_blob(core->d_used.get(), {cap_d}, B);
-    b_meta = at::from_blob(core->b_meta.get(), {cap_b, 2}, L); b_used = at::from_blob(core->b_used.get(), {cap_b}, B);
-    b_src = at::from_blob(core->b_src.get(), {cap_b, bs}, L); b_srcver = at::from_blob(core->b_srcver.get(), {cap_b, bs}, L);
+    d_meta = view(core->d_meta.get(), {cap_d, 2}, L); d_used = view(core->d_used.get(), {cap_d}, B);
+    b_meta = view(core->b_meta.get(), {cap_b, 2}, L); b_used = view(core->b_used.get(), {cap_b}, B);
+    b_src = view(core->b_src.get(), {cap_b, bs}, L); b_srcver = view(core->b_srcver.get(), {cap_b, bs}, L);
   }
-  at::Tensor kv_page(i64 p) { return at::from_blob(core->kv_page(p), {page, kv_elems}, at::TensorOptions().dtype(kv_dtype)); }
-  at::Tensor z_page(i64 p) { return at::from_blob(core->z_page(p), {page, z_elems}, at::TensorOptions().dtype(at::kFloat)); }
-  at::Tensor b_page(i64 p) { return at::from_blob(core->b_page(p), {page, b_elems}, at::TensorOptions().dtype(at::kFloat)); }
+  at::Tensor kv_page(i64 p) { return view(core->kv_page(p), {page, kv_elems}, at::TensorOptions().dtype(kv_dtype)); }
+  at::Tensor z_page(i64 p) { return view(core->z_page(p), {page, z_elems}, at::TensorOptions().dtype(at::kFloat)); }
+  at::Tensor b_page(i64 p) { return view(core->b_page(p), {page, b_elems}, at::TensorOptions().dtype(at::kFloat)); }
   i64 n_pages_d() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->kv_pages.size(); }
   i64 n_pages_b() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->b_pages.size(); }
   i64 n_free_d() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->d_free.size(); }
@@ -445,10 +449,12 @@ struct ActorDriver {
   }
   void use_rollout(int slot) { TORCH_CHECK(slot >= -1 && slot <= 1, "use_rollout: slot"); cur_slot = slot; }
   // the frame arena of a slot (B45 FrameArena's buf / used, appends of the hand-off's carry)
-  // (a view of the arena's current buffer: valid until the slot's next reset, outgrown buffers are kept until then)
+  // (a view of the arena's current buffer; the view holds the buffer, so it stays valid after growth and reset; what
+  // it shows after the slot's reset is the old rollout's frames)
   at::Tensor arena_buf(int slot) {
     std::lock_guard<std::mutex> g(amu);
-    return at::from_blob(slots[slot].arena.cur.get(), {slots[slot].arena.cap}, at::TensorOptions().dtype(at::kByte));
+    std::shared_ptr<uint8_t[]> keep = slots[slot].arena.cur;
+    return at::from_blob(keep.get(), {slots[slot].arena.cap}, [keep](void *) {}, at::TensorOptions().dtype(at::kByte));
   }
   i64 arena_used(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].arena.used; }
   void arena_reset(int slot) { std::lock_guard<std::mutex> g(amu); slots[slot].arena.reset(); }

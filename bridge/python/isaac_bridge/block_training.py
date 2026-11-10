@@ -71,7 +71,8 @@ def graph_capture(graph,stream,pool=None):
     a graph_pool_handle shared with other graphs that never replay concurrently.
     B58: the cyclic garbage collector is off while the capture runs: an automatic collection inside it could free a
     dropped actor's CUDA graph or pinned buffers (CUDA calls during a global-mode capture: 'operation failed due to a
-    previous error during capture', test_driver_with_lanes_same_seed_reproducible once on the 4090)."""
+    previous error during capture', test_driver_with_lanes_same_seed_reproducible once on the 4090). An unconfirmed
+    mitigation: the cause was not shown (3 reruns before the fix passed as well)."""
     import gc as gc_
     torch.cuda.synchronize()
     was = gc_.isenabled()
