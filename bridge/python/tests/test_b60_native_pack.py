@@ -475,3 +475,33 @@ def test_epoch_perms_on_cuda_keep_the_serial_order_whichever_generator():
             ep.get(e+1)
         lazy.append(draws)
     assert lazy == serial
+
+
+def test_lean_checkpoint_same_outputs_and_gradients(monkeypatch):
+    """B62 N5: the learner's Spatial checkpoint without the determinism metadata and RNG stashing gives the default
+    checkpoint's outputs and every gradient bit for bit (CPU, one thread)."""
+    from test_block_packed_learner import _rollout_and_teacher
+    from isaac_bridge.block_training import forward_bucketed
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    monkeypatch.setattr(block_learner, 'PACKED', True)
+    monkeypatch.setattr(block_learner, 'SPATIAL_CKPT', 1)
+    try:
+        res = []
+        for kw in (dict(use_reentrant=False), block_learner.LEAN_CKPT_KW):
+            monkeypatch.setattr(block_learner, 'CKPT_KW', kw)
+            m_, ch_, te_ = _rollout_and_teacher('cpu', seed=47)
+            m_.train()
+            out, _ = forward_bucketed(m_, ch_+te_, generator=torch.Generator().manual_seed(4), version=2, max_rows=4096)
+            loss = sum((o.float()*(i+1)).mean() for i, o in enumerate(out))
+            loss.backward()
+            res.append(([o.detach().clone() for o in out],
+                        {n: p.grad.clone() for n, p in m_.named_parameters() if p.grad is not None}))
+        (oa, ga), (ob, gb) = res
+        for x, y in zip(oa, ob):
+            assert torch.equal(x, y)
+        assert ga.keys() == gb.keys() and len(ga) > 10
+        for k in ga:
+            assert torch.equal(ga[k], gb[k]), k
+    finally:
+        torch.set_num_threads(threads)

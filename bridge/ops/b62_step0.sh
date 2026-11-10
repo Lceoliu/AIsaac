@@ -6,7 +6,10 @@
 #   N   Nsight Systems nvtx + python-gil over hand-offs 2..7 (run_b50m.sh's command, no Python sampling), per-thread
 #       CPU samples (b57_threads.py) meanwhile; the analysis (b57_nsys.py) after the lock is released;
 #   W100, W50  16-update profiles with ISAAC_SWITCH_INTERVAL_US=100 / 50.
-#   usage: CODE=<candidate dir> sh b62_step0.sh G P N W100 W50
+#   T   unit tests (gate); O / OC  bench op counts by calling frame (OC: Inductor cpp_wrapper); H  host preparation
+#       by function (bench, serial, cProfile); Q  a 5-update profile
+#       with the learner's update 4 under cProfile.
+#   usage: CODE=<candidate dir> sh b62_step0.sh G P N W100 W50 | T O OC Q
 set -u
 ROOT=/home/linux/isaac-block-memory-v1
 R=$ROOT/reports/b42-speed
@@ -28,10 +31,10 @@ take() {
   guard
 }
 give() { sleep 5; guard; grep -q "B62 step 0 stage $1" $R/GPU_LOCK 2>/dev/null && rm -f $R/GPU_LOCK; echo "$(date '+%F %T') stage $1 done, lock released" >> $LOG; }
-prof() {   # prof <tag> [env assignments...]: a 16-update profile of the C++ path
+prof() {   # prof <tag> [env assignments...]: a 16-update profile of the C++ path (PROF_HOURS / PROF_LIMIT: shorter)
   TAG=$1; shift
   cd $ROOT
-  ( env "$@" CODE=$CODE ./prof2.sh $TAG 4500 18.3 )
+  ( env "$@" CODE=$CODE ./prof2.sh $TAG ${PROF_LIMIT:-4500} ${PROF_HOURS:-18.3} )
   echo "$(date '+%F %T') $TAG done rc=$? $(grep -m1 'cpp actor driver' $R/$TAG.stdout | cut -c1-100)" >> $LOG
 }
 for S in "$@"; do
@@ -44,6 +47,27 @@ for S in "$@"; do
     echo "$(date '+%F %T') G full gate rc=$? $(tail -1 $R/tests-b62-full.log)" >> $LOG
     ;;
   P) prof prof-b62-cpp ISAAC_SWITCH_INTERVAL_US=500 ;;
+  T)   # (the B60 / B62 unit tests and the B48 prefetch test on this host)
+    cd $ROOT/$CODE/bridge/python
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=1 timeout 300 $PY -m pytest tests/test_b60_native_pack.py       tests/test_b48_prefetch.py tests/test_block_packed_learner.py -q -p no:cacheprovider > $R/tests-b62-t.log 2>&1
+    rc=$?
+    echo "$(date '+%F %T') T tests rc=$rc $(tail -1 $R/tests-b62-t.log)" >> $LOG
+    if [ $rc != 0 ]; then give $S; echo "$(date '+%F %T') stage T failed: later stages not run" >> $LOG; exit 1; fi
+    ;;
+  O|OC)   # (op count by calling frame, C packing pipelined; OC: Inductor cpp_wrapper for the learner's graphs)
+    cd $OPS
+    W=0; [ $S = OC ] && W=1
+    ISAAC_INDUCTOR_CPP_WRAPPER=$W OMP_NUM_THREADS=1 timeout 840 $PY b44_learner_bench.py       $R/b48-dump/learner_inputs.pt --mode packed --reps 2 --variants n1p1b0 --pipeline --opcount       --json $R/b62-opcount-$S.json > $R/b62-opcount-$S.log 2>&1
+    echo "$(date '+%F %T') $S opcount rc=$?" >> $LOG
+    ;;
+  H)   # (host preparation by function: C packing, serial preparation, cProfile of the last rep)
+    cd $OPS
+    OMP_NUM_THREADS=1 timeout 840 $PY b44_learner_bench.py $R/b48-dump/learner_inputs.pt --mode packed --reps 2       --variants n1p0b0 --cprofile --json $R/b62-host.json > $R/b62-host.log 2>&1
+    echo "$(date '+%F %T') H host profile rc=$?" >> $LOG
+    ;;
+  Q)   # (a 5-update C++ path profile with the learner's update 4 under cProfile)
+    PROF_HOURS=6.1 PROF_LIMIT=1500 prof prof-b62-cprof ISAAC_RL_B38_TORCHPROF=$R/prof-b62-cprof-learner ISAAC_RL_LEARNER_CPROFILE=1       ISAAC_RL_B38_TORCHPROF_AT=4
+    ;;
   W100) prof prof-b62-sw100 ISAAC_SWITCH_INTERVAL_US=100 ;;
   W50) prof prof-b62-sw50 ISAAC_SWITCH_INTERVAL_US=50 ;;
   N)

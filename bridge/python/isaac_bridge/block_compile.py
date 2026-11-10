@@ -19,6 +19,10 @@ _STEADY = [False]
 _CONFIGURED = [False]
 # B56: Inductor FX graph cache + AOTAutograd cache across processes (default on; ISAAC_FX_CACHE=0 off)
 FX_CACHE = os.environ.get('ISAAC_FX_CACHE', '1') == '1'
+# B62 N5 (experiment, default off): Inductor's cpp_wrapper for these graphs (Spatial, canvas decoders, Flex Reader):
+# the generated wrapper launches the same Triton kernels from C++ instead of one Python launcher call per kernel
+# (B62 attribution: ~2.5k Python-level calls per PPO part); a C++ build per graph on a cold cache
+CPP_WRAPPER = os.environ.get('ISAAC_INDUCTOR_CPP_WRAPPER', '0') == '1'
 
 
 def cache_counters():
@@ -85,6 +89,8 @@ def _backend(gm, example_inputs):
             shapes = [tuple(x.shape) if hasattr(x, 'shape') else x for x in example_inputs[:8]]
             print('B44 steady compile', where, shapes, flush=True)
     from torch._inductor.compile_fx import compile_fx
+    if CPP_WRAPPER:   # (B62 N5: the graph's wrapper in C++: kernel launches without the Python launcher)
+        return compile_fx(gm, example_inputs, config_patches={'cpp_wrapper': True})
     return compile_fx(gm, example_inputs)
 
 

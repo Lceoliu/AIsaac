@@ -44,6 +44,13 @@ PACKED = os.environ.get('ISAAC_PACKED_LEARNER', '1') == '1'
 # fixed-input benchmark: OOM in the first training part); 4096-row checkpoints peak at 7.7 GB.
 SPATIAL_CKPT = int(os.environ.get('ISAAC_LEARN_SPATIAL_CKPT', '1'))
 SPATIAL_ROWS = int(os.environ.get('ISAAC_LEARN_SPATIAL_ROWS', '4096'))
+# B62 N5: the checkpoint without its per-saved-tensor bookkeeping on the learner thread: determinism_check 'none'
+# (the default 'default' records every saved tensor's shape / dtype / device under no_grad in the pack hook, a debug
+# check at recompute) and preserve_rng_state False (no stash / restore of the CPU and CUDA RNG states per call: the
+# Spatial encoder draws no random numbers). The same recomputation and values; ~5.7k fewer Python-level torch calls
+# per PPO part (B62 attribution). Default off until reviewed (ISAAC_LEARN_CKPT_LEAN=1: on; off: the B44-B60 call).
+LEAN_CKPT_KW = dict(use_reentrant=False, preserve_rng_state=False, determinism_check='none')
+CKPT_KW = LEAN_CKPT_KW if os.environ.get('ISAAC_LEARN_CKPT_LEAN', '0') == '1' else dict(use_reentrant=False)
 
 
 class _PrepLock:
@@ -137,6 +144,11 @@ class Prefetch:
                 id(kw.get('generator')), bool(grad))
 
     def _worker(self):
+        try:   # (B62: the OS thread name, so nsys / ps can tell this thread from the others)
+            import ctypes
+            ctypes.CDLL(None).prctl(15, b'learner-prefetch', 0, 0, 0)
+        except Exception:
+            pass
         while True:
             item = self.q.get()
             if item is None:
@@ -911,7 +923,7 @@ def _run_packed(model, P):
     for g, names, T, m in plans:
         part = packed_rows_apply(batch, {k: di[f'sp{g}:{k}'] for k in names}, T)
         if grad and SPATIAL_CKPT and m > 0:
-            zs.append(checkpoint(model.encode_block, part, use_reentrant=False)[:m])
+            zs.append(checkpoint(model.encode_block, part, **CKPT_KW)[:m])
         else:
             zs.append(model.encode_block(part)[:m])
     z_all = (torch.cat(zs) if len(zs) > 1 else zs[0]).index_select(0, di['sp:inverse'])
