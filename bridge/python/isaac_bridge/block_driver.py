@@ -92,7 +92,8 @@ def record_rows(rec, ROW):
 # (B54) the driver's per-collect counters: their progress.csv columns, the deltas, the stdout line
 DRV_FIELDS = ('drv_pause_s', 'drv_pauses', 'drv_lane_jobs', 'drv_lane_rows', 'drv_merged_rows', 'drv_merged_calls',
               'drv_lane_calls', 'drv_captures', 'drv_lane_python', 'drv_lane_s', 'drv_lane_hist',
-              'drv_py_lane_rounds', 'drv_py_lane_rows', 'drv_py_lane_flushed_rows', 'drv_py_lane_share')
+              'drv_py_lane_rounds', 'drv_py_lane_rows', 'drv_py_lane_flushed_rows', 'drv_py_lane_share',
+              'drv_lane_deferred_requests', 'drv_lane_orphan_requests')
 
 
 def collect_counters(c0, c1, handoff, stat, py_mark):
@@ -108,7 +109,8 @@ def collect_counters(c0, c1, handoff, stat, py_mark):
     stat['drv_lane_hist'] = '/'.join(str(b-a) for a, b in zip(c0['lane_hist'], c1['lane_hist']))
     # the lane rows the Python path stepped since the last collect (the actor waiting for the learner: rounds on the
     # Python path, the round in flight flushed), their share of all lane rows
-    now = {k: stat.get(k, 0) for k in ('py_lane_rounds', 'py_lane_rows', 'py_lane_flushed_rows')}
+    now = {k: stat.get(k, 0) for k in ('py_lane_rounds', 'py_lane_rows', 'py_lane_flushed_rows', 'lane_deferred_requests',
+                                       'lane_orphan_requests')}
     for k, v in now.items():
         stat['drv_'+k] = v-py_mark[0].get(k, 0)
     py_mark[0] = now
@@ -119,4 +121,5 @@ def collect_counters(c0, c1, handoff, stat, py_mark):
             f"captures {d['captures']}, lane jobs stepped in Python {d['lane_python']}; lane-only {d['lane_s']:.2f} s, rows "
             f"histogram 1/2/3-4/5-8/9-16/>16 {stat['drv_lane_hist']}; Python path while waiting for the learner "
             f"{stat['drv_py_lane_rounds']} rounds {stat['drv_py_lane_rows']} rows + {stat['drv_py_lane_flushed_rows']} flushed "
-            f"({100*stat['drv_py_lane_share']:.1f}% of lane rows)")
+            f"({100*stat['drv_py_lane_share']:.1f}% of lane rows); branch requests waiting for their capture "
+            f"{stat['drv_lane_deferred_requests']}, cancelled for a point that never came {stat['drv_lane_orphan_requests']}")
