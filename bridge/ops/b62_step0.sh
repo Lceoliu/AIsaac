@@ -24,7 +24,8 @@ take() {
   while true; do
     ok=0
     while [ $ok -lt 4 ]; do if idle; then ok=$((ok+1)); else ok=0; fi; [ $ok -lt 4 ] && sleep 30; done
-    if ( set -C; echo "a1 $(date '+%F %T') B62 step 0 stage $1 ($CODE)" > $R/GPU_LOCK ) 2>/dev/null; then break; fi
+    case $1 in P*|Y*|W*|N*|Q) U_=' 计时运行' ;; *) U_='' ;; esac
+    if ( set -C; echo "a1 $(date '+%F %T') B62 step 0 stage $1 ($CODE)$U_ ${PTAG:-}" > $R/GPU_LOCK ) 2>/dev/null; then break; fi
     sleep 30
   done
   echo "$(date '+%F %T') stage $1 start ($CODE)" >> $LOG

@@ -89,6 +89,11 @@ class _PrepLock:
 #   store.decoded from the driver thread) only drops the cache's reference, never the arrays being copied.
 PREP_LOCK = _PrepLock()
 PREFETCH_ON = os.environ.get('ISAAC_LEARN_PREFETCH', '1') == '1'
+# B62 (D1 control arms): the B60 prefetch additions apart. ISAAC_LEARN_PREFETCH_RECOMPUTE=0: no preparation ahead for
+# the update's recompute groups; ISAAC_LEARN_PREFETCH_EPOCH=0: no next-epoch / first-part preparation ahead (the
+# epoch permutations then drawn at each epoch's start, as B48). ISAAC_LEARN_PREFETCH=0: no prefetch at all.
+PREFETCH_RECOMPUTE = PREFETCH_ON and os.environ.get('ISAAC_LEARN_PREFETCH_RECOMPUTE', '1') == '1'
+PREFETCH_EPOCH = PREFETCH_ON and os.environ.get('ISAAC_LEARN_PREFETCH_EPOCH', '1') == '1'
 # B60 test hook: the host decode layout when _prepare_packed is not told (None: packed on CUDA devices, as always;
 # True on the CPU runs the packed / C path there, for the CPU equivalence tests)
 HOST_PACKED = None

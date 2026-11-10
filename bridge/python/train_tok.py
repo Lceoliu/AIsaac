@@ -3015,7 +3015,7 @@ def main(argv=None, child=None, actor=None):
                 offset_b = 0
                 # Chunk groups are bounded in decisions, just as the PPO microbatches.
                 rgroups_b = list(temporal_bounds(rp_b['tch'],np.arange(len(rp_b['chunks'])),args.micro or args.minibatch))
-                pre_b = blearn_r.PREFETCH_ON and not mem_on
+                pre_b = blearn_r.PREFETCH_RECOMPUTE and not mem_on
                 if pre_b and rgroups_b:   # B60: the first group's host preparation now
                     blearn_r.PREFETCH.submit(learner_model,[rp_b['chunks'][i] for i in rgroups_b[0][2]],grad=False,
                                              train_history=False,version=L['update'])
@@ -3659,7 +3659,7 @@ def main(argv=None, child=None, actor=None):
         # (EpochPerms: the same place relative to the history draws on the default CPU generator as before), the
         # teacher / teacher-v2 draws a prefetch makes ahead kept per epoch (pre_by_ep), still drawn in the
         # minibatches' order (nothing else draws from numpy's generator or v2_rng in between)
-        ahead_ = block_on and blearn.PREFETCH_ON and not mem_on
+        ahead_ = block_on and blearn.PREFETCH_EPOCH and not mem_on
         eperms = blearn.EpochPerms(n_units, device) if ahead_ else None
         pre_by_ep = {}
         ep_now = [0]
