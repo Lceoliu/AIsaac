@@ -9926,6 +9926,160 @@ B55测得：打开FX graph cache与AOTAutogradCache后，缓存热时Spatial预�
   - 默认值仍未改，等协调方确认。
 
 默认值自ed6b2a0起为开（`ISAAC_FX_CACHE`未设或为1时开，设0时关）。同一提交里，train_tok在预热之后打印一行`B56 compile cache after warm-up: {...}`（fxgraph与AOTAutograd缓存的hit / miss / guard_miss / bypass计数，只观测），以后可以直接看生产中那8个backward图是否命中。P1b不修，归因见上。
+
+### B60 learner的host工作搬出GIL：原生打包与完整流水（2026-11-10）
+
+#### 实验目的
+
+learner的周期已经由update决定（prof-b54-cpp第2–14轮中位：update 21.43 s，collect 13.37 s，actor每周期等learner 8.1 s）。update里有三类host开销在和其他线程争GIL：
+- B48：host打包每次update 8.05 s，预取线程只藏住4.76 s，约3.3 s在关键路径上。隔离时打包只要3.5 s，生产里多出来的部分是GIL争用。
+- B50：learner每次update等GIL 4.4–5.2 s。
+- u_recompute 3.58 s（隔离时1.05 s），u_teach_build 1.62 s，u_opt 0.86 s。
+
+本实验：
+- 把host打包里搬字节的部分搬到不持GIL的C代码。
+- 把预取扩展到覆盖整个update。
+- 量出teach_build、recompute的host部分、opt各自的Python时间和torch调用数。
+
+不改模型定义和训练语义，不削减任何预算，不丢行，micro 8192。
+
+门槛：
+- 固定输入learner基准（b48 dump）≤ 9.5 s（现10.95 s）。
+- FP32等价按B44标准，上传内容逐字节一致，全量测试通过。
+- 诊断项：同一基准并行一个纯Python忙线程时的耗时，改前改后各一个数。
+- 生产update由集成步骤B61验证（目标≤17 s）。
+
+#### 实验方法
+
+- 原生库`bridge/engine/abp_learn.c`（纯C）。由`isaac_bridge/learn_native.py`在首次使用时用gcc编译，按源码哈希缓存，ctypes.CDLL加载（调用期间释放GIL）。函数只拷贝字节：
+  - `abp_learn_scan`：逐行头检查与计数（`check_headers`）；
+  - `abp_learn_gather`：packed解码的room、minimap和五个compact列表（`decode_frames_compact(packed=True)`）；
+  - `abp_learn_concat`：slab合并区按片拷贝，ragged末尾补零项（`_fill_merged`）。
+- 页gather（N3，约0.40 s）推后，这里不写。cpp-actor分支的页存储已经是原生的（abp_actor.cpp持有页）。合并以后，N3直接对着原生页存储写，并先写明、测试一条不变式：learner读的页在整个update期间不可变、不会被回收。
+- 接入`block_learner`：主行、历史块、open tail三处解码（缓存结构不变）和slab填充。开关`ISAAC_BLOCK_NATIVE_PACK`，默认1；设0，或没有gcc、任何一行头检查不通过时，走Python参考实现（坏头时由参考实现抛出同样的错误）。只覆盖packed（CUDA）路径。
+- 生命周期规则（写在`block_learner`注释里，有测试）：
+  - 所有解码都在PREP_LOCK之内：预取worker在锁内准备；队列未命中时，learner线程只在锁内自己准备。PREP_LOCK记录持有线程，`_decode_compact`在锁外调用会报错。
+  - DECODE_CACHE、chunk的`_host`、store.decoded的条目，只在C填充完成、解码返回之后才发布。
+  - 传给C的每个numpy数组在调用期间都由Python持有引用：decode保留帧缓冲和索引数组；`_fill_merged`的片来自准备过程持有的hosts列表。所以别的线程淘汰缓存（PagedStore.collect在driver线程修剪store.decoded）只去掉缓存的引用，不会释放正在拷贝的数组。
+- 完整流水：
+  - `Prefetch`改为有序队列（最多DEPTH=2个part在前）和一个常驻worker。准备仍按提交顺序串行（PREP_LOCK）。调用拿到自己的part时，排在它前面而被跳过的part会被放弃并释放staging。
+  - `learn()`：
+    - 旧值重算：第一组在循环前提交，第g+1组在第g组的forward之前提交（深度2，准备与第g组的主机端派发重叠）；
+    - 每个epoch最后一个part运行时，就准备下一个epoch的第一个part；
+    - update的第一个PPO part在epoch循环之前提交。
+  - epoch排列（`EpochPerms`）：
+    - 每个epoch的排列在串行learner抽它的位置抽：上一个epoch最后一个part准备之后、这个epoch第一个part准备之前。`get(e+1)`在上一个epoch最后一个part运行后、提交下一个epoch第一个part之前调用。不论randperm(n, device=cuda)用哪个generator，抽取顺序都与串行相同。
+    - 4090实测（torch 2.7.1，n约2,400）：用的是CUDA generator，默认CPU generator的状态不变。审阅时“n < 30000走CPU默认generator”的推断在这一版不成立，以实测为准。learner的历史抽样用默认CPU generator（没有传generator）。
+    - 测试先探测用的是哪个generator，再断言惰性抽取与串行在同种子下逐元素相同，两种情况都覆盖。
+    - 两次epoch之间learner没有别的消费者（teach_merge=1；teach_merge=0时，单独的teacher前向会带历史抽样落在其后，不是生产配置）。
+    - actor线程（`block_lanes`的lane均匀数、`block_paged`的CPU回退）也用默认CPU generator，与learner并发交错，改前改后都不确定。
+  - teacher / v2的抽取仍按minibatch顺序，按epoch保存。新teacher记录的两处无梯度调用暂未进队列。
+  - 关键路径上等待打包的时间按调用记录（`learn_pack_crit_s`，基准里逐调用列出）。预取等待按重算（no-grad）和PPO（grad）分开计（`learn_prefetch_wait_nograd_s` / `_grad_s`）。被跳过的排队part的等待单独计（`learn_prefetch_skip_wait_s`），连同dropped和other_calls一起报告；生产路径上dropped应为0。门槛：合计每次update ≤ 0.3 s。同时报告staging pinned池大小（深度2的增量）。
+  - arena记录的偏移不是4的倍数时，整批回到参考实现：参考在偏移处读头，在偏移//4*4处读浮点。
+- 测量：
+  - `learn()`每个分段新增`uc_*`列（learner线程CPU秒）；`ISAAC_LEARN_OPCOUNT=1`时新增`uo_*`列（Python层torch调用数，只计learner线程）。
+  - `b44_learner_bench.py`新增：
+    - `--variants n<0|1>p<0|1>b<N>[i<us>]`：C打包、流水、N个纯Python忙线程、切换间隔（默认500 µs，与train_tok的`--switch-interval`默认相同；100 µs只作诊断）；
+    - `--opcount`：按fwd_grad / bwd / opt / fwd_nograd统计torch调用数；
+    - 逐调用的关键路径等待、预取统计、staging池大小。
+- 测试`tests/test_b60_native_pack.py`。有gcc时用编译好的库，同时也用Python模拟同一组函数（检查封装的地址和大小计算）。覆盖：
+  - 解码逐字节等于参考：ROW、frame arena、混合、单行、空列表；
+  - 坏头抛出参考的错误；
+  - concat覆盖异dtype和跨步片；
+  - 整个`_prepare_packed`的slab各区逐字节相同，P里slab之外的每个字段也逐项相同：计划、形状、索引、计数、抽样、缩放；
+  - 偏移未对齐时回退；
+  - （CUDA）先探测randperm(2400, device=cuda)消耗哪个generator，再断言EpochPerms的惰性抽取序列与串行循环逐元素相同；
+  - （不需要编译器）ctypes签名与C源码的形参逐个对齐：个数相同，指针对c_void_p、其余对c_long。阶段A第一次运行失败，原因是scan的argtypes是15个、C函数是14个；本地没有gcc，C相关测试被跳过，所以当时没拦住。
+  - 填充期间淘汰全部缓存，slab不变；
+  - 锁外解码被拒绝；
+  - 预取队列的顺序、跳过和丢弃；
+  - 固定种子、预取队列真实运行时，三个epoch排列和每个part的历史抽样与串行逐元素相同；
+  - 固定输入、CPU单线程的一次完整update（三个part，各做loss、backward、Adam），C打包开与关的loss和全部参数逐位相同。
+  本地（无gcc，模拟库）156 passed / 52 skipped。
+- GPU（`bridge/ops/b60_gpu.sh`，三个阶段，各≤15分钟，各自取锁，锁连续空闲2分钟且无cpp-actor链才取）：
+  - A：B60测试（C库）+ b48 dump基准七个变体（n0p0b0、n0p0b1、n0p1b0、n1p0b0、n1p1b0、n1p1b1、n1p1b1i100）和一次计数rep；
+  - B：全量测试；
+  - C：6个update的短profile（预取命中/丢弃、uc_*）。
+- 交给learner的job结构和BlockRollout payload视为冻结接口，B60只读现有字段。
+
+#### 实验结果
+
+4090，GPU_LOCK协议下分阶段运行（2026-11-10 13:35–16:14）。
+
+GPU测试过程中修了三个问题：
+- 第一次阶段A、B失败（9 / 14个测试失败）：`abp_learn_scan`的ctypes签名写成了15个参数，C函数是14个。本地没有gcc，C路径的测试全被跳过，所以没拦住。已修，并新增不依赖编译器的签名测试。
+- 基准的op计数rep让dynamo在计数器状态上建了guard而失败：编译期间不再读计数器。
+- 我的GPU脚本取锁有竞争：上一次空闲检查之后过了30 s才写锁，结果S阶段覆盖了自己正在跑的C阶段的锁。同时段没有其他会话的作业。已改为空闲检查之后立即用noclobber原子写锁。
+
+固定输入learner基准（b48 dump：22次调用，15次有梯度、7次无梯度；第2个rep，切换间隔500 µs，与train_tok相同）：
+
+| 变体 | 总计 s | 关键路径打包 s | learner线程CPU s |
+|---|---:|---:|---:|
+| n0p0b0 改前：Python打包、串行 | 13.0–13.2 | 5.6 | 9.5 |
+| n0p1b0 Python打包、流水 | 9.0–9.2 | 1.55–1.63 | 3.9 |
+| n1p0b0 C打包、串行 | 11.1–11.4 | 3.9–4.3 | 8.1–8.4 |
+| **n1p1b0 改后：C打包、流水** | **7.9–8.4** | **0.54–1.06** | 3.8–3.9 |
+| n0p0b1 改前 + 1个纯Python忙线程 | 88.5–93.2 | 35–37 | |
+| n1p1b1 改后 + 1个忙线程 | 58.2–59.0 | 0.72 | |
+| n1p1b1i100 改后 + 忙线程，切换间隔100 µs（诊断） | 23.0 | 0.58 | |
+
+- 门槛“基准 ≤ 9.5 s”：**过**（7.9–8.4 s）。注意本基准的改前数是13.0 s，不是任务书里的10.95 s（口径不同）。
+- C打包：host打包5.6 → 3.9–4.3 s/update；主行解码0.95 → 0.25 s，历史块解码1.24 → 0.56 s。
+- 关键路径逐调用（n1p1b0第2个rep）：
+  - 重算第1组0.117 s（没有更早的提交点），第2–4组0.035–0.05 s；
+  - 新teacher小调用0.02 s；
+  - **第一个PPO part 0.266 s**：它合并了teacher记录，teach_n和teach_step在teach_new阶段才确定，无法更早提交；
+  - 其余PPO part约0.0001 s。
+- 忙线程对照：改后关键路径打包只剩0.72 s，但fwd_grad 2.35 → 21.6 s、bwd 4.65 → 28.2 s、opt 0.14 → 2.3 s。在GIL竞争下，learner的暴露面主要是前向、反向和优化器的Python派发，而不是打包。
+- staging pinned池：474 MB，1个buffer；有忙线程时2个（+0.5 MB）。深度2的增量可以忽略。
+
+生产短profile（6个update，u2–u6中位；同树、同配置：改前prof-b56-fxw，改后prof-b60 / prof-b60b）：
+
+| | 改前 | 改后 |
+|---|---:|---:|
+| update s | 19.42 | **16.94 / 17.24** |
+| u_recompute s（CPU） | 3.31 | 1.97 / 2.01（1.31 / 1.26） |
+| u_ppo s（CPU） | 12.52 | 11.52 / 11.96（3.04 / 3.16） |
+| u_teach_build s（CPU） | 1.64 | 1.67 / 1.67（1.61） |
+| u_opt s（CPU） | 0.87 | 1.14 / 1.15（1.13） |
+| collect s | 28.5 | 29.3 / 30.5 |
+| ×实时 | 144.9 | 145.3 / 136.1 |
+| 预取命中 / 丢弃 / other_calls / 跳过等待 | 12 / 0 / 0 / 0 | 20 / 0 / 0 / 0 |
+| 关键路径打包 s（PPO / 重算及其他） | — | 0.83（0.35 / 0.50） |
+| 预取等待 s（PPO / 重算） | — | 0.35 / 0.30 |
+| 预取worker CPU s | — | 4.9 |
+
+- 稳态重编译全为0。
+- prof-b60b的预热段与S阶段并发（上面的取锁竞争），它的collect / ×实时只作参考。
+- 门槛“关键路径等待 ≤ 0.3 s/update”：**未达**（0.83 s）。剩下的是重算前几组和第一个PPO part。下一步可选N4（Reader / Writer / 计划的索引表搬到C），按基准里C打包后每个part约0.18 s的准备时间，估计能降到约0.06 s，从而进门槛。是否做由协调方决定。
+- 生产也出现了B56的aot_guard_miss 8次（预热行的缓存计数）。
+
+任务2（各分段，生产u2–u6中位）：
+- teach_build：1.67 s wall里1.61 s是learner线程CPU，几乎全是Python（teacher批的取行和解码）。teacher的抽取在next_ppo_chunks里已经提前确定，可以把这部分搬到预取worker；未做。
+- recompute：2.0 s wall，CPU 1.3 s（打包已经离开learner线程，剩下的是4次前向及log_prob等的派发）。
+- opt：1.15 s wall，CPU 1.13 s，CPU-bound。基准计数：每步3.7k次Python层torch调用，按约244个参数逐个处理。fused Adam能去掉大部分，但数值不逐位相同，只报数、不改。
+
+任务3（learner线程Python层torch调用数，基准计数rep）：
+- 每个PPO part的前向14.6k次，每次无梯度调用2.1k次，每个优化器步3.7k次。反向只计到38次：autograd线程不在计数范围内。
+- 前向的大头是框架开销，不是模型算子：属性描述符65k、data_ptr 43k、_set_grad_enabled 31k、_is_view 19k、size 11k。模型算子：linear 2.2k、mm 1.9k、layer_norm 1.3k、index_select 1.2k。
+- 推测（未证实）：主要来自checkpoint包装和编译调用包装（compile_batch_dynamic的逐参数mark / pad检查）的逐张量Python。合并模型小算子收益有限；能减调用数的是少分checkpoint段（SPATIAL_ROWS更大，换显存）、编译包装少做逐张量检查、fused Adam，这些都需要单独评估。
+
+等价：
+- 4090上B60测试（C库）24 passed，连续3次。
+- 全量门223 passed（b60f）。
+- 本地156 passed / 52 skipped。
+- slab各区逐字节相同，P里每个字段相同，整次update的参数在C打包开与关下逐位相同（4090上用真C库）。
+- B48 prefetch测试的CUDA容差另有证据（`bridge/ops/b60_prefetch_spread.py`，每种20+20对，各自与同一个串行参考比较）：
+
+| | 串行对：max \|diff\| = 2.38e-7（p2输出差1 ulp）的次数 | 预取对：同上 | 其余对 |
+|---|---:|---:|---:|
+| 改前（4241254） | 1 / 20 | 2 / 20 | 全部差在第0个part的梯度，约1e-12（原子累加） |
+| 改后（B60） | 4 / 20 | 3 / 20 | 同上 |
+
+  - 串行对从来没有逐位相同过；串行对和预取对出现“1 ulp输出差”的频率相近，改前改后也相近。
+  - 旧测试只用一个串行对来估计spread，经常估成约1e-12，于是一旦预取对碰上1 ulp事件就失败。
+  - 新容差：spread取5个串行对的最大值，每个被比较值要求 ≤ max(4 × spread, 该值自身量级的2个FP32 ulp)。在4090上连续3次通过。
+
 ### B50 阶段 0：actor 调度热路径迁 C++ 之前的测量与设计（Nsight Systems + python-gil）（2026-11-09）
 
 #### 实验目的
@@ -10306,3 +10460,78 @@ B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都�
 - 若 A1 的 B60 把 learner 的 host 打包和解码移出 GIL，learner 侧还会再降。
 
 **7. prio 与 stale_share**：见 B54 节。prio 不设为默认；stale_share 为 1.00，是 actor 更快之后滞后一个版本被用满。
+
+### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
+
+#### 实验目的
+
+B60的忙线程对照显示：其他线程占着GIL时，learner的前向、反向、优化器从约7 s涨到约52 s。瓶颈是learner线程上的Python派发次数乘以切换间隔，不是打包。
+
+B62分步减少learner线程的Python层调用和关键路径上的host工作：
+- 步骤0：在合并树（主线B53–B60 + cpp-actor步骤0）上量C++路径的基线、各线程的GIL持有/等待，并扫描切换间隔；
+- 步骤1：N5，减少前向/反向/无梯度调用里的Python层torch调用；
+- 步骤2：teacher构建移出关键路径；
+- 步骤3：N3 + N4（页gather和索引表进C）；
+- 步骤4：fused Adam开关（只报数）。
+
+总门槛（合并树、C++路径、16个update）：
+- learner线程Python CPU（uc_*合计）≤ 3.0 s/update；
+- 步骤1–3之后update ≤ 16 s。
+
+禁令照旧：micro 8192，不减输入、模型、teacher、CF、lane预算，不丢行；job结构和BlockRollout载荷冻结。
+
+#### 实验方法
+
+- 合并：cpp-actor步骤0的提交9757566（已含4241254）合并进exp/block-memory-v1（498dec8）。
+  - 冲突在三处：`_prepare_packed`（B60的packed覆盖 + B50的nvtx范围）、`learn()`计时（B60的uc_/uo_ + B50的nvtx段）、EXPERIMENTS.md（两边的节都保留）。
+  - 9757566之后的B58a+b提交不合并。
+- `ISAAC_SWITCH_INTERVAL_US`：设置train_tok `--switch-interval`的默认值，未设时500 µs，行为不变。
+- `bridge/ops/b62_step0.sh`（GPU_LOCK原子取锁，各阶段各自取锁）：
+  - G：全量门；
+  - P：16个update的C++路径profile（prof2.sh，18.3游戏小时，与run_b54p.sh的cpp相同，500 µs）；
+  - N：nsys nvtx + python-gil，交接2..7（run_b50m.sh的命令，不做Python采样），同时用b57_threads.py采样；之后在锁外用b57_nsys.py分析；
+  - W100、W50：切换间隔100 / 50 µs的同口径profile。
+- 基准的op计数按调用方栈帧归因（`b44_learner_bench.py --opcount`，阶段O）。
+- 步骤4的数值比较：`--adam-compare`，从dump权重各重放一次update：默认Adam两次、fused一次（阶段F）。
+
+#### 实验结果
+
+步骤0（4090，2026-11-10 16:33–17:29，合并树b62a，C++路径）：
+- 全量门241 passed、2 skipped。
+
+| profile（u2–u16中位） | collect s | update s | ×实时 | 游戏小时 | uc_*合计 s |
+|---|---:|---:|---:|---:|---:|
+| prof-b58-s0（cpp步骤0，参考） | 12.49 | 21.88 | 196.6 | 18.40 | — |
+| prof-b54-cpp（参考） | 13.38 | 21.34 | 203.9 | 18.40 | — |
+| **prof-b62-cpp（合并树，500 µs）** | 14.04 | **20.33** | **212.7** | 19.48 | 8.07 |
+| prof-b62-sw100（100 µs） | 13.92 | 20.07 | 215.4 | 19.47 | 8.06 |
+| prof-b62-sw50（50 µs，只有15个update：u2–u15） | 14.90 | 19.20 | 227.8 | 18.43 | 7.97 |
+
+- 合并树里，B54 + B60同口径的update为20.3 s（预期约19.4 s），比cpp步骤0的21.9 s少1.6 s；×实时196.6 → 212.7。update仍是周期瓶颈（collect 14 s）。
+- 分段（prof-b62-cpp，wall / learner线程CPU）：u_ppo 14.74 / 3.54，u_recompute 2.41 / 1.45，u_teach_build 1.68 / 1.59，u_opt 1.03 / 1.00，u_teach_new — / 0.27。关键路径打包0.74 s。稳态重编译为0。
+- 切换间隔：
+  - 100 µs与500 µs在噪声内；
+  - 50 µs时update −1.1 s、collect +0.9 s、×实时 +7%。
+  - 都是单次run，run间差别没有量，结论需要重复确认。默认值不改，由协调方定。
+- GIL（nsys，prof-b62-gil，窗口104 s、5个周期；每周期持有 / 等待，单位s）：
+
+| 线程 | 持有 | 等待 |
+|---|---:|---:|
+| 主线程（actor / 消费者） | 7.13 | 4.02 |
+| learner | 2.15 | 3.76 |
+| pt_autograd_0（反向） | 1.54 | 2.58 |
+| python（未命名，持有最多的那个，推测是learner-prefetch） | 1.34 | 1.92 |
+| python（另一个） | 0.02 | 0.08 |
+
+  - 预取线程在OS里没有线程名，还无法确认身份；步骤1会给它设名字。
+  - actor每周期等learner 7.56 s（h.wait_learner），collect本身13.1 s。
+  - learner.forward_packed在actor采集期间平均366 ms，在actor等learner期间平均233 ms；after_teach_build对应为1212 / 730 ms。也就是说，与采集重叠时learner的这些段慢了约1.5倍。
+- Python层调用归因（基准，每个PPO part前向约14.6k次；下面是15个part的合计）：
+  - 非重入checkpoint的pack_hook元数据：45k；`torch.no_grad`/grad开关的进出：30k；add_device_types / get_rng_state等：10k。合计约85k，大头是checkpoint。
+  - Inductor生成代码里，每个Triton kernel的Python launcher（`nvidia/driver.py __call__`）：38k；`copy_misaligned_inputs`：5.5k。
+  - AOTAutograd运行时包装（逐参数genexpr）：21k；dynamo入口：9k。
+  - 本项目代码：structured_input.compile_inputs 6k、read_flex 5k、block_compile的mark / genexpr 6k、packed_rows_apply 2.5k。
+  - 优化器（每步3.7k）：Adam `_init_group` 18k、clip_grad_norm的列表推导 18k、zero_grad 7k、`_get_value` 7k。
+- 步骤4（先量）：
+  - 基准opt阶段：默认0.146 / 0.135 s，fused 0.124 s。
+  - 一次update后的参数差：默认对默认（run间）最大4.0e-6，fused对默认4.0e-6，最差的都是query_norm.bias等接近0的偏置。按参数自身量级算的ulp都在5.5万左右。fused与默认的差别和run间波动分不开。
