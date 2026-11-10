@@ -146,8 +146,10 @@ print('WORKER', 'error '+err[0][:300] if err else 'ok', 'during' if during else 
 '''
 
 
-def _run(mode):
-    r = subprocess.run([sys.executable, '-c', SCRIPT, mode], cwd=ROOT, capture_output=True, text=True, timeout=300)
+def _run(mode, capture_mode='global'):
+    env = dict(os.environ, ISAAC_CAPTURE_MODE=capture_mode)   # (the gate's control is a global-mode one: explicit)
+    r = subprocess.run([sys.executable, '-c', SCRIPT, mode], cwd=ROOT, capture_output=True, text=True, timeout=300,
+                       env=env)
     return r.returncode, r.stdout+r.stderr
 
 
@@ -158,3 +160,6 @@ def test_worker_staging_during_a_real_capture_gated_and_control():
     rc, out = _run('control')   # (gate off: the worker's calls run inside the capture, which must not survive them)
     assert 'WORKER ok during' in out or 'WORKER error' in out, out
     assert 'CAPTURE ok' not in out or 'WORKER error' in out, out
+    # BM1: in thread_local mode (ISAAC_CAPTURE_MODE) the same calls, gate off, leave the capture intact
+    rc, out = _run('control', 'thread_local')
+    assert rc == 0 and 'CAPTURE ok' in out and 'WORKER ok during' in out, out
