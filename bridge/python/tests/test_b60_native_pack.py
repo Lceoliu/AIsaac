@@ -505,3 +505,31 @@ def test_lean_checkpoint_same_outputs_and_gradients(monkeypatch):
             assert torch.equal(ga[k], gb[k]), k
     finally:
         torch.set_num_threads(threads)
+
+
+@pytest.mark.parametrize('device', ['cpu'] + (['cuda'] if torch.cuda.is_available() else []))
+def test_spatial_segment_draws_no_random_numbers(device, monkeypatch):
+    """B62 evidence for preserve_rng_state=False: a learner part's checkpointed Spatial segment (encode_block, forward
+    and the backward's recomputation) leaves the CPU and CUDA generators' states unchanged."""
+    from test_block_packed_learner import _rollout_and_teacher
+    from isaac_bridge.block_training import forward_bucketed
+    monkeypatch.setattr(block_learner, 'PACKED', True)
+    monkeypatch.setattr(block_learner, 'SPATIAL_CKPT', 1)
+    m_, ch_, te_ = _rollout_and_teacher(device, seed=48)
+    m_.train()
+    calls = []
+    inner = m_.encode_block
+
+    def spy(*a, **k):   # (the states around every call of the segment: the forward and its recomputation; the
+        #                  recomputation may end early by an exception (checkpoint's early stop): finally)
+        s0 = (torch.get_rng_state(), torch.cuda.get_rng_state() if device == 'cuda' else None)
+        try:
+            return inner(*a, **k)
+        finally:
+            s1 = (torch.get_rng_state(), torch.cuda.get_rng_state() if device == 'cuda' else None)
+            calls.append(torch.equal(s0[0], s1[0]) and (s0[1] is None or torch.equal(s0[1], s1[1])))
+    monkeypatch.setattr(m_, 'encode_block', spy)
+    out, _ = forward_bucketed(m_, ch_+te_, generator=torch.Generator().manual_seed(4), version=2, max_rows=4096)
+    n_fwd = len(calls)
+    sum(o.float().mean() for o in out).backward()
+    assert n_fwd > 0 and len(calls) > n_fwd and all(calls)
