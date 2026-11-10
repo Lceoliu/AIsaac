@@ -16,8 +16,7 @@ for A in $ARMS; do
   echo "cpp-actor $(date '+%Y-%m-%d %H:%M:%S') D1 CF diagnosis: $A, consumer off, 16 updates ($CODE)" > $R/GPU_LOCK
   guard
   P=1; [ "$A" = pack0 ] && P=0
-  ( sleep 300; { echo "cores $(nproc)"; T=$(pgrep -f 'train_tok.py' | head -1); echo "trainer pid $T threads $(ls /proc/$T/task 2>/dev/null | wc -l)";
-    for t in /proc/$T/task/*; do cat $t/comm; done | sort | uniq -c | sort -rn | head -20; echo "processes: $(pgrep -c isaac) isaac, $(ps -e --no-headers | wc -l) total"; } > $R/prof-d1-$A.threads.txt 2>&1 ) &
+  ( sleep 300; sh $ROOT/$CODE/bridge/ops/threads_snapshot.sh > $R/prof-d1-$A.threads.txt 2>&1 ) &
   ISAAC_BLOCK_CPP_CONSUMER=0 ISAAC_BLOCK_NATIVE_PACK=$P CODE=$CODE ./prof2.sh prof-d1-$A 4500 19.3
   rc=$?
   wait

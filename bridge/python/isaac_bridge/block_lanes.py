@@ -49,6 +49,49 @@ class ContextRegistry:
         self.completed.intersection_update(self.owners.values())
 
 
+class NativePoints:
+    """(B58c) BlockLaneService.points over the native point table (the driver captures): point -> (snapshot, generation,
+    version, token), the snapshot materialized once per point (a branch restores from it)."""
+
+    def __init__(self, store):
+        self.store = store
+        self.cache = {}
+
+    def __contains__(self, point):
+        return self.store.native.pt_get(int(point)) is not None
+
+    def __getitem__(self, point):
+        point = int(point)
+        hit = self.cache.get(point)
+        got = self.store.native.pt_get(point)
+        if got is None:
+            self.cache.pop(point, None)
+            raise KeyError(point)
+        snap, generation, version, token = (int(x) for x in got)
+        if hit is not None and hit[3] == token:
+            return hit
+        from .block_paged import native_snapshots
+        value = (native_snapshots(self.store, [snap])[0], generation, version, token)
+        self.cache[point] = value
+        return value
+
+    def __len__(self):
+        return len(self.store.native.pt_points())
+
+    def keys(self):
+        return self.store.native.pt_points()
+
+
+def publish_slot(generations, model, version, slot):
+    """(B58c) TeacherGenerations.publish into the slot the native point table chose (its refs are native)."""
+    import copy
+    if generations.slots[slot] is None:
+        generations.slots[slot] = copy.deepcopy(model).eval().requires_grad_(False)
+    else:
+        generations.slots[slot].load_state_dict(model.state_dict())
+    generations.versions[slot] = int(version)
+
+
 def driver_ring(driver, actor, lane):
     """(B54) The C++ driver's lineage ring of a restored lane row (SlotBlockActor `actor`, its slot `lane`): the
     decisions of the row's last block_steps steps from the lane's log (step s at position s % block_steps, -1 where the
@@ -106,6 +149,84 @@ class BlockLaneService(LaneService):
         self.deferred_begin={}  # (B54: lane -> when its branch request first waited for its point's capture)
         self.lanes_only=False   # (B54: the driver runs lanes only while the actor waits for the learner)
         self.ring_dirty=set()   # (B54: (generation, lane) rows the Python path stepped: their ring re-set before a job)
+        self.lin=None           # (B58c: the page store whose native lineage keeps the main rows' lineage: attach_lineage)
+
+    def attach_lineage(self, store):
+        """(B58c) The driver keeps the main rows' lineage: observe_rows / record_main / capture_deferred are its; the
+        CF points live in its point table (self.points a view), injury sources in its table (injury_context materializes
+        one), the reclamation of injury sources runs there; a capture whose generation needs new weights comes back as
+        a kind 6 record (on_publish)."""
+        self.lin = store
+        self.points = NativePoints(store)
+
+    def attach_native_lanes(self, driver, stream):
+        """(B58d) The lane service runs in C++ (on the driver thread, or on its own thread: ISAAC_BLOCK_CPP_LANE_THREAD):
+        tick has nothing to do here; the lane records that still come to Python are a lane graph to capture (kind 1)
+        and a job the graphs cannot take (kind 5: stepped on its lane actor, on the lane stream)."""
+        self.native_lanes = True
+        self.lane_stream = stream
+
+    def on_native_lane_record(self, rec):
+        """(B58d) A record of the native lane service; the lane service waits for the answer."""
+        import time as time_
+        kind = int(rec['kind'])
+        if kind == 3:
+            raise RuntimeError('native lane service: ' + self.driver.lane_error())
+        generation = int(rec['point'])
+        actor = self.actors[generation]
+        if kind == 1:   # a lane graph to capture (on its owner's graph, as the B54 path)
+            with torch.inference_mode(), torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=actor.bf16):
+                while actor.step_graph.capture_key(rec['cap'], rec['widths']) is None:
+                    time_.sleep(0.001)
+            self.driver.lane_job_resume()
+            return None
+        if kind == 5:
+            return self._native_python_job(rec, generation, actor)
+        raise RuntimeError(f'native lane service: a record of kind {kind}')
+
+    def _native_python_job(self, rec, generation, actor):
+        """(B58d, kind 5) A lane job the graphs cannot take, stepped here on its lane actor (the eager path) on the lane
+        stream: the rows' logs from the native heads first (the window a step reads), the step, the new decisions /
+        blocks back to the native lane service with the outputs, the driver's lineage rings re-set."""
+        from .block_paged import native_snapshots, EpisodeLog
+        from .tok_obs import ROW
+        nat = self.lin.native
+        lanes = rec['lane_ids'].numpy(); seq = rec['lane_seq'].numpy(); replay = rec['lane_replay'].numpy().astype(bool)
+        rows = rec['rows'].numpy().view(ROW); pend = rec['pending_before'].numpy()
+        before = {}
+        for lane in lanes.tolist():
+            row = actor.base+lane
+            end = nat.lin_head_end(row)
+            if end >= 0:
+                snap = nat.lin_snap_row(row, torch.zeros(len(self.model.heads), dtype=torch.long), 0)
+                try:
+                    log = native_snapshots(self.lin, [snap], retain=True)[0].log
+                finally:
+                    nat.lin_release(snap)
+                actor.logs[lane] = EpisodeLog(log.episode, log.offset, log.dec[:log.n], log.kvs[:log.n], log.blk[:log.nb], log.blk_end[:log.nb])
+            before[lane] = (actor.logs[lane], actor.logs[lane].n, actor.logs[lane].nb)
+        with torch.cuda.stream(self.lane_stream), torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=actor.bf16):
+            actor.step(rows, pend, lanes, ukeys=(seq, lanes), evaluate=replay)
+            torch.cuda.current_stream().synchronize()
+        k = len(lanes)
+        dec = np.zeros(k, np.int64); kvs = np.zeros(k, np.int64); bid = np.full(k, -1, np.int64)
+        sb = np.zeros(k, np.int64); first = rows['first'].astype(np.uint8); comp = np.zeros(k, np.uint8)
+        for q, lane in enumerate(lanes.tolist()):
+            log0, n0, nb0 = before[lane]
+            log = actor.logs[lane]
+            if log is not log0:   # (a first row: the step began a new log)
+                n0, nb0 = 0, 0
+            dec[q], kvs[q] = log.dec[log.n-1], log.kvs[log.n-1]
+            sb[q] = log.end-1
+            if log.nb > nb0:
+                bid[q] = log.blk[log.nb-1]; comp[q] = 1
+            driver_ring(self.driver, actor, lane)
+        out = np.ascontiguousarray(actor.host_output[:k], np.float32)
+        self.driver.lane_python_done(torch.from_numpy(out), torch.from_numpy(sb), torch.from_numpy(first),
+                                     torch.from_numpy(comp), torch.from_numpy(dec), torch.from_numpy(kvs), torch.from_numpy(bid),
+                                     int(rec['version']))
+        self.stat['py_lane_jobs_native'] = self.stat.get('py_lane_jobs_native', 0)+1
+        return None
 
     def attach_driver(self, driver):
         """(B54) The lane rounds' steps go to the C++ driver: _begin restores here (and sets the restored rows'
@@ -121,6 +242,8 @@ class BlockLaneService(LaneService):
 
     def observe_rows(self,workers,rows):
         """Called before Episodes.arrive, including terminal records (no action)."""
+        if self.lin is not None:   # (B58c: the driver's)
+            return
         for worker,row in zip(workers,rows):
             worker=int(worker); episode=int(row['episode']); step=int(row['t'])
             if row['first']:
@@ -134,6 +257,8 @@ class BlockLaneService(LaneService):
                         self.hurt_candidates.setdefault(worker,set()).add(key)
 
     def record_main(self,workers,rows,contexts):
+        if self.lin is not None:   # (B58c: the driver's)
+            return
         for worker,row,context in zip(workers,rows,contexts):
             worker=int(worker)
             key=(worker,int(row['episode']),int(row['t']))
@@ -143,6 +268,9 @@ class BlockLaneService(LaneService):
             del recent[:-self.recent_size]
 
     def injury_context(self,worker,episode,step):
+        if self.lin is not None:   # (B58c) the native source, materialized
+            from .block_paged import native_snapshots
+            return native_snapshots(self.lin,[self.lin.native.inj_get(int(worker),int(episode),int(step))])[0]
         return self.injury_sources[(int(worker),int(episode),int(step))]
 
     def capture_main(self,workers,rows,pending):
@@ -162,6 +290,8 @@ class BlockLaneService(LaneService):
     def capture_deferred(self, workers, requests, snapshots):
         """(B52) capture_main's CF point capture from the driver's record: the pre-step snapshots the consumer
         rebuilt, the workers' requests the driver read (and zeroed) before replying."""
+        if self.lin is not None:   # (B58c: the driver captured natively; kind 6 records for the rest)
+            return
         status = self.s.block_arrays[0]
         for worker, request, snap in zip(workers, requests, snapshots):
             if request:
@@ -170,6 +300,8 @@ class BlockLaneService(LaneService):
                 status.flat[point] = 2 if accepted else -1
 
     def service_control(self):
+        if getattr(self, 'native_lanes', False):   # (B58d: the native lane service's control)
+            return None
         nv_push('lane.control')
         try:
             return self._service_control()
@@ -208,6 +340,9 @@ class BlockLaneService(LaneService):
             pairs=np.array(records[...,:2],dtype=np.uint32,copy=True).reshape(-1,2)
             live_context.update((pairs[:,0] | (pairs[:,1]<<16)).tolist())
         self.contexts.retire(live_context,transient=True)
+        if self.lin is not None:   # (B58c: the injury sources' reclamation in the native table, the same rule)
+            self.lin.native.inj_reclaim()
+            return
         # Take a stable view of worker queue/active pins. If a writer is in its
         # short critical section, defer reclamation, never the main actor.
         before=epoch.copy()
@@ -281,12 +416,14 @@ class BlockLaneService(LaneService):
             self.lanes_only=True
         end=time_.perf_counter()+timeout
         did=False
-        while True:
-            rec=self.driver.next_record(0.0005)
+        native=getattr(self,'native_lanes',False)
+        while True:   # (B58d native lanes: only lane captures / Python jobs come here: a long wait, no busy loop)
+            rec=self.driver.next_record(max(0.0,min(end-time_.perf_counter(),0.05)) if native else 0.0005)
             if rec is not None:
                 self.driver_record(rec)
                 did=True
-            did=bool(self.tick()) or did
+            if not getattr(self,'native_lanes',False):
+                did=bool(self.tick()) or did
             if time_.perf_counter()>=end:
                 return did
 
@@ -295,10 +432,14 @@ class BlockLaneService(LaneService):
         lane graph to capture (1: captured on its owner's graph, the driver resumed unless resume=False)."""
         import time as time_
         kind=int(rec['kind'])
+        if int(rec.get('lane_src',0)):   # (B58d: a record of the native lane service)
+            return self.on_native_lane_record(rec)
         if kind==4:
             return self.on_lane_record(rec)
         if kind==5:
             return self.on_lane_python(rec)
+        if kind==6:   # (B58c: a capture's generation to publish; none come while main rows wait, kept for safety)
+            return self.on_publish(rec)
         if kind==1:
             owners=[self.main_actor,*self.actors.values()]
             own=next(a for a in owners if a.step_graph is not None and a.step_graph.owner==int(rec['owner']))
@@ -319,7 +460,7 @@ class BlockLaneService(LaneService):
         if int(model_version) != snapshot.policy_version:
             raise ValueError("point snapshot and supplied actor weights have different versions")
         if not self.generations.publish(actor_model, snapshot.policy_version):
-            self.stat['d1_refused'] = self.stat.get('d1_refused', 0)+1
+            self.__dict__['d1_refused'] = self.__dict__.get('d1_refused', 0)+1   # (not in self.stat: point_stats' row goes there)
             return False
         generation, version, teacher = self.generations.acquire(snapshot.policy_version)
         import time as time_
@@ -347,7 +488,37 @@ class BlockLaneService(LaneService):
                 bf16=self.main_actor.bf16 if self.main_actor is not None else False)
         return True
 
+    def on_publish(self, rec):
+        """(B58c) A kind 6 record: a CF capture the driver could not make because its version's teacher generation
+        needs the main weights first (TeacherGenerations.publish into the slot the point table chose); published here,
+        the point captured, the worker's next record released."""
+        nat=self.lin.native
+        point,slot,snap,worker,version=(int(rec[k]) for k in ('point','pub_slot','pub_snap','pub_worker','version'))
+        if version not in self.generations.versions:   # (another kind 6 record of this version published it already)
+            publish_slot(self.generations,self.model,version,slot)
+            torch.cuda.current_stream().synchronize()   # (B58d: the weights in place before the lane stream can use the slot)
+            nat.pt_published(slot,version)
+        if slot not in self.actors and hasattr(self.main_actor,'lane_actor'):
+            self.driver.pause()
+            try:
+                self.actors[slot]=self.main_actor.lane_actor(self.generations.slots[slot],len(self.s.lane_io),generation=slot)
+            finally:
+                self.driver.resume()
+        try:
+            got=nat.pt_capture(point,snap,version)
+        finally:
+            nat.lin_release(snap)
+        if got not in (2,-1):
+            raise RuntimeError(f'native point table: capture of point {point} after publishing generation {slot}: {got}')
+        self.driver.capture_done([worker])
+
     def release_point(self, bank_index):
+        if self.lin is not None:   # (B58c: the native table releases the generation; the contexts' owner completes)
+            token=self.lin.native.pt_release(int(bank_index))
+            self.points.cache.pop(int(bank_index),None)
+            if token>=0:
+                self.contexts.complete(token)
+            return
         snapshot, generation, version, token = self.points.pop(int(bank_index))
         self.generations.release(generation)
         self.contexts.complete(token)
@@ -365,7 +536,7 @@ class BlockLaneService(LaneService):
         both = all(r > 0 for r in self.generations.refs)
         since = self.__dict__.get('both_since')
         if since is not None and not both:
-            self.stat['d1_gen_both_s'] = self.stat.get('d1_gen_both_s', 0.0)+now-since
+            self.__dict__['d1_gen_both_s'] = self.__dict__.get('d1_gen_both_s', 0.0)+now-since
             self.both_since = None
         elif since is None and both:
             self.both_since = now
@@ -377,14 +548,14 @@ class BlockLaneService(LaneService):
         import numpy as np_
         now = time_.perf_counter()
         if self.__dict__.get('both_since') is not None:   # (an interval still open: counted up to now)
-            self.stat['d1_gen_both_s'] = self.stat.get('d1_gen_both_s', 0.0)+now-self.both_since
+            self.__dict__['d1_gen_both_s'] = self.__dict__.get('d1_gen_both_s', 0.0)+now-self.both_since
             self.both_since = now
         lives = self.__dict__.pop('d1_lives', [])
         s = np_.array([x[0] for x in lives]) if lives else np_.zeros(0)
         v = np_.array([x[1] for x in lives]) if lives else np_.zeros(0)
         q = lambda a, p: float(np_.percentile(a, p)) if len(a) else ''
         out = dict(d1_released=len(lives), d1_life_p50_s=q(s, 50), d1_life_p90_s=q(s, 90), d1_life_p50_v=q(v, 50),
-                   d1_life_p90_v=q(v, 90), d1_refused=self.stat.pop('d1_refused', 0), d1_gen_both_s=self.stat.pop('d1_gen_both_s', 0.0))
+                   d1_life_p90_v=q(v, 90), d1_refused=self.__dict__.pop('d1_refused', 0), d1_gen_both_s=self.__dict__.pop('d1_gen_both_s', 0.0))
         return out
 
     def _begin(self, idx):
@@ -512,6 +683,8 @@ class BlockLaneService(LaneService):
 
     # ------------------------------------------------------------------ B54: the rounds on the C++ driver
     def tick(self):
+        if getattr(self, 'native_lanes', False):   # (B58d: the native lane service's)
+            return False
         if self.driver is None:
             return super().tick()
         self.service_control()

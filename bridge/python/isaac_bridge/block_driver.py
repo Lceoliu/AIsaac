@@ -247,3 +247,189 @@ def attach_consumer(d, book, rolls, gamma):
         d.set_rollout(slot, a, int(len(r.frames.buf)))
         r.frames = NativeFrameArena(d, slot)
         r.native_slot = slot
+
+
+# ------------------------------------------------------------------------------------------------ B58c native lineage
+
+def native_lineage_reason(cpp_driver, native_cons, lanes):
+    """(B58c) None when the driver can keep the main rows' lineage (logs, snapshots, CF captures, injury sources, the
+    rollout sidecar) in C++, else why not (consume_record does it in Python, as B54)."""
+    if os.environ.get('ISAAC_BLOCK_CPP_LINEAGE', '1') == '0':
+        return 'ISAAC_BLOCK_CPP_LINEAGE=0'
+    if cpp_driver is None:
+        return 'no C++ driver'
+    if not native_cons:
+        return 'the Python consumer (the sidecar needs the native rollout indices)'
+    if lanes is None or lanes.main_actor is None:
+        return 'no block lanes'
+    return None
+
+
+class NativeBlockRollout:
+    """(B58c) BlockRollout over the store's native sidecar of a rollout slot: the driver records the chunk starts and
+    open decisions; reset / carry act on the native sidecar (the driver paused); materialize() (at the hand-off, in
+    the actor thread) turns them into Python PagedSnapshots, after which payload / plan are BlockRollout's."""
+
+    def __init__(self, store, slot, chunk_steps):
+        from .block_training import BlockRollout
+        self.store, self.slot = store, int(slot)
+        self.py = BlockRollout(chunk_steps)
+        self.chunk_steps = int(chunk_steps)
+
+    @property
+    def starts(self):
+        return self.py.starts
+
+    @property
+    def open(self):
+        return self.py.open
+
+    def record(self, *a, **k):
+        raise RuntimeError('native lineage: the driver records the sidecar')
+
+    def reset(self):
+        self.store.native.side_reset(self.slot)
+        self.py.reset()
+
+    def carry(self, other, workers, indices):
+        import torch
+        self.store.native.side_carry(self.slot, other.slot, torch.from_numpy(np.asarray(workers, np.int64)),
+                                     torch.from_numpy(np.asarray(indices, np.int64)))
+        self.py.reset()
+
+    def materialize(self):
+        """The native sidecar as BlockRollout's starts / open (one native call; a snapshot shared by a start and an open
+        decision is one Python object, as in BlockRollout)."""
+        from .block_paged import native_snapshots
+        keys, snaps, ow, oi, os_ = (x.numpy() for x in self.store.native.side_payload(self.slot))
+        ids = list(dict.fromkeys(snaps.tolist() + os_.tolist()))
+        objs = dict(zip(ids, native_snapshots(self.store, ids)))
+        self.py.reset()
+        for (w, i), s in zip(keys.tolist(), snaps.tolist()):
+            self.py.starts.setdefault(int(w), {})[int(i)] = objs[s]
+        for w, i, s in zip(ow.tolist(), oi.tolist(), os_.tolist()):
+            self.py.open[int(w)] = (int(i), objs[s])
+        return self
+
+    def payload(self):
+        return self.py.payload()
+
+    def plan(self, rollout, mask):
+        return self.py.plan(rollout, mask)
+
+
+def attach_lineage(d, actor, lanes, sampler, rolls):
+    """(B58c) The main rows' lineage into the driver: the store's lineage configured (window, blocks, the arena rows,
+    the injury depths), the CF points' status array, the teacher rings / injury pins for the reclamation, the driver's
+    ROW fields, the rollouts' sidecars native (NativeBlockRollout); the lanes' points / generations / injury sources
+    read from it (BlockLaneService.attach_lineage)."""
+    from .tok_obs import ROW
+    from .tok_sampler import ST, TEACH_RING
+    st = actor.store
+    cfg = actor.model.block_memory.config
+    nh = len(actor.model.heads)
+    st.native.lineage_configure(int(cfg.window), int(cfg.block_steps), int(cfg.memory_blocks), nh, int(actor.state.slots),
+                                int(sampler.cfg.workers), [int(x) for x in lanes.depths], int(rolls[0].block.chunk_steps),
+                                len(lanes.generations.slots))
+    status, mode, jobs, epoch, kept, commit = sampler.block_arrays[:6]
+    st.native.lineage_status(int(status.ctypes.data))
+    tr = sampler.teach_rows
+    st.native.lineage_teach(dict(stats=int(sampler.stats.ctypes.data), stats_stride=int(sampler.stats.shape[1]),
+                                 st_teach=int(ST['teach']), commit=int(commit.ctypes.data), ring=int(TEACH_RING) if tr is not None else 0,
+                                 rows=int(tr.ctypes.data) if tr is not None else 0, row_size=int(ROW.itemsize), o_episode=int(ROW.fields['episode'][1]),
+                                 o_t=int(ROW.fields['t'][1]), s_episode=int(ROW.fields['episode'][0].itemsize),
+                                 s_t=int(ROW.fields['t'][0].itemsize), jobs=int(jobs.ctypes.data), jobs_k=int(jobs.shape[1]),
+                                 epoch=int(epoch.ctypes.data)))
+    fields = {n: (int(ROW.fields[n][1]), int(ROW.fields[n][0].itemsize)) for n in ('episode', 't', 'hurt')}
+    d.set_lineage(True, os.getpid(), fields)
+    for r in rolls:
+        r.block = NativeBlockRollout(st, r.native_slot, r.block.chunk_steps)
+    lanes.attach_lineage(st)
+
+
+# --------------------------------------------------------------------------------------------- B58d native lanes
+
+class NativeContexts:
+    """(B58d) ContextRegistry over the native one (the lane service registers its answers' contexts in C++):
+    get(ident) materializes the snapshot, retire / complete act on the native registry."""
+
+    def __init__(self, store):
+        self.store = store
+
+    def get(self, ident):
+        from .block_paged import native_snapshots
+        return native_snapshots(self.store, [self.store.native.ctx_get(int(ident))])[0]
+
+    def complete(self, owner):
+        self.store.native.ctx_complete(int(owner))
+
+    def retire(self, live, transient=False):
+        self.store.native.ctx_retire(sorted(int(x) for x in live), bool(transient))
+
+    def put(self, owner, snapshot):
+        raise RuntimeError('native lanes: the lane service registers its contexts in C++')
+
+    @property
+    def values(self):   # (counts only)
+        return range(int(self.store.native.lin_stats()['contexts']))
+
+
+def native_lanes_reason(cpp_driver, native_lin, lanes):
+    """(B58d) None when the lane service can run in C++ (the driver thread: d1; its own thread: d2), else why not."""
+    if os.environ.get('ISAAC_BLOCK_CPP_LANES', '0') != '1':   # (B58d d1: off by default until its gate)
+        return 'ISAAC_BLOCK_CPP_LANES=0 (the default until the B58d gate)'
+    if not native_lin:
+        return 'the Python lineage'
+    gens = range(len(lanes.generations.slots))
+    if not lanes.actors or any(g not in lanes.actors for g in gens):
+        return 'the teacher generations not pre-created'
+    if any(lanes.actors[g].step_graph is None or getattr(lanes.actors[g].step_graph, 'pool_tag', 'main') != 'lane' for g in gens):
+        return 'lane graphs without their own pool'
+    s = lanes.s
+    if getattr(s, 'lane_t', None) is None or getattr(s, 'block_arrays', None) is None:
+        return 'no lane_t / block arrays'
+    return None
+
+
+def attach_lanes(d, lanes, sampler, stream):
+    """(B58d) The lane service in C++: its window constants, the lanes' shared arrays and pipes (taken out of the
+    sampler's poll sets: only the native service reads them now), both teacher generations' graph owners and arena
+    rows, the lane stream; the lane service's Python side switches to its native mode."""
+    from .tok_obs import ROW
+    from .tok_lanes import ACTIVE_S
+    from .tok_teacher2 import V2_RING
+    status, mode, jobs, epoch, kept = sampler.block_arrays[:5]
+    cfg = dict(lanes=len(sampler.lane_io), tw=int(sampler.lane_t.shape[1]), wait=float(lanes.wait), quiet=float(lanes.quiet),
+               active_s=float(ACTIVE_S), defer_s=float(lanes.DEFER_S), reclaim_s=float(lanes.RECLAIM_S), pid=os.getpid())
+    for name, a in (('lane_rows', sampler.lane_rows), ('lane_io', sampler.lane_io), ('lane_out', sampler.lane_out),
+                    ('lane_t', sampler.lane_t), ('v2_t', sampler.v2_t)):
+        if a is not None and not a.flags['C_CONTIGUOUS']:
+            raise TypeError(f'native lanes: {name} not contiguous')
+    sh = dict(rows=int(sampler.lane_rows.ctypes.data), o_episode=int(ROW.fields['episode'][1]),
+              s_episode=int(ROW.fields['episode'][0].itemsize), io=int(sampler.lane_io.ctypes.data), io_cols=int(sampler.lane_io.shape[1]),
+              out=int(sampler.lane_out.ctypes.data), out_cols=int(sampler.lane_out.shape[1]), t=int(sampler.lane_t.ctypes.data),
+              v2_t=int(sampler.v2_t.ctypes.data) if sampler.v2_t is not None else 0, v2_ring=int(V2_RING) if sampler.v2_t is not None else 0,
+              mode=int(mode.ctypes.data), status=int(status.ctypes.data), pts_per=int(status.shape[1]), kept=int(kept.ctypes.data),
+              kept_cols=int(kept.shape[1]), cf_snap=int(sampler.cf_snap.ctypes.data))
+    fds = [int(c.fileno()) for c in sampler.lane_conns]
+    for fd in fds:   # (Python never reads a lane request again)
+        for p in (getattr(sampler, '_poller', None), getattr(sampler, '_lane_poller', None)):
+            if p is not None:
+                try:
+                    p.unregister(fd)
+                except (KeyError, ValueError, OSError):
+                    pass
+        sampler._lanes.pop(fd, None)
+    gens = range(len(lanes.generations.slots))
+    owners = [int(lanes.actors[g].step_graph.owner) for g in gens]
+    bases = [int(lanes.actors[g].base) for g in gens]
+    d.lanes_configure(cfg, sh, fds, int(stream.stream_id), owners, bases)
+    lanes.attach_native_lanes(d, stream)
+    sampler.block_contexts = lanes.contexts = NativeContexts(lanes.lin)
+
+
+# (D1 / B58d) per collect: lane request timings (window / behind the caller / GPU / read -> reply) and the CF points'
+# (capture -> first lane step -> release, life in seconds and policy versions), refused captures, seconds every
+# teacher generation was pinned (ActorDriver.lane_timing), as progress.csv columns
+LANE_TIMING_FIELDS = tuple(f'{k}_{s}' for k in ('lt_window_s', 'lt_driver_s', 'lt_gpu_s', 'lt_rt_s', 'pt_first_s', 'pt_run_s',
+                                               'pt_life_s', 'pt_life_v') for s in ('n', 'p50', 'p90')) + ('pt_refused', 'pt_all_pinned_s')

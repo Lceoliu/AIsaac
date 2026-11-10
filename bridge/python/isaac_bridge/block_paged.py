@@ -379,16 +379,18 @@ class EpisodeLog:
 
 
 class PagedSnapshot:
-    """Before-observation memory reference: (log, step) plus the in-flight action."""
-    __slots__ = ('store', 'log', 'step', 'pending', 'policy_version', '__weakref__')
+    """Before-observation memory reference: (log, step) plus the in-flight action. pin (B58c): the native lineage's
+    snapshot this one was materialized from (a SnapPin: its rows stay while this object lives), None otherwise."""
+    __slots__ = ('store', 'log', 'step', 'pending', 'policy_version', 'pin', '__weakref__')
 
-    def __init__(self, store, log, step, pending, policy_version):
+    def __init__(self, store, log, step, pending, policy_version, pin=None):
         self.store, self.log, self.step = store, log, int(step)
         self.pending, self.policy_version = pending, int(policy_version)
+        self.pin = pin
         store.track(self)
 
     def fork(self):
-        return PagedSnapshot(self.store, self.log, self.step, self.pending.copy(), self.policy_version)
+        return PagedSnapshot(self.store, self.log, self.step, self.pending.copy(), self.policy_version, self.pin)
 
     def to(self, device):
         return self
@@ -403,6 +405,26 @@ class PagedPayload(list):
 
 
 # ----------------------------------------------------------------------------- store
+
+def native_snapshots(store, snaps, retain=True):
+    """(B58c) Python PagedSnapshots of native lineage snapshots (ids): each with its own log, the branch window of the
+    native log (EpisodeLog.branch: what a restore / the learner reads), and a SnapPin keeping the native snapshot
+    (retain False: the caller hands its own reference over). One native call for all of them."""
+    snaps = [int(s) for s in snaps]
+    if not snaps:
+        return []
+    ext = actor_native.load()
+    nat = store.native
+    meta, dec, kvs, blk, bend = (x.numpy() for x in nat.lin_materialize(snaps))
+    out, od, ob = [], 0, 0
+    nh = meta.shape[1]-8
+    for i, s in enumerate(snaps):
+        step, ver, lo, nd, nb, k0, k1, k2 = (int(x) for x in meta[i, :8])
+        log = EpisodeLog((k0, k1, k2), lo, dec[od:od+nd], kvs[od:od+nd], blk[ob:ob+nb], bend[ob:ob+nb])
+        od += nd; ob += nb
+        out.append(PagedSnapshot(store, log, step, meta[i:i+1, 8:8+nh].copy(), ver, ext.SnapPin(nat, s, retain)))
+    return out
+
 
 class _NativePages:
     """(B52) PagedStore.kv_pages / z_pages / b_pages over the C++ store: pages[p] is a view [page, *row shape] of the
@@ -727,6 +749,15 @@ class PagedStore:
         live_blk = np.unique(np.concatenate(live_blk)) if live_blk else np.empty(0, np.int64)
         raw = [self.b_src[live_blk].reshape(-1)] + live_raw
         live_raw = np.unique(np.concatenate(raw)) if raw else np.empty(0, np.int64)
+        if self.native is not None and self.native.lineage_on:   # B58c: the native lineage's rows kept too, freed there
+            keep = np.zeros(len(self.d_used), np.uint8); keep[live_kv] = 1
+            keep_b = np.zeros(len(self.b_used), np.uint8); keep_b[live_blk] = 1
+            n_kv, n_b, n_r = self.native.lin_collect(0, torch.from_numpy(keep), torch.from_numpy(keep_b), torch.from_numpy(live_raw))
+            self.decoded = {k: v for k, v in list(self.decoded.items()) if self.b_used[k[0]]}
+            self.collections += 1
+            self.freed['kv'] += n_kv; self.freed['blocks'] += n_b; self.freed['raw'] += n_r
+            return dict(kv=int(self.d_used.sum()), blocks=int(self.b_used.sum()), raw=self.native.raw_count(),
+                        freed_kv=n_kv, freed_blocks=n_b, freed_raw=n_r)
         if self.native is not None:
             keep = np.zeros(len(self.d_used), bool); keep[live_kv] = True
             dead = np.flatnonzero(self.d_used & ~keep)
@@ -789,6 +820,9 @@ class PagedStore:
 
 # B42 fix 2: start-up pre-capture of the actor graphs (ISAAC_BLOCK_PRECAPTURE=0: off).
 PRECAPTURE = os.environ.get('ISAAC_BLOCK_PRECAPTURE', '1') == '1'
+# B58d: the native lane service (ISAAC_BLOCK_CPP_LANES=0: the B54 Python lane service) replays the lane graphs on the
+# lane stream, possibly while the main graphs replay: the lane actors' step graphs get a memory pool of their own
+LANE_POOL = os.environ.get('ISAAC_BLOCK_CPP_LANES', '0') == '1' and os.environ.get('ISAAC_BLOCK_CPP_ACTOR', '1') != '0'
 PRECAPTURE_CAPS = (1, 2, 4, 8, 16)            # rows of a main-only / lane-only call (16 workers)
 PRECAPTURE_MERGED_CAPS = (2, 4, 8, 16, 32)    # rows of a merged main + teacher-lane call
 PRECAPTURE_ENTITIES = (16, 32, 64, 128)       # structured_input.BUCKETS['entity']
@@ -870,11 +904,14 @@ _UNPACK_KEYS = ('v_room', 'v_map', 'v_body', 'v_body_mask', 'v_local', 'v_local_
 _STEP_POOLS = {}
 
 
-def _step_pool(device, stream):
+def _step_pool(device, stream, tag='main'):
     """(B46) The actor step graphs' shared memory pool of a device. A pool lives while a graph
     using it does: a one-op keepalive graph is captured into it first and kept, so the pool
-    survives every step graph being dropped (LRU, a discarded actor) and later captures reuse it."""
-    key = str(device)
+    survives every step graph being dropped (LRU, a discarded actor) and later captures reuse it.
+    tag (B58d): 'lane' for the teacher generations' lane graphs when the native lane service may
+    replay them while the main graphs replay (their own pool: a shared pool's graphs never replay
+    concurrently)."""
+    key = f'{device}/{tag}'
     if key not in _STEP_POOLS:
         from .block_training import graph_capture
         pool = torch.cuda.graph_pool_handle()
@@ -1057,7 +1094,7 @@ class ActorStepGraph:
             # lane-generation graphs replay one at a time on the actor's stream, their outputs stay
             # referenced): a private pool per graph held ~5 GB and a late capture ran the 4090 out
             # of memory (prof-b46d u5)
-            pool = _step_pool(dev, self.capture)
+            pool = _step_pool(dev, self.capture, getattr(self, 'pool_tag', 'main'))
             with graph_capture(graph, self.capture, pool):   # B42: no full gc.collect / empty_cache per capture
                 out, current, z, written = self._body(st, greedy)
             back = tuple(torch.empty(x.shape, dtype=x.dtype).pin_memory() for x in (out, current, z, written))
@@ -1250,6 +1287,8 @@ class SlotBlockActor:
         lane = SlotBlockActor(model, slots, graph_entities=self.graph_entities, bf16=self.bf16, store=self.store,
                               arena=arena, base=base or 0)
         lane.device_result = self.device_result
+        if lane.step_graph is not None and LANE_POOL:   # (B58d: the lane graphs in a pool of their own)
+            lane.step_graph.pool_tag = 'lane'
         if PRECAPTURE and lane.step_graph is not None:
             # B42 fix 2: its lane-only step graphs now (a capture refused while the learner holds
             # the admission stays lazy)

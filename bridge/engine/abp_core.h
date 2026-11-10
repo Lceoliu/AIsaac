@@ -51,6 +51,7 @@ inline i64 load_i64(const i64 *p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE);
 struct RawEntry {
   uint8_t first;
   int32_t schema;
+  i64 gen = 0;   // (B58c) the stamp of the record that wrote it (the GC stamp rule covers raw frames too)
   std::string frame;
   std::vector<i64> pending;
 };
@@ -137,7 +138,7 @@ struct PageCore {
       memcpy(z_row(id), z+i*z_stride, z_elems*sizeof(float));
       d_meta[2*id] = steps[i]; d_meta[2*id+1] = version;
       RawEntry &e = raw[dec_out[i]];
-      e.first = first[i]; e.schema = schema[i];
+      e.first = first[i]; e.schema = schema[i]; e.gen = stamp;
       e.frame.assign((const char *)frames[i], (size_t)nbytes[i]);
       e.pending.assign(pending+i*nh, pending+(i+1)*nh);
     }
@@ -180,7 +181,12 @@ struct PageCore {
     };
     do_free(dd, nd, d_free, d_used.get(), d_meta.get(), d_gen.get(), freed_kv);
     do_free(db, nb, b_free, b_used.get(), b_meta.get(), b_gen.get(), freed_blocks);
-    for (i64 i = 0; i < nr; i++) freed_raw += (i64)raw.erase(dr[i]);
+    for (i64 i = 0; i < nr; i++) {
+      auto it = raw.find(dr[i]);
+      if (it == raw.end()) continue;
+      if (limit_gen > 0 && it->second.gen >= limit_gen) { stamp_kept++; continue; }
+      raw.erase(it); freed_raw++;
+    }
   }
 };
 
