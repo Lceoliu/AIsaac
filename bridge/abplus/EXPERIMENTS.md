@@ -10733,3 +10733,38 @@ B62 步骤1方案评估（4090，2026-11-10 18:09–18:59，b62c；单元测试4
 - Inductor cpp_wrapper（OC）：**在torch 2.7.1上不可用**。我们的动态形状kernel在编译时报`AssertionError: cpp_wrapper requires SymbolicGridFn`，回退到Python wrapper。
 - 生产learner的cProfile（第4个update，C++路径）：`.to()` 6,924次共1.70 s、`linalg_vector_norm` 2,025次共0.70 s（clip的逐参数范数）、index_select 0.64 s。这些都是等待GPU的同步，不是Python计算。CUDA同步默认自旋等待，会计进线程CPU，所以uc_*（learner线程CPU）也包括了自旋同步的时间，不全是Python。
 - host准备的cProfile（基准，串行）：`PagedStore._gather`（页gather，N3）每次update 2.24 s、`bytes.join`（源字节拼接）0.55 s、C解码0.74 s、concat 0.56 s、packed_rows_plan 0.20 s。
+
+B62 步骤1之后到4090停用（2026-11-10 19:00 – 11-11 03:20）的结果和未完成项。4090租期到期，按用户指令停在这里，下面标“未跑”“未验收”的都没有结论：
+- 已合并：cpp-actor的b4dd1fc（B58c + d1）合并成e07e6dd，没有冲突。合并后，按d1的数字，主线程GIL持有每周期3.55 → 1.41 s。合并树上的24轮计时基线**未跑**。
+- 精简checkpoint：cc043f0起默认打开（`ISAAC_LEARN_CKPT_LEAN=1`，设0恢复旧行为）。CUDA spread已接受：每个值都满足 ≤ max(4·spread, 2 ulp)，5对串行。**全量门验收未完成**：
+  - b62d、b62g两次全量门各26 failed；b62e是253 passed，唯一的失败是h2d测试自身的问题。
+  - 失败是一串连锁：第一个是test_b54_driver_lanes里actor step graph的capture报“operation failed due to a previous error during capture”，后面是“Offset increment outside graph capture”“beginAllocateToPool: already recording”。
+  - b62d、b62g两棵树都没有cpp在graph_capture里关gc的修法（B58）；合并树有。修法的机制没有证实，cpp的docstring写的是unconfirmed mitigation。
+  - 协调定的验收：合并树全量门连续3次全绿，lean的验收跟这3次一起判。**3次全绿未做**；合并树b62m的那一次也没跑。
+- 阻塞同步（`ISAAC_CUDA_BLOCKING_SYNC`，默认auto，只用来测量）：blocking臂里learner线程真实的Python CPU是uc_*合计5.98 s/update，门槛 ≤ 3.0 s，**未达**。uc_teach_build的1.6 s是在自旋等GPU。
+- 异步H2D（`ISAAC_LEARN_ASYNC_H2D`，默认关，代码保留，开不开由集成树决定）：u_teach_build 1.68 → 0.15 s，整次run只分配2次、0.02 MB。
+- B2上界（bridge/ops/b62_gpu_idle.py）：
+  - 基准：度量2（Spatial段里因host派发造成的GPU空隙）0.80 s/update（244个spatial段、45,652次launch）；度量1（整卡空闲）3.33 s。
+  - 生产（旧树，当时主线程还跑Python lane服务，没有spatial nvtx段）：度量1为actor等learner期间2.61 s。
+  - 合并树（d1）上两个度量都**未重测**，B2做不做没有结论。
+- N3页gather、N4 Reader索引表进C（abp_learn.c VERSION 6004），代码在树里。关键路径打包 ≤ 0.3 s的门在之前的测量里未达，合并树上未重测。teacher构建移到C、N4剩余部分：**未做**。
+- d1对照臂（lane调用/s，噪声带308–341）：prefetch全关408，在噪声带外；pfrc0 328（done 81）；pfep0 265；pack0 299。按协调意见不做prefetch节流；关prefetch的重复臂已撤。
+- 合并树上的nsys python-gil（为了认出那个未命名的GIL持有线程，以及pt_autograd_0持有约1.1 s的原因）**未跑**。
+
+#### capture闸（SIDE_CUDA）与探针（2026-11-11，去留未定）
+
+- 读代码的发现：learner预取线程（learner-prefetch）不走capture准入。Staging.acquire会做事件查询和等待、pinned分配，释放旧缓冲时host分配器会record event。capture_yield在两个part之间把准入让给actor做capture，而这时worker正在准备下一个part，两者可能重叠。
+- 闸：02b6024、8ab0a8b、6293c3e。
+  - block_training.SideCuda写者优先。graph_capture在拿到准入之后取独占端；worker的每个CUDA调用各取一次共享端，闸内不再拿别的锁。
+  - capture线程在自己的capture体内走到旁路调用时直接报错。
+  - 两侧的等待次数和秒数进progress.csv：b42_side_cuda_call_waits / _wait_s、b42_side_cuda_capture_waits / _wait_s。capture等待超过5 s打警告。
+  - worker做完一个job立刻放掉引用，这一步也算一次闸内调用：之前旧的box可能是被替换掉的pinned缓冲的最后持有者。
+  - **去留未定**：要看探针对照组的结果，三种调用都不让capture作废就撤掉闸。开销门（每个update < 1 ms，24轮计时在噪声内）**未测**。
+- 探针bridge/ops/b62_capture_probe.py（阶段CP）：每个case一个子进程，在global模式capture进行中，分别由另一条线程做query、sync、pinned分配 / 复用 / 释放、graph重放、异步H2D、另一流的同步；另外测在capture体内gc.collect()回收持有graph、pinned缓冲或actor的引用环，以及走graph_capture的正常组。**未跑**：排在cpp全量门之后，4090停用时取消。
+- tests/test_b62_capture_gate.py：闸的语义测试、自锁测试，以及子进程里的真实capture（开闸的正常组 + 关闸的对照组，对照组必须失败）。本地CPU上闸的语义和自锁两部分通过；CUDA部分**未跑**。
+- tests/conftest.py（常开）：每个测试结束时要求prefetch队列为空、make_driver造的driver已停、测试中新起的Python线程和原生线程2 s内结束（pt_*、cuda*开头的线程池除外）。**还没在4090上跑过**，白名单可能需要补。
+- 枚举（只读代码，全文在协调的共享笔记b62-capture-enumeration.md）：
+  - 训练中所有capture都由actor主线程在拿到准入之后做。
+  - 默认配置d1下，driver线程、原生consumer、原生lane服务都不会和capture重叠。只有单独的lane线程（d2，默认关）会重叠，已作为d2的前置条件交给cpp-actor。
+  - learner_loop的`job = jobs.get()`在准入外，只在learner和actor分设备时才有风险，当前配置是同一张卡，不修。
+  - tok_policy.py:2313的旧GraphActor直接用torch.cuda.graph，不经过graph_capture；block路径不用它。
