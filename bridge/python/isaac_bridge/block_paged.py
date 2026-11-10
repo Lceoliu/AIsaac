@@ -822,7 +822,7 @@ class PagedStore:
 PRECAPTURE = os.environ.get('ISAAC_BLOCK_PRECAPTURE', '1') == '1'
 # B58d: the native lane service (ISAAC_BLOCK_CPP_LANES=0: the B54 Python lane service) replays the lane graphs on the
 # lane stream, possibly while the main graphs replay: the lane actors' step graphs get a memory pool of their own
-LANE_POOL = os.environ.get('ISAAC_BLOCK_CPP_LANES', '0') == '1' and os.environ.get('ISAAC_BLOCK_CPP_ACTOR', '1') != '0'
+LANE_POOL = os.environ.get('ISAAC_BLOCK_CPP_LANES', '1') != '0' and os.environ.get('ISAAC_BLOCK_CPP_ACTOR', '1') != '0'
 PRECAPTURE_CAPS = (1, 2, 4, 8, 16)            # rows of a main-only / lane-only call (16 workers)
 PRECAPTURE_MERGED_CAPS = (2, 4, 8, 16, 32)    # rows of a merged main + teacher-lane call
 PRECAPTURE_ENTITIES = (16, 32, 64, 128)       # structured_input.BUCKETS['entity']

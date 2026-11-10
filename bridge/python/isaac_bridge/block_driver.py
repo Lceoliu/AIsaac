@@ -378,8 +378,8 @@ class NativeContexts:
 
 def native_lanes_reason(cpp_driver, native_lin, lanes):
     """(B58d) None when the lane service can run in C++ (the driver thread: d1; its own thread: d2), else why not."""
-    if os.environ.get('ISAAC_BLOCK_CPP_LANES', '0') != '1':   # (B58d d1: off by default until its gate)
-        return 'ISAAC_BLOCK_CPP_LANES=0 (the default until the B58d gate)'
+    if os.environ.get('ISAAC_BLOCK_CPP_LANES', '1') == '0':   # (B58d d1: on by default since its gate)
+        return 'ISAAC_BLOCK_CPP_LANES=0'
     if not native_lin:
         return 'the Python lineage'
     gens = range(len(lanes.generations.slots))

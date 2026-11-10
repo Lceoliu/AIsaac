@@ -10589,6 +10589,69 @@ B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都�
 - 生产中的合并：每 collect lane 作业约 1,000，合并 4 次，与 B58c 之前的运行同样接近 0，没有变少。
 - 过程中的事件：20:53 的全量门 250 过 1 败（failed/tests-b54-full-1110-205338.log），败项是新加的 d1 等价测试，抓到 kind 5 记录的版本被主版本覆盖，0f23fbe 修复；这次新测试没先单独跑绿就进了全量门，已改成先单独跑。另一次 smoke 失败是上一轮留下的输出目录（train_tok 拒绝已有目录），run_b58c.sh 改成阶段开始前先移走旧产物。
 
+### B58d d1 原生 lane 服务（由 driver 线程驱动），默认打开（2026-11-11，验收）
+
+#### 实验目的
+
+把 B54 的 Python lane 服务整段搬进 C++，使主线程不再逐轮进入 Python。lane 的四件事都由 C++ 做：接收请求、按窗口规则判定、控制、提交与恢复。lane 作业、答复写回、context 注册和回收也在 C++ 里。同时回答一个问题：lane 吞吐被什么限住。
+
+#### 实验方法
+
+- **代码**：
+  - abp_lanes.h（不依赖 torch 的 LaneCore 状态机），driver 的 lane_pass：每个主步之后、空转 poll 时、actor 等 learner 的 main_hold 期间各调一次；
+  - 原生 restore；lane 作业放在优先级 −5 的 lane 流上，lane 图用单独的内存池和单独的 scratch 行；
+  - kind 1 / 5 记录交回 Python。0f23fbe 修了 kind 5 记录的版本被主版本覆盖。
+- **开关**：`ISAAC_BLOCK_CPP_LANES`，本次验收后默认 1，=0 回到 B54 的 Python lane 服务。`ISAAC_BLOCK_CPP_LANE_THREAD=1`（独立 lane 线程）默认关，属于 d2。
+- **测试**：
+  - test_b58d_lanes：12 轮脚本流与 B54 Python 服务逐次一致；lanes-only 模式与 harness 一致；窗口规则与 Python 逐次一致；版本保护。
+  - lane 状态机 TSAN：3 个种子，0 警告 0 错值；先回复后写答案的对照组失败。
+  - 全量门（CPP_LANES=1）：entry 2 过，full 252 过 2 跳过，A8 8/8。
+- **计时**：候选 candidate-b58d1 = 09e6b76，安静机器，三臂连着跑，各 24 轮、29.14 游戏小时，不带 nsys。
+  - A：CPP_LANES=1；
+  - B：CPP_LANES=0（B58c）；
+  - C：CPP_LINEAGE=0（同一棵树上的 B58a+b）。
+- **nsys**：prof-d1-m，CPP_LANES=1，6 轮，hand-off 2–5。
+
+#### 实验结果
+
+| u15 / u10+ 中位 | A：LANES=1 | B：LANES=0 | C：LINEAGE=0 |
+|---|---:|---:|---:|
+| cf_done / cf_nobank / cf_lane_calls / cf_queue | 95 / 42 / 119.0k / 0 | 78 / 439 / 99.1k / 10 | 79 / 436 / 110.8k / 0 |
+| lane 调用 /s，cf_done /游戏小时 | 405，5.22 | 355，4.28 | 401，4.34 |
+| collect / update（s） | 20.25 / 14.50 | 18.77 / 17.19 | 17.86 / 18.03 |
+| ×实时（u10–u23 中位） | 205.5 | 225.0 | 236.3 |
+| 点寿命 p50 / p90（s） | 20.2 / 25.9 | 36.0 / 50.9 | 35.5 / 48.9 |
+| 全部代槽同时被占（s / collect） | 14.6 | 18.3 | 17.8 |
+| driver 主步 sync / driver 里的 lane 秒 | 7.59 / 9.59 | 8.68 / 7.49 | 8.51 / 7.11 |
+| 每 collect lane 作业（每作业行数） | 2,986（2.56） | 2,021（4.12） | 2,012（3.36） |
+| 最低可用内存 / isaac 进程峰值 | 2.8 GiB / 479 | 1.5 GiB / 498 | 3.0 GiB / 459 |
+
+- A 的 lane 请求时间拆分（u2+ 中位）：窗口等待 p50 0、p90 1 ms；等 driver 为 0；GPU 2 ms；从读到请求到回复 p50 3 ms、p90 6 ms。对照的 B（Python 服务）每轮窗口 4.3 ms、从提交到答复 14.4 ms。
+- A 的点寿命分解：从 capture 到第一个 lane 步 p50 3.4 s；从第一步到释放 16.6 s；跨 1 个策略版本。
+- 结论：lane 吞吐和 CF 的限制在主线程喂 job、收答复的一侧。A 和 C 的 lane 调用每秒几乎一样（405 对 401），但每步往返短了，点活的时间减半，代槽不再被占满。所以 CF 回到合并前水平，只有 A 过 CF 门。
+- 代价：A 的 lane 作业仍在 driver 线程上和主步串行，collect 比 B 长 1.5 s，×实时 205.5。这一点由 d2 处理。
+- nsys（每周期，B58c 对 d1）：
+  - 主线程 GIL 持有 3.55 → 1.41 s，等待 2.55 → 1.26 s；
+  - learner 等待 2.27 → 1.16 s，这就是 update 变短的原因；
+  - 主线程顶层进 Python：c.next 约 8,300 次（next_record 每 2 ms 轮询一次），c.record 约 2,400 次（共 0.27 s）；
+  - 交接：pause_drain 3 ms、h.job 65 ms、h.gc 195 ms。
+- 进 Python 次数（门 500）和 GIL 持有（门 0.5 s）还没达标，归 B58e：事件分批交给 Python，主循环改成阻塞等待，pending 和计数挪进 C++。交接停顿归 B59。
+
+#### 补充：D 臂（独立 lane 线程，正确性未经测试，仅供设计判断）
+
+配置为 CPP_LANES=1 加 CPP_LANE_THREAD=1，candidate-b58d1d，24 轮，在 990 s 上限内正常结束。自检全部通过：traceback 0，cf_dropped 0，原生答复与 worker 收到的答复差 1%，cf_done 与 lane 调用之比和 A 同量级。
+
+| | D | A |
+|---|---:|---:|
+| u15 cf_done / nobank | 87 / 334 | 95 / 42 |
+| lane 调用 /s，cf_done /游戏小时 | 487，4.78 | 405，5.22 |
+| collect / update（s），×实时 | 17.36 / 15.23，243.4 | 20.25 / 14.50，205.5 |
+| driver 主步 sync（s / collect） | 14.53 | 7.59 |
+| lane 作业单次，从读到回复 p50 | 5.00 ms，6 ms | 3.27 ms，3 ms |
+| 点寿命 p50 / p90（s） | 26.2 / 34.9 | 20.2 / 25.9 |
+
+两条流能部分并行，所以 collect 和 ×实时回来了。但 GPU 是共享的：主步的单步同步变长约 26%，主步数也多了一半；lane 往返翻倍，CF 没过门。每次重放的固定耗时乘以重放次数，卡住了 collect。d2 先交书面方案：lane 行并入主步，或者合批。
+
 ### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
 
 #### 实验目的
