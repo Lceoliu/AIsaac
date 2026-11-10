@@ -974,8 +974,7 @@ struct ActorDriver {
       auto ls = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
       test_guard.reset(new c10::cuda::CUDAStreamGuard(ls));
     }
-    reset_rows({row});   // (its row ids go to the device from pageable memory: a copy that waits for the stream's work)
-    if (restore_test == 1) at::cuda::sleep(4000000000LL);   // (so the long kernel after it: the pinned copies below wait)
+    reset_rows({row});
     auto dev = kv_t.device();
     auto D = [&](at::Tensor x) { return x.to(dev, /*non_blocking=*/true); };
     // reset.tensors: kv, then BlockSlotState._rows: bank, partial, steps, kv_steps, kv_versions, bank_ends, bank_versions,
@@ -1009,6 +1008,9 @@ struct ActorDriver {
       bank_source_versions.select(0, row).index_copy_(0, col, D(bsrcv.pin_memory()));
     }
     step_host[row] = p.step;
+    // (the control's long kernel goes right before the last write, the row's step counter: earlier, a pageable id copy
+    // (reset_rows) or a pinned allocation (pin_memory) waits for the stream's work / the device and orders it again)
+    if (restore_test == 1) at::cuda::sleep(4000000000LL);
     steps_t.select(0, row).fill_(p.step);
     memcpy(&ring_dec[row*block_steps], rdec.data(), block_steps*8); memcpy(&ring_kv[row*block_steps], rkv.data(), block_steps*8);
     ring_n[row] = rn;
