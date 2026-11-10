@@ -15,7 +15,7 @@ GPU=${GPU:-1}; UPDATES=${UPDATES:-24}; HOURS=${HOURS:-30.0}; LIMIT=${LIMIT:-4500
 R=$BM/reports; LOG=$R/bm1.log
 mkdir -p $R
 [ -e $R/$TAG ] && { echo "prof.sh: $R/$TAG exists (never overwritten)" >&2; exit 2; }
-take "timed $TAG ($TREE, GPU $GPU) 计时运行"
+if [ "${NOLOCK:-0}" = 1 ]; then LOCKLINE="(held by the caller: ${LOCKS_HELD:-?})"; else take "timed $TAG ($TREE, GPU $GPU) 计时运行"; fi
 echo "$(date '+%F %T') $TAG start: tree $TREE GPU $GPU updates $UPDATES hours $HOURS lock: $LOCKLINE" >> $LOG
 nvidia-smi -i $GPU --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,clocks.sm,index --format=csv,noheader -l 1 > $R/$TAG.gpu &
 S1=$!
@@ -56,4 +56,4 @@ kill $S1 $S2 $S3 $S4 $S5 $S6 2>/dev/null
 [ -d $R/$TAG/checkpoints ] && gio trash $R/$TAG/checkpoints
 echo "$(date '+%F %T') $TAG done rc=$rc rows $(($(wc -l < $R/$TAG/progress.csv 2>/dev/null || echo 1)-1))" >> $LOG
 python3 $BM/summ.py $R $TAG "${CPUSET:-0-11,24-35}" $GPU > $R/$TAG.summary.txt 2>&1   # (still inside the lock)
-give
+[ "${NOLOCK:-0}" = 1 ] || give

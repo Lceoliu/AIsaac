@@ -18,6 +18,10 @@
 | `xnew2.sh` | 4090 `xnew2.sh` 的移植，在容器里执行 |
 | `prof.sh` | 计时 profile，对应 4090 的 `prof2.sh` + `b62_step0.sh P24`：拿锁，`ISAAC_BLOCK_TIMING=1`，到 N 个 update 后给 train_tok 发 SIGINT。同时采样该卡的 nvidia-smi（1 s）、全部 GPU（5 s）和 `mpstat -P ALL 5`。跑完把 checkpoints 移进回收站 |
 | `gate.sh` | 一棵树的全量门（pytest tests）。日志带时间戳，从不覆盖，失败的拷进 `reports/failed/` |
+| `shard2.sh` | 两个分片同时计时：分片0 = GPU 1、2 + node0，分片1 = GPU 4、5 + node1。各自 learner 在第二张卡（`--learner-device=cuda:1`），每个容器 MEM=50g，同时拿 LOCK_node0 和 LOCK_node1。隔离方式见脚本头 |
+| `job.sh` | 一个不计时的容器作业，在锁下运行 |
+| `m0_mem.py` / `summ.py` | M0 采样（内存按进程类别、cgroup、每类核数、trainer 线程）；汇总（u2–u23 / u10+ 中位、CF、GPU 按周期阶段、mpstat） |
+| `diag_threads.py`、`ptc_trace.c`、`abrt_trace.c` | 诊断：遗留线程出生时的 Python 栈；pthread_create 的原生调用栈（LD_PRELOAD）；SIGABRT 时的原生栈和线程名（LD_PRELOAD，只在 train_tok 进程里生效） |
 | `probe.sh` | `b62_capture_probe.py`（B62 的 capture 探针） |
 | `deploy.sh` | `tree <名> <tar>`：解开一棵 git-archive 树。`abphome <树>`：建游戏目录 |
 | `lock.sh` | 本道的锁 `LOCK_node0`，内容是 "<session> <时间> <用途>"，用 noclobber 原子地取 |
@@ -63,3 +67,8 @@ GPU=1 ./probe.sh m77657fc
   - venv 有而 4090 没有的：pandas、matplotlib、stable-baselines3、sb3-contrib、psutil 等，train_tok 不用。
 - 游戏：runtime 用这台机器原有的只读 runtime。libabp_turbo.so 在容器里用 gcc 11.4 从同一份 `bridge/engine/abp_turbo.c` 编出来，和 4090 的源码字节相同；大小 111,584 字节，和 4090 的 .so 一样。bridge Lua 用树里自己的，和 4090 用的 candidate-a1 那份内容相同。
 - 采样：4090 只有 `<tag>.gpu`。这里另外采全部 GPU 和 mpstat，用来判断有没有被其他租户污染。
+
+## 已知事项
+
+- `tests/test_block_memory.py` 在 import 时调用 `torch.set_num_threads(4)`：只要它被收集，之后的所有测试都在 4 个 intra-op 线程下跑。现有的全部通过记录都是在这个条件下得到的，所以暂时不改；以后有空档时改成 fixture（设置后恢复）。conftest 的 session 预热在收集之后做，所以由它带起来的 libgomp 线程池不会被记到某个测试头上。
+- `xnew2.sh` 的 `NAME` 和 `PORT`（默认 b42new / 39200，和 4090 一样）：同一台机器上跑几个 trainer 时，每个要不同（shard2.sh 用 s0a / 39200 和 s1b / 39600）。
