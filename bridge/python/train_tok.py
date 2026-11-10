@@ -1894,6 +1894,9 @@ def main(argv=None, child=None, actor=None):
                         'the learner thread runs Python (default of Python: 0.005; B62: the default from '
                         'ISAAC_SWITCH_INTERVAL_US, 500 us when unset)')
     args = p.parse_args(argv)
+    # B62: how the host threads wait for the GPU (ISAAC_CUDA_BLOCKING_SYNC; set before the CUDA context exists)
+    from isaac_bridge import cuda_sched
+    cuda_sched_req = cuda_sched.apply()
     resume_input_config = (torch.load(args.resume,map_location='cpu',weights_only=False).get('config',{})
                            if args.resume else {})
     if args.block_memory or resume_input_config.get('block_config') is not None:
@@ -2470,6 +2473,8 @@ def main(argv=None, child=None, actor=None):
                     print(f'B44 Flex Reader warm-up: {block_compile.STATS["compiles"]-c_r} graphs in {s_r:.1f} s',
                           flush=True)
             print(f'B56 compile cache after warm-up: {block_compile.cache_counters()}',flush=True)
+            print(f'B62 CUDA scheduling: requested {cuda_sched_req[0] or "auto"} (rc {cuda_sched_req[1]}), '
+                  f'effective {cuda_sched.effective()}',flush=True)
             block_compile.mark_steady()
         # B42: everything alive now (models, compiled code, buffers) leaves the collector's
         # generations; later collections scan only what the run allocates afterwards.

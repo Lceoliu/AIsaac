@@ -48,9 +48,10 @@ SPATIAL_ROWS = int(os.environ.get('ISAAC_LEARN_SPATIAL_ROWS', '4096'))
 # (the default 'default' records every saved tensor's shape / dtype / device under no_grad in the pack hook, a debug
 # check at recompute) and preserve_rng_state False (no stash / restore of the CPU and CUDA RNG states per call: the
 # Spatial encoder draws no random numbers). The same recomputation and values; ~5.7k fewer Python-level torch calls
-# per PPO part (B62 attribution). Default off until reviewed (ISAAC_LEARN_CKPT_LEAN=1: on; off: the B44-B60 call).
+# per PPO part (B62 attribution; test_spatial_segment_draws_no_random_numbers guards the RNG premise).
+# ISAAC_LEARN_CKPT_LEAN=0: the B44-B60 call.
 LEAN_CKPT_KW = dict(use_reentrant=False, preserve_rng_state=False, determinism_check='none')
-CKPT_KW = LEAN_CKPT_KW if os.environ.get('ISAAC_LEARN_CKPT_LEAN', '0') == '1' else dict(use_reentrant=False)
+CKPT_KW = LEAN_CKPT_KW if os.environ.get('ISAAC_LEARN_CKPT_LEAN', '1') == '1' else dict(use_reentrant=False)
 
 
 class _PrepLock:

@@ -25,13 +25,15 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 
-def run(prefetch):
+def run(prefetch, lean=None):
     from test_block_packed_learner import _rollout_and_teacher
     from test_block_slot_integration import _losses
     from isaac_bridge import block_learner
     from isaac_bridge.block_training import forward_bucketed, source_rows
     from isaac_bridge.structured_input import from_rows
     block_learner.PACKED = True
+    if lean is not None:   # (B62: the lean checkpoint (LEAN_CKPT_KW) or the B44-B60 call)
+        block_learner.CKPT_KW = block_learner.LEAN_CKPT_KW if lean else dict(use_reentrant=False)
     m_, ch_, te_ = _rollout_and_teacher('cuda', seed=37)
     batch = ch_+te_
     idx = np.array_split(np.arange(len(batch)), 3)
@@ -85,11 +87,12 @@ def main():
     torch.set_num_threads(1)
     torch.use_deterministic_algorithms(True, warn_only=True)
     t0 = time.perf_counter()
-    ref = run(False)
-    res = dict(code=code, torch=torch.__version__, pairs=pairs, serial=[], prefetched=[])
+    lean = '--lean-compare' in sys.argv   # (B62: kinds 'serial' = default checkpoint, 'prefetched' = lean, serial)
+    ref = run(False, False if lean else None)
+    res = dict(code=code, torch=torch.__version__, pairs=pairs, serial=[], prefetched=[], lean_compare=lean)
     for i in range(pairs):
         for kind, pf in (('serial', False), ('prefetched', True)):
-            c = compare(ref, run(pf))
+            c = compare(ref, run(False, pf) if lean else run(pf))
             res[kind].append(c)
             print(json.dumps(dict(i=i, kind=kind, **c)), flush=True)
     for kind in ('serial', 'prefetched'):

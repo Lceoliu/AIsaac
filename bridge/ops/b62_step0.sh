@@ -47,6 +47,44 @@ for S in "$@"; do
     echo "$(date '+%F %T') G full gate rc=$? $(tail -1 $R/tests-b62-full.log)" >> $LOG
     ;;
   P) prof prof-b62-cpp ISAAC_SWITCH_INTERVAL_US=500 ;;
+  L)   # (lean checkpoint vs the B44-B60 call on CUDA, 20 + 20 pairs, B48 spread rule)
+    cd $OPS
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 timeout 600 $PY b60_prefetch_spread.py $ROOT/$CODE $R/b62-lean-spread.json       --pairs 20 --lean-compare > $R/b62-lean-spread.log 2>&1
+    echo "$(date '+%F %T') L lean spread rc=$? $(tail -1 $R/b62-lean-spread.log | cut -c1-300)" >> $LOG
+    ;;
+  P24|Y24)   # (24 updates, stopped by SIGINT to the train_tok main process; Y24: ISAAC_CUDA_BLOCKING_SYNC=$SYNC)
+    TAG=prof-b62-$S${SYNC:+-$SYNC}
+    python3 $OPS/b57_threads.py $R/$TAG.threads.csv 1.0 > $R/$TAG.threads.log 2>&1 &
+    THR=$!
+    cd $ROOT
+    ( ISAAC_CUDA_BLOCKING_SYNC=${SYNC:-} CODE=$CODE ./prof2.sh $TAG 4500 ${HOURS24:-30.0} ) &
+    PP=$!
+    while kill -0 $PP 2>/dev/null; do
+      sleep 15
+      n=0
+      [ -f $R/$TAG/progress.csv ] && n=$(($(wc -l < $R/$TAG/progress.csv)-1))
+      if [ $n -ge ${UPDATES:-24} ]; then
+        echo "$(date '+%F %T') $TAG: $n updates, SIGINT to the train_tok main process" >> $LOG
+        pkill -INT -f "^$PY -u train_tok.py"
+        break
+      fi
+    done
+    wait $PP
+    kill $THR 2>/dev/null
+    echo "$(date '+%F %T') $TAG done, $(grep -h 'B62 CUDA scheduling' $R/$TAG.stdout | head -1)" >> $LOG
+    ;;
+  NC)   # (nsys cuda + nvtx over hand-offs 2..4, the C++ path: the GPU idle on the learner's critical path)
+    TAG=prof-b62-cuda
+    OUT=$R/$TAG
+    cd $ROOT/$CODE/bridge/python
+    export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+    export ABP_HOME=$ROOT/formal/abplus ABP_BRIDGE_LUA=$ROOT/candidate-a1/bridge/abplus/abp_bridge.lua
+    export LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null
+    export ISAAC_BLOCK_TIMING=1 ISAAC_BLOCK_NVTX=1 ISAAC_NSYS_RANGE=2:4 ISAAC_NSYS_TRIGGER=nvtx
+    NS="/usr/local/cuda/bin/nsys profile -t cuda,nvtx --sample=none --cpuctxsw=none --cuda-graph-trace=graph       --capture-range=nvtx --nvtx-capture=B50window -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0 --capture-range-end=stop       -o $R/$TAG.nsys-rep --force-overwrite true"
+    xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" timeout --signal=INT --kill-after=60s 1800 $NS       $PY -u $(cat $R/prof-b62-gil.command.txt | sed 's/.*train_tok.py/train_tok.py/; s/--name b62gil/--name b62cuda/; s#--out [^ ]*#--out '$OUT'#; s/--game-hours 10.3/--game-hours 6.1/')       > $OUT.stdout 2> $OUT.stderr
+    echo "$(date '+%F %T') NC nsys done rc=$? $(ls -la $R/$TAG.nsys-rep 2>/dev/null | awk '{print $5}') bytes" >> $LOG
+    ;;
   T)   # (the B60 / B62 unit tests and the B48 prefetch test on this host)
     cd $ROOT/$CODE/bridge/python
     CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=1 timeout 300 $PY -m pytest tests/test_b60_native_pack.py       tests/test_b48_prefetch.py tests/test_block_packed_learner.py -q -p no:cacheprovider > $R/tests-b62-t.log 2>&1
@@ -106,6 +144,11 @@ for S in "$@"; do
     ;;
   esac
   give $S
+  if [ $S = NC ]; then   # (CPU only, after the lock)
+    python3 $OPS/b62_gpu_idle.py $R/prof-b62-cuda.nsys-rep > $R/prof-b62-cuda.idle.txt 2>&1
+    echo "$(date '+%F %T') NC analysis rc=$? $(tail -2 $R/prof-b62-cuda.idle.txt | tr '
+' ' ' | cut -c1-300)" >> $LOG
+  fi
   if [ $S = N ]; then   # (CPU only, after the lock)
     python3 $OPS/b57_nsys.py $R/prof-b62-gil.nsys-rep $R/prof-b62-gil.threads.csv > $R/prof-b62-gil.analysis.txt 2>&1
     echo "$(date '+%F %T') N analysis rc=$?" >> $LOG
