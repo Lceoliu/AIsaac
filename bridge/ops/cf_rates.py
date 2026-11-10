@@ -40,6 +40,11 @@ def main():
         print('  u15: ' + ', '.join(f'{k} {u.get(k, "")}' for k in ('cf_done', 'cf_nobank', 'cf_lane_calls', 'cf_queue')))
         print(f'  rates over u1-u15 ({wall:.0f} s wall, {gh:.2f} game hours): lane calls {lane/wall:.0f}/s, done {done/wall:.3f}/s, '
               f'{done/gh:.2f}/game hour')
+        both = [num(r.get('pt_all_pinned_s')) for r in rows[1:]] if 'pt_all_pinned_s' in rows[0] and rows[1].get('pt_all_pinned_s', '') != ''             else [num(r.get('d1_gen_both_s')) for r in rows[1:]]   # (native points / the Python lane service's)
+        both = [x for x in both if x == x]
+        life = ('pt_life_s_p50', 'pt_life_s_p90') if rows[1].get('pt_life_s_p50', '') != '' or rows[2].get('pt_life_s_p50', '') != ''             else ('d1_life_p50_s', 'd1_life_p90_s')
+        print(f'  points: life p50 {med(rows, life[0], 2):.1f} s, p90 {med(rows, life[1], 2):.1f} s (u2+ medians of {life[0][:7]}), '
+              f'every generation pinned {statistics.median(both) if both else float("nan"):.1f} s per collect (median)')
         print('  timing medians (u2+): ' + ', '.join(f'{k} p50 {med(rows, k+"_p50", 2):.3f} p90 {med(rows, k+"_p90", 2):.3f}'
                                                    for k in TIMING))
 
