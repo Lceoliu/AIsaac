@@ -4343,29 +4343,32 @@ def main(argv=None, child=None, actor=None):
             row['v2_loss_pi'] = vacc_c[0] / v2_steps if v2_steps else ''
             row['v2_loss_vf'] = vacc_c[1] / v2_steps if v2_steps else ''
             row['v2_logp'] = vacc_c[2] / v2_steps if v2_steps else ''
-            row['v2_lane_calls'], row['v2_lane_rows'] = lane_stat['calls'], lane_stat['rows']
-            row['v2_lane_s'] = lane_stat['s']   # (B36: the actor thread's seconds in the lane service)
-            row['v2_lane_fly_s'], row['v2_lane_held_s'] = lane_stat['fly_s'], lane_stat['held_s']   # (B36)
-            row['v2_lane_eager'] = lane_stat['eager']
+            # (the collect's counters as of this job's hand-off: the shared dict already holds the next collect's when the
+            # actor's next collect ended before this update's row is written; the learner process gets this copy too)
+            lane_stat_j = job.get('lane_stat') or lane_stat
+            row['v2_lane_calls'], row['v2_lane_rows'] = lane_stat_j['calls'], lane_stat_j['rows']
+            row['v2_lane_s'] = lane_stat_j['s']   # (B36: the actor thread's seconds in the lane service)
+            row['v2_lane_fly_s'], row['v2_lane_held_s'] = lane_stat_j['fly_s'], lane_stat_j['held_s']   # (B36)
+            row['v2_lane_eager'] = lane_stat_j['eager']
             if block_on:
-                row['block_merged_main_rows']=lane_stat.get('merged_main_rows',0)
-                row['block_merged_lane_rows']=lane_stat.get('merged_lane_rows',0)
-                row['block_graph_captures']=lane_stat.get('block_graph_captures',0)
-                row['block_graph_replays']=lane_stat.get('block_graph_replays',0)
-                row['block_step_graph_replays']=lane_stat.get('block_step_graph_replays',0)
-                row['block_teacher_forward_calls']=lane_stat.get('block_teacher_forward_calls',0)
-                row['block_mixed_replay_calls']=lane_stat.get('block_mixed_replay_calls',0)
+                row['block_merged_main_rows']=lane_stat_j.get('merged_main_rows',0)
+                row['block_merged_lane_rows']=lane_stat_j.get('merged_lane_rows',0)
+                row['block_graph_captures']=lane_stat_j.get('block_graph_captures',0)
+                row['block_graph_replays']=lane_stat_j.get('block_graph_replays',0)
+                row['block_step_graph_replays']=lane_stat_j.get('block_step_graph_replays',0)
+                row['block_teacher_forward_calls']=lane_stat_j.get('block_teacher_forward_calls',0)
+                row['block_mixed_replay_calls']=lane_stat_j.get('block_mixed_replay_calls',0)
                 from isaac_bridge.block_driver import DRV_FIELDS
                 for k_d in DRV_FIELDS:   # (B54: the driver's counters of the collect)
-                    row[k_d]=lane_stat.get(k_d,'')
+                    row[k_d]=lane_stat_j.get(k_d,'')
                 from isaac_bridge.block_lanes import D1_FIELDS
                 for k_d in D1_FIELDS:   # (D1: the CF points' lives)
-                    row[k_d]=lane_stat.get(k_d,'')
+                    row[k_d]=lane_stat_j.get(k_d,'')
                 from isaac_bridge.block_driver import LANE_TIMING_FIELDS
                 for k_d in LANE_TIMING_FIELDS:   # (D1 / B58d: lane request and point timings)
-                    row[k_d]=lane_stat.get(k_d,'')
+                    row[k_d]=lane_stat_j.get(k_d,'')
                 for k_b in ('block_gc_s','block_kv_rows','block_blocks','block_raw_rows'):
-                    row[k_b]=lane_stat.get(k_b,0)
+                    row[k_b]=lane_stat_j.get(k_b,0)
                 from isaac_bridge.block_compile import STATS as cstat_b
                 row['block_compiles'],row['block_steady_compiles']=cstat_b['compiles'],cstat_b['steady_compiles']
                 row['block_compiled_calls']=cstat_b['calls']
@@ -5591,6 +5594,7 @@ def main(argv=None, child=None, actor=None):
                 t_h = time.perf_counter()
                 job['lroll'], job['lready'], job['lbytes'] = hand_off(roll, lmirror, ldev, hand_streams)
                 job['lhand_s'] = time.perf_counter() - t_h
+            job.setdefault('lane_stat', dict(lane_stat))   # (this collect's counters, for this update's row)
             spare.carry(roll)
             roll, spare = spare, roll
             if lane_thread:   # (B58d d2: the lane thread goes on serving the lanes while the actor waits / collects)
