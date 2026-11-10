@@ -976,8 +976,9 @@ struct ActorDriver {
       bool ok = batch_widths(jb.rows.data(), k, wb, we, wn, wsl) && lane_force_python != -2 && lane_force_python != g;
       i64 cap = 1; while (cap < k) cap <<= 1;
       auto rec = [&](int kind) {
-        auto r = std::make_shared<Record>(); r->kind = kind; r->job = job; r->owner = jb.owner; r->version = jb.version; r->lane_src = 1;
-        r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl; r->point = g; finish_empty(*r);
+        auto r = std::make_shared<Record>(); finish_empty(*r);   // (first: finish_empty sets the main version)
+        r->kind = kind; r->job = job; r->owner = jb.owner; r->version = jb.version; r->lane_src = 1;   // (the generation's)
+        r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl; r->point = g;
         return r;
       };
       if (!ok) {   // the frames the graphs cannot take: Python steps the job on its lane actor

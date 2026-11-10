@@ -51,8 +51,10 @@ int run(int iters, unsigned seed, bool reply_first) {
   std::mutex qm; std::deque<i64> q;
   std::mutex rm; std::condition_variable rc; std::vector<i64> replied(L, 0);
   std::atomic<bool> done{false}; std::atomic<i64> errors{0}, answers{0}, reads{0}, workers_left{L};
+  std::mutex wm;   // (the two writers' rows: the K/V bytes are a function of the decision id the store gives next)
   auto write_rows = [&](i64 n, const std::vector<i64> &rws, std::vector<i64> &dec, std::vector<i64> &kvs, std::vector<i64> &bid,
                         std::vector<i64> &steps) {
+    std::lock_guard<std::mutex> wl(wm);
     uint8_t frame[8] = {1};
     std::vector<uint8_t> kv(n*KV), first(n, 0); std::vector<float> z(n*2, 0); std::vector<i64> pend(n*NH, 0), nb(n, 8);
     std::vector<int32_t> sch(n, 1); std::vector<const uint8_t *> fr(n, frame);
