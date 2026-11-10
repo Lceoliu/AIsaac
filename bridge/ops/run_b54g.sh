@@ -15,7 +15,7 @@ echo "$(date +%T) b54g start ($CODE)" >> $LOG
 rm -f $R/b54-gate.failed
 guard
 cd $ROOT/$CODE/bridge/python
-ISAAC_B54_ENTRY=1 ABP_HOME=$ROOT/formal/abplus ABP_BRIDGE_LUA=$ROOT/candidate-a1/bridge/abplus/abp_bridge.lua timeout 3600 \
+ISAAC_B52_ENTRY=1 ABP_HOME=$ROOT/formal/abplus ABP_BRIDGE_LUA=$ROOT/candidate-a1/bridge/abplus/abp_bridge.lua timeout 3600 \
   $PY -m pytest tests/test_b52_entry.py -q -p no:cacheprovider --basetemp=$R/b54-entry > $R/tests-b54-entry.log 2>&1
 echo "$(date +%T) b54g entry gate rc=$? $(tail -1 $R/tests-b54-entry.log | cut -c1-120)" >> $LOG
 tail -1 $R/tests-b54-entry.log | grep -q " passed" && ! tail -1 $R/tests-b54-entry.log | grep -qE "failed|skipped|error" || echo "entry gate" >> $R/b54-gate.failed
