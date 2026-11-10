@@ -72,6 +72,17 @@ class Emulated:
             ctypes.memset(at, 0, zero)
 
 
+class EmulatedPages(Emulated):
+    def pages_(self, n, ids, rows_per_page, n_pages, pages, row_bytes, out):
+        ids, pages = _i64(ids, n), _i64(pages, n_pages)
+        for i in range(n):
+            if ids[i] < 0 or ids[i]//rows_per_page >= n_pages:
+                return i
+            ctypes.memmove(out+i*row_bytes, int(pages[ids[i]//rows_per_page])+int(ids[i] % rows_per_page)*row_bytes,
+                           row_bytes)
+        return -1
+
+
 def _variants():
     out = ['emulated']
     if learn_native.build() is not None:
@@ -83,7 +94,7 @@ def _variants():
 def lib(request, monkeypatch):
     monkeypatch.setattr(learn_native, 'ENABLED', True)
     monkeypatch.setitem(learn_native._LIB, 'lib',
-                        learn_native.Library(learn_native.build()) if request.param == 'c' else Emulated())
+                        learn_native.Library(learn_native.build()) if request.param == 'c' else EmulatedPages())
     return request.param
 
 
@@ -533,3 +544,46 @@ def test_spatial_segment_draws_no_random_numbers(device, monkeypatch):
     n_fwd = len(calls)
     sum(o.float().mean() for o in out).backward()
     assert n_fwd > 0 and len(calls) > n_fwd and all(calls)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+def test_pages_equal_store_gather_and_follow_new_pages(lib, dtype):
+    """B62 N3: learn_native.pages gives PagedStore._gather's bytes; a page added to the store after the address table
+    was built is read too (the table is rebuilt when the page count changes)."""
+    P = 8
+    class Store:   # (weakly referenceable, as PagedStore)
+        pass
+    store = Store()
+    store.page, store.kv_dtype, store.z_pages, store.b_pages = P, dtype, [], []
+    store.kv_pages = [torch.randn(P, 3, 5).to(dtype) for _ in range(3)]
+    ref_gather = (lambda ids, out: bp.PagedStore._gather(store, store.kv_pages, ids, (3, 5), dtype, out))
+    ids = np.array([0, 23, 9, 9, 17, 2], np.int64)
+    ref, got = torch.empty((len(ids), 3, 5), dtype=dtype), torch.empty((len(ids), 3, 5), dtype=dtype)
+    ref_gather(ids, ref)
+    assert learn_native.pages(store, 'kv', ids, got)
+    assert got.view(torch.uint8).numpy().tobytes() == ref.view(torch.uint8).numpy().tobytes()
+    store.kv_pages.append(torch.randn(P, 3, 5).to(dtype))
+    ids2 = np.array([31, 24, 3], np.int64)
+    ref2, got2 = torch.empty((3, 3, 5), dtype=dtype), torch.empty((3, 3, 5), dtype=dtype)
+    ref_gather(ids2, ref2)
+    assert learn_native.pages(store, 'kv', ids2, got2)
+    assert got2.view(torch.uint8).numpy().tobytes() == ref2.view(torch.uint8).numpy().tobytes()
+    with pytest.raises(IndexError):
+        learn_native.pages(store, 'kv', np.array([32]), got2[:1])
+    assert learn_native.pages(store, 'kv', ids[:0], got[:0])
+    assert not learn_native.pages(store, 'kv', ids, torch.empty((len(ids), 3, 5), dtype=torch.float64))
+
+
+def test_pages_on_a_real_store_equal_reference(lib):
+    """B62 N3 on a store the rollout fixture filled (kv / z / blocks; the native store where it builds)."""
+    from test_block_packed_learner import _rollout_and_teacher
+    _, chunks, _ = _rollout_and_teacher('cpu', seed=49)
+    store = chunks[0].snapshot.store
+    for which, shape, pl in (('kv', store.kv_shape, store.kv_pages), ('z', store.z_shape, store.z_pages),
+                             ('blocks', store.b_shape, store.b_pages)):
+        n = len(pl)*store.page
+        ids = np.random.default_rng(1).integers(0, n, 40)
+        ref = getattr(store, which)(ids)
+        got = torch.empty_like(ref)
+        assert learn_native.pages(store, which, ids, got)
+        assert got.view(torch.uint8).numpy().tobytes() == ref.view(torch.uint8).numpy().tobytes(), which

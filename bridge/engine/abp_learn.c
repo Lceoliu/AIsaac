@@ -3,14 +3,14 @@
  * equal the Python reference's byte for byte:
  *   abp_learn_scan    structured_input.check_headers on per-row header addresses: counts (p, p, e, n, s) per row;
  *   abp_learn_gather  decode_frames_compact(packed=True)'s gathers: room, minimap and the five compact lists;
- *   abp_learn_concat  block_learner._fill_merged: pieces concatenated into one destination, a zero tail.
- * (Page gathers stay in Python until the native page store of the cpp-actor line is merged: B60 N3.)
+ *   abp_learn_concat  block_learner._fill_merged: pieces concatenated into one destination, a zero tail;
+ *   abp_learn_pages   (B62 N3) PagedStore._gather: page rows by global row id (page = id / rows per page).
  * Built by learn_native.build() with gcc -O2 on first use (cache keyed by this file's hash). */
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
 
-#define ABP_LEARN_VERSION 6002
+#define ABP_LEARN_VERSION 6003
 
 int abp_learn_version(void) { return ABP_LEARN_VERSION; }
 
@@ -77,4 +77,18 @@ void abp_learn_concat(long n, const uint64_t *src, const int64_t *nbytes, char *
         at += nbytes[i];
     }
     if (zero > 0) memset(at, 0, zero);
+}
+
+/* Rows ids[i] of a paged table (pages[p]: address of page p, rows_per_page rows of row_bytes) into out. Returns -1,
+ * else the first id outside the pages (the caller raises). The pages are never moved or freed while a learner part
+ * reads them (B62: page tensors are allocated once, the rows read belong to live snapshots). */
+long abp_learn_pages(long n, const int64_t *ids, long rows_per_page, long n_pages, const uint64_t *pages,
+                     long row_bytes, char *out) {
+    for (long i = 0; i < n; i++) {
+        int64_t id = ids[i];
+        if (id < 0 || id / rows_per_page >= n_pages) return i;
+        const char *pg = (const char *)(uintptr_t)pages[id / rows_per_page];
+        memcpy(out + i * row_bytes, pg + (id % rows_per_page) * row_bytes, row_bytes);
+    }
+    return -1;
 }

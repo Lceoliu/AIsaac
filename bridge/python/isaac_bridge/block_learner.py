@@ -107,6 +107,13 @@ bp.UPD_KEYS = tuple(bp.UPD_KEYS)+tuple(k for k in (
     if k not in bp.UPD_KEYS)
 
 
+def _pages(store, which, ids, out):
+    """store.kv / store.z / store.blocks (which) of ids into out; B62 N3: in C outside the GIL (the same bytes)."""
+    if NATIVE_PACK and learn_native.pages(store, which, ids, out):
+        return out
+    return getattr(store, which)(ids, out=out)
+
+
 def _decode_compact(parts, packed):
     """decode_frames_compact(parts, packed); B60: in C for packed decodes (the same bytes). Inside PREP_LOCK only
     (the lifecycle rules above)."""
@@ -879,12 +886,12 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
     slab = Slab(specs, device)
     _fill_merged(all_hosts, shapes, slab.host)
     if len(ukv):
-        store.kv(ukv, out=slab.host['kv'][:len(ukv)])
+        _pages(store, 'kv', ukv, slab.host['kv'][:len(ukv)])
     slab.host['kv'][len(ukv):] = 0
     if len(pk_all):
-        store.z(pk_all, out=slab.host['zpage'])
+        _pages(store, 'z', pk_all, slab.host['zpage'])
     if len(ubid):
-        store.blocks(ubid, out=slab.host['blocks'])
+        _pages(store, 'blocks', ubid, slab.host['blocks'])
     if sizes_i:
         np.concatenate([np.asarray(ints[k], np.int64) for k in names_i], out=slab.host['ints'].numpy())
     # B51: the old bank entries' gradient scales (history_scale 'unbiased'; None: nothing scaled)
