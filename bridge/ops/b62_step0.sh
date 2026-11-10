@@ -120,6 +120,12 @@ for S in "$@"; do
     echo "$(date '+%F %T') NC analysis rc=$? $(tr '
 ' ' ' < $R/$TAG.idle.txt | cut -c1-500)" >> $LOG
     ;;
+  CP)   # (B62 capture probes, not timed: which calls invalidate a global-mode capture, b62_capture_probe.py)
+    cd $ROOT/$CODE/bridge/python
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=1 timeout 1500 $PY $OPS/b62_capture_probe.py ${CPCASES:-} \
+      > $R/b62-capture-probe-$CODE-$(date +%m%d-%H%M).log 2>&1
+    echo "$(date '+%F %T') CP rc=$? $(ls -t $R/b62-capture-probe-$CODE-*.log | head -1)" >> $LOG
+    ;;
   R)   # (B62 capture repro, not timed: the gate's test files in its order up to test_b54_driver_lanes, RLOOPS runs per
     #   ISAAC_LEARN_CKPT_LEAN value in RLEAN; tests/conftest.py's leftover-work check names the test and threads)
     cd $ROOT/$CODE/bridge/python

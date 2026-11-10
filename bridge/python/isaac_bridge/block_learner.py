@@ -472,17 +472,14 @@ class Staging:
         self.allocs = 0
 
     def acquire(self, n):
-        """(B62) Its CUDA calls (event query / synchronisation, the pinned allocation, the old buffer's free) under
-        block_training.SIDE_CUDA: the prefetch worker calls this without the capture admission."""
-        from .block_training import SIDE_CUDA
-        with SIDE_CUDA.call():
-            return self._acquire(n)
-
-    def _acquire(self, n):
+        """(B62) Each CUDA call (event query, the wait for the last copy as queries, the old buffer's free with the
+        pinned allocation) is one block_training.SIDE_CUDA side call: the prefetch worker calls this without the
+        capture admission. Lock order: self.lock, then the gate inside it; nothing is taken inside the gate."""
+        from .block_training import SIDE_CUDA as gate
         with self.lock:
             free = [i for i, b in enumerate(self.bufs) if not b[2]]
             fit = [i for i in free if self.bufs[i][0].numel() >= n]
-            done = [i for i in fit if self.bufs[i][1] is None or self.bufs[i][1].query()]
+            done = [i for i in fit if self.bufs[i][1] is None or gate.query(self.bufs[i][1])]
             i = (done or fit or free or [None])[0]
             if i is None:
                 self.bufs.append([None, None, False])
@@ -490,12 +487,13 @@ class Staging:
             self.bufs[i][2] = True
             ev = self.bufs[i][1]
         if ev is not None:
-            ev.synchronize()
+            gate.wait_event(ev)
         b = self.bufs[i]
         b[1] = None
         if b[0] is None or b[0].numel() < n:
-            b[0] = None
-            b[0] = torch.empty(int(n*1.25)+self.ALIGN, dtype=torch.uint8, pin_memory=True)
+            with gate.call():
+                b[0] = None   # (the old buffer's free)
+                b[0] = torch.empty(int(n*1.25)+self.ALIGN, dtype=torch.uint8, pin_memory=True)
             self.allocs += 1
         return i, b[0]
 

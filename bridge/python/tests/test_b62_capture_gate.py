@@ -56,6 +56,17 @@ def test_side_calls_wait_for_a_capture_and_a_capture_for_the_calls():
     assert captured.is_set() and g.active == 0 and g.capturing == 0
 
 
+def test_a_capturing_thread_reaching_a_side_call_raises():
+    g = SideCuda()
+    with g.capture():
+        with pytest.raises(RuntimeError, match='own graph capture'):
+            with g.call():
+                pass
+    with g.call():   # (after its capture: an ordinary call)
+        pass
+    assert g.active == 0 and g.capturing == 0 and not g.owners
+
+
 def test_disabled_gate_does_not_block():
     g = SideCuda()
     g.ENABLED = False
@@ -143,7 +154,7 @@ def _run(mode):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA')
 def test_worker_staging_during_a_real_capture_gated_and_control():
     rc, out = _run('gated')
-    assert rc == 0 and 'CAPTURE ok' in out and 'WORKER ok after waits 1' in out, out
+    assert rc == 0 and 'CAPTURE ok' in out and 'WORKER ok after waits' in out and 'waits 0' not in out, out
     rc, out = _run('control')   # (gate off: the worker's calls run inside the capture, which must not survive them)
     assert 'WORKER ok during' in out or 'WORKER error' in out, out
     assert 'CAPTURE ok' not in out or 'WORKER error' in out, out

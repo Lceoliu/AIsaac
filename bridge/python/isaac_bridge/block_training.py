@@ -70,14 +70,22 @@ class SideCuda:
     prepares the next part: one such call during a global-mode capture invalidates it ('operation failed due to a
     previous error during capture'). The worker cannot take the admission itself (the learner thread holds it for the
     whole update), so those calls take call() (shared, short) and graph_capture takes capture() (exclusive): a capture
-    waits for the calls under way, calls wait while a capture runs. ENABLED=False (tests' control group only) turns
-    both into no-ops."""
+    waits for the calls under way, calls wait while a capture runs (writer first). ENABLED=False (tests' control
+    group only) turns both into no-ops.
+    Lock order: the capture admission, then capture() (graph_capture runs only after capture_admission); a call()
+    holds no other lock taken inside it and wraps one CUDA call only (Staging takes its own lock before, never
+    inside). A capturing thread that reaches call() inside its own capture raises (it would wait for itself).
+    Counters (progress.csv, b42_*): side_cuda_call_waits / _wait_s (calls that waited for a capture),
+    side_cuda_capture_waits / _wait_s (captures that waited for calls); a capture waiting over WARN_S prints a
+    warning (and keeps waiting)."""
     ENABLED = True
+    WARN_S = 5.0
 
     def __init__(self):
         self.cv = threading.Condition()
         self.active = 0      # calls under way
         self.capturing = 0   # captures under way or waiting for the calls
+        self.owners = set()  # threads in capture()
         self.waits = 0       # calls that found a capture under way (tests)
 
     @contextmanager
@@ -86,10 +94,16 @@ class SideCuda:
             yield
             return
         with self.cv:
+            if threading.get_ident() in self.owners:
+                raise RuntimeError('SIDE_CUDA.call() inside this thread\'s own graph capture (it would wait for '
+                                   'itself): a CUDA side call reached from a capture body')
             if self.capturing:
                 self.waits += 1
-            while self.capturing:
-                self.cv.wait()
+                t = time.perf_counter()
+                while self.capturing:
+                    self.cv.wait()
+                from .block_paged import ucount
+                ucount('side_cuda_call_waits', 1); ucount('side_cuda_call_wait_s', time.perf_counter()-t)
             self.active += 1
         try:
             yield
@@ -103,19 +117,46 @@ class SideCuda:
         if not self.ENABLED:
             yield
             return
+        me = threading.get_ident()
         with self.cv:
             self.capturing += 1   # (calls arriving from now on wait)
-            while self.active:
-                self.cv.wait()
+            self.owners.add(me)
+            if self.active:
+                t = time.perf_counter()
+                warned = False
+                while self.active:
+                    self.cv.wait(timeout=1.0)
+                    if not warned and time.perf_counter()-t > self.WARN_S:
+                        warned = True
+                        print(f'B62 SIDE_CUDA: a graph capture has waited {time.perf_counter()-t:.1f} s for '
+                              f'{self.active} side CUDA call(s)', flush=True)
+                from .block_paged import ucount
+                ucount('side_cuda_capture_waits', 1); ucount('side_cuda_capture_wait_s', time.perf_counter()-t)
         try:
             yield
         finally:
             with self.cv:
                 self.capturing -= 1
+                self.owners.discard(me)
                 self.cv.notify_all()
+
+    def query(self, ev):
+        """ev.query() as one side call."""
+        with self.call():
+            return ev.query()
+
+    def wait_event(self, ev, poll=0.0005):
+        """ev.synchronize() as side calls: queries, each one call, the waits between them outside the gate (a capture
+        never waits for a call blocked on the GPU)."""
+        while not self.query(ev):
+            time.sleep(poll)
 
 
 SIDE_CUDA = SideCuda()
+from . import block_paged as _bp   # noqa: E402  (the gate's per-update counters in progress.csv, b42_*)
+_bp.UPD_KEYS = tuple(_bp.UPD_KEYS)+tuple(k for k in (
+    'side_cuda_call_waits', 'side_cuda_call_wait_s', 'side_cuda_capture_waits', 'side_cuda_capture_wait_s')
+    if k not in _bp.UPD_KEYS)
 
 
 @contextmanager
