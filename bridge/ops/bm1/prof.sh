@@ -24,6 +24,13 @@ S2=$!
 mpstat -P ALL 5 > $R/$TAG.mpstat &
 S3=$!
 C=aisaac-bench-bm1-a1-prof-$TAG
+# M0 (host /proc, matched by this run's --out: K trainers on one host each get their own): memory by process kind and
+# the container's cgroup (5 s); per-thread CPU ticks of the trainer, its workers and every core (b57_threads.py, 1 s)
+M=" --out /bench/bm1/reports/$TAG"
+python3 $BM/m0_mem.py $R/$TAG.mem.csv 5 "$M" > $R/$TAG.mem.log 2>&1 &
+S4=$!
+python3 $BM/trees/$TREE/bridge/ops/b57_threads.py $R/$TAG.threads.csv 1.0 "$M" > $R/$TAG.threads.log 2>&1 &
+S5=$!
 DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 ${ENVS:-}" $BM/dock.sh prof-$TAG $GPU sh /bench/bm1/xnew2.sh $TAG $LIMIT $HOURS &
 DP=$!
 while kill -0 $DP 2>/dev/null; do
@@ -38,7 +45,8 @@ while kill -0 $DP 2>/dev/null; do
 done
 wait $DP
 rc=$?
-kill $S1 $S2 $S3 2>/dev/null
+kill $S1 $S2 $S3 $S4 $S5 2>/dev/null
 [ -d $R/$TAG/checkpoints ] && gio trash $R/$TAG/checkpoints
 echo "$(date '+%F %T') $TAG done rc=$rc rows $(($(wc -l < $R/$TAG/progress.csv 2>/dev/null || echo 1)-1))" >> $LOG
+python3 $BM/summ.py $R $TAG "${CPUSET:-0-11,24-35}" $GPU > $R/$TAG.summary.txt 2>&1   # (still inside the lock)
 give
