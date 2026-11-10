@@ -10768,3 +10768,88 @@ B62 步骤1之后到4090停用（2026-11-10 19:00 – 11-11 03:20）的结果和
   - 默认配置d1下，driver线程、原生consumer、原生lane服务都不会和capture重叠。只有单独的lane线程（d2，默认关）会重叠，已作为d2的前置条件交给cpp-actor。
   - learner_loop的`job = jobs.get()`在准入外，只在learner和actor分设备时才有风险，当前配置是同一张卡，不修。
   - tok_policy.py:2313的旧GraphActor直接用torch.cuda.graph，不经过graph_capture；block路径不用它。
+
+### BM1 8x3090环境：4090计时口径移植、主线77657fc的全量门×3、capture探针、24轮基线（2026-11-11）
+
+机器：dgene，8x3090（Xeon Gold 6146 + RTX 3090 + torch 2.7.1 cu128）。本道是node0：CPU 0-11,24-35（12核24线程）、内存节点0、GPU 1。这次是跨机器对比，和4090（Gold 6530 + 4090 + cu118）的差值**不能当作同一棵树的改动差值**。
+
+#### 实验目的
+
+- 把4090的计时口径（xnew2.sh、prof2.sh、b62_step0.sh P24）移植成Docker版，第一轮只看机器差异。
+- 补上B62欠的三件事：主线77657fc全量门连跑3次、`b62_capture_probe.py`（SideCuda闸的证据）、24轮计时基线。
+- 顺带做规划会话要的M0测量（内存、占核、GPU），用来判断一台机器能放几个分片。
+
+#### 实验方法
+
+- `bridge/ops/bm1/`（用法见其中的README.md）：
+  - dock.sh：容器`aisaac-bench-bm1-a1-<用途>`，`--rm`，内存64g，只读根文件系统，宿主uid，`--network none`，只给一张卡。
+  - xnew2.sh：训练旗标和4090一个不差，只改路径。
+  - prof.sh：拿锁LOCK_node0，写明“计时运行”；跑到24轮发SIGINT。运行期间采样本卡nvidia-smi（1 s）、全部GPU（5 s）、mpstat（5 s），M0由m0_mem.py采集，update结束时刻每1 s记录一次，汇总也在锁内做。
+  - gate.sh、probe.sh、deploy.sh。
+- 游戏目录是bm1/home/isaac-abplus，因为run_instance.sh用的是`$HOME/isaac-abplus`，不认ABP_HOME。libabp_turbo.so从树里的abp_turbo.c在容器内编出（gcc 11.4），大小111,584字节，和4090的一样。
+- 共享venv和4090的pip freeze不同，用`pip --target bm1/pydeps --no-deps`按4090版本补齐：
+  - 缺的：lz4 4.4.5、pytest 9.2.0及其依赖、py-spy；
+  - 版本不同的：numpy 1.26.4 → 2.2.6，zstandard 0.23 → 0.25。
+- Nsight Systems 2023.4.4.54（和4090同版本）：从NVIDIA CUDA官方源下载，sha256校验后解到bm1/tools，没有装进宿主系统。
+- smoke：2轮通过。日志里有“B52 cpp actor driver: on”和“B58d native lanes: on (the driver thread)”，冷编译约9分钟。
+
+#### 实验结果
+
+全量门（77657fc，GPU 1）：
+| 次 | 结果 | 用时 |
+|---|---|---:|
+| 1 | 270 passed, 3 skipped, 4 errors | 682 s |
+| 2 | 1 failed, 269 passed, 3 skipped, 4 errors | 483 s |
+| 3 | 270 passed, 3 skipped, 4 errors | 394 s |
+
+- 三次都没有capture连锁。
+- 每次的4个errors都来自tests/conftest.py的遗留线程检查（teardown），每次都是同样4条：
+  - test_b48_prefetch `[False-cuda]`：Python线程`_read_thread`，以及一个原生线程。推测是Inductor编译子进程池的读取线程，进程级。
+  - test_b48 `unused_prefetch`：3个名为python的原生线程，来源未查。
+  - test_b54 `pressure_restores…`：测试自己的`lane_thread`在测试结束后2 s仍活着。这是真遗留。
+  - test_b60 `spatial_segment…[cuda]`：`Dummy-37`（外来线程，推测是autograd线程）。
+- 第2次的1个failed是test_b52_cpp_actor的`test_driver_pressure_pages_complete_before_records`：`reader_checks[0] > 10`实得9。这是计时敏感的断言，偶发，和capture无关。
+- 结论：3次全绿未达成；要补conftest的白名单，并处理那个lane_thread。
+
+capture探针（global模式capture进行中，另一条线程或capture体内执行某个操作；每个case一个子进程，第二轮各重复2–6次，结果都相同）：
+
+| 操作 | capture结果 | 之后再capture |
+|---|---|---|
+| 另一线程 Event.query | 作废：capture报“operation failed due to a previous error during capture”，旁路调用报“operation not permitted when stream is capturing” | captures_underway INTERNAL ASSERT |
+| 另一线程 Event.synchronize | 作废，报错同上 | 同上 |
+| 另一线程 新尺寸pinned分配（cudaHostAlloc） | 作废，报错同上 | 同上 |
+| 另一线程 另一条流的 Stream.synchronize | 作废，报错同上 | 同上 |
+| 另一线程 缓存尺寸的pinned复用、释放用过或没用过的pinned缓冲 | 正常 | 正常 |
+| 另一线程 重放已捕获的graph、异步H2D | 正常 | 正常 |
+| capture体内gc.collect()回收引用环里的CUDAGraph | 作废（6/6） | captures_underway INTERNAL ASSERT（6/6） |
+| 同上，但走graph_capture（关gc） | 正常（4/4），之后回收也正常 | 正常 |
+| capture体内gc.collect()回收引用环里的pinned缓冲 | 正常 | 正常 |
+
+- 这两种报错文本和b62d、b62g门里的连锁逐字相同。
+- gc机制已证实：block_training.graph_capture的docstring已从“unconfirmed”改为已证实。
+- Staging.acquire里的event query、event wait、pinned分配正是会作废capture的三种调用，SideCuda闸挡的就是这些。pinned的释放不会作废，所以6293c3e里worker把释放放进闸是多余的，不算必要。闸留还是删，由协调定。
+- gc_actor这个case被探针自身的设置问题（inference tensor）挡住，结论没有用它。
+
+24轮计时基线（base-m77657fc，GPU 1，30.0游戏小时上限，24轮，跑到29.1游戏小时）和4090并排。4090这一行是cpp臂A（d1，prof-d1t-lanes1）：
+
+| 机器 / run | collect u10+ | update u10+ | wait_learner | ×实时 u10+（u2–u23） | 首 / 末update | u15 done / nobank / lane调用 / queue / dropped | done/游戏小时 | done/s | lane调用/s |
+|---|---:|---:|---:|---:|---|---|---:|---:|---:|
+| 4090 prof-d1t-lanes1 | 20.25 | 14.50 | 0 | 206.9（216.6） | 11.56 / 12.72 | 95 / 42 / 119.0k / 0 / 0 | 5.22 | 0.323 | 405 |
+| 4090 prof-e-batch1（B58e） | 20.61 | 13.87 | 0 | 208.4（215.8） | 10.61 / 13.33 | 95 / 39 / 132.9k / 0 / 0 | 5.22 | 0.320 | 447 |
+| **3090 base-m77657fc** | **32.23** | **18.30** | 0 | **135.4（138.4）** | 14.64 / 18.85 | 92 / 34 / 127.5k / 0 / 0 | 5.05 | 0.207 | 287 |
+
+- CF约束门（u15 cf_done ≥ 92、nobank ≤ 70、queue ≤ 3、dropped 0）：通过，但cf_done正好压在92。
+- 3090上collect是周期的瓶颈：collect 32.2 s，比update长14 s。
+  - drv_lane_s（driver线程上的lane作业）14.5 s，4090上约10 s；
+  - drv_sync_s（driver等GPU）11.3 s，4090上7.6 s。
+  - learner的GPU计时：前向3.8 s、反向11.2 s，4090上分别是2.8 s和8.7 s。
+- 本道24个逻辑CPU平均忙38%（约9.2核），其他道平均忙4%；其他GPU利用率中位数都是0%。没有看到其他租户的干扰。
+
+M0（稳态，u2起约709 s）：
+- 内存（PSS把共享页分摊，各项可以相加）：trainer峰值24.8 GB；worker进程56个，PSS峰值9.1 GB（RSS合计24.4 GB）；游戏实例66个，PSS峰值2.8 GB（RSS 14.5 GB）。容器cgroup峰值43.5 GB，稳态中位数36.3 GB（anon 34.6 GB）。主机最低可用内存65.2 GB（包括所有租户）。
+  - trainer内部各项（记忆页、原始观测、teacher记录）的占比不改代码分不出来。progress里只有间接的计数：rollout_mb 978、block_raw_rows 282k、teach_held 3,192、v2_held 360。
+- 占核：容器9.14核（cgroup）；trainer进程1.69核。各类进程的占核和trainer各线程的占核这次采坏了：b57_threads.py按match匹配时匹配到了它自己的命令行，按类别做差时进程又有生有灭。已经修好（m0_mem.py直接给每类的核数和trainer各线程的ticks），下一次计时运行补测。
+- GPU 1：利用率中位数84%，峰值100%；显存中位数18.5 GB。按周期阶段分（u10+）：learner和actor同时在跑时100%（274个采样），只有actor在采集时76%（204个采样）。这次没有只有learner在跑的阶段，因为wait_learner为0。
+  - nvidia-smi的利用率是“采样期间有kernel在跑的时间占比”，不是算力（SM或吞吐）占比。
+  - 4090的同口径数字也是83–85%（prof-d1t-lanes1、prof-e-batch1、prof-b62-cpp），之前记录的18–31%不是这套配置。
+  - GPU真忙程度的间接估计：actor的driver线程有35%的collect时间在等GPU（drv_sync 11.3 / 32.2 s）；learner用GPU事件计时的前向加反向约15 s，update是18.3 s。

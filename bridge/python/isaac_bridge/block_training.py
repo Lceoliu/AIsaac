@@ -170,8 +170,11 @@ def graph_capture(graph,stream,pool=None):
     a graph_pool_handle shared with other graphs that never replay concurrently.
     B58: the cyclic garbage collector is off while the capture runs: an automatic collection inside it could free a
     dropped actor's CUDA graph or pinned buffers (CUDA calls during a global-mode capture: 'operation failed due to a
-    previous error during capture', test_driver_with_lanes_same_seed_reproducible once on the 4090). An unconfirmed
-    mitigation: the cause was not shown (3 reruns before the fix passed as well).
+    previous error during capture', test_driver_with_lanes_same_seed_reproducible once on the 4090). Confirmed (B62,
+    bridge/ops/b62_capture_probe.py on the 3090, 6 of 6): a captured CUDAGraph in a dropped reference cycle, collected
+    by gc.collect() inside a global-mode capture, invalidates it with that error, and the next capture then fails with
+    'captures_underway.empty() INTERNAL ASSERT' (the b62d / b62g gates' cascade); through graph_capture (gc off) the
+    capture ends right, 4 of 4. A dropped pinned buffer collected the same way does not break a capture.
     B62: also exclusive of the CUDA calls made off the admission (SIDE_CUDA: the learner prefetch worker's staging)."""
     import gc as gc_
     with SIDE_CUDA.capture():

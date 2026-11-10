@@ -25,12 +25,12 @@ mpstat -P ALL 5 > $R/$TAG.mpstat &
 S3=$!
 C=aisaac-bench-bm1-a1-prof-$TAG
 # M0 (host /proc, matched by this run's --out: K trainers on one host each get their own): memory by process kind and
-# the container's cgroup (5 s); per-thread CPU ticks of the trainer, its workers and every core (b57_threads.py, 1 s)
+# the container's cgroup, cores by process kind, the trainer's per-thread ticks (5 s). (b57_threads.py is not used: given
+# a match string it matched its own command line, base-m77657fc)
 M=" --out /bench/bm1/reports/$TAG"
-python3 $BM/m0_mem.py $R/$TAG.mem.csv 5 "$M" > $R/$TAG.mem.log 2>&1 &
+python3 $BM/m0_mem.py $R/$TAG.mem.csv 5 "$M" $R/$TAG.threads.csv > $R/$TAG.mem.log 2>&1 &
 S4=$!
-python3 $BM/trees/$TREE/bridge/ops/b57_threads.py $R/$TAG.threads.csv 1.0 "$M" > $R/$TAG.threads.log 2>&1 &
-S5=$!
+S5=
 DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 ${ENVS:-}" $BM/dock.sh prof-$TAG $GPU sh /bench/bm1/xnew2.sh $TAG $LIMIT $HOURS &
 DP=$!
 # progress.csv row times (1 s): each update's end on the host clock, to place the 1 s GPU / CPU samples in each cycle

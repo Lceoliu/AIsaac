@@ -81,8 +81,8 @@ def main():
         out.append(f'  container cgroup: peak {max(f(x, "cg_peak_mb") for x in allm)/1024:.1f} GB, steady median '
                    f'{med(m, "cg_current_mb")/1024:.1f} GB (anon {med(m, "cg_anon_mb")/1024:.1f}, file '
                    f'{med(m, "cg_file_mb")/1024:.1f}); host MemAvailable min {min(f(x, "host_avail_mb") for x in allm)/1024:.1f} GB')
-        out.append('  cores used (steady): ' + ', '.join(
-            f'{k} {(f(m[-1], k+"_ticks")-f(m[0], k+"_ticks"))/100/dt:.2f}' for k in kinds)
+        out.append('  cores used (steady, medians of 5 s samples): ' + ', '.join(
+            f'{k} {med(m, k+"_cores"):.2f}' for k in kinds)
             + f', container {(f(m[-1], "cg_cpu_usec")-f(m[0], "cg_cpu_usec"))/1e6/dt:.2f}')
     th = window(f'{R}/{tag}.threads.csv', 't')
     if th:
@@ -115,6 +115,28 @@ def main():
         out.append(f'  GPU {gpu} (1 s samples, steady): util median {st.median(x[0] for x in gs):.0f}% peak '
                    f'{max(x[0] for x in gs):.0f}%, memory median {st.median(x[1] for x in gs)/1024:.1f} GB peak '
                    f'{max(x[1] for x in g)/1024:.1f} GB')
+    if os.path.exists(f'{R}/{tag}.rows') and os.path.exists(f'{R}/{tag}.gpu'):
+        # cycle phases from the row times (a row is written when its update ends): learner busy = [end - update_s,
+        # end] (the actor collects meanwhile unless it waits), learner only = the actor's wait_learner_s before the end
+        import datetime as dt_
+        ends = [float(x.split()[0]) for x in open(f'{R}/{tag}.rows')]
+        gt = []
+        for line in open(f'{R}/{tag}.gpu'):
+            parts = [x.strip() for x in line.split(',')]
+            try:
+                t = dt_.datetime.strptime(parts[0], '%Y/%m/%d %H:%M:%S.%f').replace(tzinfo=dt_.timezone.utc).timestamp()
+                gt.append((t, float(parts[1].split()[0])))
+            except (IndexError, ValueError):
+                pass
+        ph = {'both': [], 'learner only': [], 'actor only': []}
+        for k in range(9, min(len(rows), len(ends))):
+            e, up, wl = ends[k], f(rows[k], 'update_s'), f(rows[k], 'wait_learner_s')
+            wl = wl if wl == wl else 0.0
+            for t, u in gt:
+                if ends[k-1] < t <= e:
+                    ph['learner only' if t > e-wl else 'both' if t >= e-up else 'actor only'].append(u)
+        out.append('  GPU util by cycle phase (u10+, nvidia-smi = share of time any kernel runs): ' + ', '.join(
+            f'{k} {st.median(v):.0f}% (n {len(v)})' for k, v in ph.items() if v))
     if os.path.exists(f'{R}/{tag}.allgpu'):
         other = {}
         lines = open(f'{R}/{tag}.allgpu').read().splitlines()[-8*max(1, int(win/5)):]   # (8 GPUs per sample)
