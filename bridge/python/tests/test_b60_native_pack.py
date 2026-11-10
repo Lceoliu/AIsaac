@@ -83,6 +83,48 @@ class EmulatedPages(Emulated):
         return -1
 
 
+class EmulatedN4(EmulatedPages):
+    """+ abp_learn_reader, transcribed loop for loop from the C source (the wrapper's sizes and the algorithm checked
+    against the reference where no compiler is)."""
+    def reader_(self, nb, ids, T, max_m, Pd, lat, mt, n_old_total, lens, row_start, at_k, nk, kinv, kv_steps,
+                old_start, n_old, old_ends, new_start, complete, new_ends, zidx, real, kvidx, kp, ends, dst, src):
+        A = (lambda addr, n: _i64(addr, n))
+        ids = A(ids, nb)
+        big = 1 << 22   # (views long enough for this test's arrays; only written where the C loop writes)
+        lens, row_start, at_k, nk, old_start, n_old, new_start, complete = (
+            A(x, int(max(ids)+1) if nb else 0) for x in (lens, row_start, at_k, nk, old_start, n_old, new_start,
+                                                         complete))
+        kinv_a = A(kinv, int(at_k[-1]+nk[-1]) if nb and len(at_k) else 0) if nb else None
+        out = {k: v for k, v in (('zidx', zidx), ('real', real), ('kvidx', kvidx), ('kp', kp), ('ends', ends),
+                                 ('dst', dst), ('src', src))}
+        mem = (lambda addr, i, v: ctypes.c_int64.from_address(addr+8*int(i)).__setattr__('value', int(v)))
+        get = (lambda addr, i: ctypes.c_int64.from_address(addr+8*int(i)).value)
+        at_real = at_dst = 0
+        for r in range(nb):
+            i = int(ids[r]); n = int(lens[i])
+            for j in range(n):
+                mem(zidx, r*T+j, row_start[i]+j); mem(real, at_real, r*T+j); at_real += 1
+            k0 = int(at_k[i])
+            for j in range(int(nk[i])):
+                mem(kvidx, r*Pd+j, get(kinv, k0+j))
+                for l in range(lat):
+                    mem(kp, r*Pd*lat+j*lat+l, get(kv_steps, k0+j))
+            t = 0
+            for b in range(int(n_old[i])):
+                v, e = int(old_start[i])+b, get(old_ends, int(old_start[i])+b)
+                for q in range(mt):
+                    mem(ends, r*max_m+t*mt+q, e); mem(dst, at_dst, r*max_m+t*mt+q); mem(src, at_dst, v*mt+q)
+                    at_dst += 1
+                t += 1
+            for b in range(int(complete[i])):
+                v, e = n_old_total+int(new_start[i])+b, get(new_ends, int(new_start[i])+b)
+                for q in range(mt):
+                    mem(ends, r*max_m+t*mt+q, e); mem(dst, at_dst, r*max_m+t*mt+q); mem(src, at_dst, v*mt+q)
+                    at_dst += 1
+                t += 1
+        return at_dst
+
+
 def _variants():
     out = ['emulated']
     if learn_native.build() is not None:
@@ -94,7 +136,7 @@ def _variants():
 def lib(request, monkeypatch):
     monkeypatch.setattr(learn_native, 'ENABLED', True)
     monkeypatch.setitem(learn_native._LIB, 'lib',
-                        learn_native.Library(learn_native.build()) if request.param == 'c' else EmulatedPages())
+                        learn_native.Library(learn_native.build()) if request.param == 'c' else EmulatedN4())
     return request.param
 
 

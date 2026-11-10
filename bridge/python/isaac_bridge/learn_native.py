@@ -26,7 +26,7 @@ import numpy as np
 
 SOURCE = Path(__file__).resolve().parents[2] / 'engine' / 'abp_learn.c'
 ENABLED = os.environ.get('ISAAC_BLOCK_NATIVE_PACK', '1') != '0'
-VERSION = 6003
+VERSION = 6004
 _LIB = {}
 _LOCK = threading.Lock()
 P, L = ctypes.c_void_p, ctypes.c_long
@@ -69,6 +69,7 @@ SIGNATURES = {
     'abp_learn_gather': ([L, P, P, L, L, L, L, P] + [P]*7, None),
     'abp_learn_concat': ([L, P, P, P, L], None),
     'abp_learn_pages': ([L, P, L, L, P, L, P], L),
+    'abp_learn_reader': ([L, P, L, L, L, L, L, L] + [P]*19, L),
 }
 
 
@@ -85,6 +86,7 @@ class Library:
             fns[name] = fn
         self.scan, self.gather, self.concat_ = fns['abp_learn_scan'], fns['abp_learn_gather'], fns['abp_learn_concat']
         self.pages_ = fns['abp_learn_pages']
+        self.reader_ = fns['abp_learn_reader']
         self.path = path
 
 
@@ -236,3 +238,29 @@ def pages(store, which, ids, out):
     if bad >= 0:
         raise IndexError(f'page row {int(ids[bad])} outside the store')
     return True
+
+
+def reader_bucket(ids, T, Bb, max_m, Pd, lat, mt, n_main, n_ukv, n_old_total, lens, row_start, at_k, nk, kinv,
+                  kv_steps, old_start, n_old, old_ends, new_start, complete, new_ends):
+    """(B62 N4) One Reader bucket's tables in C (block_learner._prepare_packed's loop): (zidx, real, kvidx, kp, ends,
+    dst, src) as the reference builds them, or None when the library is unavailable (the caller runs the reference)."""
+    lib = load()
+    if lib is None or not hasattr(lib, 'reader_'):
+        return None
+    c = (lambda a: np.ascontiguousarray(a, np.int64))
+    ids, lens, row_start, at_k, nk, kinv, kv_steps, old_start, n_old, old_ends, new_start, complete, new_ends = (
+        c(x) for x in (ids, lens, row_start, at_k, nk, kinv, kv_steps, old_start, n_old, old_ends, new_start,
+                       complete, new_ends))
+    zidx = np.full((Bb, T), n_main, np.int64)
+    real = np.empty(int(lens[ids].sum()), np.int64)
+    kvidx = np.full((Bb, max(Pd, 0)), n_ukv, np.int64)
+    kp = np.full((Bb, Pd*lat), -1, np.int64)
+    ends = np.full((Bb, max_m), -1, np.int64)
+    n_tok = int((n_old[ids]+complete[ids]).sum())*mt
+    dst, src = np.empty(n_tok, np.int64), np.empty(n_tok, np.int64)
+    got = lib.reader_(len(ids), _addr(ids), int(T), int(max_m), int(Pd), int(lat), int(mt), int(n_old_total),
+                      *[_addr(x) for x in (lens, row_start, at_k, nk, kinv, kv_steps, old_start, n_old, old_ends,
+                                            new_start, complete, new_ends, zidx, real, kvidx, kp, ends, dst, src)])
+    if got != n_tok:
+        raise RuntimeError(f'abp_learn_reader wrote {got} bank entries, {n_tok} expected')
+    return zidx, real, kvidx, kp, ends, dst, src

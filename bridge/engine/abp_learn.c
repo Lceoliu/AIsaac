@@ -4,13 +4,14 @@
  *   abp_learn_scan    structured_input.check_headers on per-row header addresses: counts (p, p, e, n, s) per row;
  *   abp_learn_gather  decode_frames_compact(packed=True)'s gathers: room, minimap and the five compact lists;
  *   abp_learn_concat  block_learner._fill_merged: pieces concatenated into one destination, a zero tail;
- *   abp_learn_pages   (B62 N3) PagedStore._gather: page rows by global row id (page = id / rows per page).
+ *   abp_learn_pages   (B62 N3) PagedStore._gather: page rows by global row id (page = id / rows per page);
+ *   abp_learn_reader  (B62 N4) one Reader bucket's index tables (block_learner._prepare_packed's per-chunk loop).
  * Built by learn_native.build() with gcc -O2 on first use (cache keyed by this file's hash). */
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
 
-#define ABP_LEARN_VERSION 6003
+#define ABP_LEARN_VERSION 6004
 
 int abp_learn_version(void) { return ABP_LEARN_VERSION; }
 
@@ -91,4 +92,51 @@ long abp_learn_pages(long n, const int64_t *ids, long rows_per_page, long n_page
         memcpy(out + i * row_bytes, pg + (id % rows_per_page) * row_bytes, row_bytes);
     }
     return -1;
+}
+
+/* (B62 N4) One Reader bucket's tables, block_learner._prepare_packed's per-chunk loop: for its nb chunks ids[r] (row r),
+ * the Reader rows (zidx [Bb, T], filled with n_main; the chunk's decisions at row_start + 0..n-1), the real positions
+ * (r*T + 0..n-1, in row order), the prefix K/V rows (kvidx [Bb, Pd], filled with n_ukv; kinv of the chunk's kvs), their
+ * steps (kp [Bb, Pd*lat], filled with -1; each kv step repeated lat times), the bank's block-end table (ends [Bb, max_m],
+ * filled with -1; the chunk's old blocks' ends then its new blocks', each mt times) and the bank scatter (dst = r*max_m +
+ * 0..k-1, src = block value index * mt + 0..mt-1 over the old blocks old_start + 0..n_old-1 then the new ones
+ * n_old_total + new_start + 0..complete-1). The caller has filled zidx / kvidx / kp / ends with their pad values.
+ * Returns the number of dst / src entries written. */
+long abp_learn_reader(long nb, const int64_t *ids, long T, long max_m, long Pd, long lat, long mt, long n_old_total,
+                      const int64_t *lens, const int64_t *row_start, const int64_t *at_k, const int64_t *nk,
+                      const int64_t *kinv, const int64_t *kv_steps, const int64_t *old_start, const int64_t *n_old,
+                      const int64_t *old_ends, const int64_t *new_start, const int64_t *complete,
+                      const int64_t *new_ends, int64_t *zidx, int64_t *real, int64_t *kvidx, int64_t *kp,
+                      int64_t *ends, int64_t *dst, int64_t *src) {
+    long at_real = 0, at_dst = 0;
+    for (long r = 0; r < nb; r++) {
+        int64_t i = ids[r], n = lens[i];
+        for (int64_t j = 0; j < n; j++) {
+            zidx[r * T + j] = row_start[i] + j;
+            real[at_real++] = r * T + j;
+        }
+        int64_t k0 = at_k[i];
+        for (int64_t j = 0; j < nk[i]; j++) {
+            kvidx[r * Pd + j] = kinv[k0 + j];
+            for (long l = 0; l < lat; l++) kp[r * Pd * lat + j * lat + l] = kv_steps[k0 + j];
+        }
+        int64_t t = 0;
+        for (int64_t b = 0; b < n_old[i]; b++, t++) {
+            int64_t v = old_start[i] + b, e = old_ends[old_start[i] + b];
+            for (long q = 0; q < mt; q++) {
+                ends[r * max_m + t * mt + q] = e;
+                dst[at_dst] = r * max_m + t * mt + q;
+                src[at_dst++] = v * mt + q;
+            }
+        }
+        for (int64_t b = 0; b < complete[i]; b++, t++) {
+            int64_t v = n_old_total + new_start[i] + b, e = new_ends[new_start[i] + b];
+            for (long q = 0; q < mt; q++) {
+                ends[r * max_m + t * mt + q] = e;
+                dst[at_dst] = r * max_m + t * mt + q;
+                src[at_dst++] = v * mt + q;
+            }
+        }
+    }
+    return at_dst;
 }

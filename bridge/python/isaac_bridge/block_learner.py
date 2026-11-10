@@ -833,6 +833,12 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
     tbk = np.array([chunk_bucket(int(n)) for n in lens], np.int64)
     flex_cap = None
     rbuckets = []
+    nk_all = np.array([len(p['kvs']) for p in parts], np.int64)
+    at_k = np.concatenate(([0], np.cumsum(nk_all)[:-1])).astype(np.int64)
+    if NATIVE_PACK:   # (B62 N4: the per-chunk tables in C; the inputs once per part)
+        kvs_steps = np.concatenate([p['kv_steps'] for p in parts]) if len(all_kvs) else np.empty(0, np.int64)
+        old_ends = np.concatenate([p['ends'] for p in parts]) if n_old_total else np.empty(0, np.int64)
+        new_ends_a = np.asarray(new_ends, np.int64)
     for T in sorted(set(tbk.tolist())):
         ids = np.flatnonzero(tbk == T)
         # (T > 1: at least 2 rows, a fully padded one if needed: the compiled Flex kernels keep a
@@ -849,14 +855,23 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
             Pd = (Pd*lat+127)//128*128//lat
         if flex_on:
             max_m = ((cfg.memory_blocks+(T+bs-1)//bs+1)*mt+127)//128*128
-        zidx = np.full((Bb, T), n_main, np.int64)
-        real = []
-        kvidx = np.full((Bb, max(Pd, 0)), len(ukv), np.int64)
-        kp = np.full((Bb, Pd*lat), -1, np.int64)
-        ends = np.full((Bb, max_m), -1, np.int64)
-        dst, src = [], []
-        at_k = np.concatenate(([0], np.cumsum([len(p['kvs']) for p in parts])[:-1])).astype(np.int64)
-        for r, i in enumerate(ids.tolist()):
+        nat = learn_native.reader_bucket(ids, T, Bb, max_m, Pd, lat, mt, n_main, len(ukv), n_old_total, lens,
+                                         row_start, at_k, nk_all, kinv, kvs_steps, old_start, n_old, old_ends,
+                                         new_start, complete, new_ends_a) if NATIVE_PACK else None
+        if nat is not None:
+            zidx, real_a, kvidx, kp, ends, dst_a, src_a = nat
+            real = [real_a]
+            dst, src = ([dst_a], [src_a]) if len(dst_a) else ([], [])
+            ids_loop = []
+        else:
+            zidx = np.full((Bb, T), n_main, np.int64)
+            real = []
+            kvidx = np.full((Bb, max(Pd, 0)), len(ukv), np.int64)
+            kp = np.full((Bb, Pd*lat), -1, np.int64)
+            ends = np.full((Bb, max_m), -1, np.int64)
+            dst, src = [], []
+            ids_loop = ids.tolist()
+        for r, i in enumerate(ids_loop):
             n = int(lens[i])
             zidx[r, :n] = row_start[i]+np.arange(n)
             real.append(r*T+np.arange(n))
