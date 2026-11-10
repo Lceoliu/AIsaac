@@ -10535,3 +10535,10 @@ B62分步减少learner线程的Python层调用和关键路径上的host工作：
 - 步骤4（先量）：
   - 基准opt阶段：默认0.146 / 0.135 s，fused 0.124 s。
   - 一次update后的参数差：默认对默认（run间）最大4.0e-6，fused对默认4.0e-6，最差的都是query_norm.bias等接近0的偏置。按参数自身量级算的ulp都在5.5万左右。fused与默认的差别和run间波动分不开。
+
+B62 步骤1方案评估（4090，2026-11-10 18:09–18:59，b62c；单元测试40 passed，其中包含CUDA上的RNG证据测试）：
+- update逐轮上涨的原因（四个已有的progress.csv）：主行每update约133k，不变；**历史块重算行**从u2的80–86k涨到u9以后的103–112k，backward GPU 9.8 → 11.5–12.1 s随之上涨；teacher每步83 → 101–108行，占比很小。持平点约在u9；u9–u15的update：500 µs 21.06 s，100 µs 20.84 s，50 µs 19.96 s，prof-b58-s0 22.20 s。是否在u16之后继续缓慢上涨，要等下一次24轮的验收profile确认。
+- 精简checkpoint（OL，`ISAAC_LEARN_CKPT_LEAN=1`，默认仍关）：每个PPO part前向的Python层调用14.6k → 10.9k（−26%）；CPU上输出和全部梯度逐位相同；CPU和CUDA上，段内前向和反向重算前后，CPU与CUDA generator的状态都不变（所以preserve_rng_state=False有依据）。剩下的grad开关进出约2k/part来自AOT和dynamo的包装，不来自checkpoint钩子。
+- Inductor cpp_wrapper（OC）：**在torch 2.7.1上不可用**。我们的动态形状kernel在编译时报`AssertionError: cpp_wrapper requires SymbolicGridFn`，回退到Python wrapper。
+- 生产learner的cProfile（第4个update，C++路径）：`.to()` 6,924次共1.70 s、`linalg_vector_norm` 2,025次共0.70 s（clip的逐参数范数）、index_select 0.64 s。这些都是等待GPU的同步，不是Python计算。CUDA同步默认自旋等待，会计进线程CPU，所以uc_*（learner线程CPU）也包括了自旋同步的时间，不全是Python。
+- host准备的cProfile（基准，串行）：`PagedStore._gather`（页gather，N3）每次update 2.24 s、`bytes.join`（源字节拼接）0.55 s、C解码0.74 s、concat 0.56 s、packed_rows_plan 0.20 s。
