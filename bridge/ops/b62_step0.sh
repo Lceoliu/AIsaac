@@ -21,6 +21,16 @@ idle() { [ ! -f $R/GPU_LOCK ] && [ "$(pgrep -fc '[c]hain_b')" = "0" ] && [ "$(pg
   [ "$(pgrep -fc '[t]rain_tok.py')" = "0" ] && [ "$(pgrep -fc '[p]ytest')" = "0" ] && [ "$(pgrep -fc '[e]val_tok.py')" = "0" ]; }
 guard() { echo "$(date '+%F %T') guard: $(pgrep -fc '[t]rain_tok.py') train_tok, $(pgrep -c isaac) isaac, $(pgrep -fc '[p]ytest') pytest, gpu $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)" >> $LOG; }
 take() {
+  # (yield to cpp-actor first, between stages only: while it asks for the GPU (GPU_WANT_CPP) or its scratch-b58c
+  # runner waits, never take the lock)
+  y0=$(date +%s); why=''
+  while true; do
+    if [ -f $R/GPU_WANT_CPP ]; then why='GPU_WANT_CPP'
+    elif pgrep -f '[s]cratch-b58c/run_' > /dev/null; then why="scratch-b58c ($(pgrep -fa '[s]cratch-b58c/run_' | head -1 | cut -c1-60))"
+    else break; fi
+    sleep 15
+  done
+  [ -n "$why" ] && echo "$(date '+%F %T') stage $1: yielded to cpp-actor, last seen: $why, $(( $(date +%s)-y0 )) s" >> $LOG
   while true; do
     ok=0
     while [ $ok -lt 4 ]; do if idle; then ok=$((ok+1)); else ok=0; fi; [ $ok -lt 4 ] && sleep 30; done
