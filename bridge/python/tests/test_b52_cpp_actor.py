@@ -378,6 +378,11 @@ def test_driver_pressure_pages_complete_before_records():
             snap = PagedSnapshot(store, logs[w], step, r['pending_before'][j:j+1].numpy().copy(), 2)
             with seen_lock:
                 seen.append((int(r['kvs'][j]), int(r['dec'][j]), step, 2, snap))
+    # (the reader's checks counted until there are enough of them, not until the last record: on a slow CPU the run
+    # can end after only a few reader passes; the reader goes on over what was recorded)
+    t1 = time.perf_counter()
+    while (reader_checks[0] <= 10 or reader_checks[1] == 0) and time.perf_counter()-t1 < 60 and rd.is_alive():
+        time.sleep(0.01)
     stop.set(); rd.join(10)
     for wk in workers:
         wk.join(10); assert wk.error is None, wk.error
