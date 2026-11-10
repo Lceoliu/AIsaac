@@ -10853,3 +10853,52 @@ M0（稳态，u2起约709 s）：
   - nvidia-smi的利用率是“采样期间有kernel在跑的时间占比”，不是算力（SM或吞吐）占比。
   - 4090的同口径数字也是83–85%（prof-d1t-lanes1、prof-e-batch1、prof-b62-cpp），之前记录的18–31%不是这套配置。
   - GPU真忙程度的间接估计：actor的driver线程有35%的collect时间在等GPU（drv_sync 11.3 / 32.2 s）；learner用GPU事件计时的前向加反向约15 s，update是18.3 s。
+
+### BM1 第二轮：门 3 次（预热后）、采集分阶段、一进程两卡的 capture 探针、learner 放第二张卡（2026-11-11）
+
+机器：8x3090（Gold 6146 + 3090 + cu128），本道node0。和单卡基线base-m77657fc的对比是同机同口径；和4090的对比仍是跨机器。
+
+#### 实验方法
+
+- tests/conftest.py：
+  - 遗留线程检查加两条批准的白名单：Inductor编译子进程池的读取线程，按名字`Thread-N (_read_thread)`精确匹配；`Dummy-*`线程只在原生线程名以`pt_`开头时放过。
+  - 测试收集完、第一个测试之前做一次session预热：有CUDA时建一次CUDA上下文，再做几个CPU并行算子。预热后的线程池大小写进日志头。没有按名字放过任何线程。
+  - 预热前查过：tests/和isaac_bridge/里的multiprocessing全是spawn；os.fork只在tok_floor的worker代码里，那段代码跑在spawn出来的worker进程中，测试只读它的源码；subprocess.run都是exec。所以没有测试依赖“父进程还没初始化CUDA”。
+- 那3个叫python的原生线程是哪来的：用bm1/ptc_trace.c（LD_PRELOAD拦截pthread_create，记下调用者的原生栈）查清。tests/test_block_memory.py在import时执行`torch.set_num_threads(4)`，第一个用到CPU并行的测试（test_b48 unused_prefetch，在linalg_qr的triu里）就起了libgomp的3个worker。这同时说明：这个文件一被收集，之后所有测试都在4个intra-op线程下跑。
+- 6293c3e里worker提前放引用的那一步改成不走闸，依据是探针：从另一个线程释放pinned缓冲，用过没用过都一样，不会作废capture。这个依据来自cu128 / 3090。
+- train_tok加了时间线（只在ISAAC_BLOCK_TIMING=1且设了ISAAC_BLOCK_TIMELINE时开，跑在单独的daemon线程上，不在计时路径上）：每秒记一次driver的累计计数，以及learner是否在update中；每10 s记一次原生页存储的大小。
+- 探针加了dev1_*：capture在cuda:0上进行时，另一条线程在cuda:1上发调用。加了PROBE_CAPTURE_MODE，可以选global或thread_local。
+- learner放第二张卡：`--learner-device=cuda:1`，actor在GPU 1，learner在GPU 2，同一进程。先跑2轮smoke，再跑24轮计时split-mb427b8d。
+
+#### 实验结果
+
+全量门（m6e22498，GPU 1，3次）：每次都是270 passed、3 skipped、1 error。
+- 唯一的error每次都一样：test_b54_driver_lanes的`pressure_restores_and_jobs_while_workers_step`，测试自己的`lane_thread`在测试结束后还活着。这条已知，归cpp-actor修，单列不计。
+- 除此之外3次全绿。上一轮那个test_b52时序断言，这3次都没出现。
+- 日志头：intra-op线程4；CPU并行池3条原生线程；CUDA上下文2条（cuda-EvtHandlr和一条python）。
+
+一个进程驱动两张卡时的capture（GPU 1和2，每种2次，结果相同）：
+- global模式下，capture在cuda:0上进行时，另一条线程在cuda:1上发这些调用，cuda:0的capture一样作废，报错文本和同卡时一样：Event.query、Event.synchronize、Stream.synchronize、新尺寸的pinned分配。
+- 另一条线程在cuda:1上重放graph、做异步H2D：不作废。
+- 改成thread_local模式（各1次）：另一条线程的query、sync、stream sync、pinned分配，同卡和跨卡都不再作废capture。只有capture线程自己在capture体内gc回收graph仍会作废。
+- 含义：global模式的限制是整个进程范围的，换一张卡躲不开。把graph_capture改成thread_local，可以替代SideCuda闸，也能顺带解决d2独立lane线程的重叠问题，但gc关闭必须保留。这个改动未做，要协调定。
+
+learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡基线并排：
+
+| run | collect u10+ | update u10+ | wait_learner | ×实时 u10+（u2–u23） | 首 / 末update | u15 done / nobank / lane调用 / queue / dropped | done/游戏小时 | done/s | lane调用/s |
+|---|---:|---:|---:|---:|---|---|---:|---:|---:|
+| 单卡 base-m77657fc（GPU 1） | 32.23 | 18.30 | 0 | 135.4（138.4） | 14.64 / 18.85 | 92 / 34 / 127.5k / 0 / 0 | 5.05 | 0.207 | 287 |
+| **两卡 split-mb427b8d（actor GPU 1，learner GPU 2）** | **17.47** | **17.64** | 0.13 | **235.2（242.5）** | 15.76 / 17.78 | 100 / 0 / 111.8k / 0 / 0 | 5.49 | 0.364 | 407 |
+
+- ×实时提高74%。collect从32.2 s降到17.5 s：driver等GPU的时间从11.3 s降到7.2 s，driver线程上lane作业的时间从14.5 s降到4.4 s。update基本不变。现在collect和update大致相等。
+- 每次update的权重搬运（take_weights，41.4 MiB，一次peer拷贝）：24 ms。
+- GPU 1（actor）：利用率中位72%（和learner同时在跑时72%，只有actor在跑时71%），显存2.4 GB。GPU 2（learner）：利用率中位75%，update期间92%，显存中位14.3 GB、峰值15.1 GB。
+- 已知问题：
+  - SIGINT之后进程退出时abort：先打印“terminate called without an active exception”，然后rc=134，退出码由timeout报告“dumped core”。单卡那次是rc=130，正常退出。看起来是某个C++ std::thread在析构时还可以join（driver或lane线程没有停下），归cpp-actor。24轮的数据完整。
+  - 退出前还出现一次“B44 steady compile”（learner的_run_packed形状变了），没有查。
+- M0（两卡run的稳态）：
+  - 内存：trainer PSS峰值25.1 GB；worker 54个，8.8 GB；游戏实例67个，3.5 GB；容器峰值43.9 GB。
+  - 占核：容器13.7核，其中trainer 2.1、worker 4.0、游戏0.5；本道CPU平均忙58%。
+  - trainer线程：主线程1.55核、pt_autograd_1 0.31核、learner-prefetch 0.18核（每5 s采样）。
+  - 原生页存储（时间线）：kv页68个×64 MB加z页68个×16 MB，约5.4 GB；块页12个×32 MB，0.4 GB；原始观测raw 406,898行，4.09 GB。这几项合计约10 GB，trainer剩下的约15 GB没分出来（teacher记录、rollout、torch和CUDA在host上的分配等）。
+- 采集速率按阶段分（两卡run的时间线，u10+）：learner在算的266秒里，每秒117步、1,758个决策、134个lane作业，每步等GPU 3.3 ms。learner不在算只有21秒，这21秒里混着交接时的停顿，不能拿来比较。单卡配置下按阶段拆分，要在下一次单卡计时运行时用时间线补测。base-m77657fc的产出里没有带时间的计数（progress.csv只有每轮合计，episodes.jsonl没有时间戳），所以没法不重跑就分出来。
