@@ -1129,6 +1129,10 @@ struct ActorDriver {
   // (D1 / B58d) this collect's lane request and point timings (p50 / p90; the lists restart) and the seconds every
   // generation was pinned
   py::dict lane_timing() {
+    // (d2: the lane thread writes these lists: it stands still while they are read)
+    bool held = lrunning.load() && !lpause_req.load();
+    if (held) { py::gil_scoped_release nogil; lanes_pause(); }
+    struct Resume { ActorDriver *d; bool on; ~Resume() { if (on) d->lanes_resume(); } } resume_{this, held};
     auto q = [](std::vector<double> &v, double p) -> py::object {
       if (v.empty()) return py::str("");
       std::vector<double> s = v; std::sort(s.begin(), s.end());
