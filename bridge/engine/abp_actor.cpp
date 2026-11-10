@@ -973,9 +973,9 @@ struct ActorDriver {
     if (restore_test == 1) {   // (the control: the restore's copies on the lane stream behind a long kernel; nothing waits)
       auto ls = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
       test_guard.reset(new c10::cuda::CUDAStreamGuard(ls));
-      at::cuda::sleep(4000000000LL);   // (~1.5 s: longer than the test takes to send the main row)
     }
-    reset_rows({row});
+    reset_rows({row});   // (its row ids go to the device from pageable memory: a copy that waits for the stream's work)
+    if (restore_test == 1) at::cuda::sleep(4000000000LL);   // (so the long kernel after it: the pinned copies below wait)
     auto dev = kv_t.device();
     auto D = [&](at::Tensor x) { return x.to(dev, /*non_blocking=*/true); };
     // reset.tensors: kv, then BlockSlotState._rows: bank, partial, steps, kv_steps, kv_versions, bank_ends, bank_versions,

@@ -86,7 +86,7 @@ def run_merged(A, mrow):
     return main_out
 
 
-def records(B, until, t_max=60):
+def records(B, until, t_max=60, captured=None):
     """B's driver records until until(rec) is true for one (kind 0 / lane records answered meanwhile)"""
     t0 = time.perf_counter()
     while True:
@@ -101,6 +101,8 @@ def records(B, until, t_max=60):
             with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
                 assert B.main.step_graph.capture_key(rec['cap'], rec['widths']) is not None
             B.d.resume()
+            if captured is not None:
+                captured[0] += 1
             continue
         if until(rec):
             return rec
@@ -187,30 +189,44 @@ class Script:
             a_events(A)
         send_main = B.d.counters()['m1_waiting'] > 0
         assert send_main or mode == 'lane'
-        main_out = None
-        if mode == 'merged':
-            main_out = run_merged(A, mrow)
-        else:
-            if send_main:
-                heads = sum(A.m.heads)
-                with torch.autocast('cuda', dtype=torch.bfloat16):
-                    A.main.step(mrow, np.zeros((1, A.nh), np.int64), [MAIN], uniform=torch.full((1, heads), .5))
-                main_out = A.main.host_output.copy()
-            A.fake.run()
-        A.svc.tick()   # (A: control, the round finished)
-        A.svc.service_control()   # (B's driver keeps running lane passes after the round: its reclamation after the finish)
-        if send_main:   # (B: the main row; its batch takes the waiting job or runs it lane-only after its reply)
+        # B first: the main row (its batch takes the waiting job, or runs it lane-only); A's Python steps run on the
+        # legacy default stream, which would order B's lane stream before B's step if A went first
+        r0, captured = None, [0]
+        if send_main:
             s_ = B.ms
             s_.rows[2*MAIN+self.slot] = mrow[0]
             s_._pairs[MAIN][1].sendall(b'\x00\x00\x00\x01' + (b'1' if self.slot else b'0'))
-            r0 = records(B, lambda r: int(r['kind']) == 0)
+            r0 = records(B, lambda r: int(r['kind']) == 0, captured=captured)
             got = b''
             while len(got) < 5:
                 got += s_._pairs[MAIN][1].recv(5-len(got))
             self.slot ^= 1
+        main_out = None
+
+        def main_alone():
+            heads = sum(A.m.heads)
+            with torch.autocast('cuda', dtype=torch.bfloat16):
+                A.main.step(mrow, np.zeros((1, A.nh), np.int64), [MAIN], uniform=torch.full((1, heads), .5))
+            return A.main.host_output.copy()
+        if mode == 'merged':
+            main_out = run_merged(A, mrow)
+        elif send_main and captured[0]:   # (B handed its main batch to Python for a capture: the jobs ran first)
+            A.fake.run(); main_out = main_alone()
+        elif send_main:
+            main_out = main_alone(); A.fake.run()
+        else:
+            A.fake.run()
+        A.svc.tick()   # (A: control, the round finished)
+        A.svc.service_control()   # (B's driver keeps running lane passes after the round: its reclamation after the finish)
+        if send_main:
             np.testing.assert_array_equal(r0['out'].numpy(), main_out, err_msg=f'round {self.k}: main row')
         replies(B, [q for q, *_ in reqs])
         time.sleep(0.05)   # (B's next lane passes: the reclamation after the finish)
+        heads = {q: (A.svc.actors[g].logs[q].dec[:A.svc.actors[g].logs[q].n].tolist()[-4:]) for g in A.svc.actors
+                 for q in range(4) if A.svc.actors[g].logs[q].n}
+        print(f'round {self.k} ({mode}, main sent {send_main}): A kv rows {A.store.stats().get("kv_rows")}, '
+              f'B kv rows {B.store.native.stats().get("kv_rows")}, A lane log tails {heads}, B counters '
+              f'{ {k: v for k, v in B.d.counters().items() if k.startswith(("m1", "lo_"))} }', flush=True)
         compare(A, B, self.k)
         return B.d.counters()
 
