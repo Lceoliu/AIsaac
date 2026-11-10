@@ -9927,7 +9927,7 @@ B55测得：打开FX graph cache与AOTAutogradCache后，缓存热时Spatial预�
 
 默认值自ed6b2a0起为开（`ISAAC_FX_CACHE`未设或为1时开，设0时关）。同一提交里，train_tok在预热之后打印一行`B56 compile cache after warm-up: {...}`（fxgraph与AOTAutograd缓存的hit / miss / guard_miss / bypass计数，只观测），以后可以直接看生产中那8个backward图是否命中。P1b不修，归因见上。
 
-### B60 learner的host工作搬出GIL：原生打包与完整流水（2026-11-10，GPU测量待跑）
+### B60 learner的host工作搬出GIL：原生打包与完整流水（2026-11-10）
 
 #### 实验目的
 
@@ -10004,4 +10004,79 @@ learner的周期已经由update决定（prof-b54-cpp第2–14轮中位：update 
 
 #### 实验结果
 
-待GPU。
+4090，GPU_LOCK协议下分阶段运行（2026-11-10 13:35–16:14）。
+
+GPU测试过程中修了三个问题：
+- 第一次阶段A、B失败（9 / 14个测试失败）：`abp_learn_scan`的ctypes签名写成了15个参数，C函数是14个。本地没有gcc，C路径的测试全被跳过，所以没拦住。已修，并新增不依赖编译器的签名测试。
+- 基准的op计数rep让dynamo在计数器状态上建了guard而失败：编译期间不再读计数器。
+- 我的GPU脚本取锁有竞争：上一次空闲检查之后过了30 s才写锁，结果S阶段覆盖了自己正在跑的C阶段的锁。同时段没有其他会话的作业。已改为空闲检查之后立即用noclobber原子写锁。
+
+固定输入learner基准（b48 dump：22次调用，15次有梯度、7次无梯度；第2个rep，切换间隔500 µs，与train_tok相同）：
+
+| 变体 | 总计 s | 关键路径打包 s | learner线程CPU s |
+|---|---:|---:|---:|
+| n0p0b0 改前：Python打包、串行 | 13.0–13.2 | 5.6 | 9.5 |
+| n0p1b0 Python打包、流水 | 9.0–9.2 | 1.55–1.63 | 3.9 |
+| n1p0b0 C打包、串行 | 11.1–11.4 | 3.9–4.3 | 8.1–8.4 |
+| **n1p1b0 改后：C打包、流水** | **7.9–8.4** | **0.54–1.06** | 3.8–3.9 |
+| n0p0b1 改前 + 1个纯Python忙线程 | 88.5–93.2 | 35–37 | |
+| n1p1b1 改后 + 1个忙线程 | 58.2–59.0 | 0.72 | |
+| n1p1b1i100 改后 + 忙线程，切换间隔100 µs（诊断） | 23.0 | 0.58 | |
+
+- 门槛“基准 ≤ 9.5 s”：**过**（7.9–8.4 s）。注意本基准的改前数是13.0 s，不是任务书里的10.95 s（口径不同）。
+- C打包：host打包5.6 → 3.9–4.3 s/update；主行解码0.95 → 0.25 s，历史块解码1.24 → 0.56 s。
+- 关键路径逐调用（n1p1b0第2个rep）：
+  - 重算第1组0.117 s（没有更早的提交点），第2–4组0.035–0.05 s；
+  - 新teacher小调用0.02 s；
+  - **第一个PPO part 0.266 s**：它合并了teacher记录，teach_n和teach_step在teach_new阶段才确定，无法更早提交；
+  - 其余PPO part约0.0001 s。
+- 忙线程对照：改后关键路径打包只剩0.72 s，但fwd_grad 2.35 → 21.6 s、bwd 4.65 → 28.2 s、opt 0.14 → 2.3 s。在GIL竞争下，learner的暴露面主要是前向、反向和优化器的Python派发，而不是打包。
+- staging pinned池：474 MB，1个buffer；有忙线程时2个（+0.5 MB）。深度2的增量可以忽略。
+
+生产短profile（6个update，u2–u6中位；同树、同配置：改前prof-b56-fxw，改后prof-b60 / prof-b60b）：
+
+| | 改前 | 改后 |
+|---|---:|---:|
+| update s | 19.42 | **16.94 / 17.24** |
+| u_recompute s（CPU） | 3.31 | 1.97 / 2.01（1.31 / 1.26） |
+| u_ppo s（CPU） | 12.52 | 11.52 / 11.96（3.04 / 3.16） |
+| u_teach_build s（CPU） | 1.64 | 1.67 / 1.67（1.61） |
+| u_opt s（CPU） | 0.87 | 1.14 / 1.15（1.13） |
+| collect s | 28.5 | 29.3 / 30.5 |
+| ×实时 | 144.9 | 145.3 / 136.1 |
+| 预取命中 / 丢弃 / other_calls / 跳过等待 | 12 / 0 / 0 / 0 | 20 / 0 / 0 / 0 |
+| 关键路径打包 s（PPO / 重算及其他） | — | 0.83（0.35 / 0.50） |
+| 预取等待 s（PPO / 重算） | — | 0.35 / 0.30 |
+| 预取worker CPU s | — | 4.9 |
+
+- 稳态重编译全为0。
+- prof-b60b的预热段与S阶段并发（上面的取锁竞争），它的collect / ×实时只作参考。
+- 门槛“关键路径等待 ≤ 0.3 s/update”：**未达**（0.83 s）。剩下的是重算前几组和第一个PPO part。下一步可选N4（Reader / Writer / 计划的索引表搬到C），按基准里C打包后每个part约0.18 s的准备时间，估计能降到约0.06 s，从而进门槛。是否做由协调方决定。
+- 生产也出现了B56的aot_guard_miss 8次（预热行的缓存计数）。
+
+任务2（各分段，生产u2–u6中位）：
+- teach_build：1.67 s wall里1.61 s是learner线程CPU，几乎全是Python（teacher批的取行和解码）。teacher的抽取在next_ppo_chunks里已经提前确定，可以把这部分搬到预取worker；未做。
+- recompute：2.0 s wall，CPU 1.3 s（打包已经离开learner线程，剩下的是4次前向及log_prob等的派发）。
+- opt：1.15 s wall，CPU 1.13 s，CPU-bound。基准计数：每步3.7k次Python层torch调用，按约244个参数逐个处理。fused Adam能去掉大部分，但数值不逐位相同，只报数、不改。
+
+任务3（learner线程Python层torch调用数，基准计数rep）：
+- 每个PPO part的前向14.6k次，每次无梯度调用2.1k次，每个优化器步3.7k次。反向只计到38次：autograd线程不在计数范围内。
+- 前向的大头是框架开销，不是模型算子：属性描述符65k、data_ptr 43k、_set_grad_enabled 31k、_is_view 19k、size 11k。模型算子：linear 2.2k、mm 1.9k、layer_norm 1.3k、index_select 1.2k。
+- 推测（未证实）：主要来自checkpoint包装和编译调用包装（compile_batch_dynamic的逐参数mark / pad检查）的逐张量Python。合并模型小算子收益有限；能减调用数的是少分checkpoint段（SPATIAL_ROWS更大，换显存）、编译包装少做逐张量检查、fused Adam，这些都需要单独评估。
+
+等价：
+- 4090上B60测试（C库）24 passed，连续3次。
+- 全量门223 passed（b60f）。
+- 本地156 passed / 52 skipped。
+- slab各区逐字节相同，P里每个字段相同，整次update的参数在C打包开与关下逐位相同（4090上用真C库）。
+- B48 prefetch测试的CUDA容差另有证据（`bridge/ops/b60_prefetch_spread.py`，每种20+20对，各自与同一个串行参考比较）：
+
+| | 串行对：max \|diff\| = 2.38e-7（p2输出差1 ulp）的次数 | 预取对：同上 | 其余对 |
+|---|---:|---:|---:|
+| 改前（4241254） | 1 / 20 | 2 / 20 | 全部差在第0个part的梯度，约1e-12（原子累加） |
+| 改后（B60） | 4 / 20 | 3 / 20 | 同上 |
+
+  - 串行对从来没有逐位相同过；串行对和预取对出现“1 ulp输出差”的频率相近，改前改后也相近。
+  - 旧测试只用一个串行对来估计spread，经常估成约1e-12，于是一旦预取对碰上1 ulp事件就失败。
+  - 新容差：spread取5个串行对的最大值，每个被比较值要求 ≤ max(4 × spread, 该值自身量级的2个FP32 ulp)。在4090上连续3次通过。
+
