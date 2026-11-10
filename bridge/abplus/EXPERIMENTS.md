@@ -9951,40 +9951,51 @@ learner的周期已经由update决定（prof-b54-cpp第2–14轮中位：update 
 
 #### 实验方法
 
-- 原生库`bridge/engine/abp_learn.c`（纯C）。由`isaac_bridge/learn_native.py`在首次使用时用gcc编译，按源码哈希缓存，ctypes.CDLL加载（调用期间释放GIL）。四个函数都只拷贝字节：
+- 原生库`bridge/engine/abp_learn.c`（纯C）。由`isaac_bridge/learn_native.py`在首次使用时用gcc编译，按源码哈希缓存，ctypes.CDLL加载（调用期间释放GIL）。函数只拷贝字节：
   - `abp_learn_scan`：逐行头检查与计数（`check_headers`）；
   - `abp_learn_gather`：packed解码的room、minimap和五个compact列表（`decode_frames_compact(packed=True)`）；
-  - `abp_learn_concat`：slab合并区按片拷贝，ragged末尾补零项（`_fill_merged`）；
-  - `abp_learn_pages`：K/V、open-tail latent、块值三类页行（`PagedStore._gather`），只读访问页存储，`block_paged.py`不改。
-- 接入`block_learner`：主行、历史块、open tail三处解码（缓存结构不变），slab填充和页gather。开关`ISAAC_BLOCK_NATIVE_PACK`，默认1；设0，或没有gcc、任何一行头检查不通过时，走Python参考实现（坏头时由参考实现抛出同样的错误）。只覆盖packed（CUDA）路径。
+  - `abp_learn_concat`：slab合并区按片拷贝，ragged末尾补零项（`_fill_merged`）。
+- 页gather（N3，约0.40 s）推后，这里不写。cpp-actor分支的页存储已经是原生的（abp_actor.cpp持有页）。合并以后，N3直接对着原生页存储写，并先写明、测试一条不变式：learner读的页在整个update期间不可变、不会被回收。
+- 接入`block_learner`：主行、历史块、open tail三处解码（缓存结构不变）和slab填充。开关`ISAAC_BLOCK_NATIVE_PACK`，默认1；设0，或没有gcc、任何一行头检查不通过时，走Python参考实现（坏头时由参考实现抛出同样的错误）。只覆盖packed（CUDA）路径。
+- 生命周期规则（写在`block_learner`注释里，有测试）：
+  - 所有解码都在PREP_LOCK之内：预取worker在锁内准备；队列未命中时，learner线程只在锁内自己准备。PREP_LOCK记录持有线程，`_decode_compact`在锁外调用会报错。
+  - DECODE_CACHE、chunk的`_host`、store.decoded的条目，只在C填充完成、解码返回之后才发布。
+  - 传给C的每个numpy数组在调用期间都由Python持有引用：decode保留帧缓冲和索引数组；`_fill_merged`的片来自准备过程持有的hosts列表。所以别的线程淘汰缓存（PagedStore.collect在driver线程修剪store.decoded）只去掉缓存的引用，不会释放正在拷贝的数组。
 - 完整流水：
-  - `Prefetch`改为有序队列（最多DEPTH=2个part在前）和一个常驻worker。准备仍按提交顺序串行（PREP_LOCK），history抽样的generator序列不变。调用拿到自己的part时，排在它前面而被跳过的part会被放弃并释放staging。
+  - `Prefetch`改为有序队列（最多DEPTH=2个part在前）和一个常驻worker。准备仍按提交顺序串行（PREP_LOCK）。调用拿到自己的part时，排在它前面而被跳过的part会被放弃并释放staging。
   - `learn()`：
     - 旧值重算的各组提前一组准备，第一组在循环前提交；
-    - 每个epoch的排列在第一个epoch前连续抽完（learn()里唯一的CUDA RNG消费者，抽样顺序不变）；
     - 每个epoch最后一个part运行时，就准备下一个epoch的第一个part；
     - update的第一个PPO part在epoch循环之前提交。
-  - teacher / v2的抽取仍按minibatch顺序进行（numpy和v2_rng在这期间没有其他消费者），按epoch保存。
-  - 新teacher记录的两处无梯度调用（teach_new、v2）暂未进队列（单行chunk、无历史抽样），由测量决定是否需要。
+  - epoch排列（`EpochPerms`）：
+    - torch.randperm(n, device=cuda)在n < 30000时（n_units约2,400）走CPU实现，消耗默认CPU generator。learner的历史抽样也用它（没有传generator）。
+    - 所以排列必须在串行learner抽它的位置抽：上一个epoch最后一个part准备之后、这个epoch第一个part准备之前。`get(e+1)`在上一个epoch最后一个part运行后、提交下一个epoch第一个part之前调用。
+    - 两者之间learner没有别的默认generator消费者（teach_merge=1；teach_merge=0时，单独的teacher前向会带历史抽样落在其后，不是生产配置）。
+    - actor线程（`block_lanes`的lane均匀数、`block_paged`的CPU回退）也用默认CPU generator，与learner并发交错，改前改后都不确定。
+  - teacher / v2的抽取仍按minibatch顺序，按epoch保存。新teacher记录的两处无梯度调用暂未进队列。
+  - 关键路径上等待打包的时间按调用记录（`learn_pack_crit_s`，基准里逐调用列出）。门槛：每次update ≤ 0.3 s。同时报告staging pinned池大小（深度2的增量）。
 - 测量：
-  - `learn()`每个分段新增`uc_*`列，即learner线程CPU秒；wall减CPU就是等待时间（GPU同步、GIL）。
-  - `ISAAC_LEARN_OPCOUNT=1`时新增`uo_*`列，即Python层torch调用数（TorchFunctionMode，只计learner线程）。
+  - `learn()`每个分段新增`uc_*`列（learner线程CPU秒）；`ISAAC_LEARN_OPCOUNT=1`时新增`uo_*`列（Python层torch调用数，只计learner线程）。
   - `b44_learner_bench.py`新增：
-    - `--variants n<0|1>p<0|1>b<N>`：C打包、流水、N个纯Python忙线程；
+    - `--variants n<0|1>p<0|1>b<N>[i<us>]`：C打包、流水、N个纯Python忙线程、切换间隔（默认500 µs，与train_tok的`--switch-interval`默认相同；100 µs只作诊断）；
     - `--opcount`：按fwd_grad / bwd / opt / fwd_nograd统计torch调用数；
-    - 预取统计（host秒、CPU秒、等待、命中、丢弃）。
+    - 逐调用的关键路径等待、预取统计、staging池大小。
 - 测试`tests/test_b60_native_pack.py`。有gcc时用编译好的库，同时也用Python模拟同一组函数（检查封装的地址和大小计算）。覆盖：
   - 解码逐字节等于参考：ROW、frame arena、混合、单行、空列表；
   - 坏头抛出参考的错误；
   - concat覆盖异dtype和跨步片；
-  - 页gather覆盖fp32和bf16；
   - 整个`_prepare_packed`的slab各区逐字节相同，计划和索引元数据相同；
-  - 预取队列的顺序、跳过和丢弃。
-  本地（无gcc，模拟库）152 passed / 51 skipped。
+  - 填充期间淘汰全部缓存，slab不变；
+  - 锁外解码被拒绝；
+  - 预取队列的顺序、跳过和丢弃；
+  - 固定种子、预取队列真实运行时，三个epoch排列和每个part的历史抽样与串行逐元素相同；
+  - 固定输入、CPU单线程的一次完整update（三个part，各做loss、backward、Adam），C打包开与关的loss和全部参数逐位相同。
+  本地（无gcc，模拟库）154 passed / 51 skipped。
 - GPU（`bridge/ops/b60_gpu.sh`，三个阶段，各≤15分钟，各自取锁，锁连续空闲2分钟且无cpp-actor链才取）：
-  - A：B60测试（C库）+ b48 dump基准的五个变体和一次计数rep；
+  - A：B60测试（C库）+ b48 dump基准七个变体（n0p0b0、n0p0b1、n0p1b0、n1p0b0、n1p1b0、n1p1b1、n1p1b1i100）和一次计数rep；
   - B：全量测试；
   - C：6个update的短profile（预取命中/丢弃、uc_*）。
+- 交给learner的job结构和BlockRollout payload视为冻结接口，B60只读现有字段。
 
 #### 实验结果
 
