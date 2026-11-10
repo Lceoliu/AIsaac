@@ -21,8 +21,7 @@ take "B58d d1n: build, lane.submit dissection (not a timing run)"
 from isaac_bridge import actor_native as a
 p=a.build(True); print('BUILD', p); print(str(a.REASON)[-3000:] if p is None else '')
 " > $R/d1n-build.log 2>&1 )
-python3 $OPS/b58_maxrange.py $R/failed/old-1110-222315/prof-b58c-m.sqlite lane.submit 3 > $R/d1n-submit-max.txt 2>&1 || \
-  python3 $OPS/b58_maxrange.py $R/prof-b58c-m.sqlite lane.submit 3 > $R/d1n-submit-max.txt 2>&1
+python3 $OPS/b58_maxrange.py $R/prof-b58c-m.sqlite lane.submit 3 > $R/d1n-submit-max.txt 2>&1
 rm -f $R/GPU_LOCK
 echo "$(date +%T) d1n build: $(grep -c BUILD $R/d1n-build.log) ok line(s)" >> $LOG
 fresh prof-d1-m
@@ -34,9 +33,9 @@ echo "$(date +%T) d1n nsys rc=$?" >> $LOG
 wait
 python3 $OPS/b57_nsys.py $R/prof-d1-m.nsys-rep $R/prof-d1-m.threads.csv > $R/prof-d1-m.analysis.txt 2>&1
 echo "$(date +%T) d1n analysis rc=$?" >> $LOG
-take "B58d d1n: full gate with CPP_LANES=1 (not a timing run)"
-rm -f $R/GPU_LOCK   # (run_b54g.sh takes the lock itself; the take above only waited our turn)
-ISAAC_BLOCK_CPP_LANES=1 $OPS/run_b54g.sh $CODE > $R/d1n-gate.launcher.log 2>&1
+while :; do   # (run_b54g.sh takes the lock itself; exit 2: someone else had it)
+  waitlock; ISAAC_BLOCK_CPP_LANES=1 $OPS/run_b54g.sh $CODE > $R/d1n-gate.launcher.log 2>&1; rc=$?; [ $rc -eq 2 ] || break; sleep 30
+done
 if [ -f $R/b54-gate.failed ]; then echo "$(date +%T) d1n stops: full gate failed ($(tr '\n' ' ' < $R/b54-gate.failed))" >> $LOG; exit 1; fi
 echo "$(date +%T) d1n gate: $(tail -1 $R/tests-b54-entry.log | cut -c1-50) | $(tail -1 $R/tests-b54-full.log | cut -c1-70) | a8 $(tail -1 $R/b54-a8-play.log | grep -o '"seeds": 8, "ok": [0-9]*')" >> $LOG
 echo "$(date +%T) d1n done" >> $LOG
