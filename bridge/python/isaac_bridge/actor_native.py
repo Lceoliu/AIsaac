@@ -19,7 +19,7 @@ import tempfile
 from pathlib import Path
 
 ENGINE = Path(__file__).resolve().parents[2] / 'engine'
-SOURCES = (ENGINE / 'abp_actor.cpp', ENGINE / 'abp_visible.c')
+SOURCES = (ENGINE / 'abp_actor.cpp', ENGINE / 'abp_visible.c', ENGINE / 'abp_core.h')   # (B58c: the core header in the hash)
 ENABLED = os.environ.get('ISAAC_BLOCK_CPP_ACTOR', '1') != '0'
 REASON = None
 _MOD = []

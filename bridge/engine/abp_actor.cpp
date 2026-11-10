@@ -43,6 +43,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "abp_core.h"
+
 extern "C" int abp_visible_unpack(const unsigned char *frames, long stride, int n, int wb, int we, int wn, int ws,
                                   float *room, float *map, float *body, unsigned char *body_mask, float *local,
                                   unsigned char *local_mask, float *ent, unsigned char *ent_mask, float *inv,
@@ -63,124 +65,45 @@ static inline i64 read_int(const uint8_t *p, int size) {
 
 // ----------------------------------------------------------------------------------------------------- PageStore
 
-struct RawEntry {
-  uint8_t first;
-  int32_t schema;
-  std::string frame;
-  std::vector<i64> pending;
-};
-
+// (B58c) the store's memory, allocation, metadata, raw frames and GC stamps live in abpc::PageCore (abp_core.h, torch
+// free); PageStore gives Python and the driver tensor views of it.
+using abpc::RawEntry;
 struct PageStore {
   i64 page, kv_elems, z_elems, b_elems, bs, nh;
   int kv_itemsize;
   at::ScalarType kv_dtype;
   i64 cap_d, cap_b;
-  std::vector<at::Tensor> kv_pages, z_pages, b_pages;
-  at::Tensor d_meta, d_used, b_meta, b_src, b_srcver, b_used;
-  std::vector<i64> d_free, b_free;
-  i64 next_decision = 0;
-  std::unordered_map<i64, RawEntry> raw;
-  i64 freed_kv = 0, freed_blocks = 0, freed_raw = 0;
-  std::mutex mu;   // allocation, free lists, page vectors, raw
+  std::unique_ptr<abpc::PageCore> core;
+  at::Tensor d_meta, d_used, b_meta, b_src, b_srcver, b_used;   // views of the core's arrays (never reallocated)
 
   PageStore(i64 page_, i64 kv_elems_, bool kv_bf16, i64 z_elems_, i64 b_elems_, i64 block_steps, i64 nh_, i64 max_pages_d,
             i64 max_pages_b)
       : page(page_), kv_elems(kv_elems_), z_elems(z_elems_), b_elems(b_elems_), bs(block_steps), nh(nh_) {
     kv_dtype = kv_bf16 ? at::kBFloat16 : at::kFloat;
     kv_itemsize = kv_bf16 ? 2 : 4;
-    cap_d = max_pages_d*page; cap_b = max_pages_b*page;
-    auto l = at::TensorOptions().dtype(at::kLong);
-    d_meta = at::full({cap_d, 2}, -1, l); d_used = at::zeros({cap_d}, at::kBool);
-    b_meta = at::full({cap_b, 2}, -1, l); b_src = at::full({cap_b, bs}, -1, l); b_srcver = at::full({cap_b, bs}, -1, l);
-    b_used = at::zeros({cap_b}, at::kBool);
-    // (B58a) the page vectors never reallocate: a page tensor's pointer (and the vector element) stays where it is, so
-    // other threads may read kv_pages[p] once p is published; reallocs counts any capacity change (must stay 0)
-    kv_pages.reserve(max_pages_d); z_pages.reserve(max_pages_d); b_pages.reserve(max_pages_b);
+    core.reset(new abpc::PageCore(page, kv_elems*kv_itemsize, z_elems, b_elems, bs, nh, max_pages_d, max_pages_b));
+    cap_d = core->cap_d; cap_b = core->cap_b;
+    auto L = at::TensorOptions().dtype(at::kLong), B = at::TensorOptions().dtype(at::kBool);
+    d_meta = at::from_blob(core->d_meta.get(), {cap_d, 2}, L); d_used = at::from_blob(core->d_used.get(), {cap_d}, B);
+    b_meta = at::from_blob(core->b_meta.get(), {cap_b, 2}, L); b_used = at::from_blob(core->b_used.get(), {cap_b}, B);
+    b_src = at::from_blob(core->b_src.get(), {cap_b, bs}, L); b_srcver = at::from_blob(core->b_srcver.get(), {cap_b, bs}, L);
   }
-  i64 reallocs = 0;
-  // (pages: kept as flat [page, elems] tensors; Python views them with the row shape)
-  void grow_d_locked() {
-    i64 p = (i64)kv_pages.size();
-    TORCH_CHECK(p < cap_d/page, "PageStore: decision pages exhausted (raise max_pages_d)");
-    size_t c0 = kv_pages.capacity(), c1 = z_pages.capacity();
-    kv_pages.push_back(at::zeros({page, kv_elems}, at::TensorOptions().dtype(kv_dtype)));
-    z_pages.push_back(at::zeros({page, z_elems}, at::kFloat));
-    reallocs += (kv_pages.capacity() != c0)+(z_pages.capacity() != c1);
-    i64 base = p*page;
-    // Python: d_free = np.concatenate((np.arange(base+P-1, base-1, -1), d_free)): the new page's ids, descending,
-    // in front of the old free ids; _alloc takes the array's last n ids reversed (our pops from the back)
-    for (i64 i = page-1; i >= 0; i--) d_free.push_back(base+i);
-    std::rotate(d_free.begin(), d_free.end()-page, d_free.end());
+  at::Tensor kv_page(i64 p) { return at::from_blob(core->kv_page(p), {page, kv_elems}, at::TensorOptions().dtype(kv_dtype)); }
+  at::Tensor z_page(i64 p) { return at::from_blob(core->z_page(p), {page, z_elems}, at::TensorOptions().dtype(at::kFloat)); }
+  at::Tensor b_page(i64 p) { return at::from_blob(core->b_page(p), {page, b_elems}, at::TensorOptions().dtype(at::kFloat)); }
+  i64 n_pages_d() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->kv_pages.size(); }
+  i64 n_pages_b() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->b_pages.size(); }
+  i64 n_free_d() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->d_free.size(); }
+  i64 n_free_b() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->b_free.size(); }
+  void grow_ahead(i64 min_free_d, i64 min_free_b) { core->grow_ahead(min_free_d, min_free_b); }
+  void write_decisions_raw(i64 n, const uint8_t *kv, i64 kv_row_bytes, const float *z, i64 z_row_floats, const i64 *steps, i64 version,
+                           const uint8_t *first, const int32_t *schema, const uint8_t *const *frames, const i64 *nbytes,
+                           const i64 *pending, i64 *dec_out, i64 *kvs_out) {
+    core->write_decisions_raw(n, kv, kv_row_bytes, z, z_row_floats, steps, version, first, schema, frames, nbytes, pending, dec_out, kvs_out);
   }
-  void grow_b_locked() {
-    i64 p = (i64)b_pages.size();
-    TORCH_CHECK(p < cap_b/page, "PageStore: block pages exhausted (raise max_pages_b)");
-    size_t c2 = b_pages.capacity();
-    b_pages.push_back(at::zeros({page, b_elems}, at::kFloat));
-    reallocs += (b_pages.capacity() != c2);
-    i64 base = p*page;
-    for (i64 i = page-1; i >= 0; i--) b_free.push_back(base+i);
-    std::rotate(b_free.begin(), b_free.end()-page, b_free.end());
-  }
-  // Python's _alloc: ids = pool[len-n:][::-1] (the n ids at the end of the free array, reversed), pool = pool[:-n].
-  // Our vector mirrors the array (same order), so popping n from the back and reversing reproduces it.
-  void alloc_locked(std::vector<i64> &free, bool decisions, i64 n, i64 *out) {
-    while ((i64)free.size() < n) (decisions ? grow_d_locked() : grow_b_locked());
-    bool *used = decisions ? d_used.data_ptr<bool>() : b_used.data_ptr<bool>();
-    for (i64 i = 0; i < n; i++) {
-      out[i] = free.back(); free.pop_back();
-      used[out[i]] = true;
-    }
-  }
-  void grow_ahead(i64 min_free_d, i64 min_free_b) {
-    std::lock_guard<std::mutex> g(mu);
-    while ((i64)d_free.size() < min_free_d) grow_d_locked();
-    while ((i64)b_free.size() < min_free_b) grow_b_locked();
-  }
-  at::Tensor kv_page(i64 p) { std::lock_guard<std::mutex> g(mu); return kv_pages.at(p); }
-  at::Tensor z_page(i64 p) { std::lock_guard<std::mutex> g(mu); return z_pages.at(p); }
-  at::Tensor b_page(i64 p) { std::lock_guard<std::mutex> g(mu); return b_pages.at(p); }
-  i64 n_pages_d() { std::lock_guard<std::mutex> g(mu); return (i64)kv_pages.size(); }
-  i64 n_pages_b() { std::lock_guard<std::mutex> g(mu); return (i64)b_pages.size(); }
-  i64 n_free_d() { std::lock_guard<std::mutex> g(mu); return (i64)d_free.size(); }
-  i64 n_free_b() { std::lock_guard<std::mutex> g(mu); return (i64)b_free.size(); }
-
-  // raw page pointers (the vectors only grow; a page tensor never moves)
-  uint8_t *kv_row(i64 id) { return (uint8_t *)kv_pages[id/page].data_ptr()+(id % page)*kv_elems*kv_itemsize; }
-  float *z_row(i64 id) { return z_pages[id/page].data_ptr<float>()+(id % page)*z_elems; }
-  float *b_row(i64 id) { return b_pages[id/page].data_ptr<float>()+(id % page)*b_elems; }
-
-  // the decisions of one step: kv rows (n x kv_elems of kv_dtype, contiguous), z rows, steps, frames (pointers), pending
-  void write_decisions_raw(i64 n, const uint8_t *kv, i64 kv_row_bytes, const float *z, i64 z_row_floats, const i64 *steps,
-                           i64 version, const uint8_t *first, const int32_t *schema, const uint8_t *const *frames,
-                           const i64 *nbytes, const i64 *pending, i64 *dec_out, i64 *kvs_out) {
-    std::lock_guard<std::mutex> g(mu);
-    alloc_locked(d_free, true, n, kvs_out);
-    for (i64 i = 0; i < n; i++) dec_out[i] = next_decision+i;
-    next_decision += n;
-    i64 *meta = d_meta.data_ptr<i64>();
-    for (i64 i = 0; i < n; i++) {
-      i64 id = kvs_out[i];
-      memcpy(kv_row(id), kv+i*kv_row_bytes, kv_elems*kv_itemsize);
-      memcpy(z_row(id), z+i*z_row_floats, z_elems*sizeof(float));
-      meta[2*id] = steps[i]; meta[2*id+1] = version;
-      RawEntry &e = raw[dec_out[i]];
-      e.first = first[i]; e.schema = schema[i];
-      e.frame.assign((const char *)frames[i], (size_t)nbytes[i]);
-      e.pending.assign(pending+i*nh, pending+(i+1)*nh);
-    }
-  }
-  void write_blocks_raw(i64 m, const float *values, i64 row_floats, const i64 *ends, i64 version, const i64 *src,
-                        const i64 *srcver, i64 *bid_out) {
-    std::lock_guard<std::mutex> g(mu);
-    alloc_locked(b_free, false, m, bid_out);
-    i64 *meta = b_meta.data_ptr<i64>(), *bsrc = b_src.data_ptr<i64>(), *bver = b_srcver.data_ptr<i64>();
-    for (i64 i = 0; i < m; i++) {
-      i64 id = bid_out[i];
-      memcpy(b_row(id), values+i*row_floats, b_elems*sizeof(float));
-      meta[2*id] = ends[i]; meta[2*id+1] = version;
-      memcpy(bsrc+id*bs, src+i*bs, bs*sizeof(i64)); memcpy(bver+id*bs, srcver+i*bs, bs*sizeof(i64));
-    }
+  void write_blocks_raw(i64 m, const float *values, i64 row_floats, const i64 *ends, i64 version, const i64 *src, const i64 *srcver,
+                        i64 *bid_out) {
+    core->write_blocks_raw(m, values, row_floats, ends, version, src, srcver, bid_out);
   }
   // Python-path writes (tensors): kv [n, ...] of kv_dtype, z [n, ...] float32 (any device -> cpu contiguous)
   std::pair<at::Tensor, at::Tensor> write_decisions(at::Tensor kv, at::Tensor z, at::Tensor steps, i64 version, at::Tensor first,
@@ -196,9 +119,9 @@ struct PageStore {
     const uint8_t *fbase = frames.data_ptr<uint8_t>();
     for (i64 i = 0; i < n; i++) fp[i] = fbase+i*fstride;
     at::Tensor dec = at::empty({n}, at::kLong), kvs = at::empty({n}, at::kLong);
-    write_decisions_raw(n, (const uint8_t *)kv.data_ptr(), kv_elems*kv_itemsize, z.data_ptr<float>(), z_elems, steps.data_ptr<i64>(),
-                        version, first.data_ptr<uint8_t>(), schema.data_ptr<int32_t>(), fp.data(), nbytes.data_ptr<i64>(),
-                        pending.data_ptr<i64>(), dec.data_ptr<i64>(), kvs.data_ptr<i64>());
+    core->write_decisions_raw(n, (const uint8_t *)kv.data_ptr(), kv_elems*kv_itemsize, z.data_ptr<float>(), z_elems, steps.data_ptr<i64>(),
+                              version, first.data_ptr<uint8_t>(), schema.data_ptr<int32_t>(), fp.data(), nbytes.data_ptr<i64>(),
+                              pending.data_ptr<i64>(), dec.data_ptr<i64>(), kvs.data_ptr<i64>());
     return {dec, kvs};
   }
   at::Tensor write_blocks(at::Tensor values, at::Tensor ends, i64 version, at::Tensor src, at::Tensor srcver) {
@@ -208,32 +131,32 @@ struct PageStore {
     ends = ends.to(at::kLong).contiguous(); src = src.to(at::kLong).contiguous(); srcver = srcver.to(at::kLong).contiguous();
     TORCH_CHECK(src.numel() == m*bs && srcver.numel() == m*bs, "write_blocks: src shapes");
     at::Tensor bid = at::empty({m}, at::kLong);
-    write_blocks_raw(m, values.data_ptr<float>(), b_elems, ends.data_ptr<i64>(), version, src.data_ptr<i64>(), srcver.data_ptr<i64>(),
-                     bid.data_ptr<i64>());
+    core->write_blocks_raw(m, values.data_ptr<float>(), b_elems, ends.data_ptr<i64>(), version, src.data_ptr<i64>(), srcver.data_ptr<i64>(),
+                           bid.data_ptr<i64>());
     return bid;
   }
   // raw frames
   py::object raw_entry(i64 dec) {
-    std::lock_guard<std::mutex> g(mu);
-    auto it = raw.find(dec);
-    TORCH_CHECK(it != raw.end(), "PageStore: no raw frame for decision ", dec);
+    std::lock_guard<std::mutex> g(core->mu);
+    auto it = core->raw.find(dec);
+    TORCH_CHECK(it != core->raw.end(), "PageStore: no raw frame for decision ", dec);
     const RawEntry &e = it->second;
     at::Tensor pend = at::empty({nh}, at::kLong);
     memcpy(pend.data_ptr<i64>(), e.pending.data(), nh*sizeof(i64));
     return py::make_tuple((int)e.first, (int)e.schema, py::bytes(e.frame), pend);
   }
-  bool raw_has(i64 dec) { std::lock_guard<std::mutex> g(mu); return raw.count(dec) > 0; }
-  i64 raw_count() { std::lock_guard<std::mutex> g(mu); return (i64)raw.size(); }
+  bool raw_has(i64 dec) { std::lock_guard<std::mutex> g(core->mu); return core->raw.count(dec) > 0; }
+  i64 raw_count() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->raw.size(); }
   at::Tensor raw_keys() {
-    std::lock_guard<std::mutex> g(mu);
-    at::Tensor k = at::empty({(i64)raw.size()}, at::kLong);
+    std::lock_guard<std::mutex> g(core->mu);
+    at::Tensor k = at::empty({(i64)core->raw.size()}, at::kLong);
     i64 *p = k.data_ptr<i64>(); i64 i = 0;
-    for (auto &kv : raw) p[i++] = kv.first;
+    for (auto &kv : core->raw) p[i++] = kv.first;
     return k;
   }
   double raw_mb() {
-    std::lock_guard<std::mutex> g(mu);
-    double b = 0; for (auto &kv : raw) b += kv.second.frame.size();
+    std::lock_guard<std::mutex> g(core->mu);
+    double b = 0; for (auto &kv : core->raw) b += kv.second.frame.size();
     return b/1048576.0;
   }
   // (B45 source_arena) first [n] u8, schema [n] i32, sizes [n] i64, offsets [n] i64, joined frames u8, pending [n, nh]
@@ -241,14 +164,14 @@ struct PageStore {
     decisions = decisions.to(at::kLong).contiguous();
     i64 n = decisions.numel();
     const i64 *d = decisions.data_ptr<i64>();
-    std::lock_guard<std::mutex> g(mu);
+    std::lock_guard<std::mutex> g(core->mu);
     at::Tensor first = at::empty({n}, at::kByte), schema = at::empty({n}, at::kInt), sizes = at::empty({n}, at::kLong),
                off = at::empty({n}, at::kLong), pend = at::empty({n, nh}, at::kLong);
     i64 total = 0;
     std::vector<const RawEntry *> es(n);
     for (i64 i = 0; i < n; i++) {
-      auto it = raw.find(d[i]);
-      TORCH_CHECK(it != raw.end(), "PageStore.source_arena: no raw frame for decision ", d[i]);
+      auto it = core->raw.find(d[i]);
+      TORCH_CHECK(it != core->raw.end(), "PageStore.source_arena: no raw frame for decision ", d[i]);
       es[i] = &it->second;
       first.data_ptr<uint8_t>()[i] = es[i]->first; schema.data_ptr<int32_t>()[i] = es[i]->schema;
       sizes.data_ptr<i64>()[i] = (i64)es[i]->frame.size(); off.data_ptr<i64>()[i] = total; total += (i64)es[i]->frame.size();
@@ -259,33 +182,20 @@ struct PageStore {
     for (i64 i = 0; i < n; i++) memcpy(b+off.data_ptr<i64>()[i], es[i]->frame.data(), es[i]->frame.size());
     return py::make_tuple(first, schema, sizes, off, buf, pend);
   }
-  void free_rows(at::Tensor dead_d, at::Tensor dead_b, at::Tensor dead_raw) {
+  void free_rows(at::Tensor dead_d, at::Tensor dead_b, at::Tensor dead_raw, i64 limit) {
     dead_d = dead_d.to(at::kLong).contiguous(); dead_b = dead_b.to(at::kLong).contiguous(); dead_raw = dead_raw.to(at::kLong).contiguous();
-    std::lock_guard<std::mutex> g(mu);
-    bool *du = d_used.data_ptr<bool>(), *bu = b_used.data_ptr<bool>();
-    i64 *dm = d_meta.data_ptr<i64>(), *bm = b_meta.data_ptr<i64>();
-    // Python: d_free = concatenate((dead[::-1], d_free)): dead ids go to the front of the array = the bottom of our
-    // stack (popped last); dead is ascending, reversed -> the array holds dead descending at the front
-    const i64 *dd = dead_d.data_ptr<i64>(); i64 nd = dead_d.numel();
-    std::vector<i64> nf; nf.reserve(nd+d_free.size());
-    for (i64 i = nd-1; i >= 0; i--) nf.push_back(dd[i]);
-    nf.insert(nf.end(), d_free.begin(), d_free.end()); d_free.swap(nf);
-    for (i64 i = 0; i < nd; i++) { du[dd[i]] = false; dm[2*dd[i]] = -1; dm[2*dd[i]+1] = -1; }
-    const i64 *db = dead_b.data_ptr<i64>(); i64 nb = dead_b.numel();
-    std::vector<i64> bf; bf.reserve(nb+b_free.size());
-    for (i64 i = nb-1; i >= 0; i--) bf.push_back(db[i]);
-    bf.insert(bf.end(), b_free.begin(), b_free.end()); b_free.swap(bf);
-    for (i64 i = 0; i < nb; i++) { bu[db[i]] = false; bm[2*db[i]] = -1; bm[2*db[i]+1] = -1; }
-    const i64 *dr = dead_raw.data_ptr<i64>(); i64 nr = dead_raw.numel();
-    for (i64 i = 0; i < nr; i++) raw.erase(dr[i]);
-    freed_kv += nd; freed_blocks += nb; freed_raw += nr;
+    core->free_rows(dead_d.data_ptr<i64>(), dead_d.numel(), dead_b.data_ptr<i64>(), dead_b.numel(), dead_raw.data_ptr<i64>(),
+                    dead_raw.numel(), limit);
   }
+  void set_stamp(i64 v) { core->set_stamp(v); }
   py::dict stats() {
-    std::lock_guard<std::mutex> g(mu);
+    std::lock_guard<std::mutex> g(core->mu);
     py::dict d;
-    d["kv_pages"] = (i64)kv_pages.size(); d["b_pages"] = (i64)b_pages.size(); d["d_free"] = (i64)d_free.size(); d["b_free"] = (i64)b_free.size();
-    d["raw"] = (i64)raw.size(); d["next_decision"] = next_decision; d["reallocs"] = reallocs;
-    d["cap_pages_d"] = (i64)kv_pages.capacity(); d["cap_pages_b"] = (i64)b_pages.capacity(); d["freed_kv"] = freed_kv; d["freed_blocks"] = freed_blocks; d["freed_raw"] = freed_raw;
+    d["kv_pages"] = (i64)core->kv_pages.size(); d["b_pages"] = (i64)core->b_pages.size(); d["d_free"] = (i64)core->d_free.size();
+    d["b_free"] = (i64)core->b_free.size(); d["raw"] = (i64)core->raw.size(); d["next_decision"] = core->next_decision;
+    d["reallocs"] = core->reallocs; d["cap_pages_d"] = (i64)core->kv_pages.capacity(); d["cap_pages_b"] = (i64)core->b_pages.capacity();
+    d["freed_kv"] = core->freed_kv; d["freed_blocks"] = core->freed_blocks; d["freed_raw"] = core->freed_raw;
+    d["stamp"] = core->stamp; d["stamp_kept"] = core->stamp_kept;
     return d;
   }
 };
@@ -358,32 +268,10 @@ struct LaneJob {   // (B54) one teacher generation's rows of a lane round, queue
   std::vector<uint8_t> replay;               // evaluate rows (uniform 0.5)
 };
 
-// (B58a+b) the native consumer: train_tok's Episodes.arrive (per-record arithmetic) and store (rollout writes) of the
-// main rows, on the driver thread, in the Python path's order (arrive over all the record's rows, then store over the
-// go rows); the episode-level Python work (first-record snapshots, finished-episode summaries) stays in Python, fed by
-// each record's per-row snapshot of the accumulators taken before an episode end resets them.
-struct ConsumerCfg {
-  bool on = false;
-  i64 o_first = 0, o_done = 0, o_damage = 0, o_hurt = 0, o_events = 0, o_stage = 0, o_player = 0, o_pforce = 0;
-  i64 row_frame_at = 0;          // ROW's visible_frame offset (ROWC copies the bytes before it)
-  double w_damage = 0, w_hurt = 0, w_time = 0, w_death = 0, w_timeout = 0, w_room = 0, w_explore = 0, w_boss = 0, w_exit = 0,
-         w_heal = 0, w_resource = 0, end_bonus = 0, gamma = 0.99;
-  bool floor = false, run = false, items = false, gains_on = false, plr_on = false, pick_on = false;
-  i64 ev_exit = 8, ev_item = 16, ev_active = 32, ev_pill = 64, done_branch = 4;
-  // Episodes arrays (numpy, owned by Python)
-  double *ret = nullptr, *ep_hurt = nullptr, *ep_damage = nullptr, *gains = nullptr, *healed = nullptr, *gathered = nullptr,
-         *v0 = nullptr, *gret = nullptr;
-  i64 *rooms = nullptr, *boss = nullptr, *extra = nullptr, *steps = nullptr, *pick_steps = nullptr;
-};
-struct RollSlot {                 // one Rollout's arrays (numpy, owned by Python) and its frame arena (owned here)
-  bool set = false;
-  i64 cap = 0, rowc_size = 0, off_visible_off = 0, priv_size = 0;
-  uint8_t *rows = nullptr, *terminal = nullptr, *close_done = nullptr, *close_ev = nullptr, *priv = nullptr, *boot = nullptr;
-  float *reward = nullptr, *close_hurt = nullptr, *logp = nullptr, *value = nullptr, *value_g = nullptr;
-  i64 *open = nullptr, *length = nullptr, *pending = nullptr, *actions = nullptr, *version = nullptr;
-  at::Tensor arena; i64 used = 0; i64 grown = 0;
-};
-static const i64 N_SNAP = 17;    // ret, hurt, damage, rooms, boss, extra[6], healed, gathered, pick steps, gret, v0, steps
+// (B58a+b / B58c) the native consumer's configuration, rollout slots, frame arenas and arithmetic: abpc (abp_core.h)
+using abpc::ConsumerCfg;
+using abpc::RollSlot;
+using abpc::N_SNAP;
 
 struct Xoshiro {   // xoshiro256**, seeded through splitmix64
   uint64_t s[4];
@@ -543,23 +431,27 @@ struct ActorDriver {
     r.value_g = (float *)P("value_g"); r.open = (i64 *)P("open"); r.length = (i64 *)P("length"); r.pending = (i64 *)P("pending");
     r.actions = (i64 *)P("actions"); r.version = (i64 *)P("version");
     std::lock_guard<std::mutex> g(amu);
-    if (!r.arena.defined() || r.arena.numel() < arena_bytes) r.arena = at::zeros({std::max<i64>(arena_bytes, 1024)}, at::kByte);
-    r.used = 0;
+    r.arena.ensure(std::max<i64>(arena_bytes, 1024));
+    r.arena.reset();
     r.set = true;
   }
   void use_rollout(int slot) { TORCH_CHECK(slot >= -1 && slot <= 1, "use_rollout: slot"); cur_slot = slot; }
   // the frame arena of a slot (B45 FrameArena's buf / used, appends of the hand-off's carry)
-  at::Tensor arena_buf(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].arena; }
-  i64 arena_used(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].used; }
-  void arena_reset(int slot) { std::lock_guard<std::mutex> g(amu); slots[slot].used = 0; }
-  i64 arena_grown(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].grown; }
+  // (a view of the arena's current buffer: valid until the slot's next reset, outgrown buffers are kept until then)
+  at::Tensor arena_buf(int slot) {
+    std::lock_guard<std::mutex> g(amu);
+    return at::from_blob(slots[slot].arena.cur.get(), {slots[slot].arena.cap}, at::TensorOptions().dtype(at::kByte));
+  }
+  i64 arena_used(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].arena.used; }
+  void arena_reset(int slot) { std::lock_guard<std::mutex> g(amu); slots[slot].arena.reset(); }
+  i64 arena_grown(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].arena.grown; }
   at::Tensor arena_append_from(int slot, at::Tensor buf, at::Tensor offs, at::Tensor sizes) {
     buf = buf.contiguous(); offs = offs.to(at::kLong).contiguous(); sizes = sizes.to(at::kLong).contiguous();
     i64 n = offs.numel();
     at::Tensor out = at::empty({n}, at::kLong);
     std::lock_guard<std::mutex> g(amu);
     for (i64 i = 0; i < n; i++)
-      out.data_ptr<i64>()[i] = arena_append_locked(slots[slot], buf.data_ptr<uint8_t>()+offs.data_ptr<i64>()[i], sizes.data_ptr<i64>()[i]);
+      out.data_ptr<i64>()[i] = slots[slot].arena.append(buf.data_ptr<uint8_t>()+offs.data_ptr<i64>()[i], sizes.data_ptr<i64>()[i]);
     return out;
   }
   // (tests) the consumer on given records, as the driver runs it for a step: rows uint8 [n_all * row_stride] (ROW),
@@ -814,126 +706,18 @@ struct ActorDriver {
     running = false;
   }
 
-  i64 arena_append_locked(RollSlot &r, const uint8_t *src, i64 n) {
-    i64 padded = (n+7)/8*8;
-    i64 at_ = r.used;
-    if (at_+padded > r.arena.numel()) {   // grow by 1.5 (FrameArena's rule), the used bytes copied
-      at::Tensor g = at::zeros({std::max<i64>(at_+padded, (i64)(r.arena.numel()*1.5))}, at::kByte);
-      memcpy(g.data_ptr<uint8_t>(), r.arena.data_ptr<uint8_t>(), at_);
-      r.arena = g; r.grown++;
-    }
-    if (n) memcpy(r.arena.data_ptr<uint8_t>()+at_, src, n);
-    r.used = at_+padded;
-    return at_;
-  }
-  // (B58a+b) Episodes.arrive over all the record's rows, then store over its go rows (main rows only), in the Python
-  // path's arithmetic (float64 rewards, float32 gains as numpy computes them), into the current rollout slot
+  // (B58a+b) Episodes.arrive over the record's rows, then store over its go rows, into the current rollout slot (abpc)
   void consume(Record &r, const uint8_t *rc, i64 n_all, const std::vector<i64> &ws, const std::vector<uint8_t> &go,
                const std::vector<i64> &go_idx, const float *out, const i64 *act, const i64 *pend, i64 ver, const uint8_t *privp) {
+    (void)go;
     int sl = cur_slot.load();
     i64 n = (i64)go_idx.size();
     r.kk = at::full({n}, -1, at::kLong);
     r.snap = at::zeros({n_all, N_SNAP}, at::kDouble);
     if (!cc.on || sl < 0 || !slots[sl].set) return;
-    RollSlot &R = slots[sl];
-    const ConsumerCfg &c = cc;
-    double *snap = r.snap.data_ptr<double>();
-    auto u8 = [&](const uint8_t *src, i64 o) { return (i64)src[o]; };
-    auto f32 = [&](const uint8_t *src, i64 o) { float v; memcpy(&v, src+o, 4); return v; };
-    auto cur_gains = [&](const uint8_t *src, double *g) {
-      float p7 = f32(src, c.o_player+7*4), p8 = f32(src, c.o_player+8*4), p9 = f32(src, c.o_player+9*4), p10 = f32(src, c.o_player+10*4);
-      float a = std::nearbyint(p7*12.0f);
-      float b = std::nearbyint(p8*10.0f)+std::nearbyint(p9*10.0f);
-      b = b+std::nearbyint(p10*50.0f);
-      g[0] = (double)a; g[1] = (double)b;
-    };
-    // ---- arrive
-    for (i64 i = 0; i < n_all; i++) {
-      i64 w = ws[i];
-      const uint8_t *src = rc+i*row_stride;
-      bool first = u8(src, c.o_first) != 0;
-      i64 d = u8(src, c.o_done);
-      i64 k = R.open[w];
-      i64 ix;
-      if (first && k >= 0) {   // the episode before broke off
-        ix = w*R.cap+k;
-        R.reward[ix] = 0.0f; R.terminal[ix] = 1;
-        if (R.close_hurt) { R.close_hurt[ix] = 0.0f; R.close_ev[ix] = 0; R.close_done[ix] = 255; }
-        R.open[w] = -1; k = -1;
-      }
-      if (k >= 0) {
-        ix = w*R.cap+k;
-        double dmg = (double)f32(src, c.o_damage), hu = (double)f32(src, c.o_hurt);
-        i64 ev = u8(src, c.o_events);
-        if (R.close_hurt) { R.close_hurt[ix] = (float)hu; R.close_done[ix] = (uint8_t)d; R.close_ev[ix] = (uint8_t)ev; }
-        double endt = d == 1 ? c.end_bonus : d == 2 ? -c.w_death : d == 3 ? -c.w_timeout : 0.0;
-        double reward = c.w_damage*dmg-c.w_hurt*hu-c.w_time+endt;
-        if (c.floor) {
-          reward = reward+(c.w_room*(double)((ev & 1) > 0)+c.w_explore*(double)((ev & 2) > 0)+c.w_boss*(double)((ev & 4) > 0));
-          if (c.run) reward = reward+c.w_exit*(double)((ev & c.ev_exit) > 0);
-          c.rooms[w] += (ev & 1) > 0; c.boss[w] += (ev & 4) > 0;
-          if (c.gains_on) {
-            double g[2]; cur_gains(src, g);
-            double dl0 = g[0]-c.gains[w*2], dl1 = g[1]-c.gains[w*2+1];
-            reward = reward+c.w_heal*std::max(dl0, 0.0)+c.w_resource*std::max(dl1, 0.0);
-            c.healed[w] += std::max(dl0, 0.0); c.gathered[w] += std::max(dl1, 0.0);
-          }
-        }
-        if (c.run || c.items) {
-          i64 *x = c.extra+w*6;
-          x[0] += (ev & c.ev_exit) > 0; x[1] += (ev & c.ev_item) > 0; x[2] += (ev & c.ev_active) > 0; x[3] += (ev & c.ev_pill) > 0;
-          x[5] = std::max<i64>(x[5], u8(src, c.o_stage));
-        }
-        R.reward[ix] = (float)reward; R.terminal[ix] = d != 0 && d != c.done_branch; R.open[w] = -1;
-        c.ret[w] += reward;
-        if (c.plr_on) {
-          if (c.steps[w] == 0) c.v0[w] = (double)R.value[ix];
-          c.gret[w] += std::pow(c.gamma, (double)c.steps[w])*reward;
-          c.steps[w] += 1;
-        }
-        c.ep_hurt[w] += hu; c.ep_damage[w] += dmg;
-      }
-      if (c.gains_on && c.gains) cur_gains(src, c.gains+w*2);
-      if ((c.run || c.items) && first) { c.extra[w*6+4] = u8(src, c.o_stage); c.extra[w*6+5] = u8(src, c.o_stage); }
-      if (c.pick_on) { if (first) c.pick_steps[w] = 0; c.pick_steps[w] += u8(src, c.o_pforce) > 0; }
-      if (d != 0) {   // an episode end: the accumulators for Python's summary, then reset
-        double *sv = snap+i*N_SNAP;
-        sv[0] = c.ret[w]; sv[1] = c.ep_hurt[w]; sv[2] = c.ep_damage[w]; sv[3] = (double)c.rooms[w]; sv[4] = (double)c.boss[w];
-        for (int q = 0; q < 6; q++) sv[5+q] = c.extra ? (double)c.extra[w*6+q] : 0.0;
-        sv[11] = c.healed[w]; sv[12] = c.gathered[w]; sv[13] = c.pick_steps ? (double)c.pick_steps[w] : 0.0;
-        sv[14] = c.plr_on ? c.gret[w] : 0.0; sv[15] = c.plr_on ? c.v0[w] : 0.0; sv[16] = c.plr_on ? (double)c.steps[w] : 0.0;
-        c.ret[w] = 0; c.ep_hurt[w] = 0; c.ep_damage[w] = 0; c.rooms[w] = 0; c.boss[w] = 0;
-        if (c.extra) for (int q = 0; q < 6; q++) c.extra[w*6+q] = 0;
-        c.healed[w] = 0; c.gathered[w] = 0;
-        if (c.plr_on) { c.v0[w] = 0; c.gret[w] = 0; c.steps[w] = 0; }
-      }
-    }
-    // ---- store (go rows)
-    i64 ow = nh+3;
-    i64 *kk = r.kk.data_ptr<i64>();
-    for (i64 j = 0; j < n; j++) {
-      i64 i = go_idx[j], w = ws[i];
-      const uint8_t *src = rc+i*row_stride;
-      i64 k = R.length[w];
-      if (k >= R.cap) continue;   // (cannot happen with the trainer's capacity; dropped rather than overrun, as store)
-      i64 ix = w*R.cap+k;
-      uint8_t *dst = R.rows+ix*R.rowc_size;
-      memset(dst, 0, R.rowc_size);
-      memcpy(dst, src, c.row_frame_at);
-      i64 nbytes = read_int(src+f_bytes, 4);
-      i64 off;
-      { std::lock_guard<std::mutex> g(amu); off = arena_append_locked(R, src+f_frame, std::max<i64>(0, std::min<i64>(nbytes, frame_bytes))); }
-      memcpy(dst+R.off_visible_off, &off, 8);
-      memcpy(R.pending+ix*nh, pend+j*nh, nh*8);
-      memcpy(R.actions+ix*nh, act+j*nh, nh*8);
-      R.logp[ix] = out[j*ow+nh]; R.value[ix] = out[j*ow+nh+1];
-      if (R.value_g) R.value_g[ix] = out[j*ow+nh+2];
-      R.version[ix] = ver;
-      R.boot[ix] = u8(src, c.o_done) == c.done_branch;
-      if (R.priv && privp) memcpy(R.priv+ix*R.priv_size, privp+i*priv_itemsize, R.priv_size);
-      R.length[w] = k+1; R.open[w] = k;
-      kk[j] = k;
-    }
+    abpc::RowLayout L{row_stride, f_bytes, f_frame, frame_bytes, nh, priv_itemsize};
+    abpc::consume(cc, slots[sl], amu, L, rc, n_all, ws.data(), go_idx.data(), n, out, act, pend, ver, privp, r.kk.data_ptr<i64>(),
+                  r.snap.data_ptr<double>());
   }
   // a record's frame header: (body, entity, inventory, slot) counts; false when the frame is not a valid visible-v2 frame
   bool frame_counts(const uint8_t *src, i64 &p, i64 &e, i64 &nn, i64 &s) {
@@ -1021,8 +805,10 @@ struct ActorDriver {
     r.rows = at::empty({0}, at::kByte); r.priv = at::empty({0}, at::kByte);
   }
 
+  std::atomic<i64> record_seq{0};   // (B58c) every step's rows carry its sequence (PageCore stamp; B59's GC rule)
   void step_batch(const std::vector<i64> &ws, const std::vector<i64> &ss) {
     double t0 = now();
+    store->set_stamp(++record_seq);
     i64 n_all = (i64)ws.size();
     auto r = std::make_shared<Record>();
     r->kind = 0; r->owner = owner_main; r->workers = ws; r->slots = ss; r->go.assign(n_all, 0); r->cf_snap.assign(n_all, 0); r->t_poll = t0;
@@ -1275,11 +1061,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_property_readonly("b_meta", [](PageStore &s) { return s.b_meta; }).def_property_readonly("b_src", [](PageStore &s) { return s.b_src; })
       .def_property_readonly("b_srcver", [](PageStore &s) { return s.b_srcver; }).def_property_readonly("b_used", [](PageStore &s) { return s.b_used; })
       .def_property_readonly("cap_d", [](PageStore &s) { return s.cap_d; }).def_property_readonly("cap_b", [](PageStore &s) { return s.cap_b; })
-      .def_property("next_decision", [](PageStore &s) { return s.next_decision; }, [](PageStore &s, i64 v) { s.next_decision = v; })
+      .def_property("next_decision", [](PageStore &s) { std::lock_guard<std::mutex> g(s.core->mu); return s.core->next_decision; },
+                    [](PageStore &s, i64 v) { std::lock_guard<std::mutex> g(s.core->mu); s.core->next_decision = v; })
       .def("write_decisions", &PageStore::write_decisions).def("write_blocks", &PageStore::write_blocks)
       .def("raw_entry", &PageStore::raw_entry).def("raw_has", &PageStore::raw_has).def("raw_count", &PageStore::raw_count)
       .def("raw_keys", &PageStore::raw_keys).def("raw_mb", &PageStore::raw_mb).def("source_arena", &PageStore::source_arena)
-      .def("free_rows", &PageStore::free_rows).def("stats", &PageStore::stats);
+      .def("free_rows", &PageStore::free_rows, py::arg("dead_d"), py::arg("dead_b"), py::arg("dead_raw"), py::arg("limit") = 0)
+      .def("set_stamp", &PageStore::set_stamp).def("stats", &PageStore::stats);
   py::class_<ActorDriver, std::shared_ptr<ActorDriver>>(m, "ActorDriver")
       .def(py::init<std::shared_ptr<PageStore>>())
       .def("set_stream", &ActorDriver::set_stream).def("set_seed", &ActorDriver::set_seed).def("set_version", &ActorDriver::set_version)
