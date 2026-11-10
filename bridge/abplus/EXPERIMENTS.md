@@ -10902,3 +10902,47 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - trainer线程：主线程1.55核、pt_autograd_1 0.31核、learner-prefetch 0.18核（每5 s采样）。
   - 原生页存储（时间线）：kv页68个×64 MB加z页68个×16 MB，约5.4 GB；块页12个×32 MB，0.4 GB；原始观测raw 406,898行，4.09 GB。这几项合计约10 GB，trainer剩下的约15 GB没分出来（teacher记录、rollout、torch和CUDA在host上的分配等）。
 - 采集速率按阶段分（两卡run的时间线，u10+）：learner在算的266秒里，每秒117步、1,758个决策、134个lane作业，每步等GPU 3.3 ms。learner不在算只有21秒，这21秒里混着交接时的停顿，不能拿来比较。单卡配置下按阶段拆分，要在下一次单卡计时运行时用时间线补测。base-m77657fc的产出里没有带时间的计数（progress.csv只有每轮合计，episodes.jsonl没有时间戳），所以没法不重跑就分出来。
+
+### BM1 第三轮：分卡复跑、退出abort的现场、thread_local探针、两分片脚本（2026-11-11）
+
+机器：8x3090（Gold 6146 + 3090 + cu128），本道node0。
+
+#### 分卡复跑（split2-mb427b8d，同一棵树、同一口径）
+| run | collect u10+ | update u10+ | ×实时 u10+（u2–u23） | u10+各轮×实时范围 | u15 done / nobank / lane / queue / dropped | done/游戏小时 |
+|---|---:|---:|---:|---|---|---:|
+| split-mb427b8d | 17.47 | 17.64 | 235.2（242.5） | 196–251 | 100 / 0 / 111.8k / 0 / 0 | 5.49 |
+| split2-mb427b8d | 18.09 | 18.11 | 227.6（230.6） | 204–241 | 102 / 70 / 150.7k / 0 / 0 | 5.60 |
+
+- 两次中位相差3%。
+- cf_nobank是累计计数，几乎全部来自cf_nobank_refused：actor拒绝capture，因为两代teacher都被pin住了（没有空闲的teacher代）。拒绝是一阵一阵来的：
+  - split2在u11–u12两轮里拒绝了56+14次，那两轮里两代都被pin住的时间分别是21.8 s和17.3 s；
+  - split1一次也没拒绝；
+  - 单卡基线在u14–u16之间拒绝了18+7+46次。
+- 所以u15的nobank主要取决于u15之前有没有发生过一次爆发，这个单点的噪声很大。
+- learner卡的显存：caching allocator的reserved随轮次台阶式上涨，跑到u24时两次分别是14.7 GB和17.9 GB；nvidia-smi看到的是15.4 GB和18.8 GB。split2的峰值20.1 GB出现在u24之后、SIGINT之前，也就是正在跑的u25里。这是历史重算行数和packed形状变化造成的分配器缓存，不是泄漏。
+
+#### 退出时的abort（只诊断）
+- 抓法：用LD_PRELOAD挂上bm1/abrt_trace.c，它只在train_tok进程里生效，在SIGABRT时打印原生栈和所有线程名。
+- 结果：abort发生在pt_autograd_1线程，也就是torch autograd引擎为cuda:1（learner卡）开的设备线程。调用链是：autograd线程 → PyEval_RestoreThread → 解释器正在退出，于是调用pthread_exit → 强制unwind穿过一个noexcept的C++帧 → std::terminate（打印“terminate called without an active exception”）→ abort，返回码134。
+- 原因：分卡时SIGINT到达时主线程在wait_learner里，learner线程正在跑backward。单卡那次SIGINT到达时learner已经做完了这一轮（日志里有“finished 24 updates”），所以没有出事。
+- 修复（决定a）：在train_tok里修，收到SIGINT后先让learner做完当前update并join，再让解释器退出。
+- “B44 steady compile”：block_steady_compiles从u1到u24一直是1。这一次发生在u1之前，是分卡时actor的_body第一次遇到batch 2的形状；learner的那次出现在SIGINT之后的收尾批里，不在计时窗口内。补进warm-up（决定b）。
+- SideCuda闸的等待：两次分卡和单卡基线里，每轮的等待次数和秒数都是0（capture都发生在u1之前）。所以删掉闸不会带来速度上的变化。
+
+#### thread_local的capture探针（bridge/ops/b62_capture_probe2.py，GPU 1和2，树mf0ffad3）
+- 方法：每个(case, 重复)单独起一个子进程。主线程先在没有任何干扰时capture一张参考图；再在另一条线程动作的同时capture同一个body（matmul、relu、按行求和、除法，中间张量都从graph的私有池里分配）；然后两张图用同样的4个输入轮流重放128次，逐位比较。
+  - 两线程同时capture的case：两条线程各自capture，另外比较副线程的图和它自己的参考图，并检查4张图的内存池互不相同。
+  - SideCuda闸关掉。
+- thread_local：24个case，每个5次，全部通过。每次capture都正常结束，副线程的调用正常结束，128次重放全部逐位相同；两线程同时capture时池也全部不同。这24个case是：
+  - 在capture的同一张卡上：query、sync、stream_sync、event_destroy、pin_alloc、pin_free_used、dev_alloc（另一条流上新开64 MiB显存）、replay、h2d、staging_acquire（learner prefetch真实调用的Staging.acquire）、job_events（带CUDA事件的job，先query，再synchronize，再释放）、capture（同卡另一条流上同时capture）；
+  - 加dev1_前缀、在另一张卡（cuda:1）上做同样的事：query、sync、stream_sync、event_destroy、pin_alloc、dev_alloc、replay、h2d、peer_copy（cuda:1到cuda:0，take_weights的那种拷贝）、job_events、capture。
+- 对照组global：每个case 2次。
+  - 作废capture的：query、sync、stream_sync、pin_alloc、dev_alloc、staging_acquire、job_events、capture，同卡和跨卡都是。
+  - 不作废的：event_destroy、pin_free_used、replay、h2d、peer_copy。
+  - 新发现：在global模式下，另一条线程只要新开一段显存（dev_alloc，走到caching allocator的cudaMalloc），capture也会作废。
+- 补充：两线程同时capture时，副线程必须先在自己的线程里预热（cuBLAS句柄和workspace）。不预热的话，它自己的capture会因为在capture里分配workspace而失败。生产里actor线程在capture前都预热过。
+
+#### 两分片同时计时的脚本（只准备，不跑）
+- bm1/shard2.sh：分片0是GPU 1、2加node0，分片1是GPU 4、5加node1，learner都在各自的第二张卡上。每个容器MEM=50g。按node0、node1的顺序拿两把锁，两个prof.sh并发运行（NOLOCK=1，标签是<tag>-s0和<tag>-s1）。
+- 分片之间的隔离：每个分片是一个独立容器，有自己的pid命名空间（kill_abplus扫/proc时只看得到自己的进程）、自己的/dev/shm（PNG缓存、teacher的flock文件）、自己的/tmp（xvfb-run -a，各自的X server），并且--network none，所以端口也不会撞。名字和端口段仍然分开（s0a/39200和s1b/39600），日志和实例目录好区分。共享的HOME下面各缓存都按内容寻址并原子写入。
+- xnew2.sh新增NAME和PORT两个参数，默认b42new和39200，和4090一样。
