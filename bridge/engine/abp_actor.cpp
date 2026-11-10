@@ -973,7 +973,7 @@ struct ActorDriver {
     i64 k = jb.n;
     while (true) {
       i64 wb, we, wn, wsl;
-      bool ok = batch_widths(jb.rows.data(), k, wb, we, wn, wsl) && !lane_force_python;
+      bool ok = batch_widths(jb.rows.data(), k, wb, we, wn, wsl) && lane_force_python != -2 && lane_force_python != g;
       i64 cap = 1; while (cap < k) cap <<= 1;
       auto rec = [&](int kind) {
         auto r = std::make_shared<Record>(); r->kind = kind; r->job = job; r->owner = jb.owner; r->version = jb.version; r->lane_src = 1;
@@ -1098,7 +1098,7 @@ struct ActorDriver {
   void lanes_resume() { lpause_req = false; std::lock_guard<std::mutex> g(lcmu); lccv.notify_all(); }
   // (tests) the lane service driven by the caller with an injected clock: a request read at `now`; one pass
   // (control, a finished round, a due round) at `now`, without the pipes
-  bool lane_force_python = false;
+  i64 lane_force_python = -1;   // (tests) -1 none, -2 every job, g: generation g's jobs go to Python (kind 5)
   void lane_test_intake(i64 lane, double now) { lc.intake(lane, now); }
   bool lane_test_tick(double now) {
     c10::InferenceMode inference;
@@ -1802,7 +1802,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("lane_test_intake", &ActorDriver::lane_test_intake)
       .def("lane_test_tick", &ActorDriver::lane_test_tick, py::call_guard<py::gil_scoped_release>())
       .def("lane_state", &ActorDriver::lane_state)
-      .def("set_lane_force_python", [](ActorDriver &d, bool on) { d.lane_force_python = on; })
+      .def("set_lane_force_python", [](ActorDriver &d, i64 g) { d.lane_force_python = g; })
+      .def_property_readonly("version", [](ActorDriver &d) { return d.version.load(); })
       .def("set_lane_defer", [](ActorDriver &d, double s) { d.lc.cfg.defer_s = s; })
       .def("lane_timing", &ActorDriver::lane_timing).def("lane_counters", &ActorDriver::lane_counters).def("lane_error", [](ActorDriver &d) { return d.lerror; })
       .def_property_readonly("lanes_running", [](ActorDriver &d) { return d.lrunning.load(); })

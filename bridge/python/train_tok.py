@@ -5186,6 +5186,7 @@ def main(argv=None, child=None, actor=None):
                 """(B52) One collect with the driver: records consumed, lane rounds and weight takes with the driver
                 paused; the driver is left paused (drained) for the hand-off."""
                 cpp_driver.set_version(version)   # (take_weights may have run at the hand-off)
+                bdrv.check_versions(cpp_driver, block_actor)   # (B58d: one counter, two places)
                 c0_ = cpp_driver.counters()
                 handoff_ = time.perf_counter()-drv_paused_at[0] if drv_paused_at[0] else 0.0
                 if not cpp_started[0]:   # (the first collect starts the thread; it is paused between collects)
@@ -5202,6 +5203,7 @@ def main(argv=None, child=None, actor=None):
                         take_weights()
                         nv.pop()
                         cpp_driver.set_version(version)
+                        bdrv.check_versions(cpp_driver, block_actor)
                         prof_['weights'] += time.perf_counter() - t_w
                         cpp_driver.resume()
                     ta_ = time.perf_counter()

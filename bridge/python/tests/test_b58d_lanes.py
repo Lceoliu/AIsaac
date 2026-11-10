@@ -30,7 +30,7 @@ from isaac_bridge.block_paged import SlotBlockActor, PagedSnapshot, native_snaps
 from isaac_bridge.block_lanes import BlockLaneService, publish_slot
 from isaac_bridge.tok_lanes import LaneService, ACTIVE_S
 from isaac_bridge.tok_teacher2 import V2_RING
-from isaac_bridge.tok_sampler import TEACH_RING
+from isaac_bridge.tok_sampler import TEACH_RING, ST
 from isaac_bridge.tok_obs import ROW
 
 pytestmark = pytest.mark.skipif(EXT is None, reason='cpp actor extension unavailable')
@@ -57,6 +57,8 @@ def lane_sampler():
     s.block_arrays = [np.zeros((W, BANK), np.int64), np.zeros(W, np.int64), np.full((W, 6, 2), -1, np.int64),
                       np.zeros(W, np.int64), np.zeros((W, 4), np.int64), np.zeros((W, TEACH_RING), np.int64)]
     s.cf_snap = np.zeros(W, np.int64)
+    s.stats = np.zeros((W, max(ST.values())+1))     # (the reclamation reads the teacher rings: none here)
+    s.teach_rows = np.zeros((W, TEACH_RING), ROW)
     return s
 
 
@@ -79,7 +81,7 @@ def world(native):
             main.step(rows, synth_pending(rng, W, m.heads), list(range(W)), ukeys=(np.full(W, t), np.arange(W)))
     s = lane_sampler()
     svc = BlockLaneService(s, m, 'cuda', wait=0, quiet=0, main_actor=main)
-    svc._reclaimed_t = 1e18   # (no reclamation: its own test)
+    svc.RECLAIM_S = 0.0   # (the contexts' reclamation at every control pass, in both worlds)
     gens = svc.generations
     for g in (0, 1):   # (both generations' lane actors, as precapture_lane_generations)
         gens.slots[g] = copy.deepcopy(m).eval().requires_grad_(False)
@@ -109,7 +111,7 @@ def world(native):
                   mode=int(s.block_arrays[1].ctypes.data), status=int(s.block_arrays[0].ctypes.data), pts_per=BANK,
                   kept=int(s.block_arrays[4].ctypes.data), kept_cols=4, cf_snap=int(s.cf_snap.ctypes.data))
         cfg_l = dict(lanes=W, tw=int(s.lane_t.shape[1]), wait=0.0, quiet=0.0, active_s=float(ACTIVE_S), defer_s=float(svc.DEFER_S),
-                     reclaim_s=1e18, pid=TAG)
+                     reclaim_s=0.0, pid=TAG)
         d.lanes_configure(cfg_l, sh, [], int(stream.stream_id), [int(svc.actors[g].step_graph.owner) for g in (0, 1)],
                           [int(svc.actors[g].base) for g in (0, 1)])
         svc.attach_driver(d)
@@ -125,8 +127,9 @@ def capture(w, point, worker, version):
     if w.d is not None:   # (the driver's version is the main actor's: train_tok sets both from one counter)
         w.d.set_version(version)
     if w.d is None:
-        assert w.svc.capture_point(point, w.main.snapshot(worker), model, version)
-        return
+        ok = w.svc.capture_point(point, w.main.snapshot(worker), model, version)
+        w.s.block_arrays[0].flat[point] = 2 if ok else -1
+        return ok
     nat = w.store.native
     snap = nat.lin_snap_row(worker, torch.from_numpy(w.main.pending[worker][0].astype(np.int64)), version)
     c = nat.pt_capture(point, snap, version)
@@ -136,7 +139,8 @@ def capture(w, point, worker, version):
         nat.pt_published(-2-c, version)
         c = nat.pt_capture(point, snap, version)
     nat.lin_release(snap)
-    assert c == 2
+    assert c in (2, -1)
+    return c == 2
 
 
 def native_tick(w, now):
@@ -217,6 +221,11 @@ def compare(A, B, k):
             sn = B.store.native.lin_snap_row(row, torch.zeros(A.nh, dtype=torch.long), 0)
             sb = native_snapshots(B.store, [sn])[0]; B.store.native.lin_release(sn)
             same_snap(sa, sb, cfg)
+    assert len(A.svc.contexts.values) == int(B.store.native.lin_stats()['contexts']), k   # (after the reclamations)
+    np.testing.assert_array_equal(A.s.block_arrays[0], B.s.block_arrays[0], err_msg=f'round {k}: point status')
+    va, ra = A.svc.generations.versions, A.svc.generations.refs
+    vb, rb = B.store.native.pt_gens()
+    assert list(va) == list(vb) and list(ra) == list(rb), (k, va, ra, vb, rb)
     st = B.d.lane_state()
     assert dict(st['lane_steps']) == {int(q): int(v) for q, v in A.svc.lane_steps.items()}, k
     assert dict(st['lane_point']) == {int(q): int(v) for q, v in A.svc.lane_point.items()}, k
@@ -248,7 +257,7 @@ def test_native_lane_service_matches_python_lane_service():
             if events:
                 events(w)
             if B is w:
-                w.d.set_lane_force_python(force_python)
+                w.d.set_lane_force_python(-2 if force_python is True else (-1 if force_python is False else int(force_python)))
         for i, (lane, begin, replay, repeat, _) in enumerate(reqs):
             sq = seq[0]-1 if repeat else seq[0]
             if not repeat:
@@ -279,8 +288,20 @@ def test_native_lane_service_matches_python_lane_service():
     B.d.set_lane_defer(0.0)
     round_(9, [(0, 5, 0, 0, 0), (2, 0, 0, 0, 0)], t+8)                                              # a point that never comes
     assert A.s.lane_out[0, 5] == -1 and A.svc.stat.get('lane_orphan_requests', 0) == 1 and B.d.lane_counters()['orphan'] == 1
+    # both generations pinned (versions 0 and 1): a capture at version 2 refused in both worlds (status -1)
+    assert capture(A, 1*BANK+1, 1, 2) is False and capture(B, 1*BANK+1, 1, 2) is False
+    def ver(v):
+        return lambda w: setattr(w.main, 'version', v) or (w.d.set_version(v) if w.d is not None else None)
+    for w in (A, B):   # (lane 1 begins again at a new point of version 0: its generation still holds it)
+        assert capture(w, BANK+3, 1, 0)
+    round_(10, [(1, BANK+4, 0, 0, 0), (2, 0, 0, 0, 0)], t+9, events=ver(2))                       # version 2: lanes on v0 / v1 points
+    round_(11, [(1, 0, 0, 0, 0), (2, 0, 0, 0, 0), (3, 0, 0, 0, 0)], t+10, events=ver(3),
+           force_python=0)                                                                           # version 3; gen 0 in Python, gen 1 native
+    for w in (A, B):   # (a point released and a new capture in the same round as the reclamation)
+        w.s.block_arrays[0][2, 0] = 3
+    round_(12, [(1, 0, 0, 0, 0), (3, 0, 0, 0, 0)], t+11, events=lambda w: capture(w, 2*BANK+2, 2, 3))
     c = B.d.lane_counters()
-    assert c['python_jobs'] >= 1 and c['rounds'] >= 8 and c['begins'] >= 4
+    assert c['python_jobs'] >= 2 and c['rounds'] >= 11 and c['begins'] >= 5
 
 
 def test_window_rule_matches_python():
@@ -301,3 +322,20 @@ def test_window_rule_matches_python():
             if due_py:
                 idx = s.take_lanes(); svc.seen[idx] = now
                 assert list(idx) == probe.take(now)
+
+
+def test_policy_version_guard():
+    """The driver's version and the main actor's are one counter set in two places: check_versions stops a run where
+    only one of them was set."""
+    from isaac_bridge.block_driver import check_versions
+    torch.manual_seed(3)
+    m = make_policy('cuda').eval()
+    main = SlotBlockActor(m, 2, graph_entities=128, bf16=True, lane_slots=0)
+    d = make_driver_for(main, fake_sampler(2, len(m.heads)))
+    d.set_version(4); main.version = 4
+    check_versions(d, main)
+    main.version = 5   # (only one set)
+    with pytest.raises(RuntimeError, match='out of step'):
+        check_versions(d, main)
+    d.set_version(5)
+    check_versions(d, main)

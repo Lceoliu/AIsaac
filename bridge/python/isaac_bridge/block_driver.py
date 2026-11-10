@@ -433,3 +433,10 @@ def attach_lanes(d, lanes, sampler, stream):
 # teacher generation was pinned (ActorDriver.lane_timing), as progress.csv columns
 LANE_TIMING_FIELDS = tuple(f'{k}_{s}' for k in ('lt_window_s', 'lt_driver_s', 'lt_gpu_s', 'lt_rt_s', 'pt_first_s', 'pt_run_s',
                                                'pt_life_s', 'pt_life_v') for s in ('n', 'p50', 'p90')) + ('pt_refused', 'pt_all_pinned_s')
+
+
+def check_versions(driver, actor):
+    """(B58d) The driver's policy version (the native lane service orders a round's generations by it) and the main
+    actor's (the Python lane service's) are one counter set in two places: a mismatch stops the run."""
+    if driver is not None and actor is not None and int(driver.version) != int(actor.version):
+        raise RuntimeError(f'policy versions out of step: driver {int(driver.version)}, main actor {int(actor.version)}')
