@@ -39,6 +39,7 @@ def pair():
     A, B = world(False), world(True, lane_pipes=True)
     A.defer = 1e9
     B.d.set_fixed_uniform(0.5)
+    B.d.set_m1_merge(True)   # (off by default until M1's gate)
     B.d.set_m1_hold(True); B.d.set_m1_test_capture(True)
     return A, B
 

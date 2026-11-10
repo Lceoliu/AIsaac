@@ -852,7 +852,7 @@ struct ActorDriver {
   // A waiting job pins its teacher generation (refs + 1): its slot cannot be re-published under it.
   struct MergeJob { std::shared_ptr<LaneJob> jb; i64 g; double t_enq; };
   std::deque<MergeJob> merge_q;
-  bool m1_merge = true;
+  bool m1_merge = false;                // (off until M1's gate: Python sets it from ISAAC_BLOCK_LANE_MERGE=1)
   i64 m1_cap = 32;                      // (the largest merged batch: PRECAPTURE_MERGED_CAPS)
   int restore_test = 0;                 // (tests) 1: the restore on the lane stream behind a long kernel, no wait (must fail)
   bool m1_hold = false;                 // (tests) the waiting jobs wait for a main batch even while the driver idles

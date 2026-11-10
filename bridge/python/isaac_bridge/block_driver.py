@@ -433,8 +433,9 @@ def attach_lanes(d, lanes, sampler, stream):
     owners = [int(lanes.actors[g].step_graph.owner) for g in gens]
     bases = [int(lanes.actors[g].base) for g in gens]
     d.lanes_configure(cfg, sh, fds, int(stream.stream_id), owners, bases)
-    # (d2 M1: a lane job of the main version rides the next main batch; =0: every job lane-only, the d1 behaviour)
-    d.set_m1_merge(os.environ.get('ISAAC_BLOCK_LANE_MERGE', '1') != '0')
+    # (d2 M1: a lane job of the main version rides the next main batch. Off until M1's own gate and timing:
+    # ISAAC_BLOCK_LANE_MERGE=1 turns it on; unset / 0: every job lane-only, the d1 behaviour)
+    d.set_m1_merge(os.environ.get('ISAAC_BLOCK_LANE_MERGE', '0') == '1')
     lanes.attach_native_lanes(d, stream)
     sampler.block_contexts = lanes.contexts = NativeContexts(lanes.lin)
 
