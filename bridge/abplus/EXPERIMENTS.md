@@ -10559,6 +10559,36 @@ B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都�
 - CF：两臂 cf_nobank 都在 u8 以后快速上升，到 u24 有 900–1,000。合并 a91d189 之前的步骤 0 运行（prof-b58-s0）到 u15 只有 44，cf_done 也更高（u14 时 94 对 63）。两臂都一样，和消费者无关。原因待查，B58d 的门 d 以 off 臂为基准。
 - 对 B58d 设计的影响：门 f（collect ≤ 12.5 s）光把 Python 搬进 C++ 达不到。lane 的 GPU 工作需要离开主 driver 线程：独立的 lane 线程，用自己的 CUDA 流和 graph 内存池。
 
+### B58c 主行谱系进 C++：日志、快照、侧车、CF 点表、injury 源和 GC（2026-11-10，验收）
+
+#### 实验目的
+
+把 consume_record 里每条记录的谱系工作（EpisodeLog、PagedSnapshot、BlockRollout 侧车、CF 捕获、injury 源、日志推送）挪进 driver 线程，主线程不再逐行建 Python 对象；同时确认原生谱系不会让 CF 点活得更久。
+
+#### 实验方法
+
+- **代码**：4e2ff0d（abp_lineage.h 原生谱系、driver 的 lineage_main、kind 6 发布记录、Python 侧按需物化 native_snapshots / NativeBlockRollout / NativePoints、原生 GC），其后的修正 0f23fbe（kind 1 / 5 记录的版本）、09e6b76（测试与计时脚本）。开关 `ISAAC_BLOCK_CPP_LINEAGE=0` 回到 consume_record 的 Python 谱系。代槽表按 N 个写，默认 2。
+- **门**：门测试 66 过；核心 TSAN（谱系 5 个种子、lane 3 个种子 0 警告 0 错值，去掉保护的对照组都失败）；smoke 4 轮；全量门 251 过 2 跳过；A8 8/8。
+- **测量**：prof-b58c-m，6 轮 nsys（nvtx + python-gil，hand-off 2–5，3 个周期）。
+- **计时对照**（d1 三臂中的 B、C 两臂，candidate-b58d1 = 09e6b76，安静机器，各 24 轮、29.14 游戏小时，不带 nsys）：B = `ISAAC_BLOCK_CPP_LANES=0`（B58c 配置），C = `ISAAC_BLOCK_CPP_LINEAGE=0`（同一棵树上的 B58a+b）。判据：cf_done 在 ±8 内、点寿命不变即验收。
+
+#### 实验结果
+
+| | B（B58c） | C（B58a+b） |
+|---|---:|---:|
+| u15 cf_done / cf_nobank / cf_lane_calls / cf_queue | 78 / 439 / 99.1k / 10 | 79 / 436 / 110.8k / 0 |
+| 每游戏小时 cf_done | 4.28 | 4.34 |
+| 点寿命 p50 / p90（s） | 36.0 / 50.9 | 35.5 / 48.9 |
+| 全部代槽同时被占（s / collect） | 18.3 | 17.8 |
+| collect / update（u10+ 中位，s） | 18.77 / 17.19 | 17.86 / 18.03 |
+| ×实时（u10–u23 中位） | 225.0 | 236.3 |
+| isaac 进程峰值 / 最低可用内存 | 498 / 1.5 GiB | 459 / 3.0 GiB |
+
+- B 对 C 都在噪声带内：原生谱系没有把点拉长，B58c 验收。
+- nsys（每周期）：主线程 GIL 持有 3.55 s、等待 2.55 s（B58a+b 为 5.01 / 3.07），learner 等待 2.27 s（3.10）。c.record 单次 0.28 ms（0.70）。主线程每周期仍进 Python 约 9,100 次（actor.tick 6,076、c.record 3,005），其中 lane 服务（submit / control / finish）在 tick 里，交给 B58d。交接：pause_drain 1.8 ms、h.job 69 ms、h.gc 230 ms，driver 停约 0.3 s，归 B59。
+- 生产中的合并：每 collect lane 作业约 1,000，合并 4 次，与 B58c 之前的运行同样接近 0，没有变少。
+- 过程中的事件：20:53 的全量门 250 过 1 败（failed/tests-b54-full-1110-205338.log），败项是新加的 d1 等价测试，抓到 kind 5 记录的版本被主版本覆盖，0f23fbe 修复；这次新测试没先单独跑绿就进了全量门，已改成先单独跑。另一次 smoke 失败是上一轮留下的输出目录（train_tok 拒绝已有目录），run_b58c.sh 改成阶段开始前先移走旧产物。
+
 ### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
 
 #### 实验目的
