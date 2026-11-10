@@ -1,0 +1,11 @@
+{
+ "about": "B53 four-arm history ablation (run-ready, not started). Every arm: the same train_tok arguments (common), seed, model, input, teacher / CF budgets and micro; only the history flags differ. common = the prof-f4 / xnew2 configuration (B42-B51 profiles) with --checkpoint-every 25 for resumable runs.",
+ "common": "--groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --epochs 3 --teacher --teacher-queue 12 --archive-size 12 --lr 1e-4 --lr-final 1e-4 --episodes-per-state 8 --teacher-death-depths 2,4,8,16,32 --teacher-thread 1 --teacher-fork 1 --teacher-share 0.1 --teacher-slots 6 --poll-wait 0.001 --item-tokens 1 --global-token 1 --item-shared 1 --start-build-prob 0.5 --start-build-max 3 --start-build-mode pedestal --pickup-force 1:0 --reward heal=0.5,resource=0.25 --item-slots 8 --teach-batch 512 --teach-reuse 8 --teach-weight 8 --teach-buffer 60000 --teach-coef 1 --danger-coef 1 --teach-merge 1 --teacher-v2-batch 256 --teacher-v2-reuse 4 --teacher-v2-weight 1 --teacher-v2-coef 1 --teacher-v2-vf 0.25 --teacher-v2-buffer 30000 --cf 1 --cf-points 6 --cf-branches 4 --cf-seconds 180 --cf-target-seconds 20 --cf-margin 0.3 --cf-cap 2 --cf-distill-steps 8 --cf-random 1 --cf-advantage 0 --aux-predict 1 --aux-horizons 1,8 --aux-coef 0.1 --priv-critic 1 --memory off --temporal 0 --block-memory 1 --block-size v1 --block-slots 1 --width 192 --layers 4 --heads 4 --actor-bf16 1 --graph-entities 128 --workers 16 --rollout 32768 --minibatch 8192 --micro 8192 --checkpoint-every 25 --overlap --decoupled 1 --learner-fast 0 --actor-processes 1 --learner-process 0 --amp bf16 --seed 1000",
+ "arms": {
+  "A": {"name": "detach", "flags": "--block-history-mode detach", "port": 39300},
+  "B": {"name": "random-2 unbiased", "flags": "--block-history-mode random --block-history-blocks 2 --block-history-scale unbiased", "port": 39400},
+  "C": {"name": "gradreplay-2", "flags": "--block-history-mode gradreplay --block-history-blocks 2", "port": 39500},
+  "D": {"name": "random-4 unbiased (default)", "flags": "--block-history-mode random --block-history-blocks 4 --block-history-scale unbiased", "port": 39600}
+ },
+ "eval": {"seeds": "2147600000:512", "mode": "run", "groups": "normal:16", "run_seconds": 1800, "note": "held-out namespace (>= 2**31); disjoint from training (< 2**31), the A8 block 2147500000 and the lab panel 2147700000"}
+}

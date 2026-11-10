@@ -9581,6 +9581,351 @@ random臂每个chunk从窗口外块里均匀抽4个历史块，重编码后可�
 - 4090，GPU_LOCK下运行（排在cpp-actor的B50 nsys之后），3分钟，之后锁已释放。
 - 运行期间另一个会话启动了train_tok：本测量是梯度值，不受时间干扰。
 - 代码：ea63627（测量脚本）。
+
+### B51 random臂默认改为无偏历史梯度（Random-k × N/k，直通缩放）（2026-11-09）
+
+#### 实验目的
+
+B49测得：在早期checkpoint、代理损失下，一个chunk里各窗口外块的历史梯度贡献几乎同向（任取4块，历史部分cos 0.998）。但不加缩放的4块规则只给出约4/N的量级（≈20%），按N/4缩放后，与完整一阶梯度的总梯度cos为0.9994。
+
+用户决定：random臂改为无偏缩放作为默认（语义改动）。目标是前向数值不变、k仍为4，只把历史块重编码路径的梯度从“按k/N缩水”改为对全量历史梯度无偏。
+
+B49的两个限定照样适用：
+- 早期checkpoint（第6个update）；
+- 代理损失和一阶代理。
+
+不改k，不改detach / gradreplay的默认，不训练。
+
+#### 实验方法
+
+- 实现（三条learner路径：packed、逐长度paged、对象路径）：
+  - 组装每个chunk的bank值时，对该chunk选中并重编码的块值v做直通缩放：v' = v.detach() + s_i·(v − v.detach())。
+  - s_i = N_i / |selected_i|，N_i为该chunk窗口外可抽样块数（eligible）；N_i ≤ |selected_i|时s_i = 1。
+  - 缩放按(chunk, 块)的每次出现分别计算：同一块被多个chunk选中时仍只重编码一次，各chunk用自己的s_i。
+  - 前向数值：v + 0，逐位不变。
+- 开关：`--block-history-scale unbiased|none`，默认unbiased，写进block_cfg（`BlockConfig.history_scale`）。
+  - 旧checkpoint的config没有这一字段，加载后按默认unbiased。
+  - detach臂不受影响。
+  - gradreplay臂的aux项不变（coef 1.0）。它的叶子梯度在一次调用里按块对chunk求和，要做逐chunk缩放需要逐chunk的叶子，作为可选扩展记下，默认不启用、未实现。
+- 计量：progress.csv新增`grad_clip_frac`（PPO步中被clip缩放的比例）。
+- 测试（`tests/test_b51_history_scale.py`；测试模型用memory_blocks 8、k = 2，使N_i > k）：
+  - (a) none与unbiased的前向输出、loss逐位相同。
+  - (b) 单chunk、固定选中集合：
+    - 到达重编码块Writer输出处的梯度，unbiased恰为none的N/k倍（相对误差 ≤ 2e-7）。
+    - Spatial和Writer参数上历史路径的梯度（与“缩放为0”之差，即与只走共同部分的梯度之差）为none的N/k倍，相对误差 ≤ 1e-5。
+    - 精度说明：这一项是两个FP32参数梯度之差，测试模型里共同部分（主行、新块）约是历史部分的31倍，FP32抵消的极限在1e-6量级（实测packed路径2.5e-6，逐长度路径0.9e-6），所以容差取1e-5；精确的N/k关系由上一条（Writer输出处）验证。
+    - 其他参数（Reader、heads）的梯度逐位不变。
+  - (c) 两个chunk（N_i不同）共享同一个选中块时，批的历史梯度等于两个chunk各自单独（同一组抽样）的历史梯度之和（相对误差 ≤ 1e-5，单线程）。另有一个单元测试，验证`history_scales`的逐出现缩放向量。
+  - (d) 因果隔离测试、packed ≡ 逐长度的等价测试在unbiased下通过。
+- 4090：
+  - 全量门、A8；
+  - 固定输入learner基准（`b51_scale_bench.py`，B48 dump，none / unbiased交替各2次）；
+  - 4个update以上的短profile两次（none、unbiased各5个update，窗口u2–u5），对比grad norm与clip。
+
+#### 实验结果
+
+- 测试：
+  - 4090全量门 1 failed / 202 passed。失败的是(c)的旧版本：逐元素比较参数梯度之差（atol 1e-7），同时受FP32抵消和多线程CPU index累加非确定性的影响，与B51的实现无关。改为单线程、整体相对误差 ≤ 1e-5之后，该文件在4090和本地都是5/5。
+  - 本地143 passed。
+  - A8 8/8，digest不变（actor未改动）。
+- 固定输入learner基准（同一份dump，第2遍，s）：none 11.05、12.49（host侧离群），unbiased 11.09、11.11，无可测差别。
+- 短profile（5个update，u2–u5中位）：
+
+| | none | unbiased |
+|---|---:|---:|
+| update s | 17.8 | 17.1 |
+| collect s | 26.9 | 26.9 |
+| 总grad norm（clip前，每步平均） | 0.34 | 0.43（+27%） |
+| `grad_clip_frac` | 0 | 0 |
+| PPO clip_frac | 0.011 | 0.020 |
+| hist_writer_grad_norm | 0.0066 | 0.0084 |
+| hist_spatial_grad_norm | 0.0149 | 0.0132 |
+
+- 总梯度范数上升约27%，与“历史路径放大约N/4倍”的预期方向一致。
+- `max_grad_norm`为1.0，每步范数在0.3–0.6之间，两边都没有触发clip。PPO比率的clip比例由1.1%升到2.0%。
+- 两次run是不同的轨迹；B48的prof-b48-pf（相当于none）在同窗的grad norm为0.45，run间差别不小，量级判断只作参考。
+- update / collect的差别在噪声内。
+
+结论：
+- 无偏缩放已作为random臂默认上线，前向不变，速度不变。
+- 训练中总梯度范数上升约四分之一，clip尚未触发。
+- 减块方案（k = 1–2再按N/k缩放）等用后期checkpoint的dump复测B49之后再定。
+
+四臂消融定义更新（见PROJECT_SPEC `history_ablation`）：
+- B臂：random，2块，unbiased缩放；
+- D臂：random，4块，unbiased缩放（默认）；
+- A（detach）、C（gradreplay）不变。
+- 要复现B48及以前的不缩放语义，用`--block-history-scale none`。
+
+代码：1522d03。
+
+### B53 历史块四臂消融：可直接开跑的配置、评测协议与资源计划（2026-11-09，四臂未运行）
+
+#### 实验目的
+
+为历史块四臂消融（PROJECT_SPEC `history_ablation`）准备好可以直接开跑的全部内容，本实验本身不训练：
+- 四臂配置：除历史块开关外完全相同，可断点续跑，每臂独立run目录。
+- 留出评测协议：固定种子集、离线评测脚本、指标与置信区间。
+- 评测方差：在现有权重上实测同一checkpoint多次评测的差别，给出512 / 1024 / 2048局能分辨的最小差异。
+- 单卡4090资源计划：串行与两臂并行的墙钟和吞吐估算，供用户决定每臂时长。
+- 一键做后期B49复测：在某一臂的某个update上dump learner输入，然后跑B49统计。
+
+#### 实验方法
+
+- 配置：`bridge/ops/b53/arms.json`。
+  - `common`：B42–B51 profile所用的xnew2配置（micro 8192、16 workers、rollout 32768、teacher / CF预算与份额不变、LR常数1e-4、seed 1000），加`--checkpoint-every 25`。
+  - 四臂只差历史块参数：
+    - A：`--block-history-mode detach`
+    - B：`random --block-history-blocks 2 --block-history-scale unbiased`
+    - C：`gradreplay --block-history-blocks 2`
+    - D：`random --block-history-blocks 4 --block-history-scale unbiased`（默认）
+  - 端口：A 39300、B 39400、C 39500、D 39600；评测端口39800。
+- 启动 / 续跑：`CODE=<候选目录> sh bridge/ops/b53/b53_run_arm.sh <A|B|C|D> <总游戏小时> [墙钟上限s]`。
+  - 等GPU_LOCK空闲，并且没有train_tok或pytest在跑，再写入`b53-arm-<臂>`锁；启动前后各记一次guard（进程数、显存）；结束后释放锁。
+  - run目录为`reports/b53/arm-<臂>`，有独立的progress.csv和checkpoints，日志写`reports/b53/b53.log`。
+  - 再次执行同一命令即续跑（由`b53_arm.py`生成参数）：
+    - 从`checkpoints/last.pt`加`--resume`；
+    - 剩余游戏小时 = 总数减去progress.csv里最后的game_hours；
+    - 线性LR计划从中断点接上（`--lr`取计划在已完成小时数处的值；四臂LR为常数，实际不变）；
+    - 已完成时只打印DONE。
+  - 三种情况（新开、续跑剩514.5小时、已完成）已dry-run验证。
+  - `DUMP_AT=<update>`：在该update做一次learner dump，供后期B49复测使用。
+- 评测协议：`CODE=… sh bridge/ops/b53/b53_eval.sh <checkpoint> <输出目录>`。
+  - 种子：留出种子集`2147600000:512`。训练种子 < 2^31；A8的2147500000段、lab面板的2147700000段与它不重叠。
+  - `--mode run --run-seconds 1800`，`--groups normal:16`，采样动作（训练得到的随机策略，非greedy），floor stall 60 s（与训练相同）。
+  - GPU_LOCK规则同上（另外不与其他eval_tok并行）。
+- 指标：`b53_eval_summary.py <目录...>`。
+  - 每局：通过楼层（≥1层）、通过层数、清理房间数、受伤（半心）、死亡；另有游戏小时、×实时。
+  - 每个均值附逐局bootstrap 95% CI。
+  - 多个目录（同一checkpoint的重复评测）时给出重复间均值的SD。
+  - 分辨力：MDE = 2.80·sqrt(2·var/n)（双侧α 0.05、power 0.8，var为逐局方差），n = 512 / 1024 / 2048局每臂；另给出分辨0.1 / 0.25 / 0.5个逐局SD所需的每臂局数。
+- 后期B49复测：`CODE=… sh bridge/ops/b53/b53_b49_late.sh <臂> [advance]`。
+  - 该臂运行时已用`DUMP_AT`做过dump时，直接在GPU_LOCK下跑`b49_grad_stats.py`（40 chunk、8次抽样）和`b48_coverage.py`，输出`arm-<臂>/b49-late.json`和`coverage-late.json`。
+  - 加`advance`时，先把该臂续跑3个update，并在第一个update做dump（臂会因此多训3个update），然后再统计。
+- 方差实测：在prof-b48-pf的`last.pt`（update 16，D臂语义，B48代码训练）上，用同一协议重复评测3次（4090，2026-11-09 23:32 – 11-10 02:15，GPU_LOCK下），汇总为`reports/b53/var-b48pf-summary.json`。
+
+#### 实验结果
+
+四臂训练：未运行。
+
+评测方差（同一checkpoint，3次 × 512局）：
+
+| | r1 | r2 | r3 | 重复间SD | 逐局SD | 逐局SE（512局） |
+|---|---:|---:|---:|---:|---:|---:|
+| 通过楼层率 | 0 | 0.002 | 0 | 0.001 | 0.026 | 0.001 |
+| 清理房间/局 | 0.125 | 0.084 | 0.092 | 0.022 | 0.309 | 0.014 |
+| 受伤/局 | 2.73 | 2.54 | 2.44 | 0.148 | 2.12 | 0.094 |
+| 死亡率 | 0.400 | 0.381 | 0.363 | 0.019 | 0.486 | 0.021 |
+| 游戏小时 | 9.41 | 9.02 | 9.32 | | | |
+| ×实时 | 10.2 | 10.3 | 10.2 | | | |
+| 墙钟 s | 3306 | 3154 | 3289 | | | |
+
+- 这个checkpoint很早：几乎不过第一层，平均每局约65 s游戏时间，62%的局因60 s无进展结束。所以“通过楼层率”在这里没有方差可言，下面它的分辨力按二项方差另算。
+- 重复间SD与逐局抽样噪声一致：清理房间与受伤的重复间方差约为逐局SE²的2.5倍，死亡为0.75倍。只有3次重复（自由度2），2.5倍在偶然范围内（χ²₂上97.5%分位对应约3.7倍）。没有证据表明固定种子之外还有额外的评测间噪声。另一方面，固定种子也没有明显减小噪声：采样动作与时序已使同一种子的两局不同。
+- 分辨力（两臂之差，α 0.05双侧、power 0.8）：
+
+| 指标 | 512局/臂 | 1024 | 2048 |
+|---|---:|---:|---:|
+| 清理房间/局（本checkpoint方差） | 0.054 | 0.038 | 0.027 |
+| 受伤/局 | 0.37 | 0.26 | 0.19 |
+| 死亡率 | 0.085 | 0.060 | 0.043 |
+| 通过楼层率，p = 0.05 | 0.038 | 0.027 | 0.019 |
+| 通过楼层率，p = 0.10 | 0.053 | 0.037 | 0.026 |
+| 通过楼层率，p = 0.25 | 0.076 | 0.054 | 0.038 |
+| 通过楼层率，p = 0.50 | 0.088 | 0.062 | 0.044 |
+
+  - 按逐局SD计：分辨0.5 SD要63局/臂，0.25 SD要251局，0.1 SD要1568局。
+  - 1024 / 2048局是同一组512个种子评测2 / 4遍。上表按独立局计算；同种子重复并非完全独立，但上面实测的重复间SD不小于逐局SE，说明种子共有的成分不大。四臂共用同一组种子，按种子配对比较还能再降低方差（`b53_eval_summary.py`目前不做配对，需要时再加）。
+- 评测本身的开销：16 workers聚合只有约10×实时，即每worker约0.64×，每局（含开局）约103 s墙钟。`eval_tok`的block memory走逐worker的对象路径，没有用训练actor的paged / graph路径。评测时长随局长线性增长：现在每遍512局约55分钟；如果训练后平均局长到300 s，每遍约4.3小时；到600 s，每遍约8.5小时。
+- 资源计划（单卡4090）：
+  - 依据：B48–B51的profile都是collect瓶颈（collect约27–29 s/update；D臂update约17–19 s，与collect重叠；A / B / C的learner更轻），所以四臂的×实时都由collect决定。现在约150×（B48实测150.2），C++ actor改造后目标约200×。这是推断：A / B / C在当前代码下没有单独测过×实时，每臂开跑后的前5个update即可确认。
+  - 串行（推荐）：
+
+| 每臂游戏小时 | 150×：每臂墙钟 | 150×：四臂合计 | 200×：每臂墙钟 | 200×：四臂合计 |
+|---:|---:|---:|---:|---:|
+| 500 | 3.3 h | 13.3 h | 2.5 h | 10.0 h |
+| 1000 | 6.7 h | 26.7 h | 5.0 h | 20.0 h |
+| 2000 | 13.3 h | 53.3 h | 10.0 h | 40.0 h |
+
+  - 另加每臂最终评测（512局一遍，现在约1小时，随局长增长，见上）。
+  - 到200×后，每天（24 h墙钟）四臂各约1200游戏小时（不计评测）。
+  - 两臂并行：不可行，也没有收益。
+    - 显存：每臂约15.2 GB，两臂超过24 GB。
+    - 主机内存：B47实测16 workers占27.4 GB、剩余18 GB，装不下第二组16 workers。
+    - “每臂micro减半”违反micro 8192的固定预算，两臂的梯度噪声也不再与正式配置一致。
+    - 两臂都受collect限制：共享同一组CPU时，每臂workers减半，各自约75×（200×时约100×），总吞吐与串行相同，只是两臂同时结束。
+  - 结论：推荐串行，每臂时长N由用户决定。
+
+#### 待做
+
+- 用户确定每臂游戏小时数和评测局数之后，按 A → B → C → D 串行开跑（每臂一条`b53_run_arm.sh`命令，中断后重复同一命令即可续跑）。
+- 每臂建议在末段用`DUMP_AT`留一份dump，供后期B49复测。
+
+代码与配置：见本节提交（`bridge/ops/b53/`）。
+
+### B55 Spatial冷编译610 s的分解：FX graph / AOTAutograd缓存能省多少（P0测量，2026-11-10）
+
+#### 实验目的
+
+每个训练进程启动时，Spatial编译预热都要599–621 s（51个图，25个run几乎不变），Flex Reader另需约29 s。每次profile、每臂启动都白等十分钟。
+
+静态诊断的结论（只读检查4090缓存目录与日志）：
+- Triton kernel缓存（`~/.cache/isaac-b42-inductor/triton`）已跨进程命中。
+- `block_compile.configure()`显式关闭了FX graph cache（B42，为避免缓存图带入预热batch的范围守卫）。依赖它的AOTAutogradCache也随之失效。
+- 因此每个进程都对51个图重做Dynamo、AOT autograd和Inductor。
+
+本实验测两件事：
+- 610 s在Dynamo、AOT、Inductor之间怎么分；
+- 打开FX和AOT缓存后，冷、热两种情况各要多久，稳态重编译是否仍为0。
+
+只测量，不改`block_compile`的默认值。
+
+#### 实验方法
+
+- 脚本：`bridge/ops/b55_compile_probe.py`。
+  - 按eval_tok的方式从checkpoint构造actor和learner模型（prof-b48-pf `last.pt`，B48–B53同一结构），然后依次跑生产预热：`warm_spatial`、`warm_reader`。
+  - 记录`torch._dynamo.utils.compilation_time_metrics`（各阶段的总秒数和调用次数）和`counters`（fxgraph / autograd cache的hit、miss）。
+  - `--fx-cache on`只在本进程打开`fx_graph_cache`和`enable_autograd_cache`。
+  - `--steady`：`mark_steady()`之后，用预热时没出现过的batch大小逐类调用已编译的图，`steady_compiles`必须为0。覆盖范围：
+    - canvas解码器，n = 5 / 16 / 40；
+    - actor的12个(entity, body)桶，参数活跃和冻结两种状态，n = 5 / 16 / 40；
+    - learner的8个逐行打包T桶，grad / no_grad / inference三种模式，n = 5 / 37 / ≤700。
+- 4090上依次跑两次（GPU_LOCK `a1 … B55 spatial compile_times`，总计965 s，前后guard干净）：
+  1. **缓存开、冷**：全新的`TORCHINDUCTOR_CACHE_DIR`，Triton缓存仍指向生产目录（`TRITON_CACHE_DIR=…/isaac-b42-inductor/triton/0`），相当于“生产配置 + 打开缓存”的第一次。
+  2. **缓存开、热**：同一目录，并做`--steady`。
+- 缓存关的基线不重跑。它与冷跑做的是同样的编译工作（冷跑只多写缓存），而25个生产run已给出599–621 s；在20分钟预算内也跑不下第三次。
+
+#### 实验结果
+
+| | 生产（缓存关） | 缓存开、冷 | 缓存开、热 |
+|---|---:|---:|---:|
+| Spatial预热（51图）s | 599–621 | 533.2 | 243.5 |
+| Flex Reader预热（21图）s | 29–30 | 116.8 | 26.9 |
+| fxgraph cache hit / miss | – | 20 / 39 | 51 / 24 |
+| AOT autograd cache hit / miss | – | 8 / 43 | 43 / 8（8次都是guard_miss） |
+| 稳态重编译（--steady） | – | – | 0 |
+
+Spatial预热的分解（s，dynamo_timed嵌套计时）：
+
+| 阶段 | 缓存开、冷 | 缓存开、热 |
+|---|---:|---:|
+| Dynamo trace与guard（compile_inner − call_user_compiler） | 76 | 76 |
+| AOT autograd本身（joint trace、functionalize、partition） | ≈ 210 | ≈ 50（只有8个未命中的图） |
+| Inductor（compile_fx_inner：lowering、scheduler、codegen） | 205 | 94（只有8个图的fw+bw） |
+| 其中Triton配置autotune基准 | 31.5 | 0.9 |
+| 缓存载入（43个命中的图） | – | ≈ 20 |
+| 图外eager执行（前向、反向、解码） | 33 | 2 |
+
+- **610 s的构成**：AOT约210 s，Inductor约205 s，Dynamo约76 s，eager约33 s。冷跑比生产少约80 s，是因为同一进程内有重复的图（例如actor活跃和冻结两种状态在AOT之后相同）：开缓存后进程内也能命中（fxgraph 20次、AOT 8次）；缓存关时每个都重编。
+- **热缓存把Spatial预热从约610 s降到243.5 s（−60%）**；Flex Reader回到26.9 s。合计约640 s → 270 s。
+- **剩下的243.5 s中，145 s来自8个learner grad模式图（每个T桶1个）**：它们的AOT缓存条目在载入时guard不成立（`autograd_cache_guard_miss` 8次），于是AOT和Inductor的fw+bw全部重做。其余43个图命中，只花Dynamo时间加约20 s载入。
+- **B42担心的范围守卫没有复现**：缓存命中的图在新batch大小下（actor 5 / 16 / 40，learner到700行，三种模式）稳态重编译为0。B42当时同时有pad_mm守卫，现在`shape_padding`已关。
+- **Flex Reader冷跑116.8 s**（生产约29 s）：全新Inductor目录里没有Flex模板的编译产物；热跑恢复到26.9 s。生产目录已有这些产物，所以首次打开缓存时Flex不会变慢。
+- 提交时，本机共享仓库`.git`里EXPERIMENTS.md的新blob写坏了（loose object校验失败，推送被拒）。处理：坏对象移到scratchpad备份，从工作区重新写入，`git fsck --no-dangling`干净后推送。以后每次提交前先跑一次`git fsck --no-dangling`。
+- **限定**：
+  - 稳态检查是合成输入，覆盖Spatial和解码器；Flex Reader的稳态没有合成检查。最终门仍是带游戏的短profile中`block_steady_compiles = 0`。
+  - 模型或编译相关代码一改，缓存就失效，回到约533 s（仍比关缓存少约80 s）。
+
+结论与建议（P1 / P2的代码改动待确认后再做）：
+- **P1（推荐）**：用开关（例如`ISAAC_FX_CACHE=1`）打开FX graph cache与AOTAutogradCache，用短profile确认`block_steady_compiles = 0`后再改为默认。预期每个进程启动省约370 s。
+- **P1b**：查清8个learner grad图的AOT guard miss（用`TORCH_LOGS=aot_autograd`看载入时失败的guard）。修好后热预热预计再省约120 s，降到约120–130 s。
+- **P2暂不做**：开缓存后，Dynamo的76 s是剩下的下限。去掉12个冻结变体最多省约20 s，duck shape收益不明，都不值得改动语义邻近的代码。
+- 并行预热或mega-cache只对冷缓存有用，暂不需要。
+
+代码：`bridge/ops/b55_compile_probe.py`（只测量）。产物：4090 `reports/b42-speed/b55/`（`on-cold.json` / `.log`、`on-warm.json` / `.log`）、`b55.log`；FX缓存目录`~/.cache/isaac-b55-fxprobe`（探针专用，生产不读）。
+
+### B56 ISAAC_FX_CACHE开关：跨进程FX graph / AOTAutograd缓存（P1）与8个grad图guard miss诊断（P1b）（2026-11-10）
+
+#### 实验目的
+
+B55测得：打开FX graph cache与AOTAutogradCache后，缓存热时Spatial预热从约610 s降到243.5 s，合成输入的稳态重编译为0。剩下的时间里，145 s来自8个learner grad模式图：它们的AOT缓存条目在载入内层FX图时失败（`autograd_cache_guard_miss`），fw+bw全部重编。
+
+本实验：
+- P1：把缓存做成开关，默认保持现状（关）。用带游戏的短profile确认稳态重编译为0（覆盖Flex Reader和真实batch）、速度不退化，之后再单独提交改默认。
+- P1b：在同一把锁里，诊断这8次guard miss的原因。修法先报给协调方，确认后再改。
+
+不做P2（去冻结变体、duck shape）。
+
+#### 实验方法
+
+- 开关：`ISAAC_FX_CACHE=1`时，`block_compile.configure()`打开`inductor_config.fx_graph_cache`和`torch._functorch.config.enable_autograd_cache`；默认（未设或0）与B42–B55相同，即关闭。
+  - 缓存目录不变（`TORCHINDUCTOR_CACHE_DIR`默认`~/.cache/isaac-b42-inductor`，Triton缓存在同一目录下）。
+  - train_tok的预热行附带`(B56 fx cache on|off)`。
+  - 测试`tests/test_b56_fx_cache.py`：子进程里检查默认 / 0 / 1三种取值下的配置值。
+- P1b诊断：`b55_compile_probe.py --why-miss`。
+  - 包装`FXGraphCacheLoadable.load`，每次内层FX图载入打印：前向还是反向、FX key、该key目录是否存在及候选条目数、输入个数与前几个形状、成败。
+  - 只保留`torch._inductor.codecache`与AOTAutograd cache日志中的关键行：guard求值（`evaluating guards [...] with values ... => hit`）、hit / miss、载入失败、写入、bypass。
+  - 用来区分三种可能：
+    - 反向（或前向）的FX条目根本没写入；
+    - 条目在，但guard在新进程的hint下不成立（打印guard表达式与hint值）；
+    - 条目载入时出错。
+  - 选这个办法而不用`TORCH_LOGS=aot_autograd`：后者不打印FX层的guard表达式与hint，而且输出量大。
+- GPU验证：`CODE=<候选> sh bridge/ops/b56_verify.sh`，排在cpp-actor B54链之后，锁空闲才取，总时长≤30分钟。
+  1. 开关打开的短profile（prof2.sh，`prof-b56-fx`，生产缓存目录）：progress.csv满6个update后SIGINT（硬上限1500 s）。这一次FX缓存为冷，预热约533 s。
+     - 看`block_steady_compiles = 0`；
+     - update / collect / ×实时与同树的prof-b51-unb、prof-b52-py同口径（u2–u6中位）。
+  2. 同一锁内，在已写满的生产缓存上（热）跑`b55_compile_probe.py --fx-cache on --steady --why-miss`，时长取剩余时间，最多480 s。
+- 验证通过后，再单独提交把开关默认改为开。
+
+#### 实验结果
+
+4090，B54链因smoke失败停止后由一次性等待脚本自动启动（06:31:27），GPU_LOCK持有到06:51:59，共1232 s（≤30分钟），前后guard干净（guard里的“1 probe”是启动等待脚本那条bash命令行，不是探针进程）。
+
+- 短profile `prof-b56-fx`（开关打开，生产缓存目录，FX缓存首次写入）：
+  - 6个update后SIGINT。16个worker在退出时打印了KeyboardInterrupt traceback：这是我的停止方式造成的（pkill的匹配也命中了xvfb-run / timeout的命令行），不是run出错，6个update的数据完整。
+  - 预热：Spatial 504.8 s（51图），比关缓存的599–621 s少约105 s（进程内重复图命中）；Flex Reader 35.1 s。
+  - `block_compiles` 72（与关缓存相同），`block_steady_compiles`在6个update里全部为0：带游戏、Flex Reader和真实batch都没有稳态重编译。
+
+| 每update（s） | u1 | u2 | u3 | u4 | u5 | u6 |
+|---|---:|---:|---:|---:|---:|---:|
+| collect prof-b56-fx | 15.7 | 20.0 | 32.9 | 28.9 | 26.7 | 32.6 |
+| collect prof-b51-unb | 15.8 | 19.4 | 32.2 | 28.9 | 24.9 | – |
+| update prof-b56-fx | 15.7 | 15.3 | 19.5 | 20.0 | 19.9 | 19.5 |
+| update prof-b51-unb | 14.0 | 14.5 | 17.3 | 19.2 | 16.8 | – |
+| update prof-b52-py | 13.7 | 16.8 | 17.1 | 19.6 | 18.7 | 18.6 |
+| update prof-b48-pf | 13.8 | 14.6 | 17.7 | 18.4 | 18.7 | 18.0 |
+
+  - u2–u6中位：collect 28.88 s，update 19.53 s，×实时147.6。prof-b51-unb（只有u2–u5）为26.89 / 17.08 / 166.3，prof-b52-py为27.06 / 18.56 / 165.7。
+  - collect：逐update与prof-b51-unb几乎一样（collect按update交替在27和32 s左右，b51-unb没有u6这个高值，所以中位低）；没有退化。
+  - update：u3–u6为19.5–20.0 s，同窗的b51 / b52-py / b48-pf为16.8–19.6 s，高约1 s。这在跨run的范围之内（b48-pf后段u7–u16为17.8–21.7 s），但处在上沿。开缓存不会改变kernel（同一份Inductor产物），没有预期的机制，因此不能确定是退化还是run间差别。
+- P1b（`--why-miss`，热缓存）：没有结果。
+  - 480 s超时（rc 124），预热没跑完。原因是日志：我只在叶子logger上设了DEBUG并加了过滤handler，记录仍会传到torch自己在父logger上的handler，打印了全部DEBUG（82,356行，包括每个图的缓存key明细），拖慢了进程。已修：叶子logger `propagate=False`，过滤按未格式化的模板做（不触发明细格式化），本地已确认只剩guard求值行。
+  - 已跑到的部分也不能说明问题：探针在生产缓存上大多是AOT **key** 未命中（不是guard miss），说明探针构造的模型与train_tok的learner编译出的图不完全相同。所以P1b应当像B55那样，让探针先在自己的缓存目录里冷跑一次，再热跑`--why-miss`。
+- 结论：
+  - P1的安全性（稳态重编译为0）已在带游戏的profile中确认。
+  - 速度：collect不退化；update高约1 s，尚不能定性。
+  - 默认值未改。建议再做一次：缓存热的profile（同时验证生产中热预热的实际节省），再加上P1b按B55方式重跑，约25分钟。是否做、何时做，由协调方定。
+
+第二次（协调方批准，≤25分钟）：B54链07:09因smoke失败停止，一次性等待脚本07:11:47启动`b56_verify2.sh`，锁持有到07:32:10，共1223 s，前后guard干净。
+
+- 缓存热的短profile `prof-b56-fxw`（开关打开，生产缓存目录已由prof-b56-fx写入）：
+  - 预热：**Spatial 151.4 s**（关缓存599–621 s，−75%），Flex Reader 26.2 s；合计约178 s，原来约640 s。
+  - `block_steady_compiles`在6个update里全为0，`block_compiles` 72。
+  - 只给train_tok主进程发SIGINT：worker不再打印traceback；只有lane线程在主进程退出时打印了1个KeyboardInterrupt，是正常的停止。
+
+| u2–u6中位 | collect s | update s | ×实时 |
+|---|---:|---:|---:|
+| prof-b56-fxw（缓存开，热） | 28.5 | 19.4 | 144.9 |
+| prof-b56-fx（缓存开，冷） | 28.9 | 19.5 | 147.6 |
+| prof-b48-pf（关） | 29.6 | 18.0 | 142.9 |
+| prof-b52-py（关） | 27.1 | 18.6 | 165.7 |
+| prof-b51-unb（关，只有u2–u5） | 26.9 | 17.05 | 166.3 |
+
+  - 两次缓存开的update都比关缓存的同窗高约1 s。逐项计时：u2–u5的learner Spatial调用次数缓存开为113.5 / 117次，关为约101次（b51-unb与b48-pf的平均），多了12–16%；backward GPU时间9.55 / 9.34 s对8.53 s，按每次调用算是0.084 / 0.080 s对0.085 s，不比关缓存慢。
+  - 所以多出来的约1 s来自工作量（这几次run的轨迹给learner的Spatial调用更多），不是缓存让kernel变慢。这与缓存用的是同一份Inductor产物一致。
+  - collect与×实时处在关缓存几次run的范围内。
+- P1b（探针：先在自己的新目录冷跑538.4 s，再热跑`--why-miss` 252.0 s，只编Spatial）：
+  - 51次FX载入中，失败的8次**全部是learner grad模式图（8个T桶各1个）的backward图**。
+  - 三类归因中属于第2类：缓存条目存在（key目录在，候选1个），但guard在新进程里求值为False。
+  - 失败的方式：guard表达式里有`L['t10'] == 28*L['t2']`、`L['t11'] == 40*L['t0']`（T=40；T=48 / 64时是48 / 64倍）。新进程给出的hint列表有17个值，其中恰好有84（= 28·3）和120（= 40·3），但不在t10、t11的位置上。也就是说，backward图的symint输入顺序（以及个数）在写入和载入时不一致，guard按位置取值才失败，形状关系本身是成立的。
+  - 这是torch 2.7.1中AOTAutogradCache / FXGraphCache对动态形状backward图的问题，项目代码这边没有不改torch的修法。
+  - 生产里的热预热只要151.4 s，比探针的252 s少约100 s，约等于这8个backward重编的时间。生产很可能没有触发这个miss（train_tok没有打印缓存计数，无法确认）。所以修好它的收益最多约100 s，很可能为0。
+- 结论与建议：
+  - P1可以改为默认开：稳态重编译为0（两次带游戏的profile，冷、热各一次），热预热约178 s对约640 s，update的差别是工作量而不是缓存。
+  - P1b不修。可选：在train_tok预热行后打印一次fxgraph / autograd cache的hit / miss计数（一行，只观测），以后可以直接看生产是否命中。
+  - 默认值仍未改，等协调方确认。
+
+默认值自ed6b2a0起为开（`ISAAC_FX_CACHE`未设或为1时开，设0时关）。同一提交里，train_tok在预热之后打印一行`B56 compile cache after warm-up: {...}`（fxgraph与AOTAutograd缓存的hit / miss / guard_miss / bypass计数，只观测），以后可以直接看生产中那8个backward图是否命中。P1b不修，归因见上。
 ### B50 阶段 0：actor 调度热路径迁 C++ 之前的测量与设计（Nsight Systems + python-gil）（2026-11-09）
 
 #### 实验目的

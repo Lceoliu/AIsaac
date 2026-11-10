@@ -30,10 +30,17 @@ class BlockConfig:
     writer_heads: int = 4
     attention: str = 'sdpa'
     history_recompute_blocks: int = 4
+    # B51: 'unbiased' (default) -- in history_mode 'random' a chunk's re-encoded blocks pass the Reader's
+    # gradient back scaled by N_i / |selected_i| (N_i: the chunk's window-external blocks), straight through
+    # (forward values unchanged): an unbiased estimate of the gradient through all N_i blocks; 'none': unscaled
+    # (B48 and earlier). detach / gradreplay arms: unaffected.
+    history_scale: str = 'unbiased'
 
     def __post_init__(self):
         if self.attention not in ('sdpa','flex'):
             raise ValueError('attention backend must be sdpa or flex')
+        if self.history_scale not in ('unbiased','none'):
+            raise ValueError('history_scale must be unbiased or none')
         if self.width % self.heads or self.latent_width % self.writer_heads:
             raise ValueError("attention width must be divisible by heads")
         if self.layers < 2 or self.layers % 2:
@@ -392,6 +399,22 @@ class BlockMemory(nn.Module):
             next_states.append(EpisodeMemory(s.step+t, kv, times, versions, ms, tail, pver, s.episode))
         result['states']=next_states
         return result
+
+
+def scaled_history(value, scale):
+    """B51: straight-through gradient scaling: the forward value is `value` (bitwise: value + 0), the gradient
+    flowing back into `value` is multiplied by `scale` (a number, or a tensor broadcast against value)."""
+    if isinstance(scale, (int, float)) and scale == 1:
+        return value
+    d = value.detach()
+    return d+scale*(value-d)
+
+
+def history_scale_factor(n_eligible, n_selected, config):
+    """B51: N_i / |selected_i| under history_scale 'unbiased' (1 when every eligible block is selected)."""
+    if config.history_scale != 'unbiased' or n_selected <= 0 or n_eligible <= n_selected:
+        return 1.0
+    return float(n_eligible)/float(n_selected)
 
 
 def historical_blocks(state, generator=None,config=None):

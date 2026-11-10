@@ -741,8 +741,10 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
         store.blocks(ubid, out=slab.host['blocks'])
     if sizes_i:
         np.concatenate([np.asarray(ints[k], np.int64) for k in names_i], out=slab.host['ints'].numpy())
+    # B51: the old bank entries' gradient scales (history_scale 'unbiased'; None: nothing scaled)
+    hscale = bp.history_scales(parts, selected, cfg) if grad and len(ub) and history_mode == 'random' else None
     bp.ucount('learn_packed_host_s', time.perf_counter()-t0)
-    return dict(bs=bs, cfg=cfg, device=device, grad=grad, lat=lat, lw=lw, memory=memory, n_hist=n_hist,
+    return dict(hscale=hscale, bs=bs, cfg=cfg, device=device, grad=grad, lat=lat, lw=lw, memory=memory, n_hist=n_hist,
                 n_main=n_main, n_new=n_new, n_old_total=n_old_total, n_tail=n_tail, names_i=names_i, packed=packed,
                 pk_all=pk_all, plans=plans, rbuckets=rbuckets, replay_host=replay_host, selected=selected,
                 sizes_i=sizes_i, slab=slab, spatial_micro=spatial_micro, store=store, ub=ub, ubid=ubid,
@@ -816,7 +818,11 @@ def _run_packed(model, P):
                 pool_b = torch.cat((pool_b.detach(), leaf))
             if hist_written is not None:
                 pool_b = torch.cat((pool_b.to(hist_written.dtype), hist_written))
-            vparts.append(pool_b.index_select(0, di['old:source']).to(zdt))
+            old_v = pool_b.index_select(0, di['old:source']).to(zdt)
+            if P['hscale'] is not None:   # (B51: unbiased history gradient, straight through)
+                from .block_memory import scaled_history
+                old_v = scaled_history(old_v, torch.from_numpy(P['hscale']).to(device, old_v.dtype)[:, None, None])
+            vparts.append(old_v)
         if new_written is not None:
             vparts.append(new_written.to(zdt))
         vt = None

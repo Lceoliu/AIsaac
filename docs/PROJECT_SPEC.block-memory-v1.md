@@ -485,7 +485,8 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
   "history_ablation": {
     "entry": "bridge/abplus/EXPERIMENTS.md B43",
     "switch": "--block-history-mode random|detach|gradreplay (--block-history-blocks, --block-history-aux-coef 1.0, --block-history-replay raw; latent not wired)",
-    "arms": {"A": "detach", "B": "random, 2 blocks", "C": "gradreplay, 2 blocks (1 max ||g_j|| + 1 random, aux loss sum_j sg(g_j).f(o_j))", "D": "random, 4 blocks (default, unchanged)"},
+    "arms": {"A": "detach", "B": "random, 2 blocks, history_scale unbiased (B51: gradient x N_i/2)", "C": "gradreplay, 2 blocks (1 max ||g_j|| + 1 random, aux loss sum_j sg(g_j).f(o_j); aux unscaled)", "D": "random, 4 blocks, history_scale unbiased (default since B51: gradient x N_i/4)"},
+    "history_scale": "B51 --block-history-scale unbiased (default) | none (B48 and earlier: unscaled); k = 1-2 with N/k pending a late-checkpoint B49 re-measure",
     "commits": {"switch_ABD": "01bf1b3", "gradreplay": "c8fabb7", "diagnostics": "3391278", "memory_clear_eval": "9edbf01"},
     "equivalence_gates": {"local_cpu": "121 passed / 35 skipped", "rtx4090": "162 passed / 0 failed",
                           "C_gj_finite_difference": "passed", "C_aux_equals_D_reader_gradient_all_blocks": "passed",
@@ -498,7 +499,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     },
     "history_cost_over_A_s": {"B": 16.4, "C": 14.8, "D": 23.4},
     "memory_clear_eval": "eval_tok.py --memory-clear older:K|recent:K --memory-clear-fill zero|random; bridge/ops/b43_memclear_compare.py (not run)",
-    "training_runs": "none yet (budgets being decided)"
+    "training_runs": "none yet (budgets being decided); run-ready configuration, eval protocol and resource plan: ablation_b53"
   },
   "packed_learner": {
     "entry": "bridge/abplus/EXPERIMENTS.md B44",
@@ -666,6 +667,42 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "norm_ratio_unscaled": 0.202, "rows": {"4_blocks": 128, "all": 660},
     "conclusion": "not concentrated; per-block contributions nearly parallel; the unscaled rules keep ~4/N of the history gradient's magnitude; Random-k x N/k is closest; gradient-guided picks no better",
     "ablation_suggestion": "add Random-k x N/k arms (k=4 and 1-2); re-measure on a late checkpoint dump before deciding"
+  },
+  "history_scale_b51": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B51", "commit": "1522d03",
+    "switch": "--block-history-scale unbiased|none (BlockConfig.history_scale, default unbiased; old configs load as unbiased)",
+    "rule": "random arm: each chunk's selected re-encoded block value v -> v.detach() + s_i*(v - v.detach()), s_i = N_i/|selected_i| (1 if N_i <= |selected_i|), per (chunk, block) occurrence; forward bit-identical; k = 4",
+    "unaffected": "detach arm; gradreplay aux term (coef 1.0; per-chunk aux scaling would need per-chunk leaves: optional, not implemented)",
+    "basis": "B49 (early checkpoint, surrogate loss, first-order proxy): Random4xN/4 cos 0.9994 vs full",
+    "tests": {"forward": "bit-identical", "writer_output_grad": "exactly N/k x (2e-7)", "param_history_grad": "N/k x within 1e-5 (FP32 cancellation, common part ~31x)",
+              "shared_block": "per-chunk scales (1e-5, one thread)", "rtx4090": "202 passed + B51 file 5/5 after the tolerance fix", "a8": "8/8"},
+    "learner_bench_s": {"none": [11.05, 12.49], "unbiased": [11.09, 11.11]},
+    "short_profile_u2_u5": {"none": {"update_s": 17.8, "collect_s": 26.9, "grad_norm": 0.34, "grad_clip_frac": 0.0, "ppo_clip_frac": 0.011},
+                            "unbiased": {"update_s": 17.1, "collect_s": 26.9, "grad_norm": 0.43, "grad_clip_frac": 0.0, "ppo_clip_frac": 0.020},
+                            "max_grad_norm": 1.0}
+  },
+  "compile_cache_b56": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B55, B56", "default_on_since": "ed6b2a0",
+    "switch": "ISAAC_FX_CACHE (default 1: Inductor fx_graph_cache + functorch enable_autograd_cache; 0: off as in B42-B55); cache dir TORCHINDUCTOR_CACHE_DIR, default ~/.cache/isaac-b42-inductor",
+    "cold_breakdown_b55_s": {"aot_autograd": 210, "inductor": 205, "dynamo": 76, "eager": 33},
+    "spatial_warmup_s": {"cache_off": "599-621", "on_cold_production": 504.8, "on_warm_production": 151.4, "flex_reader_warm": 26.2},
+    "steady_compiles": "0 (prof-b56-fx cold, prof-b56-fxw warm, 6 updates each; synthetic unseen batch sizes)",
+    "speed": "u2-u6 update 19.4-19.5 s vs 17.1-18.6 s cache off: workload (+12-16% learner Spatial calls), backward GPU per call unchanged",
+    "known_miss": "torch 2.7.1: the 8 learner grad graphs' backward FX entries fail their guards on reload (symint order differs); not fixed; train_tok prints cache counters after the warm-up",
+    "probe": "bridge/ops/b55_compile_probe.py (--fx-cache, --steady, --why-miss, --no-reader)"
+  },
+  "ablation_b53": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B53", "status": "run-ready; arms not run (hours per arm: user decision)",
+    "config": "bridge/ops/b53/arms.json (common = xnew2 profile args + --checkpoint-every 25, seed 1000; arms A detach / B random-2 unbiased / C gradreplay-2 / D random-4 unbiased; ports 39300/39400/39500/39600)",
+    "launch": "CODE=<dir> sh bridge/ops/b53/b53_run_arm.sh <arm> <total_game_hours> [limit_s]; rerun = resume (b53_arm.py: --resume last.pt, remaining hours, LR schedule continued); DUMP_AT=<update> for a learner dump; GPU_LOCK b53-arm-<arm>",
+    "eval": {"script": "bridge/ops/b53/b53_eval.sh + b53_eval_summary.py", "seeds": "2147600000:512 (held out; disjoint from training < 2**31, A8 2147500000, lab 2147700000)",
+             "mode": "run, 1800 s, normal:16, sampled actions, floor stall 60 s", "metrics": "floor clear rate, floors / rooms cleared, hurt, death per run, game hours, x real time; bootstrap CI; MDE"},
+    "variance_b48pf_u16": {"repeats": 3, "episodes": 512, "rooms_cleared": [0.125, 0.084, 0.092], "hurt": [2.73, 2.54, 2.44], "death": [0.400, 0.381, 0.363],
+                           "floor_clear": [0.0, 0.002, 0.0], "repeat_sd_vs_episode_se": "consistent (variance ratio 2.5 / 2.5 / 0.75, df 2)",
+                           "mde_512_per_arm": {"rooms": 0.054, "hurt": 0.37, "death": 0.085, "floor_clear_p0.1": 0.053, "floor_clear_p0.5": 0.088},
+                           "eval_cost": "~10x real time (object-path eval_tok), ~55 min per 512 episodes at ~65 s per episode; grows with episode length"},
+    "resources": "serial recommended: per arm G/X wall hours (1000 h: 6.7 h at 150x, 5.0 h at 200x); two arms in parallel infeasible (GPU 2x15.2 GB, host RAM) and no throughput gain (collect-bound)",
+    "late_b49": "CODE=<dir> sh bridge/ops/b53/b53_b49_late.sh <arm> [advance]"
   },
   "actor_b50": {
     "entry": "bridge/abplus/EXPERIMENTS.md B50 (phase 0: measurement and design); design docs/B50_CPP_ACTOR_DESIGN.md",

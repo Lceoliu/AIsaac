@@ -1354,6 +1354,10 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--block-attention',default='sdpa',choices=('sdpa','flex'))
     p.add_argument('--block-history-blocks',type=int,default=None,
                    help='Window-external historical Writer blocks per chunk; default4, use8 for ablation')
+    p.add_argument('--block-history-scale',default='unbiased',choices=('unbiased','none'),
+                   help='B51 random arm: the re-encoded historical blocks pass the gradient back x N_i/|selected_i| '
+                        '(unbiased for all N_i window-external blocks; forward unchanged) or unscaled (none: B48 and '
+                        'earlier). No effect on the detach / gradreplay arms')
     p.add_argument('--block-history-mode',default='random',choices=('random','detach','gradreplay'),
                    help='B43 history ablation: random (B/D arms: --block-history-blocks random blocks re-encoded, '
                         'used differentiably by the Reader), detach (A arm: none), gradreplay (C arm: block values '
@@ -2029,7 +2033,8 @@ def main(argv=None, child=None, actor=None):
             p.error('--block-history-mode gradreplay needs the paged slot path (--block-slots 1)')
         if args.block_history_replay=='latent':
             p.error('--block-history-replay latent is not wired yet (B43: raw-observation replay only)')
-        block_cfg=dict(block_cfg,history_recompute_blocks=args.block_history_blocks)
+        block_cfg=dict(block_cfg,history_recompute_blocks=args.block_history_blocks,
+                       history_scale=args.block_history_scale)
         tok_kw.update(block_memory=True,block_config=block_cfg)
         args.temporal = 0
         args.temporal_width = block_cfg['width']
@@ -2434,7 +2439,8 @@ def main(argv=None, child=None, actor=None):
         if SPATIAL_COMPILE:
             t_w=time.perf_counter()
             n_w=block_compile.warm_spatial(learner_model,(model,),bf16=amp or args.actor_bf16)
-            print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s',flush=True)
+            print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s'
+                  f' (B56 fx cache {"on" if block_compile.FX_CACHE else "off"})',flush=True)
             if args.block_slots:   # B44 packed learner: the Flex Reader kernels (ISAAC_PACKED_READER=flex)
                 from isaac_bridge import block_learner
                 if block_learner.PACKED:
@@ -2442,6 +2448,7 @@ def main(argv=None, child=None, actor=None):
                     s_r=block_learner.warm_reader(learner_model,bf16=bool(amp))
                     print(f'B44 Flex Reader warm-up: {block_compile.STATS["compiles"]-c_r} graphs in {s_r:.1f} s',
                           flush=True)
+            print(f'B56 compile cache after warm-up: {block_compile.cache_counters()}',flush=True)
             block_compile.mark_steady()
         # B42: everything alive now (models, compiled code, buffers) leaves the collector's
         # generations; later collections scan only what the run allocates afterwards.
@@ -3549,6 +3556,7 @@ def main(argv=None, child=None, actor=None):
         pm = pn = n_sel = None
         t_table = None
         gn_acc = torch.zeros(1, device=device) if gn_on else None
+        gn_clip = torch.zeros(1, device=device) if gn_on else None   # (B51: optimizer steps whose norm was clipped)
         if block_on:
             from isaac_bridge import block_learner as blearn
 
@@ -3979,7 +3987,9 @@ def main(argv=None, child=None, actor=None):
                     hist_gn_steps += 1
                 with (bpt.GpuSpan('learn_clip') if block_on else contextlib.nullcontext()):
                     if gn_on:   # (progress.csv grad_norm: how far the clip scales the policy's gradient)
-                        gn_acc += torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+                        gn_ = torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+                        gn_acc += gn_
+                        gn_clip += (gn_ > args.max_grad_norm).float()
                     else:
                         torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
                 with (bpt.GpuSpan('learn_opt') if block_on else contextlib.nullcontext()):
@@ -4118,6 +4128,7 @@ def main(argv=None, child=None, actor=None):
         if gn_on:   # 2026-11-03: the policy's gradient norm before the clip, mean over the steps (ISAAC_RL_LOG_GRAD_NORM=1:
             #         without the switches too, the controls' comparison; the column only then)
             row['grad_norm'] = float(gn_acc[0]) / steps_
+            row['grad_clip_frac'] = float(gn_clip[0]) / steps_   # (B51: share of the PPO steps the clip scaled)
         if aux_on:   # 2026-11-03 (tok_aux)
             row.update(log_row(aux_acc.cpu().numpy(), aux_acc_ev.cpu().numpy(), steps_, aux_h))
             row.update(aux_log)
