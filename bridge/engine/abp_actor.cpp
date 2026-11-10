@@ -973,7 +973,7 @@ struct ActorDriver {
     if (restore_test == 1) {   // (the control: the restore's copies on the lane stream behind a long kernel; nothing waits)
       auto ls = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
       test_guard.reset(new c10::cuda::CUDAStreamGuard(ls));
-      at::cuda::sleep(400000000LL);
+      at::cuda::sleep(4000000000LL);   // (~1.5 s: longer than the test takes to send the main row)
     }
     reset_rows({row});
     auto dev = kv_t.device();
