@@ -143,3 +143,98 @@ def policy_lag_violations(roll_version, roll_length, min_version):
         return 0, -1
     used = v[mask]
     return int((used < min_version).sum()), int(used.min())
+
+
+# ------------------------------------------------------------------------------------------- B58a+b native consumer
+
+class NativeFrameArena:
+    """(B58a+b) FrameArena's interface over the driver's frame arena of a rollout slot: the driver appends the stored
+    decisions' frames; Python appends the hand-off's carried frames and reads buf / used once the rollout is handed."""
+    ALIGN = 8
+
+    def __init__(self, driver, slot):
+        self.d, self.slot = driver, int(slot)
+
+    @property
+    def buf(self):
+        return self.d.arena_buf(self.slot).numpy()
+
+    @property
+    def used(self):
+        return int(self.d.arena_used(self.slot))
+
+    def reset(self):
+        self.d.arena_reset(self.slot)
+
+    def append_from(self, buf, offs, sizes):
+        import torch
+        return self.d.arena_append_from(self.slot, torch.from_numpy(np.ascontiguousarray(buf)),
+                                        torch.from_numpy(np.asarray(offs, np.int64)),
+                                        torch.from_numpy(np.asarray(sizes, np.int64))).numpy()
+
+    def append(self, rows):
+        frames = np.ascontiguousarray(rows['visible_frame']).reshape(-1)
+        width = rows.dtype['visible_frame'].shape[0]
+        return self.append_from(frames, np.arange(len(rows), dtype=np.int64)*width, rows['visible_bytes'])
+
+
+def native_consumer_reason(cpp_driver, rolls, lab, t_on, mem_on, proc, n_act):
+    """(B58a+b) None when the native consumer can take the records, else why not (the Python consumer runs)."""
+    if os.environ.get('ISAAC_BLOCK_CPP_CONSUMER', '1') == '0':
+        return 'ISAAC_BLOCK_CPP_CONSUMER=0'
+    if cpp_driver is None:
+        return 'no C++ driver'
+    for why, bad in (('the lab', lab is not None), ('temporal models', t_on), ('GRU memory', mem_on),
+                     ('a learner process', proc), ('several actor processes', n_act > 1)):
+        if bad:
+            return why
+    if any(getattr(r, 'frames', None) is None or r.h is not None or r.t_kv is not None for r in rolls):
+        return 'a non-compact rollout'
+    return None
+
+
+def attach_consumer(d, book, rolls, gamma):
+    """(B58a+b) The driver's native consumer: Episodes' arrays and reward weights, both rollouts' arrays (slots 0 / 1:
+    rolls[i].native_slot), their frame arenas moved into the driver (NativeFrameArena)."""
+    from .tok_obs import ROW, ROWC, ROW_FRAME_AT, EV_EXIT, EV_ITEM, EV_ACTIVE, EV_PILL, DONE_BRANCH
+
+    def ptr(a, dtype=None, shape=None):
+        if a is None:
+            return None
+        if dtype is not None and a.dtype != dtype:
+            raise TypeError(f'native consumer: {dtype} expected, got {a.dtype}')
+        if not a.flags['C_CONTIGUOUS']:
+            raise TypeError('native consumer: a contiguous array expected')
+        return int(a.ctypes.data)
+    rw = book.rw
+    f = lambda n: int(ROW.fields[n][1])
+    cfg = dict(o_first=f('first'), o_done=f('done'), o_damage=f('damage'), o_hurt=f('hurt'), o_events=f('events'),
+               o_stage=f('stage'), o_player=f('player'), o_pforce=f('pforce'), row_frame_at=int(ROW_FRAME_AT),
+               **{f'w_{k}': float(rw.get(k, 0.0)) for k in ('damage', 'hurt', 'time', 'death', 'timeout', 'room', 'explore',
+                                                             'boss', 'exit', 'heal', 'resource')},
+               end_bonus=float(book.end_bonus), gamma=float(gamma), floor=bool(book.floor), run=bool(book.run),
+               items=bool(book.items), gains_on=book.gains is not None, plr_on=book.plr is not None,
+               pick_on=book.pick is not None, ev_exit=int(EV_EXIT), ev_item=int(EV_ITEM), ev_active=int(EV_ACTIVE),
+               ev_pill=int(EV_PILL), done_branch=int(DONE_BRANCH),
+               ret=ptr(book.ret, np.float64), hurt=ptr(book.hurt, np.float64), damage=ptr(book.damage, np.float64),
+               gains=ptr(book.gains, np.float64), healed=ptr(book.healed, np.float64), gathered=ptr(book.gathered, np.float64),
+               v0=ptr(book.v0, np.float64), gret=ptr(book.gret, np.float64), rooms=ptr(book.rooms, np.int64),
+               boss=ptr(book.boss, np.int64), extra=ptr(book.extra, np.int64), steps=ptr(book.steps, np.int64),
+               pick_steps=ptr(book.pick['steps'], np.int64) if book.pick is not None else None)
+    if book.plr is not None:
+        cfg['gamma'] = float(book.plr[2])
+    d.set_consumer(cfg)
+    for slot, r in enumerate(rolls):
+        if r.rows.dtype != ROWC:
+            raise TypeError('native consumer: ROWC rollouts')
+        a = dict(cap=int(r.cap), rowc_size=int(ROWC.itemsize), off_visible_off=int(ROWC.fields['visible_off'][1]),
+                 priv_size=int(r.priv.dtype.itemsize) if r.priv is not None else 0,
+                 rows=ptr(r.rows), terminal=ptr(r.terminal, np.bool_), close_done=ptr(r.close_done, np.uint8),
+                 close_ev=ptr(r.close_ev, np.uint8), priv=ptr(r.priv), boot=ptr(r.boot, np.bool_),
+                 reward=ptr(r.reward, np.float32), close_hurt=ptr(r.close_hurt, np.float32), logp=ptr(r.logp, np.float32),
+                 value=ptr(r.value, np.float32), value_g=ptr(r.value_g, np.float32), open=ptr(r.open, np.int64),
+                 length=ptr(r.length, np.int64), pending=ptr(r.pending, np.int64), actions=ptr(r.actions, np.int64),
+                 version=ptr(r.version, np.int64))
+        d.set_rollout(slot, a, int(len(r.frames.buf)))
+        r.frames = NativeFrameArena(d, slot)
+        r.native_slot = slot

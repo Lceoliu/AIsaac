@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -92,13 +93,19 @@ struct PageStore {
     d_meta = at::full({cap_d, 2}, -1, l); d_used = at::zeros({cap_d}, at::kBool);
     b_meta = at::full({cap_b, 2}, -1, l); b_src = at::full({cap_b, bs}, -1, l); b_srcver = at::full({cap_b, bs}, -1, l);
     b_used = at::zeros({cap_b}, at::kBool);
+    // (B58a) the page vectors never reallocate: a page tensor's pointer (and the vector element) stays where it is, so
+    // other threads may read kv_pages[p] once p is published; reallocs counts any capacity change (must stay 0)
+    kv_pages.reserve(max_pages_d); z_pages.reserve(max_pages_d); b_pages.reserve(max_pages_b);
   }
+  i64 reallocs = 0;
   // (pages: kept as flat [page, elems] tensors; Python views them with the row shape)
   void grow_d_locked() {
     i64 p = (i64)kv_pages.size();
     TORCH_CHECK(p < cap_d/page, "PageStore: decision pages exhausted (raise max_pages_d)");
+    size_t c0 = kv_pages.capacity(), c1 = z_pages.capacity();
     kv_pages.push_back(at::zeros({page, kv_elems}, at::TensorOptions().dtype(kv_dtype)));
     z_pages.push_back(at::zeros({page, z_elems}, at::kFloat));
+    reallocs += (kv_pages.capacity() != c0)+(z_pages.capacity() != c1);
     i64 base = p*page;
     // Python: d_free = np.concatenate((np.arange(base+P-1, base-1, -1), d_free)): the new page's ids, descending,
     // in front of the old free ids; _alloc takes the array's last n ids reversed (our pops from the back)
@@ -108,7 +115,9 @@ struct PageStore {
   void grow_b_locked() {
     i64 p = (i64)b_pages.size();
     TORCH_CHECK(p < cap_b/page, "PageStore: block pages exhausted (raise max_pages_b)");
+    size_t c2 = b_pages.capacity();
     b_pages.push_back(at::zeros({page, b_elems}, at::kFloat));
+    reallocs += (b_pages.capacity() != c2);
     i64 base = p*page;
     for (i64 i = page-1; i >= 0; i--) b_free.push_back(base+i);
     std::rotate(b_free.begin(), b_free.end()-page, b_free.end());
@@ -275,7 +284,8 @@ struct PageStore {
     std::lock_guard<std::mutex> g(mu);
     py::dict d;
     d["kv_pages"] = (i64)kv_pages.size(); d["b_pages"] = (i64)b_pages.size(); d["d_free"] = (i64)d_free.size(); d["b_free"] = (i64)b_free.size();
-    d["raw"] = (i64)raw.size(); d["next_decision"] = next_decision; d["freed_kv"] = freed_kv; d["freed_blocks"] = freed_blocks; d["freed_raw"] = freed_raw;
+    d["raw"] = (i64)raw.size(); d["next_decision"] = next_decision; d["reallocs"] = reallocs;
+    d["cap_pages_d"] = (i64)kv_pages.capacity(); d["cap_pages_b"] = (i64)b_pages.capacity(); d["freed_kv"] = freed_kv; d["freed_blocks"] = freed_blocks; d["freed_raw"] = freed_raw;
     return d;
   }
 };
@@ -314,6 +324,8 @@ struct Record {
   i64 cap = 0, wb = 0, we = 0, wn = 0, ws = 0;   // (kind 1)
   double t_poll = 0, t_sync = 0, t_reply = 0, t_pages = 0, t_done = 0;   // driver clock (s) of the step's phases
   double t_main_reply = 0;                   // (kind 4 of a merged batch) when the batch's main rows were replied
+  at::Tensor kk, snap;                       // (B58a+b, native consumer) go rows' rollout index (-1: dropped, full);
+                                             // per row [n_all, N_SNAP] accumulators before an episode end reset them
 };
 
 // tok_policy.crn_uniforms, bit for bit: element (key, t, c) = splitmix64 output t * 256 + c + 1 of the stream seeded with
@@ -345,6 +357,33 @@ struct LaneJob {   // (B54) one teacher generation's rows of a lane round, queue
   std::vector<i64> pend, ids, seq, lane;     // pending [n x nh], arena rows, CRN keys (request sequence, lane)
   std::vector<uint8_t> replay;               // evaluate rows (uniform 0.5)
 };
+
+// (B58a+b) the native consumer: train_tok's Episodes.arrive (per-record arithmetic) and store (rollout writes) of the
+// main rows, on the driver thread, in the Python path's order (arrive over all the record's rows, then store over the
+// go rows); the episode-level Python work (first-record snapshots, finished-episode summaries) stays in Python, fed by
+// each record's per-row snapshot of the accumulators taken before an episode end resets them.
+struct ConsumerCfg {
+  bool on = false;
+  i64 o_first = 0, o_done = 0, o_damage = 0, o_hurt = 0, o_events = 0, o_stage = 0, o_player = 0, o_pforce = 0;
+  i64 row_frame_at = 0;          // ROW's visible_frame offset (ROWC copies the bytes before it)
+  double w_damage = 0, w_hurt = 0, w_time = 0, w_death = 0, w_timeout = 0, w_room = 0, w_explore = 0, w_boss = 0, w_exit = 0,
+         w_heal = 0, w_resource = 0, end_bonus = 0, gamma = 0.99;
+  bool floor = false, run = false, items = false, gains_on = false, plr_on = false, pick_on = false;
+  i64 ev_exit = 8, ev_item = 16, ev_active = 32, ev_pill = 64, done_branch = 4;
+  // Episodes arrays (numpy, owned by Python)
+  double *ret = nullptr, *ep_hurt = nullptr, *ep_damage = nullptr, *gains = nullptr, *healed = nullptr, *gathered = nullptr,
+         *v0 = nullptr, *gret = nullptr;
+  i64 *rooms = nullptr, *boss = nullptr, *extra = nullptr, *steps = nullptr, *pick_steps = nullptr;
+};
+struct RollSlot {                 // one Rollout's arrays (numpy, owned by Python) and its frame arena (owned here)
+  bool set = false;
+  i64 cap = 0, rowc_size = 0, off_visible_off = 0, priv_size = 0;
+  uint8_t *rows = nullptr, *terminal = nullptr, *close_done = nullptr, *close_ev = nullptr, *priv = nullptr, *boot = nullptr;
+  float *reward = nullptr, *close_hurt = nullptr, *logp = nullptr, *value = nullptr, *value_g = nullptr;
+  i64 *open = nullptr, *length = nullptr, *pending = nullptr, *actions = nullptr, *version = nullptr;
+  at::Tensor arena; i64 used = 0; i64 grown = 0;
+};
+static const i64 N_SNAP = 17;    // ret, hurt, damage, rooms, boss, extra[6], healed, gathered, pick steps, gret, v0, steps
 
 struct Xoshiro {   // xoshiro256**, seeded through splitmix64
   uint64_t s[4];
@@ -404,6 +443,8 @@ struct ActorDriver {
   std::atomic<i64> version{0};
   std::vector<i64> ready_w, ready_s;   // a batch the driver could not step (capture needed): retried after resume
   std::string error;
+  // (B58a+b) the native consumer
+  ConsumerCfg cc; RollSlot slots[2]; std::atomic<int> cur_slot{-1}; std::mutex amu;   // amu: the arenas
   // (B54) lane jobs
   std::deque<std::shared_ptr<LaneJob>> lane_q; std::mutex lmu;
   bool lane_merge = true;              // (tests / ISAAC_BLOCK_LANE_MERGE=0) merge jobs of the main version into main batches
@@ -469,6 +510,71 @@ struct ActorDriver {
     at::Tensor t = at::empty({n_workers, nh}, at::kLong);
     memcpy(t.data_ptr<i64>(), pending_cur.data(), pending_cur.size()*sizeof(i64));
     return t;
+  }
+  // ---- (B58a+b) native consumer configuration (Python, with the driver paused or not started)
+  void set_consumer(py::dict d) {
+    auto I = [&](const char *k) { return d[k].cast<i64>(); };
+    auto F = [&](const char *k) { return d[k].cast<double>(); };
+    auto B = [&](const char *k) { return d[k].cast<bool>(); };
+    auto P = [&](const char *k) { return d.contains(k) && !d[k].is_none() ? d[k].cast<i64>() : (i64)0; };
+    ConsumerCfg c;
+    c.o_first = I("o_first"); c.o_done = I("o_done"); c.o_damage = I("o_damage"); c.o_hurt = I("o_hurt"); c.o_events = I("o_events");
+    c.o_stage = I("o_stage"); c.o_player = I("o_player"); c.o_pforce = I("o_pforce"); c.row_frame_at = I("row_frame_at");
+    c.w_damage = F("w_damage"); c.w_hurt = F("w_hurt"); c.w_time = F("w_time"); c.w_death = F("w_death"); c.w_timeout = F("w_timeout");
+    c.w_room = F("w_room"); c.w_explore = F("w_explore"); c.w_boss = F("w_boss"); c.w_exit = F("w_exit"); c.w_heal = F("w_heal");
+    c.w_resource = F("w_resource"); c.end_bonus = F("end_bonus"); c.gamma = F("gamma");
+    c.floor = B("floor"); c.run = B("run"); c.items = B("items"); c.gains_on = B("gains_on"); c.plr_on = B("plr_on"); c.pick_on = B("pick_on");
+    c.ev_exit = I("ev_exit"); c.ev_item = I("ev_item"); c.ev_active = I("ev_active"); c.ev_pill = I("ev_pill"); c.done_branch = I("done_branch");
+    c.ret = (double *)P("ret"); c.ep_hurt = (double *)P("hurt"); c.ep_damage = (double *)P("damage"); c.gains = (double *)P("gains");
+    c.healed = (double *)P("healed"); c.gathered = (double *)P("gathered"); c.v0 = (double *)P("v0"); c.gret = (double *)P("gret");
+    c.rooms = (i64 *)P("rooms"); c.boss = (i64 *)P("boss"); c.extra = (i64 *)P("extra"); c.steps = (i64 *)P("steps");
+    c.pick_steps = (i64 *)P("pick_steps");
+    c.on = true;
+    cc = c;
+  }
+  void set_rollout(int slot, py::dict d, i64 arena_bytes) {
+    TORCH_CHECK(slot == 0 || slot == 1, "set_rollout: slot 0 or 1");
+    auto P = [&](const char *k) { return d.contains(k) && !d[k].is_none() ? d[k].cast<i64>() : (i64)0; };
+    RollSlot &r = slots[slot];
+    r.cap = P("cap"); r.rowc_size = P("rowc_size"); r.off_visible_off = P("off_visible_off"); r.priv_size = P("priv_size");
+    r.rows = (uint8_t *)P("rows"); r.terminal = (uint8_t *)P("terminal"); r.close_done = (uint8_t *)P("close_done");
+    r.close_ev = (uint8_t *)P("close_ev"); r.priv = (uint8_t *)P("priv"); r.boot = (uint8_t *)P("boot");
+    r.reward = (float *)P("reward"); r.close_hurt = (float *)P("close_hurt"); r.logp = (float *)P("logp"); r.value = (float *)P("value");
+    r.value_g = (float *)P("value_g"); r.open = (i64 *)P("open"); r.length = (i64 *)P("length"); r.pending = (i64 *)P("pending");
+    r.actions = (i64 *)P("actions"); r.version = (i64 *)P("version");
+    std::lock_guard<std::mutex> g(amu);
+    if (!r.arena.defined() || r.arena.numel() < arena_bytes) r.arena = at::zeros({std::max<i64>(arena_bytes, 1024)}, at::kByte);
+    r.used = 0;
+    r.set = true;
+  }
+  void use_rollout(int slot) { TORCH_CHECK(slot >= -1 && slot <= 1, "use_rollout: slot"); cur_slot = slot; }
+  // the frame arena of a slot (B45 FrameArena's buf / used, appends of the hand-off's carry)
+  at::Tensor arena_buf(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].arena; }
+  i64 arena_used(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].used; }
+  void arena_reset(int slot) { std::lock_guard<std::mutex> g(amu); slots[slot].used = 0; }
+  i64 arena_grown(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].grown; }
+  at::Tensor arena_append_from(int slot, at::Tensor buf, at::Tensor offs, at::Tensor sizes) {
+    buf = buf.contiguous(); offs = offs.to(at::kLong).contiguous(); sizes = sizes.to(at::kLong).contiguous();
+    i64 n = offs.numel();
+    at::Tensor out = at::empty({n}, at::kLong);
+    std::lock_guard<std::mutex> g(amu);
+    for (i64 i = 0; i < n; i++)
+      out.data_ptr<i64>()[i] = arena_append_locked(slots[slot], buf.data_ptr<uint8_t>()+offs.data_ptr<i64>()[i], sizes.data_ptr<i64>()[i]);
+    return out;
+  }
+  // (tests) the consumer on given records, as the driver runs it for a step: rows uint8 [n_all * row_stride] (ROW),
+  // workers, go mask, outputs [n_go, nh+3] float32, actions / pending [n_go, nh] int64, version, priv [n_all * priv size]
+  py::tuple consume_rows(at::Tensor rows, std::vector<i64> ws, at::Tensor go, at::Tensor out, at::Tensor actions_, at::Tensor pend,
+                         i64 ver, at::Tensor priv_) {
+    rows = rows.contiguous(); go = go.to(at::kByte).contiguous(); out = out.to(at::kFloat).contiguous();
+    actions_ = actions_.to(at::kLong).contiguous(); pend = pend.to(at::kLong).contiguous();
+    i64 n_all = (i64)ws.size();
+    std::vector<uint8_t> g(go.data_ptr<uint8_t>(), go.data_ptr<uint8_t>()+n_all);
+    std::vector<i64> go_idx; for (i64 i = 0; i < n_all; i++) if (g[i]) go_idx.push_back(i);
+    Record r;
+    const uint8_t *pp = priv_.defined() && priv_.numel() ? priv_.contiguous().data_ptr<uint8_t>() : nullptr;
+    consume(r, rows.data_ptr<uint8_t>(), n_all, ws, g, go_idx, out.data_ptr<float>(), actions_.data_ptr<i64>(), pend.data_ptr<i64>(), ver, pp);
+    return py::make_tuple(r.kk, r.snap);
   }
   // (B54) a lane job: rows uint8 [n * row_stride], pending int64 [n * nh], ids / seq / lane int64 [n], replay uint8 [n]
   void submit_lanes(i64 job, i64 owner, i64 ver, at::Tensor rows, i64 n, at::Tensor pending, at::Tensor ids, at::Tensor seq,
@@ -622,6 +728,7 @@ struct ActorDriver {
     d["cap"] = r->cap; d["widths"] = py::make_tuple(r->wb, r->we, r->wn, r->ws);
     d["t_poll"] = r->t_poll; d["t_sync"] = r->t_sync; d["t_reply"] = r->t_reply; d["t_pages"] = r->t_pages; d["t_done"] = r->t_done;
     d["job"] = r->job; d["owner"] = r->owner; d["merged"] = (int)r->merged; d["t_main_reply"] = r->t_main_reply;
+    if (r->kk.defined()) { d["kk"] = r->kk; d["snap"] = r->snap; } else { d["kk"] = py::none(); d["snap"] = py::none(); }
     return d;
   }
   i64 queue_size() { std::lock_guard<std::mutex> g(qmu); return (i64)queue.size(); }
@@ -707,6 +814,127 @@ struct ActorDriver {
     running = false;
   }
 
+  i64 arena_append_locked(RollSlot &r, const uint8_t *src, i64 n) {
+    i64 padded = (n+7)/8*8;
+    i64 at_ = r.used;
+    if (at_+padded > r.arena.numel()) {   // grow by 1.5 (FrameArena's rule), the used bytes copied
+      at::Tensor g = at::zeros({std::max<i64>(at_+padded, (i64)(r.arena.numel()*1.5))}, at::kByte);
+      memcpy(g.data_ptr<uint8_t>(), r.arena.data_ptr<uint8_t>(), at_);
+      r.arena = g; r.grown++;
+    }
+    if (n) memcpy(r.arena.data_ptr<uint8_t>()+at_, src, n);
+    r.used = at_+padded;
+    return at_;
+  }
+  // (B58a+b) Episodes.arrive over all the record's rows, then store over its go rows (main rows only), in the Python
+  // path's arithmetic (float64 rewards, float32 gains as numpy computes them), into the current rollout slot
+  void consume(Record &r, const uint8_t *rc, i64 n_all, const std::vector<i64> &ws, const std::vector<uint8_t> &go,
+               const std::vector<i64> &go_idx, const float *out, const i64 *act, const i64 *pend, i64 ver, const uint8_t *privp) {
+    int sl = cur_slot.load();
+    i64 n = (i64)go_idx.size();
+    r.kk = at::full({n}, -1, at::kLong);
+    r.snap = at::zeros({n_all, N_SNAP}, at::kDouble);
+    if (!cc.on || sl < 0 || !slots[sl].set) return;
+    RollSlot &R = slots[sl];
+    const ConsumerCfg &c = cc;
+    double *snap = r.snap.data_ptr<double>();
+    auto u8 = [&](const uint8_t *src, i64 o) { return (i64)src[o]; };
+    auto f32 = [&](const uint8_t *src, i64 o) { float v; memcpy(&v, src+o, 4); return v; };
+    auto cur_gains = [&](const uint8_t *src, double *g) {
+      float p7 = f32(src, c.o_player+7*4), p8 = f32(src, c.o_player+8*4), p9 = f32(src, c.o_player+9*4), p10 = f32(src, c.o_player+10*4);
+      float a = std::nearbyint(p7*12.0f);
+      float b = std::nearbyint(p8*10.0f)+std::nearbyint(p9*10.0f);
+      b = b+std::nearbyint(p10*50.0f);
+      g[0] = (double)a; g[1] = (double)b;
+    };
+    // ---- arrive
+    for (i64 i = 0; i < n_all; i++) {
+      i64 w = ws[i];
+      const uint8_t *src = rc+i*row_stride;
+      bool first = u8(src, c.o_first) != 0;
+      i64 d = u8(src, c.o_done);
+      i64 k = R.open[w];
+      i64 ix;
+      if (first && k >= 0) {   // the episode before broke off
+        ix = w*R.cap+k;
+        R.reward[ix] = 0.0f; R.terminal[ix] = 1;
+        if (R.close_hurt) { R.close_hurt[ix] = 0.0f; R.close_ev[ix] = 0; R.close_done[ix] = 255; }
+        R.open[w] = -1; k = -1;
+      }
+      if (k >= 0) {
+        ix = w*R.cap+k;
+        double dmg = (double)f32(src, c.o_damage), hu = (double)f32(src, c.o_hurt);
+        i64 ev = u8(src, c.o_events);
+        if (R.close_hurt) { R.close_hurt[ix] = (float)hu; R.close_done[ix] = (uint8_t)d; R.close_ev[ix] = (uint8_t)ev; }
+        double endt = d == 1 ? c.end_bonus : d == 2 ? -c.w_death : d == 3 ? -c.w_timeout : 0.0;
+        double reward = c.w_damage*dmg-c.w_hurt*hu-c.w_time+endt;
+        if (c.floor) {
+          reward = reward+(c.w_room*(double)((ev & 1) > 0)+c.w_explore*(double)((ev & 2) > 0)+c.w_boss*(double)((ev & 4) > 0));
+          if (c.run) reward = reward+c.w_exit*(double)((ev & c.ev_exit) > 0);
+          c.rooms[w] += (ev & 1) > 0; c.boss[w] += (ev & 4) > 0;
+          if (c.gains_on) {
+            double g[2]; cur_gains(src, g);
+            double dl0 = g[0]-c.gains[w*2], dl1 = g[1]-c.gains[w*2+1];
+            reward = reward+c.w_heal*std::max(dl0, 0.0)+c.w_resource*std::max(dl1, 0.0);
+            c.healed[w] += std::max(dl0, 0.0); c.gathered[w] += std::max(dl1, 0.0);
+          }
+        }
+        if (c.run || c.items) {
+          i64 *x = c.extra+w*6;
+          x[0] += (ev & c.ev_exit) > 0; x[1] += (ev & c.ev_item) > 0; x[2] += (ev & c.ev_active) > 0; x[3] += (ev & c.ev_pill) > 0;
+          x[5] = std::max<i64>(x[5], u8(src, c.o_stage));
+        }
+        R.reward[ix] = (float)reward; R.terminal[ix] = d != 0 && d != c.done_branch; R.open[w] = -1;
+        c.ret[w] += reward;
+        if (c.plr_on) {
+          if (c.steps[w] == 0) c.v0[w] = (double)R.value[ix];
+          c.gret[w] += std::pow(c.gamma, (double)c.steps[w])*reward;
+          c.steps[w] += 1;
+        }
+        c.ep_hurt[w] += hu; c.ep_damage[w] += dmg;
+      }
+      if (c.gains_on && c.gains) cur_gains(src, c.gains+w*2);
+      if ((c.run || c.items) && first) { c.extra[w*6+4] = u8(src, c.o_stage); c.extra[w*6+5] = u8(src, c.o_stage); }
+      if (c.pick_on) { if (first) c.pick_steps[w] = 0; c.pick_steps[w] += u8(src, c.o_pforce) > 0; }
+      if (d != 0) {   // an episode end: the accumulators for Python's summary, then reset
+        double *sv = snap+i*N_SNAP;
+        sv[0] = c.ret[w]; sv[1] = c.ep_hurt[w]; sv[2] = c.ep_damage[w]; sv[3] = (double)c.rooms[w]; sv[4] = (double)c.boss[w];
+        for (int q = 0; q < 6; q++) sv[5+q] = c.extra ? (double)c.extra[w*6+q] : 0.0;
+        sv[11] = c.healed[w]; sv[12] = c.gathered[w]; sv[13] = c.pick_steps ? (double)c.pick_steps[w] : 0.0;
+        sv[14] = c.plr_on ? c.gret[w] : 0.0; sv[15] = c.plr_on ? c.v0[w] : 0.0; sv[16] = c.plr_on ? (double)c.steps[w] : 0.0;
+        c.ret[w] = 0; c.ep_hurt[w] = 0; c.ep_damage[w] = 0; c.rooms[w] = 0; c.boss[w] = 0;
+        if (c.extra) for (int q = 0; q < 6; q++) c.extra[w*6+q] = 0;
+        c.healed[w] = 0; c.gathered[w] = 0;
+        if (c.plr_on) { c.v0[w] = 0; c.gret[w] = 0; c.steps[w] = 0; }
+      }
+    }
+    // ---- store (go rows)
+    i64 ow = nh+3;
+    i64 *kk = r.kk.data_ptr<i64>();
+    for (i64 j = 0; j < n; j++) {
+      i64 i = go_idx[j], w = ws[i];
+      const uint8_t *src = rc+i*row_stride;
+      i64 k = R.length[w];
+      if (k >= R.cap) continue;   // (cannot happen with the trainer's capacity; dropped rather than overrun, as store)
+      i64 ix = w*R.cap+k;
+      uint8_t *dst = R.rows+ix*R.rowc_size;
+      memset(dst, 0, R.rowc_size);
+      memcpy(dst, src, c.row_frame_at);
+      i64 nbytes = read_int(src+f_bytes, 4);
+      i64 off;
+      { std::lock_guard<std::mutex> g(amu); off = arena_append_locked(R, src+f_frame, std::max<i64>(0, std::min<i64>(nbytes, frame_bytes))); }
+      memcpy(dst+R.off_visible_off, &off, 8);
+      memcpy(R.pending+ix*nh, pend+j*nh, nh*8);
+      memcpy(R.actions+ix*nh, act+j*nh, nh*8);
+      R.logp[ix] = out[j*ow+nh]; R.value[ix] = out[j*ow+nh+1];
+      if (R.value_g) R.value_g[ix] = out[j*ow+nh+2];
+      R.version[ix] = ver;
+      R.boot[ix] = u8(src, c.o_done) == c.done_branch;
+      if (R.priv && privp) memcpy(R.priv+ix*R.priv_size, privp+i*priv_itemsize, R.priv_size);
+      R.length[w] = k+1; R.open[w] = k;
+      kk[j] = k;
+    }
+  }
   // a record's frame header: (body, entity, inventory, slot) counts; false when the frame is not a valid visible-v2 frame
   bool frame_counts(const uint8_t *src, i64 &p, i64 &e, i64 &nn, i64 &s) {
     const float *f = (const float *)(src+f_frame);
@@ -824,6 +1052,8 @@ struct ActorDriver {
       reply_rows(ws);
       r->t_sync = r->t_reply = r->t_pages = r->t_done = now();
       finish_empty(*r);
+      if (cc.on) consume(*r, rc, n_all, ws, r->go, go_idx, nullptr, nullptr, nullptr, version.load(),
+                         priv ? r->priv.data_ptr<uint8_t>() : nullptr);   // (B58a+b: the episode ends)
       push_record(r); n_calls++;
       return;
     }
@@ -926,6 +1156,8 @@ struct ActorDriver {
     double t2 = now(); r->t_reply = t2;
     // the main rows' pages, then their record (the lanes' pages and records only after it: B54 condition a)
     write_part(*e, rows_ptr, 0, n, ids, steps_before, complete, first, pend.data(), ver, *r);
+    if (cc.on) consume(*r, rc, n_all, ws, r->go, go_idx, r->out.data_ptr<float>(), act, pend.data(), ver,
+                       priv ? r->priv.data_ptr<uint8_t>() : nullptr);   // (B58a+b: arrive + store, before the record)
     double t3 = now(); r->t_pages = t3; r->t_done = t3; t_pages_s = t_pages_s+(t3-t2); t_host_s = t_host_s+(t3-t0)-(t1-t_host0);
     n_steps++; n_calls++; n_rows = n_rows+n;
     push_record(r);
@@ -1064,5 +1296,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("drop_lane_job", &ActorDriver::drop_lane_job).def("set_lane_merge", &ActorDriver::set_lane_merge)
       .def("set_ring", &ActorDriver::set_ring).def("get_ring", &ActorDriver::get_ring)
       .def("capture_done", &ActorDriver::capture_done).def("set_main_hold", &ActorDriver::set_main_hold)
+      .def("set_consumer", &ActorDriver::set_consumer).def("set_rollout", &ActorDriver::set_rollout).def("use_rollout", &ActorDriver::use_rollout)
+      .def("arena_buf", &ActorDriver::arena_buf).def("arena_used", &ActorDriver::arena_used).def("arena_reset", &ActorDriver::arena_reset)
+      .def("arena_grown", &ActorDriver::arena_grown).def("arena_append_from", &ActorDriver::arena_append_from)
+      .def("consume_rows", &ActorDriver::consume_rows)
+      .def_property_readonly("consumer_on", [](ActorDriver &d) { return d.cc.on; })
       .def_property_readonly("running", [](ActorDriver &d) { return d.running.load(); });
 }

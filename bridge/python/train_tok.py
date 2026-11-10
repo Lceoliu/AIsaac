@@ -1068,6 +1068,73 @@ class Episodes:
         return go
 
 
+def _native_events(book, rows, idx, snap):
+    """(B58a+b) Episodes.arrive's Python part when the driver's native consumer did its arithmetic and the store: the
+    first records' episode snapshots (builds, stats, character, active item, pedestal build) and the finished
+    episodes' summaries, from the per-row accumulators the consumer took before an episode end reset them
+    (snap [n, 17]: ret, hurt, damage, rooms, boss, extra[6], healed, gathered, pick steps, gret, v0, steps)."""
+    self = book
+    first = rows['first'] != 0
+    done = rows['done'].astype(np.int64)
+    if (self.run or self.items) and first.any():
+        if self.items:
+            for j in np.flatnonzero(first):
+                self.inv0[int(idx[j])] = [int(v) for v, c in rows[j]['inv'] if v > 0 and c > 0]
+        if self.stats0 is not None:
+            for j in np.flatnonzero(first):
+                pl = rows[j]['player']
+                self.stats0[int(idx[j])] = [round(float(pl[11]) * 10, 3), round(float(pl[12]) * 20, 3),
+                                            round(float(pl[13]) * 2, 3), round(float(pl[14]) * 500, 1),
+                                            round(float(pl[15]) * 2, 3)]
+    if self.char0 is not None and first.any():
+        for j in np.flatnonzero(first):
+            self.char0[int(idx[j])] = int(rows[j]['pchar'])
+    if self.active0 is not None and first.any():
+        for j in np.flatnonzero(first):
+            self.active0[int(idx[j])] = int(rows[j]['player'][21] > 0)
+    if self.pick is not None and first.any():
+        for j in np.flatnonzero(first):
+            self.pick['bped'][int(idx[j])] = [int(v) for v in rows[j]['bped'] if v > 0]
+    ended = done != 0
+    for j in np.flatnonzero(ended):
+        i, r, sv = idx[j], rows[j], snap[j]
+        fin = dict(group=int(r['group']), seed=int(r['seed']), done=int(r['done']), decisions=int(r['t']), ret=float(sv[0]),
+                   hurt=float(sv[1]), damage=float(sv[2]), rooms=int(sv[3]), boss=int(sv[4]))
+        if self.run or self.items:
+            x = sv[5:11].astype(np.int64)
+            fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]), stage0=int(x[4]),
+                       stage=int(max(x[5], r['stage'])))
+            if self.inv0.get(int(i)):
+                fin['build0'] = self.inv0[int(i)]
+        if self.stats0 is not None and int(i) in self.stats0:
+            fin['stats0'] = self.stats0[int(i)]
+        if self.char0 is not None and int(i) in self.char0:
+            fin['char0'] = self.char0[int(i)]
+        if self.active0 is not None and int(i) in self.active0:
+            fin['active0'] = self.active0[int(i)]
+        if self.gains is not None:
+            fin.update(healed=float(sv[11]), gathered=float(sv[12]))
+        if self.pick is not None:
+            fin.update(build_pedestals=self.pick['bped'].get(int(i), []), pickup_forced=int(r['pmode']),
+                       forced_steps=int(sv[13]))
+        if r['lab'] != 0:
+            fin.update(lab=int(r['lab']), lab_s=int(r['lab_s']))
+            self.lab_finished.append(fin)
+        elif r['branch'] != 0:
+            fin.update(point=int(r['point']), branch=int(r['branch']))
+            self.branch_finished.append(fin)
+        else:
+            self.finished.append(fin)
+            if self.seen_inv is not None and self.items:
+                held = [int(v) for v, c in r['inv'] if v > 0 and c > 0]
+                if held:
+                    self.seen_inv.append(held)
+        if self.plr is not None and r['lab'] == 0 and r['branch'] == 0 and sv[16] > 0:
+            stats_, ST_, _ = self.plr
+            stats_[int(i), ST_['plr_score']] = abs(float(sv[14]) - float(sv[15]))
+            stats_[int(i), ST_['plr_episode']] = float(r['episode'])
+
+
 def _ccopy(rows, pending, snapshot):
     """(B45) Chunk arguments of one teacher record: compact record, actions under way, snapshot, its frame bytes."""
     rc, frames = compact_copy(rows)
@@ -4676,6 +4743,14 @@ def main(argv=None, child=None, actor=None):
         book.pick = dict(bped={}, steps=np.zeros(n, np.int64))
     version = update                                # the actor's weights: updates done
     version0 = version   # (B54: the policy-lag check at each hand-off counts from here)
+    native_cons = False   # B58a+b: the driver's native consumer (Episodes.arrive's arithmetic and store in C++)
+    if cpp_driver is not None:
+        why_c = bdrv.native_consumer_reason(cpp_driver, (roll, spare), lab, t_on, mem_on, proc, n_act)
+        if why_c is None:
+            bdrv.attach_consumer(cpp_driver, book, (roll, spare), args.gamma)
+            cpp_driver.use_rollout(roll.native_slot)
+            native_cons = True
+        print(f'B58 native consumer: {"on" if native_cons else "off (%s: the Python consumer)" % why_c}', flush=True)
     if block_actor is not None:
         block_actor.version=version
     if cpp_driver is not None:
@@ -4919,9 +4994,14 @@ def main(argv=None, child=None, actor=None):
                 if priv_pending is not None:
                     priv_pending[idx_r] = rec['priv'].numpy().view(PRIV_DTYPE)
                 lanes.observe_rows(idx_r, rows_r)
-                go_b = book.arrive(roll, rows_r, idx_r, pending)
-                if not np.array_equal(go_b, go_r):
-                    raise RuntimeError('cpp actor driver: the go mask differs from Episodes.arrive')
+                if native_cons:   # B58a+b: the arithmetic and the store were done by the driver; the episode events here
+                    _native_events(book, rows_r, idx_r, rec['snap'].numpy())
+                    fz_ = rows_r['first'] != 0; dn_ = rows_r['done'] != 0
+                    pending[idx_r[dn_ & (rows_r['done'] != DONE_BRANCH)]] = 0; pending[idx_r[fz_ & go_r]] = 0
+                else:
+                    go_b = book.arrive(roll, rows_r, idx_r, pending)
+                    if not np.array_equal(go_b, go_r):
+                        raise RuntimeError('cpp actor driver: the go mask differs from Episodes.arrive')
                 prof_['book'] += time.perf_counter() - tb_
                 prof_['polls'] += 1
                 cap_w_ = idx_r[rec['cf_snap'].numpy() != 0]   # (B54: workers whose next record waits for this capture)
@@ -4955,8 +5035,14 @@ def main(argv=None, child=None, actor=None):
                 prof_['control'] += time.perf_counter() - t1_
                 t2_ = time.perf_counter()
                 host_r = rec['out'].numpy(); act_r = rec['actions'].numpy()
-                store(roll, a_r, sub_r, under_r, act_r, host_r[:, nh], host_r[:, nh+1], ver_r, vg=host_r[:, nh+2],
-                      priv=priv_pending[a_r] if priv_pending is not None else None, block_context=contexts)
+                if native_cons:   # (B58a+b: the rollout rows are written; the memory sidecar keeps its chunk starts here)
+                    kk_r = rec['kk'].numpy()
+                    for j_, (w_, k_) in enumerate(zip(a_r.tolist(), kk_r.tolist())):
+                        if k_ >= 0:
+                            roll.block.record(w_, k_, sub_r[j_], contexts[j_])
+                else:
+                    store(roll, a_r, sub_r, under_r, act_r, host_r[:, nh], host_r[:, nh+1], ver_r, vg=host_r[:, nh+2],
+                          priv=priv_pending[a_r] if priv_pending is not None else None, block_context=contexts)
                 pending[a_r] = act_r
                 for j_, w_ in enumerate(a_r.tolist()):
                     block_actor.pending[w_] = act_r[j_:j_+1].copy()
@@ -5295,6 +5381,8 @@ def main(argv=None, child=None, actor=None):
                 job['lhand_s'] = time.perf_counter() - t_h
             spare.carry(roll)
             roll, spare = spare, roll
+            if native_cons:   # (B58a+b: the driver stores into the new rollout; paused since the collect's end)
+                cpp_driver.use_rollout(roll.native_slot)
             book.finished = []
             book.branch_finished = []
             busy = True
