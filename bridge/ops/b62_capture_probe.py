@@ -161,7 +161,7 @@ def child(case):
             ctx = None
             graph_cm = torch.cuda.stream(stream)
             graph_cm.__enter__()
-            graph.capture_begin(capture_error_mode='global')
+            graph.capture_begin(capture_error_mode=os.environ.get('PROBE_CAPTURE_MODE', 'global'))   # (thread_local: the alternative to a gate)
         try:
             if ctx is not None:
                 ctx.__enter__()
