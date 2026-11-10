@@ -9964,7 +9964,7 @@ learner的周期已经由update决定（prof-b54-cpp第2–14轮中位：update 
 - 完整流水：
   - `Prefetch`改为有序队列（最多DEPTH=2个part在前）和一个常驻worker。准备仍按提交顺序串行（PREP_LOCK）。调用拿到自己的part时，排在它前面而被跳过的part会被放弃并释放staging。
   - `learn()`：
-    - 旧值重算的各组提前一组准备，第一组在循环前提交；
+    - 旧值重算：第一组在循环前提交，第g+1组在第g组的forward之前提交（深度2，准备与第g组的主机端派发重叠）；
     - 每个epoch最后一个part运行时，就准备下一个epoch的第一个part；
     - update的第一个PPO part在epoch循环之前提交。
   - epoch排列（`EpochPerms`）：
@@ -9973,7 +9973,8 @@ learner的周期已经由update决定（prof-b54-cpp第2–14轮中位：update 
     - 两者之间learner没有别的默认generator消费者（teach_merge=1；teach_merge=0时，单独的teacher前向会带历史抽样落在其后，不是生产配置）。
     - actor线程（`block_lanes`的lane均匀数、`block_paged`的CPU回退）也用默认CPU generator，与learner并发交错，改前改后都不确定。
   - teacher / v2的抽取仍按minibatch顺序，按epoch保存。新teacher记录的两处无梯度调用暂未进队列。
-  - 关键路径上等待打包的时间按调用记录（`learn_pack_crit_s`，基准里逐调用列出）。门槛：每次update ≤ 0.3 s。同时报告staging pinned池大小（深度2的增量）。
+  - 关键路径上等待打包的时间按调用记录（`learn_pack_crit_s`，基准里逐调用列出）。预取等待按重算（no-grad）和PPO（grad）分开计（`learn_prefetch_wait_nograd_s` / `_grad_s`）。被跳过的排队part的等待单独计（`learn_prefetch_skip_wait_s`），连同dropped和other_calls一起报告；生产路径上dropped应为0。门槛：合计每次update ≤ 0.3 s。同时报告staging pinned池大小（深度2的增量）。
+  - arena记录的偏移不是4的倍数时，整批回到参考实现：参考在偏移处读头，在偏移//4*4处读浮点。
 - 测量：
   - `learn()`每个分段新增`uc_*`列（learner线程CPU秒）；`ISAAC_LEARN_OPCOUNT=1`时新增`uo_*`列（Python层torch调用数，只计learner线程）。
   - `b44_learner_bench.py`新增：
@@ -9984,13 +9985,15 @@ learner的周期已经由update决定（prof-b54-cpp第2–14轮中位：update 
   - 解码逐字节等于参考：ROW、frame arena、混合、单行、空列表；
   - 坏头抛出参考的错误；
   - concat覆盖异dtype和跨步片；
-  - 整个`_prepare_packed`的slab各区逐字节相同，计划和索引元数据相同；
+  - 整个`_prepare_packed`的slab各区逐字节相同，P里slab之外的每个字段也逐项相同：计划、形状、索引、计数、抽样、缩放；
+  - 偏移未对齐时回退；
+  - （CUDA）torch.randperm(2400, device=cuda)消耗默认CPU generator、不消耗CUDA generator，结果与CPU randperm相同；
   - 填充期间淘汰全部缓存，slab不变；
   - 锁外解码被拒绝；
   - 预取队列的顺序、跳过和丢弃；
   - 固定种子、预取队列真实运行时，三个epoch排列和每个part的历史抽样与串行逐元素相同；
   - 固定输入、CPU单线程的一次完整update（三个part，各做loss、backward、Adam），C打包开与关的loss和全部参数逐位相同。
-  本地（无gcc，模拟库）154 passed / 51 skipped。
+  本地（无gcc，模拟库）155 passed / 52 skipped。
 - GPU（`bridge/ops/b60_gpu.sh`，三个阶段，各≤15分钟，各自取锁，锁连续空闲2分钟且无cpp-actor链才取）：
   - A：B60测试（C库）+ b48 dump基准七个变体（n0p0b0、n0p0b1、n0p1b0、n1p0b0、n1p1b0、n1p1b1、n1p1b1i100）和一次计数rep；
   - B：全量测试；
