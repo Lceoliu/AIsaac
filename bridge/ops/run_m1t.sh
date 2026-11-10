@@ -21,10 +21,10 @@ from isaac_bridge import actor_native as a
 p=a.build(True); print('BUILD', p); print(str(a.REASON)[-6000:] if p is None else '')
 " > $R/m1t-build.log 2>&1
 if ! grep -q "BUILD /" $R/m1t-build.log; then rm -f $R/GPU_LOCK; echo "$(date +%T) m1t stops: build failed" >> $LOG; exit 1; fi
-timeout 900 $PY -m pytest tests/test_b58f_m1.py -v --tb=long -p no:cacheprovider -p no:logging > $R/tests-m1t-new.log 2>&1
+timeout 900 $PY -m pytest tests/test_b58f_m1.py tests/test_b58g_pause.py -v --tb=long -p no:cacheprovider -p no:logging > $R/tests-m1t-new.log 2>&1
 echo "$(date +%T) m1t new tests: $(tail -1 $R/tests-m1t-new.log | cut -c1-100)" >> $LOG
 if ! passed $R/tests-m1t-new.log; then rm -f $R/GPU_LOCK; echo "$(date +%T) m1t stops: new tests failed" >> $LOG; exit 1; fi
-ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 2400 $PY -m pytest tests/test_b58g_pause.py tests/test_b58e_batch.py tests/test_b58d_lanes.py tests/test_b58c_lineage.py tests/test_b54_driver_lanes.py tests/test_b52_cpp_actor.py tests/test_b58_native_consumer.py tests/test_b58_lifetime.py tests/test_b54_lane_bookkeeping.py -q --tb=long -p no:cacheprovider -p no:logging > $R/tests-m1t-drv.log 2>&1
+ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 2400 $PY -m pytest tests/test_b58e_batch.py tests/test_b58d_lanes.py tests/test_b58c_lineage.py tests/test_b54_driver_lanes.py tests/test_b52_cpp_actor.py tests/test_b58_native_consumer.py tests/test_b58_lifetime.py tests/test_b54_lane_bookkeeping.py -q --tb=long -p no:cacheprovider -p no:logging > $R/tests-m1t-drv.log 2>&1
 rm -f $R/GPU_LOCK
 echo "$(date +%T) m1t driver tests: $(tail -1 $R/tests-m1t-drv.log | cut -c1-100)" >> $LOG
 take "d2 M1: core TSAN (CPU only; held so that no timing run shares the CPU)"
