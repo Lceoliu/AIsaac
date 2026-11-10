@@ -9968,9 +9968,10 @@ learner的周期已经由update决定（prof-b54-cpp第2–14轮中位：update 
     - 每个epoch最后一个part运行时，就准备下一个epoch的第一个part；
     - update的第一个PPO part在epoch循环之前提交。
   - epoch排列（`EpochPerms`）：
-    - torch.randperm(n, device=cuda)在n < 30000时（n_units约2,400）走CPU实现，消耗默认CPU generator。learner的历史抽样也用它（没有传generator）。
-    - 所以排列必须在串行learner抽它的位置抽：上一个epoch最后一个part准备之后、这个epoch第一个part准备之前。`get(e+1)`在上一个epoch最后一个part运行后、提交下一个epoch第一个part之前调用。
-    - 两者之间learner没有别的默认generator消费者（teach_merge=1；teach_merge=0时，单独的teacher前向会带历史抽样落在其后，不是生产配置）。
+    - 每个epoch的排列在串行learner抽它的位置抽：上一个epoch最后一个part准备之后、这个epoch第一个part准备之前。`get(e+1)`在上一个epoch最后一个part运行后、提交下一个epoch第一个part之前调用。不论randperm(n, device=cuda)用哪个generator，抽取顺序都与串行相同。
+    - 4090实测（torch 2.7.1，n约2,400）：用的是CUDA generator，默认CPU generator的状态不变。审阅时“n < 30000走CPU默认generator”的推断在这一版不成立，以实测为准。learner的历史抽样用默认CPU generator（没有传generator）。
+    - 测试先探测用的是哪个generator，再断言惰性抽取与串行在同种子下逐元素相同，两种情况都覆盖。
+    - 两次epoch之间learner没有别的消费者（teach_merge=1；teach_merge=0时，单独的teacher前向会带历史抽样落在其后，不是生产配置）。
     - actor线程（`block_lanes`的lane均匀数、`block_paged`的CPU回退）也用默认CPU generator，与learner并发交错，改前改后都不确定。
   - teacher / v2的抽取仍按minibatch顺序，按epoch保存。新teacher记录的两处无梯度调用暂未进队列。
   - 关键路径上等待打包的时间按调用记录（`learn_pack_crit_s`，基准里逐调用列出）。预取等待按重算（no-grad）和PPO（grad）分开计（`learn_prefetch_wait_nograd_s` / `_grad_s`）。被跳过的排队part的等待单独计（`learn_prefetch_skip_wait_s`），连同dropped和other_calls一起报告；生产路径上dropped应为0。门槛：合计每次update ≤ 0.3 s。同时报告staging pinned池大小（深度2的增量）。
@@ -9987,13 +9988,14 @@ learner的周期已经由update决定（prof-b54-cpp第2–14轮中位：update 
   - concat覆盖异dtype和跨步片；
   - 整个`_prepare_packed`的slab各区逐字节相同，P里slab之外的每个字段也逐项相同：计划、形状、索引、计数、抽样、缩放；
   - 偏移未对齐时回退；
-  - （CUDA）torch.randperm(2400, device=cuda)消耗默认CPU generator、不消耗CUDA generator，结果与CPU randperm相同；
+  - （CUDA）先探测randperm(2400, device=cuda)消耗哪个generator，再断言EpochPerms的惰性抽取序列与串行循环逐元素相同；
+  - （不需要编译器）ctypes签名与C源码的形参逐个对齐：个数相同，指针对c_void_p、其余对c_long。阶段A第一次运行失败，原因是scan的argtypes是15个、C函数是14个；本地没有gcc，C相关测试被跳过，所以当时没拦住。
   - 填充期间淘汰全部缓存，slab不变；
   - 锁外解码被拒绝；
   - 预取队列的顺序、跳过和丢弃；
   - 固定种子、预取队列真实运行时，三个epoch排列和每个part的历史抽样与串行逐元素相同；
   - 固定输入、CPU单线程的一次完整update（三个part，各做loss、backward、Adam），C打包开与关的loss和全部参数逐位相同。
-  本地（无gcc，模拟库）155 passed / 52 skipped。
+  本地（无gcc，模拟库）156 passed / 52 skipped。
 - GPU（`bridge/ops/b60_gpu.sh`，三个阶段，各≤15分钟，各自取锁，锁连续空闲2分钟且无cpp-actor链才取）：
   - A：B60测试（C库）+ b48 dump基准七个变体（n0p0b0、n0p0b1、n0p1b0、n1p0b0、n1p1b0、n1p1b1、n1p1b1i100）和一次计数rep；
   - B：全量测试；
