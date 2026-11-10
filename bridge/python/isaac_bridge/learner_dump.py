@@ -128,7 +128,7 @@ def load(path):
     d = torch.load(path, map_location='cpu', weights_only=False)
     cfg = BlockConfig(**d['config'])
     kv_dtype = getattr(torch, d['kv_dtype'].replace('torch.', ''))
-    store = PagedStore(cfg, d['nh'], kv_dtype=kv_dtype, page=d['page'])
+    store = PagedStore(cfg, d['nh'], kv_dtype=kv_dtype, page=d['page'], native=False)   # (B52: the page lists are filled below)
     n_kv, n_b = len(d['kv']), len(d['blocks'])
     kv_ids = np.sort(store._alloc(max(n_kv, 1), 'd'))[:n_kv]   # a fresh store hands out 0..n-1
     if not np.array_equal(kv_ids, np.arange(n_kv)):

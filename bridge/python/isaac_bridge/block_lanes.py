@@ -5,6 +5,8 @@ The same two 16-bit reference halves used by the earlier rebuild-memory prototyp
 travel through lane_t; actual immutable snapshots stay in the actor registry and
 are returned by TokSampler.v2_records(with_block=True).
 """
+import os
+
 import numpy as np
 import torch
 
@@ -13,6 +15,7 @@ from .tok_policy import crn_uniforms
 from .block_training import BlockActor
 from .tok_lanes import LaneService
 from .block_protocol import decode_reference
+from .block_nvtx import push as nv_push, pop as nv_pop
 
 
 class ContextRegistry:
@@ -46,8 +49,26 @@ class ContextRegistry:
         self.completed.intersection_update(self.owners.values())
 
 
+def driver_ring(driver, actor, lane):
+    """(B54) The C++ driver's lineage ring of a restored lane row (SlotBlockActor `actor`, its slot `lane`): the
+    decisions of the row's last block_steps steps from the lane's log (step s at position s % block_steps, -1 where the
+    branch has none), so the blocks the lane completes later get the sources _pages would read from the log."""
+    bs=actor.model.block_memory.config.block_steps
+    row=actor.base+int(lane)
+    step=int(actor.state.step_host[row])
+    log=actor.logs[int(lane)]
+    lo=max(log.offset,step-bs)
+    dec=np.full(bs,-1,np.int64); kv=np.full(bs,-1,np.int64)
+    if step>lo:
+        d,k=log.decisions(lo,step)
+        at=np.arange(lo,step)%bs
+        dec[at]=d; kv[at]=k
+    driver.set_ring(row,torch.from_numpy(dec),torch.from_numpy(kv),int(step-lo))
+
+
 class BlockLaneService(LaneService):
     RECLAIM_S=0.1   # B46: at most this often the context / injury-source reclamation (service_control)
+    DEFER_S=2.0     # B54: a branch request whose point is not captured yet waits at most this long, then is cancelled
     def __init__(self, sampler, model, device, wait=.002, quiet=.0005, distill_steps=8,main_actor=None,stat=None):
         super().__init__(sampler, model, device, len(model.heads), gtok=True,
                          wait=wait, quiet=quiet, async_=False,stat=stat)
@@ -71,6 +92,27 @@ class BlockLaneService(LaneService):
         if main_actor is not None:
             self.depths=tuple(sorted(set(sampler.cfg.teacher_depths+sampler.cfg.teacher_death_depths)))
             self.recent_size=max(self.depths,default=0)+2
+        # B54: the C++ driver steps the lane rounds (attach_driver): jobs in flight, job id -> (generation, positions,
+        # version, lanes, rows, pending, keys, replay)
+        self.driver=None
+        self.drv_jobs={}
+        self.job_serial=0
+        self.py_mode=False      # (B54: serve_wait with the driver paused steps rounds on the Python path)
+        self.deferred_begin={}  # (B54: lane -> when its branch request first waited for its point's capture)
+        self.lanes_only=False   # (B54: the driver runs lanes only while the actor waits for the learner)
+        self.ring_dirty=set()   # (B54: (generation, lane) rows the Python path stepped: their ring re-set before a job)
+
+    def attach_driver(self, driver):
+        """(B54) The lane rounds' steps go to the C++ driver: _begin restores here (and sets the restored rows'
+        lineage rings), each generation's rows become one driver job (merged with a main batch of the same policy
+        version, else a lane-only call through the generation's lane graph), the answers come back as kind 4 records
+        (on_lane_record); tick never waits for them."""
+        self.driver=driver
+        if os.environ.get('ISAAC_BLOCK_LANE_MERGE','1')=='0':
+            driver.set_lane_merge(False)
+
+    def _set_ring(self, actor, lane):
+        driver_ring(self.driver, actor, lane)
 
     def observe_rows(self,workers,rows):
         """Called before Episodes.arrive, including terminal records (no action)."""
@@ -112,7 +154,24 @@ class BlockLaneService(LaneService):
                 status.flat[point]=2 if accepted else -1
                 self.s.cf_snap[worker]=0
 
+    def capture_deferred(self, workers, requests, snapshots):
+        """(B52) capture_main's CF point capture from the driver's record: the pre-step snapshots the consumer
+        rebuilt, the workers' requests the driver read (and zeroed) before replying."""
+        status = self.s.block_arrays[0]
+        for worker, request, snap in zip(workers, requests, snapshots):
+            if request:
+                point = int(request)-1
+                accepted = self.capture_point(point, snap, self.model, self.main_actor.version)
+                status.flat[point] = 2 if accepted else -1
+
     def service_control(self):
+        nv_push('lane.control')
+        try:
+            return self._service_control()
+        finally:
+            nv_pop()
+
+    def _service_control(self):
         if self.main_actor is None:
             return
         from .tok_sampler import ST,TEACH_RING
@@ -193,7 +252,9 @@ class BlockLaneService(LaneService):
         callback=self.main_request[3]
         self.main_request=None
         if callback is not None:
+            nv_push('lane.reply_main')
             callback(self.main_actor.host_output,self.main_actor.last_contexts)
+            nv_pop()
 
     def _step_main_only(self):
         rows,pending,slots,_=self.main_request
@@ -204,7 +265,47 @@ class BlockLaneService(LaneService):
 
     def serve_wait(self,timeout):
         self.service_control()
-        return super().serve_wait(timeout)
+        if self.driver is None:
+            return super().serve_wait(timeout)
+        # (B54: the actor waits for the learner: the driver runs the lane jobs only (main_hold: the workers' records
+        # wait), the rounds go on as in a collect, their records consumed here; quiesce ends it)
+        import time as time_
+        if not self.lanes_only:
+            self.driver.set_main_hold(True)
+            self.driver.resume()
+            self.lanes_only=True
+        end=time_.perf_counter()+timeout
+        did=False
+        while True:
+            rec=self.driver.next_record(0.0005)
+            if rec is not None:
+                self.driver_record(rec)
+                did=True
+            did=bool(self.tick()) or did
+            if time_.perf_counter()>=end:
+                return did
+
+    def driver_record(self, rec, resume=True):
+        """(B54) A record of the driver while it runs lanes only: lane rows (kind 4), a job for the Python path (5), a
+        lane graph to capture (1: captured on its owner's graph, the driver resumed unless resume=False)."""
+        import time as time_
+        kind=int(rec['kind'])
+        if kind==4:
+            return self.on_lane_record(rec)
+        if kind==5:
+            return self.on_lane_python(rec)
+        if kind==1:
+            owners=[self.main_actor,*self.actors.values()]
+            own=next(a for a in owners if a.step_graph is not None and a.step_graph.owner==int(rec['owner']))
+            with torch.inference_mode(), torch.autocast(torch.device(self.device).type,dtype=torch.bfloat16,enabled=own.bf16):
+                while own.step_graph.capture_key(rec['cap'],rec['widths']) is None:
+                    time_.sleep(0.001)
+            if resume:
+                self.driver.resume()
+            return None
+        if kind==3:
+            raise RuntimeError('cpp actor driver: '+self.driver.last_error())
+        raise RuntimeError(f'cpp actor driver: a record of kind {kind} while it runs lanes only')
 
     def capture_point(self, bank_index, snapshot, actor_model, model_version):
         """Before consuming the selection-point observation. False = backpressure."""
@@ -223,7 +324,14 @@ class BlockLaneService(LaneService):
         if generation not in self.actors and hasattr(self.main_actor,'lane_actor'):
             # A1: teacher generations share the main actor's page store; branch state is a slot row.
             # (B46: generation g's lanes in the main actor's arena: merged calls replay its step graph)
-            self.actors[generation] = self.main_actor.lane_actor(teacher, len(self.s.lane_io), generation=generation)
+            # (B54: its graph captures with the driver paused; train_tok pre-creates both generations at start-up)
+            if self.driver is not None:
+                self.driver.pause()
+            try:
+                self.actors[generation] = self.main_actor.lane_actor(teacher, len(self.s.lane_io), generation=generation)
+            finally:
+                if self.driver is not None:
+                    self.driver.resume()
         if generation not in self.actors:
             self.actors[generation] = BlockActor(teacher, len(self.s.lane_io),
                 graph_entities=self.main_actor.graph_entities if self.main_actor is not None else 0,
@@ -254,6 +362,8 @@ class BlockLaneService(LaneService):
             actor = self.actors[generation]
             actor.version = version
             actor.restore(lane, snapshot)
+            if self.driver is not None:
+                self._set_ring(actor, lane)
             self.lane_point[lane] = point
             self.lane_steps[lane] = 0
             self.s.lane_io[lane, 11] = 0
@@ -265,6 +375,7 @@ class BlockLaneService(LaneService):
         import time as time_
         from .block_paged import ucount
         t_call = time_.perf_counter()
+        nv_push('lane.eager')
         f['eager_calls'] = 0
         n = len(idx)
         a = pend.copy()
@@ -287,6 +398,12 @@ class BlockLaneService(LaneService):
             replays[j]=bool(self.s.block_arrays[1][lane]) if self.main_actor is not None else False
             groups.setdefault(generation, []).append(j)
         group_items=list(groups.items())
+        if self.py_mode:
+            for generation, positions in group_items:
+                self.ring_dirty.update((generation, int(idx[j])) for j in positions)
+            # (B54 counters: the rounds / rows the Python path steps while the actor waits for the learner)
+            self.stat['py_lane_rounds'] = self.stat.get('py_lane_rounds', 0)+int(bool(group_items))
+            self.stat['py_lane_rows'] = self.stat.get('py_lane_rows', 0)+sum(len(pos) for _, pos in group_items)
         if self.main_request is not None:
             matching=[generation for generation in groups
                       if self.actors[generation].version==self.main_actor.version]
@@ -346,9 +463,230 @@ class BlockLaneService(LaneService):
                     refs[j, -1] = 1.0
                 self.lane_steps[lane] += 1
         f.update(a=a, lp=lp, v=value, vg=vg, version=versions, block_refs=refs,cancelled=cancelled)
+        nv_pop()
         ucount('lane_call_s',time_.perf_counter()-t_call);ucount('lane_calls',1);ucount('lane_rows',n)
 
+    # ------------------------------------------------------------------ B54: the rounds on the C++ driver
+    def tick(self):
+        if self.driver is None:
+            return super().tick()
+        self.service_control()
+        did=False
+        if self.fly is not None:
+            if not self.fly['ready']:   # (its jobs' records not all consumed yet: never wait for them)
+                return False
+            self.finish()
+            did=True
+        self.s.poll_lanes()
+        if self.s.lane_ready and self.due():
+            self.submit()
+            if self.fly is not None and self.fly['ready']:
+                self.finish()
+            did=True
+        return did
+
+    def quiesce(self):
+        if self.driver is None:
+            return super().quiesce()
+        if self.lanes_only:   # (B54: back from the learner wait: the driver paused, its lane records consumed)
+            self.driver.pause()
+            while True:
+                rec=self.driver.next_record(0.0)
+                if rec is None:
+                    break
+                self.driver_record(rec, resume=False)
+            self.driver.set_main_hold(False)
+            self.lanes_only=False
+        # (the main weights change with the driver paused; the queued jobs keep their generation's own weights and
+        # merge with a main batch only at an equal version: nothing to wait for)
+        if self.fly is not None and self.fly['ready']:
+            self.finish()
+
+    def _submit(self):
+        if self.driver is None:
+            return super()._submit()
+        if self.fly is not None:   # (one round in flight at a time; tick finishes it first)
+            return False
+        import time as time_
+        s = self.s
+        idx = s.take_lanes()
+        if not len(idx):
+            return False
+        t0 = time_.perf_counter()
+        # (B54: a branch's first request can arrive before the consumer has taken the main record whose CF capture
+        # makes its point -- the driver replies before the record is consumed. Such a request waits for the capture
+        # (back into lane_ready), at most DEFER_S, then is answered as cancelled (a point that never came).)
+        keep, back = [], []
+        for lane in idx.tolist():
+            begin, seq = int(s.lane_io[lane, 11]), int(s.lane_io[lane, 10])
+            if begin > 0 and (begin-1) not in self.points and self.cancelled_requests.get(lane) != seq:
+                first = self.deferred_begin.setdefault(lane, t0)
+                if t0-first < self.DEFER_S:
+                    back.append(lane); continue
+                self.cancelled_requests[lane] = seq
+                self.stat['lane_orphan_requests'] = self.stat.get('lane_orphan_requests', 0)+1
+            self.deferred_begin.pop(lane, None)
+            keep.append(lane)
+        if back:
+            if not s.lane_ready:
+                s.lane_first_t = t0
+            s.lane_last_t = t0
+            s.lane_ready.extend(back)
+            self.stat['lane_deferred_requests'] = self.stat.get('lane_deferred_requests', 0)+len(back)
+        idx = np.asarray(keep, np.int64)
+        if not len(idx):
+            return False
+        n = len(idx)
+        self.stat['held_s'] += max(0.0, t0 - getattr(s, 'lane_first_t', t0))
+        self.seen[idx] = t0
+        rows = s.lane_rows[idx]
+        pend = s.lane_io[idx, :self.nh].astype(np.int64)
+        seq = s.lane_io[idx, 10].astype(np.int64) if s.lane_io.shape[1] > 10 else np.zeros(n, np.int64)
+        f = dict(idx=idx, rows=rows, seq=seq, t0=t0, ready=False)
+        self.fly = f
+        self._begin(idx)
+        self._submit_jobs(f, rows, pend, idx, (seq, idx))
+        self.stat['s'] += time_.perf_counter() - t0
+        return True
+
+    def _submit_jobs(self, f, rows, pend, idx, ukeys):
+        """(B54) _eager's grouping (cancelled requests, repeated answers, one group per teacher generation) with
+        the steps queued on the driver: one job per generation, the policy version of its lane actor."""
+        n = len(idx)
+        f['a'] = pend.copy()
+        f['lp'], f['v'], f['vg'] = (np.zeros(n, np.float32) for _ in range(3))
+        f['version'] = np.full(n, -1, np.int64)
+        f['cancelled'] = np.zeros(n, bool)
+        f['block_refs'] = np.zeros((n, self.s.lane_t.shape[1]), np.float32)
+        f['eager_calls'] = 0
+        groups = {}
+        replays = np.zeros(n, bool)
+        for j, lane in enumerate(idx):
+            lane = int(lane); seq = int(f['seq'][j])
+            if self.cancelled_requests.get(lane) == seq:
+                f['cancelled'][j] = True
+                continue
+            if lane in self.last_answers and self.last_answers[lane][0] == seq:
+                (_, f['a'][j], f['lp'][j], f['v'][j], f['vg'][j], f['version'][j], f['block_refs'][j],
+                 f['cancelled'][j]) = self.last_answers[lane]
+                continue
+            generation = self.points[self.lane_point[lane]][1]
+            replays[j] = bool(self.s.block_arrays[1][lane]) if self.main_actor is not None else False
+            groups.setdefault(generation, []).append(j)
+        items = list(groups.items())
+        # (the main policy's generation first, as _eager: the driver merges it with its next main batch)
+        items.sort(key=lambda item: self.actors[item[0]].version != self.main_actor.version)
+        jobs = []
+        for generation, positions in items:
+            positions = np.asarray(positions, np.int64)
+            actor = self.actors[generation]
+            lanes = idx[positions]
+            for lane in lanes.tolist():   # (rows the Python path stepped meanwhile: the driver's ring from the log)
+                if (generation, lane) in self.ring_dirty:
+                    self.ring_dirty.discard((generation, lane))
+                    driver_ring(self.driver, actor, lane)
+            sub = np.ascontiguousarray(rows[positions])
+            self.job_serial += 1
+            job = self.job_serial
+            # (the points' context owners now: a cancellation may release a point while its job is in flight)
+            tokens = [self.points[self.lane_point[int(q)]][3] for q in lanes]
+            self.drv_jobs[job] = (generation, positions, int(self.generations.versions[generation]), lanes, sub,
+                                  pend[positions].copy(), (ukeys[0][positions], ukeys[1][positions]), replays[positions], tokens)
+            jobs.append(job)
+            owner = actor.step_graph.owner if actor.step_graph is not None else id(actor)   # (CPU actors: no graphs)
+            self.driver.submit_lanes(job, int(owner), int(actor.version),
+                                     torch.from_numpy(sub.view(np.uint8).reshape(-1)), len(positions),
+                                     torch.from_numpy(np.ascontiguousarray(pend[positions], np.int64).reshape(-1)),
+                                     torch.from_numpy((actor.base+lanes).astype(np.int64)),
+                                     torch.from_numpy(np.ascontiguousarray(ukeys[0][positions], np.int64)),
+                                     torch.from_numpy(np.ascontiguousarray(ukeys[1][positions], np.int64)),
+                                     torch.from_numpy(replays[positions].astype(np.uint8)))
+        f['jobs'] = set(jobs)
+        f['ready'] = not jobs
+
+    def _answer_rows(self, f, generation, positions, version, out, contexts, replay, tokens):
+        """(B54) _eager's per-row answers of one generation's rows (outputs, version, context refs, lane steps)."""
+        nh = self.nh
+        f['a'][positions] = out[:, :nh].astype(np.int64)
+        f['lp'][positions], f['v'][positions], f['vg'][positions] = out[:, nh], out[:, nh+1], out[:, nh+2]
+        f['version'][positions] = version
+        for k, j in enumerate(positions):
+            lane = int(f['idx'][j])
+            if not replay[k]:   # (registered in _finish, right before lane_t: see there)
+                f.setdefault('puts', []).append((j, tokens[k], contexts[k]))
+            self.lane_steps[lane] += 1
+        self.stat['block_teacher_forward_calls'] = self.stat.get('block_teacher_forward_calls', 0)+1
+        self.stat['block_mixed_replay_calls'] = self.stat.get('block_mixed_replay_calls', 0)+int(replay.any() and not replay.all())
+
+    def on_lane_record(self, rec):
+        """(B54) A kind 4 record: the lane rows' lineage (logs, contexts, as SlotBlockActor._pages), the answers."""
+        from .block_paged import PagedSnapshot, EpisodeLog
+        job = int(rec['job'])
+        generation, positions, version, lanes, rows, pend, keys, replay, tokens = self.drv_jobs.pop(job)
+        f = self.fly
+        actor = self.actors[generation]
+        out = rec['out'].numpy()
+        step_b = rec['step_before'].numpy(); first = rec['first'].numpy().astype(bool)
+        comp = rec['complete'].numpy().astype(bool); dec = rec['dec'].numpy(); kvs = rec['kvs'].numpy(); bid = rec['bid'].numpy()
+        ver = int(rec['version'])
+        contexts = []
+        for k, lane in enumerate(lanes.tolist()):
+            if first[k]:
+                actor.logs[lane] = EpisodeLog((os.getpid(), lane, int(rows['episode'][k])))
+            contexts.append(PagedSnapshot(actor.store, actor.logs[lane], int(step_b[k]), pend[k:k+1].copy(), ver))
+            log = actor.logs[lane]
+            log.push(dec[k:k+1], kvs[k:k+1])
+            if comp[k]:
+                log.push_block(int(bid[k]), int(step_b[k]))
+            actor.pending[lane] = out[k:k+1, :self.nh].astype(np.int64)
+        actor.host_output = out
+        actor.last_contexts = contexts
+        if int(rec['merged']):
+            self.stat['merged_lane_rows'] = self.stat.get('merged_lane_rows', 0)+len(lanes)
+        self._answer_rows(f, generation, positions, version, out, contexts, replay, tokens)
+        f['jobs'].discard(job)
+        if not f['jobs']:
+            f['ready'] = True
+
+    def on_lane_python(self, rec):
+        """(B54) A kind 5 record: a job the driver cannot replay (an invalid / too wide frame); the driver is paused.
+        Stepped here on the lane actor (its eager path, as _eager would), the rings set again, the job dropped."""
+        job = int(rec['job'])
+        self.driver.drop_lane_job(job)
+        self._python_job(job)
+
+    def _python_job(self, job):
+        """(B54) A queued job stepped here on its lane actor (the driver paused), its rings re-set, answered."""
+        generation, positions, version, lanes, rows, pend, keys, replay, tokens = self.drv_jobs.pop(job)
+        f = self.fly
+        actor = self.actors[generation]
+        with torch.autocast(torch.device(self.device).type, dtype=torch.bfloat16, enabled=actor.bf16):
+            actor.step(rows, pend, lanes, ukeys=keys, evaluate=replay)
+        f['eager_calls'] += int(getattr(actor, 'last_path', 'eager') == 'eager')
+        for lane in lanes.tolist():
+            self._set_ring(actor, lane)
+        self._answer_rows(f, generation, positions, version, actor.host_output, actor.last_contexts, replay, tokens)
+        f['jobs'].discard(job)
+        if not f['jobs']:
+            f['ready'] = True
+
     def finish(self):
+        nv_push('lane.finish')
+        try:
+            return self._finish()
+        finally:
+            nv_pop()
+
+    def _finish(self):
+        if self.fly is not None and self.fly.get('puts'):
+            # B54: the driver path's contexts go into the registry here, just before their refs reach lane_t: between
+            # a kind 4 record and this answer the control's reclamation (retire, transient) runs and would drop an
+            # ident no lane_t / v2_t row names yet (the Python path registers and answers in one call)
+            f=self.fly
+            for j,token,ctx in f.pop('puts'):
+                ident=self.contexts.put(token,ctx)
+                f['block_refs'][j,0],f['block_refs'][j,1]=ident & 65535,ident >> 16
+                f['block_refs'][j,-1]=1.0
         if self.fly is not None:
             f=self.fly
             for j,lane in enumerate(f['idx']):

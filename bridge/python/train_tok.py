@@ -251,6 +251,7 @@ import numpy as np
 
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
+from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
 from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
@@ -2697,15 +2698,39 @@ def main(argv=None, child=None, actor=None):
         lanes = BlockLaneService(sampler,model,device,wait=args.cf_lane_wait,quiet=args.cf_lane_quiet,
                                  distill_steps=args.cf_distill_steps,main_actor=block_actor,stat=lane_stat)
     inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
-    actor_stream = torch.cuda.Stream(priority=-5)
+    # B54 experiment (ISAAC_BLOCK_STREAM_PRIO=learner): the learner's stream high priority, the actor's low (with the
+    # C++ actor the collect is shorter than the update; the actor has slack to absorb the learner's kernels first)
+    prio_learner = os.environ.get('ISAAC_BLOCK_STREAM_PRIO', 'actor') == 'learner'
+    a_prio, l_prio = (0, -5) if prio_learner else (-5, 0)
+    actor_stream = torch.cuda.Stream(priority=a_prio)
     # (B38 step 2: the actor's process of a learner process never touches the learner's GPU)
     actor_only = proc and child is None
-    learner_stream = None if actor_only else (torch.cuda.Stream(device=ldev, priority=0) if split else
-                                              torch.cuda.Stream(priority=0))
+    learner_stream = None if actor_only else (torch.cuda.Stream(device=ldev, priority=l_prio) if split else
+                                              torch.cuda.Stream(priority=l_prio))
+    if prio_learner:
+        print(f'B54 stream priorities: learner {l_prio}, actor {a_prio} (ISAAC_BLOCK_STREAM_PRIO=learner)', flush=True)
     torch.cuda.synchronize()
     if split and not actor_only:
         torch.cuda.synchronize(ldev)
     torch.cuda.set_stream(actor_stream)
+    cpp_driver = None   # B52: the actor's scheduling hot path in C++ (ISAAC_BLOCK_CPP_ACTOR=0: the Python loop)
+    cpp_started = [False]   # (B52: the driver thread starts at the first collect, then pauses / resumes)
+    drv_paused_at = [0.0]   # (B54: when the driver was paused for the hand-off)
+    py_mark = [{}]          # (B54: the Python-path lane counters at the last collect's end)
+    if block_actor is not None and lanes is not None and child is None:
+        from isaac_bridge import block_driver as bdrv
+        from isaac_bridge.block_paged import PagedSnapshot, EpisodeLog   # (consume_record)
+        made_g = bdrv.precapture_lane_generations(lanes, model)   # (both teacher generations' lane graphs now)
+        cpp_driver = bdrv.make_driver(block_actor, sampler, actor_stream, args.seed + 1000003 * aid + 0xB52, pf_on,
+                                      getattr(sampler, 'aux', None))
+        if cpp_driver is not None:
+            for la_ in lanes.actors.values():   # (the pre-created lane actors' graphs: their middle in C++ too)
+                if la_.step_graph is not None:
+                    la_.step_graph.attach_driver(cpp_driver)
+            if os.environ.get('ISAAC_BLOCK_DRIVER_LANES', '1') == '1':
+                lanes.attach_driver(cpp_driver)   # B54: the lane rounds' steps on the driver thread too
+        print(f'B52 cpp actor driver: {"on, %d graphs registered" % cpp_driver.n_graphs() if cpp_driver is not None else "off (%s)" % bdrv.reason()}'
+              f'; lane generations pre-created: {made_g}', flush=True)
     # B38 (--learner-device): the hand-off's copy of a rollout's temporal tensors to the learner's GPU (mirror_temporal:
     # issued by the actor thread on a stream pair of its own, the learner waits on the event; the next hand-off comes
     # only after the update that read the mirror has synchronised its stream, so one mirror suffices) and the weights'
@@ -2850,6 +2875,7 @@ def main(argv=None, child=None, actor=None):
         UC = dict.fromkeys(U, 0.0)
         UO = dict.fromkeys(U, 0) if OPCOUNT is not None else None
         cmark = [time.thread_time(), OPCOUNT.n if OPCOUNT is not None else 0]
+        nv_seg = [nv.start('learner.after_start')]   # (B50: the segment that follows each sec() mark)
 
         def sec(name):
             if PROFILE:
@@ -2863,6 +2889,7 @@ def main(argv=None, child=None, actor=None):
             if UO is not None:
                 UO[name] = UO.get(name, 0) + OPCOUNT.n - cmark[1]
                 cmark[1] = OPCOUNT.n
+            nv.end(nv_seg[0]); nv_seg[0] = nv.start('learner.after_'+name)
         rl = job['roll']
         if job.get('lroll') is not None:   # B38: the rollout's mirror on this GPU; its copy done before any read
             rl = job['lroll']
@@ -4257,6 +4284,9 @@ def main(argv=None, child=None, actor=None):
                 row['block_step_graph_replays']=lane_stat.get('block_step_graph_replays',0)
                 row['block_teacher_forward_calls']=lane_stat.get('block_teacher_forward_calls',0)
                 row['block_mixed_replay_calls']=lane_stat.get('block_mixed_replay_calls',0)
+                from isaac_bridge.block_driver import DRV_FIELDS
+                for k_d in DRV_FIELDS:   # (B54: the driver's counters of the collect)
+                    row[k_d]=lane_stat.get(k_d,'')
                 for k_b in ('block_gc_s','block_kv_rows','block_blocks','block_raw_rows'):
                     row[k_b]=lane_stat.get(k_b,0)
                 from isaac_bridge.block_compile import STATS as cstat_b
@@ -4436,7 +4466,11 @@ def main(argv=None, child=None, actor=None):
                     with OPCOUNT:
                         learn(job)
                 else:
-                    learn(job)
+                    nv.push('learner.update')
+                    try:
+                        learn(job)
+                    finally:
+                        nv.pop()
             except BaseException as exc:   # handed to the main thread
                 failure.append(exc)
                 fresh.set()
@@ -4717,8 +4751,11 @@ def main(argv=None, child=None, actor=None):
     if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): build_pedestals, pickup_forced, forced_steps
         book.pick = dict(bped={}, steps=np.zeros(n, np.int64))
     version = update                                # the actor's weights: updates done
+    version0 = version   # (B54: the policy-lag check at each hand-off counts from here)
     if block_actor is not None:
         block_actor.version=version
+    if cpp_driver is not None:
+        cpp_driver.set_version(version)
     busy = False                                     # an update is running on the learner
     handed = decisions_total
     wcols = ('step_s', 'wait_s', 'encode_s', 'fork_s', 'teach_s', 'overrun_s', 'state_s', 'close_s')
@@ -4764,14 +4801,20 @@ def main(argv=None, child=None, actor=None):
 
     def wait_learner():
         # (teacher v2: the lanes are answered meanwhile; their poll releases the GIL)
+        nv.push('h.wait_learner')   # (B57 measurement ranges: no-ops without ISAAC_BLOCK_NVTX=1)
         while not fresh.wait(0.0 if v2_on else 0.5):
             if lanes is not None:   # (B36: a round with its window, to its answer)
                 lanes.serve_wait(0.005)
             if failure or not learner.is_alive() or (actor_b is not None and not actor_b.is_alive()):
                 break
+        nv.pop()
         if lanes is not None:   # (B36: no lane call runs while the weights change)
+            nv.push('h.quiesce')
             lanes.quiesce()
+            nv.pop()
+        nv.push('h.take_weights')
         take_weights()
+        nv.pop()
 
     aux = sampler.aux   # Phase B2 (branches): the actor's value, log-probability and choice outputs per worker
     from isaac_bridge.tok_branch import AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_USED
@@ -4884,9 +4927,11 @@ def main(argv=None, child=None, actor=None):
         n_handoffs = -(-(target_decisions - decisions_total) // args.rollout)
         sent_handoffs = 0
         rollout_actor = args.rollout // n_act
+        nsys_win = nv.profiler_window()
         while (handed < target_decisions if n_act == 1 and not args.max_updates else sent_handoffs < n_handoffs) and sampler.live and                 not L.get('stop') and not stopped():
             # ---- collect
             t0 = time.perf_counter()
+            nv.profiler_mark(sent_handoffs, nsys_win)
             cpu_c0 = cpu_ticks()
             prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=0, calls=0, rows=0, eager=0,
                         act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0, cf_snaps=0,
@@ -4894,7 +4939,9 @@ def main(argv=None, child=None, actor=None):
 
             def _lane_tick(prof_):   # (B46: the actor thread's lane rounds outside a main call, timed)
                 t_k = time.perf_counter()
+                nv.push('actor.tick')
                 lanes.tick()
+                nv.pop()
                 prof_['tick'] += time.perf_counter() - t_k
             actor_profile_path=os.environ.get('ISAAC_BLOCK_ACTOR_PROFILE','')
             actor_profile=None
@@ -4902,7 +4949,163 @@ def main(argv=None, child=None, actor=None):
                 import cProfile
                 actor_profile=cProfile.Profile()
                 actor_profile.enable()
-            while roll.usable() < rollout_actor and sampler.live and not stopped():
+
+            def drain_driver(prof_):
+                """(B52) Every record the driver has queued, consumed (the driver paused or not)."""
+                while True:
+                    rec_ = cpp_driver.next_record(0.0)
+                    if rec_ is None:
+                        return
+                    consume_record(rec_, prof_)
+
+            def consume_record(rec, prof_):
+                """(B52) The Python side of one driver step: the bookkeeping the actor loop did around answer_block,
+                from the record (rows copied, outputs, pre-step steps / pending, decision and K/V ids, block ids)."""
+                kind = rec['kind']
+                if kind == 3:
+                    raise RuntimeError('cpp actor driver: ' + cpp_driver.last_error())
+                if kind == 2:
+                    raise ValueError('invalid visible-v2 complete frame length/counts (cpp actor driver)')
+                if kind == 1:   # a graph the driver has no capture of: captured here (the admission may be busy), then retried
+                    t_c = time.perf_counter()
+                    # (B54: the main actor's graph or a teacher generation's lane graph: the record names its owner)
+                    own_ = next((a_ for a_ in [block_actor, *lanes.actors.values()]
+                                 if a_.step_graph is not None and a_.step_graph.owner == int(rec['owner'])), block_actor)
+                    with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=own_.bf16):
+                        while own_.step_graph.capture_key(rec['cap'], rec['widths']) is None:
+                            time.sleep(0.001)
+                    print(f"B54 run-time capture: owner {'main' if own_ is block_actor else 'lane'}, cap {int(rec['cap'])}, "
+                          f"widths {tuple(rec['widths'])}", flush=True)
+                    prof_['control'] += time.perf_counter() - t_c
+                    return   # (the loop resumes the driver once it is paused with an empty queue)
+                if kind == 4:   # B54: a lane job's rows stepped by the driver (merged with a main batch or lane-only)
+                    t_l = time.perf_counter()
+                    lanes.on_lane_record(rec)
+                    prof_['tick'] += time.perf_counter() - t_l
+                    return
+                if kind == 5:   # B54: a lane job the driver cannot replay: stepped here (the driver paused itself)
+                    t_l = time.perf_counter()
+                    lanes.on_lane_python(rec)
+                    prof_['tick'] += time.perf_counter() - t_l
+                    return
+                tb_ = time.perf_counter()
+                idx_r = rec['workers'].numpy()
+                go_r = rec['go'].numpy().astype(bool)
+                rows_r = bdrv.record_rows(rec, ROW)
+                if priv_pending is not None:
+                    priv_pending[idx_r] = rec['priv'].numpy().view(PRIV_DTYPE)
+                lanes.observe_rows(idx_r, rows_r)
+                go_b = book.arrive(roll, rows_r, idx_r, pending)
+                if not np.array_equal(go_b, go_r):
+                    raise RuntimeError('cpp actor driver: the go mask differs from Episodes.arrive')
+                prof_['book'] += time.perf_counter() - tb_
+                prof_['polls'] += 1
+                cap_w_ = idx_r[rec['cf_snap'].numpy() != 0]   # (B54: workers whose next record waits for this capture)
+                if not go_r.any():
+                    if len(cap_w_):
+                        cpp_driver.capture_done(cap_w_.tolist())
+                    return
+                t1_ = time.perf_counter()
+                a_r = idx_r[go_r]
+                sub_r = rows_r if go_r.all() else rows_r[go_r]
+                under_r = rec['pending_before'].numpy()
+                step_b = rec['step_before'].numpy(); first_r = rec['first'].numpy().astype(bool)
+                comp_r = rec['complete'].numpy().astype(bool); dec_r = rec['dec'].numpy()
+                kvs_r = rec['kvs'].numpy(); bid_r = rec['bid'].numpy(); ver_r = int(rec['version'])
+                contexts = []
+                for j_, w_ in enumerate(a_r.tolist()):
+                    if first_r[j_]:
+                        block_actor.logs[w_] = EpisodeLog((os.getpid(), w_, int(sub_r['episode'][j_])))
+                    block_actor.pending[w_] = under_r[j_:j_+1].copy()
+                    contexts.append(PagedSnapshot(block_actor.store, block_actor.logs[w_], int(step_b[j_]), under_r[j_:j_+1].copy(), ver_r))
+                lanes.service_control()
+                lanes.capture_deferred(a_r, rec['cf_snap'].numpy()[go_r], contexts)
+                if len(cap_w_):   # (the captures made or refused: those workers' next records may go)
+                    cpp_driver.capture_done(cap_w_.tolist())
+                lanes.record_main(a_r, sub_r, contexts)
+                for j_, w_ in enumerate(a_r.tolist()):
+                    log_ = block_actor.logs[w_]
+                    log_.push(dec_r[j_:j_+1], kvs_r[j_:j_+1])
+                    if comp_r[j_]:
+                        log_.push_block(int(bid_r[j_]), int(step_b[j_]))
+                prof_['control'] += time.perf_counter() - t1_
+                t2_ = time.perf_counter()
+                host_r = rec['out'].numpy(); act_r = rec['actions'].numpy()
+                store(roll, a_r, sub_r, under_r, act_r, host_r[:, nh], host_r[:, nh+1], ver_r, vg=host_r[:, nh+2],
+                      priv=priv_pending[a_r] if priv_pending is not None else None, block_context=contexts)
+                pending[a_r] = act_r
+                for j_, w_ in enumerate(a_r.tolist()):
+                    block_actor.pending[w_] = act_r[j_:j_+1].copy()
+                prof_['store'] += time.perf_counter() - t2_
+                prof_['calls'] += 1
+                prof_['rows'] += len(a_r)
+                lat_ = rec['t_reply'] - rec['t_poll']
+                prof_['latency'] += lat_; prof_['main_ready'] += lat_
+                prof_['act'] += rec['t_done'] - rec['t_poll']
+                if busy:
+                    prof_['act_busy'] += lat_
+                    prof_['calls_busy'] += 1
+
+            def run_driver_collect(prof_):
+                """(B52) One collect with the driver: records consumed, lane rounds and weight takes with the driver
+                paused; the driver is left paused (drained) for the hand-off."""
+                cpp_driver.set_version(version)   # (take_weights may have run at the hand-off)
+                c0_ = cpp_driver.counters()
+                handoff_ = time.perf_counter()-drv_paused_at[0] if drv_paused_at[0] else 0.0
+                if not cpp_started[0]:   # (the first collect starts the thread; it is paused between collects)
+                    cpp_driver.start(); cpp_started[0] = True
+                cpp_driver.resume()
+                while roll.usable() < rollout_actor and sampler.live and not stopped():
+                    if busy and fresh.is_set():
+                        cpp_driver.pause(); drain_driver(prof_)
+                        lanes.quiesce()
+                        t_w = time.perf_counter()
+                        nv.push('actor.weights')
+                        take_weights()
+                        nv.pop()
+                        cpp_driver.set_version(version)
+                        prof_['weights'] += time.perf_counter() - t_w
+                        cpp_driver.resume()
+                    ta_ = time.perf_counter()
+                    rec_ = cpp_driver.next_record(0.002)
+                    prof_['poll'] += time.perf_counter() - ta_
+                    if rec_ is not None:
+                        nv.push('c.record')
+                        consume_record(rec_, prof_)
+                        nv.pop()
+                    if lanes.driver is not None:   # B54: the lane rounds go to the driver; the tick never pauses it
+                        drain_driver(prof_)   # (the queued records first: their CF captures make the points branches begin at)
+                        _lane_tick(prof_)
+                    elif sampler.poll_lanes() or lanes.in_flight:   # (B52: lane rounds on the shared arena: the driver paused)
+                        cpp_driver.pause(); drain_driver(prof_)
+                        _lane_tick(prof_)
+                        cpp_driver.resume()
+                    if rec_ is None and cpp_driver.is_paused() and cpp_driver.queue_size() == 0:
+                        cpp_driver.resume()   # (a capture request / a Python-stepped lane job was answered)
+                c1_ = cpp_driver.counters()
+                nv.push('h.pause_drain')
+                cpp_driver.pause(); drain_driver(prof_)
+                nv.pop()
+                drv_paused_at[0] = time.perf_counter()
+                # B54 counters of this collect: the driver's paused seconds (the hand-off's pause before this collect's
+                # resume excluded), lane jobs / rows, merged rows and calls, lane-only calls, run-time captures
+                line_ = bdrv.collect_counters(c0_, c1_, handoff_, lane_stat, py_mark)
+                print(f"B54 driver collect: {line_}; "
+                      f"graphs registered {cpp_driver.n_graphs()}; "
+                      f"pages {block_actor.store.native.n_pages_d()} decision / {block_actor.store.native.n_pages_b()} block", flush=True)
+                lane_stat['block_step_graph_replays']=sum(a.step_graph.replays for a in
+                    [block_actor,*lanes.actors.values()] if getattr(a,'step_graph',None) is not None)
+                lane_stat.update({'driver_'+k_: v_ for k_, v_ in cpp_driver.counters().items()})
+                if len(cpp_started) == 1:   # (the B52 entry gate reads this line: the thread ran, workers were answered)
+                    c_ = cpp_driver.counters(); cpp_started.append(True)
+                    print(f"B52 driver first collect: thread started, {c_['calls']} replies, {c_['rows']} rows, "
+                          f"{c_['steps']} steps", flush=True)
+
+            if cpp_driver is not None:
+                nv.push('actor.collect')   # (B57: the collect window, for the learner's per-window speeds)
+                run_driver_collect(prof)
+                nv.pop()
+            while cpp_driver is None and roll.usable() < rollout_actor and sampler.live and not stopped():
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
                     if block_actor is None:
                         _lane_tick(prof)
@@ -4914,21 +5117,27 @@ def main(argv=None, child=None, actor=None):
                     if lanes is not None:   # (B36: no lane call runs while the weights change)
                         lanes.quiesce()
                     t_w = time.perf_counter()
+                    nv.push('actor.weights')
                     take_weights()
+                    nv.pop()
                     prof['weights'] += time.perf_counter() - t_w
                 ta = time.perf_counter()
+                nv.push('actor.poll')
                 if inflight:   # a call is running: take what is ready now, else finish the oldest call
                     if not free:
+                        nv.pop()
                         finish(prof)
                         continue
                     idx, slots = sampler.poll_ready(idle=0.0)
                     if not len(idx):
                         prof['poll'] += time.perf_counter() - ta
+                        nv.pop()
                         finish(prof)
                         continue
                 else:   # (B36: a short wait while a lane call is in flight or a lane window is open)
                     idx, slots = sampler.poll_ready(idle=0.05 if lanes is None else lanes.idle(0.05),
                                                     want=args.poll_want, max_wait=args.poll_wait)
+                nv.pop()
                 tb = time.perf_counter()
                 prof['poll'] += tb - ta
                 prof['polls'] += 1
@@ -4936,6 +5145,7 @@ def main(argv=None, child=None, actor=None):
                     if block_actor is not None:
                         _lane_tick(prof)
                     continue
+                nv.push('actor.book')
                 rows = sampler.rows[slots]
                 if priv_pending is not None:   # 2026-11-03 (tok_priv): one record per worker is outstanding at a time
                     priv_pending[idx] = sampler.priv[slots]
@@ -4944,6 +5154,7 @@ def main(argv=None, child=None, actor=None):
                 go = book.arrive(roll, rows, idx, pending)
                 t1 = time.perf_counter()
                 prof['book'] += t1 - tb
+                nv.pop()
                 if not go.all():   # records that end an episode only need their answer
                     sampler.reply(idx[~go])
                 if not go.any():
@@ -4957,10 +5168,13 @@ def main(argv=None, child=None, actor=None):
                 under_way = pending[a_idx]
                 if block_actor is not None:
                     control_started=time.perf_counter()
+                    nv.push('actor.control')
                     lanes.capture_main(a_idx,sub,under_way)
+                    nv.pop()
                     prof['control']+=time.perf_counter()-control_started
                     inference_started=time.perf_counter()
                     def answer_block(host_b,contexts):
+                        nv.push('actor.answer')
                         prof['main_ready']+=time.perf_counter()-inference_started
                         actions=host_b[:,:nh].astype(np.int64)
                         logp,value,vg=host_b[:,nh],host_b[:,nh+1],host_b[:,nh+2]
@@ -4969,7 +5183,10 @@ def main(argv=None, child=None, actor=None):
                         # Preserve the actually issued action, including forced moves.
                         for w_b in a_idx:
                             block_actor.pending[int(w_b)]=pending[w_b:w_b+1].copy()
+                        nv.pop()
+                    nv.push('actor.step_main')
                     lanes.step_main(sub,under_way,a_idx,on_main_ready=answer_block)
+                    nv.pop()
                     inference_s=time.perf_counter()-inference_started
                     prof['latency']+=inference_s
                     if busy:
@@ -5092,6 +5309,13 @@ def main(argv=None, child=None, actor=None):
                     lab['sched'].note_seen(held)
                 book.seen_inv = []
                 post_lab_jobs()
+            if block_on:   # B54: every decision of this rollout is at most one update behind the update that trains on it
+                from isaac_bridge.block_driver import policy_lag_violations
+                lag_bad_, lag_min_ = policy_lag_violations(roll.version, roll.length, version0 + sent_handoffs - 1)
+                if lag_bad_:
+                    raise RuntimeError(f'policy lag: {lag_bad_} decisions of hand-off {sent_handoffs} use weights older '
+                                       f'than version {version0 + sent_handoffs - 1} (oldest {lag_min_})')
+            nv.push('h.job')
             job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
                        **lab_job,
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
@@ -5108,6 +5332,7 @@ def main(argv=None, child=None, actor=None):
                     record_b=job.get(kind_b)
                     if record_b is not None:
                         job[kind_b]=record_b[:2]+(pack_snapshots(record_b[-1]),)
+            nv.pop()
             proc_now = time.process_time()
             job['proc_cores'] = (proc_now - proc_mark) / max(job['cycle_s'], 1e-9)
             proc_mark = proc_now
@@ -5115,7 +5340,9 @@ def main(argv=None, child=None, actor=None):
             if block_actor is not None and hasattr(block_actor,'store'):
                 # A1 leases: free page rows/sources no rollout, teacher buffer, point, lane or slot can read.
                 t_gc = time.perf_counter()
+                nv.push('h.gc')
                 gc_b = block_actor.store.collect()
+                nv.pop()
                 lane_stat['block_gc_s'] = time.perf_counter()-t_gc
                 lane_stat['block_kv_rows'], lane_stat['block_blocks'], lane_stat['block_raw_rows'] = (
                     gc_b['kv'], gc_b['blocks'], gc_b['raw'])
@@ -5167,6 +5394,8 @@ def main(argv=None, child=None, actor=None):
             while not stop_ev.wait(1.0) and parent_a.is_alive():
                 pass
     finally:
+        if cpp_driver is not None:   # (B52)
+            cpp_driver.stop()
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
             # (2026-11-05: past this point nobody needs what is still unsent: a clean end has seen the stop, which comes after

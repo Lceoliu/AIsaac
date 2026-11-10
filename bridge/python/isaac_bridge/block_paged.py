@@ -34,6 +34,8 @@ import torch
 
 from .block_slots import BlockSlotState
 from .structured_input import from_rows
+from .block_nvtx import push as nv_push, pop as nv_pop
+from . import actor_native
 
 
 # ----------------------------------------------------------------------------- timing (ISAAC_BLOCK_TIMING=1)
@@ -402,12 +404,52 @@ class PagedPayload(list):
 
 # ----------------------------------------------------------------------------- store
 
+class _NativePages:
+    """(B52) PagedStore.kv_pages / z_pages / b_pages over the C++ store: pages[p] is a view [page, *row shape] of the
+    native page tensor (CPU, never moved); len() the pages allocated so far."""
+    def __init__(self, native, kind, shape):
+        self.native, self.kind, self.shape = native, kind, shape
+        self._get = getattr(native, kind+'_page')
+        self._n = getattr(native, 'n_pages_d' if kind != 'b' else 'n_pages_b')
+
+    def __len__(self):
+        return int(self._n())
+
+    def __getitem__(self, p):
+        if p < 0:
+            p += len(self)
+        return self._get(int(p)).view(self.shape)
+
+    def __iter__(self):
+        return (self[p] for p in range(len(self)))
+
+
+class _NativeRaw:
+    """(B52) PagedStore.raw over the C++ store: raw[dec] -> (first, schema, frame bytes, pending), len, in, keys."""
+    def __init__(self, native):
+        self.native = native
+
+    def __getitem__(self, dec):
+        first, schema, frame, pending = self.native.raw_entry(int(dec))
+        return first, schema, frame, pending.numpy()
+
+    def __contains__(self, dec):
+        return self.native.raw_has(int(dec))
+
+    def __len__(self):
+        return int(self.native.raw_count())
+
+    def keys(self):
+        return self.native.raw_keys().numpy().tolist()
+
+
 # B44: decoded historical block sources kept across rollouts (~0.5 MB each compact): at most this many.
 DECODED_CAP = int(os.environ.get('ISAAC_BLOCK_DECODED_CAP', '6000'))
 
 
 class PagedStore:
-    def __init__(self, config, nh, kv_dtype=torch.float32, page=4096):
+    def __init__(self, config, nh, kv_dtype=torch.float32, page=4096, native=None):
+        """native: None -> the C++ page store when actor_native loads, False -> the Python arrays."""
         c = self.config = config
         self.nh, self.page, self.kv_dtype = int(nh), int(page), kv_dtype
         self.kv_shape = (c.layers, 2, c.heads, c.latents, c.width//c.heads)
@@ -424,12 +466,45 @@ class PagedStore:
         self.b_free = np.empty(0, np.int64)
         self.raw = {}                                   # decision id -> (first, schema, frame bytes, pending)
         self.decoded = {}                               # learner cache: (block id, packed) -> host frames
-        self.next_decision = 0
+        self._next_decision = 0                         # (native: the C++ store's counter, see next_decision)
         self.snaps = weakref.WeakSet()
         self.roots = []                                 # weak methods -> iterable of (log, step) still live
         self.lock = threading.Lock()
         self.collections = 0
         self.freed = dict(kv=0, blocks=0, raw=0)
+        # B52: the pages, their allocation, metadata and raw frames in C++ (actor_native.PageStore) when the
+        # extension is available: the same interface (kv_pages[p] etc. are views of the native pages, d_meta /
+        # b_meta / ... numpy views of its preallocated-capacity arrays, raw a proxy), pages preallocated
+        # (ISAAC_BLOCK_PREALLOC_PAGES, decision pages; block pages a quarter) so no step allocates one.
+        self.native = None
+        ext = actor_native.load() if native is None else (native or None)
+        if ext is not None:
+            P = self.page
+            pre = int(os.environ.get('ISAAC_BLOCK_PREALLOC_PAGES', '48'))
+            self.native = ext.PageStore(P, int(np.prod(self.kv_shape)), kv_dtype == torch.bfloat16, int(np.prod(self.z_shape)),
+                                        int(np.prod(self.b_shape)), c.block_steps, self.nh,
+                                        int(os.environ.get('ISAAC_BLOCK_MAX_PAGES', '512')), int(os.environ.get('ISAAC_BLOCK_MAX_BPAGES', '128')))
+            self.native.grow_ahead(pre*P, max(1, pre//4)*P)
+            self.kv_pages = _NativePages(self.native, 'kv', (P, *self.kv_shape))
+            self.z_pages = _NativePages(self.native, 'z', (P, *self.z_shape))
+            self.b_pages = _NativePages(self.native, 'b', (P, *self.b_shape))
+            self.d_meta, self.d_used = self.native.d_meta.numpy(), self.native.d_used.numpy()
+            self.b_meta, self.b_src = self.native.b_meta.numpy(), self.native.b_src.numpy()
+            self.b_srcver, self.b_used = self.native.b_srcver.numpy(), self.native.b_used.numpy()
+            self.raw = _NativeRaw(self.native)
+
+    @property
+    def next_decision(self):
+        n = getattr(self, 'native', None)
+        return int(n.next_decision) if n is not None else self._next_decision
+
+    @next_decision.setter
+    def next_decision(self, v):
+        n = getattr(self, 'native', None)
+        if n is not None:
+            n.next_decision = int(v)
+        else:
+            self._next_decision = int(v)
 
     def track(self, snap):
         self.snaps.add(snap)
@@ -437,15 +512,18 @@ class PagedStore:
     # ---- allocation
     def _grow_d(self):
         P = self.page
+        nv_push('pages.grow')
         self.kv_pages.append(torch.zeros((P, *self.kv_shape), dtype=self.kv_dtype))
         self.z_pages.append(torch.zeros((P, *self.z_shape), dtype=torch.float32))
         base = len(self.d_used)
         self.d_meta = np.concatenate((self.d_meta, np.full((P, 2), -1, np.int64)))
         self.d_used = np.concatenate((self.d_used, np.zeros(P, bool)))
         self.d_free = np.concatenate((np.arange(base+P-1, base-1, -1, dtype=np.int64), self.d_free))
+        nv_pop()
 
     def _grow_b(self):
         P = self.page
+        nv_push('pages.grow')
         self.b_pages.append(torch.zeros((P, *self.b_shape), dtype=torch.float32))
         base = len(self.b_used)
         bs = self.config.block_steps
@@ -454,6 +532,7 @@ class PagedStore:
         self.b_srcver = np.concatenate((self.b_srcver, np.full((P, bs), -1, np.int64)))
         self.b_used = np.concatenate((self.b_used, np.zeros(P, bool)))
         self.b_free = np.concatenate((np.arange(base+P-1, base-1, -1, dtype=np.int64), self.b_free))
+        nv_pop()
 
     def _alloc(self, n, kind):
         free = 'd_free' if kind == 'd' else 'b_free'
@@ -517,6 +596,17 @@ class PagedStore:
     def write_decisions(self, rows, pending, kv, z, steps, version):
         """kv [n,L,2,H,lat,dh] cpu, z [n,lat,lw] cpu. Returns (decision ids, K/V slots)."""
         n = len(steps)
+        nv_push('pages.write_dec')
+        if self.native is not None:
+            frames = rows['visible_frame']
+            dec, kvs = self.native.write_decisions(torch.as_tensor(kv), torch.as_tensor(z), torch.as_tensor(np.asarray(steps, np.int64)),
+                                                   int(version), torch.from_numpy(np.ascontiguousarray(rows['first'])),
+                                                   torch.from_numpy(np.ascontiguousarray(rows['visible_schema'])),
+                                                   torch.from_numpy(frames if frames.strides[-1] == 1 else np.ascontiguousarray(frames)),
+                                                   torch.from_numpy(np.ascontiguousarray(rows['visible_bytes']).astype(np.int64)),
+                                                   torch.as_tensor(np.ascontiguousarray(pending, dtype=np.int64)))
+            nv_pop()
+            return dec.numpy(), kvs.numpy()
         with self.lock:
             kvs = self._alloc(n, 'd')
             dec = np.arange(self.next_decision, self.next_decision+n, dtype=np.int64)
@@ -529,14 +619,22 @@ class PagedStore:
         for i in range(n):
             self.raw[int(dec[i])] = (int(first[i]), int(schema[i]), frames[i, :int(nbytes[i])].tobytes(),
                                      np.array(pending[i], np.int64))
+        nv_pop()
         return dec, kvs
 
     def write_blocks(self, values, ends, version, src, srcver):
+        nv_push('pages.write_blk')
+        if self.native is not None:
+            bid = self.native.write_blocks(torch.as_tensor(values), torch.as_tensor(np.asarray(ends, np.int64)), int(version),
+                                           torch.as_tensor(np.asarray(src, np.int64)), torch.as_tensor(np.asarray(srcver, np.int64)))
+            nv_pop()
+            return bid.numpy()
         with self.lock:
             bid = self._alloc(len(ends), 'b')
         self._scatter(self.b_pages, bid, values)
         self.b_meta[bid, 0] = ends; self.b_meta[bid, 1] = int(version)
         self.b_src[bid] = src; self.b_srcver[bid] = srcver
+        nv_pop()
         return bid
 
     # ---- reads
@@ -567,6 +665,12 @@ class PagedStore:
     def source_arena(self, decisions):
         """(B45) source_rows without building padded records: (records with first / visible_schema / visible_bytes /
         visible_off, the frames joined into one byte array (each frame a multiple of 4 bytes), pending)."""
+        if self.native is not None:
+            first, schema, sizes, off, buf, pending = self.native.source_arena(torch.as_tensor(np.asarray(decisions, np.int64)))
+            rows = np.zeros(len(first), self.SOURCE)
+            rows['first'] = first.numpy(); rows['visible_schema'] = schema.numpy(); rows['visible_bytes'] = sizes.numpy()
+            rows['visible_off'] = off.numpy()
+            return rows, buf.numpy(), pending.numpy().reshape(len(first), self.nh)
         entries = [self.raw[int(d)] for d in decisions]
         rows = np.zeros(len(entries), self.SOURCE)
         sizes = np.fromiter((len(e[2]) for e in entries), np.int64, len(entries))
@@ -623,19 +727,28 @@ class PagedStore:
         live_blk = np.unique(np.concatenate(live_blk)) if live_blk else np.empty(0, np.int64)
         raw = [self.b_src[live_blk].reshape(-1)] + live_raw
         live_raw = np.unique(np.concatenate(raw)) if raw else np.empty(0, np.int64)
-        with self.lock:
+        if self.native is not None:
             keep = np.zeros(len(self.d_used), bool); keep[live_kv] = True
             dead = np.flatnonzero(self.d_used & ~keep)
-            self.d_used[dead] = False; self.d_meta[dead] = -1
-            self.d_free = np.concatenate((dead[::-1], self.d_free))
             keep = np.zeros(len(self.b_used), bool); keep[live_blk] = True
             dead_b = np.flatnonzero(self.b_used & ~keep)
-            self.b_used[dead_b] = False; self.b_meta[dead_b] = -1
-            self.b_free = np.concatenate((dead_b[::-1], self.b_free))
-        keys = np.fromiter(self.raw.keys(), np.int64, len(self.raw))
-        dead_r = keys[~np.isin(keys, live_raw)]
-        for k in dead_r.tolist():
-            del self.raw[k]
+            keys = self.native.raw_keys().numpy()
+            dead_r = keys[~np.isin(keys, live_raw)]
+            self.native.free_rows(torch.from_numpy(dead), torch.from_numpy(dead_b), torch.from_numpy(dead_r))
+        else:
+            with self.lock:
+                keep = np.zeros(len(self.d_used), bool); keep[live_kv] = True
+                dead = np.flatnonzero(self.d_used & ~keep)
+                self.d_used[dead] = False; self.d_meta[dead] = -1
+                self.d_free = np.concatenate((dead[::-1], self.d_free))
+                keep = np.zeros(len(self.b_used), bool); keep[live_blk] = True
+                dead_b = np.flatnonzero(self.b_used & ~keep)
+                self.b_used[dead_b] = False; self.b_meta[dead_b] = -1
+                self.b_free = np.concatenate((dead_b[::-1], self.b_free))
+            keys = np.fromiter(self.raw.keys(), np.int64, len(self.raw))
+            dead_r = keys[~np.isin(keys, live_raw)]
+            for k in dead_r.tolist():
+                del self.raw[k]
         # (B44) decoded block sources stay cached while their block lives (a freed id is reused)
         dead_set = set(dead_b.tolist())
         self.decoded = {k: v for k, v in list(self.decoded.items()) if k[0] not in dead_set}
@@ -652,6 +765,9 @@ class PagedStore:
             del self.decoded[next(iter(self.decoded))]
 
     def stats(self):
+        if self.native is not None:
+            return dict(kv_rows=int(self.d_used.sum()), kv_capacity=self.native.n_pages_d()*self.page, blocks=int(self.b_used.sum()),
+                        block_capacity=self.native.n_pages_b()*self.page, raw=self.native.raw_count(), raw_mb=self.native.raw_mb())
         return dict(kv_rows=int(self.d_used.sum()), kv_capacity=len(self.d_used), blocks=int(self.b_used.sum()),
                     block_capacity=len(self.b_used), raw=len(self.raw),
                     raw_mb=sum(len(v[2]) for v in list(self.raw.values()))/2**20)
@@ -800,6 +916,27 @@ class ActorStepGraph:
         self.capture = torch.cuda.Stream(device=self.device)
         from .visible_native import load
         self.native = load()
+        # B52: the C++ driver this arena's graphs are registered with (attach_driver); the registered graphs' step
+        # middle (unpack -> H2D -> replay -> D2H -> sync) runs in C++ (run_graph), and the driver thread replays
+        # the main actor's graphs itself
+        self.driver = None
+        self.owner = id(actor)
+
+    def attach_driver(self, driver):
+        """(B52) Register every graph captured so far with the driver; later captures register themselves."""
+        self.driver = driver
+        for key in list(self.graphs):
+            self._register(key)
+
+    def _register(self, key):
+        if self.driver is None or key[4]:   # (greedy graphs stay Python-only)
+            return
+        cap, widths = key[0], key[1]
+        heads, nh = sum(self.actor.model.heads), len(self.actor.model.heads)
+        layout, _ = self._layout(widths, cap, heads, nh)
+        flat, host, hv, graph, out, current, z, written, back, filled = self.graphs[key]
+        self.driver.register_graph([self.owner, cap, *widths], host, flat, graph, out, current, z, written, *back,
+                                   {k: (int(v[0]), tuple(int(x) for x in v[1]), str(v[2])) for k, v in layout.items()}, heads, nh)
 
     def _layout(self, widths, cap, heads, nh):
         shapes = {}
@@ -925,6 +1062,7 @@ class ActorStepGraph:
                 out, current, z, written = self._body(st, greedy)
             back = tuple(torch.empty(x.shape, dtype=x.dtype).pin_memory() for x in (out, current, z, written))
             self.graphs[key] = (flat, host, hv, graph, out, current, z, written, back, [0])
+            self._register(key)
             self.captures += 1
             ucount('actor_captures_step', 1); ucount('actor_capture_step_s', time_.perf_counter()-t_cap)
             late_capture('step', key)
@@ -936,6 +1074,16 @@ class ActorStepGraph:
         auto = torch.is_autocast_enabled('cuda')
         return (cap, tuple(int(w) for w in widths), auto, torch.get_autocast_dtype('cuda') if auto else None,
                 bool(greedy))
+
+    def capture_key(self, cap, widths, greedy=False):
+        """(B52) The graph of (row capacity, bucket widths) in the caller's autocast context, captured now when
+        missing; None when the capture admission is busy (the caller retries)."""
+        widths = tuple(int(w) for w in widths)
+        key = self._key(int(cap), widths, greedy)
+        if key in self.graphs:
+            return self.graphs[key]
+        layout, size = self._layout(widths, int(cap), sum(self.actor.model.heads), len(self.actor.model.heads))
+        return self._capture(key, layout, size, greedy)
 
     def precapture(self, n, entities, greedy=False):
         """B42 fix 2: capture the graph of an n-row step whose frames have `entities` entities
@@ -976,6 +1124,26 @@ class ActorStepGraph:
         else:
             self.graphs.move_to_end(key)
         flat, hbuf, hv, graph, out, current, z, written, back, filled = entry
+        if self.driver is not None and not greedy and 'visible_frame' in rows.dtype.names and \
+                self.driver.has_graph([self.owner, cap, *widths]):
+            # B52: the step's middle in C++ (the slab filled from the records, H2D, replay, D2H, one sync), no GIL
+            rows = np.ascontiguousarray(rows)
+            nv_push('g.native')
+            self.driver.run_graph([self.owner, cap, *widths], torch.from_numpy(rows.view(np.uint8).reshape(-1)), rows.dtype.itemsize,
+                                  n, torch.from_numpy(np.ascontiguousarray(pending, dtype=np.int64)),
+                                  torch.from_numpy(np.ascontiguousarray(rows_ids, dtype=np.int64)),
+                                  None if u is None else torch.as_tensor(u, dtype=torch.float32).cpu(),
+                                  torch.from_numpy(np.asarray(replay, np.uint8)), torch.from_numpy(np.asarray(complete, np.uint8)),
+                                  int(version))
+            nv_pop()
+            self.replays += 1
+            filled[0] = n
+            bo, bc, bz, bw = back
+            done = np.flatnonzero(complete)
+            ucount('actor_graph_host_s', time_.perf_counter()-t_call)
+            written_c = bw.index_select(0, torch.from_numpy(done)) if len(done) else None
+            return bo.numpy()[:n], bc[:n], bz[:n], z.dtype, written_c, bo[:n]
+        nv_push('g.unpack')
         lib = self.native
         if lib is not None and 'visible_frame' in rows.dtype.names:
             # B46: frames unpacked in C straight into the pinned slab (rows past n: zeroed below)
@@ -1006,9 +1174,12 @@ class ActorStepGraph:
         hv['complete'][:] = False
         hv['complete'][:n] = complete
         hv['version'][0] = int(version)
+        nv_pop(); nv_push('g.h2d')
         flat.copy_(hbuf, non_blocking=True)
+        nv_pop(); nv_push('g.replay')
         graph.replay()
         self.replays += 1
+        nv_pop(); nv_push('g.d2h')
         bo, bc, bz, bw = back
         bo.copy_(out, non_blocking=True)
         bc.copy_(current, non_blocking=True)
@@ -1016,8 +1187,10 @@ class ActorStepGraph:
         done = np.flatnonzero(complete)
         if len(done):
             bw.copy_(written, non_blocking=True)
+        nv_pop(); nv_push('g.sync')
         t_wait = time_.perf_counter()
         torch.cuda.current_stream(self.device).synchronize()
+        nv_pop()
         ucount('actor_graph_host_s', t_wait-t_call); ucount('actor_graph_wait_s', time_.perf_counter()-t_wait)
         # the Writer ran on every row; only the complete rows' blocks are handed out (the other rows of
         # the pinned buffer hold another call's values): [len(done), tokens, width], in row order
@@ -1083,6 +1256,8 @@ class SlotBlockActor:
             n, sec = precapture_actor(lane, merged=False)
             if TIMING_ON:
                 print(f'B42 lane pre-capture: {n} graphs in {sec:.1f} s', flush=True)
+        if lane.step_graph is not None and self.step_graph is not None and self.step_graph.driver is not None:
+            lane.step_graph.attach_driver(self.step_graph.driver)   # (B52: its graphs' middle in C++ too)
         return lane
 
     def snapshot(self, slot):
@@ -1109,6 +1284,7 @@ class SlotBlockActor:
     @torch.inference_mode()
     def step(self, rows, pending, slots, ukeys=None, greedy=False, evaluate=False, owners=None, uniform=None):
         from .tok_policy import crn_uniforms
+        nv_push('step.setup')
         slots = list(map(int, slots))
         owners = [self]*len(slots) if owners is None else owners
         if any(owner.version != self.version for owner in owners):
@@ -1139,6 +1315,7 @@ class SlotBlockActor:
         n_self = sum(owner is self for owner in owners)
         kind = 'main' if n_self == len(owners) and self.lane_slots else (
             'lane' if n_self == len(owners) else 'merged')
+        nv_pop()
         if self.step_graph is not None and all(owner.state is self.state for owner in owners):
             done = self._graph_step(rows, pending, slots, owners, groups, ukeys, greedy, evaluate, uniform, steps_host,
                                     record, clock)
@@ -1146,7 +1323,9 @@ class SlotBlockActor:
                 self.last_path = 'graph'
                 result, host, kv_host, z_host = done
                 t_pages = time_.perf_counter()
+                nv_push('step.pages')
                 self._pages(rows, pending, slots, owners, groups, record, host, kv_host, z_host, steps_host, contexts)
+                nv_pop()
                 clock.mark('pages')
                 if TIMING_ON:
                     t_end = time_.perf_counter()
@@ -1161,6 +1340,7 @@ class SlotBlockActor:
                     ucount('actor_graph_overlap_s', dt if active or LEARNER_ACTIVE[0] else 0.0)
                 return result
         self.last_path = 'eager'
+        nv_push('step.eager')
         if TIMING_ON:
             ucount('actor_eager_calls', 1); ucount('actor_eager_merged_calls', int(len(groups) > 1))
 
@@ -1252,6 +1432,7 @@ class SlotBlockActor:
             dt = time_.perf_counter()-t_call
             ucount('actor_step_s', dt)
             ucount('actor_eager_s', dt); ucount('actor_eager_overlap_s', dt if active or LEARNER_ACTIVE[0] else 0.0)
+        nv_pop()
         return result
 
 
@@ -1260,6 +1441,7 @@ class SlotBlockActor:
         """B42 glue 5 / B46: the step through ActorStepGraph, the Writer included (None: not
         captured; the eager path runs). Rows may belong to several owners of this arena."""
         from .tok_policy import crn_uniforms
+        nv_push('step.prep')
         n = len(slots)
         heads = sum(self.model.heads)
         replay = np.broadcast_to(np.asarray(evaluate, dtype=bool), (n,)).copy()
@@ -1278,10 +1460,12 @@ class SlotBlockActor:
         bs = self.model.block_memory.config.block_steps
         complete = (steps_host+1) % bs == 0
         clock.mark('decode_host')
+        nv_pop()
         out = self.step_graph(rows, np.asarray(pending, np.int64), ids, u, replay, complete, self.version, greedy)
         if out is None:
             return None
         out, cur, zc, zdtype, written, out_t = out
+        nv_push('step.after')
         clock.mark('graph')
         count('actor.graph_calls', 1)
         self.state.step_host[ids] += 1
@@ -1303,6 +1487,7 @@ class SlotBlockActor:
             res = out_t.to(dev, non_blocking=True)
             result = (res[:, :nh].long(), res[:, nh], res[:, nh+1], res[:, nh+2])
         self.last_result = None
+        nv_pop()
         return result, out.copy(), cur, zc   # (B47 fix 1a: rows-first K/V, float32 z: views of the pinned buffer)
 
     def _pages(self, rows, pending, slots, owners, groups, record, host, kv_host, z_host, steps_host, contexts):

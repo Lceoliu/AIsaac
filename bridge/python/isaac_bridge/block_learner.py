@@ -34,6 +34,7 @@ import numpy as np
 import torch
 
 from . import block_paged as bp
+from .block_nvtx import push as nv_push, pop as nv_pop
 
 T_LEARN = (1, 32, 64, 128)
 PACKED = os.environ.get('ISAAC_PACKED_LEARNER', '1') == '1'
@@ -707,6 +708,7 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
     if packed is None:
         packed = device.type == 'cuda' if HOST_PACKED is None else bool(HOST_PACKED)
     packed = bool(packed)
+    nv_push('learner.host_decode')
     hosts = _host_decode(chunks, packed)
     n_main = int(lens.sum())
     hist_hosts = _block_decode(store, ub, packed, bs) if len(ub) else []
@@ -718,6 +720,7 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
         tail_hosts, n_tail = [_compact((rows_t, buf_t), pend_t, packed)], len(rows_t)
         bp.ucount('learn_tail_decode_rows', n_tail)
     all_hosts = hosts+hist_hosts+tail_hosts
+    nv_pop()
     n_rows = n_main+n_hist+n_tail
     specs = []
     shapes, counts, starts = _merge_into(all_hosts, specs)
