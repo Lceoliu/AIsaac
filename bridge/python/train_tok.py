@@ -291,6 +291,12 @@ class _OpCount:
 
 OPCOUNT = _OpCount() if os.environ.get('ISAAC_LEARN_OPCOUNT') == '1' else None
 
+# B62 (step 2): the teacher records' meta of each PPO minibatch is copied to the GPU from pageable memory, a copy that
+# waits for every kernel queued before it (the previous step's backward and optimizer): u_teach_build (~1.6 s per update,
+# B62 cProfile: tensor.to) was mostly that wait, spinning on the learner thread. ISAAC_LEARN_ASYNC_H2D=1: from pinned
+# memory, non-blocking (the same bytes; the learner thread goes on queueing work). Default off until reviewed.
+ASYNC_H2D = os.environ.get('ISAAC_LEARN_ASYNC_H2D', '0') == '1'
+
 def cpu_ticks():
     """(busy, total) jiffies of all CPUs from /proc/stat ((0, 0) where there is none)."""
     try:
@@ -3741,6 +3747,10 @@ def main(argv=None, child=None, actor=None):
                     if fast:   # B18: from the meta's copy on the device (no blocking copy)
                         pick_d = dev(pick)
                         meta = t_meta.index_select(0, pick_d)
+                    elif ASYNC_H2D:   # B62: pinned, asynchronous: no wait for the previous step's GPU work here
+                        meta = torch.from_numpy(np.ascontiguousarray(teach_meta[pick])).pin_memory().to(
+                            device, non_blocking=True)
+                        pick_d = None
                     else:
                         meta = torch.from_numpy(teach_meta[pick]).to(device)
                         pick_d = None
