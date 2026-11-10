@@ -12,7 +12,7 @@ trap 'rm -f $R/GPU_WANT_CPP' EXIT
 waitlock() { touch $R/GPU_WANT_CPP; while [ -f $R/GPU_LOCK ] || [ "$(pgrep -fc '[t]rain_tok.py')" != "0" ] || [ "$(pgrep -fc '[p]ytest')" != "0" ] || [ "$(pgrep -fc '[e]val_tok.py')" != "0" ]; do sleep 20; done; sleep 10; rm -f $R/GPU_WANT_CPP; }
 take() { while :; do waitlock; [ -f $R/GPU_LOCK ] || break; done; echo "cpp-actor $(date '+%Y-%m-%d %H:%M:%S') $1" > $R/GPU_LOCK; }
 passed() { tail -1 $1 | grep -q " passed" && ! tail -1 $1 | grep -qE "failed|error"; }
-until grep -qE 'b58e (done|stops)' $LOG; do sleep 30; done
+until grep 'b58e' $LOG | tail -1 | grep -qE 'b58e (done|stops)'; do sleep 30; done
 echo "$(date +%T) m1t start ($CODE)" >> $LOG
 take "d2 M1: build + tests (not a timing run)"
 cd $C/bridge/python
