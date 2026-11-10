@@ -314,6 +314,8 @@ def test_driver_lanes_pressure_restores_and_jobs_while_workers_step():
                     lane_logs[g][lane] = ga.logs[lane]
                     restores[0] += 1
             for rep_k in range(3):
+                if stop.is_set():   # (the test's end: no new job; conftest checks for leftover threads)
+                    return
                 rows = frame(lrng, len(lanes), 100+rep_k, np.ones(len(lanes), np.int64), np.zeros(len(lanes), np.int64), seed=int(lrng.integers(1, 10**6)))
                 pend = synth_pending(lrng, len(lanes), m.heads)
                 jid += 1
@@ -321,7 +323,9 @@ def test_driver_lanes_pressure_restores_and_jobs_while_workers_step():
                     jobs[jid] = (g, lanes, rows)
                     submitted[0] += 1
                 submit(d, jid, ga, rows, pend, lanes, lrng.integers(0, 10**6, len(lanes)), np.zeros(len(lanes), bool), ga.version)
-                done_jobs.acquire()   # (one job of these lanes in flight at a time: the next restore after its record)
+                while not done_jobs.acquire(timeout=0.05):   # (one job of these lanes in flight at a time; the end too)
+                    if stop.is_set():
+                        return
 
     workers = [FakeWorker(w, s._pairs[w][1], s, lambda w_, k_: frames[w_, k_], K, delay=0.002) for w in range(W)]
     d.start()
@@ -376,6 +380,7 @@ def test_driver_lanes_pressure_restores_and_jobs_while_workers_step():
     stop.set()
     done_jobs.release()
     lt.join(10)
+    assert not lt.is_alive(), 'the test lane thread did not end'
     for wk in workers:
         wk.join(10); assert wk.error is None, wk.error
     d.pause()
