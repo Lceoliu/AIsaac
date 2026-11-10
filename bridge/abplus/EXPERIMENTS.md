@@ -9926,3 +9926,66 @@ B55测得：打开FX graph cache与AOTAutogradCache后，缓存热时Spatial预�
   - 默认值仍未改，等协调方确认。
 
 默认值自ed6b2a0起为开（`ISAAC_FX_CACHE`未设或为1时开，设0时关）。同一提交里，train_tok在预热之后打印一行`B56 compile cache after warm-up: {...}`（fxgraph与AOTAutograd缓存的hit / miss / guard_miss / bypass计数，只观测），以后可以直接看生产中那8个backward图是否命中。P1b不修，归因见上。
+
+### B60 learner的host工作搬出GIL：原生打包与完整流水（2026-11-10，GPU测量待跑）
+
+#### 实验目的
+
+learner的周期已经由update决定（prof-b54-cpp第2–14轮中位：update 21.43 s，collect 13.37 s，actor每周期等learner 8.1 s）。update里有三类host开销在和其他线程争GIL：
+- B48：host打包每次update 8.05 s，预取线程只藏住4.76 s，约3.3 s在关键路径上。隔离时打包只要3.5 s，生产里多出来的部分是GIL争用。
+- B50：learner每次update等GIL 4.4–5.2 s。
+- u_recompute 3.58 s（隔离时1.05 s），u_teach_build 1.62 s，u_opt 0.86 s。
+
+本实验：
+- 把host打包里搬字节的部分搬到不持GIL的C代码。
+- 把预取扩展到覆盖整个update。
+- 量出teach_build、recompute的host部分、opt各自的Python时间和torch调用数。
+
+不改模型定义和训练语义，不削减任何预算，不丢行，micro 8192。
+
+门槛：
+- 固定输入learner基准（b48 dump）≤ 9.5 s（现10.95 s）。
+- FP32等价按B44标准，上传内容逐字节一致，全量测试通过。
+- 诊断项：同一基准并行一个纯Python忙线程时的耗时，改前改后各一个数。
+- 生产update由集成步骤B61验证（目标≤17 s）。
+
+#### 实验方法
+
+- 原生库`bridge/engine/abp_learn.c`（纯C）。由`isaac_bridge/learn_native.py`在首次使用时用gcc编译，按源码哈希缓存，ctypes.CDLL加载（调用期间释放GIL）。四个函数都只拷贝字节：
+  - `abp_learn_scan`：逐行头检查与计数（`check_headers`）；
+  - `abp_learn_gather`：packed解码的room、minimap和五个compact列表（`decode_frames_compact(packed=True)`）；
+  - `abp_learn_concat`：slab合并区按片拷贝，ragged末尾补零项（`_fill_merged`）；
+  - `abp_learn_pages`：K/V、open-tail latent、块值三类页行（`PagedStore._gather`），只读访问页存储，`block_paged.py`不改。
+- 接入`block_learner`：主行、历史块、open tail三处解码（缓存结构不变），slab填充和页gather。开关`ISAAC_BLOCK_NATIVE_PACK`，默认1；设0，或没有gcc、任何一行头检查不通过时，走Python参考实现（坏头时由参考实现抛出同样的错误）。只覆盖packed（CUDA）路径。
+- 完整流水：
+  - `Prefetch`改为有序队列（最多DEPTH=2个part在前）和一个常驻worker。准备仍按提交顺序串行（PREP_LOCK），history抽样的generator序列不变。调用拿到自己的part时，排在它前面而被跳过的part会被放弃并释放staging。
+  - `learn()`：
+    - 旧值重算的各组提前一组准备，第一组在循环前提交；
+    - 每个epoch的排列在第一个epoch前连续抽完（learn()里唯一的CUDA RNG消费者，抽样顺序不变）；
+    - 每个epoch最后一个part运行时，就准备下一个epoch的第一个part；
+    - update的第一个PPO part在epoch循环之前提交。
+  - teacher / v2的抽取仍按minibatch顺序进行（numpy和v2_rng在这期间没有其他消费者），按epoch保存。
+  - 新teacher记录的两处无梯度调用（teach_new、v2）暂未进队列（单行chunk、无历史抽样），由测量决定是否需要。
+- 测量：
+  - `learn()`每个分段新增`uc_*`列，即learner线程CPU秒；wall减CPU就是等待时间（GPU同步、GIL）。
+  - `ISAAC_LEARN_OPCOUNT=1`时新增`uo_*`列，即Python层torch调用数（TorchFunctionMode，只计learner线程）。
+  - `b44_learner_bench.py`新增：
+    - `--variants n<0|1>p<0|1>b<N>`：C打包、流水、N个纯Python忙线程；
+    - `--opcount`：按fwd_grad / bwd / opt / fwd_nograd统计torch调用数；
+    - 预取统计（host秒、CPU秒、等待、命中、丢弃）。
+- 测试`tests/test_b60_native_pack.py`。有gcc时用编译好的库，同时也用Python模拟同一组函数（检查封装的地址和大小计算）。覆盖：
+  - 解码逐字节等于参考：ROW、frame arena、混合、单行、空列表；
+  - 坏头抛出参考的错误；
+  - concat覆盖异dtype和跨步片；
+  - 页gather覆盖fp32和bf16；
+  - 整个`_prepare_packed`的slab各区逐字节相同，计划和索引元数据相同；
+  - 预取队列的顺序、跳过和丢弃。
+  本地（无gcc，模拟库）152 passed / 51 skipped。
+- GPU（`bridge/ops/b60_gpu.sh`，三个阶段，各≤15分钟，各自取锁，锁连续空闲2分钟且无cpp-actor链才取）：
+  - A：B60测试（C库）+ b48 dump基准的五个变体和一次计数rep；
+  - B：全量测试；
+  - C：6个update的短profile（预取命中/丢弃、uc_*）。
+
+#### 实验结果
+
+待GPU。
