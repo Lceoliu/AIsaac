@@ -832,6 +832,11 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "stale_share": "1.00 (Python path 0.50): the rollout is collected before the update before it ends, so every decision uses the one-update-old weights",
     "prio": "learner stream high priority: no gain (update 21.91 vs 21.43); not the default"
   },
+  "policy_lag": {
+    "constraint": "each decision's weights lag the update that trains on it by at most one update: decisions made in the collect of hand-off h (resumed after U updates) have version >= U + h - 1; a worker's carried open decision (column 0) is from the collect before (at most 2 behind, as on the Python path)",
+    "check": "train_tok raises at every hand-off on a violation (block_driver.policy_lag_violations); tests/test_b54_lane_bookkeeping.py::test_policy_lag_check",
+    "stale_share_note": "the C++ actor collects a rollout before the update before it ends, so stale_share is 1.00 (Python path 0.50): the one-update lag is used for every decision"
+  },
   "actor_b57": {
     "entry": "bridge/abplus/EXPERIMENTS.md B57 (cycle budget, measurement only)",
     "tools": [
