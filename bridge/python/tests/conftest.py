@@ -80,6 +80,40 @@ def _tasks():
     return out
 
 
+def pytest_configure(config):
+    """Session warm-up (approved, BM1): torch's process-lifetime pools exist before the first test, so a test is not
+    charged with the pools a library starts on first use (diag_threads.py, 3090: three unnamed native threads at the
+    first CPU parallel op -- nn.Linear's kaiming init --, one at the first CUDA context). No thread is let off by name.
+    One CPU parallel op, and on a CUDA host one CUDA context; the pools' sizes are printed into the log's head.
+    Nothing in the tests depends on the parent process not having initialised CUDA (checked: every multiprocessing use
+    in tests/ and isaac_bridge/ is 'spawn'; os.fork only in tok_floor's worker code, run in spawned workers, which the
+    tests only read as source; subprocess.run execs)."""
+    import sys
+    t0 = _tasks()
+    try:
+        import torch
+    except ImportError:
+        return
+    if t0 is None:
+        return
+    py = lambda: {t.native_id for t in threading.enumerate()}   # noqa: E731
+    t0 = _tasks()
+    torch.nn.Linear(256, 256)                                # (the first CPU parallel op: the intra-op pool)
+    float((torch.randn(256, 256) @ torch.randn(256, 256)).sum())
+    t1 = _tasks()
+    cuda = torch.cuda.is_available()
+    if cuda:
+        torch.zeros(1, device='cuda')                        # (the CUDA context and its threads)
+        torch.cuda.synchronize()
+    t2 = _tasks()
+    p = py()
+    cpu_new = sorted(n for k, n in t1.items() if k not in t0 and k not in p)
+    cuda_new = sorted(n for k, n in t2.items() if k not in t1 and k not in p)
+    print(f'B62 conftest warm-up: CPU parallel pool {len(cpu_new)} native thread(s) {cpu_new}; CUDA context '
+          + (f'{len(cuda_new)} native thread(s) {cuda_new}' if cuda else 'skipped (no CUDA)')
+          + f'; process threads now {len(t2)}', file=sys.stderr, flush=True)
+
+
 def _stop(d):
     for name in ('lanes_stop', 'pause', 'stop'):
         try:
