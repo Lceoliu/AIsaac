@@ -14,6 +14,8 @@ a main version change between rounds (the generations' order), a job the graphs 
 in Python, its decisions back to the native lineage). The window rule itself: test_window_rule_matches_python.
 Skipped without the extension (no CUDA torch, no g++, ISAAC_BLOCK_CPP_ACTOR=0)."""
 import copy
+import select
+import socket
 import threading
 import time
 from types import SimpleNamespace
@@ -62,7 +64,7 @@ def lane_sampler():
     return s
 
 
-def world(native):
+def world(native, lane_pipes=False):
     torch.manual_seed(77)
     m = make_policy('cuda').eval()
     m1 = copy.deepcopy(m)
@@ -112,11 +114,14 @@ def world(native):
                   kept=int(s.block_arrays[4].ctypes.data), kept_cols=4, cf_snap=int(s.cf_snap.ctypes.data))
         cfg_l = dict(lanes=W, tw=int(s.lane_t.shape[1]), wait=0.0, quiet=0.0, active_s=float(ACTIVE_S), defer_s=float(svc.DEFER_S),
                      reclaim_s=0.0, pid=TAG)
-        d.lanes_configure(cfg_l, sh, [], int(stream.stream_id), [int(svc.actors[g].step_graph.owner) for g in (0, 1)],
+        pipes = [socket.socketpair() for _ in range(W)] if lane_pipes else []
+        w_pipes = pipes
+        d.lanes_configure(cfg_l, sh, [a_.fileno() for a_, _ in pipes], int(stream.stream_id), [int(svc.actors[g].step_graph.owner) for g in (0, 1)],
                           [int(svc.actors[g].base) for g in (0, 1)])
         svc.attach_driver(d)
         svc.attach_native_lanes(d, stream)
         w.stream = stream
+        w.pipes = w_pipes
     return w
 
 
@@ -339,3 +344,54 @@ def test_policy_version_guard():
         check_versions(d, main)
     d.set_version(5)
     check_versions(d, main)
+
+
+def test_native_lanes_only_mode_matches_the_harness():
+    """d1 while the actor waits for the learner: the driver in main_hold runs the lane passes itself, the requests
+    through the lanes' pipes (real socketpairs), each round's messages sent while the driver is paused (one round);
+    the answers equal the harness's (lane_test_tick, itself equal to the Python service)."""
+    H, D = world(True), world(True, lane_pipes=True)
+    for w in (H, D):
+        w.defer = 1e9
+        capture(w, 0, 0, 0); capture(w, BANK, 1, 0); capture(w, 2*BANK, 2, 1)
+    D.d.start(); D.d.set_main_hold(True)
+    rng = np.random.default_rng(93)
+    seq = [500]
+    msg = b'\x00\x00\x00\x010'
+    try:
+        for k, reqs in enumerate(([(0, 1), (1, BANK+1), (2, 2*BANK+1)], [(0, 0), (1, 0), (2, 0)], [(0, 0), (2, 0)],
+                                  [(1, 0), (2, 0)])):
+            rows = synth_rows(rng, len(reqs)); rows['first'] = 0; rows['episode'] = 7
+            pend = synth_pending(rng, len(reqs), H.m.heads)
+            D.d.pause()
+            for i, (lane, begin) in enumerate(reqs):
+                for w in (H, D):
+                    w.s.lane_rows[lane] = rows[i]; w.s.lane_io[lane, :5] = pend[i]; w.s.lane_io[lane, 10] = seq[0]
+                    if begin:
+                        w.s.lane_io[lane, 11] = begin
+                H.d.lane_test_intake(lane, 1.0+k)
+                D.pipes[lane][1].sendall(msg)
+                seq[0] += 1
+            D.d.resume()
+            native_tick(H, 1.0+k)
+            waiting = {D.pipes[lane][1]: lane for lane, _ in reqs}
+            t0 = time.perf_counter()
+            while waiting:   # (the replies; lane records answered meanwhile)
+                rd, _, _ = select.select(list(waiting), [], [], 0.01)
+                for sk in rd:
+                    got = b''
+                    while len(got) < 5:
+                        got += sk.recv(5-len(got))
+                    assert got == b'\x00\x00\x00\x01a'
+                    del waiting[sk]
+                rec = D.d.next_record(0.0)
+                if rec is not None:
+                    assert int(rec['lane_src']) == 1, rec['kind']
+                    D.svc.on_native_lane_record(rec)
+                assert time.perf_counter()-t0 < 60, 'lanes-only answers missing'
+            np.testing.assert_array_equal(H.s.lane_io[:, 5:10], D.s.lane_io[:, 5:10], err_msg=f'round {k}')
+            np.testing.assert_array_equal(H.s.lane_out, D.s.lane_out, err_msg=f'round {k}')
+            np.testing.assert_array_equal(H.s.lane_t, D.s.lane_t, err_msg=f'round {k}')
+    finally:
+        D.d.set_main_hold(False); D.d.pause(); D.d.stop()
+    assert D.d.last_error() == '' and D.d.lane_error() == ''
