@@ -72,8 +72,16 @@ def main():
     def ranges(text):
         rows = c.execute('select start, end, text, textId from NVTX_EVENTS where end is not null').fetchall()
         return sorted((a, b) for a, b, t, tid in rows if (t or names.get(tid)) == text)
-    upd = ranges('learner.update') or ranges('B60bench')   # (the bench: its captured rep)
-    wait = union([list(x) for x in ranges('h.wait_learner')])
+    upd = ranges('learner.update')
+    bench = not upd
+    if bench:   # (the bench: its captured rep; no actor, so no h.wait_learner: measure 1 is the rep's whole idle)
+        upd = ranges('B60bench')
+    wait_r = ranges('h.wait_learner')
+    wait = union([list(x) for x in wait_r]) if not bench else [list(x) for x in upd]
+    print(f"intervals matched: {'B60bench' if bench else 'learner.update'} {len(upd)}, "
+          f"h.wait_learner {len(wait_r)}{' (bench: the rep itself stands for it)' if bench else ''}, "
+          f"learner.forward_packed {len(ranges('learner.forward_packed'))}, learner.spatial "
+          f"{len(ranges('learner.spatial'))}")
     fwd = union([list(x) for x in ranges('learner.forward_packed')])
     gpu = []
     for t in ('CUPTI_ACTIVITY_KIND_KERNEL', 'CUPTI_ACTIVITY_KIND_MEMCPY', 'CUPTI_ACTIVITY_KIND_MEMSET'):

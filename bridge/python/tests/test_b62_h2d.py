@@ -25,6 +25,8 @@ def test_pinned_h2d_bytes_reuse_and_lifetime(device, slots):
         assert o.dtype == torch.from_numpy(r).dtype and tuple(o.shape) == r.shape
         assert o.cpu().numpy().tobytes() == r.tobytes()
     if device == 'cuda':
+        for _ in range(slots):   # (every slot once at the largest size first: then nothing more is allocated)
+            h(refs[-1])
         allocs = h.allocs
         for _ in range(10):
             h(refs[-1])
