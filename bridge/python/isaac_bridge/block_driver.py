@@ -93,7 +93,8 @@ def record_rows(rec, ROW):
 DRV_FIELDS = ('drv_pause_s', 'drv_pauses', 'drv_lane_jobs', 'drv_lane_rows', 'drv_merged_rows', 'drv_merged_calls',
               'drv_lane_calls', 'drv_captures', 'drv_lane_python', 'drv_lane_s', 'drv_lane_hist',
               'drv_py_lane_rounds', 'drv_py_lane_rows', 'drv_py_lane_flushed_rows', 'drv_py_lane_share',
-              'drv_lane_deferred_requests', 'drv_lane_orphan_requests')
+              'drv_lane_deferred_requests', 'drv_lane_orphan_requests', 'drv_steps', 'drv_sync_s', 'drv_pages_s', 'drv_host_s',
+              'drv_cap_holds')
 
 
 def collect_counters(c0, c1, handoff, stat, py_mark):
@@ -104,8 +105,10 @@ def collect_counters(c0, c1, handoff, stat, py_mark):
     d = {k: c1[k]-c0[k] for k in c1 if not isinstance(c1[k], (list, tuple))}
     stat['drv_pause_s'] = max(0.0, d['pause_s']-handoff)
     stat['drv_pauses'] = d['pauses']
-    for k in ('lane_jobs', 'lane_rows', 'merged_rows', 'merged_calls', 'lane_calls', 'captures', 'lane_python', 'lane_s'):
+    for k in ('lane_jobs', 'lane_rows', 'merged_rows', 'merged_calls', 'lane_calls', 'captures', 'lane_python', 'lane_s',
+              'steps', 'sync_s', 'pages_s', 'host_s'):
         stat['drv_'+k] = d[k]
+    stat['drv_cap_holds'] = d.get('cap_holds', 0)   # (B57: main steps' host / GPU-wait / page seconds, held records)
     stat['drv_lane_hist'] = '/'.join(str(b-a) for a, b in zip(c0['lane_hist'], c1['lane_hist']))
     # the lane rows the Python path stepped since the last collect (the actor waiting for the learner: rounds on the
     # Python path, the round in flight flushed), their share of all lane rows

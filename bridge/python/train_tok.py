@@ -4713,14 +4713,20 @@ def main(argv=None, child=None, actor=None):
 
     def wait_learner():
         # (teacher v2: the lanes are answered meanwhile; their poll releases the GIL)
+        nv.push('h.wait_learner')   # (B57 measurement ranges: no-ops without ISAAC_BLOCK_NVTX=1)
         while not fresh.wait(0.0 if v2_on else 0.5):
             if lanes is not None:   # (B36: a round with its window, to its answer)
                 lanes.serve_wait(0.005)
             if failure or not learner.is_alive() or (actor_b is not None and not actor_b.is_alive()):
                 break
+        nv.pop()
         if lanes is not None:   # (B36: no lane call runs while the weights change)
+            nv.push('h.quiesce')
             lanes.quiesce()
+            nv.pop()
+        nv.push('h.take_weights')
         take_weights()
+        nv.pop()
 
     aux = sampler.aux   # Phase B2 (branches): the actor's value, log-probability and choice outputs per worker
     from isaac_bridge.tok_branch import AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_USED
@@ -4976,7 +4982,9 @@ def main(argv=None, child=None, actor=None):
                     rec_ = cpp_driver.next_record(0.002)
                     prof_['poll'] += time.perf_counter() - ta_
                     if rec_ is not None:
+                        nv.push('c.record')
                         consume_record(rec_, prof_)
+                        nv.pop()
                     if lanes.driver is not None:   # B54: the lane rounds go to the driver; the tick never pauses it
                         drain_driver(prof_)   # (the queued records first: their CF captures make the points branches begin at)
                         _lane_tick(prof_)
@@ -4987,7 +4995,9 @@ def main(argv=None, child=None, actor=None):
                     if rec_ is None and cpp_driver.is_paused() and cpp_driver.queue_size() == 0:
                         cpp_driver.resume()   # (a capture request / a Python-stepped lane job was answered)
                 c1_ = cpp_driver.counters()
+                nv.push('h.pause_drain')
                 cpp_driver.pause(); drain_driver(prof_)
+                nv.pop()
                 drv_paused_at[0] = time.perf_counter()
                 # B54 counters of this collect: the driver's paused seconds (the hand-off's pause before this collect's
                 # resume excluded), lane jobs / rows, merged rows and calls, lane-only calls, run-time captures
@@ -5004,7 +5014,9 @@ def main(argv=None, child=None, actor=None):
                           f"{c_['steps']} steps", flush=True)
 
             if cpp_driver is not None:
+                nv.push('actor.collect')   # (B57: the collect window, for the learner's per-window speeds)
                 run_driver_collect(prof)
+                nv.pop()
             while cpp_driver is None and roll.usable() < rollout_actor and sampler.live and not stopped():
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
                     if block_actor is None:
@@ -5209,6 +5221,7 @@ def main(argv=None, child=None, actor=None):
                     lab['sched'].note_seen(held)
                 book.seen_inv = []
                 post_lab_jobs()
+            nv.push('h.job')
             job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
                        **lab_job,
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
@@ -5225,6 +5238,7 @@ def main(argv=None, child=None, actor=None):
                     record_b=job.get(kind_b)
                     if record_b is not None:
                         job[kind_b]=record_b[:2]+(pack_snapshots(record_b[-1]),)
+            nv.pop()
             proc_now = time.process_time()
             job['proc_cores'] = (proc_now - proc_mark) / max(job['cycle_s'], 1e-9)
             proc_mark = proc_now
@@ -5232,7 +5246,9 @@ def main(argv=None, child=None, actor=None):
             if block_actor is not None and hasattr(block_actor,'store'):
                 # A1 leases: free page rows/sources no rollout, teacher buffer, point, lane or slot can read.
                 t_gc = time.perf_counter()
+                nv.push('h.gc')
                 gc_b = block_actor.store.collect()
+                nv.pop()
                 lane_stat['block_gc_s'] = time.perf_counter()-t_gc
                 lane_stat['block_kv_rows'], lane_stat['block_blocks'], lane_stat['block_raw_rows'] = (
                     gc_b['kv'], gc_b['blocks'], gc_b['raw'])
