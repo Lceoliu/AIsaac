@@ -635,6 +635,7 @@ def forward_packed(model, chunks, generator=None, train_history=True, version=0,
             P = _prepare_packed(model, chunks, grad, **kw)
     wait = time.perf_counter()-t0   # (B60: host packing on the learner's critical path)
     bp.ucount('learn_pack_crit_s', wait)
+    bp.ucount('learn_pack_crit_grad_s' if grad else 'learn_pack_crit_nograd_s', wait)   # (PPO / recompute and others)
     if CRIT_LOG is not None:
         CRIT_LOG.append((bool(grad), wait, hit))
     return _run_packed(model, P)
