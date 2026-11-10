@@ -153,12 +153,19 @@ def child(case, mode, replays):
                     gq.capture_end()
             held['gq'], held['yq'] = gq, yq
         torch.cuda.synchronize(sdev)
-    go, done, side = threading.Event(), threading.Event(), {}
+    go, done, warmed, side = threading.Event(), threading.Event(), threading.Event(), {}
 
     def worker():
+        torch.cuda.set_device(sdev)
+        if base == 'capture':   # (this thread's own cuBLAS handle / workspace and warm-up before any capture, as the
+            s_s = torch.cuda.Stream(device=sdev)   # actor thread has before its captures)
+            with torch.cuda.stream(s_s):
+                for _ in range(2):
+                    held['body_s'](held['x_side'])
+            torch.cuda.synchronize(sdev)
+        warmed.set()
         go.wait()
         try:
-            torch.cuda.set_device(sdev)
             if base == 'query':
                 side['value'] = bool(ev.query())
             elif base == 'sync':
@@ -195,7 +202,6 @@ def child(case, mode, replays):
                     e.synchronize()
                 del job
             elif base == 'capture':
-                s_s = torch.cuda.Stream(device=sdev)
                 gs = torch.cuda.CUDAGraph()
                 with torch.cuda.stream(s_s):
                     gs.capture_begin(capture_error_mode=mode)
@@ -210,6 +216,7 @@ def child(case, mode, replays):
         done.set()
     t = threading.Thread(target=worker, daemon=True)
     t.start()
+    warmed.wait(60)
     x_i = ins[0].clone()
     s_i = torch.cuda.Stream(device=0)
     try:
