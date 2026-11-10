@@ -189,6 +189,16 @@ def run_batch(m, W, K, rows, ev_max, target=-1):
     return ev, cnt, book, rolls[0], got
 
 
+def same_rollout(a, b):
+    """test_b58_native_consumer.same_rollout without the privileged rows (none here)"""
+    for name in ('pending', 'actions', 'logp', 'value', 'value_g', 'reward', 'terminal', 'version', 'boot', 'close_hurt',
+                 'close_done', 'close_ev', 'length', 'open'):
+        np.testing.assert_array_equal(getattr(a, name), getattr(b, name), err_msg=name)
+    np.testing.assert_array_equal(a.rows.view(np.uint8), b.rows.view(np.uint8), err_msg='ROWC records')
+    assert a.frames.used == b.frames.used
+    np.testing.assert_array_equal(a.frames.buf[:a.frames.used], b.frames.buf[:b.frames.used], err_msg='frames')
+
+
 def same_finished(fa, fb):
     """the finished episodes' summaries equal (a NaN equals a NaN: the snapshots were compared bitwise already)"""
     import math
@@ -203,7 +213,6 @@ def same_finished(fa, fb):
 
 
 def test_batch_matches_per_record_one_worker():
-    from test_b58_native_consumer import same_rollout
     torch.manual_seed(41)
     m = make_policy('cuda').eval()
     K = 50
