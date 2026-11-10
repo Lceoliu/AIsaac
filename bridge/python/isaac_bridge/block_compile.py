@@ -199,9 +199,15 @@ def warm_spatial(learner=None, actors=(), bf16=True):
     from .structured_input import BUCKETS, canvas_decoder
     before = STATS['compiles']
     combos = [(p, e) for e in BUCKETS['entity'] for p in BUCKETS['body']]
-    model0 = learner if learner is not None else (actors[0] if actors else None)
-    if model0 is not None:
-        dev = next(model0.parameters()).device
+    # the canvas decoder on every device that runs it: the learner's and the actors' (BM1: with --learner-device the
+    # actor's GPU differs and its first decode was a steady compile, the device being part of the compiled graph's
+    # guards; split-mb427b8d / split2: block_steady_compiles 1 from u1)
+    devs = []
+    for m_ in ((learner,) if learner is not None else ())+tuple(actors):
+        d_ = next(m_.parameters()).device
+        if d_ not in devs:
+            devs.append(d_)
+    for dev in devs:
         with torch.inference_mode(False), torch.no_grad(), torch.autocast('cuda', enabled=False):
             for p in BUCKETS['body']:
                 for n in (3, 6):

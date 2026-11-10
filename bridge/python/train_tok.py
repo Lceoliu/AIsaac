@@ -5646,8 +5646,16 @@ def main(argv=None, child=None, actor=None):
             while not stop_ev.wait(1.0) and parent_a.is_alive():
                 pass
     finally:
-        if cpp_driver is not None:   # (B52)
-            cpp_driver.stop()
+        # BM1 (decision a): the shutdown runs to its end whatever SIGINT arrives meanwhile, and the interrupt is
+        # raised again once everything is closed. Before: a SIGINT while this block waited for the learner's last
+        # update (wait_learner below) skipped the learner's join and last.pt's save; the interpreter then finalised
+        # under a running backward (pt_autograd_1 taken by pthread_exit -> std::terminate, rc 134; split-mb427b8d).
+        # Order: the learner's current update ends and it is joined (with the learner prefetch worker), then the
+        # driver stops (B52: it stopped first before).
+        import signal as signal_
+        deferred_int = []
+        prev_int = (signal_.signal(signal_.SIGINT, lambda *a_: deferred_int.append(1))
+                    if threading.current_thread() is threading.main_thread() else None)
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
             # (2026-11-05: past this point nobody needs what is still unsent: a clean end has seen the stop, which comes after
@@ -5691,12 +5699,17 @@ def main(argv=None, child=None, actor=None):
             torch.cuda.synchronize()
         else:
             learner.join(timeout=900)
+            if block_on:   # (BM1: the learner prefetch worker stopped too, after the learner's last part)
+                from isaac_bridge import block_learner as blearn_end
+                blearn_end.PREFETCH.close()
             torch.cuda.synchronize()
             if split:   # (B38: the learner's GPU too)
                 torch.cuda.synchronize(ldev)
             save(out / 'checkpoints' / 'last.pt')
             if slog is not None:
                 slog.close()
+        if cpp_driver is not None:   # (B52; BM1: after the learner's end)
+            cpp_driver.stop()
         sampler.close()
         if log_file is not None:
             log_file.close()
@@ -5715,8 +5728,15 @@ def main(argv=None, child=None, actor=None):
         if actor is None:
             print('finished', L['update'], 'updates', round(L['decisions'] * hours_per_decision, 1), 'game hours',
                   round((time.perf_counter() - t_run) / 3600, 2), 'h')
+        if prev_int is not None:   # (BM1: the SIGINT held during the shutdown, raised now)
+            signal_.signal(signal_.SIGINT, prev_int)
+        if deferred_int:
+            print(f'BM1 shutdown: {len(deferred_int)} SIGINT held until the learner was joined, last.pt saved and the '
+                  f'driver stopped', flush=True)
         if failure:
             raise failure[0]
+        if deferred_int:
+            raise KeyboardInterrupt
 
 
 if __name__ == '__main__':
