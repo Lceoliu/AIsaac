@@ -39,6 +39,11 @@ def pair():
     A, B = world(False), world(True, lane_pipes=True)
     A.defer = 1e9
     B.d.set_fixed_uniform(0.5)
+    # (the driver's main stream a stream of its own, as train_tok's actor stream: on the legacy default stream every
+    # launch would wait for the lane stream's work, and the restore order control below could not fail)
+    B.main_stream = torch.cuda.Stream()
+    B.d.set_stream(int(B.main_stream.stream_id), int(torch.cuda.current_device()))
+    torch.cuda.synchronize()
     B.d.set_m1_merge(True)   # (off by default until M1's gate)
     B.d.set_m1_hold(True); B.d.set_m1_test_capture(True)
     return A, B
@@ -193,6 +198,7 @@ class Script:
                 main_out = A.main.host_output.copy()
             A.fake.run()
         A.svc.tick()   # (A: control, the round finished)
+        A.svc.service_control()   # (B's driver keeps running lane passes after the round: its reclamation after the finish)
         if send_main:   # (B: the main row; its batch takes the waiting job or runs it lane-only after its reply)
             s_ = B.ms
             s_.rows[2*MAIN+self.slot] = mrow[0]
@@ -204,6 +210,7 @@ class Script:
             self.slot ^= 1
             np.testing.assert_array_equal(r0['out'].numpy(), main_out, err_msg=f'round {self.k}: main row')
         replies(B, [q for q, *_ in reqs])
+        time.sleep(0.05)   # (B's next lane passes: the reclamation after the finish)
         compare(A, B, self.k)
         return B.d.counters()
 
