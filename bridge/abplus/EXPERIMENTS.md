@@ -10460,3 +10460,78 @@ B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都�
 - 若 A1 的 B60 把 learner 的 host 打包和解码移出 GIL，learner 侧还会再降。
 
 **7. prio 与 stale_share**：见 B54 节。prio 不设为默认；stale_share 为 1.00，是 actor 更快之后滞后一个版本被用满。
+
+### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
+
+#### 实验目的
+
+B60的忙线程对照显示：其他线程占着GIL时，learner的前向、反向、优化器从约7 s涨到约52 s。瓶颈是learner线程上的Python派发次数乘以切换间隔，不是打包。
+
+B62分步减少learner线程的Python层调用和关键路径上的host工作：
+- 步骤0：在合并树（主线B53–B60 + cpp-actor步骤0）上量C++路径的基线、各线程的GIL持有/等待，并扫描切换间隔；
+- 步骤1：N5，减少前向/反向/无梯度调用里的Python层torch调用；
+- 步骤2：teacher构建移出关键路径；
+- 步骤3：N3 + N4（页gather和索引表进C）；
+- 步骤4：fused Adam开关（只报数）。
+
+总门槛（合并树、C++路径、16个update）：
+- learner线程Python CPU（uc_*合计）≤ 3.0 s/update；
+- 步骤1–3之后update ≤ 16 s。
+
+禁令照旧：micro 8192，不减输入、模型、teacher、CF、lane预算，不丢行；job结构和BlockRollout载荷冻结。
+
+#### 实验方法
+
+- 合并：cpp-actor步骤0的提交9757566（已含4241254）合并进exp/block-memory-v1（498dec8）。
+  - 冲突在三处：`_prepare_packed`（B60的packed覆盖 + B50的nvtx范围）、`learn()`计时（B60的uc_/uo_ + B50的nvtx段）、EXPERIMENTS.md（两边的节都保留）。
+  - 9757566之后的B58a+b提交不合并。
+- `ISAAC_SWITCH_INTERVAL_US`：设置train_tok `--switch-interval`的默认值，未设时500 µs，行为不变。
+- `bridge/ops/b62_step0.sh`（GPU_LOCK原子取锁，各阶段各自取锁）：
+  - G：全量门；
+  - P：16个update的C++路径profile（prof2.sh，18.3游戏小时，与run_b54p.sh的cpp相同，500 µs）；
+  - N：nsys nvtx + python-gil，交接2..7（run_b50m.sh的命令，不做Python采样），同时用b57_threads.py采样；之后在锁外用b57_nsys.py分析；
+  - W100、W50：切换间隔100 / 50 µs的同口径profile。
+- 基准的op计数按调用方栈帧归因（`b44_learner_bench.py --opcount`，阶段O）。
+- 步骤4的数值比较：`--adam-compare`，从dump权重各重放一次update：默认Adam两次、fused一次（阶段F）。
+
+#### 实验结果
+
+步骤0（4090，2026-11-10 16:33–17:29，合并树b62a，C++路径）：
+- 全量门241 passed、2 skipped。
+
+| profile（u2–u16中位） | collect s | update s | ×实时 | 游戏小时 | uc_*合计 s |
+|---|---:|---:|---:|---:|---:|
+| prof-b58-s0（cpp步骤0，参考） | 12.49 | 21.88 | 196.6 | 18.40 | — |
+| prof-b54-cpp（参考） | 13.38 | 21.34 | 203.9 | 18.40 | — |
+| **prof-b62-cpp（合并树，500 µs）** | 14.04 | **20.33** | **212.7** | 19.48 | 8.07 |
+| prof-b62-sw100（100 µs） | 13.92 | 20.07 | 215.4 | 19.47 | 8.06 |
+| prof-b62-sw50（50 µs，只有15个update：u2–u15） | 14.90 | 19.20 | 227.8 | 18.43 | 7.97 |
+
+- 合并树里，B54 + B60同口径的update为20.3 s（预期约19.4 s），比cpp步骤0的21.9 s少1.6 s；×实时196.6 → 212.7。update仍是周期瓶颈（collect 14 s）。
+- 分段（prof-b62-cpp，wall / learner线程CPU）：u_ppo 14.74 / 3.54，u_recompute 2.41 / 1.45，u_teach_build 1.68 / 1.59，u_opt 1.03 / 1.00，u_teach_new — / 0.27。关键路径打包0.74 s。稳态重编译为0。
+- 切换间隔：
+  - 100 µs与500 µs在噪声内；
+  - 50 µs时update −1.1 s、collect +0.9 s、×实时 +7%。
+  - 都是单次run，run间差别没有量，结论需要重复确认。默认值不改，由协调方定。
+- GIL（nsys，prof-b62-gil，窗口104 s、5个周期；每周期持有 / 等待，单位s）：
+
+| 线程 | 持有 | 等待 |
+|---|---:|---:|
+| 主线程（actor / 消费者） | 7.13 | 4.02 |
+| learner | 2.15 | 3.76 |
+| pt_autograd_0（反向） | 1.54 | 2.58 |
+| python（未命名，持有最多的那个，推测是learner-prefetch） | 1.34 | 1.92 |
+| python（另一个） | 0.02 | 0.08 |
+
+  - 预取线程在OS里没有线程名，还无法确认身份；步骤1会给它设名字。
+  - actor每周期等learner 7.56 s（h.wait_learner），collect本身13.1 s。
+  - learner.forward_packed在actor采集期间平均366 ms，在actor等learner期间平均233 ms；after_teach_build对应为1212 / 730 ms。也就是说，与采集重叠时learner的这些段慢了约1.5倍。
+- Python层调用归因（基准，每个PPO part前向约14.6k次；下面是15个part的合计）：
+  - 非重入checkpoint的pack_hook元数据：45k；`torch.no_grad`/grad开关的进出：30k；add_device_types / get_rng_state等：10k。合计约85k，大头是checkpoint。
+  - Inductor生成代码里，每个Triton kernel的Python launcher（`nvidia/driver.py __call__`）：38k；`copy_misaligned_inputs`：5.5k。
+  - AOTAutograd运行时包装（逐参数genexpr）：21k；dynamo入口：9k。
+  - 本项目代码：structured_input.compile_inputs 6k、read_flex 5k、block_compile的mark / genexpr 6k、packed_rows_apply 2.5k。
+  - 优化器（每步3.7k）：Adam `_init_group` 18k、clip_grad_norm的列表推导 18k、zero_grad 7k、`_get_value` 7k。
+- 步骤4（先量）：
+  - 基准opt阶段：默认0.146 / 0.135 s，fused 0.124 s。
+  - 一次update后的参数差：默认对默认（run间）最大4.0e-6，fused对默认4.0e-6，最差的都是query_norm.bias等接近0的偏置。按参数自身量级算的ulp都在5.5万左右。fused与默认的差别和run间波动分不开。
