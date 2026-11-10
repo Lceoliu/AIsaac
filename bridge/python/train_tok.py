@@ -297,6 +297,46 @@ OPCOUNT = _OpCount() if os.environ.get('ISAAC_LEARN_OPCOUNT') == '1' else None
 # memory, non-blocking (the same bytes; the learner thread goes on queueing work). Default off until reviewed.
 ASYNC_H2D = os.environ.get('ISAAC_LEARN_ASYNC_H2D', '0') == '1'
 
+
+class PinnedH2D:
+    """B62: host -> device copies of small arrays through persistent pinned buffers (ISAAC_LEARN_ASYNC_H2D). `slots`
+    buffers in turn; a buffer is rewritten only after the copy that last read it has finished (its CUDA event, waited
+    on only if still pending: with 2+ slots that copy was queued at least one call earlier). The buffer is held by this
+    object from its allocation to the end of the run; it grows (reallocated, x1.5) only when an array is larger, so a
+    steady run allocates nothing per step. Counters: allocations, bytes pinned, event waits that blocked."""
+    def __init__(self, device, slots=2):
+        self.device, self.slots = device, int(slots)
+        self.bufs = [None]*self.slots   # [pinned uint8 tensor, event of its last copy]
+        self.events = [None]*self.slots
+        self.k = 0
+        self.allocs = self.pinned_bytes = self.waits = 0
+
+    def __call__(self, a):
+        import torch   # (train_tok imports torch inside main)
+        a = np.ascontiguousarray(a)
+        if self.device.type != 'cuda':
+            return torch.from_numpy(a.copy()).to(self.device)
+        k = self.k
+        self.k = (k+1) % self.slots
+        ev = self.events[k]
+        if ev is not None and not ev.query():
+            self.waits += 1
+            ev.synchronize()
+        buf = self.bufs[k]
+        if buf is None or buf.numel() < a.nbytes:
+            n = max(int(a.nbytes*1.5), 4096)
+            self.pinned_bytes += n-(0 if buf is None else buf.numel())
+            buf = self.bufs[k] = torch.empty(n, dtype=torch.uint8, pin_memory=True)
+            self.allocs += 1
+        host = buf[:a.nbytes].view(torch.from_numpy(a[:0]).dtype).view(a.shape) if a.nbytes else             torch.from_numpy(a.copy())
+        if a.nbytes:
+            host.numpy()[...] = a
+        out = host.to(self.device, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self.events[k] = ev
+        return out
+
 def cpu_ticks():
     """(busy, total) jiffies of all CPUs from /proc/stat ((0, 0) where there is none)."""
     try:
@@ -2283,6 +2323,7 @@ def main(argv=None, child=None, actor=None):
     nh = len(learner_model.heads)
     fused = bool(args.fused_adam) or bool(args.learner_fast)   # (B18: --learner-fast 1 implies the fused Adam)
     # (Phase B2: the choice heads are not PPO's: main_parameters() is parameters() without them, in the same order)
+    h2d_teach = PinnedH2D(lm_dev) if ASYNC_H2D else None   # (B62: the teacher meta's pinned buffers, held by the run)
     opt = torch.optim.Adam(learner_model.main_parameters(), lr=args.lr, eps=1e-5,
                            **(dict(fused=True) if fused else {}))
     copt = torch.optim.Adam(learner_model.choice.parameters(), lr=args.choice_lr) if n_choice else None
@@ -3748,8 +3789,7 @@ def main(argv=None, child=None, actor=None):
                         pick_d = dev(pick)
                         meta = t_meta.index_select(0, pick_d)
                     elif ASYNC_H2D:   # B62: pinned, asynchronous: no wait for the previous step's GPU work here
-                        meta = torch.from_numpy(np.ascontiguousarray(teach_meta[pick])).pin_memory().to(
-                            device, non_blocking=True)
+                        meta = h2d_teach(teach_meta[pick])
                         pick_d = None
                     else:
                         meta = torch.from_numpy(teach_meta[pick]).to(device)
@@ -4221,6 +4261,8 @@ def main(argv=None, child=None, actor=None):
             row.update(aux_log)
         row.update({f'u_{k}': v for k, v in U.items()})
         row.update({f'uc_{k}': v for k, v in UC.items()})   # (B60)
+        if h2d_teach is not None:   # (B62: the teacher meta's pinned staging: allocations, bytes, blocking waits)
+            row.update(h2d_allocs=h2d_teach.allocs, h2d_pinned_mb=h2d_teach.pinned_bytes/2**20, h2d_waits=h2d_teach.waits)
         if UO is not None:
             row.update({f'uo_{k}': v for k, v in UO.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)

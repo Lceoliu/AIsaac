@@ -904,6 +904,16 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
                 unique=unique, version=version)
 
 
+def _spatial_segment(model, part):
+    """model.encode_block(part) inside an NVTX range 'learner.spatial' (B62: the B2 measurement of the Spatial
+    segments' dispatch gaps; the forward and the backward's recomputation; a no-op without ISAAC_BLOCK_NVTX)."""
+    nv_push('learner.spatial')
+    try:
+        return model.encode_block(part)
+    finally:
+        nv_pop()
+
+
 def _run_packed(model, P):
     """B48: forward_packed's device part on a prepared part P (_prepare_packed): one upload, Spatial,
     Writer, Reader and heads."""
@@ -931,9 +941,9 @@ def _run_packed(model, P):
     for g, names, T, m in plans:
         part = packed_rows_apply(batch, {k: di[f'sp{g}:{k}'] for k in names}, T)
         if grad and SPATIAL_CKPT and m > 0:
-            zs.append(checkpoint(model.encode_block, part, **CKPT_KW)[:m])
+            zs.append(checkpoint(_spatial_segment, model, part, **CKPT_KW)[:m])
         else:
-            zs.append(model.encode_block(part)[:m])
+            zs.append(_spatial_segment(model, part)[:m])
     z_all = (torch.cat(zs) if len(zs) > 1 else zs[0]).index_select(0, di['sp:inverse'])
     encoded = z_all[:n_main]
     zdt = z_all.dtype

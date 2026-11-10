@@ -341,7 +341,13 @@ def main():
                     import cProfile
                     prof = cProfile.Profile(); prof.enable()
                 done = busy_threads(busy_v) if busy_v else None
+                mark = os.environ.get('ISAAC_BENCH_NVTX_REP') == str(i)   # (B62: the nsys capture range)
+                if mark:
+                    torch.cuda.nvtx.range_push('B60bench')
                 r = replay(model, opt, calls, a.mode == 'packed', seed=i, pipeline=bool(pipe_v))
+                if mark:
+                    torch.cuda.synchronize()
+                    torch.cuda.nvtx.range_pop()
                 if done is not None:
                     r['busy_spins'] = done()
                 if prof is not None:

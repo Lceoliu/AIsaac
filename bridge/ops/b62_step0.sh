@@ -73,8 +73,14 @@ for S in "$@"; do
     kill $THR 2>/dev/null
     echo "$(date '+%F %T') $TAG done, $(grep -h 'B62 CUDA scheduling' $R/$TAG.stdout | head -1)" >> $LOG
     ;;
+  NB)   # (the bench's second rep under nsys cuda + nvtx: B2 measures 1 and 2, bench口径)
+    TAG=b62-bench-cuda
+    cd $OPS
+    ISAAC_BLOCK_NVTX=1 ISAAC_BENCH_NVTX_REP=1 OMP_NUM_THREADS=1 timeout 840 /usr/local/cuda/bin/nsys profile -t cuda,nvtx       --sample=none --cpuctxsw=none --capture-range=nvtx --nvtx-capture=B60bench -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0       --capture-range-end=stop -o $R/$TAG.nsys-rep --force-overwrite true $PY b44_learner_bench.py       $R/b48-dump/learner_inputs.pt --mode packed --reps 2 --variants n1p1b0 > $R/$TAG.log 2>&1
+    echo "$(date '+%F %T') NB nsys done rc=$? $(ls -la $R/$TAG.nsys-rep 2>/dev/null | awk '{print $5}') bytes" >> $LOG
+    ;;
   NC)   # (nsys cuda + nvtx over hand-offs 2..4, the C++ path: the GPU idle on the learner's critical path)
-    TAG=prof-b62-cuda
+    TAG=${NCTAG:-prof-b62-cuda}
     OUT=$R/$TAG
     cd $ROOT/$CODE/bridge/python
     export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
@@ -144,10 +150,11 @@ for S in "$@"; do
     ;;
   esac
   give $S
-  if [ $S = NC ]; then   # (CPU only, after the lock)
-    python3 $OPS/b62_gpu_idle.py $R/prof-b62-cuda.nsys-rep > $R/prof-b62-cuda.idle.txt 2>&1
-    echo "$(date '+%F %T') NC analysis rc=$? $(tail -2 $R/prof-b62-cuda.idle.txt | tr '
-' ' ' | cut -c1-300)" >> $LOG
+  if [ $S = NC ] || [ $S = NB ]; then   # (CPU only, after the lock)
+    T_=${NCTAG:-prof-b62-cuda}; [ $S = NB ] && T_=b62-bench-cuda
+    python3 $OPS/b62_gpu_idle.py $R/$T_.nsys-rep > $R/$T_.idle.txt 2>&1
+    echo "$(date '+%F %T') $S analysis rc=$? $(tail -3 $R/$T_.idle.txt | tr '
+' ' ' | cut -c1-400)" >> $LOG
   fi
   if [ $S = N ]; then   # (CPU only, after the lock)
     python3 $OPS/b57_nsys.py $R/prof-b62-gil.nsys-rep $R/prof-b62-gil.threads.csv > $R/prof-b62-gil.analysis.txt 2>&1
