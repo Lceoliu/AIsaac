@@ -1888,9 +1888,11 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--dump-rollouts', type=int, default=0,
                    help="save the first K rollouts handed to the learner (records, actions under way, actions, stored "
                         "log-probabilities and values, rewards) to <out>/rollouts/ (a measurement aid)")
-    p.add_argument('--switch-interval', type=float, default=0.0005,
+    p.add_argument('--switch-interval', type=float,
+                   default=float(os.environ.get('ISAAC_SWITCH_INTERVAL_US', '500'))*1e-6,
                    help="Python's thread switch interval (s): how long the actor may wait for the interpreter while "
-                        'the learner thread runs Python (default of Python: 0.005)')
+                        'the learner thread runs Python (default of Python: 0.005; B62: the default from '
+                        'ISAAC_SWITCH_INTERVAL_US, 500 us when unset)')
     args = p.parse_args(argv)
     resume_input_config = (torch.load(args.resume,map_location='cpu',weights_only=False).get('config',{})
                            if args.resume else {})
