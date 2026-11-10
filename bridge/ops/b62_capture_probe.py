@@ -18,6 +18,8 @@ acts while the capture is under way:
     replay          a graph captured before, replayed on its own stream (as the C++ d2 lane thread's fill_and_run)
     h2d             a non_blocking pinned -> device copy on another stream
     stream_sync     torch.cuda.Stream.synchronize() of another (idle) stream
+  dev1_<case> (two visible GPUs): the same side call, its event / stream / graph / buffers on cuda:1 and the side
+  thread's current device cuda:1, while the capture runs on cuda:0 (one process driving two GPUs)
   capturing thread, gc.collect() inside the capture (graph_capture's gc.disable bypassed), the garbage being
   an object in a reference cycle, dropped before the capture, that holds:
     gc_graph        a captured torch.cuda.CUDAGraph (its private pool)
@@ -36,6 +38,7 @@ import threading
 
 CASES = ('none', 'query', 'sync', 'pin_alloc', 'pin_reuse', 'pin_free_used', 'pin_free_plain', 'replay', 'h2d',
          'stream_sync',
+         'dev1_query', 'dev1_sync', 'dev1_stream_sync', 'dev1_pin_alloc', 'dev1_replay', 'dev1_h2d',
          'gc_graph', 'gc_pinned', 'gc_actor', 'gc_graph_gated', 'gc_actor_gated')
 
 
@@ -50,37 +53,42 @@ def child(case):
     sys.path.insert(0, os.getcwd())
     res = dict(case=case)
     dev = 'cuda'
+    dev1 = case.startswith('dev1_')   # (the side thread's material and calls on cuda:1, the capture on cuda:0)
+    base = case[5:] if dev1 else case
+    sdev = 1 if dev1 else 0
     x = torch.ones(1 << 16, device=dev)
+    torch.cuda.set_device(sdev)
     copy_stream = torch.cuda.Stream()
     # side-thread material, made before the capture
     ev = torch.cuda.Event()
     ev.record()
     torch.cuda.synchronize()
     held = {}
-    if case == 'pin_reuse':
+    if base == 'pin_reuse':
         t_ = torch.empty(1 << 20, dtype=torch.uint8, pin_memory=True)
         del t_   # (cached by the host allocator: the next allocation of this size reuses it)
-    if case in ('pin_free_used', 'gc_pinned'):
+    if base in ('pin_free_used', 'gc_pinned'):
         p = torch.empty(1 << 20, dtype=torch.uint8, pin_memory=True)
         with torch.cuda.stream(copy_stream):
             torch.empty(1 << 20, dtype=torch.uint8, device=dev).copy_(p, non_blocking=True)
         torch.cuda.synchronize()
         held['p'] = p
         del p
-    if case == 'pin_free_plain':
+    if base == 'pin_free_plain':
         held['p'] = torch.empty(1 << 20, dtype=torch.uint8, pin_memory=True)
     other = torch.cuda.Stream()
-    if case == 'replay':
+    if base == 'replay':
         gr, yr = torch.cuda.CUDAGraph(), torch.zeros(1 << 16, device=dev)
         torch.cuda.synchronize()
         with torch.cuda.graph(gr, stream=other):
             yr.add_(1)
         torch.cuda.synchronize()
         held['g'] = gr
-    if case == 'h2d':
+    if base == 'h2d':
         held['src'] = torch.ones(1 << 20, dtype=torch.uint8, pin_memory=True)
         held['dst'] = torch.empty(1 << 20, dtype=torch.uint8, device=dev)
         torch.cuda.synchronize()
+    torch.cuda.set_device(0)
     # cyclic garbage holding CUDA resources
     if case.startswith('gc_'):
         class Holder:
@@ -95,7 +103,7 @@ def child(case):
                 y0.add_(1)
             h.graph, h.out = g0, y0
             del g0, y0
-        elif case == 'gc_pinned':
+        elif base == 'gc_pinned':
             h.pinned = held.pop('p')
         else:   # gc_actor*
             sys.path.insert(0, os.path.join(os.getcwd(), 'tests'))
@@ -115,23 +123,24 @@ def child(case):
     def worker():
         go.wait()
         try:
-            if case == 'query':
+            torch.cuda.set_device(sdev)
+            if base == 'query':
                 side['value'] = bool(ev.query())
-            elif case == 'sync':
+            elif base == 'sync':
                 ev.synchronize()
-            elif case == 'pin_alloc':
+            elif base == 'pin_alloc':
                 side['n'] = torch.empty(16 << 20, dtype=torch.uint8, pin_memory=True).numel()
-            elif case == 'pin_reuse':
+            elif base == 'pin_reuse':
                 side['n'] = torch.empty(1 << 20, dtype=torch.uint8, pin_memory=True).numel()
-            elif case in ('pin_free_used', 'pin_free_plain'):
+            elif base in ('pin_free_used', 'pin_free_plain'):
                 held.pop('p')
-            elif case == 'replay':
+            elif base == 'replay':
                 with torch.cuda.stream(other):
                     held['g'].replay()
-            elif case == 'h2d':
+            elif base == 'h2d':
                 with torch.cuda.stream(other):
                     held['dst'].copy_(held['src'], non_blocking=True)
-            elif case == 'stream_sync':
+            elif base == 'stream_sync':
                 other.synchronize()
             side['outcome'] = 'ok'
         except BaseException as e:

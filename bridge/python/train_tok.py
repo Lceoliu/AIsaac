@@ -2852,6 +2852,39 @@ def main(argv=None, child=None, actor=None):
                 lanes.attach_driver(cpp_driver)   # B54: the lane rounds' steps on the driver thread too
         print(f'B52 cpp actor driver: {"on, %d graphs registered" % cpp_driver.n_graphs() if cpp_driver is not None else "off (%s)" % bdrv.reason()}'
               f'; lane generations pre-created: {made_g}', flush=True)
+        if cpp_driver is not None and os.environ.get('ISAAC_BLOCK_TIMING') == '1' and os.environ.get('ISAAC_BLOCK_TIMELINE'):
+            # BM1 (measurement only, ISAAC_BLOCK_TIMING=1 + ISAAC_BLOCK_TIMELINE=<path>): once a second, the driver's
+            # cumulative counters (atomics) and whether the learner is inside an update (block_paged.LEARNER_ACTIVE), so
+            # the actor's rates split by phase; every 10 s the native page store's sizes (M0's memory split). A daemon
+            # thread of its own, off every timed path; the path comes from the run (no fixed global name).
+            import threading as threading_
+            from isaac_bridge import block_paged as bp_tl
+
+            def timeline_(path=os.environ['ISAAC_BLOCK_TIMELINE'], d_=cpp_driver, st_=block_actor.store.native):
+                keys = ('steps', 'calls', 'rows', 'lane_jobs', 'lane_rows', 'merged_rows', 'sync_s', 'lane_s', 'loop_s',
+                        'host_s', 'pages_s', 'pause_s')
+                try:
+                    page_b = (st_.kv_page(0).numel()*st_.kv_page(0).element_size(), st_.z_page(0).numel()*st_.z_page(0).element_size(),
+                              st_.b_page(0).numel()*st_.b_page(0).element_size())
+                except Exception:
+                    page_b = (0, 0, 0)
+                with open(path, 'w') as f_:
+                    f_.write('t,learner,' + ','.join(keys) + ',kv_pages,d_free,b_pages,b_free,raw,raw_mb,kv_page_b,z_page_b,b_page_b\n')
+                    k_ = 0
+                    while True:
+                        time.sleep(1.0)
+                        try:
+                            c_ = d_.counters()
+                            s_ = st_.stats() if k_ % 10 == 0 else None
+                            f_.write(f'{time.time():.3f},{int(bp_tl.LEARNER_ACTIVE[0])},' + ','.join(str(c_.get(k, '')) for k in keys)
+                                     + (f",{s_['kv_pages']},{s_['d_free']},{s_['b_pages']},{s_['b_free']},{s_['raw']},{st_.raw_mb():.1f},{page_b[0]},{page_b[1]},{page_b[2]}"
+                                        if s_ is not None else ',,,,,,,,,') + '\n')
+                            f_.flush()
+                        except Exception as e_:
+                            f_.write(f'# {e_!r}\n')
+                            return
+                        k_ += 1
+            threading_.Thread(target=timeline_, name='bm1-timeline', daemon=True).start()
     # B38 (--learner-device): the hand-off's copy of a rollout's temporal tensors to the learner's GPU (mirror_temporal:
     # issued by the actor thread on a stream pair of its own, the learner waits on the event; the next hand-off comes
     # only after the update that read the mirror has synchronised its stream, so one mirror suffices) and the weights'

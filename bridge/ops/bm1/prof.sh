@@ -31,7 +31,7 @@ M=" --out /bench/bm1/reports/$TAG"
 python3 $BM/m0_mem.py $R/$TAG.mem.csv 5 "$M" $R/$TAG.threads.csv > $R/$TAG.mem.log 2>&1 &
 S4=$!
 S5=
-DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 ${ENVS:-}" $BM/dock.sh prof-$TAG $GPU sh /bench/bm1/xnew2.sh $TAG $LIMIT $HOURS &
+DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 -e ISAAC_BLOCK_TIMELINE=/bench/bm1/reports/$TAG.timeline.csv ${ENVS:-}" $BM/dock.sh prof-$TAG $GPU sh /bench/bm1/xnew2.sh $TAG $LIMIT $HOURS &
 DP=$!
 # progress.csv row times (1 s): each update's end on the host clock, to place the 1 s GPU / CPU samples in each cycle
 ( k=0; while kill -0 $DP 2>/dev/null; do
