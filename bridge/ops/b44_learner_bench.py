@@ -72,16 +72,26 @@ class OpCount(torch.overrides.TorchFunctionMode):
         self.phase = 'other'
         self.n = {}
         self.by_name = {}
+        self.by_where = {}
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         if not torch.compiler.is_compiling():   # (dynamo traces the mode: no state read while it compiles)
             self.n[self.phase] = self.n.get(self.phase, 0)+1
             key = (self.phase, getattr(func, '__qualname__', None) or getattr(func, '__name__', None) or str(func))
             self.by_name[key] = self.by_name.get(key, 0)+1
+            f = sys._getframe(1)   # (B62: the Python frame that made the call, and its caller)
+            g = f.f_back
+            where = (f'{f.f_code.co_filename.rsplit("/", 2)[-2:]}:{f.f_code.co_name}',
+                     f'{g.f_code.co_filename.rsplit("/", 2)[-2:]}:{g.f_code.co_name}' if g is not None else '')
+            k2 = (self.phase,)+where
+            self.by_where[k2] = self.by_where.get(k2, 0)+1
         return func(*args, **(kwargs or {}))
 
     def top(self, k=40):
         return [(ph, name, n) for (ph, name), n in sorted(self.by_name.items(), key=lambda kv: -kv[1])[:k]]
+
+    def top_where(self, k=40):
+        return [(ph, f, g, n) for (ph, f, g), n in sorted(self.by_where.items(), key=lambda kv: -kv[1])[:k]]
 
 
 def busy_threads(n):
@@ -316,6 +326,7 @@ def main():
                 r = replay(model, opt, calls, a.mode == 'packed', seed=a.reps, pipeline=a.pipeline, ops=ops)
             r['torch_calls'] = ops.n
             r['torch_calls_top'] = ops.top(60)
+            r['torch_calls_where'] = ops.top_where(60)
             r['torch_calls_per_grad_call'] = {k: round(v/max(r['grad_calls'], 1), 1) for k, v in ops.n.items()}
             print(json.dumps(dict(rep='opcount', mode=a.mode, **r)), flush=True)
             reps.append(dict(r, opcount=True))
