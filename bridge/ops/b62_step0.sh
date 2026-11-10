@@ -147,9 +147,10 @@ for S in "$@"; do
   W100) prof prof-b62-sw100 ISAAC_SWITCH_INTERVAL_US=100 ;;
   W50) prof prof-b62-sw50 ISAAC_SWITCH_INTERVAL_US=50 ;;
   N)
-    TAG=prof-b62-gil
+    TAG=${NTAG:-prof-b62-gil}
     OUT=$R/$TAG
-    python3 $OPS/b57_threads.py $R/$TAG.threads.csv 1.0 > $R/$TAG.threads.log 2>&1 &
+    ( until pgrep -f "^$PY -u train_tok.py" > /dev/null; do sleep 1; done
+      exec python3 $OPS/b57_threads.py $R/$TAG.threads.csv 1.0 > $R/$TAG.threads.log 2>&1 ) &
     THR=$!
     cd $ROOT/$CODE/bridge/python
     export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
@@ -178,6 +179,9 @@ for S in "$@"; do
       > $OUT.stdout 2> $OUT.stderr
     echo "$(date '+%F %T') N nsys done rc=$? $(ls -la $R/$TAG.nsys-rep 2>/dev/null | awk '{print $5}') bytes" >> $LOG
     kill $THR 2>/dev/null
+    python3 $OPS/b57_nsys.py $R/$TAG.nsys-rep $R/$TAG.threads.csv > $R/$TAG.analysis.txt 2>&1   # (in the lock)
+    echo "$(date '+%F %T') N analysis rc=$?" >> $LOG
+    kill $THR 2>/dev/null
     ;;
   esac
   give $S
@@ -186,9 +190,5 @@ for S in "$@"; do
     python3 $OPS/b62_gpu_idle.py $R/$T_.nsys-rep > $R/$T_.idle.txt 2>&1
     echo "$(date '+%F %T') $S analysis rc=$? $(tail -3 $R/$T_.idle.txt | tr '
 ' ' ' | cut -c1-400)" >> $LOG
-  fi
-  if [ $S = N ]; then   # (CPU only, after the lock)
-    python3 $OPS/b57_nsys.py $R/prof-b62-gil.nsys-rep $R/prof-b62-gil.threads.csv > $R/prof-b62-gil.analysis.txt 2>&1
-    echo "$(date '+%F %T') N analysis rc=$?" >> $LOG
   fi
 done
