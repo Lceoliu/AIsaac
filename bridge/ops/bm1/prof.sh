@@ -17,7 +17,7 @@ mkdir -p $R
 [ -e $R/$TAG ] && { echo "prof.sh: $R/$TAG exists (never overwritten)" >&2; exit 2; }
 take "timed $TAG ($TREE, GPU $GPU) 计时运行"
 echo "$(date '+%F %T') $TAG start: tree $TREE GPU $GPU updates $UPDATES hours $HOURS lock: $LOCKLINE" >> $LOG
-nvidia-smi -i $GPU --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,clocks.sm --format=csv,noheader -l 1 > $R/$TAG.gpu &
+nvidia-smi -i $GPU --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,clocks.sm,index --format=csv,noheader -l 1 > $R/$TAG.gpu &
 S1=$!
 nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader -l 5 > $R/$TAG.allgpu &
 S2=$!
