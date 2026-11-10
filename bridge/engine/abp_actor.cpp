@@ -22,6 +22,7 @@
 // without lanes.
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAGraph.h>
+#include <ATen/cuda/Sleep.h>
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/core/InferenceMode.h>
@@ -842,6 +843,66 @@ struct ActorDriver {
   std::atomic<i64> n_l_jobs{0}, n_l_rows{0}, n_l_restores{0}, n_l_python{0}, n_l_captures{0};
   std::atomic<double> t_l_restore{0}, t_l_job{0}, t_l_pause{0};
 
+  // ---- (d2 M1) a lane job of the main version rides the driver's next main batch (one replay) instead of a lane-only
+  // call; an older generation's job, a job whose version changed while it waited (the main weights were taken), one
+  // the merged batch cannot take (cap, widths, no graph) and every job while the driver has no main rows go lane-only
+  // at once, in the same pass. Only the driver thread touches merge_q (and LaneCore): no lock, the thread asserted.
+  // With M1 the driver thread does all the lane GPU work (restores, lane-only calls) on the main stream: the merged
+  // step needs no cross-stream order. ISAAC_BLOCK_LANE_MERGE=0 (set_m1_merge(false)): the d1 behaviour.
+  // A waiting job pins its teacher generation (refs + 1): its slot cannot be re-published under it.
+  struct MergeJob { std::shared_ptr<LaneJob> jb; i64 g; double t_enq; };
+  std::deque<MergeJob> merge_q;
+  bool m1_merge = true;
+  i64 m1_cap = 32;                      // (the largest merged batch: PRECAPTURE_MERGED_CAPS)
+  int restore_test = 0;                 // (tests) 1: the restore on the lane stream behind a long kernel, no wait (must fail)
+  bool m1_hold = false;                 // (tests) the waiting jobs wait for a main batch even while the driver idles
+  bool m1_test_capture = false;         // (tests) a merged batch without its graph: captured by Python and retried (not refused)
+  std::thread::id drv_tid;
+  // jobs merged / rows merged; lane-only jobs by reason: an older version, the version changed while waiting, refused by
+  // the merged batch, the driver without main rows, other (merging off / a job Python steps)
+  std::atomic<i64> n_m1_jobs{0}, n_m1_rows{0}, n_lo_jobs[5] = {{0}, {0}, {0}, {0}, {0}};
+  std::vector<double> m1_wait_s;        // (per merged job: enqueue -> the main step that took it)
+  bool m1_on() const { return m1_merge && lanes_native && !lrunning.load() && running.load(); }
+  void m1_thread_check(const char *where) {
+    TORCH_CHECK(std::this_thread::get_id() == drv_tid, where, ": the M1 merge queue belongs to the driver thread");
+  }
+  void gen_pin(i64 g, i64 d) {
+    abpc::Native &N = *store->nat;
+    std::lock_guard<std::mutex> l(N.lin.mu);
+    N.pts.gens.refs.at(g) += d; N.pts.gens.track(abpc::mono_now());
+  }
+  // the waiting jobs, lane-only now (reason: 3 the driver has no main rows; a job whose version changed: 1)
+  void m1_flush(int reason) {
+    if (m1_hold && reason == 3 && !main_hold) return;
+    while (!merge_q.empty()) {
+      m1_thread_check("m1_flush");
+      MergeJob m = merge_q.front(); merge_q.pop_front();
+      lane_run(*m.jb, m.g, m.jb->version != version.load() ? 1 : reason);
+      gen_pin(m.g, -1);
+      if (lstop || stop_req) return;
+    }
+  }
+  void m1_done(const MergeJob &m, GraphEntry &e, const uint8_t *rows_ptr, i64 o, std::vector<i64> &ids, std::vector<i64> &steps_before,
+               std::vector<uint8_t> &first, std::vector<uint8_t> &complete, i64 ver, double t_step) {
+    LaneJob &jb = *m.jb;
+    i64 k = jb.n;
+    Record lr;
+    lane_record(lr, jb, e, o, steps_before, first, complete, ver);
+    write_part(e, rows_ptr, o, k, ids, steps_before, complete, first, jb.pend.data(), ver, lr);
+    abpc::LaneJobOut out;
+    out.out.assign(lr.out.data_ptr<float>(), lr.out.data_ptr<float>()+k*(nh+3));
+    out.step_before.assign(steps_before.begin()+o, steps_before.begin()+o+k);
+    out.first.assign(first.begin()+o, first.begin()+o+k); out.complete.assign(complete.begin()+o, complete.begin()+o+k);
+    out.version = ver;
+    out.dec.assign(lr.dec.data_ptr<i64>(), lr.dec.data_ptr<i64>()+k); out.kvs.assign(lr.kvs.data_ptr<i64>(), lr.kvs.data_ptr<i64>()+k);
+    out.bid.assign(lr.bid.data_ptr<i64>(), lr.bid.data_ptr<i64>()+k);
+    lc.job_done(jb.job, out);
+    gen_pin(m.g, -1);
+    m1_wait_s.push_back(t_step-m.t_enq);
+    n_m1_jobs++; n_m1_rows = n_m1_rows+k;
+    n_l_jobs++; n_l_rows = n_l_rows+k; n_lane_jobs++; n_lane_rows = n_lane_rows+k; n_merged_rows = n_merged_rows+k;
+  }
+
   void lanes_configure(py::dict c, py::dict s, std::vector<int> fds, i64 stream_id, std::vector<i64> owners, std::vector<i64> bases) {
     TORCH_CHECK(store->lineage_on, "lanes_configure: the store's lineage first");
     TORCH_CHECK(owners.size() == bases.size() && (i64)owners.size() == store->nat->pts.gens.n(), "lanes_configure: a graph owner and a base per generation");
@@ -908,6 +969,12 @@ struct ActorDriver {
         memcpy(bsrcv.data_ptr<i64>()+i*block_steps, pc.b_srcver.get()+b*block_steps, block_steps*8);
       }
     }
+    std::unique_ptr<c10::cuda::CUDAStreamGuard> test_guard;
+    if (restore_test == 1) {   // (the control: the restore's copies on the lane stream behind a long kernel; nothing waits)
+      auto ls = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
+      test_guard.reset(new c10::cuda::CUDAStreamGuard(ls));
+      at::cuda::sleep(400000000LL);
+    }
     reset_rows({row});
     auto dev = kv_t.device();
     auto D = [&](at::Tensor x) { return x.to(dev, /*non_blocking=*/true); };
@@ -973,11 +1040,26 @@ struct ActorDriver {
   }
   void lane_job(i64 job, i64 g, std::vector<uint8_t> rows, std::vector<i64> pend, std::vector<i64> lanes, std::vector<i64> seq,
                 std::vector<uint8_t> replay) {
+    auto jb = std::make_shared<LaneJob>();
+    jb->job = job; jb->owner = gen_owner[g]; jb->version = lc.ops.gen_version(g); jb->n = (i64)lanes.size();
+    jb->rows = std::move(rows); jb->pend = std::move(pend); jb->seq = std::move(seq); jb->lane = std::move(lanes); jb->replay = std::move(replay);
+    for (i64 l : jb->lane) jb->ids.push_back(gen_base[g]+l);
+    bool cur = jb->version == version.load();
+    if (cur && m1_on() && lane_force_python != -2 && lane_force_python != g) {   // (d2 M1: the next main batch takes it)
+      m1_thread_check("lane_job");
+      gen_pin(g, 1);
+      merge_q.push_back(MergeJob{jb, g, now()});
+      return;
+    }
+    lane_run(*jb, g, cur ? 4 : 0);
+  }
+  // a lane-only call of one job through its generation's graph (d1), or its kind 5 / kind 1 hand-over to Python
+  void lane_run(LaneJob &jb, i64 g, int reason) {
     double t0 = now();
-    LaneJob jb; jb.job = job; jb.owner = gen_owner[g]; jb.version = lc.ops.gen_version(g); jb.n = (i64)lanes.size();
+    i64 job = jb.job;
+    const std::vector<i64> &lanes = jb.lane, &seq = jb.seq;
     ((jb.version == version.load()) ? n_lo_cur_rows : n_lo_old_rows) += jb.n;
-    jb.rows = std::move(rows); jb.pend = std::move(pend); jb.seq = seq; jb.lane = lanes; jb.replay = std::move(replay);
-    for (i64 l : lanes) jb.ids.push_back(gen_base[g]+l);
+    n_lo_jobs[reason]++;
     i64 k = jb.n;
     while (true) {
       i64 wb, we, wn, wsl;
@@ -1038,7 +1120,8 @@ struct ActorDriver {
   // one pass of the lane service (B54's tick): control, a finished round answered, the lane pipes read (up to timeout
   // s), a due round submitted; its GPU work on the lane stream. The lane thread (d2) or the driver thread (d1) runs it.
   bool lane_pass(double timeout) {
-    auto stream = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
+    i64 sid = (m1_merge && !lrunning.load() && std::this_thread::get_id() == drv_tid) ? stream_id : lane_stream_id;
+    auto stream = c10::cuda::CUDAStream::unpack3(sid, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
     c10::cuda::CUDAStreamGuard guard(stream);
     double t = now();
     lc.control(t);
@@ -1150,12 +1233,14 @@ struct ActorDriver {
       d[(std::string(name)+"_n").c_str()] = (i64)v.size();
       d[(std::string(name)+"_p50").c_str()] = q(v, .5); d[(std::string(name)+"_p90").c_str()] = q(v, .9); v.clear();
     };
-    put("lt_window_s", lc.win_s); put("lt_driver_s", lc.drv_s); put("lt_gpu_s", lc.gpu_s); put("lt_rt_s", lc.rt_s);
+    put("m1_wait_s", m1_wait_s);
+    put("lt_window_s", lc.win_s); put("lt_worker_s", lc.wk_s); put("lt_driver_s", lc.drv_s); put("lt_gpu_s", lc.gpu_s); put("lt_rt_s", lc.rt_s);
     abpc::Native &N = *store->nat;
     std::lock_guard<std::mutex> l(N.lin.mu);
     put("pt_first_s", N.pts.first_s); put("pt_run_s", N.pts.run_s); put("pt_life_s", N.pts.life_s); put("pt_life_v", N.pts.life_v);
     d["pt_refused"] = N.pts.refused; N.pts.refused = 0;
     d["pt_all_pinned_s"] = N.pts.gens.take_all_s(abpc::mono_now());
+    { auto lv = N.pts.take_live(abpc::mono_now()); d["pt_live_mean"] = lv.first; d["pt_live_max"] = lv.second; }
     return d;
   }
   py::dict lane_counters() {
@@ -1319,6 +1404,9 @@ struct ActorDriver {
     d["polls"] = n_polls.load(); d["idle_polls"] = n_idle_polls.load();
     d["cap_native"] = n_cap_native.load(); d["cap_refused"] = n_cap_refused.load(); d["cap_publish"] = n_cap_publish.load();
     d["lin_s"] = t_lin_s.load();
+    d["m1_jobs"] = n_m1_jobs.load(); d["m1_rows"] = n_m1_rows.load();
+    d["lo_old_jobs"] = n_lo_jobs[0].load(); d["lo_switch_jobs"] = n_lo_jobs[1].load(); d["lo_refused_jobs"] = n_lo_jobs[2].load();
+    d["lo_idle_jobs"] = n_lo_jobs[3].load(); d["lo_other_jobs"] = n_lo_jobs[4].load(); d["m1_waiting"] = (i64)merge_q.size();
     d["lo_cur_rows"] = n_lo_cur_rows.load(); d["lo_old_rows"] = n_lo_old_rows.load(); d["putback_rows"] = n_putback_rows.load();
     d["enq_in_step"] = n_enq_in_step.load(); d["enq_outside"] = n_enq_outside.load();
     py::list h; for (auto &x : lane_hist) h.append(x.load()); d["lane_hist"] = h;
@@ -1359,6 +1447,7 @@ struct ActorDriver {
       std::vector<struct pollfd> pfds(fds.size());
       std::vector<i64> ws, ss;   // the batch: workers and row slots
       std::vector<i64> held_w, held_s;   // (B54) messages waiting for their worker's CF capture (cap_wait)
+      drv_tid = std::this_thread::get_id();   // (d2 M1: merge_q / LaneCore belong to this thread)
       double t_it = now();
       while (!stop_req) {
         { double t = now(); t_loop_s = t_loop_s+(t-t_it); t_it = t; }
@@ -1366,7 +1455,7 @@ struct ActorDriver {
         if (test_fail) throw std::runtime_error("set_test_fail: a driver error (B58e test)");
         bool lanes_waiting = lane_queue_size() > 0;
         if (main_hold) {   // (B54) lanes only
-          if (lanes_native && !lrunning) { lane_pass(3e-4); continue; }   // (B58d d1: the native lane service here)
+          if (lanes_native && !lrunning) { lane_pass(3e-4); m1_flush(3); continue; }   // (B58d d1: the native lane service here)
           if (lanes_waiting) run_lanes();
           else { double t = now(); std::this_thread::sleep_for(std::chrono::microseconds(300)); t_hold_s = t_hold_s+(now()-t); }
           continue;
@@ -1379,7 +1468,7 @@ struct ActorDriver {
             else q++;
           }
           for (size_t i = 0; i < fds.size(); i++) { pfds[i].fd = fds[i]; pfds[i].events = fds[i] >= 0 ? POLLIN : 0; pfds[i].revents = 0; }
-          int k = ::poll(pfds.data(), (nfds_t)pfds.size(), (lanes_waiting || !ws.empty()) ? 0 : 1);
+          int k = ::poll(pfds.data(), (nfds_t)pfds.size(), (lanes_waiting || !ws.empty() || !merge_q.empty()) ? 0 : 1);
           for (size_t i = 0; k > 0 && i < fds.size(); i++) {
             if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
             unsigned char msg[5]; ssize_t got = ::read(fds[i], msg, 5);
@@ -1395,7 +1484,7 @@ struct ActorDriver {
           if (ws.empty()) {
             n_idle_polls++;
             if (lanes_waiting) run_lanes();
-            if (lanes_native && !lrunning) lane_pass(0);   // (B58d d1)
+            if (lanes_native && !lrunning) { m1_flush(3); lane_pass(0); m1_flush(3); }   // (B58d d1; M1: no main rows now)
             continue;
           }
         } else { ws = ready_w; ss = ready_s; ready_w.clear(); ready_s.clear(); }
@@ -1622,6 +1711,25 @@ struct ActorDriver {
         if ((*it)->version == version.load()) { merged.push_back(*it); it = lane_q.erase(it); } else ++it;
       }
     }
+    // (d2 M1) the native jobs waiting for this batch: the version checked again (a job of a version taken since goes
+    // lane-only), at most m1_cap rows in all; the others run lane-only after this step's reply (later)
+    std::vector<MergeJob> nat_m;
+    std::vector<std::pair<MergeJob, int>> later;
+    if (!merge_q.empty()) {
+      m1_thread_check("step_batch");
+      i64 v = version.load(), tot = n;
+      while (!merge_q.empty()) {
+        MergeJob m = merge_q.front(); merge_q.pop_front();
+        if (m.jb->version != v) later.emplace_back(m, 1);
+        else if (tot+m.jb->n > m1_cap || (!merged.empty() && nat_m.empty())) later.emplace_back(m, 2);
+        else { tot += m.jb->n; nat_m.push_back(m); }
+      }
+      for (auto &m : nat_m) merged.push_back(m.jb);
+    }
+    auto run_later = [&]() {   // (the same pass: after the main reply, or before handing the batch to Python)
+      for (auto &x : later) { lane_run(*x.first.jb, x.first.g, x.second); gen_pin(x.first.g, -1); }
+      later.clear();
+    };
     i64 n_lane = 0; for (auto &jb : merged) n_lane += jb->n;
     std::vector<uint8_t> packed;
     const uint8_t *rows_ptr;
@@ -1633,7 +1741,12 @@ struct ActorDriver {
       if (with_lanes) { i64 o = n; for (auto &jb : merged) { memcpy(&packed[o*row_stride], jb->rows.data(), jb->n*row_stride); o += jb->n; } }
       rows_ptr = packed.data();
     };
-    auto put_back = [&]() {   // (the merged jobs return to the front of the queue, in order)
+    auto put_back = [&]() {   // (the merged jobs return to the front of the queue, in order; M1's: lane-only, refused)
+      if (!nat_m.empty()) {
+        for (auto &m : nat_m) later.emplace_back(m, 2);
+        nat_m.clear(); merged.clear(); n_lane = 0;
+        return;
+      }
       std::lock_guard<std::mutex> g(lmu);
       for (auto it = merged.rbegin(); it != merged.rend(); ++it) lane_q.push_front(*it);
       merged.clear(); n_lane = 0;
@@ -1649,15 +1762,41 @@ struct ActorDriver {
     i64 cap = 1; while (cap < n_tot) cap <<= 1;
     if (!ok) {   // Python handles this batch (it raises the same error, or takes the eager path)
       t_prep_s = t_prep_s+(now()-t0);
+      run_later();
       r->kind = 2; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
       hand_to_python(r, ws, ss);
       return;
     }
     std::vector<i64> key{owner_main, cap, wb, we, wn, wsl};
     GraphEntry *e = find_graph(key);
+    if (!e && !nat_m.empty() && m1_test_capture) {   // (tests: the merged graph captured, the batch and the jobs retried)
+      t_prep_s = t_prep_s+(now()-t0);
+      for (auto it = nat_m.rbegin(); it != nat_m.rend(); ++it) merge_q.push_front(*it);
+      nat_m.clear(); merged.clear(); n_lane = 0;
+      run_later();
+      r->kind = 1; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
+      n_captures++;
+      hand_to_python(r, ws, ss);
+      return;
+    }
+    if (!e && !nat_m.empty()) {   // (M1: no merged graph of these widths: the main rows alone, the jobs lane-only)
+      put_back(); pack(false);
+      ok = batch_widths(rows_ptr, n, wb, we, wn, wsl);
+      n_tot = n; cap = 1; while (cap < n_tot) cap <<= 1;
+      if (!ok) {
+        t_prep_s = t_prep_s+(now()-t0);
+        run_later();
+        r->kind = 2; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
+        hand_to_python(r, ws, ss);
+        return;
+      }
+      key = {owner_main, cap, wb, we, wn, wsl};
+      e = find_graph(key);
+    }
     if (!e) {   // not captured yet: Python captures (needs the GIL and the capture admission); the batch is retried
       t_prep_s = t_prep_s+(now()-t0);
       put_back();
+      run_later();
       r->kind = 1; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
       n_captures++;
       hand_to_python(r, ws, ss);
@@ -1730,6 +1869,14 @@ struct ActorDriver {
     deliver(r, rc, n_all, ws, n);   // (B58e: batched in batch mode)
     for (auto &pr : pubs) push_record(pr);
     double t4 = now();
+    if (!nat_m.empty()) {   // (d2 M1: the lane rows of this replay: their pages, their lineage, their answers)
+      n_merged_calls++;
+      i64 o = n;
+      for (auto &m : nat_m) { m1_done(m, *e, rows_ptr, o, ids, steps_before, first, complete, ver, t0); o += m.jb->n; }
+      t_mlane_s = t_mlane_s+(now()-t4);
+      merged.clear();
+    }
+    run_later();
     if (!merged.empty()) {
       n_merged_calls++;
       i64 o = n;
@@ -1900,7 +2047,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_lineage", &ActorDriver::set_lineage)
       .def("set_batch", &ActorDriver::set_batch).def("set_collect_target", &ActorDriver::set_collect_target)
       .def("set_busy", &ActorDriver::set_busy).def("wake", &ActorDriver::wake, py::call_guard<py::gil_scoped_release>())
-      .def("set_test_fail", [](ActorDriver &d, bool on) { d.test_fail = on; }).def("take_events", &ActorDriver::take_events).def("batch_counters", &ActorDriver::batch_counters)
+      .def("set_test_fail", [](ActorDriver &d, bool on) { d.test_fail = on; })
+      .def("set_m1_merge", [](ActorDriver &d, bool on) { d.m1_merge = on; }).def("set_m1_cap", [](ActorDriver &d, i64 c) { d.m1_cap = c; })
+      .def("set_restore_test", [](ActorDriver &d, int m) { d.restore_test = m; })
+      .def("set_m1_hold", [](ActorDriver &d, bool on) { d.m1_hold = on; }).def("set_m1_test_capture", [](ActorDriver &d, bool on) { d.m1_test_capture = on; }).def("take_events", &ActorDriver::take_events).def("batch_counters", &ActorDriver::batch_counters)
       .def("usable_now", &ActorDriver::usable_now)
       .def("lanes_configure", &ActorDriver::lanes_configure).def("lanes_start", &ActorDriver::lanes_start)
       .def("lanes_stop", &ActorDriver::lanes_stop, py::call_guard<py::gil_scoped_release>())

@@ -130,6 +130,10 @@ struct LaneCore {
   std::unordered_map<i64, double> t_read;
   std::unordered_map<i64, double> gpu_lane;   // (this round: a lane's restore + job seconds)
   std::vector<double> win_s, drv_s, gpu_s, rt_s;
+  // (d2 M1 measurement) the worker side of a lane step: a lane's reply -> its next request read (the worker woken, its
+  // game step, its request written; one number: the worker's parts are not timed here)
+  std::unordered_map<i64, double> t_replied;
+  std::vector<double> wk_s;
   struct Taken { i64 lane; double read, due, take; };
   std::vector<Taken> taken_now;
 
@@ -141,6 +145,8 @@ struct LaneCore {
   // ---- intake / window
   void intake(i64 lane, double now) {
     t_read.emplace(lane, now);   // (the first read of the lane's pending request)
+    auto rp = t_replied.find(lane);
+    if (rp != t_replied.end()) { wk_s.push_back(now-rp->second); t_replied.erase(rp); }
     if (ready.empty()) first_t = now;
     last_t = now;
     ready.push_back(lane);
@@ -402,6 +408,7 @@ struct LaneCore {
     if (!reply_first) ops.reply(f->idx);
     fly_s += now-f->t0;
     double tr = mono_now();
+    for (i64 j = 0; j < n; j++) t_replied[f->idx[j]] = tr;
     for (auto &tk : taken_now) {
       win_s.push_back(std::max(0.0, tk.due-tk.read)); drv_s.push_back(std::max(0.0, tk.take-tk.due));
       auto g = gpu_lane.find(tk.lane); gpu_s.push_back(g != gpu_lane.end() ? g->second : 0.0); rt_s.push_back(tr-tk.read);

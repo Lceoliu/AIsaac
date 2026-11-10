@@ -74,9 +74,10 @@ def world(native, lane_pipes=False):
     main = SlotBlockActor(m, W, graph_entities=128, bf16=True, lane_slots=W, lane_generations=2)
     rng = np.random.default_rng(77)
     nh = len(m.heads)
-    d = None
-    if native:
-        d = make_driver_for(main, fake_sampler(W, nh))
+    d = ms = None
+    if native:   # (ms: the main workers' sampler, kept: the d2 M1 tests send main rows through its pipes)
+        ms = fake_sampler(W, nh)
+        d = make_driver_for(main, ms)
     for t in range(40):   # (the main rows' histories, the Python path)
         rows = frame(rng, W, t, np.arange(W)+1, np.array([int(t == 0)]*W), seed=4000+t)
         with torch.autocast('cuda', dtype=torch.bfloat16):
@@ -88,7 +89,7 @@ def world(native, lane_pipes=False):
     for g in (0, 1):   # (both generations' lane actors, as precapture_lane_generations)
         gens.slots[g] = copy.deepcopy(m).eval().requires_grad_(False)
         svc.actors[g] = main.lane_actor(gens.slots[g], W, generation=g)
-    w = SimpleNamespace(m=m, m1=m1, main=main, s=s, svc=svc, d=d, rng=np.random.default_rng(78), nh=nh, store=main.store)
+    w = SimpleNamespace(m=m, m1=m1, main=main, s=s, svc=svc, d=d, rng=np.random.default_rng(78), nh=nh, store=main.store, ms=ms)
     if not native:
         w.fake = gpu_fake_driver(svc)
         svc.attach_driver(w.fake)

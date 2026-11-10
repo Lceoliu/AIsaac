@@ -429,6 +429,22 @@ struct Points {
   // policy versions crossed (the release's main version - the point's)
   std::vector<double> first_s, run_s, life_s, life_v;
   i64 refused = 0;
+  // (d2 M1 measurement) the points alive at once: time-weighted mean and peak since the last take
+  double live_t = -1, live_area = 0, live_since = -1; i64 live_max = 0;
+  void live_change(double now, i64 d) {
+    i64 n = (i64)table.size();
+    if (live_since < 0) live_since = now;
+    if (live_t >= 0) live_area += (double)(n-d)*(now-live_t);
+    live_t = now; live_max = std::max(live_max, n);
+  }
+  std::pair<double, i64> take_live(double now) {   // (mean, peak) since the last take; the next window starts now
+    i64 n = (i64)table.size();
+    if (live_t >= 0) live_area += (double)n*(now-live_t);
+    double span = live_since >= 0 ? now-live_since : 0;
+    std::pair<double, i64> r{span > 0 ? live_area/span : (double)n, std::max(live_max, n)};
+    live_area = 0; live_t = now; live_since = now; live_max = n;
+    return r;
+  }
   // capture_point with the weights published: false (backpressure) or the point made (-1 from choose: Python publishes)
   i64 capture(Lineage &lin, i64 point, i64 snap, i64 version) {   // (lin.mu held) 2 made, -1 refused, -2 - i: publish slot i first
     if (table.count(point)) throw std::runtime_error("release a search point before reusing its bank slot");
@@ -443,6 +459,7 @@ struct Points {
     lin.retain_locked(snap);   // (snapshot.fork(): the same immutable snapshot)
     Point p{snap, c, gens.version[c], serial}; p.t_capture = now;
     table[point] = p;
+    live_change(now, 1);
     return 2;
   }
   void published(int slot, i64 v) { gens.version.at(slot) = v; }
@@ -455,6 +472,7 @@ struct Points {
     auto it = table.find(point);
     if (it == table.end()) return -1;
     Point p = it->second; table.erase(it);
+    live_change(mono_now(), -1);
     if (gens.refs[p.gen] <= 0) throw std::runtime_error("teacher generation released without a matching acquire");
     gens.refs[p.gen]--;
     double now = mono_now();

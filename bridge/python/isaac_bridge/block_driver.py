@@ -96,7 +96,8 @@ DRV_FIELDS = ('drv_pause_s', 'drv_pauses', 'drv_lane_jobs', 'drv_lane_rows', 'dr
               'drv_lane_deferred_requests', 'drv_lane_orphan_requests', 'drv_steps', 'drv_sync_s', 'drv_pages_s', 'drv_host_s',
               'drv_cap_holds', 'drv_poll_s', 'drv_prep_s', 'drv_reply_s', 'drv_cons_s', 'drv_push_s', 'drv_mlane_s',
               'drv_hold_s', 'drv_loop_s', 'drv_polls', 'drv_idle_polls', 'drv_lo_cur_rows', 'drv_lo_old_rows', 'drv_putback_rows',
-              'drv_enq_in_step', 'drv_enq_outside', 'b58e_batches', 'b58e_ev_rows')
+              'drv_enq_in_step', 'drv_enq_outside', 'b58e_batches', 'b58e_ev_rows', 'drv_m1_jobs', 'drv_m1_rows',
+              'drv_lo_old_jobs', 'drv_lo_switch_jobs', 'drv_lo_refused_jobs', 'drv_lo_idle_jobs', 'drv_lo_other_jobs')
 # (B58 step 0) the driver thread's time by phase (abp_actor.cpp: t_*_s); pages_s leaves the consumer out since step 0
 DRV_PHASES = ('poll', 'prep', 'sync', 'reply', 'pages', 'cons', 'push', 'mlane', 'lane', 'hold', 'pause')
 
@@ -115,7 +116,8 @@ def collect_counters(c0, c1, handoff, stat, py_mark):
     stat['drv_cap_holds'] = d.get('cap_holds', 0)   # (B57: main steps' host / GPU-wait / page seconds, held records)
     stat['drv_lane_hist'] = '/'.join(str(b-a) for a, b in zip(c0['lane_hist'], c1['lane_hist']))
     for k in ('poll_s', 'prep_s', 'reply_s', 'cons_s', 'push_s', 'mlane_s', 'hold_s', 'loop_s', 'polls', 'idle_polls',
-              'lo_cur_rows', 'lo_old_rows', 'putback_rows', 'enq_in_step', 'enq_outside'):   # (B58d plan: merging)
+              'lo_cur_rows', 'lo_old_rows', 'putback_rows', 'enq_in_step', 'enq_outside',   # (B58d plan: merging)
+              'm1_jobs', 'm1_rows', 'lo_old_jobs', 'lo_switch_jobs', 'lo_refused_jobs', 'lo_idle_jobs', 'lo_other_jobs'):   # (d2 M1)
         stat['drv_'+k] = d.get(k, 0)   # (B58 step 0; absent from an older extension's counters)
     # the lane rows the Python path stepped since the last collect (the actor waiting for the learner: rounds on the
     # Python path, the round in flight flushed), their share of all lane rows
@@ -136,7 +138,9 @@ def collect_counters(c0, c1, handoff, stat, py_mark):
             f"{stat['drv_lane_deferred_requests']}, cancelled for a point that never came {stat['drv_lane_orphan_requests']}"
             f"; driver s by phase {'/'.join(DRV_PHASES)} "
             f"{phases} of loop {d.get('loop_s', 0):.2f} "
-            f"({d.get('polls', 0)} polls, {d.get('idle_polls', 0)} idle)")
+            f"({d.get('polls', 0)} polls, {d.get('idle_polls', 0)} idle); M1 merged {d.get('m1_jobs', 0)} jobs "
+            f"({d.get('m1_rows', 0)} rows), lane-only jobs old / switched / refused / idle / other "
+            f"{'/'.join(str(d.get(k, 0)) for k in ('lo_old_jobs', 'lo_switch_jobs', 'lo_refused_jobs', 'lo_idle_jobs', 'lo_other_jobs'))}")
 
 
 def policy_lag_violations(roll_version, roll_length, min_version):
@@ -426,6 +430,8 @@ def attach_lanes(d, lanes, sampler, stream):
     owners = [int(lanes.actors[g].step_graph.owner) for g in gens]
     bases = [int(lanes.actors[g].base) for g in gens]
     d.lanes_configure(cfg, sh, fds, int(stream.stream_id), owners, bases)
+    # (d2 M1: a lane job of the main version rides the next main batch; =0: every job lane-only, the d1 behaviour)
+    d.set_m1_merge(os.environ.get('ISAAC_BLOCK_LANE_MERGE', '1') != '0')
     lanes.attach_native_lanes(d, stream)
     sampler.block_contexts = lanes.contexts = NativeContexts(lanes.lin)
 
@@ -433,8 +439,9 @@ def attach_lanes(d, lanes, sampler, stream):
 # (D1 / B58d) per collect: lane request timings (window / behind the caller / GPU / read -> reply) and the CF points'
 # (capture -> first lane step -> release, life in seconds and policy versions), refused captures, seconds every
 # teacher generation was pinned (ActorDriver.lane_timing), as progress.csv columns
-LANE_TIMING_FIELDS = tuple(f'{k}_{s}' for k in ('lt_window_s', 'lt_driver_s', 'lt_gpu_s', 'lt_rt_s', 'pt_first_s', 'pt_run_s',
-                                               'pt_life_s', 'pt_life_v') for s in ('n', 'p50', 'p90')) + ('pt_refused', 'pt_all_pinned_s')
+LANE_TIMING_FIELDS = tuple(f'{k}_{s}' for k in ('m1_wait_s', 'lt_worker_s', 'lt_window_s', 'lt_driver_s', 'lt_gpu_s', 'lt_rt_s', 'pt_first_s', 'pt_run_s',
+                                               'pt_life_s', 'pt_life_v') for s in ('n', 'p50', 'p90')) + ('pt_refused', 'pt_all_pinned_s',
+                                                                                              'pt_live_mean', 'pt_live_max')
 
 
 def check_versions(driver, actor):
