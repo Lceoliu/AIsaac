@@ -66,6 +66,11 @@ def driver_ring(driver, actor, lane):
     driver.set_ring(row,torch.from_numpy(dec),torch.from_numpy(kv),int(step-lo))
 
 
+# D1 (2026-11-10): the CF points' lives (capture to release: seconds, policy versions crossed) and the seconds both
+# teacher generations were pinned, per collect (point_stats), as progress.csv columns
+D1_FIELDS = ('d1_released', 'd1_life_p50_s', 'd1_life_p90_s', 'd1_life_p50_v', 'd1_life_p90_v', 'd1_refused', 'd1_gen_both_s')
+
+
 class BlockLaneService(LaneService):
     RECLAIM_S=0.1   # B46: at most this often the context / injury-source reclamation (service_control)
     DEFER_S=2.0     # B54: a branch request whose point is not captured yet waits at most this long, then is cancelled
@@ -314,8 +319,12 @@ class BlockLaneService(LaneService):
         if int(model_version) != snapshot.policy_version:
             raise ValueError("point snapshot and supplied actor weights have different versions")
         if not self.generations.publish(actor_model, snapshot.policy_version):
+            self.stat['d1_refused'] = self.stat.get('d1_refused', 0)+1
             return False
         generation, version, teacher = self.generations.acquire(snapshot.policy_version)
+        import time as time_
+        self.__dict__.setdefault('point_life', {})[int(bank_index)] = (time_.perf_counter(), int(version))
+        self._gen_both()
         self.point_serial += 1
         token = self.point_serial
         self.points[int(bank_index)] = (snapshot.fork(), generation, version, token)
@@ -342,6 +351,41 @@ class BlockLaneService(LaneService):
         snapshot, generation, version, token = self.points.pop(int(bank_index))
         self.generations.release(generation)
         self.contexts.complete(token)
+        import time as time_
+        life = self.__dict__.setdefault('point_life', {}).pop(int(bank_index), None)
+        if life is not None:   # (D1)
+            self.__dict__.setdefault('d1_lives', []).append((time_.perf_counter()-life[0],
+                                                             int(getattr(self.main_actor, 'version', life[1]))-life[1]))
+        self._gen_both()
+
+    def _gen_both(self, now=None):
+        """(D1) Both teacher generations pinned: the time it lasts."""
+        import time as time_
+        now = time_.perf_counter() if now is None else now
+        both = all(r > 0 for r in self.generations.refs)
+        since = self.__dict__.get('both_since')
+        if since is not None and not both:
+            self.stat['d1_gen_both_s'] = self.stat.get('d1_gen_both_s', 0.0)+now-since
+            self.both_since = None
+        elif since is None and both:
+            self.both_since = now
+
+    def point_stats(self):
+        """(D1) This collect's released points' lives (p50 / p90 of seconds and of policy versions crossed), refused
+        captures, seconds both generations were pinned; the counters restart."""
+        import time as time_
+        import numpy as np_
+        now = time_.perf_counter()
+        if self.__dict__.get('both_since') is not None:   # (an interval still open: counted up to now)
+            self.stat['d1_gen_both_s'] = self.stat.get('d1_gen_both_s', 0.0)+now-self.both_since
+            self.both_since = now
+        lives = self.__dict__.pop('d1_lives', [])
+        s = np_.array([x[0] for x in lives]) if lives else np_.zeros(0)
+        v = np_.array([x[1] for x in lives]) if lives else np_.zeros(0)
+        q = lambda a, p: float(np_.percentile(a, p)) if len(a) else ''
+        out = dict(d1_released=len(lives), d1_life_p50_s=q(s, 50), d1_life_p90_s=q(s, 90), d1_life_p50_v=q(v, 50),
+                   d1_life_p90_v=q(v, 90), d1_refused=self.stat.pop('d1_refused', 0), d1_gen_both_s=self.stat.pop('d1_gen_both_s', 0.0))
+        return out
 
     def _begin(self, idx):
         starts = self.s.lane_io[idx, 11].astype(np.int64)

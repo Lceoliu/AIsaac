@@ -1883,6 +1883,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                         if victim_ is None:
                                             cf_quota.budget += 1.0
                                         mine[ST['cf_nobank']] += 1
+                                        mine[ST['cf_nobank_bank']] += 1
                                     else:
                                         bank_ = index * cf_B + b_
                                 if ok_:
@@ -1919,6 +1920,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                         cf_quota.budget=min(cf_quota.burst,cf_quota.budget+1.0)
                                     cf_release(point_b)
                                     mine[ST['cf_nobank']]+=1
+                                    mine[ST['cf_nobank_refused']]+=1
                                     mine[ST['cf_skipped']]+=1
                     if block_on:
                         v2log.rows.append(row.copy())

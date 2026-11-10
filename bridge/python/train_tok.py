@@ -4356,6 +4356,9 @@ def main(argv=None, child=None, actor=None):
                 from isaac_bridge.block_driver import DRV_FIELDS
                 for k_d in DRV_FIELDS:   # (B54: the driver's counters of the collect)
                     row[k_d]=lane_stat.get(k_d,'')
+                from isaac_bridge.block_lanes import D1_FIELDS
+                for k_d in D1_FIELDS:   # (D1: the CF points' lives)
+                    row[k_d]=lane_stat.get(k_d,'')
                 for k_b in ('block_gc_s','block_kv_rows','block_blocks','block_raw_rows'):
                     row[k_b]=lane_stat.get(k_b,0)
                 from isaac_bridge.block_compile import STATS as cstat_b
@@ -5178,6 +5181,8 @@ def main(argv=None, child=None, actor=None):
                 # B54 counters of this collect: the driver's paused seconds (the hand-off's pause before this collect's
                 # resume excluded), lane jobs / rows, merged rows and calls, lane-only calls, run-time captures
                 line_ = bdrv.collect_counters(c0_, c1_, handoff_, lane_stat, py_mark)
+                if hasattr(lanes, 'point_stats'):   # D1: the CF points' lives, refusals, both generations pinned
+                    lane_stat.update(lanes.point_stats())
                 print(f"B54 driver collect: {line_}; "
                       f"graphs registered {cpp_driver.n_graphs()}; "
                       f"pages {block_actor.store.native.n_pages_d()} decision / {block_actor.store.native.n_pages_b()} block", flush=True)
