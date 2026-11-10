@@ -89,7 +89,8 @@ def nothing_left_running(request):
         pf = block_learner.PREFETCH
         if pf.jobs:
             problems.append(f'learner prefetch: {len(pf.jobs)} part(s) left queued')
-        if not pf.close():
+        close = getattr(pf, 'close', None)   # (absent before B62's fix: trees checked with this file added)
+        if close is not None and not close():
             problems.append('learner prefetch: the worker did not stop')
     # the C++ drivers made during the test
     for r in list(_DRIVERS):
