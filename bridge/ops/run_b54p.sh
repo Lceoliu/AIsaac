@@ -26,8 +26,8 @@ if want cpp; then
   sleep 5; guard
 fi
 if want py; then
-  ISAAC_BLOCK_CPP_ACTOR=0 CODE=$CODE ./prof2.sh prof-b54-py 4500 18.3
-  echo "$(date +%T) prof-b54-py (python path, same tree) done rc=$?" >> $LOG
+  ISAAC_BLOCK_CPP_ACTOR=0 CODE=$CODE ./prof2.sh ${PYTAG:-prof-b54-py} 4500 18.3
+  echo "$(date +%T) ${PYTAG:-prof-b54-py} (python path, same tree) done rc=$?" >> $LOG
   sleep 5; guard
 fi
 if want nocf; then
