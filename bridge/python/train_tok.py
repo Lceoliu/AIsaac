@@ -4967,6 +4967,7 @@ def main(argv=None, child=None, actor=None):
                     if rec_ is not None:
                         consume_record(rec_, prof_)
                     if lanes.driver is not None:   # B54: the lane rounds go to the driver; the tick never pauses it
+                        drain_driver(prof_)   # (the queued records first: their CF captures make the points branches begin at)
                         _lane_tick(prof_)
                     elif sampler.poll_lanes() or lanes.in_flight:   # (B52: lane rounds on the shared arena: the driver paused)
                         cpp_driver.pause(); drain_driver(prof_)

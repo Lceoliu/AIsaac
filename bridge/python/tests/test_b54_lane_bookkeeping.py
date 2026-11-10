@@ -225,3 +225,27 @@ def test_lane_service_driver_mode_point_released_while_in_flight():
     reclaim(s, svc)
     svc.tick()
     assert svc.fly is None and s.lane_out[0, 4] == 77
+
+
+def test_lane_service_driver_mode_branch_waits_for_its_capture():
+    """A branch's first request for a point whose capture record the consumer has not taken yet (the driver replied
+    first): it waits in lane_ready and is served once the point exists; one whose point never comes is answered as
+    cancelled after DEFER_S (4090 prof-b54-cpp: KeyError in _begin)."""
+    m, main, s, svc, fake = setup(True)
+    rng = np.random.default_rng(64)
+    rows = synth_rows(rng, 2); rows['first'] = 0
+    s.request(1, rows[0], synth_pending(rng, 1, m.heads)[0], seq=81, tbegin=2)   # (point 1: not captured yet)
+    svc.tick()
+    assert svc.fly is None and s.lane_ready == [1] and not fake.queue
+    assert svc.capture_point(1, main.snapshot(1), m, model_version=0)
+    s.lane_first_t -= 1.0   # (the window is due)
+    assert svc.tick() and svc.fly is not None
+    assert fake.run() == 1
+    reclaim(s, svc); svc.tick()
+    assert svc.fly is None and s.lane_out[1, 4] == 81 and s.lane_out[1, 5] == 0
+    # a point that never comes: cancelled after DEFER_S
+    svc.DEFER_S = 0.0
+    s.request(0, rows[1], synth_pending(rng, 1, m.heads)[0], seq=82, tbegin=4)
+    svc.tick()
+    assert svc.fly is None and s.lane_out[0, 4] == 82 and s.lane_out[0, 5] == -1
+    assert svc.stat['lane_orphan_requests'] == 1 and svc.stat['lane_deferred_requests'] >= 1

@@ -68,6 +68,7 @@ def driver_ring(driver, actor, lane):
 
 class BlockLaneService(LaneService):
     RECLAIM_S=0.1   # B46: at most this often the context / injury-source reclamation (service_control)
+    DEFER_S=2.0     # B54: a branch request whose point is not captured yet waits at most this long, then is cancelled
     def __init__(self, sampler, model, device, wait=.002, quiet=.0005, distill_steps=8,main_actor=None,stat=None):
         super().__init__(sampler, model, device, len(model.heads), gtok=True,
                          wait=wait, quiet=quiet, async_=False,stat=stat)
@@ -97,6 +98,7 @@ class BlockLaneService(LaneService):
         self.drv_jobs={}
         self.job_serial=0
         self.py_mode=False      # (B54: serve_wait with the driver paused steps rounds on the Python path)
+        self.deferred_begin={}  # (B54: lane -> when its branch request first waited for its point's capture)
         self.ring_dirty=set()   # (B54: (generation, lane) rows the Python path stepped: their ring re-set before a job)
 
     def attach_driver(self, driver):
@@ -478,6 +480,29 @@ class BlockLaneService(LaneService):
         if not len(idx):
             return False
         t0 = time_.perf_counter()
+        # (B54: a branch's first request can arrive before the consumer has taken the main record whose CF capture
+        # makes its point -- the driver replies before the record is consumed. Such a request waits for the capture
+        # (back into lane_ready), at most DEFER_S, then is answered as cancelled (a point that never came).)
+        keep, back = [], []
+        for lane in idx.tolist():
+            begin, seq = int(s.lane_io[lane, 11]), int(s.lane_io[lane, 10])
+            if begin > 0 and (begin-1) not in self.points and self.cancelled_requests.get(lane) != seq:
+                first = self.deferred_begin.setdefault(lane, t0)
+                if t0-first < self.DEFER_S:
+                    back.append(lane); continue
+                self.cancelled_requests[lane] = seq
+                self.stat['lane_orphan_requests'] = self.stat.get('lane_orphan_requests', 0)+1
+            self.deferred_begin.pop(lane, None)
+            keep.append(lane)
+        if back:
+            if not s.lane_ready:
+                s.lane_first_t = t0
+            s.lane_last_t = t0
+            s.lane_ready.extend(back)
+            self.stat['lane_deferred_requests'] = self.stat.get('lane_deferred_requests', 0)+len(back)
+        idx = np.asarray(keep, np.int64)
+        if not len(idx):
+            return False
         n = len(idx)
         self.stat['held_s'] += max(0.0, t0 - getattr(s, 'lane_first_t', t0))
         self.seen[idx] = t0
