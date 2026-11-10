@@ -290,6 +290,7 @@ def test_driver_lanes_pressure_restores_and_jobs_while_workers_step():
     jobs = {}
     lane_recs = [0, 0]   # merged, lane-only
     restores = [0]
+    submitted = [0]
     state_lock = threading.Lock()   # (the test's mirror of the consumer: one thread at a time)
     ctxs = []                      # recent main contexts to restore lanes from
     stop = threading.Event()
@@ -318,6 +319,7 @@ def test_driver_lanes_pressure_restores_and_jobs_while_workers_step():
                 jid += 1
                 with state_lock:
                     jobs[jid] = (g, lanes, rows)
+                    submitted[0] += 1
                 submit(d, jid, ga, rows, pend, lanes, lrng.integers(0, 10**6, len(lanes)), np.zeros(len(lanes), bool), ga.version)
                 done_jobs.acquire()   # (one job of these lanes in flight at a time: the next restore after its record)
 
@@ -385,12 +387,15 @@ def test_driver_lanes_pressure_restores_and_jobs_while_workers_step():
             break
         if r['kind'] == 4:
             with state_lock:
-                jobs.pop(int(r['job']), None)
+                jobs.pop(int(r['job']))   # (KeyError: a second record of a job)
+                lane_recs[int(r['merged']) == 0] += 1
     d.pause(); d.stop()
     assert d.last_error() == ''
     c = d.counters()
-    assert restores[0] > 5 and lane_recs[0] > 0 and lane_recs[1] > 0, (restores, lane_recs, c)
-    assert c['lane_jobs'] >= sum(lane_recs)
+    # every submitted job answered exactly once (none lost, none twice); how many merged is the race's (the merged path's
+    # correctness: test_merged_batches_match_python_merged_call_and_keep_the_reply_order, which merges every step)
+    assert not jobs and sum(lane_recs) == submitted[0] == c['lane_jobs'], (lane_recs, submitted, c['lane_jobs'], len(jobs))
+    assert restores[0] > 5 and lane_recs[1] > 0, (restores, lane_recs, c)
     for w in range(W):
         assert int(a.state.step_host[w]) == K
 
