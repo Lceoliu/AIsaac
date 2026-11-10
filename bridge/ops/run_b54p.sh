@@ -21,8 +21,8 @@ if want smoke; then   # 2 updates with the driver: does the integration run at a
   sleep 5; guard
 fi
 if want cpp; then
-  CODE=$CODE ./prof2.sh prof-b54-cpp 4500 18.3
-  echo "$(date +%T) prof-b54-cpp done rc=$? $(grep -c 'collect' $R/prof-b54-cpp/progress.csv 2>/dev/null) rows; driver: $(grep -m1 'B54 cpp actor driver' $R/prof-b54-cpp.stdout | cut -c1-120)" >> $LOG
+  CODE=$CODE ./prof2.sh ${CPPTAG:-prof-b54-cpp} 4500 18.3
+  echo "$(date +%T) ${CPPTAG:-prof-b54-cpp} done rc=$?" >> $LOG
   sleep 5; guard
 fi
 if want py; then
