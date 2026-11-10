@@ -53,7 +53,7 @@ for S in "$@"; do
     echo "$(date '+%F %T') L lean spread rc=$? $(tail -1 $R/b62-lean-spread.log | cut -c1-300)" >> $LOG
     ;;
   P24|Y24)   # (24 updates, stopped by SIGINT to the train_tok main process; Y24: ISAAC_CUDA_BLOCKING_SYNC=$SYNC)
-    TAG=prof-b62-$S${SYNC:+-$SYNC}
+    TAG=${PTAG:-prof-b62-$S${SYNC:+-$SYNC}}
     python3 $OPS/b57_threads.py $R/$TAG.threads.csv 1.0 > $R/$TAG.threads.log 2>&1 &
     THR=$!
     cd $ROOT
