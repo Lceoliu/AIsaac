@@ -9,8 +9,9 @@ the code before and after B60). The setting is test_b48_prefetch's (other_call F
 history_mode random, max_rows 4096) + the test's loss + backward + Adam step; one intra-op thread, deterministic
 algorithms (warn only), CUBLAS_WORKSPACE_CONFIG as the runner. A reference serial run R, then `pairs` serial runs
 and `pairs` prefetched runs (each part's preparation queued on PREFETCH after the previous part's forward), each
-compared with R item by item in order (per part: loss, outputs, gradients in named_parameters order): max |diff|
-in ulps (np.spacing of the larger magnitude, float32) and the first item that differs."""
+compared with R item by item in order (per part: loss, outputs, gradients in named_parameters order): the largest
+|diff| (the B48 test's measure) and its item, the largest diff in ulps at each item's own scale, the first item that
+differs."""
 import json
 import os
 import sys
@@ -61,19 +62,22 @@ def run(prefetch):
 
 
 def compare(a, b):
-    """(max ulps over every item, first differing item or None, its ulps)."""
-    worst, first, first_u = 0.0, None, 0.0
+    """Per pair: the largest |diff| over every item (the B48 test's measure), the item it is in, the largest diff in
+    ulps at each item's own scale (np.spacing of the item's max |value|, float32: an element-wise ulp count is
+    meaningless for near-zero gradient elements), and the first item that differs."""
+    worst_abs, worst_item, worst_scaled, first = 0.0, None, 0.0, None
     for (na, x), (nb, y) in zip(a, b):
         assert na == nb and x.shape == y.shape
         d = np.abs(x.astype(np.float64)-y.astype(np.float64))
         if not d.any():
             continue
-        sp = np.spacing(np.maximum(np.abs(x), np.abs(y)).astype(np.float32)).astype(np.float64)
-        u = float((d/np.maximum(sp, np.finfo(np.float32).tiny)).max())
-        if first is None:
-            first, first_u = na, u
-        worst = max(worst, u)
-    return worst, first, first_u
+        first = first or na
+        m = float(d.max())
+        scale = float(np.spacing(np.float32(max(np.abs(x).max(), np.abs(y).max()))))
+        worst_scaled = max(worst_scaled, m/max(scale, float(np.finfo(np.float32).tiny)))
+        if m > worst_abs:
+            worst_abs, worst_item = m, na
+    return dict(max_abs=worst_abs, max_abs_item=worst_item, max_scaled_ulps=worst_scaled, first=first)
 
 
 def main():
@@ -85,17 +89,20 @@ def main():
     res = dict(code=code, torch=torch.__version__, pairs=pairs, serial=[], prefetched=[])
     for i in range(pairs):
         for kind, pf in (('serial', False), ('prefetched', True)):
-            w, first, fu = compare(ref, run(pf))
-            res[kind].append(dict(max_ulps=w, first=first, first_ulps=fu))
-            print(json.dumps(dict(i=i, kind=kind, max_ulps=round(w, 2), first=first)), flush=True)
+            c = compare(ref, run(pf))
+            res[kind].append(c)
+            print(json.dumps(dict(i=i, kind=kind, **c)), flush=True)
     for kind in ('serial', 'prefetched'):
-        u = [round(r['max_ulps']) for r in res[kind]]
-        res[kind+'_hist'] = {'0': u.count(0), '1': u.count(1), '2': u.count(2), '>2': sum(x > 2 for x in u)}
-        firsts = {}
-        for r in res[kind]:
-            if r['first']:
-                firsts[r['first']] = firsts.get(r['first'], 0)+1
-        res[kind+'_first_items'] = firsts
+        u = [round(r['max_scaled_ulps']) for r in res[kind]]
+        res[kind+'_scaled_ulps_hist'] = {'0': u.count(0), '1': u.count(1), '2': u.count(2), '3-4': sum(3 <= x <= 4 for x in u),
+                                         '>4': sum(x > 4 for x in u)}
+        res[kind+'_max_abs'] = sorted(r['max_abs'] for r in res[kind])
+        for key in ('first', 'max_abs_item'):
+            cnt = {}
+            for r in res[kind]:
+                if r[key]:
+                    cnt[r[key]] = cnt.get(r[key], 0)+1
+            res[kind+'_'+key+'_items'] = cnt
     res['seconds'] = round(time.perf_counter()-t0, 1)
     print(json.dumps({k: v for k, v in res.items() if k not in ('serial', 'prefetched')}), flush=True)
     with open(out, 'w') as f:
