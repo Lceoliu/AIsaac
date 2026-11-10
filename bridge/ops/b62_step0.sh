@@ -120,6 +120,18 @@ for S in "$@"; do
     echo "$(date '+%F %T') NC analysis rc=$? $(tr '
 ' ' ' < $R/$TAG.idle.txt | cut -c1-500)" >> $LOG
     ;;
+  R)   # (B62 capture repro, not timed: the gate's test files in its order up to test_b54_driver_lanes, RLOOPS runs per
+    #   ISAAC_LEARN_CKPT_LEAN value in RLEAN; tests/conftest.py's leftover-work check names the test and threads)
+    cd $ROOT/$CODE/bridge/python
+    FILES=$(ls tests/test_*.py | LC_ALL=C sort | awk '{print} /test_b54_driver_lanes.py/{exit}')
+    mkdir -p $R/repro
+    for L in ${RLEAN:-0 1}; do i=1; while [ $i -le ${RLOOPS:-10} ]; do
+      RL=$R/repro/b62r-$CODE-L$L-$i-$(date +%m%d-%H%M%S).log
+      ISAAC_LEARN_CKPT_LEAN=$L CUBLAS_WORKSPACE_CONFIG=:4096:8 ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 OMP_NUM_THREADS=1 \
+        timeout 900 $PY -m pytest $FILES -q -p no:cacheprovider > $RL 2>&1
+      echo "$(date '+%F %T') R $CODE LEAN=$L run $i rc=$? $(tail -1 $RL | cut -c1-120) | first: $(grep -m1 '^FAILED\|^ERROR' $RL | cut -c1-400)" >> $LOG
+      i=$((i+1)); done; done
+    ;;
   T)   # (the B60 / B62 unit tests and the B48 prefetch test on this host)
     cd $ROOT/$CODE/bridge/python
     CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=1 timeout 300 $PY -m pytest tests/test_b60_native_pack.py       tests/test_b48_prefetch.py tests/test_block_packed_learner.py -q -p no:cacheprovider > $R/tests-b62-t-$CODE-$(date +%m%d-%H%M).log 2>&1
@@ -184,11 +196,11 @@ for S in "$@"; do
     kill $THR 2>/dev/null
     ;;
   esac
-  give $S
-  if [ $S = NB ]; then   # (CPU only, after the lock)
+  if [ $S = NB ]; then   # (CPU only, still inside the lock: no CPU work beside another session's timed run)
     T_=b62-bench-cuda
     python3 $OPS/b62_gpu_idle.py $R/$T_.nsys-rep > $R/$T_.idle.txt 2>&1
     echo "$(date '+%F %T') $S analysis rc=$? $(tail -3 $R/$T_.idle.txt | tr '
 ' ' ' | cut -c1-400)" >> $LOG
   fi
+  give $S
 done

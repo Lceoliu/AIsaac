@@ -60,6 +60,64 @@ def capture_yield():
         ucount('learn_yield_wait_s',time.perf_counter()-t);ucount('learn_yields_given',1)
 
 
+class SideCuda:
+    """B62: CUDA calls made off the threads that hold the capture admission vs the actor's graph captures.
+
+    The admission (CUDA_CAPTURE_ADMISSION) keeps the learner thread's submissions out of a capture; the learner
+    prefetch worker (block_learner.Prefetch, B48/B60) runs beside the learner thread without it, and its staging
+    (block_learner.Staging.acquire: event queries / synchronisations, pinned allocations and frees) makes CUDA calls.
+    capture_yield hands the admission to a waiting actor capture between two learner parts while the worker already
+    prepares the next part: one such call during a global-mode capture invalidates it ('operation failed due to a
+    previous error during capture'). The worker cannot take the admission itself (the learner thread holds it for the
+    whole update), so those calls take call() (shared, short) and graph_capture takes capture() (exclusive): a capture
+    waits for the calls under way, calls wait while a capture runs. ENABLED=False (tests' control group only) turns
+    both into no-ops."""
+    ENABLED = True
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.active = 0      # calls under way
+        self.capturing = 0   # captures under way or waiting for the calls
+        self.waits = 0       # calls that found a capture under way (tests)
+
+    @contextmanager
+    def call(self):
+        if not self.ENABLED:
+            yield
+            return
+        with self.cv:
+            if self.capturing:
+                self.waits += 1
+            while self.capturing:
+                self.cv.wait()
+            self.active += 1
+        try:
+            yield
+        finally:
+            with self.cv:
+                self.active -= 1
+                self.cv.notify_all()
+
+    @contextmanager
+    def capture(self):
+        if not self.ENABLED:
+            yield
+            return
+        with self.cv:
+            self.capturing += 1   # (calls arriving from now on wait)
+            while self.active:
+                self.cv.wait()
+        try:
+            yield
+        finally:
+            with self.cv:
+                self.capturing -= 1
+                self.cv.notify_all()
+
+
+SIDE_CUDA = SideCuda()
+
+
 @contextmanager
 def graph_capture(graph,stream,pool=None):
     """torch.cuda.graph(graph, stream=stream) without its gc.collect() and empty_cache().
@@ -72,21 +130,23 @@ def graph_capture(graph,stream,pool=None):
     B58: the cyclic garbage collector is off while the capture runs: an automatic collection inside it could free a
     dropped actor's CUDA graph or pinned buffers (CUDA calls during a global-mode capture: 'operation failed due to a
     previous error during capture', test_driver_with_lanes_same_seed_reproducible once on the 4090). An unconfirmed
-    mitigation: the cause was not shown (3 reruns before the fix passed as well)."""
+    mitigation: the cause was not shown (3 reruns before the fix passed as well).
+    B62: also exclusive of the CUDA calls made off the admission (SIDE_CUDA: the learner prefetch worker's staging)."""
     import gc as gc_
-    torch.cuda.synchronize()
-    was = gc_.isenabled()
-    gc_.disable()
-    try:
-        with torch.cuda.stream(stream):
-            graph.capture_begin(pool=pool,capture_error_mode='global')
-            try:
-                yield graph
-            finally:
-                graph.capture_end()
-    finally:
-        if was:
-            gc_.enable()
+    with SIDE_CUDA.capture():
+        torch.cuda.synchronize()
+        was = gc_.isenabled()
+        gc_.disable()
+        try:
+            with torch.cuda.stream(stream):
+                graph.capture_begin(pool=pool,capture_error_mode='global')
+                try:
+                    yield graph
+                finally:
+                    graph.capture_end()
+        finally:
+            if was:
+                gc_.enable()
 
 
 def capture_admission(key):

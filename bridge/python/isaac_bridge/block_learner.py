@@ -249,6 +249,17 @@ class Prefetch:
             self.misses += 1
             bp.ucount('learn_prefetch_dropped', 1)
 
+    def close(self, timeout=10.0):
+        """(B62) Queued parts given up, the worker stopped (joined); the next submit starts a new one. True when no
+        worker is left alive."""
+        self.drop()
+        t = self.thread
+        if t is not None and t.is_alive():
+            self.q.put(None)
+            t.join(timeout)
+        self.thread = None if t is None or not t.is_alive() else t
+        return self.thread is None
+
 
 PREFETCH = Prefetch()
 
@@ -461,6 +472,13 @@ class Staging:
         self.allocs = 0
 
     def acquire(self, n):
+        """(B62) Its CUDA calls (event query / synchronisation, the pinned allocation, the old buffer's free) under
+        block_training.SIDE_CUDA: the prefetch worker calls this without the capture admission."""
+        from .block_training import SIDE_CUDA
+        with SIDE_CUDA.call():
+            return self._acquire(n)
+
+    def _acquire(self, n):
         with self.lock:
             free = [i for i, b in enumerate(self.bufs) if not b[2]]
             fit = [i for i in free if self.bufs[i][0].numel() >= n]
