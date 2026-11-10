@@ -178,12 +178,10 @@ class Prefetch:
                 bp.ucount('learn_prefetch_host_s', time.perf_counter()-t0)
                 bp.ucount('learn_prefetch_cpu_s', time.thread_time()-c0)
             ev.set()
-            # (B62) the worker's own references dropped now, as one side call: kept until the next job they could be
-            # the last ones to a pinned staging buffer the learner replaced meanwhile, freed here outside the
-            # capture admission (the host allocator records events on the free)
-            from .block_training import SIDE_CUDA
-            with SIDE_CUDA.call():
-                del model, chunks, full, box, ev
+            # (B62) the worker's own references dropped now rather than at the next job. Not a SIDE_CUDA call: freeing
+            # a pinned buffer (used in a copy or not) from another thread does not break a global-mode capture
+            # (b62_capture_probe pin_free_used / pin_free_plain, 3090 + cu128, repeated)
+            del model, chunks, full, box, ev
 
     def submit(self, model, chunks, grad=True, **kw):
         """Queue the preparation of a later forward_packed(model, chunks, **kw) call in grad mode `grad`; False when

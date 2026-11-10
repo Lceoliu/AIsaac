@@ -24,6 +24,22 @@ import pytest
 
 LINGER_S = 2.0
 POOL_PREFIXES = ('pt_', 'cuda')   # (pt_autograd_N, pt_thread_pool; cuda-EvtHandlr, cuda000...: process-lifetime)
+# Python threads of process-lifetime pools (approved, BM1 gates): Inductor's compile-worker pool reader, matched by its
+# exact name; a DummyThread (a thread Python did not start that called into Python) only when its native name is a
+# torch pool's (pt_*, e.g. the autograd engine's device threads running checkpoint hooks)
+POOL_PY_NAME = __import__('re').compile(r'^Thread-\d+ \(_read_thread\)$')
+
+
+def _pool_thread(t):
+    if POOL_PY_NAME.match(t.name):
+        return True
+    if t.name.startswith('Dummy-'):
+        try:
+            with open(f'/proc/self/task/{t.native_id}/comm') as f:
+                return f.read().strip().startswith('pt_')
+        except (OSError, TypeError):
+            return False
+    return False
 _DRIVERS = []   # weak references to the drivers made since the current test started
 
 
@@ -106,7 +122,7 @@ def nothing_left_running(request):
     # threads started during the test, given LINGER_S to end
     deadline = time.monotonic()+LINGER_S
     while True:
-        py = [t for t in threading.enumerate() if t.ident not in py0 and t.is_alive()]
+        py = [t for t in threading.enumerate() if t.ident not in py0 and t.is_alive() and not _pool_thread(t)]
         py_native = {t.native_id for t in threading.enumerate()}
         nat = _tasks()
         new_nat = {} if nat is None or nat0 is None else {
