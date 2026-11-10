@@ -10671,7 +10671,7 @@ B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都�
 - 这 5 个 collect 是 u3 到 u7，还没到稳态。每作业行数在各轮相差一倍（3.8 到 8.0），所以“M1 作业数降约 40%”只是从行占比推的估计。M1 的计时运行直接记作业级计数。
 - 裁决：批准 M1（当前版本的 lane 作业并入下一个主批，在 driver 线程上），排在 B58e 之后。M2 和 T 等 M1 的计时结果再定，lane 线程保持默认关闭。
 
-### B58e 主线程不再逐步进 Python：事件分批、阻塞等待、计数在 C++（2026-11-11，部分完成：E 臂计时跑完，同树对照没跑完，4090 已到期）
+### B58e 主线程不再逐步进 Python：事件分批、阻塞等待、计数在 C++（2026-11-11 4090 部分完成；2026-11-10 8x3090 同树对照完成）
 
 #### 实验目的
 
@@ -10750,18 +10750,59 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
   - 缺同树 24 轮对照，所以“CF 不变差”只能跨会话比较。是否据此验收由协调方定。
 - **数据位置**：本地存档 archive-cloud4090-20261111/bundle-d-delta-final.tar.zst 中的 reports/b42-speed/prof-e-batch1 和 prof-e-batch0、对应的 .stdout 和 .samples.csv、b58.log。nsys 的 prof-e-m 在 bundle-n 和 bundle-a。
 
-#### 之后的代码（未编译未运行：4090 已到期，M1 和 pause() 修复都没在 GPU 机器上编译、测试或计时过）
+#### 8x3090 上的同树对照（2026-11-10，验收数据）
+
+- **机器**：8x3090（主机 dgene）：2x Xeon Gold 6146、RTX 3090、torch 2.7.1+cu128、驱动 580。cpp 道：NUMA node1（CPU 12-23,36-47、内存节点 1）、GPU 4、Docker 容器（64 g，只读根，--network none）。计时口径是 A1 移植的 bm1/prof.sh（4090 的 P24：xnew2 配置、24 轮、30.0 游戏小时上限、第 24 轮后 SIGINT、M0 采样）。脚本是本分支加了 LANE 参数的版本（bridge/ops/bm1，LANE=cpp），A1 道的行为不变。
+- **树**：c-db1bd49（分支 db1bd49）。M1 默认关（ISAAC_BLOCK_LANE_MERGE 未设），两臂都是 B58e 的配置；差别只有 ISAAC_BLOCK_CPP_BATCH。stdout 确认：原生 consumer / 谱系 / lane（driver 线程）都开，batch1 臂 "B58e batched records: on"，batch0 臂 "off (ISAAC_BLOCK_CPP_BATCH=0)"。
+- **门**（gate3.sh，GPU 4，不计时）：
+  - 新测试单独跑：25 passed、1 xfailed。xfail 的是 M1 的 restore 顺序对照组：它在 3090 上不失败，因为 restore 里有一次从普通内存到 GPU 的拷贝或锁页分配，会让 lane 流上的 restore 先完成。协调方定为已知未决，M1 验收时处理。
+  - entry 3 passed；全部测试 261 passed、3 skipped、1 xfailed；A8 8/8。
+  - 协调方预告的五个已知项（test_b48 两项、test_b54 pressure、test_b60 的遗留线程、test_b52 时序）这次一个都没出现。
+  - 之前一棵树（c-66194a3）的门挂在 test_b54_lane_bookkeeping 上：quiesce 对 B54 的假 driver 也用了 pause_serving。已修（db1bd49）：只有原生 lane 才用 pause_serving。
+- **两臂**（GPU 4，背靠背，各 24 轮，29.14 游戏小时）：
+
+| u10–u23 中位 / u15 | BATCH=1（B58e） | BATCH=0（每步一条记录） |
+|---|---:|---:|
+| ×实时 | 142.2 | 144.4 |
+| collect / update / wait_learner（s） | 29.80 / 17.77 / 0.00 | 29.77 / 18.72 / 0.00 |
+| u2–u23：collect / update / ×实时 | 29.53 / 17.64 / 145.3 | 28.99 / 18.31 / 149.3 |
+| u15 cf_done / cf_nobank / cf_queue / cf_dropped | 96 / 1 / 0 / 0 | 96 / 0 / 0 / 0 |
+| done/s，lane 调用 /s，done /游戏小时（到 u15） | 0.222，327，5.27 | 0.225，304，5.27 |
+| driver 里 lane 秒 / 主步 sync（s / collect） | 12.53 / 12.41 | 11.87 / 12.74 |
+| 每 collect lane 作业 | 2,621 | 2,414 |
+| 点寿命 p50 / p90（s） | 28.8 / 41.6 | 25.4 / 39.0 |
+| lane 请求从读到回复 p50 | 5.0 ms | 4.6 ms |
+| 容器内存峰值 / 稳态中位（GB），宿主最低可用 | 44.3 / 37.0，59.7 | 46.4 / 39.6，59.8 |
+| 容器占核（稳态），GPU 4 利用率中位 | 9.42，84% | 9.55，82% |
+
+- **其他租户和 node0**：
+  - 稳态窗口里其他 GPU（0、6、7 和 A1 的 1–3）利用率中位都是 0%。
+  - node0 的 24 个 CPU 平均忙 10%（BATCH=1）和 8%（BATCH=0），合计 2.3 和 1.8 核。
+  - 本道 24 个 CPU 平均忙 40%，合计 9.6 核。
+- **结论**：
+  - CF 约束门两臂都过：u15 cf_done ≥ 92、nobank ≤ 70、队列 ≤ 3、丢弃 0。
+  - ×实时差 1.5%（142.2 对 144.4），collect 几乎相同（29.80 对 29.77），在单次运行的噪声内。B58e 在这台机器上不改变吞吐。
+  - update 短 0.95 s（17.77 对 18.72），方向和 4090 nsys 看到的 learner GIL 等待减半一致，只有一次运行，不下定论。
+  - collect 的瓶颈在 driver 线程：lane 作业约 12 s、主步 sync 约 12 s，不在主线程，所以主线程省下的 GIL 不体现在 collect 上。这部分归 M1 / d2。
+- **未测**：主线程 GIL 持有和每周期 Python 进入次数。prof.sh 不带 nsys，nsys 版的包装还没移植到这台机器，待验收方决定是否补。4090 上同样配置的结果见上文：GIL 持有 0.18 s / 周期，顶层进入约 50 次 / 周期。
+- **数据**：主机 bm1/cpp/reports/e3-batch{1,0}-c-db1bd49（progress.csv、.stdout、.summary.txt、.mem.csv、.mpstat、.gpu、.allgpu），gate3-c-db1bd49.*，bm1.log。
+
+#### 之后的代码（M1 和 pause() 修复：4090 上未编译未运行；状态更新见各条）
 
 - **d2 M1**（075a21d 起）：
   - 当前版本的 lane 作业在 driver 线程的合并队列里等下一个主批；组批时重判版本；被拒、换权重、driver 空转的作业在同一个 pass 里跑 lane-only；等待期间钉住代槽；M1 时 lane GPU 工作都在主流上。
   - 新计数：合并作业和行数、lane-only 按原因分、合并等待；产能量 lt_worker_s 和 pt_live_mean / max。
   - 测试 test_b58f_m1。设计说明在共享笔记 cpp-actor-m1-design.md。
-  - 状态：未编译未运行。test_b58f_m1 没跑过，TSAN 没重跑，M1 的计时（MERGE=1 对 MERGE=0）没做。
+  - 状态（3090，c-db1bd49）：默认关（ISAAC_BLOCK_LANE_MERGE=1 才开）。test_b58f_m1：
+    - 合并轮次与 Python 合并路径逐位一致（包括在途释放、换权重、交接）；
+    - MERGE=0 等于 d1；
+    - restore 顺序对照组 xfail（已知未决）。
+  - TSAN 没重跑，M1 计时没做。
 - **driver 阻塞等待**（ba4516d，A1 的发现）：
   - d1 下 driver 线程在 lane_wait_python 等一条主线程还没读的 lane 记录时，主线程调 pause() 会永远等，stop() 会 join 一个永远在等的线程。
   - 修法：pause() 在这种状态下报错；train_tok 四处暂停和 quiesce 改用 `pause_serving`（先请求暂停，再边消费记录边等）；lane 等待认 stop()。
   - 测试 test_b58g_pause。
-  - 状态：问题是读代码确认的，没在 4090 上复现；修复和测试未编译未运行。计时的 E 臂（candidate-b58e）是修复之前的代码。
+  - 状态：4090 上未运行（那次计时的 E 臂是修复之前的代码）。3090 上 test_b58g_pause 两项通过：pause() 在 1 s 内报错，pause_serving 返回时 driver 已停、lane 已回复，stop() 结束 lane 等待。3090 的两臂用的是修复之后的树。
 
 ### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
 
