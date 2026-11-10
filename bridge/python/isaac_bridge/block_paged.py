@@ -904,6 +904,11 @@ _UNPACK_KEYS = ('v_room', 'v_map', 'v_body', 'v_body_mask', 'v_local', 'v_local_
 _STEP_POOLS = {}
 
 
+def scratch_of(actor):
+    """(B58d) The arena row an actor's step graphs pad with: the last row, or a lane actor's own (scratch_row)."""
+    return int(getattr(actor, 'scratch_row', actor.state.slots-1))
+
+
 def _step_pool(device, stream, tag='main'):
     """(B46) The actor step graphs' shared memory pool of a device. A pool lives while a graph
     using it does: a one-op keepalive graph is captured into it first and kept, so the pool
@@ -973,7 +978,8 @@ class ActorStepGraph:
         layout, _ = self._layout(widths, cap, heads, nh)
         flat, host, hv, graph, out, current, z, written, back, filled = self.graphs[key]
         self.driver.register_graph([self.owner, cap, *widths], host, flat, graph, out, current, z, written, *back,
-                                   {k: (int(v[0]), tuple(int(x) for x in v[1]), str(v[2])) for k, v in layout.items()}, heads, nh)
+                                   {k: (int(v[0]), tuple(int(x) for x in v[1]), str(v[2])) for k, v in layout.items()}, heads, nh,
+                                   int(scratch_of(self.actor)))
 
     def _layout(self, widths, cap, heads, nh):
         shapes = {}
@@ -1068,7 +1074,7 @@ class ActorStepGraph:
             if len(self.graphs) >= self.limit:
                 self.graphs.popitem(last=False)
             dev = self.device
-            scratch = self.actor.state.slots-1
+            scratch = scratch_of(self.actor)
             # Normal (not inference-mode) tensors, as from_host makes: the compiled decoder and
             # Spatial guard on the dispatch keys (an inference tensor recompiled them).
             with torch.inference_mode(False):
@@ -1201,7 +1207,7 @@ class ActorStepGraph:
             for k in _STEP_KEYS:
                 hv[k][n:m] = 0
         filled[0] = n
-        hv['ids'][n:] = self.actor.state.slots-1
+        hv['ids'][n:] = scratch_of(self.actor)
         hv['ids'][:n] = rows_ids
         hv['u'][:] = .5
         if u is not None:
@@ -1259,7 +1265,9 @@ class SlotBlockActor:
         if arena is None:
             # B42 glue 5: one extra arena row (the scratch row padded graph rows address).
             self.lane_slots, self.lane_generations = int(lane_slots), int(lane_generations)
-            total = slots+self.lane_slots*self.lane_generations+int(graph_step)
+            # (B58d: with the lane pool on, a second scratch row for the lane graphs: they replay concurrently with the main
+            # graphs on another stream, and their padded rows must not share a row with the main graphs')
+            total = slots+self.lane_slots*self.lane_generations+int(graph_step)+int(graph_step and self.lane_slots > 0 and LANE_POOL)
             self.state = BlockSlotState(cfg, total, device=device, kv_dtype=kv_dtype)
         else:
             self.lane_slots, self.lane_generations = 0, 0
@@ -1289,6 +1297,8 @@ class SlotBlockActor:
         lane.device_result = self.device_result
         if lane.step_graph is not None and LANE_POOL:   # (B58d: the lane graphs in a pool of their own)
             lane.step_graph.pool_tag = 'lane'
+            if arena is not None and self.step_graph is not None:
+                lane.scratch_row = self.state.slots-2   # (and their own scratch row)
         if PRECAPTURE and lane.step_graph is not None:
             # B42 fix 2: its lane-only step graphs now (a capture refused while the learner holds
             # the admission stays lazy)

@@ -425,6 +425,7 @@ struct GraphEntry {
   at::Tensor out, cur, z, written;                // device outputs
   at::Tensor bo, bc, bz, bw;                      // pinned D2H buffers
   Layout L;
+  i64 scratch = -1;                               // (B58d) the arena row its padded rows address (-1: the driver's)
   i64 filled = 0;                                 // rows of the slab holding a call's rows (zeroed past the next call's n)
   i64 heads, nh;
 };
@@ -750,12 +751,13 @@ struct ActorDriver {
   }
   void register_graph(std::vector<i64> key, at::Tensor host_flat, at::Tensor dev_flat, std::shared_ptr<at::cuda::CUDAGraph> graph,
                       at::Tensor out, at::Tensor cur, at::Tensor z, at::Tensor written, at::Tensor bo, at::Tensor bc, at::Tensor bz,
-                      at::Tensor bw, py::dict layout, i64 heads_, i64 nh_) {
+                      at::Tensor bw, py::dict layout, i64 heads_, i64 nh_, i64 scratch_) {
     TORCH_CHECK(key.size() == 6, "graph key: (owner, cap, wb, we, wn, ws)");
     GraphEntry e;
     e.cap = key[1]; e.wb = key[2]; e.we = key[3]; e.wn = key[4]; e.ws = key[5];
     e.host_flat = host_flat; e.dev_flat = dev_flat; e.graph = std::move(graph);
     e.out = out; e.cur = cur; e.z = z; e.written = written; e.bo = bo; e.bc = bc; e.bz = bz; e.bw = bw; e.heads = heads_; e.nh = nh_;
+    e.scratch = scratch_;
     auto o = [&](const char *k) { return layout[k].cast<py::tuple>()[0].cast<i64>(); };
     e.L.room = o("v_room"); e.L.map = o("v_map"); e.L.body = o("v_body"); e.L.body_mask = o("v_body_mask"); e.L.local = o("v_local");
     e.L.local_mask = o("v_local_mask"); e.L.entity = o("v_entity"); e.L.entity_mask = o("v_entity_mask"); e.L.inventory = o("v_inventory");
@@ -787,7 +789,7 @@ struct ActorDriver {
     }
     e.filled = n;
     i64 *hid = (i64 *)(h+e.L.ids);
-    for (i64 i = 0; i < e.cap; i++) hid[i] = i < n ? ids[i] : scratch_row;
+    for (i64 i = 0; i < e.cap; i++) hid[i] = i < n ? ids[i] : (e.scratch >= 0 ? e.scratch : scratch_row);
     float *hu = (float *)(h+e.L.u);
     for (i64 i = 0; i < e.cap*hd; i++) hu[i] = .5f;
     if (u) memcpy(hu, u, n*hd*sizeof(float));
