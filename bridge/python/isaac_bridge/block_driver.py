@@ -95,7 +95,8 @@ DRV_FIELDS = ('drv_pause_s', 'drv_pauses', 'drv_lane_jobs', 'drv_lane_rows', 'dr
               'drv_py_lane_rounds', 'drv_py_lane_rows', 'drv_py_lane_flushed_rows', 'drv_py_lane_share',
               'drv_lane_deferred_requests', 'drv_lane_orphan_requests', 'drv_steps', 'drv_sync_s', 'drv_pages_s', 'drv_host_s',
               'drv_cap_holds', 'drv_poll_s', 'drv_prep_s', 'drv_reply_s', 'drv_cons_s', 'drv_push_s', 'drv_mlane_s',
-              'drv_hold_s', 'drv_loop_s', 'drv_polls', 'drv_idle_polls')
+              'drv_hold_s', 'drv_loop_s', 'drv_polls', 'drv_idle_polls', 'drv_lo_cur_rows', 'drv_lo_old_rows', 'drv_putback_rows',
+              'drv_enq_in_step', 'drv_enq_outside')
 # (B58 step 0) the driver thread's time by phase (abp_actor.cpp: t_*_s); pages_s leaves the consumer out since step 0
 DRV_PHASES = ('poll', 'prep', 'sync', 'reply', 'pages', 'cons', 'push', 'mlane', 'lane', 'hold', 'pause')
 
@@ -113,7 +114,8 @@ def collect_counters(c0, c1, handoff, stat, py_mark):
         stat['drv_'+k] = d[k]
     stat['drv_cap_holds'] = d.get('cap_holds', 0)   # (B57: main steps' host / GPU-wait / page seconds, held records)
     stat['drv_lane_hist'] = '/'.join(str(b-a) for a, b in zip(c0['lane_hist'], c1['lane_hist']))
-    for k in ('poll_s', 'prep_s', 'reply_s', 'cons_s', 'push_s', 'mlane_s', 'hold_s', 'loop_s', 'polls', 'idle_polls'):
+    for k in ('poll_s', 'prep_s', 'reply_s', 'cons_s', 'push_s', 'mlane_s', 'hold_s', 'loop_s', 'polls', 'idle_polls',
+              'lo_cur_rows', 'lo_old_rows', 'putback_rows', 'enq_in_step', 'enq_outside'):   # (B58d plan: merging)
         stat['drv_'+k] = d.get(k, 0)   # (B58 step 0; absent from an older extension's counters)
     # the lane rows the Python path stepped since the last collect (the actor waiting for the learner: rounds on the
     # Python path, the round in flight flushed), their share of all lane rows

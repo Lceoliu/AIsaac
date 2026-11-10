@@ -573,6 +573,10 @@ struct ActorDriver {
   // hold = lanes-only mode (main_hold) idle; loop = the loop's wall time (the rest is pause_s and bookkeeping)
   std::atomic<double> t_poll_s{0}, t_prep_s{0}, t_reply_s{0}, t_cons_s{0}, t_push_s{0}, t_mlane_s{0}, t_hold_s{0}, t_loop_s{0};
   std::atomic<i64> n_polls{0}, n_idle_polls{0};
+  // (B58d plan: why lane rows do not ride the main steps) lane-only rows at the main version / an older one, merged
+  // rows put back (the batch too wide), lane jobs queued while the driver was inside a main step / outside it
+  std::atomic<i64> n_lo_cur_rows{0}, n_lo_old_rows{0}, n_putback_rows{0}, n_enq_in_step{0}, n_enq_outside{0};
+  std::atomic<bool> in_step{false};
   // (B58c) the main rows' lineage in the driver (store->nat): observe_rows, logs, snapshots, CF captures, injury
   // sources, log pushes, the rollout sidecar; Python enters only for a generation to publish (kind 6)
   bool lin_on = false; i64 lin_tag = 0;
@@ -725,6 +729,7 @@ struct ActorDriver {
     jb->pend.assign(pending.data_ptr<i64>(), pending.data_ptr<i64>()+n*nh);
     jb->ids.assign(ids.data_ptr<i64>(), ids.data_ptr<i64>()+n); jb->seq.assign(seq.data_ptr<i64>(), seq.data_ptr<i64>()+n);
     jb->lane.assign(lane.data_ptr<i64>(), lane.data_ptr<i64>()+n); jb->replay.assign(replay.data_ptr<uint8_t>(), replay.data_ptr<uint8_t>()+n);
+    (in_step.load() ? n_enq_in_step : n_enq_outside)++;
     std::lock_guard<std::mutex> g(lmu);
     lane_q.push_back(jb);
   }
@@ -970,6 +975,7 @@ struct ActorDriver {
                 std::vector<uint8_t> replay) {
     double t0 = now();
     LaneJob jb; jb.job = job; jb.owner = gen_owner[g]; jb.version = lc.ops.gen_version(g); jb.n = (i64)lanes.size();
+    ((jb.version == version.load()) ? n_lo_cur_rows : n_lo_old_rows) += jb.n;
     jb.rows = std::move(rows); jb.pend = std::move(pend); jb.seq = seq; jb.lane = lanes; jb.replay = std::move(replay);
     for (i64 l : lanes) jb.ids.push_back(gen_base[g]+l);
     i64 k = jb.n;
@@ -1228,6 +1234,8 @@ struct ActorDriver {
     d["polls"] = n_polls.load(); d["idle_polls"] = n_idle_polls.load();
     d["cap_native"] = n_cap_native.load(); d["cap_refused"] = n_cap_refused.load(); d["cap_publish"] = n_cap_publish.load();
     d["lin_s"] = t_lin_s.load();
+    d["lo_cur_rows"] = n_lo_cur_rows.load(); d["lo_old_rows"] = n_lo_old_rows.load(); d["putback_rows"] = n_putback_rows.load();
+    d["enq_in_step"] = n_enq_in_step.load(); d["enq_outside"] = n_enq_outside.load();
     py::list h; for (auto &x : lane_hist) h.append(x.load()); d["lane_hist"] = h;
     return d;
   }
@@ -1305,7 +1313,7 @@ struct ActorDriver {
             continue;
           }
         } else { ws = ready_w; ss = ready_s; ready_w.clear(); ready_s.clear(); }
-        step_batch(ws, ss);
+        in_step = true; step_batch(ws, ss); in_step = false;
         if (!pause_req) run_lanes();   // (the other generations' jobs after the main reply, as the Python path)
         if (lanes_native && !lrunning && !pause_req) lane_pass(0);   // (B58d d1: a lane pass after every main step)
       }
@@ -1548,6 +1556,7 @@ struct ActorDriver {
     i64 wb, we, wn, wsl;
     bool ok = batch_widths(rows_ptr, n+n_lane, wb, we, wn, wsl);
     if (!ok && !merged.empty()) {   // the lanes would make the batch invalid / too wide: main rows alone
+      n_putback_rows = n_putback_rows+n_lane;
       put_back(); pack(false); ok = batch_widths(rows_ptr, n, wb, we, wn, wsl);
     }
     i64 n_tot = n+n_lane;
@@ -1666,6 +1675,7 @@ struct ActorDriver {
   bool run_lane_job(LaneJob &jb) {
     double t0 = now();
     i64 k = jb.n;
+    ((jb.version == version.load()) ? n_lo_cur_rows : n_lo_old_rows) += k;
     const uint8_t *rows_ptr = jb.rows.data();
     i64 wb, we, wn, wsl;
     bool ok = batch_widths(rows_ptr, k, wb, we, wn, wsl);
