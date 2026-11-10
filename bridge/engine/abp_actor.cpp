@@ -348,6 +348,14 @@ struct ActorDriver {
   std::atomic<double> t_pause_s{0};
   std::atomic<double> t_lane_s{0};                 // (B54) seconds in lane-only calls (fill, replay, pages, record)
   std::atomic<i64> lane_hist[6] = {};              // (B54) lane-only calls by rows: 1, 2, 3-4, 5-8, 9-16, > 16
+  // (B58 step 0) the driver thread's time by phase (s; one writer, the driver): poll = waiting for / reading the
+  // workers' messages; prep = a main step's row copies, packing, widths and inputs (t0 .. the graph); sync = the
+  // graph's fill + replay + sync (t_sync_s); reply = outputs, shared arrays, the replies; pages = the main rows' pages
+  // (t_pages_s, without the consumer since step 0); cons = the native consumer; push = waiting for room in the record
+  // queue (every record); mlane = the merged lane rows' records and pages; lane = lane-only calls (t_lane_s);
+  // hold = lanes-only mode (main_hold) idle; loop = the loop's wall time (the rest is pause_s and bookkeeping)
+  std::atomic<double> t_poll_s{0}, t_prep_s{0}, t_reply_s{0}, t_cons_s{0}, t_push_s{0}, t_mlane_s{0}, t_hold_s{0}, t_loop_s{0};
+  std::atomic<i64> n_polls{0}, n_idle_polls{0};
 
   explicit ActorDriver(std::shared_ptr<PageStore> s) : store(std::move(s)) {}
   ~ActorDriver() { stop(); }
@@ -632,6 +640,9 @@ struct ActorDriver {
     d["merged_calls"] = n_merged_calls.load(); d["lane_calls"] = n_lane_calls.load(); d["captures"] = n_captures.load();
     d["lane_python"] = n_lane_python.load(); d["pauses"] = n_pauses.load(); d["pause_s"] = t_pause_s.load();
     d["lane_s"] = t_lane_s.load(); d["cap_holds"] = n_cap_holds.load();
+    d["poll_s"] = t_poll_s.load(); d["prep_s"] = t_prep_s.load(); d["reply_s"] = t_reply_s.load(); d["cons_s"] = t_cons_s.load();
+    d["push_s"] = t_push_s.load(); d["mlane_s"] = t_mlane_s.load(); d["hold_s"] = t_hold_s.load(); d["loop_s"] = t_loop_s.load();
+    d["polls"] = n_polls.load(); d["idle_polls"] = n_idle_polls.load();
     py::list h; for (auto &x : lane_hist) h.append(x.load()); d["lane_hist"] = h;
     return d;
   }
@@ -640,10 +651,13 @@ struct ActorDriver {
   static i64 bucket(const std::vector<i64> &b, i64 m) { for (i64 w : b) if (m <= w) return w; return -1; }
 
   void push_record(std::shared_ptr<Record> r) {
+    double t0 = now();
     std::unique_lock<std::mutex> lk(qmu);
     qcv.wait(lk, [&] { return (i64)queue.size() < queue_max || stop_req; });
     queue.push_back(std::move(r));
     qcv.notify_all();
+    lk.unlock();
+    t_push_s = t_push_s+(now()-t0);
   }
   void wait_paused() {
     double t0 = now();
@@ -667,14 +681,18 @@ struct ActorDriver {
       std::vector<struct pollfd> pfds(fds.size());
       std::vector<i64> ws, ss;   // the batch: workers and row slots
       std::vector<i64> held_w, held_s;   // (B54) messages waiting for their worker's CF capture (cap_wait)
+      double t_it = now();
       while (!stop_req) {
+        { double t = now(); t_loop_s = t_loop_s+(t-t_it); t_it = t; }
         if (pause_req) { wait_paused(); continue; }
         bool lanes_waiting = lane_queue_size() > 0;
         if (main_hold) {   // (B54) lanes only
-          if (lanes_waiting) run_lanes(); else std::this_thread::sleep_for(std::chrono::microseconds(300));
+          if (lanes_waiting) run_lanes();
+          else { double t = now(); std::this_thread::sleep_for(std::chrono::microseconds(300)); t_hold_s = t_hold_s+(now()-t); }
           continue;
         }
         if (ready_w.empty()) {
+          double t_p = now();
           ws.clear(); ss.clear();
           for (size_t q = 0; q < held_w.size();) {   // held messages whose capture is done join the batch
             if (!cap_wait[held_w[q]]) { ws.push_back(held_w[q]); ss.push_back(held_s[q]); held_w.erase(held_w.begin()+q); held_s.erase(held_s.begin()+q); }
@@ -693,7 +711,8 @@ struct ActorDriver {
               fds[i] = -1;   // the worker ended (or something unexpected): its pipe leaves the poll; Python notices through its own bookkeeping
             }
           }
-          if (ws.empty()) { if (lanes_waiting) run_lanes(); continue; }
+          t_poll_s = t_poll_s+(now()-t_p); n_polls++;
+          if (ws.empty()) { n_idle_polls++; if (lanes_waiting) run_lanes(); continue; }
         } else { ws = ready_w; ss = ready_s; ready_w.clear(); ready_s.clear(); }
         step_batch(ws, ss);
         if (!pause_req) run_lanes();   // (the other generations' jobs after the main reply, as the Python path)
@@ -835,11 +854,14 @@ struct ActorDriver {
     i64 n = (i64)go_idx.size();
     if (n == 0) {   // terminal records only: reply, hand the bookkeeping over
       for (i64 i = 0; i < n_all; i++) if (cf_snap && r->cf_snap[i]) cf_snap[ws[i]] = 0;
+      double tq = now(); t_prep_s = t_prep_s+(tq-t0);
       reply_rows(ws);
       r->t_sync = r->t_reply = r->t_pages = r->t_done = now();
+      t_reply_s = t_reply_s+(r->t_reply-tq);
       finish_empty(*r);
       if (cc.on) consume(*r, rc, n_all, ws, r->go, go_idx, nullptr, nullptr, nullptr, version.load(),
                          priv ? r->priv.data_ptr<uint8_t>() : nullptr);   // (B58a+b: the episode ends)
+      t_cons_s = t_cons_s+(now()-r->t_reply);
       push_record(r); n_calls++;
       return;
     }
@@ -876,6 +898,7 @@ struct ActorDriver {
     i64 n_tot = n+n_lane;
     i64 cap = 1; while (cap < n_tot) cap <<= 1;
     if (!ok) {   // Python handles this batch (it raises the same error, or takes the eager path)
+      t_prep_s = t_prep_s+(now()-t0);
       r->kind = 2; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
       hand_to_python(r, ws, ss);
       return;
@@ -883,6 +906,7 @@ struct ActorDriver {
     std::vector<i64> key{owner_main, cap, wb, we, wn, wsl};
     GraphEntry *e = find_graph(key);
     if (!e) {   // not captured yet: Python captures (needs the GIL and the capture admission); the batch is retried
+      t_prep_s = t_prep_s+(now()-t0);
       put_back();
       r->kind = 1; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
       n_captures++;
@@ -912,7 +936,7 @@ struct ActorDriver {
     }
     for (i64 x = 0; x < n*heads; x++) u[x] = fixed_u >= 0 ? (float)fixed_u : rng.uniform();
     { i64 o = n; for (auto &jb : merged) { lane_uniforms(*jb, &u[o*heads]); o += jb->n; } }
-    double t_host0 = now();
+    double t_host0 = now(); t_prep_s = t_prep_s+(t_host0-t0);
     i64 ver = version.load();
     fill_and_run(*e, n_tot, rows_ptr, row_stride, pend.data(), ids.data(), u.data(), replay.data(), complete.data(), ver, any_complete);
     double t1 = now(); r->t_sync = t1; t_sync_s = t_sync_s+(t1-t_host0);
@@ -939,14 +963,16 @@ struct ActorDriver {
     }
     for (i64 i = 0; i < n_all; i++) if (cf_snap && r->cf_snap[i]) cf_snap[ws[i]] = 0;
     reply_rows(ws);
-    double t2 = now(); r->t_reply = t2;
+    double t2 = now(); r->t_reply = t2; t_reply_s = t_reply_s+(t2-t1);
     // the main rows' pages, then their record (the lanes' pages and records only after it: B54 condition a)
     write_part(*e, rows_ptr, 0, n, ids, steps_before, complete, first, pend.data(), ver, *r);
+    double t2c = now(); t_pages_s = t_pages_s+(t2c-t2);
     if (cc.on) consume(*r, rc, n_all, ws, r->go, go_idx, r->out.data_ptr<float>(), act, pend.data(), ver,
                        priv ? r->priv.data_ptr<uint8_t>() : nullptr);   // (B58a+b: arrive + store, before the record)
-    double t3 = now(); r->t_pages = t3; r->t_done = t3; t_pages_s = t_pages_s+(t3-t2); t_host_s = t_host_s+(t3-t0)-(t1-t_host0);
+    double t3 = now(); r->t_pages = t3; r->t_done = t3; t_cons_s = t_cons_s+(t3-t2c); t_host_s = t_host_s+(t3-t0)-(t1-t_host0);
     n_steps++; n_calls++; n_rows = n_rows+n;
     push_record(r);
+    double t4 = now();
     if (!merged.empty()) {
       n_merged_calls++;
       i64 o = n;
@@ -961,6 +987,7 @@ struct ActorDriver {
         push_record(lr);
         o += jb->n;
       }
+      t_mlane_s = t_mlane_s+(now()-t4);
     }
   }
   // (B54) the queued lane jobs, each a lane-only call through its generation's graph, until the queue is empty or the
