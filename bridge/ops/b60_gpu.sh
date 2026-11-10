@@ -9,7 +9,8 @@
 #   B  the full test gate;
 #   C  a 6-update short profile (prof2.sh) with ISAAC_LEARN_OPCOUNT=0: the learner's prefetch hits / drops across
 #      recompute groups and epochs, and the uc_* (thread CPU) columns; SIGINT to the train_tok main process only.
-#   usage: CODE=<candidate dir> sh b60_gpu.sh A|B|C [more stages]
+#   T  stage A's tests only (gates the stages after it).
+#   usage: CODE=<candidate dir> sh b60_gpu.sh A|T|B|C [more stages]
 set -u
 ROOT=/home/linux/isaac-block-memory-v1
 R=$ROOT/reports/b42-speed
@@ -45,6 +46,12 @@ for S in "$@"; do
     if [ $rc != 0 ] || ! grep -q " passed" $R/tests-b60-native.log || grep -q " failed" $R/tests-b60-native.log; then
       give $S; echo "$(date '+%F %T') stage A failed: later stages not run" >> $LOG; exit 1
     fi
+    ;;
+  T)   # (stage A's tests only, gating B and C)
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 timeout 240 $PY -m pytest tests/test_b60_native_pack.py tests/test_b48_prefetch.py       -q -p no:cacheprovider > $R/tests-b60-native.log 2>&1
+    rc=$?
+    echo "$(date '+%F %T') T tests rc=$rc $(tail -1 $R/tests-b60-native.log)" >> $LOG
+    if [ $rc != 0 ]; then give $S; echo "$(date '+%F %T') stage T failed: later stages not run" >> $LOG; exit 1; fi
     ;;
   B)
     CUBLAS_WORKSPACE_CONFIG=:4096:8 ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 840 $PY -m pytest tests -q \
