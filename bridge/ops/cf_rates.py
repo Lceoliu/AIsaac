@@ -45,6 +45,18 @@ def main():
         life = ('pt_life_s_p50', 'pt_life_s_p90') if rows[1].get('pt_life_s_p50', '') != '' or rows[2].get('pt_life_s_p50', '') != ''             else ('d1_life_p50_s', 'd1_life_p90_s')
         print(f'  points: life p50 {med(rows, life[0], 2):.1f} s, p90 {med(rows, life[1], 2):.1f} s (u2+ medians of {life[0][:7]}), '
               f'every generation pinned {statistics.median(both) if both else float("nan"):.1f} s per collect (median)')
+        # the lane service's per-update numbers (v2_lane_* are running totals: differences; drv_* are per collect)
+        def dmed(k):
+            xs = [num(b.get(k))-num(a.get(k)) for a, b in zip(rows[9:], rows[10:])]
+            xs = [x for x in xs if x == x]
+            return statistics.median(xs) if xs else float('nan')
+        calls, lrows = dmed('v2_lane_calls'), dmed('v2_lane_rows')
+        print(f'  per update (u10+ medians): Python lane rounds {calls:.0f} ({lrows:.0f} rows, {lrows/max(calls, 1):.2f} per round), '
+              f'held {1e3*dmed("v2_lane_held_s")/max(calls, 1):.2f} ms / fly {1e3*dmed("v2_lane_fly_s")/max(calls, 1):.2f} ms per round; '
+              f'driver lane jobs {med(rows, "drv_lane_jobs"):.0f} ({med(rows, "drv_lane_rows"):.0f} rows, '
+              f'{med(rows, "drv_lane_rows")/max(med(rows, "drv_lane_jobs"), 1):.2f} per job), merged rows {med(rows, "drv_merged_rows"):.0f}, '
+              f'lane-only calls {med(rows, "drv_lane_calls"):.0f} ({1e3*med(rows, "drv_lane_s")/max(med(rows, "drv_lane_calls"), 1):.2f} ms each), '
+              f'main steps {med(rows, "drv_steps"):.0f} ({med(rows, "rows_per_call"):.2f} rows per call)')
         print('  timing medians (u2+): ' + ', '.join(f'{k} p50 {med(rows, k+"_p50", 2):.3f} p90 {med(rows, k+"_p90", 2):.3f}'
                                                    for k in TIMING))
 
