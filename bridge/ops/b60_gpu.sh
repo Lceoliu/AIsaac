@@ -10,7 +10,8 @@
 #   C  a 6-update short profile (prof2.sh) with ISAAC_LEARN_OPCOUNT=0: the learner's prefetch hits / drops across
 #      recompute groups and epochs, and the uc_* (thread CPU) columns; SIGINT to the train_tok main process only.
 #   T  stage A's tests only (gates the stages after it); O  the op count by function (bench, C packing, pipelined);
-#   S  the B48 prefetch test's spread in ulps (b60_prefetch_spread.py), this code and OLD_CODE.
+#   S  the B48 prefetch test's spread in ulps (b60_prefetch_spread.py), this code and OLD_CODE;
+#   F  B62 step 4: default vs fused Adam after one replayed update (b44_learner_bench.py --adam-compare).
 #   usage: CODE=<candidate dir> sh b60_gpu.sh A|T|B|C [more stages]
 set -u
 ROOT=/home/linux/isaac-block-memory-v1
@@ -70,6 +71,11 @@ for S in "$@"; do
       CUBLAS_WORKSPACE_CONFIG=:4096:8 timeout 420 $PY b60_prefetch_spread.py $ROOT/$C_ $OUT/spread-$C_.json         --pairs 20 > $OUT/spread-$C_.log 2>&1
       echo "$(date '+%F %T') S spread $C_ rc=$? $(tail -1 $OUT/spread-$C_.log | cut -c1-300)" >> $LOG
     done
+    ;;
+  F)   # (B62 step 4: default vs fused Adam after one replayed update)
+    cd $ROOT/$CODE/bridge/ops
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 timeout 840 $PY b44_learner_bench.py $R/b48-dump/learner_inputs.pt --adam-compare       --json $OUT/adam.json > $OUT/adam.log 2>&1
+    echo "$(date '+%F %T') F adam compare rc=$? $(tail -1 $OUT/adam.log | cut -c1-300)" >> $LOG
     ;;
   B)
     CUBLAS_WORKSPACE_CONFIG=:4096:8 ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 840 $PY -m pytest tests -q \

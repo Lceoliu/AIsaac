@@ -211,11 +211,42 @@ def replay(model, opt, calls, packed, seed=0, pipeline=False, ops=None):
     return r
 
 
-def load_model(ck, dev):
+def load_model(ck, dev, fused=False):
     model = TokPolicy(**ck['config']).to(dev)
     model.load_state_dict(ck['model'])
-    opt = torch.optim.Adam(model.main_parameters(), lr=1e-4, eps=1e-5)
+    opt = torch.optim.Adam(model.main_parameters(), lr=1e-4, eps=1e-5, **(dict(fused=True) if fused else {}))
     return model, opt
+
+
+def adam_compare(ck, calls, dev):
+    """B62 step 4: the update replayed from the dump's weights with the default Adam twice (the run-to-run spread)
+    and with the fused Adam (train_tok --fused-adam 1) once; serial preparations, the same seeds. Per run the opt
+    seconds; per comparison the largest parameter difference after the update, in ulps at each parameter's own scale
+    (np.spacing of its largest magnitude), and the worst parameters."""
+    def state(fused, seed):
+        model, opt = load_model(ck, dev, fused)
+        r = replay(model, opt, calls, True, seed=seed)
+        return r, {k: v.detach().float().cpu().numpy() for k, v in model.state_dict().items()}
+
+    def cmp(a, b):
+        worst = []
+        for k in a:
+            d = float(np.abs(a[k].astype(np.float64)-b[k]).max()) if a[k].size else 0.0
+            sc = float(np.spacing(np.float32(max(np.abs(a[k]).max(), np.abs(b[k]).max())))) if a[k].size else 1.0
+            worst.append((d/max(sc, 1e-45), k, d))
+        worst.sort(reverse=True)
+        return dict(max_scaled_ulps=worst[0][0], max_abs=max(w[2] for w in worst),
+                    params_differing=sum(w[2] > 0 for w in worst), params=len(worst),
+                    worst=[(round(u, 1), k, d) for u, k, d in worst[:8]])
+    state(False, 0)   # (compiles)
+    ra, a = state(False, 0)
+    ra2, a2 = state(False, 0)
+    rf, f = state(True, 0)
+    out = dict(opt_s=dict(default=ra['opt'], default2=ra2['opt'], fused=rf['opt']),
+               total_s=dict(default=ra['total'], default2=ra2['total'], fused=rf['total']),
+               default_vs_default=cmp(a, a2), default_vs_fused=cmp(a, f))
+    print(json.dumps(out), flush=True)
+    return out
 
 
 def equiv(ck, calls, dev, n, fp32=False):
@@ -268,6 +299,7 @@ def main():
     p.add_argument('--pipeline', action='store_true', help='B60: host preparations queued one call ahead (learner)')
     p.add_argument('--busy', type=int, default=0, help='B60: pure-Python busy threads during the reps')
     p.add_argument('--opcount', action='store_true', help='B60: one extra rep counting Python-level torch calls')
+    p.add_argument('--adam-compare', action='store_true', help='B62 step 4: default vs fused Adam after one update')
     p.add_argument('--variants', default='',
                    help='B60: n<0|1>p<0|1>b<N>[i<us>],... (native, pipeline, busy threads, switch interval)')
     a = p.parse_args()
@@ -283,7 +315,9 @@ def main():
                 chunk_len_hist=np.bincount(lens).tolist(), load_s=round(time.perf_counter()-t, 1),
                 torch=torch.__version__)
     print(json.dumps(info), flush=True)
-    if a.equiv:
+    if a.adam_compare:
+        out = dict(info=info, adam=adam_compare(ck, calls, dev))
+    elif a.equiv:
         out = dict(info=info, equiv=equiv(ck, calls, dev, a.calls, a.fp32))
     else:
         model, opt = load_model(ck, dev)
