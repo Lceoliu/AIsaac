@@ -1167,6 +1167,91 @@ struct ActorDriver {
     return d;
   }
 
+  // ================================================================ (B58e) the main records in batches
+  // With the native consumer and lineage, Python needs nothing per step but the episode events (the rows with a first or
+  // an end) and the counters progress.csv shows (infer_ms, rows_per_call, polls, ...). In batch mode the driver keeps
+  // those counters itself, collects the event rows (header + frame, worker, the consumer's per-row snapshot) and hands
+  // them over as one kind 8 record when ev_max rows are waiting; Python takes the rest at the collect's end and before a
+  // hand-off (take_events). A collect target (set_collect_target: usable decisions of the current rollout slot) makes the
+  // driver push one kind 7 record when it is reached, so the main thread blocks on next_record instead of polling.
+  bool batch_on = false;
+  i64 ev_max = 256;
+  std::mutex evmu;
+  std::vector<uint8_t> ev_rows; std::vector<i64> ev_ws; std::vector<double> ev_snap;
+  std::atomic<i64> collect_target{-1};
+  std::atomic<bool> busy_flag{false};   // (Python: an update runs on the learner: the calls_busy / act_busy counters)
+  std::atomic<i64> b_polls{0}, b_calls{0}, b_rows{0}, b_calls_busy{0}, b_batches{0}, b_ev_rows{0};
+  std::atomic<double> b_latency{0}, b_act{0}, b_act_busy{0};
+  void set_batch(bool on, i64 max_rows) { batch_on = on; ev_max = std::max<i64>(1, max_rows); }
+  void set_collect_target(i64 n) { collect_target = n; }
+  void set_busy(bool on) { busy_flag = on; }
+  std::atomic<bool> test_fail{false};   // (B58e test: the driver thread throws at its next iteration: a driver error)
+  // (Python, any thread) one kind 9 record: the main thread's blocking wait returns (new weights to take)
+  void wake() { auto w = std::make_shared<Record>(); finish_empty(*w); w->kind = 9; push_record(w); }
+  // the usable decisions of the current rollout slot (Rollout.usable: length.sum() - (open >= 0).sum())
+  i64 usable_now() {
+    int sl = cur_slot.load();
+    if (sl < 0 || !slots[sl].set) return 0;
+    const RollSlot &s = slots[sl];
+    i64 u = 0;
+    for (i64 w = 0; w < n_workers; w++) { u += abpc::load_i64(&s.length[w]); u -= abpc::load_i64(&s.open[w]) >= 0; }
+    return u;
+  }
+  // instead of push_record for a main record (kind 0) in batch mode
+  void deliver(std::shared_ptr<Record> r, const uint8_t *rc, i64 n_all, const std::vector<i64> &ws, i64 n_go) {
+    if (!batch_on) { push_record(r); return; }
+    b_polls++;
+    if (n_go > 0) {
+      double lat = r->t_reply-r->t_poll;
+      b_calls++; b_rows = b_rows+n_go; b_latency = b_latency+lat; b_act = b_act+(r->t_done-r->t_poll);
+      if (busy_flag.load()) { b_calls_busy++; b_act_busy = b_act_busy+lat; }
+    }
+    std::shared_ptr<Record> batch;
+    {
+      std::lock_guard<std::mutex> g(evmu);
+      const double *sn = r->snap.defined() && r->snap.numel() == n_all*N_SNAP ? r->snap.data_ptr<double>() : nullptr;
+      for (i64 i = 0; i < n_all; i++) {
+        const uint8_t *src = rc+i*row_stride;
+        if (read_int(src+f_first, s_first) == 0 && read_int(src+f_done, s_done) == 0) continue;
+        ev_rows.insert(ev_rows.end(), src, src+row_stride);
+        ev_ws.push_back(ws[i]);
+        for (i64 q = 0; q < N_SNAP; q++) ev_snap.push_back(sn ? sn[i*N_SNAP+q] : 0.0);
+      }
+      if ((i64)ev_ws.size() >= ev_max) batch = take_events_locked();
+    }
+    if (batch) push_record(batch);
+    i64 tgt = collect_target.load();
+    if (tgt >= 0 && usable_now() >= tgt) {
+      collect_target = -1;
+      auto k7 = std::make_shared<Record>(); finish_empty(*k7); k7->kind = 7; push_record(k7);
+    }
+  }
+  std::shared_ptr<Record> take_events_locked() {
+    auto b = std::make_shared<Record>(); finish_empty(*b); b->kind = 8; b->kk = at::empty({0}, at::kLong);
+    i64 m = (i64)ev_ws.size();
+    b->rows = at::empty({(i64)ev_rows.size()}, at::kByte); if (m) memcpy(b->rows.data_ptr<uint8_t>(), ev_rows.data(), ev_rows.size());
+    b->workers = ev_ws;
+    b->snap = at::empty({m, N_SNAP}, at::kDouble); if (m) memcpy(b->snap.data_ptr<double>(), ev_snap.data(), ev_snap.size()*8);
+    ev_rows.clear(); ev_ws.clear(); ev_snap.clear();
+    b_batches++; b_ev_rows = b_ev_rows+m;
+    return b;
+  }
+  // (Python, the driver paused) the events still waiting, as a kind 8 record's fields (rows, workers, snap)
+  py::tuple take_events() {
+    std::shared_ptr<Record> b;
+    { std::lock_guard<std::mutex> g(evmu); b = take_events_locked(); }
+    at::Tensor w = at::empty({(i64)b->workers.size()}, at::kLong);
+    if (!b->workers.empty()) memcpy(w.data_ptr<i64>(), b->workers.data(), b->workers.size()*8);
+    return py::make_tuple(b->rows, w, b->snap);
+  }
+  py::dict batch_counters() {
+    py::dict d;
+    d["polls"] = b_polls.load(); d["calls"] = b_calls.load(); d["rows"] = b_rows.load(); d["calls_busy"] = b_calls_busy.load();
+    d["latency"] = b_latency.load(); d["act"] = b_act.load(); d["act_busy"] = b_act_busy.load();
+    d["batches"] = b_batches.load(); d["ev_rows"] = b_ev_rows.load();
+    return d;
+  }
+
   // ---- the driver thread
   void start() {
     TORCH_CHECK(!running, "driver already running");
@@ -1278,6 +1363,7 @@ struct ActorDriver {
       while (!stop_req) {
         { double t = now(); t_loop_s = t_loop_s+(t-t_it); t_it = t; }
         if (pause_req) { wait_paused(); continue; }
+        if (test_fail) throw std::runtime_error("set_test_fail: a driver error (B58e test)");
         bool lanes_waiting = lane_queue_size() > 0;
         if (main_hold) {   // (B54) lanes only
           if (lanes_native && !lrunning) { lane_pass(3e-4); continue; }   // (B58d d1: the native lane service here)
@@ -1525,7 +1611,7 @@ struct ActorDriver {
                          priv ? r->priv.data_ptr<uint8_t>() : nullptr);   // (B58a+b: the episode ends)
       t_cons_s = t_cons_s+(now()-r->t_reply);
       if (lin_on) lineage_observe(rc, n_all, ws);
-      push_record(r); n_calls++;
+      deliver(r, rc, n_all, ws, 0); n_calls++;   // (B58e: batched in batch mode)
       return;
     }
     // the batch's rows, contiguous: the go rows of the copied records, then (B54) the merged lane jobs' rows
@@ -1641,7 +1727,7 @@ struct ActorDriver {
       lineage_main(*r, rc, ws, go_idx, ids, first, steps_before, pend.data(), ver, complete, pubs);
       t_lin_s = t_lin_s+(now()-t3);
     }
-    push_record(r);
+    deliver(r, rc, n_all, ws, n);   // (B58e: batched in batch mode)
     for (auto &pr : pubs) push_record(pr);
     double t4 = now();
     if (!merged.empty()) {
@@ -1812,6 +1898,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_ring", &ActorDriver::set_ring).def("get_ring", &ActorDriver::get_ring)
       .def("capture_done", &ActorDriver::capture_done).def("set_main_hold", &ActorDriver::set_main_hold)
       .def("set_lineage", &ActorDriver::set_lineage)
+      .def("set_batch", &ActorDriver::set_batch).def("set_collect_target", &ActorDriver::set_collect_target)
+      .def("set_busy", &ActorDriver::set_busy).def("wake", &ActorDriver::wake, py::call_guard<py::gil_scoped_release>())
+      .def("set_test_fail", [](ActorDriver &d, bool on) { d.test_fail = on; }).def("take_events", &ActorDriver::take_events).def("batch_counters", &ActorDriver::batch_counters)
+      .def("usable_now", &ActorDriver::usable_now)
       .def("lanes_configure", &ActorDriver::lanes_configure).def("lanes_start", &ActorDriver::lanes_start)
       .def("lanes_stop", &ActorDriver::lanes_stop, py::call_guard<py::gil_scoped_release>())
       .def("lanes_pause", &ActorDriver::lanes_pause, py::call_guard<py::gil_scoped_release>()).def("lanes_resume", &ActorDriver::lanes_resume)

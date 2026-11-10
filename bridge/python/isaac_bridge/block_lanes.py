@@ -451,6 +451,8 @@ class BlockLaneService(LaneService):
             return None
         if kind==3:
             raise RuntimeError('cpp actor driver: '+self.driver.last_error())
+        if kind in (7,9):   # (B58e: a collect target reached late / the learner's wake: nothing to do here)
+            return None
         raise RuntimeError(f'cpp actor driver: a record of kind {kind} while it runs lanes only')
 
     def capture_point(self, bank_index, snapshot, actor_model, model_version):

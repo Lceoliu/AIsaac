@@ -4159,6 +4159,8 @@ def main(argv=None, child=None, actor=None):
         t_rooms_new = int(sum(rl.t_rc[w_, rl.tP:rl.tP + rl.length[w_]].sum() for w_ in range(rl.n))) if t_on else 0
         if not L.get('bench'):
             fresh.set()                           # the actor may take the new weights now
+            for hk_ in wake_hooks:   # (B58e: the main thread blocks in the driver's record queue: a kind 9 record)
+                hk_()
         # ---- logging (the actor is already running on)
         t_end = time.perf_counter()
         wall = t_end - (L['t_end'] if L['t_end'] is not None else job['t_start'])
@@ -4514,6 +4516,7 @@ def main(argv=None, child=None, actor=None):
     jobs = queue.Queue()
     fresh = threading.Event()        # set by the learner when new weights are final
     failure = []
+    wake_hooks = []   # (B58e: called after fresh.set(): the batch-mode collect blocks in the driver's queue)
 
     def learner_loop():
         if split:   # B38: this thread's current GPU is the learner's (CUDA's current device is per thread)
@@ -4549,6 +4552,8 @@ def main(argv=None, child=None, actor=None):
             except BaseException as exc:   # handed to the main thread
                 failure.append(exc)
                 fresh.set()
+                for hk_ in wake_hooks:
+                    hk_()
                 return
 
     def learner_process():
@@ -4852,6 +4857,14 @@ def main(argv=None, child=None, actor=None):
             lane_thread = os.environ.get('ISAAC_BLOCK_CPP_LANE_THREAD', '0') == '1'
         print(f'B58d native lanes: {"on (%s)" % ("their own thread" if lane_thread else "the driver thread") if native_lanes else "off (%s)" % why_n}',
               flush=True)
+    batch_on = False   # B58e: the driver keeps the per-step counters, hands the episode events over in batches
+    if cpp_driver is not None:
+        why_e = bdrv.batch_reason(cpp_driver, native_cons, native_lin and native_lanes)
+        if why_e is None:
+            cpp_driver.set_batch(True, int(os.environ.get('ISAAC_BLOCK_CPP_BATCH_ROWS', '256')))
+            wake_hooks.append(cpp_driver.wake)
+            batch_on = True
+        print(f'B58e batched records: {"on" if batch_on else "off (%s: a record per step)" % why_e}', flush=True)
     if block_actor is not None:
         block_actor.version=version
     if cpp_driver is not None:
@@ -4898,6 +4911,8 @@ def main(argv=None, child=None, actor=None):
             e['id'] = version
             aux[n, AUX_SNAP] = version
         busy = False
+        if batch_on:   # (B58e: the driver's calls_busy / act_busy counters)
+            cpp_driver.set_busy(False)
 
     def wait_learner():
         # (teacher v2: the lanes are answered meanwhile; their poll releases the GIL)
@@ -5058,10 +5073,27 @@ def main(argv=None, child=None, actor=None):
                         return
                     consume_record(rec_, prof_)
 
+            def consume_events(rows_t, ws_t, snap_t, prof_):
+                """(B58e) A batch of the driver's episode-event rows (a first or an end; kind 8 / take_events): the
+                episode snapshots and summaries _native_events keeps. (The Python `pending` and priv_pending arrays are
+                not kept in batch mode: with the native consumer only the driver reads its own.)"""
+                tb_ = time.perf_counter()
+                nv.push('c.events')
+                ws_ = ws_t.numpy() if hasattr(ws_t, 'numpy') else np.asarray(ws_t, np.int64)
+                if len(ws_):
+                    _native_events(book, rows_t.numpy().view(ROW), ws_, snap_t.numpy())
+                nv.pop()
+                prof_['book'] += time.perf_counter() - tb_
+
             def consume_record(rec, prof_):
                 """(B52) The Python side of one driver step: the bookkeeping the actor loop did around answer_block,
                 from the record (rows copied, outputs, pre-step steps / pending, decision and K/V ids, block ids)."""
                 kind = rec['kind']
+                if kind in (7, 9):   # (B58e: the collect target reached / the learner's wake: for the blocking wait only)
+                    return
+                if kind == 8:   # (B58e: an event batch)
+                    consume_events(rec['rows'], rec['workers'], rec['snap'], prof_)
+                    return
                 if native_lanes and int(rec['lane_src']):   # B58d: a lane graph to capture / a job Python steps
                     t_l = time.perf_counter()
                     lanes.on_native_lane_record(rec)
@@ -5197,8 +5229,32 @@ def main(argv=None, child=None, actor=None):
                     cpp_driver.start(); cpp_started[0] = True
                 if lane_thread and not cpp_driver.lanes_running:   # (B58d d2: the lane thread, started once)
                     cpp_driver.lanes_start()
+                if batch_on:   # B58e: a kind 7 record when the rollout is full; the counters are the driver's
+                    cpp_driver.set_collect_target(rollout_actor)
+                    bc0_ = cpp_driver.batch_counters()
                 cpp_driver.resume()
-                while roll.usable() < rollout_actor and sampler.live and not stopped():
+                ev_ = lambda r_, w_, s_: consume_events(r_, w_, s_, prof_)
+                rc_ = lambda r_: consume_record(r_, prof_)
+                while batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
+                    if busy and fresh.is_set():
+                        cpp_driver.pause(); drain_driver(prof_)
+                        lanes.quiesce()
+                        t_w = time.perf_counter()
+                        nv.push('actor.weights')
+                        take_weights()
+                        nv.pop()
+                        cpp_driver.set_version(version)
+                        bdrv.check_versions(cpp_driver, block_actor)
+                        prof_['weights'] += time.perf_counter() - t_w
+                        cpp_driver.resume()
+                    ta_ = time.perf_counter()
+                    nv.push('c.wait')
+                    st_ = bdrv.batch_wait(cpp_driver, ev_, rc_, 0.5)
+                    nv.pop()
+                    prof_['poll'] += time.perf_counter() - ta_
+                    if st_ == 'target':
+                        break
+                while not batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
                     if busy and fresh.is_set():
                         cpp_driver.pause(); drain_driver(prof_)
                         lanes.quiesce()
@@ -5230,9 +5286,14 @@ def main(argv=None, child=None, actor=None):
                         cpp_driver.resume()
                     if rec_ is None and cpp_driver.is_paused() and cpp_driver.queue_size() == 0:
                         cpp_driver.resume()   # (a capture request / a Python-stepped lane job was answered)
+                if batch_on:
+                    cpp_driver.set_collect_target(-1)
                 c1_ = cpp_driver.counters()
                 nv.push('h.pause_drain')
                 cpp_driver.pause(); drain_driver(prof_)
+                if batch_on:   # (B58e: the events still waiting, before the hand-off reads book.finished; the counters)
+                    consume_events(*cpp_driver.take_events(), prof_)
+                    bdrv.batch_prof(bc0_, cpp_driver.batch_counters(), prof_)
                 nv.pop()
                 drv_paused_at[0] = time.perf_counter()
                 # B54 counters of this collect: the driver's paused seconds (the hand-off's pause before this collect's
@@ -5536,6 +5597,8 @@ def main(argv=None, child=None, actor=None):
             book.finished = []
             book.branch_finished = []
             busy = True
+            if batch_on:
+                cpp_driver.set_busy(True)
             job['t_put'] = time.perf_counter()
             jobs.put(job)
             sent_handoffs += 1

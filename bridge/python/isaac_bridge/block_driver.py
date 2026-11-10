@@ -442,3 +442,58 @@ def check_versions(driver, actor):
     actor's (the Python lane service's) are one counter set in two places: a mismatch stops the run."""
     if driver is not None and actor is not None and int(driver.version) != int(actor.version):
         raise RuntimeError(f'policy versions out of step: driver {int(driver.version)}, main actor {int(actor.version)}')
+
+
+# ------------------------------------------------------------------------------------------- B58e batched records
+
+def batch_reason(cpp_driver, native_cons, native_lin_lanes):
+    """(B58e) None when the driver can keep the per-step counters and hand the episode events over in batches (the
+    native consumer, lineage and lane service: Python then needs nothing per step). ISAAC_BLOCK_CPP_BATCH=0: a record
+    per step (the B58d path)."""
+    if os.environ.get('ISAAC_BLOCK_CPP_BATCH', '1') == '0':
+        return 'ISAAC_BLOCK_CPP_BATCH=0'
+    if cpp_driver is None or not native_cons or not native_lin_lanes:
+        return 'the native consumer, lineage and lanes first'
+    return None
+
+
+def batch_wait(d, on_events, on_record, timeout=0.5):
+    """(B58e) One blocking wait of the main thread in batch mode: 'target' (the collect's rollout is full: kind 7),
+    'wake' (kind 9: new weights to take), 'idle' (nothing within timeout: the caller checks its liveness conditions).
+    Event batches (kind 8) go to on_events(rows, workers, snap); every other record (captures, lane records, publish,
+    errors) to on_record. After such a record the wait polls every 2 ms until the queue is empty and resumes a driver
+    that paused itself for it (a capture request, a Python-stepped job), as the per-record loop did. A driver that
+    stopped or failed without a record raises here (the liveness timeout: at most `timeout` later)."""
+    short = False
+    while True:
+        rec = d.next_record(0.002 if short else timeout)
+        if rec is None:
+            if short:
+                short = False
+                if d.is_paused() and d.queue_size() == 0:
+                    d.resume()
+                continue
+            if not d.running or d.last_error():
+                raise RuntimeError('cpp actor driver stopped: ' + (d.last_error() or 'no error message'))
+            return 'idle'
+        k = int(rec['kind'])
+        if k == 7:
+            return 'target'
+        if k == 9:
+            return 'wake'
+        if k == 8:
+            on_events(rec['rows'], rec['workers'], rec['snap'])
+            continue
+        on_record(rec)
+        short = True
+
+
+B58E_COUNTERS = ('polls', 'calls', 'rows', 'calls_busy', 'latency', 'act', 'act_busy')
+
+
+def batch_prof(c0, c1, prof):
+    """(B58e) The driver's per-step counters of a collect into train_tok's prof (the same progress.csv columns as the
+    per-record path: infer_ms from latency / calls, rows_per_call, infer_upd_ms, calls_upd, polls)."""
+    for k in B58E_COUNTERS:
+        prof[k] += c1[k]-c0[k]
+    prof['main_ready'] += c1['latency']-c0['latency']
