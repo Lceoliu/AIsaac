@@ -61,6 +61,12 @@ for S in "$@"; do
     if [ $rc != 0 ]; then mkdir -p $R/failed && cp $GL $R/failed/; fi   # (B62: gate logs never overwritten; failures kept)
     ;;
   P) prof prof-b62-cpp ISAAC_SWITCH_INTERVAL_US=500 ;;
+  A8)   # (the actor probe's play digest, 8 seeds, not timed)
+    cd $ROOT/$CODE/bridge/python
+    ( export OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 ABP_HOME=$ROOT/formal/abplus ABP_BRIDGE_LUA=$ROOT/candidate-a1/bridge/abplus/abp_bridge.lua LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null
+      timeout 1800 xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" $PY abplus_probe_play.py --groups-file ../abplus/catalog/scaling2_groups.json --group normal --seeds range:2147500000:8 --steps 300 --out $R/$CODE-a8-play > $R/$CODE-a8-play.log 2>&1 )
+    echo "$(date '+%F %T') A8 rc=$? $(tail -1 $R/$CODE-a8-play.log | cut -c1-200)" >> $LOG
+    ;;
   L)   # (lean checkpoint vs the B44-B60 call on CUDA, 20 + 20 pairs, B48 spread rule)
     cd $OPS
     CUBLAS_WORKSPACE_CONFIG=:4096:8 timeout 600 $PY b60_prefetch_spread.py $ROOT/$CODE $R/b62-lean-spread.json       --pairs 20 --lean-compare > $R/b62-lean-spread.log 2>&1
