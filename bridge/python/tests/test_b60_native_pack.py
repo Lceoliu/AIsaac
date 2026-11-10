@@ -421,17 +421,57 @@ def test_unaligned_arena_offsets_fall_back_to_the_reference(lib, monkeypatch):
         _same(a, b)
 
 
+def test_ctypes_signatures_match_the_c_source():
+    """Every exported abp_learn_* function: the ctypes argument list has the C parameter list's length, a pointer
+    (c_void_p) exactly where the C parameter is a pointer and c_long elsewhere (no compiler needed: the C library's
+    tests only run where gcc is, B60 stage A once failed on a 15-for-14 scan signature)."""
+    import re
+    src = learn_native.SOURCE.read_text()
+    found = {}
+    for m in re.finditer(r'^\s*(?:long|void|int)\s+(abp_learn_\w+)\s*\(([^)]*)\)\s*\{', src, re.M | re.S):
+        params = [x.strip() for x in m.group(2).split(',') if x.strip() and x.strip() != 'void']
+        found[m.group(1)] = params
+    assert set(found) - {'abp_learn_version'} == set(learn_native.SIGNATURES)
+    for name, (args, _) in learn_native.SIGNATURES.items():
+        params = found[name]
+        assert len(args) == len(params), (name, len(args), len(params))
+        for i, (t, p_) in enumerate(zip(args, params)):
+            want = ctypes.c_void_p if '*' in p_ else ctypes.c_long
+            assert t is want, (name, i, p_)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA')
-def test_small_cuda_randperm_draws_from_the_default_cpu_generator():
-    """B60 EpochPerms premise: torch.randperm(n < 30000, device=cuda) is drawn on the CPU from the default CPU
-    generator (the history draws' generator), not from the CUDA generator."""
+def test_epoch_perms_on_cuda_keep_the_serial_order_whichever_generator():
+    """EpochPerms on CUDA, whichever generator torch.randperm(2400, device=cuda) draws from in this torch (probed:
+    the default CPU generator or the CUDA one; 2.7.1 on the 4090 left the CPU state unchanged): with a fixed seed,
+    the lazily drawn permutations and CPU draws interleaved as the learner does (each epoch's parts' history draws,
+    the next epoch's permutation drawn right after the last part) equal the serial loop's, element for element."""
     torch.manual_seed(7)
     cpu0, cuda0 = torch.get_rng_state(), torch.cuda.get_rng_state()
     torch.randperm(2400, device='cuda')
     torch.cuda.synchronize()
-    assert not torch.equal(torch.get_rng_state(), cpu0)
-    assert torch.equal(torch.cuda.get_rng_state(), cuda0)
-    torch.manual_seed(7)
-    a = torch.randperm(2400, device='cuda').cpu()
-    torch.manual_seed(7)
-    assert torch.equal(a, torch.randperm(2400))
+    uses_cpu = not torch.equal(torch.get_rng_state(), cpu0)
+    uses_cuda = not torch.equal(torch.cuda.get_rng_state(), cuda0)
+    print(f'torch {torch.__version__}: randperm(2400, cuda) draws from cpu={uses_cpu} cuda={uses_cuda}')
+    assert uses_cpu or uses_cuda
+    n, parts = 2400, 4
+
+    def history():   # (a part's history draw: torch.randperm on the CPU without a generator)
+        return torch.randperm(9).tolist()
+
+    torch.manual_seed(11)
+    serial = []
+    for e in range(3):
+        serial.append(torch.randperm(n, device='cuda').cpu().tolist())
+        serial.append([history() for _ in range(parts)])
+    torch.manual_seed(11)
+    lazy = []
+    ep = block_learner.EpochPerms(n, 'cuda')
+    ep.get(0)
+    for e in range(3):
+        lazy.append(ep.get(e)[0].cpu().tolist())
+        draws = [history() for _ in range(parts)]
+        if e+1 < 3:
+            ep.get(e+1)
+        lazy.append(draws)
+    assert lazy == serial

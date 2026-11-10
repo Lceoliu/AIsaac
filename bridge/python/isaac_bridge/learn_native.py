@@ -62,21 +62,27 @@ def build(source=SOURCE):
     return str(path)
 
 
+# ctypes signatures of abp_learn.c's exported functions (argument types, result type); tests check every argument
+# list against the C source's parameter lists (test_b60_native_pack: no compiler needed)
+SIGNATURES = {
+    'abp_learn_scan': ([L, P, P, P, P] + [L]*8 + [P], L),
+    'abp_learn_gather': ([L, P, P, L, L, L, L, P] + [P]*7, None),
+    'abp_learn_concat': ([L, P, P, P, L], None),
+}
+
+
 class Library:
     def __init__(self, path):
         lib = ctypes.CDLL(path)
         lib.abp_learn_version.restype = ctypes.c_int
         if lib.abp_learn_version() != VERSION:
             raise OSError('abp_learn version mismatch')
-        self.scan = lib.abp_learn_scan
-        self.scan.argtypes = [L, P, P, P, P] + [L]*9 + [P]
-        self.scan.restype = L
-        self.gather = lib.abp_learn_gather
-        self.gather.argtypes = [L, P, P, L, L, L, L, P] + [P]*7
-        self.gather.restype = None
-        self.concat_ = lib.abp_learn_concat
-        self.concat_.argtypes = [L, P, P, P, L]
-        self.concat_.restype = None
+        fns = {}
+        for name, (args, res) in SIGNATURES.items():
+            fn = getattr(lib, name)
+            fn.argtypes, fn.restype = args, res
+            fns[name] = fn
+        self.scan, self.gather, self.concat_ = fns['abp_learn_scan'], fns['abp_learn_gather'], fns['abp_learn_concat']
         self.path = path
 
 

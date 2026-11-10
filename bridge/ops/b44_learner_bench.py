@@ -184,7 +184,7 @@ def replay(model, opt, calls, packed, seed=0, pipeline=False, ops=None):
             'learn_prefetch_dropped', 'learn_prefetch_other_calls', 'learn_prefetch_submitted',
             'learn_prefetch_wait_grad_s', 'learn_prefetch_wait_nograd_s', 'learn_prefetch_skip_wait_s',
             'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s')
-    r = {k: round(v, 3) for k, v in t.items()}
+    r = {k: round(v, 3) if isinstance(v, float) else v for k, v in t.items()}
     r.update({k: upd.get(k, 0) for k in keys})
     r['grad_calls'] = n_grad
     r['calls'] = len(calls)

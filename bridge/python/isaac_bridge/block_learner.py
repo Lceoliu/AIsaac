@@ -224,12 +224,13 @@ PREFETCH = Prefetch()
 
 class EpochPerms:
     """B60: the PPO epochs' minibatch permutations, drawn in epoch order, each at the latest when first needed:
-    get(e) draws every epoch up to e not drawn yet. torch.randperm(n, device=cuda) with n < 30000 (n_units is ~2,400)
-    runs on the CPU from the default CPU generator -- the generator the parts' history draws use as well (the
-    learner passes no generator) -- so an epoch's permutation must be drawn exactly where the serial learner drew it
-    relative to those draws: after the previous epoch's last part was prepared and before this epoch's first part
-    is. The learner calls get(e+1) right after the previous epoch's last part ran, before queueing epoch e+1's first
-    part (nothing draws from that generator in between: B60 test), and get(0) before the first part of the update."""
+    get(e) draws every epoch up to e not drawn yet. The learner calls get(e+1) right after epoch e's last part ran,
+    before queueing epoch e+1's first part, and get(0) before the update's first part: each permutation is drawn
+    where the serial learner drew it relative to the parts' history draws (torch.randperm on the CPU, default CPU
+    generator: the learner passes none), so the draw order is the serial one whichever generator randperm(n, cuda)
+    uses. Measured on the 4090 (torch 2.7.1, n ~ 2,400): the CUDA generator (the CPU generator's state unchanged);
+    B60 tests probe it and check the order either way. Not identical to a serial run when another thread draws from
+    the same generator meanwhile (the actor thread's CPU lane uniforms do, before and after B60 alike)."""
     def __init__(self, n, device):
         self.n, self.device, self.perms = int(n), device, []
 
