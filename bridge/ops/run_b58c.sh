@@ -9,7 +9,9 @@ CODE=${1:-candidate-b58c}
 C=$ROOT/$CODE
 OPS=$C/bridge/ops
 LOG=$R/b58.log
-waitlock() { while [ -f $R/GPU_LOCK ] || [ "$(pgrep -fc '[t]rain_tok.py')" != "0" ] || [ "$(pgrep -fc '[p]ytest')" != "0" ] || [ "$(pgrep -fc '[e]val_tok.py')" != "0" ]; do sleep 20; done; sleep 10; }
+# (the queue mark GPU_WANT_CPP only while waiting: A1 yields to it; removed once the lock is ours or the script ends)
+trap 'rm -f $R/GPU_WANT_CPP' EXIT
+waitlock() { touch $R/GPU_WANT_CPP; while [ -f $R/GPU_LOCK ] || [ "$(pgrep -fc '[t]rain_tok.py')" != "0" ] || [ "$(pgrep -fc '[p]ytest')" != "0" ] || [ "$(pgrep -fc '[e]val_tok.py')" != "0" ]; do sleep 20; done; sleep 10; rm -f $R/GPU_WANT_CPP; }
 stage() {
   n=$1; shift
   while :; do waitlock; "$@" > $R/b58c-$n.launcher.log 2>&1; rc=$?; [ $rc -eq 2 ] || break; sleep 30; done
