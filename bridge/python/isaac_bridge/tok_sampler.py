@@ -159,6 +159,9 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # B40 (cfg.cf_defer_target; zero unless on): points with a deferred target / bomb_at branch, of them whose
          # room was cleared within the branch (the intent started), sum of the decisions waited until then
          'cf_defer_points', 'cf_defer_started', 'cf_defer_wait',
+         # D1 (2026-11-10): cf_nobank split by its two causes: the worker had no free bank row (a released row waits
+         # for the actor's acknowledgement), the actor refused the capture (no free teacher generation)
+         'cf_nobank_bank', 'cf_nobank_refused',
          # B39 (2026-10-18, cfg.no_active_prob / cfg.no_active; zero unless on): episode starts whose active item was
          # removed (tok_pickup.NO_ACTIVE_LUA), of them with an active item to remove (0 for a character without one)
          'no_actives', 'no_active_removed',

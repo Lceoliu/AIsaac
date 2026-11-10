@@ -68,14 +68,25 @@ def graph_capture(graph,stream,pool=None):
     rollouts) took ~5.7 s per capture while the learner, which had yielded the capture
     admission, waited. The admission protocol is unchanged: no other CUDA work is submitted
     while this capture runs. The caching allocator keeps its blocks (no empty_cache). pool (B46):
-    a graph_pool_handle shared with other graphs that never replay concurrently."""
+    a graph_pool_handle shared with other graphs that never replay concurrently.
+    B58: the cyclic garbage collector is off while the capture runs: an automatic collection inside it could free a
+    dropped actor's CUDA graph or pinned buffers (CUDA calls during a global-mode capture: 'operation failed due to a
+    previous error during capture', test_driver_with_lanes_same_seed_reproducible once on the 4090). An unconfirmed
+    mitigation: the cause was not shown (3 reruns before the fix passed as well)."""
+    import gc as gc_
     torch.cuda.synchronize()
-    with torch.cuda.stream(stream):
-        graph.capture_begin(pool=pool,capture_error_mode='global')
-        try:
-            yield graph
-        finally:
-            graph.capture_end()
+    was = gc_.isenabled()
+    gc_.disable()
+    try:
+        with torch.cuda.stream(stream):
+            graph.capture_begin(pool=pool,capture_error_mode='global')
+            try:
+                yield graph
+            finally:
+                graph.capture_end()
+    finally:
+        if was:
+            gc_.enable()
 
 
 def capture_admission(key):

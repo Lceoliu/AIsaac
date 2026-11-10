@@ -20,9 +20,14 @@ ISAAC_B52_ENTRY=1 ABP_HOME=$ROOT/formal/abplus ABP_BRIDGE_LUA=$ROOT/candidate-a1
 echo "$(date +%T) b54g entry gate rc=$? $(tail -1 $R/tests-b54-entry.log | cut -c1-120)" >> $LOG
 tail -1 $R/tests-b54-entry.log | grep -q " passed" && ! tail -1 $R/tests-b54-entry.log | grep -qE "failed|skipped|error" || echo "entry gate" >> $R/b54-gate.failed
 guard
-CUBLAS_WORKSPACE_CONFIG=:4096:8 ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 3600 $PY -m pytest tests -q -p no:cacheprovider > $R/tests-b54-full.log 2>&1
+CUBLAS_WORKSPACE_CONFIG=:4096:8 ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 3600 $PY -m pytest tests -v --tb=long -p no:cacheprovider > $R/tests-b54-full.log 2>&1
 echo "$(date +%T) b54g full tests rc=$? $(tail -1 $R/tests-b54-full.log | cut -c1-120)" >> $LOG
-tail -1 $R/tests-b54-full.log | grep -q " passed" && ! tail -1 $R/tests-b54-full.log | grep -qE "failed|error" || echo "full tests" >> $R/b54-gate.failed
+# (B58c: -v keeps the test order; a failed run's whole log is kept with a time stamp, e.g. for the flaky capture error
+# f370e1d only mitigates)
+if ! { tail -1 $R/tests-b54-full.log | grep -q " passed" && ! tail -1 $R/tests-b54-full.log | grep -qE "failed|error"; }; then
+  echo "full tests" >> $R/b54-gate.failed
+  mkdir -p $R/failed && cp $R/tests-b54-full.log $R/failed/tests-b54-full-$(date +%m%d-%H%M%S).log
+fi
 guard
 ( export OMP_NUM_THREADS=1 PYTHONUNBUFFERED=1 ABP_HOME=$ROOT/formal/abplus ABP_BRIDGE_LUA=$ROOT/candidate-a1/bridge/abplus/abp_bridge.lua LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null
   timeout 1800 xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" $PY abplus_probe_play.py --groups-file ../abplus/catalog/scaling2_groups.json --group normal --seeds range:2147500000:8 --steps 300 --out $R/b54-a8-play > $R/b54-a8-play.log 2>&1 )

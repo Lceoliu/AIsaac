@@ -915,6 +915,30 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "cycle_target_s": 14.7,
     "cpu": "driver 0.87 core, learner 0.45, main 0.42, workers+games 2.48, 9.1 of 16 cores busy"
   },
+  "actor_b58ab": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B58a+b (native consumer)",
+    "switch": "ISAAC_BLOCK_CPP_CONSUMER=0 returns to the B54 Python consumer (driver unchanged)",
+    "test": "tests/test_b58_native_consumer.py (Python vs native consumer byte-equal on one record stream incl. a hand-off; page vectors reallocs 0)",
+    "gate": "tests 60 passed; smoke 4 updates native consumer on; entry 2 passed, full 242 passed / 2 skipped, A8 8/8",
+    "capture_fix": "f370e1d: cyclic GC off during graph capture, an unconfirmed mitigation (one flaky capture error; 3 clean reruns incl. ISAAC_FX_CACHE=0, before the fix as well); the full gate runs -v and keeps a failed log in reports/b42-speed/failed/",
+    "gil_per_cycle_s_held_wait": {
+      "main": [5.01, 3.07],
+      "learner": [2.01, 3.10],
+      "pt_autograd": [1.44, 1.92],
+      "prefetch": [1.34, 1.72],
+      "all_but_learner": [7.80, 6.76],
+      "before_merged_tree_python_consumer": {"main": [7.13, 4.02], "learner": [2.15, 3.76], "all_but_learner": [10.03, 8.59]}
+    },
+    "main_ranges_per_cycle_calls_s": {
+      "lane.control": [12063, 1.55],
+      "c.record": [2544, 1.77],
+      "actor.tick": [4711, 2.47],
+      "lane.submit": [1301, 1.52],
+      "lane.finish": [1301, 0.71]
+    },
+    "speed_under_nsys": "collect 15.41 s, update 18.39 s, 234.9x (u2-u4 medians); merged tree Python consumer 13.34 / 20.85 / 209.2",
+    "core": "4f5d6ba abp_core.h torch-free core; TSAN stress (core_tests/test_abp_core.cpp, ops/run_core_tsan.sh) 3 seeds 0 warnings; no-stamp control fails"
+  },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
   "spatial": {

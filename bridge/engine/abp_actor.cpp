@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -41,6 +42,10 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "abp_core.h"
+#include "abp_lineage.h"
+#include "abp_lanes.h"
 
 extern "C" int abp_visible_unpack(const unsigned char *frames, long stride, int n, int wb, int we, int wn, int ws,
                                   float *room, float *map, float *body, unsigned char *body_mask, float *local,
@@ -62,116 +67,49 @@ static inline i64 read_int(const uint8_t *p, int size) {
 
 // ----------------------------------------------------------------------------------------------------- PageStore
 
-struct RawEntry {
-  uint8_t first;
-  int32_t schema;
-  std::string frame;
-  std::vector<i64> pending;
-};
-
+// (B58c) the store's memory, allocation, metadata, raw frames and GC stamps live in abpc::PageCore (abp_core.h, torch
+// free); PageStore gives Python and the driver tensor views of it.
+using abpc::RawEntry;
 struct PageStore {
   i64 page, kv_elems, z_elems, b_elems, bs, nh;
   int kv_itemsize;
   at::ScalarType kv_dtype;
   i64 cap_d, cap_b;
-  std::vector<at::Tensor> kv_pages, z_pages, b_pages;
-  at::Tensor d_meta, d_used, b_meta, b_src, b_srcver, b_used;
-  std::vector<i64> d_free, b_free;
-  i64 next_decision = 0;
-  std::unordered_map<i64, RawEntry> raw;
-  i64 freed_kv = 0, freed_blocks = 0, freed_raw = 0;
-  std::mutex mu;   // allocation, free lists, page vectors, raw
+  std::shared_ptr<abpc::PageCore> core;   // (every view below holds a copy in its deleter: abp_core.h, Lifetimes)
+  at::Tensor d_meta, d_used, b_meta, b_src, b_srcver, b_used;   // views of the core's arrays (never reallocated)
+  at::Tensor view(void *p, at::IntArrayRef sizes, at::TensorOptions o) {
+    std::shared_ptr<abpc::PageCore> keep = core;
+    return at::from_blob(p, sizes, [keep](void *) {}, o);
+  }
 
   PageStore(i64 page_, i64 kv_elems_, bool kv_bf16, i64 z_elems_, i64 b_elems_, i64 block_steps, i64 nh_, i64 max_pages_d,
             i64 max_pages_b)
       : page(page_), kv_elems(kv_elems_), z_elems(z_elems_), b_elems(b_elems_), bs(block_steps), nh(nh_) {
     kv_dtype = kv_bf16 ? at::kBFloat16 : at::kFloat;
     kv_itemsize = kv_bf16 ? 2 : 4;
-    cap_d = max_pages_d*page; cap_b = max_pages_b*page;
-    auto l = at::TensorOptions().dtype(at::kLong);
-    d_meta = at::full({cap_d, 2}, -1, l); d_used = at::zeros({cap_d}, at::kBool);
-    b_meta = at::full({cap_b, 2}, -1, l); b_src = at::full({cap_b, bs}, -1, l); b_srcver = at::full({cap_b, bs}, -1, l);
-    b_used = at::zeros({cap_b}, at::kBool);
+    core.reset(new abpc::PageCore(page, kv_elems*kv_itemsize, z_elems, b_elems, bs, nh, max_pages_d, max_pages_b));
+    cap_d = core->cap_d; cap_b = core->cap_b;
+    auto L = at::TensorOptions().dtype(at::kLong), B = at::TensorOptions().dtype(at::kBool);
+    d_meta = view(core->d_meta.get(), {cap_d, 2}, L); d_used = view(core->d_used.get(), {cap_d}, B);
+    b_meta = view(core->b_meta.get(), {cap_b, 2}, L); b_used = view(core->b_used.get(), {cap_b}, B);
+    b_src = view(core->b_src.get(), {cap_b, bs}, L); b_srcver = view(core->b_srcver.get(), {cap_b, bs}, L);
   }
-  // (pages: kept as flat [page, elems] tensors; Python views them with the row shape)
-  void grow_d_locked() {
-    i64 p = (i64)kv_pages.size();
-    TORCH_CHECK(p < cap_d/page, "PageStore: decision pages exhausted (raise max_pages_d)");
-    kv_pages.push_back(at::zeros({page, kv_elems}, at::TensorOptions().dtype(kv_dtype)));
-    z_pages.push_back(at::zeros({page, z_elems}, at::kFloat));
-    i64 base = p*page;
-    // Python: d_free = np.concatenate((np.arange(base+P-1, base-1, -1), d_free)): the new page's ids, descending,
-    // in front of the old free ids; _alloc takes the array's last n ids reversed (our pops from the back)
-    for (i64 i = page-1; i >= 0; i--) d_free.push_back(base+i);
-    std::rotate(d_free.begin(), d_free.end()-page, d_free.end());
+  at::Tensor kv_page(i64 p) { return view(core->kv_page(p), {page, kv_elems}, at::TensorOptions().dtype(kv_dtype)); }
+  at::Tensor z_page(i64 p) { return view(core->z_page(p), {page, z_elems}, at::TensorOptions().dtype(at::kFloat)); }
+  at::Tensor b_page(i64 p) { return view(core->b_page(p), {page, b_elems}, at::TensorOptions().dtype(at::kFloat)); }
+  i64 n_pages_d() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->kv_pages.size(); }
+  i64 n_pages_b() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->b_pages.size(); }
+  i64 n_free_d() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->d_free.size(); }
+  i64 n_free_b() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->b_free.size(); }
+  void grow_ahead(i64 min_free_d, i64 min_free_b) { core->grow_ahead(min_free_d, min_free_b); }
+  void write_decisions_raw(i64 n, const uint8_t *kv, i64 kv_row_bytes, const float *z, i64 z_row_floats, const i64 *steps, i64 version,
+                           const uint8_t *first, const int32_t *schema, const uint8_t *const *frames, const i64 *nbytes,
+                           const i64 *pending, i64 *dec_out, i64 *kvs_out) {
+    core->write_decisions_raw(n, kv, kv_row_bytes, z, z_row_floats, steps, version, first, schema, frames, nbytes, pending, dec_out, kvs_out);
   }
-  void grow_b_locked() {
-    i64 p = (i64)b_pages.size();
-    TORCH_CHECK(p < cap_b/page, "PageStore: block pages exhausted (raise max_pages_b)");
-    b_pages.push_back(at::zeros({page, b_elems}, at::kFloat));
-    i64 base = p*page;
-    for (i64 i = page-1; i >= 0; i--) b_free.push_back(base+i);
-    std::rotate(b_free.begin(), b_free.end()-page, b_free.end());
-  }
-  // Python's _alloc: ids = pool[len-n:][::-1] (the n ids at the end of the free array, reversed), pool = pool[:-n].
-  // Our vector mirrors the array (same order), so popping n from the back and reversing reproduces it.
-  void alloc_locked(std::vector<i64> &free, bool decisions, i64 n, i64 *out) {
-    while ((i64)free.size() < n) (decisions ? grow_d_locked() : grow_b_locked());
-    bool *used = decisions ? d_used.data_ptr<bool>() : b_used.data_ptr<bool>();
-    for (i64 i = 0; i < n; i++) {
-      out[i] = free.back(); free.pop_back();
-      used[out[i]] = true;
-    }
-  }
-  void grow_ahead(i64 min_free_d, i64 min_free_b) {
-    std::lock_guard<std::mutex> g(mu);
-    while ((i64)d_free.size() < min_free_d) grow_d_locked();
-    while ((i64)b_free.size() < min_free_b) grow_b_locked();
-  }
-  at::Tensor kv_page(i64 p) { std::lock_guard<std::mutex> g(mu); return kv_pages.at(p); }
-  at::Tensor z_page(i64 p) { std::lock_guard<std::mutex> g(mu); return z_pages.at(p); }
-  at::Tensor b_page(i64 p) { std::lock_guard<std::mutex> g(mu); return b_pages.at(p); }
-  i64 n_pages_d() { std::lock_guard<std::mutex> g(mu); return (i64)kv_pages.size(); }
-  i64 n_pages_b() { std::lock_guard<std::mutex> g(mu); return (i64)b_pages.size(); }
-  i64 n_free_d() { std::lock_guard<std::mutex> g(mu); return (i64)d_free.size(); }
-  i64 n_free_b() { std::lock_guard<std::mutex> g(mu); return (i64)b_free.size(); }
-
-  // raw page pointers (the vectors only grow; a page tensor never moves)
-  uint8_t *kv_row(i64 id) { return (uint8_t *)kv_pages[id/page].data_ptr()+(id % page)*kv_elems*kv_itemsize; }
-  float *z_row(i64 id) { return z_pages[id/page].data_ptr<float>()+(id % page)*z_elems; }
-  float *b_row(i64 id) { return b_pages[id/page].data_ptr<float>()+(id % page)*b_elems; }
-
-  // the decisions of one step: kv rows (n x kv_elems of kv_dtype, contiguous), z rows, steps, frames (pointers), pending
-  void write_decisions_raw(i64 n, const uint8_t *kv, i64 kv_row_bytes, const float *z, i64 z_row_floats, const i64 *steps,
-                           i64 version, const uint8_t *first, const int32_t *schema, const uint8_t *const *frames,
-                           const i64 *nbytes, const i64 *pending, i64 *dec_out, i64 *kvs_out) {
-    std::lock_guard<std::mutex> g(mu);
-    alloc_locked(d_free, true, n, kvs_out);
-    for (i64 i = 0; i < n; i++) dec_out[i] = next_decision+i;
-    next_decision += n;
-    i64 *meta = d_meta.data_ptr<i64>();
-    for (i64 i = 0; i < n; i++) {
-      i64 id = kvs_out[i];
-      memcpy(kv_row(id), kv+i*kv_row_bytes, kv_elems*kv_itemsize);
-      memcpy(z_row(id), z+i*z_row_floats, z_elems*sizeof(float));
-      meta[2*id] = steps[i]; meta[2*id+1] = version;
-      RawEntry &e = raw[dec_out[i]];
-      e.first = first[i]; e.schema = schema[i];
-      e.frame.assign((const char *)frames[i], (size_t)nbytes[i]);
-      e.pending.assign(pending+i*nh, pending+(i+1)*nh);
-    }
-  }
-  void write_blocks_raw(i64 m, const float *values, i64 row_floats, const i64 *ends, i64 version, const i64 *src,
-                        const i64 *srcver, i64 *bid_out) {
-    std::lock_guard<std::mutex> g(mu);
-    alloc_locked(b_free, false, m, bid_out);
-    i64 *meta = b_meta.data_ptr<i64>(), *bsrc = b_src.data_ptr<i64>(), *bver = b_srcver.data_ptr<i64>();
-    for (i64 i = 0; i < m; i++) {
-      i64 id = bid_out[i];
-      memcpy(b_row(id), values+i*row_floats, b_elems*sizeof(float));
-      meta[2*id] = ends[i]; meta[2*id+1] = version;
-      memcpy(bsrc+id*bs, src+i*bs, bs*sizeof(i64)); memcpy(bver+id*bs, srcver+i*bs, bs*sizeof(i64));
-    }
+  void write_blocks_raw(i64 m, const float *values, i64 row_floats, const i64 *ends, i64 version, const i64 *src, const i64 *srcver,
+                        i64 *bid_out) {
+    core->write_blocks_raw(m, values, row_floats, ends, version, src, srcver, bid_out);
   }
   // Python-path writes (tensors): kv [n, ...] of kv_dtype, z [n, ...] float32 (any device -> cpu contiguous)
   std::pair<at::Tensor, at::Tensor> write_decisions(at::Tensor kv, at::Tensor z, at::Tensor steps, i64 version, at::Tensor first,
@@ -187,9 +125,9 @@ struct PageStore {
     const uint8_t *fbase = frames.data_ptr<uint8_t>();
     for (i64 i = 0; i < n; i++) fp[i] = fbase+i*fstride;
     at::Tensor dec = at::empty({n}, at::kLong), kvs = at::empty({n}, at::kLong);
-    write_decisions_raw(n, (const uint8_t *)kv.data_ptr(), kv_elems*kv_itemsize, z.data_ptr<float>(), z_elems, steps.data_ptr<i64>(),
-                        version, first.data_ptr<uint8_t>(), schema.data_ptr<int32_t>(), fp.data(), nbytes.data_ptr<i64>(),
-                        pending.data_ptr<i64>(), dec.data_ptr<i64>(), kvs.data_ptr<i64>());
+    core->write_decisions_raw(n, (const uint8_t *)kv.data_ptr(), kv_elems*kv_itemsize, z.data_ptr<float>(), z_elems, steps.data_ptr<i64>(),
+                              version, first.data_ptr<uint8_t>(), schema.data_ptr<int32_t>(), fp.data(), nbytes.data_ptr<i64>(),
+                              pending.data_ptr<i64>(), dec.data_ptr<i64>(), kvs.data_ptr<i64>());
     return {dec, kvs};
   }
   at::Tensor write_blocks(at::Tensor values, at::Tensor ends, i64 version, at::Tensor src, at::Tensor srcver) {
@@ -199,32 +137,32 @@ struct PageStore {
     ends = ends.to(at::kLong).contiguous(); src = src.to(at::kLong).contiguous(); srcver = srcver.to(at::kLong).contiguous();
     TORCH_CHECK(src.numel() == m*bs && srcver.numel() == m*bs, "write_blocks: src shapes");
     at::Tensor bid = at::empty({m}, at::kLong);
-    write_blocks_raw(m, values.data_ptr<float>(), b_elems, ends.data_ptr<i64>(), version, src.data_ptr<i64>(), srcver.data_ptr<i64>(),
-                     bid.data_ptr<i64>());
+    core->write_blocks_raw(m, values.data_ptr<float>(), b_elems, ends.data_ptr<i64>(), version, src.data_ptr<i64>(), srcver.data_ptr<i64>(),
+                           bid.data_ptr<i64>());
     return bid;
   }
   // raw frames
   py::object raw_entry(i64 dec) {
-    std::lock_guard<std::mutex> g(mu);
-    auto it = raw.find(dec);
-    TORCH_CHECK(it != raw.end(), "PageStore: no raw frame for decision ", dec);
+    std::lock_guard<std::mutex> g(core->mu);
+    auto it = core->raw.find(dec);
+    TORCH_CHECK(it != core->raw.end(), "PageStore: no raw frame for decision ", dec);
     const RawEntry &e = it->second;
     at::Tensor pend = at::empty({nh}, at::kLong);
     memcpy(pend.data_ptr<i64>(), e.pending.data(), nh*sizeof(i64));
     return py::make_tuple((int)e.first, (int)e.schema, py::bytes(e.frame), pend);
   }
-  bool raw_has(i64 dec) { std::lock_guard<std::mutex> g(mu); return raw.count(dec) > 0; }
-  i64 raw_count() { std::lock_guard<std::mutex> g(mu); return (i64)raw.size(); }
+  bool raw_has(i64 dec) { std::lock_guard<std::mutex> g(core->mu); return core->raw.count(dec) > 0; }
+  i64 raw_count() { std::lock_guard<std::mutex> g(core->mu); return (i64)core->raw.size(); }
   at::Tensor raw_keys() {
-    std::lock_guard<std::mutex> g(mu);
-    at::Tensor k = at::empty({(i64)raw.size()}, at::kLong);
+    std::lock_guard<std::mutex> g(core->mu);
+    at::Tensor k = at::empty({(i64)core->raw.size()}, at::kLong);
     i64 *p = k.data_ptr<i64>(); i64 i = 0;
-    for (auto &kv : raw) p[i++] = kv.first;
+    for (auto &kv : core->raw) p[i++] = kv.first;
     return k;
   }
   double raw_mb() {
-    std::lock_guard<std::mutex> g(mu);
-    double b = 0; for (auto &kv : raw) b += kv.second.frame.size();
+    std::lock_guard<std::mutex> g(core->mu);
+    double b = 0; for (auto &kv : core->raw) b += kv.second.frame.size();
     return b/1048576.0;
   }
   // (B45 source_arena) first [n] u8, schema [n] i32, sizes [n] i64, offsets [n] i64, joined frames u8, pending [n, nh]
@@ -232,14 +170,14 @@ struct PageStore {
     decisions = decisions.to(at::kLong).contiguous();
     i64 n = decisions.numel();
     const i64 *d = decisions.data_ptr<i64>();
-    std::lock_guard<std::mutex> g(mu);
+    std::lock_guard<std::mutex> g(core->mu);
     at::Tensor first = at::empty({n}, at::kByte), schema = at::empty({n}, at::kInt), sizes = at::empty({n}, at::kLong),
                off = at::empty({n}, at::kLong), pend = at::empty({n, nh}, at::kLong);
     i64 total = 0;
     std::vector<const RawEntry *> es(n);
     for (i64 i = 0; i < n; i++) {
-      auto it = raw.find(d[i]);
-      TORCH_CHECK(it != raw.end(), "PageStore.source_arena: no raw frame for decision ", d[i]);
+      auto it = core->raw.find(d[i]);
+      TORCH_CHECK(it != core->raw.end(), "PageStore.source_arena: no raw frame for decision ", d[i]);
       es[i] = &it->second;
       first.data_ptr<uint8_t>()[i] = es[i]->first; schema.data_ptr<int32_t>()[i] = es[i]->schema;
       sizes.data_ptr<i64>()[i] = (i64)es[i]->frame.size(); off.data_ptr<i64>()[i] = total; total += (i64)es[i]->frame.size();
@@ -250,33 +188,226 @@ struct PageStore {
     for (i64 i = 0; i < n; i++) memcpy(b+off.data_ptr<i64>()[i], es[i]->frame.data(), es[i]->frame.size());
     return py::make_tuple(first, schema, sizes, off, buf, pend);
   }
-  void free_rows(at::Tensor dead_d, at::Tensor dead_b, at::Tensor dead_raw) {
+  void free_rows(at::Tensor dead_d, at::Tensor dead_b, at::Tensor dead_raw, i64 limit) {
     dead_d = dead_d.to(at::kLong).contiguous(); dead_b = dead_b.to(at::kLong).contiguous(); dead_raw = dead_raw.to(at::kLong).contiguous();
-    std::lock_guard<std::mutex> g(mu);
-    bool *du = d_used.data_ptr<bool>(), *bu = b_used.data_ptr<bool>();
-    i64 *dm = d_meta.data_ptr<i64>(), *bm = b_meta.data_ptr<i64>();
-    // Python: d_free = concatenate((dead[::-1], d_free)): dead ids go to the front of the array = the bottom of our
-    // stack (popped last); dead is ascending, reversed -> the array holds dead descending at the front
-    const i64 *dd = dead_d.data_ptr<i64>(); i64 nd = dead_d.numel();
-    std::vector<i64> nf; nf.reserve(nd+d_free.size());
-    for (i64 i = nd-1; i >= 0; i--) nf.push_back(dd[i]);
-    nf.insert(nf.end(), d_free.begin(), d_free.end()); d_free.swap(nf);
-    for (i64 i = 0; i < nd; i++) { du[dd[i]] = false; dm[2*dd[i]] = -1; dm[2*dd[i]+1] = -1; }
-    const i64 *db = dead_b.data_ptr<i64>(); i64 nb = dead_b.numel();
-    std::vector<i64> bf; bf.reserve(nb+b_free.size());
-    for (i64 i = nb-1; i >= 0; i--) bf.push_back(db[i]);
-    bf.insert(bf.end(), b_free.begin(), b_free.end()); b_free.swap(bf);
-    for (i64 i = 0; i < nb; i++) { bu[db[i]] = false; bm[2*db[i]] = -1; bm[2*db[i]+1] = -1; }
-    const i64 *dr = dead_raw.data_ptr<i64>(); i64 nr = dead_raw.numel();
-    for (i64 i = 0; i < nr; i++) raw.erase(dr[i]);
-    freed_kv += nd; freed_blocks += nb; freed_raw += nr;
+    core->free_rows(dead_d.data_ptr<i64>(), dead_d.numel(), dead_b.data_ptr<i64>(), dead_b.numel(), dead_raw.data_ptr<i64>(),
+                    dead_raw.numel(), limit);
   }
+  void set_stamp(i64 v) { core->set_stamp(v); }
   py::dict stats() {
-    std::lock_guard<std::mutex> g(mu);
+    std::lock_guard<std::mutex> g(core->mu);
     py::dict d;
-    d["kv_pages"] = (i64)kv_pages.size(); d["b_pages"] = (i64)b_pages.size(); d["d_free"] = (i64)d_free.size(); d["b_free"] = (i64)b_free.size();
-    d["raw"] = (i64)raw.size(); d["next_decision"] = next_decision; d["freed_kv"] = freed_kv; d["freed_blocks"] = freed_blocks; d["freed_raw"] = freed_raw;
+    d["kv_pages"] = (i64)core->kv_pages.size(); d["b_pages"] = (i64)core->b_pages.size(); d["d_free"] = (i64)core->d_free.size();
+    d["b_free"] = (i64)core->b_free.size(); d["raw"] = (i64)core->raw.size(); d["next_decision"] = core->next_decision;
+    d["reallocs"] = core->reallocs; d["cap_pages_d"] = (i64)core->kv_pages.capacity(); d["cap_pages_b"] = (i64)core->b_pages.capacity();
+    d["freed_kv"] = core->freed_kv; d["freed_blocks"] = core->freed_blocks; d["freed_raw"] = core->freed_raw;
+    d["stamp"] = core->stamp; d["stamp_kept"] = core->stamp_kept;
     return d;
+  }
+
+  // ---- (B58c) the native lineage (abp_lineage.h): logs, snapshots, the rollout sidecars, contexts, injury sources,
+  // CF points; shared by the driver and Python (Lineage::mu). Python-held snapshots are SnapPin objects.
+  std::shared_ptr<abpc::Native> nat = std::make_shared<abpc::Native>();
+  bool lineage_on = false;
+  void lineage_configure(i64 window, i64 block_steps, i64 memory_blocks, i64 nh_, i64 rows, i64 workers, std::vector<i64> depths,
+                         i64 chunk_steps, i64 generations) {
+    abpc::LineageCfg c; c.window = window; c.block_steps = block_steps; c.memory_blocks = memory_blocks; c.nh = nh_;
+    nat->lin.configure(c, rows);
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    nat->inj.configure(workers, depths);
+    nat->lin.side[0].chunk_steps = nat->lin.side[1].chunk_steps = chunk_steps;
+    nat->pts.gens.configure(generations);
+    lineage_on = true;
+  }
+  void lineage_status(i64 status_ptr) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->status = (i64 *)status_ptr; }
+  void lineage_teach(py::dict d) {
+    auto I = [&](const char *k) { return d[k].cast<i64>(); };
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    abpc::TeachRing &t = nat->tr;
+    t.stats = (const double *)I("stats"); t.stats_stride = I("stats_stride"); t.st_teach = I("st_teach");
+    t.commit = (const i64 *)I("commit"); t.ring = I("ring");
+    t.rows = (const uint8_t *)I("rows"); t.row_size = I("row_size"); t.o_episode = I("o_episode"); t.o_t = I("o_t");
+    t.s_episode = (int)I("s_episode"); t.s_t = (int)I("s_t");
+    t.jobs = (const i64 *)I("jobs"); t.jobs_k = I("jobs_k"); t.epoch = (const i64 *)I("epoch");
+    nat->tr_on = true;
+  }
+  // logs / snapshots from Python (tests, the Python path's rows)
+  void lin_new_head(i64 row, i64 k0, i64 k1, i64 k2) {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    nat->lin.set_head_locked(row, nat->lin.new_log_locked(k0, k1, k2, 0));
+  }
+  i64 lin_head_end(i64 row) {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    i64 g = nat->lin.head.at(row); return g < 0 ? -1 : nat->lin.logs[g].end();
+  }
+  i64 lin_snap_row(i64 row, at::Tensor pend, i64 version) {
+    pend = pend.to(at::kLong).contiguous().cpu();
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    return nat->lin.snap_row_locked(row, pend.data_ptr<i64>(), version);
+  }
+  void lin_push(i64 row, i64 dec, i64 kvs) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->lin.push_locked(row, dec, kvs); }
+  void lin_push_block(i64 row, i64 bid, i64 end) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->lin.push_block_locked(row, bid, end); }
+  void lin_retain(i64 s) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->lin.retain_locked(s); }
+  void lin_release(i64 s) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->lin.release_locked(s); }
+  // a restored row's head: the snapshot's branch (EpisodeLog.branch) -> the row's new log
+  void lin_restore(i64 row, i64 snap) {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    nat->lin.set_head_locked(row, nat->lin.branch_locked(snap));
+  }
+  // the snapshots as Python reads them: per snapshot its branch window (EpisodeLog.branch's arrays); meta [n, 8 + nh]
+  // (step, version, offset, decisions, blocks, episode key x3, pending), the concatenated dec / kvs / blk / blk_end
+  py::tuple lin_materialize(std::vector<i64> snaps) {
+    i64 n = (i64)snaps.size(), nh_ = nat->lin.cfg.nh;
+    std::vector<i64> dec, kvs, blk, bend;
+    at::Tensor meta = at::empty({n, 8+nh_}, at::kLong);
+    i64 *m = meta.data_ptr<i64>();
+    {
+      std::lock_guard<std::mutex> l(nat->lin.mu);
+      abpc::Lineage &L = nat->lin;
+      for (i64 i = 0; i < n; i++) {
+        const abpc::SnapData &d = L.snaps.at(snaps[i]);
+        if (!d.used) throw std::runtime_error("Lineage: materialize of a freed snapshot");
+        const abpc::LogData &g = L.logs.at(d.log);
+        i64 lo = std::max(g.offset, d.step-std::max(L.cfg.window, L.cfg.block_steps));
+        L.check_range(g, lo, d.step);
+        i64 blo, bat; abpc::Lineage::blocks_before(g, d.step, L.cfg.memory_blocks, blo, bat);
+        i64 *r = m+i*(8+nh_);
+        r[0] = d.step; r[1] = d.version; r[2] = lo; r[3] = d.step-lo; r[4] = bat-blo; r[5] = g.key[0]; r[6] = g.key[1]; r[7] = g.key[2];
+        for (i64 h = 0; h < nh_; h++) r[8+h] = d.pend[h];
+        dec.insert(dec.end(), g.dec.begin()+(lo-g.offset), g.dec.begin()+(d.step-g.offset));
+        kvs.insert(kvs.end(), g.kvs.begin()+(lo-g.offset), g.kvs.begin()+(d.step-g.offset));
+        blk.insert(blk.end(), g.blk.begin()+blo, g.blk.begin()+bat);
+        bend.insert(bend.end(), g.blk_end.begin()+blo, g.blk_end.begin()+bat);
+      }
+    }
+    auto T = [](const std::vector<i64> &v) { at::Tensor t = at::empty({(i64)v.size()}, at::kLong); if (!v.empty()) memcpy(t.data_ptr<i64>(), v.data(), v.size()*8); return t; };
+    return py::make_tuple(meta, T(dec), T(kvs), T(blk), T(bend));
+  }
+  // the rollout sidecars (BlockRollout)
+  void side_record(int sl, i64 w, i64 index, bool first, i64 snap) {
+    std::lock_guard<std::mutex> l(nat->lin.mu); nat->lin.side_record_locked(sl, w, index, first, snap);
+  }
+  void side_reset(int sl) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->lin.side_reset_locked(sl); }
+  void side_carry(int dst, int src, at::Tensor workers, at::Tensor indices) {
+    workers = workers.to(at::kLong).contiguous(); indices = indices.to(at::kLong).contiguous();
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    nat->lin.side_carry_locked(dst, src, workers.data_ptr<i64>(), indices.data_ptr<i64>(), workers.numel());
+  }
+  // (keys [m, 2] (worker, index) in BlockRollout.payload's order, snapshots [m]); open: (workers, indices, snapshots)
+  py::tuple side_payload(int sl) {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    abpc::Sidecar &sc = nat->lin.side[sl];
+    std::vector<i64> keys, snaps;
+    for (i64 w : sc.worker_order)
+      for (i64 idx : sc.order[w]) { keys.push_back(w); keys.push_back(idx); snaps.push_back(sc.starts[w][idx]); }
+    at::Tensor k = at::empty({(i64)snaps.size(), 2}, at::kLong), s = at::empty({(i64)snaps.size()}, at::kLong);
+    if (!snaps.empty()) { memcpy(k.data_ptr<i64>(), keys.data(), keys.size()*8); memcpy(s.data_ptr<i64>(), snaps.data(), snaps.size()*8); }
+    std::vector<i64> ow, oi, os;
+    for (auto &e : sc.open) { ow.push_back(e.first); oi.push_back(e.second.first); os.push_back(e.second.second); }
+    auto T = [](const std::vector<i64> &v) { at::Tensor t = at::empty({(i64)v.size()}, at::kLong); if (!v.empty()) memcpy(t.data_ptr<i64>(), v.data(), v.size()*8); return t; };
+    return py::make_tuple(k, s, T(ow), T(oi), T(os));
+  }
+  // contexts (ContextRegistry)
+  i64 ctx_put(i64 owner, i64 snap) { std::lock_guard<std::mutex> l(nat->lin.mu); return nat->lin.ctx_put_locked(owner, snap); }
+  i64 ctx_get(i64 ident) {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    auto it = nat->lin.ctx.find(ident);
+    if (it == nat->lin.ctx.end()) throw py::key_error("context " + std::to_string(ident));
+    return it->second.second;
+  }
+  void ctx_complete(i64 owner) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->lin.ctx_complete_locked(owner); }
+  i64 ctx_retire(std::vector<i64> live, bool transient) {
+    std::unordered_set<i64> s(live.begin(), live.end());
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    return nat->lin.ctx_retire_locked(s, transient);
+  }
+  // injury sources
+  void inj_observe(i64 w, bool first, i64 e, i64 t, bool hurt) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->inj.observe(w, first, e, t, hurt); }
+  void inj_record(i64 w, i64 e, i64 t, i64 snap) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->inj.record(nat->lin, w, e, t, snap); }
+  i64 inj_get(i64 w, i64 e, i64 t) {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    auto it = nat->inj.sources.find(abpc::Key3{w, e, t});
+    if (it == nat->inj.sources.end()) throw py::key_error("injury source (" + std::to_string(w) + ", " + std::to_string(e) + ", " + std::to_string(t) + ")");
+    return it->second;
+  }
+  i64 inj_reclaim() {   // -1: a worker was inside its pin update (nothing reclaimed)
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    if (!nat->tr_on) return 0;
+    i64 freed = 0;
+    return nat->inj.reclaim(nat->lin, nat->tr, freed) ? freed : -1;
+  }
+  py::tuple inj_keys() {   // (tests) the sources' keys [n, 3], each worker's hurt candidates' keys [m, 3]
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    std::vector<i64> a, b;
+    for (auto &e : nat->inj.sources) { a.push_back(e.first.w); a.push_back(e.first.e); a.push_back(e.first.t); }
+    for (auto &h : nat->inj.hurt) for (auto &k : h) { b.push_back(k.w); b.push_back(k.e); b.push_back(k.t); }
+    at::Tensor ta = at::empty({(i64)a.size()/3, 3}, at::kLong), tb = at::empty({(i64)b.size()/3, 3}, at::kLong);
+    if (!a.empty()) memcpy(ta.data_ptr<i64>(), a.data(), a.size()*8);
+    if (!b.empty()) memcpy(tb.data_ptr<i64>(), b.data(), b.size()*8);
+    return py::make_tuple(ta, tb);
+  }
+  // CF points
+  i64 pt_capture(i64 point, i64 snap, i64 version) {   // 2 made, -1 refused, -2 - i: publish generation slot i first
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    i64 r = nat->pts.capture(nat->lin, point, snap, version);
+    if (nat->status && (r == 2 || r == -1)) nat->status[point] = r;
+    return r;
+  }
+  void pt_published(int slot, i64 version) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->pts.published(slot, version); }
+  i64 pt_release(i64 point) { std::lock_guard<std::mutex> l(nat->lin.mu); return nat->pts.release(nat->lin, point); }
+  py::object pt_get(i64 point) {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    auto it = nat->pts.table.find(point);
+    if (it == nat->pts.table.end()) return py::none();
+    const abpc::Point &p = it->second;
+    return py::make_tuple(p.snap, p.gen, p.version, p.token);
+  }
+  std::vector<i64> pt_points() {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    std::vector<i64> v; for (auto &e : nat->pts.table) v.push_back(e.first);
+    std::sort(v.begin(), v.end()); return v;
+  }
+  py::tuple pt_gens() {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    auto &g = nat->pts.gens;
+    return py::make_tuple(g.version, g.refs);
+  }
+  // the GC over the native lineage (abpc::collect); extra_*: rows the Python side keeps (its own snapshots / logs)
+  py::tuple lin_collect(i64 limit, py::object extra_kv, py::object extra_b, py::object extra_raw) {
+    at::Tensor ek, eb, er;
+    const uint8_t *pk = nullptr, *pb = nullptr; const i64 *pr = nullptr; i64 nr = 0;
+    if (!extra_kv.is_none()) { ek = extra_kv.cast<at::Tensor>().to(at::kByte).contiguous(); TORCH_CHECK(ek.numel() == cap_d, "extra_kv: cap_d"); pk = ek.data_ptr<uint8_t>(); }
+    if (!extra_b.is_none()) { eb = extra_b.cast<at::Tensor>().to(at::kByte).contiguous(); TORCH_CHECK(eb.numel() == cap_b, "extra_b: cap_b"); pb = eb.data_ptr<uint8_t>(); }
+    if (!extra_raw.is_none()) { er = extra_raw.cast<at::Tensor>().to(at::kLong).contiguous(); pr = er.data_ptr<i64>(); nr = er.numel(); }
+    abpc::Freed f;
+    {
+      py::gil_scoped_release nogil;
+      f = abpc::collect(*core, nat->lin, limit, pk, pb, pr, nr);
+    }
+    return py::make_tuple(f.kv, f.blocks, f.raw);
+  }
+  py::dict lin_stats() {
+    std::lock_guard<std::mutex> l(nat->lin.mu);
+    py::dict d;
+    abpc::Lineage &L = nat->lin;
+    i64 heads = 0; for (i64 h : L.head) heads += h >= 0;
+    d["logs"] = L.n_logs; d["snaps"] = L.n_snaps; d["heads"] = heads; d["made_logs"] = L.made_logs; d["made_snaps"] = L.made_snaps;
+    d["contexts"] = (i64)L.ctx.size(); d["completed"] = (i64)L.completed.size(); d["next_ident"] = L.next_ident;
+    d["injury"] = (i64)nat->inj.sources.size(); d["points"] = (i64)nat->pts.table.size(); d["gc_runs"] = L.gc_runs;
+    i64 side = 0; for (auto &sc : L.side) for (auto &w : sc.starts) side += (i64)w.second.size();
+    d["side_starts"] = side;
+    return d;
+  }
+};
+
+// (B58c) a Python-held snapshot: one reference, released when the Python object goes
+struct SnapPin {
+  std::shared_ptr<abpc::Native> nat; i64 snap;
+  SnapPin(std::shared_ptr<PageStore> s, i64 id, bool retain) : nat(s->nat), snap(id) {
+    if (retain) { std::lock_guard<std::mutex> l(nat->lin.mu); nat->lin.retain_locked(snap); }
+  }
+  ~SnapPin() {
+    try { std::lock_guard<std::mutex> l(nat->lin.mu); nat->lin.release_locked(snap); } catch (...) {}
   }
 };
 
@@ -294,6 +425,7 @@ struct GraphEntry {
   at::Tensor out, cur, z, written;                // device outputs
   at::Tensor bo, bc, bz, bw;                      // pinned D2H buffers
   Layout L;
+  i64 scratch = -1;                               // (B58d) the arena row its padded rows address (-1: the driver's)
   i64 filled = 0;                                 // rows of the slab holding a call's rows (zeroed past the next call's n)
   i64 heads, nh;
 };
@@ -314,6 +446,13 @@ struct Record {
   i64 cap = 0, wb = 0, we = 0, wn = 0, ws = 0;   // (kind 1)
   double t_poll = 0, t_sync = 0, t_reply = 0, t_pages = 0, t_done = 0;   // driver clock (s) of the step's phases
   double t_main_reply = 0;                   // (kind 4 of a merged batch) when the batch's main rows were replied
+  at::Tensor kk, snap;                       // (B58a+b, native consumer) go rows' rollout index (-1: dropped, full);
+                                             // per row [n_all, N_SNAP] accumulators before an episode end reset them
+  // (B58c, kind 6) a CF capture whose generation Python must publish first: point, generation slot, the row's snapshot
+  // (one reference the record holds), worker
+  i64 point = -1, pub_slot = -1, pub_snap = -1, pub_worker = -1;
+  int lane_src = 0;   // (B58d) 1: a record of the lane thread (kind 1: a lane graph to capture; 5: a job Python steps; 3)
+  at::Tensor lane_ids, lane_seq, lane_replay;   // (B58d, kind 5) the job's lanes, CRN keys, replay flags
 };
 
 // tok_policy.crn_uniforms, bit for bit: element (key, t, c) = splitmix64 output t * 256 + c + 1 of the stream seeded with
@@ -345,6 +484,11 @@ struct LaneJob {   // (B54) one teacher generation's rows of a lane round, queue
   std::vector<i64> pend, ids, seq, lane;     // pending [n x nh], arena rows, CRN keys (request sequence, lane)
   std::vector<uint8_t> replay;               // evaluate rows (uniform 0.5)
 };
+
+// (B58a+b / B58c) the native consumer's configuration, rollout slots, frame arenas and arithmetic: abpc (abp_core.h)
+using abpc::ConsumerCfg;
+using abpc::RollSlot;
+using abpc::N_SNAP;
 
 struct Xoshiro {   // xoshiro256**, seeded through splitmix64
   uint64_t s[4];
@@ -404,6 +548,8 @@ struct ActorDriver {
   std::atomic<i64> version{0};
   std::vector<i64> ready_w, ready_s;   // a batch the driver could not step (capture needed): retried after resume
   std::string error;
+  // (B58a+b) the native consumer
+  ConsumerCfg cc; RollSlot slots[2]; std::atomic<int> cur_slot{-1}; std::mutex amu;   // amu: the arenas
   // (B54) lane jobs
   std::deque<std::shared_ptr<LaneJob>> lane_q; std::mutex lmu;
   bool lane_merge = true;              // (tests / ISAAC_BLOCK_LANE_MERGE=0) merge jobs of the main version into main batches
@@ -419,9 +565,27 @@ struct ActorDriver {
   std::atomic<double> t_pause_s{0};
   std::atomic<double> t_lane_s{0};                 // (B54) seconds in lane-only calls (fill, replay, pages, record)
   std::atomic<i64> lane_hist[6] = {};              // (B54) lane-only calls by rows: 1, 2, 3-4, 5-8, 9-16, > 16
+  // (B58 step 0) the driver thread's time by phase (s; one writer, the driver): poll = waiting for / reading the
+  // workers' messages; prep = a main step's row copies, packing, widths and inputs (t0 .. the graph); sync = the
+  // graph's fill + replay + sync (t_sync_s); reply = outputs, shared arrays, the replies; pages = the main rows' pages
+  // (t_pages_s, without the consumer since step 0); cons = the native consumer; push = waiting for room in the record
+  // queue (every record); mlane = the merged lane rows' records and pages; lane = lane-only calls (t_lane_s);
+  // hold = lanes-only mode (main_hold) idle; loop = the loop's wall time (the rest is pause_s and bookkeeping)
+  std::atomic<double> t_poll_s{0}, t_prep_s{0}, t_reply_s{0}, t_cons_s{0}, t_push_s{0}, t_mlane_s{0}, t_hold_s{0}, t_loop_s{0};
+  std::atomic<i64> n_polls{0}, n_idle_polls{0};
+  // (B58d plan: why lane rows do not ride the main steps) lane-only rows at the main version / an older one, merged
+  // rows put back (the batch too wide), lane jobs queued while the driver was inside a main step / outside it
+  std::atomic<i64> n_lo_cur_rows{0}, n_lo_old_rows{0}, n_putback_rows{0}, n_enq_in_step{0}, n_enq_outside{0};
+  std::atomic<bool> in_step{false};
+  // (B58c) the main rows' lineage in the driver (store->nat): observe_rows, logs, snapshots, CF captures, injury
+  // sources, log pushes, the rollout sidecar; Python enters only for a generation to publish (kind 6)
+  bool lin_on = false; i64 lin_tag = 0;
+  i64 f_episode = 0, f_t = 0, f_hurt = 0; int s_episode = 8, s_t = 8;
+  std::atomic<i64> n_cap_native{0}, n_cap_refused{0}, n_cap_publish{0};
+  std::atomic<double> t_lin_s{0};
 
   explicit ActorDriver(std::shared_ptr<PageStore> s) : store(std::move(s)) {}
-  ~ActorDriver() { stop(); }
+  ~ActorDriver() { lanes_stop(); stop(); }
 
   static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
@@ -453,6 +617,16 @@ struct ActorDriver {
   // (B54) Python made (or refused) the CF captures the workers' last records asked for: their next records may go
   void capture_done(std::vector<i64> workers) { for (i64 w : workers) if (w >= 0 && w < n_workers) cap_wait[w] = 0; }
   void set_main_hold(bool on) { main_hold = on; }
+  // (B58c) the main rows' lineage in the driver (the store's Native, configured by PageStore.lineage_configure): tag =
+  // the logs' episode key's first part (Python: os.getpid()); fields: ROW 'episode' / 't' (int) offsets and sizes,
+  // 'hurt' (float32) offset
+  void set_lineage(bool on, i64 tag, py::dict fields) {
+    TORCH_CHECK(!on || store->lineage_on, "set_lineage: configure the store's lineage first");
+    auto f = [&](const char *name, int &size) { py::tuple t = fields[name].cast<py::tuple>(); size = t[1].cast<int>(); return t[0].cast<i64>(); };
+    int dummy;
+    if (on) { f_episode = f("episode", s_episode); f_t = f("t", s_t); f_hurt = f("hurt", dummy); }
+    lin_tag = tag; lin_on = on;
+  }
   void set_arena(std::vector<at::Tensor> tensors, std::vector<i64> dims, std::vector<double> fills, i64 scratch, i64 base_, i64 step_host_ptr,
                  i64 heads_, i64 nh_, i64 block_steps_, i64 arena_rows_, i64 owner) {
     reset.tensors = tensors; reset.dims = dims; reset.fills = fills; scratch_row = scratch; base = base_; step_host = (i64 *)step_host_ptr;
@@ -470,6 +644,77 @@ struct ActorDriver {
     memcpy(t.data_ptr<i64>(), pending_cur.data(), pending_cur.size()*sizeof(i64));
     return t;
   }
+  // ---- (B58a+b) native consumer configuration (Python, with the driver paused or not started)
+  void set_consumer(py::dict d) {
+    auto I = [&](const char *k) { return d[k].cast<i64>(); };
+    auto F = [&](const char *k) { return d[k].cast<double>(); };
+    auto B = [&](const char *k) { return d[k].cast<bool>(); };
+    auto P = [&](const char *k) { return d.contains(k) && !d[k].is_none() ? d[k].cast<i64>() : (i64)0; };
+    ConsumerCfg c;
+    c.o_first = I("o_first"); c.o_done = I("o_done"); c.o_damage = I("o_damage"); c.o_hurt = I("o_hurt"); c.o_events = I("o_events");
+    c.o_stage = I("o_stage"); c.o_player = I("o_player"); c.o_pforce = I("o_pforce"); c.row_frame_at = I("row_frame_at");
+    c.w_damage = F("w_damage"); c.w_hurt = F("w_hurt"); c.w_time = F("w_time"); c.w_death = F("w_death"); c.w_timeout = F("w_timeout");
+    c.w_room = F("w_room"); c.w_explore = F("w_explore"); c.w_boss = F("w_boss"); c.w_exit = F("w_exit"); c.w_heal = F("w_heal");
+    c.w_resource = F("w_resource"); c.end_bonus = F("end_bonus"); c.gamma = F("gamma");
+    c.floor = B("floor"); c.run = B("run"); c.items = B("items"); c.gains_on = B("gains_on"); c.plr_on = B("plr_on"); c.pick_on = B("pick_on");
+    c.ev_exit = I("ev_exit"); c.ev_item = I("ev_item"); c.ev_active = I("ev_active"); c.ev_pill = I("ev_pill"); c.done_branch = I("done_branch");
+    c.ret = (double *)P("ret"); c.ep_hurt = (double *)P("hurt"); c.ep_damage = (double *)P("damage"); c.gains = (double *)P("gains");
+    c.healed = (double *)P("healed"); c.gathered = (double *)P("gathered"); c.v0 = (double *)P("v0"); c.gret = (double *)P("gret");
+    c.rooms = (i64 *)P("rooms"); c.boss = (i64 *)P("boss"); c.extra = (i64 *)P("extra"); c.steps = (i64 *)P("steps");
+    c.pick_steps = (i64 *)P("pick_steps");
+    c.on = true;
+    cc = c;
+  }
+  void set_rollout(int slot, py::dict d, i64 arena_bytes) {
+    TORCH_CHECK(slot == 0 || slot == 1, "set_rollout: slot 0 or 1");
+    auto P = [&](const char *k) { return d.contains(k) && !d[k].is_none() ? d[k].cast<i64>() : (i64)0; };
+    RollSlot &r = slots[slot];
+    r.cap = P("cap"); r.rowc_size = P("rowc_size"); r.off_visible_off = P("off_visible_off"); r.priv_size = P("priv_size");
+    r.rows = (uint8_t *)P("rows"); r.terminal = (uint8_t *)P("terminal"); r.close_done = (uint8_t *)P("close_done");
+    r.close_ev = (uint8_t *)P("close_ev"); r.priv = (uint8_t *)P("priv"); r.boot = (uint8_t *)P("boot");
+    r.reward = (float *)P("reward"); r.close_hurt = (float *)P("close_hurt"); r.logp = (float *)P("logp"); r.value = (float *)P("value");
+    r.value_g = (float *)P("value_g"); r.open = (i64 *)P("open"); r.length = (i64 *)P("length"); r.pending = (i64 *)P("pending");
+    r.actions = (i64 *)P("actions"); r.version = (i64 *)P("version");
+    std::lock_guard<std::mutex> g(amu);
+    r.arena.ensure(std::max<i64>(arena_bytes, 1024));
+    r.arena.reset();
+    r.set = true;
+  }
+  void use_rollout(int slot) { TORCH_CHECK(slot >= -1 && slot <= 1, "use_rollout: slot"); cur_slot = slot; }
+  // the frame arena of a slot (B45 FrameArena's buf / used, appends of the hand-off's carry)
+  // (a view of the arena's current buffer; the view holds the buffer, so it stays valid after growth and reset; what
+  // it shows after the slot's reset is the old rollout's frames)
+  at::Tensor arena_buf(int slot) {
+    std::lock_guard<std::mutex> g(amu);
+    std::shared_ptr<uint8_t[]> keep = slots[slot].arena.cur;
+    return at::from_blob(keep.get(), {slots[slot].arena.cap}, [keep](void *) {}, at::TensorOptions().dtype(at::kByte));
+  }
+  i64 arena_used(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].arena.used; }
+  void arena_reset(int slot) { std::lock_guard<std::mutex> g(amu); slots[slot].arena.reset(); }
+  i64 arena_grown(int slot) { std::lock_guard<std::mutex> g(amu); return slots[slot].arena.grown; }
+  at::Tensor arena_append_from(int slot, at::Tensor buf, at::Tensor offs, at::Tensor sizes) {
+    buf = buf.contiguous(); offs = offs.to(at::kLong).contiguous(); sizes = sizes.to(at::kLong).contiguous();
+    i64 n = offs.numel();
+    at::Tensor out = at::empty({n}, at::kLong);
+    std::lock_guard<std::mutex> g(amu);
+    for (i64 i = 0; i < n; i++)
+      out.data_ptr<i64>()[i] = slots[slot].arena.append(buf.data_ptr<uint8_t>()+offs.data_ptr<i64>()[i], sizes.data_ptr<i64>()[i]);
+    return out;
+  }
+  // (tests) the consumer on given records, as the driver runs it for a step: rows uint8 [n_all * row_stride] (ROW),
+  // workers, go mask, outputs [n_go, nh+3] float32, actions / pending [n_go, nh] int64, version, priv [n_all * priv size]
+  py::tuple consume_rows(at::Tensor rows, std::vector<i64> ws, at::Tensor go, at::Tensor out, at::Tensor actions_, at::Tensor pend,
+                         i64 ver, at::Tensor priv_) {
+    rows = rows.contiguous(); go = go.to(at::kByte).contiguous(); out = out.to(at::kFloat).contiguous();
+    actions_ = actions_.to(at::kLong).contiguous(); pend = pend.to(at::kLong).contiguous();
+    i64 n_all = (i64)ws.size();
+    std::vector<uint8_t> g(go.data_ptr<uint8_t>(), go.data_ptr<uint8_t>()+n_all);
+    std::vector<i64> go_idx; for (i64 i = 0; i < n_all; i++) if (g[i]) go_idx.push_back(i);
+    Record r;
+    const uint8_t *pp = priv_.defined() && priv_.numel() ? priv_.contiguous().data_ptr<uint8_t>() : nullptr;
+    consume(r, rows.data_ptr<uint8_t>(), n_all, ws, g, go_idx, out.data_ptr<float>(), actions_.data_ptr<i64>(), pend.data_ptr<i64>(), ver, pp);
+    return py::make_tuple(r.kk, r.snap);
+  }
   // (B54) a lane job: rows uint8 [n * row_stride], pending int64 [n * nh], ids / seq / lane int64 [n], replay uint8 [n]
   void submit_lanes(i64 job, i64 owner, i64 ver, at::Tensor rows, i64 n, at::Tensor pending, at::Tensor ids, at::Tensor seq,
                     at::Tensor lane, at::Tensor replay) {
@@ -484,6 +729,7 @@ struct ActorDriver {
     jb->pend.assign(pending.data_ptr<i64>(), pending.data_ptr<i64>()+n*nh);
     jb->ids.assign(ids.data_ptr<i64>(), ids.data_ptr<i64>()+n); jb->seq.assign(seq.data_ptr<i64>(), seq.data_ptr<i64>()+n);
     jb->lane.assign(lane.data_ptr<i64>(), lane.data_ptr<i64>()+n); jb->replay.assign(replay.data_ptr<uint8_t>(), replay.data_ptr<uint8_t>()+n);
+    (in_step.load() ? n_enq_in_step : n_enq_outside)++;
     std::lock_guard<std::mutex> g(lmu);
     lane_q.push_back(jb);
   }
@@ -510,12 +756,13 @@ struct ActorDriver {
   }
   void register_graph(std::vector<i64> key, at::Tensor host_flat, at::Tensor dev_flat, std::shared_ptr<at::cuda::CUDAGraph> graph,
                       at::Tensor out, at::Tensor cur, at::Tensor z, at::Tensor written, at::Tensor bo, at::Tensor bc, at::Tensor bz,
-                      at::Tensor bw, py::dict layout, i64 heads_, i64 nh_) {
+                      at::Tensor bw, py::dict layout, i64 heads_, i64 nh_, i64 scratch_) {
     TORCH_CHECK(key.size() == 6, "graph key: (owner, cap, wb, we, wn, ws)");
     GraphEntry e;
     e.cap = key[1]; e.wb = key[2]; e.we = key[3]; e.wn = key[4]; e.ws = key[5];
     e.host_flat = host_flat; e.dev_flat = dev_flat; e.graph = std::move(graph);
     e.out = out; e.cur = cur; e.z = z; e.written = written; e.bo = bo; e.bc = bc; e.bz = bz; e.bw = bw; e.heads = heads_; e.nh = nh_;
+    e.scratch = scratch_;
     auto o = [&](const char *k) { return layout[k].cast<py::tuple>()[0].cast<i64>(); };
     e.L.room = o("v_room"); e.L.map = o("v_map"); e.L.body = o("v_body"); e.L.body_mask = o("v_body_mask"); e.L.local = o("v_local");
     e.L.local_mask = o("v_local_mask"); e.L.entity = o("v_entity"); e.L.entity_mask = o("v_entity_mask"); e.L.inventory = o("v_inventory");
@@ -547,7 +794,7 @@ struct ActorDriver {
     }
     e.filled = n;
     i64 *hid = (i64 *)(h+e.L.ids);
-    for (i64 i = 0; i < e.cap; i++) hid[i] = i < n ? ids[i] : scratch_row;
+    for (i64 i = 0; i < e.cap; i++) hid[i] = i < n ? ids[i] : (e.scratch >= 0 ? e.scratch : scratch_row);
     float *hu = (float *)(h+e.L.u);
     for (i64 i = 0; i < e.cap*hd; i++) hu[i] = .5f;
     if (u) memcpy(hu, u, n*hd*sizeof(float));
@@ -573,6 +820,351 @@ struct ActorDriver {
     py::gil_scoped_release nogil;
     fill_and_run(*e, n, rows.data_ptr<uint8_t>(), stride, pending.contiguous().data_ptr<i64>(), ids.contiguous().data_ptr<i64>(), up,
                  rp.data_ptr<uint8_t>(), cp.data_ptr<uint8_t>(), ver, any);
+  }
+
+  // ================================================================ (B58d) the native lane loop: its own thread
+  // abpc::LaneCore (abp_lanes.h) runs the lane service; its GPU work (a branch's restore, the jobs' lane-only graph
+  // replays) goes on the lane stream (the lane graphs captured in a pool of their own: they replay while the main
+  // graphs do); the lane rows are the arena rows base(gen) + lane, which only this thread touches. A job the lane
+  // thread cannot replay (a graph to capture: kind 1, a frame the graphs cannot take: kind 5) is a record for Python,
+  // the lane thread waits for its answer (lane_job_resume / lane_python_done).
+  abpc::LaneCore lc;
+  bool lanes_native = false;
+  std::thread lth;
+  std::atomic<bool> lrunning{false}, lstop{false}, lpause_req{false}, lpaused{false};
+  std::mutex lcmu; std::condition_variable lccv;
+  i64 lane_stream_id = 0;
+  std::vector<int> lane_fds;
+  std::string lerror;
+  std::vector<i64> gen_owner, gen_base;   // per generation (N: the point table's)
+  std::atomic<int> l_wait{0};          // 1: a lane job waits for Python
+  abpc::LaneJobOut l_py_out; bool l_py_done = false;
+  std::atomic<i64> n_l_jobs{0}, n_l_rows{0}, n_l_restores{0}, n_l_python{0}, n_l_captures{0};
+  std::atomic<double> t_l_restore{0}, t_l_job{0}, t_l_pause{0};
+
+  void lanes_configure(py::dict c, py::dict s, std::vector<int> fds, i64 stream_id, std::vector<i64> owners, std::vector<i64> bases) {
+    TORCH_CHECK(store->lineage_on, "lanes_configure: the store's lineage first");
+    TORCH_CHECK(owners.size() == bases.size() && (i64)owners.size() == store->nat->pts.gens.n(), "lanes_configure: a graph owner and a base per generation");
+    auto I = [&](py::dict d, const char *k) { return d.contains(k) && !d[k].is_none() ? d[k].cast<i64>() : (i64)0; };
+    auto F = [&](py::dict d, const char *k) { return d[k].cast<double>(); };
+    abpc::LaneCfg cfg; cfg.lanes = I(c, "lanes"); cfg.nh = nh; cfg.tw = I(c, "tw"); cfg.wait = F(c, "wait"); cfg.quiet = F(c, "quiet");
+    cfg.active_s = F(c, "active_s"); cfg.defer_s = F(c, "defer_s"); cfg.reclaim_s = F(c, "reclaim_s"); cfg.pid = I(c, "pid");
+    abpc::LaneShared sh;
+    sh.rows = (const uint8_t *)I(s, "rows"); sh.row_size = row_stride; sh.o_episode = I(s, "o_episode"); sh.s_episode = (int)I(s, "s_episode");
+    sh.io = (int32_t *)I(s, "io"); sh.io_cols = I(s, "io_cols"); sh.out = (double *)I(s, "out"); sh.out_cols = I(s, "out_cols");
+    sh.t = (float *)I(s, "t"); sh.v2_t = (const float *)I(s, "v2_t"); sh.v2_ring = I(s, "v2_ring");
+    sh.mode = (const i64 *)I(s, "mode"); sh.status = (i64 *)I(s, "status"); sh.pts_per = I(s, "pts_per");
+    sh.kept = (const i64 *)I(s, "kept"); sh.kept_cols = I(s, "kept_cols"); sh.cf_snap = (i64 *)I(s, "cf_snap");
+    lane_fds = fds; lane_stream_id = stream_id;
+    gen_owner = owners; gen_base = bases;
+    lc.configure(cfg, sh, store->nat.get());
+    lc.ops.restore = [this](i64 g, i64 lane, i64 snap) { lane_restore(g, lane, snap); };
+    lc.ops.submit = [this](i64 job, i64 g, std::vector<uint8_t> rows, std::vector<i64> pend, std::vector<i64> lanes, std::vector<i64> seq,
+                           std::vector<uint8_t> replay) { lane_job(job, g, std::move(rows), std::move(pend), std::move(lanes), std::move(seq), std::move(replay)); };
+    lc.ops.reply = [this](const std::vector<i64> &lanes) {
+      static const char R[5] = {0, 0, 0, 1, 'a'};
+      for (i64 l : lanes) if (l >= 0 && l < (i64)lane_fds.size() && lane_fds[l] >= 0) { ssize_t k = ::write(lane_fds[l], R, 5); (void)k; }
+    };
+    lc.ops.gen_version = [this](i64 g) { std::lock_guard<std::mutex> l(store->nat->lin.mu); return store->nat->pts.gens.version[g]; };
+    lc.ops.main_version = [this]() { return version.load(); };
+    lc.ops.base = [this](i64 g) { return gen_base[g]; };
+    lanes_native = true;
+    lane_merge = false;   // (lane rows never go into main batches: the main graphs and the lane graphs replay concurrently)
+  }
+  // state.load (BlockSlotState) of arena row base(g) + lane from a snapshot's parts, on the lane stream; the row's head
+  // the snapshot's branch, its lineage ring from that log
+  void lane_restore(i64 g, i64 lane, i64 snap) {
+    double t0 = now();
+    i64 row = gen_base[g]+lane;
+    abpc::Native &N = *store->nat;
+    abpc::Parts p;
+    std::vector<i64> rdec(block_steps, -1), rkv(block_steps, -1); i64 rn = 0;
+    {
+      std::lock_guard<std::mutex> l(N.lin.mu);
+      p = N.lin.parts_locked(snap);
+      N.lin.set_head_locked(row, N.lin.branch_locked(snap));
+      const abpc::LogData &hg = N.lin.logs[N.lin.head[row]];
+      i64 step = hg.end(), lo = std::max(hg.offset, step-block_steps);
+      for (i64 s_ = lo; s_ < step; s_++) { rdec[s_ % block_steps] = hg.dec[s_-hg.offset]; rkv[s_ % block_steps] = hg.kvs[s_-hg.offset]; }
+      rn = step-lo;
+    }
+    abpc::PageCore &pc = *store->core;
+    at::Tensor kv_t = reset.tensors[0];
+    at::TensorOptions H = at::TensorOptions().pinned_memory(true);
+    i64 n = (i64)p.kvs.size(), np_ = (i64)p.pdec.size(), m = (i64)p.bid.size();
+    i64 kvb = pc.kv_row_bytes, ze = pc.z_elems, be = pc.b_elems;
+    at::Tensor kvh = at::empty({std::max<i64>(n*kvb, 1)}, H.dtype(at::kByte)), zh = at::empty({std::max<i64>(np_*ze, 1)}, H.dtype(at::kFloat)),
+               bh = at::empty({std::max<i64>(m*be, 1)}, H.dtype(at::kFloat));
+    at::Tensor kver = at::empty({n}, at::kLong), pver = at::empty({np_}, at::kLong), bver = at::empty({m}, at::kLong);
+    at::Tensor bsrc = at::empty({m, block_steps}, at::kLong), bsrcv = at::empty({m, block_steps}, at::kLong);
+    {
+      std::lock_guard<std::mutex> l(pc.mu);
+      for (i64 i = 0; i < n; i++) { memcpy(kvh.data_ptr<uint8_t>()+i*kvb, pc.kv_row(p.kvs[i]), kvb); kver.data_ptr<i64>()[i] = pc.d_meta[2*p.kvs[i]+1]; }
+      for (i64 i = 0; i < np_; i++) { memcpy(zh.data_ptr<float>()+i*ze, pc.z_row(p.pkvs[i]), ze*4); pver.data_ptr<i64>()[i] = pc.d_meta[2*p.pkvs[i]+1]; }
+      for (i64 i = 0; i < m; i++) {
+        i64 b = p.bid[i];
+        memcpy(bh.data_ptr<float>()+i*be, pc.b_row(b), be*4); bver.data_ptr<i64>()[i] = pc.b_meta[2*b+1];
+        memcpy(bsrc.data_ptr<i64>()+i*block_steps, pc.b_src.get()+b*block_steps, block_steps*8);
+        memcpy(bsrcv.data_ptr<i64>()+i*block_steps, pc.b_srcver.get()+b*block_steps, block_steps*8);
+      }
+    }
+    reset_rows({row});
+    auto dev = kv_t.device();
+    auto D = [&](at::Tensor x) { return x.to(dev, /*non_blocking=*/true); };
+    // reset.tensors: kv, then BlockSlotState._rows: bank, partial, steps, kv_steps, kv_versions, bank_ends, bank_versions,
+    // partial_sources, partial_versions, bank_sources, bank_source_versions
+    at::Tensor bank = reset.tensors[1], partial = reset.tensors[2], steps_t = reset.tensors[3], kv_steps = reset.tensors[4],
+               kv_versions = reset.tensors[5], bank_ends = reset.tensors[6], bank_versions = reset.tensors[7], partial_sources = reset.tensors[8],
+               partial_versions = reset.tensors[9], bank_sources = reset.tensors[10], bank_source_versions = reset.tensors[11];
+    i64 lat = partial.size(2), wl = kv_steps.size(1), mb = bank.size(1);
+    if (n) {
+      at::Tensor st = at::from_blob(p.kv_steps.data(), {n}, at::kLong).clone();
+      at::Tensor cols = (st.unsqueeze(1)*lat+at::arange(lat, at::kLong).unsqueeze(0)).remainder(wl).reshape({-1});
+      at::Tensor colsd = D(cols.pin_memory());
+      at::Tensor vals = D(kvh.narrow(0, 0, n*kvb).view(kv_t.scalar_type()).view({n, kv_t.size(0), kv_t.size(1), kv_t.size(3), lat, kv_t.size(5)}));
+      vals = vals.permute({1, 2, 3, 0, 4, 5}).reshape({kv_t.size(0), kv_t.size(1), kv_t.size(3), n*lat, kv_t.size(5)});
+      kv_t.select(2, row).index_copy_(3, colsd, vals);
+      kv_steps.select(0, row).index_copy_(0, colsd, D(st.repeat_interleave(lat).pin_memory()));
+      kv_versions.select(0, row).index_copy_(0, colsd, D(kver.repeat_interleave(lat).pin_memory()));
+    }
+    if (np_) {
+      partial.select(0, row).narrow(0, 0, np_).copy_(D(zh.narrow(0, 0, np_*ze).view({np_, lat, partial.size(3)})).to(partial.scalar_type()));
+      partial_versions.select(0, row).narrow(0, 0, np_).copy_(D(pver.pin_memory()));
+      partial_sources.select(0, row).narrow(0, 0, np_).copy_(D(at::from_blob(p.pdec.data(), {np_}, at::kLong).clone().pin_memory()));
+    }
+    if (m) {
+      at::Tensor ends = at::from_blob(p.ends.data(), {m}, at::kLong).clone();
+      at::Tensor col = D(at::floor_divide(ends, block_steps).remainder(mb).pin_memory());
+      bank.select(0, row).index_copy_(0, col, D(bh.narrow(0, 0, m*be).view({m, bank.size(2), bank.size(3)})).to(bank.scalar_type()));
+      bank_ends.select(0, row).index_copy_(0, col, D(ends.pin_memory()));
+      bank_versions.select(0, row).index_copy_(0, col, D(bver.pin_memory()));
+      bank_sources.select(0, row).index_copy_(0, col, D(bsrc.pin_memory()));
+      bank_source_versions.select(0, row).index_copy_(0, col, D(bsrcv.pin_memory()));
+    }
+    step_host[row] = p.step;
+    steps_t.select(0, row).fill_(p.step);
+    memcpy(&ring_dec[row*block_steps], rdec.data(), block_steps*8); memcpy(&ring_kv[row*block_steps], rkv.data(), block_steps*8);
+    ring_n[row] = rn;
+    n_l_restores++; t_l_restore = t_l_restore+(now()-t0);
+  }
+  // wait for Python's answer to a lane record (kind 1: captured; 5: stepped)
+  void lane_wait_python(std::shared_ptr<Record> r) {
+    l_wait = 1;
+    push_record(r);
+    std::unique_lock<std::mutex> lk(lcmu);
+    while (l_wait.load() && !lstop) lccv.wait_for(lk, std::chrono::milliseconds(2));
+  }
+  void lane_job_resume() { std::lock_guard<std::mutex> g(lcmu); l_wait = 0; lccv.notify_all(); }
+  // (kind 5) Python stepped the job on its lane actor: the rows' outputs and pages
+  void lane_python_done(at::Tensor out, at::Tensor step_before, at::Tensor first, at::Tensor complete, at::Tensor dec, at::Tensor kvs,
+                        at::Tensor bid, i64 ver) {
+    out = out.to(at::kFloat).contiguous(); step_before = step_before.to(at::kLong).contiguous(); first = first.to(at::kByte).contiguous();
+    complete = complete.to(at::kByte).contiguous(); dec = dec.to(at::kLong).contiguous(); kvs = kvs.to(at::kLong).contiguous();
+    bid = bid.to(at::kLong).contiguous();
+    std::lock_guard<std::mutex> g(lcmu);
+    l_py_out.out.assign(out.data_ptr<float>(), out.data_ptr<float>()+out.numel());
+    l_py_out.step_before.assign(step_before.data_ptr<i64>(), step_before.data_ptr<i64>()+step_before.numel());
+    l_py_out.first.assign(first.data_ptr<uint8_t>(), first.data_ptr<uint8_t>()+first.numel());
+    l_py_out.complete.assign(complete.data_ptr<uint8_t>(), complete.data_ptr<uint8_t>()+complete.numel());
+    l_py_out.dec.assign(dec.data_ptr<i64>(), dec.data_ptr<i64>()+dec.numel());
+    l_py_out.kvs.assign(kvs.data_ptr<i64>(), kvs.data_ptr<i64>()+kvs.numel());
+    l_py_out.bid.assign(bid.data_ptr<i64>(), bid.data_ptr<i64>()+bid.numel());
+    l_py_out.version = ver; l_py_done = true; l_wait = 0; lccv.notify_all();
+  }
+  void lane_job(i64 job, i64 g, std::vector<uint8_t> rows, std::vector<i64> pend, std::vector<i64> lanes, std::vector<i64> seq,
+                std::vector<uint8_t> replay) {
+    double t0 = now();
+    LaneJob jb; jb.job = job; jb.owner = gen_owner[g]; jb.version = lc.ops.gen_version(g); jb.n = (i64)lanes.size();
+    ((jb.version == version.load()) ? n_lo_cur_rows : n_lo_old_rows) += jb.n;
+    jb.rows = std::move(rows); jb.pend = std::move(pend); jb.seq = seq; jb.lane = lanes; jb.replay = std::move(replay);
+    for (i64 l : lanes) jb.ids.push_back(gen_base[g]+l);
+    i64 k = jb.n;
+    while (true) {
+      i64 wb, we, wn, wsl;
+      bool ok = batch_widths(jb.rows.data(), k, wb, we, wn, wsl) && lane_force_python != -2 && lane_force_python != g;
+      i64 cap = 1; while (cap < k) cap <<= 1;
+      auto rec = [&](int kind) {
+        auto r = std::make_shared<Record>(); finish_empty(*r);   // (first: finish_empty sets the main version)
+        r->kind = kind; r->job = job; r->owner = jb.owner; r->version = jb.version; r->lane_src = 1;   // (the generation's)
+        r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl; r->point = g;
+        return r;
+      };
+      if (!ok) {   // the frames the graphs cannot take: Python steps the job on its lane actor
+        auto r = rec(5);
+        r->rows = at::empty({k*row_stride}, at::kByte); memcpy(r->rows.data_ptr<uint8_t>(), jb.rows.data(), k*row_stride);
+        r->pending_before = at::empty({k, nh}, at::kLong); memcpy(r->pending_before.data_ptr<i64>(), jb.pend.data(), k*nh*8);
+        auto T = [](const std::vector<i64> &v) { at::Tensor t = at::empty({(i64)v.size()}, at::kLong); memcpy(t.data_ptr<i64>(), v.data(), v.size()*8); return t; };
+        r->lane_ids = T(lanes); r->lane_seq = T(seq);
+        r->lane_replay = at::empty({k}, at::kByte); memcpy(r->lane_replay.data_ptr<uint8_t>(), jb.replay.data(), k);
+        { std::lock_guard<std::mutex> lg(lcmu); l_py_done = false; }
+        n_l_python++;
+        lane_wait_python(r);
+        if (lstop) return;
+        abpc::LaneJobOut o;
+        { std::lock_guard<std::mutex> lg(lcmu); o = l_py_out; }
+        lc.job_done(job, o);
+        break;
+      }
+      std::vector<i64> key{jb.owner, cap, wb, we, wn, wsl};
+      GraphEntry *e = find_graph(key);
+      if (!e) { n_l_captures++; lane_wait_python(rec(1)); if (lstop) return; continue; }
+      std::vector<i64> steps_before(k); std::vector<uint8_t> complete(k), first(k);
+      std::vector<i64> to_reset;
+      for (i64 j = 0; j < k; j++) {
+        first[j] = read_int(jb.rows.data()+j*row_stride+f_first, s_first) != 0;
+        if (first[j]) to_reset.push_back(jb.ids[j]);
+      }
+      if (!to_reset.empty()) reset_rows(to_reset);
+      bool any_complete = false;
+      for (i64 j = 0; j < k; j++) { steps_before[j] = step_host[jb.ids[j]]; complete[j] = (steps_before[j]+1) % block_steps == 0; any_complete |= complete[j]; }
+      std::vector<float> u(k*heads);
+      lane_uniforms(jb, u.data());
+      fill_and_run(*e, k, jb.rows.data(), row_stride, jb.pend.data(), jb.ids.data(), u.data(), jb.replay.data(), complete.data(), jb.version, any_complete);
+      Record r;
+      lane_record(r, jb, *e, 0, steps_before, first, complete, jb.version);
+      write_part(*e, jb.rows.data(), 0, k, jb.ids, steps_before, complete, first, jb.pend.data(), jb.version, r);
+      abpc::LaneJobOut o;
+      o.out.assign(r.out.data_ptr<float>(), r.out.data_ptr<float>()+k*(nh+3));
+      o.step_before = steps_before; o.first = first; o.complete = complete; o.version = jb.version;
+      o.dec.assign(r.dec.data_ptr<i64>(), r.dec.data_ptr<i64>()+k); o.kvs.assign(r.kvs.data_ptr<i64>(), r.kvs.data_ptr<i64>()+k);
+      o.bid.assign(r.bid.data_ptr<i64>(), r.bid.data_ptr<i64>()+k);
+      lc.job_done(job, o);
+      lane_hist[k <= 1 ? 0 : k <= 2 ? 1 : k <= 4 ? 2 : k <= 8 ? 3 : k <= 16 ? 4 : 5]++;
+      break;
+    }
+    n_l_jobs++; n_l_rows = n_l_rows+k; n_lane_jobs++; n_lane_calls++; n_lane_rows = n_lane_rows+k;
+    t_l_job = t_l_job+(now()-t0); t_lane_s = t_lane_s+(now()-t0);
+  }
+  // one pass of the lane service (B54's tick): control, a finished round answered, the lane pipes read (up to timeout
+  // s), a due round submitted; its GPU work on the lane stream. The lane thread (d2) or the driver thread (d1) runs it.
+  bool lane_pass(double timeout) {
+    auto stream = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
+    c10::cuda::CUDAStreamGuard guard(stream);
+    double t = now();
+    lc.control(t);
+    bool did = false;
+    if (lc.fly && lc.fly->ready) { lc.finish(t); did = true; }
+    double wl = lc.wait_left(t);
+    double to = wl < 0 ? timeout : std::min(wl, timeout);
+    if (lpfds.size() != lane_fds.size()) lpfds.resize(lane_fds.size());
+    for (size_t i = 0; i < lane_fds.size(); i++) { lpfds[i].fd = lane_fds[i]; lpfds[i].events = lane_fds[i] >= 0 ? POLLIN : 0; lpfds[i].revents = 0; }
+    struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = (long)(std::max(0.0, to)*1e9);
+    int k = ::ppoll(lpfds.data(), (nfds_t)lpfds.size(), &ts, nullptr);
+    for (size_t i = 0; k > 0 && i < lane_fds.size(); i++) {
+      if (!(lpfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
+      unsigned char msg[5]; ssize_t got = ::read(lane_fds[i], msg, 5);
+      if (got == 5 && msg[0] == 0 && msg[1] == 0 && msg[2] == 0 && msg[3] == 1 && (msg[4] == '0' || msg[4] == '1')) lc.intake((i64)i, now());
+      else lane_fds[i] = -1;   // (the lane closed)
+    }
+    t = now();
+    if (!lc.ready.empty() && !lc.fly && lc.due(t)) {
+      lc.submit(t);
+      if (lc.fly && lc.fly->ready) lc.finish(now());
+      did = true;
+    }
+    return did;
+  }
+  std::vector<struct pollfd> lpfds;
+  void lane_loop() {
+    try {
+      c10::InferenceMode inference;
+      while (!lstop) {
+        if (lpause_req) {
+          double t0 = now();
+          std::unique_lock<std::mutex> lk(lcmu);
+          lpaused = true; lccv.notify_all();
+          while (lpause_req && !lstop) lccv.wait_for(lk, std::chrono::milliseconds(2));
+          lpaused = false; t_l_pause = t_l_pause+(now()-t0);
+          continue;
+        }
+        lane_pass(1e-3);
+      }
+    } catch (const std::exception &ex) {
+      lerror = ex.what();
+      auto r = std::make_shared<Record>(); r->kind = 3; r->lane_src = 1; finish_empty(*r); push_record(r);
+    }
+    lrunning = false;
+  }
+  void lanes_start() {
+    TORCH_CHECK(lanes_native && !lrunning, "lanes_start: configure first / already running");
+    lstop = false; lpause_req = false; lpaused = false; lerror.clear(); lrunning = true;
+    lth = std::thread([this] { lane_loop(); });
+  }
+  void lanes_stop() {
+    if (!lth.joinable()) return;
+    lstop = true;
+    { std::lock_guard<std::mutex> g(lcmu); lccv.notify_all(); }
+    lth.join();
+    lrunning = false;
+  }
+  // pause: the lane thread finishes its pass and waits (a job waiting for Python counts as paused: nothing runs)
+  void lanes_pause() {
+    if (!lrunning) return;
+    lpause_req = true;
+    std::unique_lock<std::mutex> lk(lcmu);
+    while (!lpaused && lrunning && !l_wait.load()) lccv.wait_for(lk, std::chrono::milliseconds(2));
+  }
+  void lanes_resume() { lpause_req = false; std::lock_guard<std::mutex> g(lcmu); lccv.notify_all(); }
+  // (tests) the lane service driven by the caller with an injected clock: a request read at `now`; one pass
+  // (control, a finished round, a due round) at `now`, without the pipes
+  i64 lane_force_python = -1;   // (tests) -1 none, -2 every job, g: generation g's jobs go to Python (kind 5)
+  void lane_test_intake(i64 lane, double now) { lc.intake(lane, now); }
+  bool lane_test_tick(double now) {
+    c10::InferenceMode inference;
+    auto stream = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
+    c10::cuda::CUDAStreamGuard guard(stream);
+    lc.control(now);
+    bool did = false;
+    if (lc.fly && lc.fly->ready) { lc.finish(now); did = true; }
+    if (!lc.ready.empty() && !lc.fly && lc.due(now)) {
+      lc.submit(now);
+      if (lc.fly && lc.fly->ready) lc.finish(now);
+      did = true;
+    }
+    return did;
+  }
+  py::dict lane_state() {   // (tests) the service's bookkeeping
+    py::dict d;
+    py::dict canc, lp, ls;
+    for (auto &e : lc.cancelled_req) canc[py::int_(e.first)] = e.second;
+    for (auto &e : lc.lane_point) lp[py::int_(e.first)] = e.second;
+    for (auto &e : lc.lane_steps) ls[py::int_(e.first)] = e.second;
+    d["cancelled"] = canc; d["lane_point"] = lp; d["lane_steps"] = ls; d["ready"] = lc.ready; d["fly"] = (bool)lc.fly;
+    return d;
+  }
+  // (D1 / B58d) this collect's lane request and point timings (p50 / p90; the lists restart) and the seconds every
+  // generation was pinned
+  py::dict lane_timing() {
+    // (d2: the lane thread writes these lists: it stands still while they are read)
+    bool held = lrunning.load() && !lpause_req.load();
+    if (held) { py::gil_scoped_release nogil; lanes_pause(); }
+    struct Resume { ActorDriver *d; bool on; ~Resume() { if (on) d->lanes_resume(); } } resume_{this, held};
+    auto q = [](std::vector<double> &v, double p) -> py::object {
+      if (v.empty()) return py::str("");
+      std::vector<double> s = v; std::sort(s.begin(), s.end());
+      double x = p*(s.size()-1); size_t i = (size_t)x; double f = x-i;
+      return py::float_(i+1 < s.size() ? s[i]*(1-f)+s[i+1]*f : s[i]);
+    };
+    py::dict d;
+    auto put = [&](const char *name, std::vector<double> &v) {
+      d[(std::string(name)+"_n").c_str()] = (i64)v.size();
+      d[(std::string(name)+"_p50").c_str()] = q(v, .5); d[(std::string(name)+"_p90").c_str()] = q(v, .9); v.clear();
+    };
+    put("lt_window_s", lc.win_s); put("lt_driver_s", lc.drv_s); put("lt_gpu_s", lc.gpu_s); put("lt_rt_s", lc.rt_s);
+    abpc::Native &N = *store->nat;
+    std::lock_guard<std::mutex> l(N.lin.mu);
+    put("pt_first_s", N.pts.first_s); put("pt_run_s", N.pts.run_s); put("pt_life_s", N.pts.life_s); put("pt_life_v", N.pts.life_v);
+    d["pt_refused"] = N.pts.refused; N.pts.refused = 0;
+    d["pt_all_pinned_s"] = N.pts.gens.take_all_s(abpc::mono_now());
+    return d;
+  }
+  py::dict lane_counters() {
+    py::dict d;
+    d["rounds"] = lc.n_rounds; d["rows"] = lc.n_rows; d["jobs"] = n_l_jobs.load(); d["job_rows"] = n_l_rows.load(); d["restores"] = n_l_restores.load();
+    d["python_jobs"] = n_l_python.load(); d["captures"] = n_l_captures.load(); d["deferred"] = lc.n_deferred; d["orphan"] = lc.n_orphan;
+    d["retired"] = lc.n_retired; d["held_s"] = lc.held_s; d["fly_s"] = lc.fly_s; d["restore_s"] = t_l_restore.load(); d["job_s"] = t_l_job.load();
+    d["pause_s"] = t_l_pause.load(); d["control_scans"] = lc.n_cancel_scans; d["begins"] = lc.n_begins;
+    return d;
   }
 
   // ---- the driver thread
@@ -622,6 +1214,10 @@ struct ActorDriver {
     d["cap"] = r->cap; d["widths"] = py::make_tuple(r->wb, r->we, r->wn, r->ws);
     d["t_poll"] = r->t_poll; d["t_sync"] = r->t_sync; d["t_reply"] = r->t_reply; d["t_pages"] = r->t_pages; d["t_done"] = r->t_done;
     d["job"] = r->job; d["owner"] = r->owner; d["merged"] = (int)r->merged; d["t_main_reply"] = r->t_main_reply;
+    if (r->kk.defined()) { d["kk"] = r->kk; d["snap"] = r->snap; } else { d["kk"] = py::none(); d["snap"] = py::none(); }
+    d["point"] = r->point; d["pub_slot"] = r->pub_slot; d["pub_snap"] = r->pub_snap; d["pub_worker"] = r->pub_worker;
+    d["lane_src"] = r->lane_src;
+    if (r->lane_ids.defined()) { d["lane_ids"] = r->lane_ids; d["lane_seq"] = r->lane_seq; d["lane_replay"] = r->lane_replay; }
     return d;
   }
   i64 queue_size() { std::lock_guard<std::mutex> g(qmu); return (i64)queue.size(); }
@@ -633,6 +1229,13 @@ struct ActorDriver {
     d["merged_calls"] = n_merged_calls.load(); d["lane_calls"] = n_lane_calls.load(); d["captures"] = n_captures.load();
     d["lane_python"] = n_lane_python.load(); d["pauses"] = n_pauses.load(); d["pause_s"] = t_pause_s.load();
     d["lane_s"] = t_lane_s.load(); d["cap_holds"] = n_cap_holds.load();
+    d["poll_s"] = t_poll_s.load(); d["prep_s"] = t_prep_s.load(); d["reply_s"] = t_reply_s.load(); d["cons_s"] = t_cons_s.load();
+    d["push_s"] = t_push_s.load(); d["mlane_s"] = t_mlane_s.load(); d["hold_s"] = t_hold_s.load(); d["loop_s"] = t_loop_s.load();
+    d["polls"] = n_polls.load(); d["idle_polls"] = n_idle_polls.load();
+    d["cap_native"] = n_cap_native.load(); d["cap_refused"] = n_cap_refused.load(); d["cap_publish"] = n_cap_publish.load();
+    d["lin_s"] = t_lin_s.load();
+    d["lo_cur_rows"] = n_lo_cur_rows.load(); d["lo_old_rows"] = n_lo_old_rows.load(); d["putback_rows"] = n_putback_rows.load();
+    d["enq_in_step"] = n_enq_in_step.load(); d["enq_outside"] = n_enq_outside.load();
     py::list h; for (auto &x : lane_hist) h.append(x.load()); d["lane_hist"] = h;
     return d;
   }
@@ -641,10 +1244,13 @@ struct ActorDriver {
   static i64 bucket(const std::vector<i64> &b, i64 m) { for (i64 w : b) if (m <= w) return w; return -1; }
 
   void push_record(std::shared_ptr<Record> r) {
+    double t0 = now();
     std::unique_lock<std::mutex> lk(qmu);
     qcv.wait(lk, [&] { return (i64)queue.size() < queue_max || stop_req; });
     queue.push_back(std::move(r));
     qcv.notify_all();
+    lk.unlock();
+    t_push_s = t_push_s+(now()-t0);
   }
   void wait_paused() {
     double t0 = now();
@@ -668,14 +1274,19 @@ struct ActorDriver {
       std::vector<struct pollfd> pfds(fds.size());
       std::vector<i64> ws, ss;   // the batch: workers and row slots
       std::vector<i64> held_w, held_s;   // (B54) messages waiting for their worker's CF capture (cap_wait)
+      double t_it = now();
       while (!stop_req) {
+        { double t = now(); t_loop_s = t_loop_s+(t-t_it); t_it = t; }
         if (pause_req) { wait_paused(); continue; }
         bool lanes_waiting = lane_queue_size() > 0;
         if (main_hold) {   // (B54) lanes only
-          if (lanes_waiting) run_lanes(); else std::this_thread::sleep_for(std::chrono::microseconds(300));
+          if (lanes_native && !lrunning) { lane_pass(3e-4); continue; }   // (B58d d1: the native lane service here)
+          if (lanes_waiting) run_lanes();
+          else { double t = now(); std::this_thread::sleep_for(std::chrono::microseconds(300)); t_hold_s = t_hold_s+(now()-t); }
           continue;
         }
         if (ready_w.empty()) {
+          double t_p = now();
           ws.clear(); ss.clear();
           for (size_t q = 0; q < held_w.size();) {   // held messages whose capture is done join the batch
             if (!cap_wait[held_w[q]]) { ws.push_back(held_w[q]); ss.push_back(held_s[q]); held_w.erase(held_w.begin()+q); held_s.erase(held_s.begin()+q); }
@@ -694,10 +1305,17 @@ struct ActorDriver {
               fds[i] = -1;   // the worker ended (or something unexpected): its pipe leaves the poll; Python notices through its own bookkeeping
             }
           }
-          if (ws.empty()) { if (lanes_waiting) run_lanes(); continue; }
+          t_poll_s = t_poll_s+(now()-t_p); n_polls++;
+          if (ws.empty()) {
+            n_idle_polls++;
+            if (lanes_waiting) run_lanes();
+            if (lanes_native && !lrunning) lane_pass(0);   // (B58d d1)
+            continue;
+          }
         } else { ws = ready_w; ss = ready_s; ready_w.clear(); ready_s.clear(); }
-        step_batch(ws, ss);
+        in_step = true; step_batch(ws, ss); in_step = false;
         if (!pause_req) run_lanes();   // (the other generations' jobs after the main reply, as the Python path)
+        if (lanes_native && !lrunning && !pause_req) lane_pass(0);   // (B58d d1: a lane pass after every main step)
       }
     } catch (const std::exception &ex) {
       error = ex.what();
@@ -707,6 +1325,19 @@ struct ActorDriver {
     running = false;
   }
 
+  // (B58a+b) Episodes.arrive over the record's rows, then store over its go rows, into the current rollout slot (abpc)
+  void consume(Record &r, const uint8_t *rc, i64 n_all, const std::vector<i64> &ws, const std::vector<uint8_t> &go,
+               const std::vector<i64> &go_idx, const float *out, const i64 *act, const i64 *pend, i64 ver, const uint8_t *privp) {
+    (void)go;
+    int sl = cur_slot.load();
+    i64 n = (i64)go_idx.size();
+    r.kk = at::full({n}, -1, at::kLong);
+    r.snap = at::zeros({n_all, N_SNAP}, at::kDouble);
+    if (!cc.on || sl < 0 || !slots[sl].set) return;
+    abpc::RowLayout L{row_stride, f_bytes, f_frame, frame_bytes, nh, priv_itemsize};
+    abpc::consume(cc, slots[sl], amu, L, rc, n_all, ws.data(), go_idx.data(), n, out, act, pend, ver, privp, r.kk.data_ptr<i64>(),
+                  r.snap.data_ptr<double>());
+  }
   // a record's frame header: (body, entity, inventory, slot) counts; false when the frame is not a valid visible-v2 frame
   bool frame_counts(const uint8_t *src, i64 &p, i64 &e, i64 &nn, i64 &s) {
     const float *f = (const float *)(src+f_frame);
@@ -793,8 +1424,71 @@ struct ActorDriver {
     r.rows = at::empty({0}, at::kByte); r.priv = at::empty({0}, at::kByte);
   }
 
+  // (B58c) observe_rows over a record's rows (every row, terminal ones too)
+  void lineage_observe(const uint8_t *rc, i64 n_all, const std::vector<i64> &ws) {
+    abpc::Native &N = *store->nat;
+    std::lock_guard<std::mutex> l(N.lin.mu);
+    for (i64 i = 0; i < n_all; i++) {
+      const uint8_t *src = rc+i*row_stride;
+      float hurt; memcpy(&hurt, src+f_hurt, 4);
+      N.inj.observe(ws[i], read_int(src+f_first, s_first) != 0, read_int(src+f_episode, s_episode), read_int(src+f_t, s_t), hurt > 0);
+    }
+  }
+  // (B58c) the go rows' lineage, as consume_record did it: a new log at an episode's first row, the snapshot before
+  // the step (PagedSnapshot(store, log, step_before, pending_before, version)), the CF captures it makes, the injury
+  // source, the step's decision / K/V row / block into the log, the sidecar's chunk start / open decision (the native
+  // consumer's rollout index); captures whose generation Python must publish first become kind 6 records (pubs)
+  void lineage_main(Record &r, const uint8_t *rc, const std::vector<i64> &ws, const std::vector<i64> &go_idx, const std::vector<i64> &ids,
+                    const std::vector<uint8_t> &first, const std::vector<i64> &steps_before, const i64 *pend, i64 ver,
+                    const std::vector<uint8_t> &complete, std::vector<std::shared_ptr<Record>> &pubs) {
+    abpc::Native &N = *store->nat;
+    abpc::Lineage &L = N.lin;
+    i64 n = (i64)go_idx.size();
+    const i64 *dec = r.dec.data_ptr<i64>(), *kvs = r.kvs.data_ptr<i64>(), *bid = r.bid.data_ptr<i64>();
+    const i64 *kk = r.kk.defined() && r.kk.numel() == n ? r.kk.data_ptr<i64>() : nullptr;
+    int sl = cur_slot.load();
+    std::lock_guard<std::mutex> l(L.mu);
+    std::vector<i64> sn(n), ep(n), tt(n);
+    for (i64 j = 0; j < n; j++) {
+      i64 row = ids[j], w = ws[go_idx[j]];
+      const uint8_t *src = rc+go_idx[j]*row_stride;
+      ep[j] = read_int(src+f_episode, s_episode); tt[j] = read_int(src+f_t, s_t);
+      if (first[j]) L.set_head_locked(row, L.new_log_locked(lin_tag, w, ep[j], 0));
+      i64 g = L.head.at(row);
+      if (g < 0) throw std::runtime_error("lineage: a worker's row without a log (its episode began before the native lineage)");
+      if (L.logs[g].end() != steps_before[j]) throw std::runtime_error("lineage: a row's log end differs from its step");
+      sn[j] = L.snap_row_locked(row, pend+j*nh, ver);
+    }
+    for (i64 j = 0; j < n; j++) {   // capture_deferred
+      i64 req = r.cf_snap[go_idx[j]];
+      if (!req) continue;
+      i64 point = req-1;
+      i64 c = N.pts.capture(L, point, sn[j], ver);
+      if (c == 2 || c == -1) {
+        if (N.status) N.status[point] = c;
+        (c == 2 ? n_cap_native : n_cap_refused)++;
+      } else {   // the generation's weights first (Python): the worker's next record waits for it
+        auto pr = std::make_shared<Record>(); pr->kind = 6; pr->point = point; pr->pub_slot = -2-c; pr->pub_snap = sn[j];
+        pr->pub_worker = ws[go_idx[j]]; pr->version = ver; finish_empty(*pr);
+        L.retain_locked(sn[j]);
+        cap_wait[ws[go_idx[j]]] = 1; n_cap_publish++;
+        pubs.push_back(pr);
+      }
+    }
+    for (i64 j = 0; j < n; j++) N.inj.record(L, ws[go_idx[j]], ep[j], tt[j], sn[j]);   // record_main
+    for (i64 j = 0; j < n; j++) {
+      L.push_locked(ids[j], dec[j], kvs[j]);
+      if (complete[j]) L.push_block_locked(ids[j], bid[j], steps_before[j]);
+    }
+    if (kk && sl >= 0)
+      for (i64 j = 0; j < n; j++) if (kk[j] >= 0) L.side_record_locked(sl, ws[go_idx[j]], kk[j], first[j] != 0, sn[j]);
+    for (i64 j = 0; j < n; j++) L.release_locked(sn[j]);
+    L.published = record_seq.load();   // (B59: a GC while the driver runs keeps rows stamped after this)
+  }
+  std::atomic<i64> record_seq{0};   // (B58c) every step's rows carry its sequence (PageCore stamp; B59's GC rule)
   void step_batch(const std::vector<i64> &ws, const std::vector<i64> &ss) {
     double t0 = now();
+    store->set_stamp(++record_seq);
     i64 n_all = (i64)ws.size();
     auto r = std::make_shared<Record>();
     r->kind = 0; r->owner = owner_main; r->workers = ws; r->slots = ss; r->go.assign(n_all, 0); r->cf_snap.assign(n_all, 0); r->t_poll = t0;
@@ -813,7 +1507,8 @@ struct ActorDriver {
       bool ended = done != 0, boot = done == done_branch;
       bool go = !ended || boot;
       r->go[i] = go;
-      if (cf_snap) { r->cf_snap[i] = cf_snap[ws[i]]; if (r->cf_snap[i]) cap_wait[ws[i]] = 1; }   // (before the reply)
+      if (cf_snap) { r->cf_snap[i] = cf_snap[ws[i]]; if (r->cf_snap[i] && !lin_on) cap_wait[ws[i]] = 1; }   // (before the reply;
+      // B58c: the driver captures natively below, a worker waits only for a generation Python must publish)
       if (ended && !boot) memset(&pending_cur[ws[i]*nh], 0, nh*8);   // Episodes.arrive: pending[idx[ended & ~boot]] = 0
       if (first && go) memset(&pending_cur[ws[i]*nh], 0, nh*8);      //                  pending[idx[first & go]] = 0
       if (go) go_idx.push_back(i); else n_terminal++;
@@ -821,9 +1516,15 @@ struct ActorDriver {
     i64 n = (i64)go_idx.size();
     if (n == 0) {   // terminal records only: reply, hand the bookkeeping over
       for (i64 i = 0; i < n_all; i++) if (cf_snap && r->cf_snap[i]) cf_snap[ws[i]] = 0;
+      double tq = now(); t_prep_s = t_prep_s+(tq-t0);
       reply_rows(ws);
       r->t_sync = r->t_reply = r->t_pages = r->t_done = now();
+      t_reply_s = t_reply_s+(r->t_reply-tq);
       finish_empty(*r);
+      if (cc.on) consume(*r, rc, n_all, ws, r->go, go_idx, nullptr, nullptr, nullptr, version.load(),
+                         priv ? r->priv.data_ptr<uint8_t>() : nullptr);   // (B58a+b: the episode ends)
+      t_cons_s = t_cons_s+(now()-r->t_reply);
+      if (lin_on) lineage_observe(rc, n_all, ws);
       push_record(r); n_calls++;
       return;
     }
@@ -855,11 +1556,13 @@ struct ActorDriver {
     i64 wb, we, wn, wsl;
     bool ok = batch_widths(rows_ptr, n+n_lane, wb, we, wn, wsl);
     if (!ok && !merged.empty()) {   // the lanes would make the batch invalid / too wide: main rows alone
+      n_putback_rows = n_putback_rows+n_lane;
       put_back(); pack(false); ok = batch_widths(rows_ptr, n, wb, we, wn, wsl);
     }
     i64 n_tot = n+n_lane;
     i64 cap = 1; while (cap < n_tot) cap <<= 1;
     if (!ok) {   // Python handles this batch (it raises the same error, or takes the eager path)
+      t_prep_s = t_prep_s+(now()-t0);
       r->kind = 2; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
       hand_to_python(r, ws, ss);
       return;
@@ -867,6 +1570,7 @@ struct ActorDriver {
     std::vector<i64> key{owner_main, cap, wb, we, wn, wsl};
     GraphEntry *e = find_graph(key);
     if (!e) {   // not captured yet: Python captures (needs the GIL and the capture admission); the batch is retried
+      t_prep_s = t_prep_s+(now()-t0);
       put_back();
       r->kind = 1; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
       n_captures++;
@@ -896,7 +1600,7 @@ struct ActorDriver {
     }
     for (i64 x = 0; x < n*heads; x++) u[x] = fixed_u >= 0 ? (float)fixed_u : rng.uniform();
     { i64 o = n; for (auto &jb : merged) { lane_uniforms(*jb, &u[o*heads]); o += jb->n; } }
-    double t_host0 = now();
+    double t_host0 = now(); t_prep_s = t_prep_s+(t_host0-t0);
     i64 ver = version.load();
     fill_and_run(*e, n_tot, rows_ptr, row_stride, pend.data(), ids.data(), u.data(), replay.data(), complete.data(), ver, any_complete);
     double t1 = now(); r->t_sync = t1; t_sync_s = t_sync_s+(t1-t_host0);
@@ -923,12 +1627,23 @@ struct ActorDriver {
     }
     for (i64 i = 0; i < n_all; i++) if (cf_snap && r->cf_snap[i]) cf_snap[ws[i]] = 0;
     reply_rows(ws);
-    double t2 = now(); r->t_reply = t2;
+    double t2 = now(); r->t_reply = t2; t_reply_s = t_reply_s+(t2-t1);
     // the main rows' pages, then their record (the lanes' pages and records only after it: B54 condition a)
     write_part(*e, rows_ptr, 0, n, ids, steps_before, complete, first, pend.data(), ver, *r);
-    double t3 = now(); r->t_pages = t3; r->t_done = t3; t_pages_s = t_pages_s+(t3-t2); t_host_s = t_host_s+(t3-t0)-(t1-t_host0);
+    double t2c = now(); t_pages_s = t_pages_s+(t2c-t2);
+    if (cc.on) consume(*r, rc, n_all, ws, r->go, go_idx, r->out.data_ptr<float>(), act, pend.data(), ver,
+                       priv ? r->priv.data_ptr<uint8_t>() : nullptr);   // (B58a+b: arrive + store, before the record)
+    double t3 = now(); r->t_pages = t3; r->t_done = t3; t_cons_s = t_cons_s+(t3-t2c); t_host_s = t_host_s+(t3-t0)-(t1-t_host0);
     n_steps++; n_calls++; n_rows = n_rows+n;
+    std::vector<std::shared_ptr<Record>> pubs;
+    if (lin_on) {   // (B58c: before the record: Python's consume_record did this between arrive and the store)
+      lineage_observe(rc, n_all, ws);
+      lineage_main(*r, rc, ws, go_idx, ids, first, steps_before, pend.data(), ver, complete, pubs);
+      t_lin_s = t_lin_s+(now()-t3);
+    }
     push_record(r);
+    for (auto &pr : pubs) push_record(pr);
+    double t4 = now();
     if (!merged.empty()) {
       n_merged_calls++;
       i64 o = n;
@@ -943,6 +1658,7 @@ struct ActorDriver {
         push_record(lr);
         o += jb->n;
       }
+      t_mlane_s = t_mlane_s+(now()-t4);
     }
   }
   // (B54) the queued lane jobs, each a lane-only call through its generation's graph, until the queue is empty or the
@@ -959,6 +1675,7 @@ struct ActorDriver {
   bool run_lane_job(LaneJob &jb) {
     double t0 = now();
     i64 k = jb.n;
+    ((jb.version == version.load()) ? n_lo_cur_rows : n_lo_old_rows) += k;
     const uint8_t *rows_ptr = jb.rows.data();
     i64 wb, we, wn, wsl;
     bool ok = batch_widths(rows_ptr, k, wb, we, wn, wsl);
@@ -1043,11 +1760,41 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_property_readonly("b_meta", [](PageStore &s) { return s.b_meta; }).def_property_readonly("b_src", [](PageStore &s) { return s.b_src; })
       .def_property_readonly("b_srcver", [](PageStore &s) { return s.b_srcver; }).def_property_readonly("b_used", [](PageStore &s) { return s.b_used; })
       .def_property_readonly("cap_d", [](PageStore &s) { return s.cap_d; }).def_property_readonly("cap_b", [](PageStore &s) { return s.cap_b; })
-      .def_property("next_decision", [](PageStore &s) { return s.next_decision; }, [](PageStore &s, i64 v) { s.next_decision = v; })
+      .def_property("next_decision", [](PageStore &s) { std::lock_guard<std::mutex> g(s.core->mu); return s.core->next_decision; },
+                    [](PageStore &s, i64 v) { std::lock_guard<std::mutex> g(s.core->mu); s.core->next_decision = v; })
       .def("write_decisions", &PageStore::write_decisions).def("write_blocks", &PageStore::write_blocks)
       .def("raw_entry", &PageStore::raw_entry).def("raw_has", &PageStore::raw_has).def("raw_count", &PageStore::raw_count)
       .def("raw_keys", &PageStore::raw_keys).def("raw_mb", &PageStore::raw_mb).def("source_arena", &PageStore::source_arena)
-      .def("free_rows", &PageStore::free_rows).def("stats", &PageStore::stats);
+      .def("free_rows", &PageStore::free_rows, py::arg("dead_d"), py::arg("dead_b"), py::arg("dead_raw"), py::arg("limit") = 0)
+      .def("set_stamp", &PageStore::set_stamp).def("stats", &PageStore::stats)
+      // (B58c) the native lineage
+      .def("lineage_configure", &PageStore::lineage_configure, py::arg("window"), py::arg("block_steps"), py::arg("memory_blocks"),
+           py::arg("nh"), py::arg("rows"), py::arg("workers"), py::arg("depths"), py::arg("chunk_steps"), py::arg("generations") = 2).def("lineage_status", &PageStore::lineage_status)
+      .def("lineage_teach", &PageStore::lineage_teach)
+      .def_property_readonly("lineage_on", [](PageStore &s) { return s.lineage_on; })
+      .def("lin_new_head", &PageStore::lin_new_head).def("lin_head_end", &PageStore::lin_head_end).def("lin_snap_row", &PageStore::lin_snap_row)
+      .def("lin_push", &PageStore::lin_push).def("lin_push_block", &PageStore::lin_push_block)
+      .def("lin_retain", &PageStore::lin_retain).def("lin_release", &PageStore::lin_release).def("lin_restore", &PageStore::lin_restore)
+      .def("lin_materialize", &PageStore::lin_materialize).def("lin_collect", &PageStore::lin_collect).def("lin_stats", &PageStore::lin_stats)
+      .def("side_record", &PageStore::side_record).def("side_reset", &PageStore::side_reset).def("side_carry", &PageStore::side_carry)
+      .def("side_payload", &PageStore::side_payload)
+      .def("ctx_put", &PageStore::ctx_put).def("ctx_get", &PageStore::ctx_get).def("ctx_complete", &PageStore::ctx_complete)
+      .def("ctx_retire", &PageStore::ctx_retire)
+      .def("inj_observe", &PageStore::inj_observe).def("inj_record", &PageStore::inj_record).def("inj_get", &PageStore::inj_get)
+      .def("inj_reclaim", &PageStore::inj_reclaim).def("inj_keys", &PageStore::inj_keys)
+      .def("pt_capture", &PageStore::pt_capture).def("pt_published", &PageStore::pt_published).def("pt_release", &PageStore::pt_release)
+      .def("pt_get", &PageStore::pt_get).def("pt_points", &PageStore::pt_points).def("pt_gens", &PageStore::pt_gens);
+  py::class_<abpc::LaneCore>(m, "LaneWindowProbe")   // (tests) tok_lanes.window_due / LaneService.due over a LaneCore
+      .def(py::init([](i64 lanes, double wait, double quiet, double active_s) {
+        auto *c = new abpc::LaneCore(); abpc::LaneCfg cfg; cfg.lanes = lanes; cfg.wait = wait; cfg.quiet = quiet; cfg.active_s = active_s;
+        c->cfg = cfg; c->seen.assign(lanes, -1e9); return c; }))
+      .def("intake", &abpc::LaneCore::intake).def("due", &abpc::LaneCore::due).def("wait_left", &abpc::LaneCore::wait_left)
+      .def("take", [](abpc::LaneCore &c, double now) {   // (LaneService._submit's take: distinct lanes, seen = now)
+        std::set<i64> s(c.ready.begin(), c.ready.end()); c.ready.clear(); for (i64 l : s) c.seen[l] = now;
+        return std::vector<i64>(s.begin(), s.end()); });
+  py::class_<SnapPin, std::shared_ptr<SnapPin>>(m, "SnapPin")
+      .def(py::init<std::shared_ptr<PageStore>, i64, bool>(), py::arg("store"), py::arg("snap"), py::arg("retain") = true)
+      .def_readonly("snap", &SnapPin::snap);
   py::class_<ActorDriver, std::shared_ptr<ActorDriver>>(m, "ActorDriver")
       .def(py::init<std::shared_ptr<PageStore>>())
       .def("set_stream", &ActorDriver::set_stream).def("set_seed", &ActorDriver::set_seed).def("set_version", &ActorDriver::set_version)
@@ -1064,5 +1811,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("drop_lane_job", &ActorDriver::drop_lane_job).def("set_lane_merge", &ActorDriver::set_lane_merge)
       .def("set_ring", &ActorDriver::set_ring).def("get_ring", &ActorDriver::get_ring)
       .def("capture_done", &ActorDriver::capture_done).def("set_main_hold", &ActorDriver::set_main_hold)
+      .def("set_lineage", &ActorDriver::set_lineage)
+      .def("lanes_configure", &ActorDriver::lanes_configure).def("lanes_start", &ActorDriver::lanes_start)
+      .def("lanes_stop", &ActorDriver::lanes_stop, py::call_guard<py::gil_scoped_release>())
+      .def("lanes_pause", &ActorDriver::lanes_pause, py::call_guard<py::gil_scoped_release>()).def("lanes_resume", &ActorDriver::lanes_resume)
+      .def("lane_job_resume", &ActorDriver::lane_job_resume).def("lane_python_done", &ActorDriver::lane_python_done)
+      .def("lane_test_intake", &ActorDriver::lane_test_intake)
+      .def("lane_test_tick", &ActorDriver::lane_test_tick, py::call_guard<py::gil_scoped_release>())
+      .def("lane_state", &ActorDriver::lane_state)
+      .def("set_lane_force_python", [](ActorDriver &d, i64 g) { d.lane_force_python = g; })
+      .def_property_readonly("version", [](ActorDriver &d) { return d.version.load(); })
+      .def("set_lane_defer", [](ActorDriver &d, double s) { d.lc.cfg.defer_s = s; })
+      .def("lane_timing", &ActorDriver::lane_timing).def("lane_counters", &ActorDriver::lane_counters).def("lane_error", [](ActorDriver &d) { return d.lerror; })
+      .def_property_readonly("lanes_running", [](ActorDriver &d) { return d.lrunning.load(); })
+      .def("set_consumer", &ActorDriver::set_consumer).def("set_rollout", &ActorDriver::set_rollout).def("use_rollout", &ActorDriver::use_rollout)
+      .def("arena_buf", &ActorDriver::arena_buf).def("arena_used", &ActorDriver::arena_used).def("arena_reset", &ActorDriver::arena_reset)
+      .def("arena_grown", &ActorDriver::arena_grown).def("arena_append_from", &ActorDriver::arena_append_from)
+      .def("consume_rows", &ActorDriver::consume_rows)
+      .def_property_readonly("consumer_on", [](ActorDriver &d) { return d.cc.on; })
       .def_property_readonly("running", [](ActorDriver &d) { return d.running.load(); });
 }

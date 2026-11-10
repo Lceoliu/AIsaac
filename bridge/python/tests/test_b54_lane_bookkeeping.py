@@ -126,11 +126,11 @@ class FakeDriver:
             step_b = np.array([int(actor.state.step_host[actor.base+q]) for q in lanes])
             actor.step(rows, pend, lanes, ukeys=keys, evaluate=replay)
             dec, kvs, bid = [], [], []
-            for k, q in enumerate(lanes.tolist()):
+            for i_, q in enumerate(lanes.tolist()):   # (i_, not k: k bounds the jobs this call steps)
                 log = actor.logs[q]
                 dec.append(int(log.dec[log.n-1])); kvs.append(int(log.kvs[log.n-1]))
                 log.n -= 1   # (on_lane_record pushes the step's entries)
-                if (step_b[k]+1) % bs == 0:
+                if (step_b[i_]+1) % bs == 0:
                     bid.append(int(log.blk[log.nb-1])); log.nb -= 1
                 else:
                     bid.append(-1)

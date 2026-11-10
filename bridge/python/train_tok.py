@@ -1133,6 +1133,73 @@ class Episodes:
         return go
 
 
+def _native_events(book, rows, idx, snap):
+    """(B58a+b) Episodes.arrive's Python part when the driver's native consumer did its arithmetic and the store: the
+    first records' episode snapshots (builds, stats, character, active item, pedestal build) and the finished
+    episodes' summaries, from the per-row accumulators the consumer took before an episode end reset them
+    (snap [n, 17]: ret, hurt, damage, rooms, boss, extra[6], healed, gathered, pick steps, gret, v0, steps)."""
+    self = book
+    first = rows['first'] != 0
+    done = rows['done'].astype(np.int64)
+    if (self.run or self.items) and first.any():
+        if self.items:
+            for j in np.flatnonzero(first):
+                self.inv0[int(idx[j])] = [int(v) for v, c in rows[j]['inv'] if v > 0 and c > 0]
+        if self.stats0 is not None:
+            for j in np.flatnonzero(first):
+                pl = rows[j]['player']
+                self.stats0[int(idx[j])] = [round(float(pl[11]) * 10, 3), round(float(pl[12]) * 20, 3),
+                                            round(float(pl[13]) * 2, 3), round(float(pl[14]) * 500, 1),
+                                            round(float(pl[15]) * 2, 3)]
+    if self.char0 is not None and first.any():
+        for j in np.flatnonzero(first):
+            self.char0[int(idx[j])] = int(rows[j]['pchar'])
+    if self.active0 is not None and first.any():
+        for j in np.flatnonzero(first):
+            self.active0[int(idx[j])] = int(rows[j]['player'][21] > 0)
+    if self.pick is not None and first.any():
+        for j in np.flatnonzero(first):
+            self.pick['bped'][int(idx[j])] = [int(v) for v in rows[j]['bped'] if v > 0]
+    ended = done != 0
+    for j in np.flatnonzero(ended):
+        i, r, sv = idx[j], rows[j], snap[j]
+        fin = dict(group=int(r['group']), seed=int(r['seed']), done=int(r['done']), decisions=int(r['t']), ret=float(sv[0]),
+                   hurt=float(sv[1]), damage=float(sv[2]), rooms=int(sv[3]), boss=int(sv[4]))
+        if self.run or self.items:
+            x = sv[5:11].astype(np.int64)
+            fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]), stage0=int(x[4]),
+                       stage=int(max(x[5], r['stage'])))
+            if self.inv0.get(int(i)):
+                fin['build0'] = self.inv0[int(i)]
+        if self.stats0 is not None and int(i) in self.stats0:
+            fin['stats0'] = self.stats0[int(i)]
+        if self.char0 is not None and int(i) in self.char0:
+            fin['char0'] = self.char0[int(i)]
+        if self.active0 is not None and int(i) in self.active0:
+            fin['active0'] = self.active0[int(i)]
+        if self.gains is not None:
+            fin.update(healed=float(sv[11]), gathered=float(sv[12]))
+        if self.pick is not None:
+            fin.update(build_pedestals=self.pick['bped'].get(int(i), []), pickup_forced=int(r['pmode']),
+                       forced_steps=int(sv[13]))
+        if r['lab'] != 0:
+            fin.update(lab=int(r['lab']), lab_s=int(r['lab_s']))
+            self.lab_finished.append(fin)
+        elif r['branch'] != 0:
+            fin.update(point=int(r['point']), branch=int(r['branch']))
+            self.branch_finished.append(fin)
+        else:
+            self.finished.append(fin)
+            if self.seen_inv is not None and self.items:
+                held = [int(v) for v, c in r['inv'] if v > 0 and c > 0]
+                if held:
+                    self.seen_inv.append(held)
+        if self.plr is not None and r['lab'] == 0 and r['branch'] == 0 and sv[16] > 0:
+            stats_, ST_, _ = self.plr
+            stats_[int(i), ST_['plr_score']] = abs(float(sv[14]) - float(sv[15]))
+            stats_[int(i), ST_['plr_episode']] = float(r['episode'])
+
+
 def _ccopy(rows, pending, snapshot):
     """(B45) Chunk arguments of one teacher record: compact record, actions under way, snapshot, its frame bytes."""
     rc, frames = compact_copy(rows)
@@ -4346,6 +4413,12 @@ def main(argv=None, child=None, actor=None):
                 from isaac_bridge.block_driver import DRV_FIELDS
                 for k_d in DRV_FIELDS:   # (B54: the driver's counters of the collect)
                     row[k_d]=lane_stat.get(k_d,'')
+                from isaac_bridge.block_lanes import D1_FIELDS
+                for k_d in D1_FIELDS:   # (D1: the CF points' lives)
+                    row[k_d]=lane_stat.get(k_d,'')
+                from isaac_bridge.block_driver import LANE_TIMING_FIELDS
+                for k_d in LANE_TIMING_FIELDS:   # (D1 / B58d: lane request and point timings)
+                    row[k_d]=lane_stat.get(k_d,'')
                 for k_b in ('block_gc_s','block_kv_rows','block_blocks','block_raw_rows'):
                     row[k_b]=lane_stat.get(k_b,0)
                 from isaac_bridge.block_compile import STATS as cstat_b
@@ -4811,6 +4884,31 @@ def main(argv=None, child=None, actor=None):
         book.pick = dict(bped={}, steps=np.zeros(n, np.int64))
     version = update                                # the actor's weights: updates done
     version0 = version   # (B54: the policy-lag check at each hand-off counts from here)
+    native_cons = False   # B58a+b: the driver's native consumer (Episodes.arrive's arithmetic and store in C++)
+    if cpp_driver is not None:
+        why_c = bdrv.native_consumer_reason(cpp_driver, (roll, spare), lab, t_on, mem_on, proc, n_act)
+        if why_c is None:
+            bdrv.attach_consumer(cpp_driver, book, (roll, spare), args.gamma)
+            cpp_driver.use_rollout(roll.native_slot)
+            native_cons = True
+        print(f'B58 native consumer: {"on" if native_cons else "off (%s: the Python consumer)" % why_c}', flush=True)
+    native_lin = False   # B58c: the main rows' lineage in the driver (logs, snapshots, CF captures, injury sources, sidecar)
+    if cpp_driver is not None:
+        why_l = bdrv.native_lineage_reason(cpp_driver, native_cons, lanes)
+        if why_l is None:
+            bdrv.attach_lineage(cpp_driver, block_actor, lanes, sampler, (roll, spare))
+            native_lin = True
+        print(f'B58c native lineage: {"on" if native_lin else "off (%s: consume_record keeps it)" % why_l}', flush=True)
+    native_lanes = lane_thread = False   # B58d: the lane service in C++ (d1: on the driver thread; d2: a thread of its own)
+    if native_lin:
+        why_n = bdrv.native_lanes_reason(cpp_driver, native_lin, lanes)
+        if why_n is None:
+            lane_stream = torch.cuda.Stream(priority=a_prio)
+            bdrv.attach_lanes(cpp_driver, lanes, sampler, lane_stream)
+            native_lanes = True
+            lane_thread = os.environ.get('ISAAC_BLOCK_CPP_LANE_THREAD', '0') == '1'
+        print(f'B58d native lanes: {"on (%s)" % ("their own thread" if lane_thread else "the driver thread") if native_lanes else "off (%s)" % why_n}',
+              flush=True)
     if block_actor is not None:
         block_actor.version=version
     if cpp_driver is not None:
@@ -4861,9 +4959,9 @@ def main(argv=None, child=None, actor=None):
     def wait_learner():
         # (teacher v2: the lanes are answered meanwhile; their poll releases the GIL)
         nv.push('h.wait_learner')   # (B57 measurement ranges: no-ops without ISAAC_BLOCK_NVTX=1)
-        while not fresh.wait(0.0 if v2_on else 0.5):
-            if lanes is not None:   # (B36: a round with its window, to its answer)
-                lanes.serve_wait(0.005)
+        while not fresh.wait((0.02 if native_lanes else 0.0) if v2_on else 0.5):
+            if lanes is not None:   # (B36: a round with its window, to its answer; B58d native lanes: their records only)
+                lanes.serve_wait(0.0 if native_lanes else 0.005)
             if failure or not learner.is_alive() or (actor_b is not None and not actor_b.is_alive()):
                 break
         nv.pop()
@@ -5021,6 +5119,11 @@ def main(argv=None, child=None, actor=None):
                 """(B52) The Python side of one driver step: the bookkeeping the actor loop did around answer_block,
                 from the record (rows copied, outputs, pre-step steps / pending, decision and K/V ids, block ids)."""
                 kind = rec['kind']
+                if native_lanes and int(rec['lane_src']):   # B58d: a lane graph to capture / a job Python steps
+                    t_l = time.perf_counter()
+                    lanes.on_native_lane_record(rec)
+                    prof_['tick'] += time.perf_counter() - t_l
+                    return
                 if kind == 3:
                     raise RuntimeError('cpp actor driver: ' + cpp_driver.last_error())
                 if kind == 2:
@@ -5047,16 +5150,30 @@ def main(argv=None, child=None, actor=None):
                     lanes.on_lane_python(rec)
                     prof_['tick'] += time.perf_counter() - t_l
                     return
+                if kind == 6:   # B58c: a CF capture whose teacher generation needs the main weights first
+                    t_c = time.perf_counter()
+                    lanes.on_publish(rec)
+                    prof_['control'] += time.perf_counter() - t_c
+                    return
                 tb_ = time.perf_counter()
+                nv.push('c.unpack')   # (d1 report: c.record by part)
                 idx_r = rec['workers'].numpy()
                 go_r = rec['go'].numpy().astype(bool)
                 rows_r = bdrv.record_rows(rec, ROW)
+                nv.pop()
                 if priv_pending is not None:
                     priv_pending[idx_r] = rec['priv'].numpy().view(PRIV_DTYPE)
                 lanes.observe_rows(idx_r, rows_r)
-                go_b = book.arrive(roll, rows_r, idx_r, pending)
-                if not np.array_equal(go_b, go_r):
-                    raise RuntimeError('cpp actor driver: the go mask differs from Episodes.arrive')
+                if native_cons:   # B58a+b: the arithmetic and the store were done by the driver; the episode events here
+                    nv.push('c.events')
+                    _native_events(book, rows_r, idx_r, rec['snap'].numpy())
+                    nv.pop()
+                    fz_ = rows_r['first'] != 0; dn_ = rows_r['done'] != 0
+                    pending[idx_r[dn_ & (rows_r['done'] != DONE_BRANCH)]] = 0; pending[idx_r[fz_ & go_r]] = 0
+                else:
+                    go_b = book.arrive(roll, rows_r, idx_r, pending)
+                    if not np.array_equal(go_b, go_r):
+                        raise RuntimeError('cpp actor driver: the go mask differs from Episodes.arrive')
                 prof_['book'] += time.perf_counter() - tb_
                 prof_['polls'] += 1
                 cap_w_ = idx_r[rec['cf_snap'].numpy() != 0]   # (B54: workers whose next record waits for this capture)
@@ -5067,6 +5184,21 @@ def main(argv=None, child=None, actor=None):
                 t1_ = time.perf_counter()
                 a_r = idx_r[go_r]
                 sub_r = rows_r if go_r.all() else rows_r[go_r]
+                if native_lin:   # B58c: the lineage, the CF captures and the sidecar were the driver's; the pending rows here
+                    if len(cap_w_):
+                        cpp_driver.capture_done(cap_w_.tolist())
+                    act_r = rec['actions'].numpy()
+                    pending[a_r] = act_r
+                    prof_['control'] += time.perf_counter() - t1_
+                    prof_['calls'] += 1
+                    prof_['rows'] += len(a_r)
+                    lat_ = rec['t_reply'] - rec['t_poll']
+                    prof_['latency'] += lat_; prof_['main_ready'] += lat_
+                    prof_['act'] += rec['t_done'] - rec['t_poll']
+                    if busy:
+                        prof_['act_busy'] += lat_
+                        prof_['calls_busy'] += 1
+                    return
                 under_r = rec['pending_before'].numpy()
                 step_b = rec['step_before'].numpy(); first_r = rec['first'].numpy().astype(bool)
                 comp_r = rec['complete'].numpy().astype(bool); dec_r = rec['dec'].numpy()
@@ -5090,8 +5222,14 @@ def main(argv=None, child=None, actor=None):
                 prof_['control'] += time.perf_counter() - t1_
                 t2_ = time.perf_counter()
                 host_r = rec['out'].numpy(); act_r = rec['actions'].numpy()
-                store(roll, a_r, sub_r, under_r, act_r, host_r[:, nh], host_r[:, nh+1], ver_r, vg=host_r[:, nh+2],
-                      priv=priv_pending[a_r] if priv_pending is not None else None, block_context=contexts)
+                if native_cons:   # (B58a+b: the rollout rows are written; the memory sidecar keeps its chunk starts here)
+                    kk_r = rec['kk'].numpy()
+                    for j_, (w_, k_) in enumerate(zip(a_r.tolist(), kk_r.tolist())):
+                        if k_ >= 0:
+                            roll.block.record(w_, k_, sub_r[j_], contexts[j_])
+                else:
+                    store(roll, a_r, sub_r, under_r, act_r, host_r[:, nh], host_r[:, nh+1], ver_r, vg=host_r[:, nh+2],
+                          priv=priv_pending[a_r] if priv_pending is not None else None, block_context=contexts)
                 pending[a_r] = act_r
                 for j_, w_ in enumerate(a_r.tolist()):
                     block_actor.pending[w_] = act_r[j_:j_+1].copy()
@@ -5109,10 +5247,13 @@ def main(argv=None, child=None, actor=None):
                 """(B52) One collect with the driver: records consumed, lane rounds and weight takes with the driver
                 paused; the driver is left paused (drained) for the hand-off."""
                 cpp_driver.set_version(version)   # (take_weights may have run at the hand-off)
+                bdrv.check_versions(cpp_driver, block_actor)   # (B58d: one counter, two places)
                 c0_ = cpp_driver.counters()
                 handoff_ = time.perf_counter()-drv_paused_at[0] if drv_paused_at[0] else 0.0
                 if not cpp_started[0]:   # (the first collect starts the thread; it is paused between collects)
                     cpp_driver.start(); cpp_started[0] = True
+                if lane_thread and not cpp_driver.lanes_running:   # (B58d d2: the lane thread, started once)
+                    cpp_driver.lanes_start()
                 cpp_driver.resume()
                 while roll.usable() < rollout_actor and sampler.live and not stopped():
                     if busy and fresh.is_set():
@@ -5123,16 +5264,21 @@ def main(argv=None, child=None, actor=None):
                         take_weights()
                         nv.pop()
                         cpp_driver.set_version(version)
+                        bdrv.check_versions(cpp_driver, block_actor)
                         prof_['weights'] += time.perf_counter() - t_w
                         cpp_driver.resume()
                     ta_ = time.perf_counter()
+                    nv.push('c.next')
                     rec_ = cpp_driver.next_record(0.002)
+                    nv.pop()
                     prof_['poll'] += time.perf_counter() - ta_
                     if rec_ is not None:
                         nv.push('c.record')
                         consume_record(rec_, prof_)
                         nv.pop()
-                    if lanes.driver is not None:   # B54: the lane rounds go to the driver; the tick never pauses it
+                    if native_lanes:   # B58d: the lane service is C++'s; its records come with the others
+                        pass
+                    elif lanes.driver is not None:   # B54: the lane rounds go to the driver; the tick never pauses it
                         drain_driver(prof_)   # (the queued records first: their CF captures make the points branches begin at)
                         _lane_tick(prof_)
                     elif sampler.poll_lanes() or lanes.in_flight:   # (B52: lane rounds on the shared arena: the driver paused)
@@ -5149,6 +5295,10 @@ def main(argv=None, child=None, actor=None):
                 # B54 counters of this collect: the driver's paused seconds (the hand-off's pause before this collect's
                 # resume excluded), lane jobs / rows, merged rows and calls, lane-only calls, run-time captures
                 line_ = bdrv.collect_counters(c0_, c1_, handoff_, lane_stat, py_mark)
+                if hasattr(lanes, 'point_stats'):   # D1: the CF points' lives, refusals, both generations pinned
+                    lane_stat.update(lanes.point_stats())
+                if native_lin:   # (D1 / B58d: the native point table's and lane service's timings)
+                    lane_stat.update(cpp_driver.lane_timing())
                 print(f"B54 driver collect: {line_}; "
                       f"graphs registered {cpp_driver.n_graphs()}; "
                       f"pages {block_actor.store.native.n_pages_d()} decision / {block_actor.store.native.n_pages_b()} block", flush=True)
@@ -5375,6 +5525,12 @@ def main(argv=None, child=None, actor=None):
                     raise RuntimeError(f'policy lag: {lag_bad_} decisions of hand-off {sent_handoffs} use weights older '
                                        f'than version {version0 + sent_handoffs - 1} (oldest {lag_min_})')
             nv.push('h.job')
+            if lane_thread:   # B58d d2: the lane thread stands still while the lineage is read and collected
+                t_lp = time.perf_counter()
+                cpp_driver.lanes_pause()
+                lane_stat['lane_handoff_pause_s'] = time.perf_counter()-t_lp
+            if native_lin:   # B58c: the rollout's native sidecar as PagedSnapshots (what payload / plan read)
+                roll.block.materialize()
             job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
                        **lab_job,
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
@@ -5430,6 +5586,10 @@ def main(argv=None, child=None, actor=None):
                 job['lhand_s'] = time.perf_counter() - t_h
             spare.carry(roll)
             roll, spare = spare, roll
+            if lane_thread:   # (B58d d2: the lane thread goes on serving the lanes while the actor waits / collects)
+                cpp_driver.lanes_resume()
+            if native_cons:   # (B58a+b: the driver stores into the new rollout; paused since the collect's end)
+                cpp_driver.use_rollout(roll.native_slot)
             book.finished = []
             book.branch_finished = []
             busy = True
