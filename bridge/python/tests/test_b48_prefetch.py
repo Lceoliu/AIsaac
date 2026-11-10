@@ -38,11 +38,16 @@ def test_prefetched_parts_equal_serial_bit_for_bit(device, other_call, monkeypat
 
 
 def _compare(device, other_call, monkeypatch):
-    """Serial, (CUDA: serial again,) prefetched: the uploaded bytes, outputs and losses bit-identical; every
-    gradient bit-identical on the CPU; on CUDA, where atomically accumulated gradients differ between two
-    serial runs, the prefetched run's gradients differ from the serial one by no more than that."""
+    """Serial, (CUDA: five serial runs more,) prefetched: the uploaded bytes bit-identical; outputs, losses and every
+    gradient bit-identical on the CPU; on CUDA, where atomically accumulated gradients differ between serial runs,
+    every compared value of the prefetched run differs from the first serial run's by no more than four times the
+    largest serial spread or two FP32 ulps at that value's own magnitude.
+    (B60 evidence, b60_prefetch_spread.py, 20 + 20 pairs before and after B60: serial pairs always differ in a
+    part-0 gradient by ~1e-12 and in 5-20 % of the pairs by one ulp (2.38e-7) in a later part's output at magnitude
+    ~2, prefetched pairs as often; one serial pair, the old spread estimate, mostly missed that event.)"""
     serial = None
-    runs = (False, False, True) if device == 'cuda' else (False, True)
+    runs = (False,)*6+(True,) if device == 'cuda' else (False, True)
+    spread = 0.0
     spread = None
     for prefetch in runs:
         m_, ch_, te_ = _rollout_and_teacher(device, seed=37)
@@ -95,6 +100,7 @@ def _compare(device, other_call, monkeypatch):
         # the prepared parts are the same bytes (the slab each part uploads: decodes, index arrays, pages)
         assert len(serial_up) == len(got_up) == len(parts)*(2 if other_call else 1) and serial_up == got_up
         diff = 0.0
+        items = []   # (|diff| max, two ulps at the value's magnitude) per compared tensor
         for (la, oa, ga, sa), (lb, ob, gb, sb) in zip(serial_res, got_res):
             assert sa == sb and sa['selected_blocks'] > 0
             assert ga.keys() == gb.keys()
@@ -102,17 +108,18 @@ def _compare(device, other_call, monkeypatch):
             for x, y in pairs:
                 if device == 'cpu':   # (bit-identical)
                     torch.testing.assert_close(x, y, rtol=0, atol=0)
-                diff = max(diff, float((x.float()-y.float()).abs().max()))
+                d = float((x.float()-y.float()).abs().max())
+                mag = max(float(x.float().abs().max()), float(y.float().abs().max()))
+                items.append((d, 2*float(np.spacing(np.float32(mag)))))
+                diff = max(diff, d)
         if device == 'cuda':
-            if not prefetch:   # (the serial run-to-run spread)
-                spread = diff
+            if not prefetch:   # (the serial run-to-run spread: the largest over the serial pairs)
+                spread = max(spread, diff)
                 continue
-            print(f'serial vs serial max |diff| (loss, outputs, grads) {spread:.3e}, serial vs prefetched {diff:.3e}')
-            # (floor: four FP32 ulps at the compared values' magnitude (~2: 2.4e-7 per ulp). B60: on the 4090 the
-            # prefetched run twice differed by exactly one ulp (2.38e-7) while the serial pair happened to agree to
-            # 0 / 1.5e-8, the uploaded bytes asserted equal above: one serial pair underestimates the run-to-run
-            # spread of the atomically accumulated gradients)
-            assert diff <= max(4*spread, 1e-6)
+            print(f'serial vs serial max |diff| (loss, outputs, grads, 5 pairs) {spread:.3e}, '
+                  f'serial vs prefetched {diff:.3e}')
+            bad = [(d, two_ulp) for d, two_ulp in items if d > max(4*spread, two_ulp)]
+            assert not bad, bad[:5]
 
 
 def test_unused_prefetch_is_dropped_and_frees_its_buffer(monkeypatch):
