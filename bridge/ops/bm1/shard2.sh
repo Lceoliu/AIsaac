@@ -32,7 +32,28 @@ P0=$!
 NOLOCK=1 LOCKS_HELD="node0+node1" GPU=4,5 CPUSET=12-23,36-47 MEMS=1 GPUS_OK=4,5 MEM=50g \
   ENVS="$X -e NAME=s1b -e PORT=39600 ${ENVS:-}" $BM/prof.sh $TAG-s1 $TREE &
 P1=$!
+# safety line (M1b): the host's MemAvailable below 10 GiB, or an OOM kill inside either container (memory.events),
+# stops both shards (SIGINT to their trainers) and is logged; no retry
+( while kill -0 $P0 2>/dev/null || kill -0 $P1 2>/dev/null; do
+    sleep 5
+    av=$(awk '/^MemAvailable:/ {print int($2/1024)}' /proc/meminfo)
+    oom=0
+    for c in aisaac-bench-bm1-a1-prof-$TAG-s0 aisaac-bench-bm1-a1-prof-$TAG-s1; do
+      id=$(docker inspect -f '{{.Id}}' $c 2>/dev/null) || continue
+      k=$(awk '/^oom_kill / {print $2}' /sys/fs/cgroup/system.slice/docker-$id.scope/memory.events 2>/dev/null)
+      [ "${k:-0}" -gt 0 ] && oom="$oom $c:$k"
+    done
+    if [ "$av" -lt 10240 ] || [ "$oom" != 0 ]; then
+      echo "$(date '+%F %T') shard pair $TAG SAFETY STOP: MemAvailable ${av} MiB, oom_kill:$oom" >> $LOG
+      for c in aisaac-bench-bm1-a1-prof-$TAG-s0 aisaac-bench-bm1-a1-prof-$TAG-s1; do
+        docker exec $c pkill -INT -f '^/bench/home/isaac-abplus/.venv/bin/python -u train_tok.py' 2>/dev/null
+      done
+      break
+    fi
+  done ) &
+WD=$!
 wait $P0 $P1
+kill $WD 2>/dev/null
 echo "$(date '+%F %T') shard pair $TAG done" >> $LOG
 [ "$(cat $BM/LOCK_node1 2>/dev/null)" = "$L1" ] && rm -f $BM/LOCK_node1
 [ "$(cat $BM/LOCK_node0 2>/dev/null)" = "$L0" ] && rm -f $BM/LOCK_node0
