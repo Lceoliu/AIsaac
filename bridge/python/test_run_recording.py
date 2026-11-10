@@ -1400,3 +1400,76 @@ def test_fx_omit_default_list_documented():
     rm = _re.search(r'<!-- fx_omit_default: ([0-9,]+) -->', readme)
     assert rm, 'README 里要有 <!-- fx_omit_default: ... --> 标记'
     assert lua_list == sorted(int(x) for x in rm.group(1).split(','))
+
+
+class _StopMain(Exception):
+    pass
+
+
+def _capture_session(monkeypatch):
+    """把 rr.Session 换成只记录参数的假类（构造时抛 _StopMain），返回记录 dict。"""
+    got = {}
+
+    def fake(*args, **kw):
+        got['args'], got['kw'] = args, kw
+        raise _StopMain()
+    monkeypatch.setattr(rr, 'Session', fake)
+    monkeypatch.setattr(rr, 'find_unfinished', lambda out_root: [])
+    return got
+
+
+def test_record_launcher_default_obs_is_fxkey(tmp_path, monkeypatch):
+    """phase15：真人录制启动器（run_recording CLI）不传 --obs 时用 fxkey；--obs full 显式选回完整模式。"""
+    assert rr.RECORD_DEFAULT_OBS == 'fxkey'
+    got = _capture_session(monkeypatch)
+    with pytest.raises(_StopMain):
+        rr.main(['--session', 'x', '--out-root', str(tmp_path)])
+    assert got['kw']['extra_env'] == {'IRR_OBS': 'fxkey'}
+    with pytest.raises(_StopMain):
+        rr.main(['--session', 'y', '--out-root', str(tmp_path), '--obs', 'full'])
+    assert not got['kw']['extra_env']   # full = 不设 IRR_OBS（mod 默认）
+    with pytest.raises(_StopMain):
+        rr.main(['--session', 'z', '--out-root', str(tmp_path), '--obs', 'keyframe'])
+    assert got['kw']['extra_env'] == {'IRR_OBS': 'keyframe'}
+
+
+def test_record_run_ps1_default_obs_fxkey():
+    """phase15：record_run.ps1 的 -Obs 默认 fxkey，并且总是把 --obs 显式传给 Python（-Obs full 才选得回完整模式）。"""
+    import re as _re
+    ps1 = (Path(__file__).resolve().parents[2] / 'record_run.ps1').read_text(encoding='utf-8-sig')
+    m = _re.search(r"\[ValidateSet\('full', 'keyframe', 'fxkey'\)\]\[string\]\$Obs = '(\w+)'", ps1)
+    assert m and m.group(1) == 'fxkey'
+    assert "$Arguments += @('--obs', $Obs)" in ps1
+    assert "if ($Obs -ne 'full')" not in ps1
+
+
+def test_session_and_replay_defaults_stay_full(tmp_path, monkeypatch):
+    """phase15：只改启动器默认。Session 类（测试 harness、回放进程都用它）不设 IRR_OBS，session.json 记 obs = full；
+    显式 fxkey 时记 fxkey；replay_run 的 --obs 默认 full。"""
+    s0 = rr.Session('plain', tmp_path, copy_root=tmp_path / 'copy')
+    assert 'IRR_OBS' not in s0.extra_env and s0.info['obs'] == 'full' and s0.info['fx_omit_override'] is None
+    s1 = rr.Session('fx', tmp_path, copy_root=tmp_path / 'copy', extra_env=rr.obs_env('fxkey', '21,41'))
+    assert s1.info['obs'] == 'fxkey' and s1.info['fx_omit_override'] == '21,41'
+    import inspect
+    assert inspect.signature(replay_run.run_replay).parameters['obs'].default == 'full'
+    got = {}
+
+    def fake_run_replay(*args, **kw):
+        got.update(kw)
+        raise _StopMain()
+    monkeypatch.setattr(replay_run, 'run_replay', fake_run_replay)
+    with pytest.raises(_StopMain):
+        replay_run.main([str(tmp_path / 'run-0001.jsonl.zst'), '--name', 'r', '--out-root', str(tmp_path)])
+    assert got['obs'] == 'full' and got['fx_omit'] is None
+
+
+def test_validation_header_records_obs(tmp_path):
+    """phase15：session.json runs[].validation.header 带 obs 与 fx_omit（来自 run 文件 header）。"""
+    lines = _mt_lines()
+    hdr = json.loads(lines[0])
+    hdr['obs'], hdr['fx_omit'] = 'fxkey', [21, 41]
+    lines[0] = json.dumps(hdr, separators=(',', ':'))
+    p = tmp_path / 'run-p1-01-0001.jsonl'
+    p.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    v = rr.validate_lines(rr.iter_lines_raw(p))
+    assert v['header']['obs'] == 'fxkey' and v['header']['fx_omit'] == [21, 41]

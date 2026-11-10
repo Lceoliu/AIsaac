@@ -1,5 +1,7 @@
 # Isaac Run Recorder（忏悔 J746 整局被动录制）
 
+更新：2026-11-10（phase15-fxkey-default，mod 代码不变仍是 0.5.1：**真人录制启动器 `record_run.ps1` / `run_recording` 的观测模式默认改为 `fxkey`**（4.11 节）；human1/3/4 全部 44 局以 fxkey 回放重录全部 exact，与原始真人录像逐帧解码比较 0 差异（human3 run-0001 的 room 行 `curses` 有一处回放端旧差异，full 回放同样有，见 phase15 NOTES）；`-Obs full` 选回完整模式；mod 自身（`IRR_OBS` 未设置）、回放进程、测试 harness 的默认仍是 full；`session.json` 新增 `obs`/`fx_omit_override`）
+
 更新：2026-11-10（recorder 0.5.1，phase14-space：省空间。①存档快照的 blob 单独 zstd-19 压缩成 `save/blobs/<sha256>.zst`（2 节）；②校验通过的原始 jsonl 与开局存档拷贝默认送进 Windows 回收站（`--raw recycle`，2、3 节）；③归档压缩配置（5 节）；④可选观测模式 `fxkey`：装饰性特效只在关键帧写，digest 不变（4.11 节）；⑤`--recover --force` 在原始文件已挪走时拒绝、覆盖前备份 session.json，另一个窗口正在录的会话不再提示（8.10 节）。`format` 仍是 2，旧文件与旧快照布局照常读）
 
 更新：2026-11-10（recorder 0.5.0，phase13-rebuild-safety：重建安全。①观测构建出错的帧照样写一行"退化帧"（输入/生成种子/鼠标/MT 照写，`"err":1`），下一帧强制关键帧并补写 `"resync":1` 的 room 行，读取端标出受影响的帧（4.4、6 节）；`fh:write`/`flush` 失败计数（`write_errors`）；②每局开局时 mod 在开局回调里同步拷出存档（`header.save_copy`），会话存档快照按内容去重（`save/blobs/<sha256>` + 每局清单），晚了的旧快照被检测并标记（2、3、8.10 节）；③每 30 帧 flush（被杀最多丢约 1 秒）、`--recover` 收尾异常结束的会话（8.10 节）。格式只加键，`format` 仍是 2，旧文件读法不变）
@@ -53,6 +55,7 @@
 | `mods` | 副本 `mods/` 下每个 mod：目录、`metadata.xml` 的 name/id/version、是否有 `disable.it`、全部文件 sha256 |
 | `game_version` | 游戏 log 里的版本行（`Binding of Isaac: Repentance v1.7.8a.J746`） |
 | `options` | `before`（会话前全部键值）、`forced`（`EnableDebugConsole=0`；`--allow-console` 会话为空）、`forced_before`、`restored`（会话后还原的键） |
+| `obs`、`fx_omit_override` | （phase15）本会话游戏进程的观测模式（`IRR_OBS`；没设 = `full`）与省略名单覆盖（`IRR_FX_OMIT`；`null` = mod 内置名单）。真人录制启动器默认 `fxkey`，`Session` 类本身（回放进程、测试 harness）默认 `full`。每局实际的模式与名单以 run 文件 header 为准，也抄在 `runs[].validation.header.obs`/`fx_omit` |
 | `allow_console` | （0.4.0）`record_run.ps1 -AllowConsole` / `--allow-console`：不强制关控制台，游戏进程设 `RR_MT_CONSOLE=1`，DLL 记录每条控制台命令（第 8.7 节） |
 | `save_pre`、`save_post`、`init_save_from` | 存档快照清单 |
 | `launches` | 每次启动尝试：tag、pid、`use_dll`、`boot_s`（mod 加载用时）、`result`（ok/failed）、失败原因（注入器失败、进程退出码、log 洪水、mod 未加载）、版本行、`mod_mt`（mod 加载时的 MT 状态：available/reason/DLL 信息）、`dll_status`（DLL 日志里最后的状态行）、`dll_log`；`console_hook`（0.4.0，`--allow-console` 时 DLL 日志的 `console: hook installed …` / `console: OFF …` 行） |
@@ -202,7 +205,19 @@ v2 只**新增**键，旧字段（`p`/`e`/`g`/`dr`/`r`/`tk`/`mt`/`dg`、room/lev
 
 ### 4.11 观测模式 `fxkey`：装饰性特效只在关键帧写（recorder 0.5.1，phase14-space）
 
-可选，**不是默认**：`record_run.ps1 -Obs fxkey` / `--obs fxkey` / 环境变量 `IRR_OBS=fxkey`（回放进程 `replay_run.py --obs fxkey`）。
+**真人录制的默认**（phase15 起）：`rl/record_run.ps1` 不带 `-Obs` 时就是 `fxkey`（`run_recording` CLI 的 `--obs` 默认也是 `fxkey`）。要每帧完整观测：`record_run.ps1 -Obs full`（`--obs full`）。mod 本身在 `IRR_OBS` 未设置时仍是 `full`；回放进程（`replay_run.py --obs`，默认 full）、测试 harness 与 `run_recording.Session` 类的默认也仍是 `full`——只改了真人录制启动器。录像 header 的 `obs`/`fx_omit`、`session.json` 的 `obs`/`fx_omit_override` 记下这一局/这个会话用的模式。
+
+**把 fxkey 录像重录成 full 录像**（例如要让查看器画出全部特效）：用回放（默认 full 观测）重放一遍，回放进程写出的录像就是同一局的 full 录像（回放 exact 时状态逐位相同）：
+
+```
+python rl/bridge/python/replay_run.py <会话>/runs/run-0001.jsonl.zst --turbo --name full-r0001 --report full-r0001.json --init-save <会话>/save/run-p1-01-0001
+#   续局（header.continued）用 --continue-save <会话>/save/run-p1-01-NNNN；回放进程的观测模式默认 full（--obs full 也可显式写）
+#   报告 compare.exact = true 时，info.replay_file 就是这一局的 full 录像，可直接给 python -m run_viewer 打开
+```
+
+phase15 的全量验证（`experiments/run-recorder/phase15-fxkey-default/NOTES.md`）：human1（1 局）、human3（34 局）、human4（9 局）共 44 局、89,238 帧以 `--obs fxkey` 回放重录，44/44 exact；与原始真人录像（recorder 0.2.0–0.4.1）逐帧解码比较 digest、MT、玩家行、道具、生成记录、非特效实体、保留特效、网格、门、外观（解码后）全部相同（human1 原录像是 v1 没有外观，外观改与同一局的 full 回放录像比；输入 tick 只在开局窗口与暂停帧有已知的长度差异）；zst 合计 14.29 MB → 8.03 MB（−44%）。
+
+原用法（显式）：`record_run.ps1 -Obs fxkey` / `--obs fxkey` / 环境变量 `IRR_OBS=fxkey`（回放进程 `replay_run.py --obs fxkey`）。
 
 - 非关键帧里，`header.fx_omit` 列出的 EffectVariant（type 1000）的特效**不写 `e` 行和 `ea` 外观行**，也不读它们的外观、不进差分基准（下次写出时一定是完整行）；其余实体、名单外的特效每帧照写。关键帧（本局第 1 帧、进房后第一帧、每 300 帧、出错后的第一帧）照常写全量。
 - **digest 三层与 full 模式逐位相同**：省略的特效照样读出、照样算进第 3 层（digest 计算的代码路径没变），回放校验不被削弱；`sp`（生成种子流）、tick 输入、MT 校验照写。
@@ -434,7 +449,7 @@ python -m isaac_bridge.run_recording --recover <会话目录>      # PYTHONPATH=
 
 **`-NoDll`**（`rl/record_run.ps1 -NoDll`，`run_recording --no-dll`）：完全回到第二阶段行为：直接启动 EXE，存档在真实 `%USERPROFILE%\Documents\My Games\Binding of Isaac Repentance (Galaxy)\`（不存在时由游戏新建），header `mt.available=false, reason=no_dll`，回放只能近似。
 
-**观测模式**（E5）：默认 `full`；`rl/record_run.ps1 -Obs keyframe`（环境变量 `IRR_OBS=keyframe`）只在关键帧写实体行，其余帧照写 `mt`、玩家行、tick 输入、生成种子、房间头、网格/门变化与 digest。适合带 DLL、可精确回放的会话；实体状态需要回放重建。目前不默认。
+**观测模式**（E5）：mod 默认 `full`，真人录制启动器默认 `fxkey`（phase15，4.11 节；`-Obs full` 选回）；`rl/record_run.ps1 -Obs keyframe`（环境变量 `IRR_OBS=keyframe`）只在关键帧写实体行，其余帧照写 `mt`、玩家行、tick 输入、生成种子、房间头、网格/门变化与 digest。适合带 DLL、可精确回放的会话；实体状态需要回放重建。目前不默认。
 
 ## 11. 查看器：`rl/bridge/python/run_viewer/`（帧级回放，不启动游戏）
 

@@ -93,6 +93,10 @@ FORCED_OPTIONS = {'EnableDebugConsole': '0'}
 FORCED_OPTIONS_CONSOLE = {}
 # 观测模式（IRR_OBS）：full（默认）/ keyframe（实体行只在关键帧写）/ fxkey（0.5.1：装饰性特效只在关键帧写，README §4.11）
 OBS_MODES = ('full', 'keyframe', 'fxkey')
+# 真人录制启动器（本模块 CLI 与 rl/record_run.ps1）的默认观测模式（phase15：human1/3/4 全部 44 局以 fxkey 回放重录 exact、
+# 与原录像逐帧解码比较 0 差异后改为默认）。只影响启动器：mod 自身（IRR_OBS 未设置）、Session 类、回放进程（replay_run.py
+# --obs）、测试 harness 的默认仍是 full。--obs full 可显式选回完整模式。
+RECORD_DEFAULT_OBS = 'fxkey'
 
 
 def obs_env(obs, fx_omit=None):
@@ -895,7 +899,8 @@ def validate_lines(lines):
                 st['errors'].append('首行不是 isaac-run-v1 header')
             st['header'] = dict(run=o.get('run'), mode=o.get('mode'), continued=o.get('continued'), gf=o.get('gf'),
                                 seed=((o.get('meta') or {}).get('seeds') or {}).get('start_seed_string'),
-                                harness=o.get('harness') is not None, obs=o.get('obs'), recorder=o.get('recorder'),
+                                harness=o.get('harness') is not None, obs=o.get('obs'), fx_omit=o.get('fx_omit'),
+                                recorder=o.get('recorder'),
                                 flush_every=o.get('flush_every'), fault=o.get('fault'), save_copy=o.get('save_copy'),
                                 mt=dict(available=(o.get('mt') or {}).get('available'), salt=(o.get('mt') or {}).get('salt'),
                                         reason=(o.get('mt') or {}).get('reason'),
@@ -1406,6 +1411,10 @@ class Session:
                          affinity=self.affinity, allow_console=self.allow_console, launches=[], runs=[], notes=[])
         if self.extra_env:
             self.info['extra_env'] = self.extra_env
+        # phase15：本会话游戏进程的观测模式（IRR_OBS；未设置 = mod 默认 full）与省略名单覆盖（IRR_FX_OMIT；None = mod 内置名单）。
+        # 每局实际用的模式与名单以 run 文件 header 为准（runs[].validation.header.obs / fx_omit）
+        self.info['obs'] = self.extra_env.get('IRR_OBS') or 'full'
+        self.info['fx_omit_override'] = self.extra_env.get('IRR_FX_OMIT')
         self.snapshots = {}
         self.watcher = None
         self.docs_watcher = None
@@ -1714,6 +1723,8 @@ class Session:
                  f'启动 {s["launch_attempts"]} 次，失败 {s["launch_failures"]} 次；游戏进程退出码 {s.get("game_exit_hex")}'
                  + ('（异常退出）' if s.get('game_exit_abnormal') else ''),
                  f'DLL {"开" if s.get("use_dll") else "关（-NoDll）"}；有 MT reseed 的局 {s.get("mt_runs")}；存档目录 {self.save_dir}',
+                 f'观测模式 {self.info.get("obs")}' + (f'（省略名单覆盖 {self.info.get("fx_omit_override")}）'
+                                                       if self.info.get('fx_omit_override') else ''),
                  f'会话期间真实 Documents 出现 (Galaxy) 目录：{s.get("real_documents_galaxy_appeared")}',
                  f'数据有问题的局 {s.get("data_issue_runs")}；开局存档快照：mod 拷贝 {s.get("mod_snapshots")} 局，晚了 '
                  f'{s.get("late_snapshots")} 局；退化帧 {s.get("degraded_frames")}；写失败 {s.get("write_errors")}'
@@ -1727,6 +1738,7 @@ class Session:
             lines.append(f'{r["file"]}: 帧 {v.get("frames")} 种子 {h.get("seed")} 续局 {h.get("continued")} '
                          f'结束 {(v.get("end") or {}).get("reason")} zst {r.get("zst_bytes")} B 校验 {r.get("verified")} '
                          f'MT {(h.get("mt") or {}).get("available")} salt {(h.get("mt") or {}).get("salt")} '
+                         f'obs {h.get("obs")} '
                          f'数据 {"OK" if r.get("data_ok") else "有问题：" + "；".join(r.get("data_issues") or [])}')
         return '\n'.join(lines) + '\n'
 
@@ -1949,9 +1961,9 @@ def main(argv=None):
     ap.add_argument('--auto-seconds', type=float, default=0, help='>0 时由脚本自动按键代替人类（测试用）')
     ap.add_argument('--attempts', type=int, default=6)
     ap.add_argument('--no-dll', action='store_true', help='不注入 rr_mt.dll（第二阶段行为：真实 Documents 存档、无 MT reseed）')
-    ap.add_argument('--obs', choices=OBS_MODES, default='full',
-                    help='观测模式（E5；默认 full = 每帧完整观测；keyframe = 实体行只在关键帧写；fxkey = 装饰性特效只在关键帧写，'
-                         'README §4.11）')
+    ap.add_argument('--obs', choices=OBS_MODES, default=RECORD_DEFAULT_OBS,
+                    help='观测模式（默认 fxkey = 装饰性特效只在关键帧写，digest 不变，README §4.11；full = 每帧完整观测；'
+                         'keyframe = 实体行只在关键帧写）')
     ap.add_argument('--allow-console', action='store_true',
                     help='不强制关闭调试控制台；DLL 记录每条控制台命令（ev cmd src=console），回放时同帧执行（README §8.7）')
     ap.add_argument('--affinity', default=DEFAULT_AFFINITY,

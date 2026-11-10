@@ -5,6 +5,7 @@
 #   .\rl\record_run.ps1 -SessionName first-try -InitSaveFrom D:\backup\my-galaxy-save
 #   .\rl\record_run.ps1 -SessionName old-way -NoDll          # 回退到第二阶段行为（不注入 DLL）
 #   .\rl\record_run.ps1 -SessionName with-console -AllowConsole   # 允许调试控制台（命令逐条记录，回放同帧执行；README §8.7）
+#   .\rl\record_run.ps1 -SessionName full-obs -Obs full          # 每帧完整观测（默认 fxkey：装饰性特效只在关键帧写，README §4.11）
 #   .\rl\record_run.ps1 -Recover D:\...\sessions\20261110-evening  # 收尾一个没收尾的会话（本窗口被关/电脑重启之后；先关游戏）
 #
 # 流程（DESIGN_BRIEF §5 末条、§6 D5/D6/D11、§7 E1/E2）：
@@ -39,7 +40,7 @@ param(
     [int]$Attempts = 6,
     [double]$AutoSeconds = 0,  # >0：脚本自动按键进游戏、随机玩、按住 R 重开、关窗口（只用于测试）
     [switch]$NoDll,            # 不注入 rr_mt.dll（第二阶段行为）
-    [ValidateSet('full', 'keyframe', 'fxkey')][string]$Obs = 'full',  # 观测模式：full = 每帧完整（默认）；keyframe = 实体只在关键帧写；fxkey = 装饰性特效只在关键帧写（README §4.11）
+    [ValidateSet('full', 'keyframe', 'fxkey')][string]$Obs = 'fxkey',  # 观测模式：fxkey = 装饰性特效只在关键帧写（默认，phase15；digest 不变，README §4.11）；full = 每帧完整；keyframe = 实体只在关键帧写
     [switch]$AllowConsole,     # 允许调试控制台：不强制 EnableDebugConsole=0，控制台命令逐条记录（需要 DLL）
     [string]$Affinity = 'auto'  # 游戏进程 CPU 亲和：auto = 逻辑 CPU 0 一个核（默认，录下的局才可能精确回放）；0 = 不限制；0x… = 掩码
 )
@@ -66,7 +67,7 @@ $Arguments = @('-m', 'isaac_bridge.run_recording', '--session', $SessionName, '-
 if ($InitSaveFrom) { $Arguments += @('--init-save-from', ([IO.Path]::GetFullPath($InitSaveFrom))) }
 if ($AutoSeconds -gt 0) { $Arguments += @('--auto-seconds', "$AutoSeconds") }
 if ($NoDll) { $Arguments += @('--no-dll') }
-if ($Obs -ne 'full') { $Arguments += @('--obs', $Obs) }
+$Arguments += @('--obs', $Obs)   # 总是显式传（-Obs full 才能选回完整模式）
 if ($Affinity -ne 'auto') { $Arguments += @('--affinity', $Affinity) }
 if ($AllowConsole) { $Arguments += @('--allow-console') }
 & python @Arguments
