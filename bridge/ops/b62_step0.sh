@@ -54,8 +54,11 @@ for S in "$@"; do
   G)
     cd $ROOT/$CODE/bridge/python
     CUBLAS_WORKSPACE_CONFIG=:4096:8 ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 OMP_NUM_THREADS=1 timeout 1500 $PY -m pytest \
-      tests -q -p no:cacheprovider > $R/tests-b62-full.log 2>&1
-    echo "$(date '+%F %T') G full gate rc=$? $(tail -1 $R/tests-b62-full.log)" >> $LOG
+      tests -q -p no:cacheprovider > $R/tests-b62-full-$CODE-$(date +%m%d-%H%M).log 2>&1
+    rc=$?
+    GL=$(ls -t $R/tests-b62-full-$CODE-*.log | head -1)
+    echo "$(date '+%F %T') G full gate rc=$rc $(tail -1 $GL) ($GL)" >> $LOG
+    if [ $rc != 0 ]; then mkdir -p $R/failed && cp $GL $R/failed/; fi   # (B62: gate logs never overwritten; failures kept)
     ;;
   P) prof prof-b62-cpp ISAAC_SWITCH_INTERVAL_US=500 ;;
   L)   # (lean checkpoint vs the B44-B60 call on CUDA, 20 + 20 pairs, B48 spread rule)
@@ -104,9 +107,11 @@ for S in "$@"; do
     ;;
   T)   # (the B60 / B62 unit tests and the B48 prefetch test on this host)
     cd $ROOT/$CODE/bridge/python
-    CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=1 timeout 300 $PY -m pytest tests/test_b60_native_pack.py       tests/test_b48_prefetch.py tests/test_block_packed_learner.py -q -p no:cacheprovider > $R/tests-b62-t.log 2>&1
+    CUBLAS_WORKSPACE_CONFIG=:4096:8 OMP_NUM_THREADS=1 timeout 300 $PY -m pytest tests/test_b60_native_pack.py       tests/test_b48_prefetch.py tests/test_block_packed_learner.py -q -p no:cacheprovider > $R/tests-b62-t-$CODE-$(date +%m%d-%H%M).log 2>&1
     rc=$?
-    echo "$(date '+%F %T') T tests rc=$rc $(tail -1 $R/tests-b62-t.log)" >> $LOG
+    TL=$(ls -t $R/tests-b62-t-$CODE-*.log | head -1)
+    echo "$(date '+%F %T') T tests rc=$rc $(tail -1 $TL) ($TL)" >> $LOG
+    [ $rc != 0 ] && mkdir -p $R/failed && cp $TL $R/failed/
     if [ $rc != 0 ]; then give $S; echo "$(date '+%F %T') stage T failed: later stages not run" >> $LOG; exit 1; fi
     ;;
   O|OL|OC)   # (op count by calling frame, C packing pipelined; OL: lean checkpoint; OC: Inductor cpp_wrapper)
