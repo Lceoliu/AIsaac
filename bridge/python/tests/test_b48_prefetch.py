@@ -108,7 +108,11 @@ def _compare(device, other_call, monkeypatch):
                 spread = diff
                 continue
             print(f'serial vs serial max |diff| (loss, outputs, grads) {spread:.3e}, serial vs prefetched {diff:.3e}')
-            assert diff <= max(4*spread, 1e-7)
+            # (floor: four FP32 ulps at the compared values' magnitude (~2: 2.4e-7 per ulp). B60: on the 4090 the
+            # prefetched run twice differed by exactly one ulp (2.38e-7) while the serial pair happened to agree to
+            # 0 / 1.5e-8, the uploaded bytes asserted equal above: one serial pair underestimates the run-to-run
+            # spread of the atomically accumulated gradients)
+            assert diff <= max(4*spread, 1e-6)
 
 
 def test_unused_prefetch_is_dropped_and_frees_its_buffer(monkeypatch):
