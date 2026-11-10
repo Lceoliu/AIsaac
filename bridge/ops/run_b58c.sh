@@ -2,7 +2,7 @@
 # B58c chain: tests (the B58a+b set + the native lineage / lifetime tests) -> smoke (3 updates, the native lineage
 # on) -> nsys nvtx + python-gil over hand-offs 2..5 of a 6-update profile with the per-thread CPU sampler (B57 tools)
 # -> full gate (entry + all tests + A8). Each stage takes the lock itself; stops at the first failed gate.
-# usage: run_b58c.sh <code dir>
+# usage: run_b58c.sh <code dir>   (FROM=smoke: start at the smoke, the tests / TSAN of this candidate passed already)
 ROOT=/home/linux/isaac-block-memory-v1
 R=$ROOT/reports/b42-speed
 CODE=${1:-candidate-b58c}
@@ -17,7 +17,18 @@ stage() {
   while :; do waitlock; "$@" > $R/b58c-$n.launcher.log 2>&1; rc=$?; [ $rc -eq 2 ] || break; sleep 30; done
   echo "$(date +%T) c stage $n rc=$rc" >> $LOG
 }
-echo "$(date +%T) c chain start ($CODE)" >> $LOG
+# a stage's outputs left by an earlier run are moved (never removed) to failed/old-<time>/ first (train_tok refuses an
+# existing output directory)
+fresh() {
+  for x in "$@"; do
+    if ls -d $R/$x* > /dev/null 2>&1; then
+      d=$R/failed/old-$(date +%m%d-%H%M%S); mkdir -p $d; mv $R/$x* $d/
+      echo "$(date +%T) c: earlier $x* moved to $d" >> $LOG
+    fi
+  done
+}
+echo "$(date +%T) c chain start ($CODE${FROM:+, from $FROM})" >> $LOG
+if [ -z "$FROM" ]; then
 stage tests $OPS/run_b58t.sh $CODE
 if ! tail -1 $R/tests-b58t.log | grep -q " passed" || tail -1 $R/tests-b58t.log | grep -qE "failed|error"; then
   echo "$(date +%T) c stops: tests failed ($(tail -1 $R/tests-b58t.log | cut -c1-120))" >> $LOG; exit 1
@@ -28,6 +39,8 @@ echo "cpp-actor $(date '+%Y-%m-%d %H:%M:%S') B58c core TSAN (CPU, not a timing r
 $OPS/run_core_tsan.sh $CODE; rc=$?
 rm -f $R/GPU_LOCK
 echo "$(date +%T) c core tsan rc=$rc: $(grep -c 'tsan warnings 0' $R/core-tsan.log) clean lines" >> $LOG
+fi
+fresh prof-b58c-smoke
 stage smoke env SMOKETAG=prof-b58c-smoke $OPS/run_b54p.sh $CODE smoke
 ROWS=$(($(wc -l < $R/prof-b58c-smoke/progress.csv 2>/dev/null || echo 0)-1))
 TB=$(grep -cE 'File "[^"]*train_tok\.py"' $R/prof-b58c-smoke.stdout $R/prof-b58c-smoke.stderr 2>/dev/null | awk -F: '{s+=$2} END {print s+0}')
@@ -37,6 +50,7 @@ if [ "$ROWS" -lt 2 ] || [ "$TB" != "0" ] || ! echo "$NC" | grep -q ': on'; then
 fi
 echo "$(date +%T) c smoke ok: $ROWS updates, $NC" >> $LOG
 # nsys + per-thread CPU (run_b50m.sh takes the lock itself)
+fresh prof-b58c-m
 waitlock
 python3 $OPS/b57_threads.py $R/prof-b58c-m.threads.csv 1.0 > $R/prof-b58c-m.threads.log 2>&1 &
 ( sleep 240; sh $OPS/threads_snapshot.sh > $R/prof-b58c-m.threadnames.txt 2>&1 ) &
