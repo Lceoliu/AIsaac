@@ -2852,6 +2852,8 @@ def main(argv=None, child=None, actor=None):
                 lanes.attach_driver(cpp_driver)   # B54: the lane rounds' steps on the driver thread too
         print(f'B52 cpp actor driver: {"on, %d graphs registered" % cpp_driver.n_graphs() if cpp_driver is not None else "off (%s)" % bdrv.reason()}'
               f'; lane generations pre-created: {made_g}', flush=True)
+        from isaac_bridge.block_training import CAPTURE_MODE as capture_mode_
+        print(f'BM1 graph capture mode: {capture_mode_} (ISAAC_CAPTURE_MODE)', flush=True)
         if cpp_driver is not None and os.environ.get('ISAAC_BLOCK_TIMING') == '1' and os.environ.get('ISAAC_BLOCK_TIMELINE'):
             # BM1 (measurement only, ISAAC_BLOCK_TIMING=1 + ISAAC_BLOCK_TIMELINE=<path>): once a second, the driver's
             # cumulative counters (atomics) and whether the learner is inside an update (block_paged.LEARNER_ACTIVE), so

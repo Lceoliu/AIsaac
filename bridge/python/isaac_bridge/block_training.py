@@ -159,6 +159,17 @@ _bp.UPD_KEYS = tuple(_bp.UPD_KEYS)+tuple(k for k in (
     if k not in _bp.UPD_KEYS)
 
 
+# BM1 (decision 1, step 2): the capture's error mode, ISAAC_CAPTURE_MODE=global (default) | thread_local. In global mode
+# any other thread's unsafe CUDA call during a capture invalidates it -- event query / synchronize, stream synchronize,
+# a new pinned allocation, and also a new device allocation (cudaMalloc through the caching allocator), on the
+# capture's GPU or on another one; SIDE_CUDA covers only the prefetch worker's staging. In thread_local mode only the
+# capturing thread is restricted: b62_capture_probe2.py, 24 cases x 5 on the 3090 (cu128), every capture ended and
+# its graph replayed bit-identical to a quiet capture 128 times. gc stays off and the admission keeps captures apart.
+CAPTURE_MODE = os.environ.get('ISAAC_CAPTURE_MODE', 'global')
+if CAPTURE_MODE not in ('global', 'thread_local'):
+    raise ValueError(f'ISAAC_CAPTURE_MODE={CAPTURE_MODE!r}: global or thread_local')
+
+
 @contextmanager
 def graph_capture(graph,stream,pool=None):
     """torch.cuda.graph(graph, stream=stream) without its gc.collect() and empty_cache().
@@ -175,7 +186,8 @@ def graph_capture(graph,stream,pool=None):
     by gc.collect() inside a global-mode capture, invalidates it with that error, and the next capture then fails with
     'captures_underway.empty() INTERNAL ASSERT' (the b62d / b62g gates' cascade); through graph_capture (gc off) the
     capture ends right, 4 of 4. A dropped pinned buffer collected the same way does not break a capture.
-    B62: also exclusive of the CUDA calls made off the admission (SIDE_CUDA: the learner prefetch worker's staging)."""
+    B62: also exclusive of the CUDA calls made off the admission (SIDE_CUDA: the learner prefetch worker's staging).
+    BM1: the error mode is CAPTURE_MODE (ISAAC_CAPTURE_MODE, default global)."""
     import gc as gc_
     with SIDE_CUDA.capture():
         torch.cuda.synchronize()
@@ -183,7 +195,7 @@ def graph_capture(graph,stream,pool=None):
         gc_.disable()
         try:
             with torch.cuda.stream(stream):
-                graph.capture_begin(pool=pool,capture_error_mode='global')
+                graph.capture_begin(pool=pool,capture_error_mode=CAPTURE_MODE)
                 try:
                     yield graph
                 finally:
