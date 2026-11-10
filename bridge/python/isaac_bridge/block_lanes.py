@@ -713,8 +713,11 @@ class BlockLaneService(LaneService):
         if self.driver is None:
             return super().quiesce()
         if self.lanes_only:   # (B54: back from the learner wait: the driver paused, its lane records consumed)
-            from .block_driver import pause_serving
-            pause_serving(self.driver, lambda rec: self.driver_record(rec, resume=False))
+            if getattr(self,'native_lanes',False):   # (the driver thread may wait for a lane record of this queue)
+                from .block_driver import pause_serving
+                pause_serving(self.driver, lambda rec: self.driver_record(rec, resume=False))
+            else:   # (B54's Python lane service: the driver never waits for Python here)
+                self.driver.pause()
             while True:
                 rec=self.driver.next_record(0.0)
                 if rec is None:
