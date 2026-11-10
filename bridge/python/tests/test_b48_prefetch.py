@@ -48,7 +48,6 @@ def _compare(device, other_call, monkeypatch):
     serial = None
     runs = (False,)*6+(True,) if device == 'cuda' else (False, True)
     spread = 0.0
-    spread = None
     for prefetch in runs:
         m_, ch_, te_ = _rollout_and_teacher(device, seed=37)
         parts = _parts(ch_+te_)
