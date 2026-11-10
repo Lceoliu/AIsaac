@@ -186,6 +186,19 @@ def run_batch(m, W, K, rows, ev_max, target=-1):
     return ev, cnt, book, rolls[0], got
 
 
+def same_finished(fa, fb):
+    """the finished episodes' summaries equal (a NaN equals a NaN: the snapshots were compared bitwise already)"""
+    import math
+    assert len(fa) == len(fb)
+    for i, (a, b) in enumerate(zip(fa, fb)):
+        assert a.keys() == b.keys(), (i, sorted(a), sorted(b))
+        for k in a:
+            x, y = a[k], b[k]
+            if isinstance(x, float) and isinstance(y, float) and math.isnan(x) and math.isnan(y):
+                continue
+            assert x == y, (i, k, x, y)
+
+
 def test_batch_matches_per_record_one_worker():
     from test_b58_native_consumer import same_rollout
     torch.manual_seed(41)
@@ -200,8 +213,9 @@ def test_batch_matches_per_record_one_worker():
         np.testing.assert_array_equal(ha, hb)
         np.testing.assert_array_equal(sa, sb)
     assert cnt_a == cnt_b and cnt_a['polls'] == K
-    assert book_a.finished == book_b.finished and len(book_a.finished) > 2
-    assert book_a.branch_finished == book_b.branch_finished
+    same_finished(book_a.finished, book_b.finished)
+    assert len(book_a.finished) > 2
+    same_finished(book_a.branch_finished, book_b.branch_finished)
     assert book_a.inv0 == book_b.inv0
     same_rollout(roll_a, roll_b)
 
