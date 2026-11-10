@@ -750,17 +750,21 @@ end
 -- digest 三层：1 = 玩家与房间；2 = + 非外观实体；3 = 全量（+ 特效、实体种子/Index、附加字段、网格、门）
 -- omit_e = true：不写实体行（IRR_OBS=keyframe 的非关键帧；digest 照常计算）
 -- dry = true：开销基准（harness bench）用，v2 的字典/外观缓存在结束时还原（否则基准里分配的字典条目不会写进文件）
+-- omit_fx = true（0.5.1，IRR_OBS=fxkey 的非关键帧）：M.fx_omit 名单里的特效（type 1000）不写 e 行与 ea 行、不读外观，
+-- 也不进差分基准 C.prev_e/C.prev_ea（下次写出时是完整行，读取端同样从完整行开始）；它们的值照常算进 digest
 local function copy_tbl(t) local o = {}; for k, v in pairs(t) do o[k] = v end; return o end
-function M.frame_parts(n, buf, kf, omit_e, dry)
+M.fx_omit = {}
+function M.frame_parts(n, buf, kf, omit_e, dry, omit_fx)
 	local saved = nil
 	if dry then
 		saved = {sdict = copy_tbl(C.sdict), snext = C.snext, snew = copy_tbl(C.snew), sd_taken = copy_tbl(C.sd_taken or {}), prev_pa = C.prev_pa, prev_ea = C.prev_ea,
 			fcache = copy_tbl(C.fcache), pfcache = copy_tbl(C.pfcache), gspr = copy_tbl(C.gspr), dspr = copy_tbl(C.dspr), dpre = copy_tbl(C.dpre)}
 	end
-	M.frame_parts_inner(n, buf, kf, omit_e)
+	M.frame_parts_inner(n, buf, kf, omit_e, omit_fx)
 	if saved then for k, v in pairs(saved) do C[k] = v end end
 end
-function M.frame_parts_inner(n, buf, kf, omit_e)
+function M.frame_parts_inner(n, buf, kf, omit_e, omit_fx)
+	local FXO = omit_fx and M.fx_omit or nil
 	local room, level = game:GetRoom(), game:GetLevel()
 	-- v2：外观行（不进 digest）
 	local prev_pa = kf and {} or C.prev_pa
@@ -840,16 +844,18 @@ function M.frame_parts_inner(n, buf, kf, omit_e)
 			local fl, il = {}, {}
 			local ok, err = pcall(append_extra, e, t, vals, fl, il)
 			if not ok then vals[#vals + 1] = NULL end
-			local pv = prev_e[idx]
-			local same = pv and pv[12] == init and #pv == #vals
-			erow[#erow + 1] = same and row_delta(pv, vals, 5) or row_full(vals)
-			cur_e[idx] = vals
-			if APP and not omit_e then -- v2 实体外观（key = Index；与 e 行同时换成完整行）
-				local av = appearance(e, spr, idx, anim, init, kf, fc, t == ETYPE_EFFECT)
-				local pa = prev_ea[idx]
-				local r = sparse_row(pa, av, kf or not same or not pa)
-				if r then earow[#earow + 1] = r end
-				cur_ea[idx] = av
+			if not (FXO and t == ETYPE_EFFECT and FXO[vals[3]]) then
+				local pv = prev_e[idx]
+				local same = pv and pv[12] == init and #pv == #vals
+				erow[#erow + 1] = same and row_delta(pv, vals, 5) or row_full(vals)
+				cur_e[idx] = vals
+				if APP and not omit_e then -- v2 实体外观（key = Index；与 e 行同时换成完整行）
+					local av = appearance(e, spr, idx, anim, init, kf, fc, t == ETYPE_EFFECT)
+					local pa = prev_ea[idx]
+					local r = sparse_row(pa, av, kf or not same or not pa)
+					if r then earow[#earow + 1] = r end
+					cur_ea[idx] = av
+				end
 			end
 			-- 第 2 层与第一阶段的"非外观实体"口径一致：类型/位置/速度/HP/NPC State/StateFrame/FrameCount；
 			-- Index、种子和其余附加字段只进第 3 层（特效生成次数不同会让后续实体的 Index 整体错位）

@@ -23,7 +23,9 @@
 #   4. 启动游戏，启动失败（约 20–25%：崩溃、log 洪水、mod 未加载）自动重试并计数；
 #   5. 正常玩：mod 每局一个文件，开局时 Python 再快照一次存档；画面左上角录制期间常驻一个小 "REC"；
 #   6. 关闭游戏窗口后：会话后快照、每局压成 .zst 并逐字节校验、写 session.json 与 summary.txt
-#      （局数、帧数、小时、MB）。原始 jsonl 校验后移到 <OutRoot>\_raw_staging\<会话名>\，确认无误后可自行删除。
+#      （局数、帧数、小时、MB）。原始 jsonl（和 mod 的开局存档拷贝）压缩并逐字节校验通过后默认送进 Windows 回收站
+#      （-Raw recycle；回收站不可用/会被永久删除时自动退回 stage 并在 session.json 里说明）；-Raw stage = 挪到
+#      <OutRoot>\_raw_staging\<会话名>\；-Raw keep = 原地保留。校验没通过的局永远保留原始文件。
 #   7. 本窗口被关、Python 被结束或电脑重启（会话没收尾：session.json 不完整、options.ini 的 EnableDebugConsole 没还原）：
 #      关掉游戏后运行 -Recover <会话目录>：归档已录的局（截断局照常标出）、补写 session.json（state = recovered）、还原 options.ini。
 #      新会话开始时若发现 OutRoot 下有没收尾的会话会打印一行提示。
@@ -33,11 +35,11 @@ param(
     [string]$Recover = '',     # 收尾一个没收尾的会话目录（见上面第 7 条）
     [string]$InitSaveFrom = '',
     [string]$OutRoot = '',
-    [ValidateSet('stage', 'keep')][string]$Raw = 'stage',
+    [ValidateSet('recycle', 'stage', 'keep')][string]$Raw = 'recycle',  # 校验通过后原始文件去向（见上面第 6 条）
     [int]$Attempts = 6,
     [double]$AutoSeconds = 0,  # >0：脚本自动按键进游戏、随机玩、按住 R 重开、关窗口（只用于测试）
     [switch]$NoDll,            # 不注入 rr_mt.dll（第二阶段行为）
-    [ValidateSet('full', 'keyframe')][string]$Obs = 'full',  # 观测模式：full = 每帧完整（默认）；keyframe = 实体只在关键帧写
+    [ValidateSet('full', 'keyframe', 'fxkey')][string]$Obs = 'full',  # 观测模式：full = 每帧完整（默认）；keyframe = 实体只在关键帧写；fxkey = 装饰性特效只在关键帧写（README §4.11）
     [switch]$AllowConsole,     # 允许调试控制台：不强制 EnableDebugConsole=0，控制台命令逐条记录（需要 DLL）
     [string]$Affinity = 'auto'  # 游戏进程 CPU 亲和：auto = 逻辑 CPU 0 一个核（默认，录下的局才可能精确回放）；0 = 不限制；0x… = 掩码
 )

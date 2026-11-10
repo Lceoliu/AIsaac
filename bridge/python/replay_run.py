@@ -557,9 +557,23 @@ def diff_dicts(a, b, limit=8):
     return out
 
 
+def _without_omitted_fx(fs, omit):
+    """fxkey（0.5.1）：两边都去掉省略名单里的特效再比（一边是非关键帧时它没有这些特效，直接比会报假差异）。"""
+    if not omit or fs.entities is None:
+        return fs
+    import copy as _copy
+    out = _copy.copy(fs)
+    out.entities = [e for e in fs.entities if not (e['type'] == 1000 and e['variant'] in omit)]
+    return out
+
+
 def explain(fa, fb, layer):
     """首个分歧帧上，解码状态（0.01 定点）里哪些字段不同。"""
     ex = {}
+    omit = set(fa.fx_omitted or []) | set(fb.fx_omitted or [])
+    if omit:
+        ex['fx_omitted_variants_ignored'] = sorted(omit)
+        fa, fb = _without_omitted_fx(fa, omit), _without_omitted_fx(fb, omit)
     if fa.room_frame != fb.room_frame:
         ex['room_frame'] = diff_dicts(fa.room_frame, fb.room_frame)
     pd = []
@@ -895,8 +909,10 @@ def start_replay_run(g, table, limit_frames, timeout=30):
 def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=True, continue_save=None,
                copy_root=rr.DEFAULT_COPY, turbo=None, init_save=None, forced_options=None, inject_pauses=True,
                align_engine_pauses=True, inject_extras=False, mouse=True, affinity='auto', disable_mods='auto',
-               inject_restart=True):
-    """mouse：还原录制的鼠标流（phase8-mouse；需要带 RRMT_SetMouse 的 rr_mt.dll，进程环境 RR_MT_MOUSE=1）。
+               inject_restart=True, obs='full', fx_omit=None):
+    """obs / fx_omit（0.5.1，phase14）：回放进程自己的观测模式（IRR_OBS / IRR_FX_OMIT；默认 full）。只影响回放进程写的录像
+    （例如用回放把真人局以 fxkey 重录一遍量体积），不影响注入与 digest 比对。
+    mouse：还原录制的鼠标流（phase8-mouse；需要带 RRMT_SetMouse 的 rr_mt.dll，进程环境 RR_MT_MOUSE=1）。
     affinity：回放进程的 CPU 亲和（默认 'auto' = 一个核；'0' = 不限制；见 affinity_mask），只在带 DLL 时生效。
     continue_save：续局回放用的存档快照目录（含 gamestate1.dat），拷进本会话的存档目录后菜单 Enter 续局。
     copy_root：隔离副本（默认 game-rec-01）。turbo：None（原速，默认）/ 'gate' / 'clock'（见 turbo_env，需要 DLL）。
@@ -925,7 +941,8 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
         print('[回放] 提示：无法判断开局存档快照是否晚了：' + '；'.join(snap_status.get('reasons') or []), flush=True)
     # 回放进程没人看着：失焦暂停会让回放停住（真人会话 20261106-human1 的第一次回放在第 1068 帧因此被判 stalled），所以强制关掉
     sess = rr.Session(name, out_root, copy_root=copy_root, raw_policy='keep', use_dll=use_dll,
-                      init_save_from=init_from, init_save_exclude=exclude, extra_env=replay_env(turbo, mouse and use_dll, affinity if use_dll else None),
+                      init_save_from=init_from, init_save_exclude=exclude,
+                      extra_env=dict(replay_env(turbo, mouse and use_dll, affinity if use_dll else None), **rr.obs_env(obs, fx_omit)),
                       forced_options=forced_options or dict(rr.FORCED_OPTIONS, PauseOnFocusLost='0'))
     if disable_mods == 'auto':
         api_set = api_mods(run)
@@ -951,7 +968,8 @@ def run_replay(rec_path, name, out_root, attempts=6, timeout_s=None, use_dll=Tru
                 affinity=hex(affinity_mask(affinity)) if use_dll and affinity_mask(affinity) else None,
                 continue_save=str(continue_save) if continue_save else None, copy=str(sess.copy.root),
                 turbo=turbo or 'off', init_save=str(init_save) if init_save and not continued else None,
-                api_mods=list(api_set), mods_disabled=placed, save_snapshot_status=snap_status)
+                api_mods=list(api_set), mods_disabled=placed, save_snapshot_status=snap_status,
+                replay_obs=obs, replay_fx_omit=fx_omit)
     stall_s = STALL_S['turbo' if turbo else 'off']
     try:
         # 放在 try 里：建表失败也要走 finish()（还原 options.ini、停监视线程、写 session.json）
@@ -1155,9 +1173,9 @@ def restore_init_save(sess, k):
             shutil.move(str(f), str(disp / f.name))
             moved.append(f.name)
     if sess.init_save_from:
-        for nm, f in rr.snapshot_files(sess.init_save_from).items():   # 新（save/blobs 去重）旧两种布局
+        for nm, f in rr.snapshot_files(sess.init_save_from).items():   # 压缩 blob / 未压缩 blob / 旧的直接文件布局
             if nm.lower() not in sess.init_save_exclude:
-                shutil.copy2(f, sd / nm)
+                f.copy_to(sd / nm)   # 原始内容（压缩 blob 先解压），按清单 sha256 校验
                 copied.append(nm)
     opt = sd / 'options.ini'
     if opt.exists() and sess.enforce_options:
@@ -1568,6 +1586,9 @@ def main(argv=None):
     ap.add_argument('--frames', type=int, default=None, help='观战/导出只到第 N 帧（测试用）')
     ap.add_argument('--rewind', default='restart', choices=('restart', 'inproc'),
                     help='观战往回跳：restart（默认，重启回放进程，精确）或 inproc（同一进程重开回放局，快但存档状态可能不同）')
+    ap.add_argument('--obs', choices=rr.OBS_MODES, default='full',
+                    help='回放进程自己录像的观测模式（默认 full；fxkey = 装饰性特效只在关键帧写，README §4.11）。不影响回放校验')
+    ap.add_argument('--fx-omit', default=None, help='与 --obs fxkey 一起：省略名单（逗号分隔的 EffectVariant；默认用 mod 内置名单）')
     a = ap.parse_args(argv)
     if a.watch or a.capture:
         name = a.name or (('watch-' if a.watch else 'capture-') + Path(a.run).name.split('.')[0] + '-' + time.strftime('%H%M%S'))
@@ -1603,7 +1624,7 @@ def main(argv=None):
                                 copy_root=a.copy, turbo=a.turbo, init_save=a.init_save,
                                 inject_pauses=not a.no_menu_pause, align_engine_pauses=not a.no_pause_align,
                                 inject_extras=a.inject_extras, mouse=not a.no_mouse, affinity=a.affinity,
-                                disable_mods=a.disable_mods, inject_restart=not a.no_inject_restart)
+                                disable_mods=a.disable_mods, inject_restart=not a.no_inject_restart, obs=a.obs, fx_omit=a.fx_omit)
         res = dict(replay_session=str(sess.dir), info=info)
         if info.get('replay_file'):
             res['compare'] = compare(a.run, info['replay_file'])

@@ -288,6 +288,19 @@
     } else if (t === 1000) r = Math.min(r || 4, 8);
     return { x, y, r, dy };
   }
+  // recorder 0.5.1 的 fxkey 观测模式：省略名单里的特效只在关键帧有记录。为了不让它们每 300 帧闪一下，查看器对这类录像
+  // 整体不画这些特效（几何/美术/实体列表/选中都不含），页面顶部注明。展开逻辑（viewer_core.js）不变，与 load_run 一致。
+  let fxOmit = null;
+  function visibleEntities(erows, eapp) {
+    if (!fxOmit || !erows) return [erows, eapp];
+    const r = [], a = [];
+    erows.forEach((row, j) => {
+      if (row[1] === 1000 && fxOmit.has(row[2])) return;
+      r.push(row);
+      if (eapp) a.push(eapp[j]);
+    });
+    return [r, eapp ? a : eapp];
+  }
   function drawEntities(ctx, erows) {
     if (!erows) return [];
     const list = erows.slice().sort((a, b) => catOrder(a[1]) - catOrder(b[1]));
@@ -454,7 +467,7 @@
     layout(rs.room);
     drawRoom(ctx, rs);
     const q1 = performance.now();
-    const erows = run.entityRows(cur);
+    const erows = visibleEntities(run.entityRows(cur))[0];
     const q2 = performance.now();
     const h1 = drawEntities(ctx, erows);
     const h2 = drawPlayers(ctx, run.playerRows(cur));
@@ -471,14 +484,15 @@
     layout(rs.room);
     const W = cv.clientWidth, H = cv.clientHeight;
     ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
-    const erows = run.entityRows(cur), prows = run.playerRows(cur);
+    const [erows, eappVis] = visibleEntities(run.entityRows(cur), run.entityAppRows(cur));
+    const prows = run.playerRows(cur);
     if (!art || !rs.room) { RV.roomParts = [0, 0, 0, 0]; hitList = []; return rs; }
     const k = view.s / IsaacArt.PX;   // 屏幕像素 / 精灵像素
     const M = { at: (x, y) => { ctx.save(); ctx.setTransform(dpr * k, 0, 0, dpr * k, dpr * (view.ox + x * view.s), dpr * (view.oy + y * view.s)); ctx.imageSmoothingEnabled = false; } };
     const visited = new Set();
     const lv = run.level(cur);
     if (lv) for (const v of roomVisits) { if (v.at > cur) break; if (v.at >= lv.at && v.room.desc) visited.add(v.room.desc[0]); }
-    const F = { W: cv.clientWidth, H: cv.clientHeight, rs, erows, prows, eapp: run.entityAppRows(cur), papp: run.playerAppRows(cur), items: run.items(cur), EI, XI, effects: opt.effects, level: lv, visited };
+    const F = { W: cv.clientWidth, H: cv.clientHeight, rs, erows, prows, eapp: eappVis, papp: run.playerAppRows(cur), items: run.items(cur), EI, XI, effects: opt.effects, level: lv, visited };
     const q1 = performance.now();
     art.drawFrame(ctx, F, M);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -734,7 +748,7 @@
   }
   function iconHtml(key) { return names.icons[key] ? `<img class="ic" src="${names.icons[key]}">` : ''; }
   function renderEntityList() {
-    const erows = run.entityRows(cur);
+    const erows = visibleEntities(run.entityRows(cur))[0];
     const el = $('ents');
     if (!erows) { el.innerHTML = '<span class="dim">本帧未记录实体</span>'; return; }
     const counts = {};
@@ -761,7 +775,7 @@
     if (!selected) { el.innerHTML = '<span class="dim">点击画面里的实体或上面列表查看全部字段</span>'; return; }
     let row = null;
     if (selected.player) row = run.playerRows(cur).find((r) => r[0] === selected.idx) || null;
-    else row = (run.entityRows(cur) || []).find((r) => r[0] === selected.idx && r[EI.init_seed] === selected.seed) || null;
+    else row = (visibleEntities(run.entityRows(cur))[0] || []).find((r) => r[0] === selected.idx && r[EI.init_seed] === selected.seed) || null;
     if (!row) { el.innerHTML = `<span class="dim">所选对象（Index ${selected.idx}）本帧不存在</span>`; return; }
     if (selected.player) {
       const p = run.decodePlayer(row);
@@ -1104,11 +1118,13 @@
       buildLists();
       bindControls();
       const h = D.header, end = D.end;
+      fxOmit = h.obs === 'fxkey' ? new Set(h.fx_omit || []) : null;
       const seeds = (h.meta && h.meta.seeds) || {};
       $('title').textContent = `${D.source.name}`;
       document.title = `${D.source.name} · 录制回放`;
       $('meta').textContent = `种子 ${seeds.start_seed_string || '?'} · ${((h.meta || {}).players || []).map((p) => p.name).join('/')} · ${N} 帧（${fmtTime(N)} 游戏时间）· ${D.levels.length} 层 · ${roomVisits.length} 次进房 · ` +
-        `结束：${end ? end.reason : '无 end 行（截断）'} · MT ${h.mt && h.mt.available ? '有' : '无'} · recorder ${h.recorder}${h.continued ? ' · 续局' : ''}`;
+        `结束：${end ? end.reason : '无 end 行（截断）'} · MT ${h.mt && h.mt.available ? '有' : '无'} · recorder ${h.recorder}${h.continued ? ' · 续局' : ''}` +
+        (fxOmit ? ` · fxkey 观测：${fxOmit.size} 种装饰性特效只在关键帧记录，查看器不画它们` : '');
       const m = /[#&?]f=(\d+)/.exec(location.hash + '&' + location.search);
       cur = m ? Math.max(0, Math.min(N - 1, +m[1] - 1)) : 0;
       const tr = performance.now();

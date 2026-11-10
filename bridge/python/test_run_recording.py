@@ -944,7 +944,7 @@ def test_snapshot_blobs_dedup_and_old_layout(tmp_path):
     old = tmp_path / 'old'
     rr.snapshot_save(old, sd)          # 旧布局：文件直接放在快照目录
     fo = rr.snapshot_files(old)
-    assert sorted(fo) == ['gamestate1.dat', 'persistentgamedata1.dat'] and fo['gamestate1.dat'].parent == old
+    assert sorted(fo) == ['gamestate1.dat', 'persistentgamedata1.dat'] and fo['gamestate1.dat'].path.parent == old
 
     class FakeSess:
         pass
@@ -1091,3 +1091,312 @@ def test_game_process_env_drops_fault(monkeypatch):
     with pytest.raises(Boom):
         rr.GameProcess(copy, d / 'irr', 'p2', d / 'logs', use_dll=False, save_dir=d / 'save', extra_env={'IRR_FAULT': 'room:2'})
     assert captured['env']['IRR_FAULT'] == 'room:2'
+
+
+# ---------------------------------------------------------------------------------------------- phase14（recorder 0.5.1）
+MOD_DIR = Path(__file__).resolve().parents[1] / 'mod' / 'isaac_run_recorder'
+
+
+def test_metadata_version_matches_main_lua():
+    """A3：metadata.xml 的 <version> 与 main.lua 的 VERSION 相同。"""
+    import re as _re
+    main = (MOD_DIR / 'main.lua').read_text(encoding='utf-8')
+    meta = (MOD_DIR / 'metadata.xml').read_text(encoding='utf-8')
+    v_main = _re.search(r'local VERSION = "([^"]+)"', main).group(1)
+    v_meta = _re.search(r'<version>([^<]+)</version>', meta).group(1).strip()
+    assert v_main == v_meta, (v_main, v_meta)
+
+
+def _recover_fixture(tmp_path, raw_policy='stage'):
+    out_root = tmp_path / 'sessions'
+    sdir = out_root / 'kill1'
+    (sdir / 'lua').mkdir(parents=True)
+    (sdir / 'game').mkdir()
+    copy = tmp_path / 'copy'
+    save_dir = copy / 'profile' / rr.SAVE_SUBDIR
+    save_dir.mkdir(parents=True)
+    (save_dir / 'options.ini').write_text('[Options]\nEnableDebugConsole=0\n', encoding='utf-8')
+    rec = dict(schema='isaac-run-recover-v1', state='recording', name='kill1', session_dir=str(sdir), out_root=str(out_root),
+               copy=str(copy), save_dir=str(save_dir), use_dll=True, raw_policy=raw_policy, allow_console=False,
+               launcher_pid=1, options_file=str(save_dir / 'options.ini'), forced_before={'EnableDebugConsole': '1'},
+               forced={'EnableDebugConsole': '0'}, cmd_history_before=[])
+    (sdir / 'recover.json').write_text(json.dumps(rec), encoding='utf-8')
+    (sdir / 'session.json').write_text(json.dumps(dict(schema='isaac-run-session-v1', name='kill1', state='recording',
+                                                       launches=[], runs=[], notes=['原来的'],
+                                                       options=dict(before={'EnableDebugConsole': '1'}))), encoding='utf-8')
+    (sdir / 'lua' / 'run-p1-01-0001.jsonl').write_text('\n'.join(_mt_lines()) + '\n', encoding='utf-8')
+    return out_root, sdir
+
+
+def test_recover_force_refuses_when_raw_gone_and_backs_up(tmp_path):
+    """A1：--recover 覆盖 session.json 前先备份成 session.before-recover-<时间戳>.json；已收尾且原始 run 文件已挪走
+    （runs/ 里有归档、lua/ 里没有原始文件）时 --force 拒绝执行（以前会把 session.json 写成 runs=[]）。"""
+    out_root, sdir = _recover_fixture(tmp_path)
+    sess, info = rr.recover_session(sdir)
+    baks = sorted(sdir.glob('session.before-recover-*.json'))
+    assert len(baks) == 1 and json.loads(baks[0].read_text(encoding='utf-8'))['notes'] == ['原来的']
+    assert len(info['runs']) == 1 and not list((sdir / 'lua').glob('run-*.jsonl'))
+    before = (sdir / 'session.json').read_text(encoding='utf-8')
+    with pytest.raises(RuntimeError, match='runs/'):
+        rr.recover_session(sdir, force=True)
+    assert (sdir / 'session.json').read_text(encoding='utf-8') == before    # 没被改写
+    assert len(json.loads(before)['runs']) == 1
+    # 原始文件还在（keep 策略）时 --force 可以重做，且再备份一次
+    out2, sdir2 = _recover_fixture(tmp_path / 'b', raw_policy='keep')
+    rr.recover_session(sdir2)
+    assert list((sdir2 / 'lua').glob('run-*.jsonl'))
+    _s, info2 = rr.recover_session(sdir2, force=True)
+    assert len(info2['runs']) == 1 and len(list(sdir2.glob('session.before-recover-*.json'))) == 2
+
+
+def test_find_unfinished_skips_live_launcher(tmp_path):
+    """A2：recover.json 的 launcher_pid 还活着（另一个窗口正在录）时 find_unfinished 不提示；进程结束后提示。"""
+    import subprocess
+    import sys
+    out_root, sdir = _recover_fixture(tmp_path)
+    child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+    try:
+        rec = json.loads((sdir / 'recover.json').read_text(encoding='utf-8'))
+        rec['launcher_pid'] = child.pid
+        (sdir / 'recover.json').write_text(json.dumps(rec), encoding='utf-8')
+        assert rr.launcher_alive(child.pid)
+        assert rr.find_unfinished(out_root) == []
+        with pytest.raises(RuntimeError, match='还在运行'):
+            rr.recover_session(sdir)
+    finally:
+        child.terminate()      # 本测试自己启动的子进程
+        child.wait(10)
+    assert not rr.launcher_alive(child.pid)
+    assert rr.find_unfinished(out_root) == [sdir]
+    assert not rr.launcher_alive(None) and not rr.launcher_alive('x')
+
+
+def test_blob_zstd_layouts(tmp_path):
+    """B1：blob 存成 <sha256>.zst（sha256 = 原始内容），snapshot_files 透明返回原始内容；0.5.0 未压缩 blob 与旧的直接文件
+    布局照常可读；内容与清单 sha256 不符时报错；已有未压缩 blob 时复用、不重复存。"""
+    import hashlib
+    import zstandard
+    sd = tmp_path / 'savedir'
+    sd.mkdir()
+    content = bytes(range(256)) * 200
+    (sd / 'persistentgamedata1.dat').write_bytes(content)
+    (sd / 'options.ini').write_text('[Options]\nA=1\n', encoding='utf-8')
+    blobs = tmp_path / 'save' / 'blobs'
+    man = rr.snapshot_save(tmp_path / 'save' / 'run-a', sd, blobs=blobs)
+    sha = hashlib.sha256(content).hexdigest()
+    assert man['files']['persistentgamedata1.dat']['sha256'] == sha
+    assert man['files']['persistentgamedata1.dat']['blob'] == f'../blobs/{sha}.zst'
+    z = (blobs / f'{sha}.zst').read_bytes()
+    assert len(z) < len(content) // 10 and zstandard.ZstdDecompressor().decompress(z) == content
+    fa = rr.snapshot_files(tmp_path / 'save' / 'run-a')
+    assert fa['persistentgamedata1.dat'].compressed and fa['persistentgamedata1.dat'].read_bytes() == content
+    dst = fa['persistentgamedata1.dat'].copy_to(tmp_path / 'out.dat')
+    assert dst.read_bytes() == content
+    with pytest.raises(TypeError):
+        open(fa['persistentgamedata1.dat'], 'rb')    # 压缩 blob 不能当路径用（拿到的会是 .zst）
+    # 0.5.0 未压缩 blob 布局
+    b0 = tmp_path / 's050' / 'save' / 'blobs'
+    b0.mkdir(parents=True)
+    (b0 / sha).write_bytes(content)
+    snap = tmp_path / 's050' / 'save' / 'run-x'
+    snap.mkdir()
+    (snap / 'manifest.json').write_text(json.dumps({'files': {'persistentgamedata1.dat': {
+        'bytes': len(content), 'sha256': sha, 'blob': f'../blobs/{sha}'}}}), encoding='utf-8')
+    f0 = rr.snapshot_files(snap)['persistentgamedata1.dat']
+    assert not f0.compressed and f0.read_bytes() == content and Path(f0) == (b0 / sha).resolve()
+    # 往已有未压缩 blob 的库里再存同内容：复用 <sha>，不另写 <sha>.zst
+    sha2, p2 = rr.put_blob(b0, sd / 'persistentgamedata1.dat')
+    assert sha2 == sha and p2 == b0 / sha and not (b0 / f'{sha}.zst').exists()
+    # 内容被改坏：读取时按清单 sha256 报错
+    (b0 / sha).write_bytes(content[:-1] + b'X')
+    with pytest.raises(OSError):
+        rr.snapshot_files(snap)['persistentgamedata1.dat'].read_bytes()
+
+
+@pytest.mark.skipif(__import__('os').name != 'nt', reason='Windows 回收站')
+def test_recycle_small_temp_files(tmp_path):
+    """B2：只对临时小文件调用回收站：送进去后原处不再有文件；不存在的文件 -> ok=False、不调用。"""
+    a = tmp_path / 'irr-test-a.jsonl'
+    b = tmp_path / 'irr-test-b.dat'
+    a.write_bytes(b'{"k":"header"}\n')
+    b.write_bytes(b'x' * 10)
+    pol = rr.recycle_bin_policy(Path(tmp_path).anchor)
+    if pol.get('drive_type') != 3 or pol.get('nuke_on_delete'):
+        pytest.skip(f'临时目录所在盘不能用回收站：{pol}')
+    r = rr.recycle_files([a, b])
+    assert r['ok'], r
+    assert not a.exists() and not b.exists()
+    r2 = rr.recycle_files([tmp_path / 'nope.jsonl'])
+    assert not r2['ok'] and '不存在' in r2['error']
+
+
+def _archive_fixture(tmp_path, policy, monkeypatch=None, recycle_result=None):
+    sess = object.__new__(rr.Session)
+    sess.name = 'arc'
+    sess.out_root = tmp_path / 'sessions'
+    sess.dir = sess.out_root / 'arc'
+    sess.irr_dir = sess.dir / 'lua'
+    sess.irr_dir.mkdir(parents=True)
+    sess.raw_policy = policy
+    sess.allow_console = False
+    sess.info = dict(runs=[], launches=[])
+    sess.use_dll = True
+    sess.snapshots = {'run-p1-01-0001': dict(kind='mod', late=False)}
+    (sess.irr_dir / 'run-p1-01-0001.jsonl').write_text('\n'.join(_mt_lines()) + '\n', encoding='utf-8')
+    (sess.irr_dir / 'savecopy-run-p1-01-0001-gamestate1.dat').write_bytes(b'G')
+    return sess
+
+
+def test_archive_raw_policies(tmp_path, monkeypatch):
+    """B2：recycle 成功 -> raw_disposition=recycled，原始 jsonl 与 savecopy 一起送；失败 -> 退回 stage 并在记录里说明；
+    压缩校验没通过的局永远原地保留原始文件。"""
+    calls = []
+
+    def fake_ok(paths):
+        calls.append([Path(p).name for p in paths])
+        return dict(ok=True, files=[str(p) for p in paths])
+    monkeypatch.setattr(rr, 'recycle_files', fake_ok)
+    s = _archive_fixture(tmp_path / 'a', 'recycle')
+    s.archive_runs()
+    r = s.info['runs'][0]
+    assert r['verified'] and r['raw_disposition'] == 'recycled' and r['raw_recycled'] is True
+    assert calls == [['run-p1-01-0001.jsonl', 'savecopy-run-p1-01-0001-gamestate1.dat']]
+
+    monkeypatch.setattr(rr, 'recycle_files', lambda paths: dict(ok=False, error='模拟失败', files=[]))
+    s = _archive_fixture(tmp_path / 'b', 'recycle')
+    s.archive_runs()
+    r = s.info['runs'][0]
+    assert r['raw_disposition'] == 'staged' and '模拟失败' in r['raw_recycle_fallback']
+    assert Path(r['raw_staged_to']).exists() and not (s.irr_dir / 'run-p1-01-0001.jsonl').exists()
+    assert (s.out_root / '_raw_staging' / 'arc' / 'savecopy' / 'savecopy-run-p1-01-0001-gamestate1.dat').exists()
+    assert s.summary()['raw_recycle_fallbacks'] == 1
+
+    def boom(*a, **k):
+        raise RuntimeError('压缩校验失败（模拟）')
+    monkeypatch.setattr(rr, 'compress_and_verify', boom)
+    monkeypatch.setattr(rr, 'recycle_files', fake_ok)
+    calls.clear()
+    s = _archive_fixture(tmp_path / 'c', 'recycle')
+    s.archive_runs()
+    r = s.info['runs'][0]
+    assert 'archive_error' in r and r['raw_disposition'].startswith('kept') and calls == []
+    assert (s.irr_dir / 'run-p1-01-0001.jsonl').exists()
+
+
+def test_compress_and_verify_readable_everywhere(tmp_path):
+    """B3：新压缩配置归档的文件 load_run/open_run_lines 都能读、逐字节一致；旧配置（单线程 zstd-19）的文件照常读。"""
+    import zstandard
+    raw = tmp_path / 'run-p1-01-0001.jsonl'
+    raw.write_text('\n'.join(_mt_lines()) + '\n', encoding='utf-8')
+    dst = tmp_path / 'run-0001.jsonl.zst'
+    res = rr.compress_and_verify(raw, dst)
+    assert res['verified'] and res['zstd'] == rr.ARCHIVE_ZSTD
+    assert load_run.Run(dst).frames == 3
+    with rr.open_run_lines(dst) as f:
+        assert f.read() == raw.read_bytes()
+    old = tmp_path / 'old.jsonl.zst'
+    old.write_bytes(zstandard.ZstdCompressor(level=19, write_checksum=True).compress(raw.read_bytes()))
+    assert load_run.Run(old).frames == 3
+
+
+def _fx_lines(omit_variant_rows=True):
+    """fxkey 合成录像：idx 3 = NPC，idx 5 = 省略名单里的特效（variant 21），idx 6 = 名单外的特效（variant 94）。
+    omit_variant_rows=False 时生成同一局的 full 模式录像（每帧都有 idx 5）。"""
+    lines = [json.loads(x) for x in _v2_lines()]
+    hdr = lines[0]
+    hdr['obs'] = 'fxkey' if omit_variant_rows else 'full'
+    hdr['fx_omit'] = [21] if omit_variant_rows else None
+
+    def er(idx, t, v, x, init):
+        return [idx, t, v, 0, x, 1000, 0, 0, 0, 0, 1, init, init, 0, -1, 1, 0, 'Idle', 0]
+    ea = [0, 6, None, -1, 0, 100, 100, 0, 100, 100, 100, 100, 0, 0, 0, None, None, None, None, None, None, None, 0, 0, 0, 0]
+
+    def eap(k):
+        return [k] + ea[1:]
+    f1 = dict(k='f', n=1, gf=1, t=0, kf=1, tk=['u'], r=[1, 1, 0, 84], p=[[0, 32000, 38000, 0, 0, 'WalkDown']],
+              e=[er(3, 10, 0, 100, 33), er(5, 1000, 21, 200, 55), er(6, 1000, 94, 300, 66)],
+              sd=[[4, 'gfx/001.000_Player.anm2'], [5, 'HeadDown'], [6, 'gfx/x.anm2']],
+              pa=[[0, 4, 5, 0, 0, 100, 100, 0, 100, 100, 100, 100, 0, 0, 0, 100, 100, 100, 100, 0, 0, 0, 0, 0, 0, 0, -1, -1]],
+              ea=[eap(3), eap(5), eap(6)], dg=[1, 2, 3])
+    e2 = [3, [5, [[4, 7]]], [6, [[4, 1]]]] if not omit_variant_rows else [3, [6, [[4, 1]]]]
+    if not omit_variant_rows:
+        e2 = [3, [5, [[4, 7]]], [6, [[4, 1]]]]
+    f2 = dict(k='f', n=2, gf=2, t=33, tk=['u'], r=[2, 1, 0, 84], p=[0], e=e2, dg=[4, 5, 6])
+    e3 = [3, 6, er(9, 1000, 94, 400, 99)] + ([5] if not omit_variant_rows else [])
+    ea3 = [eap(9)]
+    f3 = dict(k='f', n=3, gf=3, t=66, tk=['u'], r=[3, 1, 0, 84], p=[0], e=e3, ea=ea3, dg=[7, 8, 9])
+    f4 = dict(k='f', n=4, gf=4, t=99, kf=1, tk=['u'], r=[4, 1, 0, 84], p=[[0, 32000, 38000, 0, 0, 'WalkDown']],
+              e=[er(3, 10, 0, 100, 33), er(5, 1000, 21, 207, 55), er(6, 1000, 94, 301, 66), er(9, 1000, 94, 400, 99)],
+              pa=[[0, 4, 5, 0, 0, 100, 100, 0, 100, 100, 100, 100, 0, 0, 0, 100, 100, 100, 100, 0, 0, 0, 0, 0, 0, 0, -1, -1]],
+              ea=[eap(3), eap(5), eap(6), eap(9)], dg=[10, 11, 12])
+    return [json.dumps(x, separators=(',', ':'), ensure_ascii=False) for x in (hdr, lines[1], f1, f2, f3, f4)]
+
+
+def test_fxkey_reader(tmp_path):
+    """B4：fxkey 录像的非关键帧不含省略名单里的特效（不拿关键帧旧值补），并标 fx_omitted；关键帧完整；顺序/随机访问一致；
+    逐字节 round-trip；replay_run.explain 比较 fxkey 与 full 时忽略被省略的变体。"""
+    p = tmp_path / 'run-fx.jsonl'
+    p.write_text('\n'.join(_fx_lines()) + '\n', encoding='utf-8')
+    run = load_run.Run(p)
+    assert run.obs == 'fxkey' and run.fx_omit == [21]
+    f1, f2, f3, f4 = (run.frame(n) for n in (1, 2, 3, 4))
+    assert f1.fx_omitted is None and f4.fx_omitted is None and run.effects_complete(f1)
+    assert f2.fx_omitted == [21] and f3.fx_omitted == [21] and not run.effects_complete(f2)
+    assert [e['idx'] for e in f1.entities] == [3, 5, 6]
+    assert [e['idx'] for e in f2.entities] == [3, 6] and f2.entities[1]['x'] == 3.01
+    assert [e['idx'] for e in f3.entities] == [3, 6, 9]
+    assert [e['idx'] for e in f4.entities] == [3, 5, 6, 9] and f4.entities[1]['x'] == 2.07
+    assert [run.is_omitted_effect(e) for e in f4.entities] == [False, True, False, False]
+    assert [a['_raw'][0] for a in f3.entity_appearance if a] == [3, 6, 9]
+    seq = list(run.iter_frames())
+    assert [[e['idx'] for e in s.entities] for s in seq] == [[3, 5, 6], [3, 6], [3, 6, 9], [3, 5, 6, 9]]
+    assert [s.fx_omitted for s in seq] == [None, [21], [21], None]
+    res = load_run.roundtrip(p, sample_every=1, verbose=False)
+    assert res['ok'], res
+    q = tmp_path / 'run-full.jsonl'
+    q.write_text('\n'.join(_fx_lines(False)) + '\n', encoding='utf-8')
+    full = load_run.Run(q)
+    assert full.fx_omit is None and full.frame(2).fx_omitted is None and [e['idx'] for e in full.frame(2).entities] == [3, 5, 6]
+    ex = replay_run.explain(f2, full.frame(2), 'full')
+    assert ex.get('fx_omitted_variants_ignored') == [21] and 'effects' not in ex and 'entities_record_only' not in ex
+
+
+def test_obs_env_and_game_env(monkeypatch):
+    """B4：obs_env 生成 IRR_OBS/IRR_FX_OMIT；游戏进程不从外层环境继承 IRR_OBS/IRR_FX_OMIT（只认调用方显式给的）。"""
+    assert rr.obs_env('full') == {} and rr.obs_env(None) == {}
+    assert rr.obs_env('fxkey') == {'IRR_OBS': 'fxkey'}
+    assert rr.obs_env('fxkey', '21,41') == {'IRR_OBS': 'fxkey', 'IRR_FX_OMIT': '21,41'}
+    with pytest.raises(ValueError):
+        rr.obs_env('bogus')
+    captured = {}
+
+    class Boom(Exception):
+        pass
+
+    def fake_popen(cmd, cwd=None, env=None, stdout=None, stderr=None):
+        captured['env'] = env
+        raise Boom()
+    monkeypatch.setenv('IRR_OBS', 'keyframe')
+    monkeypatch.setenv('IRR_FX_OMIT', '1')
+    monkeypatch.setattr(rr.subprocess, 'Popen', fake_popen)
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    copy = rr.GameCopy(d / 'copy')
+    with pytest.raises(Boom):
+        rr.GameProcess(copy, d / 'irr', 'p1', d / 'logs', use_dll=False, save_dir=d / 'save')
+    assert 'IRR_OBS' not in captured['env'] and 'IRR_FX_OMIT' not in captured['env']
+    with pytest.raises(Boom):
+        rr.GameProcess(copy, d / 'irr', 'p2', d / 'logs', use_dll=False, save_dir=d / 'save', extra_env=rr.obs_env('fxkey'))
+    assert captured['env']['IRR_OBS'] == 'fxkey'
+
+
+def test_fx_omit_default_list_documented():
+    """B4：mod 内置的省略名单与 README 列出的名单一致（都是 EffectVariant 编号）。"""
+    import re as _re
+    main = (MOD_DIR / 'main.lua').read_text(encoding='utf-8')
+    m = _re.search(r'local FX_OMIT_DEFAULT = "([0-9,]+)"\s*\.\.\s*"([0-9,]+)"', main)
+    lua_list = sorted(int(x) for x in (m.group(1) + m.group(2)).split(',') if x)
+    readme = (MOD_DIR / 'README.md').read_text(encoding='utf-8')
+    rm = _re.search(r'<!-- fx_omit_default: ([0-9,]+) -->', readme)
+    assert rm, 'README 里要有 <!-- fx_omit_default: ... --> 标记'
+    assert lua_list == sorted(int(x) for x in rm.group(1).split(','))

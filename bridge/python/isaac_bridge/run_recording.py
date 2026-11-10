@@ -15,16 +15,18 @@
     Console::SubmitInput，玩家在控制台提交的每条命令由 mod 写成 ev cmd（src = console，带帧号），回放时在同一帧窗口执行；
   * 启动游戏（--luadebug），自动重试启动失败并计数（注入器失败、进程崩溃、log 洪水、mod 未加载），
     log 洪水检测（只认 mtime 晚于本次启动的 log.txt）；DLL 自己的 rr_mt.<pid>.log 直接写进会话 game/ 目录；
-  * 退出后把每局 jsonl 压成 .zst（zstd-19）并逐字节校验、逐行解析校验；写 session.json 与会话摘要。
+  * 退出后把每局 jsonl 压成 .zst（ARCHIVE_ZSTD）并逐字节校验、逐行解析校验；写 session.json 与会话摘要；校验通过的原始文件
+    默认送进 Windows 回收站（raw_policy = recycle；失败退回 stage = 挪到 _raw_staging）。
 另外提供测试 harness 客户端（文件 IPC、按种子开局、机器人按键），供回归测试与 replay_run.py 使用。
 
-只会结束本模块自己启动的进程（按 pid/句柄）。删除一律不做：原始 jsonl 校验后移到暂存目录由用户处理。
+只会结束本模块自己启动的进程（按 pid/句柄）。永久删除一律不做：原始 jsonl 校验后送回收站或移到暂存目录，由用户处理。
 """
 from __future__ import annotations
 
 import ctypes as C
 import datetime as _dt
 import hashlib
+import io
 import json
 import os
 import platform
@@ -89,6 +91,23 @@ LOG_FLOOD_BYTES = 20 * 1024 * 1024
 FORCED_OPTIONS = {'EnableDebugConsole': '0'}
 # phase10：--allow-console 会话的强制项（不再强制关控制台；控制台命令由 DLL 钩子记录，README §8.7）
 FORCED_OPTIONS_CONSOLE = {}
+# 观测模式（IRR_OBS）：full（默认）/ keyframe（实体行只在关键帧写）/ fxkey（0.5.1：装饰性特效只在关键帧写，README §4.11）
+OBS_MODES = ('full', 'keyframe', 'fxkey')
+
+
+def obs_env(obs, fx_omit=None):
+    """录制/回放进程的观测模式环境变量。obs = 'full' 时返回 {}（mod 默认）；fx_omit = 覆盖 fxkey 的省略名单（逗号分隔的
+    EffectVariant 编号；None = mod 内置名单）。"""
+    if obs in (None, '', 'full'):
+        return {}
+    if obs not in OBS_MODES:
+        raise ValueError(f'观测模式只能是 {OBS_MODES}：{obs!r}')
+    env = {'IRR_OBS': obs}
+    if fx_omit is not None:
+        env['IRR_FX_OMIT'] = str(fx_omit)
+    return env
+# 解压端的窗口上限（0.5.1，phase14 B3）：长距离匹配/大窗口压出的帧需要放宽默认上限（zstd 默认 2^27）
+ZSTD_MAX_WINDOW = 1 << 31
 
 
 # ---------------------------------------------------------------------------------------------- 小工具
@@ -140,26 +159,82 @@ SAVE_COPY_FILES = ('gamestate1.dat', 'gamestate2.dat', 'gamestate3.dat', 'persis
 # 判断 Python 侧快照是否"晚了"时只看游戏在开局/退出时写的文件（options.ini 可能被选项菜单在局中改写）
 LATE_CHECK_PREFIXES = ('gamestate', 'persistentgamedata')
 BLOB_DIR = 'blobs'
+# 0.5.1（phase14 B1）：blob 单独 zstd-19 压缩存成 <sha256>.zst（sha256 仍是原始内容的哈希）。实测 human3 34 局：存档快照原始
+# 4.16 MB，按内容去重 1.55 MB，再逐个 zstd-19 0.19 MB。0.5.0 的未压缩 blob（<sha256>，无后缀）与更早的直接文件布局照常可读。
+BLOB_SUFFIX = '.zst'
+BLOB_LEVEL = 19
+
+
+def _zstd_decompress_all(data):
+    """解压一段完整的 zstd 数据（放宽窗口上限，长距离模式/大窗口的帧也能解）。"""
+    return zstandard.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW).stream_reader(io.BytesIO(data)).read()
+
+
+def put_blob(blobs_dir, src):
+    """按内容去重存储：blobs_dir/<sha256>.zst（zstd-19，同一内容只存一份）。源文件一次读进内存，哈希与压缩都基于这份
+    内容；写临时文件 -> 解压回读校验 sha256 -> 改名入库。已有同内容的 blob（压缩的 <sha>.zst 或 0.5.0 未压缩的 <sha>）就复用。
+    返回 (sha256, blob 文件路径)。"""
+    blobs_dir = Path(blobs_dir)
+    data = Path(src).read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    for cand in (blobs_dir / (sha + BLOB_SUFFIX), blobs_dir / sha):
+        if cand.exists():
+            return sha, cand
+    blobs_dir.mkdir(parents=True, exist_ok=True)
+    dst = blobs_dir / (sha + BLOB_SUFFIX)
+    comp = zstandard.ZstdCompressor(level=BLOB_LEVEL, write_checksum=True, write_content_size=True).compress(data)
+    tmp = blobs_dir / f'{sha}.tmp-{os.getpid()}-{threading.get_ident()}'
+    tmp.write_bytes(comp)
+    back = _zstd_decompress_all(tmp.read_bytes())
+    if hashlib.sha256(back).hexdigest() != sha:   # 压缩/写盘出错：不入库（挪成 .mismatch-*，不删）
+        os.replace(tmp, blobs_dir / f'{sha}.mismatch-{int(time.time() * 1000)}')
+        raise OSError(f'blob 压缩校验失败：{src}')
+    os.replace(tmp, dst)
+    return sha, dst
 
 
 def store_blob(blobs_dir, src, sha=None):
-    """按内容去重存储：blobs_dir/<sha256>（同一内容只存一份）。返回 sha256。"""
-    blobs_dir = Path(blobs_dir)
-    sha = sha or sha256_file(src)
-    dst = blobs_dir / sha
-    if not dst.exists():
-        blobs_dir.mkdir(parents=True, exist_ok=True)
-        tmp = dst.with_suffix('.tmp')
-        shutil.copyfile(src, tmp)
-        if sha256_file(tmp) != sha:   # 拷的同时源文件被改写：不入库
-            os.replace(tmp, blobs_dir / f'{sha}.mismatch-{int(time.time() * 1000)}')
-            raise OSError(f'拷贝时内容变化：{src}')
-        os.replace(tmp, dst)
-    return sha
+    """put_blob 的旧接口：返回 sha256。sha 给了就要求与读到的内容一致（不一致 = 源文件在两次读之间被改写）。"""
+    got, _path = put_blob(blobs_dir, src)
+    if sha and got != sha:
+        raise OSError(f'内容与给定 sha256 不符（读的同时被改写？）：{src}')
+    return got
 
 
-def _blob_ref(dest, blobs_dir, sha):
-    return os.path.relpath(Path(blobs_dir) / sha, Path(dest)).replace('\\', '/')
+def _blob_ref(dest, blob_path):
+    return os.path.relpath(Path(blob_path), Path(dest)).replace('\\', '/')
+
+
+class SnapFile:
+    """快照里的一个文件（snapshot_files 的值）。read_bytes() 总是返回原始内容（压缩 blob 先解压）并按清单的 sha256 校验；
+    copy_to(dst) 把原始内容写到 dst。path = 实际存储的文件（可能是 .zst），compressed = 是否压缩。"""
+
+    def __init__(self, name, path, sha256=None, compressed=False, mtime=None):
+        self.name, self.path, self.sha256, self.compressed = name, Path(path), sha256, compressed
+        self.mtime = mtime   # 原文件的 mtime（清单里有就用；旧的直接文件布局 = 快照文件自己的 mtime，同 shutil.copy2）
+
+    def read_bytes(self):
+        data = self.path.read_bytes()
+        if self.compressed:
+            data = _zstd_decompress_all(data)
+        if self.sha256 and hashlib.sha256(data).hexdigest() != self.sha256:
+            raise OSError(f'快照文件 {self.name}（{self.path}）内容与清单的 sha256 不符')
+        return data
+
+    def copy_to(self, dst):
+        dst = Path(dst)
+        dst.write_bytes(self.read_bytes())
+        if self.mtime:
+            os.utime(dst, (self.mtime, self.mtime))
+        return dst
+
+    def __fspath__(self):   # 只给"未压缩"的情形当路径用（压缩的拿到的是 .zst 文件，调用方应改用 read_bytes/copy_to）
+        if self.compressed:
+            raise TypeError(f'{self.path} 是压缩 blob：用 read_bytes() / copy_to()')
+        return str(self.path)
+
+    def __repr__(self):
+        return f'SnapFile({self.name!r}, {str(self.path)!r}, compressed={self.compressed})'
 
 
 def snapshot_save(dest, save_dir, blobs=None):
@@ -184,8 +259,8 @@ def snapshot_save(dest, save_dir, blobs=None):
             try:
                 st = f.stat()
                 if blobs:
-                    sha = store_blob(blobs, f)
-                    man['files'][f.name] = dict(bytes=st.st_size, mtime=st.st_mtime, sha256=sha, blob=_blob_ref(dest, blobs, sha))
+                    sha, bp = put_blob(blobs, f)
+                    man['files'][f.name] = dict(bytes=st.st_size, mtime=st.st_mtime, sha256=sha, blob=_blob_ref(dest, bp))
                 else:
                     shutil.copy2(f, dest / f.name)
                     man['files'][f.name] = dict(bytes=st.st_size, mtime=st.st_mtime, sha256=sha256_file(dest / f.name))
@@ -198,8 +273,9 @@ def snapshot_save(dest, save_dir, blobs=None):
 
 
 def snapshot_files(snap_dir):
-    """存档快照目录 -> {文件名: 实际文件路径}。新布局（0.5.0：manifest.json 的 files[名].blob 指向 save/blobs/<sha256>）
-    与旧布局（文件直接放在快照目录里）都认；不含 manifest.json、*.dmp、log.txt。"""
+    """存档快照目录 -> {文件名: SnapFile}（read_bytes()/copy_to() 拿原始内容）。三种布局都认：
+    0.5.1 压缩 blob（manifest.json 的 files[名].blob 指向 save/blobs/<sha256>.zst）、0.5.0 未压缩 blob（指向
+    save/blobs/<sha256>）、更早的直接文件布局（文件直接放在快照目录里）；不含 manifest.json、*.dmp、log.txt。"""
     snap_dir = Path(snap_dir)
     man = read_json(snap_dir / 'manifest.json') or {}
     files = man.get('files') or {}
@@ -210,10 +286,14 @@ def snapshot_files(snap_dir):
                 path = (snap_dir / v['blob']).resolve()
                 if not path.exists():
                     raise FileNotFoundError(f'快照 {snap_dir} 的 {name} 指向的 {path} 不存在')
-                out[name] = path
+                out[name] = SnapFile(name, path, v.get('sha256'), compressed=path.name.endswith(BLOB_SUFFIX), mtime=v.get('mtime'))
         return out
-    return {f.name: f for f in sorted(snap_dir.iterdir())
-            if f.is_file() and f.suffix.lower() != '.dmp' and f.name.lower() not in ('log.txt', 'manifest.json')}
+    out = {}
+    for f in sorted(snap_dir.iterdir()):
+        if f.is_file() and f.suffix.lower() != '.dmp' and f.name.lower() not in ('log.txt', 'manifest.json'):
+            v = files.get(f.name)
+            out[f.name] = SnapFile(f.name, f, v.get('sha256') if isinstance(v, dict) else None, mtime=f.stat().st_mtime)
+    return out
 
 
 def snapshot_status(snap_dir):
@@ -455,8 +535,9 @@ class GameProcess:
                    # 0.5.0（P2）：mod 在开局回调里把这些存档文件原样拷到 IRR_DIR
                    IRR_SAVE_DIR=str(self.save_dir).replace('\\', '/'), IRR_SAVE_FILES=','.join(SAVE_COPY_FILES))
         env_keys = ['USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'TEMP', 'TMP', 'IRR_DIR', 'IRR_PROC', 'IRR_SAVE_DIR', 'IRR_SAVE_FILES']
-        # 测试用故障注入只在调用方显式给出时生效（不从外层环境继承，免得回放进程也注入）
-        env.pop('IRR_FAULT', None)
+        # 测试用故障注入、观测模式只在调用方显式给出时生效（不从外层环境继承，免得回放进程也注入/换了观测模式）
+        for k in ('IRR_FAULT', 'IRR_OBS', 'IRR_FX_OMIT'):
+            env.pop(k, None)
         if use_dll:
             env.update(RR_MT_PROFILE=str(prof), RR_MT_LOG_DIR=str(self.log_dir), IRR_MT_DLL=str(copy.dll).replace('\\', '/'))
             env_keys += ['RR_MT_PROFILE', 'RR_MT_LOG_DIR', 'IRR_MT_DLL']
@@ -913,19 +994,35 @@ def truncated_note(game_exit, end_signal=None, flush_every=None):
     return s
 
 
-def compress_and_verify(raw, dst, level=19):
-    """jsonl -> .zst（zstd level 19，带内容校验和），解压回读逐字节比较 sha256，并逐行解析校验。"""
+# 归档压缩配置（0.5.1，phase14 B3：真人长局上的耗时/体积表见 experiments/run-recorder/phase14-space/NOTES.md §B3）。
+# 键 = zstandard.ZstdCompressionParameters.from_level 的参数（level 另取）。解压端（load_run、open_run_lines、这里的回读校验）
+# 一律放宽窗口上限 ZSTD_MAX_WINDOW，旧的单线程 zstd-19 文件照常读。
+ARCHIVE_ZSTD = dict(level=19, threads=-1, job_size=4 << 20, overlap_log=9, enable_ldm=True, window_log=27)
+
+
+def archive_compressor(cfg=None):
+    cfg = dict(cfg or ARCHIVE_ZSTD)
+    level = cfg.pop('level')
+    params = zstandard.ZstdCompressionParameters.from_level(level, write_checksum=True, write_content_size=True, **cfg)
+    return zstandard.ZstdCompressor(compression_params=params)
+
+
+def compress_and_verify(raw, dst, level=None, cfg=None):
+    """jsonl -> .zst（配置 ARCHIVE_ZSTD，带内容校验和与原始长度），解压回读逐字节比较 sha256，并逐行解析校验。
+    level（旧接口）：给了就用单线程的该级别（0.5.0 及以前的行为）。"""
     raw, dst = Path(raw), Path(dst)
+    if cfg is None:
+        cfg = dict(level=level, threads=0) if level is not None else dict(ARCHIVE_ZSTD)
     raw_sha = sha256_file(raw)
-    cctx = zstandard.ZstdCompressor(level=level, write_checksum=True, write_content_size=True)
+    cctx = archive_compressor(cfg)
     tmp = dst.with_suffix(dst.suffix + '.tmp')
     t = time.time()
     with open(raw, 'rb') as fi, open(tmp, 'wb') as fo:
-        cctx.copy_stream(fi, fo)
+        cctx.copy_stream(fi, fo, size=raw.stat().st_size)
     os.replace(tmp, dst)
     secs = time.time() - t
     h = hashlib.sha256()
-    dctx = zstandard.ZstdDecompressor()
+    dctx = zstandard.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW)
     with open(dst, 'rb') as f, dctx.stream_reader(f) as r:
         while True:
             b = r.read(1 << 20)
@@ -936,7 +1033,7 @@ def compress_and_verify(raw, dst, level=19):
         raise RuntimeError(f'压缩校验失败：{dst}')
     st = validate_lines(iter_lines_raw(raw))
     return dict(raw_bytes=raw.stat().st_size, zst_bytes=dst.stat().st_size, raw_sha256=raw_sha, zst_sha256=sha256_file(dst),
-                compress_s=round(secs, 2), level=level, verified=True, validation=st)
+                compress_s=round(secs, 2), level=cfg.get('level'), zstd=cfg, verified=True, validation=st)
 
 
 def open_run_lines(path):
@@ -945,7 +1042,7 @@ def open_run_lines(path):
     if path.suffix == '.zst':
         import io
         f = open(path, 'rb')
-        r = zstandard.ZstdDecompressor().stream_reader(f)
+        r = zstandard.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW).stream_reader(f)
         return io.BufferedReader(r)
     return open(path, 'rb')
 
@@ -957,6 +1054,124 @@ def stage_raw(raw, staging_root, session_name):
     target = d / Path(raw).name
     shutil.move(str(raw), str(target))
     return str(target)
+
+
+# ---------------------------------------------------------------------------------------------- 回收站（0.5.1，phase14 B2）
+# 原始 jsonl 与 mod 的开局存档拷贝在"压缩并逐字节校验通过"之后送进 Windows 回收站（不是永久删除，用户可以还原/自己清空）。
+# SHFileOperationW(FO_DELETE, FOF_ALLOWUNDO)：FOF_ALLOWUNDO = 进回收站；FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI = 不弹窗。
+# 风险：文件超过回收站容量、回收站被设为"直接删除"、或不是本地固定磁盘时，shell 会改成永久删除。所以先检查（盘类型、
+# 注册表 BitBucket 的 NukeOnDelete/MaxCapacity），不满足就不调用、退回 stage；另加 FOF_WANTNUKEWARNING 兜底（真要永久删除时
+# 弹确认框而不是悄悄删）。调用后核对：文件确实不在原处、回收站的项目数增加了。
+FO_DELETE = 3
+FOF_SILENT, FOF_NOCONFIRMATION, FOF_ALLOWUNDO, FOF_NOERRORUI, FOF_WANTNUKEWARNING = 0x4, 0x10, 0x40, 0x400, 0x4000
+
+
+class _SHFILEOPSTRUCTW(C.Structure):
+    _fields_ = [('hwnd', W.HWND), ('wFunc', W.UINT), ('pFrom', W.LPCWSTR), ('pTo', W.LPCWSTR), ('fFlags', W.WORD),
+                ('fAnyOperationsAborted', W.BOOL), ('hNameMappings', C.c_void_p), ('lpszProgressTitle', W.LPCWSTR)]
+
+
+class _SHQUERYRBINFO(C.Structure):
+    _fields_ = [('cbSize', W.DWORD), ('i64Size', C.c_int64), ('i64NumItems', C.c_int64)]
+
+
+def recycle_bin_state(drive_root):
+    """回收站在 drive_root（如 'D:\\\\'）上的 (项目数, 字节数)；查不到返回 None。"""
+    try:
+        info = _SHQUERYRBINFO()
+        info.cbSize = C.sizeof(info)
+        if C.windll.shell32.SHQueryRecycleBinW(C.c_wchar_p(drive_root), C.byref(info)) != 0:
+            return None
+        return int(info.i64NumItems), int(info.i64Size)
+    except Exception:   # noqa: BLE001
+        return None
+
+
+def recycle_bin_policy(drive_root):
+    """drive_root 上回收站的设置：dict(drive_type, nuke_on_delete, max_capacity_mb, volume, source)。只读注册表与卷信息。"""
+    out = dict(drive_type=None, nuke_on_delete=None, max_capacity_mb=None, volume=None, source=None)
+    try:
+        out['drive_type'] = int(k32.GetDriveTypeW(C.c_wchar_p(drive_root)))
+        buf = C.create_unicode_buffer(64)
+        if k32.GetVolumeNameForVolumeMountPointW(C.c_wchar_p(drive_root), buf, 64):
+            m = re.search(r'\{[0-9a-fA-F-]+\}', buf.value)
+            out['volume'] = m.group(0) if m else None
+    except Exception:   # noqa: BLE001
+        pass
+    try:
+        import winreg
+        base = r'Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket'
+        keys = ([base + '\\Volume\\' + out['volume']] if out['volume'] else []) + [base]
+        for kp in keys:
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, kp) as k:
+                    for nm, field in (('NukeOnDelete', 'nuke_on_delete'), ('MaxCapacity', 'max_capacity_mb')):
+                        try:
+                            v, _t = winreg.QueryValueEx(k, nm)
+                            if out[field] is None:
+                                out[field] = int(v)
+                                out['source'] = out['source'] or kp
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+    except Exception:   # noqa: BLE001
+        pass
+    return out
+
+
+def recycle_files(paths):
+    """把 paths（同一个盘上的文件）送进回收站。返回 dict(ok, files, error, bin_before, bin_after, policy)。
+    ok=False 时文件原样留在原处（调用方退回 stage）。"""
+    paths = [Path(p).resolve() for p in paths]
+    res = dict(ok=False, files=[str(p) for p in paths], error=None)
+    if not paths:
+        res['ok'] = True
+        return res
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        res['error'] = f'文件不存在：{missing}'
+        return res
+    drive = paths[0].anchor
+    if any(p.anchor.lower() != drive.lower() for p in paths):
+        res['error'] = '文件不在同一个盘上'
+        return res
+    pol = recycle_bin_policy(drive)
+    res['policy'] = pol
+    total = sum(p.stat().st_size for p in paths)
+    if pol.get('drive_type') != 3:   # DRIVE_FIXED：网络盘/可移动盘没有回收站，shell 会直接删除
+        res['error'] = f'{drive} 不是本地固定磁盘（GetDriveType={pol.get("drive_type")}），没有回收站'
+        return res
+    if pol.get('nuke_on_delete'):
+        res['error'] = f'{drive} 的回收站设置为"不移到回收站，直接删除"（NukeOnDelete=1）'
+        return res
+    if pol.get('max_capacity_mb') is not None and total > pol['max_capacity_mb'] * 1024 * 1024:
+        res['error'] = f'这批文件 {total} B 超过 {drive} 回收站容量 {pol["max_capacity_mb"]} MB（会被永久删除）'
+        return res
+    before = recycle_bin_state(drive)
+    res['bin_before'] = before
+    op = _SHFILEOPSTRUCTW()
+    op.hwnd = None
+    op.wFunc = FO_DELETE
+    op.pFrom = '\0'.join(str(p) for p in paths) + '\0'   # 双 0 结尾（ctypes 再补一个 0）
+    op.pTo = None
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING
+    try:
+        rc = C.windll.shell32.SHFileOperationW(C.byref(op))
+    except Exception as e:   # noqa: BLE001
+        res['error'] = f'SHFileOperationW 调用失败：{e!r}'
+        return res
+    after = recycle_bin_state(drive)
+    res['bin_after'] = after
+    still = [str(p) for p in paths if p.exists()]
+    if rc != 0 or op.fAnyOperationsAborted or still:
+        res['error'] = f'SHFileOperationW 返回 0x{rc:X}，aborted={bool(op.fAnyOperationsAborted)}，仍在原处：{still}'
+        return res
+    if before and after and after[0] < before[0] + 1:
+        # 文件已不在原处但回收站项目数没涨：可能被永久删除了（或回收站同时被清理）。如实记录，不当作失败（文件已无法挪回）
+        res['warning'] = f'回收站项目数 {before[0]} -> {after[0]}，没有按预期增加'
+    res['ok'] = True
+    return res
 
 
 # ---------------------------------------------------------------------------------------------- 会话
@@ -1012,8 +1227,8 @@ class SaveWatcher(threading.Thread):
             if src.stat().st_size != v:
                 man['errors'].append(f'{name}: 大小 {src.stat().st_size} 与 mod 报告的 {v} 不符')
                 continue
-            sha = store_blob(self.blobs, src)
-            man['files'][name] = dict(bytes=v, sha256=sha, blob=_blob_ref(dest, self.blobs, sha), copied_from=src.name)
+            sha, bp = put_blob(self.blobs, src)
+            man['files'][name] = dict(bytes=v, sha256=sha, blob=_blob_ref(dest, bp), copied_from=src.name)
         if man['errors']:
             return man   # 有错误也返回（记进 session.json），调用方据此退回 Python 快照
         dest.mkdir(parents=True, exist_ok=True)
@@ -1151,7 +1366,7 @@ def host_info():
 class Session:
     """一次录制会话（一个 session 目录；其中可以有多次游戏进程启动、多局）。"""
 
-    def __init__(self, name, out_root, copy_root=DEFAULT_COPY, init_save_from=None, raw_policy='stage', harness=None,
+    def __init__(self, name, out_root, copy_root=DEFAULT_COPY, init_save_from=None, raw_policy='recycle', harness=None,
                  enforce_options=True, use_dll=True, extra_env=None, forced_options=None, init_save_exclude=(),
                  affinity=DEFAULT_AFFINITY, allow_console=False):
         self.name = name
@@ -1227,10 +1442,10 @@ class Session:
                         shutil.move(str(f), str(ddir / f.name))
                         displaced.append(f.name)
             copied = []
-            # snapshot_files：0.5.0 的去重布局（manifest 指向 save/blobs/<sha256>）与旧布局都认
+            # snapshot_files：0.5.1 压缩 blob、0.5.0 未压缩 blob 与旧的直接文件布局都认；copy_to 写原始内容（按清单 sha256 校验）
             for name, f in snapshot_files(self.init_save_from).items():
                 if name.lower() not in self.init_save_exclude:
-                    shutil.copy2(f, sd / name)
+                    f.copy_to(sd / name)
                     copied.append(name)
             self.info['init_save_from'] = dict(source=str(self.init_save_from), dest=str(sd), files=copied,
                                                excluded=sorted(self.init_save_exclude), displaced=displaced,
@@ -1436,14 +1651,27 @@ class Session:
                 issues.append('开局存档快照无法判断是否晚了')
             rec['data_ok'] = not issues
             rec['data_issues'] = issues
-            if self.raw_policy == 'stage' and rec.get('verified'):
+            # 原始文件去向（0.5.1，phase14 B2）：只有压缩逐字节校验通过（verified）的局才处理原始文件；没通过的永远原地保留。
+            # mod 的开局存档拷贝只在本局快照取自它（kind = mod，已入库 save/blobs 并校验）时一并处理。
+            savecopies = [sc for sc in sorted(self.irr_dir.glob(f'savecopy-{name}-*')) if snap and snap.get('kind') == 'mod']
+            policy = self.raw_policy if rec.get('verified') else 'keep'
+            if policy == 'recycle':
+                rc = recycle_files([raw] + savecopies)
+                rec['raw_recycle'] = rc
+                if rc['ok']:
+                    rec['raw_recycled'] = True
+                    rec['raw_disposition'] = 'recycled'
+                else:
+                    policy = 'stage'
+                    rec['raw_recycle_fallback'] = f'送回收站失败，退回 stage（挪到 _raw_staging）：{rc.get("error")}'
+            if policy == 'stage':
                 rec['raw_staged_to'] = stage_raw(raw, self.out_root / '_raw_staging', self.name)
-                # mod 的开局存档拷贝已去重入库（save/blobs），原件同样挪到暂存目录（不删）
-                for sc in sorted(self.irr_dir.glob(f'savecopy-{name}-*')):
-                    if snap and snap.get('kind') == 'mod':
-                        stage_raw(sc, self.out_root / '_raw_staging', self.name + '/savecopy')
-            else:
+                for sc in savecopies:
+                    stage_raw(sc, self.out_root / '_raw_staging', self.name + '/savecopy')
+                rec['raw_disposition'] = 'staged'
+            elif policy == 'keep':
                 rec['raw_kept'] = str(raw)
+                rec['raw_disposition'] = 'kept' if rec.get('verified') else 'kept (压缩校验没通过，原始文件保留)'
             self.info['runs'].append(rec)
 
     def summary(self):
@@ -1469,6 +1697,12 @@ class Session:
                     mod_snapshots=sum(1 for r in runs if (r.get('save_snapshot') or {}).get('kind') == 'mod'),
                     degraded_frames=sum(len((r.get('validation') or {}).get('degraded_frames') or []) for r in runs),
                     write_errors=sum(((r.get('validation') or {}).get('end') or {}).get('write_errors') or 0 for r in runs),
+                    # 0.5.1（phase14 B2）：原始文件去向
+                    raw_policy=self.raw_policy,
+                    raw_recycled=sum(1 for r in runs if r.get('raw_disposition') == 'recycled'),
+                    raw_staged=sum(1 for r in runs if r.get('raw_disposition') == 'staged'),
+                    raw_kept=sum(1 for r in runs if str(r.get('raw_disposition') or '').startswith('kept')),
+                    raw_recycle_fallbacks=sum(1 for r in runs if r.get('raw_recycle_fallback')),
                     state=self.info.get('state'), recovered=bool(self.info.get('recovered')),
                     real_documents_galaxy_appeared=(self.info.get('real_documents_watch') or {}).get('appeared_during_session'))
 
@@ -1483,7 +1717,10 @@ class Session:
                  f'会话期间真实 Documents 出现 (Galaxy) 目录：{s.get("real_documents_galaxy_appeared")}',
                  f'数据有问题的局 {s.get("data_issue_runs")}；开局存档快照：mod 拷贝 {s.get("mod_snapshots")} 局，晚了 '
                  f'{s.get("late_snapshots")} 局；退化帧 {s.get("degraded_frames")}；写失败 {s.get("write_errors")}'
-                 + ('；本会话由 --recover 收尾' if s.get('recovered') else ''), '']
+                 + ('；本会话由 --recover 收尾' if s.get('recovered') else ''),
+                 f'原始文件（策略 {s.get("raw_policy")}）：送回收站 {s.get("raw_recycled")} 局，挪到暂存 {s.get("raw_staged")} 局，'
+                 f'原地保留 {s.get("raw_kept")} 局' + (f'；送回收站失败退回暂存 {s.get("raw_recycle_fallbacks")} 局'
+                                                    if s.get('raw_recycle_fallbacks') else ''), '']
         for r in self.info['runs']:
             v = r.get('validation') or {}
             h = v.get('header') or {}
@@ -1574,8 +1811,34 @@ def run_auto_play(sess: Session, seconds=40, restart=True, seed=7, entered=False
     return g.close(wm_close=True)
 
 
+def launcher_alive(pid):
+    """recover.json 里的 launcher_pid 是否还是一个活着的 Python 进程（另一个窗口正在录）。只读：OpenProcess +
+    GetExitCodeProcess + QueryFullProcessImageNameW。映像名不是 python*（pid 被别的程序复用）当作不在。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = W.DWORD()
+        if not k32.GetExitCodeProcess(h, C.byref(code)) or code.value != 259:   # STILL_ACTIVE
+            return False
+        buf = C.create_unicode_buffer(1024)
+        n = W.DWORD(1024)
+        if not k32.QueryFullProcessImageNameW(h, 0, buf, C.byref(n)):
+            return False
+        return Path(buf.value).name.lower().startswith('python')
+    finally:
+        k32.CloseHandle(h)
+
+
 def find_unfinished(out_root, exclude=None):
-    """out_root 下没有收尾的会话目录（recover.json 的 state 不是 finished/recovered）。"""
+    """out_root 下没有收尾的会话目录（recover.json 的 state 不是 finished/recovered）。启动器（launcher_pid）还活着的
+    会话不算（另一个窗口正在录，phase14 A2）。"""
     out = []
     try:
         dirs = sorted(Path(out_root).iterdir())
@@ -1585,7 +1848,7 @@ def find_unfinished(out_root, exclude=None):
         if not d.is_dir() or (exclude and d.resolve() == Path(exclude).resolve()):
             continue
         rec = read_json(d / 'recover.json')
-        if rec and rec.get('state') not in ('finished', 'recovered'):
+        if rec and rec.get('state') not in ('finished', 'recovered') and not launcher_alive(rec.get('launcher_pid')):
             out.append(d)
     return out
 
@@ -1600,10 +1863,27 @@ def recover_session(sess_dir, force=False):
         raise RuntimeError(f'{sess_dir} 没有 recover.json（不是 0.5.0 起的录制会话目录？）')
     if rec.get('state') in ('finished', 'recovered') and not force:
         raise RuntimeError(f'{sess_dir} 已收尾（state={rec.get("state")}）；确需重做加 --force')
+    # phase14 A1：重做只能基于 lua/ 里的原始 run 文件。原始文件已挪走（送回收站/暂存）而 runs/ 里已有归档时，重做会把
+    # session.json 写成 runs=[]（或少了局），毁掉元数据：拒绝
+    raws_now = sorted((sess_dir / 'lua').glob('run-*.jsonl'))
+    archived = sorted((sess_dir / 'runs').glob('run-*.jsonl.zst'))
+    if len(archived) > len(raws_now):
+        raise RuntimeError(f'{sess_dir}：runs/ 里已有 {len(archived)} 个归档，lua/ 里只剩 {len(raws_now)} 个原始 run 文件'
+                           '（原始文件已送回收站/挪到暂存）；重做会丢掉已归档局的记录，拒绝。要重做请先把原始文件放回 lua/')
+    if launcher_alive(rec.get('launcher_pid')):
+        raise RuntimeError(f'记录这个会话的启动器（pid {rec.get("launcher_pid")}）还在运行：它会自己收尾')
     copy = GameCopy(rec['copy'])
     pids = pids_of_exe(copy.exe)
     if pids:
         raise RuntimeError(f'副本 {copy.root} 的游戏进程仍在运行（pid {pids}）：先正常关掉游戏窗口，再运行 --recover')
+    # 覆盖 session.json 之前先备份（任何情况下；phase14 A1）
+    if (sess_dir / 'session.json').exists():
+        bak = sess_dir / f'session.before-recover-{_dt.datetime.now().strftime("%Y%m%d-%H%M%S")}.json'
+        k = 1
+        while bak.exists():
+            k += 1
+            bak = sess_dir / f'session.before-recover-{_dt.datetime.now().strftime("%Y%m%d-%H%M%S")}-{k}.json'
+        shutil.copy2(sess_dir / 'session.json', bak)
     partial = read_json(sess_dir / 'session.json') or {}
     sess = object.__new__(Session)   # 不走 __init__（会话目录已存在）；只设 finish/archive/summary 用到的属性
     sess.name = rec['name']
@@ -1663,11 +1943,15 @@ def main(argv=None):
     ap.add_argument('--out-root', default=str(ISAAC_ROOT / 'experiments/run-recorder/sessions'))
     ap.add_argument('--copy', default=str(DEFAULT_COPY))
     ap.add_argument('--init-save-from', default=None)
-    ap.add_argument('--raw', choices=['stage', 'keep'], default='stage')
+    ap.add_argument('--raw', choices=['recycle', 'stage', 'keep'], default='recycle',
+                    help='校验通过后原始 jsonl 与 mod 存档拷贝的去向：recycle（默认）= 送 Windows 回收站（失败退回 stage）；'
+                         'stage = 挪到 <out-root>/_raw_staging/<会话>；keep = 原地保留')
     ap.add_argument('--auto-seconds', type=float, default=0, help='>0 时由脚本自动按键代替人类（测试用）')
     ap.add_argument('--attempts', type=int, default=6)
     ap.add_argument('--no-dll', action='store_true', help='不注入 rr_mt.dll（第二阶段行为：真实 Documents 存档、无 MT reseed）')
-    ap.add_argument('--obs', choices=['full', 'keyframe'], default='full', help='观测模式（E5；默认 full = 每帧完整观测）')
+    ap.add_argument('--obs', choices=OBS_MODES, default='full',
+                    help='观测模式（E5；默认 full = 每帧完整观测；keyframe = 实体行只在关键帧写；fxkey = 装饰性特效只在关键帧写，'
+                         'README §4.11）')
     ap.add_argument('--allow-console', action='store_true',
                     help='不强制关闭调试控制台；DLL 记录每条控制台命令（ev cmd src=console），回放时同帧执行（README §8.7）')
     ap.add_argument('--affinity', default=DEFAULT_AFFINITY,
@@ -1688,7 +1972,7 @@ def main(argv=None):
     for d in find_unfinished(a.out_root):
         print(f'[录制] 提示：会话 {d} 上次没有收尾（启动器被结束/重启？）。关掉游戏后可运行 '
               f'python -m isaac_bridge.run_recording --recover "{d}"（或 record_run.ps1 -Recover）', flush=True)
-    extra_env = {'IRR_OBS': 'keyframe'} if a.obs == 'keyframe' else None
+    extra_env = obs_env(a.obs) or None
     if a.fault:
         extra_env = dict(extra_env or {}, IRR_FAULT=a.fault)
     sess = Session(a.session, a.out_root, a.copy, a.init_save_from, raw_policy=a.raw, use_dll=not a.no_dll,

@@ -17,6 +17,10 @@ v2（recorder 0.3.0，header.format = 2，schema 字符串仍是 isaac-run-v1）
 "err":2 = 连输入也没取到），其后 mod 强制关键帧并补写一条 "resync":1 的完整 room 行。读取端：Run.degraded_frames /
 input_missing_frames / frame_gaps（帧号缺口）/ suspect_frames（差分基准断了、到下一个关键帧之前解出来的值不可信的帧；0.5.0 的
 文件应为空）；FrameState.degraded / suspect 标记受影响的帧，退化帧的 players/entities/digest 等为 None，绝不静默返回错值。
+0.5.1（phase14 B4）：IRR_OBS=fxkey 录制（header.obs = "fxkey"，header.fx_omit = 省略的 EffectVariant 编号）的非关键帧不含
+省略名单里的特效（type 1000）的实体行/外观行：这些帧的 FrameState.entities 里没有它们（不拿关键帧的旧值补），并且
+FrameState.fx_omitted = 省略名单（关键帧与非 fxkey 录像为 None = 特效完整）。digest 与 full 模式逐位相同。
+压缩：0.5.1 起归档可能用多线程 + 长距离匹配（window_log 27），这里解压时放宽窗口上限；旧文件照常读。
 """
 from __future__ import annotations
 
@@ -33,6 +37,8 @@ SCHEMA = 'isaac-run-v1'
 _N_RE = re.compile(rb'"n":(-?\d+)')
 _K_RE = re.compile(rb'^\{"k":"([a-z_]+)"')
 N_COMMON = 19  # 实体行公共字段数（其后平铺该类型的附加字段）
+ZSTD_MAX_WINDOW = 1 << 31   # 解压窗口上限（长距离匹配/大窗口的帧；zstd 默认只到 2^27）
+EFFECT_TYPE = 1000
 
 
 _HEX_PREFIX = re.compile(rb'0x(-?\d)')
@@ -63,7 +69,7 @@ def read_lines(path, repaired=None, partial=None):
     data = path.read_bytes()
     if path.suffix == '.zst':
         import zstandard
-        data = zstandard.ZstdDecompressor().stream_reader(io.BytesIO(data)).read()
+        data = zstandard.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW).stream_reader(io.BytesIO(data)).read()
     lines = data.split(b'\n')
     if lines and lines[-1] == b'':
         lines.pop()
@@ -252,6 +258,9 @@ class FrameState:
     # （差分基准经过了退化帧/帧号缺口、网格基准断了还没有补写 room 行…）；正常帧为 False / None
     degraded: bool = False
     suspect: list = None
+    # 0.5.1：fxkey 录像的非关键帧 = 本帧没有记录的特效变体（EffectVariant 编号列表；entities 里不含这些特效）；
+    # None = 特效完整（关键帧、full/keyframe 录像）
+    fx_omitted: list = None
 
 
 class Run:
@@ -277,6 +286,9 @@ class Run:
         self._efix = set(self.fixed['entity'])
         # v2：外观字段（header.format >= 2）
         self.format = self.header.get('format', 1)
+        # 观测模式（E5）：full / keyframe / fxkey（0.5.1）；fx_omit = fxkey 在非关键帧省略的特效变体
+        self.obs = self.header.get('obs') or 'full'
+        self.fx_omit = sorted(self.header.get('fx_omit') or []) if self.obs == 'fxkey' else None
         self.app_names = f.get('appearance')                  # None = v1 文件
         self.app_player_extra = f.get('player_appearance_extra') or []
         self._afix = set(f.get('appearance_fixed_x100') or [])
@@ -536,6 +548,8 @@ class Run:
                         mouse=[[m[0]] + [_fix(x) for x in m[1:5]] + [m[5]] for m in o.get('ms', [])],
                         events=events, ticks=ticks, digest=o['dg'], raw=o, player_rows=prows, entity_rows=erows,
                         mt=o.get('mt'))
+        if self.obs == 'fxkey' and not fs.keyframe:
+            fs.fx_omitted = list(self.fx_omit or [])
         if self.app_names:
             fs.pa_rows = parows
             fs.ea_rows = earows
@@ -645,6 +659,14 @@ class Run:
                 yield self._make_state(o, _copy_room(room), level, {p: dict(v) for p, v in items.items()},
                                        prows, erows, events.pop(o['n'], []), ticks, parows, earows,
                                        self._suspect_reasons(o['n'], prows))
+
+    def effects_complete(self, fs):
+        """本帧的特效是否完整（fxkey 录像的非关键帧 = False：省略名单里的特效没有记录）。"""
+        return not fs.fx_omitted
+
+    def is_omitted_effect(self, e):
+        """解码后的实体 e 是否属于 fxkey 的省略名单（这类特效只在关键帧有记录）。非 fxkey 录像恒为 False。"""
+        return bool(self.fx_omit) and e.get('type') == EFFECT_TYPE and e.get('variant') in self.fx_omit
 
     def _suspect_reasons(self, n, prows):
         out = []
@@ -862,6 +884,8 @@ def main(argv=None):
         print(f'{run.path.name}: {run.frames} 帧，第 {n} 帧 gf={fs.gf} 房间 {fs.room_frame}')
         print(f'  玩家0 位置=({p.get("x")}, {p.get("y")}) 心={p.get("hearts")} 道具数={p.get("collectibles")}')
         print(f'  实体 {len(fs.entities) if fs.entities is not None else "（本帧未记录：keyframe 模式）"} 个；MT {fs.mt}；网格 {len((fs.room or {}).get("grid", {}))} 格；门 {len((fs.room or {}).get("doors", {}))}')
+        if fs.fx_omitted:
+            print(f'  （fxkey 录像的非关键帧：EffectVariant {fs.fx_omitted} 的特效本帧没有记录，实体列表里不含它们）')
         print(f'  本帧 tick: {[t.kind for t in fs.ticks]}；此前共 {len(fs.inputs_before)} 个 tick')
         print(f'  道具 {fs.items}；事件 {[e.get("ev") or e.get("k") for e in fs.events]}')
     return 0

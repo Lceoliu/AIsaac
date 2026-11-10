@@ -7,7 +7,7 @@
 -- 每局一个文件 run-<proc>-<NNNN>.jsonl：MC_POST_GAME_STARTED 开、MC_PRE_GAME_EXIT / 死亡 / 下一局开始时关。
 -- 格式见 README.md。
 local mod = RegisterMod("Isaac Run Recorder", 1)
-local VERSION = "0.5.0"
+local VERSION = "0.5.1"
 local SCHEMA = "isaac-run-v1"
 local game = Game()
 local concat = table.concat
@@ -49,7 +49,27 @@ local PROC = getenv("IRR_PROC") or tostring(os.time())
 local HUD = getenv("IRR_HUD") ~= "0"
 -- E5：观测模式。full（默认）= 每帧完整观测；keyframe = 实体行只在关键帧写，其余帧只写 mt/玩家行/输入/生成种子/
 -- 房间头/网格与门的变化/digest（实体状态由回放重建）
-local OBS = (getenv("IRR_OBS") == "keyframe") and "keyframe" or "full"
+-- 0.5.1（phase14 B4）：fxkey = 省略名单里的 type 1000 特效（环境装饰：虫子、余烬、水滴、各种 poof/粒子…）只在关键帧写
+-- 实体行与外观行，其余实体与名单外的特效每帧照写；digest 三层与 full 逐位相同（仍覆盖全部特效）。名单见 FX_OMIT_DEFAULT，
+-- IRR_FX_OMIT（逗号分隔的 EffectVariant 编号；"none" = 空名单）覆盖。README §4.11
+local OBS_ENV = getenv("IRR_OBS")
+local OBS = (OBS_ENV == "keyframe" or OBS_ENV == "fxkey") and OBS_ENV or "full"
+-- 依据：phase14-space/NOTES.md §B4（scripts_rep/enums.lua 的 EffectVariant 名字 + 真人录像里各变体的字节占比/生成者）
+local FX_OMIT_DEFAULT = "2,3,4,5,7,11,12,13,14,15,16,17,18,21,27,33,35,38,41,43,50,58,62,63,64,66,68,69,70,75,77,79,80,85,86,"
+	.. "87,88,95,98,99,121,130,131,132,133,135,138,140,145"
+local FX_OMIT, FX_OMIT_LIST = {}, {}
+if OBS == "fxkey" then
+	local spec = getenv("IRR_FX_OMIT")
+	if spec == nil or spec == "" then spec = FX_OMIT_DEFAULT end
+	if spec ~= "none" then
+		for num in spec:gmatch("%d+") do
+			local v = tonumber(num)
+			if not FX_OMIT[v] then FX_OMIT[v] = true; FX_OMIT_LIST[#FX_OMIT_LIST + 1] = v end
+		end
+	end
+	table.sort(FX_OMIT_LIST)
+	ST.fx_omit = FX_OMIT
+end
 -- E3/E4/E7：全局 MT reseed 与每帧 MT 校验（需要注入的 rr_mt.dll；没有就 available=false，照常录制）
 local MT = load_module("mt")
 pcall(MT.init, getenv, ST.hash)
@@ -334,7 +354,7 @@ local function open_run(continued, mt_header)
 	S.prespawn = {}
 	line(concat({'{"k":"header","schema":"', SCHEMA, '","recorder":"', VERSION, '","mode":', ST.jstr(is_replay and "replay" or "record"),
 		',"run":', ST.jstr(name), ',"proc":', ST.jstr(PROC), ',"run_index":', S.runs,
-		',"format":', ST.FORMAT, ',"continued":', tostring(continued == true), ',"obs":', ST.jstr(OBS), ',"mt":', ST.jval(mt_header or MT.header_base()),
+		',"format":', ST.FORMAT, ',"continued":', tostring(continued == true), ',"obs":', ST.jstr(OBS), ',"fx_omit":', OBS == "fxkey" and ST.jval(FX_OMIT_LIST) or "null", ',"mt":', ST.jval(mt_header or MT.header_base()),
 		',"gf":', game:GetFrameCount(), ',"t":', Isaac.GetTime(),
 		',"ifc":', Isaac.GetFrameCount(), ',"os_time":', os.time(), ',"os_date":', ST.jstr(os.date("!%Y-%m-%dT%H:%M:%SZ")),
 		',"meta":', ST.jval(meta),
@@ -456,7 +476,7 @@ local function build_frame(n, gf)
 	R.building = n
 	local ok, err = pcall(function()
 		ST.refresh_players()
-		ST.frame_parts(n, obs, kf, OBS == "keyframe" and not kf)
+		ST.frame_parts(n, obs, kf, OBS == "keyframe" and not kf, nil, OBS == "fxkey" and not kf)
 		il = ST.items_lines(n, false, kf)
 	end)
 	R.building = nil
