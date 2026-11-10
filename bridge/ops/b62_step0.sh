@@ -54,10 +54,11 @@ for S in "$@"; do
     echo "$(date '+%F %T') T tests rc=$rc $(tail -1 $R/tests-b62-t.log)" >> $LOG
     if [ $rc != 0 ]; then give $S; echo "$(date '+%F %T') stage T failed: later stages not run" >> $LOG; exit 1; fi
     ;;
-  O|OC)   # (op count by calling frame, C packing pipelined; OC: Inductor cpp_wrapper for the learner's graphs)
+  O|OL|OC)   # (op count by calling frame, C packing pipelined; OL: lean checkpoint; OC: Inductor cpp_wrapper)
     cd $OPS
     W=0; [ $S = OC ] && W=1
-    ISAAC_INDUCTOR_CPP_WRAPPER=$W OMP_NUM_THREADS=1 timeout 840 $PY b44_learner_bench.py       $R/b48-dump/learner_inputs.pt --mode packed --reps 2 --variants n1p1b0 --pipeline --opcount       --json $R/b62-opcount-$S.json > $R/b62-opcount-$S.log 2>&1
+    LN=0; [ $S = OL ] && LN=1
+    ISAAC_LEARN_CKPT_LEAN=$LN ISAAC_INDUCTOR_CPP_WRAPPER=$W OMP_NUM_THREADS=1 timeout 840 $PY b44_learner_bench.py       $R/b48-dump/learner_inputs.pt --mode packed --reps 2 --variants n1p1b0 --pipeline --opcount       --json $R/b62-opcount-$S.json > $R/b62-opcount-$S.log 2>&1
     echo "$(date '+%F %T') $S opcount rc=$?" >> $LOG
     ;;
   H)   # (host preparation by function: C packing, serial preparation, cProfile of the last rep)
