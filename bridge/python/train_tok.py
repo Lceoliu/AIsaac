@@ -5099,14 +5099,18 @@ def main(argv=None, child=None, actor=None):
                     prof_['control'] += time.perf_counter() - t_c
                     return
                 tb_ = time.perf_counter()
+                nv.push('c.unpack')   # (d1 report: c.record by part)
                 idx_r = rec['workers'].numpy()
                 go_r = rec['go'].numpy().astype(bool)
                 rows_r = bdrv.record_rows(rec, ROW)
+                nv.pop()
                 if priv_pending is not None:
                     priv_pending[idx_r] = rec['priv'].numpy().view(PRIV_DTYPE)
                 lanes.observe_rows(idx_r, rows_r)
                 if native_cons:   # B58a+b: the arithmetic and the store were done by the driver; the episode events here
+                    nv.push('c.events')
                     _native_events(book, rows_r, idx_r, rec['snap'].numpy())
+                    nv.pop()
                     fz_ = rows_r['first'] != 0; dn_ = rows_r['done'] != 0
                     pending[idx_r[dn_ & (rows_r['done'] != DONE_BRANCH)]] = 0; pending[idx_r[fz_ & go_r]] = 0
                 else:
@@ -5207,7 +5211,9 @@ def main(argv=None, child=None, actor=None):
                         prof_['weights'] += time.perf_counter() - t_w
                         cpp_driver.resume()
                     ta_ = time.perf_counter()
+                    nv.push('c.next')
                     rec_ = cpp_driver.next_record(0.002)
+                    nv.pop()
                     prof_['poll'] += time.perf_counter() - ta_
                     if rec_ is not None:
                         nv.push('c.record')
