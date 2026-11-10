@@ -5293,7 +5293,10 @@ def main(argv=None, child=None, actor=None):
                 cpp_driver.pause(); drain_driver(prof_)
                 if batch_on:   # (B58e: the events still waiting, before the hand-off reads book.finished; the counters)
                     consume_events(*cpp_driver.take_events(), prof_)
-                    bdrv.batch_prof(bc0_, cpp_driver.batch_counters(), prof_)
+                    bc1_ = cpp_driver.batch_counters()
+                    bdrv.batch_prof(bc0_, bc1_, prof_)
+                    lane_stat['b58e_batches'] = bc1_['batches']-bc0_['batches']   # (kind 8 records + the take at the end)
+                    lane_stat['b58e_ev_rows'] = bc1_['ev_rows']-bc0_['ev_rows']
                 nv.pop()
                 drv_paused_at[0] = time.perf_counter()
                 # B54 counters of this collect: the driver's paused seconds (the hand-off's pause before this collect's

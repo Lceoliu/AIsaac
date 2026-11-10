@@ -82,6 +82,10 @@ def main():
         if gtid != learner_tid:
             tot_other[0] += h; tot_other[1] += w
     print(f'  {"all but the learner":28s} {tot_other[0]:8.2f} {tot_other[1]:8.2f} {tot_other[0]/n_cyc:9.2f} {tot_other[1]/n_cyc:9.2f}')
+    # (B58e: the main thread's entries into Python = its GIL acquisitions: Holding GIL intervals, per cycle)
+    n_hold, = c.execute("select count(*) from NVTX_EVENTS where globalTid = ? and textId = ? and end is not null and start >= ? "
+                        "and end <= ?", (main_tid, gil.get('Holding GIL', -1), lo, hi)).fetchone()
+    print(f'  main thread GIL acquisitions (Python entries): {n_hold} in the window, {n_hold/n_cyc:.0f} per cycle')
 
     # ---- 2. learner segments by the actor's window
     waits = ranges(main_tid, 'h.wait_learner')

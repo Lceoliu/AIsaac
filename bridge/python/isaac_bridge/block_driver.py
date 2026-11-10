@@ -96,7 +96,7 @@ DRV_FIELDS = ('drv_pause_s', 'drv_pauses', 'drv_lane_jobs', 'drv_lane_rows', 'dr
               'drv_lane_deferred_requests', 'drv_lane_orphan_requests', 'drv_steps', 'drv_sync_s', 'drv_pages_s', 'drv_host_s',
               'drv_cap_holds', 'drv_poll_s', 'drv_prep_s', 'drv_reply_s', 'drv_cons_s', 'drv_push_s', 'drv_mlane_s',
               'drv_hold_s', 'drv_loop_s', 'drv_polls', 'drv_idle_polls', 'drv_lo_cur_rows', 'drv_lo_old_rows', 'drv_putback_rows',
-              'drv_enq_in_step', 'drv_enq_outside')
+              'drv_enq_in_step', 'drv_enq_outside', 'b58e_batches', 'b58e_ev_rows')
 # (B58 step 0) the driver thread's time by phase (abp_actor.cpp: t_*_s); pages_s leaves the consumer out since step 0
 DRV_PHASES = ('poll', 'prep', 'sync', 'reply', 'pages', 'cons', 'push', 'mlane', 'lane', 'hold', 'pause')
 
