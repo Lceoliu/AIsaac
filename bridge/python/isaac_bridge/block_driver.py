@@ -427,6 +427,9 @@ def attach_lanes(d, lanes, sampler, stream):
                     pass
         sampler._lanes.pop(fd, None)
     gens = range(len(lanes.generations.slots))
+    missing = [g for g in gens if g not in lanes.actors]
+    if missing:   # (on_publish must never pause the driver from inside a record: see ActorDriver.pause)
+        raise RuntimeError(f'native lanes: generations {missing} have no lane actor (ISAAC_BLOCK_LANE_PRECAPTURE=1)')
     owners = [int(lanes.actors[g].step_graph.owner) for g in gens]
     bases = [int(lanes.actors[g].base) for g in gens]
     d.lanes_configure(cfg, sh, fds, int(stream.stream_id), owners, bases)
@@ -493,6 +496,21 @@ def batch_wait(d, on_events, on_record, timeout=0.5):
             continue
         on_record(rec)
         short = True
+
+
+def pause_serving(d, consume):
+    """The driver paused between steps, its records consumed meanwhile (consume(rec)). The driver thread can be blocked
+    on Python: d1's lane service waits for the answer to a lane record (kind 1 / 5) that sits in the queue this caller
+    consumes, so a plain pause() cannot end there (ActorDriver.pause raises in that state). Returns when the driver is
+    paused (or stopped / failed: the caller's drain raises the error record). The records consumed here are the ones a
+    drain after pause() would have consumed, in the same order."""
+    d.request_pause()
+    while not d.is_paused():
+        if not d.running or d.last_error():
+            return
+        rec = d.next_record(0.002)
+        if rec is not None:
+            consume(rec)
 
 
 def event_chunks(ws):

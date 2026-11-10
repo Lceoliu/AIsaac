@@ -5242,7 +5242,7 @@ def main(argv=None, child=None, actor=None):
                 rc_ = lambda r_: consume_record(r_, prof_)
                 while batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
                     if busy and fresh.is_set():
-                        cpp_driver.pause(); drain_driver(prof_)
+                        bdrv.pause_serving(cpp_driver, rc_); drain_driver(prof_)
                         lanes.quiesce()
                         t_w = time.perf_counter()
                         nv.push('actor.weights')
@@ -5261,7 +5261,7 @@ def main(argv=None, child=None, actor=None):
                         break
                 while not batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
                     if busy and fresh.is_set():
-                        cpp_driver.pause(); drain_driver(prof_)
+                        bdrv.pause_serving(cpp_driver, lambda r_: consume_record(r_, prof_)); drain_driver(prof_)
                         lanes.quiesce()
                         t_w = time.perf_counter()
                         nv.push('actor.weights')
@@ -5286,7 +5286,7 @@ def main(argv=None, child=None, actor=None):
                         drain_driver(prof_)   # (the queued records first: their CF captures make the points branches begin at)
                         _lane_tick(prof_)
                     elif sampler.poll_lanes() or lanes.in_flight:   # (B52: lane rounds on the shared arena: the driver paused)
-                        cpp_driver.pause(); drain_driver(prof_)
+                        bdrv.pause_serving(cpp_driver, lambda r_: consume_record(r_, prof_)); drain_driver(prof_)
                         _lane_tick(prof_)
                         cpp_driver.resume()
                     if rec_ is None and cpp_driver.is_paused() and cpp_driver.queue_size() == 0:
@@ -5295,7 +5295,7 @@ def main(argv=None, child=None, actor=None):
                     cpp_driver.set_collect_target(-1)
                 c1_ = cpp_driver.counters()
                 nv.push('h.pause_drain')
-                cpp_driver.pause(); drain_driver(prof_)
+                bdrv.pause_serving(cpp_driver, lambda r_: consume_record(r_, prof_)); drain_driver(prof_)
                 if batch_on:   # (B58e: the events still waiting, before the hand-off reads book.finished; the counters)
                     consume_events(*cpp_driver.take_events(), prof_)
                     bc1_ = cpp_driver.batch_counters()

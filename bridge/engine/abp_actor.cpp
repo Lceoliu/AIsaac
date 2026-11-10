@@ -1015,12 +1015,18 @@ struct ActorDriver {
     n_l_restores++; t_l_restore = t_l_restore+(now()-t0);
   }
   // wait for Python's answer to a lane record (kind 1: captured; 5: stepped)
+  // (d1: the driver thread waits here; d2: the lane thread). Exits: Python's answer, lanes_stop, and on the driver
+  // thread stop() (stop_req: else stop() joined a thread that waited for a record nobody would consume any more)
+  std::atomic<bool> l_wait_drv{false};   // (the waiter is the driver thread: pause() cannot wait for it, see pause())
   void lane_wait_python(std::shared_ptr<Record> r) {
+    bool drv = std::this_thread::get_id() == drv_tid;
+    l_wait_drv = drv;
     l_wait = 1;
     push_record(r);
     std::unique_lock<std::mutex> lk(lcmu);
-    while (l_wait.load() && !lstop) lccv.wait_for(lk, std::chrono::milliseconds(2));
+    while (l_wait.load() && !lstop && !(drv && stop_req)) lccv.wait_for(lk, std::chrono::milliseconds(2));
   }
+  bool lane_wait_quit() { return lstop || stop_req; }
   void lane_job_resume() { std::lock_guard<std::mutex> g(lcmu); l_wait = 0; lccv.notify_all(); }
   // (kind 5) Python stepped the job on its lane actor: the rows' outputs and pages
   void lane_python_done(at::Tensor out, at::Tensor step_before, at::Tensor first, at::Tensor complete, at::Tensor dec, at::Tensor kvs,
@@ -1081,7 +1087,7 @@ struct ActorDriver {
         { std::lock_guard<std::mutex> lg(lcmu); l_py_done = false; }
         n_l_python++;
         lane_wait_python(r);
-        if (lstop) return;
+        if (lane_wait_quit()) return;
         abpc::LaneJobOut o;
         { std::lock_guard<std::mutex> lg(lcmu); o = l_py_out; }
         lc.job_done(job, o);
@@ -1089,7 +1095,7 @@ struct ActorDriver {
       }
       std::vector<i64> key{jb.owner, cap, wb, we, wn, wsl};
       GraphEntry *e = find_graph(key);
-      if (!e) { n_l_captures++; lane_wait_python(rec(1)); if (lstop) return; continue; }
+      if (!e) { n_l_captures++; lane_wait_python(rec(1)); if (lane_wait_quit()) return; continue; }
       std::vector<i64> steps_before(k); std::vector<uint8_t> complete(k), first(k);
       std::vector<i64> to_reset;
       for (i64 j = 0; j < k; j++) {
@@ -1353,12 +1359,21 @@ struct ActorDriver {
     running = false;
   }
   // pause: the driver finishes its current step and waits; resume: continues (a pending capture-needed batch is retried)
+  // pause() returns when the driver is paused between steps (or stopped / failed). The driver thread can also be
+  // blocked on Python: d1's lane service waits in lane_wait_python for Python's answer to a lane record (kind 1: a
+  // lane graph to capture; kind 5: a job Python steps). That record is in the queue the caller itself consumes, so
+  // waiting here would never end: pause() raises instead, and callers that may meet a waiting lane record pause with
+  // block_driver.pause_serving (request_pause, then the records consumed until the driver is paused).
   void pause() {
     if (!running) return;
     pause_req = true;
     std::unique_lock<std::mutex> lk(cmu);
-    while (!paused && running && error.empty()) ccv.wait_for(lk, std::chrono::milliseconds(5));
+    while (!paused && running && error.empty() && !(l_wait.load() && l_wait_drv.load())) ccv.wait_for(lk, std::chrono::milliseconds(5));
+    if (!paused && running && error.empty() && l_wait.load() && l_wait_drv.load())
+      throw std::runtime_error("pause(): the driver thread waits for Python's answer to a lane record still in the queue "
+                               "(consume it while pausing: block_driver.pause_serving)");
   }
+  void request_pause() { if (running) pause_req = true; }
   void resume() {
     pause_req = false;
     std::lock_guard<std::mutex> g(cmu); ccv.notify_all();
@@ -2037,7 +2052,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("register_graph", &ActorDriver::register_graph).def("has_graph", &ActorDriver::has_graph).def("n_graphs", &ActorDriver::n_graphs)
       .def("run_graph", &ActorDriver::run_graph)
       .def("start", &ActorDriver::start).def("stop", &ActorDriver::stop).def("pause", &ActorDriver::pause, py::call_guard<py::gil_scoped_release>())
-      .def("resume", &ActorDriver::resume).def("is_paused", &ActorDriver::is_paused).def("last_error", &ActorDriver::last_error)
+      .def("request_pause", &ActorDriver::request_pause).def("resume", &ActorDriver::resume).def("is_paused", &ActorDriver::is_paused).def("last_error", &ActorDriver::last_error)
       .def("next_record", &ActorDriver::next_record).def("queue_size", &ActorDriver::queue_size).def("counters", &ActorDriver::counters)
       .def("drop_pending_batch", &ActorDriver::drop_pending_batch)
       .def("submit_lanes", &ActorDriver::submit_lanes).def("lane_queue_size", &ActorDriver::lane_queue_size)

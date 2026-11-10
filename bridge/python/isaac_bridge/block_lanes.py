@@ -501,6 +501,11 @@ class BlockLaneService(LaneService):
             torch.cuda.current_stream().synchronize()   # (B58d: the weights in place before the lane stream can use the slot)
             nat.pt_published(slot,version)
         if slot not in self.actors and hasattr(self.main_actor,'lane_actor'):
+            # (a lane actor made here pauses the driver from inside a record's handling; with the native lane service the
+            # driver could be waiting for a lane record behind this one: attach_lanes requires every generation's lane
+            # actor made at start-up, so this branch is the B54 Python lane service's only)
+            if getattr(self,'native_lanes',False):
+                raise RuntimeError('native lanes: generation %d has no lane actor (precapture_lane_generations at start-up)' % slot)
             self.driver.pause()
             try:
                 self.actors[slot]=self.main_actor.lane_actor(self.generations.slots[slot],len(self.s.lane_io),generation=slot)
@@ -708,7 +713,8 @@ class BlockLaneService(LaneService):
         if self.driver is None:
             return super().quiesce()
         if self.lanes_only:   # (B54: back from the learner wait: the driver paused, its lane records consumed)
-            self.driver.pause()
+            from .block_driver import pause_serving
+            pause_serving(self.driver, lambda rec: self.driver_record(rec, resume=False))
             while True:
                 rec=self.driver.next_record(0.0)
                 if rec is None:
