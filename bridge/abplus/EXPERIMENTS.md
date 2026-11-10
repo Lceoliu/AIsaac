@@ -10671,6 +10671,68 @@ B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都�
 - 这 5 个 collect 是 u3 到 u7，还没到稳态。每作业行数在各轮相差一倍（3.8 到 8.0），所以“M1 作业数降约 40%”只是从行占比推的估计。M1 的计时运行直接记作业级计数。
 - 裁决：批准 M1（当前版本的 lane 作业并入下一个主批，在 driver 线程上），排在 B58e 之后。M2 和 T 等 M1 的计时结果再定，lane 线程保持默认关闭。
 
+### B58e 主线程不再逐步进 Python：事件分批、阻塞等待、计数在 C++（2026-11-11，部分完成：4090 到期，计时没跑完）
+
+#### 实验目的
+
+d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms 轮询一次）。主线程 GIL 持有 1.41 s / 周期。目标：进 Python ≤ 500 次 / 周期，主线程 GIL 持有 ≤ 0.5 s / 周期（交接的 0.26 s 另列），CF 不变差。
+
+#### 实验方法
+
+- **代码**（abp_actor.cpp 的 `set_batch` 等，train_tok 的 `batch_on` 分支）：
+  - driver 自己累计 progress.csv 用的每步计数（polls / calls / rows / latency / act / busy）。列名和口径不变。
+  - 首行和结束行（含 consumer 的每行 snapshot）攒到 256 行，推一个 kind 8 批。collect 结束时 `take_events` 取走剩余。
+  - rollout 满时 driver 推一次 kind 7。learner 发布权重后 `wake()` 推一个 kind 9。
+  - 主线程用 `block_driver.batch_wait` 阻塞等待，0.5 s 存活超时：driver 停止或出错就抛错。
+  - `ISAAC_BLOCK_CPP_BATCH=0` 回到每步一条记录的路径。
+  - 新列 b58e_batches / b58e_ev_rows。
+- **测试中发现并修掉的问题**：
+  - 一个事件批跨多步，同一 worker 下一局的首行会先于上一局的结束行处理，build0 取到下一局的值。现在按块处理（同一 worker 在一块里只出现一次）。
+  - driver 出错后线程已结束，stop() 不 join，进程退出时中止。现在照样 join。
+- **另修**：线程模式下 progress.csv 的 driver / lane 列读的是共享的 lane_stat，可能错一个 collect。见上一节“合并探测”。
+- **测试 test_b58e_batch**：
+  - 单 worker：批量和逐记录两条路径的事件行、snapshot、计数、finished 摘要、rollout 逐字节一致。
+  - 三 worker：各 worker 的事件顺序正确；kind 7 只发一次；摘要与逐记录顺序一致。
+  - driver 出错、driver 被停止、wake 三种情况都在 1 s 内结束等待。
+- **候选**：candidate-b58e = 890f4a0（树内容）。
+
+#### 实验结果
+
+- **测试**：新测试 5 过；驱动和 lane 测试 29 过 3 跳过（entry 测试在门外跳过）。
+- **全量门**（BATCH 默认开）：entry 3 过，full 257 过 3 跳过，A8 8/8。
+- **nsys**（prof-e-m，6 轮，取 3 个完整周期）：
+
+| 每周期 | B58e | d1（prof-d1-m） |
+|---|---:|---:|
+| 主线程 GIL 持有 / 等待（s） | 0.18 / 0.03 | 1.41 / 1.26 |
+| learner GIL 等待（s） | 0.55 | 1.16 |
+| 主线程顶层进入：c.wait（d1：c.next）次数 | 36（每次约 0.5 s） | 8,310 |
+| c.record / c.events 次数 | 0 / 1 | 2,432 / 2,432 |
+
+- **“进 Python 次数”的两个口径**：
+  - 按顶层进入：每周期约 50 次。包括 c.wait 36 次、等待中处理的记录约 9 段 Python、collect 结束取事件 1 次，以及交接几步。
+  - 按 python-gil 的 Holding GIL 区间数：每周期 8,800 次。每个 torch 运算、每个释放 GIL 的扩展调用都会把一段 Python 切成很多次获取：
+    - 交接段：h.gc 5,750 次，h.job 1,640 次（归 B59）；
+    - collect 内约 1,330 次。等待里的部分是每周期约 9 段，最大一段 737 次获取、11 ms，很可能是 on_publish 往代槽拷权重。
+  - 按哪个口径验收待定。
+- **nsys 下 isaac 进程多三倍**：是僵尸进程。采样：isaac 3,475 个，其中僵尸 3,353 个，3,347 个是 nsys-launcher 的子进程。退出的游戏进程被挂到 nsys-launcher（subreaper）下面，它不回收；计时运行里由 init 回收。
+- **计时（24 轮，E：BATCH=1，A：BATCH=0）**：没跑完。
+  - E 臂 03:11 开始；4090 到期，链在 E 臂运行中取消。
+  - A 臂和汇总都没跑。
+  - E 臂的进程采样在开头约 40 s 后中断：取消时一并杀掉了采样子进程。
+- **验收**：GIL 持有达标；进入次数按顶层口径达标。CF 不变差和 ×实时没有测，B58e 没有完成验收。
+
+#### 之后的代码（只在本地，未在 4090 上编译运行）
+
+- **d2 M1**（075a21d 起）：
+  - 当前版本的 lane 作业在 driver 线程的合并队列里等下一个主批；组批时重判版本；被拒、换权重、driver 空转的作业在同一个 pass 里跑 lane-only；等待期间钉住代槽；M1 时 lane GPU 工作都在主流上。
+  - 新计数：合并作业和行数、lane-only 按原因分、合并等待；产能量 lt_worker_s 和 pt_live_mean / max。
+  - 测试 test_b58f_m1。设计说明在共享笔记 cpp-actor-m1-design.md。
+- **driver 阻塞等待**（ba4516d，A1 的发现）：
+  - d1 下 driver 线程在 lane_wait_python 等一条主线程还没读的 lane 记录时，主线程调 pause() 会永远等，stop() 会 join 一个永远在等的线程。
+  - 修法：pause() 在这种状态下报错；train_tok 四处暂停和 quiesce 改用 `pause_serving`（先请求暂停，再边消费记录边等）；lane 等待认 stop()。
+  - 测试 test_b58g_pause。
+
 ### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
 
 #### 实验目的
