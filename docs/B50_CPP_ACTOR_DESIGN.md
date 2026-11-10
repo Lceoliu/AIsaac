@@ -161,3 +161,92 @@ update 侧：learner 每 update 4.4–5.2 s 的 GIL 等待随 actor 离开 GIL �
   而不是 Episodes.arrive / EpisodeLog.push 下沉（消费者 GIL 等待已只有 2 s/collect）；按 B52 数字估 collect ≈ 18–19 s。
 - **learner 长 kernel（条件 6）**：B48 dump 固定输入重放（主线程 torch profiler）没有 ≥ 10 ms 的计算 kernel（最长 5.4 ms），≥ 10 ms 的只有
   15 次 packed 输入的 HtoD 上传（10–16 ms，228 ms/update）。第 1 节“长尾来自 learner 长 kernel”的解释需要修正为“排队 / 拷贝引擎”，待 CUDA 追踪确认。
+
+## 9. 阶段 3（B58 / B59）设计草案（2026-11-10，B57 数字回填前的版本）
+
+本节先按代码写结构和等价条件，B57 的周期预算表出来后回填第 9.0 节的数字，再交父会话审。分工照 A1 的 B60：`block_learner.py` 与 train_tok 的 `learner_loop` 不动；采集循环、消费者、交接、`abp_actor.cpp` 在这条线上改。
+
+### 9.0 起点（B57 周期预算，prof-b57m 5 个周期 + prof-b54-cpp 中位）
+
+- **周期**：max(collect 13.4, update 21.4) s，瓶颈是 learner，actor 每周期等 8.1–8.2 s。
+- **GIL（每周期）**：主线程持有 7.35 s、等待 3.85 s；learner 持有 2.36 s、等待 3.82 s；pt_autograd 持有 1.41 s、等待 2.57 s；其它约 60 个 Python 线程合计持有约 1.1 s；driver 为 0。
+- **争用损失**：learner 各段在 actor 采集时比 actor 等待时慢——PPO 前向 / 反向 1.88 倍，forward_packed 1.90 倍，host_decode 5.8 倍，opt 不变；合计每周期约 7.4 s。host_decode 是纯主机工作，所以争用主要是 GIL，GPU 优先级（prio）对此无效。
+- **消费者热点**（cProfile 一个 collect）：Episodes.arrive 1.33 s，store 1.10 s（其中 compact_rows 1.37 s 累计），run_driver_collect 循环 2.64 s，drain_driver 1.0 s，tok_obs append 0.71 s，_service_control 0.57 s（每次 tick 都跑）。
+- **交接**：driver 每周期暂停约 0.27 s（pause / drain 8 ms、取权重 9 ms、job 47 ms、GC 214 ms）；wait_learner 期间 driver 只跑 lane，不算暂停。
+- **T\***：约 13.4 s（learner 在等待窗口里的速度，约 326 倍），1.10 × T* ≈ 14.7 s。learner 在不持 GIL 的打包（A1 的 B60）之后还会更低。
+- **B58 / B59 的目标**：主线程 GIL 7.35 → ≤ 1.0 s，learner 回到接近等待窗口的速度，交接暂停 0.27 s → ≤ 50 ms（GC 214 ms 要移出暂停：在 driver 继续采集时跑，或增量化）。
+
+### 9.1 B58：消费者出 GIL
+
+现在每条记录在 Python 里做的事，逐项给出去向：
+
+| 现在（consume_record） | 每 collect | B58 去向 |
+|---|---|---|
+| `bdrv.record_rows` 视图、`lanes.observe_rows`（受伤源候选） | 小 | C++：每 worker 的 (episode, t) 环与 hurt 标记；Python 控制逻辑按需读 |
+| `book.arrive`：结算上一决策的奖励、终止、close_*、episode 计数 | 约 2.2 s | C++：同样的向量公式逐行算，写 rollout 的原生数组（reward / terminal / close_* / open），episode 累计量放原生数组；episode 结束汇总按批交给 Python |
+| 逐行 `EpisodeLog` 新建 / push / push_block | 约 1 s | C++：每 worker 一条整数谱系（dec / kv / blk / blk_end，按 episode 分段），Python 端用只读视图对象（同 EpisodeLog 接口：decisions / blocks_before / branch / offset / end） |
+| 逐行 `PagedSnapshot`（含 `store.track` 的 WeakSet） | 约 1–1.5 s | 只在需要时物化：rollout 的块起点（每 worker 每 128 步或 episode 开头）、open 决策、CF 捕获点、受伤源被教师用到的那一刻。GC 改为从 C++ 谱系表和 Python 的少量物化快照取 live (log, step) |
+| `lanes.record_main`（受伤源字典，逐决策） | 约 0.5 s | C++：受伤源只记整数 (worker, episode, t) → (谱系 id, step, pending)，教师要用时物化 |
+| `store`：rollout 行（ROWC 压缩）、pending / actions / logp / value / version / vg / priv / boot / length / open | 约 2.8 s | C++：driver 写页之后直接写进 rollout 的原生数组（`compact_rows` 的 C 版，结构与 `ROWC` 逐字节一致） |
+| `lanes.capture_deferred`（CF 捕获） | 次数少 | 仍在 Python：C++ 把带请求的记录放进“事件”批，Python 物化快照、`capture_point`、`capture_done` |
+| `next_record(0.002)` 轮询 | 2 ms 粒度 | 条件变量：Python 只在“有事件”时醒（CF 捕获、episode 结束批、kind 1 / 5、错误、rollout 满） |
+
+- **Python 留下的低频事件**：CF 捕获请求；episode 结束汇总（按批）；运行期图捕获（kind 1）；lane 作业需要 Python 计算（kind 5）；错误；rollout 满 / 交接。lane 的 kind 4 记录仍在 Python 回填应答，次数约 1,000–2,000/collect；B58 第二步再看要不要把应答写入也下沉到 C++。
+- **未迁移的路径显式回退**：lab、priv、duel、temporal / GRU memory、多 actor 进程、learner 进程，任一开着时打印原因并走 B54 的 Python 消费者，不允许静默差异。
+- **开关**：`ISAAC_BLOCK_CPP_ACTOR=0`（整条 Python）、`ISAAC_BLOCK_CPP_CONSUMER=0`（driver 照旧，消费者用 B54 的 Python 版），两者都进门测。
+- **等价测试**（不依赖时序）：录下一段真实 driver 记录流（kind 0 / 4、带 CF 请求），分别喂给 C++ 消费者和 Python 消费者，比较 rollout 全字段（逐字节）、谱系（每 worker 的 dec / kv / blk / blk_end）、块起点快照的 (log 区间, step, pending, version)、CF 捕获点集合与状态、episode 结束汇总；同种子下两条路径跑同一组假 worker 也要一致。
+- **门槛**：collect 期间主线程 GIL 持有 ≤ 1.0 s；取消数 0；运行期捕获 0；全量门、入口门、A8 8/8。
+- **分步提交**：B58a rollout 原生写入 + `store` 下沉；B58b `Episodes.arrive` 下沉；B58c 谱系表 + 懒物化 + GC；B58d 事件批 + 条件变量。每步一个回退开关、一组等价测试、一次 16 update profile。
+
+### 9.1a 按需物化：线程、GIL、每周期耗时（父会话要求补充）
+
+交给 learner 的 job 结构和 BlockRollout payload 形式在 B58 / B60 期间冻结不变：job 里仍是同样的 PagedSnapshot（块起点、open 决策、教师 / v2 的上下文），只是不再每行生成。
+
+| 物化什么 | 何时 | 哪个线程 | 持 GIL | 每周期（估） |
+|---|---|---|---|---|
+| BlockRollout 块起点 + open 决策（每 worker 每 128 步、每个 episode 开头，加 16 个 open） | rollout 写满、构建 job 时 | 主线程（消费者） | 是 | 约 350 个 × 15–30 µs ≈ 5–10 ms |
+| CF 捕获点 | 捕获事件到达时（约 48 个/collect） | 主线程 | 是 | < 2 ms |
+| 受伤源上下文（教师记录引用的那些） | teacher_records 取用时，即交接构建 job | 主线程 | 是 | 约 90 个 ≈ 2–3 ms |
+
+- 这些物化都在主线程上做，driver 不暂停：B59 之后交接不再 pause / drain，构建 job 与 driver 继续采集并行。因此它们不计入“交接停顿 ≤ 50 ms/周期”，计入主线程每周期的 GIL 持有（门槛 ≤ 1.0 s，物化约 0.01–0.02 s）。
+- B58 期间如果交接仍有 pause（B59 之前），物化落在 pause 内，就计入停顿，表里分开报。
+- learner 线程不做物化。它拿到的仍是已物化的 PagedSnapshot，update 不增加这部分时间。
+- B58 加 NVTX 段 m.materialize，按周期报实测秒数。
+
+### 9.1b learner 读页期间页不可变、不被回收的保证（给 A1 B60 / N3 的不变式）
+
+1. **写一次再发布**：一行决策的 K/V / z、raw 帧，一个块的值、src / srcver，都由 driver 在 `write_decisions_raw` / `write_blocks_raw` 里于 store 互斥锁内写完，然后才把记录入队。之后这一行不再被写，除非它的 id 先被回收再重新分配。
+2. **回收只发生在 GC**：`free_rows` 只由 `PagedStore.collect()` 调用。collect 只在主线程上跑，即交接时的 h.gc，B58 之后仍只在主线程。它只释放从 live (log, step) 对不可达的 id；live 对来自所有存活的 PagedSnapshot（WeakSet）和 slot 的根，B58 之后再加上 C++ 谱系表的根。
+3. **job 持有引用直到 update 结束**：job 里的 PagedSnapshot（块起点、open、教师 / v2 上下文）被 learner 线程引用到这次 update 结束。所以 GC 跑在 update 期间也不会释放这次 update 能读到的任何行。B60 直接读原生页时，必须在读页期间一直持有 job 里的这些快照，不能先放掉再读。
+4. **页内存不搬家**：页张量一旦分配就不再移动，只追加新页。但保存页张量的 `std::vector` 在追加时可能重新分配，如果 learner 在别的线程不加锁地读 `kv_pages[p]`，就有数据竞争。B58a 会在构造时把三个页向量 reserve 到上限（max_pages_d / max_pages_b），保证永不重新分配，之后页指针可以无锁读取。在那之前，跨线程取页指针必须拿 store 的互斥锁，这正是现在 kv_page / z_page / b_page 的做法。
+5. **元数据**：d_meta / b_meta / b_src / b_srcver 是预分配容量的数组，不搬家。被回收的 id 写 −1；只要满足第 3 条，learner 读到的 id 就不会是 −1。
+
+### 9.2 B59：交接不停机与 GPU 平衡
+
+**(a) 交接不停机**
+
+- **双缓冲 rollout**：现在已是 roll / spare 交换，但交换时 driver 被 pause + drain。B58 之后 rollout 由 C++ 消费者写，交接改成：rollout k 写满（usable ≥ rollout_actor）的那条记录处，C++ 消费者原子地把写入目标切到 k+1（`spare.carry` 的 open 决策搬运在 C++ 做），并发一个“满”事件给 Python。Python 在不暂停 driver 的情况下构建 job（teacher_records、v2_records、pack_snapshots、GC），放进 learner 队列。
+- **GC 移出暂停**：GC 每周期 214 ms，B59 让它在 driver 继续写页时跑。这需要一个分配代号：PageStore 每次分配记下当时的 GC 代号，collect 开始时递增它，只释放在本次扫描开始之前分配、且不可达的行。否则 driver 在扫描期间新分配的行会被当成不可达而误删。free_rows 本身已在互斥锁内。
+- **一个 update 的滞后不变**：k+1 写满而 update k 未完，C++ 消费者进入 main_hold（主步记录扣住，lane 继续），与现在的等待语义相同。
+- **权重切换**：learner 把新权重写进影子缓冲（take_weights 已经把参数聚成一块字节）。driver 在两次 replay 之间用 actor 流上的一次拷贝把影子缓冲写进 actor 参数，然后原子地递增 version。graph 原地读参数，所以拷贝发生在 replay 之间就安全。
+- **lane 不再整体 quiesce**：只需保证同一次 lane 调用内版本一致。合并批在执行时比较版本（已是如此）；lane-only 用各代模型的副本，不受主权重切换影响。
+- **等价条件与测试**：
+  - 每行记录的 version 等于该行 replay 时的版本；
+  - 在两次 replay 之间切换，输出与 Python 用对应版本权重的结果逐位相等；
+  - 同一合并批里不出现两种版本。
+- **门槛**：driver 因交接或取权重暂停 ≤ 50 ms/周期。
+
+**(b) GPU 平衡**
+
+- 先看 prof-b54-prio（learner 流高优先级）。若 update 明显下降、collect ≤ 20 s，就设为默认。
+- 若不够，再按进度平衡，方案和数据先交父会话批：driver 读 learner 的进度计数（已完成的 PPO 微批 / 本次 update 的总微批），和自己的进度（usable / rollout）比；actor 领先超过阈值时，在两批之间让出 GPU 0.5–2 ms。
+- 只在 actor 领先时让，不丢行、不减预算，collect 仍 ≤ update。actor 本来就要在末尾等约 8 s，这里只是把等待挪到中间，周期不变或缩短。
+
+**(c)** main_hold 期间的 lane 调度纳入同一套让出规则。
+
+### 9.3 预估（B57 回填后定稿）
+
+- B58：主线程 GIL 持有 8 s → ≤ 1 s，learner 的 GIL 等待随之减少。
+- B59(a)：交接停顿 → ≤ 50 ms。
+- B59(b)：update 靠近隔离值。
+- 周期下界 T* 取 max(learner 隔离 + 必要的争用, actor host 下界)，以 B57 的测量为准。

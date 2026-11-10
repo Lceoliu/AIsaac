@@ -776,6 +776,103 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     ],
     "next": "phase 2: lane requests into the driver's batches (merged with main steps in one graph call), Python keeps lane control and CF bookkeeping; estimate collect about 18-19 s"
   },
+  "actor_b54": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B54 (phase 2: lane / CF rounds on the C++ driver)",
+    "code": "c7a9371 .. 9606517 (abp_actor.cpp lane queue, merged batches, lane-only calls, CRN in C++, kind 4 / 5, capture_done, main_hold; block_lanes driver mode; block_driver.collect_counters)",
+    "gates": {
+      "driver_tests": "58 passed",
+      "entry_gate": "2 passed",
+      "full_tests": "215 passed, 2 skipped",
+      "a8": "8/8",
+      "cpu_bookkeeping_gate": "tests/test_b54_lane_bookkeeping.py"
+    },
+    "profiles_u2_u14_median": {
+      "prof-b54-cpp": {
+        "collect_s": 13.37,
+        "update_s": 21.43,
+        "x_real_time": 203.9,
+        "game_hours": 18.4,
+        "updates": 15
+      },
+      "prof-b54-prio": {
+        "collect_s": 13.17,
+        "update_s": 21.91,
+        "x_real_time": 199.5
+      },
+      "prof-b54-py2": {
+        "collect_s": 28.09,
+        "update_s": 18.59,
+        "x_real_time": 155.6
+      },
+      "prof-b54-nocf": {
+        "collect_s": 11.01,
+        "update_s": 18.89,
+        "x_real_time": 231.3
+      },
+      "b54d_before_0e783d6": {
+        "collect_s": 13.34,
+        "update_s": 21.23,
+        "x_real_time": 205.8
+      }
+    },
+    "per_collect": {
+      "driver_pause_s": "0.000-0.001",
+      "runtime_captures": 0,
+      "deferred": 0,
+      "cancelled": 0,
+      "python_lane_share": 0.0,
+      "lane_only_s": "2.1-4.0"
+    },
+    "gate_result": {
+      "x_real_time_ge_200": true,
+      "collect_le_22": true,
+      "update_le_18_9_target": false,
+      "cancelled_0": true
+    },
+    "stale_share": "1.00 (Python path 0.50): the rollout is collected before the update before it ends, so every decision uses the one-update-old weights",
+    "prio": "learner stream high priority: no gain (update 21.91 vs 21.43); not the default"
+  },
+  "actor_b57": {
+    "entry": "bridge/abplus/EXPERIMENTS.md B57 (cycle budget, measurement only)",
+    "tools": [
+      "bridge/ops/run_b57m.sh",
+      "bridge/ops/b57_nsys.py",
+      "bridge/ops/b57_threads.py"
+    ],
+    "gil_per_cycle_s": {
+      "main": {
+        "held": 7.35,
+        "wait": 3.85
+      },
+      "learner": {
+        "held": 2.36,
+        "wait": 3.82
+      },
+      "pt_autograd": {
+        "held": 1.41,
+        "wait": 2.57
+      },
+      "others_total_held": 1.1
+    },
+    "learner_slowdown_collect_vs_waiting": {
+      "ppo_fwd_bwd": 1.88,
+      "forward_packed": 1.9,
+      "host_decode": 5.8,
+      "opt": 1.0,
+      "loss_per_cycle_s": 7.4
+    },
+    "handoff_per_cycle_s": {
+      "wait_learner": 8.2,
+      "gc": 0.214,
+      "job": 0.047,
+      "take_weights": 0.009,
+      "pause_drain": 0.008,
+      "quiesce": 0.002
+    },
+    "T_star_s": 13.4,
+    "cycle_target_s": 14.7,
+    "cpu": "driver 0.87 core, learner 0.45, main 0.42, workers+games 2.48, 9.1 of 16 cores busy"
+  },
   "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
   "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
   "spatial": {

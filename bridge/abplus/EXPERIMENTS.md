@@ -9788,3 +9788,140 @@ prof-b52-kern（train_tok 里 learner 线程上的 torch profiler）没有产出
 #### 结论与下一步
 
 阶段 1 的门：update 过（17.10 s，比同树 Python 快 1.6 s，learner GIL 等待 4.4–5.2 → 2.5 s），collect 不过（27.2 s，只比同树 Python 快 1.6 s），×实时 160.8。主路径的 C++ 化本身达到了预估（主调用 3.6 ms），但 lane / CF 轮次在 Python 里、且必须暂停 driver，成了 collect 的主体（≈ 10–12 s/collect）。要过 22 s，必须让 lane 轮次不再暂停主步：阶段 2（lane 请求进 driver 的批，像 Python 路径那样与主步合并进同一次 graph 调用，Python 只保留 lane 的控制与 CF 记账），按本节数字估 collect ≈ 27.2 − 10.3 + 合并后的 lane 增量（Python 路径约 1–2 s）≈ 18–19 s。
+
+### B54 阶段 2：lane / CF 轮次进 C++ driver（合并批、lane-only 调用、捕获先于应答、等 learner 时只跑 lane）（2026-11-10）
+
+#### 实验目的
+
+B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都要先暂停 driver，也不再并进主调用。B54 把 lane 轮次的 GPU 部分交给 driver 线程，语义不变：lane 的预算、份额、CF 预算一个不减，不丢行，过期代的行照旧处理。
+
+门槛按父会话第二次的决定：
+- u2–u14 中位 ×实时 ≥ 200（硬门槛）。
+- update 不比 CF 关的 18.9 s 差（目标）。
+- collect ≤ 22 s。
+- 分支请求的超时取消数为 0，运行期捕获为 0，Python 路径的 lane 份额 ≤ 5%。
+
+#### 实验方法
+
+代码（分支 exp/block-memory-v1-cpp-actor，c7a9371 … 9606517）：
+- **abp_actor.cpp**：lane 作业队列（submit_lanes），合并批（主行在前），lane-only 调用，CRN 的 C++ 逐位移植，kind 4 / 5 记录，set_ring，暂停与 lane 计数，capture_done（捕获请求的下一条记录先扣住），main_hold（只跑 lane）。
+- **block_lanes.py**：driver 模式的 submit / finish / tick / serve_wait / quiesce，按需重设块缓冲，分支请求等捕获（DEFER 兜底）。
+- **train_tok.py**：消费 kind 4 / 5，按 owner 运行期捕获，每 collect 计数（block_driver.collect_counters，DRV_FIELDS），learner 流高优先级的实验开关。
+
+门（每段取放 GPU_LOCK + guard）：
+- run_b54t：B52 + B54 的 driver 测试 + slot / lane 集成，以及不需 GPU 的记账门（test_b54_lane_bookkeeping）。
+- run_b54g：生产入口门（driver 开 / 关）、全量测试、A8。
+- run_b54p：smoke、cpp / py / nocf / prio。
+
+配置为完整短 profile（16 worker、rollout 32768、micro 8192、cf 6/180、teacher share 0.1），中位数取 u2–u14，×实时 = 4369 / max(collect, update)。
+
+#### 实验结果
+
+**门**：driver 测试 58 passed（含 CRN 逐位、lane-only 含恢复、合并批与 Python 合并调用逐位相等及应答顺序、含 lane 的同种子复现、driver↔Python 切换逐位相等、捕获扣住与 main_hold），生产入口门 2 passed，全量测试 215 passed / 2 skipped，A8 8/8。
+
+**同口径对照**（u2–u14 中位）：
+
+| run | 代码 | update 数 / 游戏小时 | collect s | update s | ×实时 | 主调用 ms | lane 等待 s/update | stale_share |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| prof-b52-py | B52 合并树 Python 路径 | 16 / 19.42 | 28.82 | 18.72 | 151.6 | 11.7 | 1.6 | 0.50 |
+| prof-b52-cpp | B52 driver | 16 / 19.43 | 27.17 | 17.10 | 160.8 | 3.6 | 10.1 | 0.43 |
+| prof-b54-py2 | B54 树 Python 路径（基线） | 16 / 19.42 | 28.09 | 18.59 | 155.6 | 11.5 | 1.6 | 0.50 |
+| prof-b54-py | 同上，第一次 | 16 / 19.42 | 30.09 | 21.33 | 145.2 | 12.4 | 1.9 | 0.57 |
+| b54d（修复前） | 0e783d6 之前 | 15 / 18.58 | 13.34 | 21.23 | 205.8 | 2.5 | 8.7 | 1.00 |
+| **prof-b54-cpp** | B54 最终（链 E） | 15 / 18.40 | **13.37** | **21.43** | **203.9** | 2.5 | 14.0 | 1.00 |
+| prof-b54-prio | 最终 + learner 流高优先级 | 15 / 18.36 | 13.17 | 21.91 | 199.5 | 2.5 | 12.7 | 1.00 |
+| prof-b54-nocf | 最终，CF 关（8 upd） | 8 / 9.74 | 11.01 | 18.89 | 231.3 | 2.5 | 0 | 1.00 |
+
+- **门槛对照**：×实时 203.9 ≥ 200，过；collect 13.37 ≤ 22，过；update 21.43 > 18.9，目标未达。
+- **为什么 update 是周期**：actor 先采完 rollout，每周期要等 learner 8.1 s（wait_learner_s）。
+- **基线取 py2**：两次 py 中 py2 接近 b52-py。第一次 py 偏慢的原因是工作量：learner 的 Spatial 调用 131 次对 103 次，反向 GPU 时间 10.77 s 对 9.20 s；同一时段的 guard 记录、GPU 利用率都看不到其它负载。
+- **prio 不设为默认**：learner 流高优先级没有让 update 下降（21.91 对 21.43）。B57 的测量表明，争用里 GIL 占大头，GPU 优先级管不到。
+- **预算未减**：CF 点、完成数、分支数与 py2、b52 同量级（cpp 45 / 45 / 160，py2 48 / 48 / 175，b52-py 47 / 47 / 168，中位每 update）；lane 行数相同量级（62.9k 对 66.7k）；决策数相同（约 263k，累计中位）。
+- **stale_share = 1.00**：这是训练语义的变化，需要向用户说明。actor 比 learner 快，rollout k+1 在 update k 完成前就采完，所以整个 rollout 用的都是滞后一个版本的权重；Python 路径 collect ≥ update，一半决策能用上新权重（0.50）。“滞后不超过一个 update”的约束没有变，只是现在每条决策都用到了这个滞后。
+- **lane 等待**：v2_lane_held_s 是累计值，表中是每 update 的增量。driver 路径每次只有一轮在途，lane 请求在 consumer 循环里等上一轮的记录回填后才提交，所以等待比 Python 路径长（14 s 对 1.6 s / update）。没有丢行，也没有减预算，但 CF 搜索线程等应答更久。B58 的条件变量唤醒和 B59 的调度会再看这一项。
+
+**每个 collect 的 driver 计数**（prof-b54-cpp，u2–u14 范围）：
+- driver 暂停 0.000–0.001 s；运行期捕获 0；分支请求推迟 0、超时取消 0。
+- Python 路径的 lane 份额 0：等 learner 期间也由 driver 跑 lane（main_hold）。
+- lane 作业 361–1,493 个，行 2.5k–6.2k，合并行 0–80（多数轮次是过期代或没碰上主批）。
+- lane-only 调用 352–1,493 次，共 2.1–4.0 s。行数分布以 1–2 行与 9–16 行两头为主，例如 u7 是 1 行 516 次、2 行 310 次。
+- prio 跑的版本带有新计数：因 CF 捕获被扣住的记录 0–48 条 / collect，driver host 1.2–2.0 s、同步 8.2–11.9 s、写页 0.55–0.86 s / collect。
+- 修复前（b54d）对照：u11 推迟 64、取消 1；等 learner 期间 Python 路径的 lane 份额 40–57%。
+
+**失败记录**（产物都在 reports/b42-speed/failed/，b54.log 逐条有记）：
+- smoke 1：serve_wait 遇到在途轮次，在 driver 模式下没有 _ev。修复 92af38c。
+- smoke 2：计数差分对列表做减法。修复 3095569。
+- smoke 3：lane context 在写进 lane_t 之前被控制逻辑的回收删掉（v2_records KeyError）。修复 6ba86cd。
+- 全量门 1：b54g 脚本把入口门开关 sed 成了 ISAAC_B54_ENTRY，测试被 skip，门判定失败（这是正确行为）。修复 b8d130a。
+- cpp 1（u6）：分支请求先于它所依赖的 CF 捕获到达（_begin KeyError）。修复 b7587f0 / bfcc967。
+- b54d（cpp 2）：出现 1 次超时取消，Python 路径 lane 份额 40–57%。修复 0e783d6（捕获先于应答；等 learner 时只跑 lane）。
+- 此后加了 CPU 记账门（56fb00d），能在本地复现前三次失败。
+
+**4090 锁**：每段前后 guard 都是 0 train_tok / 0 pytest / 显存 12 MiB；链 E 12:46:35 释放，prio 13:03:39 释放。
+
+### B57 测量：B54 头的周期预算（nsys nvtx + python-gil、/proc 线程 CPU、一个 collect 的 cProfile）（2026-11-10）
+
+#### 实验目的
+
+为阶段 3（B58 消费者出 GIL、B59 交接不停机与 GPU 平衡）定周期预算和下界 T*。只测量，不改行为。
+
+#### 实验方法
+
+- **代码**：ff6cb65。新增 NVTX 段 actor.collect、c.record、h.*（无 ISAAC_BLOCK_NVTX 时为空操作）；每 collect 新增 driver 步数、同步、写页、host 秒数，以及被扣住的记录数。
+- **工具**：b57_threads.py 从 /proc 采每线程 CPU；b57_nsys.py 做分析；run_b57m.sh 驱动。
+- **nsys 采集**：prof-b57m，candidate-b54，hand-off 2–7 共 5 个周期，窗口 105.3 s；9 个 update、11.11 游戏小时，u2–u9 中位 collect 12.86 s、update 20.81 s、×实时 213.2（带追踪开销）。
+- **cProfile**：prof-b57-cprof，第 3 次 hand-off 的那个 collect。
+- **分析**：reports/b42-speed/prof-b57m.analysis.txt；函数级排名在 b57-cprof/actor-cpu.txt。
+
+#### 实验结果（周期预算表）
+
+**1. 每线程 GIL（每周期 s）**
+
+| 线程 | 持有 | 等待 |
+|---|---:|---:|
+| 主线程（消费者 + lane 服务） | 7.35 | 3.85 |
+| learner | 2.36 | 3.82 |
+| pt_autograd_0（反向） | 1.41 | 2.57 |
+| 其它 Python 线程（约 60 个：worker 通信、prefetch、aux、stream-log 等，各 ≤ 0.04） | 合计约 1.1 | 合计约 2.5 |
+| learner 以外合计 | 9.86 | 8.91 |
+| driver（C++） | 0 | 0 |
+
+**2. learner 各段：actor 在采集 vs actor 在等（均值 ms）**
+
+| 段 | 采集中 | 等待中 | 倍数 | 每周期争用损失（估） |
+|---|---:|---:|---:|---:|
+| after_teach_build（PPO 前向 / 反向） | 1,296.6 | 690.7 | 1.88 | 3.4 s |
+| forward_packed | 470.8 | 247.7 | 1.90 | 2.8 s |
+| host_decode | 180.0 | 30.9 | 5.8 | 1.3 s |
+| after_opt | 114.4 | 114.8 | 1.0 | 0 |
+| after_ppo | 59.5 | 74.0 | 0.8 | — |
+
+- 合计每周期约 7.4 s 的争用损失：update 20.8 s，按等待窗口速度推算约 13.4 s。
+- host_decode 是纯主机工作，慢了 5.8 倍；主线程在 12.6 s 的 collect 里持有 GIL 7.35 s（58%）。所以争用以 GIL 为主，这也解释了 prio 无效。
+
+**3. 交接各段（每周期）**：h.wait_learner 8.20 s，h.gc 0.214 s，h.job 0.047 s，h.take_weights 9 ms，h.pause_drain 8 ms，h.quiesce 2 ms。driver 因交接暂停的部分合计约 0.27 s：pause_drain 加上 GC、job 构建和取权重的那一段。
+
+**4. 消费者函数级排名**（cProfile，一个 collect，4,049 条记录，带 profiler 开销；tottime 前几位）：
+- run_driver_collect 自身 2.64 s（循环、next_record 等待返回）；
+- Episodes.arrive 1.33 s（累计 1.72）；
+- store 1.10 s（累计 2.61，其中 compact_rows 1.37）；
+- drain_driver 1.00 s；
+- tok_obs append 0.71 s；
+- consume_record 自身 0.71 s（累计 6.99）；
+- _service_control 0.57 s（累计 1.12，每次 tick 都跑）；
+- numpy.zeros 0.26 s；cur_gains 0.12 s；_submit_jobs 0.22 s；record_main 0.12 s；observe_rows 0.13 s；PagedSnapshot.__init__ 37k 次 0.13 s。
+
+**5. CPU**（窗口内，每线程 CPU 秒 / 墙钟）：
+- driver 线程 0.87 核：CUDA 同步自旋加主步；
+- learner 0.45 核；主线程 0.42 核；pt_autograd 0.24 核；
+- worker 和游戏合计 2.48 核；
+- 16 核的忙碌比例 0.53–0.60，总计 9.1 核，没有抢核。
+
+**6. 下界 T\***
+- learner：按等待窗口速度约 13.4 s / update。那时 actor 仍在跑 lane，所以真正隔离会更低：B52 用固定输入重放是 11.7 s，父会话测的隔离值是 10.95 s。
+- actor：learner 空闲时（u1）collect 8.7–9.1 s。
+- 两者在 GPU 上可以重叠：actor 是小批量，SM 占用低；从 nocf 看，collect 11 s、update 18.9 s，同样受争用拖慢。
+- 取 T* ≈ 13.4 s 作为现有 learner 代码下可达的周期（约 326 倍），1.10 × T* ≈ 14.7 s。
+- 若 A1 的 B60 把 learner 的 host 打包和解码移出 GIL，learner 侧还会再降。
+
+**7. prio 与 stale_share**：见 B54 节。prio 不设为默认；stale_share 为 1.00，是 actor 更快之后滞后一个版本被用满。
