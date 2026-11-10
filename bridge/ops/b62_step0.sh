@@ -104,6 +104,13 @@ for S in "$@"; do
     NS="/usr/local/cuda/bin/nsys profile -t cuda,nvtx --sample=none --cpuctxsw=none --cuda-graph-trace=graph       --capture-range=nvtx --nvtx-capture=B50window -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0 --capture-range-end=stop       -o $R/$TAG.nsys-rep --force-overwrite true"
     xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" timeout --signal=INT --kill-after=60s 1800 $NS       $PY -u $(cat $R/prof-b62-gil.command.txt | sed 's/.*train_tok.py/train_tok.py/; s/--name b62gil/--name b62cuda/; s#--out [^ ]*#--out '$OUT'#; s/--game-hours 10.3/--game-hours 6.1/')       > $OUT.stdout 2> $OUT.stderr
     echo "$(date '+%F %T') NC nsys done rc=$? $(ls -la $R/$TAG.nsys-rep 2>/dev/null | awk '{print $5}') bytes" >> $LOG
+    if [ ! -s $R/$TAG.nsys-rep ] && [ -f $R/$TAG.qdstrm ]; then   # (the importer failed in the run: once more, in the lock)
+      /usr/local/cuda/nsight-systems-2023.4.4/host-linux-x64/QdstrmImporter -i $R/$TAG.qdstrm > $R/$TAG.import.log 2>&1
+      echo "$(date '+%F %T') NC re-import rc=$? $(ls -la $R/$TAG.nsys-rep 2>/dev/null | awk '{print $5}') bytes" >> $LOG
+    fi
+    python3 $OPS/b62_gpu_idle.py $R/$TAG.nsys-rep > $R/$TAG.idle.txt 2>&1   # (in the lock: no CPU work after it)
+    echo "$(date '+%F %T') NC analysis rc=$? $(tr '
+' ' ' < $R/$TAG.idle.txt | cut -c1-500)" >> $LOG
     ;;
   T)   # (the B60 / B62 unit tests and the B48 prefetch test on this host)
     cd $ROOT/$CODE/bridge/python
@@ -166,8 +173,8 @@ for S in "$@"; do
     ;;
   esac
   give $S
-  if [ $S = NC ] || [ $S = NB ]; then   # (CPU only, after the lock)
-    T_=${NCTAG:-prof-b62-cuda}; [ $S = NB ] && T_=b62-bench-cuda
+  if [ $S = NB ]; then   # (CPU only, after the lock)
+    T_=b62-bench-cuda
     python3 $OPS/b62_gpu_idle.py $R/$T_.nsys-rep > $R/$T_.idle.txt 2>&1
     echo "$(date '+%F %T') $S analysis rc=$? $(tail -3 $R/$T_.idle.txt | tr '
 ' ' ' | cut -c1-400)" >> $LOG
