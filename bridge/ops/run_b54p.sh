@@ -1,14 +1,14 @@
 #!/bin/sh
 # B54 profiles (GPU_LOCK protocol, guards): the cpp actor driver with the lane rounds on it (16 updates), the Python
 # path of the same tree (16 updates), the CF-off control (8 updates). usage: run_b54p.sh <code dir> [which]
-# which: all (default: cpp, py, nocf) | smoke | cpp | py | nocf
+# which: all (default: cpp, py, nocf) | smoke | cpp | py | nocf | prio
 ROOT=/home/linux/isaac-block-memory-v1
 R=$ROOT/reports/b42-speed
 CODE=${1:-candidate-b54}
 WHICH=${2:-all}
 LOG=$R/b54.log
 guard() { echo "$(date +%T) guard: $(pgrep -fc '[t]rain_tok.py') train_tok, $(pgrep -c isaac) isaac, $(pgrep -fc '[p]ytest') pytest, $(pgrep -fc '[a]bplus_probe') probe, gpu $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)" >> $LOG; }
-want() { { [ "$WHICH" = all ] && [ "$1" != smoke ]; } || [ "$WHICH" = "$1" ]; }
+want() { { [ "$WHICH" = all ] && [ "$1" != smoke ] && [ "$1" != prio ]; } || [ "$WHICH" = "$1" ]; }
 if [ -f $R/GPU_LOCK ]; then echo "LOCKED: $(cat $R/GPU_LOCK)"; exit 2; fi
 if [ "$WHICH" != smoke ] && [ -f $R/b54-gate.failed ]; then echo "$(date +%T) b54p $WHICH refused: the full gate failed ($(tr '\n' ' ' < $R/b54-gate.failed))" >> $LOG; exit 3; fi
 echo "cpp-actor $(date '+%Y-%m-%d %H:%M:%S') B54 profiles ($CODE, $WHICH): cpp 16 upd, python 16 upd, CF off 8 upd" > $R/GPU_LOCK
@@ -28,6 +28,11 @@ fi
 if want py; then
   ISAAC_BLOCK_CPP_ACTOR=0 CODE=$CODE ./prof2.sh ${PYTAG:-prof-b54-py} 4500 18.3
   echo "$(date +%T) ${PYTAG:-prof-b54-py} (python path, same tree) done rc=$?" >> $LOG
+  sleep 5; guard
+fi
+if want prio; then   # (B54: the learner's stream high priority, the actor's low; same as cpp otherwise)
+  ISAAC_BLOCK_STREAM_PRIO=learner CODE=$CODE ./prof2.sh prof-b54-prio 4500 18.3
+  echo "$(date +%T) prof-b54-prio done rc=$?" >> $LOG
   sleep 5; guard
 fi
 if want nocf; then

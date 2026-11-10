@@ -2672,11 +2672,17 @@ def main(argv=None, child=None, actor=None):
         lanes = BlockLaneService(sampler,model,device,wait=args.cf_lane_wait,quiet=args.cf_lane_quiet,
                                  distill_steps=args.cf_distill_steps,main_actor=block_actor,stat=lane_stat)
     inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
-    actor_stream = torch.cuda.Stream(priority=-5)
+    # B54 experiment (ISAAC_BLOCK_STREAM_PRIO=learner): the learner's stream high priority, the actor's low (with the
+    # C++ actor the collect is shorter than the update; the actor has slack to absorb the learner's kernels first)
+    prio_learner = os.environ.get('ISAAC_BLOCK_STREAM_PRIO', 'actor') == 'learner'
+    a_prio, l_prio = (0, -5) if prio_learner else (-5, 0)
+    actor_stream = torch.cuda.Stream(priority=a_prio)
     # (B38 step 2: the actor's process of a learner process never touches the learner's GPU)
     actor_only = proc and child is None
-    learner_stream = None if actor_only else (torch.cuda.Stream(device=ldev, priority=0) if split else
-                                              torch.cuda.Stream(priority=0))
+    learner_stream = None if actor_only else (torch.cuda.Stream(device=ldev, priority=l_prio) if split else
+                                              torch.cuda.Stream(priority=l_prio))
+    if prio_learner:
+        print(f'B54 stream priorities: learner {l_prio}, actor {a_prio} (ISAAC_BLOCK_STREAM_PRIO=learner)', flush=True)
     torch.cuda.synchronize()
     if split and not actor_only:
         torch.cuda.synchronize(ldev)
