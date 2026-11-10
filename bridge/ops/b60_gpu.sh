@@ -23,9 +23,14 @@ idle() { [ ! -f $R/GPU_LOCK ] && [ "$(pgrep -fc '[c]hain_b')" = "0" ] && [ "$(pg
   [ "$(pgrep -fc '[t]rain_tok.py')" = "0" ] && [ "$(pgrep -fc '[p]ytest')" = "0" ] && [ "$(pgrep -fc '[e]val_tok.py')" = "0" ]; }
 guard() { echo "$(date '+%F %T') guard: $(pgrep -fc '[t]rain_tok.py') train_tok, $(pgrep -c isaac) isaac, $(pgrep -fc '[p]ytest') pytest, gpu $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)" >> $LOG; }
 take() {
-  ok=0
-  while [ $ok -lt 4 ]; do if idle; then ok=$((ok+1)); else ok=0; fi; sleep 30; done
-  echo "a1 $(date '+%F %T') B60 stage $1 ($CODE)" > $R/GPU_LOCK
+  # (the lock written only after 2 idle minutes AND atomically -- set -C: O_EXCL, fails if another holder wrote it
+  # meanwhile; the earlier version wrote it 30 s after its last check and once overwrote this script's own stage C)
+  while true; do
+    ok=0
+    while [ $ok -lt 4 ]; do if idle; then ok=$((ok+1)); else ok=0; fi; [ $ok -lt 4 ] && sleep 30; done
+    if ( set -C; echo "a1 $(date '+%F %T') B60 stage $1 ($CODE)" > $R/GPU_LOCK ) 2>/dev/null; then break; fi
+    sleep 30
+  done
   echo "$(date '+%F %T') stage $1 start ($CODE)" >> $LOG
   guard
 }
