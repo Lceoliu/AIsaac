@@ -91,6 +91,11 @@ CRIT_LOG = None
 # (learn_native; ISAAC_BLOCK_NATIVE_PACK=0: the Python reference). Packed (CUDA) decodes only.
 from . import learn_native   # noqa: E402
 NATIVE_PACK = learn_native.ENABLED
+# B60 per-update counters in progress.csv (b42_*; block_paged's UPD_KEYS extended here, block_paged unchanged)
+bp.UPD_KEYS = tuple(bp.UPD_KEYS)+tuple(k for k in (
+    'learn_prefetch_submitted', 'learn_prefetch_cpu_s', 'learn_prefetch_wait_grad_s', 'learn_prefetch_wait_nograd_s',
+    'learn_prefetch_skip_wait_s', 'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s')
+    if k not in bp.UPD_KEYS)
 
 
 def _decode_compact(parts, packed):

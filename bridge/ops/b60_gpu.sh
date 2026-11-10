@@ -9,7 +9,7 @@
 #   B  the full test gate;
 #   C  a 6-update short profile (prof2.sh) with ISAAC_LEARN_OPCOUNT=0: the learner's prefetch hits / drops across
 #      recompute groups and epochs, and the uc_* (thread CPU) columns; SIGINT to the train_tok main process only.
-#   T  stage A's tests only (gates the stages after it).
+#   T  stage A's tests only (gates the stages after it); O  the op count by function (bench, C packing, pipelined).
 #   usage: CODE=<candidate dir> sh b60_gpu.sh A|T|B|C [more stages]
 set -u
 ROOT=/home/linux/isaac-block-memory-v1
@@ -53,13 +53,18 @@ for S in "$@"; do
     echo "$(date '+%F %T') T tests rc=$rc $(tail -1 $R/tests-b60-native.log)" >> $LOG
     if [ $rc != 0 ]; then give $S; echo "$(date '+%F %T') stage T failed: later stages not run" >> $LOG; exit 1; fi
     ;;
+  O)   # (the op count by function, C packing, pipelined: one rep to compile, then the counting rep)
+    cd $ROOT/$CODE/bridge/ops
+    timeout 780 $PY b44_learner_bench.py $R/b48-dump/learner_inputs.pt --mode packed --reps 1 --variants n1p1b0       --pipeline --opcount --json $OUT/opcount.json > $OUT/opcount.log 2>&1
+    echo "$(date '+%F %T') O opcount rc=$?" >> $LOG
+    ;;
   B)
     CUBLAS_WORKSPACE_CONFIG=:4096:8 ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 840 $PY -m pytest tests -q \
       -p no:cacheprovider > $R/tests-b60-full.log 2>&1
     echo "$(date '+%F %T') B full gate rc=$? $(tail -1 $R/tests-b60-full.log)" >> $LOG
     ;;
   C)
-    TAG=prof-b60
+    TAG=${PROF_TAG:-prof-b60}
     cd $ROOT
     ( CODE=$CODE ./prof2.sh $TAG 840 8.0 ) &
     P=$!
