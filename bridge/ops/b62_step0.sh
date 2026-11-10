@@ -68,7 +68,9 @@ for S in "$@"; do
     ;;
   P24|Y24)   # (24 updates, stopped by SIGINT to the train_tok main process; Y24: ISAAC_CUDA_BLOCKING_SYNC=$SYNC)
     TAG=${PTAG:-prof-b62-$S${SYNC:+-$SYNC}}
-    python3 $OPS/b57_threads.py $R/$TAG.threads.csv 1.0 > $R/$TAG.threads.log 2>&1 &
+    # (the sampler attaches once the trainer itself runs: started earlier it matched the xvfb-run wrapper, B62 D1)
+    ( until pgrep -f "^$PY -u train_tok.py" > /dev/null; do sleep 1; done
+      exec python3 $OPS/b57_threads.py $R/$TAG.threads.csv 1.0 > $R/$TAG.threads.log 2>&1 ) &
     THR=$!
     cd $ROOT
     ( ISAAC_CUDA_BLOCKING_SYNC=${SYNC:-} CODE=$CODE ./prof2.sh $TAG 4500 ${HOURS24:-30.0} ) &
