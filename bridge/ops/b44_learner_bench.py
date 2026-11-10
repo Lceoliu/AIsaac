@@ -73,7 +73,8 @@ class OpCount(torch.overrides.TorchFunctionMode):
         self.n = {}
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
-        self.n[self.phase] = self.n.get(self.phase, 0)+1
+        if not torch.compiler.is_compiling():   # (dynamo traces the mode: no state read while it compiles)
+            self.n[self.phase] = self.n.get(self.phase, 0)+1
         return func(*args, **(kwargs or {}))
 
 
@@ -102,8 +103,9 @@ def busy_threads(n):
 
 
 def replay(model, opt, calls, packed, seed=0, pipeline=False, ops=None):
-    """pipeline (B60): every call's host preparation queued on block_learner.PREFETCH right after the previous
-    call's forward (the first one before the replay), as the learner does; ops: an OpCount (phases fwd_grad / bwd /
+    """pipeline (B60): every call's host preparation queued on block_learner.PREFETCH ahead, as the learner does:
+    after a grad call's forward (PPO parts), before a no-grad call's forward (recompute groups), the first one before
+    the replay; ops: an OpCount (phases fwd_grad / bwd /
     opt / fwd_nograd)."""
     block_learner.PACKED = packed
     fresh(calls)
@@ -151,10 +153,10 @@ def replay(model, opt, calls, packed, seed=0, pipeline=False, ops=None):
         else:
             t0 = sync()
             phase('fwd_nograd')
+            queue(i+1)   # (as train_tok's recompute groups: the next one queued before this one's forward)
             mode = torch.inference_mode() if c['inference'] else torch.no_grad()
             with mode, torch.autocast('cuda', dtype=torch.bfloat16):
                 out, ctx = forward_bucketed(model, c['chunks'], **kw)
-            queue(i+1)
             t['fwd_nograd'] += sync()-t0
             del out, ctx
     phase('other')

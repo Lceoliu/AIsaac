@@ -40,7 +40,11 @@ for S in "$@"; do
     cd $ROOT/$CODE/bridge/ops
     timeout 780 $PY b44_learner_bench.py $R/b48-dump/learner_inputs.pt --mode packed --reps 2 \
       --variants n0p0b0,n0p0b1,n0p1b0,n1p0b0,n1p1b0,n1p1b1,n1p1b1i100 --pipeline --opcount --json $OUT/bench.json > $OUT/bench.log 2>&1
-    echo "$(date '+%F %T') A bench rc=$?" >> $LOG
+    rc=$?
+    echo "$(date '+%F %T') A bench rc=$rc" >> $LOG
+    if [ $rc != 0 ] || ! grep -q " passed" $R/tests-b60-native.log || grep -q " failed" $R/tests-b60-native.log; then
+      give $S; echo "$(date '+%F %T') stage A failed: later stages not run" >> $LOG; exit 1
+    fi
     ;;
   B)
     CUBLAS_WORKSPACE_CONFIG=:4096:8 ISAAC_VISIBLE_PAYLOADS=$R/b45-payloads2 timeout 840 $PY -m pytest tests -q \

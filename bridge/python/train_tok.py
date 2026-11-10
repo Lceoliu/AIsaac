@@ -282,7 +282,8 @@ class _OpCount:
             n = 0
 
             def __torch_function__(self, func, types, args=(), kwargs=None):
-                self.n += 1
+                if not torch_.compiler.is_compiling():   # (dynamo traces the mode: no state read while it compiles)
+                    self.n += 1
                 return func(*args, **(kwargs or {}))
         return Mode()
 
