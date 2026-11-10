@@ -10528,6 +10528,37 @@ B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都�
 
 **B58c 质量门（已提前完成）**：4f5d6ba 把页存储、帧 arena 和消费者抽成只用指针和整数的 abp_core.h，扩展包在外面。页回收加了记录序号保护：一行页只有在所属记录已被消费者取走后才能回收，B59 在 driver 运行中做 GC 时需要这一条。core_tests/test_abp_core.cpp 让写页的 driver、持页的消费者、逐字节校验的读者、按规则回收的收集器同时跑；4090 上 ThreadSanitizer 3 个种子 0 个警告、0 个错字节。去掉记录序号保护的对照组读到错字节，TSAN 也报竞争，说明测试抓得到这类问题。新扩展已在 4090 上编译通过，等价测试和 GPU 门在 B58c 的门里跑。
 
+### B58c/d 步骤 0：driver 每步时间分解，原生消费者 on / off 各 24 轮（2026-11-10）
+
+#### 实验目的
+
+解释 B58a+b 之后 collect 变长（13.3 → 15.4 s，nsys 下），判断消费者在 driver 关键路径上的成本是否超过 0.5 s/周期，并给 B58d 留一份 Python lane 路径的 24 轮 CF 基准。
+
+#### 实验方法
+
+- **代码**：dbf4cc0。driver 计数加每阶段秒数：poll（等 worker 消息）、prep（行拷贝、打包、宽度、输入）、sync（graph 填充、重放、同步）、reply、pages（主行写页，不含消费者）、cons（原生消费者）、push（等记录队列）、lane（lane-only 调用）、hold、loop（循环墙钟），以及 poll 次数和空转次数。
+- **运行**：candidate-b58c0（合并树 a91d189 + f370e1d + dbf4cc0），run_b58c0.sh，`ISAAC_BLOCK_CPP_CONSUMER=1` 和 `=0` 各 24 个 update，29.1 / 29.4 游戏小时，不带 nsys。汇总脚本 b58_ab_summary.py，结果在 reports/b42-speed/prof-b58c0.summary.txt。
+
+#### 实验结果
+
+| | 消费者 on | 消费者 off |
+|---|---:|---:|
+| u2–u23 中位 collect / update / ×实时 | 17.63 / 17.19 / 235.8 | 14.80 / 20.30 / 213.2 |
+| u10–u23 中位 collect / update / ×实时 | 17.79 / 17.38 / 239.6 | 14.80 / 20.49 / 212.0 |
+| 首轮 / 末轮 ×实时 | 210.7 / 311.2 | 175.1 / 302.4 |
+| driver 每 collect 秒数：poll / prep / sync / reply / pages / cons / lane | 0.11 / 0.59 / 8.43 / 0.17 / 0.76 / 0.23 / 7.08 | 0.11 / 0.55 / 8.86 / 0.23 / 0.93 / 0 / 4.08 |
+| driver 循环墙钟（≈ collect）/ 空转 poll | 17.64 / 0 | 15.08 / 0 |
+| 每 collect 主步数 / 每次行数 | 2,886 / 11.4 | 3,614 / 9.1 |
+| 每 collect lane 作业（全是 lane-only 调用）/ 合并进主批的行 | 1,914 / 0 | 1,020 / 0 |
+| 到 u24 的 CF：入队 / 完成 / 无存档 / 丢弃 | 121 / 112 / 899 / 0 | 114 / 111 / 1,003 / 0 |
+
+- 原生消费者净收益约 23 倍实时（周期 17.6 s 对 20.3 s）：learner 的 update 快 3.1 s，collect 慢 2.8 s。
+- 消费者自身在 driver 线程上只占 0.23 s/周期，低于 0.5 s，所以不另开消费者线程。
+- collect 变长不是消费者的成本。两臂 driver 线程都满载（空转 poll 为 0）；主步的同步约 8.5 s，两臂基本一样。差别在 lane：消费者开了以后主线程有空，lane 轮次提交得更快，每个 collect 的 lane 作业从 1,020 增加到 1,914，lane-only 时间从 4.1 s 增加到 7.1 s。lane 和主步都在 driver 一个线程里串行。
+- lane 行基本不合并进主批，每个 lane 作业都是一次单独的重放加同步，约 3.7 ms。
+- CF：两臂 cf_nobank 都在 u8 以后快速上升，到 u24 有 900–1,000。合并 a91d189 之前的步骤 0 运行（prof-b58-s0）到 u15 只有 44，cf_done 也更高（u14 时 94 对 63）。两臂都一样，和消费者无关。原因待查，B58d 的门 d 以 off 臂为基准。
+- 对 B58d 设计的影响：门 f（collect ≤ 12.5 s）光把 Python 搬进 C++ 达不到。lane 的 GPU 工作需要离开主 driver 线程：独立的 lane 线程，用自己的 CUDA 流和 graph 内存池。
+
 ### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
 
 #### 实验目的
