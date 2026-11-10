@@ -10461,6 +10461,73 @@ B52 之后 collect 仍 27.2 s：lane 和 CF 轮次在 Python 里跑，每轮都�
 
 **7. prio 与 stale_share**：见 B54 节。prio 不设为默认；stale_share 为 1.00，是 actor 更快之后滞后一个版本被用满。
 
+### B58a+b 原生消费者：Episodes.arrive 的算术和 store 进 C++ driver（2026-11-10）
+
+#### 实验目的
+
+阶段 3 第一步：把 B57 里主线程最重的一块（Episodes.arrive 的算术、store、compact_rows、帧写入）从 Python 消费者搬进 driver 线程，主线程每条记录只做事件和 block.record。看主线程 GIL 降多少、learner 拿回多少，并留出 B58c/d 的剩余账。
+
+#### 实验方法
+
+- **代码**：e2f16a4（原生消费者：driver 每步在自己线程里按 Episodes.arrive 的规则写累加器和 rollout 数组、ROWC 记录、帧 arena、私有行；Python 拿每条记录的快照做事件）；b4de8f7（脚本）；在主线合并树 20023ff（a91d189：B60 原生打包等）上加 f370e1d（graph 捕获期间关循环 GC）。部署为 candidate-b58ab2。
+- **开关**：`ISAAC_BLOCK_CPP_CONSUMER=0` 回到 B54 的 Python 消费者（driver 照旧）；`ISAAC_BLOCK_CPP_ACTOR=0` 回到整条 Python。
+- **等价测试**：tests/test_b58_native_consumer.py，同一条记录流分别走 Python 消费者和原生消费者，逐字节比较所有 rollout 数组、ROWC 记录、帧 arena、私有行、Episodes 累加器、完成的 episode、首记录快照、PLR 分数，中间做一次交接（carry 到另一个 rollout）。另验页向量 realloc 为 0。
+- **链**（run_b58ab.sh）：门测试（run_b58t）→ smoke（4 个 update，要求“B58 native consumer: on”、无 traceback）→ 6 个 update 的 nsys（nvtx + python-gil，hand-off 2–5，3 个完整周期）加 /proc 每线程 CPU → 全量门（entry + 全部测试 + A8）。
+- **对照**：prof-b62-gil（合并树、C++ 路径、Python 消费者，A1 测的，5 个周期）；B57 的 prof-b57m（合并前）。三者都带 nsys 开销，只比相对值。
+
+#### 实验结果
+
+**门**：门测试 60 passed；smoke 4 个 update、4.86 游戏小时，原生消费者 on；全量门 entry 2 passed、full 242 passed / 2 skipped、A8 8/8。
+
+**第一次链的失败（已修）**：第一次（合并前的树）全量门里一项捕获测试报“operation failed due to a previous error during capture”，出在编译后的 Spatial Triton 启动里。原样重跑 2 次、`ISAAC_FX_CACHE=0` 重跑 1 次，三次都通过，和 B56 的 FX 缓存无关。判断为捕获期间自动触发的循环 GC 释放了之前测试遗留对象（graph 或钉住的缓冲）上的 CUDA 资源。修法 f370e1d：block_training.graph_capture 在捕获期间关掉循环 GC，结束后恢复。合并树上的这次链全部通过。
+
+**每线程 GIL（每周期 s，持有 / 等待）**
+
+| 线程 | B57（合并前） | 合并树，Python 消费者 | B58a+b |
+|---|---:|---:|---:|
+| 主线程 | 7.35 / 3.85 | 7.13 / 4.02 | 5.01 / 3.07 |
+| learner | 2.36 / 3.82 | 2.15 / 3.76 | 2.01 / 3.10 |
+| pt_autograd_0 | 1.41 / 2.57 | 1.54 / 2.58 | 1.44 / 1.92 |
+| prefetch（B60 新线程） | — | 1.34 / 1.92 | 1.34 / 1.72 |
+| learner 以外合计 | 9.86 / 8.91 | 10.03 / 8.59 | 7.80 / 6.76 |
+
+主线程持有降 2.1 s/周期，learner 等待降 0.66 s。离阶段 3 的验收（任一线程等待 ≤ 0.3 s，learner 以外持有 ≤ 1.0 s）还远，a+b 只拿走了消费者的算术。
+
+**主线程每周期进 Python 的次数和时间**（nsys 段，次数 / 秒）
+
+| 段 | 合并树，Python 消费者 | B58a+b |
+|---|---:|---:|
+| lane.control | 16,102 / 1.72 | 12,063 / 1.55 |
+| c.record | 967 / 1.46 | 2,544 / 1.77 |
+| actor.tick | 2,072 / 1.22 | 4,711 / 2.47 |
+| lane.submit | 1,246 / 1.37 | 1,301 / 1.52 |
+| lane.finish | 1,246 / 0.72 | 1,301 / 0.71 |
+| h.gc | 0.150 | 0.170 |
+
+- c.record 的单次时间从 1.51 ms 降到 0.70 ms，但次数涨了 2.6 倍。主循环每次取走积压的全部记录，消费者变快以后每次积压更少，所以调用次数变多、总时间没降。actor.tick 跟着每次取记录跑一次，次数也涨了。
+- 结论：只把消费者的单条成本降下来不够，主线程按记录、按 lane 轮次进 Python 的结构还在。剩下的主要是 lane 的控制、提交、应答和 tick，这些要在 B58c/d 里整段进 C++ 闭环。
+
+**速度**（nsys 下，u2–u4；u5、u6 含 nsys 停止和写报告）
+
+| | collect s | update s | ×实时 |
+|---|---:|---:|---:|
+| 合并树，Python 消费者（u2–u6 中位） | 13.34 | 20.85 | 209.2 |
+| B58a+b（u2–u4 中位） | 15.41 | 18.39 | 234.9 |
+
+- learner 的 update 快了约 2.5 s，collect 慢了约 2 s，周期仍由 learner 决定。
+- collect 变慢的原因这个窗口分不开，可能是 learner 变快后 GPU 争用更多，也可能是消费者的工作加到了 driver 线程的关键路径上。driver 线程 CPU 0.92 核（B57 为 0.87 核），以 CUDA 同步自旋为主。B58c/d 的测量要拆 driver 每步时间。
+
+**CF 证据**（到 u6 累计，入队 / 完成 / 无存档 / 丢弃）：B58a+b 43 / 29 / 0 / 0；合并树 43 / 30 / 0 / 0；步骤 0 44 / 34 / 0 / 0。6 个 update 看不到后段的 cf_nobank，要在 B59 的 24 轮测量里核对。运行时捕获 0、取消 0、Python 路径的 lane 份额 0。
+
+**两个线程共享的数据怎么保护**（B58a+b 本身没跑 TSAN，核心抽成不依赖 torch 的头文件后在 B58c 跑，见下）：
+- rollout 数组：collect 期间只有 driver 写；Python 只读 length 和 open 计数（open 在 length 之后发布）；交接时 driver 已暂停；learner 读的是另一个槽。
+- 帧 arena：分配在互斥锁下。
+- 页存储：分配和释放在互斥锁下，页向量预留到上限，realloc 为 0。
+- Episodes 累加器：只有 driver 写，Python 读每条记录附带的快照。
+- 当前 rollout 槽：原子变量。
+
+**B58c 质量门（已提前完成）**：4f5d6ba 把页存储、帧 arena 和消费者抽成只用指针和整数的 abp_core.h，扩展包在外面。页回收加了记录序号保护：一行页只有在所属记录已被消费者取走后才能回收，B59 在 driver 运行中做 GC 时需要这一条。core_tests/test_abp_core.cpp 让写页的 driver、持页的消费者、逐字节校验的读者、按规则回收的收集器同时跑；4090 上 ThreadSanitizer 3 个种子 0 个警告、0 个错字节。去掉记录序号保护的对照组读到错字节，TSAN 也报竞争，说明测试抓得到这类问题。新扩展已在 4090 上编译通过，等价测试和 GPU 门在 B58c 的门里跑。
+
 ### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
 
 #### 实验目的
