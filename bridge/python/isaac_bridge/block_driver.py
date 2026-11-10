@@ -488,6 +488,20 @@ def batch_wait(d, on_events, on_record, timeout=0.5):
         short = True
 
 
+def event_chunks(ws):
+    """(B58e) [start, end) runs of an event batch in which no worker appears twice. _native_events takes a record's
+    first rows before its ends; a batch spans steps, so a worker's first row after its end (the next episode) must be
+    taken after that end: chunk by chunk, as the per-record path did (one record holds a worker once)."""
+    out, seen, s = [], set(), 0
+    for i, w in enumerate(ws.tolist()):
+        if w in seen:
+            out.append((s, i)); seen = set(); s = i
+        seen.add(w)
+    if len(ws) > s:
+        out.append((s, len(ws)))
+    return out
+
+
 B58E_COUNTERS = ('polls', 'calls', 'rows', 'calls_busy', 'latency', 'act', 'act_busy')
 
 

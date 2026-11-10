@@ -5084,7 +5084,9 @@ def main(argv=None, child=None, actor=None):
                 nv.push('c.events')
                 ws_ = ws_t.numpy() if hasattr(ws_t, 'numpy') else np.asarray(ws_t, np.int64)
                 if len(ws_):
-                    _native_events(book, rows_t.numpy().view(ROW), ws_, snap_t.numpy())
+                    rr_, sn_ = rows_t.numpy().view(ROW), snap_t.numpy()
+                    for a_, b_ in bdrv.event_chunks(ws_):   # (a worker's next episode after its end)
+                        _native_events(book, rr_[a_:b_], ws_[a_:b_], sn_[a_:b_])
                 nv.pop()
                 prof_['book'] += time.perf_counter() - tb_
 

@@ -7,6 +7,8 @@ never sleeps through a driver error, a stopped driver or the learner's wake.
    ev_max: many kind 8 batches) on two actors of the same weights with the native consumer, fixed uniforms. Equal:
    the event rows (worker, ROW header bytes, the consumer's per-row snapshot), in order; the counters (polls = records,
    calls = records with a go row, rows = go rows); the finished episodes' summaries; the rollouts byte for byte.
+   (Found by this test: a batch spans steps, so a worker's next episode's first row must be taken after its end:
+   event_chunks.)
 2. Three workers, batch mode: each worker's event rows are its script's first / end rows in order; rows = go rows; the
    kind 7 record comes once, when usable_now() >= the target.
 3. A driver error (set_test_fail) / a stopped driver / a wake from another thread end batch_wait within 1 s.
@@ -143,7 +145,8 @@ def run_batch(m, W, K, rows, ev_max, target=-1):
     def on_events(rows_t, ws_t, snap_t):
         ws_ = ws_t.numpy(); rr = rows_t.numpy().view(ROW); snap = snap_t.numpy()
         assert len(ws_) == len(rr) == len(snap) and len(ws_) >= 1
-        T._native_events(book, rr, ws_, snap)
+        for a, b in bdrv.event_chunks(ws_):   # (as train_tok's consume_events)
+            T._native_events(book, rr[a:b], ws_[a:b], snap[a:b])
         got['batches'] += 1
         for j in range(len(ws_)):
             ev.append((int(ws_[j]), header(rr[j:j+1])[0], snap[j].copy()))
@@ -236,6 +239,16 @@ def test_batch_events_and_target_three_workers():
     assert cnt['rows'] == n_go and cnt['calls'] <= cnt['polls']
     assert got['target'] == 1 and got['usable_at_target'][0] >= 30 and got['usable_at_target'][1] >= 30
     assert len(book.finished) > 2
+    # the same rows through the per-record path's order (one record per step) give the same finished summaries
+    import train_tok as T
+    ref = make_book(W)
+    for k in range(K):
+        for w in range(W):
+            r = rows[w, k]
+            if r['first'][0] != 0 or r['done'][0] != 0:
+                snap = [s for w_, h, s in ev if w_ == w and np.array_equal(h, header(r)[0])]
+                T._native_events(ref, r, np.array([w]), np.asarray(snap[:1]))
+    assert [f['seed'] for f in ref.finished] != [] and sorted(map(str, ref.finished)) == sorted(map(str, book.finished))
 
 
 KEEP = []
