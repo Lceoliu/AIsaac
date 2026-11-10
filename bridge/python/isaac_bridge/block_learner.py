@@ -47,17 +47,46 @@ SPATIAL_ROWS = int(os.environ.get('ISAAC_LEARN_SPATIAL_ROWS', '4096'))
 
 PREP_LOCK = __import__('threading').Lock()   # (B48: one host preparation at a time: page store caches, staging)
 PREFETCH_ON = os.environ.get('ISAAC_LEARN_PREFETCH', '1') == '1'
+# B60: the host preparation's byte moving (frame decodes, slab fill, page gathers) in C outside the GIL
+# (learn_native; ISAAC_BLOCK_NATIVE_PACK=0: the Python reference). Packed (CUDA) decodes only.
+from . import learn_native   # noqa: E402
+NATIVE_PACK = learn_native.ENABLED
+
+
+def _decode_compact(parts, packed):
+    """decode_frames_compact(parts, packed); B60: in C for packed decodes (the same bytes)."""
+    if packed and NATIVE_PACK:
+        return learn_native.decode(parts)
+    from .structured_input import decode_frames_compact
+    return decode_frames_compact(parts, packed)
+
+
+def _pages(store, which, ids, out):
+    """store.kv / store.z / store.blocks (which) of ids into out; B60: in C (the same bytes)."""
+    if NATIVE_PACK and learn_native.pages(list(getattr(store, which+'_pages' if which != 'blocks' else 'b_pages')),
+                                          ids, store.page, out):
+        return out
+    return getattr(store, which)(ids, out=out)
 
 
 class Prefetch:
-    """B48: the next learner part's host preparation (_prepare_packed) on a background thread while the
-    current part runs on the GPU. submit(model, chunks, **kwargs) starts it (grad mode: True, the PPO
-    parts); forward_packed takes it when called with the same chunks (by identity) and arguments, else
-    it is dropped (its staging buffer freed). The thread does host work only (numpy decodes and index
-    arithmetic, the pinned slab fill); the parts' draws stay in the parts' order (one preparation at a
-    time: PREP_LOCK)."""
+    """B48: learner parts' host preparations (_prepare_packed) on a background thread while earlier parts run on the
+    GPU. submit(model, chunks, grad=True, **kwargs) queues one; forward_packed takes the queue's head when called with
+    the same chunks (by identity), arguments and grad mode, else prepares its own part (the head stays queued for its
+    call). The thread does host work only (decodes and index arithmetic, B60: mostly in C outside the GIL, the pinned
+    slab fill); preparations run one at a time in submission order (PREP_LOCK), so the parts' history draws keep the
+    parts' order.
+    B60: a queue (at most DEPTH parts ahead) and one long-lived worker instead of one thread per part, so the caller
+    can queue a whole sequence (the update's recompute groups, the next epoch's first PPO part, the new teacher
+    records' calls); submit no longer drops a queued part (drop() does, at the update's end)."""
+    DEPTH = int(os.environ.get('ISAAC_LEARN_PREFETCH_DEPTH', '2'))
+
     def __init__(self):
-        self.job = None
+        import collections
+        import queue
+        self.jobs = collections.deque()   # (key, box, done event)
+        self.q = queue.Queue()
+        self.thread = None
         self.hits = self.misses = 0
 
     @staticmethod
@@ -65,46 +94,73 @@ class Prefetch:
         return (tuple(id(c) for c in chunks), tuple(sorted((k, v) for k, v in kw.items() if k != 'generator')),
                 id(kw.get('generator')), bool(grad))
 
-    def submit(self, model, chunks, **kw):
+    def _worker(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            model, chunks, grad, full, box, ev = item
+            with PREP_LOCK:
+                t0 = time.perf_counter()
+                c0 = time.thread_time()
+                try:
+                    box['P'] = _prepare_packed(model, chunks, grad, **full)
+                except BaseException as e:   # (re-raised by the caller that takes it)
+                    box['error'] = e
+                bp.ucount('learn_prefetch_host_s', time.perf_counter()-t0)
+                bp.ucount('learn_prefetch_cpu_s', time.thread_time()-c0)
+            ev.set()
+
+    def submit(self, model, chunks, grad=True, **kw):
+        """Queue the preparation of a later forward_packed(model, chunks, **kw) call in grad mode `grad`; False when
+        not queued (prefetch off, no chunks, or DEPTH parts already queued)."""
         import threading
-        self.drop()
-        if not PREFETCH_ON or not chunks:
-            return
+        if not PREFETCH_ON or not chunks or len(self.jobs) >= self.DEPTH:
+            return False
         full = dict(generator=None, train_history=True, version=0, spatial_micro=None, require_next_state=False,
                     deduplicate_sources=True, history_mode='random', max_rows=None)
         full.update(kw)
-        box = {}
-
-        def work():
-            with PREP_LOCK:
-                t0 = time.perf_counter()
-                try:
-                    box['P'] = _prepare_packed(model, chunks, True, **full)
-                    bp.ucount('learn_prefetch_host_s', time.perf_counter()-t0)
-                except BaseException as e:   # (re-raised by the caller that takes it)
-                    box['error'] = e
-        th = threading.Thread(target=work, name='learner-prefetch', daemon=True)
-        th.start()
-        self.job = (self._key(chunks, full, True), th, box, list(chunks))
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self._worker, name='learner-prefetch', daemon=True)
+            self.thread.start()
+        box, ev = {}, threading.Event()
+        chunks = list(chunks)
+        self.jobs.append((self._key(chunks, full, grad), box, ev))
+        self.q.put((model, chunks, bool(grad), full, box, ev))
+        bp.ucount('learn_prefetch_submitted', 1)
+        return True
 
     def take(self, chunks, kw, grad):
-        """The prepared part for exactly these chunks / arguments (waited for), else None: another call
-        (e.g. a no-grad forward between two PPO parts) leaves the prepared part for its own call."""
-        if self.job is None:
+        """The prepared part for exactly these chunks / arguments (waited for), else None: another call (e.g. a
+        no-grad forward between two PPO parts) leaves the queue for its own calls. Parts queued ahead of the one taken
+        were skipped by the caller: they are given up (staging buffers freed)."""
+        if not self.jobs:
             return None
-        key, th, box, _ = self.job
-        if key != self._key(chunks, kw, grad):
+        want = self._key(chunks, kw, grad)
+        at = next((j for j, job in enumerate(self.jobs) if job[0] == want), None)
+        if at is None:
             bp.ucount('learn_prefetch_other_calls', 1)
             return None
-        self.job = None
+        for _ in range(at):   # (queued ahead of this call and skipped by the caller: given up)
+            _, box_, ev_ = self.jobs.popleft()
+            ev_.wait()
+            self._free(box_)
+            self.misses += 1
+            bp.ucount('learn_prefetch_dropped', 1)
+        key, box, ev = self.jobs.popleft()
         t0 = time.perf_counter()
-        th.join()
+        ev.wait()
         bp.ucount('learn_prefetch_wait_s', time.perf_counter()-t0)
         if 'error' in box:
             raise box['error']
         self.hits += 1
         bp.ucount('learn_prefetch_hits', 1)
         return box['P']
+
+    @property
+    def job(self):
+        """The queue's head (B48 name), None when nothing is queued."""
+        return self.jobs[0] if self.jobs else None
 
     @staticmethod
     def _free(box):
@@ -113,11 +169,10 @@ class Prefetch:
             STAGING.drop(P['slab'].k)
 
     def drop(self):
-        """The prepared part, unused, given up (its staging buffer freed)."""
-        if self.job is not None:
-            _, th, box, _ = self.job
-            self.job = None
-            th.join()
+        """Every queued part, unused, given up (their staging buffers freed)."""
+        while self.jobs:
+            _, box, ev = self.jobs.popleft()
+            ev.wait()
             self._free(box)
             self.misses += 1
             bp.ucount('learn_prefetch_dropped', 1)
@@ -393,8 +448,7 @@ def _np_dtype(t):
 
 def _compact(rows, pending, packed):
     """Compact decode of records (or a (records, frame arena) pair) with their actions under way."""
-    from .structured_input import decode_frames_compact
-    d = decode_frames_compact([rows], packed=packed)[0]
+    d = _decode_compact([rows], packed)[0]
     d['pending'] = np.asarray(pending, dtype=np.int64)
     return d
 
@@ -402,7 +456,6 @@ def _compact(rows, pending, packed):
 def _host_decode(chunks, packed):
     """Main rows' compact host decodes, once per update (B42 fix 3: DECODE_CACHE / the chunk's
     own); this call's fresh chunks in one joint decode."""
-    from .structured_input import decode_frames_compact
     tag = 'compact1' if packed else 'compact0'
     hosts = [None]*len(chunks)
     fresh, keys = [], []
@@ -426,8 +479,8 @@ def _host_decode(chunks, packed):
     if fresh:
         t0 = time.perf_counter()
         # (B45: compact rollout records are read from their frame arena directly)
-        ds = decode_frames_compact([(chunks[i].rows, chunks[i].frames) if chunks[i].frames is not None
-                                    else chunks[i].rows for i in fresh], packed)
+        ds = _decode_compact([(chunks[i].rows, chunks[i].frames) if chunks[i].frames is not None
+                              else chunks[i].rows for i in fresh], packed)
         for i, key, d in zip(fresh, keys, ds):
             c = chunks[i]
             bp.ucount('learn_main_decode_rows_fresh', len(c.rows))
@@ -444,7 +497,6 @@ def _block_decode(store, bids, packed, block_steps):
     """Historical blocks' compact source decodes: cached in the page store across rollouts (pruned
     when a block is freed, PagedStore.collect); this call's fresh blocks in one source_rows and one
     joint decode."""
-    from .structured_input import decode_frames_compact
     tag = 'compact1' if packed else 'compact0'
     bids = np.asarray(bids, np.int64).tolist()
     hosts = [store.decoded.get((bid, tag)) for bid in bids]
@@ -456,7 +508,7 @@ def _block_decode(store, bids, packed, block_steps):
         # (B45: the raw frames joined into one byte array, decoded in place)
         rows_b, buf_b, pend_b = store.source_arena(np.concatenate([store.b_src[bids[i]] for i in fresh]))
         parts = [(rows_b[j*block_steps:(j+1)*block_steps], buf_b) for j in range(len(fresh))]
-        for j, (i, d) in enumerate(zip(fresh, decode_frames_compact(parts, packed))):
+        for j, (i, d) in enumerate(zip(fresh, _decode_compact(parts, packed))):
             d['pending'] = pend_b[j*block_steps:(j+1)*block_steps]
             hosts[i] = d
             store.cache_decoded((bids[i], tag), d)
@@ -491,8 +543,12 @@ def _merge_into(hosts, slab_specs):
 def _fill_merged(hosts, shapes, host_views):
     for k, shape in shapes.items():
         out = host_views['h:'+k].numpy()
-        at = 0
         compact = k.startswith('c_')
+        if NATIVE_PACK:   # B60: one C concatenation per key (outside the GIL; the same bytes)
+            pieces = [h[k] for h in hosts]
+            learn_native.concat(pieces, out, zero_rows=len(out)-sum(len(x) for x in pieces) if compact else 0)
+            continue
+        at = 0
         for h in hosts:
             x = h[k]
             out[at:at+len(x)] = x
@@ -519,10 +575,12 @@ def forward_packed(model, chunks, generator=None, train_history=True, version=0,
 
 
 def _prepare_packed(model, chunks, grad, generator=None, train_history=True, version=0, spatial_micro=None,
-                    require_next_state=False, deduplicate_sources=True, history_mode='random', max_rows=None):
+                    require_next_state=False, deduplicate_sources=True, history_mode='random', max_rows=None,
+                    packed=None):
     """B48: forward_packed's host part (history draw, decodes, plans, index arrays, the filled staging
     slab); touches no parameter and no CUDA stream (runs on the prefetch thread). grad: the run's
-    autograd mode (thread-local, so passed in)."""
+    autograd mode (thread-local, so passed in). packed: the host decode layout (None: packed on CUDA devices, as
+    always; B60 tests pass True on the CPU to compare the C packing with the reference)."""
     from .structured_input import packed_rows_plan, t_bucket
     if history_mode not in bp.HISTORY_MODES:
         raise ValueError(f'history_mode {history_mode!r}: one of {bp.HISTORY_MODES}')
@@ -573,7 +631,7 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
             unique.setdefault(int(p['bid'][k]), len(unique))
     ub = np.fromiter(unique.keys(), np.int64, len(unique))
     # ---- host decodes: main rows | historical block sources | open-tail sources
-    packed = device.type == 'cuda'
+    packed = device.type == 'cuda' if packed is None else bool(packed)
     hosts = _host_decode(chunks, packed)
     n_main = int(lens.sum())
     hist_hosts = _block_decode(store, ub, packed, bs) if len(ub) else []
@@ -730,12 +788,12 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
     slab = Slab(specs, device)
     _fill_merged(all_hosts, shapes, slab.host)
     if len(ukv):
-        store.kv(ukv, out=slab.host['kv'][:len(ukv)])
+        _pages(store, 'kv', ukv, slab.host['kv'][:len(ukv)])
     slab.host['kv'][len(ukv):] = 0
     if len(pk_all):
-        store.z(pk_all, out=slab.host['zpage'])
+        _pages(store, 'z', pk_all, slab.host['zpage'])
     if len(ubid):
-        store.blocks(ubid, out=slab.host['blocks'])
+        _pages(store, 'blocks', ubid, slab.host['blocks'])
     if sizes_i:
         np.concatenate([np.asarray(ints[k], np.int64) for k in names_i], out=slab.host['ints'].numpy())
     # B51: the old bank entries' gradient scales (history_scale 'unbiased'; None: nothing scaled)

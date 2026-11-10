@@ -6,6 +6,9 @@ page store and the weights the update started from.
 
   python b44_learner_bench.py <learner_inputs.pt> --mode old|packed [--reps 2] [--json out.json]
   python b44_learner_bench.py <learner_inputs.pt> --equiv [--calls 3]
+  B60: [--pipeline] (host preparations queued one call ahead, as the learner) [--busy N] (N pure-Python busy
+  threads during the reps: the GIL exposure) [--opcount] (one more rep counting Python-level torch calls by phase);
+  ISAAC_BLOCK_NATIVE_PACK=0 / 1 selects the Python / C host packing.
 
 Replay (each rep): the calls in their recorded order; a no-grad / inference call is a forward
 (bf16 autocast, as the learner); a grad call is forward + a fixed surrogate loss over every output
@@ -61,7 +64,47 @@ def fresh(calls):
     bp.clear_decode_cache()
 
 
-def replay(model, opt, calls, packed, seed=0):
+class OpCount(torch.overrides.TorchFunctionMode):
+    """B60: Python-level torch calls (functions, methods, tensor operators) by phase; each is at least one GIL
+    reacquisition when the call drops the GIL into C++."""
+    def __init__(self):
+        super().__init__()
+        self.phase = 'other'
+        self.n = {}
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        self.n[self.phase] = self.n.get(self.phase, 0)+1
+        return func(*args, **(kwargs or {}))
+
+
+def busy_threads(n):
+    """B60 diagnosis: n pure-Python busy threads (a GIL-holding consumer); returns done() -> spin count."""
+    import threading
+    stop = threading.Event()
+    spins = [0]*n
+
+    def spin(i):
+        x = 0
+        while not stop.is_set():
+            for _ in range(1000):
+                x += 1
+            spins[i] += 1
+    th = [threading.Thread(target=spin, args=(i,), daemon=True) for i in range(n)]
+    for t_ in th:
+        t_.start()
+
+    def done():
+        stop.set()
+        for t_ in th:
+            t_.join()
+        return sum(spins)
+    return done
+
+
+def replay(model, opt, calls, packed, seed=0, pipeline=False, ops=None):
+    """pipeline (B60): every call's host preparation queued on block_learner.PREFETCH right after the previous
+    call's forward (the first one before the replay), as the learner does; ops: an OpCount (phases fwd_grad / bwd /
+    opt / fwd_nograd)."""
     block_learner.PACKED = packed
     fresh(calls)
     bp.UPD.clear()
@@ -70,38 +113,62 @@ def replay(model, opt, calls, packed, seed=0):
     t = dict(fwd_grad=0.0, fwd_nograd=0.0, bwd=0.0, opt=0.0)
     n_grad = 0
     torch.cuda.reset_peak_memory_stats()
+
+    def queue(i):
+        if pipeline and i < len(calls):
+            c_ = calls[i]
+            kw_ = dict(c_['kwargs'])
+            kw_.setdefault('require_next_state', False)
+            block_learner.PREFETCH.submit(model, c_['chunks'], grad=bool(c_['grad']), **kw_)
+
+    def phase(name):
+        if ops is not None:
+            ops.phase = name
     t_all = sync()
-    for c in calls:
+    cpu0 = time.thread_time()
+    queue(0)
+    for i, c in enumerate(calls):
         kw = dict(c['kwargs'])
         if c['grad']:
             n_grad += 1
             model.train()
             t0 = sync()
+            phase('fwd_grad')
             with torch.autocast('cuda', dtype=torch.bfloat16):
                 out, ctx = forward_bucketed(model, c['chunks'], **kw)
+            queue(i+1)
             t1 = sync(); t['fwd_grad'] += t1-t0
+            phase('bwd')
             loss = surrogate(out, cache)
             loss.backward()
             t2 = sync(); t['bwd'] += t2-t1
+            phase('opt')
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             opt.step(); opt.zero_grad(set_to_none=True)
             t['opt'] += sync()-t2
             del out, ctx, loss
         else:
             t0 = sync()
+            phase('fwd_nograd')
             mode = torch.inference_mode() if c['inference'] else torch.no_grad()
             with mode, torch.autocast('cuda', dtype=torch.bfloat16):
                 out, ctx = forward_bucketed(model, c['chunks'], **kw)
+            queue(i+1)
             t['fwd_nograd'] += sync()-t0
             del out, ctx
+    phase('other')
     t['total'] = sync()-t_all
+    t['learner_thread_cpu'] = time.thread_time()-cpu0
+    block_learner.PREFETCH.drop()
     bp.GpuSpan.drain()
     upd = dict(bp.UPD)
     bp.clear_decode_cache()
     keys = ('learn_paged_calls', 'learn_packed_calls', 'learn_reader_calls', 'learn_reader_rows_real',
             'learn_reader_rows_padded', 'learn_spatial_calls', 'learn_spatial_tokens_real', 'learn_spatial_tokens_padded',
             'learn_writer_calls', 'learn_packed_host_s', 'learn_staged_mb', 'learn_main_decode_rows_fresh',
-            'learn_hist_decode_rows_fresh', 'learn_tail_decode_rows')
+            'learn_hist_decode_rows_fresh', 'learn_tail_decode_rows', 'learn_main_decode_s', 'learn_hist_decode_s',
+            'learn_prefetch_host_s', 'learn_prefetch_cpu_s', 'learn_prefetch_wait_s', 'learn_prefetch_hits',
+            'learn_prefetch_dropped', 'learn_prefetch_other_calls', 'learn_prefetch_submitted')
     r = {k: round(v, 3) for k, v in t.items()}
     r.update({k: upd.get(k, 0) for k in keys})
     r['grad_calls'] = n_grad
@@ -165,6 +232,10 @@ def main():
     p.add_argument('--calls', type=int, default=3)
     p.add_argument('--fp32', action='store_true', help='--equiv without autocast (FP32 everywhere)')
     p.add_argument('--cprofile', action='store_true', help='cProfile of the last rep (host time by function)')
+    p.add_argument('--pipeline', action='store_true', help='B60: host preparations queued one call ahead (learner)')
+    p.add_argument('--busy', type=int, default=0, help='B60: pure-Python busy threads during the reps')
+    p.add_argument('--opcount', action='store_true', help='B60: one extra rep counting Python-level torch calls')
+    p.add_argument('--variants', default='', help='B60: n<0|1>p<0|1>b<N>,... (native, pipeline, busy threads)')
     a = p.parse_args()
     dev = torch.device('cuda')
     from isaac_bridge import block_compile
@@ -182,22 +253,45 @@ def main():
     else:
         model, opt = load_model(ck, dev)
         reps = []
-        for i in range(a.reps):
-            prof = None
-            if a.cprofile and i == a.reps-1:
-                import cProfile
-                prof = cProfile.Profile(); prof.enable()
-            r = replay(model, opt, calls, a.mode == 'packed', seed=i)
-            if prof is not None:
-                import pstats, io
-                prof.disable()
-                for key in ('tottime', 'cumulative'):
-                    buf = io.StringIO()
-                    pstats.Stats(prof, stream=buf).sort_stats(key).print_stats(35)
-                    print(buf.getvalue(), flush=True)
-            print(json.dumps(dict(rep=i, mode=a.mode, **r)), flush=True)
-            reps.append(r)
-        out = dict(info=info, mode=a.mode, reps=reps, env={k: v for k, v in os.environ.items() if k.startswith('ISAAC_')})
+        # B60 --variants n<0|1>p<0|1>b<N>,...: host packing in C (n), pipelined preparations (p), N busy threads (b),
+        # each a.reps reps in one process (the first rep of the first variant compiles)
+        variants = [(int(v[1]), int(v[3]), int(v[5:])) for v in a.variants.split(',')] if a.variants else \
+            [(int(block_learner.NATIVE_PACK), int(a.pipeline), a.busy)]
+        for native_v, pipe_v, busy_v in variants:
+            block_learner.NATIVE_PACK = bool(native_v)
+            tag = f'n{native_v}p{pipe_v}b{busy_v}'
+            for i in range(a.reps):
+                prof = None
+                if a.cprofile and i == a.reps-1:
+                    import cProfile
+                    prof = cProfile.Profile(); prof.enable()
+                done = busy_threads(busy_v) if busy_v else None
+                r = replay(model, opt, calls, a.mode == 'packed', seed=i, pipeline=bool(pipe_v))
+                if done is not None:
+                    r['busy_spins'] = done()
+                if prof is not None:
+                    import pstats, io
+                    prof.disable()
+                    for key in ('tottime', 'cumulative'):
+                        buf = io.StringIO()
+                        pstats.Stats(prof, stream=buf).sort_stats(key).print_stats(35)
+                        print(buf.getvalue(), flush=True)
+                r['variant'] = tag
+                print(json.dumps(dict(rep=i, mode=a.mode, **r)), flush=True)
+                reps.append(r)
+        if a.opcount:
+            ops = OpCount()
+            with ops:
+                r = replay(model, opt, calls, a.mode == 'packed', seed=a.reps, pipeline=a.pipeline, ops=ops)
+            r['torch_calls'] = ops.n
+            r['torch_calls_per_grad_call'] = {k: round(v/max(r['grad_calls'], 1), 1) for k, v in ops.n.items()}
+            print(json.dumps(dict(rep='opcount', mode=a.mode, **r)), flush=True)
+            reps.append(dict(r, opcount=True))
+        from isaac_bridge import learn_native
+        lib = learn_native.load()
+        out = dict(info=info, mode=a.mode, reps=reps, pipeline=a.pipeline, busy=a.busy,
+                   native=bool(lib is not None and block_learner.NATIVE_PACK),
+                   env={k: v for k, v in os.environ.items() if k.startswith('ISAAC_')})
     if a.json:
         with open(a.json, 'w') as f:
             json.dump(out, f, indent=1)

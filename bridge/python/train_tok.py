@@ -271,6 +271,24 @@ OVERLAP_TEACHER_SHARE = 0.15
 PROFILE = os.environ.get('ISAAC_RL_PROFILE', '0') == '1'
 
 
+
+class _OpCount:
+    """B60 (ISAAC_LEARN_OPCOUNT=1, diagnosis): a TorchFunctionMode counting the Python-level torch calls of the thread
+    that enters it (functions, tensor methods and operators; modes are thread-local)."""
+    def __new__(cls):
+        import torch as torch_
+
+        class Mode(torch_.overrides.TorchFunctionMode):
+            n = 0
+
+            def __torch_function__(self, func, types, args=(), kwargs=None):
+                self.n += 1
+                return func(*args, **(kwargs or {}))
+        return Mode()
+
+
+OPCOUNT = _OpCount() if os.environ.get('ISAAC_LEARN_OPCOUNT') == '1' else None
+
 def cpu_ticks():
     """(busy, total) jiffies of all CPUs from /proc/stat ((0, 0) where there is none)."""
     try:
@@ -2825,6 +2843,12 @@ def main(argv=None, child=None, actor=None):
             raise RuntimeError('--temporal 1: the rollout has no temporal arrays (a bench job of a run without it?)')
         mark = [t0]
         cpu0 = cpu_ticks()
+        # B60: per part of the update also the learner thread's CPU seconds (uc_*: wall minus CPU is time spent
+        # waiting: GPU synchronisation, the GIL) and, with ISAAC_LEARN_OPCOUNT=1, its Python-level torch calls
+        # (uo_*: each at least one GIL reacquisition when the call drops the GIL)
+        UC = dict.fromkeys(U, 0.0)
+        UO = dict.fromkeys(U, 0) if OPCOUNT is not None else None
+        cmark = [time.thread_time(), OPCOUNT.n if OPCOUNT is not None else 0]
 
         def sec(name):
             if PROFILE:
@@ -2832,6 +2856,12 @@ def main(argv=None, child=None, actor=None):
             now_ = time.perf_counter()
             U[name] += now_ - mark[0]
             mark[0] = now_
+            c_ = time.thread_time()
+            UC[name] = UC.get(name, 0.0) + c_ - cmark[0]
+            cmark[0] = c_
+            if UO is not None:
+                UO[name] = UO.get(name, 0) + OPCOUNT.n - cmark[1]
+                cmark[1] = OPCOUNT.n
         rl = job['roll']
         if job.get('lroll') is not None:   # B38: the rollout's mirror on this GPU; its copy done before any read
             rl = job['lroll']
@@ -2891,6 +2921,7 @@ def main(argv=None, child=None, actor=None):
             all_mask = np.arange(capacity)[None,:] < lengths[:,None]
             rp_b = rl.block.plan(rl,all_mask)
             assert np.array_equal(rp_b['pos'],all_flat)
+            from isaac_bridge import block_learner as blearn_r
             every = rows_to_device(rl.rows,all_flat,rl.pending.reshape(-1,nh)[all_flat],device,with_raw=fast2,head=True)
             if fast2:
                 every,raw_e,pend_e = every
@@ -2901,10 +2932,18 @@ def main(argv=None, child=None, actor=None):
             with torch.inference_mode():
                 offset_b = 0
                 # Chunk groups are bounded in decisions, just as the PPO microbatches.
-                for lo_b,hi_b,ids_b in temporal_bounds(rp_b['tch'],np.arange(len(rp_b['chunks'])),args.micro or args.minibatch):
+                rgroups_b = list(temporal_bounds(rp_b['tch'],np.arange(len(rp_b['chunks'])),args.micro or args.minibatch))
+                pre_b = blearn_r.PREFETCH_ON and not mem_on
+                if pre_b and rgroups_b:   # B60: each group's host preparation one group ahead (the first one now)
+                    blearn_r.PREFETCH.submit(learner_model,[rp_b['chunks'][i] for i in rgroups_b[0][2]],grad=False,
+                                             train_history=False,version=L['update'])
+                for g_b,(lo_b,hi_b,ids_b) in enumerate(rgroups_b):
                     with autocast():
                         out_b,ctx_b = forward_bucketed(learner_model,[rp_b['chunks'][i] for i in ids_b],
                             train_history=False,version=L['update'])
+                    if pre_b and g_b+1 < len(rgroups_b):
+                        blearn_r.PREFETCH.submit(learner_model,[rp_b['chunks'][i] for i in rgroups_b[g_b+1][2]],
+                                                 grad=False,train_history=False,version=L['update'])
                     bb = take(every,torch.arange(lo_b,hi_b,device=device))
                     act_b = torch.from_numpy(rl.actions.reshape(-1,nh)[all_flat[lo_b:hi_b]]).to(device)
                     lp_parts.append(learner_model.log_prob(out_b[0],learner_model.gate(bb),act_b)[0])
@@ -3533,37 +3572,64 @@ def main(argv=None, child=None, actor=None):
         if block_on:
             from isaac_bridge import block_learner as blearn
 
-        def next_ppo_chunks(at_, lo_, bounds_, last_, tb_, vb_, pick_, vpick_):
-            """B48: the chunks of the PPO part after (minibatch at_, part lo_) in this epoch (its teacher / v2 draws
-            made now, in order, and kept for its minibatch), [] at the epoch's end."""
-            los_ = [b_[0] for b_ in bounds_]
-            k_ = los_.index(lo_)
-            if k_ + 1 < len(bounds_):   # the minibatch's next part (the same draws)
-                lo2, _, cids2 = bounds_[k_ + 1]
-                m2, vm2, p2, vp2 = tb_ is not None, vb_ is not None, pick_, vpick_
-            else:
-                later = [a_ for a_ in mb_ats if a_ > at_]
-                if not later:
-                    return []
-                at2 = later[0]
-                tc2 = perm_h[at2:at2 + mb_units]
-                b2 = temporal_bounds(tch, tc2, args.micro or int(tch[tc2, 1].sum()))
-                lo2, _, cids2 = b2[0]
-                last_ = b2[-1][0]
-                m2 = teach_step >= 8 and teach_n >= 256
-                vm2 = v2_step >= 8 and v2_on and L['v2_n'] >= 256
-                p2 = vp2 = None
-                if m2:
-                    p2 = pre_pick[at2] = np.random.randint(0, teach_n, teach_step)
-                if vm2:
-                    vp2 = pre_vpick[at2] = v2_rng.integers(0, L['v2_n'], v2_step)
+        # B60: every epoch's permutation drawn before the first epoch (the only CUDA generator draws of the update,
+        # consecutive as before), so the next epoch's first PPO part can be prepared while this epoch's last one
+        # runs; the teacher / teacher-v2 draws a prefetch makes ahead are kept per epoch (pre_by_ep), still drawn in
+        # the minibatches' order (nothing else draws from numpy's generator or v2_rng in between)
+        ahead_ = block_on and blearn.PREFETCH_ON and not mem_on
+        perms_ = [torch.randperm(n_units, device=device) for _ in range(args.epochs)] if ahead_ else None
+        perms_h_ = [p_.cpu().numpy() for p_ in perms_] if ahead_ else None
+        pre_by_ep = {}
+        ep_now = [0]
+
+        def first_part(ep2, at2):
+            """B60: (lo, last, chunk ids, merged?, v2 merged?, picks, v2 picks) of minibatch at2's first part in
+            epoch ep2; its teacher / v2 draws made now and kept for that minibatch."""
+            ph_ = perms_h_[ep2] if perms_h_ is not None else perm_h
+            tc2 = ph_[at2:at2 + mb_units]
+            b2 = temporal_bounds(tch, tc2, args.micro or int(tch[tc2, 1].sum()))
+            lo2, _, cids2 = b2[0]
+            m2 = teach_step >= 8 and teach_n >= 256
+            vm2 = v2_step >= 8 and v2_on and L['v2_n'] >= 256
+            pp_, pv_ = pre_by_ep.setdefault(ep2, ({}, {}))
+            p2 = vp2 = None
+            if m2:
+                p2 = pp_[at2] = np.random.randint(0, teach_n, teach_step)
+            if vm2:
+                vp2 = pv_[at2] = v2_rng.integers(0, L['v2_n'], v2_step)
+            return lo2, b2[-1][0], cids2, m2, vm2, p2, vp2
+
+        def part_chunks(lo2, last_, cids2, m2, vm2, p2, vp2):
             out_ = [mplan['chunks'][i] for i in cids2]
             if m2 and args.teach_merge and lo2 == last_:
                 out_ += [L['teach_chunks'][i] for i in p2]
             if vm2 and args.teach_merge and lo2 == last_:
                 out_ += [L['v2_chunks'][i] for i in vp2]
             return out_
-        for _ in range(args.epochs):
+
+        def next_ppo_chunks(at_, lo_, bounds_, last_, tb_, vb_, pick_, vpick_):
+            """B48: the chunks of the PPO part after (minibatch at_, part lo_) in this epoch (its teacher / v2 draws
+            made now, in order, and kept for its minibatch); B60: after the epoch's last part, the next epoch's
+            first part; [] after the update's last part."""
+            los_ = [b_[0] for b_ in bounds_]
+            k_ = los_.index(lo_)
+            if k_ + 1 < len(bounds_):   # the minibatch's next part (the same draws)
+                lo2, _, cids2 = bounds_[k_ + 1]
+                return part_chunks(lo2, last_, cids2, tb_ is not None, vb_ is not None, pick_, vpick_)
+            later = [a_ for a_ in mb_ats if a_ > at_]
+            if later:
+                return part_chunks(*first_part(ep_now[0], later[0]))
+            if perms_h_ is not None and ep_now[0] + 1 < args.epochs and mb_ats:
+                return part_chunks(*first_part(ep_now[0] + 1, mb_ats[0]))
+            return []
+        if ahead_ and n_units:   # B60: the update's first PPO part prepared before the first epoch starts
+            mb_ats = [a_ for a_ in range(0, n_units, mb_units) if len(perms_h_[0][a_:a_ + mb_units]) >= mb_units // 4]
+            if mb_ats:
+                blearn.PREFETCH.submit(learner_model, part_chunks(*first_part(0, mb_ats[0])),
+                                       max_rows=args.micro or args.minibatch, version=L['update'],
+                                       history_mode=args.block_history_mode)
+        for ep_ in range(args.epochs):
+            ep_now[0] = ep_
             if t_on:   # (B31) the rooms made before each chunk: every room token's K / V once per epoch (stop-grad)
                 t_t0 = time.perf_counter()
                 with autocast():
@@ -3571,13 +3637,16 @@ def main(argv=None, child=None, actor=None):
                 if PROFILE:
                     torch.cuda.current_stream().synchronize()
                 U['temporal'] += time.perf_counter() - t_t0
-            perm = torch.randperm(n_units, device=device)
-            perm_h = perm.cpu().numpy()
+            if perms_ is not None:   # (B60: drawn before the first epoch)
+                perm, perm_h = perms_[ep_], perms_h_[ep_]
+            else:
+                perm = torch.randperm(n_units, device=device)
+                perm_h = perm.cpu().numpy()
             first_step = True
             # B48 (block learner prefetch): the minibatches this epoch runs, and the teacher / teacher-v2 draws a
             # prefetch made ahead for one of them (drawn in the minibatches' order: the same draws)
             mb_ats = [a_ for a_ in range(0, n_units, mb_units) if len(perm_h[a_:a_ + mb_units]) >= mb_units // 4]
-            pre_pick, pre_vpick = {}, {}
+            pre_pick, pre_vpick = pre_by_ep.setdefault(ep_, ({}, {}))
             for at in range(0, n_units, mb_units):
                 sel_h = perm_h[at:at + mb_units]
                 if len(sel_h) < mb_units // 4:
@@ -4106,6 +4175,9 @@ def main(argv=None, child=None, actor=None):
             row.update(log_row(aux_acc.cpu().numpy(), aux_acc_ev.cpu().numpy(), steps_, aux_h))
             row.update(aux_log)
         row.update({f'u_{k}': v for k, v in U.items()})
+        row.update({f'uc_{k}': v for k, v in UC.items()})   # (B60)
+        if UO is not None:
+            row.update({f'uo_{k}': v for k, v in UO.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
         if run or items:   # 2026-10-06: run / item counters (absent in the other modes: their columns are unchanged)
             m_all = max(len(finished), 1)
@@ -4359,6 +4431,9 @@ def main(argv=None, child=None, actor=None):
                 if prof_dir_t and L['update']+1 == int(os.environ.get('ISAAC_RL_B38_TORCHPROF_AT', '3') or 3):
                     # B42 spike localisation: the torch profiler over update k of the learner thread
                     profile_learn(learn, job, prof_dir_t)
+                elif OPCOUNT is not None:   # B60 (ISAAC_LEARN_OPCOUNT=1): this thread's torch calls counted
+                    with OPCOUNT:
+                        learn(job)
                 else:
                     learn(job)
             except BaseException as exc:   # handed to the main thread
