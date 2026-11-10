@@ -273,3 +273,14 @@ def test_lane_service_driver_mode_branch_waits_for_its_capture():
     svc.tick()
     assert svc.fly is None and s.lane_out[0, 4] == 82 and s.lane_out[0, 5] == -1
     assert svc.stat['lane_orphan_requests'] == 1 and svc.stat['lane_deferred_requests'] >= 1
+
+
+def test_policy_lag_check():
+    """The policy-lag constraint train_tok asserts at every hand-off: the decisions of hand-off h (resumed after U
+    updates) use weights of at least U + h - 1 updates; column 0 (a worker's carried open decision) is left out."""
+    from isaac_bridge.block_driver import policy_lag_violations
+    v = np.array([[3, 5, 5, 6, 0], [4, 6, 6, 6, 6]], np.int64)
+    length = np.array([4, 5])
+    assert policy_lag_violations(v, length, 5) == (0, 5)       # (column 0 and rows past length ignored)
+    assert policy_lag_violations(v, length, 6) == (2, 5)
+    assert policy_lag_violations(v, np.array([1, 1]), 9) == (0, -1)

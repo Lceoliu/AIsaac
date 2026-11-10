@@ -4664,6 +4664,7 @@ def main(argv=None, child=None, actor=None):
     if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): build_pedestals, pickup_forced, forced_steps
         book.pick = dict(bped={}, steps=np.zeros(n, np.int64))
     version = update                                # the actor's weights: updates done
+    version0 = version   # (B54: the policy-lag check at each hand-off counts from here)
     if block_actor is not None:
         block_actor.version=version
     if cpp_driver is not None:
@@ -5221,6 +5222,12 @@ def main(argv=None, child=None, actor=None):
                     lab['sched'].note_seen(held)
                 book.seen_inv = []
                 post_lab_jobs()
+            if block_on:   # B54: every decision of this rollout is at most one update behind the update that trains on it
+                from isaac_bridge.block_driver import policy_lag_violations
+                lag_bad_, lag_min_ = policy_lag_violations(roll.version, roll.length, version0 + sent_handoffs - 1)
+                if lag_bad_:
+                    raise RuntimeError(f'policy lag: {lag_bad_} decisions of hand-off {sent_handoffs} use weights older '
+                                       f'than version {version0 + sent_handoffs - 1} (oldest {lag_min_})')
             nv.push('h.job')
             job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
                        **lab_job,

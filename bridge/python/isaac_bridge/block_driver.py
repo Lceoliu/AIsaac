@@ -126,3 +126,20 @@ def collect_counters(c0, c1, handoff, stat, py_mark):
             f"{stat['drv_py_lane_rounds']} rounds {stat['drv_py_lane_rows']} rows + {stat['drv_py_lane_flushed_rows']} flushed "
             f"({100*stat['drv_py_lane_share']:.1f}% of lane rows); branch requests waiting for their capture "
             f"{stat['drv_lane_deferred_requests']}, cancelled for a point that never came {stat['drv_lane_orphan_requests']}")
+
+
+def policy_lag_violations(roll_version, roll_length, min_version):
+    """(B54, the policy-lag constraint) The decisions of a rollout made with weights older than min_version: every
+    decision of the h-th hand-off (0-based, resumed after U updates) is made with weights of at least U + h - 1
+    updates, i.e. at most one update behind the update that trains on it. Column 0 is left out: a worker's open
+    decision carried over from the rollout before (spare.carry) was made in that collect. Returns (violations, oldest
+    version among the checked decisions, -1 when none)."""
+    import numpy as np
+    v = np.asarray(roll_version)
+    length = np.asarray(roll_length)
+    cols = np.arange(v.shape[1])[None, :]
+    mask = (cols >= 1) & (cols < length[:, None])
+    if not mask.any():
+        return 0, -1
+    used = v[mask]
+    return int((used < min_version).sum()), int(used.min())
