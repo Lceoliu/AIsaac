@@ -6,6 +6,7 @@
 # tree's own bridge Lua (identical to the 4090's candidate-a1 copy, md5 6cdc633b of the LF text).
 #   usage (in the container): CODE=<tree> [NAME=b42new PORT=39200] sh /bench/bm1/xnew2.sh <tag> [limit_s=7200] [game_hours=125]
 #   (NAME / PORT: the instances' name and port base, distinct per trainer when several run on one host)
+#   NSYS_PREFIX: a profiler command put before the trainer (nsys_update.sh); empty for every timed run
 BM=/bench/bm1
 TAG=${1:-xnew-a1}
 OUT=$BM/reports/$TAG
@@ -32,4 +33,4 @@ CMD="$PY -u train_tok.py --groups-file ../abplus/catalog/scaling2_groups.json --
  --overlap --decoupled 1 --learner-fast 0 --actor-processes 1 --learner-process 0 --amp bf16 \
  --port ${PORT:-39200} --name ${NAME:-b42new} --seed 1000 --out $OUT ${EXTRA:-}"
 echo "$CMD" > $OUT.command.txt
-exec xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" timeout --signal=INT --kill-after=60s $LIMIT $CMD > $OUT.stdout 2> $OUT.stderr
+exec xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" timeout --signal=INT --kill-after=60s $LIMIT ${NSYS_PREFIX:-} $CMD > $OUT.stdout 2> $OUT.stderr
