@@ -19,7 +19,7 @@ DOCK_ENV="-e ISAAC_B52_ENTRY=1 $GAME ${ENVS:-}" $BM/run.sh gate3-entry $GPU sh -
   "cd $T/bridge/python && timeout 3600 $PY -m pytest tests/test_b52_entry.py -q -p no:cacheprovider --basetemp=$BM1_IN/reports/$TAG-entry" > $R/$TAG.entry.log 2>&1
 echo "$(date '+%F %T') $TAG entry rc=$? $(tail -1 $R/$TAG.entry.log | cut -c1-160)" >> $LOG
 tail -1 $R/$TAG.entry.log | grep -q " passed" && ! tail -1 $R/$TAG.entry.log | grep -qE "[0-9]+ (failed|skipped|errors?)( |,|$)" || echo "entry" >> $R/$TAG.failed
-DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=$BM1_IN/payloads/b45-payloads2 ${ENVS:-}" $BM/run.sh gate3-full $GPU sh -c \
+DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=${BM1_PAYLOADS:-$BM1_IN/payloads}/b45-payloads2 ${ENVS:-}" $BM/run.sh gate3-full $GPU sh -c \
   "cd $T/bridge/python && timeout 3600 $PY -m pytest tests -v --tb=long -p no:cacheprovider" > $R/$TAG.full.log 2>&1
 echo "$(date '+%F %T') $TAG full rc=$? $(tail -1 $R/$TAG.full.log | cut -c1-160)" >> $LOG
 tail -1 $R/$TAG.full.log | grep -q " passed" && ! tail -1 $R/$TAG.full.log | grep -qE "[0-9]+ (failed|errors?)( |,|$)" || { echo "full" >> $R/$TAG.failed; cp $R/$TAG.full.log $R/failed/; }
