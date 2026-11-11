@@ -304,6 +304,23 @@ def run_bench(ctx):
                                    reverse=True)[:4]
                     print(f'check [{label}] {paths[0]} / {path_o} {name}: first gradient, tensors with the largest relative difference (rel '
                           f'norm, name, gradient norm): {" | ".join("%.2e %s %.2e" % w_ for w_ in worst)}', flush=True)
+                    # per module: ||g_new - g_old|| / ||g_old|| over the module's parameters concatenated (block_memory /
+                    # structured_spatial by their sub-module, layer numbers merged), the module's share of ||g_old||
+                    grp = {}
+                    for nm_, a, b in zip(names, g_r, g_o):
+                        if a is None or b is None:
+                            continue
+                        parts_ = nm_.split('.')
+                        key_ = parts_[0] if parts_[0] not in ('block_memory', 'structured_spatial') or len(parts_) < 3 \
+                            else parts_[0]+'.'+parts_[1]
+                        s_ = grp.setdefault(key_, [0.0, 0.0])
+                        s_[0] += float((a.double() - b.double()).pow(2).sum())
+                        s_[1] += float(a.double().pow(2).sum())
+                    tot_ = sum(v[1] for v in grp.values())
+                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first gradient per module (||dg||/||g||, '
+                          f'share of ||g||^2): ' + ' | '.join(
+                              '%s %.2e %.3f' % (k_, (v[0] / max(v[1], 1e-300)) ** 0.5, v[1] / max(tot_, 1e-300))
+                              for k_, v in sorted(grp.items(), key=lambda kv: -kv[1][1])), flush=True)
                     print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses old {step_r[0].tolist()}', flush=True)
                     print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses new {step_o[0].tolist()}', flush=True)
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
