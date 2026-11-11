@@ -13,6 +13,15 @@ P=$1; G=$2; shift 2   # (G: one GPU, or several comma-separated: the container s
 for g in $(echo "$G" | tr ',' ' '); do
   case ",$GPUS_OK," in *",$g,"*) ;; *) echo "dock.sh: GPU $g is not on this lane ($GPUS_OK)" >&2; exit 2 ;; esac
 done
+# (pre-check: every GPU of the host listed by nvidia-smi -L (GPUS_EXPECT, default 8) and the requested ones among them;
+# else stop with exit 3: one card off the bus leaves every card unusable for new contexts, 3090 01:40 Xid 79 / 154)
+NL=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU [0-9]*: ')
+if [ "$NL" -lt "${GPUS_EXPECT:-8}" ] || nvidia-smi -L 2>&1 | grep -q 'Unable to determine'; then
+  echo "dock.sh: nvidia-smi -L lists $NL GPU(s) of ${GPUS_EXPECT:-8} (or a device handle error): not starting $P" >&2; exit 3
+fi
+for g in $(echo "$G" | tr ',' ' '); do
+  nvidia-smi -L | grep -q "^GPU $g: " || { echo "dock.sh: GPU $g not listed by nvidia-smi -L: not starting $P" >&2; exit 3; }
+done
 mkdir -p "$LD/home"
 exec docker run --rm --init --name "$NAME-$P" --runtime=nvidia --network none \
   --cpuset-cpus "$CPUSET" --cpuset-mems "$MEMS" --memory "$MEM" --memory-swap "$MEM" --shm-size 8g --pids-limit ${PIDS:-4096} \

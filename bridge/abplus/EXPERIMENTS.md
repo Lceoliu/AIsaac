@@ -10866,7 +10866,7 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
 
 #### 实验结果
 
-| u10–u23 中位 | MERGE=1（m1-merge1） | 分卡基线（M1 关，另一次运行） |
+| u10–u23 中位（u10–u24 中位：collect 16.80 s，协调方复算） | MERGE=1（m1-merge1） | 分卡基线（M1 关，另一次运行） |
 |---|---:|---:|
 | collect（s） | 16.98 | 17.94 |
 | driver 线程上 lane 作业（s） | 3.52 | 6.81 |
@@ -10884,7 +10884,8 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
 - **同期的 MERGE=0 臂（m1-merge0）**：
   - 在 u11 中止，rc 134。driver 报 "CUDA error: unspecified launch failure"，出在 actor 等 learner 期间 driver 只跑 lane 的那一段（quiesce 读到 kind 3 记录）。
   - 重跑（m1-merge0b）没能起来：docker 报 "Unable to determine the device handle for GPU5: 0000:89:00.0: Unknown Error"。之后 nvidia-smi 里 GPU 5 消失，其他 7 张卡正常。
-  - 推断：GPU 5 在 MERGE=0 那次运行中出了故障，launch failure 是它的表现。这是推断，没有确认；没有 dmesg 权限看 Xid。
+  - 协调方从内核日志确认：01:40:41 GPU 5 报 Xid 79（fallen off the bus），同一秒 8 张卡全部 Xid 154（Node Reboot Required）。m1-merge0 的中止和 m1-merge0b 起不来都是机器故障，不是代码。
+  - 判定：driver 上 lane 作业 6.81 → 3.52 s 成立；吞吐对比不成立，等新机器上背靠背两臂。
   - 结论：没有同期的 MERGE=0 对照，M1 的计时对比没完成。
 - **TSAN**（不改任何安全设置：测试二进制用 -no-pie 链接，遇到 "unexpected memory mapping" 重试最多 60 次）：
   - 都能启动起来，每个最多重试 21 次。
