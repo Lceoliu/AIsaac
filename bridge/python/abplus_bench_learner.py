@@ -215,12 +215,17 @@ def run_bench(ctx):
     profile = os.environ.get('ISAAC_RL_LEARNER_PROFILE', '0') == '1'
     # a path: --learner-fast 0 / 1, optionally with a BM1 P2 suffix: 'o' P2 off (whole parts on the learner card),
     # 's' the parts' two halves one after the other on the learner card, 'p' the halves on two cards (--learner-devices)
-    paths = [v if v[-1:] in ('o', 's', 'p') else int(v)
-             for v in os.environ.get('ISAAC_RL_LEARNER_PATHS', '0,1').split(',')]
+    # (letters after the digit, any order: o / s / p the BM1 P2 mode as above; k: the learner's Spatial without its
+    #  gradient checkpoints, block_learner.SPATIAL_CKPT = 0, recomputation traded for memory)
+    paths = [int(v) if v.isdigit() else v for v in os.environ.get('ISAAC_RL_LEARNER_PATHS', '0,1').split(',')]
+    from isaac_bridge import block_learner as bl_
+    ckpt0 = bl_.SPATIAL_CKPT
 
     def set_path(fast):
-        args.learner_fast = int(str(fast).rstrip('osp'))
-        L['p2_mode'] = {'o': 'off', 's': 'serial', 'p': 'two'}.get(str(fast)[-1:])
+        s_ = str(fast)
+        args.learner_fast = int(''.join(ch for ch in s_ if ch.isdigit()))
+        L['p2_mode'] = next((m_ for ch, m_ in (('o', 'off'), ('s', 'serial'), ('p', 'two')) if ch in s_), None)
+        bl_.SPATIAL_CKPT = 0 if 'k' in s_ else ckpt0
     L['bench'] = True
     params = list(opt.param_groups[0]['params'])
     by_id = {id(p): nm_ for nm_, p in model.named_parameters()}
@@ -237,14 +242,17 @@ def run_bench(ctx):
         set_path(fast)
         L['trace'] = [] if trace else None
         torch.cuda.synchronize()
+        dev_ = next(model.parameters()).device
+        torch.cuda.reset_peak_memory_stats(dev_)
         t = time.perf_counter()
         learn(job)
         torch.cuda.synchronize()
         dt = time.perf_counter() - t
+        peak_ = (torch.cuda.max_memory_allocated(dev_) / 2 ** 30, torch.cuda.max_memory_reserved(dev_) / 2 ** 30)
         tr = L['trace']
         L['trace'] = None
         return dict(s=dt, update_s=L['last_update_s'], steps=L['last_steps'], count=L['last_count'],
-                    U=dict(L['last_U']), trace=tr,
+                    U=dict(L['last_U']), trace=tr, peak=peak_,
                     weights=[p.detach().clone() for p in params] if trace else None)
 
     for fast in paths:   # warm-up (first-call costs: cuDNN plans, allocator, compilation)
@@ -301,7 +309,8 @@ def run_bench(ctx):
         steps, count = r[0]['steps'], r[0]['count']
         print(f'bench --learner-fast {fast}: update {1000 * s:.0f} ms (inside {1000 * us:.0f} ms; runs '
               f'{" ".join("%.0f" % (1000 * x["s"]) for x in r)}), {steps} steps, {1000 * s / max(steps, 1):.1f} ms per '
-              f'step, {args.epochs * count / s:.0f} rows/s ({count} rows x {args.epochs} epochs) | u_* '
+              f'step, {args.epochs * count / s:.0f} rows/s ({count} rows x {args.epochs} epochs), learner card peak '
+              f'{max(x["peak"][0] for x in r):.2f} GB allocated / {max(x["peak"][1] for x in r):.2f} GB reserved | u_* '
               f'{" ".join("%s %.3f" % kv for kv in r[-1]["U"].items())}', flush=True)
     if os.environ.get('ISAAC_RL_LEARNER_CPROFILE', '0') == '1':   # the host's Python time per function
         import cProfile

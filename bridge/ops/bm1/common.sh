@@ -98,7 +98,7 @@ capmode() {
 # preflight: before a GPU job. Every GPU nvidia-smi -L lists without an error line, as many as BM1_GPU_EXPECT when set,
 # and no NVRM Xid in the kernel log beyond the count recorded by `preflight_baseline`. A failure is logged, the queue
 # stop file $BM/STOP_QUEUE written (every later script refuses until it is removed by hand), and the caller exits 3.
-xid_count() { ( journalctl -k --no-pager 2>/dev/null || dmesg 2>/dev/null ) | grep -c 'NVRM: Xid' || true; }
+xid_count() { ( journalctl -k -b --no-pager 2>/dev/null || dmesg 2>/dev/null ) | grep -c 'NVRM: Xid' || true; }   # (this boot's kernel log; a non-root user in adm reads it too)
 preflight_baseline() { xid_count > $BM/.xid_baseline; log "preflight baseline: $(cat $BM/.xid_baseline) Xid lines in the kernel log"; }
 preflight() {
   if [ -f $BM/STOP_QUEUE ]; then echo "bm1: $BM/STOP_QUEUE exists ($(cat $BM/STOP_QUEUE)); nothing starts" >&2; exit 3; fi
