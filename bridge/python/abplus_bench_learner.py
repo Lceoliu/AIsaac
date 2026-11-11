@@ -243,21 +243,30 @@ def run_bench(ctx):
         L['trace'] = [] if trace else None
         torch.cuda.synchronize()
         dev_ = next(model.parameters()).device
-        torch.cuda.reset_peak_memory_stats(dev_)
+        for i_ in range(torch.cuda.device_count()):   # (every visible card: P2's second learner card too)
+            torch.cuda.reset_peak_memory_stats(i_)
         t = time.perf_counter()
         learn(job)
         torch.cuda.synchronize()
         dt = time.perf_counter() - t
-        peak_ = (torch.cuda.max_memory_allocated(dev_) / 2 ** 30, torch.cuda.max_memory_reserved(dev_) / 2 ** 30)
+        peak_ = (torch.cuda.max_memory_allocated(dev_) / 2 ** 30, torch.cuda.max_memory_reserved(dev_) / 2 ** 30,
+                 {i_: torch.cuda.max_memory_allocated(i_) / 2 ** 30 for i_ in range(torch.cuda.device_count())})
         tr = L['trace']
         L['trace'] = None
         return dict(s=dt, update_s=L['last_update_s'], steps=L['last_steps'], count=L['last_count'],
                     U=dict(L['last_U']), trace=tr, peak=peak_,
                     weights=[p.detach().clone() for p in params] if trace else None)
 
-    for fast in paths:   # warm-up (first-call costs: cuDNN plans, allocator, compilation)
-        for _ in range(2):
-            one(fast)
+    for fast in list(paths):   # warm-up (first-call costs: cuDNN plans, allocator, compilation)
+        try:
+            for _ in range(2):
+                one(fast)
+        except torch.OutOfMemoryError as e:   # (a path that does not fit, e.g. k without checkpoints: reported, dropped)
+            L['trace'] = None
+            torch.cuda.empty_cache()
+            print(f'bench: path {fast} ran out of GPU memory in its warm-up, dropped: {str(e).splitlines()[0][:300]}',
+                  flush=True)
+            paths.remove(fast)
     if check:
         tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
         settings = (('this run (tf32 %s)' % bool(tf32[0]), tf32), ('strict float32', (False, False)))
@@ -310,7 +319,8 @@ def run_bench(ctx):
         print(f'bench --learner-fast {fast}: update {1000 * s:.0f} ms (inside {1000 * us:.0f} ms; runs '
               f'{" ".join("%.0f" % (1000 * x["s"]) for x in r)}), {steps} steps, {1000 * s / max(steps, 1):.1f} ms per '
               f'step, {args.epochs * count / s:.0f} rows/s ({count} rows x {args.epochs} epochs), learner card peak '
-              f'{max(x["peak"][0] for x in r):.2f} GB allocated / {max(x["peak"][1] for x in r):.2f} GB reserved | u_* '
+              f'{max(x["peak"][0] for x in r):.2f} GB allocated / {max(x["peak"][1] for x in r):.2f} GB reserved (every '
+              f'card allocated: {" ".join("cuda:%d %.2f" % (i_, max(x["peak"][2][i_] for x in r)) for i_ in r[0]["peak"][2])}) | u_* '
               f'{" ".join("%s %.3f" % kv for kv in r[-1]["U"].items())}', flush=True)
     if os.environ.get('ISAAC_RL_LEARNER_CPROFILE', '0') == '1':   # the host's Python time per function
         import cProfile
