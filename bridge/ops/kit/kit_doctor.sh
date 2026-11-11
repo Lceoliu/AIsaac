@@ -35,7 +35,10 @@ if [ "$NE" -gt 0 ]; then r FAIL gpus "nvidia-smi -L reports errors: $(echo "$L" 
 elif [ -n "${KIT_GPU_EXPECT:-}" ] && [ "$NG" -lt "$KIT_GPU_EXPECT" ]; then r FAIL gpus "$NG listed, $KIT_GPU_EXPECT expected"
 else r PASS gpus "$NG listed (expected ${KIT_GPU_EXPECT:-?}): $(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -F', ' '{printf "%s:%sMiB ", $1, $2}')"; fi
 KL=$(journalctl -k -b --no-pager 2>/dev/null); echo "$KL" | grep -q 'Linux version' || KL=$(dmesg 2>/dev/null)
-if ! echo "$KL" | grep -q 'Linux version'; then r WARN xid "kernel log of this boot not readable by $(id -un)"
+if [ -z "$KL" ]; then r WARN xid "kernel log not readable by $(id -un)"
+elif ! echo "$KL" | grep -q 'Linux version'; then
+  NX=$(echo "$KL" | grep -c 'NVRM: Xid' || true)
+  r WARN xid "kernel log does not reach back to boot ($(uptime -s 2>/dev/null)); $NX NVRM Xid line(s) in the readable part since $(echo "$KL" | head -1 | cut -c1-40)"
 else NX=$(echo "$KL" | grep -c 'NVRM: Xid' || true)
   if [ "$NX" -gt 0 ]; then r WARN xid "$NX NVRM Xid line(s) since boot, last: $(echo "$KL" | grep 'NVRM: Xid' | tail -1 | cut -c1-160)"
   else r PASS xid "no NVRM Xid line since boot ($(uptime -s 2>/dev/null))"; fi; fi

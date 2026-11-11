@@ -81,6 +81,12 @@ class Host:
         tr = self.client.get_transport()
         tr.set_keepalive(15)
         tr.default_window_size = WINDOW
+        # paramiko renegotiates keys every 512 MiB by default; a renegotiation under a full stream timed out once
+        # (Key-exchange timed out). Client-side rekeying is moved out of reach (LAN, one transfer); a failure of the
+        # session is handled by reconnecting and resuming (cmd_version).
+        pk = tr.packetizer
+        pk.REKEY_BYTES = pk.REKEY_PACKETS = 1 << 50
+        pk.REKEY_BYTES_OVERFLOW_MAX = pk.REKEY_PACKETS_OVERFLOW_MAX = 1 << 50
         return self
 
     def chan(self, cmd):
@@ -260,7 +266,24 @@ def cmd_version(args):
         plan.append((m['data']['file'], m['data']['sha256']))
     if args.only in (None, 'image'):
         plan.append((m['image']['archive']['file'], m['image']['archive']['sha256']))
-    out = [r.file(src, dst, n, s, args.seg_mib << 20) for n, s in plan]
+    out = []
+    for n, s in plan:
+        for attempt in range(1, args.retries + 2):
+            try:
+                out.append(r.file(src, dst, n, s, args.seg_mib << 20))
+                break
+            except (paramiko.SSHException, EOFError, OSError) as e:
+                say(f'{n}: session error {type(e).__name__}: {str(e)[:160]} (attempt {attempt})')
+                if attempt > args.retries:
+                    say(f'{n}: giving up after {attempt} attempts; rerun the same command to resume')
+                    sys.exit(1)
+                for h in (src, dst):
+                    try:
+                        h.client.close()
+                    except Exception:   # noqa: BLE001
+                        pass
+                time.sleep(10)
+                src, dst = Host(args.src).connect(), Host(args.dst).connect()
     say('SUMMARY ' + json.dumps(out))
 
 
@@ -308,6 +331,7 @@ def main():
     p.add_argument('dst', choices=HOSTS)
     p.add_argument('version')
     p.add_argument('--only', choices=('meta', 'data', 'image'))
+    p.add_argument('--retries', type=int, default=3, help='reconnect + resume after a session error (not a stall)')
     p.add_argument('--seg-mib', type=int, default=512)
     p.add_argument('--die-after-mib', type=int, default=0)
     cmd_version(p.parse_args())
