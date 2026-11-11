@@ -109,7 +109,9 @@ NATIVE_PACK = learn_native.ENABLED
 # B60 per-update counters in progress.csv (b42_*; block_paged's UPD_KEYS extended here, block_paged unchanged)
 bp.UPD_KEYS = tuple(bp.UPD_KEYS)+tuple(k for k in (
     'learn_prefetch_submitted', 'learn_prefetch_cpu_s', 'learn_prefetch_wait_grad_s', 'learn_prefetch_wait_nograd_s',
-    'learn_prefetch_skip_wait_s', 'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s')
+    'learn_prefetch_skip_wait_s', 'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s',
+    # BM1 P2: the second learner card's forward / backward (wall on its thread, CUDA-event span on its card)
+    'p2_fwd_part_wall_s', 'p2_fwd_part_gpu_s', 'p2_bwd_wall_s', 'p2_bwd_gpu_s', 'p2_bwd_calls')
     if k not in bp.UPD_KEYS)
 
 
