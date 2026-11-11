@@ -857,14 +857,18 @@ struct ActorDriver {
   int restore_test = 0;                 // (tests) 1: the restore on the lane stream behind a long kernel, no wait (must fail)
   bool m1_hold = false;                 // (tests) the waiting jobs wait for a main batch even while the driver idles
   bool m1_test_capture = false;         // (tests) a merged batch without its graph: captured by Python and retried (not refused)
-  std::thread::id drv_tid;
+  // (atomic: the driver thread stores its id first thing in loop(); a lane thread (d2) or a Python thread reads it any
+  // time. It cannot be set in start() before the thread exists: the id is the new thread's)
+  std::atomic<std::thread::id> drv_tid{};
+  std::atomic<i64> m1_waiting_n{0};     // (merge_q.size(), stored by the driver thread after every change: counters()
+                                        // reads it from Python while the driver runs; merge_q itself is the driver's)
   // jobs merged / rows merged; lane-only jobs by reason: an older version, the version changed while waiting, refused by
   // the merged batch, the driver without main rows, other (merging off / a job Python steps)
   std::atomic<i64> n_m1_jobs{0}, n_m1_rows{0}, n_lo_jobs[5] = {{0}, {0}, {0}, {0}, {0}};
   std::vector<double> m1_wait_s;        // (per merged job: enqueue -> the main step that took it)
   bool m1_on() const { return m1_merge && lanes_native && !lrunning.load() && running.load(); }
   void m1_thread_check(const char *where) {
-    TORCH_CHECK(std::this_thread::get_id() == drv_tid, where, ": the M1 merge queue belongs to the driver thread");
+    TORCH_CHECK(std::this_thread::get_id() == drv_tid.load(), where, ": the M1 merge queue belongs to the driver thread");
   }
   void gen_pin(i64 g, i64 d) {
     abpc::Native &N = *store->nat;
@@ -876,7 +880,7 @@ struct ActorDriver {
     if (m1_hold && reason == 3 && !main_hold) return;
     while (!merge_q.empty()) {
       m1_thread_check("m1_flush");
-      MergeJob m = merge_q.front(); merge_q.pop_front();
+      MergeJob m = merge_q.front(); merge_q.pop_front(); m1_waiting_n = (i64)merge_q.size();
       lane_run(*m.jb, m.g, m.jb->version != version.load() ? 1 : reason);
       gen_pin(m.g, -1);
       if (lstop || stop_req) return;
@@ -1021,7 +1025,7 @@ struct ActorDriver {
   // thread stop() (stop_req: else stop() joined a thread that waited for a record nobody would consume any more)
   std::atomic<bool> l_wait_drv{false};   // (the waiter is the driver thread: pause() cannot wait for it, see pause())
   void lane_wait_python(std::shared_ptr<Record> r) {
-    bool drv = std::this_thread::get_id() == drv_tid;
+    bool drv = std::this_thread::get_id() == drv_tid.load();
     l_wait_drv = drv;
     l_wait = 1;
     push_record(r);
@@ -1056,7 +1060,7 @@ struct ActorDriver {
     if (cur && m1_on() && lane_force_python != -2 && lane_force_python != g) {   // (d2 M1: the next main batch takes it)
       m1_thread_check("lane_job");
       gen_pin(g, 1);
-      merge_q.push_back(MergeJob{jb, g, now()});
+      merge_q.push_back(MergeJob{jb, g, now()}); m1_waiting_n = (i64)merge_q.size();
       return;
     }
     lane_run(*jb, g, cur ? 4 : 0);
@@ -1128,7 +1132,7 @@ struct ActorDriver {
   // one pass of the lane service (B54's tick): control, a finished round answered, the lane pipes read (up to timeout
   // s), a due round submitted; its GPU work on the lane stream. The lane thread (d2) or the driver thread (d1) runs it.
   bool lane_pass(double timeout) {
-    i64 sid = (m1_merge && !lrunning.load() && std::this_thread::get_id() == drv_tid) ? stream_id : lane_stream_id;
+    i64 sid = (m1_merge && !lrunning.load() && std::this_thread::get_id() == drv_tid.load()) ? stream_id : lane_stream_id;
     auto stream = c10::cuda::CUDAStream::unpack3(sid, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
     c10::cuda::CUDAStreamGuard guard(stream);
     double t = now();
@@ -1441,7 +1445,7 @@ struct ActorDriver {
     d["lin_s"] = t_lin_s.load();
     d["m1_jobs"] = n_m1_jobs.load(); d["m1_rows"] = n_m1_rows.load();
     d["lo_old_jobs"] = n_lo_jobs[0].load(); d["lo_switch_jobs"] = n_lo_jobs[1].load(); d["lo_refused_jobs"] = n_lo_jobs[2].load();
-    d["lo_idle_jobs"] = n_lo_jobs[3].load(); d["lo_other_jobs"] = n_lo_jobs[4].load(); d["m1_waiting"] = (i64)merge_q.size();
+    d["lo_idle_jobs"] = n_lo_jobs[3].load(); d["lo_other_jobs"] = n_lo_jobs[4].load(); d["m1_waiting"] = m1_waiting_n.load();
     d["lo_cur_rows"] = n_lo_cur_rows.load(); d["lo_old_rows"] = n_lo_old_rows.load(); d["putback_rows"] = n_putback_rows.load();
     d["enq_in_step"] = n_enq_in_step.load(); d["enq_outside"] = n_enq_outside.load();
     py::list h; for (auto &x : lane_hist) h.append(x.load()); d["lane_hist"] = h;
@@ -1482,7 +1486,7 @@ struct ActorDriver {
       std::vector<struct pollfd> pfds(fds.size());
       std::vector<i64> ws, ss;   // the batch: workers and row slots
       std::vector<i64> held_w, held_s;   // (B54) messages waiting for their worker's CF capture (cap_wait)
-      drv_tid = std::this_thread::get_id();   // (d2 M1: merge_q / LaneCore belong to this thread)
+      drv_tid.store(std::this_thread::get_id());   // (d2 M1: merge_q / LaneCore belong to this thread)
       double t_it = now();
       while (!stop_req) {
         { double t = now(); t_loop_s = t_loop_s+(t-t_it); t_it = t; }
@@ -1754,7 +1758,7 @@ struct ActorDriver {
       m1_thread_check("step_batch");
       i64 v = version.load(), tot = n;
       while (!merge_q.empty()) {
-        MergeJob m = merge_q.front(); merge_q.pop_front();
+        MergeJob m = merge_q.front(); merge_q.pop_front(); m1_waiting_n = (i64)merge_q.size();
         if (m.jb->version != v) later.emplace_back(m, 1);
         else if (tot+m.jb->n > m1_cap || (!merged.empty() && nat_m.empty())) later.emplace_back(m, 2);
         else { tot += m.jb->n; nat_m.push_back(m); }
@@ -1807,6 +1811,7 @@ struct ActorDriver {
     if (!e && !nat_m.empty() && m1_test_capture) {   // (tests: the merged graph captured, the batch and the jobs retried)
       t_prep_s = t_prep_s+(now()-t0);
       for (auto it = nat_m.rbegin(); it != nat_m.rend(); ++it) merge_q.push_front(*it);
+      m1_waiting_n = (i64)merge_q.size();
       nat_m.clear(); merged.clear(); n_lane = 0;
       run_later();
       r->kind = 1; r->cap = cap; r->wb = wb; r->we = we; r->wn = wn; r->ws = wsl;
