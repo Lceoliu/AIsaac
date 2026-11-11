@@ -10968,6 +10968,64 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
 - **CPU 归属的限制**：这一版的 driver 线程还叫“python”，和主线程合在一起（1.48 核），单独的占用报不出。545ce36 起两个线程命名为 abp-driver / abp-lane。
 - **M1 默认开的决定（协调方）**：计时不变差、lane 作业时间明确下降；counters() 修复那棵树（c-cc3af40）的 3 遍全量门全绿（8x3090，GPU 1，thread_local：三遍都是 282 passed、3 skipped、1 xfailed）。所以 M1 从这一提交起默认开，`ISAAC_BLOCK_LANE_MERGE=0` 回到 d1。M1 只在 lane 服务跑在 driver 线程（d1）时生效；开 lane 线程（d2）时自动关。
 
+### driver 线程拆解，第 0 步：把“其他”拆开（gpu57，2026-11-11，不计时）
+
+- **配置**：树 c-2138d55（M1 默认开、counters() 修复、第 0 步计数），gpu57（2x E5-2667 v3），GPU 3 跑 actor、GPU 4 跑 learner，node1 的 16 个线程，共享锁，6 轮。窗口是 u2–u6。这台机器上的数绝对值不和 8x3090 的表直接比，只看比例和“其他”里的构成。
+- **driver 每个 collect（u2–u6 中位，s）**：
+  - 循环 16.51，空转 poll 0 次。
+  - 主步等 GPU 10.80；准备 0.65；写页 0.88；consumer 0.43；回复 0.29；等 worker 0.14；lane 作业 0.28。前几轮 CF 点少，每 collect 只有 1,428 个 lane 作业。
+  - **“其他” 3.06（占循环 18.6%）**，拆开是：
+    - lane pass 自己的控制：1.22（占“其他”的 40%）。每个主步之后都跑一次，每 collect 3,427 次，每次约 0.36 ms：control 每次扫描全部点的状态，ppoll 读 lane 管道。
+    - 谱系 0.10，lane restore 0.04，事件批 0.01。
+    - 还剩 1.70 没有计时项。线程调度统计显示 abp-driver 每秒有 0.04 s 在等 CPU，按 16.5 s 算约 0.66 s；剩下约 1.0 s 落在主步之外、没有单独计时的循环记账里。
+- **driver 线程的 CPU**：第一次按名字测到，abp-driver 0.90 核（等 CPU 0.04 s/s），learner-main 0.54，pt_autograd_1 0.34，learner-prefetch 0.16，主线程 0.02。
+- **污染**：这次运行时宿主机很忙：全机 32 个线程忙 88%，iowait 12.9 核，开始时 dockerd 占 330%。所以等 CPU 和未计时那 1.0 s 都可能被放大。
+- **结论**：
+  - “其他”里最大的一项是每个主步之后的 lane pass 控制，约占“其他”的四成。它是定时轮询（每步一次扫描加一次 ppoll），是改成事件驱动的首选：只在有 lane 消息或点状态变化时跑。在 lane 卡方案里，它整块移到 lane 线程上。
+  - 剩下的 1.0 s 要再加一个计数才能拆开（step_batch 结束到下一次 poll 之间）。
+
+### lane 卡的两个探针（gpu57，2026-11-11，不计时）
+
+#### (a) 两张 3090 之间的页拷贝（bridge/ops/p2p_probe.py）
+
+- **拓扑**（`nvidia-smi topo -m`）：8 张卡都在 NUMA node0。GPU 0–3 在同一个 PCIe 交换机下（PIX），4–7 在另一个下，两组之间经过主桥（PHB）。
+- **P2P 不可用**：GPU 4+6（同一交换机）和 GPU 3+4（跨主桥）两个方向都是 False。消费级 3090 不开 P2P，驱动经主机中转，所以两组卡对的数字几乎一样，拓扑不影响。
+- **每次拷贝的耗时**（GPU 4→6，200 次的中位；3→4 在百分之几以内）：
+
+| 大小 | 一次 | 带宽 | 连排 8 次 |
+|---:|---:|---:|---:|
+| 16 KiB | 44 µs | 0.4 GB/s | 222 µs |
+| 64 KiB | 51 µs | 1.3 GB/s | 239 µs |
+| 256 KiB | 76 µs | 3.5 GB/s | 494 µs |
+| 1 MiB | 224 µs | 4.7 GB/s | 1.65 ms |
+| 4 MiB | 838 µs | 5.0 GB/s | 6.5 ms |
+| 8 MiB | 1.64 ms | 5.1 GB/s | 13.0 ms |
+
+- **对 lane 卡设计的含义**：
+  - 每次拷贝有约 45 µs 的固定开销，带宽上限约 5 GB/s，连排也不会更快。
+  - 所以要合并拷贝：每个 lane 作业的新页一次拷回，不按行拷；每次 restore 的页打包成一块。
+  - 粗估每个 collect 约 3,000 次作业拷回加约 1,500 次各约 1 MiB 的 restore，合计约 0.5 s，全在 lane 线程上，不在 driver 上。restore 的实际大小还没量。
+
+#### (b) 现有 d2 在 thread_local 下（树 c-2138d55 / c-3e56f83，GPU 3 跑 actor、GPU 4 跑 learner，node1，6 轮）
+
+- 6 轮都跑完，没有 capture 错误，也没有 lane 错误；u6 的 cf_done 21–22，dropped 0。
+- **发现一个缺陷**：第一次运行退出时段错误（rc 139）。
+  - 原因：train_tok 收尾只停 driver，lane 线程要到解释器收尾时才由 driver 的析构函数 join，那时它可能还在碰 torch 对象。
+  - 修复（3e56f83）：收尾时先停 lane 线程并 join，再停 driver。
+  - 复跑 rc 130，和其他运行一样是正常的 SIGINT 结束。
+- **数字**（u2–u6 中位，和第 0 步对比；两次都是前几轮、宿主很忙，只看方向）：
+
+| | 第 0 步（lane 在 driver 线程上） | d2（lane 在自己的线程上，复跑） |
+|---|---:|---:|
+| collect / update（s） | 16.31 / 19.18 | 15.20 / 21.47 |
+| driver 主步等 GPU（s） | 10.80 | 12.31 |
+| abp-driver / abp-lane 占核 | 0.90 / — | 0.66 / 0.55 |
+
+  - lane 工作挪出 driver 线程后，collect 少约 1.1 s。
+  - 但 driver 主步等 GPU 多约 1.5 s：主图和 lane 图在同一张卡上抢 GPU。lane 卡就是要去掉这一块。
+  - d2 下 driver 的 lane 计数（drv_lane_s、drv_lpass_s）包含 lane 线程的时间，以及它 1 ms 的 ppoll 等待，所以和第 0 步不可比。
+- **结论**：lane 卡这条路目前没有挡路的问题。thread_local 下 d2 能跑；跨卡的页拷贝每个 collect 约 0.5 s，在 lane 线程上。下一步写 lane 卡的主体。
+
 ### cpp 线核心 TSAN（gpu57，2026-11-11，通过）
 
 - **机器**：gpu57（10.19.136.57，2x E5-2667 v3，内核 5.4，`vm.mmap_rnd_bits` = 28），容器 aisaac-bench:20261019（gcc 11.4），node1 的 CPU 8-15,24-31，共享锁。树 c-b33d1b6。

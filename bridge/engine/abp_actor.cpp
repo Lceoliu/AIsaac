@@ -842,6 +842,9 @@ struct ActorDriver {
   std::atomic<int> l_wait{0};          // 1: a lane job waits for Python
   abpc::LaneJobOut l_py_out; bool l_py_done = false;
   std::atomic<i64> n_l_jobs{0}, n_l_rows{0}, n_l_restores{0}, n_l_python{0}, n_l_captures{0};
+  // (lane-GPU sizing) the bytes a lane restore reads from the page store (kv rows, partial z rows, bank blocks) and the
+  // bytes a lane job's step writes into it (kv + z per row, a bank block per completed row): what a lane GPU would copy
+  std::atomic<i64> n_l_restore_bytes{0}, n_l_out_bytes{0};
   std::atomic<double> t_l_restore{0}, t_l_job{0}, t_l_pause{0};
 
   // ---- (d2 M1) a lane job of the main version rides the driver's next main batch (one replay) instead of a lane-only
@@ -1020,6 +1023,7 @@ struct ActorDriver {
     memcpy(&ring_dec[row*block_steps], rdec.data(), block_steps*8); memcpy(&ring_kv[row*block_steps], rkv.data(), block_steps*8);
     ring_n[row] = rn;
     n_l_restores++; t_l_restore = t_l_restore+(now()-t0);
+    n_l_restore_bytes = n_l_restore_bytes+(n*kvb+np_*ze*4+m*be*4);
   }
   // wait for Python's answer to a lane record (kind 1: captured; 5: stepped)
   // (d1: the driver thread waits here; d2: the lane thread). Exits: Python's answer, lanes_stop, and on the driver
@@ -1118,6 +1122,8 @@ struct ActorDriver {
       Record r;
       lane_record(r, jb, *e, 0, steps_before, first, complete, jb.version);
       write_part(*e, jb.rows.data(), 0, k, jb.ids, steps_before, complete, first, jb.pend.data(), jb.version, r);
+      { abpc::PageCore &pc_ = *store->core; i64 nb_ = 0; for (i64 j = 0; j < k; j++) nb_ += complete[j] != 0;
+        n_l_out_bytes = n_l_out_bytes+(k*(pc_.kv_row_bytes+pc_.z_elems*4)+nb_*pc_.b_elems*4); }
       abpc::LaneJobOut o;
       o.out.assign(r.out.data_ptr<float>(), r.out.data_ptr<float>()+k*(nh+3));
       o.step_before = steps_before; o.first = first; o.complete = complete; o.version = jb.version;
@@ -1457,6 +1463,8 @@ struct ActorDriver {
     d["cap_native"] = n_cap_native.load(); d["cap_refused"] = n_cap_refused.load(); d["cap_publish"] = n_cap_publish.load();
     d["lin_s"] = t_lin_s.load(); d["restore_s"] = t_l_restore.load(); d["lpass_s"] = t_lpass_s.load();
     d["lpass_ctl_s"] = t_lpass_ctl_s.load(); d["deliver_s"] = t_deliver_s.load();
+    d["l_restores"] = n_l_restores.load(); d["l_restore_mb"] = (double)n_l_restore_bytes.load()/1048576.0;
+    d["l_out_mb"] = (double)n_l_out_bytes.load()/1048576.0; d["l_jobs"] = n_l_jobs.load();
     d["m1_jobs"] = n_m1_jobs.load(); d["m1_rows"] = n_m1_rows.load();
     d["lo_old_jobs"] = n_lo_jobs[0].load(); d["lo_switch_jobs"] = n_lo_jobs[1].load(); d["lo_refused_jobs"] = n_lo_jobs[2].load();
     d["lo_idle_jobs"] = n_lo_jobs[3].load(); d["lo_other_jobs"] = n_lo_jobs[4].load(); d["m1_waiting"] = m1_waiting_n.load();

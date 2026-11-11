@@ -98,7 +98,8 @@ DRV_FIELDS = ('drv_pause_s', 'drv_pauses', 'drv_lane_jobs', 'drv_lane_rows', 'dr
               'drv_hold_s', 'drv_loop_s', 'drv_polls', 'drv_idle_polls', 'drv_lo_cur_rows', 'drv_lo_old_rows', 'drv_putback_rows',
               'drv_enq_in_step', 'drv_enq_outside', 'b58e_batches', 'b58e_ev_rows', 'drv_m1_jobs', 'drv_m1_rows',
               'drv_lo_old_jobs', 'drv_lo_switch_jobs', 'drv_lo_refused_jobs', 'drv_lo_idle_jobs', 'drv_lo_other_jobs',
-              'drv_lin_s', 'drv_restore_s', 'drv_lpass_s', 'drv_lpass_ctl_s', 'drv_deliver_s')
+              'drv_lin_s', 'drv_restore_s', 'drv_lpass_s', 'drv_lpass_ctl_s', 'drv_deliver_s',
+              'drv_l_restores', 'drv_l_restore_mb', 'drv_l_out_mb', 'drv_l_jobs')
 # (B58 step 0) the driver thread's time by phase (abp_actor.cpp: t_*_s); pages_s leaves the consumer out since step 0
 DRV_PHASES = ('poll', 'prep', 'sync', 'reply', 'pages', 'cons', 'push', 'mlane', 'lane', 'hold', 'pause')
 
@@ -119,7 +120,8 @@ def collect_counters(c0, c1, handoff, stat, py_mark):
     for k in ('poll_s', 'prep_s', 'reply_s', 'cons_s', 'push_s', 'mlane_s', 'hold_s', 'loop_s', 'polls', 'idle_polls',
               'lo_cur_rows', 'lo_old_rows', 'putback_rows', 'enq_in_step', 'enq_outside',   # (B58d plan: merging)
               'm1_jobs', 'm1_rows', 'lo_old_jobs', 'lo_switch_jobs', 'lo_refused_jobs', 'lo_idle_jobs', 'lo_other_jobs',   # (d2 M1)
-              'lin_s', 'restore_s', 'lpass_s', 'lpass_ctl_s', 'deliver_s'):   # (driver split step 0: "other" split)
+              'lin_s', 'restore_s', 'lpass_s', 'lpass_ctl_s', 'deliver_s',   # (driver split step 0: "other" split)
+              'l_restores', 'l_restore_mb', 'l_out_mb', 'l_jobs'):   # (lane-GPU sizing: what a lane GPU would copy)
         stat['drv_'+k] = d.get(k, 0)   # (B58 step 0; absent from an older extension's counters)
     # the lane rows the Python path stepped since the last collect (the actor waiting for the learner: rounds on the
     # Python path, the round in flight flushed), their share of all lane rows

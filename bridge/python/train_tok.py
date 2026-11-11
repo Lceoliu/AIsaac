@@ -6078,6 +6078,10 @@ def main(argv=None, child=None, actor=None):
         prev_int = (signal_.signal(signal_.SIGINT, lambda *a_: deferred_int.append(1))
                     if threading.current_thread() is threading.main_thread() else None)
         if cpp_driver is not None:   # (B52)
+            # (d2: the lane thread stopped and joined first. Left running, it was joined only by the driver's destructor
+            # at interpreter teardown, while it could still step torch objects: rc 139 at the end of the gpu57 d2 probe)
+            if cpp_driver.lanes_running:
+                cpp_driver.lanes_stop()
             cpp_driver.stop()
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
