@@ -16,6 +16,7 @@ learner's agreements and the hashes; the main thread's control group (gloo) for 
 on (the two threads never share a group: a group's collectives must come in one order).
 Every rank must make the same collectives in the same order: the step count of an update is agreed (a rank with fewer
 minibatches takes zero-weight steps), the learning rate comes from the global progress, the stop is agreed."""
+import contextlib
 import os
 import threading
 import time
@@ -75,10 +76,11 @@ class ShardSync:
     def init(self):
         """The process groups (env:// rendezvous), the pid file and the watchdog of the others'."""
         to = timedelta(seconds=self.timeout)
-        if self.cuda:
-            torch.cuda.set_device(self.device)
-        dist.init_process_group('nccl' if self.cuda else 'gloo', init_method='env://', rank=self.rank,
-                                world_size=self.world, timeout=to, **(dict(device_id=self.device) if self.cuda else {}))
+        with self._dev():   # (not torch.cuda.set_device: the caller's thread keeps its current device -- the main
+            #                 thread's is the actor's; set_device here moved the actor onto the learner card, c2time)
+            dist.init_process_group('nccl' if self.cuda else 'gloo', init_method='env://', rank=self.rank,
+                                    world_size=self.world, timeout=to,
+                                    **(dict(device_id=self.device) if self.cuda else {}))
         self.pg = dist.group.WORLD
         self.ctrl = dist.new_group(backend='gloo', timeout=to)
         if self.dir:
@@ -89,6 +91,10 @@ class ShardSync:
             self._watch = threading.Thread(target=self._watchdog, name='shard-watch', daemon=True)
             self._watch.start()
         return self
+
+    def _dev(self):
+        """The learner card as the current device for a block (collectives from any thread), restored after."""
+        return torch.cuda.device(self.device) if self.cuda else contextlib.nullcontext()
 
     def _peer_pids(self):
         out = {}
@@ -226,6 +232,10 @@ class ShardSync:
         """The ranks' state hashes compared (all_gather); a mismatch: rank 0's state broadcast to every rank (the
         parameters, the Adam states, the extra arrays written back by the caller from the returned list) and counted.
         Returns (mismatch, the extra arrays as rank 0 has them)."""
+        with self._dev():
+            return self._check(models, opts, extra_arrays, restore)
+
+    def _check(self, models, opts, extra_arrays, restore):
         h = state_hash(self._state(models, opts, extra_arrays), self.device)
         hs = [torch.zeros_like(h) for _ in range(self.world)]
         dist.all_gather(hs, h, group=self.pg)
@@ -253,6 +263,10 @@ class ShardSync:
     @torch.no_grad()
     def broadcast_state(self, models, opts):
         """Rank 0's parameters and optimiser states to every rank (the start: the ranks' seeds differ)."""
+        with self._dev():
+            self._broadcast(models, opts)
+
+    def _broadcast(self, models, opts):
         for t in self._state(models, opts, ()):
             buf = t if t.device == self.device else t.to(self.device)
             dist.broadcast(buf, 0, group=self.pg)
