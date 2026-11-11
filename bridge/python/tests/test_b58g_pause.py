@@ -81,3 +81,56 @@ def test_stop_ends_a_lane_wait():
     out, dt = in_thread(w.d.stop, 5.0)
     assert out is None and dt < 2.0, (out, dt)
     assert not w.d.running
+
+
+def blocked_lane_thread():
+    """(d2) the lane thread waiting in lane_wait_python: its kind 5 record queued, nobody consuming it"""
+    w = world(True, lane_pipes=True)
+    capture(w, 0, 0, 0)
+    w.d.set_lane_force_python(-2)
+    rng = np.random.default_rng(98)
+    rows = synth_rows(rng, 1); rows['first'] = 0; rows['episode'] = 7
+    pend = synth_pending(rng, 1, w.m.heads)
+    w.s.lane_rows[0] = rows[0]; w.s.lane_io[0, :5] = pend[0]; w.s.lane_io[0, 10] = 900; w.s.lane_io[0, 11] = 1
+    w.d.lanes_start()
+    w.pipes[0][1].sendall(MSG)
+    t0 = time.perf_counter()
+    while w.d.queue_size() == 0:
+        assert time.perf_counter()-t0 < 30, w.d.lane_error()
+        time.sleep(0.005)
+    time.sleep(0.05)
+    return w
+
+
+def test_lanes_pause_does_not_wait_for_its_own_lane_record():
+    """lanes_pause() used to return while the lane thread waited for Python: once the record was answered the lane thread
+    went on with GPU work although the caller believed it paused. Now it raises (bounded); lanes_pause_serving returns
+    with the lane thread parked between passes, the job answered and replied, and nothing runs until lanes_resume."""
+    w = blocked_lane_thread()
+    try:
+        out, dt = in_thread(w.d.lanes_pause, 5.0)
+        assert isinstance(out, RuntimeError) and 'lane record' in str(out), (out, dt)
+        assert dt < 1.0 and not w.d.lanes_paused
+        out, dt = in_thread(lambda: bdrv.lanes_pause_serving(w.d, w.svc.on_native_lane_record), 30.0)
+        assert out is None and w.d.lanes_paused, (out, dt)
+        got = b''
+        while len(got) < 5:
+            got += w.pipes[0][1].recv(5-len(got))
+        assert got == b'\x00\x00\x00\x01a' and w.s.lane_out[0, 4] == 900
+        c0 = w.d.lane_counters()
+        w.pipes[0][1].sendall(MSG)   # (a new request while parked: not served until lanes_resume)
+        time.sleep(0.3)
+        c1 = w.d.lane_counters()
+        assert c1['rounds'] == c0['rounds'] and c1['jobs'] == c0['jobs'] and w.d.queue_size() == 0, (c0, c1)
+        w.d.lanes_resume()
+        t0 = time.perf_counter()
+        while w.d.lane_counters()['rounds'] == c0['rounds']:   # (served after the resume: a kind 5 record again)
+            rec = w.d.next_record(0.01)
+            if rec is not None:
+                w.svc.on_native_lane_record(rec)
+            assert time.perf_counter()-t0 < 30, w.d.lane_error()
+        assert w.d.lane_counters()['python_jobs'] >= 1
+    finally:
+        bdrv.lanes_pause_serving(w.d, w.svc.on_native_lane_record)
+        w.d.lanes_stop()
+    assert w.d.lane_error() == ''

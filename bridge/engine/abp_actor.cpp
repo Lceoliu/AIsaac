@@ -1189,11 +1189,29 @@ struct ActorDriver {
     lrunning = false;
   }
   // pause: the lane thread finishes its pass and waits (a job waiting for Python counts as paused: nothing runs)
+  // lanes_pause() returns when the lane thread is parked between two lane passes (or stopped / failed). The lane thread
+  // can also be blocked on Python: lane_wait_python waits for the answer to a lane record (kind 1 / 5) sitting in the
+  // queue the caller consumes. Returning then (as before) let the lane thread go on with GPU work as soon as that record
+  // was answered, while the caller believed it paused; waiting would never end. So lanes_pause raises in that state,
+  // and callers that may meet a lane record use block_driver.lanes_pause_serving (lanes_request_pause, the records
+  // consumed until lanes_paused). lane_timing's own short pause keeps the old exit (lanes_pause_reading): the reading
+  // thread is the only one that answers lane records, so the lane thread stays blocked while it reads.
+  bool lane_wait_lane() { return l_wait.load() && !l_wait_drv.load(); }
   void lanes_pause() {
     if (!lrunning) return;
     lpause_req = true;
     std::unique_lock<std::mutex> lk(lcmu);
-    while (!lpaused && lrunning && !l_wait.load()) lccv.wait_for(lk, std::chrono::milliseconds(2));
+    while (!lpaused && lrunning && !lane_wait_lane()) lccv.wait_for(lk, std::chrono::milliseconds(2));
+    if (!lpaused && lrunning && lane_wait_lane())
+      throw std::runtime_error("lanes_pause(): the lane thread waits for Python's answer to a lane record still in the "
+                               "queue (consume it while pausing: block_driver.lanes_pause_serving)");
+  }
+  void lanes_request_pause() { if (lrunning) lpause_req = true; }
+  void lanes_pause_reading() {
+    if (!lrunning) return;
+    lpause_req = true;
+    std::unique_lock<std::mutex> lk(lcmu);
+    while (!lpaused && lrunning && !lane_wait_lane()) lccv.wait_for(lk, std::chrono::milliseconds(2));
   }
   void lanes_resume() { lpause_req = false; std::lock_guard<std::mutex> g(lcmu); lccv.notify_all(); }
   // (tests) the lane service driven by the caller with an injected clock: a request read at `now`; one pass
@@ -1228,7 +1246,7 @@ struct ActorDriver {
   py::dict lane_timing() {
     // (d2: the lane thread writes these lists: it stands still while they are read)
     bool held = lrunning.load() && !lpause_req.load();
-    if (held) { py::gil_scoped_release nogil; lanes_pause(); }
+    if (held) { py::gil_scoped_release nogil; lanes_pause_reading(); }
     struct Resume { ActorDriver *d; bool on; ~Resume() { if (on) d->lanes_resume(); } } resume_{this, held};
     auto q = [](std::vector<double> &v, double p) -> py::object {
       if (v.empty()) return py::str("");
@@ -2072,6 +2090,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("lanes_configure", &ActorDriver::lanes_configure).def("lanes_start", &ActorDriver::lanes_start)
       .def("lanes_stop", &ActorDriver::lanes_stop, py::call_guard<py::gil_scoped_release>())
       .def("lanes_pause", &ActorDriver::lanes_pause, py::call_guard<py::gil_scoped_release>()).def("lanes_resume", &ActorDriver::lanes_resume)
+      .def("lanes_request_pause", &ActorDriver::lanes_request_pause)
+      .def_property_readonly("lanes_paused", [](ActorDriver &d) { return d.lpaused.load(); })
       .def("lane_job_resume", &ActorDriver::lane_job_resume).def("lane_python_done", &ActorDriver::lane_python_done)
       .def("lane_test_intake", &ActorDriver::lane_test_intake)
       .def("lane_test_tick", &ActorDriver::lane_test_tick, py::call_guard<py::gil_scoped_release>())

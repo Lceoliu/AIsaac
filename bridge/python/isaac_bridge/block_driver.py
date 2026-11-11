@@ -514,6 +514,18 @@ def pause_serving(d, consume):
             consume(rec)
 
 
+def lanes_pause_serving(d, consume):
+    """(d2) The lane thread parked between two lane passes, its records consumed meanwhile (consume(rec)): the lane
+    thread can be blocked on Python (a lane record of kind 1 / 5 in the queue this caller consumes), so a plain
+    lanes_pause() cannot end there (it raises). Returns when the lane thread is parked, stopped or failed (the caller's
+    drain raises a failure record); no lane GPU work runs after it until lanes_resume()."""
+    d.lanes_request_pause()
+    while d.lanes_running and not d.lanes_paused and not d.lane_error():
+        rec = d.next_record(0.002)
+        if rec is not None:
+            consume(rec)
+
+
 def event_chunks(ws):
     """(B58e) [start, end) runs of an event batch in which no worker appears twice. _native_events takes a record's
     first rows before its ends; a batch spans steps, so a worker's first row after its end (the next episode) must be

@@ -5655,7 +5655,8 @@ def main(argv=None, child=None, actor=None):
             nv.push('h.job')
             if lane_thread:   # B58d d2: the lane thread stands still while the lineage is read and collected
                 t_lp = time.perf_counter()
-                cpp_driver.lanes_pause()
+                # (the lane thread may wait for a lane record in the queue: consumed while pausing, never a bare pause)
+                bdrv.lanes_pause_serving(cpp_driver, lambda r_: consume_record(r_, prof))
                 lane_stat['lane_handoff_pause_s'] = time.perf_counter()-t_lp
             if native_lin:   # B58c: the rollout's native sidecar as PagedSnapshots (what payload / plan read)
                 roll.block.materialize()
