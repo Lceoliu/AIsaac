@@ -10984,6 +10984,48 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
   - “其他”里最大的一项是每个主步之后的 lane pass 控制，约占“其他”的四成。它是定时轮询（每步一次扫描加一次 ppoll），是改成事件驱动的首选：只在有 lane 消息或点状态变化时跑。在 lane 卡方案里，它整块移到 lane 线程上。
   - 剩下的 1.0 s 要再加一个计数才能拆开（step_batch 结束到下一次 poll 之间）。
 
+### lane 卡的两个探针（gpu57，2026-11-11，不计时）
+
+#### (a) 两张 3090 之间的页拷贝（bridge/ops/p2p_probe.py）
+
+- **拓扑**（`nvidia-smi topo -m`）：8 张卡都在 NUMA node0。GPU 0–3 在同一个 PCIe 交换机下（PIX），4–7 在另一个下，两组之间经过主桥（PHB）。
+- **P2P 不可用**：GPU 4+6（同一交换机）和 GPU 3+4（跨主桥）两个方向都是 False。消费级 3090 不开 P2P，驱动经主机中转，所以两组卡对的数字几乎一样，拓扑不影响。
+- **每次拷贝的耗时**（GPU 4→6，200 次的中位；3→4 在百分之几以内）：
+
+| 大小 | 一次 | 带宽 | 连排 8 次 |
+|---:|---:|---:|---:|
+| 16 KiB | 44 µs | 0.4 GB/s | 222 µs |
+| 64 KiB | 51 µs | 1.3 GB/s | 239 µs |
+| 256 KiB | 76 µs | 3.5 GB/s | 494 µs |
+| 1 MiB | 224 µs | 4.7 GB/s | 1.65 ms |
+| 4 MiB | 838 µs | 5.0 GB/s | 6.5 ms |
+| 8 MiB | 1.64 ms | 5.1 GB/s | 13.0 ms |
+
+- **对 lane 卡设计的含义**：
+  - 每次拷贝有约 45 µs 的固定开销，带宽上限约 5 GB/s，连排也不会更快。
+  - 所以要合并拷贝：每个 lane 作业的新页一次拷回，不按行拷；每次 restore 的页打包成一块。
+  - 粗估每个 collect 约 3,000 次作业拷回加约 1,500 次各约 1 MiB 的 restore，合计约 0.5 s，全在 lane 线程上，不在 driver 上。restore 的实际大小还没量。
+
+#### (b) 现有 d2 在 thread_local 下（树 c-2138d55 / c-3e56f83，GPU 3 跑 actor、GPU 4 跑 learner，node1，6 轮）
+
+- 6 轮都跑完，没有 capture 错误，也没有 lane 错误；u6 的 cf_done 21–22，dropped 0。
+- **发现一个缺陷**：第一次运行退出时段错误（rc 139）。
+  - 原因：train_tok 收尾只停 driver，lane 线程要到解释器收尾时才由 driver 的析构函数 join，那时它可能还在碰 torch 对象。
+  - 修复（3e56f83）：收尾时先停 lane 线程并 join，再停 driver。
+  - 复跑 rc 130，和其他运行一样是正常的 SIGINT 结束。
+- **数字**（u2–u6 中位，和第 0 步对比；两次都是前几轮、宿主很忙，只看方向）：
+
+| | 第 0 步（lane 在 driver 线程上） | d2（lane 在自己的线程上，复跑） |
+|---|---:|---:|
+| collect / update（s） | 16.31 / 19.18 | 15.20 / 21.47 |
+| driver 主步等 GPU（s） | 10.80 | 12.31 |
+| abp-driver / abp-lane 占核 | 0.90 / — | 0.66 / 0.55 |
+
+  - lane 工作挪出 driver 线程后，collect 少约 1.1 s。
+  - 但 driver 主步等 GPU 多约 1.5 s：主图和 lane 图在同一张卡上抢 GPU。lane 卡就是要去掉这一块。
+  - d2 下 driver 的 lane 计数（drv_lane_s、drv_lpass_s）包含 lane 线程的时间，以及它 1 ms 的 ppoll 等待，所以和第 0 步不可比。
+- **结论**：lane 卡这条路目前没有挡路的问题。thread_local 下 d2 能跑；跨卡的页拷贝每个 collect 约 0.5 s，在 lane 线程上。下一步写 lane 卡的主体。
+
 ### cpp 线核心 TSAN（gpu57，2026-11-11，通过）
 
 - **机器**：gpu57（10.19.136.57，2x E5-2667 v3，内核 5.4，`vm.mmap_rnd_bits` = 28），容器 aisaac-bench:20261019（gcc 11.4），node1 的 CPU 8-15,24-31，共享锁。树 c-b33d1b6。
