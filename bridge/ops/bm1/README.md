@@ -73,3 +73,31 @@ GPU=1 ./probe.sh m77657fc
 - `tests/test_block_memory.py` 在 import 时调用 `torch.set_num_threads(4)`：只要它被收集，之后的所有测试都在 4 个 intra-op 线程下跑。现有的全部通过记录都是在这个条件下得到的，所以暂时不改；以后有空档时改成 fixture（设置后恢复）。conftest 的 session 预热在收集之后做，所以由它带起来的 libgomp 线程池不会被记到某个测试头上。
 - `xnew2.sh` 的 `NAME` 和 `PORT`（默认 b42new / 39200，和 4090 一样）：同一台机器上跑几个 trainer 时，每个要不同（shard2.sh 用 s0a / 39200 和 s1b / 39600）。
 - Nsight Systems 2023.4.4（和 4090 同版本）在这台机器上（cu128 运行时 + 580 驱动）做 CUDA 跟踪时：learner 那张卡的 kernel 没有记下来，learner.update 截断，trainer 在 capture 结束后段错误退出（rc 139）。推测是 CUPTI 版本和 CUDA 12.8 不配套，未确认。出问题的是 CUDA 跟踪（-t cuda）；只开 nvtx 和 python-gil、不开 CUDA 跟踪时，cpp 线在这台机器上实测可以用（split-gil-c-02b2169）。第一次还撞上了容器的 pids 上限（nsys 往每个被跟踪的进程注入线程），所以加了 `PIDS`。learner 的分段时间改用 `ISAAC_BLOCK_TIMING=1` 下的 CUDA event 分段（`isaac_bridge/learn_segments.py`，写到 `<run>/segments.jsonl`，用 `seg_table.py` 出表）。
+
+## 主机无关的配置（bm1.env）与两种启动方式
+
+所有主机相关的信息（路径、venv、游戏 runtime、分道、内存上限、锁、预期 GPU 数）只放在 `bm1/bm1.env` 里。部署时从 `env/` 复制一份：8x3090 用 `env/dgene-8x3090.env`，新机器从 `env/new-host.env.template` 照着 `probe_host.sh` 的探测结果填。脚本里不写任何硬件数字。
+
+- `run.sh <用途> <GPU列表> <命令>` 是唯一的启动入口；`dock.sh` 是它的旧名字，留着兼容。`BM1_MODE` 决定启动方式：
+  - `docker`：现状，`aisaac-bench-bm1-a1-<用途>` 容器。
+  - `direct`：直接在当前系统里跑。
+    - CPU 亲和用 `taskset -c $BM1_CPUSET`，内存节点用 `numactl --membind=$BM1_MEMS`（有 numactl 时），GPU 用 `CUDA_VISIBLE_DEVICES`，进程组用 `setsid`。
+    - 内存上限 `BM1_MEM`：能写 cgroup v2 时建子 cgroup 设 memory.max；写不了就由 `memguard.py` 每 2 s 加总进程树的 RSS，超限时写 bm1.log 并杀掉进程树。两种情况都会记日志，不会静默。
+    - 这种方式没有网络隔离，也没有只读根文件系统，所以 runtime 的文件权限要设成只读。
+- 前置检查 `preflight`：每个作业启动前都做。`nvidia-smi -L` 不能有错误行；如果设了 `BM1_GPU_EXPECT`，列出的卡数要够；内核日志里的 NVRM Xid 行数不能比基线（`preflight_baseline` 记的那个数）多。不通过就写 `STOP_QUEUE` 并记日志，之后所有脚本都拒绝启动，直到有人手动删掉这个文件。新机器启动后先跑一次 `sh -c '. ./common.sh; preflight_baseline'`。
+- 锁协议、bm1.log 的行格式、计时口径都和原来一样。`shard2.sh` 改成读两个分道文件（`env/dgene-lane0.env`、`env/dgene-lane1.env` 是 M1b 用的那两份）。
+- 删除：`trash`。有 `gio` 就用 `gio trash`，没有就移到 `bm1/trash/<时间>/`，不会直接删。
+
+## 从零装环境（新机器）
+
+1. 系统包（Ubuntu 22.04 的名字）：python3.10、python3.10-venv、python3.10-dev、g++（11.4）、gcc、xvfb（提供 xvfb-run）、util-linux（taskset、setsid）、procps（pkill）、numactl、sysstat（mpstat，没有也能跑）、zstd、git。NVIDIA 驱动要支持 CUDA 12.8（≥ 570，8x3090 上是 580.178.04）；CUDA toolkit 不需要，torch 的 pip 包里带了。
+2. Python 3.10.12 的 venv：先 `pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.7.1+cu128`，再 `pip install -r env/requirements-bm1.txt`。这份清单里的版本是 8x3090 共享 venv 的 pip freeze 再叠上 pydeps 之后的精确版本，所以新机器上不需要 pydeps 目录。
+3. 从 8x3090 拷：
+   - 游戏 runtime（`cpu-wide/home/isaac-abplus/runtime`，约 610 MB）→ `BM1_GAME_RUNTIME`，设成只读；
+   - `tools/stub_render_f.txt`（0.4 MB 的 tools 目录里只有这一个文件需要；`libabp_turbo.so` 由 `deploy.sh abphome` 从代码树重新编译）；
+   - `bm1/payloads/b45-payloads2`（3 MB，全量门要用）；
+   - 可选：`checkpoints/c99-segment2-final.pt`（81 MB，bm1 的计时和门都不用它）。
+   - instances 目录（11 MB）不用拷，会自动重建；venv（6.6 GB）不拷，按第 2 步重装；nsys 不装（它的 CUDA 跟踪在 cu128 上有问题，分段计时用 learn_segments）。
+4. 代码：`git archive <commit> bridge/python bridge/ops bridge/abplus bridge/engine` → `deploy.sh tree <名> <tar>`，然后 `deploy.sh abphome <名>`。
+5. 写 `bm1.env`（照 `probe_host.sh` 的输出填），跑 `preflight_baseline`，先做一次 2 轮的冒烟测试。
+

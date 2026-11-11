@@ -7,12 +7,12 @@
 #   usage (in the container): CODE=<tree> [NAME=b42new PORT=39200] sh /bench/bm1/xnew2.sh <tag> [limit_s=7200] [game_hours=125]
 #   (NAME / PORT: the instances' name and port base, distinct per trainer when several run on one host)
 #   NSYS_PREFIX: a profiler command put before the trainer (nsys_update.sh); empty for every timed run
-BM=/bench/bm1
+BM=${BM1_IN:-/bench/bm1}   # (bm1 as the runner sees it: run.sh passes BM1_IN; the 8x3090 container default)
 TAG=${1:-xnew-a1}
 OUT=$BM/reports/$TAG
 LIMIT=${2:-7200}
 HOURS=${3:-125}
-PY=/bench/home/isaac-abplus/.venv/bin/python
+PY=${BM1_PY:-/bench/home/isaac-abplus/.venv/bin/python}
 mkdir -p $BM/reports
 cd $BM/trees/${CODE:?CODE=<tree under bm1/trees>}/bridge/python
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1

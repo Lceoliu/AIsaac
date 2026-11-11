@@ -8,16 +8,15 @@
 #   SIGINT goes FRAC x (that row's update_s) seconds after progress row AFTER_ROW appears (with the learner on its own
 #   GPU the actor then usually waits for the learner: wait_learner).
 set -u
-BM=${BM:-/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/bm1}
-. $BM/lock.sh
+BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
+. $BM/common.sh
 TAG=$1; TREE=$2
 GPU=${GPU:-1,2}; SPLIT=${SPLIT:-1}; AFTER_ROW=${AFTER_ROW:-2}; FRAC=${FRAC:-0.8}
 R=$BM/reports; LOG=$R/bm1.log
 [ -e $R/$TAG ] && { echo "sigint_smoke.sh: $R/$TAG exists" >&2; exit 2; }
 take "sigint smoke $TAG ($TREE, GPU $GPU, not timed)"
-C=aisaac-bench-bm1-a1-sig-$TAG
 X=""; [ "$SPLIT" = 1 ] && X="-e EXTRA=--learner-device=cuda:1"
-DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 $X" $BM/dock.sh sig-$TAG $GPU sh /bench/bm1/xnew2.sh $TAG 3000 ${HOURS:-30.0} &
+DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 $X" $BM/run.sh sig-$TAG $GPU sh $BM1_IN/xnew2.sh $TAG 3000 ${HOURS:-30.0} &
 DP=$!
 while kill -0 $DP 2>/dev/null; do
   n=0; [ -f $R/$TAG/progress.csv ] && n=$(($(wc -l < $R/$TAG/progress.csv)-1))
@@ -27,7 +26,7 @@ done
 u=$(tail -1 $R/$TAG/progress.csv | cut -d, -f6)
 d=$(python3 -c "print(round(float('$u')*$FRAC, 2))")
 sleep $d
-docker exec $C pkill -INT -f '^/bench/home/isaac-abplus/.venv/bin/python -u train_tok.py'
+sigint_trainer sig-$TAG $TAG
 t_int=$(date '+%T')
 wait $DP
 rc=$?
@@ -37,5 +36,5 @@ held=$(grep -h 'BM1 shutdown' $R/$TAG.stdout | head -1 | cut -c1-120)
 where=$(grep -h -B1 '^KeyboardInterrupt' $R/$TAG.stdout $R/$TAG.stderr 2>/dev/null | grep -v '^KeyboardInterrupt' | grep -v '^--' | tail -2 | tr '\n' ' ' | cut -c1-200)
 rows=$(($(wc -l < $R/$TAG/progress.csv)-1))
 echo "$(date '+%F %T') sigint smoke $TAG: SIGINT at $t_int ($d s after row $AFTER_ROW, update_s $u); rc=$rc, terminate $term, last.pt $ck, rows $rows; held: ${held:-none}; landed: ${where:-?}" >> $LOG
-[ -d $R/$TAG/checkpoints ] && gio trash $R/$TAG/checkpoints
+[ -d $R/$TAG/checkpoints ] && trash $R/$TAG/checkpoints
 give
