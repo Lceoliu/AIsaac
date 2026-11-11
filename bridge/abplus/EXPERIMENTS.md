@@ -11652,3 +11652,63 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - ddff5b5：shared等待有界。等待中的shared任务留下W.<session>.<pid>标记；writer在取X之前，先让比它更早开始等的shared任务进去；writer优先保留。
   - test_lock.sh 5组测试。
 - **合并cpp线（e6cce7a）：** 全量门282 passed，3 skipped，1 xfailed；A8 8/8。M1之后新的分卡基线另排。
+
+#### BM1 C：跨分片梯度同步（第1–3步，gpu57，2026-11-11）
+- **代码：**
+  - 76f3ea9：isaac_bridge/shard_sync.py；train_tok 的同步、--shard-lr-mult；ops/bm1/shardk.sh 和 shardk_in.sh；tests/test_bm1_shard_sync.py。
+  - 6a16243：NCCL 两项设置。
+  - faeb516：test_source 正则。
+  - 51fff3a：锁的容器登记。
+  - 方案见共享笔记 bm1-C-sync-plan.md。
+  - 默认关；ISAAC_SHARD_WORLD>1 时才建进程组。
+- **K=1 逐位一致：以代码审计加门作为证据。** 协调会话已接受：GPU 上单路径重跑两次，整轮后的权重就差约 1e-5（原子加），所以无法用两次运行来比。审计按 faeb516 的 train_tok.py：
+  1. **新增计算都在 SYNC 判断之后。** K=1 时不建进程组，SYNC 为 None（2568–2581 行），以下全部跳过：
+     - 种子偏移（2027 行）；
+     - 梯度归约（3929 行）；
+     - 翻转钩子和逐步比对（3962 行）；
+     - minibatch 数对齐（4365 行）和零权重步（4606 行）；
+     - 每个 update 的比对（4624 行）；
+     - progress 列（4770 行）、检查点改名（3091 行）、收尾（6237 行）。
+
+     无条件新增的只有几样不参与计算的东西：
+     - step_params 的 weight 参数（3917 行），SYNC 为 None 时不读；
+     - sync_params 为 None、sync_step 计数器、shard_check 的定义（3896–3915 行）；
+     - shard_s0 为 None（4201 行）；
+     - L['shard_frac'] 记录。
+  2. **学习率：** SYNC 为 None 的分支（3401–3403 行）与原表达式逐字相同：`frac = min(1, (decisions - start) / max(1, target - start))`，`lr = lr + (lr_final - lr) * frac`。--shard-lr-mult 只在 SYNC 分支里乘。
+  3. **AuxNorm：** tok_aux.py 216–223 行，reduce 默认为 None，此时走原来的 Welford 代码，一行未改。
+  4. **collect 循环：** 5568–5575 行，原来的 while 条件原样搬进 go_on；SYNC 为 None 时不做 all_true，`if not go_on: break` 与原 while 等价。test_lane_batch_smoke::test_source 的正则同时认两种写法（faeb516）。
+
+  加上 mfaeb516 的全量门。
+- **单元测试：** tests/test_bm1_shard_sync.py，2 个 gloo 进程，在 gpu57 容器里通过，验证了：
+  - 加权均值等于单进程处理拼接 minibatch 的梯度；
+  - 参数和 Adam 状态逐位相同；
+  - 零权重步；
+  - 翻转一个比特能被发现并修复；
+  - AuxNorm 合并后等于一次拼接更新；
+  - 一个 rank 退出后，另一个在 10 s 内察觉（僵尸进程按已结束算）。
+- **NCCL：**
+  - 两个 rank 的 CUDA_VISIBLE_DEVICES 互不相交，NCCL 2.26 报 "peer access is not supported between these two devices"，只关 P2P 也一样。
+  - 在 GPU 5、7 上用双进程探针试了 5 种组合，只有 NCCL_CUMEM_ENABLE=0 的组合能完成 all_reduce。
+  - shardk_in.sh 设 NCCL_P2P_DISABLE=1 NCCL_CUMEM_ENABLE=0，走主机共享内存。
+- **翻转冒烟 c2flipc（树 m76f3ea9，K=2，lane b：GPU 1+2/node0、GPU 3+4/node1，每步比对）：**
+  - rank 1 在 update 2 的 step 3 翻转一个比特，两个 rank 在同一步都报哈希不一致，从 rank 0 广播恢复。
+  - 两个 rank 的计数相同：150 步，151 次比对，1 次不一致，1 次恢复，0 个零权重步，全局行数相同。
+  - 两个 rank 在同一个 update（第 10 个）一起结束，都正常退出。
+  - last.pt 和 last-rank1.pt 逐张量比较（模型、三个优化器、priv、aux 和 AuxNorm）：1085 个张量全部逐位相同。
+  - 同步开销（10 个 update 合计）：reduce_s 每个 rank 约 3.0 s；wait_s 53 s 和 43 s（含启动差）。
+- **一段无锁运行（已修复，未影响计时运行）：**
+  - 起因：gpu57 上部署的 common.sh、run.sh、shard2.sh、gate.sh 还是 cpp 合并之前的版本，里面没有 BM1_NAME。shardk.sh 在 set -u 下执行到写停止文件那一步时退出，17:13:14 它的 X 被下一个取锁者按"持有者 pid 已不在"清掉，而 c2flipc 的容器还在跑。
+  - 时间段：17:13:14 到约 17:16:30，17:16:06 手工写入停止文件后容器结束。
+  - 这段时间启动过的作业：
+    - c2killc：GPU 2 忙，未启动；
+    - A8 a8-m76f3ea9（共享锁，GPU 1）：17:13:30–17:13:54 跑完；
+    - fp32diag3：GPU 2 忙，未启动。
+  - 没有计时运行受影响。c2flipc 本身是冒烟测试，不计时，它的结论（发现并修复、逐位相同）不受影响。
+  - 修复（51fff3a）：
+    - run.sh 在 docker run 之前，把 `container <名字>` 写进它所在的锁文件（take_* 导出 LOCKFILE）；
+    - 锁文件只有在持有者 pid 已不在、并且登记的容器都不在运行时才算过期，否则保留并记一次日志；
+    - test_lock.sh 新增第 6 组：持有者被 SIGKILL，替身"容器"进程还活着时，共享取锁者一直等，替身结束后才拿到锁。在 gpu57 上全部通过。
+  - 4 个过时脚本已换成仓库版本，按 sha1 与仓库逐个核对一致。今后合并主线时，把"重新部署 ops 脚本并核对 sha1"作为合并步骤的一部分。
+- **待办（续训的种子）：** 单分片也是如此：worker 的开局种子 = seed + index + workers × n，n 每次进程启动都从 0 开始，检查点不存它。所以每次续训都会重跑同一批开局。应改为按已完成的进度偏移，比如已消耗的开局数或 update 数。
+- **待测：** c2killd（杀掉一个 rank）、门加 A8、c2time（24 轮同步）对照 capb2（同一时段不同步）。
