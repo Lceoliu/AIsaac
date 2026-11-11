@@ -4,7 +4,8 @@
 # Variables of bm1.env (env/dgene-8x3090.env documents each):
 #   BM1_MODE docker | direct, BM1_IN, BM1_PY, BM1_GAME_RUNTIME, BM1_CPUSET, BM1_MEMS, BM1_GPUS_OK, BM1_MEM, BM1_PIDS,
 #   BM1_LOCK, BM1_SESSION, BM1_GPU_EXPECT, BM1_IMAGE, BM1_DOCKER_BASE
-# Functions: take / give (the lane lock), capmode, preflight, sigint_trainer, trash, log.
+# Functions: take / give (the lane lock), capmode, preflight, sigint_trainer, trash, log. (Callers may run with set -e:
+# every grep -c here ends with || true, a zero count being no error.)
 BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 if [ -f "$BM/bm1.env" ]; then . "$BM/bm1.env"; else echo "bm1: $BM/bm1.env missing (copy one of $BM/env/*.env)" >&2; exit 2; fi
 # (the older per-script variables still override: CPUSET, MEMS, GPUS_OK, MEM, PIDS, LOCK, SESSION)
@@ -33,11 +34,11 @@ capmode() {
 # preflight: before a GPU job. Every GPU nvidia-smi -L lists without an error line, as many as BM1_GPU_EXPECT when set,
 # and no NVRM Xid in the kernel log beyond the count recorded by `preflight_baseline`. A failure is logged, the queue
 # stop file $BM/STOP_QUEUE written (every later script refuses until it is removed by hand), and the caller exits 3.
-xid_count() { ( journalctl -k --no-pager 2>/dev/null || dmesg 2>/dev/null ) | grep -c 'NVRM: Xid'; }
+xid_count() { ( journalctl -k --no-pager 2>/dev/null || dmesg 2>/dev/null ) | grep -c 'NVRM: Xid' || true; }
 preflight_baseline() { xid_count > $BM/.xid_baseline; log "preflight baseline: $(cat $BM/.xid_baseline) Xid lines in the kernel log"; }
 preflight() {
   if [ -f $BM/STOP_QUEUE ]; then echo "bm1: $BM/STOP_QUEUE exists ($(cat $BM/STOP_QUEUE)); nothing starts" >&2; exit 3; fi
-  L_=$(nvidia-smi -L 2>&1); n_=$(echo "$L_" | grep -c '^GPU '); e_=$(echo "$L_" | grep -ciE 'error|unable|unknown')
+  L_=$(nvidia-smi -L 2>&1); n_=$(echo "$L_" | grep -c '^GPU ' || true); e_=$(echo "$L_" | grep -ciE 'error|unable|unknown' || true)
   x_=$(xid_count); b_=$(cat $BM/.xid_baseline 2>/dev/null || echo "$x_")
   why=
   [ "$e_" -gt 0 ] && why="nvidia-smi -L reports an error"
@@ -68,7 +69,7 @@ trash() {
 gpus_free() {
   for g in $(echo "$1" | tr ',' ' '); do
     m=$(nvidia-smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
-    p=$(nvidia-smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)
+    p=$(nvidia-smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true)
     if [ -z "$m" ] || [ "$m" -ge "${BM1_GPU_FREE_MB:-500}" ] || [ "$p" -gt 0 ]; then
       log "GPU $g BUSY (memory used ${m:-?} MiB, ${p} compute process(es)): not started"
       exit 4
