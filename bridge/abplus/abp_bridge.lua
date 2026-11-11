@@ -2427,6 +2427,7 @@ local function fork_many(cmd)
 	-- the state it was cloned in afterwards (the teacher closes it)
 	local own = cmd.self_last == true and #batches or nil
 	local n = 0
+	getenv("ABP_FORK_PURPOSE:" .. (cmd.purpose and tostring(cmd.purpose) or "fork_many"))   -- 2026-11-11: abp_turbo ABP_CLONE_STATS
 	for i, codes in ipairs(batches) do
 		if i == own then break end
 		local answer = getenv("ABP_FORK")
@@ -2620,6 +2621,8 @@ local function handle_command(line)
 				tc_available = tc.available, tc_hits = tc.hits, tc_builds = tc.builds, tc_checks = tc.checks,
 				tc_mismatches = tc.mismatches })
 		elseif cmd.cmd == "fork" then   -- abp-0.2.14
+			-- 2026-11-11: the fork's purpose for abp_turbo's ABP_CLONE_STATS (the command's "purpose"; "other" without one)
+			getenv("ABP_FORK_PURPOSE:" .. (cmd.purpose and tostring(cmd.purpose) or "other"))
 			local answer = getenv("ABP_FORK")
 			if answer == "0" then
 				fork_clone(cmd)

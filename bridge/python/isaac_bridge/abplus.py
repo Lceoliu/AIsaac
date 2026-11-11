@@ -781,7 +781,7 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
         command), as fork(reseed=value) does in a new clone. The next observation carries the terrain block again."""
         return self.lua("return tostring(os.getenv('ABP_RESEED:%d'))" % int(value))
 
-    def fork(self, tag=None, timeout=20.0, alarm=None, reseed=None, lean=None):
+    def fork(self, tag=None, timeout=20.0, alarm=None, reseed=None, lean=None, purpose=None):
         """A clone of the game in exactly its current state (bridge abp-0.2.14, abp_turbo ABP_FORK): the game process
         forks; the clone connects back here and is driven like any instance (step, play, lua, fork). Returns a new
         client of this class with this client's settings; its close() ends the clone process, and so does `alarm` real
@@ -790,14 +790,18 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
         lean=True puts the clone into the bridge's lean mode (no per-frame bookkeeping, observations in the layout of
         abplus_lean.py: read them with abplus_lean.read_lean, not with step / play).
         Launch the instance with FORK_ENV. The clone's client shares this client's last observation and terrain cache
-        (neither is changed in place)."""
+        (neither is changed in place). purpose (2026-11-11): the clone's purpose for abp_turbo's ABP_CLONE_STATS
+        (FORK_PURPOSES; None: "other"), only counted when the instance runs with ABP_CLONE_STATS."""
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             listener.bind(("127.0.0.1", 0))
             listener.listen(1)
             listener.settimeout(timeout)
-            self._send({"cmd": "fork", "host": "127.0.0.1", "port": listener.getsockname()[1], "tag": tag,
-                        "alarm": alarm, "reseed": reseed, "lean": lean})
+            msg = {"cmd": "fork", "host": "127.0.0.1", "port": listener.getsockname()[1], "tag": tag,
+                   "alarm": alarm, "reseed": reseed, "lean": lean}
+            if purpose is not None:
+                msg["purpose"] = str(purpose)
+            self._send(msg)
             ack = self._recv()
             if ack.get("type") != "ok" or ack.get("cmd") != "fork":
                 raise BridgeError(f"fork failed: {ack}")
@@ -817,7 +821,7 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
         clone.pid = int(ack["pid"])
         return clone
 
-    def fork_many(self, batches, repeat=None, alarm=None, stop_clear=False, self_last=False, stat=False):
+    def fork_many(self, batches, repeat=None, alarm=None, stop_clear=False, self_last=False, stat=False, purpose=None):
         """Clones of the current state, one per batch of action codes, each playing its batch as `play` would on a
         fork() clone and reporting only its end (bridge fork_many, 2026-10-04: no connection, hello or observation per
         clone). Lean mode only. Returns per batch (player 0's total damage taken, dead, played, stop) at the frame the
@@ -830,6 +834,8 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
                "self_last": bool(self_last)}
         if stat:
             msg["stat"] = True
+        if purpose is not None:   # (ABP_CLONE_STATS: the clones' purpose; None: "fork_many")
+            msg["purpose"] = str(purpose)
         self._send(msg)
         msg = self._recv()
         if msg.get("type") != "ok" or msg.get("cmd") != "fork_many":

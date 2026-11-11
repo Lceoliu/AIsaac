@@ -116,6 +116,11 @@
 //                   2026-10-05): a clone with one thread whose registered mutexes are all free forks without the mutex
 //                   protocol (fork_lite: same memory in both processes, without its writes; see there).
 // getenv("ABP_EXIT") from game code ends a clone at once with _exit(0); it is refused (nil) outside a clone.
+// ABP_CLONE_STATS=<dir> (2026-11-11, the clones' CPU for the host's CPU accounting; off unless set): per fork purpose
+//                   (getenv("ABP_FORK_PURPOSE:<name>") before ABP_FORK / fork_many), the forks' cost in the parent, the
+//                   clones' frames and CPU (start, simulation, teardown) in a file every process of the instance adds
+//                   to (see cs_*, read by bridge/ops/clone_stats.py); getenv("ABP_CLONE_SELF") answers this process's
+//                   "<frames since its fork or start> <cpu_ns> <minflt>".
 // getenv("ABP_FORK_TIMES") (diagnostic, 2026-10-05) returns where this process's fork time went and its own CPU, run-queue
 //                   wait and minor faults (field list at the gate); getenv("ABP_MALLOC_INFO[:TRIM]") mallinfo2 (and
 //                   malloc_trim first). ABP_FM_COLLECT:<n>:w waits for the clones to exit (their CPU, exit included,
@@ -442,11 +447,14 @@ static void prof_start(void) {
 }
 
 static void reap_children(void);
+static void cs_tick(void);
+static void *cs;   // (ABP_CLONE_STATS: struct cs_map *, see cs_*)
 
 static void tick(void) {
     v_mono_ns += FRAME_NS;
     reads_since_tick = 0;
     ticks++;
+    if (cs) cs_tick();
     if (n_children) {
         reap_children();
     }
@@ -950,6 +958,175 @@ static void game_mutexes_release_child(void) {
 
 static uint64_t ft_reaped_ns;   // CPU of the reaped clones, exit included (getrusage of wait4; ABP_FORK_TIMES)
 
+// ---- ABP_CLONE_STATS (2026-11-11): the clones' CPU by fork purpose, for the host's CPU accounting. Off unless set.
+// ABP_CLONE_STATS=<dir> at launch: the instance's root process creates <dir>/clone-stats-<pid>.bin and maps it
+// MAP_SHARED; every clone inherits the mapping, so every process of the instance (clones of clones too) adds to one
+// table (atomic adds). The purpose of a process's next forks: getenv("ABP_FORK_PURPOSE:<name>") (the bridge sends the
+// command's "purpose" field; CS_NAMES, an unknown name counts as "other"); a clone keeps the purpose it was forked with
+// until it is set again. Per purpose:
+//   parent side, per fork: forks; the fork's wall (mutex protocol + fork syscall, = ft_total) and the syscall's wall
+//     alone; the forking thread's CPU across fork() (the kernel copying the VMAs and page tables, charged to the
+//     parent); the parent's VmRSS and VmPTE (/proc/self/status, read before the fork) and, every CS_MAPS_EVERY-th
+//     fork, its map count (/proc/self/maps lines); the largest fork wall.
+//   clone side: clones; frames (the game's frame counter at ABP_EXIT minus at the fork); the clone's own CPU (it
+//     starts from zero at the fork) from the fork's return to the first loop tick that sees the frame counter move
+//     ("start": isolation, the bridge's answer to the fork command, the first copy-on-write faults), from there to
+//     ABP_EXIT ("sim": the frames and the bridge's work between them); minor faults of both parts; exits through
+//     ABP_EXIT. A clone that never sees a frame move puts all its CPU into start.
+//   reaper side (the forking process's wait4 rusage, at its next fork / fork_many collect / frame tick): reaped
+//     clones and their whole CPU; for those that ended through ABP_EXIT the teardown = whole CPU - CPU at ABP_EXIT
+//     (exit_mmap: the clone's page tables and its private pages released, after _exit); the others (alarm, signal)
+//     counted apart with their CPU. A clone whose parent ended first is reaped by nobody here.
+// The file stays after the instance ends. Nothing the game reads.
+#define CS_P 8
+#define CS_SLOTS 4096
+#define CS_MAPS_EVERY 16
+static const char *const CS_NAMES[CS_P] = {"other", "episode", "snap", "hurt", "fatal", "random", "cf", "fork_many"};
+enum {
+    CSF_FORKS, CSF_FORK_WALL_NS, CSF_FORK_SYS_WALL_NS, CSF_FORK_CPU_NS, CSF_FORK_WALL_MAX_NS, CSF_RSS_KB, CSF_PTE_KB,
+    CSF_MAPS, CSF_MAPS_N,
+    CSF_CLONES, CSF_FRAMES, CSF_CPU_START_NS, CSF_CPU_SIM_NS, CSF_FLT_START, CSF_FLT_SIM, CSF_EXITS,
+    CSF_REAPED, CSF_CPU_TOTAL_NS, CSF_CPU_TEARDOWN_NS, CSF_REAPED_NOEXIT, CSF_CPU_NOEXIT_NS,
+    CSF_N = 24
+};
+struct cs_slot { int64_t pid; uint64_t cpu_exit_ns; };
+struct cs_map {
+    char magic[8];          // "ABPCLST1"
+    uint64_t version, root_pid, n_purposes, n_fields, n_slots, slots_lost, reserved;
+    uint64_t f[CS_P][CSF_N];
+    struct cs_slot slot[CS_SLOTS];   // a clone's CPU at ABP_EXIT until its parent reaps it (by pid)
+};
+static int cs_purpose;          // the purpose of this process's next forks
+static int cs_own = -1;         // (a clone) the purpose it was forked with
+static uint32_t cs_frame0;      // (a clone) the game's frame counter at its fork
+static int cs_first_seen;
+static uint64_t cs_cpu_first, cs_flt_first, cs_nforks;
+static uint8_t children_purpose[MAX_CHILDREN];   // (the forking process) per child in children[]
+
+static inline struct cs_map *csm(void) { return (struct cs_map *)cs; }
+static inline void cs_add(int p, int f, uint64_t v) { __atomic_fetch_add(&csm()->f[p][f], v, __ATOMIC_RELAXED); }
+static inline void cs_max(int p, int f, uint64_t v) {
+    uint64_t cur = __atomic_load_n(&csm()->f[p][f], __ATOMIC_RELAXED);
+    while (v > cur && !__atomic_compare_exchange_n(&csm()->f[p][f], &cur, v, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+static uint64_t cs_minflt(void) {
+    struct rusage ru;
+    return getrusage(RUSAGE_SELF, &ru) == 0 ? (uint64_t)ru.ru_minflt : 0;
+}
+
+static void cs_init(void) {
+    const char *dir = getenv("ABP_CLONE_STATS");
+    if (!dir || !*dir) return;
+    char path[4096];
+    snprintf(path, sizeof path, "%s/clone-stats-%d.bin", dir, (int)getpid());
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0 || ftruncate(fd, (off_t)sizeof(struct cs_map)) != 0) {
+        fprintf(stderr, "ABP_CLONE_STATS: cannot create %s: %s\n", path, strerror(errno));
+        if (fd >= 0) close(fd);
+        return;
+    }
+    void *m = mmap(NULL, sizeof(struct cs_map), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) {
+        fprintf(stderr, "ABP_CLONE_STATS: mmap %s: %s\n", path, strerror(errno));
+        return;
+    }
+    struct cs_map *c = (struct cs_map *)m;
+    memcpy(c->magic, "ABPCLST1", 8);
+    c->version = 1; c->root_pid = (uint64_t)getpid(); c->n_purposes = CS_P; c->n_fields = CSF_N; c->n_slots = CS_SLOTS;
+    cs = m;
+    fprintf(stderr, "ABP_CLONE_STATS %s\n", path);
+}
+
+static char *cs_set_purpose(const char *name) {
+    int p = 0;
+    for (int i = 0; i < CS_P; i++) if (strcmp(name, CS_NAMES[i]) == 0) p = i;
+    cs_purpose = p;
+    return (char *)CS_NAMES[p];
+}
+
+// /proc/self/status VmRSS and VmPTE (kB)
+static void cs_status(uint64_t *rss, uint64_t *pte) {
+    *rss = *pte = 0;
+    char buf[8192];
+    int fd = open("/proc/self/status", O_RDONLY);
+    if (fd < 0) return;
+    ssize_t n = read(fd, buf, sizeof buf - 1);
+    close(fd);
+    if (n <= 0) return;
+    buf[n] = 0;
+    char *a = strstr(buf, "VmRSS:"), *b = strstr(buf, "VmPTE:");
+    if (a) *rss = strtoull(a + 6, NULL, 10);
+    if (b) *pte = strtoull(b + 6, NULL, 10);
+}
+
+static uint64_t cs_maps(void) {
+    char buf[65536];
+    uint64_t lines = 0;
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof buf)) > 0) {
+        for (ssize_t i = 0; i < n; i++) lines += buf[i] == '\n';
+    }
+    close(fd);
+    return lines;
+}
+
+// the first loop tick of a clone that sees the game's frame counter move: the end of its start
+static void cs_tick(void) {
+    if (!is_child || cs_first_seen || read_u32(G_GAME, GAME_FRAMECOUNT) == cs_frame0) return;
+    cs_first_seen = 1;
+    cs_cpu_first = real_ns(CLOCK_PROCESS_CPUTIME_ID);
+    cs_flt_first = cs_minflt();
+}
+
+// ABP_EXIT in a clone: its frames and CPU, its CPU at the exit for the parent's teardown figure
+static void cs_exit(void) {
+    if (!cs || !is_child || cs_own < 0) return;
+    uint64_t cpu = real_ns(CLOCK_PROCESS_CPUTIME_ID), flt = cs_minflt();
+    int p = cs_own;
+    cs_add(p, CSF_FRAMES, (uint64_t)(uint32_t)(read_u32(G_GAME, GAME_FRAMECOUNT) - cs_frame0));
+    if (cs_first_seen) {
+        cs_add(p, CSF_CPU_START_NS, cs_cpu_first); cs_add(p, CSF_CPU_SIM_NS, cpu - cs_cpu_first);
+        cs_add(p, CSF_FLT_START, cs_flt_first); cs_add(p, CSF_FLT_SIM, flt - cs_flt_first);
+    } else {
+        cs_add(p, CSF_CPU_START_NS, cpu); cs_add(p, CSF_FLT_START, flt);
+    }
+    cs_add(p, CSF_EXITS, 1);
+    struct cs_map *c = csm();
+    int64_t me = (int64_t)getpid();
+    for (int k = 0; k < CS_SLOTS; k++) {   // (open addressing by pid; a stale slot of the same pid is reused)
+        struct cs_slot *sl = &c->slot[((uint64_t)me * 2654435761u + (uint64_t)k) % CS_SLOTS];
+        int64_t cur = __atomic_load_n(&sl->pid, __ATOMIC_ACQUIRE);
+        if (cur == me || (cur == 0 && __atomic_compare_exchange_n(&sl->pid, &cur, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))) {
+            __atomic_store_n(&sl->cpu_exit_ns, cpu + 1, __ATOMIC_RELEASE);   // (+1: 0 = not written yet)
+            return;
+        }
+    }
+    __atomic_fetch_add(&c->slots_lost, 1, __ATOMIC_RELAXED);
+}
+
+// a child reaped (wait4's rusage): its whole CPU; teardown when it left its CPU at ABP_EXIT
+static void cs_reaped(pid_t pid, int p, uint64_t total) {
+    struct cs_map *c = csm();
+    for (int k = 0; k < CS_SLOTS; k++) {
+        struct cs_slot *sl = &c->slot[((uint64_t)(int64_t)pid * 2654435761u + (uint64_t)k) % CS_SLOTS];
+        int64_t cur = __atomic_load_n(&sl->pid, __ATOMIC_ACQUIRE);
+        if (cur == 0) break;
+        if (cur != (int64_t)pid) continue;
+        uint64_t at = __atomic_exchange_n(&sl->cpu_exit_ns, 0, __ATOMIC_ACQ_REL);
+        __atomic_store_n(&sl->pid, -1, __ATOMIC_RELEASE);   // (a tombstone: later probes go on past it)
+        if (at) {
+            cs_add(p, CSF_REAPED, 1); cs_add(p, CSF_CPU_TOTAL_NS, total);
+            cs_add(p, CSF_CPU_TEARDOWN_NS, total > at - 1 ? total - (at - 1) : 0);
+            return;
+        }
+        break;
+    }
+    cs_add(p, CSF_REAPED_NOEXIT, 1); cs_add(p, CSF_CPU_NOEXIT_NS, total);
+}
+
 static void reap_children_wait(int options) {
     int kept = 0;
     for (int i = 0; i < n_children; i++) {
@@ -957,10 +1134,13 @@ static void reap_children_wait(int options) {
         struct rusage ru;
         pid_t r = wait4(children[i], &status, options, &ru);
         if (r > 0) {
-            ft_reaped_ns += (uint64_t)ru.ru_utime.tv_sec * 1000000000ULL + (uint64_t)ru.ru_utime.tv_usec * 1000ULL +
-                            (uint64_t)ru.ru_stime.tv_sec * 1000000000ULL + (uint64_t)ru.ru_stime.tv_usec * 1000ULL;
+            uint64_t whole = (uint64_t)ru.ru_utime.tv_sec * 1000000000ULL + (uint64_t)ru.ru_utime.tv_usec * 1000ULL +
+                             (uint64_t)ru.ru_stime.tv_sec * 1000000000ULL + (uint64_t)ru.ru_stime.tv_usec * 1000ULL;
+            ft_reaped_ns += whole;
+            if (cs) cs_reaped(r, children_purpose[i], whole);
         }
         if (r == 0) {
+            children_purpose[kept] = children_purpose[i];
             children[kept++] = children[i];
         } else if (r > 0 && WIFSIGNALED(status)) {
             clones_signalled++;
@@ -1277,11 +1457,24 @@ static char *fork_game(void) {
         if (lite) fork_lite_n++;
         else fork_lite_refused++;
     }
+    uint64_t cs_rss = 0, cs_pte = 0, cs_mp = 0;
+    int cs_p = cs_purpose;
+    if (cs) {   // (ABP_CLONE_STATS: read before the fork's clock starts again below; t0 .. t3 stays the fork's wall)
+        cs_status(&cs_rss, &cs_pte);
+        if (cs_nforks++ % CS_MAPS_EVERY == 0) cs_mp = cs_maps() + 1;
+        t0 = real_ns(CLOCK_MONOTONIC);
+        ft_t0 = t0;
+    }
     if (!lite) game_mutexes_hold();
     uint64_t t1 = real_ns(CLOCK_MONOTONIC);
+    uint64_t cs_c0 = cs ? real_ns(CLOCK_THREAD_CPUTIME_ID) : 0;
     pid_t pid = fork();
     if (pid == 0) {
         uint64_t c0 = real_ns(CLOCK_MONOTONIC);
+        if (cs) {
+            cs_own = cs_p; cs_frame0 = read_u32(G_GAME, GAME_FRAMECOUNT); cs_first_seen = 0; cs_nforks = 0;
+            cs_add(cs_p, CSF_CLONES, 1);
+        }
         is_child = 1;
         if (!lite) game_mutexes_release_child();
         uint64_t c1 = real_ns(CLOCK_MONOTONIC);
@@ -1293,8 +1486,15 @@ static char *fork_game(void) {
         return "0";
     }
     uint64_t t2 = real_ns(CLOCK_MONOTONIC);
+    uint64_t cs_c1 = cs ? real_ns(CLOCK_THREAD_CPUTIME_ID) : 0;
     if (!lite) game_mutexes_release_parent();
     uint64_t t3 = real_ns(CLOCK_MONOTONIC);
+    if (cs && pid > 0) {
+        cs_add(cs_p, CSF_FORKS, 1); cs_add(cs_p, CSF_FORK_WALL_NS, t3 - t0); cs_add(cs_p, CSF_FORK_SYS_WALL_NS, t2 - t1);
+        cs_add(cs_p, CSF_FORK_CPU_NS, cs_c1 - cs_c0); cs_max(cs_p, CSF_FORK_WALL_MAX_NS, t3 - t0);
+        cs_add(cs_p, CSF_RSS_KB, cs_rss); cs_add(cs_p, CSF_PTE_KB, cs_pte);
+        if (cs_mp) { cs_add(cs_p, CSF_MAPS, cs_mp - 1); cs_add(cs_p, CSF_MAPS_N, 1); }
+    }
     fork_last_us = (t3 - t0) / 1000;
     ft_n++;
     ft_total_ns += t3 - t0;
@@ -1305,6 +1505,7 @@ static char *fork_game(void) {
         return "-1";
     }
     forks++;
+    children_purpose[n_children] = (uint8_t)cs_p;
     children[n_children++] = pid;
     snprintf(answer, sizeof answer, "%d", (int)pid);
     return answer;
@@ -2458,8 +2659,19 @@ char *getenv(const char *name) {
             return getenv_ok;
         }
         if (strcmp(name, "ABP_EXIT") == 0) {
-            if (is_child) _exit(0);
+            if (is_child) {
+                if (cs) cs_exit();
+                _exit(0);
+            }
             return NULL;
+        }
+        if (strncmp(name, "ABP_FORK_PURPOSE:", 17) == 0) return cs_set_purpose(name + 17);   // (ABP_CLONE_STATS)
+        if (strcmp(name, "ABP_CLONE_SELF") == 0) {   // "<frames since the fork (a clone) or the start> <cpu_ns> <minflt>"
+            static char cself[96];
+            uint32_t fr = read_u32(G_GAME, GAME_FRAMECOUNT) - (is_child && cs_own >= 0 ? cs_frame0 : 0);
+            snprintf(cself, sizeof cself, "%u %llu %llu", fr, (unsigned long long)real_ns(CLOCK_PROCESS_CPUTIME_ID),
+                     (unsigned long long)cs_minflt());
+            return cself;
         }
         if (strncmp(name, "ABP_ALARM:", 10) == 0) {
             if (!is_child) return NULL;
@@ -3925,6 +4137,7 @@ int __libc_start_main(int (*main_fn)(int, char **, char **), int argc, char **ar
     const char *fm = getenv("ABP_FAST");
     if (fm && strtoul(fm, NULL, 0) != 0) fast_apply((unsigned)strtoul(fm, NULL, 0));
     prof_start();
+    cs_init();
     stack_dump_install();
     {
         void *warm[2];

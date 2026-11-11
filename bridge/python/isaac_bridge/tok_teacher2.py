@@ -61,6 +61,8 @@ V2_META = len(V2_FIELDS)
 VI = {k: i for i, k in enumerate(V2_FIELDS)}
 KIND_HURT, KIND_FATAL, KIND_RANDOM = 1, 2, 3
 KIND_CF = 4          # B34 (2026-10-16): a counterfactual teacher's choice point (tok_cf.py)
+# (2026-11-11) a point's clones by purpose for abp_turbo's ABP_CLONE_STATS (the teacher search, the death search, CF)
+PURPOSE = {KIND_HURT: 'hurt', KIND_FATAL: 'fatal', KIND_RANDOM: 'random', KIND_CF: 'cf'}
 INTENT_STICKY = 9
 INTENT_TARGET = 10   # B34: the move toward the choice point's target (tok_cf.TargetIntent)
 INTENT_BOMB = 11     # B40 (2026-10-18): the walk to a candidate secret-room wall and one bomb (tok_cf.BombIntent)
@@ -307,7 +309,7 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
     while it returns None); 'from' = j0 (None: it never started), 'ret' the return-to-go of the kept records."""
     from .tok_obs import EV_EXIT
     from .tok_sampler import applied_action, lean_step, step_action
-    B = S.fork(lean=True, alarm=ctx.alarm)
+    B = S.fork(lean=True, alarm=ctx.alarm, purpose=PURPOSE.get(getattr(pt, 'kind', None)))
     intent.reset()
     out = dict(score=0.0, n=0, end=END_STOP, boot=False, v_end=0.0, frames=0)
     rows, pends, acts, vals, lps, rews, hs, ts = [], [], [], [], [], [], [], []
@@ -420,7 +422,8 @@ def restore(pt, d, ctx):
     point's 4 x 180 game s + replicate outlived the 120-s clone watchdog, the next fork found S gone ("connection
     closed by game": 231 of 5,190 points lost at u721; C99 at 10 s per point: 0)."""
     from .tok_sampler import play_actions
-    S = pt.base.fork(reseed=pt.reseed, lean=True, alarm=(max(int(ctx.alarm), 120) if int(ctx.alarm) > 0 else 0))
+    S = pt.base.fork(reseed=pt.reseed, lean=True, alarm=(max(int(ctx.alarm), 120) if int(ctx.alarm) > 0 else 0),
+                     purpose=PURPOSE.get(getattr(pt, 'kind', None)))
     try:
         dec = LeanDecoder()
         S._send({"cmd": "obs"})
