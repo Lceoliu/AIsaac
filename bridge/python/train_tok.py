@@ -5666,12 +5666,15 @@ def main(argv=None, child=None, actor=None):
         # raised again once everything is closed. Before: a SIGINT while this block waited for the learner's last
         # update (wait_learner below) skipped the learner's join and last.pt's save; the interpreter then finalised
         # under a running backward (pt_autograd_1 taken by pthread_exit -> std::terminate, rc 134; split-mb427b8d).
-        # Order: the learner's current update ends and it is joined (with the learner prefetch worker), then the
-        # driver stops (B52: it stopped first before).
+        # The driver stops first (B52), then the learner's current update ends and it is joined (with the learner
+        # prefetch worker). (BM1: stopping the driver after the learner's join hung a split run's exit for 70 min,
+        # gatecount-split-mf765780: the driver, its records no longer consumed, ended up waiting for Python.)
         import signal as signal_
         deferred_int = []
         prev_int = (signal_.signal(signal_.SIGINT, lambda *a_: deferred_int.append(1))
                     if threading.current_thread() is threading.main_thread() else None)
+        if cpp_driver is not None:   # (B52)
+            cpp_driver.stop()
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
             # (2026-11-05: past this point nobody needs what is still unsent: a clean end has seen the stop, which comes after
@@ -5724,8 +5727,6 @@ def main(argv=None, child=None, actor=None):
             save(out / 'checkpoints' / 'last.pt')
             if slog is not None:
                 slog.close()
-        if cpp_driver is not None:   # (B52; BM1: after the learner's end)
-            cpp_driver.stop()
         sampler.close()
         if log_file is not None:
             log_file.close()
