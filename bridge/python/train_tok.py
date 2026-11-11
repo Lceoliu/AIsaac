@@ -3758,6 +3758,39 @@ def main(argv=None, child=None, actor=None):
         t_table = None
         gn_acc = torch.zeros(1, device=device) if gn_on else None
         gn_clip = torch.zeros(1, device=device) if gn_on else None   # (B51: optimizer steps whose norm was clipped)
+
+        def step_params():
+            """BM1: the learner's one parameter-update entry, from the gradients being final (the minibatch's last
+            part's backward done) to the three optimisers' steps: priv's and aux's clip and step, the B43 gradient
+            norms (Writer, Spatial), the policy's clip, its step. A pure move of the code that was inline here (the
+            same calls in the same order: bit-identical). The place where a cross-device / cross-shard gradient
+            reduction will go: first, before any norm or clip reads a gradient."""
+            nonlocal hist_gn, hist_gn_steps, gn_acc, gn_clip
+            if priv_on:   # (the privileged encoder's and heads' norm apart: their gradient is the critic's alone)
+                torch.nn.utils.clip_grad_norm_(pcritic.parameters(), args.max_grad_norm)
+                popt.step()
+            if aux_on:   # (the policy's norm as ever, aux's share included; the head's apart: not PPO's scale)
+                torch.nn.utils.clip_grad_norm_(aux_head.parameters(), args.max_grad_norm)
+                aopt.step()
+            SEG.mark(start='opt.b43norm')
+            if block_on:   # B43: the Writer's and Spatial's gradient norms of this step
+                gn_ws_ = [torch.linalg.vector_norm(torch.stack([q.grad.float().norm() for q in mod_.parameters()
+                                                                if q.grad is not None] or [torch.zeros((), device=device)]))
+                          for mod_ in (learner_model.block_memory.writer, learner_model.structured_spatial)]
+                hist_gn = gn_ws_ if hist_gn is None else [a_+b_ for a_, b_ in zip(hist_gn, gn_ws_)]
+                hist_gn_steps += 1
+            SEG.mark(start='opt.clip')
+            with (bpt.GpuSpan('learn_clip') if block_on else contextlib.nullcontext()):
+                if gn_on:   # (progress.csv grad_norm: how far the clip scales the policy's gradient)
+                    gn_ = torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+                    gn_acc += gn_
+                    gn_clip += (gn_ > args.max_grad_norm).float()
+                else:
+                    torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+            SEG.mark(start='opt.step')
+            with (bpt.GpuSpan('learn_opt') if block_on else contextlib.nullcontext()):
+                opt.step()
+
         if block_on:
             from isaac_bridge import block_learner as blearn
 
@@ -4206,30 +4239,7 @@ def main(argv=None, child=None, actor=None):
                                        [None if q.grad is None else q.grad.clone()
                                         for q in opt.param_groups[0]['params']]))
                 m_ = pmark('b38:clip_opt', m_)
-                if priv_on:   # (the privileged encoder's and heads' norm apart: their gradient is the critic's alone)
-                    torch.nn.utils.clip_grad_norm_(pcritic.parameters(), args.max_grad_norm)
-                    popt.step()
-                if aux_on:   # (the policy's norm as ever, aux's share included; the head's apart: not PPO's scale)
-                    torch.nn.utils.clip_grad_norm_(aux_head.parameters(), args.max_grad_norm)
-                    aopt.step()
-                SEG.mark(start='opt.b43norm')
-                if block_on:   # B43: the Writer's and Spatial's gradient norms of this step
-                    gn_ws_ = [torch.linalg.vector_norm(torch.stack([q.grad.float().norm() for q in mod_.parameters()
-                                                                    if q.grad is not None] or [torch.zeros((), device=device)]))
-                              for mod_ in (learner_model.block_memory.writer, learner_model.structured_spatial)]
-                    hist_gn = gn_ws_ if hist_gn is None else [a_+b_ for a_, b_ in zip(hist_gn, gn_ws_)]
-                    hist_gn_steps += 1
-                SEG.mark(start='opt.clip')
-                with (bpt.GpuSpan('learn_clip') if block_on else contextlib.nullcontext()):
-                    if gn_on:   # (progress.csv grad_norm: how far the clip scales the policy's gradient)
-                        gn_ = torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
-                        gn_acc += gn_
-                        gn_clip += (gn_ > args.max_grad_norm).float()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
-                SEG.mark(start='opt.step')
-                with (bpt.GpuSpan('learn_opt') if block_on else contextlib.nullcontext()):
-                    opt.step()
+                step_params()   # (BM1: the one parameter-update entry)
                 pmark(None, m_)
                 sec('opt')
         if block_on:
