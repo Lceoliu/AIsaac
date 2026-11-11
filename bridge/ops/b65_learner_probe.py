@@ -244,6 +244,10 @@ def main():
     m0 = torch.cuda.memory_reserved(0)
     graphs, blockers = [], []
     for i, P in enumerate(Ps):
+        if os.environ.get('PROBE_SKIP_P1') == '1':
+            graphs.append(None); continue
+        if blockers:   # (after the first failure the rest are not tried: its memory is what is missing)
+            graphs.append(None); continue
         try:
             graphs.append(capture(model, P, cache, pool))
         except BaseException as e:
@@ -256,6 +260,9 @@ def main():
         pass
     emit(stage='p1_capture', captured=sum(g is not None for g in graphs), parts=len(Ps), extra_reserved_gb=round((m1-m0)/2**30, 2),
          blockers=blockers[:5])
+    if blockers or os.environ.get('PROBE_SKIP_P1') == '1':   # (free what was captured: the P2 stage needs the card)
+        graphs = [None]*len(Ps)
+        import gc; gc.collect(); torch.cuda.empty_cache()
     if all(g is not None for g in graphs):
         diffs = []
         for g, rg in zip(graphs, ref):
