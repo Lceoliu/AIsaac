@@ -11222,3 +11222,40 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - 在m16acc6d上第一次跑这3次门时，test_b62_capture_gate的对照组失败了：它默认“关掉闸后capture一定作废”，这个前提只在global下成立。已在m62c6130里改好：对照组的子进程固定用global，另外加一项检查，确认thread_local下关掉闸capture也完好。
   - A8：8个seed都ok。
   - 分卡24轮（split-tl-m16acc6d，thread_local）：collect 17.26 s，update 17.71 s，×实时235.9（u2–u23为239.7），u15 CF是102 / 19 / 138.8k / 0 / 0，block_steady_compiles为0，退出rc 130。速度和CF都和global下的两次单片一致（235.2、227.6）；C++ driver的graph重放没有异常。
+
+### BM1 第五轮：默认切到thread_local、闸的计数、learner分段计时（代码）、GPU 5掉卡（2026-11-11）
+
+机器：8x3090（Gold 6146 + 3090 + cu128），本道node0。
+
+#### 默认切到thread_local（e217c60；cpp的测试修复d90dcc0已cherry-pick为d3bfb83，只改了test_b52和test_b54两个测试文件）
+- ISAAC_CAPTURE_MODE默认改为thread_local，global仍然可以选。SideCuda闸、gc关闭、capture互斥都没动。gate.sh和prof.sh会把实际使用的capture模式写进bm1.log。
+- 全量门（mf765780，日志写明capture mode thread_local）：跑了3遍，每遍都是270 passed、3 skipped，全绿。A8：8/8 ok。
+- 单卡24轮计时（base-mf765780，GPU 1）：collect 31.58 s，update 17.89 s，×实时136.4（u2–u23为143.2）；u15 CF 95 / 0 / 125.6k / 0 / 0，每游戏小时5.22。base-m77657fc（global）是collect 32.23 s、×实时135.4，所以collect快了2%，没有超过“变差5%”的门。
+
+#### SideCuda闸的计数（0293745，gatecount-split-mf765780，分卡10轮）
+- 每轮获取闸的次数：prefetch线程52–76次，learner线程2–4次，其他线程0次。等待次数和等待时间全部为0。capture只在u1发生（66次，都是启动时的预捕获）。C++ driver不经过这个闸。
+- 结论：每周期等待为0 s，删闸只是代码简化，没有速度上的意义，排到后面再做。
+
+#### learner分段计时（691ec41、bc93b0f；只写了代码，还没在GPU上验证，见下面的GPU故障）
+- 新增isaac_bridge/learn_segments.py：只在ISAAC_BLOCK_TIMING=1时生效；关闭时每次调用只做一次布尔判断，不建event，也不发任何CUDA调用。
+- 每个段记三样：主机时间；learner流上段首和段尾两个event之间的跨度（包含流的空闲，不是“GPU忙时间”）；段尾工作的滞后，以update末尾原有的那次同步为锚点，不额外加同步。结果写入<run>/segments.jsonl，用bm1/seg_table.py出表。
+- 段的划分：learn()原有的各个section；B38的part标记（plan、forward、backward、stats、clip_opt，最后这个就是priv和aux的clip与step）；PPO part里的host打包等待（ppo.pack）和前向发射（ppo.dispatch）；优化器段内的B43范数、clip、step。
+
+#### SIGINT收尾顺序的更正（f94e225）
+- 决定a里我把driver.stop()挪到了learner join之后。gatecount这次运行01:39:10收到SIGINT后没有退出，70分钟后被timeout杀掉（rc 137）。
+- 已把driver.stop()放回finally开头（恢复B52原来的顺序），SIGINT暂存保留。挂死的原因不确定：可能是这个顺序（driver没人消费记录，停在等Python），也可能和91秒后整机的GPU故障有关（见下）。
+
+#### GPU 5掉卡，整机GPU不可用
+- 内核日志：01:40:41，PCI 0000:89:00（GPU 5）报Xid 79 “GPU has fallen off the bus”，并生成了GPU崩溃转储；同一秒，8张卡全部报Xid 154（GPU recovery action changed to Node Reboot Required）。
+- 之后nvidia-smi读不到GPU 5；容器里即使只给GPU 1，CUDA初始化也失败（CUDA unknown error）。02:49以后的收尾smoke（5次）、分段计时的开、关验收都在启动时就失败了，不能说明代码有问题，机器恢复后要重跑。
+- 01:40时我这条道只在用GPU 1和2。需要整机重启（要root或管理员）。
+
+#### 第五轮补记：故障期间的无效运行、尚未验证的改动（2026-11-11）
+- 01:40:41之后，主机一直处在“需要重启”的状态（Xid 79和154）。这段时间里的运行全部作废，不作为结果使用：
+  - sigx5-single-mf765780、sigy1-mf94e225、sigy2-mf94e225、sigy3-mf94e225、sigy4-single-mf94e225、sigy5-single-mf94e225、segoff-2u-mf94e225、segon-split-mf94e225：建CUDA上下文时就失败（CUDA unknown error），rc 1，0行；
+  - gatecount-split-mf765780：只取10轮的计数，这10轮在01:39:10之前已经跑完，是有效的。它SIGINT之后挂了70分钟，这一段和掉卡时间重叠，不能拿来当任何证据。
+- 尚未验证、等机器恢复以后再做：
+  - f94e225（driver.stop()放回finally开头）：按5种SIGINT落点重测之后才验收；
+  - 分段计时（691ec41及之后的提交）：开关关、开各做一次验收。已补两条防护：只有开始这一轮update的那条线程打的标记才计入；进程里没有CUDA时整个保持关闭；
+  - 单一步进入口step_params()（f73213e）：同一份数据跑2个update，比较参数和三个优化器状态的哈希，必须逐位一致。
+- 当时GPU 5上跑的是cpp-actor的m1-merge0（learner卡），它在01:40:58报CUDA error: unspecified launch failure后崩溃（协调方转述）。

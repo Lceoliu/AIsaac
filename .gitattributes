@@ -1,2 +1,5 @@
 # Scripts that run on the Linux training host keep LF on every checkout (core.autocrlf is on here).
 *.sh text eol=lf
+# bm1 environment / lane files are sourced by sh on the Linux hosts: LF too
+*.env text eol=lf
+*.env.template text eol=lf

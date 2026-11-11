@@ -252,6 +252,7 @@ import numpy as np
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
 from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
+from isaac_bridge.learn_segments import SEG   # BM1: learner segment timing (ISAAC_BLOCK_TIMING=1 only)
 from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
@@ -2988,6 +2989,7 @@ def main(argv=None, child=None, actor=None):
         """(B38 step 4, only with ISAAC_RL_B38_TORCHPROF) end the profiler region prev, open one called name."""
         if prev is not None:
             prev.__exit__(None, None, None)
+        SEG.mark(start=name)   # (BM1 learner segments, ISAAC_BLOCK_TIMING=1: these boundaries too)
         if not b38_marks or name is None:
             return None
         m__ = torch.profiler.record_function(name)
@@ -3032,6 +3034,7 @@ def main(argv=None, child=None, actor=None):
         UO = dict.fromkeys(U, 0) if OPCOUNT is not None else None
         cmark = [time.thread_time(), OPCOUNT.n if OPCOUNT is not None else 0]
         nv_seg = [nv.start('learner.after_start')]   # (B50: the segment that follows each sec() mark)
+        SEG.begin()   # (BM1: per-segment host time, stream span and lag; nothing without ISAAC_BLOCK_TIMING=1)
 
         def sec(name):
             if PROFILE:
@@ -3046,6 +3049,7 @@ def main(argv=None, child=None, actor=None):
                 UO[name] = UO.get(name, 0) + OPCOUNT.n - cmark[1]
                 cmark[1] = OPCOUNT.n
             nv.end(nv_seg[0]); nv_seg[0] = nv.start('learner.after_'+name)
+            SEG.mark(end=name)
         rl = job['roll']
         if job.get('lroll') is not None:   # B38: the rollout's mirror on this GPU; its copy done before any read
             rl = job['lroll']
@@ -3754,6 +3758,39 @@ def main(argv=None, child=None, actor=None):
         t_table = None
         gn_acc = torch.zeros(1, device=device) if gn_on else None
         gn_clip = torch.zeros(1, device=device) if gn_on else None   # (B51: optimizer steps whose norm was clipped)
+
+        def step_params():
+            """BM1: the learner's one parameter-update entry, from the gradients being final (the minibatch's last
+            part's backward done) to the three optimisers' steps: priv's and aux's clip and step, the B43 gradient
+            norms (Writer, Spatial), the policy's clip, its step. A pure move of the code that was inline here (the
+            same calls in the same order: bit-identical). The place where a cross-device / cross-shard gradient
+            reduction will go: first, before any norm or clip reads a gradient."""
+            nonlocal hist_gn, hist_gn_steps, gn_acc, gn_clip
+            if priv_on:   # (the privileged encoder's and heads' norm apart: their gradient is the critic's alone)
+                torch.nn.utils.clip_grad_norm_(pcritic.parameters(), args.max_grad_norm)
+                popt.step()
+            if aux_on:   # (the policy's norm as ever, aux's share included; the head's apart: not PPO's scale)
+                torch.nn.utils.clip_grad_norm_(aux_head.parameters(), args.max_grad_norm)
+                aopt.step()
+            SEG.mark(start='opt.b43norm')
+            if block_on:   # B43: the Writer's and Spatial's gradient norms of this step
+                gn_ws_ = [torch.linalg.vector_norm(torch.stack([q.grad.float().norm() for q in mod_.parameters()
+                                                                if q.grad is not None] or [torch.zeros((), device=device)]))
+                          for mod_ in (learner_model.block_memory.writer, learner_model.structured_spatial)]
+                hist_gn = gn_ws_ if hist_gn is None else [a_+b_ for a_, b_ in zip(hist_gn, gn_ws_)]
+                hist_gn_steps += 1
+            SEG.mark(start='opt.clip')
+            with (bpt.GpuSpan('learn_clip') if block_on else contextlib.nullcontext()):
+                if gn_on:   # (progress.csv grad_norm: how far the clip scales the policy's gradient)
+                    gn_ = torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+                    gn_acc += gn_
+                    gn_clip += (gn_ > args.max_grad_norm).float()
+                else:
+                    torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
+            SEG.mark(start='opt.step')
+            with (bpt.GpuSpan('learn_opt') if block_on else contextlib.nullcontext()):
+                opt.step()
+
         if block_on:
             from isaac_bridge import block_learner as blearn
 
@@ -4202,27 +4239,7 @@ def main(argv=None, child=None, actor=None):
                                        [None if q.grad is None else q.grad.clone()
                                         for q in opt.param_groups[0]['params']]))
                 m_ = pmark('b38:clip_opt', m_)
-                if priv_on:   # (the privileged encoder's and heads' norm apart: their gradient is the critic's alone)
-                    torch.nn.utils.clip_grad_norm_(pcritic.parameters(), args.max_grad_norm)
-                    popt.step()
-                if aux_on:   # (the policy's norm as ever, aux's share included; the head's apart: not PPO's scale)
-                    torch.nn.utils.clip_grad_norm_(aux_head.parameters(), args.max_grad_norm)
-                    aopt.step()
-                if block_on:   # B43: the Writer's and Spatial's gradient norms of this step
-                    gn_ws_ = [torch.linalg.vector_norm(torch.stack([q.grad.float().norm() for q in mod_.parameters()
-                                                                    if q.grad is not None] or [torch.zeros((), device=device)]))
-                              for mod_ in (learner_model.block_memory.writer, learner_model.structured_spatial)]
-                    hist_gn = gn_ws_ if hist_gn is None else [a_+b_ for a_, b_ in zip(hist_gn, gn_ws_)]
-                    hist_gn_steps += 1
-                with (bpt.GpuSpan('learn_clip') if block_on else contextlib.nullcontext()):
-                    if gn_on:   # (progress.csv grad_norm: how far the clip scales the policy's gradient)
-                        gn_ = torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
-                        gn_acc += gn_
-                        gn_clip += (gn_ > args.max_grad_norm).float()
-                    else:
-                        torch.nn.utils.clip_grad_norm_(learner_model.parameters(), args.max_grad_norm)
-                with (bpt.GpuSpan('learn_opt') if block_on else contextlib.nullcontext()):
-                    opt.step()
+                step_params()   # (BM1: the one parameter-update entry)
                 pmark(None, m_)
                 sec('opt')
         if block_on:
@@ -4230,8 +4247,15 @@ def main(argv=None, child=None, actor=None):
             learner_dump.end(learner_model)   # (B44 ISAAC_LEARNER_DUMP: measurement only)
         learner_model.eval()
         choice_log = train_choice() if branching else {}   # Phase B2 (before the actor takes the new weights)
+        seg_end = SEG._event() if SEG.active else None   # (BM1: the anchor of the segments' lags)
         torch.cuda.current_stream().synchronize()
+        seg_sync = time.perf_counter()
         sec('tail')
+        if seg_end is not None:   # (BM1: the update's segments, read after its own synchronisation: no new sync)
+            seg_res = SEG.finish(seg_end, seg_sync)
+            with open(out / 'segments.jsonl', 'a') as f_seg:
+                f_seg.write(json.dumps(dict(update=L['update']+1, segments={k: [round(x, 6) for x in v[:3]]+[v[3]]
+                                                                             for k, v in seg_res.items()})) + '\n')
         if slog is not None and s_plan is not None:   # 2026-11-03 (tok_stream): the job to the writer (never waits)
             slog.submit(s_plan)
             sec('log')
@@ -5724,12 +5748,15 @@ def main(argv=None, child=None, actor=None):
         # raised again once everything is closed. Before: a SIGINT while this block waited for the learner's last
         # update (wait_learner below) skipped the learner's join and last.pt's save; the interpreter then finalised
         # under a running backward (pt_autograd_1 taken by pthread_exit -> std::terminate, rc 134; split-mb427b8d).
-        # Order: the learner's current update ends and it is joined (with the learner prefetch worker), then the
-        # driver stops (B52: it stopped first before).
+        # The driver stops first (B52), then the learner's current update ends and it is joined (with the learner
+        # prefetch worker). (BM1: stopping the driver after the learner's join hung a split run's exit for 70 min,
+        # gatecount-split-mf765780: the driver, its records no longer consumed, ended up waiting for Python.)
         import signal as signal_
         deferred_int = []
         prev_int = (signal_.signal(signal_.SIGINT, lambda *a_: deferred_int.append(1))
                     if threading.current_thread() is threading.main_thread() else None)
+        if cpp_driver is not None:   # (B52)
+            cpp_driver.stop()
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
             # (2026-11-05: past this point nobody needs what is still unsent: a clean end has seen the stop, which comes after
@@ -5782,8 +5809,6 @@ def main(argv=None, child=None, actor=None):
             save(out / 'checkpoints' / 'last.pt')
             if slog is not None:
                 slog.close()
-        if cpp_driver is not None:   # (B52; BM1: after the learner's end)
-            cpp_driver.stop()
         sampler.close()
         if log_file is not None:
             log_file.close()

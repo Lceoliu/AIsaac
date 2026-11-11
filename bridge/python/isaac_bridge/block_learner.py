@@ -35,6 +35,7 @@ import torch
 
 from . import block_paged as bp
 from .block_nvtx import push as nv_push, pop as nv_pop
+from .learn_segments import SEG
 
 T_LEARN = (1, 32, 64, 128)
 PACKED = os.environ.get('ISAAC_PACKED_LEARNER', '1') == '1'
@@ -680,6 +681,7 @@ def forward_packed(model, chunks, generator=None, train_history=True, version=0,
     kw = dict(generator=generator, train_history=train_history, version=version, spatial_micro=spatial_micro,
               require_next_state=require_next_state, deduplicate_sources=deduplicate_sources,
               history_mode=history_mode, max_rows=max_rows)
+    SEG.sub(('b38:part_forward',), 'ppo.pack')   # (BM1 segments: a PPO part's wait for its host packing)
     t0 = time.perf_counter()
     P = PREFETCH.take(chunks, kw, grad)
     hit = P is not None
@@ -691,6 +693,7 @@ def forward_packed(model, chunks, generator=None, train_history=True, version=0,
     bp.ucount('learn_pack_crit_grad_s' if grad else 'learn_pack_crit_nograd_s', wait)   # (PPO / recompute and others)
     if CRIT_LOG is not None:
         CRIT_LOG.append((bool(grad), wait, hit))
+    SEG.sub(('ppo.pack',), 'ppo.dispatch')   # (BM1 segments: the part's forward on the device)
     return _run_packed(model, P)
 
 

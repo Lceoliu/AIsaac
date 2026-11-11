@@ -97,13 +97,16 @@ class SideCuda:
             if threading.get_ident() in self.owners:
                 raise RuntimeError('SIDE_CUDA.call() inside this thread\'s own graph capture (it would wait for '
                                    'itself): a CUDA side call reached from a capture body')
+            from .block_paged import ucount
+            who = _side_who()
+            ucount('side_cuda_calls_'+who, 1)   # (BM1: acquisitions per thread kind)
             if self.capturing:
                 self.waits += 1
                 t = time.perf_counter()
                 while self.capturing:
                     self.cv.wait()
-                from .block_paged import ucount
                 ucount('side_cuda_call_waits', 1); ucount('side_cuda_call_wait_s', time.perf_counter()-t)
+                ucount('side_cuda_call_wait_s_'+who, time.perf_counter()-t)
             self.active += 1
         try:
             yield
@@ -120,6 +123,8 @@ class SideCuda:
         me = threading.get_ident()
         with self.cv:
             self.capturing += 1   # (calls arriving from now on wait)
+            from .block_paged import ucount
+            ucount('side_cuda_captures', 1)
             self.owners.add(me)
             if self.active:
                 t = time.perf_counter()
@@ -152,20 +157,29 @@ class SideCuda:
             time.sleep(poll)
 
 
+def _side_who():
+    """(BM1) the calling thread's kind for the gate's counters: prefetch (the learner prefetch worker), learner (the
+    learner thread), other."""
+    n = threading.current_thread().name
+    return 'prefetch' if n == 'learner-prefetch' else 'learner' if n == 'learner' else 'other'
+
+
 SIDE_CUDA = SideCuda()
 from . import block_paged as _bp   # noqa: E402  (the gate's per-update counters in progress.csv, b42_*)
 _bp.UPD_KEYS = tuple(_bp.UPD_KEYS)+tuple(k for k in (
-    'side_cuda_call_waits', 'side_cuda_call_wait_s', 'side_cuda_capture_waits', 'side_cuda_capture_wait_s')
+    'side_cuda_call_waits', 'side_cuda_call_wait_s', 'side_cuda_capture_waits', 'side_cuda_capture_wait_s',
+    'side_cuda_captures', 'side_cuda_calls_prefetch', 'side_cuda_calls_learner', 'side_cuda_calls_other',
+    'side_cuda_call_wait_s_prefetch', 'side_cuda_call_wait_s_learner', 'side_cuda_call_wait_s_other')
     if k not in _bp.UPD_KEYS)
 
 
-# BM1 (decision 1, step 2): the capture's error mode, ISAAC_CAPTURE_MODE=global (default) | thread_local. In global mode
+# BM1 (decision 1, step 2): the capture's error mode, ISAAC_CAPTURE_MODE=thread_local (default since BM1 round 4) | global. In global mode
 # any other thread's unsafe CUDA call during a capture invalidates it -- event query / synchronize, stream synchronize,
 # a new pinned allocation, and also a new device allocation (cudaMalloc through the caching allocator), on the
 # capture's GPU or on another one; SIDE_CUDA covers only the prefetch worker's staging. In thread_local mode only the
 # capturing thread is restricted: b62_capture_probe2.py, 24 cases x 5 on the 3090 (cu128), every capture ended and
 # its graph replayed bit-identical to a quiet capture 128 times. gc stays off and the admission keeps captures apart.
-CAPTURE_MODE = os.environ.get('ISAAC_CAPTURE_MODE', 'global')
+CAPTURE_MODE = os.environ.get('ISAAC_CAPTURE_MODE', 'thread_local')
 if CAPTURE_MODE not in ('global', 'thread_local'):
     raise ValueError(f'ISAAC_CAPTURE_MODE={CAPTURE_MODE!r}: global or thread_local')
 
@@ -187,7 +201,7 @@ def graph_capture(graph,stream,pool=None):
     'captures_underway.empty() INTERNAL ASSERT' (the b62d / b62g gates' cascade); through graph_capture (gc off) the
     capture ends right, 4 of 4. A dropped pinned buffer collected the same way does not break a capture.
     B62: also exclusive of the CUDA calls made off the admission (SIDE_CUDA: the learner prefetch worker's staging).
-    BM1: the error mode is CAPTURE_MODE (ISAAC_CAPTURE_MODE, default global)."""
+    BM1: the error mode is CAPTURE_MODE (ISAAC_CAPTURE_MODE, default thread_local)."""
     import gc as gc_
     with SIDE_CUDA.capture():
         torch.cuda.synchronize()

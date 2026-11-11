@@ -1,10 +1,2 @@
-# bm1 lane lock (sourced). take "<purpose>": atomic (noclobber) LOCK_node0 with "<session> <time> <purpose>", waiting
-# while another holder has it; give: removes it if it is ours. LOCK=$BM/LOCK_node0 by default; SESSION names us.
-# (lane.sh, sourced first by the callers, sets LOCK / SESSION per lane: LANE=cpp -> LOCK_node1, bm1-cpp)
-LOCK=${LOCK:-$BM/LOCK_node0}
-SESSION=${SESSION:-bm1-a1}
-take() {
-  while ! ( set -C; echo "$SESSION $(date '+%F %T') $1" > "$LOCK" ) 2>/dev/null; do sleep 30; done
-  LOCKLINE=$(cat "$LOCK")
-}
-give() { [ "$(cat "$LOCK" 2>/dev/null)" = "${LOCKLINE:-}" ] && rm -f "$LOCK"; LOCKLINE=; }
+# bm1 (kept for older callers, sourced): common.sh under its old name (the lane lock take / give, capmode, preflight).
+. $BM/common.sh
