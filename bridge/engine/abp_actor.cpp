@@ -28,6 +28,7 @@
 #include <c10/core/InferenceMode.h>
 
 #include <poll.h>
+#include <pthread.h>
 #include <unistd.h>
 #include <errno.h>
 #include <atomic>
@@ -1161,6 +1162,7 @@ struct ActorDriver {
   }
   std::vector<struct pollfd> lpfds;
   void lane_loop() {
+    pthread_setname_np(pthread_self(), "abp-lane");
     try {
       c10::InferenceMode inference;
       while (!lstop) {
@@ -1487,6 +1489,7 @@ struct ActorDriver {
       std::vector<i64> ws, ss;   // the batch: workers and row slots
       std::vector<i64> held_w, held_s;   // (B54) messages waiting for their worker's CF capture (cap_wait)
       drv_tid.store(std::this_thread::get_id());   // (d2 M1: merge_q / LaneCore belong to this thread)
+      pthread_setname_np(pthread_self(), "abp-driver");   // (the per-thread CPU samplers tell it from python threads)
       double t_it = now();
       while (!stop_req) {
         { double t = now(); t_loop_s = t_loop_s+(t-t_it); t_it = t; }
