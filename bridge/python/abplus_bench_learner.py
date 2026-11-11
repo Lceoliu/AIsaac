@@ -211,6 +211,8 @@ def run_bench(ctx):
                   f'{L["last_steps"]} optimizer steps, {L["last_update_s"]:.3f}s', flush=True)
         L['stop'] = True
         return True
+    if os.environ.get('ISAAC_RL_LEARNER_ANOMALY', '0') == '1':   # (a failing backward: its forward's stack)
+        torch.autograd.set_detect_anomaly(True, check_nan=False)
     check = os.environ.get('ISAAC_RL_LEARNER_CHECK', '0') == '1'
     profile = os.environ.get('ISAAC_RL_LEARNER_PROFILE', '0') == '1'
     # a path: --learner-fast 0 / 1, optionally with a BM1 P2 suffix: 'o' P2 off (whole parts on the learner card),
