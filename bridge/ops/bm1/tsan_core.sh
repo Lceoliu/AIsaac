@@ -9,17 +9,23 @@ RC=0
 : > $LOGF
 run() {   # run <name> <out> <args...>: the TSAN binary with ASLR off (TSAN's shadow map)
   n=$1; o=$2; shift 2
-  if [ "${NO_SETARCH:-0}" = 1 ]; then ./$n "$@" > $o 2>&1; else setarch $(uname -m) -R ./$n "$@" > $o 2>&1; fi; r=$?
+  if [ "${NO_SETARCH:-0}" = 1 ]; then
+    # (no setarch: the binary is non-PIE (TSAN_LDFLAGS=-no-pie); the libraries' random bases can still fall outside
+    # gcc 11 TSAN's expected layout on this kernel: retried while it stops with 'unexpected memory mapping')
+    i=0; while :; do ./$n "$@" > $o 2>&1; r=$?; i=$((i+1))
+      grep -q 'unexpected memory mapping' $o && [ $i -lt ${TRIES:-60} ] || break; done
+    echo "  ($n: $i start(s))" >> $LOGF
+  else setarch $(uname -m) -R ./$n "$@" > $o 2>&1; r=$?; fi
   echo "$n $* rc=$r tsan warnings $(grep -c 'WARNING: ThreadSanitizer' $o): $(grep -E '^(part|lineage|lanes)' $o | tr '\n' ' ' | cut -c1-200)" >> $LOGF
   return $r
 }
-g++ -std=c++17 -O1 -g -fsanitize=thread -pthread test_abp_core.cpp -o test_abp_core || { echo "build core failed" >> $LOGF; exit 1; }
+g++ -std=c++17 -O1 -g -fsanitize=thread -pthread ${TSAN_LDFLAGS:-} test_abp_core.cpp -o test_abp_core || { echo "build core failed" >> $LOGF; exit 1; }
 for s in 1 2 3 4 5; do run test_abp_core out$s.txt $N $s || RC=1; done
 run test_abp_core outns.txt $N 9 nostamp && echo "CONTROL core nostamp did not fail" >> $LOGF
-g++ -std=c++17 -O1 -g -fsanitize=thread -pthread test_abp_lineage.cpp -o test_abp_lineage || { echo "build lineage failed" >> $LOGF; exit 1; }
+g++ -std=c++17 -O1 -g -fsanitize=thread -pthread ${TSAN_LDFLAGS:-} test_abp_lineage.cpp -o test_abp_lineage || { echo "build lineage failed" >> $LOGF; exit 1; }
 for s in 1 2 3 4 5; do run test_abp_lineage lout$s.txt $N $s || RC=1; done
 run test_abp_lineage loutns.txt $N 9 nostamp && echo "CONTROL lineage nostamp did not fail" >> $LOGF
-g++ -std=c++17 -O1 -g -fsanitize=thread -pthread test_abp_lanes.cpp -o test_abp_lanes || { echo "build lanes failed" >> $LOGF; exit 1; }
+g++ -std=c++17 -O1 -g -fsanitize=thread -pthread ${TSAN_LDFLAGS:-} test_abp_lanes.cpp -o test_abp_lanes || { echo "build lanes failed" >> $LOGF; exit 1; }
 for s in 1 2 3; do run test_abp_lanes nout$s.txt 300 $s || RC=1; done
 run test_abp_lanes noutrf.txt 300 9 replyfirst && echo "CONTROL lanes replyfirst did not fail" >> $LOGF
 echo "tsan_core rc=$RC" >> $LOGF
