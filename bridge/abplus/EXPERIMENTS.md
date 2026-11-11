@@ -10968,6 +10968,22 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
 - **CPU 归属的限制**：这一版的 driver 线程还叫“python”，和主线程合在一起（1.48 核），单独的占用报不出。545ce36 起两个线程命名为 abp-driver / abp-lane。
 - **M1 默认开的决定（协调方）**：计时不变差、lane 作业时间明确下降；counters() 修复那棵树（c-cc3af40）的 3 遍全量门全绿（8x3090，GPU 1，thread_local：三遍都是 282 passed、3 skipped、1 xfailed）。所以 M1 从这一提交起默认开，`ISAAC_BLOCK_LANE_MERGE=0` 回到 d1。M1 只在 lane 服务跑在 driver 线程（d1）时生效；开 lane 线程（d2）时自动关。
 
+### driver 线程拆解，第 0 步：把“其他”拆开（gpu57，2026-11-11，不计时）
+
+- **配置**：树 c-2138d55（M1 默认开、counters() 修复、第 0 步计数），gpu57（2x E5-2667 v3），GPU 3 跑 actor、GPU 4 跑 learner，node1 的 16 个线程，共享锁，6 轮。窗口是 u2–u6。这台机器上的数绝对值不和 8x3090 的表直接比，只看比例和“其他”里的构成。
+- **driver 每个 collect（u2–u6 中位，s）**：
+  - 循环 16.51，空转 poll 0 次。
+  - 主步等 GPU 10.80；准备 0.65；写页 0.88；consumer 0.43；回复 0.29；等 worker 0.14；lane 作业 0.28。前几轮 CF 点少，每 collect 只有 1,428 个 lane 作业。
+  - **“其他” 3.06（占循环 18.6%）**，拆开是：
+    - lane pass 自己的控制：1.22（占“其他”的 40%）。每个主步之后都跑一次，每 collect 3,427 次，每次约 0.36 ms：control 每次扫描全部点的状态，ppoll 读 lane 管道。
+    - 谱系 0.10，lane restore 0.04，事件批 0.01。
+    - 还剩 1.70 没有计时项。线程调度统计显示 abp-driver 每秒有 0.04 s 在等 CPU，按 16.5 s 算约 0.66 s；剩下约 1.0 s 落在主步之外、没有单独计时的循环记账里。
+- **driver 线程的 CPU**：第一次按名字测到，abp-driver 0.90 核（等 CPU 0.04 s/s），learner-main 0.54，pt_autograd_1 0.34，learner-prefetch 0.16，主线程 0.02。
+- **污染**：这次运行时宿主机很忙：全机 32 个线程忙 88%，iowait 12.9 核，开始时 dockerd 占 330%。所以等 CPU 和未计时那 1.0 s 都可能被放大。
+- **结论**：
+  - “其他”里最大的一项是每个主步之后的 lane pass 控制，约占“其他”的四成。它是定时轮询（每步一次扫描加一次 ppoll），是改成事件驱动的首选：只在有 lane 消息或点状态变化时跑。在 lane 卡方案里，它整块移到 lane 线程上。
+  - 剩下的 1.0 s 要再加一个计数才能拆开（step_batch 结束到下一次 poll 之间）。
+
 ### cpp 线核心 TSAN（gpu57，2026-11-11，通过）
 
 - **机器**：gpu57（10.19.136.57，2x E5-2667 v3，内核 5.4，`vm.mmap_rnd_bits` = 28），容器 aisaac-bench:20261019（gcc 11.4），node1 的 CPU 8-15,24-31，共享锁。树 c-b33d1b6。
