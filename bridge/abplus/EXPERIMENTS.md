@@ -10946,3 +10946,37 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
 - bm1/shard2.sh：分片0是GPU 1、2加node0，分片1是GPU 4、5加node1，learner都在各自的第二张卡上。每个容器MEM=50g。按node0、node1的顺序拿两把锁，两个prof.sh并发运行（NOLOCK=1，标签是<tag>-s0和<tag>-s1）。
 - 分片之间的隔离：每个分片是一个独立容器，有自己的pid命名空间（kill_abplus扫/proc时只看得到自己的进程）、自己的/dev/shm（PNG缓存、teacher的flock文件）、自己的/tmp（xvfb-run -a，各自的X server），并且--network none，所以端口也不会撞。名字和端口段仍然分开（s0a/39200和s1b/39600），日志和实例目录好区分。共享的HOME下面各缓存都按内容寻址并原子写入。
 - xnew2.sh新增NAME和PORT两个参数，默认b42new和39200，和4090一样。
+
+### BM1 第四轮：两分片同时计时（M1b）、SIGINT收尾修复、分卡warm-up、thread_local开关第2步（2026-11-11）
+
+机器：8x3090（Gold 6146 + 3090 + cu128）。
+
+#### M1b：两分片同时计时（pair1-mb427b8d，bm1/shard2.sh，只跑1次）
+| 分片 | GPU / NUMA | collect u10+ | update u10+ | wait_learner | ×实时 u10+（u2–u23） | u15 done / nobank / lane / queue / dropped | done/游戏小时 |
+|---|---|---:|---:|---:|---:|---|---:|
+| s0 | 1+2 / node0 | 16.18 | 17.84 | 1.18 | 231.9（238.0） | 102 / 20 / 124.2k / 0 / 0 | 5.60 |
+| s1 | 4+5 / node1 | 17.30 | 18.49 | 1.35 | 226.6（230.4） | 106 / 0 / 149.6k / 0 / 0 | 5.82 |
+
+- 和单片单跑比：单片两次是235.2和227.6，均值231.4。s0是均值的100.2%，s1是97.9%，都在单片两次之间的波动里。两片合计458.5×，是单片的2.0倍。node1和node0之间没有看到系统性差别。
+- 主机：MemAvailable最低19.8 GB，没有触发安全线（10 GiB或任一容器OOM kill）。容器内存峰值44.4 GB和44.9 GB（上限各50g）。两个节点mpstat平均都忙56%（各约13.4核）。8张卡的利用率中位：0号0%、1号72%、2号68%、3号0%、4号73%、5号74%、6号0%、7号0%（0、6、7两片都没用）。learner卡显存峰值14.3 GB和14.6 GB。
+- 这棵树还没有SIGINT修复，两片退出时都是rc 134。
+- 结论：两片同时跑基本不互相拖慢，内存是上限，第三片放不下。
+
+#### 决定a：train_tok的SIGINT收尾
+- 修改：train_tok的finally在收尾期间先把SIGINT暂存起来；等learner把当前update做完并join（连同prefetch worker），保存last.pt，停掉driver之后，再把KeyboardInterrupt抛出来（rc 130）。driver从原来“finally一开始就stop”改成“learner结束之后再stop”。
+- 验收（bm1/sigint_smoke.sh，HOURS=2.5，让主循环在第3次交接后正常结束，在第2行出现后几秒发SIGINT，使它落在收尾里等learner最后一个update的那段）：
+  - 修复前的树mb427b8d：rc 134，打出terminate，**没有保存last.pt**。这就是原来的路径，复现了，而且除了abort还会丢掉最后一次保存。
+  - 修复后的树m16acc6d：分卡3次（第2行之后分别隔2.3 s、5.6 s、9.1 s发SIGINT）都是rc 130、没有terminate、last.pt已保存，日志里有“BM1 shutdown: 1 SIGINT held until the learner was joined, last.pt saved and the driver stopped”。单卡1次也是rc 130、last.pt已保存（那次SIGINT落在主循环里）。
+  - 另外，HOURS=30时SIGINT落在主循环wait_learner里的情况，修复前后都是rc 130，那条路径本来就没有问题。
+
+#### 决定b：分卡时actor的canvas解码器warm-up
+- 原来block_compile.warm_spatial只在learner的卡上warm canvas解码器，分卡时actor那张卡第一次解码就会触发一次steady compile（block_steady_compiles从u1起是1）。现在改成在learner和各actor用到的每张卡上都warm一遍。
+- 修复后所有运行（smoke 4次、分卡24轮1次）block_steady_compiles全程都是0。
+
+#### thread_local第2步（ISAAC_CAPTURE_MODE开关，默认仍是global；闸、关gc、capture之间的互斥都保留）
+- 主线上现有的潜在风险：在global模式下，capture进行中如果有别的线程新开显存（经caching allocator走cudaMalloc），capture也会作废，同卡跨卡都一样，现有的SideCuda闸覆盖不到这种情况（b62_capture_probe2.py的dev_alloc和dev1_dev_alloc两个case，global下2/2失败，thread_local下5/5通过）。这是要切到thread_local的主要理由之一。
+- thread_local下的验证（树m16acc6d和m62c6130）：
+  - 全量门3次（m62c6130）：第1次270 passed，全绿；第2次是1个failed加1个error；第3次是1个error。剩下的都是已知、归cpp的那两条：test_b54的lane_thread遗留（error），和test_b52的时序断言（第2次的failed）。
+  - 在m16acc6d上第一次跑这3次门时，test_b62_capture_gate的对照组失败了：它默认“关掉闸后capture一定作废”，这个前提只在global下成立。已在m62c6130里改好：对照组的子进程固定用global，另外加一项检查，确认thread_local下关掉闸capture也完好。
+  - A8：8个seed都ok。
+  - 分卡24轮（split-tl-m16acc6d，thread_local）：collect 17.26 s，update 17.71 s，×实时235.9（u2–u23为239.7），u15 CF是102 / 19 / 138.8k / 0 / 0，block_steady_compiles为0，退出rc 130。速度和CF都和global下的两次单片一致（235.2、227.6）；C++ driver的graph重放没有异常。
