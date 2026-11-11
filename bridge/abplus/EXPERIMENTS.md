@@ -11552,3 +11552,45 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - 单次update（每种1个样本，且哈希检查每步都同步）：0o单卡整part 16.4 s，0s同卡两半先后跑17.8 s，0p两卡13.9 s。
   - 主卡每个update要等副卡1.2–1.3 s：两半不平衡，切点作为第二版再调。
   - 等价性的数作废（见上面的已知项），用p2check3重做；结果和背靠背计时随后补在这里。
+
+#### BM1 P2结果、GIL采样、静态形状的补齐浪费（gpu57，2026-11-11）
+- **P2计时（树m3c42661，24轮，u10+中位数）：** 两卡（p2）update 20.38 s，同时的分卡单learner（split）19.83 s，P2没有更快。
+  - 两张learner卡都很闲：GPU 2忙20%，GPU 5忙24%。
+  - opt.p2_reduce的GPU跨度2.35 s。
+  - 线程（核）：learner主线程0.40，learner-p2 0.20，两个autograd线程0.27和0.23。
+  - 结论：P2受主机发射限制，不进生产，代码留在--learner-devices开关后面。p2x/splitx那一对受了外部负载干扰，作废。
+- **p2check4（树m358e2a5，训练进程内第6个job上的bench）：**
+
+  | 路径 | update s | ppo s | 峰值GB（主卡/副卡） | 主卡前向 s | 主卡反向主机/跨度 s | join wait s |
+  |---|---|---|---|---|---|---|
+  | 0o 单卡整part | 16.11 | 9.98 | 12.34 / – | 3.3 | 5.6–5.9 / 9.8–10.3 | – |
+  | 0s 同卡两半先后 | 18.66 | 14.11 | 11.16 / – | 6.2 | 6.6–7.1 / 11.9–12.3 | – |
+  | 0p 两卡 | 15.68 | 9.39 | 11.01 / 6.16 | 2.8–3.0 | 4.2–4.5 / 6.0–6.3 | 1.1–1.4 |
+  | 0pk 两卡、Spatial不做检查点 | 13.26 | 7.05 | 15.15 / 15.25 | 2.3–2.5 | 2.7–2.9 / 4.65–4.8 | 1.0–1.1 |
+  | 0ok 单卡、不做检查点 | 预热时显存不够（24 GB卡已分配23.0 GB） | | | | | |
+
+  - p2_reduce在主机上0.09–0.11 s，广播0.05–0.08 s。
+  - 副卡的前向/反向跨度虽然计了数，但progress.csv没有它的列（UPD_KEYS缺p2_*），已在ff9ad51补上。
+  - 等价性（对0o，首梯度）：0s、0p、0pk的||Δg||/||g||都约1.3e-3，cos 0.9999992。地板：old vs old ≤9e-6，new vs new ≤1.4e-4。整个update之后的权重差都在地板以内。
+  - 0s（一张卡上两半先后跑）的差同样大，所以这个差来自"切半"本身，和第二张卡、检查点都无关。
+  - 检查是在--amp bf16下做的，切半改变了矩阵形状，bf16的舍入点也跟着变。是不是舍入要靠fp32check回答：bench新增路径字母f，同一进程内不开bf16 autocast（5d56a11）。在有结论之前，切半的路径都不进生产。
+- **A：py-spy --gil --threads --native，50 Hz，P2开，11轮：**
+  - 剔除了启动编译和torch profiler后处理的样本。训练窗口里GIL被持有约44%的时间，没有饱和。
+  - 每轮持有GIL的秒数（约）：
+    - MainThread 2.5–3：collect循环里的next_record(0.002)、roll.usable()、consume_record。这是合并cpp之前的树，合并后的主线另采一次。
+    - learner 1.6，prefetch 1.4，两个autograd线程0.84和0.75，learner-p2 0.76。
+  - learner线程每轮约8–9 s CPU，持有GIL的只有约1.6 s：其余约80%是不持GIL的C++分派和kernel发射。瓶颈在逐个kernel的主机发射，不在GIL。
+  - autograd线程持有GIL的时间：约70%在inductor编译出的反向图里，主要是每个Triton kernel的Python启动器；约20%在检查点的unpack hook（重算7–8%）。没有一两个函数独大。
+  - kernel数（update 8的torch profiler，P2开）：主卡83.7k个（GPU 4.8 s），副卡88.9k个（GPU 7.2 s），每个part约11.5k个，每轮约17万个。
+  - 主机API调用：cudaLaunchKernel 120.5k次，cuLaunchKernel 51.2k次，cudaFuncGetAttributes 123.4k次（自身0.63 s）。
+- **B（静态形状加图重放）补齐浪费，离线统计（ops/b66_static_waste.py，3952aea）：**
+  - 方法：一个update的15个part各做3次历史抽取，每一维按最大值定上限，浪费按GPU代价加权。
+  - 主行8.2%，重编码的历史块11.9%，Writer输入8.4%，旧bank条目12.6%，Spatial（行×T）17.9%，Reader（注意力代价）20.4%。
+  - 合计按GPU代价约15–20%；上限只取自一个update，规划时按20–25%留余量。
+- **B第1步（a7b150d）：** ISAAC_LEARN_HSCALE_SLAB=1时，B51的历史梯度系数放进part的slab，随slab一次上传，不再单独做一次可分页拷贝。默认关。
+  - 测试：loss、输出、梯度与默认路径逐位一致。例外是memory_age和short_relative两个参数：它们在默认路径下两次运行之间本来就不逐位相同，相对差约4e-7，开关打开后的差同样大小。
+- **bm1锁：**
+  - 096fa3f：common.sh的函数不再覆盖调用者的变量。
+  - ddff5b5：shared等待有界。等待中的shared任务留下W.<session>.<pid>标记；writer在取X之前，先让比它更早开始等的shared任务进去；writer优先保留。
+  - test_lock.sh 5组测试。
+- **合并cpp线（e6cce7a）：** 全量门282 passed，3 skipped，1 xfailed；A8 8/8。M1之后新的分卡基线另排。
