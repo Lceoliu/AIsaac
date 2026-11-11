@@ -85,7 +85,8 @@ def main():
     # (B58e: the main thread's entries into Python = its GIL acquisitions: Holding GIL intervals, per cycle)
     n_hold, = c.execute("select count(*) from NVTX_EVENTS where globalTid = ? and textId = ? and end is not null and start >= ? "
                         "and end <= ?", (main_tid, gil.get('Holding GIL', -1), lo, hi)).fetchone()
-    print(f'  main thread GIL acquisitions (Python entries): {n_hold} in the window, {n_hold/n_cyc:.0f} per cycle')
+    print(f'  main thread GIL acquisitions (Holding GIL intervals: every GIL release inside a Python stretch, e.g. a torch op '
+          f'or an extension call, starts a new one; not the top-level entries): {n_hold} in the window, {n_hold/n_cyc:.0f} per cycle')
 
     # ---- 2. learner segments by the actor's window
     waits = ranges(main_tid, 'h.wait_learner')
