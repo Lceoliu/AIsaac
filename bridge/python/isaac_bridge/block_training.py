@@ -97,13 +97,16 @@ class SideCuda:
             if threading.get_ident() in self.owners:
                 raise RuntimeError('SIDE_CUDA.call() inside this thread\'s own graph capture (it would wait for '
                                    'itself): a CUDA side call reached from a capture body')
+            from .block_paged import ucount
+            who = _side_who()
+            ucount('side_cuda_calls_'+who, 1)   # (BM1: acquisitions per thread kind)
             if self.capturing:
                 self.waits += 1
                 t = time.perf_counter()
                 while self.capturing:
                     self.cv.wait()
-                from .block_paged import ucount
                 ucount('side_cuda_call_waits', 1); ucount('side_cuda_call_wait_s', time.perf_counter()-t)
+                ucount('side_cuda_call_wait_s_'+who, time.perf_counter()-t)
             self.active += 1
         try:
             yield
@@ -120,6 +123,8 @@ class SideCuda:
         me = threading.get_ident()
         with self.cv:
             self.capturing += 1   # (calls arriving from now on wait)
+            from .block_paged import ucount
+            ucount('side_cuda_captures', 1)
             self.owners.add(me)
             if self.active:
                 t = time.perf_counter()
@@ -152,10 +157,19 @@ class SideCuda:
             time.sleep(poll)
 
 
+def _side_who():
+    """(BM1) the calling thread's kind for the gate's counters: prefetch (the learner prefetch worker), learner (the
+    learner thread), other."""
+    n = threading.current_thread().name
+    return 'prefetch' if n == 'learner-prefetch' else 'learner' if n == 'learner' else 'other'
+
+
 SIDE_CUDA = SideCuda()
 from . import block_paged as _bp   # noqa: E402  (the gate's per-update counters in progress.csv, b42_*)
 _bp.UPD_KEYS = tuple(_bp.UPD_KEYS)+tuple(k for k in (
-    'side_cuda_call_waits', 'side_cuda_call_wait_s', 'side_cuda_capture_waits', 'side_cuda_capture_wait_s')
+    'side_cuda_call_waits', 'side_cuda_call_wait_s', 'side_cuda_capture_waits', 'side_cuda_capture_wait_s',
+    'side_cuda_captures', 'side_cuda_calls_prefetch', 'side_cuda_calls_learner', 'side_cuda_calls_other',
+    'side_cuda_call_wait_s_prefetch', 'side_cuda_call_wait_s_learner', 'side_cuda_call_wait_s_other')
     if k not in _bp.UPD_KEYS)
 
 
