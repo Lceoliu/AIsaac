@@ -11024,7 +11024,27 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
   - lane 工作挪出 driver 线程后，collect 少约 1.1 s。
   - 但 driver 主步等 GPU 多约 1.5 s：主图和 lane 图在同一张卡上抢 GPU。lane 卡就是要去掉这一块。
   - d2 下 driver 的 lane 计数（drv_lane_s、drv_lpass_s）包含 lane 线程的时间，以及它 1 ms 的 ppoll 等待，所以和第 0 步不可比。
-- **结论**：lane 卡这条路目前没有挡路的问题。thread_local 下 d2 能跑；跨卡的页拷贝每个 collect 约 0.5 s，在 lane 线程上。下一步写 lane 卡的主体。
+- **结论**：lane 卡这条路目前没有挡路的问题。thread_local 下 d2 能跑。下一步写 lane 卡的主体。
+
+#### 更正：根本没有跨卡的页拷贝；以及实测的 restore 量
+
+- **页存储在主机内存里**：PageCore 的页是 `new uint8_t[]`，见 abp_core.h:82。步的输出也是先拷到主机，再由 `write_part` 写进页存储（取自 e.bc / e.bz）。
+  - restore 本来就是“主机页 → arena 所在的卡”，lane 步本来就把新页拷回主机。
+  - 换成 lane 卡，只是这些拷贝的目标卡变了；actor 卡和 lane 卡之间没有任何拷贝。
+  - 所以 (a) 量到的是主机和 GPU 之间拷贝的成本，并不是 lane 卡额外带来的成本。
+- **实测**（size-d2-c-714d38f，d2，GPU 3+4，12 轮，u6–u12 中位，每个 collect）：
+  - restore 只有 16 次，合计 7.1 MB，每次约 453 KiB，耗时 0.03 s。restore 只在分支开始时发生。
+  - lane 步写进页存储 134 MB，每个作业约 46 KiB（2,984 个作业，6,785 行）。这部分今天就已经经过主机。
+  - 之前“每轮约 0.5 s 跨卡拷贝”的估计作废。
+- **lane 线程收尾的 SIGINT 测试**（树 c-714d38f，`ISAAC_BLOCK_CPP_LANE_THREAD=1`，GPU 3+4，三个落点）：
+
+| 落点 | 结果 |
+|---|---|
+| collect 中 | rc 130，terminate 0，段错误 0，last.pt 已存 |
+| 等 learner 时 | rc 130，terminate 0，段错误 0，last.pt 已存 |
+| 收尾过程中 | rc 130，terminate 0，段错误 0，last.pt 已存，“SIGINT held until the learner was joined” |
+
+  - 同一棵树的门：entry 3 passed，全部测试 282 passed、3 skipped、1 xfailed，A8 8/8。
 
 ### cpp 线核心 TSAN（gpu57，2026-11-11，通过）
 
