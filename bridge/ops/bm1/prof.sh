@@ -31,6 +31,9 @@ S7=$!
 FQ=$(n=0; while [ -r /sys/devices/system/cpu/cpu$n/cpufreq/scaling_cur_freq ]; do echo /sys/devices/system/cpu/cpu$n/cpufreq/scaling_cur_freq; n=$((n+1)); done)
 ( [ -n "$FQ" ] && while :; do echo "$(date +%s.%N | cut -c1-14) $(awk '{printf "%d ", $1}' $FQ)"; sleep 1; done ) > $R/$TAG.freq1 &
 S8=$!
+# (every 30 s, the host's top CPU processes over a 2 s window (top's second frame), every tenant's: the run's outside load)
+( while :; do echo "== $(date +%s)"; top -b -n 2 -d 2 -w 160 2>/dev/null | awk '/^top -/ {k++} k == 2' | sed -n '8,15p'; sleep 28; done ) > $R/$TAG.topcpu &
+S9=$!
 nvidia-smi -i $GPU --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,clocks.sm,index --format=csv,noheader -l 1 > $R/$TAG.gpu &
 S1=$!
 nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader -l 5 > $R/$TAG.allgpu &
@@ -72,7 +75,7 @@ while kill -0 $DP 2>/dev/null; do
 done
 wait $DP
 rc=$?
-kill $S1 $S2 $S3 $S4 $S5 $S6 $S7 $S8 2>/dev/null
+kill $S1 $S2 $S3 $S4 $S5 $S6 $S7 $S8 $S9 2>/dev/null
 host_snapshot "$TAG end"
 [ -d $R/$TAG/checkpoints ] && trash $R/$TAG/checkpoints
 echo "$(date '+%F %T') $TAG done rc=$rc rows $(($(wc -l < $R/$TAG/progress.csv 2>/dev/null || echo 1)-1)); $(grep -h -m1 "BM1 graph capture mode" $R/$TAG.stdout 2>/dev/null)" >> $LOG
