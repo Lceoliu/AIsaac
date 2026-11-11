@@ -10894,6 +10894,24 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
   - 对照组：core 不用 stamp 规则那组 rc 66、1 条警告，按要求失败；lineage 和 lanes 的对照段错误，结论不明。
   - 段错误应是 gcc 11 的 TSAN 运行时和这台机器的地址布局不合，不是被测代码的问题，但这只是推断。TSAN 不算通过。
 
+### cpp 线核心 TSAN（gpu57，2026-11-11，通过）
+
+- **机器**：gpu57（10.19.136.57，2x E5-2667 v3，内核 5.4，`vm.mmap_rnd_bits` = 28），容器 aisaac-bench:20261019（gcc 11.4），node1 的 CPU 8-15,24-31，共享锁。树 c-b33d1b6。
+- **做法**：bm1/tsan_core.sh 编出的 TSAN 二进制直接运行：不包 `setarch -R`，不加 `-no-pie`，每个只启动一次、不重试，没有改任何安全设置（NO_SETARCH=1，TRIES=1）。
+- **结果**：
+
+| 组 | 正常运行 | TSAN 警告 | 对照组 |
+|---|---|---|---|
+| core（PageCore 的 stamp 规则） | 5/5，rc 0，0 错字节 | 0 | 关掉 stamp 规则：rc 66，1 条数据竞争，20 错字节 |
+| lineage（谱系、快照、回收） | 5/5，rc 0，0 错字节 | 0 | 关掉 stamp 规则：rc 66，1 条数据竞争，16,128 错字节 |
+| lanes（LaneCore 状态机） | 3/3，rc 0，0 错答 | 0 | 先回复后写答案：rc 66，7 条数据竞争 |
+
+- **不能在哪里跑**：
+  - 同一套 TSAN 在 8x3090 上起不来：新内核的 `vm.mmap_rnd_bits` 是 32，超出 gcc 11 的 TSAN 能处理的范围；而关 ASLR 的 `setarch -R` 被容器默认 seccomp 挡住。`-no-pie` 加重试也只部分跑通。
+  - gpu57 上包 `setarch -R` 的那次同样被 seccomp 挡住（"Operation not permitted"），所以直接运行。
+  - 结论：TSAN 以后一律在 gpu57 跑，不需要任何安全设置改动。
+- **覆盖范围**：这套 TSAN 只覆盖三个不链接 torch 的核心。M1 的合并队列和 lanes_pause 的修复在链接 torch 的 driver 里，不在其内；它们由 GPU 测试覆盖（test_b58f_m1、test_b58g_pause）。
+
 ### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
 
 #### 实验目的
