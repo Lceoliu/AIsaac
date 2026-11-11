@@ -9,7 +9,7 @@ RC=0
 : > $LOGF
 run() {   # run <name> <out> <args...>: the TSAN binary with ASLR off (TSAN's shadow map)
   n=$1; o=$2; shift 2
-  setarch $(uname -m) -R ./$n "$@" > $o 2>&1; r=$?
+  if [ "${NO_SETARCH:-0}" = 1 ]; then ./$n "$@" > $o 2>&1; else setarch $(uname -m) -R ./$n "$@" > $o 2>&1; fi; r=$?
   echo "$n $* rc=$r tsan warnings $(grep -c 'WARNING: ThreadSanitizer' $o): $(grep -E '^(part|lineage|lanes)' $o | tr '\n' ' ' | cut -c1-200)" >> $LOGF
   return $r
 }
