@@ -11346,7 +11346,7 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - sigx5-single-mf765780、sigy1-mf94e225、sigy2-mf94e225、sigy3-mf94e225、sigy4-single-mf94e225、sigy5-single-mf94e225、segoff-2u-mf94e225、segon-split-mf94e225：建CUDA上下文时就失败（CUDA unknown error），rc 1，0行；
   - gatecount-split-mf765780：只取10轮的计数，这10轮在01:39:10之前已经跑完，是有效的。它SIGINT之后挂了70分钟，这一段和掉卡时间重叠，不能拿来当任何证据。
 - 尚未验证、等机器恢复以后再做：
-  - f94e225（driver.stop()放回finally开头）：按5种SIGINT落点重测之后才验收；
+  - f94e225（driver.stop()放回finally开头）：已在gpu57验收通过（6次SIGINT落点，见“gpu57：分卡、SIGINT收尾验收…”一节）；
   - 分段计时（691ec41及之后的提交）：开关关、开各做一次验收。已补两条防护：只有开始这一轮update的那条线程打的标记才计入；进程里没有CUDA时整个保持关闭；
   - 单一步进入口step_params()（f73213e）：同一份数据跑2个update，比较参数和三个优化器状态的哈希，必须逐位一致。
 - 当时GPU 5上跑的是cpp-actor的m1-merge0（learner卡），它在01:40:58报CUDA error: unspecified launch failure后崩溃（协调方转述）。
@@ -11375,3 +11375,49 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
 - X1在u15的cf_nobank=128，超过了CF门（≤ 70），queue为1。nobank是成阵出现的（两代teacher都被pin住时actor会拒绝），8x3090上就见过0到70的波动，这一次是单个样本。X2是0。
 - update在这台机器上是19.4 s，8x3090上是17.9 s：同样型号的卡，可能是CPU或PCIe慢一些造成的，原因没查。
 - 计时期间：主机loadavg大约15（别的租户加上dockerd的330%），0号卡别人占着2.3 GB，其余的卡空闲。
+
+#### gpu57：分卡、SIGINT收尾验收、learner分段计时（树m951143c，2026-11-11）
+- 锁：整机读写锁（951143c）已上线：计时运行拿独占锁，其余作业拿共享锁，锁目录与cpp-actor共用。计时运行使用全部32个线程（BM1_TIMED_CPUSET）。
+- 分卡24轮（actor在GPU 1，learner在GPU 2，32线程，计时）：
+
+| run | collect u10+ | update u10+ | wait_learner | ×实时 u10+（u2–u23） | u15 done / nobank / lane / queue / dropped | done/游戏小时 | 容器峰值 / 核 |
+|---|---:|---:|---:|---:|---|---:|---|
+| split-segoff（分段计时关） | 17.51 | 20.99 | 3.18 | 202.6（203.0） | 102 / 0 / 152.1k / 0 / 0 | 5.60 | 48.2 GB / 13.1 |
+| split-segon（分段计时开） | 18.07 | 20.48 | 2.36 | 205.8（208.5） | 105 / 0 / 144.2k / 0 / 0 | 5.77 | 44.5 GB / 13.4 |
+
+  - 表中u10+和u2–u23的中位数取自progress.csv第10–23行和第2–23行（不含u24，也不含SIGINT之后的u25；summ.py的口径）。协调方用含u24/u25的行复算segon为207.4–207.7×，差约1%。
+  - 分段计时开着的那次并不比关着的慢（205.8对202.6，在噪声范围内），所以开销小于噪声（约3%），这次测不出更小的量。关着的那次运行没有生成segments.jsonl。block_steady_compiles全程为0。
+  - 与8x3090分卡（227.6–235.2×，update 17.6–18.1 s）对比：这里update在20.5–21.0 s，比collect长，wait_learner为2.4–3.2 s，限速的是learner。
+  - 每轮collect（s）：segoff是11.3 11.7 16.4 15.7 15.1 16.4 17.6 19.3 14.4 19.9 16.2 19.5 18.0 17.4 17.6 16.4 16.3 14.3 17.9 14.1 20.4 15.8 19.7 19.3 19.0；segon是11.5 12.3 17.1 14.0 15.2 16.5 14.5 16.1 15.5 20.6 12.9 18.6 15.8 19.0 18.5 17.2 16.0 15.8 18.1 15.0 18.4 18.0 20.3 18.4 19.0。有波动，但没有X2那种明显的奇偶交替；每轮×实时在195–224之间（首轮和末轮除外）。
+- 分段计时、step_params（24条语句逐条相同，带着它跑过的门和计时无错）都已验收，分段计时默认保持关闭。
+- learner分段表（split-segon，u10+中位，单位为每个update的秒数；“跨度”是learner流上该段首尾两个event之间的时间，包含流的空闲；“滞后”是该段返回时它的工作还在流上排队的时长）：
+  - b38:part_backward：主机8.03，跨度12.50；ppo.dispatch（PPO前向发射）：主机3.93，跨度3.93；recompute：1.98和1.98；b38:part_loss：0.69和0.69；ppo.pack（等主机打包）：0.20；teach_new：0.24；gae和batch合计0.21。
+  - teach_build：主机2.41，跨度0.07。它的主机时间落在前一段反向还在GPU上排队的时候（被反向盖住了），不在关键路径上。
+  - opt.b43norm：主机1.17，跨度0.01，滞后0.21；opt.clip：主机0.24；opt.step：主机0.37；b38:clip_opt（priv和aux的clip、step）：主机0.12。这些段在GPU上几乎不占时间，主机时间同样和前面排队的GPU工作重叠。
+  - 所有段的跨度合计20.36 s，和update一致。GPU时间主要花在反向（12.5）、前向（3.9）、recompute（2.0）上。
+  - 和8x3090上按旧计数器做的分解比较（口径不完全相同）：8x3090的前向GPU时间3.6、反向GPU时间11.0、recompute 1.9、teach_build 2.3。这里前向3.93、反向12.5、recompute 1.98。慢主要出在反向上（约1.5 s），前向慢约0.3 s，recompute基本一样。原因没查。
+- SIGINT收尾验收（f94e225：先停driver，收尾期间暂存SIGINT），6次全部rc 130、没有terminate、last.pt都保存了：
+  - SIGINT落在主循环（rc 130，未进入暂存）：分卡2次（sigz1、sigz2），单卡1次（sigz6）；
+  - SIGINT落在收尾、等learner最后一个update的那段（日志里有“SIGINT held until the learner was joined, last.pt saved and the driver stopped”）：分卡2次（sigz3、sigz4），单卡1次（sigz5，补的就是之前缺的那种）。
+  - f94e225验收通过。8x3090上那次挂死70分钟仍归因于GPU故障的同一时段，不作为证据。
+- A8（m951143c）：8/8。
+
+#### gpu57：learner离线探针（b65_learner_probe.py，固定输入，2026-11-11）
+- 输入：分卡运行里存下的第6个update的learner输入（ISAAC_LEARNER_DUMP，3.0 GB），共22次调用，其中15次是带梯度的PPO part。损失函数用b44的固定surrogate，不做optimizer.step。learner卡是GPU 2，第二张卡是GPU 5（临时借用）。量测时拿独占锁。
+
+| 做法 | 前向（流上跨度） | 反向（流上跨度） | 合计 | 梯度最大相对差 |
+|---|---:|---:|---:|---|
+| eager，15个part（两次运行） | 3.12 / 3.49 | 6.67 / 6.55 | 9.79 / 10.04 | — |
+| eager，前2个part | 0.41 | 0.85 | 1.26 | — |
+| CUDA graph重放，前2个part | — | — | 1.15（主机发射0.001） | 1.9e-6 |
+| P2 eager，15个part，一张卡（一个线程） | | | 8.83（墙钟） | — |
+| P2 eager，15个part，两张卡（两个线程，part交替分配） | | | 4.98（墙钟） | — |
+
+- 重放比eager快约8%（2个part合计1.26 s降到1.15 s）。eager前向的主机时间和流上跨度几乎相等（0.40对0.41）。
+- P2：两张卡比一张卡快1.77倍，说明两个线程各自发射时GIL的争用不大。P2的重放组没有量成：第二次运行在单卡重放那一步显存不足，因为已捕获的graph在GPU 0上占着约11 GB。
+- 探针和生产的分段表对不上：探针每个update的反向跨度是6.6 s，生产分段表是12.5 s；前向是3.1–3.5 s对3.9 s。原因没查（生产里有游戏和actor同时在跑；探针没有optimizer，用的是surrogate损失）。所以探针的绝对数字不能直接代表生产。
+- P1可行性：
+  - 形状不是静态的：各part的slab在315–386 MB之间，主行数在4932–7240之间。每个part要单独一张graph，换一个update形状就变了，所以graph没法跨update复用。
+  - 数据相关的地方：历史块抽样、各part的行数和分桶都随数据变化，全在主机准备阶段（_prepare_packed）决定。设备侧只发现一处同步：block_learner.py:1031从可分页内存上传P['hscale']，这是第一个挡路项；探针里预先上传绕开之后，前向加反向就能完整捕获。torch的同步检测是原型功能，不保证查全。
+  - 显存：每个part的graph约5–5.5 GB（2个part 10.2–11.0 GB），24 GB的卡上最多放下约3个。15个part里第3个起就显存不足。
+  - 挡路项清单：(1) hscale从可分页内存上传；(2) 显存（每个part一张graph放不下）；(3) 每个update的形状都不同，每次都要重新捕获（捕获本身要先跑2次预热），省下的时间会被捕获开销吃掉；(4) .grad要预先分配，反向必须累加到固定的张量上（探针里已经这样做）。
