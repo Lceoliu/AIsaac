@@ -1132,7 +1132,18 @@ struct ActorDriver {
   }
   // one pass of the lane service (B54's tick): control, a finished round answered, the lane pipes read (up to timeout
   // s), a due round submitted; its GPU work on the lane stream. The lane thread (d2) or the driver thread (d1) runs it.
+  // (step 0 of the driver split: the lane pass's own seconds (control, finish, intake, submit bookkeeping), without the
+  // lane jobs (t_lane_s) and restores (t_l_restore) run inside it)
+  std::atomic<double> t_lpass_s{0}, t_lpass_ctl_s{0}, t_deliver_s{0};
   bool lane_pass(double timeout) {
+    double t0 = now(), j0 = t_lane_s.load(), r0 = t_l_restore.load();
+    bool did = lane_pass_body(timeout);
+    double d = now()-t0;
+    t_lpass_s = t_lpass_s+d;
+    t_lpass_ctl_s = t_lpass_ctl_s+(d-(t_lane_s.load()-j0)-(t_l_restore.load()-r0));
+    return did;
+  }
+  bool lane_pass_body(double timeout) {
     i64 sid = (m1_merge && !lrunning.load() && std::this_thread::get_id() == drv_tid.load()) ? stream_id : lane_stream_id;
     auto stream = c10::cuda::CUDAStream::unpack3(sid, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
     c10::cuda::CUDAStreamGuard guard(stream);
@@ -1444,7 +1455,8 @@ struct ActorDriver {
     d["push_s"] = t_push_s.load(); d["mlane_s"] = t_mlane_s.load(); d["hold_s"] = t_hold_s.load(); d["loop_s"] = t_loop_s.load();
     d["polls"] = n_polls.load(); d["idle_polls"] = n_idle_polls.load();
     d["cap_native"] = n_cap_native.load(); d["cap_refused"] = n_cap_refused.load(); d["cap_publish"] = n_cap_publish.load();
-    d["lin_s"] = t_lin_s.load();
+    d["lin_s"] = t_lin_s.load(); d["restore_s"] = t_l_restore.load(); d["lpass_s"] = t_lpass_s.load();
+    d["lpass_ctl_s"] = t_lpass_ctl_s.load(); d["deliver_s"] = t_deliver_s.load();
     d["m1_jobs"] = n_m1_jobs.load(); d["m1_rows"] = n_m1_rows.load();
     d["lo_old_jobs"] = n_lo_jobs[0].load(); d["lo_switch_jobs"] = n_lo_jobs[1].load(); d["lo_refused_jobs"] = n_lo_jobs[2].load();
     d["lo_idle_jobs"] = n_lo_jobs[3].load(); d["lo_other_jobs"] = n_lo_jobs[4].load(); d["m1_waiting"] = m1_waiting_n.load();
@@ -1742,7 +1754,7 @@ struct ActorDriver {
                          priv ? r->priv.data_ptr<uint8_t>() : nullptr);   // (B58a+b: the episode ends)
       t_cons_s = t_cons_s+(now()-r->t_reply);
       if (lin_on) lineage_observe(rc, n_all, ws);
-      deliver(r, rc, n_all, ws, 0); n_calls++;   // (B58e: batched in batch mode)
+      { double td = now(); deliver(r, rc, n_all, ws, 0); t_deliver_s = t_deliver_s+(now()-td); } n_calls++;   // (B58e: batched in batch mode)
       return;
     }
     // the batch's rows, contiguous: the go rows of the copied records, then (B54) the merged lane jobs' rows
@@ -1909,7 +1921,7 @@ struct ActorDriver {
       lineage_main(*r, rc, ws, go_idx, ids, first, steps_before, pend.data(), ver, complete, pubs);
       t_lin_s = t_lin_s+(now()-t3);
     }
-    deliver(r, rc, n_all, ws, n);   // (B58e: batched in batch mode)
+    { double td = now(); deliver(r, rc, n_all, ws, n); t_deliver_s = t_deliver_s+(now()-td); }   // (B58e: batched in batch mode)
     for (auto &pr : pubs) push_record(pr);
     double t4 = now();
     if (!nat_m.empty()) {   // (d2 M1: the lane rows of this replay: their pages, their lineage, their answers)
