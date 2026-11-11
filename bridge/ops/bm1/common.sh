@@ -173,11 +173,13 @@ sigint_trainer() {
   if [ "$BM1_MODE" = docker ]; then docker exec "$BM1_NAME-$1" pkill -INT -f "$pat"; else pkill -INT -f "$pat"; fi
 }
 
-# trash <path>: gio trash where it exists, else a move into ${BM1_TRASH:-$BM/trash}/<time>/ (nothing is deleted)
+# trash <path>: nothing is deleted. BM1_TRASH_GIO=1 (default): gio trash where it exists (the account's own trash),
+# else a move into ${BM1_TRASH:-$BM/trash}/<date>/<time>/. BM1_TRASH_GIO=0 (gpu57: our files only under ~/AIsaac; gio
+# put them in the host root's ~/.local/share/Trash): always the move.
 trash() {
   [ -e "$1" ] || return 0
-  if command -v gio > /dev/null 2>&1 && gio trash "$1" 2>/dev/null; then return 0; fi
-  d=${BM1_TRASH:-$BM/trash}/$(date +%m%d-%H%M%S); mkdir -p "$d" && mv "$1" "$d/"
+  if [ "${BM1_TRASH_GIO:-1}" != 0 ] && command -v gio > /dev/null 2>&1 && gio trash "$1" 2>/dev/null; then return 0; fi
+  d=${BM1_TRASH:-$BM/trash}/$(date +%Y%m%d)/$(date +%H%M%S); mkdir -p "$d" && mv "$1" "$d/"
 }
 
 # gpus_free <g[,g...]>: every listed GPU without another process (memory used under BM1_GPU_FREE_MB, default 500 MiB,
