@@ -417,8 +417,10 @@ def test_stale():
 
 def test_source():
     src = (HERE.parent / 'train_tok.py').read_text(encoding='utf-8')
-    # (B38 step 5: the loop's condition grew a parenthesis)
-    loop = src[re.search(r'\n        while \(?handed < target_decisions', src).start():]
+    # (B38 step 5: the loop's condition grew a parenthesis; BM1 C: it moved into the loop as go_on, which the shards
+    # agree on)
+    loop = src[re.search(r'\n        while (\(?handed < target_decisions|True:\n            go_on = \(\(handed < '
+                         r'target_decisions)', src).start():]
     wl = src[src.index('    def wait_learner():'):src.index('    aux = sampler.aux')]
     check('(e) train_tok: LaneService built, tick in the loop, quiesce before take_weights, serve_wait in wait_learner',
           'LaneService(sampler, model, device, nh' in src and 'lanes.tick()' in loop and
