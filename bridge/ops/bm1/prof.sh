@@ -16,7 +16,7 @@ R=$BM/reports; LOG=$R/bm1.log
 mkdir -p $R
 [ -e $R/$TAG ] && { echo "prof.sh: $R/$TAG exists (never overwritten)" >&2; exit 2; }
 if [ "${NOLOCK:-0}" = 1 ]; then LOCKLINE="(held by the caller: ${LOCKS_HELD:-?})"; else take "timed $TAG ($TREE, GPU $GPU) 计时运行"; fi
-echo "$(date '+%F %T') $TAG start: tree $TREE GPU $GPU updates $UPDATES hours $HOURS lock: $LOCKLINE" >> $LOG
+echo "$(date '+%F %T') $TAG start: tree $TREE capture mode $(capmode $TREE) GPU $GPU updates $UPDATES hours $HOURS lock: $LOCKLINE" >> $LOG
 nvidia-smi -i $GPU --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,clocks.sm,index --format=csv,noheader -l 1 > $R/$TAG.gpu &
 S1=$!
 nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader -l 5 > $R/$TAG.allgpu &
@@ -54,6 +54,6 @@ wait $DP
 rc=$?
 kill $S1 $S2 $S3 $S4 $S5 $S6 2>/dev/null
 [ -d $R/$TAG/checkpoints ] && gio trash $R/$TAG/checkpoints
-echo "$(date '+%F %T') $TAG done rc=$rc rows $(($(wc -l < $R/$TAG/progress.csv 2>/dev/null || echo 1)-1))" >> $LOG
+echo "$(date '+%F %T') $TAG done rc=$rc rows $(($(wc -l < $R/$TAG/progress.csv 2>/dev/null || echo 1)-1)); $(grep -h -m1 "BM1 graph capture mode" $R/$TAG.stdout 2>/dev/null)" >> $LOG
 python3 $BM/summ.py $R $TAG "${CPUSET:-0-11,24-35}" $GPU > $R/$TAG.summary.txt 2>&1   # (still inside the lock)
 [ "${NOLOCK:-0}" = 1 ] || give
