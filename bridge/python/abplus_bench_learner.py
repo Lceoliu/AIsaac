@@ -211,21 +211,28 @@ def run_bench(ctx):
                   f'{L["last_steps"]} optimizer steps, {L["last_update_s"]:.3f}s', flush=True)
         L['stop'] = True
         return True
+    if os.environ.get('ISAAC_RL_LEARNER_ANOMALY', '0') == '1':   # (a failing backward: its forward's stack)
+        torch.autograd.set_detect_anomaly(True, check_nan=False)
     check = os.environ.get('ISAAC_RL_LEARNER_CHECK', '0') == '1'
     profile = os.environ.get('ISAAC_RL_LEARNER_PROFILE', '0') == '1'
     # a path: --learner-fast 0 / 1, optionally with a BM1 P2 suffix: 'o' P2 off (whole parts on the learner card),
     # 's' the parts' two halves one after the other on the learner card, 'p' the halves on two cards (--learner-devices)
     # (letters after the digit, any order: o / s / p the BM1 P2 mode as above; k: the learner's Spatial without its
-    #  gradient checkpoints, block_learner.SPATIAL_CKPT = 0, recomputation traded for memory)
+    #  gradient checkpoints, block_learner.SPATIAL_CKPT = 0, recomputation traded for memory; f: float32, the learner's
+    #  forward passes without the run's bf16 autocast)
     paths = [int(v) if v.isdigit() else v for v in os.environ.get('ISAAC_RL_LEARNER_PATHS', '0,1').split(',')]
     from isaac_bridge import block_learner as bl_
     ckpt0 = bl_.SPATIAL_CKPT
+    amp_ = ctx.get('amp')   # (train_tok's AMP: [True] in a --amp bf16 run)
+    amp0 = amp_[0] if amp_ is not None else None
 
     def set_path(fast):
         s_ = str(fast)
         args.learner_fast = int(''.join(ch for ch in s_ if ch.isdigit()))
         L['p2_mode'] = next((m_ for ch, m_ in (('o', 'off'), ('s', 'serial'), ('p', 'two')) if ch in s_), None)
         bl_.SPATIAL_CKPT = 0 if 'k' in s_ else ckpt0
+        if amp_ is not None:   # f: learn() without bf16 autocast (float32 forward passes) within a bf16 run
+            amp_[0] = False if 'f' in s_ else amp0
     L['bench'] = True
     params = list(opt.param_groups[0]['params'])
     by_id = {id(p): nm_ for nm_, p in model.named_parameters()}
@@ -272,9 +279,18 @@ def run_bench(ctx):
         settings = (('this run (tf32 %s)' % bool(tf32[0]), tf32), ('strict float32', (False, False)))
         for label, setting in settings[:1 if os.environ.get('ISAAC_RL_LEARNER_CHECK_STRICT', '1') == '0' else 2]:
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = setting
-            for path_o in paths[1:]:   # (each later path against the first; BM1 P2: o / s / p)
-                ref, new = one(paths[0], trace=True), one(path_o, trace=True)
-                ref2 = one(paths[0], trace=True)   # the old path against itself (run-to-run floor of the GPU kernels)
+            # (each later path against the first; BM1 P2: o / s / p; ISAAC_RL_LEARNER_CHECK_PAIRS='a:b,c:d': these pairs,
+            #  a pair with a path dropped above skipped)
+            pv_ = lambda v: int(v) if v.isdigit() else v
+            pairs_ = os.environ.get('ISAAC_RL_LEARNER_CHECK_PAIRS', '')
+            pairs_ = ([tuple(pv_(x) for x in q.split(':')) for q in pairs_.split(',')] if pairs_ else
+                      [(paths[0], q) for q in paths[1:]])
+            for path_b, path_o in pairs_:
+                if path_b not in paths or path_o not in paths:
+                    print(f'check: pair {path_b} / {path_o} skipped (a path dropped)', flush=True)
+                    continue
+                ref, new = one(path_b, trace=True), one(path_o, trace=True)
+                ref2 = one(path_b, trace=True)   # the old path against itself (run-to-run floor of the GPU kernels)
                 new2 = one(path_o, trace=True)  # and the new one (its gathers' gradients are atomic sums)
                 for name, other, base in (('new vs old', new, ref), ('old vs old', ref2, ref),
                                           ('new vs new', new2, new)):
@@ -290,7 +306,7 @@ def run_bench(ctx):
                     cos = float(torch.nn.functional.cosine_similarity(flat_r.double(), flat_o.double(), 0))
                     wd = [_diff(a, b) for a, b in zip(base['weights'], other['weights'])]
                     first = _diff(step_r[0], step_o[0])
-                    print(f'check [{label}] {paths[0]} / {path_o} {name}: steps {len(base["trace"])}/{len(other["trace"])}; first step losses '
+                    print(f'check [{label}] {path_b} / {path_o} {name}: steps {len(base["trace"])}/{len(other["trace"])}; first step losses '
                           f'max abs {first[0]:.3e}; all steps losses max abs {float((step_r - step_o).abs().max()):.3e} '
                           f'(columns pg vf ent kl clip teach danger safe: '
                           f'{" ".join("%.1e" % v for v in (step_r - step_o).abs().max(0).values.tolist())}); '
@@ -302,10 +318,27 @@ def run_bench(ctx):
                     worst = sorted(((float((a - b).norm() / a.norm().clamp(min=1e-30)), nm_, float(a.norm()))
                                     for nm_, a, b in zip(names, g_r, g_o) if a is not None and b is not None),
                                    reverse=True)[:4]
-                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first gradient, tensors with the largest relative difference (rel '
+                    print(f'check [{label}] {path_b} / {path_o} {name}: first gradient, tensors with the largest relative difference (rel '
                           f'norm, name, gradient norm): {" | ".join("%.2e %s %.2e" % w_ for w_ in worst)}', flush=True)
-                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses old {step_r[0].tolist()}', flush=True)
-                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses new {step_o[0].tolist()}', flush=True)
+                    # per module: ||g_new - g_old|| / ||g_old|| over the module's parameters concatenated (block_memory /
+                    # structured_spatial by their sub-module, layer numbers merged), the module's share of ||g_old||
+                    grp = {}
+                    for nm_, a, b in zip(names, g_r, g_o):
+                        if a is None or b is None:
+                            continue
+                        parts_ = nm_.split('.')
+                        key_ = parts_[0] if parts_[0] not in ('block_memory', 'structured_spatial') or len(parts_) < 3 \
+                            else parts_[0]+'.'+parts_[1]
+                        s_ = grp.setdefault(key_, [0.0, 0.0])
+                        s_[0] += float((a.double() - b.double()).pow(2).sum())
+                        s_[1] += float(a.double().pow(2).sum())
+                    tot_ = sum(v[1] for v in grp.values())
+                    print(f'check [{label}] {path_b} / {path_o} {name}: first gradient per module (||dg||/||g||, '
+                          f'share of ||g||^2): ' + ' | '.join(
+                              '%s %.2e %.3f' % (k_, (v[0] / max(v[1], 1e-300)) ** 0.5, v[1] / max(tot_, 1e-300))
+                              for k_, v in sorted(grp.items(), key=lambda kv: -kv[1][1])), flush=True)
+                    print(f'check [{label}] {path_b} / {path_o} {name}: first step losses old {step_r[0].tolist()}', flush=True)
+                    print(f'check [{label}] {path_b} / {path_o} {name}: first step losses new {step_o[0].tolist()}', flush=True)
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
     res = {fast: [] for fast in paths}
     for _ in range(repeat):
@@ -358,6 +391,9 @@ def run_bench(ctx):
             except Exception as exc:   # (a measurement aid: the tables above are the result)
                 print('profile: no chrome trace', exc)
     _restore(start, model, opt, L)
+    bl_.SPATIAL_CKPT = ckpt0
+    if amp_ is not None:
+        amp_[0] = amp0
     L['bench'] = False
     L['stop'] = True
     return True

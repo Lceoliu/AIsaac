@@ -213,8 +213,14 @@ class AuxNorm:
         self.rn = np.zeros(n_scales, np.float64)
         self.rm2 = np.zeros(n_scales, np.float64)   # (about 0: a return is not centred, its second moment scales it)
 
+    reduce = None   # BM1 C: a callable summing the batch's moments over the shards (shard_sync); None: this batch only
+
     def update(self, state_raw, ret, m_ev):
         """state_raw [records, S]; ret, m_ev [..., K]. Batched Welford."""
+        if self.reduce is not None:   # (the global batch: every shard's records, the same statistics on every rank)
+            from .shard_sync import auxnorm_apply, auxnorm_moments
+            auxnorm_apply(self, np.asarray(self.reduce(auxnorm_moments(state_raw, ret, m_ev))))
+            return
         if len(state_raw):
             b = float(len(state_raw))
             mu = state_raw.astype(np.float64).mean(0)

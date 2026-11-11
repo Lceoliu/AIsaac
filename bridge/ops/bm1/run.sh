@@ -27,6 +27,7 @@ mkdir -p "$BM/home"
 if [ "$BM1_MODE" = docker ]; then
   EV=""; for kv in $KV; do EV="$EV -e $kv"; done
   PP=${PYTHONPATH_EXTRA:-$BM1_PYTHONPATH}
+  lock_container "$BM1_NAME-$P"   # (the lock this job runs under stays held while its container runs)
   exec docker run --rm --init --name "$BM1_NAME-$P" --runtime=nvidia --network none \
     ${BM1_CPUSET:+--cpuset-cpus "$BM1_CPUSET"} ${BM1_MEMS:+--cpuset-mems "$BM1_MEMS"} \
     ${BM1_MEM:+--memory "$BM1_MEM" --memory-swap "$BM1_MEM"} --shm-size 8g --pids-limit "$BM1_PIDS" \

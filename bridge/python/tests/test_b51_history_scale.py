@@ -220,3 +220,36 @@ def test_causality_and_packed_equivalence_under_unbiased(monkeypatch):
                                            test_packed_matches_per_length_path_outputs_loss_and_every_gradient as eq)
     causal(monkeypatch)
     eq('cpu', monkeypatch)
+
+
+def test_hscale_in_slab_bit_identical(monkeypatch):
+    """BM1 B step 1 (ISAAC_LEARN_HSCALE_SLAB=1): the gradient scales staged in the part's slab instead of their own
+    host->device copy: loss, outputs and every gradient bit-identical to the default path (except the parameters
+    whose gradient already differs between two runs of the default path: block_memory.memory_age / short_relative's
+    accumulation order, ~4e-7 relative; on those, the same size of difference)."""
+    m, chunks, teach = _model_and_chunks()
+    m.train()
+    seen = []
+    orig = block_paged.history_scales
+
+    def spy(*a, **k):
+        r = orig(*a, **k)
+        seen.append(r is not None)
+        return r
+    monkeypatch.setattr(block_paged, 'history_scales', spy)
+    runs = []
+    for on in (False, False, True):
+        monkeypatch.setattr(block_learner, 'HSCALE_SLAB', on)
+        runs.append(_run(m, chunks+teach, 'unbiased', packed=True))
+    assert any(seen), 'no part with scaled history entries'
+    (l0, o0, g0, _), (_, _, g0b, _), (l1, o1, g1, _) = runs
+    floor = {n for n in g0 if not torch.equal(g0[n], g0b[n])}
+    assert len(floor) <= 2, floor
+    assert torch.equal(l0, l1)
+    assert all(torch.equal(x, y) for x, y in zip(o0, o1))
+    assert g0.keys() == g1.keys()
+    for n in g0:
+        if n in floor:
+            assert float((g0[n]-g1[n]).norm()/g0[n].norm()) <= 1e-5, n
+        else:
+            assert torch.equal(g0[n], g1[n]), n

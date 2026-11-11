@@ -44,6 +44,9 @@ PACKED = os.environ.get('ISAAC_PACKED_LEARNER', '1') == '1'
 # historical rows of one 8192-row part (~16k rows, ~0.7M tokens) needed > 23.6 GB on the 4090 (B44
 # fixed-input benchmark: OOM in the first training part); 4096-row checkpoints peak at 7.7 GB.
 SPATIAL_CKPT = int(os.environ.get('ISAAC_LEARN_SPATIAL_CKPT', '1'))
+# BM1 B step 1: the old bank entries' gradient scales (B51 hscale) staged in the part's slab and uploaded with it (1), not
+# as their own pageable host->device copy at use (0, default); the same float32 values either way
+HSCALE_SLAB = os.environ.get('ISAAC_LEARN_HSCALE_SLAB', '0') == '1'
 SPATIAL_ROWS = int(os.environ.get('ISAAC_LEARN_SPATIAL_ROWS', '4096'))
 # B62 N5: the checkpoint without its per-saved-tensor bookkeeping on the learner thread: determinism_check 'none'
 # (the default 'default' records every saved tensor's shape / dtype / device under no_grad in the pack hook, a debug
@@ -109,7 +112,9 @@ NATIVE_PACK = learn_native.ENABLED
 # B60 per-update counters in progress.csv (b42_*; block_paged's UPD_KEYS extended here, block_paged unchanged)
 bp.UPD_KEYS = tuple(bp.UPD_KEYS)+tuple(k for k in (
     'learn_prefetch_submitted', 'learn_prefetch_cpu_s', 'learn_prefetch_wait_grad_s', 'learn_prefetch_wait_nograd_s',
-    'learn_prefetch_skip_wait_s', 'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s')
+    'learn_prefetch_skip_wait_s', 'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s',
+    # BM1 P2: the second learner card's forward / backward (wall on its thread, CUDA-event span on its card)
+    'p2_fwd_part_wall_s', 'p2_fwd_part_gpu_s', 'p2_bwd_wall_s', 'p2_bwd_gpu_s', 'p2_bwd_calls')
     if k not in bp.UPD_KEYS)
 
 
@@ -1003,6 +1008,10 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
     names_i = list(ints)
     sizes_i = [len(ints[k]) for k in names_i]
     specs.append(('ints', (int(sum(sizes_i)),), torch.int64))
+    # B51: the old bank entries' gradient scales (history_scale 'unbiased'; None: nothing scaled)
+    hscale = bp.history_scales(parts, selected, cfg) if grad and len(ub) and history_mode == 'random' else None
+    if HSCALE_SLAB and hscale is not None:
+        specs.append(('hscale', hscale.shape, torch.float32))
     # ---- one staging slab, one upload
     slab = Slab(specs, device)
     _fill_merged(all_hosts, shapes, slab.host)
@@ -1015,8 +1024,8 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
         _pages(store, 'blocks', ubid, slab.host['blocks'])
     if sizes_i:
         np.concatenate([np.asarray(ints[k], np.int64) for k in names_i], out=slab.host['ints'].numpy())
-    # B51: the old bank entries' gradient scales (history_scale 'unbiased'; None: nothing scaled)
-    hscale = bp.history_scales(parts, selected, cfg) if grad and len(ub) and history_mode == 'random' else None
+    if 'hscale' in slab.host:
+        slab.host['hscale'].copy_(torch.from_numpy(hscale))
     bp.ucount('learn_packed_host_s', time.perf_counter()-t0)
     return dict(hscale=hscale, bs=bs, cfg=cfg, device=device, grad=grad, lat=lat, lw=lw, memory=memory, n_hist=n_hist,
                 n_main=n_main, n_new=n_new, n_old_total=n_old_total, n_tail=n_tail, names_i=names_i, packed=packed,
@@ -1105,7 +1114,8 @@ def _run_packed(model, P):
             old_v = pool_b.index_select(0, di['old:source']).to(zdt)
             if P['hscale'] is not None:   # (B51: unbiased history gradient, straight through)
                 from .block_memory import scaled_history
-                old_v = scaled_history(old_v, torch.from_numpy(P['hscale']).to(device, old_v.dtype)[:, None, None])
+                hs_ = dev['hscale'] if 'hscale' in dev else torch.from_numpy(P['hscale']).to(device)
+                old_v = scaled_history(old_v, hs_.to(old_v.dtype)[:, None, None])
             vparts.append(old_v)
         if new_written is not None:
             vparts.append(new_written.to(zdt))
