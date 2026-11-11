@@ -277,9 +277,18 @@ def run_bench(ctx):
         settings = (('this run (tf32 %s)' % bool(tf32[0]), tf32), ('strict float32', (False, False)))
         for label, setting in settings[:1 if os.environ.get('ISAAC_RL_LEARNER_CHECK_STRICT', '1') == '0' else 2]:
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = setting
-            for path_o in paths[1:]:   # (each later path against the first; BM1 P2: o / s / p)
-                ref, new = one(paths[0], trace=True), one(path_o, trace=True)
-                ref2 = one(paths[0], trace=True)   # the old path against itself (run-to-run floor of the GPU kernels)
+            # (each later path against the first; BM1 P2: o / s / p; ISAAC_RL_LEARNER_CHECK_PAIRS='a:b,c:d': these pairs,
+            #  a pair with a path dropped above skipped)
+            pv_ = lambda v: int(v) if v.isdigit() else v
+            pairs_ = os.environ.get('ISAAC_RL_LEARNER_CHECK_PAIRS', '')
+            pairs_ = ([tuple(pv_(x) for x in q.split(':')) for q in pairs_.split(',')] if pairs_ else
+                      [(paths[0], q) for q in paths[1:]])
+            for path_b, path_o in pairs_:
+                if path_b not in paths or path_o not in paths:
+                    print(f'check: pair {path_b} / {path_o} skipped (a path dropped)', flush=True)
+                    continue
+                ref, new = one(path_b, trace=True), one(path_o, trace=True)
+                ref2 = one(path_b, trace=True)   # the old path against itself (run-to-run floor of the GPU kernels)
                 new2 = one(path_o, trace=True)  # and the new one (its gathers' gradients are atomic sums)
                 for name, other, base in (('new vs old', new, ref), ('old vs old', ref2, ref),
                                           ('new vs new', new2, new)):
@@ -295,7 +304,7 @@ def run_bench(ctx):
                     cos = float(torch.nn.functional.cosine_similarity(flat_r.double(), flat_o.double(), 0))
                     wd = [_diff(a, b) for a, b in zip(base['weights'], other['weights'])]
                     first = _diff(step_r[0], step_o[0])
-                    print(f'check [{label}] {paths[0]} / {path_o} {name}: steps {len(base["trace"])}/{len(other["trace"])}; first step losses '
+                    print(f'check [{label}] {path_b} / {path_o} {name}: steps {len(base["trace"])}/{len(other["trace"])}; first step losses '
                           f'max abs {first[0]:.3e}; all steps losses max abs {float((step_r - step_o).abs().max()):.3e} '
                           f'(columns pg vf ent kl clip teach danger safe: '
                           f'{" ".join("%.1e" % v for v in (step_r - step_o).abs().max(0).values.tolist())}); '
@@ -307,7 +316,7 @@ def run_bench(ctx):
                     worst = sorted(((float((a - b).norm() / a.norm().clamp(min=1e-30)), nm_, float(a.norm()))
                                     for nm_, a, b in zip(names, g_r, g_o) if a is not None and b is not None),
                                    reverse=True)[:4]
-                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first gradient, tensors with the largest relative difference (rel '
+                    print(f'check [{label}] {path_b} / {path_o} {name}: first gradient, tensors with the largest relative difference (rel '
                           f'norm, name, gradient norm): {" | ".join("%.2e %s %.2e" % w_ for w_ in worst)}', flush=True)
                     # per module: ||g_new - g_old|| / ||g_old|| over the module's parameters concatenated (block_memory /
                     # structured_spatial by their sub-module, layer numbers merged), the module's share of ||g_old||
@@ -322,12 +331,12 @@ def run_bench(ctx):
                         s_[0] += float((a.double() - b.double()).pow(2).sum())
                         s_[1] += float(a.double().pow(2).sum())
                     tot_ = sum(v[1] for v in grp.values())
-                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first gradient per module (||dg||/||g||, '
+                    print(f'check [{label}] {path_b} / {path_o} {name}: first gradient per module (||dg||/||g||, '
                           f'share of ||g||^2): ' + ' | '.join(
                               '%s %.2e %.3f' % (k_, (v[0] / max(v[1], 1e-300)) ** 0.5, v[1] / max(tot_, 1e-300))
                               for k_, v in sorted(grp.items(), key=lambda kv: -kv[1][1])), flush=True)
-                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses old {step_r[0].tolist()}', flush=True)
-                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses new {step_o[0].tolist()}', flush=True)
+                    print(f'check [{label}] {path_b} / {path_o} {name}: first step losses old {step_r[0].tolist()}', flush=True)
+                    print(f'check [{label}] {path_b} / {path_o} {name}: first step losses new {step_o[0].tolist()}', flush=True)
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
     res = {fast: [] for fast in paths}
     for _ in range(repeat):
