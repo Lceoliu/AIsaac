@@ -56,9 +56,30 @@ sigint_trainer() {
   if [ "$BM1_MODE" = docker ]; then docker exec "aisaac-bench-bm1-a1-$1" pkill -INT -f "$pat"; else pkill -INT -f "$pat"; fi
 }
 
-# trash <path>: gio trash where it exists, else a move into $BM/trash/<time>/ (nothing is deleted)
+# trash <path>: gio trash where it exists, else a move into ${BM1_TRASH:-$BM/trash}/<time>/ (nothing is deleted)
 trash() {
   [ -e "$1" ] || return 0
   if command -v gio > /dev/null 2>&1 && gio trash "$1" 2>/dev/null; then return 0; fi
-  d=$BM/trash/$(date +%m%d-%H%M%S); mkdir -p "$d" && mv "$1" "$d/"
+  d=${BM1_TRASH:-$BM/trash}/$(date +%m%d-%H%M%S); mkdir -p "$d" && mv "$1" "$d/"
+}
+
+# gpus_free <g[,g...]>: every listed GPU without another process (memory used under BM1_GPU_FREE_MB, default 500 MiB,
+# and no compute process); a busy GPU is logged and the caller exits 4 (shared hosts: never start on a used card)
+gpus_free() {
+  for g in $(echo "$1" | tr ',' ' '); do
+    m=$(nvidia-smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+    p=$(nvidia-smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c .)
+    if [ -z "$m" ] || [ "$m" -ge "${BM1_GPU_FREE_MB:-500}" ] || [ "$p" -gt 0 ]; then
+      log "GPU $g BUSY (memory used ${m:-?} MiB, ${p} compute process(es)): not started"
+      exit 4
+    fi
+  done
+}
+
+# host_snapshot <label>: every GPU's memory / utilisation, the load average and the five busiest processes, one bm1.log
+# line (a timed run's start and end: a run disturbed by other tenants can be told)
+host_snapshot() {
+  g=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{printf "%s:%sMiB/%s%% ", $1, $2, $3}')
+  t=$(ps -eo pcpu=,comm= --sort=-pcpu 2>/dev/null | head -5 | awk '{printf "%s %s%%; ", $2, $1}')
+  log "$1 host: gpus [$g] load [$(cut -d' ' -f1-3 /proc/loadavg)] top cpu [$t]"
 }

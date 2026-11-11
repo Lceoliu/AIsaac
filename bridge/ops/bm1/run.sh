@@ -21,6 +21,7 @@ for g in $(echo "$G" | tr ',' ' '); do
   case ",$BM1_GPUS_OK," in *",$g,"*) ;; *) echo "run.sh: GPU $g is not on this lane ($BM1_GPUS_OK)" >&2; exit 2 ;; esac
 done
 preflight "$P"
+gpus_free "$G"
 KV="BM1_IN=$BM1_IN BM1_PY=$BM1_PY $(echo "${DOCK_ENV:-}" | sed 's/-e //g') ${RUNENV:-}"
 mkdir -p "$BM/home"
 if [ "$BM1_MODE" = docker ]; then
