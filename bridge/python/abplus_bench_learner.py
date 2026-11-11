@@ -131,9 +131,17 @@ def restore_learner(saved, model, opt, L):
         L['teach_raw'][:raw.shape[0]] = raw.to(dev)
 
 
-def _snapshot(model, opt, L):
+def _snapshot(model, opt, L, extra=()):
+    """extra: (name, object) of the other learner state an update changes (BM1: the privileged critic, the aux head,
+    their optimisers: state_dict(); the aux targets' normalisation: its attributes)."""
     import torch
+
+    def grab(o):
+        if hasattr(o, 'state_dict'):
+            return copy.deepcopy(o.state_dict())
+        return copy.deepcopy(vars(o))
     return dict(model={k: v.detach().clone() for k, v in model.state_dict().items()},
+                extra=[(nm, o, grab(o)) for nm, o in extra if o is not None],
                 opt=copy.deepcopy(opt.state_dict()),
                 L={k: (v.copy() if isinstance(v, np.ndarray) else v.clone() if torch.is_tensor(v) else v)
                    for k, v in L.items() if k not in ('writer', 'stage')},   # (stage: the pinned buffer, kept)
@@ -144,6 +152,11 @@ def _restore(s, model, opt, L):
     import torch
     model.load_state_dict(s['model'])
     opt.load_state_dict(copy.deepcopy(s['opt']))
+    for _, o, st_ in s.get('extra', ()):
+        if hasattr(o, 'load_state_dict'):
+            o.load_state_dict(copy.deepcopy(st_))
+        else:
+            vars(o).update(copy.deepcopy(st_))
     for k, v in s['L'].items():
         L[k] = v.copy() if isinstance(v, np.ndarray) else v.clone() if torch.is_tensor(v) else v
     np.random.set_state(s['np_rng'])
@@ -212,7 +225,7 @@ def run_bench(ctx):
     params = list(opt.param_groups[0]['params'])
     by_id = {id(p): nm_ for nm_, p in model.named_parameters()}
     names = [by_id.get(id(p), '?') for p in params]
-    start = _snapshot(model, opt, L)
+    start = _snapshot(model, opt, L, ctx.get('extra', ()))   # (BM1: priv / aux state restored too)
     print(f'bench: {int(job["roll"].length.sum())} records in the job, --rollout {args.rollout} --minibatch '
           f'{args.minibatch} --micro '
           f'{args.micro} --epochs {args.epochs} --packed {args.packed} --amp {args.amp} --tf32 {args.tf32} '

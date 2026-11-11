@@ -4914,6 +4914,8 @@ def main(argv=None, child=None, actor=None):
             save(out / 'checkpoints' / f'update-{upd:06d}.pt')
         L['ckpt_s'] = time.perf_counter() - t_ck
 
+    # (BM1: the learner bench restores these too before each of its learn() calls: an update changes them)
+    bench_extra = (('pcritic', pcritic), ('popt', popt), ('aux_head', aux_head), ('aopt', aopt), ('aux_norm', aux_norm))
     jobs = queue.Queue()
     fresh = threading.Event()        # set by the learner when new weights are final
     failure = []
@@ -4937,7 +4939,7 @@ def main(argv=None, child=None, actor=None):
                     # 2026-10-10 (B18): the learner bench on this job (abplus_bench_learner.py), then the run ends
                     from abplus_bench_learner import run_bench
                     if run_bench(dict(learn=learn, job=job, model=learner_model, opt=opt, L=L, args=args,
-                                      stats=sampler.stats.copy())):
+                                      stats=sampler.stats.copy(), extra=bench_extra)):
                         fresh.set()
                         continue
                 prof_dir_t = os.environ.get('ISAAC_RL_B38_TORCHPROF', '')
@@ -5426,7 +5428,7 @@ def main(argv=None, child=None, actor=None):
             from abplus_bench_learner import run_bench
             torch.cuda.set_stream(learner_stream)
             run_bench(dict(learn=learn, job=bench_job, model=learner_model, opt=opt, L=L, args=args,
-                           stats=sampler.stats.copy()))
+                           stats=sampler.stats.copy(), extra=bench_extra))
             torch.cuda.set_stream(actor_stream)
         # (B38 step 5: each actor process its share of the decisions and of every rollout)
         # (with several actors every one makes the same number of hand-offs: the learner pairs them all; one actor
