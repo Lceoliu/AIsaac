@@ -54,6 +54,13 @@ if [ -n "${BM1_LEARNER_CPUS:-}" ] && [ "${LANE_CPUS:-0}" != 1 ] && [ "${LEARNER_
   case "${ENVS:-}" in *ISAAC_LEARNER_CPUS=*) ;; *) LP="-e ISAAC_LEARNER_CPUS=$BM1_LEARNER_CPUS" ;; esac
 fi
 log "$TAG learner CPUs: $(echo "${ENVS:-} $LP" | grep -o 'ISAAC_LEARNER_CPUS=[^ ]*' | head -1 || true) ${LP:+(bm1.env BM1_LEARNER_CPUS)}"
+# (the host's driver-thread cores, bm1.env BM1_DRIVER_CPUS: the same rules; DRIVER_PIN=0: none)
+DP_=""
+if [ -n "${BM1_DRIVER_CPUS:-}" ] && [ "${LANE_CPUS:-0}" != 1 ] && [ "${DRIVER_PIN:-1}" != 0 ]; then
+  case "${ENVS:-}" in *ISAAC_DRIVER_CPUS=*) ;; *) DP_="-e ISAAC_DRIVER_CPUS=$BM1_DRIVER_CPUS" ;; esac
+fi
+log "$TAG driver CPUs: $(echo "${ENVS:-} $DP_" | grep -o 'ISAAC_DRIVER_CPUS=[^ ]*' | head -1 || true) ${DP_:+(bm1.env BM1_DRIVER_CPUS)}"
+LP="$LP $DP_"
 DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 -e ISAAC_BLOCK_TIMELINE=$BM1_IN/reports/$TAG.timeline.csv ${ENVS:-} $LP" $BM/run.sh prof-$TAG $GPU sh $BM1_IN/xnew2.sh $TAG $LIMIT $HOURS &
 DP=$!
 # progress.csv row times (1 s): each update's end on the host clock, to place the 1 s GPU / CPU samples in each cycle
