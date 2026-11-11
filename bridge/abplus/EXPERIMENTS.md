@@ -11042,3 +11042,27 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
 - X1在u15的cf_nobank=128，超过了CF门（≤ 70），queue为1。nobank是成阵出现的（两代teacher都被pin住时actor会拒绝），8x3090上就见过0到70的波动，这一次是单个样本。X2是0。
 - update在这台机器上是19.4 s，8x3090上是17.9 s：同样型号的卡，可能是CPU或PCIe慢一些造成的，原因没查。
 - 计时期间：主机loadavg大约15（别的租户加上dockerd的330%），0号卡别人占着2.3 GB，其余的卡空闲。
+
+#### gpu57：分卡、SIGINT收尾验收、learner分段计时（树m951143c，2026-11-11）
+- 锁：整机读写锁（951143c）已上线：计时运行拿独占锁，其余作业拿共享锁，锁目录与cpp-actor共用。计时运行使用全部32个线程（BM1_TIMED_CPUSET）。
+- 分卡24轮（actor在GPU 1，learner在GPU 2，32线程，计时）：
+
+| run | collect u10+ | update u10+ | wait_learner | ×实时 u10+（u2–u23） | u15 done / nobank / lane / queue / dropped | done/游戏小时 | 容器峰值 / 核 |
+|---|---:|---:|---:|---:|---|---:|---|
+| split-segoff（分段计时关） | 17.51 | 20.99 | 3.18 | 202.6（203.0） | 102 / 0 / 152.1k / 0 / 0 | 5.60 | 48.2 GB / 13.1 |
+| split-segon（分段计时开） | 18.07 | 20.48 | 2.36 | 205.8（208.5） | 105 / 0 / 144.2k / 0 / 0 | 5.77 | 44.5 GB / 13.4 |
+
+  - 分段计时开着的那次并不比关着的慢（205.8对202.6，在噪声范围内），所以开销小于噪声（约3%），这次测不出更小的量。关着的那次运行没有生成segments.jsonl。block_steady_compiles全程为0。
+  - 与8x3090分卡（227.6–235.2×，update 17.6–18.1 s）对比：这里update在20.5–21.0 s，比collect长，wait_learner为2.4–3.2 s，限速的是learner。
+  - 每轮collect（s）：segoff是11.3 11.7 16.4 15.7 15.1 16.4 17.6 19.3 14.4 19.9 16.2 19.5 18.0 17.4 17.6 16.4 16.3 14.3 17.9 14.1 20.4 15.8 19.7 19.3 19.0；segon是11.5 12.3 17.1 14.0 15.2 16.5 14.5 16.1 15.5 20.6 12.9 18.6 15.8 19.0 18.5 17.2 16.0 15.8 18.1 15.0 18.4 18.0 20.3 18.4 19.0。有波动，但没有X2那种明显的奇偶交替；每轮×实时在195–224之间（首轮和末轮除外）。
+- learner分段表（split-segon，u10+中位，单位为每个update的秒数；“跨度”是learner流上该段首尾两个event之间的时间，包含流的空闲；“滞后”是该段返回时它的工作还在流上排队的时长）：
+  - b38:part_backward：主机8.03，跨度12.50；ppo.dispatch（PPO前向发射）：主机3.93，跨度3.93；recompute：1.98和1.98；b38:part_loss：0.69和0.69；ppo.pack（等主机打包）：0.20；teach_new：0.24；gae和batch合计0.21。
+  - teach_build：主机2.41，跨度0.07。它的主机时间落在前一段反向还在GPU上排队的时候（被反向盖住了），不在关键路径上。
+  - opt.b43norm：主机1.17，跨度0.01，滞后0.21；opt.clip：主机0.24；opt.step：主机0.37；b38:clip_opt（priv和aux的clip、step）：主机0.12。这些段在GPU上几乎不占时间，主机时间同样和前面排队的GPU工作重叠。
+  - 所有段的跨度合计20.36 s，和update一致。GPU时间主要花在反向（12.5）、前向（3.9）、recompute（2.0）上。
+  - 和8x3090上按旧计数器做的分解比较（口径不完全相同）：8x3090的前向GPU时间3.6、反向GPU时间11.0、recompute 1.9、teach_build 2.3。这里前向3.93、反向12.5、recompute 1.98。慢主要出在反向上（约1.5 s），前向慢约0.3 s，recompute基本一样。原因没查。
+- SIGINT收尾验收（f94e225：先停driver，收尾期间暂存SIGINT），6次全部rc 130、没有terminate、last.pt都保存了：
+  - SIGINT落在主循环（rc 130，未进入暂存）：分卡2次（sigz1、sigz2），单卡1次（sigz6）；
+  - SIGINT落在收尾、等learner最后一个update的那段（日志里有“SIGINT held until the learner was joined, last.pt saved and the driver stopped”）：分卡2次（sigz3、sigz4），单卡1次（sigz5，补的就是之前缺的那种）。
+  - f94e225验收通过。8x3090上那次挂死70分钟仍归因于GPU故障的同一时段，不作为证据。
+- A8（m951143c）：8/8。
