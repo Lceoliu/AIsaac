@@ -129,3 +129,10 @@ GPU=1 ./probe.sh m77657fc
 - `tsan_core.sh`：在容器里跑核心 TSAN。
 
 它们和其余脚本一样走 common.sh 的 preflight 和锁。
+
+## cpp-actor 的默认开关（2026-11-11）
+
+- **lane 合并 M1**：默认开。当前版本的 lane 作业并进 driver 的下一个主批。`ISAAC_BLOCK_LANE_MERGE=0` 关掉，回到 d1。验收见 EXPERIMENTS“cpp 线 M1 背靠背四次计时”。
+- **批量记录 B58e**：默认开，`ISAAC_BLOCK_CPP_BATCH=0` 关掉。
+- **原生 lane 服务**：默认开，跑在 driver 线程上。`ISAAC_BLOCK_CPP_LANES=0` 回到 B54 的 Python lane 服务。
+- **独立 lane 线程（d2）**：默认关，`ISAAC_BLOCK_CPP_LANE_THREAD=1` 打开。开了以后 M1 自动关。

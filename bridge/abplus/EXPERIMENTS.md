@@ -10965,7 +10965,7 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
   - collect 和 update 几乎一样长（17 s 上下）这一点成立，所以 collect 再短也会被 learner 限住。M1 的收益要等 learner 变快（A1 的两卡 learner）之后才能显出来。
 - **CF 约束门**：r1 的 u15 nobank 是 75，超过 70 的门。这一项是已知的成批出现的噪声，照实记，不为此重跑。其余三次都过，queue 0、dropped 0。
 - **CPU 归属的限制**：这一版的 driver 线程还叫“python”，和主线程合在一起（1.48 核），单独的占用报不出。545ce36 起两个线程命名为 abp-driver / abp-lane。
-- **M1 默认开的决定（协调方）**：条件已满足一半，计时不变差、lane 作业时间明确下降。剩下的是 counters() 修复那棵树（c-cc3af40）的 3 遍全量门；门全绿后 M1 默认开，写进本节和 README。
+- **M1 默认开的决定（协调方）**：计时不变差、lane 作业时间明确下降；counters() 修复那棵树（c-cc3af40）的 3 遍全量门全绿（8x3090，GPU 1，thread_local：三遍都是 282 passed、3 skipped、1 xfailed）。所以 M1 从这一提交起默认开，`ISAAC_BLOCK_LANE_MERGE=0` 回到 d1。M1 只在 lane 服务跑在 driver 线程（d1）时生效；开 lane 线程（d2）时自动关。
 
 ### cpp 线核心 TSAN（gpu57，2026-11-11，通过）
 
