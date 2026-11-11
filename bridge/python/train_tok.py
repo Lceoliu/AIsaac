@@ -2614,6 +2614,18 @@ def main(argv=None, child=None, actor=None):
         learner_cpus.update(range(int(lo_), int(hi_ or lo_) + 1))
     if learner_cpus and os.environ.get('ISAAC_LEARNER_CPUS_SHARED', '0') != '1':
         os.sched_setaffinity(0, os.sched_getaffinity(0) - learner_cpus)
+    # BM1 (ISAAC_DRIVER_CPUS, e.g. 4,20: one physical core with its sibling): the C++ actor driver's thread alone on
+    # them (moved there when it starts: the threads that appear in this process during cpp_driver.start()), everything
+    # started from the main thread after this point (workers, games, the learner's threads) kept off them
+    driver_cpus = set()
+    for part_ in filter(None, os.environ.get('ISAAC_DRIVER_CPUS', '').split(',')):
+        lo_, _, hi_ = part_.partition('-')
+        driver_cpus.update(range(int(lo_), int(hi_ or lo_) + 1))
+    if driver_cpus & learner_cpus:
+        p.error(f'ISAAC_DRIVER_CPUS {sorted(driver_cpus)} overlaps the learner CPUs {sorted(learner_cpus)}')
+    if driver_cpus:
+        os.sched_setaffinity(0, os.sched_getaffinity(0) - driver_cpus)
+        print(f'driver CPUs (ISAAC_DRIVER_CPUS): {sorted(driver_cpus)}, dedicated to the C++ driver thread', flush=True)
     if learner_cpus:
         print(f'learner CPUs (--learner-cpus): {sorted(learner_cpus)}, '
               + ('shared: the rest of the trainer, its workers and games may run on them too'
@@ -5608,7 +5620,17 @@ def main(argv=None, child=None, actor=None):
                 c0_ = cpp_driver.counters()
                 handoff_ = time.perf_counter()-drv_paused_at[0] if drv_paused_at[0] else 0.0
                 if not cpp_started[0]:   # (the first collect starts the thread; it is paused between collects)
+                    tids0_ = set(os.listdir('/proc/self/task')) if driver_cpus else None
                     cpp_driver.start(); cpp_started[0] = True
+                    if driver_cpus:   # (BM1: the threads the start created: the driver's, onto its CPUs)
+                        new_ = sorted(set(os.listdir('/proc/self/task')) - tids0_, key=int)
+                        for tid_ in new_:
+                            try:
+                                os.sched_setaffinity(int(tid_), driver_cpus)
+                            except OSError:
+                                pass
+                        print(f'driver CPUs: {len(new_)} new thread(s) at the driver start moved onto them '
+                              f'(tids {" ".join(new_)})', flush=True)
                 if lane_thread and not cpp_driver.lanes_running:   # (B58d d2: the lane thread, started once)
                     cpp_driver.lanes_start()
                 cpp_driver.resume()

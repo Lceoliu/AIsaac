@@ -44,7 +44,14 @@ M=" --out $BM1_IN/reports/$TAG"
 python3 $BM/m0_mem.py $R/$TAG.mem.csv 5 "$M" $R/$TAG.threads.csv > $R/$TAG.mem.log 2>&1 &
 S4=$!
 S5=
-DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 -e ISAAC_BLOCK_TIMELINE=$BM1_IN/reports/$TAG.timeline.csv ${ENVS:-}" $BM/run.sh prof-$TAG $GPU sh $BM1_IN/xnew2.sh $TAG $LIMIT $HOURS &
+# (the host's learner cores, bm1.env BM1_LEARNER_CPUS: added unless the run names its own ISAAC_LEARNER_CPUS, runs as a
+#  shard2 lane, or says LEARNER_PIN=0)
+LP=""
+if [ -n "${BM1_LEARNER_CPUS:-}" ] && [ "${LANE_CPUS:-0}" != 1 ] && [ "${LEARNER_PIN:-1}" != 0 ]; then
+  case "${ENVS:-}" in *ISAAC_LEARNER_CPUS=*) ;; *) LP="-e ISAAC_LEARNER_CPUS=$BM1_LEARNER_CPUS" ;; esac
+fi
+log "$TAG learner CPUs: $(echo "${ENVS:-} $LP" | grep -o 'ISAAC_LEARNER_CPUS=[^ ]*' | head -1 || true) ${LP:+(bm1.env BM1_LEARNER_CPUS)}"
+DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 -e ISAAC_BLOCK_TIMELINE=$BM1_IN/reports/$TAG.timeline.csv ${ENVS:-} $LP" $BM/run.sh prof-$TAG $GPU sh $BM1_IN/xnew2.sh $TAG $LIMIT $HOURS &
 DP=$!
 # progress.csv row times (1 s): each update's end on the host clock, to place the 1 s GPU / CPU samples in each cycle
 ( k=0; while kill -0 $DP 2>/dev/null; do
