@@ -200,7 +200,14 @@ def run_bench(ctx):
         return True
     check = os.environ.get('ISAAC_RL_LEARNER_CHECK', '0') == '1'
     profile = os.environ.get('ISAAC_RL_LEARNER_PROFILE', '0') == '1'
-    paths = [int(v) for v in os.environ.get('ISAAC_RL_LEARNER_PATHS', '0,1').split(',')]
+    # a path: --learner-fast 0 / 1, optionally with a BM1 P2 suffix: 'o' P2 off (whole parts on the learner card),
+    # 's' the parts' two halves one after the other on the learner card, 'p' the halves on two cards (--learner-devices)
+    paths = [v if v[-1:] in ('o', 's', 'p') else int(v)
+             for v in os.environ.get('ISAAC_RL_LEARNER_PATHS', '0,1').split(',')]
+
+    def set_path(fast):
+        args.learner_fast = int(str(fast).rstrip('osp'))
+        L['p2_mode'] = {'o': 'off', 's': 'serial', 'p': 'two'}.get(str(fast)[-1:])
     L['bench'] = True
     params = list(opt.param_groups[0]['params'])
     by_id = {id(p): nm_ for nm_, p in model.named_parameters()}
@@ -214,7 +221,7 @@ def run_bench(ctx):
 
     def one(fast, trace=False):
         _restore(start, model, opt, L)
-        args.learner_fast = fast
+        set_path(fast)
         L['trace'] = [] if trace else None
         torch.cuda.synchronize()
         t = time.perf_counter()
@@ -257,7 +264,8 @@ def run_bench(ctx):
                       f'{" ".join("%.1e" % v for v in (step_r - step_o).abs().max(0).values.tolist())}); '
                       f'first gradient max abs {max(d for d, _ in gd):.3e}, max rel per tensor '
                       f'{max(r for _, r in gd):.3e}, norm rel {float((flat_r - flat_o).norm() / flat_r.norm()):.3e}, '
-                      f'cosine {cos:.9f}; weights after the update max abs {max(d for d, _ in wd):.3e}',
+                      f'cosine {cos:.9f}; weights after the update max abs {max(d for d, _ in wd):.3e}, max rel per tensor '
+                      f'{max(r for _, r in wd):.3e}',
                       flush=True)
                 worst = sorted(((float((a - b).norm() / a.norm().clamp(min=1e-30)), nm_, float(a.norm()))
                                 for nm_, a, b in zip(names, g_r, g_o) if a is not None and b is not None),
@@ -286,7 +294,7 @@ def run_bench(ctx):
         import pstats
         for fast in paths:
             _restore(start, model, opt, L)
-            args.learner_fast = fast
+            set_path(fast)
             pr = cProfile.Profile()
             pr.enable()
             learn(job)
@@ -302,7 +310,7 @@ def run_bench(ctx):
         from torch.profiler import ProfilerActivity, profile as tprof
         for fast in paths:
             _restore(start, model, opt, L)
-            args.learner_fast = fast
+            set_path(fast)
             with tprof(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
                 learn(job)
                 torch.cuda.synchronize()

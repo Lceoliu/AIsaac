@@ -73,7 +73,8 @@ class _Clock:
 
 def count(name, value):
     if TIMING_ON:
-        TIMING[name] = TIMING.get(name, 0)+value
+        with _UPD_LOCK:   # (the prefetch thread and BM1 P2's second learner card count too)
+            TIMING[name] = TIMING.get(name, 0)+value
 
 
 DUMP_DIR = os.environ.get('ISAAC_BLOCK_DUMP', '')

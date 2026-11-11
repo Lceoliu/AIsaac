@@ -1937,6 +1937,13 @@ def main(argv=None, child=None, actor=None):
                         'e.g. cuda:1; the actor (inference, lanes, snapshots, rollouts) stays on the first visible GPU. '
                         "Best with --overlap --decoupled 1 (see the module docstring). '' (default) or the actor's own "
                         'GPU: one GPU, as before')
+    p.add_argument('--learner-devices', default='',
+                   help="BM1 P2: the learner's cards, MAIN[,SECOND] (e.g. cuda:1,cuda:2); MAIN is --learner-device. With "
+                        'SECOND each PPO part is cut in two halves of whole chunks (rows balanced, the teachers\' records '
+                        "with the second), the second half's forward / loss / backward on SECOND (replicas of the "
+                        "trained modules); its gradients are added into MAIN's before the optimisers step on MAIN, the "
+                        'new parameters copied to SECOND after (isaac_bridge/learner_p2.py). The same algorithm, batch, '
+                        "losses and budgets. '' (default): one card, the path as before")
     # 2026-10-11 (memory, rl/docs/SCALING_THESIS.md S5b; see the module docstring)
     p.add_argument('--memory', default=None, choices=('off', 'gru'),
                    help='gru: a GRU state per worker between the token encoder and the heads, carried through the '
@@ -2356,6 +2363,19 @@ def main(argv=None, child=None, actor=None):
     ldev, split = device, False
     device_actor = torch.device('cuda', torch.cuda.current_device())   # (`device` with its index: other threads)
     lbench = child is not None and bool(child.get('bench'))   # (abplus_b38_replay.py: no actor GPU to keep apart)
+    p2_dev = None   # BM1 P2 (--learner-devices MAIN,SECOND): the second learner card
+    if args.learner_devices:
+        lds_ = [d_.strip() for d_ in args.learner_devices.split(',') if d_.strip()]
+        if not 1 <= len(lds_) <= 2:
+            p.error('--learner-devices: one or two cards')
+        if args.learner_device and torch.device(args.learner_device) != torch.device(lds_[0]):
+            p.error('--learner-devices: its first card is --learner-device')
+        args.learner_device = lds_[0]
+        if len(lds_) == 2:
+            p2_dev = torch.device(lds_[1])
+            if p2_dev.type != 'cuda' or p2_dev.index is None or p2_dev.index >= torch.cuda.device_count():
+                p.error(f'--learner-devices {args.learner_devices}: {lds_[1]} is not one of the '
+                        f'{torch.cuda.device_count()} visible GPUs (give its index)')
     if args.learner_device:
         want = torch.device(args.learner_device)
         if want.type != 'cuda' or (want.index or 0) >= torch.cuda.device_count():
@@ -2408,6 +2428,37 @@ def main(argv=None, child=None, actor=None):
     if priv_on and (child is not None or not proc):
         pcritic = make_critic(args.width).to(lm_dev)
         popt = torch.optim.Adam(pcritic.parameters(), lr=args.lr, eps=1e-5, **(dict(fused=True) if fused else {}))
+    # BM1 P2 (--learner-devices MAIN,SECOND): replicas of the trained modules on the second card (isaac_bridge/learner_p2;
+    # learn() runs each PPO part's second half on them). Built with the CPU generator's state kept (fork_rng): the run's
+    # draws are those of a run without them; their weights are the learner's from each update's start.
+    P2 = None
+    P2_ACC = ('acc', 'tacc', 'vacc', 'ent_heads', 'pacc', 'gacc', 'pacc2', 'aux_acc', 'aux_acc_ev')
+    if p2_dev is not None:
+        from isaac_bridge.block_training import CAPTURE_MODE
+        p2_bad = [nm_ for nm_, bad_ in (
+            ('the block memory (--block-memory 1 --block-slots 1)', not block_on or not args.block_slots),
+            ('--memory off', mem_on), ('--temporal 0', t_on), ('--teach-merge 1', not args.teach_merge),
+            ('--learner-fast 0', bool(args.learner_fast)), ('the learner in this process', proc or child is not None),
+            ('--block-history-mode random', args.block_history_mode != 'random'),
+            ('--cf-advantage 0', bool(args.cf_advantage)), ('no choice branches', branching),
+            ('ISAAC_CAPTURE_MODE thread_local', CAPTURE_MODE != 'thread_local'),
+            ('no learner dump', bool(os.environ.get('ISAAC_LEARNER_DUMP'))),
+            ('a learner card apart from the actor', not split),
+            ('a second card other than the learner\'s', p2_dev == ldev)) if bad_]
+        if p2_bad:
+            p.error(f'--learner-devices {args.learner_devices} (P2) needs: {", ".join(p2_bad)}')
+        from isaac_bridge.learner_p2 import TwoCard
+        with torch.random.fork_rng(devices=[]):
+            rep_m = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
+                              ent_ext=ent_ext, pchar=pchar, memory=mem_dim, **tok_kw).to(p2_dev)
+            rep_pc = make_critic(args.width).to(p2_dev) if pcritic is not None else None
+            rep_ax = make_head(args.temporal_width, len(aux_h)).to(p2_dev) if aux_head is not None else None
+        P2 = TwoCard(ldev, p2_dev, [(learner_model, rep_m)] + ([(pcritic, rep_pc)] if rep_pc is not None else []) +
+                     ([(aux_head, rep_ax)] if rep_ax is not None else []))
+        P2.replica, P2.replica_pcritic, P2.replica_aux = rep_m, rep_pc, rep_ax
+        print(f'BM1 P2 learner cards: {ldev} (main: optimisers) + {p2_dev} ({torch.cuda.get_device_name(p2_dev)}: '
+              f'replicas, {sum(p_.numel() for p_ in P2.rp) * 4 / 2 ** 20:.1f} MiB of parameters synchronised per step)',
+              flush=True)
     slog = None   # 2026-11-03 (tok_stream)
     if log_on and (child is not None or not proc):
         from isaac_bridge.tok_stream import StreamLog
@@ -2587,6 +2638,14 @@ def main(argv=None, child=None, actor=None):
                     s_r=block_learner.warm_reader(learner_model,bf16=bool(amp))
                     print(f'B44 Flex Reader warm-up: {block_compile.STATS["compiles"]-c_r} graphs in {s_r:.1f} s',
                           flush=True)
+            if P2 is not None:   # BM1 P2: the same compiled kernels for the second card (the device is in their guards)
+                t_w=time.perf_counter()
+                c_r=block_compile.STATS['compiles']
+                block_compile.warm_spatial(P2.replica,(),bf16=amp or args.actor_bf16)
+                if args.block_slots and block_learner.PACKED:
+                    block_learner.warm_reader(P2.replica,bf16=bool(amp))
+                print(f'BM1 P2 second card warm-up: {block_compile.STATS["compiles"]-c_r} graphs in '
+                      f'{time.perf_counter()-t_w:.1f} s',flush=True)
             print(f'B56 compile cache after warm-up: {block_compile.cache_counters()}',flush=True)
             print(f'B62 CUDA scheduling: requested {cuda_sched_req[0] or "auto"} (rc {cuda_sched_req[1]}), '
                   f'effective {cuda_sched.effective()}',flush=True)
@@ -3764,8 +3823,19 @@ def main(argv=None, child=None, actor=None):
             part's backward done) to the three optimisers' steps: priv's and aux's clip and step, the B43 gradient
             norms (Writer, Spatial), the policy's clip, its step. A pure move of the code that was inline here (the
             same calls in the same order: bit-identical). The place where a cross-device / cross-shard gradient
-            reduction will go: first, before any norm or clip reads a gradient."""
+            reduction will go: first, before any norm or clip reads a gradient. BM1 P2: the second learner card's
+            gradients added into the main card's here, first; after the steps its replicas get the new parameters."""
             nonlocal hist_gn, hist_gn_steps, gn_acc, gn_clip
+            if CX2 is not None:
+                SEG.mark(start='opt.p2_reduce')
+                with bpt.GpuSpan('p2_reduce'):
+                    P2.reduce()
+            if L.get('trace') is not None:   # B18 check: the loss sums after each step, the first step's gradient
+                acc_t, tacc_t = ((acc, tacc) if CX2 is None else
+                                 (acc + CX2.acc.to(device), tacc + CX2.tacc.to(device)))   # (BM1 P2: both cards)
+                L['trace'].append((acc_t.clone(), tacc_t.clone(), None if L['trace'] else
+                                   [None if q.grad is None else q.grad.clone()
+                                    for q in opt.param_groups[0]['params']]))
             if priv_on:   # (the privileged encoder's and heads' norm apart: their gradient is the critic's alone)
                 torch.nn.utils.clip_grad_norm_(pcritic.parameters(), args.max_grad_norm)
                 popt.step()
@@ -3790,9 +3860,349 @@ def main(argv=None, child=None, actor=None):
             SEG.mark(start='opt.step')
             with (bpt.GpuSpan('learn_opt') if block_on else contextlib.nullcontext()):
                 opt.step()
+            if CX2 is not None:
+                SEG.mark(start='opt.p2_bcast')
+                with bpt.GpuSpan('p2_bcast'):
+                    P2.broadcast()
 
         if block_on:
             from isaac_bridge import block_learner as blearn
+
+        def part_prep(lo_, hi_, last_):
+            """BM1 P2: a PPO (sub-)part's preparation on the main card, rows lo_:hi_ of the minibatch (moved unchanged
+            from the part loop): its rows, its share of the minibatch's trained decisions, its batch (the action gate's
+            input; the teachers' records with the minibatch's last part: last_)."""
+            nonlocal tokens, parts
+            pm_, pn_ = pm, pn
+            part = sel[lo_:hi_]
+            part_h = sel_h[lo_:hi_]
+            if chunked:   # (memory / temporal) the part's share of the minibatch's trained decisions
+                pn_ = float(lw[part_h].sum())
+                w, pm_, pn_ = pn_ / n_sel, b_w[part], max(pn_, 1.0)
+            else:
+                w = len(part) / len(sel)
+            used = min(width, used_entities(ne_h[part_h]))
+            merged = tb is not None and args.teach_merge and last_
+            vmerged = vb is not None and args.teach_merge and last_   # (teacher v2: after the teacher's)
+            if raw_mode:
+                # B18: the part's records (and the teacher's) as bytes, the fields views of them (decode_rows)
+                rp, pp, e_ = raw_all.index_select(0, part), pend_all.index_select(0, part), used
+                if merged:
+                    e_ = max(used, min(ENT_CAP, used_entities(teach_rows['n_ent'][pick])))
+                    rp = torch.cat([rp, L['teach_raw'].index_select(0, pick_d)])
+                    pp = torch.cat([pp, teach_pending(meta)])
+                if vmerged:
+                    e_ = max(e_, v_ent)
+                    rp = torch.cat([rp, L['v2_raw'].index_select(0, vpick_d)])
+                    pp = torch.cat([pp, v_pend])
+                mb = decode_rows(rp, pending=pp, entities=e_)
+            elif fast:   # (B18: the entity fields cut before the gather)
+                mb = {k: (v[:, :used] if k in ENTITY_FIELDS else v)[part] for k, v in batch.items()}
+            else:
+                mb = {k: v[part] for k, v in batch.items()}   # take(batch, part), entity tokens from the host
+                for k_e in ENTITY_FIELDS:
+                    mb[k_e] = mb[k_e][:, :used]
+            tokens += used
+            parts += 1
+            ne_p, nd_p = ne_h[part_h], nd_h[part_h]
+            ni_p = ni_h[part_h] if NI_f else None
+            if merged:   # the teacher's records ride along in the last part: one forward and backward
+                if not raw_mode:
+                    mb = cat_batch(mb, tb)
+                ne_p = np.concatenate([ne_p, teach_rows['n_ent'][pick]])
+                nd_p = np.concatenate([nd_p, teach_rows['n_doors'][pick]])
+                if NI_f:
+                    ni_p = np.concatenate([ni_p, teach_ni(pick)])
+            if vmerged:   # (teacher v2) its records after the teacher's
+                if not raw_mode:
+                    mb = cat_batch(mb, vb)
+                ne_p = np.concatenate([ne_p, L['v2_cnt']['n_ent'][vpick]])
+                nd_p = np.concatenate([nd_p, L['v2_cnt']['n_doors'][vpick]])
+                if NI_f:
+                    ni_p = np.concatenate([ni_p, L['v2_cnt']['n_item'][vpick]])
+            if xplan:   # (B24: the real item tokens and the global token in the plans)
+                xplan['n_item'] = ni_p
+            if t_on:   # (B31: the history token where a previous step exists; none for the teachers' records;
+                #         B34: teacher v2's / the cf's records from their lane's step)
+                xplan['hist'] = np.concatenate([has_h[part_h], np.zeros(len(ne_p) - len(part_h), bool)])
+                if vmerged:
+                    xplan['hist'][len(ne_p) - len(vpick):] = L['v2_has'][vpick]
+            if args.packed and fast:   # B18: + the entity positions and the attention buckets, one copy
+                plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets, **xplan)
+                hn = ['rec', 'base']
+                for k_ in dd:   # the distinct grids of this part (the teacher's records each their own)
+                    u_, i_ = first_of(dd[k_][part_h], dd_size[k_])
+                    if merged or vmerged:
+                        t_ = len(mb['n_ent']) - len(part)
+                        u_, i_ = (np.concatenate([u_, len(part) + np.arange(t_)]),
+                                  np.concatenate([i_, len(u_) + np.arange(t_)]))
+                    plan[k_ + '_u'], plan[k_ + '_i'] = u_, i_
+                    hn += [k_ + '_u', k_ + '_i']
+                bk_ = plan['buckets'] if 'buckets' in fparts else []
+                got = dev_many([plan[k_].reshape(-1) for k_ in hn] + [c_ for c_, _ in bk_])
+                got[0] = got[0].view(-1, plan['rec'].shape[1])
+                mb.update(zip(hn[2:], got[2:len(hn)]))
+                tok = plan_tokens(plan, got[0], got[1])
+                pnames = ['keep', 'starts']
+                if 'ekeep' in fparts:
+                    pnames.append('ekeep')
+                if 'buckets' in fparts:
+                    pnames.append('gpos')
+                    if 'ekeep' in fparts:   # the packed tokens built from the real ones (forward's xperm)
+                        pnames += ['dkeep', 'xperm'] + (['ikeep', 'glast'] if xplan else [])
+                mb.update((k_, tok[k_]) for k_ in pnames)
+                if bk_:
+                    mb['buckets'] = [(c_, w_) for c_, (_, w_) in zip(got[len(hn):], bk_)]
+            elif args.packed:
+                mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1],
+                                                                           **xplan))
+            return dict(part=part, part_h=part_h, w=w, pm=pm_, pn=pn_, merged=merged, vmerged=vmerged, mb=mb,
+                        k=len(part))
+
+        def part_rows(sp_, lo_, hi_):
+            """BM1 P2: a (sub-)part's per-row inputs of part_compute, on the main card (the same tensors the part loop
+            indexed in place)."""
+            part_ = sp_['part']
+            R_ = dict(act=b_act[part_], logp=b_logp[part_], ret=b_ret[part_], a=a_all[lo_:hi_],
+                      gate=learner_model.gate(sp_['mb']), adv_std=adv_std)
+            if pf_on:
+                R_['pf'] = b_pf[part_]
+            if prox is not None:
+                R_['prox'] = prox[part_]
+            if glob_loss:
+                R_['ret_g'] = b_ret_g[part_]
+            if aux_on:
+                R_.update(aux_t=aux_t, aux_part=part_, aux_den=aux_den)
+            if sp_['merged']:
+                R_['meta'] = meta
+            if sp_['vmerged']:
+                R_.update(v_act=v_act, vpick_d=vpick_d, v_w=v_w, v_G=v_G)
+            return R_
+
+        def rows_to2(R_, k_):
+            """BM1 P2: part_rows' inputs on the second card (aux's targets gathered at the part's rows first)."""
+            R2 = {}
+            for key_, v_ in R_.items():
+                if key_ == 'aux_t':
+                    R2[key_] = P2.to2({kk_: vv_.index_select(0, R_['aux_part']) for kk_, vv_ in v_.items()})
+                elif key_ == 'aux_part':
+                    R2[key_] = torch.arange(k_, device=P2.dev2)
+                else:
+                    R2[key_] = P2.to2(v_)
+            return R2
+
+        def ppo_submit(chunks_):
+            """B48: a PPO part's host preparation queued (PREFETCH.submit as always); BM1 P2: a part that will run
+            split, as its split job (the same cut as the part loop's: p2_split_of)."""
+            if p2_on and chunks_:
+                cut_s = p2_split_of(chunks_)
+                if cut_s is not None:
+                    return blearn.PREFETCH.submit(learner_model, chunks_, split=(p2_models, cut_s),
+                                                  max_rows=args.micro or args.minibatch, version=L['update'],
+                                                  history_mode=args.block_history_mode)
+            return blearn.PREFETCH.submit(learner_model, chunks_, max_rows=args.micro or args.minibatch,
+                                          version=L['update'], history_mode=args.block_history_mode)
+
+        def p2_split_of(chunks_):
+            """BM1 P2: where a part's chunk list is cut in two (rows balanced, the first half PPO chunks only: the
+            teachers' records stay with the second); None: the part stays whole (a single chunk)."""
+            n_ppo = 0
+            while n_ppo < len(chunks_) and id(chunks_[n_ppo]) in p2_ppo_ids:
+                n_ppo += 1
+            rows_c = np.cumsum([len(c_.rows) for c_ in chunks_])
+            cut_s = min(int(np.searchsorted(rows_c, rows_c[-1] / 2.0)) + 1, n_ppo)
+            return cut_s if 1 <= cut_s < len(chunks_) else None
+
+        def p2_nomark(name, prev=None):
+            return None
+
+        def p2_card2(P_b, sp_b, R_b):
+            """BM1 P2, the second card's thread: the part's second half forward (the replica), loss, backward."""
+            with autocast():
+                with bpt.GpuSpan('p2_fwd_part'):
+                    outs_b, ctx_b2 = blearn.run_prepared(P2.replica, P_b)
+            part_compute(CX2, sp_b, R_b, outs_b, dict(temporal=ctx_b2), None, p2_nomark)
+            return ctx_b2['recompute_stats']
+
+        def p2_part(at_, lo_, hi_, cids_, chunks_p, cut_p, bounds_, last_, tb_, vb_, m_):
+            """BM1 P2: one PPO part as two halves: chunks_p[:cut_p] on the main card (this thread), chunks_p[cut_p:]
+            (with the teachers' records when the part has them) on the second card ('two') or after the first on the
+            main card ('serial', a measurement aid). Their gradients add up to the part's."""
+            nonlocal teach_steps, v2_steps
+            rows_a = sum(len(c_.rows) for c_ in chunks_p[:cut_p])
+            mid_ = lo_ + rows_a
+            sa = part_prep(lo_, mid_, False)
+            sb = part_prep(mid_, hi_, lo_ == last_)
+            n_t = (len(pick) if sb['merged'] else 0) + (len(vpick) if sb['vmerged'] else 0)
+            if rows_a != int(tch[cids_[:cut_p], 1].sum()) or len(chunks_p) - len(cids_) != n_t:
+                raise RuntimeError(f'P2: a part\'s halves do not match its rows ({rows_a} rows, {n_t} teacher records)')
+            m_ = pmark('b38:part_forward', m_)
+            P_a, P_b = blearn.forward_packed_split(p2_models, chunks_p, cut_p, max_rows=args.micro or args.minibatch,
+                                                   version=L['update'], history_mode=args.block_history_mode)
+            R_b = part_rows(sb, mid_, hi_)
+            if p2_mode == 'two':
+                sb2 = dict(sb, pm=P2.to2(sb['pm']), mb=None, part=None)
+                R_b2 = rows_to2(R_b, sb['k'])
+                R_b = None
+                P2.run(lambda: p2_card2(P_b, sb2, R_b2), f'update {L["update"]+1}, step {steps+1}, rows {mid_}:{hi_}')
+            with autocast():
+                with bpt.GpuSpan('learn_fwd_part'):
+                    outs_a, ctx_a = blearn.run_prepared(learner_model, P_a)
+                for key_b, value_b in ctx_a['recompute_stats'].items():
+                    block_ppo_counts[key_b] += value_b
+                if blearn.PREFETCH_ON:   # B48: the next PPO part's host preparation now
+                    ppo_submit(next_ppo_chunks(at_, lo_, bounds_, last_, tb_, vb_, pick if tb_ is not None else None,
+                                               vpick if vb_ is not None else None))
+            m_ = part_compute(CX, sa, part_rows(sa, lo_, mid_), outs_a, dict(temporal=ctx_a), m_, pmark)
+            if p2_mode == 'two':
+                stats_b = P2.join()
+            else:   # ('serial': the second half after the first, on the main card)
+                with autocast():
+                    with bpt.GpuSpan('learn_fwd_part'):
+                        outs_b, ctx_b2 = blearn.run_prepared(learner_model, P_b)
+                stats_b = ctx_b2['recompute_stats']
+                m_ = part_compute(CX, sb, R_b, outs_b, dict(temporal=ctx_b2), m_, pmark)
+            for key_b, value_b in stats_b.items():
+                block_ppo_counts[key_b] += value_b
+            if sb['merged']:
+                teach_steps += 1
+            if sb['vmerged']:
+                v2_steps += 1
+            return m_
+
+        # BM1 P2 (--learner-devices MAIN,SECOND): this update's mode, 'two' (the second card), 'serial' (the halves one
+        # after the other on the main card: the learner bench's measurement aid) or 'off' (the learner bench sets
+        # L['p2_mode'] per path; a run: 'two' with two learner cards, else 'off')
+        p2_mode = L.get('p2_mode') or ('two' if P2 is not None else 'off')
+        p2_on = p2_mode in ('two', 'serial')
+        if p2_on:
+            p2_bad = [nm_ for nm_, bad_ in (
+                ('the block memory', not block_on), ('the packed learner', not block_on or not blearn.PACKED),
+                ('--memory off', mem_on), ('--temporal 0', t_on), ('--teach-merge 1', not args.teach_merge),
+                ('--learner-fast 0', fast), ("--block-history-mode random", args.block_history_mode != 'random'),
+                ('--cf-advantage 0', bool(args.cf_advantage)), ('no choice branches', corr_batch is not None),
+                ('no learner dump', bool(os.environ.get('ISAAC_LEARNER_DUMP'))),
+                ('a second learner card', p2_mode == 'two' and P2 is None)) if bad_]
+            if p2_bad:
+                raise RuntimeError(f'P2 ({p2_mode}) needs: {", ".join(p2_bad)}')
+        p2_models = (learner_model, P2.replica if p2_mode == 'two' else learner_model) if p2_on else None
+        p2_ppo_ids = {id(c_) for c_ in mplan['chunks']} if p2_on else set()
+        import types as types_
+        CX = types_.SimpleNamespace(model=learner_model, pcritic=pcritic, aux_head=aux_head, pv=pv_b, acc=acc, tacc=tacc,
+                                    vacc=vacc, ent_heads=ent_heads, pacc=pacc, gacc=gacc,
+                                    pacc2=pacc2 if priv_on else None, aux_acc=aux_acc if aux_on else None,
+                                    aux_acc_ev=aux_acc_ev if aux_on else None, bwd_calls='learn_bwd_calls',
+                                    bwd_span='learn_bwd')
+        CX2 = None
+        if p2_mode == 'two':   # the replicas get the learner's parameters; the second card's accumulators
+            P2.bind()
+            p2_s0 = dict(P2.stats)
+            with bpt.GpuSpan('p2_bcast'):
+                P2.broadcast()
+            P2.zero_grad()
+            P2.replica.set_math_attention('math' in fparts, nhwc='nhwc' in fparts, ln='ln' in fparts)
+            P2.replica.train()
+
+            def z2_(t_):
+                return None if t_ is None else torch.zeros_like(t_, device=P2.dev2)
+            CX2 = types_.SimpleNamespace(model=P2.replica, pcritic=P2.replica_pcritic, aux_head=P2.replica_aux,
+                                         pv=pv_b.to(P2.dev2) if priv_on else None,
+                                         **{nm_: z2_(getattr(CX, nm_)) for nm_ in P2_ACC},
+                                         bwd_calls='p2_bwd_calls', bwd_span='p2_bwd')
+
+        def part_compute(cx, sp_, R, outs_, tk_, m_, mark):
+            """BM1 P2: a PPO (sub-)part's loss terms, backward and statistics on one learner card (moved from the part
+            loop; on the main card the same operations in the same order): cx the card (its modules, its privileged
+            batch, its accumulators), sp_ the part (part_prep), R its per-row inputs on cx's device (part_rows), outs_ /
+            tk_ its forward's outputs. Returns the segment mark."""
+            k_, part_h, w, pm, pn, merged, vmerged = (sp_[k_s] for k_s in ('k', 'part_h', 'w', 'pm', 'pn', 'merged',
+                                                                            'vmerged'))
+            logits_, value_, danger_ = outs_[:3]
+            if priv_on:   # 2026-11-03 (tok_priv): the values from [zr ; p_t], [zg ; p_t]; teachers' rows: missing
+                m_ = mark('b38:part_priv', m_)
+                zr_q, zg_q = tk_['temporal'].pop('z_out')
+                # (the teachers' rows: the no-data record, one row of the same batch)
+                n_x = len(zr_q) - k_
+                idx_q, *plan_q = cx.pv.plan(np.append(part_h, len(cx.pv)) if n_x else part_h)
+                p_q = cx.pcritic.encode(cx.pv, idx_q, plan_q)
+                if n_x:
+                    p_q = torch.cat([p_q[:k_], p_q[k_:].expand(n_x, -1)])
+                value_, vg_all = cx.pcritic(zr_q, zg_q, p_q)
+            m_ = mark('b38:part_loss', m_)
+            logp, entropy = (cx.model.log_prob_fast if 'logp' in fparts else cx.model.log_prob)(
+                logits_[:k_], R['gate'][:k_], R['act'])
+            value = value_[:k_].float()
+            a = R['a']
+            if pf_on:   # 2026-10-13 (B23): forced decisions out of pg and the entropy, imitation on them
+                pg, vf, ent, imit, ratio, kl_f, clip_f = ppo_part_terms(
+                    logits_[:k_], logp, entropy, R['logp'], a, value, R['ret'], R['act'], R['pf'],
+                    args.clip, pm, pn, R['prox'] if prox is not None else None, args.decoupled_max_weight)
+                loss = (pg + args.vf_coef * vf - args.ent_coef * ent + args.pickup_force_imitation * imit) * w
+                cx.pacc += imit.detach() * w
+            elif prox is None:   # PPO's ratio to the behaviour policy (the one that sampled the action)
+                ratio = torch.exp(logp - R['logp'])
+                pg = -pmean(torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a), pm, pn)
+            else:   # decoupled: clipped around the weights at the update's start, importance-weighted
+                ratio = torch.exp(logp - R['prox'])
+                weight = torch.exp(R['prox'] - R['logp']).clamp(max=args.decoupled_max_weight)
+                pg = -pmean(weight * torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a),
+                            pm, pn)
+            if not pf_on:
+                vf = 0.5 * pmean((value - R['ret']) ** 2, pm, pn)
+                ent = pmean(entropy.sum(-1), pm, pn)
+                loss = (pg + args.vf_coef * vf - args.ent_coef * ent) * w
+            if glob_loss:   # 2026-10-12 (B22): value_global on its own returns (an auxiliary loss)
+                vgf = 0.5 * pmean(((vg_all if priv_on else outs_[-1])[:k_].float() - R['ret_g']) ** 2, pm, pn)
+                loss = loss + args.vf_global_coef * vgf * w
+                cx.gacc += vgf.detach() * w
+            if priv_on:   # 2026-11-03 (tok_priv): the policy's own value heads, from a stopped gradient, on the
+                #             same returns (the actor's graphs and the counterfactual lanes read them)
+                pl_v = 0.5 * pmean((cx.model.value(zr_q[:k_].detach())[:, 0] - R['ret']) ** 2, pm, pn)
+                pl_g = 0.5 * pmean((cx.model.gtok.value(zg_q[:k_].detach())[:, 0] - R['ret_g']) ** 2, pm, pn)
+                loss = loss + (args.vf_coef * pl_v + args.vf_global_coef * pl_g) * w
+                cx.pacc2 += torch.stack([pl_v.detach(), pl_g.detach()]) * w
+            if aux_on:   # 2026-11-03 (tok_aux): the part's share of the minibatch's L_aux
+                m_ = mark('b38:part_aux', m_)
+                aloss, astats, aevs = part_loss(cx.aux_head, tk_['temporal'].pop('o_seq')[:k_], R['aux_t'], R['aux_part'], pm, R['aux_den'])
+                loss = loss + args.aux_coef * aloss
+                cx.aux_acc += astats
+                cx.aux_acc_ev += aevs
+            if merged:
+                t_end = k_ + len(pick) if vmerged else None   # (teacher v2's records follow)
+                tloss, tstats = teacher_loss(logits_[k_:t_end], danger_[k_:t_end], R['meta'], n_sel)
+                loss = loss + tloss
+            if vmerged:   # 2026-10-10 (teacher v2): -w log pi(a | obs) over the heads + (V(obs) - G)^2
+                o_ = k_ + (len(pick) if merged else 0)
+                lp_v, _ = (cx.model.log_prob_fast if 'logp' in fparts else cx.model.log_prob)(
+                    logits_[o_:], R['gate'][o_:], R['v_act'])
+                vloss, vstats = v2_terms(lp_v, value_[o_:], R['vpick_d'], R['v_w'], R['v_G'], v_share, R['adv_std'], n_sel)
+                loss = loss + vloss
+            m_ = mark('b38:part_backward', m_)
+            if block_on:
+                bpt.ucount(cx.bwd_calls, 1)
+                with bpt.GpuSpan(cx.bwd_span):
+                    loss.backward()
+                if args.block_history_mode == 'gradreplay':
+                    # B43 C arm: g_j from this backward; re-encode the chosen blocks with the
+                    # auxiliary loss sum_j sg(g_j).f(o_j) (no second Reader pass)
+                    hist_ = bpt.grad_replay_aux(cx.model, tk_['temporal'].get('replay'),
+                                                args.block_history_aux_coef, autocast)
+                    tk_ = None
+            else:
+                loss.backward()
+            m_ = mark('b38:part_stats', m_)
+            with torch.no_grad():
+                if pf_on:   # (B23: kl and clip share over the PPO-trained decisions' rows)
+                    cx.acc += torch.stack([pg, vf, ent, kl_f, clip_f]) * w
+                else:
+                    cx.acc += torch.stack([pg, vf, ent, pmean(R['logp'] - logp, pm, pn),
+                                        pmean(((ratio - 1).abs() > args.clip).float(), pm, pn)]) * w
+                cx.ent_heads += (entropy.mean(0) if pm is None else (entropy * pm[:, None]).sum(0) / pn) * w
+                if merged:
+                    cx.tacc += tstats
+                if vmerged:
+                    cx.vacc += vstats
+            return m_
 
         # B60: the next epoch's first PPO part prepared while this epoch's last one runs: its permutation drawn then
         # (EpochPerms: the same place relative to the history draws on the default CPU generator as before), the
@@ -3846,9 +4256,7 @@ def main(argv=None, child=None, actor=None):
         if ahead_ and n_units:   # B60: the update's first PPO part prepared before the first epoch starts
             mb_ats = [a_ for a_ in range(0, n_units, mb_units) if len(eperms.get(0)[1][a_:a_ + mb_units]) >= mb_units // 4]
             if mb_ats:
-                blearn.PREFETCH.submit(learner_model, part_chunks(*first_part(0, mb_ats[0])),
-                                       max_rows=args.micro or args.minibatch, version=L['update'],
-                                       history_mode=args.block_history_mode)
+                ppo_submit(part_chunks(*first_part(0, mb_ats[0])))
         for ep_ in range(args.epochs):
             ep_now[0] = ep_
             if t_on:   # (B31) the rooms made before each chunk: every room token's K / V once per epoch (stop-grad)
@@ -3908,6 +4316,8 @@ def main(argv=None, child=None, actor=None):
                 if aux_on:   # 2026-11-03 (tok_aux): its means' denominators over this minibatch's valid trained rows
                     aopt.zero_grad(set_to_none=True)
                     aux_den = minibatch_den(aux_t, sel, b_w)
+                if CX2 is not None:   # (BM1 P2: the second card's replicas)
+                    P2.zero_grad()
                 micro = args.micro or len(sel)
                 if mem_on:   # (memory) parts of whole chunks
                     micro = max(T_mem, micro // T_mem * T_mem)
@@ -3966,90 +4376,21 @@ def main(argv=None, child=None, actor=None):
                         from isaac_bridge.block_training import capture_yield
                         capture_yield()
                     m_ = pmark('b38:part_plan')
-                    part = sel[lo_:hi_]
-                    part_h = sel_h[lo_:hi_]
-                    if chunked:   # (memory / temporal) the part's share of the minibatch's trained decisions
-                        pn = float(lw[part_h].sum())
-                        w, pm, pn = pn / n_sel, b_w[part], max(pn, 1.0)
-                    else:
-                        w = len(part) / len(sel)
-                    used = min(width, used_entities(ne_h[part_h]))
-                    merged = tb is not None and args.teach_merge and lo_ == last
-                    vmerged = vb is not None and args.teach_merge and lo_ == last   # (teacher v2: after the teacher's)
-                    if raw_mode:
-                        # B18: the part's records (and the teacher's) as bytes, the fields views of them (decode_rows)
-                        rp, pp, e_ = raw_all.index_select(0, part), pend_all.index_select(0, part), used
-                        if merged:
-                            e_ = max(used, min(ENT_CAP, used_entities(teach_rows['n_ent'][pick])))
-                            rp = torch.cat([rp, L['teach_raw'].index_select(0, pick_d)])
-                            pp = torch.cat([pp, teach_pending(meta)])
-                        if vmerged:
-                            e_ = max(e_, v_ent)
-                            rp = torch.cat([rp, L['v2_raw'].index_select(0, vpick_d)])
-                            pp = torch.cat([pp, v_pend])
-                        mb = decode_rows(rp, pending=pp, entities=e_)
-                    elif fast:   # (B18: the entity fields cut before the gather)
-                        mb = {k: (v[:, :used] if k in ENTITY_FIELDS else v)[part] for k, v in batch.items()}
-                    else:
-                        mb = {k: v[part] for k, v in batch.items()}   # take(batch, part), entity tokens from the host
-                        for k_e in ENTITY_FIELDS:
-                            mb[k_e] = mb[k_e][:, :used]
-                    tokens += used
-                    parts += 1
-                    ne_p, nd_p = ne_h[part_h], nd_h[part_h]
-                    ni_p = ni_h[part_h] if NI_f else None
-                    if merged:   # the teacher's records ride along in the last part: one forward and backward
-                        if not raw_mode:
-                            mb = cat_batch(mb, tb)
-                        ne_p = np.concatenate([ne_p, teach_rows['n_ent'][pick]])
-                        nd_p = np.concatenate([nd_p, teach_rows['n_doors'][pick]])
-                        if NI_f:
-                            ni_p = np.concatenate([ni_p, teach_ni(pick)])
-                    if vmerged:   # (teacher v2) its records after the teacher's
-                        if not raw_mode:
-                            mb = cat_batch(mb, vb)
-                        ne_p = np.concatenate([ne_p, L['v2_cnt']['n_ent'][vpick]])
-                        nd_p = np.concatenate([nd_p, L['v2_cnt']['n_doors'][vpick]])
-                        if NI_f:
-                            ni_p = np.concatenate([ni_p, L['v2_cnt']['n_item'][vpick]])
-                    if xplan:   # (B24: the real item tokens and the global token in the plans)
-                        xplan['n_item'] = ni_p
-                    if t_on:   # (B31: the history token where a previous step exists; none for the teachers' records;
-                        #         B34: teacher v2's / the cf's records from their lane's step)
-                        xplan['hist'] = np.concatenate([has_h[part_h], np.zeros(len(ne_p) - len(part_h), bool)])
-                        if vmerged:
-                            xplan['hist'][len(ne_p) - len(vpick):] = L['v2_has'][vpick]
-                    if args.packed and fast:   # B18: + the entity positions and the attention buckets, one copy
-                        plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets, **xplan)
-                        hn = ['rec', 'base']
-                        for k_ in dd:   # the distinct grids of this part (the teacher's records each their own)
-                            u_, i_ = first_of(dd[k_][part_h], dd_size[k_])
-                            if merged or vmerged:
-                                t_ = len(mb['n_ent']) - len(part)
-                                u_, i_ = (np.concatenate([u_, len(part) + np.arange(t_)]),
-                                          np.concatenate([i_, len(u_) + np.arange(t_)]))
-                            plan[k_ + '_u'], plan[k_ + '_i'] = u_, i_
-                            hn += [k_ + '_u', k_ + '_i']
-                        bk_ = plan['buckets'] if 'buckets' in fparts else []
-                        got = dev_many([plan[k_].reshape(-1) for k_ in hn] + [c_ for c_, _ in bk_])
-                        got[0] = got[0].view(-1, plan['rec'].shape[1])
-                        mb.update(zip(hn[2:], got[2:len(hn)]))
-                        tok = plan_tokens(plan, got[0], got[1])
-                        pnames = ['keep', 'starts']
-                        if 'ekeep' in fparts:
-                            pnames.append('ekeep')
-                        if 'buckets' in fparts:
-                            pnames.append('gpos')
-                            if 'ekeep' in fparts:   # the packed tokens built from the real ones (forward's xperm)
-                                pnames += ['dkeep', 'xperm'] + (['ikeep', 'glast'] if xplan else [])
-                        mb.update((k_, tok[k_]) for k_ in pnames)
-                        if bk_:
-                            mb['buckets'] = [(c_, w_) for c_, (_, w_) in zip(got[len(hn):], bk_)]
-                    elif args.packed:
-                        mb['keep'], mb['starts'] = (dev(v) for v in packed_index(ne_p, nd_p, mb['ent'].shape[1],
-                                                                                   **xplan))
-                    k_ = len(part)
+                    if p2_on:   # BM1 P2: the part's chunks cut in two halves (p2_split_of None: it stays whole)
+                        chunks_p2 = [mplan['chunks'][i] for i in cids_]
+                        if tb is not None and args.teach_merge and lo_ == last:
+                            chunks_p2 += [L['teach_chunks'][i] for i in pick]
+                        if vb is not None and args.teach_merge and lo_ == last:
+                            chunks_p2 += [L['v2_chunks'][i] for i in vpick]
+                        cut_p2 = p2_split_of(chunks_p2)
+                        if cut_p2 is not None:
+                            m_ = p2_part(at, lo_, hi_, cids_, chunks_p2, cut_p2, bounds, last, tb, vb, m_)
+                            continue
+                    sp_ = part_prep(lo_, hi_, lo_ == last)
+                    part, part_h, w, pm, pn, merged, vmerged, mb, k_ = (
+                        sp_[k_s] for k_s in ('part', 'part_h', 'w', 'pm', 'pn', 'merged', 'vmerged', 'mb', 'k'))
                     m_ = pmark('b38:part_forward', m_)
+                    tk_ = None
                     with autocast():
                         if block_on:
                             chunks_b = [mplan['chunks'][i] for i in cids_]
@@ -4064,11 +4405,9 @@ def main(argv=None, child=None, actor=None):
                                 block_ppo_counts[key_b]+=value_b
                             tk_ = dict(temporal=ctx_b)
                             if blearn.PREFETCH_ON and not mem_on:   # B48: the next PPO part's host preparation now
-                                blearn.PREFETCH.submit(learner_model, next_ppo_chunks(at, lo_, bounds, last, tb, vb,
-                                                       pick if tb is not None else None,
-                                                       vpick if vb is not None else None),
-                                                       max_rows=args.micro or args.minibatch, version=L['update'],
-                                                       history_mode=args.block_history_mode)
+                                ppo_submit(next_ppo_chunks(at, lo_, bounds, last, tb, vb,
+                                                           pick if tb is not None else None,
+                                                           vpick if vb is not None else None))
                         elif chunked:   # (memory) BPTT over the part's chunks from their stored first states; the
                             #          teacher's records one step each (the old teacher's from 0, teacher v2's own)
                             memd = None   # (B32: a temporal model without the GRU)
@@ -4103,93 +4442,11 @@ def main(argv=None, child=None, actor=None):
                         else:
                             outs_ = lm_call(mb, packed=bool(args.packed),
                                                   **(dict(need_vg=True) if glob_loss else {}))
-                        logits_, value_, danger_ = outs_[:3]
-                    if priv_on:   # 2026-11-03 (tok_priv): the values from [zr ; p_t], [zg ; p_t]; teachers' rows: missing
-                        m_ = pmark('b38:part_priv', m_)
-                        zr_q, zg_q = tk_['temporal'].pop('z_out')
-                        # (the teachers' rows: the no-data record, one row of the same batch)
-                        n_x = len(zr_q) - k_
-                        idx_q, *plan_q = pv_b.plan(np.append(part_h, len(pv_b)) if n_x else part_h)
-                        p_q = pcritic.encode(pv_b, idx_q, plan_q)
-                        if n_x:
-                            p_q = torch.cat([p_q[:k_], p_q[k_:].expand(n_x, -1)])
-                        value_, vg_all = pcritic(zr_q, zg_q, p_q)
-                    m_ = pmark('b38:part_loss', m_)
-                    logp, entropy = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
-                        logits_[:k_], learner_model.gate(mb)[:k_], b_act[part])
-                    value = value_[:k_].float()
-                    a = a_all[lo_:hi_]
-                    if pf_on:   # 2026-10-13 (B23): forced decisions out of pg and the entropy, imitation on them
-                        pg, vf, ent, imit, ratio, kl_f, clip_f = ppo_part_terms(
-                            logits_[:k_], logp, entropy, b_logp[part], a, value, b_ret[part], b_act[part], b_pf[part],
-                            args.clip, pm, pn, prox[part] if prox is not None else None, args.decoupled_max_weight)
-                        loss = (pg + args.vf_coef * vf - args.ent_coef * ent + args.pickup_force_imitation * imit) * w
-                        pacc += imit.detach() * w
-                    elif prox is None:   # PPO's ratio to the behaviour policy (the one that sampled the action)
-                        ratio = torch.exp(logp - b_logp[part])
-                        pg = -pmean(torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a), pm, pn)
-                    else:   # decoupled: clipped around the weights at the update's start, importance-weighted
-                        ratio = torch.exp(logp - prox[part])
-                        weight = torch.exp(prox[part] - b_logp[part]).clamp(max=args.decoupled_max_weight)
-                        pg = -pmean(weight * torch.min(ratio * a, torch.clamp(ratio, 1 - args.clip, 1 + args.clip) * a),
-                                    pm, pn)
-                    if not pf_on:
-                        vf = 0.5 * pmean((value - b_ret[part]) ** 2, pm, pn)
-                        ent = pmean(entropy.sum(-1), pm, pn)
-                        loss = (pg + args.vf_coef * vf - args.ent_coef * ent) * w
-                    if glob_loss:   # 2026-10-12 (B22): value_global on its own returns (an auxiliary loss)
-                        vgf = 0.5 * pmean(((vg_all if priv_on else outs_[-1])[:k_].float() - b_ret_g[part]) ** 2, pm, pn)
-                        loss = loss + args.vf_global_coef * vgf * w
-                        gacc += vgf.detach() * w
-                    if priv_on:   # 2026-11-03 (tok_priv): the policy's own value heads, from a stopped gradient, on the
-                        #             same returns (the actor's graphs and the counterfactual lanes read them)
-                        pl_v = 0.5 * pmean((learner_model.value(zr_q[:k_].detach())[:, 0] - b_ret[part]) ** 2, pm, pn)
-                        pl_g = 0.5 * pmean((learner_model.gtok.value(zg_q[:k_].detach())[:, 0] - b_ret_g[part]) ** 2, pm, pn)
-                        loss = loss + (args.vf_coef * pl_v + args.vf_global_coef * pl_g) * w
-                        pacc2 += torch.stack([pl_v.detach(), pl_g.detach()]) * w
-                    if aux_on:   # 2026-11-03 (tok_aux): the part's share of the minibatch's L_aux
-                        m_ = pmark('b38:part_aux', m_)
-                        aloss, astats, aevs = part_loss(aux_head, tk_['temporal'].pop('o_seq')[:k_], aux_t, part, pm, aux_den)
-                        loss = loss + args.aux_coef * aloss
-                        aux_acc += astats
-                        aux_acc_ev += aevs
+                    m_ = part_compute(CX, sp_, part_rows(sp_, lo_, hi_), outs_, tk_, m_, pmark)
                     if merged:
-                        t_end = k_ + len(pick) if vmerged else None   # (teacher v2's records follow)
-                        tloss, tstats = teacher_loss(logits_[k_:t_end], danger_[k_:t_end], meta, n_sel)
-                        loss = loss + tloss
-                    if vmerged:   # 2026-10-10 (teacher v2): -w log pi(a | obs) over the heads + (V(obs) - G)^2
-                        o_ = k_ + (len(pick) if merged else 0)
-                        lp_v, _ = (learner_model.log_prob_fast if 'logp' in fparts else learner_model.log_prob)(
-                            logits_[o_:], learner_model.gate(mb)[o_:], v_act)
-                        vloss, vstats = v2_terms(lp_v, value_[o_:], vpick_d, v_w, v_G, v_share, adv_std, n_sel)
-                        loss = loss + vloss
-                    m_ = pmark('b38:part_backward', m_)
-                    if block_on:
-                        bpt.ucount('learn_bwd_calls', 1)
-                        with bpt.GpuSpan('learn_bwd'):
-                            loss.backward()
-                        if args.block_history_mode == 'gradreplay':
-                            # B43 C arm: g_j from this backward; re-encode the chosen blocks with the
-                            # auxiliary loss sum_j sg(g_j).f(o_j) (no second Reader pass)
-                            hist_ = bpt.grad_replay_aux(learner_model, ctx_b.get('replay'),
-                                                        args.block_history_aux_coef, autocast)
-                            ctx_b = tk_ = None
-                    else:
-                        loss.backward()
-                    m_ = pmark('b38:part_stats', m_)
-                    with torch.no_grad():
-                        if pf_on:   # (B23: kl and clip share over the PPO-trained decisions' rows)
-                            acc += torch.stack([pg, vf, ent, kl_f, clip_f]) * w
-                        else:
-                            acc += torch.stack([pg, vf, ent, pmean(b_logp[part] - logp, pm, pn),
-                                                pmean(((ratio - 1).abs() > args.clip).float(), pm, pn)]) * w
-                        ent_heads += (entropy.mean(0) if pm is None else (entropy * pm[:, None]).sum(0) / pn) * w
-                        if merged:
-                            tacc += tstats
-                            teach_steps += 1
-                        if vmerged:
-                            vacc += vstats
-                            v2_steps += 1
+                        teach_steps += 1
+                    if vmerged:
+                        v2_steps += 1
                 if corr_batch is not None and first_step:
                     # Phase B2: the choice records' correction, once per epoch (its records count as decisions of
                     # this minibatch, their advantage in the minibatch's units)
@@ -4234,14 +4491,14 @@ def main(argv=None, child=None, actor=None):
                         vacc += vstats
                     v2_steps += 1
                     sec('teach')
-                if L.get('trace') is not None:   # B18 check: the loss sums after each step, the first step's gradient
-                    L['trace'].append((acc.clone(), tacc.clone(), None if L['trace'] else
-                                       [None if q.grad is None else q.grad.clone()
-                                        for q in opt.param_groups[0]['params']]))
                 m_ = pmark('b38:clip_opt', m_)
                 step_params()   # (BM1: the one parameter-update entry)
                 pmark(None, m_)
                 sec('opt')
+        if CX2 is not None:   # BM1 P2: the second card's statistics added into the main card's sums
+            for nm_ in P2_ACC:
+                if getattr(CX, nm_) is not None:
+                    getattr(CX, nm_).add_(getattr(CX2, nm_).to(device))
         if block_on:
             blearn.PREFETCH.drop()   # (B48: a part prepared for nothing left: its staging buffer freed)
             learner_dump.end(learner_model)   # (B44 ISAAC_LEARNER_DUMP: measurement only)
@@ -4387,6 +4644,10 @@ def main(argv=None, child=None, actor=None):
             row.update(aux_log)
         row.update({f'u_{k}': v for k, v in U.items()})
         row.update({f'uc_{k}': v for k, v in UC.items()})   # (B60)
+        if P2 is not None:   # BM1 P2: the mode, the host seconds of the reduce / broadcast / the waits for the second card
+            row['p2_mode'] = p2_mode
+            if CX2 is not None:
+                row.update({f'p2_{k_}': v_ - p2_s0[k_] for k_, v_ in P2.stats.items()})
         if h2d_teach is not None:   # (B62: the teacher meta's pinned staging: allocations, bytes, blocking waits)
             row.update(h2d_allocs=h2d_teach.allocs, h2d_pinned_mb=h2d_teach.pinned_bytes/2**20, h2d_waits=h2d_teach.waits)
         if UO is not None:
