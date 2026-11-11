@@ -12,7 +12,10 @@ with process counts and the cores each kind used since the previous sample (utim
 alive at both samples),
 and the trainer's cgroup (the container): memory.current, memory.peak, anon, file, shmem from
 memory.stat, and the host's MemAvailable (every tenant's). One CSV row per sample. threads.csv: the trainer's threads'
-ticks per sample and their schedstat run / wait ns (b57_threads.py's format plus two columns; replaces it here: b57 matched its own command line when given a match). Standard library only (host python3); pid-free names (the trainer is found by
+ticks per sample and their schedstat run / wait ns; per kind also the system part of its cores, the cores of the
+children it reaped (cutime + cstime: short-lived processes counted on their parent), its common nice value, and the
+container's user / system ticks; <tag>.sysc.csv: the syscall every task sits in at each sample, per kind (the
+trainer's threads by name) (b57_threads.py's format plus two columns; replaces it here: b57 matched its own command line when given a match). Standard library only (host python3); pid-free names (the trainer is found by
 its command line), so K trainers on one host each get their own sampler by `match` / out path."""
 import os
 import sys
@@ -51,6 +54,27 @@ def pss_kb(p):
     except (OSError, ValueError):
         pass
     return 0
+
+
+def stat4(p):
+    """(utime, stime, cutime + cstime, nice) of /proc/<p>/stat (ticks; cutime / cstime: the children it has reaped, so
+    short-lived processes that died between two samples still count, on their parent); None when gone."""
+    try:
+        with open(f'/proc/{p}/stat') as f:
+            s = f.read()
+        rest = s[s.rindex(')')+2:].split()
+        return int(rest[11]), int(rest[12]), int(rest[13])+int(rest[14]), int(rest[16])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def syscall_of(path):
+    """The syscall a task is in now (/proc/.../syscall's first field: a number, 'running', or '' when unreadable)."""
+    try:
+        with open(path+'/syscall') as f:
+            return f.read().split(' ', 1)[0].strip()
+    except OSError:
+        return ''
 
 
 def ticks(p):
@@ -123,6 +147,20 @@ def cg_sample(cg):
             str(int(ns)//1000) if ns.isdigit() else '')
 
 
+def cg_ticks(cg):
+    """(user, system) CPU of the container's cgroup: v1 cpuacct.stat (USER_HZ ticks), v2 cpu.stat (usec / 1e4: the same
+    10 ms units); '' where unknown."""
+    if cg is None:
+        return ('', '')
+    kind, d = cg
+    if kind == 'v2':
+        st = dict(x.split() for x in read(d+'/cpu.stat').splitlines() if x.count(' ') == 1)
+        return tuple(str(int(st[k])//10000) if k in st else '' for k in ('user_usec', 'system_usec'))
+    c = d.get('cpuacct', '')
+    st = dict(x.split() for x in read(c+'/cpuacct.stat').splitlines() if x.count(' ') == 1) if c else {}
+    return (st.get('user', ''), st.get('system', ''))
+
+
 def read(path):
     try:
         with open(path) as f:
@@ -136,6 +174,10 @@ def main():
     period = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
     match = sys.argv[3] if len(sys.argv) > 3 else '/.venv/bin/python -u train_tok.py'
     tout = sys.argv[4] if len(sys.argv) > 4 else None   # the trainer's threads: t,kind,name,ticks (b57 format)
+    # (the ledger, BM1 2026-11-11: <out minus .mem.csv>.sysc.csv: per sample and process kind, how many tasks sit in
+    #  which syscall; the trainer's threads by name)
+    sc = open(out[:-len('.mem.csv')]+'.sysc.csv' if out.endswith('.mem.csv') else out+'.sysc.csv', 'w')
+    sc.write('t,kind,syscall,tasks\n')
     pid = None
     while pid is None:
         pid = find(match)
@@ -143,12 +185,14 @@ def main():
             time.sleep(1)
     cg = cgroup_dir(pid)
     prev, t_prev = {}, None
+    prev4 = {}
     tf = open(tout, 'w') if tout else None
     if tf:
         tf.write('t,kind,name,ticks,run_ns,wait_ns\n')
     with open(out, 'w') as f:
         f.write('t,'+','.join(f'{k}_rss_mb,{k}_pss_mb,{k}_n,{k}_cores' for k in KINDS)
-                + ',cg_current_mb,cg_peak_mb,cg_anon_mb,cg_file_mb,cg_shmem_mb,cg_cpu_usec,host_avail_mb\n')
+                + ',cg_current_mb,cg_peak_mb,cg_anon_mb,cg_file_mb,cg_shmem_mb,cg_cpu_usec,host_avail_mb,'
+                + ','.join(f'{k}_sys_cores,{k}_child_cores,{k}_nice' for k in KINDS) + ',cg_user_ticks,cg_sys_ticks\n')
         while os.path.exists(f'/proc/{pid}'):
             now = time.time()
             kids = children()
@@ -157,6 +201,11 @@ def main():
             dtk = dict.fromkeys(KINDS, 0)
             pss = dict.fromkeys(KINDS, 0)
             cur = {}
+            cur4 = {}
+            dsys = dict.fromkeys(KINDS, 0)
+            dchild = dict.fromkeys(KINDS, 0)
+            nices = {k: {} for k in KINDS}
+            calls = {}
             todo = [(pid, True)]
             while todo:
                 p, top = todo.pop()
@@ -170,9 +219,28 @@ def main():
                     dtk[kind] += max(0, cur[p]-prev[p])
                 pss[kind] += pss_kb(p)
                 n[kind] += 1
+                st4 = stat4(p)
+                if st4 is not None:
+                    cur4[p] = st4
+                    nices[kind][st4[3]] = nices[kind].get(st4[3], 0)+1
+                    if p in prev4:
+                        dsys[kind] += max(0, st4[1]-prev4[p][1])
+                        dchild[kind] += max(0, st4[2]-prev4[p][2])
+                try:
+                    for tid in os.listdir(f'/proc/{p}/task'):
+                        sy = syscall_of(f'/proc/{p}/task/{tid}')
+                        key_ = kind if not top else 'trainer:'+(read(f'/proc/{p}/task/{tid}/comm').strip()
+                                                                .rstrip('0123456789_') or '?')
+                        calls[(key_, sy)] = calls.get((key_, sy), 0)+1
+                except OSError:
+                    pass
                 todo += [(c, False) for c in kids.get(p, [])]
             dt = now-t_prev if t_prev else 0.0
             prev, t_prev = cur, now
+            prev4 = cur4
+            for (k_, sy_), c_ in sorted(calls.items()):
+                sc.write(f'{now:.1f},{k_},{sy_},{c_}\n')
+            sc.flush()
             if tf:
                 try:
                     for tid in os.listdir(f'/proc/{pid}/task'):
@@ -199,7 +267,10 @@ def main():
                     + ','.join(mb(v) for v in (cur_, peak_, anon_, file_, shm_))
                     + ',' + cpu_
                     + ',' + next((f'{int(x.split()[1])/1024:.0f}' for x in read('/proc/meminfo').splitlines()
-                                  if x.startswith('MemAvailable:')), '') + '\n')
+                                  if x.startswith('MemAvailable:')), '') + ','
+                    + ','.join((f'{dsys[k]/100/dt:.2f},{dchild[k]/100/dt:.2f}' if dt else ',')
+                               + ',' + (str(max(nices[k], key=nices[k].get)) if nices[k] else '') for k in KINDS)
+                    + ',' + ','.join(cg_ticks(cg)) + '\n')
             f.flush()
             time.sleep(period)
 
