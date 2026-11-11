@@ -759,6 +759,11 @@ def prepare_split(models, chunks, cut, grad, **kw):
         raise ValueError(f"history_mode {kw['history_mode']!r}: one of {bp.HISTORY_MODES}")
     parts, selected = _draw_history(chunks, cfg, grad, hist_kw.get('generator'), hist_kw.get('train_history', True),
                                     hist_kw.get('history_mode', 'random'))
+    if grad:   # (the historical blocks both halves re-encode: the one computation the halves duplicate)
+        def bids(lo, hi):
+            return {int(parts[i]['bid'][k]) for i in range(lo, hi) for k in selected[i]}
+        bp.ucount('p2_dup_blocks', len(bids(0, cut) & bids(cut, len(chunks))))
+        bp.ucount('p2_hist_blocks', len(bids(0, len(chunks))))
     return (_prepare_packed(models[0], chunks[:cut], grad, pre=(parts[:cut], selected[:cut]), **kw),
             _prepare_packed(models[1], chunks[cut:], grad, pre=(parts[cut:], selected[cut:]), **kw))
 

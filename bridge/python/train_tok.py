@@ -1909,7 +1909,10 @@ def main(argv=None, child=None, actor=None):
                    help='2026-10-10 (B18): CPUs for the learner thread alone, e.g. 56-59,168-171 (Linux numbering; '
                         'whole cores with their hyperthread siblings, best on the GPU\'s NUMA node): the trainer\'s '
                         'other threads, its workers and their games are kept off them. The fast learner is bound by '
-                        'its host thread, which a busy sibling or a game on the same core slows by ~20%%. '
+                        'its host thread, which a busy sibling or a game on the same core slows by ~20%%. BM1: the '
+                        "learner's helper threads too (the autograd engine's pt_autograd_* threads, wherever they were "
+                        "started, learner-prefetch, learner-p2), at each update's start; ISAAC_LEARNER_CPUS_SHARED=1: "
+                        'the learner on them without keeping the rest off (fixed, not dedicated). '
                         "'' (default): no pinning")
     p.add_argument('--actor-processes', type=int, default=1,
                    help='2026-10-17 (B38 step 5, needs --learner-process 1): actor processes, each with --workers / N '
@@ -2605,11 +2608,34 @@ def main(argv=None, child=None, actor=None):
     branch_path = open(out / 'branch_episodes.jsonl', 'a') if branching else None
     choice_path = open(out / 'choices.jsonl', 'a') if branching else None
     learner_cpus = set()   # 2026-10-10 (B18, --learner-cpus): before the workers start (they inherit the rest)
-    for part_ in filter(None, args.learner_cpus.split(',')):
+    # (BM1: or ISAAC_LEARNER_CPUS, the same list, when the flag is not given: the bm1 runners pass one EXTRA flag)
+    for part_ in filter(None, (args.learner_cpus or os.environ.get('ISAAC_LEARNER_CPUS', '')).split(',')):
         lo_, _, hi_ = part_.partition('-')
         learner_cpus.update(range(int(lo_), int(hi_ or lo_) + 1))
-    if learner_cpus:
+    if learner_cpus and os.environ.get('ISAAC_LEARNER_CPUS_SHARED', '0') != '1':
         os.sched_setaffinity(0, os.sched_getaffinity(0) - learner_cpus)
+    if learner_cpus:
+        print(f'learner CPUs (--learner-cpus): {sorted(learner_cpus)}, '
+              + ('shared: the rest of the trainer, its workers and games may run on them too'
+                 if os.environ.get('ISAAC_LEARNER_CPUS_SHARED', '0') == '1' else
+                 'dedicated: the rest of the trainer, its workers and games kept off them'), flush=True)
+
+    def pin_learner_threads():
+        """BM1 (--learner-cpus): the learner's helper threads on its CPUs, found by name in /proc/self/task: the
+        autograd engine's device threads (pt_autograd_*: started by the first backward, the compile warm-up's on the
+        main thread, so they did not inherit the learner thread's affinity), learner-prefetch, learner-p2. Returns the
+        number of threads moved."""
+        moved = 0
+        for tid_ in os.listdir('/proc/self/task'):
+            try:
+                with open(f'/proc/self/task/{tid_}/comm') as f_:
+                    comm_ = f_.read().strip()
+                if comm_.startswith(('pt_autograd', 'learner-')) and os.sched_getaffinity(int(tid_)) != learner_cpus:
+                    os.sched_setaffinity(int(tid_), learner_cpus)
+                    moved += 1
+            except OSError:   # (a thread that ended meanwhile)
+                pass
+        return moved
     bench_job = None   # 2026-10-10 (B18, abplus_bench_learner.py): a saved rollout instead of the engine
     if proc and (os.environ.get('ISAAC_RL_LEARNER_BENCH') or lab_on or branching):
         p.error('--learner-process 1: not with the learner bench, the build lab or branches (their learner side writes '
@@ -4902,6 +4928,10 @@ def main(argv=None, child=None, actor=None):
             job = jobs.get()
             if job is None:
                 return
+            if learner_cpus:   # (BM1: and the helper threads, wherever they were started; a few new each update at most)
+                n_pin = pin_learner_threads()
+                if n_pin:
+                    print(f'learner CPUs: {n_pin} helper threads moved onto them', flush=True)
             try:
                 if os.environ.get('ISAAC_RL_LEARNER_BENCH') and not L.get('stop'):
                     # 2026-10-10 (B18): the learner bench on this job (abplus_bench_learner.py), then the run ends

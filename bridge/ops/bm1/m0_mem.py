@@ -12,7 +12,7 @@ with process counts and the cores each kind used since the previous sample (utim
 alive at both samples),
 and the trainer's cgroup (the container): memory.current, memory.peak, anon, file, shmem from
 memory.stat, and the host's MemAvailable (every tenant's). One CSV row per sample. threads.csv: the trainer's threads'
-ticks per sample (b57_threads.py's format; replaces it here: b57 matched its own command line when given a match). Standard library only (host python3); pid-free names (the trainer is found by
+ticks per sample and their schedstat run / wait ns (b57_threads.py's format plus two columns; replaces it here: b57 matched its own command line when given a match). Standard library only (host python3); pid-free names (the trainer is found by
 its command line), so K trainers on one host each get their own sampler by `match` / out path."""
 import os
 import sys
@@ -145,7 +145,7 @@ def main():
     prev, t_prev = {}, None
     tf = open(tout, 'w') if tout else None
     if tf:
-        tf.write('t,kind,name,ticks\n')
+        tf.write('t,kind,name,ticks,run_ns,wait_ns\n')
     with open(out, 'w') as f:
         f.write('t,'+','.join(f'{k}_rss_mb,{k}_pss_mb,{k}_n,{k}_cores' for k in KINDS)
                 + ',cg_current_mb,cg_peak_mb,cg_anon_mb,cg_file_mb,cg_shmem_mb,cg_cpu_usec,host_avail_mb\n')
@@ -178,7 +178,10 @@ def main():
                     for tid in os.listdir(f'/proc/{pid}/task'):
                         try:
                             nm = read(f'/proc/{pid}/task/{tid}/comm').strip()
-                            tf.write(f'{now:.3f},thread,{nm}:{tid},{ticks(f"{pid}/task/{tid}")}\n')
+                            # (schedstat: ns on a CPU, ns runnable but waiting for one: the scheduler's view)
+                            ss = read(f'/proc/{pid}/task/{tid}/schedstat').split()
+                            tf.write(f'{now:.3f},thread,{nm}:{tid},{ticks(f"{pid}/task/{tid}")},'
+                                     f'{ss[0] if ss else ""},{ss[1] if len(ss) > 1 else ""}\n')
                         except OSError:
                             pass
                     tf.flush()

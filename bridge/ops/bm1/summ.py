@@ -101,6 +101,23 @@ def main():
                 per[name] = per.get(name, 0)+(k1-k0)/100/(t1-t0)
         top = sorted(per.items(), key=lambda kv: -kv[1])[:12]
         out.append('  trainer threads (cores, steady): ' + ', '.join(f'{n} {c:.2f}' for n, c in top))
+        if th[0].get('wait_ns'):   # (m0_mem with schedstat: on-CPU and runnable-but-waiting seconds per second)
+            s0, s1 = {}, {}
+            for x in th:
+                if x['kind'] == 'thread' and x.get('wait_ns'):
+                    s0.setdefault(x['name'], (f(x, 't'), f(x, 'run_ns'), f(x, 'wait_ns')))
+                    s1[x['name']] = (f(x, 't'), f(x, 'run_ns'), f(x, 'wait_ns'))
+            sch = {}
+            for key, (t1, r1, w1) in s1.items():
+                t0, r0, w0 = s0[key]
+                if t1 > t0:
+                    nm = key.rsplit(':', 1)[0]
+                    a_ = sch.setdefault(nm, [0.0, 0.0])
+                    a_[0] += (r1-r0)/1e9/(t1-t0)
+                    a_[1] += (w1-w0)/1e9/(t1-t0)
+            topw = sorted(sch.items(), key=lambda kv: -(kv[1][0]+kv[1][1]))[:12]
+            out.append('  trainer threads schedstat (run / waiting for a CPU, s per s): ' + ', '.join(
+                f'{n} {r:.2f}/{w:.2f}' for n, (r, w) in topw))
     # this run's GPU(s): 1 s samples; the index is the last column (older files without it: one GPU, `gpu`)
     import datetime as dt_
     g = {}
