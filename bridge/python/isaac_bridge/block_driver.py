@@ -27,6 +27,14 @@ def _ptr(a):
     return 0 if a is None else int(a.ctypes.data)
 
 
+def arena_reset_args(st):
+    """A BlockSlotState's reset as the driver takes it (BlockSlotState.reset): tensors, index dims, fill values."""
+    tensors = [st.kv] + [getattr(st, name) for name in st._rows]
+    dims = [2] + [0]*len(st._rows)
+    fills = [0.0] + [0.0 if name in ('bank', 'partial', 'steps') else -1.0 for name in st._rows]
+    return tensors, dims, fills
+
+
 def make_driver(actor, sampler, stream, seed, pf_on, aux):
     """The driver for actor (the main SlotBlockActor, its store native) and sampler, on `stream`; None when off."""
     ext = actor_native.load()
@@ -55,11 +63,10 @@ def make_driver(actor, sampler, stream, seed, pf_on, aux):
     nh, heads = len(model.heads), sum(model.heads)
     # (set_arena before set_sampler: pending_cur needs nh)
     st = actor.state
-    tensors = [st.kv] + [getattr(st, name) for name in st._rows]
-    dims = [2] + [0]*len(st._rows)
-    fills = [0.0] + [0.0 if name in ('bank', 'partial', 'steps') else -1.0 for name in st._rows]
+    tensors, dims, fills = arena_reset_args(st)
+    # (the row ids: the main arena's rows, and with lane arenas of their own (lane GPU) every lane row: actor.lin_rows)
     d.set_arena(tensors, dims, fills, int(st.slots-1), int(actor.base), int(st.step_host.ctypes.data), heads, nh,
-                int(model.block_memory.config.block_steps), int(st.slots), id(actor))
+                int(model.block_memory.config.block_steps), int(actor.lin_rows), id(actor))
     d.set_sampler(int(sampler.rows.ctypes.data), int(ROW.itemsize), int(sampler.cfg.workers), [int(f) for f in sampler._fds],
                   int(sampler.actions.ctypes.data), int(sampler.actions.shape[1]), _ptr(main_value), _ptr(main_vg), _ptr(aux),
                   int(aux.shape[1]) if aux is not None else 0, _ptr(cf_snap), _ptr(priv), int(priv.dtype.itemsize) if priv is not None else 0,
@@ -338,7 +345,7 @@ def attach_lineage(d, actor, lanes, sampler, rolls):
     st = actor.store
     cfg = actor.model.block_memory.config
     nh = len(actor.model.heads)
-    st.native.lineage_configure(int(cfg.window), int(cfg.block_steps), int(cfg.memory_blocks), nh, int(actor.state.slots),
+    st.native.lineage_configure(int(cfg.window), int(cfg.block_steps), int(cfg.memory_blocks), nh, int(actor.lin_rows),
                                 int(sampler.cfg.workers), [int(x) for x in lanes.depths], int(rolls[0].block.chunk_steps),
                                 len(lanes.generations.slots))
     status, mode, jobs, epoch, kept, commit = sampler.block_arrays[:6]
@@ -401,6 +408,20 @@ def native_lanes_reason(cpp_driver, native_lin, lanes):
     return None
 
 
+def set_lane_arenas(d, main_actor, actors):
+    """(lane GPU, stage 1) With lane arenas of their own (main_actor.lane_arena 'own'): each generation's arena, its
+    row ids and device into the driver (after lanes_configure). Nothing with the lanes in the main arena."""
+    if getattr(main_actor, 'lane_arena', 'shared') != 'own':
+        return 0
+    for g, a in enumerate(actors):
+        if a.state is main_actor.state:
+            raise RuntimeError(f'lane arena own: generation {g} lane actor is in the main arena')
+        tensors, dims, fills = arena_reset_args(a.state)
+        d.set_lane_arena(g, tensors, dims, fills, int(a.state.step_host.ctypes.data), int(a.lin_base), int(a.n_slots),
+                         int(a.state.kv.device.index))
+    return len(actors)
+
+
 def attach_lanes(d, lanes, sampler, stream):
     """(B58d) The lane service in C++: its window constants, the lanes' shared arrays and pipes (taken out of the
     sampler's poll sets: only the native service reads them now), both teacher generations' graph owners and arena
@@ -435,8 +456,9 @@ def attach_lanes(d, lanes, sampler, stream):
     if missing:   # (on_publish must never pause the driver from inside a record: see ActorDriver.pause)
         raise RuntimeError(f'native lanes: generations {missing} have no lane actor (ISAAC_BLOCK_LANE_PRECAPTURE=1)')
     owners = [int(lanes.actors[g].step_graph.owner) for g in gens]
-    bases = [int(lanes.actors[g].base) for g in gens]
+    bases = [int(lanes.actors[g].lin_base) for g in gens]
     d.lanes_configure(cfg, sh, fds, int(stream.stream_id), owners, bases)
+    set_lane_arenas(d, lanes.main_actor, [lanes.actors[g] for g in gens])
     # (d2 M1: a lane job of the main version rides the next main batch; on by default since its acceptance (the four
     # back-to-back timed runs and 3 green gates of c-cc3af40, 2026-11-11). ISAAC_BLOCK_LANE_MERGE=0: every job lane-only,
     # the d1 behaviour. M1 works only with the lane service on the driver thread (d1); with a lane thread it is off.)

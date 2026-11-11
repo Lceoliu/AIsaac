@@ -97,8 +97,8 @@ def driver_ring(driver, actor, lane):
     decisions of the row's last block_steps steps from the lane's log (step s at position s % block_steps, -1 where the
     branch has none), so the blocks the lane completes later get the sources _pages would read from the log."""
     bs=actor.model.block_memory.config.block_steps
-    row=actor.base+int(lane)
-    step=int(actor.state.step_host[row])
+    row=actor.lin_base+int(lane)   # (the row id: rings, lineage; a lane arena of its own (lane GPU) is addressed by base)
+    step=int(actor.state.step_host[actor.base+int(lane)])
     log=actor.logs[int(lane)]
     lo=max(log.offset,step-bs)
     dec=np.full(bs,-1,np.int64); kv=np.full(bs,-1,np.int64)
@@ -195,7 +195,7 @@ class BlockLaneService(LaneService):
         rows = rec['rows'].numpy().view(ROW); pend = rec['pending_before'].numpy()
         before = {}
         for lane in lanes.tolist():
-            row = actor.base+lane
+            row = actor.lin_base+lane   # (the row id; the arena row is actor.base + lane)
             end = nat.lin_head_end(row)
             if end >= 0:
                 snap = nat.lin_snap_row(row, torch.zeros(len(self.model.heads), dtype=torch.long), 0)
@@ -808,6 +808,8 @@ class BlockLaneService(LaneService):
         for generation, positions in items:
             positions = np.asarray(positions, np.int64)
             actor = self.actors[generation]
+            if actor.lin_base != actor.base:   # (the B54 jobs address the main arena's rows)
+                raise RuntimeError('lane arenas of their own (ISAAC_BLOCK_LANE_ARENA=own / a lane device) need the native lane service')
             lanes = idx[positions]
             for lane in lanes.tolist():   # (rows the Python path stepped meanwhile: the driver's ring from the log)
                 if (generation, lane) in self.ring_dirty:

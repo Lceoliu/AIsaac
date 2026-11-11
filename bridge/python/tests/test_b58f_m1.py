@@ -35,8 +35,8 @@ MSG = b'\x00\x00\x00\x010'
 MAIN = 3   # (the main worker whose rows ride with the lanes; no lane of the script begins at its points)
 
 
-def pair():
-    A, B = world(False), world(True, lane_pipes=True)
+def pair(lane_arena='shared'):
+    A, B = world(False), world(True, lane_pipes=True, lane_arena=lane_arena)
     A.defer = 1e9
     B.d.set_fixed_uniform(0.5)
     # (the driver's main stream a stream of its own, as train_tok's actor stream: on the legacy default stream every
