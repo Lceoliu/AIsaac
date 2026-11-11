@@ -45,6 +45,9 @@ class TwoCard:
         self.pairs = list(pairs)
         self.mp = [p for m, _ in self.pairs for p in m.parameters()]
         self.rp = [p for _, r in self.pairs for p in r.parameters()]
+        # (buffers are never copied: all constants written at construction; the check compares them too)
+        self.mb = [b for m, _ in self.pairs for b in m.buffers()]
+        self.rb = [b for _, r in self.pairs for b in r.buffers()]
         if len(self.mp) != len(self.rp) or any(a.shape != b.shape or a.dtype != b.dtype for a, b in zip(self.mp, self.rp)):
             raise RuntimeError('P2: the replicas do not match the learner modules parameter for parameter')
         for _, r in self.pairs:
@@ -132,8 +135,8 @@ class TwoCard:
 
     @torch.no_grad()
     def check(self):
-        """(ISAAC_P2_CHECK=1) the replicas' parameters against the main card's: an integer hash of each side's bytes
-        (int32 words times their position's weight, summed in int64: order-free, exact); a mismatch raises."""
+        """(ISAAC_P2_CHECK=1) the replicas' parameters and buffers against the main card's: an integer hash of each
+        side's bytes (words times their position's weight, summed in int64: order-free, exact); a mismatch raises."""
         def h(ts, dev):
             out = torch.zeros((), dtype=torch.int64, device=dev)
             for t in ts:
@@ -143,10 +146,11 @@ class TwoCard:
                 out += (w * k).sum()
             return int(out)
         a, b = h(self.mp, self.main_dev), h(self.rp, self.dev2)
+        ab, bb = h(self.mb, self.main_dev), h(self.rb, self.dev2)
         self.stats['checks'] += 1
-        if a != b:
+        if a != b or ab != bb:
             raise RuntimeError(f'P2 check: the replicas on {self.dev2} differ from the main card after the broadcast '
-                               f'(hash {a} vs {b})')
+                               f'(parameters hash {a} vs {b}, buffers {ab} vs {bb})')
 
     def run(self, fn, label):
         """fn() on the second card's thread (asynchronous); join() waits for it."""
