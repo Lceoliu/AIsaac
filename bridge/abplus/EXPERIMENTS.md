@@ -10856,6 +10856,43 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
   - driver 线程上 lane 作业（6.8 s）和主步等 GPU（6.9 s）仍是 collect 的两大块，这是 M1 要砍的。
   - nsys 在这台机器上关掉 CUDA 跟踪、只开 nvtx 和 python-gil，可以正常使用。
 
+### cpp 线 3090：分卡下的 M1（lane 合并）计时（2026-11-11，未完成：GPU 5 掉卡）
+
+#### 实验方法
+
+- **树和配置**：c-02b2169，GPU 4 放 actor、GPU 5 放 learner，node1，capture 模式 global（ISAAC_CAPTURE_MODE 未设，和分卡基线一致），bm1/prof.sh（P24），24 轮。
+- **TSAN**：按协调方的选项 B，计时先跑，TSAN 后补。TSAN 通过之前，ISAAC_BLOCK_LANE_MERGE 默认保持关。
+- **单独跑的 M1 测试**：test_b58f_m1，2 passed，1 xfailed（restore 顺序对照组，已知未决）。合并轮次与 Python 合并路径逐位一致。
+
+#### 实验结果
+
+| u10–u23 中位 | MERGE=1（m1-merge1） | 分卡基线（M1 关，另一次运行） |
+|---|---:|---:|
+| collect（s） | 16.98 | 17.94 |
+| driver 线程上 lane 作业（s） | 3.52 | 6.81 |
+| 主步等 GPU（s） | 7.75 | 6.91 |
+| wait_learner（s） | 0.62 | 0.93 |
+| update（s） | 17.54 | 18.75 |
+| ×实时 | 241.3 | 225.4 |
+| u15 cf_done / nobank / queue / dropped | 99 / 22 / 0 / 0 | 100 / 0 / 0 / 0 |
+| 每 collect lane 作业 / 合并作业（行） | 2,170 / 499（2,541） | 3,165 / 0 |
+
+- **MERGE=1 臂**：
+  - lane-only 作业只剩旧版本的；没有因版本切换、被拒或空转走 lane-only 的作业；合并等待 p50 接近 0。
+  - CF 约束门过，丢弃 0。
+  - 这一臂运行时，A1 在 node0 跑计时：GPU 1 利用率 77%，node0 CPU 忙 35%，宿主最低可用内存 22.3 GB。update 也短了 1.2 s，而 M1 本不影响 update。所以和基线的差不能全算给 M1。
+- **同期的 MERGE=0 臂（m1-merge0）**：
+  - 在 u11 中止，rc 134。driver 报 "CUDA error: unspecified launch failure"，出在 actor 等 learner 期间 driver 只跑 lane 的那一段（quiesce 读到 kind 3 记录）。
+  - 重跑（m1-merge0b）没能起来：docker 报 "Unable to determine the device handle for GPU5: 0000:89:00.0: Unknown Error"。之后 nvidia-smi 里 GPU 5 消失，其他 7 张卡正常。
+  - 推断：GPU 5 在 MERGE=0 那次运行中出了故障，launch failure 是它的表现。这是推断，没有确认；没有 dmesg 权限看 Xid。
+  - 结论：没有同期的 MERGE=0 对照，M1 的计时对比没完成。
+- **TSAN**（不改任何安全设置：测试二进制用 -no-pie 链接，遇到 "unexpected memory mapping" 重试最多 60 次）：
+  - 都能启动起来，每个最多重试 21 次。
+  - 正常跑完的：core 3/5、lineage 4/5、lanes 1/3，都是 0 条警告。
+  - 其余 rc 139 段错误，0 条警告。
+  - 对照组：core 不用 stamp 规则那组 rc 66、1 条警告，按要求失败；lineage 和 lanes 的对照段错误，结论不明。
+  - 段错误应是 gcc 11 的 TSAN 运行时和这台机器的地址布局不合，不是被测代码的问题，但这只是推断。TSAN 不算通过。
+
 ### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
 
 #### 实验目的
