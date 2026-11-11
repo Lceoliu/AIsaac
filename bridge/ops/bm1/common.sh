@@ -38,6 +38,11 @@ log() { echo "$(date '+%F %T') $*" >> $LOG; }
 #     itself arrived take its shared lock (then claims X and waits for them to end, as always). So back-to-back timed
 #     runs let the non-timed jobs waiting between them in at least once: X1, the waiting shared jobs, X2. A timed run
 #     still never overlaps a shared job.
+#     Containers (2026-11-11): run.sh adds "container <name>" to the lock file it runs under ($LOCKFILE, exported by
+#     take_*) before it starts the container. A file is stale only when its holder pid is gone AND none of its
+#     containers is still running: a job script that dies while its container goes on (shardk.sh under set -u, c2flipc)
+#     keeps its lock until the container ends. (BM1_CONTAINER_ALIVE: a shell snippet testing "$1" instead of docker ps;
+#     the regression test's stand-in.)
 # (every variable the lock functions set is named _lk_*: sh has no locals, and a caller's f, n, p, t0 ... must survive.
 #  2026-11-11: _stale_sweep's loop variable f overwrote take_shared's own file name, so shared holders wrote one common
 #  literal "S.*" file, and the first holder to finish released the others' claim)
@@ -49,13 +54,26 @@ _mutex() {
   done
 }
 _unmutex() { rmdir "$BM1_LOCKDIR/.mutex" 2>/dev/null; }
-_stale_sweep() {   # (under the mutex) lock files whose holder pid is gone
+_container_alive() {   # <name>: the container is running
+  if [ -n "${BM1_CONTAINER_ALIVE:-}" ]; then ( set -- "$1"; eval "$BM1_CONTAINER_ALIVE" ); return; fi
+  docker ps -q --filter "name=^/$1\$" 2>/dev/null | grep -q .
+}
+_stale_sweep() {   # (under the mutex) lock files whose holder pid is gone and whose containers have all ended
   for _lk_f in "$BM1_LOCKDIR"/X "$BM1_LOCKDIR"/S.* "$BM1_LOCKDIR"/W.*; do
     [ -f "$_lk_f" ] || continue
     _lk_p=$(sed -n 's/^pid \([0-9]*\).*/\1/p' "$_lk_f")
     if [ -z "$_lk_p" ] || ! kill -0 "$_lk_p" 2>/dev/null; then
-      log "lock: stale $(basename "$_lk_f") removed (holder pid ${_lk_p:-?} gone): $(head -1 "$_lk_f")"
-      rm -f "$_lk_f"
+      _lk_c=""
+      for _lk_n in $(sed -n 's/^container \(.*\)/\1/p' "$_lk_f"); do
+        _container_alive "$_lk_n" && { _lk_c=$_lk_n; break; }
+      done
+      if [ -n "$_lk_c" ]; then
+        _lk_o="$BM1_LOCKDIR/.orphan.$(basename "$_lk_f")"   # (logged once; not a lock file name: X, S.*, W.*)
+        [ -f "$_lk_o" ] || { log "lock: $(basename "$_lk_f")'s holder pid ${_lk_p:-?} gone but its container $_lk_c runs: kept: $(head -1 "$_lk_f")"; : > "$_lk_o"; }
+        continue
+      fi
+      log "lock: stale $(basename "$_lk_f") removed (holder pid ${_lk_p:-?} gone, no container of it running): $(head -1 "$_lk_f")"
+      rm -f "$_lk_f" "$BM1_LOCKDIR/.orphan.$(basename "$_lk_f")"
     fi
   done
 }
@@ -88,7 +106,7 @@ take_excl() {
     if [ "$_lk_n" = 0 ]; then printf '%s\npid %s\n' "$SESSION $(date '+%F %T') $1" "$$" > "$BM1_LOCKDIR/X"; _unmutex; break; fi
     _unmutex; sleep ${BM1_LOCK_POLL:-30}
   done
-  LOCKFILE=$BM1_LOCKDIR/X; LOCKLINE=$(head -1 "$LOCKFILE")
+  LOCKFILE=$BM1_LOCKDIR/X; LOCKLINE=$(head -1 "$LOCKFILE"); export LOCKFILE
   log "lock: exclusive taken after $(( $(date +%s) - _lk_t0 )) s: $LOCKLINE"
 }
 take_shared() {
@@ -104,7 +122,7 @@ take_shared() {
     [ -f "$_lk_wf" ] || printf 'pid %s\nsince %s\n%s\n' "$$" "$(date +%s)" "$SESSION $(date '+%F %T') $1" > "$_lk_wf"
     _unmutex; sleep ${BM1_LOCK_POLL:-30}
   done
-  LOCKFILE=$_lk_sf; LOCKLINE=$(head -1 "$_lk_sf")
+  LOCKFILE=$_lk_sf; LOCKLINE=$(head -1 "$_lk_sf"); export LOCKFILE
   log "lock: shared taken after $(( $(date +%s) - _lk_t0 )) s: $LOCKLINE"
 }
 _take_file() {
@@ -113,8 +131,13 @@ _take_file() {
 }
 take() { case "$1" in *计时运行*) take_excl "$1" ;; *) take_shared "$1" ;; esac; }
 give() {
-  [ -n "${LOCKFILE:-}" ] && [ "$(head -1 "$LOCKFILE" 2>/dev/null)" = "${LOCKLINE:-}" ] && rm -f "$LOCKFILE"
+  [ -n "${LOCKFILE:-}" ] && [ "$(head -1 "$LOCKFILE" 2>/dev/null)" = "${LOCKLINE:-}" ] && rm -f "$LOCKFILE" "$(dirname "$LOCKFILE")/.orphan.$(basename "$LOCKFILE")"
   LOCKLINE=; LOCKFILE=
+}
+# lock_container <name>: the container a job is about to start, registered in the lock file it runs under (run.sh)
+lock_container() {
+  [ -n "${LOCKFILE:-}" ] && [ -f "$LOCKFILE" ] && [ -n "${BM1_LOCKDIR:-}" ] || return 0
+  _mutex; [ -f "$LOCKFILE" ] && echo "container $1" >> "$LOCKFILE"; _unmutex
 }
 
 # capmode <tree>: the graph capture mode a run of <tree> uses (ISAAC_CAPTURE_MODE from ENVS, else the tree's default)
