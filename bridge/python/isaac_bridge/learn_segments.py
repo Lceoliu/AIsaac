@@ -29,6 +29,7 @@ class Segments:
         self.recs = []      # (name, host start, host end, start event, end event)
         self.open = None    # (name or None, host start, start event)
         self.active = False
+        self.thread = None  # (the learner thread that began the update: marks from any other thread are ignored)
 
     def _event(self):
         import torch
@@ -37,14 +38,21 @@ class Segments:
         return e
 
     def begin(self):
-        """An update starts (learner thread)."""
+        """An update starts (learner thread). A CPU-only process stays inactive (CUDA events need a device)."""
         if not ON:
             return
-        self.recs, self.active = [], True
+        import threading
+        import torch
+        if not torch.cuda.is_available():
+            return
+        self.recs, self.active, self.thread = [], True, threading.get_ident()
         self.open = (None, time.perf_counter(), self._event())
 
     def mark(self, start=None, end=None):
         if not (ON and self.active):
+            return
+        import threading
+        if threading.get_ident() != self.thread:
             return
         t, e = time.perf_counter(), self._event()
         name, t0, e0 = self.open

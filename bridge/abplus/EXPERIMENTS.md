@@ -11007,3 +11007,13 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
 - 内核日志：01:40:41，PCI 0000:89:00（GPU 5）报Xid 79 “GPU has fallen off the bus”，并生成了GPU崩溃转储；同一秒，8张卡全部报Xid 154（GPU recovery action changed to Node Reboot Required）。
 - 之后nvidia-smi读不到GPU 5；容器里即使只给GPU 1，CUDA初始化也失败（CUDA unknown error）。02:49以后的收尾smoke（5次）、分段计时的开、关验收都在启动时就失败了，不能说明代码有问题，机器恢复后要重跑。
 - 01:40时我这条道只在用GPU 1和2。需要整机重启（要root或管理员）。
+
+#### 第五轮补记：故障期间的无效运行、尚未验证的改动（2026-11-11）
+- 01:40:41之后，主机一直处在“需要重启”的状态（Xid 79和154）。这段时间里的运行全部作废，不作为结果使用：
+  - sigx5-single-mf765780、sigy1-mf94e225、sigy2-mf94e225、sigy3-mf94e225、sigy4-single-mf94e225、sigy5-single-mf94e225、segoff-2u-mf94e225、segon-split-mf94e225：建CUDA上下文时就失败（CUDA unknown error），rc 1，0行；
+  - gatecount-split-mf765780：只取10轮的计数，这10轮在01:39:10之前已经跑完，是有效的。它SIGINT之后挂了70分钟，这一段和掉卡时间重叠，不能拿来当任何证据。
+- 尚未验证、等机器恢复以后再做：
+  - f94e225（driver.stop()放回finally开头）：按5种SIGINT落点重测之后才验收；
+  - 分段计时（691ec41及之后的提交）：开关关、开各做一次验收。已补两条防护：只有开始这一轮update的那条线程打的标记才计入；进程里没有CUDA时整个保持关闭；
+  - 单一步进入口step_params()（f73213e）：同一份数据跑2个update，比较参数和三个优化器状态的哈希，必须逐位一致。
+- 当时GPU 5上跑的是cpp-actor的m1-merge0（learner卡），它在01:40:58报CUDA error: unspecified launch failure后崩溃（协调方转述）。
