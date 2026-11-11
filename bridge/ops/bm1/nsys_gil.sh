@@ -12,6 +12,7 @@ GPU=${GPU:-4,5}; RANGE=${RANGE:-2:5}; STOP_ROWS=${STOP_ROWS:-6}
 R=$LD/reports; LOG=$R/bm1.log
 NSYS=/bench/bm1/tools/nsys-2023.4.4/opt/nvidia/nsight-systems/2023.4.4/bin/nsys
 [ -e $R/$TAG ] && { echo "nsys_gil.sh: $R/$TAG exists" >&2; exit 2; }
+export PIDS=${PIDS:-16384}   # (nsys puts threads into every traced process: 4096 pids were not enough here, A1)
 take "nsys gil $TAG ($TREE, GPU $GPU, not timed)"
 echo "$(date '+%F %T') nsys gil $TAG start: tree $TREE GPU $GPU range $RANGE lock: $LOCKLINE" >> $LOG
 C=$NAME-nsys-$TAG

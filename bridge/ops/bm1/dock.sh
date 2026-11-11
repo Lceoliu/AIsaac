@@ -15,7 +15,7 @@ for g in $(echo "$G" | tr ',' ' '); do
 done
 mkdir -p "$LD/home"
 exec docker run --rm --init --name "$NAME-$P" --runtime=nvidia --network none \
-  --cpuset-cpus "$CPUSET" --cpuset-mems "$MEMS" --memory "$MEM" --memory-swap "$MEM" --shm-size 8g --pids-limit 4096 \
+  --cpuset-cpus "$CPUSET" --cpuset-mems "$MEMS" --memory "$MEM" --memory-swap "$MEM" --shm-size 8g --pids-limit ${PIDS:-4096} \
   --log-opt max-size=10m --log-opt max-file=2 --read-only --tmpfs /tmp:rw,exec,size=4g \
   --user "$(id -u):$(id -g)" \
   -v "$B:/bench" -v "$B/home/isaac-abplus/runtime:/bench/home/isaac-abplus/runtime:ro" \
