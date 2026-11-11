@@ -1,0 +1,6 @@
+# Everything here runs on the Linux hosts: LF on every checkout (core.autocrlf is on on the PC).
+*.sh text eol=lf
+*.env text eol=lf
+*.py text eol=lf
+*.json text eol=lf
+Dockerfile* text eol=lf
