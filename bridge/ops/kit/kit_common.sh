@@ -37,6 +37,20 @@ kit_lock() {   # kit_lock "<purpose>"
   printf 'BM1_LOCKDIR=%s\nBM1_SESSION=kit\nBM1_TRASH=%s\n' "${dirs%% *}" "${KIT_TRASH:-$KIT_ROOT/kit/trash}" > "$KBM/bm1.env"
   BM=$KBM
   . "$KITDIR/../bm1/common.sh"
+  # bm1/common.sh (72e0ac74...) bug: _stale_sweep loops with the global variable f, which take_shared uses for its own
+  # file name S.<session>.<pid>; after the sweep f is the last S.* entry (or the literal "S.*"), so every shared holder
+  # writes the SAME file and may overwrite another holder's. Same protocol, loop variable renamed (this process only;
+  # bm1/common.sh itself is not edited -- reported to the coordinator).
+  _stale_sweep() {
+    for _kf in "$BM1_LOCKDIR"/X "$BM1_LOCKDIR"/S.*; do
+      [ -f "$_kf" ] || continue
+      _kp=$(sed -n 's/^pid \([0-9]*\).*/\1/p' "$_kf")
+      if [ -z "$_kp" ] || ! kill -0 "$_kp" 2>/dev/null; then
+        log "lock: stale $(basename "$_kf") removed (holder pid ${_kp:-?} gone): $(head -1 "$_kf")"
+        rm -f "$_kf"
+      fi
+    done
+  }
   klog "lock: waiting for the shared lock in [$dirs] ($1); holders now: $(for d in $dirs; do cat "$d"/* 2>/dev/null | grep -v '^pid'; done | tr '\n' ';')"
   t0=$(date +%s)
   while :; do

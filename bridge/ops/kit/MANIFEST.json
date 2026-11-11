@@ -1,0 +1,45 @@
+{
+  "format": "aisaac migration kit manifest v1: one entry per kit version, copied from <ROOT>/kit/<version>.manifest.json written by kit_build.sh; sha256 values computed on the remote hosts",
+  "versions": {
+    "kit-20261111.1": {
+      "version": "kit-20261111.1",
+      "built_on": "dgene-8x3090",
+      "built_at_utc": "2026-11-11 09:29:00",
+      "ops_commit": "aae2b9323fe6",
+      "image": {
+        "tag": "aisaac-bench:kit-20261111.1",
+        "id": "sha256:f3780008a4c976fc88d723df004182fa1ee2ee398cba87d4bbd8a53f7d01a5a2",
+        "size_bytes": 19042619238,
+        "base": "aisaac-bench:20261019",
+        "base_id": "sha256:9864d7c0e7ac68c8bf2ac9b562af09c2375c40e1e58925d5b2e1a34d44cb3098",
+        "archive": {
+          "file": "aisaac-bench-kit-20261111.1.tar.gz",
+          "bytes": 10586350952,
+          "sha256": "6a482696c653d0a6b774308387ecd290a8121439d2b3a34ce19c147d9c0727e5",
+          "compression": "gzip"
+        },
+        "python": "3.10.12",
+        "torch": "2.7.1+cu128",
+        "cuda_runtime": "12.8",
+        "cudnn": "9.7.1 (90701)",
+        "min_driver": "525.60.13",
+        "recommended_driver": "570.26",
+        "venv": "/opt/aisaac/venv",
+        "pydeps": "/opt/aisaac/pydeps",
+        "packages": 55
+      },
+      "data": {
+        "file": "aisaac-data-kit-20261111.1.tar",
+        "bytes": 725790720,
+        "sha256": "0bdae2c9c79f00e8773f39bf335725b9fb6b3f438dfa1c0b9b0d33cc0231a676",
+        "top_dir": "aisaac-data-kit-20261111.1",
+        "files": 1209,
+        "content_bytes": 724691557,
+        "contents": ["runtime/", "tools/", "payloads/b45-payloads2/", "checkpoints/c99-segment2-final.pt", "FILES.sha256"],
+        "file_list": "aisaac-data-kit-20261111.1.files.sha256",
+        "file_list_sha256": "832e1e395069ee701632a1fc762a131e1769dc4900f2348e2a18e0b3f2cd1160"
+      },
+      "stored_on": ["dgene-8x3090:<ROOT>/kit", "gpu57:/root/AIsaac/kit"]
+    }
+  }
+}
