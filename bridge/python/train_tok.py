@@ -2558,10 +2558,11 @@ def main(argv=None, child=None, actor=None):
     amp = args.amp == 'bf16'
     if amp and not torch.cuda.is_bf16_supported():
         raise SystemExit('--amp bf16: this GPU has no bfloat16 support')
+    AMP = [amp]   # (read at every call: the learner bench's 'f' paths run learn() in float32 within a bf16 run)
 
     def autocast():
         """The learner's forward passes (the losses are computed outside, in float32)."""
-        return torch.autocast('cuda', dtype=torch.bfloat16, enabled=amp)
+        return torch.autocast('cuda', dtype=torch.bfloat16, enabled=AMP[0])
     model = actor_params = None   # (B38 step 2: the learner process has no actor)
     if child is None:
         model = TokPolicy(args.width, args.layers, args.heads, items=items, charge=charge, choice=n_choice,
@@ -4962,7 +4963,7 @@ def main(argv=None, child=None, actor=None):
                     # 2026-10-10 (B18): the learner bench on this job (abplus_bench_learner.py), then the run ends
                     from abplus_bench_learner import run_bench
                     if run_bench(dict(learn=learn, job=job, model=learner_model, opt=opt, L=L, args=args,
-                                      stats=sampler.stats.copy(), extra=bench_extra)):
+                                      stats=sampler.stats.copy(), extra=bench_extra, amp=AMP)):
                         fresh.set()
                         continue
                 prof_dir_t = os.environ.get('ISAAC_RL_B38_TORCHPROF', '')
@@ -5463,7 +5464,7 @@ def main(argv=None, child=None, actor=None):
             from abplus_bench_learner import run_bench
             torch.cuda.set_stream(learner_stream)
             run_bench(dict(learn=learn, job=bench_job, model=learner_model, opt=opt, L=L, args=args,
-                           stats=sampler.stats.copy(), extra=bench_extra))
+                           stats=sampler.stats.copy(), extra=bench_extra, amp=AMP))
             torch.cuda.set_stream(actor_stream)
         # (B38 step 5: each actor process its share of the decisions and of every rollout)
         # (with several actors every one makes the same number of hand-offs: the learner pairs them all; one actor

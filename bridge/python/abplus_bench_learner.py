@@ -216,16 +216,21 @@ def run_bench(ctx):
     # a path: --learner-fast 0 / 1, optionally with a BM1 P2 suffix: 'o' P2 off (whole parts on the learner card),
     # 's' the parts' two halves one after the other on the learner card, 'p' the halves on two cards (--learner-devices)
     # (letters after the digit, any order: o / s / p the BM1 P2 mode as above; k: the learner's Spatial without its
-    #  gradient checkpoints, block_learner.SPATIAL_CKPT = 0, recomputation traded for memory)
+    #  gradient checkpoints, block_learner.SPATIAL_CKPT = 0, recomputation traded for memory; f: float32, the learner's
+    #  forward passes without the run's bf16 autocast)
     paths = [int(v) if v.isdigit() else v for v in os.environ.get('ISAAC_RL_LEARNER_PATHS', '0,1').split(',')]
     from isaac_bridge import block_learner as bl_
     ckpt0 = bl_.SPATIAL_CKPT
+    amp_ = ctx.get('amp')   # (train_tok's AMP: [True] in a --amp bf16 run)
+    amp0 = amp_[0] if amp_ is not None else None
 
     def set_path(fast):
         s_ = str(fast)
         args.learner_fast = int(''.join(ch for ch in s_ if ch.isdigit()))
         L['p2_mode'] = next((m_ for ch, m_ in (('o', 'off'), ('s', 'serial'), ('p', 'two')) if ch in s_), None)
         bl_.SPATIAL_CKPT = 0 if 'k' in s_ else ckpt0
+        if amp_ is not None:   # f: learn() without bf16 autocast (float32 forward passes) within a bf16 run
+            amp_[0] = False if 'f' in s_ else amp0
     L['bench'] = True
     params = list(opt.param_groups[0]['params'])
     by_id = {id(p): nm_ for nm_, p in model.named_parameters()}
@@ -375,6 +380,9 @@ def run_bench(ctx):
             except Exception as exc:   # (a measurement aid: the tables above are the result)
                 print('profile: no chrome trace', exc)
     _restore(start, model, opt, L)
+    bl_.SPATIAL_CKPT = ckpt0
+    if amp_ is not None:
+        amp_[0] = amp0
     L['bench'] = False
     L['stop'] = True
     return True
