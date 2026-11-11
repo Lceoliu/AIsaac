@@ -29,28 +29,31 @@ log() { echo "$(date '+%F %T') $*" >> $LOG; }
 #     the job script; the wait in seconds goes into bm1.log.
 #   take "<purpose>" is take_excl when the purpose says 计时运行 (a timed run), else take_shared. give releases what
 #   this script holds.
+# (every variable the lock functions set is named _lk_*: sh has no locals, and a caller's f, n, p, t0 ... must survive.
+#  2026-11-11: _stale_sweep's loop variable f overwrote take_shared's own file name, so shared holders wrote one common
+#  literal "S.*" file, and the first holder to finish released the others' claim)
 _mutex() {
   while ! mkdir "$BM1_LOCKDIR/.mutex" 2>/dev/null; do
-    a=$(( $(date +%s) - $(stat -c %Y "$BM1_LOCKDIR/.mutex" 2>/dev/null || date +%s) ))
-    [ "$a" -gt 60 ] && { rmdir "$BM1_LOCKDIR/.mutex" 2>/dev/null; log "lock: stale mutex ($a s) removed"; }
+    _lk_a=$(( $(date +%s) - $(stat -c %Y "$BM1_LOCKDIR/.mutex" 2>/dev/null || date +%s) ))
+    [ "$_lk_a" -gt 60 ] && { rmdir "$BM1_LOCKDIR/.mutex" 2>/dev/null; log "lock: stale mutex ($_lk_a s) removed"; }
     sleep 1
   done
 }
 _unmutex() { rmdir "$BM1_LOCKDIR/.mutex" 2>/dev/null; }
 _stale_sweep() {   # (under the mutex) lock files whose holder pid is gone
-  for f in "$BM1_LOCKDIR"/X "$BM1_LOCKDIR"/S.*; do
-    [ -f "$f" ] || continue
-    p=$(sed -n 's/^pid \([0-9]*\).*/\1/p' "$f")
-    if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
-      log "lock: stale $(basename "$f") removed (holder pid ${p:-?} gone): $(head -1 "$f")"
-      rm -f "$f"
+  for _lk_f in "$BM1_LOCKDIR"/X "$BM1_LOCKDIR"/S.*; do
+    [ -f "$_lk_f" ] || continue
+    _lk_p=$(sed -n 's/^pid \([0-9]*\).*/\1/p' "$_lk_f")
+    if [ -z "$_lk_p" ] || ! kill -0 "$_lk_p" 2>/dev/null; then
+      log "lock: stale $(basename "$_lk_f") removed (holder pid ${_lk_p:-?} gone): $(head -1 "$_lk_f")"
+      rm -f "$_lk_f"
     fi
   done
 }
 _live_shared() { ls "$BM1_LOCKDIR"/S.* 2>/dev/null | wc -l; }
 take_excl() {
   if [ -z "${BM1_LOCKDIR:-}" ]; then _take_file "$1"; return; fi
-  mkdir -p "$BM1_LOCKDIR"; t0=$(date +%s)
+  mkdir -p "$BM1_LOCKDIR"; _lk_t0=$(date +%s)
   while :; do   # 1: the writer's claim (no other writer)
     _mutex; _stale_sweep
     if [ ! -f "$BM1_LOCKDIR/X" ]; then
@@ -59,24 +62,24 @@ take_excl() {
     _unmutex; sleep ${BM1_LOCK_POLL:-30}
   done
   while :; do   # 2: the shared holders under way end (none starts meanwhile)
-    _mutex; _stale_sweep; n=$(_live_shared)
-    if [ "$n" = 0 ]; then printf '%s\npid %s\n' "$SESSION $(date '+%F %T') $1" "$$" > "$BM1_LOCKDIR/X"; _unmutex; break; fi
+    _mutex; _stale_sweep; _lk_n=$(_live_shared)
+    if [ "$_lk_n" = 0 ]; then printf '%s\npid %s\n' "$SESSION $(date '+%F %T') $1" "$$" > "$BM1_LOCKDIR/X"; _unmutex; break; fi
     _unmutex; sleep ${BM1_LOCK_POLL:-30}
   done
   LOCKFILE=$BM1_LOCKDIR/X; LOCKLINE=$(head -1 "$LOCKFILE")
-  log "lock: exclusive taken after $(( $(date +%s) - t0 )) s: $LOCKLINE"
+  log "lock: exclusive taken after $(( $(date +%s) - _lk_t0 )) s: $LOCKLINE"
 }
 take_shared() {
   if [ -z "${BM1_LOCKDIR:-}" ]; then _take_file "$1"; return; fi
-  mkdir -p "$BM1_LOCKDIR"; t0=$(date +%s)
-  f=$BM1_LOCKDIR/S.$SESSION.$$
+  mkdir -p "$BM1_LOCKDIR"; _lk_t0=$(date +%s)
+  _lk_sf=$BM1_LOCKDIR/S.$SESSION.$$
   while :; do
     _mutex; _stale_sweep
-    if [ ! -f "$BM1_LOCKDIR/X" ]; then printf '%s\npid %s\n' "$SESSION $(date '+%F %T') $1" "$$" > "$f"; _unmutex; break; fi
+    if [ ! -f "$BM1_LOCKDIR/X" ]; then printf '%s\npid %s\n' "$SESSION $(date '+%F %T') $1" "$$" > "$_lk_sf"; _unmutex; break; fi
     _unmutex; sleep ${BM1_LOCK_POLL:-30}
   done
-  LOCKFILE=$f; LOCKLINE=$(head -1 "$f")
-  log "lock: shared taken after $(( $(date +%s) - t0 )) s: $LOCKLINE"
+  LOCKFILE=$_lk_sf; LOCKLINE=$(head -1 "$_lk_sf")
+  log "lock: shared taken after $(( $(date +%s) - _lk_t0 )) s: $LOCKLINE"
 }
 _take_file() {
   while ! ( set -C; echo "$SESSION $(date '+%F %T') $1" > "$LOCK" ) 2>/dev/null; do sleep 30; done
