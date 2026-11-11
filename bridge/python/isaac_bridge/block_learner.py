@@ -153,9 +153,11 @@ class Prefetch:
         self.hits = self.misses = 0
 
     @staticmethod
-    def _key(chunks, kw, grad):
-        return (tuple(id(c) for c in chunks), tuple(sorted((k, v) for k, v in kw.items() if k != 'generator')),
-                id(kw.get('generator')), bool(grad))
+    def _key(chunks, kw, grad, split=None):
+        key = (tuple(id(c) for c in chunks), tuple(sorted((k, v) for k, v in kw.items() if k != 'generator')),
+               id(kw.get('generator')), bool(grad))
+        # (BM1 P2: a part split for two learner cards is another job than the whole part: its cut and models)
+        return key if split is None else key+(int(split[1]), tuple(id(m) for m in split[0]))
 
     def _worker(self):
         try:   # (B62: the OS thread name, so nsys / ps can tell this thread from the others)
@@ -167,13 +169,16 @@ class Prefetch:
             item = self.q.get()
             if item is None:
                 return
-            model, chunks, grad, full, box, ev = item
+            model, chunks, grad, full, box, ev, split = item
             del item
             with PREP_LOCK:
                 t0 = time.perf_counter()
                 c0 = time.thread_time()
                 try:
-                    box['P'] = _prepare_packed(model, chunks, grad, **full)
+                    if split is None:
+                        box['P'] = _prepare_packed(model, chunks, grad, **full)
+                    else:   # (BM1 P2: (P0, P1), the part's two halves)
+                        box['P'] = prepare_split(split[0], chunks, split[1], grad, **full)
                 except BaseException as e:   # (re-raised by the caller that takes it)
                     box['error'] = e
                 bp.ucount('learn_prefetch_host_s', time.perf_counter()-t0)
@@ -182,11 +187,12 @@ class Prefetch:
             # (B62) the worker's own references dropped now rather than at the next job. Not a SIDE_CUDA call: freeing
             # a pinned buffer (used in a copy or not) from another thread does not break a global-mode capture
             # (b62_capture_probe pin_free_used / pin_free_plain, 3090 + cu128, repeated)
-            del model, chunks, full, box, ev
+            del model, chunks, full, box, ev, split
 
-    def submit(self, model, chunks, grad=True, **kw):
+    def submit(self, model, chunks, grad=True, split=None, **kw):
         """Queue the preparation of a later forward_packed(model, chunks, **kw) call in grad mode `grad`; False when
-        not queued (prefetch off, no chunks, or DEPTH parts already queued)."""
+        not queued (prefetch off, no chunks, or DEPTH parts already queued). split: (models, cut) for a part split
+        over two learner cards (BM1 P2: forward_packed_split takes it)."""
         import threading
         if not PREFETCH_ON or not chunks or len(self.jobs) >= self.DEPTH:
             return False
@@ -198,18 +204,18 @@ class Prefetch:
             self.thread.start()
         box, ev = {}, threading.Event()
         chunks = list(chunks)
-        self.jobs.append((self._key(chunks, full, grad), box, ev))
-        self.q.put((model, chunks, bool(grad), full, box, ev))
+        self.jobs.append((self._key(chunks, full, grad, split), box, ev))
+        self.q.put((model, chunks, bool(grad), full, box, ev, split))
         bp.ucount('learn_prefetch_submitted', 1)
         return True
 
-    def take(self, chunks, kw, grad):
+    def take(self, chunks, kw, grad, split=None):
         """The prepared part for exactly these chunks / arguments (waited for), else None: another call (e.g. a
         no-grad forward between two PPO parts) leaves the queue for its own calls. Parts queued ahead of the one taken
         were skipped by the caller: they are given up (staging buffers freed)."""
         if not self.jobs:
             return None
-        want = self._key(chunks, kw, grad)
+        want = self._key(chunks, kw, grad, split)
         at = next((j for j, job in enumerate(self.jobs) if job[0] == want), None)
         if at is None:
             bp.ucount('learn_prefetch_other_calls', 1)
@@ -243,8 +249,9 @@ class Prefetch:
     @staticmethod
     def _free(box):
         P = box.get('P')
-        if P is not None and P['slab'].cuda:
-            STAGING.drop(P['slab'].k)
+        for P_ in (P if isinstance(P, tuple) else (P,)):   # (BM1 P2: a split part's two slabs)
+            if P_ is not None and P_['slab'].cuda:
+                STAGING.drop(P_['slab'].k)
 
     def drop(self):
         """Every queued part, unused, given up (their staging buffers freed)."""
@@ -697,13 +704,105 @@ def forward_packed(model, chunks, generator=None, train_history=True, version=0,
     return _run_packed(model, P)
 
 
+def _draw_history(chunks, cfg, grad, generator, train_history, history_mode):
+    """The chunks' page parts and their historical blocks drawn (forward_bucketed's order: length groups by first
+    appearance), as _prepare_packed always drew them (moved here unchanged: BM1 P2 draws a whole part once, then
+    prepares its two halves from the draw). Returns (parts, selected)."""
+    store = chunks[0].snapshot.store
+    B = len(chunks)
+    lens = np.array([len(c.rows) for c in chunks], np.int64)
+    parts = []
+    for chunk in chunks:
+        snap = chunk.snapshot
+        if snap.store is not store:
+            raise ValueError('a paged learner batch must use one page store')
+        if chunk.rows['first'][0]:
+            parts.append(dict(step=0, kv_steps=np.empty(0, np.int64), kvs=np.empty(0, np.int64),
+                              pdec=np.empty(0, np.int64), pkvs=np.empty(0, np.int64),
+                              bid=np.empty(0, np.int64), ends=np.empty(0, np.int64)))
+        else:
+            parts.append(store.snapshot_parts(snap))
+    # ---- historical selection: forward_bucketed's order (length groups by first appearance)
+    seen = {}
+    for n in lens.tolist():
+        seen.setdefault(n, len(seen))
+    selected = [np.empty(0, np.int64)]*B
+    if train_history and history_mode == 'random' and cfg.history_recompute_blocks:
+        for i in sorted(range(B), key=lambda i: (seen[int(lens[i])], i)):
+            p = parts[i]
+            eligible = np.flatnonzero(p['ends'] <= p['step']-cfg.window)
+            if not len(eligible):
+                continue
+            pick = torch.randperm(len(eligible), generator=generator)[:cfg.history_recompute_blocks].numpy()
+            selected[i] = eligible[pick]
+            if grad:
+                hist_add(age=((p['step']-p['ends'][eligible[pick]])//cfg.block_steps).tolist())
+    return parts, selected
+
+
+def hist_add(**kw):
+    """bp.HIST's counters and lists (B43 diagnostics) added to under the counters' lock: BM1 P2's second learner card
+    runs _run_packed on a thread of its own beside the learner thread."""
+    with bp._UPD_LOCK:
+        for k, v in kw.items():
+            bp.HIST[k] += v
+
+
+def prepare_split(models, chunks, cut, grad, **kw):
+    """BM1 P2: a part's two halves prepared for two learner cards: chunks[:cut] for models[0] (its slab uploaded to
+    that model's device), chunks[cut:] for models[1]. The history is drawn once for the whole part (_draw_history, the
+    order and the generator draws of the unsplit part), then each half prepared from its share of the draw: the same
+    blocks as when the part runs whole on one card. Returns (P0, P1)."""
+    cfg = models[0].block_memory.config
+    hist_kw = {k: kw[k] for k in ('generator', 'train_history', 'history_mode') if k in kw}
+    if kw.get('history_mode', 'random') not in bp.HISTORY_MODES:
+        raise ValueError(f"history_mode {kw['history_mode']!r}: one of {bp.HISTORY_MODES}")
+    parts, selected = _draw_history(chunks, cfg, grad, hist_kw.get('generator'), hist_kw.get('train_history', True),
+                                    hist_kw.get('history_mode', 'random'))
+    if grad:   # (the historical blocks both halves re-encode: the one computation the halves duplicate)
+        def bids(lo, hi):
+            return {int(parts[i]['bid'][k]) for i in range(lo, hi) for k in selected[i]}
+        bp.ucount('p2_dup_blocks', len(bids(0, cut) & bids(cut, len(chunks))))
+        bp.ucount('p2_hist_blocks', len(bids(0, len(chunks))))
+    return (_prepare_packed(models[0], chunks[:cut], grad, pre=(parts[:cut], selected[:cut]), **kw),
+            _prepare_packed(models[1], chunks[cut:], grad, pre=(parts[cut:], selected[cut:]), **kw))
+
+
+def forward_packed_split(models, chunks, cut, generator=None, train_history=True, version=0, spatial_micro=None,
+                         require_next_state=False, deduplicate_sources=True, history_mode='random', max_rows=None):
+    """BM1 P2: forward_packed's host part for a part split in two (prepare_split): the PREFETCH job made ahead for
+    exactly this part and cut when there is one, else prepared here. Returns (P0, P1); the caller runs each on its
+    card (run_prepared)."""
+    grad = torch.is_grad_enabled()
+    kw = dict(generator=generator, train_history=train_history, version=version, spatial_micro=spatial_micro,
+              require_next_state=require_next_state, deduplicate_sources=deduplicate_sources,
+              history_mode=history_mode, max_rows=max_rows)
+    SEG.sub(('b38:part_forward',), 'ppo.pack')
+    t0 = time.perf_counter()
+    P = PREFETCH.take(chunks, kw, grad, split=(models, cut))
+    if P is None:
+        with PREP_LOCK:
+            P = prepare_split(models, chunks, cut, grad, **kw)
+    wait = time.perf_counter()-t0
+    bp.ucount('learn_pack_crit_s', wait)
+    bp.ucount('learn_pack_crit_grad_s' if grad else 'learn_pack_crit_nograd_s', wait)
+    SEG.sub(('ppo.pack',), 'ppo.dispatch')
+    return P
+
+
+def run_prepared(model, P):
+    """BM1 P2: forward_packed's device part on a prepared part (one half of prepare_split) on its card's thread."""
+    return _run_packed(model, P)
+
+
 def _prepare_packed(model, chunks, grad, generator=None, train_history=True, version=0, spatial_micro=None,
                     require_next_state=False, deduplicate_sources=True, history_mode='random', max_rows=None,
-                    packed=None):
+                    packed=None, pre=None):
     """B48: forward_packed's host part (history draw, decodes, plans, index arrays, the filled staging
     slab); touches no parameter and no CUDA stream (runs on the prefetch thread). grad: the run's
     autograd mode (thread-local, so passed in). packed: the host decode layout (None: packed on CUDA devices, as
-    always; B60 tests pass True on the CPU to compare the C packing with the reference)."""
+    always; B60 tests pass True on the CPU to compare the C packing with the reference). pre: (parts, selected) of
+    these chunks already drawn (BM1 P2, prepare_split); None: drawn here (_draw_history), as always."""
     from .structured_input import packed_rows_plan, t_bucket
     if history_mode not in bp.HISTORY_MODES:
         raise ValueError(f'history_mode {history_mode!r}: one of {bp.HISTORY_MODES}')
@@ -721,33 +820,11 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
     lens = np.array([len(c.rows) for c in chunks], np.int64)
     bp.ucount('learn_packed_calls', 1)
     bp.count('learn.calls', 1); bp.count('learn.chunks', B); bp.count('learn.rows', int(lens.sum()))
-    parts = []
-    for chunk in chunks:
-        snap = chunk.snapshot
-        if snap.store is not store:
-            raise ValueError('a paged learner batch must use one page store')
-        if chunk.rows['first'][0]:
-            parts.append(dict(step=0, kv_steps=np.empty(0, np.int64), kvs=np.empty(0, np.int64),
-                              pdec=np.empty(0, np.int64), pkvs=np.empty(0, np.int64),
-                              bid=np.empty(0, np.int64), ends=np.empty(0, np.int64)))
-        else:
-            parts.append(store.snapshot_parts(snap))
+    if pre is None:
+        parts, selected = _draw_history(chunks, cfg, grad, generator, train_history, history_mode)
+    else:   # (BM1 P2: a half of a part whose history was drawn for the whole part: prepare_split)
+        parts, selected = pre
     steps = np.array([p['step'] for p in parts], np.int64)
-    # ---- historical selection: forward_bucketed's order (length groups by first appearance)
-    seen = {}
-    for n in lens.tolist():
-        seen.setdefault(n, len(seen))
-    selected = [np.empty(0, np.int64)]*B
-    if train_history and history_mode == 'random' and cfg.history_recompute_blocks:
-        for i in sorted(range(B), key=lambda i: (seen[int(lens[i])], i)):
-            p = parts[i]
-            eligible = np.flatnonzero(p['ends'] <= p['step']-cfg.window)
-            if not len(eligible):
-                continue
-            pick = torch.randperm(len(eligible), generator=generator)[:cfg.history_recompute_blocks].numpy()
-            selected[i] = eligible[pick]
-            if grad:
-                bp.HIST['age'] += ((p['step']-p['ends'][eligible[pick]])//bs).tolist()
     unique = {}
     for p, sel in zip(parts, selected):
         for k in sel:
@@ -995,7 +1072,7 @@ def _run_packed(model, P):
     stats = dict(selected_blocks=int(sum(map(len, selected))), unique_objects=len(unique),
                  encoded_blocks=len(unique), historical_rows=int(n_hist), tail_rows=int(n_tail))
     if grad and len(ub):
-        bp.HIST['rows'] += n_hist; bp.HIST['blocks'] += len(ub)
+        hist_add(rows=n_hist, blocks=len(ub))   # (BM1 P2: under the counters' lock, two learner threads)
     bp.count('learn.hist_rows', n_hist); bp.count('learn.tail_rows', n_tail)
     replay = []
 

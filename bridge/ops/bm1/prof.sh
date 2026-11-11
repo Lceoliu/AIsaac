@@ -19,12 +19,18 @@ if [ "${NOLOCK:-0}" = 1 ]; then LOCKLINE="(held by the caller: ${LOCKS_HELD:-?})
 echo "$(date '+%F %T') $TAG start: tree $TREE capture mode $(capmode $TREE) GPU $GPU updates $UPDATES hours $HOURS lock: $LOCKLINE" >> $LOG
 host_snapshot "$TAG start"
 # (a timed run's own CPUs / memory nodes when bm1.env sets them: gpu57's timed runs use every thread)
-[ -n "${BM1_TIMED_CPUSET+x}" ] && export CPUSET="$BM1_TIMED_CPUSET" MEMS="${BM1_TIMED_MEMS:-}"
+# (LANE_CPUS=1: the caller's CPUSET / MEMS kept as given, shard2.sh's lanes; empty: no pinning)
+[ -n "${BM1_TIMED_CPUSET+x}" ] && [ "${LANE_CPUS:-0}" != 1 ] && export CPUSET="$BM1_TIMED_CPUSET" MEMS="${BM1_TIMED_MEMS:-}"
+SUMM_CPUS=${CPUSET:-${BM1_TIMED_CPUSET:-$BM1_CPUSET}}
 torch_line=$(grep -h -m1 '' $BM/.torch_build 2>/dev/null)
 log "$TAG software: driver $(nvidia-smi --query-gpu=driver_version --format=csv,noheader -i ${GPU%%,*} 2>/dev/null) ${torch_line:-torch build: see the run's stdout}"
 # CPU frequency (read-only /proc/cpuinfo, every 5 s): every CPU's MHz on one line
 ( while :; do echo "$(date +%s) $(awk '/^cpu MHz/ {printf "%d ", $4}' /proc/cpuinfo)"; sleep 5; done ) > $R/$TAG.cpufreq &
 S7=$!
+# (each CPU's current frequency every second, kHz, from cpufreq's scaling_cur_freq in CPU order; read only)
+FQ=$(n=0; while [ -r /sys/devices/system/cpu/cpu$n/cpufreq/scaling_cur_freq ]; do echo /sys/devices/system/cpu/cpu$n/cpufreq/scaling_cur_freq; n=$((n+1)); done)
+( [ -n "$FQ" ] && while :; do echo "$(date +%s.%N | cut -c1-14) $(awk '{printf "%d ", $1}' $FQ)"; sleep 1; done ) > $R/$TAG.freq1 &
+S8=$!
 nvidia-smi -i $GPU --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,clocks.sm,index --format=csv,noheader -l 1 > $R/$TAG.gpu &
 S1=$!
 nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader -l 5 > $R/$TAG.allgpu &
@@ -38,7 +44,14 @@ M=" --out $BM1_IN/reports/$TAG"
 python3 $BM/m0_mem.py $R/$TAG.mem.csv 5 "$M" $R/$TAG.threads.csv > $R/$TAG.mem.log 2>&1 &
 S4=$!
 S5=
-DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 -e ISAAC_BLOCK_TIMELINE=$BM1_IN/reports/$TAG.timeline.csv ${ENVS:-}" $BM/run.sh prof-$TAG $GPU sh $BM1_IN/xnew2.sh $TAG $LIMIT $HOURS &
+# (the host's learner cores, bm1.env BM1_LEARNER_CPUS: added unless the run names its own ISAAC_LEARNER_CPUS, runs as a
+#  shard2 lane, or says LEARNER_PIN=0)
+LP=""
+if [ -n "${BM1_LEARNER_CPUS:-}" ] && [ "${LANE_CPUS:-0}" != 1 ] && [ "${LEARNER_PIN:-1}" != 0 ]; then
+  case "${ENVS:-}" in *ISAAC_LEARNER_CPUS=*) ;; *) LP="-e ISAAC_LEARNER_CPUS=$BM1_LEARNER_CPUS" ;; esac
+fi
+log "$TAG learner CPUs: $(echo "${ENVS:-} $LP" | grep -o 'ISAAC_LEARNER_CPUS=[^ ]*' | head -1 || true) ${LP:+(bm1.env BM1_LEARNER_CPUS)}"
+DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 -e ISAAC_BLOCK_TIMELINE=$BM1_IN/reports/$TAG.timeline.csv ${ENVS:-} $LP" $BM/run.sh prof-$TAG $GPU sh $BM1_IN/xnew2.sh $TAG $LIMIT $HOURS &
 DP=$!
 # progress.csv row times (1 s): each update's end on the host clock, to place the 1 s GPU / CPU samples in each cycle
 ( k=0; while kill -0 $DP 2>/dev/null; do
@@ -59,9 +72,9 @@ while kill -0 $DP 2>/dev/null; do
 done
 wait $DP
 rc=$?
-kill $S1 $S2 $S3 $S4 $S5 $S6 $S7 2>/dev/null
+kill $S1 $S2 $S3 $S4 $S5 $S6 $S7 $S8 2>/dev/null
 host_snapshot "$TAG end"
 [ -d $R/$TAG/checkpoints ] && trash $R/$TAG/checkpoints
 echo "$(date '+%F %T') $TAG done rc=$rc rows $(($(wc -l < $R/$TAG/progress.csv 2>/dev/null || echo 1)-1)); $(grep -h -m1 "BM1 graph capture mode" $R/$TAG.stdout 2>/dev/null)" >> $LOG
-python3 $BM/summ.py $R $TAG "${BM1_TIMED_CPUSET:-$BM1_CPUSET}" $GPU > $R/$TAG.summary.txt 2>&1   # (still inside the lock)
+python3 $BM/summ.py $R $TAG "$SUMM_CPUS" $GPU > $R/$TAG.summary.txt 2>&1   # (still inside the lock)
 [ "${NOLOCK:-0}" = 1 ] || give

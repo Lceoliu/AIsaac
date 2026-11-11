@@ -175,6 +175,17 @@ class PrivBatch:
     def __len__(self):
         return self.n
 
+    def to(self, device):
+        """(BM1 P2) this batch's copy on another device (the same records; the host ids shared)."""
+        import copy
+        import torch
+        o = copy.copy(self)
+        o.device = torch.device(device)
+        o.maps, o.ids, o.fl, o.items = (t.to(device, non_blocking=True) for t in (self.maps, self.ids, self.fl,
+                                                                                   self.items))
+        o.hp, o.scal, o.missing = o.fl[:, :NPC_K], o.fl[:, NPC_K:NPC_K + PRIV_S], o.fl[:, -1]
+        return o
+
     def plan(self, idx_h):
         """(idx, u, inv) on the device for the records idx_h (host array, a part's rows): u, the distinct maps, padded with
         copies to a multiple of CNN_BUCKET (cuDNN reuses its plans, as TokPolicy._cnn), and inv: each record's in u. From the

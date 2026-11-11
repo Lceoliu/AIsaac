@@ -13,6 +13,19 @@ import os
 import statistics as st
 import sys
 
+# x86-64 syscall numbers the ledger names (/proc/<pid>/task/<tid>/syscall: the call a task sits in)
+SYSCALL = {'0': 'read', '1': 'write', '7': 'poll', '9': 'mmap', '11': 'munmap', '16': 'ioctl', '23': 'select',
+           '24': 'sched_yield', '35': 'nanosleep', '44': 'sendto', '45': 'recvfrom', '46': 'sendmsg', '47': 'recvmsg',
+           '56': 'clone', '57': 'fork', '59': 'execve', '61': 'wait4', '202': 'futex', '230': 'clock_nanosleep',
+           '232': 'epoll_wait', '270': 'pselect6', '271': 'ppoll', '281': 'epoll_pwait', '435': 'clone3',
+           'running': 'running', '': 'unreadable'}
+WAIT_COLS = (('actor waits learner', 'wait_learner_s'), ('driver GPU sync', 'drv_sync_s'),
+             ('driver polls workers', 'drv_poll_s'), ('driver loop', 'drv_loop_s'), ('workers wait (sum over workers)', 'w_wait'),
+             ('worker idle share', 'idle_share'), ('learner waits packing', 'b42_learn_pack_crit_s'),
+             ('learner waits prefetch', 'b42_learn_prefetch_wait_s'),
+             ('learner waits admission', 'b42_learn_admission_wait_s'), ('cf wait (sum over lanes)', 'cf_wait_s'),
+             ('v2 wait', 'v2_wait_s'), ('p2 join wait', 'p2_join_wait_s'))
+
 
 def f(r, c):
     try:
@@ -61,6 +74,10 @@ def main():
                    f'  | wall to u15 {w:.0f} s, done/s {f(r, "cf_done")/w:.3f}, lane calls/s '
                    f'{f(r, "cf_lane_calls")/w:.0f}, done per game hour {f(r, "cf_done")/gh:.2f}')
     win = sum(f(x, 'wall_s') for x in rows[1:] if f(x, 'wall_s') == f(x, 'wall_s'))
+    # (the ledger: where each cycle waits, medians u10+ of progress.csv's wait columns present in this run, s per update)
+    wl = [(lab, med(s, c)) for lab, c in WAIT_COLS if c in rows[0]]
+    if wl:
+        out.append('  waits per update (u10+ medians): ' + ', '.join(f'{lab} {v:.2f}' for lab, v in wl if v == v))
 
     def window(path, tcol):   # rows of a sampler csv inside the last `win` seconds
         if not os.path.exists(path):
@@ -84,6 +101,39 @@ def main():
         out.append('  cores used (steady, medians of 5 s samples): ' + ', '.join(
             f'{k} {med(m, k+"_cores"):.2f}' for k in kinds)
             + f', container {(f(m[-1], "cg_cpu_usec")-f(m[0], "cg_cpu_usec"))/1e6/dt:.2f}')
+        if 'cg_sys_ticks' in m[0]:   # (the ledger: the container's cores split, and who they belong to)
+            cg_all = (f(m[-1], "cg_cpu_usec")-f(m[0], "cg_cpu_usec"))/1e6/dt
+            cg_u = (f(m[-1], 'cg_user_ticks')-f(m[0], 'cg_user_ticks'))/100/dt
+            cg_s = (f(m[-1], 'cg_sys_ticks')-f(m[0], 'cg_sys_ticks'))/100/dt
+            mean = (lambda c: st.mean([f(x, c) for x in m[1:] if f(x, c) == f(x, c)] or [float('nan')]))
+            seen = sum(mean(k+'_cores') for k in kinds)
+            reaped = sum(mean(k+'_child_cores') for k in kinds)
+            out.append(f'  container cores (means): {cg_all:.2f} = user {cg_u:.2f} + sys {cg_s:.2f}; sampled live '
+                       f'processes {seen:.2f} (' + ', '.join(f'{k} {mean(k+"_cores"):.2f} sys {mean(k+"_sys_cores"):.2f}'
+                                                            for k in kinds)
+                       + f'); reaped children (cutime + cstime of their parents) {reaped:.2f} ('
+                       + ', '.join(f'{k} {mean(k+"_child_cores"):.2f}' for k in kinds)
+                       + f'; reaped children are booked when they exit, a lump that overlaps the samples); not in a '
+                       f'live sample {cg_all-seen:.2f}; nice (most common over the window) ' + ', '.join(
+                           f'{k} {max(set(nv), key=nv.count) if nv else "-"}' for k in kinds
+                           for nv in [[x.get(k+"_nice") for x in m if x.get(k+"_nice")]]))
+        if 'game_sched_wait' in m[0]:   # (the ledger: per kind, on a CPU and runnable-but-waiting, s per s, means)
+            out.append('  schedstat by kind (run / waiting for a CPU, s per s): ' + ', '.join(
+                f'{k} {mean(k+"_sched_run"):.2f}/{mean(k+"_sched_wait"):.2f}' for k in kinds))
+        sc_path = f'{R}/{tag}.sysc.csv'
+        if os.path.exists(sc_path):   # (the ledger: where the tasks sit, share of samples per kind)
+            t0_ = f(m[0], 't')
+            agg = {}
+            for x in csv.DictReader(open(sc_path)):
+                if f(x, 't') >= t0_:
+                    k_ = x['kind'] if not x['kind'].startswith('trainer:') else 'trainer'
+                    d_ = agg.setdefault(k_, {})
+                    nm_ = SYSCALL.get(x['syscall'], 'sys'+x['syscall'])
+                    d_[nm_] = d_.get(nm_, 0)+f(x, 'tasks')
+            for k_, d_ in sorted(agg.items()):
+                tot_ = sum(d_.values())
+                out.append(f'  {k_} tasks by syscall (share of samples): ' + ', '.join(
+                    f'{nm_} {100*v_/tot_:.0f}%' for nm_, v_ in sorted(d_.items(), key=lambda kv: -kv[1])[:7]))
     th = window(f'{R}/{tag}.threads.csv', 't')
     if th:
         first, last = {}, {}
@@ -101,6 +151,23 @@ def main():
                 per[name] = per.get(name, 0)+(k1-k0)/100/(t1-t0)
         top = sorted(per.items(), key=lambda kv: -kv[1])[:12]
         out.append('  trainer threads (cores, steady): ' + ', '.join(f'{n} {c:.2f}' for n, c in top))
+        if th[0].get('wait_ns'):   # (m0_mem with schedstat: on-CPU and runnable-but-waiting seconds per second)
+            s0, s1 = {}, {}
+            for x in th:
+                if x['kind'] == 'thread' and x.get('wait_ns'):
+                    s0.setdefault(x['name'], (f(x, 't'), f(x, 'run_ns'), f(x, 'wait_ns')))
+                    s1[x['name']] = (f(x, 't'), f(x, 'run_ns'), f(x, 'wait_ns'))
+            sch = {}
+            for key, (t1, r1, w1) in s1.items():
+                t0, r0, w0 = s0[key]
+                if t1 > t0:
+                    nm = key.rsplit(':', 1)[0]
+                    a_ = sch.setdefault(nm, [0.0, 0.0])
+                    a_[0] += (r1-r0)/1e9/(t1-t0)
+                    a_[1] += (w1-w0)/1e9/(t1-t0)
+            topw = sorted(sch.items(), key=lambda kv: -(kv[1][0]+kv[1][1]))[:12]
+            out.append('  trainer threads schedstat (run / waiting for a CPU, s per s): ' + ', '.join(
+                f'{n} {r:.2f}/{w:.2f}' for n, (r, w) in topw))
     # this run's GPU(s): 1 s samples; the index is the last column (older files without it: one GPU, `gpu`)
     import datetime as dt_
     g = {}
@@ -145,6 +212,9 @@ def main():
         out.append('  all GPUs util median (steady): ' + ', '.join(f'{i}:{st.median(v):.0f}%' for i, v in sorted(other.items())))
     if os.path.exists(f'{R}/{tag}.mpstat'):
         busy = {}
+        cat = {}   # (the ledger: per CPU, per mpstat category: usr, nice, sys, iowait, irq + soft, steal, idle)
+        cats = (('usr', ('%usr',)), ('nice', ('%nice',)), ('sys', ('%sys',)), ('iowait', ('%iowait',)),
+                ('irq', ('%irq', '%soft')), ('steal', ('%steal',)), ('idle', ('%idle',)))
         lines = open(f'{R}/{tag}.mpstat').read().splitlines()
         hdr = None
         for line in lines:
@@ -154,12 +224,35 @@ def main():
                 continue
             if hdr and len(w_) == len(hdr) and w_[hdr.index('CPU')].isdigit():
                 busy.setdefault(int(w_[hdr.index('CPU')]), []).append(100-float(w_[hdr.index('%idle')]))
+                for nm_, cols_ in cats:
+                    cat.setdefault(int(w_[hdr.index('CPU')]), {}).setdefault(nm_, []).append(
+                        sum(float(w_[hdr.index(c_)]) for c_ in cols_ if c_ in hdr))
         n_keep = max(1, int(win/5))
         lb = [st.mean(v[-n_keep:]) for c, v in busy.items() if c in lane]
         ob = [st.mean(v[-n_keep:]) for c, v in busy.items() if c not in lane]
         if lb:
             out.append(f'  mpstat (steady): this lane {len(lb)} CPUs mean busy {st.mean(lb):.0f}% (sum {sum(lb)/100:.1f} cores); '
                        f'other CPUs {len(ob)} mean busy {st.mean(ob) if ob else 0:.0f}% (sum {sum(ob)/100:.1f} cores)')
+        for lab_, sel_ in (('this lane', [c for c in cat if c in lane]), ('whole host', list(cat))):
+            if sel_:
+                out.append(f'  mpstat cores by category (steady, {lab_}, {len(sel_)} CPUs): ' + ', '.join(
+                    f'{nm_} {sum(st.mean(cat[c][nm_][-n_keep:]) for c in sel_)/100:.1f}' for nm_, _ in cats))
+    if os.path.exists(f'{R}/{tag}.freq1') and ends:   # (the ledger: CPU frequency by cycle phase, 1 s samples)
+        fq = [list(map(float, x.split())) for x in open(f'{R}/{tag}.freq1').read().splitlines() if len(x.split()) > 1]
+        sets = [('lane', sorted(lane))]
+        if os.environ.get('FREQ_CPUS'):   # (e.g. the learner's pinned CPUs)
+            sets.append((os.environ['FREQ_CPUS'], sorted(cpus(os.environ['FREQ_CPUS']))))
+        for lab_, cs_ in sets:
+            ph = {'both': [], 'learner only': [], 'actor only': []}
+            for kk in range(9, min(len(rows), len(ends))):
+                e, up, wl = ends[kk], f(rows[kk], 'update_s'), f(rows[kk], 'wait_learner_s')
+                wl = wl if wl == wl else 0.0
+                for x in fq:
+                    if ends[kk-1] < x[0] <= e and cs_:
+                        v_ = st.mean(x[1+c] for c in cs_ if 1+c < len(x))/1000
+                        ph['learner only' if x[0] > e-wl else 'both' if x[0] >= e-up else 'actor only'].append(v_)
+            out.append(f'  CPU MHz by cycle phase (u10+, 1 s samples, mean over {lab_}): ' + ', '.join(
+                f'{kk} {st.median(v):.0f} (n {len(v)})' for kk, v in ph.items() if v))
     if os.path.exists(f'{R}/{tag}.cpufreq'):   # (CPU MHz, every CPU, 5 s, from /proc/cpuinfo)
         fl = [x.split() for x in open(f'{R}/{tag}.cpufreq').read().splitlines()]
         fl = [list(map(float, x)) for x in fl if len(x) > 1]

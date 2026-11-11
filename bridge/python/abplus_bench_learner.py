@@ -131,9 +131,17 @@ def restore_learner(saved, model, opt, L):
         L['teach_raw'][:raw.shape[0]] = raw.to(dev)
 
 
-def _snapshot(model, opt, L):
+def _snapshot(model, opt, L, extra=()):
+    """extra: (name, object) of the other learner state an update changes (BM1: the privileged critic, the aux head,
+    their optimisers: state_dict(); the aux targets' normalisation: its attributes)."""
     import torch
+
+    def grab(o):
+        if hasattr(o, 'state_dict'):
+            return copy.deepcopy(o.state_dict())
+        return copy.deepcopy(vars(o))
     return dict(model={k: v.detach().clone() for k, v in model.state_dict().items()},
+                extra=[(nm, o, grab(o)) for nm, o in extra if o is not None],
                 opt=copy.deepcopy(opt.state_dict()),
                 L={k: (v.copy() if isinstance(v, np.ndarray) else v.clone() if torch.is_tensor(v) else v)
                    for k, v in L.items() if k not in ('writer', 'stage')},   # (stage: the pinned buffer, kept)
@@ -144,6 +152,11 @@ def _restore(s, model, opt, L):
     import torch
     model.load_state_dict(s['model'])
     opt.load_state_dict(copy.deepcopy(s['opt']))
+    for _, o, st_ in s.get('extra', ()):
+        if hasattr(o, 'load_state_dict'):
+            o.load_state_dict(copy.deepcopy(st_))
+        else:
+            vars(o).update(copy.deepcopy(st_))
     for k, v in s['L'].items():
         L[k] = v.copy() if isinstance(v, np.ndarray) else v.clone() if torch.is_tensor(v) else v
     np.random.set_state(s['np_rng'])
@@ -200,12 +213,24 @@ def run_bench(ctx):
         return True
     check = os.environ.get('ISAAC_RL_LEARNER_CHECK', '0') == '1'
     profile = os.environ.get('ISAAC_RL_LEARNER_PROFILE', '0') == '1'
-    paths = [int(v) for v in os.environ.get('ISAAC_RL_LEARNER_PATHS', '0,1').split(',')]
+    # a path: --learner-fast 0 / 1, optionally with a BM1 P2 suffix: 'o' P2 off (whole parts on the learner card),
+    # 's' the parts' two halves one after the other on the learner card, 'p' the halves on two cards (--learner-devices)
+    # (letters after the digit, any order: o / s / p the BM1 P2 mode as above; k: the learner's Spatial without its
+    #  gradient checkpoints, block_learner.SPATIAL_CKPT = 0, recomputation traded for memory)
+    paths = [int(v) if v.isdigit() else v for v in os.environ.get('ISAAC_RL_LEARNER_PATHS', '0,1').split(',')]
+    from isaac_bridge import block_learner as bl_
+    ckpt0 = bl_.SPATIAL_CKPT
+
+    def set_path(fast):
+        s_ = str(fast)
+        args.learner_fast = int(''.join(ch for ch in s_ if ch.isdigit()))
+        L['p2_mode'] = next((m_ for ch, m_ in (('o', 'off'), ('s', 'serial'), ('p', 'two')) if ch in s_), None)
+        bl_.SPATIAL_CKPT = 0 if 'k' in s_ else ckpt0
     L['bench'] = True
     params = list(opt.param_groups[0]['params'])
     by_id = {id(p): nm_ for nm_, p in model.named_parameters()}
     names = [by_id.get(id(p), '?') for p in params]
-    start = _snapshot(model, opt, L)
+    start = _snapshot(model, opt, L, ctx.get('extra', ()))   # (BM1: priv / aux state restored too)
     print(f'bench: {int(job["roll"].length.sum())} records in the job, --rollout {args.rollout} --minibatch '
           f'{args.minibatch} --micro '
           f'{args.micro} --epochs {args.epochs} --packed {args.packed} --amp {args.amp} --tf32 {args.tf32} '
@@ -214,17 +239,20 @@ def run_bench(ctx):
 
     def one(fast, trace=False):
         _restore(start, model, opt, L)
-        args.learner_fast = fast
+        set_path(fast)
         L['trace'] = [] if trace else None
         torch.cuda.synchronize()
+        dev_ = next(model.parameters()).device
+        torch.cuda.reset_peak_memory_stats(dev_)
         t = time.perf_counter()
         learn(job)
         torch.cuda.synchronize()
         dt = time.perf_counter() - t
+        peak_ = (torch.cuda.max_memory_allocated(dev_) / 2 ** 30, torch.cuda.max_memory_reserved(dev_) / 2 ** 30)
         tr = L['trace']
         L['trace'] = None
         return dict(s=dt, update_s=L['last_update_s'], steps=L['last_steps'], count=L['last_count'],
-                    U=dict(L['last_U']), trace=tr,
+                    U=dict(L['last_U']), trace=tr, peak=peak_,
                     weights=[p.detach().clone() for p in params] if trace else None)
 
     for fast in paths:   # warm-up (first-call costs: cuDNN plans, allocator, compilation)
@@ -232,40 +260,43 @@ def run_bench(ctx):
             one(fast)
     if check:
         tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
-        for label, setting in (('this run (tf32 %s)' % bool(tf32[0]), tf32), ('strict float32', (False, False))):
+        settings = (('this run (tf32 %s)' % bool(tf32[0]), tf32), ('strict float32', (False, False)))
+        for label, setting in settings[:1 if os.environ.get('ISAAC_RL_LEARNER_CHECK_STRICT', '1') == '0' else 2]:
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = setting
-            ref, new = one(paths[0], trace=True), one(paths[-1], trace=True)
-            ref2 = one(paths[0], trace=True)   # the old path against itself (run-to-run floor of the GPU kernels)
-            new2 = one(paths[-1], trace=True)  # and the new one (its gathers' gradients are atomic sums)
-            for name, other, base in (('new vs old', new, ref), ('old vs old', ref2, ref),
-                                      ('new vs new', new2, new)):
-                n_ = min(len(base['trace']), len(other['trace']))
-                acc_r = torch.stack([torch.cat([a, t]) for a, t, _ in base['trace'][:n_]])
-                acc_o = torch.stack([torch.cat([a, t]) for a, t, _ in other['trace'][:n_]])
-                step_r = torch.diff(acc_r, dim=0, prepend=torch.zeros_like(acc_r[:1]))
-                step_o = torch.diff(acc_o, dim=0, prepend=torch.zeros_like(acc_o[:1]))
-                g_r, g_o = base['trace'][0][2], other['trace'][0][2]
-                gd = [(_diff(a, b)) for a, b in zip(g_r, g_o) if a is not None and b is not None]
-                flat_r = torch.cat([a.reshape(-1) for a in g_r if a is not None])
-                flat_o = torch.cat([b.reshape(-1) for b in g_o if b is not None])
-                cos = float(torch.nn.functional.cosine_similarity(flat_r.double(), flat_o.double(), 0))
-                wd = [_diff(a, b) for a, b in zip(base['weights'], other['weights'])]
-                first = _diff(step_r[0], step_o[0])
-                print(f'check [{label}] {name}: steps {len(base["trace"])}/{len(other["trace"])}; first step losses '
-                      f'max abs {first[0]:.3e}; all steps losses max abs {float((step_r - step_o).abs().max()):.3e} '
-                      f'(columns pg vf ent kl clip teach danger safe: '
-                      f'{" ".join("%.1e" % v for v in (step_r - step_o).abs().max(0).values.tolist())}); '
-                      f'first gradient max abs {max(d for d, _ in gd):.3e}, max rel per tensor '
-                      f'{max(r for _, r in gd):.3e}, norm rel {float((flat_r - flat_o).norm() / flat_r.norm()):.3e}, '
-                      f'cosine {cos:.9f}; weights after the update max abs {max(d for d, _ in wd):.3e}',
-                      flush=True)
-                worst = sorted(((float((a - b).norm() / a.norm().clamp(min=1e-30)), nm_, float(a.norm()))
-                                for nm_, a, b in zip(names, g_r, g_o) if a is not None and b is not None),
-                               reverse=True)[:4]
-                print(f'check [{label}] {name}: first gradient, tensors with the largest relative difference (rel '
-                      f'norm, name, gradient norm): {" | ".join("%.2e %s %.2e" % w_ for w_ in worst)}', flush=True)
-                print(f'check [{label}] {name}: first step losses old {step_r[0].tolist()}', flush=True)
-                print(f'check [{label}] {name}: first step losses new {step_o[0].tolist()}', flush=True)
+            for path_o in paths[1:]:   # (each later path against the first; BM1 P2: o / s / p)
+                ref, new = one(paths[0], trace=True), one(path_o, trace=True)
+                ref2 = one(paths[0], trace=True)   # the old path against itself (run-to-run floor of the GPU kernels)
+                new2 = one(path_o, trace=True)  # and the new one (its gathers' gradients are atomic sums)
+                for name, other, base in (('new vs old', new, ref), ('old vs old', ref2, ref),
+                                          ('new vs new', new2, new)):
+                    n_ = min(len(base['trace']), len(other['trace']))
+                    acc_r = torch.stack([torch.cat([a, t]) for a, t, _ in base['trace'][:n_]])
+                    acc_o = torch.stack([torch.cat([a, t]) for a, t, _ in other['trace'][:n_]])
+                    step_r = torch.diff(acc_r, dim=0, prepend=torch.zeros_like(acc_r[:1]))
+                    step_o = torch.diff(acc_o, dim=0, prepend=torch.zeros_like(acc_o[:1]))
+                    g_r, g_o = base['trace'][0][2], other['trace'][0][2]
+                    gd = [(_diff(a, b)) for a, b in zip(g_r, g_o) if a is not None and b is not None]
+                    flat_r = torch.cat([a.reshape(-1) for a in g_r if a is not None])
+                    flat_o = torch.cat([b.reshape(-1) for b in g_o if b is not None])
+                    cos = float(torch.nn.functional.cosine_similarity(flat_r.double(), flat_o.double(), 0))
+                    wd = [_diff(a, b) for a, b in zip(base['weights'], other['weights'])]
+                    first = _diff(step_r[0], step_o[0])
+                    print(f'check [{label}] {paths[0]} / {path_o} {name}: steps {len(base["trace"])}/{len(other["trace"])}; first step losses '
+                          f'max abs {first[0]:.3e}; all steps losses max abs {float((step_r - step_o).abs().max()):.3e} '
+                          f'(columns pg vf ent kl clip teach danger safe: '
+                          f'{" ".join("%.1e" % v for v in (step_r - step_o).abs().max(0).values.tolist())}); '
+                          f'first gradient max abs {max(d for d, _ in gd):.3e}, max rel per tensor '
+                          f'{max(r for _, r in gd):.3e}, norm rel {float((flat_r - flat_o).norm() / flat_r.norm()):.3e}, '
+                          f'cosine {cos:.9f}; weights after the update max abs {max(d for d, _ in wd):.3e}, max rel per tensor '
+                          f'{max(r for _, r in wd):.3e}',
+                          flush=True)
+                    worst = sorted(((float((a - b).norm() / a.norm().clamp(min=1e-30)), nm_, float(a.norm()))
+                                    for nm_, a, b in zip(names, g_r, g_o) if a is not None and b is not None),
+                                   reverse=True)[:4]
+                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first gradient, tensors with the largest relative difference (rel '
+                          f'norm, name, gradient norm): {" | ".join("%.2e %s %.2e" % w_ for w_ in worst)}', flush=True)
+                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses old {step_r[0].tolist()}', flush=True)
+                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses new {step_o[0].tolist()}', flush=True)
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
     res = {fast: [] for fast in paths}
     for _ in range(repeat):
@@ -278,7 +309,8 @@ def run_bench(ctx):
         steps, count = r[0]['steps'], r[0]['count']
         print(f'bench --learner-fast {fast}: update {1000 * s:.0f} ms (inside {1000 * us:.0f} ms; runs '
               f'{" ".join("%.0f" % (1000 * x["s"]) for x in r)}), {steps} steps, {1000 * s / max(steps, 1):.1f} ms per '
-              f'step, {args.epochs * count / s:.0f} rows/s ({count} rows x {args.epochs} epochs) | u_* '
+              f'step, {args.epochs * count / s:.0f} rows/s ({count} rows x {args.epochs} epochs), learner card peak '
+              f'{max(x["peak"][0] for x in r):.2f} GB allocated / {max(x["peak"][1] for x in r):.2f} GB reserved | u_* '
               f'{" ".join("%s %.3f" % kv for kv in r[-1]["U"].items())}', flush=True)
     if os.environ.get('ISAAC_RL_LEARNER_CPROFILE', '0') == '1':   # the host's Python time per function
         import cProfile
@@ -286,7 +318,7 @@ def run_bench(ctx):
         import pstats
         for fast in paths:
             _restore(start, model, opt, L)
-            args.learner_fast = fast
+            set_path(fast)
             pr = cProfile.Profile()
             pr.enable()
             learn(job)
@@ -302,7 +334,7 @@ def run_bench(ctx):
         from torch.profiler import ProfilerActivity, profile as tprof
         for fast in paths:
             _restore(start, model, opt, L)
-            args.learner_fast = fast
+            set_path(fast)
             with tprof(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
                 learn(job)
                 torch.cuda.synchronize()

@@ -73,7 +73,8 @@ class _Clock:
 
 def count(name, value):
     if TIMING_ON:
-        TIMING[name] = TIMING.get(name, 0)+value
+        with _UPD_LOCK:   # (the prefetch thread and BM1 P2's second learner card count too)
+            TIMING[name] = TIMING.get(name, 0)+value
 
 
 # (one directory per trainer under ISAAC_BLOCK_DUMP: <run tag>-<pid>, so that K trainers on one host never write the same

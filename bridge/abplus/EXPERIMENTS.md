@@ -2886,6 +2886,7 @@ HPC 节点（H20、160 核配额）上要练 10 个游戏年。同步 PPO 时限
     | | 快对快 | 0 | 8.3e-8 | 1.0 |
 
     TF32（训练的设置）下快对旧：`job-w48` 损失差最大 1.4e-4、梯度相对差 8.1e-3，`job-w48-wide` 1.3e-4（教师损失 0.94214 对 0.94227）、3.0e-2；旧对旧 0，快对快 6.5e-8 / 4.9e-7。
+    （2026-11-11注：这里的--check配置不带priv和aux，不受bench恢复缺失的影响，见BM1“已知项：learner bench”的清点表。）
   - 梯度的相对差集中在实体的 embedding、实体 MLP 和第一层：这一批的梯度对 float32 舍入本身就很敏感。`abplus_check_learner_fp64.py`（|g − g64| / |g64|，每行一个种子）：
 
     | rollout、精度 | 旧路径 | 快路径 | 旧路径、权重挪 1 个舍入步 |
@@ -11349,6 +11350,7 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - f94e225（driver.stop()放回finally开头）：已在gpu57验收通过（6次SIGINT落点，见“gpu57：分卡、SIGINT收尾验收…”一节）；
   - 分段计时（691ec41及之后的提交）：开关关、开各做一次验收。已补两条防护：只有开始这一轮update的那条线程打的标记才计入；进程里没有CUDA时整个保持关闭；
   - 单一步进入口step_params()（f73213e）：同一份数据跑2个update，比较参数和三个优化器状态的哈希，必须逐位一致。
+    （2026-11-11注：这项哈希比对没有执行，CUDA上做不到逐位；实际验收依据见“gpu57：分卡、SIGINT收尾验收…”一节，等价性证据清点见“已知项：learner bench”。）
 - 当时GPU 5上跑的是cpp-actor的m1-merge0（learner卡），它在01:40:58报CUDA error: unspecified launch failure后崩溃（协调方转述）。
 
 ### BM1 gpu57（10.19.136.57）：迁移、全量门、单卡基线X1和X2（2026-11-11）
@@ -11421,3 +11423,132 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - 数据相关的地方：历史块抽样、各part的行数和分桶都随数据变化，全在主机准备阶段（_prepare_packed）决定。设备侧只发现一处同步：block_learner.py:1031从可分页内存上传P['hscale']，这是第一个挡路项；探针里预先上传绕开之后，前向加反向就能完整捕获。torch的同步检测是原型功能，不保证查全。
   - 显存：每个part的graph约5–5.5 GB（2个part 10.2–11.0 GB），24 GB的卡上最多放下约3个。15个part里第3个起就显存不足。
   - 挡路项清单：(1) hscale从可分页内存上传；(2) 显存（每个part一张graph放不下）；(3) 每个update的形状都不同，每次都要重新捕获（捕获本身要先跑2次预热），省下的时间会被捕获开销吃掉；(4) .grad要预先分配，反向必须累加到固定的张量上（探针里已经这样做）。
+
+#### gpu57：P1搁置（负结果）、生产路径的learner固定输入重放（2026-11-11）
+- **P1（把learner的part捕获成CUDA graph再重放）搁置。** 理由：
+  - 重放只比eager快约8%（2个part从1.26 s降到1.15 s）。
+  - 每个part的graph要5–5.5 GB显存。
+  - 每个update的形状都不同，每次都要重新捕获。
+  - 原先推测的“前向受Python发射限制”不成立：eager前向的主机时间和流上跨度几乎相等。
+- **生产路径重放**（lbench2-inproc-m18e05e1）：
+  - 设置：树m18e05e1，分卡（GPU 1跑actor、GPU 2跑learner），分段计时开着。在训练进程里取第6个job，跑abplus_bench_learner（2次热身、3次计时）。每次learn()之前恢复模型、Adam、L和随机数状态。热身以后actor停下等待，宿主机上别的租户约占2核。
+  - 存job文件这条路走不通：block rollout的PageStore不能pickle（save_job报TypeError，见已知项），所以“离线重放”没做成。
+
+| 每个update，分段中位数（s） | 空闲重放（计时的3次） | 同一次运行里的生产update 1–5 | split-segon的生产 | 探针eager（surrogate损失） |
+|---|---:|---:|---:|---:|
+| 反向跨度 | 10.33 / 10.44 / 11.03 | 10.0–13.1（中位11.0） | 12.50 | 6.6 |
+| 反向主机时间 | 6.2–7.1 | 7.0–9.2 | 8.03 | – |
+| 前向（ppo.dispatch）跨度 | 3.07–3.10 | 3.6–4.1 | 3.93 | 3.1–3.5 |
+| recompute（2段合计） | 1.32–1.57 | 2.0–2.7 | 1.98 | – |
+| update（bench计时，15次step） | 16.06 | – | 20.4 | – |
+
+- **12.5和6.6之间约5.9 s的差，拆成两块：**
+  - 约2 s是在线时的争用：空闲时10.4，生产时11.0–12.5；反向的主机时间也一起涨。
+  - 约3.8 s是工作量：空闲时10.4对探针6.6，用的是同一批15个part、同样的chunk。反向的跨度远大于主机时间，瓶颈在GPU。
+  - 多出来的工作量在损失上：每个part只有一次合并的loss.backward()，没有retain_graph，主干只遍历一次；priv critic、aux head、并进来的teacher和v2项都在这一次里。探针的surrogate只对输出算损失，所以这3.8 s是这些损失项本身的计算量，属于预算，不再追。
+- **前向和recompute：**
+  - 前向空闲时3.1 s，和探针一致；生产时多出约0.8 s，是争用。
+  - recompute不是对PPO part再做一次前向，而是update开头对整份rollout（约32.8k行、7次packed调用）做的无梯度前向，给decoupled的prox和价值用。空闲时1.3–1.6 s，生产时2.0–2.7 s。
+- **每个update的step数：** 15次step（3个epoch，每个epoch 5个minibatch），每个minibatch正好1个part（b42_learn_bwd_calls = 15）。探针的“15个part”是整个update的量。
+
+#### gpu57、8x3090：learner专用核、阻塞同步（2026-11-11）
+- **做法**（提交15167aa、68de76a）：
+  - `--learner-cpus`或ISAAC_LEARNER_CPUS把learner线程放到给定的CPU上；每个update开始时，它的helper线程（pt_autograd_*、learner-prefetch、learner-p2）也按名字移过去。
+  - 默认是“专用”：主线程启动时把这组CPU从自己的亲和性里去掉，之后起的worker、游戏、driver都不会用到。ISAAC_LEARNER_CPUS_SHARED=1是“共享”：只绑learner，别的不排除。
+  - 每组都选整物理核，两个超线程一起留。
+- **gpu57**（m15167aa，分卡GPU 1+2，32线程，24轮，背靠背，u10+中位；learner绑物理核5–7，即CPU 5–7、21–23）：
+
+| | pin0 不绑 | pinx 专用 | pins 共享 | bsblk 阻塞 | bsblkx 阻塞+专用 |
+|---|---:|---:|---:|---:|---:|
+| collect | 18.79 | 18.55 | 17.60 | 21.10 | 18.61 |
+| update | 20.21 | 18.37 | 20.14 | 20.82 | 18.48 |
+| wait_learner | 1.68 | 0.00 | 2.50 | 0.00 | 0.14 |
+| ×实时 | 208.2 | 222.9 | 207.6 | 197.4 | 220.0 |
+| CF（u15 done） | 99 | 98 | 104 | 101 | 102 |
+| 反向跨度 / 前向跨度 | 12.13 / 3.89 | 11.42 / 3.48 | 12.35 / 3.80 | 12.28 / 4.56 | 11.51 / 3.52 |
+| learner卡忙闲（同时跑 / 只有learner） | 69% / 88% | 71% / 63% | 60% / 75% | 70% / 47% | 80% / 90% |
+
+- **8x3090**（m3c42661，node0的24线程，GPU 1+2，learner绑物理核9–11，即CPU 9–11、33–35）：
+
+| | pin0 | pinx | pins |
+|---|---:|---:|---:|
+| collect | 18.48 | 18.95 | 17.52 |
+| update | 18.31 | 17.17 | 18.33 |
+| wait_learner | 0.52 | 0.00 | 0.66 |
+| ×实时（u10+ / u2–u23） | 228.9 / 234.5 | 223.9 / 236.0 | 228.9 / 232.1 |
+| learner卡忙闲 | 94% / 97% | 100% / 96% | 80% / 96% |
+
+- **结论：**
+  - 起作用的是“专用”，不是“固定在某几个核”：两台机器上，共享那一臂都和不绑一样。
+  - gpu57上不绑时learner比collect慢，专用核把update压到collect以下，×实时从208升到223（这台机器此前不绑核的运行是202.5、207.5、208.2）。
+  - 8x3090上本来就由collect决定一轮的长短，learner卡已接近满载，专用核只是把learner的余量从约0.5 s拉到约1.8 s，×实时不变。
+  - learner专用核写进两台机器各自的env（BM1_LEARNER_CPUS），不是全局默认，因为怎么留核取决于机器。prof.sh默认加上它；run自己指定了核、run是shard2的分道、或者设了LEARNER_PIN=0时不加。
+- **已排除的解释：**
+  - 运行队列等待：schedstat里trainer各线程“可运行但在等CPU”的时间，每个update合计不到0.4 s。
+  - CPU频率：learner那几个核在“同时跑”阶段反而更高（gpu57约3.0 GHz，只有learner时约2.6 GHz），调速器不动。
+  - 超线程同核（schedstat看不到这一项）：专用（兄弟线程空着）和共享两臂的差就是它。
+- **阻塞同步**（ISAAC_CUDA_BLOCKING_SYNC=blocking）：不开，保持auto。
+  - 单独开时collect慢2.3 s，×实时从208降到197；和专用核叠加没有额外收益。
+  - 这是在“这台机器空闲核多”（13.5–14.7核空闲）的条件下得出的；将来一台机器上分片多到核不够用时要重测。
+  - B62当时只测了learner一侧的CPU（blocking下uc_*合计5.98 s/update），没比速度。
+- **线程的运行时间**（schedstat，CPU秒每秒）：
+  - driver线程：auto下0.89，blocking下0.32，其中约0.57核是自旋等GPU。
+  - learner线程：两种模式都是0.49。它真正在算的约每个update 10 s，另一半时间在睡眠等待，不自旋。
+  - actor主线程（Python）约0.13，pt_autograd约0.31，prefetch约0.18。
+  - 这棵树里learner线程还没有改名，是按tid顺序认的；48ca563起它叫learner-main，actor的第一条线程在采样里叫main。
+- **账本**（summ.py和m0_mem，05d05be起；两台机器口径一致）：
+  - CF和teacher分支fork出来的短命游戏进程，靠父进程回收时的cutime和cstime计入，gpu57约6.7核，8x3090约6.1核，单列一行，不和常驻进程的采样相加。
+  - 游戏进程nice 19，就是mpstat里的nice（gpu57约8.8核）。
+  - 按进程类别的schedstat（bsblkx）：trainer运行1.42、等待0.03；workers 4.40 / 0.51；games 0.53 / 0.43。留专用核的代价是剩下的核更挤：pinx里actor主线程的等待从约0.02升到约0.03–0.13。
+- **待办**（不追，排不到前面）：专用核下update是18.4 s，空闲时16.1 s，还差2.3 s。已排除运行队列等待、频率、自旋；还没分开的是GIL、learner卡上的其他流、内存带宽和缓存争用（同时跑的actor和游戏）。以后要量时从这里接着做。
+
+#### 已知项：learner bench（abplus_bench_learner）
+- block rollout的PageStore不能pickle：ISAAC_RL_LEARNER_JOB存盘这条路对block-memory配置不可用，只能在训练进程里就地重放（ISAAC_RL_LEARNER_AT）。
+- `--check`在bcbaa28之前，每次learn()前只恢复主模型、主Adam和L，没有恢复priv critic、aux head、它们的Adam和aux归一化。所以带priv或aux的配置上，同一路径跑两遍，第一步梯度就差约16%（cos 0.998）。修好以后才有可用的地板。
+- **清点以前的等价性证据（2026-11-11）：**
+
+| 条目 | 当时的证据 | 配置带priv或aux？ | 受影响？ |
+|---|---|---|---|
+| B18 学习器快路径（10-10） | `--check`（old vs old地板约1e-7）加abplus_check_learner_fp64.py | 否（priv和aux 11-03才加） | 否 |
+| B41、B42、B43、B48、B51 | 单元测试（门限≤1e-5） | – | 否 |
+| B44 | b44固定输入、固定surrogate（fp32相对L2 6.2e-7） | dump取自带priv和aux的运行，但工具不同 | 否 |
+| B45 | 逐字节相等 | – | 否 |
+| B46、B47 | graph和eager一致的测试，加A8摘要 | – | 否 |
+| B60 | 参数逐位相同（C打包开关），加prefetch spread脚本 | – | 否 |
+| B62 | `--adam-compare`回放b44 dump（4.0e-6） | – | 否 |
+| BM1 step_params | 搬移的24条语句逐条相同，加上带着它跑过的门和计时无错。没有做哈希比对：11018行那条哈希比对只是计划，没有执行 | – | 否 |
+| BM1 b65探针 | 固定输入，1.9e-6 | – | 否 |
+| BM1 P2第一步 p2check2（8178b4a） | `--check` | 是 | **是：作废**，用修好的bench重做（p2check3） |
+
+- P2的副本哈希检查（ISAAC_P2_CHECK）比的是另一件事：每次广播后副卡的参数和buffer是否和主卡一致。它不是step_params或P2梯度等价的证据。
+
+#### BM1 P2第一步（代码：8178b4a、19e2acd、a3d087b；开关--learner-devices，默认单卡）
+- **为什么要切part：** 每个minibatch只有1个part，按part分卡没有并行可言。所以把每个part的chunk列表按行数切成两半。
+  - 前一半只含PPO chunk，在主卡上由learner线程算。
+  - 后一半带上teacher和v2记录，在副卡上由它自己的线程算，副本是learner_model、priv critic和aux head。
+  - 每行的损失本来就按整个minibatch的分母归一，所以两半的梯度相加就是整个part的梯度，只是求和顺序不同。
+  - 历史块对整个part一次抽完再切开（block_learner.prepare_split），两卡和单卡抽到的块相同。
+  - part内唯一被多个chunk共用、带梯度的计算是历史块的重编码：被两半共用的块，两张卡各编一份。按线性相加，梯度不变；多花的量计在p2_dup_blocks里。
+- **step_params：**
+  - 开头先归约：副卡梯度按dtype拼成一块，一次peer copy，加到主卡梯度上。
+  - 三个优化器只在主卡上step。
+  - step之后广播参数到副卡（同样一块一次拷贝，每次44.3 MiB）；每个update开头也广播一次。
+  - B18的trace挪进了step_params，放在归约之后。
+- **副卡出错：** 在learner线程的join处重新抛出，信息里写明卡、update、step和行范围，走现有的failure路径。不降级。
+- **主卡默认路径：** part循环体搬进了part_prep、part_rows、part_compute，运算和顺序不变。每行输入（b_act[part]等的gather和gate(mb)）在前向之前一次取好，值相同。
+- **副本一致性（检查，不是假设）：**
+  - 被训练的模块只有3个buffer：coordinates、frequency、room_shifts，都是构造时写入的常数。没有dropout（p=0），没有batch norm，没有running统计，forward里不写模块上的任何东西。
+  - forward会写的都在模块外面：block_paged的计数器UPD、TIMING、HIST，现在都在_UPD_LOCK下；编译缓存在启动时对两张卡都预热过。
+  - ISAAC_P2_CHECK=1时，每次广播后对两张卡的参数和buffer各算一个整数哈希比对；p2check2里每个update比16次，全部一致。
+- **跨线程状态：**
+  - STAGING池：Staging.lock保护，event记在各自上传时所在的流上。
+  - SIDE_CUDA闸：只有prefetch线程走它。P2启动时要求thread_local capture模式；capture_yield发生在join之后，那时副卡线程是空闲的。
+  - PREFETCH队列和PREP_LOCK：只有learner线程提交和取用。
+  - 统计量：每张卡各一套累加器，update结束时在join之后相加。
+  - GpuSpan.PENDING：list.append在GIL下是原子的。SEG：其他线程的标记会被忽略。
+  - 流：learner线程在副卡上的当前流就是P2的流，跨卡拷贝靠PyTorch在源流和目标流之间的双向屏障排好先后。
+- **首轮检查（p2check2-ma3d087b）：**
+  - 机制：两卡路径15次step全部正常；每个update归约在主机上0.09 s、广播0.07 s。
+  - 单次update（每种1个样本，且哈希检查每步都同步）：0o单卡整part 16.4 s，0s同卡两半先后跑17.8 s，0p两卡13.9 s。
+  - 主卡每个update要等副卡1.2–1.3 s：两半不平衡，切点作为第二版再调。
+  - 等价性的数作废（见上面的已知项），用p2check3重做；结果和背靠背计时随后补在这里。
