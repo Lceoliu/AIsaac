@@ -239,41 +239,43 @@ def run_bench(ctx):
             one(fast)
     if check:
         tf32 = (torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32)
-        for label, setting in (('this run (tf32 %s)' % bool(tf32[0]), tf32), ('strict float32', (False, False))):
+        settings = (('this run (tf32 %s)' % bool(tf32[0]), tf32), ('strict float32', (False, False)))
+        for label, setting in settings[:1 if os.environ.get('ISAAC_RL_LEARNER_CHECK_STRICT', '1') == '0' else 2]:
             torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = setting
-            ref, new = one(paths[0], trace=True), one(paths[-1], trace=True)
-            ref2 = one(paths[0], trace=True)   # the old path against itself (run-to-run floor of the GPU kernels)
-            new2 = one(paths[-1], trace=True)  # and the new one (its gathers' gradients are atomic sums)
-            for name, other, base in (('new vs old', new, ref), ('old vs old', ref2, ref),
-                                      ('new vs new', new2, new)):
-                n_ = min(len(base['trace']), len(other['trace']))
-                acc_r = torch.stack([torch.cat([a, t]) for a, t, _ in base['trace'][:n_]])
-                acc_o = torch.stack([torch.cat([a, t]) for a, t, _ in other['trace'][:n_]])
-                step_r = torch.diff(acc_r, dim=0, prepend=torch.zeros_like(acc_r[:1]))
-                step_o = torch.diff(acc_o, dim=0, prepend=torch.zeros_like(acc_o[:1]))
-                g_r, g_o = base['trace'][0][2], other['trace'][0][2]
-                gd = [(_diff(a, b)) for a, b in zip(g_r, g_o) if a is not None and b is not None]
-                flat_r = torch.cat([a.reshape(-1) for a in g_r if a is not None])
-                flat_o = torch.cat([b.reshape(-1) for b in g_o if b is not None])
-                cos = float(torch.nn.functional.cosine_similarity(flat_r.double(), flat_o.double(), 0))
-                wd = [_diff(a, b) for a, b in zip(base['weights'], other['weights'])]
-                first = _diff(step_r[0], step_o[0])
-                print(f'check [{label}] {name}: steps {len(base["trace"])}/{len(other["trace"])}; first step losses '
-                      f'max abs {first[0]:.3e}; all steps losses max abs {float((step_r - step_o).abs().max()):.3e} '
-                      f'(columns pg vf ent kl clip teach danger safe: '
-                      f'{" ".join("%.1e" % v for v in (step_r - step_o).abs().max(0).values.tolist())}); '
-                      f'first gradient max abs {max(d for d, _ in gd):.3e}, max rel per tensor '
-                      f'{max(r for _, r in gd):.3e}, norm rel {float((flat_r - flat_o).norm() / flat_r.norm()):.3e}, '
-                      f'cosine {cos:.9f}; weights after the update max abs {max(d for d, _ in wd):.3e}, max rel per tensor '
-                      f'{max(r for _, r in wd):.3e}',
-                      flush=True)
-                worst = sorted(((float((a - b).norm() / a.norm().clamp(min=1e-30)), nm_, float(a.norm()))
-                                for nm_, a, b in zip(names, g_r, g_o) if a is not None and b is not None),
-                               reverse=True)[:4]
-                print(f'check [{label}] {name}: first gradient, tensors with the largest relative difference (rel '
-                      f'norm, name, gradient norm): {" | ".join("%.2e %s %.2e" % w_ for w_ in worst)}', flush=True)
-                print(f'check [{label}] {name}: first step losses old {step_r[0].tolist()}', flush=True)
-                print(f'check [{label}] {name}: first step losses new {step_o[0].tolist()}', flush=True)
+            for path_o in paths[1:]:   # (each later path against the first; BM1 P2: o / s / p)
+                ref, new = one(paths[0], trace=True), one(path_o, trace=True)
+                ref2 = one(paths[0], trace=True)   # the old path against itself (run-to-run floor of the GPU kernels)
+                new2 = one(path_o, trace=True)  # and the new one (its gathers' gradients are atomic sums)
+                for name, other, base in (('new vs old', new, ref), ('old vs old', ref2, ref),
+                                          ('new vs new', new2, new)):
+                    n_ = min(len(base['trace']), len(other['trace']))
+                    acc_r = torch.stack([torch.cat([a, t]) for a, t, _ in base['trace'][:n_]])
+                    acc_o = torch.stack([torch.cat([a, t]) for a, t, _ in other['trace'][:n_]])
+                    step_r = torch.diff(acc_r, dim=0, prepend=torch.zeros_like(acc_r[:1]))
+                    step_o = torch.diff(acc_o, dim=0, prepend=torch.zeros_like(acc_o[:1]))
+                    g_r, g_o = base['trace'][0][2], other['trace'][0][2]
+                    gd = [(_diff(a, b)) for a, b in zip(g_r, g_o) if a is not None and b is not None]
+                    flat_r = torch.cat([a.reshape(-1) for a in g_r if a is not None])
+                    flat_o = torch.cat([b.reshape(-1) for b in g_o if b is not None])
+                    cos = float(torch.nn.functional.cosine_similarity(flat_r.double(), flat_o.double(), 0))
+                    wd = [_diff(a, b) for a, b in zip(base['weights'], other['weights'])]
+                    first = _diff(step_r[0], step_o[0])
+                    print(f'check [{label}] {paths[0]} / {path_o} {name}: steps {len(base["trace"])}/{len(other["trace"])}; first step losses '
+                          f'max abs {first[0]:.3e}; all steps losses max abs {float((step_r - step_o).abs().max()):.3e} '
+                          f'(columns pg vf ent kl clip teach danger safe: '
+                          f'{" ".join("%.1e" % v for v in (step_r - step_o).abs().max(0).values.tolist())}); '
+                          f'first gradient max abs {max(d for d, _ in gd):.3e}, max rel per tensor '
+                          f'{max(r for _, r in gd):.3e}, norm rel {float((flat_r - flat_o).norm() / flat_r.norm()):.3e}, '
+                          f'cosine {cos:.9f}; weights after the update max abs {max(d for d, _ in wd):.3e}, max rel per tensor '
+                          f'{max(r for _, r in wd):.3e}',
+                          flush=True)
+                    worst = sorted(((float((a - b).norm() / a.norm().clamp(min=1e-30)), nm_, float(a.norm()))
+                                    for nm_, a, b in zip(names, g_r, g_o) if a is not None and b is not None),
+                                   reverse=True)[:4]
+                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first gradient, tensors with the largest relative difference (rel '
+                          f'norm, name, gradient norm): {" | ".join("%.2e %s %.2e" % w_ for w_ in worst)}', flush=True)
+                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses old {step_r[0].tolist()}', flush=True)
+                    print(f'check [{label}] {paths[0]} / {path_o} {name}: first step losses new {step_o[0].tolist()}', flush=True)
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = tf32
     res = {fast: [] for fast in paths}
     for _ in range(repeat):
