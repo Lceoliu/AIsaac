@@ -4921,6 +4921,11 @@ def main(argv=None, child=None, actor=None):
     failure = []
 
     def learner_loop():
+        try:   # (BM1: the OS thread name, so /proc and the samplers tell the learner thread from the actor's)
+            import ctypes
+            ctypes.CDLL(None).prctl(15, b'learner-main', 0, 0, 0)
+        except Exception:
+            pass
         if split:   # B38: this thread's current GPU is the learner's (CUDA's current device is per thread)
             torch.cuda.set_device(ldev)
         torch.cuda.set_stream(learner_stream)

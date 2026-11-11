@@ -113,8 +113,10 @@ def main():
                                                             for k in kinds)
                        + f'); reaped children (cutime + cstime of their parents) {reaped:.2f} ('
                        + ', '.join(f'{k} {mean(k+"_child_cores"):.2f}' for k in kinds)
-                       + f'); unattributed {cg_all-seen-reaped:.2f}; nice ' + ', '.join(
-                           f'{k} {m[-1].get(k+"_nice") or "-"}' for k in kinds))
+                       + f'; reaped children are booked when they exit, a lump that overlaps the samples); not in a '
+                       f'live sample {cg_all-seen:.2f}; nice (most common over the window) ' + ', '.join(
+                           f'{k} {max(set(nv), key=nv.count) if nv else "-"}' for k in kinds
+                           for nv in [[x.get(k+"_nice") for x in m if x.get(k+"_nice")]]))
         sc_path = f'{R}/{tag}.sysc.csv'
         if os.path.exists(sc_path):   # (the ledger: where the tasks sit, share of samples per kind)
             t0_ = f(m[0], 't')
