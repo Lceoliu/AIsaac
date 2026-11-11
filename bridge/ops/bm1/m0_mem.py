@@ -186,13 +186,15 @@ def main():
     cg = cgroup_dir(pid)
     prev, t_prev = {}, None
     prev4 = {}
+    prev_sch = {}
     tf = open(tout, 'w') if tout else None
     if tf:
         tf.write('t,kind,name,ticks,run_ns,wait_ns\n')
     with open(out, 'w') as f:
         f.write('t,'+','.join(f'{k}_rss_mb,{k}_pss_mb,{k}_n,{k}_cores' for k in KINDS)
                 + ',cg_current_mb,cg_peak_mb,cg_anon_mb,cg_file_mb,cg_shmem_mb,cg_cpu_usec,host_avail_mb,'
-                + ','.join(f'{k}_sys_cores,{k}_child_cores,{k}_nice' for k in KINDS) + ',cg_user_ticks,cg_sys_ticks\n')
+                + ','.join(f'{k}_sys_cores,{k}_child_cores,{k}_nice' for k in KINDS) + ',cg_user_ticks,cg_sys_ticks,'
+                + ','.join(f'{k}_sched_run,{k}_sched_wait' for k in KINDS) + '\n')
         while os.path.exists(f'/proc/{pid}'):
             now = time.time()
             kids = children()
@@ -206,6 +208,8 @@ def main():
             dchild = dict.fromkeys(KINDS, 0)
             nices = {k: {} for k in KINDS}
             calls = {}
+            sch = {}   # (per kind: schedstat run / wait ns summed over every task of its processes)
+            schk = dict.fromkeys(KINDS, (0, 0))
             todo = [(pid, True)]
             while todo:
                 p, top = todo.pop()
@@ -229,6 +233,9 @@ def main():
                 try:
                     for tid in os.listdir(f'/proc/{p}/task'):
                         sy = syscall_of(f'/proc/{p}/task/{tid}')
+                        ss_ = read(f'/proc/{p}/task/{tid}/schedstat').split()
+                        if len(ss_) > 1:
+                            sch[(p, tid)] = (kind, int(ss_[0]), int(ss_[1]))
                         key_ = kind if not top else 'trainer:'+(read(f'/proc/{p}/task/{tid}/comm').strip()
                                                                 .rstrip('0123456789_') or '?')
                         calls[(key_, sy)] = calls.get((key_, sy), 0)+1
@@ -238,6 +245,11 @@ def main():
             dt = now-t_prev if t_prev else 0.0
             prev, t_prev = cur, now
             prev4 = cur4
+            for key_, (k_, r_, w_) in sch.items():
+                if key_ in prev_sch:
+                    a_, b_ = schk[k_]
+                    schk[k_] = (a_+max(0, r_-prev_sch[key_][1]), b_+max(0, w_-prev_sch[key_][2]))
+            prev_sch = sch
             for (k_, sy_), c_ in sorted(calls.items()):
                 sc.write(f'{now:.1f},{k_},{sy_},{c_}\n')
             sc.flush()
@@ -246,6 +258,7 @@ def main():
                     for tid in os.listdir(f'/proc/{pid}/task'):
                         try:
                             nm = read(f'/proc/{pid}/task/{tid}/comm').strip()
+                            nm = 'main' if tid == str(pid) else nm   # (the process's first thread: the actor's)
                             # (schedstat: ns on a CPU, ns runnable but waiting for one: the scheduler's view)
                             ss = read(f'/proc/{pid}/task/{tid}/schedstat').split()
                             tf.write(f'{now:.3f},thread,{nm}:{tid},{ticks(f"{pid}/task/{tid}")},'
@@ -270,7 +283,9 @@ def main():
                                   if x.startswith('MemAvailable:')), '') + ','
                     + ','.join((f'{dsys[k]/100/dt:.2f},{dchild[k]/100/dt:.2f}' if dt else ',')
                                + ',' + (str(max(nices[k], key=nices[k].get)) if nices[k] else '') for k in KINDS)
-                    + ',' + ','.join(cg_ticks(cg)) + '\n')
+                    + ',' + ','.join(cg_ticks(cg)) + ','
+                    + ','.join((f'{schk[k][0]/1e9/dt:.3f},{schk[k][1]/1e9/dt:.3f}' if dt else ',') for k in KINDS)
+                    + '\n')
             f.flush()
             time.sleep(period)
 

@@ -117,6 +117,9 @@ def main():
                        f'live sample {cg_all-seen:.2f}; nice (most common over the window) ' + ', '.join(
                            f'{k} {max(set(nv), key=nv.count) if nv else "-"}' for k in kinds
                            for nv in [[x.get(k+"_nice") for x in m if x.get(k+"_nice")]]))
+        if 'game_sched_wait' in m[0]:   # (the ledger: per kind, on a CPU and runnable-but-waiting, s per s, means)
+            out.append('  schedstat by kind (run / waiting for a CPU, s per s): ' + ', '.join(
+                f'{k} {mean(k+"_sched_run"):.2f}/{mean(k+"_sched_wait"):.2f}' for k in kinds))
         sc_path = f'{R}/{tag}.sysc.csv'
         if os.path.exists(sc_path):   # (the ledger: where the tasks sit, share of samples per kind)
             t0_ = f(m[0], 't')
