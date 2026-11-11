@@ -84,14 +84,43 @@ def children():
 
 
 def cgroup_dir(pid):
+    """The container's cgroup: ('v2', dir) or ('v1', {controller: dir}) (cgroup v1 hosts: memory, cpuacct)."""
     try:
         with open(f'/proc/{pid}/cgroup') as f:
-            for line in f:
-                if line.startswith('0::'):
-                    return '/sys/fs/cgroup'+line.strip()[3:]
+            lines = f.read().splitlines()
     except OSError:
-        pass
-    return None
+        return None
+    v1 = {}
+    for line in lines:
+        hid, ctl, path = line.split(':', 2)
+        if hid == '0' and ctl == '':
+            if os.path.exists('/sys/fs/cgroup/cgroup.controllers'):
+                return ('v2', '/sys/fs/cgroup'+path)
+        for c in ctl.split(','):
+            if c in ('memory', 'cpuacct'):
+                base = '/sys/fs/cgroup/'+ctl
+                v1[c] = (base if os.path.isdir(base) else '/sys/fs/cgroup/'+c)+path
+    return ('v1', v1) if v1 else None
+
+
+def cg_sample(cg):
+    """(current bytes, peak bytes, anon, file, shmem, cpu usec) of the cgroup, '' where unknown; v1 equivalents:
+    memory.usage_in_bytes, memory.max_usage_in_bytes, memory.stat total_rss / total_cache / total_shmem,
+    cpuacct.usage (ns)."""
+    if cg is None:
+        return ('',)*6
+    kind, d = cg
+    if kind == 'v2':
+        st = dict(x.split() for x in read(d+'/memory.stat').splitlines() if x.count(' ') == 1)
+        cpu = dict(x.split() for x in read(d+'/cpu.stat').splitlines() if x.count(' ') == 1).get('usage_usec', '')
+        return (read(d+'/memory.current').strip(), read(d+'/memory.peak').strip(), st.get('anon', ''),
+                st.get('file', ''), st.get('shmem', ''), cpu)
+    m, c = d.get('memory', ''), d.get('cpuacct', '')
+    st = dict(x.split() for x in read(m+'/memory.stat').splitlines() if x.count(' ') == 1) if m else {}
+    ns = read(c+'/cpuacct.usage').strip() if c else ''
+    return (read(m+'/memory.usage_in_bytes').strip() if m else '', read(m+'/memory.max_usage_in_bytes').strip() if m else '',
+            st.get('total_rss', ''), st.get('total_cache', ''), st.get('total_shmem', ''),
+            str(int(ns)//1000) if ns.isdigit() else '')
 
 
 def read(path):
@@ -155,7 +184,7 @@ def main():
                     tf.flush()
                 except OSError:
                     pass
-            st = dict(line.split() for line in read(cg+'/memory.stat').splitlines() if line.count(' ') == 1) if cg else {}
+            cur_, peak_, anon_, file_, shm_, cpu_ = cg_sample(cg)
 
             def mb(x):
                 try:
@@ -164,11 +193,8 @@ def main():
                     return ''
             f.write(f'{now:.1f},'+','.join(f'{rss[k]/1024:.0f},{pss[k]/1024:.0f},{n[k]},'
                                            + (f'{dtk[k]/100/dt:.2f}' if dt else '') for k in KINDS)+','
-                    + ','.join(mb(v) for v in (read(cg+'/memory.current').strip() if cg else '',
-                                               read(cg+'/memory.peak').strip() if cg else '',
-                                               st.get('anon', ''), st.get('file', ''), st.get('shmem', '')))
-                    + ',' + (dict(x.split() for x in read(cg+'/cpu.stat').splitlines() if x.count(' ') == 1)
-                             .get('usage_usec', '') if cg else '')
+                    + ','.join(mb(v) for v in (cur_, peak_, anon_, file_, shm_))
+                    + ',' + cpu_
                     + ',' + next((f'{int(x.split()[1])/1024:.0f}' for x in read('/proc/meminfo').splitlines()
                                   if x.startswith('MemAvailable:')), '') + '\n')
             f.flush()

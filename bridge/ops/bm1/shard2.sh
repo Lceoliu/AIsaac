@@ -46,7 +46,7 @@ done
     if [ "$BM1_MODE" = docker ]; then
       for k in 0 1; do
         id=$(docker inspect -f '{{.Id}}' $BM1_NAME-prof-$TAG-s$k 2>/dev/null) || continue
-        n=$(awk '/^oom_kill / {print $2}' /sys/fs/cgroup/system.slice/docker-$id.scope/memory.events 2>/dev/null)
+        n=$(cat /sys/fs/cgroup/system.slice/docker-$id.scope/memory.events /sys/fs/cgroup/memory/docker/$id/memory.oom_control 2>/dev/null | awk '/^oom_kill / {print $2; exit}')   # (cgroup v2 / v1)
         [ "${n:-0}" -gt 0 ] && oom="$oom s$k:$n"
       done
     else

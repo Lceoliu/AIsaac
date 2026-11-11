@@ -29,7 +29,7 @@ def med(rows, c):
 
 def cpus(spec):
     out = set()
-    for part in spec.split(','):
+    for part in filter(None, spec.split(',')):   # (an empty spec: no lane)
         a, _, b = part.partition('-')
         out |= set(range(int(a), int(b or a)+1))
     return out
@@ -37,7 +37,7 @@ def cpus(spec):
 
 def main():
     R, tag = sys.argv[1], sys.argv[2]
-    lane = cpus(sys.argv[3] if len(sys.argv) > 3 else '0-11,24-35')
+    lane = cpus(sys.argv[3] if len(sys.argv) > 3 else '')
     gpu = sys.argv[4] if len(sys.argv) > 4 else '1'
     out = []
     p = f'{R}/{tag}/progress.csv'
@@ -160,6 +160,17 @@ def main():
         if lb:
             out.append(f'  mpstat (steady): this lane {len(lb)} CPUs mean busy {st.mean(lb):.0f}% (sum {sum(lb)/100:.1f} cores); '
                        f'other CPUs {len(ob)} mean busy {st.mean(ob) if ob else 0:.0f}% (sum {sum(ob)/100:.1f} cores)')
+    if os.path.exists(f'{R}/{tag}.cpufreq'):   # (CPU MHz, every CPU, 5 s, from /proc/cpuinfo)
+        fl = [x.split() for x in open(f'{R}/{tag}.cpufreq').read().splitlines()]
+        fl = [list(map(float, x)) for x in fl if len(x) > 1]
+        if fl:
+            t1 = fl[-1][0]
+            fs = [x for x in fl if x[0] >= t1-win] or fl
+            ln = [st.mean(x[1+c] for c in lane if 1+c < len(x)) for x in fs] if lane else []
+            al = [st.mean(x[1:]) for x in fs]
+            out.append(f'  CPU MHz (steady, 5 s samples): this lane median {st.median(ln):.0f} (min {min(ln):.0f}), '
+                       f'all CPUs median {st.median(al):.0f}' if ln else
+                       f'  CPU MHz (steady, 5 s samples): all CPUs median {st.median(al):.0f}')
     print('\n'.join(out))
 
 

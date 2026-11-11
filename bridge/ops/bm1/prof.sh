@@ -17,6 +17,14 @@ mkdir -p $R
 [ -e $R/$TAG ] && { echo "prof.sh: $R/$TAG exists (never overwritten)" >&2; exit 2; }
 if [ "${NOLOCK:-0}" = 1 ]; then LOCKLINE="(held by the caller: ${LOCKS_HELD:-?})"; else take "timed $TAG ($TREE, GPU $GPU) 计时运行"; fi
 echo "$(date '+%F %T') $TAG start: tree $TREE capture mode $(capmode $TREE) GPU $GPU updates $UPDATES hours $HOURS lock: $LOCKLINE" >> $LOG
+host_snapshot "$TAG start"
+# (a timed run's own CPUs / memory nodes when bm1.env sets them: gpu57's timed runs use every thread)
+[ -n "${BM1_TIMED_CPUSET+x}" ] && export CPUSET="$BM1_TIMED_CPUSET" MEMS="${BM1_TIMED_MEMS:-}"
+torch_line=$(grep -h -m1 '' $BM/.torch_build 2>/dev/null)
+log "$TAG software: driver $(nvidia-smi --query-gpu=driver_version --format=csv,noheader -i ${GPU%%,*} 2>/dev/null) ${torch_line:-torch build: see the run's stdout}"
+# CPU frequency (read-only /proc/cpuinfo, every 5 s): every CPU's MHz on one line
+( while :; do echo "$(date +%s) $(awk '/^cpu MHz/ {printf "%d ", $4}' /proc/cpuinfo)"; sleep 5; done ) > $R/$TAG.cpufreq &
+S7=$!
 nvidia-smi -i $GPU --query-gpu=timestamp,utilization.gpu,memory.used,power.draw,clocks.sm,index --format=csv,noheader -l 1 > $R/$TAG.gpu &
 S1=$!
 nvidia-smi --query-gpu=timestamp,index,utilization.gpu,memory.used --format=csv,noheader -l 5 > $R/$TAG.allgpu &
@@ -51,8 +59,9 @@ while kill -0 $DP 2>/dev/null; do
 done
 wait $DP
 rc=$?
-kill $S1 $S2 $S3 $S4 $S5 $S6 2>/dev/null
+kill $S1 $S2 $S3 $S4 $S5 $S6 $S7 2>/dev/null
+host_snapshot "$TAG end"
 [ -d $R/$TAG/checkpoints ] && trash $R/$TAG/checkpoints
 echo "$(date '+%F %T') $TAG done rc=$rc rows $(($(wc -l < $R/$TAG/progress.csv 2>/dev/null || echo 1)-1)); $(grep -h -m1 "BM1 graph capture mode" $R/$TAG.stdout 2>/dev/null)" >> $LOG
-python3 $BM/summ.py $R $TAG "$BM1_CPUSET" $GPU > $R/$TAG.summary.txt 2>&1   # (still inside the lock)
+python3 $BM/summ.py $R $TAG "${BM1_TIMED_CPUSET:-$BM1_CPUSET}" $GPU > $R/$TAG.summary.txt 2>&1   # (still inside the lock)
 [ "${NOLOCK:-0}" = 1 ] || give

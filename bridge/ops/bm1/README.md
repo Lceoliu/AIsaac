@@ -101,6 +101,17 @@ GPU=1 ./probe.sh m77657fc
 4. 代码：`git archive <commit> bridge/python bridge/ops bridge/abplus bridge/engine` → `deploy.sh tree <名> <tar>`，然后 `deploy.sh abphome <名>`。
 5. 写 `bm1.env`（照 `probe_host.sh` 的输出填），跑 `preflight_baseline`，先做一次 2 轮的冒烟测试。
 
+## 整机读写锁（gpu57，BM1_LOCKDIR）
+
+设了 `BM1_LOCKDIR` 时，整台机器只有一把锁，所有会话共用（gpu57 上是 `/root/AIsaac/bm1/locks`，cpp-actor 也用它）：
+
+- 计时运行（用途里有"计时运行"）拿独占锁，写 `X`。写下之后，新的共享持有者就进不来了（写者优先）；然后等正在运行的共享持有者全部结束才开始。
+- 门、编译、冒烟、探针这类非计时作业拿共享锁，各写一个 `S.<会话>.<pid>`，彼此可以同时跑。
+- 每个锁文件第一行是原来的格式 "会话 时间 用途"，第二行是 "pid <宿主机上持锁脚本的 pid>"。pid 已经不在的锁文件算陈旧，下一个来拿锁的会把它删掉并记日志。
+- 检查和写锁都在一个很短的互斥区里完成（`mkdir .mutex`，超过 60 s 视为陈旧）。等锁是作业脚本自己 sleep 循环，等了多少秒写进 bm1.log。
+- 没设 `BM1_LOCKDIR` 时，就是原来的单文件锁（8x3090 用的那种）。
+- gpu57 上：非计时作业用本会话自己的 CPU（`BM1_CPUSET`，我们是 node0 的 16 个线程，cpp-actor 是 node1 的），计时运行用 `BM1_TIMED_CPUSET=0-31`（全部线程）。GPU：我们用 1、2，cpp-actor 用 3、4，0 是别人的，5–7 先不占。
+
 
 ## 第二条道（cpp-actor）
 
