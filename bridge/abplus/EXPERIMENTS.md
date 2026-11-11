@@ -10804,6 +10804,58 @@ d1 之后，主线程每周期仍进 Python 约 8,300 次（next_record 每 2 ms
   - 测试 test_b58g_pause。
   - 状态：4090 上未运行（那次计时的 E 臂是修复之前的代码）。3090 上 test_b58g_pause 两项通过：pause() 在 1 s 内报错，pause_serving 返回时 driver 已停、lane 已回复，stop() 结束 lane 等待。3090 的两臂用的是修复之后的树。
 
+### cpp 线 3090 分卡基线：actor 卡 + learner 卡，driver 线程时间线、主线程 GIL（2026-11-11）
+
+#### 实验目的
+
+这台机器定为“2 分片 ×（actor 卡 + learner 卡）”。在这个形态下给 cpp 线定基线：collect 里 driver 线程的时间各花在哪，主线程 GIL 是否仍在门内。作为 M1 和 d2 的对照。
+
+#### 实验方法
+
+- **机器**：8x3090（Gold 6146，RTX 3090，torch 2.7.1+cu128，驱动 580）。cpp 道：node1（CPU 12-23,36-47），GPU 4 放 actor、GPU 5 放 learner（`EXTRA=--learner-device=cuda:1`），容器 64 g。
+- **树**：c-02b2169，即主线 31d37f2 合进 cpp 分支：learner 设备参数、退出顺序修复、capture 模式开关。M1 关，B58e 批量开，原生 consumer / 谱系 / lane（driver 线程）开。capture 模式用默认值（ISAAC_CAPTURE_MODE 未设，即 global），两次运行一样。
+- **合并后的门**：
+  - global：带 entry 和 A8 的全量门 1 遍，全部测试再跑 2 遍。entry 3 passed；全部测试 3 遍都是 279 passed、3 skipped、1 xfailed（M1 的 restore 顺序对照组）；A8 8/8。
+  - `ISAAC_CAPTURE_MODE=thread_local`：带 entry 和 A8 的全量门 1 遍，结果相同。
+  - 主线门上的已知项一个都没出现。
+- **计时**：bm1/prof.sh（P24），24 轮，锁写明“计时运行”。
+- **GIL**：bm1/nsys_gil.sh，不计时。nsys 2023.4.4 只开 `-t nvtx,python-gil`，不开 CUDA 跟踪；容器进程上限 16384；交接 2–5，第 6 轮后 SIGINT。分析用 b57_nsys.py。
+
+#### 实验结果
+
+| 分卡基线（split-base-c-02b2169） | 值 |
+|---|---:|
+| 游戏小时（25 行） | 30.35 |
+| ×实时，u10–u23 / u2–u23 中位 | 225.4 / 227.0 |
+| collect / update / wait_learner（s，u10+） | 17.94 / 18.75 / 0.93 |
+| u15 cf_done / nobank / queue / dropped | 100 / 0 / 0 / 0 |
+| done/s，lane 调用 /s，done /游戏小时（到 u15） | 0.342，458，5.49 |
+| 点寿命 p50 / p90（s），同时存活点数均值 / 上限 | 16.3 / 23.1，6.4 / 10.5 |
+| lane 请求从读到回复 p50 / p90，worker 侧 p50 | 5 / 6 ms，4 ms |
+| GPU 4（actor）/ GPU 5（learner）利用率中位，显存 | 72% / 95%，2.4 / 16.2 GB |
+| 容器内存峰值 / 稳态，宿主最低可用 | 48.2 / 41.2 GB，56.6 GB |
+| 占核：容器 / trainer / workers | 12.87 / 2.07 / 3.96 |
+
+- **driver 线程每 collect 的时间线**（u10+ 中位，s），一个 collect 的 driver 循环共 18.41：
+
+| lane 作业 | 主步等 GPU（sync） | 等 game worker（poll） | 写页 | 准备 | consumer | 回复 | 其余 |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 6.81 | 6.91 | 0.16 | 0.86 | 0.47 | 0.46 | 0.21 | 2.53 |
+
+  - “其余”是循环总时间减去各相，包括 lane pass 本身（窗口、控制、回复）、谱系和事件批。
+  - 每 collect 主步 2,145、lane 作业 3,165（9,471 行），其中当前版本 1,833 行、旧版本 4,765 行。
+  - 等 game worker 只有 0.16 s：worker 的请求总是先到，瓶颈不在 worker。
+- **主线程 GIL**（nsys，窗口 53.4 s，3 个完整 collect，learner.update 3 次完整，没有截断）：
+  - 持有 0.20 s / 周期，等待 0.03 s / 周期，≤ 0.5 s 的门达标。
+  - 顶层进入：c.wait 88 次（每周期约 29 次，每次约 0.49 s）、交接 6 步、c.events 1 次，约 36 次 / 周期，≤ 500 的门达标。
+  - 按 python-gil 的持有区间数是 9,988 次 / 周期，和 4090 上 8,800 的口径相同。
+  - learner 线程持有 2.17 s、等待 0.61 s / 周期。
+- **结论**：
+  - 分卡后 collect（17.94 s）已经短于 update（18.75 s），actor 每周期要等 learner 0.93 s。周期由 learner 决定。
+  - 所以 M1 / d2 缩短 collect，在这个形态下对 ×实时的直接收益会被 learner 限住，只有 learner 也变快时才全部兑现。
+  - driver 线程上 lane 作业（6.8 s）和主步等 GPU（6.9 s）仍是 collect 的两大块，这是 M1 要砍的。
+  - nsys 在这台机器上关掉 CUDA 跟踪、只开 nvtx 和 python-gil，可以正常使用。
+
 ### B62 learner线程的GIL暴露面：合并C++ actor树、切换间隔、Python派发（2026-11-10，步骤0完成）
 
 #### 实验目的
