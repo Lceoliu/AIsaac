@@ -4,7 +4,8 @@
 #   container: aisaac-bench-bm1-a1-<purpose>, --rm, 64 GB, /bench = cpu-wide (the game runtime read-only), the
 #   caller's uid, HOME=/bench/bm1/home (every cache: isaac-actor, learn-native, visible, Inductor, Triton).
 #   PYTHONPATH=/bench/bm1/pydeps (packages the shared venv lacks or has at another version than the 4090; README).
-#   Lane (environment, defaults = node0): CPUSET=0-11,24-35 MEMS=0 GPUS_OK=1,2,3; MEM=64g.
+#   Lane (environment, defaults = node0): CPUSET=0-11,24-35 MEMS=0 GPUS_OK=1,2,3; MEM=64g; PIDS=4096 (the pids limit:
+#   nsys injects threads into every traced process: nsys_update.sh raises it).
 set -eu
 BM=${BM:-/home/runaiwusheng/aisaac-bench-20261019/cpu-wide/bm1}
 B=$(dirname "$BM")
@@ -15,7 +16,7 @@ for g in $(echo "$G" | tr ',' ' '); do
 done
 mkdir -p "$BM/home"
 exec docker run --rm --init --name "aisaac-bench-bm1-a1-$P" --runtime=nvidia --network none \
-  --cpuset-cpus "$CPUSET" --cpuset-mems "$MEMS" --memory "$MEM" --memory-swap "$MEM" --shm-size 8g --pids-limit 4096 \
+  --cpuset-cpus "$CPUSET" --cpuset-mems "$MEMS" --memory "$MEM" --memory-swap "$MEM" --shm-size 8g --pids-limit ${PIDS:-4096} \
   --log-opt max-size=10m --log-opt max-file=2 --read-only --tmpfs /tmp:rw,exec,size=4g \
   --user "$(id -u):$(id -g)" \
   -v "$B:/bench" -v "$B/home/isaac-abplus/runtime:/bench/home/isaac-abplus/runtime:ro" \

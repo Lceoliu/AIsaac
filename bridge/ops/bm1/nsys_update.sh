@@ -15,7 +15,7 @@ take "nsys $TAG ($TREE, GPU $GPU, not timed)"
 C=aisaac-bench-bm1-a1-nsys-$TAG
 NS="$NSYS profile -t cuda,nvtx --sample=none --cpuctxsw=none --cuda-graph-trace=graph --capture-range=nvtx --nvtx-capture=B50window -e NSYS_NVTX_PROFILER_REGISTER_ONLY=0 --capture-range-end=stop -o /bench/bm1/reports/$TAG.nsys-rep --force-overwrite true"
 DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 -e ISAAC_BLOCK_NVTX=1 -e ISAAC_NSYS_RANGE=$RANGE -e ISAAC_NSYS_TRIGGER=nvtx -e EXTRA=--learner-device=cuda:1" \
-  $BM/dock.sh nsys-$TAG $GPU sh -c "NSYS_PREFIX='$NS' sh /bench/bm1/xnew2.sh $TAG 3000 30.0" &
+  PIDS=16384 $BM/dock.sh nsys-$TAG $GPU sh -c "NSYS_PREFIX='$NS' sh /bench/bm1/xnew2.sh $TAG 3000 30.0" &
 DP=$!
 while kill -0 $DP 2>/dev/null; do
   sleep 10
