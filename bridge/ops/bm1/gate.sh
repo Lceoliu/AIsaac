@@ -13,7 +13,7 @@ i=1
 while [ $i -le $RUNS ]; do
   take "full gate $TREE run $i/$RUNS (GPU $GPU, not timed)"
   GL=$R/tests-full-$TREE-$(date +%m%d-%H%M%S).log
-  DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=$BM1_IN/payloads/b45-payloads2 ${ENVS:-}" \
+  DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=${BM1_PAYLOADS:-$BM1_IN/payloads}/b45-payloads2 ${ENVS:-}" \
     $BM/run.sh gate-$TREE $GPU sh -c "cd $BM1_IN/trees/$TREE/bridge/python && timeout 3000 $BM1_PY -m pytest tests -q -p no:cacheprovider $*" > $GL 2>&1
   rc=$?
   echo "$(date '+%F %T') gate $TREE run $i/$RUNS (capture mode $(capmode $TREE)) rc=$rc $(tail -1 $GL | cut -c1-200) ($GL)" >> $LOG
