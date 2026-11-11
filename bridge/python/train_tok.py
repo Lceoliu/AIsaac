@@ -1557,6 +1557,10 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--heads', type=int, default=4)
     p.add_argument('--checkpoint-every', type=int, default=25)
     p.add_argument('--seed', type=int, default=1000)
+    p.add_argument('--shard-lr-mult', type=float, default=1.0,
+                   help='BM1 C (ISAAC_SHARD_WORLD > 1): the learning rate (and its final value) times this factor; '
+                        '1.0 keeps the single shard rate (the batch / step policy is the user choice: rollout and '
+                        'minibatch are the usual flags)')
     p.add_argument('--port', type=int, default=28300)
     p.add_argument('--name', default='tk')
     p.add_argument('--stub-list', default='')
@@ -2018,6 +2022,12 @@ def main(argv=None, child=None, actor=None):
                         'the learner thread runs Python (default of Python: 0.005; B62: the default from '
                         'ISAAC_SWITCH_INTERVAL_US, 500 us when unset)')
     args = p.parse_args(argv)
+    shard_world = int(os.environ.get('ISAAC_SHARD_WORLD', '1') or 1)   # BM1 C: K shards as one run (shard_sync)
+    shard_rank = int(os.environ.get('ISAAC_SHARD_RANK', '0') or 0) if shard_world > 1 else 0
+    if shard_world > 1:   # (every rank its own games and draws; rank 0's weights are broadcast at the start)
+        args.seed += 7340033 * shard_rank
+        print(f'BM1 C shard {shard_rank} of {shard_world}: seed {args.seed}, learning rate x {args.shard_lr_mult}',
+              flush=True)
     # B62: how the host threads wait for the GPU (ISAAC_CUDA_BLOCKING_SYNC; set before the CUDA context exists)
     from isaac_bridge import cuda_sched
     cuda_sched_req = cuda_sched.apply()
@@ -2555,6 +2565,20 @@ def main(argv=None, child=None, actor=None):
         print(f'aux (tok_aux): horizons {aux_h}, coef {args.aux_coef}, input o_t ({args.temporal_width}), '
               f'{sum(q.numel() for q in aux_head.parameters()) / 1e6:.2f}M parameters, {len(AUX_STATE)} state + '
               f'{len(AUX_EVENTS)} events + return per scale', flush=True)
+    SYNC = None   # BM1 C: the ranks' process groups; rank 0's weights and optimiser states everywhere
+    if shard_world > 1:
+        if proc or args.actor_processes > 1 or os.environ.get('ISAAC_RL_LEARNER_BENCH'):
+            raise SystemExit('BM1 C (ISAAC_SHARD_WORLD > 1): the learner in this process, one actor process, no bench')
+        from isaac_bridge.shard_sync import ShardSync
+        SYNC = ShardSync.from_env(lm_dev).init()
+        SYNC.broadcast_state([learner_model, pcritic, aux_head], [opt, popt, aopt])
+        if aux_norm is not None:
+            _, (n_a, aux_norm.mean, aux_norm.m2, aux_norm.rn, aux_norm.rm2) = SYNC.check(
+                [], [], (np.array([aux_norm.n]), aux_norm.mean, aux_norm.m2, aux_norm.rn, aux_norm.rm2))
+            aux_norm.n = float(n_a[0])
+            aux_norm.reduce = lambda m_: SYNC.sum(np.asarray(m_, np.float64).tolist())
+        print(f'BM1 C shard {SYNC.rank} of {SYNC.world}: process groups up ({lm_dev}), the state of rank 0 broadcast',
+              flush=True)
     amp = args.amp == 'bf16'
     if amp and not torch.cuda.is_bf16_supported():
         raise SystemExit('--amp bf16: this GPU has no bfloat16 support')
@@ -3064,6 +3088,11 @@ def main(argv=None, child=None, actor=None):
     start_decisions = decisions_total
 
     def save(path):
+        if SYNC is not None and SYNC.rank != 0:   # BM1 C: the shared state is rank 0's (identical everywhere): the others
+            path = Path(path)                     # save only their last.pt, as last-rank<r>.pt (an abnormal end's)
+            if not path.name.startswith('last'):
+                return
+            path = path.with_name(f'{path.stem}-rank{SYNC.rank}{path.suffix}')
         torch.save(dict(model=learner_model.state_dict(), optimizer=opt.state_dict(), update=L['update'],
                         decisions=L['decisions'], seconds=L['seconds'], config=learner_model.config, args=vars(args),
                         steady_updates=L.get('steady_updates',0),
@@ -3369,8 +3398,14 @@ def main(argv=None, child=None, actor=None):
         else:
             flat = np.flatnonzero(mask.reshape(-1))
             count = len(flat)
-        frac = min(1.0, (L['decisions'] - start_decisions) / max(1, target_decisions - start_decisions))
-        lr = args.lr + (args.lr_final - args.lr) * frac
+        if SYNC is None:
+            frac = min(1.0, (L['decisions'] - start_decisions) / max(1, target_decisions - start_decisions))
+            lr = args.lr + (args.lr_final - args.lr) * frac
+        else:   # BM1 C: the global progress (every rank the same learning rate), times --shard-lr-mult
+            num_, den_ = SYNC.sum([float(L['decisions'] - start_decisions), float(target_decisions - start_decisions)])
+            frac = min(1.0, num_ / max(1.0, den_))
+            lr = (args.lr + (args.lr_final - args.lr) * frac) * args.shard_lr_mult
+        L['shard_frac'] = frac
         for g in opt.param_groups:
             g['lr'] = lr
         if aux_on:
@@ -3857,7 +3892,29 @@ def main(argv=None, child=None, actor=None):
         gn_acc = torch.zeros(1, device=device) if gn_on else None
         gn_clip = torch.zeros(1, device=device) if gn_on else None   # (B51: optimizer steps whose norm was clipped)
 
-        def step_params():
+        # BM1 C: the parameters whose gradients the ranks average (the three optimisers'), the steps of this update
+        sync_step = [0]
+        sync_params = None
+        if SYNC is not None:
+            if branching:
+                raise RuntimeError('BM1 C: the choice branches (their own optimiser) are not synchronised across shards')
+            sync_params = ([q for g_ in opt.param_groups for q in g_['params']]
+                           + (list(pcritic.parameters()) if priv_on else []) + (list(aux_head.parameters()) if aux_on else []))
+
+        def shard_check():
+            """BM1 C: the ranks' parameters, Adam states and AuxNorm compared by hash; a mismatch: rank 0's everywhere."""
+            arrs = ((np.array([aux_norm.n]), aux_norm.mean, aux_norm.m2, aux_norm.rn, aux_norm.rm2)
+                    if aux_norm is not None else ())
+            mis_, back_ = SYNC.check([learner_model, pcritic if priv_on else None, aux_head if aux_on else None],
+                                     [opt, popt if priv_on else None, aopt if aux_on else None], arrs)
+            if mis_:
+                if aux_norm is not None:
+                    aux_norm.n = float(back_[0][0])
+                    aux_norm.mean, aux_norm.m2, aux_norm.rn, aux_norm.rm2 = back_[1:]
+                if CX2 is not None:
+                    P2.broadcast()
+
+        def step_params(weight=1.0):
             """BM1: the learner's one parameter-update entry, from the gradients being final (the minibatch's last
             part's backward done) to the three optimisers' steps: priv's and aux's clip and step, the B43 gradient
             norms (Writer, Spatial), the policy's clip, its step. A pure move of the code that was inline here (the
@@ -3869,6 +3926,9 @@ def main(argv=None, child=None, actor=None):
                 SEG.mark(start='opt.p2_reduce')
                 with bpt.GpuSpan('p2_reduce'):
                     P2.reduce()
+            if SYNC is not None:   # BM1 C: the ranks' gradients, the global minibatch's mean (weight: this rank's rows)
+                SEG.mark(start='opt.shard_reduce')
+                SYNC.reduce_grads(sync_params, weight)
             if L.get('trace') is not None:   # B18 check: the loss sums after each step, the first step's gradient
                 acc_t, tacc_t = ((acc, tacc) if CX2 is None else
                                  (acc + CX2.acc.to(device), tacc + CX2.tacc.to(device)))   # (BM1 P2: both cards)
@@ -3899,6 +3959,11 @@ def main(argv=None, child=None, actor=None):
             SEG.mark(start='opt.step')
             with (bpt.GpuSpan('learn_opt') if block_on else contextlib.nullcontext()):
                 opt.step()
+            if SYNC is not None:
+                sync_step[0] += 1
+                SYNC.maybe_flip(L['update'] + 1, sync_step[0], sync_params)
+                if SYNC.check_mode == 'step':
+                    shard_check()
             if CX2 is not None:
                 SEG.mark(start='opt.p2_bcast')
                 with bpt.GpuSpan('p2_bcast'):
@@ -4133,6 +4198,7 @@ def main(argv=None, child=None, actor=None):
                                     aux_acc_ev=aux_acc_ev if aux_on else None, bwd_calls='learn_bwd_calls',
                                     bwd_span='learn_bwd')
         CX2 = None
+        shard_s0 = dict(SYNC.stats) if SYNC is not None else None   # (BM1 C: this update's share of the counters)
         if p2_mode == 'two':   # the replicas get the learner's parameters; the second card's accumulators
             P2.bind()
             p2_s0 = dict(P2.stats)
@@ -4296,6 +4362,9 @@ def main(argv=None, child=None, actor=None):
             mb_ats = [a_ for a_ in range(0, n_units, mb_units) if len(eperms.get(0)[1][a_:a_ + mb_units]) >= mb_units // 4]
             if mb_ats:
                 ppo_submit(part_chunks(*first_part(0, mb_ats[0])))
+        if SYNC is not None:   # BM1 C: the ranks' minibatch counts per epoch agreed (the loop below skips a tail < 1/4)
+            n_mb_local = sum(1 for a_ in range(0, n_units, mb_units) if min(mb_units, n_units - a_) >= mb_units // 4)
+            n_mb_global = SYNC.max_int(n_mb_local)
         for ep_ in range(args.epochs):
             ep_now[0] = ep_
             if t_on:   # (B31) the rooms made before each chunk: every room token's K / V once per epoch (stop-grad)
@@ -4531,9 +4600,20 @@ def main(argv=None, child=None, actor=None):
                     v2_steps += 1
                     sec('teach')
                 m_ = pmark('b38:clip_opt', m_)
-                step_params()   # (BM1: the one parameter-update entry)
+                step_params(float(n_sel))   # (BM1: the one parameter-update entry)
                 pmark(None, m_)
                 sec('opt')
+            if SYNC is not None and n_mb_global > n_mb_local:   # BM1 C: this rank had fewer minibatches: zero-weight
+                for _ in range(n_mb_global - n_mb_local):        # steps (every rank makes the same collectives)
+                    opt.zero_grad(set_to_none=True)
+                    if priv_on:
+                        popt.zero_grad(set_to_none=True)
+                    if aux_on:
+                        aopt.zero_grad(set_to_none=True)
+                    if CX2 is not None:
+                        P2.zero_grad()
+                    step_params(0.0)
+                    SYNC.stats['pad_steps'] += 1
         if CX2 is not None:   # BM1 P2: the second card's statistics added into the main card's sums
             for nm_ in P2_ACC:
                 if getattr(CX, nm_) is not None:
@@ -4541,6 +4621,8 @@ def main(argv=None, child=None, actor=None):
         if block_on:
             blearn.PREFETCH.drop()   # (B48: a part prepared for nothing left: its staging buffer freed)
             learner_dump.end(learner_model)   # (B44 ISAAC_LEARNER_DUMP: measurement only)
+        if SYNC is not None and SYNC.check_mode != 'step':   # BM1 C: once per update (before the actor's copy)
+            shard_check()
         learner_model.eval()
         choice_log = train_choice() if branching else {}   # Phase B2 (before the actor takes the new weights)
         seg_end = SEG._event() if SEG.active else None   # (BM1: the anchor of the segments' lags)
@@ -4685,6 +4767,17 @@ def main(argv=None, child=None, actor=None):
             row.update(aux_log)
         row.update({f'u_{k}': v for k, v in U.items()})
         row.update({f'uc_{k}': v for k, v in UC.items()})   # (B60)
+        if SYNC is not None:   # BM1 C: K, the learning rate's factor and value, this update's steps (zero-weight ones
+            # among them), the global rows per step, the seconds waiting for the slowest rank / reducing, the checks
+            st_ = SYNC.stats
+            row.update(shard_world=SYNC.world, shard_rank=SYNC.rank, shard_lr_mult=args.shard_lr_mult,
+                       shard_frac=L.get('shard_frac', 0.0), shard_steps=st_['steps'] - shard_s0['steps'],
+                       shard_pad_steps=st_['pad_steps'] - shard_s0['pad_steps'],
+                       shard_rows_per_step=(st_['rows'] - shard_s0['rows']) / max(1, st_['steps'] - shard_s0['steps']),
+                       shard_wait_s=st_['wait_s'] - shard_s0['wait_s'], shard_reduce_s=st_['reduce_s'] - shard_s0['reduce_s'],
+                       shard_checks=st_['checks'] - shard_s0['checks'],
+                       shard_mismatches=st_['mismatches'] - shard_s0['mismatches'],
+                       shard_restores=st_['restores'] - shard_s0['restores'])
         if P2 is not None:   # BM1 P2: the mode, the host seconds of the reduce / broadcast / the waits for the second card
             row['p2_mode'] = p2_mode
             if CX2 is not None:
@@ -5473,7 +5566,13 @@ def main(argv=None, child=None, actor=None):
         sent_handoffs = 0
         rollout_actor = args.rollout // n_act
         nsys_win = nv.profiler_window()
-        while (handed < target_decisions if n_act == 1 and not args.max_updates else sent_handoffs < n_handoffs) and sampler.live and                 not L.get('stop') and not stopped():
+        while True:
+            go_on = ((handed < target_decisions if n_act == 1 and not args.max_updates else sent_handoffs < n_handoffs)
+                     and sampler.live and not L.get('stop') and not stopped())
+            if SYNC is not None:   # BM1 C: every rank goes on, or none (the same number of updates everywhere)
+                go_on = SYNC.all_true(go_on and not SYNC.stop_requested())
+            if not go_on:
+                break
             # ---- collect
             t0 = time.perf_counter()
             nv.profiler_mark(sent_handoffs, nsys_win)
@@ -6135,6 +6234,10 @@ def main(argv=None, child=None, actor=None):
             save(out / 'checkpoints' / 'last.pt')
             if slog is not None:
                 slog.close()
+        if SYNC is not None:   # BM1 C: the run's synchronisation counters; the process groups closed
+            print(f'BM1 C shard {SYNC.rank}: {SYNC.stats}' + (f'; rank {SYNC.peer_lost[0]} ended first'
+                                                             if SYNC.peer_lost else ''), flush=True)
+            SYNC.close()
         sampler.close()
         if log_file is not None:
             log_file.close()
