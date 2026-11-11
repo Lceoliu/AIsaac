@@ -32,7 +32,7 @@ P_=""
 for k in 0 1; do
   f=$LF0; [ $k = 1 ] && f=$LF1
   G=$(lane $f LANE_GPUS)
-  NOLOCK=1 LOCKS_HELD="both lanes" GPU=$G GPUS_OK=$G CPUSET=$(lane $f LANE_CPUSET) MEMS=$(lane $f LANE_MEMS) \
+  NOLOCK=1 LANE_CPUS=1 LOCKS_HELD="${LOCKS_HELD:-both lanes}" GPU=$G GPUS_OK=$G CPUSET=$(lane $f LANE_CPUSET) MEMS=$(lane $f LANE_MEMS) \
     MEM=$(lane $f LANE_MEM) ENVS="$X -e NAME=$(lane $f LANE_NAME) -e PORT=$(lane $f LANE_PORT) ${ENVS:-}" \
     $BM/prof.sh $TAG-s$k $TREE &
   P_="$P_ $!"
