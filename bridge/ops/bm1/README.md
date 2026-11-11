@@ -72,3 +72,4 @@ GPU=1 ./probe.sh m77657fc
 
 - `tests/test_block_memory.py` 在 import 时调用 `torch.set_num_threads(4)`：只要它被收集，之后的所有测试都在 4 个 intra-op 线程下跑。现有的全部通过记录都是在这个条件下得到的，所以暂时不改；以后有空档时改成 fixture（设置后恢复）。conftest 的 session 预热在收集之后做，所以由它带起来的 libgomp 线程池不会被记到某个测试头上。
 - `xnew2.sh` 的 `NAME` 和 `PORT`（默认 b42new / 39200，和 4090 一样）：同一台机器上跑几个 trainer 时，每个要不同（shard2.sh 用 s0a / 39200 和 s1b / 39600）。
+- Nsight Systems 2023.4.4（和 4090 同版本）在这台机器上（cu128 运行时 + 580 驱动）做 CUDA 跟踪时：learner 那张卡的 kernel 没有记下来，learner.update 截断，trainer 在 capture 结束后段错误退出（rc 139）。推测是 CUPTI 版本和 CUDA 12.8 不配套，未确认。第一次还撞上了容器的 pids 上限（nsys 往每个被跟踪的进程注入线程），所以加了 `PIDS`。learner 的分段时间改用 `ISAAC_BLOCK_TIMING=1` 下的 CUDA event 分段（`isaac_bridge/learn_segments.py`，写到 `<run>/segments.jsonl`，用 `seg_table.py` 出表）。
