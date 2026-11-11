@@ -72,6 +72,59 @@ class Emulated:
             ctypes.memset(at, 0, zero)
 
 
+class EmulatedPages(Emulated):
+    def pages_(self, n, ids, rows_per_page, n_pages, pages, row_bytes, out):
+        ids, pages = _i64(ids, n), _i64(pages, n_pages)
+        for i in range(n):
+            if ids[i] < 0 or ids[i]//rows_per_page >= n_pages:
+                return i
+            ctypes.memmove(out+i*row_bytes, int(pages[ids[i]//rows_per_page])+int(ids[i] % rows_per_page)*row_bytes,
+                           row_bytes)
+        return -1
+
+
+class EmulatedN4(EmulatedPages):
+    """+ abp_learn_reader, transcribed loop for loop from the C source (the wrapper's sizes and the algorithm checked
+    against the reference where no compiler is)."""
+    def reader_(self, nb, ids, T, max_m, Pd, lat, mt, n_old_total, lens, row_start, at_k, nk, kinv, kv_steps,
+                old_start, n_old, old_ends, new_start, complete, new_ends, zidx, real, kvidx, kp, ends, dst, src):
+        A = (lambda addr, n: _i64(addr, n))
+        ids = A(ids, nb)
+        big = 1 << 22   # (views long enough for this test's arrays; only written where the C loop writes)
+        lens, row_start, at_k, nk, old_start, n_old, new_start, complete = (
+            A(x, int(max(ids)+1) if nb else 0) for x in (lens, row_start, at_k, nk, old_start, n_old, new_start,
+                                                         complete))
+        kinv_a = A(kinv, int(at_k[-1]+nk[-1]) if nb and len(at_k) else 0) if nb else None
+        out = {k: v for k, v in (('zidx', zidx), ('real', real), ('kvidx', kvidx), ('kp', kp), ('ends', ends),
+                                 ('dst', dst), ('src', src))}
+        mem = (lambda addr, i, v: ctypes.c_int64.from_address(addr+8*int(i)).__setattr__('value', int(v)))
+        get = (lambda addr, i: ctypes.c_int64.from_address(addr+8*int(i)).value)
+        at_real = at_dst = 0
+        for r in range(nb):
+            i = int(ids[r]); n = int(lens[i])
+            for j in range(n):
+                mem(zidx, r*T+j, row_start[i]+j); mem(real, at_real, r*T+j); at_real += 1
+            k0 = int(at_k[i])
+            for j in range(int(nk[i])):
+                mem(kvidx, r*Pd+j, get(kinv, k0+j))
+                for l in range(lat):
+                    mem(kp, r*Pd*lat+j*lat+l, get(kv_steps, k0+j))
+            t = 0
+            for b in range(int(n_old[i])):
+                v, e = int(old_start[i])+b, get(old_ends, int(old_start[i])+b)
+                for q in range(mt):
+                    mem(ends, r*max_m+t*mt+q, e); mem(dst, at_dst, r*max_m+t*mt+q); mem(src, at_dst, v*mt+q)
+                    at_dst += 1
+                t += 1
+            for b in range(int(complete[i])):
+                v, e = n_old_total+int(new_start[i])+b, get(new_ends, int(new_start[i])+b)
+                for q in range(mt):
+                    mem(ends, r*max_m+t*mt+q, e); mem(dst, at_dst, r*max_m+t*mt+q); mem(src, at_dst, v*mt+q)
+                    at_dst += 1
+                t += 1
+        return at_dst
+
+
 def _variants():
     out = ['emulated']
     if learn_native.build() is not None:
@@ -83,7 +136,7 @@ def _variants():
 def lib(request, monkeypatch):
     monkeypatch.setattr(learn_native, 'ENABLED', True)
     monkeypatch.setitem(learn_native._LIB, 'lib',
-                        learn_native.Library(learn_native.build()) if request.param == 'c' else Emulated())
+                        learn_native.Library(learn_native.build()) if request.param == 'c' else EmulatedN4())
     return request.param
 
 
@@ -475,3 +528,104 @@ def test_epoch_perms_on_cuda_keep_the_serial_order_whichever_generator():
             ep.get(e+1)
         lazy.append(draws)
     assert lazy == serial
+
+
+def test_lean_checkpoint_same_outputs_and_gradients(monkeypatch):
+    """B62 N5: the learner's Spatial checkpoint without the determinism metadata and RNG stashing gives the default
+    checkpoint's outputs and every gradient bit for bit (CPU, one thread)."""
+    from test_block_packed_learner import _rollout_and_teacher
+    from isaac_bridge.block_training import forward_bucketed
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    monkeypatch.setattr(block_learner, 'PACKED', True)
+    monkeypatch.setattr(block_learner, 'SPATIAL_CKPT', 1)
+    try:
+        res = []
+        for kw in (dict(use_reentrant=False), block_learner.LEAN_CKPT_KW):
+            monkeypatch.setattr(block_learner, 'CKPT_KW', kw)
+            m_, ch_, te_ = _rollout_and_teacher('cpu', seed=47)
+            m_.train()
+            out, _ = forward_bucketed(m_, ch_+te_, generator=torch.Generator().manual_seed(4), version=2, max_rows=4096)
+            loss = sum((o.float()*(i+1)).mean() for i, o in enumerate(out))
+            loss.backward()
+            res.append(([o.detach().clone() for o in out],
+                        {n: p.grad.clone() for n, p in m_.named_parameters() if p.grad is not None}))
+        (oa, ga), (ob, gb) = res
+        for x, y in zip(oa, ob):
+            assert torch.equal(x, y)
+        assert ga.keys() == gb.keys() and len(ga) > 10
+        for k in ga:
+            assert torch.equal(ga[k], gb[k]), k
+    finally:
+        torch.set_num_threads(threads)
+
+
+@pytest.mark.parametrize('device', ['cpu'] + (['cuda'] if torch.cuda.is_available() else []))
+def test_spatial_segment_draws_no_random_numbers(device, monkeypatch):
+    """B62 evidence for preserve_rng_state=False: a learner part's checkpointed Spatial segment (encode_block, forward
+    and the backward's recomputation) leaves the CPU and CUDA generators' states unchanged."""
+    from test_block_packed_learner import _rollout_and_teacher
+    from isaac_bridge.block_training import forward_bucketed
+    monkeypatch.setattr(block_learner, 'PACKED', True)
+    monkeypatch.setattr(block_learner, 'SPATIAL_CKPT', 1)
+    m_, ch_, te_ = _rollout_and_teacher(device, seed=48)
+    m_.train()
+    calls = []
+    inner = m_.encode_block
+
+    def spy(*a, **k):   # (the states around every call of the segment: the forward and its recomputation; the
+        #                  recomputation may end early by an exception (checkpoint's early stop): finally)
+        s0 = (torch.get_rng_state(), torch.cuda.get_rng_state() if device == 'cuda' else None)
+        try:
+            return inner(*a, **k)
+        finally:
+            s1 = (torch.get_rng_state(), torch.cuda.get_rng_state() if device == 'cuda' else None)
+            calls.append(torch.equal(s0[0], s1[0]) and (s0[1] is None or torch.equal(s0[1], s1[1])))
+    monkeypatch.setattr(m_, 'encode_block', spy)
+    out, _ = forward_bucketed(m_, ch_+te_, generator=torch.Generator().manual_seed(4), version=2, max_rows=4096)
+    n_fwd = len(calls)
+    sum(o.float().mean() for o in out).backward()
+    assert n_fwd > 0 and len(calls) > n_fwd and all(calls)
+
+
+@pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
+def test_pages_equal_store_gather_and_follow_new_pages(lib, dtype):
+    """B62 N3: learn_native.pages gives PagedStore._gather's bytes; a page added to the store after the address table
+    was built is read too (the table is rebuilt when the page count changes)."""
+    P = 8
+    class Store:   # (weakly referenceable, as PagedStore)
+        pass
+    store = Store()
+    store.page, store.kv_dtype, store.z_pages, store.b_pages = P, dtype, [], []
+    store.kv_pages = [torch.randn(P, 3, 5).to(dtype) for _ in range(3)]
+    ref_gather = (lambda ids, out: bp.PagedStore._gather(store, store.kv_pages, ids, (3, 5), dtype, out))
+    ids = np.array([0, 23, 9, 9, 17, 2], np.int64)
+    ref, got = torch.empty((len(ids), 3, 5), dtype=dtype), torch.empty((len(ids), 3, 5), dtype=dtype)
+    ref_gather(ids, ref)
+    assert learn_native.pages(store, 'kv', ids, got)
+    assert got.view(torch.uint8).numpy().tobytes() == ref.view(torch.uint8).numpy().tobytes()
+    store.kv_pages.append(torch.randn(P, 3, 5).to(dtype))
+    ids2 = np.array([31, 24, 3], np.int64)
+    ref2, got2 = torch.empty((3, 3, 5), dtype=dtype), torch.empty((3, 3, 5), dtype=dtype)
+    ref_gather(ids2, ref2)
+    assert learn_native.pages(store, 'kv', ids2, got2)
+    assert got2.view(torch.uint8).numpy().tobytes() == ref2.view(torch.uint8).numpy().tobytes()
+    with pytest.raises(IndexError):
+        learn_native.pages(store, 'kv', np.array([32]), got2[:1])
+    assert learn_native.pages(store, 'kv', ids[:0], got[:0])
+    assert not learn_native.pages(store, 'kv', ids, torch.empty((len(ids), 3, 5), dtype=torch.float64))
+
+
+def test_pages_on_a_real_store_equal_reference(lib):
+    """B62 N3 on a store the rollout fixture filled (kv / z / blocks; the native store where it builds)."""
+    from test_block_packed_learner import _rollout_and_teacher
+    _, chunks, _ = _rollout_and_teacher('cpu', seed=49)
+    store = chunks[0].snapshot.store
+    for which, shape, pl in (('kv', store.kv_shape, store.kv_pages), ('z', store.z_shape, store.z_pages),
+                             ('blocks', store.b_shape, store.b_pages)):
+        n = len(pl)*store.page
+        ids = np.random.default_rng(1).integers(0, n, 40)
+        ref = getattr(store, which)(ids)
+        got = torch.empty_like(ref)
+        assert learn_native.pages(store, which, ids, got)
+        assert got.view(torch.uint8).numpy().tobytes() == ref.view(torch.uint8).numpy().tobytes(), which

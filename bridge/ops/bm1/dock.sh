@@ -1,15 +1,18 @@
 #!/bin/sh
-# bm1 (8x3090 dgene): run one command in the aisaac-bench:20261019 image, on this lane's CPUs / NUMA node / one GPU.
-#   usage: dock.sh <purpose> <gpu> <command> [args...]
+# bm1 (8x3090 dgene): run one command in the aisaac-bench:20261019 image, on this lane's CPUs / NUMA node / GPU(s).
+#   usage: dock.sh <purpose> <gpu[,gpu...]> <command> [args...]
 #   container: aisaac-bench-bm1-a1-<purpose>, --rm, 64 GB, /bench = cpu-wide (the game runtime read-only), the
 #   caller's uid, HOME=/bench/bm1/home (every cache: isaac-actor, learn-native, visible, Inductor, Triton).
 #   PYTHONPATH=/bench/bm1/pydeps (packages the shared venv lacks or has at another version than the 4090; README).
-#   Lane (lane.sh: LANE=a1 node0 / LANE=cpp node1; environment overrides): CPUSET, MEMS, GPUS_OK, MEM=64g. LANE=cpp:
-#   container aisaac-bench-bm1-cpp-<purpose>, HOME=/bench/bm1/cpp/home, PYTHONPATH bm1/pydeps then bm1/cpp/pydeps.
+#   Lane (environment, defaults = node0): CPUSET=0-11,24-35 MEMS=0 GPUS_OK=1,2,3; MEM=64g.
+#   Lane (lane.sh: LANE=a1 node0 / LANE=cpp node1; environment overrides): LANE=cpp: container
+#   aisaac-bench-bm1-cpp-<purpose>, HOME=/bench/bm1/cpp/home, PYTHONPATH bm1/pydeps then bm1/cpp/pydeps.
 set -eu
 . "$(dirname "$0")/lane.sh"
-P=$1; G=$2; shift 2
-case ",$GPUS_OK," in *",$G,"*) ;; *) echo "dock.sh: GPU $G is not on this lane ($GPUS_OK)" >&2; exit 2 ;; esac
+P=$1; G=$2; shift 2   # (G: one GPU, or several comma-separated: the container sees them as cuda:0, cuda:1, ...)
+for g in $(echo "$G" | tr ',' ' '); do
+  case ",$GPUS_OK," in *",$g,"*) ;; *) echo "dock.sh: GPU $g is not on this lane ($GPUS_OK)" >&2; exit 2 ;; esac
+done
 mkdir -p "$LD/home"
 exec docker run --rm --init --name "$NAME-$P" --runtime=nvidia --network none \
   --cpuset-cpus "$CPUSET" --cpuset-mems "$MEMS" --memory "$MEM" --memory-swap "$MEM" --shm-size 8g --pids-limit 4096 \

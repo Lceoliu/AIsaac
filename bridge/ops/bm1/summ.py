@@ -38,7 +38,7 @@ def cpus(spec):
 def main():
     R, tag = sys.argv[1], sys.argv[2]
     lane = cpus(sys.argv[3] if len(sys.argv) > 3 else '0-11,24-35')
-    gpu = int(sys.argv[4]) if len(sys.argv) > 4 else 1
+    gpu = sys.argv[4] if len(sys.argv) > 4 else '1'
     out = []
     p = f'{R}/{tag}/progress.csv'
     rows = list(csv.DictReader(open(p))) if os.path.exists(p) else []
@@ -81,8 +81,8 @@ def main():
         out.append(f'  container cgroup: peak {max(f(x, "cg_peak_mb") for x in allm)/1024:.1f} GB, steady median '
                    f'{med(m, "cg_current_mb")/1024:.1f} GB (anon {med(m, "cg_anon_mb")/1024:.1f}, file '
                    f'{med(m, "cg_file_mb")/1024:.1f}); host MemAvailable min {min(f(x, "host_avail_mb") for x in allm)/1024:.1f} GB')
-        out.append('  cores used (steady): ' + ', '.join(
-            f'{k} {(f(m[-1], k+"_ticks")-f(m[0], k+"_ticks"))/100/dt:.2f}' for k in kinds)
+        out.append('  cores used (steady, medians of 5 s samples): ' + ', '.join(
+            f'{k} {med(m, k+"_cores"):.2f}' for k in kinds)
             + f', container {(f(m[-1], "cg_cpu_usec")-f(m[0], "cg_cpu_usec"))/1e6/dt:.2f}')
     th = window(f'{R}/{tag}.threads.csv', 't')
     if th:
@@ -101,20 +101,38 @@ def main():
                 per[name] = per.get(name, 0)+(k1-k0)/100/(t1-t0)
         top = sorted(per.items(), key=lambda kv: -kv[1])[:12]
         out.append('  trainer threads (cores, steady): ' + ', '.join(f'{n} {c:.2f}' for n, c in top))
-    g = []
+    # this run's GPU(s): 1 s samples; the index is the last column (older files without it: one GPU, `gpu`)
+    import datetime as dt_
+    g = {}
     if os.path.exists(f'{R}/{tag}.gpu'):
         for line in open(f'{R}/{tag}.gpu'):
             parts = [x.strip() for x in line.split(',')]
             try:
-                g.append((float(parts[1].split()[0]), float(parts[2].split()[0])))
+                t = dt_.datetime.strptime(parts[0], '%Y/%m/%d %H:%M:%S.%f').replace(tzinfo=dt_.timezone.utc).timestamp()
+                idx = parts[5] if len(parts) > 5 else gpu
+                g.setdefault(idx, []).append((t, float(parts[1].split()[0]), float(parts[2].split()[0])))
             except (IndexError, ValueError):
                 pass
-    if g:
+    ends = [float(x.split()[0]) for x in open(f'{R}/{tag}.rows')] if os.path.exists(f'{R}/{tag}.rows') else []
+    for idx, gi in sorted(g.items()):
         k = max(1, int(win))
-        gs = g[-k:]
-        out.append(f'  GPU {gpu} (1 s samples, steady): util median {st.median(x[0] for x in gs):.0f}% peak '
-                   f'{max(x[0] for x in gs):.0f}%, memory median {st.median(x[1] for x in gs)/1024:.1f} GB peak '
-                   f'{max(x[1] for x in g)/1024:.1f} GB')
+        gs = gi[-k:]
+        out.append(f'  GPU {idx} (1 s samples, steady): util median {st.median(x[1] for x in gs):.0f}% peak '
+                   f'{max(x[1] for x in gs):.0f}%, memory median {st.median(x[2] for x in gs)/1024:.1f} GB peak '
+                   f'{max(x[2] for x in gi)/1024:.1f} GB')
+        if ends:
+            # cycle phases from the row times (a row is written when its update ends): learner busy = [end - update_s,
+            # end] (the actor collects meanwhile unless it waits), learner only = the actor's wait_learner_s before
+            # the end
+            ph = {'both': [], 'learner only': [], 'actor only': []}
+            for kk in range(9, min(len(rows), len(ends))):
+                e, up, wl = ends[kk], f(rows[kk], 'update_s'), f(rows[kk], 'wait_learner_s')
+                wl = wl if wl == wl else 0.0
+                for t, u, _ in gi:
+                    if ends[kk-1] < t <= e:
+                        ph['learner only' if t > e-wl else 'both' if t >= e-up else 'actor only'].append(u)
+            out.append(f'  GPU {idx} util by cycle phase (u10+, nvidia-smi = share of time any kernel runs): ' + ', '.join(
+                f'{kk} {st.median(v):.0f}% (n {len(v)})' for kk, v in ph.items() if v))
     if os.path.exists(f'{R}/{tag}.allgpu'):
         other = {}
         lines = open(f'{R}/{tag}.allgpu').read().splitlines()[-8*max(1, int(win/5)):]   # (8 GPUs per sample)

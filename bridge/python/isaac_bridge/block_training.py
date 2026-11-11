@@ -60,6 +60,116 @@ def capture_yield():
         ucount('learn_yield_wait_s',time.perf_counter()-t);ucount('learn_yields_given',1)
 
 
+class SideCuda:
+    """B62: CUDA calls made off the threads that hold the capture admission vs the actor's graph captures.
+
+    The admission (CUDA_CAPTURE_ADMISSION) keeps the learner thread's submissions out of a capture; the learner
+    prefetch worker (block_learner.Prefetch, B48/B60) runs beside the learner thread without it, and its staging
+    (block_learner.Staging.acquire: event queries / synchronisations, pinned allocations and frees) makes CUDA calls.
+    capture_yield hands the admission to a waiting actor capture between two learner parts while the worker already
+    prepares the next part: one such call during a global-mode capture invalidates it ('operation failed due to a
+    previous error during capture'). The worker cannot take the admission itself (the learner thread holds it for the
+    whole update), so those calls take call() (shared, short) and graph_capture takes capture() (exclusive): a capture
+    waits for the calls under way, calls wait while a capture runs (writer first). ENABLED=False (tests' control
+    group only) turns both into no-ops.
+    Lock order: the capture admission, then capture() (graph_capture runs only after capture_admission); a call()
+    holds no other lock taken inside it and wraps one CUDA call only (Staging takes its own lock before, never
+    inside). A capturing thread that reaches call() inside its own capture raises (it would wait for itself).
+    Counters (progress.csv, b42_*): side_cuda_call_waits / _wait_s (calls that waited for a capture),
+    side_cuda_capture_waits / _wait_s (captures that waited for calls); a capture waiting over WARN_S prints a
+    warning (and keeps waiting)."""
+    ENABLED = True
+    WARN_S = 5.0
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.active = 0      # calls under way
+        self.capturing = 0   # captures under way or waiting for the calls
+        self.owners = set()  # threads in capture()
+        self.waits = 0       # calls that found a capture under way (tests)
+
+    @contextmanager
+    def call(self):
+        if not self.ENABLED:
+            yield
+            return
+        with self.cv:
+            if threading.get_ident() in self.owners:
+                raise RuntimeError('SIDE_CUDA.call() inside this thread\'s own graph capture (it would wait for '
+                                   'itself): a CUDA side call reached from a capture body')
+            if self.capturing:
+                self.waits += 1
+                t = time.perf_counter()
+                while self.capturing:
+                    self.cv.wait()
+                from .block_paged import ucount
+                ucount('side_cuda_call_waits', 1); ucount('side_cuda_call_wait_s', time.perf_counter()-t)
+            self.active += 1
+        try:
+            yield
+        finally:
+            with self.cv:
+                self.active -= 1
+                self.cv.notify_all()
+
+    @contextmanager
+    def capture(self):
+        if not self.ENABLED:
+            yield
+            return
+        me = threading.get_ident()
+        with self.cv:
+            self.capturing += 1   # (calls arriving from now on wait)
+            self.owners.add(me)
+            if self.active:
+                t = time.perf_counter()
+                warned = False
+                while self.active:
+                    self.cv.wait(timeout=1.0)
+                    if not warned and time.perf_counter()-t > self.WARN_S:
+                        warned = True
+                        print(f'B62 SIDE_CUDA: a graph capture has waited {time.perf_counter()-t:.1f} s for '
+                              f'{self.active} side CUDA call(s)', flush=True)
+                from .block_paged import ucount
+                ucount('side_cuda_capture_waits', 1); ucount('side_cuda_capture_wait_s', time.perf_counter()-t)
+        try:
+            yield
+        finally:
+            with self.cv:
+                self.capturing -= 1
+                self.owners.discard(me)
+                self.cv.notify_all()
+
+    def query(self, ev):
+        """ev.query() as one side call."""
+        with self.call():
+            return ev.query()
+
+    def wait_event(self, ev, poll=0.0005):
+        """ev.synchronize() as side calls: queries, each one call, the waits between them outside the gate (a capture
+        never waits for a call blocked on the GPU)."""
+        while not self.query(ev):
+            time.sleep(poll)
+
+
+SIDE_CUDA = SideCuda()
+from . import block_paged as _bp   # noqa: E402  (the gate's per-update counters in progress.csv, b42_*)
+_bp.UPD_KEYS = tuple(_bp.UPD_KEYS)+tuple(k for k in (
+    'side_cuda_call_waits', 'side_cuda_call_wait_s', 'side_cuda_capture_waits', 'side_cuda_capture_wait_s')
+    if k not in _bp.UPD_KEYS)
+
+
+# BM1 (decision 1, step 2): the capture's error mode, ISAAC_CAPTURE_MODE=global (default) | thread_local. In global mode
+# any other thread's unsafe CUDA call during a capture invalidates it -- event query / synchronize, stream synchronize,
+# a new pinned allocation, and also a new device allocation (cudaMalloc through the caching allocator), on the
+# capture's GPU or on another one; SIDE_CUDA covers only the prefetch worker's staging. In thread_local mode only the
+# capturing thread is restricted: b62_capture_probe2.py, 24 cases x 5 on the 3090 (cu128), every capture ended and
+# its graph replayed bit-identical to a quiet capture 128 times. gc stays off and the admission keeps captures apart.
+CAPTURE_MODE = os.environ.get('ISAAC_CAPTURE_MODE', 'global')
+if CAPTURE_MODE not in ('global', 'thread_local'):
+    raise ValueError(f'ISAAC_CAPTURE_MODE={CAPTURE_MODE!r}: global or thread_local')
+
+
 @contextmanager
 def graph_capture(graph,stream,pool=None):
     """torch.cuda.graph(graph, stream=stream) without its gc.collect() and empty_cache().
@@ -71,22 +181,28 @@ def graph_capture(graph,stream,pool=None):
     a graph_pool_handle shared with other graphs that never replay concurrently.
     B58: the cyclic garbage collector is off while the capture runs: an automatic collection inside it could free a
     dropped actor's CUDA graph or pinned buffers (CUDA calls during a global-mode capture: 'operation failed due to a
-    previous error during capture', test_driver_with_lanes_same_seed_reproducible once on the 4090). An unconfirmed
-    mitigation: the cause was not shown (3 reruns before the fix passed as well)."""
+    previous error during capture', test_driver_with_lanes_same_seed_reproducible once on the 4090). Confirmed (B62,
+    bridge/ops/b62_capture_probe.py on the 3090, 6 of 6): a captured CUDAGraph in a dropped reference cycle, collected
+    by gc.collect() inside a global-mode capture, invalidates it with that error, and the next capture then fails with
+    'captures_underway.empty() INTERNAL ASSERT' (the b62d / b62g gates' cascade); through graph_capture (gc off) the
+    capture ends right, 4 of 4. A dropped pinned buffer collected the same way does not break a capture.
+    B62: also exclusive of the CUDA calls made off the admission (SIDE_CUDA: the learner prefetch worker's staging).
+    BM1: the error mode is CAPTURE_MODE (ISAAC_CAPTURE_MODE, default global)."""
     import gc as gc_
-    torch.cuda.synchronize()
-    was = gc_.isenabled()
-    gc_.disable()
-    try:
-        with torch.cuda.stream(stream):
-            graph.capture_begin(pool=pool,capture_error_mode='global')
-            try:
-                yield graph
-            finally:
-                graph.capture_end()
-    finally:
-        if was:
-            gc_.enable()
+    with SIDE_CUDA.capture():
+        torch.cuda.synchronize()
+        was = gc_.isenabled()
+        gc_.disable()
+        try:
+            with torch.cuda.stream(stream):
+                graph.capture_begin(pool=pool,capture_error_mode=CAPTURE_MODE)
+                try:
+                    yield graph
+                finally:
+                    graph.capture_end()
+        finally:
+            if was:
+                gc_.enable()
 
 
 def capture_admission(key):

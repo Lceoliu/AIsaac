@@ -44,6 +44,14 @@ PACKED = os.environ.get('ISAAC_PACKED_LEARNER', '1') == '1'
 # fixed-input benchmark: OOM in the first training part); 4096-row checkpoints peak at 7.7 GB.
 SPATIAL_CKPT = int(os.environ.get('ISAAC_LEARN_SPATIAL_CKPT', '1'))
 SPATIAL_ROWS = int(os.environ.get('ISAAC_LEARN_SPATIAL_ROWS', '4096'))
+# B62 N5: the checkpoint without its per-saved-tensor bookkeeping on the learner thread: determinism_check 'none'
+# (the default 'default' records every saved tensor's shape / dtype / device under no_grad in the pack hook, a debug
+# check at recompute) and preserve_rng_state False (no stash / restore of the CPU and CUDA RNG states per call: the
+# Spatial encoder draws no random numbers). The same recomputation and values; ~5.7k fewer Python-level torch calls
+# per PPO part (B62 attribution; test_spatial_segment_draws_no_random_numbers guards the RNG premise).
+# ISAAC_LEARN_CKPT_LEAN=0: the B44-B60 call.
+LEAN_CKPT_KW = dict(use_reentrant=False, preserve_rng_state=False, determinism_check='none')
+CKPT_KW = LEAN_CKPT_KW if os.environ.get('ISAAC_LEARN_CKPT_LEAN', '1') == '1' else dict(use_reentrant=False)
 
 
 class _PrepLock:
@@ -81,6 +89,11 @@ class _PrepLock:
 #   store.decoded from the driver thread) only drops the cache's reference, never the arrays being copied.
 PREP_LOCK = _PrepLock()
 PREFETCH_ON = os.environ.get('ISAAC_LEARN_PREFETCH', '1') == '1'
+# B62 (D1 control arms): the B60 prefetch additions apart. ISAAC_LEARN_PREFETCH_RECOMPUTE=0: no preparation ahead for
+# the update's recompute groups; ISAAC_LEARN_PREFETCH_EPOCH=0: no next-epoch / first-part preparation ahead (the
+# epoch permutations then drawn at each epoch's start, as B48). ISAAC_LEARN_PREFETCH=0: no prefetch at all.
+PREFETCH_RECOMPUTE = PREFETCH_ON and os.environ.get('ISAAC_LEARN_PREFETCH_RECOMPUTE', '1') == '1'
+PREFETCH_EPOCH = PREFETCH_ON and os.environ.get('ISAAC_LEARN_PREFETCH_EPOCH', '1') == '1'
 # B60 test hook: the host decode layout when _prepare_packed is not told (None: packed on CUDA devices, as always;
 # True on the CPU runs the packed / C path there, for the CPU equivalence tests)
 HOST_PACKED = None
@@ -97,6 +110,13 @@ bp.UPD_KEYS = tuple(bp.UPD_KEYS)+tuple(k for k in (
     'learn_prefetch_submitted', 'learn_prefetch_cpu_s', 'learn_prefetch_wait_grad_s', 'learn_prefetch_wait_nograd_s',
     'learn_prefetch_skip_wait_s', 'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s')
     if k not in bp.UPD_KEYS)
+
+
+def _pages(store, which, ids, out):
+    """store.kv / store.z / store.blocks (which) of ids into out; B62 N3: in C outside the GIL (the same bytes)."""
+    if NATIVE_PACK and learn_native.pages(store, which, ids, out):
+        return out
+    return getattr(store, which)(ids, out=out)
 
 
 def _decode_compact(parts, packed):
@@ -137,11 +157,17 @@ class Prefetch:
                 id(kw.get('generator')), bool(grad))
 
     def _worker(self):
+        try:   # (B62: the OS thread name, so nsys / ps can tell this thread from the others)
+            import ctypes
+            ctypes.CDLL(None).prctl(15, b'learner-prefetch', 0, 0, 0)
+        except Exception:
+            pass
         while True:
             item = self.q.get()
             if item is None:
                 return
             model, chunks, grad, full, box, ev = item
+            del item
             with PREP_LOCK:
                 t0 = time.perf_counter()
                 c0 = time.thread_time()
@@ -152,6 +178,10 @@ class Prefetch:
                 bp.ucount('learn_prefetch_host_s', time.perf_counter()-t0)
                 bp.ucount('learn_prefetch_cpu_s', time.thread_time()-c0)
             ev.set()
+            # (B62) the worker's own references dropped now rather than at the next job. Not a SIDE_CUDA call: freeing
+            # a pinned buffer (used in a copy or not) from another thread does not break a global-mode capture
+            # (b62_capture_probe pin_free_used / pin_free_plain, 3090 + cu128, repeated)
+            del model, chunks, full, box, ev
 
     def submit(self, model, chunks, grad=True, **kw):
         """Queue the preparation of a later forward_packed(model, chunks, **kw) call in grad mode `grad`; False when
@@ -223,6 +253,17 @@ class Prefetch:
             self._free(box)
             self.misses += 1
             bp.ucount('learn_prefetch_dropped', 1)
+
+    def close(self, timeout=10.0):
+        """(B62) Queued parts given up, the worker stopped (joined); the next submit starts a new one. True when no
+        worker is left alive."""
+        self.drop()
+        t = self.thread
+        if t is not None and t.is_alive():
+            self.q.put(None)
+            t.join(timeout)
+        self.thread = None if t is None or not t.is_alive() else t
+        return self.thread is None
 
 
 PREFETCH = Prefetch()
@@ -436,10 +477,14 @@ class Staging:
         self.allocs = 0
 
     def acquire(self, n):
+        """(B62) Each CUDA call (event query, the wait for the last copy as queries, the old buffer's free with the
+        pinned allocation) is one block_training.SIDE_CUDA side call: the prefetch worker calls this without the
+        capture admission. Lock order: self.lock, then the gate inside it; nothing is taken inside the gate."""
+        from .block_training import SIDE_CUDA as gate
         with self.lock:
             free = [i for i, b in enumerate(self.bufs) if not b[2]]
             fit = [i for i in free if self.bufs[i][0].numel() >= n]
-            done = [i for i in fit if self.bufs[i][1] is None or self.bufs[i][1].query()]
+            done = [i for i in fit if self.bufs[i][1] is None or gate.query(self.bufs[i][1])]
             i = (done or fit or free or [None])[0]
             if i is None:
                 self.bufs.append([None, None, False])
@@ -447,12 +492,13 @@ class Staging:
             self.bufs[i][2] = True
             ev = self.bufs[i][1]
         if ev is not None:
-            ev.synchronize()
+            gate.wait_event(ev)
         b = self.bufs[i]
         b[1] = None
         if b[0] is None or b[0].numel() < n:
-            b[0] = None
-            b[0] = torch.empty(int(n*1.25)+self.ALIGN, dtype=torch.uint8, pin_memory=True)
+            with gate.call():
+                b[0] = None   # (the old buffer's free)
+                b[0] = torch.empty(int(n*1.25)+self.ALIGN, dtype=torch.uint8, pin_memory=True)
             self.allocs += 1
         return i, b[0]
 
@@ -808,6 +854,12 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
     tbk = np.array([chunk_bucket(int(n)) for n in lens], np.int64)
     flex_cap = None
     rbuckets = []
+    nk_all = np.array([len(p['kvs']) for p in parts], np.int64)
+    at_k = np.concatenate(([0], np.cumsum(nk_all)[:-1])).astype(np.int64)
+    if NATIVE_PACK:   # (B62 N4: the per-chunk tables in C; the inputs once per part)
+        kvs_steps = np.concatenate([p['kv_steps'] for p in parts]) if len(all_kvs) else np.empty(0, np.int64)
+        old_ends = np.concatenate([p['ends'] for p in parts]) if n_old_total else np.empty(0, np.int64)
+        new_ends_a = np.asarray(new_ends, np.int64)
     for T in sorted(set(tbk.tolist())):
         ids = np.flatnonzero(tbk == T)
         # (T > 1: at least 2 rows, a fully padded one if needed: the compiled Flex kernels keep a
@@ -824,14 +876,23 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
             Pd = (Pd*lat+127)//128*128//lat
         if flex_on:
             max_m = ((cfg.memory_blocks+(T+bs-1)//bs+1)*mt+127)//128*128
-        zidx = np.full((Bb, T), n_main, np.int64)
-        real = []
-        kvidx = np.full((Bb, max(Pd, 0)), len(ukv), np.int64)
-        kp = np.full((Bb, Pd*lat), -1, np.int64)
-        ends = np.full((Bb, max_m), -1, np.int64)
-        dst, src = [], []
-        at_k = np.concatenate(([0], np.cumsum([len(p['kvs']) for p in parts])[:-1])).astype(np.int64)
-        for r, i in enumerate(ids.tolist()):
+        nat = learn_native.reader_bucket(ids, T, Bb, max_m, Pd, lat, mt, n_main, len(ukv), n_old_total, lens,
+                                         row_start, at_k, nk_all, kinv, kvs_steps, old_start, n_old, old_ends,
+                                         new_start, complete, new_ends_a) if NATIVE_PACK else None
+        if nat is not None:
+            zidx, real_a, kvidx, kp, ends, dst_a, src_a = nat
+            real = [real_a]
+            dst, src = ([dst_a], [src_a]) if len(dst_a) else ([], [])
+            ids_loop = []
+        else:
+            zidx = np.full((Bb, T), n_main, np.int64)
+            real = []
+            kvidx = np.full((Bb, max(Pd, 0)), len(ukv), np.int64)
+            kp = np.full((Bb, Pd*lat), -1, np.int64)
+            ends = np.full((Bb, max_m), -1, np.int64)
+            dst, src = [], []
+            ids_loop = ids.tolist()
+        for r, i in enumerate(ids_loop):
             n = int(lens[i])
             zidx[r, :n] = row_start[i]+np.arange(n)
             real.append(r*T+np.arange(n))
@@ -866,12 +927,12 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
     slab = Slab(specs, device)
     _fill_merged(all_hosts, shapes, slab.host)
     if len(ukv):
-        store.kv(ukv, out=slab.host['kv'][:len(ukv)])
+        _pages(store, 'kv', ukv, slab.host['kv'][:len(ukv)])
     slab.host['kv'][len(ukv):] = 0
     if len(pk_all):
-        store.z(pk_all, out=slab.host['zpage'])
+        _pages(store, 'z', pk_all, slab.host['zpage'])
     if len(ubid):
-        store.blocks(ubid, out=slab.host['blocks'])
+        _pages(store, 'blocks', ubid, slab.host['blocks'])
     if sizes_i:
         np.concatenate([np.asarray(ints[k], np.int64) for k in names_i], out=slab.host['ints'].numpy())
     # B51: the old bank entries' gradient scales (history_scale 'unbiased'; None: nothing scaled)
@@ -882,6 +943,16 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
                 pk_all=pk_all, plans=plans, rbuckets=rbuckets, replay_host=replay_host, selected=selected,
                 sizes_i=sizes_i, slab=slab, spatial_micro=spatial_micro, store=store, ub=ub, ubid=ubid,
                 unique=unique, version=version)
+
+
+def _spatial_segment(model, part):
+    """model.encode_block(part) inside an NVTX range 'learner.spatial' (B62: the B2 measurement of the Spatial
+    segments' dispatch gaps; the forward and the backward's recomputation; a no-op without ISAAC_BLOCK_NVTX)."""
+    nv_push('learner.spatial')
+    try:
+        return model.encode_block(part)
+    finally:
+        nv_pop()
 
 
 def _run_packed(model, P):
@@ -911,9 +982,9 @@ def _run_packed(model, P):
     for g, names, T, m in plans:
         part = packed_rows_apply(batch, {k: di[f'sp{g}:{k}'] for k in names}, T)
         if grad and SPATIAL_CKPT and m > 0:
-            zs.append(checkpoint(model.encode_block, part, use_reentrant=False)[:m])
+            zs.append(checkpoint(_spatial_segment, model, part, **CKPT_KW)[:m])
         else:
-            zs.append(model.encode_block(part)[:m])
+            zs.append(_spatial_segment(model, part)[:m])
     z_all = (torch.cat(zs) if len(zs) > 1 else zs[0]).index_select(0, di['sp:inverse'])
     encoded = z_all[:n_main]
     zdt = z_all.dtype

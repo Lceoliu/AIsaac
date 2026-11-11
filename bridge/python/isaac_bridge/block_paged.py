@@ -76,7 +76,11 @@ def count(name, value):
         TIMING[name] = TIMING.get(name, 0)+value
 
 
+# (one directory per trainer under ISAAC_BLOCK_DUMP: <run tag>-<pid>, so that K trainers on one host never write the same
+# files; the run tag from ISAAC_RUN_TAG when set, else 'run')
 DUMP_DIR = os.environ.get('ISAAC_BLOCK_DUMP', '')
+if DUMP_DIR:
+    DUMP_DIR = os.path.join(DUMP_DIR, f"{os.environ.get('ISAAC_RUN_TAG', 'run')}-{os.getpid()}")
 _DUMPED = set()
 
 

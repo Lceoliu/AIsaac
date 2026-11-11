@@ -19,6 +19,10 @@ _STEADY = [False]
 _CONFIGURED = [False]
 # B56: Inductor FX graph cache + AOTAutograd cache across processes (default on; ISAAC_FX_CACHE=0 off)
 FX_CACHE = os.environ.get('ISAAC_FX_CACHE', '1') == '1'
+# B62 N5 (experiment, default off): Inductor's cpp_wrapper for these graphs (Spatial, canvas decoders, Flex Reader):
+# the generated wrapper launches the same Triton kernels from C++ instead of one Python launcher call per kernel
+# (B62 attribution: ~2.5k Python-level calls per PPO part); a C++ build per graph on a cold cache
+CPP_WRAPPER = os.environ.get('ISAAC_INDUCTOR_CPP_WRAPPER', '0') == '1'
 
 
 def cache_counters():
@@ -85,6 +89,8 @@ def _backend(gm, example_inputs):
             shapes = [tuple(x.shape) if hasattr(x, 'shape') else x for x in example_inputs[:8]]
             print('B44 steady compile', where, shapes, flush=True)
     from torch._inductor.compile_fx import compile_fx
+    if CPP_WRAPPER:   # (B62 N5: the graph's wrapper in C++: kernel launches without the Python launcher)
+        return compile_fx(gm, example_inputs, config_patches={'cpp_wrapper': True})
     return compile_fx(gm, example_inputs)
 
 
@@ -193,9 +199,15 @@ def warm_spatial(learner=None, actors=(), bf16=True):
     from .structured_input import BUCKETS, canvas_decoder
     before = STATS['compiles']
     combos = [(p, e) for e in BUCKETS['entity'] for p in BUCKETS['body']]
-    model0 = learner if learner is not None else (actors[0] if actors else None)
-    if model0 is not None:
-        dev = next(model0.parameters()).device
+    # the canvas decoder on every device that runs it: the learner's and the actors' (BM1: with --learner-device the
+    # actor's GPU differs and its first decode was a steady compile, the device being part of the compiled graph's
+    # guards; split-mb427b8d / split2: block_steady_compiles 1 from u1)
+    devs = []
+    for m_ in ((learner,) if learner is not None else ())+tuple(actors):
+        d_ = next(m_.parameters()).device
+        if d_ not in devs:
+            devs.append(d_)
+    for dev in devs:
         with torch.inference_mode(False), torch.no_grad(), torch.autocast('cuda', enabled=False):
             for p in BUCKETS['body']:
                 for n in (3, 6):

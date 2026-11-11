@@ -291,6 +291,52 @@ class _OpCount:
 
 OPCOUNT = _OpCount() if os.environ.get('ISAAC_LEARN_OPCOUNT') == '1' else None
 
+# B62 (step 2): the teacher records' meta of each PPO minibatch is copied to the GPU from pageable memory, a copy that
+# waits for every kernel queued before it (the previous step's backward and optimizer): u_teach_build (~1.6 s per update,
+# B62 cProfile: tensor.to) was mostly that wait, spinning on the learner thread. ISAAC_LEARN_ASYNC_H2D=1: from pinned
+# memory, non-blocking (the same bytes; the learner thread goes on queueing work). Default off until reviewed.
+ASYNC_H2D = os.environ.get('ISAAC_LEARN_ASYNC_H2D', '0') == '1'
+
+
+class PinnedH2D:
+    """B62: host -> device copies of small arrays through persistent pinned buffers (ISAAC_LEARN_ASYNC_H2D). `slots`
+    buffers in turn; a buffer is rewritten only after the copy that last read it has finished (its CUDA event, waited
+    on only if still pending: with 2+ slots that copy was queued at least one call earlier). The buffer is held by this
+    object from its allocation to the end of the run; it grows (reallocated, x1.5) only when an array is larger, so a
+    steady run allocates nothing per step. Counters: allocations, bytes pinned, event waits that blocked."""
+    def __init__(self, device, slots=2):
+        self.device, self.slots = device, int(slots)
+        self.bufs = [None]*self.slots   # [pinned uint8 tensor, event of its last copy]
+        self.events = [None]*self.slots
+        self.k = 0
+        self.allocs = self.pinned_bytes = self.waits = 0
+
+    def __call__(self, a):
+        import torch   # (train_tok imports torch inside main)
+        a = np.ascontiguousarray(a)
+        if self.device.type != 'cuda':
+            return torch.from_numpy(a.copy()).to(self.device)
+        k = self.k
+        self.k = (k+1) % self.slots
+        ev = self.events[k]
+        if ev is not None and not ev.query():
+            self.waits += 1
+            ev.synchronize()
+        buf = self.bufs[k]
+        if buf is None or buf.numel() < a.nbytes:
+            n = max(int(a.nbytes*1.5), 4096)
+            self.pinned_bytes += n-(0 if buf is None else buf.numel())
+            buf = self.bufs[k] = torch.empty(n, dtype=torch.uint8, pin_memory=True)
+            self.allocs += 1
+        host = buf[:a.nbytes].view(torch.from_numpy(a[:0]).dtype).view(a.shape) if a.nbytes else             torch.from_numpy(a.copy())
+        if a.nbytes:
+            host.numpy()[...] = a
+        out = host.to(self.device, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()
+        self.events[k] = ev
+        return out
+
 def cpu_ticks():
     """(busy, total) jiffies of all CPUs from /proc/stat ((0, 0) where there is none)."""
     try:
@@ -1961,6 +2007,9 @@ def main(argv=None, child=None, actor=None):
                         'the learner thread runs Python (default of Python: 0.005; B62: the default from '
                         'ISAAC_SWITCH_INTERVAL_US, 500 us when unset)')
     args = p.parse_args(argv)
+    # B62: how the host threads wait for the GPU (ISAAC_CUDA_BLOCKING_SYNC; set before the CUDA context exists)
+    from isaac_bridge import cuda_sched
+    cuda_sched_req = cuda_sched.apply()
     resume_input_config = (torch.load(args.resume,map_location='cpu',weights_only=False).get('config',{})
                            if args.resume else {})
     if args.block_memory or resume_input_config.get('block_config') is not None:
@@ -2341,6 +2390,7 @@ def main(argv=None, child=None, actor=None):
     nh = len(learner_model.heads)
     fused = bool(args.fused_adam) or bool(args.learner_fast)   # (B18: --learner-fast 1 implies the fused Adam)
     # (Phase B2: the choice heads are not PPO's: main_parameters() is parameters() without them, in the same order)
+    h2d_teach = PinnedH2D(lm_dev) if ASYNC_H2D else None   # (B62: the teacher meta's pinned buffers, held by the run)
     opt = torch.optim.Adam(learner_model.main_parameters(), lr=args.lr, eps=1e-5,
                            **(dict(fused=True) if fused else {}))
     copt = torch.optim.Adam(learner_model.choice.parameters(), lr=args.choice_lr) if n_choice else None
@@ -2537,6 +2587,8 @@ def main(argv=None, child=None, actor=None):
                     print(f'B44 Flex Reader warm-up: {block_compile.STATS["compiles"]-c_r} graphs in {s_r:.1f} s',
                           flush=True)
             print(f'B56 compile cache after warm-up: {block_compile.cache_counters()}',flush=True)
+            print(f'B62 CUDA scheduling: requested {cuda_sched_req[0] or "auto"} (rc {cuda_sched_req[1]}), '
+                  f'effective {cuda_sched.effective()}',flush=True)
             block_compile.mark_steady()
         # B42: everything alive now (models, compiled code, buffers) leaves the collector's
         # generations; later collections scan only what the run allocates afterwards.
@@ -2800,6 +2852,41 @@ def main(argv=None, child=None, actor=None):
                 lanes.attach_driver(cpp_driver)   # B54: the lane rounds' steps on the driver thread too
         print(f'B52 cpp actor driver: {"on, %d graphs registered" % cpp_driver.n_graphs() if cpp_driver is not None else "off (%s)" % bdrv.reason()}'
               f'; lane generations pre-created: {made_g}', flush=True)
+        from isaac_bridge.block_training import CAPTURE_MODE as capture_mode_
+        print(f'BM1 graph capture mode: {capture_mode_} (ISAAC_CAPTURE_MODE)', flush=True)
+        if cpp_driver is not None and os.environ.get('ISAAC_BLOCK_TIMING') == '1' and os.environ.get('ISAAC_BLOCK_TIMELINE'):
+            # BM1 (measurement only, ISAAC_BLOCK_TIMING=1 + ISAAC_BLOCK_TIMELINE=<path>): once a second, the driver's
+            # cumulative counters (atomics) and whether the learner is inside an update (block_paged.LEARNER_ACTIVE), so
+            # the actor's rates split by phase; every 10 s the native page store's sizes (M0's memory split). A daemon
+            # thread of its own, off every timed path; the path comes from the run (no fixed global name).
+            import threading as threading_
+            from isaac_bridge import block_paged as bp_tl
+
+            def timeline_(path=os.environ['ISAAC_BLOCK_TIMELINE'], d_=cpp_driver, st_=block_actor.store.native):
+                keys = ('steps', 'calls', 'rows', 'lane_jobs', 'lane_rows', 'merged_rows', 'sync_s', 'lane_s', 'loop_s',
+                        'host_s', 'pages_s', 'pause_s')
+                try:
+                    page_b = (st_.kv_page(0).numel()*st_.kv_page(0).element_size(), st_.z_page(0).numel()*st_.z_page(0).element_size(),
+                              st_.b_page(0).numel()*st_.b_page(0).element_size())
+                except Exception:
+                    page_b = (0, 0, 0)
+                with open(path, 'w') as f_:
+                    f_.write('t,learner,' + ','.join(keys) + ',kv_pages,d_free,b_pages,b_free,raw,raw_mb,kv_page_b,z_page_b,b_page_b\n')
+                    k_ = 0
+                    while True:
+                        time.sleep(1.0)
+                        try:
+                            c_ = d_.counters()
+                            s_ = st_.stats() if k_ % 10 == 0 else None
+                            f_.write(f'{time.time():.3f},{int(bp_tl.LEARNER_ACTIVE[0])},' + ','.join(str(c_.get(k, '')) for k in keys)
+                                     + (f",{s_['kv_pages']},{s_['d_free']},{s_['b_pages']},{s_['b_free']},{s_['raw']},{st_.raw_mb():.1f},{page_b[0]},{page_b[1]},{page_b[2]}"
+                                        if s_ is not None else ',,,,,,,,,') + '\n')
+                            f_.flush()
+                        except Exception as e_:
+                            f_.write(f'# {e_!r}\n')
+                            return
+                        k_ += 1
+            threading_.Thread(target=timeline_, name='bm1-timeline', daemon=True).start()
     # B38 (--learner-device): the hand-off's copy of a rollout's temporal tensors to the learner's GPU (mirror_temporal:
     # issued by the actor thread on a stream pair of its own, the learner waits on the event; the next hand-off comes
     # only after the update that read the mirror has synchronised its stream, so one mirror suffices) and the weights'
@@ -3030,7 +3117,7 @@ def main(argv=None, child=None, actor=None):
                 offset_b = 0
                 # Chunk groups are bounded in decisions, just as the PPO microbatches.
                 rgroups_b = list(temporal_bounds(rp_b['tch'],np.arange(len(rp_b['chunks'])),args.micro or args.minibatch))
-                pre_b = blearn_r.PREFETCH_ON and not mem_on
+                pre_b = blearn_r.PREFETCH_RECOMPUTE and not mem_on
                 if pre_b and rgroups_b:   # B60: the first group's host preparation now
                     blearn_r.PREFETCH.submit(learner_model,[rp_b['chunks'][i] for i in rgroups_b[0][2]],grad=False,
                                              train_history=False,version=L['update'])
@@ -3674,7 +3761,7 @@ def main(argv=None, child=None, actor=None):
         # (EpochPerms: the same place relative to the history draws on the default CPU generator as before), the
         # teacher / teacher-v2 draws a prefetch makes ahead kept per epoch (pre_by_ep), still drawn in the
         # minibatches' order (nothing else draws from numpy's generator or v2_rng in between)
-        ahead_ = block_on and blearn.PREFETCH_ON and not mem_on
+        ahead_ = block_on and blearn.PREFETCH_EPOCH and not mem_on
         eperms = blearn.EpochPerms(n_units, device) if ahead_ else None
         pre_by_ep = {}
         ep_now = [0]
@@ -3803,6 +3890,9 @@ def main(argv=None, child=None, actor=None):
                     if fast:   # B18: from the meta's copy on the device (no blocking copy)
                         pick_d = dev(pick)
                         meta = t_meta.index_select(0, pick_d)
+                    elif ASYNC_H2D:   # B62: pinned, asynchronous: no wait for the previous step's GPU work here
+                        meta = h2d_teach(teach_meta[pick])
+                        pick_d = None
                     else:
                         meta = torch.from_numpy(teach_meta[pick]).to(device)
                         pick_d = None
@@ -4275,6 +4365,8 @@ def main(argv=None, child=None, actor=None):
             row.update(aux_log)
         row.update({f'u_{k}': v for k, v in U.items()})
         row.update({f'uc_{k}': v for k, v in UC.items()})   # (B60)
+        if h2d_teach is not None:   # (B62: the teacher meta's pinned staging: allocations, bytes, blocking waits)
+            row.update(h2d_allocs=h2d_teach.allocs, h2d_pinned_mb=h2d_teach.pinned_bytes/2**20, h2d_waits=h2d_teach.waits)
         if UO is not None:
             row.update({f'uo_{k}': v for k, v in UO.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
@@ -5628,8 +5720,16 @@ def main(argv=None, child=None, actor=None):
             while not stop_ev.wait(1.0) and parent_a.is_alive():
                 pass
     finally:
-        if cpp_driver is not None:   # (B52)
-            cpp_driver.stop()
+        # BM1 (decision a): the shutdown runs to its end whatever SIGINT arrives meanwhile, and the interrupt is
+        # raised again once everything is closed. Before: a SIGINT while this block waited for the learner's last
+        # update (wait_learner below) skipped the learner's join and last.pt's save; the interpreter then finalised
+        # under a running backward (pt_autograd_1 taken by pthread_exit -> std::terminate, rc 134; split-mb427b8d).
+        # Order: the learner's current update ends and it is joined (with the learner prefetch worker), then the
+        # driver stops (B52: it stopped first before).
+        import signal as signal_
+        deferred_int = []
+        prev_int = (signal_.signal(signal_.SIGINT, lambda *a_: deferred_int.append(1))
+                    if threading.current_thread() is threading.main_thread() else None)
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
             # (2026-11-05: past this point nobody needs what is still unsent: a clean end has seen the stop, which comes after
@@ -5673,12 +5773,17 @@ def main(argv=None, child=None, actor=None):
             torch.cuda.synchronize()
         else:
             learner.join(timeout=900)
+            if block_on:   # (BM1: the learner prefetch worker stopped too, after the learner's last part)
+                from isaac_bridge import block_learner as blearn_end
+                blearn_end.PREFETCH.close()
             torch.cuda.synchronize()
             if split:   # (B38: the learner's GPU too)
                 torch.cuda.synchronize(ldev)
             save(out / 'checkpoints' / 'last.pt')
             if slog is not None:
                 slog.close()
+        if cpp_driver is not None:   # (B52; BM1: after the learner's end)
+            cpp_driver.stop()
         sampler.close()
         if log_file is not None:
             log_file.close()
@@ -5697,8 +5802,15 @@ def main(argv=None, child=None, actor=None):
         if actor is None:
             print('finished', L['update'], 'updates', round(L['decisions'] * hours_per_decision, 1), 'game hours',
                   round((time.perf_counter() - t_run) / 3600, 2), 'h')
+        if prev_int is not None:   # (BM1: the SIGINT held during the shutdown, raised now)
+            signal_.signal(signal_.SIGINT, prev_int)
+        if deferred_int:
+            print(f'BM1 shutdown: {len(deferred_int)} SIGINT held until the learner was joined, last.pt saved and the '
+                  f'driver stopped', flush=True)
         if failure:
             raise failure[0]
+        if deferred_int:
+            raise KeyboardInterrupt
 
 
 if __name__ == '__main__':

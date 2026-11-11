@@ -4,7 +4,9 @@
 # micro 8192, teacher / CF / aux / priv-critic budgets, overlap, decoupled, AMP bf16, one learner in-process.
 # Only paths differ: the tree under /bench/bm1/trees/$CODE, the shared venv, ABP_HOME=/bench/bm1/home/isaac-abplus (run_instance.sh uses $HOME/isaac-abplus), the
 # tree's own bridge Lua (identical to the 4090's candidate-a1 copy, md5 6cdc633b of the LF text).
-#   usage (in the container): CODE=<tree> sh /bench/bm1/xnew2.sh <tag> [limit_s=7200] [game_hours=125]
+#   usage (in the container): CODE=<tree> [NAME=b42new PORT=39200] sh /bench/bm1/xnew2.sh <tag> [limit_s=7200] [game_hours=125]
+#   (NAME / PORT: the instances' name and port base, distinct per trainer when several run on one host)
+#   NSYS_PREFIX: a profiler command put before the trainer (nsys_update.sh); empty for every timed run
 BM=${BM_LANE:-/bench/bm1}   # (the lane dir in the container: dock.sh sets BM_LANE; LANE=cpp: /bench/bm1/cpp)
 TAG=${1:-xnew-a1}
 OUT=$BM/reports/$TAG
@@ -29,6 +31,6 @@ CMD="$PY -u train_tok.py --groups-file ../abplus/catalog/scaling2_groups.json --
  --actor-bf16 1 --graph-entities 128 \
  --workers 16 --rollout 32768 --minibatch 8192 --micro 8192 --game-hours $HOURS --checkpoint-every 1000 \
  --overlap --decoupled 1 --learner-fast 0 --actor-processes 1 --learner-process 0 --amp bf16 \
- --port 39200 --name b42new --seed 1000 --out $OUT ${EXTRA:-}"
+ --port ${PORT:-39200} --name ${NAME:-b42new} --seed 1000 --out $OUT ${EXTRA:-}"
 echo "$CMD" > $OUT.command.txt
-exec xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" timeout --signal=INT --kill-after=60s $LIMIT $CMD > $OUT.stdout 2> $OUT.stderr
+exec xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" timeout --signal=INT --kill-after=60s $LIMIT ${NSYS_PREFIX:-} $CMD > $OUT.stdout 2> $OUT.stderr
