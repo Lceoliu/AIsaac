@@ -17,12 +17,76 @@ mkdir -p "$R"
 
 log() { echo "$(date '+%F %T') $*" >> $LOG; }
 
-# the lane lock: atomic (noclobber) file with "<session> <time> <purpose>", waited for while another holder has it
-take() {
-  while ! ( set -C; echo "$SESSION $(date '+%F %T') $1" > "$LOCK" ) 2>/dev/null; do sleep 30; done
-  LOCKLINE=$(cat "$LOCK")
+# The lane lock. Two kinds:
+#   * BM1_LOCKDIR unset: the old single-file lane lock $LOCK (noclobber), take = take_shared = exclusive.
+#   * BM1_LOCKDIR set (gpu57: one lock for the whole host, shared by every session): a reader-writer lock.
+#     take_excl "<purpose>" (timed runs): writes $BM1_LOCKDIR/X at once -- no new shared holder starts from then on
+#     (writer first) -- then waits until no live shared holder is left. take_shared "<purpose>" (gates, builds, smokes,
+#     probes): waits while X exists, then writes $BM1_LOCKDIR/S.<session>.<pid>; shared holders run together.
+#     Each file's first line is "<session> <time> <purpose>" (the old format), its second "pid <host pid of the holding
+#     script>": a file whose pid is gone is stale and removed by the next taker (logged). Checks and writes happen under
+#     a short mutex ($BM1_LOCKDIR/.mutex, mkdir: atomic; a mutex older than 60 s is stale). Waiting is a sleep loop in
+#     the job script; the wait in seconds goes into bm1.log.
+#   take "<purpose>" is take_excl when the purpose says 计时运行 (a timed run), else take_shared. give releases what
+#   this script holds.
+_mutex() {
+  while ! mkdir "$BM1_LOCKDIR/.mutex" 2>/dev/null; do
+    a=$(( $(date +%s) - $(stat -c %Y "$BM1_LOCKDIR/.mutex" 2>/dev/null || date +%s) ))
+    [ "$a" -gt 60 ] && { rmdir "$BM1_LOCKDIR/.mutex" 2>/dev/null; log "lock: stale mutex ($a s) removed"; }
+    sleep 1
+  done
 }
-give() { [ "$(cat "$LOCK" 2>/dev/null)" = "${LOCKLINE:-}" ] && rm -f "$LOCK"; LOCKLINE=; }
+_unmutex() { rmdir "$BM1_LOCKDIR/.mutex" 2>/dev/null; }
+_stale_sweep() {   # (under the mutex) lock files whose holder pid is gone
+  for f in "$BM1_LOCKDIR"/X "$BM1_LOCKDIR"/S.*; do
+    [ -f "$f" ] || continue
+    p=$(sed -n 's/^pid \([0-9]*\).*/\1/p' "$f")
+    if [ -z "$p" ] || ! kill -0 "$p" 2>/dev/null; then
+      log "lock: stale $(basename "$f") removed (holder pid ${p:-?} gone): $(head -1 "$f")"
+      rm -f "$f"
+    fi
+  done
+}
+_live_shared() { ls "$BM1_LOCKDIR"/S.* 2>/dev/null | wc -l; }
+take_excl() {
+  if [ -z "${BM1_LOCKDIR:-}" ]; then _take_file "$1"; return; fi
+  mkdir -p "$BM1_LOCKDIR"; t0=$(date +%s)
+  while :; do   # 1: the writer's claim (no other writer)
+    _mutex; _stale_sweep
+    if [ ! -f "$BM1_LOCKDIR/X" ]; then
+      printf '%s\npid %s waiting\n' "$SESSION $(date '+%F %T') $1" "$$" > "$BM1_LOCKDIR/X"; _unmutex; break
+    fi
+    _unmutex; sleep ${BM1_LOCK_POLL:-30}
+  done
+  while :; do   # 2: the shared holders under way end (none starts meanwhile)
+    _mutex; _stale_sweep; n=$(_live_shared)
+    if [ "$n" = 0 ]; then printf '%s\npid %s\n' "$SESSION $(date '+%F %T') $1" "$$" > "$BM1_LOCKDIR/X"; _unmutex; break; fi
+    _unmutex; sleep ${BM1_LOCK_POLL:-30}
+  done
+  LOCKFILE=$BM1_LOCKDIR/X; LOCKLINE=$(head -1 "$LOCKFILE")
+  log "lock: exclusive taken after $(( $(date +%s) - t0 )) s: $LOCKLINE"
+}
+take_shared() {
+  if [ -z "${BM1_LOCKDIR:-}" ]; then _take_file "$1"; return; fi
+  mkdir -p "$BM1_LOCKDIR"; t0=$(date +%s)
+  f=$BM1_LOCKDIR/S.$SESSION.$$
+  while :; do
+    _mutex; _stale_sweep
+    if [ ! -f "$BM1_LOCKDIR/X" ]; then printf '%s\npid %s\n' "$SESSION $(date '+%F %T') $1" "$$" > "$f"; _unmutex; break; fi
+    _unmutex; sleep ${BM1_LOCK_POLL:-30}
+  done
+  LOCKFILE=$f; LOCKLINE=$(head -1 "$f")
+  log "lock: shared taken after $(( $(date +%s) - t0 )) s: $LOCKLINE"
+}
+_take_file() {
+  while ! ( set -C; echo "$SESSION $(date '+%F %T') $1" > "$LOCK" ) 2>/dev/null; do sleep 30; done
+  LOCKFILE=$LOCK; LOCKLINE=$(cat "$LOCK")
+}
+take() { case "$1" in *计时运行*) take_excl "$1" ;; *) take_shared "$1" ;; esac; }
+give() {
+  [ -n "${LOCKFILE:-}" ] && [ "$(head -1 "$LOCKFILE" 2>/dev/null)" = "${LOCKLINE:-}" ] && rm -f "$LOCKFILE"
+  LOCKLINE=; LOCKFILE=
+}
 
 # capmode <tree>: the graph capture mode a run of <tree> uses (ISAAC_CAPTURE_MODE from ENVS, else the tree's default)
 capmode() {
