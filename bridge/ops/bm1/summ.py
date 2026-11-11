@@ -234,6 +234,22 @@ def main():
             if sel_:
                 out.append(f'  mpstat cores by category (steady, {lab_}, {len(sel_)} CPUs): ' + ', '.join(
                     f'{nm_} {sum(st.mean(cat[c][nm_][-n_keep:]) for c in sel_)/100:.1f}' for nm_, _ in cats))
+    if os.path.exists(f'{R}/{tag}.freq1') and ends:   # (the ledger: CPU frequency by cycle phase, 1 s samples)
+        fq = [list(map(float, x.split())) for x in open(f'{R}/{tag}.freq1').read().splitlines() if len(x.split()) > 1]
+        sets = [('lane', sorted(lane))]
+        if os.environ.get('FREQ_CPUS'):   # (e.g. the learner's pinned CPUs)
+            sets.append((os.environ['FREQ_CPUS'], sorted(cpus(os.environ['FREQ_CPUS']))))
+        for lab_, cs_ in sets:
+            ph = {'both': [], 'learner only': [], 'actor only': []}
+            for kk in range(9, min(len(rows), len(ends))):
+                e, up, wl = ends[kk], f(rows[kk], 'update_s'), f(rows[kk], 'wait_learner_s')
+                wl = wl if wl == wl else 0.0
+                for x in fq:
+                    if ends[kk-1] < x[0] <= e and cs_:
+                        v_ = st.mean(x[1+c] for c in cs_ if 1+c < len(x))/1000
+                        ph['learner only' if x[0] > e-wl else 'both' if x[0] >= e-up else 'actor only'].append(v_)
+            out.append(f'  CPU MHz by cycle phase (u10+, 1 s samples, mean over {lab_}): ' + ', '.join(
+                f'{kk} {st.median(v):.0f} (n {len(v)})' for kk, v in ph.items() if v))
     if os.path.exists(f'{R}/{tag}.cpufreq'):   # (CPU MHz, every CPU, 5 s, from /proc/cpuinfo)
         fl = [x.split() for x in open(f'{R}/{tag}.cpufreq').read().splitlines()]
         fl = [list(map(float, x)) for x in fl if len(x) > 1]
