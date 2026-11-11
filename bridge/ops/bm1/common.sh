@@ -29,6 +29,11 @@ log() { echo "$(date '+%F %T') $*" >> $LOG; }
 #     the job script; the wait in seconds goes into bm1.log.
 #   take "<purpose>" is take_excl when the purpose says 计时运行 (a timed run), else take_shared. give releases what
 #   this script holds.
+#     Bounded wait (2026-11-11): a shared taker that has to wait leaves $BM1_LOCKDIR/W.<session>.<pid> ("pid", "since
+#     <epoch s>"); a writer about to claim X first lets every shared taker that was already waiting before the writer
+#     itself arrived take its shared lock (then claims X and waits for them to end, as always). So back-to-back timed
+#     runs let the non-timed jobs waiting between them in at least once: X1, the waiting shared jobs, X2. A timed run
+#     still never overlaps a shared job.
 # (every variable the lock functions set is named _lk_*: sh has no locals, and a caller's f, n, p, t0 ... must survive.
 #  2026-11-11: _stale_sweep's loop variable f overwrote take_shared's own file name, so shared holders wrote one common
 #  literal "S.*" file, and the first holder to finish released the others' claim)
@@ -41,7 +46,7 @@ _mutex() {
 }
 _unmutex() { rmdir "$BM1_LOCKDIR/.mutex" 2>/dev/null; }
 _stale_sweep() {   # (under the mutex) lock files whose holder pid is gone
-  for _lk_f in "$BM1_LOCKDIR"/X "$BM1_LOCKDIR"/S.*; do
+  for _lk_f in "$BM1_LOCKDIR"/X "$BM1_LOCKDIR"/S.* "$BM1_LOCKDIR"/W.*; do
     [ -f "$_lk_f" ] || continue
     _lk_p=$(sed -n 's/^pid \([0-9]*\).*/\1/p' "$_lk_f")
     if [ -z "$_lk_p" ] || ! kill -0 "$_lk_p" 2>/dev/null; then
@@ -51,13 +56,26 @@ _stale_sweep() {   # (under the mutex) lock files whose holder pid is gone
   done
 }
 _live_shared() { ls "$BM1_LOCKDIR"/S.* 2>/dev/null | wc -l; }
+_older_waiters() {   # (under the mutex) shared takers waiting since before epoch $1
+  _lk_c=0
+  for _lk_w in "$BM1_LOCKDIR"/W.*; do
+    [ -f "$_lk_w" ] || continue
+    _lk_s=$(sed -n 's/^since \([0-9]*\).*/\1/p' "$_lk_w")
+    [ -n "$_lk_s" ] && [ "$_lk_s" -lt "$1" ] && _lk_c=$((_lk_c+1))
+  done
+  echo $_lk_c
+}
 take_excl() {
   if [ -z "${BM1_LOCKDIR:-}" ]; then _take_file "$1"; return; fi
-  mkdir -p "$BM1_LOCKDIR"; _lk_t0=$(date +%s)
-  while :; do   # 1: the writer's claim (no other writer)
+  mkdir -p "$BM1_LOCKDIR"; _lk_t0=$(date +%s); _lk_y=0
+  while :; do   # 1: the writer's claim (no other writer; shared takers waiting since before this writer go first)
     _mutex; _stale_sweep
     if [ ! -f "$BM1_LOCKDIR/X" ]; then
-      printf '%s\npid %s waiting\n' "$SESSION $(date '+%F %T') $1" "$$" > "$BM1_LOCKDIR/X"; _unmutex; break
+      _lk_o=$(_older_waiters "$_lk_t0")
+      if [ "$_lk_o" = 0 ]; then
+        printf '%s\npid %s waiting\n' "$SESSION $(date '+%F %T') $1" "$$" > "$BM1_LOCKDIR/X"; _unmutex; break
+      fi
+      [ "$_lk_y" = 0 ] && log "lock: exclusive yields to $_lk_o shared taker(s) waiting since before it: $1"; _lk_y=1
     fi
     _unmutex; sleep ${BM1_LOCK_POLL:-30}
   done
@@ -72,10 +90,14 @@ take_excl() {
 take_shared() {
   if [ -z "${BM1_LOCKDIR:-}" ]; then _take_file "$1"; return; fi
   mkdir -p "$BM1_LOCKDIR"; _lk_t0=$(date +%s)
-  _lk_sf=$BM1_LOCKDIR/S.$SESSION.$$
+  _lk_sf=$BM1_LOCKDIR/S.$SESSION.$$; _lk_wf=$BM1_LOCKDIR/W.$SESSION.$$
   while :; do
     _mutex; _stale_sweep
-    if [ ! -f "$BM1_LOCKDIR/X" ]; then printf '%s\npid %s\n' "$SESSION $(date '+%F %T') $1" "$$" > "$_lk_sf"; _unmutex; break; fi
+    if [ ! -f "$BM1_LOCKDIR/X" ]; then
+      printf '%s\npid %s\n' "$SESSION $(date '+%F %T') $1" "$$" > "$_lk_sf"; rm -f "$_lk_wf"; _unmutex; break
+    fi
+    # (waiting: the marker a later writer yields to)
+    [ -f "$_lk_wf" ] || printf 'pid %s\nsince %s\n%s\n' "$$" "$(date +%s)" "$SESSION $(date '+%F %T') $1" > "$_lk_wf"
     _unmutex; sleep ${BM1_LOCK_POLL:-30}
   done
   LOCKFILE=$_lk_sf; LOCKLINE=$(head -1 "$_lk_sf")

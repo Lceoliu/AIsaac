@@ -40,6 +40,28 @@ ck "the writer still waits while B holds" '[ ! -f $T/W.t0 ]'
 wait $W
 ck "the writer took the lock only after B ended" '[ "$(cat $T/W.t0)" -ge "$(cat $T/B.t1)" ]'
 wait
+# 4 (bounded wait) writer 1 holds; a shared taker starts waiting; writer 2 arrives later: X1, the shared job, X2
+writer() {   # writer <name> <seconds>
+  BM=$T sh -c ". $T/common.sh; take_excl 'test $1 计时运行'; date +%s > $T/$1.t0; sleep $2; give; date +%s > $T/$1.t1" &
+}
+writer E1 6
+sleep 1
+holder S4 3
+sleep 2
+writer E2 1
+wait
+ck "the shared job ran after writer 1 ended" '[ "$(cat $T/S4.t0)" -ge "$(cat $T/E1.t1)" ]'
+ck "writer 2 took the lock only after the shared job ended" '[ "$(cat $T/E2.t0)" -ge "$(cat $T/S4.t1)" ]'
+ck "no waiting marker left" '[ "$(ls "$T"/locks/W.* 2>/dev/null | wc -l)" = 0 ]'
+# 5 (writer first is kept) a shared taker that arrives after a writer started waiting does not go before it
+holder S5a 6
+sleep 1
+writer E3 1
+sleep 2
+holder S5b 1
+wait
+ck "the late shared job ran after the writer (writer first)" '[ "$(cat $T/S5b.t0)" -ge "$(cat $T/E3.t1)" ]'
+ck "the writer waited for the early shared job" '[ "$(cat $T/E3.t0)" -ge "$(cat $T/S5a.t1)" ]'
 # 3
 r=$(BM=$T sh -c ". $T/common.sh; f=keep_f; n=keep_n; p=keep_p; t0=keep_t0; a=keep_a; take_shared 'test vars'; give; take_excl 'test vars 计时运行'; give; echo \$f \$n \$p \$t0 \$a")
 ck "a caller's f n p t0 a survive (got: $r)" '[ "$r" = "keep_f keep_n keep_p keep_t0 keep_a" ]'
