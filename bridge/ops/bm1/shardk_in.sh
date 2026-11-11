@@ -9,6 +9,9 @@
 TAG=$1; LIMIT=$2; HOURS=$3; PAIRS=$4; CPUS=${5:-}
 K=$(echo $PAIRS | wc -w)
 export ISAAC_SHARD_WORLD=$K MASTER_ADDR=127.0.0.1 MASTER_PORT=${SHARD_PORT:-29400} ISAAC_SHARD_DIR=/tmp/shards-$TAG
+# (NCCL between the ranks through host shared memory: the 3090s here have no peer access, and NCCL's P2P probe across
+#  the ranks' disjoint CUDA_VISIBLE_DEVICES fails with 'peer access is not supported' (c2flip, 2026-11-11))
+export NCCL_P2P_DISABLE=${NCCL_P2P_DISABLE:-1}
 mkdir -p $ISAAC_SHARD_DIR
 r=0; PIDS=""
 for pair in $PAIRS; do
