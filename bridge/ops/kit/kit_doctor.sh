@@ -50,10 +50,10 @@ miss=; for t in docker tar gzip sha256sum python3 taskset setsid nvidia-smi awk;
 [ -z "$miss" ] && r PASS tools-required "all present" || r FAIL tools-required "missing:$miss"
 miss=; for t in pigz zstd gio numactl ionice; do command -v $t > /dev/null || miss="$miss $t"; done
 [ -z "$miss" ] && r PASS tools-optional "all present" || r WARN tools-optional "missing:$miss"
-if [ -n "${KIT_LOCKDIR:-}" ]; then
-  h=$(for f in "$KIT_LOCKDIR"/X "$KIT_LOCKDIR"/S.*; do [ -f "$f" ] && echo "$(basename "$f")=$(head -1 "$f")"; done | tr '\n' ';')
-  r PASS lock "$KIT_LOCKDIR holders now: ${h:-none}"
-fi
+for LD in ${KIT_LOCKDIRS:-${KIT_LOCKDIR:-}}; do
+  h=$(for f in "$LD"/X "$LD"/S.*; do [ -f "$f" ] && echo "$(basename "$f")=$(head -1 "$f")"; done | tr '\n' ';')
+  r PASS lock "$LD holders now: ${h:-none}"
+done
 
 # kit version: manifest, archives, image, data
 if [ ! -f "$M" ]; then r FAIL manifest "$M missing"; else
@@ -90,7 +90,7 @@ if [ "$SMOKE" = 1 ] && [ -f "$M" ]; then
     p=$(nvidia-smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true)
     if [ -n "$m" ] && [ "$m" -lt 500 ] && [ "$p" = 0 ]; then G=$g; break; fi
   done
-  if [ -z "$G" ]; then r WARN smoke "no free GPU among ${KIT_SMOKE_GPUS:-none}: smoke not run"
+  if [ -z "$G" ]; then r WARN smoke "no free GPU among ${KIT_SMOKE_GPUS:-none}: GPU part of doctor skipped"
   else
     kit_lock "doctor $V smoke (GPU $G, not timed)"
     m=$(nvidia-smi -i $G --query-gpu=memory.used --format=csv,noheader,nounits | tr -d ' ')

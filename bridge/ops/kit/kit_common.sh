@@ -19,19 +19,49 @@ pinned() {
   if [ -n "${KIT_CPUSET:-}" ]; then nice -n 10 ionice -c2 -n7 taskset -c "$KIT_CPUSET" "$@"; else nice -n 10 "$@"; fi
 }
 
-kit_lock() {   # kit_lock "<purpose>": the shared bm1 lock (waits while a timed run holds or wants it)
-  if [ -z "${KIT_LOCKDIR:-}" ]; then klog "lock: no KIT_LOCKDIR on this host, not locking ($1)"; return 0; fi
+# KIT_LOCKDIRS: one or more bm1 lock directories (space-separated; KIT_LOCKDIR = one). kit_lock takes the SHARED lock
+# in every one of them: it waits until none has a live exclusive file X (a timed run holding or queued), then takes them
+# in order; when an X appears in a later directory meanwhile, it releases what it took and waits again, so the kit never
+# sits on one directory's shared lock while waiting for another's timed run.
+_x_live() {   # _x_live <dir>: an X whose holder pid is alive
+  [ -f "$1/X" ] || return 1
+  p=$(sed -n 's/^pid \([0-9]*\).*/\1/p' "$1/X")
+  [ -n "$p" ] && kill -0 "$p" 2>/dev/null
+}
+KIT_HELD_F=(); KIT_HELD_L=()
+kit_lock() {   # kit_lock "<purpose>"
+  dirs=${KIT_LOCKDIRS:-${KIT_LOCKDIR:-}}
+  if [ -z "$dirs" ]; then klog "lock: no lock directory on this host, not locking ($1)"; return 0; fi
   KBM=$KIT_ROOT/kit/lockshim
   mkdir -p "$KBM"
-  printf 'BM1_LOCKDIR=%s\nBM1_SESSION=kit\nBM1_TRASH=%s\n' "$KIT_LOCKDIR" "${KIT_TRASH:-$KIT_ROOT/kit/trash}" > "$KBM/bm1.env"
-  klog "lock: waiting for the shared lock ($1); holders now: $(cat "$KIT_LOCKDIR"/* 2>/dev/null | grep -v '^pid' | tr '\n' ';')"
+  printf 'BM1_LOCKDIR=%s\nBM1_SESSION=kit\nBM1_TRASH=%s\n' "${dirs%% *}" "${KIT_TRASH:-$KIT_ROOT/kit/trash}" > "$KBM/bm1.env"
   BM=$KBM
   . "$KITDIR/../bm1/common.sh"
-  take_shared "kit $1"
-  klog "lock: shared taken: $LOCKLINE"
+  klog "lock: waiting for the shared lock in [$dirs] ($1); holders now: $(for d in $dirs; do cat "$d"/* 2>/dev/null | grep -v '^pid'; done | tr '\n' ';')"
+  t0=$(date +%s)
+  while :; do
+    busy=1
+    while [ $busy = 1 ]; do busy=0; for d in $dirs; do _x_live "$d" && busy=1; done; [ $busy = 1 ] && sleep 30; done
+    ok=1
+    for d in $dirs; do
+      mkdir -p "$d"
+      if _x_live "$d"; then ok=0; break; fi
+      BM1_LOCKDIR=$d
+      take_shared "kit $1"
+      KIT_HELD_F+=("$LOCKFILE"); KIT_HELD_L+=("$LOCKLINE")
+    done
+    [ $ok = 1 ] && break
+    klog "lock: an exclusive lock appeared in $d meanwhile: releasing and waiting again"
+    kit_unlock
+    sleep 30
+  done
+  klog "lock: shared taken in [$dirs] after $(( $(date +%s) - t0 )) s: ${KIT_HELD_F[*]}"
 }
 kit_unlock() {
-  if [ -n "${LOCKFILE:-}" ]; then give; klog "lock: released"; fi
+  [ ${#KIT_HELD_F[@]} -gt 0 ] || return 0
+  for i in "${!KIT_HELD_F[@]}"; do LOCKFILE=${KIT_HELD_F[$i]}; LOCKLINE=${KIT_HELD_L[$i]}; give; done
+  klog "lock: released ${KIT_HELD_F[*]}"
+  KIT_HELD_F=(); KIT_HELD_L=()
 }
 
 kit_trash() {   # move into $KIT_TRASH/<time>/ (nothing is deleted)
