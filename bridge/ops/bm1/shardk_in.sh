@@ -47,4 +47,10 @@ while :; do
   fi
   sleep 2
 done
+# (the container's cgroup: the kernel's OOM kills in it (the memory limit, not another tenant) and its peak; the
+#  guard reads <tag>.oom_kills)
+ok_=$(cat /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory/memory.oom_control 2>/dev/null | awk '$1 == "oom_kill" {print $2; exit}')
+pk_=$(cat /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory/memory.max_usage_in_bytes 2>/dev/null | head -1)
+echo "shardk_in: ranks ended rc=$rc; container cgroup oom_kill ${ok_:-?}, peak $(( ${pk_:-0} / 1073741824 )) GB"
+echo "${ok_:-?}" > ${OUTDIR:-$BM1_IN/reports}/$TAG.oom_kills
 exit $rc

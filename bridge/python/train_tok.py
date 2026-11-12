@@ -4802,6 +4802,17 @@ def main(argv=None, child=None, actor=None):
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
         import shutil as shutil_
         row['disk_free_gb'] = shutil_.disk_usage(out).free / 2 ** 30   # (the training run: the guard warns / stops on it)
+        # (the container's memory: used without the inactive file cache, its limit, the kernel's OOM kills in it so
+        #  far; a warning line past 90 % of the limit -- the guard logs it too)
+        from isaac_bridge.cgroup_mem import cgroup_mem
+        cu_, cl_, ck_ = cgroup_mem()
+        row['ctr_mem_gb'] = '' if cu_ is None else cu_ / 2 ** 30
+        row['ctr_mem_limit_gb'] = '' if cl_ is None else cl_ / 2 ** 30
+        row['ctr_mem_frac'] = '' if cu_ is None or not cl_ else cu_ / cl_
+        row['ctr_oom_kills'] = '' if ck_ is None else ck_
+        if cu_ is not None and cl_ and cu_ > 0.9 * cl_:
+            print(f'WARNING container memory {cu_ / 2 ** 30:.1f} GB > 90 % of its limit {cl_ / 2 ** 30:.0f} GB '
+                  f'(update {upd})', flush=True)
         if run or items:   # 2026-10-06: run / item counters (absent in the other modes: their columns are unchanged)
             m_all = max(len(finished), 1)
             row.update({'items_taken': sum(e.get('items', 0) for e in finished),
