@@ -19,6 +19,7 @@
 #        R0 baseline (G off, W-a off), with the smaps survey at update 6 (root + 3 clones)
 #        R1 candidate: ISAAC_RL_NATIVE_VISIBLE=1, ISAAC_RL_V2LOG_COMPACT=1
 #        R2 check: ISAAC_RL_NATIVE_VISIBLE=2, 6 updates: native visible checks > 0, mismatches 0 (clone_stats)
+#   5b every worker ended (ISAAC_FAULT_WORKERS=die): rc != 0 with 'workers ended' within FAULT_S, driver and Python path ~6
 #   6  (GATE=1) gate3 on the tree                                                                      ~40
 # Total ~50 min, ~90 min with GATE=1. Results: reports/acceptg-<tree>-<time>/ (summary.txt: one line per check).
 # Fails early (the lock given back at once, 'ABORT <why>' in summary.txt and bm1.log, exit 1): the library build or the
@@ -143,6 +144,27 @@ touch $D/r0.done; wait $SM
 train r1 12 -e ISAAC_RL_NATIVE_VISIBLE=1 -e ISAAC_RL_V2LOG_COMPACT=1
 train r2 6 -e ISAAC_RL_NATIVE_VISIBLE=2
 note "5 r2 native visible check: $(head -1 $D/r2-clone-stats.txt)"
+
+# 5b every worker ended (tok_floor's ISAAC_FAULT_WORKERS=die: each episode start raises, uncaught): the trainer ends
+#    with 'workers ended' and rc != 0 within FAULT_S (default 600 s), not a silent wait; the driver path (fd) and the
+#    Python path (pd, ISAAC_BLOCK_CPP_ACTOR=0). A check: its result noted, the batch goes on
+faultrun() {   # name, extra -e flags
+  n=$1; shift
+  touch $D/fault-on
+  ( t=0; C=$BM1_NAME-prof-$TAG-$n
+    while [ ! -f $D/$n.end ]; do sleep 5; t=$((t+5)); [ $t -ge ${FAULT_S:-600} ] && { echo "timeout $t s" > $D/$n.timeout; docker stop -t 20 $C > /dev/null 2>&1; exit 0; }; done ) &
+  WP=$!
+  t0=$(date +%s)
+  NOLOCK=1 LOCKS_HELD="$TAG" LANE_CPUS=1 CPUSET=8-15,24-31 MEMS=1 LEARNER_PIN=0 DRIVER_PIN=0 GPU=$GPU UPDATES=4     ENVS="-e ISAAC_FAULT_WORKERS=die:$BM1_IN/reports/$TAG/fault-on $*" sh $BM/prof.sh $TAG-$n $TREE
+  touch $D/$n.end; wait $WP
+  O=$R/$TAG-$n.stdout
+  rc=$(grep "$TAG-$n done rc=" $R/bm1.log | tail -1 | sed 's/.*done rc=\([0-9]*\).*//')
+  if [ ! -f $D/$n.timeout ] && grep -q 'workers ended' $O && [ "${rc:-0}" != 0 ]; then v=PASS; else v=FAIL; fi
+  note "5b $n $v: rc=${rc:-?} in $(( $(date +%s) - t0 )) s; $(grep -m1 -o 'RuntimeError: .*workers ended.*' $O | cut -c1-160)$(cat $D/$n.timeout 2>/dev/null)"
+}
+faultrun fd
+faultrun pd -e ISAAC_BLOCK_CPP_ACTOR=0
+rm -f $D/fault-on
 
 # 6 the gate (optional; under this batch's lock)
 if [ "${GATE:-0}" = 1 ]; then

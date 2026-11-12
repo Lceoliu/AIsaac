@@ -133,6 +133,27 @@ def test_python_path_count():
     w.check(force=True)                  # (2 x 10 >= 10; procs unknown: no second guard)
 
 
+def test_python_path_too_few_left_raises():
+    conns = [object() for _ in range(4)]
+    s = types.SimpleNamespace(cfg=types.SimpleNamespace(workers=4), conns=conns, live=[conns[3]],
+                              procs=[Proc(False), Proc(False), Proc(False), Proc()])
+    roll = types.SimpleNamespace(length=np.zeros(4, np.int64), open=np.full(4, -1, np.int64), cap=10)
+    w = bdrv.WorkerWatch(None, s, roll, 30, stopped=lambda: False, every=0.0)
+    with pytest.raises(RuntimeError, match='3 of 4 workers ended'):
+        w.check(force=True)
+
+
+def test_evaluation_never_raises():
+    """an evaluation's workers end after their seeds: never an error"""
+    d, s, roll, w = make()
+    s.cfg.eval_seeds = [[1], [2], [3], [4]]
+    d.dead = [0, 1, 2, 3]
+    for p in s.procs:
+        p.alive = False
+    w.check(force=True)
+    assert wait(d, w) == 'idle'
+
+
 # ------------------------------------------------------------------------------------------- with the extension
 try:
     from test_b52_cpp_actor import EXT

@@ -503,7 +503,8 @@ class WorkerWatch:
     poll path, which driver mode never takes. check() raises RuntimeError when every worker ended (the driver's count,
     or no worker process alive: the second guard), or when the workers left cannot fill this collect any more: the
     decisions already usable from the ended ones plus a full capacity per live one below the target. Never while the
-    run is stopping (stopped()). Throttled to one look per `every` s unless forced; live() is the progress column."""
+    run is stopping (stopped()), never in an evaluation (its workers end after their seeds). Throttled to one look per
+    `every` s unless forced; live() is the progress column. d None: the Python path (sampler.live, which its poll keeps)."""
 
     def __init__(self, d, sampler, roll, target, stopped=None, every=1.0):
         self.d, self.sampler, self.roll, self.target = d, sampler, roll, int(target)
@@ -528,7 +529,7 @@ class WorkerWatch:
         if not force and t - self.t_last < self.every:
             return
         self.t_last = t
-        if self.stopped is not None and self.stopped():
+        if (self.stopped is not None and self.stopped()) or getattr(self.sampler.cfg, 'eval_seeds', None):
             return
         dead = self.dead()
         pa = self.procs_alive()

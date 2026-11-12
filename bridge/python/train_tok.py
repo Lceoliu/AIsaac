@@ -6022,7 +6022,11 @@ def main(argv=None, child=None, actor=None):
                 nv.push('actor.collect')   # (B57: the collect window, for the learner's per-window speeds)
                 run_driver_collect(prof)
                 nv.pop()
+            if cpp_driver is None:   # (the Python path: too few workers left to fill the collect -> RuntimeError)
+                from isaac_bridge.block_driver import WorkerWatch
+                pwatch_ = WorkerWatch(None, sampler, roll, rollout_actor, stopped=stopped)
             while cpp_driver is None and roll.usable() < rollout_actor and sampler.live and not stopped():
+                pwatch_.check()
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
                     if block_actor is None:
                         _lane_tick(prof)
@@ -6202,6 +6206,11 @@ def main(argv=None, child=None, actor=None):
                     pstats.Stats(actor_profile,stream=f).sort_stats('cumulative').print_stats(50)
                     pstats.Stats(actor_profile,stream=f).sort_stats('tottime').print_stats(30)
             collect_s = time.perf_counter() - t0
+            if not sampler.live and not stopped() and not sampler.cfg.eval_seeds:
+                # (every worker ended: no record can come -- an error, not a finished run (rc 0 read as the target
+                #  reached by the guard): raised through the finally below (last.pt saved), exit 1)
+                raise RuntimeError(f'all {len(sampler.conns)} workers ended (the Python path: every pipe closed) at '
+                                   f'update {L.get("update")}: the run cannot go on')
             if not sampler.live or stopped():
                 break
             check_actors()
