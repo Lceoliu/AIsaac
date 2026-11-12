@@ -4711,6 +4711,9 @@ def main(argv=None, child=None, actor=None):
             'w_wait': dst['wait_s'], 'w_encode': dst['encode_s'], 'w_fork': dst['fork_s'], 'w_teach': dst['teach_s'],
             'w_overrun': dst.get('overrun_s', 0.0), 'w_state': dst.get('state_s', 0.0),
             'w_close': dst.get('close_s', 0.0), 'w_total': n * job['cycle_s'],
+            # (B: the workers' CPU s by part this cycle, all workers; zero unless ISAAC_RL_WORKER_CPU=1)
+            **{'w_' + k: dst.get(k, 0.0) for k in ('enc_cpu', 'book_cpu', 'wait_cpu', 'step_cpu', 'teach_thr_cpu', 'cf_thr_cpu',
+                                                   'search_child_cpu', 'cf_child_cpu')},
             'q_teach': float(stats[:, ST['queue']].sum()), 'teach_dropped': float(stats[:, ST['dropped']].sum()),
             'cpu_collect': job.get('cpu_collect', 0.0), 'cpu_update': cpu_share(job['cpu0'], cpu_end),
             'c_wait_learner': job.get('cycle_wait_s', 0.0), 'c_dec_min': job.get('dec_min', 0.0),
@@ -5394,7 +5397,9 @@ def main(argv=None, child=None, actor=None):
         cpp_driver.set_version(version)
     busy = False                                     # an update is running on the learner
     handed = decisions_total
-    wcols = ('step_s', 'wait_s', 'encode_s', 'fork_s', 'teach_s', 'overrun_s', 'state_s', 'close_s')
+    wcols = ('step_s', 'wait_s', 'encode_s', 'fork_s', 'teach_s', 'overrun_s', 'state_s', 'close_s',
+             # 2026-11-12 (B, ISAAC_RL_WORKER_CPU=1; zero otherwise): the workers' CPU seconds by part
+             'enc_cpu', 'book_cpu', 'wait_cpu', 'step_cpu', 'teach_thr_cpu', 'cf_thr_cpu', 'search_child_cpu', 'cf_child_cpu')
     sync_wait = 0.0
 
     def take_weights():
