@@ -4800,6 +4800,8 @@ def main(argv=None, child=None, actor=None):
         if UO is not None:
             row.update({f'uo_{k}': v for k, v in UO.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
+        import shutil as shutil_
+        row['disk_free_gb'] = shutil_.disk_usage(out).free / 2 ** 30   # (the training run: the guard warns / stops on it)
         if run or items:   # 2026-10-06: run / item counters (absent in the other modes: their columns are unchanged)
             m_all = max(len(finished), 1)
             row.update({'items_taken': sum(e.get('items', 0) for e in finished),
@@ -5043,23 +5045,35 @@ def main(argv=None, child=None, actor=None):
 
     def rotate_checkpoints(d):
         """(the training configuration) ISAAC_CKPT_KEEP=N: the newest N update-*.pt kept, and every one whose update is a
-        multiple of ISAAC_CKPT_MILESTONE (a milestone); the others moved to ISAAC_CKPT_TRASH/<date>/ (nothing deleted)."""
+        multiple of ISAAC_CKPT_MILESTONE (a milestone); the others, by ISAAC_CKPT_ROTATE: 'trash' (default) moved to
+        ISAAC_CKPT_TRASH/<date>/, 'delete' deleted -- only files of this run's checkpoints directory named exactly
+        update-<6 digits>.pt, each one a line in <out>/checkpoint_rotation.log (name, size, update, what was done)."""
+        import re as re_
         keep_ = int(os.environ.get('ISAAC_CKPT_KEEP', '0') or 0)
+        mode_ = os.environ.get('ISAAC_CKPT_ROTATE', 'trash')
         trash_ = os.environ.get('ISAAC_CKPT_TRASH', '')
-        if keep_ <= 0 or not trash_:
+        if keep_ <= 0 or mode_ not in ('trash', 'delete') or (mode_ == 'trash' and not trash_):
             return
         mile_ = int(os.environ.get('ISAAC_CKPT_MILESTONE', '0') or 0)
-        files_ = sorted(Path(d).glob('update-*.pt'))
-        for f_ in files_[:-keep_]:
-            try:
-                u_ = int(f_.stem.split('-')[1])
-            except ValueError:
-                continue
-            if mile_ and u_ % mile_ == 0:
-                continue
-            dst_ = Path(trash_) / time.strftime('%Y%m%d')
-            dst_.mkdir(parents=True, exist_ok=True)
-            os.replace(f_, dst_ / f'{out.name}-{f_.name}')
+        d = Path(d).resolve()
+        if d != (out / 'checkpoints').resolve():
+            return
+        files_ = sorted(f_ for f_ in d.iterdir() if re_.fullmatch(r'update-\d{6}\.pt', f_.name) and f_.is_file())
+        with open(out / 'checkpoint_rotation.log', 'a') as log_:
+            for f_ in files_[:-keep_]:
+                u_ = int(f_.name[7:13])
+                if mile_ and u_ % mile_ == 0:
+                    continue
+                size_ = f_.stat().st_size
+                if mode_ == 'delete':
+                    f_.unlink()
+                    what_ = 'deleted'
+                else:
+                    dst_ = Path(trash_) / time.strftime('%Y%m%d')
+                    dst_.mkdir(parents=True, exist_ok=True)
+                    os.replace(f_, dst_ / f'{out.name}-{f_.name}')
+                    what_ = f'moved to {dst_}'
+                log_.write(f"{time.strftime('%F %T')} {f_.name} {size_} bytes update {u_} {what_}" + chr(10))
 
     def rotate_episodes():
         """(the training configuration) ISAAC_EPISODES_ROTATE_MB: episodes.jsonl renamed episodes.<k>.jsonl past that size
