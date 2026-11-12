@@ -101,6 +101,32 @@ STAT_AUG_KEYS = ('speed', 'damage', 'shot_speed', 'tears', 'range')   # AbpSetSt
 STAT_AUG_DEFAULT = 'damage=0.7:2.5,tears=0.7:2,range=0.8:1.5,shot_speed=0.8:1.3,speed=0.9:1.3'
 
 
+# 2026-11-12 (B): the worker's CPU by part (ST enc_cpu .. cf_child_cpu) and named threads (the per-thread samplers tell
+# the episode loop, the search / cf threads and the forked children apart). Counting only: ISAAC_RL_WORKER_CPU=1.
+WORKER_CPU = os.environ.get('ISAAC_RL_WORKER_CPU', '0') == '1'
+_thread_time = time.thread_time
+
+
+def name_thread(name):
+    """(WORKER_CPU) This thread's name in /proc (prctl PR_SET_NAME, 15 bytes); nothing when off or unavailable."""
+    if not WORKER_CPU:
+        return
+    try:
+        import ctypes
+        ctypes.CDLL(None, use_errno=True).prctl(15, ctypes.c_char_p(name.encode()[:15]), 0, 0, 0)
+    except (OSError, AttributeError):
+        pass
+
+
+def wait_child(pid, options):
+    """os.waitpid(pid, options) and, with WORKER_CPU, the child's CPU seconds (wait4's rusage; 0.0 otherwise)."""
+    if not WORKER_CPU:
+        wpid, status = os.waitpid(pid, options)
+        return wpid, status, 0.0
+    wpid, status, ru = os.wait4(pid, options)
+    return wpid, status, (ru.ru_utime+ru.ru_stime) if wpid == pid else 0.0
+
+
 def parse_stat_aug(text):
     """'damage=0.7:2.5,tears=0.7:2,...' -> {stat: (low, high)} multiplier ranges (STAT_AUG_KEYS; '' : the default)."""
     out = {}
@@ -245,6 +271,7 @@ class Parked:
 def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=None, lab_names=None, v2_names=None,
                       v2_conn=None):
     blocks, rows, actions, stats, control = attach(names, cfg.workers)
+    name_thread(f'w{index}-main')
     evaluation = bool(cfg.eval_seeds)
     # 2026-10-10 (teacher v2, tok_teacher2.py): off unless cfg.teacher_v2 and the sampler gave this worker a lane
     v2on = bool(cfg.teacher_v2) and v2_names is not None and v2_conn is not None and not evaluation
@@ -694,6 +721,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         pid = os.fork()
         if pid == 0:   # the child: the point on its own copy, records into the shared ring, then gone
             code = 0
+            name_thread(f'w{index}-cfchild')
             try:
                 cf_run(pt, child=True)
             except BaseException:
@@ -713,15 +741,16 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         t_wait = time.perf_counter()
         status = 0
         while True:
-            wpid, status = os.waitpid(pid, os.WNOHANG)
+            wpid, status, cpu_ = wait_child(pid, os.WNOHANG)
             if wpid == pid:
+                mine[ST['cf_child_cpu']] += cpu_
                 break
             if time.perf_counter() - t_wait > CF_CHILD_LIMIT:
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
                     pass
-                os.waitpid(pid, 0)
+                mine[ST['cf_child_cpu']] += wait_child(pid, 0)[2]
                 status = -1
                 mine[ST['errors']] += 1
                 mine[ST['cf_errors']] += 1
@@ -742,7 +771,13 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     def cf_loop():
         """The cf thread (B34): the newest queued choice point whenever there is one (its rate is the quota's, not a
         share of the worker's time), one at a time, on the lane (lane_lock)."""
+        name_thread(f'w{index}-cf')
+        c_last = _thread_time() if WORKER_CPU else 0.0
         while not search_stop.is_set():
+            if WORKER_CPU:
+                c_now = _thread_time()
+                mine[ST['cf_thr_cpu']] += c_now-c_last
+                c_last = c_now
             if not cf_queue or control[0]:
                 time.sleep(0.02)
                 continue
@@ -811,6 +846,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             pid = os.fork()
             if pid == 0:   # the child: the search on its own copy, records into the shared ring, then gone
                 code = 0
+                name_thread(f'w{index}-schild')
                 try:
                     search(child_item, pair=False)
                 except BaseException:
@@ -832,15 +868,16 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             # waited for with a time limit; a hung child (a lock copied locked at fork time, a dead clone) is killed
             t_wait = time.perf_counter()
             while True:
-                wpid, status = os.waitpid(pid, os.WNOHANG)
+                wpid, status, cpu_ = wait_child(pid, os.WNOHANG)
                 if wpid == pid:
+                    mine[ST['search_child_cpu']] += cpu_
                     break
                 if time.perf_counter() - t_wait > SEARCH_CHILD_LIMIT:
                     try:
                         os.kill(pid, signal.SIGKILL)
                     except OSError:
                         pass
-                    os.waitpid(pid, 0)
+                    mine[ST['search_child_cpu']] += wait_child(pid, 0)[2]
                     status = -1
                     mine[ST['errors']] += 1
                     if search_errors[0] < 5:
@@ -860,7 +897,13 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         return True
 
     def search_loop():
+        name_thread(f'w{index}-search')
+        c_last = _thread_time() if WORKER_CPU else 0.0
         while not search_stop.is_set():
+            if WORKER_CPU:
+                c_now = _thread_time()
+                mine[ST['teach_thr_cpu']] += c_now-c_last
+                c_last = c_now
             if not (queue or v2_queue) or control[0]:
                 time.sleep(0.02)
                 continue
@@ -1780,6 +1823,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             try:
                 while True:
                     t0 = time.perf_counter()
+                    c0 = _thread_time() if WORKER_CPU else 0.0
                     row = slots[t_ep & 1]
                     inv_before = st.inv_counts   # (branches: a record that gains an item replaces the dict)
                     if enc is not None:   # a room change always goes through encode_row (enc.obs, st updated)
@@ -1789,6 +1833,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         done = encode_row(obs, st, row, t_ep)
                         row['episode'], row['seed'], row['group'], row['first'] = episode_n, seed_now, group, t_ep == 0
                         hurt, room_idx = row['hurt'][0] > 0, obs.room[4]
+                    if WORKER_CPU:
+                        ce = _thread_time()
+                        mine[ST['enc_cpu']] += ce-c0
                     # (2026-10-09: the fatal hit does not raise the bridge's damage_taken, so a death record has hurt 0
                     # and was never a hurt to search; the death teacher queues it by its done code)
                     if pf_track:   # 2026-10-13 (B23): the forced move of this record (0: the policy's), the episode's
@@ -1899,6 +1946,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         episode.priv_frame = None
                     t1 = time.perf_counter()
                     mine[ST['encode_s']] += t1 - t0
+                    if WORKER_CPU:
+                        c1 = _thread_time()
+                        mine[ST['book_cpu']] += c1-ce
                     if waiting:   # the answer to the record before this one: the action of the step to come
                         receive()
                         action = tuple(int(v) for v in actions[index])
@@ -1923,7 +1973,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                     mine[ST['cf_nobank_refused']]+=1
                                     mine[ST['cf_skipped']]+=1
                     if block_on:
-                        v2log.rows.append(row.copy())
+                        v2log.add_row(row)
                         v2log.pending.append(tuple(action))
                     if cf_snap_req:   # B34: the actor copies this worker's temporal slot into the point's bank row
                         #             before this record's step (the record before is answered: no other request
@@ -1937,6 +1987,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         waiting = False
                     t2 = time.perf_counter()
                     mine[ST['wait_s']] += t2 - t1
+                    if WORKER_CPU:
+                        c2 = _thread_time()
+                        mine[ST['wait_cpu']] += c2-c1
                     if done or control[0]:
                         break
                     applied.append(applied_action(action, cfg.items))
@@ -1948,6 +2001,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         obs = lean_step(episode, decoder, applied_action(action, cfg.items), cfg.frames_per_decision)
                         lf = obs.logic_frames
                     mine[ST['step_s']] += time.perf_counter() - t2
+                    if WORKER_CPU:
+                        mine[ST['step_cpu']] += _thread_time()-c2
                     t_ep += 1
                     mine[ST['decisions']] += 1
                     mine[ST['frames']] += lf - lf_now

@@ -45,7 +45,7 @@ import numpy as np
 
 from .abplus_lean import LeanDecoder, lean_logic_frames, read_lean, read_lean_raw
 from .tok_branch import step_reward
-from .tok_obs import RC_HP0, RC_PROGRESS, ROW, EpisodeState, FastRow, encode_row
+from .tok_obs import RC_HP0, RC_PROGRESS, ROW, ROW_FRAME_AT as _ROW_FRAME_AT, EpisodeState, FastRow, encode_row
 
 V2_RING = 384        # imitation records per worker the trainer may fall behind by (a point writes <= cap of them)
 # per imitation record (float64): the action under way and the applied one (5 each, items / pill 0 without items),
@@ -60,6 +60,8 @@ V2_FIELDS = ('pend0', 'pend1', 'pend2', 'pend3', 'pend4', 'act0', 'act1', 'act2'
 V2_META = len(V2_FIELDS)
 VI = {k: i for i, k in enumerate(V2_FIELDS)}
 KIND_HURT, KIND_FATAL, KIND_RANDOM = 1, 2, 3
+_FRAME_BYTES = ROW.fields['visible_frame'][0].shape[0]
+V2LOG_COMPACT = os.environ.get('ISAAC_RL_V2LOG_COMPACT', '0') == '1'   # (W-a, V2Log.add_row)
 KIND_CF = 4          # B34 (2026-10-16): a counterfactual teacher's choice point (tok_cf.py)
 # (2026-11-11) a point's clones by purpose for abp_turbo's ABP_CLONE_STATS (the teacher search, the death search, CF)
 PURPOSE = {KIND_HURT: 'hurt', KIND_FATAL: 'fatal', KIND_RANDOM: 'random', KIND_CF: 'cf'}
@@ -162,6 +164,29 @@ class V2Log:
         self.vg = []
         self.gain_r, self._g = [], None
         self.rows,self.pending=[],[]
+
+    def add_row(self, row):
+        """The record's ROW for a later replay (replay_value). 2026-11-12 (W-a, ISAAC_RL_V2LOG_COMPACT=1): kept as the
+        bytes of its header and the used part of its visible frame (ROW_FRAME_AT + visible_bytes, ~32 KB) instead of a
+        whole 152-KB ROW copy; the frame bytes past visible_bytes are never read by the actor (the driver and the
+        Python path take visible_bytes of it), so a replay through row_into answers the same."""
+        if V2LOG_COMPACT:
+            b = np.ascontiguousarray(row).view(np.uint8).reshape(-1)
+            n = min(max(int(np.asarray(row['visible_bytes']).reshape(-1)[0]), 0), _FRAME_BYTES)
+            self.rows.append(b[:_ROW_FRAME_AT+n].tobytes())
+        else:
+            self.rows.append(row.copy())
+
+    def row_into(self, step, dst):
+        """Record `step`'s ROW into dst (a ROW array of one record, as row_buffer): the whole copy, or (compact) its
+        header and used frame bytes."""
+        r = self.rows[step]
+        if isinstance(r, bytes):
+            if not dst.flags['C_CONTIGUOUS']:
+                raise ValueError('V2Log.row_into: the row buffer must be contiguous')
+            dst.view(np.uint8).reshape(-1)[:len(r)] = np.frombuffer(r, np.uint8)
+        else:
+            dst[:] = r
 
     def add(self, row, done, progress, rw=None):
         self.damage.append(float(row['damage'][0]))
@@ -574,7 +599,7 @@ class LanePolicy:
         self.block_mode[self.i]=1
         try:
             for step in range(start,end+1):
-                row_buffer[:]=log.rows[step]
+                log.row_into(step,row_buffer)
                 self.request(row_buffer,log.pending[step])
                 _,value,_=self.answer()
             return self.vg if global_value else value
