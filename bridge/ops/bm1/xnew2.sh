@@ -7,6 +7,7 @@
 #   usage (in the container): CODE=<tree> [NAME=b42new PORT=39200] sh /bench/bm1/xnew2.sh <tag> [limit_s=7200] [game_hours=125]
 #   (NAME / PORT: the instances' name and port base, distinct per trainer when several run on one host)
 #   NSYS_PREFIX: a profiler command put before the trainer (nsys_update.sh); empty for every timed run
+#   EXTRA, EXTRA2, EXTRA3: flags added at the end (one each: docker -e values carry no spaces; a later flag wins)
 BM=${BM1_IN:-/bench/bm1}   # (bm1 as the runner sees it: run.sh passes BM1_IN; the 8x3090 container default)
 TAG=${1:-xnew-a1}
 OUT=$BM/reports/$TAG
@@ -31,6 +32,6 @@ CMD="$PY -u train_tok.py --groups-file ../abplus/catalog/scaling2_groups.json --
  --actor-bf16 1 --graph-entities 128 \
  --workers 16 --rollout 32768 --minibatch 8192 --micro 8192 --game-hours $HOURS --checkpoint-every 1000 \
  --overlap --decoupled 1 --learner-fast 0 --actor-processes 1 --learner-process 0 --amp bf16 \
- --port ${PORT:-39200} --name ${NAME:-b42new} --seed 1000 --out $OUT ${EXTRA:-}"
+ --port ${PORT:-39200} --name ${NAME:-b42new} --seed 1000 --out $OUT ${EXTRA:-} ${EXTRA2:-} ${EXTRA3:-}"
 echo "$CMD" > $OUT.command.txt
 exec xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" timeout --signal=INT --kill-after=60s $LIMIT ${NSYS_PREFIX:-} $CMD > $OUT.stdout 2> $OUT.stderr
