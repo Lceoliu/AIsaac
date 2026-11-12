@@ -353,7 +353,7 @@ def auxnorm_apply(norm, m):
     """The global batch's sums applied as AuxNorm.update would apply the concatenated batch."""
     S = len(norm.mean)
     K = len(norm.rn)
-    b = m[0]
+    b = float(m[0])   # (a Python float: norm.n goes into the checkpoint, which torch.load's weights_only reads)
     if b > 0:
         mu = m[1:1 + S] / b
         var = np.maximum(m[1 + S:1 + 2 * S] / b - mu * mu, 0.0)
