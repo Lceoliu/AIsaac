@@ -290,7 +290,7 @@ def black_half_hearts(soul, mask):
 class EpisodeState:
     """What the encoder keeps between the records of one episode."""
 
-    def __init__(self, limit, floor=False, stall=0, run=False, items=False, stall_pickups=False):
+    def __init__(self, limit, floor=False, stall=0, run=False, items=False, stall_pickups=False, stall_items=False):
         self.limit = max(int(limit), 1)
         self.floor = floor or run  # a whole-floor episode: it ends at the floor's exit, not at a room's clear
         self.run = run             # a run (2026-10-06): the floor's exit is an event (EV_EXIT), the episode goes on
@@ -309,6 +309,10 @@ class EpisodeState:
         # B40 (2026-10-18, --stall-progress pickups): a gain in player 0's coins, keys, bombs or health units is progress
         # too; prev_res: those four (floats) at the record before (None: none yet)
         self.stall_pickups = bool(stall_pickups)
+        # (2026-11-12, --stall-progress items: stall_pickups and also a collectible gained or a trinket / pill / card
+        #  acquired -- _inventory's inv_gain; inventory blocks always take the Python path, abp_row_encode hands them back)
+        self.stall_items = bool(stall_items)
+        self.inv_gain = False
         self.prev_res = None
         self.stage0 = None
         self.progress_t = 0
@@ -514,6 +518,8 @@ def encode_row(o, st, row, t):
             if st.prev_res is not None and any(a > b for a, b in zip(res, st.prev_res)):
                 st.progress_t = t
             st.prev_res = res
+        if st.stall_items and st.inv_gain:   # (--stall-progress items: an item, trinket, pill or card acquired)
+            st.progress_t = t
         stalled = st.stall > 0 and t - st.progress_t >= st.stall
         done = 2 if o.dead else 1 if (room[5] != st.stage0 and not st.run) else \
             3 if (t >= st.limit or stalled) else 0
@@ -528,6 +534,7 @@ def encode_row(o, st, row, t):
 def _inventory(o, st):
     """Items: take in the decoder's inventory block when it is new (st.inv_version); returns the EV_ITEM / EV_PILL bits
     of the change (none at the episode's first block)."""
+    st.inv_gain = False
     if o.inv_version == st.inv_version or o.inv_head is None:
         return 0
     first = st.inv_version is None
@@ -541,6 +548,12 @@ def _inventory(o, st):
             events |= EV_ITEM
         if (st.pocket[0] != 0 and pill == 0) or (st.pocket[1] != 0 and card == 0):
             events |= EV_PILL
+        # (--stall-progress items: something acquired -- a collectible's count up, a trinket not held before, a pill or
+        #  card in a pocket that held none or another)
+        held_tr = {int(st.pitem[1]), int(st.pitem[2])} - {0}
+        new_tr = {min(tr0 & 0x7fff, N_TRINKET - 1), min(tr1 & 0x7fff, N_TRINKET - 1)} - {0}
+        st.inv_gain = bool(events & EV_ITEM) or bool(new_tr - held_tr) or (pill != 0 and pill != st.pocket[0]) or \
+            (card != 0 and card != st.pocket[1])
     st.inv_counts = counts
     st.pocket = (pill, card)
     k = min(len(o.inv), INV_CAP)
