@@ -959,6 +959,32 @@ def workers_live(driver, sampler):
     return len(getattr(sampler, 'live', None) or [])
 
 
+# (--cap-truncate 1) the episode cap in decisions (run mode --run-seconds, else --floor-seconds): an end with done 3
+# at or past it is the time cap, not a stall -- a truncation (no timeout penalty, not terminal; its record is
+# evaluated and bootstraps the decision before, as a branch's truncated end); 0: off (every done 3 a terminal timeout)
+CAP_T = 0
+
+
+def is_cap(rows):
+    """Records that end their episode at the time cap (CAP_T; none when off)."""
+    if CAP_T <= 0:
+        return np.zeros(len(rows), bool)
+    return (rows['done'] == 3) & (rows['t'].astype(np.int64) >= CAP_T)
+
+
+def lr_at(frac, lr0, lr1, schedule='linear', warmup=0.0):
+    """The learning rate at run progress frac (0..1): over the first `warmup` share linearly from 0 to lr0, then lr0
+    to lr1 over the rest -- linearly, or along a half cosine (flat at both ends). linear with no warmup: lr0 + (lr1 -
+    lr0) x frac, the schedule before 2026-11-12, value for value."""
+    if warmup > 0 and frac < warmup:
+        return lr0 * frac / warmup
+    p = (frac - warmup) / (1.0 - warmup) if warmup > 0 else frac
+    p = min(max(p, 0.0), 1.0)
+    if schedule == 'cosine':
+        return lr1 + (lr0 - lr1) * 0.5 * (1.0 + math.cos(math.pi * p))
+    return lr0 + (lr1 - lr0) * p
+
+
 DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its game / worker failed before its end record)
 
 
@@ -1066,14 +1092,16 @@ class Episodes:
             if (~trunc).any():
                 self.close_broken(wb[~trunc])
         has = k >= 0
+        cap = is_cap(rows)   # (--cap-truncate: the time cap's ends, a truncation)
         if has.any():   # the reward of the decision before
             w, kk, d = idx[has], k[has], done[has]
+            cap_h = cap[has]
             dmg = rows['damage'][has].astype(np.float64)
             hu = rows['hurt'][has].astype(np.float64)
             if roll.close_hurt is not None:   # 2026-11-03 (--aux-predict): what closes these decisions
                 roll.close_hurt[w, kk], roll.close_done[w, kk], roll.close_ev[w, kk] = hu, d, rows['events'][has]
             reward = rw['damage'] * dmg - rw['hurt'] * hu - rw['time'] + np.where(
-                d == 1, self.end_bonus, np.where(d == 2, -rw['death'], np.where(d == 3, -rw['timeout'], 0.0)))
+                d == 1, self.end_bonus, np.where(d == 2, -rw['death'], np.where((d == 3) & ~cap_h, -rw['timeout'], 0.0)))
             if self.floor:
                 ev = rows['events'][has].astype(np.int64)
                 reward = reward + (rw['room'] * ((ev & 1) > 0) + rw['explore'] * ((ev & 2) > 0)
@@ -1096,7 +1124,7 @@ class Episodes:
                 x[w, 3] += (ev & EV_PILL) > 0
                 x[w, 5] = np.maximum(x[w, 5], rows['stage'][has])
             # (a branch's truncated end, DONE_BRANCH: not terminal, the decision bootstraps from the end's value)
-            roll.reward[w, kk], roll.terminal[w, kk] = reward, (d != 0) & (d != DONE_BRANCH)
+            roll.reward[w, kk], roll.terminal[w, kk] = reward, (d != 0) & (d != DONE_BRANCH) & ~cap_h
             roll.open[w] = -1
             self.ret[w] += reward
             if self.plr is not None:   # 2026-10-10 (archive_plr)
@@ -1144,6 +1172,8 @@ class Episodes:
                 fin = dict(group=int(r['group']), seed=int(r['seed']), done=int(r['done']),
                            decisions=int(r['t']), ret=float(self.ret[i]), hurt=float(self.hurt[i]),
                            damage=float(self.damage[i]), rooms=int(self.rooms[i]), boss=int(self.boss[i]))
+                if cap[j]:   # (--cap-truncate: done 3 at the time cap -- not a stall)
+                    fin['cap'] = 1
                 if self.run or self.items:
                     x = self.extra[i]
                     fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]),
@@ -1185,7 +1215,7 @@ class Episodes:
                         stats_[i, ST_['plr_score']] = abs(float(self.gret[i]) - float(self.v0[i]))
                         stats_[i, ST_['plr_episode']] = float(r['episode'])
                 self.v0[e], self.gret[e], self.steps[e] = 0.0, 0.0, 0
-            boot = done == DONE_BRANCH
+            boot = (done == DONE_BRANCH) | cap   # (the time cap's end, --cap-truncate: evaluated as well)
             pending[idx[ended & ~boot]] = 0   # (a truncated branch end keeps it: its record is evaluated, see below)
         else:
             boot = np.zeros(len(idx), bool)
@@ -1233,6 +1263,8 @@ def _native_events(book, rows, idx, snap):
         i, r, sv = idx[j], rows[j], snap[j]
         fin = dict(group=int(r['group']), seed=int(r['seed']), done=int(r['done']), decisions=int(r['t']), ret=float(sv[0]),
                    hurt=float(sv[1]), damage=float(sv[2]), rooms=int(sv[3]), boss=int(sv[4]))
+        if CAP_T > 0 and int(r['done']) == 3 and int(r['t']) >= CAP_T:   # (--cap-truncate: the time cap)
+            fin['cap'] = 1
         if self.run or self.items:
             x = sv[5:11].astype(np.int64)
             fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]), stage0=int(x[4]),
@@ -1305,7 +1337,7 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
     if priv is not None:   # 2026-11-03 (--priv-critic)
         roll.priv[a_idx, kk] = priv
     roll.rows[a_idx, kk] = compact_rows(rows, roll.frames) if roll.rows.dtype == ROWC else rows   # (B45)
-    roll.boot[a_idx, kk] = rows['done'] == DONE_BRANCH   # 2026-10-07 (branches; always False without them)
+    roll.boot[a_idx, kk] = (rows['done'] == DONE_BRANCH) | is_cap(rows)   # (branches' truncated ends; --cap-truncate)
     roll.pending[a_idx, kk], roll.actions[a_idx, kk] = under_way, actions
     roll.logp[a_idx, kk], roll.value[a_idx, kk], roll.version[a_idx, kk] = logp, value, version
     roll.length[a_idx], roll.open[a_idx] = kk + 1, kk
@@ -1582,6 +1614,11 @@ def main(argv=None, child=None, actor=None):
                         'size (0: the whole minibatch at once). The step is the same, the GPU memory smaller')
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--lr-final', type=float, default=1e-4)
+    p.add_argument('--lr-schedule', choices=('linear', 'cosine'), default='linear',
+                   help="--lr to --lr-final over the run's progress (with ISAAC_GAME_HOURS_TOTAL: the whole run's, a "
+                        "resume included): linear, or a half cosine (lr_at)")
+    p.add_argument('--lr-warmup', type=float, default=0.0,
+                   help='the share of the run (0..1) over which the learning rate rises linearly from 0 to --lr first')
     p.add_argument('--gamma', type=float, default=0.995)
     p.add_argument('--lam', type=float, default=0.95)
     p.add_argument('--clip', type=float, default=0.2)
@@ -1595,6 +1632,11 @@ def main(argv=None, child=None, actor=None):
                         '(2026-10-06): from Basement I on through the trapdoors (one group, named run)')
     p.add_argument('--run-seconds', type=float, default=1800.0,
                    help='run mode: game seconds a run may last (the stall rule of each floor as in floor mode)')
+    p.add_argument('--cap-truncate', type=int, default=0,
+                   help='floor / run modes, 1: an episode ended by the time cap (--run-seconds; floor mode '
+                        '--floor-seconds) is a truncation -- no timeout penalty, not terminal, the decision before '
+                        'bootstraps from the value of its last record (as a branch end); a stall stays a terminal '
+                        'timeout. 0: both terminal timeouts (as before)')
     p.add_argument('--items', action='store_true',
                    help='2026-10-06: item-aware observation and the item / pill heads (see the module docstring)')
     p.add_argument('--charge', type=int, default=1,
@@ -2672,6 +2714,12 @@ def main(argv=None, child=None, actor=None):
         actor_params = [t for t in list(model.parameters()) + list(model.buffers())]
     learner_params = [t for t in list(learner_model.parameters()) + list(learner_model.buffers())]
     hours_per_decision = args.frames_per_decision / 30 / 3600
+    if args.cap_truncate:   # (the consumers' CAP_T: the cap in decisions, as tok_floor's limit)
+        if args.mode not in ('floor', 'run'):
+            raise SystemExit('--cap-truncate: floor or run mode only')
+        globals()['CAP_T'] = int(round((args.run_seconds if args.mode == 'run' else args.floor_seconds) * 30
+                                       / args.frames_per_decision))
+    total_h = float(os.environ.get('ISAAC_GAME_HOURS_TOTAL') or 0)   # (train_guard.sh: the run's game hours in all)
     config = dict(vars(args), groups_resolved=names, assign=assign,
                   parameters=sum(q.numel() for q in learner_model.parameters()), reward_terms=rw, lag=1,
                   record='tok_obs.ROW', sampler='tok_sampler (fork sampler, lean bridge)',
@@ -2807,6 +2855,9 @@ def main(argv=None, child=None, actor=None):
         sampler = JobSampler(bench_stats)
     else:
         sampler = TokSampler(cfg)
+        if pf_on and total_h > 0 and decisions_total > 0:   # (a resumed run: the forcing probability where the run is,
+            sampler.stats[:, ST['pf_p']] = pickup_force_p(   # not pickup_force[0] until the first update rewrites it)
+                pick_force, decisions_total / max(1, int(total_h / hours_per_decision)))
     n = n_loc if child is None else args.workers   # (B38 step 5: an actor process's own workers)
     lab = None
     if lab_on:   # 2026-10-08: the build lab's trainer side (tok_lab: LabBook, LabScheduler, LabModel)
@@ -3044,6 +3095,8 @@ def main(argv=None, child=None, actor=None):
         made_g = bdrv.precapture_lane_generations(lanes, model)   # (both teacher generations' lane graphs now)
         cpp_driver = bdrv.make_driver(block_actor, sampler, actor_stream, args.seed + 1000003 * aid + 0xB52, pf_on,
                                       getattr(sampler, 'aux', None))
+        if cpp_driver is not None and CAP_T > 0:   # (--cap-truncate: the driver evaluates the time cap's ends too)
+            cpp_driver.set_cap(CAP_T)
         if cpp_driver is not None:
             for la_ in lanes.actors.values():   # (the pre-created lane actors' graphs: their middle in C++ too)
                 if la_.step_graph is not None:
@@ -3160,11 +3213,14 @@ def main(argv=None, child=None, actor=None):
         from isaac_bridge.tok_cf import TRIGGERS as CF_TRIGGERS, t_split
         v2_rng = np.random.default_rng([args.seed, 0x7E2])   # its own: the teacher's draws stay as without
     target_decisions = decisions_total + int(args.game_hours / hours_per_decision)
-    if os.environ.get('ISAAC_GAME_HOURS_TOTAL'):   # (train_guard.sh: the run's total, every resume included -- not
-        target_decisions = int(float(os.environ['ISAAC_GAME_HOURS_TOTAL']) / hours_per_decision)   # this start's)
+    if total_h > 0:   # (train_guard.sh: the run's total, every resume included -- not this start's)
+        target_decisions = int(total_h / hours_per_decision)
     if args.max_updates:
         target_decisions = decisions_total + args.max_updates * args.rollout
     start_decisions = decisions_total
+    # (the schedules' origin -- the learning rate, the forcing probability: the run's start when its total is set, so a
+    #  resume goes on where the run was; else this start's, as before)
+    prog0 = 0 if total_h > 0 and not args.max_updates else start_decisions
 
     def save(path):
         if SYNC is not None and SYNC.rank != 0:   # BM1 C: the shared state is rank 0's (identical everywhere): the others
@@ -3481,12 +3537,12 @@ def main(argv=None, child=None, actor=None):
             flat = np.flatnonzero(mask.reshape(-1))
             count = len(flat)
         if SYNC is None:
-            frac = min(1.0, (L['decisions'] - start_decisions) / max(1, target_decisions - start_decisions))
-            lr = args.lr + (args.lr_final - args.lr) * frac
+            frac = min(1.0, (L['decisions'] - prog0) / max(1, target_decisions - prog0))
+            lr = lr_at(frac, args.lr, args.lr_final, args.lr_schedule, args.lr_warmup)
         else:   # BM1 C: the global progress (every rank the same learning rate), times --shard-lr-mult
-            num_, den_ = SYNC.sum([float(L['decisions'] - start_decisions), float(target_decisions - start_decisions)])
+            num_, den_ = SYNC.sum([float(L['decisions'] - prog0), float(target_decisions - prog0)])
             frac = min(1.0, num_ / max(1.0, den_))
-            lr = (args.lr + (args.lr_final - args.lr) * frac) * args.shard_lr_mult
+            lr = lr_at(frac, args.lr, args.lr_final, args.lr_schedule, args.lr_warmup) * args.shard_lr_mult
         L['shard_frac'] = frac
         for g in opt.param_groups:
             g['lr'] = lr
@@ -4725,8 +4781,9 @@ def main(argv=None, child=None, actor=None):
         L['update'] += 1
         L['decisions'] += count
         if pf_on:   # 2026-10-13 (B23): the forcing probability of the episodes to come (the workers read 'pf_p')
-            L['pf_p'] = pickup_force_p(pick_force, (L['decisions'] - start_decisions) /
-                                       max(1, target_decisions - start_decisions))
+            # (K shards: the run's global progress, shard_frac, the learning rate's: every rank the same probability)
+            L['pf_p'] = pickup_force_p(pick_force, L['shard_frac'] if SYNC is not None and 'shard_frac' in L else
+                                       (L['decisions'] - prog0) / max(1, target_decisions - prog0))
             sampler.stats[:, ST['pf_p']] = L['pf_p']
         L['last_update_s'], L['last_steps'], L['last_count'], L['last_U'] = update_s, steps, count, U   # (B18 bench)
         # (B38: read before `fresh`: after it the actor may reuse this rollout; logging only)
@@ -5512,7 +5569,7 @@ def main(argv=None, child=None, actor=None):
     if cpp_driver is not None:
         why_c = bdrv.native_consumer_reason(cpp_driver, (roll, spare), lab, t_on, mem_on, proc, n_act)
         if why_c is None:
-            bdrv.attach_consumer(cpp_driver, book, (roll, spare), args.gamma)
+            bdrv.attach_consumer(cpp_driver, book, (roll, spare), args.gamma, cap_t=CAP_T)
             cpp_driver.use_rollout(roll.native_slot)
             native_cons = True
         print(f'B58 native consumer: {"on" if native_cons else "off (%s: the Python consumer)" % why_c}', flush=True)

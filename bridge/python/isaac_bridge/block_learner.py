@@ -119,8 +119,9 @@ bp.UPD_KEYS = tuple(bp.UPD_KEYS)+tuple(k for k in (
     'learn_prefetch_skip_wait_s', 'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s',
     # BM1 P2: the second learner card's forward / backward (wall on its thread, CUDA-event span on its card)
     'p2_fwd_part_wall_s', 'p2_fwd_part_gpu_s', 'p2_bwd_wall_s', 'p2_bwd_gpu_s', 'p2_bwd_calls',
-    # (a checkpointed Spatial segment redone: a graph compiled during its forward)
-    'learn_ckpt_compile_redo')
+    # (a checkpointed Spatial segment redone: a graph compiled during its forward; the checkpointed segments, each one
+    #  recomputed in the backward -- with ISAAC_LEARN_CKPT_DET=1 one determinism comparison each)
+    'learn_ckpt_compile_redo', 'learn_ckpt_segments')
     if k not in bp.UPD_KEYS)
 
 
@@ -1117,6 +1118,7 @@ def _run_packed(model, P):
                 bp.ucount('learn_ckpt_compile_redo', 1)
             else:
                 raise RuntimeError('BM1: the checkpointed Spatial segment compiled again on each of 3 tries')
+            bp.ucount('learn_ckpt_segments', 1)
             zs.append(z_[:m])
         else:
             zs.append(_spatial_segment(model, part)[:m])

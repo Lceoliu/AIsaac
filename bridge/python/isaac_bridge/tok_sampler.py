@@ -195,6 +195,17 @@ def start_seed(cfg, index, n):
     return cfg.seed + index + cfg.workers * (cfg.seed_stride * (cfg.state_base + n) + cfg.seed_phase)
 
 
+def rng_key(cfg, *parts):
+    """A worker random stream's seed: [seed, *parts] -- a fresh single run's (rank 0, nothing resumed) exactly as
+    before -- with the shard's phase and the resumed run's state base after it otherwise (0x5EED a separator), so the
+    K shards' streams differ worker for worker and a resume does not replay the draws of the run it continues (the
+    episodes' resets, start builds, forced pickups, characters, augmentation, teacher / CF draws)."""
+    key = [cfg.seed, *parts]
+    if getattr(cfg, 'seed_phase', 0) or getattr(cfg, 'state_base', 0):
+        key += [0x5EED, int(cfg.seed_phase), int(cfg.state_base)]
+    return key
+
+
 @dataclass
 class TokSamplerConfig:
     workers: int = 16
@@ -1075,7 +1086,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
     gx = GxConfig(bridge_lua=cfg.bridge_lua, preload=cfg.preload, al_stopped=True, nice=cfg.nice,
                   frames_per_decision=cfg.frames_per_decision, start_hp=cfg.start_hp[1], bombs=cfg.bombs,
                   stub_list=cfg.stub_list or default_stub_list(cfg.preload), die_with_parent=True)
-    rng = np.random.default_rng([cfg.seed, index])
+    rng = np.random.default_rng(rng_key(cfg, index))
     seconds = cfg.episode_seconds or float(spec['seconds'])
     limit = int(round(seconds * 30 / cfg.frames_per_decision))
     evaluation = bool(cfg.eval_seeds)
