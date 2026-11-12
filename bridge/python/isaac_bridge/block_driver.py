@@ -11,6 +11,7 @@ generations' lane actors (and their graphs) at start-up instead of on the actor 
 appears (B50 phase 0: a 9.2 s stall).
 """
 import copy
+import time
 import os
 
 import numpy as np
@@ -495,13 +496,66 @@ def batch_reason(cpp_driver, native_cons, native_lin_lanes):
     return None
 
 
-def batch_wait(d, on_events, on_record, timeout=0.5):
+class WorkerWatch:
+    """The collect's liveness of its workers in driver mode (2026-11-12: every worker of acceptg-c-78ad1e8 failed at its
+    first decode and the trainer waited, silently, until its timeout): the driver closes an ended worker's main pipe
+    (EOF) and counts it (workers_live / dead_workers), while Python's own list (sampler.live) only shrinks on Python's
+    poll path, which driver mode never takes. check() raises RuntimeError when every worker ended (the driver's count,
+    or no worker process alive: the second guard), or when the workers left cannot fill this collect any more: the
+    decisions already usable from the ended ones plus a full capacity per live one below the target. Never while the
+    run is stopping (stopped()). Throttled to one look per `every` s unless forced; live() is the progress column."""
+
+    def __init__(self, d, sampler, roll, target, stopped=None, every=1.0):
+        self.d, self.sampler, self.roll, self.target = d, sampler, roll, int(target)
+        self.stopped, self.every, self.t_last = stopped, float(every), 0.0
+        self.n = int(sampler.cfg.workers)
+
+    def dead(self):
+        if self.d is not None and hasattr(self.d, 'dead_workers'):
+            return [int(w) for w in self.d.dead_workers()]
+        live = set(getattr(self.sampler, 'live', []) or [])
+        return [i for i, c in enumerate(getattr(self.sampler, 'conns', []) or []) if c not in live]
+
+    def live(self):
+        return self.n - len(self.dead())
+
+    def procs_alive(self):
+        procs = getattr(self.sampler, 'procs', None)
+        return None if not procs else sum(1 for p in procs if p.is_alive())
+
+    def check(self, force=False):
+        t = time.perf_counter()
+        if not force and t - self.t_last < self.every:
+            return
+        self.t_last = t
+        if self.stopped is not None and self.stopped():
+            return
+        dead = self.dead()
+        pa = self.procs_alive()
+        if len(dead) >= self.n or pa == 0:
+            raise RuntimeError(f'all {self.n} workers ended: the driver closed {len(dead)} of their pipes, '
+                               f'{pa if pa is not None else "?"} worker processes alive; the collect cannot go on')
+        if dead:
+            r = self.roll
+            ln, op = np.asarray(r.length), np.asarray(r.open)
+            gone = np.zeros(self.n, bool)
+            gone[dead] = True
+            done_rows = int((ln[gone] - (op[gone] >= 0)).sum())
+            room = int((~gone).sum()) * int(r.cap)
+            if done_rows + room < self.target:
+                raise RuntimeError(f'{len(dead)} of {self.n} workers ended (workers {dead[:16]}), {self.n - len(dead)} '
+                                   f'left: at most {done_rows} + {room} decisions (the ended ones\' usable + the '
+                                   f'live ones\' capacity) of the collect\'s target {self.target}: it cannot fill')
+
+
+def batch_wait(d, on_events, on_record, timeout=0.5, watch=None):
     """(B58e) One blocking wait of the main thread in batch mode: 'target' (the collect's rollout is full: kind 7),
     'wake' (kind 9: new weights to take), 'idle' (nothing within timeout: the caller checks its liveness conditions).
     Event batches (kind 8) go to on_events(rows, workers, snap); every other record (captures, lane records, publish,
     errors) to on_record. After such a record the wait polls every 2 ms until the queue is empty and resumes a driver
     that paused itself for it (a capture request, a Python-stepped job), as the per-record loop did. A driver that
-    stopped or failed without a record raises here (the liveness timeout: at most `timeout` later)."""
+    stopped or failed without a record raises here (the liveness timeout: at most `timeout` later). watch (WorkerWatch):
+    its check at every idle return (the workers ended: RuntimeError)."""
     short = False
     while True:
         rec = d.next_record(0.002 if short else timeout)
@@ -513,6 +567,8 @@ def batch_wait(d, on_events, on_record, timeout=0.5):
                 continue
             if not d.running or d.last_error():
                 raise RuntimeError('cpp actor driver stopped: ' + (d.last_error() or 'no error message'))
+            if watch is not None:
+                watch.check(force=True)
             return 'idle'
         k = int(rec['kind'])
         if k == 7:

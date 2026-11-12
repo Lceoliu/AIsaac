@@ -65,7 +65,7 @@ note "1 abphome rc=$rc warnings $(grep -c 'warning' $D/abphome.log) ($(ls -la $B
 
 # 2 unit tests
 DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=${BM1_PAYLOADS:-$BM1_IN/payloads}/b45-payloads2" $BM/run.sh acceptg-unit $GPU sh -c \
-  "cd $T/bridge/python && timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py tests/test_lean_decode.py -q -p no:cacheprovider" > $D/unit.log 2>&1
+  "cd $T/bridge/python && timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py tests/test_lean_decode.py tests/test_worker_watch.py tests/test_b58e_batch.py -q -p no:cacheprovider" > $D/unit.log 2>&1
 rc=$?
 note "2 unit rc=$rc $(tail -1 $D/unit.log)"
 [ $rc = 0 ] || abort "2 unit tests rc=$rc"

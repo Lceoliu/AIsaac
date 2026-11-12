@@ -522,6 +522,9 @@ struct ActorDriver {
   // sampler shared memory
   uint8_t *rows_base = nullptr; i64 row_stride = 0; i64 n_workers = 0;
   std::vector<int> fds;
+  // the workers whose main pipe the driver closed (EOF / an unexpected message: the worker ended), in that order;
+  // deadmu guards it (the driver thread appends, Python reads: workers_live / dead_workers, block_driver.WorkerWatch)
+  std::mutex deadmu; std::vector<i64> dead_main;
   int32_t *actions = nullptr; i64 actions_stride = 0;   // int32 [W, ACTION_F]
   double *main_value = nullptr, *main_vg = nullptr, *aux = nullptr; i64 aux_stride = 0;
   i64 *cf_snap = nullptr;
@@ -616,6 +619,7 @@ struct ActorDriver {
                    i64 main_vg_ptr, i64 aux_ptr, i64 aux_stride_, i64 cf_snap_ptr, i64 priv_ptr, i64 priv_itemsize_, py::dict fields,
                    py::bytes reply_, i64 done_branch_, bool pf_on_) {
     rows_base = (uint8_t *)rows_ptr; row_stride = stride; n_workers = workers; fds = fds_;
+    { std::lock_guard<std::mutex> g(deadmu); dead_main.clear(); }
     actions = (int32_t *)actions_ptr; actions_stride = actions_stride_;
     main_value = (double *)main_value_ptr; main_vg = (double *)main_vg_ptr; aux = (double *)aux_ptr; aux_stride = aux_stride_;
     cf_snap = (i64 *)cf_snap_ptr; priv = (uint8_t *)priv_ptr; priv_itemsize = priv_itemsize_;
@@ -1588,7 +1592,8 @@ struct ActorDriver {
               if (cap_wait[i]) { held_w.push_back((i64)i); held_s.push_back(slot); n_cap_holds++; }
               else { ws.push_back((i64)i); ss.push_back(slot); }
             } else {
-              fds[i] = -1;   // the worker ended (or something unexpected): its pipe leaves the poll; Python notices through its own bookkeeping
+              fds[i] = -1;   // the worker ended (or something unexpected): its pipe leaves the poll; counted for Python
+              { std::lock_guard<std::mutex> g(deadmu); dead_main.push_back((i64)i); }   // (workers_live / dead_workers)
             }
           }
           t_poll_s = t_poll_s+(now()-t_p); n_polls++;
@@ -2151,6 +2156,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("run_graph", &ActorDriver::run_graph)
       .def("start", &ActorDriver::start).def("stop", &ActorDriver::stop).def("pause", &ActorDriver::pause, py::call_guard<py::gil_scoped_release>())
       .def("request_pause", &ActorDriver::request_pause).def("resume", &ActorDriver::resume).def("is_paused", &ActorDriver::is_paused).def("last_error", &ActorDriver::last_error)
+      .def("workers_live", [](ActorDriver &d) { std::lock_guard<std::mutex> g(d.deadmu); return d.n_workers-(i64)d.dead_main.size(); })
+      .def("dead_workers", [](ActorDriver &d) { std::lock_guard<std::mutex> g(d.deadmu); return d.dead_main; })
       .def("next_record", &ActorDriver::next_record).def("queue_size", &ActorDriver::queue_size).def("counters", &ActorDriver::counters)
       .def("drop_pending_batch", &ActorDriver::drop_pending_batch)
       .def("submit_lanes", &ActorDriver::submit_lanes).def("lane_queue_size", &ActorDriver::lane_queue_size)

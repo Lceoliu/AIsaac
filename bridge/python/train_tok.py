@@ -688,6 +688,7 @@ def merge_jobs(halves):
     j['branch_finished'] = [e for h in halves for e in h.get('branch_finished', [])]
     j['broken'] = [e for h in halves for e in h.get('broken', [])]
     j['broken_total'] = max(h.get('broken_total', 0) for h in halves)
+    j['workers_live'] = sum(h.get('workers_live', 0) for h in halves)
     for k in ('collect_s', 'wait_learner_s', 'cycle_s', 'cycle_wait_s', 'take_s', 't_put'):
         if k in j:
             j[k] = max(h.get(k, 0.0) for h in halves)
@@ -948,6 +949,14 @@ class Rollout:
             if len(o_src):
                 self.t_o.index_copy_(0, torch.from_numpy(o_dst).to(dev),
                                      other.t_o.index_select(0, torch.from_numpy(o_src).to(dev)))
+
+
+def workers_live(driver, sampler):
+    """The workers still connected (progress workers_live): the driver's count of open main pipes in driver mode (it owns
+    them), else the sampler's live list (Python's poll path drops an ended worker's pipe)."""
+    if driver is not None and hasattr(driver, 'workers_live'):
+        return int(driver.workers_live())
+    return len(getattr(sampler, 'live', None) or [])
 
 
 DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its game / worker failed before its end record)
@@ -4866,6 +4875,9 @@ def main(argv=None, child=None, actor=None):
         import shutil as shutil_
         row['broken_episodes'] = len(job.get('broken', []))   # (this update's; the guard warns / stops on them)
         row['broken_total'] = job.get('broken_total', 0)
+        # (workers whose pipe is still open: fewer than --workers = some ended -- the collect slower, or, below what fills
+        #  a collect, the run stopped by WorkerWatch; the guard acts on it)
+        row['workers_live'] = job.get('workers_live', -1)
         row['disk_free_gb'] = shutil_.disk_usage(out).free / 2 ** 30   # (the training run: the guard warns / stops on it)
         # (the container's memory: used without the inactive file cache, its limit, the kernel's OOM kills in it so
         #  far; a warning line past 90 % of the limit -- the guard logs it too)
@@ -5919,6 +5931,9 @@ def main(argv=None, child=None, actor=None):
                 cpp_driver.resume()
                 ev_ = lambda r_, w_, s_: consume_events(r_, w_, s_, prof_)
                 rc_ = lambda r_: consume_record(r_, prof_)
+                # (the workers' liveness: every one ended, or too few left to fill this collect: RuntimeError, not a
+                #  silent wait -- the driver owns their pipes, so sampler.live never shrinks in driver mode)
+                watch_ = bdrv.WorkerWatch(cpp_driver, sampler, roll, rollout_actor, stopped=stopped)
                 while batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
                     if busy and fresh.is_set():
                         bdrv.pause_serving(cpp_driver, rc_); drain_driver(prof_)
@@ -5933,11 +5948,12 @@ def main(argv=None, child=None, actor=None):
                         cpp_driver.resume()
                     ta_ = time.perf_counter()
                     nv.push('c.wait')
-                    st_ = bdrv.batch_wait(cpp_driver, ev_, rc_, 0.5)
+                    st_ = bdrv.batch_wait(cpp_driver, ev_, rc_, 0.5, watch=watch_)
                     nv.pop()
                     prof_['poll'] += time.perf_counter() - ta_
                     if st_ == 'target':
                         break
+                    watch_.check()   # (once a second: event batches may keep the wait from ever going idle)
                 while not batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
                     if busy and fresh.is_set():
                         bdrv.pause_serving(cpp_driver, lambda r_: consume_record(r_, prof_)); drain_driver(prof_)
@@ -5970,6 +5986,7 @@ def main(argv=None, child=None, actor=None):
                         cpp_driver.resume()
                     if rec_ is None and cpp_driver.is_paused() and cpp_driver.queue_size() == 0:
                         cpp_driver.resume()   # (a capture request / a Python-stepped lane job was answered)
+                    watch_.check()
                 if batch_on:
                     cpp_driver.set_collect_target(-1)
                 c1_ = cpp_driver.counters()
@@ -6229,6 +6246,7 @@ def main(argv=None, child=None, actor=None):
                        choices=sampler.choice_records() if branching else None,
                        v2=sampler.v2_records(with_h=mem_on, with_t=t_on,with_block=block_on) if v2_on else None,
                        branch_finished=book.branch_finished, broken=book.broken, broken_total=book.broken_total,
+                       workers_live=workers_live(cpp_driver, sampler),
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,
                        dec_min=float(dec_w.min()), dec_max=float(dec_w.max()),
