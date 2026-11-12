@@ -13,8 +13,10 @@ The reader (the operator's waiter) asks for the lines past the last n it saw.
 
 Thresholds (TRAINING.md section 8): KL median of the last 50 updates > 0.05; a head's entropy (median of 10 updates)
 down by more than half against 100 updates before; at 2500 game hours in all (both ranks): the zero-progress share of
-all episodes not below the u1-400 window's and the floor starts' mean new rooms not above it; ctr_mem_gb > 105, or
-after update 400 growing more than 2 GB per 100 updates; the combined x real time's 100-update median < 300.
+all episodes not below the u1-400 window's and the floor starts' mean new rooms not above it; ctr_mem_gb > 128, or
+after update 800 growing more than 2 GB per 100 updates (the coordinator, 2026-11-12: MEM_GB 144, the buffers fill to
+about 116 GB); the combined x real time's 100-update median < 300. The milestones add the characters by start builds
+(each rank's distinct fresh-start (group, seed)) and rank 0's new checkpoint_rotation.log lines.
 Standard library only (the host's python3); train_summary.py beside it."""
 import csv
 import os
@@ -42,7 +44,7 @@ class Watch:
                 for line in f:
                     self.n = max(self.n, int(line.split(' ', 1)[0]))
         self.guard_pos = 0
-        self.done_u300, self.milestones, self.alert_at = False, set(), {}
+        self.done_u300, self.milestones, self.alert_at, self.rot_pos = False, set(), {}, 0
         self.state = os.path.join(self.rd, 'train_watch.state')
         if os.path.exists(self.state):   # (a restarted watcher: what it already reported)
             with open(self.state) as f:
@@ -54,6 +56,8 @@ class Watch:
                         self.done_u300 = True
                     elif k == 'milestone':
                         self.milestones.add(int(v))
+                    elif k == 'rot_pos':
+                        self.rot_pos = int(v)
                     elif k == 'alert':
                         a, _, u = v.partition(' ')
                         self.alert_at[a] = int(u)
@@ -61,6 +65,7 @@ class Watch:
     def save(self):
         with open(self.state + '.tmp', 'w') as f:
             f.write(f'guard_pos {self.guard_pos}\n')
+            f.write(f'rot_pos {self.rot_pos}\n')
             if self.done_u300:
                 f.write('u300 1\n')
             for m in sorted(self.milestones):
@@ -102,6 +107,31 @@ class Watch:
                     ended = True
         return ended
 
+    def builds(self):
+        """the characters by start builds: each rank's distinct fresh-start (group, seed), by char0"""
+        try:
+            eps, _ = TS.load(self.rd)
+        except Exception as e:   # noqa: BLE001
+            return f'builds: {e}'
+        seen = {}
+        for e in eps:
+            if e.get('start') == 'fresh':
+                seen.setdefault((e.get('_rank'), e.get('group'), e.get('seed')), e.get('char0'))
+        n = [sum(1 for c in seen.values() if c == k) for k in range(3)]
+        return f'start builds by character (Isaac / Magdalene / Cain): {n[0]} / {n[1]} / {n[2]} of {len(seen)}'
+
+    def rotation(self):
+        """rank 0's checkpoint_rotation.log lines since the last milestone"""
+        p = os.path.join(self.rd, f'{os.path.basename(self.rd)}-s0', 'checkpoint_rotation.log')
+        if not os.path.exists(p):
+            return 'checkpoint_rotation.log: none'
+        with open(p) as fh:
+            fh.seek(self.rot_pos)
+            new = fh.read()
+        self.rot_pos += len(new.encode())
+        lines = [x for x in new.splitlines() if x.strip()]
+        return 'checkpoint_rotation.log new: ' + (' || '.join(lines) if lines else 'none')
+
     def alert(self, name, u, text):
         if u - self.alert_at.get(name, -10 ** 9) >= 100:
             self.alert_at[name] = u
@@ -117,7 +147,10 @@ class Watch:
             self.done_u300 = True
             w = p0[-50:]
             mem = [f(x, 'ctr_mem_gb') for x in p0]
-            self.emit('u300', f'u{u}: ctr_mem_gb u250 {mem[min(249, len(mem) - 1)]:.1f} now {mem[-1]:.1f}; '
+            held = ' '.join(f"rank {r} teach_held {P[r][-1].get('teach_held', '?')} v2_held {P[r][-1].get('v2_held', '?')}"
+                            for r in sorted(P))
+            self.emit('u300', f'u{u}: ctr_mem_gb u250 {mem[min(249, len(mem) - 1)]:.1f} now {mem[-1]:.1f} (expected '
+                              f'105-112); {held}; '
                               f'block_gc_s median50 {st.median(f(x, "block_gc_s") for x in w):.2f}; '
                               f'x_real median50 {sum(st.median(f(x, "x_real_time") for x in P[r][-50:]) for r in P):.0f}; '
                               f'kl median50 {st.median(f(x, "kl") for x in w):.4f}; '
@@ -132,7 +165,8 @@ class Watch:
                                           '--window', '400'], capture_output=True, text=True, timeout=600).stdout
                 except Exception as e:   # (a report must not stop the watcher)
                     out = f'train_summary failed: {e}'
-                self.emit('milestone', f'u{m}: ' + out.replace('\n', ' | '))
+                self.emit('milestone', f'u{m}: ' + out.replace('\n', ' | ') + ' | ' + self.builds() + ' | '
+                          + self.rotation())
         # the report-only thresholds
         if len(p0) >= 50:
             k = st.median(f(x, 'kl') for x in p0[-50:])
@@ -146,13 +180,13 @@ class Watch:
                     if then > 0 and now_ < then / 2:
                         self.alert(f'entropy_{h[4:]}', u, f'{h} {then:.2f} -> {now_:.2f} in 100 updates')
         mem = f(p0[-1], 'ctr_mem_gb')
-        if mem > 105:
-            self.alert('memory', u, f'ctr_mem_gb {mem:.1f} > 105')
-        if u > 500:
+        if mem > 128:
+            self.alert('memory', u, f'ctr_mem_gb {mem:.1f} > 128')
+        if u > 800:
             back = [x for x in p0 if int(x['update']) == u - 100]
             if back and mem - f(back[0], 'ctr_mem_gb') > 2:
                 self.alert('memory_growth', u, f'ctr_mem_gb +{mem - f(back[0], "ctr_mem_gb"):.1f} GB in 100 updates '
-                                               f'after update 400')
+                                               f'after update 800')
         if len(p0) >= 100 and all(len(P[r]) >= 100 for r in P):
             x = sum(st.median(f(y, 'x_real_time') for y in P[r][-100:]) for r in P)
             if x < 300:

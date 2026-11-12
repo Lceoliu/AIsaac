@@ -33,7 +33,7 @@ cat > $RD/train_args <<'EOF'
 --teach-buffer 8000 --teacher-v2-buffer 4000
 --lr 2e-4 --lr-final 2e-5 --lr-schedule cosine --lr-warmup 0.01
 EOF
-HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_GB=128 \
+HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_GB=144 \
   setsid nohup ./train_guard.sh $N $T env/gpu57-k2-s0dl.env env/gpu57-k2-s1dl.env \
   > $RD/guard.out 2>&1 < /dev/null &
 ```
@@ -41,7 +41,7 @@ HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_
 - 用户已定：`--stall-truncate 1`（无进展也按截断处理），学习率 2e-4 → 2e-5 余弦、预热 1%。
 - 从零开始：不设 `INIT`，不加载任何权重。
 - 起来后先看 `$RD/guard.log` 的前几行：
-  - "guard start"那一行有树、GPU、CPU、128g、hours 5000；
+  - "guard start"那一行有树、GPU、CPU、144g、hours 5000；
   - "train_args:"那一行是上面的参数；
   - "attempt 1: fresh start"。
 
@@ -66,7 +66,7 @@ HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_
 | 同步 | K=2 | 梯度取平均、学习率不乘系数；每一步做一次哈希检查，确定性检查开启 |
 | 绑核 | `gpu57-k2-s0dl/s1dl.env` | 每片 driver 1 个物理核，learner 2 个 |
 | PageStore 回收 | `COLLECT_EVERY=4`（守护脚本默认） | 每 4 次 hand-off 回收一次；检查点之前和运行结束时强制回收 |
-| 容器内存上限 | `MEM_GB=128` | 是上限，不是预留 |
+| 容器内存上限 | `MEM_GB=144` | 是上限，不是预留（协调方 2026-11-12：稳态约 116 GB，128g 只留 12 GB；主机 251 GB、其他租户几乎不占内存） |
 
 **在这个配置下不起作用的参数**（命令行与 long2 相同、保留，只在这里注明）：
 
@@ -158,7 +158,7 @@ progress.csv 的列（括号里是预期值）：
 
 | 列 | 看什么 |
 |---|---|
-| `ctr_mem_gb` / `ctr_mem_frac` | 约第 250 轮（约 1.7 小时）走平，稳态约 84 GB（最多 115 GB 左右）；不应持续上涨 |
+| `ctr_mem_gb` / `ctr_mem_frac` | 随缓冲区填充上涨：归档填满后基线约 85–88 GB，之后每条缓冲记录约 1.2–1.3 MB（每 rank）；teach 8000 约第 100 轮填满（约 105–111 GB），v2 4000 约第 600 轮后填满，稳态约 116 GB（long2 拟合，协调方 2026-11-12；彩排 u32 为 87.6 GB）。之后不应持续上涨 |
 | `block_gc_s` | 每 4 轮一次完整回收，约 2 s，其余轮接近 0，平均约 0.5 s；不应随时间增长 |
 | `x_real_time` | 每片约 170–200，合计约 340–390（long2 从 422 降到 342，一半是缓冲区增大造成的，现在缓冲区有上限） |
 | `kl` | 学习率 2e-4 时预计会比 C99（常数 1e-4 时 0.012–0.03）更高，注意是否明显越界 |
@@ -177,8 +177,8 @@ setsid nohup python3 /root/AIsaac/bm1/train_watch.py $RD > $RD/train_watch.out 2
 
 它每分钟只读一次 guard.log 和 progress/episodes 文件，把事件逐行追加到 `$RD/events.log`（`<序号> <时间> <类型> <内容>`，类型有 guard、u300、milestone、alert、end）。本机的等待命令只取上次之后的新行。监视脚本重启后会从 `train_watch.state` 接着走，已经报过的不会重报。事件包括：
 
-- 第 300 轮（约 2 小时）：内存是否在约 250 轮走平（ctr_mem_gb、trainer 和 workers 的 PSS）、block_gc_s 是否封顶、×实时走势、KL 和各头熵、学习率是否按曲线走、三个角色的实际比例、哈希不一致和稳态编译计数；
-- 每个里程碑（每 400 轮）：train_summary.py 的窗口表，加 KL 中位数、熵、×实时、内存；
+- 第 300 轮（约 2 小时）：内存的实际数值（ctr_mem_gb，预期 105–112 GB；teach_held、v2_held；trainer 和 workers 的 PSS）、block_gc_s 是否封顶、×实时走势、KL 和各头熵、学习率是否按曲线走、三个角色的实际比例、哈希不一致和稳态编译计数；
+- 每个里程碑（每 400 轮）：train_summary.py 的窗口表，加 KL 中位数、熵、×实时、内存；按开局构建数（各 rank 新开局的不同 (group, seed)）的角色分布；`checkpoint_rotation.log` 的新行（第一次真实轮转在第 400 轮）；
 - 守护脚本的任何恢复、警告（内存 90%、OOM、断局、worker 相关、卡死）和停下等人：立即；
 - 训练到点结束：立即。
 
@@ -188,7 +188,7 @@ setsid nohup python3 /root/AIsaac/bm1/train_watch.py $RD > $RD/train_watch.out 2
 |---|---|
 | KL / 熵 | 最近 50 轮 KL 中位数 > 0.05，或任一动作头的熵在 100 轮内掉了一半以上 |
 | 学习停滞 | 到合计 2500 游戏小时，全体对局的零进展占比没有比第 400 轮时下降，且新开局的平均清房数（这里用新进入房间数）没有上升 |
-| 内存 | ctr_mem_gb > 105 GB，或第 400 轮之后仍以每 100 轮 2 GB 以上的速度上涨 |
+| 内存 | ctr_mem_gb > 128 GB，或第 800 轮之后仍以每 100 轮 2 GB 以上的速度上涨 |
 | 速度 | ×实时（两片合计）的 100 轮中位数 < 300 |
 
 ## 9. 开训后的待办
