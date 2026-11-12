@@ -161,7 +161,7 @@ faultrun() {   # name, extra -e flags
   NOLOCK=1 LOCKS_HELD="$TAG" LANE_CPUS=1 CPUSET=8-15,24-31 MEMS=1 LEARNER_PIN=0 DRIVER_PIN=0 GPU=$GPU UPDATES=4     ENVS="-e ISAAC_FAULT_WORKERS=die:$BM1_IN/reports/$TAG/fault-on $*" sh $BM/prof.sh $TAG-$n $TREE
   touch $D/$n.end; wait $WP
   O=$R/$TAG-$n.stdout
-  rc=$(grep "$TAG-$n done rc=" $R/bm1.log | tail -1 | sed 's/.*done rc=\([0-9]*\).*//')
+  rc=$(grep "$TAG-$n done rc=" $R/bm1.log | tail -1 | grep -o 'done rc=[0-9]*' | cut -d= -f2)
   if [ ! -f $D/$n.timeout ] && grep -q 'workers ended' $O && [ "${rc:-0}" != 0 ]; then v=PASS; else v=FAIL; fi
   note "5b $n $v: rc=${rc:-?} in $(( $(date +%s) - t0 )) s; $(grep -m1 -o 'RuntimeError: .*workers ended.*' $O | cut -c1-160)$(cat $D/$n.timeout 2>/dev/null)"
 }
