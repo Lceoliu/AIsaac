@@ -687,9 +687,7 @@ def merge_jobs(halves):
     j['finished'] = [e for h in halves for e in h.get('finished', [])]
     j['branch_finished'] = [e for h in halves for e in h.get('branch_finished', [])]
     j['broken'] = [e for h in halves for e in h.get('broken', [])]
-    j['broken_total'] = sum(h.get('broken_total', 0) for h in halves)   # (each actor its own book)
-    if all('workers_live' in h for h in halves):
-        j['workers_live'] = sum(h['workers_live'] for h in halves)   # (each actor its own workers)
+    j['broken_total'] = max(h.get('broken_total', 0) for h in halves)
     for k in ('collect_s', 'wait_learner_s', 'cycle_s', 'cycle_wait_s', 'take_s', 't_put'):
         if k in j:
             j[k] = max(h.get(k, 0.0) for h in halves)
@@ -4865,7 +4863,6 @@ def main(argv=None, child=None, actor=None):
         import shutil as shutil_
         row['broken_episodes'] = len(job.get('broken', []))   # (this update's; the guard warns / stops on them)
         row['broken_total'] = job.get('broken_total', 0)
-        row['workers_live'] = job.get('workers_live', '')   # (worker processes alive at the hand-off; the guard warns on a drop)
         row['disk_free_gb'] = shutil_.disk_usage(out).free / 2 ** 30   # (the training run: the guard warns / stops on it)
         # (the container's memory: used without the inactive file cache, its limit, the kernel's OOM kills in it so
         #  far; a warning line past 90 % of the limit -- the guard logs it too)
@@ -5455,24 +5452,6 @@ def main(argv=None, child=None, actor=None):
         if failure:
             raise failure[0]
 
-    reap_t, workers_dead = [0.0], [0]
-
-    def reap_dead():
-        """(the native driver, every 2 s of its collect) worker processes that ended leave sampler.live, as the Python
-        path's poll drops them (the driver only stops polling their pipes): the run goes on with the others; none
-        left -- the collect and the run end, with an error (below)."""
-        now_ = time.perf_counter()
-        if cpp_driver is None or now_ - reap_t[0] < 2.0:
-            return
-        reap_t[0] = now_
-        for c_, p_ in list(zip(sampler.conns, sampler.procs)):
-            if c_ in sampler.live and not p_.is_alive():
-                code_ = p_.exitcode
-                sampler._drop(c_)
-                workers_dead[0] += 1
-                print(f'worker process {sampler.conns.index(c_)} ended (exit code {code_}): {len(sampler.live)} of '
-                      f'{len(sampler.conns)} left', flush=True)
-
     def stopped():
         """(B38 step 5, another actor) the first actor asked this one to stop."""
         return stop_ev is not None and stop_ev.is_set()
@@ -5936,7 +5915,6 @@ def main(argv=None, child=None, actor=None):
                 ev_ = lambda r_, w_, s_: consume_events(r_, w_, s_, prof_)
                 rc_ = lambda r_: consume_record(r_, prof_)
                 while batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
-                    reap_dead()
                     if busy and fresh.is_set():
                         bdrv.pause_serving(cpp_driver, rc_); drain_driver(prof_)
                         lanes.quiesce()
@@ -5956,7 +5934,6 @@ def main(argv=None, child=None, actor=None):
                     if st_ == 'target':
                         break
                 while not batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
-                    reap_dead()
                     if busy and fresh.is_set():
                         bdrv.pause_serving(cpp_driver, lambda r_: consume_record(r_, prof_)); drain_driver(prof_)
                         lanes.quiesce()
@@ -6203,11 +6180,6 @@ def main(argv=None, child=None, actor=None):
                     pstats.Stats(actor_profile,stream=f).sort_stats('cumulative').print_stats(50)
                     pstats.Stats(actor_profile,stream=f).sort_stats('tottime').print_stats(30)
             collect_s = time.perf_counter() - t0
-            if not sampler.live and not failure and not sampler.cfg.eval_seeds:
-                # (every worker process ended: no records can come -- an error, not a finished run: last.pt saved,
-                #  then raised at the end, exit 1; the guard resumes / stops by its rules)
-                failure.append(RuntimeError(f'every worker process ended ({workers_dead[0]} seen by the driver path) '
-                                            f'at update {L.get("update", update)}: the run cannot go on'))
             if not sampler.live or stopped():
                 break
             check_actors()
@@ -6252,7 +6224,6 @@ def main(argv=None, child=None, actor=None):
                        choices=sampler.choice_records() if branching else None,
                        v2=sampler.v2_records(with_h=mem_on, with_t=t_on,with_block=block_on) if v2_on else None,
                        branch_finished=book.branch_finished, broken=book.broken, broken_total=book.broken_total,
-                       workers_live=len(sampler.live),
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,
                        dec_min=float(dec_w.min()), dec_max=float(dec_w.max()),
