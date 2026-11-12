@@ -2,14 +2,14 @@
 
 本文是首次正式训练的操作手册：启动命令、参数、检查点与磁盘、日志位置、停止与恢复、失败时守护脚本的行为、开训后头两小时要看的指标。
 
-- 适用的树：`m200b863`，即提交 200b863 = 6f8e099 加训练参数文件。要等最终门禁 3 道加 A8 和启动彩排都通过，再由协调方确认。
-- 开训由用户发话。
+- 适用的树：`$T`，即最终训练树。最终门禁 3 道加 A8 和启动彩排都通过后，由协调方确认具体是哪个提交。
+- 启动由协调方下指令（用户已经授权给协调方）。
 
 ## 1. 开训前确认
 
 | 项 | 怎么确认 |
 |---|---|
-| 树已部署 | `ls /root/AIsaac/bm1/trees/m200b863/bridge/python/train_tok.py` |
+| 树已部署 | `ls /root/AIsaac/bm1/trees/$T/bridge/python/train_tok.py` |
 | 游戏库来自合并后的树 | `md5sum /root/AIsaac/bm1/home/isaac-abplus/tools/abp_turbo.c` 与树里的 `bridge/engine/abp_turbo.c` 相同（ea617f1f…） |
 | 门禁和 A8 都绿 | `reports/bm1.log` 里该树有 3 次 `gate … rc=0`，还有 `job a8-… rc=0` |
 | 脚本是最新的 | `sha1sum train_guard.sh xnew2.sh` 与仓库一致 |
@@ -20,6 +20,7 @@
 
 ```sh
 cd /root/AIsaac/bm1
+T=m<最终训练树>
 N=main1
 RD=/root/AIsaac/train/$N
 mkdir -p $RD
@@ -33,12 +34,11 @@ cat > $RD/train_args <<'EOF'
 --lr 2e-4 --lr-final 2e-5 --lr-schedule cosine --lr-warmup 0.01
 EOF
 HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_GB=128 \
-  setsid nohup ./train_guard.sh $N m200b863 env/gpu57-k2-s0dl.env env/gpu57-k2-s1dl.env \
+  setsid nohup ./train_guard.sh $N $T env/gpu57-k2-s0dl.env env/gpu57-k2-s1dl.env \
   > $RD/guard.out 2>&1 < /dev/null &
 ```
 
-- `--stall-truncate` 等用户定：1 表示无进展也按截断处理，0 表示照旧按终止处理并给惩罚。上面写的是 1，按用户的决定改。
-- 学习率峰值和终值也待用户确认，目前按 2e-4 / 2e-5 写。
+- 用户已定：`--stall-truncate 1`（无进展也按截断处理），学习率 2e-4 → 2e-5 余弦、预热 1%。
 - 从零开始：不设 `INIT`，不加载任何权重。
 - 起来后先看 `$RD/guard.log` 的前几行：
   - "guard start"那一行有树、GPU、CPU、128g、hours 5000；
@@ -55,10 +55,11 @@ HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_
 | 角色 | `--characters 0,1,2` | Isaac、Magdalene、Cain 等权重。实际比例：约 30% 的新开局严格按权重；约 70% 从存档点开局，沿用存档点的角色，所以会略偏向活得久的角色。episodes.jsonl 的 `char0` 可以直接统计。 |
 | 整局上限 | `--run-seconds 3600 --cap-truncate 1` | 到点按截断处理：不给 timeout 惩罚、不算终止、用最后一条记录的价值自举。 |
 | 无进展 | `--stall-progress items --floor-stall-seconds 120` | 新房间、清房、打到怪、资源增加、获得收集品/饰品/药丸/卡牌，都算进展。120 秒无进展判 stall。 |
-| 无进展的处理 | `--stall-truncate` | 待定，见第 2 节。模型的输入里看不到 stall 计时。 |
+| 无进展的处理 | `--stall-truncate 1` | 按截断处理（不给惩罚、不算终止、用最后一条记录的价值自举）。原因是模型的输入里看不到 stall 计时。 |
 | 奖励 | `--reward heal=0.5,resource=0.05` | 其余项不变 |
 | 强制拾取 | `--pickup-force 0` | 关闭。起始道具底座（`--start-build-mode pedestal`）照常生成，捡不捡由策略决定。 |
 | PLR | 不开 | 配置里本来就没有 |
+| 在线评测 | 不做 | 训练曲线用 `train_summary.py`（第 8 节）汇总训练对局；里程碑检查点在训练结束后做 512 种子的留出评测（eval_tok.py，三个角色各自） |
 | 缓冲区 | `--teach-buffer 8000 --teacher-v2-buffer 4000` | 每条记录在 trainer 里约占 1.33 MB/rank。每条记录的期望使用次数由 `--teach-reuse` 决定，缓冲区大小只决定记录有多新。 |
 | 学习率 | `--lr 2e-4 --lr-final 2e-5 --lr-schedule cosine --lr-warmup 0.01` | 前 1% 从 0 线性升到峰值，之后按余弦降到终值。进度按全程累计计算，恢复后连续，两个分片相同。 |
 | 训练总量 | `HOURS=5000` | 每个分片 5000 游戏小时，两片合计 10000（ISAAC_GAME_HOURS_TOTAL）。每轮每片约 1.21 游戏小时，共约 4125 轮。按 340–390× 估算墙钟约 26–29 小时。到点后守护进程正常结束（rc 0）。 |
@@ -137,7 +138,19 @@ HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_
 
 守护脚本只管我们自己的容器，系统层面什么都不做：不重置 GPU，不碰别人的进程。
 
-## 8. 头两小时要看的指标
+## 8. 指标和汇总
+
+**离线汇总**：`python3 /root/AIsaac/bm1/train_summary.py $RD --window 400 [--csv out.csv]`。只读运行目录，不碰训练进程。按每 400 轮一个窗口给出：
+
+- 新开局（episodes.jsonl 的 `start` 为 fresh）的平均最深层数、新进入的房间数、Boss 清除数、收集品数、受伤；
+- 结束方式占比：死亡、stall 截断、cap 截断、断局；
+- 以上按角色（char0）再分别算一遍；
+- 全体对局的零进展占比；
+- 窗口内 KL 和各动作头熵的中位数、合计 ×实时、容器内存。
+
+episodes 里没有"清房数"，用"新进入的房间数"代替。
+
+**头两小时要看的指标**
 
 progress.csv 的列（括号里是预期值）：
 
