@@ -66,9 +66,12 @@ note "1 abphome rc=$rc warnings $(grep -c 'warning' $D/abphome.log) ($(ls -la $B
 
 # 2 unit tests
 DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=${BM1_PAYLOADS:-$BM1_IN/payloads}/b45-payloads2" $BM/run.sh acceptg-unit $GPU sh -c \
-  "cd $T/bridge/python && timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py tests/test_lean_decode.py tests/test_worker_watch.py tests/test_b58e_batch.py -q -p no:cacheprovider" > $D/unit.log 2>&1
+  "cd $T/bridge/python && $BM1_PY -c \"from isaac_bridge import actor_native as a; m = a.load(); print('EXT', 'ok' if m is not None else 'FAIL ' + str(a.REASON)[-1500:])\" && timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py tests/test_lean_decode.py tests/test_worker_watch.py tests/test_b58e_batch.py -q -rs -p no:cacheprovider" > $D/unit.log 2>&1
 rc=$?
-note "2 unit rc=$rc $(tail -1 $D/unit.log)"
+note "2 unit rc=$rc $(grep -m1 '^EXT' $D/unit.log | cut -c1-200); $(tail -1 $D/unit.log)"
+# (the C++ actor extension built and loaded: its tests skip without it, so a failed build would pass silently)
+grep -q '^EXT ok' $D/unit.log || abort "2 the cpp actor extension did not load: $(grep -m1 '^EXT' $D/unit.log | cut -c1-300)"
+grep -q 'extension unavailable' $D/unit.log && abort "2 unit tests skipped for the extension"
 [ $rc = 0 ] || abort "2 unit tests rc=$rc"
 
 # 3 frame probes
