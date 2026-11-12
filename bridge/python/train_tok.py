@@ -5452,24 +5452,6 @@ def main(argv=None, child=None, actor=None):
         if failure:
             raise failure[0]
 
-    reap_t, workers_dead = [0.0], [0]
-
-    def reap_dead():
-        """(the native driver, every 2 s of its collect) worker processes that ended leave sampler.live, as the Python
-        path's poll drops them (the driver only stops polling their pipes): the run goes on with the others; none
-        left -- the collect and the run end, with an error (below)."""
-        now_ = time.perf_counter()
-        if cpp_driver is None or now_ - reap_t[0] < 2.0:
-            return
-        reap_t[0] = now_
-        for c_, p_ in list(zip(sampler.conns, sampler.procs)):
-            if c_ in sampler.live and not p_.is_alive():
-                code_ = p_.exitcode
-                sampler._drop(c_)
-                workers_dead[0] += 1
-                print(f'worker process {sampler.conns.index(c_)} ended (exit code {code_}): {len(sampler.live)} of '
-                      f'{len(sampler.conns)} left', flush=True)
-
     def stopped():
         """(B38 step 5, another actor) the first actor asked this one to stop."""
         return stop_ev is not None and stop_ev.is_set()
@@ -5933,7 +5915,6 @@ def main(argv=None, child=None, actor=None):
                 ev_ = lambda r_, w_, s_: consume_events(r_, w_, s_, prof_)
                 rc_ = lambda r_: consume_record(r_, prof_)
                 while batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
-                    reap_dead()
                     if busy and fresh.is_set():
                         bdrv.pause_serving(cpp_driver, rc_); drain_driver(prof_)
                         lanes.quiesce()
@@ -5953,7 +5934,6 @@ def main(argv=None, child=None, actor=None):
                     if st_ == 'target':
                         break
                 while not batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
-                    reap_dead()
                     if busy and fresh.is_set():
                         bdrv.pause_serving(cpp_driver, lambda r_: consume_record(r_, prof_)); drain_driver(prof_)
                         lanes.quiesce()
@@ -6200,11 +6180,6 @@ def main(argv=None, child=None, actor=None):
                     pstats.Stats(actor_profile,stream=f).sort_stats('cumulative').print_stats(50)
                     pstats.Stats(actor_profile,stream=f).sort_stats('tottime').print_stats(30)
             collect_s = time.perf_counter() - t0
-            if not sampler.live and not failure and not sampler.cfg.eval_seeds:
-                # (every worker process ended: no records can come -- an error, not a finished run: last.pt saved,
-                #  then raised at the end, exit 1; the guard resumes / stops by its rules)
-                failure.append(RuntimeError(f'every worker process ended ({workers_dead[0]} seen by the driver path) '
-                                            f'at update {L.get("update", update)}: the run cannot go on'))
             if not sampler.live or stopped():
                 break
             check_actors()
