@@ -14,8 +14,9 @@ RW = dict(damage=1.0, hurt=0.75, room=1.0, explore=0.5, boss=2.0, exit=3.0, deat
 GAMMA, LAM = 0.9, 0.95
 
 
-def _row(first=0, done=0, damage=0.0, seed=7, branch=0):
+def _row(first=0, done=0, damage=0.0, seed=7, branch=0, t=0):
     r = np.zeros(1, ROW)
+    r['t'] = t
     r['first'], r['done'], r['damage'], r['seed'], r['group'], r['branch'] = first, done, damage, seed, 3, branch
     return r
 
@@ -34,7 +35,7 @@ class Run:
         if go[0]:   # (the store: a new open decision with this value; DONE_BRANCH's too, as a boot)
             k = int(self.roll.length[0])
             self.roll.value[0, k] = value
-            self.roll.boot[0, k] = rows['done'][0] == DONE_BRANCH
+            self.roll.boot[0, k] = (rows['done'][0] == DONE_BRANCH) | T.is_cap(rows)[0]
             self.roll.open[0], self.roll.length[0] = k, k + 1
 
     def gae(self):

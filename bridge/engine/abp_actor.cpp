@@ -530,6 +530,7 @@ struct ActorDriver {
   // ROW fields: offset, size
   i64 f_first = 0, f_done = 0, f_pforce = 0, f_schema = 0, f_bytes = 0, f_frame = 0; int s_first = 1, s_done = 1, s_pforce = 1;
   i64 done_branch = 4;
+  i64 cap_t = 0, f_t = -1; int s_t = 4;   // (--cap-truncate: the time cap's ends are evaluated, as a branch's truncated end)
   bool pf_on = false;
   // arena
   ArenaReset reset; i64 scratch_row = 0, base = 0; i64 *step_host = nullptr; i64 heads = 0, nh = 0; i64 block_steps = 32;
@@ -608,6 +609,7 @@ struct ActorDriver {
   void set_seed(i64 seed) { rng = Xoshiro((uint64_t)seed); }
   void set_fixed_uniform(double v) { fixed_u = v; }
   void set_version(i64 v) { version = v; }
+  void set_cap(i64 v) { cap_t = v; }   // (--cap-truncate: the cap in decisions; 0 off)
   void set_buckets(std::vector<i64> body, std::vector<i64> entity, std::vector<i64> inventory, std::vector<i64> slots, i64 fixed,
                    i64 fbytes, i64 schema) {
     bk_body = body; bk_entity = entity; bk_inventory = inventory; bk_slots = slots; frame_fixed = fixed; frame_bytes = fbytes; schema_version = schema;
@@ -624,6 +626,7 @@ struct ActorDriver {
     f_first = f("first", s_first); f_done = f("done", s_done); f_pforce = f("pforce", s_pforce);
     f_schema = f("visible_schema", dummy); f_bytes = f("visible_bytes", dummy); f_frame = f("visible_frame", dummy);
     reply = reply_; done_branch = done_branch_; pf_on = pf_on_;
+    if (fields.contains("t")) f_t = f("t", s_t);
     pending_cur.assign(workers*nh, 0);
     cap_wait.reset(new std::atomic<uint8_t>[workers]);
     for (i64 w = 0; w < workers; w++) cap_wait[w] = 0;
@@ -695,6 +698,7 @@ struct ActorDriver {
     c.w_resource = F("w_resource"); c.end_bonus = F("end_bonus"); c.gamma = F("gamma");
     c.floor = B("floor"); c.run = B("run"); c.items = B("items"); c.gains_on = B("gains_on"); c.plr_on = B("plr_on"); c.pick_on = B("pick_on");
     c.ev_exit = I("ev_exit"); c.ev_item = I("ev_item"); c.ev_active = I("ev_active"); c.ev_pill = I("ev_pill"); c.done_branch = I("done_branch");
+    c.cap_t = P("cap_t"); c.o_t = d.contains("o_t") ? I("o_t") : (i64)-1;
     c.ret = (double *)P("ret"); c.ep_hurt = (double *)P("hurt"); c.ep_damage = (double *)P("damage"); c.gains = (double *)P("gains");
     c.healed = (double *)P("healed"); c.gathered = (double *)P("gathered"); c.v0 = (double *)P("v0"); c.gret = (double *)P("gret");
     c.rooms = (i64 *)P("rooms"); c.boss = (i64 *)P("boss"); c.extra = (i64 *)P("extra"); c.steps = (i64 *)P("steps");
@@ -1790,7 +1794,8 @@ struct ActorDriver {
       memcpy(rc+i*row_stride, src, (size_t)std::min<i64>(used, row_stride));
       if (priv) memcpy(r->priv.data_ptr<uint8_t>()+i*priv_itemsize, priv+ss[i]*priv_itemsize, priv_itemsize);
       i64 done = read_int(src+f_done, s_done), first = read_int(src+f_first, s_first);
-      bool ended = done != 0, boot = done == done_branch;
+      bool ended = done != 0, boot = done == done_branch
+                   || (cap_t > 0 && f_t >= 0 && done == 3 && read_int(src+f_t, s_t) >= cap_t);
       bool go = !ended || boot;
       r->go[i] = go;
       if (cf_snap) { r->cf_snap[i] = cf_snap[ws[i]]; if (r->cf_snap[i] && !lin_on) cap_wait[ws[i]] = 1; }   // (before the reply;
@@ -2142,7 +2147,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def_readonly("snap", &SnapPin::snap);
   py::class_<ActorDriver, std::shared_ptr<ActorDriver>>(m, "ActorDriver")
       .def(py::init<std::shared_ptr<PageStore>>())
-      .def("set_stream", &ActorDriver::set_stream).def("set_seed", &ActorDriver::set_seed).def("set_version", &ActorDriver::set_version)
+      .def("set_stream", &ActorDriver::set_stream).def("set_seed", &ActorDriver::set_seed).def("set_version", &ActorDriver::set_version).def("set_cap", &ActorDriver::set_cap)
       .def("set_fixed_uniform", &ActorDriver::set_fixed_uniform)
       .def("set_buckets", &ActorDriver::set_buckets).def("set_sampler", &ActorDriver::set_sampler).def("set_arena", &ActorDriver::set_arena)
       .def("set_lane_arena", &ActorDriver::set_lane_arena).def("lane_arena_count", &ActorDriver::lane_arena_count).def("lane_device", &ActorDriver::lane_device)
