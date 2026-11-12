@@ -2,7 +2,8 @@
 one only changes when dead page rows are freed and their ids reused -- never a value. The same rollout (an episode
 reset, teacher records kept a while and then let go, so rows die and ids get reused) is built twice, the store
 collected after every step and after every fourth: every action / value the actor computed, every rollout array, and
-the learner's outputs and gradients on the chunks and the teacher records still held are equal bit for bit."""
+the learner's outputs and gradients on the chunks and the teacher records still held are equal bit for bit (on CUDA in
+torch's deterministic mode: by default its backward is not reproducible even between two identical builds)."""
 import gc
 
 import numpy as np
@@ -52,12 +53,21 @@ def _build(device, every, seed=31):
 def test_collect_every_four_changes_no_value(device, monkeypatch):
     # (one CPU thread: two identical builds' backward is then bitwise reproducible -- with several, the scatter-adds of
     #  memory_age / short_relative accumulate in another order run to run, ~5e-10, whatever the collects)
+    # (CUDA, 2026-11-12, gpu57: the backward is not reproducible by default -- the memory-efficient attention's backward
+    #  is non-deterministic: the same build twice (every 1 vs 1) differed in 99 of 184 gradients, max |d| 4.8e-07 and
+    #  6.6e-07, every 1 vs 4 max 9.5e-07; torch.use_deterministic_algorithms(True, warn_only=True) still 1.2e-10 (qkv);
+    #  with warn_only False (its deterministic backward; CUBLAS_WORKSPACE_CONFIG set, as the gate does) every 1 vs 1 three
+    #  times and every 1 vs 4 twice: 0 of 184 differ. So bit for bit, in that mode)
     n_threads = torch.get_num_threads()
+    det = torch.are_deterministic_algorithms_enabled(), torch.is_deterministic_algorithms_warn_only_enabled()
     torch.set_num_threads(1)
+    if device == 'cuda':
+        torch.use_deterministic_algorithms(True)
     try:
         _check(device, monkeypatch)
     finally:
         torch.set_num_threads(n_threads)
+        torch.use_deterministic_algorithms(det[0], warn_only=det[1])
 
 
 def _check(device, monkeypatch):
