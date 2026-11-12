@@ -5061,7 +5061,6 @@ def main(argv=None, child=None, actor=None):
         multiple of ISAAC_CKPT_MILESTONE (a milestone); the others, by ISAAC_CKPT_ROTATE: 'trash' (default) moved to
         ISAAC_CKPT_TRASH/<date>/, 'delete' deleted -- only files of this run's checkpoints directory named exactly
         update-<6 digits>.pt, each one a line in <out>/checkpoint_rotation.log (name, size, update, what was done)."""
-        import re as re_
         keep_ = int(os.environ.get('ISAAC_CKPT_KEEP', '0') or 0)
         mode_ = os.environ.get('ISAAC_CKPT_ROTATE', 'trash')
         trash_ = os.environ.get('ISAAC_CKPT_TRASH', '')
@@ -5071,12 +5070,12 @@ def main(argv=None, child=None, actor=None):
         d = Path(d).resolve()
         if d != (out / 'checkpoints').resolve():
             return
-        files_ = sorted(f_ for f_ in d.iterdir() if re_.fullmatch(r'update-\d{6}\.pt', f_.name) and f_.is_file())
+        from isaac_bridge.ckpt_rotation import rotation_drop, update_of   # (the choice: tests/test_ckpt_rotation.py)
+        names_ = [f_.name for f_ in d.iterdir() if f_.is_file()]
         with open(out / 'checkpoint_rotation.log', 'a') as log_:
-            for f_ in files_[:-keep_]:
-                u_ = int(f_.name[7:13])
-                if mile_ and u_ % mile_ == 0:
-                    continue
+            for n_ in rotation_drop(names_, keep_, mile_):
+                f_ = d / n_
+                u_ = update_of(n_)
                 size_ = f_.stat().st_size
                 if mode_ == 'delete':
                     f_.unlink()

@@ -21,7 +21,9 @@
 #     hashes differing in consecutive checks; preflight failing (Xid / a GPU missing); free disk under DISK_MIN_GB;
 #     the same update failing MAX_RETRY times; an out-of-memory a second time while another tenant's process was on
 #     our GPUs (the first: resumed once); the kernel killing a rank at the container's memory limit (cgroup oom_kill,
-#     shardk_in's <name>.oom_kills) a second time (the first: resumed once);
+#     shardk_in's <name>.oom_kills) a second time (the first: resumed once); the kernel's OOM kills in the container
+#     (game / worker processes) growing in OOM_KILL_STREAK (3) updates in a row or reaching OOM_KILL_MAX (20) in one
+#     attempt (the monitor: the ranks stopped at once, .oom_stop; a single growth: a warning);
 #   else: resumed after BACKOFF x attempt seconds, MAX_RETRY attempts per cause.
 # Nothing system-wide: no GPU reset, no other process touched.
 set -u
@@ -48,7 +50,7 @@ LANESUM=$MEMG; MEMG=${MEM_GB:-128}
 NB=$(lane $1 LANE_NAME); PB=$(lane $1 LANE_PORT)
 CTR="$BM1_NAME-train-$NAME"
 take_excl "training $NAME ($TREE, K $K, GPU $G) 计时运行"
-for m_ in .guard_end .stop_sent; do   # (an earlier guard's markers: moved aside, nothing deleted)
+for m_ in .guard_end .stop_sent .oom_stop; do   # (an earlier guard's markers: moved aside, nothing deleted)
   [ -f $RD/$m_ ] && { mkdir -p ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d); mv $RD/$m_ ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d)/$NAME$m_-$(date +%H%M%S); }
 done
 glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCPUS memory limit ${MEMG}g (the lanes' sum ${LANESUM}g) hours ${HOURS:-125}"
@@ -70,9 +72,21 @@ glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCP
     #  the same), a warning every 10 min while it lasts)
     cm_=$(python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); x = r[-1] if r else {}; print(x.get('ctr_mem_frac', ''), x.get('ctr_mem_gb', ''), x.get('update', ''), x.get('ctr_oom_kills', ''))" $RD/$NAME-s0/progress.csv 2>/dev/null)
     set -- $cm_
-    # (the kernel's OOM kills in the container (a game or worker process: the ranks may go on), logged as they grow)
-    if [ $# -ge 4 ] && [ "$4" != "${okl_:-}" ]; then
-      [ "$4" -gt 0 ] 2>/dev/null && glog "WARNING the kernel's OOM kills in the container at its memory limit ${MEMG}g: $4 so far in this attempt (update $3)"
+    # (the kernel's OOM kills in the container (a game or worker process: the ranks may go on), per new progress row:
+    #  a growth a warning; growing in OOM_KILL_STREAK (3) updates in a row, or OOM_KILL_MAX (20) in one attempt: the
+    #  ranks' stop file and .oom_stop -- the guard stops, no resume)
+    if [ $# -ge 4 ] && [ "$3" != "${oku_:-}" ] && [ ! -f $RD/.oom_stop ]; then
+      oku_=$3
+      if [ "$4" -lt "${okl_:-0}" ] 2>/dev/null; then okl_=0; oks_=0; fi   # (a new attempt: its new container's count)
+      if [ "$4" -gt "${okl_:-0}" ] 2>/dev/null; then
+        oks_=$(( ${oks_:-0} + 1 ))
+        glog "WARNING the kernel's OOM kills in the container at its memory limit ${MEMG}g: $4 in this attempt (update $3, growing $oks_ update(s) in a row)"
+        if [ $oks_ -ge ${OOM_KILL_STREAK:-3} ] || [ "$4" -ge ${OOM_KILL_MAX:-20} ]; then
+          echo "the container's memory at its limit ${MEMG}g, the kernel killing game or worker processes ($4 kills in this attempt, growing $oks_ update(s) in a row)" > $RD/.oom_stop
+          docker exec $CTR touch /tmp/shards-$NAME/stop 2>/dev/null
+          glog "STOP (memory): $(cat $RD/.oom_stop); the ranks' stop file written"
+        fi
+      else oks_=0; fi
       okl_=$4
     fi
     if [ $# -ge 3 ] && awk "BEGIN {exit !($1 > 0.9)}" && [ $(( $(date +%s) - ${mwarned_:-0} )) -ge 600 ]; then
@@ -130,6 +144,7 @@ while :; do
   cgk=$(cat $RD/$NAME.oom_kills 2>/dev/null); [ -f $RD/$NAME.oom_kills ] && mv $RD/$NAME.oom_kills $RD/$NAME.oom_kills.attempt$attempt
   outs=$(for r in $(seq 0 $((K-1))); do tail -c 200000 $RD/$NAME-s$r.stdout $RD/$NAME-s$r.stderr 2>/dev/null; done)
   upd=$(python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); print(r[-1]['update'] if r else '')" $RD/$NAME-s0/progress.csv 2>/dev/null)
+  if [ -f $RD/.oom_stop ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?}: $(cat $RD/.oom_stop): stopped, no resume (a person looks)"; break; fi
   if [ -f $RD/STOP ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?} after STOP: the guard ends"; break; fi
   if [ $rc = 0 ]; then
     case "$cgk" in [1-9]*) glog "WARNING the kernel killed $cgk process(es) at the container's memory limit ${MEMG}g in attempt $attempt (the ranks went on)" ;; esac
