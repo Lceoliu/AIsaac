@@ -114,7 +114,9 @@ bp.UPD_KEYS = tuple(bp.UPD_KEYS)+tuple(k for k in (
     'learn_prefetch_submitted', 'learn_prefetch_cpu_s', 'learn_prefetch_wait_grad_s', 'learn_prefetch_wait_nograd_s',
     'learn_prefetch_skip_wait_s', 'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s',
     # BM1 P2: the second learner card's forward / backward (wall on its thread, CUDA-event span on its card)
-    'p2_fwd_part_wall_s', 'p2_fwd_part_gpu_s', 'p2_bwd_wall_s', 'p2_bwd_gpu_s', 'p2_bwd_calls')
+    'p2_fwd_part_wall_s', 'p2_fwd_part_gpu_s', 'p2_bwd_wall_s', 'p2_bwd_gpu_s', 'p2_bwd_calls',
+    # (a checkpointed Spatial segment redone: a graph compiled during its forward)
+    'learn_ckpt_compile_redo')
     if k not in bp.UPD_KEYS)
 
 
@@ -1034,6 +1036,12 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
                 unique=unique, version=version)
 
 
+def _compiles():
+    """block_compile's compile count (every graph the dynamo backend compiled, warm-up and steady)."""
+    from .block_compile import STATS
+    return STATS['compiles']
+
+
 def _spatial_segment(model, part):
     """model.encode_block(part) inside an NVTX range 'learner.spatial' (B62: the B2 measurement of the Spatial
     segments' dispatch gaps; the forward and the backward's recomputation; a no-op without ISAAC_BLOCK_NVTX)."""
@@ -1071,7 +1079,19 @@ def _run_packed(model, P):
     for g, names, T, m in plans:
         part = packed_rows_apply(batch, {k: di[f'sp{g}:{k}'] for k in names}, T)
         if grad and SPATIAL_CKPT and m > 0:
-            zs.append(checkpoint(_spatial_segment, model, part, **CKPT_KW)[:m])
+            # (a graph compiled during the checkpointed forward: the recomputation in the backward runs the compiled
+            #  graph, the forward ran the first call's other path; they save different tensors and the backward
+            #  unpacks the wrong ones -- fp32check3, CheckpointError with the determinism check on. Redo the segment
+            #  now that the graph exists; its first output is dropped and never backpropagated)
+            for try_ in range(3):
+                c0_ = _compiles()
+                z_ = checkpoint(_spatial_segment, model, part, **CKPT_KW)
+                if _compiles() == c0_:
+                    break
+                bp.ucount('learn_ckpt_compile_redo', 1)
+            else:
+                raise RuntimeError('BM1: the checkpointed Spatial segment compiled again on each of 3 tries')
+            zs.append(z_[:m])
         else:
             zs.append(_spatial_segment(model, part)[:m])
     z_all = (torch.cat(zs) if len(zs) > 1 else zs[0]).index_select(0, di['sp:inverse'])
