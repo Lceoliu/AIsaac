@@ -3093,6 +3093,8 @@ def main(argv=None, child=None, actor=None):
         from isaac_bridge.tok_cf import TRIGGERS as CF_TRIGGERS, t_split
         v2_rng = np.random.default_rng([args.seed, 0x7E2])   # its own: the teacher's draws stay as without
     target_decisions = decisions_total + int(args.game_hours / hours_per_decision)
+    if os.environ.get('ISAAC_GAME_HOURS_TOTAL'):   # (train_guard.sh: the run's total, every resume included -- not
+        target_decisions = int(float(os.environ['ISAAC_GAME_HOURS_TOTAL']) / hours_per_decision)   # this start's)
     if args.max_updates:
         target_decisions = decisions_total + args.max_updates * args.rollout
     start_decisions = decisions_total

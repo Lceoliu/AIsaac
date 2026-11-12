@@ -1,6 +1,6 @@
 #!/bin/sh
 # bm1: a training run of K synchronised shards (BM1 C) under a guard that resumes it after a failure, unattended.
-#   usage: [HOURS=<game hours target>] [INIT=<checkpoint path as the container sees it>] [ENVS="-e K=V ..."]
+#   usage: [HOURS=<the run's game hours in all, resumes included (ISAAC_GAME_HOURS_TOTAL)>] [INIT=<checkpoint path as the container sees it>] [ENVS="-e K=V ..."]
 #          [MAX_RETRY=3] [BACKOFF=120] [DISK_MIN_GB=50] [MEM_GB=128] train_guard.sh <name> <tree> <lane 0 file> <lane 1 file> [...]
 # Run directory /root/AIsaac/train/<name> (the container's /bench/train/<name>): rank r writes <name>-s<r>/ (progress.csv,
 # episodes.jsonl rotated past 256 MB, checkpoints/), guard.log (every start, end, cause, resume), foreign_gpu.log (other
@@ -15,7 +15,8 @@
 # Takes the host's exclusive lock for the whole run (purpose: training), released at its end.
 # Each attempt: preflight (every GPU listed, no new Xid), the disk's free space, the newest readable checkpoint of rank 0
 # (update-*.pt / last.pt: a zip that tests whole; else the one before), one container (shardk_in.sh, the K ranks).
-# After an attempt ends: the cause from the ranks' stdout and the guard's own checks --
+# After an attempt ends: rc 0 without STOP -- the run's HOURS reached: the guard ends; else the cause from the ranks'
+# stdout and the guard's own checks --
 #   stop, no resume: the STOP file; a CheckpointError or a compile during a checkpoint's recomputation; the ranks'
 #     hashes differing in consecutive checks; preflight failing (Xid / a GPU missing); free disk under DISK_MIN_GB;
 #     the same update failing MAX_RETRY times; an out-of-memory a second time while another tenant's process was on
@@ -67,8 +68,13 @@ glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCP
     fi
     # (the container's memory past 90 % of its limit: rank 0's newest progress row (the container's cgroup, every rank's
     #  the same), a warning every 10 min while it lasts)
-    cm_=$(python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); x = r[-1] if r else {}; print(x.get('ctr_mem_frac', ''), x.get('ctr_mem_gb', ''), x.get('update', ''))" $RD/$NAME-s0/progress.csv 2>/dev/null)
+    cm_=$(python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); x = r[-1] if r else {}; print(x.get('ctr_mem_frac', ''), x.get('ctr_mem_gb', ''), x.get('update', ''), x.get('ctr_oom_kills', ''))" $RD/$NAME-s0/progress.csv 2>/dev/null)
     set -- $cm_
+    # (the kernel's OOM kills in the container (a game or worker process: the ranks may go on), logged as they grow)
+    if [ $# -ge 4 ] && [ "$4" != "${okl_:-}" ]; then
+      [ "$4" -gt 0 ] 2>/dev/null && glog "WARNING the kernel's OOM kills in the container at its memory limit ${MEMG}g: $4 so far in this attempt (update $3)"
+      okl_=$4
+    fi
     if [ $# -ge 3 ] && awk "BEGIN {exit !($1 > 0.9)}" && [ $(( $(date +%s) - ${mwarned_:-0} )) -ge 600 ]; then
       mwarned_=$(date +%s)
       glog "WARNING container memory $(printf %.1f $2) GB = $(awk "BEGIN {printf \"%.0f\", 100 * $1}") % of its limit ${MEMG}g (update $3)"
@@ -115,7 +121,7 @@ while :; do
   done
   DE="-e CODE=$TREE -e OUTDIR=$RDC -e ISAAC_BLOCK_TIMING=1 -e EXTRA=--learner-device=cuda:1 -e EXTRA2=--checkpoint-every=${CKPT_EVERY:-25} $EX3"
   DE="$DE -e NAME_BASE=$NB -e PORT_BASE=$PB -e SHARD_PORT=${SHARD_PORT:-29400} -e ISAAC_SHARD_TIMEOUT=${SHARD_TIMEOUT:-1800}"
-  DE="$DE -e ISAAC_LEARN_CKPT_DET=1 -e ISAAC_CKPT_KEEP=${CKPT_KEEP:-5} -e ISAAC_CKPT_MILESTONE=${CKPT_MILESTONE:-250}"
+  DE="$DE -e ISAAC_GAME_HOURS_TOTAL=${HOURS:-125} -e ISAAC_LEARN_CKPT_DET=1 -e ISAAC_CKPT_KEEP=${CKPT_KEEP:-5} -e ISAAC_CKPT_MILESTONE=${CKPT_MILESTONE:-250}"
   DE="$DE -e ISAAC_CKPT_TRASH=/bench/trash -e ISAAC_CKPT_ROTATE=${CKPT_ROTATE:-trash} -e ISAAC_EPISODES_ROTATE_MB=${EPISODES_MB:-256} ${ENVS:-}"
   CPUSET="${CS:-${BM1_TIMED_CPUSET:-$BM1_CPUSET}}" MEMS="" MEM="${MEMG}g" PIDS=$((${BM1_PIDS:-4096} * K)) GPUS_OK="$G" \
     DOCK_ENV="$DE" $BM/run.sh train-$NAME $G sh $BM1_IN/shardk_in.sh $NAME 315360000 ${HOURS:-125} "$(echo $PAIRS)" "$CPUS" "$LCPUS" "$DCPUS" >> $RD/launcher.log 2>&1
@@ -125,6 +131,10 @@ while :; do
   outs=$(for r in $(seq 0 $((K-1))); do tail -c 200000 $RD/$NAME-s$r.stdout $RD/$NAME-s$r.stderr 2>/dev/null; done)
   upd=$(python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); print(r[-1]['update'] if r else '')" $RD/$NAME-s0/progress.csv 2>/dev/null)
   if [ -f $RD/STOP ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?} after STOP: the guard ends"; break; fi
+  if [ $rc = 0 ]; then
+    case "$cgk" in [1-9]*) glog "WARNING the kernel killed $cgk process(es) at the container's memory limit ${MEMG}g in attempt $attempt (the ranks went on)" ;; esac
+    glog "attempt $attempt ended rc=0 at update ${upd:-?}: the run's ${HOURS:-125} game hours reached, the guard ends"; break
+  fi
   cause=other
   echo "$outs" | grep -q "CheckpointError\|compiled during the backward recomputation" && cause=checkpoint
   echo "$outs" | grep -q "state hashes of the ranks differed" && cause=hash
