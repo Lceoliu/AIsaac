@@ -11712,3 +11712,35 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - 4 个过时脚本已换成仓库版本，按 sha1 与仓库逐个核对一致。今后合并主线时，把"重新部署 ops 脚本并核对 sha1"作为合并步骤的一部分。
 - **待办（续训的种子）：** 单分片也是如此：worker 的开局种子 = seed + index + workers × n，n 每次进程启动都从 0 开始，检查点不存它。所以每次续训都会重跑同一批开局。应改为按已完成的进度偏移，比如已消耗的开局数或 update 数。
 - **待测：** c2killd（杀掉一个 rank）、门加 A8、c2time（24 轮同步）对照 capb2（同一时段不同步）。
+- **gpu57 冒烟（树 mfaeb516）：**
+  - 门 287 passed，3 skipped，1 xfailed。
+  - c2flipd：rc=0，停止文件由 shardk 自己写，两个 rank 一起结束。
+  - c2killd：17:42:19 对 rank 1 的 trainer 发 SIGKILL；rank 0 的 watchdog 发现后中止集合通信，走 failure 路径收尾，14.3 s 后写好 last.pt（139.7 MB）。
+- **c2time 作废，原因是 actor 被挪到了 learner 卡上：**
+  - ShardSync.init 在主线程调用了 torch.cuda.set_device(learner 卡)，改掉了主线程的当前设备，actor 就在 learner 卡上分配。
+  - 现象：GPU 1/3 的利用率 0%，显存 4 MiB。
+  - gpumap 探针确认容器里的 CUDA 设备号映射是对的，问题不在映射。
+  - 修复：8174566，只在 init、check、broadcast 内临时切换设备。
+  - c2time 的 256× 作废。此前 shardk 的各次运行都有这个问题，但翻转和杀 rank 的结论不受影响。
+- **计时（树 m8174566，lane b，24 轮，u10+ 中位数，背靠背，四张卡都有负载）：**
+
+  | 臂 | collect s | update s | ×实时 |
+  |---|---|---|---|
+  | c2time2 同步 s0 | 19.50 | 22.48 | 188.1 |
+  | c2time2 同步 s1 | 21.02 | 22.49 | 188.1 |
+  | capb3 不同步 s0 | 19.16 | 21.40 | 196.8 |
+  | capb3 不同步 s1 | 21.56 | 19.79 | 198.7 |
+
+  - 合计：同步 376.2×，同一时段的不同步对照 395.5×，损失 4.9%，在 ≤5% 的门限内。capb 是 374.9×。
+  - 每个 update 的同步开销：
+    - 归约 0.29 s。
+    - shard_wait_s 4.9 s，但它含本 rank 等自己 GPU 排空的时间，偏大。
+    - 净开销以 update 时间计：同步 22.5 s，不同步两个 rank 平均 20.6 s，约多 1.9 s。来源是每步一次主机同步、等较慢的 rank、归约。
+  - 一致性：375 步，0 个零权重步，26 次比对，0 次不一致。
+  - 后续可做：去掉每步的 cuda synchronize，改用 event 计时、在计算流上异步归约。
+- **fp32check2（开 anomaly）崩溃复现：**
+  - 出错节点：NativeLayerNormBackward0。
+  - 前向调用链：_run_packed → checkpoint(_spatial_segment) → encode_block → block_memory.resampler 的输出 LayerNorm（block_memory.py:118）。
+  - 出错时机：反向解包时触发检查点重算，然后报错。
+  - 推测：精简检查点 determinism_check='none' 下，重算保存的张量与前向不一致（中间发生了首次编译）。fp32check3 用默认检查点验证。
+  - 三次 fp32diag 开着 anomaly 都没崩，所以崩不崩取决于当次的 job，与 anomaly 无关。
