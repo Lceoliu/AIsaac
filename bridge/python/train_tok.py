@@ -1638,9 +1638,10 @@ def main(argv=None, child=None, actor=None):
                         'resumed checkpoint keeps its own setting, --init pads them with zeros')
     p.add_argument('--floor-seconds', type=float, default=480.0)
     p.add_argument('--floor-stall-seconds', type=float, default=60.0)
-    p.add_argument('--stall-progress', choices=('events', 'pickups'), default='events',
-                   help="B40: what resets the floor's stall timer: 'events' (a new / cleared room, a monster hurt) or "
-                        "'pickups' (also a gain in coins / keys / bombs / health); the stall share is a policy input")
+    p.add_argument('--stall-progress', choices=('events', 'pickups', 'items'), default='events',
+                   help="B40: what resets the floor's stall timer: 'events' (a new / cleared room, a monster hurt), "
+                        "'pickups' (also a gain in coins / keys / bombs / health) or 'items' (2026-11-12: pickups and "
+                        "also a collectible gained, a trinket / pill / card acquired; needs --items)")
     p.add_argument('--archive-size', type=int, default=12)
     p.add_argument('--archive-prob', type=float, default=0.7)
     p.add_argument('--snapshot-prob', type=float, default=0.5)

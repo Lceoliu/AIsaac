@@ -374,7 +374,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     run = cfg.mode == 'run'
     limit = int(round((cfg.run_seconds if run else cfg.floor_seconds) * 30 / cfg.frames_per_decision))
     stall = int(round(cfg.floor_stall_seconds * 30 / cfg.frames_per_decision))
-    stall_pk = getattr(cfg, 'stall_progress', 'events') == 'pickups'   # B40: gains count as progress
+    stall_pk = getattr(cfg, 'stall_progress', 'events') in ('pickups', 'items')   # B40: gains count as progress
+    stall_it = getattr(cfg, 'stall_progress', 'events') == 'items'   # (and acquired items, trinkets, pills, cards)
     queue = []      # hurts to search: (parked base, reseed, applied actions, hurt_at, seed, episode, base's decision)
     archive = []
     # 2026-10-10 (teacher v2): its points (tok_teacher2.V2Point), searched by the search thread through the lane
@@ -995,7 +996,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         records, 'gamma_t' gamma^T, 'v_end' and 'boot' the actor's value of a truncated last record); returns (the end
         code, its EpisodeState). trace (a dict, Phase B2): filled with the records' state digests and the actions
         answered to them."""
-        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk)
+        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it)
         st.visited = set(visited)
         st.stage0 = int(obs.room[5])
         for s in slots:
@@ -1295,7 +1296,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         tagged ROW lab / lab_s / crn, actions from the actor. Ends: death, the room cleared / left, the cap (the last
         three DONE_BRANCH: a truncation), the floor's stall rule. Fills res (tok_lab RES)."""
         st = EpisodeState(lab_cap + 1, floor=True, stall=stall, run=run, items=cfg.items,
-                          stall_pickups=stall_pk)
+                          stall_pickups=stall_pk, stall_items=stall_it)
         st.stage0 = int(obs.room[5])
         st.visited = set()
         for s in slots:
@@ -1757,7 +1758,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['archive_starts']] += from_archive
             episode_n += 1
             seed_now = src.info['seed']
-            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk)
+            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it)
             st.visited, st.stage0 = set(src.info['visited']), src.info['stage0']
             enc = FastRow(fast_fn, st, decoder, episode_n, seed_now, group) if fast_fn is not None else None
             item, lf_now = obs, obs.logic_frames   # with FastRow item is the step's raw payload
