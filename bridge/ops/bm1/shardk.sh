@@ -3,7 +3,7 @@
 # (the K trainers share its loopback and /dev/shm: NCCL between them without any network; the container's security
 # settings as every bm1 run's), its GPUs every lane's, its memory limit the lanes' sum, its CPUs the lanes' union.
 # Inside, shardk_in.sh starts rank r with lane r's two GPUs (actor, learner) and CPUs (taskset).
-#   usage: [UPDATES=24] [HOURS=30.0] [LIMIT=4500] [ENVS="-e K=V ..."] [SHARD_PORT=29400] [NOLOCK=1]
+#   usage: [UPDATES=24] [HOURS=30.0] [LIMIT=4500] [ENVS="-e K=V ..."] [SHARD_PORT=29400] [NOLOCK=1] [KEEP_CKPT=1: keep the checkpoints]
 #          shardk.sh <tag> <tree> <lane 0 file> <lane 1 file> [...]
 #   lane files as shard2.sh's: LANE_GPUS (two: actor, learner), LANE_CPUSET (empty: no pinning), LANE_MEM, LANE_NAME,
 #   LANE_PORT (each rank's instances' name / port base); optional LANE_LEARNER_CPUS / LANE_DRIVER_CPUS (that rank's
@@ -87,7 +87,7 @@ kill $S1 $S2 $S3 $S4 $SP 2>/dev/null
 host_snapshot "$TAG end"
 r=0
 while [ $r -lt $K ]; do
-  [ -d $R/$TAG-s$r/checkpoints ] && trash $R/$TAG-s$r/checkpoints
+  [ "${KEEP_CKPT:-0}" = 1 ] || { [ -d $R/$TAG-s$r/checkpoints ] && trash $R/$TAG-s$r/checkpoints; }
   python3 $BM/summ.py $R $TAG-s$r "$(lane $(eval echo \${$((r+1))}) LANE_CPUSET)" $(lane $(eval echo \${$((r+1))}) LANE_GPUS) > $R/$TAG-s$r.summary.txt 2>&1
   r=$((r+1))
 done

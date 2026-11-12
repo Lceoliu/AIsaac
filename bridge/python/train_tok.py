@@ -3103,6 +3103,8 @@ def main(argv=None, child=None, actor=None):
             if not path.name.startswith('last'):
                 return
             path = path.with_name(f'{path.stem}-rank{SYNC.rank}{path.suffix}')
+        path = Path(path)
+        tmp_ = path.with_name(path.name + '.tmp')
         torch.save(dict(model=learner_model.state_dict(), optimizer=opt.state_dict(), update=L['update'],
                         decisions=L['decisions'], seconds=L['seconds'], config=learner_model.config, args=vars(args),
                         steady_updates=L.get('steady_updates',0),
@@ -3111,7 +3113,8 @@ def main(argv=None, child=None, actor=None):
                            if aux_head is not None else {}),
                         **(dict(priv=dict(model=pcritic.state_dict(), opt=popt.state_dict()))
                            if pcritic is not None else {})),
-                   path)
+                   tmp_)
+        os.replace(tmp_, path)   # (atomic: a kill during the write leaves the previous file whole, never a torn one)
 
     b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
     # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
