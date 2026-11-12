@@ -11744,3 +11744,47 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - 出错时机：反向解包时触发检查点重算，然后报错。
   - 推测：精简检查点 determinism_check='none' 下，重算保存的张量与前向不一致（中间发生了首次编译）。fp32check3 用默认检查点验证。
   - 三次 fp32diag 开着 anomaly 都没崩，所以崩不崩取决于当次的 job，与 anomaly 无关。
+
+#### 检查点重算与首次编译错位（fp32 对照的崩溃，2026-11-11/12）
+- **现象：**
+  - fp32check（树 m358e2a5c，第 6 个 job）和 fp32check2（开 anomaly）都在 0of 预热之后、0sf 第一半的反向里崩溃。
+  - 报错节点：NativeLayerNormBackward0（Spatial resampler 末尾的 LayerNorm，block_memory.py:118）。
+  - 报错信息："Only Tensors of floating point and complex dtype can require gradients"。
+- **三次诊断为什么没复现：**
+  - fp32diag：只跑 0sf，第 2 个 job。
+  - fp32diag2：先 0of 后 0sf，第 2 个 job。
+  - fp32diag3：先 0of 后 0sf，第 6 个 job。
+  - 三次都开着 anomaly，都没崩。fp32check2 在同样的条件下崩了，所以与 anomaly 无关。
+  - 崩不崩取决于 fp32 首次编译是否恰好发生在某个带检查点的 Spatial 段的前向里，这由当次 job 的形状决定（新的 T 桶或行数组合），所以时有时无。
+  - recompile 日志：_spatial_rows 重编译 57 次、flex_attention 53 次，都没有触到上限，"重编译上限"的猜测排除。
+- **fp32check3（默认检查点，ISAAC_LEARN_CKPT_LEAN=0，打开确定性检查）：** 抛了 CheckpointError，前向保存的张量和重算得到的对不上。
+
+  | 位置 | 前向保存的 | 重算得到的 |
+  |---|---|---|
+  | 0 | int64 [17] | float32 [17, 80] |
+  | 1 | float32 [32, 16, 3, 3] | float32 [17, 192] |
+  | 2 | float32 [17, 16, 16, 28] | float32 [17, 192] |
+  | 3 | float32 [64, 32, 3, 3] | float32 [192, 192] |
+  | 4 | float32 [28, 2] | float32 [17, 20] |
+  | 5 | float32 [32, 16, 3, 3] | int64 [17] |
+  | … | … | … |
+
+- **原因：**
+  - 带检查点的 Spatial 段在前向期间发生了首次编译。前向走的是首次调用的那条路径（eager 卷积等，保存的是卷积权重和中间激活），反向重算时走的是已编译好的图，保存的是另一组张量。
+  - 精简检查点（LEAN_CKPT_KW：non-reentrant、preserve_rng_state=False、determinism_check='none'）按顺序解包，取到的张量是错的：
+    - 取到整数张量时报错，就是这两次崩溃；
+    - 如果取到的是形状和类型都对得上的浮点张量，会悄悄算出错的梯度。
+- **两种防护：**
+  1. e11da25：前向期间（按设备计）发生了编译，就丢掉这次输出、重做这一段（最多 3 次）。计数在 progress.csv 的 b42_learn_ckpt_compile_redo。
+  2. 1fd922a：反向重算期间在该设备上发生了编译，就报错停止。这时梯度已经在累加，无法重做。
+     - 每个带检查点的调用带一个 token，第一次运行算前向，之后算重算。
+     - 编译按设备计数（block_compile.DEV_COMPILES），另一张卡的线程同时编译不会误报。
+  - 两种都常开，不发生编译时只多几次整数读取。
+  - summ.py 新增一行"compiles: block_steady_compiles …, learn_ckpt_compile_redo …"，不为 0 时标 "<-- NOT 0"。
+  - 精简检查点是否保留 determinism_check：开销用 bench 的 0o 对 0od 测（ckdet），每个 update 不超过约 0.1 s 就常开。它只比较形状、类型、设备，但能在这类错位时给出明确报错。
+- **对 bf16 生产路径的结论：**
+  - warm_spatial 在启动时、在检查点之外，对所有 T 桶的三种模式各编译一遍；batch 维是动态的。mark_steady 在第一次 learn 之前调用。
+  - block_steady_compiles 在编译后端里计数，覆盖检查点内部的编译，所有计时运行都为 0。所以生产的稳态和预热都没有进入"检查点内首次编译"的条件。
+  - 关检查点的路径（0pk、p2k）没有重算，不受影响。
+  - 其他检查点（block_paged、block_training 的旧路径）用的是默认检查点，会报错而不会静默。
+- **待补：** fp32check5（树 m1fd922a，两种防护都开，并开确定性检查）的五组配对数字、ckdet 的开销。
