@@ -6,7 +6,8 @@
 #   usage: [UPDATES=24] [HOURS=30.0] [LIMIT=4500] [ENVS="-e K=V ..."] [SHARD_PORT=29400] [NOLOCK=1]
 #          shardk.sh <tag> <tree> <lane 0 file> <lane 1 file> [...]
 #   lane files as shard2.sh's: LANE_GPUS (two: actor, learner), LANE_CPUSET (empty: no pinning), LANE_MEM, LANE_NAME,
-#   LANE_PORT (each rank's instances' name / port base)
+#   LANE_PORT (each rank's instances' name / port base); optional LANE_LEARNER_CPUS / LANE_DRIVER_CPUS (that rank's
+#   dedicated learner / driver CPUs, inside its LANE_CPUSET)
 # Per rank r (tag <tag>-s<r>): reports/<tag>-s<r>/ (progress.csv ...), .stdout / .stderr, .mem.csv / .threads.csv (M0,
 # this trainer's processes only), .gpu (its two GPUs); shared: <tag>.mpstat / .allgpu / .topcpu / .cpufreq (linked
 # under each rank's name for summ.py); then summ.py per rank, and in bm1.log the ranks' u10+ x_real and their sum.
@@ -21,20 +22,21 @@ R=$BM/reports; LOG=$R/bm1.log
 lane() { ( . "$1"; eval echo "\$$2" ); }
 K=$#
 [ $K -ge 2 ] || { echo "shardk.sh: at least two lane files" >&2; exit 2; }
-G=""; PAIRS=""; CPUS=""; MEMG=0; CS=""; i=0; r=0
+G=""; PAIRS=""; CPUS=""; LCPUS=""; DCPUS=""; MEMG=0; CS=""; i=0; r=0
 for f in "$@"; do
   for v in LANE_GPUS LANE_MEM LANE_NAME LANE_PORT; do [ -n "$(lane $f $v)" ] || { echo "shardk.sh: $v missing in $f" >&2; exit 2; }; done
   lg=$(lane $f LANE_GPUS); pair=""
   for g in $(echo $lg | tr ',' ' '); do G="${G:+$G,}$g"; pair="${pair:+$pair,}$i"; i=$((i+1)); done
   PAIRS="$PAIRS $pair"
   c=$(lane $f LANE_CPUSET); CPUS="${CPUS}${c}|"; [ -n "$c" ] && CS="${CS:+$CS,}$c"
+  LCPUS="${LCPUS}$(lane $f LANE_LEARNER_CPUS)|"; DCPUS="${DCPUS}$(lane $f LANE_DRIVER_CPUS)|"
   MEMG=$((MEMG + $(lane $f LANE_MEM | tr -d 'gG')))
   [ -e $R/$TAG-s$r ] && { echo "shardk.sh: $R/$TAG-s$r exists (never overwritten)" >&2; exit 2; }
   r=$((r+1))
 done
-CPUS=${CPUS%|}
+CPUS=${CPUS%|}; LCPUS=${LCPUS%|}; DCPUS=${DCPUS%|}
 if [ "${NOLOCK:-0}" = 1 ]; then :; else take_excl "timed shards $TAG ($TREE, K $K, GPU $G) 计时运行"; fi
-log "$TAG start: tree $TREE K $K GPUs $G (rank pairs$PAIRS) CPUs ${CPUS:-unpinned} memory ${MEMG}g updates $UPDATES hours $HOURS"
+log "$TAG start: tree $TREE K $K GPUs $G (rank pairs$PAIRS) CPUs ${CPUS:-unpinned} learner CPUs ${LCPUS:-none} driver CPUs ${DCPUS:-none} memory ${MEMG}g updates $UPDATES hours $HOURS"
 host_snapshot "$TAG start"
 ( while :; do echo "$(date +%s) $(awk '/^cpu MHz/ {printf "%d ", $4}' /proc/cpuinfo)"; sleep 5; done ) > $R/$TAG.cpufreq &
 S1=$!
@@ -57,7 +59,7 @@ done
 NB=$(lane $1 LANE_NAME); PB=$(lane $1 LANE_PORT)
 CPUSET="${CS:-${BM1_TIMED_CPUSET:-$BM1_CPUSET}}" MEMS="" MEM="${MEMG}g" PIDS=$((${BM1_PIDS:-4096} * K)) GPUS_OK="$G" \
 DOCK_ENV="-e CODE=$TREE -e ISAAC_BLOCK_TIMING=1 -e EXTRA=--learner-device=cuda:1 -e NAME_BASE=$NB -e PORT_BASE=$PB -e SHARD_PORT=${SHARD_PORT:-29400} ${ENVS:-}" \
-  $BM/run.sh shards-$TAG $G sh $BM1_IN/shardk_in.sh $TAG $LIMIT $HOURS "$(echo $PAIRS)" "$CPUS" > $R/$TAG.launcher.log 2>&1 &
+  $BM/run.sh shards-$TAG $G sh $BM1_IN/shardk_in.sh $TAG $LIMIT $HOURS "$(echo $PAIRS)" "$CPUS" "$LCPUS" "$DCPUS" > $R/$TAG.launcher.log 2>&1 &
 DP=$!
 while kill -0 $DP 2>/dev/null; do
   sleep 15
