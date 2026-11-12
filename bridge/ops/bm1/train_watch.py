@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)
 import train_summary as TS   # noqa: E402
 
 GUARD_KEYS = ('attempt', 'resuming', 'WARNING', 'STALL', 'stopped', 'STOP', 'guard end', 'cause', 'no progress',
-              'failed', 'unreadable', 'free disk')
+              'failed', 'unreadable', 'free disk', 'DRIVER OFF', 'driver_off', 'early_end', 'early end')
 HEADS = ('ent_move', 'ent_shoot', 'ent_bomb', 'ent_item', 'ent_pill')
 
 

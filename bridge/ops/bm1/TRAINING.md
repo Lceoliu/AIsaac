@@ -11,7 +11,7 @@
 |---|---|
 | 树已部署 | `ls /root/AIsaac/bm1/trees/$T/bridge/python/train_tok.py` |
 | 游戏库来自合并后的树 | `md5sum /root/AIsaac/bm1/home/isaac-abplus/tools/abp_turbo.c` 与树里的 `bridge/engine/abp_turbo.c` 相同（ea617f1f…） |
-| 门禁和 A8 都绿 | `reports/bm1.log` 里该树有 3 次 `gate … rc=0`，还有 `job a8-… rc=0` |
+| 门禁和 A8 都绿 | `reports/bm1.log` 里该树有 3 次 `gate … rc=0`（每行带 `EXT actor ok EXT learn ok EXT visible ok; native skips 0`；原生组件没编出来或其测试被 skip 时 gate 记 rc=9），还有 `job a8-… rc=0` |
 | 脚本是最新的 | `sha1sum train_guard.sh xnew2.sh` 与仓库一致 |
 | GPU 4–7 上没有别人的进程 | `nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv`；守护脚本启动时也会查 |
 | 没有别的任务占着锁 | `ls /root/AIsaac/bm1/locks/`；守护脚本会以"training"为目的等待并拿独占锁 |
@@ -121,7 +121,9 @@ HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_
 
 | 情形 | 行为 |
 |---|---|
-| 达到 HOURS（rc 0，没有 STOP） | 训练完成，守护进程结束 |
+| 达到 HOURS（rc 0，没有 STOP，且两个 rank 中最大的 game_hours ≥ HOURS × 0.999） | 训练完成，守护进程结束（guard.log：`game hours reached`） |
+| rc 0 但游戏小时没到（例如 worker 全部退出，trainer 照常结束） | 原因 early_end，警告并恢复一次；连续第二次就停下等人 |
+| 某个 rank 的 stdout 里 `B52 cpp actor driver:` 不是 on（编译失败会静默回落 Python 路径） | 当场按容器 id kill，原因 driver_off，不恢复，停下等人；train_watch 记事件。`REQUIRE_DRIVER=0` 才能在没有 driver 时跑 |
 | 一个 trainer 退出或被杀 | 另一个 rank 的看门狗发现后自己结束并保存；守护进程以原因 other 恢复（等待 BACKOFF × 次数） |
 | 同一个原因连续失败超过 MAX_RETRY（3）次，或同一轮失败 3 次 | 停下等人 |
 | 两个 rank 的哈希不一致 | 自动用 rank 0 的状态修复；连续 3 次检查都不一致就报错，守护进程停下等人 |
