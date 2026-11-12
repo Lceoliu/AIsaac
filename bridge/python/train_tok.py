@@ -976,6 +976,9 @@ def lr_at(frac, lr0, lr1, schedule='linear', warmup=0.0):
     return lr0 + (lr1 - lr0) * p
 
 
+# (the hand-offs' PageStore collect every this many; 1: every one, as before; see the hand-off)
+COLLECT_EVERY = max(1, int(os.environ.get('ISAAC_BLOCK_COLLECT_EVERY', '1') or 1))
+
 DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its game / worker failed before its end record)
 
 
@@ -5510,6 +5513,7 @@ def main(argv=None, child=None, actor=None):
         if failure:
             raise failure[0]
 
+    collect_k, gc_last = [0], [None]   # (ISAAC_BLOCK_COLLECT_EVERY: hand-offs counted, the last collect's figures)
     def stopped():
         """(B38 step 5, another actor) the first actor asked this one to stop."""
         return stop_ev is not None and stop_ev.is_set()
@@ -6299,10 +6303,19 @@ def main(argv=None, child=None, actor=None):
             handed += roll.usable()
             if block_actor is not None and hasattr(block_actor,'store'):
                 # A1 leases: free page rows/sources no rollout, teacher buffer, point, lane or slot can read.
+                # (ISAAC_BLOCK_COLLECT_EVERY=N: every N-th hand-off only -- its cost grows with the live records (the
+                #  teacher / CF buffers: ~2 s per hand-off at 12000 records); rows dead since stay up to N-1 hand-offs
+                #  longer: at most ~(N-1) x 4000 rows x 31 KiB, ~0.4 GB per rank at N=4; the hand-offs before a
+                #  checkpoint update collect always. Values are untouched: only when row ids are freed / reused)
+                collect_k[0] += 1
+                force_ = (sent_handoffs + 1) % max(1, args.checkpoint_every) == 0
                 t_gc = time.perf_counter()
-                nv.push('h.gc')
-                gc_b = block_actor.store.collect()
-                nv.pop()
+                if COLLECT_EVERY <= 1 or collect_k[0] % COLLECT_EVERY == 0 or force_ or gc_last[0] is None:
+                    nv.push('h.gc')
+                    gc_b = gc_last[0] = block_actor.store.collect()
+                    nv.pop()
+                else:
+                    gc_b = dict(gc_last[0], freed_kv=0, freed_blocks=0, freed_raw=0)
                 lane_stat['block_gc_s'] = time.perf_counter()-t_gc
                 lane_stat['block_kv_rows'], lane_stat['block_blocks'], lane_stat['block_raw_rows'] = (
                     gc_b['kv'], gc_b['blocks'], gc_b['raw'])
@@ -6355,6 +6368,8 @@ def main(argv=None, child=None, actor=None):
             if failure:
                 raise failure[0]
         clean_end = True
+        if COLLECT_EVERY > 1 and block_actor is not None and hasattr(block_actor, 'store'):
+            block_actor.store.collect()   # (ISAAC_BLOCK_COLLECT_EVERY: the end's state as with a collect every hand-off)
         if actor is not None and not stopped():   # (B38 step 5, a second actor at its end: its last half is handed;
             #                                       it waits, its workers paused, until the first actor stops it)
             actor['last'].set()
