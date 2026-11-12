@@ -107,9 +107,12 @@ def main():
             bad.append(f'{purpose}: clones {d["clones"]} forks {d["forks"]} != {want_clones}')
         if d['exits'] != want_clones or d['reaped'] != want_clones:
             bad.append(f'{purpose}: exits {d["exits"]} reaped {d["reaped"]} != {want_clones}')
-        if not (d['cpu_start_ns'] > 0 and d['cpu_sim_ns'] > 0 and d['cpu_teardown_ns'] > 0 and d['rss_kb'] > 0 and d['pte_kb'] > 0
-                and d['maps_n'] > 0):
+        if not (d['cpu_start_ns'] > 0 and d['cpu_sim_ns'] > 0 and d['cpu_teardown_ns'] > 0 and d['rss_kb'] > 0 and d['pte_kb'] > 0):
             bad.append(f'{purpose}: a part is zero {d}')
+        if d['cpu_teardown_ns'] > d['cpu_total_ns']/2:   # (S's whole CPU must not hold its children's)
+            bad.append(f'{purpose}: teardown {d["cpu_teardown_ns"]} vs whole {d["cpu_total_ns"]}')
+    if sum(tot[q]['maps_n'] for q in tot) == 0:   # (the map count every 16th fork of a process: S's first)
+        bad.append('no map count sampled')
     for purpose in ('fatal', 'cf'):
         d = tot[purpose]
         if abs(d['frames']-4*N*K) > 2*K:   # (4 frames per step; a clone's obs command adds none)

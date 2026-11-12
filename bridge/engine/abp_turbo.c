@@ -974,7 +974,9 @@ static uint64_t ft_reaped_ns;   // CPU of the reaped clones, exit included (getr
 //     ABP_EXIT ("sim": the frames and the bridge's work between them); minor faults of both parts; exits through
 //     ABP_EXIT. A clone that never sees a frame move puts all its CPU into start.
 //   reaper side (the forking process's wait4 rusage, at its next fork / fork_many collect / frame tick): reaped
-//     clones and their whole CPU; for those that ended through ABP_EXIT the teardown = whole CPU - CPU at ABP_EXIT
+//     clones and their whole CPU (their own: wait4's rusage minus their reaped children's, which the clone notes at
+//     ABP_EXIT; a clone reaped otherwise keeps its children's in); for those that ended through ABP_EXIT the
+//     teardown = whole CPU - CPU at ABP_EXIT
 //     (exit_mmap: the clone's page tables and its private pages released, after _exit); the others (alarm, signal)
 //     counted apart with their CPU. A clone whose parent ended first is reaped by nobody here.
 // The file stays after the instance ends. Nothing the game reads.
@@ -989,12 +991,12 @@ enum {
     CSF_REAPED, CSF_CPU_TOTAL_NS, CSF_CPU_TEARDOWN_NS, CSF_REAPED_NOEXIT, CSF_CPU_NOEXIT_NS,
     CSF_N = 24
 };
-struct cs_slot { int64_t pid; uint64_t cpu_exit_ns; };
+struct cs_slot { int64_t pid; uint64_t cpu_exit_ns, kids_ns, reserved; };
 struct cs_map {
     char magic[8];          // "ABPCLST1"
     uint64_t version, root_pid, n_purposes, n_fields, n_slots, slots_lost, reserved;
     uint64_t f[CS_P][CSF_N];
-    struct cs_slot slot[CS_SLOTS];   // a clone's CPU at ABP_EXIT until its parent reaps it (by pid)
+    struct cs_slot slot[CS_SLOTS];   // a clone's CPU at ABP_EXIT (and its reaped children's) until its parent reaps it
 };
 static int cs_purpose;          // the purpose of this process's next forks
 static int cs_own = -1;         // (a clone) the purpose it was forked with
@@ -1008,6 +1010,12 @@ static inline void cs_add(int p, int f, uint64_t v) { __atomic_fetch_add(&csm()-
 static inline void cs_max(int p, int f, uint64_t v) {
     uint64_t cur = __atomic_load_n(&csm()->f[p][f], __ATOMIC_RELAXED);
     while (v > cur && !__atomic_compare_exchange_n(&csm()->f[p][f], &cur, v, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+static uint64_t cs_kids_ns(void) {   // the CPU of this process's reaped children (and theirs): in wait4's rusage
+    struct rusage ru;
+    if (getrusage(RUSAGE_CHILDREN, &ru) != 0) return 0;
+    return (uint64_t)ru.ru_utime.tv_sec * 1000000000ULL + (uint64_t)ru.ru_utime.tv_usec * 1000ULL +
+           (uint64_t)ru.ru_stime.tv_sec * 1000000000ULL + (uint64_t)ru.ru_stime.tv_usec * 1000ULL;
 }
 static uint64_t cs_minflt(void) {
     struct rusage ru;
@@ -1033,7 +1041,7 @@ static void cs_init(void) {
     }
     struct cs_map *c = (struct cs_map *)m;
     memcpy(c->magic, "ABPCLST1", 8);
-    c->version = 1; c->root_pid = (uint64_t)getpid(); c->n_purposes = CS_P; c->n_fields = CSF_N; c->n_slots = CS_SLOTS;
+    c->version = 2; c->root_pid = (uint64_t)getpid(); c->n_purposes = CS_P; c->n_fields = CSF_N; c->n_slots = CS_SLOTS;
     cs = m;
     fprintf(stderr, "ABP_CLONE_STATS %s\n", path);
 }
@@ -1100,6 +1108,7 @@ static void cs_exit(void) {
         struct cs_slot *sl = &c->slot[((uint64_t)me * 2654435761u + (uint64_t)k) % CS_SLOTS];
         int64_t cur = __atomic_load_n(&sl->pid, __ATOMIC_ACQUIRE);
         if (cur == me || (cur == 0 && __atomic_compare_exchange_n(&sl->pid, &cur, me, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))) {
+            sl->kids_ns = cs_kids_ns();
             __atomic_store_n(&sl->cpu_exit_ns, cpu + 1, __ATOMIC_RELEASE);   // (+1: 0 = not written yet)
             return;
         }
@@ -1116,10 +1125,12 @@ static void cs_reaped(pid_t pid, int p, uint64_t total) {
         if (cur == 0) break;
         if (cur != (int64_t)pid) continue;
         uint64_t at = __atomic_exchange_n(&sl->cpu_exit_ns, 0, __ATOMIC_ACQ_REL);
+        uint64_t kids = sl->kids_ns;
         __atomic_store_n(&sl->pid, -1, __ATOMIC_RELEASE);   // (a tombstone: later probes go on past it)
-        if (at) {
-            cs_add(p, CSF_REAPED, 1); cs_add(p, CSF_CPU_TOTAL_NS, total);
-            cs_add(p, CSF_CPU_TEARDOWN_NS, total > at - 1 ? total - (at - 1) : 0);
+        if (at) {   // (wait4's rusage holds the clone's reaped children too: its own whole CPU = total - theirs)
+            uint64_t own = total > kids ? total - kids : 0;
+            cs_add(p, CSF_REAPED, 1); cs_add(p, CSF_CPU_TOTAL_NS, own);
+            cs_add(p, CSF_CPU_TEARDOWN_NS, own > at - 1 ? own - (at - 1) : 0);
             return;
         }
         break;

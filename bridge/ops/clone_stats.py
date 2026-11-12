@@ -29,8 +29,8 @@ def read(path):
     with open(path, 'rb') as f:
         raw = f.read()
     magic, version, root, n_p, n_f, n_slots, lost, _ = HEAD.unpack_from(raw, 0)
-    if magic != b'ABPCLST1' or version != 1:
-        raise ValueError(f'{path}: not an ABP_CLONE_STATS v1 file')
+    if magic != b'ABPCLST1' or version not in (1, 2):   # (2: whole CPU without the clone's reaped children)
+        raise ValueError(f'{path}: not an ABP_CLONE_STATS v1 / v2 file')
     vals = struct.unpack_from(f'<{n_p*n_f}Q', raw, HEAD.size)
     out = {}
     for p in range(n_p):

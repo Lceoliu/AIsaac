@@ -219,7 +219,7 @@ def compare(A, B, k):
     for g, ga in A.svc.actors.items():   # each lane's lineage (log window at its step)
         for lane in range(W):
             la = ga.logs[lane]
-            row = ga.lin_base+lane
+            row = B.svc.actors[g].lin_base+lane   # (B's row id: its lane arena may be its own)
             end = B.store.native.lin_head_end(row)
             if la.episode is None and la.n == 0:
                 assert end in (-1, 0), (g, lane, end)
