@@ -5,7 +5,8 @@
 #   usage: [GPU=6] [GATE=0|1] accept_g.sh <tree>        (the tree deployed with deploy.sh tree first)
 # Steps (expected minutes on gpu57, without other tenants):
 #   1  the lane home's libabp_turbo.so from the tree (deploy.sh abphome), compile warnings kept       ~2
-#   2  unit tests: test_w_a_v2log_compact, test_b59_lane_arena, test_b58d_lanes                       ~3
+#   2  unit tests: test_w_a_v2log_compact, test_b59_lane_arena, test_b58d_lanes, test_b58_native_consumer,
+#      test_broken_episode (the native consumer's broken-episode snapshot, N_SNAP 35)                      ~4
 #   3  frame probes (abplus_probe_frame_exact): reference clone mode 0, candidate clone ...            ~16
 #        a mode 1 (native block + native step), 16 room seeds, --visible-json: payloads equal but for
 #          the JSON key order, digests equal, the native block used (status: native / step counts)
@@ -47,7 +48,7 @@ note "1 abphome rc=$? warnings $(grep -c 'warning' $D/abphome.log) ($(ls -la $BM
 
 # 2 unit tests
 DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=${BM1_PAYLOADS:-$BM1_IN/payloads}/b45-payloads2" $BM/run.sh acceptg-unit $GPU sh -c \
-  "cd $T/bridge/python && timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py -q -p no:cacheprovider" > $D/unit.log 2>&1
+  "cd $T/bridge/python && timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py -q -p no:cacheprovider" > $D/unit.log 2>&1
 note "2 unit rc=$? $(tail -1 $D/unit.log)"
 
 # 3 frame probes
