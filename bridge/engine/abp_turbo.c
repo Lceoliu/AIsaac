@@ -2318,6 +2318,13 @@ static int step_read(int fd, long long v[6], const char **why) {
     return *c == 0 ? 1 : 3;
 }
 
+// (G) the native visible block (vis_build, below): the state the native step reads
+static int vis_ready = -1;       // -1 not checked, 0 refused, 1 ready
+static uint64_t vis_calls, vis_fallbacks;
+static char *vis_buf;
+static size_t vis_len;
+static const char *vis_build(void);
+
 static int obs_lua_step(lua_State *L) {
     if (step_prof < 0) {
         const char *e = real_getenv ? real_getenv("ABP_STEP_PROF") : NULL;
@@ -2426,11 +2433,8 @@ static const struct { uintptr_t va; const char *name; } VIS_FUNCS[VF_COUNT] = { 
 #define VFN(id) ((void *)VIS_FUNCS[VF_##id].va)
 #define PL_SECONDARY 0x38e8      // Entity_Player: ActiveItemDesc SecondaryActiveItem (Item, Charge, BatteryCharge: ints)
 #define IC_MAX_CHARGES 0x44      // ItemConfig::Item: int MaxCharges
-static int vis_ready = -1;       // -1 not checked, 0 refused, 1 ready
 static char vis_refusal[160];
-static uint64_t vis_calls, vis_fallbacks;
-static char *vis_buf;
-static size_t vis_cap, vis_len;
+static size_t vis_cap;
 
 static int vis_check(void) {
     for (int i = 0; i < VF_COUNT; i++) {
@@ -2484,9 +2488,19 @@ static const char *vis_build(void) {
     static char *parts[3];
     static size_t pcap[3], plen[3];
     plen[0] = plen[1] = plen[2] = 0;
-#define PART_PUT(k, t, n) do { size_t n_ = (n); if (plen[k] + n_ + 1 > pcap[k]) { size_t c_ = pcap[k] ? pcap[k] : 1024; \
-        while (c_ < plen[k] + n_ + 1) c_ *= 2; char *b_ = realloc(parts[k], c_); if (!b_) abort(); parts[k] = b_; pcap[k] = c_; } \
-        memcpy(parts[k] + plen[k], (t), n_); plen[k] += n_; } while (0)
+#define PART_PUT(k, t, n) do { \
+        size_t n_ = (n); \
+        if (plen[k] + n_ + 1 > pcap[k]) { \
+            size_t c_ = pcap[k] ? pcap[k] : 1024; \
+            while (c_ < plen[k] + n_ + 1) { c_ *= 2; } \
+            char *b_ = realloc(parts[k], c_); \
+            if (!b_) abort(); \
+            parts[k] = b_; \
+            pcap[k] = c_; \
+        } \
+        memcpy(parts[k] + plen[k], (t), n_); \
+        plen[k] += n_; \
+    } while (0)
     vis_len = 0;
     for (int i = 0; i < n_players; i++) {
         const void *p = ((const void *(*)(int))FN(P_GET))(i);
