@@ -1,0 +1,163 @@
+# 首次正式训练启动包（gpu57，GPU 4–7，K=2 同步）
+
+本文是首次正式训练的操作手册：启动命令、参数、检查点与磁盘、日志位置、停止与恢复、失败时守护脚本的行为、开训后头两小时要看的指标。
+
+- 适用的树：`m200b863`，即提交 200b863 = 6f8e099 加训练参数文件。要等最终门禁 3 道加 A8 和启动彩排都通过，再由协调方确认。
+- 开训由用户发话。
+
+## 1. 开训前确认
+
+| 项 | 怎么确认 |
+|---|---|
+| 树已部署 | `ls /root/AIsaac/bm1/trees/m200b863/bridge/python/train_tok.py` |
+| 游戏库来自合并后的树 | `md5sum /root/AIsaac/bm1/home/isaac-abplus/tools/abp_turbo.c` 与树里的 `bridge/engine/abp_turbo.c` 相同（ea617f1f…） |
+| 门禁和 A8 都绿 | `reports/bm1.log` 里该树有 3 次 `gate … rc=0`，还有 `job a8-… rc=0` |
+| 脚本是最新的 | `sha1sum train_guard.sh xnew2.sh` 与仓库一致 |
+| GPU 4–7 上没有别人的进程 | `nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv`；守护脚本启动时也会查 |
+| 没有别的任务占着锁 | `ls /root/AIsaac/bm1/locks/`；守护脚本会以"training"为目的等待并拿独占锁 |
+
+## 2. 启动命令
+
+```sh
+cd /root/AIsaac/bm1
+N=main1
+RD=/root/AIsaac/train/$N
+mkdir -p $RD
+cat > $RD/train_args <<'EOF'
+--characters 0,1,2
+--run-seconds 3600 --cap-truncate 1
+--stall-progress items --floor-stall-seconds 120 --stall-truncate 1
+--reward heal=0.5,resource=0.05
+--pickup-force 0
+--teach-buffer 8000 --teacher-v2-buffer 4000
+--lr 2e-4 --lr-final 2e-5 --lr-schedule cosine --lr-warmup 0.01
+EOF
+HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_GB=128 \
+  setsid nohup ./train_guard.sh $N m200b863 env/gpu57-k2-s0dl.env env/gpu57-k2-s1dl.env \
+  > $RD/guard.out 2>&1 < /dev/null &
+```
+
+- `--stall-truncate` 等用户定：1 表示无进展也按截断处理，0 表示照旧按终止处理并给惩罚。上面写的是 1，按用户的决定改。
+- 学习率峰值和终值也待用户确认，目前按 2e-4 / 2e-5 写。
+- 从零开始：不设 `INIT`，不加载任何权重。
+- 起来后先看 `$RD/guard.log` 的前几行：
+  - "guard start"那一行有树、GPU、CPU、128g、hours 5000；
+  - "train_args:"那一行是上面的参数；
+  - "attempt 1: fresh start"。
+
+## 3. 参数
+
+**训练命令** = `xnew2.sh` 里的固定配置（与 long2 相同），加上 `train_args`（写在后面的同名参数生效）。
+
+| 参数 | 值 | 说明 |
+|---|---|---|
+| 模式 | `--mode run` | 一局可以跨楼层 |
+| 角色 | `--characters 0,1,2` | Isaac、Magdalene、Cain 等权重。实际比例：约 30% 的新开局严格按权重；约 70% 从存档点开局，沿用存档点的角色，所以会略偏向活得久的角色。episodes.jsonl 的 `char0` 可以直接统计。 |
+| 整局上限 | `--run-seconds 3600 --cap-truncate 1` | 到点按截断处理：不给 timeout 惩罚、不算终止、用最后一条记录的价值自举。 |
+| 无进展 | `--stall-progress items --floor-stall-seconds 120` | 新房间、清房、打到怪、资源增加、获得收集品/饰品/药丸/卡牌，都算进展。120 秒无进展判 stall。 |
+| 无进展的处理 | `--stall-truncate` | 待定，见第 2 节。模型的输入里看不到 stall 计时。 |
+| 奖励 | `--reward heal=0.5,resource=0.05` | 其余项不变 |
+| 强制拾取 | `--pickup-force 0` | 关闭。起始道具底座（`--start-build-mode pedestal`）照常生成，捡不捡由策略决定。 |
+| PLR | 不开 | 配置里本来就没有 |
+| 缓冲区 | `--teach-buffer 8000 --teacher-v2-buffer 4000` | 每条记录在 trainer 里约占 1.33 MB/rank。每条记录的期望使用次数由 `--teach-reuse` 决定，缓冲区大小只决定记录有多新。 |
+| 学习率 | `--lr 2e-4 --lr-final 2e-5 --lr-schedule cosine --lr-warmup 0.01` | 前 1% 从 0 线性升到峰值，之后按余弦降到终值。进度按全程累计计算，恢复后连续，两个分片相同。 |
+| 训练总量 | `HOURS=5000` | 每个分片 5000 游戏小时，两片合计 10000（ISAAC_GAME_HOURS_TOTAL）。每轮每片约 1.21 游戏小时，共约 4125 轮。按 340–390× 估算墙钟约 26–29 小时。到点后守护进程正常结束（rc 0）。 |
+| 同步 | K=2 | 梯度取平均、学习率不乘系数；每一步做一次哈希检查，确定性检查开启 |
+| 绑核 | `gpu57-k2-s0dl/s1dl.env` | 每片 driver 1 个物理核，learner 2 个 |
+| PageStore 回收 | `COLLECT_EVERY=4`（守护脚本默认） | 每 4 次 hand-off 回收一次；检查点之前和运行结束时强制回收 |
+| 容器内存上限 | `MEM_GB=128` | 是上限，不是预留 |
+
+**在这个配置下不起作用的参数**（命令行与 long2 相同、保留，只在这里注明）：
+
+- `--start-hp`；
+- `--groups-file` 的分组（`scaling2_groups.json`）：run 模式下各组只决定起点；进度里 `run win / hurt` 的分组统计仍按组给出；
+- `--item-tokens / --item-shared / --item-slots`：block-memory 模型读的是可见帧，不读旧的 ROW；
+- `--episode-seconds / --floor-seconds`：run 模式用 `--run-seconds`。
+
+## 4. 检查点与磁盘
+
+| 项 | 设置 |
+|---|---|
+| 保存间隔 | `CKPT_EVERY=100`：每 100 轮（约 242 个合计游戏小时，墙钟约 40 分钟）。崩溃时最多重跑 100 轮。实测每次保存耗时 0.3–0.43 s，collect 没有可见停顿。 |
+| 保留 | 最近 3 个 `update-*.pt`，加上每 400 轮一个里程碑（永久保留，约 10 个），加 `last.pt`（rank 0）和 `last-rank1.pt` |
+| 轮换 | `CKPT_ROTATE=delete`：轮换下来的旧检查点直接删除。这是用户只对这一类文件的批准，其他任何删除仍先进 `/root/AIsaac/trash`。每次删除都记在 `checkpoint_rotation.log`。 |
+
+**磁盘估算**（实测：每个检查点 133 MB；episodes.jsonl 每轮每片约 26 KB；progress.csv 每轮约 5.6 KB）：
+
+- 检查点：(3 + 约 10 个里程碑) × 133 MB ≈ 1.7 GB，加 last 两个 0.27 GB，合计约 2 GB；
+- episodes.jsonl：约 110 MB/片，超过 256 MB 会轮转成 `episodes.<k>.jsonl`，全部保留；
+- progress.csv：约 23 MB/片；
+- 内存采样：约 30 MB；
+- 合计约 2.5 GB，相对 gpu57 的约 320 GB 空余可以忽略。
+- 守护脚本在可用空间低于 100 GB 时每小时警告一次，低于 50 GB 时停机。
+
+## 5. 日志和进度
+
+都在 `$RD = /root/AIsaac/train/<N>/` 下：
+
+| 文件 | 内容 |
+|---|---|
+| `guard.log` | 每次尝试的开始、结束、原因、恢复；train_args；各类警告和停机原因（最重要的一个） |
+| `<N>-s0/progress.csv`、`<N>-s1/progress.csv` | 每轮一行，列见第 8 节 |
+| `<N>-s{0,1}/episodes.jsonl` | 每局一行：done、cap、stall、broken、char0、ret 等 |
+| `<N>-s0/checkpoints/`、`checkpoint_rotation.log` | 检查点 |
+| `<N>-s{0,1}.mem.attempt<k>.csv` | 每 30 s 一行：trainer、workers、游戏进程的 RSS/PSS，cgroup |
+| `<N>-s{r}.stdout / .stderr`（`.attempt<k>` 是之前尝试的） | trainer 输出 |
+| `foreign_gpu.log` | 其他租户出现在 GPU 4–7 上的进程 |
+| `launcher.log` | 容器启动输出 |
+| `reports/bm1.log` | 锁、全局事件 |
+
+## 6. 停止与恢复
+
+- **停止**：`touch $RD/STOP`。两个 rank 会在下一次 collect 时一起结束、保存 `last.pt`，守护进程结束，不再恢复。通常 1 分钟内完成。
+- **恢复**：先把 STOP 移进 trash（`mv $RD/STOP /root/AIsaac/trash/$(date +%Y%m%d)/STOP-<N>-$(date +%H%M%S)`），再运行与第 2 节**完全相同**的命令。守护进程会从最新的、能完整读出的检查点继续：
+  - 游戏小时、学习率、强制拾取概率都接着走；
+  - worker 的随机流不重放；
+  - teacher 和 CF 缓冲区从空开始（恢复后约 3 轮没有 CF 样本，约 6 轮 teacher 持有量偏低）。
+- **改参数**：编辑 `$RD/train_args`，下一次尝试生效（守护进程每次尝试前读取并记入 guard.log）。守护脚本自己的参数（DISK_MIN_GB、MAX_RETRY、BACKOFF 等）写在 `$RD/guard.env` 里，同样每次尝试前读取。
+
+## 7. 失败时守护脚本的行为
+
+| 情形 | 行为 |
+|---|---|
+| 达到 HOURS（rc 0，没有 STOP） | 训练完成，守护进程结束 |
+| 一个 trainer 退出或被杀 | 另一个 rank 的看门狗发现后自己结束并保存；守护进程以原因 other 恢复（等待 BACKOFF × 次数） |
+| 同一个原因连续失败超过 MAX_RETRY（3）次，或同一轮失败 3 次 | 停下等人 |
+| 两个 rank 的哈希不一致 | 自动用 rank 0 的状态修复；连续 3 次检查都不一致就报错，守护进程停下等人 |
+| CheckpointError，或检查点重算时发生编译 | 停下等人 |
+| CUDA out of memory | 恢复；如果当时有别人的进程在我们的卡上，第二次就停 |
+| 容器内存超过上限的 90% | guard.log 每 10 分钟警告一次（progress 的 ctr_mem_frac） |
+| 内核在内存上限处杀掉 trainer（rc ≠ 0，cgroup oom_kill > 0） | 恢复一次，第二次停下；日志写明是内存上限，不是别人的进程 |
+| 内核杀掉游戏或 worker 进程（trainer 还在） | 增长一次只警告；连续 3 轮在增长，或一次尝试累计达到 20，就停下 rank、守护进程停下 |
+| 断局（游戏或 worker 出错导致一局中断） | 按截断处理，单独记一行；有就警告；连续 3 轮都有，或一次尝试累计达到 20，就停下 |
+| 单个 worker 进程死掉 | 当前没有提示：少一个 worker 继续跑，collect 变慢，唯一痕迹是 progress 的 errors 加 1000（trainer 侧的检测由 cpp-actor 在下个维护窗口加） |
+| 活着的 worker 少于 4 个或全死，或 worker 都活着但一局也产不出（collect 卡死） | 看门狗：任一 rank 超过 600 s 没有新的 progress 行（尝试刚开始时放宽到 1800 s）就判卡死 → SIGINT（trainer 存 last.pt）→ 180 s 后如果同一个容器（按 id）还在就 kill → 原因 stall，恢复；同一轮第二次卡死就停下 |
+| 预检失败（Xid、GPU 缺失） | 停下，系统层面什么都不碰 |
+| 可用磁盘低于 50 GB | 停下 |
+
+守护脚本只管我们自己的容器，系统层面什么都不做：不重置 GPU，不碰别人的进程。
+
+## 8. 头两小时要看的指标
+
+progress.csv 的列（括号里是预期值）：
+
+| 列 | 看什么 |
+|---|---|
+| `ctr_mem_gb` / `ctr_mem_frac` | 约第 250 轮（约 1.7 小时）走平，稳态约 84 GB（最多 115 GB 左右）；不应持续上涨 |
+| `block_gc_s` | 每 4 轮一次完整回收，约 2 s，其余轮接近 0，平均约 0.5 s；不应随时间增长 |
+| `x_real_time` | 每片约 170–200，合计约 340–390（long2 从 422 降到 342，一半是缓冲区增大造成的，现在缓冲区有上限） |
+| `kl` | 学习率 2e-4 时预计会比 C99（常数 1e-4 时 0.012–0.03）更高，注意是否明显越界 |
+| `ep_stall` / `ep_stall_zero` / `ep_cap` | 每轮 stall 局数、零进展 stall 局数、到上限结束的局数。long2 里零进展 stall 占全部局 31% → 44%，新口径下应明显下降 |
+| `lr` / `shard_frac` | 预热约 41 轮后到 2e-4，之后余弦下降 |
+| `shard_mismatches`、`block_steady_compiles`、`b42_learn_ckpt_compile_redo`、`broken_total`、`ctr_oom_kills` | 都应为 0 |
+| `teach_dropped` | 累计值，含义是搜索预算放不下而放弃的受伤候选点，不是丢数据；随策略变好会下降 |
+| `b42_learn_ckpt_segments` | 每轮的确定性检查次数 |
+| `errors` | 应为 0；每加 1000 表示一个 worker 进程死了 |
+
+## 9. 开训后的待办
+
+- 观测格式 v3（Repentance 兼容）：设计已定稿，第一步已在树里，不改行为；其余在开训后并行做。
+- trainer 侧检测 worker 死亡、新增 `workers_live` 列、纯 Python 路径全死时 rc=0 的问题：归 cpp-actor。
+- 绑核细调（learner 只留 1 个核）、worker 数扫描、双卡 learner、切分均衡、CPU 记账。
+- PageStore 增量标记，进一步降低回收开销。
+- CF 价值目标的折扣不一致：目标按 0.999 计算并从 value_global 自举，但回归到的是 0.995 的主价值头。从 B34（2026-10-16）起就是这样。
