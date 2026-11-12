@@ -2663,6 +2663,7 @@ def main(argv=None, child=None, actor=None):
         actor_params = [t for t in list(model.parameters()) + list(model.buffers())]
     learner_params = [t for t in list(learner_model.parameters()) + list(learner_model.buffers())]
     hours_per_decision = args.frames_per_decision / 30 / 3600
+    total_h = float(os.environ.get('ISAAC_GAME_HOURS_TOTAL') or 0)   # (train_guard.sh: the run's game hours in all)
     config = dict(vars(args), groups_resolved=names, assign=assign,
                   parameters=sum(q.numel() for q in learner_model.parameters()), reward_terms=rw, lag=1,
                   record='tok_obs.ROW', sampler='tok_sampler (fork sampler, lean bridge)',
@@ -2798,6 +2799,9 @@ def main(argv=None, child=None, actor=None):
         sampler = JobSampler(bench_stats)
     else:
         sampler = TokSampler(cfg)
+        if pf_on and total_h > 0 and decisions_total > 0:   # (a resumed run: the forcing probability where the run is,
+            sampler.stats[:, ST['pf_p']] = pickup_force_p(   # not pickup_force[0] until the first update rewrites it)
+                pick_force, decisions_total / max(1, int(total_h / hours_per_decision)))
     n = n_loc if child is None else args.workers   # (B38 step 5: an actor process's own workers)
     lab = None
     if lab_on:   # 2026-10-08: the build lab's trainer side (tok_lab: LabBook, LabScheduler, LabModel)
@@ -3151,11 +3155,14 @@ def main(argv=None, child=None, actor=None):
         from isaac_bridge.tok_cf import TRIGGERS as CF_TRIGGERS, t_split
         v2_rng = np.random.default_rng([args.seed, 0x7E2])   # its own: the teacher's draws stay as without
     target_decisions = decisions_total + int(args.game_hours / hours_per_decision)
-    if os.environ.get('ISAAC_GAME_HOURS_TOTAL'):   # (train_guard.sh: the run's total, every resume included -- not
-        target_decisions = int(float(os.environ['ISAAC_GAME_HOURS_TOTAL']) / hours_per_decision)   # this start's)
+    if total_h > 0:   # (train_guard.sh: the run's total, every resume included -- not this start's)
+        target_decisions = int(total_h / hours_per_decision)
     if args.max_updates:
         target_decisions = decisions_total + args.max_updates * args.rollout
     start_decisions = decisions_total
+    # (the schedules' origin -- the learning rate, the forcing probability: the run's start when its total is set, so a
+    #  resume goes on where the run was; else this start's, as before)
+    prog0 = 0 if total_h > 0 and not args.max_updates else start_decisions
 
     def save(path):
         if SYNC is not None and SYNC.rank != 0:   # BM1 C: the shared state is rank 0's (identical everywhere): the others
@@ -3472,10 +3479,10 @@ def main(argv=None, child=None, actor=None):
             flat = np.flatnonzero(mask.reshape(-1))
             count = len(flat)
         if SYNC is None:
-            frac = min(1.0, (L['decisions'] - start_decisions) / max(1, target_decisions - start_decisions))
+            frac = min(1.0, (L['decisions'] - prog0) / max(1, target_decisions - prog0))
             lr = args.lr + (args.lr_final - args.lr) * frac
         else:   # BM1 C: the global progress (every rank the same learning rate), times --shard-lr-mult
-            num_, den_ = SYNC.sum([float(L['decisions'] - start_decisions), float(target_decisions - start_decisions)])
+            num_, den_ = SYNC.sum([float(L['decisions'] - prog0), float(target_decisions - prog0)])
             frac = min(1.0, num_ / max(1.0, den_))
             lr = (args.lr + (args.lr_final - args.lr) * frac) * args.shard_lr_mult
         L['shard_frac'] = frac
@@ -4716,8 +4723,9 @@ def main(argv=None, child=None, actor=None):
         L['update'] += 1
         L['decisions'] += count
         if pf_on:   # 2026-10-13 (B23): the forcing probability of the episodes to come (the workers read 'pf_p')
-            L['pf_p'] = pickup_force_p(pick_force, (L['decisions'] - start_decisions) /
-                                       max(1, target_decisions - start_decisions))
+            # (K shards: the run's global progress, shard_frac, the learning rate's: every rank the same probability)
+            L['pf_p'] = pickup_force_p(pick_force, L['shard_frac'] if SYNC is not None and 'shard_frac' in L else
+                                       (L['decisions'] - prog0) / max(1, target_decisions - prog0))
             sampler.stats[:, ST['pf_p']] = L['pf_p']
         L['last_update_s'], L['last_steps'], L['last_count'], L['last_U'] = update_s, steps, count, U   # (B18 bench)
         # (B38: read before `fresh`: after it the actor may reuse this rollout; logging only)

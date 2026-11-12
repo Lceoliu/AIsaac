@@ -46,3 +46,26 @@ def test_both_worker_kinds_use_it():
     import inspect
     assert 'start_seed(cfg, index, state_n)' in inspect.getsource(tok_sampler)
     assert 'start_seed(cfg, index, state_n)' in inspect.getsource(tok_floor)
+
+
+def test_worker_streams_per_shard_and_resume():
+    """The workers' random streams (tok_sampler.rng_key: resets, start builds, forced pickups, characters, teacher /
+    CF draws): a fresh single run's exactly as before; each shard's its own; a resumed run's not the earlier run's."""
+    import numpy as np
+    from isaac_bridge.tok_sampler import rng_key
+    a = TokSamplerConfig(workers=16, seed=1000)
+    assert rng_key(a, 3) == [1000, 3] and rng_key(a, 3, 29) == [1000, 3, 29]   # (the old [cfg.seed, index, k])
+    two = replace(a, seed_stride=2)
+    r0, r1 = replace(two, seed_phase=0), replace(two, seed_phase=1)
+    assert rng_key(r0, 3, 29) == [1000, 3, 29]                                # (rank 0 fresh: unchanged)
+    draw = lambda c: np.random.default_rng(rng_key(c, 3, 29)).random(8)
+    assert not np.allclose(draw(r0), draw(r1))
+    r0b, r1b = replace(r0, state_base=640), replace(r1, state_base=640)       # (resumed after 10 updates)
+    assert not np.allclose(draw(r0), draw(r0b)) and not np.allclose(draw(r1), draw(r1b))
+    assert not np.allclose(draw(r0b), draw(r1b))
+
+
+def test_floor_worker_streams_use_it():
+    import inspect
+    src = inspect.getsource(tok_floor)
+    assert 'default_rng([cfg.seed' not in src and src.count('rng_key(cfg, index') >= 11

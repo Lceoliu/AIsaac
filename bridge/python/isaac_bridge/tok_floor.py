@@ -75,7 +75,7 @@ from .tok_obs import (DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW
                       encode_row, fast_row_function)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
-from .tok_sampler import start_seed   # noqa: E402  (a resumed run's / a shard's start seeds)
+from .tok_sampler import rng_key, start_seed   # noqa: E402  (a resumed run's / a shard's start seeds, random streams)
 from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, SearchSlots, StartBuilder, applied_action,
                           apply_instance_defaults, attach, attach_choices, attach_lab, attach_teacher, default_stub_list,
                           hindsight,
@@ -272,7 +272,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         kinds = parse_kinds(cfg.branch_kinds)
         rw_b = parse_reward(cfg.branch_reward)   # Phase B2: the trainer's reward terms and discount (the score)
         points = PointQueue(cfg.branch_queue, cfg.branch_uncert)
-        brng = np.random.default_rng([cfg.seed, index, 7])   # its own: the episodes' rng draws stay as without branches
+        brng = np.random.default_rng(rng_key(cfg, index, 7))   # its own: the episodes' rng draws stay as without branches
         b_cap = max(1, int(round(cfg.branch_seconds * 30 / cfg.frames_per_decision)))
         walk_cap = max(1, int(round(cfg.branch_walk_seconds * 30 / cfg.frames_per_decision)))
         point_n = [0]
@@ -298,7 +298,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                                           'catalog' / 'lab_items.json'))
         build_ids = np.array(sorted(_items), np.int64)
         build_active = {i for i, r in _items.items() if r['kind'] == 'active'}
-        build_rng = np.random.default_rng([cfg.seed, index, 11])   # its own: the episodes' rng draws stay as without
+        build_rng = np.random.default_rng(rng_key(cfg, index, 11))   # its own: the episodes' rng draws stay as without
 
         def random_build():
             k = 1 + int(build_rng.integers(max(1, cfg.start_build_max)))
@@ -322,7 +322,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     if pf_track:
         from .tok_pickup import PED_MAX, PickupForcer, parse_spawned, spawn_lua
         forcer = PickupForcer()
-        pf_rng = np.random.default_rng([cfg.seed, index, 29])   # its own: the episodes' rng draws stay as without
+        pf_rng = np.random.default_rng(rng_key(cfg, index, 29))   # its own: the episodes' rng draws stay as without
         pf_counts = dict(steps=0, forced=0, free=0)
     # B39 (2026-10-18): no-active starts (training: cfg.no_active_prob of the floor-start episodes, drawn from an rng of
     # their own; evaluation: cfg.no_active, every episode): player 0's active item removed in the episode's fork before
@@ -330,14 +330,14 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     na_train = float(getattr(cfg, 'no_active_prob', 0.0) or 0.0) > 0 and not evaluation
     na_eval = bool(getattr(cfg, 'no_active', False)) and evaluation
     if na_train:
-        na_rng = np.random.default_rng([cfg.seed, index, 41])   # its own: the episodes' rng draws stay as without
+        na_rng = np.random.default_rng(rng_key(cfg, index, 41))   # its own: the episodes' rng draws stay as without
     # 2026-10-08: stat augmentation (cfg.stat_aug_prob of the floor-start training episodes get random multipliers of
     # the base stats, as AbpSetStats offsets in the episode's clone; user: generalisation of the no-item play)
     augmenting = cfg.stat_aug_prob > 0 and not evaluation
     if augmenting:
         from .abplus import lua_stats
         aug_ranges = parse_stat_aug(cfg.stat_aug)
-        aug_rng = np.random.default_rng([cfg.seed, index, 13])   # its own: the episodes' rng draws stay as without
+        aug_rng = np.random.default_rng(rng_key(cfg, index, 13))   # its own: the episodes' rng draws stay as without
 
         def random_stats():
             m = {k: float(np.exp(aug_rng.uniform(np.log(lo), np.log(hi)))) for k, (lo, hi) in aug_ranges.items()}
@@ -350,7 +350,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     plr_on = cfg.archive_plr > 0 and not evaluation
     plr_seen = [0.0]
     ep_src = {}
-    char_rng = np.random.default_rng([cfg.seed, index, 17])   # its own: the episodes' rng draws stay as without
+    char_rng = np.random.default_rng(rng_key(cfg, index, 17))   # its own: the episodes' rng draws stay as without
     # every room change is parked as the restore point of what happens in that room
     rebase = teaching or branching or laneon
     t_begin = time.perf_counter()
@@ -393,8 +393,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mem_blocks, main_h, lane_h, v2_h = attach_v2_mem(v2_names[6:], cfg.workers, cfg.memory_dim)
             blocks = blocks + mem_blocks
         v2ctx = V2Context(cfg, limit, stall, run, fast_fn, group, lane_rows[index:index + 1], cfg.branch_reward)
-        v2_rng = np.random.default_rng([cfg.seed, index, 19])    # its own: the episodes' rng draws stay as without
-        v2_srng = np.random.default_rng([cfg.seed, index, 23])   # the search thread's (candidates, reseeds)
+        v2_rng = np.random.default_rng(rng_key(cfg, index, 19))    # its own: the episodes' rng draws stay as without
+        v2_srng = np.random.default_rng(rng_key(cfg, index, 23))   # the search thread's (candidates, reseeds)
         v2_p = cfg.teacher_v2_random * cfg.frames_per_decision / 30 / 3600   # random points per decision
         v2_n = [0]
     t_dim = int(getattr(cfg, 'temporal_dim', 0) or 0)
@@ -416,7 +416,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                           seconds=cfg.cf_seconds, gamma=cfg.cf_gamma, boot_vg=bool(cfg.cf_vglobal), exit_end=run,
                           gains=True)
         cf_quota = CfQuota(cfg.cf_points, cfg.frames_per_decision)
-        cf_rng = np.random.default_rng([cfg.seed, index, 31])   # its own: the episodes' rng draws stay as without
+        cf_rng = np.random.default_rng(rng_key(cfg, index, 31))   # its own: the episodes' rng draws stay as without
         cf_p = cfg.cf_random * cfg.frames_per_decision / 30 / 3600   # random points per decision
         cf_n = [0]
         cf_B = bank_rows(cfg) if t_dim else 0   # bank rows of this worker: index * cf_B + b
@@ -620,7 +620,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                             lane_h=lane_h, lane_t=lane_t,block_mode=block_arrays[1] if block_on else None,
                             block_keep=block_arrays[4] if block_on else None)
         s0 = dict(cfctx.stats)
-        rng_p = np.random.default_rng([cfg.seed, index, 37, int(pt.pid) % (2 ** 62)])   # per point (a child's draws
+        rng_p = np.random.default_rng(rng_key(cfg, index, 37, int(pt.pid) % (2 ** 62)))   # per point (a child's draws
         res = None                                                                        # never reach the parent)
         try:
             res = cf_search(pt, cfctx, policy, rng_p)
@@ -1480,7 +1480,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     gx = GxConfig(bridge_lua=cfg.bridge_lua, preload=cfg.preload, al_stopped=True, nice=cfg.nice,
                   frames_per_decision=cfg.frames_per_decision, start_hp=6, bombs=1,
                   stub_list=cfg.stub_list or default_stub_list(cfg.preload), die_with_parent=True)
-    rng = np.random.default_rng([cfg.seed, index])
+    rng = np.random.default_rng(rng_key(cfg, index))
     todo = list(cfg.eval_seeds[index]) if evaluation else None
     state_n = 0
     inst = template = episode = base = builder = state_seed = None
