@@ -830,6 +830,18 @@ PRECAPTURE = os.environ.get('ISAAC_BLOCK_PRECAPTURE', '1') == '1'
 LANE_POOL = os.environ.get('ISAAC_BLOCK_CPP_LANES', '1') != '0' and os.environ.get('ISAAC_BLOCK_CPP_ACTOR', '1') != '0'
 PRECAPTURE_CAPS = (1, 2, 4, 8, 16)            # rows of a main-only / lane-only call (16 workers)
 PRECAPTURE_MERGED_CAPS = (2, 4, 8, 16, 32)    # rows of a merged main + teacher-lane call
+
+
+def precapture_caps(n_slots):
+    """The step graphs' row caps (powers of two) a run with n_slots workers can call: main-only / lane-only up to
+    n_slots rows, merged main + lane up to 2 * n_slots; 16 workers: exactly PRECAPTURE_CAPS / PRECAPTURE_MERGED_CAPS
+    (more workers: 32 and 64 too, so no step graph is captured late in a timed run)."""
+    def up(n):
+        return 1 << max(0, int(n) - 1).bit_length()
+    top, top_m = max(16, up(n_slots)), max(32, up(2 * n_slots))
+    caps = tuple(1 << i for i in range(top.bit_length()) if 1 << i <= top)
+    merged = tuple(c for c in (1 << i for i in range(1, top_m.bit_length())) if c <= top_m)
+    return caps, merged
 PRECAPTURE_ENTITIES = (16, 32, 64, 128)       # structured_input.BUCKETS['entity']
 PRECAPTURED = [False]
 
@@ -868,7 +880,8 @@ def precapture_actor(actor, merged=True):
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=actor.bf16):
         if actor.step_graph is not None:
             # B46: a merged main + lane call (up to main + lane rows) replays the step graph too
-            caps = sorted(set(PRECAPTURE_CAPS) | (set(PRECAPTURE_MERGED_CAPS) if merged and actor.lane_slots else set()))
+            caps_m, merged_m = precapture_caps(actor.n_slots)
+            caps = sorted(set(caps_m) | (set(merged_m) if merged and actor.lane_slots else set()))
             for cap in caps:
                 for e in PRECAPTURE_ENTITIES:
                     made += int(actor.step_graph.precapture(cap, e))
@@ -878,7 +891,7 @@ def precapture_actor(actor, merged=True):
             memory = actor.model.block_memory
             scratch = actor.state.slots-1
             nh = len(actor.model.heads)
-            for cap in PRECAPTURE_MERGED_CAPS:
+            for cap in precapture_caps(actor.n_slots)[1]:
                 for e in PRECAPTURE_ENTITIES:
                     before = actor.encoder.captures
                     _, z = actor.encoder(synthetic_rows(cap, e), np.zeros((cap, nh), np.int64))

@@ -243,7 +243,7 @@ class AuxNorm:
 
     def state(self):
         # (plain lists: train_tok reads a checkpoint with torch.load's default, weights_only, which refuses numpy arrays)
-        return dict(n=self.n, mean=self.mean.tolist(), m2=self.m2.tolist(), rn=self.rn.tolist(), rm2=self.rm2.tolist())
+        return dict(n=float(self.n), mean=self.mean.tolist(), m2=self.m2.tolist(), rn=self.rn.tolist(), rm2=self.rm2.tolist())
 
     def load(self, d):
         self.n = float(d['n'])

@@ -75,6 +75,7 @@ from .tok_obs import (DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW
                       encode_row, fast_row_function)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
+from .tok_sampler import start_seed   # noqa: E402  (a resumed run's / a shard's start seeds)
 from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, SearchSlots, StartBuilder, applied_action,
                           apply_instance_defaults, attach, attach_choices, attach_lab, attach_teacher, default_stub_list,
                           hindsight,
@@ -1531,7 +1532,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         nonlocal state_n
         if evaluation:
             return todo.pop(0) if todo else None
-        seed = cfg.seed + index + cfg.workers * state_n
+        seed = start_seed(cfg, index, state_n)
         state_n += 1
         return seed
 

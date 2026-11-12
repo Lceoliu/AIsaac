@@ -11732,3 +11732,100 @@ learner放第二张卡（split-mb427b8d，24轮，29.1游戏小时）和单卡�
   - 4 个过时脚本已换成仓库版本，按 sha1 与仓库逐个核对一致。今后合并主线时，把"重新部署 ops 脚本并核对 sha1"作为合并步骤的一部分。
 - **待办（续训的种子）：** 单分片也是如此：worker 的开局种子 = seed + index + workers × n，n 每次进程启动都从 0 开始，检查点不存它。所以每次续训都会重跑同一批开局。应改为按已完成的进度偏移，比如已消耗的开局数或 update 数。
 - **待测：** c2killd（杀掉一个 rank）、门加 A8、c2time（24 轮同步）对照 capb2（同一时段不同步）。
+- **gpu57 冒烟（树 mfaeb516）：**
+  - 门 287 passed，3 skipped，1 xfailed。
+  - c2flipd：rc=0，停止文件由 shardk 自己写，两个 rank 一起结束。
+  - c2killd：17:42:19 对 rank 1 的 trainer 发 SIGKILL；rank 0 的 watchdog 发现后中止集合通信，走 failure 路径收尾，14.3 s 后写好 last.pt（139.7 MB）。
+- **c2time 作废，原因是 actor 被挪到了 learner 卡上：**
+  - ShardSync.init 在主线程调用了 torch.cuda.set_device(learner 卡)，改掉了主线程的当前设备，actor 就在 learner 卡上分配。
+  - 现象：GPU 1/3 的利用率 0%，显存 4 MiB。
+  - gpumap 探针确认容器里的 CUDA 设备号映射是对的，问题不在映射。
+  - 修复：8174566，只在 init、check、broadcast 内临时切换设备。
+  - c2time 的 256× 作废。此前 shardk 的各次运行都有这个问题，但翻转和杀 rank 的结论不受影响。
+- **计时（树 m8174566，lane b，24 轮，u10+ 中位数，背靠背，四张卡都有负载）：**
+
+  | 臂 | collect s | update s | ×实时 |
+  |---|---|---|---|
+  | c2time2 同步 s0 | 19.50 | 22.48 | 188.1 |
+  | c2time2 同步 s1 | 21.02 | 22.49 | 188.1 |
+  | capb3 不同步 s0 | 19.16 | 21.40 | 196.8 |
+  | capb3 不同步 s1 | 21.56 | 19.79 | 198.7 |
+
+  - 合计：同步 376.2×，同一时段的不同步对照 395.5×，损失 4.9%，在 ≤5% 的门限内。capb 是 374.9×。
+  - 每个 update 的同步开销：
+    - 归约 0.29 s。
+    - shard_wait_s 4.9 s，但它含本 rank 等自己 GPU 排空的时间，偏大。
+    - 净开销以 update 时间计：同步 22.5 s，不同步两个 rank 平均 20.6 s，约多 1.9 s。来源是每步一次主机同步、等较慢的 rank、归约。
+  - 一致性：375 步，0 个零权重步，26 次比对，0 次不一致。
+  - 后续可做：去掉每步的 cuda synchronize，改用 event 计时、在计算流上异步归约。
+- **fp32check2（开 anomaly）崩溃复现：**
+  - 出错节点：NativeLayerNormBackward0。
+  - 前向调用链：_run_packed → checkpoint(_spatial_segment) → encode_block → block_memory.resampler 的输出 LayerNorm（block_memory.py:118）。
+  - 出错时机：反向解包时触发检查点重算，然后报错。
+  - 推测：精简检查点 determinism_check='none' 下，重算保存的张量与前向不一致（中间发生了首次编译）。fp32check3 用默认检查点验证。
+  - 三次 fp32diag 开着 anomaly 都没崩，所以崩不崩取决于当次的 job，与 anomaly 无关。
+
+#### 检查点重算与首次编译错位（fp32 对照的崩溃，2026-11-11/12）
+- **现象：**
+  - fp32check（树 m358e2a5c，第 6 个 job）和 fp32check2（开 anomaly）都在 0of 预热之后、0sf 第一半的反向里崩溃。
+  - 报错节点：NativeLayerNormBackward0（Spatial resampler 末尾的 LayerNorm，block_memory.py:118）。
+  - 报错信息："Only Tensors of floating point and complex dtype can require gradients"。
+- **三次诊断为什么没复现：**
+  - fp32diag：只跑 0sf，第 2 个 job。
+  - fp32diag2：先 0of 后 0sf，第 2 个 job。
+  - fp32diag3：先 0of 后 0sf，第 6 个 job。
+  - 三次都开着 anomaly，都没崩。fp32check2 在同样的条件下崩了，所以与 anomaly 无关。
+  - 崩不崩取决于 fp32 首次编译是否恰好发生在某个带检查点的 Spatial 段的前向里，这由当次 job 的形状决定（新的 T 桶或行数组合），所以时有时无。
+  - recompile 日志：_spatial_rows 重编译 57 次、flex_attention 53 次，都没有触到上限，"重编译上限"的猜测排除。
+- **fp32check3（默认检查点，ISAAC_LEARN_CKPT_LEAN=0，打开确定性检查）：** 抛了 CheckpointError，前向保存的张量和重算得到的对不上。
+
+  | 位置 | 前向保存的 | 重算得到的 |
+  |---|---|---|
+  | 0 | int64 [17] | float32 [17, 80] |
+  | 1 | float32 [32, 16, 3, 3] | float32 [17, 192] |
+  | 2 | float32 [17, 16, 16, 28] | float32 [17, 192] |
+  | 3 | float32 [64, 32, 3, 3] | float32 [192, 192] |
+  | 4 | float32 [28, 2] | float32 [17, 20] |
+  | 5 | float32 [32, 16, 3, 3] | int64 [17] |
+  | … | … | … |
+
+- **原因：**
+  - 带检查点的 Spatial 段在前向期间发生了首次编译。前向走的是首次调用的那条路径（eager 卷积等，保存的是卷积权重和中间激活），反向重算时走的是已编译好的图，保存的是另一组张量。
+  - 精简检查点（LEAN_CKPT_KW：non-reentrant、preserve_rng_state=False、determinism_check='none'）按顺序解包，取到的张量是错的：
+    - 取到整数张量时报错，就是这两次崩溃；
+    - 如果取到的是形状和类型都对得上的浮点张量，会悄悄算出错的梯度。
+- **两种防护：**
+  1. e11da25：前向期间（按设备计）发生了编译，就丢掉这次输出、重做这一段（最多 3 次）。计数在 progress.csv 的 b42_learn_ckpt_compile_redo。
+  2. 1fd922a：反向重算期间在该设备上发生了编译，就报错停止。这时梯度已经在累加，无法重做。
+     - 每个带检查点的调用带一个 token，第一次运行算前向，之后算重算。
+     - 编译按设备计数（block_compile.DEV_COMPILES），另一张卡的线程同时编译不会误报。
+  - 两种都常开，不发生编译时只多几次整数读取。
+  - summ.py 新增一行"compiles: block_steady_compiles …, learn_ckpt_compile_redo …"，不为 0 时标 "<-- NOT 0"。
+  - 精简检查点是否保留 determinism_check：开销用 bench 的 0o 对 0od 测（ckdet），每个 update 不超过约 0.1 s 就常开。它只比较形状、类型、设备，但能在这类错位时给出明确报错。
+- **对 bf16 生产路径的结论：**
+  - warm_spatial 在启动时、在检查点之外，对所有 T 桶的三种模式各编译一遍；batch 维是动态的。mark_steady 在第一次 learn 之前调用。
+  - block_steady_compiles 在编译后端里计数，覆盖检查点内部的编译，所有计时运行都为 0。所以生产的稳态和预热都没有进入"检查点内首次编译"的条件。
+  - 关检查点的路径（0pk、p2k）没有重算，不受影响。
+  - 其他检查点（block_paged、block_training 的旧路径）用的是默认检查点，会报错而不会静默。
+- **待补：** fp32check5（树 m1fd922a，两种防护都开，并开确定性检查）的五组配对数字、ckdet 的开销。
+- **口径（用户决定，2026-11-12）：** 多分片同步"先用梯度取平均、学习率不变"，即方案里的口径 1，--shard-lr-mult 保持默认 1.0。这个倍率留作以后对比实验的开关。
+- **主线：** 2026-11-12 快进到 ca2ee19。过门的树 m8174566（全量门 287 passed，A8 8/8）和 ca2ee19 之间只差 EXPERIMENTS.md。C 默认关闭。
+- **fp32check5 推翻了"前向期间编译"这个解释（树 m1fd922a，两种防护都开，同时开确定性检查）：**
+  - 防护 b 重做了 4 次，确定性检查照样报 CheckpointError。
+
+    | 位置 | 前向保存的 | 重算得到的 |
+    |---|---|---|
+    | 0 | int64 [144] | float32 [144, 80] |
+    | 1 | float32 [32, 16, 3, 3] | float32 [144, 192] |
+    | 2 | float32 [144, 16, 16, 28] | float32 [144, 192] |
+
+  - 重做之后的那次前向没有发生编译（否则会再重做），重算时也没有发生编译（否则防护 2 会报错）。
+  - **已排除：** 重编译上限（日志里有 57 次和 53 次重编译，但从没触到上限）；前向期间编译（防护 b 重做之后仍然对不上）。
+  - **已知事实：** 同一个编译函数（Spatial，block_compile 的 spatial_rows_compiled），在检查点的前向里走了 eager（卷积在 eager 里执行，保存了卷积权重和画布输入），在重算里走了编译好的图。fp32 下的若干形状会这样；bf16 的生产运行从未报过这个错（数千个 update）。
+  - **没查清的：** 为什么会分叉，为什么 bf16 不分叉。
+  - **生产上的处置（2026-11-12 决定）：**
+    - 训练配置打开 determinism_check（ISAAC_LEARN_CKPT_DET=1），任何前向和重算的不一致都会成为明确的 CheckpointError；守护脚本遇到它就停下等人，不自动重试。
+    - 防护 b 和防护 2 保留。
+    - 第 6 项长稳运行用这个配置跑，作为 bf16 不受影响的直接证据。
+    - 切半路径的等价性记为：模型一侧已证（CPU 上 2.5e-7），损失一侧未证。两卡 learner 不进训练配置。
+  - **开训后的待办：** 查清 fp32 下分叉的原因。线索：检查点的前向是在"保存张量的钩子"（saved_tensors_hooks）生效的环境里跑的，可以从"编译过的函数在这种环境下是否会退回 eager、bf16 下为什么不退回"入手。

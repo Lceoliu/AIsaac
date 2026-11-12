@@ -177,6 +177,8 @@ def test_native_consumer_matches_python_consumer():
     np.testing.assert_array_equal(book_a.pick['steps'], book_b.pick['steps'])
     assert book_a.finished == book_b.finished and len(book_a.finished) > 5
     assert book_a.branch_finished == book_b.branch_finished and len(book_a.branch_finished) > 0
+    # (episodes that broke off -- the stream's breaks while a decision is open: their own lines, the same both ways)
+    assert book_a.broken == book_b.broken and book_a.broken_total == book_b.broken_total and len(book_a.broken) > 0
     assert book_a.inv0 == book_b.inv0 and book_a.stats0 == book_b.stats0 and book_a.char0 == book_b.char0
     assert book_a.active0 == book_b.active0 and book_a.pick['bped'] == book_b.pick['bped'] and book_a.seen_inv == book_b.seen_inv
     np.testing.assert_array_equal(stats_a, stats_b)

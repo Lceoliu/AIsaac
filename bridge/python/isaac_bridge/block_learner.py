@@ -56,6 +56,10 @@ SPATIAL_ROWS = int(os.environ.get('ISAAC_LEARN_SPATIAL_ROWS', '4096'))
 # ISAAC_LEARN_CKPT_LEAN=0: the B44-B60 call.
 LEAN_CKPT_KW = dict(use_reentrant=False, preserve_rng_state=False, determinism_check='none')
 CKPT_KW = LEAN_CKPT_KW if os.environ.get('ISAAC_LEARN_CKPT_LEAN', '1') == '1' else dict(use_reentrant=False)
+# (the training configuration, 2026-11-12: the lean checkpoint with torch's determinism check, a recomputation that
+#  saves other tensors than its forward raises CheckpointError instead of unpacking the wrong ones; fp32check3 / 5)
+if os.environ.get('ISAAC_LEARN_CKPT_DET', '0') == '1':
+    CKPT_KW = dict(CKPT_KW, determinism_check='default')
 
 
 class _PrepLock:
@@ -114,7 +118,9 @@ bp.UPD_KEYS = tuple(bp.UPD_KEYS)+tuple(k for k in (
     'learn_prefetch_submitted', 'learn_prefetch_cpu_s', 'learn_prefetch_wait_grad_s', 'learn_prefetch_wait_nograd_s',
     'learn_prefetch_skip_wait_s', 'learn_pack_crit_s', 'learn_pack_crit_grad_s', 'learn_pack_crit_nograd_s',
     # BM1 P2: the second learner card's forward / backward (wall on its thread, CUDA-event span on its card)
-    'p2_fwd_part_wall_s', 'p2_fwd_part_gpu_s', 'p2_bwd_wall_s', 'p2_bwd_gpu_s', 'p2_bwd_calls')
+    'p2_fwd_part_wall_s', 'p2_fwd_part_gpu_s', 'p2_bwd_wall_s', 'p2_bwd_gpu_s', 'p2_bwd_calls',
+    # (a checkpointed Spatial segment redone: a graph compiled during its forward)
+    'learn_ckpt_compile_redo')
     if k not in bp.UPD_KEYS)
 
 
@@ -1034,12 +1040,39 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
                 unique=unique, version=version)
 
 
-def _spatial_segment(model, part):
+def _compiles(dev=None):
+    """block_compile's compile count (every graph the dynamo backend compiled, warm-up and steady); with dev, only
+    the graphs whose inputs are on that device (another card's thread compiling meanwhile does not count)."""
+    from .block_compile import STATS, DEV_COMPILES
+    return STATS['compiles'] if dev is None else DEV_COMPILES.get(str(dev), 0)
+
+
+class _SegToken:
+    """One checkpointed Spatial call: its first run is the forward, a later one the backward's recomputation."""
+    __slots__ = ('runs', '__weakref__')
+
+    def __init__(self):
+        self.runs = 0
+
+
+def _spatial_segment(model, part, token=None):
     """model.encode_block(part) inside an NVTX range 'learner.spatial' (B62: the B2 measurement of the Spatial
-    segments' dispatch gaps; the forward and the backward's recomputation; a no-op without ISAAC_BLOCK_NVTX)."""
+    segments' dispatch gaps; the forward and the backward's recomputation; a no-op without ISAAC_BLOCK_NVTX).
+    token (a checkpointed call): on its recomputation a graph compiled on this device means the recomputation ran
+    another graph than the forward; the gradient would be computed from the wrong saved tensors and is already being
+    accumulated, so the run stops here (no redo is possible in the backward)."""
     nv_push('learner.spatial')
     try:
-        return model.encode_block(part)
+        if token is None:
+            return model.encode_block(part)
+        token.runs += 1
+        dev = next(model.parameters()).device
+        c0 = _compiles(dev)
+        out = model.encode_block(part)
+        if token.runs > 1 and _compiles(dev) != c0:
+            raise RuntimeError('BM1: a graph was compiled during the backward recomputation of a checkpointed '
+                               'Spatial segment (its forward ran another graph): the gradient would be wrong; stopped')
+        return out
     finally:
         nv_pop()
 
@@ -1071,7 +1104,20 @@ def _run_packed(model, P):
     for g, names, T, m in plans:
         part = packed_rows_apply(batch, {k: di[f'sp{g}:{k}'] for k in names}, T)
         if grad and SPATIAL_CKPT and m > 0:
-            zs.append(checkpoint(_spatial_segment, model, part, **CKPT_KW)[:m])
+            # (a graph compiled during the checkpointed forward: the recomputation in the backward runs the compiled
+            #  graph, the forward ran the first call's other path; they save different tensors and the backward
+            #  unpacks the wrong ones -- fp32check3, CheckpointError with the determinism check on. Redo the segment
+            #  now that the graph exists; its first output is dropped and never backpropagated)
+            dev_ = next(model.parameters()).device
+            for try_ in range(3):
+                c0_ = _compiles(dev_)
+                z_ = checkpoint(_spatial_segment, model, part, _SegToken(), **CKPT_KW)
+                if _compiles(dev_) == c0_:
+                    break
+                bp.ucount('learn_ckpt_compile_redo', 1)
+            else:
+                raise RuntimeError('BM1: the checkpointed Spatial segment compiled again on each of 3 tries')
+            zs.append(z_[:m])
         else:
             zs.append(_spatial_segment(model, part)[:m])
     z_all = (torch.cat(zs) if len(zs) > 1 else zs[0]).index_select(0, di['sp:inverse'])

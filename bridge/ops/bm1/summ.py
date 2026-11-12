@@ -63,6 +63,13 @@ def main():
         out.append(f'  {name:7s} collect {med(seg, "collect_s"):6.2f}  update {med(seg, "update_s"):6.2f}  '
                    f'wait_learner {med(seg, "wait_learner_s"):6.2f}  x_real {med(seg, "x_real_time"):6.1f}')
     out.append(f'  first update {f(rows[0], "update_s"):.2f} s, last {f(rows[-1], "update_s"):.2f} s')
+    # (the learner's compile integrity: graphs compiled after the warm-up, checkpointed Spatial segments redone because
+    #  a graph compiled during their forward; both must be 0 in a steady run)
+    sc = rows[-1].get('block_steady_compiles', '')
+    rd = sum(f(x, 'b42_learn_ckpt_compile_redo') for x in rows if x.get('b42_learn_ckpt_compile_redo', '') != '')
+    flag = '  <-- NOT 0' if ((sc not in ('', '0', '0.0')) or rd > 0) else ''
+    out.append(f'  compiles: block_steady_compiles {sc or "-"}, learn_ckpt_compile_redo '
+               f'{rd:.0f}{"" if any("b42_learn_ckpt_compile_redo" in x for x in rows[:1]) else " (no column)"}{flag}')
     if len(rows) >= 15:
         r = rows[14]
         w = f(r, 'wall_s')

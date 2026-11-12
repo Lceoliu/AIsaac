@@ -14,6 +14,7 @@ import numpy as np
 import torch
 
 STATS = dict(compiles=0, steady_compiles=0, calls=0)
+DEV_COMPILES = {}   # (BM1) compiles per device of the graph's first tensor input: block_learner's checkpoint guards
 _LOCK = threading.Lock()
 _STEADY = [False]
 _CONFIGURED = [False]
@@ -80,6 +81,8 @@ def mark_steady():
 def _backend(gm, example_inputs):
     with _LOCK:
         STATS['compiles'] += 1
+        dev_ = next((str(x.device) for x in example_inputs if hasattr(x, 'device')), '?')
+        DEV_COMPILES[dev_] = DEV_COMPILES.get(dev_, 0) + 1
         if _STEADY[0]:
             STATS['steady_compiles'] += 1
             # B44: which compiled call recompiled, with its input shapes (diagnosis only)

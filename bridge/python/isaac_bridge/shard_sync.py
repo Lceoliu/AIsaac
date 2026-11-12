@@ -16,6 +16,7 @@ learner's agreements and the hashes; the main thread's control group (gloo) for 
 on (the two threads never share a group: a group's collectives must come in one order).
 Every rank must make the same collectives in the same order: the step count of an update is agreed (a rank with fewer
 minibatches takes zero-weight steps), the learning rate comes from the global progress, the stop is agreed."""
+import contextlib
 import os
 import threading
 import time
@@ -24,6 +25,10 @@ from datetime import timedelta
 import numpy as np
 import torch
 import torch.distributed as dist
+
+
+HOSTSYNC = os.environ.get('ISAAC_SHARD_HOSTSYNC', '0') == '1'
+MISMATCH_STOP = int(os.environ.get('ISAAC_SHARD_MISMATCH_STOP', '3'))   # consecutive hash mismatches that stop the run
 
 
 def _int_view(t):
@@ -56,6 +61,7 @@ class ShardSync:
         self.dir = shard_dir
         self.stats = dict(reduce_s=0.0, wait_s=0.0, steps=0, pad_steps=0, rows=0.0, checks=0, mismatches=0, restores=0)
         self.peer_lost = None
+        self._pending = []
         self.pg = self.ctrl = None
         self._watch = None
 
@@ -75,10 +81,11 @@ class ShardSync:
     def init(self):
         """The process groups (env:// rendezvous), the pid file and the watchdog of the others'."""
         to = timedelta(seconds=self.timeout)
-        if self.cuda:
-            torch.cuda.set_device(self.device)
-        dist.init_process_group('nccl' if self.cuda else 'gloo', init_method='env://', rank=self.rank,
-                                world_size=self.world, timeout=to, **(dict(device_id=self.device) if self.cuda else {}))
+        with self._dev():   # (not torch.cuda.set_device: the caller's thread keeps its current device -- the main
+            #                 thread's is the actor's; set_device here moved the actor onto the learner card, c2time)
+            dist.init_process_group('nccl' if self.cuda else 'gloo', init_method='env://', rank=self.rank,
+                                    world_size=self.world, timeout=to,
+                                    **(dict(device_id=self.device) if self.cuda else {}))
         self.pg = dist.group.WORLD
         self.ctrl = dist.new_group(backend='gloo', timeout=to)
         if self.dir:
@@ -89,6 +96,10 @@ class ShardSync:
             self._watch = threading.Thread(target=self._watchdog, name='shard-watch', daemon=True)
             self._watch.start()
         return self
+
+    def _dev(self):
+        """The learner card as the current device for a block (collectives from any thread), restored after."""
+        return torch.cuda.device(self.device) if self.cuda else contextlib.nullcontext()
 
     def _peer_pids(self):
         out = {}
@@ -161,16 +172,28 @@ class ShardSync:
         """Every rank's gradients of `params` (one list: the optimisers' parameters in a fixed order; a missing
         gradient counts as zero) replaced by sum_r(weight_r * g_r) / sum_r(weight_r): per dtype one flat buffer, the
         weights' sum in the float32 one's last element. The time waiting for the slowest rank (a one-element all_reduce
-        first) and the reduce's own time are counted apart."""
+        first) and the reduce's own time are counted apart.
+        CUDA (default): no host synchronisation -- the collectives queue on the current stream behind the backward, the
+        CPU goes on to the next part; the two times are CUDA-event spans on the stream (read by drain(): the wait from
+        this rank's backward end to every rank's, the reduce after it). ISAAC_SHARD_HOSTSYNC=1 (the first version): the
+        host waits for the stream before and after the barrier, host-clock times."""
+        ev = self.cuda and not HOSTSYNC
         t0 = time.perf_counter()
-        if self.cuda:
+        if ev:
+            e0 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+        elif self.cuda:
             torch.cuda.current_stream().synchronize()
         tw = self._t([1.0], torch.float32)
         dist.all_reduce(tw, group=self.pg)   # (the barrier: every rank's backward done)
-        if self.cuda:
+        if ev:
+            e1 = torch.cuda.Event(enable_timing=True)
+            e1.record()
+        elif self.cuda:
             torch.cuda.current_stream().synchronize()
         t1 = time.perf_counter()
-        self.stats['wait_s'] += t1 - t0
+        if not ev:
+            self.stats['wait_s'] += t1 - t0
         groups = {}
         for i, p in enumerate(params):
             groups.setdefault(p.dtype, []).append(i)
@@ -201,9 +224,25 @@ class ShardSync:
                     p.grad = v.view_as(p).clone()
                 else:
                     p.grad.copy_(v.view_as(p))
-        self.stats['rows'] += float(wsum.item())   # (a synchronisation: the reduce's end, the global rows)
-        self.stats['reduce_s'] += time.perf_counter() - t1
+        if ev:   # (read at drain(): no synchronisation here)
+            e2 = torch.cuda.Event(enable_timing=True)
+            e2.record()
+            self._pending.append((e0, e1, e2, wsum))
+        else:
+            self.stats['rows'] += float(wsum.item())   # (a synchronisation: the reduce's end, the global rows)
+            self.stats['reduce_s'] += time.perf_counter() - t1
         self.stats['steps'] += 1
+
+    def drain(self):
+        """The queued steps' CUDA-event times and global rows into stats (synchronises with their events: call it
+        where the update ends anyway). Returns stats."""
+        for e0, e1, e2, wsum in self._pending:
+            e2.synchronize()
+            self.stats['wait_s'] += e0.elapsed_time(e1) / 1e3
+            self.stats['reduce_s'] += e1.elapsed_time(e2) / 1e3
+            self.stats['rows'] += float(wsum.item())
+        self._pending.clear()
+        return self.stats
 
     # ---- consistency
     def _state(self, models, opts, extra_arrays):
@@ -226,14 +265,22 @@ class ShardSync:
         """The ranks' state hashes compared (all_gather); a mismatch: rank 0's state broadcast to every rank (the
         parameters, the Adam states, the extra arrays written back by the caller from the returned list) and counted.
         Returns (mismatch, the extra arrays as rank 0 has them)."""
+        with self._dev():
+            return self._check(models, opts, extra_arrays, restore)
+
+    def _check(self, models, opts, extra_arrays, restore):
         h = state_hash(self._state(models, opts, extra_arrays), self.device)
         hs = [torch.zeros_like(h) for _ in range(self.world)]
         dist.all_gather(hs, h, group=self.pg)
         self.stats['checks'] += 1
         vals = [int(x.item()) for x in hs]
         if len(set(vals)) == 1:
+            self._consec = 0
             return False, list(extra_arrays)
         self.stats['mismatches'] += 1
+        self._consec = getattr(self, '_consec', 0) + 1
+        if self._consec >= MISMATCH_STOP:   # (not an accident: a determinism problem; the run stops, a person looks)
+            raise RuntimeError(f'BM1 C: the state hashes of the ranks differed in {self._consec} consecutive checks {vals}')
         print(f'shard {self.rank}: state hashes differ {vals}: rank 0\'s broadcast', flush=True)
         if not restore:
             return True, list(extra_arrays)
@@ -253,6 +300,10 @@ class ShardSync:
     @torch.no_grad()
     def broadcast_state(self, models, opts):
         """Rank 0's parameters and optimiser states to every rank (the start: the ranks' seeds differ)."""
+        with self._dev():
+            self._broadcast(models, opts)
+
+    def _broadcast(self, models, opts):
         for t in self._state(models, opts, ()):
             buf = t if t.device == self.device else t.to(self.device)
             dist.broadcast(buf, 0, group=self.pg)
@@ -302,7 +353,7 @@ def auxnorm_apply(norm, m):
     """The global batch's sums applied as AuxNorm.update would apply the concatenated batch."""
     S = len(norm.mean)
     K = len(norm.rn)
-    b = m[0]
+    b = float(m[0])   # (a Python float: norm.n goes into the checkpoint, which torch.load's weights_only reads)
     if b > 0:
         mu = m[1:1 + S] / b
         var = np.maximum(m[1 + S:1 + 2 * S] / b - mu * mu, 0.0)

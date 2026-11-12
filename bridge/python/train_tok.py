@@ -686,6 +686,8 @@ def merge_jobs(halves):
         return out
     j['finished'] = [e for h in halves for e in h.get('finished', [])]
     j['branch_finished'] = [e for h in halves for e in h.get('branch_finished', [])]
+    j['broken'] = [e for h in halves for e in h.get('broken', [])]
+    j['broken_total'] = max(h.get('broken_total', 0) for h in halves)
     for k in ('collect_s', 'wait_learner_s', 'cycle_s', 'cycle_wait_s', 'take_s', 't_put'):
         if k in j:
             j[k] = max(h.get(k, 0.0) for h in halves)
@@ -948,6 +950,9 @@ class Rollout:
                                      other.t_o.index_select(0, torch.from_numpy(o_src).to(dev)))
 
 
+DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its game / worker failed before its end record)
+
+
 class Episodes:
     """The actor's bookkeeping of the records that arrive (vectorised over a poll's records): the reward of each
     worker's open decision, episode ends and their statistics, the action under way."""
@@ -967,6 +972,9 @@ class Episodes:
         self.finished = []                       # episodes ended since the last hand-over
         self.branch_finished = []                # 2026-10-07: branch episodes ended since then (tok_branch)
         self.lab_finished = []                   # 2026-10-08: lab episodes ended since then (tok_lab)
+        # episodes that broke off since then (no end record: the game or its worker failed; done DONE_BROKE), apart
+        # from every statistic; ep_meta: worker -> (group, seed, branch, point, lab) of its episode's first record
+        self.broken, self.broken_total, self.ep_meta = [], 0, {}
         self.seen_inv = None                     # 2026-10-08 (lab on): held collectibles at ordinary episodes' ends
         self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
         self.stats0 = None                       # 2026-10-08 (stat aug on): worker -> the stats at the first record
@@ -988,6 +996,45 @@ class Episodes:
         return np.stack([np.rint(pl[:, 7] * 12.0), np.rint(pl[:, 8] * 10.0) + np.rint(pl[:, 9] * 10.0)
                          + np.rint(pl[:, 10] * 50.0)], 1).astype(np.float64)
 
+    def note_first(self, rows, idx, first):
+        """Each first record's (group, seed, branch, point, lab): the broken-episode line's, should it break off."""
+        for j in np.flatnonzero(first):
+            r = rows[j]
+            self.ep_meta[int(idx[j])] = (int(r['group']), int(r['seed']), int(r['branch']), int(r['point']),
+                                         int(r['lab']))
+
+    def broken_line(self, i, acc):
+        """The episodes.jsonl line of worker i's episode that broke off; acc: its accumulators in the native
+        consumer's snapshot order (ret, hurt, damage, rooms, boss, extra[6], healed, gathered, ...)."""
+        g, sd, br, pt, lb = self.ep_meta.get(int(i), (-1, -1, 0, 0, 0))
+        fin = dict(group=g, seed=sd, done=DONE_BROKE, broken=1, ret=float(acc[0]), hurt=float(acc[1]),
+                   damage=float(acc[2]), rooms=int(acc[3]), boss=int(acc[4]))
+        if self.run or self.items:
+            x = np.asarray(acc[5:11]).astype(np.int64)
+            fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]), stage0=int(x[4]),
+                       stage=int(x[5]))
+            if self.inv0.get(int(i)):
+                fin['build0'] = self.inv0[int(i)]
+        if self.gains is not None:
+            fin.update(healed=float(acc[11]), gathered=float(acc[12]))
+        if br:
+            fin.update(point=pt, branch=br)
+        if lb:
+            fin['lab'] = lb
+        self.broken.append(fin)
+        self.broken_total += 1
+
+    def close_broken(self, ws):
+        """(the Python consumer) workers ws's episodes broke off: their lines, their accumulators reset."""
+        for i in ws:
+            self.broken_line(i, [self.ret[i], self.hurt[i], self.damage[i], self.rooms[i], self.boss[i],
+                                 *self.extra[i], self.healed[i], self.gathered[i]])
+        self.ret[ws], self.hurt[ws], self.damage[ws], self.rooms[ws], self.boss[ws] = 0.0, 0.0, 0.0, 0, 0
+        self.extra[ws] = 0
+        self.healed[ws], self.gathered[ws] = 0.0, 0.0
+        if self.plr is not None:
+            self.v0[ws], self.gret[ws], self.steps[ws] = 0.0, 0.0, 0
+
     def arrive(self, roll, rows, idx, pending):
         """Records `rows` of workers `idx` (distinct): close the decisions before them, end episodes, reset the action
         under way where an episode starts or ends. Returns the mask of the records that need an action."""
@@ -995,14 +1042,20 @@ class Episodes:
         first = rows['first'] != 0
         done = rows['done'].astype(np.int64)
         k = roll.open[idx]
-        broke = first & (k >= 0)   # the episode before broke off (a worker error): end it there
+        broke = first & (k >= 0)   # the episode before ended with no end record: a branch's truncated end, or broke off
         if broke.any():
-            roll.reward[idx[broke], k[broke]], roll.terminal[idx[broke], k[broke]] = 0.0, True
+            wb, kb = idx[broke], k[broke]
+            trunc = roll.boot[wb, kb]   # (a branch's truncated end (DONE_BRANCH): closed here as always)
+            # (any other open decision: the episode broke off (its game / worker failed): a truncation as well, not a
+            #  death -- boot: only its value, for the decision before; never trained)
+            roll.reward[wb, kb], roll.terminal[wb, kb], roll.boot[wb, kb] = 0.0, trunc, True
             if roll.close_hurt is not None:   # 2026-11-03 (--aux-predict): an end of unknown outcome
-                roll.close_hurt[idx[broke], k[broke]], roll.close_ev[idx[broke], k[broke]] = 0.0, 0
-                roll.close_done[idx[broke], k[broke]] = CLOSE_BROKE
-            roll.open[idx[broke]] = -1
+                roll.close_hurt[wb, kb], roll.close_ev[wb, kb] = 0.0, 0
+                roll.close_done[wb, kb] = CLOSE_BROKE
+            roll.open[wb] = -1
             k = np.where(broke, -1, k)
+            if (~trunc).any():
+                self.close_broken(wb[~trunc])
         has = k >= 0
         if has.any():   # the reward of the decision before
             w, kk, d = idx[has], k[has], done[has]
@@ -1045,6 +1098,7 @@ class Episodes:
                 self.steps[w] += 1
             self.hurt[w] += hu
             self.damage[w] += dmg
+        self.note_first(rows, idx, first)
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
             self.gains[idx] = self.cur_gains(rows)
         if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
@@ -1142,6 +1196,10 @@ def _native_events(book, rows, idx, snap):
     self = book
     first = rows['first'] != 0
     done = rows['done'].astype(np.int64)
+    if snap.shape[1] > 34:   # (episodes that broke off at these first records: the consumer's second snapshot, flag 34)
+        for j in np.flatnonzero(first & (snap[:, 34] != 0)):
+            self.broken_line(idx[j], snap[j, 17:34])
+    self.note_first(rows, idx, first)
     if (self.run or self.items) and first.any():
         if self.items:
             for j in np.flatnonzero(first):
@@ -1434,6 +1492,9 @@ def require_mps_client():
         if str(os.getpid()) in clients:
             return int(server)
     raise RuntimeError('this CUDA process is not registered with the requested MPS server')
+
+
+STATES_PER_UPDATE = 64   # (a resumed run's start-seed offset per update done: a bound on the start states a worker builds)
 
 
 def main(argv=None, child=None, actor=None):
@@ -2024,6 +2085,11 @@ def main(argv=None, child=None, actor=None):
     args = p.parse_args(argv)
     shard_world = int(os.environ.get('ISAAC_SHARD_WORLD', '1') or 1)   # BM1 C: K shards as one run (shard_sync)
     shard_rank = int(os.environ.get('ISAAC_SHARD_RANK', '0') or 0) if shard_world > 1 else 0
+    seed_games = args.seed   # (the workers' start seeds: from the unshifted seed, interleaved across the shards below)
+    # (a resumed run: the start states continue past every one it may have used -- each worker's n restarts at 0 in a new
+    #  process; STATES_PER_UPDATE bounds the start states a worker builds per update, ~1 in the timed configuration)
+    resume_update = (int(torch.load(args.resume, map_location='cpu', weights_only=False).get('update', 0) or 0)
+                     if args.resume else 0)
     if shard_world > 1:   # (every rank its own games and draws; rank 0's weights are broadcast at the start)
         args.seed += 7340033 * shard_rank
         print(f'BM1 C shard {shard_rank} of {shard_world}: seed {args.seed}, learning rate x {args.shard_lr_mult}',
@@ -2309,7 +2375,8 @@ def main(argv=None, child=None, actor=None):
                            assign=assign[w_lo:w_lo + n_loc] if in_actor else assign,
                            frames_per_decision=args.frames_per_decision,
                            episodes_per_state=args.episodes_per_state, episode_seconds=args.episode_seconds,
-                           start_hp=(lo, hi), seed=args.seed + 1000003 * aid, name=args.name + (f'a{aid}' if aid else ''),
+                           start_hp=(lo, hi), seed=seed_games + 1000003 * aid, name=args.name + (f'a{aid}' if aid else ''),
+                           state_base=resume_update * STATES_PER_UPDATE, seed_stride=shard_world, seed_phase=shard_rank,
                            port=args.port + w_lo,
                            teacher=args.teacher, teacher_share=args.teacher_share, teacher_queue=args.teacher_queue,
                            teacher_slots=(max(1, args.teacher_slots // n_act) if args.teacher_slots else 0),
@@ -2569,6 +2636,7 @@ def main(argv=None, child=None, actor=None):
     if shard_world > 1:
         if proc or args.actor_processes > 1 or os.environ.get('ISAAC_RL_LEARNER_BENCH'):
             raise SystemExit('BM1 C (ISAAC_SHARD_WORLD > 1): the learner in this process, one actor process, no bench')
+        from isaac_bridge import shard_sync as shard_sync_mod
         from isaac_bridge.shard_sync import ShardSync
         SYNC = ShardSync.from_env(lm_dev).init()
         SYNC.broadcast_state([learner_model, pcritic, aux_head], [opt, popt, aopt])
@@ -3083,6 +3151,8 @@ def main(argv=None, child=None, actor=None):
         from isaac_bridge.tok_cf import TRIGGERS as CF_TRIGGERS, t_split
         v2_rng = np.random.default_rng([args.seed, 0x7E2])   # its own: the teacher's draws stay as without
     target_decisions = decisions_total + int(args.game_hours / hours_per_decision)
+    if os.environ.get('ISAAC_GAME_HOURS_TOTAL'):   # (train_guard.sh: the run's total, every resume included -- not
+        target_decisions = int(float(os.environ['ISAAC_GAME_HOURS_TOTAL']) / hours_per_decision)   # this start's)
     if args.max_updates:
         target_decisions = decisions_total + args.max_updates * args.rollout
     start_decisions = decisions_total
@@ -3093,6 +3163,8 @@ def main(argv=None, child=None, actor=None):
             if not path.name.startswith('last'):
                 return
             path = path.with_name(f'{path.stem}-rank{SYNC.rank}{path.suffix}')
+        path = Path(path)
+        tmp_ = path.with_name(path.name + '.tmp')
         torch.save(dict(model=learner_model.state_dict(), optimizer=opt.state_dict(), update=L['update'],
                         decisions=L['decisions'], seconds=L['seconds'], config=learner_model.config, args=vars(args),
                         steady_updates=L.get('steady_updates',0),
@@ -3101,7 +3173,8 @@ def main(argv=None, child=None, actor=None):
                            if aux_head is not None else {}),
                         **(dict(priv=dict(model=pcritic.state_dict(), opt=popt.state_dict()))
                            if pcritic is not None else {})),
-                   path)
+                   tmp_)
+        os.replace(tmp_, path)   # (atomic: a kill during the write leaves the previous file whole, never a torn one)
 
     b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
     # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
@@ -4198,7 +4271,7 @@ def main(argv=None, child=None, actor=None):
                                     aux_acc_ev=aux_acc_ev if aux_on else None, bwd_calls='learn_bwd_calls',
                                     bwd_span='learn_bwd')
         CX2 = None
-        shard_s0 = dict(SYNC.stats) if SYNC is not None else None   # (BM1 C: this update's share of the counters)
+        shard_s0 = dict(SYNC.drain()) if SYNC is not None else None   # (BM1 C: this update's share of the counters)
         if p2_mode == 'two':   # the replicas get the learner's parameters; the second card's accumulators
             P2.bind()
             p2_s0 = dict(P2.stats)
@@ -4772,8 +4845,8 @@ def main(argv=None, child=None, actor=None):
         row.update({f'uc_{k}': v for k, v in UC.items()})   # (B60)
         if SYNC is not None:   # BM1 C: K, the learning rate's factor and value, this update's steps (zero-weight ones
             # among them), the global rows per step, the seconds waiting for the slowest rank / reducing, the checks
-            st_ = SYNC.stats
-            row.update(shard_world=SYNC.world, shard_rank=SYNC.rank, shard_lr_mult=args.shard_lr_mult,
+            st_ = SYNC.drain()   # (the steps' CUDA-event times read now: the update has ended)
+            row.update(shard_hostsync=int(shard_sync_mod.HOSTSYNC), shard_world=SYNC.world, shard_rank=SYNC.rank, shard_lr_mult=args.shard_lr_mult,
                        shard_frac=L.get('shard_frac', 0.0), shard_steps=st_['steps'] - shard_s0['steps'],
                        shard_pad_steps=st_['pad_steps'] - shard_s0['pad_steps'],
                        shard_rows_per_step=(st_['rows'] - shard_s0['rows']) / max(1, st_['steps'] - shard_s0['steps']),
@@ -4790,6 +4863,21 @@ def main(argv=None, child=None, actor=None):
         if UO is not None:
             row.update({f'uo_{k}': v for k, v in UO.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
+        import shutil as shutil_
+        row['broken_episodes'] = len(job.get('broken', []))   # (this update's; the guard warns / stops on them)
+        row['broken_total'] = job.get('broken_total', 0)
+        row['disk_free_gb'] = shutil_.disk_usage(out).free / 2 ** 30   # (the training run: the guard warns / stops on it)
+        # (the container's memory: used without the inactive file cache, its limit, the kernel's OOM kills in it so
+        #  far; a warning line past 90 % of the limit -- the guard logs it too)
+        from isaac_bridge.cgroup_mem import cgroup_mem
+        cu_, cl_, ck_ = cgroup_mem()
+        row['ctr_mem_gb'] = '' if cu_ is None else cu_ / 2 ** 30
+        row['ctr_mem_limit_gb'] = '' if cl_ is None else cl_ / 2 ** 30
+        row['ctr_mem_frac'] = '' if cu_ is None or not cl_ else cu_ / cl_
+        row['ctr_oom_kills'] = '' if ck_ is None else ck_
+        if cu_ is not None and cl_ and cu_ > 0.9 * cl_:
+            print(f'WARNING container memory {cu_ / 2 ** 30:.1f} GB > 90 % of its limit {cl_ / 2 ** 30:.0f} GB '
+                  f'(update {upd})', flush=True)
         if run or items:   # 2026-10-06: run / item counters (absent in the other modes: their columns are unchanged)
             m_all = max(len(finished), 1)
             row.update({'items_taken': sum(e.get('items', 0) for e in finished),
@@ -5011,6 +5099,8 @@ def main(argv=None, child=None, actor=None):
         log_file.flush()
         for e in finished:
             episodes_path.write(json.dumps(dict(e, update=upd)) + '\n')
+        for e in job.get('broken', []):   # (episodes that broke off: their own lines, done DONE_BROKE, broken 1)
+            episodes_path.write(json.dumps(dict(e, update=upd)) + '\n')
         episodes_path.flush()
         if branch_path is not None:
             for e in job.get('branch_finished', []):
@@ -5026,7 +5116,55 @@ def main(argv=None, child=None, actor=None):
         L['log_s'] = t_ck - t_end
         if upd % args.checkpoint_every == 0:
             save(out / 'checkpoints' / f'update-{upd:06d}.pt')
+            if SYNC is None or SYNC.rank == 0:
+                rotate_checkpoints(out / 'checkpoints')
+        rotate_episodes()
         L['ckpt_s'] = time.perf_counter() - t_ck
+
+    def rotate_checkpoints(d):
+        """(the training configuration) ISAAC_CKPT_KEEP=N: the newest N update-*.pt kept, and every one whose update is a
+        multiple of ISAAC_CKPT_MILESTONE (a milestone); the others, by ISAAC_CKPT_ROTATE: 'trash' (default) moved to
+        ISAAC_CKPT_TRASH/<date>/, 'delete' deleted -- only files of this run's checkpoints directory named exactly
+        update-<6 digits>.pt, each one a line in <out>/checkpoint_rotation.log (name, size, update, what was done)."""
+        keep_ = int(os.environ.get('ISAAC_CKPT_KEEP', '0') or 0)
+        mode_ = os.environ.get('ISAAC_CKPT_ROTATE', 'trash')
+        trash_ = os.environ.get('ISAAC_CKPT_TRASH', '')
+        if keep_ <= 0 or mode_ not in ('trash', 'delete') or (mode_ == 'trash' and not trash_):
+            return
+        mile_ = int(os.environ.get('ISAAC_CKPT_MILESTONE', '0') or 0)
+        d = Path(d).resolve()
+        if d != (out / 'checkpoints').resolve():
+            return
+        from isaac_bridge.ckpt_rotation import rotation_drop, update_of   # (the choice: tests/test_ckpt_rotation.py)
+        names_ = [f_.name for f_ in d.iterdir() if f_.is_file()]
+        with open(out / 'checkpoint_rotation.log', 'a') as log_:
+            for n_ in rotation_drop(names_, keep_, mile_):
+                f_ = d / n_
+                u_ = update_of(n_)
+                size_ = f_.stat().st_size
+                if mode_ == 'delete':
+                    f_.unlink()
+                    what_ = 'deleted'
+                else:
+                    dst_ = Path(trash_) / time.strftime('%Y%m%d')
+                    dst_.mkdir(parents=True, exist_ok=True)
+                    os.replace(f_, dst_ / f'{out.name}-{f_.name}')
+                    what_ = f'moved to {dst_}'
+                log_.write(f"{time.strftime('%F %T')} {f_.name} {size_} bytes update {u_} {what_}" + chr(10))
+
+    def rotate_episodes():
+        """(the training configuration) ISAAC_EPISODES_ROTATE_MB: episodes.jsonl renamed episodes.<k>.jsonl past that size
+        and a new one begun (kept; progress.csv is never rotated)."""
+        nonlocal episodes_path
+        mb_ = float(os.environ.get('ISAAC_EPISODES_ROTATE_MB', '0') or 0)
+        if mb_ <= 0 or episodes_path.tell() < mb_ * 2 ** 20:
+            return
+        episodes_path.close()
+        k_ = 1
+        while (out / f'episodes.{k_}.jsonl').exists():
+            k_ += 1
+        os.replace(out / 'episodes.jsonl', out / f'episodes.{k_}.jsonl')
+        episodes_path = open(out / 'episodes.jsonl', 'a')
 
     # (BM1: the learner bench restores these too before each of its learn() calls: an update changes them)
     bench_extra = (('pcritic', pcritic), ('popt', popt), ('aux_head', aux_head), ('aopt', aopt), ('aux_norm', aux_norm))
@@ -6090,7 +6228,7 @@ def main(argv=None, child=None, actor=None):
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,
                        v2=sampler.v2_records(with_h=mem_on, with_t=t_on,with_block=block_on) if v2_on else None,
-                       branch_finished=book.branch_finished,
+                       branch_finished=book.branch_finished, broken=book.broken, broken_total=book.broken_total,
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,
                        dec_min=float(dec_w.min()), dec_max=float(dec_w.max()),
@@ -6147,6 +6285,7 @@ def main(argv=None, child=None, actor=None):
                 cpp_driver.use_rollout(roll.native_slot)
             book.finished = []
             book.branch_finished = []
+            book.broken = []
             busy = True
             if batch_on:
                 cpp_driver.set_busy(True)
@@ -6240,6 +6379,11 @@ def main(argv=None, child=None, actor=None):
             if slog is not None:
                 slog.close()
         if SYNC is not None:   # BM1 C: the run's synchronisation counters; the process groups closed
+            if SYNC.peer_lost is None:   # (an aborted run: its last events are not waited for)
+                try:
+                    SYNC.drain()
+                except Exception:
+                    pass
             print(f'BM1 C shard {SYNC.rank}: {SYNC.stats}' + (f'; rank {SYNC.peer_lost[0]} ended first'
                                                              if SYNC.peer_lost else ''), flush=True)
             SYNC.close()
