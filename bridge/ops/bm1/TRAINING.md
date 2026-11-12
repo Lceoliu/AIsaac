@@ -167,7 +167,13 @@ progress.csv 的列（括号里是预期值）：
 | `b42_learn_ckpt_segments` | 每轮的确定性检查次数 |
 | `errors` | 应为 0；每加 1000 表示一个 worker 进程死了 |
 
-**事件驱动的回报**（gpu57 上的只读监视脚本 + 本机的后台等待；没有事件时不唤醒，不轮询）：
+**事件驱动的回报**（gpu57 上的只读监视脚本 + 本机的后台等待；没有事件时不唤醒，不轮询）。启动训练后紧接着在 gpu57 上运行：
+
+```sh
+setsid nohup python3 /root/AIsaac/bm1/train_watch.py $RD > $RD/train_watch.out 2>&1 < /dev/null &
+```
+
+它每分钟只读一次 guard.log 和 progress/episodes 文件，把事件逐行追加到 `$RD/events.log`（`<序号> <时间> <类型> <内容>`，类型有 guard、u300、milestone、alert、end）。本机的等待命令只取上次之后的新行。监视脚本重启后会从 `train_watch.state` 接着走，已经报过的不会重报。事件包括：
 
 - 第 300 轮（约 2 小时）：内存是否在约 250 轮走平（ctr_mem_gb、trainer 和 workers 的 PSS）、block_gc_s 是否封顶、×实时走势、KL 和各头熵、学习率是否按曲线走、三个角色的实际比例、哈希不一致和稳态编译计数；
 - 每个里程碑（每 400 轮）：train_summary.py 的窗口表，加 KL 中位数、熵、×实时、内存；
