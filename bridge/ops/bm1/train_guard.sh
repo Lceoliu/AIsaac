@@ -120,10 +120,23 @@ print(u, e, t)" $(for r in $(seq 0 $((K-1))); do echo $RD/$NAME-s$r/progress.csv
         fi
       else bks_=0; fi
     fi
+    set -- $cm_   # (the memory row again: the block above set its own)
     if [ $# -ge 3 ] && awk "BEGIN {exit !($1 > 0.9)}" && [ $(( $(date +%s) - ${mwarned_:-0} )) -ge 600 ]; then
       mwarned_=$(date +%s)
       glog "WARNING container memory $(printf %.1f $2) GB = $(awk "BEGIN {printf \"%.0f\", 100 * $1}") % of its limit ${MEMG}g (update $3)"
     fi
+    # (worker processes alive, every rank's newest progress row (workers_live): a drop a warning, nothing more -- the
+    #  run goes on with the others, slower; none left ends the rank's run with an error)
+    wl_=$(for r in $(seq 0 $((K-1))); do python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); print((r[-1].get('workers_live') or '-') if r else '-', r[-1]['update'] if r else '-')" $RD/$NAME-s$r/progress.csv 2>/dev/null || echo "- -"; done | tr '\n' ' ')
+    set -- $wl_
+    r_=0; while [ $# -ge 2 ]; do
+      eval "pw_=\${wlp_$r_:-}"
+      if [ "$1" != "-" ] && [ -n "$pw_" ] && [ "$1" -lt "$pw_" ] 2>/dev/null; then
+        glog "WARNING rank $r_: worker processes alive $1 (were $pw_) at update $2 -- the run goes on with the others, slower"
+      fi
+      [ "$1" != "-" ] && eval "wlp_$r_=$1"
+      shift 2; r_=$((r_+1))
+    done
     # (no progress: while the attempt's container runs, a rank without a new progress row for STALL_S (600 s, about 14
     #  updates' time) -- STARTUP_STALL_S (1800 s) before its first row of the attempt: .stall, the trainers SIGINTed (they
     #  save last.pt), the container killed STALL_KILL_S (180 s) later if still there)
