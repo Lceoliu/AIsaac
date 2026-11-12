@@ -535,7 +535,19 @@ struct ActorDriver {
   ArenaReset reset; i64 scratch_row = 0, base = 0; i64 *step_host = nullptr; i64 heads = 0, nh = 0; i64 block_steps = 32;
   i64 owner_main = 0;
   std::vector<i64> ring_dec, ring_kv, ring_ver; std::vector<i64> ring_n;   // per arena row: the last block_steps decisions
-  i64 arena_rows = 0;
+  i64 arena_rows = 0;   // (the row ids: the main arena's rows, then with lane arenas of their own every lane row's id)
+  // (lane GPU, stage 1) the teacher generations' lane rows in arenas of their own (SlotBlockActor lane_arena='own'), one
+  // per generation, on the lane device: their rows keep their ids (rings, lineage heads: gen_base[g] + lane), the graphs
+  // and the arena tensors address them by the local row id - row0. Empty: the lane rows live in the main arena.
+  struct LaneArena { ArenaReset reset; i64 *step_host = nullptr; i64 row0 = 0, n = 0; };
+  std::vector<LaneArena> lane_arenas;
+  std::vector<int32_t> row_arena;   // per row id: -1 the main arena, g: generation g's lane arena (empty: all main)
+  i64 lane_dev = -1;                // the lane arenas' / lane stream's device (-1: the actor's, device_index)
+  i64 lane_device() const { return lane_dev >= 0 ? lane_dev : device_index; }
+  int arena_of(i64 row) const { return row_arena.empty() ? -1 : row_arena[row]; }
+  i64 local_row(i64 row) const { int a = arena_of(row); return a < 0 ? row : row-lane_arenas[a].row0; }
+  i64 &steph(i64 row) { int a = arena_of(row); return a < 0 ? step_host[row] : lane_arenas[a].step_host[row-lane_arenas[a].row0]; }
+  ArenaReset &reset_of(i64 row) { int a = arena_of(row); return a < 0 ? reset : lane_arenas[a].reset; }
   std::vector<i64> pending_cur;   // [W, nh] the action under way per worker
   // frame buckets
   std::vector<i64> bk_body, bk_entity, bk_inventory, bk_slots;
@@ -636,7 +648,30 @@ struct ActorDriver {
     ring_dec.assign(arena_rows*block_steps, -1); ring_kv.assign(arena_rows*block_steps, -1); ring_ver.assign(arena_rows*block_steps, -1);
     ring_n.assign(arena_rows, 0);
     if (n_workers) pending_cur.assign(n_workers*nh, 0);
+    lane_arenas.clear(); row_arena.clear(); lane_dev = -1;
   }
+  // (lane GPU, stage 1) generation g's lane rows (ids row0 .. row0 + n) in an arena of their own on device `dev`: its
+  // tensors (as set_arena's), its step_host. Set after set_arena and lanes_configure (row0 must be the generation's
+  // base); lane rows then never ride a main batch (M1 and the B54 merge off: two arenas, maybe two devices).
+  void set_lane_arena(i64 g, std::vector<at::Tensor> tensors, std::vector<i64> dims, std::vector<double> fills, i64 step_host_ptr,
+                      i64 row0, i64 n, i64 dev) {
+    TORCH_CHECK(!running.load() && !lrunning.load(), "set_lane_arena: before start / lanes_start");
+    TORCH_CHECK(g >= 0 && g < (i64)gen_base.size() && gen_base[g] == row0, "set_lane_arena: lanes_configure first; row0 must be the generation's base");
+    TORCH_CHECK(row0 >= 0 && n > 0 && row0+n <= arena_rows, "set_lane_arena: rows outside the row ids (set_arena's arena_rows)");
+    TORCH_CHECK(lane_dev < 0 || lane_dev == dev, "set_lane_arena: every lane arena on one device");
+    TORCH_CHECK(!tensors.empty() && tensors[0].device().index() == dev, "set_lane_arena: the tensors are not on device ", dev);
+    if (row_arena.empty()) row_arena.assign(arena_rows, -1);
+    if ((i64)lane_arenas.size() <= g) lane_arenas.resize(g+1);
+    for (i64 r = row0; r < row0+n; r++) {
+      TORCH_CHECK(row_arena[r] < 0 || row_arena[r] == g, "set_lane_arena: row ", r, " already in another lane arena");
+      row_arena[r] = (int32_t)g;
+    }
+    LaneArena &a = lane_arenas[g];
+    a.reset.tensors = tensors; a.reset.dims = dims; a.reset.fills = fills; a.step_host = (i64 *)step_host_ptr; a.row0 = row0; a.n = n;
+    lane_dev = dev;
+    lane_merge = false;
+  }
+  i64 lane_arena_count() const { i64 k = 0; for (auto &a : lane_arenas) k += a.step_host != nullptr; return k; }
   void set_pending(i64 worker, at::Tensor p) {   // (the consumer mirrors forced / branch resets if it ever needs to)
     p = p.to(at::kLong).contiguous();
     memcpy(&pending_cur[worker*nh], p.data_ptr<i64>(), nh*sizeof(i64));
@@ -870,7 +905,7 @@ struct ActorDriver {
   // the merged batch, the driver without main rows, other (merging off / a job Python steps)
   std::atomic<i64> n_m1_jobs{0}, n_m1_rows{0}, n_lo_jobs[5] = {{0}, {0}, {0}, {0}, {0}};
   std::vector<double> m1_wait_s;        // (per merged job: enqueue -> the main step that took it)
-  bool m1_on() const { return m1_merge && lanes_native && !lrunning.load() && running.load(); }
+  bool m1_on() const { return m1_merge && lanes_native && !lrunning.load() && running.load() && lane_arenas.empty(); }
   void m1_thread_check(const char *where) {
     TORCH_CHECK(std::this_thread::get_id() == drv_tid.load(), where, ": the M1 merge queue belongs to the driver thread");
   }
@@ -958,7 +993,9 @@ struct ActorDriver {
       rn = step-lo;
     }
     abpc::PageCore &pc = *store->core;
-    at::Tensor kv_t = reset.tensors[0];
+    ArenaReset &R = reset_of(row);   // (lane GPU stage 1: the row's arena, its local row id)
+    i64 lr = local_row(row);
+    at::Tensor kv_t = R.tensors[0];
     at::TensorOptions H = at::TensorOptions().pinned_memory(true);
     i64 n = (i64)p.kvs.size(), np_ = (i64)p.pdec.size(), m = (i64)p.bid.size();
     i64 kvb = pc.kv_row_bytes, ze = pc.z_elems, be = pc.b_elems;
@@ -979,7 +1016,7 @@ struct ActorDriver {
     }
     std::unique_ptr<c10::cuda::CUDAStreamGuard> test_guard;
     if (restore_test == 1) {   // (the control: the restore's copies on the lane stream behind a long kernel; nothing waits)
-      auto ls = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
+      auto ls = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)lane_device(), c10::DeviceType::CUDA);
       test_guard.reset(new c10::cuda::CUDAStreamGuard(ls));
     }
     reset_rows({row});
@@ -987,9 +1024,9 @@ struct ActorDriver {
     auto D = [&](at::Tensor x) { return x.to(dev, /*non_blocking=*/true); };
     // reset.tensors: kv, then BlockSlotState._rows: bank, partial, steps, kv_steps, kv_versions, bank_ends, bank_versions,
     // partial_sources, partial_versions, bank_sources, bank_source_versions
-    at::Tensor bank = reset.tensors[1], partial = reset.tensors[2], steps_t = reset.tensors[3], kv_steps = reset.tensors[4],
-               kv_versions = reset.tensors[5], bank_ends = reset.tensors[6], bank_versions = reset.tensors[7], partial_sources = reset.tensors[8],
-               partial_versions = reset.tensors[9], bank_sources = reset.tensors[10], bank_source_versions = reset.tensors[11];
+    at::Tensor bank = R.tensors[1], partial = R.tensors[2], steps_t = R.tensors[3], kv_steps = R.tensors[4],
+               kv_versions = R.tensors[5], bank_ends = R.tensors[6], bank_versions = R.tensors[7], partial_sources = R.tensors[8],
+               partial_versions = R.tensors[9], bank_sources = R.tensors[10], bank_source_versions = R.tensors[11];
     i64 lat = partial.size(2), wl = kv_steps.size(1), mb = bank.size(1);
     if (n) {
       at::Tensor st = at::from_blob(p.kv_steps.data(), {n}, at::kLong).clone();
@@ -997,29 +1034,29 @@ struct ActorDriver {
       at::Tensor colsd = D(cols.pin_memory());
       at::Tensor vals = D(kvh.narrow(0, 0, n*kvb).view(kv_t.scalar_type()).view({n, kv_t.size(0), kv_t.size(1), kv_t.size(3), lat, kv_t.size(5)}));
       vals = vals.permute({1, 2, 3, 0, 4, 5}).reshape({kv_t.size(0), kv_t.size(1), kv_t.size(3), n*lat, kv_t.size(5)});
-      kv_t.select(2, row).index_copy_(3, colsd, vals);
-      kv_steps.select(0, row).index_copy_(0, colsd, D(st.repeat_interleave(lat).pin_memory()));
-      kv_versions.select(0, row).index_copy_(0, colsd, D(kver.repeat_interleave(lat).pin_memory()));
+      kv_t.select(2, lr).index_copy_(3, colsd, vals);
+      kv_steps.select(0, lr).index_copy_(0, colsd, D(st.repeat_interleave(lat).pin_memory()));
+      kv_versions.select(0, lr).index_copy_(0, colsd, D(kver.repeat_interleave(lat).pin_memory()));
     }
     if (np_) {
-      partial.select(0, row).narrow(0, 0, np_).copy_(D(zh.narrow(0, 0, np_*ze).view({np_, lat, partial.size(3)})).to(partial.scalar_type()));
-      partial_versions.select(0, row).narrow(0, 0, np_).copy_(D(pver.pin_memory()));
-      partial_sources.select(0, row).narrow(0, 0, np_).copy_(D(at::from_blob(p.pdec.data(), {np_}, at::kLong).clone().pin_memory()));
+      partial.select(0, lr).narrow(0, 0, np_).copy_(D(zh.narrow(0, 0, np_*ze).view({np_, lat, partial.size(3)})).to(partial.scalar_type()));
+      partial_versions.select(0, lr).narrow(0, 0, np_).copy_(D(pver.pin_memory()));
+      partial_sources.select(0, lr).narrow(0, 0, np_).copy_(D(at::from_blob(p.pdec.data(), {np_}, at::kLong).clone().pin_memory()));
     }
     if (m) {
       at::Tensor ends = at::from_blob(p.ends.data(), {m}, at::kLong).clone();
       at::Tensor col = D(at::floor_divide(ends, block_steps).remainder(mb).pin_memory());
-      bank.select(0, row).index_copy_(0, col, D(bh.narrow(0, 0, m*be).view({m, bank.size(2), bank.size(3)})).to(bank.scalar_type()));
-      bank_ends.select(0, row).index_copy_(0, col, D(ends.pin_memory()));
-      bank_versions.select(0, row).index_copy_(0, col, D(bver.pin_memory()));
-      bank_sources.select(0, row).index_copy_(0, col, D(bsrc.pin_memory()));
-      bank_source_versions.select(0, row).index_copy_(0, col, D(bsrcv.pin_memory()));
+      bank.select(0, lr).index_copy_(0, col, D(bh.narrow(0, 0, m*be).view({m, bank.size(2), bank.size(3)})).to(bank.scalar_type()));
+      bank_ends.select(0, lr).index_copy_(0, col, D(ends.pin_memory()));
+      bank_versions.select(0, lr).index_copy_(0, col, D(bver.pin_memory()));
+      bank_sources.select(0, lr).index_copy_(0, col, D(bsrc.pin_memory()));
+      bank_source_versions.select(0, lr).index_copy_(0, col, D(bsrcv.pin_memory()));
     }
-    step_host[row] = p.step;
+    steph(row) = p.step;
     // (the control's long kernel goes right before the last write, the row's step counter: earlier, a pageable id copy
     // (reset_rows) or a pinned allocation (pin_memory) waits for the stream's work / the device and orders it again)
     if (restore_test == 1) at::cuda::sleep(4000000000LL);
-    steps_t.select(0, row).fill_(p.step);
+    steps_t.select(0, lr).fill_(p.step);
     memcpy(&ring_dec[row*block_steps], rdec.data(), block_steps*8); memcpy(&ring_kv[row*block_steps], rkv.data(), block_steps*8);
     ring_n[row] = rn;
     n_l_restores++; t_l_restore = t_l_restore+(now()-t0);
@@ -1115,10 +1152,12 @@ struct ActorDriver {
       }
       if (!to_reset.empty()) reset_rows(to_reset);
       bool any_complete = false;
-      for (i64 j = 0; j < k; j++) { steps_before[j] = step_host[jb.ids[j]]; complete[j] = (steps_before[j]+1) % block_steps == 0; any_complete |= complete[j]; }
+      for (i64 j = 0; j < k; j++) { steps_before[j] = steph(jb.ids[j]); complete[j] = (steps_before[j]+1) % block_steps == 0; any_complete |= complete[j]; }
       std::vector<float> u(k*heads);
       lane_uniforms(jb, u.data());
-      fill_and_run(*e, k, jb.rows.data(), row_stride, jb.pend.data(), jb.ids.data(), u.data(), jb.replay.data(), complete.data(), jb.version, any_complete);
+      std::vector<i64> lids(k);   // (the graph addresses its arena's local rows: a lane arena of its own starts at row0)
+      for (i64 j = 0; j < k; j++) lids[j] = local_row(jb.ids[j]);
+      fill_and_run(*e, k, jb.rows.data(), row_stride, jb.pend.data(), lids.data(), u.data(), jb.replay.data(), complete.data(), jb.version, any_complete);
       Record r;
       lane_record(r, jb, *e, 0, steps_before, first, complete, jb.version);
       write_part(*e, jb.rows.data(), 0, k, jb.ids, steps_before, complete, first, jb.pend.data(), jb.version, r);
@@ -1151,7 +1190,7 @@ struct ActorDriver {
   }
   bool lane_pass_body(double timeout) {
     i64 sid = (m1_merge && !lrunning.load() && std::this_thread::get_id() == drv_tid.load()) ? stream_id : lane_stream_id;
-    auto stream = c10::cuda::CUDAStream::unpack3(sid, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
+    auto stream = c10::cuda::CUDAStream::unpack3(sid, (c10::DeviceIndex)(sid == stream_id ? device_index : lane_device()), c10::DeviceType::CUDA);
     c10::cuda::CUDAStreamGuard guard(stream);
     double t = now();
     lc.control(t);
@@ -1243,7 +1282,7 @@ struct ActorDriver {
   void lane_test_intake(i64 lane, double now) { lc.intake(lane, now); }
   bool lane_test_tick(double now) {
     c10::InferenceMode inference;
-    auto stream = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
+    auto stream = c10::cuda::CUDAStream::unpack3(lane_stream_id, (c10::DeviceIndex)lane_device(), c10::DeviceType::CUDA);
     c10::cuda::CUDAStreamGuard guard(stream);
     lc.control(now);
     bool did = false;
@@ -1495,9 +1534,19 @@ struct ActorDriver {
     t_pause_s = t_pause_s+(now()-t0); n_pauses++;
   }
   void reset_rows(const std::vector<i64> &rows) {
-    at::Tensor ids = at::from_blob((void *)rows.data(), {(i64)rows.size()}, at::kLong).to(reset.tensors[0].device());
-    for (size_t k = 0; k < reset.tensors.size(); k++) reset.tensors[k].index_fill_(reset.dims[k], ids, reset.fills[k]);
-    for (i64 r : rows) { step_host[r] = 0; ring_n[r] = 0; }
+    if (lane_arenas.empty()) {
+      at::Tensor ids = at::from_blob((void *)rows.data(), {(i64)rows.size()}, at::kLong).to(reset.tensors[0].device());
+      for (size_t k = 0; k < reset.tensors.size(); k++) reset.tensors[k].index_fill_(reset.dims[k], ids, reset.fills[k]);
+    } else {   // (lane GPU stage 1: each arena's rows by their local ids, in the arenas' order)
+      std::map<int, std::vector<i64>> by;
+      for (i64 r : rows) by[arena_of(r)].push_back(local_row(r));
+      for (auto &kv : by) {
+        ArenaReset &R = kv.first < 0 ? reset : lane_arenas[kv.first].reset;
+        at::Tensor ids = at::from_blob(kv.second.data(), {(i64)kv.second.size()}, at::kLong).to(R.tensors[0].device());
+        for (size_t k = 0; k < R.tensors.size(); k++) R.tensors[k].index_fill_(R.dims[k], ids, R.fills[k]);
+      }
+    }
+    for (i64 r : rows) { steph(r) = 0; ring_n[r] = 0; }
   }
 
   void loop() {
@@ -1627,7 +1676,7 @@ struct ActorDriver {
         done_rows.push_back(j); ends.push_back(steps_before[o+j]);
         for (i64 q = 0; q < block_steps; q++) { src.push_back(rd[q]); srcver.push_back(rd[q] >= 0 ? dmeta[2*rk[q]+1] : -1); }
       }
-      step_host[row] += 1;
+      steph(row) += 1;
     }
     if (!done_rows.empty()) {
       i64 m = (i64)done_rows.size();
@@ -2096,6 +2145,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("set_stream", &ActorDriver::set_stream).def("set_seed", &ActorDriver::set_seed).def("set_version", &ActorDriver::set_version)
       .def("set_fixed_uniform", &ActorDriver::set_fixed_uniform)
       .def("set_buckets", &ActorDriver::set_buckets).def("set_sampler", &ActorDriver::set_sampler).def("set_arena", &ActorDriver::set_arena)
+      .def("set_lane_arena", &ActorDriver::set_lane_arena).def("lane_arena_count", &ActorDriver::lane_arena_count).def("lane_device", &ActorDriver::lane_device)
       .def("set_pending", &ActorDriver::set_pending).def("get_pending", &ActorDriver::get_pending)
       .def("register_graph", &ActorDriver::register_graph).def("has_graph", &ActorDriver::has_graph).def("n_graphs", &ActorDriver::n_graphs)
       .def("run_graph", &ActorDriver::run_graph)

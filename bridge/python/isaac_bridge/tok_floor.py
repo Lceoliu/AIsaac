@@ -1671,7 +1671,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             start_base = None   # B39: the starting room's restore point when the start was changed (below)
             try:
                 reseed = state_seed % (2 ** 31 - 1) + 1 if evaluation else int(rng.integers(1, 2 ** 31 - 1))
-                episode = src.fork(alarm=cfg.clone_alarm, reseed=reseed, lean=True)   # (under its lock, 2026-10-10)
+                episode = src.fork(alarm=cfg.clone_alarm, reseed=reseed, lean=True, purpose='episode')   # (under its lock, 2026-10-10)
                 start_mod = 0   # B39: the episode's start state differs from src's fork: 2 a no-active start, 1 a start
                 #                 build or a stat augmentation only; the starting room's restore point below
                 # B39 (2026-10-18): a no-active start (training: floor starts only, like the builds, archive entries
@@ -1711,7 +1711,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 # parked here instead, as at a room change (reseed None: the fork continues the episode's RNG).
                 # Unchanged starts keep src as before.
                 if rebase and start_mod > int(START_BASE_LEGACY):
-                    start_base = Parked(episode.fork(tag='snap', alarm=0), seed=src.info['seed'],
+                    start_base = Parked(episode.fork(tag='snap', alarm=0, purpose='snap'), seed=src.info['seed'],
                                         visited=tuple(src.info['visited']), stage0=src.info['stage0'], uses=0,
                                         boss=False, stage=src.info['stage0'])
                     trim_parked(start_base.clone, cfg, mine)
@@ -1840,7 +1840,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         if row['events'][0] & EV_EXIT:   # a run's next floor: its first room is always parked
                             keep = True
                         if keep or rebase:   # the episode as it enters this room, parked
-                            snap = Parked(episode.fork(tag='snap', alarm=0), seed=seed_now, visited=tuple(st.visited),
+                            snap = Parked(episode.fork(tag='snap', alarm=0, purpose='snap'), seed=seed_now, visited=tuple(st.visited),
                                           stage0=st.stage0, uses=0, boss=boss_entry, stage=st.stage0)
                             trim_parked(snap.clone, cfg, mine)   # cfg.trim_parked (on by default, 2026-10-06)
                             mine[ST['snaps']] += 1

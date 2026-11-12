@@ -876,6 +876,7 @@ def precapture_actor(actor, merged=True):
     import time as time_
     t = time_.perf_counter()
     made = 0
+    merged = merged and getattr(actor, 'lane_arena', 'shared') != 'own'   # (lanes in arenas of their own: no merged calls)
     with torch.autocast('cuda', dtype=torch.bfloat16, enabled=actor.bf16):
         if actor.step_graph is not None:
             # B46: a merged main + lane call (up to main + lane rows) replays the step graph too
@@ -1259,14 +1260,34 @@ class ActorStepGraph:
         return bo.numpy()[:n], bc[:n], bz[:n], z.dtype, written_c, bo[:n]
 
 
+def lane_arena_mode():
+    """(lane GPU) Where the teacher generations' lane rows live: 'shared' (default: in the main actor's arena, B46) or
+    'own' (an arena per generation on the lane device, ISAAC_BLOCK_LANE_ARENA=own; implied by a lane device other than
+    the actor's). With 'own' a lane row never rides a main batch (M1 / the B54 merge off)."""
+    v = os.environ.get('ISAAC_BLOCK_LANE_ARENA', 'shared')
+    if v not in ('shared', 'own'):
+        raise ValueError(f'ISAAC_BLOCK_LANE_ARENA={v!r}: shared or own')
+    return v
+
+
+def lane_device_of(device):
+    """(lane GPU) The lane rows' device: ISAAC_BLOCK_LANE_DEVICE (a torch device string, e.g. cuda:1, of this process's
+    visible devices), else the actor's `device`."""
+    v = os.environ.get('ISAAC_BLOCK_LANE_DEVICE', '')
+    return torch.device(v) if v else torch.device(device)
+
+
 class SlotBlockActor:
     """BlockActor's interface on dense GPU slots and paged snapshots."""
     def __init__(self, model, slots, graph_entities=0, bf16=False, store=None, arena=None, base=0, lane_slots=0,
-                 lane_generations=2):
+                 lane_generations=2, lane_arena=None):
         """B46: lane_slots > 0 (the main actor): its arena also holds lane_generations x lane_slots
         rows for the teacher-generation lane actors (lane_actor), so a merged main + lane call is
         one arena call (the main actor's step graph). arena / base: a lane actor's rows in the
-        main actor's arena start at base."""
+        main actor's arena start at base.
+        (lane GPU) lane_arena='own' (None: lane_arena_mode()): the lane actors get arenas of their own on the lane device
+        (lane_device_of); the main arena then holds the main rows only, and the row ids (rings, lineage heads: lin_rows)
+        continue past it, generation g's lanes at lane_row0(g) + lane (lin_base of its lane actor)."""
         if model.block_memory is None:
             raise ValueError('SlotBlockActor requires a block-memory policy')
         from .block_training import SpatialEncoderGraph, ReaderStepGraph
@@ -1280,16 +1301,30 @@ class SlotBlockActor:
         self.store = PagedStore(cfg, len(model.heads), kv_dtype) if store is None else store
         graph_step = bool(graph_entities) and STEP_GRAPH and device.type == 'cuda'
         self.n_slots, self.base = int(slots), int(base)
+        self.lin_base = self.base   # (the row ids of this actor's slots: lin_base + slot; a lane arena of its own: lane_actor)
+        self.lane_arena, self.lane_device = 'shared', device
         if arena is None:
             # B42 glue 5: one extra arena row (the scratch row padded graph rows address).
             self.lane_slots, self.lane_generations = int(lane_slots), int(lane_generations)
-            # (B58d: with the lane pool on, a second scratch row for the lane graphs: they replay concurrently with the main
-            # graphs on another stream, and their padded rows must not share a row with the main graphs')
-            total = slots+self.lane_slots*self.lane_generations+int(graph_step)+int(graph_step and self.lane_slots > 0 and LANE_POOL)
-            self.state = BlockSlotState(cfg, total, device=device, kv_dtype=kv_dtype)
+            if self.lane_slots > 0:
+                self.lane_arena = lane_arena_mode() if lane_arena is None else str(lane_arena)
+                self.lane_device = lane_device_of(device)
+                if self.lane_device != device:
+                    self.lane_arena = 'own'   # (a lane device of its own: arenas of their own)
+            if self.lane_arena == 'own':
+                total = slots+int(graph_step)
+                self.state = BlockSlotState(cfg, total, device=device, kv_dtype=kv_dtype)
+                self.lin_rows = total+self.lane_slots*self.lane_generations
+            else:
+                # (B58d: with the lane pool on, a second scratch row for the lane graphs: they replay concurrently with the main
+                # graphs on another stream, and their padded rows must not share a row with the main graphs')
+                total = slots+self.lane_slots*self.lane_generations+int(graph_step)+int(graph_step and self.lane_slots > 0 and LANE_POOL)
+                self.state = BlockSlotState(cfg, total, device=device, kv_dtype=kv_dtype)
+                self.lin_rows = total
         else:
             self.lane_slots, self.lane_generations = 0, 0
             self.state = arena
+            self.lin_rows = arena.slots
         self.step_graph = ActorStepGraph(self) if graph_step else None
         self.logs = [EpisodeLog(None) for _ in range(slots)]
         self.store.roots.append(weakref.WeakMethod(self._live))
@@ -1303,15 +1338,29 @@ class SlotBlockActor:
     def _live(self):
         return [(log, int(step)) for log, step in zip(self.logs, self.state.step_host[self.base:self.base+self.n_slots])]
 
+    def lane_row0(self, generation):
+        """(lane GPU) The first row id of generation g's lanes with lane arenas of their own."""
+        return self.state.slots+int(generation)*self.lane_slots
+
     def lane_actor(self, model, slots, generation=None):
         """A teacher-generation actor sharing this actor's page store (merged batches allowed). B46:
         with room in this actor's arena (lane_slots), generation g's lanes are its rows
-        n_slots + g * lane_slots + lane: a merged main + lane call replays the main step graph."""
+        n_slots + g * lane_slots + lane: a merged main + lane call replays the main step graph.
+        (lane GPU) lane_arena 'own': an arena of its own on the model's device (the lane device), its row ids
+        lane_row0(g) + lane."""
         arena = base = None
-        if generation is not None and 0 <= int(generation) < self.lane_generations and slots <= self.lane_slots:
+        fits = generation is not None and 0 <= int(generation) < self.lane_generations and slots <= self.lane_slots
+        own = fits and self.lane_arena == 'own'
+        if own:
+            mdev = next(model.parameters()).device
+            if mdev != self.lane_device:
+                raise ValueError(f'lane_actor: the generation model is on {mdev}, the lane device is {self.lane_device}')
+        elif fits:
             arena, base = self.state, self.base+self.n_slots+int(generation)*self.lane_slots
         lane = SlotBlockActor(model, slots, graph_entities=self.graph_entities, bf16=self.bf16, store=self.store,
                               arena=arena, base=base or 0)
+        if own:
+            lane.lin_base = self.lane_row0(generation)
         lane.device_result = self.device_result
         if lane.step_graph is not None and LANE_POOL:   # (B58d: the lane graphs in a pool of their own)
             lane.step_graph.pool_tag = 'lane'

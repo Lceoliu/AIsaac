@@ -64,14 +64,14 @@ def lane_sampler():
     return s
 
 
-def world(native, lane_pipes=False):
+def world(native, lane_pipes=False, lane_arena='shared'):
     torch.manual_seed(77)
     m = make_policy('cuda').eval()
     m1 = copy.deepcopy(m)
     with torch.no_grad():
         for p_ in m1.parameters():
             p_.mul_(1.01)
-    main = SlotBlockActor(m, W, graph_entities=128, bf16=True, lane_slots=W, lane_generations=2)
+    main = SlotBlockActor(m, W, graph_entities=128, bf16=True, lane_slots=W, lane_generations=2, lane_arena=lane_arena)
     rng = np.random.default_rng(77)
     nh = len(m.heads)
     d = ms = None
@@ -96,7 +96,7 @@ def world(native, lane_pipes=False):
     if native:
         st = main.store
         cfg = m.block_memory.config
-        st.native.lineage_configure(int(cfg.window), int(cfg.block_steps), int(cfg.memory_blocks), nh, int(main.state.slots), W,
+        st.native.lineage_configure(int(cfg.window), int(cfg.block_steps), int(cfg.memory_blocks), nh, int(main.lin_rows), W,
                                     [2, 4], 8)
         st.native.lineage_status(int(s.block_arrays[0].ctypes.data))
         for q in range(W):   # (the main lineage into the native one)
@@ -118,7 +118,9 @@ def world(native, lane_pipes=False):
         pipes = [socket.socketpair() for _ in range(W)] if lane_pipes else []
         w_pipes = pipes
         d.lanes_configure(cfg_l, sh, [a_.fileno() for a_, _ in pipes], int(stream.stream_id), [int(svc.actors[g].step_graph.owner) for g in (0, 1)],
-                          [int(svc.actors[g].base) for g in (0, 1)])
+                          [int(svc.actors[g].lin_base) for g in (0, 1)])
+        from isaac_bridge.block_driver import set_lane_arenas
+        set_lane_arenas(d, main, [svc.actors[g] for g in (0, 1)])
         svc.attach_driver(d)
         svc.attach_native_lanes(d, stream)
         w.stream = stream
@@ -217,7 +219,7 @@ def compare(A, B, k):
     for g, ga in A.svc.actors.items():   # each lane's lineage (log window at its step)
         for lane in range(W):
             la = ga.logs[lane]
-            row = ga.base+lane
+            row = B.svc.actors[g].lin_base+lane   # (B's row id: its lane arena may be its own)
             end = B.store.native.lin_head_end(row)
             if la.episode is None and la.n == 0:
                 assert end in (-1, 0), (g, lane, end)
@@ -238,7 +240,12 @@ def compare(A, B, k):
 
 
 def test_native_lane_service_matches_python_lane_service():
-    A, B = world(False), world(True)
+    run_script(world(False), world(True), compare)
+
+
+def run_script(A, B, cmp):
+    """The scripted rounds (injected clock) on worlds A and B (A Python or native, B native), cmp(A, B, round) after
+    each (also test_b59_lane_arena: the lane rows in the main arena against arenas of their own)."""
     for w in (A, B):
         w.defer = 1e9
         capture(w, 0, 0, 0)            # (generation 0: version 0)
@@ -262,7 +269,7 @@ def test_native_lane_service_matches_python_lane_service():
         for w in (A, B):
             if events:
                 events(w)
-            if B is w:
+            if w.d is not None:
                 w.d.set_lane_force_python(-2 if force_python is True else (-1 if force_python is False else int(force_python)))
         for i, (lane, begin, replay, repeat, _) in enumerate(reqs):
             sq = seq[0]-1 if repeat else seq[0]
@@ -272,7 +279,7 @@ def test_native_lane_service_matches_python_lane_service():
                 request(w, lane, rows[i], pend[i], sq, begin, replay, now)
         for w in (A, B):
             tick(w, now)
-        compare(A, B, k)
+        cmp(A, B, k)
 
     t = 1.0
     round_(1, [(0, 1, 0, 0, 0), (1, BANK+1, 0, 0, 0), (2, 2*BANK+1, 0, 0, 0)], t)                  # begins, two generations
@@ -290,10 +297,13 @@ def test_native_lane_service_matches_python_lane_service():
     round_(7, [(3, 0, 0, 0, 1), (2, 0, 0, 0, 0)], t+6,
            events=lambda w: setattr(w.main, 'version', 1) or (w.d.set_version(1) if w.d is not None else None))  # first row; main version 1
     round_(8, [(2, 0, 0, 0, 0), (3, 0, 0, 0, 0)], t+7, force_python=True)                           # kind 5: stepped in Python
-    A.defer = 0.0
-    B.d.set_lane_defer(0.0)
+    for w in (A, B):
+        w.defer = 0.0
+        if w.d is not None:
+            w.d.set_lane_defer(0.0)
     round_(9, [(0, 5, 0, 0, 0), (2, 0, 0, 0, 0)], t+8)                                              # a point that never comes
-    assert A.s.lane_out[0, 5] == -1 and A.svc.stat.get('lane_orphan_requests', 0) == 1 and B.d.lane_counters()['orphan'] == 1
+    orphan_a = A.svc.stat.get('lane_orphan_requests', 0) if A.d is None else A.d.lane_counters()['orphan']
+    assert A.s.lane_out[0, 5] == -1 and orphan_a == 1 and B.d.lane_counters()['orphan'] == 1
     # both generations pinned (versions 0 and 1): a capture at version 2 refused in both worlds (status -1)
     assert capture(A, 1*BANK+1, 1, 2) is False and capture(B, 1*BANK+1, 1, 2) is False
     def ver(v):
