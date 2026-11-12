@@ -1036,18 +1036,39 @@ def _prepare_packed(model, chunks, grad, generator=None, train_history=True, ver
                 unique=unique, version=version)
 
 
-def _compiles():
-    """block_compile's compile count (every graph the dynamo backend compiled, warm-up and steady)."""
-    from .block_compile import STATS
-    return STATS['compiles']
+def _compiles(dev=None):
+    """block_compile's compile count (every graph the dynamo backend compiled, warm-up and steady); with dev, only
+    the graphs whose inputs are on that device (another card's thread compiling meanwhile does not count)."""
+    from .block_compile import STATS, DEV_COMPILES
+    return STATS['compiles'] if dev is None else DEV_COMPILES.get(str(dev), 0)
 
 
-def _spatial_segment(model, part):
+class _SegToken:
+    """One checkpointed Spatial call: its first run is the forward, a later one the backward's recomputation."""
+    __slots__ = ('runs', '__weakref__')
+
+    def __init__(self):
+        self.runs = 0
+
+
+def _spatial_segment(model, part, token=None):
     """model.encode_block(part) inside an NVTX range 'learner.spatial' (B62: the B2 measurement of the Spatial
-    segments' dispatch gaps; the forward and the backward's recomputation; a no-op without ISAAC_BLOCK_NVTX)."""
+    segments' dispatch gaps; the forward and the backward's recomputation; a no-op without ISAAC_BLOCK_NVTX).
+    token (a checkpointed call): on its recomputation a graph compiled on this device means the recomputation ran
+    another graph than the forward; the gradient would be computed from the wrong saved tensors and is already being
+    accumulated, so the run stops here (no redo is possible in the backward)."""
     nv_push('learner.spatial')
     try:
-        return model.encode_block(part)
+        if token is None:
+            return model.encode_block(part)
+        token.runs += 1
+        dev = next(model.parameters()).device
+        c0 = _compiles(dev)
+        out = model.encode_block(part)
+        if token.runs > 1 and _compiles(dev) != c0:
+            raise RuntimeError('BM1: a graph was compiled during the backward recomputation of a checkpointed '
+                               'Spatial segment (its forward ran another graph): the gradient would be wrong; stopped')
+        return out
     finally:
         nv_pop()
 
@@ -1083,10 +1104,11 @@ def _run_packed(model, P):
             #  graph, the forward ran the first call's other path; they save different tensors and the backward
             #  unpacks the wrong ones -- fp32check3, CheckpointError with the determinism check on. Redo the segment
             #  now that the graph exists; its first output is dropped and never backpropagated)
+            dev_ = next(model.parameters()).device
             for try_ in range(3):
-                c0_ = _compiles()
-                z_ = checkpoint(_spatial_segment, model, part, **CKPT_KW)
-                if _compiles() == c0_:
+                c0_ = _compiles(dev_)
+                z_ = checkpoint(_spatial_segment, model, part, _SegToken(), **CKPT_KW)
+                if _compiles(dev_) == c0_:
                     break
                 bp.ucount('learn_ckpt_compile_redo', 1)
             else:
