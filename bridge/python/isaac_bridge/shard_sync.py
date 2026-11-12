@@ -28,6 +28,7 @@ import torch.distributed as dist
 
 
 HOSTSYNC = os.environ.get('ISAAC_SHARD_HOSTSYNC', '0') == '1'
+MISMATCH_STOP = int(os.environ.get('ISAAC_SHARD_MISMATCH_STOP', '3'))   # consecutive hash mismatches that stop the run
 
 
 def _int_view(t):
@@ -274,8 +275,12 @@ class ShardSync:
         self.stats['checks'] += 1
         vals = [int(x.item()) for x in hs]
         if len(set(vals)) == 1:
+            self._consec = 0
             return False, list(extra_arrays)
         self.stats['mismatches'] += 1
+        self._consec = getattr(self, '_consec', 0) + 1
+        if self._consec >= MISMATCH_STOP:   # (not an accident: a determinism problem; the run stops, a person looks)
+            raise RuntimeError(f'BM1 C: the state hashes of the ranks differed in {self._consec} consecutive checks {vals}')
         print(f'shard {self.rank}: state hashes differ {vals}: rank 0\'s broadcast', flush=True)
         if not restore:
             return True, list(extra_arrays)

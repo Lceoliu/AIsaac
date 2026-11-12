@@ -42,8 +42,8 @@ while :; do
   [ -z "$PIDS" ] && break
   if [ -n "$first" ]; then
     el=$(( $(date +%s) - first ))
-    if [ $el -ge $(( ${GRACE:-90} + 120 )) ]; then pkill -KILL -f "train_tok.py .*--out $BM1_IN/reports/$TAG-s"
-    elif [ $el -ge ${GRACE:-90} ]; then pkill -INT -f "train_tok.py .*--out $BM1_IN/reports/$TAG-s"; fi
+    if [ $el -ge $(( ${GRACE:-90} + 120 )) ]; then pkill -KILL -f "train_tok.py .*--out ${OUTDIR:-$BM1_IN/reports}/$TAG-s"
+    elif [ $el -ge ${GRACE:-90} ]; then pkill -INT -f "train_tok.py .*--out ${OUTDIR:-$BM1_IN/reports}/$TAG-s"; fi
   fi
   sleep 2
 done

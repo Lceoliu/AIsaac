@@ -56,6 +56,10 @@ SPATIAL_ROWS = int(os.environ.get('ISAAC_LEARN_SPATIAL_ROWS', '4096'))
 # ISAAC_LEARN_CKPT_LEAN=0: the B44-B60 call.
 LEAN_CKPT_KW = dict(use_reentrant=False, preserve_rng_state=False, determinism_check='none')
 CKPT_KW = LEAN_CKPT_KW if os.environ.get('ISAAC_LEARN_CKPT_LEAN', '1') == '1' else dict(use_reentrant=False)
+# (the training configuration, 2026-11-12: the lean checkpoint with torch's determinism check, a recomputation that
+#  saves other tensors than its forward raises CheckpointError instead of unpacking the wrong ones; fp32check3 / 5)
+if os.environ.get('ISAAC_LEARN_CKPT_DET', '0') == '1':
+    CKPT_KW = dict(CKPT_KW, determinism_check='default')
 
 
 class _PrepLock:

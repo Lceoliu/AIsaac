@@ -10,7 +10,7 @@
 #   EXTRA, EXTRA2, EXTRA3: flags added at the end (one each: docker -e values carry no spaces; a later flag wins)
 BM=${BM1_IN:-/bench/bm1}   # (bm1 as the runner sees it: run.sh passes BM1_IN; the 8x3090 container default)
 TAG=${1:-xnew-a1}
-OUT=$BM/reports/$TAG
+OUT=${OUTDIR:-$BM/reports}/$TAG   # (OUTDIR: a training run's own directory, e.g. /bench/train/<name>)
 LIMIT=${2:-7200}
 HOURS=${3:-125}
 PY=${BM1_PY:-/bench/home/isaac-abplus/.venv/bin/python}

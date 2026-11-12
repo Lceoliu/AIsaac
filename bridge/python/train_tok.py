@@ -5036,7 +5036,44 @@ def main(argv=None, child=None, actor=None):
         L['log_s'] = t_ck - t_end
         if upd % args.checkpoint_every == 0:
             save(out / 'checkpoints' / f'update-{upd:06d}.pt')
+            if SYNC is None or SYNC.rank == 0:
+                rotate_checkpoints(out / 'checkpoints')
+        rotate_episodes()
         L['ckpt_s'] = time.perf_counter() - t_ck
+
+    def rotate_checkpoints(d):
+        """(the training configuration) ISAAC_CKPT_KEEP=N: the newest N update-*.pt kept, and every one whose update is a
+        multiple of ISAAC_CKPT_MILESTONE (a milestone); the others moved to ISAAC_CKPT_TRASH/<date>/ (nothing deleted)."""
+        keep_ = int(os.environ.get('ISAAC_CKPT_KEEP', '0') or 0)
+        trash_ = os.environ.get('ISAAC_CKPT_TRASH', '')
+        if keep_ <= 0 or not trash_:
+            return
+        mile_ = int(os.environ.get('ISAAC_CKPT_MILESTONE', '0') or 0)
+        files_ = sorted(Path(d).glob('update-*.pt'))
+        for f_ in files_[:-keep_]:
+            try:
+                u_ = int(f_.stem.split('-')[1])
+            except ValueError:
+                continue
+            if mile_ and u_ % mile_ == 0:
+                continue
+            dst_ = Path(trash_) / time.strftime('%Y%m%d')
+            dst_.mkdir(parents=True, exist_ok=True)
+            os.replace(f_, dst_ / f'{out.name}-{f_.name}')
+
+    def rotate_episodes():
+        """(the training configuration) ISAAC_EPISODES_ROTATE_MB: episodes.jsonl renamed episodes.<k>.jsonl past that size
+        and a new one begun (kept; progress.csv is never rotated)."""
+        nonlocal episodes_path
+        mb_ = float(os.environ.get('ISAAC_EPISODES_ROTATE_MB', '0') or 0)
+        if mb_ <= 0 or episodes_path.tell() < mb_ * 2 ** 20:
+            return
+        episodes_path.close()
+        k_ = 1
+        while (out / f'episodes.{k_}.jsonl').exists():
+            k_ += 1
+        os.replace(out / 'episodes.jsonl', out / f'episodes.{k_}.jsonl')
+        episodes_path = open(out / 'episodes.jsonl', 'a')
 
     # (BM1: the learner bench restores these too before each of its learn() calls: an update changes them)
     bench_extra = (('pcritic', pcritic), ('popt', popt), ('aux_head', aux_head), ('aopt', aopt), ('aux_norm', aux_norm))
