@@ -22,20 +22,26 @@ NAMES = ('other', 'episode', 'snap', 'hurt', 'fatal', 'random', 'cf', 'fork_many
 FIELDS = ('forks', 'fork_wall_ns', 'fork_sys_wall_ns', 'fork_cpu_ns', 'fork_wall_max_ns', 'rss_kb', 'pte_kb', 'maps', 'maps_n',
           'clones', 'frames', 'cpu_start_ns', 'cpu_sim_ns', 'flt_start', 'flt_sim', 'exits',
           'reaped', 'cpu_total_ns', 'cpu_teardown_ns', 'reaped_noexit', 'cpu_noexit_ns')
-HEAD = struct.Struct('<8s7Q')
+HEAD = struct.Struct('<8s7Q')      # (v1 / v2)
+HEAD3 = struct.Struct('<8s9Q')     # (v3: + vis_checks, vis_mismatches)
 
 
 def read(path):
     with open(path, 'rb') as f:
         raw = f.read()
     magic, version, root, n_p, n_f, n_slots, lost, _ = HEAD.unpack_from(raw, 0)
-    if magic != b'ABPCLST1' or version not in (1, 2):   # (2: whole CPU without the clone's reaped children)
-        raise ValueError(f'{path}: not an ABP_CLONE_STATS v1 / v2 file')
-    vals = struct.unpack_from(f'<{n_p*n_f}Q', raw, HEAD.size)
+    if magic != b'ABPCLST1' or version not in (1, 2, 3):   # (2: whole CPU without the clone's reaped children; 3: G)
+        raise ValueError(f'{path}: not an ABP_CLONE_STATS v1-v3 file')
+    vis = (0, 0)
+    head = HEAD.size
+    if version >= 3:
+        vis = HEAD3.unpack_from(raw, 0)[7:9]
+        head = HEAD3.size
+    vals = struct.unpack_from(f'<{n_p*n_f}Q', raw, head)
     out = {}
     for p in range(n_p):
         out[NAMES[p] if p < len(NAMES) else f'p{p}'] = {FIELDS[k]: vals[p*n_f+k] for k in range(min(n_f, len(FIELDS)))}
-    return out, dict(root=root, slots_lost=lost)
+    return out, dict(root=root, slots_lost=lost, vis_checks=vis[0], vis_mismatches=vis[1])
 
 
 def files(args):
@@ -47,10 +53,11 @@ def files(args):
 
 
 def summed(paths):
-    tot, meta = {}, dict(files=0, slots_lost=0)
+    tot, meta = {}, dict(files=0, slots_lost=0, vis_checks=0, vis_mismatches=0)
     for path in paths:
         t, m = read(path)
         meta['files'] += 1; meta['slots_lost'] += m['slots_lost']
+        meta['vis_checks'] += m['vis_checks']; meta['vis_mismatches'] += m['vis_mismatches']
         for p, d in t.items():
             acc = tot.setdefault(p, dict.fromkeys(FIELDS, 0))
             for k, v in d.items():
@@ -61,7 +68,8 @@ def summed(paths):
 def report(tot, meta):
     def r(a, b, scale=1.0):
         return f'{a/b*scale:9.3f}' if b else f'{"-":>9s}'
-    print(f'files {meta["files"]}, exit slots lost {meta["slots_lost"]}')
+    print(f'files {meta["files"]}, exit slots lost {meta["slots_lost"]}, native visible checks {meta["vis_checks"]} '
+          f'mismatches {meta["vis_mismatches"]}')
     print(f'{"purpose":10s} {"forks":>7s} {"clones":>7s} {"exits":>7s} {"reaped":>7s} {"noexit":>6s} {"frames":>9s} {"fr/clone":>9s} '
           f'{"start ms":>9s} {"sim ms":>9s} {"tear ms":>9s} {"whole ms":>9s} {"us/frame":>9s} {"flt st":>9s} {"flt sim":>9s}')
     for p in NAMES:

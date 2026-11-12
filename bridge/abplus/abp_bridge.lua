@@ -1700,9 +1700,9 @@ ABP_NATIVE_OBS = { available = native_lean ~= nil, native = 0, fallbacks = 0, la
 -- 1 native (and the native step's fast path takes the block along: native_step_obs), 2 check (both built, the Lua one
 -- sent; their json.decode compared: ABP_NATIVE_VIS.mismatches, the first difference kept).
 local native_visible = native_lean ~= nil and type(abp_native_visible) == "function" and abp_native_visible or nil
-state.native_visible = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_VISIBLE") or "0")) or 0
+-- (the mode lives in the global ABP_NATIVE_VIS.mode: probes switch it in one clone with a lua command)
 ABP_NATIVE_VIS = { available = native_visible ~= nil, native = 0, fallbacks = 0, last_fallback = nil, checks = 0,
-	mismatches = 0, first = nil, step = 0 }
+	mismatches = 0, first = nil, step = 0, mode = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_VISIBLE") or "0")) or 0 }
 -- Terrain block cache (2026-10-04, same VERSION: the bytes on the wire are unchanged). The lean terrain check resends
 -- the terrain block every LEAN_FULL_EVERY logic frames once anything in the room changed (a full pass after a change
 -- clears the full signature), each time built anew in Lua: the cells' tables and two json.encode, the costliest thing
@@ -2022,7 +2022,7 @@ end
 
 -- The visible block as the mode says (see ABP_NATIVE_VIS); the Lua block when the native one hands over
 function visible_block()
-	local mode = native_visible ~= nil and state.native_visible or 0
+	local mode = native_visible ~= nil and ABP_NATIVE_VIS.mode or 0
 	if mode == 0 then return visible_input_block() end
 	local v = ABP_NATIVE_VIS
 	local nb, why = native_visible()
@@ -2037,6 +2037,7 @@ function visible_block()
 	local ref = visible_input_block()
 	v.checks = v.checks + 1
 	local ok, where = same_json(json.decode(ref:sub(5)), json.decode(nb:sub(5)), "")
+	getenv(ok and "ABP_VIS_CHECK:0" or "ABP_VIS_CHECK:1")   -- (counted across the instance's clones: ABP_CLONE_STATS)
 	if not ok then
 		v.mismatches = v.mismatches + 1
 		if v.first == nil then v.first = { frame = state.logic_frames, where = where, lua = ref:sub(5), c = nb:sub(5) } end
@@ -2666,13 +2667,13 @@ local function handle_command(line)
 		elseif cmd.cmd == "native_step" then   -- native step: 0 off, 1 on when available (see native_step_obs)
 			if cmd.mode ~= nil then state.native_step = math.tointeger(tonumber(cmd.mode)) or 1 end
 			if cmd.terrain_cache ~= nil then state.terrain_cache = math.tointeger(tonumber(cmd.terrain_cache)) or 1 end
-			if cmd.native_visible ~= nil then state.native_visible = math.tointeger(tonumber(cmd.native_visible)) or 0 end
+			if cmd.native_visible ~= nil then ABP_NATIVE_VIS.mode = math.tointeger(tonumber(cmd.native_visible)) or 0 end
 			local s, tc, v = ABP_NATIVE_STEP, ABP_TERRAIN_CACHE, ABP_NATIVE_VIS
 			send({ type = "ok", cmd = "native_step", mode = state.native_step, available = s.available, steps = s.steps,
 				lines = s.lines, other = s.other, fallbacks = s.fallbacks, blocks = s.blocks, last_fallback = s.last_fallback,
 				turbo = getenv("ABP_OBS_STATUS"), prof = getenv("ABP_STEP_PROF"), terrain_cache = state.terrain_cache,
 				-- (G) the native visible block: mode, availability, counts, the first difference in check mode
-				native_visible = state.native_visible, vis_available = v.available, vis_native = v.native, vis_step = v.step,
+				native_visible = ABP_NATIVE_VIS.mode, vis_available = v.available, vis_native = v.native, vis_step = v.step,
 				vis_fallbacks = v.fallbacks, vis_last_fallback = v.last_fallback, vis_checks = v.checks,
 				vis_mismatches = v.mismatches, vis_first = v.first, vis_turbo = getenv("ABP_VIS_STATUS"),
 				tc_available = tc.available, tc_hits = tc.hits, tc_builds = tc.builds, tc_checks = tc.checks,
@@ -2820,7 +2821,7 @@ local function native_step_obs()
 	s.consecutive = false
 	-- (G, 2026-11-12) native visible mode 1: lean_blocks leaves the visible block out; the fast path (no other block)
 	-- has abp_native_step append the native one, a slow one builds it below
-	local nvis = native_visible ~= nil and state.native_visible == 1
+	local nvis = native_visible ~= nil and ABP_NATIVE_VIS.mode == 1
 	local ok, terrain, map, inv, visible = pcall(lean_blocks, "step", resend, here, clear, nvis)
 	if ok and nvis and (terrain ~= "" or map ~= "" or inv ~= "") then visible = visible_block() end
 	if not ok or terrain ~= "" or map ~= "" or inv ~= "" or visible ~= "" then
