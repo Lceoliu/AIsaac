@@ -35,7 +35,7 @@ class Run:
         if go[0]:   # (the store: a new open decision with this value; DONE_BRANCH's too, as a boot)
             k = int(self.roll.length[0])
             self.roll.value[0, k] = value
-            self.roll.boot[0, k] = (rows['done'][0] == DONE_BRANCH) | T.is_cap(rows)[0]
+            self.roll.boot[0, k] = (rows['done'][0] == DONE_BRANCH) | T.is_trunc(rows)[0]
             self.roll.open[0], self.roll.length[0] = k, k + 1
 
     def gae(self):

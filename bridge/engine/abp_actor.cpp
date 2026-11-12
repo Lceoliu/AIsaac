@@ -530,7 +530,7 @@ struct ActorDriver {
   // ROW fields: offset, size
   i64 f_first = 0, f_done = 0, f_pforce = 0, f_schema = 0, f_bytes = 0, f_frame = 0; int s_first = 1, s_done = 1, s_pforce = 1;
   i64 done_branch = 4;
-  i64 cap_t = 0, f_t = -1; int s_t = 4;   // (--cap-truncate: the time cap's ends are evaluated, as a branch's truncated end)
+  i64 cap_t = 0, f_t = -1, trunc = 0; int s_t = 4;   // (--cap- / --stall-truncate: those ends evaluated, as a branch end)
   bool pf_on = false;
   // arena
   ArenaReset reset; i64 scratch_row = 0, base = 0; i64 *step_host = nullptr; i64 heads = 0, nh = 0; i64 block_steps = 32;
@@ -609,7 +609,7 @@ struct ActorDriver {
   void set_seed(i64 seed) { rng = Xoshiro((uint64_t)seed); }
   void set_fixed_uniform(double v) { fixed_u = v; }
   void set_version(i64 v) { version = v; }
-  void set_cap(i64 v) { cap_t = v; }   // (--cap-truncate: the cap in decisions; 0 off)
+  void set_cap(i64 v, i64 m) { cap_t = v; trunc = m; }   // (the cap in decisions; m: 1 cap ends, 2 stall ends, 3 both)
   void set_buckets(std::vector<i64> body, std::vector<i64> entity, std::vector<i64> inventory, std::vector<i64> slots, i64 fixed,
                    i64 fbytes, i64 schema) {
     bk_body = body; bk_entity = entity; bk_inventory = inventory; bk_slots = slots; frame_fixed = fixed; frame_bytes = fbytes; schema_version = schema;
@@ -698,7 +698,7 @@ struct ActorDriver {
     c.w_resource = F("w_resource"); c.end_bonus = F("end_bonus"); c.gamma = F("gamma");
     c.floor = B("floor"); c.run = B("run"); c.items = B("items"); c.gains_on = B("gains_on"); c.plr_on = B("plr_on"); c.pick_on = B("pick_on");
     c.ev_exit = I("ev_exit"); c.ev_item = I("ev_item"); c.ev_active = I("ev_active"); c.ev_pill = I("ev_pill"); c.done_branch = I("done_branch");
-    c.cap_t = P("cap_t"); c.o_t = d.contains("o_t") ? I("o_t") : (i64)-1;
+    c.cap_t = P("cap_t"); c.o_t = d.contains("o_t") ? I("o_t") : (i64)-1; c.trunc = P("trunc");
     c.ret = (double *)P("ret"); c.ep_hurt = (double *)P("hurt"); c.ep_damage = (double *)P("damage"); c.gains = (double *)P("gains");
     c.healed = (double *)P("healed"); c.gathered = (double *)P("gathered"); c.v0 = (double *)P("v0"); c.gret = (double *)P("gret");
     c.rooms = (i64 *)P("rooms"); c.boss = (i64 *)P("boss"); c.extra = (i64 *)P("extra"); c.steps = (i64 *)P("steps");
@@ -1795,7 +1795,8 @@ struct ActorDriver {
       if (priv) memcpy(r->priv.data_ptr<uint8_t>()+i*priv_itemsize, priv+ss[i]*priv_itemsize, priv_itemsize);
       i64 done = read_int(src+f_done, s_done), first = read_int(src+f_first, s_first);
       bool ended = done != 0, boot = done == done_branch
-                   || (cap_t > 0 && f_t >= 0 && done == 3 && read_int(src+f_t, s_t) >= cap_t);
+                   || (trunc && cap_t > 0 && f_t >= 0 && done == 3
+                       && (read_int(src+f_t, s_t) >= cap_t ? (trunc & 1) != 0 : (trunc & 2) != 0));
       bool go = !ended || boot;
       r->go[i] = go;
       if (cf_snap) { r->cf_snap[i] = cf_snap[ws[i]]; if (r->cf_snap[i] && !lin_on) cap_wait[ws[i]] = 1; }   // (before the reply;
