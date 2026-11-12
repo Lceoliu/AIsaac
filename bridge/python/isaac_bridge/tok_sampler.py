@@ -185,6 +185,11 @@ FORK_MANY = os.environ.get('ISAAC_RL_FORK_MANY', '1') != '0'   # hindsight: the 
 _MSG0, _MSG1, _REPLY = b'\x00\x00\x00\x010', b'\x00\x00\x00\x011', b'\x00\x00\x00\x01a'
 
 
+def start_seed(cfg, index, n):
+    """Worker index's n-th training start seed (TokSamplerConfig: seed, workers, state_base, seed_stride, seed_phase)."""
+    return cfg.seed + index + cfg.workers * (cfg.seed_stride * (cfg.state_base + n) + cfg.seed_phase)
+
+
 @dataclass
 class TokSamplerConfig:
     workers: int = 16
@@ -196,6 +201,12 @@ class TokSamplerConfig:
     start_hp: tuple = (6, 6)                      # half hearts at an episode's start: drawn uniformly per state
     bombs: int = 1
     seed: int = 1000
+    # (start seeds: seed + index + workers * (seed_stride * (state_base + n) + seed_phase) for a worker's n-th start
+    #  state; state_base: a resumed run's offset past the starts it may have used; seed_stride / seed_phase: K shards
+    #  and this one's rank, so the shards' sequences interleave without overlap. Defaults: the old sequence exactly)
+    state_base: int = 0
+    seed_stride: int = 1
+    seed_phase: int = 0
     eval_seeds: list = field(default_factory=list)   # per worker: its seeds (evaluation); empty: training
     name: str = 'tk'
     port: int = 28300
@@ -1074,7 +1085,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         nonlocal state_n
         if evaluation:
             return todo.pop(0) if todo else None
-        seed = cfg.seed + index + cfg.workers * state_n
+        seed = start_seed(cfg, index, state_n)
         state_n += 1
         return seed
 

@@ -1436,6 +1436,9 @@ def require_mps_client():
     raise RuntimeError('this CUDA process is not registered with the requested MPS server')
 
 
+STATES_PER_UPDATE = 64   # (a resumed run's start-seed offset per update done: a bound on the start states a worker builds)
+
+
 def main(argv=None, child=None, actor=None):
     """argv: the arguments (default sys.argv[1:]). child (B38 step 2): the learner process's start-up data
     (learner_child_entry); None: the trainer itself. actor (B38 step 5): a second actor process's start-up data
@@ -2024,6 +2027,11 @@ def main(argv=None, child=None, actor=None):
     args = p.parse_args(argv)
     shard_world = int(os.environ.get('ISAAC_SHARD_WORLD', '1') or 1)   # BM1 C: K shards as one run (shard_sync)
     shard_rank = int(os.environ.get('ISAAC_SHARD_RANK', '0') or 0) if shard_world > 1 else 0
+    seed_games = args.seed   # (the workers' start seeds: from the unshifted seed, interleaved across the shards below)
+    # (a resumed run: the start states continue past every one it may have used -- each worker's n restarts at 0 in a new
+    #  process; STATES_PER_UPDATE bounds the start states a worker builds per update, ~1 in the timed configuration)
+    resume_update = (int(torch.load(args.resume, map_location='cpu', weights_only=False).get('update', 0) or 0)
+                     if args.resume else 0)
     if shard_world > 1:   # (every rank its own games and draws; rank 0's weights are broadcast at the start)
         args.seed += 7340033 * shard_rank
         print(f'BM1 C shard {shard_rank} of {shard_world}: seed {args.seed}, learning rate x {args.shard_lr_mult}',
@@ -2309,7 +2317,8 @@ def main(argv=None, child=None, actor=None):
                            assign=assign[w_lo:w_lo + n_loc] if in_actor else assign,
                            frames_per_decision=args.frames_per_decision,
                            episodes_per_state=args.episodes_per_state, episode_seconds=args.episode_seconds,
-                           start_hp=(lo, hi), seed=args.seed + 1000003 * aid, name=args.name + (f'a{aid}' if aid else ''),
+                           start_hp=(lo, hi), seed=seed_games + 1000003 * aid, name=args.name + (f'a{aid}' if aid else ''),
+                           state_base=resume_update * STATES_PER_UPDATE, seed_stride=shard_world, seed_phase=shard_rank,
                            port=args.port + w_lo,
                            teacher=args.teacher, teacher_share=args.teacher_share, teacher_queue=args.teacher_queue,
                            teacher_slots=(max(1, args.teacher_slots // n_act) if args.teacher_slots else 0),
