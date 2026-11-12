@@ -25,7 +25,9 @@
 #     (game / worker processes) growing in OOM_KILL_STREAK (3) updates in a row or reaching OOM_KILL_MAX (20) in one
 #     attempt (the monitor: the ranks stopped at once, .oom_stop; a single growth: a warning); episodes breaking off
 #     (progress broken_episodes: a game or worker failed) in BROKEN_STREAK (3) updates in a row or BROKEN_MAX (20) in
-#     one attempt (likewise, .broken_stop; any: a warning);
+#     one attempt (likewise, .broken_stop; any: a warning); no progress (the monitor: a rank without a new progress row
+#     for STALL_S, 600 s, or STARTUP_STALL_S, 1800 s, before its first row of the attempt: the trainers SIGINTed, the
+#     container killed STALL_KILL_S, 180 s, later; cause stall, resumed) twice at the same update;
 #   else: resumed after BACKOFF x attempt seconds, MAX_RETRY attempts per cause.
 # Nothing system-wide: no GPU reset, no other process touched.
 set -u
@@ -52,7 +54,7 @@ LANESUM=$MEMG; MEMG=${MEM_GB:-128}
 NB=$(lane $1 LANE_NAME); PB=$(lane $1 LANE_PORT)
 CTR="$BM1_NAME-train-$NAME"
 take_excl "training $NAME ($TREE, K $K, GPU $G) 计时运行"
-for m_ in .guard_end .stop_sent .oom_stop .broken_stop; do   # (an earlier guard's markers: moved aside, nothing deleted)
+for m_ in .guard_end .stop_sent .oom_stop .broken_stop .stall .attempt_start; do   # (an earlier guard's markers: moved aside, nothing deleted)
   [ -f $RD/$m_ ] && { mkdir -p ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d); mv $RD/$m_ ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d)/$NAME$m_-$(date +%H%M%S); }
 done
 glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCPUS memory limit ${MEMG}g (the lanes' sum ${LANESUM}g) hours ${HOURS:-125}"
@@ -122,6 +124,25 @@ print(u, e, t)" $(for r in $(seq 0 $((K-1))); do echo $RD/$NAME-s$r/progress.csv
       mwarned_=$(date +%s)
       glog "WARNING container memory $(printf %.1f $2) GB = $(awk "BEGIN {printf \"%.0f\", 100 * $1}") % of its limit ${MEMG}g (update $3)"
     fi
+    # (no progress: while the attempt's container runs, a rank without a new progress row for STALL_S (600 s, about 14
+    #  updates' time) -- STARTUP_STALL_S (1800 s) before its first row of the attempt: .stall, the trainers SIGINTed (they
+    #  save last.pt), the container killed STALL_KILL_S (180 s) later if still there)
+    if [ -f $RD/.attempt_start ] && [ ! -f $RD/.stall ] && [ "$(docker inspect -f '{{.State.Running}}' $CTR 2>/dev/null)" = true ]; then
+      a_=$(cat $RD/.attempt_start); now_=$(date +%s)
+      for r in $(seq 0 $((K-1))); do
+        m_=$(stat -c %Y $RD/$NAME-s$r/progress.csv 2>/dev/null || echo 0)
+        if [ "$m_" -lt "$a_" ]; then lim_=${STARTUP_STALL_S:-1800}; since_=$a_; what_="no progress row of the attempt yet"
+        else lim_=${STALL_S:-600}; since_=$m_; what_="no new progress row"; fi
+        if [ $(( now_ - since_ )) -ge $lim_ ]; then
+          echo "rank $r: $what_ for $(( now_ - since_ )) s (limit $lim_ s)" > $RD/.stall
+          glog "STALL: $(cat $RD/.stall): the trainers SIGINTed, the container killed in ${STALL_KILL_S:-180} s if still there"
+          docker exec $CTR pkill -INT -f "train_tok.py .*--out $RDC/$NAME-s" 2>/dev/null
+          ( sleep ${STALL_KILL_S:-180}; [ "$(docker inspect -f '{{.State.Running}}' $CTR 2>/dev/null)" = true ] && {
+              docker kill $CTR > /dev/null 2>&1; glog "STALL: the container $CTR killed (still there ${STALL_KILL_S:-180} s after the SIGINT)"; } ) &
+          break
+        fi
+      done
+    fi
     sleep 30
   done ) &
 MON=$!
@@ -157,6 +178,7 @@ while :; do
     for x in stdout stderr; do [ -f $RD/$NAME-s$r.$x ] && mv $RD/$NAME-s$r.$x $RD/$NAME-s$r.$x.attempt$((attempt-1)); done
   done
   glog "attempt $attempt: $from"
+  date +%s > $RD/.attempt_start   # (the monitor's no-progress clock)
   MP=""
   for r in $(seq 0 $((K-1))); do   # (each rank's memory by process kind and the container's cgroup, every MEM_SAMPLE_S s)
     python3 $BM/m0_mem.py $RD/$NAME-s$r.mem.attempt$attempt.csv ${MEM_SAMPLE_S:-30} " --out $RDC/$NAME-s$r " > $RD/$NAME-s$r.mem.attempt$attempt.log 2>&1 &
@@ -170,6 +192,7 @@ while :; do
     DOCK_ENV="$DE" $BM/run.sh train-$NAME $G sh $BM1_IN/shardk_in.sh $NAME 315360000 ${HOURS:-125} "$(echo $PAIRS)" "$CPUS" "$LCPUS" "$DCPUS" >> $RD/launcher.log 2>&1
   rc=$?
   kill $MP 2>/dev/null
+  stall_=""; [ -f $RD/.stall ] && { stall_=$(cat $RD/.stall); mv $RD/.stall $RD/.stall.attempt$attempt; }
   cgk=$(cat $RD/$NAME.oom_kills 2>/dev/null); [ -f $RD/$NAME.oom_kills ] && mv $RD/$NAME.oom_kills $RD/$NAME.oom_kills.attempt$attempt
   outs=$(for r in $(seq 0 $((K-1))); do tail -c 200000 $RD/$NAME-s$r.stdout $RD/$NAME-s$r.stderr 2>/dev/null; done)
   upd=$(python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); print(r[-1]['update'] if r else '')" $RD/$NAME-s0/progress.csv 2>/dev/null)
@@ -181,16 +204,21 @@ while :; do
     glog "attempt $attempt ended rc=0 at update ${upd:-?}: the run's ${HOURS:-125} game hours reached, the guard ends"; break
   fi
   cause=other
+  [ -f $RD/.attempt_start ] && mv $RD/.attempt_start $RD/.attempt_start.prev
   echo "$outs" | grep -q "CheckpointError\|compiled during the backward recomputation" && cause=checkpoint
   echo "$outs" | grep -q "state hashes of the ranks differed" && cause=hash
   echo "$outs" | grep -q "out of memory" && cause=oom
   case "$cgk" in [1-9]*) cause=cgroup_oom ;; esac   # (the kernel's OOM kill at the container's limit)
   [ $rc = 4 ] && cause=gpu_busy   # (run.sh: a GPU had another process at the start)
+  [ -n "$stall_" ] && cause=stall   # (the monitor's no-progress watchdog ended it)
   glog "attempt $attempt ended rc=$rc at update ${upd:-?}: cause $cause"
   case $cause in
     checkpoint|hash) glog "cause $cause: stopped, no resume (a person looks)"; break ;;
     oom) if [ -s $RD/foreign_gpu.log ] && [ $oom_foreign -ge 1 ]; then glog "out of memory again with other tenants on our GPUs: stopped"; break; fi
          [ -s $RD/foreign_gpu.log ] && oom_foreign=$((oom_foreign+1)) ;;
+    stall) glog "no progress: $stall_"
+         if [ -n "$upd" ] && [ "$upd" = "${stall_upd:-}" ]; then glog "stalled again at update $upd: stopped, no resume (a person looks)"; break; fi
+         stall_upd=$upd ;;
     cgroup_oom) cg_oom=$(( ${cg_oom:-0} + 1 ))
          glog "a rank killed by the kernel at the container's memory limit ${MEMG}g (cgroup oom_kill $cgk; the memory limit, not another tenant's process) -- the $cg_oom. time"
          [ $cg_oom -ge 2 ] && { glog "the container's memory limit a second time: stopped, no resume (a person looks)"; break; } ;;
