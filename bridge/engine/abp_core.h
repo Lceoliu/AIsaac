@@ -237,11 +237,14 @@ struct RollSlot {
   Arena arena;
 };
 struct RowLayout { i64 row_stride, f_bytes, f_frame, frame_bytes, nh, priv_itemsize; };
-static const i64 N_SNAP = 17;   // ret, hurt, damage, rooms, boss, extra[6], healed, gathered, pick steps, gret, v0, steps
+// per row: [0, 17) ret, hurt, damage, rooms, boss, extra[6], healed, gathered, pick steps, gret, v0, steps of an episode
+// that ends at it; [17, 34) the same of the episode before that broke off at its first record (no end record: its game /
+// worker failed), [34] 1 when one did (Episodes.broken_line)
+static const i64 N_SNAP = 35;
 
 // Episodes.arrive over all n_all rows of a record (rows rc, workers ws), then store over its n go rows (go_idx), in the
 // Python path's arithmetic (float64 rewards, float32 gains as numpy computes them); kk_out [n] (-1: dropped), snap_out
-// [n_all, N_SNAP] (the accumulators of a row whose episode ends, before their reset). amu guards the arena.
+// [n_all, N_SNAP] (the accumulators of a row whose episode ends or broke off, before their reset). amu guards the arena.
 inline void consume(const ConsumerCfg &c, RollSlot &R, std::mutex &amu, const RowLayout &L, const uint8_t *rc, i64 n_all,
                     const i64 *ws, const i64 *go_idx, i64 n, const float *out, const i64 *act, const i64 *pend, i64 ver,
                     const uint8_t *privp, i64 *kk_out, double *snap) {
@@ -261,11 +264,25 @@ inline void consume(const ConsumerCfg &c, RollSlot &R, std::mutex &amu, const Ro
     i64 d = u8(src, c.o_done);
     i64 k = load_i64(&R.open[w]);
     i64 ix;
-    if (first && k >= 0) {   // the episode before broke off
+    if (first && k >= 0) {   // the episode before ended with no end record: a branch's truncated end, or broke off
       ix = w*R.cap+k;
-      R.reward[ix] = 0.0f; R.terminal[ix] = 1;
+      bool trunc = R.boot[ix] != 0;   // (a branch's truncated end: closed here as always)
+      // (any other: its game / worker failed -- a truncation as well, not a death: boot, only its value; never trained)
+      R.reward[ix] = 0.0f; R.terminal[ix] = trunc ? 1 : 0; R.boot[ix] = 1;
       if (R.close_hurt) { R.close_hurt[ix] = 0.0f; R.close_ev[ix] = 0; R.close_done[ix] = 255; }
       store_i64(&R.open[w], -1); k = -1;
+      if (!trunc) {   // its accumulators for Python's broken-episode line, then reset (as at an episode end)
+        double *sv = snap+i*N_SNAP+17;
+        sv[0] = c.ret[w]; sv[1] = c.ep_hurt[w]; sv[2] = c.ep_damage[w]; sv[3] = (double)c.rooms[w]; sv[4] = (double)c.boss[w];
+        for (int q = 0; q < 6; q++) sv[5+q] = c.extra ? (double)c.extra[w*6+q] : 0.0;
+        sv[11] = c.healed[w]; sv[12] = c.gathered[w]; sv[13] = c.pick_steps ? (double)c.pick_steps[w] : 0.0;
+        sv[14] = c.plr_on ? c.gret[w] : 0.0; sv[15] = c.plr_on ? c.v0[w] : 0.0; sv[16] = c.plr_on ? (double)c.steps[w] : 0.0;
+        sv[17] = 1.0;
+        c.ret[w] = 0; c.ep_hurt[w] = 0; c.ep_damage[w] = 0; c.rooms[w] = 0; c.boss[w] = 0;
+        if (c.extra) for (int q = 0; q < 6; q++) c.extra[w*6+q] = 0;
+        c.healed[w] = 0; c.gathered[w] = 0;
+        if (c.plr_on) { c.v0[w] = 0; c.gret[w] = 0; c.steps[w] = 0; }
+      }
     }
     if (k >= 0) {
       ix = w*R.cap+k;

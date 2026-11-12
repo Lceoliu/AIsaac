@@ -686,6 +686,8 @@ def merge_jobs(halves):
         return out
     j['finished'] = [e for h in halves for e in h.get('finished', [])]
     j['branch_finished'] = [e for h in halves for e in h.get('branch_finished', [])]
+    j['broken'] = [e for h in halves for e in h.get('broken', [])]
+    j['broken_total'] = max(h.get('broken_total', 0) for h in halves)
     for k in ('collect_s', 'wait_learner_s', 'cycle_s', 'cycle_wait_s', 'take_s', 't_put'):
         if k in j:
             j[k] = max(h.get(k, 0.0) for h in halves)
@@ -948,6 +950,9 @@ class Rollout:
                                      other.t_o.index_select(0, torch.from_numpy(o_src).to(dev)))
 
 
+DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its game / worker failed before its end record)
+
+
 class Episodes:
     """The actor's bookkeeping of the records that arrive (vectorised over a poll's records): the reward of each
     worker's open decision, episode ends and their statistics, the action under way."""
@@ -967,6 +972,9 @@ class Episodes:
         self.finished = []                       # episodes ended since the last hand-over
         self.branch_finished = []                # 2026-10-07: branch episodes ended since then (tok_branch)
         self.lab_finished = []                   # 2026-10-08: lab episodes ended since then (tok_lab)
+        # episodes that broke off since then (no end record: the game or its worker failed; done DONE_BROKE), apart
+        # from every statistic; ep_meta: worker -> (group, seed, branch, point, lab) of its episode's first record
+        self.broken, self.broken_total, self.ep_meta = [], 0, {}
         self.seen_inv = None                     # 2026-10-08 (lab on): held collectibles at ordinary episodes' ends
         self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
         self.stats0 = None                       # 2026-10-08 (stat aug on): worker -> the stats at the first record
@@ -988,6 +996,45 @@ class Episodes:
         return np.stack([np.rint(pl[:, 7] * 12.0), np.rint(pl[:, 8] * 10.0) + np.rint(pl[:, 9] * 10.0)
                          + np.rint(pl[:, 10] * 50.0)], 1).astype(np.float64)
 
+    def note_first(self, rows, idx, first):
+        """Each first record's (group, seed, branch, point, lab): the broken-episode line's, should it break off."""
+        for j in np.flatnonzero(first):
+            r = rows[j]
+            self.ep_meta[int(idx[j])] = (int(r['group']), int(r['seed']), int(r['branch']), int(r['point']),
+                                         int(r['lab']))
+
+    def broken_line(self, i, acc):
+        """The episodes.jsonl line of worker i's episode that broke off; acc: its accumulators in the native
+        consumer's snapshot order (ret, hurt, damage, rooms, boss, extra[6], healed, gathered, ...)."""
+        g, sd, br, pt, lb = self.ep_meta.get(int(i), (-1, -1, 0, 0, 0))
+        fin = dict(group=g, seed=sd, done=DONE_BROKE, broken=1, ret=float(acc[0]), hurt=float(acc[1]),
+                   damage=float(acc[2]), rooms=int(acc[3]), boss=int(acc[4]))
+        if self.run or self.items:
+            x = np.asarray(acc[5:11]).astype(np.int64)
+            fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]), stage0=int(x[4]),
+                       stage=int(x[5]))
+            if self.inv0.get(int(i)):
+                fin['build0'] = self.inv0[int(i)]
+        if self.gains is not None:
+            fin.update(healed=float(acc[11]), gathered=float(acc[12]))
+        if br:
+            fin.update(point=pt, branch=br)
+        if lb:
+            fin['lab'] = lb
+        self.broken.append(fin)
+        self.broken_total += 1
+
+    def close_broken(self, ws):
+        """(the Python consumer) workers ws's episodes broke off: their lines, their accumulators reset."""
+        for i in ws:
+            self.broken_line(i, [self.ret[i], self.hurt[i], self.damage[i], self.rooms[i], self.boss[i],
+                                 *self.extra[i], self.healed[i], self.gathered[i]])
+        self.ret[ws], self.hurt[ws], self.damage[ws], self.rooms[ws], self.boss[ws] = 0.0, 0.0, 0.0, 0, 0
+        self.extra[ws] = 0
+        self.healed[ws], self.gathered[ws] = 0.0, 0.0
+        if self.plr is not None:
+            self.v0[ws], self.gret[ws], self.steps[ws] = 0.0, 0.0, 0
+
     def arrive(self, roll, rows, idx, pending):
         """Records `rows` of workers `idx` (distinct): close the decisions before them, end episodes, reset the action
         under way where an episode starts or ends. Returns the mask of the records that need an action."""
@@ -995,14 +1042,20 @@ class Episodes:
         first = rows['first'] != 0
         done = rows['done'].astype(np.int64)
         k = roll.open[idx]
-        broke = first & (k >= 0)   # the episode before broke off (a worker error): end it there
+        broke = first & (k >= 0)   # the episode before ended with no end record: a branch's truncated end, or broke off
         if broke.any():
-            roll.reward[idx[broke], k[broke]], roll.terminal[idx[broke], k[broke]] = 0.0, True
+            wb, kb = idx[broke], k[broke]
+            trunc = roll.boot[wb, kb]   # (a branch's truncated end (DONE_BRANCH): closed here as always)
+            # (any other open decision: the episode broke off (its game / worker failed): a truncation as well, not a
+            #  death -- boot: only its value, for the decision before; never trained)
+            roll.reward[wb, kb], roll.terminal[wb, kb], roll.boot[wb, kb] = 0.0, trunc, True
             if roll.close_hurt is not None:   # 2026-11-03 (--aux-predict): an end of unknown outcome
-                roll.close_hurt[idx[broke], k[broke]], roll.close_ev[idx[broke], k[broke]] = 0.0, 0
-                roll.close_done[idx[broke], k[broke]] = CLOSE_BROKE
-            roll.open[idx[broke]] = -1
+                roll.close_hurt[wb, kb], roll.close_ev[wb, kb] = 0.0, 0
+                roll.close_done[wb, kb] = CLOSE_BROKE
+            roll.open[wb] = -1
             k = np.where(broke, -1, k)
+            if (~trunc).any():
+                self.close_broken(wb[~trunc])
         has = k >= 0
         if has.any():   # the reward of the decision before
             w, kk, d = idx[has], k[has], done[has]
@@ -1045,6 +1098,7 @@ class Episodes:
                 self.steps[w] += 1
             self.hurt[w] += hu
             self.damage[w] += dmg
+        self.note_first(rows, idx, first)
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
             self.gains[idx] = self.cur_gains(rows)
         if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
@@ -1142,6 +1196,10 @@ def _native_events(book, rows, idx, snap):
     self = book
     first = rows['first'] != 0
     done = rows['done'].astype(np.int64)
+    if snap.shape[1] > 34:   # (episodes that broke off at these first records: the consumer's second snapshot, flag 34)
+        for j in np.flatnonzero(first & (snap[:, 34] != 0)):
+            self.broken_line(idx[j], snap[j, 17:34])
+    self.note_first(rows, idx, first)
     if (self.run or self.items) and first.any():
         if self.items:
             for j in np.flatnonzero(first):
@@ -4803,6 +4861,8 @@ def main(argv=None, child=None, actor=None):
             row.update({f'uo_{k}': v for k, v in UO.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
         import shutil as shutil_
+        row['broken_episodes'] = len(job.get('broken', []))   # (this update's; the guard warns / stops on them)
+        row['broken_total'] = job.get('broken_total', 0)
         row['disk_free_gb'] = shutil_.disk_usage(out).free / 2 ** 30   # (the training run: the guard warns / stops on it)
         # (the container's memory: used without the inactive file cache, its limit, the kernel's OOM kills in it so
         #  far; a warning line past 90 % of the limit -- the guard logs it too)
@@ -5035,6 +5095,8 @@ def main(argv=None, child=None, actor=None):
         L['writer'].writerow(row)
         log_file.flush()
         for e in finished:
+            episodes_path.write(json.dumps(dict(e, update=upd)) + '\n')
+        for e in job.get('broken', []):   # (episodes that broke off: their own lines, done DONE_BROKE, broken 1)
             episodes_path.write(json.dumps(dict(e, update=upd)) + '\n')
         episodes_path.flush()
         if branch_path is not None:
@@ -6161,7 +6223,7 @@ def main(argv=None, child=None, actor=None):
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,
                        v2=sampler.v2_records(with_h=mem_on, with_t=t_on,with_block=block_on) if v2_on else None,
-                       branch_finished=book.branch_finished,
+                       branch_finished=book.branch_finished, broken=book.broken, broken_total=book.broken_total,
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,
                        dec_min=float(dec_w.min()), dec_max=float(dec_w.max()),
@@ -6218,6 +6280,7 @@ def main(argv=None, child=None, actor=None):
                 cpp_driver.use_rollout(roll.native_slot)
             book.finished = []
             book.branch_finished = []
+            book.broken = []
             busy = True
             if batch_on:
                 cpp_driver.set_busy(True)
