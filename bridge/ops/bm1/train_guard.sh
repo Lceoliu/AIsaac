@@ -18,7 +18,8 @@
 # Takes the host's exclusive lock for the whole run (purpose: training), released at its end.
 # Each attempt: preflight (every GPU listed, no new Xid), the disk's free space, the newest readable checkpoint of rank 0
 # (update-*.pt / last.pt: a zip that tests whole; else the one before), one container (shardk_in.sh, the K ranks).
-# After an attempt ends: rc 0 without STOP -- the run's HOURS reached: the guard ends; else the cause from the ranks'
+# After an attempt ends: rc 0 without STOP and rank 0's game hours at HOURS -- the run's end: the guard ends (rc 0 short of
+# HOURS: cause early_end, resumed once, the second in a row stopped); else the cause from the ranks'
 # stdout and the guard's own checks --
 #   stop, no resume: the STOP file; a CheckpointError or a compile during a checkpoint's recomputation; the ranks'
 #     hashes differing in consecutive checks; preflight failing (Xid / a GPU missing); free disk under DISK_MIN_GB;
@@ -223,11 +224,17 @@ while :; do
   if [ -f $RD/.broken_stop ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?}: $(cat $RD/.broken_stop): stopped, no resume (a person looks)"; break; fi
   if [ -f $RD/.oom_stop ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?}: $(cat $RD/.oom_stop): stopped, no resume (a person looks)"; break; fi
   if [ -f $RD/STOP ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?} after STOP: the guard ends"; break; fi
-  if [ $rc = 0 ]; then
+  # (2026-11-12, run_w2) rc 0 is the end only when rank 0's game hours (progress.csv, resumes included) reached HOURS:
+  # a trainer whose workers all ended also finishes with rc 0 -- that attempt is cause early_end (resumed once; a
+  # second early end in a row: stopped, a person looks)
+  gh=$(python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); print(r[-1]['game_hours'] if r else 0)" $RD/$NAME-s0/progress.csv 2>/dev/null)
+  early=$(python3 -c "import sys; print(1 if float(sys.argv[1] or 0) < 0.999 * float(sys.argv[2]) else 0)" "${gh:-0}" "${HOURS:-125}" 2>/dev/null || echo 1)
+  if [ $rc = 0 ] && [ "$early" = 0 ]; then
     case "$cgk" in [1-9]*) glog "WARNING the kernel killed $cgk process(es) at the container's memory limit ${MEMG}g in attempt $attempt (the ranks went on)" ;; esac
-    glog "attempt $attempt ended rc=0 at update ${upd:-?}: the run's ${HOURS:-125} game hours reached, the guard ends"; break
+    glog "attempt $attempt ended rc=0 at update ${upd:-?}: the run's ${HOURS:-125} game hours reached (rank 0 ${gh}), the guard ends"; break
   fi
   cause=other
+  [ $rc = 0 ] && cause=early_end
   [ -f $RD/.attempt_start ] && mv $RD/.attempt_start $RD/.attempt_start.prev
   echo "$outs" | grep -q "CheckpointError\|compiled during the backward recomputation" && cause=checkpoint
   echo "$outs" | grep -q "state hashes of the ranks differed" && cause=hash
@@ -243,6 +250,8 @@ while :; do
     stall) glog "no progress: $stall_"
          if [ -n "$upd" ] && [ "$upd" = "${stall_upd:-}" ]; then glog "stalled again at update $upd: stopped, no resume (a person looks)"; break; fi
          stall_upd=$upd ;;
+    early_end) glog "WARNING the ranks ended rc=0 at ${gh:-?} of ${HOURS:-125} game hours (rank 0): not the run's end (all workers gone?)"
+         [ "$last_cause" = early_end ] && { glog "an early end twice in a row: stopped, no resume (a person looks)"; break; } ;;
     cgroup_oom) cg_oom=$(( ${cg_oom:-0} + 1 ))
          glog "a rank killed by the kernel at the container's memory limit ${MEMG}g (cgroup oom_kill $cgk; the memory limit, not another tenant's process) -- the $cg_oom. time"
          [ $cg_oom -ge 2 ] && { glog "the container's memory limit a second time: stopped, no resume (a person looks)"; break; } ;;
