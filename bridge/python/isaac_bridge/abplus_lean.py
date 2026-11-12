@@ -133,10 +133,11 @@ class LeanDecoder:
             self.inv = np.frombuffer(payload, INV_ITEM, head[0], off + INV_HEADER.size)
             self.inv_version += 1
             off += INV_HEADER.size + INV_ITEM.itemsize * head[0]
-        o.visible = None
+        o.visible = o.visible_at = None
         if flags & 32:
             size = struct.unpack_from('<I', payload, off)[0]
             off += 4
+            o.visible_at = off   # (2026-11-12: where its JSON text starts; probes compare the bytes before it)
             o.visible = json.loads(payload[off:off+size])
             off += size
         if off != len(payload):

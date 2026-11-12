@@ -994,7 +994,8 @@ enum {
 struct cs_slot { int64_t pid; uint64_t cpu_exit_ns, kids_ns, reserved; };
 struct cs_map {
     char magic[8];          // "ABPCLST1"
-    uint64_t version, root_pid, n_purposes, n_fields, n_slots, slots_lost, reserved;
+    uint64_t version, root_pid, n_purposes, n_fields, n_slots, slots_lost;
+    uint64_t vis_checks, vis_mismatches, reserved;   // (v3, G: the bridge's native visible check mode 2, ABP_VIS_CHECK)
     uint64_t f[CS_P][CSF_N];
     struct cs_slot slot[CS_SLOTS];   // a clone's CPU at ABP_EXIT (and its reaped children's) until its parent reaps it
 };
@@ -1041,7 +1042,7 @@ static void cs_init(void) {
     }
     struct cs_map *c = (struct cs_map *)m;
     memcpy(c->magic, "ABPCLST1", 8);
-    c->version = 2; c->root_pid = (uint64_t)getpid(); c->n_purposes = CS_P; c->n_fields = CSF_N; c->n_slots = CS_SLOTS;
+    c->version = 3; c->root_pid = (uint64_t)getpid(); c->n_purposes = CS_P; c->n_fields = CSF_N; c->n_slots = CS_SLOTS;
     cs = m;
     fprintf(stderr, "ABP_CLONE_STATS %s\n", path);
 }
@@ -2894,6 +2895,14 @@ char *getenv(const char *name) {
             return NULL;
         }
         if (strncmp(name, "ABP_FORK_PURPOSE:", 17) == 0) return cs_set_purpose(name + 17);   // (ABP_CLONE_STATS)
+        if (strncmp(name, "ABP_VIS_CHECK:", 14) == 0) {   // (G, check mode 2: one comparison, ":1" a difference; counted in
+            //                                            the ABP_CLONE_STATS file, every process of the instance)
+            if (cs) {
+                __atomic_fetch_add(&csm()->vis_checks, 1, __ATOMIC_RELAXED);
+                if (name[14] == '1') __atomic_fetch_add(&csm()->vis_mismatches, 1, __ATOMIC_RELAXED);
+            }
+            return getenv_ok;
+        }
         if (strcmp(name, "ABP_CLONE_SELF") == 0) {   // "<frames since the fork (a clone) or the start> <cpu_ns> <minflt>"
             static char cself[96];
             uint32_t fr = read_u32(G_GAME, GAME_FRAMECOUNT) - (is_child && cs_own >= 0 ? cs_frame0 : 0);

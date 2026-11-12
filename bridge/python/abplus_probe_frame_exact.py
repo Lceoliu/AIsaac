@@ -43,7 +43,7 @@ def cpu_ns(pid):
 
 
 class Pair:
-    def __init__(self, parent, check_every, setups):
+    def __init__(self, parent, check_every, setups, visible_json=False):
         self.clones = {}
         self.setup_answers = {}
         for name in ('ref', 'fast'):
@@ -51,6 +51,9 @@ class Pair:
             self.setup_answers[name] = [c.lua(code) for code in setups[name]]
             self.clones[name] = c
         self.decoder = LeanDecoder()
+        self.decoder_fast = LeanDecoder()   # (--visible-json: the fast clone's payloads decoded too)
+        self.visible_json = bool(visible_json)
+        self.reordered = 0                  # (--visible-json: payloads equal but for the visible JSON's key order)
         self.check_every = check_every
         self.decisions = self.payloads = self.digest_checks = 0
         self.mismatch = None
@@ -69,9 +72,17 @@ class Pair:
             raw[k] = read_raw(c)
             self.cpu[k] += cpu_ns(c.pid) - c0
         self.payloads += 1
+        o_ref = self.decoder.decode(raw['ref'])
+        o_fast = self.decoder_fast.decode(raw['fast']) if self.visible_json else None
         if self.mismatch is None and raw['fast'] != raw['ref']:
-            self.mismatch = dict(decision=self.decisions, **first_diff(raw['ref'], raw['fast']))
-        return self.decoder.decode(raw['ref'])
+            # (2026-11-12, --visible-json: the native visible block's JSON has its keys in another order than the
+            # Lua encoder's; equal when the bytes before the JSON text and the decoded JSON are equal)
+            at = o_ref.visible_at
+            if self.visible_json and at is not None and o_fast.visible_at == at and raw['ref'][:at] == raw['fast'][:at]                     and len(raw['ref']) == len(raw['fast']) and o_ref.visible == o_fast.visible:
+                self.reordered += 1
+            else:
+                self.mismatch = dict(decision=self.decisions, **first_diff(raw['ref'], raw['fast']))
+        return o_ref
 
     def step(self, action, repeat):
         self.decisions += 1
@@ -97,6 +108,7 @@ class Pair:
         for c in self.clones.values():
             c.close()
         return dict(decisions=self.decisions, payloads=self.payloads, payload_mismatch=self.mismatch,
+                    visible_reordered=self.reordered,
                     digests_equal=self.digest_mismatch is None, digest_mismatch_at=self.digest_mismatch,
                     digest_checks=self.digest_checks, setup=self.setup_answers, status=status,
                     cpu_ms_ref=round(self.cpu['ref'] / 1e6, 3), cpu_ms_fast=round(self.cpu['fast'] / 1e6, 3))
@@ -109,7 +121,7 @@ def room_seed(inst, seed, args, setups):
     _, _, stop = inst.env.bridge.play(warm, repeat=args.fpd, stop_clear=True)
     if stop != 'done':
         return dict(seed=seed, skipped='episode ended in the warm-up')
-    g = Pair(inst.env.bridge, args.check, setups)
+    g = Pair(inst.env.bridge, args.check, setups, args.visible_json)
     after = None
     for code in test:
         o = g.step(split_code(code), args.fpd)
@@ -128,7 +140,7 @@ def floor_seed(inst, seed, args, setups):
     inst.env.bridge.reset_mode = 'floor'
     inst.reset(seed)
     rng = np.random.default_rng(seed)
-    g = Pair(inst.env.bridge, args.check, setups)
+    g = Pair(inst.env.bridge, args.check, setups, args.visible_json)
     legs, rooms = 0, set()
     o = g.obs
     for _ in range(args.legs):
@@ -187,6 +199,8 @@ def main():
     p.add_argument('--port', type=int, default=37200)
     p.add_argument('--name', default='frmexact')
     p.add_argument('--out', required=True)
+    p.add_argument('--visible-json', action='store_true',
+                   help='payloads may differ in the visible JSON key order only (the native visible block, G)')
     args = p.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=False)
@@ -216,6 +230,7 @@ def main():
         summary = dict(group='floor' if args.floor else args.group, fpd=args.fpd, seeds=len(rows), tested=len(done),
                        decisions=dec, payloads=sum(r['payloads'] for r in done),
                        payload_equal=sum(r['payload_mismatch'] is None for r in done),
+                       visible_reordered=sum(r.get('visible_reordered', 0) for r in done),
                        digests_equal=sum(r['digests_equal'] for r in done),
                        digest_checks=sum(r['digest_checks'] for r in done),
                        legs=sum(r.get('legs', 0) for r in done),
