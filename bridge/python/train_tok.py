@@ -2569,6 +2569,7 @@ def main(argv=None, child=None, actor=None):
     if shard_world > 1:
         if proc or args.actor_processes > 1 or os.environ.get('ISAAC_RL_LEARNER_BENCH'):
             raise SystemExit('BM1 C (ISAAC_SHARD_WORLD > 1): the learner in this process, one actor process, no bench')
+        from isaac_bridge import shard_sync as shard_sync_mod
         from isaac_bridge.shard_sync import ShardSync
         SYNC = ShardSync.from_env(lm_dev).init()
         SYNC.broadcast_state([learner_model, pcritic, aux_head], [opt, popt, aopt])
@@ -4198,7 +4199,7 @@ def main(argv=None, child=None, actor=None):
                                     aux_acc_ev=aux_acc_ev if aux_on else None, bwd_calls='learn_bwd_calls',
                                     bwd_span='learn_bwd')
         CX2 = None
-        shard_s0 = dict(SYNC.stats) if SYNC is not None else None   # (BM1 C: this update's share of the counters)
+        shard_s0 = dict(SYNC.drain()) if SYNC is not None else None   # (BM1 C: this update's share of the counters)
         if p2_mode == 'two':   # the replicas get the learner's parameters; the second card's accumulators
             P2.bind()
             p2_s0 = dict(P2.stats)
@@ -4769,8 +4770,8 @@ def main(argv=None, child=None, actor=None):
         row.update({f'uc_{k}': v for k, v in UC.items()})   # (B60)
         if SYNC is not None:   # BM1 C: K, the learning rate's factor and value, this update's steps (zero-weight ones
             # among them), the global rows per step, the seconds waiting for the slowest rank / reducing, the checks
-            st_ = SYNC.stats
-            row.update(shard_world=SYNC.world, shard_rank=SYNC.rank, shard_lr_mult=args.shard_lr_mult,
+            st_ = SYNC.drain()   # (the steps' CUDA-event times read now: the update has ended)
+            row.update(shard_hostsync=int(shard_sync_mod.HOSTSYNC), shard_world=SYNC.world, shard_rank=SYNC.rank, shard_lr_mult=args.shard_lr_mult,
                        shard_frac=L.get('shard_frac', 0.0), shard_steps=st_['steps'] - shard_s0['steps'],
                        shard_pad_steps=st_['pad_steps'] - shard_s0['pad_steps'],
                        shard_rows_per_step=(st_['rows'] - shard_s0['rows']) / max(1, st_['steps'] - shard_s0['steps']),
@@ -6235,6 +6236,11 @@ def main(argv=None, child=None, actor=None):
             if slog is not None:
                 slog.close()
         if SYNC is not None:   # BM1 C: the run's synchronisation counters; the process groups closed
+            if SYNC.peer_lost is None:   # (an aborted run: its last events are not waited for)
+                try:
+                    SYNC.drain()
+                except Exception:
+                    pass
             print(f'BM1 C shard {SYNC.rank}: {SYNC.stats}' + (f'; rank {SYNC.peer_lost[0]} ended first'
                                                              if SYNC.peer_lost else ''), flush=True)
             SYNC.close()

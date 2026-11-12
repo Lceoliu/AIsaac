@@ -27,6 +27,9 @@ import torch
 import torch.distributed as dist
 
 
+HOSTSYNC = os.environ.get('ISAAC_SHARD_HOSTSYNC', '0') == '1'
+
+
 def _int_view(t):
     iv = {8: torch.int64, 4: torch.int32, 2: torch.int16, 1: torch.uint8}[t.element_size()]
     return t.detach().reshape(-1).view(iv).to(torch.int64)
@@ -57,6 +60,7 @@ class ShardSync:
         self.dir = shard_dir
         self.stats = dict(reduce_s=0.0, wait_s=0.0, steps=0, pad_steps=0, rows=0.0, checks=0, mismatches=0, restores=0)
         self.peer_lost = None
+        self._pending = []
         self.pg = self.ctrl = None
         self._watch = None
 
@@ -167,16 +171,28 @@ class ShardSync:
         """Every rank's gradients of `params` (one list: the optimisers' parameters in a fixed order; a missing
         gradient counts as zero) replaced by sum_r(weight_r * g_r) / sum_r(weight_r): per dtype one flat buffer, the
         weights' sum in the float32 one's last element. The time waiting for the slowest rank (a one-element all_reduce
-        first) and the reduce's own time are counted apart."""
+        first) and the reduce's own time are counted apart.
+        CUDA (default): no host synchronisation -- the collectives queue on the current stream behind the backward, the
+        CPU goes on to the next part; the two times are CUDA-event spans on the stream (read by drain(): the wait from
+        this rank's backward end to every rank's, the reduce after it). ISAAC_SHARD_HOSTSYNC=1 (the first version): the
+        host waits for the stream before and after the barrier, host-clock times."""
+        ev = self.cuda and not HOSTSYNC
         t0 = time.perf_counter()
-        if self.cuda:
+        if ev:
+            e0 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+        elif self.cuda:
             torch.cuda.current_stream().synchronize()
         tw = self._t([1.0], torch.float32)
         dist.all_reduce(tw, group=self.pg)   # (the barrier: every rank's backward done)
-        if self.cuda:
+        if ev:
+            e1 = torch.cuda.Event(enable_timing=True)
+            e1.record()
+        elif self.cuda:
             torch.cuda.current_stream().synchronize()
         t1 = time.perf_counter()
-        self.stats['wait_s'] += t1 - t0
+        if not ev:
+            self.stats['wait_s'] += t1 - t0
         groups = {}
         for i, p in enumerate(params):
             groups.setdefault(p.dtype, []).append(i)
@@ -207,9 +223,25 @@ class ShardSync:
                     p.grad = v.view_as(p).clone()
                 else:
                     p.grad.copy_(v.view_as(p))
-        self.stats['rows'] += float(wsum.item())   # (a synchronisation: the reduce's end, the global rows)
-        self.stats['reduce_s'] += time.perf_counter() - t1
+        if ev:   # (read at drain(): no synchronisation here)
+            e2 = torch.cuda.Event(enable_timing=True)
+            e2.record()
+            self._pending.append((e0, e1, e2, wsum))
+        else:
+            self.stats['rows'] += float(wsum.item())   # (a synchronisation: the reduce's end, the global rows)
+            self.stats['reduce_s'] += time.perf_counter() - t1
         self.stats['steps'] += 1
+
+    def drain(self):
+        """The queued steps' CUDA-event times and global rows into stats (synchronises with their events: call it
+        where the update ends anyway). Returns stats."""
+        for e0, e1, e2, wsum in self._pending:
+            e2.synchronize()
+            self.stats['wait_s'] += e0.elapsed_time(e1) / 1e3
+            self.stats['reduce_s'] += e1.elapsed_time(e2) / 1e3
+            self.stats['rows'] += float(wsum.item())
+        self._pending.clear()
+        return self.stats
 
     # ---- consistency
     def _state(self, models, opts, extra_arrays):
