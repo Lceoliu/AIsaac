@@ -4,7 +4,8 @@
 #          [MAX_RETRY=3] [BACKOFF=120] [DISK_MIN_GB=50] train_guard.sh <name> <tree> <lane 0 file> <lane 1 file> [...]
 # Run directory /root/AIsaac/train/<name> (the container's /bench/train/<name>): rank r writes <name>-s<r>/ (progress.csv,
 # episodes.jsonl rotated past 256 MB, checkpoints/), guard.log (every start, end, cause, resume), foreign_gpu.log (other
-# processes seen on our GPUs), STOP (touch it: the ranks end together at their next collect, the guard ends, no resume).
+# processes seen on our GPUs), STOP (touch it: the ranks end together at their next collect, the guard ends, no resume),
+# guard.env (optional: sourced before every attempt, e.g. DISK_MIN_GB / MAX_RETRY / BACKOFF).
 # Takes the host's exclusive lock for the whole run (purpose: training), released at its end.
 # Each attempt: preflight (every GPU listed, no new Xid), the disk's free space, the newest readable checkpoint of rank 0
 # (update-*.pt / last.pt: a zip that tests whole; else the one before), one container (shardk_in.sh, the K ranks).
@@ -68,6 +69,7 @@ newest_ckpt() {   # rank 0's newest checkpoint whose zip tests whole (as the con
 }
 attempt=0; last_cause=""; same=0; oom_foreign=0; last_upd=""; upd_fail=0
 while :; do
+  [ -f $RD/guard.env ] && . $RD/guard.env   # (overrides read before every attempt: DISK_MIN_GB, MAX_RETRY, BACKOFF, ...)
   [ -f $RD/STOP ] && { glog "STOP before an attempt: the guard ends"; break; }
   ( preflight "train $NAME" ) || { glog "preflight failed (Xid or a GPU missing: $(cat $BM/STOP_QUEUE 2>/dev/null)): stopped, no resume"; break; }
   free_gb=$(df -BG --output=avail /root/AIsaac | tail -1 | tr -dc 0-9)
