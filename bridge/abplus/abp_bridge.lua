@@ -1693,6 +1693,16 @@ ABP_PU.play_armed = 0
 state.native_obs = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_OBS") or "1")) or 1
 ABP_NATIVE_OBS = { available = native_lean ~= nil, native = 0, fallbacks = 0, last_fallback = nil, checks = 0,
 	mismatches = 0, first = nil }
+-- Native visible block (G, 2026-11-12, same VERSION: what the worker decodes is unchanged). abp_turbo's
+-- abp_native_visible() builds visible_input_block()'s block in C from the same engine functions (one call per item id
+-- without luabridge, no Lua tables, no json.encode); the JSON keys come in a fixed order (decoders do not depend on it).
+-- Mode (ISAAC_RL_NATIVE_VISIBLE, or "native_visible" in the native_step command): 0 off (default: the Lua block),
+-- 1 native (and the native step's fast path takes the block along: native_step_obs), 2 check (both built, the Lua one
+-- sent; their json.decode compared: ABP_NATIVE_VIS.mismatches, the first difference kept).
+local native_visible = native_lean ~= nil and type(abp_native_visible) == "function" and abp_native_visible or nil
+state.native_visible = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_VISIBLE") or "0")) or 0
+ABP_NATIVE_VIS = { available = native_visible ~= nil, native = 0, fallbacks = 0, last_fallback = nil, checks = 0,
+	mismatches = 0, first = nil, step = 0 }
 -- Terrain block cache (2026-10-04, same VERSION: the bytes on the wire are unchanged). The lean terrain check resends
 -- the terrain block every LEAN_FULL_EVERY logic frames once anything in the room changed (a full pass after a change
 -- clears the full signature), each time built anew in Lua: the cells' tables and two json.encode, the costliest thing
@@ -1993,6 +2003,47 @@ function visible_input_block()
 	return spack("<s4", json.encode(result))
 end
 
+-- (G) deep equality of two decoded JSON values (check mode 2); the path of the first difference
+local function same_json(a, b, path)
+	if type(a) ~= type(b) then return false, path end
+	if type(a) ~= "table" then
+		if a == b then return true end
+		return false, path
+	end
+	for k, v in pairs(a) do
+		local ok, where = same_json(v, b[k], path .. "." .. tostring(k))
+		if not ok then return false, where end
+	end
+	for k, _ in pairs(b) do
+		if a[k] == nil then return false, path .. "." .. tostring(k) end
+	end
+	return true
+end
+
+-- The visible block as the mode says (see ABP_NATIVE_VIS); the Lua block when the native one hands over
+function visible_block()
+	local mode = native_visible ~= nil and state.native_visible or 0
+	if mode == 0 then return visible_input_block() end
+	local v = ABP_NATIVE_VIS
+	local nb, why = native_visible()
+	if nb == nil then
+		v.fallbacks, v.last_fallback = v.fallbacks + 1, why
+		return visible_input_block()
+	end
+	if mode == 1 then
+		v.native = v.native + 1
+		return nb
+	end
+	local ref = visible_input_block()
+	v.checks = v.checks + 1
+	local ok, where = same_json(json.decode(ref:sub(5)), json.decode(nb:sub(5)), "")
+	if not ok then
+		v.mismatches = v.mismatches + 1
+		if v.first == nil then v.first = { frame = state.logic_frames, where = where, lua = ref:sub(5), c = nb:sub(5) } end
+	end
+	return ref
+end
+
 function pack_lean(event)
 	local mode = native_lean ~= nil and state.native_obs or 0
 	local force = event ~= "step" or state.terrain_dirty
@@ -2019,7 +2070,7 @@ end
 
 -- The terrain block (when the terrain check says resend) and the map block (when it is due and changed) of a lean
 -- observation; "" for a block that is not sent.
-function lean_blocks(event, resend, here, clear)
+function lean_blocks(event, resend, here, clear, novis)
 	local terrain = ""
 	if resend then
 		local _, room, _, player0 = lean_handles()
@@ -2058,7 +2109,8 @@ function lean_blocks(event, resend, here, clear)
 		end
 	end
 	local inv = state.lean_items and lean_inventory(event, here) or ""
-	return terrain, map, inv, visible_input_block()
+	-- (G: novis: the native step appends the native visible block itself)
+	return terrain, map, inv, novis and "" or visible_block()
 end
 
 -- The fixed part of a lean observation (header .. entities .. lasers): native in mode 1 / 2 when it can, else Lua.
@@ -2614,10 +2666,15 @@ local function handle_command(line)
 		elseif cmd.cmd == "native_step" then   -- native step: 0 off, 1 on when available (see native_step_obs)
 			if cmd.mode ~= nil then state.native_step = math.tointeger(tonumber(cmd.mode)) or 1 end
 			if cmd.terrain_cache ~= nil then state.terrain_cache = math.tointeger(tonumber(cmd.terrain_cache)) or 1 end
-			local s, tc = ABP_NATIVE_STEP, ABP_TERRAIN_CACHE
+			if cmd.native_visible ~= nil then state.native_visible = math.tointeger(tonumber(cmd.native_visible)) or 0 end
+			local s, tc, v = ABP_NATIVE_STEP, ABP_TERRAIN_CACHE, ABP_NATIVE_VIS
 			send({ type = "ok", cmd = "native_step", mode = state.native_step, available = s.available, steps = s.steps,
 				lines = s.lines, other = s.other, fallbacks = s.fallbacks, blocks = s.blocks, last_fallback = s.last_fallback,
 				turbo = getenv("ABP_OBS_STATUS"), prof = getenv("ABP_STEP_PROF"), terrain_cache = state.terrain_cache,
+				-- (G) the native visible block: mode, availability, counts, the first difference in check mode
+				native_visible = state.native_visible, vis_available = v.available, vis_native = v.native, vis_step = v.step,
+				vis_fallbacks = v.fallbacks, vis_last_fallback = v.last_fallback, vis_checks = v.checks,
+				vis_mismatches = v.mismatches, vis_first = v.first, vis_turbo = getenv("ABP_VIS_STATUS"),
 				tc_available = tc.available, tc_hits = tc.hits, tc_builds = tc.builds, tc_checks = tc.checks,
 				tc_mismatches = tc.mismatches })
 		elseif cmd.cmd == "fork" then   -- abp-0.2.14
@@ -2761,7 +2818,11 @@ local function native_step_obs()
 	local s = ABP_NATIVE_STEP
 	local consecutive = s.consecutive
 	s.consecutive = false
-	local ok, terrain, map, inv, visible = pcall(lean_blocks, "step", resend, here, clear)
+	-- (G, 2026-11-12) native visible mode 1: lean_blocks leaves the visible block out; the fast path (no other block)
+	-- has abp_native_step append the native one, a slow one builds it below
+	local nvis = native_visible ~= nil and state.native_visible == 1
+	local ok, terrain, map, inv, visible = pcall(lean_blocks, "step", resend, here, clear, nvis)
+	if ok and nvis and (terrain ~= "" or map ~= "" or inv ~= "") then visible = visible_block() end
 	if not ok or terrain ~= "" or map ~= "" or inv ~= "" or visible ~= "" then
 		s.blocks = s.blocks + 1
 		local sent = send_lean_payload(function()
@@ -2772,7 +2833,8 @@ local function native_step_obs()
 		if sent then wait_command() end
 		return true
 	end
-	local code, a, b, cc, d, e, f = native_step(c:getfd(), state.logic_frames, state.seq, consecutive)
+	local code, a, b, cc, d, e, f = native_step(c:getfd(), state.logic_frames, state.seq, consecutive, nvis)
+	if nvis and code ~= 0 then ABP_NATIVE_VIS.native, ABP_NATIVE_VIS.step = ABP_NATIVE_VIS.native + 1, ABP_NATIVE_VIS.step + 1 end
 	if code == 1 then   -- a step line: (repeat, move, shoot, bomb, item[, pill]: a library without it gives nil = 0)
 		s.steps, s.lines, s.consecutive = s.steps + 1, s.lines + 1, true
 		ABP_NATIVE_OBS.native = ABP_NATIVE_OBS.native + 1
@@ -2782,9 +2844,12 @@ local function native_step_obs()
 		ABP_NATIVE_OBS.native = ABP_NATIVE_OBS.native + 1
 		if code == 3 then send({ type = "error", msg = "bad step line" }) end
 		wait_command()
-	elseif code == 0 then   -- nothing sent: the native fixed part handed over (a laser)
+	elseif code == 0 then   -- nothing sent: the native fixed part (or, G, the native visible block) handed over
 		s.fallbacks, s.last_fallback = s.fallbacks + 1, a
-		if send_lean_payload(function() return lean_fixed(1, here, 0) end) then wait_command() end
+		if nvis then   -- (the Lua visible block: the step's observation always carries one)
+			local vb = visible_input_block()
+			if send_lean_payload(function() return lean_fixed(1, here, 32) .. vb end) then wait_command() end
+		elseif send_lean_payload(function() return lean_fixed(1, here, 0) end) then wait_command() end
 	else   -- the connection failed
 		disconnect(a)
 	end
