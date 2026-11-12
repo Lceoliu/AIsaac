@@ -220,7 +220,7 @@ def native_consumer_reason(cpp_driver, rolls, lab, t_on, mem_on, proc, n_act):
     return None
 
 
-def attach_consumer(d, book, rolls, gamma, cap_t=0):
+def attach_consumer(d, book, rolls, gamma, cap_t=0, trunc=0):
     """(B58a+b) The driver's native consumer: Episodes' arrays and reward weights, both rollouts' arrays (slots 0 / 1:
     rolls[i].native_slot), their frame arenas moved into the driver (NativeFrameArena)."""
     from .tok_obs import ROW, ROWC, ROW_FRAME_AT, EV_EXIT, EV_ITEM, EV_ACTIVE, EV_PILL, DONE_BRANCH
@@ -242,7 +242,7 @@ def attach_consumer(d, book, rolls, gamma, cap_t=0):
                end_bonus=float(book.end_bonus), gamma=float(gamma), floor=bool(book.floor), run=bool(book.run),
                items=bool(book.items), gains_on=book.gains is not None, plr_on=book.plr is not None,
                pick_on=book.pick is not None, ev_exit=int(EV_EXIT), ev_item=int(EV_ITEM), ev_active=int(EV_ACTIVE),
-               ev_pill=int(EV_PILL), done_branch=int(DONE_BRANCH), cap_t=int(cap_t), o_t=f('t'),
+               ev_pill=int(EV_PILL), done_branch=int(DONE_BRANCH), cap_t=int(cap_t), o_t=f('t'), trunc=int(trunc),
                ret=ptr(book.ret, np.float64), hurt=ptr(book.hurt, np.float64), damage=ptr(book.damage, np.float64),
                gains=ptr(book.gains, np.float64), healed=ptr(book.healed, np.float64), gathered=ptr(book.gathered, np.float64),
                v0=ptr(book.v0, np.float64), gret=ptr(book.gret, np.float64), rooms=ptr(book.rooms, np.int64),

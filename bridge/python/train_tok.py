@@ -959,17 +959,29 @@ def workers_live(driver, sampler):
     return len(getattr(sampler, 'live', None) or [])
 
 
-# (--cap-truncate 1) the episode cap in decisions (run mode --run-seconds, else --floor-seconds): an end with done 3
-# at or past it is the time cap, not a stall -- a truncation (no timeout penalty, not terminal; its record is
-# evaluated and bootstraps the decision before, as a branch's truncated end); 0: off (every done 3 a terminal timeout)
+# The episode cap in decisions (floor / run modes: run mode --run-seconds, else --floor-seconds; 0 elsewhere): an end
+# with done 3 at or past it is the time cap, before it the floor's stall rule (episodes.jsonl 'cap' / 'stall' 1).
+# TRUNC (--cap-truncate 1: bit 1, --stall-truncate 1: bit 2): those ends are truncations -- no timeout penalty, not
+# terminal; the end record is evaluated and bootstraps the decision before (a branch's truncated end); 0: every done 3
+# a terminal timeout, as before
 CAP_T = 0
+TRUNC = 0
 
 
 def is_cap(rows):
-    """Records that end their episode at the time cap (CAP_T; none when off)."""
+    """Records that end their episode at the time cap (none outside floor / run modes)."""
     if CAP_T <= 0:
         return np.zeros(len(rows), bool)
     return (rows['done'] == 3) & (rows['t'].astype(np.int64) >= CAP_T)
+
+
+def is_trunc(rows):
+    """Records whose done 3 is a truncation (TRUNC: the cap's ends, the stall's ends, both; none when 0)."""
+    if CAP_T <= 0 or not TRUNC:
+        return np.zeros(len(rows), bool)
+    t3 = rows['done'] == 3
+    at_cap = rows['t'].astype(np.int64) >= CAP_T
+    return t3 & ((at_cap & bool(TRUNC & 1)) | (~at_cap & bool(TRUNC & 2)))
 
 
 def lr_at(frac, lr0, lr1, schedule='linear', warmup=0.0):
@@ -984,6 +996,9 @@ def lr_at(frac, lr0, lr1, schedule='linear', warmup=0.0):
         return lr1 + (lr0 - lr1) * 0.5 * (1.0 + math.cos(math.pi * p))
     return lr0 + (lr1 - lr0) * p
 
+
+# (the hand-offs' PageStore collect every this many; 1: every one, as before; see the hand-off)
+COLLECT_EVERY = max(1, int(os.environ.get('ISAAC_BLOCK_COLLECT_EVERY', '1') or 1))
 
 DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its game / worker failed before its end record)
 
@@ -1092,7 +1107,8 @@ class Episodes:
             if (~trunc).any():
                 self.close_broken(wb[~trunc])
         has = k >= 0
-        cap = is_cap(rows)   # (--cap-truncate: the time cap's ends, a truncation)
+        cap = is_trunc(rows)   # (--cap-truncate / --stall-truncate: those ends, truncations)
+        capped = is_cap(rows)
         if has.any():   # the reward of the decision before
             w, kk, d = idx[has], k[has], done[has]
             cap_h = cap[has]
@@ -1172,8 +1188,10 @@ class Episodes:
                 fin = dict(group=int(r['group']), seed=int(r['seed']), done=int(r['done']),
                            decisions=int(r['t']), ret=float(self.ret[i]), hurt=float(self.hurt[i]),
                            damage=float(self.damage[i]), rooms=int(self.rooms[i]), boss=int(self.boss[i]))
-                if cap[j]:   # (--cap-truncate: done 3 at the time cap -- not a stall)
+                if capped[j]:   # (done 3 at the time cap)
                     fin['cap'] = 1
+                elif CAP_T > 0 and int(r['done']) == 3:   # (done 3 before it: the floor's stall rule)
+                    fin['stall'] = 1
                 if self.run or self.items:
                     x = self.extra[i]
                     fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]),
@@ -1263,8 +1281,8 @@ def _native_events(book, rows, idx, snap):
         i, r, sv = idx[j], rows[j], snap[j]
         fin = dict(group=int(r['group']), seed=int(r['seed']), done=int(r['done']), decisions=int(r['t']), ret=float(sv[0]),
                    hurt=float(sv[1]), damage=float(sv[2]), rooms=int(sv[3]), boss=int(sv[4]))
-        if CAP_T > 0 and int(r['done']) == 3 and int(r['t']) >= CAP_T:   # (--cap-truncate: the time cap)
-            fin['cap'] = 1
+        if CAP_T > 0 and int(r['done']) == 3:   # (the time cap's end, or the stall rule's)
+            fin['cap' if int(r['t']) >= CAP_T else 'stall'] = 1
         if self.run or self.items:
             x = sv[5:11].astype(np.int64)
             fin.update(exits=int(x[0]), items=int(x[1]), uses=int(x[2]), pills=int(x[3]), stage0=int(x[4]),
@@ -1337,7 +1355,7 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
     if priv is not None:   # 2026-11-03 (--priv-critic)
         roll.priv[a_idx, kk] = priv
     roll.rows[a_idx, kk] = compact_rows(rows, roll.frames) if roll.rows.dtype == ROWC else rows   # (B45)
-    roll.boot[a_idx, kk] = (rows['done'] == DONE_BRANCH) | is_cap(rows)   # (branches' truncated ends; --cap-truncate)
+    roll.boot[a_idx, kk] = (rows['done'] == DONE_BRANCH) | is_trunc(rows)   # (branch ends; --cap- / --stall-truncate)
     roll.pending[a_idx, kk], roll.actions[a_idx, kk] = under_way, actions
     roll.logp[a_idx, kk], roll.value[a_idx, kk], roll.version[a_idx, kk] = logp, value, version
     roll.length[a_idx], roll.open[a_idx] = kk + 1, kk
@@ -1632,6 +1650,9 @@ def main(argv=None, child=None, actor=None):
                         '(2026-10-06): from Basement I on through the trapdoors (one group, named run)')
     p.add_argument('--run-seconds', type=float, default=1800.0,
                    help='run mode: game seconds a run may last (the stall rule of each floor as in floor mode)')
+    p.add_argument('--stall-truncate', type=int, default=0,
+                   help='floor / run modes, 1: an episode ended by the floor\'s stall rule (done 3 before the time cap) '
+                        'is a truncation too, as --cap-truncate\'s cap ends; 0: a terminal timeout (as before)')
     p.add_argument('--cap-truncate', type=int, default=0,
                    help='floor / run modes, 1: an episode ended by the time cap (--run-seconds; floor mode '
                         '--floor-seconds) is a truncation -- no timeout penalty, not terminal, the decision before '
@@ -2715,11 +2736,12 @@ def main(argv=None, child=None, actor=None):
         actor_params = [t for t in list(model.parameters()) + list(model.buffers())]
     learner_params = [t for t in list(learner_model.parameters()) + list(learner_model.buffers())]
     hours_per_decision = args.frames_per_decision / 30 / 3600
-    if args.cap_truncate:   # (the consumers' CAP_T: the cap in decisions, as tok_floor's limit)
-        if args.mode not in ('floor', 'run'):
-            raise SystemExit('--cap-truncate: floor or run mode only')
+    if (args.cap_truncate or args.stall_truncate) and args.mode not in ('floor', 'run'):
+        raise SystemExit('--cap-truncate / --stall-truncate: floor or run mode only')
+    if args.mode in ('floor', 'run'):   # (the consumers' CAP_T: the cap in decisions, as tok_floor's limit; TRUNC)
         globals()['CAP_T'] = int(round((args.run_seconds if args.mode == 'run' else args.floor_seconds) * 30
                                        / args.frames_per_decision))
+        globals()['TRUNC'] = (1 if args.cap_truncate else 0) | (2 if args.stall_truncate else 0)
     total_h = float(os.environ.get('ISAAC_GAME_HOURS_TOTAL') or 0)   # (train_guard.sh: the run's game hours in all)
     config = dict(vars(args), groups_resolved=names, assign=assign,
                   parameters=sum(q.numel() for q in learner_model.parameters()), reward_terms=rw, lag=1,
@@ -3096,8 +3118,8 @@ def main(argv=None, child=None, actor=None):
         made_g = bdrv.precapture_lane_generations(lanes, model)   # (both teacher generations' lane graphs now)
         cpp_driver = bdrv.make_driver(block_actor, sampler, actor_stream, args.seed + 1000003 * aid + 0xB52, pf_on,
                                       getattr(sampler, 'aux', None))
-        if cpp_driver is not None and CAP_T > 0:   # (--cap-truncate: the driver evaluates the time cap's ends too)
-            cpp_driver.set_cap(CAP_T)
+        if cpp_driver is not None and CAP_T > 0 and TRUNC:   # (the driver evaluates the truncated ends too)
+            cpp_driver.set_cap(CAP_T, TRUNC)
         if cpp_driver is not None:
             for la_ in lanes.actors.values():   # (the pre-created lane actors' graphs: their middle in C++ too)
                 if la_.step_graph is not None:
@@ -4931,6 +4953,12 @@ def main(argv=None, child=None, actor=None):
             row.update({f'uo_{k}': v for k, v in UO.items()})
         row['u_log_prev'], row['u_ckpt_prev'] = L.get('log_s', 0.0), L.get('ckpt_s', 0.0)
         import shutil as shutil_
+        # (the episodes' ends this update, main episodes: the time cap's, the stall rule's, the stall rule's with no
+        #  progress at all -- no monster hurt, no new room, no item gained, no exit)
+        row['ep_cap'] = sum(1 for e in finished if e.get('cap'))
+        row['ep_stall'] = sum(1 for e in finished if e.get('stall'))
+        row['ep_stall_zero'] = sum(1 for e in finished if e.get('stall') and not e.get('damage') and not e.get('rooms')
+                                   and not e.get('items') and not e.get('exits'))
         row['broken_episodes'] = len(job.get('broken', []))   # (this update's; the guard warns / stops on them)
         row['broken_total'] = job.get('broken_total', 0)
         # (workers whose pipe is still open: fewer than --workers = some ended -- the collect slower, or, below what fills
@@ -5525,6 +5553,7 @@ def main(argv=None, child=None, actor=None):
         if failure:
             raise failure[0]
 
+    collect_k, gc_last = [0], [None]   # (ISAAC_BLOCK_COLLECT_EVERY: hand-offs counted, the last collect's figures)
     def stopped():
         """(B38 step 5, another actor) the first actor asked this one to stop."""
         return stop_ev is not None and stop_ev.is_set()
@@ -5570,7 +5599,7 @@ def main(argv=None, child=None, actor=None):
     if cpp_driver is not None:
         why_c = bdrv.native_consumer_reason(cpp_driver, (roll, spare), lab, t_on, mem_on, proc, n_act)
         if why_c is None:
-            bdrv.attach_consumer(cpp_driver, book, (roll, spare), args.gamma, cap_t=CAP_T)
+            bdrv.attach_consumer(cpp_driver, book, (roll, spare), args.gamma, cap_t=CAP_T, trunc=TRUNC)
             cpp_driver.use_rollout(roll.native_slot)
             native_cons = True
         print(f'B58 native consumer: {"on" if native_cons else "off (%s: the Python consumer)" % why_c}', flush=True)
@@ -6331,10 +6360,19 @@ def main(argv=None, child=None, actor=None):
             handed += roll.usable()
             if block_actor is not None and hasattr(block_actor,'store'):
                 # A1 leases: free page rows/sources no rollout, teacher buffer, point, lane or slot can read.
+                # (ISAAC_BLOCK_COLLECT_EVERY=N: every N-th hand-off only -- its cost grows with the live records (the
+                #  teacher / CF buffers: ~2 s per hand-off at 12000 records); rows dead since stay up to N-1 hand-offs
+                #  longer: at most ~(N-1) x 4000 rows x 31 KiB, ~0.4 GB per rank at N=4; the hand-offs before a
+                #  checkpoint update collect always. Values are untouched: only when row ids are freed / reused)
+                collect_k[0] += 1
+                force_ = (sent_handoffs + 1) % max(1, args.checkpoint_every) == 0
                 t_gc = time.perf_counter()
-                nv.push('h.gc')
-                gc_b = block_actor.store.collect()
-                nv.pop()
+                if COLLECT_EVERY <= 1 or collect_k[0] % COLLECT_EVERY == 0 or force_ or gc_last[0] is None:
+                    nv.push('h.gc')
+                    gc_b = gc_last[0] = block_actor.store.collect()
+                    nv.pop()
+                else:
+                    gc_b = dict(gc_last[0], freed_kv=0, freed_blocks=0, freed_raw=0)
                 lane_stat['block_gc_s'] = time.perf_counter()-t_gc
                 lane_stat['block_kv_rows'], lane_stat['block_blocks'], lane_stat['block_raw_rows'] = (
                     gc_b['kv'], gc_b['blocks'], gc_b['raw'])
@@ -6387,6 +6425,8 @@ def main(argv=None, child=None, actor=None):
             if failure:
                 raise failure[0]
         clean_end = True
+        if COLLECT_EVERY > 1 and block_actor is not None and hasattr(block_actor, 'store'):
+            block_actor.store.collect()   # (ISAAC_BLOCK_COLLECT_EVERY: the end's state as with a collect every hand-off)
         if actor is not None and not stopped():   # (B38 step 5, a second actor at its end: its last half is handed;
             #                                       it waits, its workers paused, until the first actor stops it)
             actor['last'].set()

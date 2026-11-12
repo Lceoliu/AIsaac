@@ -43,7 +43,7 @@ def make_book(stats):
     return b
 
 
-def stream(rng, n_steps, nh, cap=0):
+def stream(rng, n_steps, nh, cap=0, trunc=0):
     """per step: (workers, ROW records, go mask, outputs [n_go, nh+3], actions / pending [n_go, nh], priv bytes)"""
     started = np.zeros(W, bool)
     t = np.zeros(W, np.int64)
@@ -83,8 +83,9 @@ def stream(rng, n_steps, nh, cap=0):
             if d not in (0, DONE_BRANCH):
                 started[w] = False
         go = ~(rows['done'] != 0) | (rows['done'] == DONE_BRANCH)
-        if cap:   # (--cap-truncate: done 3 at t >= cap, the time cap, is evaluated as a truncation)
-            go |= (rows['done'] == 3) & (rows['t'] >= cap)
+        if cap and trunc:   # (--cap- / --stall-truncate: done 3 at t >= cap / before it, evaluated as truncations)
+            at_cap = rows['t'] >= cap
+            go |= (rows['done'] == 3) & ((at_cap & bool(trunc & 1)) | (~at_cap & bool(trunc & 2)))
         n = int(go.sum())
         o = np.zeros((n, nh+3), np.float32)
         o[:, :nh] = rng.integers(0, 4, (n, nh))
@@ -155,11 +156,12 @@ def same_rollout(a, b):
     assert a.block.open == b.block.open
 
 
-@pytest.mark.parametrize('cap', [0, 6])
-def test_native_consumer_matches_python_consumer(cap, monkeypatch):
+@pytest.mark.parametrize('cap,trunc', [(0, 0), (6, 0), (6, 1), (6, 2), (6, 3)])
+def test_native_consumer_matches_python_consumer(cap, trunc, monkeypatch):
     import train_tok as T
     from isaac_bridge.tok_priv import PRIV as PRIV_DTYPE
-    monkeypatch.setattr(T, 'CAP_T', cap)   # (--cap-truncate: the time cap's ends a truncation, both consumers)
+    monkeypatch.setattr(T, 'CAP_T', cap)   # (the time cap in decisions: its ends and the stall's told apart)
+    monkeypatch.setattr(T, 'TRUNC', trunc)   # (1 the cap's ends, 2 the stall's, 3 both: truncations, both consumers)
     torch.manual_seed(71)
     m = make_policy('cuda').eval()
     nh = len(m.heads)
@@ -167,11 +169,11 @@ def test_native_consumer_matches_python_consumer(cap, monkeypatch):
     s = fake_sampler(W, nh)
     s.priv = np.zeros(2*W, PRIV_DTYPE)   # (the records' privileged rows: the driver copies them, the consumer stores them)
     d = make_driver_for(actor, s)
-    steps = stream(np.random.default_rng(71), 120, nh, cap)
+    steps = stream(np.random.default_rng(71), 120, nh, cap, trunc)
     stats_a, stats_b = np.zeros((W, 2)), np.zeros((W, 2))
     book_a, book_b = make_book(stats_a), make_book(stats_b)
     rolls_a, rolls_b = make_pair(nh, PRIV_DTYPE), make_pair(nh, PRIV_DTYPE)
-    bdrv.attach_consumer(d, book_b, rolls_b, 0.99, cap_t=cap)
+    bdrv.attach_consumer(d, book_b, rolls_b, 0.99, cap_t=cap, trunc=trunc)
     assert d.consumer_on and isinstance(rolls_b[0].frames, bdrv.NativeFrameArena)
     ra = run_python(book_a, rolls_a, steps, nh, PRIV_DTYPE, 5)
     rb = run_native(d, book_b, rolls_b, steps, nh, PRIV_DTYPE, 5)
@@ -181,8 +183,8 @@ def test_native_consumer_matches_python_consumer(cap, monkeypatch):
         np.testing.assert_array_equal(getattr(book_a, name), getattr(book_b, name), err_msg=name)
     np.testing.assert_array_equal(book_a.pick['steps'], book_b.pick['steps'])
     assert book_a.finished == book_b.finished and len(book_a.finished) > 5
-    if cap:   # (time-cap ends among them, marked, and their decisions truncations)
-        assert any(e.get('cap') for e in book_a.finished) and any(e['done'] == 3 and not e.get('cap') for e in book_a.finished)
+    if cap:   # (time-cap ends and stall ends among them, marked apart)
+        assert any(e.get('cap') for e in book_a.finished) and any(e.get('stall') for e in book_a.finished)
     assert book_a.branch_finished == book_b.branch_finished and len(book_a.branch_finished) > 0
     # (episodes that broke off -- the stream's breaks while a decision is open: their own lines, the same both ways)
     assert book_a.broken == book_b.broken and book_a.broken_total == book_b.broken_total and len(book_a.broken) > 0

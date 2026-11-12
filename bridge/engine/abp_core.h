@@ -226,7 +226,8 @@ struct ConsumerCfg {
   i64 ev_exit = 8, ev_item = 16, ev_active = 32, ev_pill = 64, done_branch = 4;
   // (--cap-truncate) the episode cap in decisions, 0 off; o_t ROW 't' (int32): done 3 at t >= cap_t is the time cap -- a
   // truncation (no timeout penalty, not terminal, its record a boot decision), not a stall (train_tok.is_cap)
-  i64 cap_t = 0, o_t = -1;
+  // trunc: bit 1 the cap's ends (t >= cap_t), bit 2 the stall's (done 3 before it, --stall-truncate); 0 off
+  i64 cap_t = 0, o_t = -1, trunc = 0;
   double *ret = nullptr, *ep_hurt = nullptr, *ep_damage = nullptr, *gains = nullptr, *healed = nullptr, *gathered = nullptr,
          *v0 = nullptr, *gret = nullptr;
   i64 *rooms = nullptr, *boss = nullptr, *extra = nullptr, *steps = nullptr, *pick_steps = nullptr;
@@ -265,7 +266,11 @@ inline void consume(const ConsumerCfg &c, RollSlot &R, std::mutex &amu, const Ro
     const uint8_t *src = rc+i*L.row_stride;
     bool first = u8(src, c.o_first) != 0;
     i64 d = u8(src, c.o_done);
-    bool cap = c.cap_t > 0 && c.o_t >= 0 && d == 3 && (i64)rd_int(src+c.o_t, 4) >= c.cap_t;
+    bool cap = false;
+    if (c.trunc && c.cap_t > 0 && c.o_t >= 0 && d == 3) {
+      bool at_cap = (i64)rd_int(src+c.o_t, 4) >= c.cap_t;
+      cap = at_cap ? (c.trunc & 1) != 0 : (c.trunc & 2) != 0;
+    }
     i64 k = load_i64(&R.open[w]);
     i64 ix;
     if (first && k >= 0) {   // the episode before ended with no end record: a branch's truncated end, or broke off
@@ -357,7 +362,8 @@ inline void consume(const ConsumerCfg &c, RollSlot &R, std::mutex &amu, const Ro
     if (R.value_g) R.value_g[ix] = out[j*ow+L.nh+2];
     R.version[ix] = ver;
     R.boot[ix] = u8(src, c.o_done) == c.done_branch
-                 || (c.cap_t > 0 && c.o_t >= 0 && u8(src, c.o_done) == 3 && (i64)rd_int(src+c.o_t, 4) >= c.cap_t);
+                 || (c.trunc && c.cap_t > 0 && c.o_t >= 0 && u8(src, c.o_done) == 3
+                     && ((i64)rd_int(src+c.o_t, 4) >= c.cap_t ? (c.trunc & 1) != 0 : (c.trunc & 2) != 0));
     if (R.priv && privp) memcpy(R.priv+ix*R.priv_size, privp+i*L.priv_itemsize, R.priv_size);
     store_i64(&R.length[w], k+1); store_i64(&R.open[w], k);
     kk_out[j] = k;

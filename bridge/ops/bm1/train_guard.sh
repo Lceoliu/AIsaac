@@ -149,9 +149,12 @@ print(u, e, t)" $(for r in $(seq 0 $((K-1))); do echo $RD/$NAME-s$r/progress.csv
         if [ $(( now_ - since_ )) -ge $lim_ ]; then
           echo "rank $r: $what_ for $(( now_ - since_ )) s (limit $lim_ s)" > $RD/.stall
           glog "STALL: $(cat $RD/.stall): the trainers SIGINTed, the container killed in ${STALL_KILL_S:-180} s if still there"
+          # (the kill aims at this attempt's container by its id: the next attempt's has the same name -- faulttest,
+          #  2026-11-12: a kill by name 180 s later hit the resumed attempt's container)
+          cid_=$(docker inspect -f '{{.Id}}' $CTR 2>/dev/null)
           docker exec $CTR pkill -INT -f "train_tok.py .*--out $RDC/$NAME-s" 2>/dev/null
-          ( sleep ${STALL_KILL_S:-180}; [ "$(docker inspect -f '{{.State.Running}}' $CTR 2>/dev/null)" = true ] && {
-              docker kill $CTR > /dev/null 2>&1; glog "STALL: the container $CTR killed (still there ${STALL_KILL_S:-180} s after the SIGINT)"; } ) &
+          ( sleep ${STALL_KILL_S:-180}; [ -n "$cid_" ] && [ "$(docker inspect -f '{{.State.Running}}' $cid_ 2>/dev/null)" = true ] && {
+              docker kill $cid_ > /dev/null 2>&1; glog "STALL: the container $CTR (${cid_%${cid_#????????????}}) killed (still there ${STALL_KILL_S:-180} s after the SIGINT)"; } ) &
           break
         fi
       done
