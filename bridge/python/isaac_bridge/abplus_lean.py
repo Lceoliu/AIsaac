@@ -58,7 +58,7 @@ class LeanObs:
     __slots__ = ('logic_frames', 'game_frame', 'clear', 'paused', 'room', 'damage_taken', 'monsters_hp',
                  'blocking_hp', 'blocking_count', 'players', 'doors', 'entities', 'lasers', 'terrain', 'grid',
                  'terrain_version', 'terrain_changed', 'map', 'map_version', 'terrain_key', 'inv', 'inv_head',
-                 'inv_version', 'visible')
+                 'inv_version', 'visible', 'visible_at')
 
     @property
     def dead(self):
