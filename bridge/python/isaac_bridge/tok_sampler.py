@@ -165,6 +165,9 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # B39 (2026-10-18, cfg.no_active_prob / cfg.no_active; zero unless on): episode starts whose active item was
          # removed (tok_pickup.NO_ACTIVE_LUA), of them with an active item to remove (0 for a character without one)
          'no_actives', 'no_active_removed',
+         # (2026-11-12) the worker's current main episode started from an archive entry (1) or a floor start (0): set
+         # before its first record is sent; the trainer's Episodes reads it at that record (episodes.jsonl 'start')
+         'ep_archive',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
