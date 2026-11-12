@@ -88,6 +88,10 @@ from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, Searc
 # restore point and the ones its hurts hold, every parked clone still open (pid, holders, kind), the finished builds.
 # abplus_probe_memory.py joins them with /proc to give the memory per role. Nothing else changes.
 MEM_LOG = os.environ.get('ISAAC_RL_MEM_LOG', '')
+# (the guard's tests only) ISAAC_FAULT_WORKERS=<mode>:<path>[,...] (mode die | fail): while a <path> exists, every
+# episode start of every worker raises -- 'die' an uncaught error (the worker process ends), 'fail' a caught one
+# (counted in errors, the worker goes on producing nothing); unset (training): no effect
+FAULT = [tuple(x.split(':', 1)) for x in os.environ.get('ISAAC_FAULT_WORKERS', '').split(',') if ':' in x] or None
 SEARCH_CHILD_LIMIT = float(os.environ.get('ISAAC_RL_SEARCH_CHILD_LIMIT', '120'))   # s a forked search may take
 CF_CHILD_LIMIT = float(os.environ.get('ISAAC_RL_CF_CHILD_LIMIT', '900'))   # B34: s a forked choice point may take
 # B39 (2026-10-18): the starting room's restore point of an episode whose start was changed is the episode itself,
@@ -1746,6 +1750,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     episode._send({"cmd": "priv", "enabled": True})
                 episode._send({"cmd": "obs"})
                 obs = read_lean(episode, decoder)
+                for mode_, path_ in FAULT or ():   # (ISAAC_FAULT_WORKERS: the guard's tests only)
+                    if os.path.exists(path_):
+                        if mode_ == 'die':
+                            raise AssertionError('ISAAC_FAULT_WORKERS die: an uncaught worker error (the worker ends)')
+                        raise ValueError('ISAAC_FAULT_WORKERS fail: every episode start fails (the worker goes on)')
                 if obs.dead:
                     raise ValueError('a start state with a dead player')
                 # B39: the starting room's restore point (searches: death teacher, teacher v2, cf, branches) was src
