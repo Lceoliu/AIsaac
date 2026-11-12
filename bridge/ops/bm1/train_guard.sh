@@ -39,6 +39,9 @@ CPUS=${CPUS%|}; LCPUS=${LCPUS%|}; DCPUS=${DCPUS%|}
 NB=$(lane $1 LANE_NAME); PB=$(lane $1 LANE_PORT)
 CTR="$BM1_NAME-train-$NAME"
 take_excl "training $NAME ($TREE, K $K, GPU $G) 计时运行"
+for m_ in .guard_end .stop_sent; do   # (an earlier guard's markers: moved aside, nothing deleted)
+  [ -f $RD/$m_ ] && { mkdir -p ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d); mv $RD/$m_ ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d)/$NAME$m_-$(date +%H%M%S); }
+done
 glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCPUS memory ${MEMG}g hours ${HOURS:-125}"
 # (other tenants' processes on our GPUs, every 30 s: our container's pids from docker top)
 ( while [ ! -f $RD/.guard_end ]; do
