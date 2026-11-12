@@ -8,6 +8,8 @@
 #   (NAME / PORT: the instances' name and port base, distinct per trainer when several run on one host)
 #   NSYS_PREFIX: a profiler command put before the trainer (nsys_update.sh); empty for every timed run
 #   EXTRA, EXTRA2, EXTRA3: flags added at the end (one each: docker -e values carry no spaces; a later flag wins)
+#   FLAGS_FILE: a file of more flags (any number, whitespace-separated: train_guard.sh's <run dir>/train_args), put after
+#   the configuration's own flags (so they win) and before EXTRA..EXTRA3 (which win over them)
 BM=${BM1_IN:-/bench/bm1}   # (bm1 as the runner sees it: run.sh passes BM1_IN; the 8x3090 container default)
 TAG=${1:-xnew-a1}
 OUT=${OUTDIR:-$BM/reports}/$TAG   # (OUTDIR: a training run's own directory, e.g. /bench/train/<name>)
@@ -32,6 +34,6 @@ CMD="$PY -u train_tok.py --groups-file ../abplus/catalog/scaling2_groups.json --
  --actor-bf16 1 --graph-entities 128 \
  --workers 16 --rollout 32768 --minibatch 8192 --micro 8192 --game-hours $HOURS --checkpoint-every 1000 \
  --overlap --decoupled 1 --learner-fast 0 --actor-processes 1 --learner-process 0 --amp bf16 \
- --port ${PORT:-39200} --name ${NAME:-b42new} --seed 1000 --out $OUT ${EXTRA:-} ${EXTRA2:-} ${EXTRA3:-}"
+ --port ${PORT:-39200} --name ${NAME:-b42new} --seed 1000 --out $OUT  $( [ -n "${FLAGS_FILE:-}" ] && cat "$FLAGS_FILE" ) ${EXTRA:-} ${EXTRA2:-} ${EXTRA3:-}"
 echo "$CMD" > $OUT.command.txt
 exec xvfb-run -a -s "-screen 0 640x480x24 -nolisten tcp -noreset" timeout --signal=INT --kill-after=60s $LIMIT ${NSYS_PREFIX:-} $CMD > $OUT.stdout 2> $OUT.stderr

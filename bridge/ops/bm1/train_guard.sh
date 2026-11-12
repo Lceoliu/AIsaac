@@ -5,6 +5,9 @@
 # Run directory /root/AIsaac/train/<name> (the container's /bench/train/<name>): rank r writes <name>-s<r>/ (progress.csv,
 # episodes.jsonl rotated past 256 MB, checkpoints/), guard.log (every start, end, cause, resume), foreign_gpu.log (other
 # processes seen on our GPUs), STOP (touch it: the ranks end together at their next collect, the guard ends, no resume),
+# train_args (optional: the trainer's own flags for this run, whitespace-separated, after the configuration's -- e.g.
+# --lr 2e-4 --lr-schedule cosine; read at every attempt, its content in guard.log), COLLECT_EVERY (4: the page store's
+# collect every 4th hand-off, ISAAC_BLOCK_COLLECT_EVERY),
 # guard.env (optional: sourced before every attempt, e.g. DISK_MIN_GB / DISK_WARN_GB / MAX_RETRY / BACKOFF /
 # CKPT_ROTATE=trash|delete: the rotated checkpoints moved to /root/AIsaac/trash/<date>/ (default) or deleted -- only
 # update-<6 digits>.pt of the run's checkpoints directories, each logged in checkpoint_rotation.log; the newest
@@ -202,6 +205,11 @@ while :; do
   done
   DE="-e CODE=$TREE -e OUTDIR=$RDC -e ISAAC_BLOCK_TIMING=1 -e EXTRA=--learner-device=cuda:1 -e EXTRA2=--checkpoint-every=${CKPT_EVERY:-25} $EX3"
   DE="$DE -e NAME_BASE=$NB -e PORT_BASE=$PB -e SHARD_PORT=${SHARD_PORT:-29400} -e ISAAC_SHARD_TIMEOUT=${SHARD_TIMEOUT:-1800}"
+  if [ -f $RD/train_args ]; then   # (the run's own trainer flags: xnew2.sh's FLAGS_FILE, read at every attempt)
+    DE="$DE -e FLAGS_FILE=$RDC/train_args"; glog "train_args: $(tr '
+' ' ' < $RD/train_args)"
+  fi
+  DE="$DE -e ISAAC_BLOCK_COLLECT_EVERY=${COLLECT_EVERY:-4}"   # (the page store collected every 4th hand-off)
   DE="$DE -e ISAAC_GAME_HOURS_TOTAL=${HOURS:-125} -e ISAAC_LEARN_CKPT_DET=1 -e ISAAC_CKPT_KEEP=${CKPT_KEEP:-5} -e ISAAC_CKPT_MILESTONE=${CKPT_MILESTONE:-250}"
   DE="$DE -e ISAAC_CKPT_TRASH=/bench/trash -e ISAAC_CKPT_ROTATE=${CKPT_ROTATE:-trash} -e ISAAC_EPISODES_ROTATE_MB=${EPISODES_MB:-256} ${ENVS:-}"
   CPUSET="${CS:-${BM1_TIMED_CPUSET:-$BM1_CPUSET}}" MEMS="" MEM="${MEMG}g" PIDS=$((${BM1_PIDS:-4096} * K)) GPUS_OK="$G" \
