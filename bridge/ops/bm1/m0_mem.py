@@ -18,10 +18,24 @@ container's user / system ticks; <tag>.sysc.csv: the syscall every task sits in 
 trainer's threads by name) (b57_threads.py's format plus two columns; replaces it here: b57 matched its own command line when given a match). Standard library only (host python3); pid-free names (the trainer is found by
 its command line), so K trainers on one host each get their own sampler by `match` / out path."""
 import os
+import re
 import sys
 import time
 
 KINDS = ('trainer', 'game', 'workers', 'other')
+
+
+def kind_of(name, top):
+    """A process's kind by its /proc name: the trainer (the top process), the game ('isaac*'), the sampler workers
+    ('python*', and with ISAAC_RL_WORKER_CPU=1 the names tok_floor.name_thread gives a worker and its forked children:
+    'w<index>-main', 'w<index>-cfchild', 'w<index>-schild'; before 2026-11-12 these fell into 'other'), the rest."""
+    if top:
+        return 'trainer'
+    if name.startswith('isaac'):
+        return 'game'
+    if 'python' in name or re.match(r'w\d+-', name):
+        return 'workers'
+    return 'other'
 
 
 def cmdline(p):
@@ -216,7 +230,7 @@ def main():
                 s = status(p)
                 kb = int(s.get('VmRSS', '0 kB').split()[0]) if s.get('VmRSS') else 0
                 name = s.get('Name', '')
-                kind = 'trainer' if top else 'game' if name.startswith('isaac') else                     'workers' if 'python' in name else 'other'
+                kind = kind_of(name, top)
                 rss[kind] += kb
                 cur[p] = ticks(p)
                 if p in prev:   # (cores: per-process tick deltas of the processes alive at both samples)
