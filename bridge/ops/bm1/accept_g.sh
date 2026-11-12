@@ -21,6 +21,11 @@
 #        R2 check: ISAAC_RL_NATIVE_VISIBLE=2, 6 updates: native visible checks > 0, mismatches 0 (clone_stats)
 #   6  (GATE=1) gate3 on the tree                                                                      ~40
 # Total ~50 min, ~90 min with GATE=1. Results: reports/acceptg-<tree>-<time>/ (summary.txt: one line per check).
+# Fails early (the lock given back at once, 'ABORT <why>' in summary.txt and bm1.log, exit 1): the library build or the
+# unit tests failing, a frame probe with rc != 0 or 0 states tested, an A8 run not ok on every seed, a training run with
+# no progress row within FIRST_ROW_S (default 600) or with an exception line in its stdout (TB_MAX, default 1;
+# not KeyboardInterrupt, which every run's stop prints: its container stopped by the watch at once), a training run ending with no row. (2026-11-12: acceptg-c-78ad1e8 held X for 80 min with
+# every probe and worker failing, the runs waiting out their 75 min timeout.)
 set -u
 BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 . $BM/common.sh
@@ -38,18 +43,32 @@ T=$BM1_IN/trees/$TREE
 GAME="-e ABP_HOME=$BM1_IN/home/isaac-abplus -e ABP_BRIDGE_LUA=$T/bridge/abplus/abp_bridge.lua -e LIBGL_ALWAYS_SOFTWARE=1 -e SDL_AUDIODRIVER=dummy -e ALSOFT_DRIVERS=null -e OMP_NUM_THREADS=1"
 XV="xvfb-run -a -s '-screen 0 640x480x24 -nolisten tcp -noreset'"
 note() { echo "$(date '+%F %T') $*" | tee -a $S; }
+FIRST_ROW_S=${FIRST_ROW_S:-600}
+TB_MAX=${TB_MAX:-1}
+abort() {   # the batch ends here: the lock given back, the reason logged
+  note "ABORT $*"
+  log "$TAG ABORT $*"
+  touch $D/r0.done
+  give
+  host_snapshot "$TAG aborted"
+  exit 1
+}
 take_excl "$TAG: G / W-a / B acceptance batch (GPU $GPU) 计时运行"
 note "$TAG start: tree $TREE GPU $GPU"
 host_snapshot "$TAG start"
 
 # 1 the library
 GPU=$GPU sh $BM/deploy.sh abphome $TREE > $D/abphome.log 2>&1
-note "1 abphome rc=$? warnings $(grep -c 'warning' $D/abphome.log) ($(ls -la $BM/home/isaac-abplus/tools/libabp_turbo.so 2>/dev/null | awk '{print $5}') bytes)"
+rc=$?
+note "1 abphome rc=$rc warnings $(grep -c 'warning' $D/abphome.log) ($(ls -la $BM/home/isaac-abplus/tools/libabp_turbo.so 2>/dev/null | awk '{print $5}') bytes)"
+[ $rc = 0 ] || abort "1 abphome rc=$rc"
 
 # 2 unit tests
 DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=${BM1_PAYLOADS:-$BM1_IN/payloads}/b45-payloads2" $BM/run.sh acceptg-unit $GPU sh -c \
-  "cd $T/bridge/python && timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py -q -p no:cacheprovider" > $D/unit.log 2>&1
-note "2 unit rc=$? $(tail -1 $D/unit.log)"
+  "cd $T/bridge/python && timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py tests/test_lean_decode.py -q -p no:cacheprovider" > $D/unit.log 2>&1
+rc=$?
+note "2 unit rc=$rc $(tail -1 $D/unit.log)"
+[ $rc = 0 ] || abort "2 unit tests rc=$rc"
 
 # 3 frame probes
 ST="return tostring(ABP_NATIVE_VIS.mode)..' native='..ABP_NATIVE_VIS.native..' step='..ABP_NATIVE_VIS.step..' fallbacks='..ABP_NATIVE_VIS.fallbacks..' checks='..ABP_NATIVE_VIS.checks..' mismatches='..ABP_NATIVE_VIS.mismatches"
@@ -58,6 +77,8 @@ probe() {   # name, mode, extra args
   DOCK_ENV="$GAME" $BM/run.sh acceptg-$n $GPU sh -c "cd $T/bridge/python && timeout 1800 $XV $BM1_PY abplus_probe_frame_exact.py --out $BM1_IN/reports/$TAG/$n --fast-lua 'ABP_NATIVE_VIS.mode = $m; return \"ok\"' --status-lua \"$ST\" $*" > $D/$n.log 2>&1
   rc=$?
   note "3 $n rc=$rc $(python3 -c "import json,sys; s=json.load(open('$D/$n/summary.json')); print({k: s.get(k) for k in ('tested','decisions','payload_equal','visible_reordered','digests_equal','cpu_ms_per_decision_ref','cpu_ms_per_decision_fast')})" 2>/dev/null) fast clones: $(python3 $BM/vis_status.py $D/$n/rows.json 2>/dev/null)"
+  tested=$(python3 -c "import json; print(int(json.load(open('$D/$n/summary.json')).get('tested') or 0))" 2>/dev/null || echo 0)
+  [ $rc = 0 ] && [ "${tested:-0}" -gt 0 ] || abort "3 probe $n rc=$rc tested=${tested:-0} ($D/$n.log)"
 }
 probe room1 1 --group normal --seeds range:2147500000:16 --visible-json
 probe floor1 1 --floor --seeds range:2147600000:4 --visible-json
@@ -68,7 +89,10 @@ probe floor2 2 --floor --seeds range:2147600000:4
 for m in 1 2; do
   DOCK_ENV="$GAME -e ISAAC_RL_NATIVE_VISIBLE=$m" $BM/run.sh acceptg-a8m$m $GPU sh -c \
     "cd $T/bridge/python && timeout 1800 $XV $BM1_PY abplus_probe_play.py --groups-file ../abplus/catalog/scaling2_groups.json --group normal --seeds range:2147500000:8 --steps 300 --out $BM1_IN/reports/$TAG/a8m$m" > $D/a8m$m.log 2>&1
-  note "4 A8 mode $m rc=$? $(tail -1 $D/a8m$m.log | grep -o '"seeds": [0-9]*, "ok": [0-9]*')"
+  rc=$?
+  a8=$(tail -1 $D/a8m$m.log | grep -o '"seeds": [0-9]*, "ok": [0-9]*')
+  note "4 A8 mode $m rc=$rc $a8"
+  [ $rc = 0 ] && [ -n "$a8" ] && [ "$(echo "$a8" | grep -o '[0-9]*' | sort -u | wc -l)" = 1 ] || abort "4 A8 mode $m rc=$rc ${a8:-no summary}"
 done
 
 # 5 training runs (prof.sh under this batch's lock: NOLOCK; one shard on node1 as cload.sh)
@@ -76,8 +100,24 @@ CSPY=$BM/trees/$TREE/bridge/ops/clone_stats.py
 train() {   # name, updates, extra -e flags
   n=$1; u=$2; shift 2
   mkdir -p $D/$n-stats
+  # (the watch: no progress row within FIRST_ROW_S, or TB_MAX exception lines in the stdout: the run's container stopped)
+  ( P=$R/$TAG-$n/progress.csv; O=$R/$TAG-$n.stdout; t=0; C=$BM1_NAME-prof-$TAG-$n
+    while [ ! -f $D/$n.end ]; do
+      sleep 5; t=$((t+5))
+      rows=0; [ -f $P ] && rows=$(($(wc -l < $P)-1))
+      tb=$(grep -cE '^[A-Za-z_.]+(Error|Exception)' $O 2>/dev/null); tb=${tb:-0}   # (not KeyboardInterrupt: a run's stop)
+      why=""
+      [ $rows -lt 1 ] && [ $t -ge $FIRST_ROW_S ] && why="no progress row after $t s"
+      [ $tb -ge $TB_MAX ] && why="$tb exception line(s) in the stdout ($(grep -m1 -E '^[A-Za-z_.]+(Error|Exception)' $O | cut -c1-160))"
+      if [ -n "$why" ]; then echo "$why" > $D/$n.abort; docker stop -t 20 $C > /dev/null 2>&1; exit 0; fi
+    done ) &
+  WP=$!
   NOLOCK=1 LOCKS_HELD="$TAG" LANE_CPUS=1 CPUSET=8-15,24-31 MEMS=1 LEARNER_PIN=0 DRIVER_PIN=0 GPU=$GPU UPDATES=$u \
     ENVS="-e ABP_CLONE_STATS=$BM1_IN/reports/$TAG/$n-stats -e ISAAC_RL_WORKER_CPU=1 $*" sh $BM/prof.sh $TAG-$n $TREE
+  touch $D/$n.end; wait $WP
+  rows=0; [ -f $R/$TAG-$n/progress.csv ] && rows=$(($(wc -l < $R/$TAG-$n/progress.csv)-1))
+  [ -f $D/$n.abort ] && abort "5 $n stopped by the watch: $(cat $D/$n.abort)"
+  [ $rows -ge 1 ] || abort "5 $n ended with no progress row"
   python3 $CSPY $D/$n-stats > $D/$n-clone-stats.txt 2>&1
   note "5 $n done: $(tail -1 $R/$TAG-$n.summary.txt 2>/dev/null | cut -c1-200); $(head -1 $D/$n-clone-stats.txt)"
 }
