@@ -33,7 +33,7 @@ cat > $RD/train_args <<'EOF'
 --teach-buffer 8000 --teacher-v2-buffer 4000
 --lr 2e-4 --lr-final 2e-5 --lr-schedule cosine --lr-warmup 0.01
 EOF
-HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_GB=144 \
+HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_GB=176 \
   setsid nohup ./train_guard.sh $N $T env/gpu57-k2-s0dl.env env/gpu57-k2-s1dl.env \
   > $RD/guard.out 2>&1 < /dev/null &
 ```
@@ -41,7 +41,7 @@ HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_
 - 用户已定：`--stall-truncate 1`（无进展也按截断处理），学习率 2e-4 → 2e-5 余弦、预热 1%。
 - 从零开始：不设 `INIT`，不加载任何权重。
 - 起来后先看 `$RD/guard.log` 的前几行：
-  - "guard start"那一行有树、GPU、CPU、144g、hours 5000；
+  - "guard start"那一行有树、GPU、CPU、176g、hours 5000；
   - "train_args:"那一行是上面的参数；
   - "attempt 1: fresh start"。
 
@@ -66,7 +66,7 @@ HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_
 | 同步 | K=2 | 梯度取平均、学习率不乘系数；每一步做一次哈希检查，确定性检查开启 |
 | 绑核 | `gpu57-k2-s0dl/s1dl.env` | 每片 driver 1 个物理核，learner 2 个 |
 | PageStore 回收 | `COLLECT_EVERY=4`（守护脚本默认） | 每 4 次 hand-off 回收一次；检查点之前和运行结束时强制回收 |
-| 容器内存上限 | `MEM_GB=144` | 是上限，不是预留（协调方 2026-11-12：稳态约 116 GB，128g 只留 12 GB；主机 251 GB、其他租户几乎不占内存） |
+| 容器内存上限 | `MEM_GB=176` | 是上限，不是预留。main1 在 144g 下于第 368 轮触顶（缓冲区填满后稳定在 138–143 GB，worker PSS 是 long2 的两倍），协调方 2026-11-13 改为 176g；主机 251 GB，其他租户合计十几 GB |
 
 **在这个配置下不起作用的参数**（命令行与 long2 相同、保留，只在这里注明）：
 
@@ -131,7 +131,7 @@ HOURS=5000 CKPT_EVERY=100 CKPT_KEEP=3 CKPT_MILESTONE=400 CKPT_ROTATE=delete MEM_
 | CUDA out of memory | 恢复；如果当时有别人的进程在我们的卡上，第二次就停 |
 | 容器内存超过上限的 90% | guard.log 每 10 分钟警告一次（progress 的 ctr_mem_frac） |
 | 内核在内存上限处杀掉 trainer（rc ≠ 0，cgroup oom_kill > 0） | 恢复一次，第二次停下；日志写明是内存上限，不是别人的进程 |
-| 内核杀掉游戏或 worker 进程（trainer 还在） | 增长一次只警告；连续 3 轮在增长，或一次尝试累计达到 20，就停下 rank、守护进程停下 |
+| 内核杀掉游戏或 worker 进程（trainer 还在） | 增长一次只警告；连续 3 轮在增长，或一次尝试累计达到 20，就停下 rank：原因 cgroup_mem，警告后自动续跑（缓冲区从空开始，内存回到约 52 GB）；两次内存停机相隔不足 100 轮，或全程超过 3 次，才停下等人（2026-11-13） |
 | 断局（游戏或 worker 出错导致一局中断） | 按截断处理，单独记一行；有就警告；连续 3 轮都有，或一次尝试累计达到 20，就停下 |
 | 单个 worker 进程死掉 | 当前没有提示：少一个 worker 继续跑，collect 变慢，唯一痕迹是 progress 的 errors 加 1000（trainer 侧的检测由 cpp-actor 在下个维护窗口加） |
 | 活着的 worker 少于 4 个或全死，或 worker 都活着但一局也产不出（collect 卡死） | 看门狗：任一 rank 超过 600 s 没有新的 progress 行（尝试刚开始时放宽到 1800 s）就判卡死 → SIGINT（trainer 存 last.pt）→ 180 s 后如果同一个容器（按 id）还在就 kill → 原因 stall，恢复；同一轮第二次卡死就停下 |
@@ -188,7 +188,7 @@ setsid nohup python3 /root/AIsaac/bm1/train_watch.py $RD > $RD/train_watch.out 2
 |---|---|
 | KL / 熵 | 最近 50 轮 KL 中位数 > 0.05，或任一动作头的熵在 100 轮内掉了一半以上 |
 | 学习停滞 | 到合计 2500 游戏小时，全体对局的零进展占比没有比第 400 轮时下降，且新开局的平均清房数（这里用新进入房间数）没有上升 |
-| 内存 | ctr_mem_gb > 128 GB，或第 800 轮之后仍以每 100 轮 2 GB 以上的速度上涨 |
+| 内存 | ctr_mem_gb > 160 GB（上限 176），或第 800 轮之后仍以每 100 轮 2 GB 以上的速度上涨 |
 | 速度 | ×实时（两片合计）的 100 轮中位数 < 300 |
 
 ## 9. 开训后的待办

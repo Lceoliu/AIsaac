@@ -28,7 +28,9 @@
 #     our GPUs (the first: resumed once); the kernel killing a rank at the container's memory limit (cgroup oom_kill,
 #     shardk_in's <name>.oom_kills) a second time (the first: resumed once); the kernel's OOM kills in the container
 #     (game / worker processes) growing in OOM_KILL_STREAK (3) updates in a row or reaching OOM_KILL_MAX (20) in one
-#     attempt (the monitor: the ranks stopped at once, .oom_stop; a single growth: a warning); episodes breaking off
+#     attempt (the monitor: the ranks stopped at once, .oom_stop; a single growth: a warning -- since 2026-11-13 cause
+#     cgroup_mem, resumed by itself; stopped when two are under MEM_STOP_GAP (100) updates apart or past MEM_STOP_MAX (3)
+#     in the run); episodes breaking off
 #     (progress broken_episodes: a game or worker failed) in BROKEN_STREAK (3) updates in a row or BROKEN_MAX (20) in
 #     one attempt (likewise, .broken_stop; any: a warning); no progress (the monitor: a rank without a new progress row
 #     for STALL_S, 600 s, or STARTUP_STALL_S, 1800 s, before its first row of the attempt: the trainers SIGINTed, the
@@ -240,7 +242,23 @@ while :; do
   upd=$(python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); print(r[-1]['update'] if r else '')" $RD/$NAME-s0/progress.csv 2>/dev/null)
   if [ -f $RD/.driver_off ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?}: cause driver_off ($(cat $RD/.driver_off)): stopped, no resume (a person looks)"; break; fi
   if [ -f $RD/.broken_stop ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?}: $(cat $RD/.broken_stop): stopped, no resume (a person looks)"; break; fi
-  if [ -f $RD/.oom_stop ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?}: $(cat $RD/.oom_stop): stopped, no resume (a person looks)"; break; fi
+  # (2026-11-13, the coordinator: a memory stop resumes by itself -- the buffers start empty again, about 52 GB; main1
+  #  waited 6 h for a person. Stopped for a person only when two memory stops are under MEM_STOP_GAP (100) updates
+  #  apart or there are more than MEM_STOP_MAX (3) in the run)
+  if [ -f $RD/.oom_stop ]; then
+    why_=$(cat $RD/.oom_stop); mv $RD/.oom_stop $RD/.oom_stop.attempt$attempt
+    mem_n=$(( ${mem_n:-0} + 1 ))
+    glog "attempt $attempt ended rc=$rc at update ${upd:-?}: cause cgroup_mem ($why_)"
+    if [ $mem_n -gt ${MEM_STOP_MAX:-3} ]; then glog "cause cgroup_mem: memory stop $mem_n (more than ${MEM_STOP_MAX:-3}): stopped, no resume (a person looks)"; break; fi
+    if [ -n "${mem_upd:-}" ] && [ -n "$upd" ] && [ $(( upd - mem_upd )) -lt ${MEM_STOP_GAP:-100} ]; then
+      glog "cause cgroup_mem: memory stop $mem_n at update $upd, $(( upd - mem_upd )) updates after the one before (under ${MEM_STOP_GAP:-100}): stopped, no resume (a person looks)"; break
+    fi
+    mem_upd=$upd; last_cause=cgroup_mem; same=1; [ -f $RD/.attempt_start ] && mv $RD/.attempt_start $RD/.attempt_start.prev
+    w=${BACKOFF:-120}
+    glog "WARNING cause cgroup_mem: memory stop $mem_n at update ${upd:-?} (the buffers refill from empty): resuming in $w s"
+    t0=$(date +%s); while [ $(( $(date +%s) - t0 )) -lt $w ] && [ ! -f $RD/STOP ]; do sleep 5; done
+    continue
+  fi
   if [ -f $RD/STOP ]; then glog "attempt $attempt ended rc=$rc at update ${upd:-?} after STOP: the guard ends"; break; fi
   # (2026-11-12, run_w2) rc 0 is the end only when the ranks' game hours (progress.csv, resumes included; each rank's
   # own, HOURS each) reached HOURS -- the largest: the ranks go on together while every one is short (SYNC.all_true),

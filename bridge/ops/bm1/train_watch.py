@@ -13,7 +13,7 @@ The reader (the operator's waiter) asks for the lines past the last n it saw.
 
 Thresholds (TRAINING.md section 8): KL median of the last 50 updates > 0.05; a head's entropy (median of 10 updates)
 down by more than half against 100 updates before; at 2500 game hours in all (both ranks): the zero-progress share of
-all episodes not below the u1-400 window's and the floor starts' mean new rooms not above it; ctr_mem_gb > 128, or
+all episodes not below the u1-400 window's and the floor starts' mean new rooms not above it; ctr_mem_gb > 160 (MEM_GB 176 since the resume of 2026-11-13), or
 after update 800 growing more than 2 GB per 100 updates (the coordinator, 2026-11-12: MEM_GB 144, the buffers fill to
 about 116 GB); the combined x real time's 100-update median < 300. The milestones add the characters by start builds
 (each rank's distinct fresh-start (group, seed)) and rank 0's new checkpoint_rotation.log lines.
@@ -30,7 +30,7 @@ sys.path.insert(0, HERE)
 import train_summary as TS   # noqa: E402
 
 GUARD_KEYS = ('attempt', 'resuming', 'WARNING', 'STALL', 'stopped', 'STOP', 'guard end', 'cause', 'no progress',
-              'failed', 'unreadable', 'free disk', 'DRIVER OFF', 'driver_off', 'early_end', 'early end')
+              'failed', 'unreadable', 'free disk', 'DRIVER OFF', 'driver_off', 'early_end', 'early end', 'cgroup_mem')
 HEADS = ('ent_move', 'ent_shoot', 'ent_bomb', 'ent_item', 'ent_pill')
 
 
@@ -180,8 +180,8 @@ class Watch:
                     if then > 0 and now_ < then / 2:
                         self.alert(f'entropy_{h[4:]}', u, f'{h} {then:.2f} -> {now_:.2f} in 100 updates')
         mem = f(p0[-1], 'ctr_mem_gb')
-        if mem > 128:
-            self.alert('memory', u, f'ctr_mem_gb {mem:.1f} > 128')
+        if mem > 160:
+            self.alert('memory', u, f'ctr_mem_gb {mem:.1f} > 160')
         if u > 800:
             back = [x for x in p0 if int(x['update']) == u - 100]
             if back and mem - f(back[0], 'ctr_mem_gb') > 2:
