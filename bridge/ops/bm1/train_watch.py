@@ -105,6 +105,8 @@ class Watch:
                     self.emit('guard', line.strip())
                 if 'guard end' in line:
                     ended = True
+                elif 'guard start' in line:   # (2026-11-13: a later guard on the same run -- an earlier guard's end
+                    ended = False             #  read in the same pass is not this guard's)
         return ended
 
     def builds(self):
