@@ -71,7 +71,7 @@ from .tok_branch import (AUX_LOGP, AUX_PRED, AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX
                          PointQueue, choice_meta,
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
-from .tok_obs import (stall_flags, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
+from .tok_obs import (stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
                       encode_row, fast_row_function)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
@@ -1771,6 +1771,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             else:
                 base, base_reseed, base_t = src.hold(), reseed, 0
             room_now = None
+            clear_ctr = ClearCounter()   # (2026-11-13: the main episode's rooms cleared after a fight)
             tracker = PedestalTracker() if branching else None
             # Phase B2: copies of the last records and the actor's outputs per record (the points' decision records)
             ring = deque(maxlen=8 + cfg.branch_left_back) if branching else None
@@ -1863,9 +1864,15 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                             snap.release()
                             if mem_file is not None:
                                 mem_dump()
+                    # (2026-11-13) a room cleared in the main episode (branches: never), after a fight (the episode hurt
+                    # its monsters since it entered the room): only that earns cfg.cf_per_clear's tokens
+                    cleared_, fought_ = clear_ctr.step(room_idx != room_now or bool(row['events'][0] & EV_EXIT),
+                                                       row['damage'][0], row['events'][0])
                     room_now = room_idx
-                    if row['events'][0] & EV_CLEARED:   # (2026-11-13) a room cleared in the main episode (branches: never)
+                    if cleared_:
                         mine[ST['clears']] += 1
+                    if fought_:
+                        mine[ST['clears_fought']] += 1
                         if cfon:   # (cfg.cf_per_clear: the points' earned bucket)
                             e0_ = cf_quota.earned_total
                             cf_quota.earn(1)

@@ -144,15 +144,41 @@ def test_only_the_main_episodes_earn():
     assert "per_clear=getattr(cfg, 'cf_per_clear', 0.0)" in src
     assert "cf_quota.refund(charge_)" in src and "cf_quota.refund(point_b['charge'])" in src
     assert 'cf_quota.budget += 1.0' not in src
+    # (only a fought clear earns: the earn call sits under 'if fought_:', every EV_CLEARED counts in clears)
+    blk = src[src.index('cleared_, fought_ = clear_ctr.step('):src.index('if cfon and not done:   # B34')]
+    assert blk.index('if cleared_:') < blk.index("mine[ST['clears']] += 1") < blk.index('if fought_:') <         blk.index("mine[ST['clears_fought']] += 1") < blk.index('cf_quota.earn(1)')
+    assert 'clear_ctr = ClearCounter()' in src
+
+
+def test_a_clear_without_a_fight_does_not_earn():
+    """tok_obs.ClearCounter: EV_CLEARED counts as cleared always, as fought only after damage in the room since
+    entering it; a room change resets the sum."""
+    from isaac_bridge.tok_obs import ClearCounter, EV_CLEARED, EV_NEW_ROOM
+    c = ClearCounter()
+    assert c.step(True, 0.0, EV_NEW_ROOM) == (False, False)
+    assert c.step(False, 0.0, EV_CLEARED) == (True, False)          # (an empty room's late clear flag: not fought)
+    assert c.step(True, 0.0, EV_NEW_ROOM) == (False, False)
+    assert c.step(False, 0.4, 0) == (False, False)
+    assert c.step(False, 0.6, EV_CLEARED) == (True, True)           # (monsters hurt in this room: fought)
+    assert c.step(True, 0.0, 0) == (False, False)                   # (the next room: the sum starts again)
+    assert c.step(False, 0.0, EV_CLEARED) == (True, False)
+    # the bucket: X per fought clear only (tok_floor calls earn on fought ones)
+    q = CF.Quota(6.0, 4, per_clear=0.5)
+    c = ClearCounter()
+    for new_room, dmg, ev in ((True, 0, 0), (False, 0, EV_CLEARED), (True, 0, 0), (False, 1.0, EV_CLEARED)):
+        cleared, fought = c.step(new_room, dmg, ev)
+        if fought:
+            q.earn(1)
+    assert q.earned == 0.5
 
 
 def test_plumbing():
     assert tok_sampler.TokSamplerConfig().cf_per_clear == 0.0
     st = tok_sampler.STATS
-    for k in ('clears', 'cf_earned', 'cf_skip_earned'):
+    for k in ('clears', 'clears_fought', 'cf_earned', 'cf_skip_earned'):
         assert k in st and st.index(k) < st.index('np_runs')
     assert list(st[-2:]) == ['np_runs', 'np_removed']   # (tests/test_eval_ablate_smoke.py)
     import train_tok
     src = inspect.getsource(train_tok)
     assert "'--cf-per-clear', type=float, default=0.0" in src and 'cf_per_clear=args.cf_per_clear' in src
-    assert "row['clears'] = tot_cl - L.get('clears_prev', 0.0)" in src
+    assert "for k_cl in ('clears', 'clears_fought'):" in src and "row[k_cl] = tot_cl - L.get(k_cl + '_prev', 0.0)" in src

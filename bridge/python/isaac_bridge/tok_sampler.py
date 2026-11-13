@@ -168,9 +168,10 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # (2026-11-12) the worker's current main episode started from an archive entry (1) or a floor start (0): set
          # before its first record is sent; the trainer's Episodes reads it at that record (episodes.jsonl 'start')
          'ep_archive',
-         # (2026-11-13) rooms the worker's main episodes cleared (EV_CLEARED records; branches never count); with
-         # cfg.cf_per_clear: the earned bucket's tokens added (before its cap), triggers refused for want of one
-         'clears', 'cf_earned', 'cf_skip_earned',
+         # (2026-11-13) rooms the worker's main episodes cleared (EV_CLEARED records; branches never count), of them
+         # after a fight (tok_obs.ClearCounter: the episode hurt the room's monsters since entering it); with
+         # cfg.cf_per_clear: the earned bucket's tokens added (fought clears only; before its cap), triggers refused
+         'clears', 'clears_fought', 'cf_earned', 'cf_skip_earned',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it

@@ -5020,10 +5020,12 @@ def main(argv=None, child=None, actor=None):
             if pf_on:
                 row['pickup_imit'] = float(pacc[0]) / steps_
                 row['forced_share'] = pf_share   # (forced share of the update's trained decisions)
-        if 'clears' in ST:   # (2026-11-13) rooms the workers' main episodes cleared in this update's window
-            tot_cl = float(stats[:, ST['clears']].sum())
-            row['clears'] = tot_cl - L.get('clears_prev', 0.0)
-            L['clears_prev'] = tot_cl
+        if 'clears' in ST:   # (2026-11-13) rooms the workers' main episodes cleared in this update's window, and
+            #                    of them after a fight (tok_obs.ClearCounter: what --cf-per-clear earns on)
+            for k_cl in ('clears', 'clears_fought'):
+                tot_cl = float(stats[:, ST[k_cl]].sum())
+                row[k_cl] = tot_cl - L.get(k_cl + '_prev', 0.0)
+                L[k_cl + '_prev'] = tot_cl
         if cfg.stat_aug_prob > 0:   # 2026-10-08: stat augmentations applied so far (worker totals)
             row['stat_augs'] = float(stats[:, ST['stat_augs']].sum())
         if cfg.no_active_prob > 0:   # B39: no-active starts so far (worker totals) and this update's finished episodes
