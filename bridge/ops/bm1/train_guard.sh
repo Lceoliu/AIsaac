@@ -82,6 +82,10 @@ glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCP
     # (the container's memory past 90 % of its limit: rank 0's newest progress row (the container's cgroup, every rank's
     #  the same), a warning every 10 min while it lasts)
     cm_=$(python3 -c "import csv, sys; r = list(csv.DictReader(open(sys.argv[1]))); x = r[-1] if r else {}; print(x.get('ctr_mem_frac', ''), x.get('ctr_mem_gb', ''), x.get('update', ''), x.get('ctr_oom_kills', ''))" $RD/$NAME-s0/progress.csv 2>/dev/null)
+    # (2026-11-13, main1's resume: only a row of the running attempt -- progress.csv written since .attempt_start; the
+    #  last row of a stopped one (29 kills at update 370) read by a new guard wrote a stale .oom_stop at its start)
+    pm_=$(stat -c %Y $RD/$NAME-s0/progress.csv 2>/dev/null || echo 0)
+    { [ -f $RD/.attempt_start ] && [ "$pm_" -ge "$(cat $RD/.attempt_start)" ]; } || cm_=""
     set -- $cm_
     # (the kernel's OOM kills in the container (a game or worker process: the ranks may go on), per new progress row:
     #  a growth a warning; growing in OOM_KILL_STREAK (3) updates in a row, or OOM_KILL_MAX (20) in one attempt: the
