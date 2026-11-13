@@ -633,6 +633,31 @@ class LanePolicy:
         return tuple(int(v) for v in self.io[self.i, 5:10]), float(self.out[self.i, 0]), float(self.out[self.i, 1])
 
 
+V2_MIN = 8   # train_tok: a minibatch step draws teacher-v2 records only in batches of at least this many
+
+
+def v2_plan(target, steps, acc):
+    """(2026-11-13) train_tok's teacher-v2 records per minibatch step for one update of `steps` steps. target: the
+    per-step count before int() (min(--teacher-v2-batch, reuse x rate / planned steps)). int(target) >= V2_MIN: that
+    count every step (the old rule, acc untouched). 0 < target < V2_MIN (the old rule drew nothing: main1's 3-4 a step):
+    acc += target each step; a step that takes acc to V2_MIN or more draws V2_MIN (acc -= V2_MIN), the others none --
+    the records used stay reuse x rate per update on average, at one more batch shape. acc carries over updates
+    (train_tok's L['v2_acc']). Returns (counts per step, acc)."""
+    n = int(target)
+    if n >= V2_MIN:
+        return [n] * steps, acc
+    out = []
+    for _ in range(steps):
+        if target > 0:
+            acc += target
+        if acc >= V2_MIN:
+            out.append(V2_MIN)
+            acc -= V2_MIN
+        else:
+            out.append(0)
+    return out, acc
+
+
 def teacher_v2_loss(logp, value, weight, ret, share, coef, vf):
     """train_tok's teacher-v2 term on b imitation records (torch tensors [b]): logp = sum over the heads of
     log pi(a_head | obs) of the recorded actions, value V(obs), weight w, ret G. Returns (share x (coef x mean(-w logp)

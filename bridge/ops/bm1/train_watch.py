@@ -15,7 +15,8 @@ Thresholds (TRAINING.md section 8): KL median of the last 50 updates > 0.05; a h
 down by more than half against 100 updates before; at 2500 game hours in all (both ranks): the zero-progress share of
 all episodes not below the u1-400 window's and the floor starts' mean new rooms not above it; ctr_mem_gb > 160 (MEM_GB 176 since the resume of 2026-11-13), or
 after update 800 growing more than 2 GB per 100 updates (the coordinator, 2026-11-12: MEM_GB 144, the buffers fill to
-about 116 GB); the combined x real time's 100-update median < 300. The milestones add the characters by start builds
+about 116 GB); the combined x real time's 100-update median < 300; v2_idle (2026-11-13): a rank holding >= 256
+teacher-v2 records with no v2_loss_pi in 20 updates in a row. The milestones add the characters by start builds
 (each rank's distinct fresh-start (group, seed)) and rank 0's new checkpoint_rotation.log lines.
 Standard library only (the host's python3); train_summary.py beside it."""
 import csv
@@ -189,6 +190,11 @@ class Watch:
             if back and mem - f(back[0], 'ctr_mem_gb') > 2:
                 self.alert('memory_growth', u, f'ctr_mem_gb +{mem - f(back[0], "ctr_mem_gb"):.1f} GB in 100 updates '
                                                f'after update 800')
+        for r in sorted(P):   # (2026-11-13) the teacher-v2 / CF records held but not trained on (main1: 0 of 824 rows)
+            w = P[r][-20:]
+            if len(w) == 20 and all(f(x, 'v2_held') >= 256 and x.get('v2_loss_pi') in (None, '') for x in w):
+                self.alert(f'v2_idle_s{r}', u, f'rank {r}: v2_held {w[-1].get("v2_held")} >= 256 and no v2_loss_pi in '
+                                               f'the last 20 updates (v2_step {w[-1].get("v2_step")})')
         if len(p0) >= 100 and all(len(P[r]) >= 100 for r in P):
             x = sum(st.median(f(y, 'x_real_time') for y in P[r][-100:]) for r in P)
             if x < 300:

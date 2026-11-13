@@ -3229,7 +3229,7 @@ def main(argv=None, child=None, actor=None):
     if args.teacher_v2 or args.cf:   # 2026-10-10 (teacher v2; B34: and the cf's): the imitation records' ring (bytes
         #                              and per-record targets on the GPU, entity / door counts on the host for the
         #                              minibatch planning)
-        from isaac_bridge.tok_teacher2 import VI as V2I, teacher_v2_loss
+        from isaac_bridge.tok_teacher2 import VI as V2I, teacher_v2_loss, v2_plan
         L.update(v2_cnt=np.zeros((args.teacher_v2_buffer,), np.dtype([('n_ent', ROW.fields['n_ent'][0]),
                                                                        ('n_doors', ROW.fields['n_doors'][0])] +
                                                                       ([('n_item', np.int16)] if NI_f else []))),
@@ -3716,6 +3716,7 @@ def main(argv=None, child=None, actor=None):
         # 2026-10-10 (teacher v2): the new imitation records into the ring, and what the policy and the value head
         # say on them before this update trains on them (v2_prior: log pi of the move at a best branch's first record)
         v2_new, v2_step, v2_log = 0, 0, {}
+        v2_target = 0.0   # (2026-11-13: v2_step before int(): v2_plan's per-step target)
         vacc = torch.zeros(3, device=device)   # teacher v2: mean(-w logp), mean((V - G)^2), mean(logp) (sums)
         v2_steps = 0
         if v2_on and job.get('v2') is not None:
@@ -3834,7 +3835,8 @@ def main(argv=None, child=None, actor=None):
                 L['v2_G'][at_d] = torch.from_numpy(G_v).to(device)
             L['v2_rate'] = v2_new if L['v2_rate'] is None else 0.9 * L['v2_rate'] + 0.1 * v2_new
             planned_v = args.epochs * max(1, len(flat) // args.minibatch)
-            v2_step = int(min(args.teacher_v2_batch, args.teacher_v2_reuse * L['v2_rate'] / planned_v))
+            v2_target = min(args.teacher_v2_batch, args.teacher_v2_reuse * L['v2_rate'] / planned_v)
+            v2_step = int(v2_target)
             L['v2_at'] = (L['v2_at'] + v2_new) % B_
             L['v2_n'] = min(L['v2_n'] + v2_new, B_)
             sec('teach_new')
@@ -4491,13 +4493,14 @@ def main(argv=None, child=None, actor=None):
             b2 = temporal_bounds(tch, tc2, args.micro or int(tch[tc2, 1].sum()))
             lo2, _, cids2 = b2[0]
             m2 = teach_step >= 8 and teach_n >= 256
-            vm2 = v2_step >= 8 and v2_on and L['v2_n'] >= 256
+            vn2 = v2_count(ep2, at2)
+            vm2 = vn2 >= 8
             pp_, pv_ = pre_by_ep.setdefault(ep2, ({}, {}))
             p2 = vp2 = None
             if m2:
                 p2 = pp_[at2] = np.random.randint(0, teach_n, teach_step)
             if vm2:
-                vp2 = pv_[at2] = v2_rng.integers(0, L['v2_n'], v2_step)
+                vp2 = pv_[at2] = v2_rng.integers(0, L['v2_n'], vn2)
             return lo2, b2[-1][0], cids2, m2, vm2, p2, vp2
 
         def part_chunks(lo2, last_, cids2, m2, vm2, p2, vp2):
@@ -4523,6 +4526,19 @@ def main(argv=None, child=None, actor=None):
             if eperms is not None and ep_now[0] + 1 < args.epochs and mb_ats:
                 return part_chunks(*first_part(ep_now[0] + 1, mb_ats[0]))
             return []
+        # (2026-11-13) teacher-v2 records per minibatch step, keyed (epoch, minibatch start): v2_plan -- int(v2_target)
+        # >= 8 the old count every step; below 8 (the old rule drew nothing) a fixed 8 on the steps where the
+        # accumulator L['v2_acc'] (kept over updates) reaches 8. The prefetch (first_part) and the step use the same.
+        v2_counts = {}
+        if v2_on and L['v2_n'] >= 256:
+            mb_ats0 = [a_ for a_ in range(0, n_units, mb_units) if min(mb_units, n_units - a_) >= mb_units // 4]
+            cnt_, L['v2_acc'] = v2_plan(v2_target, args.epochs * len(mb_ats0), L.get('v2_acc', 0.0))
+            v2_counts = {(e_, a_): cnt_[e_ * len(mb_ats0) + k_]
+                         for e_ in range(args.epochs) for k_, a_ in enumerate(mb_ats0)}
+
+        def v2_count(ep2, at2):
+            return v2_counts.get((ep2, at2), 0)
+
         if ahead_ and n_units:   # B60: the update's first PPO part prepared before the first epoch starts
             mb_ats = [a_ for a_ in range(0, n_units, mb_units) if len(eperms.get(0)[1][a_:a_ + mb_units]) >= mb_units // 4]
             if mb_ats:
@@ -4627,8 +4643,9 @@ def main(argv=None, child=None, actor=None):
                         tb = to_batch(teach_rows[pick], teach_pending(teach_meta[pick]), device)
                     sec('teach_build')
                 vb = None   # 2026-10-10 (teacher v2): this step's imitation records (drawn with their own generator)
-                if v2_step >= 8 and v2_on and L['v2_n'] >= 256:
-                    vpick = pre_vpick.pop(at) if at in pre_vpick else v2_rng.integers(0, L['v2_n'], v2_step)
+                v2_n_at = v2_count(ep_, at)
+                if v2_n_at >= 8:
+                    vpick = pre_vpick.pop(at) if at in pre_vpick else v2_rng.integers(0, L['v2_n'], v2_n_at)
                     vpick_d = dev(vpick)
                     v_pend, v_act = L['v2_pend'].index_select(0, vpick_d), L['v2_act'].index_select(0, vpick_d)
                     v_w, v_G = L['v2_w'].index_select(0, vpick_d), L['v2_G'].index_select(0, vpick_d)
@@ -4637,7 +4654,7 @@ def main(argv=None, child=None, actor=None):
                                                               pending=v_pend, entities=v_ent,
                                                               visible='gate' if block_on else True)
                     v_h = L['v2_h'].index_select(0, vpick_d) if mem_on else None   # (memory) their input states
-                    v_share = args.teacher_v2_weight * v2_step / n_sel
+                    v_share = args.teacher_v2_weight * v2_n_at / n_sel
                     sec('teach_build')
                 if t_on or block_on:   # parts of whole temporal chunks
                     bounds = temporal_bounds(tch, tc_h, micro)
