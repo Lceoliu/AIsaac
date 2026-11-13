@@ -204,7 +204,10 @@ newest_ckpt() {   # rank 0's newest checkpoint whose zip tests whole (as the con
     glog "checkpoint $c unreadable: skipped"
   done
 }
-attempt=0; last_cause=""; same=0; oom_foreign=0; last_upd=""; upd_fail=0
+# (2026-11-13, main1's resume: a new guard numbered its attempts from 1 again and m0_mem.py wrote over the earlier
+#  guard's <name>-s<r>.mem.attempt1.csv -- its numbering goes on from the run directory's highest attempt now)
+attempt=$(ls $RD/$NAME-s0.mem.attempt*.csv $RD/$NAME-s0.stdout.attempt* 2>/dev/null | sed -n 's/.*\.attempt\([0-9][0-9]*\)\(\.csv\)\{0,1\}$/\1/p' | sort -n | tail -1)
+attempt=${attempt:-0}; last_cause=""; same=0; oom_foreign=0; last_upd=""; upd_fail=0
 while :; do
   [ -f $RD/guard.env ] && . $RD/guard.env   # (overrides read before every attempt: DISK_MIN_GB, MAX_RETRY, BACKOFF, ...)
   [ -f $RD/STOP ] && { glog "STOP before an attempt: the guard ends"; break; }
