@@ -45,7 +45,7 @@ import numpy as np
 
 from .abplus_lean import LeanDecoder, lean_logic_frames, read_lean, read_lean_raw
 from .tok_branch import step_reward
-from .tok_obs import RC_HP0, RC_PROGRESS, ROW, ROW_FRAME_AT, EpisodeState, FastRow, encode_row
+from .tok_obs import RC_HP0, RC_PROGRESS, ROW, ROW_FRAME_AT, EpisodeState, FastRow, encode_row, stall_flags
 
 V2_RING = 384        # imitation records per worker the trainer may fall behind by (a point writes <= cap of them)
 # per imitation record (float64): the action under way and the applied one (5 each, items / pill 0 without items),
@@ -347,8 +347,13 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
         B._send({"cmd": "obs"})
         ob = read_lean(B, dec)
         lf0 = lf = ob.logic_frames
+        # (2026-11-13: the main episode's stall rule, tok_obs.stall_flags -- with --stall-progress items the branches
+        #  counted neither resources nor items as progress and stalled before the main episode would have. Known and
+        #  accepted: the branch's EpisodeState does not know the ids the episode held before record d and no longer
+        #  holds; in the branch those count as acquired for the first time.)
+        pk_, it_ = stall_flags(getattr(ctx.cfg, 'stall_progress', 'events'))
         st = EpisodeState(ctx.limit, floor=True, stall=ctx.stall, run=ctx.run, items=ctx.items,
-                          stall_pickups=getattr(ctx.cfg, 'stall_progress', 'events') == 'pickups')
+                          stall_pickups=pk_, stall_items=it_)
         st.visited = set(pt.visited)
         st.stage0 = int(pt.stage0) if pt.stage0 is not None else int(ob.room[5])
         st.progress_t = pt.log.progress[d - 1] if d >= 1 else d   # the stall counter before record d

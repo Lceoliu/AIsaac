@@ -109,4 +109,20 @@ def test_encode_row_and_workers_use_it():
     src = inspect.getsource(TO.encode_row)
     assert 'if st.stall_items and st.inv_gain:' in src
     fl = inspect.getsource(tok_floor)
-    assert fl.count('stall_items=stall_it') == 3 and "== 'items'" in fl
+    assert fl.count('stall_items=stall_it') == 3
+    assert "stall_pk, stall_it = stall_flags(getattr(cfg, 'stall_progress', 'events'))" in fl
+
+
+def test_branches_use_the_main_rule():
+    """(2026-11-13) tok_teacher2.play_branch's EpisodeState takes the floor workers' stall rule (tok_obs.stall_flags):
+    with --stall-progress items both switches on."""
+    from isaac_bridge import tok_teacher2 as T2
+    assert TO.stall_flags('items') == (True, True)
+    assert TO.stall_flags('pickups') == (True, False)
+    assert TO.stall_flags('events') == (False, False)
+    src = inspect.getsource(T2.play_branch)
+    assert "pk_, it_ = stall_flags(getattr(ctx.cfg, 'stall_progress', 'events'))" in src
+    assert 'stall_pickups=pk_, stall_items=it_' in src and "== 'pickups'" not in src
+    st = TO.EpisodeState(100, floor=True, stall=10, items=True, **dict(zip(('stall_pickups', 'stall_items'),
+                                                                          TO.stall_flags('items'))))
+    assert st.stall_pickups and st.stall_items

@@ -287,6 +287,12 @@ def black_half_hearts(soul, mask):
     return sum(min(2, soul - 2 * k) for k in range(32) if (mask >> k) & 1 and 2 * k < soul)
 
 
+def stall_flags(mode):
+    """(stall_pickups, stall_items) of EpisodeState for --stall-progress `mode` ('events', 'pickups', 'items'): the one
+    rule the floor workers' episodes (tok_floor) and the teacher's branches (tok_teacher2.play_branch) share."""
+    return mode in ('pickups', 'items'), mode == 'items'
+
+
 class EpisodeState:
     """What the encoder keeps between the records of one episode."""
 
