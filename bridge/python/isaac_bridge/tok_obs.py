@@ -313,6 +313,10 @@ class EpisodeState:
         #  acquired -- _inventory's inv_gain; inventory blocks always take the Python path, abp_row_encode hands them back)
         self.stall_items = bool(stall_items)
         self.inv_gain = False
+        # (2026-11-13: an acquisition is progress only the first time the episode holds that id -- swapping two active
+        #  items on a pedestal back and forth raised a collectible's count on every swap and the stall never came.
+        #  Ids held so far this episode, the first inventory block's included: collectibles, trinkets, pill colors, cards)
+        self.seen_items, self.seen_tr, self.seen_pill, self.seen_card = set(), set(), set(), set()
         self.prev_res = None
         self.stage0 = None
         self.progress_t = 0
@@ -542,18 +546,24 @@ def _inventory(o, st):
     n, _, max_charge, tr0, tr1, pill, effect, card, curses = o.inv_head
     counts = {int(i): int(c) for i, c in zip(o.inv['id'], o.inv['count'])}
     events = 0
+    now_items = {i for i, c in counts.items() if c > 0}
+    now_tr = {min(tr0 & 0x7fff, N_TRINKET - 1), min(tr1 & 0x7fff, N_TRINKET - 1)} - {0}
     if not first:
         old = st.inv_counts or {}
         if any(c > old.get(i, 0) for i, c in counts.items()):
             events |= EV_ITEM
         if (st.pocket[0] != 0 and pill == 0) or (st.pocket[1] != 0 and card == 0):
             events |= EV_PILL
-        # (--stall-progress items: something acquired -- a collectible's count up, a trinket not held before, a pill or
-        #  card in a pocket that held none or another)
-        held_tr = {int(st.pitem[1]), int(st.pitem[2])} - {0}
-        new_tr = {min(tr0 & 0x7fff, N_TRINKET - 1), min(tr1 & 0x7fff, N_TRINKET - 1)} - {0}
-        st.inv_gain = bool(events & EV_ITEM) or bool(new_tr - held_tr) or (pill != 0 and pill != st.pocket[0]) or \
-            (card != 0 and card != st.pocket[1])
+        # (--stall-progress items: something acquired for the first time this episode -- a collectible, a trinket, a
+        #  pill color or a card the episode has not held before; one swapped back in is not progress)
+        st.inv_gain = bool(now_items - st.seen_items) or bool(now_tr - st.seen_tr) or \
+            (pill != 0 and pill not in st.seen_pill) or (card != 0 and card not in st.seen_card)
+    st.seen_items |= now_items
+    st.seen_tr |= now_tr
+    if pill != 0:
+        st.seen_pill.add(pill)
+    if card != 0:
+        st.seen_card.add(card)
     st.inv_counts = counts
     st.pocket = (pill, card)
     k = min(len(o.inv), INV_CAP)
