@@ -66,12 +66,18 @@ note "1 abphome rc=$rc warnings $(grep -c 'warning' $D/abphome.log) ($(ls -la $B
 
 # 2 unit tests
 DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=${BM1_PAYLOADS:-$BM1_IN/payloads}/b45-payloads2" $BM/run.sh acceptg-unit $GPU sh -c \
-  "cd $T/bridge/python && $BM1_PY -c \"from isaac_bridge import actor_native as a; m = a.load(); print('EXT', 'ok' if m is not None else 'FAIL ' + str(a.REASON)[-1500:])\" && timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py tests/test_lean_decode.py tests/test_worker_watch.py tests/test_b58e_batch.py -q -rs -p no:cacheprovider" > $D/unit.log 2>&1
+  "cd $T/bridge/python && $BM1_PY $BM1_IN/native_check.py; timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py tests/test_lean_decode.py tests/test_worker_watch.py tests/test_b58e_batch.py tests/test_driver_truncate.py tests/test_cap_truncate.py -q -rs -p no:cacheprovider" > $D/unit.log 2>&1
 rc=$?
-note "2 unit rc=$rc $(grep -m1 '^EXT' $D/unit.log | cut -c1-200); $(tail -1 $D/unit.log)"
-# (the C++ actor extension built and loaded: its tests skip without it, so a failed build would pass silently)
-grep -q '^EXT ok' $D/unit.log || abort "2 the cpp actor extension did not load: $(grep -m1 '^EXT' $D/unit.log | cut -c1-300)"
-grep -q 'extension unavailable' $D/unit.log && abort "2 unit tests skipped for the extension"
+nat=$(grep -a '^EXT ' $D/unit.log | paste -sd ' ' | cut -c1-300)
+note "2 unit rc=$rc $nat; $(tail -1 $D/unit.log)"
+# (the native components built and loaded: their tests skip without them, so a failed build would pass silently;
+#  the mainline gate's rule, gate.sh 2026-11-12: native_check.py's three EXT lines ok, no skip for a native component /
+#  CUDA / the step graph. native_check.py runs first and its rc is ignored: the EXT lines decide, so the tests' own
+#  result still shows)
+grep -a -q '^EXT .* FAIL' $D/unit.log && abort "2 a native component did not load: $nat"
+[ "$(grep -a -c '^EXT .* ok' $D/unit.log)" -ge 3 ] || abort "2 native_check: fewer than 3 EXT ok ($nat)"
+nskip=$(grep -a -c -E '^SKIPPED.*(extension unavailable|C visible encoder|gcc unavailable|CUDA|GPU|ISAAC_BLOCK_STEP_GRAPH=0|memfd|gloo)' $D/unit.log)
+[ "$nskip" = 0 ] || abort "2 unit tests skipped for a native component: $nskip"
 [ $rc = 0 ] || abort "2 unit tests rc=$rc"
 
 # 3 frame probes

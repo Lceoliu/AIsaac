@@ -1025,6 +1025,10 @@ class Episodes:
         # episodes that broke off since then (no end record: the game or its worker failed; done DONE_BROKE), apart
         # from every statistic; ep_meta: worker -> (group, seed, branch, point, lab) of its episode's first record
         self.broken, self.broken_total, self.ep_meta = [], 0, {}
+        # (2026-11-12) the workers' ep_archive stats column (a view; None: not known): each episode's 'start', fresh /
+        # archive, read at its first record (the worker writes it before sending that record)
+        self.origin = None
+        self.ep_start = {}
         self.seen_inv = None                     # 2026-10-08 (lab on): held collectibles at ordinary episodes' ends
         self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
         self.stats0 = None                       # 2026-10-08 (stat aug on): worker -> the stats at the first record
@@ -1047,9 +1051,12 @@ class Episodes:
                          + np.rint(pl[:, 10] * 50.0)], 1).astype(np.float64)
 
     def note_first(self, rows, idx, first):
-        """Each first record's (group, seed, branch, point, lab): the broken-episode line's, should it break off."""
+        """Each first record's (group, seed, branch, point, lab): the broken-episode line's, should it break off; and
+        the episode's start (fresh / archive) when the workers' column is known."""
         for j in np.flatnonzero(first):
             r = rows[j]
+            if self.origin is not None:
+                self.ep_start[int(idx[j])] = 'archive' if self.origin[int(idx[j])] > 0 else 'fresh'
             self.ep_meta[int(idx[j])] = (int(r['group']), int(r['seed']), int(r['branch']), int(r['point']),
                                          int(r['lab']))
 
@@ -1071,6 +1078,8 @@ class Episodes:
             fin.update(point=pt, branch=br)
         if lb:
             fin['lab'] = lb
+        if int(i) in self.ep_start:
+            fin['start'] = self.ep_start[int(i)]
         self.broken.append(fin)
         self.broken_total += 1
 
@@ -1188,6 +1197,8 @@ class Episodes:
                 fin = dict(group=int(r['group']), seed=int(r['seed']), done=int(r['done']),
                            decisions=int(r['t']), ret=float(self.ret[i]), hurt=float(self.hurt[i]),
                            damage=float(self.damage[i]), rooms=int(self.rooms[i]), boss=int(self.boss[i]))
+                if int(i) in self.ep_start:   # (fresh: a floor start; archive: an archive entry)
+                    fin['start'] = self.ep_start[int(i)]
                 if capped[j]:   # (done 3 at the time cap)
                     fin['cap'] = 1
                 elif CAP_T > 0 and int(r['done']) == 3:   # (done 3 before it: the floor's stall rule)
@@ -1281,6 +1292,8 @@ def _native_events(book, rows, idx, snap):
         i, r, sv = idx[j], rows[j], snap[j]
         fin = dict(group=int(r['group']), seed=int(r['seed']), done=int(r['done']), decisions=int(r['t']), ret=float(sv[0]),
                    hurt=float(sv[1]), damage=float(sv[2]), rooms=int(sv[3]), boss=int(sv[4]))
+        if int(i) in self.ep_start:
+            fin['start'] = self.ep_start[int(i)]
         if CAP_T > 0 and int(r['done']) == 3:   # (the time cap's end, or the stall rule's)
             fin['cap' if int(r['t']) >= CAP_T else 'stall'] = 1
         if self.run or self.items:
@@ -5593,6 +5606,8 @@ def main(argv=None, child=None, actor=None):
         book.active0 = {}
     if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): build_pedestals, pickup_forced, forced_steps
         book.pick = dict(bped={}, steps=np.zeros(n, np.int64))
+    if child is None and getattr(sampler, 'stats', None) is not None and 'ep_archive' in ST:
+        book.origin = sampler.stats[:, ST['ep_archive']]   # (2026-11-12: episodes.jsonl 'start', fresh / archive)
     version = update                                # the actor's weights: updates done
     version0 = version   # (B54: the policy-lag check at each hand-off counts from here)
     native_cons = False   # B58a+b: the driver's native consumer (Episodes.arrive's arithmetic and store in C++)

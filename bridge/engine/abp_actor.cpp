@@ -533,7 +533,7 @@ struct ActorDriver {
   // ROW fields: offset, size
   i64 f_first = 0, f_done = 0, f_pforce = 0, f_schema = 0, f_bytes = 0, f_frame = 0; int s_first = 1, s_done = 1, s_pforce = 1;
   i64 done_branch = 4;
-  i64 cap_t = 0, f_t = -1, trunc = 0; int s_t = 4;   // (--cap- / --stall-truncate: those ends evaluated, as a branch end)
+  i64 cap_t = 0, f_cap_t = -1, trunc = 0; int s_cap_t = 4;   // (--cap- / --stall-truncate: those ends evaluated, as a branch end; ROW 't')
   bool pf_on = false;
   // arena
   ArenaReset reset; i64 scratch_row = 0, base = 0; i64 *step_host = nullptr; i64 heads = 0, nh = 0; i64 block_steps = 32;
@@ -630,7 +630,7 @@ struct ActorDriver {
     f_first = f("first", s_first); f_done = f("done", s_done); f_pforce = f("pforce", s_pforce);
     f_schema = f("visible_schema", dummy); f_bytes = f("visible_bytes", dummy); f_frame = f("visible_frame", dummy);
     reply = reply_; done_branch = done_branch_; pf_on = pf_on_;
-    if (fields.contains("t")) f_t = f("t", s_t);
+    if (fields.contains("t")) f_cap_t = f("t", s_cap_t);
     pending_cur.assign(workers*nh, 0);
     cap_wait.reset(new std::atomic<uint8_t>[workers]);
     for (i64 w = 0; w < workers; w++) cap_wait[w] = 0;
@@ -1800,8 +1800,8 @@ struct ActorDriver {
       if (priv) memcpy(r->priv.data_ptr<uint8_t>()+i*priv_itemsize, priv+ss[i]*priv_itemsize, priv_itemsize);
       i64 done = read_int(src+f_done, s_done), first = read_int(src+f_first, s_first);
       bool ended = done != 0, boot = done == done_branch
-                   || (trunc && cap_t > 0 && f_t >= 0 && done == 3
-                       && (read_int(src+f_t, s_t) >= cap_t ? (trunc & 1) != 0 : (trunc & 2) != 0));
+                   || (trunc && cap_t > 0 && f_cap_t >= 0 && done == 3
+                       && (read_int(src+f_cap_t, s_cap_t) >= cap_t ? (trunc & 1) != 0 : (trunc & 2) != 0));
       bool go = !ended || boot;
       r->go[i] = go;
       if (cf_snap) { r->cf_snap[i] = cf_snap[ws[i]]; if (r->cf_snap[i] && !lin_on) cap_wait[ws[i]] = 1; }   // (before the reply;

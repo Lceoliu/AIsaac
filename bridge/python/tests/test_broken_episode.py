@@ -92,3 +92,16 @@ def test_normal_end_and_branch_truncation_unchanged():
     assert mask[0, 0] and not mask[0, 1] and mask[0, 2]
     assert np.isclose(ret[0, 0], ro.reward[0, 0] + GAMMA * 0.6)      # (bootstraps from the boot decision's value)
     assert np.isclose(ret[0, 2], ro.reward[0, 2])                    # (terminal)
+
+
+def test_episode_start_from_the_workers_column():
+    """(2026-11-12) episodes.jsonl 'start': the worker's ep_archive stats column at the episode's first record."""
+    r = Run()
+    origin = np.array([1.0])
+    r.book.origin = origin
+    r.rec(0.5, first=1, seed=7)
+    origin[0] = 0.0   # (the worker's next episode, a floor start: written before its first record)
+    r.rec(0.6, damage=1.0, done=2)
+    r.rec(0.1, first=1, seed=8)
+    r.rec(0.2, done=2, seed=8)
+    assert [e['start'] for e in r.book.finished] == ['archive', 'fresh']

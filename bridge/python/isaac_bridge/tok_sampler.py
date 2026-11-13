@@ -170,6 +170,9 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # per-record bookkeeping, the actor round trip (receive + send), the game step (step line + payload read); the
          # search thread and the cf thread (their own threads, loops included); the forked search / cf children (whole)
          'enc_cpu', 'book_cpu', 'wait_cpu', 'step_cpu', 'teach_thr_cpu', 'cf_thr_cpu', 'search_child_cpu', 'cf_child_cpu',
+         # (2026-11-12) the worker's current main episode started from an archive entry (1) or a floor start (0): set
+         # before its first record is sent; the trainer's Episodes reads it at that record (episodes.jsonl 'start')
+         'ep_archive',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it

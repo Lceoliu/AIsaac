@@ -1799,6 +1799,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             if plr_on:
                 ep_src[episode_n + 1] = src   # (episode_n is incremented just below)
             mine[ST['archive_starts']] += from_archive
+            mine[ST['ep_archive']] = float(from_archive)   # (before the episode's first record: its 'start')
             episode_n += 1
             seed_now = src.info['seed']
             st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it)
