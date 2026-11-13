@@ -45,7 +45,7 @@ import numpy as np
 
 from .abplus_lean import LeanDecoder, lean_logic_frames, read_lean, read_lean_raw
 from .tok_branch import step_reward
-from .tok_obs import RC_HP0, RC_PROGRESS, ROW, ROW_FRAME_AT as _ROW_FRAME_AT, EpisodeState, FastRow, encode_row
+from .tok_obs import RC_HP0, RC_PROGRESS, ROW, ROW_FRAME_AT, EpisodeState, FastRow, encode_row, stall_flags
 
 V2_RING = 384        # imitation records per worker the trainer may fall behind by (a point writes <= cap of them)
 # per imitation record (float64): the action under way and the applied one (5 each, items / pill 0 without items),
@@ -60,8 +60,6 @@ V2_FIELDS = ('pend0', 'pend1', 'pend2', 'pend3', 'pend4', 'act0', 'act1', 'act2'
 V2_META = len(V2_FIELDS)
 VI = {k: i for i, k in enumerate(V2_FIELDS)}
 KIND_HURT, KIND_FATAL, KIND_RANDOM = 1, 2, 3
-_FRAME_BYTES = ROW.fields['visible_frame'][0].shape[0]
-V2LOG_COMPACT = os.environ.get('ISAAC_RL_V2LOG_COMPACT', '0') == '1'   # (W-a, V2Log.add_row)
 KIND_CF = 4          # B34 (2026-10-16): a counterfactual teacher's choice point (tok_cf.py)
 # (2026-11-11) a point's clones by purpose for abp_turbo's ABP_CLONE_STATS (the teacher search, the death search, CF)
 PURPOSE = {KIND_HURT: 'hurt', KIND_FATAL: 'fatal', KIND_RANDOM: 'random', KIND_CF: 'cf'}
@@ -155,7 +153,9 @@ class V2Log:
     (2026-10-11, memory): the GRU input state the actor used for the record (answered ones; empty without memory);
     vg (B34): the actor's value_global of the record (answered ones; with the counterfactual teacher only); gain_r
     (B34, add's rw given): the trainer's heal / resource reward of the step before the record (gain_reward; 0 for the
-    episode's first record)."""
+    episode's first record). rows (block mode): each record as replay_value re-sends it -- since 2026-11-13 its bytes up
+    to the end of its frame only (keep_row / put_row): every ROW field but the visible_frame budget's unused tail, about
+    32 KB a record instead of 151,880 (main1: a 3600 s episode's 27,000 records were ~4 GB in its worker)."""
     __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value', 'h', 'vg', 'gain_r', '_g','rows','pending')
 
     def __init__(self):
@@ -165,28 +165,20 @@ class V2Log:
         self.gain_r, self._g = [], None
         self.rows,self.pending=[],[]
 
-    def add_row(self, row):
-        """The record's ROW for a later replay (replay_value). 2026-11-12 (W-a, ISAAC_RL_V2LOG_COMPACT=1): kept as the
-        bytes of its header and the used part of its visible frame (ROW_FRAME_AT + visible_bytes, ~32 KB) instead of a
-        whole 152-KB ROW copy; the frame bytes past visible_bytes are never read by the actor (the driver and the
-        Python path take visible_bytes of it), so a replay through row_into answers the same."""
-        if V2LOG_COMPACT:
-            b = np.ascontiguousarray(row).view(np.uint8).reshape(-1)
-            n = min(max(int(np.asarray(row['visible_bytes']).reshape(-1)[0]), 0), _FRAME_BYTES)
-            self.rows.append(b[:_ROW_FRAME_AT+n].tobytes())
-        else:
-            self.rows.append(row.copy())
+    def keep_row(self, row):
+        """Record `row` (a 1-record ROW array) kept for replay_value: its bytes up to the end of its frame (offset
+        ROW_FRAME_AT + visible_bytes) -- every field the actor reads; the frame budget's tail past visible_bytes (stale
+        bytes of the worker's slot, never read: the readers stop at visible_bytes) is not kept."""
+        b = np.ascontiguousarray(row).view(np.uint8).reshape(-1)
+        n = ROW_FRAME_AT + max(0, min(int(row['visible_bytes'][0]), ROW.itemsize - ROW_FRAME_AT))
+        self.rows.append(b[:n].copy())
 
-    def row_into(self, step, dst):
-        """Record `step`'s ROW into dst (a ROW array of one record, as row_buffer): the whole copy, or (compact) its
-        header and used frame bytes."""
-        r = self.rows[step]
-        if isinstance(r, bytes):
-            if not dst.flags['C_CONTIGUOUS']:
-                raise ValueError('V2Log.row_into: the row buffer must be contiguous')
-            dst.view(np.uint8).reshape(-1)[:len(r)] = np.frombuffer(r, np.uint8)
-        else:
-            dst[:] = r
+    def put_row(self, step, row_buffer):
+        """Record `step` written into row_buffer (a 1-record ROW array: the lane's slot) as keep_row kept it; the
+        slot's frame bytes past its visible_bytes stay as they were (never read)."""
+        b = self.rows[step]
+        dst = row_buffer.view(np.uint8).reshape(-1)
+        dst[:len(b)] = b
 
     def add(self, row, done, progress, rw=None):
         self.damage.append(float(row['damage'][0]))
@@ -355,8 +347,13 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
         B._send({"cmd": "obs"})
         ob = read_lean(B, dec)
         lf0 = lf = ob.logic_frames
+        # (2026-11-13: the main episode's stall rule, tok_obs.stall_flags -- with --stall-progress items the branches
+        #  counted neither resources nor items as progress and stalled before the main episode would have. Known and
+        #  accepted: the branch's EpisodeState does not know the ids the episode held before record d and no longer
+        #  holds; in the branch those count as acquired for the first time.)
+        pk_, it_ = stall_flags(getattr(ctx.cfg, 'stall_progress', 'events'))
         st = EpisodeState(ctx.limit, floor=True, stall=ctx.stall, run=ctx.run, items=ctx.items,
-                          stall_pickups=getattr(ctx.cfg, 'stall_progress', 'events') == 'pickups')
+                          stall_pickups=pk_, stall_items=it_)
         st.visited = set(pt.visited)
         st.stage0 = int(pt.stage0) if pt.stage0 is not None else int(ob.room[5])
         st.progress_t = pt.log.progress[d - 1] if d >= 1 else d   # the stall counter before record d
@@ -599,7 +596,7 @@ class LanePolicy:
         self.block_mode[self.i]=1
         try:
             for step in range(start,end+1):
-                log.row_into(step,row_buffer)
+                log.put_row(step,row_buffer)
                 self.request(row_buffer,log.pending[step])
                 _,value,_=self.answer()
             return self.vg if global_value else value
@@ -639,6 +636,31 @@ class LanePolicy:
             self.t_used = self.lane_t[self.i].copy()
         self.vg = float(self.out[self.i, 3]) if self.out.shape[1] > 3 else float(self.out[self.i, 0])
         return tuple(int(v) for v in self.io[self.i, 5:10]), float(self.out[self.i, 0]), float(self.out[self.i, 1])
+
+
+V2_MIN = 8   # train_tok: a minibatch step draws teacher-v2 records only in batches of at least this many
+
+
+def v2_plan(target, steps, acc):
+    """(2026-11-13) train_tok's teacher-v2 records per minibatch step for one update of `steps` steps. target: the
+    per-step count before int() (min(--teacher-v2-batch, reuse x rate / planned steps)). int(target) >= V2_MIN: that
+    count every step (the old rule, acc untouched). 0 < target < V2_MIN (the old rule drew nothing: main1's 3-4 a step):
+    acc += target each step; a step that takes acc to V2_MIN or more draws V2_MIN (acc -= V2_MIN), the others none --
+    the records used stay reuse x rate per update on average, at one more batch shape. acc carries over updates
+    (train_tok's L['v2_acc']). Returns (counts per step, acc)."""
+    n = int(target)
+    if n >= V2_MIN:
+        return [n] * steps, acc
+    out = []
+    for _ in range(steps):
+        if target > 0:
+            acc += target
+        if acc >= V2_MIN:
+            out.append(V2_MIN)
+            acc -= V2_MIN
+        else:
+            out.append(0)
+    return out, acc
 
 
 def teacher_v2_loss(logp, value, weight, ret, share, coef, vf):

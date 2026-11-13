@@ -71,7 +71,7 @@ from .tok_branch import (AUX_LOGP, AUX_PRED, AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX
                          PointQueue, choice_meta,
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
-from .tok_obs import (DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
+from .tok_obs import (stall_flags, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
                       encode_row, fast_row_function)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
@@ -401,8 +401,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     run = cfg.mode == 'run'
     limit = int(round((cfg.run_seconds if run else cfg.floor_seconds) * 30 / cfg.frames_per_decision))
     stall = int(round(cfg.floor_stall_seconds * 30 / cfg.frames_per_decision))
-    stall_pk = getattr(cfg, 'stall_progress', 'events') in ('pickups', 'items')   # B40: gains count as progress
-    stall_it = getattr(cfg, 'stall_progress', 'events') == 'items'   # (and acquired items, trinkets, pills, cards)
+    # B40: gains count as progress (--stall-progress items: and acquired items, trinkets, pills, cards)
+    stall_pk, stall_it = stall_flags(getattr(cfg, 'stall_progress', 'events'))
     queue = []      # hurts to search: (parked base, reseed, applied actions, hurt_at, seed, episode, base's decision)
     archive = []
     # 2026-10-10 (teacher v2): its points (tok_teacher2.V2Point), searched by the search thread through the lane
@@ -1985,7 +1985,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                     mine[ST['cf_nobank_refused']]+=1
                                     mine[ST['cf_skipped']]+=1
                     if block_on:
-                        v2log.add_row(row)
+                        v2log.keep_row(row)   # (2026-11-13: up to the end of its frame, not 151,880 bytes)
                         v2log.pending.append(tuple(action))
                     if cf_snap_req:   # B34: the actor copies this worker's temporal slot into the point's bank row
                         #             before this record's step (the record before is answered: no other request

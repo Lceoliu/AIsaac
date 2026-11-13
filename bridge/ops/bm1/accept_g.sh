@@ -5,7 +5,7 @@
 #   usage: [GPU=6] [GATE=0|1] accept_g.sh <tree>        (the tree deployed with deploy.sh tree first)
 # Steps (expected minutes on gpu57, without other tenants):
 #   1  the lane home's libabp_turbo.so from the tree (deploy.sh abphome), compile warnings kept       ~2
-#   2  unit tests: test_w_a_v2log_compact, test_b59_lane_arena, test_b58d_lanes, test_b58_native_consumer,
+#   2  unit tests: test_b_worker_cpu, test_v2log_compact, test_b59_lane_arena, test_b58d_lanes, test_b58_native_consumer,
 #      test_broken_episode (the native consumer's broken-episode snapshot, N_SNAP 35)                      ~4
 #   3  frame probes (abplus_probe_frame_exact): reference clone mode 0, candidate clone ...            ~16
 #        a mode 1 (native block + native step), 16 room seeds, --visible-json: payloads equal but for
@@ -16,8 +16,8 @@
 #        (cpu_ms_per_decision_ref / _fast of a / b: G's saving per decision on the same states)
 #   4  A8 (abplus_probe_play, 8 seeds, 300 steps) with ISAAC_RL_NATIVE_VISIBLE=1 and =2: 8/8 ok each     ~2
 #   5  training, one shard untimed (node1, 12 updates each; ABP_CLONE_STATS and ISAAC_RL_WORKER_CPU=1 in all):  ~27
-#        R0 baseline (G off, W-a off), with the smaps survey at update 6 (root + 3 clones)
-#        R1 candidate: ISAAC_RL_NATIVE_VISIBLE=1, ISAAC_RL_V2LOG_COMPACT=1
+#        R0 baseline (G off), with the smaps survey at update 6 (root + 3 clones)
+#        R1 candidate: ISAAC_RL_NATIVE_VISIBLE=1 (W-a: always on since the mainline's 645760f, R0 too)
 #        R2 check: ISAAC_RL_NATIVE_VISIBLE=2, 6 updates: native visible checks > 0, mismatches 0 (clone_stats)
 #   5b every worker ended (ISAAC_FAULT_WORKERS=die): rc != 0 with 'workers ended' within FAULT_S, driver and Python path ~6
 #   6  (GATE=1) gate3 on the tree                                                                      ~40
@@ -66,7 +66,7 @@ note "1 abphome rc=$rc warnings $(grep -c 'warning' $D/abphome.log) ($(ls -la $B
 
 # 2 unit tests
 DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e ISAAC_VISIBLE_PAYLOADS=${BM1_PAYLOADS:-$BM1_IN/payloads}/b45-payloads2" $BM/run.sh acceptg-unit $GPU sh -c \
-  "cd $T/bridge/python && $BM1_PY $BM1_IN/native_check.py; timeout 1200 $BM1_PY -m pytest tests/test_w_a_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py tests/test_lean_decode.py tests/test_worker_watch.py tests/test_b58e_batch.py tests/test_driver_truncate.py tests/test_cap_truncate.py -q -rs -p no:cacheprovider" > $D/unit.log 2>&1
+  "cd $T/bridge/python && $BM1_PY $BM1_IN/native_check.py; timeout 1200 $BM1_PY -m pytest tests/test_b_worker_cpu.py tests/test_v2log_compact.py tests/test_b59_lane_arena.py tests/test_b58d_lanes.py tests/test_b58_native_consumer.py tests/test_broken_episode.py tests/test_lean_decode.py tests/test_worker_watch.py tests/test_b58e_batch.py tests/test_driver_truncate.py tests/test_cap_truncate.py -q -rs -p no:cacheprovider" > $D/unit.log 2>&1
 rc=$?
 nat=$(grep -a '^EXT ' $D/unit.log | paste -sd ' ' | cut -c1-300)
 note "2 unit rc=$rc $nat; $(tail -1 $D/unit.log)"
@@ -150,7 +150,7 @@ train() {   # name, updates, extra -e flags
 SM=$!
 train r0 12
 touch $D/r0.done; wait $SM
-train r1 12 -e ISAAC_RL_NATIVE_VISIBLE=1 -e ISAAC_RL_V2LOG_COMPACT=1
+train r1 12 -e ISAAC_RL_NATIVE_VISIBLE=1
 train r2 6 -e ISAAC_RL_NATIVE_VISIBLE=2
 note "5 r2 native visible check: $(head -1 $D/r2-clone-stats.txt)"
 
