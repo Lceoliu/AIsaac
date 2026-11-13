@@ -1786,6 +1786,11 @@ def main(argv=None, child=None, actor=None):
                         'the same state and random numbers; the improving branch\'s first records become weighted '
                         'imitation records. 0: off, nothing changes')
     p.add_argument('--cf-points', type=float, default=6.0, help='choice points per worker per game hour at most')
+    p.add_argument('--cf-per-clear', type=float, default=0.0,
+                   help="(2026-11-13) choice points earned per room a worker's own main episode clears (EV_CLEARED; "
+                        'branches never earn): a point needs a token of this bucket too (capacity tok_cf.CF_BURST), '
+                        'a replacement one as well. 0: off, the quota as before. progress.csv clears, cf_earned(_w), '
+                        'cf_skip_earned(_w)')
     p.add_argument('--cf-branches', type=int, default=4, help='branches per point, the episode\'s own (taken) among them')
     p.add_argument('--cf-seconds', type=float, default=180.0,
                    help="a branch's game-time cap (then gamma^T V_global; the floor's end comes first)")
@@ -2493,7 +2498,8 @@ def main(argv=None, child=None, actor=None):
                            teacher_v2_queue=args.teacher_v2_queue,
                            teacher_v2_depths=tuple(int(v) for v in args.teacher_v2_depths.split(',') if v.strip()),
                            memory_dim=mem_dim,
-                           cf=bool(args.cf) and floor, cf_points=args.cf_points, cf_branches=args.cf_branches,
+                           cf=bool(args.cf) and floor, cf_points=args.cf_points, cf_per_clear=args.cf_per_clear,
+                           cf_branches=args.cf_branches,
                            cf_seconds=args.cf_seconds, cf_target_seconds=args.cf_target_seconds,
                            cf_margin=args.cf_margin, cf_cap=args.cf_cap, cf_distill_steps=args.cf_distill_steps,
                            cf_random=args.cf_random, cf_queue=args.cf_queue, cf_sticky_eps=args.cf_sticky_eps,
@@ -5014,6 +5020,10 @@ def main(argv=None, child=None, actor=None):
             if pf_on:
                 row['pickup_imit'] = float(pacc[0]) / steps_
                 row['forced_share'] = pf_share   # (forced share of the update's trained decisions)
+        if 'clears' in ST:   # (2026-11-13) rooms the workers' main episodes cleared in this update's window
+            tot_cl = float(stats[:, ST['clears']].sum())
+            row['clears'] = tot_cl - L.get('clears_prev', 0.0)
+            L['clears_prev'] = tot_cl
         if cfg.stat_aug_prob > 0:   # 2026-10-08: stat augmentations applied so far (worker totals)
             row['stat_augs'] = float(stats[:, ST['stat_augs']].sum())
         if cfg.no_active_prob > 0:   # B39: no-active starts so far (worker totals) and this update's finished episodes
@@ -5105,6 +5115,8 @@ def main(argv=None, child=None, actor=None):
             row['cf_cpu_per_point'] = d_c['cf_cpu'] / d_c['cf_points'] if d_c['cf_points'] > 0 else ''
             row['cf_wait_per_point'] = d_c['cf_wait_s'] / d_c['cf_points'] if d_c['cf_points'] > 0 else ''
             row['cf_dec_w'] = d_c['cf_dec']   # branch decisions this window (vs the update's own decisions)
+            row['cf_earned_w'] = d_c['cf_earned']   # (2026-11-13, --cf-per-clear: earned tokens, refused triggers)
+            row['cf_skip_earned_w'] = d_c['cf_skip_earned']
             row['cf_game_hours'] = tot_c['cf_frames'] / 30 / 3600
             row['cf_snaps'] = prof.get('cf_snaps', 0)
             if args.cf_wall:   # B40: the wall points' bomb_at branches in this window

@@ -168,6 +168,9 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # (2026-11-12) the worker's current main episode started from an archive entry (1) or a floor start (0): set
          # before its first record is sent; the trainer's Episodes reads it at that record (episodes.jsonl 'start')
          'ep_archive',
+         # (2026-11-13) rooms the worker's main episodes cleared (EV_CLEARED records; branches never count); with
+         # cfg.cf_per_clear: the earned bucket's tokens added (before its cap), triggers refused for want of one
+         'clears', 'cf_earned', 'cf_skip_earned',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
@@ -273,6 +276,7 @@ class TokSamplerConfig:
     # improving branch's first records into the V2 ring
     cf: bool = False
     cf_points: float = 6.0                        # choice points per worker per game hour at most (the quota's rate)
+    cf_per_clear: float = 0.0                     # (2026-11-13) earned tokens per room cleared; 0: no earned condition
     cf_branches: int = 4                          # K branches a point compares, taken among them
     cf_seconds: float = 180.0                     # a branch's game-time cap (then gamma^T V_global)
     cf_target_seconds: float = 20.0               # the target / sticky intents' game-time cap (then the policy)
