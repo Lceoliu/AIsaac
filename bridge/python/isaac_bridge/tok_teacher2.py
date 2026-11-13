@@ -45,7 +45,7 @@ import numpy as np
 
 from .abplus_lean import LeanDecoder, lean_logic_frames, read_lean, read_lean_raw
 from .tok_branch import step_reward
-from .tok_obs import RC_HP0, RC_PROGRESS, ROW, EpisodeState, FastRow, encode_row
+from .tok_obs import RC_HP0, RC_PROGRESS, ROW, ROW_FRAME_AT, EpisodeState, FastRow, encode_row
 
 V2_RING = 384        # imitation records per worker the trainer may fall behind by (a point writes <= cap of them)
 # per imitation record (float64): the action under way and the applied one (5 each, items / pill 0 without items),
@@ -153,7 +153,9 @@ class V2Log:
     (2026-10-11, memory): the GRU input state the actor used for the record (answered ones; empty without memory);
     vg (B34): the actor's value_global of the record (answered ones; with the counterfactual teacher only); gain_r
     (B34, add's rw given): the trainer's heal / resource reward of the step before the record (gain_reward; 0 for the
-    episode's first record)."""
+    episode's first record). rows (block mode): each record as replay_value re-sends it -- since 2026-11-13 its bytes up
+    to the end of its frame only (keep_row / put_row): every ROW field but the visible_frame budget's unused tail, about
+    32 KB a record instead of 151,880 (main1: a 3600 s episode's 27,000 records were ~4 GB in its worker)."""
     __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value', 'h', 'vg', 'gain_r', '_g','rows','pending')
 
     def __init__(self):
@@ -162,6 +164,21 @@ class V2Log:
         self.vg = []
         self.gain_r, self._g = [], None
         self.rows,self.pending=[],[]
+
+    def keep_row(self, row):
+        """Record `row` (a 1-record ROW array) kept for replay_value: its bytes up to the end of its frame (offset
+        ROW_FRAME_AT + visible_bytes) -- every field the actor reads; the frame budget's tail past visible_bytes (stale
+        bytes of the worker's slot, never read: the readers stop at visible_bytes) is not kept."""
+        b = np.ascontiguousarray(row).view(np.uint8).reshape(-1)
+        n = ROW_FRAME_AT + max(0, min(int(row['visible_bytes'][0]), ROW.itemsize - ROW_FRAME_AT))
+        self.rows.append(b[:n].copy())
+
+    def put_row(self, step, row_buffer):
+        """Record `step` written into row_buffer (a 1-record ROW array: the lane's slot) as keep_row kept it; the
+        slot's frame bytes past its visible_bytes stay as they were (never read)."""
+        b = self.rows[step]
+        dst = row_buffer.view(np.uint8).reshape(-1)
+        dst[:len(b)] = b
 
     def add(self, row, done, progress, rw=None):
         self.damage.append(float(row['damage'][0]))
@@ -574,7 +591,7 @@ class LanePolicy:
         self.block_mode[self.i]=1
         try:
             for step in range(start,end+1):
-                row_buffer[:]=log.rows[step]
+                log.put_row(step,row_buffer)
                 self.request(row_buffer,log.pending[step])
                 _,value,_=self.answer()
             return self.vg if global_value else value

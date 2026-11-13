@@ -1935,7 +1935,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                     mine[ST['cf_nobank_refused']]+=1
                                     mine[ST['cf_skipped']]+=1
                     if block_on:
-                        v2log.rows.append(row.copy())
+                        v2log.keep_row(row)   # (2026-11-13: up to the end of its frame, not 151,880 bytes)
                         v2log.pending.append(tuple(action))
                     if cf_snap_req:   # B34: the actor copies this worker's temporal slot into the point's bank row
                         #             before this record's step (the record before is answered: no other request
