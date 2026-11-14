@@ -1,6 +1,7 @@
 #!/bin/sh
 # bm1: a training run of K synchronised shards (BM1 C) under a guard that resumes it after a failure, unattended.
 #   usage: [HOURS=<the run's game hours in all, resumes included (ISAAC_GAME_HOURS_TOTAL)>] [INIT=<checkpoint path as the container sees it>] [ENVS="-e K=V ..."]
+#          [RUN_PARENT=<dir under /root/AIsaac/train: the run directory is <dir>/<name>>] [NOLOCK=1: the caller holds the lock (ab1_pair.sh)]
 #          [MAX_RETRY=3] [BACKOFF=120] [DISK_MIN_GB=50] [MEM_GB=128] train_guard.sh <name> <tree> <lane 0 file> <lane 1 file> [...]
 # Run directory /root/AIsaac/train/<name> (the container's /bench/train/<name>): rank r writes <name>-s<r>/ (progress.csv,
 # episodes.jsonl rotated past 256 MB, checkpoints/), guard.log (every start, end, cause, resume), foreign_gpu.log (other
@@ -42,7 +43,7 @@ BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 . $BM/common.sh
 NAME=$1; TREE=$2; shift 2
 K=$#
-RD=/root/AIsaac/train/$NAME; RDC=/bench/train/$NAME
+RD=/root/AIsaac/train/${RUN_PARENT:+$RUN_PARENT/}$NAME; RDC=/bench/train/${RUN_PARENT:+$RUN_PARENT/}$NAME
 mkdir -p $RD
 GL=$RD/guard.log
 glog() { echo "$(date '+%F %T') $*" >> $GL; log "train $NAME: $*"; }
@@ -60,7 +61,16 @@ CPUS=${CPUS%|}; LCPUS=${LCPUS%|}; DCPUS=${DCPUS%|}
 LANESUM=$MEMG; MEMG=${MEM_GB:-128}
 NB=$(lane $1 LANE_NAME); PB=$(lane $1 LANE_PORT)
 CTR="$BM1_NAME-train-$NAME"
-take_excl "training $NAME ($TREE, K $K, GPU $G) 计时运行"
+[ "${NOLOCK:-0}" = 1 ] || take_excl "training $NAME ($TREE, K $K, GPU $G) 计时运行"   # (NOLOCK=1: the caller holds X, ab1_pair.sh)
+# (2026-11-14, ab1: K=1 has no shard_sync -- ISAAC_SHARD_WORLD 1 reads no stop file -- so a stop SIGINTs the trainer too;
+#  it saves last.pt and ends, as the stall path's SIGINT). Only the trainer's own process (^$BM1_PY): "train_tok.py" alone
+#  matched xvfb-run's and timeout's command lines too, and timeout passed its SIGINT on -- a second SIGINT inside the
+#  trainer's shutdown aborted it (ab1smoke, 2026-11-14: rc 134, no last.pt)
+stop_ranks() {
+  docker exec $CTR touch /tmp/shards-$NAME/stop 2>/dev/null || return 1
+  [ $K = 1 ] && docker exec $CTR pkill -INT -f "^$BM1_PY -u train_tok.py .*--out $RDC/$NAME-s" 2>/dev/null
+  return 0
+}
 for m_ in .guard_end .stop_sent .oom_stop .broken_stop .stall .attempt_start; do   # (an earlier guard's markers: moved aside, nothing deleted)
   [ -f $RD/$m_ ] && { mkdir -p ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d); mv $RD/$m_ ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d)/$NAME$m_-$(date +%H%M%S); }
 done
@@ -98,7 +108,7 @@ glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCP
         glog "WARNING the kernel's OOM kills in the container at its memory limit ${MEMG}g: $4 in this attempt (update $3, growing $oks_ update(s) in a row)"
         if [ $oks_ -ge ${OOM_KILL_STREAK:-3} ] || [ "$4" -ge ${OOM_KILL_MAX:-20} ]; then
           echo "the container's memory at its limit ${MEMG}g, the kernel killing game or worker processes ($4 kills in this attempt, growing $oks_ update(s) in a row)" > $RD/.oom_stop
-          docker exec $CTR touch /tmp/shards-$NAME/stop 2>/dev/null
+          stop_ranks
           glog "STOP (memory): $(cat $RD/.oom_stop); the ranks' stop file written"
         fi
       else oks_=0; fi
@@ -126,7 +136,7 @@ print(u, e, t)" $(for r in $(seq 0 $((K-1))); do echo $RD/$NAME-s$r/progress.csv
         glog "WARNING episodes broke off (a game or worker failed): $2 in update $1, $3 in this attempt ($bks_ update(s) in a row)"
         if [ $bks_ -ge ${BROKEN_STREAK:-3} ] || [ "$3" -ge ${BROKEN_MAX:-20} ]; then
           echo "episodes breaking off: games or workers failing ($3 in this attempt, $bks_ update(s) in a row)" > $RD/.broken_stop
-          docker exec $CTR touch /tmp/shards-$NAME/stop 2>/dev/null
+          stop_ranks
           glog "STOP (broken episodes): $(cat $RD/.broken_stop); the ranks' stop file written"
         fi
       else bks_=0; fi
@@ -178,7 +188,7 @@ print(u, e, t)" $(for r in $(seq 0 $((K-1))); do echo $RD/$NAME-s$r/progress.csv
           # (the kill aims at this attempt's container by its id: the next attempt's has the same name -- faulttest,
           #  2026-11-12: a kill by name 180 s later hit the resumed attempt's container)
           cid_=$(docker inspect -f '{{.Id}}' $CTR 2>/dev/null)
-          docker exec $CTR pkill -INT -f "train_tok.py .*--out $RDC/$NAME-s" 2>/dev/null
+          docker exec $CTR pkill -INT -f "^$BM1_PY -u train_tok.py .*--out $RDC/$NAME-s" 2>/dev/null
           ( sleep ${STALL_KILL_S:-180}; [ -n "$cid_" ] && [ "$(docker inspect -f '{{.State.Running}}' $cid_ 2>/dev/null)" = true ] && {
               docker kill $cid_ > /dev/null 2>&1; glog "STALL: the container $CTR (${cid_%${cid_#????????????}}) killed (still there ${STALL_KILL_S:-180} s after the SIGINT)"; } ) &
           break
@@ -191,7 +201,7 @@ MON=$!
 # (STOP while the ranks run: their stop file inside the container, so they end together at the next collect)
 ( while [ ! -f $RD/.guard_end ]; do
     if [ -f $RD/STOP ] && [ ! -f $RD/.stop_sent ]; then
-      docker exec $CTR touch /tmp/shards-$NAME/stop 2>/dev/null && { : > $RD/.stop_sent; glog "STOP: the ranks' stop file written"; }
+      stop_ranks && { : > $RD/.stop_sent; glog "STOP: the ranks' stop file written"; }
     fi
     sleep 5
   done ) &
@@ -310,5 +320,5 @@ while :; do
 done
 touch $RD/.guard_end
 kill $MON $STW 2>/dev/null
-give
+[ "${NOLOCK:-0}" = 1 ] || give
 glog "guard end"
