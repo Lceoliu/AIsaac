@@ -3,7 +3,7 @@
 updates, read-only, standard library -- plus the explained variance (median) and the errors (sum) per window; a log
 whose episodes carry no 'start' (the C99 tree 1ae82d3 does not record fresh vs archive starts) shows the fresh-start
 column as n/a.
-  ab2_win.py <run dir>/<name>-s0 [W]
+  ab2_win.py <run dir>/<name>-s0 [W] [U]   (U, C108 2026-11-15: only updates <= U, e.g. a longer run's first 330)
 Per window, from the episodes (episodes.jsonl and its rotated files): episodes, the share with a room cleared (rooms
 >= 1; and among the fresh starts, start == 'fresh'), items per episode, floors passed (exits per episode, and episodes reaching stage >= 2), deaths / no-progress
 ends, forced-pickup share; from progress.csv: the medians of x real, move + shoot entropy (and each head), bomb / item /
@@ -16,6 +16,7 @@ import sys
 
 d = sys.argv[1]
 W = int(sys.argv[2]) if len(sys.argv) > 2 else 200
+U = int(sys.argv[3]) if len(sys.argv) > 3 else None
 eps = []
 for name in sorted(os.listdir(d)):
     if name.startswith('episodes.jsonl'):
@@ -28,7 +29,8 @@ for name in sorted(os.listdir(d)):
 prog = {}
 with open(os.path.join(d, 'progress.csv')) as f:
     for x in csv.DictReader(f):
-        prog[int(x['update'])] = x
+        if U is None or int(x['update']) <= U:
+            prog[int(x['update'])] = x
 
 
 def fl(x, k):

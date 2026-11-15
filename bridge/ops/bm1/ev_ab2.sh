@@ -14,7 +14,8 @@
 set -u
 BM=/root/AIsaac/bm1
 RUN=$1; KIND=$2; G=$3; CS=$4; MS=$5; W=$6; shift 6
-HOST=/root/AIsaac/train/ab2/eval
+PAR=${PARENT:-ab2}   # (C108, 2026-11-15: PARENT=ab3 for ab3's runs; ab2 as before)
+HOST=/root/AIsaac/train/$PAR/eval
 mkdir -p $HOST
 echo "$(date '+%F %T') ev_ab2: $RUN ($KIND) GPU $G CPUs $CS workers $W: $*" >> $BM/reports/bm1.log
 X="xvfb-run -a -s '-screen 0 640x480x24 -nolisten tcp -noreset'"
@@ -22,8 +23,8 @@ for spec in "$@"; do
   tag=$(echo "$spec" | cut -d, -f1); ck=$(echo "$spec" | cut -d, -f2); seeds=$(echo "$spec" | cut -d, -f3)
   [ -f $HOST/$tag/summary.json ] && { echo "skip $tag (done)"; continue; }
   [ -e $HOST/$tag ] && { echo "skip $tag: $HOST/$tag exists without summary.json (a failed run: look)"; continue; }
-  [ -f /root/AIsaac/train/ab2/$RUN/$RUN-s0/checkpoints/$ck ] || { echo "skip $tag: no checkpoint $ck"; continue; }
-  CK=/bench/train/ab2/$RUN/$RUN-s0/checkpoints/$ck; O=/bench/train/ab2/eval/$tag
+  [ -f /root/AIsaac/train/$PAR/$RUN/$RUN-s0/checkpoints/$ck ] || { echo "skip $tag: no checkpoint $ck"; continue; }
+  CK=/bench/train/$PAR/$RUN/$RUN-s0/checkpoints/$ck; O=/bench/train/$PAR/eval/$tag
   t0=$(date +%s)
   if [ "$KIND" = old ]; then
     L=$(GPU=$G CPUSET=$CS MEMS=$MS sh $BM/job.sh ev-$RUN "cd /bench/bm1/trees/m1ae82d3/bridge/python && export HOME=/bench/bm1/home-c99 ABP_HOME=/bench/bm1/home-c99/isaac-abplus ABP_BRIDGE_LUA=/bench/bm1/trees/m1ae82d3/bridge/abplus/abp_bridge.lua OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null PYTHONPATH=.:\$PYTHONPATH && $X \$BM1_PY -u eval_tok.py --checkpoint $CK --groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --workers 8 --seeds $seeds --name hc99e --port 49300 --out $O" | tail -1)
