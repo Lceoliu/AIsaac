@@ -3,6 +3,10 @@
 #   usage: [HOURS=<the run's game hours in all, resumes included (ISAAC_GAME_HOURS_TOTAL)>] [INIT=<checkpoint path as the container sees it>] [ENVS="-e K=V ..."]
 #          [RUN_PARENT=<dir under /root/AIsaac/train: the run directory is <dir>/<name>>] [NOLOCK=1: the caller holds the lock (ab1_pair.sh)]
 #          [MAX_RETRY=3] [BACKOFF=120] [DISK_MIN_GB=50] [MEM_GB=128] train_guard.sh <name> <tree> <lane 0 file> <lane 1 file> [...]
+#   (2026-11-14, ab2's arm A, the C99 tree m1ae82d3: BASE=<base script in bm1, default xnew2.sh> (shardk_in.sh);
+#    LEARNER_DEV=<--learner-device, default cuda:1; empty: the flag left out -- a tree without it, one GPU per rank>;
+#    NO_RESUME=1: no resume at all -- after the first attempt of this guard, or with a checkpoint already in the run
+#    directory, the guard stops (a tree whose --resume restarts its --game-hours and --pickup-force line from zero))
 # Run directory /root/AIsaac/train/<name> (the container's /bench/train/<name>): rank r writes <name>-s<r>/ (progress.csv,
 # episodes.jsonl rotated past 256 MB, checkpoints/), guard.log (every start, end, cause, resume), foreign_gpu.log (other
 # processes seen on our GPUs), STOP (touch it: the ranks end together at their next collect, the guard ends, no resume),
@@ -74,7 +78,7 @@ stop_ranks() {
 for m_ in .guard_end .stop_sent .oom_stop .broken_stop .stall .attempt_start; do   # (an earlier guard's markers: moved aside, nothing deleted)
   [ -f $RD/$m_ ] && { mkdir -p ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d); mv $RD/$m_ ${BM1_TRASH:-/root/AIsaac/trash}/$(date +%Y%m%d)/$NAME$m_-$(date +%H%M%S); }
 done
-glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCPUS memory limit ${MEMG}g (the lanes' sum ${LANESUM}g) hours ${HOURS:-125}"
+glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCPUS memory limit ${MEMG}g (the lanes' sum ${LANESUM}g) hours ${HOURS:-125} base ${BASE:-xnew2.sh} learner-device ${LEARNER_DEV-cuda:1}${NO_RESUME:+ no-resume $NO_RESUME}"
 # (other tenants' processes on our GPUs, every 30 s: our container's pids from docker top)
 ( while [ ! -f $RD/.guard_end ]; do
     ours=$(docker top $CTR -eo pid 2>/dev/null | tail -n +2 | tr '\n' ' ')
@@ -225,6 +229,10 @@ while :; do
   free_gb=$(df -BG --output=avail /root/AIsaac | tail -1 | tr -dc 0-9)
   [ "$free_gb" -lt "${DISK_MIN_GB:-50}" ] && { glog "free disk ${free_gb} GB < ${DISK_MIN_GB:-50}: stopped, no resume"; break; }
   ck=$(newest_ckpt)
+  if [ "${NO_RESUME:-0}" = 1 ] && { [ -n "$ck" ] || [ -n "${tried_:-}" ]; }; then
+    glog "NO_RESUME: ${ck:+a checkpoint exists ($ck)}${ck:+; }${tried_:+an attempt of this guard has ended}: stopped, no resume (a person decides)"; break
+  fi
+  tried_=1
   if [ -n "$ck" ]; then EX3="-e EXTRA3=--resume=$ck"; from="resume from $ck"
   elif [ -n "${INIT:-}" ]; then EX3="-e EXTRA3=--init=$INIT"; from="start from INIT $INIT"
   else EX3=""; from="fresh start"; fi
@@ -240,7 +248,8 @@ while :; do
     python3 $BM/m0_mem.py $RD/$NAME-s$r.mem.attempt$attempt.csv ${MEM_SAMPLE_S:-30} " --out $RDC/$NAME-s$r " > $RD/$NAME-s$r.mem.attempt$attempt.log 2>&1 &
     MP="$MP $!"
   done
-  DE="-e CODE=$TREE -e OUTDIR=$RDC -e ISAAC_BLOCK_TIMING=1 -e EXTRA=--learner-device=cuda:1 -e EXTRA2=--checkpoint-every=${CKPT_EVERY:-25} $EX3"
+  LD_=${LEARNER_DEV-cuda:1}
+  DE="-e CODE=$TREE -e OUTDIR=$RDC -e ISAAC_BLOCK_TIMING=1 ${LD_:+-e EXTRA=--learner-device=$LD_} -e EXTRA2=--checkpoint-every=${CKPT_EVERY:-25} $EX3 ${BASE:+-e BASE=$BASE}"
   DE="$DE -e NAME_BASE=$NB -e PORT_BASE=$PB -e SHARD_PORT=${SHARD_PORT:-29400} -e ISAAC_SHARD_TIMEOUT=${SHARD_TIMEOUT:-1800}"
   if [ -f $RD/train_args ]; then   # (the run's own trainer flags: xnew2.sh's FLAGS_FILE, read at every attempt)
     DE="$DE -e FLAGS_FILE=$RDC/train_args"; glog "train_args: $(tr '
