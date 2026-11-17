@@ -40,11 +40,11 @@ local out = { g0 = { g0.X, g0.Y }, gw = room:GetGridWidth(), gh = room:GetGridHe
   players = {}, entities = {} }
 for i = 0, Game():GetNumPlayers() - 1 do
   local p = Isaac.GetPlayer(i)
-  out.players[#out.players + 1] = { index = p.Index, x = p.Position.X, y = p.Position.Y, gi = room:GetGridIndex(p.Position),
+  out.players[#out.players + 1] = { x = p.Position.X, y = p.Position.Y, gi = room:GetGridIndex(p.Position),
     ptype = p:GetPlayerType(), fire_dir = p:GetFireDirection(), seed = p.InitSeed }
   local ok, sub = pcall(function() return p:GetSubPlayer() end)
   if ok and sub then
-    out.players[#out.players].sub = { index = sub.Index, seed = sub.InitSeed, x = sub.Position.X, y = sub.Position.Y,
+    out.players[#out.players].sub = { seed = sub.InitSeed, x = sub.Position.X, y = sub.Position.Y,
       gi = room:GetGridIndex(sub.Position), ptype = sub:GetPlayerType() }
   end
 end

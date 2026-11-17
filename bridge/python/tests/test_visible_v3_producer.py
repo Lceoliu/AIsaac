@@ -18,7 +18,7 @@ O = (20.0, 100.0)
 
 
 def body(**kw):
-    b = dict(entity_index=1, x=O[0] + 100.0, y=O[1] + 60.0, vx=1.5, vy=-2.0, size=10, hearts=6, max_hearts=6, soul=2,
+    b = dict(init_seed=1, x=O[0] + 100.0, y=O[1] + 60.0, vx=1.5, vy=-2.0, size=10, hearts=6, max_hearts=6, soul=2,
              bone=0, eternal=0, golden=0, broken=0, rotten=0, extra_lives=0, coins=7, bombs=1, keys=2, giga_bombs=0,
              golden_bomb=0, golden_key=0, poop_mana=0, soul_charge=0, blood_charge=0, damage=3.5, max_fire_delay=10,
              shot_speed=1, range=260, move_speed=1, luck=0, can_fly=0, invulnerable=0, controls=1, dead=0,
@@ -155,7 +155,7 @@ def test_decorative_list_equals_the_bridges():
 def test_a_body_without_a_room_position():
     """Schema batch 3: position_known 0 (the AB+ sub-player, never a room entity) -> x / y / vx / vy 0 and the local
     patch 0; the other fields as usual."""
-    sub = body(entity_index=0, x=0.0, y=0.0, vx=3.0, vy=4.0, ptype=17, role=3, linked=1, position_known=0)
+    sub = body(init_seed=7, x=0.0, y=0.0, vx=3.0, vy=4.0, ptype=17, role=3, linked=1, position_known=0)
     main = body(linked=2, position_known=1)
     f = VP.unpack_frame_v3(VP.observation_frame_v3(raw_block(bodies=[main, sub])))
     P = f['P']
