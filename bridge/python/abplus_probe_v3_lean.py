@@ -33,18 +33,18 @@ def game_cpu(c):
     return float(c.lua("return tostring(os.clock())"))
 
 
-def run(inst, seed, steps, stall, v3, out):
+def run(inst, seed, steps, stall, v3, out, run_mode=False):
     b = inst.env.bridge
     b.reset_mode, b.character = 'floor', 0
     inst.reset(seed)
     c = b.fork(tag='v3lean', lean=True, alarm=900)
-    stats = dict(seed=seed, v3=v3, records=0, v3_blocks=0, equal=0, schema_ok=0, mismatch=[])
+    stats = dict(seed=seed, v3=v3, run=run_mode, records=0, v3_blocks=0, equal=0, schema_ok=0, mismatch=[])
     try:
         c._send({"cmd": "visible_v3", "enabled": v3})
         ack = c._recv()
         assert ack.get('type') == 'ok' and ack.get('enabled') == v3, ack
         dec = LeanDecoder()
-        st = EpisodeState(limit=100000, floor=True, stall=stall)
+        st = EpisodeState(limit=100000, floor=True, stall=stall, run=run_mode)   # (run: --mode run's state)
         row = np.zeros(1, ROW)
         c._send({"cmd": "obs"})
         payload = read_raw(c)
@@ -85,6 +85,7 @@ def main():
     ap.add_argument('--steps', type=int, default=300)
     ap.add_argument('--stall', type=int, default=120)
     ap.add_argument('--port', type=int, default=44530)
+    ap.add_argument('--run', type=int, default=0, help='1: EpisodeState(run=True), the --mode run path')
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
     out = Path(args.out)
@@ -102,7 +103,7 @@ def main():
     try:
         for seed in range(first, first + count):
             for v3 in (True, False):
-                r = run(inst, seed, args.steps, args.stall, v3, out)
+                r = run(inst, seed, args.steps, args.stall, v3, out, run_mode=bool(args.run))
                 res.append(r)
                 print(json.dumps(r), flush=True)
     finally:
