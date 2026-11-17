@@ -17,7 +17,7 @@ CRLF, LF = chr(13) + chr(10), chr(10)   # (a Windows checkout may hold the heade
 
 
 def test_f1_sizes():
-    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111201
+    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111701
     assert (S.FIXED, S.PF, S.LOCAL, S.EF, S.NF, S.SF, S.BODY, S.RC) == (2417, 192, 405, 64, 8, 24, 597, 21)
     assert S.HEADER == 8 and S.MAGIC == 61107 and S.LAYOUT_GEN == 3
     assert S.frame_floats(1, 0, 0, 0) == 2417 + 597
@@ -38,7 +38,7 @@ def test_f1_columns_the_design_names():
                     ('curse0', 72), ('black_slot0', 104), ('bone_slot0', 128), ('weapon0', 152),
                     ('overflow_interactable', 176), ('overflow_other', 180)):
         assert S.col(P, name) == c, name
-    assert all(P[i][1] == 'reserved' for i in list(range(41, 48)) + [54, 55] + list(range(66, 72)) + list(range(181, 192)))
+    assert all(P[i][1] == 'reserved' for i in list(range(43, 48)) + [54, 55] + list(range(66, 72)) + list(range(181, 192)))
     for name, c in (('type', 0), ('subtype', 2), ('kind', 15), ('npc_flags', 16), ('champion', 19), ('price', 31),
                     ('identity_known', 32), ('flags_known', 33), ('tear_w0', 34), ('tear_w7', 41), ('proj_w0', 42),
                     ('eflag_w0', 46), ('anim_id', 50)):
@@ -139,3 +139,24 @@ def test_scale_vector():
     sv = S.scale_vector(S.P_COLS)
     assert len(sv) == S.PF and sv[0] == 520 and sv[S.col(S.P_COLS, 'stall_share')] == 1 and sv[S.col(S.P_COLS, 'ptype')] == 1
     assert all(math.isfinite(x) and x > 0 for x in sv)
+
+
+def test_batch1_coordinate_contract():
+    """Batch 1 (the coordinator, 2026-11-17; the coordinate contract, after V1): one canvas frame, isotropic scales,
+    the laser's scales, P grid_w / grid_h, kind + 1."""
+    P, E = S.P_COLS, S.E_COLS
+    assert S.CELL == 40
+    sp, se = S.scale_vector(P), S.scale_vector(E)
+    for cols, sv, x, y in ((P, sp, 'x', 'y'), (E, se, 'x', 'y')):
+        cx, cy = S.col(cols, x), S.col(cols, y)
+        assert sv[cx] == sv[cy] == 520 and 'canvas-frame px' in cols[cx][2] and 'canvas-frame px' in cols[cy][2]
+    assert sp[S.col(P, 'vx')] == sp[S.col(P, 'vy')] == se[S.col(E, 'vx')] == se[S.col(E, 'vy')] == 10
+    assert (se[S.col(E, 'l_len')], se[S.col(E, 'l_ex')], se[S.col(E, 'l_ey')], se[S.col(E, 'l_radius')]) == (300, 520, 520, 100)
+    assert 'canvas-frame px' in E[S.col(E, 'l_ex')][2] and 'canvas-frame px' in E[S.col(E, 'l_ey')][2]
+    assert (S.col(P, 'grid_w'), S.col(P, 'grid_h')) == (41, 42) and (sp[41], sp[42]) == (28, 16)
+    assert S.ENTITY_KIND == {'other': 1, 'tear': 2, 'projectile': 3, 'laser': 4, 'bomb': 5, 'pickup': 6, 'npc': 7,
+                             'knife': 8, 'familiar': 9, 'effect': 10}
+    assert 0 not in S.ENTITY_KIND.values() and max(S.ENTITY_KIND.values()) < S.CAT_NS['entity_kind'][1]
+    assert len({S.cat_index('entity_kind', v) for v in S.ENTITY_KIND.values()}) == 10   # (no kind on the 'none' row)
+    for cols in (P, E):   # (no column is relative to GetTopLeftPos any more)
+        assert not any('top-left' in c[2] or 'TopLeft' in c[2] for c in cols)

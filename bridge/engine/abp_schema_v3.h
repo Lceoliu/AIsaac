@@ -6,7 +6,7 @@
 
 /* ---- F1: identity and header */
 #define ABP_V3_SCHEMA "isaac-visible-prlmens-g-v3"
-#define ABP_V3_VERSION 2026111201
+#define ABP_V3_VERSION 2026111701
 #define ABP_V3_FRAME_BYTES 131072
 #define ABP_V3_MAGIC 61107
 #define ABP_V3_LAYOUT_GEN 3
@@ -29,6 +29,8 @@
 #define ABP_V3_CANVAS_W 28
 #define ABP_V3_ROOM_WORDS 5
 #define ABP_V3_RC 21
+/* the canvas frame (batch 1): origin = GetGridPosition(0) - (CELL / 2, CELL / 2); cell = floor(pos / CELL) */
+#define ABP_V3_CELL 40
 #define ABP_V3_W0_INSIDE_SHIFT 0
 #define ABP_V3_W0_INSIDE_BITS 1
 #define ABP_V3_W0_COLLISION_SHIFT 1
@@ -98,8 +100,8 @@
 /* frame floats = ABP_V3_FIXED + p * ABP_V3_BODY + e * ABP_V3_EF + n * ABP_V3_NF + s * ABP_V3_SF */
 
 /* ---- F1: columns (raw units on the wire; reserved columns 0) */
-#define ABP_V3_P_X 0   /* num: px from the room top-left */
-#define ABP_V3_P_Y 1   /* num: px from the room top-left */
+#define ABP_V3_P_X 0   /* num: canvas-frame px (Position.X - origin x) */
+#define ABP_V3_P_Y 1   /* num: canvas-frame px (Position.Y - origin y) */
 #define ABP_V3_P_VX 2   /* num: px/frame */
 #define ABP_V3_P_VY 3   /* num: px/frame */
 #define ABP_V3_P_SIZE 4   /* num: px */
@@ -139,6 +141,8 @@
 #define ABP_V3_P_BODY_INDEX 38   /* num: index in the frame */
 #define ABP_V3_P_LINKED_BODY 39   /* num: partner index + 1, 0 none */
 #define ABP_V3_P_STALL_SHARE 40   /* num: decisions since the last progress / the stall limit, 0..1 (known: P 53) */
+#define ABP_V3_P_GRID_W 41   /* num: GetGridWidth (cells; the room fills canvas columns 0..grid_w-1) */
+#define ABP_V3_P_GRID_H 42   /* num: GetGridHeight (cells; the room fills canvas rows 0..grid_h-1) */
 #define ABP_V3_P_HEALTH_KNOWN 48   /* known: not Curse of the Unknown */
 #define ABP_V3_P_CONTROLLER_KNOWN 49   /* known: ControllerIndex present */
 #define ABP_V3_P_ANIMATION_KNOWN 50   /* known: animation name known */
@@ -171,8 +175,8 @@
 #define ABP_V3_E_TYPE 0   /* id: EntityType (identity) */
 #define ABP_V3_E_VARIANT 1   /* id: variant (identity) */
 #define ABP_V3_E_SUBTYPE 2   /* id: subtype (identity; 0 for a pedestal under Curse of the Blind) */
-#define ABP_V3_E_X 3   /* num: px from the room top-left */
-#define ABP_V3_E_Y 4   /* num: px from the room top-left */
+#define ABP_V3_E_X 3   /* num: canvas-frame px (Position.X - origin x) */
+#define ABP_V3_E_Y 4   /* num: canvas-frame px (Position.Y - origin y) */
 #define ABP_V3_E_VX 5   /* num: px/frame */
 #define ABP_V3_E_VY 6   /* num: px/frame */
 #define ABP_V3_E_SIZE 7   /* num: px */
@@ -183,7 +187,7 @@
 #define ABP_V3_E_CDMG 12   /* num: CollisionDamage */
 #define ABP_V3_E_SPRITE_FRAME 13   /* num: frame */
 #define ABP_V3_E_AGE 14   /* num: FrameCount */
-#define ABP_V3_E_KIND 15   /* cat:entity_kind: 0 other, 1 tear, 2 projectile, 3 laser, 4 bomb, 5 pickup, 6 npc, 7 knife, 8 familiar, 9 effect */
+#define ABP_V3_E_KIND 15   /* cat:entity_kind: raw kind + 1: 1 other, 2 tear, 3 projectile, 4 laser, 5 bomb, 6 pickup, 7 npc, 8 knife, 9 familiar, 10 effect; 0 none */
 #define ABP_V3_E_NPC_FLAGS 16   /* bits8: 1 IsEnemy, 2 IsVulnerableEnemy, 4 IsBoss, 8 CanShutDoors */
 #define ABP_V3_E_ANIM 17   /* num: short animation list index */
 #define ABP_V3_E_FLIP_X 18   /* num: 0/1 */
@@ -195,8 +199,8 @@
 #define ABP_V3_E_L_COS 24   /* num: laser direction cos */
 #define ABP_V3_E_L_SIN 25   /* num: laser direction sin */
 #define ABP_V3_E_L_LEN 26   /* num: laser length px */
-#define ABP_V3_E_L_EX 27   /* num: laser end x px */
-#define ABP_V3_E_L_EY 28   /* num: laser end y px */
+#define ABP_V3_E_L_EX 27   /* num: laser end x, canvas-frame px */
+#define ABP_V3_E_L_EY 28   /* num: laser end y, canvas-frame px */
 #define ABP_V3_E_L_RADIUS 29   /* num: laser radius px */
 #define ABP_V3_E_L_CIRCLE 30   /* num: 0/1 */
 #define ABP_V3_E_PRICE 31   /* num: shop price (coins) */
@@ -300,16 +304,16 @@
 #define ABP_V3_SLOT_FAMILY_POOP_SPELL 5
 #define ABP_V3_SLOT_FAMILY_CRAFTING_ITEM 6
 #define ABP_V3_SLOT_FAMILY_CRAFTING_OUTPUT 7
-#define ABP_V3_ENTITY_KIND_OTHER 0
-#define ABP_V3_ENTITY_KIND_TEAR 1
-#define ABP_V3_ENTITY_KIND_PROJECTILE 2
-#define ABP_V3_ENTITY_KIND_LASER 3
-#define ABP_V3_ENTITY_KIND_BOMB 4
-#define ABP_V3_ENTITY_KIND_PICKUP 5
-#define ABP_V3_ENTITY_KIND_NPC 6
-#define ABP_V3_ENTITY_KIND_KNIFE 7
-#define ABP_V3_ENTITY_KIND_FAMILIAR 8
-#define ABP_V3_ENTITY_KIND_EFFECT 9
+#define ABP_V3_ENTITY_KIND_OTHER 1
+#define ABP_V3_ENTITY_KIND_TEAR 2
+#define ABP_V3_ENTITY_KIND_PROJECTILE 3
+#define ABP_V3_ENTITY_KIND_LASER 4
+#define ABP_V3_ENTITY_KIND_BOMB 5
+#define ABP_V3_ENTITY_KIND_PICKUP 6
+#define ABP_V3_ENTITY_KIND_NPC 7
+#define ABP_V3_ENTITY_KIND_KNIFE 8
+#define ABP_V3_ENTITY_KIND_FAMILIAR 9
+#define ABP_V3_ENTITY_KIND_EFFECT 10
 
 /* ---- F1: flags (16-bit words) */
 #define ABP_V3_FLAG_WORD_BITS 16
