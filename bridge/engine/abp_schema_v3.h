@@ -6,7 +6,7 @@
 
 /* ---- F1: identity and header */
 #define ABP_V3_SCHEMA "isaac-visible-prlmens-g-v3"
-#define ABP_V3_VERSION 2026111702
+#define ABP_V3_VERSION 2026111703
 #define ABP_V3_FRAME_BYTES 131072
 #define ABP_V3_MAGIC 61107
 #define ABP_V3_LAYOUT_GEN 3
@@ -152,6 +152,7 @@
 #define ABP_V3_P_WEAPON_CHARGE_KNOWN 51   /* known: P 37 read */
 #define ABP_V3_P_BONE_SLOTS_KNOWN 52   /* known: IsBoneHeart readable (P 128..151) */
 #define ABP_V3_P_STALL_KNOWN 53   /* known: the stall rule exists here (AB+ training 1; a producer without it 0) */
+#define ABP_V3_P_POSITION_KNOWN 54   /* known: the body is a room entity (by InitSeed); 0: x / y / vx / vy and local patch 0 */
 #define ABP_V3_P_PTYPE 56   /* cat:ptype: PlayerType + 2 (-1 POSSESSOR -> 1) */
 #define ABP_V3_P_BODY_ROLE 57   /* cat:body_role: 1 main, 2 twin, 3 sub-player, 4 co-op baby, 5 co-op ghost */
 #define ABP_V3_P_CONTROLLER 58   /* cat:controller: ControllerIndex + 2 */

@@ -1,6 +1,6 @@
 """visible-v3: the frozen interface between the producers (package C: Lua bridge, abp_turbo.c, abp_visible.c, the
 producer module, the C++ actor) and the model / learner (package A). The single source of truth of the design
-D:/Projects/fortune/Isaac/temp/rep-compat-schema-20261112/DESIGN.md (2026-11-12), artefacts F1, F2 and F4:
+docs/VISIBLE_V3_DESIGN.md (2026-11-12), artefacts F1, F2 and F4:
 
   F1  the frame: schema string, version, header, sizes, the room canvas words and their bit layouts, the minimap
       bits, every P / E / N / S column (name, kind, raw unit), known flags, the embedding tables' namespaces and the
@@ -35,6 +35,15 @@ reach the model as large numbers; the wire keeps the raw value, unclamped); B6 N
 'num' column after scaling (None where not known yet), to be checked against real frames (contract V4, every numeric
 column).
 
+Batch 3 (the coordinator, 2026-11-17): VERSION 2026111703; P col 54 position_known: 1 when the body has a real position
+in the current room, i.e. its entity (by InitSeed) is among Isaac.GetRoomEntities(); 0 otherwise, and then its x, y,
+vx, vy are written 0 and its 9 x 9 local patch is all 0 (the other fields as usual). Evidence (AB+, 184 subbody1 /
+subbody2): the Forgotten's GetSubPlayer() is never a room entity and always sits at world (0, 0), Visible and Exists
+true whichever of the two is controlled -- the controlled character is always the room's player entity (switching
+changes its PlayerType 16 <-> 17 in place), and while the Soul is controlled the Forgotten's body lying in the room is
+the familiar 3.900 (gfx/003.900_Forgotten Body.anm2, an E token) with the chain effects 1000.114. Bodies are listed
+once each by InitSeed (AB+: the Soul and the Forgotten share Entity.Index; on Rep UNVERIFIED).
+
 Wire rule (DESIGN 2.0): every value is a raw game unit as float32 (integers exact to 2^24, bit words <= 24 bits, flag
 words in 16-bit chunks); categorical codes are integers, 0 = none / not known; reserved columns are 0. The model
 applies SCALE (below) itself. Known flags (G3): a field the game version lacks is written as its true value there
@@ -43,7 +52,8 @@ applies SCALE (below) itself. Known flags (G3): a field the game version lacks i
 
 # ------------------------------------------------------------------------------------------------- F1: identity
 SCHEMA = 'isaac-visible-prlmens-g-v3'
-VERSION = 2026111702   # batch 2 (the coordinator, 2026-11-17): non-position scales, NUM_CLAMP, NUM_RANGE
+VERSION = 2026111703   # batch 3 (the coordinator, 2026-11-17): P col 54 position_known
+#                       (batch 2, 2026111702: non-position scales, NUM_CLAMP, NUM_RANGE)
 #                       (batch 1, 2026111701: canvas frame, isotropic scales, kind + 1)
 FRAME_BYTES = 131072
 MAGIC = 61107
@@ -158,6 +168,7 @@ P_SPEC = [
     (51, 'weapon_charge_known', 'known', 'P 37 read', 1),
     (52, 'bone_slots_known', 'known', 'IsBoneHeart readable (P 128..151)', 1),
     (53, 'stall_known', 'known', 'the stall rule exists here (AB+ training 1; a producer without it 0)', 1),
+    (54, 'position_known', 'known', 'the body is a room entity (by InitSeed); 0: x / y / vx / vy and local patch 0', 1),
     (56, 'ptype', 'cat:ptype', 'PlayerType + 2 (-1 POSSESSOR -> 1)', 1),
     (57, 'body_role', 'cat:body_role', '1 main, 2 twin, 3 sub-player, 4 co-op baby, 5 co-op ghost', 1),
     (58, 'controller', 'cat:controller', 'ControllerIndex + 2', 1),

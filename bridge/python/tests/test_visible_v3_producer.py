@@ -147,3 +147,17 @@ def test_decorative_list_equals_the_bridges():
     m = re.search(r'local V3_DECORATIVE = \{\}.*?ipairs\(\{(.*?)\}\)', lua, re.S)
     assert tuple(int(v) for v in re.findall(r'\d+', m.group(1))) == VP.V3_DECORATIVE
     assert 41 in VP.V3_DECORATIVE   # the water droplet (V1)
+
+
+def test_a_body_without_a_room_position():
+    """Schema batch 3: position_known 0 (the AB+ sub-player, never a room entity) -> x / y / vx / vy 0 and the local
+    patch 0; the other fields as usual."""
+    sub = body(entity_index=0, x=0.0, y=0.0, vx=3.0, vy=4.0, ptype=17, role=3, linked=1, position_known=0)
+    main = body(linked=2, position_known=1)
+    f = VP.unpack_frame_v3(VP.observation_frame_v3(raw_block(bodies=[main, sub])))
+    P = f['P']
+    c = lambda n: V3.col(V3.P_COLS, n)
+    assert P[0][c('position_known')] == 1 and P[1][c('position_known')] == 0
+    assert (P[1][c('x')], P[1][c('y')], P[1][c('vx')], P[1][c('vy')]) == (0, 0, 0, 0)
+    assert not f['local'][1].any() and f['local'][0].any()
+    assert P[1][c('ptype')] == 19 and P[1][c('body_role')] == 3 and P[1][c('hearts')] == 6
