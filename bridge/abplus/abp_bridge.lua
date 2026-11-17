@@ -1961,7 +1961,9 @@ end
 -- Decorative effects, never sent (schema_v3 convention, the coordinator 2026-11-17): only effects that take no part in
 -- collisions, deal no damage, and whose position another sent entity already gives or that bear on no decision;
 -- anything uncertain is sent (and reported). Each with why; AB+ numbering = Rep below 118, 118+ Rep only. From the
--- recorder's fx_omit list, without 121 LIGHT and 138 MIST (Rep: they change what is visible -- sent, reported),
+-- recorder's fx_omit list, without 121 LIGHT and 138 MIST (Rep only: the room's light and visibility, information the
+-- player sees -- sent, the coordinator 2026-11-17; their Rep form, one or several entities and whether their position
+-- means anything, UNVERIFIED until a Rep producer exists),
 -- with 114 FORGOTTEN_CHAIN. Kept only while CollisionDamage is 0 (v3_entities). visible_producer.V3_DECORATIVE: the same.
 local V3_DECORATIVE_SPEC = {
 	[2] = "BLOOD_EXPLOSION: the splash of a death: drawn after the kill, no collision, no damage",
