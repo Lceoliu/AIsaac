@@ -1,0 +1,357 @@
+{
+ "frames": [
+  {
+   "name": "doorframe",
+   "covers": "the player in a door frame (its formula cell is the door cell)",
+   "shape": 1,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    0,
+    1,
+    3
+   ],
+   "bytes": 12376,
+   "sha256": "4d3ef08db6632c01bdb640251a03cfba8cf1b5d08e913f091a667e1fc97003f0"
+  },
+  {
+   "name": "longlived",
+   "covers": "a coin 600 frames old (age clamp)",
+   "shape": 1,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    1,
+    1,
+    3
+   ],
+   "bytes": 12632,
+   "sha256": "28c3be4f34b6af674462883c45f890c4c43cf54687af4d802234226b3d4b1a0a"
+  },
+  {
+   "name": "devilprice",
+   "covers": "a pickup with a negative Price (a devil deal)",
+   "shape": 1,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    5,
+    1,
+    3
+   ],
+   "bytes": 13656,
+   "sha256": "b5e567bbd72e0e10567558825a55140b683ae1baddc2a8c650bf9a2bb4aca0e9"
+  },
+  {
+   "name": "shooting",
+   "covers": "the player shooting right",
+   "shape": 1,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    2,
+    1,
+    3
+   ],
+   "bytes": 12888,
+   "sha256": "77244b8e7655fbdbc5485c1fc11871bb26011a33e51ec6750aa9d30d378e4ba6"
+  },
+  {
+   "name": "forgotten",
+   "covers": "the Forgotten and the Soul as bodies",
+   "shape": 1,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    2,
+    1,
+    0,
+    6
+   ],
+   "bytes": 15276,
+   "sha256": "8d28132c0af7f33b113137236cb5eee456bfb9010e2e0380e353bad2d345b539"
+  },
+  {
+   "name": "offgrid",
+   "covers": "V1 room 89 (2x1): the Homunculus part 228.10 below the grid",
+   "shape": 6,
+   "gw": 28,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    37,
+    1,
+    3
+   ],
+   "bytes": 21848,
+   "sha256": "864397c5fa5a52520bd62cb7a24736151720f257617f8cba1be777bc8867250f"
+  },
+  {
+   "name": "shape-1x1",
+   "covers": "RoomShape 1 (seed 2147700000, stage 1, room 68, type 5)",
+   "shape": 1,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    10,
+    1,
+    3
+   ],
+   "bytes": 14936,
+   "sha256": "c1bad0ee9eeb72a98b554f734d004a601f34878a237fab2ed82609c883181459"
+  },
+  {
+   "name": "shape-1x2",
+   "covers": "RoomShape 4 (seed 2147700000, stage 3, room 72, type 1)",
+   "shape": 4,
+   "gw": 15,
+   "gh": 16,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    4,
+    1,
+    3
+   ],
+   "bytes": 13400,
+   "sha256": "e90210bf4d5b2d5c9b2578138e892c200567a59b53af069bf16dec7e0a5e29fe"
+  },
+  {
+   "name": "shape-LBR",
+   "covers": "RoomShape 12 (seed 2147700000, stage 4, room 81, type 1)",
+   "shape": 12,
+   "gw": 28,
+   "gh": 16,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    9,
+    1,
+    3
+   ],
+   "bytes": 14680,
+   "sha256": "93161392ee55ae8322a20ae837b2231bac3e5e4b21df75a56b4213590df276df"
+  },
+  {
+   "name": "shape-2x2",
+   "covers": "RoomShape 8 (seed 2147700000, stage 5, room 94, type 1)",
+   "shape": 8,
+   "gw": 28,
+   "gh": 16,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    4,
+    1,
+    3
+   ],
+   "bytes": 13400,
+   "sha256": "bd589e493c4d5f6bbccaa9e01994da8ef559f4a880b4a1f1ac3a95672b515791"
+  },
+  {
+   "name": "shape-IIV",
+   "covers": "RoomShape 5 (seed 2147700000, stage 5, room 55, type 1)",
+   "shape": 5,
+   "gw": 15,
+   "gh": 16,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    2,
+    1,
+    3
+   ],
+   "bytes": 12888,
+   "sha256": "6c3da2e2e26c068cee285baf919acaa27d5568f139fff159204af2cf2df3bcdc"
+  },
+  {
+   "name": "shape-2x1",
+   "covers": "RoomShape 6 (seed 2147700000, stage 7, room 89, type 5)",
+   "shape": 6,
+   "gw": 28,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    37,
+    1,
+    3
+   ],
+   "bytes": 21848,
+   "sha256": "864397c5fa5a52520bd62cb7a24736151720f257617f8cba1be777bc8867250f"
+  },
+  {
+   "name": "shape-LTL",
+   "covers": "RoomShape 9 (seed 2147700000, stage 7, room 58, type 1)",
+   "shape": 9,
+   "gw": 28,
+   "gh": 16,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    11,
+    1,
+    3
+   ],
+   "bytes": 15192,
+   "sha256": "c0c63d008e09358b5cd42c93b5c2e4ff64e01d30fa6eae7bd0e66250ec39b6d3"
+  },
+  {
+   "name": "shape-IH",
+   "covers": "RoomShape 2 (seed 2147700000, stage 7, room 86, type 1)",
+   "shape": 2,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    2,
+    1,
+    3
+   ],
+   "bytes": 12888,
+   "sha256": "ab521c032e4f2a0b0348f5f03e2f873e762d67d3e5bbb57f34e30a6d645cde2b"
+  },
+  {
+   "name": "shape-IV",
+   "covers": "RoomShape 3 (seed 2147700000, stage 7, room 97, type 1)",
+   "shape": 3,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    8,
+    1,
+    3
+   ],
+   "bytes": 14424,
+   "sha256": "29dcab5e3c97d887b238d48c47510cdc0d868004d44f6e31db1bf8e4161fec72"
+  },
+  {
+   "name": "shape-LBL",
+   "covers": "RoomShape 11 (seed 2147700001, stage 5, room 57, type 1)",
+   "shape": 11,
+   "gw": 28,
+   "gh": 16,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    7,
+    1,
+    3
+   ],
+   "bytes": 14168,
+   "sha256": "992f128220e2abf4910d57956bdf8b2aedc6f895272259948cee914818a90106"
+  },
+  {
+   "name": "shape-LTR",
+   "covers": "RoomShape 10 (seed 2147700001, stage 5, room 15, type 1)",
+   "shape": 10,
+   "gw": 28,
+   "gh": 16,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    5,
+    1,
+    3
+   ],
+   "bytes": 13656,
+   "sha256": "83c9ff6e14ad62bd002822d8f01fe3444b119b4bad7ae2e7c8b2d2bb56d70c82"
+  },
+  {
+   "name": "shape-IIH",
+   "covers": "RoomShape 7 (seed 2147700004, stage 3, room 60, type 1)",
+   "shape": 7,
+   "gw": 28,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    5,
+    1,
+    3
+   ],
+   "bytes": 13656,
+   "sha256": "6830e6883c78c8bd8d865ec533491b1df198ce7c6f48bc758442a3541259ae6e"
+  }
+ ],
+ "errors": [],
+ "stall": {
+  "stall_share": 0.5,
+  "stall_known": 1
+ },
+ "notes": {
+  "doorframe": "slot 1 (open 1), door cell (7, 0), reached after 6 frames; slots tried before: [(0, '0', (0, 4), (1, 4))]",
+  "devilprice": "goto s.devil.0: room type 14, prices -1,-2",
+  "offgrid": "228.10 at 500.00,367.00 after 0 more frames"
+ },
+ "seconds": 6.8
+}
