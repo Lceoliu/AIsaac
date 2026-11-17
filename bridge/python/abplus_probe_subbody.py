@@ -3,7 +3,8 @@ position in the current room? For the Forgotten (PlayerType 16): at the start (t
 drop press (the Soul controlled), after a second press (back), a few frames apart, per body (the player and its
 GetSubPlayer): PlayerType, InitSeed, Index, Position, Velocity, Visible, Exists, IsDead, ControlsEnabled,
 EntityCollisionClass, GridCollisionClass, whether it is among Isaac.GetRoomEntities() and Isaac.FindByType(1)
-(matched by InitSeed), the sprite's current frame and file. -> <out>/subbody.jsonl, printed.
+(matched by InitSeed), the sprite's current frame and file; and every room entity (type, variant, position,
+sprite file). -> <out>/subbody.jsonl, printed.
 
 usage (bridge python dir, PYTHONPATH=.): python abplus_probe_subbody.py --groups-file ../abplus/catalog/scaling2_groups.json --out <dir>
 """
@@ -32,7 +33,13 @@ local function info(p)
 end
 local p = Isaac.GetPlayer(0)
 local ok, sub = pcall(function() return p:GetSubPlayer() end)
-return json.encode({ game_frame = Game():GetFrameCount(), player = info(p), sub = ok and info(sub) or false })
+local ents = {}
+for _, e in ipairs(Isaac.GetRoomEntities()) do
+  ents[#ents + 1] = { type = e.Type, variant = e.Variant, subtype = e.SubType, x = e.Position.X, y = e.Position.Y,
+    visible = e.Visible, seed = e.InitSeed, file = e:GetSprite():GetFilename() }
+end
+return json.encode({ game_frame = Game():GetFrameCount(), player = info(p), sub = ok and info(sub) or false,
+  room_entities = ents })
 """
 
 
