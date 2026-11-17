@@ -2171,7 +2171,8 @@ static const char *obs_fixed(long long lf, int extra, size_t *len) {
     if (why) goto give_up;
     // header, room, totals
     int clear = gbool(FN(R_CLEAR), room);
-    int flags = (clear ? 1 : 0) + (extra & 58) + (gbool(FN(G_PAUSED), (const void *)game) ? 4 : 0);   // 16: items
+    // 16: items; 64: the native visible-v3 frame (2026-11-17)
+    int flags = (clear ? 1 : 0) + (extra & 122) + (gbool(FN(G_PAUSED), (const void *)game) ? 4 : 0);
     PUT(0, (uint32_t)LEAN_MAGIC);
     PUT(4, (uint32_t)lf);
     PUT(8, (uint32_t)game_frame);
@@ -2619,6 +2620,8 @@ static int obs_lua_pu_take(lua_State *L) {
 // and registers the Lua globals abp_native_lean and abp_native_terrain (and abp_native_step, abp_native_terrain_key,
 // abp_player_charge (2026-10-07), abp_native_player_f (2026-10-08), abp_pu_arm / abp_pu_take). Returns "1", or nil when refused
 // (getenv("ABP_OBS_STATUS") says why).
+#include "abp_v3_native.c"   // (visible-v3, package C: abp_native_v3)
+
 static char *obs_init(void) {
     if (obs_ready < 0) obs_ready = obs_check();
     if (!obs_ready) return NULL;
@@ -2643,6 +2646,12 @@ static char *obs_init(void) {
     // only when this equals its own LEAN_ENTITY_BYTES
     LPUSHINT(L, LEAN_ENTITY_BYTES);
     ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_native_entity_bytes");
+    // (visible-v3, 2026-11-17) abp_native_v3, when its own addresses check out (a refusal leaves the rest registered)
+    if (v3_ready < 0) v3_ready = v3_check();
+    if (v3_ready == 1) {
+        ((void (*)(lua_State *, lua_cfn, int))FN(PUSHCCLOSURE))(L, v3_lua, 0);
+        ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_native_v3");
+    }
     // (G, 2026-11-12) abp_native_visible, when its own addresses check out (a refusal leaves the rest registered)
     if (vis_ready < 0) vis_ready = vis_check();
     if (vis_ready == 1) {
