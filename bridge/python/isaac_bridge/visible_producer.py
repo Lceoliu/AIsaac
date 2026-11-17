@@ -160,7 +160,8 @@ import math as _math
 from . import schema_v3 as V3
 
 # Decorative effects never sent (abp_bridge.lua V3_DECORATIVE_SPEC; tests compare the two; the rule in schema_v3):
-# effect variant -> (name, why). The bridge drops one only while its CollisionDamage is 0.
+# effect variant -> (name, why). The bridge drops one only while its CollisionDamage is 0. Not in it, sent: 121 LIGHT
+# and 138 MIST (Rep only: the room's light and visibility; their Rep form UNVERIFIED).
 V3_DECORATIVE_WHY = {
     2: ('BLOOD_EXPLOSION', 'the splash of a death: drawn after the kill, no collision, no damage'),
     3: ('FLY_EXPLOSION', 'the splash of a fly dying: after the kill, no collision, no damage'),

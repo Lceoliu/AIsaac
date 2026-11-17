@@ -128,8 +128,9 @@ def capture(c, name, out, manifest, covers):
     raw = json.loads(text)
     engine = json.loads(c.lua(ENGINE_LUA))
     payload = VP.observation_frame_v3(raw, **STALL)
-    (out / f'{name}.raw.json').write_text(json.dumps(dict(raw=raw, **STALL)))
-    (out / f'{name}.engine.json').write_text(json.dumps(engine))
+    # (keys sorted: the Lua tables' pairs order varies, the files must not -- every fixture file reproducible)
+    (out / f'{name}.raw.json').write_text(json.dumps(dict(raw=raw, **STALL), sort_keys=True))
+    (out / f'{name}.engine.json').write_text(json.dumps(engine, sort_keys=True))
     (out / f'{name}.v3.bin').write_bytes(payload)
     f = VP.unpack_frame_v3(payload)
     manifest.append(dict(name=name, covers=covers, shape=raw['shape'], gw=raw['gw'], gh=raw['gh'],
