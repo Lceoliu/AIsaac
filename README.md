@@ -43,11 +43,11 @@
 | `bridge/abplus/` | AB+ 的桥 `abp_bridge.lua`、房间目录、实验记录 `EXPERIMENTS.md` | 在用 |
 | `bridge/python/` | 训练 `train_tok.py`、评估 `eval_tok.py`、`isaac_bridge/` 包、探针和基准脚本、测试 | 在用；其中 `train_abplus.py` 一套是 9 月的旧管线 |
 | `bridge/ops/bm1/` | 多卡主机上的运行环境：容器、锁、计时、测试门、正式训练守护 | 在用 |
-| `bridge/ops/` 其余 | 过去实验的启动和测量脚本 | 历史记录 |
+| `bridge/ops/` 其余 | 仍被 bm1、测试或代码引用的 26 个旧脚本；另外 126 个一次性脚本在 `bridge/ops/archive/` | 留用 / 归档 |
 | `docs/` | 项目说明、系统结构、设计文档；`docs/archive/` 是归档 | 在用 |
 | `macro/` | AB+ 楼层生成器（与引擎逐房间一致）、隐藏房推断、规划工具、网页小测试 | 已完成 |
 | `bridge/README.md`、`bridge/mod/isaac_rl_bridge/`、`turbo/` | 忏悔+ J460（Windows）的桥和加速层 | 暂停 |
-| `bridge/mod/isaac_human_recorder/` | 人类录制 mod 的旧副本；录制器已移到单独的仓库 isaac-run-recorder | 历史遗留 |
+| `archive/` | 归档的代码：9 月的人类录制 mod 和行为克隆一线（后来重写的录制器在单独的仓库 isaac-run-recorder） | 归档 |
 | `sim/` | Rust 单房间模拟器 | 9 月起搁置 |
 | `isaac_room/`、`play.ps1`、`tests/` | 最早的自编规则原型和它的测试 | 已否定 |
 | `code-tests/` | 一个采样器读写竞争问题的复现脚本 | 历史 |
@@ -80,7 +80,7 @@
 | [bridge/abplus/EXPERIMENTS.md](bridge/abplus/EXPERIMENTS.md) | 全部实验 |
 | [bridge/abplus/README.md](bridge/abplus/README.md)、[bridge/ops/bm1/README.md](bridge/ops/bm1/README.md) | 训练入口的用法；运行环境 |
 | 其余 `docs/*.md` | 仍有效的专题设计：时间注意力、反事实教师、C++ actor、预测记忆、宏观规划、相关工作 |
-| [docs/archive/README.md](docs/archive/README.md) | 归档文档的索引 |
+| [docs/archive/README.md](docs/archive/README.md) | 归档文档的索引；归档的代码见 [archive/README.md](archive/README.md)，归档的运维脚本见 [bridge/ops/archive/README.md](bridge/ops/archive/README.md) |
 
 ## 实验记录
 

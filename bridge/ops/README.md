@@ -6,18 +6,25 @@
 
 现在所有的训练、计时、测试门和评估都通过 [bm1/](bm1/README.md) 运行。主机相关的设置只放在 `bm1.env` 里，从 `bm1/env/*.env` 复制，脚本里不写硬件数字。操作手册模板是 [bm1/TRAINING.md](bm1/TRAINING.md)。
 
-## 其余脚本
+## 这一层留下的脚本
 
-这一层的大部分脚本是过去实验的一次性启动器和测量脚本，留作记录。它们的参数就是当时的实验记录，对应 [EXPERIMENTS.md](../abplus/EXPERIMENTS.md) 的同号条目。很多脚本写死了已经不可用的机器上的路径，不要直接重跑。
+这 26 个文件仍被 bm1 的脚本、测试或代码引用（直接引用，或被这些文件引用），所以留在原位。它们本身大多是过去实验的脚本，参数对应 [EXPERIMENTS.md](../abplus/EXPERIMENTS.md) 的同号条目。
 
-| 脚本 | 内容 |
+| 脚本 | 谁在用 |
 |---|---|
-| `c6x_start.sh`–`c8x_start.sh`、`hpc_*.sh`、`launch_*.sh` | C68–C104 的启动脚本；HPC 节点的环境、守护和十游戏年运行 |
-| `mk_ws*.sh` | HPC 节点上的沙箱建立脚本 |
-| `b38_*`–`b66_*`、`b53/`、`run_*.sh` | B38–B66 的测量和计时 |
-| `host1_*.sh`、`host2_*.sh`、`sync_h1.sh`、`sync_to.sh`、`sync_hpc.sh` | 已不可用的主机 1、主机 2、HPC 节点的同步和迁移 |
-| `run_evals.py`、`choice_stats.py`、`lab_trend.py`、`lab_compare.py`、`cf_rates.py`、`clone_stats.py` | 结果统计：整局评估表、分支记录、构筑实验室、反事实比率、克隆统计 |
-| `pred_*` | 预测记忆实验（辅助损失、特权 critic，见 `docs/PREDICTIVE_MEMORY_DESIGN.md`）用的脚本和门槛文件 |
+| `hpc_c99.sh`、`hpc_env.sh` | `bm1/xold_c99.sh`、`bm1/ev_ab2.sh`：旧模型 C99 的命令行和评估协议 |
+| `hpc_b38.sh`、`hpc_guard.sh`、`mk_ws14.sh` | `tests/test_learner_device_smoke.py` |
+| `b62_step0.sh`、`b60_gpu.sh`、`b62_gpu_idle.py`、`run_b50m.sh`、`run_b54p.sh` | `bm1/gate.sh`、`bm1/prof.sh` |
+| `run_b54g.sh` | `bm1/gate3.sh` |
+| `run_b52g.sh`、`run_b52p.sh`、`b52_kernels.py`、`b52_learner_kernels.py` | `tests/test_b52_entry.py` |
+| `b57_nsys.py`、`b57_threads.py`、`b62_learner_sections.py`、`b62_capture_probe.py` | `bm1/nsys_gil.sh`、`bm1/nsys_update.sh`、`bm1/prof.sh`、`bm1/m0_mem.py`、`bm1/probe.sh` |
+| `run_core_tsan.sh` | `bm1/tsan_core.sh` |
+| `b60_prefetch_spread.py` | `tests/test_b48_prefetch.py` |
+| `b42_kernels.py`、`b43_memclear_compare.py`、`b44_learner_bench.py`、`b62_capture_probe2.py`、`clone_stats.py` | `bridge/python`、`bridge/engine` 里的代码或注释指向它们 |
+
+## 归档的脚本
+
+其余 126 个一次性启动器和测量脚本在 2026-11-17 移到了 [archive/](archive/README.md)，内容没有改。
 
 ## git
 
