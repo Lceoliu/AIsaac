@@ -41,7 +41,10 @@ starts on it; triggers visible on entry show at the room's second record):
   Quota (Quota): a per-worker token bucket that fills at cfg.cf_points per game hour of the worker's play (capacity
   CF_BURST tokens); a trigger takes a token when one is there. Without a token, a trigger of a type the episode has
   not shown yet replaces the oldest of the episode's pending points whose type had shown before ("unseen trigger types
-  first"), else it is skipped (cf_skipped). A point's state is snapshotted at once (temporal models: the actor copies
+  first"), else it is skipped (cf_skipped). With cfg.cf_per_clear X > 0 (2026-11-13, the points earned by clearing
+  rooms) a second bucket must allow it too: the worker's own main episodes add X tokens per EV_CLEARED (Quota.earn;
+  branches never earn), capacity CF_BURST; a point takes a token from both, a replacement one earned token (no new
+  point without one); a trigger refused for want of an earned token counts in cf_skip_earned. X = 0: as before. A point's state is snapshotted at once (temporal models: the actor copies
   the worker's temporal slot into the point's bank row before the record's own step; cf_snap block); the episode's
   points are queued at its end (their taken score needs its continuation); when the queue is full the oldest point
   goes (cf_dropped; the death teacher's searches are a queue of their own and never compete).
@@ -365,16 +368,38 @@ class Quota:
     of play (tick(n): n decisions of fpd logic frames), capacity burst; and the episode's pending points with the
     "unseen trigger types first" replacement. offer() decides one trigger."""
 
-    def __init__(self, points_per_hour, fpd, burst=CF_BURST):
+    def __init__(self, points_per_hour, fpd, burst=CF_BURST, per_clear=0.0):
         self.rate = float(points_per_hour) * fpd / 30.0 / 3600.0
         self.burst = max(1.0, float(burst))
         self.budget = 0.0
         self.types = set()     # trigger types the running episode has shown (accepted or not)
         self.pending = []      # the running episode's accepted points: dicts with 'trig', 'fresh' (and the caller's)
         self.skipped = self.replaced = 0
+        # (2026-11-13, cfg.cf_per_clear) the earned bucket: per_clear tokens per room the worker's main episode
+        # clears, capacity burst; 0: off (every offer as before). earned_total: tokens added (before the cap)
+        self.per_clear = float(per_clear)
+        self.earned = 0.0
+        self.earned_total = 0.0
+        self.skipped_earned = 0
+        self.charge = (0.0, 0.0)   # what the last accepted offer took: (time tokens, earned tokens); refund() returns it
 
     def tick(self, n=1):
         self.budget = min(self.burst, self.budget + self.rate * n)
+
+    def earn(self, clears=1):
+        """The worker's main episode cleared `clears` rooms (EV_CLEARED records): per_clear tokens each."""
+        if self.per_clear > 0 and clears > 0:
+            self.earned_total += self.per_clear * clears
+            self.earned = min(self.burst, self.earned + self.per_clear * clears)
+
+    def refund(self, charge):
+        """An accepted point given up before its search (no bank row, the actor refused its capture): its tokens back
+        (each bucket capped at burst)."""
+        t_, e_ = charge
+        if t_:
+            self.budget = min(self.burst, self.budget + t_)
+        if e_:
+            self.earned = min(self.burst, self.earned + e_)
 
     def begin_episode(self):
         self.types = set()
@@ -394,8 +419,17 @@ class Quota:
         name = TRIGGERS[trig]
         fresh = name not in self.types
         self.types.add(name)
+        gate = self.per_clear > 0
+        if gate and self.earned < 1.0:   # (no earned token: no new point, not even a replacement)
+            self.skipped_earned += 1
+            self.skipped += 1
+            self.charge = (0.0, 0.0)
+            return False, None, fresh
         if self.budget >= 1.0:
             self.budget -= 1.0
+            if gate:
+                self.earned -= 1.0
+            self.charge = (1.0, 1.0 if gate else 0.0)
             return True, None, fresh
         if fresh:
             stale = [p for p in self.pending if not p['fresh']]
@@ -403,8 +437,12 @@ class Quota:
                 victim = stale[0]
                 self.pending.remove(victim)
                 self.replaced += 1
+                if gate:
+                    self.earned -= 1.0
+                self.charge = (0.0, 1.0 if gate else 0.0)
                 return True, victim, fresh
         self.skipped += 1
+        self.charge = (0.0, 0.0)
         return False, None, fresh
 
 

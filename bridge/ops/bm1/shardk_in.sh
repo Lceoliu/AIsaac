@@ -1,5 +1,6 @@
 #!/bin/sh
 # bm1 BM1 C, inside the one container of shardk.sh: K trainers (xnew2.sh) as the ranks of one training run.
+# BASE: the trainer's base script in bm1 (default xnew2.sh; ab2's arm A, 2026-11-14: xold_c99.sh, C99's command line).
 #   usage: shardk_in.sh <tag> <limit_s> <game_hours> "<rank 0 gpus> <rank 1 gpus> ..." "<rank 0 cpus>|<rank 1 cpus>|..."
 #          ["<rank 0 learner cpus>|..." ["<rank 0 driver cpus>|..."]]   (ISAAC_LEARNER_CPUS / ISAAC_DRIVER_CPUS per rank)
 #   e.g.   shardk_in.sh c2 4500 30.0 "0,1 2,3" "0-7,16-23|8-15,24-31"     (container GPUs: the order run.sh got them)
@@ -24,8 +25,8 @@ for pair in $PAIRS; do
   ( export CUDA_VISIBLE_DEVICES=$pair ISAAC_SHARD_RANK=$r NAME=${NAME_BASE:-b42new}s$r PORT=$((${PORT_BASE:-39200} + 1000 * r))
     [ -n "$lc" ] && export ISAAC_LEARNER_CPUS=$lc
     [ -n "$dc" ] && export ISAAC_DRIVER_CPUS=$dc
-    if [ -n "$cs" ]; then exec taskset -c $cs sh $BM1_IN/xnew2.sh $TAG-s$r $LIMIT $HOURS
-    else exec sh $BM1_IN/xnew2.sh $TAG-s$r $LIMIT $HOURS; fi ) &
+    if [ -n "$cs" ]; then exec taskset -c $cs sh $BM1_IN/${BASE:-xnew2.sh} $TAG-s$r $LIMIT $HOURS
+    else exec sh $BM1_IN/${BASE:-xnew2.sh} $TAG-s$r $LIMIT $HOURS; fi ) &
   PIDS="$PIDS $!"
   r=$((r+1))
 done
