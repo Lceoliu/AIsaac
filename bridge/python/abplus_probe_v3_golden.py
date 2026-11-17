@@ -132,6 +132,13 @@ def capture(c, name, out, manifest, covers):
     (out / f'{name}.raw.json').write_text(json.dumps(dict(raw=raw, **STALL), sort_keys=True))
     (out / f'{name}.engine.json').write_text(json.dumps(engine, sort_keys=True))
     (out / f'{name}.v3.bin').write_bytes(payload)
+    # (the native encoder's frame of the same state, when the library has it: <name>.native.bin, for the stage checks;
+    #  not a fixture)
+    hexf = c.lua("if type(abp_native_v3) ~= 'function' then return 'nil:none' end "
+                 "local f, why = abp_native_v3() if not f then return 'nil:' .. tostring(why) end "
+                 "return (f:gsub('.', function(ch) return string.format('%02x', ch:byte()) end))")
+    if hexf and not hexf.startswith('nil:'):
+        (out / f'{name}.native.bin').write_bytes(bytes.fromhex(hexf))
     f = VP.unpack_frame_v3(payload)
     manifest.append(dict(name=name, covers=covers, shape=raw['shape'], gw=raw['gw'], gh=raw['gh'],
                          origin=raw['origin'], counts=[int(v) for v in f['header'][2:6]], bytes=len(payload),
