@@ -17,7 +17,7 @@
     3
    ],
    "bytes": 12376,
-   "sha256": "4d3ef08db6632c01bdb640251a03cfba8cf1b5d08e913f091a667e1fc97003f0"
+   "sha256": "1ef9ab6482f4f6d72290122be0ef121d9fb713f6c7b58c98d96e39d2a97f6551"
   },
   {
    "name": "longlived",
@@ -36,7 +36,7 @@
     3
    ],
    "bytes": 12632,
-   "sha256": "28c3be4f34b6af674462883c45f890c4c43cf54687af4d802234226b3d4b1a0a"
+   "sha256": "54f79e8f386d23fe68969226aaa545e5ae45ec4633e61db8e7c8def2f0e2c2bf"
   },
   {
    "name": "devilprice",
@@ -55,7 +55,7 @@
     3
    ],
    "bytes": 13656,
-   "sha256": "b5e567bbd72e0e10567558825a55140b683ae1baddc2a8c650bf9a2bb4aca0e9"
+   "sha256": "1a2d2c0f10e39025fd99abb41de92473aa8fbb55f25fa728668839d5e69b1a1e"
   },
   {
    "name": "shooting",
@@ -74,11 +74,11 @@
     3
    ],
    "bytes": 12888,
-   "sha256": "77244b8e7655fbdbc5485c1fc11871bb26011a33e51ec6750aa9d30d378e4ba6"
+   "sha256": "a5fd916fadafb5a3cee804e7e61b1a37744f9356f81b0076f412fdeb62ffcf38"
   },
   {
    "name": "forgotten",
-   "covers": "the Forgotten and the Soul as bodies",
+   "covers": "the Forgotten controlled; the Soul (GetSubPlayer) has no room position",
    "shape": 1,
    "gw": 15,
    "gh": 9,
@@ -93,7 +93,26 @@
     6
    ],
    "bytes": 15276,
-   "sha256": "8d28132c0af7f33b113137236cb5eee456bfb9010e2e0380e353bad2d345b539"
+   "sha256": "0595214d5910ba86310352eee8ee3966ede93b12d06ef5c6c9edb4ce186b7983"
+  },
+  {
+   "name": "forgotten-soul",
+   "covers": "the Soul controlled; the Forgotten body lies in the room as the familiar 3.900",
+   "shape": 1,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    2,
+    10,
+    0,
+    6
+   ],
+   "bytes": 17580,
+   "sha256": "94121c156f2fbb0c3f20ff4d6eb0f1e1f6a5cdad493c9698d2bef3de4df938df"
   },
   {
    "name": "offgrid",
@@ -112,7 +131,7 @@
     3
    ],
    "bytes": 21848,
-   "sha256": "864397c5fa5a52520bd62cb7a24736151720f257617f8cba1be777bc8867250f"
+   "sha256": "ffa14cf0a581c355cd2e7712b7eb8a83a7dce5110c099830ff81baea07d98793"
   },
   {
    "name": "shape-1x1",
@@ -131,7 +150,7 @@
     3
    ],
    "bytes": 14936,
-   "sha256": "c1bad0ee9eeb72a98b554f734d004a601f34878a237fab2ed82609c883181459"
+   "sha256": "70a65843e77c79934aa2e2defe15625629402f3a8f1cdf56fc00b87e66eff251"
   },
   {
    "name": "shape-1x2",
@@ -150,7 +169,7 @@
     3
    ],
    "bytes": 13400,
-   "sha256": "e90210bf4d5b2d5c9b2578138e892c200567a59b53af069bf16dec7e0a5e29fe"
+   "sha256": "61d50aa588d255c8e651c050842c2fc3f9c445a5ae6fae597e763d9b221db815"
   },
   {
    "name": "shape-LBR",
@@ -169,7 +188,7 @@
     3
    ],
    "bytes": 14680,
-   "sha256": "93161392ee55ae8322a20ae837b2231bac3e5e4b21df75a56b4213590df276df"
+   "sha256": "061ccfd0db64f60f7b3f7e92818fe8e37dae844363739c8d2d86c18cae627f36"
   },
   {
    "name": "shape-2x2",
@@ -188,7 +207,7 @@
     3
    ],
    "bytes": 13400,
-   "sha256": "bd589e493c4d5f6bbccaa9e01994da8ef559f4a880b4a1f1ac3a95672b515791"
+   "sha256": "674bebb92cec7d0e0837b6c4f0586e3d27a08724df30dff0c4ab85152c3173a1"
   },
   {
    "name": "shape-IIV",
@@ -207,7 +226,7 @@
     3
    ],
    "bytes": 12888,
-   "sha256": "6c3da2e2e26c068cee285baf919acaa27d5568f139fff159204af2cf2df3bcdc"
+   "sha256": "fa3018af1ec34da73e8e2e30e9d31e6af11d9ea3bd9e650c64bf06f9207b5aff"
   },
   {
    "name": "shape-2x1",
@@ -226,7 +245,7 @@
     3
    ],
    "bytes": 21848,
-   "sha256": "864397c5fa5a52520bd62cb7a24736151720f257617f8cba1be777bc8867250f"
+   "sha256": "ffa14cf0a581c355cd2e7712b7eb8a83a7dce5110c099830ff81baea07d98793"
   },
   {
    "name": "shape-LTL",
@@ -245,7 +264,7 @@
     3
    ],
    "bytes": 15192,
-   "sha256": "c0c63d008e09358b5cd42c93b5c2e4ff64e01d30fa6eae7bd0e66250ec39b6d3"
+   "sha256": "e5e8b8d6089f531a51995a21f062b6995c9b579339d5b342945f954235d4fb3d"
   },
   {
    "name": "shape-IH",
@@ -264,7 +283,7 @@
     3
    ],
    "bytes": 12888,
-   "sha256": "ab521c032e4f2a0b0348f5f03e2f873e762d67d3e5bbb57f34e30a6d645cde2b"
+   "sha256": "a759d00f30659f28545d548e59ed75530b95e45272401618fc960fc9e8d4b6ab"
   },
   {
    "name": "shape-IV",
@@ -283,7 +302,7 @@
     3
    ],
    "bytes": 14424,
-   "sha256": "29dcab5e3c97d887b238d48c47510cdc0d868004d44f6e31db1bf8e4161fec72"
+   "sha256": "acd27f6d58316e32f6a028689947f45ac712f5b6cfe11590f670f827b4261ab6"
   },
   {
    "name": "shape-LBL",
@@ -302,7 +321,7 @@
     3
    ],
    "bytes": 14168,
-   "sha256": "992f128220e2abf4910d57956bdf8b2aedc6f895272259948cee914818a90106"
+   "sha256": "a6ffcbc3c7d923c52941894a166d8f772f7d03093f581af7aae6caf5d3792ee0"
   },
   {
    "name": "shape-LTR",
@@ -321,7 +340,7 @@
     3
    ],
    "bytes": 13656,
-   "sha256": "83c9ff6e14ad62bd002822d8f01fe3444b119b4bad7ae2e7c8b2d2bb56d70c82"
+   "sha256": "0be685494141a5a7b44b1d3916dd5db8cb641c7a201adfa3acfa20db5cc75135"
   },
   {
    "name": "shape-IIH",
@@ -340,7 +359,7 @@
     3
    ],
    "bytes": 13656,
-   "sha256": "6830e6883c78c8bd8d865ec533491b1df198ce7c6f48bc758442a3541259ae6e"
+   "sha256": "a92c1ce60cacf1b3b387033c875ecbd2be7bf1c31d4868ec0123918155b8a1e5"
   }
  ],
  "errors": [],
@@ -353,5 +372,5 @@
   "devilprice": "goto s.devil.0: room type 14, prices -1,-2",
   "offgrid": "228.10 at 500.00,367.00 after 0 more frames"
  },
- "seconds": 6.8
+ "seconds": 6.9
 }

@@ -1,7 +1,7 @@
 """visible-v3 golden frames (V2 / F3, package C, 2026-11-17; tests/fixtures/visible_v3, from abplus_probe_v3_golden.py
-on AB+, 184 golden4, tree c-be851cb): 18 real frames -- every RoomShape 1-12, the off-grid Homunculus part 228.10, a
+on AB+, 184 golden5): 19 real frames -- every RoomShape 1-12, the off-grid Homunculus part 228.10, a
 player in a door frame, a coin 600 frames old, a devil room's negative prices, a shooting player, the Forgotten with
-the Soul. Each: the raw block (abp_bridge.lua visible_v3_raw), the reference encoder's bytes, the engine values read
+the Soul (Forgotten controlled; Soul controlled). Each: the raw block (abp_bridge.lua visible_v3_raw), the reference encoder's bytes, the engine values read
 apart. Here: the bytes are reproduced from the raw block (the reference encoder unchanged), and every body's and sent
 entity's position in the frame is an engine Position minus (GetGridPosition(0) - (20, 20)) read apart."""
 import hashlib
@@ -20,9 +20,9 @@ NAMES = [f['name'] for f in MANIFEST['frames']]
 
 
 def test_the_cases_are_there():
-    assert len(NAMES) == 18 and not MANIFEST['errors']
+    assert len(NAMES) == 19 and not MANIFEST['errors']
     assert {f'shape-{s}' for s in ('1x1', 'IH', 'IV', '1x2', 'IIV', '2x1', 'IIH', '2x2', 'LTL', 'LTR', 'LBL', 'LBR')} <= set(NAMES)
-    assert {'offgrid', 'doorframe', 'longlived', 'devilprice', 'shooting', 'forgotten'} <= set(NAMES)
+    assert {'offgrid', 'doorframe', 'longlived', 'devilprice', 'shooting', 'forgotten', 'forgotten-soul'} <= set(NAMES)
 
 
 @pytest.mark.parametrize('name', NAMES)
@@ -37,6 +37,9 @@ def test_bytes_and_positions(name):
     bodies = [(p['x'], p['y']) for p in eng['players']] + [(p['sub']['x'], p['sub']['y']) for p in eng['players'] if p.get('sub')]
     ents = [(e['x'], e['y']) for e in eng['entities']]
     for row in f['P']:
+        if not row[V3.col(V3.P_COLS, 'position_known')]:   # (schema batch 3: no room position, written 0)
+            assert row[0] == row[1] == 0
+            continue
         assert any(abs(row[0] - (x - ox)) < 1e-3 and abs(row[1] - (y - oy)) < 1e-3 for x, y in bodies)
     for row in f['E']:
         assert any(abs(row[3] - (x - ox)) < 2e-3 and abs(row[4] - (y - oy)) < 2e-3 for x, y in ents)
@@ -60,6 +63,12 @@ def test_the_special_cases():
     prices = [r[V3.col(E, 'price')] for r in _frame('devilprice')['E'] if int(r[0]) == 5]
     assert min(prices) < 0
     assert _frame('shooting')['P'][0][V3.col(P, 'fire_dir')] >= 0
-    fg = _frame('forgotten')['P']
-    assert len(fg) == 2 and [int(r[V3.col(P, 'ptype')]) - 2 for r in fg] == [16, 17]
-    assert [int(r[V3.col(P, 'body_role')]) for r in fg] == [1, 3] and [int(r[V3.col(P, 'linked_body')]) for r in fg] == [2, 1]
+    fg = _frame('forgotten')
+    P0 = fg['P']
+    assert len(P0) == 2 and [int(r[V3.col(P, 'ptype')]) - 2 for r in P0] == [16, 17]
+    assert [int(r[V3.col(P, 'body_role')]) for r in P0] == [1, 3] and [int(r[V3.col(P, 'linked_body')]) for r in P0] == [2, 1]
+    assert [int(r[V3.col(P, 'position_known')]) for r in P0] == [1, 0] and not fg['local'][1].any()
+    soul = _frame('forgotten-soul')
+    assert [int(r[V3.col(P, 'ptype')]) - 2 for r in soul['P']] == [17, 16]      # (the room entity is the Soul now)
+    assert [int(r[V3.col(P, 'position_known')]) for r in soul['P']] == [1, 0]
+    assert any(int(r[0]) == 3 and int(r[1]) == 900 for r in soul['E'])           # the Forgotten's body, a familiar
