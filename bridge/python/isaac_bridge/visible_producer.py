@@ -396,7 +396,7 @@ def unpack_frame_v3(payload):
 # and, after its progress update, the stall columns of every body (P 40 / 53, v3_backfill_stall).
 import os as _os
 
-VISIBLE_V3 = _os.environ.get('ISAAC_RL_VISIBLE_V3', '0') == '1'
+VISIBLE_V3 = _os.environ.get('ISAAC_RL_VISIBLE_V3', '0') not in ('', '0')   # (modes 1 Lua, 2 native, 3 both)
 RAW_SCHEMA_V3 = 'isaac-visible-raw-v3'
 
 

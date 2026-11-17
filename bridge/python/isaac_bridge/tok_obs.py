@@ -399,7 +399,12 @@ def encode_row(o, st, row, t):
     group and first. Returns the done code."""
     vis = getattr(o, 'visible', None)
     v3 = False
-    if vis is not None and isinstance(vis, dict) and vis.get('schema') == 'isaac-visible-raw-v3':
+    native_v3 = getattr(o, 'visible_v3_frame', None)
+    if native_v3 is not None:   # visible-v3, the native frame (ISAAC_RL_VISIBLE_V3=2 / 3): written as it came
+        from .visible_producer import write_frame_v3
+        write_frame_v3(row, native_v3)
+        v3 = True
+    elif vis is not None and isinstance(vis, dict) and vis.get('schema') == 'isaac-visible-raw-v3':
         # visible-v3 (package C, ISAAC_RL_VISIBLE_V3=1): the reference encoder; the stall columns after the progress
         # update below (v3_backfill_stall)
         from .visible_producer import observation_frame_v3, write_frame_v3
@@ -700,7 +705,7 @@ def fast_row_function(path):
     return _LIBS[path]
 
 
-_VISIBLE_V3 = os.environ.get('ISAAC_RL_VISIBLE_V3', '0') == '1'
+_VISIBLE_V3 = os.environ.get('ISAAC_RL_VISIBLE_V3', '0') not in ('', '0')
 
 
 class FastRow:

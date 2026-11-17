@@ -257,10 +257,11 @@ local state = {
 	-- see pack_lean) and the run-mode map rules. Off unless ISAAC_RL_LEAN_ITEMS=1 at launch or the `lean_items` command
 	-- (clones inherit it); off, the bytes on the wire are those of abp-0.2.15.
 	lean_items = getenv("ISAAC_RL_LEAN_ITEMS") == "1",
-	-- visible-v3 (package C, 2026-11-17; off by default): the lean payload's visible block (flag 32) is
-	-- visible_v3_raw()'s JSON (schema "isaac-visible-raw-v3") instead of the v2 block; the native visible step (G)
-	-- is not used then. ISAAC_RL_VISIBLE_V3=1 at launch, or the visible_v3 command
-	visible_v3 = getenv("ISAAC_RL_VISIBLE_V3") == "1",
+	-- visible-v3 (package C, 2026-11-17; 0 = off, the default): 1 the lean payload's visible block (flag 32) is
+	-- visible_v3_raw()'s JSON (schema "isaac-visible-raw-v3") instead of the v2 block; 2 the native v3 frame
+	-- (abp_native_v3, flag 64; the raw block, flag 32, when it hands back); 3 both (the check mode). The native
+	-- visible step (G) is not used then. ISAAC_RL_VISIBLE_V3=<mode> at launch, or the visible_v3 command
+	visible_v3 = math.tointeger(tonumber(getenv("ISAAC_RL_VISIBLE_V3") or "0")) or 0,
 }
 
 -- abp-0.2.13: an undiscovered secret-room door (DOOR_HIDDEN) is not part of what the player sees.
@@ -1704,6 +1705,9 @@ ABP_NATIVE_OBS = { available = native_lean ~= nil, native = 0, fallbacks = 0, la
 -- 1 native (and the native step's fast path takes the block along: native_step_obs), 2 check (both built, the Lua one
 -- sent; their json.decode compared: ABP_NATIVE_VIS.mismatches, the first difference kept).
 local native_visible = native_lean ~= nil and type(abp_native_visible) == "function" and abp_native_visible or nil
+-- (visible-v3) abp_native_v3(): the v3 frame bytes, or nil, why (abp_v3_native.c)
+local native_v3 = native_lean ~= nil and type(abp_native_v3) == "function" and abp_native_v3 or nil
+ABP_NATIVE_V3 = { available = native_v3 ~= nil, native = 0, fallbacks = 0, last_fallback = nil, flags = 32 }
 -- (the mode lives in the global ABP_NATIVE_VIS.mode: probes switch it in one clone with a lua command)
 ABP_NATIVE_VIS = { available = native_visible ~= nil, native = 0, fallbacks = 0, last_fallback = nil, checks = 0,
 	mismatches = 0, first = nil, step = 0, mode = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_VISIBLE") or "0")) or 0 }
@@ -2390,7 +2394,23 @@ end
 
 -- The visible block as the mode says (see ABP_NATIVE_VIS); the Lua block when the native one hands over
 function visible_block()
-	if state.visible_v3 then return spack("<s4", visible_v3_raw()) end   -- (v3: the raw block, Lua only for now)
+	if state.visible_v3 ~= 0 then   -- (v3: the raw block and / or the native frame; their flags in ABP_NATIVE_V3.flags)
+		local m, v = state.visible_v3, ABP_NATIVE_V3
+		local out, flags = "", 0
+		if m == 1 or m == 3 or native_v3 == nil then out, flags = spack("<s4", visible_v3_raw()), 32 end
+		if (m == 2 or m == 3) and native_v3 ~= nil then
+			local frame, why = native_v3()
+			if frame ~= nil then
+				out, flags = out .. spack("<s4", frame), flags + 64
+				v.native = v.native + 1
+			else
+				v.fallbacks, v.last_fallback = v.fallbacks + 1, why
+				if flags == 0 then out, flags = spack("<s4", visible_v3_raw()), 32 end
+			end
+		end
+		v.flags = flags
+		return out
+	end
 	local mode = native_visible ~= nil and ABP_NATIVE_VIS.mode or 0
 	if mode == 0 then return visible_input_block() end
 	local v = ABP_NATIVE_VIS
@@ -2434,7 +2454,7 @@ function pack_lean(event)
 	end
 	state.terrain_dirty = false
 	local terrain, map, inv, visible = lean_blocks(event, resend, here, clear)
-	return lean_fixed(mode, here, 32 + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) .. terrain
+	return lean_fixed(mode, here, (state.visible_v3 ~= 0 and ABP_NATIVE_V3.flags or 32) + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) .. terrain
 		.. map .. inv .. visible
 end
 
@@ -3017,8 +3037,11 @@ local function handle_command(line)
 			priv_reset()
 			send({ type = "ok", cmd = "priv", enabled = state.priv, sent = PRIV.sent, skipped = PRIV.skipped })
 		elseif cmd.cmd == "visible_v3" then   -- 2026-11-17 (visible-v3, package C): the v3 raw block in the lean payload
-			if cmd.enabled ~= nil then state.visible_v3 = cmd.enabled == true end
-			send({ type = "ok", cmd = "visible_v3", enabled = state.visible_v3 })
+			if cmd.mode ~= nil then state.visible_v3 = math.tointeger(tonumber(cmd.mode)) or 0
+			elseif cmd.enabled ~= nil then state.visible_v3 = cmd.enabled == true and 1 or 0 end
+			local v = ABP_NATIVE_V3
+			send({ type = "ok", cmd = "visible_v3", enabled = state.visible_v3 ~= 0, mode = state.visible_v3,
+				native_available = v.available, native = v.native, fallbacks = v.fallbacks, last_fallback = v.last_fallback })
 		elseif cmd.cmd == "lean_items" then   -- 2026-10-06 (items, Phase A): the inventory block and run-mode map rules
 			if cmd.enabled ~= nil then
 				state.lean_items = cmd.enabled == true
@@ -3200,14 +3223,14 @@ local function native_step_obs()
 	s.consecutive = false
 	-- (G, 2026-11-12) native visible mode 1: lean_blocks leaves the visible block out; the fast path (no other block)
 	-- has abp_native_step append the native one, a slow one builds it below
-	local nvis = native_visible ~= nil and ABP_NATIVE_VIS.mode == 1 and not state.visible_v3
+	local nvis = native_visible ~= nil and ABP_NATIVE_VIS.mode == 1 and state.visible_v3 == 0
 	local ok, terrain, map, inv, visible = pcall(lean_blocks, "step", resend, here, clear, nvis)
 	if ok and nvis and (terrain ~= "" or map ~= "" or inv ~= "") then visible = visible_block() end
 	if not ok or terrain ~= "" or map ~= "" or inv ~= "" or visible ~= "" then
 		s.blocks = s.blocks + 1
 		local sent = send_lean_payload(function()
 			if not ok then error(terrain) end
-			return lean_fixed(1, here, 32 + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) ..
+			return lean_fixed(1, here, (state.visible_v3 ~= 0 and ABP_NATIVE_V3.flags or 32) + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) ..
 				terrain .. map .. inv .. visible
 		end)
 		if sent then wait_command() end
