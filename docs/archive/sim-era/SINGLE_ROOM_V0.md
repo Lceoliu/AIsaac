@@ -87,7 +87,7 @@
 ### 功能测试
 
 ```powershell
-Set-Location -LiteralPath 'D:\Projects\fortune\Isaac\rl'
+Set-Location -LiteralPath '<仓库根>'
 $env:PYTEST_DISABLE_PLUGIN_AUTOLOAD = '1'
 python -m pytest -q -p no:cacheprovider
 ```

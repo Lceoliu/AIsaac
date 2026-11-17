@@ -1,5 +1,8 @@
 # B30 时间注意力：设计（2026-10-14）
 
+> **状态（2026-11-17）**：已实现（`isaac_bridge/tok_policy.py`，`train_tok.py --temporal 1`），是"旧模型"（逐帧 token transformer + 时间 transformer）的时间侧；C99、C100 用的就是它，C107、C110 里它在 400 游戏小时内能学会真实任务。
+> 结果见 `bridge/abplus/EXPERIMENTS.md` 的 B30、B31、B33、C96、C99、C100、C110。下文的 HPC 是当时的机器，现已不可用。
+
 图：`docs/figures/temporal_attention_arch.svg`。用户决定（10-14）：反馈路开、时间侧 256 宽 × 4 层、窗口 W = 256 步、GRU 先保留、
 参数量与空间侧同量级；不做记忆消融；现有的每步空间 transformer 原样保留。训练速度基本不降（B29 的结论：actor 的开销是 pad 的
 token 和小 kernel，时间侧每步只有一个查询，就地读缓存）。

@@ -1,5 +1,8 @@
 # 路线规划与道具选择：规则、推断、搜索与学习怎么分工
 
+> **状态（2026-11-17）**：已完成的设计分析。其中 P0（楼层生成器、隐藏房推断、规则规划器）已在 [macro/](../macro/README.md) 实现；训练主线没有把宏观层当模块接入，策略自己学整局决策；只有反事实教师的炸墙选择点（B40，`isaac_bridge/tok_cf.py`）移植了 `macro/isaac_macro/secret.py` 的隐藏房位置规则。
+> 结果在 [macro/README.md](../macro/README.md)，不在 EXPERIMENTS.md。文中"远端正在训练"等说法是 2026-09 的情况。
+
 日期：2026-09-25。
 
 **本文性质**
@@ -10,8 +13,8 @@
     - 09-26 的引擎整层导出：6,000 层（第 1–8、10、11 层）逐房间一致，包括隐藏房、超级隐藏房的位置。
   - 隐藏房推断器、道具先验表、规则规划器 v0 都已完成，并在生成的楼层上评估。
   - 下文凡与此冲突之处，以本节和各处"更新"标注为准。
-- 对应 [PROJECT_SPEC.md](PROJECT_SPEC.md) 的阶段 3（连续房间）和阶段 4（完整游戏）。
-- 游戏规则背景见 [ISAAC_GAME_PRIMER.md](../../analysis/docs/ISAAC_GAME_PRIMER.md)。
+- 对应 [PROJECT_SPEC-2026-09.md](archive/sim-era/PROJECT_SPEC-2026-09.md) 的阶段 3（连续房间）和阶段 4（完整游戏）。
+- 游戏规则背景见 `ISAAC_GAME_PRIMER.md`（工作区的 analysis/docs，不在本仓库）。
 
 **标注**
 - 〔事实〕：有来源或本地数据直接支持。
@@ -185,7 +188,7 @@
 | 清房奖励 `Room::SpawnClearAward` | 16.6 KB |
 | **合计** | **约 91 KB** |
 
-- 按 [ENGINE_REUSE_ASSESSMENT.md](../../analysis/docs/ENGINE_REUSE_ASSESSMENT.md) 的速率（472 KB 对应 70–150 天）换算，约需 2–5 周，还要用真实楼层逐格验证〔推断〕。
+- 按 `ENGINE_REUSE_ASSESSMENT.md`（工作区的 analysis/docs，不在本仓库） 的速率（472 KB 对应 70–150 天）换算，约需 2–5 周，还要用真实楼层逐格验证〔推断〕。
 - **更新**：实际上，楼层生成部分（52.6 KB）不到一天就翻译完并通过验证（[rl/macro](../macro/README.md)）。
   - 原因是 AB+ 带函数名；而且引擎日志逐步记录了生成过程，可以直接当测试。
   - 道具池、商店、清房奖励还没翻译。
@@ -517,7 +520,7 @@
 6. **统计功效**：整层、整局成功率的方差大，比较两个规划器需要大量配对种子，并保留独立的测试种子。
 
 ## 7. 参考
-- 游戏规则：[ISAAC_GAME_PRIMER.md](../../analysis/docs/ISAAC_GAME_PRIMER.md)，以及 wiki[楼层生成]。
+- 游戏规则：`ISAAC_GAME_PRIMER.md`（工作区的 analysis/docs，不在本仓库），以及 wiki[楼层生成]。
 - AB+ 生成器与隐藏房函数：`analysis/abplus-linux/exports/abplus-x64-baseline/functions.jsonl`。
 - 训练统计：`~/isaac-abplus/train/abp-mix-01*`（远端）。
 

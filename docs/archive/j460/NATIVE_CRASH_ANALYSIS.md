@@ -90,7 +90,7 @@ PID27288和18872分别捕获 `afterbirthp.a`、`afterbirth.a` 解析返回NULL�
 
 ## 1. 崩溃清单
 
-来源：Windows 应用程序日志 Event 1000/1001（`isaac-ng.exe`，时间戳 `0x69e6e3a7`），共 19 次；WER 转储在 `C:\Users\eolc\AppData\Local\CrashDumps\`，游戏自带转储在 `Documents\My Games\Binding of Isaac Repentance+\crash_dumps\`。
+来源：Windows 应用程序日志 Event 1000/1001（`isaac-ng.exe`，时间戳 `0x69e6e3a7`），共 19 次；WER 转储在 `<用户目录>\AppData\Local\CrashDumps\`，游戏自带转储在 `Documents\My Games\Binding of Isaac Repentance+\crash_dumps\`。
 
 | 时间 | 类别 | 故障偏移 | 备注 |
 |---|---|---|---|

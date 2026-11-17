@@ -1,6 +1,9 @@
 # isaac_turbo：J460 原版加速层（L1）的原生部分
 
-设计、证据与实验方案见 [rl/docs/L1_FEASIBILITY_PLAN.md](../docs/L1_FEASIBILITY_PLAN.md)。这里只放构建与文件说明。
+> **状态（2026-11-17）**：暂停。这是 Repentance+ J460（Windows）的加速层，现在的训练不用它；AB+ 的加速层在 [bridge/engine/](../bridge/engine/README.md)。
+> 下文是 2026-09 的记录，`<仓库根>` 指本仓库的根目录。
+
+设计、证据与实验方案见 [docs/archive/j460/L1_FEASIBILITY_PLAN.md](../docs/archive/j460/L1_FEASIBILITY_PLAN.md)。这里只放构建与文件说明。
 
 ## 做什么
 
@@ -14,7 +17,7 @@
 | 字体绘制 `0x0061BD80`（缓解，`kFlagFontGuard`） | 先查 `KAGE_ColorTextureShader` 是否可用，不可用则跳过本次文本绘制（`ret 0x24`），避免空栈出栈崩溃；不改玩法状态 |
 | KAGE 文件打开 `0x00617EA0`（探针 + 缓解，`kFlagFileRetry`） | 失败时记录路径 / errno / _doserrno / GetLastError；对 `*.a` 归档最多重试 5 次（20–100 ms 退避） |
 
-探针的依据与判据见 [rl/docs/NATIVE_CRASH_ANALYSIS.md](../docs/NATIVE_CRASH_ANALYSIS.md)。`shader_registry.hpp` 是注册表/栈的纯逻辑解析，`tests/registry_test.cpp` 用伪造内存验证哈希、查找和"空栈出栈读 0xC"的算术。
+探针的依据与判据见 [docs/archive/j460/NATIVE_CRASH_ANALYSIS.md](../docs/archive/j460/NATIVE_CRASH_ANALYSIS.md)。`shader_registry.hpp` 是注册表/栈的纯逻辑解析，`tests/registry_test.cpp` 用伪造内存验证哈希、查找和"空栈出栈读 0xC"的算术。
 
 不改任何玩法状态、不注入输入、不写游戏目录（日志与探针转储在 `%LOCALAPPDATA%\IsaacRL\turbo\`，可用 `ISAAC_TURBO_LOG_DIR` 改）。宿主不是 J460（PE 时间戳/大小/7 段序言/GLFW 频率任一不符）时不装任何 Hook。
 
@@ -23,7 +26,7 @@
 ## 构建与测试
 
 ```powershell
-pwsh -NoProfile -File D:\Projects\fortune\Isaac\rl\turbo\build.ps1
+pwsh -NoProfile -File <仓库根>\turbo\build.ps1
 ```
 
 产物：`build/isaac_turbo.dll`、`build/isaac_turbo_inject.exe`（x86，zig cc + MinHook）。脚本依次运行 `clock_test`（虚拟时钟对限帧算术）、`probe_host`（非游戏宿主必须被拦住）、`scripts/verify_targets.py`（只读核对 exe 字节）。Python 端的共享内存测试：`python rl/bridge/python/test_turbo_control.py`。

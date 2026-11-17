@@ -98,14 +98,14 @@ Isaac-RL（Repentance 1.7.9b）：6 个游戏进程并行、每动作 8 帧、�
 
 准备（2026-09-19 17:33 已按用户要求完成前两步）：
 
-1. 已在 `D:\Steam\steamapps\common\The Binding of Isaac Rebirth\mods\isaac_rl_bridge` 建立**目录联接**（Junction）指向 `rl/bridge/mod/isaac_rl_bridge`；游戏目录里没有复制任何文件，删除该联接即可还原。这是用户明确授权的唯一游戏目录改动。
+1. 已在 `<Steam 库>\steamapps\common\The Binding of Isaac Rebirth\mods\isaac_rl_bridge` 建立**目录联接**（Junction）指向 `rl/bridge/mod/isaac_rl_bridge`；游戏目录里没有复制任何文件，删除该联接即可还原。这是用户明确授权的唯一游戏目录改动。
 2. `Documents\My Games\Binding of Isaac Repentance+\options.ini` 已改 `EnableMods=1`、`PauseOnFocusLost=0`（改前备份在 `rl/runs/l1/backup/options.ini.20260919-173336`，逐行比对只有这两处不同，CRLF 保持）。`EnableDebugConsole=1` 原本就是；`VSync=1` 未动。
 3. Steam 已登录（用户手动启动游戏）。
 
 构建（已通过）：
 
 ```powershell
-pwsh -NoProfile -File D:\Projects\fortune\Isaac\rl\turbo\build.ps1
+pwsh -NoProfile -File <仓库根>\turbo\build.ps1
 ```
 
 手动启动（用户操作）。必须带 `--luadebug`，否则 mod 里的 `require("socket")` 失败；端口不设环境变量时默认 27015：
@@ -113,7 +113,7 @@ pwsh -NoProfile -File D:\Projects\fortune\Isaac\rl\turbo\build.ps1
 ```powershell
 # 直接启动（Steam 已登录即可；等价于 python -m isaac_bridge.launch --port 27015 --privileged）
 $env:ISAAC_RL_PORT = '27015'; $env:ISAAC_RL_PRIVILEGED = '1'
-Start-Process -FilePath 'D:\Steam\steamapps\common\The Binding of Isaac Rebirth\isaac-ng.exe' -ArgumentList '--luadebug' -WorkingDirectory 'D:\Steam\steamapps\common\The Binding of Isaac Rebirth'
+Start-Process -FilePath '<Steam 库>\steamapps\common\The Binding of Isaac Rebirth\isaac-ng.exe' -ArgumentList '--luadebug' -WorkingDirectory '<Steam 库>\steamapps\common\The Binding of Isaac Rebirth'
 ```
 
 或者在 Steam 里给游戏的启动选项填 `--luadebug` 后从 Steam 启动。启动后 `Documents\My Games\Binding of Isaac Repentance+\log.txt` 应出现 `[IsaacRLBridge] listening on 127.0.0.1:27015`；若出现 `luasocket unavailable`，说明没传 `--luadebug`。
