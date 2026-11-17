@@ -93,7 +93,7 @@
     6
    ],
    "bytes": 15276,
-   "sha256": "0595214d5910ba86310352eee8ee3966ede93b12d06ef5c6c9edb4ce186b7983"
+   "sha256": "adda67076b2777739fa878f52499411ad0f45b5aca396235d28af49bc89a2963"
   },
   {
    "name": "forgotten-soul",
@@ -112,7 +112,7 @@
     6
    ],
    "bytes": 15276,
-   "sha256": "0bd634d402e6f73b2e102b3c483cc9a70c5c7be8cccbc69a21b77fc3de60241c"
+   "sha256": "5267282bb7b25474f4d025f6ec852018aafa8e5f922e2f4d03247bbbedd51ed8"
   },
   {
    "name": "offgrid",
@@ -372,5 +372,5 @@
   "devilprice": "goto s.devil.0: room type 14, prices -1,-2",
   "offgrid": "228.10 at 500.00,367.00 after 0 more frames"
  },
- "seconds": 6.9
+ "seconds": 6.7
 }
