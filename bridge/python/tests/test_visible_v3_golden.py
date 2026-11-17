@@ -92,3 +92,13 @@ def test_worker_row_and_stall_backfill():
     mask[[s, k]] = False
     assert np.array_equal(a['P'][:, mask], b['P'][:, mask]) and np.array_equal(a['E'], b['E'])
     assert np.array_equal(a['canvas'], b['canvas']) and np.array_equal(a['local'], b['local'])
+
+
+def test_stall_columns_in_run_mode_too():
+    """--mode run's EpisodeState (run=True) is a whole-floor state (st.floor), so encode_row backfills the stall
+    columns there as on whole floors: known 1 with a stall rule, 0 without one."""
+    from isaac_bridge.tok_obs import EpisodeState
+    assert EpisodeState(100, run=True, stall=120).floor and EpisodeState(100, floor=True, stall=120).floor
+    assert not EpisodeState(100).floor
+    src = (Path(VP.__file__).parent / 'tok_obs.py').read_text(encoding='utf-8')
+    assert 'known = st.floor and st.stall > 0' in src and 'v3_backfill_stall(row' in src
