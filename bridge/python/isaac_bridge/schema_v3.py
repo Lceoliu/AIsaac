@@ -18,6 +18,15 @@ structured_input.py as before; v3 is a new path chosen by a switch.
 Freeze rule: after the coordinator's review, any change of a column number, a size, the version or the head order is
 reported to the coordinator first, who tells the other package; neither side changes them on its own.
 
+Batch 1 (the coordinator, 2026-11-17; SINGLE_TRANSFORMER_DESIGN.md section 9, the coordinate contract, after V1 --
+the engine's room-shape table measured on AB+: GetGridPosition(0) = (40, 120) in all 12 shapes, every cell centre at
+origin + 40 (col + 0.5, row + 0.5), GetTopLeftPos shape-dependent): VERSION 2026111701; A0 E col 15 kind = the raw
+kind + 1 (0 none); A1 one frame of reference, the canvas frame (CELL, below), P cols 0-1 / E cols 3-4 in canvas
+pixels, both axes / 520; A2 E velocities / 10 as P's; A3 laser length / 300, end point in canvas pixels / 520, radius
+/ 100; A4 the canvas and local-patch placement rules; A5 the inside bit IsPositionInRoom(cell centre, 0); A6 P cols 41
+grid_w and 42 grid_h. GetTopLeftPos / GetBottomRightPos are used nowhere. Offsets relative to a body, distances and
+in-cell offsets are the model's (computed at decode), never on the wire.
+
 Wire rule (DESIGN 2.0): every value is a raw game unit as float32 (integers exact to 2^24, bit words <= 24 bits, flag
 words in 16-bit chunks); categorical codes are integers, 0 = none / not known; reserved columns are 0. The model
 applies SCALE (below) itself. Known flags (G3): a field the game version lacks is written as its true value there
@@ -26,7 +35,7 @@ applies SCALE (below) itself. Known flags (G3): a field the game version lacks i
 
 # ------------------------------------------------------------------------------------------------- F1: identity
 SCHEMA = 'isaac-visible-prlmens-g-v3'
-VERSION = 2026111201
+VERSION = 2026111701   # batch 1 (the coordinator, 2026-11-17): canvas frame, isotropic scales, kind + 1
 FRAME_BYTES = 131072
 MAGIC = 61107
 LAYOUT_GEN = 3        # header[6]
@@ -37,8 +46,21 @@ PRODUCER = {'abplus': 0, 'rep_j746': 1, 'rep_plus': 2, 'recorder': 3}
 
 # ------------------------------------------------------------------------------------------------- F1: room canvas
 CANVAS_H, CANVAS_W = 16, 28
+# The canvas frame (batch 1, A1): ONE frame of reference for every position on the wire (P cols 0-1, E cols 3-4, the
+# laser end point E cols 27-28). Origin = the top-left corner of grid cell 0 = GetGridPosition(0) - (CELL / 2,
+# CELL / 2), taken by the producer from GetGridPosition(0) at run time (never a constant: AB+ gives (40, 120) - (20,
+# 20) = (20, 100) in every room shape, V1); x grows right, y down, in pixels (world position - origin). The cell of a
+# position: col = floor(x / CELL), row = floor(y / CELL); a position outside [0, CELL * gw) x [0, CELL * gh) has no
+# cell (never the engine's GetGridIndex, which answers -1 or an edge cell outside the grid). GetTopLeftPos /
+# GetBottomRightPos are not used (shape-dependent: (1, 1) cells from the origin in 1x1 / 1x2 / 2x1 / 2x2 / L rooms,
+# (1, 3) in IH / IIH, (5, 1) in IV / IIV).
+CELL = 40
+# Placement (batch 1, A4): the room's grid fills canvas rows 0..gh-1 and columns 0..gw-1 (top-left aligned, as v2),
+# every other canvas cell all 0. A body's 9 x 9 local patch is centred on (floor(x / CELL), floor(y / CELL)) of its
+# canvas-frame position, clamped first to [0, gw - 1] x [0, gh - 1].
 ROOM_WORDS = 5        # per cell: word 0 bits, word 1 bits, grid type, grid variant, grid state (raw)
-# word 0, LSB first (20 bits): (name, bits)
+# word 0, LSB first (20 bits): (name, bits). inside (batch 1, A5) = IsPositionInRoom(the cell centre, 0): the cell is in
+# the room, independent of any body's size
 ROOM_W0 = (('inside', 1), ('collision', 3), ('solid', 1), ('pit', 1), ('destructible', 1), ('hazard', 1),
            ('door', 1), ('door_open', 1), ('door_locked', 1), ('door_target', 6), ('visited', 1), ('clear', 1),
            ('exit', 1))
@@ -94,7 +116,8 @@ def _block(start, n, prefix, kind, unit='', scale=1.0):
 
 # P: one token per body (DESIGN 2.5). (col, name, kind, raw unit, model scale)
 P_SPEC = [
-    (0, 'x', 'num', 'px from the room top-left', 520), (1, 'y', 'num', 'px from the room top-left', 280),
+    (0, 'x', 'num', 'canvas-frame px (Position.X - origin x)', 520),
+    (1, 'y', 'num', 'canvas-frame px (Position.Y - origin y)', 520),
     (2, 'vx', 'num', 'px/frame', 10), (3, 'vy', 'num', 'px/frame', 10), (4, 'size', 'num', 'px', 20),
     (5, 'hearts', 'num', 'red half hearts (0 under Curse of the Unknown)', 12),
     (6, 'max_hearts', 'num', 'half hearts', 12), (7, 'soul', 'num', 'soul half hearts', 12),
@@ -116,6 +139,8 @@ P_SPEC = [
     (37, 'weapon_charge', 'num', 'charge counter frames (known: P 51)', 60),
     (38, 'body_index', 'num', 'index in the frame', 4), (39, 'linked_body', 'num', 'partner index + 1, 0 none', 4),
     (40, 'stall_share', 'num', "decisions since the last progress / the stall limit, 0..1 (known: P 53)", 1),
+    (41, 'grid_w', 'num', 'GetGridWidth (cells; the room fills canvas columns 0..grid_w-1)', 28),
+    (42, 'grid_h', 'num', 'GetGridHeight (cells; the room fills canvas rows 0..grid_h-1)', 16),
     (48, 'health_known', 'known', 'not Curse of the Unknown', 1),
     (49, 'controller_known', 'known', 'ControllerIndex present', 1),
     (50, 'animation_known', 'known', 'animation name known', 1),
@@ -141,22 +166,23 @@ P_COLS = _cols(P_SPEC, PF)
 E_SPEC = [
     (0, 'type', 'id', 'EntityType (identity)', 1), (1, 'variant', 'id', 'variant (identity)', 1),
     (2, 'subtype', 'id', 'subtype (identity; 0 for a pedestal under Curse of the Blind)', 1),
-    (3, 'x', 'num', 'px from the room top-left', 520), (4, 'y', 'num', 'px from the room top-left', 280),
-    (5, 'vx', 'num', 'px/frame', 20), (6, 'vy', 'num', 'px/frame', 20), (7, 'size', 'num', 'px', 20),
+    (3, 'x', 'num', 'canvas-frame px (Position.X - origin x)', 520),
+    (4, 'y', 'num', 'canvas-frame px (Position.Y - origin y)', 520),
+    (5, 'vx', 'num', 'px/frame', 10), (6, 'vy', 'num', 'px/frame', 10), (7, 'size', 'num', 'px', 20),
     (8, 'size_mx', 'num', 'SizeMulti x', 20), (9, 'size_my', 'num', 'SizeMulti y', 20),
     (10, 'coll', 'num', 'EntityCollisionClass', 1), (11, 'gcoll', 'num', 'GridCollisionClass', 1),
     (12, 'cdmg', 'num', 'CollisionDamage', 1), (13, 'sprite_frame', 'num', 'frame', 60),
     (14, 'age', 'num', 'FrameCount', 60), (15, 'kind', 'cat:entity_kind',
-                                             '0 other, 1 tear, 2 projectile, 3 laser, 4 bomb, 5 pickup, 6 npc, '
-                                             '7 knife, 8 familiar, 9 effect', 1),
+                                             'raw kind + 1: 1 other, 2 tear, 3 projectile, 4 laser, 5 bomb, '
+                                             '6 pickup, 7 npc, 8 knife, 9 familiar, 10 effect; 0 none', 1),
     (16, 'npc_flags', 'bits8', '1 IsEnemy, 2 IsVulnerableEnemy, 4 IsBoss, 8 CanShutDoors', 1),
     (17, 'anim', 'num', 'short animation list index', 1), (18, 'flip_x', 'num', '0/1', 1),
     (19, 'champion', 'cat:champion', 'ChampionColorIdx + 2', 1),
     (20, 'boss_hp', 'num', 'visible boss bar fraction', 1), (21, 'height', 'num', 'Height', 30),
     (22, 'fall', 'num', 'FallingSpeed', 30), (23, 'scale', 'num', 'Scale', 30),
     (24, 'l_cos', 'num', 'laser direction cos', 1), (25, 'l_sin', 'num', 'laser direction sin', 1),
-    (26, 'l_len', 'num', 'laser length px', 520), (27, 'l_ex', 'num', 'laser end x px', 520),
-    (28, 'l_ey', 'num', 'laser end y px', 520), (29, 'l_radius', 'num', 'laser radius px', 520),
+    (26, 'l_len', 'num', 'laser length px', 300), (27, 'l_ex', 'num', 'laser end x, canvas-frame px', 520),
+    (28, 'l_ey', 'num', 'laser end y, canvas-frame px', 520), (29, 'l_radius', 'num', 'laser radius px', 100),
     (30, 'l_circle', 'num', '0/1', 1), (31, 'price', 'num', 'shop price (coins)', 100),
     (32, 'identity_known', 'known', 'type / variant / subtype readable', 1),
     (33, 'flags_known', 'bits8', '1 tear namespace, 2 projectile, 4 entity flags, 8 anim_id', 1),
@@ -230,8 +256,9 @@ GAME_VERSION = {'abplus': 1, 'rep': 2, 'rep_plus': 3}
 BODY_ROLE = {'main': 1, 'twin': 2, 'sub': 3, 'coop_baby': 4, 'coop_ghost': 5}
 SLOT_FAMILY = {'active': 1, 'trinket': 2, 'pill': 3, 'card': 4, 'poop_spell': 5, 'crafting_item': 6,
                'crafting_output': 7}
-ENTITY_KIND = {'other': 0, 'tear': 1, 'projectile': 2, 'laser': 3, 'bomb': 4, 'pickup': 5, 'npc': 6, 'knife': 7,
-               'familiar': 8, 'effect': 9}
+# E col 15's code on the wire (batch 1, A0, the coordinator's ruling of 2026-11-12): the raw kind + 1, 0 = none
+ENTITY_KIND = {'other': 1, 'tear': 2, 'projectile': 3, 'laser': 4, 'bomb': 5, 'pickup': 6, 'npc': 7, 'knife': 8,
+               'familiar': 9, 'effect': 10}
 
 
 def _bad(v):

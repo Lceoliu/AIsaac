@@ -69,7 +69,9 @@ def generate():
         L.append(f'#define ABP_V3_PRODUCER_{_ident(k)} {v}')
     L += ['', '/* ---- F1: room canvas (per cell: word 0 bits, word 1 bits, grid type, variant, state) */',
           f'#define ABP_V3_CANVAS_H {S.CANVAS_H}', f'#define ABP_V3_CANVAS_W {S.CANVAS_W}',
-          f'#define ABP_V3_ROOM_WORDS {S.ROOM_WORDS}', f'#define ABP_V3_RC {S.RC}']
+          f'#define ABP_V3_ROOM_WORDS {S.ROOM_WORDS}', f'#define ABP_V3_RC {S.RC}',
+          '/* the canvas frame (batch 1): origin = GetGridPosition(0) - (CELL / 2, CELL / 2); cell = floor(pos / CELL) */',
+          f'#define ABP_V3_CELL {S.CELL}']
     L += _bits('W0', S.ROOM_W0) + _bits('W1', S.ROOM_W1)
     L += [f'#define ABP_V3_LOCAL_SIDE {S.LOCAL_SIDE}', f'#define ABP_V3_LOCAL {S.LOCAL}',
           '', '/* ---- F1: minimap (one float per cell) */', f'#define ABP_V3_MAP_SIDE {S.MAP_SIDE}',
