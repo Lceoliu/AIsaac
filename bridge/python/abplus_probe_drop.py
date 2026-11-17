@@ -6,6 +6,8 @@ ways a client sends a step -- the step line's 7th number (the sampler's path, le
   schoolbag   Schoolbag (534) + two active items: one press swaps the active item
   pockets     a card and a pill: one press cycles the pocket items (GetCard(0) / GetPill(0))
   trinket     a trinket: drop held for --hold decisions drops it (GetTrinket(0) 0, a trinket pickup in the room)
+  (the items given, the press waits --wait idle decisions: no swap while the pickup animation runs; pockets: Polydactyly
+  for a second pocket)
   release     one press, then decisions with drop 0: the swap happens once (no repeat while released)
   zero        drop 0 written out ("S r m s b i 0 0", play codes < 360, JSON drop 0) against the old forms (5 numbers,
               no field): the game digest after a fixed 40-decision sequence is equal (G6: drop 0 leaves trajectories)
@@ -42,7 +44,7 @@ SETUP = {
     'forgotten': None,
     'schoolbag': "local p = Isaac.GetPlayer(0) p:AddCollectible(534, 0, false) p:AddCollectible(45, 0, false) "
                  "p:AddCollectible(63, 0, false) return 'ok'",
-    'pockets': "local p = Isaac.GetPlayer(0) p:AddCard(1) p:AddPill(3) return 'ok'",
+    'pockets': "local p = Isaac.GetPlayer(0) p:AddCollectible(454, 0, false) p:AddCard(1) p:AddPill(3) return 'ok'",
     'trinket': "local p = Isaac.GetPlayer(0) p:AddTrinket(1) return 'ok'",
     'release': "local p = Isaac.GetPlayer(0) p:AddCollectible(534, 0, false) p:AddCollectible(45, 0, false) "
                "p:AddCollectible(63, 0, false) return 'ok'",
@@ -93,20 +95,20 @@ def run_json(c, seq, form):
         read_raw_after_ok(c)
 
 
-def case_seq(case, hold):
+def case_seq(case, hold, wait):
     idle = (0, 0, 0, 0, 0, 0)
     press = (0, 0, 0, 0, 0, 1)
     if case == 'trinket':
-        return [idle] * 2 + [press] * hold + [idle] * 4
+        return [idle] * wait + [press] * hold + [idle] * 4
     if case == 'release':
-        return [idle] * 2 + [press] + [idle] * 10
+        return [idle] * wait + [press] + [idle] * 10
     if case == 'zero':
         moves = [(m, s, 0, 0, 0, 0) for m, s in ((3, 0), (3, 2), (5, 0), (5, 3), (7, 1), (1, 4), (0, 0), (2, 2))]
         return (moves * 5)[:40]
-    return [idle] * 2 + [press] + [idle] * 6
+    return [idle] * wait + [press] + [idle] * 6
 
 
-def one(inst, seed, case, hold, out_f):
+def one(inst, seed, case, hold, wait, old_only, out_f):
     b = inst.env.bridge
     b.reset_mode, b.character = 'floor', CHAR.get(case, 0)
     inst.reset(seed)
@@ -118,7 +120,9 @@ def one(inst, seed, case, hold, out_f):
     try:
         forms = [('line', 'new'), ('line', 'old'), ('play', ''), ('json', 'new'), ('json', 'old')] if case == 'zero' \
             else [('line', 'new'), ('play', ''), ('json', 'new')]
-        seq = case_seq(case, hold)
+        if old_only:   # (a bridge before the drop: only the forms it reads)
+            forms = [f for f in forms if f[1] != 'new']
+        seq = case_seq(case, hold, wait)
         for path, form in forms:
             c = S.fork(lean=True, alarm=600)
             try:
@@ -165,6 +169,8 @@ def main():
     p.add_argument('--seeds', default='2147800000:2')
     p.add_argument('--cases', default='forgotten,schoolbag,pockets,trinket,release,zero')
     p.add_argument('--hold', type=int, default=20)
+    p.add_argument('--wait', type=int, default=20, help='idle decisions before the press (the pickup animation ends)')
+    p.add_argument('--old-only', type=int, default=0, help='1: only the old forms (a tree before the drop)')
     p.add_argument('--fpd', type=int, default=4)
     p.add_argument('--port', type=int, default=44490)
     p.add_argument('--out', required=True)
@@ -186,7 +192,7 @@ def main():
             for seed in range(first, first + count):
                 for case in args.cases.split(','):
                     try:
-                        res = one(inst, seed, case, args.hold, f)
+                        res = one(inst, seed, case, args.hold, args.wait, args.old_only, f)
                         v = dict(case=case, seed=seed, **verdict(case, res))
                     except Exception as e:   # reported; the instance relaunched
                         v = dict(case=case, seed=seed, error=f'{type(e).__name__}: {e}')
