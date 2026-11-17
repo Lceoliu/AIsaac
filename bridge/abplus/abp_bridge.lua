@@ -2398,7 +2398,9 @@ function visible_block()
 		local m, v = state.visible_v3, ABP_NATIVE_V3
 		local out, flags = "", 0
 		if m == 1 or m == 3 or native_v3 == nil then out, flags = spack("<s4", visible_v3_raw()), 32 end
-		if (m == 2 or m == 3) and native_v3 ~= nil then
+		local lethal = false   -- (a cancelled lethal hit: only the Lua block knows it, as for the native lean part)
+		for _, lv in pairs(state.lethal) do if lv == true then lethal = true end end
+		if (m == 2 or m == 3) and native_v3 ~= nil and not lethal then
 			local frame, why = native_v3()
 			if frame ~= nil then
 				out, flags = out .. spack("<s4", frame), flags + 64
@@ -2407,6 +2409,9 @@ function visible_block()
 				v.fallbacks, v.last_fallback = v.fallbacks + 1, why
 				if flags == 0 then out, flags = spack("<s4", visible_v3_raw()), 32 end
 			end
+		elseif m == 2 and native_v3 ~= nil and lethal then
+			v.fallbacks, v.last_fallback = v.fallbacks + 1, "lethal hit cancelled"
+			out, flags = spack("<s4", visible_v3_raw()), 32
 		end
 		v.flags = flags
 		return out
