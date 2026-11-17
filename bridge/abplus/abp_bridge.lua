@@ -2049,7 +2049,9 @@ local function v3_body(p, index, role, n_players, cfg_players)
 	end
 	local charge, charge_known = 0, 0
 	if index ~= nil and type(abp_player_charge) == "function" then charge, charge_known = abp_player_charge(index) or 0, 1 end
-	return { entity_index = p.Index, init_seed = p.InitSeed, x = pos.X, y = pos.Y, vx = vel.X, vy = vel.Y, size = p.Size,
+	-- (no Entity.Index: on AB+ a player's Index is not reproducible -- 4294967295 / 1172069600 for the same state,
+	-- golden7 / golden7b; InitSeed identifies the body)
+	return { init_seed = p.InitSeed, x = pos.X, y = pos.Y, vx = vel.X, vy = vel.Y, size = p.Size,
 		hearts = p:GetHearts(), max_hearts = p:GetMaxHearts(), soul = p:GetSoulHearts(), bone = p:GetBoneHearts(),
 		eternal = p:GetEternalHearts(), golden = p:GetGoldenHearts(), broken = 0, rotten = 0,
 		extra_lives = p:GetExtraLives(), coins = p:GetNumCoins(), bombs = p:GetNumBombs(), keys = p:GetNumKeys(),
