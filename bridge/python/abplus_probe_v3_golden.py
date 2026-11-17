@@ -5,10 +5,10 @@ for an independent check of the model-unit values.
 
 Cases (every one a clone of a floor template; nothing written back):
   shape-<name>    one room of every RoomShape 1-12 (IH / IV narrow, the four L), entered by ChangeRoom, 10 frames on
-  offgrid         the 2x1 room of V1 with the Homunculus part 228.10 below the grid (seed 2147700000, stage 7, room 89)
-  doorframe       the player put on an allowed door slot's position of the start room, 2 frames on
+  offgrid         V1's 2x1 room 89 (seed 2147700000, stage 7) until a sent entity is outside the grid
+  doorframe       the player walked into a door of the start room until its formula cell is the door cell
   longlived       a coin spawned in the start room, 600 frames on (age 600: 10 after the scale, clamped at 8)
-  devilprice      a collectible pedestal with Price -1 (one heart container, a devil deal's code)
+  devilprice      a devil deal (goto s.devil.0; else a pedestal set to Price -1)
   shooting        the player shooting right for 3 decisions (fire_dir set)
   forgotten       the Forgotten (PlayerType 16) at the start: the Soul as a sub-player body
 
@@ -20,6 +20,7 @@ usage (bridge python dir, PYTHONPATH=.): python abplus_probe_v3_golden.py --grou
 import argparse
 import hashlib
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -39,7 +40,12 @@ local out = { g0 = { g0.X, g0.Y }, gw = room:GetGridWidth(), gh = room:GetGridHe
 for i = 0, Game():GetNumPlayers() - 1 do
   local p = Isaac.GetPlayer(i)
   out.players[#out.players + 1] = { index = p.Index, x = p.Position.X, y = p.Position.Y, gi = room:GetGridIndex(p.Position),
-    ptype = p:GetPlayerType(), fire_dir = p:GetFireDirection() }
+    ptype = p:GetPlayerType(), fire_dir = p:GetFireDirection(), seed = p.InitSeed }
+  local ok, sub = pcall(function() return p:GetSubPlayer() end)
+  if ok and sub then
+    out.players[#out.players].sub = { index = sub.Index, seed = sub.InitSeed, x = sub.Position.X, y = sub.Position.Y,
+      gi = room:GetGridIndex(sub.Position), ptype = sub:GetPlayerType() }
+  end
 end
 for _, e in ipairs(Isaac.GetRoomEntities()) do
   out.entities[#out.entities + 1] = { type = e.Type, variant = e.Variant, subtype = e.SubType, x = e.Position.X,
@@ -58,25 +64,61 @@ for i = 0, room:GetGridSize() - 1 do
 end
 return 'none'
 """
+DEVIL_GOTO = "Isaac.ExecuteCommand('goto s.devil.0') return 'ok'"
+DEVIL_PRICES = """
+local out = {}
+for _, e in ipairs(Isaac.GetRoomEntities()) do
+  if e.Type == 5 and e:ToPickup() and e:ToPickup().Price < 0 then out[#out + 1] = tostring(e:ToPickup().Price) end
+end
+return Game():GetRoom():GetType() .. ':' .. table.concat(out, ',')
+"""
 SPAWN_DEVIL = """
 local room = Game():GetRoom()
 local p = Isaac.GetPlayer(0)
 local q = room:FindFreePickupSpawnPosition(p.Position + Vector(80, 0), 0, true)
 local e = Isaac.Spawn(5, 100, 1, q, Vector(0, 0), nil):ToPickup()
+pcall(function() e.AutoUpdatePrice = false end)
 e.Price = -1
 return tostring(e.Price)
 """
-DOOR_LUA = """
+# a door of the start room: the player put one cell inside it, then walked into it frame by frame until the formula
+# cell of its position is the door's cell (the door frame), the room unchanged
+DOOR_START = """
 local room = Game():GetRoom()
-for slot = 0, 7 do
+local p = Isaac.GetPlayer(0)
+local inward = { [0] = { 40, 0 }, [1] = { 0, 40 }, [2] = { -40, 0 }, [3] = { 0, -40 } }
+for slot = 0, 3 do
   if room:IsDoorSlotAllowed(slot) and room:GetDoor(slot) then
     local q = room:GetDoorSlotPosition(slot)
-    Isaac.GetPlayer(0).Position = q
-    return string.format('%d,%.3f,%.3f', slot, q.X, q.Y)
+    p.Position = Vector(q.X + inward[slot][1], q.Y + inward[slot][2]); p.Velocity = Vector(0, 0)
+    return string.format('%d,%.4f,%.4f', slot, q.X, q.Y)
   end
 end
 return 'none'
 """
+PLAYER_CELL = """
+local room = Game():GetRoom()
+local g0 = room:GetGridPosition(0)
+local p = Isaac.GetPlayer(0)
+local c, r = math.floor((p.Position.X - g0.X + 20) / 40), math.floor((p.Position.Y - g0.Y + 20) / 40)
+return string.format('%d,%d,%d', c, r, Game():GetLevel():GetCurrentRoomDesc().SafeGridIndex)
+"""
+# the first sent entity (not a player, visible, not a decorative effect) whose formula cell is outside the grid
+OFFGRID_LUA = """
+local room = Game():GetRoom()
+local g0 = room:GetGridPosition(0)
+local ox, oy, gw, gh = g0.X - 20, g0.Y - 20, room:GetGridWidth(), room:GetGridHeight()
+for _, e in ipairs(Isaac.GetRoomEntities()) do
+  if e.Type ~= 1 and e.Visible and not (e.Type == 1000 and V3_DECORATIVE_LIST[e.Variant]) then
+    local c, r = math.floor((e.Position.X - ox) / 40), math.floor((e.Position.Y - oy) / 40)
+    if c < 0 or c >= gw or r < 0 or r >= gh then
+      return string.format('%d.%d at %.2f,%.2f', e.Type, e.Variant, e.Position.X - ox, e.Position.Y - oy)
+    end
+  end
+end
+return 'none'
+"""
+MOVE_INTO = {0: 7, 1: 1, 2: 3, 3: 5}   # left, up, right, down door: the move code toward it
 STALL = dict(stall_share=0.5, stall_known=1)
 
 
@@ -123,6 +165,7 @@ def main():
     stages = [int(v) for v in args.stages.split(',')]
     try:
         b = inst.env.bridge
+        notes = {}
 
         def floor(seed, char=0):
             b.reset_mode, b.character = 'floor', char
@@ -150,10 +193,35 @@ def main():
                     break
             idle(c, 10)
 
-        case('doorframe', 'the player on a door slot position (the door frame)',
-             lambda c: (c.lua(DOOR_LUA), idle(c, 2)))
+        def doorframe(c):
+            slot, qx, qy = c.lua(DOOR_START).split(',')
+            slot = int(slot)
+            here0 = c.lua(PLAYER_CELL).split(',')[2]
+            g0 = json.loads(c.lua(ENGINE_LUA))['g0']
+            dc, dr = math.floor((float(qx) - g0[0] + 20) / 40), math.floor((float(qy) - g0[1] + 20) / 40)
+            for k in range(90):
+                c.step({'move': MOVE_INTO[slot]}, repeat=1)
+                col, row, here = c.lua(PLAYER_CELL).split(',')
+                if here != here0:
+                    raise RuntimeError(f'left the room after {k + 1} frames before reaching the door cell')
+                if (int(col), int(row)) == (dc, dr):
+                    notes['doorframe'] = f'slot {slot}, door cell ({dc}, {dr}), reached after {k + 1} frames'
+                    return
+            raise RuntimeError('the door cell not reached in 90 frames')
+        case('doorframe', 'the player in a door frame (its formula cell is the door cell)', doorframe)
         case('longlived', 'a coin 600 frames old (age clamp)', lambda c: (c.lua(SPAWN_COIN), idle(c, 600)))
-        case('devilprice', 'a pedestal with Price -1', lambda c: (c.lua(SPAWN_DEVIL), idle(c, 2)))
+        def devil(c):
+            c.lua(DEVIL_GOTO)
+            idle(c, 30)
+            got = c.lua(DEVIL_PRICES)
+            if got.split(':')[0] == '14' and got.split(':')[1]:
+                notes['devilprice'] = f'goto s.devil.0: room type 14, prices {got.split(":")[1]}'
+                return
+            price = c.lua(SPAWN_DEVIL)
+            idle(c, 2)
+            notes['devilprice'] = f'goto gave {got!r}; a pedestal spawned with Price -1 (read back {price}), ' \
+                                  f'after 2 frames: {c.lua(DEVIL_PRICES)}'
+        case('devilprice', 'a pickup with a negative Price (a devil deal)', devil)
         case('shooting', 'the player shooting right', lambda c: [c.step({'shoot': 2}, repeat=4) for _ in range(3)])
         case('forgotten', 'the Forgotten and the Soul as bodies', lambda c: idle(c, 2), char=16)
 
@@ -164,6 +232,14 @@ def main():
             c = b.fork(tag='v3golden', alarm=900)
             try:
                 enter(c, 89)
+                for k in range(600):   # until a sent entity's formula cell is outside the grid
+                    found = c.lua(OFFGRID_LUA)
+                    if found != 'none':
+                        notes['offgrid'] = f'{found} after {k} more frames'
+                        break
+                    c.step({}, repeat=1)
+                else:
+                    notes['offgrid'] = 'no sent entity outside the grid in 600 frames'
                 capture(c, 'offgrid', out, manifest, 'V1 room 89 (2x1): the Homunculus part 228.10 below the grid')
             finally:
                 c.close()
@@ -209,7 +285,7 @@ def main():
                         errors.append(dict(name=f'shape {shape} room {idx}', error=f'{type(e).__name__}: {e}'))
     finally:
         inst.kill()
-    (out / 'manifest.json').write_text(json.dumps(dict(frames=manifest, errors=errors, stall=STALL,
+    (out / 'manifest.json').write_text(json.dumps(dict(frames=manifest, errors=errors, stall=STALL, notes=notes,
                                                        seconds=round(time.perf_counter() - t0, 1)), indent=1))
     print('SUMMARY frames', len(manifest), 'errors', len(errors), flush=True)
 
