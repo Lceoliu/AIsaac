@@ -71,7 +71,7 @@ def run_line(c, seq, form):
 
 
 def run_play(c, seq):
-    c._send({"cmd": "play", "actions": [action_code(*a) for a in seq], "repeat": 4, "stop_clear": False})
+    c._send({"cmd": "play", "actions": [action_code(*a) if a[5] else action_code(*a[:5]) for a in seq], "repeat": 4, "stop_clear": False})
     read_raw_after_ok(c)
 
 
