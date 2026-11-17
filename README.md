@@ -1,103 +1,108 @@
-# Isaac RL 训练场
+# AIsaac
 
-更新：2026-10-07（两台远端结果已同步）。
+用强化学习玩《以撒的结合》的研究仓库。训练直接在原版引擎上进行：用的是 Afterbirth+ v1.06 的原生 Linux 版，经一个 `LD_PRELOAD` 加速层改成无渲染、虚拟时钟、可 `fork` 克隆的环境。一台机器并行跑几十个游戏进程，GPU 上的 PPO 训练一个只看可见信息、打整局的策略。目标是一个能打完整局、最终超过人类玩家的 AI；现在离这个目标还很远。
 
-## 目标
+## 现状（2026-11-17）
 
-构建可迁移到原版以撒的完整流程 AI。先证明单房间战斗能力，再扩展探索、道具选择、资源管理和整局决策。策略推理只接收玩家可观察信息；视觉或内存只是采集手段，隐藏实体、内部 AI 状态、RNG 和未来事件不得进入策略输入。成绩只以原版引擎为准。
+- **当前主线**：单序列因果 transformer "seq-v1"，输入用兼容 Repentance 的新格式 visible-v3。设计已批准（[docs/SINGLE_TRANSFORMER_DESIGN.md](docs/SINGLE_TRANSFORMER_DESIGN.md)、[docs/VISIBLE_V3_DESIGN.md](docs/VISIBLE_V3_DESIGN.md)），代码还没写。
+- **参考基线**："旧模型"（逐帧 token transformer + 时间 transformer）。已核对的最好成绩：
+  - C99 从零训练 58,506 游戏小时，在 512 个留出种子的整局评估里平均过 **1.953** 层（±0.035），29% 的局到第四层以上；
+  - C100 把模型放大约 1.5 倍，25,005 游戏小时时 512 种子平均过 1.006 层；C99 在同样训练量（25,379 小时）时是 1.19；
+  - 以上见 [EXPERIMENTS.md](bridge/abplus/EXPERIMENTS.md) C99、C100。
+- **搁置**：block-memory v1（四 latent 分块记忆）。在 400 游戏小时的对照里，以"清房 ≥ 1 的局所占比例"为指标：
+  - 旧模型 0.483–0.506（C110）；
+  - block-memory 最好的一臂 0.253，阈值是 0.35（C113 rt-hf）。
 
-## 当前主线（2026-09-24 起）
+  11-17 起不再投入，代码保留。
+- **暂停或已结束**：Rust 模拟器、忏悔+ J460 桥与加速层、宏观规划工具、目标条件选项、Go-Explore、对战场、memory-chain v2 / v3。见文末"历史"。
 
-- **战斗 RL：原版 AB+ 引擎**（[bridge/abplus/](bridge/abplus/README.md)）
-  - 在《以撒的结合：胎衣†》v1.06 原生 Linux 版上，用加速后的原版引擎并行训练房间战斗策略（GPU PPO，Transformer 策略）。
-  - 全部实验至 C67、B17/第二阶段 B2 记在 [EXPERIMENTS.md](bridge/abplus/EXPERIMENTS.md)，开头有总览表。
-  - 进展：
-    - 瞄准课程（C22–C30）之后，无敌时普通房稳定清房（C31）。
-    - 阶段二从 C33 起去掉无敌，C37 以后主要在减少挨打。
-    - C38–C40 试了对战场自对弈，没有带来提升。
-    - C39 在第二台从头训练（combat-hp、四类房间、Room Buffer）。
-  - 远端机器、看板和各台部署的桥接版本见该 README 的"现状"。
-  - 10-01 至 10-03 的两日任务：RL 战斗加 A* 脚本导航加碰撞护盾，512 个留出种子第一层通关 31.8%（A18）。
-  - **10-03 起换方向**（用户要求：能随算力扩展的训练架构，最终超过人类玩家）。已将克隆采样、精简观测接入 token 策略和 PPO：
-    - 进程级 `fork` 把运行中的原版引擎克隆成逐帧相同的副本，房间内任意帧可以分支（A19）；
-    - 每决策耗时的分解、桥的精简模式和 fork 采样器（B9、B10）。
-  - **最新已核对结果（10-07）**：C64 最终在 256 个留出楼层中通过 180 个（70.3%，Boss 清除率同为 70.3%）；C67 整局训练已完成 3,000.1 游戏小时，最新已评估 u9600 在 32 局中平均过 1.125 层，最高到第 3 层，最终 u9885 尚未评估。两者任务和种子不同，不直接比较百分比。
-  - 第二阶段 B2 的分支数据和选择头训练已跑通；最新无 CRN/无快照实验的选择头训练准确率 84.5%、留出准确率 46.3%（41 例），尚未证明泛化收益。可核对的精简原始结果见 [远端结果快照](docs/archive/goal-conditioned/goal_conditioned/remote_results_20261007.json)。大模型权重和完整轨迹仅保存在本地忽略目录 `runs/sync-20261007/`，不随 Git 推送。
-- **宏观规划**（[macro/](macro/README.md)，设计见 [MACRO_PLANNING.md](docs/MACRO_PLANNING.md)）
-  - AB+ 楼层生成器的 Python 翻译，与引擎逐种子、逐房间一致；隐藏房推断、道具先验、规则规划器。
-  - 忏悔+ 生成器的静态移植（没有和引擎核对），以及网页"找隐藏房"和以撒小测试。
-- **可发布的 gym 仓库**（`../isaac-abplus-gym`，还没发布）：AB+ 环境加 PPO 基线，GPL-3.0，英文文档。
-- **外部评审报告**：[COMBAT_RL_EXPERT_REVIEW.md](docs/archive/2026-09-combat/COMBAT_RL_EXPERT_REVIEW.md)，截至 C37，含并行训练方案。
+## 怎么工作
 
-## 暂停的线
+结构见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。要点：
 
-| 项 | 状态 | 位置 |
+- **引擎与加速层**（`bridge/engine/abp_turbo.c`）：
+  - 虚拟时钟、跳过渲染、随机数重播；
+  - 进程级 `fork`：克隆体与父进程逐帧相同（A19）；
+  - 观测和步进的热路径在 C 里。
+- **桥**（`bridge/abplus/abp_bridge.lua`）：游戏内的 Lua，在 `127.0.0.1` 上接收 JSON 命令（重置、step、fork 等），回二进制观测。
+- **worker**：每个游戏实例一个进程，不导入 torch，每局是一个克隆体。
+  - 每个决策（4 个逻辑帧）写一条记录到共享内存；
+  - 动作晚一个决策生效。
+- **训练进程**（`bridge/python/train_tok.py`）：
+  - actor 批量推理（旧模型用 CUDA Graph，block 一套用 C++ driver）；
+  - learner 做 PPO，可以放到另一块卡上、与采样重叠；
+  - 多个分片同步梯度，组成一次训练。
+- **教师**：用克隆体回到受伤前或选择点，试别的走法，把更好的分支作为训练目标。共有三种：受伤回溯（C56）、教师 v2（B19）、反事实分支（B34）。克隆体知道未来，所以只用来产生训练目标，评估时不用。
+- **观测边界**：只有玩家看得到的信息进 actor；特权信息（例如真实楼层布局）只进 learner 的价值头。见 [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md)。
+
+## 仓库地图
+
+| 目录 | 内容 | 状态 |
 |---|---|---|
-| L2 Rust 单房间模拟器 + 128 环境 GPU PPO | 2026-09-21–24 的主线。u425 迁移到 AB+：模拟器胜率 19.1%，AB+ 0.4%；原因是模拟器缺少 Monstro 出场阶段，策略学会了开局炸弹（A2）。修不修待定 | [sim/](sim/)、[ENV_ARCHITECTURE.md](docs/archive/sim-era/ENV_ARCHITECTURE.md) |
-| 忏悔+（J460）原版桥接与 L1 加速 | 实机跑通；2/4 引擎共用模型训练，累计 512 局全部死亡；Windows 上三类原生崩溃的根因已查明。AB+ 路线接手后暂停 | [bridge/](bridge/README.md)、[turbo/](turbo/README.md)、[L1_FEASIBILITY_PLAN.md](docs/archive/j460/L1_FEASIBILITY_PLAN.md)、[NATIVE_CRASH_ANALYSIS.md](docs/archive/j460/NATIVE_CRASH_ANALYSIS.md) |
-| 真人录制与模仿学习 | 六局录制和首轮 BC 完成；BC 后额外 64 局胜率 13/64 → 1/64，没有替换策略；暂缓 | `record_human.ps1`、[ENV_ARCHITECTURE.md §0.13](docs/archive/sim-era/ENV_ARCHITECTURE.md#013-原版真人录制2026-09-23) |
-| 旧 v0 原型 `isaac_room/` | 已否定，见"历史原型" | [SINGLE_ROOM_V0.md](docs/archive/sim-era/SINGLE_ROOM_V0.md) |
+| `bridge/engine/` | 加速层 `abp_turbo.c`、实例启动脚本、C / C++ 原生组件 | 在用 |
+| `bridge/abplus/` | AB+ 的桥 `abp_bridge.lua`、房间目录、实验记录 `EXPERIMENTS.md` | 在用 |
+| `bridge/python/` | 训练 `train_tok.py`、评估 `eval_tok.py`、`isaac_bridge/` 包、探针和基准脚本、测试 | 在用；其中 `train_abplus.py` 一套是 9 月的旧管线 |
+| `bridge/ops/bm1/` | 多卡主机上的运行环境：容器、锁、计时、测试门、正式训练守护 | 在用 |
+| `bridge/ops/` 其余 | 过去实验的启动和测量脚本 | 历史记录 |
+| `docs/` | 项目说明、系统结构、设计文档；`docs/archive/` 是归档 | 在用 |
+| `macro/` | AB+ 楼层生成器（与引擎逐房间一致）、隐藏房推断、规划工具、网页小测试 | 已完成 |
+| `bridge/README.md`、`bridge/mod/isaac_rl_bridge/`、`turbo/` | 忏悔+ J460（Windows）的桥和加速层 | 暂停 |
+| `bridge/mod/isaac_human_recorder/` | 人类录制 mod 的旧副本；录制器已移到单独的仓库 isaac-run-recorder | 历史遗留 |
+| `sim/` | Rust 单房间模拟器 | 9 月起搁置 |
+| `isaac_room/`、`play.ps1`、`tests/` | 最早的自编规则原型和它的测试 | 已否定 |
+| `code-tests/` | 一个采样器读写竞争问题的复现脚本 | 历史 |
+
+## 上手
+
+需要准备：
+- 一台 Linux 机器，带 NVIDIA GPU（驱动支持 CUDA 12.8），以及 gcc / g++、xvfb、Python 3.10。
+- 自己的一份《以撒的结合：胎衣†》v1.06 Linux 版游戏文件。**游戏文件不在本仓库里。**
+  - 不要改动 Steam 安装目录，复制一份作为 runtime。
+  - runtime 的 `resources/scripts/main.lua` 要能用 `dofile(ABP_LUA)` 加载桥。做法写在工作区的逆向文档里，那份文档不在本仓库。
+
+步骤：
+1. **编加速层**：`gcc -shared -fPIC -O2 -o $ABP_HOME/tools/libabp_turbo.so bridge/engine/abp_turbo.c -ldl`。
+   - `ABP_HOME` 默认是 `~/isaac-abplus`；其中 `runtime/` 放游戏副本，`tools/` 还要放 `run_instance.sh` 和打桩表（见 [bridge/engine/README.md](bridge/engine/README.md)）。
+   - 用 bm1 时，`deploy.sh abphome` 会做这一步。
+2. **装依赖**：torch 2.7.1（cu128），再加上 `bridge/ops/bm1/env/requirements-bm1.txt`。
+3. **测试与冒烟**：在 bm1 里先跑 `gate.sh <树>`（全量测试），再跑 `UPDATES=2 ./prof.sh <tag> <树>`（两个更新的训练冒烟）。见 [bridge/ops/bm1/README.md](bridge/ops/bm1/README.md)。
+4. **训练与评估**：入口是 `bridge/python/train_tok.py` 和 `eval_tok.py`。
+   - 模式、奖励和开关见 [bridge/abplus/README.md](bridge/abplus/README.md)；
+   - 正式训练用 `train_guard.sh`，手册模板见 [bridge/ops/bm1/TRAINING.md](bridge/ops/bm1/TRAINING.md)。
 
 ## 文档
 
-| 文档 | 内容 | 状态 |
-|---|---|---|
-| [bridge/abplus/README.md](bridge/abplus/README.md)、[EXPERIMENTS.md](bridge/abplus/EXPERIMENTS.md) | AB+ 桥接、训练管线和用法；全部实验 | 当前 |
-| [macro/README.md](macro/README.md)、[MACRO_PLANNING.md](docs/MACRO_PLANNING.md) | 宏观层离线工具；路线规划与道具选择里规则、推断、搜索和学习的分工 | 当前 |
-| [COMBAT_RL_EXPERT_REVIEW.md](docs/archive/2026-09-combat/COMBAT_RL_EXPERT_REVIEW.md) | 给外部专家的进展汇总和并行训练方案 | 截至 C37（09-28） |
-| [PROJECT_SPEC.md](docs/archive/sim-era/PROJECT_SPEC-2026-09.md) | 目标、观测边界、分阶段设计 | 目标和观测边界仍有效；"当前主线"停在 09-23 |
-| [ENV_ARCHITECTURE.md](docs/archive/sim-era/ENV_ARCHITECTURE.md) | 三层环境栈（原版 / 加速 / 模拟器）与统一契约；模拟器训练、PPO 审查、真人录制 | 模拟器阶段（到 09-23） |
-| [RELATED_WORK.md](docs/RELATED_WORK.md) | 游戏 RL 的相关工作：结构化观测、并行环境与迁移 | 09-18 的调研 |
-| [TRAINING_ARENA_DESIGN.md](docs/archive/j460/TRAINING_ARENA_DESIGN.md)、[ARENA_RESEARCH_NOTES.md](docs/archive/j460/ARENA_RESEARCH_NOTES.md) | 把原版引擎做成训练场：参照项目和实施方案；原始调研笔记（每条附 URL） | 历史（J460 方案，09-20–22） |
-| [L1_FEASIBILITY_PLAN.md](docs/archive/j460/L1_FEASIBILITY_PLAN.md) | J460 原版加速的可行性方案和控制层 | 历史（09-19–20） |
-| [NATIVE_CRASH_ANALYSIS.md](docs/archive/j460/NATIVE_CRASH_ANALYSIS.md) | J460 worker 的原生崩溃根因与修复方案 | 历史（09-20） |
-| [bridge/README.md](bridge/README.md)、[turbo/README.md](turbo/README.md) | J460 桥接 mod 和加速层 | 暂停 |
-| [SINGLE_ROOM_V0.md](docs/archive/sim-era/SINGLE_ROOM_V0.md) | 旧 v0 原型的实现与自测 | 已否定 |
+| 文档 | 内容 |
+|---|---|
+| [docs/PROJECT_SPEC.md](docs/PROJECT_SPEC.md) | 目标、观测边界、立场、当前阶段、不做的事 |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 系统结构：每层的代码位置和对应实验 |
+| [docs/SINGLE_TRANSFORMER_DESIGN.md](docs/SINGLE_TRANSFORMER_DESIGN.md)、[docs/VISIBLE_V3_DESIGN.md](docs/VISIBLE_V3_DESIGN.md) | 当前主线的模型设计和输入格式设计 |
+| [bridge/abplus/EXPERIMENTS.md](bridge/abplus/EXPERIMENTS.md) | 全部实验 |
+| [bridge/abplus/README.md](bridge/abplus/README.md)、[bridge/ops/bm1/README.md](bridge/ops/bm1/README.md) | 训练入口的用法；运行环境 |
+| 其余 `docs/*.md` | 仍有效的专题设计：时间注意力、反事实教师、C++ actor、预测记忆、宏观规划、相关工作 |
+| [docs/archive/README.md](docs/archive/README.md) | 归档文档的索引 |
 
-引擎逆向和游戏机制的共用材料在 [../analysis/](../analysis/README.md)，例如 AB+ 引擎改造层 [ABP_LINUX_REVERSE_ENGINEERING.md](../analysis/docs/ABP_LINUX_REVERSE_ENGINEERING.md) 和游戏入门 [ISAAC_GAME_PRIMER.md](../analysis/docs/ISAAC_GAME_PRIMER.md)。
+## 实验记录
 
-## 构建 L2 内核
+所有实验只记在 [bridge/abplus/EXPERIMENTS.md](bridge/abplus/EXPERIMENTS.md)：
+- 每条分"实验目的 / 实验方法 / 实验结果"三段，开头有总览表；
+- 编号：A 桥与环境，B 性能与稳定性，C 奖励与训练，各自按时间递增；
+- 训练量用游戏小时（逻辑帧 ÷ 30 ÷ 3600）表示，速度用相对实时的倍率；
+- 其他文档只引用编号，不抄数字。
 
-`cargo` 不在 PATH 上；用 [sim/build.ps1](sim/build.ps1)（复用 `D:\Projects\fortune\.tooling` 的便携 GNU 工具链，与 `netfix/scripts/build_rust.ps1` 同一套环境）：
+## 历史
 
-```powershell
-.\rl\sim\build.ps1            # cargo test
-.\rl\sim\build.ps1 run --example gaper_chase
-.\rl\sim\build.ps1 run --example player_shoot
-.\rl\sim\build.ps1 run --release --example bench
-```
+| 线 | 时间（2026） | 状态 | 文档 |
+|---|---|---|---|
+| 自编规则原型 `isaac_room/` | 09-19 前 | 已否定 | [SINGLE_ROOM_V0.md](docs/archive/sim-era/SINGLE_ROOM_V0.md) |
+| 忏悔+ J460 原版桥与加速层 | 09-19 – 09-22 | 暂停 | [bridge/README.md](bridge/README.md)、[turbo/README.md](turbo/README.md)、[归档索引](docs/archive/README.md) |
+| Rust 模拟器 + GPU PPO | 09-21 – 09-24 | 搁置：迁移到原版后胜率从 19.1% 掉到 0.4%（A2） | [ENV_ARCHITECTURE.md](docs/archive/sim-era/ENV_ARCHITECTURE.md) |
+| AB+ 房间战斗（`train_abplus.py`） | 09-24 – 10-03 | 被 token 策略取代 | [abplus-README-2026-10.md](docs/archive/abplus-README-2026-10.md)、[COMBAT_RL_EXPERT_REVIEW.md](docs/archive/2026-09-combat/COMBAT_RL_EXPERT_REVIEW.md) |
+| 目标条件选项、碰撞护盾、Go-Explore、对战场 | 09-28 – 10-03 | 结束 | [GOAL_CONDITIONED_DESIGN.md](docs/archive/goal-conditioned/GOAL_CONDITIONED_DESIGN.md)；A6–A8、A17、C38–C54 |
+| 宏观规划与楼层生成器 | 09-25 起 | 已完成 | [macro/README.md](macro/README.md)、[MACRO_PLANNING.md](docs/MACRO_PLANNING.md) |
+| token 策略 + fork 训练器（旧模型） | 10-03 – 10-19 | 参考基线 | [TEMPORAL_ATTENTION.md](docs/TEMPORAL_ATTENTION.md)、[COUNTERFACTUAL_TEACHER.md](docs/COUNTERFACTUAL_TEACHER.md)；C55–C104 |
+| memory-chain v2 / v3 | 10 月下旬 – 11-06 | 被 block-memory 取代 | [PROJECT_SPEC.block-memory-v1.md](docs/archive/block-memory-v1/PROJECT_SPEC.block-memory-v1.md) §9.9–9.11 |
+| block-memory v1 + C++ actor | 11-06 – 11-17 | 搁置 | [PROJECT_SPEC.block-memory-v1.md](docs/archive/block-memory-v1/PROJECT_SPEC.block-memory-v1.md)、[B50_CPP_ACTOR_DESIGN.md](docs/B50_CPP_ACTOR_DESIGN.md)；B41–B62、C105–C113 |
+| seq-v1 on visible-v3 | 11-17 起 | 主线，设计阶段 | [SINGLE_TRANSFORMER_DESIGN.md](docs/SINGLE_TRANSFORMER_DESIGN.md) |
 
-## 构建 L1 加速层
-
-```powershell
-pwsh -NoProfile -File .\rl\turbo\build.ps1     # DLL + 注入器 + 离线测试 + exe 字节核对
-python .\rl\bridge\python\test_turbo_control.py  # Python 端共享内存双向测试
-```
-
-## 模拟器阶段的记录（2026-09-21–24）
-
-AB+ 路线开始前的主线，细节都在 [ENV_ARCHITECTURE.md](docs/archive/sim-era/ENV_ARCHITECTURE.md)：
-- **手感测试**：`pwsh -File sim/play_motion.ps1`，WASD 移动、方向键射击、R 复位、F1 显示碰撞圈；`-Monstro -Seed 42` 打 Monstro。展示用已有的解包原图，动力学走同一个 Rust 内核。普通 Monstro 的接近小跳、高跳锁定格子、落地环射、Taunt 前摇扇形喷弹和弹幕高度碰撞已实现，同 seed + 同输入可复现（[§0.6](docs/archive/sim-era/ENV_ARCHITECTURE.md#06-monstro-接入与可见观测2026-09-21)）。
-- **Ubuntu 训练**：`/home/eolc/isaac-rl`，RTX 3080 Ti，128 环境 GPU PPO（部署验收时完整 PPO 更新约 287 条新 transition/s，峰值 CUDA 2.39 GiB），GPU 常驻原始帧和 rollout（[§0.9](docs/archive/sim-era/ENV_ARCHITECTURE.md#09-gpu-原始帧rollout-与冻结编码缓存2026-09-22已实现)），每 10 轮 checkpoint、固定留出种子评估（[§0.11](docs/archive/sim-era/ENV_ARCHITECTURE.md#011-checkpoint断点续训与固定留出评估2026-09-22)）。`python bridge/python/train_sim.py` 默认只展示配置，`--train` 才开训；`--pipeline legacy` 保留 CPU 对照。
-- **PPO 审查**：旧实验 `monstro-128k-reward-v1-20260923`（batch 32 × 4 epochs）每轮更新过大（精确 KL 约 0.14），在 256 个未见种子上从第 425 轮的 19% 退到第 750 轮的 7%，不是 reward hacking（[§0.14](docs/archive/sim-era/ENV_ARCHITECTURE.md#014-当前阶段与-claude-只读审查交接2026-09-23)，`runs/ppo-audit/20260923-e1e2/`）。
-- **最后一次模拟器训练**：`monstro-128k-seg1024-20260923`，09-23 21:29 从第 425 轮续训，batch 1024 × 2 epochs、帧去重分段、训练开局随机化、熵 0.01（[§0.15](docs/archive/sim-era/ENV_ARCHITECTURE.md#015-更新量帧去重与训练开局随机化2026-09-23已上线)）。09-24 它的 u8110 被用作 AB+ 第一次训练的热启动（EXPERIMENTS.md C2）。
-- **迁移到原版**：同种子配对评估 u425，模拟器胜率 19.1%，AB+ 0.4%（A2）。修复办法是给模拟器的 Monstro 加出场阶段，待定。
-- **真人录制**：`pwsh -File record_human.ps1` 启动独立的原版游戏副本和 http://127.0.0.1:8764 侧边面板，F6 倒数开始、F7 保存并重置、F8 结束；正式样本在 `runs/human/`，验收样本在 `runs/human-recorder-qa/`（[§0.13](docs/archive/sim-era/ENV_ARCHITECTURE.md#013-原版真人录制2026-09-23)）。
-  - 数据处理：`python -m isaac_bridge.human_recording SESSION --prepare-to NEW-DIRECTORY --validation-episode episode-0006.jsonl.gz`。
-  - BC：`python bridge/python/train_human_bc.py --checkpoint CHECKPOINT --dataset DATASET --out NEW-DIRECTORY --run`，须设 `PYTHONPATH=bridge/python`。
-
-## 复用边界
-
-- [分析区](../analysis/README.md)：帧循环、ZHL 命名表、资源索引等共用游戏事实。
-- [NetFix](../netfix/README.md)：注入器、MinHook 接线、J460 地址档案与启动/日志经验，供 L1 复用；不以其未完成的任意帧恢复作为前置条件。
-- [第三方区](../third_party/README.md)：REPENTOGON 只作 ABI/特征码参考，不能在 J460 上运行。
-
-## 历史原型（已否定，仅记录）
-
-`isaac_room/` 是 2026-09-19 之前写的通用射击原型：固定 60 Hz、自编敌人、几何绘图，没有使用任何原版资源或机制。它可以运行（`play.ps1`、`python -m isaac_room.benchmark`），37 项自测和 24/24 脚本清房只验证自编规则，不构成以撒仿真的验收。细节见 [SINGLE_ROOM_V0.md](docs/archive/sim-era/SINGLE_ROOM_V0.md)。
-
-## Git 管理
-
-`Isaac/rl` 为独立本地Git仓库，与 `Isaac/netfix` 分开；没有配置远程，也没有推送。跟踪桥接/训练/原生控制层代码、测试、观测fixture、设计文档，以及已明确标为历史的模拟器代码。`runs/`、模型/转储/日志、依赖目录、Rust target及原生build产物不入库。
-
-本仓库仍依赖工作区的 `../third_party/minhook`、`../../.tools` 工具链及 `../analysis` 机制材料；首次提交不表示已成为可单独克隆构建的发行包。先保留依赖关系，不复制第三方或游戏资源进本仓库。
+游戏的图像、音频和程序文件都不包含在本仓库里。
