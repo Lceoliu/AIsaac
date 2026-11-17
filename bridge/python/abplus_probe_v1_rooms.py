@@ -75,6 +75,20 @@ for i = 0, n - 1 do
   out.gcoll[#out.gcoll + 1] = try(function() return room:GetGridCollision(i) end)
 end
 out.first_inside, out.last_inside = first, last
+out.sizes = SIZES   -- bit k of inside[i] = IsPositionInRoom(GetGridPosition(i), sizes[k])
+-- GetGridIndex along the row through the middle row's cells and the column through the middle column's, from 90 px
+-- before the grid's first edge to 90 px past its last (2.5 px steps): {coordinate, index}
+do
+  local o = room:GetGridPosition(0)
+  local ox, oy = o.X - 20, o.Y - 20
+  local my = room:GetGridPosition((gh // 2) * gw).Y
+  local mx = room:GetGridPosition(gw // 2).X
+  out.sweep = { row_y = my, col_x = mx, x = {}, y = {} }
+  local x = ox - 90
+  while x <= ox + 40 * gw + 90 do out.sweep.x[#out.sweep.x + 1] = { x, room:GetGridIndex(Vector(x, my)) }; x = x + 2.5 end
+  local y = oy - 90
+  while y <= oy + 40 * gh + 90 do out.sweep.y[#out.sweep.y + 1] = { y, room:GetGridIndex(Vector(mx, y)) }; y = y + 2.5 end
+end
 out.corner_cells = {}
 for _, c in ipairs({ 0, gw - 1, (gh - 1) * gw, n - 1 }) do
   local q = room:GetGridPosition(c)
@@ -136,8 +150,11 @@ for i = 0, room:GetGridSize() - 1 do   -- a coin at a known offset (+7, +13) fro
 end
 local ents = {}
 for _, e in ipairs(Isaac.GetRoomEntities()) do
+  local sp = e:GetSprite()
   ents[#ents + 1] = { type = e.Type, variant = e.Variant, subtype = e.SubType, x = e.Position.X, y = e.Position.Y,
-    gi = room:GetGridIndex(e.Position), enemy = e:IsActiveEnemy(false), seed = e.InitSeed }
+    gi = room:GetGridIndex(e.Position), enemy = e:IsActiveEnemy(false), seed = e.InitSeed, visible = e.Visible,
+    size = e.Size, depth = e.DepthOffset, file = sp and sp:GetFilename() or false,
+    collision = e.EntityCollisionClass, frame = e.FrameCount }
 end
 return json.encode({ entities = ents, spawned = spawned })
 """
@@ -275,7 +292,9 @@ def sizes_pass(inst, chars, seed, sf):
             inst.reset(seed)
             rec = lua_json(b, ROOM_LUA)
             sf.write(json.dumps(dict(char=char, seed=seed, psize=rec.get('psize'), ptype=rec.get('ptype'),
-                                     shape=rec.get('shape'), inside=rec.get('inside'))) + '\n')
+                                     shape=rec.get('shape'), sizes=list(SIZES), inside=rec.get('inside'),
+                                     inside_note='bit k of inside[i] = IsPositionInRoom(GetGridPosition(i), sizes[k])'))
+                     + '\n')
         except Exception as e:   # reported
             sf.write(json.dumps(dict(char=char, seed=seed, error=f'{type(e).__name__}: {e}')) + '\n')
             inst.relaunch(hard=True)
