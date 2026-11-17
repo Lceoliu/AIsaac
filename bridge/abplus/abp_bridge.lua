@@ -2045,6 +2045,10 @@ local function v3_body(p, index, role, n_players, cfg_players)
 	local bone_bits, weapon_bits = 0, 0
 	for i = 0, 23 do
 		if v3_try(function() return p:IsBoneHeart(i) end, false) then bone_bits = bone_bits | (1 << i) end
+	end
+	-- HasWeaponType only over AB+'s WeaponType range 0..10 (an id past it reads past the engine's table: the Forgotten
+	-- sub-player's bit 11 differed between two runs of the same state, golden7 / golden8); the bits above stay 0
+	for i = 0, 10 do
 		if v3_try(function() return p:HasWeaponType(i) end, false) then weapon_bits = weapon_bits | (1 << i) end
 	end
 	local charge, charge_known = 0, 0
