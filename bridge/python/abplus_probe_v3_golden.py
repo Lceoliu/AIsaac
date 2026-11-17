@@ -87,12 +87,12 @@ DOOR_START = """
 local room = Game():GetRoom()
 local p = Isaac.GetPlayer(0)
 local inward = { [0] = { 40, 0 }, [1] = { 0, 40 }, [2] = { -40, 0 }, [3] = { 0, -40 } }
-for slot = 0, 3 do
-  if room:IsDoorSlotAllowed(slot) and room:GetDoor(slot) then
-    local q = room:GetDoorSlotPosition(slot)
-    p.Position = Vector(q.X + inward[slot][1], q.Y + inward[slot][2]); p.Velocity = Vector(0, 0)
-    return string.format('%d,%.4f,%.4f', slot, q.X, q.Y)
-  end
+local slot = %d
+local d = room:GetDoor(slot)
+if room:IsDoorSlotAllowed(slot) and d then
+  local q = room:GetDoorSlotPosition(slot)
+  p.Position = Vector(q.X + inward[slot][1], q.Y + inward[slot][2]); p.Velocity = Vector(0, 0)
+  return string.format('%%d,%%.4f,%%.4f,%%d', slot, q.X, q.Y, d:IsOpen() and 1 or 0)
 end
 return 'none'
 """
@@ -196,23 +196,28 @@ def main():
             idle(c, 10)
 
         def doorframe(c):
-            slot, qx, qy = c.lua(DOOR_START).split(',')
-            slot = int(slot)
-            here0 = c.lua(PLAYER_CELL).split(',')[2]
             g0 = json.loads(c.lua(ENGINE_LUA))['g0']
-            dc, dr = math.floor((float(qx) - g0[0] + 20) / 40), math.floor((float(qy) - g0[1] + 20) / 40)
-            trail = []
-            for k in range(90):
-                c.step({'move': MOVE_INTO[slot]}, repeat=1)
-                col, row, here = c.lua(PLAYER_CELL).split(',')
-                trail.append((int(col), int(row)))
-                if here != here0:
-                    raise RuntimeError(f'left the room after {k + 1} frames before reaching the door cell')
-                if (int(col), int(row)) == (dc, dr):
-                    notes['doorframe'] = f'slot {slot}, door cell ({dc}, {dr}), reached after {k + 1} frames'
-                    return
-            raise RuntimeError(f'the door cell ({dc}, {dr}) of slot {slot} not reached in 90 frames: {trail[:3]} .. '
-                               f'{trail[-3:]}')
+            here0 = c.lua(PLAYER_CELL).split(',')[2]
+            tried = []
+            for slot in range(4):
+                got = c.lua(DOOR_START % slot)
+                if got == 'none':
+                    continue
+                _, qx, qy, is_open = got.split(',')
+                dc, dr = math.floor((float(qx) - g0[0] + 20) / 40), math.floor((float(qy) - g0[1] + 20) / 40)
+                trail = []
+                for k in range(90):
+                    c.step({'move': MOVE_INTO[slot]}, repeat=1)
+                    col, row, here = c.lua(PLAYER_CELL).split(',')
+                    trail.append((int(col), int(row)))
+                    if here != here0:
+                        raise RuntimeError(f'slot {slot}: left the room after {k + 1} frames before the door cell')
+                    if (int(col), int(row)) == (dc, dr):
+                        notes['doorframe'] = (f'slot {slot} (open {is_open}), door cell ({dc}, {dr}), reached after '
+                                              f'{k + 1} frames; slots tried before: {tried}')
+                        return
+                tried.append((slot, is_open, (dc, dr), trail[-1]))
+            raise RuntimeError(f'no door cell reached: {tried}')
         case('doorframe', 'the player in a door frame (its formula cell is the door cell)', doorframe)
         case('longlived', 'a coin 600 frames old (age clamp)', lambda c: (c.lua(SPAWN_COIN), idle(c, 600)))
         def devil(c):
