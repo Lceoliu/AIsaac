@@ -1995,7 +1995,7 @@ local function v3_body(p, index, role, n_players, cfg_players)
 	end
 	local charge, charge_known = 0, 0
 	if index ~= nil and type(abp_player_charge) == "function" then charge, charge_known = abp_player_charge(index) or 0, 1 end
-	return { entity_index = p.Index, x = pos.X, y = pos.Y, vx = vel.X, vy = vel.Y, size = p.Size,
+	return { entity_index = p.Index, init_seed = p.InitSeed, x = pos.X, y = pos.Y, vx = vel.X, vy = vel.Y, size = p.Size,
 		hearts = p:GetHearts(), max_hearts = p:GetMaxHearts(), soul = p:GetSoulHearts(), bone = p:GetBoneHearts(),
 		eternal = p:GetEternalHearts(), golden = p:GetGoldenHearts(), broken = 0, rotten = 0,
 		extra_lives = p:GetExtraLives(), coins = p:GetNumCoins(), bombs = p:GetNumBombs(), keys = p:GetNumKeys(),
@@ -2011,28 +2011,30 @@ local function v3_body(p, index, role, n_players, cfg_players)
 end
 
 local function v3_bodies(game)
-	local bodies, seen = {}, {}
+	-- de-duplicated by InitSeed (a sub-player shares its main body's Index on AB+: the golden frames, 2026-11-17)
+	local bodies, players, seen = {}, {}, {}
 	local n = game:GetNumPlayers()
 	for i = 0, n - 1 do
 		local p = Isaac.GetPlayer(i)
-		if not seen[p.Index] then
-			seen[p.Index] = true
+		if not seen[p.InitSeed] then
+			seen[p.InitSeed] = #bodies + 1
 			bodies[#bodies + 1] = v3_body(p, i, 1)
+			players[#players + 1] = p
 		end
 	end
 	for i = 0, n - 1 do   -- the sub-players (the Forgotten / the Soul), after every player; linked both ways
 		local p = Isaac.GetPlayer(i)
 		local sub = v3_try(function() return p:GetSubPlayer() end, nil)
-		if sub ~= nil and not seen[sub.Index] then
-			seen[sub.Index] = true
+		if sub ~= nil and not seen[sub.InitSeed] then
+			seen[sub.InitSeed] = #bodies + 1
 			bodies[#bodies + 1] = v3_body(sub, nil, 3)
-			local main = nil
-			for k, b in ipairs(bodies) do if b.entity_index == p.Index then main = k end end
+			players[#players + 1] = sub
+			local main = seen[p.InitSeed]
 			bodies[#bodies].linked = main
 			if main then bodies[main].linked = #bodies end
 		end
 	end
-	return bodies
+	return bodies, players
 end
 
 local function v3_entities(room, curses)
@@ -2176,17 +2178,13 @@ local function v3_map(level, here)
 	return out
 end
 
-local function v3_items(bodies)
+local function v3_items(players)
 	local game, config = Game(), Isaac.GetItemConfig()
 	local pool = game:GetItemPool()
 	local inventory, slots = {}, {}
-	for b, rec in ipairs(bodies) do
+	for b, p in ipairs(players) do
 		local owner = b - 1
-		local p = nil
-		for _, e in ipairs(Isaac.FindByType(1, -1, -1, false, false)) do
-			if e.Index == rec.entity_index then p = e:ToPlayer() end
-		end
-		if p then
+		do
 			for id = 1, config:GetCollectibles().Size - 1 do
 				local count = p:GetCollectibleNum(id)
 				if count > 0 then inventory[#inventory + 1] = { owner, id, count } end
@@ -2227,9 +2225,9 @@ function visible_v3_raw()
 	local g0 = room:GetGridPosition(0)
 	local curses = level:GetCurses()
 	local here = v3_try(function() return level:GetCurrentRoomDesc().SafeGridIndex end, -1)
-	local bodies = v3_bodies(game)
+	local bodies, players = v3_bodies(game)
 	local cells, doors = v3_cells(room, level)
-	local inventory, slots = v3_items(bodies)
+	local inventory, slots = v3_items(players)
 	return json.encode({ schema = "isaac-visible-raw-v3", version = 2026111702, game_version = 1, control_scheme = 0,
 		origin = { g0.X - 20, g0.Y - 20 }, gw = room:GetGridWidth(), gh = room:GetGridHeight(),
 		room_type = room:GetType(), shape = room:GetRoomShape(), stage = level:GetStage(),
