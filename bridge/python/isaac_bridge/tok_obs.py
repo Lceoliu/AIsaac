@@ -397,7 +397,15 @@ def _minimap(o, st):
 def encode_row(o, st, row, t):
     """Write the lean observation `o` into row (a length-1 view of a ROW array). Sets everything but episode, seed,
     group and first. Returns the done code."""
-    if getattr(o,'visible',None) is not None:
+    vis = getattr(o, 'visible', None)
+    v3 = False
+    if vis is not None and isinstance(vis, dict) and vis.get('schema') == 'isaac-visible-raw-v3':
+        # visible-v3 (package C, ISAAC_RL_VISIBLE_V3=1): the reference encoder; the stall columns after the progress
+        # update below (v3_backfill_stall)
+        from .visible_producer import observation_frame_v3, write_frame_v3
+        write_frame_v3(row, observation_frame_v3(vis))
+        v3 = True
+    elif vis is not None:
         from .structured_input import write_frame
         from .visible_native import frame   # B45: the C encoder (observation_frame's bytes) when available
         write_frame(row,frame(o))
@@ -552,6 +560,10 @@ def encode_row(o, st, row, t):
             3 if (t >= st.limit or stalled) else 0
     else:
         done = 2 if o.dead else 1 if o.clear else 3 if t >= st.limit else 0
+    if v3:   # P 40 / 53: the share of the stall limit used up, with this record's progress counted
+        from .visible_producer import v3_backfill_stall
+        known = st.floor and st.stall > 0
+        v3_backfill_stall(row, min((t - st.progress_t) / st.stall, 1.0) if known else 0.0, 1.0 if known else 0.0)
     row['t'], row['done'] = t, done
     if st.items or st.run:
         _items_step(st, row, room[5], float(p['active']), float(p['active_charge']), inv_events)
@@ -688,6 +700,9 @@ def fast_row_function(path):
     return _LIBS[path]
 
 
+_VISIBLE_V3 = os.environ.get('ISAAC_RL_VISIBLE_V3', '0') == '1'
+
+
 class FastRow:
     """One episode's records through abp_row_encode (fn from fast_row_function). encode(item, row, row_address, t):
     item is a raw lean payload (bytes) or a LeanObs; returns the done code like encode_row and sets self.hurt (half
@@ -726,6 +741,8 @@ class FastRow:
 
     def encode(self, item, row, row_address, t):
         c = self.ctx
+        if type(item) is bytes and _VISIBLE_V3:   # (visible-v3: abp_row_encode does not know the v3 block yet)
+            item = self.decoder.decode(item)
         if type(item) is bytes:
             c[RC_T] = t
             c[RC_FIRST] = t == 0
