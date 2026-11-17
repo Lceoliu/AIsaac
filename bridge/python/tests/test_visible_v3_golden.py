@@ -1,5 +1,5 @@
 """visible-v3 golden frames (V2 / F3, package C, 2026-11-17; tests/fixtures/visible_v3, from abplus_probe_v3_golden.py
-on AB+, 184 golden5): 19 real frames -- every RoomShape 1-12, the off-grid Homunculus part 228.10, a
+on AB+, 184 golden6): 19 real frames -- every RoomShape 1-12, the off-grid Homunculus part 228.10, a
 player in a door frame, a coin 600 frames old, a devil room's negative prices, a shooting player, the Forgotten with
 the Soul (Forgotten controlled; Soul controlled). Each: the raw block (abp_bridge.lua visible_v3_raw), the reference encoder's bytes, the engine values read
 apart. Here: the bytes are reproduced from the raw block (the reference encoder unchanged), and every body's and sent
@@ -72,3 +72,4 @@ def test_the_special_cases():
     assert [int(r[V3.col(P, 'ptype')]) - 2 for r in soul['P']] == [17, 16]      # (the room entity is the Soul now)
     assert [int(r[V3.col(P, 'position_known')]) for r in soul['P']] == [1, 0]
     assert any(int(r[0]) == 3 and int(r[1]) == 900 for r in soul['E'])           # the Forgotten's body, a familiar
+    assert not any(int(r[0]) == 1000 and int(r[1]) == 114 for r in soul['E'])   # the chain: decorative
