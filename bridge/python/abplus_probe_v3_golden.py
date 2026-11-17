@@ -135,7 +135,7 @@ def capture(c, name, out, manifest, covers):
     # (the native encoder's frame of the same state, when the library has it: <name>.native.bin, for the stage checks;
     #  not a fixture)
     hexf = c.lua("if type(abp_native_v3) ~= 'function' then return 'nil:none' end "
-                 "local f, why = abp_native_v3(V3_MAP_BYTES()) if not f then return 'nil:' .. tostring(why) end "
+                 "local f, why = abp_native_v3(V3_MAP_BYTES(), V3_LASER_BYTES()) if not f then return 'nil:' .. tostring(why) end "
                  "return (f:gsub('.', function(ch) return string.format('%02x', ch:byte()) end))")
     if hexf and not hexf.startswith('nil:'):
         (out / f'{name}.native.bin').write_bytes(bytes.fromhex(hexf))

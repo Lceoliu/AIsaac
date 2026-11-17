@@ -1,7 +1,7 @@
 // visible-v3 native frame (package C, 2026-11-17; included by abp_turbo.c just before obs_init, so it uses the
 // native observation's helpers: FN / G0 / G1 / FIELD, the OBS_FUNC_LIST getters, obs_dyncast, vis_*).
 //
-// Lua: frame = abp_native_v3(map) -- the v3 frame bytes (schema_v3.py, abp_schema_v3.h) exactly as
+// Lua: frame = abp_native_v3(map, lasers) -- the v3 frame bytes (schema_v3.py, abp_schema_v3.h) exactly as
 // visible_producer.observation_frame_v3(visible_v3_raw()) gives them, built here from the same engine functions the
 // bridge's Lua code calls; or nil, why (the bridge then sends its Lua raw block). Every column number, size, range and
 // the decorative list come from the generated header: nothing hand-written twice.
@@ -316,7 +316,9 @@ static void v3_body_row(const v3_room *r, const v3_body_t *bd, int bi, float *P,
 }
 
 // Stage 3: the entities (visible_v3_raw's v3_entities; observation_frame_v3's priority cap, E rows, overflow counts).
-// A laser hands the frame back (the Lua block is sent for that step: its geometry getters are not read here yet).
+// A laser's geometry comes from the bridge (abp_native_v3's second argument: laser_record's values per laser, 53 bytes:
+// InitSeed u32, circle u8, radius, angle (degrees), length, end x, end y (doubles), TearFlags i64), found by InitSeed;
+// a laser missing there hands the frame back.
 typedef struct {
     const void *e;
     int prio, idx;
@@ -393,7 +395,6 @@ static const char *v3_select(const v3_room *r, const v3_body_t *bodies, int n_bo
         if (t == 1 || !gbool(FN(E_VISIBLE), e)) continue;
         float cdmg = G0(float, E_CDMG, e);
         if (t == 1000 && v3_is_decorative((int)G0(uint32_t, E_VARIANT, e)) && cdmg == 0) continue;
-        if (t == 7) return "v3: laser";
         const void *npc;
         int kind = v3_kind(e, t, &npc);
         int f = kind == 6 ? v3_npc_flags(e) : 0;
@@ -413,6 +414,10 @@ static const char *v3_select(const v3_room *r, const v3_body_t *bodies, int n_bo
     *n_out = n < ABP_V3_CAP_ENTITY ? n : ABP_V3_CAP_ENTITY;
     return NULL;
 }
+
+#define V3_LASER_REC 53
+static const unsigned char *v3_lasers;
+static size_t v3_lasers_len;
 
 static const char *v3_entity_row(const v3_room *r, const void *e, uint32_t curses, float *E) {
     int t = G0(int, E_TYPE, e);
@@ -456,6 +461,30 @@ static const char *v3_entity_row(const v3_room *r, const void *e, uint32_t curse
     } else if (t == 4) {
         const void *x = obs_dyncast(e, ti_entity, ti_bomb, -1);
         if (x) tear = ((uint64_t (*)(const void *))V3FN(V3_BOMB_FLAGS))(x);   // (Lua: pcall, 0 without a bomb)
+        flags_known = 4 | 1;
+    } else if (t == 7) {
+        uint32_t seed = v3_seed(e);
+        const unsigned char *rec = NULL;
+        for (size_t at = 0; at + V3_LASER_REC <= v3_lasers_len; at += V3_LASER_REC) {
+            uint32_t s_;
+            memcpy(&s_, v3_lasers + at, 4);
+            if (s_ == seed) rec = v3_lasers + at;
+        }
+        if (!rec) return "v3: a laser not in the bridge's list";
+        double radius, angle, length, ex, ey;
+        int64_t tf;
+        memcpy(&radius, rec + 5, 8); memcpy(&angle, rec + 13, 8); memcpy(&length, rec + 21, 8);
+        memcpy(&ex, rec + 29, 8); memcpy(&ey, rec + 37, 8); memcpy(&tf, rec + 45, 8);
+        double rad = angle * (3.141592653589793238462643383279502884 / 180.0);   // (Lua's math.rad)
+        E[ABP_V3_E_L_COS] = (float)cos(rad); E[ABP_V3_E_L_SIN] = (float)sin(rad);
+        E[ABP_V3_E_L_LEN] = (float)length; E[ABP_V3_E_L_RADIUS] = (float)radius;
+        if (rec[4]) {   // a circle laser: its end point is its own position
+            E[ABP_V3_E_L_CIRCLE] = 1;
+            E[ABP_V3_E_L_EX] = (float)((double)pos.x - r->ox); E[ABP_V3_E_L_EY] = (float)((double)pos.y - r->oy);
+        } else {
+            E[ABP_V3_E_L_EX] = (float)(ex - r->ox); E[ABP_V3_E_L_EY] = (float)(ey - r->oy);
+        }
+        tear = (uint64_t)tf;
         flags_known = 4 | 1;
     } else if (t == 5) {
         const void *x = obs_dyncast(e, ti_entity, ti_pickup, 0);
@@ -705,6 +734,8 @@ static int v3_lua(lua_State *L) {
     size_t n = 0, map_len = 0;
     const unsigned char *map = (const unsigned char *)((const char *(*)(lua_State *, int, size_t *))V3FN(V3_TOLSTRING))(L, 1, &map_len);
     if (!map) return obs_fallback(L, "v3: no map block");
+    v3_lasers = (const unsigned char *)((const char *(*)(lua_State *, int, size_t *))V3FN(V3_TOLSTRING))(L, 2, &v3_lasers_len);
+    if (!v3_lasers) v3_lasers_len = 0;
     const char *why = v3_build(map, map_len, &n);
     if (why) {
         v3_fallbacks++;
