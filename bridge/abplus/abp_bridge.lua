@@ -1958,11 +1958,63 @@ end
 -- positions as the engine gives them (the encoder subtracts the canvas origin, sent here as origin = GetGridPosition(0)
 -- - (20, 20)); flag integers as 16-bit words (exact through the JSON encoder); entity kind raw 0..9 (the encoder writes
 -- kind + 1). Not on the lean payload yet (the probe and the fixtures call it through the lua command).
-local V3_DECORATIVE = {}   -- effect variants never sent (the recorder's fx_omit list, Rep numbering = AB+ below 60)
-for _, v in ipairs({ 2, 3, 4, 5, 7, 11, 12, 13, 14, 15, 16, 17, 18, 21, 27, 33, 35, 38, 41, 43, 50, 58, 62, 63, 64,
-	66, 68, 69, 70, 75, 77, 79, 80, 85, 86, 87, 88, 95, 98, 99, 121, 130, 131, 132, 133, 135, 138, 140, 145 }) do
-	V3_DECORATIVE[v] = true
-end
+-- Decorative effects, never sent (schema_v3 convention, the coordinator 2026-11-17): only effects that take no part in
+-- collisions, deal no damage, and whose position another sent entity already gives or that bear on no decision;
+-- anything uncertain is sent (and reported). Each with why; AB+ numbering = Rep below 118, 118+ Rep only. From the
+-- recorder's fx_omit list, without 121 LIGHT and 138 MIST (Rep: they change what is visible -- sent, reported),
+-- with 114 FORGOTTEN_CHAIN. Kept only while CollisionDamage is 0 (v3_entities). visible_producer.V3_DECORATIVE: the same.
+local V3_DECORATIVE_SPEC = {
+	[2] = "BLOOD_EXPLOSION: the splash of a death: drawn after the kill, no collision, no damage",
+	[3] = "FLY_EXPLOSION: the splash of a fly dying: after the kill, no collision, no damage",
+	[4] = "ROCK_PARTICLE: debris of a broken rock: the rock cell is in the room canvas",
+	[5] = "BLOOD_PARTICLE: blood debris of a hit: no collision, no damage",
+	[7] = "BLOOD_SPLAT: a blood stain on the floor: no collision, no damage",
+	[11] = "BULLET_POOF: the poof of a projectile ending: the projectile itself was sent",
+	[12] = "TEAR_POOF_A: the poof of a tear ending: the tear itself was sent",
+	[13] = "TEAR_POOF_B: the poof of a tear ending: the tear itself was sent",
+	[14] = "CROSS_POOF: a poof animation: no collision, no damage",
+	[15] = "POOF01: a poof animation (spawn / death): no collision, no damage",
+	[16] = "POOF02: a poof animation (spawn / death): no collision, no damage",
+	[17] = "POOF04: a poof animation (spawn / death): no collision, no damage",
+	[18] = "BOMB_CRATER: the scorch mark a bomb leaves: no collision, no damage",
+	[21] = "TINY_BUG: ambient critter: no collision, no damage",
+	[27] = "WOOD_PARTICLE: debris of a broken object: no collision, no damage",
+	[33] = "TINY_FLY: ambient critter: no collision, no damage",
+	[35] = "TOOTH_PARTICLE: debris of a hit: no collision, no damage",
+	[38] = "SPIDER_EXPLOSION: the splash of a spider dying: after the kill, no collision",
+	[41] = "WATER_DROPLET: a drop falling from the ceiling (V1: above the grid): no collision, no damage",
+	[43] = "POOP_EXPLOSION: debris of a broken poop: the poop cell is in the room canvas",
+	[50] = "LASER_IMPACT: the flash where a laser hits: the laser itself (and its end point) was sent",
+	[58] = "POOP_PARTICLE: debris of a broken poop: no collision, no damage",
+	[62] = "ROCK_EXPLOSION: the burst of a broken rock: the rock cell is in the room canvas",
+	[63] = "WORM: ambient critter: no collision, no damage",
+	[64] = "BEETLE: ambient critter: no collision, no damage",
+	[66] = "EMBER_PARTICLE: sparks of a fire place: the fire itself (an entity) was sent",
+	[68] = "WALL_BUG: ambient critter on the walls: no collision, no damage",
+	[69] = "BUTTERFLY: ambient critter: no collision, no damage",
+	[70] = "BLOOD_DROP: a blood drop of a hit: no collision, no damage",
+	[75] = "BAR_PARTICLE: debris particles: no collision, no damage",
+	[77] = "LARGE_BLOOD_EXPLOSION: the splash of a big death: after the kill, no collision",
+	[79] = "TEAR_POOF_SMALL: the poof of a tear ending: the tear itself was sent",
+	[80] = "TEAR_POOF_VERYSMALL: the poof of a tear ending: the tear itself was sent",
+	[85] = "DIAMOND_PARTICLE: debris particles: no collision, no damage",
+	[86] = "NAIL_PARTICLE: debris particles: no collision, no damage",
+	[87] = "FALLING_EMBER: ambient embers: no collision, no damage",
+	[88] = "DARK_BALL_SMOKE_PARTICLE: smoke particles of a projectile: the projectile itself was sent",
+	[95] = "GOLD_PARTICLE: sparkle particles: no collision, no damage",
+	[98] = "COIN_PARTICLE: sparkle of a coin: the coin itself (a pickup) was sent",
+	[99] = "WATER_SPLASH: a splash in water: no collision, no damage",
+	[114] = "FORGOTTEN_CHAIN: the chain drawn between the Soul and the Forgotten body: both ends (the controlled body and the familiar 3.900) are sent; 9 segments, no new information (the coordinator, 2026-11-17)",
+	[130] = "LEECH_EXPLOSION: Rep: the splash of a leech dying: after the kill, no collision",
+	[131] = "MAGGOT_EXPLOSION: Rep: the splash of a maggot dying: after the kill, no collision",
+	[132] = "BIG_SPLASH: Rep: a splash in water: no collision, no damage",
+	[133] = "WATER_RIPPLE: Rep: a ripple in water: no collision, no damage",
+	[135] = "RAIN_DROP: Rep: a rain drop: no collision, no damage",
+	[140] = "BACKDROP_DECORATION: Rep: backdrop decoration: no collision, no damage",
+	[145] = "ROCK_POOF: Rep: the poof of a broken rock: the rock cell is in the room canvas",
+}
+local V3_DECORATIVE = {}
+for v, _ in pairs(V3_DECORATIVE_SPEC) do V3_DECORATIVE[v] = true end
 V3_DECORATIVE_LIST = V3_DECORATIVE
 local V3_BODY_ANIMS = { "WalkDown", "WalkUp", "WalkLeft", "WalkRight", "HeadDown", "HeadUp", "HeadLeft", "HeadRight",
 	"Hit", "Death", "Appear", "TeleportUp", "TeleportDown", "Trapdoor" }
@@ -2047,7 +2099,7 @@ local function v3_entities(room, curses)
 	local ents = {}
 	for _, e in ipairs(Isaac.GetRoomEntities()) do
 		local t = e.Type
-		if t ~= 1 and e.Visible and not (t == 1000 and V3_DECORATIVE[e.Variant]) then
+		if t ~= 1 and e.Visible and not (t == 1000 and V3_DECORATIVE[e.Variant] and e.CollisionDamage == 0) then
 			local npc = t >= 10 and t < 1000 and e:ToNPC() or nil
 			local kind = 0
 			local rec = { type = t, variant = e.Variant, subtype = e.SubType, x = e.Position.X, y = e.Position.Y,
@@ -2124,7 +2176,7 @@ local function v3_cells(room, level)
 	local cells = {}
 	local hazards = {}
 	for _, e in ipairs(Isaac.GetRoomEntities()) do
-		if e.Visible and e.Type == 1000 and not V3_DECORATIVE[e.Variant] and e.CollisionDamage > 0 then
+		if e.Visible and e.Type == 1000 and e.CollisionDamage > 0 then   -- (a decorative effect has none)
 			hazards[#hazards + 1] = e
 		end
 	end

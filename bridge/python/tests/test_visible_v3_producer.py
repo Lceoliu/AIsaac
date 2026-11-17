@@ -144,9 +144,12 @@ def test_bits_that_do_not_fit_are_an_error():
 
 def test_decorative_list_equals_the_bridges():
     lua = (BRIDGE / 'abplus' / 'abp_bridge.lua').read_text(encoding='utf-8')
-    m = re.search(r'local V3_DECORATIVE = \{\}.*?ipairs\(\{(.*?)\}\)', lua, re.S)
-    assert tuple(int(v) for v in re.findall(r'\d+', m.group(1))) == VP.V3_DECORATIVE
-    assert 41 in VP.V3_DECORATIVE   # the water droplet (V1)
+    m = re.search(r'local V3_DECORATIVE_SPEC = \{(.*?)\n\}', lua.replace('\r\n', '\n'), re.S)
+    lua_spec = {int(v): (n, why) for v, n, why in re.findall(r'\[(\d+)\] = "(\w+): (.*?)",', m.group(1))}
+    assert lua_spec == VP.V3_DECORATIVE_WHY and tuple(sorted(lua_spec)) == VP.V3_DECORATIVE
+    assert 41 in VP.V3_DECORATIVE and 114 in VP.V3_DECORATIVE      # the water droplet (V1), the Forgotten's chain
+    assert 121 not in VP.V3_DECORATIVE and 138 not in VP.V3_DECORATIVE   # (uncertain: sent)
+    assert all(why for _, why in VP.V3_DECORATIVE_WHY.values())
 
 
 def test_a_body_without_a_room_position():

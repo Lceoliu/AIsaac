@@ -44,6 +44,13 @@ changes its PlayerType 16 <-> 17 in place), and while the Soul is controlled the
 the familiar 3.900 (gfx/003.900_Forgotten Body.anm2, an E token) with the chain effects 1000.114. Bodies are listed
 once each by InitSeed (AB+: the Soul and the Forgotten share Entity.Index; on Rep UNVERIFIED).
 
+Entities sent (convention, the coordinator 2026-11-17; no shape change): every visible entity but the players (they are
+bodies), wherever it is (outside the grid too); effects (type 1000) likewise except a decorative list kept by the
+producers (abp_bridge.lua V3_DECORATIVE_SPEC = visible_producer.V3_DECORATIVE_WHY, each entry with its reason). An
+effect is decorative only if it takes no part in collisions, deals no damage, and its position is given by another
+sent entity or bears on no decision; an uncertain one is sent and reported. The producers drop a listed effect only
+while its CollisionDamage is 0.
+
 Wire rule (DESIGN 2.0): every value is a raw game unit as float32 (integers exact to 2^24, bit words <= 24 bits, flag
 words in 16-bit chunks); categorical codes are integers, 0 = none / not known; reserved columns are 0. The model
 applies SCALE (below) itself. Known flags (G3): a field the game version lacks is written as its true value there
