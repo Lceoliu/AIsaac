@@ -9,11 +9,16 @@ def secs(b):
     for name, size in (('canvas', C), ('minimap', M), ('P', p * PF), ('local', p * LOC), ('E', e * EF), ('N', n * NF), ('S', s * SF)):
         out[name] = list(f[at:at + size]); at += size
     return out
+def unstall(sec):   # P cols 40 / 53 (stall_share / stall_known): the worker writes them, the fixtures carry 0.5 / 1
+    P = sec['P']
+    for i in range(0, len(P), PF):
+        P[i + 40] = P[i + 53] = 0
 d, names = sys.argv[1], sys.argv[2].split(',')
 tot = {k: [0, 0] for k in names}
 for nb in sorted(glob.glob(os.path.join(d, '*.native.bin'))):
     name = os.path.basename(nb)[:-11]
     a, b = secs(open(nb, 'rb').read()), secs(open(os.path.join(d, name + '.v3.bin'), 'rb').read())
+    unstall(a); unstall(b)
     for k in names:
         tot[k][0] += 1
         if a[k] == b[k]: tot[k][1] += 1
