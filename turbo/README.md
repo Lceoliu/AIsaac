@@ -1,5 +1,8 @@
 # isaac_turbo：J460 原版加速层（L1）的原生部分
 
+> **状态（2026-11-17）**：暂停。这是 Repentance+ J460（Windows）的加速层，现在的训练不用它；AB+ 的加速层在 [bridge/engine/](../bridge/engine/README.md)。
+> 下文是 2026-09 的记录，`<仓库根>` 指本仓库的根目录。
+
 设计、证据与实验方案见 [docs/archive/j460/L1_FEASIBILITY_PLAN.md](../docs/archive/j460/L1_FEASIBILITY_PLAN.md)。这里只放构建与文件说明。
 
 ## 做什么
@@ -23,7 +26,7 @@
 ## 构建与测试
 
 ```powershell
-pwsh -NoProfile -File D:\Projects\fortune\Isaac\rl\turbo\build.ps1
+pwsh -NoProfile -File <仓库根>\turbo\build.ps1
 ```
 
 产物：`build/isaac_turbo.dll`、`build/isaac_turbo_inject.exe`（x86，zig cc + MinHook）。脚本依次运行 `clock_test`（虚拟时钟对限帧算术）、`probe_host`（非游戏宿主必须被拦住）、`scripts/verify_targets.py`（只读核对 exe 字节）。Python 端的共享内存测试：`python rl/bridge/python/test_turbo_control.py`。

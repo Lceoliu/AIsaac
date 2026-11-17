@@ -1,5 +1,9 @@
 # IsaacRLBridge：原版 J460 的同步训练桥接
 
+> **状态（2026-11-17）**：暂停。这是 Repentance+ J460（Windows）的桥接线，现在的训练不用它；训练在 AB+ 引擎上做，见 [abplus/README.md](abplus/README.md)。
+> 下文是 2026-09 的记录。`<仓库根>` 指本仓库的根目录，`../runs/` 等结果目录不在 git 里。
+> 设计文档已归档到 [docs/archive/](../docs/archive/README.md)。
+
 设计见 [ENV_ARCHITECTURE.md §0.3](../docs/archive/sim-era/ENV_ARCHITECTURE.md)。原引擎同步采样、原生worker修复与PPO存取档已验收。2026-09-21默认训练入口升级为实体注意力 + 地图CNN + 因果Transformer；保留MLP对照，不把短程接入当作战斗达标。
 
 ## Transformer v1
@@ -11,12 +15,12 @@
 采样复用SB3 VecEnv接口，通过线程池并发等待各游戏TCP连接；并不是同一个游戏里的四个假环境。先验证过SubprocVecEnv的2实例路径，但4实例因重复加载PyTorch及观测缓冲区分配而内存不足，改为单Python运行时，游戏进程仍独立。失败报告保留。
 
 ```powershell
-$env:PYTHONPATH="D:\Projects\fortune\Isaac\rl\bridge\python;D:\Projects\fortune\Isaac\rl\runs\cuda-deps;D:\Projects\fortune\Isaac\rl\runs\training-deps"
+$env:PYTHONPATH="<仓库根>\bridge\python;<仓库根>\runs\cuda-deps;<仓库根>\runs\training-deps"
 # 2/4实例等预算短测：每次PPO更新总计256条transition，epochs=4，batch_size=8
-python D:\Projects\fortune\Isaac\rl\bridge\python\train_parallel.py --workers 2 --device cuda --updates 2 --out D:\Projects\fortune\Isaac\rl\runs\parallel-2
-python D:\Projects\fortune\Isaac\rl\bridge\python\train_parallel.py --workers 4 --device cuda --updates 2 --out D:\Projects\fortune\Isaac\rl\runs\parallel-4
+python <仓库根>\bridge\python\train_parallel.py --workers 2 --device cuda --updates 2 --out <仓库根>\runs\parallel-2
+python <仓库根>\bridge\python\train_parallel.py --workers 4 --device cuda --updates 2 --out <仓库根>\runs\parallel-4
 # 正式训练：所有worker累计至少512个完整回合，不是512步；每个rollout完成更新后判断停止
-python D:\Projects\fortune\Isaac\rl\bridge\python\train_parallel.py --workers 4 --device cuda --episodes 512 --episode-frames 3600 --out D:\Projects\fortune\Isaac\rl\runs\parallel-512
+python <仓库根>\bridge\python\train_parallel.py --workers 4 --device cuda --episodes 512 --episode-frames 3600 --out <仓库根>\runs\parallel-512
 ```
 
 `--episode-frames`为单局逻辑帧上限，30帧/秒；默认3600帧，即用户确认的120秒。死亡/清房提前结束，超时单独记为truncated。`--updates`仅供短测，会覆盖episodes停止条件。`--checkpoint`可接续模型和优化器，但512局计数从此次运行开始，旧run不重复计入。每8次更新及结束保存checkpoint；`episodes.jsonl`逐局记录worker、回报、长度和结局，`resources.jsonl`逐秒记录学习器与引擎RSS/CPU，`report.json`记录完整状态。RSS合计包含共享页，不是独占物理内存。
@@ -29,11 +33,11 @@ python D:\Projects\fortune\Isaac\rl\bridge\python\train_parallel.py --workers 4 
 
 ```powershell
 $env:PYTHONIOENCODING = 'utf-8'
-$env:PYTHONPATH = 'D:\Projects\fortune\Isaac\rl\bridge\python;D:\Projects\fortune\Isaac\rl\runs\training-deps'
-python D:\Projects\fortune\Isaac\rl\bridge\python\train_monstro.py --launch --model transformer --steps 512 --out D:\Projects\fortune\Isaac\rl\runs\transformer-smoke
+$env:PYTHONPATH = '<仓库根>\bridge\python;<仓库根>\runs\training-deps'
+python <仓库根>\bridge\python\train_monstro.py --launch --model transformer --steps 512 --out <仓库根>\runs\transformer-smoke
 # 与训练完全相同的历史窗口、CNN、因果注意力及动作mask；不再使用规则控制器：
 $workerPid = [int](Read-Host '输入训练命令打印的游戏 PID')
-python D:\Projects\fortune\Isaac\rl\bridge\python\monstro_rollout.py --pid $workerPid --render-mode visible --checkpoint D:\Projects\fortune\Isaac\rl\runs\transformer-smoke\ppo_monstro.zip --episodes 3 --frames 960 --out D:\Projects\fortune\Isaac\rl\runs\transformer-eval
+python <仓库根>\bridge\python\monstro_rollout.py --pid $workerPid --render-mode visible --checkpoint <仓库根>\runs\transformer-smoke\ppo_monstro.zip --episodes 3 --frames 960 --out <仓库根>\runs\transformer-eval
 ```
 
 默认64步历史、每2逻辑帧决策、256个实体/激光线段容量；超容量报错，不能静默截断。`--history`和`--entity-capacity`属于checkpoint输入规格；评估会从checkpoint恢复。`--model mlp`保留原两层64单元网络/4帧动作间隔。两个模型不能直接互载checkpoint。`--pid`与`--launch`二选一；结束后进入安全房、保留worker，实际退出验收另发WM_CLOSE并记录退出码。
@@ -48,14 +52,14 @@ python D:\Projects\fortune\Isaac\rl\bridge\python\monstro_rollout.py --pid $work
 新会话使用 `isaac_bridge.training.IsaacTrainingEnv`。它复用底层 `env.py` 的传输，并在 `connect()` 中消费服务端主动发送的初始观测，防止 reset/step 响应错位。原 `env.py` 保留不变作为传输层；旧 feasibility 脚本尚未切换到这个入口，不要用它们代替本节验收。
 
 ```powershell
-Set-Location D:\Projects\fortune\Isaac\rl\bridge\python
-$env:PYTHONPATH = 'D:\Projects\fortune\Isaac\rl\runs\training-deps'
+Set-Location <仓库根>\bridge\python
+$env:PYTHONPATH = '<仓库根>\runs\training-deps'
 python -m unittest -v test_training test_monstro_gym test_rendering
-python monstro_rollout.py --launch --frames 2700 --policies idle,track,track --out D:\Projects\fortune\Isaac\rl\runs\l1\monstro-full-episodes
+python monstro_rollout.py --launch --frames 2700 --policies idle,track,track --out <仓库根>\runs\l1\monstro-full-episodes
 $workerPid = [int](Read-Host '输入上一条命令打印的游戏 PID')
-python train_monstro.py --pid $workerPid --model mlp --steps 512 --episode-frames 960 --out D:\Projects\fortune\Isaac\rl\runs\l1\monstro-ppo-smoke
+python train_monstro.py --pid $workerPid --model mlp --steps 512 --episode-frames 960 --out <仓库根>\runs\l1\monstro-ppo-smoke
 # 可视化验收（不改变逻辑时钟）：
-python monstro_rollout.py --pid $workerPid --render-mode visible --frames 120 --policies track --out D:\Projects\fortune\Isaac\rl\runs\l1\monstro-visible
+python monstro_rollout.py --pid $workerPid --render-mode visible --frames 120 --policies track --out <仓库根>\runs\l1\monstro-visible
 ```
 
 `monstro_rollout.py` / `train_monstro.py` 的 `--launch` 现在先挂起创建进程、注入原生控制层，再用 `--set-stage=1` 直接开局。默认只在本worker排除 `NvCamera32.dll` / `nvspcap.dll` 录屏/照片叠加层，不改系统驱动、Steam设置或游戏EXE；用于处理已复现的NVIDIA退出故障。默认同时启用已注册物理容器的绝对路径解析修复，嵌套归档仍走原生搜索。默认 `--render-mode headless`，从启动阶段关闭渲染，**virtual_clock=false**；`--render-mode visible` 保留真实渲染。两种启动方式都使用隔离；不默认启用字体跳过、文件重试或探针转储。已有游戏使用 `--pid`（与 `--launch` 二选一），但无法追溯移除已加载的叠加层，需要重启worker才能应用启动隔离。正常结束回到安全房，保留游戏进程；验收脚本另外发送WM_CLOSE并检查实际退出码。连接等待默认30秒，可用 `--connect-timeout` 调整，尚无自动重启监督器。
@@ -143,14 +147,14 @@ rewind不再被假定一定恢复完整玩家资源：已观察到2/6红血、0�
 
 ## 安装（2026-09-19 已按用户要求完成）
 
-1. `D:\Steam\steamapps\common\The Binding of Isaac Rebirth\mods\isaac_rl_bridge` 是指向 `mod/isaac_rl_bridge` 的目录联接（Junction），游戏目录里没有复制文件；删除联接即可还原。这是用户明确授权的唯一游戏目录改动。
+1. `<Steam 库>\steamapps\common\The Binding of Isaac Rebirth\mods\isaac_rl_bridge` 是指向 `mod/isaac_rl_bridge` 的目录联接（Junction），游戏目录里没有复制文件；删除联接即可还原。这是用户明确授权的唯一游戏目录改动。
 2. `options.ini`（`Documents\My Games\Binding of Isaac Repentance+\`）已改 `EnableMods=1`、`PauseOnFocusLost=0`，改前备份在 `rl/runs/l1/backup/`；`EnableDebugConsole=1` 原本就是；`VSync=1` 未动（加速层跳过渲染后它不再限速）。
 3. Steam 已登录后由用户手动启动游戏（必须带 `--luadebug`）。
 
 ## 运行探针
 
 ```powershell
-Set-Location -LiteralPath 'D:\Projects\fortune\Isaac\rl\bridge\python'
+Set-Location -LiteralPath '<仓库根>\bridge\python'
 $env:ISAAC_RL_PORT = '27015'
 $env:ISAAC_RL_PRIVILEGED = '1'
 python -m isaac_bridge.launch --port 27015 --privileged
