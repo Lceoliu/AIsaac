@@ -2314,7 +2314,21 @@ local function v3_map_bytes()
 	for _, m in ipairs(v3_map(level, here)) do parts[#parts + 1] = spack("<BBBBBB", m[1], m[2], m[3], m[4], m[5], m[6]) end
 	return table.concat(parts)
 end
-V3_MAP_BYTES = v3_map_bytes   -- (for the probes: abp_native_v3(V3_MAP_BYTES()) in a lua command)
+V3_MAP_BYTES = v3_map_bytes   -- (for the probes: abp_native_v3(V3_MAP_BYTES(), V3_LASER_BYTES()) in a lua command)
+
+-- (visible-v3 native) laser_record's values per laser (Isaac.FindByType(7)) for abp_native_v3: InitSeed, circle, radius,
+-- angle, length, end point, TearFlags (53 bytes); the native side finds them by InitSeed
+local function v3_laser_bytes()
+	local parts = {}
+	for _, e in ipairs(Isaac.FindByType(7, -1, -1, false, false)) do
+		local l = laser_record(e)
+		local tf = v3_try(function() return e:ToLaser().TearFlags end, 0)
+		parts[#parts + 1] = spack("<I4Bdddddi8", e.InitSeed, l.circle and 1 or 0, l.radius, l.angle, l.length,
+			l["end"][1], l["end"][2], math.tointeger(tf) or 0)
+	end
+	return table.concat(parts)
+end
+V3_LASER_BYTES = v3_laser_bytes
 
 function visible_v3_raw()
 	local game = Game()
@@ -2411,7 +2425,7 @@ function visible_block()
 		local lethal = false   -- (a cancelled lethal hit: only the Lua block knows it, as for the native lean part)
 		for _, lv in pairs(state.lethal) do if lv == true then lethal = true end end
 		if (m == 2 or m == 3) and native_v3 ~= nil and not lethal then
-			local frame, why = native_v3(v3_map_bytes())
+			local frame, why = native_v3(v3_map_bytes(), v3_laser_bytes())
 			if frame ~= nil then
 				out, flags = out .. spack("<s4", frame), flags + 64
 				v.native = v.native + 1

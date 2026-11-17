@@ -33,7 +33,7 @@ def sections(payload):
     f = np.frombuffer(payload, '<f4')
     p, e, n, s = (int(v) for v in f[2:6])
     at = V3.HEADER
-    out = {'header': f[:V3.HEADER]}
+    out = {'header': f[:V3.HEADER], 'frame': f}
     for name, size in (('canvas', V3.CANVAS_H * V3.CANVAS_W * V3.ROOM_WORDS), ('minimap', V3.MAP_SIDE * V3.MAP_SIDE),
                        ('P', p * V3.PF), ('local', p * V3.LOCAL), ('E', e * V3.EF), ('N', n * V3.NF), ('S', s * V3.SF)):
         out[name] = f[at:at + size]
@@ -47,8 +47,8 @@ def compare(native, ref, names, stats, rec):
         st = stats.setdefault(name, dict(compared=0, equal=0, first=[]))
         st['compared'] += 1
         x, y = a[name], b[name]
-        if name == 'header':   # (the counts follow the stages: only magic, generation, producer until all are done)
-            x, y = x[[0, 6, 7]], y[[0, 6, 7]]
+        if name == 'frame':   # (every byte)
+            x, y = np.frombuffer(native, '<f4'), np.frombuffer(ref, '<f4')
         if x.shape == y.shape and x.tobytes() == y.tobytes():
             st['equal'] += 1
         elif len(st['first']) < 5:
@@ -106,7 +106,7 @@ def main():
     ap.add_argument('--groups-file', required=True)
     ap.add_argument('--seeds', default='2148000000:4')
     ap.add_argument('--steps', type=int, default=250)
-    ap.add_argument('--sections', default='header,canvas')
+    ap.add_argument('--sections', default='frame,header,canvas,minimap,P,local,E,N,S')
     ap.add_argument('--timing', type=int, default=1)
     ap.add_argument('--port', type=int, default=44540)
     ap.add_argument('--out', required=True)
