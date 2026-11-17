@@ -82,7 +82,7 @@ python monstro_rollout.py --pid $workerPid --render-mode visible --frames 120 --
 - 20 项离线测试通过。新版实机 PPO **512 步 / 16 epochs / 74.27 秒**，参数 L2 改变 **0.6133**，存取档与重载动作一致；4个结束回合全部死亡，回报为 −5.552 / −4.744 / −5.744 / −5.230。奖励已生效，但没有战斗达标结论。
 - 另用规则控制器实测3回合：正奖励步骤 **24 / 23 / 25**，Boss 受伤比例 **36.4% / 35.0% / 36.4%**；不是 RL 学习成绩。三局在同一个 PID18788 内完成，重置类型 initialize / rewind / rewind；敌弹标记 **1642/1642** 正确；渲染调用增量和虚拟 tick 增量均为0。正常清理保留存活 worker。
 - 地形物理探针：从 x=260 向右走24逻辑帧，空地/飞行越坑/飞行越石头到 x≈435.07；地面石头/坑停在 x≈290，障碍中心 x=320。与掩码一致。测试坑由运行时生成后显式设为坑碰撞，非自然房间采样；飞行由测试道具提供，rewind 后确认移除。首次探针错误及飞行石头掩码缺陷均保留证据，修复后同输入通过。
-- 证据：[本轮结果](../runs/l1/20260920-rewind/live-summary.json)、[PPO 报告](../runs/l1/20260920-rewind/dense-ppo/report.json)、[地形探针](../runs/l1/20260920-rewind/terrain-probe.json)。该轮尚未完成原生崩溃修复；后续worker修复及实战结果见下节。这不是独立无窗口引擎。
+- 证据：本轮结果（`../runs/l1/20260920-rewind/live-summary.json`）、PPO 报告（`../runs/l1/20260920-rewind/dense-ppo/report.json`）、地形探针（`../runs/l1/20260920-rewind/terrain-probe.json`）。该轮尚未完成原生崩溃修复；后续worker修复及实战结果见下节。这不是独立无窗口引擎。
 
 
 ## 弹幕输入覆盖核对（2026-09-20）
