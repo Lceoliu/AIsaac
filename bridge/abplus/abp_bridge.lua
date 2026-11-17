@@ -1952,6 +1952,293 @@ local function lean_handles()
 	return game, game:GetRoom(), game:GetLevel(), Isaac.GetPlayer(0)
 end
 
+-- visible-v3 raw block (package C, 2026-11-17; schema_v3.py VERSION 2026111702, batch 1 / 2): every raw game value the
+-- v3 frame is built from, as JSON, for the Python reference encoder (visible_producer.observation_frame_v3) and the
+-- golden fixtures; the native encoder (abp_visible.c v3) must give the same frame bytes. Raw units throughout, world
+-- positions as the engine gives them (the encoder subtracts the canvas origin, sent here as origin = GetGridPosition(0)
+-- - (20, 20)); flag integers as 16-bit words (exact through the JSON encoder); entity kind raw 0..9 (the encoder writes
+-- kind + 1). Not on the lean payload yet (the probe and the fixtures call it through the lua command).
+local V3_DECORATIVE = {}   -- effect variants never sent (the recorder's fx_omit list, Rep numbering = AB+ below 60)
+for _, v in ipairs({ 2, 3, 4, 5, 7, 11, 12, 13, 14, 15, 16, 17, 18, 21, 27, 33, 35, 38, 41, 43, 50, 58, 62, 63, 64,
+	66, 68, 69, 70, 75, 77, 79, 80, 85, 86, 87, 88, 95, 98, 99, 121, 130, 131, 132, 133, 135, 138, 140, 145 }) do
+	V3_DECORATIVE[v] = true
+end
+V3_DECORATIVE_LIST = V3_DECORATIVE
+local V3_BODY_ANIMS = { "WalkDown", "WalkUp", "WalkLeft", "WalkRight", "HeadDown", "HeadUp", "HeadLeft", "HeadRight",
+	"Hit", "Death", "Appear", "TeleportUp", "TeleportDown", "Trapdoor" }
+
+local function v3_words(value, n)
+	local out = {}
+	local v = math.tointeger(value) or 0
+	for k = 0, n - 1 do out[k + 1] = (v >> (16 * k)) & 0xffff end
+	return out
+end
+
+local function v3_try(f, default)
+	local ok, v = pcall(f)
+	if ok and v ~= nil then return v end
+	return default
+end
+
+local function v3_body(p, index, role, n_players, cfg_players)
+	local pos, vel = p.Position, p.Velocity
+	local spr = p:GetSprite()
+	local animation = 0
+	for k, name in ipairs(V3_BODY_ANIMS) do
+		if spr:IsPlaying(name) or spr:IsFinished(name) then animation = k; break end
+	end
+	local controller = p.ControllerIndex
+	local bone_bits, weapon_bits = 0, 0
+	for i = 0, 23 do
+		if v3_try(function() return p:IsBoneHeart(i) end, false) then bone_bits = bone_bits | (1 << i) end
+		if v3_try(function() return p:HasWeaponType(i) end, false) then weapon_bits = weapon_bits | (1 << i) end
+	end
+	local charge, charge_known = 0, 0
+	if index ~= nil and type(abp_player_charge) == "function" then charge, charge_known = abp_player_charge(index) or 0, 1 end
+	return { entity_index = p.Index, x = pos.X, y = pos.Y, vx = vel.X, vy = vel.Y, size = p.Size,
+		hearts = p:GetHearts(), max_hearts = p:GetMaxHearts(), soul = p:GetSoulHearts(), bone = p:GetBoneHearts(),
+		eternal = p:GetEternalHearts(), golden = p:GetGoldenHearts(), broken = 0, rotten = 0,
+		extra_lives = p:GetExtraLives(), coins = p:GetNumCoins(), bombs = p:GetNumBombs(), keys = p:GetNumKeys(),
+		giga_bombs = 0, golden_bomb = 0, golden_key = 0, poop_mana = 0, soul_charge = 0, blood_charge = 0,
+		damage = p.Damage, max_fire_delay = p.MaxFireDelay, shot_speed = p.ShotSpeed, range = tear_range(p),
+		move_speed = p.MoveSpeed, luck = p.Luck, can_fly = B(p.CanFly), invulnerable = B(p:GetDamageCooldown() > 0),
+		controls = B(p.ControlsEnabled), dead = B(p:IsDead() or state.lethal[p.Index] == true),
+		head_dir = p:GetHeadDirection(), fire_dir = p:GetFireDirection(), move_dir = p:GetMovementDirection(),
+		sprite_frame = spr:GetFrame(), weapon_charge = charge, weapon_charge_known = charge_known,
+		ptype = p:GetPlayerType(), role = role, controller = controller or -1, controller_known = controller ~= nil and 1 or 0,
+		animation = animation, animation_known = animation ~= 0 and 1 or 0, black = p:GetBlackHearts(),
+		bone_bits = bone_bits, weapon_bits = weapon_bits, bone_slots_known = 1 }
+end
+
+local function v3_bodies(game)
+	local bodies, seen = {}, {}
+	local n = game:GetNumPlayers()
+	for i = 0, n - 1 do
+		local p = Isaac.GetPlayer(i)
+		if not seen[p.Index] then
+			seen[p.Index] = true
+			bodies[#bodies + 1] = v3_body(p, i, 1)
+		end
+	end
+	for i = 0, n - 1 do   -- the sub-players (the Forgotten / the Soul), after every player; linked both ways
+		local p = Isaac.GetPlayer(i)
+		local sub = v3_try(function() return p:GetSubPlayer() end, nil)
+		if sub ~= nil and not seen[sub.Index] then
+			seen[sub.Index] = true
+			bodies[#bodies + 1] = v3_body(sub, nil, 3)
+			local main = nil
+			for k, b in ipairs(bodies) do if b.entity_index == p.Index then main = k end end
+			bodies[#bodies].linked = main
+			if main then bodies[main].linked = #bodies end
+		end
+	end
+	return bodies
+end
+
+local function v3_entities(room, curses)
+	local ents = {}
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		local t = e.Type
+		if t ~= 1 and e.Visible and not (t == 1000 and V3_DECORATIVE[e.Variant]) then
+			local npc = t >= 10 and t < 1000 and e:ToNPC() or nil
+			local kind = 0
+			local rec = { type = t, variant = e.Variant, subtype = e.SubType, x = e.Position.X, y = e.Position.Y,
+				vx = e.Velocity.X, vy = e.Velocity.Y, size = e.Size, size_mx = e.SizeMulti.X, size_my = e.SizeMulti.Y,
+				coll = e.EntityCollisionClass, gcoll = e.GridCollisionClass, cdmg = e.CollisionDamage,
+				sprite_frame = e:GetSprite():GetFrame(), age = e.FrameCount, flip_x = B(e.FlipX),
+				identity_known = 1, npc_flags = 0, champion = 0, boss_hp = 0, height = 0, fall = 0, scale = 0,
+				l_cos = 0, l_sin = 0, l_len = 0, l_ex = 0, l_ey = 0, l_radius = 0, l_circle = 0, price = 0,
+				tear = { 0, 0, 0, 0 }, proj = { 0, 0, 0, 0 }, flags_known = 4,
+				eflags = v3_words(v3_try(function() return e:GetEntityFlags() end, 0), 4) }
+			local spr = e:GetSprite()
+			local anim, names = 0, ANIMATIONS[t]
+			if names then
+				for k = 1, #names do
+					if spr:IsPlaying(names[k]) or spr:IsFinished(names[k]) then anim = k; break end
+				end
+			end
+			rec.anim = anim
+			if t == 2 then
+				local x = e:ToTear()
+				kind, rec.height, rec.fall, rec.scale = 1, x.Height, x.FallingSpeed, x.Scale
+				rec.tear, rec.flags_known = v3_words(x.TearFlags, 4), 4 | 1
+			elseif t == 9 then
+				local x = e:ToProjectile()
+				kind, rec.height, rec.fall, rec.scale = 2, x.Height, x.FallingSpeed, x.Scale
+				rec.proj, rec.flags_known = v3_words(x.ProjectileFlags, 4), 4 | 2
+			elseif t == 7 then
+				kind = 3
+				local l = laser_record(e)
+				local rad = math.rad(l.angle)
+				rec.l_cos, rec.l_sin, rec.l_len, rec.l_radius = math.cos(rad), math.sin(rad), l.length, l.radius
+				if l.circle then rec.l_circle, rec.l_ex, rec.l_ey = 1, e.Position.X, e.Position.Y
+				else rec.l_ex, rec.l_ey = l["end"][1], l["end"][2] end
+				rec.tear = v3_words(v3_try(function() return e:ToLaser().TearFlags end, 0), 4)
+				rec.flags_known = 4 | 1
+			elseif t == TYPE_BOMB then
+				kind = 4
+				rec.tear = v3_words(v3_try(function() return e:ToBomb().Flags end, 0), 4)
+				rec.flags_known = 4 | 1
+			elseif t == 5 then
+				kind = 5
+				local pk = e:ToPickup()
+				rec.price = pk and math.tointeger(pk.Price) or 0
+				if (curses & 64) ~= 0 and e.Variant == 100 then rec.subtype, rec.identity_known = 0, 0 end
+			elseif t == 8 then
+				kind = 7
+				rec.tear = v3_words(v3_try(function() return e:ToKnife().TearFlags end, 0), 4)
+				rec.flags_known = 4 | 1
+			elseif t == 3 then
+				kind = 8
+			elseif t == 1000 then
+				kind = 9
+			elseif npc then
+				kind = 6
+				local f = 0
+				if e:IsEnemy() then f = f + 1 end
+				if e:IsVulnerableEnemy() then f = f + 2 end
+				if e:IsBoss() then
+					f = f + 4
+					if e.MaxHitPoints > 0 then rec.boss_hp = e.HitPoints / e.MaxHitPoints end
+				end
+				if e:CanShutDoors() and not e:IsDead() then f = f + 8 end
+				rec.npc_flags = f
+				rec.champion = npc:GetChampionColorIdx() + 2
+			end
+			rec.kind = kind
+			ents[#ents + 1] = rec
+		end
+	end
+	return ents
+end
+
+local function v3_cells(room, level)
+	local cells = {}
+	local hazards = {}
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		if e.Visible and e.Type == 1000 and not V3_DECORATIVE[e.Variant] and e.CollisionDamage > 0 then
+			hazards[#hazards + 1] = e
+		end
+	end
+	for i = 0, room:GetGridSize() - 1 do
+		local pos = room:GetGridPosition(i)
+		local collision = room:GetGridCollision(i)
+		local g = room:GetGridEntity(i)
+		local gt, gv, gs = 0, 0, 0
+		if g then
+			gt = g:GetType()
+			if gt == GridEntityType.GRID_DOOR and g:GetVariant() == DOOR_HIDDEN then gt = GridEntityType.GRID_WALL
+			elseif gt ~= GridEntityType.GRID_NULL and gt ~= GridEntityType.GRID_DECORATION then gv, gs = g:GetVariant(), g.State
+			else gt = 0 end
+		end
+		local pit = collision == GridCollisionClass.COLLISION_PIT
+		local solid = collision ~= GridCollisionClass.COLLISION_NONE and not pit
+		local destructible = solid and g ~= nil and (g:ToRock() ~= nil or g:ToPoop() ~= nil or g:ToTNT() ~= nil)
+		local hazard = gt == GridEntityType.GRID_SPIKES or gt == GridEntityType.GRID_SPIKES_ONOFF
+		for _, e in ipairs(hazards) do
+			if pos:Distance(e.Position) <= e.Size + 28.3 then hazard = true end
+		end
+		cells[i + 1] = { B(room:IsPositionInRoom(pos, 0)), collision, B(solid), B(pit), B(destructible), B(hazard),
+			gt, gv, gs }
+	end
+	local doors = {}
+	for slot = 0, 7 do
+		local d = room:GetDoor(slot)
+		if d and visible_door(d) then
+			local visited, clear = 0, 0
+			pcall(function()
+				local behind = level:GetRoomByIdx(d.TargetRoomIndex)
+				if behind.VisitedCount > 0 then visited = 1; clear = behind.Clear and 1 or 0 end
+			end)
+			doors[#doors + 1] = { slot = slot, x = d.Position.X, y = d.Position.Y, open = B(d:IsOpen()),
+				locked = B(d:IsLocked()), target = math.tointeger(d.TargetRoomType) or 0, visited = visited, clear = clear,
+				variant = d:GetVariant(), state = d.State }
+		end
+	end
+	return cells, doors
+end
+
+local function v3_map(level, here)
+	local out = {}
+	if (level:GetCurses() & 4) ~= 0 then return out end   -- Curse of the Lost: no map
+	local rooms = level:GetRooms()
+	for i = 0, rooms.Size - 1 do
+		local r = rooms:Get(i)
+		local display, gi = r.DisplayFlags, r.GridIndex
+		if display ~= 0 and gi >= 0 and gi < 169 then
+			local d = r.Data
+			local visited = r.VisitedCount > 0
+			local known = visited or (display & 4) ~= 0
+			out[#out + 1] = { gi, d.Shape, known and d.Type or 0, B(visited), B(visited and r.Clear),
+				B(r.SafeGridIndex == here) }
+		end
+	end
+	return out
+end
+
+local function v3_items(bodies)
+	local game, config = Game(), Isaac.GetItemConfig()
+	local pool = game:GetItemPool()
+	local inventory, slots = {}, {}
+	for b, rec in ipairs(bodies) do
+		local owner = b - 1
+		local p = nil
+		for _, e in ipairs(Isaac.FindByType(1, -1, -1, false, false)) do
+			if e.Index == rec.entity_index then p = e:ToPlayer() end
+		end
+		if p then
+			for id = 1, config:GetCollectibles().Size - 1 do
+				local count = p:GetCollectibleNum(id)
+				if count > 0 then inventory[#inventory + 1] = { owner, id, count } end
+			end
+			local active, charge = p:GetActiveItem(), p:GetActiveCharge()
+			local ac = active ~= 0 and config:GetCollectible(active) or nil
+			slots[#slots + 1] = { owner = owner, family = 1, slot = 0, id = active, occupied = B(active ~= 0), selected = 1,
+				charge = charge, max_charge = ac and ac.MaxCharges or 0, battery = p:GetBatteryCharge() }
+			local secondary = p.SecondaryActiveItem
+			if p:HasCollectible(534) or secondary.Item ~= 0 then   -- Schoolbag (AB+ 534)
+				local id = secondary.Item
+				local desc = id ~= 0 and config:GetCollectible(id) or nil
+				slots[#slots + 1] = { owner = owner, family = 1, slot = 1, id = id, occupied = B(id ~= 0), selected = 0,
+					charge = secondary.Charge, max_charge = desc and desc.MaxCharges or 0, battery = secondary.BatteryCharge }
+			end
+			for slot = 0, p:GetMaxTrinkets() - 1 do
+				local id = p:GetTrinket(slot)
+				slots[#slots + 1] = { owner = owner, family = 2, slot = slot, id = id & 0x7fff, occupied = B(id ~= 0),
+					selected = 0, golden = B((id & 0x8000) ~= 0), charge_known = 0 }
+			end
+			for slot = 0, p:GetMaxPoketItems() - 1 do
+				local pill, card = p:GetPill(slot), p:GetCard(slot)
+				local identified = pill ~= 0 and pool:IsPillIdentified(pill)
+				local effect = identified and (pool:GetPillEffect(pill) + 1) or 0
+				slots[#slots + 1] = { owner = owner, family = card ~= 0 and 4 or 3, slot = slot,
+					id = card ~= 0 and card or effect, occupied = B(pill ~= 0 or card ~= 0), selected = B(slot == 0),
+					id_known = B(pill == 0 or identified), charge_known = 0, pill_colour = pill & 0x7ff,
+					giant = B((pill & 0x800) ~= 0) }
+			end
+		end
+	end
+	return inventory, slots
+end
+
+function visible_v3_raw()
+	local game = Game()
+	local room, level = game:GetRoom(), game:GetLevel()
+	local g0 = room:GetGridPosition(0)
+	local curses = level:GetCurses()
+	local here = v3_try(function() return level:GetCurrentRoomDesc().SafeGridIndex end, -1)
+	local bodies = v3_bodies(game)
+	local cells, doors = v3_cells(room, level)
+	local inventory, slots = v3_items(bodies)
+	return json.encode({ schema = "isaac-visible-raw-v3", version = 2026111702, game_version = 1, control_scheme = 0,
+		origin = { g0.X - 20, g0.Y - 20 }, gw = room:GetGridWidth(), gh = room:GetGridHeight(),
+		room_type = room:GetType(), shape = room:GetRoomShape(), stage = level:GetStage(),
+		stage_type = v3_try(function() return level:GetStageType() end, 0),
+		difficulty = v3_try(function() return game.Difficulty end, 0), curses = curses, here = here,
+		frame = game:GetFrameCount(), bodies = bodies, entities = v3_entities(room, curses), cells = cells,
+		doors = doors, map = v3_map(level, here), inventory = inventory, slots = slots })
+end
+
 -- New visible contract: full per-body inventory on every decision. A changed item
 -- with the same total count cannot hide behind the legacy inventory cache.
 function visible_input_block()
