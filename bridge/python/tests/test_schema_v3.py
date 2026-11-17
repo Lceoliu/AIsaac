@@ -17,7 +17,7 @@ CRLF, LF = chr(13) + chr(10), chr(10)   # (a Windows checkout may hold the heade
 
 
 def test_f1_sizes():
-    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111701
+    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111702
     assert (S.FIXED, S.PF, S.LOCAL, S.EF, S.NF, S.SF, S.BODY, S.RC) == (2417, 192, 405, 64, 8, 24, 597, 21)
     assert S.HEADER == 8 and S.MAGIC == 61107 and S.LAYOUT_GEN == 3
     assert S.frame_floats(1, 0, 0, 0) == 2417 + 597
@@ -160,3 +160,21 @@ def test_batch1_coordinate_contract():
     assert len({S.cat_index('entity_kind', v) for v in S.ENTITY_KIND.values()}) == 10   # (no kind on the 'none' row)
     for cols in (P, E):   # (no column is relative to GetTopLeftPos any more)
         assert not any('top-left' in c[2] or 'TopLeft' in c[2] for c in cols)
+
+
+def test_batch2_scales():
+    """Batch 2 (the coordinator, 2026-11-17): the non-position scales B1-B4, NUM_CLAMP (B5), and NUM_RANGE (B6): one
+    entry per 'num' column of every token kind, each None or an ordered (low, high)."""
+    E = S.E_COLS
+    se = S.scale_vector(E)
+    for name, scale in (('size_mx', 1), ('size_my', 1), ('scale', 1), ('fall', 10), ('coll', 4), ('gcoll', 8),
+                        ('cdmg', 2), ('anim', 8)):
+        assert se[S.col(E, name)] == scale, name
+    assert S.NUM_CLAMP == 8.0
+    for key, cols in (('P', S.P_COLS), ('E', S.E_COLS), ('N', S.N_COLS), ('S', S.S_COLS)):
+        nums = {c[0] for c in cols if c[1] == 'num'}
+        assert set(S.NUM_RANGE[key]) == nums, (key, nums ^ set(S.NUM_RANGE[key]))
+        for name, r in S.NUM_RANGE[key].items():
+            assert r is None or (len(r) == 2 and r[0] < r[1] and -S.NUM_CLAMP <= r[0] and r[1] <= S.NUM_CLAMP), name
+    P = S.P_COLS
+    assert S.NUM_RANGE['P']['x'] == (0.0, 1120 / 520) and S.NUM_RANGE['P']['y'] == (0.0, 640 / 520)

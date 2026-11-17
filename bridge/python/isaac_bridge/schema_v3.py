@@ -27,6 +27,14 @@ pixels, both axes / 520; A2 E velocities / 10 as P's; A3 laser length / 300, end
 grid_w and 42 grid_h. GetTopLeftPos / GetBottomRightPos are used nowhere. Offsets relative to a body, distances and
 in-cell offsets are the model's (computed at decode), never on the wire.
 
+Batch 2 (the coordinator, 2026-11-17; the scales checked against tok_obs.py's ROW, the model that learns): VERSION
+2026111702; B1 E size_mx / size_my / 1 (were / 20); B2 E scale / 1 (was / 30); B3 E fall / 10 (was / 30); B4 E coll / 4,
+gcoll / 8, cdmg / 2, anim / 8 (were / 1); B5 NUM_CLAMP: every 'num' column is divided by its scale and then clamped
+to [-NUM_CLAMP, NUM_CLAMP] at decode (unbounded counters such as age, sprite_frame, weapon_charge, Rep coins never
+reach the model as large numbers; the wire keeps the raw value, unclamped); B6 NUM_RANGE: the expected range of every
+'num' column after scaling (None where not known yet), to be checked against real frames (contract V4, every numeric
+column).
+
 Wire rule (DESIGN 2.0): every value is a raw game unit as float32 (integers exact to 2^24, bit words <= 24 bits, flag
 words in 16-bit chunks); categorical codes are integers, 0 = none / not known; reserved columns are 0. The model
 applies SCALE (below) itself. Known flags (G3): a field the game version lacks is written as its true value there
@@ -35,7 +43,8 @@ applies SCALE (below) itself. Known flags (G3): a field the game version lacks i
 
 # ------------------------------------------------------------------------------------------------- F1: identity
 SCHEMA = 'isaac-visible-prlmens-g-v3'
-VERSION = 2026111701   # batch 1 (the coordinator, 2026-11-17): canvas frame, isotropic scales, kind + 1
+VERSION = 2026111702   # batch 2 (the coordinator, 2026-11-17): non-position scales, NUM_CLAMP, NUM_RANGE
+#                       (batch 1, 2026111701: canvas frame, isotropic scales, kind + 1)
 FRAME_BYTES = 131072
 MAGIC = 61107
 LAYOUT_GEN = 3        # header[6]
@@ -51,7 +60,9 @@ CANVAS_H, CANVAS_W = 16, 28
 # CELL / 2), taken by the producer from GetGridPosition(0) at run time (never a constant: AB+ gives (40, 120) - (20,
 # 20) = (20, 100) in every room shape, V1); x grows right, y down, in pixels (world position - origin). The cell of a
 # position: col = floor(x / CELL), row = floor(y / CELL); a position outside [0, CELL * gw) x [0, CELL * gh) has no
-# cell (never the engine's GetGridIndex, which answers -1 or an edge cell outside the grid). GetTopLeftPos /
+# cell. Producers use only this floor formula, never the engine's GetGridIndex: that one truncates toward 0 per axis
+# (trunc((pos - origin) / CELL), V1 / rooms2: 8,868 points, 0 exceptions), so a position up to CELL px left of or
+# above the grid counts as column 0 / row 0 there, and every other position outside the grid gives -1. GetTopLeftPos /
 # GetBottomRightPos are not used (shape-dependent: (1, 1) cells from the origin in 1x1 / 1x2 / 2x1 / 2x2 / L rooms,
 # (1, 3) in IH / IIH, (5, 1) in IV / IIV).
 CELL = 40
@@ -169,17 +180,17 @@ E_SPEC = [
     (3, 'x', 'num', 'canvas-frame px (Position.X - origin x)', 520),
     (4, 'y', 'num', 'canvas-frame px (Position.Y - origin y)', 520),
     (5, 'vx', 'num', 'px/frame', 10), (6, 'vy', 'num', 'px/frame', 10), (7, 'size', 'num', 'px', 20),
-    (8, 'size_mx', 'num', 'SizeMulti x', 20), (9, 'size_my', 'num', 'SizeMulti y', 20),
-    (10, 'coll', 'num', 'EntityCollisionClass', 1), (11, 'gcoll', 'num', 'GridCollisionClass', 1),
-    (12, 'cdmg', 'num', 'CollisionDamage', 1), (13, 'sprite_frame', 'num', 'frame', 60),
+    (8, 'size_mx', 'num', 'SizeMulti x', 1), (9, 'size_my', 'num', 'SizeMulti y', 1),
+    (10, 'coll', 'num', 'EntityCollisionClass', 4), (11, 'gcoll', 'num', 'GridCollisionClass', 8),
+    (12, 'cdmg', 'num', 'CollisionDamage', 2), (13, 'sprite_frame', 'num', 'frame', 60),
     (14, 'age', 'num', 'FrameCount', 60), (15, 'kind', 'cat:entity_kind',
                                              'raw kind + 1: 1 other, 2 tear, 3 projectile, 4 laser, 5 bomb, '
                                              '6 pickup, 7 npc, 8 knife, 9 familiar, 10 effect; 0 none', 1),
     (16, 'npc_flags', 'bits8', '1 IsEnemy, 2 IsVulnerableEnemy, 4 IsBoss, 8 CanShutDoors', 1),
-    (17, 'anim', 'num', 'short animation list index', 1), (18, 'flip_x', 'num', '0/1', 1),
+    (17, 'anim', 'num', 'short animation list index', 8), (18, 'flip_x', 'num', '0/1', 1),
     (19, 'champion', 'cat:champion', 'ChampionColorIdx + 2', 1),
     (20, 'boss_hp', 'num', 'visible boss bar fraction', 1), (21, 'height', 'num', 'Height', 30),
-    (22, 'fall', 'num', 'FallingSpeed', 30), (23, 'scale', 'num', 'Scale', 30),
+    (22, 'fall', 'num', 'FallingSpeed', 10), (23, 'scale', 'num', 'Scale', 1),
     (24, 'l_cos', 'num', 'laser direction cos', 1), (25, 'l_sin', 'num', 'laser direction sin', 1),
     (26, 'l_len', 'num', 'laser length px', 300), (27, 'l_ex', 'num', 'laser end x, canvas-frame px', 520),
     (28, 'l_ey', 'num', 'laser end y, canvas-frame px', 520), (29, 'l_radius', 'num', 'laser radius px', 100),
@@ -228,6 +239,40 @@ def col(cols, name):
 def scale_vector(cols):
     """The model's divisor per column (1 for every non-numeric / reserved column)."""
     return tuple(c[3] if c[1] == 'num' and c[3] else 1.0 for c in cols)
+
+
+# B5 (batch 2): at decode every 'num' column is value / scale clamped to [-NUM_CLAMP, NUM_CLAMP] (the model's only
+# numeric transform besides the scale, contract C7); the wire carries the raw value, never clamped by a producer.
+NUM_CLAMP = 8.0
+
+# B6 (batch 2): the expected range of each 'num' column AFTER scaling, (low, high), or None where not known yet (then
+# measured: contract V4, every numeric column, real frames per room shape). Typical, not hard limits: a value outside
+# is a finding to explain, not an error. The position bounds are V1's grid (x < 1120 px / 520, y < 640 px / 520);
+# entities run past the grid (V1: a falling drop at y -107 px, a Homunculus part 7 px below it).
+_GRID_X, _GRID_Y = 28 * CELL / 520, 16 * CELL / 520
+NUM_RANGE = {
+    'P': {'x': (0.0, _GRID_X), 'y': (0.0, _GRID_Y), 'vx': None, 'vy': None, 'size': None,
+          'hearts': (0.0, 2.0), 'max_hearts': (0.0, 2.0), 'soul': (0.0, 2.0), 'bone': (0.0, 2.0),
+          'eternal': (0.0, 0.5), 'golden': None, 'broken': (0.0, 1.0), 'rotten': (0.0, 1.0), 'extra_lives': None,
+          'coins': (0.0, 0.99),   # (AB+ <= 99; Rep up to 999 = 9.99 meets the clamp at 8)
+          'bombs': (0.0, 0.99), 'keys': (0.0, 0.99), 'giga_bombs': None,
+          'golden_bomb': (0.0, 1.0), 'golden_key': (0.0, 1.0), 'poop_mana': (0.0, 1.0), 'soul_charge': None,
+          'blood_charge': None, 'damage': None, 'max_fire_delay': None, 'shot_speed': None, 'range': None,
+          'move_speed': (0.0, 1.0), 'luck': None, 'can_fly': (0.0, 1.0), 'invulnerable': (0.0, 1.0),
+          'controls': (0.0, 1.0), 'dead': (0.0, 1.0), 'head_dir': (-0.25, 0.75), 'fire_dir': (-0.25, 0.75),
+          'move_dir': (-0.25, 0.75), 'sprite_frame': None, 'weapon_charge': None, 'body_index': (0.0, 0.75),
+          'linked_body': (0.0, 1.0), 'stall_share': (0.0, 1.0), 'grid_w': (15 / 28, 1.0), 'grid_h': (9 / 16, 1.0),
+          **{f'overflow_{c}': None for c in ENTITY_CLASSES}},
+    'E': {'x': (-0.25, _GRID_X + 0.25), 'y': (-0.25, _GRID_Y + 0.25), 'vx': None, 'vy': None, 'size': None,
+          'size_mx': None, 'size_my': None, 'coll': (0.0, 1.0), 'gcoll': (0.0, 1.0), 'cdmg': None,
+          'sprite_frame': None, 'age': None, 'anim': None, 'flip_x': (0.0, 1.0), 'boss_hp': (0.0, 1.0),
+          'height': None, 'fall': None, 'scale': None, 'l_cos': (-1.0, 1.0), 'l_sin': (-1.0, 1.0), 'l_len': None,
+          'l_ex': None, 'l_ey': None, 'l_radius': None, 'l_circle': (0.0, 1.0), 'price': None},
+    'N': {'owner': (0.0, 0.75), 'count': None, 'display_order': None},
+    'S': {'owner': (0.0, 0.75), 'slot': None, 'occupied': (0.0, 1.0), 'selected': (0.0, 1.0), 'charge': (0.0, 1.0),
+          'max_charge': (0.0, 1.0), 'battery': (0.0, 1.0), 'golden': (0.0, 1.0), 'giant': (0.0, 1.0),
+          'display_order': None, 'sub_charge': None},
+}
 
 
 # ------------------------------------------------------------------------------------------------- F1: tables
