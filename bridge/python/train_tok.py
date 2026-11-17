@@ -2849,7 +2849,7 @@ def main(argv=None, child=None, actor=None):
         from isaac_bridge.structured_input import SPATIAL_COMPILE
         if SPATIAL_COMPILE:
             t_w=time.perf_counter()
-            n_w=block_compile.warm_spatial(learner_model,(model,),bf16=amp or args.actor_bf16)
+            n_w=block_compile.warm_spatial(learner_model,(model,),bf16=bool(amp or args.actor_bf16))
             print(f'B42 compiled Spatial warm-up: {n_w} graphs in {time.perf_counter()-t_w:.1f} s'
                   f' (B56 fx cache {"on" if block_compile.FX_CACHE else "off"})',flush=True)
             if args.block_slots:   # B44 packed learner: the Flex Reader kernels (ISAAC_PACKED_READER=flex)
@@ -2862,7 +2862,7 @@ def main(argv=None, child=None, actor=None):
             if P2 is not None:   # BM1 P2: the same compiled kernels for the second card (the device is in their guards)
                 t_w=time.perf_counter()
                 c_r=block_compile.STATS['compiles']
-                block_compile.warm_spatial(P2.replica,(),bf16=amp or args.actor_bf16)
+                block_compile.warm_spatial(P2.replica,(),bf16=bool(amp or args.actor_bf16))
                 if args.block_slots and block_learner.PACKED:
                     block_learner.warm_reader(P2.replica,bf16=bool(amp))
                 print(f'BM1 P2 second card warm-up: {block_compile.STATS["compiles"]-c_r} graphs in '
