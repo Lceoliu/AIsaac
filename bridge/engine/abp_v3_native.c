@@ -1,7 +1,7 @@
 // visible-v3 native frame (package C, 2026-11-17; included by abp_turbo.c just before obs_init, so it uses the
 // native observation's helpers: FN / G0 / G1 / FIELD, the OBS_FUNC_LIST getters, obs_dyncast, vis_*).
 //
-// Lua: frame = abp_native_v3() -- the v3 frame bytes (schema_v3.py, abp_schema_v3.h) exactly as
+// Lua: frame = abp_native_v3(map) -- the v3 frame bytes (schema_v3.py, abp_schema_v3.h) exactly as
 // visible_producer.observation_frame_v3(visible_v3_raw()) gives them, built here from the same engine functions the
 // bridge's Lua code calls; or nil, why (the bridge then sends its Lua raw block). Every column number, size, range and
 // the decorative list come from the generated header: nothing hand-written twice.
@@ -22,7 +22,8 @@
     X(V3_BOMB_FLAGS, 0x780aa0, "_ZNK11Entity_Bomb12GetTearFlagsEv") \
     X(V3_BONE_HEART, 0x6673d0, "_ZNK13Entity_Player11IsBoneHeartEi") \
     X(V3_SECONDARY, 0x781b90, "_ZN13Entity_Player18GetSecondaryPlayerEv") \
-    X(V3_KNIFE_FLAGS, 0x780cb0, "_ZNK12Entity_Knife12GetTearFlagsEv")
+    X(V3_KNIFE_FLAGS, 0x780cb0, "_ZNK12Entity_Knife12GetTearFlagsEv") \
+    X(V3_TOLSTRING, 0x92de40, "lua_tolstring")
 
 #define V3_ENUM(id, va, name) VF3_##id,
 enum { V3_FUNC_LIST(V3_ENUM) VF3_COUNT };
@@ -501,8 +502,138 @@ static const char *v3_entity_row(const v3_room *r, const void *e, uint32_t curse
     return NULL;
 }
 
+// Stage 4: inventory and slots (visible_v3_raw's v3_items; observation_frame_v3's N / S rows), from the native visible
+// block's getters (VIS_FUNC_LIST). Rows into v3_inv / v3_slots first (their counts size the frame).
+typedef struct { float v[ABP_V3_NF]; } v3_nrow;
+typedef struct { float v[ABP_V3_SF]; } v3_srow;
+static v3_nrow *v3_inv;
+static v3_srow *v3_slots;
+static size_t v3_inv_cap, v3_slots_cap;
+
+static v3_nrow *v3_inv_add(size_t *n) {
+    if (*n == v3_inv_cap) {
+        size_t c = v3_inv_cap ? v3_inv_cap * 2 : 64;
+        v3_nrow *b = realloc(v3_inv, c * sizeof *b);
+        if (!b) abort();
+        v3_inv = b;
+        v3_inv_cap = c;
+    }
+    memset(&v3_inv[*n], 0, sizeof *v3_inv);
+    return &v3_inv[(*n)++];
+}
+
+static v3_srow *v3_slot_add(size_t *n, int owner, int family, int slot) {
+    if (*n == v3_slots_cap) {
+        size_t c = v3_slots_cap ? v3_slots_cap * 2 : 32;
+        v3_srow *b = realloc(v3_slots, c * sizeof *b);
+        if (!b) abort();
+        v3_slots = b;
+        v3_slots_cap = c;
+    }
+    v3_srow *r = &v3_slots[(*n)++];
+    memset(r, 0, sizeof *r);
+    r->v[ABP_V3_S_OWNER] = (float)owner;
+    r->v[ABP_V3_S_FAMILY] = (float)family;
+    r->v[ABP_V3_S_SLOT] = (float)slot;
+    r->v[ABP_V3_S_ID_KNOWN] = 1;
+    r->v[ABP_V3_S_SELECTED_KNOWN] = 1;
+    r->v[ABP_V3_S_CHARGE_KNOWN] = 1;
+    return r;
+}
+
+static const char *v3_items(const v3_room *r, const v3_body_t *bodies, int n_bodies, size_t *n_inv, size_t *n_slots) {
+    const void *config = ((const void *(*)(void))VFN(V_ITEMCONFIG))();
+    const void *pool = ((const void *(*)(const void *))VFN(V_ITEMPOOL))((const void *)r->game);
+    if (!config || !pool) return "v3: no item config or pool";
+    const void *colls = ((const void *(*)(const void *))VFN(V_IC_COLLS))(config);
+    long size = (long)((*(const char *const *)((const char *)colls + 8) - *(const char *const *)colls) / (ptrdiff_t)sizeof(void *));
+    if (size > ABP_V3_ABP_COLLECTIBLES) size = ABP_V3_ABP_COLLECTIBLES;   // (GetCollectibleNum: no bounds check)
+    *n_inv = *n_slots = 0;
+    for (int b = 0; b < n_bodies; b++) {
+        const void *p = bodies[b].p;
+        for (long id = 1; id <= size - 1; id++) {
+            int count = ((int (*)(const void *, int))VFN(V_NUM_HELD))(p, (int)id);
+            if (count > 0) {
+                v3_nrow *n = v3_inv_add(n_inv);
+                n->v[ABP_V3_N_OWNER] = (float)b; n->v[ABP_V3_N_ID] = (float)id; n->v[ABP_V3_N_COUNT] = (float)count;
+                n->v[ABP_V3_N_ID_KNOWN] = 1;
+            }
+        }
+        int active = G0(int, P_ACTIVE, p), charge = G0(int, P_CHARGE, p);
+        const void *ac = active != 0 ? ((const void *(*)(const void *, int))VFN(V_IC_COLL))(config, active) : NULL;
+        v3_srow *a = v3_slot_add(n_slots, b, 1, 0);
+        a->v[ABP_V3_S_ID] = (float)active; a->v[ABP_V3_S_OCCUPIED] = active != 0; a->v[ABP_V3_S_SELECTED] = 1;
+        a->v[ABP_V3_S_CHARGE] = (float)charge; a->v[ABP_V3_S_MAX_CHARGE] = ac ? (float)FIELD(int32_t, ac, IC_MAX_CHARGES) : 0;
+        a->v[ABP_V3_S_BATTERY] = (float)((int (*)(const void *))VFN(V_BATTERY))(p);
+        const char *sec = (const char *)p + PL_SECONDARY;
+        int sid = *(const int32_t *)sec;
+        if (((char (*)(const void *, int))VFN(V_HAS_COLL))(p, 534) != 0 || sid != 0) {   // (Schoolbag)
+            const void *desc = sid != 0 ? ((const void *(*)(const void *, int))VFN(V_IC_COLL))(config, sid) : NULL;
+            v3_srow *c = v3_slot_add(n_slots, b, 1, 1);
+            c->v[ABP_V3_S_ID] = (float)sid; c->v[ABP_V3_S_OCCUPIED] = sid != 0;
+            c->v[ABP_V3_S_CHARGE] = (float)*(const int32_t *)(sec + 4);
+            c->v[ABP_V3_S_MAX_CHARGE] = desc ? (float)FIELD(int32_t, desc, IC_MAX_CHARGES) : 0;
+            c->v[ABP_V3_S_BATTERY] = (float)*(const int32_t *)(sec + 8);
+        }
+        int max_tr = ((int (*)(const void *))VFN(V_MAX_TRINKETS))(p);
+        if (max_tr > ABP_V3_ABP_TRINKET_SLOTS) max_tr = ABP_V3_ABP_TRINKET_SLOTS;
+        for (int slot = 0; slot < max_tr; slot++) {
+            int id = ((int (*)(const void *, unsigned))VFN(V_TRINKET))(p, (unsigned)slot);
+            v3_srow *t = v3_slot_add(n_slots, b, 2, slot);
+            t->v[ABP_V3_S_ID] = (float)(id & 0x7fff); t->v[ABP_V3_S_OCCUPIED] = id != 0;
+            t->v[ABP_V3_S_GOLDEN] = (id & 0x8000) != 0; t->v[ABP_V3_S_CHARGE_KNOWN] = 0;
+        }
+        int max_pk = ((int (*)(const void *))VFN(V_MAX_POCKET))(p);
+        if (max_pk > ABP_V3_ABP_POCKET_SLOTS) max_pk = ABP_V3_ABP_POCKET_SLOTS;
+        for (int slot = 0; slot < max_pk; slot++) {
+            int pill = ((int (*)(const void *, int))VFN(V_PILL))(p, slot), card = ((int (*)(const void *, int))VFN(V_CARD))(p, slot);
+            int identified = pill > 0 && pill < ABP_V3_ABP_PILLS && ((char (*)(const void *, int))VFN(V_PILL_ID))(pool, pill) != 0;
+            int effect = identified ? ((int (*)(const void *, int))VFN(V_PILL_EFFECT))(pool, pill) + 1 : 0;
+            v3_srow *k = v3_slot_add(n_slots, b, card != 0 ? 4 : 3, slot);
+            k->v[ABP_V3_S_ID] = (float)(card != 0 ? card : effect);
+            k->v[ABP_V3_S_OCCUPIED] = pill != 0 || card != 0;
+            k->v[ABP_V3_S_SELECTED] = slot == 0;
+            k->v[ABP_V3_S_ID_KNOWN] = pill == 0 || identified;
+            k->v[ABP_V3_S_CHARGE_KNOWN] = 0;
+            k->v[ABP_V3_S_PILL_COLOUR] = (float)(pill & 0x7ff);
+            k->v[ABP_V3_S_GIANT] = (pill & 0x800) != 0;
+        }
+    }
+    return NULL;
+}
+
+// Stage 5: the minimap from the bridge's room list (visible_v3_raw's v3_map: the Lua code packs it, 6 bytes a room:
+// GridIndex, Shape, the icon code, visited, clear, current), as observation_frame_v3 writes it: the room's cell and
+// tok_obs.SHAPE_CELLS' offsets (cell 0 always, as the reference does).
+static const char *v3_minimap(const unsigned char *map, size_t len, float *minimap) {
+    static const signed char SHAPE[13][4] = {{-1, -1, -1, -1}, {-1, -1, -1, -1}, {-1, -1, -1, -1}, {-1, -1, -1, -1},
+                                             {0, 13, -1, -1}, {0, 13, -1, -1}, {0, 1, -1, -1}, {0, 1, -1, -1},
+                                             {0, 1, 13, 14}, {1, 13, 14, -1}, {0, 13, 14, -1}, {0, 1, 14, -1},
+                                             {0, 1, 13, -1}};
+    if (len % 6) return "v3: map block";
+    for (size_t at = 0; at < len; at += 6) {
+        int gi = map[at], shape = map[at + 1];
+        uint32_t w = 0;
+        if (v3_bits(&w, 1, ABP_V3_MAP_SHOWN_SHIFT, ABP_V3_MAP_SHOWN_BITS) ||
+            v3_bits(&w, map[at + 3], ABP_V3_MAP_VISITED_SHIFT, ABP_V3_MAP_VISITED_BITS) ||
+            v3_bits(&w, map[at + 4], ABP_V3_MAP_CLEAR_SHIFT, ABP_V3_MAP_CLEAR_BITS) ||
+            v3_bits(&w, map[at + 5], ABP_V3_MAP_CURRENT_SHIFT, ABP_V3_MAP_CURRENT_BITS) ||
+            v3_bits(&w, map[at + 2], ABP_V3_MAP_ICON_SHIFT, ABP_V3_MAP_ICON_BITS))
+            return "v3: a map bit does not fit";
+        int cells[5] = {0, -1, -1, -1, -1};
+        if (shape >= 0 && shape < 13)
+            for (int k = 0; k < 4; k++) cells[1 + k] = SHAPE[shape][k];
+        for (int k = 0; k < 5; k++) {
+            if (cells[k] < 0) continue;
+            int j = gi + cells[k];
+            if (j >= 0 && j < ABP_V3_MAP_SIDE * ABP_V3_MAP_SIDE) minimap[j] = (float)w;
+        }
+    }
+    return NULL;
+}
+
 // The frame into v3_buf; its size in floats in *n_floats. NULL, or why the Lua block is sent instead.
-static const char *v3_build(size_t *n_floats) {
+static const char *v3_build(const unsigned char *map, size_t map_len, size_t *n_floats) {
     v3_room r;
     r.game = obs_game();
     r.room = r.game ? G0(const void *, G_ROOM, (const void *)r.game) : NULL;
@@ -521,7 +652,10 @@ static const char *v3_build(size_t *n_floats) {
     int e = 0, overflow[5];
     const char *sel = v3_select(&r, bodies, p, &e, overflow);
     if (sel) return sel;
-    int n = 0, s = 0;   // (stage 4)
+    size_t n_inv = 0, n_slots = 0;
+    const char *it = v3_items(&r, bodies, p, &n_inv, &n_slots);
+    if (it) return it;
+    int n = (int)n_inv, s = (int)n_slots;
     size_t total = (size_t)ABP_V3_FIXED + (size_t)p * (ABP_V3_PF + ABP_V3_LOCAL) + (size_t)e * ABP_V3_EF +
                    (size_t)n * ABP_V3_NF + (size_t)s * ABP_V3_SF;
     if (total * 4 > ABP_V3_FRAME_BYTES) return "v3: frame past the byte budget";
@@ -557,14 +691,21 @@ static const char *v3_build(size_t *n_floats) {
         why = v3_entity_row(&r, v3_ents[i].e, curses, E + (size_t)i * ABP_V3_EF);
         if (why) return why;
     }
+    float *N = E + (size_t)e * ABP_V3_EF, *S = N + (size_t)n * ABP_V3_NF;
+    for (int i = 0; i < n; i++) memcpy(N + (size_t)i * ABP_V3_NF, v3_inv[i].v, sizeof v3_inv[i].v);
+    for (int i = 0; i < s; i++) memcpy(S + (size_t)i * ABP_V3_SF, v3_slots[i].v, sizeof v3_slots[i].v);
+    why = v3_minimap(map, map_len, canvas + (size_t)ABP_V3_CANVAS_H * ABP_V3_CANVAS_W * ABP_V3_ROOM_WORDS);
+    if (why) return why;
     *n_floats = total;
     return NULL;
 }
 
 static int v3_lua(lua_State *L) {
     v3_calls++;
-    size_t n = 0;
-    const char *why = v3_build(&n);
+    size_t n = 0, map_len = 0;
+    const unsigned char *map = (const unsigned char *)((const char *(*)(lua_State *, int, size_t *))V3FN(V3_TOLSTRING))(L, 1, &map_len);
+    if (!map) return obs_fallback(L, "v3: no map block");
+    const char *why = v3_build(map, map_len, &n);
     if (why) {
         v3_fallbacks++;
         snprintf(v3_last_fallback, sizeof v3_last_fallback, "%s", why);
