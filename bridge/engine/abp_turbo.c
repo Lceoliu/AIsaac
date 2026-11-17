@@ -2253,7 +2253,7 @@ static int step_write_all(int fd, struct iovec *iov, int n) {
 }
 
 // Only the bytes of a step line are consumed (never past its newline): luasocket reads every other command itself.
-static int step_read(int fd, long long v[6], const char **why) {
+static int step_read(int fd, long long v[7], const char **why) {
     char line[64];
     size_t have = 0;
     for (;;) {
@@ -2298,11 +2298,13 @@ static int step_read(int fd, long long v[6], const char **why) {
     line[have - 1] = 0;
     // "^S (%d+) (%d+) (%d+) (%d+) (%d+)$" as the bridge's Lua parse (numbers of up to 9 digits here); 2026-10-06 (items,
     // Phase A): an optional sixth number, the pill / card action ("S <repeat> <move> <shoot> <bomb> <item> <pill>");
-    // without it the pill is 0
+    // without it the pill is 0; 2026-11-17 (visible-v3 F2): an optional seventh, the drop action, only after a sixth
+    // ("... <pill> <drop>"); without it the drop is 0
     const char *c = line + 1;
     v[5] = 0;
-    for (int i = 0; i < 6; i++) {
-        if (i == 5 && *c == 0) break;
+    v[6] = 0;
+    for (int i = 0; i < 7; i++) {
+        if (i >= 5 && *c == 0) break;
         if (*c != ' ') return 3;
         c++;
         if (*c < '0' || *c > '9') return 3;
@@ -2370,7 +2372,7 @@ static int obs_lua_step(lua_State *L) {
         LPUSHSTR(L, "send failed", 11);
         return 2;
     }
-    long long v[6];
+    long long v[7];
     const char *err = "";
     int r = step_read(fd, v, &err);
     if (step_prof) {
@@ -2383,8 +2385,8 @@ static int obs_lua_step(lua_State *L) {
     if (r == 1) {
         step_lines++;
         LPUSHINT(L, 1);
-        for (int i = 0; i < 6; i++) LPUSHINT(L, v[i]);
-        return 7;
+        for (int i = 0; i < 7; i++) LPUSHINT(L, v[i]);
+        return 8;
     }
     if (r == 2 || r == 3) {
         if (r == 2) step_other++; else step_bad++;

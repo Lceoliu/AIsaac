@@ -882,7 +882,7 @@ local function try_accept()
 		log("client connected on port " .. cfg.port)
 		send({ type = "hello", version = VERSION, engine = "abplus-1.06", port = cfg.port,
 			privileged = cfg.privileged, game_frame = Game():GetFrameCount(), logic_frames = state.logic_frames,
-			step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items })
+			step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items, drop = true })
 	end
 end
 
@@ -2366,9 +2366,10 @@ local function play_next()
 	local p = state.play
 	p.i = p.i + 1
 	local code = math.floor(tonumber(p.codes[p.i]) or 0)
-	-- 2026-10-06 (items): + 180 x the pill / card action (codes below 180 as before)
+	-- 2026-10-06 (items): + 180 x the pill / card action (codes below 180 as before); 2026-11-17 (visible-v3 F2):
+	-- + 360 x the drop action (codes below 360 as before)
 	apply_action({ move = code % 9, shoot = (code // 9) % 5, bomb = (code // 45) % 2, item = (code // 90) % 2,
-		pill = (code // 180) % 2 })
+		pill = (code // 180) % 2, drop = (code // 360) % 2 })
 	state.frames_left = math.max(1, math.floor(tonumber(p.repeats and p.repeats[p.i]) or p.rep))
 	state.stats.steps = state.stats.steps + 1
 	if ABP_PU.play and state.frames_left > 1 and state.lean and state.native_input and not state.stop_clear
@@ -2436,7 +2437,7 @@ local function fork_clone(cmd)
 	set_native_input(state.lean)   -- needs the connection: without a client the engine reads the real devices
 	send({ type = "hello", version = VERSION, engine = "abplus-1.06", clone = true, tag = cmd.tag,
 		game_frame = Game():GetFrameCount(), logic_frames = state.logic_frames, turbo = getenv("ABP_FORK_COUNTERS"),
-		step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items })
+		step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items, drop = true })
 end
 
 -- fork_many (2026-10-04, same VERSION; hello says fork_many = true when abp_turbo has ABP_FM_*): the hindsight teacher's
@@ -2559,10 +2560,12 @@ end
 -- step command {"cmd":"step","repeat":..,"move":..,"shoot":..,"bomb":..,"item":..} without goal, stop_clear or duel
 -- fields, without its JSON parse (json.decode of a step command cost 0.07-0.12 ms, more than the native observation).
 -- 2026-10-06 (items): an optional sixth number is the pill / card action ("S <repeat> <move> <shoot> <bomb> <item>
--- <pill>"); without it 0.
-local step_cmd = { move = 0, shoot = 0, bomb = 0, item = 0, pill = 0 }
-local function begin_step_line(rep, move, shoot, bomb, item, pill)
+-- <pill>"); without it 0. 2026-11-17 (visible-v3 F2; hello says drop = true): an optional seventh number, the drop
+-- action ("S <repeat> <move> <shoot> <bomb> <item> <pill> <drop>"), only after a sixth; without it 0.
+local step_cmd = { move = 0, shoot = 0, bomb = 0, item = 0, pill = 0, drop = 0 }
+local function begin_step_line(rep, move, shoot, bomb, item, pill, drop)
 	step_cmd.move, step_cmd.shoot, step_cmd.bomb, step_cmd.item, step_cmd.pill = move, shoot, bomb, item, pill or 0
+	step_cmd.drop = drop or 0
 	apply_action(step_cmd)
 	state.goal = nil
 	state.nav = { hit = false, changed = false, min = -1 }
@@ -2581,7 +2584,11 @@ end
 -- One command line; true when the frame loop goes on (a step, play, reset or close), false to wait for the next.
 local function handle_command(line)
 		if line:byte(1) == 83 then   -- "S": a step line
-			local rep, move, shoot, bomb, item, pill = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+) (%d+)$")
+			local rep, move, shoot, bomb, item, pill, drop = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+) (%d+) (%d+)$")
+			if rep == nil then
+				rep, move, shoot, bomb, item, pill = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+) (%d+)$")
+				drop = "0"
+			end
 			if rep == nil then
 				rep, move, shoot, bomb, item = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+)$")
 				pill = "0"
@@ -2592,7 +2599,7 @@ local function handle_command(line)
 			end
 			begin_step_line(math.tointeger(tonumber(rep)), math.tointeger(tonumber(move)),
 				math.tointeger(tonumber(shoot)), math.tointeger(tonumber(bomb)), math.tointeger(tonumber(item)),
-				math.tointeger(tonumber(pill)))
+				math.tointeger(tonumber(pill)), math.tointeger(tonumber(drop or "0")))
 			return true
 		end
 		local ok, cmd = pcall(json.decode, line)
@@ -2834,12 +2841,12 @@ local function native_step_obs()
 		if sent then wait_command() end
 		return true
 	end
-	local code, a, b, cc, d, e, f = native_step(c:getfd(), state.logic_frames, state.seq, consecutive, nvis)
+	local code, a, b, cc, d, e, f, g = native_step(c:getfd(), state.logic_frames, state.seq, consecutive, nvis)
 	if nvis and code ~= 0 then ABP_NATIVE_VIS.native, ABP_NATIVE_VIS.step = ABP_NATIVE_VIS.native + 1, ABP_NATIVE_VIS.step + 1 end
-	if code == 1 then   -- a step line: (repeat, move, shoot, bomb, item[, pill]: a library without it gives nil = 0)
+	if code == 1 then   -- a step line: (repeat, move, shoot, bomb, item[, pill[, drop]]: a library without them gives nil = 0)
 		s.steps, s.lines, s.consecutive = s.steps + 1, s.lines + 1, true
 		ABP_NATIVE_OBS.native = ABP_NATIVE_OBS.native + 1
-		begin_step_line(a, b, cc, d, e, f)
+		begin_step_line(a, b, cc, d, e, f, g)
 	elseif code == 2 or code == 3 then   -- sent; another kind of command waits in the socket, or a bad step line
 		s.steps, s.other = s.steps + 1, s.other + 1
 		ABP_NATIVE_OBS.native = ABP_NATIVE_OBS.native + 1
