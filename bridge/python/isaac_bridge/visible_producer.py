@@ -437,3 +437,41 @@ def unpack_frame_v3(payload):
         out[name] = f[at:at + k].reshape((count,) + shape if name not in ('canvas', 'minimap') else shape)
         at += k
     return out
+
+
+# ------------------------------------------------------------------ v3 in the worker (encode_row; off unless enabled)
+# ISAAC_RL_VISIBLE_V3=1 (the bridge's lean payload then carries visible_v3_raw()'s block, flag 32, schema
+# 'isaac-visible-raw-v3'): encode_row writes the v3 frame into ROW.visible_frame (visible_schema = schema_v3.VERSION)
+# and, after its progress update, the stall columns of every body (P 40 / 53, v3_backfill_stall).
+import os as _os
+
+VISIBLE_V3 = _os.environ.get('ISAAC_RL_VISIBLE_V3', '0') == '1'
+RAW_SCHEMA_V3 = 'isaac-visible-raw-v3'
+
+
+def is_raw_v3(block):
+    return isinstance(block, dict) and block.get('schema') == RAW_SCHEMA_V3
+
+
+def write_frame_v3(row, payload):
+    """The v3 frame bytes into a ROW (a length-1 view): visible_bytes, visible_frame, visible_schema = V3.VERSION."""
+    if len(payload) > V3.FRAME_BYTES or len(payload) > row['visible_frame'].shape[-1]:
+        raise ValueError('visible-v3 frame exceeds the transport byte budget')
+    row['visible_bytes'] = len(payload)
+    row['visible_frame'][0, :len(payload)] = np.frombuffer(payload, np.uint8)
+    row['visible_schema'] = V3.VERSION
+
+
+_F4 = np.dtype('<f4')
+_STALL_AT = (V3.col(V3.P_COLS, 'stall_share'), V3.col(V3.P_COLS, 'stall_known'))
+
+
+def v3_backfill_stall(row, share, known):
+    """P cols 40 (stall_share) / 53 (stall_known) of every body of the v3 frame in row, written after encode_row's
+    progress update (so a record with progress this step shows 0). The bodies' P tokens start at schema_v3.FIXED."""
+    frame = row['visible_frame'][0]
+    head = np.frombuffer(frame[:V3.HEADER * 4].tobytes(), _F4)
+    for i in range(int(head[V3.H_P])):
+        at = (V3.FIXED + i * V3.PF) * 4
+        frame[at + _STALL_AT[0] * 4:at + _STALL_AT[0] * 4 + 4] = np.frombuffer(np.float32(share).tobytes(), np.uint8)
+        frame[at + _STALL_AT[1] * 4:at + _STALL_AT[1] * 4 + 4] = np.frombuffer(np.float32(known).tobytes(), np.uint8)

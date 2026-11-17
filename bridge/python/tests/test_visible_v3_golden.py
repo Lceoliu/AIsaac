@@ -73,3 +73,22 @@ def test_the_special_cases():
     assert [int(r[V3.col(P, 'position_known')]) for r in soul['P']] == [1, 0]
     assert any(int(r[0]) == 3 and int(r[1]) == 900 for r in soul['E'])           # the Forgotten's body, a familiar
     assert not any(int(r[0]) == 1000 and int(r[1]) == 114 for r in soul['E'])   # the chain: decorative
+
+
+def test_worker_row_and_stall_backfill():
+    """The worker side (ISAAC_RL_VISIBLE_V3=1): write_frame_v3 puts the frame into a ROW (visible_schema = the v3
+    VERSION) and v3_backfill_stall writes P 40 / 53 of every body after encode_row's progress update, nothing else."""
+    from isaac_bridge.tok_obs import ROW
+    payload = (FIX / 'forgotten.v3.bin').read_bytes()   # (two bodies)
+    row = np.zeros(1, ROW)
+    VP.write_frame_v3(row, payload)
+    assert int(row['visible_schema'][0]) == V3.VERSION and int(row['visible_bytes'][0]) == len(payload)
+    VP.v3_backfill_stall(row, 0.25, 1.0)
+    got = bytes(row['visible_frame'][0, :len(payload)])
+    a, b = VP.unpack_frame_v3(payload), VP.unpack_frame_v3(got)
+    s, k = V3.col(V3.P_COLS, 'stall_share'), V3.col(V3.P_COLS, 'stall_known')
+    assert list(b['P'][:, s]) == [0.25, 0.25] and list(b['P'][:, k]) == [1.0, 1.0]
+    mask = np.ones(V3.PF, bool)
+    mask[[s, k]] = False
+    assert np.array_equal(a['P'][:, mask], b['P'][:, mask]) and np.array_equal(a['E'], b['E'])
+    assert np.array_equal(a['canvas'], b['canvas']) and np.array_equal(a['local'], b['local'])

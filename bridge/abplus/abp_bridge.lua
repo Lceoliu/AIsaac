@@ -257,6 +257,10 @@ local state = {
 	-- see pack_lean) and the run-mode map rules. Off unless ISAAC_RL_LEAN_ITEMS=1 at launch or the `lean_items` command
 	-- (clones inherit it); off, the bytes on the wire are those of abp-0.2.15.
 	lean_items = getenv("ISAAC_RL_LEAN_ITEMS") == "1",
+	-- visible-v3 (package C, 2026-11-17; off by default): the lean payload's visible block (flag 32) is
+	-- visible_v3_raw()'s JSON (schema "isaac-visible-raw-v3") instead of the v2 block; the native visible step (G)
+	-- is not used then. ISAAC_RL_VISIBLE_V3=1 at launch, or the visible_v3 command
+	visible_v3 = getenv("ISAAC_RL_VISIBLE_V3") == "1",
 }
 
 -- abp-0.2.13: an undiscovered secret-room door (DOOR_HIDDEN) is not part of what the player sees.
@@ -2386,6 +2390,7 @@ end
 
 -- The visible block as the mode says (see ABP_NATIVE_VIS); the Lua block when the native one hands over
 function visible_block()
+	if state.visible_v3 then return spack("<s4", visible_v3_raw()) end   -- (v3: the raw block, Lua only for now)
 	local mode = native_visible ~= nil and ABP_NATIVE_VIS.mode or 0
 	if mode == 0 then return visible_input_block() end
 	local v = ABP_NATIVE_VIS
@@ -3011,6 +3016,9 @@ local function handle_command(line)
 			state.priv = cmd.enabled ~= false
 			priv_reset()
 			send({ type = "ok", cmd = "priv", enabled = state.priv, sent = PRIV.sent, skipped = PRIV.skipped })
+		elseif cmd.cmd == "visible_v3" then   -- 2026-11-17 (visible-v3, package C): the v3 raw block in the lean payload
+			if cmd.enabled ~= nil then state.visible_v3 = cmd.enabled == true end
+			send({ type = "ok", cmd = "visible_v3", enabled = state.visible_v3 })
 		elseif cmd.cmd == "lean_items" then   -- 2026-10-06 (items, Phase A): the inventory block and run-mode map rules
 			if cmd.enabled ~= nil then
 				state.lean_items = cmd.enabled == true
@@ -3192,7 +3200,7 @@ local function native_step_obs()
 	s.consecutive = false
 	-- (G, 2026-11-12) native visible mode 1: lean_blocks leaves the visible block out; the fast path (no other block)
 	-- has abp_native_step append the native one, a slow one builds it below
-	local nvis = native_visible ~= nil and ABP_NATIVE_VIS.mode == 1
+	local nvis = native_visible ~= nil and ABP_NATIVE_VIS.mode == 1 and not state.visible_v3
 	local ok, terrain, map, inv, visible = pcall(lean_blocks, "step", resend, here, clear, nvis)
 	if ok and nvis and (terrain ~= "" or map ~= "" or inv ~= "") then visible = visible_block() end
 	if not ok or terrain ~= "" or map ~= "" or inv ~= "" or visible ~= "" then
