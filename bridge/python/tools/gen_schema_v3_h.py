@@ -118,6 +118,13 @@ def generate():
           f'#define ABP_V3_V2_META {S.V2_META}', f'#define ABP_V3_TEACH_META {S.TEACH_META}']
     L += [f'#define ABP_V3_V2_{_ident(k)} {i}' for i, k in enumerate(S.V2_FIELDS)]
     L += [f'#define ABP_V3_TEACH_{_ident(k)} {i}' for i, k in enumerate(S.TEACH_FIELDS)]
+    L += ['', '/* ---- engine argument ranges, AB+ (schema_v3.ABP_RANGES; the producers loop only inside them) */']
+    for k, (v, _) in S.ABP_RANGES.items():
+        L.append(f'#define ABP_V3_ABP_{_ident(k)} {v}')
+    L += ['', '/* ---- decorative effects never sent (schema_v3.DECORATIVE_EFFECTS; dropped only while CollisionDamage is 0) */',
+          f'#define ABP_V3_DECORATIVE_N {len(S.DECORATIVE_EFFECTS)}',
+          'static const int ABP_V3_DECORATIVE[ABP_V3_DECORATIVE_N] = {'
+          + ', '.join(str(v) for v in sorted(S.DECORATIVE_EFFECTS)) + '};']
     L += ['', '#endif', '']
     return '\n'.join(L)
 
