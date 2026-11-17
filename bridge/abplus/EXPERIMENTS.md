@@ -150,6 +150,8 @@
 | C107 | 11-14/15 | ab2：两组从零对照各 1,200 游戏小时，强制拾取都是 1:0.952（与 C99 前 1,220 小时相当）；A 组 = C99 的旧树 1ae82d3 与 hpc_c99.sh 配方（16 worker），B 组 = block-memory 这一套（ab1-force 只改强制），gpu57 | 约 163× / 192×；留出评测 1,200 小时：A 过层 0.117、清房 2.90、每局道具 1.98（C99 1,220 小时为 0.02 / — / 1.1），B 过层 0、清房 0.09、道具 0.02；按事先定的读法 = 新的一套有问题，哪一项未拆开 |
 | C108 | 11-15 | block-memory 一套的四项诊断（用户 11-15：先不拆分，诊断这一套）：D1 actor / learner 对数概率一致性，D2 动作与效果，D3 学习率 5e-5 跑 400 小时，D4 输入的静态对比与线性探针；gpu57 | D1：差约千分之三（旧树万分之五），没有一条超出裁剪；D2：两套动作都在 t+1→t+2 生效，B 的移动接近随机游走；D3：过层 0、清房 0.10，与 ab2-bm 同期相同；D4：门方向 B 可读、不比 A 差，敌人方向与"下一步换房间"B 明显弱于 A |
 | C109 | 11-15 | block-memory 一套的两组 400 小时对照（用户 11-15 批准）：ab4-sync 同步 learner（去掉 --overlap），ab4-noaux 关掉 aux-predict 和 priv-critic；外加 D5：固定权重下 PPO 梯度的一致性（两栈、三组权重、各 16 轮）；gpu57 | 两组都不算学会：u201–330 清房 ≥1 为 0.231 / 0.183（阈值 0.35，A 0.50），评测离开起始房间 0.336 / 0.266。D5：跨轮策略梯度的两两余弦 block 0.002–0.007，旧栈 0.023–0.089，\|μ\|²/E 都只有 0–10%；block 偏低，三组同向，合并约 2.5 个标准误；不做逐开关排查（每个开关需 64 轮以上） |
+| C110 | 11-15 | 病因定位的五组 400 小时对照：c45a583 上的旧模型（R＠c45 = A 组命令行，Q＠c45 = 再加 ab2-bm 的学习侧设置）、block 全 fp32、maa1e98a 上的旧模型（Q＠maa）、block 关三个使用头（门组）；外加 D5 按动作头分解；gpu57 | 旧模型三组都学会（u201–330 清房 ≥1 0.483 / 0.506 / 0.493，评测 128 局全部离开起始房间），block 两组学不会（0.210 / 0.225）：病因只剩 block 专有部分（模型、可见帧输入、block 的损失与历史路径、C++ driver 等实现）；撤回 C109 的"差距在随机初始化时就存在" |
+| C111 | 11-16 | block 一套的实现回退，各计划 400 小时：REF（C++ driver、整步 graph、packed learner、编译、原生打包、预取、C 帧编码器全部换回参考实现）、VN0（只关 C 帧编码器）、HD（history detach）；gpu57 | VN0 400 小时清房 ≥1 0.17–0.20，评测超时 94.5%；REF 到 u151（183 小时）0.167–0.170，按 u150 规则停止，评测与 VN0 分不开：实现优化不是原因。HD 在 u36 按用户指示停下，不下结论（同一问题后由 C112 的 l2hd / l2hs 回答） |
 
 ## A. 桥接与环境
 
@@ -12931,3 +12933,371 @@ D5 的原始文件：/root/AIsaac/train/c109/d5/<配置>/d5_grad.jsonl（每轮�
   这与上面三类中的前两类对应（随机历史重算是 block 独有的，Q 里也一并去掉）；Q 和全 fp32 两组正好能把它们分开。
 - **两组对照都没有改变结果**，说明 C108 列出的"还没有检验过的"里，重叠和 aux / priv 两项可以排除。剩下的候选（Q：新代码里的旧模型；全 fp32）的命令行差异见协调会话笔记 c110-q-fp32-cmdline-1115.md。全 fp32 下 cudnn 卷积默认仍走 TF32，要不要关由用户定。
 - 做不做、先做哪一项，由用户决定。
+
+3. README.md 没有按编号列条目的索引（它只说"实验进度和结论：EXPERIMENTS.md 的总览表"），不用改。
+
+---8<--- 以下逐字追加到 EXPERIMENTS.md 末尾 ---8<---
+
+### C110 病因定位的五组 400 小时对照：c45a583 上的旧模型（R＠c45 / Q＠c45）、全 fp32、maa1e98a 上的旧模型（Q＠maa）、关三个使用头（门组），以及 D5 分头，gpu57（2026-11-15，已完成）
+
+**实验目的**
+
+C109 排除了重叠和 aux / priv，把还没检验过的部分归成三类：(1) 模型、输入和动作门；(2) bf16；(3) 新代码的学习路径（block history 的梯度路径、C++ driver 的采样器路径）。本轮用几组 400 小时对照，把病因落到其中一类：
+
+- **R / Q：问题在代码还是在设置**。原定在新树 maa1e98a 上跑旧模型：R 用 A 组命令行，Q 用 ab2-bm 的设置。旧模型在新树上起不来（见方法），于是改在 c45a583（f3264e0 的父提交）上跑 R＠c45、Q＠c45：
+  - R＠c45：1ae82d3..c45a583 的 141 个提交，是否已经让旧模型学不会；
+  - Q＠c45：ab2-bm 的学习侧设置（bf16、重叠、aux / priv、缓冲区、学习率 / 批量 / 奖励）放在旧模型上，是否会阻止学习。
+- **fp32**：block 一套全精度运行，检验 bf16。
+- **第二批（11-15 晚，协调方定）**：
+  - **Q＠maa**：maa1e98a 上跑旧模型。学会了，就排除两套栈共用的全部新代码和新设置；
+  - **门组**：block 一套把 bomb / item / pill 三个使用头整体关掉，检验常开的动作门。
+- **D5 分头**：把 C109 的 PPO 梯度一致性按五个动作头拆开，并复核 C109 的"差距在随机初始化时就存在"。
+
+**实验方法**
+
+- **机器**：gpu57，bm1 的 Docker 容器（aisaac-bench:20261019）。
+- **共同设置**：
+  - 都跑 400 游戏小时（u330）。
+  - 强制拾取都是 1:0.984。A 组是 1:0.952 跑 1,200 小时，两者前 400 小时逐点相同：p = 1 − 0.016·h/400。
+- **原定 R / Q 作废**：
+  - 冒烟（15:51 起）两组都在第一次 actor 调用时退出，rc 1，0 次更新。Q 的守护自动续跑了一次，错误相同，之后写了 STOP。
+  - 报错：`ValueError: visible-v2 requires BlockActor, not the legacy GraphActor`（tok_policy.py:2340）。
+  - 原因：从 f3264e0（11-07，1ae82d3 之后第 142 个提交）起，旧模型在新树上就不能运行：
+    - Lua 桥接层对每次观测都无条件发送 visible-v2 块；
+    - `tok_obs.encode_row` 收到就写 `visible_schema`；
+    - 旧模型的 `GraphActor.submit` 见到非零 schema 就报错。
+  - 冒烟目录移到 trash/20261115/c110s-{r,q}-graphactor。
+- **R＠c45**：
+  - 树 trees/mc45a583（`git archive c45a583 bridge`，tar sha1 48a9e54b）。ABP_HOME 为 bm1/home-c45，libabp_turbo.so 从这棵树编译，行编码版本 0x072e19，FastRow 开。
+  - 命令行：xold_c99.sh（A 组），逐词不变，train_args 只有 `--pickup-force 1:0.984`。
+  - NO_RESUME=1：c45 的 `--resume` 会把游戏时和强制进度从头起算。
+  - GPU 4 单卡同步，节点 0 的 CPU。
+- **Q＠c45**：在 R＠c45 的命令行上加：
+  - `--overlap --decoupled 1 --learner-fast 0 --amp bf16 --actor-bf16 1 --aux-predict 1 --aux-horizons 1,8 --aux-coef 0.1 --priv-critic 1 --teach-buffer 8000 --teacher-v2-buffer 4000`；
+  - ab2-bm train_args 里 c45 认识的部分：minibatch / micro 4096、lr 1e-4、奖励、run-seconds 1800、stall-progress events、floor-stall 60。
+  - c45 没有的参数不替代：cf-per-clear、cap-truncate、stall-truncate、lr-schedule、lr-warmup。后两项在 lr 恒定时等价。
+  - GPU 5 单卡（重叠），节点 1 的 CPU。
+  - **重叠方式与 ab2-bm 不同**：c45 单卡 `--overlap` 下，actor 在收集中途就换上新权重，只有一部分 rollout 落后一次更新（stale_share 正式跑时 0.34–0.37）；ab2-bm 是整批落后一次（约 1）。
+- **fp32**：
+  - ab2-bm 的 train_args 加 `--amp off --actor-bf16 0 --micro 2048`。GPU 6（actor）+ 7（learner）。cudnn 卷积的 TF32 保持 torch 默认（开）。
+  - **maa1e98a 的 block 栈在 `--amp off` 下启动即崩**（冒烟 c110s-f，15:58，16 秒后 rc 1）：
+    - train_tok.py:2852 的 `warm_spatial(..., bf16=amp or args.actor_bf16)`，在 amp 为 False、actor_bf16 为 int 0 时得到 int 0；
+    - 传到 block_compile.py:238 的 `torch.autocast(enabled=...)`，报 `TypeError: ... must be bool, not int`；
+    - 这一行来自 2bd8bf7（B42）和 8178b4a（P2）。ab2-bm 以来一直用 bf16，所以从没走到过这个分支。
+  - 所以 fp32 用一次性树 trees/maa1e98a-f32。它对 maa1e98a 的全部差异是两处 bool 转换（train_tok.py:2852、2865）：`bf16=bool(amp or args.actor_bf16)`。
+    - diff 存于 /root/AIsaac/train/c110/f32_tree.diff；
+    - 崩掉的冒烟移到 trash/20261115/c110s-f-ampoff-crash；
+    - 这处修复作为单独的 bug 修复提交，本条写入时还没有提交。
+- **Q＠maa**：
+  - 一次性树 trees/maa1e98a-nv，只改 tok_obs.encode_row 一行：设了 ISAAC_NO_VISIBLE=1 时不写可见帧，visible_schema 记 0。Lua 不改。diff 在 c110/nv_tree.diff。
+  - 命令行：ab2-bm 的 train_args（pickup-force 1:0.984），末尾加 `--block-memory 0 --temporal 1 --obs-v2 1`。
+  - 旧模型走 Python actor，没有 C++ driver（REQUIRE_DRIVER=0）。GPU 4 + 5。
+  - 冒烟（19:06，u7）：
+    - 错误全 0；参数 7,056,611，与 ab2-c99old 相同；约 184×；
+    - pending[t+1]==action[t] 五个头都是 1.000；
+    - 续跑正常；4 种子试评测 0 错误。
+  - D1（lr 0，u7–u11）：|Δlogp| 均值 0.00026–0.00028，p99 0.0012–0.0014。
+- **门组**：
+  - 一次性树 trees/maa1e98a-gate：ISAAC_BLOCK_GATE=closed 时，structured_input.action_gate 返回全关的常量。bomb / item / pill 只能输出"不使用"；move、shoot 不受门控。diff 在 c110/gate_tree.diff。
+  - 本组只做诊断，不是恢复旧门。门常开是 11-12 用户认可的可见帧设计的一部分（"可用性是观测不是规则"），正式设计由用户定。
+  - 一致性：actor 和 learner 的各条路径都经同一个 action_gate 取门，门又是常量，两侧一致由构造保证。
+  - 只读核实过没有绕过策略注入"使用"动作的地方：
+    - cf_wall 为 0；
+    - CF / v2 只约束移动；
+    - 教师 v1 只用移动头；
+    - 强制拾取只改移动和 shoot。
+  - 命令行：ab2-bm 的 train_args，pickup-force 1:0.984。其余与 ab2-bm 相同：bf16、重叠、aux / priv、C++ driver。GPU 6 + 7。
+  - 冒烟（19:47–20:02，u7）：
+    - 错误全 0；ent_bomb / item / pill 从第 1 次更新起都是 0；
+    - D1 导出的 74,704 个决策（强制 4,572 个）里，"门关而动作为使用"0 次；
+    - D1 |Δlogp| 均值 0.000164–0.000173，p99 0.00065–0.00070，比 ab2-bm 的 bf16 D1（0.0026–0.0035）小一个量级。
+- **评测**：
+  - 各组 last.pt（u330），128 个种子 2147490000 起，14 worker，经 evtools/eval_ent.py，含 entropy.json。
+  - c45 两组用 c45 自己的 eval_tok 和 home-c45（ev_ab2.sh 的 EV_TREE / EV_ABHOME）。
+  - block 各组用 maa1e98a 的 eval_tok，与 C109 相同。
+- **D5 分头**（GPU 4、5，lr 0）：
+  - 每个头 h 的梯度：g_h = ∇Σ(rw·wgt·keep·(−A)·logp_h)，logp_h 由 model.split(logits, gate) 拆出；ms = g_move + g_shoot。
+  - 核对五头之和是否等于训练器自己的 pg_trainer：新栈 cos ≥ 0.99997（bf16 下 rel_diff ≤ 8e-3），旧栈 cos = 1.000000。
+  - 新初始化（18:29–18:59，seed 1000）：
+    - bm-fresh-heads：block，树 maa1e98a-d5，16 批；
+    - c99old-fresh-heads：旧栈，树 m1ae82d3-d5，17 批。
+  - 训练中的检查点（21:37–22:25）：bm-u0250-heads、bm-last-heads（ab2-bm 的 u250 / last）各 16 批，c99old-u0250-heads 17 批。
+  - 原始文件：/root/AIsaac/train/c110/d5h/。
+- **运维脚本**：都在 gpu57 的 bm1/ 下，本条写入时还没有进 repo：
+  - c110_after.sh、c110_fp32.sh、c110_gate.py、c110_qmaa.sh、c110_gatearm.sh、c110_usecount.py；
+  - env/gpu57-c110-{a,b,r45,q45}.env；
+  - ev_ab2.sh 的 EV_TREE / EV_ABHOME / EV_ENVS / EV_PORT；
+  - c108/d1_run.sh 的 D1_GPUS / D1_CPUSET / D1_MEMS / D1_CODE / D1_ARGS；
+  - 一次性的 c108/c110_d5h.sh、c110_d5ck.sh、d5hook.py v3。
+
+**实验结果**
+
+*运行情况*（×实时为 progress.csv 中 x_real_time 的中位数）
+
+| 组 | 时间（UTC） | 结束 | ×实时 | 备注 |
+|---|---|---|---|---|
+| R＠c45 | 16:10–18:06 | rc 0，u330，400.5 小时 | 208.9 | 没有续跑，errors 0 |
+| Q＠c45 | 16:10–18:21 | rc 0，u330，400.5 小时 | 180.8 | 同上 |
+| fp32 | 16:33–19:43 | rc 0，u330，400.6 小时 | 128.5 | 只有 attempt 1，没有 OOM；learner 卡（GPU 7）显存峰值 16.3 GB |
+| Q＠maa | 19:26–21:29 | rc 0，u330，400.5 小时 | 195.2 | 没有续跑 |
+| 门组 | 20:02–22:04 | rc 0，u330，400.6 小时 | 206.5 | 没有续跑 |
+
+*窗口*（每 100 次更新一窗，win100_c110-{r45,q45,f,qm,g}.txt；grad_norm、stale_share 取自 progress.csv；清房 ≥1 指至少清掉一个房间的局占比）
+
+| 组 | 窗口（累计游戏时） | 清房 ≥1 | move 熵 | KL | grad_norm 均值 [范围] | stale_share | ×实时 |
+|---|---|---|---|---|---|---|---|
+| R＠c45 | u1–100（121） | 0.266 | 2.042 | 0.0098 | 0.95 [0.69, 1.33] | 0 | 219 |
+| | u101–200（243） | 0.331 | 1.822 | 0.0130 | 1.19 [0.96, 1.72] | 0 | 207 |
+| | u201–300（364） | 0.461 | 1.797 | 0.0140 | 1.22 [0.96, 1.60] | 0 | 207 |
+| | u301–330（401） | 0.569 | 1.690 | 0.0145 | 1.45 [1.24, 1.91] | 0 | 196 |
+| Q＠c45 | u1–100 | 0.265 | 1.948 | 0.0150 | 1.03 [0.75, 1.37] | 0.37 [0.00, 0.61] | 213 |
+| | u101–200 | 0.395 | 1.757 | 0.0201 | 1.29 [1.08, 1.60] | 0.34 [0.30, 0.43] | 178 |
+| | u201–300 | 0.489 | 1.679 | 0.0206 | 1.32 [1.15, 1.63] | 0.35 [0.28, 0.39] | 178 |
+| | u301–330 | 0.572 | 1.642 | 0.0227 | 1.45 [1.23, 1.63] | 0.34 [0.31, 0.39] | 180 |
+| fp32 | u1–100 | 0.178 | 1.987 | 0.0247 | 0.74 [0.43, 1.07] | — | 120 |
+| | u101–200 | 0.200 | 1.919 | 0.0354 | 0.85 [0.70, 1.13] | — | 127 |
+| | u201–300 | 0.213 | 1.878 | 0.0373 | 0.98 [0.81, 1.23] | — | 146 |
+| | u301–330 | 0.202 | 1.885 | 0.0384 | 1.10 [0.98, 1.23] | — | 135 |
+| Q＠maa | u1–100 | 0.245 | 1.982 | 0.0175 | 0.99 [0.62, 1.38] | 0.62 | 208 |
+| | u101–200 | 0.322 | 1.843 | 0.0222 | 1.24 [1.04, 1.49] | 0.55 | 200 |
+| | u201–300 | 0.475 | 1.818 | 0.0222 | 1.35 [1.10, 1.65] | 0.49 | 188 |
+| | u301–330 | 0.557 | 1.777 | 0.0232 | 1.47 [1.27, 1.79] | 0.47 | 187 |
+| 门组 | u1–100 | 0.199 | 1.990 | 0.0215 | 0.70 [0.49, 1.11] | 0.99 | 194 |
+| | u101–200 | 0.226 | 1.767 | 0.0325 | 0.75 [0.55, 0.97] | 1.00 | 207 |
+| | u201–300 | 0.222 | 1.812 | 0.0370 | 0.88 [0.76, 1.06] | 1.00 | 215 |
+| | u301–330 | 0.236 | 1.884 | 0.0321 | 0.81 [0.70, 0.94] | 1.00 | 223 |
+
+- fp32 的窗口文件没有汇总 stale_share。
+- **使用头熵**（bomb / item / pill）：
+  - fp32 被推向最大熵：0.535 / 0.523 / 0.495 → 0.676 / 0.670 / 0.662；
+  - Q＠maa 约 0.003 / 0.008 / 0.000（旧栈的门几乎总是关的）；
+  - 门组全程为 0。
+- **grad_clip_frac**：
+  - fp32 0.11 → 0.57；
+  - Q＠maa 0.39 → 0.96，但照样学会；
+  - 门组 0.10–0.20。
+- **门组的 v2 记录**：v2_loss_pi 共 229 行，范围 2.6–7.2，KL 最大 0.058，没有出现 −1e9 的 logp。
+- Q＠c45 的 KL 比 R＠c45 高约 1.5 倍；grad_norm 前三个窗口高约 8%，最后一个窗口持平。
+
+*五组的最终对照*
+
+- 训练一列：u201–330 合并的清房 ≥1。
+- 评测：last（u330），128 个种子 2147490000:128，采样。
+- "离开起始房间"指 episodes.json 里 `entered ≥ 1` 的局。
+
+| 组 | 模型 / 树 | ×实时 | u201–330 清房 ≥1 | 评测：过层 | 清房 | 清房 ≥1 的局 | 离开起始房间的局 | 死亡 / 超时 | move 熵 | 评测 ×实时 | 判定 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| R＠c45 | 旧模型，c45a583，A 组命令行 | 208.9 | 0.483 | 0 | 1.23 | 0.680 | 1.000 | 0.398 / 0.602 | 1.748 | 44 | 学会 |
+| Q＠c45 | 旧模型，c45a583，加 ab2-bm 学习侧 | 180.8 | 0.506 | 0 | 1.30 | 0.703 | 1.000 | 0.328 / 0.672 | 1.659 | 46 | 学会 |
+| fp32 | block，maa1e98a-f32 | 128.5 | 0.210 | 0 | 0.023 | 0.023 | 0.0625 | 0.023 / 0.977 | 2.043 | 48 | 学不会 |
+| Q＠maa | 旧模型，maa1e98a-nv，ab2-bm 设置 | 195.2 | 0.493 | 0 | 1.05 | 0.625 | 1.000 | 0.422 / 0.578 | 1.774 | 43 | 学会 |
+| 门组 | block，maa1e98a-gate | 206.5 | 0.225 | 0 | 0.023 | 0.023 | 0.094 | 0.039 / 0.961 | 2.108 | 46 | 学不会 |
+| 参照：ab2-bm u989（C107） | block，maa1e98a | — | 0.235（C109） | 0 | 0.09 | — | 0.227 | 0.047 / 0.953 | 2.071 | — | 学不会 |
+
+- fp32 一行的"清房 ≥1 的局"：episodes.json 中 3/128 = 0.023（3 局各清 1 个房间）。
+- **其他评测读数**（entropy.json）：
+  - R＠c45 / Q＠c45 的 Boss 0.023 / 0.008，炸弹 p(use) 0.0009 / 0.0010。
+  - 旧栈动作门打开的决策占比（R / Q）：bomb 0.40 / 0.31，item 0.008 / 0.010，pill 0.0002 / 0.0007。
+  - fp32 的使用头熵 0.690 / 0.688 / 0.688，接近 ln2；p(use) 0.48 / 0.46 / 0.48；门打开占比 1.0。
+- 原始文件：/root/AIsaac/train/c110/eval/c110-{r45,q45,f,qm,g}-c128-last/{summary,entropy,episodes}.json。
+
+*D5 分头：新初始化*（16–17 批合计）
+
+- 共享参数：新栈 reader / readout4 / writer / zr_proj / spatial，共 10.7M；旧栈 trunk / temporal，共 7.0M。
+
+| | move | shoot | bomb | item | pill | ms | 使用头 / ms ¹ | cos(ms, pg_trainer) | PG / total |
+|---|---|---|---|---|---|---|---|---|---|
+| 新栈 | 0.0313 | 0.0248 | 0.0098 | 0.0062 | 0.0040 | 0.0401 | 0.31 | 0.943 | 0.40% |
+| 旧栈 | 0.0495 | 0.0474 | 0.0063 | 0.0038 | 0.0002 | 0.0678 | 0.11 | 0.993 | 0.38% |
+
+¹ bomb、item、pill 三个头范数的平方和开根号，再除以 ms 的范数。
+
+- **门**：新栈三个使用头门关闭的占比都是 0，p(use) 0.048 / 0.018 / 0.018；旧栈门关闭的占比 0.966 / 0.909 / 0.998。
+- **批间一致性**（两两余弦）：
+  - 新栈 item、pill 约为 0，与 move、shoot 相同；
+  - bomb：新栈 0.06–0.28，旧栈 0.71。旧栈的门几乎总关着，bomb 头只有"压低使用概率"一个方向。
+  - sum 的 |均值| / 范数：新栈 0.31，旧栈 0.25。
+
+*D5 分头：训练中的检查点*
+
+| | move | shoot | bomb | item | pill | ms | 使用头 / ms | cos(ms, pg_trainer) |
+|---|---|---|---|---|---|---|---|---|
+| bm u250 | 1.395 | 0.657 | 0.435 | 0.548 | 0.429 | 1.564 | 0.52 | 0.88 |
+| bm last | 3.858 | 1.796 | 1.705 | 0.912 | 0.609 | 4.28 | 0.47 | 0.90 |
+| c99old u250 | 2.288 | 0.926 | 0.156 | 0.111 | 0.017 | 2.492 | 0.08 | 0.996 |
+
+- p(use)：新栈 u250 0.003 / 0.54 / 0.42，last 0.032 / 0.54 / 0.46，门都开着；旧栈 u250 0.001 / 0.005 / 0.0001。
+- ms 自身的批间余弦（各参数组的范围）：bm u250 0.012–0.110，bm last 0.006–0.029，c99old u250 0.036–0.089。
+
+*撤回 C109 的"差距在随机初始化时就存在"*
+
+C109 的结论写过："随机权重下差距最大，说明这个差别在初始化时就存在"。本轮在同一配置下（随机初始化、seed 1000、lr 0）各重跑一次，比较共享参数上 pg_trainer 的两两余弦（协调方复核）：
+
+| 栈 | C109 | C110 |
+|---|---|---|
+| 旧栈 | c99old-fresh 0.089 ± 0.033（前 8 批 / 后 8 批均值的余弦 0.51） | c99old-fresh-heads 0.003 ± 0.027（0.01） |
+| 新栈 | bm-fresh 0.002 ± 0.039 | bm-fresh-heads 0.037 ± 0.047 |
+
+- **两次运行的初始权重逐位相同**：
+  - 比的是 c109/d5/{c99old,bm}-fresh 与 c110/d5h/{c99old,bm}-fresh-heads 的 last.pt。lr 0 时权重不变，last.pt 就是初始化。
+  - 不加载 torch，按张量名比较 zip 里的存储字节：旧栈 181 个张量、新栈 245 个张量以及 aux / priv 模块全部相同，只有优化器状态不同。
+  - 所以两次的差别只来自 rollout 数据：游戏的随机性、时序和采样。
+- 只算 move 头也分不开：新栈 −0.008 ± 0.047，旧栈 +0.015 ± 0.043。
+- C109 那次旧栈的 0.089 不像是 bomb 头造成的：
+  - 本次旧栈 bomb 头的批间余弦是 0.71，但它在共享参数上的范数只有 0.0063，pg_trainer 是 0.0685；
+  - 它对 pg_trainer 两两余弦的贡献约为 0.71 × (0.0063/0.0685)² ≈ 0.006。
+  - C109 那次没有分头记录，无法直接核对。
+- **结论**：随机初始化下，两套栈的策略梯度一致性在 16 批的精度内分不开。C109 剩下的证据只有 u250（差 0.029 ± 0.018）和 last（0.017 ± 0.018），属于弱证据。
+
+*结论*（只写数据支持的）：
+
+- **旧模型三组（R＠c45、Q＠c45、Q＠maa）都学会了**：
+  - u201–330 的清房 ≥1 为 0.483 / 0.506 / 0.493，高于预定的 0.35；
+  - move 熵在下降；
+  - 评测 128 局全部离开起始房间，与 C107 的 A 组同一量级。
+- **block 两组（fp32、门组）都学不会**：u201–330 的清房 ≥1 为 0.210 / 0.225，与 ab2-bm（0.235）相同；评测里 91–94% 的局没离开起始房间。
+- **据此排除**：
+  - 1ae82d3..c45a583 的 141 个提交（R＠c45）；
+  - 对旧模型而言的 bf16、重叠（部分落后）、aux / priv、缓冲 8000 / 4000、learner-fast 0，以及 ab2-bm 的学习率 / 批量 / 奖励（Q＠c45）；
+  - 两套栈共用的全部新代码和新设置：桥接层、局结束规则、cf-per-clear、奖励、教师、PPO 公共路径（Q＠maa）；
+  - block 一套的 bf16（fp32）；
+  - 常开的动作门加熵奖励（门组），至少不是充分原因。
+- **剩下的只有 block 专有部分**：
+  - block 模型本身（StructuredSpatial / Reader / Writer / QueryReadout）；
+  - 可见帧输入；
+  - block 的损失和历史路径（随机历史重编码等）；
+  - C++ actor driver 等实现。
+- **D5 分头**：
+  - 训练后，block 栈的使用头在共享参数上的梯度约为 ms 的一半，旧栈只有 8%。但门组关掉使用头后照样学不会，所以这部分梯度不是原因。
+  - block last 的 ms 批间余弦（0.006–0.029）低于旧栈 u250（0.036–0.089）。这一差别要从 block 专有部分去找。
+- **撤回** C109 的"差距在随机初始化时就存在"（见上）。
+
+### C111 block 一套的实现回退（REF / VN0 / HD），各计划 400 小时，gpu57（2026-11-16，已完成；REF 按规则提前停止，HD 中途停下）
+
+**实验目的**
+
+C110 把病因落到 block 专有部分。其中一类只改实现、不改数学的"优化"包括：C++ actor driver、整步 CUDA graph、packed learner、Flex Reader、Spatial 编译、原生打包、预取、C 帧编码器等。本轮检验它们是不是学不会的原因：
+
+- **REF**：把 block 路径上的实现优化全部换回参考实现，其余与 ab2-bm 相同。学会了，病因就在实现里；学不会，就排除实现，剩下模型和输入本身。
+- **VN0**：只关 C 帧编码器（`ISAAC_VISIBLE_NATIVE=0`，改用 Python 参照编码器）。
+  - B45 已测过两者输出的帧逐字节相同；
+  - 但 Python 编码每个决策慢约 25 倍，可能改变 collect、CF 和教师的时序，所以从 REF 里单独拿出来做一臂。
+- **HD**：检验 B51 的随机历史重编码梯度是不是学不会的原因。这部分梯度按 N_i/|selected_i| 放大，在 ab2-bm 里均值约 2.5，p90 为 5，最大约 21。
+
+**实验方法**
+
+- **机器**：gpu57，bm1 的 Docker 容器，树 maa1e98a（未改），守护 c108_guard.sh（共享锁），基础脚本 xnew2.sh，learner 在 cuda:1。
+  - lane a（env/gpu57-c110-a.env）：GPU 4 + 5，CPU 0-7,16-23。
+  - lane b（env/gpu57-c110-b.env）：GPU 6 + 7，CPU 8-15,24-31。
+- **共同的 train_args**：与 C110 门组 / ab2-bm 相同，即 `--minibatch 4096 --micro 4096 --lr 1e-4 --lr-final 1e-4 --lr-schedule linear --lr-warmup 0 --reward heal=0.5,resource=0.25 --run-seconds 1800 --cap-truncate 0 --stall-progress events --floor-stall-seconds 60 --stall-truncate 0 --teach-buffer 8000 --teacher-v2-buffer 4000 --cf-per-clear 0.08 --pickup-force 1:0.984`。各臂只在此基础上改动下面列出的部分，都计划 400 游戏小时。
+- **REF**（lane a，strict 版）：
+  - train_args 末尾加 `--graph-entities 0`；guard 设 `REQUIRE_DRIVER=0`、`COLLECT_EVERY=1`。
+  - ENVS：
+    ```
+    -e ISAAC_BLOCK_CPP_ACTOR=0 -e ISAAC_BLOCK_CPP_CONSUMER=0 -e ISAAC_BLOCK_CPP_LINEAGE=0 -e ISAAC_BLOCK_CPP_LANES=0 -e ISAAC_BLOCK_CPP_BATCH=0 -e ISAAC_BLOCK_LANE_MERGE=0 -e ISAAC_BLOCK_STEP_GRAPH=0 -e ISAAC_BLOCK_PRECAPTURE=0 -e ISAAC_BLOCK_LANE_PRECAPTURE=0 -e ISAAC_VISIBLE_NATIVE=0 -e ISAAC_SPATIAL_COMPILE=0 -e ISAAC_FX_CACHE=0 -e ISAAC_PACKED_LEARNER=0 -e ISAAC_PACKED_READER=sdpa -e ISAAC_SPATIAL_PACKED=0 -e ISAAC_LEARN_PREFETCH=0 -e ISAAC_BLOCK_NATIVE_PACK=0 -e ISAAC_LEARN_CKPT_LEAN=0 -e ISAAC_BLOCK_DECODED_CAP=0
+    ```
+  - `ISAAC_PACKED_LEARNER=0` 必须同时设 `ISAAC_LEARN_PREFETCH=0`：预取不检查 PACKED，会准备出从不使用的 part，并打乱历史块的抽样序列。
+  - 冒烟的 stdout 核对：
+    - `B52 cpp actor driver: off (ISAAC_BLOCK_CPP_ACTOR=0)`；
+    - `B45 visible frame encoder: reference (Python observation_frame)`；
+    - 没有 B42 编译预热行。
+  - 不动的：`--block-slots 1`、`--block-attention sdpa`、bf16（amp、actor_bf16）、learner 分卡、`ISAAC_LEARN_SPATIAL_CKPT=1`、游戏层的快路径。`--block-slots 0` 读码看已经坏了，不用作参考。
+  - 即使数学相同，两臂也必然有差别，比较时按游戏时对齐：
+    - 策略滞后的分布；
+    - CF 的动态：Python lane 下每游戏小时 cf_done 约少 18%（B58d）；
+    - bf16 下 graph 与 eager、packed 与逐长度的数值差（都在已测容差内）；
+    - 随机流：eager 用 multinomial，graph 用 Gumbel。
+- **VN0**（lane b）：只加 `-e ISAAC_VISIBLE_NATIVE=0`。
+  - 冒烟前跑了 B45 的测试（test_visible_native、test_compact_records）：10 passed，1 failed，用时 132 s。
+  - 失败的是 test_compact_records.py::test_rollout_stores_compact_records_and_learner_reads_them：同一输入下，forward_bucketed 两种取帧方式的输出最多差 4.66e-9（rtol 0、atol 0 的断言），属于浮点舍入；输入解码的一致性测试 test_compact_decode_equals_inline_decode 通过。
+  - 记为待办：以后放宽 atol，并写明理由。
+- **HD**（lane b）：train_args 末尾加 `--block-history-mode detach`。
+- **REF 和 VN0 正式跑的 guard.pre** 都还带 `-e ISAAC_RL_LOG_GRAD_NORM=1`，只多记 grad_norm 一列。
+- **冒烟**（各 8 游戏小时，u7）后接 D1（lr 0，树 maa1e98a-d1），通过才转正式：
+
+| 臂 | 冒烟（UTC） | ×实时（u2 之后的中位数） | stale_share | 显存峰值 | D1 max mean \|Δlogp\| |
+|---|---|---|---|---|---|
+| HD（hds） | 06:54–07:01 | 281.4 | 0.81–0.97 | 6.77 GB | 0.00024 |
+| REF（refs） | 07:11–07:26 | 40.3 | 0.72–0.94 | 15.44 GB | 0.000169 |
+| VN0（vn0s） | 07:25–07:35 | 94.3 | 0.38–0.48 | 11.46 GB | 0.000169 |
+
+  - 三臂冒烟的 errors、stalls、cf / v2 错误、broken_episodes 都是 0，没有 Traceback。
+  - VN0 冒烟的 collect 中位数 46.2 s，update 20.1 s；REF 为 112.9 s / 100.5 s；HD 为 15.5 s / 13.6 s。
+- **顺序**：
+  - HD 先在 lane b 上，07:08 起正式跑；
+  - 07:22 按用户指示（"VN0 先跑"）停下，见结果；
+  - 之后 VN0 在 lane b、REF 在 lane a 正式跑。
+- **中途读数**（c111_mid.sh）：
+  - 每 50 次更新读一次 episodes.jsonl 的清房 ≥1 和 ent_move。
+  - u150 的提前停止规则只用于 REF：u51–100 和 u101–150 两窗的清房 ≥1 都 ≤ 0.22，就停下，并对当时的权重做 128 种子评测。
+  - VN0 和之后的各臂只在 u50 / u100 报早期读数，不提前停止。
+- **评测**：last.pt，128 个种子 2147490000:128，采样，14 worker，口径同 C110。
+- **运维脚本**：c111_smoke.sh、c111_go.sh、c111_mid.sh、c111_vn0.sh、c111_after.sh、c111_win50.py，都在 gpu57 的 bm1/ 下，本条写入时还没有进 repo。
+
+**实验结果**
+
+*运行情况*（×实时为 progress.csv 中 x_real_time 的中位数）
+
+| 臂 | 时间（UTC） | 结束 | ×实时 | collect / update 中位数 | stale_share 中位数 [范围] | 显存峰值（gpu_reserved） |
+|---|---|---|---|---|---|---|
+| HD | 07:08–07:22 | 07:22:28 写 STOP，rc 130，u36，43.7 小时 | 273.4 | — | — | learner 峰值 6.8 GB（协调方读数） |
+| VN0 | 07:43–12:57 | rc 0，u330，400.5 小时 | 77.8 | 55.8 s / 19.2 s | 0.35 [0, 0.48] | 19.1 GB |
+| REF | 07:37–13:16 | 13:15:46 按规则停止，rc 130，u151，183.3 小时 | 32.8 | 131.7 s / 96.8 s | 0.69 [0, 0.93] | 16.2 GB |
+
+- **HD**：
+  - 07:22:28 按用户指示停下，原话是"VN0 first on GPUs 6,7"，意思是 HD 不够有说服力，先跑 VN0。
+  - 目录移到 /root/AIsaac/trash/20261116/hd-stopped-u36；冒烟 c111smoke/hds 和 D1 c108/d1/hd-smoke 保留。
+  - 本条不下结论。同一问题后来在 C112 的 L2 测试台上由 l2hd / l2hs 回答。
+  - u36 时 43.7 游戏小时，x_real_time 中位数 273.4（读自 trash 里的 hd-s0/progress.csv）；stale_share 0.81–0.97 与 learner 显存峰值 6.8 GB 来自协调方的读数。
+- **VN0 的时序**：collect（55.8 s）远长于 update（19.2 s），stale_share 0.35，ab2-bm / 门组是 0.99–1.00。Python 帧编码让 collect 成了瓶颈，所以 VN0 同时改变了策略滞后的分布。
+
+*窗口*（清房 ≥1 指至少清掉一个房间的局占比，按局计）
+
+每 50 次更新（c111_mid；括号里是窗口内的局数）：
+
+| 窗口 | VN0 清房 ≥1 | VN0 move 熵 | REF 清房 ≥1 | REF move 熵 |
+|---|---|---|---|---|
+| u1–50 | 0.179（4125） | 2.100 | 0.169（4016） | 2.088 |
+| u51–100 | 0.185（4211） | 1.988 | 0.167（3957） | 1.930 |
+| u101–150 | 0.170（4147） | 1.902 | 0.170（3910） | 1.921 |
+| u151–200 | 0.181（3869） | 1.873 | — | — |
+
+VN0 每 100 次更新（win100_vn0.txt）：
+
+| 窗口（累计游戏时） | 局数 | 清房 ≥1 | 每局道具 | move 熵 | 使用头熵 bomb / item / pill | KL | EV | 死亡 / 无进展 | ×实时 |
+|---|---|---|---|---|---|---|---|---|---|
+| u1–100（121） | 8336 | 0.182 | 0.485 | 2.040 | 0.532 / 0.424 / 0.409 | 0.0148 | 0.790 | 0.465 / 0.535 | 78 |
+| u101–200（243） | 8016 | 0.175 | 0.835 | 1.884 | 0.639 / 0.645 / 0.634 | 0.0224 | 0.813 | 0.366 / 0.634 | 77 |
+| u201–300（364） | 7727 | 0.181 | 0.940 | 1.949 | 0.675 / 0.677 / 0.661 | 0.0241 | 0.839 | 0.317 / 0.683 | 77 |
+| u301–330（401） | 2353 | 0.201 | 0.737 | 1.911 | 0.669 / 0.666 / 0.643 | 0.0240 | 0.830 | 0.348 / 0.652 | 83 |
+
+- **VN0 u201–330 合并**（按局数加权）的清房 ≥1 为 0.186；阈值 0.35，C110 的 Q＠maa 为 0.493。
+- **对照**（C109 / C110，每 100 次更新一窗）：ab2-bm u1–100 0.177、u101–200 0.224；门组 0.199、0.226；Q＠maa 0.245、0.322。
+- **REF** 在 u150 处两窗都 ≤ 0.22（0.167、0.170），13:15:46 按规则停止。
+- 各窗 errors 都是 0。
+
+*评测*（128 个种子 2147490000:128，采样）
+
+| | 权重 | 错误 | 过层 | 死亡 / 超时 | 清房 | 清房 ≥1 的局 | 离开起始房间的局 | room_changes | round_trips | 每局道具 | 平均局长 | 评测 ×实时 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| VN0 | last.pt，u330 | 0 | 0 | 0.055 / 0.945 | 0.0625 | 0.0625 | 0.156 | 0.20 | 0.016 | 0.023 | 62.7 s | 45.0 |
+| REF | last.pt，u151 | 0 | 0 | 0.094 / 0.906 | 0.047 | 0.047 | 0.180 | 0.27 | 0.023 | 0.031 | 62.4 s | 45.5 |
+
+- 两组所有局都停在第 1 层（stage_reached 全为 1），Boss 通关 0。
+- room_changes 是评测的进房读数，与训练的清房 ≥1 不是一回事；“离开起始房间”是 episodes.json 中 entered ≥ 1 的局占比。
+- 原始文件：
+  - 训练：/root/AIsaac/train/c111/{ref,vn0}/（progress.csv、episodes.jsonl、config.json）、/root/AIsaac/train/c111/win100_vn0.txt、MID_{ref,vn0}；
+  - 评测：/root/AIsaac/train/c111/eval/{ref,vn0}-c128-last/。
+
+*结论*（只写数据支持的）：
+
+- **VN0 学不会**：
+  - 400 小时里清房 ≥1 一直在 0.17–0.20（u201–330 合并 0.186），与 ab2-bm、门组同一水平；
+  - 评测里 94.5% 的局超时，清房 0.0625。
+  - 所以 C 帧编码器不是原因。VN0 的 stale_share 降到 0.35，部分落后一次更新也没有改变结果。
+- **REF 到 u151（183 小时）没有学习的迹象**：
+  - 清房 ≥1 0.167–0.170，而 Q＠maa 在 u101–200 已经到 0.322；
+  - 评测与 VN0 分不开：清房 0.047 对 0.0625，超时 90.6% 对 94.5%。
+- 据此，block 路径上的实现优化（C++ driver、整步 graph、packed learner、编译、原生打包、预取、C 帧编码器）不像是学不会的原因，病因应在 block 模型和输入本身。
+  - 限制：REF 按事先定的规则在 183 小时停止，没有跑满 400 小时。
+- HD 中途停下，不下结论。history 梯度路径的问题由 C112 的 l2hd / l2hs 在 L2 测试台上回答。
