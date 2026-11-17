@@ -168,6 +168,8 @@ def main():
         notes = {}
 
         def floor(seed, char=0):
+            nonlocal b
+            b = inst.env.bridge   # (a relaunch makes a new bridge)
             b.reset_mode, b.character = 'floor', char
             inst.reset(seed)
 
@@ -199,15 +201,18 @@ def main():
             here0 = c.lua(PLAYER_CELL).split(',')[2]
             g0 = json.loads(c.lua(ENGINE_LUA))['g0']
             dc, dr = math.floor((float(qx) - g0[0] + 20) / 40), math.floor((float(qy) - g0[1] + 20) / 40)
+            trail = []
             for k in range(90):
                 c.step({'move': MOVE_INTO[slot]}, repeat=1)
                 col, row, here = c.lua(PLAYER_CELL).split(',')
+                trail.append((int(col), int(row)))
                 if here != here0:
                     raise RuntimeError(f'left the room after {k + 1} frames before reaching the door cell')
                 if (int(col), int(row)) == (dc, dr):
                     notes['doorframe'] = f'slot {slot}, door cell ({dc}, {dr}), reached after {k + 1} frames'
                     return
-            raise RuntimeError('the door cell not reached in 90 frames')
+            raise RuntimeError(f'the door cell ({dc}, {dr}) of slot {slot} not reached in 90 frames: {trail[:3]} .. '
+                               f'{trail[-3:]}')
         case('doorframe', 'the player in a door frame (its formula cell is the door cell)', doorframe)
         case('longlived', 'a coin 600 frames old (age clamp)', lambda c: (c.lua(SPAWN_COIN), idle(c, 600)))
         def devil(c):
