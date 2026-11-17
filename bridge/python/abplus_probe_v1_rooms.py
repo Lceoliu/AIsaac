@@ -14,6 +14,12 @@ premise). Measured on AB+ (isaac.x64 sha256 b9bfef32...) for every RoomShape 1-1
     the player   its Size, PlayerType, position at entry, and over a scripted walk (every direction held to the walls,
                  the four corners, along each wall; the room's enemies removed, the player invincible): every sample's
                  position and GetGridIndex(position) -> <out>/walk.jsonl, the min / max in rooms.jsonl
+    corners      the centres of cell 0, the first row's last, the last row's first and the last cell
+    entities     before the enemies are removed: every entity's Position and GetGridIndex (a coin spawned at +(7, 13)
+                 from the first free inside cell's centre, so a pickup is always there), the formula's cell beside it
+    the formula  every walk sample (one per logic frame, unfiltered: walls, door frames, a door left through and the
+                 transition back) with GetGridIndex and floor((pos - (GetGridPosition(0) - (20, 20))) / 40); the
+                 mismatches counted, the off-grid samples' range and their GetGridIndex values
     the payload  the lean observation at entry (raw bytes) -> <out>/payloads/<key>.lean (the V2 golden frames' inputs)
   per character of --chars (a floor reset as it): its Size and the inside mask of the start room for its Size
   (<out>/sizes.jsonl) -- does a cell's inside change with the player's size.
@@ -27,6 +33,7 @@ usage (from the bridge's python dir, PYTHONPATH=.; CPU only, the game's instance
 """
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -68,6 +75,11 @@ for i = 0, n - 1 do
   out.gcoll[#out.gcoll + 1] = try(function() return room:GetGridCollision(i) end)
 end
 out.first_inside, out.last_inside = first, last
+out.corner_cells = {}
+for _, c in ipairs({ 0, gw - 1, (gh - 1) * gw, n - 1 }) do
+  local q = room:GetGridPosition(c)
+  out.corner_cells[#out.corner_cells + 1] = { c, q.X, q.Y }
+end
 -- the cell a position belongs to, across the edges of cell 0, the first and the last inside cell (offsets from the
 -- cell's GetGridPosition, -30..+30 px in 5 px steps, x and y apart)
 for _, c in ipairs({ 0, first or 0, last or 0 }) do
@@ -110,6 +122,25 @@ Game():ChangeRoom(idx)
 return 'ok'
 """
 HERE_LUA = "return tostring(Game():GetLevel():GetCurrentRoomDesc().SafeGridIndex)"
+ENT_LUA = """
+local json = require("json")
+local room = Game():GetRoom()
+local spawned
+for i = 0, room:GetGridSize() - 1 do   -- a coin at a known offset (+7, +13) from the first free inside cell's centre
+  local q = room:GetGridPosition(i)
+  if room:IsPositionInRoom(q, 0) and room:GetGridCollision(i) == 0 then
+    local e = Isaac.Spawn(5, 20, 1, Vector(q.X + 7, q.Y + 13), Vector(0, 0), nil)
+    spawned = { cell = i, cell_pos = { q.X, q.Y }, asked = { q.X + 7, q.Y + 13 }, seed = e.InitSeed }
+    break
+  end
+end
+local ents = {}
+for _, e in ipairs(Isaac.GetRoomEntities()) do
+  ents[#ents + 1] = { type = e.Type, variant = e.Variant, subtype = e.SubType, x = e.Position.X, y = e.Position.Y,
+    gi = room:GetGridIndex(e.Position), enemy = e:IsActiveEnemy(false), seed = e.InitSeed }
+end
+return json.encode({ entities = ents, spawned = spawned })
+"""
 CALM_LUA = """
 AbpSetInvincible(true)
 local n = 0
@@ -119,7 +150,8 @@ end
 return tostring(n)
 """
 POS_LUA = ("local p = Isaac.GetPlayer(0) local r = Game():GetRoom() "
-           "return string.format('%.3f,%.3f,%d', p.Position.X, p.Position.Y, r:GetGridIndex(p.Position))")
+           "return string.format('%.3f,%.3f,%d,%d', p.Position.X, p.Position.Y, r:GetGridIndex(p.Position), "
+           "Game():GetLevel():GetCurrentRoomDesc().SafeGridIndex)")
 # the walk: (move code, decisions of 6 frames); move 1 up, 2 up-right, 3 right, ... 8 up-left (abp_bridge MOVE)
 WALK = ([(m, 15) for m in (1, 3, 5, 7)] + [(m, 15) for m in (2, 4, 6, 8)]
         + [(8, 25), (3, 30), (5, 25), (7, 30), (1, 25)]      # the corners and along each wall, clockwise
@@ -143,17 +175,63 @@ def payload(c):
         cc.close()
 
 
-def walk(c, key, wf):
-    xs, ys, cells = [], [], set()
+def formula_cell(x, y, rec):
+    """The cell by the contract's formula: origin = GetGridPosition(0) - (20, 20), floor((pos - origin) / 40); (col, row,
+    index or -1 off the grid)."""
+    ox, oy = rec['gp'][0][0] - 20.0, rec['gp'][0][1] - 20.0
+    col, row = math.floor((x - ox) / 40.0), math.floor((y - oy) / 40.0)
+    inside = 0 <= col < rec['gw'] and 0 <= row < rec['gh']
+    return col, row, (row * rec['gw'] + col) if inside else -1
+
+
+def pos(c):
+    x, y, gi, here = c.lua(POS_LUA).split(',')
+    return float(x), float(y), int(gi), int(here)
+
+
+def walk(c, key, wf, rec, idx):
+    """The walk frame by frame (one logic frame per sample, unfiltered): every sample's position, GetGridIndex, the
+    formula's cell, the room it is in. Leaving the room (an open door) is recorded, and the clone sent back
+    (ChangeRoom) to go on; those transition frames are written with transition=1."""
+    st = dict(samples=0, mismatch=0, off_grid=0, left_room=0, x_min=1e9, x_max=-1e9, y_min=1e9, y_max=-1e9)
+    off = dict(x_min=1e9, x_max=-1e9, y_min=1e9, y_max=-1e9, gi=set())
+    cells, mism = set(), []
     for move, n in WALK:
-        for _ in range(n):
-            c.step({'move': move}, repeat=6)
-            x, y, gi = c.lua(POS_LUA).split(',')
-            x, y, gi = float(x), float(y), int(gi)
-            xs.append(x); ys.append(y); cells.add(gi)
-            wf.write(json.dumps(dict(key=key, move=move, x=x, y=y, gi=gi)) + '\n')
+        for _ in range(n * 6):
+            c.step({'move': move}, repeat=1)
+            x, y, gi, here = pos(c)
+            row = dict(key=key, move=move, x=x, y=y, gi=gi, room=here)
+            if here != idx:
+                st['left_room'] += 1
+                wf.write(json.dumps(dict(row, transition=1)) + '\n')
+                c.lua(ENTER_LUA % idx)
+                for _ in range(120):
+                    c.step({}, repeat=1)
+                    x, y, gi, here = pos(c)
+                    wf.write(json.dumps(dict(key=key, move=0, x=x, y=y, gi=gi, room=here, transition=1)) + '\n')
+                    if here == idx:
+                        break
+                continue
+            col, rw, fgi = formula_cell(x, y, rec)
+            row.update(col=col, row=rw, fgi=fgi)
+            wf.write(json.dumps(row) + '\n')
+            st['samples'] += 1
+            st['x_min'], st['x_max'] = min(st['x_min'], x), max(st['x_max'], x)
+            st['y_min'], st['y_max'] = min(st['y_min'], y), max(st['y_max'], y)
+            cells.add(gi)
+            if fgi != gi:
+                st['mismatch'] += 1
+                if len(mism) < 20:
+                    mism.append([x, y, gi, fgi, col, rw])
+            if fgi < 0:
+                st['off_grid'] += 1
+                off['x_min'], off['x_max'] = min(off['x_min'], x), max(off['x_max'], x)
+                off['y_min'], off['y_max'] = min(off['y_min'], y), max(off['y_max'], y)
+                off['gi'].add(gi)
     wf.flush()
-    return dict(x_min=min(xs), x_max=max(xs), y_min=min(ys), y_max=max(ys), samples=len(xs), cells=len(cells))
+    st.update(cells=len(cells), mismatch_examples=mism,
+              off_grid_range=dict(off, gi=sorted(off['gi'])) if st['off_grid'] else None)
+    return st
 
 
 def measure(b, idx, key, out, rf, wf, meta):
@@ -161,20 +239,27 @@ def measure(b, idx, key, out, rf, wf, meta):
     try:
         if idx != int(c.lua(HERE_LUA)):
             c.lua(ENTER_LUA % idx)
-            for _ in range(20):
-                c.step({}, repeat=6)
-                if int(c.lua(HERE_LUA)) == idx:
+            for _ in range(120):   # the transition frame by frame (positions while the room changes)
+                c.step({}, repeat=1)
+                x, y, gi, here = pos(c)
+                wf.write(json.dumps(dict(key=key, move=0, x=x, y=y, gi=gi, room=here, transition=1)) + '\n')
+                if here == idx:
                     break
+            for _ in range(10):
+                c.step({}, repeat=1)
         here = int(c.lua(HERE_LUA))
         if here != idx:
             return dict(key=key, idx=idx, error=f'ChangeRoom: in room {here}, not {idx}', **meta)
+        ents = lua_json(c, ENT_LUA)
         removed = int(c.lua(CALM_LUA))
         c.step({}, repeat=6)
         rec = lua_json(c, ROOM_LUA)
         raw = payload(c)
         (out / 'payloads' / f'{key}.lean').write_bytes(raw)
-        rec.update(key=key, idx=idx, enemies_removed=removed, payload_bytes=len(raw), **meta)
-        rec['walk'] = walk(c, key, wf)
+        rec.update(key=key, idx=idx, enemies_removed=removed, payload_bytes=len(raw), entities=ents, **meta)
+        for e in (ents.get('entities') or []):   # the formula's cell of every entity, beside its GetGridIndex
+            e['col'], e['row'], e['fgi'] = formula_cell(e['x'], e['y'], rec)
+        rec['walk'] = walk(c, key, wf, rec, idx)
         rec['after_walk'] = lua_json(c, "local p = Isaac.GetPlayer(0) return require('json').encode({p.Position.X, "
                                         "p.Position.Y, p:GetPlayerType()})")
         return rec
