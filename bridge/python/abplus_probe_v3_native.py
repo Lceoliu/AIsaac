@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 
 os.environ.setdefault('ISAAC_RL_VISIBLE_V3', '3')
+os.environ.setdefault('ISAAC_RL_NATIVE_VISIBLE', '1')   # (mode 0 = the v2 native path: G mode 1 + abp_visible.c)
 
 from abplus_probe_native_obs import read_raw   # noqa: E402
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec   # noqa: E402
