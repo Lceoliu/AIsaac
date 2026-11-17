@@ -15,6 +15,10 @@ set -u
 BM=/root/AIsaac/bm1
 RUN=$1; KIND=$2; G=$3; CS=$4; MS=$5; W=$6; shift 6
 PAR=${PARENT:-ab2}   # (C108, 2026-11-15: PARENT=ab3 for ab3's runs; ab2 as before)
+# (C110, 2026-11-15: kind new with EV_TREE=<tree> (default maa1e98a) and EV_ABHOME=<bm1 home dir> (default: run.sh's
+#  bm1/home) -- the c45a583 runs evaluated by their own tree's eval_tok.py and libabp_turbo.so, as C109 otherwise;
+#  EV_ENVS="-e K=V ..." added to the container's environment -- Q@maa: -e ISAAC_NO_VISIBLE=1; EV_PORT (default 41300) -- two evaluations at once)
+ET=${EV_TREE:-maa1e98a}; EH=""; [ -n "${EV_ABHOME:-}" ] && EH="export HOME=/bench/bm1/$EV_ABHOME ABP_HOME=/bench/bm1/$EV_ABHOME/isaac-abplus ABP_BRIDGE_LUA=/bench/bm1/trees/$ET/bridge/abplus/abp_bridge.lua && "
 HOST=/root/AIsaac/train/$PAR/eval
 mkdir -p $HOST
 echo "$(date '+%F %T') ev_ab2: $RUN ($KIND) GPU $G CPUs $CS workers $W: $*" >> $BM/reports/bm1.log
@@ -29,7 +33,7 @@ for spec in "$@"; do
   if [ "$KIND" = old ]; then
     L=$(GPU=$G CPUSET=$CS MEMS=$MS sh $BM/job.sh ev-$RUN "cd /bench/bm1/trees/m1ae82d3/bridge/python && export HOME=/bench/bm1/home-c99 ABP_HOME=/bench/bm1/home-c99/isaac-abplus ABP_BRIDGE_LUA=/bench/bm1/trees/m1ae82d3/bridge/abplus/abp_bridge.lua OMP_NUM_THREADS=4 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null PYTHONPATH=.:\$PYTHONPATH && $X \$BM1_PY -u eval_tok.py --checkpoint $CK --groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --workers 8 --seeds $seeds --name hc99e --port 49300 --out $O" | tail -1)
   else
-    L=$(GPU=$G CPUSET=$CS MEMS=$MS ENVS="-e TOK_EVAL_DEVICE=cuda" sh $BM/job.sh ev-$RUN "cd /bench/bm1/trees/maa1e98a/bridge/python && export LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null && $X \$BM1_PY -u /bench/bm1/evtools/eval_ent.py --checkpoint $CK --groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --workers $W --seeds $seeds --name abev --port 41300 --out $O" | tail -1)
+    L=$(GPU=$G CPUSET=$CS MEMS=$MS ENVS="-e TOK_EVAL_DEVICE=cuda ${EV_ENVS:-}" sh $BM/job.sh ev-$RUN "cd /bench/bm1/trees/$ET/bridge/python && $EH export LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null && $X \$BM1_PY -u /bench/bm1/evtools/eval_ent.py --checkpoint $CK --groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --workers $W --seeds $seeds --name abev --port ${EV_PORT:-41300} --out $O" | tail -1)
   fi
   cp "$L" $HOST/$tag.log 2>/dev/null
   echo "$(date '+%F %T') $tag $ck $seeds: $(( $(date +%s) - t0 )) s, summary $( [ -f $HOST/$tag/summary.json ] && echo yes || echo NO ) ($L)"
