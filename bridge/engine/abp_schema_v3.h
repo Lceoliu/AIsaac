@@ -413,4 +413,18 @@ static const int abp_v3_action_code_mul[ABP_V3_N_HEADS] = {1, 9, 45, 90, 180, 36
 #define ABP_V3_TEACH_SAFE 17
 #define ABP_V3_TEACH_PAD 18
 
+/* ---- engine argument ranges, AB+ (schema_v3.ABP_RANGES; the producers loop only inside them) */
+#define ABP_V3_ABP_WEAPON_TYPE_MAX 10
+#define ABP_V3_ABP_HEART_SLOTS 24
+#define ABP_V3_ABP_DOOR_SLOTS 8
+#define ABP_V3_ABP_COLLECTIBLES 553
+#define ABP_V3_ABP_PILLS 14
+#define ABP_V3_ABP_POCKET_SLOTS 2
+#define ABP_V3_ABP_TRINKET_SLOTS 2
+#define ABP_V3_ABP_GRID_CELLS 448
+
+/* ---- decorative effects never sent (schema_v3.DECORATIVE_EFFECTS; dropped only while CollisionDamage is 0) */
+#define ABP_V3_DECORATIVE_N 48
+static const int ABP_V3_DECORATIVE[ABP_V3_DECORATIVE_N] = {2, 3, 4, 5, 7, 11, 12, 13, 14, 15, 16, 17, 18, 21, 27, 33, 35, 38, 41, 43, 50, 58, 62, 63, 64, 66, 68, 69, 70, 75, 77, 79, 80, 85, 86, 87, 88, 95, 98, 99, 114, 130, 131, 132, 133, 135, 140, 145};
+
 #endif
