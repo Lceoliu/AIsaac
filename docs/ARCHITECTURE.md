@@ -64,8 +64,12 @@ eval_tok.py：留出种子评估（128 / 512 个种子）
 | 格式 | 用在 | 定义 | 引入 |
 |---|---|---|---|
 | ROW（`tok_obs.ROW`，约 20 KB 一条） | 旧模型的输入；所有模型的奖励、事件位、辅助目标 | `isaac_bridge/tok_obs.py`；C 端 `abp_row_encode` 逐字节相同 | C55；道具 A21；激光 / 标志 A24；观测 v2（价格、心、房间类型）B35 |
-| visible-v2 帧（131,072 字节，schema `isaac-visible-prlmens-g-v2`） | block-memory v1 的输入 | 常量 `isaac_bridge/schema_v2.py`；生产 `visible_producer.py` / `visible_native.py`（C：`abp_visible.c`）；解码 `structured_input.py` | B41、B45 |
-| visible-v3（schema `isaac-visible-prlmens-g-v3`） | 计划中，seq-v1 的输入 | 冻结的接口文件 `isaac_bridge/schema_v3.py`、`bridge/engine/abp_schema_v3.h`；设计 [VISIBLE_V3_DESIGN.md](VISIBLE_V3_DESIGN.md) | 只有接口，生产端和模型端都没写 |
+| visible-v2 帧（变长，上限 131,072 字节，schema `isaac-visible-prlmens-g-v2`） | block-memory v1 的输入 | 常量 `isaac_bridge/schema_v2.py`；生产 `visible_producer.py` / `visible_native.py`（C：`abp_visible.c`）；解码 `structured_input.py` | B41、B45 |
+| visible-v3（schema `isaac-visible-prlmens-g-v3`） | 计划中，seq-v1 的输入 | 冻结的接口文件 `isaac_bridge/schema_v3.py`、`bridge/engine/abp_schema_v3.h`；设计 [VISIBLE_V3_DESIGN.md](VISIBLE_V3_DESIGN.md) | 只有接口；生产端 11-17 开工，模型端还没写 |
+
+坐标的注意事项（[SINGLE_TRANSFORMER_DESIGN.md](SINGLE_TRANSFORMER_DESIGN.md) 第 9 节，2026-11-17 的审核）：
+- visible-v2 有已知的坐标问题，不要照它的做法写新代码：实体向量被缩放两次（生产端一次，`structured_input.py` 里再整体除以 64）；x 除以 520 而 y 除以 280；位置以 `GetTopLeftPos` 为原点，在窄房间里和地形画布差 2 行或 4 列；激光端点是世界坐标。
+- visible-v3 按坐标契约做：原点是 0 号格的左上角，两轴同一缩放，缩放只在解码处做一次，数值列统一截断，相对玩家的位移由模型在解码时算。AB+ 引擎上 12 种房型的实测数据见同一节。
 
 ROW 是每个决策一条定长记录。它包含：
 - 玩家；
