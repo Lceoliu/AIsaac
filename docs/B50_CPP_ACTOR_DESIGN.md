@@ -1,6 +1,6 @@
 # B50 设计：actor 调度热路径迁到 C++（阶段 0 设计稿，2026-11-09，已回填 nsys 数字）
 
-对应实验记录：`bridge/abplus/EXPERIMENTS.md` B50 节；字段：`docs/PROJECT_SPEC.block-memory-v1.md` 的 `actor_b50`。
+对应实验记录：`bridge/abplus/EXPERIMENTS.md` B50 节；字段：`docs/archive/block-memory-v1/PROJECT_SPEC.block-memory-v1.md` 的 `actor_b50`。
 目标：不改模型计算、batch 组成、CF/teacher 语义和任何预算，把完整短 profile 的 collect 从 27.9 s 压到 ≤ 22 s，
 update 不变差，×实时 ≥ 200。
 

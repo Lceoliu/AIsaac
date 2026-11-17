@@ -11,7 +11,7 @@
 
 保留 9.1–9.8 编号，9.9–9.12 扩展模型与训练设计。本轮只更新文档，不修改生产代码、训练配置、游戏或检查点。
 
-审计依据：`D:/Projects/fortune/Isaac/analysis/j746/port-20260930/c99-replays-20261017/README.md` 及其中的 `segment2-20261018/logs/input-observability-audit.json`。
+审计依据：`<项目根>/analysis/j746/port-20260930/c99-replays-20261017/README.md` 及其中的 `segment2-20261018/logs/input-observability-audit.json`。
 
 ### 9.1 原则：补齐可观察性和可控制性，不编码玩法答案
 
@@ -242,7 +242,7 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 
 ### 9.13 下一代四 latent 分块记忆模型：最终设计（2026-11-06）
 
-**状态纠正：新输入功能/稳定性测试已完成，但当前在线8.97×吞吐不合格；不能作为正式训练可用性验收。停止正式长训准备，先修实现与并行吞吐。** predictive-aux c45a583仅为代码基线来源，不是模型初始化来源。实现副本位于 D:/Projects/fortune/Isaac/temp/wt-block-memory-v1；原工作树、生产配置和检查点未改变。本节替代房间摘要、Temporal→Spatial反馈、长期持图和延迟源梯度，9.9–9.11仅为历史。
+**状态纠正：新输入功能/稳定性测试已完成，但当前在线8.97×吞吐不合格；不能作为正式训练可用性验收。停止正式长训准备，先修实现与并行吞吐。** predictive-aux c45a583仅为代码基线来源，不是模型初始化来源。实现副本位于 <项目根>/temp/wt-block-memory-v1；原工作树、生产配置和检查点未改变。本节替代房间摘要、Temporal→Spatial反馈、长期持图和延迟源梯度，9.9–9.11仅为历史。
 
 目标顺序：保留完整反事实教师；固定形状合批和并行计算；建立可学习的独立片段记忆；再扩参数。首版不同时改变奖励、动作空间、PPO调度、搜索预算或引入APPO/V-trace。下面是确定的V1规格，不是候选清单。
 
@@ -375,15 +375,15 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 
 **本轮已修复且重测的实质问题：**新ROW握手字段被初始化清零；旧FastRow v7不携带新帧（新路径禁用）；动态P/E/N/S图键与capture/learner并发准入；stream schema/表示语义与匿名padding；自动resume和eval遗漏schema、兼容迁移旧权重入口。后者先新增3个失败用例，再修至3 passed；新block禁止load_compatible，exact schema用strict加载。旧m.player/旧graph-key假设属于迁移测试fixture修正，不当作模型学习成果。
 
-完整机器可读统计：`D:/Projects/fortune/Isaac/analysis/model-design-20261106/new-input-20261107/RESULTS.json`。
-原始验收与CSV/JUnit：`D:/Projects/fortune/Isaac/analysis/model-design-20261106/new-input-20261107/remote-results`。
-远端结果：`/home/linux/isaac-block-memory-v1/reports/new-input-20261107`。
+完整机器可读统计：`<项目根>/analysis/model-design-20261106/new-input-20261107/RESULTS.json`。
+原始验收与CSV/JUnit：`<项目根>/analysis/model-design-20261106/new-input-20261107/remote-results`。
+远端结果：`~/isaac-block-memory-v1/reports/new-input-20261107`。
 
 **2026-11-07 性能复核、原设计回溯与当前边界：**
 
 原设计是解除 Temporal→Spatial 与递归记忆的串行依赖，使 Spatial 按帧、独立 Writer 按32步块、Reader 按已知轨迹并行；再以中央 GPU 服务汇集主环境和搜索分支。4 latent 不是自动加速器。当前训练时间维确实批量展开为 `[B,4T,D]`，不能误称 Reader 仍逐时间步运行；但中央服务外围仍有 Python 状态表拼装，完整异步 GPU slot 后端尚未实现。
 
-历史口径已重新核实：旧三卡843.395×有原始记录；**另有单3090的220.905×**（12 workers，rollout32768，epochs3，minibatch/micro8192；两次25更新各去掉5次warmup）。后者有287点/993分支/608269分支decisions的实际CF搜索，也有伤害教师，但CF蒸馏尚未持续优化。证据在 `D:/Projects/fortune/Isaac/temp/memory-chain-v2/gpu-unlock/TRAINING_RESULTS.json` 和同目录 `prepared-evidence.tar.gz`。不能用“三卡对单卡”概括所有200×证据；也不能把旧输入、不同搜索/优化预算当成严格配对。仅查日志/配置，未加载C99或衍生权重。
+历史口径已重新核实：旧三卡843.395×有原始记录；**另有单3090的220.905×**（12 workers，rollout32768，epochs3，minibatch/micro8192；两次25更新各去掉5次warmup）。后者有287点/993分支/608269分支decisions的实际CF搜索，也有伤害教师，但CF蒸馏尚未持续优化。证据在 `<项目根>/temp/memory-chain-v2/gpu-unlock/TRAINING_RESULTS.json` 和同目录 `prepared-evidence.tar.gz`。不能用“三卡对单卡”概括所有200×证据；也不能把旧输入、不同搜索/优化预算当成严格配对。仅查日志/配置，未加载C99或衍生权重。
 
 已完成的r2历史验收：77项GPU回归、两次2更新冒烟、离线50、在线67更新（连续42次双教师）。最后40次82298 decisions / 513.493秒 = **21.369×**。旧宿主OOM已通过驻留LZ4历史、CPU快照独立storage修复，末轮零游戏/教师错误，最低MemAvailable23.976GiB。细节及失败记录保留于 performance-fix/FINAL_ACCEPTANCE-r2.json；这些完成记录不替代本次修改后的验收。
 
@@ -412,9 +412,9 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
 
 用户11-07审核已要求下一轮验收前贯通GPU常驻slot KV/bank/partial、索引快照与tensor rollout；配置默认4个窗外均匀历史块（4/8消融）、纯相对Reader、P补stage/curses及溢出计数、实体优先截断、取消全部use存在性mask、L保留9×9布局。正式速度对照固定同4090/同worker、rollout32768/micro8192、CF6点/180秒/share0.1，先跑旧c45a583再新模型；未完成这些修正前不重启下一轮验收。必须保留immutable fork快照、源/参数版本和Writer因果边界：新完成块下一决策才可读，FIFO满时先读再覆盖，长bank存canonical Writer value而非跨publish复用旧Reader投影。完整8192步长期运行、多GPU扩展和长期学习收益仍未验收。
 
-本轮证据：`D:/Projects/fortune/Isaac/analysis/model-design-20261106/new-input-20261107/performance-fix/architecture-alignment`。四角色保持原路径，新增ALIGNMENT_CODE.patch及ROLLBACK.sh --alignment只扩展原事务，不替换历史记录。
+本轮证据：`<项目根>/analysis/model-design-20261106/new-input-20261107/performance-fix/architecture-alignment`。四角色保持原路径，新增ALIGNMENT_CODE.patch及ROLLBACK.sh --alignment只扩展原事务，不替换历史记录。
 
-成熟learner补充证据：`D:/Projects/fortune/Isaac/analysis/model-design-20261106/new-input-20261107/performance-fix/native-learner-optimization`；`ROLLBACK.sh --native-learner`恢复到本轮修改之前。
+成熟learner补充证据：`<项目根>/analysis/model-design-20261106/new-input-20261107/performance-fix/native-learner-optimization`；`ROLLBACK.sh --native-learner`恢复到本轮修改之前。
 
 **11-07 Claude 审核落实（组件阶段，不是新一轮速度验收）：**
 
@@ -939,8 +939,8 @@ episode reset、存档恢复及反事实分支需要正确的源作用域；分�
     "speed_under_nsys": "collect 15.41 s, update 18.39 s, 234.9x (u2-u4 medians); merged tree Python consumer 13.34 / 20.85 / 209.2",
     "core": "4f5d6ba abp_core.h torch-free core; TSAN stress (core_tests/test_abp_core.cpp, ops/run_core_tsan.sh) 3 seeds 0 warnings; no-stamp control fails"
   },
-  "candidate_worktree": "D:/Projects/fortune/Isaac/temp/wt-block-memory-v1",
-  "base_provenance": {"worktree": "D:/Projects/fortune/Isaac/temp/wt-predictive-aux", "revision": "c45a583"},
+  "candidate_worktree": "<项目根>/temp/wt-block-memory-v1",
+  "base_provenance": {"worktree": "<项目根>/temp/wt-predictive-aux", "revision": "c45a583"},
   "spatial": {
     "width": 192,
     "layers": 4,

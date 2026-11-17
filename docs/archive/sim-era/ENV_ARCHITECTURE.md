@@ -293,7 +293,7 @@ v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空
 
 复现：`python -m unittest test_sim_infra test_sim_vec test_sim_obs`；`python sim/tools/benchmark_pipeline.py --envs 8 32 128 --steps 32 --out runs/infra-benchmark.json`；`python sim/tools/benchmark_rollout.py --out runs/infra-rollout.json`。扩展接口依据 [SB3 OnPolicyAlgorithm 文档](https://stable-baselines3.readthedocs.io/en/master/modules/base.html#stable_baselines3.common.on_policy_algorithm.OnPolicyAlgorithm)；后续传输优化需遵守 [PyTorch pinned memory/异步传输的生命周期与性能约束](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html)，不是每步临时pin_memory就会更快。
 
-**Ubuntu RDP（仅恢复服务，未动训练环境）：** `ssh -p 2222 eolc@100.76.185.120`；实机Ubuntu22.04.5、RTX3080Ti12GB、94GiB RAM。3389的owner是GNOME Remote Desktop42.9，不是inactive的xrdp。旧daemon PID1462监听队列积压8–9、存在多条CLOSE-WAIT；客户端RDP协商5秒超时，普通restart35秒也未结束，停在stop-sigterm。只终止挂死的远程桌面daemon并重新启动，未注销GNOME会话、改密码、改防火墙或重启主机。新PID1542226启动CUDA编码，监听队列回到0；从本机通过RDP/NLA协商及TLS1.3握手（证书与通过SSH读取的服务器公钥证书匹配），耗时50ms。探针不提交凭据，随后关闭连接产生的NLA认证失败日志是预期结果，不是验证了错误密码。用户仍需用原RDP凭据确认实际桌面显示；本轮未证明GNOME内部挂死根因或长期不复发。
+**Ubuntu RDP（仅恢复服务，未动训练环境）：** `ssh <主机 1>`；实机Ubuntu22.04.5、RTX3080Ti12GB、94GiB RAM。3389的owner是GNOME Remote Desktop42.9，不是inactive的xrdp。旧daemon PID1462监听队列积压8–9、存在多条CLOSE-WAIT；客户端RDP协商5秒超时，普通restart35秒也未结束，停在stop-sigterm。只终止挂死的远程桌面daemon并重新启动，未注销GNOME会话、改密码、改防火墙或重启主机。新PID1542226启动CUDA编码，监听队列回到0；从本机通过RDP/NLA协商及TLS1.3握手（证书与通过SSH读取的服务器公钥证书匹配），耗时50ms。探针不提交凭据，随后关闭连接产生的NLA认证失败日志是预期结果，不是验证了错误密码。用户仍需用原RDP凭据确认实际桌面显示；本轮未证明GNOME内部挂死根因或长期不复发。
 
 ### 0.9 GPU 原始帧、rollout 与冻结编码缓存（2026-09-22，已实现）
 
@@ -325,8 +325,8 @@ v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空
 
 ### 0.10 Ubuntu 部署与完整 PPO 验收（2026-09-22，未正式开训）
 
-- 主机 `ssh -p 2222 eolc@100.76.185.120`，仓库 `/home/eolc/isaac-rl`，分支 `ubuntu-training`；运行时代码 `f3ee070`（GPU优化 `ce5d3a0` + Linux导入修复）。RTX3080Ti12GB、94GiB RAM。独立 `.venv`：Python3.10、Torch2.7.1+cu128、NumPy1.26.4、Gymnasium1.2.3、SB3/contrib2.7.1。
-- Linux共享库为 `sim/target/release/libisaac_sim.so`；私有Rust工具链位于 `/home/eolc/.local/share/isaac-rl/{cargo,rustup}`，显式使用 `cargo +stable-x86_64-unknown-linux-gnu`，不采用仓库Windows默认toolchain。未改系统驱动、Steam、RDP或全局代理；慢速依赖下载用了临时loopback SSH代理转发，安装结束关闭。
+- 主机 `ssh <主机 1>`，仓库 `~/isaac-rl`，分支 `ubuntu-training`；运行时代码 `f3ee070`（GPU优化 `ce5d3a0` + Linux导入修复）。RTX3080Ti12GB、94GiB RAM。独立 `.venv`：Python3.10、Torch2.7.1+cu128、NumPy1.26.4、Gymnasium1.2.3、SB3/contrib2.7.1。
+- Linux共享库为 `sim/target/release/libisaac_sim.so`；私有Rust工具链位于 `~/.local/share/isaac-rl/{cargo,rustup}`，显式使用 `cargo +stable-x86_64-unknown-linux-gnu`，不采用仓库Windows默认toolchain。未改系统驱动、Steam、RDP或全局代理；慢速依赖下载用了临时loopback SSH代理转发，安装结束关闭。
 - 实际发现并修复 `isaac_bridge.__init__` 无条件加载 `ctypes.WinDLL` 的Linux导入失败；只在 `sys.platform == "win32"` 导出原生注入接口，TCP/模拟器保持跨平台。`test_sim_obs` 按平台选择 `motion_trace` 后缀。新增回归在旧版失败、修正版通过、隔离回滚再次失败，Windows原生导出保留。
 - 远端44项Rust测试、29项Python测试通过；128路单块/2块/4块采样分别约 **9128/7273/4561 决策/s**。继续采用单块，CPU/Rayon线程8、PyTorch线程4。
 - 完整PPO隔离探针：128环境×128步=16,384条新transition；minibatch32、4epochs=2,048次实际optimizer.step。采样1.792s，更新55.381s，端到端286.57条新transition/s；训练峰值CUDA2.387GiB、进程峰值RSS1.944GiB。模型参数确实更新，保存/重载确定性动作一致。探针checkpoint不是正式模型，不能把采样9128决策/s当作训练吞吐。
@@ -334,7 +334,7 @@ v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空
 - 当前入口 `train_sim.py` 从随机初始化开始，各worker结束后进程内reset并更换seed，不重启原游戏。输入为64步v3可见历史，地图CNN+实体注意力+4层8头Transformer；输出45种移动/射击联合动作及独立炸弹开关，主动道具禁用。奖励仍为受伤−1、有效命中+0.05、归一化实际伤害、清房+1；死亡不重复扣分，timeout bootstrap。
 - **存档与评估准备已由§0.11补齐。** 本节吞吐不含周期存档/评估开销，不以测试更新代替正式训练，不报告胜率提升。之后仍需原版引擎迁移验收。
 
-远端证据在 `/home/eolc/isaac-rl/runs/deploy-20260922/`；本机镜像在 `runs/l2/20260922-remote-deploy/remote-evidence/`。复查配置（不会训练）：`PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --envs 128 --threads 8 --chunks 1 --n-steps 128 --batch-size 32 --episodes 100000`。
+远端证据在 `~/isaac-rl/runs/deploy-20260922/`；本机镜像在 `runs/l2/20260922-remote-deploy/remote-evidence/`。复查配置（不会训练）：`PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --envs 128 --threads 8 --chunks 1 --n-steps 128 --batch-size 32 --episodes 100000`。
 
 ### 0.11 Checkpoint、断点续训与固定留出评估（2026-09-22）
 
@@ -351,7 +351,7 @@ v3在**两端**去掉未校准的玩家/眼泪/血弹装饰动画字段（置空
 Ubuntu启动与续训示例（只有显式`--train`才开训）：
 
 ```bash
-cd /home/eolc/isaac-rl
+cd ~/isaac-rl
 PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --envs 128 --threads 8 --chunks 1 --n-steps 128 --batch-size 32 --episodes 100000 --checkpoint-every 10 --eval-every 25 --out runs/monstro-100k
 PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --resume runs/monstro-100k/checkpoints/latest.json --episodes 100000 --out runs/monstro-100k-resumed
 ```
@@ -360,7 +360,7 @@ PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --r
 
 **Ubuntu验收已完成：** 44项Rust、33项Python测试通过（含回合终止/autoreset后的历史恢复，以及中断写入不替换latest）。生产规模网络H64/E256/4层8头、128环境×8步、minibatch32/4epochs跑完一次更新，保存并关闭环境；从checkpoint恢复现场后再更新一次，总2048条transition、2轮更新。续训恢复5.777秒，末次checkpoint 67,633,447字节（64.50MiB），最终保存加16局评估6.760秒；本次总峰值CUDA2.058GiB。这里T=8，不取代§0.10的T=128完整训练性能数据；此短现场的恢复速度/压缩率也不是满H64历史的最坏值。
 
-16局固定留出评估全部生成轨迹与HTML（约20.77MiB），结果0胜/16死/0超时，均回报-5.876；模型仅经过两轮验证更新，没有训练效果主张。浏览器经localhost实际验收初始帧、95号帧、191号死亡帧和播放推进；单个HTML没有外部依赖，独立文件打开由用户侧浏览器完成。远端记录：`/home/eolc/isaac-rl/runs/checkpoint-acceptance-20260922/`；本机副本：`runs/l2/20260922-checkpoints/replays/index.html`。重建工具已从gzip记录重新产出`rebuilt.html`并验证时间轴。更新Rust ABI后需先重新build release库，再运行Python；仅替换Python源码不够。
+16局固定留出评估全部生成轨迹与HTML（约20.77MiB），结果0胜/16死/0超时，均回报-5.876；模型仅经过两轮验证更新，没有训练效果主张。浏览器经localhost实际验收初始帧、95号帧、191号死亡帧和播放推进；单个HTML没有外部依赖，独立文件打开由用户侧浏览器完成。远端记录：`~/isaac-rl/runs/checkpoint-acceptance-20260922/`；本机副本：`runs/l2/20260922-checkpoints/replays/index.html`。重建工具已从gzip记录重新产出`rebuilt.html`并验证时间轴。更新Rust ABI后需先重新build release库，再运行Python；仅替换Python源码不够。
 
 ### 0.12 第一版战斗目标与权重迁移（2026-09-23）
 
@@ -376,7 +376,7 @@ PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --r
 
 资源观测（旧正式训练，连续120个一秒采样）：GPU平均82.05%、最高87%，显存整卡6794/12288MiB，功耗约302W，温度约74℃；训练进程CPU约100.3%（相当一个逻辑核，不是全机100%），全机CPU约6.5%，进程RSS约3.10GiB，全机可用约82.3GiB，swap为0。物理8核/逻辑16线程。该观测不能单凭空余显存就推断增加环境数会加速；需要测PPO更新与CPU调度/GPU算子的实际占比。
 
-**切换已执行：** 旧进程1576867停止，旧目录完整保留；旧日志11027局，迁移源为第520轮checkpoint（11019局、8519680 transitions）。新目录`/home/eolc/isaac-rl/runs/monstro-128k-reward-v1-20260923`，128环境、8个Rust线程、单块、T128、minibatch32、4epochs、严格FP32；控制记录在`runs/reward-v1-20260923-control/`。本机/远端38项Python测试通过。不要把新实验重置的episode计数当成旧实验数据丢失。
+**切换已执行：** 旧进程1576867停止，旧目录完整保留；旧日志11027局，迁移源为第520轮checkpoint（11019局、8519680 transitions）。新目录`~/isaac-rl/runs/monstro-128k-reward-v1-20260923`，128环境、8个Rust线程、单块、T128、minibatch32、4epochs、严格FP32；控制记录在`runs/reward-v1-20260923-control/`。本机/远端38项Python测试通过。不要把新实验重置的episode计数当成旧实验数据丢失。
 
 **隔离性能实验（3080Ti，旧进程停止后、新进程启动前）：** 从同一迁移源复制模型，对固定128×128 rollout做4epochs完整更新；各配置重置相同权重和Adam。采样1.640秒（约9991决策/秒），默认更新57.783秒，占采样+更新的97.24%；即使采样成本变成零，该短测最多只提升约2.84%。Profiler显示卷积反向、embedding反向、矩阵乘与attention反向突出，CPU侧有频繁CUDA同步/launch。不能把8个空闲CPU线程等同于8倍学习器加速。
 
@@ -457,8 +457,8 @@ PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --r
 
 #### 固定证据快照
 
-- 远端实验：`/home/eolc/isaac-rl/runs/monstro-128k-reward-v1-20260923`；训练日志在`/home/eolc/isaac-rl/runs/reward-v1-20260923-control`。13:01复核PID1607660仍在运行，本次没有停止/重启它。
-- 本机曲线与原始数据：`D:/Projects/fortune/Isaac/rl/runs/training-curves/20260923-1301/`。`summary.json`汇总、`episodes.jsonl`回合、`training.log`优化日志、`evaluations.json`评估；`training-updates.csv`/`evaluation-points.csv`可再分析，`plot_curves.py`生成`performance.png`/`optimization.png`。
+- 远端实验：`~/isaac-rl/runs/monstro-128k-reward-v1-20260923`；训练日志在`~/isaac-rl/runs/reward-v1-20260923-control`。13:01复核PID1607660仍在运行，本次没有停止/重启它。
+- 本机曲线与原始数据：`<仓库根>/runs/training-curves/20260923-1301/`。`summary.json`汇总、`episodes.jsonl`回合、`training.log`优化日志、`evaluations.json`评估；`training-updates.csv`/`evaluation-points.csv`可再分析，`plot_curves.py`生成`performance.png`/`optimization.png`。
 - 完成11063局（目标8.64%），12353536次决策；日志有754个采样块、753次已完成PPO更新。SB3的`n_updates`按epoch累计，除以4才对应这里的完整更新轮数。
 - 最近500局胜率4.4%、平均回报−3.343；最近1000局胜率5.1%，前1000局7.4%。训练曲线先改善后回落，不能称为稳定收敛。
 - 固定验证种子`2147483648..2147483663`，30次评估。最好第425轮6/16胜、均回报−1.454；最新第750轮3/16胜、11死、2超时、均回报−2.856。16局结果波动大，且被反复用于选模，不是未见最终测试集。
@@ -539,7 +539,7 @@ PYTHONPATH=bridge/python .venv/bin/python bridge/python/train_sim.py --train --r
 
 **选择起点：** 256种子验证集上的确定性/随机胜率：第425轮19.1%/18.8%，第800轮16.4%/16.0%，第825轮10.9%/16.4%，第850轮18.4%/14.5%，第925轮11.3%/18.8%。第425轮不劣于任何候选，确定性模式下显著好于第825轮（McNemar p=0.009）和第925轮（p=0.019），因此从第425轮续训。旧实验在第1150轮停止（运行19小时34分），目录完整保留。旧实验第750轮后训练曲线曾回升到约17%（第800–849轮），随后回落到约9%（第1100–1149轮），与§0.14的振荡判断一致。
 
-**新运行：** 输出目录`/home/eolc/isaac-rl/runs/monstro-128k-seg1024-20260923`，控制目录`runs/seg1024-20260923-control`（含`launch.json`、补丁、测试与训练日志）。
+**新运行：** 输出目录`~/isaac-rl/runs/monstro-128k-seg1024-20260923`，控制目录`runs/seg1024-20260923-control`（含`launch.json`、补丁、测试与训练日志）。
 - 继承自第425轮：128环境、T128、seed 1、combat-v1、γ=.999。
 - 优化：batch 1024×2 epochs，微批256，片段长32，ent_coef 0.01。
 - 开局随机化：50%训练局的Boss以10%–100%血量开局，25%训练局的玩家以3–5个半心开局。

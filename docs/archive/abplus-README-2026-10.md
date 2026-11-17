@@ -9,7 +9,7 @@
 **历史部署状态**（2026-09-30；后续按实验使用独立沙箱，不代表当前活动版本）：
 - 桥接：主工作区是 abp-0.2.12（批量重放 `play`，Go-Explore 用，A8）。第一台部署的是 abp-0.2.9（C38、C40）；Go-Explore 另用一份主工作区的独立副本 `~/isaac-abplus/gx`（09-30 02:06，abp-0.2.12），见"Go-Explore"。第二台是 abp-0.2.11（C41），即 09-29 23:46 的主工作区，不含之后加的 `ABP_STARTSEED`、`ABP_SOUND_RESET`（A7）；C39 用的 abp-0.2.8-hp 留在第二台的 `~/isaac-abplus/bridge-abp-0.2.8-hp`。见"二进制观测与版本"。
 - abp_turbo：第一台 09-30 已换成含 A7 钩子的新库，旧库留作 `.bak-20260930`；第二台还是旧库。主工作区的代码需要新库。源码又加了 `ABP_AL_STOPPED`（A8，默认关），这一版只编进了第一台的 `~/isaac-abplus/gx/tools`，给 Go-Explore 用；训练环境没有打开它。
-- 远端：第一台 `ssh -p 2222 eolc@100.76.185.120`，第二台 `ssh rhythmo@10.19.131.132`。代码在 `~/isaac-abplus/bridge`，每次训练的输出在 `~/isaac-abplus/train/<运行名>`。两台各有一个训练看板。
+- 远端：第一台 `ssh <主机 1>`，第二台 `ssh <主机 2>`。代码在 `~/isaac-abplus/bridge`，每次训练的输出在 `~/isaac-abplus/train/<运行名>`。两台各有一个训练看板。
 - 实验进度和结论：EXPERIMENTS.md 的总览表。
 - **2026-10-03 起的新方向**（用户要求：能随算力扩展的训练架构）：主工作区是 abp-0.2.14，加了进程克隆 `fork`、精简模式 `lean` 和 fork 采样器（见"克隆与精简模式""fork 采样器"，实验 A19、B9、B10）。这一版只放在第二台的沙箱 `~/isaac-abplus/fk`（代码、`abp_bridge.lua`、`tools/libabp_turbo.so`、`tools/stub_render_g.txt`、结果 `runs/`），两台已部署的 `bridge/`、`flr/`、`tools/` 都没动。旧的训练管线（`train_abplus.py`）不受影响：新功能都要显式打开。
 
@@ -857,10 +857,10 @@ worker 进程 × N（tok_sampler.worker_main，不导入 torch）
 
 ```bash
 cd ~/isaac-abplus/gx/python
-PYTHONPATH=. /home/eolc/isaac-rl/.venv/bin/python -u goexplore_abplus.py \
+PYTHONPATH=. ~/isaac-rl/.venv/bin/python -u goexplore_abplus.py \
   --groups-file ../abplus/catalog/scaling2_groups.json --group normal --seeds range:2147600000:64 \
   --iterations 1000 --workers 12 --rooms-at-once 8 --name gxn --port 27610 --out ../runs/<运行名>
-PYTHONPATH=. /home/eolc/isaac-rl/.venv/bin/python goexplore_summary.py ../runs/<运行名> ../abplus/catalog/abplus_basement1_rooms.json
+PYTHONPATH=. ~/isaac-rl/.venv/bin/python goexplore_summary.py ../runs/<运行名> ../abplus/catalog/abplus_basement1_rooms.json
 ```
 
 - 输出（`--out`）：`config.json`；`progress.jsonl`（每 `--progress-s` 秒：任务数、失败、重返结果、游戏时和倍率、重置耗时、返回和探索的帧速、摘要耗时、在跑房间的存档概况）；`events.jsonl`（返回失败、`digest_retry`、worker 故障）；`results.jsonl`（每房一行）；`rooms/<种子>.json`（汇总、所有 cell 不带轨迹、胜利 cell 和最好 cell 带轨迹）；`rooms/<种子>.cells.json.gz`（每个 cell 带轨迹，动作码十六进制、一个动作一字节：joint + 45 × 炸弹 + 90 × 道具）。`--resume` 跳过已写出的房间。
@@ -900,7 +900,7 @@ PYTHONPATH=. /home/eolc/isaac-rl/.venv/bin/python goexplore_summary.py ../runs/<
 
 ```bash
 cd ~/isaac-abplus/bridge/python
-PY=/home/eolc/isaac-rl/.venv/bin/python
+PY=~/isaac-rl/.venv/bin/python
 CATALOG=~/isaac-abplus/bridge/abplus/catalog
 env PYTHONDONTWRITEBYTECODE=1 $PY -u train_abplus.py --train --envs 16 --chunks 1 --n-steps 1024 --batch-size 1024 \
   --micro-batch 256 --segment-length 32 --n-epochs 2 --nice 0 --tasks-file $CATALOG/mixture_positioning_rooms.json \
@@ -930,7 +930,7 @@ cd ~/isaac-abplus/train; nohup setsid bash <名字>.sh > <名字>.out 2>&1 < /de
 ### 训练看板（2026-09-27）
 
 `abplus_dashboard.py`（服务端，只用 Python 标准库）加 `isaac_bridge/abplus_dashboard.html`（页面，wandb 风格，图表用 jsdelivr 上的 uPlot）：
-- 地址：第一台 http://100.76.185.120:8790/ ，第二台 http://10.19.131.132:8790/ 。第一台只绑在 Tailscale 地址上，同一个 tailnet 里的设备能打开。
+- 地址：第一台 <主机 1> ，第二台 <主机 2> 。第一台只绑在 Tailscale 地址上，同一个 tailnet 里的设备能打开。
 - 只读。服务端读 `~/isaac-abplus/train/<运行>/` 下的 `progress.csv`、`config.json`、`episodes.jsonl`、`evaluations*/<检查点>/[sampled/]results.jsonl` 和 `replays.html`；运行名和检查点名必须是训练目录下的普通目录名。
 - 页面每 10 / 20 / 60 秒增量刷新：
   - 左边是运行列表，勾选的运行叠加在同一张图里，颜色按运行名固定；
@@ -940,7 +940,7 @@ cd ~/isaac-abplus/train; nohup setsid bash <名字>.sh > <名字>.out 2>&1 < /de
 - 启动：
   ```bash
   cd ~/isaac-abplus/bridge/python
-  setsid nohup python3 -u abplus_dashboard.py --host 100.76.185.120 --port 8790 > ~/isaac-abplus/dashboard.log 2>&1 < /dev/null &
+  setsid nohup python3 -u abplus_dashboard.py --host <主机 1> --port 8790 > ~/isaac-abplus/dashboard.log 2>&1 < /dev/null &
   ```
   改页面不用重启，每次请求都会重新读页面文件。
 
@@ -954,10 +954,10 @@ cd ~/isaac-abplus/train; nohup setsid bash <名字>.sh > <名字>.out 2>&1 < /de
 cd ~/isaac-abplus/bridge/python
 A="--checkpoint <checkpoint 目录> --tasks-file ~/isaac-abplus/bridge/abplus/catalog/mixture_target_dodge.json --target-from-tasks
    --episode-seconds 30 --seeds range:2147490000:64 --instances 6 --device cpu --replays 16 --port 27340 --name dg"
-env PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES= /home/eolc/isaac-rl/.venv/bin/python -u abplus_eval.py $A --out <输出目录>
-env PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES= /home/eolc/isaac-rl/.venv/bin/python -u abplus_eval.py $A --out <输出目录>/sampled \
+env PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES= ~/isaac-rl/.venv/bin/python -u abplus_eval.py $A --out <输出目录>
+env PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES= ~/isaac-rl/.venv/bin/python -u abplus_eval.py $A --out <输出目录>/sampled \
   --stochastic --sample-seed 0
-/home/eolc/isaac-rl/.venv/bin/python abplus_replay_view.py <输出目录>/replays.html "<输出目录>=最优" "<输出目录>/sampled=采样"
+~/isaac-rl/.venv/bin/python abplus_replay_view.py <输出目录>/replays.html "<输出目录>=最优" "<输出目录>/sampled=采样"
 ```
 
 - 和正在跑的训练、评估同时用时，`--port` 和 `--name` 要和它们错开。
@@ -972,7 +972,7 @@ env PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES= /home/eolc/isaac-rl/.venv/bi
 
 ```bash
 cd ~/isaac-abplus/bridge/python
-PYTHONDONTWRITEBYTECODE=1 nice -n 19 /home/eolc/isaac-rl/.venv/bin/python -u abplus_eval.py \
+PYTHONDONTWRITEBYTECODE=1 nice -n 19 ~/isaac-rl/.venv/bin/python -u abplus_eval.py \
   --checkpoint ~/isaac-abplus/checkpoints/u0425 --seeds ~/isaac-abplus/eval/seeds-e2.json \
   --out ~/isaac-abplus/eval/u0425-det-e2 --instances 6 --device cpu --verify-steps 3 --replays 16
 python abplus_transfer_report.py --sim <e2/results/u0425/det> --abplus <results.jsonl> \

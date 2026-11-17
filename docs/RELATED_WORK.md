@@ -1,6 +1,6 @@
 # 游戏 RL：结构化观测、并行环境与迁移经验
 
-调研日期：2026-09-18。以下使用原论文、官方接口和项目作者源码；社区成绩仅按作者报告记录，本轮没有运行这些外部项目。项目设计建议见 [PROJECT_SPEC.md](PROJECT_SPEC.md)。
+调研日期：2026-09-18。以下使用原论文、官方接口和项目作者源码；社区成绩仅按作者报告记录，本轮没有运行这些外部项目。项目设计建议见 [PROJECT_SPEC-2026-09.md](archive/sim-era/PROJECT_SPEC-2026-09.md)。
 
 ## 1. 总览
 
@@ -75,6 +75,6 @@ SoulsGym 用真实游戏的内存/输入控制构建 Gym 环境，文档涉及�
 | [Supermaxman/SerpentSuperAIsaacGameAgentPlugin](https://github.com/Supermaxman/SerpentSuperAIsaacGameAgentPlugin) | SerpentAI 截图 + 按键，Monstro 单 Boss PPO | 纯视觉、异步实时，不可扩展到多实例 |
 | [LanbingIce/IsaacSocket-Mod](https://github.com/LanbingIce/IsaacSocket-Mod) | Lua mod + 外部连接工具，为其他 mod 提供 WebSocket/HTTP/剪贴板及未开放 API | 证明 Rep/Rep+ 上 Lua 与外部进程通信是成熟做法；本项目不依赖它 |
 
-对本项目的结论：Lua mod 同步单步 + 控制台重置是经过验证的"半独立可操控环境"做法，直接采用；但实时原版只能出真值与评估数据，训练样本必须来自加速原版或独立模拟器，见 [ENV_ARCHITECTURE.md](ENV_ARCHITECTURE.md)。
+对本项目的结论：Lua mod 同步单步 + 控制台重置是经过验证的"半独立可操控环境"做法，直接采用；但实时原版只能出真值与评估数据，训练样本必须来自加速原版或独立模拟器，见 [ENV_ARCHITECTURE.md](archive/sim-era/ENV_ARCHITECTURE.md)。
 
 吞吐参照：PufferLib 报告 Pokémon Red（PyBoy 模拟器，无头多进程）在单台桌面机上超过 6000 步/秒（[PufferLib 1.0 博客](https://pufferai.github.io/build/html/rst/blog.html)）。以撒没有模拟器，达到同量级只能靠 L1 多实例加速与 L2 重实现。

@@ -10,7 +10,7 @@
     - 09-26 的引擎整层导出：6,000 层（第 1–8、10、11 层）逐房间一致，包括隐藏房、超级隐藏房的位置。
   - 隐藏房推断器、道具先验表、规则规划器 v0 都已完成，并在生成的楼层上评估。
   - 下文凡与此冲突之处，以本节和各处"更新"标注为准。
-- 对应 [PROJECT_SPEC.md](PROJECT_SPEC.md) 的阶段 3（连续房间）和阶段 4（完整游戏）。
+- 对应 [PROJECT_SPEC-2026-09.md](archive/sim-era/PROJECT_SPEC-2026-09.md) 的阶段 3（连续房间）和阶段 4（完整游戏）。
 - 游戏规则背景见 [ISAAC_GAME_PRIMER.md](../../analysis/docs/ISAAC_GAME_PRIMER.md)。
 
 **标注**

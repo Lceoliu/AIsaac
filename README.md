@@ -22,21 +22,21 @@
     - 进程级 `fork` 把运行中的原版引擎克隆成逐帧相同的副本，房间内任意帧可以分支（A19）；
     - 每决策耗时的分解、桥的精简模式和 fork 采样器（B9、B10）。
   - **最新已核对结果（10-07）**：C64 最终在 256 个留出楼层中通过 180 个（70.3%，Boss 清除率同为 70.3%）；C67 整局训练已完成 3,000.1 游戏小时，最新已评估 u9600 在 32 局中平均过 1.125 层，最高到第 3 层，最终 u9885 尚未评估。两者任务和种子不同，不直接比较百分比。
-  - 第二阶段 B2 的分支数据和选择头训练已跑通；最新无 CRN/无快照实验的选择头训练准确率 84.5%、留出准确率 46.3%（41 例），尚未证明泛化收益。可核对的精简原始结果见 [远端结果快照](docs/goal_conditioned/remote_results_20261007.json)。大模型权重和完整轨迹仅保存在本地忽略目录 `runs/sync-20261007/`，不随 Git 推送。
+  - 第二阶段 B2 的分支数据和选择头训练已跑通；最新无 CRN/无快照实验的选择头训练准确率 84.5%、留出准确率 46.3%（41 例），尚未证明泛化收益。可核对的精简原始结果见 [远端结果快照](docs/archive/goal-conditioned/goal_conditioned/remote_results_20261007.json)。大模型权重和完整轨迹仅保存在本地忽略目录 `runs/sync-20261007/`，不随 Git 推送。
 - **宏观规划**（[macro/](macro/README.md)，设计见 [MACRO_PLANNING.md](docs/MACRO_PLANNING.md)）
   - AB+ 楼层生成器的 Python 翻译，与引擎逐种子、逐房间一致；隐藏房推断、道具先验、规则规划器。
   - 忏悔+ 生成器的静态移植（没有和引擎核对），以及网页"找隐藏房"和以撒小测试。
 - **可发布的 gym 仓库**（`../isaac-abplus-gym`，还没发布）：AB+ 环境加 PPO 基线，GPL-3.0，英文文档。
-- **外部评审报告**：[COMBAT_RL_EXPERT_REVIEW.md](docs/COMBAT_RL_EXPERT_REVIEW.md)，截至 C37，含并行训练方案。
+- **外部评审报告**：[COMBAT_RL_EXPERT_REVIEW.md](docs/archive/2026-09-combat/COMBAT_RL_EXPERT_REVIEW.md)，截至 C37，含并行训练方案。
 
 ## 暂停的线
 
 | 项 | 状态 | 位置 |
 |---|---|---|
-| L2 Rust 单房间模拟器 + 128 环境 GPU PPO | 2026-09-21–24 的主线。u425 迁移到 AB+：模拟器胜率 19.1%，AB+ 0.4%；原因是模拟器缺少 Monstro 出场阶段，策略学会了开局炸弹（A2）。修不修待定 | [sim/](sim/)、[ENV_ARCHITECTURE.md](docs/ENV_ARCHITECTURE.md) |
-| 忏悔+（J460）原版桥接与 L1 加速 | 实机跑通；2/4 引擎共用模型训练，累计 512 局全部死亡；Windows 上三类原生崩溃的根因已查明。AB+ 路线接手后暂停 | [bridge/](bridge/README.md)、[turbo/](turbo/README.md)、[L1_FEASIBILITY_PLAN.md](docs/L1_FEASIBILITY_PLAN.md)、[NATIVE_CRASH_ANALYSIS.md](docs/NATIVE_CRASH_ANALYSIS.md) |
-| 真人录制与模仿学习 | 六局录制和首轮 BC 完成；BC 后额外 64 局胜率 13/64 → 1/64，没有替换策略；暂缓 | `record_human.ps1`、[ENV_ARCHITECTURE.md §0.13](docs/ENV_ARCHITECTURE.md#013-原版真人录制2026-09-23) |
-| 旧 v0 原型 `isaac_room/` | 已否定，见"历史原型" | [SINGLE_ROOM_V0.md](docs/SINGLE_ROOM_V0.md) |
+| L2 Rust 单房间模拟器 + 128 环境 GPU PPO | 2026-09-21–24 的主线。u425 迁移到 AB+：模拟器胜率 19.1%，AB+ 0.4%；原因是模拟器缺少 Monstro 出场阶段，策略学会了开局炸弹（A2）。修不修待定 | [sim/](sim/)、[ENV_ARCHITECTURE.md](docs/archive/sim-era/ENV_ARCHITECTURE.md) |
+| 忏悔+（J460）原版桥接与 L1 加速 | 实机跑通；2/4 引擎共用模型训练，累计 512 局全部死亡；Windows 上三类原生崩溃的根因已查明。AB+ 路线接手后暂停 | [bridge/](bridge/README.md)、[turbo/](turbo/README.md)、[L1_FEASIBILITY_PLAN.md](docs/archive/j460/L1_FEASIBILITY_PLAN.md)、[NATIVE_CRASH_ANALYSIS.md](docs/archive/j460/NATIVE_CRASH_ANALYSIS.md) |
+| 真人录制与模仿学习 | 六局录制和首轮 BC 完成；BC 后额外 64 局胜率 13/64 → 1/64，没有替换策略；暂缓 | `record_human.ps1`、[ENV_ARCHITECTURE.md §0.13](docs/archive/sim-era/ENV_ARCHITECTURE.md#013-原版真人录制2026-09-23) |
+| 旧 v0 原型 `isaac_room/` | 已否定，见"历史原型" | [SINGLE_ROOM_V0.md](docs/archive/sim-era/SINGLE_ROOM_V0.md) |
 
 ## 文档
 
@@ -44,15 +44,15 @@
 |---|---|---|
 | [bridge/abplus/README.md](bridge/abplus/README.md)、[EXPERIMENTS.md](bridge/abplus/EXPERIMENTS.md) | AB+ 桥接、训练管线和用法；全部实验 | 当前 |
 | [macro/README.md](macro/README.md)、[MACRO_PLANNING.md](docs/MACRO_PLANNING.md) | 宏观层离线工具；路线规划与道具选择里规则、推断、搜索和学习的分工 | 当前 |
-| [COMBAT_RL_EXPERT_REVIEW.md](docs/COMBAT_RL_EXPERT_REVIEW.md) | 给外部专家的进展汇总和并行训练方案 | 截至 C37（09-28） |
-| [PROJECT_SPEC.md](docs/PROJECT_SPEC.md) | 目标、观测边界、分阶段设计 | 目标和观测边界仍有效；"当前主线"停在 09-23 |
-| [ENV_ARCHITECTURE.md](docs/ENV_ARCHITECTURE.md) | 三层环境栈（原版 / 加速 / 模拟器）与统一契约；模拟器训练、PPO 审查、真人录制 | 模拟器阶段（到 09-23） |
+| [COMBAT_RL_EXPERT_REVIEW.md](docs/archive/2026-09-combat/COMBAT_RL_EXPERT_REVIEW.md) | 给外部专家的进展汇总和并行训练方案 | 截至 C37（09-28） |
+| [PROJECT_SPEC.md](docs/archive/sim-era/PROJECT_SPEC-2026-09.md) | 目标、观测边界、分阶段设计 | 目标和观测边界仍有效；"当前主线"停在 09-23 |
+| [ENV_ARCHITECTURE.md](docs/archive/sim-era/ENV_ARCHITECTURE.md) | 三层环境栈（原版 / 加速 / 模拟器）与统一契约；模拟器训练、PPO 审查、真人录制 | 模拟器阶段（到 09-23） |
 | [RELATED_WORK.md](docs/RELATED_WORK.md) | 游戏 RL 的相关工作：结构化观测、并行环境与迁移 | 09-18 的调研 |
-| [TRAINING_ARENA_DESIGN.md](docs/TRAINING_ARENA_DESIGN.md)、[ARENA_RESEARCH_NOTES.md](docs/ARENA_RESEARCH_NOTES.md) | 把原版引擎做成训练场：参照项目和实施方案；原始调研笔记（每条附 URL） | 历史（J460 方案，09-20–22） |
-| [L1_FEASIBILITY_PLAN.md](docs/L1_FEASIBILITY_PLAN.md) | J460 原版加速的可行性方案和控制层 | 历史（09-19–20） |
-| [NATIVE_CRASH_ANALYSIS.md](docs/NATIVE_CRASH_ANALYSIS.md) | J460 worker 的原生崩溃根因与修复方案 | 历史（09-20） |
+| [TRAINING_ARENA_DESIGN.md](docs/archive/j460/TRAINING_ARENA_DESIGN.md)、[ARENA_RESEARCH_NOTES.md](docs/archive/j460/ARENA_RESEARCH_NOTES.md) | 把原版引擎做成训练场：参照项目和实施方案；原始调研笔记（每条附 URL） | 历史（J460 方案，09-20–22） |
+| [L1_FEASIBILITY_PLAN.md](docs/archive/j460/L1_FEASIBILITY_PLAN.md) | J460 原版加速的可行性方案和控制层 | 历史（09-19–20） |
+| [NATIVE_CRASH_ANALYSIS.md](docs/archive/j460/NATIVE_CRASH_ANALYSIS.md) | J460 worker 的原生崩溃根因与修复方案 | 历史（09-20） |
 | [bridge/README.md](bridge/README.md)、[turbo/README.md](turbo/README.md) | J460 桥接 mod 和加速层 | 暂停 |
-| [SINGLE_ROOM_V0.md](docs/SINGLE_ROOM_V0.md) | 旧 v0 原型的实现与自测 | 已否定 |
+| [SINGLE_ROOM_V0.md](docs/archive/sim-era/SINGLE_ROOM_V0.md) | 旧 v0 原型的实现与自测 | 已否定 |
 
 引擎逆向和游戏机制的共用材料在 [../analysis/](../analysis/README.md)，例如 AB+ 引擎改造层 [ABP_LINUX_REVERSE_ENGINEERING.md](../analysis/docs/ABP_LINUX_REVERSE_ENGINEERING.md) 和游戏入门 [ISAAC_GAME_PRIMER.md](../analysis/docs/ISAAC_GAME_PRIMER.md)。
 
@@ -76,13 +76,13 @@ python .\rl\bridge\python\test_turbo_control.py  # Python 端共享内存双向�
 
 ## 模拟器阶段的记录（2026-09-21–24）
 
-AB+ 路线开始前的主线，细节都在 [ENV_ARCHITECTURE.md](docs/ENV_ARCHITECTURE.md)：
-- **手感测试**：`pwsh -File sim/play_motion.ps1`，WASD 移动、方向键射击、R 复位、F1 显示碰撞圈；`-Monstro -Seed 42` 打 Monstro。展示用已有的解包原图，动力学走同一个 Rust 内核。普通 Monstro 的接近小跳、高跳锁定格子、落地环射、Taunt 前摇扇形喷弹和弹幕高度碰撞已实现，同 seed + 同输入可复现（[§0.6](docs/ENV_ARCHITECTURE.md#06-monstro-接入与可见观测2026-09-21)）。
-- **Ubuntu 训练**：`/home/eolc/isaac-rl`，RTX 3080 Ti，128 环境 GPU PPO（部署验收时完整 PPO 更新约 287 条新 transition/s，峰值 CUDA 2.39 GiB），GPU 常驻原始帧和 rollout（[§0.9](docs/ENV_ARCHITECTURE.md#09-gpu-原始帧rollout-与冻结编码缓存2026-09-22已实现)），每 10 轮 checkpoint、固定留出种子评估（[§0.11](docs/ENV_ARCHITECTURE.md#011-checkpoint断点续训与固定留出评估2026-09-22)）。`python bridge/python/train_sim.py` 默认只展示配置，`--train` 才开训；`--pipeline legacy` 保留 CPU 对照。
-- **PPO 审查**：旧实验 `monstro-128k-reward-v1-20260923`（batch 32 × 4 epochs）每轮更新过大（精确 KL 约 0.14），在 256 个未见种子上从第 425 轮的 19% 退到第 750 轮的 7%，不是 reward hacking（[§0.14](docs/ENV_ARCHITECTURE.md#014-当前阶段与-claude-只读审查交接2026-09-23)，`runs/ppo-audit/20260923-e1e2/`）。
-- **最后一次模拟器训练**：`monstro-128k-seg1024-20260923`，09-23 21:29 从第 425 轮续训，batch 1024 × 2 epochs、帧去重分段、训练开局随机化、熵 0.01（[§0.15](docs/ENV_ARCHITECTURE.md#015-更新量帧去重与训练开局随机化2026-09-23已上线)）。09-24 它的 u8110 被用作 AB+ 第一次训练的热启动（EXPERIMENTS.md C2）。
+AB+ 路线开始前的主线，细节都在 [ENV_ARCHITECTURE.md](docs/archive/sim-era/ENV_ARCHITECTURE.md)：
+- **手感测试**：`pwsh -File sim/play_motion.ps1`，WASD 移动、方向键射击、R 复位、F1 显示碰撞圈；`-Monstro -Seed 42` 打 Monstro。展示用已有的解包原图，动力学走同一个 Rust 内核。普通 Monstro 的接近小跳、高跳锁定格子、落地环射、Taunt 前摇扇形喷弹和弹幕高度碰撞已实现，同 seed + 同输入可复现（[§0.6](docs/archive/sim-era/ENV_ARCHITECTURE.md#06-monstro-接入与可见观测2026-09-21)）。
+- **Ubuntu 训练**：`/home/eolc/isaac-rl`，RTX 3080 Ti，128 环境 GPU PPO（部署验收时完整 PPO 更新约 287 条新 transition/s，峰值 CUDA 2.39 GiB），GPU 常驻原始帧和 rollout（[§0.9](docs/archive/sim-era/ENV_ARCHITECTURE.md#09-gpu-原始帧rollout-与冻结编码缓存2026-09-22已实现)），每 10 轮 checkpoint、固定留出种子评估（[§0.11](docs/archive/sim-era/ENV_ARCHITECTURE.md#011-checkpoint断点续训与固定留出评估2026-09-22)）。`python bridge/python/train_sim.py` 默认只展示配置，`--train` 才开训；`--pipeline legacy` 保留 CPU 对照。
+- **PPO 审查**：旧实验 `monstro-128k-reward-v1-20260923`（batch 32 × 4 epochs）每轮更新过大（精确 KL 约 0.14），在 256 个未见种子上从第 425 轮的 19% 退到第 750 轮的 7%，不是 reward hacking（[§0.14](docs/archive/sim-era/ENV_ARCHITECTURE.md#014-当前阶段与-claude-只读审查交接2026-09-23)，`runs/ppo-audit/20260923-e1e2/`）。
+- **最后一次模拟器训练**：`monstro-128k-seg1024-20260923`，09-23 21:29 从第 425 轮续训，batch 1024 × 2 epochs、帧去重分段、训练开局随机化、熵 0.01（[§0.15](docs/archive/sim-era/ENV_ARCHITECTURE.md#015-更新量帧去重与训练开局随机化2026-09-23已上线)）。09-24 它的 u8110 被用作 AB+ 第一次训练的热启动（EXPERIMENTS.md C2）。
 - **迁移到原版**：同种子配对评估 u425，模拟器胜率 19.1%，AB+ 0.4%（A2）。修复办法是给模拟器的 Monstro 加出场阶段，待定。
-- **真人录制**：`pwsh -File record_human.ps1` 启动独立的原版游戏副本和 http://127.0.0.1:8764 侧边面板，F6 倒数开始、F7 保存并重置、F8 结束；正式样本在 `runs/human/`，验收样本在 `runs/human-recorder-qa/`（[§0.13](docs/ENV_ARCHITECTURE.md#013-原版真人录制2026-09-23)）。
+- **真人录制**：`pwsh -File record_human.ps1` 启动独立的原版游戏副本和 http://127.0.0.1:8764 侧边面板，F6 倒数开始、F7 保存并重置、F8 结束；正式样本在 `runs/human/`，验收样本在 `runs/human-recorder-qa/`（[§0.13](docs/archive/sim-era/ENV_ARCHITECTURE.md#013-原版真人录制2026-09-23)）。
   - 数据处理：`python -m isaac_bridge.human_recording SESSION --prepare-to NEW-DIRECTORY --validation-episode episode-0006.jsonl.gz`。
   - BC：`python bridge/python/train_human_bc.py --checkpoint CHECKPOINT --dataset DATASET --out NEW-DIRECTORY --run`，须设 `PYTHONPATH=bridge/python`。
 
@@ -94,7 +94,7 @@ AB+ 路线开始前的主线，细节都在 [ENV_ARCHITECTURE.md](docs/ENV_ARCHI
 
 ## 历史原型（已否定，仅记录）
 
-`isaac_room/` 是 2026-09-19 之前写的通用射击原型：固定 60 Hz、自编敌人、几何绘图，没有使用任何原版资源或机制。它可以运行（`play.ps1`、`python -m isaac_room.benchmark`），37 项自测和 24/24 脚本清房只验证自编规则，不构成以撒仿真的验收。细节见 [SINGLE_ROOM_V0.md](docs/SINGLE_ROOM_V0.md)。
+`isaac_room/` 是 2026-09-19 之前写的通用射击原型：固定 60 Hz、自编敌人、几何绘图，没有使用任何原版资源或机制。它可以运行（`play.ps1`、`python -m isaac_room.benchmark`），37 项自测和 24/24 脚本清房只验证自编规则，不构成以撒仿真的验收。细节见 [SINGLE_ROOM_V0.md](docs/archive/sim-era/SINGLE_ROOM_V0.md)。
 
 ## Git 管理
 
