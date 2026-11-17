@@ -10,7 +10,8 @@ Cases (every one a clone of a floor template; nothing written back):
   longlived       a coin spawned in the start room, 600 frames on (age 600: 10 after the scale, clamped at 8)
   devilprice      a devil deal (goto s.devil.0; else a pedestal set to Price -1)
   shooting        the player shooting right for 3 decisions (fire_dir set)
-  forgotten       the Forgotten (PlayerType 16) at the start: the Soul as a sub-player body
+  forgotten       the Forgotten (PlayerType 16) at the start: the Soul a sub-player body without a room position
+  forgotten-soul  after one drop press: the Soul controlled, the Forgotten's body the familiar 3.900 in the room
 
 Writes <out>/<name>.raw.json (the block, with its stall extras), <out>/<name>.v3.bin, <out>/<name>.engine.json (the
 engine values read apart) and <out>/manifest.json (per frame: shape, counts, sha256 of the bytes, what it covers).
@@ -233,7 +234,14 @@ def main():
                                   f'after 2 frames: {c.lua(DEVIL_PRICES)}'
         case('devilprice', 'a pickup with a negative Price (a devil deal)', devil)
         case('shooting', 'the player shooting right', lambda c: [c.step({'shoot': 2}, repeat=4) for _ in range(3)])
-        case('forgotten', 'the Forgotten and the Soul as bodies', lambda c: idle(c, 2), char=16)
+        case('forgotten', 'the Forgotten controlled; the Soul (GetSubPlayer) has no room position', lambda c: idle(c, 2),
+             char=16)
+
+        def to_soul(c):
+            c.step({'drop': 1}, repeat=4)
+            idle(c, 12)
+        case('forgotten-soul', 'the Soul controlled; the Forgotten body lies in the room as the familiar 3.900', to_soul,
+             char=16)
 
         try:   # (the stage commands on the template as the V1 probe ran them: 2, 3, .., 7 in turn)
             floor(first)

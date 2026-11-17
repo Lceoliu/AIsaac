@@ -281,10 +281,15 @@ def observation_frame_v3(raw, stall_share=0.0, stall_known=0, producer=V3.PRODUC
     padded[4:4 + V3.CANVAS_H, 4:4 + V3.CANVAS_W] = canvas
     for i, b in enumerate(bodies):
         p = P[i]
+        known_pos = int(b.get('position_known', 1))
         x, y = float(b['x']) - ox, float(b['y']) - oy
-        p[_P['x']], p[_P['y']] = x, y
         for k in _P_RAW:
             p[_P[k]] = float(b.get(k, 0))
+        if known_pos:
+            p[_P['x']], p[_P['y']] = x, y
+        else:   # (schema batch 3: no position in this room -- x, y, vx, vy 0 and the local patch 0)
+            p[_P['vx']] = p[_P['vy']] = 0.0
+        p[_P['position_known']] = known_pos
         if unknown:
             for k in _HEALTH:
                 p[_P[k]] = 0.0
@@ -317,9 +322,10 @@ def observation_frame_v3(raw, stall_share=0.0, stall_known=0, producer=V3.PRODUC
             p[_P[f'weapon{k}']] = (weapons >> k) & 1
         for k, c in enumerate(V3.ENTITY_CLASSES):
             p[_P[f'overflow_{c}']] = overflow[k]
-        col = min(max(_math.floor(x / V3.CELL), 0), gw - 1)
-        row = min(max(_math.floor(y / V3.CELL), 0), gh - 1)
-        local[i] = padded[row:row + V3.LOCAL_SIDE, col:col + V3.LOCAL_SIDE]
+        if known_pos:
+            col = min(max(_math.floor(x / V3.CELL), 0), gw - 1)
+            row = min(max(_math.floor(y / V3.CELL), 0), gh - 1)
+            local[i] = padded[row:row + V3.LOCAL_SIDE, col:col + V3.LOCAL_SIDE]
     # entities
     E = np.zeros((len(entities), V3.EF), '<f4')
     for i, e in enumerate(entities):

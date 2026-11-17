@@ -2011,14 +2011,19 @@ local function v3_body(p, index, role, n_players, cfg_players)
 end
 
 local function v3_bodies(game)
-	-- de-duplicated by InitSeed (a sub-player shares its main body's Index on AB+: the golden frames, 2026-11-17)
+	-- de-duplicated by InitSeed (AB+: the Soul and the Forgotten share Entity.Index -- golden1, 2026-11-17; Rep
+	-- UNVERIFIED). position_known (schema batch 3): the body's entity is among the room's entities (by InitSeed); AB+'s
+	-- GetSubPlayer() never is (it sits at world (0, 0) whichever character is controlled: 184 subbody1 / subbody2)
 	local bodies, players, seen = {}, {}, {}
+	local in_room = {}
+	for _, e in ipairs(Isaac.GetRoomEntities()) do if e.Type == 1 then in_room[e.InitSeed] = true end end
 	local n = game:GetNumPlayers()
 	for i = 0, n - 1 do
 		local p = Isaac.GetPlayer(i)
 		if not seen[p.InitSeed] then
 			seen[p.InitSeed] = #bodies + 1
 			bodies[#bodies + 1] = v3_body(p, i, 1)
+			bodies[#bodies].position_known = in_room[p.InitSeed] and 1 or 0
 			players[#players + 1] = p
 		end
 	end
@@ -2028,6 +2033,7 @@ local function v3_bodies(game)
 		if sub ~= nil and not seen[sub.InitSeed] then
 			seen[sub.InitSeed] = #bodies + 1
 			bodies[#bodies + 1] = v3_body(sub, nil, 3)
+			bodies[#bodies].position_known = in_room[sub.InitSeed] and 1 or 0
 			players[#players + 1] = sub
 			local main = seen[p.InitSeed]
 			bodies[#bodies].linked = main

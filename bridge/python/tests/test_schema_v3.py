@@ -17,7 +17,7 @@ CRLF, LF = chr(13) + chr(10), chr(10)   # (a Windows checkout may hold the heade
 
 
 def test_f1_sizes():
-    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111702
+    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111703
     assert (S.FIXED, S.PF, S.LOCAL, S.EF, S.NF, S.SF, S.BODY, S.RC) == (2417, 192, 405, 64, 8, 24, 597, 21)
     assert S.HEADER == 8 and S.MAGIC == 61107 and S.LAYOUT_GEN == 3
     assert S.frame_floats(1, 0, 0, 0) == 2417 + 597
@@ -38,7 +38,7 @@ def test_f1_columns_the_design_names():
                     ('curse0', 72), ('black_slot0', 104), ('bone_slot0', 128), ('weapon0', 152),
                     ('overflow_interactable', 176), ('overflow_other', 180)):
         assert S.col(P, name) == c, name
-    assert all(P[i][1] == 'reserved' for i in list(range(43, 48)) + [54, 55] + list(range(66, 72)) + list(range(181, 192)))
+    assert all(P[i][1] == 'reserved' for i in list(range(43, 48)) + [55] + list(range(66, 72)) + list(range(181, 192)))
     for name, c in (('type', 0), ('subtype', 2), ('kind', 15), ('npc_flags', 16), ('champion', 19), ('price', 31),
                     ('identity_known', 32), ('flags_known', 33), ('tear_w0', 34), ('tear_w7', 41), ('proj_w0', 42),
                     ('eflag_w0', 46), ('anim_id', 50)):
@@ -178,3 +178,10 @@ def test_batch2_scales():
             assert r is None or (len(r) == 2 and r[0] < r[1] and -S.NUM_CLAMP <= r[0] and r[1] <= S.NUM_CLAMP), name
     P = S.P_COLS
     assert S.NUM_RANGE['P']['x'] == (0.0, 1120 / 520) and S.NUM_RANGE['P']['y'] == (0.0, 640 / 520)
+
+
+def test_batch3_position_known():
+    """Batch 3 (the coordinator, 2026-11-17): P col 54 position_known, a known flag; not a num column (no NUM_RANGE)."""
+    P = S.P_COLS
+    assert S.col(P, 'position_known') == 54 and P[54][1] == 'known' and S.VERSION == 2026111703
+    assert 'position_known' not in S.NUM_RANGE['P']
