@@ -2018,6 +2018,12 @@ local V3_DECORATIVE_SPEC = {
 local V3_DECORATIVE = {}
 for v, _ in pairs(V3_DECORATIVE_SPEC) do V3_DECORATIVE[v] = true end
 V3_DECORATIVE_LIST = V3_DECORATIVE
+-- The argument ranges of every indexed engine call of this block on AB+ (schema_v3.ABP_RANGES, the same values; a
+-- test compares them and checks that no loop bound here is a bare number). An index past a getter's own table reads
+-- other fields (HasWeaponType: no bounds check, golden7 / golden8), so every loop takes its bound from here.
+local V3_ABP = { weapon_type_max = 10, heart_slots = 24, door_slots = 8, collectibles = 553, pills = 14,
+	pocket_slots = 2, trinket_slots = 2, grid_cells = 448 }
+V3_ABP_RANGES = V3_ABP
 local V3_BODY_ANIMS = { "WalkDown", "WalkUp", "WalkLeft", "WalkRight", "HeadDown", "HeadUp", "HeadLeft", "HeadRight",
 	"Hit", "Death", "Appear", "TeleportUp", "TeleportDown", "Trapdoor" }
 
@@ -2043,14 +2049,19 @@ local function v3_body(p, index, role, n_players, cfg_players)
 	end
 	local controller = p.ControllerIndex
 	local bone_bits, weapon_bits = 0, 0
-	for i = 0, 23 do
+	-- IsBoneHeart(i) over the heart slots only, (max + soul + 1) // 2 + bones (the engine's own limit, 0x667400; its
+	-- mask is a 32-bit field read as bit i & 31, so no bit past the slots is read)
+	local slots = math.min(V3_ABP.heart_slots, (p:GetMaxHearts() + p:GetSoulHearts() + 1) // 2 + p:GetBoneHearts())
+	for i = 0, slots - 1 do
 		if v3_try(function() return p:IsBoneHeart(i) end, false) then bone_bits = bone_bits | (1 << i) end
 	end
-	-- HasWeaponType only over AB+'s WeaponType range 0..10 (an id past it reads past the engine's table: the Forgotten
-	-- sub-player's bit 11 differed between two runs of the same state, golden7 / golden8); the bits above stay 0
-	for i = 0, 10 do
+	-- HasWeaponType only over AB+'s WeaponType 0..10 (no bounds check: an id past it reads other fields -- the
+	-- Forgotten sub-player's bit 11 differed between two runs of the same state, golden7 / golden8); bits above 0
+	for i = 0, V3_ABP.weapon_type_max do
 		if v3_try(function() return p:HasWeaponType(i) end, false) then weapon_bits = weapon_bits | (1 << i) end
 	end
+	-- the black-heart mask over the soul-heart slots only, (soul + 1) // 2 (a bit per full soul heart)
+	local black = p:GetBlackHearts() & ((1 << math.min(V3_ABP.heart_slots, (p:GetSoulHearts() + 1) // 2)) - 1)
 	local charge, charge_known = 0, 0
 	if index ~= nil and type(abp_player_charge) == "function" then charge, charge_known = abp_player_charge(index) or 0, 1 end
 	-- (no Entity.Index: on AB+ a player's Index is not reproducible -- 4294967295 / 1172069600 for the same state,
@@ -2066,7 +2077,7 @@ local function v3_body(p, index, role, n_players, cfg_players)
 		head_dir = p:GetHeadDirection(), fire_dir = p:GetFireDirection(), move_dir = p:GetMovementDirection(),
 		sprite_frame = spr:GetFrame(), weapon_charge = charge, weapon_charge_known = charge_known,
 		ptype = p:GetPlayerType(), role = role, controller = controller or -1, controller_known = controller ~= nil and 1 or 0,
-		animation = animation, animation_known = animation ~= 0 and 1 or 0, black = p:GetBlackHearts(),
+		animation = animation, animation_known = animation ~= 0 and 1 or 0, black = black,
 		bone_bits = bone_bits, weapon_bits = weapon_bits, bone_slots_known = 1 }
 end
 
@@ -2188,7 +2199,7 @@ local function v3_cells(room, level)
 			hazards[#hazards + 1] = e
 		end
 	end
-	for i = 0, room:GetGridSize() - 1 do
+	for i = 0, math.min(room:GetGridSize(), V3_ABP.grid_cells) - 1 do   -- (GetGridCollision has no upper bound check)
 		local pos = room:GetGridPosition(i)
 		local collision = room:GetGridCollision(i)
 		local g = room:GetGridEntity(i)
@@ -2210,7 +2221,7 @@ local function v3_cells(room, level)
 			gt, gv, gs }
 	end
 	local doors = {}
-	for slot = 0, 7 do
+	for slot = 0, V3_ABP.door_slots - 1 do
 		local d = room:GetDoor(slot)
 		if d and visible_door(d) then
 			local visited, clear = 0, 0
@@ -2251,7 +2262,8 @@ local function v3_items(players)
 	for b, p in ipairs(players) do
 		local owner = b - 1
 		do
-			for id = 1, config:GetCollectibles().Size - 1 do
+			-- (GetCollectibleNum reads the player's count table at id without a check: ids below NUM_COLLECTIBLES only)
+			for id = 1, math.min(config:GetCollectibles().Size, V3_ABP.collectibles) - 1 do
 				local count = p:GetCollectibleNum(id)
 				if count > 0 then inventory[#inventory + 1] = { owner, id, count } end
 			end
@@ -2266,14 +2278,15 @@ local function v3_items(players)
 				slots[#slots + 1] = { owner = owner, family = 1, slot = 1, id = id, occupied = B(id ~= 0), selected = 0,
 					charge = secondary.Charge, max_charge = desc and desc.MaxCharges or 0, battery = secondary.BatteryCharge }
 			end
-			for slot = 0, p:GetMaxTrinkets() - 1 do
+			for slot = 0, math.min(p:GetMaxTrinkets(), V3_ABP.trinket_slots) - 1 do
 				local id = p:GetTrinket(slot)
 				slots[#slots + 1] = { owner = owner, family = 2, slot = slot, id = id & 0x7fff, occupied = B(id ~= 0),
 					selected = 0, golden = B((id & 0x8000) ~= 0), charge_known = 0 }
 			end
-			for slot = 0, p:GetMaxPoketItems() - 1 do
+			for slot = 0, math.min(p:GetMaxPoketItems(), V3_ABP.pocket_slots) - 1 do   -- (GetCard / GetPill: no check)
 				local pill, card = p:GetPill(slot), p:GetCard(slot)
-				local identified = pill ~= 0 and pool:IsPillIdentified(pill)
+				-- IsPillIdentified reads a byte table at the colour without a check: colours 1 .. NUM_PILLS - 1 only
+				local identified = pill > 0 and pill < V3_ABP.pills and pool:IsPillIdentified(pill)
 				local effect = identified and (pool:GetPillEffect(pill) + 1) or 0
 				slots[#slots + 1] = { owner = owner, family = card ~= 0 and 4 or 3, slot = slot,
 					id = card ~= 0 and card or effect, occupied = B(pill ~= 0 or card ~= 0), selected = B(slot == 0),

@@ -51,6 +51,12 @@ effect is decorative only if it takes no part in collisions, deals no damage, an
 sent entity or bears on no decision; an uncertain one is sent and reported. The producers drop a listed effect only
 while its CollisionDamage is 0.
 
+Engine argument ranges (convention, the coordinator 2026-11-17; no shape change): a producer calls the engine only with
+arguments inside that game version's own ranges (ABP_RANGES below for AB+, with where each comes from; REP_RANGES for
+Rep, UNVERIFIED where not measured); a bit or column past them is written 0, with a known flag where one says so. Many
+getters have no bounds check (an index past their table reads other fields: AB+ HasWeaponType(11) gave a different
+bit in two runs of the same state), so every loop bound comes from these tables, never a bare number.
+
 Wire rule (DESIGN 2.0): every value is a raw game unit as float32 (integers exact to 2^24, bit words <= 24 bits, flag
 words in 16-bit chunks); categorical codes are integers, 0 = none / not known; reserved columns are 0. The model
 applies SCALE (below) itself. Known flags (G3): a field the game version lacks is written as its true value there
@@ -292,6 +298,38 @@ NUM_RANGE = {
           'display_order': None, 'sub_charge': None},
 }
 
+
+# Engine argument ranges per game version (the convention above). (value, source); abp_bridge.lua V3_ABP = the values.
+# 'disasm' = the getter in isaac.x64 (sha256 b9bfef32...) read with objdump on 184; 'enums' = resources/scripts/enums.lua
+# of the AB+ install there (line); 'measured' = abplus_probe_v3_ranges.py (184 ranges1).
+ABP_RANGES = {
+    'weapon_type_max': (10, 'enums 931-942 WeaponType 0..10, NUM_WEAPON_TYPES 11; disasm HasWeaponType 0x7819a0: '
+                            'byte at +0x2628 + id, no bounds check'),
+    'heart_slots': (24, "the P bit blocks (24); per body the bound is (max + soul + 1) // 2 + bones (IsBoneHeart: the "
+                        "engine's limit 0x667400) and (soul + 1) // 2 for the black mask; measured: no bit past them"),
+    'door_slots': (8, 'enums 1143-1153 DoorSlot 0..7, NUM_DOOR_SLOTS 8; disasm GetDoor 0x781030: -1..7 checked'),
+    'collectibles': (553, 'enums 2260 NUM_COLLECTIBLES 553; measured GetCollectibles().Size 553; disasm '
+                          'NumCollectibleHeld 0x65cc20: the count table read at id, no bounds check'),
+    'pills': (14, 'enums 1205-1220 PillColor, NUM_PILLS 14; disasm IsPillIdentified 0x7815b0: byte at +0x8e4 + colour, '
+                  'no bounds check'),
+    'pocket_slots': (2, 'disasm GetMaxPoketItems 0x658df0: 1, or 2 with 251 / 252 / 416 / 454; GetCard / GetPill '
+                        '0x657bf0 / 0x657c10: no bounds check; measured slot 1 with Polydactyly'),
+    'trinket_slots': (2, "disasm GetMaxTrinkets 0x655c90: 1, or 2 with 139 / 458; GetTrinket 0x657d40: slot <= 1 checked; "
+                         "measured with Mom's Purse"),
+    'grid_cells': (448, 'disasm GetGridEntity 0x781100: index <= 447 checked; GetGridCollision 0x82d0a0: only < 0 '
+                        'checked; 28 x 16'),
+}
+# Rep (docs/VISIBLE_V3_DESIGN.md sources; nothing measured yet: UNVERIFIED)
+REP_RANGES = {
+    'weapon_type_max': (15, 'E_REP:1396 WeaponType 1..15 -- UNVERIFIED'),
+    'heart_slots': (24, 'as AB+ -- UNVERIFIED'),
+    'door_slots': (8, 'DoorSlot 0..7 -- UNVERIFIED'),
+    'collectibles': (733, 'REPA items.xml max 732 -- UNVERIFIED'),
+    'pills': (15, 'E_REP:1735 PillColor to PILL_GOLD 14 (giant flag 0x800 apart) -- UNVERIFIED'),
+    'pocket_slots': (4, 'DOC:EP GetCard / GetPill slots 0..3 -- UNVERIFIED'),
+    'trinket_slots': (2, 'as AB+ -- UNVERIFIED'),
+    'grid_cells': (448, 'as AB+ -- UNVERIFIED'),
+}
 
 # ------------------------------------------------------------------------------------------------- F1: tables
 # identity (existing, 65536 x 24): the raw id; < 0 or >= 65535 (or NaN) -> IDENTITY_UNKNOWN; 0 the padding row

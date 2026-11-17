@@ -164,3 +164,17 @@ def test_a_body_without_a_room_position():
     assert (P[1][c('x')], P[1][c('y')], P[1][c('vx')], P[1][c('vy')]) == (0, 0, 0, 0)
     assert not f['local'][1].any() and f['local'][0].any()
     assert P[1][c('ptype')] == 19 and P[1][c('body_role')] == 3 and P[1][c('hearts')] == 6
+
+
+def test_engine_ranges_come_from_one_table():
+    """The range convention (schema_v3.ABP_RANGES, the coordinator 2026-11-17): abp_bridge.lua's V3_ABP has the same
+    values, and no loop of the v3 block has a bare-number bound (every one from V3_ABP or an engine count)."""
+    lua = (BRIDGE / 'abplus' / 'abp_bridge.lua').read_text(encoding='utf-8').replace('\r\n', '\n')
+    m = re.search(r'local V3_ABP = \{(.*?)\}', lua, re.S)
+    table = {k: int(v) for k, v in re.findall(r'(\w+) = (\d+)', m.group(1))}
+    assert table == {k: v for k, (v, _) in V3.ABP_RANGES.items()} and set(V3.REP_RANGES) == set(V3.ABP_RANGES)
+    assert all(src for _, src in V3.ABP_RANGES.values()) and all('UNVERIFIED' in s for _, s in V3.REP_RANGES.values())
+    start = lua.index('local V3_ABP = {')
+    end = lua.index('\nend\n', lua.index('function visible_v3_raw()'))
+    bare = re.findall(r'for \w+ = -?\d+, -?\d+ do', lua[start:end])
+    assert not bare, bare
