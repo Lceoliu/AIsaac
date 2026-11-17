@@ -6,7 +6,7 @@
 
 /* ---- F1: identity and header */
 #define ABP_V3_SCHEMA "isaac-visible-prlmens-g-v3"
-#define ABP_V3_VERSION 2026111701
+#define ABP_V3_VERSION 2026111702
 #define ABP_V3_FRAME_BYTES 131072
 #define ABP_V3_MAGIC 61107
 #define ABP_V3_LAYOUT_GEN 3
@@ -31,6 +31,9 @@
 #define ABP_V3_RC 21
 /* the canvas frame (batch 1): origin = GetGridPosition(0) - (CELL / 2, CELL / 2); cell = floor(pos / CELL) */
 #define ABP_V3_CELL 40
+/* batch 2: the model clamps every scaled num column to +-NUM_CLAMP at decode (reference only: no producer
+ * clamps, the wire is raw) */
+#define ABP_V3_NUM_CLAMP_MILLI 8000
 #define ABP_V3_W0_INSIDE_SHIFT 0
 #define ABP_V3_W0_INSIDE_BITS 1
 #define ABP_V3_W0_COLLISION_SHIFT 1
