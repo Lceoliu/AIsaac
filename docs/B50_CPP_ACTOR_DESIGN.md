@@ -1,5 +1,8 @@
 # B50 设计：actor 调度热路径迁到 C++（阶段 0 设计稿，2026-11-09，已回填 nsys 数字）
 
+> **状态（2026-11-17）**：已实现（`bridge/engine/abp_actor.cpp`、`isaac_bridge/actor_native.py`、`isaac_bridge/block_driver.py`），只用于 block-memory v1 一套；这条模型线 11-17 起不再投入，代码保留。
+> 结果见 `bridge/abplus/EXPERIMENTS.md` 的 B50、B52、B54、B57、B58a–e、B62 各节。文中的 4090 已不可用，数字是当时那台机器上测的。
+
 对应实验记录：`bridge/abplus/EXPERIMENTS.md` B50 节；字段：`docs/archive/block-memory-v1/PROJECT_SPEC.block-memory-v1.md` 的 `actor_b50`。
 目标：不改模型计算、batch 组成、CF/teacher 语义和任何预算，把完整短 profile 的 collect 从 27.9 s 压到 ≤ 22 s，
 update 不变差，×实时 ≥ 200。

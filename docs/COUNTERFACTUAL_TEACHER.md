@@ -1,5 +1,8 @@
 # B34 反事实分支教师：设计（2026-10-16）
 
+> **状态（2026-11-17）**：已实现（`isaac_bridge/tok_cf.py`、`isaac_bridge/tok_lanes.py`，`train_tok.py --cf 1`），C99、C100 开着它；block-memory v1 的设计也要求保留它（C++ driver 的 lane 服务见 B54）。
+> 结果见 `bridge/abplus/EXPERIMENTS.md` 的 B34、B36、B37 和 C99。下文的 HPC160 是当时的机器，现已不可用。
+
 用户 10-16 决定：加进 C99（从零、无 GRU、无门、B35 观测），起始参数 4 支 × 180 游戏秒；每游戏小时的选择点数 c 按吞吐调
 （起步 6），瓶颈是 actor 的 GPU 推理而不是 CPU（HPC160 配额 160 核，C96 时负载 28）。
 

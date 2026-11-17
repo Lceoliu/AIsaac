@@ -1,5 +1,8 @@
 # 游戏 RL：结构化观测、并行环境与迁移经验
 
+> **状态（2026-11-17）**：参考资料，2026-09-18 的调研，之后没有更新。
+> 文中对本项目的建议写于模拟器阶段（见 [archive/sim-era/](archive/sim-era/ENV_ARCHITECTURE.md)）；现在的做法见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
 调研日期：2026-09-18。以下使用原论文、官方接口和项目作者源码；社区成绩仅按作者报告记录，本轮没有运行这些外部项目。项目设计建议见 [PROJECT_SPEC-2026-09.md](archive/sim-era/PROJECT_SPEC-2026-09.md)。
 
 ## 1. 总览
