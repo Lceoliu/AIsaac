@@ -21,7 +21,8 @@
     X(V3_INIT_SEED, 0x780990, "_ZNK6Entity11GetInitSeedEv") \
     X(V3_BOMB_FLAGS, 0x780aa0, "_ZNK11Entity_Bomb12GetTearFlagsEv") \
     X(V3_BONE_HEART, 0x6673d0, "_ZNK13Entity_Player11IsBoneHeartEi") \
-    X(V3_SECONDARY, 0x781b90, "_ZN13Entity_Player18GetSecondaryPlayerEv")
+    X(V3_SECONDARY, 0x781b90, "_ZN13Entity_Player18GetSecondaryPlayerEv") \
+    X(V3_KNIFE_FLAGS, 0x780cb0, "_ZNK12Entity_Knife12GetTearFlagsEv")
 
 #define V3_ENUM(id, va, name) VF3_##id,
 enum { V3_FUNC_LIST(V3_ENUM) VF3_COUNT };
@@ -32,7 +33,7 @@ static const struct { uintptr_t va; const char *name; } V3_FUNCS[VF3_COUNT] = { 
 
 static int v3_ready = -1;          // -1 not checked, 0 refused, 1 ready
 static char v3_refusal[200];
-static const void *ti_grid, *ti_rock, *ti_poop, *ti_tnt;
+static const void *ti_grid, *ti_rock, *ti_poop, *ti_tnt, *ti_bomb, *ti_knife;
 static float *v3_buf;              // the frame being built, float32 little-endian (the host's order)
 static size_t v3_cap;
 static uint64_t v3_calls, v3_fallbacks;
@@ -60,8 +61,10 @@ static int v3_check(void) {
     ti_rock = dlsym(RTLD_DEFAULT, "_ZTI15GridEntity_Rock");
     ti_poop = dlsym(RTLD_DEFAULT, "_ZTI15GridEntity_Poop");
     ti_tnt = dlsym(RTLD_DEFAULT, "_ZTI14GridEntity_TNT");
-    if (!ti_grid || !ti_rock || !ti_poop || !ti_tnt) {
-        snprintf(v3_refusal, sizeof v3_refusal, "grid typeinfo not found");
+    ti_bomb = dlsym(RTLD_DEFAULT, "_ZTI11Entity_Bomb");
+    ti_knife = dlsym(RTLD_DEFAULT, "_ZTI12Entity_Knife");
+    if (!ti_grid || !ti_rock || !ti_poop || !ti_tnt || !ti_bomb || !ti_knife) {
+        snprintf(v3_refusal, sizeof v3_refusal, "grid / entity typeinfo not found");
         return 0;
     }
     return 1;
@@ -311,6 +314,193 @@ static void v3_body_row(const v3_room *r, const v3_body_t *bd, int bi, float *P,
     }
 }
 
+// Stage 3: the entities (visible_v3_raw's v3_entities; observation_frame_v3's priority cap, E rows, overflow counts).
+// A laser hands the frame back (the Lua block is sent for that step: its geometry getters are not read here yet).
+typedef struct {
+    const void *e;
+    int prio, idx;
+    double dist;
+} v3_ent_t;
+static v3_ent_t *v3_ents;
+static size_t v3_ents_cap;
+
+static int v3_ent_cmp(const void *a_, const void *b_) {
+    const v3_ent_t *a = a_, *b = b_;
+    if (a->prio != b->prio) return a->prio < b->prio ? -1 : 1;
+    if (a->dist != b->dist) return a->dist < b->dist ? -1 : 1;
+    return a->idx < b->idx ? -1 : a->idx > b->idx;
+}
+
+static const char *const V3_ANIM_MONSTRO[6] = {"Walk", "JumpUp", "JumpDown", "Taunt", "Appear", "Death"};
+static const char *const V3_ANIM_BOMB[3] = {"Pulse", "Idle", "Explode"};
+
+// the raw kind of visible_v3_raw (0 other, 1 tear, 2 projectile, 3 laser, 4 bomb, 5 pickup, 6 npc, 7 knife, 8 familiar,
+// 9 effect) and its npc flags (for the priority)
+static int v3_kind(const void *e, int t, const void **npc_out) {
+    const void *npc = (t >= 10 && t < 1000) ? obs_dyncast(e, ti_entity, ti_npc, 0) : NULL;
+    *npc_out = npc;
+    if (t == 2) return 1;
+    if (t == 9) return 2;
+    if (t == 7) return 3;
+    if (t == 4) return 4;
+    if (t == 5) return 5;
+    if (t == 8) return 7;
+    if (t == 3) return 8;
+    if (t == 1000) return 9;
+    if (npc) return 6;
+    return 0;
+}
+
+static int v3_npc_flags(const void *e) {
+    int f = 0;
+    if (gbool(FN(E_IS_ENEMY), e)) f += 1;
+    if (gbool(FN(E_IS_VULNERABLE), e)) f += 2;
+    if (vcall_bool(e, VT_IS_BOSS)) f += 4;
+    if (vcall_bool(e, VT_CAN_SHUT_DOORS) && !gbool(FN(E_IS_DEAD), e)) f += 8;
+    return f;
+}
+
+// visible_producer.v3_priority on the raw values
+static int v3_prio(int kind, int t, int npc_flags, float cdmg) {
+    if (kind == 5 || t == 5 || t == 6 || t == 1022 || t == 1023) return 0;
+    if (kind == 6 || (npc_flags & 1)) return 1;
+    if (t == 3) return 2;
+    if (kind == 1 || kind == 2 || kind == 3 || kind == 4 || kind == 7 || t == 2 || t == 4 || t == 7 || t == 8 || t == 9 ||
+        (t == 1000 && cdmg > 0)) return 3;
+    return 4;
+}
+
+static void v3_words16(float *dst, uint64_t v, int n) {
+    for (int k = 0; k < n; k++) dst[k] = (float)((v >> (16 * k)) & 0xffff);
+}
+
+// The entities sent, in priority order (at most CAP); their count in *n_out, the dropped per class in overflow[5].
+static const char *v3_select(const v3_room *r, const v3_body_t *bodies, int n_bodies, int *n_out, int overflow[5]) {
+    uintptr_t list = FIELD(uintptr_t, r->room, ROOM_ENTITIES);
+    uint32_t count = FIELD(uint32_t, r->room, ROOM_ENTITY_COUNT);
+    if (count > v3_ents_cap) {
+        v3_ent_t *b = realloc(v3_ents, count * sizeof *b);
+        if (!b) abort();
+        v3_ents = b;
+        v3_ents_cap = count;
+    }
+    int n = 0;
+    for (uint32_t k = 0; k < count; k++) {
+        const void *e = ((const void *const *)list)[k];
+        if (!e) continue;
+        int t = G0(int, E_TYPE, e);
+        if (t == 1 || !gbool(FN(E_VISIBLE), e)) continue;
+        float cdmg = G0(float, E_CDMG, e);
+        if (t == 1000 && v3_is_decorative((int)G0(uint32_t, E_VARIANT, e)) && cdmg == 0) continue;
+        if (t == 7) return "v3: laser";
+        const void *npc;
+        int kind = v3_kind(e, t, &npc);
+        int f = kind == 6 ? v3_npc_flags(e) : 0;
+        vec2f ep = G0(vec2f, E_POSITION, e);
+        double best = 0;
+        for (int b = 0; b < n_bodies; b++) {   // (every body's raw position, a sub-player's (0, 0) included)
+            vec2f bp = G0(vec2f, E_POSITION, bodies[b].p);
+            double dx = (double)ep.x - (double)bp.x, dy = (double)ep.y - (double)bp.y, d = dx * dx + dy * dy;
+            if (b == 0 || d < best) best = d;
+        }
+        v3_ents[n].e = e; v3_ents[n].prio = v3_prio(kind, t, f, cdmg); v3_ents[n].dist = best; v3_ents[n].idx = n;
+        n++;
+    }
+    qsort(v3_ents, (size_t)n, sizeof *v3_ents, v3_ent_cmp);
+    for (int c = 0; c < 5; c++) overflow[c] = 0;
+    for (int k = ABP_V3_CAP_ENTITY; k < n; k++) overflow[v3_ents[k].prio]++;
+    *n_out = n < ABP_V3_CAP_ENTITY ? n : ABP_V3_CAP_ENTITY;
+    return NULL;
+}
+
+static const char *v3_entity_row(const v3_room *r, const void *e, uint32_t curses, float *E) {
+    int t = G0(int, E_TYPE, e);
+    const void *npc;
+    int kind = v3_kind(e, t, &npc);
+    uint32_t variant = G0(uint32_t, E_VARIANT, e), subtype = G0(uint32_t, E_SUBTYPE, e);
+    vec2f pos = G0(vec2f, E_POSITION, e), vel = G0(vec2f, E_VELOCITY, e), sm = G0(vec2f, E_SIZEMULTI, e);
+    const void *spr = G0(const void *, E_SPRITE, e);
+    int identity_known = 1, flags_known = 4;
+    uint64_t tear = 0, proj = 0;
+    E[ABP_V3_E_TYPE] = (float)t;
+    E[ABP_V3_E_VARIANT] = (float)variant;
+    E[ABP_V3_E_X] = (float)((double)pos.x - r->ox);
+    E[ABP_V3_E_Y] = (float)((double)pos.y - r->oy);
+    E[ABP_V3_E_VX] = vel.x; E[ABP_V3_E_VY] = vel.y;
+    E[ABP_V3_E_SIZE] = G0(float, E_SIZE, e);
+    E[ABP_V3_E_SIZE_MX] = sm.x; E[ABP_V3_E_SIZE_MY] = sm.y;
+    E[ABP_V3_E_COLL] = (float)G0(int, E_ECC, e);
+    E[ABP_V3_E_GCOLL] = (float)G0(int, E_GCC, e);
+    E[ABP_V3_E_CDMG] = G0(float, E_CDMG, e);
+    E[ABP_V3_E_SPRITE_FRAME] = (float)G0(int, ANM2_FRAME, spr);
+    E[ABP_V3_E_AGE] = (float)G0(int, E_FRAMECOUNT, e);
+    E[ABP_V3_E_FLIP_X] = gbool(FN(E_FLIPX), e);
+    E[ABP_V3_E_KIND] = (float)(kind + 1);
+    if (t == 2) {
+        const void *x = obs_dyncast(e, ti_entity, ti_tear, 0);
+        if (!x) return "v3: ToTear";
+        E[ABP_V3_E_HEIGHT] = G0(float, TEAR_HEIGHT, x);
+        E[ABP_V3_E_FALL] = G0(float, TEAR_FALL, x);
+        E[ABP_V3_E_SCALE] = G0(float, TEAR_SCALE, x);
+        tear = G0(uint64_t, TEAR_FLAGS, x);
+        flags_known = 4 | 1;
+    } else if (t == 9) {
+        const void *x = obs_dyncast(e, ti_entity, ti_projectile, 0);
+        if (!x) return "v3: ToProjectile";
+        E[ABP_V3_E_HEIGHT] = G0(float, PROJ_HEIGHT, x);
+        E[ABP_V3_E_FALL] = G0(float, PROJ_FALL, x);
+        E[ABP_V3_E_SCALE] = G0(float, PROJ_SCALE, x);
+        proj = G0(uint64_t, PROJ_FLAGS, x);
+        flags_known = 4 | 2;
+    } else if (t == 4) {
+        const void *x = obs_dyncast(e, ti_entity, ti_bomb, -1);
+        if (x) tear = ((uint64_t (*)(const void *))V3FN(V3_BOMB_FLAGS))(x);   // (Lua: pcall, 0 without a bomb)
+        flags_known = 4 | 1;
+    } else if (t == 5) {
+        const void *x = obs_dyncast(e, ti_entity, ti_pickup, 0);
+        if (!x) return "v3: ToPickup";
+        E[ABP_V3_E_PRICE] = (float)G0(int32_t, PICKUP_PRICE, x);
+        if ((curses & 64) != 0 && variant == 100) { subtype = 0; identity_known = 0; }   // Curse of the Blind
+    } else if (t == 8) {
+        const void *x = obs_dyncast(e, ti_entity, ti_knife, -1);
+        if (x) tear = ((uint64_t (*)(const void *))V3FN(V3_KNIFE_FLAGS))(x);
+        flags_known = 4 | 1;
+    } else if (kind == 6) {
+        int f = v3_npc_flags(e);
+        E[ABP_V3_E_NPC_FLAGS] = (float)f;
+        if (f & 4) {
+            double maxhp = (double)G0(float, E_MAXHP, e);
+            if (maxhp > 0) E[ABP_V3_E_BOSS_HP] = (float)((double)G0(float, E_HP, e) / maxhp);
+        }
+        E[ABP_V3_E_CHAMPION] = (float)(G0(int32_t, NPC_CHAMPION, npc) + 2);
+    }
+    E[ABP_V3_E_SUBTYPE] = (float)subtype;
+    E[ABP_V3_E_IDENTITY_KNOWN] = (float)identity_known;
+    E[ABP_V3_E_FLAGS_KNOWN] = (float)flags_known;
+    const char *const *names = t == 20 ? V3_ANIM_MONSTRO : t == 4 ? V3_ANIM_BOMB : NULL;
+    int n_names = t == 20 ? 6 : t == 4 ? 3 : 0;
+    for (int k = 0; k < n_names; k++) {
+        if (((char (*)(const void *, const char *))FN(ANM2_PLAYING))(spr, names[k]) ||
+            ((char (*)(const void *, const char *))FN(ANM2_FINISHED))(spr, names[k])) {
+            E[ABP_V3_E_ANIM] = (float)(k + 1);
+            break;
+        }
+    }
+    // the flag words: AB+ tear flags remapped to the canonical numbering; projectile / entity flags masked
+    uint64_t canon_lo = 0, canon_hi = 0;
+    for (int b = 0; b < ABP_V3_TEAR_AB_BITS; b++) {
+        if (!((tear >> b) & 1)) continue;
+        int c = abp_v3_tear_ab_to_canon[b];
+        if (c < 64) canon_lo |= 1ULL << c; else canon_hi |= 1ULL << (c - 64);
+    }
+    v3_words16(E + ABP_V3_E_TEAR_W_FIRST, canon_lo, 4);
+    v3_words16(E + ABP_V3_E_TEAR_W_FIRST + 4, canon_hi, 4);
+    v3_words16(E + ABP_V3_E_PROJ_W_FIRST, proj & ABP_V3_PROJ_VISIBLE_MASK, ABP_V3_E_PROJ_W_N);
+    uint64_t ef = ((uint64_t (*)(const void *))V3FN(V3_EFLAGS))(e);
+    v3_words16(E + ABP_V3_E_EFLAG_W_FIRST, ef & ABP_V3_ENTITY_VISIBLE_MASK, ABP_V3_E_EFLAG_W_N);
+    return NULL;
+}
+
 // The frame into v3_buf; its size in floats in *n_floats. NULL, or why the Lua block is sent instead.
 static const char *v3_build(size_t *n_floats) {
     v3_room r;
@@ -328,7 +518,10 @@ static const char *v3_build(size_t *n_floats) {
     v3_body_t bodies[V3_BODY_CAP];
     int p = v3_bodies(&r, bodies);
     if (p <= 0) return "v3: bodies";
-    int e = 0, n = 0, s = 0;   // (stages 3-4)
+    int e = 0, overflow[5];
+    const char *sel = v3_select(&r, bodies, p, &e, overflow);
+    if (sel) return sel;
+    int n = 0, s = 0;   // (stage 4)
     size_t total = (size_t)ABP_V3_FIXED + (size_t)p * (ABP_V3_PF + ABP_V3_LOCAL) + (size_t)e * ABP_V3_EF +
                    (size_t)n * ABP_V3_NF + (size_t)s * ABP_V3_SF;
     if (total * 4 > ABP_V3_FRAME_BYTES) return "v3: frame past the byte budget";
@@ -353,6 +546,17 @@ static const char *v3_build(size_t *n_floats) {
     for (int i = 0; i < p; i++)
         v3_body_row(&r, &bodies[i], i, P + (size_t)i * ABP_V3_PF, local + (size_t)i * ABP_V3_LOCAL, canvas, stage,
                     stage_type, G0(int, R_TYPE, r.room), difficulty, curses);
+    for (int i = 0; i < p; i++) {
+        float *row = P + (size_t)i * ABP_V3_PF;
+        row[ABP_V3_P_OVERFLOW_INTERACTABLE] = (float)overflow[0]; row[ABP_V3_P_OVERFLOW_MONSTER] = (float)overflow[1];
+        row[ABP_V3_P_OVERFLOW_FAMILIAR] = (float)overflow[2]; row[ABP_V3_P_OVERFLOW_PROJECTILE] = (float)overflow[3];
+        row[ABP_V3_P_OVERFLOW_OTHER] = (float)overflow[4];
+    }
+    float *E = local + (size_t)p * ABP_V3_LOCAL;
+    for (int i = 0; i < e; i++) {
+        why = v3_entity_row(&r, v3_ents[i].e, curses, E + (size_t)i * ABP_V3_EF);
+        if (why) return why;
+    }
     *n_floats = total;
     return NULL;
 }
