@@ -2330,6 +2330,40 @@ local function v3_laser_bytes()
 end
 V3_LASER_BYTES = v3_laser_bytes
 
+-- (visible-v3) the raw block's JSON with every number exact: the game's json.encode writes numbers with tostring
+-- (Lua 5.3: "%.14g"), which loses a float's last bits, and a position minus the origin can sit exactly between two
+-- floats (|world| < 128, |canvas| >= 128): the reference then rounded the other way than the native frame (accept10k2,
+-- one value in 8,923 records). Integers as such, other numbers "%.17g" (exact for a double), keys sorted.
+local function v3_json(v)
+	local t = type(v)
+	if t == "number" then
+		if math.type(v) == "integer" then return string.format("%d", v) end
+		if v ~= v then return "NaN" end
+		if v == math.huge then return "Infinity" end
+		if v == -math.huge then return "-Infinity" end
+		if v == math.floor(v) and math.abs(v) < 2 ^ 53 then return string.format("%.1f", v) end
+		return string.format("%.17g", v)
+	elseif t == "string" then
+		return json.encode(v)
+	elseif t == "boolean" then
+		return v and "true" or "false"
+	elseif t == "table" then
+		local n = #v
+		if n > 0 or next(v) == nil then
+			local parts = {}
+			for i = 1, n do parts[i] = v3_json(v[i]) end
+			return "[" .. table.concat(parts, ",") .. "]"
+		end
+		local keys = {}
+		for k in pairs(v) do keys[#keys + 1] = tostring(k) end
+		table.sort(keys)
+		local parts = {}
+		for i, k in ipairs(keys) do parts[i] = json.encode(k) .. ":" .. v3_json(v[k]) end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	return "null"
+end
+
 function visible_v3_raw()
 	local game = Game()
 	local room, level = game:GetRoom(), game:GetLevel()
@@ -2339,7 +2373,7 @@ function visible_v3_raw()
 	local bodies, players = v3_bodies(game)
 	local cells, doors = v3_cells(room, level)
 	local inventory, slots = v3_items(players)
-	return json.encode({ schema = "isaac-visible-raw-v3", version = 2026111702, game_version = 1, control_scheme = 0,
+	return v3_json({ schema = "isaac-visible-raw-v3", version = 2026111703, game_version = 1, control_scheme = 0,
 		origin = { g0.X - 20, g0.Y - 20 }, gw = room:GetGridWidth(), gh = room:GetGridHeight(),
 		room_type = room:GetType(), shape = room:GetRoomShape(), stage = level:GetStage(),
 		stage_type = v3_try(function() return level:GetStageType() end, 0),
