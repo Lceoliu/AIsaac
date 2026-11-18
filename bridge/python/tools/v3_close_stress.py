@@ -2,12 +2,14 @@
 at the close): start a TokSampler (floor workers, mode 0 -- every visible / trigger switch at its default), answer its
 records with random actions for a while, close it; again and again with the close at varied moments (from before the
 first connect is done to well into the episodes), so that some closes find a worker's start-state builder launching /
-connecting / querying the bridge's mode. Per round: every worker's exit code, whether close() raised VisibleV3Fatal,
-and the fatal files left. Pass: no worker exit 86, no VisibleV3Fatal, no fatal file, in any round.
+connecting / querying the bridge's mode. Every other round (--kill-every 2) first kills the round's game processes
+(isaac.x64, SIGKILL; the CPU runner's container has its own PID namespace: only these) and closes 0.3 s later -- the
+games gone while builders may be connecting, as at a run's end. Per round: every worker's exit code, whether close()
+raised VisibleV3Fatal, and the fatal files left. Pass: no worker exit 86, no VisibleV3Fatal, no fatal file.
 
 usage (bridge python dir, PYTHONPATH=.; the CPU runner adds --groups-file / --out):
   python tools/v3_close_stress.py --groups-file ../abplus/catalog/scaling2_groups.json --out <dir>
-         [--rounds 36] [--workers 4] [--delays 0.5,1,2,3,5,8,13,20] [--mode floor]
+         [--rounds 48] [--workers 4] [--delays 0.5,1,1.5,2,3,5,8,12,20,30] [--kill-every 2] [--mode floor]
 Writes <out>/rounds.jsonl and <out>/summary.json; prints SUMMARY; exit 0 on a pass, 1 otherwise.
 """
 import argparse
@@ -26,6 +28,22 @@ import numpy as np   # noqa: E402
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec   # noqa: E402
 from isaac_bridge import visible_producer as VP   # noqa: E402
 from isaac_bridge.tok_sampler import TokSampler, TokSamplerConfig   # noqa: E402
+
+
+def kill_games():
+    """SIGKILL every isaac.x64 process (by /proc comm): the number killed."""
+    import signal
+    n = 0
+    for d in Path('/proc').iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            if (d / 'comm').read_text().strip() == 'isaac.x64':
+                os.kill(int(d.name), signal.SIGKILL)
+                n += 1
+        except (OSError, ValueError):
+            pass
+    return n
 
 
 def one_round(k, args, spec, out):
@@ -51,6 +69,10 @@ def one_round(k, args, spec, out):
             sampler.reply(idx)
     except VP.VisibleV3Fatal as exc:
         during = str(exc)[:400]
+    killed = None
+    if args.kill_every and k % args.kill_every == 1:
+        killed = kill_games()
+        time.sleep(0.3)
     t_close = time.perf_counter()
     try:
         sampler.close(timeout=60.0)
@@ -58,7 +80,7 @@ def one_round(k, args, spec, out):
         raised = str(exc)[:400]
     codes = [p.exitcode for p in sampler.procs]
     files = sorted(str(p.name) for p in fatal_dir.glob('fatal-worker-*.txt')) if fatal_dir.is_dir() else []
-    return dict(round=k, delay=delay, records=records, close_s=round(time.perf_counter() - t_close, 2),
+    return dict(round=k, delay=delay, killed=killed, records=records, close_s=round(time.perf_counter() - t_close, 2),
                 exit_codes=codes, fatal_on_close=raised, fatal_during=during, fatal_files=files,
                 seconds=round(time.perf_counter() - t0, 1))
 
@@ -67,11 +89,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--groups-file', required=True)
     ap.add_argument('--out', required=True)
-    ap.add_argument('--rounds', type=int, default=36)
+    ap.add_argument('--rounds', type=int, default=48)
     ap.add_argument('--workers', type=int, default=4)
-    ap.add_argument('--delays', default='0.5,1,2,3,5,8,13,20')
+    ap.add_argument('--delays', default='0.5,1,1.5,2,3,5,8,12,20,30')
     ap.add_argument('--mode', default='floor', choices=('room', 'floor'))
     ap.add_argument('--port', type=int, default=46100)
+    ap.add_argument('--kill-every', type=int, default=2, help='every k-th round (k % n == 1) kills the games first')
     args = ap.parse_args()
     args.delays = [float(v) for v in args.delays.split(',')]
     out = Path(args.out)
@@ -98,6 +121,7 @@ def main():
                    fatal_on_close=sum(bool(r['fatal_on_close']) for r in done),
                    fatal_during=sum(bool(r['fatal_during']) for r in done),
                    fatal_files=sum(len(r['fatal_files']) for r in done),
+                   rounds_with_kill=sum(r.get('killed') is not None for r in done),
                    delays=args.delays, seconds=round(time.perf_counter() - t0, 1))
     ok = (summary['ran'] >= 30 and summary['exit_86'] == 0 and summary['fatal_on_close'] == 0 and
           summary['fatal_during'] == 0 and summary['fatal_files'] == 0)
