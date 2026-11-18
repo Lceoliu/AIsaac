@@ -493,7 +493,7 @@ def main():
         (out / 'summary.json').write_text(json.dumps(summary, indent=1))
         print('SUMMARY', json.dumps(summary))
         if missing > 0:
-            raise SystemExit(f'eval_tok: {missing} of {len(wanted)} requested seeds have no episode (and were not '
+            raise SystemExit(f'eval_tok: {missing} of {n_wanted} requested seeds have no episode (and were not '
                              f'empty): the evaluation is incomplete')
     finally:
         sampler.close()

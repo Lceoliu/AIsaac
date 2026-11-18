@@ -104,3 +104,40 @@ def test_eval_counts_missing_seeds():
     assert et.seeds_missing(names, assign, seeds, every + [dict(group='normal', seed=99)], 0)[2] == 0
     src = path.read_text(encoding='utf-8')
     assert 'if missing > 0:\n            raise SystemExit(' in src.replace('\r\n', '\n')
+
+
+def test_eval_main_fails_on_missing_seeds(tmp_path, monkeypatch):
+    """eval_tok.main run to its end (2026-11-18, round 4: the exit message used a name main does not have -- a
+    NameError, not the SystemExit) with a sampler that plays nothing: every requested seed missing -> the summary
+    written, then SystemExit naming the count; every start state empty instead -> no exit, 0 missing."""
+    import importlib.util
+    import json
+    from pathlib import Path
+    import numpy as np
+    from isaac_bridge.tok_sampler import ST, STATS
+    py = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location('eval_tok_main_test', py / 'eval_tok.py')
+    et = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(et)
+
+    for empty, want_exit in ((0, True), (1, False)):
+        class Sampler:   # (no worker: no record, the stats as the workers would leave them)
+            def __init__(self, cfg):
+                self.live = []
+                self.stats = np.zeros((cfg.workers, len(STATS)))
+                self.stats[:, ST['empty']] = empty * np.array([len(s_) for s_ in cfg.eval_seeds])
+
+            def close(self):
+                pass
+        monkeypatch.setattr(et, 'TokSampler', Sampler)
+        out = tmp_path / f'out{empty}'
+        monkeypatch.setattr(sys, 'argv', ['eval_tok.py', '--random', '--groups', 'normal:2', '--seeds', '2147490000:4',
+                                          '--groups-file', str(py.parent / 'abplus' / 'catalog' / 'scaling2_groups.json'),
+                                          '--out', str(out)])
+        if want_exit:
+            with pytest.raises(SystemExit, match='4 of 4 requested seeds have no episode'):
+                et.main()
+        else:
+            et.main()
+        s = json.loads((out / 'summary.json').read_text())
+        assert (s['seeds_requested'], s['seeds_played'], s['seeds_missing']) == (4, 0, 4 if want_exit else 0)
