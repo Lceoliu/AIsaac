@@ -139,6 +139,10 @@ def worker(args, seeds, wi, out_path):
                         payload[m] = read_raw(cl[m])
                 if first is None and digest(cl['off'])[0] != digest(cl['on'])[0]:
                     first = dict(t=t, by='digest_end')
+                if build:   # (the start build's collectibles held at the end, off clone)
+                    rec['build_held'] = cl['off'].lua("local p = Isaac.GetPlayer(0) local o = {} for _, i in ipairs({%s}) "
+                                                      "do o[#o + 1] = tostring(p:GetCollectibleNum(i)) end "
+                                                      "return table.concat(o, ',')" % ','.join(map(str, build)))
                 for c in cl.values():
                     c.close()
                 cause = None
@@ -210,6 +214,8 @@ def main():
                    steps_mean=round(float(np.mean([r['steps'] for r in ok])) if ok else 0, 1),
                    deaths=sum(bool(r['dead']) for r in ok), builds=sum(bool(r['build']) for r in ok),
                    pickups=sum(r['pickups']['forced'] + r['pickups']['free'] for r in ok),
+                   build_items_held=sum(sum(int(v) > 0 for v in r.get('build_held', '').split(',') if v) for r in ok),
+                   build_items=sum(len(r['build']) for r in ok),
                    presses=sum(r['n_presses'] for r in ok))
     (out / 'summary.json').write_text(json.dumps(summary, indent=1))
     print('SUMMARY', json.dumps(summary), flush=True)
