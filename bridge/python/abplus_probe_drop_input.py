@@ -41,7 +41,7 @@ return json.encode({ ptype = p:GetPlayerType(), active = p:GetActiveItem(),
   frame = Game():GetFrameCount() })
 """
 LOGGER_LUA = r"""
-ABPX = { log = {}, frames = {}, press = false, mode = "%s", first = nil, seq = {} }
+ABPX = { log = {}, frames = {}, press = false, mode = "__MODE__", first = nil, seq = {} }
 local m = RegisterMod("abpx_drop_input", 1)
 m:AddCallback(ModCallbacks.MC_POST_PLAYER_UPDATE, function(_, p)
   if ABPX.press and #ABPX.seq < 64 then
@@ -141,7 +141,7 @@ def main():
                         for variant in args.variants.split(','):
                             c = S.fork(alarm=600)
                             try:
-                                assert c.lua(LOGGER_LUA % variant) == 'ok'
+                                assert c.lua(LOGGER_LUA.replace('__MODE__', variant)) == 'ok'
                                 for _ in range(20):
                                     step(c)
                                 before = json.loads(c.lua(STATE_LUA))
