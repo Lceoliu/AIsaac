@@ -215,11 +215,13 @@ def v3_priority(e):
 
 
 def v3_prioritize(entities, bodies):
-    """At most CAP_ENTITY entities: by class, then the distance to the nearest body, then the bridge's order; the
-    dropped count per class."""
+    """At most CAP_ENTITY entities: by class, then the distance to the nearest body with a room position
+    (position_known: a body without one -- AB+'s sub-player at world (0, 0) -- takes no part; none at all: 0), then
+    the bridge's order; the dropped count per class."""
+    placed = [b for b in bodies if int(b.get('position_known', 1))]
     keyed = []
     for i, e in enumerate(entities):
-        d = min(((e['x'] - b['x']) ** 2 + (e['y'] - b['y']) ** 2 for b in bodies), default=0.0)
+        d = min(((e['x'] - b['x']) ** 2 + (e['y'] - b['y']) ** 2 for b in placed), default=0.0)
         keyed.append((v3_priority(e), d, i))
     keyed.sort()
     kept = keyed[:V3.CAP_ENTITY]

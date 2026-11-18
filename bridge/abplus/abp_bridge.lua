@@ -1707,7 +1707,7 @@ ABP_NATIVE_OBS = { available = native_lean ~= nil, native = 0, fallbacks = 0, la
 local native_visible = native_lean ~= nil and type(abp_native_visible) == "function" and abp_native_visible or nil
 -- (visible-v3) abp_native_v3(): the v3 frame bytes, or nil, why (abp_v3_native.c)
 local native_v3 = native_lean ~= nil and type(abp_native_v3) == "function" and abp_native_v3 or nil
-ABP_NATIVE_V3 = { available = native_v3 ~= nil, native = 0, fallbacks = 0, last_fallback = nil, flags = 32 }
+ABP_NATIVE_V3 = { available = native_v3 ~= nil, native = 0, fallbacks = 0, last_fallback = nil, flags = 32, reasons = {} }
 -- (the mode lives in the global ABP_NATIVE_VIS.mode: probes switch it in one clone with a lua command)
 ABP_NATIVE_VIS = { available = native_visible ~= nil, native = 0, fallbacks = 0, last_fallback = nil, checks = 0,
 	mismatches = 0, first = nil, step = 0, mode = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_VISIBLE") or "0")) or 0 }
@@ -2431,11 +2431,13 @@ function visible_block()
 				v.native = v.native + 1
 			else
 				v.fallbacks, v.last_fallback = v.fallbacks + 1, why
+				v.reasons[tostring(why)] = (v.reasons[tostring(why)] or 0) + 1
 				if flags == 0 then out, flags = spack("<s4", visible_v3_raw()), 32 end
 			end
-		elseif m == 2 and native_v3 ~= nil and lethal then
+		elseif (m == 2 or m == 3) and native_v3 ~= nil and lethal then
 			v.fallbacks, v.last_fallback = v.fallbacks + 1, "lethal hit cancelled"
-			out, flags = spack("<s4", visible_v3_raw()), 32
+			v.reasons["lethal hit cancelled"] = (v.reasons["lethal hit cancelled"] or 0) + 1
+			if flags == 0 then out, flags = spack("<s4", visible_v3_raw()), 32 end
 		end
 		v.flags = flags
 		return out
@@ -3070,7 +3072,8 @@ local function handle_command(line)
 			elseif cmd.enabled ~= nil then state.visible_v3 = cmd.enabled == true and 1 or 0 end
 			local v = ABP_NATIVE_V3
 			send({ type = "ok", cmd = "visible_v3", enabled = state.visible_v3 ~= 0, mode = state.visible_v3,
-				native_available = v.available, native = v.native, fallbacks = v.fallbacks, last_fallback = v.last_fallback })
+				native_available = v.available, native = v.native, fallbacks = v.fallbacks, last_fallback = v.last_fallback,
+				reasons = v.reasons })
 		elseif cmd.cmd == "lean_items" then   -- 2026-10-06 (items, Phase A): the inventory block and run-mode map rules
 			if cmd.enabled ~= nil then
 				state.lean_items = cmd.enabled == true

@@ -400,10 +400,13 @@ static const char *v3_select(const v3_room *r, const v3_body_t *bodies, int n_bo
         int f = kind == 6 ? v3_npc_flags(e) : 0;
         vec2f ep = G0(vec2f, E_POSITION, e);
         double best = 0;
-        for (int b = 0; b < n_bodies; b++) {   // (every body's raw position, a sub-player's (0, 0) included)
+        int have = 0;
+        for (int b = 0; b < n_bodies; b++) {   // (bodies with a room position only: a sub-player's (0, 0) takes no part)
+            if (!bodies[b].in_room) continue;
             vec2f bp = G0(vec2f, E_POSITION, bodies[b].p);
             double dx = (double)ep.x - (double)bp.x, dy = (double)ep.y - (double)bp.y, d = dx * dx + dy * dy;
-            if (b == 0 || d < best) best = d;
+            if (!have || d < best) best = d;
+            have = 1;
         }
         v3_ents[n].e = e; v3_ents[n].prio = v3_prio(kind, t, f, cdmg); v3_ents[n].dist = best; v3_ents[n].idx = n;
         n++;

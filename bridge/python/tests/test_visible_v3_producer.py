@@ -178,3 +178,21 @@ def test_engine_ranges_come_from_one_table():
     end = lua.index('\nend\n', lua.index('function visible_v3_raw()'))
     bare = re.findall(r'for \w+ = -?\d+, -?\d+ do', lua[start:end])
     assert not bare, bare
+
+
+def test_priority_distance_ignores_bodies_without_a_position():
+    """The 128-entity cap's distance (the coordinator, 2026-11-17): only bodies with a room position count. A Forgotten
+    frame with its sub-player at world (0, 0) (position_known 0) and 140 projectiles: the kept 128 are the ones nearest
+    the controlled body, whatever lies near world (0, 0)."""
+    main = body(x=O[0] + 500.0, y=O[1] + 300.0, linked=2, position_known=1)
+    sub = body(init_seed=7, x=0.0, y=0.0, ptype=17, role=3, linked=1, position_known=0)
+    ents = [entity(type=9, kind=2, npc_flags=0, champion=0, x=float(i), y=float(i)) for i in range(70)]       # near (0, 0)
+    ents += [entity(type=9, kind=2, npc_flags=0, champion=0, x=O[0] + 500.0 + i, y=O[1] + 300.0) for i in range(70)]
+    kept, overflow = VP.v3_prioritize(ents, [main, sub])
+    assert len(kept) == 128 and overflow[3] == 12
+    near_main = [e for e in kept if e['x'] >= O[0] + 500.0]
+    assert len(near_main) == 70 and kept[:70] == ents[70:]          # the main body's neighbours first, in their order
+    only, _ = VP.v3_prioritize(ents, [main])
+    assert kept == only                                              # the sub-player changes nothing
+    none, _ = VP.v3_prioritize(ents, [sub])                          # no placed body: the bridge's order
+    assert none == ents[:128]
