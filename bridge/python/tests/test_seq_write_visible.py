@@ -130,3 +130,27 @@ def test_eval_tok_refuses_the_pair(monkeypatch, capsys, tmp_path):
     with pytest.raises(SystemExit):
         eval_tok.main()
     assert 'contradict' in capsys.readouterr().err
+
+
+def test_eval_tok_frame_and_workers_agree(monkeypatch, capsys, tmp_path):
+    """(seq-v1 step 4) eval_tok: a v3 checkpoint needs ISAAC_RL_VISIBLE_V3 (its workers send v3 frames); a ROW one is
+    refused with it set; ROW-encoder options are refused for a v3 checkpoint. Each refusal at argument checking, before
+    any worker starts."""
+    import torch
+    sys.path.insert(0, str(HERE.parent))
+    import eval_tok
+    from isaac_bridge import visible_producer
+    monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
+    for frame in ('v3', None):
+        ck = tmp_path / f'{frame}.pt'
+        torch.save(dict(config=dict(frame=frame, items=True), model={}), ck)
+    cases = ((0, 'v3.pt', [], 'needs ISAAC_RL_VISIBLE_V3'), (2, 'v3.pt', ['--ablate', 'items'], 'ROW-encoder options'),
+             (2, 'None.pt', [], 'reads ROW records'))
+    for i, (mode, name, extra, msg) in enumerate(cases):
+        monkeypatch.setattr(visible_producer, 'VISIBLE_V3_MODE', mode)
+        monkeypatch.setenv('ISAAC_RL_VISIBLE_V3', str(mode))
+        monkeypatch.setattr(sys, 'argv', ['eval_tok.py', '--groups-file', 'x.json', '--out', str(tmp_path / f'o{i}'),
+                                          '--checkpoint', str(tmp_path / name)] + extra)
+        with pytest.raises(SystemExit):
+            eval_tok.main()
+        assert msg in capsys.readouterr().err, (mode, name)

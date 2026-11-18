@@ -239,6 +239,16 @@ def main():
     ck = None
     if not args.random:
         ck = torch.load(args.checkpoint, map_location=os.environ.get('TOK_EVAL_DEVICE', 'cpu'))
+    if ck is not None:   # (seq-v1 step 4: the checkpoint's frame side and the workers' frames must agree, as in train_tok)
+        from isaac_bridge.visible_producer import VISIBLE_V3_MODE
+        if ck.get('config', {}).get('frame') == 'v3':
+            if not VISIBLE_V3_MODE or not args.obs_visible:
+                p.error('a v3 checkpoint (config frame v3) needs ISAAC_RL_VISIBLE_V3 set (1 / 2 / 3) and --obs-visible 1: '
+                        'its workers must send v3 frames')
+            if args.ablate or args.item_slots is not None:
+                p.error('--ablate / --item-slots: ROW-encoder options, not for a v3 checkpoint')
+        elif VISIBLE_V3_MODE and args.obs_visible:
+            p.error(f'ISAAC_RL_VISIBLE_V3={VISIBLE_V3_MODE} sends v3 frames, this checkpoint reads ROW records: unset it')
     items = bool(args.items or (ck is not None and ck.get('config', {}).get('items')))
     names, assign, eval_seeds = [], [], []
     first, count = (int(v) for v in args.seeds.split(':'))
