@@ -12,7 +12,8 @@ Cases (per seed; the items given, 20 idle decisions for the pickup animation, th
                  MaxCharges is 0): used twice?
   item_full      Yum Heart (45) fully charged, the player hurt by one heart first
   item_battery   The Battery (63) + Yum Heart charged twice over (SetActiveCharge(2 x MaxCharges)): both charges at once?
-  item_timed     an active item with a timed charge (MaxCharges > 12 among the actives; none: skipped), fully charged
+  item_timed     an active item with a timed charge (MaxCharges > 12 among the actives: Brown Nugget 504 when there,
+                 its fly familiar stays in the room; none: skipped), fully charged
   bomb           three bombs, one press: placed / spent once or twice?
   bomb_twice     three bombs, the press held on two decisions in a row (the second inside the bomb's cooldown)
 Each case: mode double (the bridge as it is) and once (ABP_SET_TRIGGER_ONCE(true) in the clone); path line (a lean
@@ -162,7 +163,8 @@ def main():
                     if picks is None:
                         picks = json.loads(b.lua(PICK_LUA))
                         f.write(json.dumps(dict(picks=picks)) + '\n')
-                    timed = picks['timed'][0][0] if picks['timed'] else None
+                    ids = [t[0] for t in picks['timed']]   # (Brown Nugget first: its fly stays in the room)
+                    timed = 504 if 504 in ids else (ids[0] if ids else None)
                     if case == 'item_timed' and timed is None or case == 'item_free' and picks['free'] is None:
                         continue
                     code = setup.replace('__FREE__', str(picks['free'])).replace('__TIMED__', str(timed))
