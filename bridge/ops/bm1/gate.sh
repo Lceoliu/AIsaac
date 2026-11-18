@@ -3,11 +3,13 @@
 # Log: reports/tests-full-<tree>-<mmdd-HHMM>.log, never overwritten; failures copied to reports/failed/.
 #   usage: [GPU=1] [RUNS=1] gate.sh <tree> [pytest args...]
 # rc 9: the tests passed but a native component did not build / load (native_check.py) or its tests skipped.
+# Exit status (2026-11-18, the coordinator): the last run's rc (as its bm1.log line); 2 for RUNS < 1.
 set -u
 BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 . $BM/common.sh
 TREE=$1; shift
 GPU=${GPU:-1}; RUNS=${RUNS:-1}
+case "$RUNS" in ''|*[!0-9]*|0) echo "gate.sh: RUNS must be >= 1 (got '$RUNS')" >&2; exit 2 ;; esac
 R=$BM/reports; LOG=$R/bm1.log
 mkdir -p $R/failed
 i=1
@@ -28,3 +30,4 @@ while [ $i -le $RUNS ]; do
   give
   i=$((i+1))
 done
+exit $rc

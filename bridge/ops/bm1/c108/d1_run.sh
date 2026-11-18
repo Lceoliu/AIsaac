@@ -8,8 +8,8 @@
 #  D1_CODE (default maa1e98a-d1) and D1_ARGS (default ab2-bm's train_args) for the new kind -- Q@maa: maa1e98a-nv-d1)
 #   usage: d1_run.sh <tag>:<new|old>:<input checkpoint name in inputs/>[:<extra flags, comma-separated>][:<env K=V,...>] ...
 set -u
-BM=/root/AIsaac/bm1
-D=/root/AIsaac/train/c108/d1
+BM=${BM:-$(cd "$(dirname "$0")/.." && pwd)}; . $BM/bm1.env   # (C113: host-independent -- bm1.env; gpu57 defaults below)
+D=${D1_DIR:-${BM1_TRAIN:-/root/AIsaac/train}/c108/d1}; DC=${D1_DIR_IN:-${BM1_TRAIN_IN:-/bench/train}/c108/d1}
 echo "$(date '+%F %T') d1_run: $*" >> $BM/reports/bm1.log
 for spec in "$@"; do
   tag=$(echo "$spec" | cut -d: -f1); kind=$(echo "$spec" | cut -d: -f2); ck=$(echo "$spec" | cut -d: -f3)
@@ -19,7 +19,7 @@ for spec in "$@"; do
   t0=$(date +%s)
   if [ "$kind" = new ]; then
     { cat ${D1_ARGS:-/root/AIsaac/train/ab2/ab2-bm/train_args}; echo "--lr 0 --lr-final 0 $xf"; } > $D/$tag.args
-    L=$(env GPU=${D1_GPUS:-4,5} ${D1_CPUSET:+CPUSET=$D1_CPUSET} ${D1_MEMS:+MEMS=$D1_MEMS} MEM=80g sh $BM/job.sh d1-$tag "cd /bench && export $xe CODE=${D1_CODE:-maa1e98a-d1} OUTDIR=/bench/train/c108/d1 NAME=d1n PORT=41500 FLAGS_FILE=/bench/train/c108/d1/$tag.args EXTRA=--learner-device=cuda:1 EXTRA2=--max-updates=5 EXTRA3=--resume=/bench/train/c108/d1/inputs/$ck ISAAC_D1_DIAG=1 ISAAC_BLOCK_TIMING=1 && sh /bench/bm1/xnew2.sh $tag 3600 1200" | tail -1)
+    L=$(env GPU=${D1_GPUS:-4,5} ${D1_CPUSET:+CPUSET=$D1_CPUSET} ${D1_MEMS:+MEMS=$D1_MEMS} MEM=${D1_MEM:-80g} sh $BM/job.sh d1-$tag "cd /bench && export $xe CODE=${D1_CODE:-maa1e98a-d1} OUTDIR=$DC NAME=d1n PORT=41500 FLAGS_FILE=$DC/$tag.args EXTRA=--learner-device=cuda:1 EXTRA2=--max-updates=5 EXTRA3=--resume=$DC/inputs/$ck ISAAC_D1_DIAG=1 ISAAC_BLOCK_TIMING=1 && sh $BM1_IN/xnew2.sh $tag 3600 1200" | tail -1)
   else
     { cat /root/AIsaac/train/ab2/ab2-c99old/train_args; echo "--lr 0 --lr-final 0 $xf"; } > $D/$tag.args
     L=$(GPU=4 MEM=80g sh $BM/job.sh d1-$tag "cd /bench && export $xe CODE=m1ae82d3-d1 OUTDIR=/bench/train/c108/d1 NAME=d1o PORT=41700 FLAGS_FILE=/bench/train/c108/d1/$tag.args EXTRA3=--resume=/bench/train/c108/d1/inputs/$ck ISAAC_D1_DIAG=1 && sh /bench/bm1/xold_c99.sh $tag 3600 6" | tail -1)

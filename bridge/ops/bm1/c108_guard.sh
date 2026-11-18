@@ -9,7 +9,7 @@ set -u
 BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 . $BM/common.sh
 PARENT=$1; N=$2; T=$3; L=$4
-D=/root/AIsaac/train/$PARENT/$N
+D=${BM1_TRAIN:-/root/AIsaac/train}/$PARENT/$N   # (bm1.env BM1_TRAIN; gpu57 default)
 [ -f $D/train_args ] || { echo "c108_guard: $D/train_args missing" >&2; exit 2; }
 [ -e $D/$N-s0 ] && { echo "c108_guard: $D/$N-s0 exists" >&2; exit 2; }
 take_shared "training $PARENT/$N ($T, $L), not timed"
