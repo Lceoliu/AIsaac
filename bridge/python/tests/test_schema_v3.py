@@ -248,3 +248,11 @@ def test_batch5_the_header_word_is_the_version():
     assert 'LAYOUT_GEN' not in header and 'H_GEN' not in header
     c = (HERE.parents[1] / 'engine' / 'abp_v3_native.c').read_text(encoding='utf-8')
     assert 'h[ABP_V3_H_VERSION] = ABP_V3_VERSION_WORD;' in c and str(S.VERSION_WORD) not in c
+
+
+def test_price_coin_scale_is_model_side():
+    """PRICE_COIN_SCALE (2026-11-18): the coins / 15 of the price number, model side only (no wire change: VERSION
+    stays 2026111802, nothing in the C header)."""
+    assert S.PRICE_COIN_SCALE == 15.0 and S.VERSION == 2026111802
+    header = (HERE.parents[1] / 'engine' / 'abp_schema_v3.h').read_text()
+    assert 'PRICE_COIN' not in header

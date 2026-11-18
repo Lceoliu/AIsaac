@@ -347,6 +347,13 @@ NUM_RANGE = {
 # door / laser offsets / 200, distances / 300). Python only (not in the C header).
 REL_SCALE = {'offset': 200.0, 'distance': 300.0}
 
+# PRICE_COIN_SCALE (the coordinator, 2026-11-18): E col 31 price also as a model number, coins / 15 for a price > 0
+# (the old model's /15), 0 otherwise -- the special prices (-1 / -2 / -3 / -1000) are categories only (price_code).
+# Model side only, like REL_SCALE (never on the wire, not in the C header): the wire value and the column's meaning
+# stay as they are, so VERSION is unchanged (batch 5's rule: a change of the layout or of a column's meaning raises
+# it). Until 2026-11-18 a local constant of v3_input.py.
+PRICE_COIN_SCALE = 15.0
+
 # Engine argument ranges per game version (the convention above). (value, source); abp_bridge.lua V3_ABP = the values.
 # 'disasm' = the getter in isaac.x64 (sha256 b9bfef32...) read with objdump on 184; 'enums' = resources/scripts/enums.lua
 # of the AB+ install there (line); 'measured' = abplus_probe_v3_ranges.py (184 ranges1).
