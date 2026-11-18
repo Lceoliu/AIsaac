@@ -2174,6 +2174,10 @@ def main(argv=None, child=None, actor=None):
     args = p.parse_args(argv)
     if args.temporal_rooms < 0:
         p.error('--temporal-rooms must be >= 0')
+    from isaac_bridge.tok_obs import obs_visible_conflict
+    why = obs_visible_conflict(args.obs_visible, os.environ.get('ISAAC_RL_VISIBLE_V3', '0'))
+    if why:
+        p.error(why)
     if not args.obs_visible:   # (seq-v1: before any worker / child process starts; tok_obs.encode_row reads it)
         os.environ['ISAAC_NO_VISIBLE'] = '1'
     shard_world = int(os.environ.get('ISAAC_SHARD_WORLD', '1') or 1)   # BM1 C: K shards as one run (shard_sync)

@@ -395,6 +395,19 @@ def _minimap(o, st):
                 m[special, y, x] = 1
 
 
+def obs_visible_conflict(obs_visible, v3_raw):
+    """(seq-v1, the coordinator 2026-11-18) --obs-visible 0 (no visible frame at all) and ISAAC_RL_VISIBLE_V3 set to a
+    mode (a v3 worker writes a v3 frame for every record) contradict each other: write_visible would take
+    --obs-visible 0 first and write nothing. train_tok / eval_tok refuse the pair at their argument parsing: the
+    message, or None when the two agree."""
+    from .visible_producer import configured_mode
+    mode = configured_mode(v3_raw)
+    if not obs_visible and mode:
+        return (f'--obs-visible 0 (the workers write no visible frame) and ISAAC_RL_VISIBLE_V3={v3_raw} (mode {mode}: '
+                f'a v3 frame for every record) contradict each other: set one of them')
+    return None
+
+
 def write_visible(o, row):
     """encode_row's visible frame: v3 (the native frame or the raw block's reference frame), else v2, else none
     (visible_schema 0); a worker configured for v3 (visible_producer.VISIBLE_V3_MODE) refuses a record without a v3

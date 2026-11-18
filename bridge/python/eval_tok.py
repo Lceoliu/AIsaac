@@ -203,6 +203,10 @@ def main():
     p.add_argument('--obs-visible', type=int, default=1, choices=(0, 1),
                    help='(seq-v1) 0: the evaluation workers write no visible frame (ROW only, as train_tok --obs-visible 0)')
     args = p.parse_args()
+    from isaac_bridge.tok_obs import obs_visible_conflict
+    why = obs_visible_conflict(args.obs_visible, os.environ.get('ISAAC_RL_VISIBLE_V3', '0'))
+    if why:
+        p.error(why)
     if not args.obs_visible:   # (seq-v1: before the workers start; tok_obs.encode_row reads it)
         os.environ['ISAAC_NO_VISIBLE'] = '1'
     if args.random and (args.item_slots is not None or args.ablate):

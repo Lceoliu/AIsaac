@@ -1,0 +1,113 @@
+"""seq-v1 (2026-11-18, the coordinator): tok_obs.write_visible's three cases after package C (05f1622) met step 0's
+--obs-visible 0, and the one pair of settings that cannot both hold. CPU only.
+
+- v3 on: a record with a v3 frame gets that frame (visible_schema = schema_v3.VERSION, the bytes as they came);
+- v3 off and a v2 visible block: the v2 frame (visible_native.frame -> structured_input.write_frame);
+- --obs-visible 0 (ISAAC_NO_VISIBLE=1): no frame at all, v3 or v2, even with both present (visible_schema 0);
+- a worker configured for v3 without a v3 frame refuses the record (05f1622);
+- --obs-visible 0 together with ISAAC_RL_VISIBLE_V3 = a mode is refused by train_tok / eval_tok at argument parsing
+  (tok_obs.obs_visible_conflict), so a v3 configuration never reaches write_visible's --obs-visible 0 branch."""
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from isaac_bridge import schema_v3 as V3
+from isaac_bridge import structured_input, tok_obs, visible_native
+from isaac_bridge import visible_producer as VP
+from isaac_bridge.tok_obs import ROW
+
+HERE = Path(__file__).resolve().parent
+FIX = HERE / 'fixtures' / 'visible_v3'
+GOLDEN = (FIX / f"{json.loads((FIX / 'manifest.json').read_text())['frames'][0]['name']}.v3.bin").read_bytes()
+V2_SCHEMA = 4242   # (the stub's v2 schema number)
+
+
+class Obs:
+    def __init__(self, v3=None, v2=None):
+        self.visible_v3_frame, self.visible = v3, v2
+
+
+@pytest.fixture
+def v2_stub(monkeypatch):
+    calls = []
+    monkeypatch.setattr(visible_native, 'frame', lambda o: b'v2-frame')
+
+    def write_frame(row, payload):
+        calls.append(payload)
+        row['visible_schema'] = V2_SCHEMA
+    monkeypatch.setattr(structured_input, 'write_frame', write_frame)
+    monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
+    monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', 0)
+    return calls
+
+
+def row():
+    r = np.zeros(1, ROW)
+    r['visible_schema'] = 7
+    return r
+
+
+def test_v3_on_writes_the_v3_frame(v2_stub):
+    r = row()
+    assert tok_obs.write_visible(Obs(v3=GOLDEN, v2={'schema': 'v2'}), r) is True
+    assert int(r['visible_schema'][0]) == V3.VERSION and int(r['visible_bytes'][0]) == len(GOLDEN)
+    assert r['visible_frame'][0, :len(GOLDEN)].tobytes() == GOLDEN
+    assert v2_stub == []
+
+
+def test_v3_off_with_a_v2_block_writes_the_v2_frame(v2_stub):
+    r = row()
+    assert tok_obs.write_visible(Obs(v2={'schema': 'v2'}), r) is False
+    assert v2_stub == [b'v2-frame'] and int(r['visible_schema'][0]) == V2_SCHEMA
+
+
+def test_obs_visible_0_writes_no_frame(v2_stub, monkeypatch):
+    monkeypatch.setenv('ISAAC_NO_VISIBLE', '1')
+    for obs in (Obs(v3=GOLDEN, v2={'schema': 'v2'}), Obs(v2={'schema': 'v2'}), Obs()):
+        r = row()
+        assert tok_obs.write_visible(obs, r) is False
+        assert int(r['visible_schema'][0]) == 0 and int(r['visible_bytes'][0]) == 0 and not r['visible_frame'].any()
+    assert v2_stub == []
+    # (and the v3 configuration never gets here: refused at argument parsing, below)
+    assert tok_obs.obs_visible_conflict(0, '2')
+
+
+def test_a_v3_worker_without_a_v3_frame_refuses(v2_stub, monkeypatch):
+    monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', 2)
+    with pytest.raises(Exception, match='visible-v3'):
+        tok_obs.write_visible(Obs(v2={'schema': 'v2'}), row())
+    assert v2_stub == []
+
+
+def test_obs_visible_conflict():
+    for mode in ('1', '2', '3', ' 2 '):
+        assert 'contradict' in tok_obs.obs_visible_conflict(0, mode)
+    for ov, mode in ((1, '2'), (0, '0'), (0, ''), (1, '0'), (1, '')):
+        assert tok_obs.obs_visible_conflict(ov, mode) is None
+
+
+def test_train_tok_refuses_the_pair(monkeypatch, capsys, tmp_path):
+    import train_tok
+    monkeypatch.setenv('ISAAC_RL_VISIBLE_V3', '2')
+    monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
+    monkeypatch.setenv('ISAAC_SHARD_WORLD', 'stop-here')   # (were the check missing: int() fails right after it)
+    with pytest.raises(SystemExit):
+        train_tok.main(['--groups-file', 'x.json', '--out', str(tmp_path), '--obs-visible', '0'])
+    assert 'contradict' in capsys.readouterr().err
+    assert 'ISAAC_NO_VISIBLE' not in __import__('os').environ
+
+
+def test_eval_tok_refuses_the_pair(monkeypatch, capsys, tmp_path):
+    sys.path.insert(0, str(HERE.parent))
+    import eval_tok
+    monkeypatch.setenv('ISAAC_RL_VISIBLE_V3', '2')
+    monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
+    # (--random with --ablate: were the check missing, eval_tok stops at its next check with another message)
+    monkeypatch.setattr(sys, 'argv', ['eval_tok.py', '--groups-file', 'x.json', '--out', str(tmp_path), '--random',
+                                      '--ablate', 'items', '--obs-visible', '0'])
+    with pytest.raises(SystemExit):
+        eval_tok.main()
+    assert 'contradict' in capsys.readouterr().err
