@@ -154,3 +154,99 @@ def test_a_short_grid_is_refused():
         VP.observation_frame_v3(raw)
     raw['cells'] = RAW['cells'][:n]
     VP.observation_frame_v3(raw)
+
+
+# ------------------------------------------------------------------ item 5: real differences fail the scripts
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_native_probe_verdict():
+    probe = _load(PY / 'abplus_probe_v3_native.py', 'probe_v3_native')
+    good = {'P': dict(compared=5, equal=5), 'E': dict(compared=5, equal=5), 'missing': 1}
+    assert probe.failures(good, {'lethal hit cancelled': 1}, ['lethal hit cancelled']) is None
+    assert probe.failures({**good, 'E': dict(compared=5, equal=4)}, {}, [])['differ'] == ['E']
+    assert probe.failures({'missing': 3}, {}, [])['nothing_compared']
+    assert probe.failures({'P': dict(compared=0, equal=0)}, {}, [])['nothing_compared']
+    assert probe.failures(good, {'v3: grid size': 2}, ['lethal hit cancelled'])['reasons_not_allowed'] == ['v3: grid size']
+
+
+def test_drop_probe_verdict():
+    probe = _load(PY / 'abplus_probe_drop.py', 'probe_drop')
+    case = dict(paths_agree=True, expected_change=True)
+    assert probe.summary_ok([case, case])
+    assert not probe.summary_ok([])
+    assert not probe.summary_ok([case, dict(case, paths_agree=False)])
+    assert not probe.summary_ok([case, dict(case='x', error='RuntimeError')])
+
+
+def _run(args, **kw):
+    return subprocess.run(args, capture_output=True, text=True, **kw)
+
+
+def test_native_golden_cmp_exit_code(tmp_path):
+    tool = PY / 'tools' / 'v3_native_golden_cmp.py'
+    names = 'header,canvas,minimap,P,local,E,N,S'
+    for f in ('forgotten', 'shooting'):
+        shutil.copy(FIX / f'{f}.v3.bin', tmp_path / f'{f}.v3.bin')
+        shutil.copy(FIX / f'{f}.v3.bin', tmp_path / f'{f}.native.bin')
+    r = _run([sys.executable, str(tool), str(tmp_path), names])
+    assert r.returncode == 0 and 'PASS' in r.stdout, r.stdout + r.stderr
+    b = bytearray((tmp_path / 'shooting.native.bin').read_bytes())
+    b[V3.FIXED * 4 + 4 * 3] ^= 0x10   # a P float of body 0
+    (tmp_path / 'shooting.native.bin').write_bytes(bytes(b))
+    r = _run([sys.executable, str(tool), str(tmp_path), names])
+    assert r.returncode == 1 and 'FAIL' in r.stdout and 'shooting P differs' in r.stdout
+    empty = tmp_path / 'empty'
+    empty.mkdir()
+    assert _run([sys.executable, str(tool), str(empty), names]).returncode == 1
+
+
+def test_accept_checks():
+    ac = _load(BM1 / 'accept_checks.py', 'accept_checks')
+    assert ac.frame_ok(dict(tested=4, payload_equal=4, digests_equal=4))
+    assert not ac.frame_ok(dict(tested=4, payload_equal=3, digests_equal=4))
+    assert not ac.frame_ok(dict(tested=4, payload_equal=4, digests_equal=3))
+    assert not ac.frame_ok(dict(tested=0, payload_equal=0, digests_equal=0))
+    line = 'files 12, exit slots lost 0, native visible checks %d mismatches %d'
+    assert ac.r2_ok(line % (500, 0)) and not ac.r2_ok(line % (500, 1)) and not ac.r2_ok(line % (0, 0))
+    assert not ac.r2_ok('no such line')
+
+
+SH = shutil.which('sh')
+
+
+@pytest.mark.skipif(SH is None, reason='no sh')
+@pytest.mark.parametrize('build_ok', [True, False])
+def test_deploy_abphome_fails_on_a_failed_build(tmp_path, build_ok):
+    """deploy.sh abphome with a stub run.sh (the container build): a build that writes no library exits non-zero and
+    moves the old library to trash (none left to pass for the new one); a good build replaces it."""
+    bm = tmp_path / 'bm1'
+    eng = bm / 'trees' / 't' / 'bridge' / 'engine'
+    eng.mkdir(parents=True)
+    for f in ('run_instance.sh', 'null_render_e.txt', 'stub_render_g.txt', 'stub_render_h.txt', 'abp_turbo.c',
+              'abp_v3_native.c', 'abp_schema_v3.h', 'abp_step_line.h'):
+        (eng / f).write_text('x')
+    shutil.copy(BM1 / 'deploy.sh', bm / 'deploy.sh')
+    tools = bm / 'home' / 'isaac-abplus' / 'tools'
+    tools.mkdir(parents=True)
+    (tools.parent / 'runtime').mkdir()   # (present: no link made)
+    (tools / 'libabp_turbo.so').write_text('OLD')
+    (bm / 'common.sh').write_text(
+        'BM1_MODE=direct\nBM1_GAME_RUNTIME=/nonexistent\nBM1_IN=%s\n'
+        'trash() { [ -e "$1" ] || return 0; d=$BM/trash/x; mkdir -p "$d" && mv "$1" "$d/"; }\n' % bm.as_posix())
+    # (the failure as on the host: the container's gcc fails, run.sh still returns 0)
+    build = 'echo NEW > %s/libabp_turbo.so.new' % tools.as_posix() if build_ok else 'echo "gcc: error" >&2; exit 0'
+    (bm / 'run.sh').write_text('#!/bin/sh\n%s\n' % build)
+    os.chmod(bm / 'run.sh', 0o755)
+    r = _run([SH, (bm / 'deploy.sh').as_posix(), 'abphome', 't'], env=dict(os.environ, BM=bm.as_posix()))
+    lib = tools / 'libabp_turbo.so'
+    if build_ok:
+        assert r.returncode == 0, r.stderr
+        assert lib.read_text().strip() == 'NEW' and not (tools / 'libabp_turbo.so.new').exists()
+    else:
+        assert r.returncode != 0 and 'not built' in r.stderr
+        assert not lib.exists() and (bm / 'trash' / 'x' / 'libabp_turbo.so').read_text() == 'OLD'

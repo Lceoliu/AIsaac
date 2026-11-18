@@ -13,6 +13,7 @@ usage (bridge python dir, PYTHONPATH=.): python abplus_probe_v3_native.py --grou
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -146,6 +147,18 @@ def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1, cover=COVE
     return rec, cpu, ack, worker
 
 
+def failures(stats, fallback_reasons, allowed):
+    """The run's verdict (2026-11-18, Codex round 2): None when every compared section is equal, something was compared
+    in each, and every native hand-back reason is an allowed one; else what failed."""
+    parts = {k: v for k, v in stats.items() if isinstance(v, dict)}
+    bad = sorted(k for k, v in parts.items() if v['equal'] != v['compared'])
+    empty = not parts or min(v['compared'] for v in parts.values()) == 0
+    unknown = sorted(set(fallback_reasons) - {r for r in allowed if r})
+    if bad or empty or unknown:
+        return dict(differ=bad, nothing_compared=empty, reasons_not_allowed=unknown)
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--groups-file', required=True)
@@ -156,6 +169,8 @@ def main():
     ap.add_argument('--hop', type=int, default=25, help='decisions per room (ChangeRoom to the next room of the floor)')
     ap.add_argument('--stages', type=int, default=6, help='seed k plays stage 1 + k mod stages')
     ap.add_argument('--port', type=int, default=44540)
+    ap.add_argument('--allowed-fallbacks', default='lethal hit cancelled',
+                    help='native hand-back reasons that do not fail the run (comma-separated)')
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
     out = Path(args.out)
@@ -198,6 +213,11 @@ def main():
                    seconds=round(time.perf_counter() - t0, 1))
     (out / 'summary.json').write_text(json.dumps(summary, indent=1, sort_keys=True))
     print('SUMMARY', json.dumps(summary, sort_keys=True), flush=True)
+    fail = failures(stats, summary['fallback_reasons'], args.allowed_fallbacks.split(','))
+    if fail:
+        print('FAIL', json.dumps(fail), flush=True)
+        sys.exit(1)
+    print('PASS', flush=True)
 
 
 if __name__ == '__main__':

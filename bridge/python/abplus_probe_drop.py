@@ -20,6 +20,7 @@ usage (bridge python dir, PYTHONPATH=.): python abplus_probe_drop.py --groups-fi
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -163,6 +164,11 @@ def verdict(case, res):
     return dict(paths_agree=same, expected_change=expected, before=b0, after=a0)
 
 
+def summary_ok(summary):
+    """Every case ran, both input paths agree and the change is the expected one; no case at all is a failure."""
+    return bool(summary) and all(v.get('paths_agree') and v.get('expected_change') for v in summary)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--groups-file', required=True)
@@ -201,10 +207,12 @@ def main():
                     print(json.dumps(v)[:600], flush=True)
         finally:
             inst.kill()
-    ok = all(v.get('paths_agree') and v.get('expected_change') for v in summary)
+    ok = summary_ok(summary)
     (out / 'summary.json').write_text(json.dumps(dict(ok=ok, cases=summary, seconds=round(time.perf_counter() - t0, 1)),
                                                  indent=1))
     print('SUMMARY ok' if ok else 'SUMMARY FAIL', flush=True)
+    if not ok:   # (2026-11-18, Codex round 2: a failing case fails the run)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

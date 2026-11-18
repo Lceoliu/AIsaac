@@ -41,3 +41,7 @@ for nb in sorted(glob.glob(os.path.join(d, '*.native.bin'))):
             i = next((i for i, (x, y) in enumerate(zip(a[k], b[k])) if x != y), None)
             print(name, k, 'differs', 'len', len(a[k]), len(b[k]), 'first index', i)
 print({k: f'{v[1]}/{v[0]} equal' for k, v in tot.items()}, f'body order {order[1]}/{order[0]} hold')
+# (2026-11-18, Codex round 2: exit 1 on any difference, a body order that fails, or no native frame at all)
+ok = order[0] > 0 and order[1] == order[0] and all(v[0] > 0 and v[1] == v[0] for v in tot.values())
+print('PASS' if ok else 'FAIL')
+sys.exit(0 if ok else 1)

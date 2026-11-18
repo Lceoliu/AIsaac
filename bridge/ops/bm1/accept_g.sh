@@ -78,7 +78,9 @@ probe() {   # name, mode, extra args
   rc=$?
   note "3 $n rc=$rc $(python3 -c "import json,sys; s=json.load(open('$D/$n/summary.json')); print({k: s.get(k) for k in ('tested','decisions','payload_equal','visible_reordered','digests_equal','cpu_ms_per_decision_ref','cpu_ms_per_decision_fast')})" 2>/dev/null) fast clones: $(python3 $BM/vis_status.py $D/$n/rows.json 2>/dev/null)"
   tested=$(python3 -c "import json; print(int(json.load(open('$D/$n/summary.json')).get('tested') or 0))" 2>/dev/null || echo 0)
-  [ $rc = 0 ] && [ "${tested:-0}" -gt 0 ] || abort "3 probe $n rc=$rc tested=${tested:-0} ($D/$n.log)"
+  # (2026-11-18, Codex round 2: every tested seed with equal payloads and equal digests, not only tested > 0)
+  same=$(python3 $BM/accept_checks.py frame $D/$n/summary.json)
+  [ $rc = 0 ] && [ "${tested:-0}" -gt 0 ] && [ "$same" = 1 ] || abort "3 probe $n rc=$rc tested=${tested:-0} all equal=$same ($D/$n.log)"
 }
 probe room1 1 --group normal --seeds range:2147500000:16 --visible-json
 probe floor1 1 --floor --seeds range:2147600000:4 --visible-json
@@ -143,6 +145,9 @@ touch $D/r0.done; wait $SM
 train r1 12 -e ISAAC_RL_NATIVE_VISIBLE=1 -e ISAAC_RL_V2LOG_COMPACT=1
 train r2 6 -e ISAAC_RL_NATIVE_VISIBLE=2
 note "5 r2 native visible check: $(head -1 $D/r2-clone-stats.txt)"
+# (2026-11-18, Codex round 2: R2 passes only with checks > 0 and 0 mismatches, not logged only)
+r2ok=$(python3 $BM/accept_checks.py r2 $D/r2-clone-stats.txt)
+[ "$r2ok" = 1 ] || abort "5 r2 native visible checks: not > 0 with 0 mismatches ($(head -1 $D/r2-clone-stats.txt))"
 
 # 6 the gate (optional; under this batch's lock)
 if [ "${GATE:-0}" = 1 ]; then
