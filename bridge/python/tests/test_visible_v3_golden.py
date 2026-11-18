@@ -46,6 +46,47 @@ def test_bytes_and_positions(name):
     assert int(f['P'][0][V3.col(V3.P_COLS, 'grid_w')]) == eng['gw'] and int(f['P'][0][V3.col(V3.P_COLS, 'grid_h')]) == eng['gh']
 
 
+def _identity_check(f, eng):
+    """Every sent entity (E row) matched to exactly one engine entity of the same type, variant, subtype (or a masked
+    subtype: identity_known 0) at its position in the canvas frame, no engine entity used twice; and every visible
+    engine entity that is not a player nor a listed decorative effect sent. Returns (unmatched rows, missing ones)."""
+    ox, oy = eng['g0'][0] - 20, eng['g0'][1] - 20
+    ik = V3.col(V3.E_COLS, 'identity_known')
+    used, unmatched = set(), []
+    for r in f['E']:
+        c = [k for k, e in enumerate(eng['entities']) if k not in used and int(r[0]) == e['type'] and
+             int(r[1]) == e['variant'] and (int(r[2]) == e['subtype'] or not r[ik]) and
+             abs(r[3] - np.float32(e['x'] - ox)) < 1e-3 and abs(r[4] - np.float32(e['y'] - oy)) < 1e-3]
+        if len(c) == 1:
+            used.add(c[0])
+        else:
+            unmatched.append((int(r[0]), int(r[1]), int(r[2]), len(c)))
+    missing = [(e['type'], e['variant'], e['subtype']) for k, e in enumerate(eng['entities']) if k not in used and
+               e['type'] != 1 and e['visible'] and not (e['type'] == 1000 and e['variant'] in VP.V3_DECORATIVE_WHY)]
+    return unmatched, missing
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_entity_identity_unique_and_complete(name):
+    """(2026-11-18, Codex round 2: the position check alone did not test identity, a unique match or a missing row)
+    The E rows against the engine's own entity list read apart (engine.json): see _identity_check. The check bites: a
+    frame with one E row taken out has a missing entity."""
+    eng = json.loads((FIX / f'{name}.engine.json').read_text())
+    f = _frame(name)
+    assert _identity_check(f, eng) == ([], [])
+    if len(f['E']):
+        assert _identity_check(dict(f, E=f['E'][1:]), eng)[1]
+
+
+@pytest.mark.parametrize('name', NAMES)
+def test_the_native_encoder_frames(name):
+    """<name>.native.bin: abp_v3_native.c's own frame of the same state (184 golden-b5, tree c2-9e941f3, the native
+    encoder in the game), equal to the reference encoder's frame of the raw block with the stall columns 0 (the native
+    side writes them 0, the worker backfills them). Taken again with the golden probe when the schema changes."""
+    blob = json.loads((FIX / f'{name}.raw.json').read_text())
+    assert (FIX / f'{name}.native.bin').read_bytes() == VP.observation_frame_v3(blob['raw'])
+
+
 def _frame(name):
     return VP.unpack_frame_v3((FIX / f'{name}.v3.bin').read_bytes())
 
@@ -94,14 +135,42 @@ def test_worker_row_and_stall_backfill():
     assert np.array_equal(a['canvas'], b['canvas']) and np.array_equal(a['local'], b['local'])
 
 
-def test_stall_columns_in_run_mode_too():
-    """--mode run's EpisodeState (run=True) is a whole-floor state (st.floor), so encode_row backfills the stall
-    columns there as on whole floors: known 1 with a stall rule, 0 without one."""
-    from isaac_bridge.tok_obs import EpisodeState
-    assert EpisodeState(100, run=True, stall=120).floor and EpisodeState(100, floor=True, stall=120).floor
-    assert not EpisodeState(100).floor
-    src = (Path(VP.__file__).parent / 'tok_obs.py').read_text(encoding='utf-8')
-    assert 'known = st.floor and st.stall > 0' in src and 'v3_backfill_stall(row' in src
+def _lean_v3(frame, terrain):
+    """A lean payload (abplus_lean's layout) with the native v3 frame (flag 64), one player, and (terrain) a 15 x 9
+    terrain block (flag 2): enough for encode_row."""
+    import struct
+    from isaac_bridge import abplus_lean as al
+    b = bytearray(al._HEADER.pack(al.MAGIC, 1234, 1200, (2 if terrain else 0) | 64, 1, 0, 0))
+    b += al._ROOM.pack(1, 0, 0, 0, 60, 2, 0, 0, 40.0, 120.0, 600.0, 400.0)
+    b += al._TOTALS.pack(0.0, 0.0, 0.0, 0.0)
+    pl = np.zeros(1, al.PLAYER)
+    pl['hearts'], pl['x'], pl['y'] = 6, 300, 250
+    b += pl.tobytes() + struct.pack('<H', 0)
+    if terrain:
+        cells = [[i, 40 + 40 * (i % 15), 120 + 40 * (i // 15), 0, 1, 1, 0, 0, 0, 0] for i in range(135)]
+        t, g = json.dumps(dict(width=15, height=9, cells=cells)).encode(), b'[]'
+        b += struct.pack('<II', 1, len(t)) + t + struct.pack('<I', len(g)) + g
+    return bytes(b) + struct.pack('<I', len(frame)) + frame
+
+
+@pytest.mark.parametrize('mode, known', [('run', 1.0), ('floor', 1.0), ('floor-no-stall', 0.0), ('room', 0.0)])
+def test_stall_columns_by_episode_mode(mode, known):
+    """encode_row itself (2026-11-18: a behaviour test in place of the source check): --mode run's EpisodeState
+    (run=True) is a whole-floor state, so the stall columns are backfilled there as on whole floors -- the share of the
+    stall limit used (t - progress_t) / stall and known 1 with a stall rule; 0 / 0 without one or in a room episode."""
+    from isaac_bridge.abplus_lean import LeanDecoder
+    from isaac_bridge.tok_obs import ROW, EpisodeState, encode_row
+    blob = json.loads((FIX / 'forgotten.raw.json').read_text())
+    frame = VP.observation_frame_v3(blob['raw'])
+    st = dict(run=EpisodeState(1000, run=True, stall=120), floor=EpisodeState(1000, floor=True, stall=120),
+              room=EpisodeState(1000, stall=120), **{'floor-no-stall': EpisodeState(1000, floor=True)})[mode]
+    dec, row = LeanDecoder(), np.zeros(1, ROW)
+    for t in range(4):
+        encode_row(dec.decode(_lean_v3(frame, terrain=t == 0)), st, row, t)
+    f = VP.unpack_frame_v3(bytes(row['visible_frame'][0, :int(row['visible_bytes'][0])]))
+    share = f['P'][:, V3.col(V3.P_COLS, 'stall_share')]
+    assert list(f['P'][:, V3.col(V3.P_COLS, 'stall_known')]) == [known, known]
+    assert np.allclose(share, (3 - st.progress_t) / 120 if known else 0.0)
 
 
 def test_a_handed_back_record_reads_like_a_native_one():
@@ -111,7 +180,7 @@ def test_a_handed_back_record_reads_like_a_native_one():
     from types import SimpleNamespace
     from isaac_bridge.tok_obs import ROW
     blob = json.loads((FIX / 'forgotten.raw.json').read_text())
-    native = VP.observation_frame_v3(blob['raw'])                       # (what the native side sends: stall 0)
+    native = (FIX / 'forgotten.native.bin').read_bytes()               # (the native encoder's own frame: stall 0)
     rows = []
     for o in (SimpleNamespace(visible=blob['raw'], visible_v3_frame=None),
               SimpleNamespace(visible=None, visible_v3_frame=native)):
