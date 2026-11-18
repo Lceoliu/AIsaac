@@ -1031,14 +1031,36 @@ def temporal_part(td, cids, counts, qep_rows, table, to_dev=None):
     return tp
 
 
+class ActiveLinear(nn.Linear):
+    """(seq-v1 step 2, frame='v3') The policy layer with every head of schema_v3 (22 logits: move, shoot, bomb, item,
+    pill, drop) of which only the first `active` are used: forward returns those (the drop head's two logits take no
+    part in any distribution, sampling, log-probability, entropy or loss, and get no gradient). Opening the drop head
+    later is active = 22 with the same parameters."""
+
+    def __init__(self, n_in, n_out, active):
+        super().__init__(n_in, n_out)
+        self.active = int(active)
+
+    def forward(self, x):
+        return super().forward(x)[..., :self.active]
+
+
 class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
                  memory=0, item_tokens=False, global_token=False, item_shared=False, item_slots=INV_CAP, temporal=False,
                  temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128,
                  temporal_feedback=1,
                  obs_prices=False, obs_hearts=False, obs_room_type=False, block_memory=False, block_config=None,
-                 input_schema=None):
+                 input_schema=None, frame=None):
         super().__init__()
+        if frame not in (None, 'row', 'v3'):
+            raise ValueError(f'TokPolicy: frame {frame!r} (None / row: the ROW encoder; v3: FrameEncoderV3)')
+        if frame == 'v3':   # (seq-v1 step 2: the first v3 arm is C114 T1 with the frame encoder replaced)
+            bad = [k for k, ok in (('temporal', temporal), ('temporal_feedback 0', not int(temporal_feedback)),
+                                   ('global_token', global_token), ('items', items), ('no item_tokens', not item_tokens),
+                                   ('no block_memory', not block_memory), ('memory 0', not memory)) if not ok]
+            if bad:
+                raise ValueError(f'TokPolicy(frame=v3) needs {", ".join(bad)} (the C114 T1 configuration)')
         if int(item_slots) != INV_CAP and not item_tokens:
             raise ValueError('TokPolicy: item_slots needs item_tokens=True (B24)')
         if item_tokens and not items:
@@ -1156,6 +1178,29 @@ class TokPolicy(nn.Module):
             self.room_type_emb = nn.Embedding(N_ROOM_TYPE, width)
             nn.init.zeros_(self.room_type_emb.weight)
         self.block_memory = None
+        # seq-v1 step 2 (frame='v3'): registered after everything else; the ROW input modules removed (the v3 frame is
+        # the only observation), the norm, heads, global token's norm / value and the temporal side kept as T1's
+        self.frame_v3 = None
+        if frame == 'v3':
+            from .frame_v3 import FrameEncoderV3
+            from .schema_v3 import DROP_BIAS, HEAD_SIZES
+            self.config['frame'] = 'v3'
+            self.frame_v3 = FrameEncoderV3(width, layers, heads)
+            for name in ('type_emb', 'variant_emb', 'subtype_emb', 'item_emb', 'trinket_emb', 'pill_emb', 'effect_emb',
+                         'card_emb', 'entity', 'patch', 'player', 'room', 'door', 'map', 'kind', 'blocks', 'char_emb',
+                         'room_type_emb', 'itok'):
+                if hasattr(self, name):
+                    delattr(self, name)
+            self.itok, self.room_type_emb, self.char_emb = None, None, None
+            n = sum(self.heads)
+            assert tuple(HEAD_SIZES[:len(self.heads)]) == tuple(self.heads)
+            pi = ActiveLinear(width, sum(HEAD_SIZES), n)
+            nn.init.orthogonal_(pi.weight, gain=0.01)
+            nn.init.zeros_(pi.bias)
+            with torch.no_grad():   # (the first 20 as T1's; drop's "drop" at schema_v3.DROP_BIAS)
+                pi.bias[:n].copy_(self.pi.bias)
+                pi.bias[n + 1] = DROP_BIAS
+            self.pi = pi
         if block_memory:
             if self.memory:
                 raise ValueError('block memory replaces the GRU; use memory=0')
@@ -1189,7 +1234,12 @@ class TokPolicy(nn.Module):
         nhwc: the convolutions' inputs in channels-last layout (cuDNN's TF32 kernels work in it: no layout conversions
         of the activations before and after every convolution; the same convolutions); ln: the packed layer norms as
         _LayerNorm (the same function)."""
-        blocks=self.structured_spatial.blocks if self.block_memory is not None else self.blocks
+        if self.block_memory is not None:
+            blocks = self.structured_spatial.blocks
+        elif getattr(self, 'frame_v3', None) is not None:   # (seq-v1 step 2)
+            blocks = self.frame_v3.blocks
+        else:
+            blocks = self.blocks
         for block in blocks:
             block.math = bool(on)
             block.ln_fast = bool(on) if ln is None else bool(ln)
@@ -1230,6 +1280,8 @@ class TokPolicy(nn.Module):
             raise ValueError('TokPolicy.forward: need_vg needs a global-token model (global_token=True)')
         if self.block_memory is not None:
             return self._forward_block(b, entities, packed, need_h, need_vg, temporal)
+        if self.frame_v3 is not None:   # (seq-v1 step 2)
+            return self._forward_v3(b, need_h, mem, need_vg, temporal)
         tctx = hist = None
         if temporal is not None and self.tatt is not None:   # 2026-10-14 (B30)
             tctx, hist = self._temporal_in(b, temporal)
@@ -1412,6 +1464,18 @@ class TokPolicy(nn.Module):
         if tctx is not None and tctx.get('block_encode'):
             return self.block_memory.resampler(x, pad)
         return self._heads(x[:, 0], need_h, mem, x[:, -1] if G else None, need_vg, tctx)
+
+    def _forward_v3(self, b, need_h, mem, need_vg, temporal):
+        """forward() of frame='v3' (seq-v1 step 2): the frame encoder's tokens of b['v3'] (frame_v3.v3_tensors of a
+        v3_input.pad_batch), the controlled body's token (0) and the global token (last) after its blocks, then the
+        heads exactly as T1 (_heads -> _heads_temporal with a temporal context; no feedback token). The ROW fields the
+        temporal step and the action gate read (first, map, events, stage; bombs, player column 22, pinv) still come
+        from b; no ROW observation field enters the encoder."""
+        tctx = None
+        if temporal is not None and self.tatt is not None:
+            tctx, _hist = self._temporal_in(b, temporal)   # (feedback 0: no history token)
+        x, _pad, g = self.frame_v3(b['v3'], b['pending'], self.gtok.tok)
+        return self._heads(x[:, 0], need_h, mem, x[:, g], need_vg, tctx)
 
     def _block_packed_readout(self, xp, starts):
         counts = torch.cat((starts[1:], starts.new_tensor([len(xp)]))) - starts
