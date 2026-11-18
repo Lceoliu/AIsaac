@@ -35,7 +35,8 @@ for spec in "$@"; do
   else
     L=$(GPU=$G CPUSET=$CS MEMS=$MS ENVS="-e TOK_EVAL_DEVICE=cuda ${EV_ENVS:-}" sh $BM/job.sh ev-$RUN "cd /bench/bm1/trees/$ET/bridge/python && $EH export LIBGL_ALWAYS_SOFTWARE=1 SDL_AUDIODRIVER=dummy ALSOFT_DRIVERS=null && $X \$BM1_PY -u /bench/bm1/evtools/eval_ent.py --checkpoint $CK --groups-file ../abplus/catalog/scaling2_groups.json --mode run --items --workers $W --seeds $seeds --name abev --port ${EV_PORT:-41300} --out $O" | tail -1)
   fi
-  cp "$L" $HOST/$tag.log 2>/dev/null
-  echo "$(date '+%F %T') $tag $ck $seeds: $(( $(date +%s) - t0 )) s, summary $( [ -f $HOST/$tag/summary.json ] && echo yes || echo NO ) ($L)"
+  cp "$L" $HOST/$tag.log 2>/dev/null; cp "$L.rc" $HOST/$tag.log.rc 2>/dev/null
+  # (2026-11-18: complete only with every requested seed played and the job's rc 0 -- evtools/ev_complete.py)
+  echo "$(date '+%F %T') $tag $ck $seeds: $(( $(date +%s) - t0 )) s, $(python3 $BM/evtools/ev_complete.py --dir $HOST/$tag --seeds $seeds --rc-file $HOST/$tag.log.rc) ($L)"
 done
 echo "EV_AB2 DONE $RUN"

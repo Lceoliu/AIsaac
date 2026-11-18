@@ -23,8 +23,10 @@
 | `train_guard.sh` | 正式训练：K 个同步分片，失败后自动续训，写 `guard.log`；`STOP` 文件让它收尾 |
 | `gate.sh`、`gate3.sh` | 一棵树的全量测试门（pytest）；`gate3.sh` 是 entry、全部测试和 A8 连着跑。日志带时间戳，从不覆盖，失败的拷进 `reports/failed/` |
 | `job.sh`、`jobcpu.sh` | 不计时的容器作业，在锁下运行 |
-| `ev_ab1.sh`、`ev_ab2.sh` | 留出种子评估的作业（C106、C107） |
-| `deploy.sh` | `tree <名> <tar>`：解开一棵 git-archive 树。`abphome <树>`：建游戏目录，从树的 `bridge/engine` 编 `libabp_turbo.so` |
+| `ev_ab1.sh`、`ev_ab2.sh`、`ev_c113.sh` | 留出种子评估的作业（C106、C107；C113 起主机无关的 `ev_c113.sh`）。状态行由 `evtools/ev_complete.py` 给出：每个请求的种子都有一局、作业 rc 0 才算完成，否则写 `summary yes, INCOMPLETE`；`job.sh` 把容器的退出码写进 `<日志>.rc` |
+| `evtools/` | `eval_ent.py`（评测外壳：eval_tok 原样 + entropy.json / config.json）、`ev_table.py`（汇总表）、`ev_complete.py`（评测是否完整） |
+| `deploy.sh` | `tree <名> <tar>`：解开一棵 git-archive 树。`abphome <树>`：建游戏目录，从树的 `bridge/engine` 编 `libabp_turbo.so`（编译失败非零退出）。`ops <树>`：从树的 `bridge/ops/bm1` 部署 bm1 自己的脚本（见下"部署 bm1 脚本"） |
+| `test_lock.sh`、`test_deploy_ops.sh` | 锁和 `deploy.sh ops` 的回归测试，在一个临时目录里跑 |
 | `lock.sh` | 本道的锁，内容是 "<session> <时间> <用途>"，用 noclobber 原子地取 |
 | `probe_host.sh` | 只读地列出主机的 CPU、NUMA、内存、GPU、驱动、Xid 计数，供写 `bm1.env` |
 | `memguard.py` | direct 模式下写不了 cgroup 时，按进程树 RSS 守内存上限 |
@@ -39,6 +41,13 @@
 | `reports/` | 所有结果和日志：总日志 `bm1.log`；`<tag>/progress.csv`、`<tag>.stdout`、`<tag>.gpu`、`<tag>.allgpu`、`<tag>.mpstat` |
 
 `trees/`、`home/`、`payloads/`、`reports/` 只在主机上，不在 git 里。
+
+## 部署 bm1 脚本（2026-11-18）
+
+- 只用 `deploy.sh ops <树>`，不要整目录拷贝。它写 LF 行尾；主机上的文件如果和它上次部署的版本（`.ops_deployed/`）不同，就是没进仓库的主机改动：一个都不写，列出文件，退出码 3。先把改动提交进仓库再部署，或者确认要覆盖时用 `OPS_ACCEPT=文件1,文件2`。
+- 新的 `run.sh`、`train_guard.sh` 里必须调用 `gpu_forbid`（`bm1.env` 的 `BM1_GPU_FORBID` / `BM1_GPU_FORBID_UUID`：dgene 上 GPU 5 永远不用），否则拒绝部署（退出码 4）；部署后再查一遍。
+- 部署后的逐文件核对忽略行尾：仓库在 Windows 上 checkout 时 bridge/ops 也是 LF（`.gitattributes`），但一棵用 `git archive` 打的树仍可能带 CRLF。
+- `train_guard.sh`：训练输出里出现 `VisibleV3Fatal`（visible-v3 的版本 / 模式 / 帧错误）时 cause 为 v3_fatal，停、不续跑。
 
 ## 用法（在主机的 bm1 目录里）
 

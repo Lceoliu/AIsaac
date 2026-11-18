@@ -17,6 +17,7 @@ if grep -q "game hours reached" $P/$N/guard.log; then
   python3 $BM/ab2_win.py $P/$N/$N-s0 100 > $P/win100_$N.txt 2>&1
   PARENT=c110 sh $BM/ev_ab2.sh $N new $G $CS $MS 14 $N-c128-last,last.pt,2147490000:128 > $P/eval_$N.out 2>&1
 else st=" $N short of its hours ($(tail -1 $P/$N/guard.log | cut -c1-120));"; fi
-n=$(ls $P/eval/$N-c128-last/summary.json 2>/dev/null | wc -l)
-echo "$(date '+%F %T') evaluation done: $n/1 summary.json;$st" > $P/AFTER_DONE_$N
-echo "$(date '+%F %T') c110_after $N: evaluation done, $n/1 summary.json;$st" >> $BM/reports/bm1.log
+# (2026-11-18: an evaluation counts as done only when complete -- every requested seed played, rc 0)
+n=$(python3 $BM/evtools/ev_complete.py --quiet --dir $P/eval/$N-c128-last --seeds 2147490000:128 --rc-file $P/eval/$N-c128-last.log.rc && echo 1 || echo 0)
+echo "$(date '+%F %T') evaluation done: $n/1 complete;$st" > $P/AFTER_DONE_$N
+echo "$(date '+%F %T') c110_after $N: evaluation done, $n/1 complete;$st" >> $BM/reports/bm1.log

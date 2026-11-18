@@ -3,3 +3,7 @@
 # bm1 environment / lane files are sourced by sh on the Linux hosts: LF too
 *.env text eol=lf
 *.env.template text eol=lf
+
+# bridge/ops: everything there runs or is read on the Linux hosts -- LF on every checkout and in git archive (the
+# index already holds LF; 2026-11-18: a tree archived on Windows carried CRLF .py / .md files to the host)
+bridge/ops/** text eol=lf

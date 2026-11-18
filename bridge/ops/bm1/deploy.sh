@@ -6,6 +6,15 @@
 #                              read-only runtime, tools/ from the tree's bridge/engine (libabp_turbo.so built in the
 #                              container: gcc -shared -fPIC -O2 ... -ldl, as the 4090 / mk_ws*.sh), instances/ its own
 #   deploy.sh tree <name> <tar>  unpack a git-archive tar (bridge/...) as trees/<name> (never over an existing one)
+#   [OPS_ACCEPT=f1,f2] deploy.sh ops <tree>   bm1's own scripts from trees/<tree>/bridge/ops/bm1 (2026-11-18, after a
+#                              wholesale copy nearly dropped the host's GPU 5 guard):
+#                              - every file written with LF line ends (a tree made on Windows can carry CRLF);
+#                              - a host file that differs from the copy this command deployed last time
+#                                (.ops_deployed/<file>; no record yet: from the new one) is a host edit not in the repo:
+#                                nothing is written, the files are listed, exit 3 -- unless named in OPS_ACCEPT;
+#                              - the new run.sh and train_guard.sh must call gpu_forbid (else exit 4, nothing written);
+#                              - afterwards every file compared with the tree's (line ends aside), and gpu_forbid
+#                                checked again in the deployed run.sh / train_guard.sh (exit 5 on a mismatch).
 set -eu
 BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 . $BM/common.sh
@@ -30,6 +39,46 @@ case $1 in
     fi
     mv -f $A/tools/libabp_turbo.so.new $A/tools/libabp_turbo.so
     ls -la $A/tools
+    ;;
+  ops)
+    O=$BM/trees/$2/bridge/ops/bm1; K=$BM/.ops_deployed
+    [ -d $O ] || { echo "deploy.sh ops: no $O" >&2; exit 2; }
+    tmp=$(mktemp -d); bad=""; n=0
+    lf() { tr -d '' < "$1"; }
+    for f in $(cd $O && find . -type f | sed 's#^\./##' | sort); do
+      n=$((n+1))
+      [ -e "$BM/$f" ] || continue
+      if [ -e "$K/$f" ]; then base="$K/$f"; else base="$O/$f"; fi
+      lf "$BM/$f" > $tmp/host; lf "$base" > $tmp/base
+      if ! cmp -s $tmp/host $tmp/base; then
+        case ",${OPS_ACCEPT:-}," in *",$f,"*) ;; *) bad="$bad $f" ;; esac
+      fi
+    done
+    if [ -n "$bad" ]; then
+      echo "deploy.sh ops: host edits not in the repo (the host copy differs from the one last deployed) -- nothing written:" >&2
+      for f in $bad; do echo "  $f" >&2; done
+      echo "  (commit them to the repo, or name them in OPS_ACCEPT=f1,f2 to overwrite)" >&2
+      rm -rf $tmp; exit 3
+    fi
+    for f in run.sh train_guard.sh; do
+      grep -q '^ *gpu_forbid ' $O/$f || { echo "deploy.sh ops: $O/$f does not call gpu_forbid -- nothing written" >&2; rm -rf $tmp; exit 4; }
+    done
+    for f in $(cd $O && find . -type f | sed 's#^\./##' | sort); do
+      mkdir -p "$(dirname "$BM/$f")" "$(dirname "$K/$f")"
+      lf "$O/$f" > "$BM/$f.new"
+      if [ -e "$BM/$f" ]; then chmod --reference="$BM/$f" "$BM/$f.new"; else case $f in *.sh) chmod +x "$BM/$f.new" ;; esac; fi
+      mv "$BM/$f.new" "$BM/$f"
+      cp -p "$BM/$f" "$K/$f"
+    done
+    m=0
+    for f in $(cd $O && find . -type f | sed 's#^\./##'); do
+      lf "$O/$f" > $tmp/new; cmp -s $tmp/new "$BM/$f" || { m=$((m+1)); echo "deploy.sh ops: MISMATCH $f" >&2; }
+    done
+    rm -rf $tmp
+    for f in run.sh train_guard.sh; do grep -q '^ *gpu_forbid ' $BM/$f || { echo "deploy.sh ops: the deployed $f has no gpu_forbid" >&2; m=$((m+1)); }; done
+    echo "deploy.sh ops: $n files from trees/$2, $m mismatches"
+    log "deploy.sh ops $2: $n files, $m mismatches"
+    [ $m = 0 ] || exit 5
     ;;
   tree)
     D=$BM/trees/$2

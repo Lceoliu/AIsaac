@@ -26,7 +26,8 @@
 # After an attempt ends: rc 0 without STOP and a rank's game hours at HOURS -- the run's end: the guard ends (rc 0 short of
 # HOURS: cause early_end, resumed once, the second in a row stopped); else the cause from the ranks'
 # stdout and the guard's own checks --
-#   stop, no resume: the STOP file; a rank without the C++ actor driver ("B52 cpp actor driver: on" missing: cause
+#   stop, no resume: the STOP file; a VisibleV3Fatal in a rank's output (cause v3_fatal: a visible-v3 version / mode /
+#     frame error, 2026-11-18); a rank without the C++ actor driver ("B52 cpp actor driver: on" missing: cause
 #     driver_off, REQUIRE_DRIVER=0 to run without it); a CheckpointError or a compile during a checkpoint's recomputation; the ranks'
 #     hashes differing in consecutive checks; preflight failing (Xid / a GPU missing); free disk under DISK_MIN_GB;
 #     the same update failing MAX_RETRY times; an out-of-memory a second time while another tenant's process was on
@@ -47,7 +48,7 @@ BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 . $BM/common.sh
 NAME=$1; TREE=$2; shift 2
 K=$#
-RD=/root/AIsaac/train/${RUN_PARENT:+$RUN_PARENT/}$NAME; RDC=/bench/train/${RUN_PARENT:+$RUN_PARENT/}$NAME
+RD=${BM1_TRAIN:-/root/AIsaac/train}/${RUN_PARENT:+$RUN_PARENT/}$NAME; RDC=${BM1_TRAIN_IN:-/bench/train}/${RUN_PARENT:+$RUN_PARENT/}$NAME   # (bm1.env: BM1_TRAIN / BM1_TRAIN_IN; gpu57 defaults)
 mkdir -p $RD
 GL=$RD/guard.log
 glog() { echo "$(date '+%F %T') $*" >> $GL; log "train $NAME: $*"; }
@@ -65,6 +66,7 @@ CPUS=${CPUS%|}; LCPUS=${LCPUS%|}; DCPUS=${DCPUS%|}
 LANESUM=$MEMG; MEMG=${MEM_GB:-128}
 NB=$(lane $1 LANE_NAME); PB=$(lane $1 LANE_PORT)
 CTR="$BM1_NAME-train-$NAME"
+gpu_forbid "$G" "train $NAME"   # (dgene: GPU 5 never)
 [ "${NOLOCK:-0}" = 1 ] || take_excl "training $NAME ($TREE, K $K, GPU $G) 计时运行"   # (NOLOCK=1: the caller holds X, ab1_pair.sh)
 # (2026-11-14, ab1: K=1 has no shard_sync -- ISAAC_SHARD_WORLD 1 reads no stop file -- so a stop SIGINTs the trainer too;
 #  it saves last.pt and ends, as the stall path's SIGINT). Only the trainer's own process (^$BM1_PY): "train_tok.py" alone
@@ -83,12 +85,12 @@ glog "guard start: tree $TREE K $K GPUs $G CPUs $CPUS learner $LCPUS driver $DCP
 ( while [ ! -f $RD/.guard_end ]; do
     ours=$(docker top $CTR -eo pid 2>/dev/null | tail -n +2 | tr '\n' ' ')
     for g in $(echo $G | tr ',' ' '); do
-      for p in $(nvidia-smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
+      for p in $(smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null); do
         case " $ours " in *" $p "*) ;; *) echo "$(date '+%F %T') GPU $g: pid $p ($(ps -o comm= -p $p 2>/dev/null)) not ours" >> $RD/foreign_gpu.log ;; esac
       done
     done
     # (disk: under DISK_WARN_GB a warning every hour -- the trash's size with it; it is on the same disk)
-    fg_=$(df -BG --output=avail /root/AIsaac | tail -1 | tr -dc 0-9)
+    fg_=$(df -BG --output=avail ${BM1_DISK:-/root/AIsaac} | tail -1 | tr -dc 0-9)
     if [ "$fg_" -lt "${DISK_WARN_GB:-100}" ] && [ $(( $(date +%s) - ${warned_:-0} )) -ge 3600 ]; then
       warned_=$(date +%s)
       glog "WARNING free disk ${fg_} GB < ${DISK_WARN_GB:-100} GB (trash $(du -sh ${BM1_TRASH:-/root/AIsaac/trash} 2>/dev/null | cut -f1); stop at ${DISK_MIN_GB:-50} GB)"
@@ -226,7 +228,7 @@ while :; do
   [ -f $RD/guard.env ] && . $RD/guard.env   # (overrides read before every attempt: DISK_MIN_GB, MAX_RETRY, BACKOFF, ...)
   [ -f $RD/STOP ] && { glog "STOP before an attempt: the guard ends"; break; }
   ( preflight "train $NAME" ) || { glog "preflight failed (Xid or a GPU missing: $(cat $BM/STOP_QUEUE 2>/dev/null)): stopped, no resume"; break; }
-  free_gb=$(df -BG --output=avail /root/AIsaac | tail -1 | tr -dc 0-9)
+  free_gb=$(df -BG --output=avail ${BM1_DISK:-/root/AIsaac} | tail -1 | tr -dc 0-9)
   [ "$free_gb" -lt "${DISK_MIN_GB:-50}" ] && { glog "free disk ${free_gb} GB < ${DISK_MIN_GB:-50}: stopped, no resume"; break; }
   ck=$(newest_ckpt)
   if [ "${NO_RESUME:-0}" = 1 ] && { [ -n "$ck" ] || [ -n "${tried_:-}" ]; }; then
@@ -257,7 +259,7 @@ while :; do
   fi
   DE="$DE -e ISAAC_BLOCK_COLLECT_EVERY=${COLLECT_EVERY:-4}"   # (the page store collected every 4th hand-off)
   DE="$DE -e ISAAC_GAME_HOURS_TOTAL=${HOURS:-125} -e ISAAC_LEARN_CKPT_DET=1 -e ISAAC_CKPT_KEEP=${CKPT_KEEP:-5} -e ISAAC_CKPT_MILESTONE=${CKPT_MILESTONE:-250}"
-  DE="$DE -e ISAAC_CKPT_TRASH=/bench/trash -e ISAAC_CKPT_ROTATE=${CKPT_ROTATE:-trash} -e ISAAC_EPISODES_ROTATE_MB=${EPISODES_MB:-256} ${ENVS:-}"
+  DE="$DE -e ISAAC_CKPT_TRASH=${BM1_TRASH_IN:-/bench/trash} -e ISAAC_CKPT_ROTATE=${CKPT_ROTATE:-trash} -e ISAAC_EPISODES_ROTATE_MB=${EPISODES_MB:-256} ${ENVS:-}"
   CPUSET="${CS:-${BM1_TIMED_CPUSET:-$BM1_CPUSET}}" MEMS="" MEM="${MEMG}g" PIDS=$((${BM1_PIDS:-4096} * K)) GPUS_OK="$G" \
     DOCK_ENV="$DE" $BM/run.sh train-$NAME $G sh $BM1_IN/shardk_in.sh $NAME 315360000 ${HOURS:-125} "$(echo $PAIRS)" "$CPUS" "$LCPUS" "$DCPUS" >> $RD/launcher.log 2>&1
   rc=$?
@@ -301,6 +303,7 @@ while :; do
   [ -f $RD/.attempt_start ] && mv $RD/.attempt_start $RD/.attempt_start.prev
   echo "$outs" | grep -q "CheckpointError\|compiled during the backward recomputation" && cause=checkpoint
   echo "$outs" | grep -q "state hashes of the ranks differed" && cause=hash
+  echo "$outs" | grep -q "VisibleV3Fatal" && cause=v3_fatal   # (2026-11-18: a visible-v3 protocol error, not a game fault)
   echo "$outs" | grep -q "out of memory" && cause=oom
   case "$cgk" in [1-9]*) cause=cgroup_oom ;; esac   # (the kernel's OOM kill at the container's limit)
   [ $rc = 4 ] && cause=gpu_busy   # (run.sh: a GPU had another process at the start)
@@ -308,6 +311,7 @@ while :; do
   glog "attempt $attempt ended rc=$rc at update ${upd:-?}: cause $cause"
   case $cause in
     checkpoint|hash) glog "cause $cause: stopped, no resume (a person looks)"; break ;;
+    v3_fatal) glog "cause v3_fatal ($(echo "$outs" | grep -a -m1 'VisibleV3Fatal' | cut -c1-200)): a visible-v3 version / mode / frame error is a configuration or code fault, never retried: stopped, no resume (a person looks)"; break ;;
     oom) if [ -s $RD/foreign_gpu.log ] && [ $oom_foreign -ge 1 ]; then glog "out of memory again with other tenants on our GPUs: stopped"; break; fi
          [ -s $RD/foreign_gpu.log ] && oom_foreign=$((oom_foreign+1)) ;;
     stall) glog "no progress: $stall_"
