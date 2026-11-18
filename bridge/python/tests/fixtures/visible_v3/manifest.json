@@ -131,7 +131,7 @@
     3
    ],
    "bytes": 21848,
-   "sha256": "ffa14cf0a581c355cd2e7712b7eb8a83a7dce5110c099830ff81baea07d98793"
+   "sha256": "95d702607db419cb73092c22937ec2b9d15349fd5747d4d8800694cbadd70cea"
   },
   {
    "name": "shape-1x1",
@@ -245,7 +245,7 @@
     3
    ],
    "bytes": 21848,
-   "sha256": "ffa14cf0a581c355cd2e7712b7eb8a83a7dce5110c099830ff81baea07d98793"
+   "sha256": "95d702607db419cb73092c22937ec2b9d15349fd5747d4d8800694cbadd70cea"
   },
   {
    "name": "shape-LTL",
@@ -264,7 +264,7 @@
     3
    ],
    "bytes": 15192,
-   "sha256": "e5e8b8d6089f531a51995a21f062b6995c9b579339d5b342945f954235d4fb3d"
+   "sha256": "ffa4633a560e2bfc35e2786004914da6e911d40dfda086ad8e5411824fef3371"
   },
   {
    "name": "shape-IH",
@@ -283,7 +283,7 @@
     3
    ],
    "bytes": 12888,
-   "sha256": "a759d00f30659f28545d548e59ed75530b95e45272401618fc960fc9e8d4b6ab"
+   "sha256": "bf6b67e5bde6a101db15b535536f84d70ff2cc7312e050c1972c471f6a02e5c7"
   },
   {
    "name": "shape-IV",
@@ -302,7 +302,7 @@
     3
    ],
    "bytes": 14424,
-   "sha256": "acd27f6d58316e32f6a028689947f45ac712f5b6cfe11590f670f827b4261ab6"
+   "sha256": "66c0b54bce2c37520eb8bb26a66207ac2a89578c2792069baa7c805876f8424a"
   },
   {
    "name": "shape-LBL",
@@ -372,5 +372,5 @@
   "devilprice": "goto s.devil.0: room type 14, prices -1,-2",
   "offgrid": "228.10 at 500.00,367.00 after 0 more frames"
  },
- "seconds": 6.7
+ "seconds": 7.4
 }
