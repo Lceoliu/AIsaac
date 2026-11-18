@@ -2210,8 +2210,9 @@ local function v3_entities(room, curses)
 				rec.flags_known = 4 | 1
 			elseif t == TYPE_BOMB then
 				kind = 4
-				rec.tear = v3_words(v3_try(function() return e:ToBomb().Flags end, 0), 4)
-				rec.flags_known = 4 | 1
+				-- (2026-11-18, Codex round 2: the tear flags known only when read; as abp_v3_native.c)
+				local ok, f = pcall(function() return e:ToBomb().Flags end)
+				if ok and f ~= nil then rec.tear, rec.flags_known = v3_words(f, 4), 4 | 1 end
 			elseif t == 5 then
 				kind = 5
 				local pk = e:ToPickup()
@@ -2219,8 +2220,8 @@ local function v3_entities(room, curses)
 				if (curses & 64) ~= 0 and e.Variant == 100 then rec.subtype, rec.identity_known = 0, 0 end
 			elseif t == 8 then
 				kind = 7
-				rec.tear = v3_words(v3_try(function() return e:ToKnife().TearFlags end, 0), 4)
-				rec.flags_known = 4 | 1
+				local ok, f = pcall(function() return e:ToKnife().TearFlags end)   -- (as bombs)
+				if ok and f ~= nil then rec.tear, rec.flags_known = v3_words(f, 4), 4 | 1 end
 			elseif t == 3 then
 				kind = 8
 			elseif t == 1000 then

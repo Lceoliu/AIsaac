@@ -464,17 +464,22 @@ static const char *v3_entity_row(const v3_room *r, const void *e, uint32_t curse
         flags_known = 4 | 2;
     } else if (t == 4) {
         const void *x = obs_dyncast(e, ti_entity, ti_bomb, -1);
-        if (x) tear = ((uint64_t (*)(const void *))V3FN(V3_BOMB_FLAGS))(x);   // (Lua: pcall, 0 without a bomb)
-        flags_known = 4 | 1;
+        // (2026-11-18, Codex round 2: the tear flags known only when read, as the Lua side's pcall: 0 and unknown
+        // without a bomb)
+        if (x) { tear = ((uint64_t (*)(const void *))V3FN(V3_BOMB_FLAGS))(x); flags_known = 4 | 1; }
     } else if (t == 7) {
         uint32_t seed = v3_seed(e);
         const unsigned char *rec = NULL;
+        int found = 0;
         for (size_t at = 0; at + V3_LASER_REC <= v3_lasers_len; at += V3_LASER_REC) {
             uint32_t s_;
             memcpy(&s_, v3_lasers + at, 4);
-            if (s_ == seed) rec = v3_lasers + at;
+            if (s_ == seed) { rec = v3_lasers + at; found++; }
         }
         if (!rec) return "v3: a laser not in the bridge's list";
+        // (2026-11-18, Codex round 2: two lasers of one InitSeed cannot be told apart in the bridge's list -- the
+        // Lua side reads each laser itself: handed back, the reason counted)
+        if (found > 1) return "v3: two lasers with one InitSeed";
         double radius, angle, length, ex, ey;
         int64_t tf;
         memcpy(&radius, rec + 5, 8); memcpy(&angle, rec + 13, 8); memcpy(&length, rec + 21, 8);
@@ -497,8 +502,7 @@ static const char *v3_entity_row(const v3_room *r, const void *e, uint32_t curse
         if ((curses & 64) != 0 && variant == 100) { subtype = 0; identity_known = 0; }   // Curse of the Blind
     } else if (t == 8) {
         const void *x = obs_dyncast(e, ti_entity, ti_knife, -1);
-        if (x) tear = ((uint64_t (*)(const void *))V3FN(V3_KNIFE_FLAGS))(x);
-        flags_known = 4 | 1;
+        if (x) { tear = ((uint64_t (*)(const void *))V3FN(V3_KNIFE_FLAGS))(x); flags_known = 4 | 1; }   // (as bombs)
     } else if (kind == 6) {
         int f = v3_npc_flags(e);
         E[ABP_V3_E_NPC_FLAGS] = (float)f;
