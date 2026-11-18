@@ -12,8 +12,9 @@ Two parts:
            the pocket (pill 1, the 6-number line; a pill and a card given at the start and again every 30 decisions,
            an active item with its charge at the start), a ChangeRoom into the floor's next room every 25 decisions.
            Writes <out>/payloads.bin + rows.bin (back to back) and index.jsonl (per step: offsets, lengths, sha256s).
-  compare  on the host: python3 cross_tree_exact.py compare <out A> <out B>  (pure Python: every payload, every ROW,
-           every digest; the first differences)
+  compare  python3 cross_tree_exact.py compare <out A> <out B> (every payload, every ROW, every digest; the first
+           differences; numpy for the item / pill step counts), or by the CPU runner:
+           PROBE=<this file> cpurun.sh <tree> <name> --compare <out A> <out B>
 """
 import hashlib
 import json
@@ -181,4 +182,7 @@ def compare(a, b):
 if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'compare':
         sys.exit(compare(sys.argv[2], sys.argv[3]))
+    if '--compare' in sys.argv:   # (by the CPU runner, where numpy is: the item / pill step counts need the sequence)
+        i = sys.argv.index('--compare')
+        sys.exit(compare(sys.argv[i + 1], sys.argv[i + 2]))
     record(sys.argv[1:])
