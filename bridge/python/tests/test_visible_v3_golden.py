@@ -102,3 +102,26 @@ def test_stall_columns_in_run_mode_too():
     assert not EpisodeState(100).floor
     src = (Path(VP.__file__).parent / 'tok_obs.py').read_text(encoding='utf-8')
     assert 'known = st.floor and st.stall > 0' in src and 'v3_backfill_stall(row' in src
+
+
+def test_a_handed_back_record_reads_like_a_native_one():
+    """A record the native side handed back (a cancelled lethal hit: only the raw block, flag 32) goes through the
+    reference encoder in the worker (visible_producer.write_v3, as encode_row calls it): the same frame format as a
+    native frame, read by the same decoder, with the stall columns backfilled the same way."""
+    from types import SimpleNamespace
+    from isaac_bridge.tok_obs import ROW
+    blob = json.loads((FIX / 'forgotten.raw.json').read_text())
+    native = VP.observation_frame_v3(blob['raw'])                       # (what the native side sends: stall 0)
+    rows = []
+    for o in (SimpleNamespace(visible=blob['raw'], visible_v3_frame=None),
+              SimpleNamespace(visible=None, visible_v3_frame=native)):
+        row = np.zeros(1, ROW)
+        assert VP.write_v3(row, o)
+        VP.v3_backfill_stall(row, 0.5, 1.0)
+        rows.append(bytes(row['visible_frame'][0, :int(row['visible_bytes'][0])]))
+        assert int(row['visible_schema'][0]) == V3.VERSION
+    assert rows[0] == rows[1]
+    f = VP.unpack_frame_v3(rows[0])
+    assert list(f['P'][:, V3.col(V3.P_COLS, 'stall_share')]) == [0.5, 0.5]
+    assert not VP.write_v3(np.zeros(1, ROW), SimpleNamespace(visible={'schema': 'isaac-visible-prlmens-g-v2'},
+                                                             visible_v3_frame=None))
