@@ -142,3 +142,15 @@ def test_the_c_row_path_hands_a_v3_frame_back():
     src = (PY.parent / 'engine' / 'abp_turbo.c').read_text(encoding='utf-8')
     at = src.index('int abp_row_encode(const unsigned char *pl')
     assert 'if (flags & 64) return -9;' in src[at:at + 600]
+
+
+# ------------------------------------------------------------------ item 4: a short grid
+def test_a_short_grid_is_refused():
+    raw = json.loads(json.dumps(RAW))
+    n = int(raw['gw']) * int(raw['gh'])
+    assert len(raw['cells']) >= n
+    raw['cells'] = raw['cells'][:n - 1]
+    with pytest.raises(ValueError, match=f'grid size: {n - 1} cells'):
+        VP.observation_frame_v3(raw)
+    raw['cells'] = RAW['cells'][:n]
+    VP.observation_frame_v3(raw)

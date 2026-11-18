@@ -251,6 +251,9 @@ def observation_frame_v3(raw, stall_share=0.0, stall_known=0, producer=V3.PRODUC
     unknown = bool(curses & 8)
     # room canvas
     canvas = np.zeros((V3.CANVAS_H, V3.CANVAS_W, V3.ROOM_WORDS), '<f4')
+    if len(raw['cells']) < gw * gh:   # (2026-11-18, Codex round 2: as abp_v3_native.c's 'v3: grid size'; before, the
+        #                               missing cells were written 0)
+        raise ValueError(f"visible-v3: grid size: {len(raw['cells'])} cells for a {gw} x {gh} grid")
     w0 = [dict() for _ in range(gw * gh)]
     w1 = [dict() for _ in range(gw * gh)]
     raws = [(0, 0, 0)] * (gw * gh)
