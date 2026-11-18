@@ -74,34 +74,37 @@ def test_the_old_arm_clears_the_trigger_switch():
 
 
 def test_close_stress_verdict_needs_coverage():
-    """tools/v3_close_stress.verdict (2026-11-18, Codex round 5): coverage and outcome apart. Codex's case -- 30 rounds
-    without a record, no kill landing in a query -- does not pass; nor does a worker not ended (exit code None); a
-    covered run with no 86 / fatal passes; one exit 86 fails it."""
+    """tools/v3_close_stress.verdict (Codex rounds 5 / 9): coverage and outcome apart. A kill counts only when it ended
+    the traced operation in an error and its worker gave records afterwards -- ten 'interrupted' operations that all
+    ended 'ok' (a kill that missed the I/O) are no coverage; nor kills without recovery; death-teaching coverage is the
+    line's own events; in mode 0 a mode query sent fails; an exit 86 / a worker not ended fails."""
     import importlib.util
     spec = importlib.util.spec_from_file_location('close_stress', PY / 'tools' / 'v3_close_stress.py')
     cs = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cs)
 
-    def row(k, kind, records=0, interrupted=(), killed=None, codes=(0, 0, 0, 0), episodes=0, hurts=0):
-        return dict(round=k, kind=kind, records=records, interrupted=list(interrupted), killed=killed,
-                    episodes=episodes, hurts=hurts,
-                    exit_codes=list(codes), fatal_during=None, fatal_on_close=None, fatal_files=[], site_errors=[])
-    kinds = ('play', 'query-kill', 'early')
-    empty = [row(k, kinds[k % 3]) for k in range(30)]
-    v = cs.verdict(empty)
-    assert not v['ok'] and not v['covered'] and v['clean']
-    good = [row(k, kinds[k % 3], records=50 if k % 3 == 0 else 0,
-                interrupted=[dict(tag='1-1', outcome='BridgeError')] if k % 3 == 1 else (),
-                killed=1 if k % 3 == 1 else None, episodes=3 if k % 3 == 0 else 0, hurts=2 if k % 3 == 0 else 0)
-            for k in range(30)]
+    def row(k, kind, records=0, hit=None, codes=(0, 0, 0, 0), death=0, sent=0):
+        return dict(round=k, kind=kind, records=records, hit=hit, exit_codes=list(codes), fatal_during=None,
+                    fatal_on_close=None, fatal_files=[], site_errors=[], death_events=death, queries_sent=sent)
+    kinds = ('play', 'reset-kill', 'early')
+    broke = dict(pid=1, index=0, t=1.0, killed=1, interrupted=[dict(tag='r-1-1', outcome='BridgeError')], failed=True,
+                 recovered=True)
+    good = [row(k, kinds[k % 3], records=50 if k % 3 == 0 else 0, hit=broke if k % 3 == 1 else None,
+                death=1 if k % 3 == 0 else 0) for k in range(30)]
     v = cs.verdict(good)
-    assert v['ok'] and v['coverage'] == dict(play_with_records=10, query_killed=10, early=10, episodes_with_hurts=10)
-    assert not cs.verdict([dict(r, episodes=0) for r in good])['covered']   # (no episode ended: the path not run)
-    assert v['interrupted_query_outcomes'] == {'BridgeError': 10}
+    assert v['ok'], v
+    assert v['coverage'] == dict(play_with_records=10, kills_that_broke_and_recovered=10, early=10,
+                                 death_teaching_events=10)
+    missed = dict(broke, interrupted=[dict(tag='r-1-1', outcome='ok')], failed=False)   # (Codex's case)
+    assert not cs.verdict([dict(r, hit=missed) if r['hit'] else r for r in good])['covered']
+    stuck = dict(broke, recovered=False)
+    assert not cs.verdict([dict(r, hit=stuck) if r['hit'] else r for r in good])['covered']
+    assert not cs.verdict([dict(r, death_events=0) for r in good])['covered']
+    assert not cs.verdict(good[:-1] + [row(29, 'early', sent=1)])['ok']             # (mode 0: a query sent)
+    assert cs.verdict([dict(r, kind='query-kill') if r['kind'] == 'reset-kill' else r for r in good] [:-1]
+                      + [row(29, 'early', sent=1)], v3=1)['ok']                        # (v3: queries are sent)
     assert not cs.verdict(good[:-1] + [row(29, 'early', codes=(0, None, 0, 0))])['ok']
     assert not cs.verdict(good[:-1] + [row(29, 'early', codes=(0, 86, 0, 0))])['ok']
-    no_kill = [dict(r, killed=0) if r['kind'] == 'query-kill' else r for r in good]
-    assert not cs.verdict(no_kill)['covered']
 
 
 def test_golden_v3_diff_checks_hashes_and_empty_manifests(tmp_path):
