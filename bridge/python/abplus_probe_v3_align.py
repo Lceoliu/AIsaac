@@ -13,7 +13,7 @@ plus the formula cell floor((pos - O) / 40) of each (None when outside the grid:
 Rooms: per seed (stage 1 + k mod --stages), every room of the floor whose shape still needs frames is entered
 (ChangeRoom) in a fresh lean clone and stepped --per-room decisions (4 frames each): the player walks holding a
 direction 10 decisions at a time (into the walls), shoots, now and then bombs; at decision --door-at it is put one cell
-inside a door slot of the room, that door opened (Open(): a room with monsters keeps them shut), and walks into the
+inside a door slot of the room (again every 4 decisions, the next slot), that door opened (Open(): a room with monsters keeps them shut), and walks into the
 door frame (through it the next room: the frames count for the shape they show). A record without a native frame (the bridge's fallback, e.g. after a lethal hit) ends
 the room.
 
@@ -213,7 +213,7 @@ def main():
     ap.add_argument('--stages', type=int, default=8)
     ap.add_argument('--per-shape', type=int, default=220)
     ap.add_argument('--per-room', type=int, default=50)
-    ap.add_argument('--door-at', type=int, default=38)
+    ap.add_argument('--door-at', type=int, default=30)
     ap.add_argument('--port', type=int, default=44580)
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
@@ -306,7 +306,8 @@ def main():
                             where[sh]['enemies'] += any(10 <= e['type'] < 1000 for e in ents)
                             where[sh]['door_walk'] += door_walk
                         types[str(eng['room_type'])] = types.get(str(eng['room_type']), 0) + 1
-                        if t == args.door_at:   # put inside a door of the room, then walk into its frame
+                        if t >= args.door_at and (t - args.door_at) % 4 == 0:   # every 4 decisions from door_at:
+                            # put inside a door of the room shown (the next slot each time), then walk into its frame
                             for slot in sorted(range(8), key=lambda s: (s * 5 + seed + t) % 8):
                                 if c.lua(DOOR_START % slot) == 'ok':
                                     door_walk, into = True, INTO[slot]
