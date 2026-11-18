@@ -486,3 +486,52 @@ def test_padded_body_rows_are_pad():
         k = len(f['P_num'])
         assert b['local_pad'][i, k:].all() and np.array_equal(b['local_pad'][i, :k], f['local_pad'])
     assert b['nonfinite'].shape == (3, len(VI.SECTIONS))
+
+
+# ------------------------------------------------------------------------------------- the batched device decode
+def _frames_matrix(bufs):
+    W = max(len(b) for b in bufs) // 4 + 7   # (trailing floats past every frame: never read)
+    F = np.full((len(bufs), W), np.nan, np.float32)
+    for i, b in enumerate(bufs):
+        F[i, :len(b) // 4] = np.frombuffer(b, '<f4')
+    return F
+
+
+def test_batched_device_decode_equals_pad_batch_of_host_decodes():
+    import torch
+    bufs = [payload(n) for n in NAMES]
+    odd = _frame('devilprice')   # (the category / non-finite edge frame of the tests above, built again)
+    p, e = int(odd[V3.H_P]), int(odd[V3.H_E])
+    eat = V3.FIXED + p * V3.BODY
+    for r in range(e):
+        for c in VI.PLAN['E']['cat'] + VI.PLAN['E']['idn'] + VI.PLAN['E']['anim']:
+            odd[eat + r * V3.EF + c] = [np.float32(2.0 ** 63), np.inf, np.nan, -np.inf][(r + c) % 4]
+    odd[eat + EC('vx')] = np.nan
+    bufs.append(odd.tobytes())
+    F = _frames_matrix(bufs)
+    counts, trunc = VI.check_batch(F[:, :8], [V3.VERSION] * len(bufs), [len(b) for b in bufs], VI.P_MAX, 64, 32)
+    assert trunc == dict(n=0, s=0)
+    host = VI.pad_batch([VI.decode_frame(b, V3.VERSION) for b in bufs], e_bucket=64, n_max=64, s_max=32)
+    for dev in _devices():
+        got = VI.decode_frames_device(torch.from_numpy(F).to(dev), counts, 64, 64, 32)
+        assert set(got) == set(host)
+        for k in host:
+            a = torch.as_tensor(host[k])
+            assert got[k].dtype == a.dtype and got[k].shape == a.shape, k
+            assert torch.equal(got[k].cpu(), a), (dev, k)
+
+
+def test_check_batch_refuses_and_counts():
+    bufs = [payload(n) for n in NAMES[:4]]
+    F = _frames_matrix(bufs)
+    sizes = [len(b) for b in bufs]
+    with pytest.raises(VisibleV3Fatal, match='visible_schema'):
+        VI.check_batch(F[:, :8], [V3.VERSION, V3.VERSION - 1, V3.VERSION, V3.VERSION], sizes)
+    with pytest.raises(VisibleV3Fatal):
+        VI.check_batch(F[:, :8], [V3.VERSION] * 4, [s + 4 for s in sizes])   # (the record's length off the header)
+    g = F.copy()
+    g[2, V3.H_P] = 1.5
+    with pytest.raises(VisibleV3Fatal):
+        VI.check_batch(g[:, :8], [V3.VERSION] * 4, sizes)
+    counts, trunc = VI.check_batch(F[:, :8], [V3.VERSION] * 4, sizes, VI.P_MAX, 0 + 1, 2)
+    assert trunc['n'] == int((counts[:, 2] > 1).sum()) and trunc['s'] == int((counts[:, 3] > 2).sum())

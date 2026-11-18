@@ -649,3 +649,133 @@ def pad_batch(frames, e_bucket=None, n_max=None, s_max=None):
         lens = np.asarray([len(f[g + '_num']) for f in frames])
         out[g + '_mask'] = np.arange(sizes[g])[None, :] < lens[:, None]
     return out
+
+
+# ----------------------------------------------------------------------------------------------- batches on the device
+# (seq-v1 steps 3-4) The whole padded batch decoded on the device from the frames' floats -- the learner's batches and
+# the actor's graphs. The headers are checked on the host first (check_batch: the same strict check per record, from
+# the 8 header words and the record's byte count); the device then gathers each record's rows at its own offsets and
+# decodes them with the t_* rules above. decode_frames_device(...) equals pad_batch([decode_frame(...) ...]) with the
+# same e_bucket / n_max / s_max value for value (tests/test_v3_input.py).
+def check_batch(headers, versions, sizes, p_max=None, n_max=None, s_max=None):
+    """Host check of a batch: headers [B, >= 8] float32 (each record's first 8 words), versions [B] (visible_schema),
+    sizes [B] (visible_bytes). Every record must pass split_frame's checks (VisibleV3Fatal otherwise). Returns
+    (counts [B, 4] int64 p, e, n, s, truncated: dict(n=records with more inventory rows than n_max, s=... slots))."""
+    headers = np.asarray(headers, np.float32)
+    versions, sizes = np.asarray(versions), np.asarray(sizes)
+    counts = np.zeros((len(headers), 4), np.int64)
+    for i in range(len(headers)):
+        vs = versions[i]
+        if not np.isfinite(float(vs)) or float(vs) != V3.VERSION:
+            _refuse(f'visible_schema {vs} is not schema_v3.VERSION {V3.VERSION} (record {i})')
+        n = int(sizes[i])
+        if n % 4 or n < V3.HEADER * 4:
+            _refuse(f'{n} bytes is not a whole frame of floats (record {i})')
+        f = np.zeros(n // 4, np.float32)
+        f[:V3.HEADER] = headers[i, :V3.HEADER]
+        f[1] = headers[i, 1]
+        counts[i] = check_frame_header_v3(f, exact=True)
+    if p_max is not None and (counts[:, 0] > p_max).any():
+        _refuse(f'{int(counts[:, 0].max())} bodies, the padded layout holds {p_max}')
+    trunc = dict(n=int((counts[:, 2] > n_max).sum()) if n_max else 0, s=int((counts[:, 3] > s_max).sum()) if s_max else 0)
+    return counts, trunc
+
+
+def _t_rows(F, base, stride, m, width, count):
+    """[B, m, width] rows gathered from frame floats F [B, W] at base + i * stride (i < count; others 0) and the
+    validity mask [B, m]."""
+    torch = _t()
+    dev = F.device
+    i = torch.arange(m, device=dev)
+    valid = i[None, :] < count[:, None]
+    idx = base[:, None, None] + i[None, :, None] * stride + torch.arange(width, device=dev)[None, None, :]
+    idx = torch.where(valid[..., None], idx, torch.zeros_like(idx)).clamp_(0, F.shape[1] - 1)
+    rows = F.gather(1, idx.view(F.shape[0], -1)).view(F.shape[0], m, width)
+    return torch.where(valid[..., None], rows, torch.zeros_like(rows)), valid
+
+
+def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None):
+    """frames: float32 [B, W] on the device (each record's frame floats from its start; W >= every frame); counts [B, 4]
+    from check_batch. Returns the pad_batch dict (tensors on frames' device)."""
+    torch = _t()
+    p_max = p_max or P_MAX
+    F = frames.to(torch.float32)
+    B, dev = F.shape[0], F.device
+    c = torch.as_tensor(np.asarray(counts), device=dev, dtype=torch.int64)
+    p, e = c[:, 0], torch.clamp(c[:, 1], max=e_bucket)
+    n, s = torch.clamp(c[:, 2], max=n_max), torch.clamp(c[:, 3], max=s_max)
+    if int(c[:, 1].max()) > e_bucket:
+        raise ValueError(f'v3_input: {int(c[:, 1].max())} entities, the bucket {e_bucket}')
+    fixed = torch.full((B,), V3.FIXED, dtype=torch.int64, device=dev)
+    P, pv = _t_rows(F, fixed, V3.PF, p_max, V3.PF, p)
+    Lr, _ = _t_rows(F, fixed + p * V3.PF, V3.LOCAL, p_max, V3.LOCAL, p)
+    eat = fixed + p * V3.BODY
+    E, ev = _t_rows(F, eat, V3.EF, e_bucket, V3.EF, e)
+    nat = eat + c[:, 1] * V3.EF
+    N, nv = _t_rows(F, nat, V3.NF, n_max, V3.NF, n)
+    S, sv = _t_rows(F, nat + c[:, 2] * V3.NF, V3.SF, s_max, V3.SF, s)
+    H, CW = V3.HEADER, V3.CANVAS_H * V3.CANVAS_W * V3.ROOM_WORDS
+    canvas = F[:, H:H + CW].reshape(B, V3.CANVAS_H, V3.CANVAS_W, V3.ROOM_WORDS)
+    mm = F[:, H + CW:H + CW + V3.MAP_SIDE * V3.MAP_SIDE]
+    flat = lambda x: x.reshape(-1, x.shape[-1])   # noqa: E731
+
+    def back(x, m):
+        return x.reshape(B, m, *x.shape[1:])
+
+    def keep(x, valid, fill=0):
+        v = valid.view(*valid.shape, *([1] * (x.dim() - valid.dim())))
+        return torch.where(v, x, torch.full_like(x, fill))
+    nf = lambda x, valid: (~torch.isfinite(x) & valid.view(*valid.shape, *([1] * (x.dim() - valid.dim())))).flatten(1).sum(1)  # noqa: E731,E501
+    L5 = Lr.view(B, p_max, V3.LOCAL_SIDE, V3.LOCAL_SIDE, V3.ROOM_WORDS)
+    out = {'nonfinite': torch.stack([nf(P, pv), nf(E, ev), nf(N, nv), nf(S, sv),
+                                     (~torch.isfinite(canvas)).flatten(1).sum(1) + (~torch.isfinite(mm)).sum(1)
+                                     + nf(L5, pv)], 1).to(torch.int64)}
+    main = P[:, 0, [_PC['x'], _PC['y']]].to(torch.float64)
+    out['main_xy'] = main.to(torch.float32)
+    out['room'] = _t_room(canvas)
+    centres = torch.as_tensor(_ROOM_CENTRES, device=dev)
+    out['room_xy'] = _t_div(centres, POS_SCALE).to(torch.float32)[None].expand(B, -1, -1).contiguous()
+    out['room_rel'] = _t_rel(centres[None], main[:, None])
+    mb = _t_bits(mm, V3.MAP_BITS)
+    out['map_bits'], out['map_icon'] = mb[..., :4], t_map_icon_index(mb[..., 4])
+    fp = flat(P)
+    out['P_num'], out['P_flag'] = back(_t_num(fp, PLAN['P']), p_max), back(_t_flags(fp, PLAN['P']), p_max)
+    out['P_cat'] = back(_t_cats(fp, PLAN['P']), p_max)
+    known = (P[..., _PC['position_known']] == 1) & pv
+    xy = P[..., [_PC['x'], _PC['y']]].to(torch.float64)
+    g = torch.nan_to_num(P[:, 0, [_PC['grid_w'], _PC['grid_h']]].to(torch.float64), nan=1.0)
+    gw = torch.trunc(torch.clamp(g[:, 0], 1, V3.CANVAS_W))[:, None]
+    gh = torch.trunc(torch.clamp(g[:, 1], 1, V3.CANVAS_H))[:, None]
+    cxy = torch.floor(_t_div(xy, V3.CELL))
+    cell = torch.stack([torch.minimum(torch.clamp(cxy[..., 0], min=0), gw - 1),
+                        torch.minimum(torch.clamp(cxy[..., 1], min=0), gh - 1)], -1)
+    out['P_off'] = keep(_t_clamp(_t_div(xy - V3.CELL * cell - V3.CELL / 2, V3.CELL)), known)
+    out['P_rel'] = keep(_t_rel(xy, main[:, None]), known)
+    out['P_rel_valid'] = known.to(torch.float32)
+    out['local'] = keep(_t_room(L5), pv)
+    out['local_pad'] = ~known
+    fe = flat(E)
+    out['E_num'], out['E_flag'] = back(_t_num(fe, PLAN['E']), e_bucket), back(_t_flags(fe, PLAN['E']), e_bucket)
+    out['E_cat'] = back(_t_cats(fe, PLAN['E']), e_bucket)
+    out['E_id'] = back(_t_stack([t_identity_index(fe[:, c_]) for c_ in PLAN['E']['idn']], fe.shape[0], dev), e_bucket)
+    v, bad = _t_sane(E[..., PLAN['E']['anim']])
+    out['E_anim'] = torch.where(~bad & (v >= 0) & (v < V3.ANIM_ROWS), _t_trunc(v), torch.zeros_like(_t_trunc(v)))
+    pr = E[..., _EC['price']]
+    out['E_price'] = _t_clamp(torch.where(pr > 0, _t_div(pr, PRICE_COIN_SCALE), torch.zeros_like(pr)))[..., None]
+    out['E_rel'] = _t_rel(E[..., [_EC['x'], _EC['y']]], main[:, None])
+    lrel = _t_rel(E[..., [_EC['l_ex'], _EC['l_ey']]], main[:, None])
+    out['E_laser_rel'] = torch.where((E[..., _EC['kind']] == _LASER_KIND)[..., None], lrel, torch.zeros_like(lrel))
+    fn_ = flat(N)
+    out['N_num'], out['N_flag'] = back(_t_num(fn_, PLAN['N']), n_max), back(_t_flags(fn_, PLAN['N']), n_max)
+    out['N_item'] = back(_t_items(fn_, PLAN['N']), n_max)
+    fs = flat(S)
+    out['S_num'], out['S_flag'] = back(_t_num(fs, PLAN['S']), s_max), back(_t_flags(fs, PLAN['S']), s_max)
+    out['S_cat'] = back(_t_cats(fs, PLAN['S']), s_max)
+    out['S_item'] = back(_t_items(fs, PLAN['S'], family=fs[:, _SC_FAMILY]), s_max)
+    for k in list(out):
+        g_ = k.split('_')[0]
+        valid = {'P': pv, 'E': ev, 'N': nv, 'S': sv}.get(g_)
+        if valid is not None:
+            out[k] = keep(out[k], valid)
+    out['P_mask'], out['E_mask'], out['N_mask'], out['S_mask'] = pv, ev, nv, sv
+    return out
