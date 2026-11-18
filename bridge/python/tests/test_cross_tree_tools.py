@@ -82,8 +82,9 @@ def test_close_stress_verdict_needs_coverage():
     cs = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cs)
 
-    def row(k, kind, records=0, interrupted=(), killed=None, codes=(0, 0, 0, 0)):
+    def row(k, kind, records=0, interrupted=(), killed=None, codes=(0, 0, 0, 0), episodes=0, hurts=0):
         return dict(round=k, kind=kind, records=records, interrupted=list(interrupted), killed=killed,
+                    episodes=episodes, hurts=hurts,
                     exit_codes=list(codes), fatal_during=None, fatal_on_close=None, fatal_files=[], site_errors=[])
     kinds = ('play', 'query-kill', 'early')
     empty = [row(k, kinds[k % 3]) for k in range(30)]
@@ -91,9 +92,11 @@ def test_close_stress_verdict_needs_coverage():
     assert not v['ok'] and not v['covered'] and v['clean']
     good = [row(k, kinds[k % 3], records=50 if k % 3 == 0 else 0,
                 interrupted=[dict(tag='1-1', outcome='BridgeError')] if k % 3 == 1 else (),
-                killed=1 if k % 3 == 1 else None) for k in range(30)]
+                killed=1 if k % 3 == 1 else None, episodes=3 if k % 3 == 0 else 0, hurts=2 if k % 3 == 0 else 0)
+            for k in range(30)]
     v = cs.verdict(good)
-    assert v['ok'] and v['coverage'] == dict(play_with_records=10, query_killed=10, early=10)
+    assert v['ok'] and v['coverage'] == dict(play_with_records=10, query_killed=10, early=10, episodes_with_hurts=10)
+    assert not cs.verdict([dict(r, episodes=0) for r in good])['covered']   # (no episode ended: the path not run)
     assert v['interrupted_query_outcomes'] == {'BridgeError': 10}
     assert not cs.verdict(good[:-1] + [row(29, 'early', codes=(0, None, 0, 0))])['ok']
     assert not cs.verdict(good[:-1] + [row(29, 'early', codes=(0, 86, 0, 0))])['ok']

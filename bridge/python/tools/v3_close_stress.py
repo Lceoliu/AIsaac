@@ -19,6 +19,7 @@ interrupted a traced query and killed >= 1 game process of the round; >= 8 early
 
 usage (bridge python dir, PYTHONPATH=.; the CPU runner adds --groups-file / --out):
   python tools/v3_close_stress.py --groups-file ../abplus/catalog/scaling2_groups.json --out <dir> [--rounds 36]
+         [--floor-seconds 5] [--teacher 1]   (short floors: episodes end in a round; the training's teacher config)
 Writes <out>/rounds.jsonl and <out>/summary.json; prints SUMMARY; exit 0 on a pass, 1 otherwise.
 """
 import argparse
@@ -37,7 +38,7 @@ import numpy as np   # noqa: E402
 
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec   # noqa: E402
 from isaac_bridge import visible_producer as VP   # noqa: E402
-from isaac_bridge.tok_sampler import TokSampler, TokSamplerConfig   # noqa: E402
+from isaac_bridge.tok_sampler import ST, TokSampler, TokSamplerConfig   # noqa: E402
 
 SITE = '''
 import os, time
@@ -123,10 +124,15 @@ def one_round(k, kind, args, spec, out, site_dir):
     os.environ['V3_STRESS_TRACE'] = str(trace)
     os.environ['ISAAC_RL_FATAL_DIR'] = str(out / f'fatal-{k}')
     stub = str(Path(default_preload()).parent / 'stub_render_g.txt')
+    # (2026-11-18: floors short enough that episodes end within a round -- the floor worker's code after an episode
+    # with hurts is where A1's smokes met their exit 86 -- and the training's teacher: death teaching, its thread
+    # and its forked search children)
+    teach = dict(teacher=True, teacher_share=0.5, teacher_death_depths=(2, 4, 8), teacher_thread=True,
+                 teacher_fork=True) if args.teacher else {}
     cfg = TokSamplerConfig(workers=args.workers, specs=[spec], assign=[0] * args.workers, frames_per_decision=4,
-                           episodes_per_state=2, mode='floor', floor_seconds=60.0, name=f'cs{k % 4}',
+                           episodes_per_state=2, mode='floor', floor_seconds=args.floor_seconds, name=f'cs{k % 4}',
                            port=args.port + 40 * (k % 4), seed=1000 + 97 * k, bridge_lua=default_bridge_lua(),
-                           preload=default_preload(), stub_list=stub if Path(stub).is_file() else '', nice=0)
+                           preload=default_preload(), stub_list=stub if Path(stub).is_file() else '', nice=0, **teach)
     rng = np.random.default_rng(k)
     t0 = time.perf_counter()
     sampler = TokSampler(cfg)
@@ -168,6 +174,8 @@ def one_round(k, kind, args, spec, out, site_dir):
     else:
         play(early)
     t_close = time.perf_counter()
+    totals = sampler.stats.sum(axis=0)   # (before close: it lets the arrays go)
+    episodes, hurts = int(totals[ST['episodes']]), int(totals[ST['hurts']])
     raised = None
     try:
         sampler.close(timeout=60.0)
@@ -179,7 +187,8 @@ def one_round(k, kind, args, spec, out, site_dir):
                    if kill_t is not None and q[0] == kill_pid and q[1] <= kill_t and (q[2] is None or q[2] >= kill_t)]
     fatal_dir = out / f'fatal-{k}'
     files = sorted(p.name for p in fatal_dir.rglob('fatal-worker-*.txt')) if fatal_dir.is_dir() else []
-    return dict(round=k, kind=kind, records=records, t_records=None if t_records is None else round(t_records - t0, 1),
+    return dict(round=k, kind=kind, records=records, episodes=episodes, hurts=hurts,
+                t_records=None if t_records is None else round(t_records - t0, 1),
                 queries=len(qs), queries_open_at_end=sum(q[2] is None for q in qs.values()),
                 query_outcomes=sorted({q[3] for q in qs.values() if q[3]}), killed=killed, interrupted=interrupted,
                 site_errors=[p.name for p in trace.glob('site-error-*')],
@@ -197,7 +206,8 @@ def verdict(rows, minimum=8, rounds=30):
     cover = dict(
         play_with_records=sum(r['kind'] == 'play' and r['records'] > 0 for r in done),
         query_killed=sum(r['kind'] == 'query-kill' and bool(r['interrupted']) and (r['killed'] or 0) > 0 for r in done),
-        early=sum(r['kind'] == 'early' for r in done))
+        early=sum(r['kind'] == 'early' for r in done),
+        episodes_with_hurts=sum(r.get('episodes', 0) > 0 and r.get('hurts', 0) > 0 for r in done))
     outcome = dict(exit_86=codes.get(str(VP.V3_FATAL_EXIT), 0), exit_none=codes.get('None', 0),
                    fatal_during=sum(bool(r['fatal_during']) for r in done),
                    fatal_on_close=sum(bool(r['fatal_on_close']) for r in done),
@@ -221,6 +231,8 @@ def main():
     ap.add_argument('--rounds', type=int, default=36)
     ap.add_argument('--workers', type=int, default=4)
     ap.add_argument('--port', type=int, default=46100)
+    ap.add_argument('--floor-seconds', type=float, default=5.0, help='game seconds per floor episode (short: they end)')
+    ap.add_argument('--teacher', type=int, default=1, help='the training teacher config (death teaching, thread, fork)')
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
