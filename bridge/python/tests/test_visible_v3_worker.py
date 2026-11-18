@@ -359,10 +359,11 @@ def test_native_golden_cmp_exit_code(tmp_path):
     frozen = json.loads((FIX / 'manifest.json').read_text())
     names = [f['name'] for f in frozen['frames']]
 
-    def setup(d, which=None, errors=()):
+    def setup(d, which=None, errors=(), native=None):
         d.mkdir()
-        (d / 'manifest.json').write_text(json.dumps(dict(frames=[dict(name=n) for n in (which or names)],
-                                                         errors=list(errors))))
+        (d / 'manifest.json').write_text(json.dumps(dict(
+            frames=[dict(name=n, native=(native or {}).get(n, 'frame')) for n in (which or names)],
+            errors=list(errors))))
         for n in (which or names):
             shutil.copy(FIX / f'{n}.v3.bin', d / f'{n}.v3.bin')   # (stall 0.5 / 1, as the fixtures)
             raw = json.loads((FIX / f'{n}.raw.json').read_text())['raw']
@@ -395,6 +396,14 @@ def test_native_golden_cmp_exit_code(tmp_path):
     assert r.returncode == 1 and 'collection error' in r.stdout
     r = run(setup(tmp_path / 'one', which=['forgotten']))
     assert r.returncode == 1 and 'expected set' in r.stdout
+    # (round 5) the directory reused, this run's native encoder answered nil for a frame: the earlier run's
+    # .native.bin is still there, byte-equal -- the manifest's mark fails it; a manifest without marks fails too
+    r = run(setup(tmp_path / 'reused', native={'shooting': 'nil:v3: grid size'}))
+    assert r.returncode == 1 and "no native frame from this run for ['shooting']" in r.stdout
+    d = setup(tmp_path / 'unmarked')
+    m = json.loads((d / 'manifest.json').read_text())
+    (d / 'manifest.json').write_text(json.dumps(dict(m, frames=[dict(name=f['name']) for f in m['frames']])))
+    assert run(d).returncode == 1
     d = setup(tmp_path / 'missing')
     (d / 'shooting.native.bin').unlink()
     r = run(d)
@@ -402,6 +411,20 @@ def test_native_golden_cmp_exit_code(tmp_path):
     empty = tmp_path / 'empty'
     empty.mkdir()
     assert run(empty).returncode == 1
+
+
+def test_the_golden_probe_moves_an_earlier_run_aside(tmp_path):
+    """abplus_probe_v3_golden.clear_previous (round 5): the files a run writes, left by an earlier run in the same
+    directory, go to <out>/trash/<time>/ (never deleted) before this run writes its own; other files stay."""
+    probe = _load(PY / 'abplus_probe_v3_golden.py', 'probe_v3_golden')
+    for f in ('a.raw.json', 'a.v3.bin', 'a.engine.json', 'a.native.bin', 'manifest.json', 'run.log', 'STATUS'):
+        (tmp_path / f).write_text(f)
+    assert probe.clear_previous(tmp_path) == 5
+    left = sorted(p.name for p in tmp_path.iterdir() if p.is_file())
+    assert left == ['STATUS', 'run.log']
+    moved = sorted(p.name for p in (tmp_path / 'trash').rglob('*') if p.is_file())
+    assert moved == ['a.engine.json', 'a.native.bin', 'a.raw.json', 'a.v3.bin', 'manifest.json']
+    assert probe.clear_previous(tmp_path) == 0
 
 
 def test_accept_checks():

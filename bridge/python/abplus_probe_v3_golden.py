@@ -124,6 +124,21 @@ MOVE_INTO = {0: 7, 1: 1, 2: 3, 3: 5}   # left, up, right, down door: the move co
 STALL = dict(stall_share=0.5, stall_known=1)
 
 
+OUTPUTS = ('*.raw.json', '*.v3.bin', '*.engine.json', '*.native.bin', 'manifest.json')
+
+
+def clear_previous(out):
+    """(2026-11-18, Codex round 5) A run in an output directory used before: the files a run writes moved to
+    <out>/trash/<time>/ first (never deleted), so no frame of an earlier run passes for one of this run. The count."""
+    old = [p for pat in OUTPUTS for p in sorted(out.glob(pat)) if p.is_file()]
+    if old:
+        dest = out / 'trash' / time.strftime('%Y%m%d-%H%M%S')
+        dest.mkdir(parents=True, exist_ok=True)
+        for p in old:
+            p.rename(dest / p.name)
+    return len(old)
+
+
 def capture(c, name, out, manifest, covers):
     text = c.lua("return visible_v3_raw()")
     raw = json.loads(text)
@@ -140,8 +155,10 @@ def capture(c, name, out, manifest, covers):
                  "return (f:gsub('.', function(ch) return string.format('%02x', ch:byte()) end))")
     if hexf and not hexf.startswith('nil:'):
         (out / f'{name}.native.bin').write_bytes(bytes.fromhex(hexf))
+    # (2026-11-18, Codex round 5: whether this run's native encoder gave the frame -- the comparator needs 'frame')
+    native = 'frame' if hexf and not hexf.startswith('nil:') else (hexf or 'nil:no answer')
     f = VP.unpack_frame_v3(payload)
-    manifest.append(dict(name=name, covers=covers, shape=raw['shape'], gw=raw['gw'], gh=raw['gh'],
+    manifest.append(dict(name=name, covers=covers, native=native, shape=raw['shape'], gw=raw['gw'], gh=raw['gh'],
                          origin=raw['origin'], counts=[int(v) for v in f['header'][2:6]], bytes=len(payload),
                          sha256=hashlib.sha256(payload).hexdigest()))
     print(name, manifest[-1]['counts'], raw['origin'], flush=True)
@@ -162,6 +179,9 @@ def main():
     args = p.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    moved = clear_previous(out)
+    if moved:
+        print(f'{moved} file(s) of an earlier run moved to {out}/trash/', flush=True)
     spec = load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))
     stub = str(Path(default_preload()).parent / 'stub_render_h.txt')
     os.environ.update(FORK_ENV)
