@@ -239,6 +239,10 @@ def observation_frame_v3(raw, stall_share=0.0, stall_known=0, producer=V3.PRODUC
         raw = json.loads(raw)
     if raw.get('schema') != 'isaac-visible-raw-v3':
         raise ValueError('visible-v3: not a v3 raw block')
+    if raw.get('version') != V3.VERSION:   # (2026-11-18, Codex round 1: a raw block from a Lua / tool of another commit
+        #                                     than this tree -- e.g. no position_known, read here as 1 -- is refused)
+        raise ValueError('visible-v3: raw block version %r, this tree: schema_v3.VERSION %d'
+                         % (raw.get('version'), V3.VERSION))
     ox, oy = float(raw['origin'][0]), float(raw['origin'][1])
     gw, gh = int(raw['gw']), int(raw['gh'])
     if not (0 < gw <= V3.CANVAS_W and 0 < gh <= V3.CANVAS_H):
@@ -391,15 +395,28 @@ def v3_body_order(frame):
     return bad
 
 
+def check_frame_header_v3(f, exact=False):
+    """A v3 frame's header (f: its floats) against this tree's schema_v3: magic, LAYOUT_GEN, size = frame_floats(p, e,
+    n, s), and at least that many floats (exact: exactly that many). Returns (p, e, n, s). The header carries no schema
+    VERSION (header[0..7]: magic, size, p, e, n, s, LAYOUT_GEN, producer); LAYOUT_GEN (3) did not change in batches 1-4."""
+    if f.size < V3.HEADER:
+        raise ValueError('visible-v3: %d floats, shorter than the header' % f.size)
+    if int(f[0]) != V3.MAGIC or int(f[6]) != V3.LAYOUT_GEN:
+        raise ValueError('visible-v3: bad header (magic %r, layout gen %r; this tree: %d, %d)'
+                         % (float(f[0]), float(f[6]), V3.MAGIC, V3.LAYOUT_GEN))
+    p, e, n, s = (int(v) for v in f[2:6])
+    want = V3.frame_floats(p, e, n, s)
+    if int(f[1]) != want or f.size < want or (exact and f.size != want):
+        raise ValueError('visible-v3: size mismatch (header %d floats, counts give %d, %d given)'
+                         % (int(f[1]), want, f.size))
+    return p, e, n, s
+
+
 def unpack_frame_v3(payload):
     """The v3 frame bytes -> dict of arrays (header, canvas [16, 28, 5], minimap [169], P [p, 192], local
     [p, 9, 9, 5], E, N, S) -- the reference reader for tests and fixtures (package A decodes on its own)."""
     f = np.frombuffer(payload, '<f4')
-    if int(f[0]) != V3.MAGIC or int(f[6]) != V3.LAYOUT_GEN:
-        raise ValueError('visible-v3: bad header')
-    p, e, n, s = (int(v) for v in f[2:6])
-    if int(f[1]) != V3.frame_floats(p, e, n, s) or f.size < int(f[1]):
-        raise ValueError('visible-v3: size mismatch')
+    p, e, n, s = check_frame_header_v3(f)
     at = V3.HEADER
     out = dict(header=f[:V3.HEADER])
     for name, count, shape in (('canvas', 1, (V3.CANVAS_H, V3.CANVAS_W, V3.ROOM_WORDS)),
@@ -442,6 +459,9 @@ def write_v3(row, o):
     True when a v3 frame was written."""
     native = getattr(o, 'visible_v3_frame', None)
     if native is not None:
+        if len(native) % 4:
+            raise ValueError('visible-v3: native frame of %d bytes, not whole floats' % len(native))
+        check_frame_header_v3(np.frombuffer(native, '<f4'), exact=True)   # (2026-11-18: before, none at all)
         write_frame_v3(row, native)
         return True
     if is_raw_v3(getattr(o, 'visible', None)):

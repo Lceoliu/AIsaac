@@ -4,6 +4,7 @@ origin from the block), the cell rule floor(pos / 40) for doors and the local pa
 the flag words (AB+ TearFlags remapped, projectile / entity masks), Curse of the Unknown, the priority cap and its
 overflow counts, the room words' bit packing, and the decorative list equal to the Lua one."""
 import json
+from types import SimpleNamespace
 import re
 from pathlib import Path
 
@@ -233,3 +234,45 @@ def test_the_bridge_and_the_native_encoder_put_the_sub_after_its_player():
     c = (BRIDGE / 'engine' / 'abp_v3_native.c').read_text(encoding='utf-8')
     fn = c[c.index('static int v3_bodies('):c.index('static void v3_body_row(')]
     assert fn.index('for (int i = 0; i < np; i++)') < fn.index('for (int pass = 0; pass < 2; pass++)')
+
+def test_a_raw_block_of_another_version_is_refused():
+    """observation_frame_v3 takes only a raw block of this tree's schema_v3.VERSION (2026-11-18, Codex round 1): a Lua
+    / tool of another commit (e.g. batch 3, no position_known, which the encoder would read as 1) is an error naming
+    both versions, and so is a block without one."""
+    VP.observation_frame_v3(raw_block())
+    old = raw_block(version=2026111703)
+    with pytest.raises(ValueError, match='2026111703.*%d' % V3.VERSION):
+        VP.observation_frame_v3(old)
+    with pytest.raises(ValueError, match='2026111703'):
+        VP.observation_frame_v3(json.dumps(old))
+    none = raw_block()
+    del none['version']
+    with pytest.raises(ValueError, match='None.*%d' % V3.VERSION):
+        VP.observation_frame_v3(none)
+    with pytest.raises(ValueError, match='version'):     # (the worker's path: write_v3 of a handed-back raw block)
+        from isaac_bridge.tok_obs import ROW
+        VP.write_v3(np.zeros(1, ROW), SimpleNamespace(visible=old, visible_v3_frame=None))
+
+
+def test_the_worker_checks_a_native_frames_header():
+    """write_v3 (encode_row) checks a native frame (flag 64) before it goes into the ROW: magic, LAYOUT_GEN, the size
+    word against the counts and exactly the bytes given (before 2026-11-18 it wrote the bytes unchecked)."""
+    from isaac_bridge.tok_obs import ROW
+    good = VP.observation_frame_v3(raw_block())
+    row = np.zeros(1, ROW)
+    assert VP.write_v3(row, SimpleNamespace(visible=None, visible_v3_frame=good))
+    assert bytes(row['visible_frame'][0, :int(row['visible_bytes'][0])]) == good
+
+    def edited(word, value):
+        f = np.frombuffer(good, '<f4').copy()
+        f[word] = value
+        return f.tobytes()
+    bad = {'magic': edited(V3.H_MAGIC, V3.MAGIC + 1), 'layout gen': edited(V3.H_GEN, V3.LAYOUT_GEN + 1),
+           'size': edited(V3.H_SIZE, len(good) // 4 + 1), 'counts': edited(V3.H_E, 0 if VP.unpack_frame_v3(good)[
+               'E'].shape[0] else 1), 'truncated': good[:-4], 'extra float': good + bytes(4),
+           'partial float': good + bytes(2), 'header only part': good[:16]}
+    for why, frame in bad.items():
+        row = np.zeros(1, ROW)
+        with pytest.raises(ValueError):
+            VP.write_v3(row, SimpleNamespace(visible=None, visible_v3_frame=frame))
+        assert int(row['visible_bytes'][0]) == 0, why
