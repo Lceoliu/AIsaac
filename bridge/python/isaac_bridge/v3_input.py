@@ -396,6 +396,28 @@ def _t():
     return torch
 
 
+_DEVC = {}
+
+
+def _dc(key, value, device, dtype=None):
+    """A constant (a column list, a scale table, the room centres) as a tensor on `device`, made once per device and
+    kept: inside a captured CUDA graph no host-to-device copy may run (a Python list as an index is one), and
+    GraphActor's warm-up calls before each capture make every one of them. (184, 2026-11-18: the first capture failed
+    with 'operation not permitted when stream is capturing' at the room centres' as_tensor.)"""
+    torch = _t()
+    k = (key, str(device), dtype)
+    t = _DEVC.get(k)
+    if t is None:
+        t = _DEVC[k] = torch.as_tensor(np.asarray(value), device=device, dtype=dtype)
+    return t
+
+
+def _ix(x, cols):
+    """x[..., cols] for a list of columns, the index from _dc (no copy from the host)."""
+    torch = _t()
+    return x.index_select(-1, _dc(('ix', tuple(int(c) for c in cols)), list(cols), x.device, torch.int64))
+
+
 def _t_sane(v):
     torch = _t()
     v = v.to(torch.float64)
@@ -465,8 +487,8 @@ def t_item_index(base, size, wire):
     torch = _t()
     v, bad = _t_sane(wire)
     c = _t_trunc(v)
-    base = torch.as_tensor(base, dtype=torch.int64, device=v.device)
-    size = torch.as_tensor(size, dtype=torch.int64, device=v.device)
+    if not torch.is_tensor(base):   # (a namespace's two ints: kernels, not a copy from the host)
+        base, size = torch.full_like(c, int(base)), torch.full_like(c, int(size))
     unk = torch.full_like(c, V3.ITEM_UNKNOWN)
     row = torch.where((c > 0) & (c < size), base + c, unk)
     row = torch.where(c == 0, torch.zeros_like(c), row)
@@ -505,17 +527,17 @@ def _t_room(cells):
     torch = _t()
     ch = torch.cat([_t_bits(cells[..., 0], V3.ROOM_W0), _t_bits(cells[..., 1], V3.ROOM_W1),
                     _t_fin0(cells[..., 2:5])], -1)
-    return ch / torch.as_tensor(_ROOM_DIV, device=cells.device)
+    return ch / _dc('room_div', _ROOM_DIV, cells.device)
 
 
 def _t_flags(x, plan):
     torch = _t()
     n = x.shape[0]
-    parts = [_t_fin0(x[:, plan['known']]), _t_fin0(x[:, plan['bit']])]
+    parts = [_t_fin0(_ix(x, plan['known'])), _t_fin0(_ix(x, plan['bit']))]
     if plan['bits8']:
-        parts.append(_t_bits(x[:, plan['bits8']], (('b', 1),) * W8).reshape(n, W8 * len(plan['bits8'])))
+        parts.append(_t_bits(_ix(x, plan['bits8']), (('b', 1),) * W8).reshape(n, W8 * len(plan['bits8'])))
     if plan['word16']:
-        parts.append(_t_bits(x[:, plan['word16']], (('b', 1),) * W16).reshape(n, W16 * len(plan['word16'])))
+        parts.append(_t_bits(_ix(x, plan['word16']), (('b', 1),) * W16).reshape(n, W16 * len(plan['word16'])))
     return torch.cat([q.to(torch.float32) for q in parts], 1)
 
 
@@ -525,8 +547,8 @@ def _t_clamp(v):
 
 
 def _t_num(x, plan):
-    torch = _t()
-    return _t_clamp(x[:, plan['num']] / torch.as_tensor(plan['scale'], device=x.device))
+    return _t_clamp(_ix(x, plan['num']) / _dc(('scale', tuple(plan['num']), tuple(map(float, plan['scale']))),
+                                              plan['scale'], x.device))
 
 
 def _t_stack(cols, n, device):
@@ -731,10 +753,10 @@ def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None, che
     out = {'nonfinite': torch.stack([nf(P, pv), nf(E, ev), nf(N, nv), nf(S, sv),
                                      (~torch.isfinite(canvas)).flatten(1).sum(1) + (~torch.isfinite(mm)).sum(1)
                                      + nf(L5, pv)], 1).to(torch.int64)}
-    main = P[:, 0, [_PC['x'], _PC['y']]].to(torch.float64)
+    main = _ix(P[:, 0], [_PC['x'], _PC['y']]).to(torch.float64)
     out['main_xy'] = main.to(torch.float32)
     out['room'] = _t_room(canvas)
-    centres = torch.as_tensor(_ROOM_CENTRES, device=dev)
+    centres = _dc('room_centres', _ROOM_CENTRES, dev)
     out['room_xy'] = _t_div(centres, POS_SCALE).to(torch.float32)[None].expand(B, -1, -1).contiguous()
     out['room_rel'] = _t_rel(centres[None], main[:, None])
     mb = _t_bits(mm, V3.MAP_BITS)
@@ -743,8 +765,8 @@ def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None, che
     out['P_num'], out['P_flag'] = back(_t_num(fp, PLAN['P']), p_max), back(_t_flags(fp, PLAN['P']), p_max)
     out['P_cat'] = back(_t_cats(fp, PLAN['P']), p_max)
     known = (P[..., _PC['position_known']] == 1) & pv
-    xy = P[..., [_PC['x'], _PC['y']]].to(torch.float64)
-    g = torch.nan_to_num(P[:, 0, [_PC['grid_w'], _PC['grid_h']]].to(torch.float64), nan=1.0)
+    xy = _ix(P, [_PC['x'], _PC['y']]).to(torch.float64)
+    g = torch.nan_to_num(_ix(P[:, 0], [_PC['grid_w'], _PC['grid_h']]).to(torch.float64), nan=1.0)
     gw = torch.trunc(torch.clamp(g[:, 0], 1, V3.CANVAS_W))[:, None]
     gh = torch.trunc(torch.clamp(g[:, 1], 1, V3.CANVAS_H))[:, None]
     cxy = torch.floor(_t_div(xy, V3.CELL))
@@ -759,12 +781,12 @@ def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None, che
     out['E_num'], out['E_flag'] = back(_t_num(fe, PLAN['E']), e_bucket), back(_t_flags(fe, PLAN['E']), e_bucket)
     out['E_cat'] = back(_t_cats(fe, PLAN['E']), e_bucket)
     out['E_id'] = back(_t_stack([t_identity_index(fe[:, c_]) for c_ in PLAN['E']['idn']], fe.shape[0], dev), e_bucket)
-    v, bad = _t_sane(E[..., PLAN['E']['anim']])
+    v, bad = _t_sane(_ix(E, PLAN['E']['anim']))
     out['E_anim'] = torch.where(~bad & (v >= 0) & (v < V3.ANIM_ROWS), _t_trunc(v), torch.zeros_like(_t_trunc(v)))
     pr = E[..., _EC['price']]
     out['E_price'] = _t_clamp(torch.where(pr > 0, _t_div(pr, PRICE_COIN_SCALE), torch.zeros_like(pr)))[..., None]
-    out['E_rel'] = _t_rel(E[..., [_EC['x'], _EC['y']]], main[:, None])
-    lrel = _t_rel(E[..., [_EC['l_ex'], _EC['l_ey']]], main[:, None])
+    out['E_rel'] = _t_rel(_ix(E, [_EC['x'], _EC['y']]), main[:, None])
+    lrel = _t_rel(_ix(E, [_EC['l_ex'], _EC['l_ey']]), main[:, None])
     out['E_laser_rel'] = torch.where((E[..., _EC['kind']] == _LASER_KIND)[..., None], lrel, torch.zeros_like(lrel))
     fn_ = flat(N)
     out['N_num'], out['N_flag'] = back(_t_num(fn_, PLAN['N']), n_max), back(_t_flags(fn_, PLAN['N']), n_max)

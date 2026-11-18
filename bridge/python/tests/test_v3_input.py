@@ -521,6 +521,33 @@ def test_batched_device_decode_equals_pad_batch_of_host_decodes():
             assert torch.equal(got[k].cpu(), a), (dev, k)
 
 
+def test_device_decode_makes_no_host_copies_after_its_first_call(monkeypatch):
+    """(184, 2026-11-18: GraphActor's capture failed -- 'operation not permitted when stream is capturing' -- on the room
+    centres' as_tensor; a Python list as an index is such a copy too.) After one call per device, a call with the
+    counts on the device creates no tensor from host data: as_tensor / tensor raise, and every column list goes
+    through v3_input._ix (index_select of a cached index)."""
+    import torch
+    bufs = [payload(n) for n in NAMES[:3]]
+    F = _frames_matrix(bufs)
+    counts, _ = VI.check_batch(F[:, :8], [V3.VERSION] * len(bufs), [len(b) for b in bufs], VI.P_MAX, 64, 32)
+    for dev in _devices():
+        Ft, ct = torch.from_numpy(F).to(dev), torch.from_numpy(counts).to(dev)
+        want = VI.decode_frames_device(Ft, ct, 64, 64, 32, check=False)
+
+        def no(*a, **k):
+            raise AssertionError('a tensor made from host data inside the device decode')
+        with monkeypatch.context() as m:
+            m.setattr(torch, 'as_tensor', no)
+            m.setattr(torch, 'tensor', no)
+            got = VI.decode_frames_device(Ft, ct, 64, 64, 32, check=False)
+        for k in want:
+            assert torch.equal(got[k], want[k]), (dev, k)
+    import inspect
+    src = inspect.getsource(VI.decode_frames_device) + ''.join(
+        inspect.getsource(f) for f in (VI._t_flags, VI._t_num, VI._t_room, VI.t_item_index))
+    assert '[_PC[' not in src.replace('_ix(P, [_PC[', '').replace('_ix(P[:, 0], [_PC[', '') and "[:, plan[" not in src
+
+
 def test_check_batch_refuses_and_counts():
     bufs = [payload(n) for n in NAMES[:4]]
     F = _frames_matrix(bufs)
