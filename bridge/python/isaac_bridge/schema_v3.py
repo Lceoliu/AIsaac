@@ -115,6 +115,13 @@ MAP_SIDE = 13
 # one float per cell, LSB first (16 bits): the icon is the raw RoomType when shown or visited, else 0
 MAP_BITS = (('shown', 1), ('visited', 1), ('clear', 1), ('current', 1), ('icon', 6), ('reserved', 6))
 MAP_ICONS = 64        # the icon's embedding rows (Embedding(64, 8)); a code >= 64 -> 63
+# The map cells a room of each RoomShape occupies, as offsets from its RoomDescriptor.GridIndex (the 13 x 13 map cell
+# the minimap word is written into; nothing else is). From the engine (the coordinator, 2026-11-17): every room of 40
+# seeds x stages 1-8 (6,114 rooms, abplus_probe_v3_mapcells.py, 184 mapcells1), the cells g with
+# level:GetRoomByIdx(g) the same room (SafeGridIndex and GridIndex); one set per shape, no exception. It equals
+# tok_obs.SHAPE_CELLS; the v2 producer's (0,) + SHAPE_CELLS also marks LTL's cell 0, which is not the room's (v2 kept).
+MAP_SHAPE_CELLS = {1: (0,), 2: (0,), 3: (0,), 4: (0, 13), 5: (0, 13), 6: (0, 1), 7: (0, 1), 8: (0, 1, 13, 14),
+                   9: (1, 13, 14), 10: (0, 13, 14), 11: (0, 1, 14), 12: (0, 1, 13)}   # another shape: (0,)
 
 FIXED = HEADER + CANVAS_H * CANVAS_W * ROOM_WORDS + MAP_SIDE * MAP_SIDE
 

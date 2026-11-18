@@ -118,6 +118,11 @@ def generate():
           f'#define ABP_V3_V2_META {S.V2_META}', f'#define ABP_V3_TEACH_META {S.TEACH_META}']
     L += [f'#define ABP_V3_V2_{_ident(k)} {i}' for i, k in enumerate(S.V2_FIELDS)]
     L += [f'#define ABP_V3_TEACH_{_ident(k)} {i}' for i, k in enumerate(S.TEACH_FIELDS)]
+    L += ['', '/* ---- the map cells of a RoomShape (schema_v3.MAP_SHAPE_CELLS: offsets from GridIndex, -1 padding;',
+          ' * another shape: cell 0 only) */', f'#define ABP_V3_MAP_SHAPES {max(S.MAP_SHAPE_CELLS) + 1}',
+          'static const signed char ABP_V3_MAP_SHAPE_CELLS[ABP_V3_MAP_SHAPES][4] = {'
+          + ', '.join('{' + ', '.join(str(c) for c in (list(S.MAP_SHAPE_CELLS.get(k, ())) + [-1] * 4)[:4]) + '}'
+                      for k in range(max(S.MAP_SHAPE_CELLS) + 1)) + '};']
     L += ['', '/* ---- engine argument ranges, AB+ (schema_v3.ABP_RANGES; the producers loop only inside them) */']
     for k, (v, _) in S.ABP_RANGES.items():
         L.append(f'#define ABP_V3_ABP_{_ident(k)} {v}')
