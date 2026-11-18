@@ -2,7 +2,8 @@
 usage (bridge/python, numpy): python tools/v3_native_golden_cmp.py <golden dir> [<section,...>] [--expected <manifest>]
 
 (2026-11-18, Codex rounds 3 / 4) A pass needs:
-  - the run's manifest.json with no collection error, listing exactly the expected frames -- the frozen set of
+  - the run's manifest.json with no collection error, every frame marked native 'frame' (this run's native encoder
+    gave it: abplus_probe_v3_golden.py), listing exactly the expected frames -- the frozen set of
     tests/fixtures/visible_v3/manifest.json unless --expected names another manifest;
   - for every frame both files, each passing visible_producer.check_frame_header_v3(exact=True) against this tree's
     schema (magic, version word, count ranges, size word = counts = the bytes given);
@@ -52,6 +53,12 @@ def main(argv):
     try:
         run = json.load(open(os.path.join(d, 'manifest.json')))
         frames = [f['name'] for f in run['frames']]
+        # (2026-11-18, Codex round 5: this run's native encoder must have given every frame -- a .native.bin of an
+        # earlier run in a reused directory does not count)
+        no_native = [f['name'] for f in run['frames'] if f.get('native') != 'frame']
+        if no_native:
+            why.append(f"no native frame from this run for {no_native[:6]} "
+                       f"({[f.get('native') for f in run['frames'] if f.get('native') != 'frame'][:3]})")
         if run.get('errors'):
             why.append(f"the run's manifest has {len(run['errors'])} collection error(s): {str(run['errors'])[:200]}")
     except (OSError, ValueError, KeyError) as e:
