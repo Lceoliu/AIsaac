@@ -105,6 +105,7 @@ static const char *v3_canvas(const v3_room *r, float *canvas) {
     int n_haz = 0;
     uintptr_t list = FIELD(uintptr_t, room, ROOM_ENTITIES);
     uint32_t count = FIELD(uint32_t, room, ROOM_ENTITY_COUNT);
+    if (count && !list) return "v3: no room entity list";   // (2026-11-18, Codex round 2: a count without a list)
     for (uint32_t k = 0; k < count; k++) {
         const void *e = ((const void *const *)list)[k];
         if (!e || G0(int, E_TYPE, e) != 1000 || !gbool(FN(E_VISIBLE), e)) continue;
@@ -191,6 +192,7 @@ static int v3_bodies(const v3_room *r, v3_body_t *b) {
     int n_seeds = 0;   // the room's player entities (position_known)
     uintptr_t list = FIELD(uintptr_t, r->room, ROOM_ENTITIES);
     uint32_t count = FIELD(uint32_t, r->room, ROOM_ENTITY_COUNT);
+    if (count && !list) return -1;   // ("v3: bodies")
     for (uint32_t k = 0; k < count && n_seeds < 64; k++) {
         const void *e = ((const void *const *)list)[k];
         if (e && G0(int, E_TYPE, e) == 1) seeds[n_seeds++] = v3_seed(e);
@@ -382,6 +384,7 @@ static void v3_words16(float *dst, uint64_t v, int n) {
 static const char *v3_select(const v3_room *r, const v3_body_t *bodies, int n_bodies, int *n_out, int overflow[5]) {
     uintptr_t list = FIELD(uintptr_t, r->room, ROOM_ENTITIES);
     uint32_t count = FIELD(uint32_t, r->room, ROOM_ENTITY_COUNT);
+    if (count && !list) return "v3: no room entity list";
     if (count > v3_ents_cap) {
         v3_ent_t *b = realloc(v3_ents, count * sizeof *b);
         if (!b) abort();
@@ -436,6 +439,7 @@ static const char *v3_entity_row(const v3_room *r, const void *e, uint32_t curse
     uint32_t variant = G0(uint32_t, E_VARIANT, e), subtype = G0(uint32_t, E_SUBTYPE, e);
     vec2f pos = G0(vec2f, E_POSITION, e), vel = G0(vec2f, E_VELOCITY, e), sm = G0(vec2f, E_SIZEMULTI, e);
     const void *spr = G0(const void *, E_SPRITE, e);
+    if (!spr) return "v3: an entity without a sprite";   // (2026-11-18: read below before any other check)
     int identity_known = 1, flags_known = 4;
     uint64_t tear = 0, proj = 0;
     E[ABP_V3_E_TYPE] = (float)t;
@@ -589,6 +593,9 @@ static const char *v3_items(const v3_room *r, const v3_body_t *bodies, int n_bod
     const void *pool = ((const void *(*)(const void *))VFN(V_ITEMPOOL))((const void *)r->game);
     if (!config || !pool) return "v3: no item config or pool";
     const void *colls = ((const void *(*)(const void *))VFN(V_IC_COLLS))(config);
+    // (2026-11-18, Codex round 2: the collectible vector itself checked -- no list, or an end before its start)
+    if (!colls || !*(const char *const *)colls ||
+        *(const char *const *)((const char *)colls + 8) < *(const char *const *)colls) return "v3: no collectible list";
     long size = (long)((*(const char *const *)((const char *)colls + 8) - *(const char *const *)colls) / (ptrdiff_t)sizeof(void *));
     if (size > ABP_V3_ABP_COLLECTIBLES) size = ABP_V3_ABP_COLLECTIBLES;   // (GetCollectibleNum: no bounds check)
     *n_inv = *n_slots = 0;
@@ -603,7 +610,8 @@ static const char *v3_items(const v3_room *r, const v3_body_t *bodies, int n_bod
             }
         }
         int active = G0(int, P_ACTIVE, p), charge = G0(int, P_CHARGE, p);
-        const void *ac = active != 0 ? ((const void *(*)(const void *, int))VFN(V_IC_COLL))(config, active) : NULL;
+        // (2026-11-18, Codex round 2 C14: GetCollectible only for an id in the config's range; Lua the same)
+        const void *ac = active > 0 && active < size ? ((const void *(*)(const void *, int))VFN(V_IC_COLL))(config, active) : NULL;
         v3_srow *a = v3_slot_add(n_slots, b, 1, 0);
         a->v[ABP_V3_S_ID] = (float)active; a->v[ABP_V3_S_OCCUPIED] = active != 0; a->v[ABP_V3_S_SELECTED] = 1;
         a->v[ABP_V3_S_CHARGE] = (float)charge; a->v[ABP_V3_S_MAX_CHARGE] = ac ? (float)FIELD(int32_t, ac, IC_MAX_CHARGES) : 0;
@@ -611,7 +619,7 @@ static const char *v3_items(const v3_room *r, const v3_body_t *bodies, int n_bod
         const char *sec = (const char *)p + PL_SECONDARY;
         int sid = *(const int32_t *)sec;
         if (((char (*)(const void *, int))VFN(V_HAS_COLL))(p, 534) != 0 || sid != 0) {   // (Schoolbag)
-            const void *desc = sid != 0 ? ((const void *(*)(const void *, int))VFN(V_IC_COLL))(config, sid) : NULL;
+            const void *desc = sid > 0 && sid < size ? ((const void *(*)(const void *, int))VFN(V_IC_COLL))(config, sid) : NULL;
             v3_srow *c = v3_slot_add(n_slots, b, 1, 1);
             c->v[ABP_V3_S_ID] = (float)sid; c->v[ABP_V3_S_OCCUPIED] = sid != 0;
             c->v[ABP_V3_S_CHARGE] = (float)*(const int32_t *)(sec + 4);
@@ -678,16 +686,20 @@ static const char *v3_build(const unsigned char *map, size_t map_len, size_t *n_
     r.room = r.game ? G0(const void *, G_ROOM, (const void *)r.game) : NULL;
     r.level = r.game ? G0(const void *, G_LEVEL, (const void *)r.game) : NULL;
     if (!r.room || !r.level) return "v3: no room";
-    vec2f g0 = V3G1(vec2f, V3_GRID_POS, r.room, 0);
-    r.ox = (double)g0.x - 20.0;
-    r.oy = (double)g0.y - 20.0;
+    // (2026-11-18, Codex round 2 C14: the grid checked before GetGridPosition(0) is asked -- a room without cells)
     r.gw = G0(int, R_WIDTH, r.room);
     r.gh = G0(int, R_HEIGHT, r.room);
     r.n = G0(int, R_SIZE, r.room);
     if (r.gw <= 0 || r.gh <= 0 || r.gw > ABP_V3_CANVAS_W || r.gh > ABP_V3_CANVAS_H) return "v3: grid past the canvas";
+    if (r.n < r.gw * r.gh) return "v3: grid size";
+    vec2f g0 = V3G1(vec2f, V3_GRID_POS, r.room, 0);
+    r.ox = (double)g0.x - 20.0;
+    r.oy = (double)g0.y - 20.0;
     v3_body_t bodies[V3_BODY_CAP];
     int p = v3_bodies(&r, bodies);
     if (p <= 0) return "v3: bodies";
+    for (int i = 0; i < p; i++)   // (v3_body_row reads each body's sprite frame)
+        if (!G0(const void *, E_SPRITE, bodies[i].p)) return "v3: a body without a sprite";
     int e = 0, overflow[5];
     const char *sel = v3_select(&r, bodies, p, &e, overflow);
     if (sel) return sel;
