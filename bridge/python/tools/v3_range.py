@@ -78,8 +78,10 @@ class Acc:
         self.hi = np.maximum(self.hi, x.max(0))
         self.clamp += (np.abs(x) >= V3.NUM_CLAMP).sum(0)
         if rng is not None:
-            lo = np.array([r[0] if r else -np.inf for r in rng])
-            hi = np.array([r[1] if r else np.inf for r in rng])
+            # (the bounds rounded to float32 as the decoded values are: 15 / 28 or 0.99 on a bound is inside -- the
+            #  first table counted float32 values at a bound as outside, the coordinator 2026-11-18)
+            lo = np.array([r[0] if r else -np.inf for r in rng], np.float32).astype(np.float64)
+            hi = np.array([r[1] if r else np.inf for r in rng], np.float32).astype(np.float64)
             self.out += ((x < lo) | (x > hi)).sum(0)
 
     def rows(self):
