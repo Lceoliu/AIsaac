@@ -395,7 +395,9 @@ static const char *v3_select(const v3_room *r, const v3_body_t *bodies, int n_bo
         int t = G0(int, E_TYPE, e);
         if (t == 1 || !gbool(FN(E_VISIBLE), e)) continue;
         float cdmg = G0(float, E_CDMG, e);
-        if (t == 1000 && v3_is_decorative((int)G0(uint32_t, E_VARIANT, e)) && cdmg == 0) continue;
+        // (C11, 2026-11-18 Codex round 2: decorative only with no damage and no entity collision; Lua the same)
+        if (t == 1000 && v3_is_decorative((int)G0(uint32_t, E_VARIANT, e)) && cdmg == 0 && G0(int, E_ECC, e) == 0)
+            continue;
         const void *npc;
         int kind = v3_kind(e, t, &npc);
         int f = kind == 6 ? v3_npc_flags(e) : 0;

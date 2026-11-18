@@ -2172,7 +2172,9 @@ local function v3_entities(room, curses)
 	local ents = {}
 	for _, e in ipairs(Isaac.GetRoomEntities()) do
 		local t = e.Type
-		if t ~= 1 and e.Visible and not (t == 1000 and V3_DECORATIVE[e.Variant] and e.CollisionDamage == 0) then
+		-- (C11, 2026-11-18 Codex round 2: decorative only with no damage AND no entity collision, as the contract says)
+		if t ~= 1 and e.Visible and not (t == 1000 and V3_DECORATIVE[e.Variant] and e.CollisionDamage == 0 and
+				e.EntityCollisionClass == 0) then
 			local npc = t >= 10 and t < 1000 and e:ToNPC() or nil
 			local kind = 0
 			local rec = { type = t, variant = e.Variant, subtype = e.SubType, x = e.Position.X, y = e.Position.Y,

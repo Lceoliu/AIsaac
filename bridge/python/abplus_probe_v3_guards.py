@@ -7,6 +7,8 @@
              two with different seeds: a native frame, equal to the reference encoder's frame of the raw block (item 6a)
   flag64     a lean payload of a mode 2 clone carries the native frame (flag 64) and visible_producer.needs_decode says
              so (the C ROW path never takes it)
+  decorative a listed decorative effect without damage (1000.7) left out with entity collision class 0 and sent with
+             class 4, in the raw block and the native frame alike (C11)
 Exits 1 when a check fails (each check's result in <out>/summary.json).
 
 usage (bridge python dir, PYTHONPATH=.): python abplus_probe_v3_guards.py --groups-file ../abplus/catalog/scaling2_groups.json --out <dir>
@@ -104,6 +106,31 @@ def check_lasers(c, seed_a, seed_b):
     return out
 
 
+DECOR = r"""
+local p = Isaac.GetPlayer(0)
+local e = Isaac.Spawn(1000, 7, 0, p.Position + Vector(60, 0), Vector(0, 0), nil)
+e.CollisionDamage = 0
+e.EntityCollisionClass = __CLASS__
+return tostring(e.EntityCollisionClass) .. ',' .. tostring(e.CollisionDamage)
+"""
+
+
+def check_decorative(c, cls):
+    """C11 (2026-11-18): a listed decorative effect (1000.7 BLOOD_SPLAT, no damage) is left out with no entity collision
+    and sent with one -- in the raw block and in the native frame alike (and the native frame equal to the reference)."""
+    made = c.lua(DECOR.replace('__CLASS__', str(cls)))
+    raw = json.loads(c.lua("return visible_v3_raw()"))
+    in_raw = sum(1 for e in raw['entities'] if e['type'] == 1000 and e['variant'] == 7)
+    native = c.lua(NATIVE)
+    out = dict(spawned=made, in_raw=in_raw, native=native[:40] if native.startswith('nil:') else 'frame')
+    if not native.startswith('nil:'):
+        frame = bytes.fromhex(native)
+        f = VP.unpack_frame_v3(frame)
+        out['in_native'] = int(sum(1 for r in f['E'] if int(r[0]) == 1000 and int(r[1]) == 7))
+        out['equals_reference'] = frame == VP.observation_frame_v3(raw)
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--groups-file', required=True)
@@ -158,6 +185,14 @@ def main():
                 try:
                     query(c, 2)
                     detail[name] = check_lasers(c, sa, sb)
+                finally:
+                    c.close()
+            for cls, want in ((0, 0), (4, 1)):
+                c = b.fork(tag='v3guards', lean=True, alarm=600)
+                try:
+                    query(c, 2)
+                    d = detail[f'decorative class {cls}'] = check_decorative(c, cls)
+                    checks[f'decorative 1000.7 with collision class {cls}: {"sent" if want else "left out"}'] =                         d['in_raw'] == want and d.get('in_native') == want and d.get('equals_reference') is True
                 finally:
                     c.close()
             d1, d2 = detail['two seeds'], detail['one seed']
