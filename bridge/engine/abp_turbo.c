@@ -2254,6 +2254,7 @@ static int step_write_all(int fd, struct iovec *iov, int n) {
 }
 
 // Only the bytes of a step line are consumed (never past its newline): luasocket reads every other command itself.
+#include "abp_step_line.h"
 static int step_read(int fd, long long v[7], const char **why) {
     char line[64];
     size_t have = 0;
@@ -2297,28 +2298,8 @@ static int step_read(int fd, long long v[7], const char **why) {
         }
     }
     line[have - 1] = 0;
-    // "^S (%d+) (%d+) (%d+) (%d+) (%d+)$" as the bridge's Lua parse (numbers of up to 9 digits here); 2026-10-06 (items,
-    // Phase A): an optional sixth number, the pill / card action ("S <repeat> <move> <shoot> <bomb> <item> <pill>");
-    // without it the pill is 0; 2026-11-17 (visible-v3 F2): an optional seventh, the drop action, only after a sixth
-    // ("... <pill> <drop>"); without it the drop is 0
-    const char *c = line + 1;
-    v[5] = 0;
-    v[6] = 0;
-    for (int i = 0; i < 7; i++) {
-        if (i >= 5 && *c == 0) break;
-        if (*c != ' ') return 3;
-        c++;
-        if (*c < '0' || *c > '9') return 3;
-        long long x = 0;
-        int digits = 0;
-        while (*c >= '0' && *c <= '9') {
-            x = x * 10 + (*c - '0');
-            c++;
-            if (++digits > 9) return 3;
-        }
-        v[i] = x;
-    }
-    return *c == 0 ? 1 : 3;
+    // the numbers as the bridge's Lua parse reads them (abp_step_line.h: the 6th and 7th optional, 0 when absent)
+    return abp_step_line_parse(line, v);
 }
 
 // (G) the native visible block (vis_build, below): the state the native step reads

@@ -195,9 +195,10 @@ static int v3_bodies(const v3_room *r, v3_body_t *b) {
         const void *e = ((const void *const *)list)[k];
         if (e && G0(int, E_TYPE, e) == 1) seeds[n_seeds++] = v3_seed(e);
     }
+    // (schema batch 4: player 0's controlled body first; each sub-player right after its own player)
     int n = 0, np = (int)G0(long, G_NUM_PLAYERS, (const void *)r->game);
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < np; i++) {
+    for (int i = 0; i < np; i++) {
+        for (int pass = 0; pass < 2; pass++) {
             const void *p = ((const void *(*)(int))FN(P_GET))(i);
             if (!p) return -1;
             const void *q = pass == 0 ? p : ((const void *(*)(const void *))V3FN(V3_SECONDARY))(p);

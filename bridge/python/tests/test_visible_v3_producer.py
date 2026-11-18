@@ -207,3 +207,29 @@ def test_minimap_marks_only_the_rooms_cells():
     raw = raw_block(map=[[30, 9, 1, 1, 0, 0], [60, 1, 0, 1, 1, 1]])
     m = VP.unpack_frame_v3(VP.observation_frame_v3(raw))['minimap']
     assert m[30] == 0 and all(m[30 + d] != 0 for d in (1, 13, 14)) and m[60] != 0
+
+def test_body_order_convention():
+    """Batch 4: P row 0 is player 0's controlled body (position_known 1); each sub-player right after its own player.
+    The reference encoder keeps the raw block's order (abp_bridge.lua v3_bodies makes it; abp_v3_native.c the same);
+    v3_body_order finds a violation."""
+    p0 = body(init_seed=1, linked=2)
+    s0 = body(init_seed=2, x=0.0, y=0.0, ptype=17, role=3, linked=1, position_known=0)
+    p1 = body(init_seed=3, ptype=3, controller=1)
+    f = VP.unpack_frame_v3(VP.observation_frame_v3(raw_block(bodies=[p0, s0, p1])))
+    assert VP.v3_body_order(f) == []
+    c = lambda n: V3.col(V3.P_COLS, n)
+    assert [int(r[c('body_role')]) for r in f['P']] == [1, 3, 1] and [int(r[c('body_index')]) for r in f['P']] == [0, 1, 2]
+    # the old order (every player first, then the sub-players) is a violation
+    old = [dict(p0, linked=3), dict(p1), dict(s0, linked=1)]
+    assert VP.v3_body_order(VP.unpack_frame_v3(VP.observation_frame_v3(raw_block(bodies=old))))
+    # row 0 without a room position is a violation
+    assert VP.v3_body_order(VP.unpack_frame_v3(VP.observation_frame_v3(raw_block(bodies=[body(position_known=0)]))))
+
+
+def test_the_bridge_and_the_native_encoder_put_the_sub_after_its_player():
+    lua = (BRIDGE / 'abplus' / 'abp_bridge.lua').read_text(encoding='utf-8')
+    fn = lua[lua.index('local function v3_bodies(game)'):lua.index('local function v3_entities')]
+    assert fn.count('for i = 0, n - 1 do') == 1 and fn.index('Isaac.GetPlayer(i)') < fn.index('p:GetSubPlayer()')
+    c = (BRIDGE / 'engine' / 'abp_v3_native.c').read_text(encoding='utf-8')
+    fn = c[c.index('static int v3_bodies('):c.index('static void v3_body_row(')]
+    assert fn.index('for (int i = 0; i < np; i++)') < fn.index('for (int pass = 0; pass < 2; pass++)')

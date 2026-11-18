@@ -370,6 +370,27 @@ def observation_frame_v3(raw, stall_share=0.0, stall_known=0, producer=V3.PRODUC
     return out.tobytes()
 
 
+def v3_body_order(frame):
+    """The body-order convention (schema_v3 batch 4) checked on an unpacked v3 frame: P row 0 is player 0's controlled
+    body (body_role 1, position_known 1); every sub-player (body_role 3) sits right after its own player, linked both
+    ways. [] when it holds, else the violations (text). Used on the reference encoder's frames (tests) and on the native
+    encoder's (v3_native_golden_cmp.py on 184)."""
+    P, c = frame['P'], lambda n: V3.col(V3.P_COLS, n)
+    bad = []
+    if len(P) == 0:
+        return ['no body']
+    if int(P[0][c('body_role')]) != 1 or int(P[0][c('position_known')]) != 1:
+        bad.append('row 0: body_role %d position_known %d' % (P[0][c('body_role')], P[0][c('position_known')]))
+    for r in range(len(P)):
+        role, linked = int(P[r][c('body_role')]), int(P[r][c('linked_body')])
+        if role == 3 and (r == 0 or linked != r or int(P[r - 1][c('linked_body')]) != r + 1
+                          or int(P[r - 1][c('body_role')]) != 1):
+            bad.append('row %d: a sub-player not right after its player (linked %d)' % (r, linked))
+        if role == 1 and linked and linked != r + 2:
+            bad.append('row %d: its sub-player at %d, not right after it' % (r, linked - 1))
+    return bad
+
+
 def unpack_frame_v3(payload):
     """The v3 frame bytes -> dict of arrays (header, canvas [16, 28, 5], minimap [169], P [p, 192], local
     [p, 9, 9, 5], E, N, S) -- the reference reader for tests and fixtures (package A decodes on its own)."""

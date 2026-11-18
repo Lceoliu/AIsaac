@@ -6,7 +6,7 @@
 
 /* ---- F1: identity and header */
 #define ABP_V3_SCHEMA "isaac-visible-prlmens-g-v3"
-#define ABP_V3_VERSION 2026111703
+#define ABP_V3_VERSION 2026111801
 #define ABP_V3_FRAME_BYTES 131072
 #define ABP_V3_MAGIC 61107
 #define ABP_V3_LAYOUT_GEN 3
@@ -136,9 +136,9 @@
 #define ABP_V3_P_INVULNERABLE 30   /* num: 0/1 (damage cooldown > 0) */
 #define ABP_V3_P_CONTROLS 31   /* num: 0/1 ControlsEnabled */
 #define ABP_V3_P_DEAD 32   /* num: 0/1 */
-#define ABP_V3_P_HEAD_DIR 33   /* num: Direction -1..3 */
-#define ABP_V3_P_FIRE_DIR 34   /* num: Direction -1..3 */
-#define ABP_V3_P_MOVE_DIR 35   /* num: Direction -1..3 */
+#define ABP_V3_P_HEAD_DIR 33   /* cat:direction: Direction -1..3 raw (direction_code) */
+#define ABP_V3_P_FIRE_DIR 34   /* cat:direction: Direction -1..3 raw (direction_code) */
+#define ABP_V3_P_MOVE_DIR 35   /* cat:direction: Direction -1..3 raw (direction_code) */
 #define ABP_V3_P_SPRITE_FRAME 36   /* num: sprite frame */
 #define ABP_V3_P_WEAPON_CHARGE 37   /* num: charge counter frames (known: P 51) */
 #define ABP_V3_P_BODY_INDEX 38   /* num: index in the frame */
@@ -207,7 +207,7 @@
 #define ABP_V3_E_L_EY 28   /* num: laser end y, canvas-frame px */
 #define ABP_V3_E_L_RADIUS 29   /* num: laser radius px */
 #define ABP_V3_E_L_CIRCLE 30   /* num: 0/1 */
-#define ABP_V3_E_PRICE 31   /* num: shop price (coins) */
+#define ABP_V3_E_PRICE 31   /* cat:price: Price raw: coins > 0, devil deal < 0 (price_code) */
 #define ABP_V3_E_IDENTITY_KNOWN 32   /* known: type / variant / subtype readable */
 #define ABP_V3_E_FLAGS_KNOWN 33   /* bits8: 1 tear namespace, 2 projectile, 4 entity flags, 8 anim_id */
 #define ABP_V3_E_TEAR_W_FIRST 34
@@ -293,6 +293,10 @@
 #define ABP_V3_CAT_NS_SLOT_FAMILY_SIZE 16
 #define ABP_V3_CAT_NS_CHARGE_TYPE_BASE 384
 #define ABP_V3_CAT_NS_CHARGE_TYPE_SIZE 16
+#define ABP_V3_CAT_NS_PRICE_BASE 400
+#define ABP_V3_CAT_NS_PRICE_SIZE 128
+#define ABP_V3_CAT_NS_DIRECTION_BASE 528
+#define ABP_V3_CAT_NS_DIRECTION_SIZE 8
 #define ABP_V3_GAME_VERSION_ABPLUS 1
 #define ABP_V3_GAME_VERSION_REP 2
 #define ABP_V3_GAME_VERSION_REP_PLUS 3

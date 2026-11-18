@@ -2094,6 +2094,7 @@ local function v3_bodies(game)
 	-- UNVERIFIED). position_known (schema batch 3): the body's entity is among the room's entities (by InitSeed); AB+'s
 	-- GetSubPlayer() never is (it sits at world (0, 0) whichever character is controlled: 184 subbody1 / subbody2)
 	local bodies, players, seen = {}, {}, {}
+	-- (schema batch 4: player 0's controlled body first; each sub-player right after its own player)
 	local in_room = {}
 	for _, e in ipairs(Isaac.GetRoomEntities()) do if e.Type == 1 then in_room[e.InitSeed] = true end end
 	local n = game:GetNumPlayers()
@@ -2105,10 +2106,7 @@ local function v3_bodies(game)
 			bodies[#bodies].position_known = in_room[p.InitSeed] and 1 or 0
 			players[#players + 1] = p
 		end
-	end
-	for i = 0, n - 1 do   -- the sub-players (the Forgotten / the Soul), after every player; linked both ways
-		local p = Isaac.GetPlayer(i)
-		local sub = v3_try(function() return p:GetSubPlayer() end, nil)
+		local sub = v3_try(function() return p:GetSubPlayer() end, nil)   -- (the Forgotten / the Soul; linked both ways)
 		if sub ~= nil and not seen[sub.InitSeed] then
 			seen[sub.InitSeed] = #bodies + 1
 			bodies[#bodies + 1] = v3_body(sub, nil, 3)
@@ -2373,7 +2371,7 @@ function visible_v3_raw()
 	local bodies, players = v3_bodies(game)
 	local cells, doors = v3_cells(room, level)
 	local inventory, slots = v3_items(players)
-	return v3_json({ schema = "isaac-visible-raw-v3", version = 2026111703, game_version = 1, control_scheme = 0,
+	return v3_json({ schema = "isaac-visible-raw-v3", version = 2026111801, game_version = 1, control_scheme = 0,
 		origin = { g0.X - 20, g0.Y - 20 }, gw = room:GetGridWidth(), gh = room:GetGridHeight(),
 		room_type = room:GetType(), shape = room:GetRoomShape(), stage = level:GetStage(),
 		stage_type = v3_try(function() return level:GetStageType() end, 0),

@@ -125,3 +125,10 @@ def test_a_handed_back_record_reads_like_a_native_one():
     assert list(f['P'][:, V3.col(V3.P_COLS, 'stall_share')]) == [0.5, 0.5]
     assert not VP.write_v3(np.zeros(1, ROW), SimpleNamespace(visible={'schema': 'isaac-visible-prlmens-g-v2'},
                                                              visible_v3_frame=None))
+
+@pytest.mark.parametrize('name', NAMES)
+def test_body_order_in_every_golden_frame(name):
+    """Batch 4's body order on the real frames (the reference bytes; 184's v3_native_golden_cmp.py checks the native
+    encoder's frames the same way): the forgotten / forgotten-soul frames hold the Forgotten / the Soul at row 0
+    (position_known 1) and the other right after it."""
+    assert VP.v3_body_order(_frame(name)) == []

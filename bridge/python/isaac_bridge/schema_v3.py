@@ -44,6 +44,16 @@ changes its PlayerType 16 <-> 17 in place), and while the Soul is controlled the
 the familiar 3.900 (gfx/003.900_Forgotten Body.anm2, an E token) with the chain effects 1000.114. Bodies are listed
 once each by InitSeed (AB+: the Soul and the Forgotten share Entity.Index; on Rep UNVERIFIED).
 
+Batch 4 (the coordinator, 2026-11-18; VERSION 2026111801; kinds and conventions only, no column number and no wire
+value changed): P cols 33-35 head_dir / fire_dir / move_dir are categorical ('cat:direction', the raw
+Direction -1..3 on the wire, direction_code = value + 2 at decode); E col 31 price is categorical ('cat:price', the raw
+Price on the wire, price_code at decode: coins as such, the devil-deal codes apart; CAT_FROM_RAW, wire_cat_index); the four
+leave NUM_RANGE and the scale vector. REL_SCALE: the model's relative offsets / distances (Python only). Body order: P
+row 0 is player 0's controlled body (its position_known is 1: AB+'s controlled character is the room's player entity);
+every sub-player follows its own player (player 0, its sub-player, player 1, ...). The step line: without a 7th number
+(5 or 6 numbers) drop is 0, the same held / triggered set as a 7th number 0 (abp_step_line.h; the game frames equal:
+the drop probe's zero case, golden digests).
+
 Entities sent (convention, the coordinator 2026-11-17; no shape change): every visible entity but the players (they are
 bodies), wherever it is (outside the grid too); effects (type 1000) likewise except a decorative list kept by the
 producers (abp_bridge.lua V3_DECORATIVE_SPEC = visible_producer.V3_DECORATIVE_WHY, each entry with its reason). An
@@ -65,7 +75,8 @@ applies SCALE (below) itself. Known flags (G3): a field the game version lacks i
 
 # ------------------------------------------------------------------------------------------------- F1: identity
 SCHEMA = 'isaac-visible-prlmens-g-v3'
-VERSION = 2026111703   # batch 3 (the coordinator, 2026-11-17): P col 54 position_known
+VERSION = 2026111801   # batch 4 (the coordinator, 2026-11-18): direction / price categorical, REL_SCALE, the body
+#                       order and the step line's drop written down (batch 3, 2026111703: P col 54 position_known)
 #                       (batch 2, 2026111702: non-position scales, NUM_CLAMP, NUM_RANGE)
 #                       (batch 1, 2026111701: canvas frame, isotropic scales, kind + 1)
 FRAME_BYTES = 131072
@@ -175,8 +186,9 @@ P_SPEC = [
     (27, 'move_speed', 'num', 'MoveSpeed', 2), (28, 'luck', 'num', 'Luck', 5),
     (29, 'can_fly', 'num', '0/1', 1), (30, 'invulnerable', 'num', '0/1 (damage cooldown > 0)', 1),
     (31, 'controls', 'num', '0/1 ControlsEnabled', 1), (32, 'dead', 'num', '0/1', 1),
-    (33, 'head_dir', 'num', 'Direction -1..3', 4), (34, 'fire_dir', 'num', 'Direction -1..3', 4),
-    (35, 'move_dir', 'num', 'Direction -1..3', 4), (36, 'sprite_frame', 'num', 'sprite frame', 60),
+    (33, 'head_dir', 'cat:direction', 'Direction -1..3 raw (direction_code)', 1),
+    (34, 'fire_dir', 'cat:direction', 'Direction -1..3 raw (direction_code)', 1),
+    (35, 'move_dir', 'cat:direction', 'Direction -1..3 raw (direction_code)', 1), (36, 'sprite_frame', 'num', 'sprite frame', 60),
     (37, 'weapon_charge', 'num', 'charge counter frames (known: P 51)', 60),
     (38, 'body_index', 'num', 'index in the frame', 4), (39, 'linked_body', 'num', 'partner index + 1, 0 none', 4),
     (40, 'stall_share', 'num', "decisions since the last progress / the stall limit, 0..1 (known: P 53)", 1),
@@ -225,7 +237,7 @@ E_SPEC = [
     (24, 'l_cos', 'num', 'laser direction cos', 1), (25, 'l_sin', 'num', 'laser direction sin', 1),
     (26, 'l_len', 'num', 'laser length px', 300), (27, 'l_ex', 'num', 'laser end x, canvas-frame px', 520),
     (28, 'l_ey', 'num', 'laser end y, canvas-frame px', 520), (29, 'l_radius', 'num', 'laser radius px', 100),
-    (30, 'l_circle', 'num', '0/1', 1), (31, 'price', 'num', 'shop price (coins)', 100),
+    (30, 'l_circle', 'num', '0/1', 1), (31, 'price', 'cat:price', 'Price raw: coins > 0, devil deal < 0 (price_code)', 1),
     (32, 'identity_known', 'known', 'type / variant / subtype readable', 1),
     (33, 'flags_known', 'bits8', '1 tear namespace, 2 projectile, 4 entity flags, 8 anim_id', 1),
 ] + _block(34, 8, 'tear_w', 'word16', 'TearFlags bits 16k..16k+15, canonical (Rep TEARFLAG) numbering') \
@@ -290,21 +302,25 @@ NUM_RANGE = {
           'golden_bomb': (0.0, 1.0), 'golden_key': (0.0, 1.0), 'poop_mana': (0.0, 1.0), 'soul_charge': None,
           'blood_charge': None, 'damage': None, 'max_fire_delay': None, 'shot_speed': None, 'range': None,
           'move_speed': (0.0, 1.0), 'luck': None, 'can_fly': (0.0, 1.0), 'invulnerable': (0.0, 1.0),
-          'controls': (0.0, 1.0), 'dead': (0.0, 1.0), 'head_dir': (-0.25, 0.75), 'fire_dir': (-0.25, 0.75),
-          'move_dir': (-0.25, 0.75), 'sprite_frame': None, 'weapon_charge': None, 'body_index': (0.0, 0.75),
+          'controls': (0.0, 1.0), 'dead': (0.0, 1.0), 'sprite_frame': None, 'weapon_charge': None, 'body_index': (0.0, 0.75),
           'linked_body': (0.0, 1.0), 'stall_share': (0.0, 1.0), 'grid_w': (15 / 28, 1.0), 'grid_h': (9 / 16, 1.0),
           **{f'overflow_{c}': None for c in ENTITY_CLASSES}},
     'E': {'x': (-0.25, _GRID_X + 0.25), 'y': (-0.25, _GRID_Y + 0.25), 'vx': None, 'vy': None, 'size': None,
           'size_mx': None, 'size_my': None, 'coll': (0.0, 1.0), 'gcoll': (0.0, 1.0), 'cdmg': None,
           'sprite_frame': None, 'age': None, 'anim': None, 'flip_x': (0.0, 1.0), 'boss_hp': (0.0, 1.0),
           'height': None, 'fall': None, 'scale': None, 'l_cos': (-1.0, 1.0), 'l_sin': (-1.0, 1.0), 'l_len': None,
-          'l_ex': None, 'l_ey': None, 'l_radius': None, 'l_circle': (0.0, 1.0), 'price': None},
+          'l_ex': None, 'l_ey': None, 'l_radius': None, 'l_circle': (0.0, 1.0)},
     'N': {'owner': (0.0, 0.75), 'count': None, 'display_order': None},
     'S': {'owner': (0.0, 0.75), 'slot': None, 'occupied': (0.0, 1.0), 'selected': (0.0, 1.0), 'charge': (0.0, 1.0),
           'max_charge': (0.0, 1.0), 'battery': (0.0, 1.0), 'golden': (0.0, 1.0), 'giant': (0.0, 1.0),
           'display_order': None, 'sub_charge': None},
 }
 
+
+# REL_SCALE (batch 4): the model's relative quantities, computed at decode from the canvas-frame positions (never on
+# the wire): an offset (dx, dy px) / 200, a distance (px) / 300 -- tok_obs' scales of the model that learns (entity /
+# door / laser offsets / 200, distances / 300). Python only (not in the C header).
+REL_SCALE = {'offset': 200.0, 'distance': 300.0}
 
 # Engine argument ranges per game version (the convention above). (value, source); abp_bridge.lua V3_ABP = the values.
 # 'disasm' = the getter in isaac.x64 (sha256 b9bfef32...) read with objdump on 184; 'enums' = resources/scripts/enums.lua
@@ -408,9 +424,44 @@ CAT_ROWS = 1024
 CAT_NS = {'ptype': (0, 64), 'body_role': (64, 16), 'controller': (80, 16), 'animation': (96, 32), 'stage': (128, 32),
           'stage_type': (160, 16), 'room_type': (176, 64), 'difficulty': (240, 16), 'game_version': (256, 16),
           'control_scheme': (272, 16), 'entity_kind': (288, 16), 'champion': (304, 64), 'slot_family': (368, 16),
-          'charge_type': (384, 16)}   # 400..1023 free
+          'charge_type': (384, 16), 'price': (400, 128), 'direction': (528, 8)}   # 536..1023 free
 # code conventions: +2 (so -1 = 1 and 0 = 2; 0 stays "none") for these
 CAT_PLUS2 = ('ptype', 'controller', 'champion')
+# price (batch 4): the raw Price -> its code in the 'price' namespace. AB+ (enums.lua 548-553 PickupPrice: -1
+# PRICE_ONE_HEART, -2 PRICE_TWO_HEARTS, -3 PRICE_THREE_SOULHEARTS, -1000 PRICE_FREE) and measured (184 prices1: 5
+# characters x 4 seeds; devil rooms -1 / -2 with red heart containers, -3 without (???, the Lost, the Forgotten); shops
+# 3 / 5 / 15, with Steam Sale 2 / 3 / 7; -1000 not seen): 0 none; coins 1..99 as such; -1 -> 100, -2 -> 101,
+# -3 -> 102, -1000 -> 103; any other value -> the namespace's last row (unknown)
+PRICE_CODES = {-1: 100, -2: 101, -3: 102, -1000: 103}
+
+
+def price_code(v):
+    if _bad(v):
+        return CAT_NS['price'][1] - 1
+    v = int(v)
+    if v == 0:
+        return 0
+    if 1 <= v <= 99:
+        return v
+    return PRICE_CODES.get(v, CAT_NS['price'][1] - 1)
+
+
+def direction_code(v):
+    """Direction -1..3 (NO_DIRECTION, LEFT, UP, RIGHT, DOWN: enums.lua 1064) -> 1..5; else the last row."""
+    if _bad(v) or not -1 <= v <= 3:
+        return CAT_NS['direction'][1] - 1
+    return int(v) + 2
+
+
+# batch 4: the categorical columns whose wire value stays the raw engine value (not a code): the decode makes the
+# code (every other 'cat:' column carries its code on the wire, CAT_PLUS2 applied by the producer)
+CAT_FROM_RAW = {'price': price_code, 'direction': direction_code}
+
+
+def wire_cat_index(ns, wire):
+    """cat row of a 'cat:<ns>' column's wire value (the model does the same)."""
+    f = CAT_FROM_RAW.get(ns)
+    return cat_index(ns, f(wire) if f else wire)
 # anim (new, 4096 x 16): hash(file, animation) mod 4095 + 1, 0 unknown (collisions accepted)
 ANIM_ROWS = 4096
 GAME_VERSION = {'abplus': 1, 'rep': 2, 'rep_plus': 3}

@@ -5,6 +5,8 @@ The bridge (abp_bridge.lua: play_next, the step-line parse, begin_step_line) and
 checked here by their source text; their behaviour on the game is the drop probe's (abplus_probe_drop.py)."""
 import itertools
 import re
+import subprocess
+import shutil
 from pathlib import Path
 
 import pytest
@@ -78,3 +80,31 @@ def test_bridge_and_turbo_sources_take_the_seventh_number():
     c = (BRIDGE / 'engine' / 'abp_turbo.c').read_text(encoding='utf-8')
     assert 'static int step_read(int fd, long long v[7], const char **why)' in c
     assert 'for (int i = 0; i < 7; i++) LPUSHINT(L, v[i]);' in c
+
+def test_a_line_without_the_seventh_number_is_drop_0():
+    """Batch 4's convention: a step line without a 7th number is drop 0, the same step as a 7th number 0 -- the C parse
+    (abp_step_line.h, by itself: engine/test_step_line.c, where gcc exists) and the bridge's Lua patterns (read from the
+    source, run as Python regexes, with the Lua defaults)."""
+    lua = (BRIDGE / 'abplus' / 'abp_bridge.lua').read_text(encoding='utf-8')
+    fn = lua[lua.index('if line:byte(1) == 83 then'):lua.index('local ok, cmd = pcall(json.decode, line)')]
+    pats = [re.compile(p.replace('%d', r'\d')) for p in re.findall(r'line:match\("([^"]+)"\)', fn)]
+    assert len(pats) == 3 and 'drop = "0"' in fn and 'pill = "0"' in fn and 'tonumber(drop or "0")' in fn
+
+    def lua_parse(line):
+        for k, p in enumerate(pats):   # (the 7-, 6-, 5-number patterns in the bridge's order and its defaults)
+            m = p.match(line)
+            if m:
+                v = [int(x) for x in m.groups()]
+                return tuple(v + [0] * (7 - len(v)))
+        return None
+    assert lua_parse('S 4 1 2 0 1') == lua_parse('S 4 1 2 0 1 0 0') == lua_parse('S 4 1 2 0 1 0') == (4, 1, 2, 0, 1, 0, 0)
+    assert lua_parse('S 4 1 2 0 1 0 1')[6] == 1 and lua_parse('S 4 1 2 0') is None
+    gcc = shutil.which('gcc') or shutil.which('cc')
+    if gcc is None:
+        pytest.skip('no C compiler (the C half runs on 184: gcc engine/test_step_line.c)')
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        exe = str(Path(d) / 'step_line')
+        subprocess.run([gcc, '-O1', '-o', exe, str(BRIDGE / 'engine' / 'test_step_line.c')], check=True)
+        r = subprocess.run([exe], capture_output=True, text=True)
+        assert r.returncode == 0, r.stdout

@@ -17,7 +17,7 @@ CRLF, LF = chr(13) + chr(10), chr(10)   # (a Windows checkout may hold the heade
 
 
 def test_f1_sizes():
-    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111703
+    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111801
     assert (S.FIXED, S.PF, S.LOCAL, S.EF, S.NF, S.SF, S.BODY, S.RC) == (2417, 192, 405, 64, 8, 24, 597, 21)
     assert S.HEADER == 8 and S.MAGIC == 61107 and S.LAYOUT_GEN == 3
     assert S.frame_floats(1, 0, 0, 0) == 2417 + 597
@@ -183,5 +183,48 @@ def test_batch2_scales():
 def test_batch3_position_known():
     """Batch 3 (the coordinator, 2026-11-17): P col 54 position_known, a known flag; not a num column (no NUM_RANGE)."""
     P = S.P_COLS
-    assert S.col(P, 'position_known') == 54 and P[54][1] == 'known' and S.VERSION == 2026111703
+    assert S.col(P, 'position_known') == 54 and P[54][1] == 'known' and S.VERSION >= 2026111703
     assert 'position_known' not in S.NUM_RANGE['P']
+
+def test_batch4_categorical_direction_and_price():
+    """Batch 4 (the coordinator, 2026-11-18; VERSION 2026111801): P 33-35 'cat:direction', E 31 'cat:price'; the column
+    numbers stay; the four leave NUM_RANGE and the scale vector; the wire keeps the raw value (CAT_FROM_RAW: the decode
+    makes the code)."""
+    P, E = S.P_COLS, S.E_COLS
+    for c, n in ((33, 'head_dir'), (34, 'fire_dir'), (35, 'move_dir')):
+        assert S.col(P, n) == c and P[c][1] == 'cat:direction' and n not in S.NUM_RANGE['P']
+        assert S.scale_vector(P)[c] == 1.0
+    assert S.col(E, 'price') == 31 and E[31][1] == 'cat:price' and 'price' not in S.NUM_RANGE['E']
+    assert S.scale_vector(E)[31] == 1.0
+    assert S.CAT_NS['price'] == (400, 128) and S.CAT_NS['direction'] == (528, 8)
+    spans = sorted(S.CAT_NS.values())
+    assert all(a[0] + a[1] <= b[0] for a, b in zip(spans, spans[1:])) and spans[-1][0] + spans[-1][1] <= S.CAT_ROWS
+    for kind in {c[1] for cols in (P, E, S.N_COLS, S.S_COLS) for c in cols if c[1].startswith('cat:')}:
+        assert kind[4:] in S.CAT_NS, kind
+    # direction: Direction -1..3 (enums.lua 1064) -> 1..5; anything else the last row
+    assert [S.direction_code(v) for v in (-1, 0, 1, 2, 3)] == [1, 2, 3, 4, 5]
+    assert S.direction_code(4) == S.direction_code(-2) == S.direction_code(float('nan')) == 7
+    assert [S.wire_cat_index('direction', v) for v in (-1, 0, 3)] == [529, 530, 533]
+    # price: AB+ PickupPrice (enums.lua 548-553) and the measured values (184 prices1)
+    assert S.price_code(0) == 0
+    for v in (2, 3, 5, 7, 15, 99):
+        assert S.price_code(v) == v
+    assert [S.price_code(v) for v in (-1, -2, -3, -1000)] == [100, 101, 102, 103]
+    assert S.price_code(100) == S.price_code(-4) == S.price_code(float('nan')) == 127
+    assert S.wire_cat_index('price', -1) == 500 and S.wire_cat_index('price', 15) == 415
+    assert len({S.wire_cat_index('price', v) for v in (0, 2, 3, 5, 7, 15, -1, -2, -3, -1000, 100)}) == 11
+    # every other namespace: the wire carries the code already
+    assert S.wire_cat_index('ptype', 2) == S.cat_index('ptype', 2) and set(S.CAT_FROM_RAW) == {'price', 'direction'}
+
+
+def test_batch4_rel_scale_python_only():
+    """REL_SCALE (batch 4): the model's relative offsets / 200, distances / 300 (tok_obs' scales); not in the header."""
+    assert S.REL_SCALE == {'offset': 200.0, 'distance': 300.0}
+    header = (HERE.parents[1] / 'engine' / 'abp_schema_v3.h').read_text()
+    assert 'REL_SCALE' not in header and '#define ABP_V3_VERSION 2026111801' in header
+    assert '#define ABP_V3_CAT_NS_PRICE_BASE 400' in header and '#define ABP_V3_CAT_NS_DIRECTION_BASE 528' in header
+
+
+def test_batch4_the_raw_block_carries_the_version():
+    lua = (HERE.parents[1] / 'abplus' / 'abp_bridge.lua').read_text(encoding='utf-8')
+    assert f'schema = "isaac-visible-raw-v3", version = {S.VERSION},' in lua
