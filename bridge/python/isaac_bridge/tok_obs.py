@@ -424,7 +424,7 @@ def write_visible(o, row):
         from .visible_producer import write_v3
         v3 = write_v3(row, o)
     elif _VP.VISIBLE_V3_MODE:   # (2026-11-18, Codex round 2: a v3 worker writes a v3 frame for every record or stops)
-        raise ValueError('visible-v3: this worker is configured for mode %d, the record has no v3 frame and %s'
+        raise _VP.VisibleV3Fatal('visible-v3: this worker is configured for mode %d, the record has no v3 frame and %s'
                          % (_VP.VISIBLE_V3_MODE, 'no visible block' if vis is None else 'a visible block of schema %r'
                             % (vis.get('schema') if isinstance(vis, dict) else type(vis).__name__)))
     elif vis is not None:
@@ -769,8 +769,11 @@ class FastRow:
 
     def encode(self, item, row, row_address, t):
         c = self.ctx
-        if type(item) is bytes and _VP.needs_decode(item):   # (visible-v3: abp_row_encode does not know the v3 frame
-            item = self.decoder.decode(item)                    # or raw block; by the payload's flags, 2026-11-18)
+        # (visible-v3: abp_row_encode does not know the v3 frame or raw block -- by the payload's flags; and a worker
+        # configured for v3 sends every record through encode_row, whose check a record without one must meet:
+        # 2026-11-18, Codex rounds 2 / 3)
+        if type(item) is bytes and (_VP.VISIBLE_V3_MODE or _VP.needs_decode(item)):
+            item = self.decoder.decode(item)
         if type(item) is bytes:
             c[RC_T] = t
             c[RC_FIRST] = t == 0

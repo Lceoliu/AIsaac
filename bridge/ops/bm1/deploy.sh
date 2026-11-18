@@ -13,22 +13,28 @@ case $1 in
   abphome)
     T=$BM/trees/$2/bridge/engine
     A=$BM/${ABHOME:-home}/isaac-abplus
-    mkdir -p $A/tools $A/instances
+    # (2026-11-18, Codex round 3: every step passes its failure on; the installed library is replaced only by a build
+    # that succeeded (run.sh's rc 0: it passes gcc's on) and left a fresh non-empty file, by one rename; any failure
+    # leaves the installed library as it was)
+    fail() { echo "deploy.sh abphome: $*; the installed libabp_turbo.so left as it was" >&2; exit 1; }
+    mkdir -p $A/tools $A/instances || fail "mkdir"
     # (docker: the runtime is mounted read-only three levels above bm1/home/isaac-abplus; direct: a link to BM1_GAME_RUNTIME)
-    if [ ! -e $A/runtime ]; then if [ "$BM1_MODE" = docker ]; then ln -s "$BM1_RUNTIME_LINK" $A/runtime; else ln -s "$BM1_GAME_RUNTIME" $A/runtime; fi; fi
-    for f in run_instance.sh null_render_e.txt stub_render_g.txt stub_render_h.txt abp_turbo.c abp_v3_native.c abp_schema_v3.h abp_step_line.h; do cp $T/$f $A/tools/; done
-    chmod +x $A/tools/run_instance.sh
-    [ -f "$BM1_GAME_RUNTIME/../tools/stub_render_f.txt" ] && cp "$BM1_GAME_RUNTIME/../tools/stub_render_f.txt" $A/tools/
-    # (2026-11-18, Codex round 2: a failed build exits non-zero and leaves no old library in place to pass for the new
-    # one; built under a new name, checked, then moved over the old one)
-    [ -e $A/tools/libabp_turbo.so.new ] && trash $A/tools/libabp_turbo.so.new
-    $BM/run.sh build-turbo ${GPU:-1} sh -c "cd $BM1_IN/${ABHOME:-home}/isaac-abplus/tools && gcc -shared -fPIC -O2 -o libabp_turbo.so.new abp_turbo.c -ldl" || true
-    if [ ! -s $A/tools/libabp_turbo.so.new ] || [ $A/tools/libabp_turbo.so.new -ot $A/tools/abp_turbo.c ]; then
-      [ -e $A/tools/libabp_turbo.so ] && trash $A/tools/libabp_turbo.so
-      echo "deploy.sh abphome: libabp_turbo.so not built (the old one moved to trash)" >&2
-      exit 1
+    if [ ! -e $A/runtime ]; then if [ "$BM1_MODE" = docker ]; then ln -s "$BM1_RUNTIME_LINK" $A/runtime; else ln -s "$BM1_GAME_RUNTIME" $A/runtime; fi || fail "the runtime link"; fi
+    for f in run_instance.sh null_render_e.txt stub_render_g.txt stub_render_h.txt abp_turbo.c abp_v3_native.c abp_schema_v3.h abp_step_line.h; do
+      cp $T/$f $A/tools/ || fail "copying $f"
+    done
+    chmod +x $A/tools/run_instance.sh || fail "chmod"
+    if [ -f "$BM1_GAME_RUNTIME/../tools/stub_render_f.txt" ]; then cp "$BM1_GAME_RUNTIME/../tools/stub_render_f.txt" $A/tools/ || fail "copying stub_render_f.txt"; fi
+    NEW=$A/tools/libabp_turbo.so.new
+    if [ -e $NEW ]; then trash $NEW || fail "a stale $NEW"; fi
+    rc=0
+    $BM/run.sh build-turbo ${GPU:-1} sh -c "cd $BM1_IN/${ABHOME:-home}/isaac-abplus/tools && gcc -shared -fPIC -O2 -o libabp_turbo.so.new abp_turbo.c -ldl" || rc=$?
+    if [ $rc != 0 ] || [ ! -s $NEW ] || [ $NEW -ot $A/tools/abp_turbo.c ]; then
+      have=$([ -s $NEW ] && echo 'a new file left' || echo 'no new library')
+      [ -e $NEW ] && trash $NEW
+      fail "the build failed (run.sh rc $rc, $have)"
     fi
-    mv -f $A/tools/libabp_turbo.so.new $A/tools/libabp_turbo.so
+    mv -fT $NEW $A/tools/libabp_turbo.so || fail "installing the new library"
     ls -la $A/tools
     ;;
   tree)

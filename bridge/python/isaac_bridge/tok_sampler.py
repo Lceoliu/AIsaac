@@ -86,6 +86,7 @@ from .abplus_goexplore import GxConfig, Instance
 from .abplus_lean import LeanDecoder, read_lean, read_lean_raw
 from .env import BridgeError
 from .tok_obs import ROW, EpisodeState, FastRow, encode_row, fast_row_function
+from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal
 
 STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins', 'deaths', 'timeouts', 'empty',
          'step_s', 'wait_s', 'fork_s', 'encode_s', 'finished', 'extra_episodes', 'teach', 'teach_s', 'searches',
@@ -763,6 +764,38 @@ def parse_faults(index, text=None):
     return out
 
 
+def fatal_file(index, pid):
+    """(2026-11-18) Where a worker that stops on a visible-v3 protocol error leaves its reason: $ISAAC_RL_FATAL_DIR
+    (train_tok / eval_tok: their output directory) or ABP_HOME/instances/fatal, fatal-worker-<index>-<pid>.txt."""
+    base = os.environ.get('ISAAC_RL_FATAL_DIR') or str(ABP_HOME / 'instances' / 'fatal')
+    return Path(base) / f'fatal-worker-{index}-{pid}.txt'
+
+
+def report_fatal(index, conn, exc, who='tok worker'):
+    """(2026-11-18, the coordinator: the reason must reach the parent) A worker's VisibleV3Fatal, before any cleanup:
+    printed (stderr and stdout, flushed), written to fatal_file (flushed and synced) and sent to the parent over the
+    worker's pipe ('F' + the text: TokSampler takes it as the reason; the C++ actor drops the worker on it)."""
+    text = f'{who} {index}: visible-v3 protocol error, the worker stops: {exc}'
+    for stream in (sys.stderr, sys.stdout):
+        try:
+            print(text, file=stream, flush=True)
+        except (OSError, ValueError):
+            pass
+    try:
+        path = fatal_file(index, os.getpid())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text + '\n')
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+    try:
+        conn.send_bytes(b'F' + text.encode('utf-8', 'replace')[:8000])
+    except (OSError, ValueError):
+        pass
+
+
 class StartBuilder:
     """A worker's start states, built by its root instance in a helper thread (the worker plays on meanwhile), with a
     time limit (2026-10-05). start() begins the next build (the seed from next_seed, prepare(inst) first in the thread);
@@ -1150,6 +1183,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
             mine[ST['retries']] += 1
         builder.start(seed=retry)
 
+    v3_fatal = None   # (2026-11-18: a VisibleV3Fatal ends the worker with V3_FATAL_EXIT; 'fatal' is the teacher's)
     try:
         inst = Instance(f'{cfg.name}{index}', cfg.port + index, gx, spec)
         builder = StartBuilder(index, inst, cfg, next_seed, prepare)
@@ -1165,6 +1199,8 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
                 if not builder.wait(stopping, lambda: recover('stall')):
                     break
                 state_seed, exc = builder.take()
+                if isinstance(exc, VisibleV3Fatal):   # (a configuration / protocol error: no relaunch, the worker stops)
+                    raise exc
                 if exc is not None:
                     recover(f'failed ({type(exc).__name__}: {str(exc)[:200]})')
                     continue
@@ -1284,6 +1320,10 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
                     pass
                 episode = None
                 mine[ST['close_s']] += time.perf_counter() - t_close
+    except VisibleV3Fatal as exc:
+        v3_fatal = exc
+        report_fatal(index, conn, exc)   # (before the cleanup below)
+        mine[ST['errors']] += 1000
     except Exception:
         traceback.print_exc()
         mine[ST['errors']] += 1000
@@ -1312,6 +1352,8 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
             pass
         for b in blocks:
             b.close()
+    if v3_fatal is not None:
+        sys.exit(V3_FATAL_EXIT)
 
 
 class TokSampler:
@@ -1457,6 +1499,9 @@ class TokSampler:
             self.procs.append(proc)
         self.index = {c: i for i, c in enumerate(self.conns)}
         self.live = list(self.conns)
+        self.fatal = None   # (2026-11-18) a worker ended with V3_FATAL_EXIT: check_fatal raises VisibleV3Fatal
+        self._closing = False
+        self._fatal_reason = {}   # worker index -> the reason it sent ('F' message)
         # poll_ready: one persistent poll set over the workers' pipes (connection.wait builds a selector per call)
         self._poller = select.poll()
         self._by_fd = {}
@@ -1583,6 +1628,7 @@ class TokSampler:
                     self.procs[i].join(0.5)
                 except (AssertionError, ValueError, OSError):
                     pass
+                self._note_exit(i)
         try:
             self._poller.unregister(c.fileno())
         except (KeyError, ValueError, OSError):
@@ -1616,7 +1662,9 @@ class TokSampler:
                     i = self.index[c]
                     idx.append(i)
                     slots.append(2 * i + (msg == _MSG1))
-                else:   # 'x' (the worker ends), EOF or anything unexpected
+                else:   # 'x' (the worker ends), 'F' + a reason (a visible-v3 protocol error), EOF or anything else
+                    if msg[4:5] == b'F':
+                        self._take_reason(c, fd, msg)
                     self._drop(c)
             if not idx:
                 break
@@ -1625,10 +1673,53 @@ class TokSampler:
             if len(idx) >= want or time.perf_counter() - first >= max_wait or not self.live:
                 break
             timeout = 0
+        if self.fatal is not None and not self._closing:
+            raise VisibleV3Fatal(self.fatal)
         return np.array(idx, np.int64), np.array(slots, np.int64)
 
     def totals(self):
         return dict(zip(STATS, self.stats.sum(axis=0).tolist()))
+
+    def _take_reason(self, c, fd, head):
+        """poll_ready read 5 bytes of an 'F' message (4-byte length, 'F'): the rest is the worker's reason."""
+        n, got = int.from_bytes(head[:4], 'big') - 1, b''
+        try:
+            while len(got) < n:
+                part = os.read(fd, n - len(got))
+                if not part:
+                    break
+                got += part
+        except OSError:
+            pass
+        self._fatal_reason[self.index[c]] = got.decode('utf-8', 'replace')
+
+    def _note_exit(self, i):
+        """A worker that ended with V3_FATAL_EXIT, or sent its reason / left its fatal_file (the exit code can be
+        another one if its cleanup failed): self.fatal, with the reason (from the pipe, else the file) or a plain
+        statement that none reached the parent."""
+        if self.fatal is not None:
+            return
+        p = self.procs[i]
+        code = p.exitcode
+        reason = self._fatal_reason.get(i)
+        if reason is None and code is not None and p.pid is not None:
+            try:
+                reason = fatal_file(i, p.pid).read_text(encoding='utf-8').strip()
+            except OSError:
+                reason = None
+        if code == V3_FATAL_EXIT or reason is not None:
+            self.fatal = (f'tok worker {i} stopped on a visible-v3 protocol error (exit {code}): '
+                          f'{reason or "the reason did not reach the parent (no message on its pipe, no fatal file)"}'
+                          f' -- a version / mode / missing-frame error is not retried')
+
+    def check_fatal(self):
+        """(2026-11-18, Codex round 3) Raises VisibleV3Fatal when a worker ended with V3_FATAL_EXIT (a visible-v3
+        version / mode / frame error): train / eval stop with an error instead of going on with the other workers.
+        Cheap (each worker's exit code, not waited for); also run by poll / poll_ready and close."""
+        for i in range(len(self.procs)):
+            self._note_exit(i)
+        if self.fatal is not None:
+            raise VisibleV3Fatal(self.fatal)
 
     def poll(self, want, max_wait, idle=0.2):
         """The workers whose records are ready and the records' rows: waits up to `idle` s for the first, then until
@@ -1649,11 +1740,15 @@ class TokSampler:
                         idx.append(self.index[c])
                         slots.append(2 * self.index[c] + (msg == b'1'))
                     else:
+                        if msg[:1] == b'F':
+                            self._fatal_reason[self.index[c]] = msg[1:].decode('utf-8', 'replace')
                         self._drop(c)
                 except (EOFError, OSError):
                     self._drop(c)
             if first is None and idx:
                 first = time.perf_counter()
+        if self.fatal is not None and not self._closing:
+            raise VisibleV3Fatal(self.fatal)
         return idx, slots
 
     def teacher_records(self,with_block=False):
@@ -1719,6 +1814,7 @@ class TokSampler:
                 pass
 
     def close(self, timeout=60.0):
+        self._closing = True
         self.control[0] = 1
         end = time.time() + timeout
         while time.time() < end and any(p.is_alive() for p in self.procs) and self.live:
@@ -1728,6 +1824,8 @@ class TokSampler:
             p.join(max(0.1, end - time.time()))
             if p.is_alive():
                 p.terminate()
+        for i in range(len(self.procs)):
+            self._note_exit(i)
         self.rows = self.actions = self.stats = self.control = self.teach_rows = self.teach_meta = None
         self.choice_rows = self.choice_meta = self.aux = None
         self.lab_jobs = self.lab_res = None
@@ -1746,3 +1844,5 @@ class TokSampler:
                 os.unlink(self.png_file)
             except OSError:
                 pass
+        if self.fatal is not None:   # (2026-11-18: after everything is closed: the caller fails)
+            raise VisibleV3Fatal(self.fatal)

@@ -48,7 +48,7 @@ def actions(seed, steps):
 def record(argv):
     import argparse
     sys.path.insert(0, os.getcwd())   # (the tree's python dir: its isaac_bridge, its probes)
-    for k in ('ISAAC_RL_VISIBLE_V3', 'ISAAC_RL_NATIVE_VISIBLE'):
+    for k in ('ISAAC_RL_VISIBLE_V3', 'ISAAC_RL_NATIVE_VISIBLE', 'ISAAC_RL_TRIGGER_ONCE'):   # (+ trigger, 2026-11-18)
         os.environ.pop(k, None)
     import numpy as np
     from abplus_probe_fork import digest
@@ -81,7 +81,7 @@ def record(argv):
     first, count = (int(v) for v in args.seeds.split(':'))
     fp, fr = open(os.path.join(out, 'payloads.bin'), 'wb'), open(os.path.join(out, 'rows.bin'), 'wb')
     fi = open(os.path.join(out, 'index.jsonl'), 'w')
-    env = {k: os.environ.get(k) for k in ('ISAAC_RL_VISIBLE_V3', 'ISAAC_RL_NATIVE_VISIBLE', 'ABP_FAST',
+    env = {k: os.environ.get(k) for k in ('ISAAC_RL_VISIBLE_V3', 'ISAAC_RL_NATIVE_VISIBLE', 'ISAAC_RL_TRIGGER_ONCE', 'ABP_FAST',
                                           'ISAAC_RL_LEAN_ITEMS')}
     fi.write(json.dumps(dict(env=env, row_itemsize=ROW.itemsize, args=vars(args))) + '\n')
     try:
@@ -272,6 +272,8 @@ def analyze(a, b):
         for k in set(s1) | set(s2):
             if k in ('logic_frames', 'terrain_json', 'visible_json'):
                 continue
+            if k == 'players' and s1.get(k) != s2.get(k) and len(s1.get(k) or b'') != len(s2.get(k) or b''):
+                res['player_fields']['<count>'] = res['player_fields'].get('<count>', 0) + 1
             if k == 'players' and s1.get(k) != s2.get(k) and len(s1[k]) == len(s2[k]):
                 import numpy as np
                 u, v = np.frombuffer(s1[k], AL.PLAYER), np.frombuffer(s2[k], AL.PLAYER)
@@ -299,6 +301,8 @@ def analyze(a, b):
             if v1 is not None and v2 is not None:
                 for q in json_paths(json.loads(v1), json.loads(v2)):
                     res['visible_paths'][q] = res['visible_paths'].get(q, 0) + 1
+            else:   # (a block on one side only)
+                res['visible_paths']['<present on one side>'] = res['visible_paths'].get('<present on one side>', 0) + 1
         lf1, lf2 = struct.unpack('<I', s1['logic_frames'])[0], struct.unpack('<I', s2['logic_frames'])[0]
         key = (x['seed'], x['items'])
         if prev is not None and prev[0] == key:
@@ -307,8 +311,14 @@ def analyze(a, b):
             res['logic_frames_increment_equal'] += 1   # (an episode's first payload: nothing to compare)
         prev = (key, lf1, lf2)
     n = len(sa)
-    res['ok'] = (len(sa) == len(sb) and all(v[0] == v[1] == n or (k not in ('magic', 'header_rest', 'room', 'totals',
-                 'players', 'doors', 'entities', 'lasers', 'rest') and v[0] == v[1]) for k, v in res['parts'].items())
+    # (2026-11-18, Codex round 3) ok: records on both sides (none is no pass); every part equal byte for byte but the
+    # launch-dependent ones -- players only in the id field (p.Index), logic_frames as increments, the terrain and
+    # visible JSON as values (no field of a visible block differing, none on one side only)
+    players_ok = set(res['player_fields']) <= {'id'}
+    res['ok'] = (n > 0 and len(sa) == len(sb) and players_ok and not res['visible_paths'] and
+                 all(v[0] == v[1] == n or (k == 'players' and v[0] == n) or
+                     (k not in ('magic', 'header_rest', 'room', 'totals', 'players', 'doors', 'entities', 'lasers',
+                                'rest') and v[0] == v[1]) for k, v in res['parts'].items())
                  and res['terrain_json_value_equal'] == res['terrain_blocks'] and res['logic_frames_increment_equal'] == n)
     print(json.dumps(res, indent=1))
     return 0 if res['ok'] else 1

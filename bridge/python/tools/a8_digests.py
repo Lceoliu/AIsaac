@@ -10,9 +10,12 @@ import os
 import sys
 
 
+SWITCHES = ('ISAAC_RL_VISIBLE_V3', 'ISAAC_RL_NATIVE_VISIBLE', 'ISAAC_RL_TRIGGER_ONCE')   # (2026-11-18: + trigger)
+
+
 def run(argv):
     sys.path.insert(0, os.getcwd())   # (the tree's python dir)
-    for k in ('ISAAC_RL_VISIBLE_V3', 'ISAAC_RL_NATIVE_VISIBLE'):
+    for k in SWITCHES:   # (the old arm: every visible / trigger switch at its default)
         os.environ.pop(k, None)
     out = argv[argv.index('--out') + 1]
     os.makedirs(out, exist_ok=True)
@@ -42,7 +45,10 @@ def compare(a, b):
     eq = sum(x['d'] == y['d'] for x, y in zip(la, lb))
     sa = json.load(open(os.path.join(a, 'summary.json')))
     sb = json.load(open(os.path.join(b, 'summary.json')))
-    ok = len(la) == len(lb) > 0 and eq == len(la)
+    # (2026-11-18, Codex round 3: both probes' own summaries all ok too, not the digests alone)
+    runs_ok = all(isinstance(s_.get('seeds'), int) and s_.get('seeds', 0) > 0 and s_.get('ok') == s_.get('seeds')
+                  for s_ in (sa, sb))
+    ok = len(la) == len(lb) > 0 and eq == len(la) and runs_ok
     print(json.dumps(dict(digests=[len(la), len(lb)], equal=eq, ok=ok,
                           summary_a={k: sa.get(k) for k in ('seeds', 'ok')},
                           summary_b={k: sb.get(k) for k in ('seeds', 'ok')},

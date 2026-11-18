@@ -19,9 +19,6 @@ from pathlib import Path
 
 import numpy as np
 
-os.environ.setdefault('ISAAC_RL_VISIBLE_V3', '3')
-os.environ.setdefault('ISAAC_RL_NATIVE_VISIBLE', '1')   # (mode 0 = the v2 native path: G mode 1 + abp_visible.c)
-
 from abplus_probe_native_obs import read_raw   # noqa: E402
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec   # noqa: E402
 from isaac_bridge import schema_v3 as V3, visible_producer as VP   # noqa: E402
@@ -62,6 +59,24 @@ def compare(native, ref, names, stats, rec):
             else:
                 k = int(np.flatnonzero(x.view(np.uint32) != y.view(np.uint32))[0])
                 st['first'].append(dict(record=rec, index=k, native=float(x[k]), reference=float(y[k])))
+
+
+def classify_raw_only(raw, n_fb, why, fallbacks, allowed):
+    """A decoded record without the native frame (mode 3): ('raw_only_allowed', why) only when it carries a raw v3
+    block, the bridge's fallback counter moved by exactly one at it (n_fb: after, fallbacks: before), the reason is an
+    allowed one, and the reference encoder encodes the block (2026-11-18, Codex round 4: as the worker's write_v3 --
+    a block of another version or a short grid is refused there); else ('other_missing', why)."""
+    if not VP.is_raw_v3(raw):
+        return 'other_missing', f'{why}; no raw v3 block'
+    if n_fb != fallbacks + 1:
+        return 'other_missing', f'{why}; the fallback counter moved by {n_fb - fallbacks}'
+    if why not in allowed:
+        return 'other_missing', why
+    try:
+        VP.observation_frame_v3(raw)
+    except Exception as exc:   # (VisibleV3Fatal, ValueError, a missing field: the worker would not take it)
+        return 'other_missing', f'{why}; the reference encoder: {type(exc).__name__}: {str(exc)[:120]}'
+    return 'raw_only_allowed', why
 
 
 def set_mode(c, mode):
@@ -108,6 +123,7 @@ def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1, cover=COVE
         dec = LeanDecoder()
         st = EpisodeState(limit=10 ** 6, floor=True, stall=120)
         row = np.zeros(1, ROW)
+        fallbacks = int(c.lua("return tostring(ABP_NATIVE_V3.fallbacks)")) if mode == 3 else 0
         c._send({"cmd": "obs"})
         payload = read_raw(c)
         cpu0 = game_cpu(c)
@@ -118,10 +134,25 @@ def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1, cover=COVE
                 encode_row(o, st, row, t)
                 worker += time.thread_time() - w0
             if mode == 3:
-                if o.visible_v3_frame is None or not VP.is_raw_v3(o.visible):
-                    stats.setdefault('missing', 0)
-                    stats['missing'] += 1
+                # (2026-11-18, Codex round 3: every decoded record accounted for -- both blocks (compared), a raw-only
+                # hand-back of an allowed reason (the bridge's fallback counter up by one at this record, its reason
+                # read), or another missing frame (a failure); not the bridge's own counts, which include the payload
+                # after the last decision)
+                acct = stats.setdefault('records', dict(both=0, raw_only_allowed=0, other_missing=0, other_first=[]))
+                if o.visible_v3_frame is None:
+                    n_fb, why = c.lua("return tostring(ABP_NATIVE_V3.fallbacks) .. '|' .. "
+                                      "tostring(ABP_NATIVE_V3.last_fallback)").split('|', 1)
+                    kind, why = classify_raw_only(o.visible, int(n_fb), why, fallbacks, ALLOWED_FALLBACKS)
+                    fallbacks = int(n_fb)
+                    acct[kind] += 1
+                    if kind != 'raw_only_allowed' and len(acct['other_first']) < 5:
+                        acct['other_first'].append(dict(record=rec, raw_v3=VP.is_raw_v3(o.visible), reason=why))
+                elif not VP.is_raw_v3(o.visible):
+                    acct['other_missing'] += 1
+                    if len(acct['other_first']) < 5:
+                        acct['other_first'].append(dict(record=rec, raw_v3=False, reason='frame without a raw block'))
                 else:
+                    acct['both'] += 1
                     compare(o.visible_v3_frame, VP.observation_frame_v3(o.visible), names, stats, rec)
                     raw = o.visible
                     cover['shape'][str(raw['shape'])] = cover['shape'].get(str(raw['shape']), 0) + 1
@@ -147,15 +178,25 @@ def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1, cover=COVE
     return rec, cpu, ack, worker
 
 
+ALLOWED_FALLBACKS = {'lethal hit cancelled'}   # (main: --allowed-fallbacks)
+
+
 def failures(stats, fallback_reasons, allowed):
-    """The run's verdict (2026-11-18, Codex round 2): None when every compared section is equal, something was compared
-    in each, and every native hand-back reason is an allowed one; else what failed."""
-    parts = {k: v for k, v in stats.items() if isinstance(v, dict)}
+    """The run's verdict (2026-11-18, Codex rounds 2 / 3): None when every decoded record is accounted for -- both
+    blocks, or a raw-only hand-back of an allowed reason; no other missing frame -- every compared section equal and
+    compared once for each record with both blocks (> 0), and every reason the bridge reports allowed; else what
+    failed."""
+    acct = stats.get('records') or dict(both=0, raw_only_allowed=0, other_missing=0)
+    parts = {k: v for k, v in stats.items() if k != 'records' and isinstance(v, dict)}
     bad = sorted(k for k, v in parts.items() if v['equal'] != v['compared'])
-    empty = not parts or min(v['compared'] for v in parts.values()) == 0
+    short = sorted(k for k, v in parts.items() if v['compared'] != acct['both'])
+    if 'frame' not in parts:   # (2026-11-18, round 4: the whole frame is the verdict, whatever --sections lists)
+        short.append('frame (not compared)')
+    empty = not parts or acct['both'] == 0
     unknown = sorted(set(fallback_reasons) - {r for r in allowed if r})
-    if bad or empty or unknown:
-        return dict(differ=bad, nothing_compared=empty, reasons_not_allowed=unknown)
+    if bad or short or empty or unknown or acct['other_missing']:
+        return dict(differ=bad, compared_short=short, nothing_compared=empty, reasons_not_allowed=unknown,
+                    other_missing=acct['other_missing'])
     return None
 
 
@@ -173,9 +214,17 @@ def main():
                     help='native hand-back reasons that do not fail the run (comma-separated)')
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
+    # (2026-11-18, Codex round 3: the defaults here, not at import -- a test importing failures() leaves the
+    # environment alone; the worker's configured mode follows the one the game is launched with)
+    os.environ.setdefault('ISAAC_RL_VISIBLE_V3', '3')
+    os.environ.setdefault('ISAAC_RL_NATIVE_VISIBLE', '1')   # (mode 0 = the v2 native path: G mode 1 + abp_visible.c)
+    VP.VISIBLE_V3_MODE = VP.configured_mode(os.environ['ISAAC_RL_VISIBLE_V3'])
+    ALLOWED_FALLBACKS.clear()
+    ALLOWED_FALLBACKS.update(r for r in args.allowed_fallbacks.split(',') if r)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    names = [v for v in args.sections.split(',') if v]
+    # ('frame', every byte, is always compared -- the verdict's; --sections adds the per-section diagnostics)
+    names = ['frame'] + [v for v in args.sections.split(',') if v and v != 'frame']
     spec = load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))
     stub = str(Path(default_preload()).parent / 'stub_render_h.txt')
     os.environ.update(FORK_ENV)
@@ -204,7 +253,7 @@ def main():
     finally:
         inst.kill()
     summary = dict(records=rec, sections=stats, bridge=acks, coverage=COVER,
-                   frame_bytes_mean=round(COVER['bytes'] / max(1, rec - stats.get('missing', 0)), 1),
+                   frame_bytes_mean=round(COVER['bytes'] / max(1, (stats.get('records') or {}).get('both', 0)), 1),
                    fallback_reasons={k: sum(int((a.get('reasons') or {}).get(k, 0)) for a in acks)
                                      for k in sorted({k for a in acks for k in (a.get('reasons') or {})})},
                    game_cpu_ms_per_decision={f'mode{m}': round(float(np.mean(v)), 4) for m, v in timing.items()},

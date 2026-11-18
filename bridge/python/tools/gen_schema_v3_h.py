@@ -82,7 +82,7 @@ def generate():
     L += _bits('MAP', S.MAP_BITS)
     L += ['', '/* ---- F1: sizes */', f'#define ABP_V3_FIXED {S.FIXED}', f'#define ABP_V3_PF {S.PF}',
           f'#define ABP_V3_EF {S.EF}', f'#define ABP_V3_NF {S.NF}', f'#define ABP_V3_SF {S.SF}',
-          f'#define ABP_V3_BODY {S.BODY}', f'#define ABP_V3_CAP_ENTITY {S.CAP_ENTITY}',
+          f'#define ABP_V3_BODY {S.BODY}', f'#define ABP_V3_CAP_ENTITY {S.CAP_ENTITY}', f'#define ABP_V3_CAP_BODY {S.CAP_BODY}',
           '/* frame floats = ABP_V3_FIXED + p * ABP_V3_BODY + e * ABP_V3_EF + n * ABP_V3_NF + s * ABP_V3_SF */',
           '', '/* ---- F1: columns (raw units on the wire; reserved columns 0) */']
     for prefix, cols in (('P', S.P_COLS), ('E', S.E_COLS), ('N', S.N_COLS), ('S', S.S_COLS)):
