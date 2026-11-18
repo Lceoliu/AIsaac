@@ -300,7 +300,8 @@ def test_native_probe_verdict():
     probe = _load(PY / 'abplus_probe_v3_native.py', 'probe_v3_native')
     assert os.environ.get('ISAAC_RL_VISIBLE_V3') == before   # (no environment written at import)
     acct = lambda both, ok=0, other=0: dict(both=both, raw_only_allowed=ok, other_missing=other, other_first=[])
-    good = {'records': acct(5, 1), 'P': dict(compared=5, equal=5), 'E': dict(compared=5, equal=5)}
+    good = {'records': acct(5, 1), 'frame': dict(compared=5, equal=5), 'P': dict(compared=5, equal=5),
+            'E': dict(compared=5, equal=5)}
     assert probe.failures(good, {'lethal hit cancelled': 1}, ['lethal hit cancelled']) is None
     assert probe.failures({**good, 'E': dict(compared=5, equal=4)}, {}, [])['differ'] == ['E']
     assert probe.failures({**good, 'records': acct(5, 1, 1)}, {}, [])['other_missing'] == 1
@@ -308,6 +309,28 @@ def test_native_probe_verdict():
     assert probe.failures({'records': acct(0), 'P': dict(compared=0, equal=0)}, {}, [])['nothing_compared']
     assert probe.failures({**good, 'P': dict(compared=4, equal=4)}, {}, [])['compared_short'] == ['P']
     assert probe.failures(good, {'v3: grid size': 2}, ['lethal hit cancelled'])['reasons_not_allowed'] == ['v3: grid size']
+
+
+def test_native_probe_raw_only_records_must_encode():
+    """(2026-11-18, Codex round 4) A raw-only record counts as an allowed hand-back only when the reference encoder
+    encodes its block (as the worker's write_v3): a lethal-hit hand-back whose block is of another version or has a
+    short grid is another missing frame. And the verdict needs the whole frame compared, whatever --sections lists."""
+    probe = _load(PY / 'abplus_probe_v3_native.py', 'probe_v3_native_r4')
+    allowed = {'lethal hit cancelled'}
+    why = 'lethal hit cancelled'
+    assert probe.classify_raw_only(RAW, 6, why, 5, allowed) == ('raw_only_allowed', why)
+    old = dict(RAW, version=2026111801)
+    short = dict(RAW, cells=RAW['cells'][:int(RAW['gw']) * int(RAW['gh']) - 1])
+    for raw in (old, short):
+        kind, w = probe.classify_raw_only(raw, 6, why, 5, allowed)
+        assert kind == 'other_missing' and 'the reference encoder' in w
+    assert probe.classify_raw_only(RAW, 7, why, 5, allowed)[0] == 'other_missing'      # (the counter moved by 2)
+    assert probe.classify_raw_only(RAW, 6, 'v3: grid size', 5, allowed)[0] == 'other_missing'
+    assert probe.classify_raw_only(None, 6, why, 5, allowed)[0] == 'other_missing'
+    acct = dict(both=5, raw_only_allowed=1, other_missing=0, other_first=[])
+    header_only = {'records': acct, 'header': dict(compared=5, equal=5)}   # (--sections header: no 'frame')
+    assert probe.failures(header_only, {}, [])['compared_short'] == ['frame (not compared)']
+    assert probe.failures({**header_only, 'frame': dict(compared=5, equal=5)}, {}, []) is None
 
 
 def test_drop_probe_verdict():

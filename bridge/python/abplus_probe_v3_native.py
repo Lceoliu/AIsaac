@@ -61,6 +61,24 @@ def compare(native, ref, names, stats, rec):
                 st['first'].append(dict(record=rec, index=k, native=float(x[k]), reference=float(y[k])))
 
 
+def classify_raw_only(raw, n_fb, why, fallbacks, allowed):
+    """A decoded record without the native frame (mode 3): ('raw_only_allowed', why) only when it carries a raw v3
+    block, the bridge's fallback counter moved by exactly one at it (n_fb: after, fallbacks: before), the reason is an
+    allowed one, and the reference encoder encodes the block (2026-11-18, Codex round 4: as the worker's write_v3 --
+    a block of another version or a short grid is refused there); else ('other_missing', why)."""
+    if not VP.is_raw_v3(raw):
+        return 'other_missing', f'{why}; no raw v3 block'
+    if n_fb != fallbacks + 1:
+        return 'other_missing', f'{why}; the fallback counter moved by {n_fb - fallbacks}'
+    if why not in allowed:
+        return 'other_missing', why
+    try:
+        VP.observation_frame_v3(raw)
+    except Exception as exc:   # (VisibleV3Fatal, ValueError, a missing field: the worker would not take it)
+        return 'other_missing', f'{why}; the reference encoder: {type(exc).__name__}: {str(exc)[:120]}'
+    return 'raw_only_allowed', why
+
+
 def set_mode(c, mode):
     c._send({"cmd": "visible_v3", "mode": mode})
     ack = c._recv()
@@ -124,10 +142,10 @@ def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1, cover=COVE
                 if o.visible_v3_frame is None:
                     n_fb, why = c.lua("return tostring(ABP_NATIVE_V3.fallbacks) .. '|' .. "
                                       "tostring(ABP_NATIVE_V3.last_fallback)").split('|', 1)
-                    ok = VP.is_raw_v3(o.visible) and int(n_fb) == fallbacks + 1 and why in ALLOWED_FALLBACKS
+                    kind, why = classify_raw_only(o.visible, int(n_fb), why, fallbacks, ALLOWED_FALLBACKS)
                     fallbacks = int(n_fb)
-                    acct['raw_only_allowed' if ok else 'other_missing'] += 1
-                    if not ok and len(acct['other_first']) < 5:
+                    acct[kind] += 1
+                    if kind != 'raw_only_allowed' and len(acct['other_first']) < 5:
                         acct['other_first'].append(dict(record=rec, raw_v3=VP.is_raw_v3(o.visible), reason=why))
                 elif not VP.is_raw_v3(o.visible):
                     acct['other_missing'] += 1
@@ -172,6 +190,8 @@ def failures(stats, fallback_reasons, allowed):
     parts = {k: v for k, v in stats.items() if k != 'records' and isinstance(v, dict)}
     bad = sorted(k for k, v in parts.items() if v['equal'] != v['compared'])
     short = sorted(k for k, v in parts.items() if v['compared'] != acct['both'])
+    if 'frame' not in parts:   # (2026-11-18, round 4: the whole frame is the verdict, whatever --sections lists)
+        short.append('frame (not compared)')
     empty = not parts or acct['both'] == 0
     unknown = sorted(set(fallback_reasons) - {r for r in allowed if r})
     if bad or short or empty or unknown or acct['other_missing']:
@@ -203,7 +223,8 @@ def main():
     ALLOWED_FALLBACKS.update(r for r in args.allowed_fallbacks.split(',') if r)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    names = [v for v in args.sections.split(',') if v]
+    # ('frame', every byte, is always compared -- the verdict's; --sections adds the per-section diagnostics)
+    names = ['frame'] + [v for v in args.sections.split(',') if v and v != 'frame']
     spec = load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))
     stub = str(Path(default_preload()).parent / 'stub_render_h.txt')
     os.environ.update(FORK_ENV)
