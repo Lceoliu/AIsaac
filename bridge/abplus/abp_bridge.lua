@@ -214,9 +214,14 @@ local CONTROLLED = {
 -- frame: control_drop_pocket_items (0x6a7780) swapped the Schoolbag's active items / the pocket slots twice (back again;
 -- 184 dropin4: the query, player update, post update sequence). Its IsActionTriggered(ACTION_DROP) is the only one for
 -- a player entity (one per player update): the first such query of a press answers true, every later one false.
--- (ITEM, PILLCARD and BOMB have the same double answer; kept as they were: the trajectories of the models trained
--- with them stay as they are.)
+-- A real key press is "triggered" in one input poll only (Manager::Update 0x7d84c0: one KAGE::Input::Manager::Poll,
+-- whose InputDeviceBase::Poll copies the current state to the previous one first, then one Game::Update with one
+-- player update). ITEM, PILLCARD and BOMB (control_active_item, control_pocket_item, control_bombs: one
+-- IsActionTriggered each per player update) have the same double answer; by default they keep it (the trajectories of
+-- the models trained with it stay as they are): ISAAC_RL_TRIGGER_ONCE=1 at launch, or ABP_SET_TRIGGER_ONCE(true) from
+-- game code (a probe, per clone), answers them once per press too. DROP (new, no history) is always once.
 local TRIGGER_ONCE = { [A.ACTION_DROP] = true }
+local TRIGGER_ONCE_ALL = { A.ACTION_ITEM, A.ACTION_PILLCARD, A.ACTION_BOMB }
 local MOVE = {
 	[0] = {}, [1] = { A.ACTION_UP }, [2] = { A.ACTION_UP, A.ACTION_RIGHT }, [3] = { A.ACTION_RIGHT },
 	[4] = { A.ACTION_RIGHT, A.ACTION_DOWN }, [5] = { A.ACTION_DOWN }, [6] = { A.ACTION_DOWN, A.ACTION_LEFT },
@@ -913,11 +918,27 @@ local function push_input()
 	getenv("ABP_INPUT:" .. h .. ":" .. t)
 end
 
+local function trigger_once_mask()
+	local m = 0
+	for a in pairs(TRIGGER_ONCE) do m = m | (1 << a) end
+	return m
+end
+
+-- ISAAC_RL_TRIGGER_ONCE=1 / ABP_SET_TRIGGER_ONCE(all): ITEM, PILLCARD, BOMB answered once per press too (see
+-- TRIGGER_ONCE); the native input gets the same set (ABP_INPUT_ONCE:<mask>)
+function ABP_SET_TRIGGER_ONCE(all)
+	for _, a in ipairs(TRIGGER_ONCE_ALL) do TRIGGER_ONCE[a] = all and true or nil end
+	if state.native_input then getenv("ABP_INPUT_ONCE:" .. trigger_once_mask()) end
+	return trigger_once_mask()
+end
+if getenv("ISAAC_RL_TRIGGER_ONCE") == "1" then ABP_SET_TRIGGER_ONCE(true) end
+
 local function set_native_input(on)
 	if on and state.client and state.control then
 		local mask = 0
 		for a in pairs(CONTROLLED) do mask = mask | (1 << a) end
 		state.native_input = getenv("ABP_INPUT_ON:" .. mask) == "1"
+		if state.native_input then getenv("ABP_INPUT_ONCE:" .. trigger_once_mask()) end
 		push_input()
 	else
 		if state.native_input then getenv("ABP_INPUT_OFF") end

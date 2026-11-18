@@ -118,4 +118,8 @@ def test_drop_is_pressed_this_frame_once_per_press():
     assert 'local TRIGGER_ONCE = { [A.ACTION_DROP] = true }' in lua
     assert 'state.trigger_used = {}' in lua and 'if TRIGGER_ONCE[action] then' in lua
     c = (BRIDGE / 'engine' / 'abp_turbo.c').read_text(encoding='utf-8')
-    assert '#define INPUT_ONCE_MASK (1u << 11)' in c and 'if (input_triggered) input_once_used = 0;' in c
+    assert 'static uint32_t input_once_mask = 1u << 11;' in c and 'if (input_triggered) input_once_used = 0;' in c
+    # the switch (default off: ITEM / PILLCARD / BOMB answered as before; on: once per press, both paths)
+    assert 'local TRIGGER_ONCE_ALL = { A.ACTION_ITEM, A.ACTION_PILLCARD, A.ACTION_BOMB }' in lua
+    assert 'if getenv("ISAAC_RL_TRIGGER_ONCE") == "1" then ABP_SET_TRIGGER_ONCE(true) end' in lua
+    assert 'getenv("ABP_INPUT_ONCE:" .. trigger_once_mask())' in lua and '"ABP_INPUT_ONCE:", 15' in c

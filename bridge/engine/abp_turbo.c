@@ -756,7 +756,9 @@ static uint32_t input_mask, input_held, input_triggered;
 // TRIGGER_ONCE, abp_bridge.lua: AB+ updates the player twice per game frame, so its one IsActionTriggered(ACTION_DROP)
 // per player update saw the press twice and swapped the Schoolbag / the pocket slots back); input_once_used: those of
 // them answered true since the last ABP_INPUT
-#define INPUT_ONCE_MASK (1u << 11)   // ButtonAction.ACTION_DROP
+// getenv("ABP_INPUT_ONCE:<mask>") sets the set (the bridge: DROP always; ITEM, PILLCARD, BOMB with
+// ISAAC_RL_TRIGGER_ONCE=1 / ABP_SET_TRIGGER_ONCE(true))
+static uint32_t input_once_mask = 1u << 11;   // ButtonAction.ACTION_DROP
 static uint32_t input_once_used;
 static uint64_t input_answers, input_passed;
 
@@ -771,7 +773,7 @@ static char input_hook_b(void *engine, void *entity, int hook, unsigned action, 
     }
     if (native_action(entity, action)) {
         unsigned char v = ((hook == 0 ? input_held : input_triggered) >> action) & 1;
-        if (hook != 0 && v && ((INPUT_ONCE_MASK >> action) & 1)) {   // (the first query of the press only)
+        if (hook != 0 && v && ((input_once_mask >> action) & 1)) {   // (the first query of the press only)
             if ((input_once_used >> action) & 1) v = 0;
             input_once_used |= 1u << action;
         }
@@ -2891,7 +2893,11 @@ char *getenv(const char *name) {
             char *end = NULL;
             input_held = (uint32_t)strtoul(name + 10, &end, 10);
             input_triggered = end && *end == ':' ? (uint32_t)strtoul(end + 1, NULL, 10) : 0;
-            if (input_triggered) input_once_used = 0;   // (a new press: see INPUT_ONCE_MASK)
+            if (input_triggered) input_once_used = 0;   // (a new press: see input_once_mask)
+            return getenv_ok;
+        }
+        if (strncmp(name, "ABP_INPUT_ONCE:", 15) == 0) {
+            input_once_mask = (uint32_t)strtoul(name + 15, NULL, 10);
             return getenv_ok;
         }
         if (strncmp(name, "ABP_INPUT_ON:", 13) == 0) {
