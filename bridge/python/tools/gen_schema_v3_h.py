@@ -62,8 +62,9 @@ def generate():
          '/* ---- F1: identity and header */',
          f'#define ABP_V3_SCHEMA "{S.SCHEMA}"', f'#define ABP_V3_VERSION {S.VERSION}',
          f'#define ABP_V3_FRAME_BYTES {S.FRAME_BYTES}', f'#define ABP_V3_MAGIC {S.MAGIC}',
-         f'#define ABP_V3_LAYOUT_GEN {S.LAYOUT_GEN}', f'#define ABP_V3_HEADER {S.HEADER}']
-    for k in ('H_MAGIC', 'H_SIZE', 'H_P', 'H_E', 'H_N', 'H_S', 'H_GEN', 'H_PRODUCER'):
+         f'/* header[6]: VERSION - {S.VERSION_BASE}, exact in float32 (schema_v3.version_word) */',
+         f'#define ABP_V3_VERSION_WORD {S.VERSION_WORD}', f'#define ABP_V3_HEADER {S.HEADER}']
+    for k in ('H_MAGIC', 'H_SIZE', 'H_P', 'H_E', 'H_N', 'H_S', 'H_VERSION', 'H_PRODUCER'):
         L.append(f'#define ABP_V3_{k} {getattr(S, k)}')
     for k, v in S.PRODUCER.items():
         L.append(f'#define ABP_V3_PRODUCER_{_ident(k)} {v}')

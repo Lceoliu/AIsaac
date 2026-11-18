@@ -54,6 +54,10 @@ every sub-player follows its own player (player 0, its sub-player, player 1, ...
 (5 or 6 numbers) drop is 0, the same held / triggered set as a 7th number 0 (abp_step_line.h; the game frames equal:
 the drop probe's zero case, golden digests).
 
+Batch 5 (the coordinator, 2026-11-18; VERSION 2026111802; header semantics only, no column and no size changed):
+header[6] is VERSION_WORD = VERSION - 2026000000 (was LAYOUT_GEN 3); every reader checks it against its own
+schema_v3 frame by frame. Any later change of the layout or of a column's meaning raises VERSION.
+
 Entities sent (convention, the coordinator 2026-11-17; no shape change): every visible entity but the players (they are
 bodies), wherever it is (outside the grid too); effects (type 1000) likewise except a decorative list kept by the
 producers (abp_bridge.lua V3_DECORATIVE_SPEC = visible_producer.V3_DECORATIVE_WHY, each entry with its reason). An
@@ -75,16 +79,35 @@ applies SCALE (below) itself. Known flags (G3): a field the game version lacks i
 
 # ------------------------------------------------------------------------------------------------- F1: identity
 SCHEMA = 'isaac-visible-prlmens-g-v3'
-VERSION = 2026111801   # batch 4 (the coordinator, 2026-11-18): direction / price categorical, REL_SCALE, the body
-#                       order and the step line's drop written down (batch 3, 2026111703: P col 54 position_known)
+VERSION = 2026111802   # batch 5 (the coordinator, 2026-11-18): header[6] carries VERSION_WORD (LAYOUT_GEN retired)
+#                       (batch 4, 2026111801: direction / price categorical, REL_SCALE, the body order and the step
+#                       line's drop written down) (batch 3, 2026111703: P col 54 position_known)
 #                       (batch 2, 2026111702: non-position scales, NUM_CLAMP, NUM_RANGE)
 #                       (batch 1, 2026111701: canvas frame, isotropic scales, kind + 1)
 FRAME_BYTES = 131072
 MAGIC = 61107
-LAYOUT_GEN = 3        # header[6]
+# header[6] = VERSION_WORD = VERSION - VERSION_BASE (batch 5, the coordinator 2026-11-18): every frame names the schema
+# VERSION it was written under, so a frame from a producer (Lua, native DLL) of another commit than the reader, or a
+# frame on disk, is checked frame by frame (visible_producer.check_frame_header_v3). There is no separate layout
+# generation any more (LAYOUT_GEN, 3 through batches 1-4, retired): a change of the frame layout or of any column's
+# meaning raises VERSION, one number for all of it. float32 holds integers exactly up to 2^24 = 16,777,216, so the
+# word is exact for VERSION up to 2026000000 + 16777215 = 2042777215 (every YYYYMMDDnn through 2042); version_word
+# refuses anything past that (tests/test_schema_v3.py checks the range).
+VERSION_BASE = 2026000000
+
+
+def version_word(version):
+    """header[6] for a schema VERSION: version - VERSION_BASE, exact in float32 (0 < word < 2^24)."""
+    word = int(version) - VERSION_BASE
+    if not 0 < word < 1 << 24:
+        raise ValueError(f'schema_v3: VERSION {version} has no exact float32 header word (past 2042?)')
+    return word
+
+
+VERSION_WORD = version_word(VERSION)   # header[6]
 HEADER = 8
-# header[0..7]: magic, size (floats), p, e, n, s, LAYOUT_GEN, producer id (diagnostics only, never a model input)
-H_MAGIC, H_SIZE, H_P, H_E, H_N, H_S, H_GEN, H_PRODUCER = range(8)
+# header[0..7]: magic, size (floats), p, e, n, s, VERSION_WORD, producer id (diagnostics only, never a model input)
+H_MAGIC, H_SIZE, H_P, H_E, H_N, H_S, H_VERSION, H_PRODUCER = range(8)
 PRODUCER = {'abplus': 0, 'rep_j746': 1, 'rep_plus': 2, 'recorder': 3}
 
 # ------------------------------------------------------------------------------------------------- F1: room canvas

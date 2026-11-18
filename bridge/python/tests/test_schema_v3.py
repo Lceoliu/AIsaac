@@ -17,9 +17,10 @@ CRLF, LF = chr(13) + chr(10), chr(10)   # (a Windows checkout may hold the heade
 
 
 def test_f1_sizes():
-    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111801
+    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111802
     assert (S.FIXED, S.PF, S.LOCAL, S.EF, S.NF, S.SF, S.BODY, S.RC) == (2417, 192, 405, 64, 8, 24, 597, 21)
-    assert S.HEADER == 8 and S.MAGIC == 61107 and S.LAYOUT_GEN == 3
+    assert S.HEADER == 8 and S.MAGIC == 61107 and S.VERSION_WORD == 111802 and S.H_VERSION == 6
+    assert not hasattr(S, 'LAYOUT_GEN') and not hasattr(S, 'H_GEN')   # (batch 5: one number, VERSION)
     assert S.frame_floats(1, 0, 0, 0) == 2417 + 597
     assert S.frame_floats(4, 128, 64, 32) * 4 < S.FRAME_BYTES   # (the design's worst case fits)
     for cols, width in ((S.P_COLS, S.PF), (S.E_COLS, S.EF), (S.N_COLS, S.NF), (S.S_COLS, S.SF)):
@@ -221,10 +222,29 @@ def test_batch4_rel_scale_python_only():
     """REL_SCALE (batch 4): the model's relative offsets / 200, distances / 300 (tok_obs' scales); not in the header."""
     assert S.REL_SCALE == {'offset': 200.0, 'distance': 300.0}
     header = (HERE.parents[1] / 'engine' / 'abp_schema_v3.h').read_text()
-    assert 'REL_SCALE' not in header and '#define ABP_V3_VERSION 2026111801' in header
+    assert 'REL_SCALE' not in header and f'#define ABP_V3_VERSION {S.VERSION}' in header
     assert '#define ABP_V3_CAT_NS_PRICE_BASE 400' in header and '#define ABP_V3_CAT_NS_DIRECTION_BASE 528' in header
 
 
 def test_batch4_the_raw_block_carries_the_version():
     lua = (HERE.parents[1] / 'abplus' / 'abp_bridge.lua').read_text(encoding='utf-8')
     assert f'schema = "isaac-visible-raw-v3", version = {S.VERSION},' in lua
+
+
+def test_batch5_the_header_word_is_the_version():
+    """Batch 5 (the coordinator, 2026-11-18; VERSION 2026111802): header[6] = VERSION - 2026000000, exact in float32
+    (integers to 2^24): the encoding holds through 2042 and is refused past it -- this test fails when VERSION outgrows
+    it. The C header gets the word from the generator (abp_v3_native.c writes ABP_V3_VERSION_WORD, no number of its
+    own)."""
+    import numpy as np
+    assert S.VERSION_WORD == S.VERSION - S.VERSION_BASE == S.version_word(S.VERSION)
+    assert 0 < S.VERSION_WORD < 1 << 24 and float(np.float32(S.VERSION_WORD)) == S.VERSION_WORD
+    assert S.version_word(2042123199) == 16123199 and float(np.float32(16123199)) == 16123199
+    for past in (2043010101, 2026000000, 2025123101):
+        with pytest.raises(ValueError):
+            S.version_word(past)
+    header = (HERE.parents[1] / 'engine' / 'abp_schema_v3.h').read_text()
+    assert f'#define ABP_V3_VERSION_WORD {S.VERSION_WORD}' in header and '#define ABP_V3_H_VERSION 6' in header
+    assert 'LAYOUT_GEN' not in header and 'H_GEN' not in header
+    c = (HERE.parents[1] / 'engine' / 'abp_v3_native.c').read_text(encoding='utf-8')
+    assert 'h[ABP_V3_H_VERSION] = ABP_V3_VERSION_WORD;' in c and str(S.VERSION_WORD) not in c

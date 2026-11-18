@@ -697,7 +697,7 @@ static const char *v3_build(const unsigned char *map, size_t map_len, size_t *n_
     memset(v3_buf, 0, total * sizeof *v3_buf);
     float *h = v3_buf;
     h[ABP_V3_H_MAGIC] = ABP_V3_MAGIC; h[ABP_V3_H_SIZE] = (float)total; h[ABP_V3_H_P] = (float)p; h[ABP_V3_H_E] = (float)e;
-    h[ABP_V3_H_N] = (float)n; h[ABP_V3_H_S] = (float)s; h[ABP_V3_H_GEN] = ABP_V3_LAYOUT_GEN;
+    h[ABP_V3_H_N] = (float)n; h[ABP_V3_H_S] = (float)s; h[ABP_V3_H_VERSION] = ABP_V3_VERSION_WORD;
     h[ABP_V3_H_PRODUCER] = ABP_V3_PRODUCER_ABPLUS;
     float *canvas = v3_buf + ABP_V3_HEADER;
     const char *why = v3_canvas(&r, canvas);

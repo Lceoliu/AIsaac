@@ -65,7 +65,7 @@ def test_layout_and_positions():
     raw = raw_block()
     f = VP.unpack_frame_v3(VP.observation_frame_v3(json.dumps(raw), stall_share=0.25, stall_known=1))
     h = f['header']
-    assert (int(h[0]), int(h[6]), int(h[7])) == (V3.MAGIC, V3.LAYOUT_GEN, 0)
+    assert (int(h[0]), int(h[6]), int(h[7])) == (V3.MAGIC, V3.VERSION_WORD, 0)
     assert tuple(int(v) for v in h[2:6]) == (1, 1, 1, 1) and int(h[1]) == V3.frame_floats(1, 1, 1, 1)
     P, E = f['P'][0], f['E'][0]
     c = lambda cols, n: V3.col(cols, n)
@@ -255,7 +255,7 @@ def test_a_raw_block_of_another_version_is_refused():
 
 
 def test_the_worker_checks_a_native_frames_header():
-    """write_v3 (encode_row) checks a native frame (flag 64) before it goes into the ROW: magic, LAYOUT_GEN, the size
+    """write_v3 (encode_row) checks a native frame (flag 64) before it goes into the ROW: magic, the version word, the size
     word against the counts and exactly the bytes given (before 2026-11-18 it wrote the bytes unchecked)."""
     from isaac_bridge.tok_obs import ROW
     good = VP.observation_frame_v3(raw_block())
@@ -267,7 +267,7 @@ def test_the_worker_checks_a_native_frames_header():
         f = np.frombuffer(good, '<f4').copy()
         f[word] = value
         return f.tobytes()
-    bad = {'magic': edited(V3.H_MAGIC, V3.MAGIC + 1), 'layout gen': edited(V3.H_GEN, V3.LAYOUT_GEN + 1),
+    bad = {'magic': edited(V3.H_MAGIC, V3.MAGIC + 1), 'version': edited(V3.H_VERSION, V3.VERSION_WORD - 1),
            'size': edited(V3.H_SIZE, len(good) // 4 + 1), 'counts': edited(V3.H_E, 0 if VP.unpack_frame_v3(good)[
                'E'].shape[0] else 1), 'truncated': good[:-4], 'extra float': good + bytes(4),
            'partial float': good + bytes(2), 'header only part': good[:16]}
@@ -276,3 +276,19 @@ def test_the_worker_checks_a_native_frames_header():
         with pytest.raises(ValueError):
             VP.write_v3(row, SimpleNamespace(visible=None, visible_v3_frame=frame))
         assert int(row['visible_bytes'][0]) == 0, why
+
+
+def test_a_frame_of_another_version_is_refused_by_every_reader():
+    """Batch 5: header[6] is the schema version (VERSION - 2026000000); a frame written under batch 4 (word 111801) or
+    by a batch 1-4 producer (LAYOUT_GEN 3 there) is refused by unpack_frame_v3 and by the worker's write_v3, the
+    error naming both versions."""
+    from isaac_bridge.tok_obs import ROW
+    good = VP.observation_frame_v3(raw_block())
+    assert VP.unpack_frame_v3(good)['header'][V3.H_VERSION] == V3.VERSION_WORD
+    for word, named in ((111801, '2026111801'), (3, '2026000003')):
+        f = np.frombuffer(good, '<f4').copy()
+        f[V3.H_VERSION] = word
+        with pytest.raises(ValueError, match='%s.*%d' % (named, V3.VERSION)):
+            VP.unpack_frame_v3(f.tobytes())
+        with pytest.raises(ValueError, match=named):
+            VP.write_v3(np.zeros(1, ROW), SimpleNamespace(visible=None, visible_v3_frame=f.tobytes()))

@@ -75,7 +75,7 @@ Human recordings from `REC` must also be convertible into v3.
 | Item | v2 (`SI:12-27,58-69`) | v3 | Shape change |
 |---|---|---|---|
 | header[0..5] | magic 61107, size, p, e, n, s | same | – |
-| header[6] | 1 | 3 (layout generation) | – |
+| header[6] | 1 | schema version word: `VERSION − 2026000000` (batch 5, 2026-11-18; e.g. 111802). Exact in float32 through 2042. Every reader checks it frame by frame. Batches 1–4 wrote 3 (layout generation, retired: any layout or column-meaning change now raises VERSION). | – |
 | header[7] | 0 | producer id: 0 AB+, 1 Rep J746, 2 Rep+, 3 recorder-converted. Diagnostics only; never decoded into model inputs. | – |
 | room canvas | 16×28 cells × 4 floats = 1792 | 16×28 × **5** floats = 2240 | yes |
 | minimap | 169 floats (8 one-bit channels) | 169 floats (new bit layout, 2.4) | decode only |

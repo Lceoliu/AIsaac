@@ -366,7 +366,7 @@ def observation_frame_v3(raw, stall_share=0.0, stall_known=0, producer=V3.PRODUC
         S[i, _S['charge_known']] = sl.get('charge_known', 1)
     counts = (len(bodies), len(entities), len(N), len(S))
     size = V3.frame_floats(*counts)
-    header = np.array([V3.MAGIC, size, *counts, V3.LAYOUT_GEN, producer], '<f4')
+    header = np.array([V3.MAGIC, size, *counts, V3.VERSION_WORD, producer], '<f4')
     out = np.concatenate([header, canvas.reshape(-1), minimap, P.reshape(-1), local.reshape(-1), E.reshape(-1),
                           N.reshape(-1), S.reshape(-1)]).astype('<f4')
     if out.size != size or out.size * 4 > V3.FRAME_BYTES:
@@ -396,14 +396,17 @@ def v3_body_order(frame):
 
 
 def check_frame_header_v3(f, exact=False):
-    """A v3 frame's header (f: its floats) against this tree's schema_v3: magic, LAYOUT_GEN, size = frame_floats(p, e,
-    n, s), and at least that many floats (exact: exactly that many). Returns (p, e, n, s). The header carries no schema
-    VERSION (header[0..7]: magic, size, p, e, n, s, LAYOUT_GEN, producer); LAYOUT_GEN (3) did not change in batches 1-4."""
+    """A v3 frame's header (f: its floats) against this tree's schema_v3: magic, the schema version (header[6] =
+    VERSION_WORD, batch 5), size = frame_floats(p, e, n, s), and at least that many floats (exact: exactly that many).
+    Returns (p, e, n, s)."""
     if f.size < V3.HEADER:
         raise ValueError('visible-v3: %d floats, shorter than the header' % f.size)
-    if int(f[0]) != V3.MAGIC or int(f[6]) != V3.LAYOUT_GEN:
-        raise ValueError('visible-v3: bad header (magic %r, layout gen %r; this tree: %d, %d)'
-                         % (float(f[0]), float(f[6]), V3.MAGIC, V3.LAYOUT_GEN))
+    if int(f[V3.H_MAGIC]) != V3.MAGIC:
+        raise ValueError('visible-v3: bad header (magic %r, this tree: %d)' % (float(f[V3.H_MAGIC]), V3.MAGIC))
+    if float(f[V3.H_VERSION]) != V3.VERSION_WORD:
+        raise ValueError('visible-v3: frame version %.0f (header[6] %r), this tree: schema_v3.VERSION %d (word %d)'
+                         % (float(f[V3.H_VERSION]) + V3.VERSION_BASE, float(f[V3.H_VERSION]), V3.VERSION,
+                            V3.VERSION_WORD))
     p, e, n, s = (int(v) for v in f[2:6])
     want = V3.frame_floats(p, e, n, s)
     if int(f[1]) != want or f.size < want or (exact and f.size != want):

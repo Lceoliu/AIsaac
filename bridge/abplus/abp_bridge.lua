@@ -2407,7 +2407,7 @@ function visible_v3_raw()
 	local bodies, players = v3_bodies(game)
 	local cells, doors = v3_cells(room, level)
 	local inventory, slots = v3_items(players)
-	return v3_json({ schema = "isaac-visible-raw-v3", version = 2026111801, game_version = 1, control_scheme = 0,
+	return v3_json({ schema = "isaac-visible-raw-v3", version = 2026111802, game_version = 1, control_scheme = 0,
 		origin = { g0.X - 20, g0.Y - 20 }, gw = room:GetGridWidth(), gh = room:GetGridHeight(),
 		room_type = room:GetType(), shape = room:GetRoomShape(), stage = level:GetStage(),
 		stage_type = v3_try(function() return level:GetStageType() end, 0),
