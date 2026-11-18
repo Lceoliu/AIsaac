@@ -2887,6 +2887,7 @@ def main(argv=None, child=None, actor=None):
                                           args.rollout // args.workers * 4 + 64)
         sampler = JobSampler(bench_stats)
     else:
+        os.environ.setdefault('ISAAC_RL_FATAL_DIR', str(out))   # (a worker's visible-v3 fatal reason: tok_sampler)
         sampler = TokSampler(cfg)
         if pf_on and total_h > 0 and decisions_total > 0:   # (a resumed run: the forcing probability where the run is,
             sampler.stats[:, ST['pf_p']] = pickup_force_p(   # not pickup_force[0] until the first update rewrites it)

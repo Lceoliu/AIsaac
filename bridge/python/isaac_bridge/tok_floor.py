@@ -76,7 +76,7 @@ from .tok_obs import (stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARE
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal   # noqa: E402
-from .tok_sampler import rng_key, start_seed   # noqa: E402  (a resumed run's / a shard's start seeds, random streams)
+from .tok_sampler import rng_key, start_seed, report_fatal   # noqa: E402  (a resumed run's / a shard's start seeds, random streams)
 from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, SearchSlots, StartBuilder, applied_action,
                           apply_instance_defaults, attach, attach_choices, attach_lab, attach_teacher, default_stub_list,
                           hindsight,
@@ -2112,8 +2112,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 run_lab()
     except VisibleV3Fatal as exc:
         fatal = exc
-        print(f'tok floor worker {index}: visible-v3 protocol error, the worker stops: {exc}', file=sys.stderr,
-              flush=True)
+        report_fatal(index, conn, exc, 'tok floor worker')   # (before the cleanup below)
         mine[ST['errors']] += 1000
     except Exception:
         traceback.print_exc()

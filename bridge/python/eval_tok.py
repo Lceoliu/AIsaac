@@ -280,6 +280,7 @@ def main():
         info['no_pedestals'] = True
     if args.no_active:   # B39
         info['no_active'] = True
+    os.environ.setdefault('ISAAC_RL_FATAL_DIR', str(out))   # (a worker's visible-v3 fatal reason: tok_sampler)
     sampler = TokSampler(cfg)
     n = cfg.workers
     recorder = None

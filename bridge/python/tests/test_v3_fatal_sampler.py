@@ -21,8 +21,8 @@ def test_the_fatal_class_is_no_game_fault():
 
 
 class _Proc:
-    def __init__(self, code):
-        self.exitcode = code
+    def __init__(self, code, pid=None):
+        self.exitcode, self.pid = code, pid
 
     def join(self, timeout=None):
         pass
@@ -31,7 +31,7 @@ class _Proc:
 def _sampler(codes):
     s = object.__new__(TokSampler)
     s.procs = [_Proc(c) for c in codes]
-    s.fatal, s._closing = None, False
+    s.fatal, s._closing, s._fatal_reason = None, False, {}
     return s
 
 
@@ -63,7 +63,7 @@ def test_poll_raises_once_a_worker_ended_fatally(code, fatal):
         s.procs.append(p)
     s.index = {c: i for i, c in enumerate(s.conns)}
     s.live = list(s.conns)
-    s.fatal, s._closing = None, False
+    s.fatal, s._closing, s._fatal_reason = None, False, {}
     s._poller = None
 
     class _Poller:   # (_drop unregisters from poll_ready's poller)
@@ -141,3 +141,99 @@ def test_eval_main_fails_on_missing_seeds(tmp_path, monkeypatch):
             et.main()
         s = json.loads((out / 'summary.json').read_text())
         assert (s['seeds_requested'], s['seeds_played'], s['seeds_missing']) == (4, 0, 4 if want_exit else 0)
+
+
+def _fatal_worker(conn, how, d):
+    """A worker that meets a VisibleV3Fatal: its reason reported as worker_main does (report_fatal, before cleanup),
+    then the exit -- 86, or another code as if its cleanup had failed; 'file only': the pipe message lost (the C++
+    actor reads worker pipes itself), only the file left; 'nothing': 86 without any report."""
+    import os
+    os.environ['ISAAC_RL_FATAL_DIR'] = d
+    from isaac_bridge.tok_sampler import report_fatal
+    exc = VP.VisibleV3Fatal('visible-v3: the bridge runs mode 1, this worker is configured for mode 0')
+    if how == 'pipe, exit 0':
+        report_fatal(1, conn, exc)
+        sys.exit(0)
+    if how == 'file only, exit 1':
+        class _Gone:
+            def send_bytes(self, b):
+                raise OSError('pipe consumed elsewhere')
+        report_fatal(1, _Gone(), exc)
+        conn.send_bytes(b'x')
+        sys.exit(1)
+    conn.send_bytes(b'x')
+    sys.exit(VP.V3_FATAL_EXIT)
+
+
+@pytest.mark.parametrize('how', ['pipe, exit 0', 'file only, exit 1', 'nothing, exit 86'])
+def test_the_reason_reaches_the_parent(tmp_path, how):
+    """(2026-11-18, the coordinator: 'the reason is in its stderr' was all the parent could say, and the stderr was
+    empty) The worker's reason travels on its pipe ('F' + text) and in fatal-worker-<i>-<pid>.txt, both before its
+    cleanup; TokSampler's VisibleV3Fatal carries it, from the pipe or else the file; a worker that left neither (exit
+    86) is reported as such, plainly."""
+    ctx = mp.get_context('spawn')
+    s = object.__new__(TokSampler)
+    ours, theirs = ctx.Pipe()
+    p = ctx.Process(target=_fatal_worker, args=(theirs, how, str(tmp_path)), daemon=True)
+    p.start()
+    theirs.close()
+    s.conns, s.procs, s.index, s.live = [None, ours], [_Proc(0), p], {ours: 1}, [ours]
+    s.fatal, s._closing, s._fatal_reason = None, False, {}
+
+    class _Poller:
+        def unregister(self, fd):
+            pass
+    s._poller = _Poller()
+    import os
+    os.environ['ISAAC_RL_FATAL_DIR'] = str(tmp_path)
+    try:
+        end, raised = time.time() + 60, None
+        while s.live and time.time() < end and raised is None:
+            try:
+                s.poll(want=1, max_wait=0.5, idle=0.5)
+            except VP.VisibleV3Fatal as exc:
+                raised = str(exc)
+        p.join(10)
+        if raised is None:
+            with pytest.raises(VP.VisibleV3Fatal) as got:
+                s.check_fatal()
+            raised = str(got.value)
+    finally:
+        os.environ.pop('ISAAC_RL_FATAL_DIR', None)
+    assert 'tok worker 1 stopped on a visible-v3 protocol error' in raised and 'stderr' not in raised
+    if how == 'nothing, exit 86':
+        assert 'the reason did not reach the parent' in raised
+    else:
+        assert 'configured for mode 0' in raised
+        assert (tmp_path / f'fatal-worker-1-{p.pid}.txt').read_text().strip().endswith('configured for mode 0')
+
+
+def test_a_connection_closed_during_the_mode_query_is_retried_not_fatal():
+    """(2026-11-18, A1's mode-0 smoke on c80c9f2: a worker exited 86 at the end of training, its reason lost) The
+    path, deterministically: a StartBuilder's build connects a relaunched instance and the game goes away during the
+    visible_v3 query (EOF). The builder's result is a plain BridgeError -- the worker's recover() relaunches, as
+    before 05f1622 -- not VisibleV3Fatal (which the worker re-raises at builder.take(): exit 86). With c80c9f2's
+    abplus.check_visible_v3 the result is VisibleV3Fatal in mode 0 too."""
+    import socket
+    import types
+    from isaac_bridge.abplus import check_visible_v3
+    from isaac_bridge.env import IsaacBridgeEnv
+    from isaac_bridge.tok_sampler import StartBuilder
+
+    class Inst:   # (Instance.reset's connect, reduced to the mode query)
+        digest_ready = False
+
+        def reset(self, seed):
+            ours, theirs = socket.socketpair()
+            c = object.__new__(IsaacBridgeEnv)
+            c._sock, c._buf = ours, b''
+            theirs.shutdown(socket.SHUT_WR)   # (the game gone: EOF on the answer)
+            self.keep = theirs
+            check_visible_v3(c, 0)
+    cfg = types.SimpleNamespace(build_timeout=30, reset_timeout=30)
+    b = StartBuilder(15, Inst(), cfg, next_seed=lambda: 1)
+    b.start()
+    assert b.ready.wait(10)
+    seed, exc = b.take()
+    assert seed == 1 and exc is not None and not isinstance(exc, VP.VisibleV3Fatal)
+    assert isinstance(exc, BridgeError) and 'connection closed by game' in str(exc)
