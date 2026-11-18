@@ -403,6 +403,12 @@ def _t_sane(v):
     return torch.where(bad, torch.zeros_like(v), torch.clamp(v, -CODE_CUT, CODE_CUT)), bad
 
 
+def _t_div(x, c):
+    """x / c with c as a tensor of x's shape: a true division on every device (CUDA divides by a Python scalar as a
+    multiplication by its reciprocal, which can differ from numpy's division in the last bit)."""
+    return x / _t().full_like(x, float(c))
+
+
 def _t_trunc(v):
     torch = _t()
     return torch.trunc(v).to(torch.int64)
@@ -556,7 +562,7 @@ def _t_rel(xy, main):
     torch = _t()
     d = xy.to(torch.float64) - main
     dist = torch.sqrt((d ** 2).sum(-1, keepdim=True))
-    return _t_clamp(torch.cat([d / V3.REL_SCALE['offset'], dist / V3.REL_SCALE['distance']], -1))
+    return _t_clamp(torch.cat([_t_div(d, V3.REL_SCALE['offset']), _t_div(dist, V3.REL_SCALE['distance'])], -1))
 
 
 def decode_frame_torch(buf, visible_schema, nbytes=None, device='cpu'):
@@ -570,16 +576,16 @@ def decode_frame_torch(buf, visible_schema, nbytes=None, device='cpu'):
     known = P[:, _PC['position_known']] == 1
     centres = torch.as_tensor(_ROOM_CENTRES, device=device)
     out = {'main_xy': main.to(torch.float32), 'nonfinite': torch.as_tensor(nonfinite, device=device),
-           'room': _t_room(f['canvas']), 'room_xy': (centres / POS_SCALE).to(torch.float32),
+           'room': _t_room(f['canvas']), 'room_xy': _t_div(centres, POS_SCALE).to(torch.float32),
            'room_rel': _t_rel(centres, main)}
     mb = _t_bits(f['minimap'], V3.MAP_BITS)
     out['map_bits'], out['map_icon'] = mb[:, :4], t_map_icon_index(mb[:, 4])
     out['P_num'], out['P_flag'], out['P_cat'] = _t_num(P, PLAN['P']), _t_flags(P, PLAN['P']), _t_cats(P, PLAN['P'])
     xy = P[:, [_PC['x'], _PC['y']]].to(torch.float64)
     gw, gh = _grid(host['P'])
-    cell = torch.stack([torch.clamp(torch.floor(xy[:, 0] / V3.CELL), 0, gw - 1),
-                        torch.clamp(torch.floor(xy[:, 1] / V3.CELL), 0, gh - 1)], 1)
-    off = _t_clamp((xy - V3.CELL * cell - V3.CELL / 2) / V3.CELL)
+    cxy = torch.floor(_t_div(xy, V3.CELL))
+    cell = torch.stack([torch.clamp(cxy[:, 0], 0, gw - 1), torch.clamp(cxy[:, 1], 0, gh - 1)], 1)
+    off = _t_clamp(_t_div(xy - V3.CELL * cell - V3.CELL / 2, V3.CELL))
     out['P_off'] = torch.where(known[:, None], off, torch.zeros_like(off))
     rel = _t_rel(xy, main)
     out['P_rel'] = torch.where(known[:, None], rel, torch.zeros_like(rel))
@@ -591,7 +597,7 @@ def decode_frame_torch(buf, visible_schema, nbytes=None, device='cpu'):
     v, bad = _t_sane(E[:, PLAN['E']['anim']])
     out['E_anim'] = torch.where(~bad & (v >= 0) & (v < V3.ANIM_ROWS), _t_trunc(v), torch.zeros_like(_t_trunc(v)))
     pr = E[:, _EC['price']]
-    out['E_price'] = _t_clamp(torch.where(pr > 0, pr / PRICE_COIN_SCALE, torch.zeros_like(pr)))[:, None]
+    out['E_price'] = _t_clamp(torch.where(pr > 0, _t_div(pr, PRICE_COIN_SCALE), torch.zeros_like(pr)))[:, None]
     out['E_rel'] = _t_rel(E[:, [_EC['x'], _EC['y']]], main)
     lrel = _t_rel(E[:, [_EC['l_ex'], _EC['l_ey']]], main)
     out['E_laser_rel'] = torch.where((E[:, _EC['kind']] == _LASER_KIND)[:, None], lrel, torch.zeros_like(lrel))
