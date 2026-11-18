@@ -1057,6 +1057,7 @@ class TokPolicy(nn.Module):
             raise ValueError(f'TokPolicy: frame {frame!r} (None / row: the ROW encoder; v3: FrameEncoderV3)')
         if frame == 'v3':   # (seq-v1 step 2: the first v3 arm is C114 T1 with the frame encoder replaced)
             bad = [k for k, ok in (('temporal', temporal), ('temporal_feedback 0', not int(temporal_feedback)),
+                                   ('temporal_rooms 0', not int(temporal_rooms)),
                                    ('global_token', global_token), ('items', items), ('no item_tokens', not item_tokens),
                                    ('no block_memory', not block_memory), ('memory 0', not memory)) if not ok]
             if bad:
@@ -1600,10 +1601,10 @@ class TokPolicy(nn.Module):
         """(B30) forward's temporal context (the mode's inputs and, for 'step', the records' fields) and the history
         token dict(y [n, width] float32 = Q(o_{t-1}) + kind_hist, has [n] bool: a previous step exists) for the blocks
         (B31: an ordinary token of the one attention, its key masked where has is False)."""
-        n = b['player'].shape[0]
+        n = b['pending'].shape[0]   # (seq-v1: the pending actions, in every batch -- a v3 batch has no ROW player)
         mode = temporal['mode']
         ta = self.tatt
-        dev = b['player'].device
+        dev = b['pending'].device
         tctx = dict(temporal, user=temporal)
         if mode == 'step':
             st, slot = temporal['state'], temporal['slot']

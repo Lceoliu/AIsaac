@@ -4,8 +4,9 @@ CPU only, a small model (width 64) on the 19 golden frames (tests/fixtures/visib
 - forward and backward: logits of the first arm's five heads (20), finite values and gradients;
 - the drop head: the policy layer holds 22 logits (schema_v3.HEAD_SIZES), the forward gives 20, drop's two rows get no
   gradient, drop's "drop" bias is schema_v3.DROP_BIAS, the first 20 biases as T1's;
-- no ROW observation field enters: the ROW fields of the batch randomised (all but those the temporal step and the
-  gate read), the outputs bit for bit the same;
+- no ROW observation field enters: batches of only v3, pending and the temporal metadata equal full batches with every
+  other field randomised, over two steps; rooms 0 is required and the room fields change nothing; padding contents
+  (junk, NaN, ids past the tables) never reach the real tokens; the gate is T1's;
 - the configuration: frame=v3 needs T1's (temporal, feedback 0, global token, items, no item tokens, no block memory,
   no GRU); TokPolicy(**config) rebuilds the same model; a model without frame has no frame_v3 and the old modules."""
 import json
@@ -77,22 +78,104 @@ def test_forward_backward_and_the_drop_head():
     assert float(m.pi.bias[21]) == V3.DROP_BIAS and float(m.pi.bias[20]) == 0.0
 
 
+TEMPORAL_FIELDS = ('first', 'map', 'events', 'stage')   # (the T1 metadata the temporal step reads from the records)
+
+
+def _two_steps(m, batches):
+    """Two actor steps on one fresh TemporalState: the outputs of each."""
+    st = TP.TemporalState(m, len(batches[0]['pending']), 'cpu', torch.float32)
+    return [step(m, b, st) for b in batches], st
+
+
 def test_no_row_observation_field_enters():
+    """(Codex, step 2's review: the randomisation missed int16 fields, kept map / events / stage, ran one step.) The
+    model run on batches holding ONLY v3, pending and the temporal metadata -- any other field read would be a KeyError
+    -- equals the run on the full batches with every other ROW field randomised (every dtype), over two steps."""
     m = build()
     TS.perturb_all(m, 7)
-    b = batch(NAMES[6:12])
-    ref = step(m, b)
+    full = [batch(NAMES[6:12], seed=s_) for s_ in (0, 1)]
+    for b in full:
+        b['first'][:] = 0
+    full[0]['first'][:] = 1
+    minimal = [{k: b[k] for k in ('v3', 'pending') + TEMPORAL_FIELDS} for b in full]
     g = torch.Generator().manual_seed(9)
-    keep = {'v3', 'pending', 'first', 'map', 'events', 'stage'}   # (the temporal step's record fields)
-    c = dict(b)
-    for k, v in b.items():
-        if k not in keep and torch.is_tensor(v) and v.is_floating_point():
-            c[k] = torch.randn(v.shape, generator=g).to(v.dtype)
-        elif k not in keep and torch.is_tensor(v) and v.dtype in (torch.int64, torch.int32, torch.uint8):
-            c[k] = (v + 1) % 3
-    got = step(m, c)
-    for a, b_ in zip(ref, got):
-        assert torch.equal(a, b_)
+    noisy = []
+    for b in full:
+        c = {}
+        for k, v in b.items():
+            if k in ('v3', 'pending') + TEMPORAL_FIELDS or not torch.is_tensor(v):
+                c[k] = v
+            elif v.is_floating_point():
+                c[k] = torch.randn(v.shape, generator=g).to(v.dtype)
+            else:
+                c[k] = torch.randint(0, 7, v.shape, generator=g).to(v.dtype)
+        noisy.append(c)
+    assert {str(v.dtype) for k, v in full[0].items() if torch.is_tensor(v) and k not in ('v3',)} >= {'torch.int16'}
+    ref, _ = _two_steps(m, minimal)
+    got, _ = _two_steps(m, noisy)
+    for r_, g_ in zip(ref, got):
+        for a, b_ in zip(r_, g_):
+            assert torch.equal(a, b_)
+
+
+def test_rooms_0_makes_no_room_and_ignores_the_room_fields():
+    """(Codex: rooms must be 0 -- the default 128 brought the room tokens back.) Two steps with a room change in ROW's
+    map (current-room bit) and EV_NEW_ROOM / stage events: no room token is made and the outputs equal the run without
+    the change."""
+    m = build()
+    TS.perturb_all(m, 11)
+    full = [batch(NAMES[:4], seed=s_) for s_ in (0, 1)]
+    full[0]['first'][:] = 1
+    full[1]['first'][:] = 0
+    base = [{k: b[k] for k in ('v3', 'pending') + TEMPORAL_FIELDS} for b in full]
+    moved = [dict(b) for b in base]
+    mp = base[1]['map'].clone()
+    mp[:, 3] = torch.roll(mp[:, 3], 1, dims=-1)   # (the current room moves)
+    moved[1] = dict(base[1], map=mp, events=base[1]['events'] | 0xFF, stage=base[1]['stage'] + 1)
+    ref, st = _two_steps(m, base)
+    got, st2 = _two_steps(m, moved)
+    assert int(st.nroom.max()) == 0 and int(st2.nroom.max()) == 0
+    for r_, g_ in zip(ref, got):
+        for a, b_ in zip(r_, g_):
+            assert torch.equal(a, b_)
+
+
+def test_padding_contents_never_reach_the_real_tokens():
+    """(Codex: padding was masked only in attention.) Padded entity / inventory / slot / body rows holding finite junk,
+    NaN, and ids past every table: the outputs are the clean ones bit for bit, and finite."""
+    m = build()
+    TS.perturb_all(m, 12)
+    b = batch(NAMES[:3])
+    ref = step(m, b)
+    for junk in ('finite', 'nan', 'ids'):
+        v = {k: t.clone() for k, t in b['v3'].items()}
+        for g_ in ('P', 'E', 'N', 'S'):
+            pad = ~v[g_ + '_mask']
+            for k in [k for k in v if k.startswith(g_ + '_') and k != g_ + '_mask']:
+                t = v[k]
+                if t.dtype == torch.bool:
+                    continue
+                if junk == 'ids' and not t.is_floating_point():
+                    t[pad] = 70000
+                elif junk == 'nan' and t.is_floating_point():
+                    t[pad] = float('nan')
+                elif junk == 'finite' and t.is_floating_point():
+                    t[pad] = 3.25
+        pl = ~v['P_mask']
+        v['local'][pl] = float('nan') if junk == 'nan' else 2.5
+        got = step(m, dict(b, v3=v))
+        for a, b_ in zip(ref, got):
+            assert torch.isfinite(b_).all() and torch.equal(a, b_), junk
+
+
+def test_the_action_gate_is_t1s():
+    """The gate is T1's, from the records' bombs / ready / pocket fields; a v3 batch carries no structured-input gate."""
+    rows = _rows_with_frames(NAMES[:3])
+    rows['bombs'] = [0, 2, 0]
+    b = TP.to_batch(rows, np.zeros((3, 5), np.int64), 'cpu')
+    assert 'v_gate' not in b and 'v_body' not in b
+    g = TP.TokPolicy.gate(b)
+    assert g[:, 0].tolist() == [False, True, False]
 
 
 def test_the_action_under_way_reaches_the_controlled_body():
@@ -115,9 +198,11 @@ def test_configuration():
     assert old.frame_v3 is None and 'frame' not in old.config and not any(k.startswith('frame_v3') for k in old.state_dict())
     assert old.pi.out_features == 20 and type(old.pi) is torch.nn.Linear
     for bad in (dict(temporal_feedback=1), dict(global_token=False), dict(item_tokens=True, item_shared=True),
-                dict(temporal=False)):
+                dict(temporal=False), dict(temporal_rooms=1), dict(temporal_rooms=128)):
         with pytest.raises(ValueError):
             TP.TokPolicy(**dict(CFG, **bad))
+    with pytest.raises(ValueError, match='temporal_rooms 0'):   # (left out: the default 128)
+        TP.TokPolicy(**{k: v for k, v in CFG.items() if k != 'temporal_rooms'})
     n = sum(p.numel() for p in m.parameters())
     assert n > sum(p.numel() for p in m.frame_v3.parameters()) > 0
 

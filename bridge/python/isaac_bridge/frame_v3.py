@@ -76,9 +76,13 @@ class FrameEncoderV3(nn.Module):
         nn.init.normal_(self.kind, std=0.02)
         self.blocks = nn.ModuleList(Block(width, heads) for _ in range(layers))
 
-    def _emb(self, table, rows):
-        """[..., k] int rows -> [..., k * dim] (the k columns' embeddings side by side)."""
-        e = table(rows.long())
+    def _emb(self, table, rows, real=None):
+        """[..., k] int rows -> [..., k * dim] (the k columns' embeddings side by side); a padded token's rows (real
+        False) are row 0 and every row is clamped into the table (a reused buffer's stale ids never index past it)."""
+        rows = rows.long()
+        if real is not None:
+            rows = torch.where(real[..., None], rows, torch.zeros_like(rows))
+        e = table(rows.clamp(0, table.num_embeddings - 1))
         return e.reshape(*rows.shape[:-1], rows.shape[-1] * e.shape[-1])
 
     def tokens(self, v, pending, gtok):
@@ -86,22 +90,29 @@ class FrameEncoderV3(nn.Module):
         (the global token's parameter). Returns (x [B, T, width], pad [B, T] bool, g index)."""
         B, PM = v['P_num'].shape[:2]
         k = self.kind
+        # (Codex, step 2's review: padding was masked only in attention -- a NaN left in a padded row of a reused buffer
+        #  reached the real tokens through 0 x NaN, a stale id past a table raised. A padded token's inputs are zeroed
+        #  and its ids taken as row 0 before anything reads them, and its token is zeroed before the blocks.)
+        pm, em, nm, sm = v['P_mask'], v['E_mask'], v['N_mask'], v['S_mask']
+        lm = pm & ~v['local_pad']
+        z = lambda x, m: torch.where(m.view(*m.shape, *([1] * (x.dim() - m.dim()))), x, torch.zeros_like(x))   # noqa: E731
         one = torch.cat([F.one_hot(pending[:, i].long().clamp(0, h - 1), h) for i, h in enumerate(PENDING_HEADS)],
                         -1).float()
         pend = torch.zeros((B, PM, self.n_pending), device=one.device)
         pend[:, 0] = one
-        P = torch.cat([v['P_num'], v['P_flag'], self._emb(self.cat_emb, v['P_cat']), v['P_off'], v['P_rel'],
-                       v['P_rel_valid'][..., None], pend], -1)
+        P = torch.cat([z(v['P_num'], pm), z(v['P_flag'], pm), self._emb(self.cat_emb, v['P_cat'], pm), z(v['P_off'], pm),
+                       z(v['P_rel'], pm), z(v['P_rel_valid'][..., None], pm), pend], -1)
         tp = self.p_mlp(P) + k[0]
-        loc = v['local'].permute(0, 1, 4, 2, 3).reshape(B * PM, RC, V3.LOCAL_SIDE, V3.LOCAL_SIDE)
+        loc = z(v['local'], lm).permute(0, 1, 4, 2, 3).reshape(B * PM, RC, V3.LOCAL_SIDE, V3.LOCAL_SIDE)
         tl = self.l_cnn(loc).view(B, PM, -1) + k[1]
-        E = torch.cat([v['E_num'], v['E_flag'], self._emb(self.id_emb, v['E_id']), self._emb(self.cat_emb, v['E_cat']),
-                       self._emb(self.anim_emb, v['E_anim']), v['E_price'], v['E_rel'], v['E_laser_rel']], -1)
+        E = torch.cat([z(v['E_num'], em), z(v['E_flag'], em), self._emb(self.id_emb, v['E_id'], em),
+                       self._emb(self.cat_emb, v['E_cat'], em), self._emb(self.anim_emb, v['E_anim'], em),
+                       z(v['E_price'], em), z(v['E_rel'], em), z(v['E_laser_rel'], em)], -1)
         te = self.e_mlp(E) + k[2]
-        Nn = torch.cat([v['N_num'], v['N_flag'], self._emb(self.item_emb, v['N_item'])], -1)
+        Nn = torch.cat([z(v['N_num'], nm), z(v['N_flag'], nm), self._emb(self.item_emb, v['N_item'], nm)], -1)
         tn = self.n_mlp(Nn) + k[3]
-        S = torch.cat([v['S_num'], v['S_flag'], self._emb(self.cat_emb, v['S_cat']), self._emb(self.item_emb, v['S_item'])],
-                      -1)
+        S = torch.cat([z(v['S_num'], sm), z(v['S_flag'], sm), self._emb(self.cat_emb, v['S_cat'], sm),
+                       self._emb(self.item_emb, v['S_item'], sm)], -1)
         ts = self.s_mlp(S) + k[4]
         r = self.r_cnn(v['room'].permute(0, 3, 1, 2))                       # [B, 64, 4, 7]
         r = r.flatten(2).transpose(1, 2)                                     # [B, 28, 64] (block row-major)
@@ -114,9 +125,8 @@ class FrameEncoderV3(nn.Module):
         x = torch.cat([tp, tl, te, tn, ts, tr, tm, tg], 1)
         dev = x.device
         ones = lambda n: torch.ones((B, n), dtype=torch.bool, device=dev)   # noqa: E731
-        real = torch.cat([v['P_mask'], v['P_mask'] & ~v['local_pad'], v['E_mask'], v['N_mask'], v['S_mask'],
-                          ones(tr.shape[1]), ones(1), ones(1)], 1)
-        return x, ~real, x.shape[1] - 1
+        real = torch.cat([pm, lm, em, nm, sm, ones(tr.shape[1]), ones(1), ones(1)], 1)
+        return z(x, real), ~real, x.shape[1] - 1
 
     def forward(self, v, pending, gtok):
         """(x [B, T, width] after the blocks, pad [B, T], g index)."""
