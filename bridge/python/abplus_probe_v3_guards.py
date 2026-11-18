@@ -111,7 +111,17 @@ local p = Isaac.GetPlayer(0)
 local e = Isaac.Spawn(1000, 7, 0, p.Position + Vector(60, 0), Vector(0, 0), nil)
 e.CollisionDamage = 0
 e.EntityCollisionClass = __CLASS__
+e.Visible = true
 return tostring(e.EntityCollisionClass) .. ',' .. tostring(e.CollisionDamage)
+"""
+SEEN = r"""
+local out = {}
+for _, e in ipairs(Isaac.GetRoomEntities()) do
+  if e.Type == 1000 and e.Variant == 7 then
+    out[#out + 1] = tostring(e.Visible) .. '/' .. tostring(e.EntityCollisionClass) .. '/' .. tostring(e.CollisionDamage)
+  end
+end
+return table.concat(out, ',')
 """
 
 
@@ -119,10 +129,11 @@ def check_decorative(c, cls):
     """C11 (2026-11-18): a listed decorative effect (1000.7 BLOOD_SPLAT, no damage) is left out with no entity collision
     and sent with one -- in the raw block and in the native frame alike (and the native frame equal to the reference)."""
     made = c.lua(DECOR.replace('__CLASS__', str(cls)))
+    seen = c.lua(SEEN)   # (visible / entity collision class / damage of every 1000.7 when the block is built)
     raw = json.loads(c.lua("return visible_v3_raw()"))
     in_raw = sum(1 for e in raw['entities'] if e['type'] == 1000 and e['variant'] == 7)
     native = c.lua(NATIVE)
-    out = dict(spawned=made, in_raw=in_raw, native=native[:40] if native.startswith('nil:') else 'frame')
+    out = dict(spawned=made, seen=seen, in_raw=in_raw, native=native[:40] if native.startswith('nil:') else 'frame')
     if not native.startswith('nil:'):
         frame = bytes.fromhex(native)
         f = VP.unpack_frame_v3(frame)

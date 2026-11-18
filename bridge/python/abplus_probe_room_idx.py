@@ -1,6 +1,7 @@
 """Level:GetRoomByIdx's domain on AB+ (2026-11-18, the hardening batch, Codex round 2's C14: the door's target index
 goes to GetRoomByIdx with no check before the call). Three readings:
-  disasm   objdump of Level::GetRoomByIdx (abp_turbo.c L_ROOM_BY_IDX, 0x733cd0) from the game binary: what it checks
+  disasm   objdump of Level::GetRoomByIdx (abp_turbo.c L_ROOM_BY_IDX, 0x733cd0: a jump to the const one at 0x7337c0,
+           disassembled from there) from the game binary: what it checks
   calls    on a throwaway lean clone, level:GetRoomByIdx(k) for k in [-20, 180] (pcall): which k give a descriptor and
            its GridIndex / SafeGridIndex / Data (a crash of the clone is reported, the next k on a new clone)
   doors    over floors of several seeds and stages, every door's TargetRoomIndex in every room entered: the values
@@ -59,8 +60,8 @@ def main():
     res = dict(disasm=None, calls={}, doors={}, errors=[])
     binary = Path(ABP_HOME) / 'runtime' / 'isaac.x64'
     try:
-        r = subprocess.run(['objdump', '-d', '--no-show-raw-insn', '--start-address=0x733cd0',
-                            '--stop-address=0x733e40', str(binary)], capture_output=True, text=True, timeout=120)
+        r = subprocess.run(['objdump', '-d', '--no-show-raw-insn', '--start-address=0x7337c0',
+                            '--stop-address=0x733cd8', str(binary)], capture_output=True, text=True, timeout=120)
         res['disasm'] = r.stdout[-6000:] if r.returncode == 0 else f'objdump rc {r.returncode}: {r.stderr[:300]}'
     except Exception as exc:
         res['disasm'] = f'{type(exc).__name__}: {exc}'
