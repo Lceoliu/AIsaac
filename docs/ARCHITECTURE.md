@@ -171,7 +171,7 @@ visible 帧按对象组织：每个身体一个 P、实体 E（上限 128，超�
   - `deploy.sh`：部署 `git archive` 树、编译 `libabp_turbo.so`。
 - 主机相关的设置只放在 `bm1.env` 里，从 `env/*.env` 复制；新机器先跑 `probe_host.sh`。锁、前置检查和删进回收站在 `common.sh`。
 - 用法见 [bridge/ops/bm1/README.md](../bridge/ops/bm1/README.md)。正式训练的操作手册模板是 [bridge/ops/bm1/TRAINING.md](../bridge/ops/bm1/TRAINING.md)（C105 main1）。
-- `bridge/ops/` 下其余的 `c6x–c8x_*`、`hpc_*`、`mk_ws*`、`b4x–b6x*` 脚本是过去实验的一次性启动器和测量脚本，留作记录。
+- `bridge/ops/` 这一层只留下仍被 bm1、测试或代码引用的 26 个旧脚本（清单见 [bridge/ops/README.md](../bridge/ops/README.md)）。其余 126 个过去实验的一次性启动器和测量脚本在 [bridge/ops/archive/](../bridge/ops/archive/README.md)。
 
 ## 12. 不在主线上的代码
 
@@ -180,6 +180,6 @@ visible 帧按对象组织：每个身体一个 P、实体 E（上限 128，超�
 | `bridge/python/train_abplus.py`、`abplus_vec.py`、`abplus_worker.py`、`gpu_ppo.py`、`abplus_eval.py` | 9 月的房间战斗管线（C1–C54），已被 `train_tok.py` 代替；说明在 [archive/abplus-README-2026-10.md](archive/abplus-README-2026-10.md) |
 | `bridge/python/goexplore_*.py`、`isaac_bridge/abplus_duel.py`、`abplus_options.py`、`abplus_nav.py`、`abplus_shield.py` | Go-Explore（A7、A8）、对战场（A6、C38、C40）、目标条件选项（C42–C45）、碰撞护盾（A17） |
 | `bridge/README.md`、`bridge/mod/isaac_rl_bridge/`、`turbo/` | 忏悔+ J460 的桥和加速层，暂停 |
-| `bridge/mod/isaac_human_recorder/` | 人类录制 mod 的旧副本；录制器 11-10 起是单独的仓库 isaac-run-recorder |
+| `archive/human-recorder-2026-09/` | 9 月的人类录制 mod 和行为克隆一线，已归档（[archive/README.md](../archive/README.md)）；后来重写的录制器 11-10 起是单独的仓库 isaac-run-recorder |
 | `sim/`、`isaac_room/` | Rust 模拟器（9 月起搁置）、已否定的原型 |
 | `macro/` | AB+ 楼层生成器、隐藏房推断、规划工具（离线，[MACRO_PLANNING.md](MACRO_PLANNING.md)） |

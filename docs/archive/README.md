@@ -6,6 +6,7 @@
 - 归档文档里的相对链接仍按它们原来的位置写，很多已经打不开。要找对应的文件，按文件名在仓库里搜。
 - 文中的"当前""现状""第一台 / 第二台 / HPC"都是写作当时的情况。这些机器现在都已不可用。
 - 实验结果以 [bridge/abplus/EXPERIMENTS.md](../../bridge/abplus/EXPERIMENTS.md) 为准。
+- 这里只放文档。归档的代码在 [archive/](../../archive/README.md)，归档的一次性运维脚本在 [bridge/ops/archive/](../../bridge/ops/archive/README.md)。
 
 | 文件 | 最后一次内容修改 | 所属的线 | 为什么归档，由什么代替 |
 |---|---|---|---|
