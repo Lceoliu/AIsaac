@@ -2112,7 +2112,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 run_lab()
     except VisibleV3Fatal as exc:
         v3_fatal = exc
-        report_fatal(index, conn, exc, 'tok floor worker')   # (before the cleanup below)
+        report_fatal(index, conn, exc, 'tok floor worker', cfg.fatal_dir)   # (before the cleanup below)
         mine[ST['errors']] += 1000
     except Exception:
         traceback.print_exc()
