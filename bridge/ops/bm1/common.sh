@@ -9,7 +9,24 @@
 BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 if [ -f "$BM/bm1.env" ]; then . "$BM/bm1.env"; else echo "bm1: $BM/bm1.env missing (copy one of $BM/env/*.env)" >&2; exit 2; fi
 # (the older per-script variables still override: CPUSET, MEMS, GPUS_OK, MEM, PIDS, LOCK, SESSION)
-BM1_CPUSET=${CPUSET-${BM1_CPUSET:-}}; BM1_MEMS=${MEMS-${BM1_MEMS:-}}; BM1_GPUS_OK=${GPUS_OK:-${BM1_GPUS_OK:-}}
+BM1_CPUSET=${CPUSET-${BM1_CPUSET:-}}; BM1_MEMS=${MEMS-${BM1_MEMS:-}}
+# (2026-11-18, the coordinator: a caller's GPUS_OK only narrows the lane, never widens it. The lane's ceiling is
+#  bm1.env's BM1_GPUS_OK plus BM1_TIMED_GPUS_OK (the timed runs' GPUs, e.g. accept_g.sh's); a caller's list keeps only
+#  the ceiling's members, compared as written (index or UUID, as bm1.env spells them: a different spelling is dropped,
+#  failing closed). Nothing in common: BM1_GPUS_OK empty and BM1_GPUS_NONE says why -- gpu_forbid refuses every launch.)
+_bm1_narrow() (
+  set -f; out=
+  for g in $(printf '%s\n' "$1" | tr ',' ' '); do
+    case ",$2," in *",$g,"*) case ",$out," in *",$g,"*) ;; *) out="${out:+$out,}$g" ;; esac ;; esac
+  done
+  printf '%s\n' "$out"
+)
+BM1_GPUS_OK=${BM1_GPUS_OK:-}; BM1_GPUS_NONE=
+if [ -n "${GPUS_OK:-}" ]; then
+  _ceil="$BM1_GPUS_OK${BM1_TIMED_GPUS_OK:+,$BM1_TIMED_GPUS_OK}"
+  BM1_GPUS_OK=$(_bm1_narrow "$GPUS_OK" "$_ceil")
+  [ -n "$BM1_GPUS_OK" ] || BM1_GPUS_NONE="the caller's GPUS_OK=$GPUS_OK has no GPU of this lane ($_ceil)"
+fi
 BM1_MEM=${MEM:-${BM1_MEM:-}}; BM1_PIDS=${PIDS:-${BM1_PIDS:-4096}}
 LOCK=${LOCK:-${BM1_LOCK:-$BM/LOCK_node0}}; SESSION=${SESSION:-${BM1_SESSION:-bm1-a1}}
 # (two lanes of one host = two bm1 directories, each with its own bm1.env: the container name prefix, the runner's
@@ -180,6 +197,10 @@ gpu_forbid() (
     valid_list "$forbidden" || bad 'missing or invalid forbidden device list'
   fi
   valid_list "$request" || bad 'use a nonempty explicit GPU list (not all)'
+  if [ -z "$BM1_GPUS_OK" ]; then
+    printf 'bm1: no GPU allowed on this lane: %s\n' "${BM1_GPUS_NONE:-BM1_GPUS_OK is empty}" >&2
+    exit 2
+  fi
   if [ "$guarded" = 1 ]; then
     mapping=$(gpu_uuid_map) || bad 'could not resolve physical GPU UUIDs'
     for spec in $(printf '%s\n' "$forbidden" | tr ',' ' '); do
