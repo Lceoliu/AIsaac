@@ -27,7 +27,9 @@
 # HOURS: cause early_end, resumed once, the second in a row stopped); else the cause from the ranks'
 # stdout and the guard's own checks --
 #   stop, no resume: the STOP file; a VisibleV3Fatal in a rank's output (cause v3_fatal: a visible-v3 version / mode /
-#     frame error, 2026-11-18); a rank without the C++ actor driver ("B52 cpp actor driver: on" missing: cause
+#     frame error, 2026-11-18); two attempts in a row ending the same way early (cause config_fault, 2026-11-18: rc != 0
+#     within EARLY_S, 300 s, of the start, before any progress row of the attempt, the same rc and rank 0's same last
+#     stderr line -- train_tok refusing its arguments, a model that cannot be built; the first such end is resumed); a rank without the C++ actor driver ("B52 cpp actor driver: on" missing: cause
 #     driver_off, REQUIRE_DRIVER=0 to run without it); a CheckpointError or a compile during a checkpoint's recomputation; the ranks'
 #     hashes differing in consecutive checks; preflight failing (Xid / a GPU missing); free disk under DISK_MIN_GB;
 #     the same update failing MAX_RETRY times; an out-of-memory a second time while another tenant's process was on
@@ -264,6 +266,7 @@ while :; do
   CPUSET="${CS:-${BM1_TIMED_CPUSET:-$BM1_CPUSET}}" MEMS="" MEM="${MEMG}g" PIDS=$((${BM1_PIDS:-4096} * K)) \
     DOCK_ENV="$DE" env -u GPUS_OK "$BM/run.sh" train-$NAME "$DEVICES" sh $BM1_IN/shardk_in.sh $NAME 315360000 ${HOURS:-125} "$(echo $PAIRS)" "$CPUS" "$LCPUS" "$DCPUS" >> $RD/launcher.log 2>&1
   rc=$?
+  a_end=$(date +%s); a_t0=$(cat $RD/.attempt_start 2>/dev/null || echo 0)
   kill $MP 2>/dev/null
   stall_=""; [ -f $RD/.stall ] && { stall_=$(cat $RD/.stall); mv $RD/.stall $RD/.stall.attempt$attempt; }
   cgk=$(cat $RD/$NAME.oom_kills 2>/dev/null); [ -f $RD/$NAME.oom_kills ] && mv $RD/$NAME.oom_kills $RD/$NAME.oom_kills.attempt$attempt
@@ -309,9 +312,21 @@ while :; do
   case "$cgk" in [1-9]*) cause=cgroup_oom ;; esac   # (the kernel's OOM kill at the container's limit)
   [ $rc = 4 ] && cause=gpu_busy   # (run.sh: a GPU had another process at the start)
   [ -n "$stall_" ] && cause=stall   # (the monitor's no-progress watchdog ended it)
-  glog "attempt $attempt ended rc=$rc at update ${upd:-?}: cause $cause"
+  # (2026-11-18, the coordinator: a deterministic configuration fault ended every attempt of the first v3 smoke within
+  #  8 s, the same ValueError each time, and the guard went on retrying until stopped by hand. An early end -- rc != 0
+  #  within EARLY_S (300) s of the attempt's start and no progress row written since -- has the signature rc + rank 0's
+  #  last stderr line; the same signature two attempts in a row is cause config_fault: never retried. The first early
+  #  end is resumed as before, so a transient fault still gets its retry.)
+  early_sig=""
+  if [ "$cause" = other ] && [ "$a_t0" -gt 0 ] && [ $(( a_end - a_t0 )) -lt ${EARLY_S:-300} ]      && [ "$(stat -c %Y $RD/$NAME-s0/progress.csv 2>/dev/null || echo 0)" -lt "$a_t0" ]; then
+    early_sig="rc=$rc, $(grep -a -v '^[[:space:]]*$' $RD/$NAME-s0.stderr 2>/dev/null | tail -1 | cut -c1-200)"
+  fi
+  [ -n "$early_sig" ] && [ "$early_sig" = "${last_early_sig:-}" ] && cause=config_fault
+  last_early_sig=$early_sig
+  glog "attempt $attempt ended rc=$rc at update ${upd:-?}: cause $cause${early_sig:+ (early: $early_sig)}"
   case $cause in
     checkpoint|hash) glog "cause $cause: stopped, no resume (a person looks)"; break ;;
+    config_fault) glog "cause config_fault: two attempts in a row ended the same way within ${EARLY_S:-300} s of their start, before any progress row -- a configuration or code fault, never retried: stopped, no resume (a person looks)"; break ;;
     v3_fatal) glog "cause v3_fatal ($(echo "$outs" | grep -a -m1 'VisibleV3Fatal' | cut -c1-200)): a visible-v3 version / mode / frame error is a configuration or code fault, never retried: stopped, no resume (a person looks)"; break ;;
     oom) if [ -s $RD/foreign_gpu.log ] && [ $oom_foreign -ge 1 ]; then glog "out of memory again with other tenants on our GPUs: stopped"; break; fi
          [ -s $RD/foreign_gpu.log ] && oom_foreign=$((oom_foreign+1)) ;;
