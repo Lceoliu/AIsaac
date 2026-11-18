@@ -516,10 +516,11 @@ MAX_ROOM_RETRIES = 8  # mixture rooms tried per seed before giving up
 
 
 def check_visible_v3(client, mode=None):
-    """visible-v3 (2026-11-18, Codex round 2): the bridge's mode (the visible_v3 query) against this client's
+    """visible-v3 (2026-11-18, Codex rounds 2 / 3): the bridge's mode (the visible_v3 query) against this client's
     ISAAC_RL_VISIBLE_V3 (and the native encoder there for modes 2 / 3); a bridge without the command answers
-    'unknown cmd' (mode 0). A mismatch is refused like a bridge of another version (BridgeError). Returns the mode."""
-    from .visible_producer import check_bridge_mode
+    'unknown cmd' (mode 0). A mismatch closes the connection and raises VisibleV3Fatal (a configuration error, not a
+    game fault: the samplers' retries do not take it). Returns the mode."""
+    from .visible_producer import VisibleV3Fatal, check_bridge_mode
     client._send({"cmd": "visible_v3"})
     try:
         reply = client._recv()
@@ -527,8 +528,14 @@ def check_visible_v3(client, mode=None):
         reply = {"type": "error", "msg": str(exc)}
     try:
         return check_bridge_mode(reply, mode)
-    except ValueError as exc:
-        raise BridgeError(str(exc)) from None
+    except VisibleV3Fatal:
+        sock, client._sock = getattr(client, '_sock', None), None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        raise
 
 
 class RoomUnusable(BridgeError):

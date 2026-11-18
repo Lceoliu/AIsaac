@@ -159,6 +159,17 @@ import math as _math
 
 from . import schema_v3 as V3
 
+
+class VisibleV3Fatal(Exception):
+    """A visible-v3 protocol error (2026-11-18, Codex round 3): a frame or raw block of another schema version, a
+    malformed frame header, a bridge in another mode than the worker's (or without the native encoder its mode needs),
+    a record without the v3 frame a v3 worker needs. Not a game fault: deliberately no subclass of BridgeError /
+    OSError / RuntimeError / ValueError, so the samplers' retry paths do not take it -- the worker stops with
+    V3_FATAL_EXIT and train / eval fail (TokSampler.check_fatal)."""
+
+
+V3_FATAL_EXIT = 86   # a sampler worker's exit code after a VisibleV3Fatal
+
 # Decorative effects never sent (abp_bridge.lua V3_DECORATIVE_SPEC; tests compare the two; the rule in schema_v3):
 # effect variant -> (name, why). The bridge drops one only while its CollisionDamage is 0. Not in it, sent: 121 LIGHT
 # and 138 MIST (Rep only: the room's light and visibility; their Rep form UNVERIFIED).
@@ -241,7 +252,7 @@ def observation_frame_v3(raw, stall_share=0.0, stall_known=0, producer=V3.PRODUC
         raise ValueError('visible-v3: not a v3 raw block')
     if raw.get('version') != V3.VERSION:   # (2026-11-18, Codex round 1: a raw block from a Lua / tool of another commit
         #                                     than this tree -- e.g. no position_known, read here as 1 -- is refused)
-        raise ValueError('visible-v3: raw block version %r, this tree: schema_v3.VERSION %d'
+        raise VisibleV3Fatal('visible-v3: raw block version %r, this tree: schema_v3.VERSION %d'
                          % (raw.get('version'), V3.VERSION))
     ox, oy = float(raw['origin'][0]), float(raw['origin'][1])
     gw, gh = int(raw['gw']), int(raw['gh'])
@@ -284,6 +295,8 @@ def observation_frame_v3(raw, stall_share=0.0, stall_known=0, producer=V3.PRODUC
     bodies = raw['bodies']
     if not bodies:
         raise ValueError('visible-v3: no body')
+    if len(bodies) > V3.CAP_BODY:   # (as abp_v3_native.c, which hands such a frame back)
+        raise ValueError(f'visible-v3: {len(bodies)} bodies, more than CAP_BODY {V3.CAP_BODY}')
     entities, overflow = v3_prioritize(raw['entities'], bodies)
     P = np.zeros((len(bodies), V3.PF), '<f4')
     local = np.zeros((len(bodies), V3.LOCAL_SIDE, V3.LOCAL_SIDE, V3.ROOM_WORDS), '<f4')
@@ -399,22 +412,28 @@ def v3_body_order(frame):
 
 
 def check_frame_header_v3(f, exact=False):
-    """A v3 frame's header (f: its floats) against this tree's schema_v3: magic, the schema version (header[6] =
-    VERSION_WORD, batch 5), size = frame_floats(p, e, n, s), and at least that many floats (exact: exactly that many).
-    Returns (p, e, n, s)."""
+    """A v3 frame's header (f: its floats) against this tree's schema_v3 (2026-11-18, Codex round 3: the values first):
+    every header word a finite whole number; magic; the schema version (header[6] = VERSION_WORD, batch 5); counts in
+    range -- 1 <= p <= CAP_BODY, 0 <= e <= CAP_ENTITY, n >= 0, s >= 0; size = frame_floats(p, e, n, s) within the byte
+    budget; and at least that many floats given (exact: exactly that many). Returns (p, e, n, s). Raises VisibleV3Fatal."""
     if f.size < V3.HEADER:
-        raise ValueError('visible-v3: %d floats, shorter than the header' % f.size)
-    if int(f[V3.H_MAGIC]) != V3.MAGIC:
-        raise ValueError('visible-v3: bad header (magic %r, this tree: %d)' % (float(f[V3.H_MAGIC]), V3.MAGIC))
-    if float(f[V3.H_VERSION]) != V3.VERSION_WORD:
-        raise ValueError('visible-v3: frame version %.0f (header[6] %r), this tree: schema_v3.VERSION %d (word %d)'
-                         % (float(f[V3.H_VERSION]) + V3.VERSION_BASE, float(f[V3.H_VERSION]), V3.VERSION,
-                            V3.VERSION_WORD))
-    p, e, n, s = (int(v) for v in f[2:6])
+        raise VisibleV3Fatal('visible-v3: %d floats, shorter than the header' % f.size)
+    h = [float(v) for v in f[:V3.HEADER]]
+    if not all(_math.isfinite(v) and v == int(v) for v in h):
+        raise VisibleV3Fatal(f'visible-v3: bad header (a word not a finite whole number: {h})')
+    magic, size, p, e, n, s, word, _ = (int(v) for v in h)
+    if magic != V3.MAGIC:
+        raise VisibleV3Fatal('visible-v3: bad header (magic %d, this tree: %d)' % (magic, V3.MAGIC))
+    if word != V3.VERSION_WORD:
+        raise VisibleV3Fatal('visible-v3: frame version %d (header[6] %d), this tree: schema_v3.VERSION %d (word %d)'
+                             % (word + V3.VERSION_BASE, word, V3.VERSION, V3.VERSION_WORD))
+    if not (1 <= p <= V3.CAP_BODY and 0 <= e <= V3.CAP_ENTITY and n >= 0 and s >= 0):
+        raise VisibleV3Fatal(f'visible-v3: bad header (counts p {p}, e {e}, n {n}, s {s}: p 1..{V3.CAP_BODY}, '
+                             f'e 0..{V3.CAP_ENTITY}, n / s >= 0)')
     want = V3.frame_floats(p, e, n, s)
-    if int(f[1]) != want or f.size < want or (exact and f.size != want):
-        raise ValueError('visible-v3: size mismatch (header %d floats, counts give %d, %d given)'
-                         % (int(f[1]), want, f.size))
+    if size != want or want * 4 > V3.FRAME_BYTES or f.size < want or (exact and f.size != want):
+        raise VisibleV3Fatal('visible-v3: size mismatch (header %d floats, counts give %d, %d given, budget %d bytes)'
+                             % (size, want, f.size, V3.FRAME_BYTES))
     return p, e, n, s
 
 
@@ -469,19 +488,19 @@ RAW_SCHEMA_V3_BYTES = RAW_SCHEMA_V3.encode()
 def check_bridge_mode(reply, mode=None):
     """The bridge's answer to {"cmd": "visible_v3"} (no mode: a query) against the worker's configured mode (2026-11-18,
     Codex round 2): the same mode, and for modes 2 / 3 the native encoder there (no silent fall back to the Lua raw
-    block every step). A bridge without the command ('unknown cmd') is a mode 0 bridge. Raises ValueError."""
+    block every step). A bridge without the command ('unknown cmd') is a mode 0 bridge. Raises VisibleV3Fatal."""
     mode = VISIBLE_V3_MODE if mode is None else mode
     if reply.get('type') == 'error' and reply.get('msg') == 'unknown cmd':
         have = 0
     elif reply.get('type') != 'ok' or reply.get('cmd') != 'visible_v3':
-        raise ValueError(f'visible-v3: the bridge did not answer the mode query: {str(reply)[:200]}')
+        raise VisibleV3Fatal(f'visible-v3: the bridge did not answer the mode query: {str(reply)[:200]}')
     else:
         have = int(reply.get('mode', -1))
     if have != mode:
-        raise ValueError(f'visible-v3: the bridge runs mode {have}, this worker is configured for mode {mode} '
+        raise VisibleV3Fatal(f'visible-v3: the bridge runs mode {have}, this worker is configured for mode {mode} '
                          f'(ISAAC_RL_VISIBLE_V3 of the game and of the worker differ)')
     if mode in (2, 3) and not reply.get('native_available'):
-        raise ValueError(f'visible-v3: mode {mode} needs the native encoder, the bridge has none (abp_native_v3 not '
+        raise VisibleV3Fatal(f'visible-v3: mode {mode} needs the native encoder, the bridge has none (abp_native_v3 not '
                          f'registered: libabp_turbo.so of another tree, or its address check refused)')
     return have
 
@@ -500,7 +519,7 @@ def is_raw_v3(block):
 def write_frame_v3(row, payload):
     """The v3 frame bytes into a ROW (a length-1 view): visible_bytes, visible_frame, visible_schema = V3.VERSION."""
     if len(payload) > V3.FRAME_BYTES or len(payload) > row['visible_frame'].shape[-1]:
-        raise ValueError('visible-v3 frame exceeds the transport byte budget')
+        raise VisibleV3Fatal('visible-v3 frame exceeds the transport byte budget')
     row['visible_bytes'] = len(payload)
     row['visible_frame'][0, :len(payload)] = np.frombuffer(payload, np.uint8)
     row['visible_schema'] = V3.VERSION
@@ -514,7 +533,7 @@ def write_v3(row, o):
     native = getattr(o, 'visible_v3_frame', None)
     if native is not None:
         if len(native) % 4:
-            raise ValueError('visible-v3: native frame of %d bytes, not whole floats' % len(native))
+            raise VisibleV3Fatal('visible-v3: native frame of %d bytes, not whole floats' % len(native))
         check_frame_header_v3(np.frombuffer(native, '<f4'), exact=True)   # (2026-11-18: before, none at all)
         write_frame_v3(row, native)
         return True

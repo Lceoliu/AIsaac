@@ -67,7 +67,7 @@ def test_a_v3_worker_refuses_a_record_without_a_v3_frame(mode, m):
     mode(m)
     v2 = {'schema': 'isaac-visible-prlmens-g-v2', 'bodies': [], 'inventory': [], 'capabilities': 1}
     for payload, why in ((lean(v2=v2), "schema 'isaac-visible-prlmens-g-v2'"), (lean(), 'no visible block')):
-        with pytest.raises(ValueError, match=why):
+        with pytest.raises(VP.VisibleV3Fatal, match=why):
             write_visible(al.LeanDecoder().decode(payload), np.zeros(1, ROW))
     for payload in (lean(raw=RAW), lean(frame=VP.observation_frame_v3(RAW))):   # a v3 record: written
         row = np.zeros(1, ROW)
@@ -77,30 +77,61 @@ def test_a_v3_worker_refuses_a_record_without_a_v3_frame(mode, m):
     assert 'v3 = write_visible(o, row)' in src[src.index('def encode_row('):]
 
 
+def _lean_v2():
+    """A lean payload with a 15 x 9 terrain block (flag 2) and a real v2 visible block (flag 32), one player."""
+    from isaac_bridge import schema_v2
+    b = bytearray(al._HEADER.pack(al.MAGIC, 1234, 1200, 2 | 32, 1, 0, 0))
+    b += al._ROOM.pack(1, 0, 0, 0, 60, 2, 0, 0, 40.0, 120.0, 600.0, 400.0)
+    b += al._TOTALS.pack(0.0, 0.0, 0.0, 0.0)
+    pl = np.zeros(1, al.PLAYER)
+    pl['hearts'], pl['x'], pl['y'] = 6, 300, 250
+    b += pl.tobytes() + struct.pack('<H', 0)
+    cells = [[i, 60 + 40 * (i % 15), 140 + 40 * (i // 15), 0, 1, 1, 0, 0, 0, 0] for i in range(135)]
+    t, g = json.dumps(dict(width=15, height=9, cells=cells)).encode(), b'[]'
+    b += struct.pack('<II', 1, len(t)) + t + struct.pack('<I', len(g)) + g
+    vis = json.dumps(dict(schema=schema_v2.SCHEMA, curses=0, capabilities=1, stage=1, inventory=[], slots=[],
+                          bodies=[dict(controller=0, controller_known=1, animation=0, animation_known=1)])).encode()
+    return bytes(b) + struct.pack('<I', len(vis)) + vis
+
+
 def test_a_v2_worker_still_takes_v2_records(mode):
+    """(2026-11-18, round 3: a real v2 block, not only a record without one) A v2 worker writes the v2 frame of a v2
+    record (visible_schema = schema_v2.VERSION, the frame's bytes) and visible_schema 0 for a record without a block;
+    a v3 worker refuses the same v2 record."""
+    from isaac_bridge import schema_v2
+    from isaac_bridge.visible_native import frame
     mode(0)
+    o = al.LeanDecoder().decode(_lean_v2())
+    row = np.zeros(1, ROW)
+    assert not write_visible(o, row)
+    want = frame(o)
+    assert int(row['visible_schema'][0]) == schema_v2.VERSION and int(row['visible_bytes'][0]) == len(want) > 0
+    assert bytes(row['visible_frame'][0, :len(want)]) == want
     row = np.zeros(1, ROW)
     assert not write_visible(al.LeanDecoder().decode(lean()), row)
     assert int(row['visible_schema'][0]) == 0
+    mode(2)
+    with pytest.raises(VP.VisibleV3Fatal, match='prlmens-g-v2'):
+        write_visible(al.LeanDecoder().decode(_lean_v2()), np.zeros(1, ROW))
 
 
 def test_the_bridge_mode_is_checked(mode):
     ok = lambda m, native=True: dict(type='ok', cmd='visible_v3', mode=m, enabled=m != 0, native_available=native)
     for m in range(4):
         assert VP.check_bridge_mode(ok(m), m) == m
-    with pytest.raises(ValueError, match='bridge runs mode 0, this worker is configured for mode 2'):
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 2'):
         VP.check_bridge_mode(ok(0), 2)
-    with pytest.raises(ValueError, match='bridge runs mode 2, this worker is configured for mode 0'):
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 2, this worker is configured for mode 0'):
         VP.check_bridge_mode(ok(2), 0)
     for m in (2, 3):
-        with pytest.raises(ValueError, match='native encoder'):
+        with pytest.raises(VP.VisibleV3Fatal, match='native encoder'):
             VP.check_bridge_mode(ok(m, native=False), m)
     assert VP.check_bridge_mode(ok(1, native=False), 1) == 1   # (mode 1 needs no native encoder)
     unknown = dict(type='error', msg='unknown cmd')   # a bridge without the command: mode 0
     assert VP.check_bridge_mode(unknown, 0) == 0
-    with pytest.raises(ValueError):
+    with pytest.raises(VP.VisibleV3Fatal):
         VP.check_bridge_mode(unknown, 1)
-    with pytest.raises(ValueError, match='did not answer'):
+    with pytest.raises(VP.VisibleV3Fatal, match='did not answer'):
         VP.check_bridge_mode(dict(type='error', cmd='visible_v3', msg='visible_v3: mode must be 0-3, got 4'), 0)
     mode(3)   # (the default: the worker's configured mode)
     assert VP.check_bridge_mode(ok(3)) == 3
@@ -109,13 +140,20 @@ def test_the_bridge_mode_is_checked(mode):
 def test_the_connect_check_with_the_clients_recv():
     """abplus.check_visible_v3 (AbplusTrainingEnv.connect's check) with a client whose _recv raises on an error reply,
     as the real one does: an old bridge's 'unknown cmd' is mode 0 (passes for a mode 0 client, refused otherwise); a
-    mismatch is a BridgeError naming both modes."""
+    mismatch is a VisibleV3Fatal naming both modes (2026-11-18, round 3: not a BridgeError, which the samplers retry)
+    and the connection is closed."""
     from isaac_bridge.abplus import check_visible_v3
     from isaac_bridge.env import BridgeError
 
+    class Sock:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
     class Client:
         def __init__(self, reply):
-            self.reply, self.sent = reply, []
+            self.reply, self.sent, self._sock = reply, [], Sock()
 
         def _send(self, msg):
             self.sent.append(msg)
@@ -126,11 +164,14 @@ def test_the_connect_check_with_the_clients_recv():
             return self.reply
     c = Client(dict(type='ok', cmd='visible_v3', mode=2, native_available=True))
     assert check_visible_v3(c, 2) == 2 and c.sent == [{'cmd': 'visible_v3'}]
-    with pytest.raises(BridgeError, match='bridge runs mode 2, this worker is configured for mode 0'):
+    sock = c._sock
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 2, this worker is configured for mode 0'):
         check_visible_v3(c, 0)
+    assert sock.closed and c._sock is None and not issubclass(VP.VisibleV3Fatal, (BridgeError, OSError, RuntimeError,
+                                                                                  ValueError))
     old = Client(dict(type='error', msg='unknown cmd'))
-    assert check_visible_v3(old, 0) == 0
-    with pytest.raises(BridgeError, match='bridge runs mode 0, this worker is configured for mode 1'):
+    assert check_visible_v3(old, 0) == 0 and not old._sock.closed
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 1'):
         check_visible_v3(old, 1)
     src = Path(al.__file__).with_name('abplus.py').read_text(encoding='utf-8')
     assert 'check_visible_v3(self)' in src[src.index('    def connect(self):'):]
@@ -147,7 +188,8 @@ def test_needs_decode_by_the_payload():
 def test_fastrow_never_lets_the_c_path_take_a_v3_payload(mode, monkeypatch, m):
     """FastRow.encode on a raw payload with a v3 frame (flag 64) or raw block decodes it and hands the LeanObs to
     encode_row, whatever the worker's own mode (before: decided by ISAAC_RL_VISIBLE_V3 at import, so a v2-configured
-    worker let abp_row_encode take the step and drop the frame); a payload without one still goes to the C path."""
+    worker let abp_row_encode take the step and drop the frame). A payload without one goes to the C path only in a
+    v2 worker; a v3 worker sends it to encode_row too, whose check refuses it (2026-11-18, round 3)."""
     mode(m)
     calls, slow = [], []
 
@@ -164,8 +206,18 @@ def test_fastrow_never_lets_the_c_path_take_a_v3_payload(mode, monkeypatch, m):
     assert not calls and fr.slow == 3 and len(slow) == 3
     assert slow[0].visible_v3_frame == frame and slow[1].visible_v3_frame == frame and slow[2].visible == RAW
     fr._ptrs = (1, 1, 1)   # (a slow record resets them: _from_st)
-    fr.encode(lean(), row, row.ctypes.data, 2)   # no v3 in it: the C path
-    assert len(calls) == 1 and fr.fast == 1
+    fr.encode(lean(), row, row.ctypes.data, 2)   # no v3 in it: the C path in a v2 worker, encode_row in a v3 one
+    if m == 0:
+        assert len(calls) == 1 and fr.fast == 1
+    else:
+        assert not calls and fr.slow == 4 and slow[3].visible_v3_frame is None
+        monkeypatch.undo()   # the real encode_row: the v3 worker's check (undo resets the mode too: set again)
+        mode(m)
+        fr2 = FastRow(fn, EpisodeState(1000), al.LeanDecoder())
+        fr2._ptrs = (1, 1, 1)
+        with pytest.raises(VP.VisibleV3Fatal, match='no v3 frame'):
+            fr2.encode(lean(), np.zeros(1, ROW), row.ctypes.data, 2)
+        assert not calls
 
 
 def test_the_c_row_path_hands_a_v3_frame_back():

@@ -5576,7 +5576,11 @@ def main(argv=None, child=None, actor=None):
         actor_b.start()
 
     def check_actors():
-        """(B38 step 5, the first actor) the second actor process must be alive (else the run ends)."""
+        """(B38 step 5, the first actor) the second actor process must be alive (else the run ends). (2026-11-18) A
+        sampler worker that ended on a visible-v3 protocol error ends the run too (TokSampler.check_fatal)."""
+        check_fatal = getattr(sampler, 'check_fatal', None)
+        if check_fatal is not None:
+            check_fatal()
         if actor_b is not None and not actor_b.is_alive() and not failure:
             failure.append(RuntimeError(f'the actor process 1 ended (exit code {actor_b.exitcode})'))
         if failure:

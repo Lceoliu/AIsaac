@@ -101,6 +101,7 @@
 #define ABP_V3_SF 24
 #define ABP_V3_BODY 597
 #define ABP_V3_CAP_ENTITY 128
+#define ABP_V3_CAP_BODY 8
 /* frame floats = ABP_V3_FIXED + p * ABP_V3_BODY + e * ABP_V3_EF + n * ABP_V3_NF + s * ABP_V3_SF */
 
 /* ---- F1: columns (raw units on the wire; reserved columns 0) */

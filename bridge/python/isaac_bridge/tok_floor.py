@@ -75,6 +75,7 @@ from .tok_obs import (stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARE
                       encode_row, fast_row_function)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
+from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal   # noqa: E402
 from .tok_sampler import rng_key, start_seed   # noqa: E402  (a resumed run's / a shard's start seeds, random streams)
 from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, SearchSlots, StartBuilder, applied_action,
                           apply_instance_defaults, attach, attach_choices, attach_lab, attach_teacher, default_stub_list,
@@ -702,6 +703,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             code = 0
             try:
                 cf_run(pt, child=True)
+            except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child)
+                code = V3_FATAL_EXIT
             except BaseException:
                 code = 1
             finally:
@@ -737,6 +740,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                           file=sys.stderr, flush=True)
                 break
             time.sleep(0.01)
+        if status > 0 and os.WIFEXITED(status) and os.WEXITSTATUS(status) == V3_FATAL_EXIT:
+            raise VisibleV3Fatal(f'cf child {pid}: a visible-v3 protocol error (its stderr has the reason)')
         if status != 0 and status != -1:
             mine[ST['errors']] += 1
             mine[ST['cf_errors']] += 1
@@ -744,6 +749,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             block_arrays[1][index]=0
             block_arrays[4][index]=0
         cf_release(pt)   # (the bank row; the base is already None)
+
+    thread_fatal = []   # (2026-11-18) a VisibleV3Fatal of the search / cf thread: the worker's main loop raises it
 
     def cf_loop():
         """The cf thread (B34): the newest queued choice point whenever there is one (its rate is the quota's, not a
@@ -764,6 +771,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     else:
                         cf_run(pt)
                         cf_release(dict(base=None, bank=pt.bank))
+            except VisibleV3Fatal as exc:   # (2026-11-18: not a game fault -- the worker stops, see thread_fatal)
+                thread_fatal.append(exc)
+                return False
             except Exception as exc:   # (never the worker's death: logged, the next point)
                 mine[ST['errors']] += 1
                 print(f'tok floor worker {index}: cf thread: {type(exc).__name__}: {str(exc)[:200]}',
@@ -819,6 +829,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 code = 0
                 try:
                     search(child_item, pair=False)
+                except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child)
+                    code = V3_FATAL_EXIT
                 except BaseException:
                     code = 1
                 finally:
@@ -855,6 +867,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                               file=sys.stderr, flush=True)
                     break
                 time.sleep(0.01)
+            if status > 0 and os.WIFEXITED(status) and os.WEXITSTATUS(status) == V3_FATAL_EXIT:
+                raise VisibleV3Fatal(f'search child {pid}: a visible-v3 protocol error (its stderr has the reason)')
             if status != 0 and status != -1:
                 mine[ST['errors']] += 1
         finally:
@@ -880,6 +894,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     ok = search_forked() if forking else search_gated()
                 if not ok:
                     time.sleep(0.01)
+            except VisibleV3Fatal as exc:   # (2026-11-18: not a game fault -- the worker stops, see thread_fatal)
+                thread_fatal.append(exc)
+                return
             except Exception as exc:   # (never the worker's death: logged, the next item)
                 mine[ST['errors']] += 1
                 print(f'tok floor worker {index}: search thread: {type(exc).__name__}: {str(exc)[:200]}',
@@ -1601,6 +1618,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         except (OSError, ValueError):
             pass
 
+    fatal = None   # (2026-11-18: a VisibleV3Fatal ends the worker with V3_FATAL_EXIT)
     try:
         inst = Instance(f'{cfg.name}{index}', cfg.port + index, gx, spec)
         builder = StartBuilder(index, inst, cfg, next_seed, prepare)
@@ -1613,6 +1631,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             cf_thread.start()
         episodes_left, episode_n = 0, 0
         while not stopping():
+            if thread_fatal:
+                raise thread_fatal[0]
             mem_dump()
             if builder.stalled():   # the next start state's build hangs (training went on with the old one)
                 recover('stall')
@@ -1620,6 +1640,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 if not builder.wait(stopping, lambda: recover('stall')):
                     break
                 state_seed, exc = builder.take()
+                if isinstance(exc, VisibleV3Fatal):   # (a configuration / protocol error: no relaunch, the worker stops)
+                    raise exc
                 if exc is not None:
                     recover(f'failed ({type(exc).__name__}: {str(exc)[:200]})')
                     continue
@@ -2088,6 +2110,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 run_points()
             if labbing and not control[0]:   # 2026-10-08: posted lab jobs, within cfg.lab_share (tok_lab)
                 run_lab()
+    except VisibleV3Fatal as exc:
+        fatal = exc
+        print(f'tok floor worker {index}: visible-v3 protocol error, the worker stops: {exc}', file=sys.stderr,
+              flush=True)
+        mine[ST['errors']] += 1000
     except Exception:
         traceback.print_exc()
         mine[ST['errors']] += 1000
@@ -2123,3 +2150,5 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             pass
         for b in blocks:
             b.close()
+    if fatal is not None:
+        sys.exit(V3_FATAL_EXIT)

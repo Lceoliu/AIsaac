@@ -241,15 +241,15 @@ def test_a_raw_block_of_another_version_is_refused():
     both versions, and so is a block without one."""
     VP.observation_frame_v3(raw_block())
     old = raw_block(version=2026111703)
-    with pytest.raises(ValueError, match='2026111703.*%d' % V3.VERSION):
+    with pytest.raises(VP.VisibleV3Fatal, match='2026111703.*%d' % V3.VERSION):
         VP.observation_frame_v3(old)
-    with pytest.raises(ValueError, match='2026111703'):
+    with pytest.raises(VP.VisibleV3Fatal, match='2026111703'):
         VP.observation_frame_v3(json.dumps(old))
     none = raw_block()
     del none['version']
-    with pytest.raises(ValueError, match='None.*%d' % V3.VERSION):
+    with pytest.raises(VP.VisibleV3Fatal, match='None.*%d' % V3.VERSION):
         VP.observation_frame_v3(none)
-    with pytest.raises(ValueError, match='version'):     # (the worker's path: write_v3 of a handed-back raw block)
+    with pytest.raises(VP.VisibleV3Fatal, match='version'):     # (the worker's path: write_v3 of a handed-back raw block)
         from isaac_bridge.tok_obs import ROW
         VP.write_v3(np.zeros(1, ROW), SimpleNamespace(visible=old, visible_v3_frame=None))
 
@@ -273,7 +273,7 @@ def test_the_worker_checks_a_native_frames_header():
            'partial float': good + bytes(2), 'header only part': good[:16]}
     for why, frame in bad.items():
         row = np.zeros(1, ROW)
-        with pytest.raises(ValueError):
+        with pytest.raises(VP.VisibleV3Fatal):
             VP.write_v3(row, SimpleNamespace(visible=None, visible_v3_frame=frame))
         assert int(row['visible_bytes'][0]) == 0, why
 
@@ -288,7 +288,51 @@ def test_a_frame_of_another_version_is_refused_by_every_reader():
     for word, named in ((111801, '2026111801'), (3, '2026000003')):
         f = np.frombuffer(good, '<f4').copy()
         f[V3.H_VERSION] = word
-        with pytest.raises(ValueError, match='%s.*%d' % (named, V3.VERSION)):
+        with pytest.raises(VP.VisibleV3Fatal, match='%s.*%d' % (named, V3.VERSION)):
             VP.unpack_frame_v3(f.tobytes())
-        with pytest.raises(ValueError, match=named):
+        with pytest.raises(VP.VisibleV3Fatal, match=named):
             VP.write_v3(np.zeros(1, ROW), SimpleNamespace(visible=None, visible_v3_frame=f.tobytes()))
+
+
+def test_header_values_are_checked_before_the_length():
+    """(2026-11-18, Codex round 3) check_frame_header_v3 takes the header's raw values first: every word a finite
+    whole number, 1 <= p <= CAP_BODY, 0 <= e <= CAP_ENTITY, n / s >= 0, then the exact length. Codex's counter-examples
+    (a fractional header that int() made valid; p = 0; e = 129; e = -1 balanced by n = 8) and the rest are refused."""
+    good = np.frombuffer(VP.observation_frame_v3(raw_block()), '<f4').copy()
+    p, e, n, s = (int(v) for v in good[2:6])
+    assert VP.check_frame_header_v3(good, exact=True) == (p, e, n, s)
+
+    def frame(head, floats=None):
+        f = np.zeros(int(floats if floats is not None else V3.frame_floats(*(int(v) for v in head[2:6]))), '<f4')
+        f[:8] = head
+        return f
+    W = V3.VERSION_WORD
+    cases = {
+        'fractional': frame([61107.5, 3014.5, 1.5, 0, 0, 0, W, 0], 3014),
+        'p = 0': frame([V3.MAGIC, V3.frame_floats(0, 1, 0, 0), 0, 1, 0, 0, W, 0]),
+        'p past CAP_BODY': frame([V3.MAGIC, V3.frame_floats(V3.CAP_BODY + 1, 0, 0, 0), V3.CAP_BODY + 1, 0, 0, 0, W, 0]),
+        'e = 129': frame([V3.MAGIC, V3.frame_floats(1, 129, 0, 0), 1, 129, 0, 0, W, 0]),
+        'e = -1, n = 8': frame([V3.MAGIC, V3.frame_floats(1, -1, 8, 0), 1, -1, 8, 0, W, 0]),
+        's < 0': frame([V3.MAGIC, V3.frame_floats(1, 0, 3, -1), 1, 0, 3, -1, W, 0]),
+        'NaN word': frame([V3.MAGIC, V3.frame_floats(1, 0, 0, 0), 1, 0, 0, 0, W, float('nan')]),
+        'inf size': frame([V3.MAGIC, float('inf'), 1, 0, 0, 0, W, 0], V3.frame_floats(1, 0, 0, 0)),
+        'past the budget': frame([V3.MAGIC, V3.frame_floats(1, 0, 4000, 0), 1, 0, 4000, 0, W, 0]),
+    }
+    for why, f in cases.items():
+        with pytest.raises(VP.VisibleV3Fatal):
+            VP.check_frame_header_v3(f)
+        with pytest.raises(VP.VisibleV3Fatal):   # (the worker's path)
+            from types import SimpleNamespace
+            from isaac_bridge.tok_obs import ROW
+            VP.write_v3(np.zeros(1, ROW), SimpleNamespace(visible=None, visible_v3_frame=f.tobytes()))
+    assert V3.frame_floats(1, 0, 4000, 0) * 4 > V3.FRAME_BYTES
+
+
+def test_more_bodies_than_the_cap_are_refused():
+    """CAP_BODY (8, the native encoder's own limit, now in schema_v3): the reference encoder refuses a 9th body."""
+    bodies = [body(init_seed=k + 1) for k in range(V3.CAP_BODY)]
+    VP.observation_frame_v3(raw_block(bodies=bodies))
+    with pytest.raises(ValueError, match='CAP_BODY'):
+        VP.observation_frame_v3(raw_block(bodies=bodies + [body(init_seed=99)]))
+    header = (BRIDGE / 'engine' / 'abp_schema_v3.h').read_text()
+    assert f'#define ABP_V3_CAP_BODY {V3.CAP_BODY}' in header
