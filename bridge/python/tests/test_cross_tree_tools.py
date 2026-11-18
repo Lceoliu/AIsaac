@@ -111,18 +111,22 @@ def test_golden_v3_diff_checks_hashes_and_empty_manifests(tmp_path):
     tool = PY / 'tools' / 'golden_v3_diff.py'
     args = ['--old-version', '2026111801', '--old-word', '3', '--new-version', '2026111802', '--new-word', '111802']
     run = lambda *a: subprocess.run([sys.executable, str(tool), *a, *args], cwd=PY, capture_output=True, text=True)
-    r = run('--old-rev', '9e941f3~1')
-    if r.returncode != 0 and 'fatal' in r.stderr:   # (no git history here: a shallow tree)
-        import pytest
-        pytest.skip('git history unavailable')
-    assert r.returncode == 0, r.stdout[-500:]
+    import pytest
+    try:   # (the gate runs on a git-archive tree: no history to read the old fixtures from)
+        git = subprocess.run(['git', 'cat-file', '-e', '9e941f3~1'], cwd=PY, capture_output=True)
+    except OSError:
+        git = None
+    have_git = git is not None and git.returncode == 0
+    if have_git:   # (the batch-5 migration against the old fixtures read from git)
+        r = run('--old-rev', '9e941f3~1')
+        assert r.returncode == 0, r.stdout[-500:]
     fix = PY / 'tests' / 'fixtures' / 'visible_v3'
     d = tmp_path / 'new'
     shutil.copytree(fix, d)
     m = json.loads((d / 'manifest.json').read_text())
     m['frames'][0]['sha256'] = '0' * 64
     (d / 'manifest.json').write_text(json.dumps(m))
-    r = run('--old-rev', '9e941f3~1', '--new', str(d))
+    r = run('--old', str(fix), '--new', str(d))   # (the fixtures against themselves: only the sha256 can fail)
     assert r.returncode == 1 and 'does not match its sha256' in r.stdout
     e1, e2 = tmp_path / 'e1', tmp_path / 'e2'
     for e in (e1, e2):
