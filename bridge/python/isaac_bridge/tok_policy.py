@@ -1055,13 +1055,16 @@ class TokPolicy(nn.Module):
         super().__init__()
         if frame not in (None, 'row', 'v3'):
             raise ValueError(f'TokPolicy: frame {frame!r} (None / row: the ROW encoder; v3: FrameEncoderV3)')
-        if frame == 'v3':   # (seq-v1 step 2: the first v3 arm is C114 T1 with the frame encoder replaced)
+        if frame == 'v3':   # (seq-v1 step 2: the first v3 arm is C114 T1 with its frame side replaced -- the ROW observation,
+            # the token / spatial encoder and the item tokens (they read ROW inv / pitem) by FrameEncoderV3, the items
+            # coming in as the frame's N / S tokens; the temporal side, heads, losses, gate and records as T1's)
             bad = [k for k, ok in (('temporal', temporal), ('temporal_feedback 0', not int(temporal_feedback)),
                                    ('temporal_rooms 0', not int(temporal_rooms)),
                                    ('global_token', global_token), ('items', items), ('no item_tokens', not item_tokens),
                                    ('no block_memory', not block_memory), ('memory 0', not memory)) if not ok]
             if bad:
-                raise ValueError(f'TokPolicy(frame=v3) needs {", ".join(bad)} (the C114 T1 configuration)')
+                raise ValueError(f'TokPolicy(frame=v3) needs {", ".join(bad)} (the C114 T1 configuration with its frame side '
+                                 'replaced: no item tokens, the N / S tokens of the frame carry the items)')
         if int(item_slots) != INV_CAP and not item_tokens:
             raise ValueError('TokPolicy: item_slots needs item_tokens=True (B24)')
         if item_tokens and not items:

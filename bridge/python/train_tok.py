@@ -2395,6 +2395,13 @@ def main(argv=None, child=None, actor=None):
             p.error('--frame v3 needs ISAAC_RL_VISIBLE_V3 set (1 / 2 / 3: the workers send v3 frames)')
         if not args.obs_visible:
             p.error('--frame v3 needs --obs-visible 1')
+        # (2026-11-18, the coordinator: the v3 arm replaces the whole frame side -- the ROW observation, the token /
+        #  spatial encoder and the item tokens (they read ROW inv / pitem) -- by the v3 frame encoder; the items come in
+        #  as the frame's N / S tokens. The first smoke's command line, C114 T1's, carried --item-tokens 1: refused here
+        #  at once, not by the model's constructor inside a retried attempt)
+        if args.item_tokens or args.item_shared or item_slots != INV_CAP:
+            p.error(f'--frame v3 takes no item tokens (the N / S tokens of the frame carry the items): --item-tokens 0 '
+                    f'--item-shared 0 --item-slots {INV_CAP} (got {args.item_tokens} / {args.item_shared} / {item_slots})')
         tok_kw['frame'] = 'v3'
     elif VISIBLE_V3_MODE and args.obs_visible:
         p.error(f'ISAAC_RL_VISIBLE_V3={VISIBLE_V3_MODE} sends v3 frames: the model must read them (--frame v3) or '

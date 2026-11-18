@@ -100,6 +100,25 @@ def test_train_tok_refuses_the_pair(monkeypatch, capsys, tmp_path):
     assert 'ISAAC_NO_VISIBLE' not in __import__('os').environ
 
 
+def test_train_tok_frame_v3_refuses_item_tokens(monkeypatch, capsys, tmp_path):
+    """(2026-11-18, the coordinator: the v3 arm takes no item tokens -- they read ROW inv / pitem; the frame's N / S
+    tokens carry the items. The first smoke's T1 line had --item-tokens 1: refused at argument parsing, not by the
+    model's constructor inside a retried attempt.)"""
+    import train_tok
+    from isaac_bridge import visible_producer
+    monkeypatch.setattr(visible_producer, 'VISIBLE_V3_MODE', 2)
+    monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
+    base = ['--groups-file', str(tmp_path / 'missing.json'), '--frame', 'v3', '--temporal', '1', '--temporal-rooms', '0',
+            '--temporal-feedback', '0', '--global-token', '1', '--items']
+    for i, extra in enumerate((['--item-tokens', '1'], ['--item-tokens', '1', '--item-shared', '1'])):
+        with pytest.raises(SystemExit):
+            train_tok.main(base + ['--out', str(tmp_path / f'o{i}')] + extra)
+        assert '--frame v3 takes no item tokens' in capsys.readouterr().err
+    with pytest.raises(FileNotFoundError):   # (without them the arguments pass: the missing groups file is next)
+        train_tok.main(base + ['--out', str(tmp_path / 'ok')])
+    assert '--frame v3 takes no item tokens' not in capsys.readouterr().err
+
+
 def test_eval_tok_refuses_the_pair(monkeypatch, capsys, tmp_path):
     sys.path.insert(0, str(HERE.parent))
     import eval_tok
