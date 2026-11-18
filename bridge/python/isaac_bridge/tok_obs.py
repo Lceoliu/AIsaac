@@ -395,6 +395,9 @@ def _minimap(o, st):
                 m[special, y, x] = 1
 
 
+V3_FRAMES = [0, 0]   # (seq-v1 step 3) this process's v3 frames written: native, the reference encoder's
+
+
 def obs_visible_conflict(obs_visible, v3_raw):
     """(seq-v1, the coordinator 2026-11-18) --obs-visible 0 (no visible frame at all) and ISAAC_RL_VISIBLE_V3 set to a
     mode (a v3 worker writes a v3 frame for every record) contradict each other: write_visible would take
@@ -422,7 +425,10 @@ def write_visible(o, row):
         # visible-v3 (package C): the native frame as it came, else (mode 1, or the native side handed back) the
         # reference encoder's frame of the raw block; the stall columns after the progress update below
         from .visible_producer import write_v3
+        native = getattr(o, 'visible_v3_frame', None) is not None
         v3 = write_v3(row, o)
+        if v3:
+            V3_FRAMES[0 if native else 1] += 1
     elif _VP.VISIBLE_V3_MODE:   # (2026-11-18, Codex round 2: a v3 worker writes a v3 frame for every record or stops)
         raise _VP.VisibleV3Fatal('visible-v3: this worker is configured for mode %d, the record has no v3 frame and %s'
                          % (_VP.VISIBLE_V3_MODE, 'no visible block' if vis is None else 'a visible block of schema %r'

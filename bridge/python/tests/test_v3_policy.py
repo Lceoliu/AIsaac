@@ -120,3 +120,74 @@ def test_configuration():
             TP.TokPolicy(**dict(CFG, **bad))
     n = sum(p.numel() for p in m.parameters())
     assert n > sum(p.numel() for p in m.frame_v3.parameters()) > 0
+
+
+def _rows_with_frames(names, seed=0):
+    from isaac_bridge import visible_producer as VP
+    rng = np.random.default_rng(seed)
+    rows = np.ascontiguousarray(TS.make_seq(rng, nw=len(names), T=1)[0])
+    for i, n in enumerate(names):
+        VP.write_frame_v3(rows[i:i + 1], (FIX / f'{n}.v3.bin').read_bytes())
+    return rows
+
+
+def test_records_carry_their_frames_to_the_model():
+    """to_batch (host records) and decode_rows (records as bytes on the device: the learner) both give b['v3'], equal
+    to pad_batch of the host decodes in the layout's caps; the model reads it."""
+    names = NAMES[:5]
+    rows = _rows_with_frames(names)
+    pend = np.zeros((len(names), 5), np.int64)
+    b = TP.to_batch(rows, pend, 'cpu')
+    raw = torch.from_numpy(rows.view(np.uint8).reshape(len(rows), -1).copy())
+    d = TP.decode_rows(raw, pending=torch.from_numpy(pend))
+    frames = [VI.decode_frame((FIX / f'{n}.v3.bin').read_bytes(), V3.VERSION) for n in names]
+    eb = VI.bucket(max(len(f['E_num']) for f in frames), VI.E_BUCKETS)
+    ref = VI.pad_batch(frames, e_bucket=eb, n_max=VI.N_MAX_V3, s_max=VI.S_MAX_V3)
+    for got in (b['v3'], d['v3']):
+        for k in ref:
+            assert torch.equal(got[k], torch.as_tensor(ref[k])), k
+    m = build()
+    with torch.no_grad():
+        out = m(b, need_vg=True)
+    assert out[0].shape == (len(names), 20) and torch.isfinite(out[0]).all()
+
+
+def test_a_record_without_a_v3_frame_is_refused_in_a_v3_batch():
+    from isaac_bridge.visible_producer import VisibleV3Fatal
+    rows = _rows_with_frames(NAMES[:3])
+    rows['visible_schema'][1] = 0
+    rows['visible_bytes'][1] = 0
+    with pytest.raises(VisibleV3Fatal):
+        TP.to_batch(rows, np.zeros((3, 5), np.int64), 'cpu')
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA: GraphActor')
+@pytest.mark.parametrize('fold', [False, True])
+def test_graph_actor_v3_equals_the_eager_step(fold):
+    """GraphActor of a v3 model: each call's records checked on the host, decoded on the device inside the graph of
+    their entity bucket; the values, value_global and the temporal step's counters equal the eager step's (to_batch,
+    the same rows) over a short sequence; v3_input.STATS counts the calls and buckets."""
+    cuda = torch.device('cuda')
+    m = build().to(cuda)
+    TS.perturb_all(m, 31)
+    st = TP.TemporalState(m, 6, cuda, torch.float32)
+    actor = TP.GraphActor(m, 6, 32, stream=torch.cuda.Stream(), crn=False, temporal=st, fold=fold)
+    st_e = TP.TemporalState(m, 6, cuda, torch.float32)
+    before = dict(VI.STATS)
+    widx = np.array([5, 0, 3, 1])
+    rng = np.random.default_rng(4)
+    for t in range(4):
+        rows = _rows_with_frames(NAMES[4 * t:4 * t + 4], seed=t)
+        if t == 0:
+            rows['first'] = 1
+        pend = np.stack([rng.integers(0, k, 4) for k in m.heads], 1).astype(np.int64)
+        _, lp, val = actor.act(rows, pend, widx, None, None)
+        torch.cuda.synchronize()
+        td = dict(mode='step', state=st_e, slot=torch.from_numpy(widx).to(cuda))
+        with torch.no_grad():
+            _, v_ref, _, vg_ref = m(TP.to_batch(rows, pend, cuda), need_vg=True, temporal=td)
+        assert np.allclose(val, v_ref.cpu().numpy(), atol=1e-4), (t, val, v_ref)
+        assert np.allclose(actor.vg, vg_ref.cpu().numpy(), atol=1e-4)
+        assert np.array_equal(actor.t_out['steps'], td['out']['steps'].cpu().numpy())
+    assert VI.STATS['calls'] - before['calls'] >= 4
+    assert sum(VI.STATS[f'bucket{b}'] - before[f'bucket{b}'] for b in VI.E_BUCKETS) >= 4

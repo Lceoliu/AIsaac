@@ -264,7 +264,7 @@ def test_device_decode_refuses_like_the_host():
 def test_no_contract_constant_written_in_the_decoder():
     """Every scale / clamp / table size the decoder uses comes from schema_v3 (contract C7): none of them as a number in
     v3_input.py's code (comments and docstrings aside). Allowed: PRICE_COIN_SCALE's one definition (to move into
-    schema_v3), the bit widths of the bits8 / word16 kinds, the room-token block layout (4 x 7 blocks of 4 cells, checked against the canvas below), the actor's
+    schema_v3), the bit widths of the bits8 / word16 kinds, the padded layout's inventory / slot rows, the room-token block layout (4 x 7 blocks of 4 cells, checked against the canvas below), the actor's
     bucket sizes."""
     import ast
     import re
@@ -279,7 +279,7 @@ def test_no_contract_constant_written_in_the_decoder():
               V3.IDENTITY_UNKNOWN, V3.ITEM_UNKNOWN, V3.ANIM_ROWS, V3.MAP_ICONS, V3.MAP_ICONS - 1, V3.CANVAS_W,
               V3.CANVAS_H, V3.PF, V3.EF, V3.NF, V3.SF, 100, 1000}
     allowed = ('PRICE_COIN_SCALE = 15.0', 'R_ROWS, R_COLS, R_BLOCK = 4, 7, 4', 'E_BUCKETS = (16, 32, 64, 128)',
-               'W8, W16 = 8, V3.FLAG_WORD_BITS')
+               'W8, W16 = 8, V3.FLAG_WORD_BITS', 'N_MAX_V3, S_MAX_V3 = 64, 32')
     found = []
     for i, line in enumerate(src.splitlines(), 1):
         code = line.split('#', 1)[0]

@@ -694,17 +694,18 @@ def _t_rows(F, base, stride, m, width, count):
     return torch.where(valid[..., None], rows, torch.zeros_like(rows)), valid
 
 
-def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None):
+def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None, check=True):
     """frames: float32 [B, W] on the device (each record's frame floats from its start; W >= every frame); counts [B, 4]
-    from check_batch. Returns the pad_batch dict (tensors on frames' device)."""
+    from check_batch (numpy, or a device tensor: then nothing reads the device back -- check=False inside a captured
+    graph; the caller has checked the bucket). Returns the pad_batch dict (tensors on frames' device)."""
     torch = _t()
     p_max = p_max or P_MAX
     F = frames.to(torch.float32)
     B, dev = F.shape[0], F.device
-    c = torch.as_tensor(np.asarray(counts), device=dev, dtype=torch.int64)
+    c = (counts if torch.is_tensor(counts) else torch.as_tensor(np.asarray(counts))).to(dev, torch.int64)
     p, e = c[:, 0], torch.clamp(c[:, 1], max=e_bucket)
     n, s = torch.clamp(c[:, 2], max=n_max), torch.clamp(c[:, 3], max=s_max)
-    if int(c[:, 1].max()) > e_bucket:
+    if check and int(c[:, 1].max()) > e_bucket:
         raise ValueError(f'v3_input: {int(c[:, 1].max())} entities, the bucket {e_bucket}')
     fixed = torch.full((B,), V3.FIXED, dtype=torch.int64, device=dev)
     P, pv = _t_rows(F, fixed, V3.PF, p_max, V3.PF, p)
@@ -779,3 +780,60 @@ def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None):
             out[k] = keep(out[k], valid)
     out['P_mask'], out['E_mask'], out['N_mask'], out['S_mask'] = pv, ev, nv, sv
     return out
+
+
+# ----------------------------------------------------------------------------------------------- ROW records
+# (seq-v1 step 3) The padded layout of the actor's graphs and the learner's batches: E in its bucket (E_BUCKETS, by the
+# batch's largest e), bodies P_MAX, inventory / slot rows N_MAX_V3 / S_MAX_V3 (records with more are cut there and
+# counted: STATS['trunc_n'] / ['trunc_s']). STATS (this process): the host side of the actor's calls -- checks, buckets,
+# truncations, non-finite wire floats -- for the progress rows.
+N_MAX_V3, S_MAX_V3 = 64, 32
+STATS = dict(calls=0, records=0, host_s=0.0, trunc_n=0, trunc_s=0, nonfinite=0, **{f'bucket{b}': 0 for b in E_BUCKETS})
+
+
+def rows_counts(rows, stats=True):
+    """ROW records (numpy, each with its v3 frame) -> (counts [n, 4], e bucket): check_batch on the records' headers,
+    visible_schema and visible_bytes; with stats the call's host time, bucket, truncations and non-finite frame floats
+    added to STATS."""
+    import time
+    t0 = time.perf_counter()
+    frames = rows['visible_frame'].view('<f4')
+    counts, trunc = check_batch(frames[:, :V3.HEADER], rows['visible_schema'], rows['visible_bytes'], P_MAX, N_MAX_V3,
+                                S_MAX_V3)
+    eb = bucket(int(counts[:, 1].max()), E_BUCKETS)
+    if stats:
+        words = (np.asarray(rows['visible_bytes'], np.int64) // 4)
+        w = int(words.max())
+        live = np.arange(w)[None, :] < words[:, None]
+        STATS['nonfinite'] += int((~np.isfinite(frames[:, :w]) & live).sum())
+        STATS['calls'] += 1
+        STATS['records'] += len(rows)
+        STATS[f'bucket{eb}'] += 1
+        STATS['trunc_n'] += trunc['n']
+        STATS['trunc_s'] += trunc['s']
+        STATS['host_s'] += time.perf_counter() - t0
+    return counts, eb
+
+
+def batch_from_rows(rows, device, stats=False):
+    """ROW records (numpy) -> the padded v3 batch on `device` (decode_frames_device)."""
+    import torch
+    counts, eb = rows_counts(rows, stats)
+    w = int(np.asarray(rows['visible_bytes']).max()) // 4
+    F = torch.from_numpy(np.ascontiguousarray(rows['visible_frame'].view('<f4')[:, :w])).to(device)
+    return decode_frames_device(F, counts, eb, N_MAX_V3, S_MAX_V3)
+
+
+def batch_from_raw(raw, frame_at, schema_at, bytes_at):
+    """ROW records as bytes on the device (raw uint8 [n, >= ROW bytes]; the frame, visible_schema and visible_bytes at
+    the given byte offsets) -> the padded v3 batch on raw's device. One host read of the headers, schemas and sizes."""
+    import torch
+    n = raw.shape[0]
+    head = raw[:, frame_at:frame_at + 4 * V3.HEADER].contiguous().view(torch.float32).cpu().numpy()
+    vs = raw[:, schema_at:schema_at + 4].contiguous().view(torch.int32)[:, 0].cpu().numpy()
+    nb = raw[:, bytes_at:bytes_at + 4].contiguous().view(torch.int32)[:, 0].cpu().numpy()
+    counts, trunc = check_batch(head, vs, nb, P_MAX, N_MAX_V3, S_MAX_V3)
+    eb = bucket(int(counts[:, 1].max()), E_BUCKETS)
+    w = int(nb.max())
+    F = raw[:, frame_at:frame_at + w].contiguous().view(torch.float32).view(n, w // 4)
+    return decode_frames_device(F, counts, eb, N_MAX_V3, S_MAX_V3)

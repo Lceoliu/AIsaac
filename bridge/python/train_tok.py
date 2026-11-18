@@ -2139,6 +2139,9 @@ def main(argv=None, child=None, actor=None):
                    help='(B30) room tokens per episode at most; 0: none (seq-v1, C114 T1: no room token is made)')
     p.add_argument('--temporal-feedback', type=int, default=1, choices=(0, 1),
                    help='(seq-v1, C114 T1) 0: no feedback (history) token o_{t-1} in the frame encoder')
+    p.add_argument('--frame', default='row', choices=('row', 'v3'),
+                   help='(seq-v1 step 3) v3: TokPolicy(frame=v3) -- the visible-v3 frame encoder (needs the C114 T1 '
+                        'configuration and ISAAC_RL_VISIBLE_V3 set: the workers send v3 frames)')
     p.add_argument('--obs-visible', type=int, default=1, choices=(0, 1),
                    help='(seq-v1, C110 Q@maa) 0: the workers write no visible frame (ROW only; sets '
                         'ISAAC_NO_VISIBLE=1 for this process and its children)')
@@ -2311,6 +2314,8 @@ def main(argv=None, child=None, actor=None):
             for key_ in ('width', 'layers', 'heads', 'window', 'rooms'):
                 setattr(args, 'temporal_' + key_, int(ck_cfg['temporal_' + key_]))
             args.temporal_feedback = int(ck_cfg.get('temporal_feedback', 1))   # (seq-v1)
+        if ck_cfg.get('frame'):   # (seq-v1 step 3: a v3 checkpoint keeps its frame encoder)
+            args.frame = ck_cfg['frame']
         tatt_fresh = bool(args.temporal) and not ck_cfg.get('temporal')
         del ck_cfg
     itok_on, gtok_on = bool(args.item_tokens), bool(args.global_token)
@@ -2384,6 +2389,16 @@ def main(argv=None, child=None, actor=None):
         tok_kw.update(temporal=True, temporal_width=args.temporal_width, temporal_layers=args.temporal_layers,
                       temporal_heads=args.temporal_heads, temporal_window=args.temporal_window,
                       temporal_rooms=args.temporal_rooms, temporal_feedback=args.temporal_feedback)
+    from isaac_bridge.visible_producer import VISIBLE_V3_MODE
+    if args.frame == 'v3':   # (seq-v1 step 3)
+        if not VISIBLE_V3_MODE:
+            p.error('--frame v3 needs ISAAC_RL_VISIBLE_V3 set (1 / 2 / 3: the workers send v3 frames)')
+        if not args.obs_visible:
+            p.error('--frame v3 needs --obs-visible 1')
+        tok_kw['frame'] = 'v3'
+    elif VISIBLE_V3_MODE and args.obs_visible:
+        p.error(f'ISAAC_RL_VISIBLE_V3={VISIBLE_V3_MODE} sends v3 frames: the model must read them (--frame v3) or '
+                'the workers write none (--obs-visible 0 is refused with it too): unset it')
     aux_on = bool(args.aux_predict)   # 2026-11-03 (tok_aux)
     if aux_on:
         from isaac_bridge.tok_aux import (AuxNorm, EVENTS as AUX_EVENTS, REG_COLS as AUX_REG, STATE as AUX_STATE,
@@ -5028,6 +5043,21 @@ def main(argv=None, child=None, actor=None):
                         'stage_mean': sum(e.get('stage', 0) for e in finished) / m_all})
             if cfg.start_build_prob > 0:   # 2026-10-08: start builds transplanted so far (worker totals)
                 row['start_builds'] = float(stats[:, ST['start_builds']].sum())
+        if args.frame == 'v3':   # (seq-v1 step 3) the actor's host side of the v3 calls (this process), this update
+            from isaac_bridge import v3_input as VI_
+            tot3 = dict(VI_.STATS)
+            prev3 = L.get('v3_prev') or dict.fromkeys(tot3, 0)
+            L['v3_prev'] = tot3
+            d3 = {k_: tot3[k_] - prev3[k_] for k_ in tot3}
+            row['v3_calls'], row['v3_records'] = d3['calls'], d3['records']
+            row['v3_host_ms'] = 1000 * d3['host_s'] / max(d3['calls'], 1)
+            row['v3_host_share'] = d3['host_s'] / max(job['collect_s'], 1e-9)
+            for b_ in VI_.E_BUCKETS:
+                row[f'v3_bucket{b_}'] = d3[f'bucket{b_}']
+            row['v3_trunc_n'], row['v3_trunc_s'], row['v3_nonfinite'] = d3['trunc_n'], d3['trunc_s'], d3['nonfinite']
+            if 'v3_native' in ST:   # (the workers' frames: native / the reference encoder's -- a handed-back step)
+                row['v3_native'] = float(stats[:, ST['v3_native']].sum())
+                row['v3_reference'] = float(stats[:, ST['v3_reference']].sum())
         if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): this update's worker deltas
             tot = {k_p: float(stats[:, ST[k_p]].sum()) for k_p in ('pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups')}
             prev = L.get('pf_prev') or dict.fromkeys(tot, 0.0)

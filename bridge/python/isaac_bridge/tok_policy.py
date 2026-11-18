@@ -1832,6 +1832,11 @@ def to_batch(rows, pending, device):
         b[k] = torch.from_numpy(np.ascontiguousarray(rows[k][:, :used])).to(device, non_blocking=True)
     b['pending'] = torch.from_numpy(np.ascontiguousarray(pending)).to(device, non_blocking=True).long()
     if np.any(rows['visible_schema']):
+        from .schema_v3 import VERSION as V3_VERSION
+        if np.any(rows['visible_schema'] == V3_VERSION):   # (seq-v1: v3 frames, every record's checked: v3_input)
+            from .v3_input import batch_from_rows
+            b['v3'] = batch_from_rows(rows, device)
+            return b
         from .structured_input import from_rows
         b.update(from_rows(rows,device))
     return b
@@ -2098,6 +2103,12 @@ def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True, co
     # counts (B42): the records' host (p,e,n,s), already checked on the host (check_frames): the
     # visible frame decodes without reading device memory back (fixed buckets, no sync).
     if visible and (counts is not None or bool(versions.any())):
+        from .schema_v3 import VERSION as V3_VERSION
+        if counts is None and bool((versions == V3_VERSION).any()):   # (seq-v1: v3 frames; every record checked)
+            from .v3_input import batch_from_raw
+            b['v3'] = batch_from_raw(raw, ROW.fields['visible_frame'][1], ROW.fields['visible_schema'][1],
+                                     ROW.fields['visible_bytes'][1])
+            return b
         from .structured_input import decode_frame, FRAME_BYTES
         off=ROW.fields['visible_frame'][1]
         sz=ROW.fields['visible_bytes'][1]
@@ -2267,6 +2278,19 @@ class GraphActor:
         self.done = torch.cuda.Event()
         ents = [entities] if np.ndim(entities) == 0 else list(entities)
         self.sizes = sorted({min(int(e), ENT_CAP) for e in ents} | {ENT_CAP})
+        # seq-v1 step 3 (frame='v3'): one graph per entity bucket of the v3 layout; each call's records checked on the
+        # host (v3_input.rows_counts: headers, versions, sizes; the call's time, bucket, truncations and non-finite
+        # floats into v3_input.STATS), their counts sent with them, the frames decoded on the device inside the graph
+        # (decode_frames_device from the records' bytes, no read-back)
+        self.v3 = getattr(model, 'frame_v3', None) is not None
+        if self.v3:
+            from . import v3_input as VI
+            self.VI = VI
+            self.sizes = list(VI.E_BUCKETS)
+            self.v3_counts = torch.zeros((n, 4), dtype=torch.int64, device=dev)
+            self.v3_counts_stage = torch.zeros((n, 4), dtype=torch.int64).pin_memory()
+            self.v3_counts_np = self.v3_counts_stage.numpy()
+            self.v3_frame_at = ROW.fields['visible_frame'][1]
         self.entities = self.sizes[0]
         self.fold = bool(fold)
         if row_sizes and not self.fold:
@@ -2354,13 +2378,22 @@ class GraphActor:
                     setattr(dcfg, name_, max(int(getattr(dcfg, name_)), v_))
         fn = core if not compile_mode else torch.compile(core, mode=compile_mode, dynamic=False)
 
+        def v3in(b, raw, tokens, r):
+            """(seq-v1 step 3) b['v3'] from the records' frame bytes and the staged counts, on the device."""
+            if self.v3:
+                fa = self.v3_frame_at
+                frames = raw[:, fa:fa + self.VI.V3.FRAME_BYTES].view(torch.float32)
+                b['v3'] = self.VI.decode_frames_device(frames, self.v3_counts[:r], tokens, self.VI.N_MAX_V3,
+                                                       self.VI.S_MAX_V3, check=False)
+            return b
+
         def run(tokens, r=None):
             if not self.fold:
-                b = decode_rows(self.raw, entities=tokens, n_heads=nh, visible=False)
+                b = v3in(decode_rows(self.raw, entities=tokens, n_heads=nh, visible=False), self.raw, tokens, self.n)
                 out, self._h_last, self.extra_out, self._t_last = fn(b, self.u, self.h_in if self.mem else None, tokens,
                                                                      self.tslot if t_on else None)
                 return out
-            b = decode_rows(self.raw[:r], entities=tokens, n_heads=nh, visible=False)
+            b = v3in(decode_rows(self.raw[:r], entities=tokens, n_heads=nh, visible=False), self.raw[:r], tokens, r)
             c = self.ctrl[:r]   # (B29 fold: the control block decoded on the device, the per-call work inside the graph)
             widx, keep, dup, cf = (c[:, 0:8].view(torch.int64)[:, 0], c[:, 8:12].view(torch.float32)[:, 0],
                                    c[:, 12:16].view(torch.float32)[:, 0], c[:, 16:20].view(torch.float32)[:, 0])
@@ -2414,14 +2447,20 @@ class GraphActor:
         records or its row in the call); None: as before."""
         # This legacy graph has a fixed input layout. Validate on the host,
         # not with a data-dependent device bool inside CUDA graph capture.
-        if np.any(rows['visible_schema']):
+        if not getattr(self, 'v3', False) and np.any(rows['visible_schema']):
             raise ValueError('visible-v2 requires BlockActor, not the legacy GraphActor')
         n = len(rows)
         if n > self.n:
             return False
+        g_v3 = None
+        if self.v3:   # (seq-v1 step 3) the records' checks and counts on the host; the graph of their entity bucket
+            counts, eb = self.VI.rows_counts(rows)
+            self.v3_counts_np[:n] = counts
+            self.v3_counts_np[n:] = 0
+            g_v3 = self.sizes.index(eb)
         self._tdest = tdest if self.t_on else None
         if self.fold:
-            return self._submit_fold(rows, pending, widx, reset, ukeys)
+            return self._submit_fold(rows, pending, widx, reset, ukeys, g_v3)
         if self.mem:
             self.widx_np[:n] = widx
             self.keep_np[:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
@@ -2433,6 +2472,8 @@ class GraphActor:
         most = int(rows['n_ent'].max())
         g = 0 if most <= self.sizes[0] else (len(self.sizes) - 1 if len(self.sizes) == 2 else
                                              int(np.searchsorted(self.sizes, most)))
+        if g_v3 is not None:
+            g = g_v3
         self.stage_np[:n, :ROW_BYTES] = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
         self.stage_np[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * self.nh)
         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
@@ -2451,6 +2492,8 @@ class GraphActor:
                 self.crn_rows += k
         with torch.cuda.stream(stream):
             self.raw[:n].copy_(self.stage[:n], non_blocking=True)
+            if self.v3:
+                self.v3_counts.copy_(self.v3_counts_stage, non_blocking=True)
             self.u.uniform_()
             if sel is not None:
                 k = len(sel)
@@ -2475,15 +2518,19 @@ class GraphActor:
         self._n = n
         return True
 
-    def _submit_fold(self, rows, pending, widx, reset, ukeys=None):
+    def _submit_fold(self, rows, pending, widx, reset, ukeys=None, g_v3=None):
         """submit() with fold (B29): records + control block in, the replay, the outputs out."""
         g = self._pack_fold(rows, pending, widx, reset, ukeys)
+        if g_v3 is not None:   # (seq-v1 step 3: the v3 entity bucket's graph)
+            g = g_v3
         n = len(rows)
         r = self.rsizes[int(np.searchsorted(self.rsizes, n))]
         g += self.rsizes.index(r) * len(self.sizes)
         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
         with torch.cuda.stream(stream):
             self.raw[:n].copy_(self.stage[:n], non_blocking=True)
+            if self.v3:
+                self.v3_counts.copy_(self.v3_counts_stage, non_blocking=True)
             self.ctrl[:r].copy_(self.ctrl_stage[:r], non_blocking=True)
             with torch.inference_mode():   # (the graphs draw uniforms: replay advances the RNG state they captured,
                 self.graphs[g].replay()    # an inference tensor since the capture ran in inference mode)
