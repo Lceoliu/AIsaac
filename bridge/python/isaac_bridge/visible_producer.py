@@ -230,9 +230,22 @@ def v3_prioritize(entities, bodies):
     (position_known: a body without one -- AB+'s sub-player at world (0, 0) -- takes no part; none at all: 0), then
     the bridge's order; the dropped count per class."""
     placed = [b for b in bodies if int(b.get('position_known', 1))]
+    # (2026-11-18, Codex round 2: a non-finite position has no order -- refused before the sort, as abp_v3_native.c
+    # does; the squared distance as the same expression there, dx * dx + dy * dy in doubles, the first minimum kept)
+    for b in placed:
+        if not (_math.isfinite(b['x']) and _math.isfinite(b['y'])):
+            raise ValueError(f"visible-v3: a body at a non-finite position ({b['x']}, {b['y']})")
     keyed = []
     for i, e in enumerate(entities):
-        d = min(((e['x'] - b['x']) ** 2 + (e['y'] - b['y']) ** 2 for b in placed), default=0.0)
+        ex, ey = float(e['x']), float(e['y'])
+        if not (_math.isfinite(ex) and _math.isfinite(ey)):
+            raise ValueError(f'visible-v3: an entity at a non-finite position ({ex}, {ey})')
+        d, have = 0.0, False
+        for b in placed:
+            dx, dy = ex - float(b['x']), ey - float(b['y'])
+            dd = dx * dx + dy * dy
+            if not have or dd < d:
+                d, have = dd, True
         keyed.append((v3_priority(e), d, i))
     keyed.sort()
     kept = keyed[:V3.CAP_ENTITY]

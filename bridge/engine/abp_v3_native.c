@@ -400,11 +400,15 @@ static const char *v3_select(const v3_room *r, const v3_body_t *bodies, int n_bo
         int kind = v3_kind(e, t, &npc);
         int f = kind == 6 ? v3_npc_flags(e) : 0;
         vec2f ep = G0(vec2f, E_POSITION, e);
+        // (2026-11-18, Codex round 2: a non-finite position has no order; handed back before the sort, as the
+        // reference encoder refuses it)
+        if (!isfinite(ep.x) || !isfinite(ep.y)) return "v3: an entity at a non-finite position";
         double best = 0;
         int have = 0;
         for (int b = 0; b < n_bodies; b++) {   // (bodies with a room position only: a sub-player's (0, 0) takes no part)
             if (!bodies[b].in_room) continue;
             vec2f bp = G0(vec2f, E_POSITION, bodies[b].p);
+            if (!isfinite(bp.x) || !isfinite(bp.y)) return "v3: a body at a non-finite position";
             double dx = (double)ep.x - (double)bp.x, dy = (double)ep.y - (double)bp.y, d = dx * dx + dy * dy;
             if (!have || d < best) best = d;
             have = 1;
