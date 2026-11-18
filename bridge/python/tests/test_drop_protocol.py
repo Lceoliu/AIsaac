@@ -108,3 +108,14 @@ def test_a_line_without_the_seventh_number_is_drop_0():
         subprocess.run([gcc, '-O1', '-o', exe, str(BRIDGE / 'engine' / 'test_step_line.c')], check=True)
         r = subprocess.run([exe], capture_output=True, text=True)
         assert r.returncode == 0, r.stdout
+
+def test_drop_is_pressed_this_frame_once_per_press():
+    """2026-11-18: AB+ updates the player twice per game frame; ACTION_DROP's IsActionTriggered is answered true for the
+    first query of a press only, in the Lua callback (TRIGGER_ONCE) and in abp_turbo's native input (INPUT_ONCE_MASK),
+    so one press swaps the Schoolbag / the pocket slots once (184 drop4: every case and path as expected). ITEM,
+    PILLCARD and BOMB keep their answers (the old trajectories)."""
+    lua = (BRIDGE / 'abplus' / 'abp_bridge.lua').read_text(encoding='utf-8')
+    assert 'local TRIGGER_ONCE = { [A.ACTION_DROP] = true }' in lua
+    assert 'state.trigger_used = {}' in lua and 'if TRIGGER_ONCE[action] then' in lua
+    c = (BRIDGE / 'engine' / 'abp_turbo.c').read_text(encoding='utf-8')
+    assert '#define INPUT_ONCE_MASK (1u << 11)' in c and 'if (input_triggered) input_once_used = 0;' in c
