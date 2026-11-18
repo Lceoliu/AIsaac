@@ -102,3 +102,31 @@ def test_close_stress_verdict_needs_coverage():
     assert not cs.verdict(good[:-1] + [row(29, 'early', codes=(0, 86, 0, 0))])['ok']
     no_kill = [dict(r, killed=0) if r['kind'] == 'query-kill' else r for r in good]
     assert not cs.verdict(no_kill)['covered']
+
+
+def test_golden_v3_diff_checks_hashes_and_empty_manifests(tmp_path):
+    """tools/golden_v3_diff.py (2026-11-18, Codex round 3 notes): the batch-5 migration still passes (old = 9e941f3~1);
+    a manifest sha256 not matching its file fails; two empty manifests are no pass."""
+    import shutil
+    tool = PY / 'tools' / 'golden_v3_diff.py'
+    args = ['--old-version', '2026111801', '--old-word', '3', '--new-version', '2026111802', '--new-word', '111802']
+    run = lambda *a: subprocess.run([sys.executable, str(tool), *a, *args], cwd=PY, capture_output=True, text=True)
+    r = run('--old-rev', '9e941f3~1')
+    if r.returncode != 0 and 'fatal' in r.stderr:   # (no git history here: a shallow tree)
+        import pytest
+        pytest.skip('git history unavailable')
+    assert r.returncode == 0, r.stdout[-500:]
+    fix = PY / 'tests' / 'fixtures' / 'visible_v3'
+    d = tmp_path / 'new'
+    shutil.copytree(fix, d)
+    m = json.loads((d / 'manifest.json').read_text())
+    m['frames'][0]['sha256'] = '0' * 64
+    (d / 'manifest.json').write_text(json.dumps(m))
+    r = run('--old-rev', '9e941f3~1', '--new', str(d))
+    assert r.returncode == 1 and 'does not match its sha256' in r.stdout
+    e1, e2 = tmp_path / 'e1', tmp_path / 'e2'
+    for e in (e1, e2):
+        e.mkdir()
+        (e / 'manifest.json').write_text(json.dumps(dict(frames=[], errors=[])))
+    r = run('--old', str(e1), '--new', str(e2))
+    assert r.returncode == 1 and 'lists no frame' in r.stdout

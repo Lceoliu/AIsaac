@@ -76,6 +76,16 @@ def main():
         else:
             counts['bin'] += 1
     names_o, names_n = [f['name'] for f in mo['frames']], [f['name'] for f in mn['frames']]
+    if not names_o or not names_n:   # (2026-11-18, Codex round 3: two empty manifests are no pass)
+        bad.append('a manifest lists no frame')
+    import hashlib
+    for label, m, read in (('old', mo, old), ('new', mn, new)):   # (each manifest's sha256 against its own file)
+        for f in m['frames']:
+            try:
+                if hashlib.sha256(read(f"{f['name']}.v3.bin")).hexdigest() != f.get('sha256'):
+                    bad.append(f"{label} manifest: {f['name']}.v3.bin does not match its sha256")
+            except Exception as exc:
+                bad.append(f"{label}: {f['name']}.v3.bin unreadable ({type(exc).__name__})")
     if names_o != names_n:
         bad.append(f'manifest frames {names_o} -> {names_n}')
     for m in (mo, mn):
