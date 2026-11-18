@@ -6566,6 +6566,9 @@ def main(argv=None, child=None, actor=None):
             if actor_b.is_alive():
                 print('the actor process 1 did not end; terminated', flush=True)
                 actor_b.terminate()
+                actor_b.join(timeout=10)
+            if actor_b.exitcode not in (0, None) and not failure:   # (2026-11-18: its end checked, not only its join)
+                failure.append(RuntimeError(f'the actor process 1 ended with exit code {actor_b.exitcode}'))
         if actor is None:
             print('finished', L['update'], 'updates', round(L['decisions'] * hours_per_decision, 1), 'game hours',
                   round((time.perf_counter() - t_run) / 3600, 2), 'h')

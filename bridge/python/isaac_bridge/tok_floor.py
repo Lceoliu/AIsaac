@@ -1523,6 +1523,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 int(chars[0][int(char_rng.choice(len(chars[0]), p=chars[1]))])
 
     def stopping():
+        # (2026-11-18, Codex round 4: a search / cf thread's VisibleV3Fatal is raised here, in the main thread, also when
+        # the stop came first or the main thread waits on its builder -- not only at the next loop top)
+        if thread_fatal:
+            raise thread_fatal[0]
         return bool(control[0]) or (parent is not None and not parent.is_alive())
 
     def recover(why):

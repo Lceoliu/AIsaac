@@ -133,6 +133,9 @@ def test_the_bridge_mode_is_checked(mode):
         VP.check_bridge_mode(unknown, 1)
     with pytest.raises(VP.VisibleV3Fatal, match='did not answer'):
         VP.check_bridge_mode(dict(type='error', cmd='visible_v3', msg='visible_v3: mode must be 0-3, got 4'), 0)
+    for bad in ('x', None, [1]):   # (a malformed answer: a protocol error, not a ValueError)
+        with pytest.raises(VP.VisibleV3Fatal, match='answered the mode query'):
+            VP.check_bridge_mode(dict(type='ok', cmd='visible_v3', mode=bad, native_available=True), 1)
     mode(3)   # (the default: the worker's configured mode)
     assert VP.check_bridge_mode(ok(3)) == 3
 
