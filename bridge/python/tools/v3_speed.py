@@ -101,20 +101,30 @@ def learner(torch, TP, VI, m, rows, pend, micro, dev):
         def fwd(bf16=False):
             with torch.autocast('cuda', torch.bfloat16, enabled=bf16):
                 x, _pad, g = m.frame_v3(v, b['pending'], m.gtok.tok)
-            return x.float(), g
+            return x, g
 
-        def step(bf16=False):
+        def step(bf16=False):   # (bf16: the whole forward under autocast, as train_tok --amp bf16)
             m.zero_grad(set_to_none=True)
-            x, g = fwd(bf16)
-            out = m._heads(x[:, 0], False, None, x[:, g], True, None)
-            loss = sum(o.float().sum() for o in out if torch.is_tensor(o) and o.is_floating_point())
+            with torch.autocast('cuda', torch.bfloat16, enabled=bf16):
+                x, g = fwd(bf16)
+                out = m._heads(x[:, 0], False, None, x[:, g], True, None)
+                loss = sum(o.float().sum() for o in out if torch.is_tensor(o) and o.is_floating_point())
             loss.backward()
         acc['frame_fwd'] += timed(torch, lambda: fwd(False), 5, 1)
         x0, g0 = fwd(False)
         acc['rest_fwd'] += timed(torch, lambda: m._heads(x0[:, 0], False, None, x0[:, g0], True, None), 5, 1)
-        acc['step'] += timed(torch, lambda: step(False), 5, 1)
-        acc['frame_fwd_bf16'] += timed(torch, lambda: fwd(True), 5, 1)
-        acc['step_bf16'] += timed(torch, lambda: step(True), 5, 1)
+        def safe(fn):   # (an out-of-memory measurement is nan, the others go on)
+            try:
+                return timed(torch, fn, 5, 1)
+            except torch.OutOfMemoryError:
+                m.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                return float('nan')
+        acc['step'] += safe(lambda: step(False))
+        acc['frame_fwd_bf16'] += safe(lambda: fwd(True))
+        torch.cuda.reset_peak_memory_stats()
+        acc['step_bf16'] += safe(lambda: step(True))
+        acc['peak_gb_bf16'] = max(acc.get('peak_gb_bf16', 0.0), torch.cuda.max_memory_allocated() / 2 ** 30)
     k = len(parts)
     res['parts'] = k
     res['take_ms'] = acc['take']
@@ -124,10 +134,14 @@ def learner(torch, TP, VI, m, rows, pend, micro, dev):
     res['step_ms (fwd + bwd, all parts)'] = acc['step']
     res['backward_ms (step - frame fwd - rest fwd)'] = acc['step'] - acc['frame_fwd'] - acc['rest_fwd']
     res['frame_encoder_fwd_ms bf16'] = acc['frame_fwd_bf16']
-    res['step_ms bf16 frame encoder'] = acc['step_bf16']
+    res['step_ms bf16 (whole forward under autocast, as --amp bf16)'] = acc['step_bf16']
+    res['peak_gb bf16 step (one part)'] = acc['peak_gb_bf16']
     res['tokens per record: real mean'] = float(np.mean(real_tok))
     res['tokens per record: padded'] = float(np.mean(pad_tok))
     return res
+
+
+BF16_ACTOR = [True]   # (train_tok --actor-bf16 1: the actor graphs under bfloat16 autocast)
 
 
 def actor(torch, TP, VI, m, rows, pend, bs, dev, t1=None):
@@ -145,7 +159,7 @@ def actor(torch, TP, VI, m, rows, pend, bs, dev, t1=None):
         c = torch.from_numpy(counts).to(dev)
         b = TP.to_batch(r, pend[:B], dev)
         st = {}
-        with torch.inference_mode():
+        with torch.inference_mode(), torch.autocast('cuda', torch.bfloat16, enabled=bool(BF16_ACTOR[0])):
             dec = lambda: st.__setitem__('v', VI.decode_frames_device(F, c, eb, VI.N_MAX_V3, VI.S_MAX_V3, check=False))  # noqa: E731
             dec()
             v = st['v']
@@ -176,7 +190,8 @@ def main(argv=None):
     ap.add_argument('rollouts')
     ap.add_argument('--t1', default=None)
     ap.add_argument('--minibatch', type=int, default=4096)
-    ap.add_argument('--micro', type=int, default=1024)
+    ap.add_argument('--micro', default='1024,2048')
+    ap.add_argument('--actor-fp32', action='store_true', help='the actor graphs in float32 (default: bf16, as --actor-bf16 1)')
     ap.add_argument('--actor-b', default='8,32,128')
     ap.add_argument('--out', default=None)
     a = ap.parse_args(argv)
@@ -191,7 +206,9 @@ def main(argv=None):
     m.load_state_dict(ck['model'])
     rows, pend = load(paths, max(a.minibatch, 128))
     out = dict(records=len(rows), gpu=torch.cuda.get_device_name(0))
-    out['learner'] = learner(torch, TP, VI, m, rows[:a.minibatch], pend[:a.minibatch], a.micro, dev)
+    out['learner'] = {f'micro {mi}': learner(torch, TP, VI, m, rows[:a.minibatch], pend[:a.minibatch], mi, dev)
+                      for mi in [int(x) for x in str(a.micro).split(',')]}
+    BF16_ACTOR[0] = not a.actor_fp32
     t1 = None
     if a.t1:
         c1 = torch.load(a.t1, map_location='cpu', weights_only=False)
