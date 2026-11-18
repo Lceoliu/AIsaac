@@ -23,6 +23,16 @@ class BridgeError(RuntimeError):
     pass
 
 
+class BridgeErrorReply(BridgeError):
+    """(2026-11-18) The bridge answered with an error message ({"type": "error"}): reply is that message. A
+    BridgeError like any other for every caller; told apart from transport errors (EOF, not connected) only where the
+    answer itself matters (abplus.check_visible_v3)."""
+
+    def __init__(self, reply):
+        super().__init__(reply.get("msg", "error"))
+        self.reply = reply
+
+
 @dataclass
 class Action:
     move: int = 0      # 0 stop, 1 up, 2 up-right, 3 right, 4 down-right, 5 down, 6 down-left, 7 left, 8 up-left
@@ -104,7 +114,7 @@ class IsaacBridgeEnv:
         line, _, self._buf = self._buf.partition(b"\n")
         msg = json.loads(line.decode("utf-8"))
         if msg.get("type") == "error":
-            raise BridgeError(msg.get("msg", "error"))
+            raise BridgeErrorReply(msg)
         return msg
 
     def _expect_obs(self) -> Dict[str, Any]:

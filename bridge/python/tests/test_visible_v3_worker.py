@@ -143,7 +143,7 @@ def test_the_connect_check_with_the_clients_recv():
     mismatch is a VisibleV3Fatal naming both modes (2026-11-18, round 3: not a BridgeError, which the samplers retry)
     and the connection is closed."""
     from isaac_bridge.abplus import check_visible_v3
-    from isaac_bridge.env import BridgeError
+    from isaac_bridge.env import BridgeError, BridgeErrorReply
 
     class Sock:
         closed = False
@@ -160,7 +160,7 @@ def test_the_connect_check_with_the_clients_recv():
 
         def _recv(self):
             if self.reply.get('type') == 'error':
-                raise BridgeError(self.reply.get('msg', 'error'))
+                raise BridgeErrorReply(self.reply)
             return self.reply
     c = Client(dict(type='ok', cmd='visible_v3', mode=2, native_available=True))
     assert check_visible_v3(c, 2) == 2 and c.sent == [{'cmd': 'visible_v3'}]
@@ -175,6 +175,51 @@ def test_the_connect_check_with_the_clients_recv():
         check_visible_v3(old, 1)
     src = Path(al.__file__).with_name('abplus.py').read_text(encoding='utf-8')
     assert 'check_visible_v3(self)' in src[src.index('    def connect(self):'):]
+
+
+def _socket_client(answer):
+    """An IsaacBridgeEnv on one end of a socket pair (its real _send / _recv); answer: bytes written by the other end
+    first, then None closes it (EOF)."""
+    import socket
+    from isaac_bridge.env import IsaacBridgeEnv
+    ours, theirs = socket.socketpair()
+    c = object.__new__(IsaacBridgeEnv)
+    c._sock, c._buf = ours, b''
+    if answer is not None:
+        theirs.sendall(answer)
+    else:   # (EOF on our read; our query still goes out)
+        theirs.shutdown(socket.SHUT_WR)
+    return c, theirs
+
+
+def test_the_connect_check_retries_transport_errors_as_before():
+    """(2026-11-18, round 4) Only a real error answer of the bridge ({"type": "error"}: BridgeErrorReply) is read as
+    the answer -- 'unknown cmd' is mode 0, another error a protocol error (VisibleV3Fatal); the game closing the
+    connection during the query (EOF) or no connection stays a plain BridgeError, retried by the samplers as before
+    05f1622 (before: any BridgeError became the answer, and an EOF a fatal error, in mode 0 too)."""
+    from isaac_bridge.abplus import check_visible_v3
+    from isaac_bridge.env import BridgeError, BridgeErrorReply
+    c, other = _socket_client(b'{"type":"error","msg":"unknown cmd"}\n')
+    assert check_visible_v3(c, 0) == 0
+    c, other = _socket_client(b'{"type":"error","msg":"unknown cmd"}\n')
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 1'):
+        check_visible_v3(c, 1)
+    c, other = _socket_client(b'{"type":"error","msg":"something else"}\n')
+    with pytest.raises(VP.VisibleV3Fatal, match='did not answer'):
+        check_visible_v3(c, 0)
+    for mode in (0, 2):
+        c, other = _socket_client(None)   # the game gone during the query
+        with pytest.raises(BridgeError, match='connection closed by game') as got:
+            check_visible_v3(c, mode)
+        assert not isinstance(got.value, (VP.VisibleV3Fatal, BridgeErrorReply))
+    c, other = _socket_client(b'')
+    c._sock = None   # not connected
+    with pytest.raises(BridgeError, match='not connected'):
+        check_visible_v3(c, 0)
+    c, other = _socket_client(b'{"type":"error","msg":"x"}\n')   # the reply kept on the exception
+    with pytest.raises(BridgeErrorReply) as got:
+        c._recv()
+    assert got.value.reply == {'type': 'error', 'msg': 'x'} and isinstance(got.value, BridgeError)
 
 
 def test_needs_decode_by_the_payload():

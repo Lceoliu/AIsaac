@@ -26,7 +26,7 @@ import numpy as np
 
 from . import abplus_geometry as geometry
 from .abplus_obs import ObsDecoder, compare
-from .env import Action, BridgeError
+from .env import Action, BridgeError, BridgeErrorReply
 from .training import IsaacTrainingEnv
 from .transformer_obs import TransformerMonstroEnv, VisibleHistory
 
@@ -524,8 +524,8 @@ def check_visible_v3(client, mode=None):
     client._send({"cmd": "visible_v3"})
     try:
         reply = client._recv()
-    except BridgeError as exc:   # (_recv raises on an error reply)
-        reply = {"type": "error", "msg": str(exc)}
+    except BridgeErrorReply as exc:   # (_recv raises on an error reply: that reply is the answer. A transport error --
+        reply = exc.reply             # EOF, not connected -- is not caught: it is retried as before, 2026-11-18)
     try:
         return check_bridge_mode(reply, mode)
     except VisibleV3Fatal:
@@ -751,7 +751,7 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             return {"type": "obs", "event": event.decode(), "seq": int(seq), "obs": obs}
         msg = json.loads(line.decode("utf-8"))
         if msg.get("type") == "error":
-            raise BridgeError(msg.get("msg", "error"))
+            raise BridgeErrorReply(msg)
         if self.validate_obs and msg.get("type") == "obs":
             binary = self._recv()
             if binary.get("seq") != msg.get("seq"):
