@@ -399,17 +399,12 @@ def encode_row(o, st, row, t):
     group and first. Returns the done code."""
     vis = getattr(o, 'visible', None)
     v3 = False
-    native_v3 = getattr(o, 'visible_v3_frame', None)
-    if native_v3 is not None:   # visible-v3, the native frame (ISAAC_RL_VISIBLE_V3=2 / 3): written as it came
-        from .visible_producer import write_frame_v3
-        write_frame_v3(row, native_v3)
-        v3 = True
-    elif vis is not None and isinstance(vis, dict) and vis.get('schema') == 'isaac-visible-raw-v3':
-        # visible-v3 (package C, ISAAC_RL_VISIBLE_V3=1): the reference encoder; the stall columns after the progress
-        # update below (v3_backfill_stall)
-        from .visible_producer import observation_frame_v3, write_frame_v3
-        write_frame_v3(row, observation_frame_v3(vis))
-        v3 = True
+    if getattr(o, 'visible_v3_frame', None) is not None or (isinstance(vis, dict) and
+                                                           vis.get('schema') == 'isaac-visible-raw-v3'):
+        # visible-v3 (package C): the native frame as it came, else (mode 1, or the native side handed back) the
+        # reference encoder's frame of the raw block; the stall columns after the progress update below
+        from .visible_producer import write_v3
+        v3 = write_v3(row, o)
     elif vis is not None:
         from .structured_input import write_frame
         from .visible_native import frame   # B45: the C encoder (observation_frame's bytes) when available

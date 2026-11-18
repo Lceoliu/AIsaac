@@ -414,6 +414,21 @@ def write_frame_v3(row, payload):
     row['visible_schema'] = V3.VERSION
 
 
+def write_v3(row, o):
+    """encode_row's v3 frame: the native frame (o.visible_v3_frame, flag 64) as it came, else the reference encoder's
+    frame of the raw block (o.visible, flag 32: mode 1, or a step the native side handed back -- a cancelled lethal
+    hit). Either is the same frame format (schema_v3), read by the same decoder; the stall columns are written after.
+    True when a v3 frame was written."""
+    native = getattr(o, 'visible_v3_frame', None)
+    if native is not None:
+        write_frame_v3(row, native)
+        return True
+    if is_raw_v3(getattr(o, 'visible', None)):
+        write_frame_v3(row, observation_frame_v3(o.visible))
+        return True
+    return False
+
+
 _F4 = np.dtype('<f4')
 _STALL_AT = (V3.col(V3.P_COLS, 'stall_share'), V3.col(V3.P_COLS, 'stall_known'))
 
