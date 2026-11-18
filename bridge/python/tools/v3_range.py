@@ -179,13 +179,13 @@ def probe(pt, paths, n=2048, seed=0, fresh=True):
         at = 0
         for k, w in kinds:
             sl, real = x[:, at:at + w], ~pad[:, at:at + w]
-            v = sl[real]
-            out[f'tokens {k}'] = dict(n=int(real.sum()), std=float(v.std()) if v.numel() > 1 else float('nan'),
-                                      absmax=float(v.abs().max()) if v.numel() else float('nan'))
+            t_ = sl[real]
+            out[f'tokens {k}'] = dict(n=int(real.sum()), std=float(t_.std()) if t_.numel() > 1 else float('nan'),
+                                      absmax=float(t_.abs().max()) if t_.numel() else float('nan'))
             at += w
         y, _pad, g = m.frame_v3(v, b['pending'], m.gtok.tok)
-        for k, v in (('out P0', y[:, 0]), ('out G', y[:, g])):
-            out[k] = dict(n=int(v.shape[0]), std=float(v.std()), absmax=float(v.abs().max()))
+        for k, t_ in (('out P0', y[:, 0]), ('out G', y[:, g])):
+            out[k] = dict(n=int(t_.shape[0]), std=float(t_.std()), absmax=float(t_.abs().max()))
         logits, value, _danger, vg = m(b, need_vg=True)
         at = 0
         for h, w in enumerate(m.heads):
