@@ -357,6 +357,10 @@ PRICE_COIN_SCALE = 15.0
 # Engine argument ranges per game version (the convention above). (value, source); abp_bridge.lua V3_ABP = the values.
 # 'disasm' = the getter in isaac.x64 (sha256 b9bfef32...) read with objdump on 184; 'enums' = resources/scripts/enums.lua
 # of the AB+ install there (line); 'measured' = abplus_probe_v3_ranges.py (184 ranges1).
+# (2026-11-18, the hardening batch, C14) Level::GetRoomByIdx (a door's target index; no range here: the function checks
+# it itself) -- disasm 0x7337c0 (0x733cd0 jumps there): idx + 9 > 177 (unsigned, so idx outside -9..168) gives a static
+# dummy descriptor; idx < 0 gives rooms[127 - idx]; idx >= 0 the grid table's entry, a negative entry the dummy. Never
+# an out-of-range read; 184 calls -20..180 all answered, the door targets seen 29..141 (abplus_probe_room_idx.py).
 ABP_RANGES = {
     'weapon_type_max': (10, 'enums 931-942 WeaponType 0..10, NUM_WEAPON_TYPES 11; disasm HasWeaponType 0x7819a0: '
                             'byte at +0x2628 + id, no bounds check'),
