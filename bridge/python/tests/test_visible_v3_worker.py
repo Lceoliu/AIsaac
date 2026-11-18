@@ -302,33 +302,48 @@ SH = shutil.which('sh')
 
 
 @pytest.mark.skipif(SH is None, reason='no sh')
-@pytest.mark.parametrize('build_ok', [True, False])
-def test_deploy_abphome_fails_on_a_failed_build(tmp_path, build_ok):
-    """deploy.sh abphome with a stub run.sh (the container build): a build that writes no library exits non-zero and
-    moves the old library to trash (none left to pass for the new one); a good build replaces it."""
+@pytest.mark.parametrize('case', ['ok', 'gcc fails', 'fails after a new file', 'gpu refused', 'install fails',
+                                  'copy fails'])
+def test_deploy_abphome(tmp_path, case):
+    """deploy.sh abphome with a stub run.sh that passes its command's exit code on, as the real one (docker: exec; direct:
+    exit $rc) (2026-11-18, Codex round 3): only a build with rc 0 that left a fresh non-empty library replaces the
+    installed one, by a rename; a failed build (with or without a file left behind), a GPU check that refuses (gcc
+    never ran), a failed install or a failed copy exit non-zero and leave the installed library as it was."""
     bm = tmp_path / 'bm1'
     eng = bm / 'trees' / 't' / 'bridge' / 'engine'
     eng.mkdir(parents=True)
     for f in ('run_instance.sh', 'null_render_e.txt', 'stub_render_g.txt', 'stub_render_h.txt', 'abp_turbo.c',
               'abp_v3_native.c', 'abp_schema_v3.h', 'abp_step_line.h'):
-        (eng / f).write_text('x')
+        if not (case == 'copy fails' and f == 'abp_step_line.h'):
+            (eng / f).write_text('x')
     shutil.copy(BM1 / 'deploy.sh', bm / 'deploy.sh')
     tools = bm / 'home' / 'isaac-abplus' / 'tools'
     tools.mkdir(parents=True)
     (tools.parent / 'runtime').mkdir()   # (present: no link made)
-    (tools / 'libabp_turbo.so').write_text('OLD')
+    lib = tools / 'libabp_turbo.so'
+    if case == 'install fails':   # (the install target cannot be replaced: a non-empty directory in its place)
+        lib.mkdir()
+        (lib / 'keep').write_text('OLD')
+    else:
+        lib.write_text('OLD')
     (bm / 'common.sh').write_text(
         'BM1_MODE=direct\nBM1_GAME_RUNTIME=/nonexistent\nBM1_IN=%s\n'
         'trash() { [ -e "$1" ] || return 0; d=$BM/trash/x; mkdir -p "$d" && mv "$1" "$d/"; }\n' % bm.as_posix())
-    # (the failure as on the host: the container's gcc fails, run.sh still returns 0)
-    build = 'echo NEW > %s/libabp_turbo.so.new' % tools.as_posix() if build_ok else 'echo "gcc: error" >&2; exit 0'
+    new = tools.as_posix() + '/libabp_turbo.so.new'
+    build = {'ok': f'echo NEW > {new}; exit 0', 'install fails': f'echo NEW > {new}; exit 0',
+             'gcc fails': 'echo "gcc: error" >&2; exit 1', 'fails after a new file': f'echo PART > {new}; exit 1',
+             'gpu refused': 'echo "GPU 1 BUSY: not started" >&2; exit 4', 'copy fails': f'echo NEW > {new}; exit 0'}[case]
     (bm / 'run.sh').write_text('#!/bin/sh\n%s\n' % build)
     os.chmod(bm / 'run.sh', 0o755)
     r = _run([SH, (bm / 'deploy.sh').as_posix(), 'abphome', 't'], env=dict(os.environ, BM=bm.as_posix()))
-    lib = tools / 'libabp_turbo.so'
-    if build_ok:
+    if case == 'ok':
         assert r.returncode == 0, r.stderr
         assert lib.read_text().strip() == 'NEW' and not (tools / 'libabp_turbo.so.new').exists()
+        return
+    assert r.returncode != 0 and 'left as it was' in r.stderr, (r.returncode, r.stderr)
+    if case == 'install fails':
+        assert (lib / 'keep').read_text() == 'OLD'
     else:
-        assert r.returncode != 0 and 'not built' in r.stderr
-        assert not lib.exists() and (bm / 'trash' / 'x' / 'libabp_turbo.so').read_text() == 'OLD'
+        assert lib.read_text() == 'OLD'
+    if case in ('gcc fails', 'fails after a new file', 'gpu refused'):
+        assert not (tools / 'libabp_turbo.so.new').exists()
