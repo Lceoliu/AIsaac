@@ -164,6 +164,8 @@ PF, EF, NF, SF = 192, 64, 8, 24
 BODY = PF + LOCAL     # floats per body (P token + its local patch)
 RAGGED = {'body': PF, 'local': LOCAL, 'entity': EF, 'inventory': NF, 'slots': SF}
 CAP_ENTITY = 128      # entities per frame at most (priority classes; the overflow counts P 176..180)
+CAP_BODY = 8          # bodies per frame at most (2026-11-18: written down from abp_v3_native.c's V3_BODY_CAP; the
+#                       reference encoder and the readers' header check hold to it; no wire change)
 ENTITY_CLASSES = ('interactable', 'monster', 'familiar', 'projectile', 'other')
 
 

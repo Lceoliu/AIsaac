@@ -181,7 +181,7 @@ static const char *v3_canvas(const v3_room *r, float *canvas) {
 }
 
 // Stage 2: the bodies (visible_v3_raw's v3_bodies / v3_body; observation_frame_v3's P rows and local patches).
-#define V3_BODY_CAP 8
+#define V3_BODY_CAP ABP_V3_CAP_BODY   // (schema_v3.CAP_BODY, 2026-11-18)
 typedef struct { const void *p; int index, role, linked, in_room; } v3_body_t;
 
 static inline uint32_t v3_seed(const void *e) { return ((uint32_t (*)(const void *))V3FN(V3_INIT_SEED))(e); }

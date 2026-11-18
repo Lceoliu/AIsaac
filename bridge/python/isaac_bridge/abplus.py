@@ -26,7 +26,7 @@ import numpy as np
 
 from . import abplus_geometry as geometry
 from .abplus_obs import ObsDecoder, compare
-from .env import Action, BridgeError
+from .env import Action, BridgeError, BridgeErrorReply
 from .training import IsaacTrainingEnv
 from .transformer_obs import TransformerMonstroEnv, VisibleHistory
 
@@ -516,19 +516,26 @@ MAX_ROOM_RETRIES = 8  # mixture rooms tried per seed before giving up
 
 
 def check_visible_v3(client, mode=None):
-    """visible-v3 (2026-11-18, Codex round 2): the bridge's mode (the visible_v3 query) against this client's
+    """visible-v3 (2026-11-18, Codex rounds 2 / 3): the bridge's mode (the visible_v3 query) against this client's
     ISAAC_RL_VISIBLE_V3 (and the native encoder there for modes 2 / 3); a bridge without the command answers
-    'unknown cmd' (mode 0). A mismatch is refused like a bridge of another version (BridgeError). Returns the mode."""
-    from .visible_producer import check_bridge_mode
+    'unknown cmd' (mode 0). A mismatch closes the connection and raises VisibleV3Fatal (a configuration error, not a
+    game fault: the samplers' retries do not take it). Returns the mode."""
+    from .visible_producer import VisibleV3Fatal, check_bridge_mode
     client._send({"cmd": "visible_v3"})
     try:
         reply = client._recv()
-    except BridgeError as exc:   # (_recv raises on an error reply)
-        reply = {"type": "error", "msg": str(exc)}
+    except BridgeErrorReply as exc:   # (_recv raises on an error reply: that reply is the answer. A transport error --
+        reply = exc.reply             # EOF, not connected -- is not caught: it is retried as before, 2026-11-18)
     try:
         return check_bridge_mode(reply, mode)
-    except ValueError as exc:
-        raise BridgeError(str(exc)) from None
+    except VisibleV3Fatal:
+        sock, client._sock = getattr(client, '_sock', None), None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        raise
 
 
 class RoomUnusable(BridgeError):
@@ -744,7 +751,7 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             return {"type": "obs", "event": event.decode(), "seq": int(seq), "obs": obs}
         msg = json.loads(line.decode("utf-8"))
         if msg.get("type") == "error":
-            raise BridgeError(msg.get("msg", "error"))
+            raise BridgeErrorReply(msg)
         if self.validate_obs and msg.get("type") == "obs":
             binary = self._recv()
             if binary.get("seq") != msg.get("seq"):

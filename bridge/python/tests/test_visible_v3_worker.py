@@ -67,7 +67,7 @@ def test_a_v3_worker_refuses_a_record_without_a_v3_frame(mode, m):
     mode(m)
     v2 = {'schema': 'isaac-visible-prlmens-g-v2', 'bodies': [], 'inventory': [], 'capabilities': 1}
     for payload, why in ((lean(v2=v2), "schema 'isaac-visible-prlmens-g-v2'"), (lean(), 'no visible block')):
-        with pytest.raises(ValueError, match=why):
+        with pytest.raises(VP.VisibleV3Fatal, match=why):
             write_visible(al.LeanDecoder().decode(payload), np.zeros(1, ROW))
     for payload in (lean(raw=RAW), lean(frame=VP.observation_frame_v3(RAW))):   # a v3 record: written
         row = np.zeros(1, ROW)
@@ -77,30 +77,61 @@ def test_a_v3_worker_refuses_a_record_without_a_v3_frame(mode, m):
     assert 'v3 = write_visible(o, row)' in src[src.index('def encode_row('):]
 
 
+def _lean_v2():
+    """A lean payload with a 15 x 9 terrain block (flag 2) and a real v2 visible block (flag 32), one player."""
+    from isaac_bridge import schema_v2
+    b = bytearray(al._HEADER.pack(al.MAGIC, 1234, 1200, 2 | 32, 1, 0, 0))
+    b += al._ROOM.pack(1, 0, 0, 0, 60, 2, 0, 0, 40.0, 120.0, 600.0, 400.0)
+    b += al._TOTALS.pack(0.0, 0.0, 0.0, 0.0)
+    pl = np.zeros(1, al.PLAYER)
+    pl['hearts'], pl['x'], pl['y'] = 6, 300, 250
+    b += pl.tobytes() + struct.pack('<H', 0)
+    cells = [[i, 60 + 40 * (i % 15), 140 + 40 * (i // 15), 0, 1, 1, 0, 0, 0, 0] for i in range(135)]
+    t, g = json.dumps(dict(width=15, height=9, cells=cells)).encode(), b'[]'
+    b += struct.pack('<II', 1, len(t)) + t + struct.pack('<I', len(g)) + g
+    vis = json.dumps(dict(schema=schema_v2.SCHEMA, curses=0, capabilities=1, stage=1, inventory=[], slots=[],
+                          bodies=[dict(controller=0, controller_known=1, animation=0, animation_known=1)])).encode()
+    return bytes(b) + struct.pack('<I', len(vis)) + vis
+
+
 def test_a_v2_worker_still_takes_v2_records(mode):
+    """(2026-11-18, round 3: a real v2 block, not only a record without one) A v2 worker writes the v2 frame of a v2
+    record (visible_schema = schema_v2.VERSION, the frame's bytes) and visible_schema 0 for a record without a block;
+    a v3 worker refuses the same v2 record."""
+    from isaac_bridge import schema_v2
+    from isaac_bridge.visible_native import frame
     mode(0)
+    o = al.LeanDecoder().decode(_lean_v2())
+    row = np.zeros(1, ROW)
+    assert not write_visible(o, row)
+    want = frame(o)
+    assert int(row['visible_schema'][0]) == schema_v2.VERSION and int(row['visible_bytes'][0]) == len(want) > 0
+    assert bytes(row['visible_frame'][0, :len(want)]) == want
     row = np.zeros(1, ROW)
     assert not write_visible(al.LeanDecoder().decode(lean()), row)
     assert int(row['visible_schema'][0]) == 0
+    mode(2)
+    with pytest.raises(VP.VisibleV3Fatal, match='prlmens-g-v2'):
+        write_visible(al.LeanDecoder().decode(_lean_v2()), np.zeros(1, ROW))
 
 
 def test_the_bridge_mode_is_checked(mode):
     ok = lambda m, native=True: dict(type='ok', cmd='visible_v3', mode=m, enabled=m != 0, native_available=native)
     for m in range(4):
         assert VP.check_bridge_mode(ok(m), m) == m
-    with pytest.raises(ValueError, match='bridge runs mode 0, this worker is configured for mode 2'):
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 2'):
         VP.check_bridge_mode(ok(0), 2)
-    with pytest.raises(ValueError, match='bridge runs mode 2, this worker is configured for mode 0'):
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 2, this worker is configured for mode 0'):
         VP.check_bridge_mode(ok(2), 0)
     for m in (2, 3):
-        with pytest.raises(ValueError, match='native encoder'):
+        with pytest.raises(VP.VisibleV3Fatal, match='native encoder'):
             VP.check_bridge_mode(ok(m, native=False), m)
     assert VP.check_bridge_mode(ok(1, native=False), 1) == 1   # (mode 1 needs no native encoder)
     unknown = dict(type='error', msg='unknown cmd')   # a bridge without the command: mode 0
     assert VP.check_bridge_mode(unknown, 0) == 0
-    with pytest.raises(ValueError):
+    with pytest.raises(VP.VisibleV3Fatal):
         VP.check_bridge_mode(unknown, 1)
-    with pytest.raises(ValueError, match='did not answer'):
+    with pytest.raises(VP.VisibleV3Fatal, match='did not answer'):
         VP.check_bridge_mode(dict(type='error', cmd='visible_v3', msg='visible_v3: mode must be 0-3, got 4'), 0)
     mode(3)   # (the default: the worker's configured mode)
     assert VP.check_bridge_mode(ok(3)) == 3
@@ -109,31 +140,86 @@ def test_the_bridge_mode_is_checked(mode):
 def test_the_connect_check_with_the_clients_recv():
     """abplus.check_visible_v3 (AbplusTrainingEnv.connect's check) with a client whose _recv raises on an error reply,
     as the real one does: an old bridge's 'unknown cmd' is mode 0 (passes for a mode 0 client, refused otherwise); a
-    mismatch is a BridgeError naming both modes."""
+    mismatch is a VisibleV3Fatal naming both modes (2026-11-18, round 3: not a BridgeError, which the samplers retry)
+    and the connection is closed."""
     from isaac_bridge.abplus import check_visible_v3
-    from isaac_bridge.env import BridgeError
+    from isaac_bridge.env import BridgeError, BridgeErrorReply
+
+    class Sock:
+        closed = False
+
+        def close(self):
+            self.closed = True
 
     class Client:
         def __init__(self, reply):
-            self.reply, self.sent = reply, []
+            self.reply, self.sent, self._sock = reply, [], Sock()
 
         def _send(self, msg):
             self.sent.append(msg)
 
         def _recv(self):
             if self.reply.get('type') == 'error':
-                raise BridgeError(self.reply.get('msg', 'error'))
+                raise BridgeErrorReply(self.reply)
             return self.reply
     c = Client(dict(type='ok', cmd='visible_v3', mode=2, native_available=True))
     assert check_visible_v3(c, 2) == 2 and c.sent == [{'cmd': 'visible_v3'}]
-    with pytest.raises(BridgeError, match='bridge runs mode 2, this worker is configured for mode 0'):
+    sock = c._sock
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 2, this worker is configured for mode 0'):
         check_visible_v3(c, 0)
+    assert sock.closed and c._sock is None and not issubclass(VP.VisibleV3Fatal, (BridgeError, OSError, RuntimeError,
+                                                                                  ValueError))
     old = Client(dict(type='error', msg='unknown cmd'))
-    assert check_visible_v3(old, 0) == 0
-    with pytest.raises(BridgeError, match='bridge runs mode 0, this worker is configured for mode 1'):
+    assert check_visible_v3(old, 0) == 0 and not old._sock.closed
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 1'):
         check_visible_v3(old, 1)
     src = Path(al.__file__).with_name('abplus.py').read_text(encoding='utf-8')
     assert 'check_visible_v3(self)' in src[src.index('    def connect(self):'):]
+
+
+def _socket_client(answer):
+    """An IsaacBridgeEnv on one end of a socket pair (its real _send / _recv); answer: bytes written by the other end
+    first, then None closes it (EOF)."""
+    import socket
+    from isaac_bridge.env import IsaacBridgeEnv
+    ours, theirs = socket.socketpair()
+    c = object.__new__(IsaacBridgeEnv)
+    c._sock, c._buf = ours, b''
+    if answer is not None:
+        theirs.sendall(answer)
+    else:   # (EOF on our read; our query still goes out)
+        theirs.shutdown(socket.SHUT_WR)
+    return c, theirs
+
+
+def test_the_connect_check_retries_transport_errors_as_before():
+    """(2026-11-18, round 4) Only a real error answer of the bridge ({"type": "error"}: BridgeErrorReply) is read as
+    the answer -- 'unknown cmd' is mode 0, another error a protocol error (VisibleV3Fatal); the game closing the
+    connection during the query (EOF) or no connection stays a plain BridgeError, retried by the samplers as before
+    05f1622 (before: any BridgeError became the answer, and an EOF a fatal error, in mode 0 too)."""
+    from isaac_bridge.abplus import check_visible_v3
+    from isaac_bridge.env import BridgeError, BridgeErrorReply
+    c, other = _socket_client(b'{"type":"error","msg":"unknown cmd"}\n')
+    assert check_visible_v3(c, 0) == 0
+    c, other = _socket_client(b'{"type":"error","msg":"unknown cmd"}\n')
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 1'):
+        check_visible_v3(c, 1)
+    c, other = _socket_client(b'{"type":"error","msg":"something else"}\n')
+    with pytest.raises(VP.VisibleV3Fatal, match='did not answer'):
+        check_visible_v3(c, 0)
+    for mode in (0, 2):
+        c, other = _socket_client(None)   # the game gone during the query
+        with pytest.raises(BridgeError, match='connection closed by game') as got:
+            check_visible_v3(c, mode)
+        assert not isinstance(got.value, (VP.VisibleV3Fatal, BridgeErrorReply))
+    c, other = _socket_client(b'')
+    c._sock = None   # not connected
+    with pytest.raises(BridgeError, match='not connected'):
+        check_visible_v3(c, 0)
+    c, other = _socket_client(b'{"type":"error","msg":"x"}\n')   # the reply kept on the exception
+    with pytest.raises(BridgeErrorReply) as got:
+        c._recv()
+    assert got.value.reply == {'type': 'error', 'msg': 'x'} and isinstance(got.value, BridgeError)
 
 
 def test_needs_decode_by_the_payload():
@@ -147,7 +233,8 @@ def test_needs_decode_by_the_payload():
 def test_fastrow_never_lets_the_c_path_take_a_v3_payload(mode, monkeypatch, m):
     """FastRow.encode on a raw payload with a v3 frame (flag 64) or raw block decodes it and hands the LeanObs to
     encode_row, whatever the worker's own mode (before: decided by ISAAC_RL_VISIBLE_V3 at import, so a v2-configured
-    worker let abp_row_encode take the step and drop the frame); a payload without one still goes to the C path."""
+    worker let abp_row_encode take the step and drop the frame). A payload without one goes to the C path only in a
+    v2 worker; a v3 worker sends it to encode_row too, whose check refuses it (2026-11-18, round 3)."""
     mode(m)
     calls, slow = [], []
 
@@ -164,8 +251,18 @@ def test_fastrow_never_lets_the_c_path_take_a_v3_payload(mode, monkeypatch, m):
     assert not calls and fr.slow == 3 and len(slow) == 3
     assert slow[0].visible_v3_frame == frame and slow[1].visible_v3_frame == frame and slow[2].visible == RAW
     fr._ptrs = (1, 1, 1)   # (a slow record resets them: _from_st)
-    fr.encode(lean(), row, row.ctypes.data, 2)   # no v3 in it: the C path
-    assert len(calls) == 1 and fr.fast == 1
+    fr.encode(lean(), row, row.ctypes.data, 2)   # no v3 in it: the C path in a v2 worker, encode_row in a v3 one
+    if m == 0:
+        assert len(calls) == 1 and fr.fast == 1
+    else:
+        assert not calls and fr.slow == 4 and slow[3].visible_v3_frame is None
+        monkeypatch.undo()   # the real encode_row: the v3 worker's check (undo resets the mode too: set again)
+        mode(m)
+        fr2 = FastRow(fn, EpisodeState(1000), al.LeanDecoder())
+        fr2._ptrs = (1, 1, 1)
+        with pytest.raises(VP.VisibleV3Fatal, match='no v3 frame'):
+            fr2.encode(lean(), np.zeros(1, ROW), row.ctypes.data, 2)
+        assert not calls
 
 
 def test_the_c_row_path_hands_a_v3_frame_back():
@@ -195,13 +292,45 @@ def _load(path, name):
 
 
 def test_native_probe_verdict():
+    """failures() on the probe's per-record accounting (2026-11-18, Codex round 3): every decoded record is both
+    blocks (compared), an allowed raw-only hand-back, or another missing frame (a failure); each section compared once
+    per record with both blocks; Codex's false pass (1 compared, the rest missing, no reason reported) fails."""
+    import os
+    before = os.environ.get('ISAAC_RL_VISIBLE_V3')
     probe = _load(PY / 'abplus_probe_v3_native.py', 'probe_v3_native')
-    good = {'P': dict(compared=5, equal=5), 'E': dict(compared=5, equal=5), 'missing': 1}
+    assert os.environ.get('ISAAC_RL_VISIBLE_V3') == before   # (no environment written at import)
+    acct = lambda both, ok=0, other=0: dict(both=both, raw_only_allowed=ok, other_missing=other, other_first=[])
+    good = {'records': acct(5, 1), 'frame': dict(compared=5, equal=5), 'P': dict(compared=5, equal=5),
+            'E': dict(compared=5, equal=5)}
     assert probe.failures(good, {'lethal hit cancelled': 1}, ['lethal hit cancelled']) is None
     assert probe.failures({**good, 'E': dict(compared=5, equal=4)}, {}, [])['differ'] == ['E']
-    assert probe.failures({'missing': 3}, {}, [])['nothing_compared']
-    assert probe.failures({'P': dict(compared=0, equal=0)}, {}, [])['nothing_compared']
+    assert probe.failures({**good, 'records': acct(5, 1, 1)}, {}, [])['other_missing'] == 1
+    assert probe.failures({'records': acct(1, 0, 9999), 'P': dict(compared=1, equal=1)}, {}, [])   # (Codex's case)
+    assert probe.failures({'records': acct(0), 'P': dict(compared=0, equal=0)}, {}, [])['nothing_compared']
+    assert probe.failures({**good, 'P': dict(compared=4, equal=4)}, {}, [])['compared_short'] == ['P']
     assert probe.failures(good, {'v3: grid size': 2}, ['lethal hit cancelled'])['reasons_not_allowed'] == ['v3: grid size']
+
+
+def test_native_probe_raw_only_records_must_encode():
+    """(2026-11-18, Codex round 4) A raw-only record counts as an allowed hand-back only when the reference encoder
+    encodes its block (as the worker's write_v3): a lethal-hit hand-back whose block is of another version or has a
+    short grid is another missing frame. And the verdict needs the whole frame compared, whatever --sections lists."""
+    probe = _load(PY / 'abplus_probe_v3_native.py', 'probe_v3_native_r4')
+    allowed = {'lethal hit cancelled'}
+    why = 'lethal hit cancelled'
+    assert probe.classify_raw_only(RAW, 6, why, 5, allowed) == ('raw_only_allowed', why)
+    old = dict(RAW, version=2026111801)
+    short = dict(RAW, cells=RAW['cells'][:int(RAW['gw']) * int(RAW['gh']) - 1])
+    for raw in (old, short):
+        kind, w = probe.classify_raw_only(raw, 6, why, 5, allowed)
+        assert kind == 'other_missing' and 'the reference encoder' in w
+    assert probe.classify_raw_only(RAW, 7, why, 5, allowed)[0] == 'other_missing'      # (the counter moved by 2)
+    assert probe.classify_raw_only(RAW, 6, 'v3: grid size', 5, allowed)[0] == 'other_missing'
+    assert probe.classify_raw_only(None, 6, why, 5, allowed)[0] == 'other_missing'
+    acct = dict(both=5, raw_only_allowed=1, other_missing=0, other_first=[])
+    header_only = {'records': acct, 'header': dict(compared=5, equal=5)}   # (--sections header: no 'frame')
+    assert probe.failures(header_only, {}, [])['compared_short'] == ['frame (not compared)']
+    assert probe.failures({**header_only, 'frame': dict(compared=5, equal=5)}, {}, []) is None
 
 
 def test_drop_probe_verdict():
@@ -218,21 +347,57 @@ def _run(args, **kw):
 
 
 def test_native_golden_cmp_exit_code(tmp_path):
+    """v3_native_golden_cmp.py (2026-11-18, Codex rounds 3 / 4): PASS only for the frozen frame set (the fixtures'
+    manifest), a run manifest without collection errors, both headers strictly valid for this schema, and the frames
+    byte for byte equal but for the stall words. Codex's -0.0 for +0.0 at word 2460 (equal as decoded values), a
+    changed size word, an appended float, another magic, a collection error, one frame only, a missing file: FAIL."""
     tool = PY / 'tools' / 'v3_native_golden_cmp.py'
-    names = 'header,canvas,minimap,P,local,E,N,S'
-    for f in ('forgotten', 'shooting'):
-        shutil.copy(FIX / f'{f}.v3.bin', tmp_path / f'{f}.v3.bin')
-        shutil.copy(FIX / f'{f}.v3.bin', tmp_path / f'{f}.native.bin')
-    r = _run([sys.executable, str(tool), str(tmp_path), names])
-    assert r.returncode == 0 and 'PASS' in r.stdout, r.stdout + r.stderr
-    b = bytearray((tmp_path / 'shooting.native.bin').read_bytes())
-    b[V3.FIXED * 4 + 4 * 3] ^= 0x10   # a P float of body 0
-    (tmp_path / 'shooting.native.bin').write_bytes(bytes(b))
-    r = _run([sys.executable, str(tool), str(tmp_path), names])
-    assert r.returncode == 1 and 'FAIL' in r.stdout and 'shooting P differs' in r.stdout
+    frozen = json.loads((FIX / 'manifest.json').read_text())
+    names = [f['name'] for f in frozen['frames']]
+
+    def setup(d, which=None, errors=()):
+        d.mkdir()
+        (d / 'manifest.json').write_text(json.dumps(dict(frames=[dict(name=n) for n in (which or names)],
+                                                         errors=list(errors))))
+        for n in (which or names):
+            shutil.copy(FIX / f'{n}.v3.bin', d / f'{n}.v3.bin')   # (stall 0.5 / 1, as the fixtures)
+            raw = json.loads((FIX / f'{n}.raw.json').read_text())['raw']
+            (d / f'{n}.native.bin').write_bytes(VP.observation_frame_v3(raw))   # (stall 0, as the native side)
+        return d
+    run = lambda d: _run([sys.executable, str(tool), str(d)], cwd=str(PY))
+    good = setup(tmp_path / 'good')
+    r = run(good)
+    assert r.returncode == 0 and 'PASS' in r.stdout and 'frames 19/19 equal' in r.stdout, r.stdout + r.stderr
+
+    def broken(how):
+        d = setup(tmp_path / how.replace(' ', '_'))
+        p_ = d / 'forgotten.native.bin'
+        b = bytearray(p_.read_bytes())
+        if how == 'minus zero':
+            assert struct.unpack_from('<f', b, 4 * 2460)[0] == 0.0
+            struct.pack_into('<f', b, 4 * 2460, -0.0)
+        elif how == 'size word':
+            struct.pack_into('<f', b, 4, struct.unpack_from('<f', b, 4)[0] + 1)
+        elif how == 'float appended':
+            b += bytes(4)
+        elif how == 'magic':
+            struct.pack_into('<f', b, 0, V3.MAGIC + 1)
+        p_.write_bytes(bytes(b))
+        return d
+    for how in ('minus zero', 'size word', 'float appended', 'magic'):
+        r = run(broken(how))
+        assert r.returncode == 1 and 'FAIL' in r.stdout, (how, r.stdout)
+    r = run(setup(tmp_path / 'errors', errors=[dict(name='shape 3', error='RuntimeError')]))
+    assert r.returncode == 1 and 'collection error' in r.stdout
+    r = run(setup(tmp_path / 'one', which=['forgotten']))
+    assert r.returncode == 1 and 'expected set' in r.stdout
+    d = setup(tmp_path / 'missing')
+    (d / 'shooting.native.bin').unlink()
+    r = run(d)
+    assert r.returncode == 1 and 'shooting: a file is missing' in r.stdout
     empty = tmp_path / 'empty'
     empty.mkdir()
-    assert _run([sys.executable, str(tool), str(empty), names]).returncode == 1
+    assert run(empty).returncode == 1
 
 
 def test_accept_checks():
@@ -250,33 +415,48 @@ SH = shutil.which('sh')
 
 
 @pytest.mark.skipif(SH is None, reason='no sh')
-@pytest.mark.parametrize('build_ok', [True, False])
-def test_deploy_abphome_fails_on_a_failed_build(tmp_path, build_ok):
-    """deploy.sh abphome with a stub run.sh (the container build): a build that writes no library exits non-zero and
-    moves the old library to trash (none left to pass for the new one); a good build replaces it."""
+@pytest.mark.parametrize('case', ['ok', 'gcc fails', 'fails after a new file', 'gpu refused', 'install fails',
+                                  'copy fails'])
+def test_deploy_abphome(tmp_path, case):
+    """deploy.sh abphome with a stub run.sh that passes its command's exit code on, as the real one (docker: exec; direct:
+    exit $rc) (2026-11-18, Codex round 3): only a build with rc 0 that left a fresh non-empty library replaces the
+    installed one, by a rename; a failed build (with or without a file left behind), a GPU check that refuses (gcc
+    never ran), a failed install or a failed copy exit non-zero and leave the installed library as it was."""
     bm = tmp_path / 'bm1'
     eng = bm / 'trees' / 't' / 'bridge' / 'engine'
     eng.mkdir(parents=True)
     for f in ('run_instance.sh', 'null_render_e.txt', 'stub_render_g.txt', 'stub_render_h.txt', 'abp_turbo.c',
               'abp_v3_native.c', 'abp_schema_v3.h', 'abp_step_line.h'):
-        (eng / f).write_text('x')
+        if not (case == 'copy fails' and f == 'abp_step_line.h'):
+            (eng / f).write_text('x')
     shutil.copy(BM1 / 'deploy.sh', bm / 'deploy.sh')
     tools = bm / 'home' / 'isaac-abplus' / 'tools'
     tools.mkdir(parents=True)
     (tools.parent / 'runtime').mkdir()   # (present: no link made)
-    (tools / 'libabp_turbo.so').write_text('OLD')
+    lib = tools / 'libabp_turbo.so'
+    if case == 'install fails':   # (the install target cannot be replaced: a non-empty directory in its place)
+        lib.mkdir()
+        (lib / 'keep').write_text('OLD')
+    else:
+        lib.write_text('OLD')
     (bm / 'common.sh').write_text(
         'BM1_MODE=direct\nBM1_GAME_RUNTIME=/nonexistent\nBM1_IN=%s\n'
         'trash() { [ -e "$1" ] || return 0; d=$BM/trash/x; mkdir -p "$d" && mv "$1" "$d/"; }\n' % bm.as_posix())
-    # (the failure as on the host: the container's gcc fails, run.sh still returns 0)
-    build = 'echo NEW > %s/libabp_turbo.so.new' % tools.as_posix() if build_ok else 'echo "gcc: error" >&2; exit 0'
+    new = tools.as_posix() + '/libabp_turbo.so.new'
+    build = {'ok': f'echo NEW > {new}; exit 0', 'install fails': f'echo NEW > {new}; exit 0',
+             'gcc fails': 'echo "gcc: error" >&2; exit 1', 'fails after a new file': f'echo PART > {new}; exit 1',
+             'gpu refused': 'echo "GPU 1 BUSY: not started" >&2; exit 4', 'copy fails': f'echo NEW > {new}; exit 0'}[case]
     (bm / 'run.sh').write_text('#!/bin/sh\n%s\n' % build)
     os.chmod(bm / 'run.sh', 0o755)
     r = _run([SH, (bm / 'deploy.sh').as_posix(), 'abphome', 't'], env=dict(os.environ, BM=bm.as_posix()))
-    lib = tools / 'libabp_turbo.so'
-    if build_ok:
+    if case == 'ok':
         assert r.returncode == 0, r.stderr
         assert lib.read_text().strip() == 'NEW' and not (tools / 'libabp_turbo.so.new').exists()
+        return
+    assert r.returncode != 0 and 'left as it was' in r.stderr, (r.returncode, r.stderr)
+    if case == 'install fails':
+        assert (lib / 'keep').read_text() == 'OLD'
     else:
-        assert r.returncode != 0 and 'not built' in r.stderr
-        assert not lib.exists() and (bm / 'trash' / 'x' / 'libabp_turbo.so').read_text() == 'OLD'
+        assert lib.read_text() == 'OLD'
+    if case in ('gcc fails', 'fails after a new file', 'gpu refused'):
+        assert not (tools / 'libabp_turbo.so.new').exists()

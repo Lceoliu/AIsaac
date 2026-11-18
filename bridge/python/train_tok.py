@@ -2887,6 +2887,7 @@ def main(argv=None, child=None, actor=None):
                                           args.rollout // args.workers * 4 + 64)
         sampler = JobSampler(bench_stats)
     else:
+        os.environ.setdefault('ISAAC_RL_FATAL_DIR', str(out))   # (a worker's visible-v3 fatal reason: tok_sampler)
         sampler = TokSampler(cfg)
         if pf_on and total_h > 0 and decisions_total > 0:   # (a resumed run: the forcing probability where the run is,
             sampler.stats[:, ST['pf_p']] = pickup_force_p(   # not pickup_force[0] until the first update rewrites it)
@@ -5576,7 +5577,11 @@ def main(argv=None, child=None, actor=None):
         actor_b.start()
 
     def check_actors():
-        """(B38 step 5, the first actor) the second actor process must be alive (else the run ends)."""
+        """(B38 step 5, the first actor) the second actor process must be alive (else the run ends). (2026-11-18) A
+        sampler worker that ended on a visible-v3 protocol error ends the run too (TokSampler.check_fatal)."""
+        check_fatal = getattr(sampler, 'check_fatal', None)
+        if check_fatal is not None:
+            check_fatal()
         if actor_b is not None and not actor_b.is_alive() and not failure:
             failure.append(RuntimeError(f'the actor process 1 ended (exit code {actor_b.exitcode})'))
         if failure:

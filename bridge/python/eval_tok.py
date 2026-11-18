@@ -151,6 +151,15 @@ def policy_actions(model, rows, pending, act_idx, device, greedy=False, mem_h=No
         return model.act(b, greedy=greedy, **kw)[0].cpu().numpy()
 
 
+def seeds_missing(names, assign, eval_seeds, episodes, empty):
+    """(2026-11-18, Codex round 3) The evaluation's completeness: (requested, played, missing). Requested: every
+    (group, seed) of the workers' seed lists; played: those with an episode; missing: the rest less the start states
+    with nothing to fight (the workers' 'empty' count) -- a seed given up after failed builds, or a worker that stopped."""
+    wanted = {(names[assign[w]], s_) for w, seeds_ in enumerate(eval_seeds) for s_ in seeds_}
+    played = {(e['group'], e['seed']) for e in episodes} & wanted
+    return len(wanted), len(played), len(wanted) - len(played) - int(round(float(empty)))
+
+
 def main():
     # torch is imported here, not at the top: the sampler's workers are spawned and import this module too
     import torch
@@ -271,6 +280,7 @@ def main():
         info['no_pedestals'] = True
     if args.no_active:   # B39
         info['no_active'] = True
+    os.environ.setdefault('ISAAC_RL_FATAL_DIR', str(out))   # (a worker's visible-v3 fatal reason: tok_sampler)
     sampler = TokSampler(cfg)
     n = cfg.workers
     recorder = None
@@ -477,8 +487,15 @@ def main():
             recorder.close()
         if args.dump_final and finals:
             np.save(out / 'final_rows.npy', np.stack(finals))
+        # (2026-11-18, Codex round 3) every requested seed played, or counted empty (its start state had nothing to
+        # fight): a seed given up after its builds failed is missing, and the evaluation fails (after the summary)
+        n_wanted, n_played, missing = seeds_missing(names, assign, eval_seeds, episodes, summary['empty'])
+        summary['seeds_requested'], summary['seeds_played'], summary['seeds_missing'] = n_wanted, n_played, missing
         (out / 'summary.json').write_text(json.dumps(summary, indent=1))
         print('SUMMARY', json.dumps(summary))
+        if missing > 0:
+            raise SystemExit(f'eval_tok: {missing} of {n_wanted} requested seeds have no episode (and were not '
+                             f'empty): the evaluation is incomplete')
     finally:
         sampler.close()
 

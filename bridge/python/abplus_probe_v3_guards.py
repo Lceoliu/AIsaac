@@ -68,14 +68,22 @@ def check_mode_cmd(c):
         res[f'set {m}'] = r.get('type') == 'ok' and r.get('mode') == m and query(c).get('mode') == m
     try:   # (the connect's own check, on this clone: mode 1 now)
         res['check same mode'] = check_visible_v3(c, 1) == 1
-    except BridgeError:
+    except VP.VisibleV3Fatal:
         res['check same mode'] = False
+    return res
+
+
+def check_refused(c):
+    """The connect's check against another mode (this clone at mode 1, the client at 2): VisibleV3Fatal (not a
+    BridgeError, which the samplers retry) and the connection closed (2026-11-18, Codex round 3). The clone is used up."""
+    query(c, 1)
     try:
         check_visible_v3(c, 2)
-        res['check another mode refused'] = False
+        return dict(refused=False)
+    except VP.VisibleV3Fatal as exc:
+        return dict(refused='configured for mode 2' in str(exc), closed=c._sock is None)
     except BridgeError as exc:
-        res['check another mode refused'] = 'configured for mode 2' in str(exc)
-    return res
+        return dict(refused=False, bridge_error=str(exc)[:200])
 
 
 def check_lasers(c, seed_a, seed_b):
@@ -135,6 +143,15 @@ def main():
                 checks['flag64'] = bool(p[12] & 64) and VP.needs_decode(p)
         finally:
             c.close()
+        c = b.fork(tag='v3guards', lean=True, alarm=600)
+        try:
+            d = detail['check another mode refused'] = check_refused(c)
+            checks['check another mode refused, connection closed'] = d.get('refused') is True and d.get('closed') is True
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
         if detail.get('native_available'):
             for name, (sa, sb) in (('two seeds', (11111, 22222)), ('one seed', (33333, 33333))):
                 c = b.fork(tag='v3guards', lean=True, alarm=600)
