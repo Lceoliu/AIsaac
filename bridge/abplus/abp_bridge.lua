@@ -231,6 +231,18 @@ local SHOOT = {
 	[0] = {}, [1] = { A.ACTION_SHOOTUP }, [2] = { A.ACTION_SHOOTRIGHT }, [3] = { A.ACTION_SHOOTDOWN }, [4] = { A.ACTION_SHOOTLEFT },
 }
 
+-- (2026-11-18) ISAAC_RL_VISIBLE_V3 at launch: 0-3, anything else is 0 with a line on stderr (the worker refuses such a
+-- value itself, and checks the bridge's mode after connecting: abplus.check_visible_v3)
+local function v3_launch_mode()
+	local raw = getenv("ISAAC_RL_VISIBLE_V3") or "0"
+	local m = math.tointeger(tonumber(raw))
+	if raw ~= "" and (m == nil or m < 0 or m > 3) then
+		print("abp_bridge: ISAAC_RL_VISIBLE_V3=" .. raw .. " is not 0-3; visible-v3 off")
+		return 0
+	end
+	return m or 0
+end
+
 local state = {
 	server = nil, client = nil, seq = 0, bind_attempted = false,
 	control = true,
@@ -275,7 +287,7 @@ local state = {
 	-- visible_v3_raw()'s JSON (schema "isaac-visible-raw-v3") instead of the v2 block; 2 the native v3 frame
 	-- (abp_native_v3, flag 64; the raw block, flag 32, when it hands back); 3 both (the check mode). The native
 	-- visible step (G) is not used then. ISAAC_RL_VISIBLE_V3=<mode> at launch, or the visible_v3 command
-	visible_v3 = math.tointeger(tonumber(getenv("ISAAC_RL_VISIBLE_V3") or "0")) or 0,
+	visible_v3 = v3_launch_mode(),
 }
 
 -- abp-0.2.13: an undiscovered secret-room door (DOOR_HIDDEN) is not part of what the player sees.
@@ -3136,12 +3148,20 @@ local function handle_command(line)
 			priv_reset()
 			send({ type = "ok", cmd = "priv", enabled = state.priv, sent = PRIV.sent, skipped = PRIV.skipped })
 		elseif cmd.cmd == "visible_v3" then   -- 2026-11-17 (visible-v3, package C): the v3 raw block in the lean payload
-			if cmd.mode ~= nil then state.visible_v3 = math.tointeger(tonumber(cmd.mode)) or 0
-			elseif cmd.enabled ~= nil then state.visible_v3 = cmd.enabled == true and 1 or 0 end
-			local v = ABP_NATIVE_V3
-			send({ type = "ok", cmd = "visible_v3", enabled = state.visible_v3 ~= 0, mode = state.visible_v3,
-				native_available = v.available, native = v.native, fallbacks = v.fallbacks, last_fallback = v.last_fallback,
-				reasons = v.reasons })
+			-- (2026-11-18, Codex round 2: a mode outside 0-3 is an error, the mode left as it was; before, mode 4 was
+			-- answered enabled = true and sent an empty block)
+			local mode = cmd.mode ~= nil and math.tointeger(tonumber(cmd.mode)) or nil
+			if cmd.mode ~= nil and (mode == nil or mode < 0 or mode > 3) then
+				send({ type = "error", cmd = "visible_v3", msg = "visible_v3: mode must be 0-3, got " .. tostring(cmd.mode),
+					mode = state.visible_v3 })
+			else
+				if mode ~= nil then state.visible_v3 = mode
+				elseif cmd.enabled ~= nil then state.visible_v3 = cmd.enabled == true and 1 or 0 end
+				local v = ABP_NATIVE_V3
+				send({ type = "ok", cmd = "visible_v3", enabled = state.visible_v3 ~= 0, mode = state.visible_v3,
+					native_available = v.available, native = v.native, fallbacks = v.fallbacks, last_fallback = v.last_fallback,
+					reasons = v.reasons })
+			end
 		elseif cmd.cmd == "lean_items" then   -- 2026-10-06 (items, Phase A): the inventory block and run-mode map rules
 			if cmd.enabled ~= nil then
 				state.lean_items = cmd.enabled == true
