@@ -490,3 +490,62 @@ def test_deploy_abphome(tmp_path, case):
         assert lib.read_text() == 'OLD'
     if case in ('gcc fails', 'fails after a new file', 'gpu refused'):
         assert not (tools / 'libabp_turbo.so.new').exists()
+
+
+# ------------------------------------------------------------------ Codex round 9 (the hardening batch's review)
+def test_a_mode_0_worker_refuses_v3_records_before_the_row(mode, monkeypatch):
+    """Item 1: a worker not configured for v3 sends no mode query (05f1622's protocol without the query) and so must
+    refuse a v3 record itself -- before the ROW, as an ordinary protocol error (ValueError: the episode's handlers take
+    it, the worker goes on) -- a valid native frame, a bad one, a raw v3 block; and FastRow sends such a payload to
+    encode_row, where the same refusal holds. Before: a valid frame was written (visible_schema the v3 VERSION), a bad
+    one ended the worker."""
+    mode(0)
+    good = VP.observation_frame_v3(RAW)
+    bad = bytearray(good)
+    bad[0:4] = bytes(4)   # (another magic)
+    for payload in (lean(frame=good), lean(frame=bytes(bad)), lean(raw=RAW)):
+        row = np.zeros(1, ROW)
+        with pytest.raises(ValueError, match='not configured for v3') as got:
+            write_visible(al.LeanDecoder().decode(payload), row)
+        assert not isinstance(got.value, VP.VisibleV3Fatal)
+        assert int(row['visible_schema'][0]) == 0 and int(row['visible_bytes'][0]) == 0
+    calls = []
+    fr = FastRow(lambda *a: calls.append(a) or 0, EpisodeState(1000), al.LeanDecoder())
+    fr._ptrs = (1, 1, 1)
+    row = np.zeros(1, ROW)
+    with pytest.raises(ValueError, match='not configured for v3'):
+        fr.encode(lean(frame=good), row, row.ctypes.data, 1)
+    assert not calls and int(row['visible_schema'][0]) == 0
+    mode(2)   # (a v3 worker writes the same valid frame)
+    row = np.zeros(1, ROW)
+    assert write_visible(al.LeanDecoder().decode(lean(frame=good)), row)
+    assert int(row['visible_schema'][0]) == V3.VERSION
+
+
+def test_a_whole_payload_of_bad_structure_is_fatal_in_v3_mode(mode):
+    """Item 2: the inner structure of a whole payload (read_lean_raw read all its bytes -- a connection lost half way is
+    a BridgeError there): the v3 frame or the visible block running past the end, trailing bytes -- VisibleV3Fatal in a
+    v3 worker (not retried), the ordinary ValueError in mode 0."""
+    frame = VP.observation_frame_v3(RAW)
+    good = lean(frame=frame)
+    for bad in (good[:-1], good + bytes(1), lean(raw=RAW)[:-3]):
+        mode(2)
+        with pytest.raises(VP.VisibleV3Fatal):
+            al.LeanDecoder().decode(bad)
+        mode(0)
+        with pytest.raises(ValueError) as got:
+            al.LeanDecoder().decode(bad)
+        assert not isinstance(got.value, VP.VisibleV3Fatal)
+
+
+def test_the_mode_answer_is_taken_as_the_protocol_has_it():
+    """Item 2: the mode an integer 0-3 as it is (2.9 is no 2, inf no OverflowError, True / '2' no mode), native_available
+    a boolean."""
+    ok = dict(type='ok', cmd='visible_v3', native_available=True)
+    assert VP.check_bridge_mode(dict(ok, mode=2), 2) == 2
+    for bad in (2.9, 2.0, float('inf'), float('nan'), True, '2', -1, 4, None):
+        with pytest.raises(VP.VisibleV3Fatal, match='answered the mode query'):
+            VP.check_bridge_mode(dict(ok, mode=bad), 2)
+    for bad in (1, 'yes', None):
+        with pytest.raises(VP.VisibleV3Fatal, match='native_available'):
+            VP.check_bridge_mode(dict(ok, mode=2, native_available=bad), 2)

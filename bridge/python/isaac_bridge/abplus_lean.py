@@ -138,7 +138,7 @@ class LeanDecoder:
             size = struct.unpack_from('<I', payload, off)[0]
             off += 4
             if off + size > len(payload):   # (2026-11-18: before, a short read and a negative 'trailing bytes')
-                raise ValueError(f'lean observation: the visible block ({size} bytes) runs past the payload end')
+                raise _structural(f'lean observation: the visible block ({size} bytes) runs past the payload end')
             o.visible_at = off   # (2026-11-12: where its JSON text starts; probes compare the bytes before it)
             o.visible = json.loads(payload[off:off+size])
             off += size
@@ -147,16 +147,24 @@ class LeanDecoder:
             size = struct.unpack_from('<I', payload, off)[0]
             off += 4
             if off + size > len(payload):
-                raise ValueError(f'lean observation: the v3 frame ({size} bytes) runs past the payload end')
+                raise _structural(f'lean observation: the v3 frame ({size} bytes) runs past the payload end')
             o.visible_v3_frame = payload[off:off+size]
             off += size
         if off != len(payload):
-            raise ValueError(f'lean observation has {len(payload) - off} trailing bytes')
+            raise _structural(f'lean observation has {len(payload) - off} trailing bytes')
         o.terrain, o.grid, o.terrain_version = self.terrain, self.grid, self.terrain_version
         o.terrain_key = self.terrain_key
         o.map, o.map_version = self.map, self.map_version
         o.inv, o.inv_head, o.inv_version = self.inv, self.inv_head, self.inv_version
         return o
+
+
+def _structural(msg):
+    """(2026-11-18, Codex round 9) A whole payload (read_lean_raw read all its bytes: a connection lost half way is a
+    BridgeError there) whose inner structure does not hold: a protocol error -- VisibleV3Fatal in a worker configured
+    for v3 (not retried), the ordinary ValueError in mode 0 (as before)."""
+    from .visible_producer import VisibleV3Fatal, fatal_active
+    return VisibleV3Fatal(msg) if fatal_active() else ValueError(msg)
 
 
 def read_lean(bridge, decoder):

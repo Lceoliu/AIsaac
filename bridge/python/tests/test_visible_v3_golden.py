@@ -154,12 +154,13 @@ def _lean_v3(frame, terrain):
 
 
 @pytest.mark.parametrize('mode, known', [('run', 1.0), ('floor', 1.0), ('floor-no-stall', 0.0), ('room', 0.0)])
-def test_stall_columns_by_episode_mode(mode, known):
+def test_stall_columns_by_episode_mode(mode, known, monkeypatch):
     """encode_row itself (2026-11-18: a behaviour test in place of the source check): --mode run's EpisodeState
     (run=True) is a whole-floor state, so the stall columns are backfilled there as on whole floors -- the share of the
     stall limit used (t - progress_t) / stall and known 1 with a stall rule; 0 / 0 without one or in a room episode."""
     from isaac_bridge.abplus_lean import LeanDecoder
     from isaac_bridge.tok_obs import ROW, EpisodeState, encode_row
+    monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', 2)   # (a v3 worker: a mode 0 one refuses v3 records, round 9)
     blob = json.loads((FIX / 'forgotten.raw.json').read_text())
     frame = VP.observation_frame_v3(blob['raw'])
     st = dict(run=EpisodeState(1000, run=True, stall=120), floor=EpisodeState(1000, floor=True, stall=120),

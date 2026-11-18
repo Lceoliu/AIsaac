@@ -515,10 +515,13 @@ def check_bridge_mode(reply, mode=None):
     elif reply.get('type') != 'ok' or reply.get('cmd') != 'visible_v3':
         raise VisibleV3Fatal(f'visible-v3: the bridge did not answer the mode query: {str(reply)[:200]}')
     else:
-        try:   # (2026-11-18, Codex round 4: a malformed answer is a protocol error too, not a ValueError)
-            have = int(reply.get('mode', -1))
-        except (TypeError, ValueError):
-            raise VisibleV3Fatal(f'visible-v3: the bridge answered the mode query with mode {reply.get("mode")!r}') from None
+        # (2026-11-18, Codex round 9: the answer as the protocol has it -- an integer 0-3, no conversion: 2.9 is no 2,
+        # inf no OverflowError -- and native_available a boolean)
+        have = reply.get('mode')
+        if type(have) is not int or not 0 <= have <= 3:
+            raise VisibleV3Fatal(f'visible-v3: the bridge answered the mode query with mode {have!r}')
+        if type(reply.get('native_available')) is not bool:
+            raise VisibleV3Fatal(f"visible-v3: the bridge answered native_available {reply.get('native_available')!r}")
     if have != mode:
         raise VisibleV3Fatal(f'visible-v3: the bridge runs mode {have}, this worker is configured for mode {mode} '
                          f'(ISAAC_RL_VISIBLE_V3 of the game and of the worker differ)')
