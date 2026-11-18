@@ -22,6 +22,7 @@ import pytest
 from isaac_bridge import schema_v3 as V3
 from isaac_bridge import v3_input as VI
 from isaac_bridge import visible_producer as VP
+from isaac_bridge.visible_producer import VisibleV3Fatal
 
 FIX = Path(__file__).resolve().parent / 'fixtures' / 'visible_v3'
 NAMES = [f['name'] for f in json.loads((FIX / 'manifest.json').read_text())['frames']]
@@ -49,35 +50,35 @@ def edit(buf, table, row, col, value):
 def test_the_entry_refuses_what_it_must_not_read():
     buf = payload(NAMES[0])
     decode(buf)
-    with pytest.raises(ValueError, match='visible_schema'):
+    with pytest.raises(VisibleV3Fatal, match='visible_schema'):
         VI.decode_frame(buf, V3.VERSION - 1, len(buf))
-    with pytest.raises(ValueError, match='visible_schema'):
+    with pytest.raises(VisibleV3Fatal, match='visible_schema'):
         VI.decode_frame(buf, 0, len(buf))
     f = np.frombuffer(buf, '<f4').copy()
     f[V3.H_MAGIC] += 1
-    with pytest.raises(ValueError, match='header'):
+    with pytest.raises(VisibleV3Fatal, match='header'):
         decode(f.tobytes())
     for old in (2026111801, 2026111703):   # (batch 5: header[6] = VERSION_WORD; a frame of another schema refused)
         f = np.frombuffer(buf, '<f4').copy()
         f[V3.H_VERSION] = old - V3.VERSION_BASE
-        with pytest.raises(ValueError, match='version'):
+        with pytest.raises(VisibleV3Fatal, match='version'):
             decode(f.tobytes())
     assert np.frombuffer(buf, '<f4')[V3.H_VERSION] == V3.VERSION_WORD
-    with pytest.raises(ValueError, match='size'):
+    with pytest.raises(VisibleV3Fatal, match='size'):
         VI.decode_frame(buf + b'\0' * 4, V3.VERSION, len(buf) + 4)
-    with pytest.raises(ValueError, match='whole frame'):
+    with pytest.raises(VisibleV3Fatal, match='whole frame'):
         VI.decode_frame(buf, V3.VERSION, len(buf) - 2)
     f = np.frombuffer(buf, '<f4').copy()
     f[V3.H_SIZE] += 1
-    with pytest.raises(ValueError, match='size'):
+    with pytest.raises(VisibleV3Fatal, match='size'):
         decode(f.tobytes())
 
 
 def test_p_row_0_must_be_the_controlled_body_with_a_position():
     buf = payload(NAMES[0])
-    with pytest.raises(ValueError, match='row 0'):
+    with pytest.raises(VisibleV3Fatal, match='row 0'):
         decode(edit(buf, 'P', 0, PC('position_known'), 0))
-    with pytest.raises(ValueError, match='row 0'):
+    with pytest.raises(VisibleV3Fatal, match='row 0'):
         decode(edit(buf, 'P', 0, PC('body_role'), V3.BODY_ROLE['sub']))
 
 
@@ -122,11 +123,11 @@ def test_c13_a_body_without_a_position_takes_no_part(name):
     known = raw['P'][:, PC('position_known')] == 1
     assert known[0]
     for i in np.flatnonzero(~known):
-        assert d['P_rel_valid'][i] == 0 and not d['P_rel'][i].any() and not d['P_cell'][i].any() and d['local_pad'][i]
+        assert d['P_rel_valid'][i] == 0 and not d['P_rel'][i].any() and not d['P_off'][i].any() and d['local_pad'][i]
     assert d['P_rel'][0] == pytest.approx([0, 0, 0]) and d['P_rel_valid'][0] == 1
 
 
-def test_c6_in_cell_offsets():
+def test_c6_offsets_from_the_patch_centre():
     buf = payload(NAMES[0])
     raw = VP.unpack_frame_v3(buf)
     x, y = raw['P'][0, PC('x')], raw['P'][0, PC('y')]
@@ -135,7 +136,7 @@ def test_c6_in_cell_offsets():
         b = edit(edit(buf, 'P', 0, PC('x'), nx), 'P', 0, PC('y'), ny)
         c = (min(max(math.floor(nx / V3.CELL), 0), gw - 1), min(max(math.floor(ny / V3.CELL), 0), gh - 1))
         exp = [(nx - V3.CELL * c[0] - V3.CELL / 2) / V3.CELL, (ny - V3.CELL * c[1] - V3.CELL / 2) / V3.CELL]
-        assert decode(b)['P_cell'][0] == pytest.approx(exp, abs=1e-5)
+        assert decode(b)['P_off'][0] == pytest.approx(exp, abs=1e-5)
 
 
 def test_derived_inputs_are_clamped():
@@ -194,7 +195,7 @@ def test_rows_are_checked_one_by_one():
         VP.write_frame_v3(rows[i:i + 1], payload(n))
     assert len(VI.decode_rows(rows)) == 3
     rows['visible_schema'][1] = 2026111801   # (a frame of another schema in a ROW the v3 path reads: refused)
-    with pytest.raises(ValueError, match='visible_schema'):
+    with pytest.raises(VisibleV3Fatal, match='visible_schema'):
         VI.decode_rows(rows)
 
 
@@ -253,9 +254,9 @@ def test_device_decode_equals_host_on_out_of_range_codes():
 
 def test_device_decode_refuses_like_the_host():
     buf = payload(NAMES[0])
-    with pytest.raises(ValueError, match='visible_schema'):
+    with pytest.raises(VisibleV3Fatal, match='visible_schema'):
         VI.decode_frame_torch(buf, V3.VERSION - 1, len(buf))
-    with pytest.raises(ValueError, match='row 0'):
+    with pytest.raises(VisibleV3Fatal, match='row 0'):
         VI.decode_frame_torch(edit(buf, 'P', 0, PC('position_known'), 0), V3.VERSION, len(buf))
 
 
@@ -312,3 +313,176 @@ def test_relative_quantities_are_translation_free_and_isotropic():
         g[eat + r * V3.EF + EC('x')] += 37.0
         g[eat + r * V3.EF + EC('y')] -= 23.0
     assert np.allclose(decode(g.tobytes())['E_rel'], d0, atol=1e-5)
+
+
+# ------------------------------------------------------------------------------------- round 1 of the review (11-18)
+def _frame(name):
+    return np.frombuffer(payload(name), '<f4').copy()
+
+
+def test_strict_header_and_exact_length():
+    buf = payload(NAMES[0])
+    for word, value in ((V3.H_P, 1.5), (V3.H_E, np.nan), (V3.H_SIZE, np.inf), (V3.H_MAGIC, V3.MAGIC + 0.5)):
+        f = np.frombuffer(buf, '<f4').copy()
+        f[word] = value
+        with pytest.raises(VisibleV3Fatal):
+            decode(f.tobytes())
+        with pytest.raises(VisibleV3Fatal):
+            VI.decode_frame_torch(f.tobytes(), V3.VERSION)
+    with pytest.raises(VisibleV3Fatal):   # (trailing data: the plain entry takes the whole buffer as the frame)
+        VI.decode_frame(buf + b'\0' * 4, V3.VERSION)
+    with pytest.raises(VisibleV3Fatal, match='visible_schema'):
+        VI.decode_frame(buf, V3.VERSION + 0.5)
+    # e = 129 with a self-consistent size: past CAP_ENTITY
+    f = np.frombuffer(buf, '<f4').copy()
+    p, e, n, s = (int(v) for v in f[V3.H_P:V3.H_S + 1])
+    extra = (V3.CAP_ENTITY + 1 - e) * V3.EF
+    eat = V3.FIXED + p * V3.BODY + e * V3.EF
+    g = np.concatenate([f[:eat], np.zeros(extra, '<f4'), f[eat:]])
+    g[V3.H_E] = V3.CAP_ENTITY + 1
+    g[V3.H_SIZE] = V3.frame_floats(p, V3.CAP_ENTITY + 1, n, s)
+    with pytest.raises(VisibleV3Fatal):
+        decode(g.tobytes())
+
+
+def test_main_body_flags_must_be_exactly_1():
+    buf = payload(NAMES[0])
+    for col, v in ((PC('body_role'), 1.5), (PC('body_role'), 0.999), (PC('position_known'), 1.25),
+                   (PC('position_known'), np.nan)):
+        with pytest.raises(VisibleV3Fatal, match='row 0'):
+            decode(edit(buf, 'P', 0, col, v))
+
+
+def test_a_bad_frame_fails_the_whole_batch():
+    from isaac_bridge.tok_obs import ROW
+    rows = np.zeros(3, ROW)
+    for i, n in enumerate(NAMES[:3]):
+        f = _frame(n)
+        if i == 1:
+            f[V3.H_P] = 1.5   # (written by hand below: write_frame_v3 does not read the header)
+        b = f.tobytes()
+        rows['visible_bytes'][i] = len(b)
+        rows['visible_frame'][i, :len(b)] = np.frombuffer(b, np.uint8)
+        rows['visible_schema'][i] = V3.VERSION
+    with pytest.raises(VisibleV3Fatal):
+        VI.decode_rows(rows)
+
+
+def _spec_values(spec, salt):
+    """Per 'num' column of a schema spec (col, name, kind, unit, scale): a wire value scale * q with q non-zero,
+    unsaturated and distinct per column -- the expectation built from the schema alone, not from v3_input.PLAN."""
+    cols = sorted((c, sc) for c, _n, kind, _u, sc in spec if kind == 'num')
+    q = [round(0.11 + 0.017 * i + salt, 6) for i in range(len(cols))]
+    return cols, q
+
+
+def test_every_numeric_column_scaled_once_from_the_schema():
+    import torch
+    spec = {'P': V3.P_SPEC, 'E': V3.E_SPEC, 'N': V3.N_SPEC, 'S': V3.S_SPEC}
+    width = {'P': V3.PF, 'E': V3.EF, 'N': V3.NF, 'S': V3.SF}
+    seen = set()
+    for name in ('forgotten', 'devilprice'):   # (2 bodies, 1 entity, 0 / 6 slots; 1 body, 5 entities, 1 / 3)
+        frame = _frame(name)
+        p, e, n, s = (int(v) for v in frame[V3.H_P:V3.H_S + 1])
+        at = {'P': V3.FIXED, 'E': V3.FIXED + p * V3.BODY}
+        at['N'] = at['E'] + e * V3.EF
+        at['S'] = at['N'] + n * V3.NF
+        rows = {'P': p, 'E': e, 'N': n, 'S': s}
+        expect = {}
+        for t in 'PENS':
+            cols, q = _spec_values(spec[t], salt=0.001 * 'PENS'.index(t))
+            for r in range(rows[t]):
+                for (c, sc), qq in zip(cols, q):
+                    frame[at[t] + r * width[t] + c] = np.float32(qq * sc)
+            expect[t] = np.asarray(q, np.float32)
+        d = decode(frame.tobytes())
+        t_ = VI.decode_frame_torch(frame.tobytes(), V3.VERSION)
+        for t in 'PENS':
+            got = d[f'{t}_num']
+            assert got.shape == (rows[t], len(expect[t])), t
+            for r in range(rows[t]):
+                assert np.allclose(got[r], expect[t], rtol=1e-5, atol=1e-6), (t, r, got[r] - expect[t])
+                seen.add(t)
+            assert torch.equal(t_[f'{t}_num'], torch.as_tensor(got)), t
+    assert seen == set('PENS')
+
+
+def test_bucket_bounds():
+    for n, b in ((0, 16), (1, 16), (16, 16), (17, 32), (32, 32), (33, 64), (64, 64), (65, 128), (128, 128)):
+        assert VI.bucket(n, VI.E_BUCKETS) == b
+    with pytest.raises(ValueError):
+        VI.bucket(129, VI.E_BUCKETS)
+
+
+def test_c6_offset_outside_the_grid_is_from_the_edge_cell_centre():
+    buf = payload(NAMES[0])
+    b = edit(edit(buf, 'P', 0, PC('x'), -30.0), 'P', 0, PC('y'), 60.0)
+    assert list(decode(b)['P_off'][0]) == [-1.25, 0.0]   # (centre cell 0: (-30 - 20) / 40; y in cell 1: (60 - 60) / 40)
+
+
+def test_category_edges_same_on_both_sides():
+    f = _frame('devilprice')
+    p, e, n, s = (int(v) for v in f[V3.H_P:V3.H_S + 1])
+    eat = V3.FIXED + p * V3.BODY
+    nat, sat = eat + e * V3.EF, eat + e * V3.EF + n * V3.NF
+    odd = [np.float32(2.0 ** 63), np.inf, -np.inf, np.nan, np.float32(-2.0 ** 63)]
+    for r in range(e):
+        for c in VI.PLAN['E']['cat'] + VI.PLAN['E']['idn'] + VI.PLAN['E']['anim']:
+            f[eat + r * V3.EF + c] = odd[(r + c) % len(odd)]
+    f[nat + V3.col(V3.N_COLS, 'id')] = np.inf
+    for r in range(s):
+        f[sat + r * V3.SF + V3.col(V3.S_COLS, 'family')] = odd[r % len(odd)]
+        f[sat + r * V3.SF + V3.col(V3.S_COLS, 'id')] = 5.0
+    b = f.tobytes()
+    h = decode(b)
+    for dev in _devices():
+        _same(h, VI.decode_frame_torch(b, V3.VERSION, device=dev))
+    jk = VI.PLAN['E']['cat'].index(EC('kind'))
+    base, size = V3.CAT_NS['entity_kind']
+    assert ((h['E_cat'][:, jk] >= base) & (h['E_cat'][:, jk] < base + size)).all()
+    assert (h['E_id'] >= 0).all() and (h['E_id'] <= V3.IDENTITY_UNKNOWN).all()
+    assert h['N_item'][0, 0] == V3.ITEM_UNKNOWN and (h['S_item'][:, 0] == V3.ITEM_UNKNOWN).all()
+    assert (h['E_anim'] >= 0).all() and (h['E_anim'] < V3.ANIM_ROWS).all()
+
+
+def test_finite_codes_follow_the_schema_functions():
+    vals = np.concatenate([np.arange(-6, 140, 0.5), [999, 1000, -1000, 4095, 4096, 65534, 65535, 1e9]]).astype(np.float32)
+    for ns in V3.CAT_NS:
+        got = VI.n_wire_cat_index(ns, vals)
+        assert got.tolist() == [V3.wire_cat_index(ns, float(v)) for v in vals], ns
+    assert VI.n_identity_index(vals).tolist() == [V3.identity_index(float(v)) for v in vals]
+    for ns, (base, size) in V3.ITEM_NS.items():
+        assert VI.n_item_index(base, size, vals).tolist() == [V3.item_index(ns, float(v)) for v in vals], ns
+    assert VI.n_map_icon_index(vals).tolist() == [V3.map_icon_index(float(v)) for v in vals]
+
+
+def test_nonfinite_counted_per_section_and_replaced():
+    f = _frame('devilprice')
+    p, e, n, s = (int(v) for v in f[V3.H_P:V3.H_S + 1])
+    eat = V3.FIXED + p * V3.BODY
+    nat, sat = eat + e * V3.EF, eat + e * V3.EF + n * V3.NF
+    f[V3.FIXED + VI.PLAN['P']['bit'][0]] = np.nan            # (P: a bit column)
+    f[V3.FIXED + VI.PLAN['P']['known'][0]] = np.inf          # (P: a known column)
+    f[eat + EC('vx')] = np.nan
+    f[eat + V3.EF + VI.PLAN['E']['bits8'][0]] = np.inf      # (E: a bit word)
+    f[nat + V3.col(V3.N_COLS, 'count')] = np.nan
+    f[sat + V3.col(V3.S_COLS, 'charge')] = -np.inf
+    f[V3.HEADER + 3] = np.nan                                # (canvas: cell 0, word 3 = grid_variant)
+    f[V3.FIXED + p * V3.PF + 7] = np.inf                     # (body 0's local patch)
+    b = f.tobytes()
+    d = decode(b)
+    assert dict(zip(VI.SECTIONS, d['nonfinite'].tolist())) == {'P': 2, 'E': 2, 'N': 1, 'S': 1, 'canvas': 2}
+    for k, v in d.items():
+        if v.dtype.kind == 'f':
+            assert np.isfinite(v).all(), k
+    for dev in _devices():
+        _same(d, VI.decode_frame_torch(b, V3.VERSION, device=dev))
+
+
+def test_padded_body_rows_are_pad():
+    fr = [decode(payload(n)) for n in NAMES[:3]]
+    b = VI.pad_batch(fr)
+    for i, f in enumerate(fr):
+        k = len(f['P_num'])
+        assert b['local_pad'][i, k:].all() and np.array_equal(b['local_pad'][i, :k], f['local_pad'])
+    assert b['nonfinite'].shape == (3, len(VI.SECTIONS))

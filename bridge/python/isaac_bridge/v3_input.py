@@ -1,36 +1,43 @@
-"""visible-v3 decode for the model (package A, seq-v1 step 1; DRAFT 2026-11-18, not committed: waits for main = the C
-package). The only place where a v3 frame (schema_v3, the frozen interface) becomes model inputs; the only place where
-the scales apply (contract C7). Host side (numpy): the actor decodes outside its captured graph; the device side (torch,
-the learner) must give the same values (a test asserts it).
+"""visible-v3 decode for the model (package A, seq-v1 step 1). The only place where a v3 frame (schema_v3, the frozen
+interface) becomes model inputs; the only place where the scales apply (contract C7). Host side (numpy): the actor
+decodes outside its captured graph; device side (torch): the learner decodes on its own device. The two give the same
+values (tests/test_v3_input.py).
 
-Per frame (decode_frame):
-  - the record's visible_schema must equal schema_v3.VERSION (row by row: the audit found a worker could write a v2
-    frame into a ROW configured for v3), and the frame header must pass visible_producer.check_frame_header_v3 (magic,
-    header[6] = VERSION_WORD of this tree's schema, batch 5; counts in range; the size formula, exactly the record's
-    byte count), else ValueError -- never a silent decode (main's 05f1622 interface; the hardening batch's
-    VisibleV3Fatal replaces it when it lands);
-  - numeric ('num') columns: value / scale, clamped to [-NUM_CLAMP, NUM_CLAMP] (batch 2, B5); a NaN (none on the
-    wire by its rule) decodes to 0, an infinity to the clamp;
-  - 'known' / 'bit' columns: 0 / 1; 'bits8' / 'word16': expanded into bits;
-  - categorical columns -> rows of the shared tables (cat_index / wire_cat_index for the batch-4 columns whose wire
-    value is raw: price, direction; identity_index; item_index per family; map_icon_index; anim rows);
+Per frame (decode_frame / decode_frame_torch):
+  - the record's visible_schema must equal schema_v3.VERSION exactly (row by row: the audit found a worker could write
+    a v2 frame into a ROW configured for v3), and the header must pass visible_producer.check_frame_header_v3 with the
+    exact length (every header word a finite whole number, magic, header[6] = VERSION_WORD, counts in range, the size
+    formula, no trailing data); P row 0 must be the controlled body with a position (batch 4: body_role and
+    position_known exactly 1) -- else VisibleV3Fatal (a protocol error, never retried, never a silent decode);
+  - numeric ('num') columns: value / scale, clamped to [-NUM_CLAMP, NUM_CLAMP] (batch 2, B5);
+  - 'known' / 'bit' columns: as they are (0 / 1); 'bits8' / 'word16': expanded into bits;
+  - categorical columns -> rows of the shared tables, schema_v3's rules (cat_index / wire_cat_index -- price and
+    direction coded from their raw wire values, batch 4 --, identity_index, item_index per family, map_icon_index, anim
+    rows);
   - price (E col 31) also as a number: coins / PRICE_COIN_SCALE when > 0, else 0 (the coordinator, 11-18: the old
     model's /15; the special prices -1 / -2 / -3 / -1000 are categories only);
   - 'reserved' columns dropped.
+Non-finite wire values (none by the wire rule; a producer bug otherwise turns every loss into NaN), the same on both
+sides (the coordinator, 11-18): a numeric column NaN -> 0, +-inf -> +-NUM_CLAMP; a known / bit column, a bit word, a
+canvas word NaN / inf -> 0; a categorical value NaN / inf -> its unknown row (cat: the namespace's last row; identity /
+item: the unknown row; map icon: the last row; anim: 0); finite codes past +-2^31 are cut there before the integer
+conversion (so 2^63 never wraps to a negative row). Each frame carries the count of its non-finite floats per section
+(nonfinite: P, E, N, S, canvas = room canvas + minimap + local patches); V4's acceptance fails on any count above 0.
 Derived inputs (the model's, never on the wire), every one clamped to [-NUM_CLAMP, NUM_CLAMP] (a NaN to 0):
-  - C4 relative offsets / distances to the main body (P row 0, batch 4: body_role 1, position_known 1 -- asserted):
-    entities, other bodies, laser end points, the 28 room-token centres; offsets / REL_SCALE['offset'], distances /
-    REL_SCALE['distance'] (schema_v3, batch 4); computed from the raw canvas-frame pixels;
-  - C6 in-cell offsets of each body with a position: (pos - CELL * clamp(floor(pos / CELL)) - CELL / 2) / CELL;
-  - C13: a body with position_known 0 takes no part: its relative quantities and in-cell offset are 0 with
-    rel_valid 0, its local patch is marked pad.
+  - C4 relative offsets / distances to the main body (P row 0): entities, other bodies, laser end points, the 28
+    room-token centres; offsets / REL_SCALE['offset'], distances / REL_SCALE['distance'] (schema_v3, batch 4);
+    computed from the raw canvas-frame pixels;
+  - C6 P_off: each body's offset from the centre of its local patch's centre cell, in cells: (pos - CELL * c - CELL /
+    2) / CELL with c = floor(pos / CELL) clamped into the grid (the producer's centre cell). Inside the grid within
+    +-0.5; outside it larger (x = -30 px: -1.25) -- how far the body is from the patch's centre (the coordinator,
+    11-18: not cut to +-0.5);
+  - C13: a body with position_known 0 takes no part: its relative quantities and P_off are 0 with rel_valid 0, its
+    local patch is marked pad.
 Outputs are numpy arrays (see DecodedFrame); padded batches for the actor come from pad_batch."""
-import math
-
 import numpy as np
 
 from . import schema_v3 as V3
-from .visible_producer import check_frame_header_v3
+from .visible_producer import VisibleV3Fatal, check_frame_header_v3
 
 # The coins scale of the price number (the coordinator 11-18: the old model's /15; to move into schema_v3 with the next
 # batch -- until then the one model-side constant here, on the grep gate's whitelist).
@@ -38,9 +45,12 @@ PRICE_COIN_SCALE = 15.0
 CLAMP = V3.NUM_CLAMP
 W8, W16 = 8, V3.FLAG_WORD_BITS   # (the bits of a 'bits8' / a 'word16' column: schema_v3's kinds)
 R_ROWS, R_COLS, R_BLOCK = 4, 7, 4   # the 28 room tokens: 4 x 7 blocks of 4 x 4 canvas cells (v2's down-sampling)
+CODE_CUT = 2.0 ** 31   # a finite categorical / word value is cut to +-CODE_CUT before its integer conversion
+SECTIONS = ('P', 'E', 'N', 'S', 'canvas')   # the nonfinite counts' order
 
 _LASER_KIND = V3.ENTITY_KIND['laser']   # E col 15's code on the wire (raw kind + 1)
 POS_SCALE = V3.P_COLS[V3.col(V3.P_COLS, 'x')][3]   # (the canvas-frame positions' scale, P / E x and y: 520)
+_MAIN = V3.BODY_ROLE['main']
 
 
 # ----------------------------------------------------------------------------------------------- column plans
@@ -78,37 +88,124 @@ PLAN = {'P': _plan(V3.P_COLS, 'P'), 'E': _plan(V3.E_COLS, 'E'), 'N': _plan(V3.N_
 _PC = {n: V3.col(V3.P_COLS, n) for n in ('x', 'y', 'body_role', 'position_known', 'grid_w', 'grid_h')}
 _EC = {n: V3.col(V3.E_COLS, n) for n in ('x', 'y', 'kind', 'l_ex', 'l_ey', 'price')}
 _SC_FAMILY = V3.col(V3.S_COLS, 'family')
+_FAMILY_NS = sorted((k, V3.ITEM_NS[ns]) for k, ns in V3.FAMILY_ITEM_NS.items())   # family code -> (base, size)
 
 
 # ----------------------------------------------------------------------------------------------- frame bytes
+def _refuse(msg):
+    raise VisibleV3Fatal(f'v3_input: {msg}')
+
+
 def split_frame(buf, visible_schema, nbytes=None):
     """The frame bytes of a record -> dict of float32 views (header, canvas [16, 28, 5], minimap [169], P [p, 192],
-    local [p, 9, 9, 5], E [e, 64], N [n, 8], S [s, 24]). Raises ValueError on another schema version, a bad header or
-    a size that does not match."""
-    if int(visible_schema) != V3.VERSION:
-        raise ValueError(f'v3_input: visible_schema {int(visible_schema)} is not schema_v3.VERSION {V3.VERSION}')
+    local [p, 9, 9, 5], E [e, 64], N [n, 8], S [s, 24]). nbytes: the record's frame length (default: the whole
+    buffer); the frame must fill it exactly. VisibleV3Fatal on another schema version, a bad header or a size that does
+    not match."""
+    vs = np.asarray(visible_schema).reshape(-1)
+    if vs.size != 1 or not np.isfinite(float(vs[0])) or float(vs[0]) != V3.VERSION:
+        _refuse(f'visible_schema {vs.tolist()} is not schema_v3.VERSION {V3.VERSION}')
     mv = memoryview(buf).cast('B')
-    if nbytes is not None and (nbytes % 4 or nbytes > len(mv)):
-        raise ValueError(f'v3_input: {nbytes} bytes is not a whole frame of floats ({len(mv)} in the buffer)')
-    f = np.frombuffer(mv, '<f4', count=(nbytes // 4) if nbytes is not None else -1)
-    p, e, n, s = check_frame_header_v3(f, exact=nbytes is not None)
-    if p < 1:
-        raise ValueError('v3_input: a frame without a body')
+    n = len(mv) if nbytes is None else int(nbytes)
+    if n % 4 or n > len(mv) or n < 0:
+        _refuse(f'{n} bytes is not a whole frame of floats ({len(mv)} in the buffer)')
+    f = np.frombuffer(mv, '<f4', count=n // 4)
+    p, e, nn, s = check_frame_header_v3(f, exact=True)
     at, out = V3.HEADER, {'header': f[:V3.HEADER]}
     for name, count, shape in (('canvas', 1, (V3.CANVAS_H, V3.CANVAS_W, V3.ROOM_WORDS)),
                                ('minimap', 1, (V3.MAP_SIDE * V3.MAP_SIDE,)), ('P', p, (V3.PF,)),
                                ('local', p, (V3.LOCAL_SIDE, V3.LOCAL_SIDE, V3.ROOM_WORDS)), ('E', e, (V3.EF,)),
-                               ('N', n, (V3.NF,)), ('S', s, (V3.SF,))):
+                               ('N', nn, (V3.NF,)), ('S', s, (V3.SF,))):
         k = count * int(np.prod(shape))
         out[name] = f[at:at + k].reshape(shape if name in ('canvas', 'minimap') else (count,) + shape)
         at += k
+    P = out['P']
+    if not (P[0, _PC['body_role']] == _MAIN and P[0, _PC['position_known']] == 1):
+        _refuse('P row 0 is not the controlled body with a position (schema_v3 batch 4: body_role and position_known '
+                f'exactly 1, got {float(P[0, _PC["body_role"]])}, {float(P[0, _PC["position_known"]])})')
     return out
 
 
-# ----------------------------------------------------------------------------------------------- the decoders
+# ----------------------------------------------------------------------------------------------- host (numpy)
+def _n_sane(v):
+    """float64 values, cut to +-CODE_CUT, and the non-finite mask (those set 0)."""
+    v = np.asarray(v, np.float64)
+    bad = ~np.isfinite(v)
+    return np.where(bad, 0.0, np.clip(v, -CODE_CUT, CODE_CUT)), bad
+
+
+def _n_trunc(v):
+    return np.trunc(v).astype(np.int64)
+
+
+def n_cat_index(ns, code, bad):
+    """schema_v3.cat_index on sanitised codes (bad: non-finite -> the namespace's last row)."""
+    base, size = V3.CAT_NS[ns]
+    c = _n_trunc(code)
+    row = np.where(c == 0, 0, base + np.minimum(c, size - 1))
+    return np.where(bad | (code < 0), base + size - 1, row)
+
+
+def n_price_code(v, bad):
+    """schema_v3.price_code."""
+    size = V3.CAT_NS['price'][1]
+    c = _n_trunc(v)
+    out = np.full(c.shape, size - 1, np.int64)
+    out = np.where(c == 0, 0, out)
+    out = np.where((c >= 1) & (c <= 99), c, out)
+    for raw, code in V3.PRICE_CODES.items():
+        out = np.where(c == raw, code, out)
+    return np.where(bad, size - 1, out).astype(np.float64)
+
+
+def n_direction_code(v, bad):
+    """schema_v3.direction_code."""
+    size = V3.CAT_NS['direction'][1]
+    return np.where(bad | (v < -1) | (v > 3), size - 1, _n_trunc(v) + 2).astype(np.float64)
+
+
+_N_FROM_RAW = {'price': n_price_code, 'direction': n_direction_code}
+
+
+def n_wire_cat_index(ns, wire):
+    """schema_v3.wire_cat_index on an array (non-finite -> the last row)."""
+    v, bad = _n_sane(wire)
+    f = _N_FROM_RAW.get(ns)
+    if f is None and ns in V3.CAT_FROM_RAW:
+        raise KeyError(f'v3_input: no array form of schema_v3.CAT_FROM_RAW[{ns!r}]')
+    if f is not None:
+        return n_cat_index(ns, f(v, bad), np.zeros_like(bad))
+    return n_cat_index(ns, v, bad)
+
+
+def n_identity_index(wire):
+    v, bad = _n_sane(wire)
+    return np.where(bad | (v < 0) | (v >= V3.IDENTITY_UNKNOWN), V3.IDENTITY_UNKNOWN, _n_trunc(v))
+
+
+def n_item_index(base, size, wire):
+    """schema_v3.item_index with the namespace's (base, size) as arrays or ints (size 0: no namespace -> unknown)."""
+    v, bad = _n_sane(wire)
+    c = _n_trunc(v)
+    size = np.asarray(size, np.int64)
+    row = np.where((c > 0) & (c < size), np.asarray(base, np.int64) + c, V3.ITEM_UNKNOWN)
+    row = np.where(c == 0, 0, row)
+    return np.where(bad | (size == 0), V3.ITEM_UNKNOWN, row)
+
+
+def n_map_icon_index(wire):
+    v, bad = _n_sane(wire)
+    return np.where(bad | (v < 0), V3.MAP_ICONS - 1, np.minimum(_n_trunc(v), V3.MAP_ICONS - 1))
+
+
+def _n_words(w):
+    """bit words as int64: non-finite -> 0, cut to [0, CODE_CUT]."""
+    w = np.asarray(w, np.float64)
+    return np.where(np.isfinite(w), np.clip(w, 0, CODE_CUT), 0).astype(np.int64)
+
+
 def _bits(words, layout):
     """[..., ] float words -> [..., len(layout)] the unsigned fields (name, bits) LSB first, as float32."""
-    w = words.astype(np.int64)
+    w = _n_words(words)
     out, shift = [], 0
     for _name, bits in layout:
         out.append((w >> shift) & ((1 << bits) - 1))
@@ -119,83 +216,96 @@ def _bits(words, layout):
 _ROOM_DIV = np.asarray([V3.ROOM_DECODE_SCALE.get(n, 1) for n in V3.ROOM_CHANNELS], np.float32)
 
 
+def _n_fin0(x):
+    return np.where(np.isfinite(x), x, 0).astype(np.float32)
+
+
 def room_channels(cells):
     """[..., 5] cell words -> [..., RC] the 21 decoded channels (word 0's 13 fields, word 1's 5, the raw words 2..4),
     divided by ROOM_DECODE_SCALE (codes / 64 etc.; others 1)."""
     ch = np.concatenate([_bits(cells[..., 0], V3.ROOM_W0), _bits(cells[..., 1], V3.ROOM_W1),
-                         cells[..., 2:5].astype(np.float32)], -1)
+                         _n_fin0(cells[..., 2:5])], -1)
     return ch / _ROOM_DIV
 
 
 def minimap(words):
     """[169] map words -> ([169, 4] shown / visited / clear / current, [169] icon rows)."""
     b = _bits(words, V3.MAP_BITS)
-    icon = np.asarray([V3.map_icon_index(v) for v in b[:, 4]], np.int64)
-    return b[:, :4], icon
+    return b[:, :4], n_map_icon_index(b[:, 4])
 
 
 def _num(x, plan):
-    # (a NaN never reaches the model: 0, as a missing value -- the wire rule has none, a producer bug would otherwise
-    #  turn every loss into NaN; the device side does the same)
     return np.clip(np.nan_to_num(x[:, plan['num']] / plan['scale'], nan=0.0, posinf=CLAMP, neginf=-CLAMP),
                    -CLAMP, CLAMP).astype(np.float32)
 
 
 def _flags(x, plan):
-    parts = [x[:, plan['known']], x[:, plan['bit']]]
+    n = len(x)
+    parts = [_n_fin0(x[:, plan['known']]), _n_fin0(x[:, plan['bit']])]
     if plan['bits8']:
-        parts.append(_bits(x[:, plan['bits8']], (('b', 1),) * W8).reshape(len(x), W8 * len(plan['bits8'])))
+        parts.append(_bits(x[:, plan['bits8']], (('b', 1),) * W8).reshape(n, W8 * len(plan['bits8'])))
     if plan['word16']:
-        parts.append(_bits(x[:, plan['word16']], (('b', 1),) * W16).reshape(len(x), W16 * len(plan['word16'])))
+        parts.append(_bits(x[:, plan['word16']], (('b', 1),) * W16).reshape(n, W16 * len(plan['word16'])))
     return np.concatenate([np.asarray(q, np.float32) for q in parts], 1)
 
 
 def _cats(x, plan):
-    out = np.zeros((len(x), len(plan['cat'])), np.int64)
-    for j, (c, ns) in enumerate(zip(plan['cat'], plan['cat_ns'])):
-        out[:, j] = [V3.wire_cat_index(ns, v) for v in x[:, c]]
-    return out
+    cols = [n_wire_cat_index(ns, x[:, c]) for c, ns in zip(plan['cat'], plan['cat_ns'])]
+    return np.stack(cols, 1).astype(np.int64) if cols else np.zeros((len(x), 0), np.int64)
 
 
 def _ids(x, plan):
-    return np.asarray([[V3.identity_index(v) for v in r] for r in x[:, plan['idn']]], np.int64).reshape(len(x), len(plan['idn']))
+    cols = [n_identity_index(x[:, c]) for c in plan['idn']]
+    return np.stack(cols, 1).astype(np.int64) if cols else np.zeros((len(x), 0), np.int64)
 
 
 def _anims(x, plan):
-    a = x[:, plan['anim']]
-    ok = (a == a) & (a >= 0) & (a < V3.ANIM_ROWS)
-    return np.where(ok, np.nan_to_num(a), 0).astype(np.int64)
+    v, bad = _n_sane(x[:, plan['anim']])
+    return np.where(~bad & (v >= 0) & (v < V3.ANIM_ROWS), _n_trunc(v), 0).astype(np.int64)
+
+
+def _family_ns(family):
+    v, bad = _n_sane(family)
+    fam = _n_trunc(v)
+    base, size = np.zeros_like(fam), np.zeros_like(fam)
+    for k, (b_, s_) in _FAMILY_NS:
+        hit = (fam == k) & ~bad
+        base, size = np.where(hit, b_, base), np.where(hit, s_, size)
+    return base, size
 
 
 def _items(x, plan, family=None):
-    out = np.zeros((len(x), len(plan['item'])), np.int64)
-    for j, (c, ns) in enumerate(zip(plan['item'], plan['item_ns'])):
-        for r in range(len(x)):
-            n_ = ns
-            if ns == 'by_family':
-                n_ = V3.FAMILY_ITEM_NS.get(int(family[r]) if family[r] == family[r] else -1)
-            out[r, j] = V3.ITEM_UNKNOWN if n_ is None else V3.item_index(n_, x[r, c])
-    return out
+    cols = []
+    for c, ns in zip(plan['item'], plan['item_ns']):
+        if ns == 'by_family':
+            base, size = _family_ns(family)
+        else:
+            base, size = V3.ITEM_NS[ns]
+        cols.append(n_item_index(base, size, x[:, c]))
+    return np.stack(cols, 1).astype(np.int64) if cols else np.zeros((len(x), 0), np.int64)
 
 
 def _clamp(v):
     return np.clip(np.nan_to_num(v, nan=0.0, posinf=CLAMP, neginf=-CLAMP), -CLAMP, CLAMP).astype(np.float32)
 
 
-def _t_clamp(v):
-    torch = _t()
-    return torch.clamp(torch.nan_to_num(v, nan=0.0, posinf=CLAMP, neginf=-CLAMP), -CLAMP, CLAMP).to(torch.float32)
+def _nonfinite(f):
+    """The non-finite floats per section (SECTIONS order)."""
+    c = lambda a: int(np.count_nonzero(~np.isfinite(a)))   # noqa: E731
+    return np.asarray([c(f['P']), c(f['E']), c(f['N']), c(f['S']), c(f['canvas']) + c(f['minimap']) + c(f['local'])],
+                      np.int64)
 
 
 class DecodedFrame(dict):
     """One frame's model inputs (numpy). Keys:
-      room [16, 28, RC]           canvas channels; room_xy [28, 2] the room tokens' centres / 520; room_rel [28, 3]
-                                  their offsets to the main body / REL offset, distance / REL distance
+      room [16, 28, RC]           canvas channels; room_xy [28, 2] the room tokens' centres / POS_SCALE; room_rel
+                                  [28, 3] their offsets to the main body / REL offset, distance / REL distance
       map_bits [169, 4], map_icon [169]
-      P_num, P_flag, P_cat        per body; P_cell [p, 2] in-cell offset; P_rel [p, 3]; P_rel_valid [p]
+      P_num, P_flag, P_cat        per body; P_off [p, 2] (C6, see the module doc); P_rel [p, 3]; P_rel_valid [p]
       local [p, 9, 9, RC], local_pad [p] (C13: position_known 0)
       E_num, E_flag, E_cat, E_id, E_anim; E_price [e, 1]; E_rel [e, 3]; E_laser_rel [e, 3] (0 for a non-laser)
       N_num, N_flag, N_item; S_num, S_flag, S_cat, S_item
+      nonfinite [5] the non-finite wire floats per section (SECTIONS)
       main_xy [2] the main body's canvas-frame pixels (diagnostics)"""
 
 
@@ -216,27 +326,36 @@ def _rel(xy, main):
     return _clamp(np.concatenate([d / V3.REL_SCALE['offset'], dist / V3.REL_SCALE['distance']], -1))
 
 
+def _off(xy, gw, gh):
+    """C6: [p, 2] offsets (in cells) from the centre of the producer's local-patch centre cell."""
+    cell = np.stack([np.clip(np.floor(xy[:, 0] / V3.CELL), 0, gw - 1), np.clip(np.floor(xy[:, 1] / V3.CELL), 0, gh - 1)],
+                    1)
+    return _clamp((xy - V3.CELL * cell - V3.CELL / 2) / V3.CELL)
+
+
+def _grid(P):
+    g = np.nan_to_num(P[0, [_PC['grid_w'], _PC['grid_h']]].astype(np.float64), nan=1.0)
+    return int(np.clip(g[0], 1, V3.CANVAS_W)), int(np.clip(g[1], 1, V3.CANVAS_H))
+
+
 def decode_frame(buf, visible_schema, nbytes=None):
-    """A record's v3 frame -> DecodedFrame (see the module doc). ValueError on a frame this decoder must not read."""
+    """A record's v3 frame -> DecodedFrame (see the module doc). VisibleV3Fatal on a frame this decoder must not read."""
     f = split_frame(buf, visible_schema, nbytes)
     P, E, N, S = f['P'], f['E'], f['N'], f['S']
-    # the main body (batch 4): P row 0, body_role 1, position_known 1
-    if int(P[0, _PC['body_role']]) != V3.BODY_ROLE['main'] or int(P[0, _PC['position_known']]) != 1:
-        raise ValueError('v3_input: P row 0 is not the controlled body with a position (schema_v3 batch 4)')
     main = P[0, [_PC['x'], _PC['y']]].astype(np.float64)
     known = P[:, _PC['position_known']] == 1
     out = DecodedFrame()
     out['main_xy'] = main.astype(np.float32)
+    out['nonfinite'] = _nonfinite(f)
     out['room'] = room_channels(f['canvas'])
-    out['room_xy'] = (_ROOM_CENTRES / POS_SCALE).astype(np.float32)   # (the P / E positions' scale)
+    out['room_xy'] = (_ROOM_CENTRES / POS_SCALE).astype(np.float32)
     out['room_rel'] = _rel(_ROOM_CENTRES, main)
     out['map_bits'], out['map_icon'] = minimap(f['minimap'])
     # bodies
     out['P_num'], out['P_flag'], out['P_cat'] = _num(P, PLAN['P']), _flags(P, PLAN['P']), _cats(P, PLAN['P'])
     xy = P[:, [_PC['x'], _PC['y']]].astype(np.float64)
-    gw, gh = int(P[0, _PC['grid_w']]), int(P[0, _PC['grid_h']])
-    cell = np.stack([np.clip(np.floor(xy[:, 0] / V3.CELL), 0, gw - 1), np.clip(np.floor(xy[:, 1] / V3.CELL), 0, gh - 1)], 1)
-    out['P_cell'] = np.where(known[:, None], _clamp((xy - V3.CELL * cell - V3.CELL / 2) / V3.CELL), 0).astype(np.float32)
+    gw, gh = _grid(P)
+    out['P_off'] = np.where(known[:, None], _off(xy, gw, gh), 0).astype(np.float32)
     out['P_rel'] = np.where(known[:, None], _rel(xy, main), 0).astype(np.float32)
     out['P_rel_valid'] = known.astype(np.float32)
     out['local'] = room_channels(f['local'])
@@ -257,7 +376,8 @@ def decode_frame(buf, visible_schema, nbytes=None):
 
 
 def decode_rows(rows):
-    """ROW records -> [DecodedFrame], each row's visible_schema checked on its own (decode_row)."""
+    """ROW records -> [DecodedFrame], each row's visible_schema checked on its own (decode_row); one bad row fails the
+    whole call."""
     return [decode_row(rows[i:i + 1]) for i in range(len(rows))]
 
 
@@ -268,19 +388,101 @@ def decode_row(row):
     return decode_frame(buf.tobytes(), np.asarray(row['visible_schema']).reshape(-1)[0], n)
 
 
-# ----------------------------------------------------------------------------------------------- the device side
-# The same decode in torch (the learner decodes the frame bytes on its own device; contract C7: one decode, two
-# implementations that give the same values -- tests/test_v3_input.py asserts it value for value on the golden frames
-# and on frames with out-of-range codes). The header is read on the host (split_frame: the same checks); everything
-# after it runs in torch on `device`. Every categorical rule mirrors schema_v3's scalar function named beside it.
+# ----------------------------------------------------------------------------------------------- device (torch)
+# The same decode in torch, rule for rule (each t_* function mirrors the n_* one above). The header is read on the host
+# (split_frame: the same checks); everything after it runs in torch on `device`.
 def _t():
     import torch
     return torch
 
 
-def _t_bits(w, layout):
+def _t_sane(v):
     torch = _t()
-    w = w.to(torch.int64)
+    v = v.to(torch.float64)
+    bad = ~torch.isfinite(v)
+    return torch.where(bad, torch.zeros_like(v), torch.clamp(v, -CODE_CUT, CODE_CUT)), bad
+
+
+def _t_trunc(v):
+    torch = _t()
+    return torch.trunc(v).to(torch.int64)
+
+
+def t_cat_index(ns, code, bad):
+    torch = _t()
+    base, size = V3.CAT_NS[ns]
+    c = _t_trunc(code)
+    row = torch.where(c == 0, torch.zeros_like(c), base + torch.clamp(c, max=size - 1))
+    return torch.where(bad | (code < 0), torch.full_like(c, base + size - 1), row)
+
+
+def t_price_code(v, bad):
+    torch = _t()
+    size = V3.CAT_NS['price'][1]
+    c = _t_trunc(v)
+    out = torch.full_like(c, size - 1)
+    out = torch.where(c == 0, torch.zeros_like(c), out)
+    out = torch.where((c >= 1) & (c <= 99), c, out)
+    for raw, code in V3.PRICE_CODES.items():
+        out = torch.where(c == raw, torch.full_like(c, code), out)
+    return torch.where(bad, torch.full_like(c, size - 1), out).to(torch.float64)
+
+
+def t_direction_code(v, bad):
+    torch = _t()
+    size = V3.CAT_NS['direction'][1]
+    c = _t_trunc(v)
+    return torch.where(bad | (v < -1) | (v > 3), torch.full_like(c, size - 1), c + 2).to(torch.float64)
+
+
+_T_FROM_RAW = {'price': t_price_code, 'direction': t_direction_code}
+
+
+def t_wire_cat_index(ns, wire):
+    v, bad = _t_sane(wire)
+    f = _T_FROM_RAW.get(ns)
+    if f is None and ns in V3.CAT_FROM_RAW:
+        raise KeyError(f'v3_input: no tensor form of schema_v3.CAT_FROM_RAW[{ns!r}]')
+    if f is not None:
+        return t_cat_index(ns, f(v, bad), _t().zeros_like(bad))
+    return t_cat_index(ns, v, bad)
+
+
+def t_identity_index(wire):
+    torch = _t()
+    v, bad = _t_sane(wire)
+    c = _t_trunc(v)
+    return torch.where(bad | (v < 0) | (v >= V3.IDENTITY_UNKNOWN), torch.full_like(c, V3.IDENTITY_UNKNOWN), c)
+
+
+def t_item_index(base, size, wire):
+    torch = _t()
+    v, bad = _t_sane(wire)
+    c = _t_trunc(v)
+    base = torch.as_tensor(base, dtype=torch.int64, device=v.device)
+    size = torch.as_tensor(size, dtype=torch.int64, device=v.device)
+    unk = torch.full_like(c, V3.ITEM_UNKNOWN)
+    row = torch.where((c > 0) & (c < size), base + c, unk)
+    row = torch.where(c == 0, torch.zeros_like(c), row)
+    return torch.where(bad | (size == 0), unk, row)
+
+
+def t_map_icon_index(wire):
+    torch = _t()
+    v, bad = _t_sane(wire)
+    c = _t_trunc(v)
+    return torch.where(bad | (v < 0), torch.full_like(c, V3.MAP_ICONS - 1), torch.clamp(c, max=V3.MAP_ICONS - 1))
+
+
+def _t_words(w):
+    torch = _t()
+    w = w.to(torch.float64)
+    return torch.where(torch.isfinite(w), torch.clamp(w, 0, CODE_CUT), torch.zeros_like(w)).to(torch.int64)
+
+
+def _t_bits(words, layout):
+    torch = _t()
+    w = _t_words(words)
     out, shift = [], 0
     for _name, bits in layout:
         out.append((w >> shift) & ((1 << bits) - 1))
@@ -288,97 +490,22 @@ def _t_bits(w, layout):
     return torch.stack(out, -1).to(torch.float32)
 
 
-def _t_trunc(v):
+def _t_fin0(x):
     torch = _t()
-    return torch.trunc(torch.nan_to_num(v.to(torch.float64), nan=0.0)).to(torch.int64)
-
-
-def t_cat_index(ns, code):
-    """schema_v3.cat_index on a tensor of codes."""
-    torch = _t()
-    base, size = V3.CAT_NS[ns]
-    code = code.to(torch.float64)
-    bad = torch.isnan(code) | (code < 0)
-    c = _t_trunc(code)
-    row = torch.where(c == 0, torch.zeros_like(c), base + torch.clamp(c, max=size - 1))
-    return torch.where(bad, torch.full_like(c, base + size - 1), row)
-
-
-def t_price_code(v):
-    """schema_v3.price_code on a tensor."""
-    torch = _t()
-    size = V3.CAT_NS['price'][1]
-    v = v.to(torch.float64)
-    c = _t_trunc(v)
-    out = torch.full_like(c, size - 1)
-    out = torch.where(c == 0, torch.zeros_like(c), out)
-    out = torch.where((c >= 1) & (c <= 99), c, out)
-    for raw, code in V3.PRICE_CODES.items():
-        out = torch.where(c == raw, torch.full_like(c, code), out)
-    return torch.where(torch.isnan(v), torch.full_like(c, size - 1), out)
-
-
-def t_direction_code(v):
-    """schema_v3.direction_code on a tensor."""
-    torch = _t()
-    size = V3.CAT_NS['direction'][1]
-    v = v.to(torch.float64)
-    bad = torch.isnan(v) | (v < -1) | (v > 3)
-    return torch.where(bad, torch.full_like(_t_trunc(v), size - 1), _t_trunc(v) + 2)
-
-
-_T_FROM_RAW = {'price': t_price_code, 'direction': t_direction_code}
-
-
-def t_wire_cat_index(ns, wire):
-    """schema_v3.wire_cat_index on a tensor (the batch-4 raw columns coded first)."""
-    f = _T_FROM_RAW.get(ns)
-    if f is None and ns in V3.CAT_FROM_RAW:
-        raise KeyError(f'v3_input: no tensor form of schema_v3.CAT_FROM_RAW[{ns!r}]')
-    return t_cat_index(ns, f(wire) if f else wire)
-
-
-def t_identity_index(v):
-    """schema_v3.identity_index on a tensor."""
-    torch = _t()
-    v = v.to(torch.float64)
-    bad = torch.isnan(v) | (v < 0) | (v >= V3.IDENTITY_UNKNOWN)
-    return torch.where(bad, torch.full_like(_t_trunc(v), V3.IDENTITY_UNKNOWN), _t_trunc(v))
-
-
-def t_item_index(base, size, v):
-    """schema_v3.item_index with the namespace's (base, size) as tensors or ints (size 0: no namespace -> unknown)."""
-    torch = _t()
-    v = v.to(torch.float64)
-    c = _t_trunc(v)
-    base = torch.as_tensor(base, dtype=torch.int64, device=v.device)
-    size = torch.as_tensor(size, dtype=torch.int64, device=v.device)
-    unk = torch.full_like(c, V3.ITEM_UNKNOWN)
-    row = torch.where((c > 0) & (c < size), base + c, unk)
-    row = torch.where(c == 0, torch.zeros_like(c), row)
-    return torch.where(torch.isnan(v) | (size == 0), unk, row)
-
-
-def t_map_icon_index(v):
-    """schema_v3.map_icon_index on a tensor."""
-    torch = _t()
-    v = v.to(torch.float64)
-    bad = torch.isnan(v) | (v < 0)
-    return torch.where(bad, torch.full_like(_t_trunc(v), V3.MAP_ICONS - 1),
-                       torch.clamp(_t_trunc(v), max=V3.MAP_ICONS - 1))
+    return torch.where(torch.isfinite(x), x, torch.zeros_like(x)).to(torch.float32)
 
 
 def _t_room(cells):
     torch = _t()
     ch = torch.cat([_t_bits(cells[..., 0], V3.ROOM_W0), _t_bits(cells[..., 1], V3.ROOM_W1),
-                    cells[..., 2:5].to(torch.float32)], -1)
+                    _t_fin0(cells[..., 2:5])], -1)
     return ch / torch.as_tensor(_ROOM_DIV, device=cells.device)
 
 
 def _t_flags(x, plan):
     torch = _t()
     n = x.shape[0]
-    parts = [x[:, plan['known']], x[:, plan['bit']]]
+    parts = [_t_fin0(x[:, plan['known']]), _t_fin0(x[:, plan['bit']])]
     if plan['bits8']:
         parts.append(_t_bits(x[:, plan['bits8']], (('b', 1),) * W8).reshape(n, W8 * len(plan['bits8'])))
     if plan['word16']:
@@ -386,36 +513,43 @@ def _t_flags(x, plan):
     return torch.cat([q.to(torch.float32) for q in parts], 1)
 
 
+def _t_clamp(v):
+    torch = _t()
+    return torch.clamp(torch.nan_to_num(v, nan=0.0, posinf=CLAMP, neginf=-CLAMP), -CLAMP, CLAMP).to(torch.float32)
+
+
 def _t_num(x, plan):
     torch = _t()
-    v = x[:, plan['num']] / torch.as_tensor(plan['scale'], device=x.device)
-    return torch.clamp(torch.nan_to_num(v, nan=0.0, posinf=CLAMP, neginf=-CLAMP), -CLAMP, CLAMP)
+    return _t_clamp(x[:, plan['num']] / torch.as_tensor(plan['scale'], device=x.device))
+
+
+def _t_stack(cols, n, device):
+    torch = _t()
+    return torch.stack(cols, 1) if cols else torch.zeros((n, 0), dtype=torch.int64, device=device)
 
 
 def _t_cats(x, plan):
+    return _t_stack([t_wire_cat_index(ns, x[:, c]) for c, ns in zip(plan['cat'], plan['cat_ns'])], x.shape[0], x.device)
+
+
+def _t_family_ns(family):
     torch = _t()
-    cols = [t_wire_cat_index(ns, x[:, c]) for c, ns in zip(plan['cat'], plan['cat_ns'])]
-    return torch.stack(cols, 1) if cols else torch.zeros((x.shape[0], 0), dtype=torch.int64, device=x.device)
+    v, bad = _t_sane(family)
+    fam = _t_trunc(v)
+    base, size = torch.zeros_like(fam), torch.zeros_like(fam)
+    for k, (b_, s_) in _FAMILY_NS:
+        hit = (fam == k) & ~bad
+        base = torch.where(hit, torch.full_like(fam, b_), base)
+        size = torch.where(hit, torch.full_like(fam, s_), size)
+    return base, size
 
 
 def _t_items(x, plan, family=None):
-    torch = _t()
     cols = []
     for c, ns in zip(plan['item'], plan['item_ns']):
-        if ns == 'by_family':
-            fam = _t_trunc(family)
-            base = torch.zeros_like(fam)
-            size = torch.zeros_like(fam)
-            for k, fns in V3.FAMILY_ITEM_NS.items():
-                b_, s_ = V3.ITEM_NS[fns]
-                hit = (fam == k) & ~torch.isnan(family.to(torch.float64))
-                base = torch.where(hit, torch.full_like(fam, b_), base)
-                size = torch.where(hit, torch.full_like(fam, s_), size)
-            cols.append(t_item_index(base, size, x[:, c]))
-        else:
-            b_, s_ = V3.ITEM_NS[ns]
-            cols.append(t_item_index(b_, s_, x[:, c]))
-    return torch.stack(cols, 1) if cols else torch.zeros((x.shape[0], 0), dtype=torch.int64, device=x.device)
+        base, size = _t_family_ns(family) if ns == 'by_family' else V3.ITEM_NS[ns]
+        cols.append(t_item_index(base, size, x[:, c]))
+    return _t_stack(cols, x.shape[0], x.device)
 
 
 def _t_rel(xy, main):
@@ -428,38 +562,34 @@ def _t_rel(xy, main):
 def decode_frame_torch(buf, visible_schema, nbytes=None, device='cpu'):
     """decode_frame on `device` in torch: the same keys, the same values (float32 / int64 / bool tensors)."""
     torch = _t()
-    f = {k: torch.as_tensor(np.array(v), device=device) for k, v in
-         split_frame(buf, visible_schema, nbytes).items()}
+    host = split_frame(buf, visible_schema, nbytes)
+    nonfinite = _nonfinite(host)
+    f = {k: torch.as_tensor(np.array(v), device=device) for k, v in host.items()}
     P, E, N, S = f['P'], f['E'], f['N'], f['S']
-    if int(P[0, _PC['body_role']]) != V3.BODY_ROLE['main'] or int(P[0, _PC['position_known']]) != 1:
-        raise ValueError('v3_input: P row 0 is not the controlled body with a position (schema_v3 batch 4)')
     main = P[0, [_PC['x'], _PC['y']]].to(torch.float64)
     known = P[:, _PC['position_known']] == 1
     centres = torch.as_tensor(_ROOM_CENTRES, device=device)
-    out = {'main_xy': main.to(torch.float32), 'room': _t_room(f['canvas']),
-           'room_xy': (centres / POS_SCALE).to(torch.float32), 'room_rel': _t_rel(centres, main)}
+    out = {'main_xy': main.to(torch.float32), 'nonfinite': torch.as_tensor(nonfinite, device=device),
+           'room': _t_room(f['canvas']), 'room_xy': (centres / POS_SCALE).to(torch.float32),
+           'room_rel': _t_rel(centres, main)}
     mb = _t_bits(f['minimap'], V3.MAP_BITS)
     out['map_bits'], out['map_icon'] = mb[:, :4], t_map_icon_index(mb[:, 4])
     out['P_num'], out['P_flag'], out['P_cat'] = _t_num(P, PLAN['P']), _t_flags(P, PLAN['P']), _t_cats(P, PLAN['P'])
     xy = P[:, [_PC['x'], _PC['y']]].to(torch.float64)
-    gw, gh = int(P[0, _PC['grid_w']]), int(P[0, _PC['grid_h']])
+    gw, gh = _grid(host['P'])
     cell = torch.stack([torch.clamp(torch.floor(xy[:, 0] / V3.CELL), 0, gw - 1),
                         torch.clamp(torch.floor(xy[:, 1] / V3.CELL), 0, gh - 1)], 1)
     off = _t_clamp((xy - V3.CELL * cell - V3.CELL / 2) / V3.CELL)
-    out['P_cell'] = torch.where(known[:, None], off, torch.zeros_like(off))
+    out['P_off'] = torch.where(known[:, None], off, torch.zeros_like(off))
     rel = _t_rel(xy, main)
     out['P_rel'] = torch.where(known[:, None], rel, torch.zeros_like(rel))
     out['P_rel_valid'] = known.to(torch.float32)
     out['local'] = _t_room(f['local'])
     out['local_pad'] = ~known
     out['E_num'], out['E_flag'], out['E_cat'] = _t_num(E, PLAN['E']), _t_flags(E, PLAN['E']), _t_cats(E, PLAN['E'])
-    if PLAN['E']['idn']:
-        out['E_id'] = torch.stack([t_identity_index(E[:, c]) for c in PLAN['E']['idn']], 1)
-    else:
-        out['E_id'] = torch.zeros((E.shape[0], 0), dtype=torch.int64, device=device)
-    a = E[:, PLAN['E']['anim']]
-    ok = ~torch.isnan(a) & (a >= 0) & (a < V3.ANIM_ROWS)
-    out['E_anim'] = torch.where(ok, _t_trunc(a), torch.zeros_like(_t_trunc(a)))
+    out['E_id'] = _t_stack([t_identity_index(E[:, c]) for c in PLAN['E']['idn']], E.shape[0], device)
+    v, bad = _t_sane(E[:, PLAN['E']['anim']])
+    out['E_anim'] = torch.where(~bad & (v >= 0) & (v < V3.ANIM_ROWS), _t_trunc(v), torch.zeros_like(_t_trunc(v)))
     pr = E[:, _EC['price']]
     out['E_price'] = _t_clamp(torch.where(pr > 0, pr / PRICE_COIN_SCALE, torch.zeros_like(pr)))[:, None]
     out['E_rel'] = _t_rel(E[:, [_EC['x'], _EC['y']]], main)
@@ -473,7 +603,8 @@ def decode_frame_torch(buf, visible_schema, nbytes=None, device='cpu'):
 
 # ----------------------------------------------------------------------------------------------- batches (actor)
 E_BUCKETS = (16, 32, 64, 128)
-P_MAX = 4   # bodies per frame at most in the padded layout (AB+ single player: 1-2)
+P_MAX = 4   # the actor's padded layout: bodies per frame (AB+ single player: 1-2); a frame with more is refused here
+#            (the wire allows schema_v3.CAP_BODY; this is the first arm's graph shape, not a wire limit)
 
 
 def bucket(n, buckets):
@@ -483,9 +614,13 @@ def bucket(n, buckets):
     raise ValueError(f'v3_input: {n} past the largest bucket {buckets[-1]}')
 
 
+_PAD_TRUE = ('local_pad',)   # (a padded body row is pad: its local patch too)
+
+
 def pad_batch(frames, e_bucket=None, n_max=None, s_max=None):
     """[DecodedFrame] -> dict of arrays [B, max, ...] with masks *_mask (True = a real token). e padded to its bucket
-    (E_BUCKETS), bodies to P_MAX; n / s to the batch maximum unless given (their buckets wait for V4)."""
+    (E_BUCKETS), bodies to P_MAX; n / s to the batch maximum unless given (their buckets wait for V4); a padded body's
+    local_pad is True."""
     B = len(frames)
     e_bucket = e_bucket or bucket(max([len(f['E_num']) for f in frames] + [1]), E_BUCKETS)
     n_max = n_max or max([len(f['N_num']) for f in frames] + [1])
@@ -496,7 +631,7 @@ def pad_batch(frames, e_bucket=None, n_max=None, s_max=None):
         group = 'local' if k.startswith('local') else k.split('_')[0]
         if group in sizes:
             m = sizes[group]
-            a = np.zeros((B, m) + v.shape[1:], v.dtype)
+            a = np.full((B, m) + v.shape[1:], k in _PAD_TRUE, v.dtype)
             for i, f in enumerate(frames):
                 if len(f[k]) > m:
                     raise ValueError(f'v3_input: {k} has {len(f[k])} rows, the padded layout {m}')
