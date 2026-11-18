@@ -1470,15 +1470,19 @@ class TokPolicy(nn.Module):
         return self._heads(x[:, 0], need_h, mem, x[:, -1] if G else None, need_vg, tctx)
 
     def _forward_v3(self, b, need_h, mem, need_vg, temporal):
-        """forward() of frame='v3' (seq-v1 step 2): the frame encoder's tokens of b['v3'] (frame_v3.v3_tensors of a
-        v3_input.pad_batch), the controlled body's token (0) and the global token (last) after its blocks, then the
+        """forward() of frame='v3' (seq-v1 step 2): the frame encoder's tokens of the batch's v3 tensors ('v3.<name>',
+        v3_input.put_batch: v3_input.pad_batch's layout), the controlled body's token (0) and the global token (last) after its blocks, then the
         heads exactly as T1 (_heads -> _heads_temporal with a temporal context; no feedback token). The ROW fields the
         temporal step and the action gate read (first, map, events, stage; bombs, player column 22, pinv) still come
         from b; no ROW observation field enters the encoder."""
         tctx = None
         if temporal is not None and self.tatt is not None:
             tctx, _hist = self._temporal_in(b, temporal)   # (feedback 0: no history token)
-        x, _pad, g = self.frame_v3(b['v3'], b['pending'], self.gtok.tok)
+        from .v3_input import get_batch
+        v3 = get_batch(b)
+        if not v3:
+            raise ValueError('TokPolicy(frame=v3): a batch without v3 tensors (records without a v3 frame)')
+        x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
         return self._heads(x[:, 0], need_h, mem, x[:, g], need_vg, tctx)
 
     def _block_packed_readout(self, xp, starts):
@@ -1838,9 +1842,8 @@ def to_batch(rows, pending, device):
     if np.any(rows['visible_schema']):
         from .schema_v3 import VERSION as V3_VERSION
         if np.any(rows['visible_schema'] == V3_VERSION):   # (seq-v1: v3 frames, every record's checked: v3_input)
-            from .v3_input import batch_from_rows
-            b['v3'] = batch_from_rows(rows, device)
-            return b
+            from .v3_input import batch_from_rows, put_batch
+            return put_batch(b, batch_from_rows(rows, device))
         from .structured_input import from_rows
         b.update(from_rows(rows,device))
     return b
@@ -2109,10 +2112,9 @@ def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True, co
     if visible and (counts is not None or bool(versions.any())):
         from .schema_v3 import VERSION as V3_VERSION
         if counts is None and bool((versions == V3_VERSION).any()):   # (seq-v1: v3 frames; every record checked)
-            from .v3_input import batch_from_raw
-            b['v3'] = batch_from_raw(raw, ROW.fields['visible_frame'][1], ROW.fields['visible_schema'][1],
-                                     ROW.fields['visible_bytes'][1])
-            return b
+            from .v3_input import batch_from_raw, put_batch
+            return put_batch(b, batch_from_raw(raw, ROW.fields['visible_frame'][1], ROW.fields['visible_schema'][1],
+                                               ROW.fields['visible_bytes'][1]))
         from .structured_input import decode_frame, FRAME_BYTES
         off=ROW.fields['visible_frame'][1]
         sz=ROW.fields['visible_bytes'][1]
@@ -2383,12 +2385,13 @@ class GraphActor:
         fn = core if not compile_mode else torch.compile(core, mode=compile_mode, dynamic=False)
 
         def v3in(b, raw, tokens, r):
-            """(seq-v1 step 3) b['v3'] from the records' frame bytes and the staged counts, on the device."""
+            """(seq-v1 step 3) the v3 tensors ('v3.<name>', v3_input.put_batch) from the records' frame bytes and
+            the staged counts, on the device."""
             if self.v3:
                 fa = self.v3_frame_at
                 frames = raw[:, fa:fa + self.VI.V3.FRAME_BYTES].view(torch.float32)
-                b['v3'] = self.VI.decode_frames_device(frames, self.v3_counts[:r], tokens, self.VI.N_MAX_V3,
-                                                       self.VI.S_MAX_V3, check=False)
+                self.VI.put_batch(b, self.VI.decode_frames_device(frames, self.v3_counts[:r], tokens, self.VI.N_MAX_V3,
+                                                                  self.VI.S_MAX_V3, check=False))
             return b
 
         def run(tokens, r=None):

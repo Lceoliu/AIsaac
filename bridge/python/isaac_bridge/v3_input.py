@@ -837,6 +837,24 @@ def rows_counts(rows, stats=True):
     return counts, eb
 
 
+V3_PREFIX = 'v3.'
+
+
+def put_batch(b, d):
+    """The decoded v3 tensors into a batch dict as top-level keys 'v3.<name>' (184, 2026-11-18: a nested dict b['v3']
+    broke the learner's per-key row selection, tok_policy.take -- every per-key index / slice of a batch now covers the
+    v3 tensors too, each with the records on its first axis). Returns b."""
+    for k, v in d.items():
+        b[V3_PREFIX + k] = v
+    return b
+
+
+def get_batch(b):
+    """The v3 tensors of a batch dict (put_batch's keys) as a dict by name; {} when it has none."""
+    n = len(V3_PREFIX)
+    return {k[n:]: v for k, v in b.items() if k.startswith(V3_PREFIX)}
+
+
 def batch_from_rows(rows, device, stats=False):
     """ROW records (numpy) -> the padded v3 batch on `device` (decode_frames_device)."""
     import torch

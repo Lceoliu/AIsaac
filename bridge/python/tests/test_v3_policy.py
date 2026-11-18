@@ -45,7 +45,7 @@ def batch(names, seed=0):
     pend = np.stack([rng.integers(0, k, len(names)) for k in m.heads], 1).astype(np.int64)
     b = TP.to_batch(rows, pend, 'cpu')
     frames = [VI.decode_frame((FIX / f'{n}.v3.bin').read_bytes(), V3.VERSION) for n in names]
-    b['v3'] = v3_tensors(VI.pad_batch(frames), 'cpu')
+    VI.put_batch(b, v3_tensors(VI.pad_batch(frames), 'cpu'))
     return b
 
 
@@ -97,20 +97,21 @@ def test_no_row_observation_field_enters():
     for b in full:
         b['first'][:] = 0
     full[0]['first'][:] = 1
-    minimal = [{k: b[k] for k in ('v3', 'pending') + TEMPORAL_FIELDS} for b in full]
+    keep = lambda k: k.startswith(VI.V3_PREFIX) or k in ('pending',) + TEMPORAL_FIELDS   # noqa: E731
+    minimal = [{k: v for k, v in b.items() if keep(k)} for b in full]
     g = torch.Generator().manual_seed(9)
     noisy = []
     for b in full:
         c = {}
         for k, v in b.items():
-            if k in ('v3', 'pending') + TEMPORAL_FIELDS or not torch.is_tensor(v):
+            if keep(k) or not torch.is_tensor(v):
                 c[k] = v
             elif v.is_floating_point():
                 c[k] = torch.randn(v.shape, generator=g).to(v.dtype)
             else:
                 c[k] = torch.randint(0, 7, v.shape, generator=g).to(v.dtype)
         noisy.append(c)
-    assert {str(v.dtype) for k, v in full[0].items() if torch.is_tensor(v) and k not in ('v3',)} >= {'torch.int16'}
+    assert {str(v.dtype) for k, v in full[0].items() if torch.is_tensor(v) and not keep(k)} >= {'torch.int16'}
     ref, _ = _two_steps(m, minimal)
     got, _ = _two_steps(m, noisy)
     for r_, g_ in zip(ref, got):
@@ -127,7 +128,8 @@ def test_rooms_0_makes_no_room_and_ignores_the_room_fields():
     full = [batch(NAMES[:4], seed=s_) for s_ in (0, 1)]
     full[0]['first'][:] = 1
     full[1]['first'][:] = 0
-    base = [{k: b[k] for k in ('v3', 'pending') + TEMPORAL_FIELDS} for b in full]
+    base = [{k: v for k, v in b.items() if k.startswith(VI.V3_PREFIX) or k in ('pending',) + TEMPORAL_FIELDS}
+            for b in full]
     moved = [dict(b) for b in base]
     mp = base[1]['map'].clone()
     mp[:, 3] = torch.roll(mp[:, 3], 1, dims=-1)   # (the current room moves)
@@ -148,7 +150,7 @@ def test_padding_contents_never_reach_the_real_tokens():
     b = batch(NAMES[:3])
     ref = step(m, b)
     for junk in ('finite', 'nan', 'ids'):
-        v = {k: t.clone() for k, t in b['v3'].items()}
+        v = {k: t.clone() for k, t in VI.get_batch(b).items()}
         for g_ in ('P', 'E', 'N', 'S'):
             pad = ~v[g_ + '_mask']
             for k in [k for k in v if k.startswith(g_ + '_') and k != g_ + '_mask']:
@@ -163,7 +165,7 @@ def test_padding_contents_never_reach_the_real_tokens():
                     t[pad] = 3.25
         pl = ~v['P_mask']
         v['local'][pl] = float('nan') if junk == 'nan' else 2.5
-        got = step(m, dict(b, v3=v))
+        got = step(m, VI.put_batch(dict(b), v))
         for a, b_ in zip(ref, got):
             assert torch.isfinite(b_).all() and torch.equal(a, b_), junk
 
@@ -228,7 +230,7 @@ def test_records_carry_their_frames_to_the_model():
     frames = [VI.decode_frame((FIX / f'{n}.v3.bin').read_bytes(), V3.VERSION) for n in names]
     eb = VI.bucket(max(len(f['E_num']) for f in frames), VI.E_BUCKETS)
     ref = VI.pad_batch(frames, e_bucket=eb, n_max=VI.N_MAX_V3, s_max=VI.S_MAX_V3)
-    for got in (b['v3'], d['v3']):
+    for got in (VI.get_batch(b), VI.get_batch(d)):
         for k in ref:
             assert torch.equal(got[k], torch.as_tensor(ref[k])), k
     m = build()
@@ -276,3 +278,25 @@ def test_graph_actor_v3_equals_the_eager_step(fold):
         assert np.array_equal(actor.t_out['steps'], td['out']['steps'].cpu().numpy())
     assert VI.STATS['calls'] - before['calls'] >= 4
     assert sum(VI.STATS[f'bucket{b}'] - before[f'bucket{b}'] for b in VI.E_BUCKETS) >= 4
+
+
+def test_take_selects_the_v3_rows_too():
+    """(184, 2026-11-18: the learner's minibatch selection, tok_policy.take, met a nested b['v3'] -- KeyError at the
+    first update.) The v3 tensors are top-level batch keys: take() picks their rows like any field's, and the model
+    on the taken batch equals the model on a batch built from those records alone."""
+    m = build()
+    b = batch(NAMES[:6])
+    idx = torch.tensor([4, 1, 3])
+    t = TP.take(b, idx)
+    v, vt = VI.get_batch(b), VI.get_batch(t)
+    assert set(v) == set(vt) and v
+    for k in v:
+        assert torch.equal(vt[k], v[k][idx]), k
+    with torch.no_grad():
+        a = m(t, need_vg=True)
+        c = m(TP.take(b, torch.arange(6)), need_vg=True)
+    for x, y in zip(a, c):
+        if torch.is_tensor(x):
+            assert torch.allclose(x, y[idx], atol=1e-5), 'row-selected batch differs'
+    with pytest.raises(ValueError, match='without v3 tensors'):
+        m({k: v_ for k, v_ in b.items() if not k.startswith(VI.V3_PREFIX)}, need_vg=True)

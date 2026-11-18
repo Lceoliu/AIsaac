@@ -171,8 +171,8 @@ def probe(pt, paths, n=2048, seed=0, fresh=True):
     b = TP.to_batch(rows, pend, 'cpu')
     out = {}
     with torch.no_grad():
-        x, pad, g = m.frame_v3.tokens(b['v3'], b['pending'], m.gtok.tok)
-        v = b['v3']
+        v = VI.get_batch(b)
+        x, pad, g = m.frame_v3.tokens(v, b['pending'], m.gtok.tok)
         kinds = [('P', v['P_mask'].shape[1]), ('L', v['P_mask'].shape[1]), ('E', v['E_mask'].shape[1]),
                  ('N', v['N_mask'].shape[1]), ('S', v['S_mask'].shape[1]), ('R', VI.R_ROWS * VI.R_COLS), ('M', 1),
                  ('G', 1)]
@@ -183,7 +183,7 @@ def probe(pt, paths, n=2048, seed=0, fresh=True):
             out[f'tokens {k}'] = dict(n=int(real.sum()), std=float(v.std()) if v.numel() > 1 else float('nan'),
                                       absmax=float(v.abs().max()) if v.numel() else float('nan'))
             at += w
-        y, _pad, g = m.frame_v3(b['v3'], b['pending'], m.gtok.tok)
+        y, _pad, g = m.frame_v3(v, b['pending'], m.gtok.tok)
         for k, v in (('out P0', y[:, 0]), ('out G', y[:, g])):
             out[k] = dict(n=int(v.shape[0]), std=float(v.std()), absmax=float(v.abs().max()))
         logits, value, _danger, vg = m(b, need_vg=True)
