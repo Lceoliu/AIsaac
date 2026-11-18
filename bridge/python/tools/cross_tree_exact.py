@@ -15,6 +15,10 @@ Two parts:
   compare  python3 cross_tree_exact.py compare <out A> <out B> (every payload, every ROW, every digest; the first
            differences; numpy for the item / pill step counts), or by the CPU runner:
            PROBE=<this file> cpurun.sh <tree> <name> --compare <out A> <out B>
+  analyze  PROBE=<this file> cpurun.sh <tree> <name> --analyze <out A> <out B>: part by part (see analyze()): two
+           launches of the same tree differ in the payload bytes in two places that are not the tree's doing -- the
+           header's logic_frames (a process-wide counter) and the terrain block's JSON text (Lua's string hash seed
+           orders the keys); every other part byte for byte, those two as increments / parsed values
 """
 import hashlib
 import json
@@ -179,7 +183,101 @@ def compare(a, b):
     return 0 if res['ok'] else 1
 
 
+def sections(payload, sizes):
+    """A mode-0 lean payload cut into its parts (abplus_lean.LeanDecoder's layout): {name: bytes}; the terrain block's two
+    JSON texts apart (json.encode of Lua tables: the key order follows the process's string hash seed, so the text may
+    differ between two launches of the same tree while the values are the same)."""
+    import struct
+    out = {'magic': payload[0:4], 'logic_frames': payload[4:8], 'header_rest': payload[8:16]}
+    flags, n_players, n_doors, n_lasers = payload[12], payload[13], payload[14], payload[15]
+    off = 16
+    for name, size in (('room', 48), ('totals', 32), ('players', sizes['player'] * n_players),
+                       ('doors', sizes['door'] * n_doors)):
+        out[name] = payload[off:off + size]
+        off += size
+    n = struct.unpack_from('<H', payload, off)[0]
+    out['entities'] = payload[off:off + 2 + sizes['entity'] * n]
+    off += 2 + sizes['entity'] * n
+    start = off
+    for _ in range(n_lasers):
+        k = struct.unpack_from('<q', payload, off + 57)[0]
+        off += 65 + 16 * k
+    out['lasers'] = payload[start:off]
+    if flags & 2:
+        version, n = struct.unpack_from('<II', payload, off)
+        n2 = struct.unpack_from('<I', payload, off + 8 + n)[0]
+        out['terrain_version'] = payload[off:off + 4]
+        out['terrain_json'] = (payload[off + 8:off + 8 + n], payload[off + 12 + n:off + 12 + n + n2])
+        off += 12 + n + n2
+    if flags & 8:
+        m = payload[off]
+        out['map'] = payload[off:off + 1 + sizes['map'] * m]
+        off += 1 + sizes['map'] * m
+    if flags & 16:
+        h = struct.unpack_from('<B', payload, off)[0]
+        out['inventory'] = payload[off:off + 18 + sizes['inv'] * h]
+        off += 18 + sizes['inv'] * h
+    out['rest'] = payload[off:]
+    return out
+
+
+def analyze(a, b):
+    """Part by part: every binary part byte for byte; the terrain JSON as text and as parsed values; logic_frames as its
+    step-to-step increments within an episode (a process-wide counter: its start differs between launches)."""
+    import struct
+    sys.path.insert(0, os.getcwd())
+    from isaac_bridge import abplus_lean as AL
+    sizes = dict(player=AL.PLAYER.itemsize, door=AL.DOOR.itemsize, entity=AL.ENTITY.itemsize,
+                 map=AL.MAP_ROOM.itemsize, inv=AL.INV_ITEM.itemsize)
+
+    def load(d):
+        lines = [json.loads(x) for x in open(os.path.join(d, 'index.jsonl'))]
+        return [x for x in lines[1:] if 't' in x], open(os.path.join(d, 'payloads.bin'), 'rb').read()
+    sa, pa = load(a)
+    sb, pb = load(b)
+    res = dict(steps=[len(sa), len(sb)], bytes_equal=0, parts={}, terrain_json_text_equal=0, terrain_json_value_equal=0,
+               terrain_blocks=0, logic_frames_increment_equal=0, first=[])
+    prev = None
+    for x, y in zip(sa, sb):
+        p1, p2 = pa[x['p_off']:x['p_off'] + x['p_len']], pb[y['p_off']:y['p_off'] + y['p_len']]
+        res['bytes_equal'] += p1 == p2
+        s1, s2 = sections(p1, sizes), sections(p2, sizes)
+        for k in set(s1) | set(s2):
+            if k in ('logic_frames', 'terrain_json'):
+                continue
+            st = res['parts'].setdefault(k, [0, 0])
+            st[0] += 1
+            if s1.get(k) == s2.get(k):
+                st[1] += 1
+            elif len(res['first']) < 10:
+                res['first'].append(dict(part=k, key=[x['seed'], x['items'], x['t']]))
+        if 'terrain_json' in s1 or 'terrain_json' in s2:
+            res['terrain_blocks'] += 1
+            t1, t2 = s1.get('terrain_json'), s2.get('terrain_json')
+            res['terrain_json_text_equal'] += t1 == t2
+            ok = t1 is not None and t2 is not None and all(json.loads(u) == json.loads(v) for u, v in zip(t1, t2))
+            res['terrain_json_value_equal'] += ok
+            if not ok and len(res['first']) < 10:
+                res['first'].append(dict(part='terrain_json values', key=[x['seed'], x['items'], x['t']]))
+        lf1, lf2 = struct.unpack('<I', s1['logic_frames'])[0], struct.unpack('<I', s2['logic_frames'])[0]
+        key = (x['seed'], x['items'])
+        if prev is not None and prev[0] == key:
+            res['logic_frames_increment_equal'] += (lf1 - prev[1]) == (lf2 - prev[2])
+        else:
+            res['logic_frames_increment_equal'] += 1   # (an episode's first payload: nothing to compare)
+        prev = (key, lf1, lf2)
+    n = len(sa)
+    res['ok'] = (len(sa) == len(sb) and all(v[0] == v[1] == n or (k not in ('magic', 'header_rest', 'room', 'totals',
+                 'players', 'doors', 'entities', 'lasers', 'rest') and v[0] == v[1]) for k, v in res['parts'].items())
+                 and res['terrain_json_value_equal'] == res['terrain_blocks'] and res['logic_frames_increment_equal'] == n)
+    print(json.dumps(res, indent=1))
+    return 0 if res['ok'] else 1
+
+
 if __name__ == '__main__':
+    if '--analyze' in sys.argv:   # (by the CPU runner: the tree's abplus_lean for the record sizes)
+        i = sys.argv.index('--analyze')
+        sys.exit(analyze(sys.argv[i + 1], sys.argv[i + 2]))
     if len(sys.argv) > 1 and sys.argv[1] == 'compare':
         sys.exit(compare(sys.argv[2], sys.argv[3]))
     if '--compare' in sys.argv:   # (by the CPU runner, where numpy is: the item / pill step counts need the sequence)
