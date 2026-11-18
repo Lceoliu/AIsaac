@@ -114,5 +114,5 @@ def test_a_malformed_frame_header_is_refused_when_written():
     f = np.frombuffer(frame, '<f4').copy()
     f[V3.H_VERSION] = 3   # (a batch 1-4 producer)
     o = al.LeanDecoder().decode(v3_payload(frame=f.tobytes()))
-    with pytest.raises(ValueError, match='frame version'):
+    with pytest.raises(VP.VisibleV3Fatal, match='frame version'):
         VP.write_v3(np.zeros(1, ROW), SimpleNamespace(visible=None, visible_v3_frame=o.visible_v3_frame))
