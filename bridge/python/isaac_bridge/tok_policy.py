@@ -1478,8 +1478,8 @@ class TokPolicy(nn.Module):
         tctx = None
         if temporal is not None and self.tatt is not None:
             tctx, _hist = self._temporal_in(b, temporal)   # (feedback 0: no history token)
-        from .v3_input import get_batch
-        v3 = get_batch(b)
+        from .v3_input import get_batch, materialize
+        v3 = materialize(get_batch(b))
         if not v3:
             raise ValueError('TokPolicy(frame=v3): a batch without v3 tensors (records without a v3 frame)')
         x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
@@ -2112,9 +2112,9 @@ def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True, co
     if visible and (counts is not None or bool(versions.any())):
         from .schema_v3 import VERSION as V3_VERSION
         if counts is None and bool((versions == V3_VERSION).any()):   # (seq-v1: v3 frames; every record checked)
-            from .v3_input import batch_from_raw, put_batch
-            return put_batch(b, batch_from_raw(raw, ROW.fields['visible_frame'][1], ROW.fields['visible_schema'][1],
-                                               ROW.fields['visible_bytes'][1]))
+            from .v3_input import lazy_from_raw, put_batch   # (decoded per forward: _forward_v3, materialize)
+            return put_batch(b, lazy_from_raw(raw, ROW.fields['visible_frame'][1], ROW.fields['visible_schema'][1],
+                                              ROW.fields['visible_bytes'][1]))
         from .structured_input import decode_frame, FRAME_BYTES
         off=ROW.fields['visible_frame'][1]
         sz=ROW.fields['visible_bytes'][1]

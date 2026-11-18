@@ -230,7 +230,8 @@ def test_records_carry_their_frames_to_the_model():
     frames = [VI.decode_frame((FIX / f'{n}.v3.bin').read_bytes(), V3.VERSION) for n in names]
     eb = VI.bucket(max(len(f['E_num']) for f in frames), VI.E_BUCKETS)
     ref = VI.pad_batch(frames, e_bucket=eb, n_max=VI.N_MAX_V3, s_max=VI.S_MAX_V3)
-    for got in (VI.get_batch(b), VI.get_batch(d)):
+    assert set(VI.get_batch(d)) == {'raw', 'counts'}   # (decode_rows: lazy, decoded by the forward that reads it)
+    for got in (VI.get_batch(b), VI.materialize(VI.get_batch(d))):
         for k in ref:
             assert torch.equal(got[k], torch.as_tensor(ref[k])), k
     m = build()
@@ -298,5 +299,21 @@ def test_take_selects_the_v3_rows_too():
     for x, y in zip(a, c):
         if torch.is_tensor(x):
             assert torch.allclose(x, y[idx], atol=1e-5), 'row-selected batch differs'
+    # the learner's batches (decode_rows: the frames' bytes and counts, decoded per forward) select rows the same way
+    rows = _rows_with_frames(NAMES[:6])
+    pend = np.zeros((6, 5), np.int64)
+    raw = torch.from_numpy(rows.view(np.uint8).reshape(6, -1).copy())
+    d = TP.decode_rows(raw, pending=torch.from_numpy(pend))
+    e = TP.to_batch(rows, pend, 'cpu')
+    dt, et = VI.materialize(VI.get_batch(TP.take(d, idx))), VI.get_batch(TP.take(e, idx))
+    eb = VI.bucket(int(VI.get_batch(d)['counts'][idx, 1].max()), VI.E_BUCKETS)
+    ref = VI.pad_batch([VI.decode_frame((FIX / f'{NAMES[i]}.v3.bin').read_bytes(), V3.VERSION) for i in idx.tolist()],
+                       e_bucket=eb, n_max=VI.N_MAX_V3, s_max=VI.S_MAX_V3)
+    for k in ref:
+        assert torch.equal(dt[k], torch.as_tensor(ref[k])), k
+    with torch.no_grad():
+        for x, y in zip(m(TP.take(d, idx), need_vg=True), m(TP.take(e, idx), need_vg=True)):
+            if torch.is_tensor(x):
+                assert torch.allclose(x, y, atol=1e-5)
     with pytest.raises(ValueError, match='without v3 tensors'):
         m({k: v_ for k, v_ in b.items() if not k.startswith(VI.V3_PREFIX)}, need_vg=True)

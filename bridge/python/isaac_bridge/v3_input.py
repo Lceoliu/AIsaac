@@ -512,10 +512,10 @@ def _t_bits(words, layout):
     torch = _t()
     w = _t_words(words)
     out, shift = [], 0
-    for _name, bits in layout:
-        out.append((w >> shift) & ((1 << bits) - 1))
+    for _name, bits in layout:   # (each field to float32 at once: no [..., fields] int64 stack -- 184's learner, 8 GiB)
+        out.append(((w >> shift) & ((1 << bits) - 1)).to(torch.float32))
         shift += bits
-    return torch.stack(out, -1).to(torch.float32)
+    return torch.stack(out, -1)
 
 
 def _t_fin0(x):
@@ -862,6 +862,34 @@ def batch_from_rows(rows, device, stats=False):
     w = int(np.asarray(rows['visible_bytes']).max()) // 4
     F = torch.from_numpy(np.ascontiguousarray(rows['visible_frame'].view('<f4')[:, :w])).to(device)
     return decode_frames_device(F, counts, eb, N_MAX_V3, S_MAX_V3)
+
+
+def lazy_from_raw(raw, frame_at, schema_at, bytes_at):
+    """batch_from_raw without the decode (184, 2026-11-18: the learner put a whole rollout through decode_rows at once;
+    its padded v3 layout -- every record's 128-entity bucket -- did not fit the GPU): the records' frame bytes (a view
+    of raw, no copy) and their counts (checked here, on the host: one read of the headers, schemas and sizes; kept on
+    raw's device). put_batch them: per-key row selection (take) carries them, and _forward_v3 decodes only the rows a
+    forward reads (materialize)."""
+    import torch
+    head = raw[:, frame_at:frame_at + 4 * V3.HEADER].contiguous().view(torch.float32).cpu().numpy()
+    vs = raw[:, schema_at:schema_at + 4].contiguous().view(torch.int32)[:, 0].cpu().numpy()
+    nb = raw[:, bytes_at:bytes_at + 4].contiguous().view(torch.int32)[:, 0].cpu().numpy()
+    counts, _trunc = check_batch(head, vs, nb, P_MAX, N_MAX_V3, S_MAX_V3)
+    w = int(nb.max())
+    return {'raw': raw[:, frame_at:frame_at + w], 'counts': torch.from_numpy(counts).to(raw.device)}
+
+
+def materialize(v):
+    """get_batch's dict -> the decoded v3 tensors: a lazy one (lazy_from_raw: 'raw', 'counts') decoded now -- the E
+    bucket from its rows' largest count (one read from the device) -- an already decoded one as it is."""
+    if 'raw' not in v:
+        return v
+    import torch
+    raw, c = v['raw'], v['counts']
+    n, w = raw.shape
+    eb = bucket(int(c[:, 1].max()), E_BUCKETS)
+    F = raw.contiguous().view(torch.float32).view(n, w // 4)
+    return decode_frames_device(F, c, eb, N_MAX_V3, S_MAX_V3, check=False)
 
 
 def batch_from_raw(raw, frame_at, schema_at, bytes_at):
