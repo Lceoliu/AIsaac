@@ -283,7 +283,7 @@ def test_graph_actor_v3_equals_the_eager_step(fold):
         with torch.no_grad():
             lg_ref, v_ref, _, vg_ref = m(b_ref, need_vg=True, temporal=td)
             # (Codex round 10: the actor's log-probability of the actions it chose, against the eager logits)
-            lp_ref = m.log_prob(lg_ref, m.gate(b_ref), torch.as_tensor(np.asarray(acts), device=cuda).long())
+            lp_ref, _ent = m.log_prob(lg_ref, m.gate(b_ref), torch.as_tensor(np.asarray(acts), device=cuda).long())
         assert np.allclose(lp, lp_ref.cpu().numpy(), atol=1e-4), (t, lp, lp_ref)
         assert np.allclose(val, v_ref.cpu().numpy(), atol=1e-4), (t, val, v_ref)
         assert np.allclose(actor.vg, vg_ref.cpu().numpy(), atol=1e-4)
