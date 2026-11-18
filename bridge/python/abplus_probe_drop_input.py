@@ -41,14 +41,29 @@ return json.encode({ ptype = p:GetPlayerType(), active = p:GetActiveItem(),
   frame = Game():GetFrameCount() })
 """
 LOGGER_LUA = r"""
-ABPX = { log = {}, frames = {}, press = false, mode = "%s", first = nil }
+ABPX = { log = {}, frames = {}, press = false, mode = "%s", first = nil, seq = {} }
 local m = RegisterMod("abpx_drop_input", 1)
+m:AddCallback(ModCallbacks.MC_POST_PLAYER_UPDATE, function(_, p)
+  if ABPX.press and #ABPX.seq < 64 then
+    ABPX.seq[#ABPX.seq + 1] = string.format("player_update i%d g%d", Isaac.GetFrameCount(), Game():GetFrameCount())
+  end
+end)
+m:AddCallback(ModCallbacks.MC_POST_UPDATE, function()
+  if ABPX.press and #ABPX.seq < 64 then
+    ABPX.seq[#ABPX.seq + 1] = string.format("post_update i%d g%d", Isaac.GetFrameCount(), Game():GetFrameCount())
+  end
+end)
 m:AddCallback(ModCallbacks.MC_INPUT_ACTION, function(_, ent, hook, action)
   if action ~= ButtonAction.ACTION_DROP then return nil end
   local who = ent == nil and "nil" or tostring(ent.Type)
   local key = who .. ":" .. tostring(hook) .. (ABPX.press and ":press" or "")
   ABPX.log[key] = (ABPX.log[key] or 0) + 1
-  if ABPX.press then ABPX.frames[key .. "@" .. tostring(Game():GetFrameCount())] = true end
+  if ABPX.press then
+    ABPX.frames[key .. "@" .. tostring(Game():GetFrameCount())] = true
+    if #ABPX.seq < 64 then
+      ABPX.seq[#ABPX.seq + 1] = string.format("h%d i%d g%d", hook, Isaac.GetFrameCount(), Game():GetFrameCount())
+    end
+  end
   if ABPX.press and ent == nil and ABPX.mode == "nil_triggered" then
     local f = Game():GetFrameCount()
     if hook == InputHook.IS_ACTION_TRIGGERED then
@@ -69,7 +84,7 @@ local json = require("json")
 local fr = {}
 for k in pairs(ABPX.frames) do fr[#fr + 1] = k end
 table.sort(fr)
-return json.encode({ log = ABPX.log, frames = fr, first = ABPX.first })
+return json.encode({ log = ABPX.log, frames = fr, first = ABPX.first, seq = ABPX.seq })
 """
 
 
