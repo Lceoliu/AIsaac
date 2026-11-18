@@ -161,60 +161,65 @@ def main():
         try:
             for seed in range(first, first + count):
                 for case in cases:
-                    kind, setup = CASES[case]
-                    b = inst.env.bridge
-                    b.reset_mode, b.character = 'floor', 0
-                    inst.reset(seed)
-                    b = inst.env.bridge
-                    if picks is None:
-                        picks = json.loads(b.lua(PICK_LUA))
-                        f.write(json.dumps(dict(picks=picks)) + '\n')
-                    ids = [t[0] for t in picks['timed']]   # (Brown Nugget first: its fly stays in the room)
-                    timed = 504 if 504 in ids else (ids[0] if ids else None)
-                    if case == 'item_timed' and timed is None or case == 'item_free' and picks['free'] is None:
-                        continue
-                    code = setup.replace('__FREE__', str(picks['free'])).replace('__TIMED__', str(timed))
-                    assert b.lua(f"local p = Isaac.GetPlayer(0) {code} return 'ok'") == 'ok'
-                    S = b.fork(tag='template', alarm=0)
-                    try:
-                        for mode in ('double', 'once'):
-                            for path in ('line', 'json'):
-                                c = S.fork(lean=path == 'line', alarm=600)
-                                try:
-                                    if path == 'line':
-                                        c._send({"cmd": "obs"})
-                                        read_raw(c)
-                                    stp = step_line if path == 'line' else step_json
-                                    mask = c.lua(f"return tostring(ABP_SET_TRIGGER_ONCE({'true' if mode == 'once' else 'false'}))")
-                                    if path == 'json':
-                                        assert c.lua(LOGGER_LUA.replace('__ACTION__', ACTION[kind])) == 'ok'
-                                    for _ in range(20):
-                                        stp(c)
-                                    before = json.loads(c.lua(STATE_LUA))
-                                    if path == 'json':
-                                        c.lua("ABPT.press = true return 'ok'")
-                                    press = dict(b=int(kind == 'bomb'), i=int(kind == 'item'), p=int(kind == 'pill'))
-                                    for _ in range(2 if case == 'bomb_twice' else 1):
-                                        stp(c, **press)
-                                    if path == 'json':
-                                        c.lua("ABPT.press = false return 'ok'")
-                                    for _ in range(10):
-                                        stp(c)
-                                    after = json.loads(c.lua(STATE_LUA))
-                                    seq = json.loads(c.lua("return require('json').encode(ABPT.seq)")) \
-                                        if path == 'json' else None
-                                finally:
-                                    c.close()
-                                row = dict(seed=seed, case=case, mode=mode, path=path, once_mask=mask,
-                                           change=diff(before, after), seq=seq,
-                                           before={k: v for k, v in before.items() if k != 'ents'})
-                                rows.append(row)
-                                f.write(json.dumps(row) + '\n')
-                                f.flush()
-                                print(json.dumps({k: row[k] for k in ('seed', 'case', 'mode', 'path', 'change')}),
-                                      flush=True)
-                    finally:
-                        S.close()
+                  try:   # (a case that fails is reported; the instance relaunched)
+                      kind, setup = CASES[case]
+                      b = inst.env.bridge
+                      b.reset_mode, b.character = 'floor', 0
+                      inst.reset(seed)
+                      b = inst.env.bridge
+                      if picks is None:
+                          picks = json.loads(b.lua(PICK_LUA))
+                          f.write(json.dumps(dict(picks=picks)) + '\n')
+                      ids = [t[0] for t in picks['timed']]   # (Brown Nugget first: its fly stays in the room)
+                      timed = 504 if 504 in ids else (ids[0] if ids else None)
+                      if case == 'item_timed' and timed is None or case == 'item_free' and picks['free'] is None:
+                          continue
+                      code = setup.replace('__FREE__', str(picks['free'])).replace('__TIMED__', str(timed))
+                      assert b.lua(f"local p = Isaac.GetPlayer(0) {code} return 'ok'") == 'ok'
+                      S = b.fork(tag='template', alarm=0)
+                      try:
+                          for mode in ('double', 'once'):
+                              for path in ('line', 'json'):
+                                  c = S.fork(lean=path == 'line', alarm=600)
+                                  try:
+                                      if path == 'line':
+                                          c._send({"cmd": "obs"})
+                                          read_raw(c)
+                                      stp = step_line if path == 'line' else step_json
+                                      mask = c.lua(f"return tostring(ABP_SET_TRIGGER_ONCE({'true' if mode == 'once' else 'false'}))")
+                                      if path == 'json':
+                                          assert c.lua(LOGGER_LUA.replace('__ACTION__', ACTION[kind])) == 'ok'
+                                      for _ in range(20):
+                                          stp(c)
+                                      before = json.loads(c.lua(STATE_LUA))
+                                      if path == 'json':
+                                          c.lua("ABPT.press = true return 'ok'")
+                                      press = dict(b=int(kind == 'bomb'), i=int(kind == 'item'), p=int(kind == 'pill'))
+                                      for _ in range(2 if case == 'bomb_twice' else 1):
+                                          stp(c, **press)
+                                      if path == 'json':
+                                          c.lua("ABPT.press = false return 'ok'")
+                                      for _ in range(10):
+                                          stp(c)
+                                      after = json.loads(c.lua(STATE_LUA))
+                                      seq = json.loads(c.lua("return require('json').encode(ABPT.seq)")) \
+                                          if path == 'json' else None
+                                  finally:
+                                      c.close()
+                                  row = dict(seed=seed, case=case, mode=mode, path=path, once_mask=mask,
+                                             change=diff(before, after), seq=seq,
+                                             before={k: v for k, v in before.items() if k != 'ents'})
+                                  rows.append(row)
+                                  f.write(json.dumps(row) + '\n')
+                                  f.flush()
+                                  print(json.dumps({k: row[k] for k in ('seed', 'case', 'mode', 'path', 'change')}),
+                                        flush=True)
+                      finally:
+                          S.close()
+                  except Exception as e:
+                    f.write(json.dumps(dict(seed=seed, case=case, error=f'{type(e).__name__}: {e}')) + chr(10))
+                    f.flush()
+                    inst.relaunch(hard=True)
         finally:
             inst.kill()
     summary = {}
