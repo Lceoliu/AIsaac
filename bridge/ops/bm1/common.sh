@@ -9,7 +9,24 @@
 BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 if [ -f "$BM/bm1.env" ]; then . "$BM/bm1.env"; else echo "bm1: $BM/bm1.env missing (copy one of $BM/env/*.env)" >&2; exit 2; fi
 # (the older per-script variables still override: CPUSET, MEMS, GPUS_OK, MEM, PIDS, LOCK, SESSION)
-BM1_CPUSET=${CPUSET-${BM1_CPUSET:-}}; BM1_MEMS=${MEMS-${BM1_MEMS:-}}; BM1_GPUS_OK=${GPUS_OK:-${BM1_GPUS_OK:-}}
+BM1_CPUSET=${CPUSET-${BM1_CPUSET:-}}; BM1_MEMS=${MEMS-${BM1_MEMS:-}}
+# (2026-11-18, the coordinator: a caller's GPUS_OK only narrows the lane, never widens it. The lane's ceiling is
+#  bm1.env's BM1_GPUS_OK plus BM1_TIMED_GPUS_OK (the timed runs' GPUs, e.g. accept_g.sh's); a caller's list keeps only
+#  the ceiling's members, compared as written (index or UUID, as bm1.env spells them: a different spelling is dropped,
+#  failing closed). Nothing in common: BM1_GPUS_OK empty and BM1_GPUS_NONE says why -- gpu_forbid refuses every launch.)
+_bm1_narrow() (
+  set -f; out=
+  for g in $(printf '%s\n' "$1" | tr ',' ' '); do
+    case ",$2," in *",$g,"*) case ",$out," in *",$g,"*) ;; *) out="${out:+$out,}$g" ;; esac ;; esac
+  done
+  printf '%s\n' "$out"
+)
+BM1_GPUS_OK=${BM1_GPUS_OK:-}; BM1_GPUS_NONE=
+if [ -n "${GPUS_OK:-}" ]; then
+  _ceil="$BM1_GPUS_OK${BM1_TIMED_GPUS_OK:+,$BM1_TIMED_GPUS_OK}"
+  BM1_GPUS_OK=$(_bm1_narrow "$GPUS_OK" "$_ceil")
+  [ -n "$BM1_GPUS_OK" ] || BM1_GPUS_NONE="the caller's GPUS_OK=$GPUS_OK has no GPU of this lane ($_ceil)"
+fi
 BM1_MEM=${MEM:-${BM1_MEM:-}}; BM1_PIDS=${PIDS:-${BM1_PIDS:-4096}}
 LOCK=${LOCK:-${BM1_LOCK:-$BM/LOCK_node0}}; SESSION=${SESSION:-${BM1_SESSION:-bm1-a1}}
 # (two lanes of one host = two bm1 directories, each with its own bm1.env: the container name prefix, the runner's
@@ -147,22 +164,95 @@ capmode() {
   echo "${m:-global (no switch in this tree)}"
 }
 
-# preflight: before a GPU job. Every GPU nvidia-smi -L lists without an error line, as many as BM1_GPU_EXPECT when set,
-# and no NVRM Xid in the kernel log beyond the count recorded by `preflight_baseline`. A failure is logged, the queue
-# stop file $BM/STOP_QUEUE written (every later script refuses until it is removed by hand), and the caller exits 3.
+# smi: every nvidia-smi call of these scripts, under timeout BM1_SMI_TIMEOUT (default 20 s; a hung driver must not pile up
+# callers -- gpu57 2026-11-16, Xid 79). rc 124 = timed out.
+smi() { timeout "${BM1_SMI_TIMEOUT:-20}" nvidia-smi "$@"; }
+
+# Use the same device enumeration as the launch and pass the resulting UUIDs, not
+# volatile indices, on guarded hosts. Tests can replace this function (or stub smi).
+gpu_uuid_map() { smi --query-gpu=index,uuid --format=csv,noheader,nounits; }
+
+gpu_forbid() (
+  set -f
+  request=$1; purpose=$2
+  bad() { log "GPU FORBIDDEN ($purpose): $* -- not started"; printf 'bm1: GPU FORBIDDEN: %s\n' "$*" >&2; exit 5; }
+  valid_list() {
+    case "$1" in '' | ,* | *, | *,,* | *[!a-zA-Z0-9,-]*) return 1 ;; esac
+    for spec in $(printf '%s\n' "$1" | tr ',' ' '); do
+      case "$spec" in GPU-?*) ;; *[!0-9]*) return 1 ;; esac
+    done
+  }
+  resolve() {
+    printf '%s\n' "$mapping" | awk -F, -v want="$1" '
+      { for (i=1;i<=NF;i++) gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i) }
+      NF==2 && ($1==want || $2==want) && $2 ~ /^GPU-[[:alnum:]-]+$/ { id=$2; n++ }
+      END { if (n!=1) exit 1; print id }'
+  }
+  case "${BM1_GPU_FORBID_REQUIRED:-0}" in 0|1) ;; *) bad 'invalid BM1_GPU_FORBID_REQUIRED' ;; esac
+  forbidden=${BM1_GPU_FORBID_UUID:-}
+  [ -z "${BM1_GPU_FORBID:-}" ] || forbidden="${forbidden:+$forbidden,}$BM1_GPU_FORBID"
+  guarded=0
+  if [ "${BM1_GPU_FORBID_REQUIRED:-0}" = 1 ] || [ -n "$forbidden" ]; then
+    guarded=1
+    valid_list "$forbidden" || bad 'missing or invalid forbidden device list'
+  fi
+  valid_list "$request" || bad 'use a nonempty explicit GPU list (not all)'
+  if [ -z "$BM1_GPUS_OK" ]; then
+    printf 'bm1: no GPU allowed on this lane: %s\n' "${BM1_GPUS_NONE:-BM1_GPUS_OK is empty}" >&2
+    exit 2
+  fi
+  if [ "$guarded" = 1 ]; then
+    mapping=$(gpu_uuid_map) || bad 'could not resolve physical GPU UUIDs'
+    for spec in $(printf '%s\n' "$forbidden" | tr ',' ' '); do
+      uuid=$(resolve "$spec") || bad "cannot resolve forbidden device $spec"
+      deny="${deny:-} $uuid"
+    done
+    for spec in $(printf '%s\n' "$BM1_GPUS_OK" | tr ',' ' '); do
+      if uuid=$(resolve "$spec"); then allow="${allow:-} $uuid"; fi
+    done
+  fi
+  final=
+  for spec in $(printf '%s\n' "$request" | tr ',' ' '); do
+    if [ "$guarded" = 1 ]; then
+      uuid=$(resolve "$spec") || bad "cannot resolve requested device $spec"
+      case " ${deny:-} " in *" $uuid "*) bad "request includes forbidden device $spec" ;; esac
+      case " ${allow:-} " in *" $uuid "*) allowed=1 ;; *) allowed=0 ;; esac
+    else
+      uuid=$spec
+      case ",$BM1_GPUS_OK," in *",$spec,"*) allowed=1 ;; *) allowed=0 ;; esac
+    fi
+    if [ "$allowed" = 0 ]; then
+      printf 'bm1: GPU %s is not on this lane (%s)\n' "$spec" "$BM1_GPUS_OK" >&2
+      exit 2
+    fi
+    final="${final:+$final,}$uuid"
+  done
+  printf '%s\n' "$final"
+)
+
+# preflight: before a GPU job. Every GPU nvidia-smi -L lists without an error line (within BM1_SMI_TIMEOUT), as many
+# as BM1_GPU_EXPECT when set, and no NVRM Xid in the kernel log beyond the count recorded by `preflight_baseline`. A
+# failure is logged, the queue stop file $BM/STOP_QUEUE written (every later script refuses until it is removed by
+# hand), nvidia-smi -L's output and this boot's Xid lines kept in reports/preflight-fail-<time>.txt, and the caller
+# exits 3.
 xid_count() { ( journalctl -k -b --no-pager 2>/dev/null || dmesg 2>/dev/null ) | grep -c 'NVRM: Xid' || true; }   # (this boot's kernel log; a non-root user in adm reads it too)
 preflight_baseline() { xid_count > $BM/.xid_baseline; log "preflight baseline: $(cat $BM/.xid_baseline) Xid lines in the kernel log"; }
 preflight() {
   if [ -f $BM/STOP_QUEUE ]; then echo "bm1: $BM/STOP_QUEUE exists ($(cat $BM/STOP_QUEUE)); nothing starts" >&2; exit 3; fi
-  L_=$(nvidia-smi -L 2>&1); n_=$(echo "$L_" | grep -c '^GPU ' || true); e_=$(echo "$L_" | grep -ciE 'error|unable|unknown' || true)
+  L_=$(smi -L 2>&1) && r_=0 || r_=$?;   # (callers may run with set -e)
+  n_=$(echo "$L_" | grep -c '^GPU ' || true); e_=$(echo "$L_" | grep -ciE 'error|unable|unknown' || true)
   x_=$(xid_count); b_=$(cat $BM/.xid_baseline 2>/dev/null || echo "$x_")
   why=
-  [ "$e_" -gt 0 ] && why="nvidia-smi -L reports an error"
-  [ -n "${BM1_GPU_EXPECT:-}" ] && [ "$n_" -lt "$BM1_GPU_EXPECT" ] && why="${why:+$why; }$n_ GPUs listed, $BM1_GPU_EXPECT expected"
+  [ "$r_" = 124 ] && why="nvidia-smi -L timed out (${BM1_SMI_TIMEOUT:-20} s)"
+  [ "$e_" -gt 0 ] && why="${why:+$why; }nvidia-smi -L reports an error"
+  [ -n "${BM1_GPU_EXPECT:-}" ] && [ "$n_" -ne "$BM1_GPU_EXPECT" ] && why="${why:+$why; }$n_ GPUs listed, $BM1_GPU_EXPECT expected"
   [ "$x_" -gt "$b_" ] && why="${why:+$why; }$((x_-b_)) new Xid line(s) in the kernel log"
   if [ -n "$why" ]; then
     echo "$(date '+%F %T') $why" > $BM/STOP_QUEUE
-    log "PREFLIGHT FAIL ($1): $why -- queue stopped ($BM/STOP_QUEUE)"
+    f_=$R/preflight-fail-$(date +%m%d-%H%M%S).txt
+    { echo "$why"; echo "== nvidia-smi -L (rc $r_)"; echo "$L_"; echo "== Xid lines (this boot)"
+      ( journalctl -k -b --no-pager 2>/dev/null || dmesg 2>/dev/null ) | grep 'NVRM: Xid' | tail -50; } > $f_
+    log "PREFLIGHT FAIL ($1): $why -- queue stopped ($BM/STOP_QUEUE; $f_)"
     exit 3
   fi
 }
@@ -186,8 +276,8 @@ trash() {
 # and no compute process); a busy GPU is logged and the caller exits 4 (shared hosts: never start on a used card)
 gpus_free() {
   for g in $(echo "$1" | tr ',' ' '); do
-    m=$(nvidia-smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
-    p=$(nvidia-smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true)
+    m=$(smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
+    p=$(smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true)
     if [ -z "$m" ] || [ "$m" -ge "${BM1_GPU_FREE_MB:-500}" ] || [ "$p" -gt 0 ]; then
       log "GPU $g BUSY (memory used ${m:-?} MiB, ${p} compute process(es)): not started"
       exit 4
@@ -198,7 +288,7 @@ gpus_free() {
 # host_snapshot <label>: every GPU's memory / utilisation, the load average and the five busiest processes, one bm1.log
 # line (a timed run's start and end: a run disturbed by other tenants can be told)
 host_snapshot() {
-  g=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{printf "%s:%sMiB/%s%% ", $1, $2, $3}')
+  g=$(smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader,nounits 2>/dev/null | awk -F', ' '{printf "%s:%sMiB/%s%% ", $1, $2, $3}')
   t=$(ps -eo pcpu=,comm= --sort=-pcpu 2>/dev/null | head -5 | awk '{printf "%s %s%%; ", $2, $1}')
   log "$1 host: gpus [$g] load [$(cut -d' ' -f1-3 /proc/loadavg)] top cpu [$t]"
 }
