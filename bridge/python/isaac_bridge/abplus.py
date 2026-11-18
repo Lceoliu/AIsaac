@@ -515,6 +515,22 @@ MAX_ROOM_ATTEMPTS = 16
 MAX_ROOM_RETRIES = 8  # mixture rooms tried per seed before giving up
 
 
+def check_visible_v3(client, mode=None):
+    """visible-v3 (2026-11-18, Codex round 2): the bridge's mode (the visible_v3 query) against this client's
+    ISAAC_RL_VISIBLE_V3 (and the native encoder there for modes 2 / 3); a bridge without the command answers
+    'unknown cmd' (mode 0). A mismatch is refused like a bridge of another version (BridgeError). Returns the mode."""
+    from .visible_producer import check_bridge_mode
+    client._send({"cmd": "visible_v3"})
+    try:
+        reply = client._recv()
+    except BridgeError as exc:   # (_recv raises on an error reply)
+        reply = {"type": "error", "msg": str(exc)}
+    try:
+        return check_bridge_mode(reply, mode)
+    except ValueError as exc:
+        raise BridgeError(str(exc)) from None
+
+
 class RoomUnusable(BridgeError):
     """A mixture room cannot host this episode (content, not a failure): pick the next candidate."""
 
@@ -695,14 +711,7 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             if reply.get("type") != "ok" or reply.get("version") != 2:
                 raise BridgeError(f"binary observations unavailable (bridge {hello.get('version')}): {reply}")
             self.obs_format = 2
-        # visible-v3 (2026-11-18, Codex round 2): the bridge's mode against this client's ISAAC_RL_VISIBLE_V3 (and the
-        # native encoder there for modes 2 / 3), refused like a bridge of another version
-        from .visible_producer import check_bridge_mode
-        self._send({"cmd": "visible_v3"})
-        try:
-            check_bridge_mode(self._recv())
-        except ValueError as exc:
-            raise BridgeError(str(exc)) from None
+        check_visible_v3(self)
         return hello
 
     def _read_line(self):

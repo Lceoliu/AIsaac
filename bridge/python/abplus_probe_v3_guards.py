@@ -23,7 +23,8 @@ os.environ.setdefault('ISAAC_RL_VISIBLE_V3', '0')
 from abplus_probe_native_obs import read_raw   # noqa: E402
 from goexplore_abplus import default_bridge_lua, default_preload, load_spec   # noqa: E402
 from isaac_bridge import visible_producer as VP   # noqa: E402
-from isaac_bridge.abplus import FORK_ENV   # noqa: E402
+from isaac_bridge.abplus import FORK_ENV, check_visible_v3   # noqa: E402
+from isaac_bridge.env import BridgeError   # noqa: E402
 from isaac_bridge.abplus_goexplore import GxConfig, Instance   # noqa: E402
 
 LASERS = r"""
@@ -47,7 +48,10 @@ SEEDS_NOW = "local s = {} for _, e in ipairs(Isaac.FindByType(7, -1, -1, false, 
 
 def query(c, mode=None):
     c._send({"cmd": "visible_v3"} if mode is None else {"cmd": "visible_v3", "mode": mode})
-    return c._recv()
+    try:
+        return c._recv()
+    except BridgeError as exc:   # (_recv raises on an error reply)
+        return {"type": "error", "msg": str(exc)}
 
 
 def check_mode_cmd(c):
@@ -62,17 +66,15 @@ def check_mode_cmd(c):
     for m in (0, 2, 3, 1):
         r = query(c, m)
         res[f'set {m}'] = r.get('type') == 'ok' and r.get('mode') == m and query(c).get('mode') == m
-    a = query(c)
-    try:
-        VP.check_bridge_mode(a, 1)
-        res['check same mode'] = True
-    except ValueError:
+    try:   # (the connect's own check, on this clone: mode 1 now)
+        res['check same mode'] = check_visible_v3(c, 1) == 1
+    except BridgeError:
         res['check same mode'] = False
     try:
-        VP.check_bridge_mode(a, 2)
+        check_visible_v3(c, 2)
         res['check another mode refused'] = False
-    except ValueError:
-        res['check another mode refused'] = True
+    except BridgeError as exc:
+        res['check another mode refused'] = 'configured for mode 2' in str(exc)
     return res
 
 

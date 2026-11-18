@@ -106,6 +106,36 @@ def test_the_bridge_mode_is_checked(mode):
     assert VP.check_bridge_mode(ok(3)) == 3
 
 
+def test_the_connect_check_with_the_clients_recv():
+    """abplus.check_visible_v3 (AbplusTrainingEnv.connect's check) with a client whose _recv raises on an error reply,
+    as the real one does: an old bridge's 'unknown cmd' is mode 0 (passes for a mode 0 client, refused otherwise); a
+    mismatch is a BridgeError naming both modes."""
+    from isaac_bridge.abplus import check_visible_v3
+    from isaac_bridge.env import BridgeError
+
+    class Client:
+        def __init__(self, reply):
+            self.reply, self.sent = reply, []
+
+        def _send(self, msg):
+            self.sent.append(msg)
+
+        def _recv(self):
+            if self.reply.get('type') == 'error':
+                raise BridgeError(self.reply.get('msg', 'error'))
+            return self.reply
+    c = Client(dict(type='ok', cmd='visible_v3', mode=2, native_available=True))
+    assert check_visible_v3(c, 2) == 2 and c.sent == [{'cmd': 'visible_v3'}]
+    with pytest.raises(BridgeError, match='bridge runs mode 2, this worker is configured for mode 0'):
+        check_visible_v3(c, 0)
+    old = Client(dict(type='error', msg='unknown cmd'))
+    assert check_visible_v3(old, 0) == 0
+    with pytest.raises(BridgeError, match='bridge runs mode 0, this worker is configured for mode 1'):
+        check_visible_v3(old, 1)
+    src = Path(al.__file__).with_name('abplus.py').read_text(encoding='utf-8')
+    assert 'check_visible_v3(self)' in src[src.index('    def connect(self):'):]
+
+
 def test_needs_decode_by_the_payload():
     frame = VP.observation_frame_v3(RAW)
     assert VP.needs_decode(lean(frame=frame)) and VP.needs_decode(lean(raw=RAW, frame=frame))
