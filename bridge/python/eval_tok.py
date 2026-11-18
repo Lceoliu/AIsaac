@@ -224,8 +224,7 @@ def main():
         p.error('--no-pedestals needs --mode floor or run')
     if args.no_active and args.mode not in ('floor', 'run'):
         p.error('--no-active needs --mode floor or run')
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=False)
+    out = Path(args.out)   # (made after the configuration checks below: a refused run leaves no directory, Codex round 10)
     run = args.mode == 'run'
     floor = args.mode == 'floor' or run
     if args.characters:   # 2026-10-08 (a bad spec fails here, not in the workers)
@@ -249,6 +248,7 @@ def main():
                 p.error('--ablate / --item-slots: ROW-encoder options, not for a v3 checkpoint')
         elif VISIBLE_V3_MODE and args.obs_visible:
             p.error(f'ISAAC_RL_VISIBLE_V3={VISIBLE_V3_MODE} sends v3 frames, this checkpoint reads ROW records: unset it')
+    out.mkdir(parents=True, exist_ok=False)
     items = bool(args.items or (ck is not None and ck.get('config', {}).get('items')))
     names, assign, eval_seeds = [], [], []
     first, count = (int(v) for v in args.seeds.split(':'))

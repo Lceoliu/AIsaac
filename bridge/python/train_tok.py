@@ -2399,6 +2399,9 @@ def main(argv=None, child=None, actor=None):
         #  spatial encoder and the item tokens (they read ROW inv / pitem) -- by the v3 frame encoder; the items come in
         #  as the frame's N / S tokens. The first smoke's command line, C114 T1's, carried --item-tokens 1: refused here
         #  at once, not by the model's constructor inside a retried attempt)
+        if args.teach_merge and not args.teach_gpu:   # (Codex round 10: the CPU teacher merge joins an eager batch to
+            # the learner's lazy v3 one -- cat_batch has no 'v3.raw' on one side)
+            p.error('--frame v3 with --teach-merge 1 needs --teach-gpu 1 (the CPU teacher merge cannot join v3 batches)')
         if args.item_tokens or args.item_shared or item_slots != INV_CAP:
             p.error(f'--frame v3 takes no item tokens (the N / S tokens of the frame carry the items): --item-tokens 0 '
                     f'--item-shared 0 --item-slots {INV_CAP} (got {args.item_tokens} / {args.item_shared} / {item_slots})')

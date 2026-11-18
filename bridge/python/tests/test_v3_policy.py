@@ -276,11 +276,15 @@ def test_graph_actor_v3_equals_the_eager_step(fold):
         if t == 0:
             rows['first'] = 1
         pend = np.stack([rng.integers(0, k, 4) for k in m.heads], 1).astype(np.int64)
-        _, lp, val = actor.act(rows, pend, widx, None, None)
+        acts, lp, val = actor.act(rows, pend, widx, None, None)
         torch.cuda.synchronize()
         td = dict(mode='step', state=st_e, slot=torch.from_numpy(widx).to(cuda))
+        b_ref = TP.to_batch(rows, pend, cuda)
         with torch.no_grad():
-            _, v_ref, _, vg_ref = m(TP.to_batch(rows, pend, cuda), need_vg=True, temporal=td)
+            lg_ref, v_ref, _, vg_ref = m(b_ref, need_vg=True, temporal=td)
+            # (Codex round 10: the actor's log-probability of the actions it chose, against the eager logits)
+            lp_ref = m.log_prob(lg_ref, m.gate(b_ref), torch.as_tensor(np.asarray(acts), device=cuda).long())
+        assert np.allclose(lp, lp_ref.cpu().numpy(), atol=1e-4), (t, lp, lp_ref)
         assert np.allclose(val, v_ref.cpu().numpy(), atol=1e-4), (t, val, v_ref)
         assert np.allclose(actor.vg, vg_ref.cpu().numpy(), atol=1e-4)
         assert np.array_equal(actor.t_out['steps'], td['out']['steps'].cpu().numpy())
