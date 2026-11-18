@@ -234,6 +234,7 @@ class TokSamplerConfig:
     preload: str = ''
     stub_list: str = ''
     clone_alarm: int = 900
+    fatal_dir: str = ''                           # (2026-11-18) set by TokSampler: this sampler's own fatal directory
     teacher: bool = False                         # hindsight search teacher, run during the trainer's updates
     teacher_share: float = 0.0                    # and, beyond that, up to this share of a worker's sampling time
     teacher_queue: int = 24                       # hurts waiting to be searched per worker (the newest are kept)
@@ -764,14 +765,21 @@ def parse_faults(index, text=None):
     return out
 
 
-def fatal_file(index, pid):
-    """(2026-11-18) Where a worker that stops on a visible-v3 protocol error leaves its reason: $ISAAC_RL_FATAL_DIR
-    (train_tok / eval_tok: their output directory) or ABP_HOME/instances/fatal, fatal-worker-<index>-<pid>.txt."""
+def fatal_run_dir():
+    """(2026-11-18, Codex round 5) A new sampler's own fatal directory: under $ISAAC_RL_FATAL_DIR (train_tok /
+    eval_tok: their output directory) or ABP_HOME/instances/fatal, a sub-directory no earlier sampler used (this
+    process, the time, a random part) -- a file a former run left (the same output directory, a worker of the same
+    index and pid in a new container) is never read as this run's."""
     base = os.environ.get('ISAAC_RL_FATAL_DIR') or str(ABP_HOME / 'instances' / 'fatal')
-    return Path(base) / f'fatal-worker-{index}-{pid}.txt'
+    return str(Path(base) / f'fatal-{os.getpid()}-{time.time_ns()}-{os.urandom(4).hex()}')
 
 
-def report_fatal(index, conn, exc, who='tok worker'):
+def fatal_file(fatal_dir, index, pid):
+    """Where worker index (pid) leaves its reason: <the sampler's fatal_dir>/fatal-worker-<index>-<pid>.txt."""
+    return Path(fatal_dir) / f'fatal-worker-{index}-{pid}.txt'
+
+
+def report_fatal(index, conn, exc, who='tok worker', fatal_dir=''):
     """(2026-11-18, the coordinator: the reason must reach the parent) A worker's VisibleV3Fatal, before any cleanup:
     printed (stderr and stdout, flushed), written to fatal_file (flushed and synced) and sent to the parent over the
     worker's pipe ('F' + the text: TokSampler takes it as the reason; the C++ actor drops the worker on it)."""
@@ -782,7 +790,9 @@ def report_fatal(index, conn, exc, who='tok worker'):
         except (OSError, ValueError):
             pass
     try:
-        path = fatal_file(index, os.getpid())
+        if not fatal_dir:
+            raise OSError('no fatal directory')
+        path = fatal_file(fatal_dir, index, os.getpid())
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, 'w', encoding='utf-8') as f:
             f.write(text + '\n')
@@ -1322,7 +1332,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
                 mine[ST['close_s']] += time.perf_counter() - t_close
     except VisibleV3Fatal as exc:
         fatal = exc
-        report_fatal(index, conn, exc)   # (before the cleanup below)
+        report_fatal(index, conn, exc, fatal_dir=cfg.fatal_dir)   # (before the cleanup below)
         mine[ST['errors']] += 1000
     except Exception:
         traceback.print_exc()
@@ -1358,6 +1368,13 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
 
 class TokSampler:
     def __init__(self, cfg):
+        # (this sampler's own fatal directory: the workers get it in cfg; a cfg that is no dataclass: a copy)
+        if dataclasses.is_dataclass(cfg):
+            cfg = dataclasses.replace(cfg, fatal_dir=fatal_run_dir())
+        else:
+            import copy
+            cfg = copy.copy(cfg)
+            cfg.fatal_dir = fatal_run_dir()
         self.cfg = cfg
         n = cfg.workers
         sizes = (ROW.itemsize * 2 * n, 4 * ACTION_F * n, 8 * len(STATS) * n, 8 * 4)
@@ -1704,7 +1721,7 @@ class TokSampler:
         reason = self._fatal_reason.get(i)
         if reason is None and code is not None and p.pid is not None:
             try:
-                reason = fatal_file(i, p.pid).read_text(encoding='utf-8').strip()
+                reason = fatal_file(self.cfg.fatal_dir, i, p.pid).read_text(encoding='utf-8').strip()
             except OSError:
                 reason = None
         if code == V3_FATAL_EXIT or reason is not None:
