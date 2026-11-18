@@ -8,16 +8,18 @@
 # (the c45a583 arms: EV_TREE=mc45a583 EV_ABHOME=home-c45 in the environment -> ev_ab2.sh: their own tree's eval_tok.py)
 #   usage: setsid nohup sh c110_after.sh <name> <eval gpu> <cpuset> <mems> > /root/AIsaac/train/c110/after_<name>.out 2>&1 < /dev/null &
 N=$1; G=$2; CS=$3; MS=$4
-P=/root/AIsaac/train/c110
-BM=/root/AIsaac/bm1
+P=${BM1_TRAIN:-/root/AIsaac/train}/c110
+BM=${BM:-/root/AIsaac/bm1}
 while pgrep -f "c108_guard.sh c110 $N " > /dev/null; do sleep 60; done
 echo "$(date '+%F %T') c110_after $N: training ended" >> $BM/reports/bm1.log
-st=""
+st=""; n=0; unknown=0
+tag=$N-c128-last; seeds=2147490000:128
 if grep -q "game hours reached" $P/$N/guard.log; then
   python3 $BM/ab2_win.py $P/$N/$N-s0 100 > $P/win100_$N.txt 2>&1
-  PARENT=c110 sh $BM/ev_ab2.sh $N new $G $CS $MS 14 $N-c128-last,last.pt,2147490000:128 > $P/eval_$N.out 2>&1
+  PARENT=c110 sh $BM/ev_ab2.sh $N new $G $CS $MS 14 $tag,last.pt,$seeds > $P/eval_$N.out 2>&1
+  rc=0; python3 "$BM/evtools/ev_complete.py" --quiet --dir "$P/eval/$tag" --seeds "$seeds" || rc=$?
+  case "$rc" in 0) n=1 ;; 2) unknown=1 ;; esac
 else st=" $N short of its hours ($(tail -1 $P/$N/guard.log | cut -c1-120));"; fi
-# (2026-11-18: an evaluation counts as done only when complete -- every requested seed played, rc 0)
-n=$(python3 $BM/evtools/ev_complete.py --quiet --dir $P/eval/$N-c128-last --seeds 2147490000:128 --rc-file $P/eval/$N-c128-last.log.rc && echo 1 || echo 0)
-echo "$(date '+%F %T') evaluation done: $n/1 complete;$st" > $P/AFTER_DONE_$N
-echo "$(date '+%F %T') c110_after $N: evaluation done, $n/1 complete;$st" >> $BM/reports/bm1.log
+echo "$(date '+%F %T') evaluation done: $n/1 complete, $unknown exit status unknown;$st" > $P/AFTER_DONE_$N
+echo "$(date '+%F %T') c110_after $N: evaluation done, $n/1 complete, $unknown exit status unknown;$st" >> $BM/reports/bm1.log
+[ "$n" = 1 ]

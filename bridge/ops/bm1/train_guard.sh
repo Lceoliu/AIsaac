@@ -45,7 +45,8 @@
 # Nothing system-wide: no GPU reset, no other process touched.
 set -u
 BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
-. $BM/common.sh
+unset GPUS_OK   # only the configured lane whitelist, not a caller override
+. "$BM/common.sh"
 NAME=$1; TREE=$2; shift 2
 K=$#
 RD=${BM1_TRAIN:-/root/AIsaac/train}/${RUN_PARENT:+$RUN_PARENT/}$NAME; RDC=${BM1_TRAIN_IN:-/bench/train}/${RUN_PARENT:+$RUN_PARENT/}$NAME   # (bm1.env: BM1_TRAIN / BM1_TRAIN_IN; gpu57 defaults)
@@ -66,7 +67,7 @@ CPUS=${CPUS%|}; LCPUS=${LCPUS%|}; DCPUS=${DCPUS%|}
 LANESUM=$MEMG; MEMG=${MEM_GB:-128}
 NB=$(lane $1 LANE_NAME); PB=$(lane $1 LANE_PORT)
 CTR="$BM1_NAME-train-$NAME"
-gpu_forbid "$G" "train $NAME"   # (dgene: GPU 5 never)
+DEVICES=$(gpu_forbid "$G" "train $NAME") || exit $?
 [ "${NOLOCK:-0}" = 1 ] || take_excl "training $NAME ($TREE, K $K, GPU $G) 计时运行"   # (NOLOCK=1: the caller holds X, ab1_pair.sh)
 # (2026-11-14, ab1: K=1 has no shard_sync -- ISAAC_SHARD_WORLD 1 reads no stop file -- so a stop SIGINTs the trainer too;
 #  it saves last.pt and ends, as the stall path's SIGINT). Only the trainer's own process (^$BM1_PY): "train_tok.py" alone
@@ -260,8 +261,8 @@ while :; do
   DE="$DE -e ISAAC_BLOCK_COLLECT_EVERY=${COLLECT_EVERY:-4}"   # (the page store collected every 4th hand-off)
   DE="$DE -e ISAAC_GAME_HOURS_TOTAL=${HOURS:-125} -e ISAAC_LEARN_CKPT_DET=1 -e ISAAC_CKPT_KEEP=${CKPT_KEEP:-5} -e ISAAC_CKPT_MILESTONE=${CKPT_MILESTONE:-250}"
   DE="$DE -e ISAAC_CKPT_TRASH=${BM1_TRASH_IN:-/bench/trash} -e ISAAC_CKPT_ROTATE=${CKPT_ROTATE:-trash} -e ISAAC_EPISODES_ROTATE_MB=${EPISODES_MB:-256} ${ENVS:-}"
-  CPUSET="${CS:-${BM1_TIMED_CPUSET:-$BM1_CPUSET}}" MEMS="" MEM="${MEMG}g" PIDS=$((${BM1_PIDS:-4096} * K)) GPUS_OK="$G" \
-    DOCK_ENV="$DE" $BM/run.sh train-$NAME $G sh $BM1_IN/shardk_in.sh $NAME 315360000 ${HOURS:-125} "$(echo $PAIRS)" "$CPUS" "$LCPUS" "$DCPUS" >> $RD/launcher.log 2>&1
+  CPUSET="${CS:-${BM1_TIMED_CPUSET:-$BM1_CPUSET}}" MEMS="" MEM="${MEMG}g" PIDS=$((${BM1_PIDS:-4096} * K)) \
+    DOCK_ENV="$DE" env -u GPUS_OK "$BM/run.sh" train-$NAME "$DEVICES" sh $BM1_IN/shardk_in.sh $NAME 315360000 ${HOURS:-125} "$(echo $PAIRS)" "$CPUS" "$LCPUS" "$DCPUS" >> $RD/launcher.log 2>&1
   rc=$?
   kill $MP 2>/dev/null
   stall_=""; [ -f $RD/.stall ] && { stall_=$(cat $RD/.stall); mv $RD/.stall $RD/.stall.attempt$attempt; }

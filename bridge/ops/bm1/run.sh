@@ -4,7 +4,7 @@
 #   (DOCK_ENV="-e K=V ..." of the older scripts is accepted too: its "-e" are dropped)
 # The command sees BM1_IN (bm1's directory as the runner sees it), BM1_PY, HOME=$BM1_IN/home (every cache),
 # ABP_HOME=$BM1_IN/home/isaac-abplus (run_instance.sh starts the game from $HOME/isaac-abplus), PYTHONPATH=$BM1_IN/pydeps
-# (when it exists), OMP / MKL / OpenBLAS threads 1, no proxy; its GPUs as cuda:0, cuda:1, ... in the order given.
+# (when it exists), OMP / MKL / OpenBLAS threads 1, no proxy; its GPUs as cuda:0, cuda:1, ... in the order given (UUIDs on guarded hosts).
 #   BM1_MODE=docker: a container $BM1_NAME-<purpose> (default aisaac-bench-bm1-a1-<purpose>) of $BM1_IMAGE (--rm, --cpuset-cpus / --cpuset-mems,
 #     --memory, --pids-limit, read-only root, /tmp tmpfs, --network none, the caller's uid, $BM1_DOCKER_BASE as /bench,
 #     the game runtime read-only).
@@ -17,13 +17,23 @@ set -eu
 BM=${BM:-$(cd "$(dirname "$0")" && pwd)}
 . $BM/common.sh
 P=$1; G=$2; shift 2
-for g in $(echo "$G" | tr ',' ' '); do
-  case ",$BM1_GPUS_OK," in *",$g,"*) ;; *) echo "run.sh: GPU $g is not on this lane ($BM1_GPUS_OK)" >&2; exit 2 ;; esac
-done
-gpu_forbid "$G" "$P"   # (dgene: GPU 5 never, by index or UUID)
+DEVICES=$(gpu_forbid "$G" "$P") || exit $?
 preflight "$P"
-gpus_free "$G"
+gpus_free "$DEVICES"
 KV="BM1_IN=$BM1_IN BM1_PY=$BM1_PY $(echo "${DOCK_ENV:-}" | sed 's/-e //g') ${RUNENV:-}"
+# Do not let a later generic -e/export override the checked device selection.
+set -f
+for kv in $KV; do
+  case "$kv" in
+    CUDA_VISIBLE_DEVICES=*|NVIDIA_VISIBLE_DEVICES=*|CUDA_DEVICE_ORDER=*)
+      printf 'run.sh: device selection must use the GPU argument, not %s\n' "${kv%%=*}" >&2; exit 2 ;;
+    *=*)
+      case "${kv%%=*}" in ''|[0-9]*|*[!a-zA-Z0-9_]*)
+        echo "run.sh: invalid environment variable name" >&2; exit 2 ;;
+      esac ;;
+    *) printf 'run.sh: invalid environment assignment: %s\n' "$kv" >&2; exit 2 ;;
+  esac
+done
 mkdir -p "$BM/home"
 if [ "$BM1_MODE" = docker ]; then
   EV=""; for kv in $KV; do EV="$EV -e $kv"; done
@@ -35,7 +45,7 @@ if [ "$BM1_MODE" = docker ]; then
     --log-opt max-size=10m --log-opt max-file=2 --read-only --tmpfs /tmp:rw,exec,size=4g \
     --user "$(id -u):$(id -g)" \
     -v "$BM1_DOCKER_BASE:/bench" -v "$BM1_GAME_RUNTIME:/bench/home/isaac-abplus/runtime:ro" \
-    -e NVIDIA_VISIBLE_DEVICES="$G" -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
+    -e NVIDIA_VISIBLE_DEVICES="$DEVICES" -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
     -e HOME=$BM1_IN/home -e ABP_HOME=$BM1_IN/home/isaac-abplus -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONUNBUFFERED=1 \
     -e OMP_NUM_THREADS=1 -e MKL_NUM_THREADS=1 -e OPENBLAS_NUM_THREADS=1 -e PYTHONPATH="$PP" \
     -e http_proxy= -e https_proxy= -e HTTP_PROXY= -e HTTPS_PROXY= -e ALL_PROXY= -e all_proxy= \
@@ -43,7 +53,7 @@ if [ "$BM1_MODE" = docker ]; then
 fi
 # direct
 export HOME=$BM1_IN/home ABP_HOME=$BM1_IN/home/isaac-abplus PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
-export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 CUDA_VISIBLE_DEVICES="$G"
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 CUDA_VISIBLE_DEVICES="$DEVICES"
 export http_proxy= https_proxy= HTTP_PROXY= HTTPS_PROXY= ALL_PROXY= all_proxy=
 [ -d "$BM1_IN/pydeps" ] && export PYTHONPATH="${PYTHONPATH_EXTRA:-$BM1_PYTHONPATH}"
 for kv in $KV; do export "$kv"; done

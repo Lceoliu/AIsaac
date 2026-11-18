@@ -151,17 +151,63 @@ capmode() {
 # callers -- gpu57 2026-11-16, Xid 79). rc 124 = timed out.
 smi() { timeout "${BM1_SMI_TIMEOUT:-20}" nvidia-smi "$@"; }
 
-# gpu_forbid <g[,g...]>: refuse (log, exit 5) a GPU list holding a forbidden index (BM1_GPU_FORBID, e.g. 5 on dgene) or
-# the forbidden card's UUID (BM1_GPU_FORBID_UUID) -- the list given and, when set, NVIDIA_VISIBLE_DEVICES of the caller.
-gpu_forbid() {
-  for g_ in $(echo "$1,${NVIDIA_VISIBLE_DEVICES:-}" | tr ',' ' '); do
-    for f_ in $(echo "${BM1_GPU_FORBID:-}" | tr ',' ' '); do
-      [ "$g_" = "$f_" ] && { log "GPU FORBIDDEN ($2): GPU $f_ in the list '$1' -- not started"; echo "bm1: GPU $f_ is forbidden on this host" >&2; exit 5; }
+# Use the same device enumeration as the launch and pass the resulting UUIDs, not
+# volatile indices, on guarded hosts. Tests can replace this function (or stub smi).
+gpu_uuid_map() { smi --query-gpu=index,uuid --format=csv,noheader,nounits; }
+
+gpu_forbid() (
+  set -f
+  request=$1; purpose=$2
+  bad() { log "GPU FORBIDDEN ($purpose): $* -- not started"; printf 'bm1: GPU FORBIDDEN: %s\n' "$*" >&2; exit 5; }
+  valid_list() {
+    case "$1" in '' | ,* | *, | *,,* | *[!a-zA-Z0-9,-]*) return 1 ;; esac
+    for spec in $(printf '%s\n' "$1" | tr ',' ' '); do
+      case "$spec" in GPU-?*) ;; *[!0-9]*) return 1 ;; esac
     done
-    [ -n "${BM1_GPU_FORBID_UUID:-}" ] && [ "$g_" = "$BM1_GPU_FORBID_UUID" ] && { log "GPU FORBIDDEN ($2): $g_ -- not started"; echo "bm1: $g_ is forbidden on this host" >&2; exit 5; }
+  }
+  resolve() {
+    printf '%s\n' "$mapping" | awk -F, -v want="$1" '
+      { for (i=1;i<=NF;i++) gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i) }
+      NF==2 && ($1==want || $2==want) && $2 ~ /^GPU-[[:alnum:]-]+$/ { id=$2; n++ }
+      END { if (n!=1) exit 1; print id }'
+  }
+  case "${BM1_GPU_FORBID_REQUIRED:-0}" in 0|1) ;; *) bad 'invalid BM1_GPU_FORBID_REQUIRED' ;; esac
+  forbidden=${BM1_GPU_FORBID_UUID:-}
+  [ -z "${BM1_GPU_FORBID:-}" ] || forbidden="${forbidden:+$forbidden,}$BM1_GPU_FORBID"
+  guarded=0
+  if [ "${BM1_GPU_FORBID_REQUIRED:-0}" = 1 ] || [ -n "$forbidden" ]; then
+    guarded=1
+    valid_list "$forbidden" || bad 'missing or invalid forbidden device list'
+  fi
+  valid_list "$request" || bad 'use a nonempty explicit GPU list (not all)'
+  if [ "$guarded" = 1 ]; then
+    mapping=$(gpu_uuid_map) || bad 'could not resolve physical GPU UUIDs'
+    for spec in $(printf '%s\n' "$forbidden" | tr ',' ' '); do
+      uuid=$(resolve "$spec") || bad "cannot resolve forbidden device $spec"
+      deny="${deny:-} $uuid"
+    done
+    for spec in $(printf '%s\n' "$BM1_GPUS_OK" | tr ',' ' '); do
+      if uuid=$(resolve "$spec"); then allow="${allow:-} $uuid"; fi
+    done
+  fi
+  final=
+  for spec in $(printf '%s\n' "$request" | tr ',' ' '); do
+    if [ "$guarded" = 1 ]; then
+      uuid=$(resolve "$spec") || bad "cannot resolve requested device $spec"
+      case " ${deny:-} " in *" $uuid "*) bad "request includes forbidden device $spec" ;; esac
+      case " ${allow:-} " in *" $uuid "*) allowed=1 ;; *) allowed=0 ;; esac
+    else
+      uuid=$spec
+      case ",$BM1_GPUS_OK," in *",$spec,"*) allowed=1 ;; *) allowed=0 ;; esac
+    fi
+    if [ "$allowed" = 0 ]; then
+      printf 'bm1: GPU %s is not on this lane (%s)\n' "$spec" "$BM1_GPUS_OK" >&2
+      exit 2
+    fi
+    final="${final:+$final,}$uuid"
   done
-  return 0
-}
+  printf '%s\n' "$final"
+)
 
 # preflight: before a GPU job. Every GPU nvidia-smi -L lists without an error line (within BM1_SMI_TIMEOUT), as many
 # as BM1_GPU_EXPECT when set, and no NVRM Xid in the kernel log beyond the count recorded by `preflight_baseline`. A
