@@ -71,3 +71,31 @@ def test_a8_compare_needs_both_summaries_ok(tmp_path):
 def test_the_old_arm_clears_the_trigger_switch():
     for tool in ('cross_tree_exact.py', 'a8_digests.py'):
         assert 'ISAAC_RL_TRIGGER_ONCE' in (PY / 'tools' / tool).read_text(encoding='utf-8')
+
+
+def test_close_stress_verdict_needs_coverage():
+    """tools/v3_close_stress.verdict (2026-11-18, Codex round 5): coverage and outcome apart. Codex's case -- 30 rounds
+    without a record, no kill landing in a query -- does not pass; nor does a worker not ended (exit code None); a
+    covered run with no 86 / fatal passes; one exit 86 fails it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('close_stress', PY / 'tools' / 'v3_close_stress.py')
+    cs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cs)
+
+    def row(k, kind, records=0, interrupted=(), killed=None, codes=(0, 0, 0, 0)):
+        return dict(round=k, kind=kind, records=records, interrupted=list(interrupted), killed=killed,
+                    exit_codes=list(codes), fatal_during=None, fatal_on_close=None, fatal_files=[], site_errors=[])
+    kinds = ('play', 'query-kill', 'early')
+    empty = [row(k, kinds[k % 3]) for k in range(30)]
+    v = cs.verdict(empty)
+    assert not v['ok'] and not v['covered'] and v['clean']
+    good = [row(k, kinds[k % 3], records=50 if k % 3 == 0 else 0,
+                interrupted=[dict(tag='1-1', outcome='BridgeError')] if k % 3 == 1 else (),
+                killed=1 if k % 3 == 1 else None) for k in range(30)]
+    v = cs.verdict(good)
+    assert v['ok'] and v['coverage'] == dict(play_with_records=10, query_killed=10, early=10)
+    assert v['interrupted_query_outcomes'] == {'BridgeError': 10}
+    assert not cs.verdict(good[:-1] + [row(29, 'early', codes=(0, None, 0, 0))])['ok']
+    assert not cs.verdict(good[:-1] + [row(29, 'early', codes=(0, 86, 0, 0))])['ok']
+    no_kill = [dict(r, killed=0) if r['kind'] == 'query-kill' else r for r in good]
+    assert not cs.verdict(no_kill)['covered']
