@@ -78,7 +78,8 @@ local function try(f) local ok, v = pcall(f) if ok then return v end return "ERR
 return json.encode({ bombs = p:GetNumBombs(), coins = p:GetNumCoins(), keys = p:GetNumKeys(), hearts = p:GetHearts(),
   soul = p:GetSoulHearts(), active = p:GetActiveItem(), charge = p:GetActiveCharge(),
   battery = try(function() return p:GetBatteryCharge() end), card0 = p:GetCard(0), card1 = p:GetCard(1),
-  pill0 = p:GetPill(0), pill1 = p:GetPill(1), frame = Game():GetFrameCount(), ents = ents })
+  pill0 = p:GetPill(0), pill1 = p:GetPill(1), frame = Game():GetFrameCount(), ents = ents,
+  holding = try(function() return p:IsHoldingItem() and 1 or 0 end), max_hearts = p:GetMaxHearts() })
 """
 LOGGER_LUA = r"""
 ABPT = { press = false, seq = {}, action = ButtonAction.__ACTION__ }
@@ -119,7 +120,7 @@ def step_json(c, b=0, i=0, p=0):
 
 def diff(before, after):
     keys = ('bombs', 'coins', 'keys', 'hearts', 'soul', 'active', 'charge', 'battery', 'card0', 'card1', 'pill0',
-            'pill1')
+            'pill1', 'holding', 'max_hearts')
     out = {k: [before[k], after[k]] for k in keys if before[k] != after[k]}
     old = {s for s, _ in before['ents']}
     new = {}
@@ -135,11 +136,16 @@ def main():
     ap.add_argument('--groups-file', required=True)
     ap.add_argument('--seeds', default='2147800000:3')
     ap.add_argument('--cases', default=','.join(CASES))
+    ap.add_argument('--items', default='', help='extra cases item_<id>: that active item, fully charged, one press')
     ap.add_argument('--port', type=int, default=44640)
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    cases = [c for c in args.cases.split(',') if c]
+    for i in (v for v in args.items.split(',') if v):   # (the actives behind trigger_div's partings)
+        CASES[f'item_{i}'] = ('item', f"p:AddCollectible({int(i)}, 0, false) p:FullCharge()")
+        cases.append(f'item_{i}')
     spec = load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))
     stub = str(Path(default_preload()).parent / 'stub_render_h.txt')
     os.environ.update(FORK_ENV)
@@ -154,7 +160,7 @@ def main():
     with open(out / 'trigger.jsonl', 'w') as f:
         try:
             for seed in range(first, first + count):
-                for case in args.cases.split(','):
+                for case in cases:
                     kind, setup = CASES[case]
                     b = inst.env.bridge
                     b.reset_mode, b.character = 'floor', 0
