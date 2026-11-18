@@ -8,6 +8,7 @@ Cases (every one a clone of a floor template; nothing written back):
   offgrid         V1's 2x1 room 89 (seed 2147700000, stage 7) until a sent entity is outside the grid
   doorframe       the player walked into a door of the start room until its formula cell is the door cell
   longlived       a coin spawned in the start room, 600 frames on (age 600: 10 after the scale, clamped at 8)
+  decorative-collision  a listed decorative effect (1000.15) without damage, entity collision class 4: sent (batch 6)
   devilprice      a devil deal (goto s.devil.0; else a pedestal set to Price -1)
   shooting        the player shooting right for 3 decisions (fire_dir set)
   forgotten       the Forgotten (PlayerType 16) at the start: the Soul a sub-player body without a room position
@@ -52,9 +53,18 @@ end
 for _, e in ipairs(Isaac.GetRoomEntities()) do
   out.entities[#out.entities + 1] = { type = e.Type, variant = e.Variant, subtype = e.SubType, x = e.Position.X,
     y = e.Position.Y, gi = room:GetGridIndex(e.Position), age = e.FrameCount, visible = e.Visible,
+    coll = e.EntityCollisionClass, cdmg = e.CollisionDamage, seed = e.InitSeed,
     price = (e.Type == 5 and e:ToPickup()) and e:ToPickup().Price or nil }
 end
 return json.encode(out)
+"""
+SPAWN_DECOR_COLL = """
+local p = Isaac.GetPlayer(0)
+local e = Isaac.Spawn(1000, 15, 0, p.Position + Vector(80, 0), Vector(0, 0), nil)
+e.CollisionDamage = 0
+e.EntityCollisionClass = 4
+e.Visible = true
+return 'ok'
 """
 SPAWN_COIN = """
 local room = Game():GetRoom()
@@ -250,6 +260,10 @@ def main():
             raise RuntimeError(f'no door cell reached: {tried}')
         case('doorframe', 'the player in a door frame (its formula cell is the door cell)', doorframe)
         case('longlived', 'a coin 600 frames old (age clamp)', lambda c: (c.lua(SPAWN_COIN), idle(c, 600)))
+        # (batch 6) a listed decorative effect without damage but with entity collision: sent under the batch 6 rule,
+        # left out under the batch 1-5 one -- the frame that tells the two apart
+        case('decorative-collision', 'a decorative 1000.15 with no damage, entity collision class 4 (sent, batch 6)',
+             lambda c: c.lua(SPAWN_DECOR_COLL))
         def devil(c):
             c.lua(DEVIL_GOTO)
             idle(c, 30)

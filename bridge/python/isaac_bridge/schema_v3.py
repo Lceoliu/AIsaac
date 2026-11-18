@@ -54,6 +54,11 @@ every sub-player follows its own player (player 0, its sub-player, player 1, ...
 (5 or 6 numbers) drop is 0, the same held / triggered set as a 7th number 0 (abp_step_line.h; the game frames equal:
 the drop probe's zero case, golden digests).
 
+Batch 6 (the coordinator, 2026-11-18; VERSION 2026111803; no column, no size changed): which entities enter the
+frame -- a listed decorative effect (DECORATIVE_EFFECTS) is left out only when it deals no damage AND takes no part
+in entity collisions (EntityCollisionClass 0), in both producers (contract C11; before: no damage only). A Lua /
+native library of batch 5 with a reader of batch 6 (or the other way round) is refused by the version word.
+
 Batch 5 (the coordinator, 2026-11-18; VERSION 2026111802; header semantics only, no column and no size changed):
 header[6] is VERSION_WORD = VERSION - 2026000000 (was LAYOUT_GEN 3); every reader checks it against its own
 schema_v3 frame by frame. Any later change of the layout or of a column's meaning raises VERSION.
@@ -79,7 +84,9 @@ applies SCALE (below) itself. Known flags (G3): a field the game version lacks i
 
 # ------------------------------------------------------------------------------------------------- F1: identity
 SCHEMA = 'isaac-visible-prlmens-g-v3'
-VERSION = 2026111802   # batch 5 (the coordinator, 2026-11-18): header[6] carries VERSION_WORD (LAYOUT_GEN retired)
+VERSION = 2026111803   # batch 6 (the coordinator, 2026-11-18): C11 -- a listed decorative effect is left out only
+#                       with no damage and no entity collision (which entities enter the frame changed)
+#                       (batch 5, 2026111802: header[6] carries VERSION_WORD, LAYOUT_GEN retired)
 #                       (batch 4, 2026111801: direction / price categorical, REL_SCALE, the body order and the step
 #                       line's drop written down) (batch 3, 2026111703: P col 54 position_known)
 #                       (batch 2, 2026111702: non-position scales, NUM_CLAMP, NUM_RANGE)

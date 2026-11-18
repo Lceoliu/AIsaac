@@ -375,7 +375,7 @@ def test_native_golden_cmp_exit_code(tmp_path):
     run = lambda d: _run([sys.executable, str(tool), str(d)], cwd=str(PY))
     good = setup(tmp_path / 'good')
     r = run(good)
-    assert r.returncode == 0 and 'PASS' in r.stdout and 'frames 19/19 equal' in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and 'PASS' in r.stdout and f'frames {len(names)}/{len(names)} equal' in r.stdout, r.stdout + r.stderr
 
     def broken(how):
         d = setup(tmp_path / how.replace(' ', '_'))

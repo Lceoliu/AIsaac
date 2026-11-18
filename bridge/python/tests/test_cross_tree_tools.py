@@ -120,8 +120,17 @@ def test_golden_v3_diff_checks_hashes_and_empty_manifests(tmp_path):
     except OSError:
         git = None
     have_git = git is not None and git.returncode == 0
-    if have_git:   # (the batch-5 migration against the old fixtures read from git)
-        r = run('--old-rev', '9e941f3~1')
+    if have_git:   # (the batch-5 migration: 9e941f3~1's fixtures against 9e941f3's own, both read from git)
+        b5 = tmp_path / 'b5'
+        b5.mkdir()
+        top = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=PY, capture_output=True, text=True,
+                             check=True).stdout.strip()
+        arch = subprocess.run(['git', 'archive', '9e941f3', 'bridge/python/tests/fixtures/visible_v3'],
+                              cwd=top, capture_output=True, check=True).stdout
+        import io
+        import tarfile
+        tarfile.open(fileobj=io.BytesIO(arch)).extractall(b5)
+        r = run('--old-rev', '9e941f3~1', '--new', str(b5 / 'bridge' / 'python' / 'tests' / 'fixtures' / 'visible_v3'))
         assert r.returncode == 0, r.stdout[-500:]
     fix = PY / 'tests' / 'fixtures' / 'visible_v3'
     d = tmp_path / 'new'

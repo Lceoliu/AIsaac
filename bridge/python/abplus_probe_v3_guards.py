@@ -112,13 +112,14 @@ local e = Isaac.Spawn(1000, __VAR__, 0, p.Position + Vector(60, 0), Vector(0, 0)
 e.CollisionDamage = 0
 e.EntityCollisionClass = __CLASS__
 e.Visible = true
-return tostring(e.EntityCollisionClass) .. ',' .. tostring(e.CollisionDamage)
+return tostring(e.InitSeed)
 """
 SEEN = r"""
 local out = {}
 for _, e in ipairs(Isaac.GetRoomEntities()) do
   if e.Type == 1000 and e.Variant == __VAR__ then
-    out[#out + 1] = tostring(e.Visible) .. '/' .. tostring(e.EntityCollisionClass) .. '/' .. tostring(e.CollisionDamage)
+    out[#out + 1] = tostring(e.InitSeed) .. '/' .. tostring(e.Visible) .. '/' .. tostring(e.EntityCollisionClass) ..
+      '/' .. tostring(e.CollisionDamage) .. '/' .. tostring(e.Position.X) .. '/' .. tostring(e.Position.Y)
   end
 end
 return table.concat(out, ',')
@@ -132,17 +133,25 @@ def check_decorative(c, cls, var):
     """C11 (2026-11-18): a listed decorative effect (1000.var, no damage) is left out with no entity collision and
     sent with one -- in the raw block and in the native frame alike (and the native frame equal to the reference).
     'seen': every such effect's visible / entity collision class / damage when the block is built."""
-    made = c.lua(DECOR.replace('__CLASS__', str(cls)).replace('__VAR__', str(var)))
-    seen = c.lua(SEEN.replace('__VAR__', str(var)))
+    seed = c.lua(DECOR.replace('__CLASS__', str(cls)).replace('__VAR__', str(var)))
+    seen = [s_.split('/') for s_ in c.lua(SEEN.replace('__VAR__', str(var))).split(',') if s_]
+    # (Codex round 9: the target itself, by its InitSeed -- exactly one, visible, no damage, the collision class set --
+    # in both cases, so a 'left out' is no entity that never was there)
+    mine = [s_ for s_ in seen if s_[0] == seed]
+    target = len(mine) == 1 and mine[0][1] == 'true' and int(mine[0][2]) == cls and float(mine[0][3]) == 0.0
+    x, y = (float(v) for v in mine[0][4:6]) if len(mine) == 1 else (None, None)
     raw = json.loads(c.lua("return visible_v3_raw()"))
-    in_raw = sum(1 for e in raw['entities'] if e['type'] == 1000 and e['variant'] == var)
+    at = lambda ex, ey: x is not None and abs(ex - x) < 1e-3 and abs(ey - y) < 1e-3
+    in_raw = sum(1 for e in raw['entities'] if e['type'] == 1000 and e['variant'] == var and at(e['x'], e['y']))
     native = c.lua(NATIVE)
-    out = dict(variant=var, spawned=made, seen=seen, in_raw=in_raw,
+    out = dict(variant=var, seed=seed, target=target, seen=seen, in_raw=in_raw,
                native=native[:40] if native.startswith('nil:') else 'frame')
     if not native.startswith('nil:'):
         frame = bytes.fromhex(native)
         f = VP.unpack_frame_v3(frame)
-        out['in_native'] = int(sum(1 for r in f['E'] if int(r[0]) == 1000 and int(r[1]) == var))
+        ox, oy = raw['origin']
+        out['in_native'] = int(sum(1 for r in f['E'] if int(r[0]) == 1000 and int(r[1]) == var and
+                                   at(float(r[3]) + ox, float(r[4]) + oy)))
         out['equals_reference'] = frame == VP.observation_frame_v3(raw)
     return out
 
@@ -152,8 +161,8 @@ def decorative_variant(b):
     for var in DECOR_VARIANTS:
         c = b.fork(tag='v3guards', lean=True, alarm=120)
         try:
-            c.lua(DECOR.replace('__CLASS__', '4').replace('__VAR__', str(var)))
-            if c.lua(SEEN.replace('__VAR__', str(var))).startswith('true/'):
+            seed = c.lua(DECOR.replace('__CLASS__', '4').replace('__VAR__', str(var)))
+            if any(s_.startswith(seed + '/true/') for s_ in c.lua(SEEN.replace('__VAR__', str(var))).split(',')):
                 return var
         finally:
             c.close()
@@ -223,7 +232,8 @@ def main():
                 try:
                     query(c, 2)
                     d = detail[f'decorative class {cls}'] = check_decorative(c, cls, var)
-                    ok_ = d['in_raw'] == want and d.get('in_native') == want and d.get('equals_reference') is True
+                    ok_ = d['target'] and d['in_raw'] == want and d.get('in_native') == want and \
+                        d.get('equals_reference') is True
                     checks[f'decorative 1000.{var} with collision class {cls}: {"sent" if want else "left out"}'] = ok_
                 finally:
                     c.close()

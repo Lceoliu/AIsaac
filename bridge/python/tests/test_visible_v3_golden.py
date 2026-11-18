@@ -20,9 +20,10 @@ NAMES = [f['name'] for f in MANIFEST['frames']]
 
 
 def test_the_cases_are_there():
-    assert len(NAMES) == 19 and not MANIFEST['errors']
+    assert len(NAMES) == 20 and not MANIFEST['errors']
     assert {f'shape-{s}' for s in ('1x1', 'IH', 'IV', '1x2', 'IIV', '2x1', 'IIH', '2x2', 'LTL', 'LTR', 'LBL', 'LBR')} <= set(NAMES)
-    assert {'offgrid', 'doorframe', 'longlived', 'devilprice', 'shooting', 'forgotten', 'forgotten-soul'} <= set(NAMES)
+    assert {'offgrid', 'doorframe', 'longlived', 'devilprice', 'shooting', 'forgotten', 'forgotten-soul',
+            'decorative-collision'} <= set(NAMES)
 
 
 @pytest.mark.parametrize('name', NAMES)
@@ -62,7 +63,8 @@ def _identity_check(f, eng):
         else:
             unmatched.append((int(r[0]), int(r[1]), int(r[2]), len(c)))
     missing = [(e['type'], e['variant'], e['subtype']) for k, e in enumerate(eng['entities']) if k not in used and
-               e['type'] != 1 and e['visible'] and not (e['type'] == 1000 and e['variant'] in VP.V3_DECORATIVE_WHY)]
+               e['type'] != 1 and e['visible'] and not (e['type'] == 1000 and e['variant'] in VP.V3_DECORATIVE_WHY and
+                                                        e['cdmg'] == 0 and e['coll'] == 0)]   # (C11, batch 6)
     return unmatched, missing
 
 
@@ -202,3 +204,18 @@ def test_body_order_in_every_golden_frame(name):
     encoder's frames the same way): the forgotten / forgotten-soul frames hold the Forgotten / the Soul at row 0
     (position_known 1) and the other right after it."""
     assert VP.v3_body_order(_frame(name)) == []
+
+
+def test_the_decorative_collision_frame_tells_the_c11_rules_apart():
+    """(batch 6) The golden frame 'decorative-collision': a listed decorative effect (1000.15) with no damage and entity
+    collision class 4 is in the engine's list (engine.json, its own InitSeed) and in the frame (an E row 1000.15 at its
+    position) -- under the batch 1-5 rule (no damage only) it was left out."""
+    eng = json.loads((FIX / 'decorative-collision.engine.json').read_text())
+    mine = [e for e in eng['entities'] if e['type'] == 1000 and e['variant'] == 15 and e['coll'] == 4 and e['cdmg'] == 0
+            and e['visible']]
+    assert len(mine) == 1
+    f = _frame('decorative-collision')
+    ox, oy = eng['g0'][0] - 20, eng['g0'][1] - 20
+    rows = [r for r in f['E'] if int(r[0]) == 1000 and int(r[1]) == 15 and
+            abs(r[3] - np.float32(mine[0]['x'] - ox)) < 1e-3 and abs(r[4] - np.float32(mine[0]['y'] - oy)) < 1e-3]
+    assert len(rows) == 1
