@@ -752,6 +752,12 @@ static uint64_t start_debug_player_init(void *players, uint64_t ptype, uint64_t 
 static int input_patched;              // how many of the three call sites go through the functions below
 static volatile int native_input;
 static uint32_t input_mask, input_held, input_triggered;
+// 2026-11-18 (drop): actions answered "pressed this frame" for the first query of a press only (the bridge's
+// TRIGGER_ONCE, abp_bridge.lua: AB+ updates the player twice per game frame, so its one IsActionTriggered(ACTION_DROP)
+// per player update saw the press twice and swapped the Schoolbag / the pocket slots back); input_once_used: those of
+// them answered true since the last ABP_INPUT
+#define INPUT_ONCE_MASK (1u << 11)   // ButtonAction.ACTION_DROP
+static uint32_t input_once_used;
 static uint64_t input_answers, input_passed;
 
 static inline int native_action(void *entity, unsigned action) {
@@ -764,7 +770,12 @@ static char input_hook_b(void *engine, void *entity, int hook, unsigned action, 
                                                                                              action, out);
     }
     if (native_action(entity, action)) {
-        *out = ((hook == 0 ? input_held : input_triggered) >> action) & 1;
+        unsigned char v = ((hook == 0 ? input_held : input_triggered) >> action) & 1;
+        if (hook != 0 && v && ((INPUT_ONCE_MASK >> action) & 1)) {   // (the first query of the press only)
+            if ((input_once_used >> action) & 1) v = 0;
+            input_once_used |= 1u << action;
+        }
+        *out = v;
         input_answers++;
         return 1;
     }
@@ -2880,6 +2891,7 @@ char *getenv(const char *name) {
             char *end = NULL;
             input_held = (uint32_t)strtoul(name + 10, &end, 10);
             input_triggered = end && *end == ':' ? (uint32_t)strtoul(end + 1, NULL, 10) : 0;
+            if (input_triggered) input_once_used = 0;   // (a new press: see INPUT_ONCE_MASK)
             return getenv_ok;
         }
         if (strncmp(name, "ABP_INPUT_ON:", 13) == 0) {

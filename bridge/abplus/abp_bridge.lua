@@ -208,6 +208,15 @@ local CONTROLLED = {
 	[A.ACTION_SHOOTLEFT] = true, [A.ACTION_SHOOTRIGHT] = true, [A.ACTION_SHOOTUP] = true, [A.ACTION_SHOOTDOWN] = true,
 	[A.ACTION_BOMB] = true, [A.ACTION_ITEM] = true, [A.ACTION_PILLCARD] = true, [A.ACTION_DROP] = true,
 }
+-- 2026-11-18 (drop, visible-v3 F2): actions whose "pressed this frame" is answered true once per press. AB+ updates
+-- the player twice per game frame (60 Hz; Entity_Player::Update, isaac.x64 0x6ade00) while state.triggered is cleared
+-- once per game frame (MC_POST_UPDATE, 30 Hz), so both player updates of the press's first frame saw it pressed this
+-- frame: control_drop_pocket_items (0x6a7780) swapped the Schoolbag's active items / the pocket slots twice (back again;
+-- 184 dropin4: the query, player update, post update sequence). Its IsActionTriggered(ACTION_DROP) is the only one for
+-- a player entity (one per player update): the first such query of a press answers true, every later one false.
+-- (ITEM, PILLCARD and BOMB have the same double answer; kept as they were: the trajectories of the models trained
+-- with them stay as they are.)
+local TRIGGER_ONCE = { [A.ACTION_DROP] = true }
 local MOVE = {
 	[0] = {}, [1] = { A.ACTION_UP }, [2] = { A.ACTION_UP, A.ACTION_RIGHT }, [3] = { A.ACTION_RIGHT },
 	[4] = { A.ACTION_RIGHT, A.ACTION_DOWN }, [5] = { A.ACTION_DOWN }, [6] = { A.ACTION_DOWN, A.ACTION_LEFT },
@@ -220,7 +229,7 @@ local SHOOT = {
 local state = {
 	server = nil, client = nil, seq = 0, bind_attempted = false,
 	control = true,
-	held = {}, triggered = {},
+	held = {}, triggered = {}, trigger_used = {},
 	frames_left = 0,
 	pending_reset = false, room_ready = false, settle = 0,
 	stats = { steps = 0, resets = 0 },
@@ -930,6 +939,7 @@ local function apply_action(cmd)
 	end
 	state.held = held
 	state.triggered = trig
+	state.trigger_used = {}
 	push_input()
 end
 
@@ -942,7 +952,12 @@ mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, function(_, entity, hook, action)
 	if hook == InputHook.IS_ACTION_PRESSED then
 		return state.held[action] == true
 	elseif hook == InputHook.IS_ACTION_TRIGGERED then
-		return state.triggered[action] == true
+		if state.triggered[action] ~= true then return false end
+		if TRIGGER_ONCE[action] then   -- (the first query of the press only: see TRIGGER_ONCE)
+			if state.trigger_used[action] then return false end
+			state.trigger_used[action] = true
+		end
+		return true
 	elseif hook == InputHook.GET_ACTION_VALUE then
 		return state.held[action] and 1.0 or 0.0
 	end
