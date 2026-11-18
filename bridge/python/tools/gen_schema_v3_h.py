@@ -62,14 +62,19 @@ def generate():
          '/* ---- F1: identity and header */',
          f'#define ABP_V3_SCHEMA "{S.SCHEMA}"', f'#define ABP_V3_VERSION {S.VERSION}',
          f'#define ABP_V3_FRAME_BYTES {S.FRAME_BYTES}', f'#define ABP_V3_MAGIC {S.MAGIC}',
-         f'#define ABP_V3_LAYOUT_GEN {S.LAYOUT_GEN}', f'#define ABP_V3_HEADER {S.HEADER}']
-    for k in ('H_MAGIC', 'H_SIZE', 'H_P', 'H_E', 'H_N', 'H_S', 'H_GEN', 'H_PRODUCER'):
+         f'/* header[6]: VERSION - {S.VERSION_BASE}, exact in float32 (schema_v3.version_word) */',
+         f'#define ABP_V3_VERSION_WORD {S.VERSION_WORD}', f'#define ABP_V3_HEADER {S.HEADER}']
+    for k in ('H_MAGIC', 'H_SIZE', 'H_P', 'H_E', 'H_N', 'H_S', 'H_VERSION', 'H_PRODUCER'):
         L.append(f'#define ABP_V3_{k} {getattr(S, k)}')
     for k, v in S.PRODUCER.items():
         L.append(f'#define ABP_V3_PRODUCER_{_ident(k)} {v}')
     L += ['', '/* ---- F1: room canvas (per cell: word 0 bits, word 1 bits, grid type, variant, state) */',
           f'#define ABP_V3_CANVAS_H {S.CANVAS_H}', f'#define ABP_V3_CANVAS_W {S.CANVAS_W}',
-          f'#define ABP_V3_ROOM_WORDS {S.ROOM_WORDS}', f'#define ABP_V3_RC {S.RC}']
+          f'#define ABP_V3_ROOM_WORDS {S.ROOM_WORDS}', f'#define ABP_V3_RC {S.RC}',
+          '/* the canvas frame (batch 1): origin = GetGridPosition(0) - (CELL / 2, CELL / 2); cell = floor(pos / CELL) */',
+          f'#define ABP_V3_CELL {S.CELL}',
+          '/* batch 2: the model clamps every scaled num column to +-NUM_CLAMP at decode (reference only: no producer',
+          ' * clamps, the wire is raw) */', f'#define ABP_V3_NUM_CLAMP_MILLI {int(round(S.NUM_CLAMP * 1000))}']
     L += _bits('W0', S.ROOM_W0) + _bits('W1', S.ROOM_W1)
     L += [f'#define ABP_V3_LOCAL_SIDE {S.LOCAL_SIDE}', f'#define ABP_V3_LOCAL {S.LOCAL}',
           '', '/* ---- F1: minimap (one float per cell) */', f'#define ABP_V3_MAP_SIDE {S.MAP_SIDE}',
@@ -114,6 +119,18 @@ def generate():
           f'#define ABP_V3_V2_META {S.V2_META}', f'#define ABP_V3_TEACH_META {S.TEACH_META}']
     L += [f'#define ABP_V3_V2_{_ident(k)} {i}' for i, k in enumerate(S.V2_FIELDS)]
     L += [f'#define ABP_V3_TEACH_{_ident(k)} {i}' for i, k in enumerate(S.TEACH_FIELDS)]
+    L += ['', '/* ---- the map cells of a RoomShape (schema_v3.MAP_SHAPE_CELLS: offsets from GridIndex, -1 padding;',
+          ' * another shape: cell 0 only) */', f'#define ABP_V3_MAP_SHAPES {max(S.MAP_SHAPE_CELLS) + 1}',
+          'static const signed char ABP_V3_MAP_SHAPE_CELLS[ABP_V3_MAP_SHAPES][4] = {'
+          + ', '.join('{' + ', '.join(str(c) for c in (list(S.MAP_SHAPE_CELLS.get(k, ())) + [-1] * 4)[:4]) + '}'
+                      for k in range(max(S.MAP_SHAPE_CELLS) + 1)) + '};']
+    L += ['', '/* ---- engine argument ranges, AB+ (schema_v3.ABP_RANGES; the producers loop only inside them) */']
+    for k, (v, _) in S.ABP_RANGES.items():
+        L.append(f'#define ABP_V3_ABP_{_ident(k)} {v}')
+    L += ['', '/* ---- decorative effects never sent (schema_v3.DECORATIVE_EFFECTS; dropped only while CollisionDamage is 0) */',
+          f'#define ABP_V3_DECORATIVE_N {len(S.DECORATIVE_EFFECTS)}',
+          'static const int ABP_V3_DECORATIVE[ABP_V3_DECORATIVE_N] = {'
+          + ', '.join(str(v) for v in sorted(S.DECORATIVE_EFFECTS)) + '};']
     L += ['', '#endif', '']
     return '\n'.join(L)
 

@@ -208,6 +208,20 @@ local CONTROLLED = {
 	[A.ACTION_SHOOTLEFT] = true, [A.ACTION_SHOOTRIGHT] = true, [A.ACTION_SHOOTUP] = true, [A.ACTION_SHOOTDOWN] = true,
 	[A.ACTION_BOMB] = true, [A.ACTION_ITEM] = true, [A.ACTION_PILLCARD] = true, [A.ACTION_DROP] = true,
 }
+-- 2026-11-18 (drop, visible-v3 F2): actions whose "pressed this frame" is answered true once per press. AB+ updates
+-- the player twice per game frame (60 Hz; Entity_Player::Update, isaac.x64 0x6ade00) while state.triggered is cleared
+-- once per game frame (MC_POST_UPDATE, 30 Hz), so both player updates of the press's first frame saw it pressed this
+-- frame: control_drop_pocket_items (0x6a7780) swapped the Schoolbag's active items / the pocket slots twice (back again;
+-- 184 dropin4: the query, player update, post update sequence). Its IsActionTriggered(ACTION_DROP) is the only one for
+-- a player entity (one per player update): the first such query of a press answers true, every later one false.
+-- A real key press is "triggered" in one input poll only (Manager::Update 0x7d84c0: one KAGE::Input::Manager::Poll,
+-- whose InputDeviceBase::Poll copies the current state to the previous one first, then one Game::Update with one
+-- player update). ITEM, PILLCARD and BOMB (control_active_item, control_pocket_item, control_bombs: one
+-- IsActionTriggered each per player update) have the same double answer; by default they keep it (the trajectories of
+-- the models trained with it stay as they are): ISAAC_RL_TRIGGER_ONCE=1 at launch, or ABP_SET_TRIGGER_ONCE(true) from
+-- game code (a probe, per clone), answers them once per press too. DROP (new, no history) is always once.
+local TRIGGER_ONCE = { [A.ACTION_DROP] = true }
+local TRIGGER_ONCE_ALL = { A.ACTION_ITEM, A.ACTION_PILLCARD, A.ACTION_BOMB }
 local MOVE = {
 	[0] = {}, [1] = { A.ACTION_UP }, [2] = { A.ACTION_UP, A.ACTION_RIGHT }, [3] = { A.ACTION_RIGHT },
 	[4] = { A.ACTION_RIGHT, A.ACTION_DOWN }, [5] = { A.ACTION_DOWN }, [6] = { A.ACTION_DOWN, A.ACTION_LEFT },
@@ -217,10 +231,22 @@ local SHOOT = {
 	[0] = {}, [1] = { A.ACTION_SHOOTUP }, [2] = { A.ACTION_SHOOTRIGHT }, [3] = { A.ACTION_SHOOTDOWN }, [4] = { A.ACTION_SHOOTLEFT },
 }
 
+-- (2026-11-18) ISAAC_RL_VISIBLE_V3 at launch: 0-3, anything else is 0 with a line on stderr (the worker refuses such a
+-- value itself, and checks the bridge's mode after connecting: abplus.check_visible_v3)
+local function v3_launch_mode()
+	local raw = getenv("ISAAC_RL_VISIBLE_V3") or "0"
+	local m = math.tointeger(tonumber(raw))
+	if raw ~= "" and (m == nil or m < 0 or m > 3) then
+		print("abp_bridge: ISAAC_RL_VISIBLE_V3=" .. raw .. " is not 0-3; visible-v3 off")
+		return 0
+	end
+	return m or 0
+end
+
 local state = {
 	server = nil, client = nil, seq = 0, bind_attempted = false,
 	control = true,
-	held = {}, triggered = {},
+	held = {}, triggered = {}, trigger_used = {},
 	frames_left = 0,
 	pending_reset = false, room_ready = false, settle = 0,
 	stats = { steps = 0, resets = 0 },
@@ -257,6 +283,11 @@ local state = {
 	-- see pack_lean) and the run-mode map rules. Off unless ISAAC_RL_LEAN_ITEMS=1 at launch or the `lean_items` command
 	-- (clones inherit it); off, the bytes on the wire are those of abp-0.2.15.
 	lean_items = getenv("ISAAC_RL_LEAN_ITEMS") == "1",
+	-- visible-v3 (package C, 2026-11-17; 0 = off, the default): 1 the lean payload's visible block (flag 32) is
+	-- visible_v3_raw()'s JSON (schema "isaac-visible-raw-v3") instead of the v2 block; 2 the native v3 frame
+	-- (abp_native_v3, flag 64; the raw block, flag 32, when it hands back); 3 both (the check mode). The native
+	-- visible step (G) is not used then. ISAAC_RL_VISIBLE_V3=<mode> at launch, or the visible_v3 command
+	visible_v3 = v3_launch_mode(),
 }
 
 -- abp-0.2.13: an undiscovered secret-room door (DOOR_HIDDEN) is not part of what the player sees.
@@ -882,7 +913,7 @@ local function try_accept()
 		log("client connected on port " .. cfg.port)
 		send({ type = "hello", version = VERSION, engine = "abplus-1.06", port = cfg.port,
 			privileged = cfg.privileged, game_frame = Game():GetFrameCount(), logic_frames = state.logic_frames,
-			step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items })
+			step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items, drop = true })
 	end
 end
 
@@ -899,11 +930,27 @@ local function push_input()
 	getenv("ABP_INPUT:" .. h .. ":" .. t)
 end
 
+local function trigger_once_mask()
+	local m = 0
+	for a in pairs(TRIGGER_ONCE) do m = m | (1 << a) end
+	return m
+end
+
+-- ISAAC_RL_TRIGGER_ONCE=1 / ABP_SET_TRIGGER_ONCE(all): ITEM, PILLCARD, BOMB answered once per press too (see
+-- TRIGGER_ONCE); the native input gets the same set (ABP_INPUT_ONCE:<mask>)
+function ABP_SET_TRIGGER_ONCE(all)
+	for _, a in ipairs(TRIGGER_ONCE_ALL) do TRIGGER_ONCE[a] = all and true or nil end
+	if state.native_input then getenv("ABP_INPUT_ONCE:" .. trigger_once_mask()) end
+	return trigger_once_mask()
+end
+if getenv("ISAAC_RL_TRIGGER_ONCE") == "1" then ABP_SET_TRIGGER_ONCE(true) end
+
 local function set_native_input(on)
 	if on and state.client and state.control then
 		local mask = 0
 		for a in pairs(CONTROLLED) do mask = mask | (1 << a) end
 		state.native_input = getenv("ABP_INPUT_ON:" .. mask) == "1"
+		if state.native_input then getenv("ABP_INPUT_ONCE:" .. trigger_once_mask()) end
 		push_input()
 	else
 		if state.native_input then getenv("ABP_INPUT_OFF") end
@@ -925,6 +972,7 @@ local function apply_action(cmd)
 	end
 	state.held = held
 	state.triggered = trig
+	state.trigger_used = {}
 	push_input()
 end
 
@@ -937,7 +985,12 @@ mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, function(_, entity, hook, action)
 	if hook == InputHook.IS_ACTION_PRESSED then
 		return state.held[action] == true
 	elseif hook == InputHook.IS_ACTION_TRIGGERED then
-		return state.triggered[action] == true
+		if state.triggered[action] ~= true then return false end
+		if TRIGGER_ONCE[action] then   -- (the first query of the press only: see TRIGGER_ONCE)
+			if state.trigger_used[action] then return false end
+			state.trigger_used[action] = true
+		end
+		return true
 	elseif hook == InputHook.GET_ACTION_VALUE then
 		return state.held[action] and 1.0 or 0.0
 	end
@@ -1693,6 +1746,19 @@ ABP_PU.play_armed = 0
 state.native_obs = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_OBS") or "1")) or 1
 ABP_NATIVE_OBS = { available = native_lean ~= nil, native = 0, fallbacks = 0, last_fallback = nil, checks = 0,
 	mismatches = 0, first = nil }
+-- Native visible block (G, 2026-11-12, same VERSION: what the worker decodes is unchanged). abp_turbo's
+-- abp_native_visible() builds visible_input_block()'s block in C from the same engine functions (one call per item id
+-- without luabridge, no Lua tables, no json.encode); the JSON keys come in a fixed order (decoders do not depend on it).
+-- Mode (ISAAC_RL_NATIVE_VISIBLE, or "native_visible" in the native_step command): 0 off (default: the Lua block),
+-- 1 native (and the native step's fast path takes the block along: native_step_obs), 2 check (both built, the Lua one
+-- sent; their json.decode compared: ABP_NATIVE_VIS.mismatches, the first difference kept).
+local native_visible = native_lean ~= nil and type(abp_native_visible) == "function" and abp_native_visible or nil
+-- (visible-v3) abp_native_v3(): the v3 frame bytes, or nil, why (abp_v3_native.c)
+local native_v3 = native_lean ~= nil and type(abp_native_v3) == "function" and abp_native_v3 or nil
+ABP_NATIVE_V3 = { available = native_v3 ~= nil, native = 0, fallbacks = 0, last_fallback = nil, flags = 32, reasons = {} }
+-- (the mode lives in the global ABP_NATIVE_VIS.mode: probes switch it in one clone with a lua command)
+ABP_NATIVE_VIS = { available = native_visible ~= nil, native = 0, fallbacks = 0, last_fallback = nil, checks = 0,
+	mismatches = 0, first = nil, step = 0, mode = math.tointeger(tonumber(getenv("ISAAC_RL_NATIVE_VISIBLE") or "0")) or 0 }
 -- Terrain block cache (2026-10-04, same VERSION: the bytes on the wire are unchanged). The lean terrain check resends
 -- the terrain block every LEAN_FULL_EVERY logic frames once anything in the room changed (a full pass after a change
 -- clears the full signature), each time built anew in Lua: the cells' tables and two json.encode, the costliest thing
@@ -1942,6 +2008,427 @@ local function lean_handles()
 	return game, game:GetRoom(), game:GetLevel(), Isaac.GetPlayer(0)
 end
 
+-- visible-v3 raw block (package C, 2026-11-17; schema_v3.py VERSION 2026111702, batch 1 / 2): every raw game value the
+-- v3 frame is built from, as JSON, for the Python reference encoder (visible_producer.observation_frame_v3) and the
+-- golden fixtures; the native encoder (abp_visible.c v3) must give the same frame bytes. Raw units throughout, world
+-- positions as the engine gives them (the encoder subtracts the canvas origin, sent here as origin = GetGridPosition(0)
+-- - (20, 20)); flag integers as 16-bit words (exact through the JSON encoder); entity kind raw 0..9 (the encoder writes
+-- kind + 1). Not on the lean payload yet (the probe and the fixtures call it through the lua command).
+-- Decorative effects, never sent (schema_v3 convention, the coordinator 2026-11-17): only effects that take no part in
+-- collisions, deal no damage, and whose position another sent entity already gives or that bear on no decision;
+-- anything uncertain is sent (and reported). Each with why; AB+ numbering = Rep below 118, 118+ Rep only. From the
+-- recorder's fx_omit list, without 121 LIGHT and 138 MIST (Rep only: the room's light and visibility, information the
+-- player sees -- sent, the coordinator 2026-11-17; their Rep form, one or several entities and whether their position
+-- means anything, UNVERIFIED until a Rep producer exists),
+-- with 114 FORGOTTEN_CHAIN. Kept only while CollisionDamage is 0 (v3_entities). visible_producer.V3_DECORATIVE: the same.
+local V3_DECORATIVE_SPEC = {
+	[2] = "BLOOD_EXPLOSION: the splash of a death: drawn after the kill, no collision, no damage",
+	[3] = "FLY_EXPLOSION: the splash of a fly dying: after the kill, no collision, no damage",
+	[4] = "ROCK_PARTICLE: debris of a broken rock: the rock cell is in the room canvas",
+	[5] = "BLOOD_PARTICLE: blood debris of a hit: no collision, no damage",
+	[7] = "BLOOD_SPLAT: a blood stain on the floor: no collision, no damage",
+	[11] = "BULLET_POOF: the poof of a projectile ending: the projectile itself was sent",
+	[12] = "TEAR_POOF_A: the poof of a tear ending: the tear itself was sent",
+	[13] = "TEAR_POOF_B: the poof of a tear ending: the tear itself was sent",
+	[14] = "CROSS_POOF: a poof animation: no collision, no damage",
+	[15] = "POOF01: a poof animation (spawn / death): no collision, no damage",
+	[16] = "POOF02: a poof animation (spawn / death): no collision, no damage",
+	[17] = "POOF04: a poof animation (spawn / death): no collision, no damage",
+	[18] = "BOMB_CRATER: the scorch mark a bomb leaves: no collision, no damage",
+	[21] = "TINY_BUG: ambient critter: no collision, no damage",
+	[27] = "WOOD_PARTICLE: debris of a broken object: no collision, no damage",
+	[33] = "TINY_FLY: ambient critter: no collision, no damage",
+	[35] = "TOOTH_PARTICLE: debris of a hit: no collision, no damage",
+	[38] = "SPIDER_EXPLOSION: the splash of a spider dying: after the kill, no collision",
+	[41] = "WATER_DROPLET: a drop falling from the ceiling (V1: above the grid): no collision, no damage",
+	[43] = "POOP_EXPLOSION: debris of a broken poop: the poop cell is in the room canvas",
+	[50] = "LASER_IMPACT: the flash where a laser hits: the laser itself (and its end point) was sent",
+	[58] = "POOP_PARTICLE: debris of a broken poop: no collision, no damage",
+	[62] = "ROCK_EXPLOSION: the burst of a broken rock: the rock cell is in the room canvas",
+	[63] = "WORM: ambient critter: no collision, no damage",
+	[64] = "BEETLE: ambient critter: no collision, no damage",
+	[66] = "EMBER_PARTICLE: sparks of a fire place: the fire itself (an entity) was sent",
+	[68] = "WALL_BUG: ambient critter on the walls: no collision, no damage",
+	[69] = "BUTTERFLY: ambient critter: no collision, no damage",
+	[70] = "BLOOD_DROP: a blood drop of a hit: no collision, no damage",
+	[75] = "BAR_PARTICLE: debris particles: no collision, no damage",
+	[77] = "LARGE_BLOOD_EXPLOSION: the splash of a big death: after the kill, no collision",
+	[79] = "TEAR_POOF_SMALL: the poof of a tear ending: the tear itself was sent",
+	[80] = "TEAR_POOF_VERYSMALL: the poof of a tear ending: the tear itself was sent",
+	[85] = "DIAMOND_PARTICLE: debris particles: no collision, no damage",
+	[86] = "NAIL_PARTICLE: debris particles: no collision, no damage",
+	[87] = "FALLING_EMBER: ambient embers: no collision, no damage",
+	[88] = "DARK_BALL_SMOKE_PARTICLE: smoke particles of a projectile: the projectile itself was sent",
+	[95] = "GOLD_PARTICLE: sparkle particles: no collision, no damage",
+	[98] = "COIN_PARTICLE: sparkle of a coin: the coin itself (a pickup) was sent",
+	[99] = "WATER_SPLASH: a splash in water: no collision, no damage",
+	[114] = "FORGOTTEN_CHAIN: the chain drawn between the Soul and the Forgotten body: both ends (the controlled body and the familiar 3.900) are sent; 9 segments, no new information (the coordinator, 2026-11-17)",
+	[130] = "LEECH_EXPLOSION: Rep: the splash of a leech dying: after the kill, no collision",
+	[131] = "MAGGOT_EXPLOSION: Rep: the splash of a maggot dying: after the kill, no collision",
+	[132] = "BIG_SPLASH: Rep: a splash in water: no collision, no damage",
+	[133] = "WATER_RIPPLE: Rep: a ripple in water: no collision, no damage",
+	[135] = "RAIN_DROP: Rep: a rain drop: no collision, no damage",
+	[140] = "BACKDROP_DECORATION: Rep: backdrop decoration: no collision, no damage",
+	[145] = "ROCK_POOF: Rep: the poof of a broken rock: the rock cell is in the room canvas",
+}
+local V3_DECORATIVE = {}
+for v, _ in pairs(V3_DECORATIVE_SPEC) do V3_DECORATIVE[v] = true end
+V3_DECORATIVE_LIST = V3_DECORATIVE
+-- The argument ranges of every indexed engine call of this block on AB+ (schema_v3.ABP_RANGES, the same values; a
+-- test compares them and checks that no loop bound here is a bare number). An index past a getter's own table reads
+-- other fields (HasWeaponType: no bounds check, golden7 / golden8), so every loop takes its bound from here.
+local V3_ABP = { weapon_type_max = 10, heart_slots = 24, door_slots = 8, collectibles = 553, pills = 14,
+	pocket_slots = 2, trinket_slots = 2, grid_cells = 448 }
+V3_ABP_RANGES = V3_ABP
+local V3_BODY_ANIMS = { "WalkDown", "WalkUp", "WalkLeft", "WalkRight", "HeadDown", "HeadUp", "HeadLeft", "HeadRight",
+	"Hit", "Death", "Appear", "TeleportUp", "TeleportDown", "Trapdoor" }
+
+local function v3_words(value, n)
+	local out = {}
+	local v = math.tointeger(value) or 0
+	for k = 0, n - 1 do out[k + 1] = (v >> (16 * k)) & 0xffff end
+	return out
+end
+
+local function v3_try(f, default)
+	local ok, v = pcall(f)
+	if ok and v ~= nil then return v end
+	return default
+end
+
+local function v3_body(p, index, role, n_players, cfg_players)
+	local pos, vel = p.Position, p.Velocity
+	local spr = p:GetSprite()
+	local animation = 0
+	for k, name in ipairs(V3_BODY_ANIMS) do
+		if spr:IsPlaying(name) or spr:IsFinished(name) then animation = k; break end
+	end
+	local controller = p.ControllerIndex
+	local bone_bits, weapon_bits = 0, 0
+	-- IsBoneHeart(i) over the heart slots only, (max + soul + 1) // 2 + bones (the engine's own limit, 0x667400; its
+	-- mask is a 32-bit field read as bit i & 31, so no bit past the slots is read)
+	local slots = math.min(V3_ABP.heart_slots, (p:GetMaxHearts() + p:GetSoulHearts() + 1) // 2 + p:GetBoneHearts())
+	for i = 0, slots - 1 do
+		if v3_try(function() return p:IsBoneHeart(i) end, false) then bone_bits = bone_bits | (1 << i) end
+	end
+	-- HasWeaponType only over AB+'s WeaponType 0..10 (no bounds check: an id past it reads other fields -- the
+	-- Forgotten sub-player's bit 11 differed between two runs of the same state, golden7 / golden8); bits above 0
+	for i = 0, V3_ABP.weapon_type_max do
+		if v3_try(function() return p:HasWeaponType(i) end, false) then weapon_bits = weapon_bits | (1 << i) end
+	end
+	-- the black-heart mask over the soul-heart slots only, (soul + 1) // 2 (a bit per full soul heart)
+	local black = p:GetBlackHearts() & ((1 << math.min(V3_ABP.heart_slots, (p:GetSoulHearts() + 1) // 2)) - 1)
+	local charge, charge_known = 0, 0
+	if index ~= nil and type(abp_player_charge) == "function" then charge, charge_known = abp_player_charge(index) or 0, 1 end
+	-- (no Entity.Index: on AB+ a player's Index is not reproducible -- 4294967295 / 1172069600 for the same state,
+	-- golden7 / golden7b; InitSeed identifies the body)
+	return { init_seed = p.InitSeed, x = pos.X, y = pos.Y, vx = vel.X, vy = vel.Y, size = p.Size,
+		hearts = p:GetHearts(), max_hearts = p:GetMaxHearts(), soul = p:GetSoulHearts(), bone = p:GetBoneHearts(),
+		eternal = p:GetEternalHearts(), golden = p:GetGoldenHearts(), broken = 0, rotten = 0,
+		extra_lives = p:GetExtraLives(), coins = p:GetNumCoins(), bombs = p:GetNumBombs(), keys = p:GetNumKeys(),
+		giga_bombs = 0, golden_bomb = 0, golden_key = 0, poop_mana = 0, soul_charge = 0, blood_charge = 0,
+		damage = p.Damage, max_fire_delay = p.MaxFireDelay, shot_speed = p.ShotSpeed, range = tear_range(p),
+		move_speed = p.MoveSpeed, luck = p.Luck, can_fly = B(p.CanFly), invulnerable = B(p:GetDamageCooldown() > 0),
+		controls = B(p.ControlsEnabled), dead = B(p:IsDead() or state.lethal[p.Index] == true),
+		head_dir = p:GetHeadDirection(), fire_dir = p:GetFireDirection(), move_dir = p:GetMovementDirection(),
+		sprite_frame = spr:GetFrame(), weapon_charge = charge, weapon_charge_known = charge_known,
+		ptype = p:GetPlayerType(), role = role, controller = controller or -1, controller_known = controller ~= nil and 1 or 0,
+		animation = animation, animation_known = animation ~= 0 and 1 or 0, black = black,
+		bone_bits = bone_bits, weapon_bits = weapon_bits, bone_slots_known = 1 }
+end
+
+local function v3_bodies(game)
+	-- de-duplicated by InitSeed (AB+: the Soul and the Forgotten share Entity.Index -- golden1, 2026-11-17; Rep
+	-- UNVERIFIED). position_known (schema batch 3): the body's entity is among the room's entities (by InitSeed); AB+'s
+	-- GetSubPlayer() never is (it sits at world (0, 0) whichever character is controlled: 184 subbody1 / subbody2)
+	local bodies, players, seen = {}, {}, {}
+	-- (schema batch 4: player 0's controlled body first; each sub-player right after its own player)
+	local in_room = {}
+	for _, e in ipairs(Isaac.GetRoomEntities()) do if e.Type == 1 then in_room[e.InitSeed] = true end end
+	local n = game:GetNumPlayers()
+	for i = 0, n - 1 do
+		local p = Isaac.GetPlayer(i)
+		if not seen[p.InitSeed] then
+			seen[p.InitSeed] = #bodies + 1
+			bodies[#bodies + 1] = v3_body(p, i, 1)
+			bodies[#bodies].position_known = in_room[p.InitSeed] and 1 or 0
+			players[#players + 1] = p
+		end
+		local sub = v3_try(function() return p:GetSubPlayer() end, nil)   -- (the Forgotten / the Soul; linked both ways)
+		if sub ~= nil and not seen[sub.InitSeed] then
+			seen[sub.InitSeed] = #bodies + 1
+			bodies[#bodies + 1] = v3_body(sub, nil, 3)
+			bodies[#bodies].position_known = in_room[sub.InitSeed] and 1 or 0
+			players[#players + 1] = sub
+			local main = seen[p.InitSeed]
+			bodies[#bodies].linked = main
+			if main then bodies[main].linked = #bodies end
+		end
+	end
+	return bodies, players
+end
+
+local function v3_entities(room, curses)
+	local ents = {}
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		local t = e.Type
+		if t ~= 1 and e.Visible and not (t == 1000 and V3_DECORATIVE[e.Variant] and e.CollisionDamage == 0) then
+			local npc = t >= 10 and t < 1000 and e:ToNPC() or nil
+			local kind = 0
+			local rec = { type = t, variant = e.Variant, subtype = e.SubType, x = e.Position.X, y = e.Position.Y,
+				vx = e.Velocity.X, vy = e.Velocity.Y, size = e.Size, size_mx = e.SizeMulti.X, size_my = e.SizeMulti.Y,
+				coll = e.EntityCollisionClass, gcoll = e.GridCollisionClass, cdmg = e.CollisionDamage,
+				sprite_frame = e:GetSprite():GetFrame(), age = e.FrameCount, flip_x = B(e.FlipX),
+				identity_known = 1, npc_flags = 0, champion = 0, boss_hp = 0, height = 0, fall = 0, scale = 0,
+				l_cos = 0, l_sin = 0, l_len = 0, l_ex = 0, l_ey = 0, l_radius = 0, l_circle = 0, price = 0,
+				tear = { 0, 0, 0, 0 }, proj = { 0, 0, 0, 0 }, flags_known = 4,
+				eflags = v3_words(v3_try(function() return e:GetEntityFlags() end, 0), 4) }
+			local spr = e:GetSprite()
+			local anim, names = 0, ANIMATIONS[t]
+			if names then
+				for k = 1, #names do
+					if spr:IsPlaying(names[k]) or spr:IsFinished(names[k]) then anim = k; break end
+				end
+			end
+			rec.anim = anim
+			if t == 2 then
+				local x = e:ToTear()
+				kind, rec.height, rec.fall, rec.scale = 1, x.Height, x.FallingSpeed, x.Scale
+				rec.tear, rec.flags_known = v3_words(x.TearFlags, 4), 4 | 1
+			elseif t == 9 then
+				local x = e:ToProjectile()
+				kind, rec.height, rec.fall, rec.scale = 2, x.Height, x.FallingSpeed, x.Scale
+				rec.proj, rec.flags_known = v3_words(x.ProjectileFlags, 4), 4 | 2
+			elseif t == 7 then
+				kind = 3
+				local l = laser_record(e)
+				local rad = math.rad(l.angle)
+				rec.l_cos, rec.l_sin, rec.l_len, rec.l_radius = math.cos(rad), math.sin(rad), l.length, l.radius
+				if l.circle then rec.l_circle, rec.l_ex, rec.l_ey = 1, e.Position.X, e.Position.Y
+				else rec.l_ex, rec.l_ey = l["end"][1], l["end"][2] end
+				rec.tear = v3_words(v3_try(function() return e:ToLaser().TearFlags end, 0), 4)
+				rec.flags_known = 4 | 1
+			elseif t == TYPE_BOMB then
+				kind = 4
+				-- (2026-11-18, Codex round 2: the tear flags known only when read; as abp_v3_native.c)
+				local ok, f = pcall(function() return e:ToBomb().Flags end)
+				if ok and f ~= nil then rec.tear, rec.flags_known = v3_words(f, 4), 4 | 1 end
+			elseif t == 5 then
+				kind = 5
+				local pk = e:ToPickup()
+				rec.price = pk and math.tointeger(pk.Price) or 0
+				if (curses & 64) ~= 0 and e.Variant == 100 then rec.subtype, rec.identity_known = 0, 0 end
+			elseif t == 8 then
+				kind = 7
+				local ok, f = pcall(function() return e:ToKnife().TearFlags end)   -- (as bombs)
+				if ok and f ~= nil then rec.tear, rec.flags_known = v3_words(f, 4), 4 | 1 end
+			elseif t == 3 then
+				kind = 8
+			elseif t == 1000 then
+				kind = 9
+			elseif npc then
+				kind = 6
+				local f = 0
+				if e:IsEnemy() then f = f + 1 end
+				if e:IsVulnerableEnemy() then f = f + 2 end
+				if e:IsBoss() then
+					f = f + 4
+					if e.MaxHitPoints > 0 then rec.boss_hp = e.HitPoints / e.MaxHitPoints end
+				end
+				if e:CanShutDoors() and not e:IsDead() then f = f + 8 end
+				rec.npc_flags = f
+				rec.champion = npc:GetChampionColorIdx() + 2
+			end
+			rec.kind = kind
+			ents[#ents + 1] = rec
+		end
+	end
+	return ents
+end
+
+local function v3_cells(room, level)
+	local cells = {}
+	local hazards = {}
+	for _, e in ipairs(Isaac.GetRoomEntities()) do
+		if e.Visible and e.Type == 1000 and e.CollisionDamage > 0 then   -- (a decorative effect has none)
+			hazards[#hazards + 1] = e
+		end
+	end
+	for i = 0, math.min(room:GetGridSize(), V3_ABP.grid_cells) - 1 do   -- (GetGridCollision has no upper bound check)
+		local pos = room:GetGridPosition(i)
+		local collision = room:GetGridCollision(i)
+		local g = room:GetGridEntity(i)
+		local gt, gv, gs = 0, 0, 0
+		if g then
+			gt = g:GetType()
+			if gt == GridEntityType.GRID_DOOR and g:GetVariant() == DOOR_HIDDEN then gt = GridEntityType.GRID_WALL
+			elseif gt ~= GridEntityType.GRID_NULL and gt ~= GridEntityType.GRID_DECORATION then gv, gs = g:GetVariant(), g.State
+			else gt = 0 end
+		end
+		local pit = collision == GridCollisionClass.COLLISION_PIT
+		local solid = collision ~= GridCollisionClass.COLLISION_NONE and not pit
+		local destructible = solid and g ~= nil and (g:ToRock() ~= nil or g:ToPoop() ~= nil or g:ToTNT() ~= nil)
+		local hazard = gt == GridEntityType.GRID_SPIKES or gt == GridEntityType.GRID_SPIKES_ONOFF
+		for _, e in ipairs(hazards) do
+			if pos:Distance(e.Position) <= e.Size + 28.3 then hazard = true end
+		end
+		cells[i + 1] = { B(room:IsPositionInRoom(pos, 0)), collision, B(solid), B(pit), B(destructible), B(hazard),
+			gt, gv, gs }
+	end
+	local doors = {}
+	for slot = 0, V3_ABP.door_slots - 1 do
+		local d = room:GetDoor(slot)
+		if d and visible_door(d) then
+			local visited, clear = 0, 0
+			pcall(function()
+				local behind = level:GetRoomByIdx(d.TargetRoomIndex)
+				if behind.VisitedCount > 0 then visited = 1; clear = behind.Clear and 1 or 0 end
+			end)
+			doors[#doors + 1] = { slot = slot, x = d.Position.X, y = d.Position.Y, open = B(d:IsOpen()),
+				locked = B(d:IsLocked()), target = math.tointeger(d.TargetRoomType) or 0, visited = visited, clear = clear,
+				variant = d:GetVariant(), state = d.State }
+		end
+	end
+	return cells, doors
+end
+
+local function v3_map(level, here)
+	local out = {}
+	if (level:GetCurses() & 4) ~= 0 then return out end   -- Curse of the Lost: no map
+	local rooms = level:GetRooms()
+	for i = 0, rooms.Size - 1 do
+		local r = rooms:Get(i)
+		local display, gi = r.DisplayFlags, r.GridIndex
+		if display ~= 0 and gi >= 0 and gi < 169 then
+			local d = r.Data
+			local visited = r.VisitedCount > 0
+			local known = visited or (display & 4) ~= 0
+			out[#out + 1] = { gi, d.Shape, known and d.Type or 0, B(visited), B(visited and r.Clear),
+				B(r.SafeGridIndex == here) }
+		end
+	end
+	return out
+end
+
+local function v3_items(players)
+	local game, config = Game(), Isaac.GetItemConfig()
+	local pool = game:GetItemPool()
+	local inventory, slots = {}, {}
+	for b, p in ipairs(players) do
+		local owner = b - 1
+		do
+			-- (GetCollectibleNum reads the player's count table at id without a check: ids below NUM_COLLECTIBLES only)
+			for id = 1, math.min(config:GetCollectibles().Size, V3_ABP.collectibles) - 1 do
+				local count = p:GetCollectibleNum(id)
+				if count > 0 then inventory[#inventory + 1] = { owner, id, count } end
+			end
+			local active, charge = p:GetActiveItem(), p:GetActiveCharge()
+			local ac = active ~= 0 and config:GetCollectible(active) or nil
+			slots[#slots + 1] = { owner = owner, family = 1, slot = 0, id = active, occupied = B(active ~= 0), selected = 1,
+				charge = charge, max_charge = ac and ac.MaxCharges or 0, battery = p:GetBatteryCharge() }
+			local secondary = p.SecondaryActiveItem
+			if p:HasCollectible(534) or secondary.Item ~= 0 then   -- Schoolbag (AB+ 534)
+				local id = secondary.Item
+				local desc = id ~= 0 and config:GetCollectible(id) or nil
+				slots[#slots + 1] = { owner = owner, family = 1, slot = 1, id = id, occupied = B(id ~= 0), selected = 0,
+					charge = secondary.Charge, max_charge = desc and desc.MaxCharges or 0, battery = secondary.BatteryCharge }
+			end
+			for slot = 0, math.min(p:GetMaxTrinkets(), V3_ABP.trinket_slots) - 1 do
+				local id = p:GetTrinket(slot)
+				slots[#slots + 1] = { owner = owner, family = 2, slot = slot, id = id & 0x7fff, occupied = B(id ~= 0),
+					selected = 0, golden = B((id & 0x8000) ~= 0), charge_known = 0 }
+			end
+			for slot = 0, math.min(p:GetMaxPoketItems(), V3_ABP.pocket_slots) - 1 do   -- (GetCard / GetPill: no check)
+				local pill, card = p:GetPill(slot), p:GetCard(slot)
+				-- IsPillIdentified reads a byte table at the colour without a check: colours 1 .. NUM_PILLS - 1 only
+				local identified = pill > 0 and pill < V3_ABP.pills and pool:IsPillIdentified(pill)
+				local effect = identified and (pool:GetPillEffect(pill) + 1) or 0
+				slots[#slots + 1] = { owner = owner, family = card ~= 0 and 4 or 3, slot = slot,
+					id = card ~= 0 and card or effect, occupied = B(pill ~= 0 or card ~= 0), selected = B(slot == 0),
+					id_known = B(pill == 0 or identified), charge_known = 0, pill_colour = pill & 0x7ff,
+					giant = B((pill & 0x800) ~= 0) }
+			end
+		end
+	end
+	return inventory, slots
+end
+
+-- (visible-v3 native) v3_map's rooms packed for abp_native_v3: GridIndex, Shape, icon, visited, clear, current (6 bytes)
+local function v3_map_bytes()
+	local level = Game():GetLevel()
+	local here = v3_try(function() return level:GetCurrentRoomDesc().SafeGridIndex end, -1)
+	local parts = {}
+	for _, m in ipairs(v3_map(level, here)) do parts[#parts + 1] = spack("<BBBBBB", m[1], m[2], m[3], m[4], m[5], m[6]) end
+	return table.concat(parts)
+end
+V3_MAP_BYTES = v3_map_bytes   -- (for the probes: abp_native_v3(V3_MAP_BYTES(), V3_LASER_BYTES()) in a lua command)
+
+-- (visible-v3 native) laser_record's values per laser (Isaac.FindByType(7)) for abp_native_v3: InitSeed, circle, radius,
+-- angle, length, end point, TearFlags (53 bytes); the native side finds them by InitSeed
+local function v3_laser_bytes()
+	local parts = {}
+	for _, e in ipairs(Isaac.FindByType(7, -1, -1, false, false)) do
+		local l = laser_record(e)
+		local tf = v3_try(function() return e:ToLaser().TearFlags end, 0)
+		parts[#parts + 1] = spack("<I4Bdddddi8", e.InitSeed, l.circle and 1 or 0, l.radius, l.angle, l.length,
+			l["end"][1], l["end"][2], math.tointeger(tf) or 0)
+	end
+	return table.concat(parts)
+end
+V3_LASER_BYTES = v3_laser_bytes
+
+-- (visible-v3) the raw block's JSON with every number exact: the game's json.encode writes numbers with tostring
+-- (Lua 5.3: "%.14g"), which loses a float's last bits, and a position minus the origin can sit exactly between two
+-- floats (|world| < 128, |canvas| >= 128): the reference then rounded the other way than the native frame (accept10k2,
+-- one value in 8,923 records). Integers as such, other numbers "%.17g" (exact for a double), keys sorted.
+local function v3_json(v)
+	local t = type(v)
+	if t == "number" then
+		if math.type(v) == "integer" then return string.format("%d", v) end
+		if v ~= v then return "NaN" end
+		if v == math.huge then return "Infinity" end
+		if v == -math.huge then return "-Infinity" end
+		if v == math.floor(v) and math.abs(v) < 2 ^ 53 then return string.format("%.1f", v) end
+		return string.format("%.17g", v)
+	elseif t == "string" then
+		return json.encode(v)
+	elseif t == "boolean" then
+		return v and "true" or "false"
+	elseif t == "table" then
+		local n = #v
+		if n > 0 or next(v) == nil then
+			local parts = {}
+			for i = 1, n do parts[i] = v3_json(v[i]) end
+			return "[" .. table.concat(parts, ",") .. "]"
+		end
+		local keys = {}
+		for k in pairs(v) do keys[#keys + 1] = tostring(k) end
+		table.sort(keys)
+		local parts = {}
+		for i, k in ipairs(keys) do parts[i] = json.encode(k) .. ":" .. v3_json(v[k]) end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	return "null"
+end
+
+function visible_v3_raw()
+	local game = Game()
+	local room, level = game:GetRoom(), game:GetLevel()
+	local g0 = room:GetGridPosition(0)
+	local curses = level:GetCurses()
+	local here = v3_try(function() return level:GetCurrentRoomDesc().SafeGridIndex end, -1)
+	local bodies, players = v3_bodies(game)
+	local cells, doors = v3_cells(room, level)
+	local inventory, slots = v3_items(players)
+	return v3_json({ schema = "isaac-visible-raw-v3", version = 2026111802, game_version = 1, control_scheme = 0,
+		origin = { g0.X - 20, g0.Y - 20 }, gw = room:GetGridWidth(), gh = room:GetGridHeight(),
+		room_type = room:GetType(), shape = room:GetRoomShape(), stage = level:GetStage(),
+		stage_type = v3_try(function() return level:GetStageType() end, 0),
+		difficulty = v3_try(function() return game.Difficulty end, 0), curses = curses, here = here,
+		frame = game:GetFrameCount(), bodies = bodies, entities = v3_entities(room, curses), cells = cells,
+		doors = doors, map = v3_map(level, here), inventory = inventory, slots = slots })
+end
+
 -- New visible contract: full per-body inventory on every decision. A changed item
 -- with the same total count cannot hide behind the legacy inventory cache.
 function visible_input_block()
@@ -1993,6 +2480,72 @@ function visible_input_block()
 	return spack("<s4", json.encode(result))
 end
 
+-- (G) deep equality of two decoded JSON values (check mode 2); the path of the first difference
+local function same_json(a, b, path)
+	if type(a) ~= type(b) then return false, path end
+	if type(a) ~= "table" then
+		if a == b then return true end
+		return false, path
+	end
+	for k, v in pairs(a) do
+		local ok, where = same_json(v, b[k], path .. "." .. tostring(k))
+		if not ok then return false, where end
+	end
+	for k, _ in pairs(b) do
+		if a[k] == nil then return false, path .. "." .. tostring(k) end
+	end
+	return true
+end
+
+-- The visible block as the mode says (see ABP_NATIVE_VIS); the Lua block when the native one hands over
+function visible_block()
+	if state.visible_v3 ~= 0 then   -- (v3: the raw block and / or the native frame; their flags in ABP_NATIVE_V3.flags)
+		local m, v = state.visible_v3, ABP_NATIVE_V3
+		local out, flags = "", 0
+		if m == 1 or m == 3 or native_v3 == nil then out, flags = spack("<s4", visible_v3_raw()), 32 end
+		local lethal = false   -- (a cancelled lethal hit: only the Lua block knows it, as for the native lean part)
+		for _, lv in pairs(state.lethal) do if lv == true then lethal = true end end
+		if (m == 2 or m == 3) and native_v3 ~= nil and not lethal then
+			local frame, why = native_v3(v3_map_bytes(), v3_laser_bytes())
+			if frame ~= nil then
+				out, flags = out .. spack("<s4", frame), flags + 64
+				v.native = v.native + 1
+			else
+				v.fallbacks, v.last_fallback = v.fallbacks + 1, why
+				v.reasons[tostring(why)] = (v.reasons[tostring(why)] or 0) + 1
+				if flags == 0 then out, flags = spack("<s4", visible_v3_raw()), 32 end
+			end
+		elseif (m == 2 or m == 3) and native_v3 ~= nil and lethal then
+			v.fallbacks, v.last_fallback = v.fallbacks + 1, "lethal hit cancelled"
+			v.reasons["lethal hit cancelled"] = (v.reasons["lethal hit cancelled"] or 0) + 1
+			if flags == 0 then out, flags = spack("<s4", visible_v3_raw()), 32 end
+		end
+		v.flags = flags
+		return out
+	end
+	local mode = native_visible ~= nil and ABP_NATIVE_VIS.mode or 0
+	if mode == 0 then return visible_input_block() end
+	local v = ABP_NATIVE_VIS
+	local nb, why = native_visible()
+	if nb == nil then
+		v.fallbacks, v.last_fallback = v.fallbacks + 1, why
+		return visible_input_block()
+	end
+	if mode == 1 then
+		v.native = v.native + 1
+		return nb
+	end
+	local ref = visible_input_block()
+	v.checks = v.checks + 1
+	local ok, where = same_json(json.decode(ref:sub(5)), json.decode(nb:sub(5)), "")
+	getenv(ok and "ABP_VIS_CHECK:0" or "ABP_VIS_CHECK:1")   -- (counted across the instance's clones: ABP_CLONE_STATS)
+	if not ok then
+		v.mismatches = v.mismatches + 1
+		if v.first == nil then v.first = { frame = state.logic_frames, where = where, lua = ref:sub(5), c = nb:sub(5) } end
+	end
+	return ref
+end
+
 function pack_lean(event)
 	local mode = native_lean ~= nil and state.native_obs or 0
 	local force = event ~= "step" or state.terrain_dirty
@@ -2013,13 +2566,13 @@ function pack_lean(event)
 	end
 	state.terrain_dirty = false
 	local terrain, map, inv, visible = lean_blocks(event, resend, here, clear)
-	return lean_fixed(mode, here, 32 + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) .. terrain
+	return lean_fixed(mode, here, (state.visible_v3 ~= 0 and ABP_NATIVE_V3.flags or 32) + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) .. terrain
 		.. map .. inv .. visible
 end
 
 -- The terrain block (when the terrain check says resend) and the map block (when it is due and changed) of a lean
 -- observation; "" for a block that is not sent.
-function lean_blocks(event, resend, here, clear)
+function lean_blocks(event, resend, here, clear, novis)
 	local terrain = ""
 	if resend then
 		local _, room, _, player0 = lean_handles()
@@ -2058,7 +2611,8 @@ function lean_blocks(event, resend, here, clear)
 		end
 	end
 	local inv = state.lean_items and lean_inventory(event, here) or ""
-	return terrain, map, inv, visible_input_block()
+	-- (G: novis: the native step appends the native visible block itself)
+	return terrain, map, inv, novis and "" or visible_block()
 end
 
 -- The fixed part of a lean observation (header .. entities .. lasers): native in mode 1 / 2 when it can, else Lua.
@@ -2313,9 +2867,10 @@ local function play_next()
 	local p = state.play
 	p.i = p.i + 1
 	local code = math.floor(tonumber(p.codes[p.i]) or 0)
-	-- 2026-10-06 (items): + 180 x the pill / card action (codes below 180 as before)
+	-- 2026-10-06 (items): + 180 x the pill / card action (codes below 180 as before); 2026-11-17 (visible-v3 F2):
+	-- + 360 x the drop action (codes below 360 as before)
 	apply_action({ move = code % 9, shoot = (code // 9) % 5, bomb = (code // 45) % 2, item = (code // 90) % 2,
-		pill = (code // 180) % 2 })
+		pill = (code // 180) % 2, drop = (code // 360) % 2 })
 	state.frames_left = math.max(1, math.floor(tonumber(p.repeats and p.repeats[p.i]) or p.rep))
 	state.stats.steps = state.stats.steps + 1
 	if ABP_PU.play and state.frames_left > 1 and state.lean and state.native_input and not state.stop_clear
@@ -2383,7 +2938,7 @@ local function fork_clone(cmd)
 	set_native_input(state.lean)   -- needs the connection: without a client the engine reads the real devices
 	send({ type = "hello", version = VERSION, engine = "abplus-1.06", clone = true, tag = cmd.tag,
 		game_frame = Game():GetFrameCount(), logic_frames = state.logic_frames, turbo = getenv("ABP_FORK_COUNTERS"),
-		step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items })
+		step_line = true, fork_many = FM_AVAILABLE, items = true, lean_items = state.lean_items, drop = true })
 end
 
 -- fork_many (2026-10-04, same VERSION; hello says fork_many = true when abp_turbo has ABP_FM_*): the hindsight teacher's
@@ -2506,10 +3061,12 @@ end
 -- step command {"cmd":"step","repeat":..,"move":..,"shoot":..,"bomb":..,"item":..} without goal, stop_clear or duel
 -- fields, without its JSON parse (json.decode of a step command cost 0.07-0.12 ms, more than the native observation).
 -- 2026-10-06 (items): an optional sixth number is the pill / card action ("S <repeat> <move> <shoot> <bomb> <item>
--- <pill>"); without it 0.
-local step_cmd = { move = 0, shoot = 0, bomb = 0, item = 0, pill = 0 }
-local function begin_step_line(rep, move, shoot, bomb, item, pill)
+-- <pill>"); without it 0. 2026-11-17 (visible-v3 F2; hello says drop = true): an optional seventh number, the drop
+-- action ("S <repeat> <move> <shoot> <bomb> <item> <pill> <drop>"), only after a sixth; without it 0.
+local step_cmd = { move = 0, shoot = 0, bomb = 0, item = 0, pill = 0, drop = 0 }
+local function begin_step_line(rep, move, shoot, bomb, item, pill, drop)
 	step_cmd.move, step_cmd.shoot, step_cmd.bomb, step_cmd.item, step_cmd.pill = move, shoot, bomb, item, pill or 0
+	step_cmd.drop = drop or 0
 	apply_action(step_cmd)
 	state.goal = nil
 	state.nav = { hit = false, changed = false, min = -1 }
@@ -2528,7 +3085,11 @@ end
 -- One command line; true when the frame loop goes on (a step, play, reset or close), false to wait for the next.
 local function handle_command(line)
 		if line:byte(1) == 83 then   -- "S": a step line
-			local rep, move, shoot, bomb, item, pill = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+) (%d+)$")
+			local rep, move, shoot, bomb, item, pill, drop = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+) (%d+) (%d+)$")
+			if rep == nil then
+				rep, move, shoot, bomb, item, pill = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+) (%d+)$")
+				drop = "0"
+			end
 			if rep == nil then
 				rep, move, shoot, bomb, item = line:match("^S (%d+) (%d+) (%d+) (%d+) (%d+)$")
 				pill = "0"
@@ -2539,7 +3100,7 @@ local function handle_command(line)
 			end
 			begin_step_line(math.tointeger(tonumber(rep)), math.tointeger(tonumber(move)),
 				math.tointeger(tonumber(shoot)), math.tointeger(tonumber(bomb)), math.tointeger(tonumber(item)),
-				math.tointeger(tonumber(pill)))
+				math.tointeger(tonumber(pill)), math.tointeger(tonumber(drop or "0")))
 			return true
 		end
 		local ok, cmd = pcall(json.decode, line)
@@ -2587,6 +3148,21 @@ local function handle_command(line)
 			state.priv = cmd.enabled ~= false
 			priv_reset()
 			send({ type = "ok", cmd = "priv", enabled = state.priv, sent = PRIV.sent, skipped = PRIV.skipped })
+		elseif cmd.cmd == "visible_v3" then   -- 2026-11-17 (visible-v3, package C): the v3 raw block in the lean payload
+			-- (2026-11-18, Codex round 2: a mode outside 0-3 is an error, the mode left as it was; before, mode 4 was
+			-- answered enabled = true and sent an empty block)
+			local mode = cmd.mode ~= nil and math.tointeger(tonumber(cmd.mode)) or nil
+			if cmd.mode ~= nil and (mode == nil or mode < 0 or mode > 3) then
+				send({ type = "error", cmd = "visible_v3", msg = "visible_v3: mode must be 0-3, got " .. tostring(cmd.mode),
+					mode = state.visible_v3 })
+			else
+				if mode ~= nil then state.visible_v3 = mode
+				elseif cmd.enabled ~= nil then state.visible_v3 = cmd.enabled == true and 1 or 0 end
+				local v = ABP_NATIVE_V3
+				send({ type = "ok", cmd = "visible_v3", enabled = state.visible_v3 ~= 0, mode = state.visible_v3,
+					native_available = v.available, native = v.native, fallbacks = v.fallbacks, last_fallback = v.last_fallback,
+					reasons = v.reasons })
+			end
 		elseif cmd.cmd == "lean_items" then   -- 2026-10-06 (items, Phase A): the inventory block and run-mode map rules
 			if cmd.enabled ~= nil then
 				state.lean_items = cmd.enabled == true
@@ -2614,10 +3190,15 @@ local function handle_command(line)
 		elseif cmd.cmd == "native_step" then   -- native step: 0 off, 1 on when available (see native_step_obs)
 			if cmd.mode ~= nil then state.native_step = math.tointeger(tonumber(cmd.mode)) or 1 end
 			if cmd.terrain_cache ~= nil then state.terrain_cache = math.tointeger(tonumber(cmd.terrain_cache)) or 1 end
-			local s, tc = ABP_NATIVE_STEP, ABP_TERRAIN_CACHE
+			if cmd.native_visible ~= nil then ABP_NATIVE_VIS.mode = math.tointeger(tonumber(cmd.native_visible)) or 0 end
+			local s, tc, v = ABP_NATIVE_STEP, ABP_TERRAIN_CACHE, ABP_NATIVE_VIS
 			send({ type = "ok", cmd = "native_step", mode = state.native_step, available = s.available, steps = s.steps,
 				lines = s.lines, other = s.other, fallbacks = s.fallbacks, blocks = s.blocks, last_fallback = s.last_fallback,
 				turbo = getenv("ABP_OBS_STATUS"), prof = getenv("ABP_STEP_PROF"), terrain_cache = state.terrain_cache,
+				-- (G) the native visible block: mode, availability, counts, the first difference in check mode
+				native_visible = ABP_NATIVE_VIS.mode, vis_available = v.available, vis_native = v.native, vis_step = v.step,
+				vis_fallbacks = v.fallbacks, vis_last_fallback = v.last_fallback, vis_checks = v.checks,
+				vis_mismatches = v.mismatches, vis_first = v.first, vis_turbo = getenv("ABP_VIS_STATUS"),
 				tc_available = tc.available, tc_hits = tc.hits, tc_builds = tc.builds, tc_checks = tc.checks,
 				tc_mismatches = tc.mismatches })
 		elseif cmd.cmd == "fork" then   -- abp-0.2.14
@@ -2761,30 +3342,38 @@ local function native_step_obs()
 	local s = ABP_NATIVE_STEP
 	local consecutive = s.consecutive
 	s.consecutive = false
-	local ok, terrain, map, inv, visible = pcall(lean_blocks, "step", resend, here, clear)
+	-- (G, 2026-11-12) native visible mode 1: lean_blocks leaves the visible block out; the fast path (no other block)
+	-- has abp_native_step append the native one, a slow one builds it below
+	local nvis = native_visible ~= nil and ABP_NATIVE_VIS.mode == 1 and state.visible_v3 == 0
+	local ok, terrain, map, inv, visible = pcall(lean_blocks, "step", resend, here, clear, nvis)
+	if ok and nvis and (terrain ~= "" or map ~= "" or inv ~= "") then visible = visible_block() end
 	if not ok or terrain ~= "" or map ~= "" or inv ~= "" or visible ~= "" then
 		s.blocks = s.blocks + 1
 		local sent = send_lean_payload(function()
 			if not ok then error(terrain) end
-			return lean_fixed(1, here, 32 + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) ..
+			return lean_fixed(1, here, (state.visible_v3 ~= 0 and ABP_NATIVE_V3.flags or 32) + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) ..
 				terrain .. map .. inv .. visible
 		end)
 		if sent then wait_command() end
 		return true
 	end
-	local code, a, b, cc, d, e, f = native_step(c:getfd(), state.logic_frames, state.seq, consecutive)
-	if code == 1 then   -- a step line: (repeat, move, shoot, bomb, item[, pill]: a library without it gives nil = 0)
+	local code, a, b, cc, d, e, f, g = native_step(c:getfd(), state.logic_frames, state.seq, consecutive, nvis)
+	if nvis and code ~= 0 then ABP_NATIVE_VIS.native, ABP_NATIVE_VIS.step = ABP_NATIVE_VIS.native + 1, ABP_NATIVE_VIS.step + 1 end
+	if code == 1 then   -- a step line: (repeat, move, shoot, bomb, item[, pill[, drop]]: a library without them gives nil = 0)
 		s.steps, s.lines, s.consecutive = s.steps + 1, s.lines + 1, true
 		ABP_NATIVE_OBS.native = ABP_NATIVE_OBS.native + 1
-		begin_step_line(a, b, cc, d, e, f)
+		begin_step_line(a, b, cc, d, e, f, g)
 	elseif code == 2 or code == 3 then   -- sent; another kind of command waits in the socket, or a bad step line
 		s.steps, s.other = s.steps + 1, s.other + 1
 		ABP_NATIVE_OBS.native = ABP_NATIVE_OBS.native + 1
 		if code == 3 then send({ type = "error", msg = "bad step line" }) end
 		wait_command()
-	elseif code == 0 then   -- nothing sent: the native fixed part handed over (a laser)
+	elseif code == 0 then   -- nothing sent: the native fixed part (or, G, the native visible block) handed over
 		s.fallbacks, s.last_fallback = s.fallbacks + 1, a
-		if send_lean_payload(function() return lean_fixed(1, here, 0) end) then wait_command() end
+		if nvis then   -- (the Lua visible block: the step's observation always carries one)
+			local vb = visible_input_block()
+			if send_lean_payload(function() return lean_fixed(1, here, 32) .. vb end) then wait_command() end
+		elseif send_lean_payload(function() return lean_fixed(1, here, 0) end) then wait_command() end
 	else   -- the connection failed
 		disconnect(a)
 	end

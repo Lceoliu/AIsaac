@@ -6,10 +6,11 @@
 
 /* ---- F1: identity and header */
 #define ABP_V3_SCHEMA "isaac-visible-prlmens-g-v3"
-#define ABP_V3_VERSION 2026111201
+#define ABP_V3_VERSION 2026111802
 #define ABP_V3_FRAME_BYTES 131072
 #define ABP_V3_MAGIC 61107
-#define ABP_V3_LAYOUT_GEN 3
+/* header[6]: VERSION - 2026000000, exact in float32 (schema_v3.version_word) */
+#define ABP_V3_VERSION_WORD 111802
 #define ABP_V3_HEADER 8
 #define ABP_V3_H_MAGIC 0
 #define ABP_V3_H_SIZE 1
@@ -17,7 +18,7 @@
 #define ABP_V3_H_E 3
 #define ABP_V3_H_N 4
 #define ABP_V3_H_S 5
-#define ABP_V3_H_GEN 6
+#define ABP_V3_H_VERSION 6
 #define ABP_V3_H_PRODUCER 7
 #define ABP_V3_PRODUCER_ABPLUS 0
 #define ABP_V3_PRODUCER_REP_J746 1
@@ -29,6 +30,11 @@
 #define ABP_V3_CANVAS_W 28
 #define ABP_V3_ROOM_WORDS 5
 #define ABP_V3_RC 21
+/* the canvas frame (batch 1): origin = GetGridPosition(0) - (CELL / 2, CELL / 2); cell = floor(pos / CELL) */
+#define ABP_V3_CELL 40
+/* batch 2: the model clamps every scaled num column to +-NUM_CLAMP at decode (reference only: no producer
+ * clamps, the wire is raw) */
+#define ABP_V3_NUM_CLAMP_MILLI 8000
 #define ABP_V3_W0_INSIDE_SHIFT 0
 #define ABP_V3_W0_INSIDE_BITS 1
 #define ABP_V3_W0_COLLISION_SHIFT 1
@@ -98,8 +104,8 @@
 /* frame floats = ABP_V3_FIXED + p * ABP_V3_BODY + e * ABP_V3_EF + n * ABP_V3_NF + s * ABP_V3_SF */
 
 /* ---- F1: columns (raw units on the wire; reserved columns 0) */
-#define ABP_V3_P_X 0   /* num: px from the room top-left */
-#define ABP_V3_P_Y 1   /* num: px from the room top-left */
+#define ABP_V3_P_X 0   /* num: canvas-frame px (Position.X - origin x) */
+#define ABP_V3_P_Y 1   /* num: canvas-frame px (Position.Y - origin y) */
 #define ABP_V3_P_VX 2   /* num: px/frame */
 #define ABP_V3_P_VY 3   /* num: px/frame */
 #define ABP_V3_P_SIZE 4   /* num: px */
@@ -131,20 +137,23 @@
 #define ABP_V3_P_INVULNERABLE 30   /* num: 0/1 (damage cooldown > 0) */
 #define ABP_V3_P_CONTROLS 31   /* num: 0/1 ControlsEnabled */
 #define ABP_V3_P_DEAD 32   /* num: 0/1 */
-#define ABP_V3_P_HEAD_DIR 33   /* num: Direction -1..3 */
-#define ABP_V3_P_FIRE_DIR 34   /* num: Direction -1..3 */
-#define ABP_V3_P_MOVE_DIR 35   /* num: Direction -1..3 */
+#define ABP_V3_P_HEAD_DIR 33   /* cat:direction: Direction -1..3 raw (direction_code) */
+#define ABP_V3_P_FIRE_DIR 34   /* cat:direction: Direction -1..3 raw (direction_code) */
+#define ABP_V3_P_MOVE_DIR 35   /* cat:direction: Direction -1..3 raw (direction_code) */
 #define ABP_V3_P_SPRITE_FRAME 36   /* num: sprite frame */
 #define ABP_V3_P_WEAPON_CHARGE 37   /* num: charge counter frames (known: P 51) */
 #define ABP_V3_P_BODY_INDEX 38   /* num: index in the frame */
 #define ABP_V3_P_LINKED_BODY 39   /* num: partner index + 1, 0 none */
 #define ABP_V3_P_STALL_SHARE 40   /* num: decisions since the last progress / the stall limit, 0..1 (known: P 53) */
+#define ABP_V3_P_GRID_W 41   /* num: GetGridWidth (cells; the room fills canvas columns 0..grid_w-1) */
+#define ABP_V3_P_GRID_H 42   /* num: GetGridHeight (cells; the room fills canvas rows 0..grid_h-1) */
 #define ABP_V3_P_HEALTH_KNOWN 48   /* known: not Curse of the Unknown */
 #define ABP_V3_P_CONTROLLER_KNOWN 49   /* known: ControllerIndex present */
 #define ABP_V3_P_ANIMATION_KNOWN 50   /* known: animation name known */
 #define ABP_V3_P_WEAPON_CHARGE_KNOWN 51   /* known: P 37 read */
 #define ABP_V3_P_BONE_SLOTS_KNOWN 52   /* known: IsBoneHeart readable (P 128..151) */
 #define ABP_V3_P_STALL_KNOWN 53   /* known: the stall rule exists here (AB+ training 1; a producer without it 0) */
+#define ABP_V3_P_POSITION_KNOWN 54   /* known: the body is a room entity (by InitSeed); 0: x / y / vx / vy and local patch 0 */
 #define ABP_V3_P_PTYPE 56   /* cat:ptype: PlayerType + 2 (-1 POSSESSOR -> 1) */
 #define ABP_V3_P_BODY_ROLE 57   /* cat:body_role: 1 main, 2 twin, 3 sub-player, 4 co-op baby, 5 co-op ghost */
 #define ABP_V3_P_CONTROLLER 58   /* cat:controller: ControllerIndex + 2 */
@@ -171,8 +180,8 @@
 #define ABP_V3_E_TYPE 0   /* id: EntityType (identity) */
 #define ABP_V3_E_VARIANT 1   /* id: variant (identity) */
 #define ABP_V3_E_SUBTYPE 2   /* id: subtype (identity; 0 for a pedestal under Curse of the Blind) */
-#define ABP_V3_E_X 3   /* num: px from the room top-left */
-#define ABP_V3_E_Y 4   /* num: px from the room top-left */
+#define ABP_V3_E_X 3   /* num: canvas-frame px (Position.X - origin x) */
+#define ABP_V3_E_Y 4   /* num: canvas-frame px (Position.Y - origin y) */
 #define ABP_V3_E_VX 5   /* num: px/frame */
 #define ABP_V3_E_VY 6   /* num: px/frame */
 #define ABP_V3_E_SIZE 7   /* num: px */
@@ -183,7 +192,7 @@
 #define ABP_V3_E_CDMG 12   /* num: CollisionDamage */
 #define ABP_V3_E_SPRITE_FRAME 13   /* num: frame */
 #define ABP_V3_E_AGE 14   /* num: FrameCount */
-#define ABP_V3_E_KIND 15   /* cat:entity_kind: 0 other, 1 tear, 2 projectile, 3 laser, 4 bomb, 5 pickup, 6 npc, 7 knife, 8 familiar, 9 effect */
+#define ABP_V3_E_KIND 15   /* cat:entity_kind: raw kind + 1: 1 other, 2 tear, 3 projectile, 4 laser, 5 bomb, 6 pickup, 7 npc, 8 knife, 9 familiar, 10 effect; 0 none */
 #define ABP_V3_E_NPC_FLAGS 16   /* bits8: 1 IsEnemy, 2 IsVulnerableEnemy, 4 IsBoss, 8 CanShutDoors */
 #define ABP_V3_E_ANIM 17   /* num: short animation list index */
 #define ABP_V3_E_FLIP_X 18   /* num: 0/1 */
@@ -195,11 +204,11 @@
 #define ABP_V3_E_L_COS 24   /* num: laser direction cos */
 #define ABP_V3_E_L_SIN 25   /* num: laser direction sin */
 #define ABP_V3_E_L_LEN 26   /* num: laser length px */
-#define ABP_V3_E_L_EX 27   /* num: laser end x px */
-#define ABP_V3_E_L_EY 28   /* num: laser end y px */
+#define ABP_V3_E_L_EX 27   /* num: laser end x, canvas-frame px */
+#define ABP_V3_E_L_EY 28   /* num: laser end y, canvas-frame px */
 #define ABP_V3_E_L_RADIUS 29   /* num: laser radius px */
 #define ABP_V3_E_L_CIRCLE 30   /* num: 0/1 */
-#define ABP_V3_E_PRICE 31   /* num: shop price (coins) */
+#define ABP_V3_E_PRICE 31   /* cat:price: Price raw: coins > 0, devil deal < 0 (price_code) */
 #define ABP_V3_E_IDENTITY_KNOWN 32   /* known: type / variant / subtype readable */
 #define ABP_V3_E_FLAGS_KNOWN 33   /* bits8: 1 tear namespace, 2 projectile, 4 entity flags, 8 anim_id */
 #define ABP_V3_E_TEAR_W_FIRST 34
@@ -285,6 +294,10 @@
 #define ABP_V3_CAT_NS_SLOT_FAMILY_SIZE 16
 #define ABP_V3_CAT_NS_CHARGE_TYPE_BASE 384
 #define ABP_V3_CAT_NS_CHARGE_TYPE_SIZE 16
+#define ABP_V3_CAT_NS_PRICE_BASE 400
+#define ABP_V3_CAT_NS_PRICE_SIZE 128
+#define ABP_V3_CAT_NS_DIRECTION_BASE 528
+#define ABP_V3_CAT_NS_DIRECTION_SIZE 8
 #define ABP_V3_GAME_VERSION_ABPLUS 1
 #define ABP_V3_GAME_VERSION_REP 2
 #define ABP_V3_GAME_VERSION_REP_PLUS 3
@@ -300,16 +313,16 @@
 #define ABP_V3_SLOT_FAMILY_POOP_SPELL 5
 #define ABP_V3_SLOT_FAMILY_CRAFTING_ITEM 6
 #define ABP_V3_SLOT_FAMILY_CRAFTING_OUTPUT 7
-#define ABP_V3_ENTITY_KIND_OTHER 0
-#define ABP_V3_ENTITY_KIND_TEAR 1
-#define ABP_V3_ENTITY_KIND_PROJECTILE 2
-#define ABP_V3_ENTITY_KIND_LASER 3
-#define ABP_V3_ENTITY_KIND_BOMB 4
-#define ABP_V3_ENTITY_KIND_PICKUP 5
-#define ABP_V3_ENTITY_KIND_NPC 6
-#define ABP_V3_ENTITY_KIND_KNIFE 7
-#define ABP_V3_ENTITY_KIND_FAMILIAR 8
-#define ABP_V3_ENTITY_KIND_EFFECT 9
+#define ABP_V3_ENTITY_KIND_OTHER 1
+#define ABP_V3_ENTITY_KIND_TEAR 2
+#define ABP_V3_ENTITY_KIND_PROJECTILE 3
+#define ABP_V3_ENTITY_KIND_LASER 4
+#define ABP_V3_ENTITY_KIND_BOMB 5
+#define ABP_V3_ENTITY_KIND_PICKUP 6
+#define ABP_V3_ENTITY_KIND_NPC 7
+#define ABP_V3_ENTITY_KIND_KNIFE 8
+#define ABP_V3_ENTITY_KIND_FAMILIAR 9
+#define ABP_V3_ENTITY_KIND_EFFECT 10
 
 /* ---- F1: flags (16-bit words) */
 #define ABP_V3_FLAG_WORD_BITS 16
@@ -404,5 +417,24 @@ static const int abp_v3_action_code_mul[ABP_V3_N_HEADS] = {1, 9, 45, 90, 180, 36
 #define ABP_V3_TEACH_DEPTH 16
 #define ABP_V3_TEACH_SAFE 17
 #define ABP_V3_TEACH_PAD 18
+
+/* ---- the map cells of a RoomShape (schema_v3.MAP_SHAPE_CELLS: offsets from GridIndex, -1 padding;
+ * another shape: cell 0 only) */
+#define ABP_V3_MAP_SHAPES 13
+static const signed char ABP_V3_MAP_SHAPE_CELLS[ABP_V3_MAP_SHAPES][4] = {{-1, -1, -1, -1}, {0, -1, -1, -1}, {0, -1, -1, -1}, {0, -1, -1, -1}, {0, 13, -1, -1}, {0, 13, -1, -1}, {0, 1, -1, -1}, {0, 1, -1, -1}, {0, 1, 13, 14}, {1, 13, 14, -1}, {0, 13, 14, -1}, {0, 1, 14, -1}, {0, 1, 13, -1}};
+
+/* ---- engine argument ranges, AB+ (schema_v3.ABP_RANGES; the producers loop only inside them) */
+#define ABP_V3_ABP_WEAPON_TYPE_MAX 10
+#define ABP_V3_ABP_HEART_SLOTS 24
+#define ABP_V3_ABP_DOOR_SLOTS 8
+#define ABP_V3_ABP_COLLECTIBLES 553
+#define ABP_V3_ABP_PILLS 14
+#define ABP_V3_ABP_POCKET_SLOTS 2
+#define ABP_V3_ABP_TRINKET_SLOTS 2
+#define ABP_V3_ABP_GRID_CELLS 448
+
+/* ---- decorative effects never sent (schema_v3.DECORATIVE_EFFECTS; dropped only while CollisionDamage is 0) */
+#define ABP_V3_DECORATIVE_N 48
+static const int ABP_V3_DECORATIVE[ABP_V3_DECORATIVE_N] = {2, 3, 4, 5, 7, 11, 12, 13, 14, 15, 16, 17, 18, 21, 27, 33, 35, 38, 41, 43, 50, 58, 62, 63, 64, 66, 68, 69, 70, 75, 77, 79, 80, 85, 86, 87, 88, 95, 98, 99, 114, 130, 131, 132, 133, 135, 140, 145};
 
 #endif

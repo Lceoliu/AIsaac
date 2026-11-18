@@ -515,6 +515,22 @@ MAX_ROOM_ATTEMPTS = 16
 MAX_ROOM_RETRIES = 8  # mixture rooms tried per seed before giving up
 
 
+def check_visible_v3(client, mode=None):
+    """visible-v3 (2026-11-18, Codex round 2): the bridge's mode (the visible_v3 query) against this client's
+    ISAAC_RL_VISIBLE_V3 (and the native encoder there for modes 2 / 3); a bridge without the command answers
+    'unknown cmd' (mode 0). A mismatch is refused like a bridge of another version (BridgeError). Returns the mode."""
+    from .visible_producer import check_bridge_mode
+    client._send({"cmd": "visible_v3"})
+    try:
+        reply = client._recv()
+    except BridgeError as exc:   # (_recv raises on an error reply)
+        reply = {"type": "error", "msg": str(exc)}
+    try:
+        return check_bridge_mode(reply, mode)
+    except ValueError as exc:
+        raise BridgeError(str(exc)) from None
+
+
 class RoomUnusable(BridgeError):
     """A mixture room cannot host this episode (content, not a failure): pick the next candidate."""
 
@@ -556,10 +572,11 @@ def chain_pairs(floor, start, rooms):
     return out
 
 
-def action_code(move: int, shoot: int, bomb: int = 0, item: int = 0, pill: int = 0) -> int:
+def action_code(move: int, shoot: int, bomb: int = 0, item: int = 0, pill: int = 0, drop: int = 0) -> int:
     """One action of the bridge's play command (abp-0.2.12): move 0-8, shoot 0-4, bomb and item 0/1; 2026-10-06 the pill /
-    card action 0/1 (+ 180; the bridge's play_next decodes it)."""
-    return int(move) + 9 * int(shoot) + 45 * int(bomb) + 90 * int(item) + 180 * int(pill)
+    card action 0/1 (+ 180; the bridge's play_next decodes it); 2026-11-17 (visible-v3 F2, schema_v3.action_code) the
+    drop action 0/1 (+ 360; 720 codes)."""
+    return int(move) + 9 * int(shoot) + 45 * int(bomb) + 90 * int(item) + 180 * int(pill) + 360 * int(drop)
 
 
 def joint_code(joint: int, bomb: int = 0, item: int = 0) -> int:
@@ -694,6 +711,7 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
             if reply.get("type") != "ok" or reply.get("version") != 2:
                 raise BridgeError(f"binary observations unavailable (bridge {hello.get('version')}): {reply}")
             self.obs_format = 2
+        check_visible_v3(self)
         return hello
 
     def _read_line(self):
@@ -851,14 +869,19 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
                     self.fm_stat[int(i) - 1] = [int(v) for v in fields[5:]]
         return [found.get(i + 1) for i in range(len(batches))]
 
-    def step_line(self, move, shoot, bomb=0, item=0, repeat=None, pill=0):
+    def step_line(self, move, shoot, bomb=0, item=0, repeat=None, pill=0, drop=0):
         """Send a step as the bridge's step line ("S <repeat> <move> <shoot> <bomb> <item>", 2026-10-04: no JSON on
         either side; the same step as the step command without goal, stop_clear or duel fields) when the bridge's hello
         offers it (step_line) and ISAAC_RL_STEP_LINE is not 0, else as the JSON step command. Only sends: read the
-        observation as after step (abplus_lean.read_lean in lean mode)."""
+        observation as after step (abplus_lean.read_lean in lean mode). 2026-11-17 (visible-v3 F2): drop 1 needs a bridge
+        whose hello says drop = true (the seventh number; the JSON step's drop field); drop 0 sends what it sent before."""
         rep = int(repeat or self.action_repeat)
+        if drop and not self.hello.get("drop"):
+            raise BridgeError("step_line: drop needs a bridge whose hello says drop = true")
         if self.hello.get("step_line") and STEP_LINE:
-            if pill:   # 2026-10-06: the sixth number (bridges that say items = true in their hello)
+            if drop:   # 2026-11-17: the seventh number (after the sixth)
+                self._sock.sendall(b"S %d %d %d %d %d %d %d\n" % (rep, move, shoot, bomb, item, pill, drop))
+            elif pill:   # 2026-10-06: the sixth number (bridges that say items = true in their hello)
                 self._sock.sendall(b"S %d %d %d %d %d %d\n" % (rep, move, shoot, bomb, item, pill))
             else:
                 self._sock.sendall(b"S %d %d %d %d %d\n" % (rep, move, shoot, bomb, item))
@@ -867,6 +890,8 @@ class AbplusTrainingEnv(IsaacTrainingEnv):
                    "item": int(item)}
             if pill:
                 msg["pill"] = int(pill)
+            if drop:
+                msg["drop"] = int(drop)
             self._send(msg)
 
     def play(self, codes, repeat=None, repeats=None, stop_clear=True, stop_room=False):

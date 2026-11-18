@@ -752,6 +752,14 @@ static uint64_t start_debug_player_init(void *players, uint64_t ptype, uint64_t 
 static int input_patched;              // how many of the three call sites go through the functions below
 static volatile int native_input;
 static uint32_t input_mask, input_held, input_triggered;
+// 2026-11-18 (drop): actions answered "pressed this frame" for the first query of a press only (the bridge's
+// TRIGGER_ONCE, abp_bridge.lua: AB+ updates the player twice per game frame, so its one IsActionTriggered(ACTION_DROP)
+// per player update saw the press twice and swapped the Schoolbag / the pocket slots back); input_once_used: those of
+// them answered true since the last ABP_INPUT
+// getenv("ABP_INPUT_ONCE:<mask>") sets the set (the bridge: DROP always; ITEM, PILLCARD, BOMB with
+// ISAAC_RL_TRIGGER_ONCE=1 / ABP_SET_TRIGGER_ONCE(true))
+static uint32_t input_once_mask = 1u << 11;   // ButtonAction.ACTION_DROP
+static uint32_t input_once_used;
 static uint64_t input_answers, input_passed;
 
 static inline int native_action(void *entity, unsigned action) {
@@ -764,7 +772,12 @@ static char input_hook_b(void *engine, void *entity, int hook, unsigned action, 
                                                                                              action, out);
     }
     if (native_action(entity, action)) {
-        *out = ((hook == 0 ? input_held : input_triggered) >> action) & 1;
+        unsigned char v = ((hook == 0 ? input_held : input_triggered) >> action) & 1;
+        if (hook != 0 && v && ((input_once_mask >> action) & 1)) {   // (the first query of the press only)
+            if ((input_once_used >> action) & 1) v = 0;
+            input_once_used |= 1u << action;
+        }
+        *out = v;
         input_answers++;
         return 1;
     }
@@ -994,7 +1007,8 @@ enum {
 struct cs_slot { int64_t pid; uint64_t cpu_exit_ns, kids_ns, reserved; };
 struct cs_map {
     char magic[8];          // "ABPCLST1"
-    uint64_t version, root_pid, n_purposes, n_fields, n_slots, slots_lost, reserved;
+    uint64_t version, root_pid, n_purposes, n_fields, n_slots, slots_lost;
+    uint64_t vis_checks, vis_mismatches, reserved;   // (v3, G: the bridge's native visible check mode 2, ABP_VIS_CHECK)
     uint64_t f[CS_P][CSF_N];
     struct cs_slot slot[CS_SLOTS];   // a clone's CPU at ABP_EXIT (and its reaped children's) until its parent reaps it
 };
@@ -1041,7 +1055,7 @@ static void cs_init(void) {
     }
     struct cs_map *c = (struct cs_map *)m;
     memcpy(c->magic, "ABPCLST1", 8);
-    c->version = 2; c->root_pid = (uint64_t)getpid(); c->n_purposes = CS_P; c->n_fields = CSF_N; c->n_slots = CS_SLOTS;
+    c->version = 3; c->root_pid = (uint64_t)getpid(); c->n_purposes = CS_P; c->n_fields = CSF_N; c->n_slots = CS_SLOTS;
     cs = m;
     fprintf(stderr, "ABP_CLONE_STATS %s\n", path);
 }
@@ -2170,7 +2184,8 @@ static const char *obs_fixed(long long lf, int extra, size_t *len) {
     if (why) goto give_up;
     // header, room, totals
     int clear = gbool(FN(R_CLEAR), room);
-    int flags = (clear ? 1 : 0) + (extra & 58) + (gbool(FN(G_PAUSED), (const void *)game) ? 4 : 0);   // 16: items
+    // 16: items; 64: the native visible-v3 frame (2026-11-17)
+    int flags = (clear ? 1 : 0) + (extra & 122) + (gbool(FN(G_PAUSED), (const void *)game) ? 4 : 0);
     PUT(0, (uint32_t)LEAN_MAGIC);
     PUT(4, (uint32_t)lf);
     PUT(8, (uint32_t)game_frame);
@@ -2252,7 +2267,8 @@ static int step_write_all(int fd, struct iovec *iov, int n) {
 }
 
 // Only the bytes of a step line are consumed (never past its newline): luasocket reads every other command itself.
-static int step_read(int fd, long long v[6], const char **why) {
+#include "abp_step_line.h"
+static int step_read(int fd, long long v[7], const char **why) {
     char line[64];
     size_t have = 0;
     for (;;) {
@@ -2295,27 +2311,16 @@ static int step_read(int fd, long long v[6], const char **why) {
         }
     }
     line[have - 1] = 0;
-    // "^S (%d+) (%d+) (%d+) (%d+) (%d+)$" as the bridge's Lua parse (numbers of up to 9 digits here); 2026-10-06 (items,
-    // Phase A): an optional sixth number, the pill / card action ("S <repeat> <move> <shoot> <bomb> <item> <pill>");
-    // without it the pill is 0
-    const char *c = line + 1;
-    v[5] = 0;
-    for (int i = 0; i < 6; i++) {
-        if (i == 5 && *c == 0) break;
-        if (*c != ' ') return 3;
-        c++;
-        if (*c < '0' || *c > '9') return 3;
-        long long x = 0;
-        int digits = 0;
-        while (*c >= '0' && *c <= '9') {
-            x = x * 10 + (*c - '0');
-            c++;
-            if (++digits > 9) return 3;
-        }
-        v[i] = x;
-    }
-    return *c == 0 ? 1 : 3;
+    // the numbers as the bridge's Lua parse reads them (abp_step_line.h: the 6th and 7th optional, 0 when absent)
+    return abp_step_line_parse(line, v);
 }
+
+// (G) the native visible block (vis_build, below): the state the native step reads
+static int vis_ready = -1;       // -1 not checked, 0 refused, 1 ready
+static uint64_t vis_calls, vis_fallbacks;
+static char *vis_buf;
+static size_t vis_len;
+static const char *vis_build(void);
 
 static int obs_lua_step(lua_State *L) {
     if (step_prof < 0) {
@@ -2331,18 +2336,30 @@ static int obs_lua_step(lua_State *L) {
     obs_calls++;
     int fd = (int)LTOINT(L, 1);
     long long lf = LTOINT(L, 2), seq = LTOINT(L, 3);
+    // (G, 2026-11-12) 5th argument true: the native visible block (vis_build) after the fixed part, flag 32
+    int vis = vis_ready == 1 && LTOBOOL(L, 5);
+    if (vis) {
+        const char *vwhy = vis_build();
+        if (vwhy) {
+            vis_fallbacks++;
+            LPUSHINT(L, 0);
+            LPUSHSTR(L, vwhy, strlen(vwhy));
+            return 2;
+        }
+        vis_calls++;
+    }
     size_t len = 0;
-    const char *why = obs_fixed(lf, 0, &len);
+    const char *why = obs_fixed(lf, vis ? 32 : 0, &len);
     if (why) {
         LPUSHINT(L, 0);
         LPUSHSTR(L, why, strlen(why));
         return 2;
     }
     char head[64];
-    int hn = snprintf(head, sizeof head, "L %zu step %lld\n", len, seq);
-    struct iovec iov[2] = {{head, (size_t)hn}, {obs_buf, len}};
+    int hn = snprintf(head, sizeof head, "L %zu step %lld\n", len + (vis ? vis_len : 0), seq);
+    struct iovec iov[3] = {{head, (size_t)hn}, {obs_buf, len}, {vis_buf, vis ? vis_len : 0}};
     uint64_t p1 = thread_ns();
-    int wrote = step_write_all(fd, iov, 2);
+    int wrote = step_write_all(fd, iov, vis ? 3 : 2);
     uint64_t p2 = thread_ns();
     if (wrote != 0) {
         step_io_errors++;
@@ -2350,7 +2367,7 @@ static int obs_lua_step(lua_State *L) {
         LPUSHSTR(L, "send failed", 11);
         return 2;
     }
-    long long v[6];
+    long long v[7];
     const char *err = "";
     int r = step_read(fd, v, &err);
     if (step_prof) {
@@ -2363,8 +2380,8 @@ static int obs_lua_step(lua_State *L) {
     if (r == 1) {
         step_lines++;
         LPUSHINT(L, 1);
-        for (int i = 0; i < 6; i++) LPUSHINT(L, v[i]);
-        return 7;
+        for (int i = 0; i < 7; i++) LPUSHINT(L, v[i]);
+        return 8;
     }
     if (r == 2 || r == 3) {
         if (r == 2) step_other++; else step_bad++;
@@ -2375,6 +2392,206 @@ static int obs_lua_step(lua_State *L) {
     LPUSHINT(L, -1);
     LPUSHSTR(L, err, strlen(err));
     return 2;
+}
+
+
+// ---- native visible block (G, 2026-11-12; abp_bridge.lua visible_input_block in C) ----
+// Lua: block = abp_native_visible() -- the visible-v2 extension block exactly as visible_input_block() returns it
+// (spack("<s4", json.encode(result)): a uint32 length and the JSON text), or nil, why. Every value comes from the very
+// functions luabridge binds the Lua names to (each address checked against its exported name, vis_check), called under
+// the same conditions as the Lua code (GetPillEffect only for an identified pill, GetCollectible only for an item id),
+// in the same order per player. The JSON text has a fixed key order (the Lua encoder's is the table's pairs order);
+// its decoders (the worker's json.loads, the bridge's json.decode in check mode 2) do not depend on the order. Lua names
+// -> functions (LuaEngine::register_classes, 2026-11-12): GetCollectibleNum = Entity_Player::NumCollectibleHeld,
+// ControllerIndex = GetControllerIndex, SecondaryActiveItem = the ActiveItemDesc at +0x38e8 (Item +0, Charge +4,
+// BatteryCharge +8), ItemConfig::Item MaxCharges +0x44, Isaac.GetItemConfig = LuaEngine::lua_get_itemconfig,
+// GetCollectibles().Size = the size of ItemConfig's vector of Item* (GetCollectibles returns the ItemConfig itself).
+#define VIS_FUNC_LIST(X) \
+    X(V_NUM_HELD, 0x65cc20, "_ZNK13Entity_Player18NumCollectibleHeldE16eCollectibleType") \
+    X(V_HAS_COLL, 0x656020, "_ZNK13Entity_Player14HasCollectibleE16eCollectibleType") \
+    X(V_BATTERY, 0x781770, "_ZNK13Entity_Player16GetBatteryChargeEv") \
+    X(V_MAX_TRINKETS, 0x655c90, "_ZNK13Entity_Player14GetMaxTrinketsEv") \
+    X(V_TRINKET, 0x657d40, "_ZNK13Entity_Player10GetTrinketEj") \
+    X(V_MAX_POCKET, 0x658df0, "_ZNK13Entity_Player16GetMaxPoketItemsEv") \
+    X(V_PILL, 0x657c10, "_ZNK13Entity_Player7GetPillEi") \
+    X(V_CARD, 0x657bf0, "_ZNK13Entity_Player7GetCardEi") \
+    X(V_CTRL, 0x781970, "_ZNK13Entity_Player18GetControllerIndexEv") \
+    X(V_ITEMCONFIG, 0x746680, "_ZN9LuaEngine18lua_get_itemconfigEv") \
+    X(V_IC_COLL, 0x7207d0, "_ZNK10ItemConfig14GetCollectibleEi") \
+    X(V_IC_COLLS, 0x780590, "_ZNK10ItemConfig15GetCollectiblesEv") \
+    X(V_ITEMPOOL, 0x781f00, "_ZN4Game11GetItemPoolEv") \
+    X(V_PILL_ID, 0x7815b0, "_ZNK8ItemPool16IsPillIdentifiedE10ePillColor") \
+    X(V_PILL_EFFECT, 0x728920, "_ZN8ItemPool13GetPillEffectE10ePillColor") \
+    X(V_CURSES, 0x732540, "_ZNK5Level9GetCursesEv")
+#define VIS_ENUM(id, va, name) VF_##id,
+enum { VIS_FUNC_LIST(VIS_ENUM) VF_COUNT };
+#define VIS_ENTRY(id, va, name) [VF_##id] = {(uintptr_t)va, name},
+static const struct { uintptr_t va; const char *name; } VIS_FUNCS[VF_COUNT] = { VIS_FUNC_LIST(VIS_ENTRY) };
+#define VFN(id) ((void *)VIS_FUNCS[VF_##id].va)
+#define PL_SECONDARY 0x38e8      // Entity_Player: ActiveItemDesc SecondaryActiveItem (Item, Charge, BatteryCharge: ints)
+#define IC_MAX_CHARGES 0x44      // ItemConfig::Item: int MaxCharges
+static char vis_refusal[160];
+static size_t vis_cap;
+
+static int vis_check(void) {
+    for (int i = 0; i < VF_COUNT; i++) {
+        Dl_info info;
+        if (!dladdr((void *)VIS_FUNCS[i].va, &info) || (uintptr_t)info.dli_saddr != VIS_FUNCS[i].va || !info.dli_sname ||
+            strcmp(info.dli_sname, VIS_FUNCS[i].name) != 0) {
+            snprintf(vis_refusal, sizeof vis_refusal, "%s not at 0x%lx", VIS_FUNCS[i].name, (unsigned long)VIS_FUNCS[i].va);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void vis_put(const char *t, size_t n) {
+    if (vis_len + n + 1 > vis_cap) {
+        size_t cap = vis_cap ? vis_cap : 4096;
+        while (cap < vis_len + n + 1) cap *= 2;
+        char *b = realloc(vis_buf, cap);
+        if (!b) abort();
+        vis_buf = b;
+        vis_cap = cap;
+    }
+    memcpy(vis_buf + vis_len, t, n);
+    vis_len += n;
+}
+static void vis_str(const char *t) { vis_put(t, strlen(t)); }
+static void vis_int(long long v) { char t[24]; int n = snprintf(t, sizeof t, "%lld", v); vis_put(t, (size_t)n); }
+static void vis_ints(const long long *v, int n) {   // "[a,b,...]"
+    vis_put("[", 1);
+    for (int k = 0; k < n; k++) {
+        if (k) vis_put(",", 1);
+        vis_int(v[k]);
+    }
+    vis_put("]", 1);
+}
+
+// The block into vis_buf[0 .. vis_len): 4 length bytes, then the JSON text. NULL, or why the Lua code builds it.
+static const char *vis_build(void) {
+    static const char *const ANIMS[14] = {"WalkDown", "WalkUp", "WalkLeft", "WalkRight", "HeadDown", "HeadUp", "HeadLeft",
+                                          "HeadRight", "Hit", "Death", "Appear", "TeleportUp", "TeleportDown", "Trapdoor"};
+    uintptr_t game = obs_game();
+    const void *level = game ? G0(const void *, G_LEVEL, (const void *)game) : NULL;
+    if (!level) return "no game or level";
+    const void *config = ((const void *(*)(void))VFN(V_ITEMCONFIG))();
+    const void *pool = ((const void *(*)(const void *))VFN(V_ITEMPOOL))((const void *)game);
+    if (!config || !pool) return "no item config or pool";
+    const void *colls = ((const void *(*)(const void *))VFN(V_IC_COLLS))(config);   // (std::vector<Item *>)
+    long size = (long)((*(const char *const *)((const char *)colls + 8) - *(const char *const *)colls) / (ptrdiff_t)sizeof(void *));
+    int n_players = (int)G0(long, G_NUM_PLAYERS, (const void *)game);
+    // three parts, as the Lua code appends them per player: bodies, inventory, slots
+    static char *parts[3];
+    static size_t pcap[3], plen[3];
+    plen[0] = plen[1] = plen[2] = 0;
+#define PART_PUT(k, t, n) do { \
+        size_t n_ = (n); \
+        if (plen[k] + n_ + 1 > pcap[k]) { \
+            size_t c_ = pcap[k] ? pcap[k] : 1024; \
+            while (c_ < plen[k] + n_ + 1) { c_ *= 2; } \
+            char *b_ = realloc(parts[k], c_); \
+            if (!b_) abort(); \
+            parts[k] = b_; \
+            pcap[k] = c_; \
+        } \
+        memcpy(parts[k] + plen[k], (t), n_); \
+        plen[k] += n_; \
+    } while (0)
+    vis_len = 0;
+    for (int i = 0; i < n_players; i++) {
+        const void *p = ((const void *(*)(int))FN(P_GET))(i);
+        if (!p) return "no player";
+        const void *sprite = G0(const void *, E_SPRITE, p);
+        int animation = 0;
+        for (int k = 0; k < 14 && sprite; k++) {
+            if (((char (*)(const void *, const char *))FN(ANM2_PLAYING))(sprite, ANIMS[k]) ||
+                ((char (*)(const void *, const char *))FN(ANM2_FINISHED))(sprite, ANIMS[k])) {
+                animation = k + 1;
+                break;
+            }
+        }
+        unsigned controller = ((unsigned (*)(const void *))VFN(V_CTRL))(p);
+        char t[160];
+        int n = snprintf(t, sizeof t, "%s{\"controller\":%u,\"controller_known\":1,\"animation\":%d,\"animation_known\":%d}",
+                         plen[0] ? "," : "", controller, animation, animation != 0 ? 1 : 0);
+        PART_PUT(0, t, (size_t)n);
+        for (long id = 1; id <= size - 1; id++) {
+            int count = ((int (*)(const void *, int))VFN(V_NUM_HELD))(p, (int)id);
+            if (count > 0) {
+                n = snprintf(t, sizeof t, "%s[%d,%ld,%d,1]", plen[1] ? "," : "", i, id, count);
+                PART_PUT(1, t, (size_t)n);
+            }
+        }
+        vis_len = 0;   // (vis_buf: this player's slot records, then copied into parts[2])
+        int active = G0(int, P_ACTIVE, p), charge = G0(int, P_CHARGE, p);
+        const void *ac = active != 0 ? ((const void *(*)(const void *, int))VFN(V_IC_COLL))(config, active) : NULL;
+        int maxcharge = ac ? FIELD(int32_t, ac, IC_MAX_CHARGES) : 0;
+        long long r0[13] = {i, 1, 0, active, active != 0, 1, charge, maxcharge, 1, 1, 1, 0,
+                            ((int (*)(const void *))VFN(V_BATTERY))(p)};
+        vis_ints(r0, 13);
+        const char *sec = (const char *)p + PL_SECONDARY;
+        int has534 = ((char (*)(const void *, int))VFN(V_HAS_COLL))(p, 534) != 0;   // (Schoolbag)
+        int sid = *(const int32_t *)sec;
+        if (has534 || sid != 0) {
+            const void *desc = sid != 0 ? ((const void *(*)(const void *, int))VFN(V_IC_COLL))(config, sid) : NULL;
+            long long r1[13] = {i, 1, 1, sid, sid != 0, 0, *(const int32_t *)(sec + 4), desc ? FIELD(int32_t, desc, IC_MAX_CHARGES) : 0,
+                                1, 1, 1, 0, *(const int32_t *)(sec + 8)};
+            vis_put(",", 1);
+            vis_ints(r1, 13);
+        }
+        int max_tr = ((int (*)(const void *))VFN(V_MAX_TRINKETS))(p);
+        for (int slot = 0; slot <= max_tr - 1; slot++) {
+            int id = ((int (*)(const void *, unsigned))VFN(V_TRINKET))(p, (unsigned)slot);
+            long long r2[13] = {i, 2, slot, id, id != 0, 0, 0, 0, 1, 1, 0, 0, 0};
+            vis_put(",", 1);
+            vis_ints(r2, 13);
+        }
+        int max_pk = ((int (*)(const void *))VFN(V_MAX_POCKET))(p);
+        for (int slot = 0; slot <= max_pk - 1; slot++) {
+            int pill = ((int (*)(const void *, int))VFN(V_PILL))(p, slot), card = ((int (*)(const void *, int))VFN(V_CARD))(p, slot);
+            int identified = pill != 0 && ((char (*)(const void *, int))VFN(V_PILL_ID))(pool, pill) != 0;
+            int effect = identified ? ((int (*)(const void *, int))VFN(V_PILL_EFFECT))(pool, pill) + 1 : 0;
+            long long r3[13] = {i, card != 0 ? 4 : 3, slot, card != 0 ? card : effect, (pill != 0 || card != 0), slot == 0,
+                                0, 0, (pill == 0 || identified), 1, 0, pill, 0};
+            vis_put(",", 1);
+            vis_ints(r3, 13);
+        }
+        if (plen[2]) PART_PUT(2, ",", 1);
+        PART_PUT(2, vis_buf, vis_len);
+    }
+    long curses = (long)((unsigned (*)(const void *))VFN(V_CURSES))(level);
+    long stage = (long)G0(int, L_STAGE, level);
+    vis_len = 0;
+    vis_put("\0\0\0\0", 4);
+    vis_str("{\"schema\":\"isaac-visible-prlmens-g-v2\",\"bodies\":[");
+    vis_put(parts[0] ? parts[0] : "", plen[0]);
+    vis_str("],\"inventory\":[");
+    vis_put(parts[1] ? parts[1] : "", plen[1]);
+    vis_str("],\"slots\":[");
+    vis_put(parts[2] ? parts[2] : "", plen[2]);
+    vis_str("],\"curses\":");
+    vis_int(curses);
+    vis_str(",\"stage\":");
+    vis_int(stage);
+    vis_str(",\"capabilities\":1}");
+    uint32_t body = (uint32_t)(vis_len - 4);
+    memcpy(vis_buf, &body, 4);
+#undef PART_PUT
+    return NULL;
+}
+
+static int vis_lua(lua_State *L) {
+    vis_calls++;
+    const char *why = vis_build();
+    if (why) {
+        vis_fallbacks++;
+        LPUSHNIL(L);
+        LPUSHSTR(L, why, strlen(why));
+        return 2;
+    }
+    LPUSHSTR(L, vis_buf, vis_len);
+    return 1;
 }
 
 // Lua: abp_pu_arm(n): the next n MC_POST_UPDATE calls are answered by pu_gate (0 disarms); abp_pu_take() -> how many
@@ -2397,6 +2614,8 @@ static int obs_lua_pu_take(lua_State *L) {
 // and registers the Lua globals abp_native_lean and abp_native_terrain (and abp_native_step, abp_native_terrain_key,
 // abp_player_charge (2026-10-07), abp_native_player_f (2026-10-08), abp_pu_arm / abp_pu_take). Returns "1", or nil when refused
 // (getenv("ABP_OBS_STATUS") says why).
+#include "abp_v3_native.c"   // (visible-v3, package C: abp_native_v3)
+
 static char *obs_init(void) {
     if (obs_ready < 0) obs_ready = obs_check();
     if (!obs_ready) return NULL;
@@ -2421,6 +2640,18 @@ static char *obs_init(void) {
     // only when this equals its own LEAN_ENTITY_BYTES
     LPUSHINT(L, LEAN_ENTITY_BYTES);
     ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_native_entity_bytes");
+    // (visible-v3, 2026-11-17) abp_native_v3, when its own addresses check out (a refusal leaves the rest registered)
+    if (v3_ready < 0) v3_ready = v3_check();
+    if (v3_ready == 1) {
+        ((void (*)(lua_State *, lua_cfn, int))FN(PUSHCCLOSURE))(L, v3_lua, 0);
+        ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_native_v3");
+    }
+    // (G, 2026-11-12) abp_native_visible, when its own addresses check out (a refusal leaves the rest registered)
+    if (vis_ready < 0) vis_ready = vis_check();
+    if (vis_ready == 1) {
+        ((void (*)(lua_State *, lua_cfn, int))FN(PUSHCCLOSURE))(L, vis_lua, 0);
+        ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_native_visible");
+    }
     if (pu_patched) {
         ((void (*)(lua_State *, lua_cfn, int))FN(PUSHCCLOSURE))(L, obs_lua_pu_arm, 0);
         ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_pu_arm");
@@ -2642,6 +2873,12 @@ char *getenv(const char *name) {
                      (unsigned long long)sp_recv, (unsigned long long)sp_between, (unsigned long long)step_calls);
             return sp;
         }
+        if (strcmp(name, "ABP_VIS_STATUS") == 0) {   // (G) the native visible block: "ready=.. calls=.. fallbacks=.. <refusal>"
+            static char vs[240];
+            snprintf(vs, sizeof vs, "ready=%d calls=%llu fallbacks=%llu %s", vis_ready, (unsigned long long)vis_calls,
+                     (unsigned long long)vis_fallbacks, vis_refusal);
+            return vs;
+        }
         if (strcmp(name, "ABP_OBS_STATUS") == 0) {
             static char why[400];
             snprintf(why, sizeof why, "ready=%d calls=%llu fallbacks=%llu terrain_calls=%llu step_calls=%llu "
@@ -2656,6 +2893,11 @@ char *getenv(const char *name) {
             char *end = NULL;
             input_held = (uint32_t)strtoul(name + 10, &end, 10);
             input_triggered = end && *end == ':' ? (uint32_t)strtoul(end + 1, NULL, 10) : 0;
+            if (input_triggered) input_once_used = 0;   // (a new press: see input_once_mask)
+            return getenv_ok;
+        }
+        if (strncmp(name, "ABP_INPUT_ONCE:", 15) == 0) {
+            input_once_mask = (uint32_t)strtoul(name + 15, NULL, 10);
             return getenv_ok;
         }
         if (strncmp(name, "ABP_INPUT_ON:", 13) == 0) {
@@ -2677,6 +2919,14 @@ char *getenv(const char *name) {
             return NULL;
         }
         if (strncmp(name, "ABP_FORK_PURPOSE:", 17) == 0) return cs_set_purpose(name + 17);   // (ABP_CLONE_STATS)
+        if (strncmp(name, "ABP_VIS_CHECK:", 14) == 0) {   // (G, check mode 2: one comparison, ":1" a difference; counted in
+            //                                            the ABP_CLONE_STATS file, every process of the instance)
+            if (cs) {
+                __atomic_fetch_add(&csm()->vis_checks, 1, __ATOMIC_RELAXED);
+                if (name[14] == '1') __atomic_fetch_add(&csm()->vis_mismatches, 1, __ATOMIC_RELAXED);
+            }
+            return getenv_ok;
+        }
         if (strcmp(name, "ABP_CLONE_SELF") == 0) {   // "<frames since the fork (a clone) or the start> <cpu_ns> <minflt>"
             static char cself[96];
             uint32_t fr = read_u32(G_GAME, GAME_FRAMECOUNT) - (is_child && cs_own >= 0 ? cs_frame0 : 0);
@@ -2892,6 +3142,7 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     if (len < 96 || rd_i(pl) != (int32_t)LEAN_MAGIC) return -1;
     int flags = pl[12], n_players = pl[13], n_doors = pl[14], n_lasers = pl[15];
     if (flags & (8 | 16)) return -2;                 // a map or inventory block: the decoder must see it
+    if (flags & 64) return -9;                       // a native visible-v3 frame (2026-11-18): the decoder must see it
     if (n_players < 1) return -1;
     ctx[RC_TSEEN] = 0;
     if (!(ctx[RC_HAVE_PREV] != 0)) return -4;          // the episode's first record

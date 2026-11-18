@@ -58,7 +58,7 @@ class LeanObs:
     __slots__ = ('logic_frames', 'game_frame', 'clear', 'paused', 'room', 'damage_taken', 'monsters_hp',
                  'blocking_hp', 'blocking_count', 'players', 'doors', 'entities', 'lasers', 'terrain', 'grid',
                  'terrain_version', 'terrain_changed', 'map', 'map_version', 'terrain_key', 'inv', 'inv_head',
-                 'inv_version', 'visible')
+                 'inv_version', 'visible', 'visible_at', 'visible_v3_frame')
 
     @property
     def dead(self):
@@ -133,11 +133,18 @@ class LeanDecoder:
             self.inv = np.frombuffer(payload, INV_ITEM, head[0], off + INV_HEADER.size)
             self.inv_version += 1
             off += INV_HEADER.size + INV_ITEM.itemsize * head[0]
-        o.visible = None
+        o.visible = o.visible_at = None
         if flags & 32:
             size = struct.unpack_from('<I', payload, off)[0]
             off += 4
+            o.visible_at = off   # (2026-11-12: where its JSON text starts; probes compare the bytes before it)
             o.visible = json.loads(payload[off:off+size])
+            off += size
+        o.visible_v3_frame = None
+        if flags & 64:   # (visible-v3, 2026-11-17: the native v3 frame bytes, abp_native_v3)
+            size = struct.unpack_from('<I', payload, off)[0]
+            off += 4
+            o.visible_v3_frame = payload[off:off+size]
             off += size
         if off != len(payload):
             raise ValueError(f'lean observation has {len(payload) - off} trailing bytes')
