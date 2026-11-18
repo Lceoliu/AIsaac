@@ -247,12 +247,21 @@ def _load(path, name):
 
 
 def test_native_probe_verdict():
+    """failures() on the probe's per-record accounting (2026-11-18, Codex round 3): every decoded record is both
+    blocks (compared), an allowed raw-only hand-back, or another missing frame (a failure); each section compared once
+    per record with both blocks; Codex's false pass (1 compared, the rest missing, no reason reported) fails."""
+    import os
+    before = os.environ.get('ISAAC_RL_VISIBLE_V3')
     probe = _load(PY / 'abplus_probe_v3_native.py', 'probe_v3_native')
-    good = {'P': dict(compared=5, equal=5), 'E': dict(compared=5, equal=5), 'missing': 1}
+    assert os.environ.get('ISAAC_RL_VISIBLE_V3') == before   # (no environment written at import)
+    acct = lambda both, ok=0, other=0: dict(both=both, raw_only_allowed=ok, other_missing=other, other_first=[])
+    good = {'records': acct(5, 1), 'P': dict(compared=5, equal=5), 'E': dict(compared=5, equal=5)}
     assert probe.failures(good, {'lethal hit cancelled': 1}, ['lethal hit cancelled']) is None
     assert probe.failures({**good, 'E': dict(compared=5, equal=4)}, {}, [])['differ'] == ['E']
-    assert probe.failures({'missing': 3}, {}, [])['nothing_compared']
-    assert probe.failures({'P': dict(compared=0, equal=0)}, {}, [])['nothing_compared']
+    assert probe.failures({**good, 'records': acct(5, 1, 1)}, {}, [])['other_missing'] == 1
+    assert probe.failures({'records': acct(1, 0, 9999), 'P': dict(compared=1, equal=1)}, {}, [])   # (Codex's case)
+    assert probe.failures({'records': acct(0), 'P': dict(compared=0, equal=0)}, {}, [])['nothing_compared']
+    assert probe.failures({**good, 'P': dict(compared=4, equal=4)}, {}, [])['compared_short'] == ['P']
     assert probe.failures(good, {'v3: grid size': 2}, ['lethal hit cancelled'])['reasons_not_allowed'] == ['v3: grid size']
 
 
@@ -270,21 +279,42 @@ def _run(args, **kw):
 
 
 def test_native_golden_cmp_exit_code(tmp_path):
+    """v3_native_golden_cmp.py (2026-11-18, Codex round 3): PASS only for the manifest's full set, each native frame
+    equal to its v3 frame word for word but for the stall columns, headers fitting their files. Fails: a changed P
+    float, a changed size word (header[1]), a whole float appended, a native file missing, no manifest."""
     tool = PY / 'tools' / 'v3_native_golden_cmp.py'
     names = 'header,canvas,minimap,P,local,E,N,S'
-    for f in ('forgotten', 'shooting'):
-        shutil.copy(FIX / f'{f}.v3.bin', tmp_path / f'{f}.v3.bin')
-        shutil.copy(FIX / f'{f}.v3.bin', tmp_path / f'{f}.native.bin')
-    r = _run([sys.executable, str(tool), str(tmp_path), names])
+    frames = ('forgotten', 'shooting')
+    (tmp_path / 'manifest.json').write_text(json.dumps(dict(frames=[dict(name=f) for f in frames])))
+    natives = {}
+    for f in frames:
+        shutil.copy(FIX / f'{f}.v3.bin', tmp_path / f'{f}.v3.bin')   # (stall 0.5 / 1, as the fixtures)
+        raw = json.loads((FIX / f'{f}.raw.json').read_text())['raw']
+        natives[f] = VP.observation_frame_v3(raw)                    # (stall 0, as the native side writes it)
+        (tmp_path / f'{f}.native.bin').write_bytes(natives[f])
+    run = lambda d=tmp_path: _run([sys.executable, str(tool), str(d), names])
+    r = run()
     assert r.returncode == 0 and 'PASS' in r.stdout, r.stdout + r.stderr
-    b = bytearray((tmp_path / 'shooting.native.bin').read_bytes())
-    b[V3.FIXED * 4 + 4 * 3] ^= 0x10   # a P float of body 0
-    (tmp_path / 'shooting.native.bin').write_bytes(bytes(b))
-    r = _run([sys.executable, str(tool), str(tmp_path), names])
-    assert r.returncode == 1 and 'FAIL' in r.stdout and 'shooting P differs' in r.stdout
+
+    def broken(how):
+        b = bytearray(natives['shooting'])
+        if how == 'P float':
+            b[V3.FIXED * 4 + 4 * 3] ^= 0x10
+        elif how == 'size word':
+            b[4:8] = struct.pack('<f', struct.unpack('<f', bytes(b[4:8]))[0] + 1)
+        elif how == 'a float appended':
+            b += bytes(4)
+        return bytes(b)
+    for how in ('P float', 'size word', 'a float appended'):
+        (tmp_path / 'shooting.native.bin').write_bytes(broken(how))
+        r = run()
+        assert r.returncode == 1 and 'FAIL' in r.stdout, (how, r.stdout)
+    (tmp_path / 'shooting.native.bin').unlink()
+    r = run()
+    assert r.returncode == 1 and 'shooting: a file is missing' in r.stdout
     empty = tmp_path / 'empty'
     empty.mkdir()
-    assert _run([sys.executable, str(tool), str(empty), names]).returncode == 1
+    assert run(empty).returncode == 1
 
 
 def test_accept_checks():
