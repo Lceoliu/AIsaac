@@ -87,6 +87,7 @@ from .abplus_lean import LeanDecoder, read_lean, read_lean_raw
 from .env import BridgeError
 from .tok_obs import ROW, EpisodeState, FastRow, encode_row, fast_row_function
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal
+from .visible_producer import fatal_active as VP_fatal_active
 
 STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins', 'deaths', 'timeouts', 'empty',
          'step_s', 'wait_s', 'fork_s', 'encode_s', 'finished', 'extra_episodes', 'teach', 'teach_s', 'searches',
@@ -191,6 +192,7 @@ FORK_MANY = os.environ.get('ISAAC_RL_FORK_MANY', '1') != '0'   # hindsight: the 
 # variable a terminated worker leaves its instance running (no watcher).
 # multiprocessing.Connection's framing of a one-byte message (big-endian length, then the byte)
 _MSG0, _MSG1, _REPLY = b'\x00\x00\x00\x010', b'\x00\x00\x00\x011', b'\x00\x00\x00\x01a'
+_MSGF = b'\x00\x00\x00\x01F'   # (2026-11-18) a worker's visible-v3 fatal: 'R' + the reason follows
 
 
 def start_seed(cfg, index, n):
@@ -800,8 +802,10 @@ def report_fatal(index, conn, exc, who='tok worker', fatal_dir=''):
             os.fsync(f.fileno())
     except OSError:
         pass
-    try:
-        conn.send_bytes(b'F' + text.encode('utf-8', 'replace')[:8000])
+    try:   # (two whole messages: 'F' alone -- 5 bytes, as the C++ actor reads a message -- then 'R' + the text, which
+        #     Python reads whole after the 'F', or in close() when the C++ actor took the 'F': no partial read)
+        conn.send_bytes(b'F')
+        conn.send_bytes(b'R' + text.encode('utf-8', 'replace')[:8000])
     except (OSError, ValueError):
         pass
 
@@ -1331,8 +1335,11 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
                 episode = None
                 mine[ST['close_s']] += time.perf_counter() - t_close
     except VisibleV3Fatal as exc:
-        v3_fatal = exc
-        report_fatal(index, conn, exc, fatal_dir=cfg.fatal_dir)   # (before the cleanup below)
+        if VP_fatal_active():
+            v3_fatal = exc
+            report_fatal(index, conn, exc, fatal_dir=cfg.fatal_dir)   # (before the cleanup below)
+        else:   # (mode 0: an ordinary error, as in 05f1622 -- no exit 86)
+            traceback.print_exc()
         mine[ST['errors']] += 1000
     except Exception:
         traceback.print_exc()
@@ -1680,8 +1687,10 @@ class TokSampler:
                     idx.append(i)
                     slots.append(2 * i + (msg == _MSG1))
                 else:   # 'x' (the worker ends), 'F' + a reason (a visible-v3 protocol error), EOF or anything else
-                    if msg[4:5] == b'F':
-                        self._take_reason(c, fd, msg)
+                    if msg == _MSGF:
+                        self._take_reason(c)
+                    elif msg[4:5] == b'R':
+                        self._read_rest(c, fd, msg)
                     self._drop(c)
             if not idx:
                 break
@@ -1697,8 +1706,20 @@ class TokSampler:
     def totals(self):
         return dict(zip(STATS, self.stats.sum(axis=0).tolist()))
 
-    def _take_reason(self, c, fd, head):
-        """poll_ready read 5 bytes of an 'F' message (4-byte length, 'F'): the rest is the worker's reason."""
+    def _take_reason(self, c):
+        """After a worker's 'F' message: its next message, 'R' + the reason (sent right after; up to 2 s)."""
+        i = self.index[c]
+        try:
+            if c.poll(2.0):
+                m = c.recv_bytes()
+                if m[:1] == b'R':
+                    self._fatal_reason[i] = m[1:].decode('utf-8', 'replace')
+        except (EOFError, OSError):
+            pass
+
+    def _read_rest(self, c, fd, head):
+        """poll_ready read the 5 first bytes of an 'R' message (4-byte length, 'R'; the C++ actor took the 'F'
+        before it): the rest is the reason."""
         n, got = int.from_bytes(head[:4], 'big') - 1, b''
         try:
             while len(got) < n:
@@ -1714,7 +1735,7 @@ class TokSampler:
         """A worker that ended with V3_FATAL_EXIT, or sent its reason / left its fatal_file (the exit code can be
         another one if its cleanup failed): self.fatal, with the reason (from the pipe, else the file) or a plain
         statement that none reached the parent."""
-        if self.fatal is not None:
+        if self.fatal is not None or not VP_fatal_active():   # (mode 0: never, as 05f1622)
             return
         p = self.procs[i]
         code = p.exitcode
@@ -1757,7 +1778,9 @@ class TokSampler:
                         idx.append(self.index[c])
                         slots.append(2 * self.index[c] + (msg == b'1'))
                     else:
-                        if msg[:1] == b'F':
+                        if msg == b'F':
+                            self._take_reason(c)
+                        elif msg[:1] == b'R':   # (the 'F' was read by the C++ actor)
                             self._fatal_reason[self.index[c]] = msg[1:].decode('utf-8', 'replace')
                         self._drop(c)
                 except (EOFError, OSError):

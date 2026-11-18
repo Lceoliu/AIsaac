@@ -170,6 +170,13 @@ class VisibleV3Fatal(Exception):
 
 V3_FATAL_EXIT = 86   # a sampler worker's exit code after a VisibleV3Fatal
 
+
+def fatal_active():
+    """(2026-11-18, the coordinator: mode 0 must behave as 05f1622) The fatal machinery -- the connect-time mode query,
+    a worker's exit 86, the parent reading it -- only for a worker configured for v3 (VISIBLE_V3_MODE != 0). In mode
+    0 there is no v3 protocol error to catch, and any way into the fatal path is risk only."""
+    return VISIBLE_V3_MODE != 0
+
 # Decorative effects never sent (abp_bridge.lua V3_DECORATIVE_SPEC; tests compare the two; the rule in schema_v3):
 # effect variant -> (name, why). The bridge drops one only while its CollisionDamage is 0. Not in it, sent: 121 LIGHT
 # and 138 MIST (Rep only: the room's light and visibility; their Rep form UNVERIFIED).

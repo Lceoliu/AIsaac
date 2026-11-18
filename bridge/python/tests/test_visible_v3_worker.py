@@ -165,12 +165,12 @@ def test_the_connect_check_with_the_clients_recv():
     c = Client(dict(type='ok', cmd='visible_v3', mode=2, native_available=True))
     assert check_visible_v3(c, 2) == 2 and c.sent == [{'cmd': 'visible_v3'}]
     sock = c._sock
-    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 2, this worker is configured for mode 0'):
-        check_visible_v3(c, 0)
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 2, this worker is configured for mode 1'):
+        check_visible_v3(c, 1)
     assert sock.closed and c._sock is None and not issubclass(VP.VisibleV3Fatal, (BridgeError, OSError, RuntimeError,
                                                                                   ValueError))
-    old = Client(dict(type='error', msg='unknown cmd'))
-    assert check_visible_v3(old, 0) == 0 and not old._sock.closed
+    old = Client(dict(type='error', msg='unknown cmd'))   # (mode 0: no query at all -- 05f1622's protocol)
+    assert check_visible_v3(old, 0) == 0 and old.sent == [] and not old._sock.closed
     with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 1'):
         check_visible_v3(old, 1)
     src = Path(al.__file__).with_name('abplus.py').read_text(encoding='utf-8')
@@ -204,14 +204,12 @@ def test_the_connect_check_retries_transport_errors_as_before(binary):
     from isaac_bridge.abplus import check_visible_v3
     from isaac_bridge.env import BridgeError, BridgeErrorReply
     c, other = _socket_client(binary=binary, answer=b'{"type":"error","msg":"unknown cmd"}\n')
-    assert check_visible_v3(c, 0) == 0
-    c, other = _socket_client(binary=binary, answer=b'{"type":"error","msg":"unknown cmd"}\n')
     with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 1'):
         check_visible_v3(c, 1)
     c, other = _socket_client(binary=binary, answer=b'{"type":"error","msg":"something else"}\n')
     with pytest.raises(VP.VisibleV3Fatal, match='did not answer'):
-        check_visible_v3(c, 0)
-    for mode in (0, 2):
+        check_visible_v3(c, 2)
+    for mode in (1, 2):
         c, other = _socket_client(None, binary)   # the game gone during the query
         with pytest.raises(BridgeError, match='connection closed by game') as got:
             check_visible_v3(c, mode)
@@ -219,7 +217,9 @@ def test_the_connect_check_retries_transport_errors_as_before(binary):
     c, other = _socket_client(binary=binary, answer=b'')
     c._sock = None   # not connected
     with pytest.raises(BridgeError, match='not connected'):
-        check_visible_v3(c, 0)
+        check_visible_v3(c, 1)
+    c, other = _socket_client(None, binary)   # mode 0: no query sent, nothing read (05f1622's protocol)
+    assert check_visible_v3(c, 0) == 0 and c._buf == b''
     c, other = _socket_client(binary=binary, answer=b'{"type":"error","msg":"x"}\n')   # the reply kept on the exception
     with pytest.raises(BridgeErrorReply) as got:
         c._recv()

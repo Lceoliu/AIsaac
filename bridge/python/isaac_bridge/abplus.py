@@ -520,7 +520,10 @@ def check_visible_v3(client, mode=None):
     ISAAC_RL_VISIBLE_V3 (and the native encoder there for modes 2 / 3); a bridge without the command answers
     'unknown cmd' (mode 0). A mismatch closes the connection and raises VisibleV3Fatal (a configuration error, not a
     game fault: the samplers' retries do not take it). Returns the mode."""
+    from . import visible_producer as VP
     from .visible_producer import VisibleV3Fatal, check_bridge_mode
+    if (VP.VISIBLE_V3_MODE if mode is None else mode) == 0:   # (mode 0: no query at all -- 05f1622's protocol)
+        return 0
     client._send({"cmd": "visible_v3"})
     try:
         reply = client._recv()

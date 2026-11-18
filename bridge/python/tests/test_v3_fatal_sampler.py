@@ -37,6 +37,12 @@ def _sampler(codes):
     return s
 
 
+@pytest.fixture(autouse=True)
+def v3_worker(monkeypatch):
+    """These tests are of a worker configured for v3 (the fatal machinery is off in mode 0: fatal_active)."""
+    monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', 2)
+
+
 def test_check_fatal_by_exit_code():
     _sampler([None, 0, 1, -15]).check_fatal()   # (running, ended, an ordinary failure, killed: not this)
     with pytest.raises(VP.VisibleV3Fatal, match='tok worker 2 stopped on a visible-v3 protocol error'):
@@ -249,7 +255,7 @@ def test_a_former_runs_file_is_not_this_runs_fatal(tmp_path):
     assert fatal_run_dir() != fatal_run_dir()
 
 
-def test_a_connection_closed_during_the_mode_query_is_retried_not_fatal():
+def test_a_connection_closed_during_the_mode_query_is_retried_not_fatal(monkeypatch):
     """(2026-11-18, A1's mode-0 smoke on c80c9f2: a worker exited 86 at the end of training, its reason lost) The
     path, deterministically: a StartBuilder's build connects a relaunched instance and the game goes away during the
     visible_v3 query (EOF). The builder's result is a plain BridgeError -- the worker's recover() relaunches, as
@@ -270,7 +276,7 @@ def test_a_connection_closed_during_the_mode_query_is_retried_not_fatal():
             c._sock, c._buf = ours, b''
             theirs.shutdown(socket.SHUT_WR)   # (the game gone: EOF on the answer)
             self.keep = theirs
-            check_visible_v3(c, 0)
+            check_visible_v3(c, 2)
     cfg = types.SimpleNamespace(build_timeout=30, reset_timeout=30)
     b = StartBuilder(15, Inst(), cfg, next_seed=lambda: 1)
     b.start()
@@ -310,3 +316,52 @@ def test_the_exit_86_flag_is_set_only_by_a_visible_v3_fatal(module, func):
                 if isinstance(n, ast.Name) and n.id == guard:
                     other.append(ast.unparse(node)[:80])
     assert in_handler == 1 and len(other) == 2 and any(o.endswith('= None') for o in other), (guard, other)
+
+
+def test_mode_0_has_no_fatal_machinery(monkeypatch, tmp_path):
+    """(2026-11-18, the coordinator: mode 0 as 05f1622) A worker not configured for v3: the parent reads no exit 86
+    and no reason as fatal (check_fatal, close), the connect sends no mode query, and the worker functions take a
+    VisibleV3Fatal as an ordinary error (no exit 86; the forked children 1)."""
+    import inspect
+    from isaac_bridge import tok_floor, tok_sampler
+    monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', 0)
+    assert not VP.fatal_active()
+    s = _sampler([VP.V3_FATAL_EXIT, 0])
+    s._fatal_reason[0] = 'tok worker 0: a reason'
+    s.check_fatal()   # (no raise)
+    assert s.fatal is None
+    for src in (inspect.getsource(tok_sampler.worker_main), inspect.getsource(tok_floor.floor_worker_main)):
+        i = src.rindex('except VisibleV3Fatal as exc:')   # (the worker's own: the last one)
+        assert 'fatal_active()' in src[i:i + 200] and 'traceback.print_exc()' in src[i:i + 500]
+    src = inspect.getsource(tok_floor)
+    assert src.count('code = V3_FATAL_EXIT if fatal_active() else 1') == 2
+
+
+@pytest.mark.skipif(__import__('os').name == 'nt', reason='a POSIX pipe (os.read on its fd)')
+def test_the_reason_after_the_cpp_actor_took_the_f(tmp_path):
+    """(2026-11-18, Codex round 5: the C++ actor reads 5 bytes of a worker message) The worker sends 'F' alone (5
+    bytes) and then 'R' + the reason; after a reader took exactly the 'F' (as the C++ actor does), poll() reads the 'R'
+    message whole -- no length read from the middle of a message -- and the reason reaches the VisibleV3Fatal."""
+    import os
+    ctx = mp.get_context('spawn')
+    ours, theirs = ctx.Pipe()
+    p = ctx.Process(target=_fatal_worker, args=(theirs, 'pipe', ''), daemon=True)
+    p.start()
+    theirs.close()
+    assert ours.poll(30)
+    head = os.read(ours.fileno(), 5)   # (the C++ actor's read)
+    assert head == bytes([0, 0, 0, 1]) + b'F'
+    s = object.__new__(TokSampler)
+    s.conns, s.procs, s.index, s.live = [None, ours], [_Proc(0), p], {ours: 1}, [ours]
+    s.fatal, s._closing, s._fatal_reason = None, False, {}
+    s.cfg = types.SimpleNamespace(fatal_dir='')
+
+    class _Poller:
+        def unregister(self, fd):
+            pass
+    s._poller = _Poller()
+    with pytest.raises(VP.VisibleV3Fatal, match='configured for mode 0'):
+        end = time.time() + 30
+        while s.live and time.time() < end:
+            s.poll(want=1, max_wait=0.5, idle=0.5)
+    p.join(10)

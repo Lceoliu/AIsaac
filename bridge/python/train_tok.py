@@ -5582,6 +5582,19 @@ def main(argv=None, child=None, actor=None):
         check_fatal = getattr(sampler, 'check_fatal', None)
         if check_fatal is not None:
             check_fatal()
+
+    watch_t = [0.0]
+
+    def watch_workers():
+        """(2026-11-18) Where the run waits without check_actors -- the C++ driver's collect waits (its own worker
+        pipes: a worker's end is not seen in Python there), the learner's end -- a worker's visible-v3 fatal exit raises,
+        at most once a second (TokSampler.check_fatal: a no-op in mode 0)."""
+        now = time.perf_counter()
+        if now - watch_t[0] >= 1.0:
+            watch_t[0] = now
+            check_fatal = getattr(sampler, 'check_fatal', None)
+            if check_fatal is not None:
+                check_fatal()
         if actor_b is not None and not actor_b.is_alive() and not failure:
             failure.append(RuntimeError(f'the actor process 1 ended (exit code {actor_b.exitcode})'))
         if failure:
@@ -6071,6 +6084,8 @@ def main(argv=None, child=None, actor=None):
                     prof_['poll'] += time.perf_counter() - ta_
                     if st_ == 'target':
                         break
+                    if st_ == 'idle':
+                        watch_workers()
                 while not batch_on and roll.usable() < rollout_actor and sampler.live and not stopped():
                     if busy and fresh.is_set():
                         bdrv.pause_serving(cpp_driver, lambda r_: consume_record(r_, prof_)); drain_driver(prof_)
@@ -6103,6 +6118,8 @@ def main(argv=None, child=None, actor=None):
                         cpp_driver.resume()
                     if rec_ is None and cpp_driver.is_paused() and cpp_driver.queue_size() == 0:
                         cpp_driver.resume()   # (a capture request / a Python-stepped lane job was answered)
+                    if rec_ is None:
+                        watch_workers()
                 if batch_on:
                     cpp_driver.set_collect_target(-1)
                 c1_ = cpp_driver.counters()
@@ -6512,7 +6529,10 @@ def main(argv=None, child=None, actor=None):
                 stop_b.set()
             torch.cuda.synchronize()
         else:
-            learner.join(timeout=900)
+            t_join = time.perf_counter()   # (2026-11-18: the workers watched while the learner ends)
+            while learner.is_alive() and time.perf_counter() - t_join < 900:
+                learner.join(timeout=1.0)
+                watch_workers()
             if block_on:   # (BM1: the learner prefetch worker stopped too, after the learner's last part)
                 from isaac_bridge import block_learner as blearn_end
                 blearn_end.PREFETCH.close()
