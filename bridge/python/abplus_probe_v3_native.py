@@ -100,8 +100,10 @@ def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1, cover=COVE
     c = b.fork(tag='v3native', lean=True, alarm=1800)
     rec = rec0
     worker = 0.0
+    configured = VP.VISIBLE_V3_MODE
     try:
         set_mode(c, mode)
+        VP.VISIBLE_V3_MODE = mode   # (encode_row: a v3 worker refuses a record without a v3 frame, 2026-11-18)
         dec = LeanDecoder()
         st = EpisodeState(limit=10 ** 6, floor=True, stall=120)
         row = np.zeros(1, ROW)
@@ -139,6 +141,7 @@ def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1, cover=COVE
         cpu = game_cpu(c) - cpu0
         ack = set_mode(c, mode)
     finally:
+        VP.VISIBLE_V3_MODE = configured
         c.close()
     return rec, cpu, ack, worker
 

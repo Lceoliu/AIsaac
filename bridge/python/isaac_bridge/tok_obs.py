@@ -19,6 +19,7 @@ import struct
 import numpy as np
 
 from .transformer_obs import terrain_channels
+from . import visible_producer as _VP
 
 ENT_CAP = 64
 # 2026-10-08 (abp-0.2.16, the policy's view of lasers and tear flags): entity columns 0 .. 32 are those of before (same
@@ -394,9 +395,10 @@ def _minimap(o, st):
                 m[special, y, x] = 1
 
 
-def encode_row(o, st, row, t):
-    """Write the lean observation `o` into row (a length-1 view of a ROW array). Sets everything but episode, seed,
-    group and first. Returns the done code."""
+def write_visible(o, row):
+    """encode_row's visible frame: v3 (the native frame or the raw block's reference frame), else v2, else none
+    (visible_schema 0); a worker configured for v3 (visible_producer.VISIBLE_V3_MODE) refuses a record without a v3
+    frame. True when a v3 frame was written (its stall columns are encode_row's to fill)."""
     vis = getattr(o, 'visible', None)
     v3 = False
     if getattr(o, 'visible_v3_frame', None) is not None or (isinstance(vis, dict) and
@@ -405,12 +407,23 @@ def encode_row(o, st, row, t):
         # reference encoder's frame of the raw block; the stall columns after the progress update below
         from .visible_producer import write_v3
         v3 = write_v3(row, o)
+    elif _VP.VISIBLE_V3_MODE:   # (2026-11-18, Codex round 2: a v3 worker writes a v3 frame for every record or stops)
+        raise ValueError('visible-v3: this worker is configured for mode %d, the record has no v3 frame and %s'
+                         % (_VP.VISIBLE_V3_MODE, 'no visible block' if vis is None else 'a visible block of schema %r'
+                            % (vis.get('schema') if isinstance(vis, dict) else type(vis).__name__)))
     elif vis is not None:
         from .structured_input import write_frame
         from .visible_native import frame   # B45: the C encoder (observation_frame's bytes) when available
         write_frame(row,frame(o))
     else:
         row['visible_schema'] = 0
+    return v3
+
+
+def encode_row(o, st, row, t):
+    """Write the lean observation `o` into row (a length-1 view of a ROW array). Sets everything but episode, seed,
+    group and first. Returns the done code."""
+    v3 = write_visible(o, row)
     p = o.players[0]
     px, py = float(p['x']), float(p['y'])
     room = o.room
@@ -700,7 +713,6 @@ def fast_row_function(path):
     return _LIBS[path]
 
 
-_VISIBLE_V3 = os.environ.get('ISAAC_RL_VISIBLE_V3', '0') not in ('', '0')
 
 
 class FastRow:
@@ -741,8 +753,8 @@ class FastRow:
 
     def encode(self, item, row, row_address, t):
         c = self.ctx
-        if type(item) is bytes and _VISIBLE_V3:   # (visible-v3: abp_row_encode does not know the v3 block yet)
-            item = self.decoder.decode(item)
+        if type(item) is bytes and _VP.needs_decode(item):   # (visible-v3: abp_row_encode does not know the v3 frame
+            item = self.decoder.decode(item)                    # or raw block; by the payload's flags, 2026-11-18)
         if type(item) is bytes:
             c[RC_T] = t
             c[RC_FIRST] = t == 0

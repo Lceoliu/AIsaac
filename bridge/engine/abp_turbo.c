@@ -3142,6 +3142,7 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     if (len < 96 || rd_i(pl) != (int32_t)LEAN_MAGIC) return -1;
     int flags = pl[12], n_players = pl[13], n_doors = pl[14], n_lasers = pl[15];
     if (flags & (8 | 16)) return -2;                 // a map or inventory block: the decoder must see it
+    if (flags & 64) return -9;                       // a native visible-v3 frame (2026-11-18): the decoder must see it
     if (n_players < 1) return -1;
     ctx[RC_TSEEN] = 0;
     if (!(ctx[RC_HAVE_PREV] != 0)) return -4;          // the episode's first record

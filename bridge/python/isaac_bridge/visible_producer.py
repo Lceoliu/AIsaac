@@ -438,8 +438,56 @@ def unpack_frame_v3(payload):
 # and, after its progress update, the stall columns of every body (P 40 / 53, v3_backfill_stall).
 import os as _os
 
-VISIBLE_V3 = _os.environ.get('ISAAC_RL_VISIBLE_V3', '0') not in ('', '0')   # (modes 1 Lua, 2 native, 3 both)
+
+
+def configured_mode(raw):
+    """ISAAC_RL_VISIBLE_V3's value -> the mode 0-3 (0 off, 1 the Lua raw block, 2 the native frame, 3 both: the check
+    mode); anything else is an error (2026-11-18: before, any non-'0' text counted as on)."""
+    raw = (raw or '').strip()
+    if raw == '':
+        return 0
+    try:
+        mode = int(raw)
+    except ValueError:
+        mode = -1
+    if not 0 <= mode <= 3:
+        raise ValueError(f'ISAAC_RL_VISIBLE_V3={raw!r}: the mode is 0-3 (0 off, 1 Lua raw, 2 native, 3 both)')
+    return mode
+
+
+# The worker's configured mode (read at call time by encode_row and check_bridge_mode; a probe that walks several
+# modes on one worker sets VISIBLE_V3_MODE itself)
+VISIBLE_V3_MODE = configured_mode(_os.environ.get('ISAAC_RL_VISIBLE_V3', '0'))
+VISIBLE_V3 = VISIBLE_V3_MODE != 0
 RAW_SCHEMA_V3 = 'isaac-visible-raw-v3'
+RAW_SCHEMA_V3_BYTES = RAW_SCHEMA_V3.encode()
+
+
+def check_bridge_mode(reply, mode=None):
+    """The bridge's answer to {"cmd": "visible_v3"} (no mode: a query) against the worker's configured mode (2026-11-18,
+    Codex round 2): the same mode, and for modes 2 / 3 the native encoder there (no silent fall back to the Lua raw
+    block every step). A bridge without the command ('unknown cmd') is a mode 0 bridge. Raises ValueError."""
+    mode = VISIBLE_V3_MODE if mode is None else mode
+    if reply.get('type') == 'error' and reply.get('msg') == 'unknown cmd':
+        have = 0
+    elif reply.get('type') != 'ok' or reply.get('cmd') != 'visible_v3':
+        raise ValueError(f'visible-v3: the bridge did not answer the mode query: {str(reply)[:200]}')
+    else:
+        have = int(reply.get('mode', -1))
+    if have != mode:
+        raise ValueError(f'visible-v3: the bridge runs mode {have}, this worker is configured for mode {mode} '
+                         f'(ISAAC_RL_VISIBLE_V3 of the game and of the worker differ)')
+    if mode in (2, 3) and not reply.get('native_available'):
+        raise ValueError(f'visible-v3: mode {mode} needs the native encoder, the bridge has none (abp_native_v3 not '
+                         f'registered: libabp_turbo.so of another tree, or its address check refused)')
+    return have
+
+
+def needs_decode(payload):
+    """A raw lean payload abp_row_encode (the C ROW fast path) must not take: it carries a v3 frame (flag 64) or a v3
+    raw block (flag 32 with the raw v3 schema) -- by the payload, not by the worker's configuration (FastRow)."""
+    flags = payload[12]
+    return bool(flags & 64) or bool(flags & 32 and RAW_SCHEMA_V3_BYTES in payload)
 
 
 def is_raw_v3(block):
