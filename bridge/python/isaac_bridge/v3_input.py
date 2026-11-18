@@ -34,6 +34,8 @@ Derived inputs (the model's, never on the wire), every one clamped to [-NUM_CLAM
   - C13: a body with position_known 0 takes no part: its relative quantities and P_off are 0 with rel_valid 0, its
     local patch is marked pad.
 Outputs are numpy arrays (see DecodedFrame); padded batches for the actor come from pad_batch."""
+from functools import lru_cache
+
 import numpy as np
 
 from . import schema_v3 as V3
@@ -426,9 +428,8 @@ def _t_sane(v):
 
 
 def _t_div(x, c):
-    """x / c with c as a tensor of x's shape: a true division on every device (CUDA divides by a Python scalar as a
-    multiplication by its reciprocal, which can differ from numpy's division in the last bit)."""
-    return x / _t().full_like(x, float(c))
+    """True division by a cached device tensor; a Python scalar would use a reciprocal on CUDA."""
+    return x / _dc(('divisor', c), c, x.device, x.dtype)
 
 
 def _t_trunc(v):
@@ -504,41 +505,62 @@ def t_map_icon_index(wire):
 
 def _t_words(w):
     torch = _t()
-    w = w.to(torch.float64)
-    return torch.where(torch.isfinite(w), torch.clamp(w, 0, CODE_CUT), torch.zeros_like(w)).to(torch.int64)
+    w = torch.nan_to_num(w.to(torch.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    return w.clamp_(0, CODE_CUT).to(torch.int64)
+
+
+@lru_cache(None)
+def _bit_plan(widths):
+    cols, shifts, masks = [], [], []
+    for i, layout in enumerate(widths):
+        at = 0
+        for bits in layout:
+            cols.append(i)
+            shifts.append(at)
+            masks.append((1 << bits) - 1)
+            at += bits
+    return cols, shifts, masks, max(map(sum, widths))
+
+
+def _t_unpack(words, widths):
+    """All lanes of all packed words at once, in word-major, LSB-first order."""
+    torch = _t()
+    cols, shifts, masks, span = _bit_plan(widths)
+    x = _t_words(words)
+    if span <= 31:
+        # Narrow before expanding to one lane per output channel. Mask first: CODE_CUT itself is 2**31.
+        x = x.bitwise_and_((1 << span) - 1).to(torch.int32)
+    k = ('bit-plan', widths)
+    y = x.index_select(-1, _dc((k, 'cols'), cols, x.device, torch.int64))
+    y.bitwise_right_shift_(_dc((k, 'shifts'), shifts, x.device, x.dtype))
+    return y.bitwise_and_(_dc((k, 'masks'), masks, x.device, x.dtype)).to(torch.float32)
 
 
 def _t_bits(words, layout):
-    torch = _t()
-    w = _t_words(words)
-    out, shift = [], 0
-    for _name, bits in layout:   # (each field to float32 at once: no [..., fields] int64 stack -- 184's learner, 8 GiB)
-        out.append(((w >> shift) & ((1 << bits) - 1)).to(torch.float32))
-        shift += bits
-    return torch.stack(out, -1)
+    return _t_unpack(words.unsqueeze(-1), (tuple(bits for _, bits in layout),))
+
+
+_ROOM_WIDTHS = tuple(tuple(bits for _, bits in layout) for layout in (V3.ROOM_W0, V3.ROOM_W1))
 
 
 def _t_fin0(x):
-    torch = _t()
-    return torch.where(torch.isfinite(x), x, torch.zeros_like(x)).to(torch.float32)
+    return _t().nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).to(_t().float32)
 
 
 def _t_room(cells):
     torch = _t()
-    ch = torch.cat([_t_bits(cells[..., 0], V3.ROOM_W0), _t_bits(cells[..., 1], V3.ROOM_W1),
-                    _t_fin0(cells[..., 2:5])], -1)
-    return ch / _dc('room_div', _ROOM_DIV, cells.device)
+    ch = torch.cat([_t_unpack(cells[..., :2], _ROOM_WIDTHS), _t_fin0(cells[..., 2:5])], -1)
+    return ch.div_(_dc('room_div', _ROOM_DIV, cells.device))
 
 
 def _t_flags(x, plan):
     torch = _t()
-    n = x.shape[0]
-    parts = [_t_fin0(_ix(x, plan['known'])), _t_fin0(_ix(x, plan['bit']))]
-    if plan['bits8']:
-        parts.append(_t_bits(_ix(x, plan['bits8']), (('b', 1),) * W8).reshape(n, W8 * len(plan['bits8'])))
-    if plan['word16']:
-        parts.append(_t_bits(_ix(x, plan['word16']), (('b', 1),) * W16).reshape(n, W16 * len(plan['word16'])))
-    return torch.cat([q.to(torch.float32) for q in parts], 1)
+    flags = _t_fin0(_ix(x, plan['known'] + plan['bit']))
+    if not (plan['bits8'] or plan['word16']):
+        return flags
+    widths = ((1,) * W8,) * len(plan['bits8']) + ((1,) * W16,) * len(plan['word16'])
+    packed = _t_unpack(_ix(x, plan['bits8'] + plan['word16']), widths)
+    return torch.cat((flags, packed), -1)
 
 
 def _t_clamp(v):
@@ -551,33 +573,67 @@ def _t_num(x, plan):
                                               plan['scale'], x.device))
 
 
-def _t_stack(cols, n, device):
-    torch = _t()
-    return torch.stack(cols, 1) if cols else torch.zeros((n, 0), dtype=torch.int64, device=device)
+@lru_cache(None)
+def _cat_table(names):
+    # Integer codes can use one lookup. Retain the pre-truncation bounds separately:
+    # e.g. -0.5 is unknown for a generic category, but maps to 0 for price.
+    lo = min(V3.PRICE_CODES) - 1 if 'price' in names else -2
+    hi = max(V3.CAT_NS[ns][1] for ns in names)
+    codes = np.arange(lo, hi + 1)
+    lut = np.concatenate([n_wire_cat_index(ns, codes) for ns in names])
+    lower = [(-CODE_CUT if ns == 'price' else -1 if ns == 'direction' else 0) for ns in names]
+    upper = [(3 if ns == 'direction' else CODE_CUT) for ns in names]
+    unknown = [sum(V3.CAT_NS[ns]) - 1 for ns in names]
+    return lo, hi, lut, np.arange(len(names)) * len(codes), lower, upper, unknown
 
 
 def _t_cats(x, plan):
-    return _t_stack([t_wire_cat_index(ns, x[:, c]) for c, ns in zip(plan['cat'], plan['cat_ns'])], x.shape[0], x.device)
+    torch = _t()
+    names = tuple(plan['cat_ns'])
+    if not names:
+        return torch.empty((*x.shape[:-1], 0), dtype=torch.int64, device=x.device)
+    lo, hi, lut, offset, lower, upper, unknown = _cat_table(names)
+    dev, key = x.device, ('category', names)
+    v, bad = _t_sane(_ix(x, plan['cat']))
+    idx = v.to(torch.int64).clamp_(lo, hi).sub_(lo)
+    idx.add_(_dc((key, 'offset'), offset, dev))
+    row = _dc((key, 'lookup'), lut, dev).index_select(0, idx.flatten()).view_as(idx)
+    invalid = bad | (v < _dc((key, 'min'), lower, dev, v.dtype)) | (v > _dc((key, 'max'), upper, dev, v.dtype))
+    return torch.where(invalid, _dc((key, 'unknown'), unknown, dev, torch.int64), row)
+
+
+_FAMILY_LO, _FAMILY_HI = _FAMILY_NS[0][0] - 1, _FAMILY_NS[-1][0] + 1
+_FAMILY_TABLE = np.zeros((_FAMILY_HI - _FAMILY_LO + 1, 2), dtype=np.int64)
+for _family, _namespace in _FAMILY_NS:
+    _FAMILY_TABLE[_family - _FAMILY_LO] = _namespace
 
 
 def _t_family_ns(family):
     torch = _t()
     v, bad = _t_sane(family)
-    fam = _t_trunc(v)
-    base, size = torch.zeros_like(fam), torch.zeros_like(fam)
-    for k, (b_, s_) in _FAMILY_NS:
-        hit = (fam == k) & ~bad
-        base = torch.where(hit, torch.full_like(fam, b_), base)
-        size = torch.where(hit, torch.full_like(fam, s_), size)
-    return base, size
+    idx = v.to(torch.int64).clamp_(_FAMILY_LO, _FAMILY_HI).sub_(_FAMILY_LO)
+    idx = idx.masked_fill_(bad, 0)
+    params = _dc('item-family', _FAMILY_TABLE, family.device).index_select(0, idx.flatten())
+    return params.view(*idx.shape, 2).unbind(-1)
 
 
 def _t_items(x, plan, family=None):
-    cols = []
-    for c, ns in zip(plan['item'], plan['item_ns']):
-        base, size = _t_family_ns(family) if ns == 'by_family' else V3.ITEM_NS[ns]
-        cols.append(t_item_index(base, size, x[:, c]))
-    return _t_stack(cols, x.shape[0], x.device)
+    torch = _t()
+    names = tuple(plan['item_ns'])
+    dev, key = x.device, ('items', names)
+    ns = _dc(key, [V3.ITEM_NS.get(n, (0, 0)) for n in names], dev, torch.int64)
+    base, size = ns.unbind(-1)
+    if 'by_family' in names:
+        mask = _dc((key, 'by-family'), [n == 'by_family' for n in names], dev, torch.bool)
+        f_base, f_size = _t_family_ns(family)
+        base = torch.where(mask, f_base.unsqueeze(-1), base)
+        size = torch.where(mask, f_size.unsqueeze(-1), size)
+    return t_item_index(base, size, _ix(x, plan['item']))
+
+
+def _t_anim(x):
+    v, bad = _t_sane(_ix(x, PLAN['E']['anim']))
+    return v.to(_t().int64).masked_fill_(bad | (v < 0) | (v >= V3.ANIM_ROWS), 0)
 
 
 def _t_rel(xy, main):
@@ -587,6 +643,19 @@ def _t_rel(xy, main):
     return _t_clamp(torch.cat([_t_div(d, V3.REL_SCALE['offset']), _t_div(dist, V3.REL_SCALE['distance'])], -1))
 
 
+def _t_map(words):
+    mb = _t_bits(words, V3.MAP_BITS)
+    # These values came from bit extraction: no non-finite/negative icon codes are possible.
+    return mb[..., :4], mb[..., 4].to(_t().int64).clamp_(max=V3.MAP_ICONS - 1)
+
+
+def _t_entity_rel(e, main):
+    coords = _ix(e, [_EC['x'], _EC['y'], _EC['l_ex'], _EC['l_ey']]).unflatten(-1, (2, 2))
+    xy, laser_end = _t_rel(coords, main.unsqueeze(-2)).unbind(-2)
+    laser_end = laser_end.masked_fill(e[..., _EC['kind'], None] != _LASER_KIND, 0)
+    return xy, laser_end
+
+
 def decode_frame_torch(buf, visible_schema, nbytes=None, device='cpu'):
     """decode_frame on `device` in torch: the same keys, the same values (float32 / int64 / bool tensors)."""
     torch = _t()
@@ -594,16 +663,15 @@ def decode_frame_torch(buf, visible_schema, nbytes=None, device='cpu'):
     nonfinite = _nonfinite(host)
     f = {k: torch.as_tensor(np.array(v), device=device) for k, v in host.items()}
     P, E, N, S = f['P'], f['E'], f['N'], f['S']
-    main = P[0, [_PC['x'], _PC['y']]].to(torch.float64)
+    xy = _ix(P, [_PC['x'], _PC['y']]).to(torch.float64)
+    main = xy[0]
     known = P[:, _PC['position_known']] == 1
-    centres = torch.as_tensor(_ROOM_CENTRES, device=device)
+    centres = _dc('room_centres', _ROOM_CENTRES, P.device)
     out = {'main_xy': main.to(torch.float32), 'nonfinite': torch.as_tensor(nonfinite, device=device),
            'room': _t_room(f['canvas']), 'room_xy': _t_div(centres, POS_SCALE).to(torch.float32),
            'room_rel': _t_rel(centres, main)}
-    mb = _t_bits(f['minimap'], V3.MAP_BITS)
-    out['map_bits'], out['map_icon'] = mb[:, :4], t_map_icon_index(mb[:, 4])
+    out['map_bits'], out['map_icon'] = _t_map(f['minimap'])
     out['P_num'], out['P_flag'], out['P_cat'] = _t_num(P, PLAN['P']), _t_flags(P, PLAN['P']), _t_cats(P, PLAN['P'])
-    xy = P[:, [_PC['x'], _PC['y']]].to(torch.float64)
     gw, gh = _grid(host['P'])
     cxy = torch.floor(_t_div(xy, V3.CELL))
     cell = torch.stack([torch.clamp(cxy[:, 0], 0, gw - 1), torch.clamp(cxy[:, 1], 0, gh - 1)], 1)
@@ -615,14 +683,11 @@ def decode_frame_torch(buf, visible_schema, nbytes=None, device='cpu'):
     out['local'] = _t_room(f['local'])
     out['local_pad'] = ~known
     out['E_num'], out['E_flag'], out['E_cat'] = _t_num(E, PLAN['E']), _t_flags(E, PLAN['E']), _t_cats(E, PLAN['E'])
-    out['E_id'] = _t_stack([t_identity_index(E[:, c]) for c in PLAN['E']['idn']], E.shape[0], device)
-    v, bad = _t_sane(E[:, PLAN['E']['anim']])
-    out['E_anim'] = torch.where(~bad & (v >= 0) & (v < V3.ANIM_ROWS), _t_trunc(v), torch.zeros_like(_t_trunc(v)))
+    out['E_id'] = t_identity_index(_ix(E, PLAN['E']['idn']))
+    out['E_anim'] = _t_anim(E)
     pr = E[:, _EC['price']]
     out['E_price'] = _t_clamp(torch.where(pr > 0, _t_div(pr, PRICE_COIN_SCALE), torch.zeros_like(pr)))[:, None]
-    out['E_rel'] = _t_rel(E[:, [_EC['x'], _EC['y']]], main)
-    lrel = _t_rel(E[:, [_EC['l_ex'], _EC['l_ey']]], main)
-    out['E_laser_rel'] = torch.where((E[:, _EC['kind']] == _LASER_KIND)[:, None], lrel, torch.zeros_like(lrel))
+    out['E_rel'], out['E_laser_rel'] = _t_entity_rel(E, main)
     out['N_num'], out['N_flag'], out['N_item'] = _t_num(N, PLAN['N']), _t_flags(N, PLAN['N']), _t_items(N, PLAN['N'])
     out['S_num'], out['S_flag'], out['S_cat'] = _t_num(S, PLAN['S']), _t_flags(S, PLAN['S']), _t_cats(S, PLAN['S'])
     out['S_item'] = _t_items(S, PLAN['S'], family=S[:, _SC_FAMILY])
@@ -711,9 +776,9 @@ def _t_rows(F, base, stride, m, width, count):
     i = torch.arange(m, device=dev)
     valid = i[None, :] < count[:, None]
     idx = base[:, None, None] + i[None, :, None] * stride + torch.arange(width, device=dev)[None, None, :]
-    idx = torch.where(valid[..., None], idx, torch.zeros_like(idx)).clamp_(0, F.shape[1] - 1)
+    idx.masked_fill_(~valid[..., None], 0).clamp_(0, F.shape[1] - 1)
     rows = F.gather(1, idx.view(F.shape[0], -1)).view(F.shape[0], m, width)
-    return torch.where(valid[..., None], rows, torch.zeros_like(rows)), valid
+    return rows.masked_fill_(~valid[..., None], 0), valid
 
 
 def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None, check=True):
@@ -740,32 +805,24 @@ def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None, che
     H, CW = V3.HEADER, V3.CANVAS_H * V3.CANVAS_W * V3.ROOM_WORDS
     canvas = F[:, H:H + CW].reshape(B, V3.CANVAS_H, V3.CANVAS_W, V3.ROOM_WORDS)
     mm = F[:, H + CW:H + CW + V3.MAP_SIDE * V3.MAP_SIDE]
-    flat = lambda x: x.reshape(-1, x.shape[-1])   # noqa: E731
-
-    def back(x, m):
-        return x.reshape(B, m, *x.shape[1:])
-
-    def keep(x, valid, fill=0):
-        v = valid.view(*valid.shape, *([1] * (x.dim() - valid.dim())))
-        return torch.where(v, x, torch.full_like(x, fill))
+    def keep(x, valid):
+        bad = ~valid.view(*valid.shape, *([1] * (x.dim() - valid.dim())))
+        return x.masked_fill(bad, 0)
     nf = lambda x, valid: (~torch.isfinite(x) & valid.view(*valid.shape, *([1] * (x.dim() - valid.dim())))).flatten(1).sum(1)  # noqa: E731,E501
     L5 = Lr.view(B, p_max, V3.LOCAL_SIDE, V3.LOCAL_SIDE, V3.ROOM_WORDS)
     out = {'nonfinite': torch.stack([nf(P, pv), nf(E, ev), nf(N, nv), nf(S, sv),
                                      (~torch.isfinite(canvas)).flatten(1).sum(1) + (~torch.isfinite(mm)).sum(1)
                                      + nf(L5, pv)], 1).to(torch.int64)}
-    main = _ix(P[:, 0], [_PC['x'], _PC['y']]).to(torch.float64)
+    xy = _ix(P, [_PC['x'], _PC['y']]).to(torch.float64)
+    main = xy[:, 0]
     out['main_xy'] = main.to(torch.float32)
     out['room'] = _t_room(canvas)
     centres = _dc('room_centres', _ROOM_CENTRES, dev)
     out['room_xy'] = _t_div(centres, POS_SCALE).to(torch.float32)[None].expand(B, -1, -1).contiguous()
     out['room_rel'] = _t_rel(centres[None], main[:, None])
-    mb = _t_bits(mm, V3.MAP_BITS)
-    out['map_bits'], out['map_icon'] = mb[..., :4], t_map_icon_index(mb[..., 4])
-    fp = flat(P)
-    out['P_num'], out['P_flag'] = back(_t_num(fp, PLAN['P']), p_max), back(_t_flags(fp, PLAN['P']), p_max)
-    out['P_cat'] = back(_t_cats(fp, PLAN['P']), p_max)
+    out['map_bits'], out['map_icon'] = _t_map(mm)
+    out['P_num'], out['P_flag'], out['P_cat'] = _t_num(P, PLAN['P']), _t_flags(P, PLAN['P']), _t_cats(P, PLAN['P'])
     known = (P[..., _PC['position_known']] == 1) & pv
-    xy = _ix(P, [_PC['x'], _PC['y']]).to(torch.float64)
     g = torch.nan_to_num(_ix(P[:, 0], [_PC['grid_w'], _PC['grid_h']]).to(torch.float64), nan=1.0)
     gw = torch.trunc(torch.clamp(g[:, 0], 1, V3.CANVAS_W))[:, None]
     gh = torch.trunc(torch.clamp(g[:, 1], 1, V3.CANVAS_H))[:, None]
@@ -777,24 +834,15 @@ def decode_frames_device(frames, counts, e_bucket, n_max, s_max, p_max=None, che
     out['P_rel_valid'] = known.to(torch.float32)
     out['local'] = keep(_t_room(L5), pv)
     out['local_pad'] = ~known
-    fe = flat(E)
-    out['E_num'], out['E_flag'] = back(_t_num(fe, PLAN['E']), e_bucket), back(_t_flags(fe, PLAN['E']), e_bucket)
-    out['E_cat'] = back(_t_cats(fe, PLAN['E']), e_bucket)
-    out['E_id'] = back(_t_stack([t_identity_index(fe[:, c_]) for c_ in PLAN['E']['idn']], fe.shape[0], dev), e_bucket)
-    v, bad = _t_sane(_ix(E, PLAN['E']['anim']))
-    out['E_anim'] = torch.where(~bad & (v >= 0) & (v < V3.ANIM_ROWS), _t_trunc(v), torch.zeros_like(_t_trunc(v)))
+    out['E_num'], out['E_flag'], out['E_cat'] = _t_num(E, PLAN['E']), _t_flags(E, PLAN['E']), _t_cats(E, PLAN['E'])
+    out['E_id'] = t_identity_index(_ix(E, PLAN['E']['idn']))
+    out['E_anim'] = _t_anim(E)
     pr = E[..., _EC['price']]
     out['E_price'] = _t_clamp(torch.where(pr > 0, _t_div(pr, PRICE_COIN_SCALE), torch.zeros_like(pr)))[..., None]
-    out['E_rel'] = _t_rel(_ix(E, [_EC['x'], _EC['y']]), main[:, None])
-    lrel = _t_rel(_ix(E, [_EC['l_ex'], _EC['l_ey']]), main[:, None])
-    out['E_laser_rel'] = torch.where((E[..., _EC['kind']] == _LASER_KIND)[..., None], lrel, torch.zeros_like(lrel))
-    fn_ = flat(N)
-    out['N_num'], out['N_flag'] = back(_t_num(fn_, PLAN['N']), n_max), back(_t_flags(fn_, PLAN['N']), n_max)
-    out['N_item'] = back(_t_items(fn_, PLAN['N']), n_max)
-    fs = flat(S)
-    out['S_num'], out['S_flag'] = back(_t_num(fs, PLAN['S']), s_max), back(_t_flags(fs, PLAN['S']), s_max)
-    out['S_cat'] = back(_t_cats(fs, PLAN['S']), s_max)
-    out['S_item'] = back(_t_items(fs, PLAN['S'], family=fs[:, _SC_FAMILY]), s_max)
+    out['E_rel'], out['E_laser_rel'] = _t_entity_rel(E, main[:, None])
+    out['N_num'], out['N_flag'], out['N_item'] = _t_num(N, PLAN['N']), _t_flags(N, PLAN['N']), _t_items(N, PLAN['N'])
+    out['S_num'], out['S_flag'], out['S_cat'] = _t_num(S, PLAN['S']), _t_flags(S, PLAN['S']), _t_cats(S, PLAN['S'])
+    out['S_item'] = _t_items(S, PLAN['S'], family=S[..., _SC_FAMILY])
     for k in list(out):
         g_ = k.split('_')[0]
         valid = {'P': pv, 'E': ev, 'N': nv, 'S': sv}.get(g_)
