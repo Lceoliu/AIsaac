@@ -173,13 +173,14 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # after a fight (tok_obs.ClearCounter: the episode hurt the room's monsters since entering it); with
          # cfg.cf_per_clear: the earned bucket's tokens added (fought clears only; before its cap), triggers refused
          'clears', 'clears_fought', 'cf_earned', 'cf_skip_earned',
+         # seq-v1 step 3: this worker's v3 frames so far -- native (abp_v3_native) / the reference encoder's (mode 1, or a
+         # step the native side handed back: a cancelled lethal hit); tok_obs.V3_FRAMES. (Before A28's two: 184's gate,
+         # 2026-11-18 -- test_cf_per_clear.test_plumbing; every reader indexes by name, ST)
+         'v3_native', 'v3_reference',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
-         'np_runs', 'np_removed',
-         # seq-v1 step 3: this worker's v3 frames so far -- native (abp_v3_native) / the reference encoder's (mode 1, or a
-         # step the native side handed back: a cancelled lethal hit); tok_obs.V3_FRAMES
-         'v3_native', 'v3_reference')
+         'np_runs', 'np_removed')
 TEACH_RING = 128     # teacher records per worker the trainer may fall behind by
 TEACH_META = 16      # per record: the action under way (3), nine danger bits, the move taken, depth, safe moves, 0
 ST = {k: i for i, k in enumerate(STATS)}
