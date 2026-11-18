@@ -200,7 +200,11 @@ def main():
                    help='A28, floor / run modes: 1 = every collectible pedestal removed from the rooms entered')
     p.add_argument('--no-active', type=int, default=0,
                    help="B39, floor / run modes: 1 = player 0's active item removed at every episode's start")
+    p.add_argument('--obs-visible', type=int, default=1, choices=(0, 1),
+                   help='(seq-v1) 0: the evaluation workers write no visible frame (ROW only, as train_tok --obs-visible 0)')
     args = p.parse_args()
+    if not args.obs_visible:   # (seq-v1: before the workers start; tok_obs.encode_row reads it)
+        os.environ['ISAAC_NO_VISIBLE'] = '1'
     if args.random and (args.item_slots is not None or args.ablate):
         p.error('--item-slots / --ablate need a checkpoint')
     if args.no_pedestals and args.mode not in ('floor', 'run'):

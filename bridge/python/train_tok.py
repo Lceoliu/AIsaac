@@ -502,7 +502,7 @@ def profile_learn(learn, job, path):
     print(f'B38: the profile of one update written to {path}', flush=True)
 
 
-def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on):
+def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on, t_fb=True):
     """(B38 step 4, train_tok --learner-fast 2) what the start-of-update pass needs for the B18 fast path's host plans
     of records at flat positions of a rollout: per record its entity / door / item counts and its history token's
     presence on the host, and (dedup) its ids among the distinct grids of rows_dev (the records on the device)."""
@@ -510,7 +510,8 @@ def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on)
     w_, t_ = flat // roll.cap, flat % roll.cap
     fr = dict(ne=roll.rows['n_ent'][w_, t_].astype(np.int64), nd=roll.rows['n_doors'][w_, t_].astype(np.int64),
               ni=item_count(row_fields(roll, flat, ('inv', 'pitem')), item_slots) if n_item_tok else None,
-              hist=(roll.t_step[w_, roll.tP + t_] > 0) if t_on else None, width=rows_dev['ent'].shape[1])
+              hist=((roll.t_step[w_, roll.tP + t_] > 0) & bool(t_fb)) if t_on else None,   # (seq-v1: t_fb, --temporal-feedback)
+              width=rows_dev['ent'].shape[1])
     fr['dd'] = {k_: distinct_ids(rows_dev[k_]).cpu().numpy() for k_ in DEDUP} if 'dedup' in fparts else {}
     fr['dd_size'] = {k_: int(v_.max()) + 1 for k_, v_ in fr['dd'].items()}
     return fr
@@ -2134,7 +2135,13 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--temporal-layers', type=int, default=4, help='(B30) its layers')
     p.add_argument('--temporal-heads', type=int, default=4, help='(B30) its heads')
     p.add_argument('--temporal-window', type=int, default=256, help='(B30) decisions a step token sees (itself included)')
-    p.add_argument('--temporal-rooms', type=int, default=128, help='(B30) room tokens per episode at most')
+    p.add_argument('--temporal-rooms', type=int, default=128,
+                   help='(B30) room tokens per episode at most; 0: none (seq-v1, C114 T1: no room token is made)')
+    p.add_argument('--temporal-feedback', type=int, default=1, choices=(0, 1),
+                   help='(seq-v1, C114 T1) 0: no feedback (history) token o_{t-1} in the frame encoder')
+    p.add_argument('--obs-visible', type=int, default=1, choices=(0, 1),
+                   help='(seq-v1, C110 Q@maa) 0: the workers write no visible frame (ROW only; sets '
+                        'ISAAC_NO_VISIBLE=1 for this process and its children)')
     p.add_argument('--temporal-bptt', type=int, default=256,
                    help="(B30) decisions per learner chunk (with memory a multiple of --memory-bptt; a minibatch is "
                         '--minibatch // this chunks, --micro parts of whole chunks)')
@@ -2165,6 +2172,10 @@ def main(argv=None, child=None, actor=None):
                         'the learner thread runs Python (default of Python: 0.005; B62: the default from '
                         'ISAAC_SWITCH_INTERVAL_US, 500 us when unset)')
     args = p.parse_args(argv)
+    if args.temporal_rooms < 0:
+        p.error('--temporal-rooms must be >= 0')
+    if not args.obs_visible:   # (seq-v1: before any worker / child process starts; tok_obs.encode_row reads it)
+        os.environ['ISAAC_NO_VISIBLE'] = '1'
     shard_world = int(os.environ.get('ISAAC_SHARD_WORLD', '1') or 1)   # BM1 C: K shards as one run (shard_sync)
     shard_rank = int(os.environ.get('ISAAC_SHARD_RANK', '0') or 0) if shard_world > 1 else 0
     seed_games = args.seed   # (the workers' start seeds: from the unshifted seed, interleaved across the shards below)
@@ -2295,6 +2306,7 @@ def main(argv=None, child=None, actor=None):
             args.temporal = 1
             for key_ in ('width', 'layers', 'heads', 'window', 'rooms'):
                 setattr(args, 'temporal_' + key_, int(ck_cfg['temporal_' + key_]))
+            args.temporal_feedback = int(ck_cfg.get('temporal_feedback', 1))   # (seq-v1)
         tatt_fresh = bool(args.temporal) and not ck_cfg.get('temporal')
         del ck_cfg
     itok_on, gtok_on = bool(args.item_tokens), bool(args.global_token)
@@ -2353,6 +2365,7 @@ def main(argv=None, child=None, actor=None):
     if args.steady_updates and (not block_on or args.actor_processes!=1):
         p.error('--steady-updates is the single-actor-process block-memory verification gate')
     t_on = bool(args.temporal)   # 2026-10-14 (B30)
+    t_fb = bool(args.temporal_feedback)   # (seq-v1: False -- every record's history-token flag False in the host plans)
     T_t = int(args.temporal_bptt)
     # (B32: the learner's decisions in chunks: the GRU's (memory), the temporal ones (temporal; with memory the GRU
     # chunks nest inside), or none)
@@ -2366,7 +2379,7 @@ def main(argv=None, child=None, actor=None):
             p.error('--temporal 1: branches (--branch-share) are not supported (v1)')
         tok_kw.update(temporal=True, temporal_width=args.temporal_width, temporal_layers=args.temporal_layers,
                       temporal_heads=args.temporal_heads, temporal_window=args.temporal_window,
-                      temporal_rooms=args.temporal_rooms)
+                      temporal_rooms=args.temporal_rooms, temporal_feedback=args.temporal_feedback)
     aux_on = bool(args.aux_predict)   # 2026-11-03 (tok_aux)
     if aux_on:
         from isaac_bridge.tok_aux import (AuxNorm, EVENTS as AUX_EVENTS, REG_COLS as AUX_REG, STATE as AUX_STATE,
@@ -2967,7 +2980,7 @@ def main(argv=None, child=None, actor=None):
     capacity = args.rollout // args.workers * 4 + 64   # (per worker: the same in the actor and learner processes)
     # (B30; B31: the per-decision K / V, s and o on the device, a pool of --rollout + 4 x workers rows: a rollout ends
     # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
-    t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
+    t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=max(1, args.temporal_rooms),
                  kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64) if t_on else None
     shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
     #                                                                                   learner maps)
@@ -3004,7 +3017,8 @@ def main(argv=None, child=None, actor=None):
         if (t_on and child is None) else None
     if t_state is not None:
         print(f'temporal (B30): width {args.temporal_width} x {args.temporal_layers} layers x {args.temporal_heads} '
-              f'heads, window {args.temporal_window}, rooms {args.temporal_rooms}, learner chunks of {T_t} decisions '
+              f'heads, window {args.temporal_window}, rooms {args.temporal_rooms}, feedback {args.temporal_feedback}, '
+              f'learner chunks of {T_t} decisions '
               + (f'(GRU chunks of {T_mem} inside)' if mem_on else '(no GRU: no nested chunks)')
               + f', K / V {args.temporal_kv}; actor cache '
               f'{t_state.kv.numel() * t_state.kv.element_size() / 2 ** 20:.0f} MiB', flush=True)
@@ -3459,7 +3473,7 @@ def main(argv=None, child=None, actor=None):
                                                dtype=torch.uint8).pin_memory()
                 every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
                                                       stage=L['stage_r'], with_raw=True)
-                fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on)
+                fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on, t_fb)
             else:
                 every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
@@ -4204,6 +4218,8 @@ def main(argv=None, child=None, actor=None):
                 xplan['hist'] = np.concatenate([has_h[part_h], np.zeros(len(ne_p) - len(part_h), bool)])
                 if vmerged:
                     xplan['hist'][len(ne_p) - len(vpick):] = L['v2_has'][vpick]
+                if not t_fb:   # (seq-v1: --temporal-feedback 0, as TokPolicy._temporal_in)
+                    xplan['hist'][:] = False
             if args.packed and fast:   # B18: + the entity positions and the attention buckets, one copy
                 plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets, **xplan)
                 hn = ['rec', 'base']

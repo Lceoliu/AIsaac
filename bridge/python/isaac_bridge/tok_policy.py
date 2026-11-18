@@ -634,17 +634,23 @@ class TemporalAttention(nn.Module):
     TEMPORAL_ATTENTION.md). width: the spatial width d; glob: the policy has a global token (s_t reads it, value_global's
     readout P_g exists); D, layers, heads, window W, rooms R."""
 
-    def __init__(self, width, glob, D=256, layers=4, heads=4, window=256, rooms=128):
+    def __init__(self, width, glob, D=256, layers=4, heads=4, window=256, rooms=128, feedback=True):
         super().__init__()
-        if D % heads or window < 2 or rooms < 1:
+        if D % heads or window < 2 or rooms < 0:
             raise ValueError(f'TemporalAttention: width {D} / heads {heads} / window {window} / rooms {rooms}')
-        self.D, self.L, self.H, self.W, self.R = int(D), int(layers), int(heads), int(window), int(rooms)
+        # seq-v1 (C114 T1, 2026-11-18): rooms 0 = no room token is ever made (step's create always False; the cache
+        # keeps one room slot, always masked, and the room modules stay, so a rooms-0 model and a rooms-1 model with
+        # no room made are the same parameters and the same outputs); feedback False = no feedback (history) token
+        # (_temporal_in: every record's has False -- a masked key in the eager layout, absent from the packed one,
+        # whose host plans the caller builds with has False; feed / hist_kind stay, unused)
+        self.rooms_on, self.feedback = int(rooms) > 0, bool(feedback)
+        self.D, self.L, self.H, self.W, self.R = int(D), int(layers), int(heads), int(window), max(int(rooms), 1)
         self.inp = nn.Linear(2 * width if glob else width, D)   # W_s
         self.layers = nn.ModuleList(TemporalLayer(D, heads, 4 * D) for _ in range(layers))
         self.norm = nn.LayerNorm(D)
         self.rel = nn.Parameter(torch.zeros(heads, window + 1))   # [h, distance 0 .. W-1], [h, W]: a room key
         self.room_in = nn.Linear(D, D)                            # W_r
-        self.room_emb = nn.Embedding(rooms, D)
+        self.room_emb = nn.Embedding(self.R, D)   # (seq-v1: rooms 0 keeps one row, never read)
         self.stage_emb = nn.Embedding(N_STAGE_EMB, D)
         self.read = nn.Linear(D, width)                           # P
         self.read_g = nn.Linear(D, width) if glob else None       # P_g
@@ -685,6 +691,8 @@ class TemporalAttention(nn.Module):
         shown = map3.any(1).bool()   # (a record without a current room on its map neither moves nor replaces the last one)
         moved = (shown & (map3 != pmap).any(1)) | ((rec['events'].long() & (EV_EXIT | EV_NEW_ROOM)) != 0)
         create = (~first) & (steps0 > 0) & moved & (nroom0 < R)
+        if not self.rooms_on:   # (seq-v1: --temporal-rooms 0)
+            create = torch.zeros_like(create)
         kroom = nroom0.clamp(max=R - 1)
         stage_prev = st.prev_stage.index_select(0, slot)
         r = self.room_token(st.prev_o.index_select(0, slot), kroom, stage_prev)
@@ -1027,6 +1035,7 @@ class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
                  memory=0, item_tokens=False, global_token=False, item_shared=False, item_slots=INV_CAP, temporal=False,
                  temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128,
+                 temporal_feedback=1,
                  obs_prices=False, obs_hearts=False, obs_room_type=False, block_memory=False, block_config=None,
                  input_schema=None):
         super().__init__()
@@ -1134,9 +1143,12 @@ class TokPolicy(nn.Module):
             self.config.update(temporal=True, temporal_width=int(temporal_width), temporal_layers=int(temporal_layers),
                                temporal_heads=int(temporal_heads), temporal_window=int(temporal_window),
                                temporal_rooms=int(temporal_rooms))
+            if not int(temporal_feedback):   # (seq-v1: the key only when off; older configs are unchanged)
+                self.config['temporal_feedback'] = 0
             self.tatt = TemporalAttention(width, glob=self.global_token, D=int(temporal_width),
                                           layers=int(temporal_layers), heads=int(temporal_heads),
-                                          window=int(temporal_window), rooms=int(temporal_rooms))
+                                          window=int(temporal_window), rooms=int(temporal_rooms),
+                                          feedback=bool(int(temporal_feedback)))
         # 2026-10-16 (B35): the room-type table, registered after everything else, zero at the start (the module
         # docstring)
         self.room_type_emb = None
@@ -1551,6 +1563,8 @@ class TokPolicy(nn.Module):
         ctx = torch.autocast('cuda', enabled=False) if _autocast_on() else contextlib.nullcontext()
         with ctx:
             y = ta.feed(o_prev.to(dev).float()) + ta.hist_kind
+        if not ta.feedback:   # (seq-v1: --temporal-feedback 0, no feedback token)
+            has = torch.zeros_like(has)
         return tctx, dict(y=y, has=has.to(dev).bool())
 
     def _heads_temporal(self, x0, need_h, mem, yg, need_vg, tctx):

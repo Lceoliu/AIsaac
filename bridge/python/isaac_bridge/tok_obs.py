@@ -397,7 +397,7 @@ def _minimap(o, st):
 def encode_row(o, st, row, t):
     """Write the lean observation `o` into row (a length-1 view of a ROW array). Sets everything but episode, seed,
     group and first. Returns the done code."""
-    if getattr(o,'visible',None) is not None:
+    if getattr(o,'visible',None) is not None and os.environ.get('ISAAC_NO_VISIBLE') != '1':   # (train_tok / eval_tok --obs-visible 0)
         from .structured_input import write_frame
         from .visible_native import frame   # B45: the C encoder (observation_frame's bytes) when available
         write_frame(row,frame(o))
