@@ -879,17 +879,25 @@ def lazy_from_raw(raw, frame_at, schema_at, bytes_at):
     return {'raw': raw[:, frame_at:frame_at + w], 'counts': torch.from_numpy(counts).to(raw.device)}
 
 
+N_BUCKETS, S_BUCKETS = (8, 16, 32, N_MAX_V3), (8, 16, S_MAX_V3)
+
+
 def materialize(v):
-    """get_batch's dict -> the decoded v3 tensors: a lazy one (lazy_from_raw: 'raw', 'counts') decoded now -- the E
-    bucket from its rows' largest count (one read from the device) -- an already decoded one as it is."""
+    """get_batch's dict -> the decoded v3 tensors: a lazy one (lazy_from_raw: 'raw', 'counts') decoded now -- the E, N
+    and S widths each the bucket of its rows' largest count (one read from the device; 184, 2026-11-18: the learner's
+    4096-record minibatch at the fixed N 64 / S 32 -- 262 tokens a record -- ran out of memory in the frame encoder's
+    attention; padding never changes a real token: test_v3_policy) -- an already decoded one as it is."""
     if 'raw' not in v:
         return v
     import torch
     raw, c = v['raw'], v['counts']
     n, w = raw.shape
-    eb = bucket(int(c[:, 1].max()), E_BUCKETS)
+    mx = c.max(0).values.tolist()
+    eb = bucket(int(mx[1]), E_BUCKETS)
+    nb = bucket(min(int(mx[2]), N_MAX_V3), N_BUCKETS)
+    sb = bucket(min(int(mx[3]), S_MAX_V3), S_BUCKETS)
     F = raw.contiguous().view(torch.float32).view(n, w // 4)
-    return decode_frames_device(F, c, eb, N_MAX_V3, S_MAX_V3, check=False)
+    return decode_frames_device(F, c, eb, nb, sb, check=False)
 
 
 def batch_from_raw(raw, frame_at, schema_at, bytes_at):

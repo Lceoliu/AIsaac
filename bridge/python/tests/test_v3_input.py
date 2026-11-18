@@ -279,7 +279,8 @@ def test_no_contract_constant_written_in_the_decoder():
               V3.IDENTITY_UNKNOWN, V3.ITEM_UNKNOWN, V3.ANIM_ROWS, V3.MAP_ICONS, V3.MAP_ICONS - 1, V3.CANVAS_W,
               V3.CANVAS_H, V3.PF, V3.EF, V3.NF, V3.SF, 100, 1000}
     allowed = ('PRICE_COIN_SCALE = 15.0', 'R_ROWS, R_COLS, R_BLOCK = 4, 7, 4', 'E_BUCKETS = (16, 32, 64, 128)',
-               'W8, W16 = 8, V3.FLAG_WORD_BITS', 'N_MAX_V3, S_MAX_V3 = 64, 32')
+               'W8, W16 = 8, V3.FLAG_WORD_BITS', 'N_MAX_V3, S_MAX_V3 = 64, 32',
+               'N_BUCKETS, S_BUCKETS = (8, 16, 32, N_MAX_V3), (8, 16, S_MAX_V3)')
     found = []
     for i, line in enumerate(src.splitlines(), 1):
         code = line.split('#', 1)[0]

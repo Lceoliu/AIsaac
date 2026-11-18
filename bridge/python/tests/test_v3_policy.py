@@ -231,9 +231,16 @@ def test_records_carry_their_frames_to_the_model():
     eb = VI.bucket(max(len(f['E_num']) for f in frames), VI.E_BUCKETS)
     ref = VI.pad_batch(frames, e_bucket=eb, n_max=VI.N_MAX_V3, s_max=VI.S_MAX_V3)
     assert set(VI.get_batch(d)) == {'raw', 'counts'}   # (decode_rows: lazy, decoded by the forward that reads it)
-    for got in (VI.get_batch(b), VI.materialize(VI.get_batch(d))):
-        for k in ref:
-            assert torch.equal(got[k], torch.as_tensor(ref[k])), k
+    got = VI.get_batch(b)
+    for k in ref:
+        assert torch.equal(got[k], torch.as_tensor(ref[k])), k
+    lz = VI.materialize(VI.get_batch(d))   # (the learner's: N / S in their buckets -- the same rows, less padding)
+    for k in ref:
+        r_ = torch.as_tensor(ref[k])
+        if k[:2] in ('N_', 'S_'):
+            r_ = r_[:, :lz[k].shape[1]]
+            assert not torch.as_tensor(ref[k])[:, lz[k].shape[1]:].any() or k.endswith('_pad'), k
+        assert torch.equal(lz[k], r_), k
     m = build()
     with torch.no_grad():
         out = m(b, need_vg=True)
@@ -306,9 +313,12 @@ def test_take_selects_the_v3_rows_too():
     d = TP.decode_rows(raw, pending=torch.from_numpy(pend))
     e = TP.to_batch(rows, pend, 'cpu')
     dt, et = VI.materialize(VI.get_batch(TP.take(d, idx))), VI.get_batch(TP.take(e, idx))
-    eb = VI.bucket(int(VI.get_batch(d)['counts'][idx, 1].max()), VI.E_BUCKETS)
+    c_ = VI.get_batch(d)['counts'][idx].max(0).values.tolist()   # (E, N, S each in its bucket: materialize)
+    eb, nb, sb = (VI.bucket(c_[1], VI.E_BUCKETS), VI.bucket(min(c_[2], VI.N_MAX_V3), VI.N_BUCKETS),
+                  VI.bucket(min(c_[3], VI.S_MAX_V3), VI.S_BUCKETS))
+    assert (nb, sb) != (VI.N_MAX_V3, VI.S_MAX_V3)   # (the golden frames' few rows: the narrow buckets are exercised)
     ref = VI.pad_batch([VI.decode_frame((FIX / f'{NAMES[i]}.v3.bin').read_bytes(), V3.VERSION) for i in idx.tolist()],
-                       e_bucket=eb, n_max=VI.N_MAX_V3, s_max=VI.S_MAX_V3)
+                       e_bucket=eb, n_max=nb, s_max=sb)
     for k in ref:
         assert torch.equal(dt[k], torch.as_tensor(ref[k])), k
     with torch.no_grad():
