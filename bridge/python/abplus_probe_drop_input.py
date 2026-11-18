@@ -90,6 +90,8 @@ def main():
     ap.add_argument('--fast', default='3', help="ABP_FAST ('' unset)")
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
+    args.stubs = '' if args.stubs == 'none' else args.stubs   # ('none': an empty value through the runner's $*)
+    args.fast = '' if args.fast == 'none' else args.fast
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     spec = load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))
