@@ -635,13 +635,9 @@ static const char *v3_items(const v3_room *r, const v3_body_t *bodies, int n_bod
 }
 
 // Stage 5: the minimap from the bridge's room list (visible_v3_raw's v3_map: the Lua code packs it, 6 bytes a room:
-// GridIndex, Shape, the icon code, visited, clear, current), as observation_frame_v3 writes it: the room's cell and
-// tok_obs.SHAPE_CELLS' offsets (cell 0 always, as the reference does).
+// GridIndex, Shape, the icon code, visited, clear, current), as observation_frame_v3 writes it: the cells the room
+// occupies (the header's ABP_V3_MAP_SHAPE_CELLS, from the engine; another shape: its cell 0).
 static const char *v3_minimap(const unsigned char *map, size_t len, float *minimap) {
-    static const signed char SHAPE[13][4] = {{-1, -1, -1, -1}, {-1, -1, -1, -1}, {-1, -1, -1, -1}, {-1, -1, -1, -1},
-                                             {0, 13, -1, -1}, {0, 13, -1, -1}, {0, 1, -1, -1}, {0, 1, -1, -1},
-                                             {0, 1, 13, 14}, {1, 13, 14, -1}, {0, 13, 14, -1}, {0, 1, 14, -1},
-                                             {0, 1, 13, -1}};
     if (len % 6) return "v3: map block";
     for (size_t at = 0; at < len; at += 6) {
         int gi = map[at], shape = map[at + 1];
@@ -652,10 +648,10 @@ static const char *v3_minimap(const unsigned char *map, size_t len, float *minim
             v3_bits(&w, map[at + 5], ABP_V3_MAP_CURRENT_SHIFT, ABP_V3_MAP_CURRENT_BITS) ||
             v3_bits(&w, map[at + 2], ABP_V3_MAP_ICON_SHIFT, ABP_V3_MAP_ICON_BITS))
             return "v3: a map bit does not fit";
-        int cells[5] = {0, -1, -1, -1, -1};
-        if (shape >= 0 && shape < 13)
-            for (int k = 0; k < 4; k++) cells[1 + k] = SHAPE[shape][k];
-        for (int k = 0; k < 5; k++) {
+        int cells[4] = {0, -1, -1, -1};
+        if (shape >= 0 && shape < ABP_V3_MAP_SHAPES && ABP_V3_MAP_SHAPE_CELLS[shape][0] >= 0)
+            for (int k = 0; k < 4; k++) cells[k] = ABP_V3_MAP_SHAPE_CELLS[shape][k];
+        for (int k = 0; k < 4; k++) {
             if (cells[k] < 0) continue;
             int j = gi + cells[k];
             if (j >= 0 && j < ABP_V3_MAP_SIDE * ABP_V3_MAP_SIDE) minimap[j] = (float)w;

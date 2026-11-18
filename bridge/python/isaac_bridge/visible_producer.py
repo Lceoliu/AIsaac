@@ -266,11 +266,10 @@ def observation_frame_v3(raw, stall_share=0.0, stall_known=0, producer=V3.PRODUC
     for i in range(gw * gh):
         row, col = divmod(i, gw)
         canvas[row, col] = (_pack(w0[i], V3.ROOM_W0), _pack(w1[i], V3.ROOM_W1)) + tuple(float(v) for v in raws[i])
-    # minimap
-    from .tok_obs import SHAPE_CELLS
+    # minimap: the cells the room occupies (schema_v3.MAP_SHAPE_CELLS, from the engine; another shape: its cell 0)
     minimap = np.zeros(V3.MAP_SIDE * V3.MAP_SIDE, '<f4')
     for gi, shape, icon, visited, clear, current in raw['map']:
-        for delta in (0,) + SHAPE_CELLS.get(int(shape), ()):
+        for delta in V3.MAP_SHAPE_CELLS.get(int(shape), (0,)):
             j = int(gi) + delta
             if 0 <= j < V3.MAP_SIDE * V3.MAP_SIDE:
                 minimap[j] = _pack(dict(shown=1, visited=visited, clear=clear, current=current, icon=icon), V3.MAP_BITS)

@@ -413,6 +413,11 @@ static const int abp_v3_action_code_mul[ABP_V3_N_HEADS] = {1, 9, 45, 90, 180, 36
 #define ABP_V3_TEACH_SAFE 17
 #define ABP_V3_TEACH_PAD 18
 
+/* ---- the map cells of a RoomShape (schema_v3.MAP_SHAPE_CELLS: offsets from GridIndex, -1 padding;
+ * another shape: cell 0 only) */
+#define ABP_V3_MAP_SHAPES 13
+static const signed char ABP_V3_MAP_SHAPE_CELLS[ABP_V3_MAP_SHAPES][4] = {{-1, -1, -1, -1}, {0, -1, -1, -1}, {0, -1, -1, -1}, {0, -1, -1, -1}, {0, 13, -1, -1}, {0, 13, -1, -1}, {0, 1, -1, -1}, {0, 1, -1, -1}, {0, 1, 13, 14}, {1, 13, 14, -1}, {0, 13, 14, -1}, {0, 1, 14, -1}, {0, 1, 13, -1}};
+
 /* ---- engine argument ranges, AB+ (schema_v3.ABP_RANGES; the producers loop only inside them) */
 #define ABP_V3_ABP_WEAPON_TYPE_MAX 10
 #define ABP_V3_ABP_HEART_SLOTS 24

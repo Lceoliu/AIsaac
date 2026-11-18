@@ -196,3 +196,14 @@ def test_priority_distance_ignores_bodies_without_a_position():
     assert kept == only                                              # the sub-player changes nothing
     none, _ = VP.v3_prioritize(ents, [sub])                          # no placed body: the bridge's order
     assert none == ents[:128]
+
+
+def test_minimap_marks_only_the_rooms_cells():
+    """schema_v3.MAP_SHAPE_CELLS (the engine's cells per shape, 184 mapcells1): an LTL room (shape 9) marks GridIndex +
+    1, 13, 14 and not cell 0 (the missing quadrant); the table equals tok_obs.SHAPE_CELLS for every shape."""
+    from isaac_bridge.tok_obs import SHAPE_CELLS
+    assert {s: tuple(sorted(c)) for s, c in V3.MAP_SHAPE_CELLS.items()} == \
+        {s: tuple(sorted(SHAPE_CELLS.get(s, (0,)))) for s in range(1, 13)}
+    raw = raw_block(map=[[30, 9, 1, 1, 0, 0], [60, 1, 0, 1, 1, 1]])
+    m = VP.unpack_frame_v3(VP.observation_frame_v3(raw))['minimap']
+    assert m[30] == 0 and all(m[30 + d] != 0 for d in (1, 13, 14)) and m[60] != 0

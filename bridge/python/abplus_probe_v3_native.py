@@ -74,7 +74,19 @@ def game_cpu(c):
     return float(c.lua("return tostring(os.clock())"))
 
 
-def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1):
+def hop_plan(rooms, cover):
+    """The rooms to visit in turn: first those of a shape not seen yet, then a boss room (type 5), a shop (2), a devil
+    room (14) not seen yet, then the rest in the floor's order."""
+    seen_shapes, seen_types = cover['shape'], cover['room_type']
+    first = [r for r in rooms if str(r[3]) not in seen_shapes]
+    first += [r for r in rooms if r[1] in (5, 2, 14) and str(r[1]) not in seen_types and r not in first]
+    return [r[0] for r in first] + [r[0] for r in rooms if r not in first]
+
+
+COVER = dict(shape={}, room_type={}, priced_records=0, negative_price_records=0, entities=0, npc_records=0, bytes=0)
+
+
+def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1, cover=COVER):
     """A lean clone of seed's floor (at `stage` by the stage command) stepped `steps` decisions; every `hop` decisions
     it is sent into the floor's next room (ChangeRoom), so rooms with monsters come in. mode 3: every record compared;
     modes 0 / 2: the worker's side timed (LeanDecoder.decode + encode_row, thread CPU)."""
@@ -83,7 +95,8 @@ def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1):
     inst.reset(seed)
     if stage > 1:
         b.reset(phases=[[f'stage {stage}']], settle=2)
-    rooms = [int(row.split(',')[0]) for row in b.lua(FLOOR_LUA).split(';')[2:]]
+    rooms = [tuple(int(x) for x in row.split(',')[:4]) for row in b.lua(FLOOR_LUA).split(';')[2:]]   # idx, type, var, shape
+    plan = hop_plan(rooms, cover)
     c = b.fork(tag='v3native', lean=True, alarm=1800)
     rec = rec0
     worker = 0.0
@@ -107,9 +120,19 @@ def walk(inst, seed, steps, mode, names, stats, rec0, hop=0, stage=1):
                     stats['missing'] += 1
                 else:
                     compare(o.visible_v3_frame, VP.observation_frame_v3(o.visible), names, stats, rec)
+                    raw = o.visible
+                    cover['shape'][str(raw['shape'])] = cover['shape'].get(str(raw['shape']), 0) + 1
+                    cover['room_type'][str(raw['room_type'])] = cover['room_type'].get(str(raw['room_type']), 0) + 1
+                    prices = [e['price'] for e in raw['entities'] if e['kind'] == 5 and e['price'] != 0]
+                    if prices:
+                        cover['priced_records'] += 1
+                        cover['negative_price_records'] += any(v < 0 for v in prices)
+                    cover['entities'] += len(raw['entities'])
+                    cover['npc_records'] += any(e['kind'] == 6 for e in raw['entities'])
+                    cover['bytes'] += len(o.visible_v3_frame)
             rec += 1
-            if hop and t % hop == hop - 1 and rooms:
-                c.lua(ENTER_LUA % rooms[(t // hop) % len(rooms)])
+            if hop and t % hop == hop - 1 and plan:
+                c.lua(ENTER_LUA % plan[(t // hop) % len(plan)])
             m, s_ = MOVES[(t * 7 + seed) % len(MOVES)]
             c._sock.sendall(b'S 4 %d %d %d 0\n' % (m, s_, int(t % 97 == 50)))
             payload = read_raw(c)
@@ -151,15 +174,21 @@ def main():
             stage = 1 + (seed - first) % args.stages
             rec, _, ack, _ = walk(inst, seed, args.steps, 3, names, stats, rec, hop=args.hop, stage=stage)
             acks.append(dict(seed=seed, native=ack.get('native'), fallbacks=ack.get('fallbacks'),
-                             last_fallback=ack.get('last_fallback'), available=ack.get('native_available')))
+                             last_fallback=ack.get('last_fallback'), available=ack.get('native_available'),
+                             reasons=ack.get('reasons') if isinstance(ack.get('reasons'), dict) else {}))
             if args.timing:
                 for mode in (0, 1, 2):
-                    _, cpu, _, worker = walk(inst, seed, args.steps, mode, names, {}, 0, hop=args.hop, stage=stage)
+                    _, cpu, _, worker = walk(inst, seed, args.steps, mode, names, {}, 0, hop=args.hop, stage=stage,
+                                             cover=dict(shape={}, room_type={}, priced_records=0,
+                                                        negative_price_records=0, entities=0, npc_records=0, bytes=0))
                     timing.setdefault(mode, []).append(1000 * cpu / args.steps)
                     wtiming.setdefault(mode, []).append(1000 * worker / args.steps)
     finally:
         inst.kill()
-    summary = dict(records=rec, sections=stats, bridge=acks,
+    summary = dict(records=rec, sections=stats, bridge=acks, coverage=COVER,
+                   frame_bytes_mean=round(COVER['bytes'] / max(1, rec - stats.get('missing', 0)), 1),
+                   fallback_reasons={k: sum(int((a.get('reasons') or {}).get(k, 0)) for a in acks)
+                                     for k in sorted({k for a in acks for k in (a.get('reasons') or {})})},
                    game_cpu_ms_per_decision={f'mode{m}': round(float(np.mean(v)), 4) for m, v in timing.items()},
                    worker_cpu_ms_per_decision={f'mode{m}': round(float(np.mean(v)), 4) for m, v in wtiming.items()
                                                if m != 1},
