@@ -137,6 +137,8 @@ class LeanDecoder:
         if flags & 32:
             size = struct.unpack_from('<I', payload, off)[0]
             off += 4
+            if off + size > len(payload):   # (2026-11-18: before, a short read and a negative 'trailing bytes')
+                raise ValueError(f'lean observation: the visible block ({size} bytes) runs past the payload end')
             o.visible_at = off   # (2026-11-12: where its JSON text starts; probes compare the bytes before it)
             o.visible = json.loads(payload[off:off+size])
             off += size
@@ -144,6 +146,8 @@ class LeanDecoder:
         if flags & 64:   # (visible-v3, 2026-11-17: the native v3 frame bytes, abp_native_v3)
             size = struct.unpack_from('<I', payload, off)[0]
             off += 4
+            if off + size > len(payload):
+                raise ValueError(f'lean observation: the v3 frame ({size} bytes) runs past the payload end')
             o.visible_v3_frame = payload[off:off+size]
             off += size
         if off != len(payload):
