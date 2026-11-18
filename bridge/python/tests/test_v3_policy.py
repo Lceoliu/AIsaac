@@ -348,3 +348,51 @@ def test_cat_batch_joins_v3_parts_of_different_widths():
     for x, ya, yb in zip(oj, oa, ob):
         if torch.is_tensor(x):
             assert torch.allclose(x, torch.cat([ya, yb]), atol=1e-5)
+
+
+@pytest.mark.parametrize('flag', ['body_role', 'position_known'])
+def test_batched_entries_refuse_a_p0_without_the_contract(flag):
+    """(Codex round 10: only the single-frame entry checked P row 0.) Every batched entry -- the actor's / eval's
+    to_batch (rows_counts), the learner's decode_rows (lazy_from_raw) and batch_from_raw -- refuses a record whose P row
+    0 is not the controlled body (body_role 1) with a position (position_known 1): VisibleV3Fatal, never a decode
+    of relative quantities against another body."""
+    from isaac_bridge.visible_producer import VisibleV3Fatal
+    rows = _rows_with_frames(NAMES[:3])
+    f = rows['visible_frame'].view('<f4')
+    f[1, V3.FIXED + V3.col(V3.P_COLS, flag)] = 0.0
+    pend = np.zeros((3, 5), np.int64)
+    with pytest.raises(VisibleV3Fatal, match='P row 0'):
+        TP.to_batch(rows, pend, 'cpu')
+    raw = torch.from_numpy(rows.view(np.uint8).reshape(3, -1).copy())
+    with pytest.raises(VisibleV3Fatal, match='P row 0'):
+        TP.decode_rows(raw, pending=torch.from_numpy(pend))
+    fa, sa, ba = (TP.ROW.fields[k][1] for k in ('visible_frame', 'visible_schema', 'visible_bytes'))
+    with pytest.raises(VisibleV3Fatal, match='P row 0'):
+        VI.batch_from_raw(raw, fa, sa, ba)
+    f[1, V3.FIXED + V3.col(V3.P_COLS, flag)] = 1.0   # (restored: accepted)
+    TP.to_batch(rows, pend, 'cpu')
+
+
+def test_rows_to_device_copies_the_frame_prefix_only():
+    """(seq-v1: v3 frames fill ~15 KB of the 128-KiB field.) rows_to_device sends each record up to the longest frame
+    of the set -- the same batch as before (to_batch), fewer bytes -- and refuses a declared length past the field."""
+    from isaac_bridge.visible_producer import VisibleV3Fatal
+    rows = _rows_with_frames(NAMES[:5])
+    pend = np.zeros((5, 5), np.int64)
+    idx = np.array([4, 0, 2], np.int64)
+    out, raw, _p = TP.rows_to_device(rows, idx, pend[idx], 'cpu', with_raw=True)
+    assert raw.shape[1] == TP.ROW.fields['visible_frame'][1] + int(rows['visible_bytes'][idx].max())
+    ref = TP.to_batch(rows[idx], pend[idx], 'cpu')
+    got, want = VI.materialize(VI.get_batch(out)), VI.get_batch(ref)
+
+    def same(g_, w_):   # (the learner's decode: N / S in their buckets -- the eager one's first columns)
+        for k in w_:
+            assert torch.equal(g_[k], w_[k][:, :g_[k].shape[1]] if k[:2] in ('N_', 'S_') else w_[k]), k
+    same(got, want)
+    stage = torch.empty((8, TP.ROW_BYTES), dtype=torch.uint8)   # (the learner's pinned stage, reinterpreted)
+    out2 = TP.rows_to_device(rows, idx, pend[idx], 'cpu', stage=stage)
+    same(VI.materialize(VI.get_batch(out2)), want)
+    bad = rows.copy()
+    bad['visible_bytes'][0] = 1 << 30
+    with pytest.raises(VisibleV3Fatal, match='visible_bytes'):
+        TP.rows_to_device(bad, idx, pend[idx], 'cpu')

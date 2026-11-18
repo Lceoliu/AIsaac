@@ -679,7 +679,17 @@ def pad_batch(frames, e_bucket=None, n_max=None, s_max=None):
 # the 8 header words and the record's byte count); the device then gathers each record's rows at its own offsets and
 # decodes them with the t_* rules above. decode_frames_device(...) equals pad_batch([decode_frame(...) ...]) with the
 # same e_bucket / n_max / s_max value for value (tests/test_v3_input.py).
-def check_batch(headers, versions, sizes, p_max=None, n_max=None, s_max=None):
+P0_WORDS = (V3.FIXED + _PC['body_role'], V3.FIXED + _PC['position_known'])   # (frame float indices of P row 0's flags)
+
+
+def p0_from_raw(raw, frame_at):
+    """[n, 2] float32 (numpy): P row 0's body_role and position_known of records held as bytes on a device."""
+    import torch
+    return np.stack([raw[:, frame_at + 4 * w:frame_at + 4 * w + 4].contiguous().view(torch.float32)[:, 0].cpu().numpy()
+                     for w in P0_WORDS], 1)
+
+
+def check_batch(headers, versions, sizes, p_max=None, n_max=None, s_max=None, p0=None):
     """Host check of a batch: headers [B, >= 8] float32 (each record's first 8 words), versions [B] (visible_schema),
     sizes [B] (visible_bytes). Every record must pass split_frame's checks (VisibleV3Fatal otherwise). Returns
     (counts [B, 4] int64 p, e, n, s, truncated: dict(n=records with more inventory rows than n_max, s=... slots))."""
@@ -691,12 +701,19 @@ def check_batch(headers, versions, sizes, p_max=None, n_max=None, s_max=None):
         if not np.isfinite(float(vs)) or float(vs) != V3.VERSION:
             _refuse(f'visible_schema {vs} is not schema_v3.VERSION {V3.VERSION} (record {i})')
         n = int(sizes[i])
-        if n % 4 or n < V3.HEADER * 4:
-            _refuse(f'{n} bytes is not a whole frame of floats (record {i})')
+        if n % 4 or n < V3.HEADER * 4 or n > V3.FRAME_BYTES:   # (Codex round 10: checked before the allocation)
+            _refuse(f'{n} bytes is not a whole frame of floats within {V3.FRAME_BYTES} (record {i})')
         f = np.zeros(n // 4, np.float32)
         f[:V3.HEADER] = headers[i, :V3.HEADER]
         f[1] = headers[i, 1]
         counts[i] = check_frame_header_v3(f, exact=True)
+    if p0 is not None:   # (Codex round 10: the batched entries as split_frame -- P row 0 the controlled body, located)
+        p0 = np.asarray(p0, np.float32)
+        bad = np.nonzero(~((p0[:, 0] == _MAIN) & (p0[:, 1] == 1)))[0]
+        if len(bad):
+            i = int(bad[0])
+            _refuse(f'P row 0 is not the controlled body with a position (body_role and position_known exactly 1, got '
+                    f'{float(p0[i, 0])}, {float(p0[i, 1])}; record {i}, {len(bad)} such)')
     if p_max is not None and (counts[:, 0] > p_max).any():
         _refuse(f'{int(counts[:, 0].max())} bodies, the padded layout holds {p_max}')
     trunc = dict(n=int((counts[:, 2] > n_max).sum()) if n_max else 0, s=int((counts[:, 3] > s_max).sum()) if s_max else 0)
@@ -821,7 +838,7 @@ def rows_counts(rows, stats=True):
     t0 = time.perf_counter()
     frames = rows['visible_frame'].view('<f4')
     counts, trunc = check_batch(frames[:, :V3.HEADER], rows['visible_schema'], rows['visible_bytes'], P_MAX, N_MAX_V3,
-                                S_MAX_V3)
+                                S_MAX_V3, p0=frames[:, list(P0_WORDS)])
     eb = bucket(int(counts[:, 1].max()), E_BUCKETS)
     if stats:
         words = (np.asarray(rows['visible_bytes'], np.int64) // 4)
@@ -874,7 +891,7 @@ def lazy_from_raw(raw, frame_at, schema_at, bytes_at):
     head = raw[:, frame_at:frame_at + 4 * V3.HEADER].contiguous().view(torch.float32).cpu().numpy()
     vs = raw[:, schema_at:schema_at + 4].contiguous().view(torch.int32)[:, 0].cpu().numpy()
     nb = raw[:, bytes_at:bytes_at + 4].contiguous().view(torch.int32)[:, 0].cpu().numpy()
-    counts, _trunc = check_batch(head, vs, nb, P_MAX, N_MAX_V3, S_MAX_V3)
+    counts, _trunc = check_batch(head, vs, nb, P_MAX, N_MAX_V3, S_MAX_V3, p0=p0_from_raw(raw, frame_at))
     w = int(nb.max())
     return {'raw': raw[:, frame_at:frame_at + w], 'counts': torch.from_numpy(counts).to(raw.device)}
 
@@ -908,7 +925,7 @@ def batch_from_raw(raw, frame_at, schema_at, bytes_at):
     head = raw[:, frame_at:frame_at + 4 * V3.HEADER].contiguous().view(torch.float32).cpu().numpy()
     vs = raw[:, schema_at:schema_at + 4].contiguous().view(torch.int32)[:, 0].cpu().numpy()
     nb = raw[:, bytes_at:bytes_at + 4].contiguous().view(torch.int32)[:, 0].cpu().numpy()
-    counts, trunc = check_batch(head, vs, nb, P_MAX, N_MAX_V3, S_MAX_V3)
+    counts, trunc = check_batch(head, vs, nb, P_MAX, N_MAX_V3, S_MAX_V3, p0=p0_from_raw(raw, frame_at))
     eb = bucket(int(counts[:, 1].max()), E_BUCKETS)
     w = int(nb.max())
     F = raw[:, frame_at:frame_at + w].contiguous().view(torch.float32).view(n, w // 4)

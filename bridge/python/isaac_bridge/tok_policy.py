@@ -2147,9 +2147,25 @@ def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, hea
         raw, stage = raw[:, :ROW_HEAD], None
     elif rows.dtype.itemsize != ROW_BYTES:
         raise ValueError('rows_to_device: compact records carry no frame (head=True only)')
+    else:
+        # (seq-v1, the coordinator 2026-11-18: v3 frames fill about 15 KB of the 128-KiB frame field -- every record
+        #  copied whole was 8 x the bytes. With v3 frames only, each record's bytes up to the longest frame of the
+        #  set: the frame field is the record's last, every other field lies before it; a declared length past the
+        #  field is refused before anything is copied)
+        from .schema_v3 import VERSION as V3_VERSION, FRAME_BYTES as V3_FRAME_BYTES
+        flat_ = rows.reshape(-1)
+        if len(index) and np.all(flat_['visible_schema'][index] == V3_VERSION):
+            nb_ = np.asarray(flat_['visible_bytes'][index], np.int64)
+            if nb_.min() < 0 or nb_.max() > V3_FRAME_BYTES:
+                from .visible_producer import VisibleV3Fatal
+                raise VisibleV3Fatal(f'rows_to_device: visible_bytes {int(nb_.min())} .. {int(nb_.max())} outside '
+                                     f'0 .. {V3_FRAME_BYTES}')
+            raw = raw[:, :ROW.fields['visible_frame'][1] + (-(-int(nb_.max()) // 4) * 4)]
     index_t = torch.from_numpy(np.ascontiguousarray(index, np.int64))
     if stage is not None:
-        dev_raw = torch.index_select(raw, 0, index_t, out=stage[:len(index)]).to(device, non_blocking=True)
+        cols_ = raw.shape[1]   # (the pinned stage reinterpreted as [n, cols]: a contiguous target for the gather)
+        dst_ = stage.view(-1)[:len(index) * cols_].view(len(index), cols_)
+        dev_raw = torch.index_select(raw, 0, index_t, out=dst_).to(device, non_blocking=True)
     else:
         dev_raw = raw.index_select(0, index_t).to(device, non_blocking=False)
     pend = torch.from_numpy(np.ascontiguousarray(pending, np.int64)).to(device)
