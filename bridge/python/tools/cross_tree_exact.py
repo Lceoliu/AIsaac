@@ -217,7 +217,32 @@ def sections(payload, sizes):
         h = struct.unpack_from('<B', payload, off)[0]
         out['inventory'] = payload[off:off + 18 + sizes['inv'] * h]
         off += 18 + sizes['inv'] * h
+    if flags & 32:   # the v2 visible block (Lua JSON)
+        m = struct.unpack_from('<I', payload, off)[0]
+        out['visible_json'] = payload[off + 4:off + 4 + m]
+        off += 4 + m
     out['rest'] = payload[off:]
+    return out
+
+
+def json_paths(a, b, path='', out=None):
+    """The paths (list indices as []) where two JSON values differ."""
+    out = set() if out is None else out
+    if type(a) != type(b):
+        out.add(path)
+    elif isinstance(a, dict):
+        for k in set(a) | set(b):
+            if k not in a or k not in b:
+                out.add(path + '.' + k)
+            else:
+                json_paths(a[k], b[k], path + '.' + k, out)
+    elif isinstance(a, list):
+        if len(a) != len(b):
+            out.add(path + '#len')
+        for x, y in zip(a, b):
+            json_paths(x, y, path + '[]', out)
+    elif a != b:
+        out.add(path)
     return out
 
 
@@ -236,15 +261,22 @@ def analyze(a, b):
     sa, pa = load(a)
     sb, pb = load(b)
     res = dict(steps=[len(sa), len(sb)], bytes_equal=0, parts={}, terrain_json_text_equal=0, terrain_json_value_equal=0,
-               terrain_blocks=0, logic_frames_increment_equal=0, first=[])
+               terrain_blocks=0, logic_frames_increment_equal=0, first=[], player_fields={}, visible_blocks=0,
+               visible_text_equal=0, visible_paths={})
     prev = None
     for x, y in zip(sa, sb):
         p1, p2 = pa[x['p_off']:x['p_off'] + x['p_len']], pb[y['p_off']:y['p_off'] + y['p_len']]
         res['bytes_equal'] += p1 == p2
         s1, s2 = sections(p1, sizes), sections(p2, sizes)
         for k in set(s1) | set(s2):
-            if k in ('logic_frames', 'terrain_json'):
+            if k in ('logic_frames', 'terrain_json', 'visible_json'):
                 continue
+            if k == 'players' and s1.get(k) != s2.get(k) and len(s1[k]) == len(s2[k]):
+                import numpy as np
+                u, v = np.frombuffer(s1[k], AL.PLAYER), np.frombuffer(s2[k], AL.PLAYER)
+                for f in AL.PLAYER.names:
+                    if u[f].tobytes() != v[f].tobytes():
+                        res['player_fields'][f] = res['player_fields'].get(f, 0) + 1
             st = res['parts'].setdefault(k, [0, 0])
             st[0] += 1
             if s1.get(k) == s2.get(k):
@@ -259,6 +291,13 @@ def analyze(a, b):
             res['terrain_json_value_equal'] += ok
             if not ok and len(res['first']) < 10:
                 res['first'].append(dict(part='terrain_json values', key=[x['seed'], x['items'], x['t']]))
+        if 'visible_json' in s1 or 'visible_json' in s2:
+            res['visible_blocks'] += 1
+            v1, v2 = s1.get('visible_json'), s2.get('visible_json')
+            res['visible_text_equal'] += v1 == v2
+            if v1 is not None and v2 is not None:
+                for q in json_paths(json.loads(v1), json.loads(v2)):
+                    res['visible_paths'][q] = res['visible_paths'].get(q, 0) + 1
         lf1, lf2 = struct.unpack('<I', s1['logic_frames'])[0], struct.unpack('<I', s2['logic_frames'])[0]
         key = (x['seed'], x['items'])
         if prev is not None and prev[0] == key:
