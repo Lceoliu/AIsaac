@@ -237,3 +237,35 @@ def test_a_connection_closed_during_the_mode_query_is_retried_not_fatal():
     seed, exc = b.take()
     assert seed == 1 and exc is not None and not isinstance(exc, VP.VisibleV3Fatal)
     assert isinstance(exc, BridgeError) and 'connection closed by game' in str(exc)
+
+
+@pytest.mark.parametrize('module, func', [('tok_floor', 'floor_worker_main'), ('tok_sampler', 'worker_main')])
+def test_the_exit_86_flag_is_set_only_by_a_visible_v3_fatal(module, func):
+    """(2026-11-18, A1's mode-0 smoke on 253f759: a floor worker exited 86 with no reason anywhere) The worker
+    function's 'sys.exit(V3_FATAL_EXIT)' is guarded by a variable that only its None start and the 'except
+    VisibleV3Fatal' handler assign. Before: the flag was named 'fatal', a name the floor worker's death-teaching code
+    already assigns (fatal = death_teaching and done == 2 ...: False / True, never None) -- every worker past that
+    line ended with exit 86."""
+    import ast
+    import inspect
+    import importlib
+    mod = importlib.import_module(f'isaac_bridge.{module}')
+    tree = ast.parse(inspect.getsource(getattr(mod, func)))
+    guard = None
+    for node in ast.walk(tree):   # if <name> is not None: sys.exit(V3_FATAL_EXIT)
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Compare) and \
+                isinstance(node.test.ops[0], ast.IsNot) and isinstance(node.test.left, ast.Name) and \
+                'V3_FATAL_EXIT' in ast.unparse(node.body[0]):
+            guard = node.test.left.id
+    assert guard
+    in_handler, other = 0, []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None and 'VisibleV3Fatal' in ast.unparse(node.type):
+            in_handler += sum(isinstance(t, ast.Name) and t.id == guard for n in ast.walk(node)
+                              if isinstance(n, ast.Assign) for t in n.targets)
+    for node in ast.walk(tree):
+        for t in (node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(node, (ast.AugAssign, ast.AnnAssign)) else []):
+            for n in ast.walk(t):
+                if isinstance(n, ast.Name) and n.id == guard:
+                    other.append(ast.unparse(node)[:80])
+    assert in_handler == 1 and len(other) == 2 and any(o.endswith('= None') for o in other), (guard, other)

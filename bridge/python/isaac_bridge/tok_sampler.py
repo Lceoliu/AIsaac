@@ -1183,7 +1183,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
             mine[ST['retries']] += 1
         builder.start(seed=retry)
 
-    fatal = None   # (2026-11-18: a VisibleV3Fatal ends the worker with V3_FATAL_EXIT)
+    v3_fatal = None   # (2026-11-18: a VisibleV3Fatal ends the worker with V3_FATAL_EXIT; 'fatal' is the teacher's)
     try:
         inst = Instance(f'{cfg.name}{index}', cfg.port + index, gx, spec)
         builder = StartBuilder(index, inst, cfg, next_seed, prepare)
@@ -1321,7 +1321,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
                 episode = None
                 mine[ST['close_s']] += time.perf_counter() - t_close
     except VisibleV3Fatal as exc:
-        fatal = exc
+        v3_fatal = exc
         report_fatal(index, conn, exc)   # (before the cleanup below)
         mine[ST['errors']] += 1000
     except Exception:
@@ -1352,7 +1352,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
             pass
         for b in blocks:
             b.close()
-    if fatal is not None:
+    if v3_fatal is not None:
         sys.exit(V3_FATAL_EXIT)
 
 
