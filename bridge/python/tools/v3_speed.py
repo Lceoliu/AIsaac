@@ -194,6 +194,7 @@ def main(argv=None):
     ap.add_argument('--actor-fp32', action='store_true', help='the actor graphs in float32 (default: bf16, as --actor-bf16 1)')
     ap.add_argument('--actor-b', default='8,32,128')
     ap.add_argument('--out', default=None)
+    ap.add_argument('--actor-only', action='store_true')
     a = ap.parse_args(argv)
     import torch
     from isaac_bridge import tok_policy as TP
@@ -207,7 +208,7 @@ def main(argv=None):
     rows, pend = load(paths, max(a.minibatch, 128))
     out = dict(records=len(rows), gpu=torch.cuda.get_device_name(0))
     out['learner'] = {f'micro {mi}': learner(torch, TP, VI, m, rows[:a.minibatch], pend[:a.minibatch], mi, dev)
-                      for mi in [int(x) for x in str(a.micro).split(',')]}
+                      for mi in [int(x) for x in str(a.micro).split(',')]} if not a.actor_only else 'skipped'
     BF16_ACTOR[0] = not a.actor_fp32
     t1 = None
     if a.t1:
