@@ -9,6 +9,8 @@ registered at run time, after the bridge's) counts every ACTION_DROP query by (e
   plain          it only logs (returns nil: the bridge's answers stand)
   nil_triggered  during the press it also answers the queries without an entity: IS_ACTION_TRIGGERED true on the
                  press's first frame, IS_ACTION_PRESSED true, GET_ACTION_VALUE 1.0 while drop is held
+  trig_all       during the press IS_ACTION_TRIGGERED true for the player on every frame (not only the first)
+  hold<N>        the press held N decisions (4N frames) instead of one
 20 idle decisions, one drop press (one decision, repeat 4), 6 idle decisions; the state before / after (active,
 secondary active, cards / pills in slots 0 and 1, PlayerType) and the query log -> <out>/drop_input.jsonl.
 
@@ -54,6 +56,9 @@ m:AddCallback(ModCallbacks.MC_INPUT_ACTION, function(_, ent, hook, action)
       return f == ABPX.first
     elseif hook == InputHook.IS_ACTION_PRESSED then return true
     elseif hook == InputHook.GET_ACTION_VALUE then return 1.0 end
+  end
+  if ABPX.press and ent ~= nil and ABPX.mode == "trig_all" and hook == InputHook.IS_ACTION_TRIGGERED then
+    return true
   end
   return nil
 end)
@@ -126,7 +131,9 @@ def main():
                                     step(c)
                                 before = json.loads(c.lua(STATE_LUA))
                                 c.lua("ABPX.press = true return 'ok'")
-                                step(c, drop=1)
+                                hold = int(variant[4:]) if variant.startswith('hold') else 1
+                                for _ in range(hold):
+                                    step(c, drop=1)
                                 c.lua("ABPX.press = false return 'ok'")
                                 mid = json.loads(c.lua(STATE_LUA))
                                 for _ in range(6):
