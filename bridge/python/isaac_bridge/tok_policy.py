@@ -2069,6 +2069,12 @@ def cat_batch(a, b):
         if k in ENTITY_FIELDS:
             x = F.pad(x, (0, 0, 0, e - x.shape[1])) if x.shape[1] < e else x
             y = F.pad(y, (0, 0, 0, e - y.shape[1])) if y.shape[1] < e else y
+        if k.startswith('v3.') and x.dim() >= 2 and x.shape[1] != y.shape[1]:
+            # (seq-v1, 184: a learner's two parts with different v3 widths -- the lazy frames' bytes, a bucket -- each
+            #  padded to the wider: zero bytes past a frame are never read, a padded row's mask is False)
+            w_ = max(x.shape[1], y.shape[1])
+            pad_ = lambda t: F.pad(t, (0, 0) * (t.dim() - 2) + (0, w_ - t.shape[1]))   # noqa: E731
+            x, y = pad_(x), pad_(y)
         out[k] = torch.cat([x, y.to(x.dtype)])
     return out
 

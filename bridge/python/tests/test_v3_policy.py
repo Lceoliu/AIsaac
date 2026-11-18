@@ -327,3 +327,24 @@ def test_take_selects_the_v3_rows_too():
                 assert torch.allclose(x, y, atol=1e-5)
     with pytest.raises(ValueError, match='without v3 tensors'):
         m({k: v_ for k, v_ in b.items() if not k.startswith(VI.V3_PREFIX)}, need_vg=True)
+
+
+def test_cat_batch_joins_v3_parts_of_different_widths():
+    """(184, 2026-11-18: the learner's part_prep joins two parts with cat_batch; their lazy frames had different byte
+    widths -- RuntimeError.) A part widened by zero bytes past its frames joins another; the joined batch's outputs
+    equal each part's."""
+    m = build()
+    rows = _rows_with_frames(NAMES[:6])
+    raw = torch.from_numpy(rows.view(np.uint8).reshape(6, -1).copy())
+    d = TP.decode_rows(raw, pending=torch.from_numpy(np.zeros((6, 5), np.int64)))
+    a_, b_ = TP.take(d, torch.tensor([0, 1, 2])), TP.take(d, torch.tensor([3, 4, 5]))
+    a_ = dict(a_, **{'v3.raw': torch.nn.functional.pad(a_['v3.raw'], (0, 40))})   # (wider by 40 zero bytes)
+    w1, w2 = a_['v3.raw'].shape[1], b_['v3.raw'].shape[1]
+    assert w1 != w2
+    j = TP.cat_batch(a_, b_)
+    assert j['v3.raw'].shape[1] == max(w1, w2)
+    with torch.no_grad():
+        oj, oa, ob = m(j, need_vg=True), m(a_, need_vg=True), m(b_, need_vg=True)
+    for x, ya, yb in zip(oj, oa, ob):
+        if torch.is_tensor(x):
+            assert torch.allclose(x, torch.cat([ya, yb]), atol=1e-5)
