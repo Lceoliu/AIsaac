@@ -85,6 +85,9 @@ def main():
     ap.add_argument('--cases', default='schoolbag,pockets,forgotten')
     ap.add_argument('--variants', default='plain,nil_triggered')
     ap.add_argument('--port', type=int, default=44620)
+    ap.add_argument('--mode', default='exact', help='the instance launch mode (abplus.MODES: exact / skip / render)')
+    ap.add_argument('--stubs', default='h', help="the stub list: h (stub_render_h.txt), '' the mode's own")
+    ap.add_argument('--fast', default='3', help="ABP_FAST ('' unset)")
     ap.add_argument('--out', required=True)
     args = ap.parse_args()
     out = Path(args.out)
@@ -92,10 +95,12 @@ def main():
     spec = load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))
     stub = str(Path(default_preload()).parent / 'stub_render_h.txt')
     os.environ.update(FORK_ENV)
-    for k, v in {'ABP_FAST': '3', 'ISAAC_RL_PU_SKIP': '1', 'ABP_FORK_LITE': '1'}.items():
-        os.environ.setdefault(k, v)
-    gx = GxConfig(bridge_lua=default_bridge_lua(), preload=default_preload(), al_stopped=True, nice=0,
-                  frames_per_decision=4, start_hp=6, bombs=1, stub_list=stub if Path(stub).is_file() else '')
+    for k, v in {'ABP_FAST': args.fast, 'ISAAC_RL_PU_SKIP': '1', 'ABP_FORK_LITE': '1'}.items():
+        if v:
+            os.environ.setdefault(k, v)
+    stub = str(Path(default_preload()).parent / f'stub_render_{args.stubs}.txt') if args.stubs else ''
+    gx = GxConfig(bridge_lua=default_bridge_lua(), preload=default_preload(), al_stopped=True, nice=0, mode=args.mode,
+                  frames_per_decision=4, start_hp=6, bombs=1, stub_list=stub if stub and Path(stub).is_file() else '')
     inst = Instance('dropin', args.port, gx, spec)
     first, count = (int(v) for v in args.seeds.split(':'))
     rows = []
