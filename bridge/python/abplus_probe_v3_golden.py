@@ -23,6 +23,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -314,6 +315,8 @@ def main():
     (out / 'manifest.json').write_text(json.dumps(dict(frames=manifest, errors=errors, stall=STALL, notes=notes,
                                                        seconds=round(time.perf_counter() - t0, 1)), indent=1))
     print('SUMMARY frames', len(manifest), 'errors', len(errors), flush=True)
+    if errors or not manifest:   # (2026-11-18, Codex round 4: a collection error fails the run)
+        sys.exit(1)
 
 
 if __name__ == '__main__':

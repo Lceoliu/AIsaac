@@ -347,38 +347,53 @@ def _run(args, **kw):
 
 
 def test_native_golden_cmp_exit_code(tmp_path):
-    """v3_native_golden_cmp.py (2026-11-18, Codex round 3): PASS only for the manifest's full set, each native frame
-    equal to its v3 frame word for word but for the stall columns, headers fitting their files. Fails: a changed P
-    float, a changed size word (header[1]), a whole float appended, a native file missing, no manifest."""
+    """v3_native_golden_cmp.py (2026-11-18, Codex rounds 3 / 4): PASS only for the frozen frame set (the fixtures'
+    manifest), a run manifest without collection errors, both headers strictly valid for this schema, and the frames
+    byte for byte equal but for the stall words. Codex's -0.0 for +0.0 at word 2460 (equal as decoded values), a
+    changed size word, an appended float, another magic, a collection error, one frame only, a missing file: FAIL."""
     tool = PY / 'tools' / 'v3_native_golden_cmp.py'
-    names = 'header,canvas,minimap,P,local,E,N,S'
-    frames = ('forgotten', 'shooting')
-    (tmp_path / 'manifest.json').write_text(json.dumps(dict(frames=[dict(name=f) for f in frames])))
-    natives = {}
-    for f in frames:
-        shutil.copy(FIX / f'{f}.v3.bin', tmp_path / f'{f}.v3.bin')   # (stall 0.5 / 1, as the fixtures)
-        raw = json.loads((FIX / f'{f}.raw.json').read_text())['raw']
-        natives[f] = VP.observation_frame_v3(raw)                    # (stall 0, as the native side writes it)
-        (tmp_path / f'{f}.native.bin').write_bytes(natives[f])
-    run = lambda d=tmp_path: _run([sys.executable, str(tool), str(d), names])
-    r = run()
-    assert r.returncode == 0 and 'PASS' in r.stdout, r.stdout + r.stderr
+    frozen = json.loads((FIX / 'manifest.json').read_text())
+    names = [f['name'] for f in frozen['frames']]
+
+    def setup(d, which=None, errors=()):
+        d.mkdir()
+        (d / 'manifest.json').write_text(json.dumps(dict(frames=[dict(name=n) for n in (which or names)],
+                                                         errors=list(errors))))
+        for n in (which or names):
+            shutil.copy(FIX / f'{n}.v3.bin', d / f'{n}.v3.bin')   # (stall 0.5 / 1, as the fixtures)
+            raw = json.loads((FIX / f'{n}.raw.json').read_text())['raw']
+            (d / f'{n}.native.bin').write_bytes(VP.observation_frame_v3(raw))   # (stall 0, as the native side)
+        return d
+    run = lambda d: _run([sys.executable, str(tool), str(d)], cwd=str(PY))
+    good = setup(tmp_path / 'good')
+    r = run(good)
+    assert r.returncode == 0 and 'PASS' in r.stdout and 'frames 19/19 equal' in r.stdout, r.stdout + r.stderr
 
     def broken(how):
-        b = bytearray(natives['shooting'])
-        if how == 'P float':
-            b[V3.FIXED * 4 + 4 * 3] ^= 0x10
+        d = setup(tmp_path / how.replace(' ', '_'))
+        p_ = d / 'forgotten.native.bin'
+        b = bytearray(p_.read_bytes())
+        if how == 'minus zero':
+            assert struct.unpack_from('<f', b, 4 * 2460)[0] == 0.0
+            struct.pack_into('<f', b, 4 * 2460, -0.0)
         elif how == 'size word':
-            b[4:8] = struct.pack('<f', struct.unpack('<f', bytes(b[4:8]))[0] + 1)
-        elif how == 'a float appended':
+            struct.pack_into('<f', b, 4, struct.unpack_from('<f', b, 4)[0] + 1)
+        elif how == 'float appended':
             b += bytes(4)
-        return bytes(b)
-    for how in ('P float', 'size word', 'a float appended'):
-        (tmp_path / 'shooting.native.bin').write_bytes(broken(how))
-        r = run()
+        elif how == 'magic':
+            struct.pack_into('<f', b, 0, V3.MAGIC + 1)
+        p_.write_bytes(bytes(b))
+        return d
+    for how in ('minus zero', 'size word', 'float appended', 'magic'):
+        r = run(broken(how))
         assert r.returncode == 1 and 'FAIL' in r.stdout, (how, r.stdout)
-    (tmp_path / 'shooting.native.bin').unlink()
-    r = run()
+    r = run(setup(tmp_path / 'errors', errors=[dict(name='shape 3', error='RuntimeError')]))
+    assert r.returncode == 1 and 'collection error' in r.stdout
+    r = run(setup(tmp_path / 'one', which=['forgotten']))
+    assert r.returncode == 1 and 'expected set' in r.stdout
+    d = setup(tmp_path / 'missing')
+    (d / 'shooting.native.bin').unlink()
+    r = run(d)
     assert r.returncode == 1 and 'shooting: a file is missing' in r.stdout
     empty = tmp_path / 'empty'
     empty.mkdir()
