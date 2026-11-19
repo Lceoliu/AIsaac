@@ -2172,7 +2172,9 @@ local function v3_entities(room, curses)
 	local ents = {}
 	for _, e in ipairs(Isaac.GetRoomEntities()) do
 		local t = e.Type
-		if t ~= 1 and e.Visible and not (t == 1000 and V3_DECORATIVE[e.Variant] and e.CollisionDamage == 0) then
+		-- (C11, 2026-11-18 Codex round 2: decorative only with no damage AND no entity collision, as the contract says)
+		if t ~= 1 and e.Visible and not (t == 1000 and V3_DECORATIVE[e.Variant] and e.CollisionDamage == 0 and
+				e.EntityCollisionClass == 0) then
 			local npc = t >= 10 and t < 1000 and e:ToNPC() or nil
 			local kind = 0
 			local rec = { type = t, variant = e.Variant, subtype = e.SubType, x = e.Position.X, y = e.Position.Y,
@@ -2318,18 +2320,20 @@ local function v3_items(players)
 		local owner = b - 1
 		do
 			-- (GetCollectibleNum reads the player's count table at id without a check: ids below NUM_COLLECTIBLES only)
-			for id = 1, math.min(config:GetCollectibles().Size, V3_ABP.collectibles) - 1 do
+			local ncoll = math.min(config:GetCollectibles().Size, V3_ABP.collectibles)
+			for id = 1, ncoll - 1 do
 				local count = p:GetCollectibleNum(id)
 				if count > 0 then inventory[#inventory + 1] = { owner, id, count } end
 			end
 			local active, charge = p:GetActiveItem(), p:GetActiveCharge()
-			local ac = active ~= 0 and config:GetCollectible(active) or nil
+			-- (2026-11-18, Codex round 2 C14: GetCollectible only for an id in the config's range, as abp_v3_native.c)
+			local ac = active > 0 and active < ncoll and config:GetCollectible(active) or nil
 			slots[#slots + 1] = { owner = owner, family = 1, slot = 0, id = active, occupied = B(active ~= 0), selected = 1,
 				charge = charge, max_charge = ac and ac.MaxCharges or 0, battery = p:GetBatteryCharge() }
 			local secondary = p.SecondaryActiveItem
 			if p:HasCollectible(534) or secondary.Item ~= 0 then   -- Schoolbag (AB+ 534)
 				local id = secondary.Item
-				local desc = id ~= 0 and config:GetCollectible(id) or nil
+				local desc = id > 0 and id < ncoll and config:GetCollectible(id) or nil
 				slots[#slots + 1] = { owner = owner, family = 1, slot = 1, id = id, occupied = B(id ~= 0), selected = 0,
 					charge = secondary.Charge, max_charge = desc and desc.MaxCharges or 0, battery = secondary.BatteryCharge }
 			end
@@ -2420,7 +2424,7 @@ function visible_v3_raw()
 	local bodies, players = v3_bodies(game)
 	local cells, doors = v3_cells(room, level)
 	local inventory, slots = v3_items(players)
-	return v3_json({ schema = "isaac-visible-raw-v3", version = 2026111802, game_version = 1, control_scheme = 0,
+	return v3_json({ schema = "isaac-visible-raw-v3", version = 2026111803, game_version = 1, control_scheme = 0,
 		origin = { g0.X - 20, g0.Y - 20 }, gw = room:GetGridWidth(), gh = room:GetGridHeight(),
 		room_type = room:GetType(), shape = room:GetRoomShape(), stage = level:GetStage(),
 		stage_type = v3_try(function() return level:GetStageType() end, 0),

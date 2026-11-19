@@ -170,6 +170,13 @@ class VisibleV3Fatal(Exception):
 
 V3_FATAL_EXIT = 86   # a sampler worker's exit code after a VisibleV3Fatal
 
+
+def fatal_active():
+    """(2026-11-18, the coordinator: mode 0 must behave as 05f1622) The fatal machinery -- the connect-time mode query,
+    a worker's exit 86, the parent reading it -- only for a worker configured for v3 (VISIBLE_V3_MODE != 0). In mode
+    0 there is no v3 protocol error to catch, and any way into the fatal path is risk only."""
+    return VISIBLE_V3_MODE != 0
+
 # Decorative effects never sent (abp_bridge.lua V3_DECORATIVE_SPEC; tests compare the two; the rule in schema_v3):
 # effect variant -> (name, why). The bridge drops one only while its CollisionDamage is 0. Not in it, sent: 121 LIGHT
 # and 138 MIST (Rep only: the room's light and visibility; their Rep form UNVERIFIED).
@@ -230,9 +237,22 @@ def v3_prioritize(entities, bodies):
     (position_known: a body without one -- AB+'s sub-player at world (0, 0) -- takes no part; none at all: 0), then
     the bridge's order; the dropped count per class."""
     placed = [b for b in bodies if int(b.get('position_known', 1))]
+    # (2026-11-18, Codex round 2: a non-finite position has no order -- refused before the sort, as abp_v3_native.c
+    # does; the squared distance as the same expression there, dx * dx + dy * dy in doubles, the first minimum kept)
+    for b in placed:
+        if not (_math.isfinite(b['x']) and _math.isfinite(b['y'])):
+            raise ValueError(f"visible-v3: a body at a non-finite position ({b['x']}, {b['y']})")
     keyed = []
     for i, e in enumerate(entities):
-        d = min(((e['x'] - b['x']) ** 2 + (e['y'] - b['y']) ** 2 for b in placed), default=0.0)
+        ex, ey = float(e['x']), float(e['y'])
+        if not (_math.isfinite(ex) and _math.isfinite(ey)):
+            raise ValueError(f'visible-v3: an entity at a non-finite position ({ex}, {ey})')
+        d, have = 0.0, False
+        for b in placed:
+            dx, dy = ex - float(b['x']), ey - float(b['y'])
+            dd = dx * dx + dy * dy
+            if not have or dd < d:
+                d, have = dd, True
         keyed.append((v3_priority(e), d, i))
     keyed.sort()
     kept = keyed[:V3.CAP_ENTITY]
@@ -495,7 +515,13 @@ def check_bridge_mode(reply, mode=None):
     elif reply.get('type') != 'ok' or reply.get('cmd') != 'visible_v3':
         raise VisibleV3Fatal(f'visible-v3: the bridge did not answer the mode query: {str(reply)[:200]}')
     else:
-        have = int(reply.get('mode', -1))
+        # (2026-11-18, Codex round 9: the answer as the protocol has it -- an integer 0-3, no conversion: 2.9 is no 2,
+        # inf no OverflowError -- and native_available a boolean)
+        have = reply.get('mode')
+        if type(have) is not int or not 0 <= have <= 3:
+            raise VisibleV3Fatal(f'visible-v3: the bridge answered the mode query with mode {have!r}')
+        if type(reply.get('native_available')) is not bool:
+            raise VisibleV3Fatal(f"visible-v3: the bridge answered native_available {reply.get('native_available')!r}")
     if have != mode:
         raise VisibleV3Fatal(f'visible-v3: the bridge runs mode {have}, this worker is configured for mode {mode} '
                          f'(ISAAC_RL_VISIBLE_V3 of the game and of the worker differ)')

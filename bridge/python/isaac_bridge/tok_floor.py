@@ -75,7 +75,7 @@ from .tok_obs import (stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARE
                       encode_row, fast_row_function, V3_FRAMES)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
-from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal   # noqa: E402
+from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal, fatal_active   # noqa: E402
 from .tok_sampler import rng_key, start_seed, report_fatal   # noqa: E402  (a resumed run's / a shard's start seeds, random streams)
 from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, SearchSlots, StartBuilder, applied_action,
                           apply_instance_defaults, attach, attach_choices, attach_lab, attach_teacher, default_stub_list,
@@ -703,8 +703,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             code = 0
             try:
                 cf_run(pt, child=True)
-            except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child)
-                code = V3_FATAL_EXIT
+            except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child; mode 0: 1)
+                code = V3_FATAL_EXIT if fatal_active() else 1
             except BaseException:
                 code = 1
             finally:
@@ -829,8 +829,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 code = 0
                 try:
                     search(child_item, pair=False)
-                except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child)
-                    code = V3_FATAL_EXIT
+                except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child; mode 0: 1)
+                    code = V3_FATAL_EXIT if fatal_active() else 1
                 except BaseException:
                     code = 1
                 finally:
@@ -1523,6 +1523,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 int(chars[0][int(char_rng.choice(len(chars[0]), p=chars[1]))])
 
     def stopping():
+        # (2026-11-18, Codex round 4: a search / cf thread's VisibleV3Fatal is raised here, in the main thread, also when
+        # the stop came first or the main thread waits on its builder -- not only at the next loop top)
+        if thread_fatal:
+            raise thread_fatal[0]
         return bool(control[0]) or (parent is not None and not parent.is_alive())
 
     def recover(why):
@@ -2112,8 +2116,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             if labbing and not control[0]:   # 2026-10-08: posted lab jobs, within cfg.lab_share (tok_lab)
                 run_lab()
     except VisibleV3Fatal as exc:
-        v3_fatal = exc
-        report_fatal(index, conn, exc, 'tok floor worker')   # (before the cleanup below)
+        if fatal_active():
+            v3_fatal = exc
+            report_fatal(index, conn, exc, 'tok floor worker', cfg.fatal_dir)   # (before the cleanup below)
+        else:   # (mode 0: an ordinary error, as in 05f1622 -- no exit 86)
+            traceback.print_exc()
         mine[ST['errors']] += 1000
     except Exception:
         traceback.print_exc()

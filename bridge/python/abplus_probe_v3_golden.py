@@ -8,6 +8,7 @@ Cases (every one a clone of a floor template; nothing written back):
   offgrid         V1's 2x1 room 89 (seed 2147700000, stage 7) until a sent entity is outside the grid
   doorframe       the player walked into a door of the start room until its formula cell is the door cell
   longlived       a coin spawned in the start room, 600 frames on (age 600: 10 after the scale, clamped at 8)
+  decorative-collision  a listed decorative effect (1000.15) without damage, entity collision class 4: sent (batch 6)
   devilprice      a devil deal (goto s.devil.0; else a pedestal set to Price -1)
   shooting        the player shooting right for 3 decisions (fire_dir set)
   forgotten       the Forgotten (PlayerType 16) at the start: the Soul a sub-player body without a room position
@@ -52,9 +53,18 @@ end
 for _, e in ipairs(Isaac.GetRoomEntities()) do
   out.entities[#out.entities + 1] = { type = e.Type, variant = e.Variant, subtype = e.SubType, x = e.Position.X,
     y = e.Position.Y, gi = room:GetGridIndex(e.Position), age = e.FrameCount, visible = e.Visible,
+    coll = e.EntityCollisionClass, cdmg = e.CollisionDamage, seed = e.InitSeed,
     price = (e.Type == 5 and e:ToPickup()) and e:ToPickup().Price or nil }
 end
 return json.encode(out)
+"""
+SPAWN_DECOR_COLL = """
+local p = Isaac.GetPlayer(0)
+local e = Isaac.Spawn(1000, 15, 0, p.Position + Vector(80, 0), Vector(0, 0), nil)
+e.CollisionDamage = 0
+e.EntityCollisionClass = 4
+e.Visible = true
+return 'ok'
 """
 SPAWN_COIN = """
 local room = Game():GetRoom()
@@ -124,6 +134,21 @@ MOVE_INTO = {0: 7, 1: 1, 2: 3, 3: 5}   # left, up, right, down door: the move co
 STALL = dict(stall_share=0.5, stall_known=1)
 
 
+OUTPUTS = ('*.raw.json', '*.v3.bin', '*.engine.json', '*.native.bin', 'manifest.json')
+
+
+def clear_previous(out):
+    """(2026-11-18, Codex round 5) A run in an output directory used before: the files a run writes moved to
+    <out>/trash/<time>/ first (never deleted), so no frame of an earlier run passes for one of this run. The count."""
+    old = [p for pat in OUTPUTS for p in sorted(out.glob(pat)) if p.is_file()]
+    if old:
+        dest = out / 'trash' / time.strftime('%Y%m%d-%H%M%S')
+        dest.mkdir(parents=True, exist_ok=True)
+        for p in old:
+            p.rename(dest / p.name)
+    return len(old)
+
+
 def capture(c, name, out, manifest, covers):
     text = c.lua("return visible_v3_raw()")
     raw = json.loads(text)
@@ -140,8 +165,10 @@ def capture(c, name, out, manifest, covers):
                  "return (f:gsub('.', function(ch) return string.format('%02x', ch:byte()) end))")
     if hexf and not hexf.startswith('nil:'):
         (out / f'{name}.native.bin').write_bytes(bytes.fromhex(hexf))
+    # (2026-11-18, Codex round 5: whether this run's native encoder gave the frame -- the comparator needs 'frame')
+    native = 'frame' if hexf and not hexf.startswith('nil:') else (hexf or 'nil:no answer')
     f = VP.unpack_frame_v3(payload)
-    manifest.append(dict(name=name, covers=covers, shape=raw['shape'], gw=raw['gw'], gh=raw['gh'],
+    manifest.append(dict(name=name, covers=covers, native=native, shape=raw['shape'], gw=raw['gw'], gh=raw['gh'],
                          origin=raw['origin'], counts=[int(v) for v in f['header'][2:6]], bytes=len(payload),
                          sha256=hashlib.sha256(payload).hexdigest()))
     print(name, manifest[-1]['counts'], raw['origin'], flush=True)
@@ -162,6 +189,9 @@ def main():
     args = p.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    moved = clear_previous(out)
+    if moved:
+        print(f'{moved} file(s) of an earlier run moved to {out}/trash/', flush=True)
     spec = load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))
     stub = str(Path(default_preload()).parent / 'stub_render_h.txt')
     os.environ.update(FORK_ENV)
@@ -230,6 +260,10 @@ def main():
             raise RuntimeError(f'no door cell reached: {tried}')
         case('doorframe', 'the player in a door frame (its formula cell is the door cell)', doorframe)
         case('longlived', 'a coin 600 frames old (age clamp)', lambda c: (c.lua(SPAWN_COIN), idle(c, 600)))
+        # (batch 6) a listed decorative effect without damage but with entity collision: sent under the batch 6 rule,
+        # left out under the batch 1-5 one -- the frame that tells the two apart
+        case('decorative-collision', 'a decorative 1000.15 with no damage, entity collision class 4 (sent, batch 6)',
+             lambda c: c.lua(SPAWN_DECOR_COLL))
         def devil(c):
             c.lua(DEVIL_GOTO)
             idle(c, 30)

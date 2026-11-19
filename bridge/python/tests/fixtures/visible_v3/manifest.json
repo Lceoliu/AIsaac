@@ -3,6 +3,7 @@
   {
    "name": "doorframe",
    "covers": "the player in a door frame (its formula cell is the door cell)",
+   "native": "frame",
    "shape": 1,
    "gw": 15,
    "gh": 9,
@@ -17,11 +18,12 @@
     3
    ],
    "bytes": 12376,
-   "sha256": "b51ff05cb4ce3ea8267c3cca2ea98716e41e54991a35367bdb64f3ca994e69fc"
+   "sha256": "b55e25fc122ab63cd4b22ce69f92c0035404d1cb4a7ff2237f9fe38d99847086"
   },
   {
    "name": "longlived",
    "covers": "a coin 600 frames old (age clamp)",
+   "native": "frame",
    "shape": 1,
    "gw": 15,
    "gh": 9,
@@ -36,11 +38,32 @@
     3
    ],
    "bytes": 12632,
-   "sha256": "4ed1c21f0a900ce7880e83cf37560a40a1a1c8b9a665537213a05c90155f6464"
+   "sha256": "4b337c4bbdf71fd35be8b0041c4e72674636fdda6363ef72a364a2636d973372"
+  },
+  {
+   "name": "decorative-collision",
+   "covers": "a decorative 1000.15 with no damage, entity collision class 4 (sent, batch 6)",
+   "native": "frame",
+   "shape": 1,
+   "gw": 15,
+   "gh": 9,
+   "origin": [
+    20.0,
+    100.0
+   ],
+   "counts": [
+    1,
+    1,
+    1,
+    3
+   ],
+   "bytes": 12632,
+   "sha256": "cb68cfa230d15f02571fb729f77863506ed5ac557615c3ccf790120d09db6718"
   },
   {
    "name": "devilprice",
    "covers": "a pickup with a negative Price (a devil deal)",
+   "native": "frame",
    "shape": 1,
    "gw": 15,
    "gh": 9,
@@ -55,11 +78,12 @@
     3
    ],
    "bytes": 13656,
-   "sha256": "810315af0683bd493807c181d961b6bc22167ae0ee77a519c3484538249f56c4"
+   "sha256": "4738b70bccd877926bc367a2fea0c6acae9731ca31483e1961be6d57048f7b37"
   },
   {
    "name": "shooting",
    "covers": "the player shooting right",
+   "native": "frame",
    "shape": 1,
    "gw": 15,
    "gh": 9,
@@ -74,11 +98,12 @@
     3
    ],
    "bytes": 12888,
-   "sha256": "37386c50098f9b7eb88f24a82a81ff1cfddb285fdb5006d10a39415e4ac7810f"
+   "sha256": "f407d03747103117d6df3669fba0ff398dfb07f5db94e3dc97305ffec71c2fd8"
   },
   {
    "name": "forgotten",
    "covers": "the Forgotten controlled; the Soul (GetSubPlayer) has no room position",
+   "native": "frame",
    "shape": 1,
    "gw": 15,
    "gh": 9,
@@ -93,11 +118,12 @@
     6
    ],
    "bytes": 15276,
-   "sha256": "def215902c37cd890c639a0087706b1f6ba2bff60cf0c33f136b24a257213f1e"
+   "sha256": "aa693382fafe27d122adb9fb5132186531c1e8084659f8aa2c43cb7ce813749e"
   },
   {
    "name": "forgotten-soul",
    "covers": "the Soul controlled; the Forgotten body lies in the room as the familiar 3.900",
+   "native": "frame",
    "shape": 1,
    "gw": 15,
    "gh": 9,
@@ -112,11 +138,12 @@
     6
    ],
    "bytes": 15276,
-   "sha256": "f5c9306d6a31f2f2c117d7d6f9892d3cb4e6aae7718d499974e2466d5079a9b2"
+   "sha256": "81a04ce9f71c3d4b99680756ca20a106f9abd92adff6499dcf0509640dc73c12"
   },
   {
    "name": "offgrid",
    "covers": "V1 room 89 (2x1): the Homunculus part 228.10 below the grid",
+   "native": "frame",
    "shape": 6,
    "gw": 28,
    "gh": 9,
@@ -126,16 +153,17 @@
    ],
    "counts": [
     1,
-    37,
+    48,
     1,
     3
    ],
-   "bytes": 21848,
-   "sha256": "08e0038700dfab18e1cefb0c1efd7689867c8b2074e955443dd0ccc945240ea4"
+   "bytes": 24664,
+   "sha256": "e3e49158190bc109e7cd0f541c6d0e903105d84602013e5404fb062afcb193d4"
   },
   {
    "name": "shape-1x1",
    "covers": "RoomShape 1 (seed 2147700000, stage 1, room 68, type 5)",
+   "native": "frame",
    "shape": 1,
    "gw": 15,
    "gh": 9,
@@ -150,11 +178,12 @@
     3
    ],
    "bytes": 14936,
-   "sha256": "2e0b3061d959b9e96461832c89b21324d47540370a529ee49cca5330031deef7"
+   "sha256": "17310e086cddb81402af4fdfe798a8ad0081d7b13fe0f37a674a094d8c849a7a"
   },
   {
    "name": "shape-1x2",
    "covers": "RoomShape 4 (seed 2147700000, stage 3, room 72, type 1)",
+   "native": "frame",
    "shape": 4,
    "gw": 15,
    "gh": 16,
@@ -164,16 +193,17 @@
    ],
    "counts": [
     1,
-    4,
+    6,
     1,
     3
    ],
-   "bytes": 13400,
-   "sha256": "47ddeb67a49c650e4ca3c354a1b2defd4e18de0cafce507625ef81dd6493444e"
+   "bytes": 13912,
+   "sha256": "d3278185296de2c383e85ebbc8e032560cca13645e10809056560f5fcb71f415"
   },
   {
    "name": "shape-LBR",
    "covers": "RoomShape 12 (seed 2147700000, stage 4, room 81, type 1)",
+   "native": "frame",
    "shape": 12,
    "gw": 28,
    "gh": 16,
@@ -183,16 +213,17 @@
    ],
    "counts": [
     1,
-    9,
+    23,
     1,
     3
    ],
-   "bytes": 14680,
-   "sha256": "2520be861f5e0723c758750331c553751ef462ed9aafe52247d3ae3004001128"
+   "bytes": 18264,
+   "sha256": "a70d7637d106d4b303f347bb24595feac49f3d1ecc7452c2479caa829dfa8d65"
   },
   {
    "name": "shape-2x2",
    "covers": "RoomShape 8 (seed 2147700000, stage 5, room 94, type 1)",
+   "native": "frame",
    "shape": 8,
    "gw": 28,
    "gh": 16,
@@ -207,11 +238,12 @@
     3
    ],
    "bytes": 13400,
-   "sha256": "3c24143d93ea9ddef8d668aadf4b79368ac7b33163dd61e15dfd4659d8eed2ea"
+   "sha256": "d5e596926898671adc8844bdd5d0855e1e7b628843894a5f67f9f782f655bd26"
   },
   {
    "name": "shape-IIV",
    "covers": "RoomShape 5 (seed 2147700000, stage 5, room 55, type 1)",
+   "native": "frame",
    "shape": 5,
    "gw": 15,
    "gh": 16,
@@ -221,16 +253,17 @@
    ],
    "counts": [
     1,
-    2,
+    17,
     1,
     3
    ],
-   "bytes": 12888,
-   "sha256": "c45f8d5424356f48e7cc9c539fc73c2d396b3d37a5eafb9cc1663a6a4588b0f3"
+   "bytes": 16728,
+   "sha256": "9d8b815edd884199ba3d4a0022fcf9113dc0bb859ffbd58036839144199ac199"
   },
   {
    "name": "shape-2x1",
    "covers": "RoomShape 6 (seed 2147700000, stage 7, room 89, type 5)",
+   "native": "frame",
    "shape": 6,
    "gw": 28,
    "gh": 9,
@@ -240,16 +273,17 @@
    ],
    "counts": [
     1,
-    37,
+    48,
     1,
     3
    ],
-   "bytes": 21848,
-   "sha256": "08e0038700dfab18e1cefb0c1efd7689867c8b2074e955443dd0ccc945240ea4"
+   "bytes": 24664,
+   "sha256": "e3e49158190bc109e7cd0f541c6d0e903105d84602013e5404fb062afcb193d4"
   },
   {
    "name": "shape-LTL",
    "covers": "RoomShape 9 (seed 2147700000, stage 7, room 58, type 1)",
+   "native": "frame",
    "shape": 9,
    "gw": 28,
    "gh": 16,
@@ -259,16 +293,17 @@
    ],
    "counts": [
     1,
-    11,
+    14,
     1,
     3
    ],
-   "bytes": 15192,
-   "sha256": "8eaead1e8ae1ed62e19eee660f89711cc6b8438b7a89503661eb899bd66b9d19"
+   "bytes": 15960,
+   "sha256": "5026dc9562b5034e648f89e60aa58fdf7349859411822b743e95966d782f98d4"
   },
   {
    "name": "shape-IH",
    "covers": "RoomShape 2 (seed 2147700000, stage 7, room 86, type 1)",
+   "native": "frame",
    "shape": 2,
    "gw": 15,
    "gh": 9,
@@ -278,16 +313,17 @@
    ],
    "counts": [
     1,
-    2,
+    7,
     1,
     3
    ],
-   "bytes": 12888,
-   "sha256": "2809533bf0ae2957b10a3a3950791b13c580b62f4b73ae5a3c82d5a6271f83d0"
+   "bytes": 14168,
+   "sha256": "217fb516ca57bc5353f1cea4d1617fdd0a5f31885b9bc2af3cb374d7994f198a"
   },
   {
    "name": "shape-IV",
    "covers": "RoomShape 3 (seed 2147700000, stage 7, room 97, type 1)",
+   "native": "frame",
    "shape": 3,
    "gw": 15,
    "gh": 9,
@@ -297,16 +333,17 @@
    ],
    "counts": [
     1,
-    8,
+    14,
     1,
     3
    ],
-   "bytes": 14424,
-   "sha256": "40aff6d4d819f384f1c06f1d42fc778bc3ea6f9e710216cb06cdc1eae117920e"
+   "bytes": 15960,
+   "sha256": "89ab18bfce9265c7b464e016ae0baca58a3c2163b99e3e228c1269c774a94a7b"
   },
   {
    "name": "shape-LBL",
    "covers": "RoomShape 11 (seed 2147700001, stage 5, room 57, type 1)",
+   "native": "frame",
    "shape": 11,
    "gw": 28,
    "gh": 16,
@@ -321,11 +358,12 @@
     3
    ],
    "bytes": 14168,
-   "sha256": "2acc4bd0dd5392a0cc93b8bfcd4f115269f7fe0f49134c1354fdfe99f5774754"
+   "sha256": "64e70f0327fec588680f63928c51cb64c3ed8094890be44d3e5845f2c5d29937"
   },
   {
    "name": "shape-LTR",
    "covers": "RoomShape 10 (seed 2147700001, stage 5, room 15, type 1)",
+   "native": "frame",
    "shape": 10,
    "gw": 28,
    "gh": 16,
@@ -340,11 +378,12 @@
     3
    ],
    "bytes": 13656,
-   "sha256": "89cbe8742652195032f9a8d8f21917e135c0294a13822a40fd67531229c60758"
+   "sha256": "0256ed4c8295bac2fa8ed35d4f368706ad9ffc4a564976d74f010b9032889382"
   },
   {
    "name": "shape-IIH",
    "covers": "RoomShape 7 (seed 2147700004, stage 3, room 60, type 1)",
+   "native": "frame",
    "shape": 7,
    "gw": 28,
    "gh": 9,
@@ -359,7 +398,7 @@
     3
    ],
    "bytes": 13656,
-   "sha256": "17d56da8928d03cfd5e17f003ed236188963c94d16f4263294694b442253ca03"
+   "sha256": "0011a5ed2c14a61802f2ed7844b790a295767877c75b8b2197779fceb2449af7"
   }
  ],
  "errors": [],

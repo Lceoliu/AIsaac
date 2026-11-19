@@ -50,7 +50,8 @@ def row():
     return r
 
 
-def test_v3_on_writes_the_v3_frame(v2_stub):
+def test_v3_on_writes_the_v3_frame(v2_stub, monkeypatch):
+    monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', 2)   # (Codex round 9: a v3 record needs a v3 worker)
     r = row()
     assert tok_obs.write_visible(Obs(v3=GOLDEN, v2={'schema': 'v2'}), r) is True
     assert int(r['visible_schema'][0]) == V3.VERSION and int(r['visible_bytes'][0]) == len(GOLDEN)
@@ -66,7 +67,9 @@ def test_v3_off_with_a_v2_block_writes_the_v2_frame(v2_stub):
 
 def test_obs_visible_0_writes_no_frame(v2_stub, monkeypatch):
     monkeypatch.setenv('ISAAC_NO_VISIBLE', '1')
-    for obs in (Obs(v3=GOLDEN, v2={'schema': 'v2'}), Obs(v2={'schema': 'v2'}), Obs()):
+    with pytest.raises(ValueError, match='not configured for v3'):   # (mode 0: a v3 record is refused, Codex round 9)
+        tok_obs.write_visible(Obs(v3=GOLDEN, v2={'schema': 'v2'}), row())
+    for obs in (Obs(v2={'schema': 'v2'}), Obs()):
         r = row()
         assert tok_obs.write_visible(obs, r) is False
         assert int(r['visible_schema'][0]) == 0 and int(r['visible_bytes'][0]) == 0 and not r['visible_frame'].any()

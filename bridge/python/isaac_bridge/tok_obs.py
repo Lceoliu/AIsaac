@@ -418,10 +418,19 @@ def write_visible(o, row):
     frame was written (its stall columns are encode_row's to fill)."""
     vis = getattr(o, 'visible', None)
     v3 = False
+    is_v3 = getattr(o, 'visible_v3_frame', None) is not None or (isinstance(vis, dict) and
+                                                                vis.get('schema') == 'isaac-visible-raw-v3')
+    if is_v3 and not _VP.VISIBLE_V3_MODE:   # (2026-11-18, Codex round 9: a mode 0 worker, which sends no mode query,
+        # refuses a v3 record before the ROW -- an ordinary protocol error: the episode's handlers take it, as 05f1622
+        # took a bridge in another mode -- never a v3 frame in an old arm's ROW, never the worker's end; seq-v1's
+        # --obs-visible 0 below does not hide it)
+        raise ValueError('visible-v3: a v3 record (%s) in a worker not configured for v3 (ISAAC_RL_VISIBLE_V3=0): '
+                         'the game runs another visible mode' % ('native frame' if getattr(o, 'visible_v3_frame',
+                                                                                          None) is not None
+                                                                 else 'raw v3 block'))
     if os.environ.get('ISAAC_NO_VISIBLE') == '1':   # (train_tok / eval_tok --obs-visible 0: no frame, v3 or v2)
         row['visible_schema'] = 0
-    elif getattr(o, 'visible_v3_frame', None) is not None or (isinstance(vis, dict) and
-                                                             vis.get('schema') == 'isaac-visible-raw-v3'):
+    elif is_v3:
         # visible-v3 (package C): the native frame as it came, else (mode 1, or the native side handed back) the
         # reference encoder's frame of the raw block; the stall columns after the progress update below
         from .visible_producer import write_v3
