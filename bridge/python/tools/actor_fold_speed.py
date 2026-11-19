@@ -124,7 +124,7 @@ def main(argv=None):
         rp = []
         for gr in g.graphs[:len(g.sizes)]:
             e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            with torch.cuda.stream(st):
+            with torch.cuda.stream(st), torch.inference_mode():
                 for _ in range(3):
                     gr.replay()
                 e0.record(st)
