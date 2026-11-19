@@ -162,7 +162,7 @@ def check_records(rig, recs, T, episode):
 
 
 @pytest.mark.parametrize('blocks,K,lag,pace', [(4, 64, 0.0, 0.0), (1, 8, 0.002, 0.0), (2, 16, 0.0, 0.003),
-                                               (1, 6, 0.0, 0.0)])   # (K = 6 < a call's rows: the ring wraps every call)
+                                               (2, 9, 0.0, 0.0)])   # (K = 9: the ring wraps inside calls)
 def test_every_record_once_in_order(blocks, K, lag, pace):
     W, T, ep = 6, 40, 7
     rig = Rig(W=W, blocks=blocks, n=8, K=K, episode=ep)
@@ -269,3 +269,11 @@ def test_a_worker_gone_is_reported():
     kinds = {int(r['worker']): int(r['kind']) for r in recs if r['kind'] in (1, 2)}
     assert kinds == {0: 1, 1: 1, 2: 2}
     assert rig.d.fatal()[0] == 0
+
+
+def test_a_ring_smaller_than_a_call_is_refused():
+    rig = Rig(W=2, n=8, K=6)
+    with pytest.raises(Exception, match='must hold a call'):
+        rig.d.start()
+    for s_ in rig.drv_socks + rig.wk_socks:
+        s_.close()

@@ -146,11 +146,16 @@ class DriverCollect:
             vg = np.array([recs[j]['vg'] for j in g], np.float32)
             ver = int(recs[g[0]]['version'])
             ring_seq = np.array([int(recs[j]['ring']) for j in g], np.int64)
-            r0 = int(ring_seq[0]) % self.K
             kg = len(g)
+            r_ = ring_seq % self.K   # (the ring wraps: a call's rows are its sequence numbers mod K)
+            if r_[-1] - r_[0] == kg - 1:
+                sel = lambda x: x[int(r_[0]):int(r_[0]) + kg]   # noqa: E731
+            else:
+                ix = torch.from_numpy(r_).to(self.ring['kv'].device)
+                sel = lambda x: x.index_select(0, ix)   # noqa: E731
             tc = np.stack([recs[j]['tc'] for j in g])
             t = dict(create=tc[:, 0] > 0, nroom=tc[:, 1], steps=tc[:, 2], stage_prev=tc[:, 3],
-                     kv=self.ring['kv'][r0:r0 + kg], s=self.ring['s'][r0:r0 + kg], o=self.ring['o'][r0:r0 + kg])
+                     kv=sel(self.ring['kv']), s=sel(self.ring['s']), o=sel(self.ring['o']))
             with torch.cuda.stream(self.stream):   # (the driver's stream: the copy before the rows' next write)
                 store(roll, a_idx, sub, under_way, actions, logp, value, ver, None, vg, t, None)
             pending[a_idx] = actions

@@ -43,7 +43,7 @@ struct TokDriver {
   // the staging blocks [M, n, row_bytes] (Python owns them: numpy ROW arrays the consumer reads in place)
   uint8_t *blocks = nullptr; i64 M = 0, n = 0;
   std::vector<int> block_free;
-  // the output ring: K rows, absolute sequence numbers (head: the next row; released: below it free)
+  // the output ring: K rows, absolute sequence numbers (row = seq mod K; head: the next; released: below it free)
   i64 K = 0, ring_head = 0, ring_released = 0;
   // the queue
   std::deque<Rec> q; i64 q_cap = 0, seq = 0, call_id = 0, version = 0;
@@ -83,7 +83,7 @@ struct TokDriver {
     block_free.clear(); for (i64 b = M-1; b >= 0; b--) block_free.push_back((int)b);
     q_cap = q_cap_ > 0 ? q_cap_ : M*n;
   }
-  void set_ring_rows(i64 K_) { K = K_; ring_head = ring_released = 0; }
+  void set_ring_rows(i64 K_) { K = K_; ring_head = ring_released = 0; }   // (K >= n: checked at start)
   void set_version(i64 v) { std::lock_guard<std::mutex> g(mu); version = v; }
   void set_pending(i64 w, std::vector<i64> p) {
     std::lock_guard<std::mutex> g(mu);
@@ -95,6 +95,7 @@ struct TokDriver {
     std::lock_guard<std::mutex> g(mu);
     if (running) return;
     TORCH_CHECK(blocks && rows_base && K > 0, "TokDriver.start: sampler, blocks and ring first");
+    TORCH_CHECK(K >= n, "TokDriver.start: the ring (", K, " rows) must hold a call (", n, " rows)");
     stop_req = pause_req = paused = false; running = true;
     th = std::thread([this] { loop(); });
   }
@@ -263,10 +264,8 @@ struct TokDriver {
       {
         const double tc0 = now();
         std::unique_lock<std::mutex> lk(mu);
-        auto ok = [&] {
-          if (block_free.empty() || (i64)q.size()+k > q_cap) return false;
-          i64 h = ring_head; if (h % K+k > K) h += K-h % K;
-          return h+k-ring_released <= K;
+        auto ok = [&] {   // (ring rows wrap: a call's rows are (r0 + j) mod K, the consumer gathers them by row)
+          return !block_free.empty() && (i64)q.size()+k <= q_cap && ring_head+k-ring_released <= K;
         };
         if (!ok()) {
           credit_waits++;
@@ -275,7 +274,6 @@ struct TokDriver {
           if (!ok()) continue;   // (a stop / a fatal / a pause: the records stay ready)
         }
         b = block_free.back(); block_free.pop_back();
-        if (ring_head % K+k > K) ring_head += K-ring_head % K;   // (a call's rows contiguous: the ring's tail skipped)
         r0 = ring_head; ring_head += k;
         slots.assign((size_t)k, -1);
         for (i64 i = 0; i < k; i++) { slots[i] = ready_slot[take_w[i]]; ready_slot[take_w[i]] = -1; }
