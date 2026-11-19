@@ -375,6 +375,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         if audit is None or audit['n'] >= audit['cap']:
             if audit is not None:
                 audit['last'] = None
+                if not audit.get('cut'):   # (Codex 18-3: where the log stops, said in the log)
+                    audit['cut'] = True
+                    audit['dump'](('cut', audit['n'], int(ep), int(t)), audit['f'])
+                    audit['f'].flush()
             return
         audit['n'] += 1
         nb_ = int(row['visible_bytes'][0])
@@ -2190,6 +2194,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 inst.close()
         if gate is not None:
             gate.close()
+        if audit is not None:   # (Codex 18-3: the worker's end, said in its log)
+            try:
+                audit['dump'](('end', 'x', audit['n']), audit['f'])
+                audit['f'].close()
+            except (OSError, ValueError):
+                pass
         try:
             conn.send_bytes(b'x')
         except OSError:

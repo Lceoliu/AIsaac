@@ -57,6 +57,10 @@ struct TokDriver {
   // (Codex 17-3) a worker's end / EOF read while its record waits to be taken: queued after that record (the consumer
   // sees a worker's records before its end); 0 none, else the RecKind
   std::vector<i64> gone_after;
+  // (Codex 18-1) the workers whose record was accepted into a call and not yet answered: every exit of the thread
+  // (a refused check, a middle exception, any other) answers them without an action (a cancel), as close_serve
+  // answers the records only read -- none is left waiting
+  std::vector<char> owed;
   abptok::MsgReader reader;
   std::vector<double> f_at;      // an 'F' waiting for its 'R' since (seconds)
   std::vector<double> ready_t;   // when each worker's waiting record was read (the ready -> reply clock)
@@ -91,7 +95,7 @@ struct TokDriver {
     row_bytes = mid->L.row_bytes; nh = mid->L.nh;
     TORCH_CHECK((i64)fds.size() == W && nh <= 8, "set_sampler: one fd per worker, at most 8 heads");
     pending.assign((size_t)(W*nh), 0); ready_slot.assign((size_t)W, -1); gone.assign((size_t)W, 0);
-    gone_after.assign((size_t)W, 0);
+    gone_after.assign((size_t)W, 0); owed.assign((size_t)W, 0);
     reader.reset(W); f_at.assign((size_t)W, -1.0); ready_t.assign((size_t)W, 0.0);
   }
   void set_rules(i64 off_done_, i64 off_first_, i64 off_t_, i64 done_branch_, i64 cap_t_, i64 trunc_) {
@@ -133,10 +137,11 @@ struct TokDriver {
   void pause() { { std::lock_guard<std::mutex> g(mu); pause_req = true; pause_gen++; } cv.notify_all(); }
   void resume() { { std::lock_guard<std::mutex> g(mu); pause_req = false; paused = false; } cv.notify_all(); }
   bool is_paused() { std::lock_guard<std::mutex> g(mu); return paused_ack(); }
-  // (Codex 17-1) one consistent view for the consumer's drain: (paused and acknowledged, queue length, next seq)
+  // (Codex 17-1 / 18-2) one consistent view for the consumer's drain: (paused and acknowledged, queue length, next
+  // seq, the fatal code)
   py::tuple drain_state() {
     std::lock_guard<std::mutex> g(mu);
-    return py::make_tuple(paused_ack(), (i64)q.size(), seq);
+    return py::make_tuple(paused_ack(), (i64)q.size(), seq, fatal_code);
   }
   // (Codex 17-2) after stop(): every record already read (and every one still arriving) answered without an action
   // -- a cancel, the workers told to close first (sampler.control[0]) -- until each worker has ended or the time is up;
@@ -253,6 +258,7 @@ struct TokDriver {
     const bool ok = off == 5;
     const double dt = now()-ready_t[(size_t)w];
     std::lock_guard<std::mutex> g(mu);
+    owed[(size_t)w] = 0;
     if (ok) replies++; else reply_fail++;
     rr_s += dt; rr_n++;
     return ok;
@@ -332,9 +338,24 @@ struct TokDriver {
     } catch (...) {
       set_fatal(5, -1, "TokDriver thread: an unknown exception");
     }
+    cancel_owed();
     std::lock_guard<std::mutex> g(mu);
     paused = true; ack_gen = pause_gen;
     cv.notify_all();
+  }
+  // (Codex 18-1) every accepted, unanswered record answered without an action; a worker's end held behind it queued
+  void cancel_owed() {
+    std::vector<i64> ws;
+    {
+      std::lock_guard<std::mutex> g(mu);
+      for (i64 w = 0; w < W; w++) if (owed[(size_t)w]) ws.push_back(w);
+    }
+    for (i64 w : ws) {
+      reply(w);
+      std::lock_guard<std::mutex> g(mu);
+      cancelled++;
+      push_gone_after(w);
+    }
   }
   void loop_body() {
     std::vector<i64> take_w, slots, pend_c, widx_c, ring_c, cs, cd, gi;
@@ -392,7 +413,7 @@ struct TokDriver {
         b = block_free.back(); block_free.pop_back();
         r0 = ring_head; ring_head += k;
         slots.assign((size_t)k, -1);
-        for (i64 i = 0; i < k; i++) { slots[i] = ready_slot[take_w[i]]; ready_slot[take_w[i]] = -1; }
+        for (i64 i = 0; i < k; i++) { slots[i] = ready_slot[take_w[i]]; ready_slot[take_w[i]] = -1; owed[take_w[i]] = 1; }
       }
       // the records into the block (fixed fields + the frame prefix: A-4's take_prefix rule), go, pending, cf_snap
       uint8_t *blk = blocks+b*n*row_bytes;

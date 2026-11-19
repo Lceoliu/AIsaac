@@ -109,6 +109,11 @@ class DriverCollect:
         prof['drv_call_s'] = prof.get('drv_call_s', 0.0) + c1['t_call_s'] - c0['t_call_s']
         prof['cf_snaps'] = prof.get('cf_snaps', 0) + c1['cf_snaps'] - c0['cf_snaps']   # (as the Python loop's)
         prof['drv_reply_fail'] = prof.get('drv_reply_fail', 0) + c1['reply_fail'] - c0['reply_fail']
+        if c1['reply_fail'] > c0['reply_fail']:   # (Codex 18, a known deviation: a failed write is taken for the
+            #  worker's end -- stored as the Python loop stores it, its EOF expected; one that is not an EOF would leave
+            #  a worker waiting: counted and reported, to be handled if it is ever seen)
+            print(f"P package: {c1['reply_fail'] - c0['reply_fail']} replies could not be written in this collect "
+                  f"(gone so far: {self.stat.get('gone', 0)})", flush=True)
 
     def drain(self, roll, book, pending, prof, store):
         """Pause the driver; every record it accepted committed (P-driver-design 11.1). The boundary (Codex 17-1): the
@@ -119,7 +124,9 @@ class DriverCollect:
             got = self.step(roll, book, pending, prof, store, 0.01)
             if got or self.partial:
                 continue
-            ok, qn, seq = self.d.drain_state()
+            ok, qn, seq, fat = self.d.drain_state()
+            if fat:   # (Codex 18-2: a fatal the driver found while paused / draining is part of the boundary)
+                self.raise_fatal()
             if ok and qn == 0:
                 if self.next_seq != seq:
                     raise RuntimeError(f'tok_driver: drained at seq {self.next_seq}, the driver gave out {seq}')
@@ -129,13 +136,7 @@ class DriverCollect:
         t0 = time.perf_counter()
         d = self.d.take(256, timeout)
         self.stat['take_s'] += time.perf_counter() - t0
-        code, w, text = self.d.fatal()
-        if code:
-            msg = text.decode('utf-8', 'replace')
-            if code == 86:
-                from .visible_producer import VisibleV3Fatal
-                raise VisibleV3Fatal(f'tok_driver: worker {w}: {msg}')
-            raise RuntimeError(f'tok_driver: fatal {code} (worker {w}): {msg}')
+        self.raise_fatal()
         m = len(d['seq'])
         if not m:
             return 0
@@ -239,6 +240,22 @@ class DriverCollect:
         self.stat['records'] += k
         self.stat['calls'] += 1
 
+    def fatal_error(self):
+        """The driver's fatal as the exception to raise (VisibleV3Fatal for a visible-v3 one, 86), or None."""
+        code, w, text = self.d.fatal()
+        if not code:
+            return None
+        msg = text.decode('utf-8', 'replace')
+        if code == 86:
+            from .visible_producer import VisibleV3Fatal
+            return VisibleV3Fatal(f'tok_driver: worker {w}: {msg}')
+        return RuntimeError(f'tok_driver: fatal {code} (worker {w}): {msg}')
+
+    def raise_fatal(self):
+        e = self.fatal_error()
+        if e is not None:
+            raise e
+
     def close(self, timeout=60.0):
         """(Codex 17-2) The driver stopped and joined; then every record it had read but not answered, and every one
         still arriving, answered without an action (a cancel) with the workers told to close (sampler.control[0]), until
@@ -262,3 +279,10 @@ class DriverCollect:
         self.stat['cancelled'] = int(n_c)
         print(f'P package: the driver stopped ({n_c} records cancelled at the end, {open_w} workers still open)',
               flush=True)
+        # (Codex 18-2) everything is cleaned up; now the errors: a fatal the driver found up to its end (also while
+        # closing), then workers that never ended -- raised, so the run ends with a non-zero code
+        e = self.fatal_error()
+        if e is not None:
+            raise e
+        if open_w:
+            raise RuntimeError(f'tok_driver: {open_w} workers still open after {timeout:.0f} s of the end')

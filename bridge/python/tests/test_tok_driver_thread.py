@@ -481,3 +481,60 @@ def test_each_records_origin_is_copied_at_its_take():
     for w in range(W):
         mine = [float(r['origin']) for r in recs if int(r['worker']) == w and r['kind'] == 0]
         assert mine == [1000.0 * w + t for t in range(T)], (w, mine[:5])
+
+
+def test_a_refused_call_leaves_no_worker_waiting():
+    """(Codex 18-1) The middle refuses a call (a bad frame: fatal 86) after its records were accepted -- taken out of
+    the ready slots, not answered: every worker of that call gets a reply (a cancel) when the thread ends, so with the
+    driver stopped and close_serve answering the rest, every worker ends well before close_serve's time limit."""
+    W, T = 3, 40
+    rig = Rig(W=W, blocks=4, n=8, K=64)
+    orig = rig.record
+
+    def record(w, t):
+        slot = orig(w, t)
+        if w == 2 and t == 3:
+            rig.rows['visible_schema'][slot] = V3.VERSION + 7
+        return slot
+    rig.record = record
+    stop = threading.Event()
+    got = {w: [] for w in range(W)}
+
+    def worker(w):
+        s = rig.wk_socks[w]
+        try:
+            for t in range(T):
+                if stop.is_set():
+                    break
+                _send_record(rig, w, t)
+                r = _recv_reply(rig, w, 8.0)
+                got[w].append(r)
+                if r != REPLY:
+                    return
+                time.sleep(0.002)
+            s.sendall(struct.pack('!i', 1) + b'x')
+        except OSError:
+            got[w].append(b'timeout')
+    ths = [threading.Thread(daemon=True, target=worker, args=(w,)) for w in range(W)]
+    rig.d.start()
+    for t_ in ths:
+        t_.start()
+    try:
+        t0 = time.time()
+        while rig.d.fatal()[0] == 0 and time.time() - t0 < 10:
+            rig.consume(lambda rs: len(rs) > 0, timeout=0.05)
+        f = rig.d.fatal()
+        stop.set()
+        rig.d.stop()
+        t1 = time.time()
+        n_c, open_w = rig.d.close_serve(4.0)
+        took = time.time() - t1
+        for t_ in ths:
+            t_.join(10)
+    finally:
+        for s in rig.drv_socks + rig.wk_socks:
+            s.close()
+    assert f[0] == 86 and f[1] == 2, f
+    assert not any(t_.is_alive() for t_ in ths)
+    assert all(r == REPLY for w in got for r in got[w]), {w: got[w][-2:] for w in got}
+    assert open_w == 0 and took < 3.0, (open_w, took)

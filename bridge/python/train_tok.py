@@ -6863,8 +6863,10 @@ def main(argv=None, child=None, actor=None):
             #                          the workers closed before the learner's join and the last save)
             try:
                 tok_dc[0].close()
-            except Exception as e_:   # (the shutdown goes on: sampler.close still reaps the workers)
-                print(f'P package: the driver close failed: {e_}', flush=True)
+            except Exception as e_:   # (the shutdown goes on -- sampler.close still reaps the workers; Codex 18-2: the
+                #                        error kept for the run's end, a non-zero exit)
+                print(f'P package: the driver close failed: {type(e_).__name__}: {e_}', flush=True)
+                failure.append(e_)
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
             # (2026-11-05: past this point nobody needs what is still unsent: a clean end has seen the stop, which comes after

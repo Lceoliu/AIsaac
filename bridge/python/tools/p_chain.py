@@ -69,7 +69,13 @@ BANK_R = 4   # bank rows per worker (reused in turn)
 
 def bitdiff(a, b):
     """(Codex 17-4) a against b, bit for bit: dict(n, equal, finite, max_abs). Rows [N, ...]; finiteness first (a NaN /
-    inf on either side fails the row), then the bytes of the original dtypes (+0 / -0 differ)."""
+    inf on either side fails the row), then the bytes of the original dtypes (+0 / -0 differ). a / b may be (bits, finite
+    per row) pairs (tensor_bits: a bf16 tensor's bits are int16, its finiteness taken before -- Codex 18-4)."""
+    fa_ = fb_ = None
+    if isinstance(a, tuple):
+        a, fa_ = a
+    if isinstance(b, tuple):
+        b, fb_ = b
     a, b = np.ascontiguousarray(a), np.ascontiguousarray(b)
     if a.shape != b.shape or a.dtype != b.dtype:
         return dict(n=int(len(a)), equal=0, finite=False, max_abs=float('inf'),
@@ -79,6 +85,10 @@ def bitdiff(a, b):
         return dict(n=0, equal=0, finite=True, max_abs=0.0)
     a2, b2 = a.reshape(n, -1), b.reshape(n, -1)
     fin = (np.isfinite(a2).all(1) & np.isfinite(b2).all(1)) if a.dtype.kind == 'f' else np.ones(n, bool)
+    if fa_ is not None:
+        fin &= np.asarray(fa_, bool).reshape(n)
+    if fb_ is not None:
+        fin &= np.asarray(fb_, bool).reshape(n)
     eq = (a2.view(np.uint8).reshape(n, -1) == b2.view(np.uint8).reshape(n, -1)).all(1) & fin
     with np.errstate(invalid='ignore'):
         d = np.abs(a2.astype(np.float64) - b2.astype(np.float64))
@@ -180,22 +190,31 @@ class Roll:
         return r
 
 
-def tensor_bits(t):
+def tensor_bits(t, axis=0):
+    """(bits, finite): the tensor with `axis` first, a bf16 one as its int16 bits; finite per row along that axis --
+    taken from the values BEFORE the bits (Codex 18-4: a NaN / inf bf16 is otherwise just an int16)."""
     import torch
     t = t.detach()
-    return (t.view(torch.int16) if t.dtype == torch.bfloat16 else t).cpu().numpy()
+    fin = torch.isfinite(t.float()) if t.is_floating_point() else torch.ones_like(t, dtype=torch.bool)
+    fin = np.moveaxis(fin.cpu().numpy(), axis, 0)
+    v = np.moveaxis((t.view(torch.int16) if t.dtype == torch.bfloat16 else t).cpu().numpy(), axis, 0)
+    return np.ascontiguousarray(v), fin.reshape(fin.shape[0], -1).all(1)
+
+
+def sel(x, i):
+    return x[0][i], x[1][i]
 
 
 def state_of(ts, upto):
-    """The slots' tensors (bf16 as their bits), slot axis first; the slots below `upto` (the scratch slot left out)."""
+    """The slots' tensors as tensor_bits pairs, slot axis first; the slots below `upto` (the scratch slot left out)."""
     import torch
     torch.cuda.synchronize()
-    out = {}
-    for k in STATE:
-        v = tensor_bits(getattr(ts, k))
-        v = np.moveaxis(v, 2, 0) if k == 'kv' else v
-        out[k] = np.ascontiguousarray(v[:upto])
-    return out
+    return {k: sel(tensor_bits(getattr(ts, k), 2 if k == 'kv' else 0), slice(0, upto)) for k in STATE}
+
+
+def slot_bits(ts, s):
+    """(Codex 18-5) one slot's state as a lane would read it: per tensor (bits, finite)."""
+    return {k: sel(tensor_bits(getattr(ts, k), 2 if k == 'kv' else 0), slice(s, s + 1)) for k in STATE}
 
 
 def numstats(a, b, line=None):
@@ -250,6 +269,8 @@ def main(argv=None):
     ap.add_argument('--alt', default='', help='gate 2: single,wide')
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--timeout', type=float, default=1800)
+    ap.add_argument('--require', default='', help="gates that must have run (Codex 18-4): '1,2,3' -- gate 2 with "
+                    "--alt naming two different splits, every gate over a non-zero number of records")
     ap.add_argument('--out', default=None)
     a = ap.parse_args(argv)
 
@@ -361,6 +382,8 @@ def main(argv=None):
         if a.lag:
             time.sleep(a.lag)
 
+    gens_d = defaultdict(list)   # bank row -> the generations read back after each write (Codex 18-5)
+
     def worker(w):
         rng = np.random.default_rng(a.seed * 1000 + w)
         s = sampler.wk[w]
@@ -392,6 +415,9 @@ def main(argv=None):
                     got += c
                 if got != REPLY:
                     errors.append(f'worker {w} record {i}: reply {got!r}')
+                if cf and bank is not None and go_rule(sampler.rows[slot:slot + 1], a.cap_t, a.trunc,
+                                                       DONE_BRANCH)[0]:
+                    gens_d[cf - 1].append(slot_bits(bank, cf - 1))   # (the generation a lane would read now)
                 ent.update(replied=True, actions=sampler.actions[w, :nh].astype(np.int64),
                            value=float(sampler.main_value[w]), vg=float(sampler.main_vg[w]),
                            cf_after=int(sampler.cf_snap[w]) if sampler.cf_snap is not None else 0)
@@ -434,11 +460,20 @@ def main(argv=None):
         died = f'{type(e).__name__}: {e}'
     res['collect_s'] = time.perf_counter() - t0
     tc0 = time.perf_counter()
-    closer = threading.Thread(target=dc.close, kwargs=dict(timeout=20.0), daemon=True)   # (the training loop's close)
+    close_res = {}
+
+    def do_close():   # (the training loop's close; its return / exception kept -- Codex 18-4)
+        try:
+            dc.close(timeout=20.0)
+            close_res['ok'] = True
+        except Exception as e:   # noqa: BLE001
+            close_res['error'] = f'{type(e).__name__}: {e}'
+    closer = threading.Thread(target=do_close, daemon=True)
     closer.start()
     closer.join(40)
     res['close_s'] = time.perf_counter() - tc0
-    res['closed'] = not closer.is_alive()
+    res['close_error'] = close_res.get('error')
+    res['closed'] = not closer.is_alive() and bool(close_res.get('ok'))
     for th in threads:
         th.join(10)
     res['workers_hung'] = [w for w, th in enumerate(threads) if th.is_alive()]
@@ -446,12 +481,13 @@ def main(argv=None):
     res['counters'] = {k: v for k, v in dc.d.counters().items() if isinstance(v, (int, float))}
     res['consumer'] = dict(dc.stat)
 
-    if a.die_after:   # (the consumer died: the exception out, the close prompt, every worker answered and ended)
+    if a.die_after:   # (the consumer died: the exception out, the close prompt and clean, every worker answered)
         res['died'] = died
         res['unreplied'] = {w: [e['i'] for e in sent[w] if not e['replied']] for w in sent
                             if any(not e['replied'] for e in sent[w])}
-        res['pass'] = bool(died and 'consumer dies' in died and res['closed'] and not res['workers_hung']
-                           and not res['unreplied'])
+        res['hit_died_at'] = state['calls'] == a.die_after
+        res['pass'] = bool(died and 'consumer dies' in died and res['hit_died_at'] and res['closed']
+                           and not res['workers_hung'] and not res['unreplied'])
         _out(res, a)
         return
     if died:
@@ -475,6 +511,30 @@ def main(argv=None):
                                       and go_rule(e['row'], a.cap_t, a.trunc, DONE_BRANCH)[0])),
                         cf_requests=int(sum(1 for v in sent.values() for e in v if e['cf'])),
                         gone=dc.stat['gone'], mismatch=recon, errors=errors[:20], workers_hung=res['workers_hung'])
+    # (Codex 18-4) each fault injected must have happened
+    hits = {}
+    if a.kill:
+        hits['kill'] = bool(len(sent[kill_w]) == kill_i + 1 and dc.stat['gone'] >= 1)
+    if a.blocks <= 4 or a.ring <= 64:
+        hits['short_of_credits'] = bool(res['counters'].get('credit_waits', 0) > 0)
+    if a.swaps:
+        hits['swaps'] = len(swaps_log) == a.swaps
+    if a.ends:
+        allr = [e['row'] for v in sent.values() for e in v]
+        dn = np.array([int(r['done'][0]) for r in allr])
+        tt = np.array([int(r['t'][0]) for r in allr])
+        kinds_ = dict(win=int((dn == 1).sum()), death=int((dn == 2).sum()), branch=int((dn == DONE_BRANCH).sum()),
+                      stall_end=int(((dn == 3) & (tt < a.cap_t)).sum()), cap_end=int(((dn == 3) & (tt >= a.cap_t)).sum()))
+        res['gate3']['end_kinds'] = kinds_
+        hits['ends'] = all(v > 0 for k, v in kinds_.items() if k != 'cap_end' or a.cap_t > 0)
+    if a.cf:
+        hits['cf'] = bool(res['gate3']['cf_requests'] > 0)
+        hits['bank_reuse'] = bool(gens_d) and all(len(g) >= 2 for g in gens_d.values())
+        res['gate3']['bank_rows_written'] = len(gens_d)
+        res['gate3']['bank_writes'] = int(sum(len(g) for g in gens_d.values()))
+    if a.lag:
+        hits['lag'] = bool(res['counters'].get('credit_waits', 0) > 0 or a.blocks > 4)
+    res['gate3']['hits'] = hits
 
     # ---- the tested chain's results, kept before its tensors go
     torch.cuda.synchronize()
@@ -497,6 +557,7 @@ def main(argv=None):
         torch.cuda.synchronize()
         pend = np.zeros((W, nh), np.int64)
         nxt, ndec = np.zeros(W, np.int64), np.zeros(W, np.int64)
+        gens_r = defaultdict(list)
         out = {}
         ver = 0
         if split == 'same':
@@ -554,6 +615,8 @@ def main(argv=None):
                 m = cfs[g] > 0
                 if bank_r is not None and m.any():   # (the slot before this record's step, into the named row)
                     bank_r.copy_slot_(gw[m], cfs[g][m] - 1, other=be.ts)
+                    for row_ in (cfs[g][m] - 1).tolist():
+                        gens_r[row_].append(slot_bits(bank_r, row_))
                 dec = ndec[gw].copy()
                 ndec[gw] += 1
                 keys_t = (gw + 1, gr['t'].astype(np.int64)) if forced is None else (gw + 1, dec)
@@ -567,11 +630,12 @@ def main(argv=None):
         finally:
             TP.crn_uniforms = orig_u
         torch.cuda.synchronize()
-        kept = dict(kv=tensor_bits(be.td['kv']), s=tensor_bits(be.td['s']), o=tensor_bits(be.td['o']))
+        kept = dict(kv=tensor_bits(be.td['kv']), s=tensor_bits(be.td['s']), o=tensor_bits(be.td['o']))   # (pairs)
         st = state_of(be.ts, W)
         bk = state_of(bank_r, W * BANK_R) if bank_r is not None else None
         del be
         torch.cuda.empty_cache()
+        reference.gens = gens_r
         return out, kept, st, bk
 
     # the tested side per decision (worker, ordinal), in the stores' order
@@ -631,7 +695,7 @@ def main(argv=None):
         g1['rows_prefix'] = dict(n=len(keys), equal=same_rows, where=row_diff, examples=row_ex,
                                  padding_differs=int(pad_rows))
         for k in kept_d:
-            g1[f'rollout_{k}'] = bitdiff(kept_d[k][dest], kept_r[k][dest])
+            g1[f'rollout_{k}'] = bitdiff(sel(kept_d[k], dest), sel(kept_r[k], dest))
         # what each worker read back against the reference's answer
         rb_a, rf_a, rb_v, rf_v, rb_g, rf_g = [], [], [], [], [], []
         for w in range(W):
@@ -661,6 +725,15 @@ def main(argv=None):
             ok_cf = sum(1 for e in reqs if e['cf_after'] == (0 if go_rule(e['row'], a.cap_t, a.trunc, DONE_BRANCH)[0]
                                                             else e['cf']))
             g1['cf_cleared'] = dict(n=len(reqs), equal=int(ok_cf))
+            # (Codex 18-5) every generation of every bank row, as read back after its write, against the reference's
+            gr_ = reference.gens
+            n_g = eq_g = 0
+            for row_ in sorted(set(gens_d) | set(gr_)):
+                a_, b_ = gens_d.get(row_, []), gr_.get(row_, [])
+                n_g += max(len(a_), len(b_))
+                if len(a_) == len(b_):
+                    eq_g += sum(all_equal({k: bitdiff(x[k], y[k]) for k in STATE}) for x, y in zip(a_, b_))
+            g1['bank_generations'] = dict(n=int(n_g), equal=int(eq_g))
         g1['all_bit_equal'] = all_equal(g1)
     else:
         g1['all_bit_equal'] = False
@@ -669,7 +742,7 @@ def main(argv=None):
     res['gate1'] = g1
     res['gate3']['decisions_reference'] = len(ref)
     res['gate3']['pass'] = bool(not recon and not errors and res['closed'] and not res['workers_hung']
-                                and res['gate3']['swaps_done'] == a.swaps and g1['same_keys'])
+                                and res['gate3']['swaps_done'] == a.swaps and g1['same_keys'] and all(hits.values()))
 
     # ---- gate 2: the driver's actions forced in other splits
     if a.alt:
@@ -695,6 +768,16 @@ def main(argv=None):
                           and all(g2[s_]['pass'] for s_ in alts))
         res['gate2'] = g2
     res['pass'] = bool(res['gate3']['pass'] and g1['all_bit_equal'] and res.get('gate2', {}).get('pass', True))
+    req = [x for x in a.require.split(',') if x]   # (Codex 18-4: a gate not run is not a gate passed)
+    miss = []
+    if '1' in req and not g1.get('decisions_ref'):
+        miss.append('gate 1: no decisions')
+    if '2' in req and (len(set(a.alt.split(',')) - {''}) < 2 or not res.get('gate2', {}).get('records')):
+        miss.append('gate 2: --alt with two different splits over a non-zero number of records')
+    if '3' in req and not res['gate3'].get('records_sent'):
+        miss.append('gate 3: no records')
+    res['required'] = dict(gates=req, missing=miss)
+    res['pass'] = res['pass'] and not miss
     _out(res, a)
 
 
