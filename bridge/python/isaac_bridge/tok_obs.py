@@ -235,6 +235,25 @@ def compact_rows(rows, arena):
     return out
 
 
+def take_prefix(src, slots, out):
+    """(A-4, 2026-11-19) src[slots] into out[:len(slots)] (ROW arrays; out reused between calls), each record's bytes
+    up to the end of its frame only -- every field before visible_frame and the frame's visible_bytes (rounded up to
+    whole floats); the frame field's tail past it keeps what out held (never read: decode_frames_device / the lazy
+    decode read a frame within its length, compact_rows / store copy it no further). A record whose visible_bytes is
+    outside 0 .. the frame field is copied whole (the checks downstream refuse it). Returns out[:len(slots)]; the
+    same values as src[slots] on every field byte and each frame (tests/test_take_prefix.py)."""
+    n = len(slots)
+    dst = out[:n]
+    sb = src.reshape(-1).view(np.uint8).reshape(-1, ROW.itemsize)
+    db = dst.view(np.uint8).reshape(n, ROW.itemsize)
+    nb = np.asarray(src['visible_bytes'], np.int64)[slots]
+    cap = ROW.itemsize - ROW_FRAME_AT
+    for i, (s_, k) in enumerate(zip(np.asarray(slots, np.int64).tolist(), nb.tolist())):
+        e = ROW_FRAME_AT + ((k + 3) & ~3) if 0 <= k <= cap else ROW.itemsize
+        db[i, :e] = sb[s_, :e]
+    return dst
+
+
 def compact_copy(rows):
     """(ROWC records, their own frame bytes) of ROW records: a self-contained compact copy (teacher records)."""
     arena = FrameArena(int(np.asarray(rows['visible_bytes'], np.int64).sum())+64)

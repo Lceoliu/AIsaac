@@ -253,6 +253,7 @@ from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
 from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
 from isaac_bridge.learn_segments import SEG   # BM1: learner segment timing (ISAAC_BLOCK_TIMING=1 only)
+from isaac_bridge.tok_obs import take_prefix   # noqa: E402  (A-4)
 from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
@@ -3347,6 +3348,12 @@ def main(argv=None, child=None, actor=None):
         lanes = BlockLaneService(sampler,model,device,wait=args.cf_lane_wait,quiet=args.cf_lane_quiet,
                                  distill_steps=args.cf_distill_steps,main_actor=block_actor,stat=lane_stat)
     inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
+    # (A-4, 2026-11-19, v3 frames: each call's records taken up to their frame's end only (take_prefix) into a ring of
+    #  reused ROW buffers -- a call's records stay referenced while it is in flight (its own, the snapshots'), so the
+    #  ring is longer than the calls in flight can be; ISAAC_RL_ROW_PREFIX=0: sampler.rows[slots] as before)
+    row_ring = ([np.zeros(n, ROW) for _ in range(3 * max(1, args.actor_slots) + 3)]
+                if args.frame == 'v3' and child is None and os.environ.get('ISAAC_RL_ROW_PREFIX', '1') == '1' else None)
+    row_at = [0]
     # B54 experiment (ISAAC_BLOCK_STREAM_PRIO=learner): the learner's stream high priority, the actor's low (with the
     # C++ actor the collect is shorter than the update; the actor has slack to absorb the learner's kernels first)
     prio_learner = os.environ.get('ISAAC_BLOCK_STREAM_PRIO', 'actor') == 'learner'
@@ -6463,7 +6470,13 @@ def main(argv=None, child=None, actor=None):
                         _lane_tick(prof)
                     continue
                 nv.push('actor.book')
-                rows = sampler.rows[slots]
+                if row_ring is not None:   # (A-4)
+                    if len(inflight) > len(row_ring) - 2:
+                        raise RuntimeError('A-4: more calls in flight than the row ring holds')
+                    row_at[0] = (row_at[0] + 1) % len(row_ring)
+                    rows = take_prefix(sampler.rows, slots, row_ring[row_at[0]])
+                else:
+                    rows = sampler.rows[slots]
                 if priv_pending is not None:   # 2026-11-03 (tok_priv): one record per worker is outstanding at a time
                     priv_pending[idx] = sampler.priv[slots]
                 if block_actor is not None:

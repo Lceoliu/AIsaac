@@ -2673,7 +2673,13 @@ class GraphActor:
                                              int(np.searchsorted(self.sizes, most)))
         if g_v3 is not None:
             g = g_v3
-        self.stage_np[:n, :ROW_BYTES] = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
+        src_ = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
+        if self.v3:   # (A-4: the bytes up to the call's longest frame; the frame field's tail is never decoded)
+            nb_ = int(np.asarray(rows['visible_bytes'], np.int64).max())
+            cut_ = min(ROW_BYTES, self.v3_frame_at + max((nb_ + 3) & ~3, 0))
+            self.stage_np[:n, :cut_] = src_[:, :cut_]
+        else:
+            self.stage_np[:n, :ROW_BYTES] = src_
         self.stage_np[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * self.nh)
         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
         sel = None
