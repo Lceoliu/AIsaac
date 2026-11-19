@@ -303,6 +303,11 @@ struct TokDriver {
         if (go[i]) gi.push_back(i);
       }
       const i64 kg = (i64)gi.size();
+      {   // (the call's ring rows: its go records only -- the rows reserved for its ends given back at once, else the
+          //  consumer, releasing up to its last go record's row + 1, would never free them: a full ring, a stall)
+        std::lock_guard<std::mutex> g(mu);
+        ring_head = r0+kg;
+      }
       const uint8_t *call_p = blk;
       bool front = true; for (i64 j = 0; j < kg; j++) if (gi[j] != j) front = false;
       if (!front) {   // (the go records contiguous for the call)

@@ -161,7 +161,8 @@ def check_records(rig, recs, T, episode):
                 assert r['value'] == t and r['logp'] == -t
 
 
-@pytest.mark.parametrize('blocks,K,lag,pace', [(4, 64, 0.0, 0.0), (1, 8, 0.002, 0.0), (2, 16, 0.0, 0.003)])
+@pytest.mark.parametrize('blocks,K,lag,pace', [(4, 64, 0.0, 0.0), (1, 8, 0.002, 0.0), (2, 16, 0.0, 0.003),
+                                               (1, 6, 0.0, 0.0)])   # (K = 6 < a call's rows: the ring wraps every call)
 def test_every_record_once_in_order(blocks, K, lag, pace):
     W, T, ep = 6, 40, 7
     rig = Rig(W=W, blocks=blocks, n=8, K=K, episode=ep)
@@ -170,6 +171,7 @@ def test_every_record_once_in_order(blocks, K, lag, pace):
     for t_ in ths:
         t_.start()
     recs = rig.consume(lambda rs: sum(r['kind'] == 1 for r in rs) == W, lag=lag)
+    assert sum(r['kind'] == 1 for r in recs) == W, ('stalled', rig.d.counters())
     for t_ in ths:
         t_.join(5)
     c = rig.d.counters()
