@@ -1,6 +1,7 @@
 """P package (Codex round 18-3): p_audit's regression test on a real training run's logs and dumps -- the clean data must
 reconcile (exit 0) and each of Codex's three counterexamples must fail (exit 1):
-  (a) the last rollout's last closed decision of a worker made open, its reward 999;
+  (a) a worker's last closed decision of a rollout made open, its reward 999 -- in the rollout before the last (the
+      last one's open decisions have no witness: the next rollout, not dumped, would carry them);
   (b) the first decision of a worker deleted from the first rollout;
   (c) a reply deleted from the middle of a worker's log, and a later decision's reward changed.
 The mutated copies go to <scratch> (the unchanged rollouts linked); the tool under test is any p_audit.py (an old tree's
@@ -56,8 +57,9 @@ def main(argv=None):
     # clean
     res['clean'] = run(a.tool, a.audit, a.rollouts, os.path.join(a.scratch, 'clean.json'))
 
-    # (a) the last rollout: a worker's last decision, closed, made open with reward 999
-    z = dict(np.load(last))
+    # (a) the rollout before the last: a worker's last decision, closed, made open with reward 999
+    a_src = npz[-2]
+    z = dict(np.load(a_src))
     w = next((w for w in range(len(z['length'])) if z['length'][w] > 0 and z['open'][w] == -1), None)
     how = 'closed last decision made open'
     if w is None:   # (every worker's last decision open: the one before it made open -- also a wrong open)
@@ -68,7 +70,7 @@ def main(argv=None):
     z['open'][w] = k
     z['reward'] = z['reward'].copy()
     z['reward'][w, k] = 999.0
-    copy_rollouts(a.rollouts, os.path.join(a.scratch, 'ra'), {os.path.basename(last): z})
+    copy_rollouts(a.rollouts, os.path.join(a.scratch, 'ra'), {os.path.basename(a_src): z})
     res['a'] = dict(worker=w, k=k, how=how,
                     result=run(a.tool, a.audit, os.path.join(a.scratch, 'ra'), os.path.join(a.scratch, 'a.json')))
 

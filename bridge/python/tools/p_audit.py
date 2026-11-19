@@ -18,7 +18,8 @@ The handed rollouts, per worker, against the rebuild -- the boundaries independe
   - the first rollout (update 1) starts at the worker's first decision; each later one starts with the open decision of
     the one before (carried: identical in every field) or, when none was open, with the next decision;
   - every rollout is a contiguous run of the rebuild's decisions (none lost, doubled, reordered);
-  - open is -1 or the rollout's last decision, and an open decision has reward 0 and terminal 0 (still to come);
+  - open is -1 or the rollout's last decision, and every open decision is carried into the next rollout (the last
+    rollout's open decisions have no witness: counted apart -- an open row's reward / terminal are stale, not checked);
   - per decision: the row (every field before the frame, the frame up to its end) against the sent bytes; pending,
     actions against the rebuild; actions, value, value_g against what the worker read; reward, terminal, boot of every
     closed decision against the rebuild (except the one with no successor observed); logp finite; version never
@@ -199,12 +200,12 @@ def main(argv=None):
                         problem(f'rollout {upd} worker {w}: starts at {key[1:]}, the worker\'s first decision is '
                                 f'{order[w][0]}')
                 is_open = k == o_
-                if is_open:
+                if is_open:   # (its reward / terminal are not yet written: Rollout.reset clears length and open only,
+                    #            so they hold what the buffer held before -- never read: an open row is not trained.
+                    #            Its status is witnessed by the next rollout: carried there, identical)
                     carry[w] = (key, r.copy(), fl)
-                    if np.asarray(fl['reward']).tobytes() != np.zeros((), np.asarray(fl['reward']).dtype).tobytes() \
-                            or bool(fl['terminal']):
-                        problem(f'rollout {upd} worker {w} {key}: open with reward {fl["reward"]} / terminal '
-                                f'{fl["terminal"]} (still to come)')
+                    if p == paths[-1]:
+                        n_cmp['open_last_unwitnessed'] = n_cmp.get('open_last_unwitnessed', 0) + 1
                 kr = ident.get(key)
                 if not is_carried:   # (the sequence: the next of the rebuild's decisions, none skipped)
                     if beyond[w]:

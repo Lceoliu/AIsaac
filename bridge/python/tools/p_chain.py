@@ -213,8 +213,10 @@ def state_of(ts, upto):
 
 
 def slot_bits(ts, s):
-    """(Codex 18-5) one slot's state as a lane would read it: per tensor (bits, finite)."""
-    return {k: sel(tensor_bits(getattr(ts, k), 2 if k == 'kv' else 0), slice(s, s + 1)) for k in STATE}
+    """(Codex 18-5) one slot's state as a lane would read it: per tensor (bits, finite) -- the slot taken on the device
+    first (a whole bank to the host per generation, kept by views, ran a 16 GB container out of memory)."""
+    return {k: tensor_bits(getattr(ts, k).narrow(2 if k == 'kv' else 0, s, 1).clone(), 2 if k == 'kv' else 0)
+            for k in STATE}
 
 
 def numstats(a, b, line=None):
