@@ -36,6 +36,8 @@ Derived inputs (the model's, never on the wire), every one clamped to [-NUM_CLAM
 Outputs are numpy arrays (see DecodedFrame); padded batches for the actor come from pad_batch."""
 from functools import lru_cache
 
+import weakref
+
 import numpy as np
 
 from . import schema_v3 as V3
@@ -976,10 +978,24 @@ N_MAX_V3, S_MAX_V3 = 64, 32
 STATS = dict(calls=0, records=0, host_s=0.0, trunc_n=0, trunc_s=0, nonfinite=0, **{f'bucket{b}': 0 for b in E_BUCKETS})
 
 
-def rows_counts(rows, stats=True):
+# (A-2, 2026-11-19) the GraphActors' non-finite counts, kept on the device: each graph adds its call's count (the
+# decode's per-record 'nonfinite', the records' rows only) to its actor's counter -- no host scan per call. Read with
+# stats_snapshot() (one read-back per counter, at a progress row).
+DEVICE_NONFINITE = weakref.WeakSet()
+
+
+def stats_snapshot():
+    """STATS with the device counters' non-finite floats added (cumulative, as STATS: callers take differences)."""
+    out = dict(STATS)
+    out['nonfinite'] += sum(int(t.item()) for t in list(DEVICE_NONFINITE))
+    return out
+
+
+def rows_counts(rows, stats=True, scan=True):
     """ROW records (numpy, each with its v3 frame) -> (counts [n, 4], e bucket): check_batch on the records' headers,
-    visible_schema and visible_bytes; with stats the call's host time, bucket, truncations and non-finite frame floats
-    added to STATS."""
+    visible_schema and visible_bytes; with stats the call's host time, bucket, truncations and (scan) non-finite frame
+    floats added to STATS. scan=False: the caller counts them on the device (GraphActor: DEVICE_NONFINITE -- the same
+    floats but for N / S rows past N_MAX_V3 / S_MAX_V3, which the layout cuts)."""
     import time
     t0 = time.perf_counter()
     frames = rows['visible_frame'].view('<f4')
@@ -987,10 +1003,11 @@ def rows_counts(rows, stats=True):
                                 S_MAX_V3, p0=frames[:, list(P0_WORDS)])
     eb = bucket(int(counts[:, 1].max()), E_BUCKETS)
     if stats:
-        words = (np.asarray(rows['visible_bytes'], np.int64) // 4)
-        w = int(words.max())
-        live = np.arange(w)[None, :] < words[:, None]
-        STATS['nonfinite'] += int((~np.isfinite(frames[:, :w]) & live).sum())
+        if scan:
+            words = (np.asarray(rows['visible_bytes'], np.int64) // 4)
+            w = int(words.max())
+            live = np.arange(w)[None, :] < words[:, None]
+            STATS['nonfinite'] += int((~np.isfinite(frames[:, :w]) & live).sum())
         STATS['calls'] += 1
         STATS['records'] += len(rows)
         STATS[f'bucket{eb}'] += 1

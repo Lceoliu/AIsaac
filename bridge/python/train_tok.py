@@ -5236,7 +5236,7 @@ def main(argv=None, child=None, actor=None):
                 row['start_builds'] = float(stats[:, ST['start_builds']].sum())
         if args.frame == 'v3':   # (seq-v1 step 3) the actor's host side of the v3 calls (this process), this update
             from isaac_bridge import v3_input as VI_
-            tot3 = dict(VI_.STATS)
+            tot3 = VI_.stats_snapshot()   # (A-2: with the actors' device counters)
             prev3 = L.get('v3_prev') or dict.fromkeys(tot3, 0)
             L['v3_prev'] = tot3
             d3 = {k_: tot3[k_] - prev3[k_] for k_ in tot3}

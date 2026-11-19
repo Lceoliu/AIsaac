@@ -2444,6 +2444,9 @@ class GraphActor:
             self.v3_counts_stage = torch.zeros((n, 4), dtype=torch.int64).pin_memory()
             self.v3_counts_np = self.v3_counts_stage.numpy()
             self.v3_frame_at = ROW.fields['visible_frame'][1]
+            # (A-2) the calls' non-finite frame floats, counted inside the graphs (v3_input.stats_snapshot reads it)
+            self.v3_nf = torch.zeros((), dtype=torch.int64, device=dev)
+            VI.DEVICE_NONFINITE.add(self.v3_nf)
         self.entities = self.sizes[0]
         self.fold = bool(fold)
         if row_sizes and not self.fold:
@@ -2537,8 +2540,11 @@ class GraphActor:
             if self.v3:
                 fa = self.v3_frame_at
                 frames = raw[:, fa:fa + self.VI.V3.FRAME_BYTES].view(torch.float32)
-                self.VI.put_batch(b, self.VI.decode_frames_device(frames, self.v3_counts[:r], tokens, self.VI.N_MAX_V3,
-                                                                  self.VI.S_MAX_V3, check=False))
+                d_ = self.VI.decode_frames_device(frames, self.v3_counts[:r], tokens, self.VI.N_MAX_V3,
+                                                  self.VI.S_MAX_V3, check=False)
+                # (A-2: the records' rows only -- a padded row's counts are 0, p 0)
+                self.v3_nf.add_((d_['nonfinite'].sum(1) * (self.v3_counts[:r, 0] > 0)).sum())
+                self.VI.put_batch(b, d_)
             return b
 
         def run(tokens, r=None):
@@ -2608,7 +2614,7 @@ class GraphActor:
             return False
         g_v3 = None
         if self.v3:   # (seq-v1 step 3) the records' checks and counts on the host; the graph of their entity bucket
-            counts, eb = self.VI.rows_counts(rows)
+            counts, eb = self.VI.rows_counts(rows, scan=False)   # (A-2: the non-finite floats on the device)
             self.v3_counts_np[:n] = counts
             self.v3_counts_np[n:] = 0
             g_v3 = self.sizes.index(eb)
