@@ -20,10 +20,12 @@ from .tok_obs import DONE_BRANCH
 
 def supported(args, *, t_on, mem_on, frame_v3, block_on, proc, n_act, snaps, priv_on, pf_on, lab, aux, plr, lanes_gpu,
               use_graphs=True, b52=False):
-    """(P-driver-design 11.3) None when phase 1 supports this run, else why not. (Codex 17-6: the driver folds on the
-    GraphActor's captured graphs -- a run without graphs or at --actor-fold 0 would change numerics silently.)"""
+    """(P-driver-design 11.3) None when the driver supports this run, else why not. (Codex 17-6: the driver folds on the
+    GraphActor's captured graphs -- a run without graphs or at --actor-fold 0 would change numerics silently.) A learner
+    process (--learner-process 1, A-6's compact rollouts in shared memory, K / V through CUDA IPC) is supported since
+    the P package's second delivery: the consumer stores into the same Rollout; `proc` is kept for the callers."""
     why = [w for w, bad in (('not temporal', not t_on), ('a GRU', mem_on), ('not --frame v3', not frame_v3),
-                            ('block memory', block_on), ('a learner process', proc), ('more actor processes', n_act != 1),
+                            ('block memory', block_on), ('more actor processes', n_act != 1),
                             ('branch snapshots', bool(snaps)), ('pickup force', pf_on),
                             ('the lab', lab), ('branch aux', aux), ('archive PLR', plr),
                             ('the teacher on its own GPU', lanes_gpu), ('no CUDA graphs', not use_graphs),
@@ -101,6 +103,10 @@ class DriverCollect:
                 self.d.resume()
             self.step(roll, book, pending, prof, store, 0.002)
         self.drain(roll, book, pending, prof, store)
+        # (the learner process: the rollout's K / V and o rows -- CUDA IPC tensors the learner process reads after the
+        #  hand-off -- written by this consumer on the driver's stream: complete before the collect returns, whatever
+        #  stream the hand-off then synchronises)
+        self.stream.synchronize()
         c1 = self.d.counters()   # (the driver's ready -> reply clock of this collect, as the Python loop's)
         prof['rr_s'] = prof.get('rr_s', 0.0) + c1['rr_s'] - c0['rr_s']
         prof['rr_n'] = prof.get('rr_n', 0) + c1['rr_n'] - c0['rr_n']
