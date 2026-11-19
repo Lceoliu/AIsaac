@@ -5153,6 +5153,12 @@ def main(argv=None, child=None, actor=None):
             'p_tick': prof.get('tick', 0.0), 'p_control': prof.get('control', 0.0),
             'p_weights': prof.get('weights', 0.0), 'p_main_ready': prof.get('main_ready', 0.0),
             'p_store': prof['store'], 'polls': prof['polls'],
+            # (P experiment: ms per record from the poll that took it to its reply, and (deferred) from the reply to
+            #  its store; the queue's high-water marks (calls, records) and its flushes by cause)
+            'p_ready_reply_ms': 1000 * prof.get('rr_s', 0.0) / max(prof.get('rr_n', 0), 1),
+            'p_reply_commit_ms': 1000 * prof.get('rc_s', 0.0) / max(prof.get('rc_n', 0), 1),
+            'p_q_max': prof.get('q_max', 0), 'p_q_rows_max': prof.get('q_rows_max', 0),
+            **{f'p_q_{k_}': prof.get(f'q_{k_}', 0) for k_ in ('dep', 'gpu', 'idle', 'full', 'ring', 'end')},
             'idle_share': dst['wait_s'] / max(n * job['cycle_s'], 1e-9), 'w_step': dst['step_s'],
             'w_wait': dst['wait_s'], 'w_encode': dst['encode_s'], 'w_fork': dst['fork_s'], 'w_teach': dst['teach_s'],
             'w_overrun': dst.get('overrun_s', 0.0), 'w_state': dst.get('state_s', 0.0),
@@ -6040,6 +6046,58 @@ def main(argv=None, child=None, actor=None):
 
     priv_pending = np.zeros(n, PRIV_DTYPE) if (priv_on and child is None) else None   # (tok_priv)
 
+    # P package experiment (2026-11-19, Codex round 14 / the coordinator): ISAAC_RL_DEFER_STORE=<Q> (Q >= 1) defers
+    # answer()'s store of the decisions just answered (the reply already went out before it) to a FIFO of at most Q
+    # calls, committed (a) before a poll's records of the same workers are booked (Episodes.arrive closes a worker's
+    # open decision: its store must be in), (b) before the oldest call's result is waited for (the host work overlaps
+    # the GPU's), (c) before an idle poll, (d) when the queue is full, (e) before an A-4 row ring buffer a queued
+    # record still points into is reused, (f) at the collect's end, before the hand-off; the collect's target counts the
+    # queued decisions. Every entry keeps its own version (the answering weights), pending is updated at the reply as
+    # before. 0 (default): store at once, as before. Measured either way: ready -> reply (the poll that took a record
+    # to its answer, ends included) and, deferred, reply -> commit, the queue's high-water mark and why it was flushed.
+    defer_q = max(0, int(os.environ.get('ISAAC_RL_DEFER_STORE', '0') or 0)) if child is None else 0
+    dq = collections.deque()   # (t_reply, a_idx, sub, store's arguments) per answered call, oldest first
+    dq_rows = [0]
+    ready_at = np.zeros(n)
+    if defer_q:
+        print(f'P experiment: store deferred, at most {defer_q} calls queued (ISAAC_RL_DEFER_STORE)', flush=True)
+
+    def commit(prof, k=None, why=None):
+        """Store the k oldest queued calls (None: all)."""
+        if not dq:
+            return
+        k = len(dq) if k is None else min(k, len(dq))
+        t_c = time.perf_counter()
+        for _ in range(k):
+            t_r, a_c, sub_c, st_args, st_kw = dq.popleft()
+            dq_rows[0] -= len(a_c)
+            store(roll, a_c, sub_c, *st_args, **st_kw)
+            prof['rc_s'] += (t_c - t_r) * len(a_c)
+            prof['rc_n'] += len(a_c)
+        prof['store'] += time.perf_counter() - t_c
+        if why is not None:
+            prof['q_' + why] += 1
+
+    def commit_for(prof, workers):
+        """(a) Every queued call up to the last one holding one of these workers."""
+        if not dq:
+            return
+        last = -1
+        for j, e in enumerate(dq):
+            if np.isin(e[1], workers).any():
+                last = j
+        if last >= 0:
+            commit(prof, last + 1, 'dep')
+
+    def commit_ring(prof, buf):
+        """(e) Every queued call up to the last one whose records point into this row ring buffer."""
+        last = -1
+        for j, e in enumerate(dq):
+            if np.may_share_memory(e[2], buf):
+                last = j
+        if last >= 0:
+            commit(prof, last + 1, 'ring')
+
     def answer(prof, a_idx, sub, under_way, actions, logp, value, extra=None, ver=None, h=None, vg=None, t=None,
                block_context=None):
         """The actions out to the workers, the decisions into the rollout. ver: the weights that answered (a
@@ -6070,14 +6128,28 @@ def main(argv=None, child=None, actor=None):
         sampler.reply(a_idx)
         t3 = time.perf_counter()
         prof['reply'] += t3 - t2
-        store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h, vg, t,
-              priv_pending[a_idx] if priv_pending is not None else None,block_context=block_context)
+        prof['rr_s'] += float((t3 - ready_at[a_idx]).sum())
+        prof['rr_n'] += len(a_idx)
+        st_args = (under_way, actions, logp, value, version if ver is None else ver, h, vg, t,
+                   priv_pending[a_idx].copy() if priv_pending is not None else None)
+        if defer_q and block_context is None:   # (P experiment: into the queue; the oldest out when it is full)
+            dq.append((t3, a_idx, sub, st_args, {}))
+            dq_rows[0] += len(a_idx)
+            prof['q_max'] = max(prof['q_max'], len(dq))
+            prof['q_rows_max'] = max(prof['q_rows_max'], dq_rows[0])
+            pending[a_idx] = actions
+            if len(dq) > defer_q:
+                commit(prof, len(dq) - defer_q, 'full')
+            return
+        store(roll, a_idx, sub, *st_args, block_context=block_context)
         pending[a_idx] = actions
         prof['store'] += time.perf_counter() - t3
 
     def finish(prof):
         """Wait for the oldest call in flight and answer it."""
         slot, a_idx, sub, under_way, t_sub, was_busy = inflight.popleft()
+        if dq:   # (P experiment (b): the queued stores while this call's GPU work runs)
+            commit(prof, None, 'gpu')
         t = time.perf_counter()
         actions, logp, value = slot.result()
         t2 = time.perf_counter()
@@ -6144,7 +6216,9 @@ def main(argv=None, child=None, actor=None):
             cpu_c0 = cpu_ticks()
             prof = dict(poll=0.0, book=0.0, act=0.0, reply=0.0, store=0.0, polls=0, calls=0, rows=0, eager=0,
                         act_busy=0.0, calls_busy=0, latency=0.0, snap_calls=0, snap_miss=0, cf_snaps=0,
-                        main_ready=0.0, control=0.0, tick=0.0, weights=0.0)
+                        main_ready=0.0, control=0.0, tick=0.0, weights=0.0,
+                        rr_s=0.0, rr_n=0, rc_s=0.0, rc_n=0, q_max=0, q_rows_max=0, q_dep=0, q_gpu=0, q_idle=0,
+                        q_full=0, q_ring=0, q_end=0)   # (P experiment: ready -> reply, reply -> commit, the queue)
 
             def _lane_tick(prof_):   # (B46: the actor thread's lane rounds outside a main call, timed)
                 t_k = time.perf_counter()
@@ -6431,7 +6505,7 @@ def main(argv=None, child=None, actor=None):
                 nv.push('actor.collect')   # (B57: the collect window, for the learner's per-window speeds)
                 run_driver_collect(prof)
                 nv.pop()
-            while cpp_driver is None and roll.usable() < rollout_actor and sampler.live and not stopped():
+            while cpp_driver is None and roll.usable() + dq_rows[0] < rollout_actor and sampler.live and not stopped():
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
                     if block_actor is None:
                         _lane_tick(prof)
@@ -6461,6 +6535,8 @@ def main(argv=None, child=None, actor=None):
                         finish(prof)
                         continue
                 else:   # (B36: a short wait while a lane call is in flight or a lane window is open)
+                    if dq:   # (P experiment (c): nothing runs; the queued stores first)
+                        commit(prof, None, 'idle')
                     idx, slots = sampler.poll_ready(idle=0.05 if lanes is None else lanes.idle(0.05),
                                                     want=args.poll_want, max_wait=args.poll_wait)
                 nv.pop()
@@ -6472,10 +6548,13 @@ def main(argv=None, child=None, actor=None):
                         _lane_tick(prof)
                     continue
                 nv.push('actor.book')
+                ready_at[idx] = tb
                 if row_ring is not None:   # (A-4)
                     if len(inflight) > len(row_ring) - 2:
                         raise RuntimeError('A-4: more calls in flight than the row ring holds')
                     row_at[0] = (row_at[0] + 1) % len(row_ring)
+                    if dq:   # (P experiment (e))
+                        commit_ring(prof, row_ring[row_at[0]])
                     rows = take_prefix(sampler.rows, slots, row_ring[row_at[0]])
                 else:
                     rows = sampler.rows[slots]
@@ -6483,12 +6562,18 @@ def main(argv=None, child=None, actor=None):
                     priv_pending[idx] = sampler.priv[slots]
                 if block_actor is not None:
                     lanes.observe_rows(idx,rows)
+                if dq:   # (P experiment (a): these workers' queued decisions stored before their next records)
+                    tq_ = time.perf_counter()
+                    commit_for(prof, idx)
+                    tb += time.perf_counter() - tq_   # (timed in p_store, not again in p_book)
                 go = book.arrive(roll, rows, idx, pending)
                 t1 = time.perf_counter()
                 prof['book'] += t1 - tb
                 nv.pop()
                 if not go.all():   # records that end an episode only need their answer
                     sampler.reply(idx[~go])
+                    prof['rr_s'] += float((time.perf_counter() - ready_at[idx[~go]]).sum())
+                    prof['rr_n'] += int((~go).sum())
                 if not go.any():
                     prof['reply'] += time.perf_counter() - t1
                     if block_actor is not None:
@@ -6608,6 +6693,8 @@ def main(argv=None, child=None, actor=None):
                 answer(prof, a_idx, sub, under_way, actions, logp, value, h=h_e, vg=vg_e, t=t_e)
             while inflight:
                 finish(prof)
+            if dq:   # (P experiment (f): every queued store in before the hand-off)
+                commit(prof, None, 'end')
             if actor_profile is not None:
                 import pstats
                 actor_profile.disable()
