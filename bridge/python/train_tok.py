@@ -1063,25 +1063,35 @@ class Episodes:
         self.seen_t = [set() for _ in range(workers)]
         self.stage_prev = np.zeros(workers, np.int64)
         self.stage_max = np.zeros(workers, np.int64)
-        self.held_prev = [None] * workers   # (active, trinket 0, trinket 1, collectibles' count) of the record before
+        # per worker (active, trinket 0, trinket 1, collectibles' count) of the record before, and whether there is one
+        self.held_prev = np.zeros((workers, 4), np.int64)
+        self.held_ok = np.zeros(workers, bool)
 
     @staticmethod
-    def held(r):
-        """(active, trinket 0, trinket 1, collectibles' count: ROW pinv[6] x 16, distinct ids, at most 32)."""
-        return (int(r['pitem'][0]), int(r['pitem'][1]), int(r['pitem'][2]), int(round(float(r['pinv'][6]) * 16)))
+    def held(pitem, pinv):
+        """[n, 4] int64 per record (ROW pitem, pinv): active, trinket 0, trinket 1, collectibles' count (pinv[6] x 16,
+        distinct ids, at most 32; rounded half to even, as Python's round)."""
+        pi = pitem.astype(np.int64)
+        return np.stack([pi[:, 0], pi[:, 1], pi[:, 2], np.rint(pinv[:, 6].astype(np.float64) * 16).astype(np.int64)], 1)
 
     def new_terms(self, rows, sel, w, ev, hu, d):
-        """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w."""
+        """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w.
+        (A-1, 2026-11-19: vectorized; only records whose holdings changed -- the active slot or a trinket slot to
+        another nonzero id, the collectibles' count up -- go through the per-record id sets. The rewards are the
+        per-record loop's bit for bit: tests/test_reward_terms.py's random streams against that loop.)"""
         rw = self.rw
         out = np.zeros((len(w), 4))
-        r_ = rows[sel]
-        stage = r_['stage'].astype(np.int64)
-        for j in range(len(w)):
-            i = int(w[j])
-            r = r_[j]
-            if (rw.get('item') or rw.get('trinket')) and self.held_prev[i] is not None:
-                a0, t0, t1, n0 = self.held_prev[i]
-                a, ta, tb, n = self.held(r)
+        at = np.flatnonzero(sel)   # (fields only: a whole ROW record is ~150 KB with its visible frame)
+        stage = rows['stage'][at].astype(np.int64)
+        if rw.get('item') or rw.get('trinket'):
+            cur, prev = self.held(rows['pitem'][at], rows['pinv'][at]), self.held_prev[w]
+            chg = self.held_ok[w] & (((cur[:, 0] > 0) & (cur[:, 0] != prev[:, 0])) | (cur[:, 3] > prev[:, 3])
+                                     | ((cur[:, 1] > 0) & (cur[:, 1] != prev[:, 1]))
+                                     | ((cur[:, 2] > 0) & (cur[:, 2] != prev[:, 2])))
+            for j in np.flatnonzero(chg):
+                i = int(w[j])
+                a0, t0, t1, n0 = (int(x) for x in prev[j])
+                a, ta, tb, n = (int(x) for x in cur[j])
                 seen = self.seen_c[i]
                 got_c = 0
                 if a > 0 and a != a0 and a not in seen:   # the active slot: a new id
@@ -1089,8 +1099,7 @@ class Episodes:
                     got_c += 1
                 rise = n - n0 - (1 if got_c else 0)   # (the active, when counted among the collectibles)
                 if rise > 0:   # passives: at most the rise, ids of the newest 16 never rewarded
-                    for v, c in r['inv']:
-                        v = int(v)
+                    for v, c in rows['inv'][at[j]].tolist():   # (Python ints: no numpy scalars per entry)
                         if rise <= 0:
                             break
                         if v > 0 and c > 0 and v != a and v not in seen:
@@ -1106,15 +1115,15 @@ class Episodes:
                 out[j, 1] = rw.get('trinket', 0.0) * got_t
                 self.counts[i, 0] += got_c
                 self.counts[i, 1] += got_t
-            if rw.get('depth'):
-                if self.run and (ev[j] & EV_EXIT):
-                    if stage[j] > self.stage_max[i]:   # (a floor deeper than any reached: the floor left scales it)
-                        out[j, 2] += rw['exit'] * rw['depth'] * max(int(self.stage_prev[i]) - 1, 0)
-                if ev[j] & 4:
-                    out[j, 2] += rw['boss'] * rw['depth'] * max(int(stage[j]) - 1, 0)
-            if rw.get('nohit') and (ev[j] & EV_NOHIT) and d[j] != 2:
-                out[j, 3] = rw['nohit']
-                self.counts[i, 2] += 1
+        if rw.get('depth'):
+            if self.run:   # (the exit: to a floor deeper than any reached; the floor left scales it)
+                ex = ((ev & EV_EXIT) != 0) & (stage > self.stage_max[w])
+                out[:, 2] += np.where(ex, rw['exit'] * rw['depth'] * np.maximum(self.stage_prev[w] - 1, 0), 0.0)
+            out[:, 2] += np.where((ev & 4) != 0, rw['boss'] * rw['depth'] * np.maximum(stage - 1, 0), 0.0)
+        if rw.get('nohit'):
+            nh = ((ev & EV_NOHIT) != 0) & (d != 2)
+            out[nh, 3] = rw['nohit']
+            self.counts[w[nh], 2] += 1
         return out
 
     def start_terms(self, rows, idx, first):
@@ -1276,8 +1285,8 @@ class Episodes:
                 self.start_terms(rows, idx, first)
             self.stage_prev[idx] = rows['stage']
             self.stage_max[idx] = np.maximum(self.stage_max[idx], rows['stage'])
-            for j in range(len(idx)):
-                self.held_prev[int(idx[j])] = self.held(rows[j])
+            self.held_prev[idx] = self.held(rows['pitem'], rows['pinv'])
+            self.held_ok[idx] = True
         if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
             st0 = first
             if st0.any():
