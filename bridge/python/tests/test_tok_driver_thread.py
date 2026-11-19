@@ -328,3 +328,156 @@ def test_each_records_priv_is_copied_beside_it():
     for w in range(W):
         mine = [(pw, pt) for sw, pw, pt in seen if sw == w]
         assert mine == [(w, t) for t in range(T)], (w, mine[:5])
+
+
+# ---- Codex round 17 (2026-11-19): the handshake, the fds read while waiting, the reply's outcome, a worker's end after
+#      its record, the end's cancels, each record's ep_archive column
+
+def _send_record(rig, w, t):
+    slot = rig.record(w, t)
+    rig.wk_socks[w].sendall(struct.pack('!i', 1) + (b'0' if slot % 2 == 0 else b'1'))
+
+
+def _recv_reply(rig, w, timeout=5.0):
+    s = rig.wk_socks[w]
+    s.settimeout(timeout)
+    got = b''
+    while len(got) < 5:
+        c = s.recv(5 - len(got))
+        if not c:
+            break
+        got += c
+    return got
+
+
+def test_resume_then_pause_is_acknowledged():
+    """(17-2) A pause right after a resume, before the thread woke: the new pause is acknowledged (a generation of its
+    own), never a drain waiting forever; nothing lost or doubled."""
+    W, T, ep = 4, 60, 7
+    rig = Rig(W=W, episode=ep)
+    rig.d.start()
+    ths = [threading.Thread(daemon=True, target=rig.worker, args=(w, T, 0.001)) for w in range(W)]
+    for t_ in ths:
+        t_.start()
+    recs = []
+    try:
+        for _ in range(60):
+            rig.d.pause()
+            t0 = time.time()
+            while not rig.d.is_paused() and time.time() - t0 < 3:
+                recs += rig.consume(lambda rs: True, timeout=0.01)
+            assert rig.d.is_paused(), 'a pause never acknowledged'
+            rig.d.resume()
+            rig.d.pause()   # (at once: the thread may not have woken from the last pause yet)
+            t0 = time.time()
+            while not rig.d.is_paused() and time.time() - t0 < 3:
+                recs += rig.consume(lambda rs: True, timeout=0.01)
+            assert rig.d.is_paused(), 'the pause after a resume never acknowledged'
+            rig.d.resume()
+            recs += rig.consume(lambda rs: True, timeout=0.01)
+        recs += rig.consume(lambda rs: sum(r['kind'] == 1 for r in rs) == W, timeout=20)
+    finally:
+        rig.close()
+    check_records(rig, recs, T, ep)
+    assert rig.d.counters()['pause_gen'] == 120
+
+
+def test_a_workers_eof_comes_after_its_record():
+    """(17-3) EOF read while the worker's record waits for credits: the record first (its reply failed: replied 0,
+    counted), then the worker's GONE."""
+    rig = Rig(W=2, blocks=1, n=2, K=4)
+    rig.d.start()
+    try:
+        _send_record(rig, 1, 0)
+        assert _recv_reply(rig, 1) == REPLY   # (worker 1's call holds the only block: nothing released)
+        _send_record(rig, 0, 0)
+        rig.wk_socks[0].close()               # (worker 0 dies right after sending)
+        time.sleep(0.3)                       # (the driver, short of credits, reads the EOF meanwhile)
+        recs = rig.consume(lambda rs: any(r['kind'] == 2 for r in rs), timeout=10)
+        c = rig.d.counters()
+    finally:
+        rig.close()
+    mine = [(int(r['kind']), int(r['replied'])) for r in recs if int(r['worker']) == 0]
+    assert mine == [(0, 0), (2, 1)], mine
+    assert c['reply_fail'] == 1
+
+
+def test_f_and_half_r_advance_while_short_of_credits():
+    """(17-3) An 'F' and part of its 'R' while the driver waits for credits: the reader still runs, the missing rest
+    times out into the fatal (86) -- before, the driver slept on the credits and never saw it."""
+    rig = Rig(W=3, blocks=1, n=2, K=4)
+    rig.d.r_timeout_s = 0.3
+    rig.d.start()
+    try:
+        _send_record(rig, 1, 0)
+        assert _recv_reply(rig, 1) == REPLY   # (the only block held)
+        _send_record(rig, 2, 0)               # (waits for credits)
+        rig.wk_socks[0].sendall(struct.pack('!i', 1) + b'F' + struct.pack('!i', 20) + b'Rhalf')
+        t0 = time.time()
+        while rig.d.fatal()[0] == 0 and time.time() - t0 < 5:
+            time.sleep(0.05)
+        f = rig.d.fatal()
+    finally:
+        rig.close()
+    assert f[0] == 86 and f[1] == 0, f
+
+
+def test_close_serve_cancels_the_records_read():
+    """(17-2) Records the driver read but never took (credits short at the stop) and records arriving after the stop:
+    answered without an action until the workers end -- none waits for a reply nobody writes."""
+    W = 3
+    rig = Rig(W=W, blocks=1, n=2, K=4)
+    rig.d.start()
+    got = {}
+
+    def late(w):   # (a record, its reply, then the end)
+        _send_record(rig, w, 0)
+        got[w] = _recv_reply(rig, w, 10)
+        rig.wk_socks[w].sendall(struct.pack('!i', 1) + b'x')
+    try:
+        _send_record(rig, 0, 0)
+        assert _recv_reply(rig, 0) == REPLY   # (the only block held)
+        ths = [threading.Thread(daemon=True, target=late, args=(w,)) for w in (1, 2)]
+        for t_ in ths:
+            t_.start()
+        time.sleep(0.3)   # (1 and 2 read, waiting for credits)
+        rig.d.stop()
+        rig.wk_socks[0].sendall(struct.pack('!i', 1) + b'x')
+        n_c, open_w = rig.d.close_serve(5.0)
+        for t_ in ths:
+            t_.join(5)
+        recs = rig.consume(lambda rs: sum(r['kind'] == 1 for r in rs) == W, timeout=5, release=False)
+    finally:
+        for s in rig.drv_socks + rig.wk_socks:
+            s.close()
+    assert got == {1: REPLY, 2: REPLY}
+    assert n_c == 2 and open_w == 0, (n_c, open_w)
+    assert sorted(int(r['worker']) for r in recs if r['kind'] == 1) == [0, 1, 2]
+    assert rig.d.counters()['cancelled'] == 2
+
+
+def test_each_records_origin_is_copied_at_its_take():
+    """(17-5) The worker's ep_archive column as it was when its record was taken: the worker may change it right after
+    its reply (a new episode's start), the consumer reads the record's copy."""
+    W, T = 3, 20
+    rig = Rig(W=W, blocks=2, n=4, K=16)
+    stats = np.zeros((W, 5))
+    col = stats[:, 3]
+    rig.d.set_origin(col.ctypes.data, col.strides[0])
+    orig = rig.record
+
+    def record(w, t):
+        stats[w, 3] = 1000 * w + t
+        return orig(w, t)
+    rig.record = record
+    rig.d.start()
+    ths = [threading.Thread(daemon=True, target=rig.worker, args=(w, T)) for w in range(W)]
+    for t_ in ths:
+        t_.start()
+    try:
+        recs = rig.consume(lambda rs: sum(r['kind'] == 1 for r in rs) == W, lag=0.002)
+    finally:
+        rig.close()
+    for w in range(W):
+        mine = [float(r['origin']) for r in recs if int(r['worker']) == w and r['kind'] == 0]
+        assert mine == [1000.0 * w + t for t in range(T)], (w, mine[:5])

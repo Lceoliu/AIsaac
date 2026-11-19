@@ -1,31 +1,48 @@
-"""P package phase 1: the gates on the GPU through the whole driver chain (2026-11-19, P-driver-design 11.5).
+"""P package phase 1: the gates on the GPU through the whole driver chain (2026-11-19, P-driver-design 11.5; rewritten
+after Codex round 17).
 
 Fake workers on socketpairs replay the records of a train_tok --dump-rollouts directory (D1's: real v3 frames and the
 model) into shared ROW slots; the real C++ driver (abp_tok_thread.h TokDriver over TokMiddle and the captured fold
-graphs) answers them, and tok_consumer.DriverCollect -- the training loop's consumer -- commits every call: the go mask
-and pending checked against a book, each decision's K / V, s and o copied from the driver's output ring into a
-rollout's t_kv / t_s / t_o, store. Sampling uses B36's per-record uniforms (TokDriver.test_ukeys: key worker + 1, t the
+graphs) answers them, and tok_consumer.DriverCollect -- the training loop's consumer -- commits every call (the go mask
+and pending checked against a book, each decision's K / V, s and o copied from the driver's output ring into the
+rollout's t_kv / t_s / t_o, store). Sampling uses B36's per-record uniforms (TokDriver.test_ukeys: key worker + 1, t the
 ROW 't'), so a Python replay draws the same numbers whatever the calls.
 
-Gate 1 (same batch, bitwise): the calls the driver made, replayed in commit order through tok_policy.GraphActor
-  (fold=1, p_replay.PyBackend) with the pending each call used, the same weights per call; compared bit for bit:
-  actions / logp / value / vg / the four temporal counters per record, the rollout's t_kv / t_s / t_o rows, and every
-  worker slot's TemporalState at the end.
-Gate 2 (variable batch, numeric; --alt): the same records through Python in other call splits -- 'single' (one record
-  per call), 'wide' (each worker's n-th record together) -- against the driver's (and Python's same split against the
-  alternative: the reference line). Per alternative: action flips, and on the records whose actions agree the logp /
-  value / vg differences: mean (bias) and its standard error, share of |dlogp| > 0.1, max; the counters must agree.
-Gate 3 (asynchronous faults): small credits (--blocks, --ring), a slow consumer (--lag), workers at random paces
-  (--pace), weight swaps during the collect (--swaps: drain, new weights, version, resume -- the training loop's
-  _W), a worker's EOF right after a record (--kill w:i, with the queue full when --blocks is small), the consumer's
-  death (--die-after: store raises after that many calls; the driver must stop promptly); --flat: one episode per
-  worker (first / done cleared after record 0, 't' = the record index) so the temporal step passes 256. Every run
-  checks: each worker's records committed once each, in order, none lost (the book's arrivals against what was sent);
-  each record's version the weights' version then.
+Every expectation comes from the SENDING side, never from what the tested chain handed on: each worker logs the rows it
+wrote, its snapshot requests, whether it got its reply, and the actions / values it read back. The reference
+(p_replay.PyBackend: tok_policy.GraphActor fold=1, its own TemporalState, its own snapshot bank) walks the calls the
+driver made -- only the partition: which workers' next records formed each call, in commit order (the book's log) --
+and derives everything else itself: each worker's next record, go (Episodes.arrive's rule with the cap / stall
+truncations), the pending resets and the actions under way, each decision's rollout row, the snapshot copies.
+
+Comparisons are bitwise: finiteness first (a NaN / inf anywhere fails), then the bytes of the original dtype (+0 / -0
+and NaN payloads differ).
+
+Gate 1 (same calls): per decision -- actions, logp, value, vg, the four temporal counters, the pending used, the version
+  -- against the reference; the rows the consumer stored against the sender's (the prefix the driver copies: fixed
+  fields and the frame); the rollout's t_kv / t_s / t_o rows; the actions / value / vg each worker read back; at the end
+  every worker slot's TemporalState and the snapshot bank; each snapshot request cleared after a go record's step, left
+  (to the worker's cancel) on an end.
+Gate 2 (other calls; --alt): each record's log-probability of the SAME action -- the driver's -- recomputed in other
+  splits ('single': one record per call; 'wide': each worker's n-th record together) by forcing the Gumbel-max uniforms
+  (1 - 1e-7 at the action, 1e-10 elsewhere: tok_policy.gumbel_sample's clamp), and value / vg. Coverage: every record
+  must come out with its forced action (and the forced same split must give the driver's numbers bit for bit). The
+  error line: Python against Python (the first alternative against the last). Fails on a non-finite value, counters that
+  differ, |dlogp| > 0.1 in 1e-4 or more of the records, a logp / value / vg difference (max, or mean beyond 3 standard
+  errors) more than twice the line's.
+Gate 3 (asynchronous faults): small credits (--blocks, --ring), a slow consumer (--lag), random paces (--pace), weight
+  swaps during the collect (--swaps: drain, new weights, version, resume), a worker's EOF right after a record (--kill
+  w:i), episode ends (--ends n: done 1 / 2 / 3 below the cap (the stall's) / 3 at the cap / DONE_BRANCH in turn, then a
+  new episode; --cap-t / --trunc: the run's truncation rule), snapshot requests (--cf p: a bank row of the worker's own,
+  reused in turn), the consumer's death (--die-after: store raises at that call; then the training loop's close: every
+  worker must get its reply and end). Four-way reconciliation per worker and record: sent, replied (as the worker saw
+  it), booked (arrive), stored (the reference's decisions = the stored ones) -- none lost, doubled or reordered; each
+  version the weights' version then.
 
    usage: python tools/p_chain.py <rollouts dir> [--steps 300] [--workers 16] [--fp32] [--blocks 64] [--ring 8192]
-          [--lag 0] [--pace 0] [--swaps 0] [--kill w:i] [--die-after 0] [--flat] [--ends n] [--alt single,wide] [--out f.json]
-Prints one JSON object (and --out)."""
+          [--lag 0] [--pace 0] [--swaps 0] [--kill w:i] [--die-after 0] [--flat] [--ends n] [--cap-t 0] [--trunc 0]
+          [--cf 0] [--alt single,wide] [--out f.json]
+Prints one JSON object (and --out); exit 0 only when every gate it ran passed."""
 import argparse
 import glob
 import json
@@ -42,23 +59,61 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from p_replay import STATE, PyBackend, diff   # noqa: E402
+from p_replay import STATE, PyBackend   # noqa: E402
 
 REPLY = b'\x00\x00\x00\x01a'
 OUTS = ('actions', 'logp', 'value', 'vg', 'create', 'nroom', 'steps', 'stage_prev')
 TC = ('create', 'nroom', 'steps', 'stage_prev')
+BANK_R = 4   # bank rows per worker (reused in turn)
+
+
+def bitdiff(a, b):
+    """(Codex 17-4) a against b, bit for bit: dict(n, equal, finite, max_abs). Rows [N, ...]; finiteness first (a NaN /
+    inf on either side fails the row), then the bytes of the original dtypes (+0 / -0 differ)."""
+    a, b = np.ascontiguousarray(a), np.ascontiguousarray(b)
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return dict(n=int(len(a)), equal=0, finite=False, max_abs=float('inf'),
+                    why=f'{a.shape}/{a.dtype} vs {b.shape}/{b.dtype}')
+    n = len(a)
+    if n == 0:
+        return dict(n=0, equal=0, finite=True, max_abs=0.0)
+    a2, b2 = a.reshape(n, -1), b.reshape(n, -1)
+    fin = (np.isfinite(a2).all(1) & np.isfinite(b2).all(1)) if a.dtype.kind == 'f' else np.ones(n, bool)
+    eq = (a2.view(np.uint8).reshape(n, -1) == b2.view(np.uint8).reshape(n, -1)).all(1) & fin
+    with np.errstate(invalid='ignore'):
+        d = np.abs(a2.astype(np.float64) - b2.astype(np.float64))
+    return dict(n=int(n), equal=int(eq.sum()), finite=bool(fin.all()),
+                max_abs=float(np.nanmax(d)) if np.isfinite(d).any() else float('nan'))
+
+
+def all_equal(rec):
+    return all(v['equal'] == v['n'] and v.get('finite', True) for v in rec.values()
+               if isinstance(v, dict) and 'equal' in v)
+
+
+def go_rule(rows, cap_t, trunc, done_branch):
+    """Episodes.arrive's go (with is_trunc): a record needs an action unless it ends its episode -- a branch's end and a
+    truncation (cap / stall, as TRUNC says) are still answered."""
+    done = rows['done'].astype(np.int64)
+    t3 = done == 3
+    at_cap = rows['t'].astype(np.int64) >= cap_t
+    trunc_ = (t3 & ((at_cap & bool(trunc & 1)) | (~at_cap & bool(trunc & 2)))) if (cap_t > 0 and trunc) \
+        else np.zeros(len(rows), bool)
+    return (done == 0) | (done == done_branch) | trunc_
 
 
 class Sampler:
-    """What DriverCollect reads of tok_sampler's: the ROW slots [2 W], actions, values, the driver's pipe ends, the
-    connections and _drop (a worker's end / EOF)."""
+    """What DriverCollect reads of tok_sampler's: ROW slots [2 W], actions, values, cf_snap, control, the driver's pipe
+    ends, the connections and _drop (a worker's end / EOF)."""
 
-    def __init__(self, W, nh):
+    def __init__(self, W, cf):
         from isaac_bridge.tok_obs import ROW
         self.rows = np.zeros(2 * W, ROW)
-        self.actions = np.zeros((W, nh), np.int32)
+        self.actions = np.zeros((W, 8), np.int32)
         self.main_value = np.zeros(W)
         self.main_vg = np.zeros(W)
+        self.cf_snap = np.zeros(W, np.int64) if cf else None
+        self.control = np.zeros(4, np.int64)
         pairs = [socket.socketpair() for _ in range(W)]
         self.drv, self.wk = [p[0] for p in pairs], [p[1] for p in pairs]
         self._fds = [s.fileno() for s in self.drv]
@@ -81,72 +136,95 @@ class Sampler:
 
 
 class Book:
-    """Episodes.arrive's go rule and pending resets (cap_t = trunc = 0: a done record needs an action only as a
-    branch's end, DONE_BRANCH); every arrival logged per worker."""
+    """Logs each arrive (the call: its workers in order) and returns the go mask by Episodes.arrive's rule with its
+    pending resets."""
 
-    def __init__(self, W):
-        self.arrived = defaultdict(list)
+    def __init__(self, cap_t, trunc):
+        from isaac_bridge.tok_obs import DONE_BRANCH
+        self.cap_t, self.trunc, self.db = cap_t, trunc, DONE_BRANCH
+        self.calls = []                      # workers int64 [k] per arrive, in commit order
+        self.arrived = defaultdict(list)     # worker -> [(t, first, done)]
+        self.origin_rec = None
 
     def arrive(self, roll, rows, idx, pending):
-        from isaac_bridge.tok_obs import DONE_BRANCH
         done = rows['done'].astype(np.int64)
         first = rows['first'] != 0
-        go = (done == 0) | (done == DONE_BRANCH)
+        go = go_rule(rows, self.cap_t, self.trunc, self.db)
         pending[idx[(done != 0) & ~go]] = 0
         pending[idx[first & go]] = 0
+        self.calls.append(idx.copy())
         for w, r in zip(idx.tolist(), rows):
             self.arrived[w].append((int(r['t']), int(r['first']), int(r['done'])))
         return go
 
 
 class Roll:
-    """The rollout's temporal rows: worker w's i-th decision at row w * T + i."""
+    """The rollout's temporal rows: worker w's d-th decision at row w * T + d; capacity T decisions per worker."""
 
     def __init__(self, W, T, ta, dtype, dev):
         import torch
-        self.T = T
+        self.T, self.cap = T, T
         self.t_kv = torch.zeros((W * T, ta.L, 2, ta.D), dtype=dtype, device=dev)
         self.t_s = torch.zeros((W * T, ta.D), dtype=dtype, device=dev)
         self.t_o = torch.zeros((W * T, ta.D), device=dev)
         self.t_obase = 0
-        self.cnt = np.zeros(W, np.int64)
+        self.length = np.zeros(W, np.int64)
         self.last = None
 
     def usable(self):
         return 0   # (the collect runs until every worker has ended)
 
     def t_assign(self, a_idx):
-        r = a_idx * self.T + self.cnt[a_idx]
-        self.cnt[a_idx] += 1
+        r = a_idx * self.T + self.length[a_idx]
         self.last = r
         return r
 
 
-def state_of(ts):
-    """p_replay.PyBackend.state of a TemporalState: the worker slots' tensors, slot axis first."""
+def tensor_bits(t):
+    import torch
+    t = t.detach()
+    return (t.view(torch.int16) if t.dtype == torch.bfloat16 else t).cpu().numpy()
+
+
+def state_of(ts, upto):
+    """The slots' tensors (bf16 as their bits), slot axis first; the slots below `upto` (the scratch slot left out)."""
     import torch
     torch.cuda.synchronize()
     out = {}
     for k in STATE:
-        v = getattr(ts, k).float().cpu().numpy()
+        v = tensor_bits(getattr(ts, k))
         v = np.moveaxis(v, 2, 0) if k == 'kv' else v
-        out[k] = v[:ts.scratch]
+        out[k] = np.ascontiguousarray(v[:upto])
     return out
 
 
-def numstats(a, b):
-    """Gate 2: b against a, records aligned. Flips; on the records whose actions agree, the differences."""
-    eq = np.all(a['actions'] == b['actions'], 1)
-    res = dict(records=int(len(eq)), flips=int((~eq).sum()),
+def numstats(a, b, line=None):
+    """Gate 2: b against a over aligned records (the same forced actions). With `line` (Python against Python): pass /
+    fail by Codex 17-4's criteria."""
+    res = dict(records=int(len(a['logp'])),
+               finite=bool(all(np.isfinite(x[k].astype(np.float64)).all() for x in (a, b) for k in ('logp', 'value', 'vg'))),
                counters_equal=bool(all(np.array_equal(a[k], b[k]) for k in TC)))
     for k in ('logp', 'value', 'vg'):
-        d = (b[k].astype(np.float64) - a[k].astype(np.float64))[eq]
+        d = b[k].astype(np.float64) - a[k].astype(np.float64)
         n = max(len(d), 1)
         res[k] = dict(bias=float(d.mean()) if len(d) else 0.0, se=float(d.std() / np.sqrt(n)) if len(d) else 0.0,
                       max_abs=float(np.abs(d).max()) if len(d) else 0.0,
                       gt_0_1=float((np.abs(d) > 0.1).mean()) if len(d) else 0.0)
-    res['pass'] = bool(res['counters_equal'] and res['logp']['gt_0_1'] < 1e-4
-                       and abs(res['logp']['bias']) <= 3 * res['logp']['se'] + 1e-6)
+    if line is not None:
+        why = []
+        if not res['finite']:
+            why.append('non-finite')
+        if not res['counters_equal']:
+            why.append('counters')
+        if res['logp']['gt_0_1'] >= 1e-4:
+            why.append('|dlogp| > 0.1')
+        for k in ('logp', 'value', 'vg'):
+            if res[k]['max_abs'] > 2 * line[k]['max_abs'] + 1e-6:
+                why.append(f'{k} max beyond the line')
+            if abs(res[k]['bias']) > 2 * abs(line[k]['bias']) + 3 * res[k]['se'] + 1e-7:
+                why.append(f'{k} bias beyond the line')
+        res['fail'] = why
+        res['pass'] = not why
     return res
 
 
@@ -163,12 +241,15 @@ def main(argv=None):
     ap.add_argument('--swaps', type=int, default=0, help='weight swaps during the collect')
     ap.add_argument('--kill', default='', help="w:i -- worker w's socket closed right after sending its i-th record")
     ap.add_argument('--die-after', type=int, default=0, help='store raises at this call (the consumer dies)')
-    ap.add_argument('--flat', action='store_true')
-    ap.add_argument('--ends', type=int, default=0, help="every n-th record an episode's end (done 3, or DONE_BRANCH "
-                    "every other time: a branch's end, still answered), the next a new episode's first")
+    ap.add_argument('--flat', action='store_true', help="one episode per worker, 't' = the record index")
+    ap.add_argument('--ends', type=int, default=0, help='every n-th record an end (done 1 / 2 / 3 / 3 at the cap / '
+                    'DONE_BRANCH in turn), the next a new episode')
+    ap.add_argument('--cap-t', type=int, default=0, help="the run's CAP_T ('t' at or past it: the cap's end)")
+    ap.add_argument('--trunc', type=int, default=0, help="the run's TRUNC (1 the cap's ends, 2 the stall's, 3 both)")
+    ap.add_argument('--cf', type=float, default=0.0, help='snapshot requests per record (probability)')
     ap.add_argument('--alt', default='', help='gate 2: single,wide')
     ap.add_argument('--seed', type=int, default=1)
-    ap.add_argument('--timeout', type=float, default=1500)
+    ap.add_argument('--timeout', type=float, default=1800)
     ap.add_argument('--out', default=None)
     a = ap.parse_args(argv)
 
@@ -182,6 +263,7 @@ def main(argv=None):
     import torch
     from isaac_bridge import tok_consumer, tok_driver
     from isaac_bridge import tok_policy as TP
+    from isaac_bridge.tok_obs import DONE_BRANCH, ROW
     dev = torch.device('cuda')
     paths = sorted(glob.glob(os.path.join(a.rollouts, 'rollout-*.npz')))
     pts = sorted(glob.glob(os.path.join(a.rollouts, 'rollout-*.pt')))
@@ -194,19 +276,22 @@ def main(argv=None):
     length = zf['length']
     W = min(a.workers, len(length))
     T = int(min(length[:W].max(), a.steps))
-    rows = np.ascontiguousarray(zf['rows'][:W, :T])
+    src_rows = np.ascontiguousarray(zf['rows'][:W, :T])
     length = np.minimum(length[:W], T)
     del zf
     bf16 = not a.fp32
+    kdt = torch.bfloat16 if bf16 else torch.float32
     mod = tok_driver.load(verbose=True)
     assert mod is not None, f'p_chain: the extension: {tok_driver.REASON}'
+    # the uniforms' columns per head as gumbel_sample walks them (TokPolicy.split: heads 2..4 two-wide)
+    widths = [2 if j in (2, 3, 4) else int(h) for j, h in enumerate(model.heads)]
 
-    # ---- the weights: version v's parameters (v = 0: the checkpoint's; v > 0: seeded small perturbations)
-    params = [p for p in model.parameters()]
+    # ---- the weights: version v's parameters (0: the checkpoint's; v > 0: seeded small perturbations)
+    params = list(model.parameters())
     w0 = [p.detach().clone() for p in params]
     rng_w = np.random.default_rng(a.seed + 100)
     wsets = [w0]
-    for v in range(1, a.swaps + 1):
+    for _ in range(a.swaps):
         g = torch.Generator(device='cpu').manual_seed(int(rng_w.integers(1 << 30)))
         wsets.append([p + (0.01 * max(float(p.float().std()) if p.numel() > 1 else 0.0, 1e-3)
                            * torch.randn(p.shape, generator=g)).to(p.device, p.dtype) for p in w0])
@@ -217,23 +302,47 @@ def main(argv=None):
                 p.copy_(q)
         torch.cuda.synchronize()
 
+    # ---- the records each worker will send (the source rows; ends / firsts / 't' as the options say)
+    plan = []
+    kinds = [1, 2, 3, 3, DONE_BRANCH]
+    for w in range(W):
+        rs = src_rows[w, :int(length[w])].copy()
+        idx = np.arange(len(rs))
+        if a.flat or a.ends:
+            rs['t'] = idx
+            rs['first'] = (idx == 0).astype(rs['first'].dtype)
+            rs['done'] = 0
+        if a.ends:
+            rs['first'] = (idx % a.ends == 0).astype(rs['first'].dtype)
+            for j in np.flatnonzero(idx % a.ends == a.ends - 1):
+                c = (j // a.ends + w) % len(kinds)
+                rs['done'][j] = kinds[c]
+                if kinds[c] == 3:   # (c == 2: below the cap -- the stall's end; c == 3: at / past it -- the cap's)
+                    rs['t'][j] = (max(a.cap_t, 1) + j) if c == 3 else min(j, max(a.cap_t - 1, 0))
+        plan.append(rs)
+    rng_cf = np.random.default_rng(a.seed + 33)
+    cf_plan = [(rng_cf.random(len(plan[w])) < a.cf) if a.cf else np.zeros(len(plan[w]), bool) for w in range(W)]
+
     # ---- the driver chain
+    load_w(0)
     stream = torch.cuda.Stream()
-    ts = TP.TemporalState(model, W, dev, torch.bfloat16 if bf16 else torch.float32)
-    sampler = Sampler(W, 8)
-    gkw = dict(bf16=bf16)
-    dc = tok_consumer.DriverCollect(mod, model, sampler, W, 32, gkw, ts, None, stream, 0, 0, 0,
+    ts = TP.TemporalState(model, W, dev, kdt)
+    bank = TP.TemporalState(model, W * BANK_R, dev, kdt) if a.cf else None
+    sampler = Sampler(W, bool(a.cf))
+    dc = tok_consumer.DriverCollect(mod, model, sampler, W, 32, dict(bf16=bf16), ts, bank, stream, 0, a.cap_t, a.trunc,
                                     blocks=a.blocks, ring=a.ring)
     nh = dc.nh
-    ts.reset_()   # (as p_replay's: every slot at the start after the capture)
+    ts.reset_()
+    if bank is not None:
+        bank.reset_()
     torch.cuda.synchronize()
     dc.d.test_ukeys = True
-    roll = Roll(W, T, model.tatt, ts.dtype, dev)
-    book = Book(W)
+    roll = Roll(W, T, model.tatt, kdt, dev)
+    book = Book(a.cap_t, a.trunc)
     pending = np.zeros((W, nh), np.int64)
-    log = []          # ('call', index into calls) / ('swap', v) in commit order
-    calls = []
-    sent = defaultdict(list)
+    swaps_log = []    # (version, the number of calls booked before it)
+    stores = []
+    sent = defaultdict(list)    # worker -> [dict(i, row [1], cf, replied, actions, value, vg, cf_after)]
     errors = []
     kill_w, kill_i = (int(x) for x in a.kill.split(':')) if a.kill else (-1, -1)
     state = dict(version=0, calls=0)
@@ -244,33 +353,31 @@ def main(argv=None):
             raise RuntimeError('p_chain: the consumer dies (--die-after)')
         if ver != state['version']:
             errors.append(f'call {state["calls"]}: version {ver}, the weights {state["version"]}')
-        calls.append(dict(a_idx=a_idx.copy(), rows=sub.copy(), pend=under_way.copy(), dest=roll_.last.copy(),
-                                 actions=np.asarray(actions).copy(), logp=np.asarray(logp, np.float32).copy(),
-                                 value=np.asarray(value, np.float32).copy(), vg=np.asarray(vg, np.float32).copy(),
-                                 **{k: np.asarray(t[k]).astype(np.int64) for k in TC}))
-        log.append(('call', len(calls) - 1))
+        stores.append(dict(a_idx=a_idx.copy(), rows=sub.copy(), pend=np.asarray(under_way).copy(), ver=int(ver),
+                           dest=np.asarray(roll_.last).copy(), actions=np.asarray(actions).copy(),
+                           logp=np.asarray(logp).copy(), value=np.asarray(value).copy(), vg=np.asarray(vg).copy(),
+                           **{k: np.asarray(t[k]).astype(np.int64) for k in TC}))
+        roll_.length[a_idx] += 1
         if a.lag:
             time.sleep(a.lag)
 
     def worker(w):
         rng = np.random.default_rng(a.seed * 1000 + w)
         s = sampler.wk[w]
+        nb = 0
         try:
-            for i in range(int(length[w])):
+            for i in range(len(plan[w])):
+                if sampler.control[0]:   # (the run is closing: the worker ends)
+                    break
                 slot = 2 * w + (i & 1)
-                sampler.rows[slot] = rows[w, i]
-                if a.flat:
-                    sampler.rows['first'][slot] = 1 if i == 0 else 0
-                    sampler.rows['done'][slot] = 0
-                    sampler.rows['t'][slot] = i
-                if a.ends:   # (an end record -- no action unless a branch's -- then a new episode at once)
-                    from isaac_bridge.tok_obs import DONE_BRANCH
-                    e_ = i // a.ends
-                    sampler.rows['first'][slot] = 1 if i % a.ends == 0 else 0
-                    sampler.rows['done'][slot] = (DONE_BRANCH if e_ % 2 else 3) if i % a.ends == a.ends - 1 else 0
-                    sampler.rows['t'][slot] = i
-                r = sampler.rows[slot]
-                sent[w].append((int(r['t']), int(r['first']), int(r['done'])))
+                sampler.rows[slot] = plan[w][i]
+                cf = 0
+                if cf_plan[w][i]:
+                    cf = w * BANK_R + nb % BANK_R + 1
+                    nb += 1
+                    sampler.cf_snap[w] = cf
+                ent = dict(i=i, row=sampler.rows[slot:slot + 1].copy(), cf=cf, replied=False)
+                sent[w].append(ent)
                 s.sendall(struct.pack('!i', 1) + (b'0' if slot % 2 == 0 else b'1'))
                 if w == kill_w and i == kill_i:
                     s.close()
@@ -283,6 +390,11 @@ def main(argv=None):
                     got += c
                 if got != REPLY:
                     errors.append(f'worker {w} record {i}: reply {got!r}')
+                ent.update(replied=True, actions=sampler.actions[w, :nh].astype(np.int64),
+                           value=float(sampler.main_value[w]), vg=float(sampler.main_vg[w]),
+                           cf_after=int(sampler.cf_snap[w]) if sampler.cf_snap is not None else 0)
+                if sampler.cf_snap is not None and sampler.cf_snap[w]:   # (an end's request: cancelled, as tok_floor)
+                    sampler.cf_snap[w] = 0
                 if a.pace:
                     time.sleep(float(rng.uniform(0, a.pace)))
             s.sendall(struct.pack('!i', 1) + b'x')
@@ -290,8 +402,9 @@ def main(argv=None):
             if not a.die_after:
                 errors.append(f'worker {w}: {e}')
 
-    swap_at = sorted(np.random.default_rng(a.seed + 7).choice(np.arange(5, max(int(length.sum()) // 8, 6)),
-                                                             size=a.swaps, replace=False).tolist()) if a.swaps else []
+    n_rec = int(sum(len(p) for p in plan))
+    swap_at = sorted(np.random.default_rng(a.seed + 7).choice(np.arange(5, max(n_rec // 8, 6)), size=a.swaps,
+                                                             replace=False).tolist()) if a.swaps else []
 
     class Weights:
         def ready(self):
@@ -301,135 +414,269 @@ def main(argv=None):
             swap_at.pop(0)
             state['version'] += 1
             load_w(state['version'])
-            log.append(('swap', state['version']))
+            swaps_log.append((state['version'], len(book.calls)))
             return state['version']
 
     prof = defaultdict(float)
-    load_w(0)
     threads = [threading.Thread(target=worker, args=(w,), daemon=True) for w in range(W)]
     t0 = time.perf_counter()
     for th in threads:
         th.start()
     res = dict(rollout=os.path.basename(paths[0]), workers=W, steps=T, bf16=bf16, flat=a.flat, ends=a.ends,
-               blocks=a.blocks,
-               ring=a.ring, lag=a.lag, pace=a.pace, swaps=a.swaps, kill=a.kill, die_after=a.die_after,
-               gpu=torch.cuda.get_device_name(0))
+               cap_t=a.cap_t, trunc=a.trunc, cf=a.cf, blocks=a.blocks, ring=a.ring, lag=a.lag, pace=a.pace,
+               swaps=a.swaps, kill=a.kill, die_after=a.die_after, gpu=torch.cuda.get_device_name(0))
     died = None
     try:
         dc.collect(roll, book, pending, 1, prof, store, weights=Weights() if a.swaps else None, version=0)
     except Exception as e:   # noqa: BLE001
         died = f'{type(e).__name__}: {e}'
-    t_collect = time.perf_counter() - t0
+    res['collect_s'] = time.perf_counter() - t0
     tc0 = time.perf_counter()
-    closer = threading.Thread(target=dc.close, daemon=True)
+    closer = threading.Thread(target=dc.close, kwargs=dict(timeout=20.0), daemon=True)   # (the training loop's close)
     closer.start()
-    closer.join(20)
+    closer.join(40)
     res['close_s'] = time.perf_counter() - tc0
     res['closed'] = not closer.is_alive()
-    sampler.close()
     for th in threads:
-        th.join(5)
-    res['collect_s'] = t_collect
+        th.join(10)
+    res['workers_hung'] = [w for w, th in enumerate(threads) if th.is_alive()]
+    sampler.close()
     res['counters'] = {k: v for k, v in dc.d.counters().items() if isinstance(v, (int, float))}
     res['consumer'] = dict(dc.stat)
-    if a.die_after:
+
+    if a.die_after:   # (the consumer died: the exception out, the close prompt, every worker answered and ended)
         res['died'] = died
-        res['pass'] = bool(died and 'consumer dies' in died and res['closed'])
-        print(json.dumps(res, indent=1))
-        if a.out:
-            open(a.out, 'w').write(json.dumps(res, indent=1))
-        os._exit(0 if res['pass'] else 1)
+        res['unreplied'] = {w: [e['i'] for e in sent[w] if not e['replied']] for w in sent
+                            if any(not e['replied'] for e in sent[w])}
+        res['pass'] = bool(died and 'consumer dies' in died and res['closed'] and not res['workers_hung']
+                           and not res['unreplied'])
+        _out(res, a)
+        return
     if died:
         errors.append(f'the collect raised: {died}')
 
-    # ---- gate 3: every record committed once, in order (the book's arrivals against what the workers sent)
-    lost = {w: (len(sent[w]), len(book.arrived[w])) for w in range(W) if sent[w] != book.arrived[w]}
-    recs = sum(len(c['a_idx']) for c in calls)
+    # ---- gate 3: per worker and record, sent / replied / booked (stored: below, against the reference's decisions)
+    recon = {}
+    for w in range(W):
+        s_ = [(int(e['row']['t'][0]), int(e['row']['first'][0]), int(e['row']['done'][0])) for e in sent[w]]
+        if s_ != book.arrived[w]:
+            recon[w] = f'sent {len(s_)} / booked {len(book.arrived[w])}: differ'
+        unreplied = [e['i'] for e in sent[w] if not e['replied']]
+        if unreplied and not (w == kill_w and unreplied == [kill_i]):
+            recon.setdefault(w, f'records without a reply: {unreplied[:5]}')
     res['gate3'] = dict(records_sent=int(sum(len(v) for v in sent.values())),
-                        records_arrived=int(sum(len(v) for v in book.arrived.values())), decisions=int(recs),
-                        calls=len(calls), swaps_done=sum(1 for k, _ in log if k == 'swap'),
-                        ends=int(sum(1 for v in sent.values() for r in v if r[2] != 0)),
-                        firsts=int(sum(1 for v in sent.values() for r in v if r[1] != 0)),
-                        gone=dc.stat['gone'], workers_mismatch=lost, errors=errors[:20],
-                        max_steps=int(max((c['steps'].max() for c in calls), default=0)),
-                        rows_per_call=float(recs / max(len(calls), 1)))
-    res['gate3']['pass'] = not lost and not errors and res['closed'] and (
-        a.swaps == 0 or res['gate3']['swaps_done'] == a.swaps)
+                        records_booked=int(sum(len(v) for v in book.arrived.values())),
+                        decisions_stored=int(sum(len(s_['a_idx']) for s_ in stores)), calls=len(book.calls),
+                        swaps_done=len(swaps_log),
+                        ends=int(sum(1 for v in sent.values() for e in v if e['row']['done'][0] != 0)),
+                        boots=int(sum(1 for v in sent.values() for e in v if e['row']['done'][0] != 0
+                                      and go_rule(e['row'], a.cap_t, a.trunc, DONE_BRANCH)[0])),
+                        cf_requests=int(sum(1 for v in sent.values() for e in v if e['cf'])),
+                        gone=dc.stat['gone'], mismatch=recon, errors=errors[:20], workers_hung=res['workers_hung'])
 
-    # ---- the driver's side, kept before its tensors go
-    drv = {k: np.concatenate([c[k] for c in calls]) for k in OUTS}
-    dest_all = np.concatenate([c['dest'] for c in calls])
+    # ---- the tested chain's results, kept before its tensors go
     torch.cuda.synchronize()
-    kept_d = dict(kv=roll.t_kv.float().cpu().numpy(), s=roll.t_s.float().cpu().numpy(),
-                  o=roll.t_o.float().cpu().numpy())
-    state_d = state_of(ts)
+    kept_d = dict(kv=tensor_bits(roll.t_kv), s=tensor_bits(roll.t_s), o=tensor_bits(roll.t_o))
+    state_d = state_of(ts, W)
+    bank_d = state_of(bank, W * BANK_R) if bank is not None else None
     del dc, roll
     torch.cuda.empty_cache()
 
-    def py_run(split):
-        """The same records through Python's GraphActor(fold=1), the calls of `split`; outputs in the driver's order."""
+    def reference(split, forced=None):
+        """Python's GraphActor over the senders' records. split 'same': the driver's calls (the book's partition, the
+        swaps where they came); 'single' / 'wide' (gate 2, no swaps). forced: actions per (worker, decision) -- the
+        uniforms forced to them. Returns per decision (worker, ordinal) the outputs, the pending used, the version, the
+        row; the kept rows, the state, the bank."""
         load_w(0)
         be = PyBackend(model, W, W * T, fold=True, bf16=bf16)
-        out = {k: np.zeros_like(drv[k]) for k in OUTS}
-        base = np.cumsum([0] + [len(c['a_idx']) for c in calls])
+        bank_r = TP.TemporalState(model, W * BANK_R, dev, kdt) if a.cf else None
+        if bank_r is not None:
+            bank_r.reset_()
+        torch.cuda.synchronize()
+        pend = np.zeros((W, nh), np.int64)
+        nxt, ndec = np.zeros(W, np.int64), np.zeros(W, np.int64)
+        out = {}
+        ver = 0
         if split == 'same':
-            groups = []
-            for k, x in log:
-                groups.append(('swap', x) if k == 'swap' else ('call', [(x, j) for j in range(len(calls[x]['a_idx']))]))
+            seq, si = [], 0
+            for ci, ws in enumerate(book.calls):
+                while si < len(swaps_log) and swaps_log[si][1] == ci:
+                    seq.append(('swap', swaps_log[si][0]))
+                    si += 1
+                seq.append(('call', ws))
+        elif split == 'single':
+            seq = [('call', np.array([w], np.int64)) for ws in book.calls for w in ws]
+        elif split == 'wide':
+            lv, cnt = defaultdict(list), defaultdict(int)
+            for ws in book.calls:
+                for w in ws:
+                    lv[cnt[int(w)]].append(int(w))
+                    cnt[int(w)] += 1
+            seq = [('call', np.array(lv[i], np.int64)) for i in sorted(lv)]
         else:
-            assert a.swaps == 0, 'gate 2 splits need --swaps 0'
-            items = [(ci, j) for ci, c in enumerate(calls) for j in range(len(c['a_idx']))]
-            if split == 'single':
-                groups = [('call', [it]) for it in items]
-            elif split == 'wide':
-                nth, lv = defaultdict(int), defaultdict(list)
-                for ci, j in items:
-                    w = int(calls[ci]['a_idx'][j])
-                    lv[nth[w]].append((ci, j))
-                    nth[w] += 1
-                groups = [('call', lv[i]) for i in sorted(lv)]
-            else:
-                raise ValueError(split)
-        for kind, g in groups:
-            if kind == 'swap':
-                load_w(g)
-                continue
-            c_rows = np.concatenate([calls[ci]['rows'][j:j + 1] for ci, j in g])
-            widx = np.array([calls[ci]['a_idx'][j] for ci, j in g], np.int64)
-            pend = np.stack([calls[ci]['pend'][j] for ci, j in g])
-            dest = np.array([calls[ci]['dest'][j] for ci, j in g], np.int64)
-            r = be.call(c_rows, pend, widx, c_rows['first'] != 0, dest,
-                        (widx + 1, c_rows['t'].astype(np.int64)))
-            at = np.array([base[ci] + j for ci, j in g])
-            for k in OUTS:
-                out[k][at] = np.asarray(r[k]).astype(out[k].dtype).reshape(out[k][at].shape)
-        kept, st = be.kept(), be.state()
+            raise ValueError(split)
+        orig_u = TP.crn_uniforms
+        if forced is not None:
+            def forced_u(keys, t, columns):
+                u = np.full((len(keys), columns), 1e-10, np.float32)
+                for j, (k_, t_) in enumerate(zip(np.asarray(keys).tolist(), np.asarray(t).tolist())):
+                    act = forced[(int(k_) - 1, int(t_))]
+                    at = 0
+                    for h, hs in enumerate(widths):
+                        u[j, at + int(act[h])] = 1 - 1e-7
+                        at += hs
+                return u
+            TP.crn_uniforms = forced_u
+        try:
+            for kind, x in seq:
+                if kind == 'swap':
+                    load_w(x)
+                    ver = x
+                    continue
+                ws = x
+                rows = np.concatenate([plan[int(w)][int(nxt[w]):int(nxt[w]) + 1] for w in ws])
+                cfs = np.array([sent[int(w)][int(nxt[w])]['cf'] for w in ws], np.int64)
+                nxt[ws] += 1
+                go = go_rule(rows, a.cap_t, a.trunc, DONE_BRANCH)
+                done = rows['done'] != 0
+                first = rows['first'] != 0
+                pend[ws[done & ~go]] = 0
+                pend[ws[first & go]] = 0
+                g = np.flatnonzero(go)
+                if not len(g):
+                    continue
+                gw, gr = ws[g], np.ascontiguousarray(rows[g])
+                m = cfs[g] > 0
+                if bank_r is not None and m.any():   # (the slot before this record's step, into the named row)
+                    bank_r.copy_slot_(gw[m], cfs[g][m] - 1, other=be.ts)
+                dec = ndec[gw].copy()
+                ndec[gw] += 1
+                keys_t = (gw + 1, gr['t'].astype(np.int64)) if forced is None else (gw + 1, dec)
+                r = be.call(gr, pend[gw].copy(), gw.astype(np.int64), gr['first'] != 0,
+                            (gw * T + dec).astype(np.int64), keys_t)
+                for j, w in enumerate(gw.tolist()):
+                    out[(w, int(dec[j]))] = dict(pend=pend[w].copy(), ver=ver, row=gr[j:j + 1].copy(),
+                                                 **{k: np.asarray(r[k])[j] for k in OUTS})
+                pend[gw] = np.asarray(r['actions'], np.int64)
+        finally:
+            TP.crn_uniforms = orig_u
+        torch.cuda.synchronize()
+        kept = dict(kv=tensor_bits(be.td['kv']), s=tensor_bits(be.td['s']), o=tensor_bits(be.td['o']))
+        st = state_of(be.ts, W)
+        bk = state_of(bank_r, W * BANK_R) if bank_r is not None else None
         del be
         torch.cuda.empty_cache()
-        return out, kept, st
+        return out, kept, st, bk
 
-    # ---- gate 1: the same calls through Python, bit for bit
-    po, pk, ps = py_run('same')
-    g1 = {k: diff(drv[k], po[k]) for k in OUTS}
-    g1.update({f'rollout_{k}': diff(kept_d[k][dest_all], pk[k][dest_all]) for k in kept_d})
-    g1.update({f'state_{k}': diff(state_d[k], ps[k]) for k in ps})
-    g1['all_bit_equal'] = all(v['equal'] == v['n'] for v in g1.values() if isinstance(v, dict))
+    # the tested side per decision (worker, ordinal), in the stores' order
+    drv = {}
+    cnt = defaultdict(int)
+    for s_ in stores:
+        for j, w in enumerate(s_['a_idx'].tolist()):
+            drv[(w, cnt[w])] = dict(pend=s_['pend'][j], ver=s_['ver'], row=s_['rows'][j:j + 1],
+                                    dest=int(s_['dest'][j]), **{k: np.asarray(s_[k])[j] for k in OUTS})
+            cnt[w] += 1
+    ref, kept_r, state_r, bank_rr = reference('same')
+    keys = sorted(ref)
+    g1 = dict(decisions_ref=len(ref), decisions_driver=len(drv), same_keys=sorted(drv) == keys)
+    if g1['same_keys']:
+        def col(src, k, dt):
+            return np.stack([np.asarray(src[x][k]) for x in keys]).astype(dt)
+        g1['actions'] = bitdiff(col(drv, 'actions', np.int64), col(ref, 'actions', np.int64))
+        for k in ('logp', 'value', 'vg'):
+            g1[k] = bitdiff(col(drv, k, np.float32), col(ref, k, np.float32))
+        for k in TC:
+            g1[k] = bitdiff(col(drv, k, np.int64), col(ref, k, np.int64))
+        g1['pending'] = bitdiff(col(drv, 'pend', np.int64), col(ref, 'pend', np.int64))
+        g1['version'] = bitdiff(np.array([drv[x]['ver'] for x in keys], np.int64),
+                                np.array([ref[x]['ver'] for x in keys], np.int64))
+        dest = np.array([w * T + d for w, d in keys], np.int64)
+        g1['dest'] = bitdiff(np.array([drv[x]['dest'] for x in keys], np.int64), dest)
+        # the rows stored against the sender's (the prefix the driver copies: fixed fields + the frame's bytes)
+        fa = ROW.fields['visible_frame'][1]
+        same_rows = 0
+        for x in keys:
+            sr = drv[x]['row'].view(np.uint8).reshape(-1)
+            rr = ref[x]['row'].view(np.uint8).reshape(-1)
+            nb_ = int(ref[x]['row']['visible_bytes'][0])
+            e = min(fa + ((max(nb_, 0) + 3) & ~3), ROW.itemsize)
+            same_rows += bool(np.array_equal(sr[:e], rr[:e]))
+        g1['rows_prefix'] = dict(n=len(keys), equal=same_rows)
+        for k in kept_d:
+            g1[f'rollout_{k}'] = bitdiff(kept_d[k][dest], kept_r[k][dest])
+        # what each worker read back against the reference's answer
+        rb_a, rf_a, rb_v, rf_v, rb_g, rf_g = [], [], [], [], [], []
+        for w in range(W):
+            d_ = 0
+            for e in sent[w]:
+                if not go_rule(e['row'], a.cap_t, a.trunc, DONE_BRANCH)[0]:
+                    continue
+                r_ = ref.get((w, d_))
+                d_ += 1
+                if not e['replied'] or r_ is None:
+                    continue
+                rb_a.append(e['actions'])
+                rf_a.append(np.asarray(r_['actions'], np.int64))
+                rb_v.append(e['value'])
+                rf_v.append(float(np.float32(r_['value'])))
+                rb_g.append(e['vg'])
+                rf_g.append(float(np.float32(r_['vg'])))
+        g1['worker_actions'] = bitdiff(np.array(rb_a, np.int64), np.array(rf_a, np.int64))
+        g1['worker_value'] = bitdiff(np.array(rb_v), np.array(rf_v))
+        g1['worker_vg'] = bitdiff(np.array(rb_g), np.array(rf_g))
+        for k in state_d:
+            g1[f'state_{k}'] = bitdiff(state_d[k], state_r[k])
+        if bank_d is not None:
+            for k in bank_d:
+                g1[f'bank_{k}'] = bitdiff(bank_d[k], bank_rr[k])
+            reqs = [e for v in sent.values() for e in v if e['cf'] and e['replied']]
+            ok_cf = sum(1 for e in reqs if e['cf_after'] == (0 if go_rule(e['row'], a.cap_t, a.trunc, DONE_BRANCH)[0]
+                                                            else e['cf']))
+            g1['cf_cleared'] = dict(n=len(reqs), equal=int(ok_cf))
+        g1['all_bit_equal'] = all_equal(g1)
+    else:
+        g1['all_bit_equal'] = False
+        g1['missing'] = [k for k in keys if k not in drv][:10]
+        g1['extra'] = [k for k in drv if k not in ref][:10]
     res['gate1'] = g1
+    res['gate3']['decisions_reference'] = len(ref)
+    res['gate3']['pass'] = bool(not recon and not errors and res['closed'] and not res['workers_hung']
+                                and res['gate3']['swaps_done'] == a.swaps and g1['same_keys'])
 
-    # ---- gate 2: other splits
+    # ---- gate 2: the driver's actions forced in other splits
     if a.alt:
-        res['gate2'] = {}
-        for split in a.alt.split(','):
-            ao, _, _ = py_run(split)
-            res['gate2'][split] = dict(driver=numstats(drv, ao), python_same_split=numstats(po, ao))
-    res['pass'] = bool(res['gate3']['pass'] and g1['all_bit_equal']
-                       and all(v['driver']['pass'] for v in res.get('gate2', {}).values()))
-    s = json.dumps(res, indent=1)
+        assert a.swaps == 0, 'gate 2 splits need --swaps 0'
+        forced = {x: np.asarray(drv[x]['actions'], np.int64) for x in keys}
+        alts = a.alt.split(',')
+        runs = {s_: reference(s_, forced)[0] for s_ in ['same'] + alts}
+        cov = {s_: int(sum(np.array_equal(np.asarray(runs[s_][x]['actions'], np.int64), forced[x]) for x in keys))
+               for s_ in runs}
+
+        def arr(o_):
+            return {k: np.stack([np.asarray(o_[x][k]) for x in keys]) for k in OUTS}
+        D_ = arr(drv)
+        S_ = arr(runs['same'])
+        g2 = dict(records=len(keys), coverage=cov,
+                  same_forced_vs_driver={k: bitdiff(D_[k].astype(np.float32), S_[k].astype(np.float32))
+                                         for k in ('logp', 'value', 'vg')})
+        line = numstats(arr(runs[alts[0]]), arr(runs[alts[-1]])) if len(alts) > 1 else numstats(S_, arr(runs[alts[0]]))
+        g2['line_python'] = line
+        for s_ in alts:
+            g2[s_] = numstats(D_, arr(runs[s_]), line)
+        g2['pass'] = bool(all(c == len(keys) for c in cov.values()) and all_equal(g2['same_forced_vs_driver'])
+                          and all(g2[s_]['pass'] for s_ in alts))
+        res['gate2'] = g2
+    res['pass'] = bool(res['gate3']['pass'] and g1['all_bit_equal'] and res.get('gate2', {}).get('pass', True))
+    _out(res, a)
+
+
+def _out(res, a):
+    s = json.dumps(res, indent=1, default=str)
     print(s)
     if a.out:
         with open(a.out, 'w') as f:
             f.write(s)
-    os._exit(0 if res['pass'] else 1)
+    os._exit(0 if res.get('pass') else 1)
 
 
 if __name__ == '__main__':

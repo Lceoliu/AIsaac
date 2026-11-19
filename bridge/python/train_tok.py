@@ -1044,6 +1044,7 @@ class Episodes:
         # (2026-11-12) the workers' ep_archive stats column (a view; None: not known): each episode's 'start', fresh /
         # archive, read at its first record (the worker writes it before sending that record)
         self.origin = None
+        self.origin_rec = None   # (P package, Codex 17-5) per record of this arrive: the column at each record's take
         self.ep_start = {}
         self.seen_inv = None                     # 2026-10-08 (lab on): held collectibles at ordinary episodes' ends
         self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
@@ -1154,7 +1155,9 @@ class Episodes:
         the episode's start (fresh / archive) when the workers' column is known."""
         for j in np.flatnonzero(first):
             r = rows[j]
-            if self.origin is not None:
+            if self.origin_rec is not None:
+                self.ep_start[int(idx[j])] = 'archive' if self.origin_rec[j] > 0 else 'fresh'
+            elif self.origin is not None:
                 self.ep_start[int(idx[j])] = 'archive' if self.origin[int(idx[j])] > 0 else 'fresh'
             self.ep_meta[int(idx[j])] = (int(r['group']), int(r['seed']), int(r['branch']), int(r['point']),
                                          int(r['lab']))
@@ -3643,7 +3646,7 @@ def main(argv=None, child=None, actor=None):
             (out / 'rollouts').mkdir(exist_ok=True)
             stem = out / 'rollouts' / f'rollout-{L["update"]:06d}'
             np.savez(str(stem) + '.npz', **{k: (expand_rows(rl, m) if k == 'rows' else getattr(rl, k)[:, :m]) for k in (
-                'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version')},
+                'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version', 'boot')},
                 **({'value_g': rl.value_g[:, :m]} if getattr(rl, 'value_g', None) is not None else {}),
                 length=rl.length, open=rl.open, update=L['update'])
             torch.save(dict(model=learner_model.state_dict(), config=learner_model.config, update=L['update']),
@@ -5984,7 +5987,9 @@ def main(argv=None, child=None, actor=None):
         why = tok_consumer.supported(
             args, t_on=t_on, mem_on=mem_on, frame_v3=args.frame == 'v3', block_on=block_on, proc=proc, n_act=n_act,
             snaps=snaps, priv_on=priv_pending is not None, pf_on=pf_on, lab=lab is not None, aux=aux is not None,
-            plr=getattr(book, 'plr', None) is not None, lanes_gpu=False)
+            plr=getattr(book, 'plr', None) is not None,
+            lanes_gpu=lanes is not None and torch.device(getattr(lanes, 'device', device)) != torch.device(device),
+            use_graphs=use_graphs, b52=cpp_driver is not None)
         mod = None if why else tok_driver.load(verbose=True)
         if why is None and mod is None:
             why = f'the extension: {tok_driver.REASON}'
@@ -5993,6 +5998,8 @@ def main(argv=None, child=None, actor=None):
                 raise RuntimeError(f'P package: ISAAC_TOK_CPP_DRIVER=2 and the driver cannot run: {why}')
             print(f'P package: the C++ driver off ({why}); the Python loop', flush=True)
             return None
+        if book.origin is not None:   # (Codex 17-5: the driver copies each record's ep_archive at its take)
+            sampler.origin_column = book.origin
         dc = tok_consumer.DriverCollect(mod, model, sampler, n, g_ents, gkw, t_state, bank_tstate, actor_stream,
                                         version, CAP_T, TRUNC,
                                         priv_dtype=priv_pending.dtype if priv_pending is not None else None)
@@ -6172,6 +6179,18 @@ def main(argv=None, child=None, actor=None):
         sent_handoffs = 0
         rollout_actor = args.rollout // n_act
         nsys_win = nv.profiler_window()
+        if os.environ.get('ISAAC_TOK_AUDIT') and child is None:   # (P package, Codex 17-4: the reconciliation's start --
+            #   the book as configured before any record (its state), the rules; tools/p_audit.py rebuilds the
+            #   rollouts from the workers' logs with it)
+            import pickle as pickle_
+            try:
+                st_ = {k_: v_ for k_, v_ in vars(book).items() if k_ not in ('origin', 'plr')}
+                with open(os.path.join(os.environ['ISAAC_TOK_AUDIT'], 'book.pkl'), 'wb') as f_:
+                    pickle_.dump(dict(book=st_, cap_t=CAP_T, trunc=TRUNC, workers=n, nh=nh, capacity=capacity,
+                                      rollout=args.rollout, driver=tok_mode, mode=args.mode, items=bool(items),
+                                      rw=rw, floor=bool(floor), run=bool(run)), f_)
+            except Exception as e_:
+                print(f'P audit: the book could not be saved: {type(e_).__name__}: {e_}', flush=True)
         while True:
             go_on = ((handed < target_decisions if n_act == 1 and not args.max_updates else sent_handoffs < n_handoffs)
                      and sampler.live and not L.get('stop') and not stopped())
@@ -6490,7 +6509,7 @@ def main(argv=None, child=None, actor=None):
                         return version
                 tok_dc[0].collect(roll, book, pending, rollout_actor, prof, store,
                                   tick=_lane_tick if lanes is not None else None, weights=_W(), stopped=stopped,
-                                  version=version)   # (take_weights may have run at the hand-off)
+                                  version=version, watch=watch_workers)   # (take_weights may have run at the hand-off)
             while (cpp_driver is None and tok_dc[0] is None and roll.usable() < rollout_actor and sampler.live
                    and not stopped()):
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
@@ -6682,6 +6701,9 @@ def main(argv=None, child=None, actor=None):
                     pstats.Stats(actor_profile,stream=f).sort_stats('tottime').print_stats(30)
             collect_s = time.perf_counter() - t0
             if not sampler.live or stopped():
+                if tok_mode >= 2 and sent_handoffs == 0 and not stopped():   # (Codex 17-3: no zero-update "success")
+                    raise RuntimeError('P package: ISAAC_TOK_CPP_DRIVER=2 and every worker ended before the first '
+                                       'hand-off (no update)')
                 break
             check_actors()
             # ---- hand the rollout to the learner
@@ -6833,6 +6855,12 @@ def main(argv=None, child=None, actor=None):
             if cpp_driver.lanes_running:
                 cpp_driver.lanes_stop()
             cpp_driver.stop()
+        if tok_dc[0] is not None:   # (P package, Codex 17-2: the driver stopped, its unanswered records cancelled and
+            #                          the workers closed before the learner's join and the last save)
+            try:
+                tok_dc[0].close()
+            except Exception as e_:   # (the shutdown goes on: sampler.close still reaps the workers)
+                print(f'P package: the driver close failed: {e_}', flush=True)
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
             # (2026-11-05: past this point nobody needs what is still unsent: a clean end has seen the stop, which comes after
@@ -6897,8 +6925,6 @@ def main(argv=None, child=None, actor=None):
             print(f'BM1 C shard {SYNC.rank}: {SYNC.stats}' + (f'; rank {SYNC.peer_lost[0]} ended first'
                                                              if SYNC.peer_lost else ''), flush=True)
             SYNC.close()
-        if tok_dc[0] is not None:   # (P package: the driver thread joined before the workers' pipes close)
-            tok_dc[0].close()
         sampler.close()
         if log_file is not None:
             log_file.close()

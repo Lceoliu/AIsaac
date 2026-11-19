@@ -358,6 +358,36 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     mine = stats[index]
     slots = (rows[2 * index:2 * index + 1], rows[2 * index + 1:2 * index + 2])
     slot_address = (slots[0].ctypes.data, slots[1].ctypes.data)
+    # P package (Codex 17-4, the training run's reconciliation; ISAAC_TOK_AUDIT=<dir>): this worker's first
+    # ISAAC_TOK_AUDIT_N records as sent -- (episode, t, the snapshot request, the row's bytes up to its frame's end) --
+    # and each reply as read -- (episode, t of the record answered, the actions, main_value, main_vg); tools/p_audit.py
+    # reconciles them with the rollouts handed to the learner (--dump-rollouts)
+    audit = None
+    main_value = main_vg = cf_snap = None   # (set below when the lanes / the counterfactual teacher are on)
+    if os.environ.get('ISAAC_TOK_AUDIT'):
+        import pickle as pickle_
+        from .tok_obs import ROW as ROW_
+        audit = dict(f=open(os.path.join(os.environ['ISAAC_TOK_AUDIT'], f'w{index:03d}.pkl'), 'wb'), n=0,
+                     cap=int(os.environ.get('ISAAC_TOK_AUDIT_N', '1500')), last=None, dump=pickle_.dump,
+                     fa=ROW_.fields['visible_frame'][1])
+
+    def audit_sent(row, ep, t, cf):
+        if audit is None or audit['n'] >= audit['cap']:
+            if audit is not None:
+                audit['last'] = None
+            return
+        audit['n'] += 1
+        nb_ = int(row['visible_bytes'][0])
+        e_ = min(audit['fa'] + ((max(nb_, 0) + 3) & ~3), row.dtype.itemsize)
+        audit['dump'](('s', int(ep), int(t), int(cf), row.view(np.uint8).reshape(-1)[:e_].tobytes()), audit['f'])
+        audit['last'] = (int(ep), int(t))
+
+    def audit_got(action, value, vg):
+        if audit is None or audit['last'] is None:
+            return
+        audit['dump'](('r',) + audit['last'] + (action, value, vg), audit['f'])
+        audit['last'] = None
+        audit['f'].flush()
     fast_fn = fast_row_function(row_library(cfg))   # None: LeanDecoder + encode_row as before
     # 2026-11-03 (tok_priv, cfg.priv): this worker's slots of the privileged records and its map version counter
     priv_on = bool(getattr(cfg, 'priv', False)) and not evaluation
@@ -1956,6 +1986,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     if waiting:   # the answer to the record before this one: the action of the step to come
                         receive()
                         action = tuple(int(v) for v in actions[index])
+                        if audit is not None:
+                            audit_got(action, float(main_value[index]) if main_value is not None else None,
+                                      float(main_vg[index]) if main_vg is not None else None)
                         if branching:   # Phase B2: the actor's outputs for record t_ep - 1 (hist[t] is record t's)
                             hist.append((float(aux[index, AUX_LOGP]), float(aux[index, AUX_PRED]),
                                          float(aux[index, AUX_UNCERT])))
@@ -1983,11 +2016,15 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         #             of this worker is outstanding)
                         cf_snap[index] = cf_snap_req
                         cf_snap_req = 0
+                    if audit is not None:
+                        audit_sent(slots[t_ep & 1], episode_n, t_ep, cf_snap[index] if cf_snap is not None else 0)
                     conn.send_bytes(b'1' if t_ep & 1 else b'0')
                     waiting = True
                     if done or control[0]:
                         receive()   # nothing may be outstanding when the next episode starts
                         waiting = False
+                        if audit is not None:
+                            audit_got(None, None, None)
                     t2 = time.perf_counter()
                     mine[ST['wait_s']] += t2 - t1
                     if done or control[0]:
@@ -2090,6 +2127,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                           file=sys.stderr, flush=True)
                 if waiting:
                     conn.recv_bytes()
+                    if audit is not None:
+                        audit_got(None, None, None)
                 for h in hurts:
                     h[1].release()
                 for h in v2_pts:   # 2026-10-10 (teacher v2)

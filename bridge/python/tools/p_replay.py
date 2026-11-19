@@ -145,14 +145,23 @@ def replay(backend, z, steps, spec):
 
 
 def diff(a, b, mask=None):
-    """(records compared, bit-equal records, max |a - b|) of two arrays [N, ...] (rows where mask)."""
-    a, b = np.asarray(a), np.asarray(b)
+    """(records compared, bit-equal records, max |a - b|) of two arrays [N, ...] (rows where mask). (Codex 17-4) Bit
+    for bit: a row with a NaN / inf on either side is not equal, then the bytes of the original dtype are compared
+    (+0 / -0 differ); arrays of other dtypes / shapes compare as all different."""
+    a, b = np.ascontiguousarray(a), np.ascontiguousarray(b)
     if mask is not None:
-        a, b = a[mask], b[mask]
-    a2, b2 = a.reshape(len(a), -1), b.reshape(len(b), -1)
-    eq = np.all((a2 == b2) | (np.isnan(a2.astype(np.float64)) & np.isnan(b2.astype(np.float64))), 1)
-    d = np.abs(a2.astype(np.float64) - b2.astype(np.float64))
-    return dict(n=int(len(a)), equal=int(eq.sum()), max_abs=float(np.nanmax(d)) if d.size else 0.0)
+        a, b = np.ascontiguousarray(a[mask]), np.ascontiguousarray(b[mask])
+    n = len(a)
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return dict(n=int(n), equal=0, max_abs=float('inf'))
+    if n == 0:
+        return dict(n=0, equal=0, max_abs=0.0)
+    a2, b2 = a.reshape(n, -1), b.reshape(n, -1)
+    fin = np.isfinite(a2).all(1) & np.isfinite(b2).all(1) if a.dtype.kind == 'f' else np.ones(n, bool)
+    eq = (a2.view(np.uint8).reshape(n, -1) == b2.view(np.uint8).reshape(n, -1)).all(1) & fin
+    with np.errstate(invalid='ignore'):
+        d = np.abs(a2.astype(np.float64) - b2.astype(np.float64))
+    return dict(n=int(n), equal=int(eq.sum()), max_abs=float(np.nanmax(d)) if np.isfinite(d).any() else float('nan'))
 
 
 def main(argv=None):

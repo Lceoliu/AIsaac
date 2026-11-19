@@ -18,13 +18,17 @@ from .tok_obs import ROW
 from .tok_obs import DONE_BRANCH
 
 
-def supported(args, *, t_on, mem_on, frame_v3, block_on, proc, n_act, snaps, priv_on, pf_on, lab, aux, plr, lanes_gpu):
-    """(P-driver-design 11.3) None when phase 1 supports this run, else why not."""
+def supported(args, *, t_on, mem_on, frame_v3, block_on, proc, n_act, snaps, priv_on, pf_on, lab, aux, plr, lanes_gpu,
+              use_graphs=True, b52=False):
+    """(P-driver-design 11.3) None when phase 1 supports this run, else why not. (Codex 17-6: the driver folds on the
+    GraphActor's captured graphs -- a run without graphs or at --actor-fold 0 would change numerics silently.)"""
     why = [w for w, bad in (('not temporal', not t_on), ('a GRU', mem_on), ('not --frame v3', not frame_v3),
                             ('block memory', block_on), ('a learner process', proc), ('more actor processes', n_act != 1),
                             ('branch snapshots', bool(snaps)), ('pickup force', pf_on),
                             ('the lab', lab), ('branch aux', aux), ('archive PLR', plr),
-                            ('the teacher on its own GPU', lanes_gpu)) if bad]
+                            ('the teacher on its own GPU', lanes_gpu), ('no CUDA graphs', not use_graphs),
+                            ('not --actor-fold 1', int(getattr(args, 'actor_fold', 0) or 0) != 1),
+                            ('the B52 driver', b52)) if bad]
     return ', '.join(why) or None
 
 
@@ -54,6 +58,9 @@ class DriverCollect:
                       int(sampler.actions.shape[1]), ptr(getattr(sampler, 'main_value', None)),
                       ptr(getattr(sampler, 'main_vg', None)), ptr(getattr(sampler, 'cf_snap', None)))
         d.set_rules(ROW.fields['done'][1], ROW.fields['first'][1], ROW.fields['t'][1], DONE_BRANCH, int(cap_t), int(trunc))
+        origin = getattr(sampler, 'origin_column', None)
+        if origin is not None:   # (Codex 17-5: each record's ep_archive copied at its take, before the reply)
+            d.set_origin(int(origin.ctypes.data), int(origin.strides[0]))
         d.set_blocks(int(self.blocks.ctypes.data), blocks, n, 0)
         self.pblocks = None
         if priv_dtype is not None:   # (tok_priv: each record's PRIV record copied by the driver beside its row)
@@ -63,15 +70,17 @@ class DriverCollect:
         d.set_version(int(version))
         self.started = False
         self.partial = {}   # call -> records taken so far (a take may end inside a call)
-        self.stat = dict(records=0, calls=0, ends=0, gone=0, take_s=0.0, waits=0)
+        self.next_seq = 0   # (Codex 17-1) every queued record / end consumed once, in sequence
+        self.stat = dict(records=0, calls=0, ends=0, gone=0, take_s=0.0, waits=0, reply_fail=0, stored=0)
 
     # ---- the collect
     def collect(self, roll, book, pending, target, prof, store, tick=None, weights=None, stopped=lambda: False,
-                version=None):
+                version=None, watch=None):
         """Records into the rollout until its committed usable count reaches target (or the workers end / a stop);
         tick(): the lanes' round (each loop); weights(): None, or a callable that swaps the weights (called with the
         driver paused and drained; returns the new version); version: the actor's weights now (the hand-off may have
-        taken new ones since the last collect -- the driver paused then; as B52's run_driver_collect)."""
+        taken new ones since the last collect -- the driver paused then; as B52's run_driver_collect); watch(): the
+        workers' fatal exits (train_tok's watch_workers, at most once a second)."""
         if version is not None:
             self.d.set_version(int(version))
         c0 = self.d.counters()
@@ -83,6 +92,8 @@ class DriverCollect:
         while roll.usable() < target and self.sampler.live and not stopped():
             if tick is not None:
                 tick(prof)
+            if watch is not None:
+                watch()
             if weights is not None and weights.ready():
                 self.drain(roll, book, pending, prof, store)
                 self.d.set_version(int(weights()))
@@ -95,13 +106,22 @@ class DriverCollect:
         prof['drv_calls'] = prof.get('drv_calls', 0) + c1['calls'] - c0['calls']
         prof['drv_credit_s'] = prof.get('drv_credit_s', 0.0) + c1['t_credit_s'] - c0['t_credit_s']
         prof['drv_call_s'] = prof.get('drv_call_s', 0.0) + c1['t_call_s'] - c0['t_call_s']
+        prof['cf_snaps'] = prof.get('cf_snaps', 0) + c1['cf_snaps'] - c0['cf_snaps']   # (as the Python loop's)
+        prof['drv_reply_fail'] = prof.get('drv_reply_fail', 0) + c1['reply_fail'] - c0['reply_fail']
 
     def drain(self, roll, book, pending, prof, store):
-        """Pause the driver; every record it accepted committed (P-driver-design 11.1)."""
+        """Pause the driver; every record it accepted committed (P-driver-design 11.1). The boundary (Codex 17-1): the
+        pause acknowledged for this generation, the queue empty, no call half taken, and every sequence number the
+        driver gave out consumed (the committed watermark = the driver's next seq)."""
         self.d.pause()
         while True:
             got = self.step(roll, book, pending, prof, store, 0.01)
-            if not got and self.d.is_paused() and self.d.counters()['queue'] == 0 and not self.partial:
+            if got or self.partial:
+                continue
+            ok, qn, seq = self.d.drain_state()
+            if ok and qn == 0:
+                if self.next_seq != seq:
+                    raise RuntimeError(f'tok_driver: drained at seq {self.next_seq}, the driver gave out {seq}')
                 return
 
     def step(self, roll, book, pending, prof, store, timeout):
@@ -118,6 +138,10 @@ class DriverCollect:
         m = len(d['seq'])
         if not m:
             return 0
+        seqs = d['seq']
+        if int(seqs[0]) != self.next_seq or (m > 1 and not np.array_equal(np.diff(seqs), np.ones(m - 1, seqs.dtype))):
+            raise RuntimeError(f'tok_driver: records out of sequence (expected {self.next_seq}, got {seqs[:8]})')
+        self.next_seq += m
         for i in range(m):
             kind = int(d['kind'][i])
             if kind:   # a worker's end ('x') / EOF: the sampler's bookkeeping, as poll_ready's _drop
@@ -142,7 +166,13 @@ class DriverCollect:
         idx = np.array([int(r['worker']) for r in recs], np.int64)
         go_d = np.array([bool(r['go']) for r in recs])
         tb = time.perf_counter()
-        go = book.arrive(roll, rows, idx, pending)
+        # (Codex 17-5: each first record's fresh / archive from the column as it was at the record's take, not the
+        #  live column the worker may have moved on since)
+        book.origin_rec = np.array([float(r['origin']) for r in recs]) if 'origin' in recs[0] else None
+        try:
+            go = book.arrive(roll, rows, idx, pending)
+        finally:
+            book.origin_rec = None
         t1 = time.perf_counter()
         prof['book'] += t1 - tb
         if not np.array_equal(go, go_d):
@@ -155,6 +185,16 @@ class DriverCollect:
             pend_d = np.stack([recs[j]['pending'] for j in g])
             if not np.array_equal(under_way, pend_d):
                 raise RuntimeError(f'tok_driver: the pending of workers {a_idx} differs from the driver\'s')
+            # (Codex 17-1) the rollout's room: a full worker's decision cannot be stored -- an error, not a filter
+            full = roll.length[a_idx] >= roll.cap
+            if full.any():
+                raise RuntimeError(f'tok_driver: workers {a_idx[full].tolist()} are at the rollout capacity ({roll.cap} '
+                                   f'decisions each): their answered decisions cannot be stored (the collect target '
+                                   f'is out of reach with the workers still running)')
+            bad = [int(recs[j]['worker']) for j in g if not int(recs[j].get('replied', 1))]
+            if bad:   # (Codex 17-3: the reply failed -- the worker's end is gone; stored as the Python loop stores it
+                #      (sampler.reply ignores OSError), its EOF follows; counted apart)
+                self.stat['reply_fail'] += len(bad)
             actions = np.stack([recs[j]['actions'] for j in g]).astype(np.int64)
             logp = np.array([recs[j]['logp'] for j in g], np.float32)
             value = np.array([recs[j]['value'] for j in g], np.float32)
@@ -183,16 +223,41 @@ class DriverCollect:
                 roll.t_kv.index_copy_(0, rows_t, sel(self.ring['kv']).to(roll.t_kv.dtype))
                 roll.t_s.index_copy_(0, rows_t, sel(self.ring['s']).to(roll.t_s.dtype))
                 roll.t_o.index_copy_(0, rows_t + int(roll.t_obase), sel(self.ring['o']).to(roll.t_o.dtype))
+                n0 = int(roll.length[a_idx].sum())
                 store(roll, a_idx, sub, under_way, actions, logp, value, ver, None, vg, t, priv)
+                stored = int(roll.length[a_idx].sum()) - n0
+            if stored != kg:
+                raise RuntimeError(f'tok_driver: {kg} decisions committed, {stored} stored')
             pending[a_idx] = actions
             self.d.release_ring(int(ring_seq[-1]) + 1)
             prof['calls'] += 1
-            prof['rows'] += kg
+            prof['rows'] += stored
+            self.stat['stored'] += stored
         self.d.release_block(b)
         prof['store'] += time.perf_counter() - t1
         self.stat['records'] += k
         self.stat['calls'] += 1
 
-    def close(self):
-        if self.started:
-            self.d.stop()
+    def close(self, timeout=60.0):
+        """(Codex 17-2) The driver stopped and joined; then every record it had read but not answered, and every one
+        still arriving, answered without an action (a cancel) with the workers told to close (sampler.control[0]), until
+        they have ended: no worker waits for a reply nobody will write (sampler.close reads the pipes after this). The
+        ends / EOFs reach the sampler's bookkeeping. Called before the learner's join and the last save."""
+        if not self.started:
+            return
+        self.started = False
+        ctl = getattr(self.sampler, 'control', None)
+        if ctl is not None:
+            ctl[0] = 1
+        self.d.stop()
+        n_c, open_w = self.d.close_serve(float(timeout))
+        while True:
+            d = self.d.take(4096, 0.0)
+            if not len(d['seq']):
+                break
+            for i in range(len(d['seq'])):
+                if int(d['kind'][i]):
+                    self.sampler._drop(self.sampler.conns[int(d['worker'][i])])
+        self.stat['cancelled'] = int(n_c)
+        print(f'P package: the driver stopped ({n_c} records cancelled at the end, {open_w} workers still open)',
+              flush=True)
