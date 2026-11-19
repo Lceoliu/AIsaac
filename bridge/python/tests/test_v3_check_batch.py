@@ -127,3 +127,79 @@ def test_valid_wire_uses_no_scalar_row_checks(monkeypatch):
     bad(data, 4, 'length', 7)
     assert_failure(data)
     assert calls == [4]
+
+
+# ------------------------------------------------------------- (P package, 2026-11-19) reject_code = check_batch's outcome
+def _code(data, p_max=V3.CAP_BODY):
+    h, v, s, p0 = data
+    return VI.reject_code(h, v, s, p0=p0, p_max=p_max)
+
+
+def _refused(data, p_max=V3.CAP_BODY):
+    try:
+        check(VI.check_batch, *data, p_max=p_max)
+    except Exception as e:   # noqa: BLE001
+        return str(e)
+    return None
+
+
+@pytest.mark.parametrize('b', [0, 1, 8, 128])
+def test_reject_code_accepts_what_check_batch_accepts(b):
+    assert _code(batch(b, seed=b)) == (0, -1)
+
+
+@pytest.mark.parametrize('field,value,code', [
+    ('schema', V3.VERSION - 1, 'schema'), ('length', 4, 'bytes'), ('length', V3.FRAME_BYTES + 4, 'bytes'),
+    ('length', 10001, 'bytes'), ('length', np.nan, 'bytes'), ('length', np.inf, 'bytes'),
+    (V3.H_MAGIC, V3.MAGIC + 1, 'magic'), (V3.H_VERSION, V3.VERSION_WORD + 1, 'version_word'),
+    (V3.H_PRODUCER, 0.5, 'nonwhole'), (V3.H_PRODUCER, np.nan, 'nonwhole'), (V3.H_PRODUCER, np.inf, 'nonwhole'),
+    (V3.H_P, 0, 'counts'), (V3.H_P, V3.CAP_BODY + 1, 'counts'), (V3.H_E, -1, 'counts'),
+    (V3.H_E, V3.CAP_ENTITY + 1, 'counts'), (V3.H_N, -1, 'counts'), (V3.H_S, -1, 'counts'),
+    (V3.H_N, np.finfo(np.float32).max, 'size'), (V3.H_SIZE, 1.5, 'nonwhole'), (V3.H_SIZE, 10000, 'size'),
+    ('role', 0.999, 'p0'), ('known', 0, 'p0'), ('known', np.nan, 'p0'),
+])
+def test_reject_code_names_the_reason_and_record(field, value, code):
+    for i in (0, 3, 7):
+        h, v, s, p0 = batch(8)
+        data = h, v, s.astype(np.float64), p0
+        bad(data, i, field, value)
+        msg = _refused(data)
+        assert msg is not None
+        assert _code(data) == (VI.REJECT[code], i), msg
+
+
+def test_reject_code_precedence_and_p_max():
+    data = batch(8)
+    bad(data, 1, 'role', 0)
+    assert _code(data) == (VI.REJECT['p0'], 1)
+    bad(data, 4, V3.H_MAGIC, -1)
+    bad(data, 5, 'schema', V3.VERSION - 1)
+    assert _code(data) == (VI.REJECT['magic'], 4)   # (headers across the batch before the P0 pass)
+    bad(data, 0, 'schema', V3.VERSION + 1)
+    assert _code(data) == (VI.REJECT['schema'], 0)
+    assert _code(batch(8), p_max=0) == (VI.REJECT['p_max'], -1) and _refused(batch(8), p_max=0)
+
+
+def test_reject_code_fuzz_equals_check_batch():
+    """Random defects (one to three per batch, any word / schema / length / P0 flag, values near and far from the
+    valid ones): reject_code refuses exactly when check_batch does, naming the record its message names."""
+    import re
+    rng = np.random.default_rng(7)
+    fields = ['schema', 'length', 'role', 'known'] + list(range(V3.HEADER))
+    for trial in range(1500):
+        h, v, s, p0 = batch(6, seed=trial)
+        v = v.astype(np.float64)
+        data = h, v, s.astype(np.float64), p0
+        for _ in range(int(rng.integers(1, 4))):
+            f = fields[int(rng.integers(len(fields)))]
+            i = int(rng.integers(6))
+            cur = float({'schema': v[i], 'length': data[2][i], 'role': p0[i, 0], 'known': p0[i, 1]}.get(
+                f, h[i, f] if isinstance(f, int) else 0))
+            val = rng.choice([cur + 1, cur - 1, cur + 0.5, 0.0, -1.0, np.nan, np.inf, cur * 4, 1.0, cur])
+            bad(data, i, f, val)
+        pm = int(rng.choice([V3.CAP_BODY, 1]))
+        msg, (code, at) = _refused(data, pm), _code(data, pm)
+        assert (msg is None) == (code == 0), (trial, msg, code)
+        m = re.search(r'record (\d+)', msg or '')
+        if m:
+            assert at == int(m.group(1)), (trial, msg, code, at)

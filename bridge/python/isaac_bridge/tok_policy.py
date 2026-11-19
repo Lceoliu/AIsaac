@@ -1299,7 +1299,7 @@ class TokPolicy(nn.Module):
         if self.block_memory is not None:
             return self._forward_block(b, entities, packed, need_h, need_vg, temporal)
         if self.frame_v3 is not None:   # (seq-v1 step 2)
-            return self._forward_v3(b, need_h, mem, need_vg, temporal)
+            return self._forward_v3(b, need_h, mem, need_vg, temporal, packed)
         tctx = hist = None
         if temporal is not None and self.tatt is not None:   # 2026-10-14 (B30)
             tctx, hist = self._temporal_in(b, temporal)
@@ -1483,7 +1483,7 @@ class TokPolicy(nn.Module):
             return self.block_memory.resampler(x, pad)
         return self._heads(x[:, 0], need_h, mem, x[:, -1] if G else None, need_vg, tctx)
 
-    def _forward_v3(self, b, need_h, mem, need_vg, temporal):
+    def _forward_v3(self, b, need_h, mem, need_vg, temporal, packed):
         """forward() of frame='v3' (seq-v1 step 2): the frame encoder's tokens of the batch's v3 tensors ('v3.<name>',
         v3_input.put_batch: v3_input.pad_batch's layout), the controlled body's token (0) and the global token (last) after its blocks, then the
         heads exactly as T1 (_heads -> _heads_temporal with a temporal context; no feedback token). The ROW fields the
@@ -1491,13 +1491,20 @@ class TokPolicy(nn.Module):
         from b; no ROW observation field enters the encoder."""
         tctx = None
         if temporal is not None and self.tatt is not None:
-            tctx, _hist = self._temporal_in(b, temporal)   # (feedback 0: no history token)
+            with _mark('v3:temporal_in'):
+                tctx, _hist = self._temporal_in(b, temporal)   # (feedback 0: no history token)
         from .v3_input import get_batch, materialize
-        v3 = materialize(get_batch(b))
+        with _mark('v3:decode'):
+            v3 = materialize(get_batch(b))
         if not v3:
             raise ValueError('TokPolicy(frame=v3): a batch without v3 tensors (records without a v3 frame)')
-        x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
-        return self._heads(x[:, 0], need_h, mem, x[:, g], need_vg, tctx)
+        with _mark('v3:frame'):
+            if packed:
+                x, _pad, g = self.frame_v3.forward_packed(v3, b['pending'], self.gtok.tok)
+            else:
+                x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
+        with _mark('v3:heads'):
+            return self._heads(x[:, 0], need_h, mem, x[:, g], need_vg, tctx)
 
     def _block_packed_readout(self, xp, starts):
         counts = torch.cat((starts[1:], starts.new_tensor([len(xp)]))) - starts
@@ -1899,6 +1906,38 @@ def packed_index(n_ent, n_doors, entities, n_item=None, item_tok=0, glob=0, hist
 BUCKET_COST = 2.0e5   # a bucket's fixed cost in record x token^2 units (its ~12 more kernels per layer; H20, B18)
 
 
+def _attention_buckets(cnt, buckets):
+    """Attention layout for positive per-record counts (numpy): row bases and (counts, width) per bucket."""
+    n = len(cnt)
+    top = int(cnt.max())
+    upto = np.cumsum(np.bincount(cnt, minlength=top + 1))   # records with c <= index
+    w = np.arange(top + 1, dtype=np.float64)
+    a, b = np.meshgrid(w, w, indexing='ij')                  # the bounds: (0, a], (a, b], (b, top]
+    na, nb = upto[a.astype(np.int64)], upto[b.astype(np.int64)]
+    n1, n2, n3 = na, nb - na, n - nb
+    # Keep B18's boolean arithmetic and argmin tie-break so existing ROW plans do not change.
+    cost = n1 * a ** 2 + n2 * b ** 2 + n3 * float(top) ** 2 + BUCKET_COST * ((n1 > 0) + (n2 > 0) + (n3 > 0))
+    cost[~((a <= b) & (b <= top))] = np.inf
+    if buckets < 3:
+        cost[(n1 > 0) & (n2 > 0) & (n3 > 0)] = np.inf
+    if buckets < 2:
+        cost[(n1 > 0) | (n2 > 0)] = np.inf
+    i, j = np.unravel_index(int(np.argmin(cost)), cost.shape)
+    group = np.where(cnt <= i, 0, np.where(cnt <= j, 1, 2))
+    base = np.zeros(n, np.int64)
+    layout = []
+    at = 0
+    for k in range(3):
+        r = np.flatnonzero(group == k)
+        if not len(r):
+            continue
+        width = int(cnt[r].max())
+        base[r] = at + np.arange(len(r)) * width
+        layout.append((cnt[r], width))
+        at += len(r) * width
+    return base, layout
+
+
 def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, glob=0, hist=None):
     """2026-10-10 (B18, the learner's fast path): forward(packed=True)'s token layout for a batch with `entities`
     entity tokens, planned on the host per record (counts only; plan_tokens expands it per token on the device). A
@@ -1933,34 +1972,11 @@ def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, g
         rec[:, 6], rec[:, 7] = ni, np.cumsum(ni) - ni
     if hs:
         rec[:, 8] = nh
-    top = int(cnt.max())
-    upto = np.cumsum(np.bincount(cnt, minlength=top + 1))   # records with c <= index
-    w = np.arange(top + 1, dtype=np.float64)
-    a, b = np.meshgrid(w, w, indexing='ij')                  # the bounds: (0, a], (a, b], (b, top]
-    na, nb = upto[a.astype(np.int64)], upto[b.astype(np.int64)]
-    n1, n2, n3 = na, nb - na, n - nb
-    cost = n1 * a ** 2 + n2 * b ** 2 + n3 * float(top) ** 2 + BUCKET_COST * ((n1 > 0) + (n2 > 0) + (n3 > 0))
-    cost[~((a <= b) & (b <= top))] = np.inf
-    if buckets < 3:
-        cost[(n1 > 0) & (n2 > 0) & (n3 > 0)] = np.inf
-    if buckets < 2:
-        cost[(n1 > 0) | (n2 > 0)] = np.inf
-    i, j = np.unravel_index(int(np.argmin(cost)), cost.shape)
-    group = np.where(cnt <= i, 0, np.where(cnt <= j, 1, 2))
-    base = np.zeros(n, np.int64)
+    base, layout = _attention_buckets(cnt, buckets)
     out = dict(rec=rec, base=base, m=int(cnt.sum()), m_doors=int(nd.sum()), m_ent=int(ne.sum()),
-               t=3 + DOOR_CAP + entities + item_tok + hs + glob, entities=entities, buckets=[])
+               t=3 + DOOR_CAP + entities + item_tok + hs + glob, entities=entities, buckets=layout)
     if fused:
         out.update(m_item=int(ni.sum()), item_tok=int(item_tok), glob=int(glob), hist=hs)
-    at = 0
-    for k in range(3):
-        r = np.flatnonzero(group == k)
-        if not len(r):
-            continue
-        width = int(cnt[r].max())
-        base[r] = at + np.arange(len(r)) * width
-        out['buckets'].append((cnt[r], width))
-        at += len(r) * width
     return out
 
 
@@ -2147,20 +2163,59 @@ ROW_HEAD = ROW.fields['visible_bytes'][1]   # B42: every record field before the
 assert ROW_HEAD % 8 == 0
 
 
-def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, head=False):
+def _compact_v3_raw(rows, index, frames, stage):
+    """(A-3, 2026-11-19) compact ROWC records with v3 frames in their FrameArena `frames` -> [n, frame_at + w] uint8
+    (torch, CPU; in stage when given): each record's ROW bytes up to its frame (the head, all fixed fields) and its
+    frame's bytes (visible_bytes) at the frame field's offset, zeros after it; w the longest frame's bytes. The bytes
+    rows_to_device sends for ROW records with v3 frames, but for the frame field's tail past each record's own frame
+    (zeros here; whatever the ROW record held there: never decoded -- tests/test_rollout_compact.py)."""
+    from .schema_v3 import VERSION as V3_VERSION, FRAME_BYTES as V3_FRAME_BYTES
+    flat_ = rows.reshape(-1)
+    if len(index) and not np.all(flat_['visible_schema'][index] == V3_VERSION):
+        raise ValueError('rows_to_device: compact records without a v3 frame need head=True')
+    nb_ = np.asarray(flat_['visible_bytes'][index], np.int64)
+    if len(index) and (nb_.min() < 0 or nb_.max() > V3_FRAME_BYTES):
+        from .visible_producer import VisibleV3Fatal
+        raise VisibleV3Fatal(f'rows_to_device: visible_bytes {int(nb_.min())} .. {int(nb_.max())} outside '
+                             f'0 .. {V3_FRAME_BYTES}')
+    fa = ROW.fields['visible_frame'][1]
+    cols = fa + (-(-int(nb_.max() if len(index) else 0) // 4) * 4)
+    n = len(index)
+    out = (stage.view(-1)[:n * cols].view(n, cols) if stage is not None else torch.empty((n, cols), dtype=torch.uint8))
+    raw = torch.from_numpy(flat_.view(np.uint8).reshape(-1, rows.dtype.itemsize))[:, :fa]
+    idx = torch.from_numpy(np.ascontiguousarray(index, np.int64))
+    for lo in range(0, n, 1024):   # (in chunks: a gathered [1024, frame_at] block at a time, no GIL)
+        out[lo:lo + 1024, :fa].copy_(raw.index_select(0, idx[lo:lo + 1024]))
+    o_np = out.numpy()
+    o_np[:, fa:] = 0
+    buf = frames.buf
+    for i, (o, k) in enumerate(zip(np.asarray(flat_['visible_off'][index], np.int64), nb_)):
+        o_np[i, fa:fa + k] = buf[o:o + k]
+    return out
+
+
+def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, head=False, frames=None):
     """to_batch for a large set of records without numpy copies: rows a ROW array (any shape, C-contiguous), index the
     flat positions to take (numpy int64), pending [len(index), heads] int64. The gather runs in torch (no GIL held), one
     copy goes to the device and the fields are views of it (decode_rows). Same values as
     to_batch(rows.reshape(-1)[index], pending, device).
     stage (2026-10-10, B18): a pinned uint8 tensor [>= len(index), ROW_BYTES]: the records are gathered into it and
     copied asynchronously (the caller must not reuse it before the copy is done: a later sync of the device).
-    with_raw (B18): also return the records' bytes on the device and the actions under way: (batch, bytes, pending)."""
+    with_raw (B18): also return the records' bytes on the device and the actions under way: (batch, bytes, pending).
+    frames (A-3, 2026-11-19): the FrameArena of compact ROWC records with v3 frames (Rollout.frames): their bytes
+    rebuilt in ROW's layout up to the longest frame (_compact_v3_raw)."""
     # (B45: compact ROWC records share ROW's head layout; their own record size)
     raw = torch.from_numpy(rows.reshape(-1).view(np.uint8).reshape(-1, rows.dtype.itemsize))
     if head:   # B42 (block memory): the record head only, never the visible frame's padding
         raw, stage = raw[:, :ROW_HEAD], None
     elif rows.dtype.itemsize != ROW_BYTES:
-        raise ValueError('rows_to_device: compact records carry no frame (head=True only)')
+        if frames is None:
+            raise ValueError('rows_to_device: compact records carry no frame (head=True, or their frames)')
+        g_ = _compact_v3_raw(rows, index, frames, stage)
+        dev_raw = g_.to(device, non_blocking=stage is not None)
+        pend = torch.from_numpy(np.ascontiguousarray(pending, np.int64)).to(device)
+        out = decode_rows(dev_raw, pend, visible=True, counts=None)
+        return (out, dev_raw, pend) if with_raw else out
     else:
         # (seq-v1, the coordinator 2026-11-18: v3 frames fill about 15 KB of the 128-KiB frame field -- every record
         #  copied whole was 8 x the bytes. With v3 frames only, each record's bytes up to the longest frame of the
@@ -2194,6 +2249,127 @@ def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, hea
                                    flat['visible_bytes'][index])
     out = decode_rows(dev_raw, pend, visible=vis, counts=counts)
     return (out, dev_raw, pend) if with_raw else out
+
+
+# (L-1, 2026-11-19, a measurement aid) True: TokPolicy's v3 forward marks its parts for the torch profiler
+# (record_function 'v3:decode' / 'v3:temporal_in' / 'v3:frame' / 'v3:heads'); train_tok sets it with
+# ISAAC_RL_B38_TORCHPROF. False: no marks.
+PROF_MARKS = False
+
+
+def _mark(name):
+    return torch.profiler.record_function(name) if PROF_MARKS else contextlib.nullcontext()
+
+
+class FoldLayout(tuple):
+    """(P package, 2026-11-19) GraphActor(fold=True)'s staging layout: n rows (the largest call), nh heads (H logits in
+    all), the control block's width cw and its fields' byte offsets (fold_views), the record graphs' entity sizes and
+    row buckets, and which inputs the graphs read (mem: the GRU table row and keep; t_on: the temporal slot and the
+    rollout row; crn). A tuple: fold_pack's callers (GraphActor, the C++ driver's tests) build it once."""
+    __slots__ = ()
+    _f = ('n', 'nh', 'H', 'cw', 'dest_at', 'mem', 't_on', 'crn', 'sizes', 'rsizes', 'ent_span')
+
+    def __new__(cls, n, heads, mem, t_on, crn, sizes, rsizes):
+        H = int(sum(heads))
+        cw = -(-(20 + 4 * H) // 8) * 8
+        dest_at = cw
+        if t_on:
+            cw += 8
+        dt_e, off_e = ROW.fields['ent'][:2]
+        span = (off_e, dt_e.itemsize // dt_e.shape[0], off_e + dt_e.itemsize)
+        return tuple.__new__(cls, (int(n), len(heads), H, cw, dest_at, bool(mem), bool(t_on), bool(crn),
+                                   tuple(int(x) for x in sizes), tuple(int(x) for x in rsizes), span))
+
+    def __getattr__(self, k):
+        try:
+            return self[FoldLayout._f.index(k)]
+        except ValueError:
+            raise AttributeError(k) from None
+
+
+def fold_views(lay, ctrl):
+    """The control block's fields as numpy views of ctrl [n, cw] uint8: widx (int64: the GRU table row / the temporal
+    slot), keep (float32: 0 where an episode starts), dup (float32: 1 on a row past the call's records), cf (float32: 1
+    where the row's uniforms are given), cu [n, H] float32 (those uniforms), dest (int64: the record's rollout row;
+    temporal models only)."""
+    return dict(widx=ctrl[:, 0:8].view(np.int64)[:, 0], keep=ctrl[:, 8:12].view(np.float32)[:, 0],
+                dup=ctrl[:, 12:16].view(np.float32)[:, 0], cf=ctrl[:, 16:20].view(np.float32)[:, 0],
+                cu=ctrl[:, 20:20 + 4 * lay.H].view(np.float32),
+                dest=ctrl[:, lay.dest_at:lay.dest_at + 8].view(np.int64)[:, 0] if lay.t_on else None)
+
+
+def fold_pack(lay, rows, pending, widx=None, reset=None, dest=None, ukeys=None, *, stage, ctrl, cv=None, eb=None):
+    """(P package, 2026-11-19) The host side of one GraphActor(fold=True) call as a pure function of its inputs: the
+    records' bytes and the pending actions into stage [n, ROW_BYTES + 8 nh] uint8, the control block into ctrl [n, cw]
+    uint8 (numpy; cv: fold_views(lay, ctrl), built here when None), and which graph to replay. rows: a C-contiguous ROW
+    array of the call's records; pending [k, nh] int64; widx [k] (memory / temporal models), reset [k] bool or None,
+    dest [k] int64 the rollout rows (temporal models with a rollout; None: none), ukeys (keys [k], t [k]) or None, eb:
+    the v3 entity bucket of the call (v3 models; None: the entity graph from the records' n_ent).
+    Returns dict(g: the entity graph, r: the row bucket, graph: the graph's index (g + rsizes.index(r) x len(sizes)),
+    crn_rows: records whose uniforms came from their crn key).
+    The bytes it defines are fold_defined's; the others keep what the buffers held (stale: no graph reads them). The C++
+    driver packs the same defined bytes (tools/p_golden.py's samples)."""
+    cv = fold_views(lay, ctrl) if cv is None else cv
+    n = len(rows)
+    most = int(rows['n_ent'].max())
+    g = int(np.searchsorted(lay.sizes, most))
+    src = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
+    off_e, per_e, end_e = lay.ent_span
+    cut = off_e + per_e * lay.sizes[g]
+    stage[:n, :cut] = src[:, :cut]
+    stage[:n, end_e:ROW_BYTES] = src[:, end_e:]
+    stage[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * lay.nh)
+    if lay.mem or lay.t_on:   # ((B30) temporal: the slot of each row; the padded rows go to the scratch slot)
+        cv['widx'][:n] = widx
+        cv['widx'][n:] = widx[0]
+    if lay.mem:
+        cv['keep'][:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
+    if dest is not None:   # (B31) each record's rollout row
+        cv['dest'][:n] = dest
+    cv['dup'][:n] = 0.0
+    cv['dup'][n:] = 1.0
+    cv['cf'][:] = 0.0
+    crn_rows = 0
+    if lay.crn and 'crn' in rows.dtype.names:
+        crn = rows['crn']
+        if crn.any():
+            sel = np.flatnonzero(crn)
+            cv['cu'][sel] = crn_uniforms(crn[sel], rows['t'][sel], lay.H)
+            cv['cf'][sel] = 1.0
+            crn_rows = len(sel)
+    if ukeys is not None:   # (B36) every record's uniforms from its key (the graph's own draws unused)
+        cv['cu'][:n] = crn_uniforms(ukeys[0], ukeys[1], lay.H)
+        cv['cf'][:n] = 1.0
+    if eb is not None:   # (seq-v1 step 3: the v3 entity bucket's graph)
+        g = lay.sizes.index(eb)
+    r = lay.rsizes[int(np.searchsorted(lay.rsizes, n))]
+    return dict(g=g, r=r, graph=g + lay.rsizes.index(r) * len(lay.sizes), crn_rows=crn_rows)
+
+
+def fold_defined(lay, rows, dest=False, ukeys=False):
+    """(P package) The bytes fold_pack defines for a call of these records: (stage mask [k, ROW_BYTES + 8 nh], ctrl
+    mask [n, cw]) bool -- what a C++ packer must equal; the rest is stale and never read by the graph."""
+    k = len(rows)
+    off_e, per_e, end_e = lay.ent_span
+    g = int(np.searchsorted(lay.sizes, int(rows['n_ent'].max())))
+    sm = np.zeros((k, ROW_BYTES + 8 * lay.nh), bool)
+    sm[:, :off_e + per_e * lay.sizes[g]] = True
+    sm[:, end_e:] = True
+    cm = np.zeros((lay.n, lay.cw), bool)
+    if lay.mem or lay.t_on:
+        cm[:, 0:8] = True
+    if lay.mem:
+        cm[:k, 8:12] = True
+    cm[:, 12:20] = True
+    cf = np.zeros(k, bool)
+    if lay.crn and 'crn' in rows.dtype.names:
+        cf |= rows['crn'] != 0
+    if ukeys:
+        cf[:] = True
+    cm[:k, 20:20 + 4 * lay.H] = cf[:, None]
+    if dest and lay.t_on:
+        cm[:k, lay.dest_at:lay.dest_at + 8] = True
+    return sm, cm
 
 
 class GraphActor:
@@ -2333,24 +2509,27 @@ class GraphActor:
             self.v3_counts_stage = torch.zeros((n, 4), dtype=torch.int64).pin_memory()
             self.v3_counts_np = self.v3_counts_stage.numpy()
             self.v3_frame_at = ROW.fields['visible_frame'][1]
+            # (A-2) the calls' non-finite frame floats, counted inside the graphs (v3_input.stats_snapshot reads it)
+            self.v3_nf = torch.zeros((), dtype=torch.int64, device=dev)
+            VI.DEVICE_NONFINITE.add(self.v3_nf)
         self.entities = self.sizes[0]
         self.fold = bool(fold)
         if row_sizes and not self.fold:
             raise ValueError('GraphActor: row_sizes needs fold=True')
         self.rsizes = sorted({min(int(r_), n) for r_ in (row_sizes or ())} | {n})
         if self.fold:   # (B29) the control block per row: table row (int64), keep, dup, crn flag (float32), crn uniforms
-            H = sum(heads)
-            cw = -(-(20 + 4 * H) // 8) * 8
-            self.c_dest_at = cw   # (B31, temporal: the record's rollout row (int64) after them)
-            if self.t_on:
-                cw += 8
+            # (P package, 2026-11-19: the layout and the packing are FoldLayout / fold_pack, shared with the C++
+            # driver's tests)
+            self.fold_lay = FoldLayout(n, heads, self.mem, self.t_on, self.crn, self.sizes, self.rsizes)
+            cw = self.fold_lay.cw
+            self.c_dest_at = self.fold_lay.dest_at   # (B31, temporal: the record's rollout row (int64) after them)
             self.ctrl_stage = torch.zeros((n, cw), dtype=torch.uint8).pin_memory()
             self.ctrl = torch.zeros((n, cw), dtype=torch.uint8, device=dev)
             cs = self.ctrl_stage.numpy()
-            self.c_widx, self.c_keep, self.c_dup, self.c_cf = (cs[:, 0:8].view(np.int64)[:, 0], cs[:, 8:12].view(
-                np.float32)[:, 0], cs[:, 12:16].view(np.float32)[:, 0], cs[:, 16:20].view(np.float32)[:, 0])
-            self.c_cu = cs[:, 20:20 + 4 * H].view(np.float32)
-            self.c_dest = cs[:, cw - 8:cw].view(np.int64)[:, 0] if self.t_on else None
+            self.c_views = fold_views(self.fold_lay, cs)
+            self.c_widx, self.c_keep, self.c_dup, self.c_cf = (self.c_views[k] for k in ('widx', 'keep', 'dup', 'cf'))
+            self.c_cu = self.c_views['cu']
+            self.c_dest = self.c_views['dest']
             self.c_dup[:] = 1.0
             self.c_keep[:] = 1.0
             # (the staging copy skips the entity rows a graph does not read: ROW 'ent' rows past its size; their bytes
@@ -2426,8 +2605,11 @@ class GraphActor:
             if self.v3:
                 fa = self.v3_frame_at
                 frames = raw[:, fa:fa + self.VI.V3.FRAME_BYTES].view(torch.float32)
-                self.VI.put_batch(b, self.VI.decode_frames_device(frames, self.v3_counts[:r], tokens, self.VI.N_MAX_V3,
-                                                                  self.VI.S_MAX_V3, check=False))
+                d_ = self.VI.decode_frames_device(frames, self.v3_counts[:r], tokens, self.VI.N_MAX_V3,
+                                                  self.VI.S_MAX_V3, check=False)
+                # (A-2: the records' rows only -- a padded row's counts are 0, p 0)
+                self.v3_nf.add_((d_['nonfinite'].sum(1) * (self.v3_counts[:r, 0] > 0)).sum())
+                self.VI.put_batch(b, d_)
             return b
 
         def run(tokens, r=None):
@@ -2497,7 +2679,7 @@ class GraphActor:
             return False
         g_v3 = None
         if self.v3:   # (seq-v1 step 3) the records' checks and counts on the host; the graph of their entity bucket
-            counts, eb = self.VI.rows_counts(rows)
+            counts, eb = self.VI.rows_counts(rows, scan=False)   # (A-2: the non-finite floats on the device)
             self.v3_counts_np[:n] = counts
             self.v3_counts_np[n:] = 0
             g_v3 = self.sizes.index(eb)
@@ -2517,7 +2699,13 @@ class GraphActor:
                                              int(np.searchsorted(self.sizes, most)))
         if g_v3 is not None:
             g = g_v3
-        self.stage_np[:n, :ROW_BYTES] = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
+        src_ = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
+        if self.v3:   # (A-4: the bytes up to the call's longest frame; the frame field's tail is never decoded)
+            nb_ = int(np.asarray(rows['visible_bytes'], np.int64).max())
+            cut_ = min(ROW_BYTES, self.v3_frame_at + max((nb_ + 3) & ~3, 0))
+            self.stage_np[:n, :cut_] = src_[:, :cut_]
+        else:
+            self.stage_np[:n, :ROW_BYTES] = src_
         self.stage_np[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * self.nh)
         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
         sel = None
@@ -2597,37 +2785,15 @@ class GraphActor:
         td['o'].index_copy_(0, rows + int(td.get('obase', 0)), o[:n].to(td['o'].dtype))
 
     def _pack_fold(self, rows, pending, widx, reset, ukeys=None):
-        """(fold) The records and the control block into the pinned staging buffers; returns the graph to replay."""
-        n = len(rows)
-        most = int(rows['n_ent'].max())
-        g = int(np.searchsorted(self.sizes, most))
-        src = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
-        off_e, per_e, end_e = self._ent_span
-        cut = off_e + per_e * self.sizes[g]
-        self.stage_np[:n, :cut] = src[:, :cut]
-        self.stage_np[:n, end_e:ROW_BYTES] = src[:, end_e:]
-        self.stage_np[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * self.nh)
-        if self.mem or self.t_on:   # ((B30) temporal: the slot of each row; the padded rows go to the scratch slot)
-            self.c_widx[:n] = widx
-            self.c_widx[n:] = widx[0]
-        if self.mem:
-            self.c_keep[:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
-        if self._tdest is not None:   # (B31) each record's rollout row
-            self.c_dest[:n] = self._tdest['rows']
-        self.c_dup[:n] = 0.0
-        self.c_dup[n:] = 1.0
-        self.c_cf[:] = 0.0
-        if self.crn and 'crn' in rows.dtype.names:
-            crn = rows['crn']
-            if crn.any():
-                sel = np.flatnonzero(crn)
-                self.c_cu[sel] = crn_uniforms(crn[sel], rows['t'][sel], self.u.shape[1])
-                self.c_cf[sel] = 1.0
-                self.crn_rows += len(sel)
-        if ukeys is not None:   # (B36) every record's uniforms from its key (the graph's own draws unused)
-            self.c_cu[:n] = crn_uniforms(ukeys[0], ukeys[1], self.u.shape[1])
-            self.c_cf[:n] = 1.0
-        return g
+        """(fold) The records and the control block into the pinned staging buffers (fold_pack); returns the graph to
+        replay."""
+        lay = self.fold_lay
+        if lay.sizes != tuple(self.sizes) or lay.rsizes != tuple(self.rsizes) or lay.H != self.u.shape[1]:
+            raise RuntimeError('GraphActor: the fold layout does not match the graphs')
+        res = fold_pack(lay, rows, pending, widx, reset, self._tdest['rows'] if self._tdest is not None else None,
+                        ukeys, stage=self.stage_np, ctrl=self.ctrl_stage.numpy(), cv=self.c_views)
+        self.crn_rows += res['crn_rows']
+        return res['g']
 
     def result(self):
         """(actions [n, heads] int64, log-probabilities [n], values [n]) of the submitted call, as numpy arrays."""

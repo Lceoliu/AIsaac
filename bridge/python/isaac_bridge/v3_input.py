@@ -36,6 +36,8 @@ Derived inputs (the model's, never on the wire), every one clamped to [-NUM_CLAM
 Outputs are numpy arrays (see DecodedFrame); padded batches for the actor come from pad_batch."""
 from functools import lru_cache
 
+import weakref
+
 import numpy as np
 
 from . import schema_v3 as V3
@@ -829,6 +831,60 @@ def check_batch(headers, versions, sizes, p_max=None, n_max=None, s_max=None, p0
     return counts, trunc
 
 
+# (P package, 2026-11-19) check_batch's outcome as a code -- for the C++ driver's frame_counts_v3, which has no
+# Python exception to raise: both are held to the same golden samples (tools/p_golden.py). The first record whose
+# header fails, in record order, with the reason of the first failing test in check_frame_header_v3's order; then
+# (all headers good) P row 0's contract over the batch; then the padded layout's bodies.
+REJECT = {k: i for i, k in enumerate(('ok', 'schema', 'bytes', 'nonwhole', 'magic', 'version_word', 'counts', 'size',
+                                         'p0', 'p_max'))}   # (ok 0, schema 1, ... p_max 9)
+
+
+def _reject_row(h, version, nbytes):
+    """The reason code (REJECT) of one record's header words h [8] float32, visible_schema and byte count; 0: good."""
+    vs = float(version)
+    if not np.isfinite(vs) or vs != V3.VERSION:
+        return REJECT['schema']
+    if not np.isfinite(float(nbytes)):
+        return REJECT['bytes']
+    n = int(nbytes)
+    if n % 4 or n < V3.HEADER * 4 or n > V3.FRAME_BYTES:
+        return REJECT['bytes']
+    w = [float(x) for x in h[:V3.HEADER]]
+    if not all(np.isfinite(x) and x == int(x) for x in w):
+        return REJECT['nonwhole']
+    magic, size, p, e, nn, ss, word, _ = (int(x) for x in w)
+    if magic != V3.MAGIC:
+        return REJECT['magic']
+    if word != V3.VERSION_WORD:
+        return REJECT['version_word']
+    if not (1 <= p <= V3.CAP_BODY and 0 <= e <= V3.CAP_ENTITY and nn >= 0 and ss >= 0):
+        return REJECT['counts']
+    want = V3.frame_floats(p, e, nn, ss)
+    if size != want or want * 4 > V3.FRAME_BYTES or n // 4 != want:
+        return REJECT['size']
+    return REJECT['ok']
+
+
+def reject_code(headers, versions, sizes, p0=None, p_max=None):
+    """(code, record) of check_batch(headers, versions, sizes, p_max, p0=p0) on the wire's arrays (headers [B, >= 8]
+    float32, versions / sizes [B], p0 [B, 2] float32): (0, -1) where it accepts, else REJECT's code of the refusal and
+    the record it names (-1 for p_max). Equal to check_batch on every input of tests/test_v3_check_batch.py and the
+    golden samples."""
+    headers = np.asarray(headers, np.float32)
+    for i in range(len(headers)):
+        c = _reject_row(headers[i], versions[i], sizes[i])
+        if c:
+            return c, i
+    if p0 is not None:
+        p0 = np.asarray(p0, np.float32)
+        bad = np.nonzero(~((p0[:, 0] == _MAIN) & (p0[:, 1] == 1)))[0]
+        if len(bad):
+            return REJECT['p0'], int(bad[0])
+    if p_max is not None and len(headers) and (headers[:, V3.H_P].astype(np.int64) > p_max).any():
+        return REJECT['p_max'], -1
+    return REJECT['ok'], -1
+
+
 def _t_rows(F, base, stride, m, width, count):
     """[B, m, width] rows gathered from frame floats F [B, W] at base + i * stride (i < count; others 0) and the
     validity mask [B, m]."""
@@ -922,10 +978,24 @@ N_MAX_V3, S_MAX_V3 = 64, 32
 STATS = dict(calls=0, records=0, host_s=0.0, trunc_n=0, trunc_s=0, nonfinite=0, **{f'bucket{b}': 0 for b in E_BUCKETS})
 
 
-def rows_counts(rows, stats=True):
+# (A-2, 2026-11-19) the GraphActors' non-finite counts, kept on the device: each graph adds its call's count (the
+# decode's per-record 'nonfinite', the records' rows only) to its actor's counter -- no host scan per call. Read with
+# stats_snapshot() (one read-back per counter, at a progress row).
+DEVICE_NONFINITE = weakref.WeakSet()
+
+
+def stats_snapshot():
+    """STATS with the device counters' non-finite floats added (cumulative, as STATS: callers take differences)."""
+    out = dict(STATS)
+    out['nonfinite'] += sum(int(t.item()) for t in list(DEVICE_NONFINITE))
+    return out
+
+
+def rows_counts(rows, stats=True, scan=True):
     """ROW records (numpy, each with its v3 frame) -> (counts [n, 4], e bucket): check_batch on the records' headers,
-    visible_schema and visible_bytes; with stats the call's host time, bucket, truncations and non-finite frame floats
-    added to STATS."""
+    visible_schema and visible_bytes; with stats the call's host time, bucket, truncations and (scan) non-finite frame
+    floats added to STATS. scan=False: the caller counts them on the device (GraphActor: DEVICE_NONFINITE -- the same
+    floats but for N / S rows past N_MAX_V3 / S_MAX_V3, which the layout cuts)."""
     import time
     t0 = time.perf_counter()
     frames = rows['visible_frame'].view('<f4')
@@ -933,10 +1003,11 @@ def rows_counts(rows, stats=True):
                                 S_MAX_V3, p0=frames[:, list(P0_WORDS)])
     eb = bucket(int(counts[:, 1].max()), E_BUCKETS)
     if stats:
-        words = (np.asarray(rows['visible_bytes'], np.int64) // 4)
-        w = int(words.max())
-        live = np.arange(w)[None, :] < words[:, None]
-        STATS['nonfinite'] += int((~np.isfinite(frames[:, :w]) & live).sum())
+        if scan:
+            words = (np.asarray(rows['visible_bytes'], np.int64) // 4)
+            w = int(words.max())
+            live = np.arange(w)[None, :] < words[:, None]
+            STATS['nonfinite'] += int((~np.isfinite(frames[:, :w]) & live).sum())
         STATS['calls'] += 1
         STATS['records'] += len(rows)
         STATS[f'bucket{eb}'] += 1

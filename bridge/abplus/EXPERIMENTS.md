@@ -131,6 +131,7 @@
 | B60 | 11-10 | learner 的 host 工作搬出 GIL：原生 C 打包（`abp_learn.c`，调用期间释放 GIL）与覆盖整个 update 的流水预取，固定输入基准 + 生产短 profile，4090 | 固定输入基准 13.0–13.2 → 7.9–8.4 s（≤ 9.5 s 门过）；生产 update 19.42 → 16.94 / 17.24 s，×实时 145.3 / 136.1；关键路径等待 0.83 s/update，未达 0.3 s 门；忙线程对照显示 GIL 下的暴露面主要是前向、反向、优化器的 Python 派发；全量门 223 passed |
 | B62 | 11-10 | learner 线程的 GIL 暴露面：合并 C++ actor 树后量基线、扫描切换间隔、Python 派发归因，后续步骤 1–4（精简 checkpoint、阻塞同步、异步 H2D 等）；4090 | 步骤 0：合并树 update 20.33 s、212.7×（cpp 步骤 0 为 196.6×），50 µs 切换间隔 +7% 但只单次；learner 前向调用的 Python 层大头是 checkpoint 钩子。精简 checkpoint 让每 part 调用 14.6k → 10.9k 并默认打开，但全量门 3 次全绿未做；blocking 下 learner 线程 Python CPU 5.98 s/update，未达 ≤ 3.0 s 的门；4090 到期时多项未跑、未验收 |
 | B67 | 11-17/18 | visible-v3 生产端（C 包）：房型实测（契约 V1）、金样本 V2、越界审计、原生编码器、schema 批次 4–5、对齐数据集；合并前四项检查；Codex 五轮审计；dgene | 坐标与数值都有引擎证据；参考与原生编码器逐字节一致（8,923 / 8,923，批次 4 后 1,812 / 1,812）；每决策游戏侧与 v2 原生持平、worker 侧 −38%。主线并入 05f1622：v3 关时 ROW 与 digest 与主线全同，合并树训练冒烟正常，配对速度 1.035（198d0cb 时 1.013；原单次参照线撤回）。后又并入 8fc3ab1（第 2–4 轮修复），冒烟 3 次干净、配对 1.0066；收尾 exit 86 的根因是变量重名（ef702a1 引入、8fc3ab1 修，曾误诊为模式查询断线）；第 5 轮 3 条在加固批次；v3 帧的训练吞吐未量 |
+| B68 | 11-19 | seq1 期间的提速批次（exp/seq-v1）：A-1 新奖励记账向量化、A-2 非有限值在图内计数、A-3 v3 rollout 紧凑存储、A-4 只拷到帧尾；learner 的 GPU 时间分解；P 包的纯函数与金样本；dgene lane b | 进行中。A-3：8 个 worker 下容器内存 15.4–17.8 → 9.3–10.1 GB。A-1 / A-4 对 p_book 无可测效果（更正此前估计）：book 是每次调用约 0.9 ms 的固定开销。learner：GPU 时间约 85% 在帧编码器（更正此前“剩下 5 s 在时间侧”），时间侧加头约 7%；帧编码器 compile −21%，打包交 Codex |
 | cpp 线 3090 分卡基线 | 11-11 | cpp 线在 8x3090 上的分卡形态（actor 卡 + learner 卡）基线：24 轮计时 + nsys python-gil，树 c-02b2169 | 225.4×（u10–u23），collect 17.94 s 已短于 update 18.75 s，周期由 learner 决定；CF u15 100 / 0 / 0 / 0。driver 每 collect 循环 18.41 s，lane 作业 6.81、主步等 GPU 6.91；主线程 GIL 持有 0.20 s/周期、顶层进入约 36 次/周期，两道门都达标 |
 | cpp 线 3090 分卡 M1 | 11-11 | 分卡下 M1（lane 合并）计时，MERGE=1 对同期 MERGE=0；8x3090 | 未完成，被"背靠背四次"一条取代：MERGE=1 为 241.3×，driver 上 lane 作业 6.81 → 3.52 s；同期 MERGE=0 臂在 u11 因 GPU 5 掉卡（Xid 79）中止，吞吐对比不成立。TSAN 在这台机器上部分段错误，不算通过 |
 | cpp 线 M1 背靠背四次 | 11-11 | 8x3090 重启后 M1 按 MERGE 0、1、0、1 背靠背四次 24 轮计时（GPU 1 actor + GPU 2 learner） | lane 作业时间约 −37%（6.3–7.0 → 4.0–4.5 s），lane 调用约减半，CF 完成数不受影响；吞吐两臂均值 236.1× 对 244.7×（+3.6%），但同臂两次之差更大，不成立。省下的 1.9 s 里约 1.1 s 被更重的合并主步吃回。M1 由协调方决定默认开（3 遍全量门 282 passed 全绿） |
@@ -253,6 +254,7 @@
 | C113 | 11-17 | gpu57 掉卡后迁到 dgene（8x3090，只用 GPU 1–4，GPU 5 不用）续做 C112 的 L2 训练臂：同机对照、EGO=head + ENTITY_SCALE_FIX、只 head、只 FIX（各 60 游戏小时），head + FIX 加长到 182 小时；真实任务 400 小时 rt-hf（head + FIX）、rt-h2f（head2 + FIX）；dgene | 对照 0.431，与 gpu57 相同。head 0.604、head + FIX 0.592：block 一套第一次随 x 改变左右，u31 起离开平台，但 60 小时内没到 0.62，判不过。FIX 单独 0.433，在 L2 上没有作用（L2 与实体无关，预期如此）。head + FIX 加长到 182 小时后 0.817，越过 L2 的 0.62 线（判据原定 60 小时，按原判据各臂都不过）；同 seed 开关全关的 l2long 到 u90 仍是 0.446。rt-hf：u201–330 清房 ≥1 0.253（阈值 0.35），不过；单种子，略高于 block 以前的 400 小时臂（0.167–0.231），不能说有改善，与旧模型（0.483–0.506）的差距没有缩小；评测离开起始房间 0.672（block 以前 0.06–0.23，旧模型 1.000），清房 0.219（旧模型 1.05–1.30）。rt-h2f（head2：头部改读空间 Transformer 之后的 body-0 token）：u201–330 0.333，不过；评测清房 0.398、离开起始房间 0.766；单种子 |
 | C114 | 11-17/18 | 旧帧编码器（C110 Q＠maa 的树和命令行）上只改时间侧，各 400 小时：T1 去掉房间 token 和反馈 token，T2 再加深到 8 层，T3 再把窗口加长到 1024；dgene | 三臂都学会：u201–330 清房 ≥1 为 0.592 / 0.578 / 0.526（Q＠maa 0.493，判据 0.35），评测清房 1.68 / 1.67 / 1.77（Q＠maa 1.05），离开起始房间都是 1.000；单种子。加深和加长窗口在 400 小时内看不出收益；W 256 → 1024 时 actor 每槽 cache 2.01 → 8.01 MiB，actor 卡显存 1.44 → 3.27 GB，x_real 270 → 250。补充：同机 T0（Q＠maa 原样）0.495，T1 换 seed 1001（T1b）0.521，评测清房 0.859 / 1.469（T1 1.680）；T1 两个种子差 0.071，大于 T1b 与 T0 的差 0.026，只支持"不比原模型差" |
 | C115 | 11-18/19 | 第一条 v3 臂 v3t1：T1 的帧侧整体换成 v3 帧编码器（ROW 观测、空间编码器和 item tokens 都去掉，物品由帧里的 N / S token 进），时间侧、头、损失、门控同 T1；`--micro 1024`，schema 批次 5，400 小时；dgene | 学会：u201–330 清房 ≥1 0.507（T1 0.592、T1b 0.521、T0 0.495，判据 0.35），评测清房 1.148（T1 1.680、T1b 1.469、T0 0.859），离开起始房间 1.000；单种子，结构对照不是等参数量对照（8.71M 对 7.02M），只支持"学得会、不比 T0 差"，评测差距大于训练读数差距。速度：全程 x_real 156、冒烟 180（T1 约 300）；三项提速后（micro 2048、只搬帧前缀、解码改写）配对里量到 250.7。加固批次合并门槛：配对 T/R 1.0154 通过。补充 v3t1b（seed 1001，micro 2048，带三项提速，批次 5）：u201–330 0.498，评测清房 1.023，x_real 235；v3 两个种子 0.507 / 0.498，都低于 T1 0.592、接近 T1b 0.521 |
+| C116 | 11-19 起 | 长训练 seq1：v3 一套（树 m20b0fce：批次 6、输入版本 2、trigger-once、新奖励项 item / trinket / depth / nohit，三个角色），窗口 256，学习率固定 1e-4，5000 游戏小时；前约 560 小时以内存探测的名义跑，停下检查后原地续跑；dgene lane s | 进行中。开跑前检查通过：开局物品没有被算成奖励，nohit 开关到了 worker，pending 1.0000，内存平台 27g。D1 0.0025 没过原来的 0.001 线；三级精度 0.0025 → 0.00025 → 3.4e-7（全程 fp32 只有 5703 条），无偏，T1 训练后同样是 0.0024，判为数值精度；D1 判据改为无偏 + 大偏差比例 + 全程 fp32 |
 
 ## A. 桥接与环境
 
@@ -14341,6 +14343,134 @@ C114 的 T1（旧帧编码器 + 纯窗口时间侧）在 400 游戏小时内学�
 4. 已知偏差：v3t1b 用的是批次 5，长训练（seq1）是批次 6 加输入版本 2 加 trigger-once。批次 6 在一条完整臂上的验证，由 seq1 本身和它开跑前的内存探测 / 冒烟承担。
 
 - 原始文件：dgene bm1/c114/v3t1b/、c114/STATUS_v3t1b、c114/STATUS_v3armb、c114/win100_v3t1b.txt、c114/eval/v3t1b-c128-last/。
+
+### C116 长训练 seq1：v3 一套 5000 游戏小时，dgene（2026-11-19 起；进行中，本段写开跑前的内存探测、检查与 D1 判别）
+
+**实验目的**
+
+用户 11-19 定：窗口 256，跑 5000 游戏小时，学习率固定 1e-4。这条臂是 v3 一套（C115 的 v3 帧编码器 + T1 的纯窗口时间侧）第一次长训练，同时打开四个新奖励项（item / trinket / depth / nohit）和三个角色。
+
+**实验方法**
+
+- **树**：m20b0fce = exp/seq-v1 20b0fce。包括加固批次 6（schema VERSION 2026111803）、输入版本 2（INPUT_REV 2：E age / S charge 放宽量程并取对数，L 初始化 ×5，G 初始化标准差 0.15）、v3 默认 trigger-once、check_batch 向量化，以及四个新奖励项（按 Codex 第 13 轮的规则）。全量门在 m917bae0 上 rc 0（709 passed, 3 skipped, 1 xfailed）；917bae0 相对 20b0fce 只多了 EXPERIMENTS.md。home tools 是批次 6（libabp_turbo b4e0f658aa30）。
+- **命令行**：C115 v3t1 那一行（T1 的 train_args 加 `--frame v3 --item-tokens 0 --item-shared 0 --item-slots 16`），再加：
+  - `--micro 2048`、`--characters 0,1,2`
+  - `--run-seconds 3600 --cap-truncate 1`、`--stall-progress items --floor-stall-seconds 120 --stall-truncate 1`
+  - `--reward heal=0.5,resource=0.05,item=1,trinket=0.3,depth=0.25,nohit=0.5`、`--pickup-force 0`
+  - `--teach-buffer 8000 --teacher-v2-buffer 4000`、`--lr 1e-4 --lr-final 1e-4 --lr-schedule linear --lr-warmup 0`
+  - 基线 xnew2.sh：`--actor-bf16 1 --amp bf16 --seed 1000`，learner cuda:1，`--checkpoint-every 100`。
+  - 环境：`ISAAC_RL_VISIBLE_V3=2`、`ISAAC_RL_LOG_GRAD_NORM=1`；train_tok 自己设 `ISAAC_RL_TRIGGER_ONCE=1`（v3 默认）和 `ISAAC_RL_NOHIT=1`（nohit ≠ 0 时）。
+- **位置**：lane s（GPU 1 actor、GPU 2 learner，CPU 0-11,24-35，node0）。运行目录 bm1/c114/smoke/v3mem（c114/seq1 是指向它的软链）。
+- **前约 560 游戏小时是以"内存探测"的名义跑的**：与 seq1 同一棵树、同一套设置、seed 1000、从零开始，目的是在定容器上限之前看清内存曲线。05:36:31 开跑，容器上限 34g，ctr_mem_gb ≥ 30 或满 150 分钟写 STOP。08:06 到 150 分钟写 STOP，08:08:07 在 u460 停下（rc 130，558.0 游戏小时）。之后做开跑前的检查（下一段），08:29:18 从这次运行的 last.pt（u460）原地续跑（attempt 2），目标是总计 5000 游戏小时（含探测）。所以里程碑和游戏小时都从探测的起点算，seq1 与探测是同一次运行。
+  - **更正**：STATUS_mem 的起始行写成了"lane b"，是标签写错了。guard.log 记的是 GPU 1,2、CPU 0-11,24-35，即 lane s。
+- **续跑设置**：容器上限 40g；ctr_mem_gb ≥ 34 或主机 MemAvailable < 20 GB 时写 STOP（探测的平台是 26.7–27.1）。检查点每 100 次更新一个，保留 3 个，每 400 次一个里程碑，轮换掉的删除；不做在线评测；每 500 游戏小时在 c114/STATUS_seq1 写一行窗口读数。
+  - c108_guard.sh 不接受已有 -s0 的目录，所以续跑用 a1seq1g.sh：共享锁、guard.pre、train_guard.sh 都与 c108_guard.sh 相同，但要求目录里已有检查点，guard.out 改为追加。启动脚本 a1seq1c.sh。
+- **训练结束后**：各里程碑检查点各做 128 种子评测画曲线；最终检查点按三个角色各做 512 种子评测；home tools 保持批次 6。
+
+**开跑前的检查**（探测停下后，从探测的 last.pt 起）
+
+- **探测的读数**：460 次更新、558.0 游戏小时；x_real 中位 222。ctr_mem_gb 从 20.9 涨到 27.1，后段在 26.7–27.1 走平。非有限值 0；截断 0 / 0；errors 最大 0。主机端 v3 每次调用 0.270 ms，占 collect_s 8.9%；infer_ms 6.69；actor 卡显存 1.01 GB。启动行里有"frame v3: ISAAC_RL_TRIGGER_ONCE=1"。
+- **局数**：角色 0 / 1 / 2 分别是 4997 / 4273 / 5512 局。
+- **各奖励项的每局均值**（探测全程各行每局均值的平均）：
+  - damage 0.741，hurt −1.307，time −2.084，death −0.581，room 0.461，explore 0.253，boss 0.007，exit 0.010，heal 0.127，resource 0.020
+  - item 0.467（n_item 0.467），trinket 0.004（n_trinket 0.013），depth 0.000（过层太少），nohit 0.088（n_nohit 0.176）
+  - 量级正常，没有被刷的迹象。
+- **pending[t+1] == action[t]**：五个头都是 1.0000（65,505 条），通过。
+- **首条记录**（D1 的 --dump-rollouts，firstrec.py）：三个角色共 50 个开局（14 / 25 / 11）。首条记录都不空（开局的物品已经在第一条里），第二条记录都没有出现新 id，所以开局物品没有被算成奖励。
+- **nohit 开关到了 worker**：探测运行中查容器内 /proc environ，21 个进程有 ISAAC_RL_NOHIT=1，21 个有 ISAAC_RL_TRIGGER_ONCE=1，22 个有 ISAAC_RL_VISIBLE_V3=2；n_nohit > 0，也说明 worker 发出了 EV_NOHIT。探测结束时自动做的 environ 检查因为 grep 没加 -a 失败了，是检查脚本的问题，不是开关的问题。续跑后查到 172 / 172 / 179 个进程分别带这三个变量。
+- **D1：没过原来的线，随后做判别**
+  - 从 u460 起 5 行，max mean |dlogp| 0.002501，原判据 < 0.001，判 bad，所以没有续跑，报给了协调方。
+  - 之前所有 D1（C114 的 T0–T3、C115 的 v3as 等，0.0002–0.00035）用的都是冒烟 u7 的检查点。这是第一次在训练过的检查点上做 D1。
+  - 同一棵树、同一套设置，bf16 下随训练单调变大：u100 0.00103（p99 0.0044），u400 0.00200（p99 0.0093），u460 0.00250（p99 0.0126）。
+  - 三级精度（都从 u460 起）：
+
+| | max mean \|dlogp\| | 最大 \|均值\| | p99 | 最大 | \|dlogp\| > 0.1 的比例 | 触到裁剪 0.2 |
+|---|---|---|---|---|---|---|
+| bf16（原设置：actor bf16、learner autocast bf16、TF32、K / V bf16） | 0.002501 | 3.9e-5 | 0.0126 | 0.102 | ≤ 3.0e-5 | 0 |
+| 部分 fp32（`--actor-bf16 0 --amp off`；TF32 仍开，存下来的 K / V 仍是 bf16） | 0.000248 | 3.4e-6 | 0.0012 | 0.0102 | 0 | 0 |
+| 全程 fp32（再加 `--temporal-kv fp32` 和 `NVIDIA_TF32_OVERRIDE=0`） | 3.37e-7 | 1.5e-9 | 1.4e-6 | 1.1e-5 | 0 | 0 |
+
+  - 全程 fp32 那一级只有 1 行、5,703 条记录：fp32 的 learner 在 micro 2048 下 OOM（GPU 1 用满 23.35 GB），只记下了一次更新的一部分（bf16 每行约 9.8 万条），约为一次更新的 6%。协调方决定不为补齐这部分停 seq1，也不临时超过 64g。
+  - train_tok 的 `--tf32` 默认开、命令行关不掉，所以用环境变量 NVIDIA_TF32_OVERRIDE=0 关掉 cuBLAS / cuDNN 的 TF32，没有改代码。
+  - **标定**：C114 T1 训练后的 u330 检查点（它自己的树 maa1e98a-nvt-d1、它自己的环境、bf16）：5 行，0.00242，最大 |均值| 2.0e-5，p99 0.0113，最大 0.0438，> 0.1 的比例 0。第一次在 lane b 的 24g 下被杀，后来在 lane s 的 40g 下重跑。
+  - C115 v3t1 训练后的 u330 没有测：它的树 m7ea9bd9 是批次 5，遇到批次 6 的 home tools 时报 VisibleV3Fatal（帧版本 111803 对 111802）。
+  - **判定**（按协调方事先定的规则）：偏差随精度逐级下降（0.0025 → 0.00025 → 3.4e-7），无偏，没有 > 0.1 的记录，判为数值精度。不是采样和学习两条路径不一致。旧结构 T1 训练后同样是 0.0024。08:29 续跑。
+  - **D1 判据从此改为**：均值的绝对值 < 1e-4（无偏），|dlogp| > 0.1 的比例 < 1e-4；需要判断"两条路径是否一致"时，用全程 fp32（`--actor-bf16 0 --amp off --temporal-kv fp32`、NVIDIA_TF32_OVERRIDE=0，micro 取装得下的值），看是否 < 1e-4。原来的"均值绝对偏差 < 1e-3"只对冒烟 u7 的检查点成立。
+
+**实验结果**（训练中；1000 / 2500 / 5000 游戏小时各补一次读数，结束后补评测）
+
+- 续跑：11-19 08:29:18 起，attempt 2，从 last.pt（u460）。08:32 到 u468、567.7 游戏小时，x_real 229，errors 0。
+
+- 原始文件：dgene bm1/c114/smoke/v3mem/（= c114/seq1）、c114/STATUS_mem、c114/STATUS_seq1、c114/memprobe.csv、c114/STATUS_d1x、c114/STATUS_d1y、c114/d1/{v3mem,v3m100,v3m400,v3m32,v3m32s,t1f2}/。
+
+### B68 seq1 期间的提速批次：A-1–A-4、learner 的分解、P 包准备（2026-11-19；进行中，打包与 compile 未完成）
+
+**目的**
+
+seq1 的速度约为 T1 的四分之三：x_real 约 216，T1 约 289。协调方要两边一起提速：actor 侧，以及 learner 侧（L-1）。所有改动都在 exp/seq-v1 上，seq1 本身不换树。测量都在 lane b（GPU 3/4，≤ 24g，与 seq1 的 40g 合计 64g）或本机 CPU 上做，不占 lane s。
+
+**seq1 的时间分解（每次更新的中位数；seq1 u420–470，v3t1b、T1 取 u200–330）**
+
+| 秒 / 次更新 | seq1 | v3t1b | T1 |
+|---|---|---|---|
+| collect_s / update_s | 19.5 / 20.0 | 19.0 / 18.2 | 15.1 / 14.5 |
+| p_book / p_act / p_tick / p_store | 5.6 / 5.5 / 4.9 / 2.3 | 3.1 / 6.9 / 5.4 / 2.3 | 3.0 / 3.9 / 5.0 / 2.1 |
+| u_ppo | 15.0 | 13.2 | 5.85 |
+
+- 两边都约 20 s，learner 略慢。所以只给 actor 提速，x_real 不会涨。
+
+**actor 侧的改动与实测**
+
+- **A-1**（7b29499）：新奖励项的记账向量化，只有持有物变了的记录才进 Python 循环，并去掉了一次 rows[sel] 的整行拷贝。奖励与原来的逐条循环逐位相同（6 个随机记录流）。
+- **A-2**（4c3ecfe）：非有限值改在 actor 图里计数，不再每次调用都在主机上扫一遍帧。
+- **A-3**（4229d8f）：v3 的 rollout 改存 ROWC + FrameArena（B45 的格式）。learner 按 ROW 布局重建字节，与 ROW rollout 逐位对照（字段字节和每帧）；dump 仍写 ROW。
+- **A-4**（2ffd8f8）：主循环取记录时只拷到帧尾（tok_obs.take_prefix，拷进复用的环），GraphActor 非 fold 路径的 stage 也只拷到本次调用里最长的帧。
+- **同口径冒烟**：seq1 的 u460 续跑，8 个 worker，lr 0，各 3–4 个更新，lane b。
+
+| 树 | p_book（s） | p_store（s） | 容器内存（GB） |
+|---|---|---|---|
+| m20b0fce（seq1 的树） | 6.3–7.5 | 2.7–3.9 | 15.4–17.8 |
+| m4229d8f（A-1、A-3） | 6.5–7.6 | 2.5–3.2 | 9.3–10.1 |
+| m2ffd8f8（A-1–A-4） | 5.9–7.4 | 2.4–3.2 | 9.3–10.0 |
+
+  errors 0，nonfinite 0。GPU 测试：m4229d8f 187 passed，m2ffd8f8 30 passed。
+- **更正**：之前估计 A-1 能让 book 5.6 → 3.1 s，以及“A-4 是 book 那 5 GB 拷贝的正解”，都不成立。A-1 / A-4 对 p_book 没有可测的效果。
+  - book 的开销是按调用算的：这个配置每次更新约 7500 次调用、每次 3.8 行，每次约 0.9 ms。
+  - 本机复现：arrive 每次约 380 us，几乎全是函数体里几十个小 numpy 运算的固定开销；整行拷贝只占几十 us。
+  - 要降 book，只能每次调用多带几行，或者把 book / store 挪出应答路径（cpp-actor 的 store 延后实验、P 包）。
+  - A-3 的内存效果成立：8 个 worker 下每份 rollout 约省 3 GB。A-4 保留：结果不变，拷贝更少，与 P 包 C++ 的拷入规则一致。
+- **cpp-actor 第 0 期的结论**（见 P-driver-design.md）：actor 每次调用的 GPU 时间约 2.6 ms，与行数基本无关。worker 加倍后每次调用的行数近乎翻倍，但每决策的 collect 一直在 0.47–0.52 ms，瓶颈是 Python 主循环每次调用的工作。
+
+**learner 侧（L-1）的分解**
+
+- **帧编码器各部分**（tools/v3_modprof.py，seq1 u460 的记录，3090，bf16，micro 2048）：
+  - 帧编码器前向+反向 98–122 ms，其中 4 层 Transformer 79–100 ms（约 80%）。
+  - 每条记录补齐后 70–86 个 token，真实的 43–45 个。
+  - torch.compile 后前向+反向 123.5 → 97.1 ms（−21%）。default 和 reduce-overhead 两种模式结果一样，首次编译分别 25 s 和 12.5 s。
+- **整个 update 的 GPU kernel 时间**（树 m21817ef，learner 的 v3 前向打 profiler 标记；rollout 8192，update 462；按前向标记和 autograd 序号把反向归到对应的前向段）。learner 卡共 1.60 s、4.5 万个 kernel：
+
+| 部分 | 时间 | 占比 |
+|---|---|---|
+| 帧编码器（前向 404 + 反向 706 ms + 未归属的 GEMM 权重梯度约 237 ms） | 约 1.35 s | 约 85% |
+| 懒解码 | 92 ms | 6% |
+| 头和时间侧（前向 26 + 反向 87 ms） | 113 ms | 7% |
+| 其余（时间侧输入、损失、aux、priv、clip / 优化器） | — | < 3% |
+
+  不开 profiler 时同口径的 u_ppo 是每 1/4 次更新 1.7 s，与 kernel 时间相当：learner 在算力上是满的，不是卡在 kernel 发射上。
+- **更正**：之前说“u_ppo 里剩下约 5 s 是时间侧、头和损失”不对，实际约 85% 在帧编码器。原因是 v3_modprof 只量了 PPO 那 48 个 micro，漏了重算 / 教师的几遍帧编码器。
+- **计划**：
+  - 打包前向（只算真实 token）交给 Codex，规格见共享笔记 codex-task-v3-packed-encoder.md；
+  - compile 按 E / N / S 桶组合接进 learner；
+  - 两者合起来测，预期 u_ppo 约 −40%。时间侧和头不动。
+
+**P 包的准备**（与 cpp-actor 对齐，见 P-interface-v2.md、P-driver-design.md）
+
+- 0191eb1：
+  - v3_input.reject_code / REJECT：把 check_batch 的结果写成 (code, record)。在 test_v3_check_batch 的全部用例和 1500 批随机缺陷上与 check_batch 一致。
+  - tok_policy.FoldLayout / fold_views / fold_pack / fold_defined：GraphActor fold 打包改成纯函数，与原打包逐字节相同。
+  - tools/p_golden.py：94 个金样本，带 --verify。
+
+- 原始文件：dgene bm1/c114/lprof/、c114/l1/、c114/l2/、c114/l3/（prof/ops.txt、trace.json）、c114/STATUS_l1、STATUS_l2、STATUS_l3；共享笔记 seq1-speed-next-and-P-prep.md。
 
 ### B67 visible-v3 生产端（C 包）：房型实测、坐标契约、金样本、越界审计、原生编码器（2026-11-17—18，验收；主线并入 05f1622，后并入 8fc3ab1）
 

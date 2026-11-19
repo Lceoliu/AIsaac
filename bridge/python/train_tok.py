@@ -253,6 +253,7 @@ from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
 from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
 from isaac_bridge.learn_segments import SEG   # BM1: learner segment timing (ISAAC_BLOCK_TIMING=1 only)
+from isaac_bridge.tok_obs import take_prefix   # noqa: E402  (A-4)
 from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
@@ -755,7 +756,7 @@ class Rollout:
     stored (store_temporal); the actor writes them on the device (GraphActor tdest / store's index_copy_)."""
 
     def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False, temporal=None, alloc=None, close=False,
-                 priv=None, block_steps=0):
+                 priv=None, block_steps=0, compact=False):
         # B38 step 2: alloc(shape, dtype) -> a zeroed array for every host array (SharedArrays: shared memory the
         # learner process maps); None: numpy's, as before
         zeros = np.zeros if alloc is None else alloc
@@ -797,9 +798,11 @@ class Rollout:
         self.h = zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
         # B45: block-memory rollouts store compact records (ROWC) and their visible frames in a byte arena (~11 KB each
         # instead of 128 KiB); others (and B38's shared-memory learner process) keep ROW
-        compact = bool(block_steps) and alloc is None
+        # (A-3, 2026-11-19: and v3-frame rollouts, compact=True -- the learner's rows_to_device rebuilds their bytes
+        #  from the arena; 5 GB of mostly empty frame budget per 32,768-decision rollout before)
+        compact = (bool(block_steps) or bool(compact)) and alloc is None
         self.rows = zeros((workers, capacity), ROWC if compact else ROW)
-        self.frames = FrameArena(workers * capacity * 12288) if compact else None
+        self.frames = FrameArena(workers * capacity * 16384) if compact else None
         self.pending = zeros((workers, capacity, n_heads), np.int64)
         self.actions = zeros((workers, capacity, n_heads), np.int64)
         self.logp = zeros((workers, capacity), np.float32)
@@ -1063,25 +1066,37 @@ class Episodes:
         self.seen_t = [set() for _ in range(workers)]
         self.stage_prev = np.zeros(workers, np.int64)
         self.stage_max = np.zeros(workers, np.int64)
-        self.held_prev = [None] * workers   # (active, trinket 0, trinket 1, collectibles' count) of the record before
+        # per worker (active, trinket 0, trinket 1, collectibles' count) of the record before, and whether there is one
+        self.held_prev = np.zeros((workers, 4), np.int64)
+        self.held_ok = np.zeros(workers, bool)
 
     @staticmethod
-    def held(r):
-        """(active, trinket 0, trinket 1, collectibles' count: ROW pinv[6] x 16, distinct ids, at most 32)."""
-        return (int(r['pitem'][0]), int(r['pitem'][1]), int(r['pitem'][2]), int(round(float(r['pinv'][6]) * 16)))
+    def held(pitem, pinv):
+        """[n, 4] int64 per record (ROW pitem, pinv): active, trinket 0, trinket 1, collectibles' count (pinv[6] x 16,
+        distinct ids, at most 32; rounded half to even, as Python's round)."""
+        pi = pitem.astype(np.int64)
+        return np.stack([pi[:, 0], pi[:, 1], pi[:, 2], np.rint(pinv[:, 6].astype(np.float64) * 16).astype(np.int64)], 1)
 
-    def new_terms(self, rows, sel, w, ev, hu, d):
-        """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w."""
+    def new_terms(self, rows, sel, w, ev, hu, d, held_all=None):
+        """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w.
+        (A-1, 2026-11-19: vectorized; only records whose holdings changed -- the active slot or a trinket slot to
+        another nonzero id, the collectibles' count up -- go through the per-record id sets. The rewards are the
+        per-record loop's bit for bit: tests/test_reward_terms.py's random streams against that loop.)"""
         rw = self.rw
         out = np.zeros((len(w), 4))
-        r_ = rows[sel]
-        stage = r_['stage'].astype(np.int64)
-        for j in range(len(w)):
-            i = int(w[j])
-            r = r_[j]
-            if (rw.get('item') or rw.get('trinket')) and self.held_prev[i] is not None:
-                a0, t0, t1, n0 = self.held_prev[i]
-                a, ta, tb, n = self.held(r)
+        at = np.flatnonzero(sel)   # (fields only: a whole ROW record is ~150 KB with its visible frame)
+        stage = rows['stage'][at].astype(np.int64)
+        if rw.get('item') or rw.get('trinket'):
+            # (A-5: held_all, the call's holdings computed once by arrive)
+            cur = held_all[at] if held_all is not None else self.held(rows['pitem'][at], rows['pinv'][at])
+            prev = self.held_prev[w]
+            chg = self.held_ok[w] & (((cur[:, 0] > 0) & (cur[:, 0] != prev[:, 0])) | (cur[:, 3] > prev[:, 3])
+                                     | ((cur[:, 1] > 0) & (cur[:, 1] != prev[:, 1]))
+                                     | ((cur[:, 2] > 0) & (cur[:, 2] != prev[:, 2])))
+            for j in np.flatnonzero(chg):
+                i = int(w[j])
+                a0, t0, t1, n0 = (int(x) for x in prev[j])
+                a, ta, tb, n = (int(x) for x in cur[j])
                 seen = self.seen_c[i]
                 got_c = 0
                 if a > 0 and a != a0 and a not in seen:   # the active slot: a new id
@@ -1089,8 +1104,7 @@ class Episodes:
                     got_c += 1
                 rise = n - n0 - (1 if got_c else 0)   # (the active, when counted among the collectibles)
                 if rise > 0:   # passives: at most the rise, ids of the newest 16 never rewarded
-                    for v, c in r['inv']:
-                        v = int(v)
+                    for v, c in rows['inv'][at[j]].tolist():   # (Python ints: no numpy scalars per entry)
                         if rise <= 0:
                             break
                         if v > 0 and c > 0 and v != a and v not in seen:
@@ -1106,15 +1120,15 @@ class Episodes:
                 out[j, 1] = rw.get('trinket', 0.0) * got_t
                 self.counts[i, 0] += got_c
                 self.counts[i, 1] += got_t
-            if rw.get('depth'):
-                if self.run and (ev[j] & EV_EXIT):
-                    if stage[j] > self.stage_max[i]:   # (a floor deeper than any reached: the floor left scales it)
-                        out[j, 2] += rw['exit'] * rw['depth'] * max(int(self.stage_prev[i]) - 1, 0)
-                if ev[j] & 4:
-                    out[j, 2] += rw['boss'] * rw['depth'] * max(int(stage[j]) - 1, 0)
-            if rw.get('nohit') and (ev[j] & EV_NOHIT) and d[j] != 2:
-                out[j, 3] = rw['nohit']
-                self.counts[i, 2] += 1
+        if rw.get('depth') and (ev & (EV_EXIT | 4)).any():   # (A-5: nothing to add without an exit or a boss)
+            if self.run:   # (the exit: to a floor deeper than any reached; the floor left scales it)
+                ex = ((ev & EV_EXIT) != 0) & (stage > self.stage_max[w])
+                out[:, 2] += np.where(ex, rw['exit'] * rw['depth'] * np.maximum(self.stage_prev[w] - 1, 0), 0.0)
+            out[:, 2] += np.where((ev & 4) != 0, rw['boss'] * rw['depth'] * np.maximum(stage - 1, 0), 0.0)
+        if rw.get('nohit') and (ev & EV_NOHIT).any():   # (A-5)
+            nh = ((ev & EV_NOHIT) != 0) & (d != 2)
+            out[nh, 3] = rw['nohit']
+            self.counts[w[nh], 2] += 1
         return out
 
     def start_terms(self, rows, idx, first):
@@ -1204,6 +1218,10 @@ class Episodes:
             if (~trunc).any():
                 self.close_broken(wb[~trunc])
         has = k >= 0
+        # (A-5, 2026-11-19: what the call needs twice, computed once: the gains' base, the holdings)
+        gains_now = self.cur_gains(rows) if self.gains is not None else None
+        held_all = (self.held(rows['pitem'], rows['pinv'])
+                    if self.new_on and (rw.get('item') or rw.get('trinket')) else None)
         cap = is_trunc(rows)   # (--cap-truncate / --stall-truncate: those ends, truncations)
         capped = is_cap(rows)
         if has.any():   # the reward of the decision before
@@ -1224,7 +1242,7 @@ class Episodes:
                 self.rooms[w] += (ev & 1) > 0
                 self.boss[w] += (ev & 4) > 0
                 if self.gains is not None:   # 2026-10-08: health units and resources gained since the record before
-                    dl = self.cur_gains(rows)[has] - self.gains[w]
+                    dl = gains_now[has] - self.gains[w]
                     reward = reward + rw['heal'] * np.maximum(dl[:, 0], 0) + rw['resource'] * np.maximum(dl[:, 1], 0)
                     self.healed[w] += np.maximum(dl[:, 0], 0)
                     self.gathered[w] += np.maximum(dl[:, 1], 0)
@@ -1245,7 +1263,7 @@ class Episodes:
                     tm[w, _RT['heal']] += rw['heal'] * np.maximum(dl[:, 0], 0)
                     tm[w, _RT['resource']] += rw['resource'] * np.maximum(dl[:, 1], 0)
                 if self.new_on:   # the new terms (each 0 by default: then nothing here)
-                    nt_ = self.new_terms(rows, has, w, ev, hu, d)
+                    nt_ = self.new_terms(rows, has, w, ev, hu, d, held_all)
                     reward = reward + nt_.sum(1)
                     tm[w, _RT['item']:_RT['nohit'] + 1] += nt_
             if self.run or self.items:
@@ -1270,14 +1288,14 @@ class Episodes:
             self.damage[w] += dmg
         self.note_first(rows, idx, first)
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
-            self.gains[idx] = self.cur_gains(rows)
+            self.gains[idx] = gains_now
         if self.new_on:   # (2026-11-19) an episode's first record: its held ids; every record: its stage, holdings
             if first.any():
                 self.start_terms(rows, idx, first)
             self.stage_prev[idx] = rows['stage']
             self.stage_max[idx] = np.maximum(self.stage_max[idx], rows['stage'])
-            for j in range(len(idx)):
-                self.held_prev[int(idx[j])] = self.held(rows[j])
+            self.held_prev[idx] = held_all if held_all is not None else self.held(rows['pitem'], rows['pinv'])
+            self.held_ok[idx] = True
         if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
             st0 = first
             if st0.any():
@@ -1498,6 +1516,22 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
     roll.pending[a_idx, kk], roll.actions[a_idx, kk] = under_way, actions
     roll.logp[a_idx, kk], roll.value[a_idx, kk], roll.version[a_idx, kk] = logp, value, version
     roll.length[a_idx], roll.open[a_idx] = kk + 1, kk
+
+
+def expand_rows(roll, m):
+    """(A-3) roll.rows[:, :m] as ROW records (the dumps' format, the tools read it): compact ROWC records with their
+    frames from roll.frames (the frame field's tail past each frame zero); ROW records as they are."""
+    rows = roll.rows[:, :m]
+    if rows.dtype == ROW:
+        return rows
+    out = np.zeros(rows.shape, ROW)
+    fa = ROW.fields['visible_frame'][1]
+    o_ = out.reshape(-1).view(np.uint8).reshape(-1, ROW.itemsize)
+    o_[:, :fa] = np.ascontiguousarray(rows).reshape(-1).view(np.uint8).reshape(-1, ROWC.itemsize)[:, :fa]
+    buf = roll.frames.buf
+    for i, (o, k) in enumerate(zip(rows['visible_off'].reshape(-1), rows['visible_bytes'].reshape(-1))):
+        o_[i, fa:fa + int(k)] = buf[int(o):int(o) + int(k)]
+    return out
 
 
 def store_temporal(roll, a_idx, kk, rows, t):
@@ -3188,7 +3222,8 @@ def main(argv=None, child=None, actor=None):
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
     if child is None:
-        r_kw = dict(close=aux_on or log_on, priv=PRIV_DTYPE if priv_on else None,block_steps=128 if block_on else 0)
+        r_kw = dict(close=aux_on or log_on, priv=PRIV_DTYPE if priv_on else None,block_steps=128 if block_on else 0,
+                    compact=args.frame == 'v3' and os.environ.get('ISAAC_RL_V3_COMPACT', '1') == '1')
         roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw), \
             Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw)
         if n_act > 1 and actor is None:   # (the first actor: the shared arrays of all workers, its rows of them)
@@ -3319,6 +3354,12 @@ def main(argv=None, child=None, actor=None):
         lanes = BlockLaneService(sampler,model,device,wait=args.cf_lane_wait,quiet=args.cf_lane_quiet,
                                  distill_steps=args.cf_distill_steps,main_actor=block_actor,stat=lane_stat)
     inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
+    # (A-4, 2026-11-19, v3 frames: each call's records taken up to their frame's end only (take_prefix) into a ring of
+    #  reused ROW buffers -- a call's records stay referenced while it is in flight (its own, the snapshots'), so the
+    #  ring is longer than the calls in flight can be; ISAAC_RL_ROW_PREFIX=0: sampler.rows[slots] as before)
+    row_ring = ([np.zeros(n, ROW) for _ in range(3 * max(1, args.actor_slots) + 3)]
+                if args.frame == 'v3' and child is None and os.environ.get('ISAAC_RL_ROW_PREFIX', '1') == '1' else None)
+    row_at = [0]
     # B54 experiment (ISAAC_BLOCK_STREAM_PRIO=learner): the learner's stream high priority, the actor's low (with the
     # C++ actor the collect is shorter than the update; the actor has slack to absorb the learner's kernels first)
     prio_learner = os.environ.get('ISAAC_BLOCK_STREAM_PRIO', 'actor') == 'learner'
@@ -3491,6 +3532,8 @@ def main(argv=None, child=None, actor=None):
         os.replace(tmp_, path)   # (atomic: a kill during the write leaves the previous file whole, never a torn one)
 
     b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
+    import isaac_bridge.tok_policy as tp_marks_
+    tp_marks_.PROF_MARKS = b38_marks   # (L-1: the v3 forward's parts marked too)
     # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
     # --learner-compile, the same module and parameters)
     lm_call = learner_model
@@ -3599,7 +3642,7 @@ def main(argv=None, child=None, actor=None):
             m = int(lengths.max())
             (out / 'rollouts').mkdir(exist_ok=True)
             stem = out / 'rollouts' / f'rollout-{L["update"]:06d}'
-            np.savez(str(stem) + '.npz', **{k: getattr(rl, k)[:, :m] for k in (
+            np.savez(str(stem) + '.npz', **{k: (expand_rows(rl, m) if k == 'rows' else getattr(rl, k)[:, :m]) for k in (
                 'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version')},
                 **({'value_g': rl.value_g[:, :m]} if getattr(rl, 'value_g', None) is not None else {}),
                 length=rl.length, open=rl.open, update=L['update'])
@@ -3674,10 +3717,11 @@ def main(argv=None, child=None, actor=None):
                     L['stage_r'] = torch.empty((int(len(all_flat) * 1.25) + 64, ROW_BYTES),
                                                dtype=torch.uint8).pin_memory()
                 every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
-                                                      stage=L['stage_r'], with_raw=True)
+                                                      stage=L['stage_r'], with_raw=True, frames=rl.frames)
                 fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on, t_fb)
             else:
-                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
+                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
+                                       frames=rl.frames)
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
             # (memory: one GRU step from each decision's stored input state)
             h_all = torch.from_numpy(rl.h.reshape(-1, mem_dim)[all_flat]).to(device) if mem_on else None
@@ -3759,7 +3803,8 @@ def main(argv=None, child=None, actor=None):
                             t_p = temporal_rows(rl, idx_, capacity, device)
                             tk_ = dict(temporal=dict(mode='stored', o=t_p['o'], o_prev=t_p['o_prev'], has=t_p['has']))
                         with autocast():
-                            o_ = learner_model(rows_to_device(rl.rows, idx_, rl.pending.reshape(-1, nh)[idx_], device),
+                            o_ = learner_model(rows_to_device(rl.rows, idx_, rl.pending.reshape(-1, nh)[idx_], device,
+                                                              frames=rl.frames),
                                                packed=bool(args.packed), need_vg=True,
                                                mem=torch.from_numpy(rl.h.reshape(-1, mem_dim)[idx_]).to(device)
                                                if mem_on else None, **tk_)
@@ -3823,7 +3868,7 @@ def main(argv=None, child=None, actor=None):
                     L['stage'] = torch.empty((int(len(flat) * 1.25) + 64, ROW_BYTES), dtype=torch.uint8).pin_memory()
                 stage = L['stage']
             batch = rows_to_device(rl.rows, flat, rl.pending.reshape(-1, nh)[flat], device, stage=stage,
-                                   with_raw=fast, head=block_on)
+                                   with_raw=fast, head=block_on, frames=None if block_on else rl.frames)
             if fast:   # (B18: a minibatch's records are gathered as bytes, the fields are views of them)
                 batch, raw_all, pend_all = batch
         b_act =torch.from_numpy(rl.actions.reshape(-1, nh)[flat]).to(device)
@@ -5227,7 +5272,7 @@ def main(argv=None, child=None, actor=None):
                 row['start_builds'] = float(stats[:, ST['start_builds']].sum())
         if args.frame == 'v3':   # (seq-v1 step 3) the actor's host side of the v3 calls (this process), this update
             from isaac_bridge import v3_input as VI_
-            tot3 = dict(VI_.STATS)
+            tot3 = VI_.stats_snapshot()   # (A-2: with the actors' device counters)
             prev3 = L.get('v3_prev') or dict.fromkeys(tot3, 0)
             L['v3_prev'] = tot3
             d3 = {k_: tot3[k_] - prev3[k_] for k_ in tot3}
@@ -6433,7 +6478,13 @@ def main(argv=None, child=None, actor=None):
                         _lane_tick(prof)
                     continue
                 nv.push('actor.book')
-                rows = sampler.rows[slots]
+                if row_ring is not None:   # (A-4)
+                    if len(inflight) > len(row_ring) - 2:
+                        raise RuntimeError('A-4: more calls in flight than the row ring holds')
+                    row_at[0] = (row_at[0] + 1) % len(row_ring)
+                    rows = take_prefix(sampler.rows, slots, row_ring[row_at[0]])
+                else:
+                    rows = sampler.rows[slots]
                 if priv_pending is not None:   # 2026-11-03 (tok_priv): one record per worker is outstanding at a time
                     priv_pending[idx] = sampler.priv[slots]
                 if block_actor is not None:
