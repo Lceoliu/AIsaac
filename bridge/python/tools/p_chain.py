@@ -531,7 +531,9 @@ def main(argv=None):
         hits['ends'] = all(v > 0 for k, v in kinds_.items() if k != 'cap_end' or a.cap_t > 0)
     if a.cf:
         hits['cf'] = bool(res['gate3']['cf_requests'] > 0)
-        hits['bank_reuse'] = bool(gens_d) and all(len(g) >= 2 for g in gens_d.values())
+        # (every bank row written at least twice, read back each time -- the killed worker's rows exempt: it stops
+        #  early by design; the generations of every row are compared all the same)
+        hits['bank_reuse'] = bool(gens_d) and all(len(g) >= 2 for row_, g in gens_d.items() if row_ // BANK_R != kill_w)
         res['gate3']['bank_rows_written'] = len(gens_d)
         res['gate3']['bank_writes'] = int(sum(len(g) for g in gens_d.values()))
     if a.lag:
