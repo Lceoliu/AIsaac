@@ -376,7 +376,9 @@ def main(argv=None):
                     cf = w * BANK_R + nb % BANK_R + 1
                     nb += 1
                     sampler.cf_snap[w] = cf
-                ent = dict(i=i, row=sampler.rows[slot:slot + 1].copy(), cf=cf, replied=False)
+                ent = dict(i=i, row=sampler.rows[slot:slot + 1].copy(), cf=cf, replied=False,
+                           raw=sampler.rows[slot:slot + 1].view(np.uint8).reshape(-1).copy())   # (the bytes: a
+                #  structured copy() does not keep the padding between fields, the driver's memcpy does)
                 sent[w].append(ent)
                 s.sendall(struct.pack('!i', 1) + (b'0' if slot % 2 == 0 else b'1'))
                 if w == kill_w and i == kill_i:
@@ -538,7 +540,7 @@ def main(argv=None):
                 for j_, w_ in enumerate(ws.tolist()):
                     rows[j_] = plan[w_][int(nxt[w_])]
                 cfs = np.array([sent[int(w)][int(nxt[w])]['cf'] for w in ws], np.int64)
-                srows = [sent[int(w)][int(nxt[w])]['row'] for w in ws]   # (the slot's bytes as the worker wrote them)
+                srows = [sent[int(w)][int(nxt[w])]['raw'] for w in ws]   # (the slot's bytes as the worker wrote them)
                 nxt[ws] += 1
                 go = go_rule(rows, a.cap_t, a.trunc, DONE_BRANCH)
                 done = rows['done'] != 0
@@ -599,14 +601,24 @@ def main(argv=None):
         # the rows stored against the slot's bytes as the worker wrote them (the prefix the driver copies: the fixed
         # fields and the padding between them, then the frame's bytes)
         fa = ROW.fields['visible_frame'][1]
-        same_rows = 0
+        same_rows, row_diff, row_ex = 0, {}, []
         for x in keys:
             sr = drv[x]['row'].view(np.uint8).reshape(-1)
-            rr = ref[x]['sent_row'].view(np.uint8).reshape(-1)
+            rr = ref[x]['sent_row']
             nb_ = int(ref[x]['row']['visible_bytes'][0])
             e = min(fa + ((max(nb_, 0) + 3) & ~3), ROW.itemsize)
-            same_rows += bool(np.array_equal(sr[:e], rr[:e]))
-        g1['rows_prefix'] = dict(n=len(keys), equal=same_rows)
+            ok_ = bool(np.array_equal(sr[:e], rr[:e]))
+            same_rows += ok_
+            if not ok_:   # (where they differ: the fields, the padding between them, the frame)
+                d_ = np.flatnonzero(sr[:e] != rr[:e])
+                for o_ in d_[:64]:
+                    f_ = next((f for f in ROW.names if ROW.fields[f][1] <= o_ < ROW.fields[f][1]
+                               + ROW.fields[f][0].itemsize), 'padding')
+                    row_diff[f_] = row_diff.get(f_, 0) + 1
+                if len(row_ex) < 3:
+                    row_ex.append(dict(key=x, n=int(len(d_)), first=int(d_[0]), e=int(e), nb=nb_,
+                                       drv=sr[d_[0]:d_[0] + 8].tolist(), sent=rr[d_[0]:d_[0] + 8].tolist()))
+        g1['rows_prefix'] = dict(n=len(keys), equal=same_rows, where=row_diff, examples=row_ex)
         for k in kept_d:
             g1[f'rollout_{k}'] = bitdiff(kept_d[k][dest], kept_r[k][dest])
         # what each worker read back against the reference's answer
