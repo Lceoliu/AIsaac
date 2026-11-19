@@ -167,15 +167,17 @@ def test_every_record_once_in_order(blocks, K, lag, pace):
     W, T, ep = 6, 40, 7
     rig = Rig(W=W, blocks=blocks, n=8, K=K, episode=ep)
     rig.d.start()
-    ths = [threading.Thread(target=rig.worker, args=(w, T, pace * (w % 2))) for w in range(W)]
+    ths = [threading.Thread(daemon=True, target=rig.worker, args=(w, T, pace * (w % 2))) for w in range(W)]
     for t_ in ths:
         t_.start()
-    recs = rig.consume(lambda rs: sum(r['kind'] == 1 for r in rs) == W, lag=lag)
-    assert sum(r['kind'] == 1 for r in recs) == W, ('stalled', rig.d.counters())
+    try:
+        recs = rig.consume(lambda rs: sum(r['kind'] == 1 for r in rs) == W, lag=lag)
+        c = rig.d.counters()
+    finally:
+        rig.close()   # (a stall fails here, never hangs: the driver joined, the sockets closed, the workers daemons)
+    assert sum(r['kind'] == 1 for r in recs) == W, ('stalled', c)
     for t_ in ths:
         t_.join(5)
-    c = rig.d.counters()
-    rig.close()
     assert not rig.errors, rig.errors[:3]
     check_records(rig, recs, T, ep)
     assert sum(r['kind'] == 1 for r in recs) == W   # (each worker's 'x')
@@ -193,7 +195,7 @@ def test_pause_and_resume():
     W, T, ep = 4, 30, 5
     rig = Rig(W=W, episode=ep)
     rig.d.start()
-    ths = [threading.Thread(target=rig.worker, args=(w, T, 0.002)) for w in range(W)]
+    ths = [threading.Thread(daemon=True, target=rig.worker, args=(w, T, 0.002)) for w in range(W)]
     for t_ in ths:
         t_.start()
     recs = rig.consume(lambda rs: len(rs) >= 20)
@@ -218,7 +220,7 @@ def test_pause_and_resume():
 def test_stop_wakes_a_driver_short_of_credits():
     rig = Rig(W=4, blocks=1, n=4, K=4)
     rig.d.start()
-    ths = [threading.Thread(target=rig.worker, args=(w, 50)) for w in range(4)]
+    ths = [threading.Thread(daemon=True, target=rig.worker, args=(w, 50)) for w in range(4)]
     for t_ in ths:
         t_.start()
     time.sleep(0.3)   # (nothing consumed: the one block and the ring are held -- the driver waits for credits)
@@ -241,7 +243,7 @@ def test_fatal_messages_stop_the_driver(msgs, code, text):
     rig = Rig(W=3)
     rig.d.r_timeout_s = 0.3
     rig.d.start()
-    ths = [threading.Thread(target=rig.worker, args=(w, 20, 0.0, b'x', (5, msgs) if w == 1 else None))
+    ths = [threading.Thread(daemon=True, target=rig.worker, args=(w, 20, 0.0, b'x', (5, msgs) if w == 1 else None))
            for w in range(3)]
     for t_ in ths:
         t_.start()
@@ -258,7 +260,7 @@ def test_fatal_messages_stop_the_driver(msgs, code, text):
 def test_a_worker_gone_is_reported():
     rig = Rig(W=3)
     rig.d.start()
-    ths = [threading.Thread(target=rig.worker, args=(w, 10, 0.0, None if w == 2 else b'x')) for w in range(3)]
+    ths = [threading.Thread(daemon=True, target=rig.worker, args=(w, 10, 0.0, None if w == 2 else b'x')) for w in range(3)]
     for t_ in ths:
         t_.start()
     for t_ in ths:
