@@ -181,12 +181,24 @@ assert ROWC.fields['visible_off'][1] >= ROW_FRAME_AT
 
 class FrameArena:
     """Append-only byte store of visible frames (8-byte aligned starts); grows by reallocation. Records hold their
-    frame's offset (ROWC visible_off). Readers take .buf once the writer is done (a rollout's chunks: after it)."""
+    frame's offset (ROWC visible_off). Readers take .buf once the writer is done (a rollout's chunks: after it).
+    buf (A-6, 2026-11-19): a given byte array (e.g. shared memory the learner process maps) used as it is -- never
+    reallocated (a full arena raises: size it for the worst case; untouched pages of a memfd cost nothing)."""
     ALIGN = 8
 
-    def __init__(self, nbytes=1 << 20):
-        self.buf = np.zeros(max(int(nbytes), 1024), np.uint8)
+    def __init__(self, nbytes=1 << 20, buf=None):
+        self.fixed = buf is not None
+        self.buf = buf if buf is not None else np.zeros(max(int(nbytes), 1024), np.uint8)
         self.used = 0
+
+    def _room(self, need):
+        if need <= len(self.buf):
+            return
+        if self.fixed:
+            raise RuntimeError(f'FrameArena: {need} bytes past a fixed arena of {len(self.buf)}')
+        grown = np.zeros(max(need, int(len(self.buf) * 1.5)), np.uint8)
+        grown[:self.used] = self.buf[:self.used]
+        self.buf = grown
 
     def reset(self):
         self.used = 0
@@ -197,10 +209,7 @@ class FrameArena:
         padded = (sizes+self.ALIGN-1)//self.ALIGN*self.ALIGN
         offs = self.used+np.concatenate(([0], np.cumsum(padded)[:-1])).astype(np.int64)
         need = self.used+int(padded.sum())
-        if need > len(self.buf):
-            grown = np.zeros(max(need, int(len(self.buf)*1.5)), np.uint8)
-            grown[:self.used] = self.buf[:self.used]
-            self.buf = grown
+        self._room(need)
         frames = rows['visible_frame']
         for i in range(len(sizes)):
             n = int(sizes[i])
@@ -216,10 +225,7 @@ class FrameArena:
         padded = (sizes+self.ALIGN-1)//self.ALIGN*self.ALIGN
         new = self.used+np.concatenate(([0], np.cumsum(padded)[:-1])).astype(np.int64)
         need = self.used+int(padded.sum())
-        if need > len(self.buf):
-            grown = np.zeros(max(need, int(len(self.buf)*1.5)), np.uint8)
-            grown[:self.used] = self.buf[:self.used]
-            self.buf = grown
+        self._room(need)
         for o, n, d in zip(np.asarray(offs, np.int64), sizes, new):
             self.buf[d:d+n] = buf[o:o+n]
         self.used = need
