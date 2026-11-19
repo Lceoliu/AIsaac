@@ -534,7 +534,9 @@ def main(argv=None):
                     ver = x
                     continue
                 ws = x
-                rows = np.concatenate([plan[int(w)][int(nxt[w]):int(nxt[w]) + 1] for w in ws])
+                rows = np.empty(len(ws), plan[0].dtype)   # (np.concatenate would repack the padded record dtype)
+                for j_, w_ in enumerate(ws.tolist()):
+                    rows[j_] = plan[w_][int(nxt[w_])]
                 cfs = np.array([sent[int(w)][int(nxt[w])]['cf'] for w in ws], np.int64)
                 nxt[ws] += 1
                 go = go_rule(rows, a.cap_t, a.trunc, DONE_BRANCH)
