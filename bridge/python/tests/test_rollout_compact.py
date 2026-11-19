@@ -102,3 +102,51 @@ def test_expand_rows_and_carry():
     _, raw_c, _ = TP.rows_to_device(rc2.rows, flat, pend, 'cpu', with_raw=True, frames=rc2.frames)
     _, raw_r, _ = TP.rows_to_device(rr2.rows, flat, pend, 'cpu', with_raw=True)
     _prefix_equal(raw_c.numpy(), raw_r.numpy(), rr2.rows.reshape(-1)['visible_bytes'][flat].astype(np.int64))
+
+
+def test_shared_memory_rollout_is_compact_and_the_learner_view_reads_it():
+    """(A-6, 2026-11-19) --learner-process 1: a Rollout over an allocator (SharedArrays in train_tok; a plain one
+    here) is compact too -- its arena a fixed byte array among the shared arrays (frames_buf), never in the scalars the
+    jobs carry; the learner process's view (rollout_view over the arrays and scalars) rebuilds the arena and gives the
+    learner the same bytes as a ROW rollout."""
+    made = {}
+
+    def alloc(shape, dtype):
+        a = np.zeros(shape, dtype)
+        made[id(a)] = a
+        return a
+    rr = _fill(False)
+    rs = T.Rollout(5, 16, 5, compact=True, alloc=alloc)
+    assert rs.rows.dtype == ROWC and rs.frames.fixed and rs.frames_buf is rs.frames.buf
+    for t in range(4):   # (the records _fill stores, with the ROW rollout's pending)
+        names = [VP.NAMES[(t * 5 + i) % len(VP.NAMES)] for i in range(5)]
+        rows = VP._rows_with_frames(names, seed=t)
+        for i in range(5):
+            nb = int(rows['visible_bytes'][i])
+            rows['visible_frame'][i, nb:nb + 64] = 0xEE
+        T.store(rs, np.arange(5), rows, rr.pending[:, t], rr.pending[:, t], np.zeros(5, np.float32),
+                np.zeros(5, np.float32), 0)
+    scal = T.rollout_scalars(rs)
+    assert 'frames' not in scal and 'frames_buf' not in scal
+    arrays = {k: v for k, v in vars(rs).items() if isinstance(v, np.ndarray)}
+    assert 'frames_buf' in arrays
+    view = T.rollout_view(arrays, scal, None)
+    assert view.frames is not None and view.frames.buf is rs.frames_buf
+    flat = np.array([0, 3, 17, 18, 33, 49])
+    flat = flat[(flat % rr.cap) < rr.length[flat // rr.cap]]
+    pend = rr.pending.reshape(-1, 5)[flat]
+    _, raw_v, _ = TP.rows_to_device(view.rows, flat, pend, 'cpu', with_raw=True, frames=view.frames)
+    _, raw_r, _ = TP.rows_to_device(rr.rows, flat, pend, 'cpu', with_raw=True)
+    _prefix_equal(raw_v.numpy(), raw_r.numpy(), rr.rows.reshape(-1)['visible_bytes'][flat].astype(np.int64))
+
+
+def test_a_fixed_arena_never_grows():
+    from isaac_bridge.tok_obs import FrameArena
+    a = FrameArena(buf=np.zeros(64, np.uint8))
+    rows = VP._rows_with_frames(VP.NAMES[:1])
+    try:
+        a.append(rows)
+    except RuntimeError as e:
+        assert 'fixed arena' in str(e)
+    else:
+        raise AssertionError('a full fixed arena must raise')

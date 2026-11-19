@@ -131,7 +131,7 @@
 | B60 | 11-10 | learner 的 host 工作搬出 GIL：原生 C 打包（`abp_learn.c`，调用期间释放 GIL）与覆盖整个 update 的流水预取，固定输入基准 + 生产短 profile，4090 | 固定输入基准 13.0–13.2 → 7.9–8.4 s（≤ 9.5 s 门过）；生产 update 19.42 → 16.94 / 17.24 s，×实时 145.3 / 136.1；关键路径等待 0.83 s/update，未达 0.3 s 门；忙线程对照显示 GIL 下的暴露面主要是前向、反向、优化器的 Python 派发；全量门 223 passed |
 | B62 | 11-10 | learner 线程的 GIL 暴露面：合并 C++ actor 树后量基线、扫描切换间隔、Python 派发归因，后续步骤 1–4（精简 checkpoint、阻塞同步、异步 H2D 等）；4090 | 步骤 0：合并树 update 20.33 s、212.7×（cpp 步骤 0 为 196.6×），50 µs 切换间隔 +7% 但只单次；learner 前向调用的 Python 层大头是 checkpoint 钩子。精简 checkpoint 让每 part 调用 14.6k → 10.9k 并默认打开，但全量门 3 次全绿未做；blocking 下 learner 线程 Python CPU 5.98 s/update，未达 ≤ 3.0 s 的门；4090 到期时多项未跑、未验收 |
 | B67 | 11-17/18 | visible-v3 生产端（C 包）：房型实测（契约 V1）、金样本 V2、越界审计、原生编码器、schema 批次 4–5、对齐数据集；合并前四项检查；Codex 五轮审计；dgene | 坐标与数值都有引擎证据；参考与原生编码器逐字节一致（8,923 / 8,923，批次 4 后 1,812 / 1,812）；每决策游戏侧与 v2 原生持平、worker 侧 −38%。主线并入 05f1622：v3 关时 ROW 与 digest 与主线全同，合并树训练冒烟正常，配对速度 1.035（198d0cb 时 1.013；原单次参照线撤回）。后又并入 8fc3ab1（第 2–4 轮修复），冒烟 3 次干净、配对 1.0066；收尾 exit 86 的根因是变量重名（ef702a1 引入、8fc3ab1 修，曾误诊为模式查询断线）；第 5 轮 3 条在加固批次；v3 帧的训练吞吐未量 |
-| B68 | 11-19 | seq1 期间的提速批次（exp/seq-v1）：A-1 新奖励记账向量化、A-2 非有限值在图内计数、A-3 v3 rollout 紧凑存储、A-4 只拷到帧尾；learner 的 GPU 时间分解；P 包的纯函数与金样本；dgene lane b | 进行中。A-3：8 个 worker 下容器内存 15.4–17.8 → 9.3–10.1 GB。A-1 / A-4 对 p_book 无可测效果（更正此前估计）：book 是每次调用约 0.9 ms 的固定开销。learner：GPU 时间约 85% 在帧编码器（更正此前“剩下 5 s 在时间侧”），时间侧加头约 7%；帧编码器 compile −21%，打包交 Codex |
+| B68 | 11-19 | seq1 期间的提速批次（exp/seq-v1）：A-1 新奖励记账向量化、A-2 非有限值在图内计数、A-3 v3 rollout 紧凑存储、A-4 只拷到帧尾；learner 的 GPU 时间分解；P 包的纯函数与金样本；dgene lane b | 进行中。A-3：8 个 worker 下容器内存 15.4–17.8 → 9.3–10.1 GB。A-1 / A-4 对 p_book 无可测效果（更正此前估计）：book 是每次调用约 0.9 ms 的固定开销。learner：GPU 时间约 85% 在帧编码器（更正此前“剩下 5 s 在时间侧”），时间侧加头约 7%；帧编码器 compile −21%，打包交 Codex。补充：learner 线程在主机端受限（打包 GPU −14–29% 但端到端无变化），learner 独立进程 u_ppo −45%，加打包再 −8–11%；帧编码器 compile 形状太多不可用；A-6 进程模式内存 22 → 15 GB（16 个 worker）；进程 + 打包上 D1（bf16 0.00235 无偏，fp32 3.7e-7）与 pending 通过 |
 | cpp 线 3090 分卡基线 | 11-11 | cpp 线在 8x3090 上的分卡形态（actor 卡 + learner 卡）基线：24 轮计时 + nsys python-gil，树 c-02b2169 | 225.4×（u10–u23），collect 17.94 s 已短于 update 18.75 s，周期由 learner 决定；CF u15 100 / 0 / 0 / 0。driver 每 collect 循环 18.41 s，lane 作业 6.81、主步等 GPU 6.91；主线程 GIL 持有 0.20 s/周期、顶层进入约 36 次/周期，两道门都达标 |
 | cpp 线 3090 分卡 M1 | 11-11 | 分卡下 M1（lane 合并）计时，MERGE=1 对同期 MERGE=0；8x3090 | 未完成，被"背靠背四次"一条取代：MERGE=1 为 241.3×，driver 上 lane 作业 6.81 → 3.52 s；同期 MERGE=0 臂在 u11 因 GPU 5 掉卡（Xid 79）中止，吞吐对比不成立。TSAN 在这台机器上部分段错误，不算通过 |
 | cpp 线 M1 背靠背四次 | 11-11 | 8x3090 重启后 M1 按 MERGE 0、1、0、1 背靠背四次 24 轮计时（GPU 1 actor + GPU 2 learner） | lane 作业时间约 −37%（6.3–7.0 → 4.0–4.5 s），lane 调用约减半，CF 完成数不受影响；吞吐两臂均值 236.1× 对 244.7×（+3.6%），但同臂两次之差更大，不成立。省下的 1.9 s 里约 1.1 s 被更重的合并主步吃回。M1 由协调方决定默认开（3 遍全量门 282 passed 全绿） |
@@ -14471,6 +14471,55 @@ seq1 的速度约为 T1 的四分之三：x_real 约 216，T1 约 289。协调�
   - tools/p_golden.py：94 个金样本，带 --verify。
 
 - 原始文件：dgene bm1/c114/lprof/、c114/l1/、c114/l2/、c114/l3/（prof/ops.txt、trace.json）、c114/STATUS_l1、STATUS_l2、STATUS_l3；共享笔记 seq1-speed-next-and-P-prep.md。
+
+**补充（11-19 午）：打包、compile、learner 独立进程、A-5 / A-6，以及 book 的口径**
+
+- **book 的口径**：本机拆分，每次 1 / 4 / 8 / 16 行调用 Episodes.arrive。
+  - 旧的逐条循环：固定约 210 us + 每行约 65 us（整行拷贝加循环）。
+  - A-1 之后：固定约 350 us，每行约 0。
+  - 取数：花式索引在 16 行时 1190 us，take_prefix 68 us。
+  - 所以旧树上 book 按行计（攒批省不了），A-1 + A-4 之后按调用计，攒批才能省。
+  - cpp-actor 在新树上实测（rollout 8192）：book 每次 poll 1.18 / 1.24 ms，与行数无关；每决策 collect 0.449 → 0.408 ms（16 → 32 个 worker）。
+  - 上文“A-1 / A-4 对 p_book 无可测效果”只对 8 个 worker、每次 3.8 行的冒烟成立。
+- **新开运行的端到端**（cpp-actor；seq1 那一行，16 个 worker，u2–u6，各 3 次）：
+  - 旧树（p2effc82）x_real 242.9 / 243.9 / 244.4，新树（pd8cc0842，含 A-1–A-4）274.7 / 268.9 / 267.2，平均约 244 → 270（+11%）。
+  - 新树里 update_s（15.8–16.3 s）已大于 collect（15.1–15.4 s），端到端卡在 learner 上。rollout 8192 时也是如此：update 4.32 / 4.48 s 对 collect 3.68 / 3.34 s。
+  - 新树还带着 A-2 和 store 延后的代码（未开），所以这 11% 不全是 A-1 / A-3 / A-4 的。
+  - store 延后实验：T / R = 0.964，队列从未超过 1 个调用，没有好处。
+- **A-5**（bba9370）：arrive 每次调用只算一次的量和无事件时跳过，新奖励项的额外固定开销约 140 → 50–70 us（本机粗测）。
+- **打包前向**（Codex 25d006e，并入 355fb33）：
+  - 帧编码器单独量（micro 2048，bf16，两份）：补齐 eager 122.3 / 98.3 ms，打包 eager 86.5 / 84.6 ms（−29% / −14%）。
+  - 补齐 compile 97.0 / 76.8 ms（−21%），打包 compile 65.5 / 64.5 ms。
+  - 同口径冒烟（8 个 worker，learner 线程）里 u_ppo 打包 12.2 / 12.4 / 11.0 / 6.7 s，补齐 12.0 / 10.8 / 11.0 / 6.8 s，**无可测差别**。
+- **读法的更正**：上文“learner 在算力上是满的”只在 1/4 rollout、actor 不忙时成立。
+  - learner 线程在主机端受限：每次更新约 18 万个 kernel 逐个发射。
+  - actor 同时在跑时还要再翻一倍：两线程争 GIL / CPU，u_ppo 11–12 s，actor 不忙时 6.7 s。
+- **learner 独立进程**（--learner-process 1，B38 第 2 步）：对 v3 可用（懒解码、--aux-predict 1 兼容）。同口径冒烟（8 个 worker，补齐）：
+  - u_ppo 线程 11.8 / 11.5 / 10.5 / 6.6 s → 进程 6.6 / 6.3 / 6.0 / 5.6 s（−45%）；交接 0.003–0.04 s。
+  - 进程 + 打包：6.1 / 5.6 / 5.8 / 5.0 s，比进程 + 补齐再快 8–11%。打包的 GPU 收益要在 learner 离开 GIL 后才显现。
+- **帧编码器 compile**（--v3-encoder-compile，0091f51）不可用：
+  - learner 里形状太多（E / N / S 桶 × 每份行数 × 重算 / 教师），每个新形状重编。前 3 个更新 u_ppo 300–370 s，撞到 dynamo 缓存上限 64。
+  - 进程 + default：learner 进程退出；reduce-overhead：CUDA 图与梯度复用冲突。
+  - 编好之后 u_ppo 5.3 s（对 eager 6.6），但编译成本付不起。--learner-compile 与 --aux-predict 1 本来就不兼容。
+- **A-6**（263f7dd，Codex 第 16 轮后 3ebd00b）：learner 进程下共享内存里的 rollout 也是 ROWC + arena（固定的 memfd 数组，按最坏情况开）。
+  - 16 个 worker 的冒烟（--packed 1）：线程 13.8–14.5 GB，进程 + 紧凑 14.8–15.4 GB，进程 + ROW 21.6–22.6 GB。
+  - update_s：线程 15.3–15.8 s，进程 10.6–12.2 s。
+  - Codex 第 16 轮：可用于下一条臂。ISAAC_RL_B38_DUMP 在紧凑 + 共享时拒收（dump_job 会复制整个 arena 预留）。新列 arena_peak_mb_a / _b（reset 不释放写过的页，平台看高水位）和 store_dropped。
+  - 已知偏差：多个 actor 进程的 v3 有意改为 ROW，不与旧提交逐位相同。
+  - 跨进程的 A → B 轮换回归测试待做。
+- **进程 + 打包这条路上的 D1 与 pending**（树 m263f7dd-d1，从 seq1 u460 起，各 5 行、约 49 万条）：
+  - bf16：最大平均偏差 0.00235，|均值| ≤ 1.0e-5，> 0.1 的比例 0，按新判据通过。
+  - 全程 fp32（micro 1024，NVIDIA_TF32_OVERRIDE=0，K / V fp32）：3.7e-7，< 1e-4，通过。
+  - pending：五个头都是 1.0000（65,490 条）。
+- **房间 token**（协调方的问题；4 层前向+反向，micro 2048，bf16）：
+  - T = 86 / 73 / 70 / 66 / 57 / 50 / 44 / 31 / 24 时为 99.7 / 80.7 / 77.9 / 74.1 / 58.4 / 51.9 / 46.5 / 33.9 / 27.4 ms，约每 token 1.1 ms。
+  - 房间块 2 × 4 时整个帧编码器约 −21–33%，3 × 5 时约 −15–22%（GPU）。主机端仍是瓶颈时不会体现在 u_ppo 上，这条对比臂暂不做。
+- **结论**：
+  1. 下一条臂的 learner 用独立进程 + 打包（两项显式写出），16 个 worker 下容器约 15 GB。
+  2. 打包和帧编码器 compile 单独看在 GPU 上都有效，但 learner 线程模式下被主机端发射和 GIL 挡住，端到端看不到；离开 GIL 之后打包有 8–11%。
+  3. 备用配置和各项预期写在共享笔记 next-arm-config.md。
+
+- 原始文件：dgene bm1/c114/l5/、l6/、l7/、l8/（STATUS_l5 – STATUS_l8）、c114/d1/{l8pb16,l8pf32}/、bm1/p0/（cpp-actor：values.txt、defer.txt、sweep2.txt）。
 
 ### B67 visible-v3 生产端（C 包）：房型实测、坐标契约、金样本、越界审计、原生编码器（2026-11-17—18，验收；主线并入 05f1622，后并入 8fc3ab1）
 

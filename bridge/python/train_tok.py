@@ -253,7 +253,7 @@ from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
 from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
 from isaac_bridge.learn_segments import SEG   # BM1: learner segment timing (ISAAC_BLOCK_TIMING=1 only)
-from isaac_bridge.tok_obs import take_prefix   # noqa: E402  (A-4)
+from isaac_bridge.tok_obs import ROW_FRAME_AT, take_prefix   # noqa: E402  (A-4, A-6)
 from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
@@ -719,7 +719,9 @@ def rollout_scalars(roll):
     """(B38 step 2) a rollout's attributes that are neither arrays nor tensors (counters, sizes; None for the parts
     that are off): what the learner process's view needs per job besides the shared arrays."""
     import torch
-    result = {k: v for k, v in vars(roll).items() if k != 'block' and not isinstance(v, (np.ndarray, torch.Tensor))}
+    result = {k: v for k, v in vars(roll).items()
+              if k not in ('block', 'frames') and not isinstance(v, (np.ndarray, torch.Tensor))}   # (A-6: the arena
+    #                                                                       is the shared frames_buf, rebuilt by the view)
     if getattr(roll, 'block', None) is not None:
         result['block_payload'] = roll.block.payload()
     return result
@@ -735,6 +737,7 @@ def rollout_view(arrays, scalars, tensors):
     r.block = BlockRollout.from_payloads([(0,scalars['block_payload'])]) if scalars.get('block_payload') is not None else None
     if tensors is not None:
         r.t_kv, r.t_o, r.t_s = tensors[0], tensors[1], None
+    r.frames = FrameArena(buf=arrays['frames_buf']) if 'frames_buf' in arrays else None   # (A-6)
     return r
 
 
@@ -797,12 +800,22 @@ class Rollout:
         # 2026-10-11 (memory): the GRU's input state of each decision (None without memory)
         self.h = zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
         # B45: block-memory rollouts store compact records (ROWC) and their visible frames in a byte arena (~11 KB each
-        # instead of 128 KiB); others (and B38's shared-memory learner process) keep ROW
+        # instead of 128 KiB); with B38's shared-memory learner process block rollouts keep ROW
         # (A-3, 2026-11-19: and v3-frame rollouts, compact=True -- the learner's rows_to_device rebuilds their bytes
         #  from the arena; 5 GB of mostly empty frame budget per 32,768-decision rollout before)
-        compact = (bool(block_steps) or bool(compact)) and alloc is None
+        # (A-6, 2026-11-19: v3 rollouts compact in shared memory too, --learner-process 1: the arena a fixed shared
+        #  byte array of the worst case -- every record a whole frame field -- whose untouched pages cost nothing;
+        #  frames_buf names it among the shared arrays, rollout_view rebuilds the arena over it)
+        compact = (bool(block_steps) and alloc is None) or bool(compact)
+        self.dropped = 0   # (A-6, Codex round 16: decisions past a worker's capacity, dropped by store)
         self.rows = zeros((workers, capacity), ROWC if compact else ROW)
-        self.frames = FrameArena(workers * capacity * 16384) if compact else None
+        if not compact:
+            self.frames = None
+        elif alloc is None:
+            self.frames = FrameArena(workers * capacity * 16384)
+        else:
+            self.frames = FrameArena(buf=alloc((workers * capacity * (ROW.itemsize - ROW_FRAME_AT),), np.uint8))
+            self.frames_buf = self.frames.buf
         self.pending = zeros((workers, capacity, n_heads), np.int64)
         self.actions = zeros((workers, capacity, n_heads), np.int64)
         self.logp = zeros((workers, capacity), np.float32)
@@ -1493,6 +1506,7 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
     kk = roll.length[a_idx]
     ok = kk < roll.cap   # cannot fail with the trainer's capacity; drop rather than overrun
     if not ok.all():
+        roll.dropped = getattr(roll, 'dropped', 0) + int((~ok).sum())   # (counted: progress store_dropped)
         a_idx, kk, rows, under_way = a_idx[ok], kk[ok], rows[ok], under_way[ok]
         actions, logp, value = actions[ok], logp[ok], value[ok]
         h = h[ok] if h is not None else None
@@ -2220,6 +2234,10 @@ def main(argv=None, child=None, actor=None):
                         '(attention buckets, entity positions, the distinct grids: the same values up to summation '
                         'order), its records staged in pinned memory and kept as bytes, so that the PPO parts gather '
                         "bytes after it too (B18's raw gather; values identical), the item counts read from the fields")
+    p.add_argument('--v3-encoder-compile', default='',
+                   help="2026-11-19 (L-1, --frame v3 with --packed 0): torch.compile mode of the learner's padded frame "
+                        "encoder alone (fixed shapes: one compile per E / N / S bucket and part size; e.g. default, "
+                        "reduce-overhead); '': eager, as before. The actor's graphs and the evaluation are not compiled")
     p.add_argument('--learner-compile', default='',
                    help="2026-10-17 (B38 step 4, an experiment): torch.compile mode of the learner model's forward in "
                         "the PPO parts and the recompute pass (e.g. default, max-autotune-no-cudagraphs; dynamic "
@@ -3221,12 +3239,17 @@ def main(argv=None, child=None, actor=None):
     # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
     t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=max(1, args.temporal_rooms),
                  kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64) if t_on else None
+    if (proc and args.frame == 'v3' and os.environ.get('ISAAC_RL_V3_COMPACT', '1') == '1'
+            and os.environ.get('ISAAC_RL_B38_DUMP')):
+        p.error('ISAAC_RL_B38_DUMP: not with compact v3 rollouts in shared memory (dump_job would copy the whole '
+                'arena, its reserve ~16 GiB at 32,768 decisions; Codex round 16) -- ISAAC_RL_V3_COMPACT=0 for it')
     shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
     if child is None:
         r_kw = dict(close=aux_on or log_on, priv=PRIV_DTYPE if priv_on else None,block_steps=128 if block_on else 0,
-                    compact=args.frame == 'v3' and os.environ.get('ISAAC_RL_V3_COMPACT', '1') == '1')
+                    compact=args.frame == 'v3' and os.environ.get('ISAAC_RL_V3_COMPACT', '1') == '1'
+                    and n_act == 1)   # (A-6: not with several actor processes -- their merged full arrays are ROW)
         roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw), \
             Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw)
         if n_act > 1 and actor is None:   # (the first actor: the shared arrays of all workers, its rows of them)
@@ -3540,6 +3563,17 @@ def main(argv=None, child=None, actor=None):
     # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
     # --learner-compile, the same module and parameters)
     lm_call = learner_model
+    if args.v3_encoder_compile and (args.frame != 'v3' or args.packed):
+        p.error('--v3-encoder-compile: --frame v3 with --packed 0 only (the packed path has no fixed shapes)')
+    if args.v3_encoder_compile and (child is not None or not proc):   # (L-1: the frame encoder alone)
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = max(int(torch._dynamo.config.cache_size_limit),
+                                                    int(os.environ.get('ISAAC_RL_V3_COMPILE_CACHE', '64')))
+        # (object.__setattr__: a compiled module is a Module -- set as usual it would become a submodule and its
+        #  parameters a second time in the state dict)
+        object.__setattr__(learner_model, 'frame_v3_call',
+                           torch.compile(learner_model.frame_v3, mode=args.v3_encoder_compile, dynamic=False))
+        print(f'L-1: the learner\'s v3 frame encoder compiled ({args.v3_encoder_compile}, fixed shapes)', flush=True)
     if args.learner_compile and (child is not None or not proc):
         import torch._dynamo
         torch._dynamo.config.cache_size_limit = int(os.environ.get('ISAAC_RL_B38_COMPILE_CACHE', '64'))
@@ -5285,6 +5319,9 @@ def main(argv=None, child=None, actor=None):
             L['v3_prev'] = tot3
             d3 = {k_: tot3[k_] - prev3[k_] for k_ in tot3}
             row['v3_calls'], row['v3_records'] = d3['calls'], d3['records']
+            ap_ = job.get('arena_peak_mb') or []
+            row['arena_peak_mb_a'], row['arena_peak_mb_b'] = (ap_ + [0.0, 0.0])[:2]
+            row['store_dropped'] = job.get('store_dropped', 0)
             row['v3_host_ms'] = 1000 * d3['host_s'] / max(d3['calls'], 1)
             row['v3_host_share'] = d3['host_s'] / max(job['collect_s'], 1e-9)
             for b_ in VI_.E_BUCKETS:
@@ -6746,6 +6783,9 @@ def main(argv=None, child=None, actor=None):
             if native_lin:   # B58c: the rollout's native sidecar as PagedSnapshots (what payload / plan read)
                 roll.block.materialize()
             job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
+                       # (A-6, Codex round 16: the two arenas' high-water marks; decisions dropped at a worker's cap)
+                       arena_peak_mb=[r_.frames.peak / 2 ** 20 for r_ in (roll, spare) if r_.frames is not None],
+                       store_dropped=int(getattr(roll, 'dropped', 0)) + int(getattr(spare, 'dropped', 0)),
                        **lab_job,
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,
