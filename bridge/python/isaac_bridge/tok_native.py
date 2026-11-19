@@ -103,4 +103,4 @@ def fold_layout(lay):
     return dict(n=lay.n, nh=lay.nh, H=lay.H, cw=lay.cw, dest_at=lay.dest_at, row_bytes=ROW_BYTES, mem=lay.mem,
                 t_on=lay.t_on, crn=lay.crn, sizes=list(lay.sizes), rsizes=list(lay.rsizes), off_e=off_e, per_e=per_e,
                 end_e=end_e, off_n_ent=ROW.fields['n_ent'][1],
-                off_crn=ROW.fields['crn'][1] if 'crn' in ROW.dtype.names else -1, off_t=ROW.fields['t'][1])
+                off_crn=ROW.fields['crn'][1] if 'crn' in ROW.names else -1, off_t=ROW.fields['t'][1])
