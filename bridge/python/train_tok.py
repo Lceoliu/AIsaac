@@ -6489,7 +6489,8 @@ def main(argv=None, child=None, actor=None):
                         prof['weights'] += time.perf_counter() - t_w_
                         return version
                 tok_dc[0].collect(roll, book, pending, rollout_actor, prof, store,
-                                  tick=_lane_tick if lanes is not None else None, weights=_W(), stopped=stopped)
+                                  tick=_lane_tick if lanes is not None else None, weights=_W(), stopped=stopped,
+                                  version=version)   # (take_weights may have run at the hand-off)
             while (cpp_driver is None and tok_dc[0] is None and roll.usable() < rollout_actor and sampler.live
                    and not stopped()):
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished

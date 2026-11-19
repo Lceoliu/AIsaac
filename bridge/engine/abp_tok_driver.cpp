@@ -115,7 +115,8 @@ struct TokMiddle {
   // fake (tests without a GPU): no copy, no replay -- each record's outputs from its bytes (fake_outputs).
   bool fake = false;
   int run_raw(const uint8_t *rb, i64 k, const i64 *pending_p, const i64 *widx_p, const i64 *ring_p,
-              const std::vector<i64> &cs, const std::vector<i64> &cd, float *out_p, i64 *rec_p, i64 *eb_p, i64 *graph_p) {
+              const std::vector<i64> &cs, const std::vector<i64> &cd, float *out_p, i64 *rec_p, i64 *eb_p, i64 *graph_p,
+              const i64 *ukey_p = nullptr, const i64 *ut_p = nullptr) {
     std::vector<float> head((size_t)(8*k)), p0((size_t)(2*k));
     std::vector<double> vs((size_t)k), nb((size_t)k);
     std::vector<i64> pf((size_t)k), cnt((size_t)(4*k), 0);
@@ -135,7 +136,7 @@ struct TokMiddle {
     if (chk.code) return chk.code;
     if (fake) { fake_outputs(rb, k, cnt.data(), out_p); last_e_bucket = chk.e_bucket; last_rows = k; calls++; return 0; }
     uint8_t *st = stage_h.data_ptr<uint8_t>(), *ct = ctrl_h.data_ptr<uint8_t>();
-    abptok::FoldOut fo = abptok::fold_pack(L, rb, k, pending_p, widx_p, nullptr, ring_p, nullptr, nullptr, chk.e_bucket,
+    abptok::FoldOut fo = abptok::fold_pack(L, rb, k, pending_p, widx_p, nullptr, ring_p, ukey_p, ut_p, chk.e_bucket,
                                            st, ct, pf.data());
     TORCH_CHECK(fo.g >= 0, "TokMiddle: no graph for this call (bucket ", chk.e_bucket, ", ", k, " rows)");
     TORCH_CHECK(fo.graph < (i64)graphs.size() && graphs[fo.graph].graph, "TokMiddle: graph ", fo.graph, " not registered");
@@ -307,5 +308,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("last_seq", &TokDriver::last_seq).def("take", &TokDriver::take, py::arg("max_n"), py::arg("timeout"))
       .def("release_block", &TokDriver::release_block).def("release_ring", &TokDriver::release_ring)
       .def("counters", &TokDriver::counters)
-      .def_readwrite("r_timeout_s", &TokDriver::r_timeout_s).def_readwrite("test_call_delay", &TokDriver::test_call_delay);
+      .def_readwrite("r_timeout_s", &TokDriver::r_timeout_s).def_readwrite("test_call_delay", &TokDriver::test_call_delay)
+      .def_readwrite("test_ukeys", &TokDriver::test_ukeys);
 }

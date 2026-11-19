@@ -66,10 +66,14 @@ class DriverCollect:
         self.stat = dict(records=0, calls=0, ends=0, gone=0, take_s=0.0, waits=0)
 
     # ---- the collect
-    def collect(self, roll, book, pending, target, prof, store, tick=None, weights=None, stopped=lambda: False):
+    def collect(self, roll, book, pending, target, prof, store, tick=None, weights=None, stopped=lambda: False,
+                version=None):
         """Records into the rollout until its committed usable count reaches target (or the workers end / a stop);
         tick(): the lanes' round (each loop); weights(): None, or a callable that swaps the weights (called with the
-        driver paused and drained; returns the new version)."""
+        driver paused and drained; returns the new version); version: the actor's weights now (the hand-off may have
+        taken new ones since the last collect -- the driver paused then; as B52's run_driver_collect)."""
+        if version is not None:
+            self.d.set_version(int(version))
         c0 = self.d.counters()
         if not self.started:
             self.d.start()

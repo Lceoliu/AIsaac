@@ -65,6 +65,10 @@ struct TokDriver {
   double r_timeout_s = 2.0;
   // fault injection (tests): the consumer's lag is the test's; here, a delay before each call
   double test_call_delay = 0;
+  // (the gates' tool p_chain: each record's sampling uniforms from (worker + 1, its ROW 't') -- B36's ukeys -- so a
+  //  Python replay of the same calls draws the same numbers; off in training: the graphs' own draws)
+  bool test_ukeys = false;
+  std::vector<i64> uk_c, ut_c;
 
   explicit TokDriver(py::object middle) : mid_keep(middle) { mid = middle.cast<TokMiddle *>(); }
   ~TokDriver() { halt(); }
@@ -325,10 +329,15 @@ struct TokDriver {
         call_p = callrows.data();
       }
       pend_c.assign((size_t)(std::max<i64>(kg, 1)*nh), 0); widx_c.clear(); ring_c.clear(); cs.clear(); cd.clear();
+      uk_c.clear(); ut_c.clear();
       for (i64 j = 0; j < kg; j++) {
         const i64 w = take_w[gi[j]];
         for (i64 h = 0; h < nh; h++) pend_c[j*nh+h] = pending[w*nh+h];
         widx_c.push_back(w); ring_c.push_back((r0+j) % K);
+        if (test_ukeys) {
+          int32_t t_; std::memcpy(&t_, blk+gi[j]*row_bytes+off_t, 4);
+          uk_c.push_back(w+1); ut_c.push_back((i64)t_);
+        }
         if (cf_snap && cf_snap[w] > 0) { cs.push_back(w); cd.push_back(cf_snap[w]-1); }
       }
       for (i64 i = 0; i < k; i++) if (!go[i]) reply(take_w[i]);   // (an episode's end that needs no action)
@@ -340,7 +349,8 @@ struct TokDriver {
         int code = 0;
         try {
           code = mid->run_raw(call_p, kg, pend_c.data(), widx_c.data(), mid->L.t_on ? ring_c.data() : nullptr, cs, cd,
-                              out_c.data(), &rec, &eb, &graph);
+                              out_c.data(), &rec, &eb, &graph, test_ukeys ? uk_c.data() : nullptr,
+                              test_ukeys ? ut_c.data() : nullptr);
         } catch (const std::exception &ex) {
           set_fatal(5, take_w[gi[0]], std::string("TokMiddle: ") + ex.what());
           break;
