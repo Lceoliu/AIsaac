@@ -70,6 +70,7 @@ def main(argv=None):
                bf16=not a.fp32, config={k: ck['config'].get(k) for k in ('frame', 'temporal', 'memory', 'width')})
     for spec in a.modes.split(','):
         fold, _, rb = spec.partition(':')
+        rb, _, comp = rb.partition(':')   # (fold[:row buckets[:compile mode]], e.g. 1::default)
         fold = bool(int(fold))
         row_sizes = [int(x) for x in rb.split('+') if x] or None
         res = {}
@@ -81,7 +82,7 @@ def main(argv=None):
         mem = int(getattr(model, 'memory', 0) or 0)
         table = torch.zeros((W + 1, mem), device=dev) if mem else None
         actors = [TP.GraphActor(model, W, 32, stream=st, crn=False, memory=table, temporal=ts, bf16=not a.fp32,
-                                fold=fold, row_sizes=row_sizes) for _ in range(2)]
+                                fold=fold, row_sizes=row_sizes, compile_mode=comp or None) for _ in range(2)]
         torch.cuda.synchronize()
         used = [0]
 
@@ -149,7 +150,8 @@ def main(argv=None):
             g.result()
         torch.cuda.synchronize()
         res['pipelined_calls_per_s'] = len(calls) / (time.perf_counter() - t0)
-        out[f'fold{int(fold)}' + (f'_rows{"+".join(map(str, row_sizes))}' if row_sizes else '')] = res
+        out[f'fold{int(fold)}' + (f'_rows{"+".join(map(str, row_sizes))}' if row_sizes else '') +
+            (f'_compile-{comp}' if comp else '')] = res
         actors = table = None
         torch.cuda.empty_cache()
     s = json.dumps(out, indent=1)
