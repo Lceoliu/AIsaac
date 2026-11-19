@@ -1491,13 +1491,17 @@ class TokPolicy(nn.Module):
         from b; no ROW observation field enters the encoder."""
         tctx = None
         if temporal is not None and self.tatt is not None:
-            tctx, _hist = self._temporal_in(b, temporal)   # (feedback 0: no history token)
+            with _mark('v3:temporal_in'):
+                tctx, _hist = self._temporal_in(b, temporal)   # (feedback 0: no history token)
         from .v3_input import get_batch, materialize
-        v3 = materialize(get_batch(b))
+        with _mark('v3:decode'):
+            v3 = materialize(get_batch(b))
         if not v3:
             raise ValueError('TokPolicy(frame=v3): a batch without v3 tensors (records without a v3 frame)')
-        x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
-        return self._heads(x[:, 0], need_h, mem, x[:, g], need_vg, tctx)
+        with _mark('v3:frame'):
+            x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
+        with _mark('v3:heads'):
+            return self._heads(x[:, 0], need_h, mem, x[:, g], need_vg, tctx)
 
     def _block_packed_readout(self, xp, starts):
         counts = torch.cat((starts[1:], starts.new_tensor([len(xp)]))) - starts
@@ -2233,6 +2237,16 @@ def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, hea
                                    flat['visible_bytes'][index])
     out = decode_rows(dev_raw, pend, visible=vis, counts=counts)
     return (out, dev_raw, pend) if with_raw else out
+
+
+# (L-1, 2026-11-19, a measurement aid) True: TokPolicy's v3 forward marks its parts for the torch profiler
+# (record_function 'v3:decode' / 'v3:temporal_in' / 'v3:frame' / 'v3:heads'); train_tok sets it with
+# ISAAC_RL_B38_TORCHPROF. False: no marks.
+PROF_MARKS = False
+
+
+def _mark(name):
+    return torch.profiler.record_function(name) if PROF_MARKS else contextlib.nullcontext()
 
 
 class FoldLayout(tuple):

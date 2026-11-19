@@ -3526,6 +3526,8 @@ def main(argv=None, child=None, actor=None):
         os.replace(tmp_, path)   # (atomic: a kill during the write leaves the previous file whole, never a torn one)
 
     b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
+    import isaac_bridge.tok_policy as tp_marks_
+    tp_marks_.PROF_MARKS = b38_marks   # (L-1: the v3 forward's parts marked too)
     # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
     # --learner-compile, the same module and parameters)
     lm_call = learner_model
