@@ -2406,6 +2406,11 @@ def main(argv=None, child=None, actor=None):
             p.error(f'--frame v3 takes no item tokens (the N / S tokens of the frame carry the items): --item-tokens 0 '
                     f'--item-shared 0 --item-slots {INV_CAP} (got {args.item_tokens} / {args.item_shared} / {item_slots})')
         tok_kw['frame'] = 'v3'
+        # (2026-11-19, the coordinator: a bug fix as the v3 arms' default -- AB+ answers ITEM / PILLCARD / BOMB's
+        #  "triggered" twice per press, 13 active items unusable or used twice; abp_bridge.lua TRIGGER_ONCE_ALL. The
+        #  games inherit the trainer's environment; an explicit ISAAC_RL_TRIGGER_ONCE=0 is kept)
+        os.environ.setdefault('ISAAC_RL_TRIGGER_ONCE', '1')
+        print(f"frame v3: ISAAC_RL_TRIGGER_ONCE={os.environ['ISAAC_RL_TRIGGER_ONCE']}", flush=True)
         from isaac_bridge.v3_input import INPUT_REV
         # (a resume keeps its checkpoint's revision -- none: 1, refused by TokPolicy; a new run states the tree's)
         tok_kw['v3_inputs'] = (torch.load(args.resume, map_location='cpu').get('config', {}).get('v3_inputs')

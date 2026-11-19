@@ -111,6 +111,7 @@ def test_train_tok_frame_v3_refuses_item_tokens(monkeypatch, capsys, tmp_path):
     from isaac_bridge import visible_producer
     monkeypatch.setattr(visible_producer, 'VISIBLE_V3_MODE', 2)
     monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
+    monkeypatch.setenv('ISAAC_RL_TRIGGER_ONCE', '1')   # (train_tok --frame v3 sets it: restored after the test)
     base = ['--groups-file', str(tmp_path / 'missing.json'), '--frame', 'v3', '--temporal', '1', '--temporal-rooms', '0',
             '--temporal-feedback', '0', '--global-token', '1', '--items']
     for i, extra in enumerate((['--item-tokens', '1'], ['--item-tokens', '1', '--item-shared', '1'])):
