@@ -107,6 +107,21 @@ class PyBackend:
         return {k: self.td[k].float().cpu().numpy() for k in ('kv', 's', 'o')}
 
 
+class CppBackend(PyBackend):
+    """(P package phase 1) The same GraphActor(fold=True)'s graphs and buffers, each call's middle through the C++
+    driver (isaac_bridge.tok_driver.Middle: the check, the staging, the copies, the replay, the ring in C++)."""
+
+    def __init__(self, model, workers, rows_kept, fold=True, bf16=True, row_sizes=None):
+        super().__init__(model, workers, rows_kept, fold=True, bf16=bf16, row_sizes=row_sizes)
+        from isaac_bridge.tok_driver import Middle
+        self.mid = Middle(self.g, ring=self.td)
+
+    def call(self, rows, pending, widx, first, dest_rows, ukeys):
+        actions, logp, value, vg, t = self.mid.call(rows, pending, widx, dest_rows, ukeys)
+        return dict(actions=actions, logp=logp, value=value, vg=vg if vg is not None else np.zeros(len(rows)),
+                    create=t['create'], nroom=t['nroom'], steps=t['steps'], stage_prev=t['stage_prev'])
+
+
 def replay(backend, z, steps, spec):
     """Every record of the schedule through the backend: (outputs per record [W, T, ...], done mask [W, T])."""
     rows, pend, length = z['rows'], z['pending'].astype(np.int64), z['length']
@@ -163,14 +178,19 @@ def main(argv=None):
     W = len(z['length'])
     T = int(min(z['length'].max(), a.steps))
     rs = [int(x) for x in a.row_buckets.split(',') if x.strip()] or None
-    mk = lambda: PyBackend(model, W, W * T, fold=bool(a.fold), bf16=not a.fp32, row_sizes=rs)   # noqa: E731
+    def mk(kind):   # ('py' / 'cpp' before a schedule spec: 'cpp:poisson:7.8'; default py)
+        cls = CppBackend if kind == 'cpp' else PyBackend
+        return cls(model, W, W * T, fold=bool(a.fold), bf16=not a.fp32, row_sizes=rs)
     res = dict(rollout=os.path.basename(paths[0]), workers=W, steps=T, fold=a.fold, bf16=not a.fp32,
                row_buckets=rs, gpu=torch.cuda.get_device_name(0), pairs={})
     for pair in a.pairs.split(','):
         x, _, y = pair.partition('=')
         runs = []
         for spec in (x, y):
-            be = mk()
+            kind = 'py'
+            if spec.split(':', 1)[0] in ('py', 'cpp'):
+                kind, spec = spec.split(':', 1)
+            be = mk(kind)
             out, done = replay(be, z, a.steps, spec)
             runs.append((out, done, be.kept(), be.state(), len(schedule(z['length'], a.steps, spec))))
             del be
