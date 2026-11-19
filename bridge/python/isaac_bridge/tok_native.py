@@ -53,7 +53,11 @@ def build(verbose=False):
         os.close(fd)
         r = subprocess.run(cmd + ['-o', tmp], capture_output=True, text=True, timeout=600)
         if r.returncode:
-            REASON = 'build failed: ' + r.stderr[-3000:]
+            try:   # (the whole compiler output beside the cache: the first error is what matters)
+                (cache / f'{name}.err').write_text(r.stderr)
+            except OSError:
+                pass
+            REASON = f'build failed (all of it: {cache / (name + ".err")}): ' + r.stderr[:2000] + ' ... ' + r.stderr[-1000:]
             if verbose:
                 print(REASON, file=sys.stderr)
             os.unlink(tmp)

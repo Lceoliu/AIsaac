@@ -37,7 +37,7 @@ static abptok::Fold fold_of(py::dict d) {
   return L;
 }
 
-static py::tuple check_batch(py::dict consts, arr<float> headers, arr<double> versions, arr<double> sizes,
+static py::tuple py_check_batch(py::dict consts, arr<float> headers, arr<double> versions, arr<double> sizes,
                              py::object p0, py::object p_max) {
   abptok::V3 c = v3_of(consts);
   if (headers.ndim() != 2 || headers.shape(1) < 8) throw std::invalid_argument("headers: [b, >= 8] float32");
@@ -58,7 +58,7 @@ static py::tuple check_batch(py::dict consts, arr<float> headers, arr<double> ve
   return py::make_tuple(o.code, o.record, counts, o.trunc_n, o.trunc_s, o.e_bucket);
 }
 
-static py::tuple fold_pack(py::dict layout, arr<uint8_t> rows, arr<i64> pending, py::object widx, py::object reset,
+static py::tuple py_fold_pack(py::dict layout, arr<uint8_t> rows, arr<i64> pending, py::object widx, py::object reset,
                            py::object dest, py::object ukey, py::object ut, i64 eb, py::array_t<uint8_t> stage,
                            py::array_t<uint8_t> ctrl, py::object prefix) {
   abptok::Fold L = fold_of(layout);
@@ -92,7 +92,7 @@ static py::tuple fold_pack(py::dict layout, arr<uint8_t> rows, arr<i64> pending,
   return py::make_tuple(o.g, o.r, o.graph, o.crn_rows);
 }
 
-static arr<float> crn(arr<i64> keys, arr<i64> t, i64 columns) {
+static arr<float> py_crn(arr<i64> keys, arr<i64> t, i64 columns) {
   i64 n = keys.size();
   if (t.size() != n) throw std::invalid_argument("crn: keys and t of one length");
   arr<float> out({n, columns});
@@ -102,10 +102,10 @@ static arr<float> crn(arr<i64> keys, arr<i64> t, i64 columns) {
 
 PYBIND11_MODULE(TOK_EXTENSION_NAME, m) {
   m.doc() = "P package: abp_tok_core.h (v3 frame check, CRN, fold packing) for the golden samples and tests";
-  m.def("check_batch", &check_batch, py::arg("consts"), py::arg("headers"), py::arg("versions"), py::arg("sizes"),
+  m.def("check_batch", &py_check_batch, py::arg("consts"), py::arg("headers"), py::arg("versions"), py::arg("sizes"),
         py::arg("p0") = py::none(), py::arg("p_max") = py::none());
-  m.def("fold_pack", &fold_pack, py::arg("layout"), py::arg("rows"), py::arg("pending"), py::arg("widx"),
+  m.def("fold_pack", &py_fold_pack, py::arg("layout"), py::arg("rows"), py::arg("pending"), py::arg("widx"),
         py::arg("reset"), py::arg("dest"), py::arg("ukey"), py::arg("ut"), py::arg("eb"), py::arg("stage"),
         py::arg("ctrl"), py::arg("prefix") = py::none());
-  m.def("crn", &crn, py::arg("keys"), py::arg("t"), py::arg("columns"));
+  m.def("crn", &py_crn, py::arg("keys"), py::arg("t"), py::arg("columns"));
 }

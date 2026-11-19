@@ -26,7 +26,8 @@ REASON = None
 _MOD = []
 
 
-def build(verbose=False):
+def build(verbose=False, need_cuda=True):
+    """need_cuda False: build without a GPU (a compile check in a CPU container)."""
     global REASON
     if os.name == 'nt':
         REASON = 'windows'
@@ -36,7 +37,7 @@ def build(verbose=False):
     except ImportError as e:
         REASON = f'no torch: {e}'
         return None
-    if not torch.cuda.is_available():
+    if need_cuda and not torch.cuda.is_available():
         REASON = 'torch without CUDA'
         return None
     code = b''.join(Path(s).read_bytes() for s in SOURCES)
@@ -64,7 +65,11 @@ def build(verbose=False):
                 '-ltorch_python', f'-Wl,-rpath,{torch_dir / "lib"}']
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
         if r.returncode:
-            REASON = 'build failed: ' + r.stderr[-3000:]
+            try:   # (the whole compiler output beside the cache: the first error is what matters)
+                (cache / f'{name}.err').write_text(r.stderr)
+            except OSError:
+                pass
+            REASON = f'build failed (all of it: {cache / (name + ".err")}): ' + r.stderr[:2000] + ' ... ' + r.stderr[-1000:]
             if verbose:
                 print(REASON, file=sys.stderr)
             os.unlink(tmp)

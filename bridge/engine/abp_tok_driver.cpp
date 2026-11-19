@@ -6,6 +6,8 @@
 // the driver's stream, then a synchronize. call() is the test entry (tools/p_replay.py's 'cpp' backend: the same-batch
 // gate) and the body the driver thread will run per call (milestone B).
 #include <torch/extension.h>
+#include <pybind11/numpy.h>
+#include <pybind11/stl.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDAGraph.h>
 #include <c10/core/InferenceMode.h>
