@@ -995,6 +995,24 @@ COLLECT_EVERY = max(1, int(os.environ.get('ISAAC_BLOCK_COLLECT_EVERY', '1') or 1
 DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its game / worker failed before its end record)
 
 
+# (2026-11-19, the user / the coordinator: three reward terms for the long run, each 0 by default -- then every reward
+#  is as before, bit for bit; Episodes.arrive, floor / run modes):
+#   item / trinket: a collectible (ROW inv ids with a count, and pitem[0], the active item) / a trinket (pitem[1:3])
+#     not yet rewarded in this episode: weight each; the episode's set starts as what its first record holds (a start
+#     build is not rewarded), so putting an item down and taking it again, swapping two actives or dropping a trinket
+#     and taking it again pays once; a rerolled item is a new id;
+#   depth: the exit and boss terms times 1 + depth x (n - 1), n the LevelStage of the floor -- for EV_EXIT the
+#     floor left (the stage of the record before), for EV_BOSS the record's;
+#   nohit: a room cleared (EV_CLEARED) in which the episode was never hurt, over every visit: the room is (stage, the
+#     first map cell of the player's room, ROW map channel 3); a record with hurt marks its room; no room known: none.
+#  These are the actor's rewards only: the workers' branch scores (tok_branch.step_reward: the teachers, cf) do not
+#  have them, as they never had heal / resource.
+NEW_TERMS = ('item', 'trinket', 'depth', 'nohit')
+REWARD_TERMS = ('damage', 'hurt', 'time', 'win', 'death', 'timeout', 'room', 'explore', 'boss', 'exit', 'heal',
+                'resource') + NEW_TERMS
+_RT = {k: i for i, k in enumerate(REWARD_TERMS)}
+
+
 class Episodes:
     """The actor's bookkeeping of the records that arrive (vectorised over a poll's records): the reward of each
     worker's open decision, episode ends and their statistics, the action under way."""
@@ -1033,6 +1051,72 @@ class Episodes:
         # last record (the deltas' base) and the episode's gains so far
         self.gains = np.zeros((workers, 2)) if self.floor and (rw.get('heal') or rw.get('resource')) else None
         self.healed, self.gathered = np.zeros(workers), np.zeros(workers)
+        # (2026-11-19) each term's share of the episode's return (episodes.jsonl 'r', progress rw_<term>), and the new
+        # terms' state: per worker the ids rewarded (and held at the start), the rooms hurt in, the last stage
+        self.term = np.zeros((workers, len(REWARD_TERMS))) if self.floor else None
+        self.new_on = bool(self.floor and any(rw.get(k, 0.0) for k in NEW_TERMS))
+        self.counts = np.zeros((workers, 3), np.int64)   # items, trinkets, no-hit rooms rewarded
+        self.seen_c = [set() for _ in range(workers)]
+        self.seen_t = [set() for _ in range(workers)]
+        self.room_hurt = [set() for _ in range(workers)]
+        self.stage_prev = np.zeros(workers, np.int64)
+
+    @staticmethod
+    def held_ids(r):
+        """(collectibles, trinkets) a record holds: ROW inv ids with a count and the active item; the trinket slots."""
+        c = {int(v) for v, n in r['inv'] if v > 0 and n > 0}
+        if r['pitem'][0] > 0:
+            c.add(int(r['pitem'][0]))
+        return c, {int(t) for t in r['pitem'][1:3] if t > 0}
+
+    @staticmethod
+    def room_keys(rows):
+        """Per record its room: stage * 256 + the first map cell of the player's room (ROW map channel 3), -1 if none."""
+        m = rows['map'][:, 3].reshape(len(rows), -1)
+        cell = np.where(m.any(1), m.argmax(1), -1).astype(np.int64)
+        return np.where(cell >= 0, rows['stage'].astype(np.int64) * 256 + cell, -1)
+
+    def new_terms(self, rows, sel, w, ev, hu):
+        """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w."""
+        rw = self.rw
+        out = np.zeros((len(w), 4))
+        r_ = rows[sel]
+        keys = self.room_keys(r_)
+        stage = r_['stage'].astype(np.int64)
+        for j in range(len(w)):
+            i = int(w[j])
+            if rw.get('item') or rw.get('trinket'):
+                c, t = self.held_ids(r_[j])
+                nc, nt = c - self.seen_c[i], t - self.seen_t[i]
+                if nc:
+                    self.seen_c[i] |= nc
+                    out[j, 0] = rw.get('item', 0.0) * len(nc)
+                    self.counts[i, 0] += len(nc)
+                if nt:
+                    self.seen_t[i] |= nt
+                    out[j, 1] = rw.get('trinket', 0.0) * len(nt)
+                    self.counts[i, 1] += len(nt)
+            if rw.get('depth'):
+                if self.run and (ev[j] & EV_EXIT):
+                    out[j, 2] += rw['exit'] * rw['depth'] * max(int(self.stage_prev[i]) - 1, 0)
+                if ev[j] & 4:
+                    out[j, 2] += rw['boss'] * rw['depth'] * max(int(stage[j]) - 1, 0)
+            if rw.get('nohit'):
+                k = int(keys[j])
+                if hu[j] > 0 and k >= 0:
+                    self.room_hurt[i].add(k)
+                if (ev[j] & 1) and k >= 0 and k not in self.room_hurt[i]:
+                    out[j, 3] = rw['nohit']
+                    self.counts[i, 2] += 1
+        return out
+
+    def start_terms(self, rows, idx, first):
+        """An episode's first record: the new terms' state from what it holds."""
+        for j in np.flatnonzero(first):
+            i = int(idx[j])
+            c, t = self.held_ids(rows[j])
+            self.seen_c[i], self.seen_t[i], self.room_hurt[i] = c, t, set()
+            self.counts[i] = 0
 
     @staticmethod
     def cur_gains(rows):
@@ -1083,6 +1167,9 @@ class Episodes:
         self.ret[ws], self.hurt[ws], self.damage[ws], self.rooms[ws], self.boss[ws] = 0.0, 0.0, 0.0, 0, 0
         self.extra[ws] = 0
         self.healed[ws], self.gathered[ws] = 0.0, 0.0
+        if self.term is not None:   # (2026-11-19: never into the next episode's shares)
+            self.term[ws] = 0.0
+        self.counts[ws] = 0
         if self.plr is not None:
             self.v0[ws], self.gret[ws], self.steps[ws] = 0.0, 0.0, 0
 
@@ -1132,6 +1219,26 @@ class Episodes:
                     reward = reward + rw['heal'] * np.maximum(dl[:, 0], 0) + rw['resource'] * np.maximum(dl[:, 1], 0)
                     self.healed[w] += np.maximum(dl[:, 0], 0)
                     self.gathered[w] += np.maximum(dl[:, 1], 0)
+                # (2026-11-19) each term's share, for the log only (the reward above is the one trained on)
+                tm = self.term
+                tm[w, _RT['damage']] += rw['damage'] * dmg
+                tm[w, _RT['hurt']] -= rw['hurt'] * hu
+                tm[w, _RT['time']] -= rw['time']
+                tm[w, _RT['win']] += np.where(d == 1, self.end_bonus, 0.0)
+                tm[w, _RT['death']] -= np.where(d == 2, rw['death'], 0.0)
+                tm[w, _RT['timeout']] -= np.where((d == 3) & ~cap_h, rw['timeout'], 0.0)
+                tm[w, _RT['room']] += rw['room'] * ((ev & 1) > 0)
+                tm[w, _RT['explore']] += rw['explore'] * ((ev & 2) > 0)
+                tm[w, _RT['boss']] += rw['boss'] * ((ev & 4) > 0)
+                if self.run:
+                    tm[w, _RT['exit']] += rw['exit'] * ((ev & EV_EXIT) > 0)
+                if self.gains is not None:
+                    tm[w, _RT['heal']] += rw['heal'] * np.maximum(dl[:, 0], 0)
+                    tm[w, _RT['resource']] += rw['resource'] * np.maximum(dl[:, 1], 0)
+                if self.new_on:   # the new terms (each 0 by default: then nothing here)
+                    nt_ = self.new_terms(rows, has, w, ev, hu)
+                    reward = reward + nt_.sum(1)
+                    tm[w, _RT['item']:_RT['nohit'] + 1] += nt_
             if self.run or self.items:
                 ev = rows['events'][has].astype(np.int64)
                 x = self.extra
@@ -1155,6 +1262,10 @@ class Episodes:
         self.note_first(rows, idx, first)
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
             self.gains[idx] = self.cur_gains(rows)
+        if self.new_on:   # (2026-11-19) an episode's first record: its held ids and rooms; every record: its stage
+            if first.any():
+                self.start_terms(rows, idx, first)
+            self.stage_prev[idx] = rows['stage']
         if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
             st0 = first
             if st0.any():
@@ -1209,6 +1320,13 @@ class Episodes:
                     fin['active0'] = self.active0[int(i)]
                 if self.gains is not None:   # 2026-10-08: health units healed, coins + bombs + keys gathered
                     fin.update(healed=float(self.healed[i]), gathered=float(self.gathered[i]))
+                if self.new_on:   # (2026-11-19) each reward term's share of 'ret' (with the new terms only: the
+                    # driver's native consumer, held to this one record for record, has neither)
+                    fin['r'] = {k: round(float(self.term[i, j]), 4) for j, k in enumerate(REWARD_TERMS)
+                                if self.term[i, j] != 0}
+                if self.new_on:
+                    fin.update(items_new=int(self.counts[i, 0]), trinkets_new=int(self.counts[i, 1]),
+                               nohit_rooms=int(self.counts[i, 2]))
                 if self.pick is not None:   # 2026-10-13 (B23): the pedestal build, the forcing draw and its decisions
                     fin.update(build_pedestals=self.pick['bped'].get(int(i), []), pickup_forced=int(r['pmode']),
                                forced_steps=int(self.pick['steps'][i]))
@@ -1228,6 +1346,10 @@ class Episodes:
             self.ret[e], self.hurt[e], self.damage[e], self.rooms[e], self.boss[e] = 0.0, 0.0, 0.0, 0, 0
             self.extra[e] = 0
             self.healed[e], self.gathered[e] = 0.0, 0.0
+            if self.term is not None:
+                self.term[e] = 0.0
+            if self.new_on:
+                self.counts[e] = 0
             if self.plr is not None:   # 2026-10-10 (archive_plr): the score of each finished ordinary episode
                 stats_, ST_, gamma_ = self.plr
                 for j in np.flatnonzero(ended):
@@ -2472,6 +2594,12 @@ def main(argv=None, child=None, actor=None):
     rw.update({k: float(v) for k, v in (kv.split('=') for kv in (FLOOR_REWARD if floor else ROOM_REWARD).split(','))})
     if args.reward:
         rw.update({k: float(v) for k, v in (kv.split('=') for kv in args.reward.split(','))})
+    if any(rw.get(k_) for k_ in NEW_TERMS):   # (2026-11-19: item / trinket / depth / nohit)
+        if not floor:
+            p.error('--reward item / trinket / depth / nohit: --mode floor or run only')
+        if args.block_memory:
+            p.error('--reward item / trinket / depth / nohit: not with --block-memory (the native consumer of its driver '
+                    'computes the rewards without them)')
     if floor:   # the root instances are launched with the normal group's spec; the floor reset does not use its rooms
         names, assign = ['run' if run else 'floor'], [0] * args.workers
         specs = [load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))]
@@ -5282,6 +5410,11 @@ def main(argv=None, child=None, actor=None):
                         f'{name}/seconds': sum(e['decisions'] for e in eps) / m * args.frames_per_decision / 30,
                         f'{name}/rooms': sum(e['rooms'] for e in eps) / m,
                         f'{name}/boss': sum(e['boss'] for e in eps) / m})
+        if floor and any(rw.get(k_) for k_ in NEW_TERMS):   # (2026-11-19) each term's mean share; the new terms' counts
+            m_ = max(len(finished), 1)
+            row.update({f'rw_{k}': sum(e.get('r', {}).get(k, 0.0) for e in finished) / m_ for k in REWARD_TERMS})
+            row.update({f'n_{k}': sum(e.get(f, 0) for e in finished) / m_
+                        for k, f in (('item', 'items_new'), ('trinket', 'trinkets_new'), ('nohit', 'nohit_rooms'))})
         if block_on:
             row.update({'block_ppo_'+key:value for key,value in block_ppo_counts.items()})
             ru1 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))
