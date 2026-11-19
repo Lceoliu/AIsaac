@@ -6,11 +6,11 @@
 
 /* ---- F1: identity and header */
 #define ABP_V3_SCHEMA "isaac-visible-prlmens-g-v3"
-#define ABP_V3_VERSION 2026111802
+#define ABP_V3_VERSION 2026111803
 #define ABP_V3_FRAME_BYTES 131072
 #define ABP_V3_MAGIC 61107
 /* header[6]: VERSION - 2026000000, exact in float32 (schema_v3.version_word) */
-#define ABP_V3_VERSION_WORD 111802
+#define ABP_V3_VERSION_WORD 111803
 #define ABP_V3_HEADER 8
 #define ABP_V3_H_MAGIC 0
 #define ABP_V3_H_SIZE 1

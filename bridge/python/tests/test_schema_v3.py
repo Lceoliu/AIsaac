@@ -17,9 +17,9 @@ CRLF, LF = chr(13) + chr(10), chr(10)   # (a Windows checkout may hold the heade
 
 
 def test_f1_sizes():
-    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111802
+    assert S.SCHEMA == 'isaac-visible-prlmens-g-v3' and S.VERSION == 2026111803
     assert (S.FIXED, S.PF, S.LOCAL, S.EF, S.NF, S.SF, S.BODY, S.RC) == (2417, 192, 405, 64, 8, 24, 597, 21)
-    assert S.HEADER == 8 and S.MAGIC == 61107 and S.VERSION_WORD == 111802 and S.H_VERSION == 6
+    assert S.HEADER == 8 and S.MAGIC == 61107 and S.VERSION_WORD == 111803 and S.H_VERSION == 6
     assert not hasattr(S, 'LAYOUT_GEN') and not hasattr(S, 'H_GEN')   # (batch 5: one number, VERSION)
     assert S.frame_floats(1, 0, 0, 0) == 2417 + 597
     assert S.frame_floats(4, 128, 64, 32) * 4 < S.FRAME_BYTES   # (the design's worst case fits)
@@ -248,3 +248,11 @@ def test_batch5_the_header_word_is_the_version():
     assert 'LAYOUT_GEN' not in header and 'H_GEN' not in header
     c = (HERE.parents[1] / 'engine' / 'abp_v3_native.c').read_text(encoding='utf-8')
     assert 'h[ABP_V3_H_VERSION] = ABP_V3_VERSION_WORD;' in c and str(S.VERSION_WORD) not in c
+
+
+def test_price_coin_scale_is_model_side():
+    """PRICE_COIN_SCALE (2026-11-18): the coins / 15 of the price number, model side only (no wire change: VERSION
+    stays the batch's, nothing in the C header)."""
+    assert S.PRICE_COIN_SCALE == 15.0 and S.VERSION == 2026111803
+    header = (HERE.parents[1] / 'engine' / 'abp_schema_v3.h').read_text()
+    assert 'PRICE_COIN' not in header

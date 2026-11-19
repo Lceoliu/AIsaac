@@ -336,3 +336,17 @@ def test_more_bodies_than_the_cap_are_refused():
         VP.observation_frame_v3(raw_block(bodies=bodies + [body(init_seed=99)]))
     header = (BRIDGE / 'engine' / 'abp_schema_v3.h').read_text()
     assert f'#define ABP_V3_CAP_BODY {V3.CAP_BODY}' in header
+
+
+def test_a_non_finite_position_is_refused():
+    """(2026-11-18, Codex round 2) An entity or a placed body at a non-finite position has no place in the distance
+    order: refused before the sort (abp_v3_native.c hands such a frame back); a body without a room position
+    (position_known 0) takes no part and is not looked at."""
+    for v in (float('nan'), float('inf'), float('-inf')):
+        with pytest.raises(ValueError, match='entity at a non-finite'):
+            VP.observation_frame_v3(raw_block(entities=[entity(x=v)]))
+        with pytest.raises(ValueError, match='body at a non-finite'):
+            VP.observation_frame_v3(raw_block(bodies=[body(y=v)]))
+    VP.observation_frame_v3(raw_block(bodies=[body(), body(position_known=0, x=float('nan'), y=0.0)]))
+    src = (BRIDGE / 'engine' / 'abp_v3_native.c').read_text(encoding='utf-8')
+    assert 'return "v3: an entity at a non-finite position";' in src and 'dx * dx + dy * dy' in src

@@ -133,6 +133,9 @@ def test_the_bridge_mode_is_checked(mode):
         VP.check_bridge_mode(unknown, 1)
     with pytest.raises(VP.VisibleV3Fatal, match='did not answer'):
         VP.check_bridge_mode(dict(type='error', cmd='visible_v3', msg='visible_v3: mode must be 0-3, got 4'), 0)
+    for bad in ('x', None, [1]):   # (a malformed answer: a protocol error, not a ValueError)
+        with pytest.raises(VP.VisibleV3Fatal, match='answered the mode query'):
+            VP.check_bridge_mode(dict(type='ok', cmd='visible_v3', mode=bad, native_available=True), 1)
     mode(3)   # (the default: the worker's configured mode)
     assert VP.check_bridge_mode(ok(3)) == 3
 
@@ -165,26 +168,29 @@ def test_the_connect_check_with_the_clients_recv():
     c = Client(dict(type='ok', cmd='visible_v3', mode=2, native_available=True))
     assert check_visible_v3(c, 2) == 2 and c.sent == [{'cmd': 'visible_v3'}]
     sock = c._sock
-    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 2, this worker is configured for mode 0'):
-        check_visible_v3(c, 0)
+    with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 2, this worker is configured for mode 1'):
+        check_visible_v3(c, 1)
     assert sock.closed and c._sock is None and not issubclass(VP.VisibleV3Fatal, (BridgeError, OSError, RuntimeError,
                                                                                   ValueError))
-    old = Client(dict(type='error', msg='unknown cmd'))
-    assert check_visible_v3(old, 0) == 0 and not old._sock.closed
+    old = Client(dict(type='error', msg='unknown cmd'))   # (mode 0: no query at all -- 05f1622's protocol)
+    assert check_visible_v3(old, 0) == 0 and old.sent == [] and not old._sock.closed
     with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 1'):
         check_visible_v3(old, 1)
     src = Path(al.__file__).with_name('abplus.py').read_text(encoding='utf-8')
     assert 'check_visible_v3(self)' in src[src.index('    def connect(self):'):]
 
 
-def _socket_client(answer):
-    """An IsaacBridgeEnv on one end of a socket pair (its real _send / _recv); answer: bytes written by the other end
-    first, then None closes it (EOF)."""
+def _socket_client(answer, binary=False):
+    """A client on one end of a socket pair with its real _send / _recv: IsaacBridgeEnv's, or (binary) the
+    AbplusTrainingEnv's of obs_format 2; answer: bytes written by the other end first, None: EOF on our read."""
     import socket
     from isaac_bridge.env import IsaacBridgeEnv
+    from isaac_bridge.abplus import AbplusTrainingEnv
     ours, theirs = socket.socketpair()
-    c = object.__new__(IsaacBridgeEnv)
+    c = object.__new__(AbplusTrainingEnv if binary else IsaacBridgeEnv)
     c._sock, c._buf = ours, b''
+    if binary:
+        c.obs_format, c.validate_obs = 2, False
     if answer is not None:
         theirs.sendall(answer)
     else:   # (EOF on our read; our query still goes out)
@@ -192,31 +198,32 @@ def _socket_client(answer):
     return c, theirs
 
 
-def test_the_connect_check_retries_transport_errors_as_before():
+@pytest.mark.parametrize('binary', [False, True])
+def test_the_connect_check_retries_transport_errors_as_before(binary):
     """(2026-11-18, round 4) Only a real error answer of the bridge ({"type": "error"}: BridgeErrorReply) is read as
     the answer -- 'unknown cmd' is mode 0, another error a protocol error (VisibleV3Fatal); the game closing the
     connection during the query (EOF) or no connection stays a plain BridgeError, retried by the samplers as before
     05f1622 (before: any BridgeError became the answer, and an EOF a fatal error, in mode 0 too)."""
     from isaac_bridge.abplus import check_visible_v3
     from isaac_bridge.env import BridgeError, BridgeErrorReply
-    c, other = _socket_client(b'{"type":"error","msg":"unknown cmd"}\n')
-    assert check_visible_v3(c, 0) == 0
-    c, other = _socket_client(b'{"type":"error","msg":"unknown cmd"}\n')
+    c, other = _socket_client(binary=binary, answer=b'{"type":"error","msg":"unknown cmd"}\n')
     with pytest.raises(VP.VisibleV3Fatal, match='bridge runs mode 0, this worker is configured for mode 1'):
         check_visible_v3(c, 1)
-    c, other = _socket_client(b'{"type":"error","msg":"something else"}\n')
+    c, other = _socket_client(binary=binary, answer=b'{"type":"error","msg":"something else"}\n')
     with pytest.raises(VP.VisibleV3Fatal, match='did not answer'):
-        check_visible_v3(c, 0)
-    for mode in (0, 2):
-        c, other = _socket_client(None)   # the game gone during the query
+        check_visible_v3(c, 2)
+    for mode in (1, 2):
+        c, other = _socket_client(None, binary)   # the game gone during the query
         with pytest.raises(BridgeError, match='connection closed by game') as got:
             check_visible_v3(c, mode)
         assert not isinstance(got.value, (VP.VisibleV3Fatal, BridgeErrorReply))
-    c, other = _socket_client(b'')
+    c, other = _socket_client(binary=binary, answer=b'')
     c._sock = None   # not connected
     with pytest.raises(BridgeError, match='not connected'):
-        check_visible_v3(c, 0)
-    c, other = _socket_client(b'{"type":"error","msg":"x"}\n')   # the reply kept on the exception
+        check_visible_v3(c, 1)
+    c, other = _socket_client(None, binary)   # mode 0: no query sent, nothing read (05f1622's protocol)
+    assert check_visible_v3(c, 0) == 0 and c._buf == b''
+    c, other = _socket_client(binary=binary, answer=b'{"type":"error","msg":"x"}\n')   # the reply kept on the exception
     with pytest.raises(BridgeErrorReply) as got:
         c._recv()
     assert got.value.reply == {'type': 'error', 'msg': 'x'} and isinstance(got.value, BridgeError)
@@ -355,10 +362,11 @@ def test_native_golden_cmp_exit_code(tmp_path):
     frozen = json.loads((FIX / 'manifest.json').read_text())
     names = [f['name'] for f in frozen['frames']]
 
-    def setup(d, which=None, errors=()):
+    def setup(d, which=None, errors=(), native=None):
         d.mkdir()
-        (d / 'manifest.json').write_text(json.dumps(dict(frames=[dict(name=n) for n in (which or names)],
-                                                         errors=list(errors))))
+        (d / 'manifest.json').write_text(json.dumps(dict(
+            frames=[dict(name=n, native=(native or {}).get(n, 'frame')) for n in (which or names)],
+            errors=list(errors))))
         for n in (which or names):
             shutil.copy(FIX / f'{n}.v3.bin', d / f'{n}.v3.bin')   # (stall 0.5 / 1, as the fixtures)
             raw = json.loads((FIX / f'{n}.raw.json').read_text())['raw']
@@ -367,7 +375,7 @@ def test_native_golden_cmp_exit_code(tmp_path):
     run = lambda d: _run([sys.executable, str(tool), str(d)], cwd=str(PY))
     good = setup(tmp_path / 'good')
     r = run(good)
-    assert r.returncode == 0 and 'PASS' in r.stdout and 'frames 19/19 equal' in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and 'PASS' in r.stdout and f'frames {len(names)}/{len(names)} equal' in r.stdout, r.stdout + r.stderr
 
     def broken(how):
         d = setup(tmp_path / how.replace(' ', '_'))
@@ -391,6 +399,14 @@ def test_native_golden_cmp_exit_code(tmp_path):
     assert r.returncode == 1 and 'collection error' in r.stdout
     r = run(setup(tmp_path / 'one', which=['forgotten']))
     assert r.returncode == 1 and 'expected set' in r.stdout
+    # (round 5) the directory reused, this run's native encoder answered nil for a frame: the earlier run's
+    # .native.bin is still there, byte-equal -- the manifest's mark fails it; a manifest without marks fails too
+    r = run(setup(tmp_path / 'reused', native={'shooting': 'nil:v3: grid size'}))
+    assert r.returncode == 1 and "no native frame from this run for ['shooting']" in r.stdout
+    d = setup(tmp_path / 'unmarked')
+    m = json.loads((d / 'manifest.json').read_text())
+    (d / 'manifest.json').write_text(json.dumps(dict(m, frames=[dict(name=f['name']) for f in m['frames']])))
+    assert run(d).returncode == 1
     d = setup(tmp_path / 'missing')
     (d / 'shooting.native.bin').unlink()
     r = run(d)
@@ -398,6 +414,20 @@ def test_native_golden_cmp_exit_code(tmp_path):
     empty = tmp_path / 'empty'
     empty.mkdir()
     assert run(empty).returncode == 1
+
+
+def test_the_golden_probe_moves_an_earlier_run_aside(tmp_path):
+    """abplus_probe_v3_golden.clear_previous (round 5): the files a run writes, left by an earlier run in the same
+    directory, go to <out>/trash/<time>/ (never deleted) before this run writes its own; other files stay."""
+    probe = _load(PY / 'abplus_probe_v3_golden.py', 'probe_v3_golden')
+    for f in ('a.raw.json', 'a.v3.bin', 'a.engine.json', 'a.native.bin', 'manifest.json', 'run.log', 'STATUS'):
+        (tmp_path / f).write_text(f)
+    assert probe.clear_previous(tmp_path) == 5
+    left = sorted(p.name for p in tmp_path.iterdir() if p.is_file())
+    assert left == ['STATUS', 'run.log']
+    moved = sorted(p.name for p in (tmp_path / 'trash').rglob('*') if p.is_file())
+    assert moved == ['a.engine.json', 'a.native.bin', 'a.raw.json', 'a.v3.bin', 'manifest.json']
+    assert probe.clear_previous(tmp_path) == 0
 
 
 def test_accept_checks():
@@ -460,3 +490,62 @@ def test_deploy_abphome(tmp_path, case):
         assert lib.read_text() == 'OLD'
     if case in ('gcc fails', 'fails after a new file', 'gpu refused'):
         assert not (tools / 'libabp_turbo.so.new').exists()
+
+
+# ------------------------------------------------------------------ Codex round 9 (the hardening batch's review)
+def test_a_mode_0_worker_refuses_v3_records_before_the_row(mode, monkeypatch):
+    """Item 1: a worker not configured for v3 sends no mode query (05f1622's protocol without the query) and so must
+    refuse a v3 record itself -- before the ROW, as an ordinary protocol error (ValueError: the episode's handlers take
+    it, the worker goes on) -- a valid native frame, a bad one, a raw v3 block; and FastRow sends such a payload to
+    encode_row, where the same refusal holds. Before: a valid frame was written (visible_schema the v3 VERSION), a bad
+    one ended the worker."""
+    mode(0)
+    good = VP.observation_frame_v3(RAW)
+    bad = bytearray(good)
+    bad[0:4] = bytes(4)   # (another magic)
+    for payload in (lean(frame=good), lean(frame=bytes(bad)), lean(raw=RAW)):
+        row = np.zeros(1, ROW)
+        with pytest.raises(ValueError, match='not configured for v3') as got:
+            write_visible(al.LeanDecoder().decode(payload), row)
+        assert not isinstance(got.value, VP.VisibleV3Fatal)
+        assert int(row['visible_schema'][0]) == 0 and int(row['visible_bytes'][0]) == 0
+    calls = []
+    fr = FastRow(lambda *a: calls.append(a) or 0, EpisodeState(1000), al.LeanDecoder())
+    fr._ptrs = (1, 1, 1)
+    row = np.zeros(1, ROW)
+    with pytest.raises(ValueError, match='not configured for v3'):
+        fr.encode(lean(frame=good), row, row.ctypes.data, 1)
+    assert not calls and int(row['visible_schema'][0]) == 0
+    mode(2)   # (a v3 worker writes the same valid frame)
+    row = np.zeros(1, ROW)
+    assert write_visible(al.LeanDecoder().decode(lean(frame=good)), row)
+    assert int(row['visible_schema'][0]) == V3.VERSION
+
+
+def test_a_whole_payload_of_bad_structure_is_fatal_in_v3_mode(mode):
+    """Item 2: the inner structure of a whole payload (read_lean_raw read all its bytes -- a connection lost half way is
+    a BridgeError there): the v3 frame or the visible block running past the end, trailing bytes -- VisibleV3Fatal in a
+    v3 worker (not retried), the ordinary ValueError in mode 0."""
+    frame = VP.observation_frame_v3(RAW)
+    good = lean(frame=frame)
+    for bad in (good[:-1], good + bytes(1), lean(raw=RAW)[:-3]):
+        mode(2)
+        with pytest.raises(VP.VisibleV3Fatal):
+            al.LeanDecoder().decode(bad)
+        mode(0)
+        with pytest.raises(ValueError) as got:
+            al.LeanDecoder().decode(bad)
+        assert not isinstance(got.value, VP.VisibleV3Fatal)
+
+
+def test_the_mode_answer_is_taken_as_the_protocol_has_it():
+    """Item 2: the mode an integer 0-3 as it is (2.9 is no 2, inf no OverflowError, True / '2' no mode), native_available
+    a boolean."""
+    ok = dict(type='ok', cmd='visible_v3', native_available=True)
+    assert VP.check_bridge_mode(dict(ok, mode=2), 2) == 2
+    for bad in (2.9, 2.0, float('inf'), float('nan'), True, '2', -1, 4, None):
+        with pytest.raises(VP.VisibleV3Fatal, match='answered the mode query'):
+            VP.check_bridge_mode(dict(ok, mode=bad), 2)
+    for bad in (1, 'yes', None):
+        with pytest.raises(VP.VisibleV3Fatal, match='native_available'):
+            VP.check_bridge_mode(dict(ok, mode=2, native_available=bad), 2)
