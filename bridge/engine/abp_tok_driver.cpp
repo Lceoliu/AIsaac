@@ -108,6 +108,81 @@ struct TokMiddle {
     return c10::cuda::CUDAStream::unpack3(stream_id, (c10::DeviceIndex)device_index, c10::DeviceType::CUDA);
   }
 
+  // The call's middle on raw pointers (no Python object, no GIL: the driver thread's body). rows [k, row_bytes] (only
+  // each record's prefix is read), pending [k, nh], widx [k], ring [k] (null: no K / V kept), cs / cd the cf_snap
+  // copies (actor slot -> bank row). out [k, cols] written. Returns the check's code (0: the call ran), record; e_bucket
+  // and graph through the pointers. Throws c10::Error on a misuse (no graph for the call, ...).
+  // fake (tests without a GPU): no copy, no replay -- each record's outputs from its bytes (fake_outputs).
+  bool fake = false;
+  int run_raw(const uint8_t *rb, i64 k, const i64 *pending_p, const i64 *widx_p, const i64 *ring_p,
+              const std::vector<i64> &cs, const std::vector<i64> &cd, float *out_p, i64 *rec_p, i64 *eb_p, i64 *graph_p) {
+    std::vector<float> head((size_t)(8*k)), p0((size_t)(2*k));
+    std::vector<double> vs((size_t)k), nb((size_t)k);
+    std::vector<i64> pf((size_t)k), cnt((size_t)(4*k), 0);
+    const i64 cap = L.row_bytes-off_frame;
+    for (i64 i = 0; i < k; i++) {
+      const uint8_t *r = rb+i*L.row_bytes;
+      std::memcpy(&head[8*i], r+off_frame, 32);
+      int32_t s, b; std::memcpy(&s, r+off_schema, 4); std::memcpy(&b, r+off_bytes, 4);
+      vs[i] = (double)s; nb[i] = (double)b;
+      std::memcpy(&p0[2*i], r+off_frame+4*v3.p0_role, 4);
+      std::memcpy(&p0[2*i+1], r+off_frame+4*v3.p0_known, 4);
+      pf[i] = (b >= 0 && b <= cap) ? off_frame-L.end_e+(((i64)b+3) & ~(i64)3) : L.row_bytes-L.end_e;
+    }
+    abptok::CheckOut chk = abptok::check_batch(v3, head.data(), 8, vs.data(), nb.data(), p0.data(), k, true, v3.p_max,
+                                               cnt.data());
+    *rec_p = chk.record; *eb_p = chk.e_bucket; *graph_p = -1;
+    if (chk.code) return chk.code;
+    if (fake) { fake_outputs(rb, k, cnt.data(), out_p); last_e_bucket = chk.e_bucket; last_rows = k; calls++; return 0; }
+    uint8_t *st = stage_h.data_ptr<uint8_t>(), *ct = ctrl_h.data_ptr<uint8_t>();
+    abptok::FoldOut fo = abptok::fold_pack(L, rb, k, pending_p, widx_p, nullptr, ring_p, nullptr, nullptr, chk.e_bucket,
+                                           st, ct, pf.data());
+    TORCH_CHECK(fo.g >= 0, "TokMiddle: no graph for this call (bucket ", chk.e_bucket, ", ", k, " rows)");
+    TORCH_CHECK(fo.graph < (i64)graphs.size() && graphs[fo.graph].graph, "TokMiddle: graph ", fo.graph, " not registered");
+    i64 *ch = counts_h.data_ptr<i64>();
+    std::memcpy(ch, cnt.data(), (size_t)(32*k));
+    std::memset(ch+4*k, 0, (size_t)(32*(L.n-k)));
+    Entry &e = graphs[fo.graph];
+    c10::InferenceMode im;
+    auto s = stream();
+    c10::cuda::CUDAStreamGuard guard(s);
+    if (!cs.empty()) {   // cf_snap (B34): the bank rows from the actor's slots, before this step, on this stream
+      auto dev = ts_t[0].device();
+      at::Tensor si = at::tensor(cs, at::kLong).to(dev), di = at::tensor(cd, at::kLong).to(dev);
+      for (size_t j = 0; j < 6; j++) bank_t[j].index_copy_(ts_ax[j], di, ts_t[j].index_select(ts_ax[j], si));
+    }
+    raw.narrow(0, 0, k).copy_(stage_h.narrow(0, 0, k), true);
+    counts.copy_(counts_h, true);
+    ctrl.narrow(0, 0, fo.r).copy_(ctrl_h.narrow(0, 0, fo.r), true);
+    e.graph->replay();
+    out_h.narrow(0, 0, k).copy_(e.out.narrow(0, 0, k), true);
+    if (ring_p) {
+      TORCH_CHECK(ring_kv.defined() && e.tkv.defined(), "TokMiddle: ring rows without a ring / temporal outputs");
+      at::Tensor rr = ctrl.narrow(0, 0, k).narrow(1, L.dest_at, 8).view(at::kLong).reshape({k}).contiguous();
+      auto sz = ring_kv.sizes().vec(); sz[0] = k;
+      ring_kv.index_copy_(0, rr, e.tkv.narrow(0, 0, k).narrow(1, 0, L2D).reshape(sz).to(ring_kv.scalar_type()));
+      ring_s.index_copy_(0, rr, e.tkv.narrow(0, 0, k).narrow(1, L2D, D).to(ring_s.scalar_type()));
+      ring_o.index_copy_(0, rr+ring_obase, e.o.narrow(0, 0, k).to(ring_o.scalar_type()));
+    }
+    s.synchronize();
+    std::memcpy(out_p, out_h.data_ptr<float>(), (size_t)(4*k*cols));
+    last_e_bucket = chk.e_bucket; last_graph = fo.graph; last_rows = k; calls++;
+    *graph_p = fo.graph;
+    return 0;
+  }
+  // (fake) outputs as a function of the record: actions (t + c) mod 3, logp -t, value t, vg 2t, the four counters
+  // (0, 0, t, 0) -- t the ROW 't' (int32 at off_t); the tests know them without a GPU
+  void fake_outputs(const uint8_t *rb, i64 k, const i64 *, float *out_p) {
+    for (i64 i = 0; i < k; i++) {
+      int32_t t; std::memcpy(&t, rb+i*L.row_bytes+L.off_t, 4);
+      float *o = out_p+i*cols;
+      for (i64 c = 0; c < cols; c++) o[c] = 0.0f;
+      for (i64 c = 0; c < L.nh; c++) o[c] = (float)((t+c)%3);
+      o[L.nh] = -(float)t; o[L.nh+1] = (float)t;
+      if (cols >= L.nh+7) { o[L.nh+2] = 2.0f*(float)t; o[L.nh+5] = (float)t; }
+    }
+  }
+
   // One call (milestone A: synchronous). rows [k, row_bytes] uint8 (each record's ROW bytes; only its prefix is read),
   // pending [k, nh] int64, widx [k] int64 (the temporal slots), ring_rows [k] int64 (-1 in none: no K / V kept),
   // ukey / ut [k] (none: the graph's own uniforms or the records' crn), cf_src / cf_dst (none: no bank copy).
@@ -202,6 +277,8 @@ struct TokMiddle {
   }
 };
 
+#include "abp_tok_thread.h"   // (milestone B: TokDriver, the driver thread)
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "P package: the thin TokPolicy driver (milestone A: TokMiddle, one call's middle in C++)";
   py::class_<TokMiddle>(m, "TokMiddle")
@@ -218,5 +295,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
            py::arg("ukey") = py::none(), py::arg("ut") = py::none(), py::arg("cf_src") = py::none(),
            py::arg("cf_dst") = py::none())
       .def_readonly("last_e_bucket", &TokMiddle::last_e_bucket).def_readonly("last_graph", &TokMiddle::last_graph)
-      .def_readonly("calls", &TokMiddle::calls);
+      .def_readonly("calls", &TokMiddle::calls).def_readwrite("fake", &TokMiddle::fake);
+  py::class_<TokDriver>(m, "TokDriver")
+      .def(py::init<py::object>())
+      .def("set_sampler", &TokDriver::set_sampler).def("set_rules", &TokDriver::set_rules)
+      .def("set_blocks", &TokDriver::set_blocks).def("set_ring_rows", &TokDriver::set_ring_rows)
+      .def("set_version", &TokDriver::set_version).def("set_pending", &TokDriver::set_pending)
+      .def("pending_of", &TokDriver::pending_of)
+      .def("start", &TokDriver::start).def("stop", &TokDriver::stop).def("pause", &TokDriver::pause)
+      .def("resume", &TokDriver::resume).def("is_paused", &TokDriver::is_paused).def("fatal", &TokDriver::fatal)
+      .def("last_seq", &TokDriver::last_seq).def("take", &TokDriver::take, py::arg("max_n"), py::arg("timeout"))
+      .def("release_block", &TokDriver::release_block).def("release_ring", &TokDriver::release_ring)
+      .def("counters", &TokDriver::counters)
+      .def_readwrite("r_timeout_s", &TokDriver::r_timeout_s).def_readwrite("test_call_delay", &TokDriver::test_call_delay);
 }

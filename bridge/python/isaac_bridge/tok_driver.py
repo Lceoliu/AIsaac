@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 
 ENGINE = Path(__file__).resolve().parents[2] / 'engine'
-SOURCES = (ENGINE / 'abp_tok_driver.cpp', ENGINE / 'abp_tok_core.h')
+SOURCES = (ENGINE / 'abp_tok_driver.cpp', ENGINE / 'abp_tok_core.h', ENGINE / 'abp_tok_thread.h')
 REASON = None
 _MOD = []
 
@@ -81,11 +81,12 @@ def build(verbose=False, need_cuda=True):
     return str(path)
 
 
-def load(verbose=False):
+def load(verbose=False, need_cuda=True):
+    """need_cuda False: also without a GPU (the thread's tests in fake mode)."""
     if _MOD:
         return _MOD[0]
     import torch  # noqa: F401  (torch's libraries before the extension's)
-    path = build(verbose)
+    path = build(verbose, need_cuda=need_cuda)
     if path is None:
         return None
     name = Path(path).stem
