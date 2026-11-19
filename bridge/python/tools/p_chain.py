@@ -538,6 +538,7 @@ def main(argv=None):
                 for j_, w_ in enumerate(ws.tolist()):
                     rows[j_] = plan[w_][int(nxt[w_])]
                 cfs = np.array([sent[int(w)][int(nxt[w])]['cf'] for w in ws], np.int64)
+                srows = [sent[int(w)][int(nxt[w])]['row'] for w in ws]   # (the slot's bytes as the worker wrote them)
                 nxt[ws] += 1
                 go = go_rule(rows, a.cap_t, a.trunc, DONE_BRANCH)
                 done = rows['done'] != 0
@@ -558,6 +559,7 @@ def main(argv=None):
                             (gw * T + dec).astype(np.int64), keys_t)
                 for j, w in enumerate(gw.tolist()):
                     out[(w, int(dec[j]))] = dict(pend=pend[w].copy(), ver=ver, row=gr[j:j + 1].copy(),
+                                                 sent_row=srows[int(g[j])],
                                                  **{k: np.asarray(r[k])[j] for k in OUTS})
                 pend[gw] = np.asarray(r['actions'], np.int64)
         finally:
@@ -594,12 +596,13 @@ def main(argv=None):
                                 np.array([ref[x]['ver'] for x in keys], np.int64))
         dest = np.array([w * T + d for w, d in keys], np.int64)
         g1['dest'] = bitdiff(np.array([drv[x]['dest'] for x in keys], np.int64), dest)
-        # the rows stored against the sender's (the prefix the driver copies: fixed fields + the frame's bytes)
+        # the rows stored against the slot's bytes as the worker wrote them (the prefix the driver copies: the fixed
+        # fields and the padding between them, then the frame's bytes)
         fa = ROW.fields['visible_frame'][1]
         same_rows = 0
         for x in keys:
             sr = drv[x]['row'].view(np.uint8).reshape(-1)
-            rr = ref[x]['row'].view(np.uint8).reshape(-1)
+            rr = ref[x]['sent_row'].view(np.uint8).reshape(-1)
             nb_ = int(ref[x]['row']['visible_bytes'][0])
             e = min(fa + ((max(nb_, 0) + 3) & ~3), ROW.itemsize)
             same_rows += bool(np.array_equal(sr[:e], rr[:e]))
