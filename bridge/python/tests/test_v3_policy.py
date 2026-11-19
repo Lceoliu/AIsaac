@@ -411,14 +411,22 @@ def test_input_revision_2():
     enc = FrameEncoderV3(64, 1, 4)
     ja = VI.PLAN['E']['num'].index(V3.col(V3.E_COLS, 'age'))
     x = torch.zeros(3, len(VI.PLAN['E']['num']))
-    x[:, ja] = torch.tensor([0.0, 8 / 60, 8.0])   # (0 s, 8 s, the clamp: 8 min)
+    x[:, ja] = torch.tensor([0.0, 8 / 60, 8.0])   # (0 s, 8 game seconds, the clamp: 8 game minutes)
     y = enc._log_inputs(x, 'E')
     assert torch.allclose(y[:, ja], torch.tensor([0.0, math.log2(9) / 2, math.log2(481) / 2]))
     assert torch.equal(torch.cat([y[:, :ja], y[:, ja + 1:]], 1), torch.cat([x[:, :ja], x[:, ja + 1:]], 1))
-    jc = VI.PLAN['S']['num'].index(V3.col(V3.S_COLS, 'charge'))
-    s = torch.zeros(3, len(VI.PLAN['S']['num']))
-    s[:, jc] = torch.tensor([0.05, 0.1, 0.8])   # (6 / 120, 12 / 120, 96 / 120)
-    assert torch.allclose(enc._log_inputs(s, 'S')[:, jc], torch.tensor([0.5, 1.0, 1 + math.log2(8)]))
+    for name in ('charge', 'max_charge'):
+        jc = VI.PLAN['S']['num'].index(V3.col(V3.S_COLS, name))
+        s = torch.zeros(3, len(VI.PLAN['S']['num']))
+        s[:, jc] = torch.tensor([0.05, 0.1, 0.8])   # (6 / 120, 12 / 120, 96 / 120)
+        assert torch.allclose(enc._log_inputs(s, 'S')[:, jc], torch.tensor([0.5, 1.0, 1 + math.log2(8)])), name
+    # the L token's last Linear x5 and the G token's parameter std 0.15 at init (independent expectations)
+    torch.manual_seed(0)
+    ref = torch.nn.Linear(enc.l_cnn[-1].in_features, enc.l_cnn[-1].out_features)
+    assert enc.l_cnn[-1].weight.abs().max() > 4 * ref.weight.abs().max()
+    m = build()
+    assert 0.1 < float(m.gtok.tok.std()) < 0.2
+    assert 'trigger_once' not in m.config and TP.TokPolicy(**CFG, trigger_once=0).config['trigger_once'] == 0
     with pytest.raises(ValueError, match='revision'):
         TP.TokPolicy(**{k: v for k, v in CFG.items() if k != 'v3_inputs'})
     assert build().config['v3_inputs'] == VI.INPUT_REV

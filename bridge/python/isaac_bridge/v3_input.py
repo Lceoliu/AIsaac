@@ -58,11 +58,12 @@ _MAIN = V3.BODY_ROLE['main']
 # ----------------------------------------------------------------------------------------------- column plans
 # (2026-11-19, the coordinator: the first arm's range table -- E age saturated at the clamp in 24 % of the entity rows
 #  (8 s), S charge / max_charge in timed items (frames). The model's view, not the wire: these columns decoded in a
-#  wider unit before the clamp -- age in minutes (the clamp at 8 min), charges in 120ths (at 960) -- and frame_v3 maps
-#  them back (frame_v3.LOG_INPUTS: log2(1 + age in s) / 2, the charges linear up to 12 and logarithmic past it).
+#  wider unit before the clamp -- age in game minutes (30 logic frames = 1 game second, the project's measure: Codex round
+#  12; the clamp at 8 game minutes), charges in 120ths (at 960) -- and frame_v3 maps them back (frame_v3.LOG_INPUTS:
+#  log2(1 + game seconds) / 2, the charges linear up to 12 and logarithmic past it).
 #  INPUT_REV 2: a model of an older revision (no config key) is refused, its tree decodes it.)
 INPUT_REV = 2
-WIDEN = {('E', 'age'): 60.0, ('S', 'charge'): 10.0, ('S', 'max_charge'): 10.0}
+WIDEN = {('E', 'age'): 30.0, ('S', 'charge'): 10.0, ('S', 'max_charge'): 10.0}   # (age: FrameCount / 60 x 30 = / 1800)
 
 
 def _plan(cols, table):

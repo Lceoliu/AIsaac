@@ -246,8 +246,13 @@ def main():
                         'its workers must send v3 frames')
             if args.ablate or args.item_slots is not None:
                 p.error('--ablate / --item-slots: ROW-encoder options, not for a v3 checkpoint')
-            if ck.get('config', {}).get('v3_inputs'):   # (input revision 2 on: trained with trigger-once, train_tok)
-                os.environ.setdefault('ISAAC_RL_TRIGGER_ONCE', '1')
+            if ck.get('config', {}).get('v3_inputs'):   # (input revision 2 on: the trigger mode it was trained in)
+                ck_trig = ck['config'].get('trigger_once')
+                want = str(1 if ck_trig is None else int(ck_trig))
+                have = os.environ.setdefault('ISAAC_RL_TRIGGER_ONCE', want)
+                if have != want:
+                    p.error(f'ISAAC_RL_TRIGGER_ONCE={have}: the checkpoint was trained with {want} (Codex round 12)')
+                print(f'v3 checkpoint: ISAAC_RL_TRIGGER_ONCE={have}', flush=True)
         elif VISIBLE_V3_MODE and args.obs_visible:
             p.error(f'ISAAC_RL_VISIBLE_V3={VISIBLE_V3_MODE} sends v3 frames, this checkpoint reads ROW records: unset it')
     out.mkdir(parents=True, exist_ok=False)

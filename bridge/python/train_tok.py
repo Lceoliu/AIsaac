@@ -2410,8 +2410,23 @@ def main(argv=None, child=None, actor=None):
         #  "triggered" twice per press, 13 active items unusable or used twice; abp_bridge.lua TRIGGER_ONCE_ALL. The
         #  games inherit the trainer's environment; an explicit ISAAC_RL_TRIGGER_ONCE=0 is kept)
         os.environ.setdefault('ISAAC_RL_TRIGGER_ONCE', '1')
-        print(f"frame v3: ISAAC_RL_TRIGGER_ONCE={os.environ['ISAAC_RL_TRIGGER_ONCE']}", flush=True)
+        trig_ = os.environ['ISAAC_RL_TRIGGER_ONCE']
+        if trig_ not in ('0', '1'):
+            p.error(f'ISAAC_RL_TRIGGER_ONCE={trig_!r}: 0 or 1')
+        print(f"frame v3: ISAAC_RL_TRIGGER_ONCE={trig_}", flush=True)
         from isaac_bridge.v3_input import INPUT_REV
+        # (Codex round 12: --init took any checkpoint's weights -- a revision-1 v3 model's, a ROW model's -- through
+        #  load_compatible, without a word. Its source must be a v3 model of this tree's input revision.)
+        if args.init:
+            init_cfg_ = torch.load(args.init, map_location='cpu', weights_only=False).get('config', {})
+            if init_cfg_.get('frame') != 'v3' or init_cfg_.get('v3_inputs') != INPUT_REV:
+                p.error(f"--init {args.init}: a v3 model of input revision {INPUT_REV} only (its config: frame "
+                        f"{init_cfg_.get('frame')}, v3_inputs {init_cfg_.get('v3_inputs')})")
+        if args.resume:   # (the trigger mode the checkpoint was trained in)
+            ck_trig_ = torch.load(args.resume, map_location='cpu', weights_only=False).get('config', {}).get('trigger_once')
+            if ck_trig_ is not None and int(ck_trig_) != int(trig_):
+                p.error(f'--resume: the checkpoint was trained with ISAAC_RL_TRIGGER_ONCE={ck_trig_}, this run has {trig_}')
+        tok_kw['trigger_once'] = int(trig_)
         # (a resume keeps its checkpoint's revision -- none: 1, refused by TokPolicy; a new run states the tree's)
         tok_kw['v3_inputs'] = (torch.load(args.resume, map_location='cpu').get('config', {}).get('v3_inputs')
                                if args.resume else INPUT_REV)

@@ -28,7 +28,7 @@ from . import v3_input as VI
 
 ID_EMB, ITEM_EMB, CAT_EMB, ANIM_EMB, ICON_EMB = 24, 24, 16, 16, 8
 # (input revision 2, the coordinator 2026-11-19: v3_input.WIDEN's columns mapped back inside the model, in float32:
-#  E age (minutes) -> log2(1 + seconds) / 2; S charge / max_charge (120ths) -> u = 12ths, u up to 1, 1 + log2(u) past it)
+#  E age (game minutes) -> log2(1 + game seconds) / 2; S charge / max_charge (120ths) -> u = 12ths, u up to 1, 1 + log2(u) past it)
 LOG_INPUTS = {('E', 'age'): 'age', ('S', 'charge'): 'charge', ('S', 'max_charge'): 'charge'}
 L_INIT_GAIN = 5.0   # (the local patch token's initial scale: 0.027 -> ~0.14, as the other kinds; the range table's probe)
 G_INIT_STD = 0.15   # (the global token's parameter, TokPolicy.gtok.tok, for a v3 model: 0.02 -> 0.15, likewise)

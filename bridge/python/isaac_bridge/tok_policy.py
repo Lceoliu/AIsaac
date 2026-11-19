@@ -1051,7 +1051,7 @@ class TokPolicy(nn.Module):
                  temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128,
                  temporal_feedback=1,
                  obs_prices=False, obs_hearts=False, obs_room_type=False, block_memory=False, block_config=None,
-                 input_schema=None, frame=None, v3_inputs=None):
+                 input_schema=None, frame=None, v3_inputs=None, trigger_once=None):
         super().__init__()
         if frame not in (None, 'row', 'v3'):
             raise ValueError(f'TokPolicy: frame {frame!r} (None / row: the ROW encoder; v3: FrameEncoderV3)')
@@ -1192,11 +1192,14 @@ class TokPolicy(nn.Module):
             # (input revision 2, 2026-11-19: v3_input.WIDEN / frame_v3.LOG_INPUTS / L_INIT_GAIN. A configuration
             #  without it -- C115's v3t1 / v3t1b -- was trained on revision 1: refused here, never decoded silently in
             #  the new units; a new model states it (train_tok --frame v3))
-            if v3_inputs is None or int(v3_inputs) != INPUT_REV:
+            if not (isinstance(v3_inputs, int) and not isinstance(v3_inputs, bool) and v3_inputs == INPUT_REV):
                 raise ValueError(f'TokPolicy(frame=v3): v3 inputs revision {v3_inputs} (none: 1), this tree decodes '
                                  f'revision {INPUT_REV}: evaluate or resume it with its own tree')
             self.config['frame'] = 'v3'
             self.config['v3_inputs'] = INPUT_REV
+            if trigger_once is not None:   # (Codex round 12: the run's effective ISAAC_RL_TRIGGER_ONCE, kept with the
+                # weights -- a resume or an evaluation in the other trigger mode is refused: train_tok / eval_tok)
+                self.config['trigger_once'] = int(trigger_once)
             self.frame_v3 = FrameEncoderV3(width, layers, heads)
             if self.gtok is not None:   # (input revision 2: the G token's initial scale as the other kinds')
                 from .frame_v3 import G_INIT_STD

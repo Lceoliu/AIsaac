@@ -570,6 +570,11 @@ def test_check_batch_refuses_and_counts():
 def test_widened_columns_are_the_listed_ones_only():
     """(input revision 2) v3_input.WIDEN names three numeric columns; every other column keeps the schema's scale."""
     assert set(VI.WIDEN) == {('E', 'age'), ('S', 'charge'), ('S', 'max_charge')} and VI.INPUT_REV == 2
+    # (Codex round 12: the expectations independent of WIDEN -- age in game minutes: FrameCount / 1800, 30 logic frames
+    #  a game second; charges in 120ths)
+    for t, name, want in (('E', 'age', 1800.0), ('S', 'charge', 120.0), ('S', 'max_charge', 120.0)):
+        cols = V3.E_COLS if t == 'E' else V3.S_COLS
+        assert VI.PLAN[t]['scale'][VI.PLAN[t]['num'].index(V3.col(cols, name))] == np.float32(want), name
     for t, cols in (('P', V3.P_COLS), ('E', V3.E_COLS), ('N', V3.N_COLS), ('S', V3.S_COLS)):
         for j, i in enumerate(VI.PLAN[t]['num']):
             name, _kind, _u, sc = cols[i]

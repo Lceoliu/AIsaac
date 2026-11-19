@@ -55,6 +55,14 @@ def _names():
 GROUPS = _names()
 
 
+def _rng(t, name):
+    """schema_v3.NUM_RANGE's (low, high) of a column in the decoded unit (v3_input.WIDEN's columns divided: Codex
+    round 12 -- the charges were judged in the schema's unit)."""
+    r = V3.NUM_RANGE[t].get(name)
+    w = VI.WIDEN.get((t, name), 1.0)
+    return None if r is None else (r[0] / w, r[1] / w)
+
+
 class Acc:
     """Streaming per-column sums (float64) for one (group, room type)."""
     def __init__(self, k):
@@ -141,7 +149,7 @@ def table(paths, progress=None, chunk=2048):
                 rt_n[int(t)] = rt_n.get(int(t), 0) + int((rtype == t).sum())
             for g, (names, tab) in GROUPS.items():
                 x, rec = _real(g, d)
-                rng = [V3.NUM_RANGE[tab].get(n) for n in names] if tab else None
+                rng = [_rng(tab, n) for n in names] if tab else None
                 acc.setdefault((g, 'all'), Acc(len(names))).add(x, rng)
                 rr = rtype[rec]
                 for t in np.unique(rr):

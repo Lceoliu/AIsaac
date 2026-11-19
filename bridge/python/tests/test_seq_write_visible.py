@@ -111,7 +111,8 @@ def test_train_tok_frame_v3_refuses_item_tokens(monkeypatch, capsys, tmp_path):
     from isaac_bridge import visible_producer
     monkeypatch.setattr(visible_producer, 'VISIBLE_V3_MODE', 2)
     monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
-    monkeypatch.setenv('ISAAC_RL_TRIGGER_ONCE', '1')   # (train_tok --frame v3 sets it: restored after the test)
+    monkeypatch.setenv('ISAAC_RL_TRIGGER_ONCE', '0')   # (recorded for the undo: absent again after the test)
+    monkeypatch.delenv('ISAAC_RL_TRIGGER_ONCE')
     base = ['--groups-file', str(tmp_path / 'missing.json'), '--frame', 'v3', '--temporal', '1', '--temporal-rooms', '0',
             '--temporal-feedback', '0', '--global-token', '1', '--items']
     for i, extra in enumerate((['--item-tokens', '1'], ['--item-tokens', '1', '--item-shared', '1'])):
@@ -120,6 +121,7 @@ def test_train_tok_frame_v3_refuses_item_tokens(monkeypatch, capsys, tmp_path):
         assert '--frame v3 takes no item tokens' in capsys.readouterr().err
     with pytest.raises(FileNotFoundError):   # (without them the arguments pass: the missing groups file is next)
         train_tok.main(base + ['--out', str(tmp_path / 'ok')])
+    assert __import__('os').environ.get('ISAAC_RL_TRIGGER_ONCE') == '1'   # (train_tok's v3 default, set unasked)
     assert '--frame v3 takes no item tokens' not in capsys.readouterr().err
 
 
@@ -158,3 +160,35 @@ def test_eval_tok_frame_and_workers_agree(monkeypatch, capsys, tmp_path):
         with pytest.raises(SystemExit):
             eval_tok.main()
         assert msg in capsys.readouterr().err, (mode, name)
+
+
+def test_v3_init_resume_and_eval_keep_revision_and_trigger_mode(monkeypatch, capsys, tmp_path):
+    """(Codex round 12) train_tok --frame v3: --init only from a v3 model of this input revision (a revision-1 v3 model,
+    a ROW model: refused before any weight is read); --resume refused in another trigger mode than the checkpoint's;
+    eval_tok refused in another trigger mode than the checkpoint's."""
+    import torch
+    import train_tok
+    sys.path.insert(0, str(HERE.parent))
+    import eval_tok
+    from isaac_bridge import visible_producer
+    from isaac_bridge.v3_input import INPUT_REV
+    monkeypatch.setattr(visible_producer, 'VISIBLE_V3_MODE', 2)
+    monkeypatch.setenv('ISAAC_RL_VISIBLE_V3', '2')
+    monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
+    monkeypatch.setenv('ISAAC_RL_TRIGGER_ONCE', '1')
+    old, new0 = tmp_path / 'rev1.pt', tmp_path / 'rev2-t0.pt'
+    torch.save(dict(config=dict(frame='v3', items=True), model={}), old)
+    torch.save(dict(config=dict(frame='v3', items=True, v3_inputs=INPUT_REV, trigger_once=0), model={}), new0)
+    base = ['--groups-file', str(tmp_path / 'missing.json'), '--frame', 'v3', '--temporal', '1', '--temporal-rooms', '0',
+            '--temporal-feedback', '0', '--global-token', '1', '--items']
+    with pytest.raises(SystemExit):
+        train_tok.main(base + ['--out', str(tmp_path / 'i'), '--init', str(old)])
+    assert 'input revision' in capsys.readouterr().err
+    with pytest.raises(SystemExit):
+        train_tok.main(base + ['--out', str(tmp_path / 'r'), '--resume', str(new0)])
+    assert 'ISAAC_RL_TRIGGER_ONCE=0' in capsys.readouterr().err
+    monkeypatch.setattr(sys, 'argv', ['eval_tok.py', '--groups-file', 'x.json', '--out', str(tmp_path / 'e'),
+                                      '--checkpoint', str(new0)])
+    with pytest.raises(SystemExit):
+        eval_tok.main()
+    assert 'trained with 0' in capsys.readouterr().err
