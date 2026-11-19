@@ -800,13 +800,14 @@ class Rollout:
         # 2026-10-11 (memory): the GRU's input state of each decision (None without memory)
         self.h = zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
         # B45: block-memory rollouts store compact records (ROWC) and their visible frames in a byte arena (~11 KB each
-        # instead of 128 KiB); others (and B38's shared-memory learner process) keep ROW
+        # instead of 128 KiB); with B38's shared-memory learner process block rollouts keep ROW
         # (A-3, 2026-11-19: and v3-frame rollouts, compact=True -- the learner's rows_to_device rebuilds their bytes
         #  from the arena; 5 GB of mostly empty frame budget per 32,768-decision rollout before)
         # (A-6, 2026-11-19: v3 rollouts compact in shared memory too, --learner-process 1: the arena a fixed shared
         #  byte array of the worst case -- every record a whole frame field -- whose untouched pages cost nothing;
         #  frames_buf names it among the shared arrays, rollout_view rebuilds the arena over it)
         compact = (bool(block_steps) and alloc is None) or bool(compact)
+        self.dropped = 0   # (A-6, Codex round 16: decisions past a worker's capacity, dropped by store)
         self.rows = zeros((workers, capacity), ROWC if compact else ROW)
         if not compact:
             self.frames = None
@@ -1502,6 +1503,7 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
     kk = roll.length[a_idx]
     ok = kk < roll.cap   # cannot fail with the trainer's capacity; drop rather than overrun
     if not ok.all():
+        roll.dropped = getattr(roll, 'dropped', 0) + int((~ok).sum())   # (counted: progress store_dropped)
         a_idx, kk, rows, under_way = a_idx[ok], kk[ok], rows[ok], under_way[ok]
         actions, logp, value = actions[ok], logp[ok], value[ok]
         h = h[ok] if h is not None else None
@@ -3234,6 +3236,10 @@ def main(argv=None, child=None, actor=None):
     # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
     t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=max(1, args.temporal_rooms),
                  kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64) if t_on else None
+    if (proc and args.frame == 'v3' and os.environ.get('ISAAC_RL_V3_COMPACT', '1') == '1'
+            and os.environ.get('ISAAC_RL_B38_DUMP')):
+        p.error('ISAAC_RL_B38_DUMP: not with compact v3 rollouts in shared memory (dump_job would copy the whole '
+                'arena, its reserve ~16 GiB at 32,768 decisions; Codex round 16) -- ISAAC_RL_V3_COMPACT=0 for it')
     shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
@@ -5305,6 +5311,9 @@ def main(argv=None, child=None, actor=None):
             L['v3_prev'] = tot3
             d3 = {k_: tot3[k_] - prev3[k_] for k_ in tot3}
             row['v3_calls'], row['v3_records'] = d3['calls'], d3['records']
+            ap_ = job.get('arena_peak_mb') or []
+            row['arena_peak_mb_a'], row['arena_peak_mb_b'] = (ap_ + [0.0, 0.0])[:2]
+            row['store_dropped'] = job.get('store_dropped', 0)
             row['v3_host_ms'] = 1000 * d3['host_s'] / max(d3['calls'], 1)
             row['v3_host_share'] = d3['host_s'] / max(job['collect_s'], 1e-9)
             for b_ in VI_.E_BUCKETS:
@@ -6690,6 +6699,9 @@ def main(argv=None, child=None, actor=None):
             if native_lin:   # B58c: the rollout's native sidecar as PagedSnapshots (what payload / plan read)
                 roll.block.materialize()
             job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
+                       # (A-6, Codex round 16: the two arenas' high-water marks; decisions dropped at a worker's cap)
+                       arena_peak_mb=[r_.frames.peak / 2 ** 20 for r_ in (roll, spare) if r_.frames is not None],
+                       store_dropped=int(getattr(roll, 'dropped', 0)) + int(getattr(spare, 'dropped', 0)),
                        **lab_job,
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,

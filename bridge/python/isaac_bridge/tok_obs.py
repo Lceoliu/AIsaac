@@ -190,6 +190,7 @@ class FrameArena:
         self.fixed = buf is not None
         self.buf = buf if buf is not None else np.zeros(max(int(nbytes), 1024), np.uint8)
         self.used = 0
+        self.peak = 0   # (A-6, Codex round 16: the high-water mark -- reset keeps the pages written, shared memory too)
 
     def _room(self, need):
         if need <= len(self.buf):
@@ -216,6 +217,7 @@ class FrameArena:
             if n:
                 self.buf[offs[i]:offs[i]+n] = frames[i, :n]
         self.used = need
+        self.peak = max(self.peak, need)
         return offs
 
 
@@ -229,6 +231,7 @@ class FrameArena:
         for o, n, d in zip(np.asarray(offs, np.int64), sizes, new):
             self.buf[d:d+n] = buf[o:o+n]
         self.used = need
+        self.peak = max(self.peak, need)
         return new
 
 
