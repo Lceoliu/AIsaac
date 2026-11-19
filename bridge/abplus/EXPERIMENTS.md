@@ -131,6 +131,7 @@
 | B60 | 11-10 | learner 的 host 工作搬出 GIL：原生 C 打包（`abp_learn.c`，调用期间释放 GIL）与覆盖整个 update 的流水预取，固定输入基准 + 生产短 profile，4090 | 固定输入基准 13.0–13.2 → 7.9–8.4 s（≤ 9.5 s 门过）；生产 update 19.42 → 16.94 / 17.24 s，×实时 145.3 / 136.1；关键路径等待 0.83 s/update，未达 0.3 s 门；忙线程对照显示 GIL 下的暴露面主要是前向、反向、优化器的 Python 派发；全量门 223 passed |
 | B62 | 11-10 | learner 线程的 GIL 暴露面：合并 C++ actor 树后量基线、扫描切换间隔、Python 派发归因，后续步骤 1–4（精简 checkpoint、阻塞同步、异步 H2D 等）；4090 | 步骤 0：合并树 update 20.33 s、212.7×（cpp 步骤 0 为 196.6×），50 µs 切换间隔 +7% 但只单次；learner 前向调用的 Python 层大头是 checkpoint 钩子。精简 checkpoint 让每 part 调用 14.6k → 10.9k 并默认打开，但全量门 3 次全绿未做；blocking 下 learner 线程 Python CPU 5.98 s/update，未达 ≤ 3.0 s 的门；4090 到期时多项未跑、未验收 |
 | B67 | 11-17/18 | visible-v3 生产端（C 包）：房型实测（契约 V1）、金样本 V2、越界审计、原生编码器、schema 批次 4–5、对齐数据集；合并前四项检查；Codex 五轮审计；dgene | 坐标与数值都有引擎证据；参考与原生编码器逐字节一致（8,923 / 8,923，批次 4 后 1,812 / 1,812）；每决策游戏侧与 v2 原生持平、worker 侧 −38%。主线并入 05f1622：v3 关时 ROW 与 digest 与主线全同，合并树训练冒烟正常，配对速度 1.035（198d0cb 时 1.013；原单次参照线撤回）。后又并入 8fc3ab1（第 2–4 轮修复），冒烟 3 次干净、配对 1.0066；收尾 exit 86 的根因是变量重名（ef702a1 引入、8fc3ab1 修，曾误诊为模式查询断线）；第 5 轮 3 条在加固批次；v3 帧的训练吞吐未量 |
+| B68 | 11-19 | seq1 期间的提速批次（exp/seq-v1）：A-1 新奖励记账向量化、A-2 非有限值在图内计数、A-3 v3 rollout 紧凑存储、A-4 只拷到帧尾；learner 的 GPU 时间分解；P 包的纯函数与金样本；dgene lane b | 进行中。A-3：8 个 worker 下容器内存 15.4–17.8 → 9.3–10.1 GB。A-1 / A-4 对 p_book 无可测效果（更正此前估计）：book 是每次调用约 0.9 ms 的固定开销。learner：GPU 时间约 85% 在帧编码器（更正此前“剩下 5 s 在时间侧”），时间侧加头约 7%；帧编码器 compile −21%，打包交 Codex |
 | cpp 线 3090 分卡基线 | 11-11 | cpp 线在 8x3090 上的分卡形态（actor 卡 + learner 卡）基线：24 轮计时 + nsys python-gil，树 c-02b2169 | 225.4×（u10–u23），collect 17.94 s 已短于 update 18.75 s，周期由 learner 决定；CF u15 100 / 0 / 0 / 0。driver 每 collect 循环 18.41 s，lane 作业 6.81、主步等 GPU 6.91；主线程 GIL 持有 0.20 s/周期、顶层进入约 36 次/周期，两道门都达标 |
 | cpp 线 3090 分卡 M1 | 11-11 | 分卡下 M1（lane 合并）计时，MERGE=1 对同期 MERGE=0；8x3090 | 未完成，被"背靠背四次"一条取代：MERGE=1 为 241.3×，driver 上 lane 作业 6.81 → 3.52 s；同期 MERGE=0 臂在 u11 因 GPU 5 掉卡（Xid 79）中止，吞吐对比不成立。TSAN 在这台机器上部分段错误，不算通过 |
 | cpp 线 M1 背靠背四次 | 11-11 | 8x3090 重启后 M1 按 MERGE 0、1、0、1 背靠背四次 24 轮计时（GPU 1 actor + GPU 2 learner） | lane 作业时间约 −37%（6.3–7.0 → 4.0–4.5 s），lane 调用约减半，CF 完成数不受影响；吞吐两臂均值 236.1× 对 244.7×（+3.6%），但同臂两次之差更大，不成立。省下的 1.9 s 里约 1.1 s 被更重的合并主步吃回。M1 由协调方决定默认开（3 遍全量门 282 passed 全绿） |
@@ -14401,6 +14402,75 @@ C114 的 T1（旧帧编码器 + 纯窗口时间侧）在 400 游戏小时内学�
 - 续跑：11-19 08:29:18 起，attempt 2，从 last.pt（u460）。08:32 到 u468、567.7 游戏小时，x_real 229，errors 0。
 
 - 原始文件：dgene bm1/c114/smoke/v3mem/（= c114/seq1）、c114/STATUS_mem、c114/STATUS_seq1、c114/memprobe.csv、c114/STATUS_d1x、c114/STATUS_d1y、c114/d1/{v3mem,v3m100,v3m400,v3m32,v3m32s,t1f2}/。
+
+### B68 seq1 期间的提速批次：A-1–A-4、learner 的分解、P 包准备（2026-11-19；进行中，打包与 compile 未完成）
+
+**目的**
+
+seq1 的速度约为 T1 的四分之三：x_real 约 216，T1 约 289。协调方要两边一起提速：actor 侧，以及 learner 侧（L-1）。所有改动都在 exp/seq-v1 上，seq1 本身不换树。测量都在 lane b（GPU 3/4，≤ 24g，与 seq1 的 40g 合计 64g）或本机 CPU 上做，不占 lane s。
+
+**seq1 的时间分解（每次更新的中位数；seq1 u420–470，v3t1b、T1 取 u200–330）**
+
+| 秒 / 次更新 | seq1 | v3t1b | T1 |
+|---|---|---|---|
+| collect_s / update_s | 19.5 / 20.0 | 19.0 / 18.2 | 15.1 / 14.5 |
+| p_book / p_act / p_tick / p_store | 5.6 / 5.5 / 4.9 / 2.3 | 3.1 / 6.9 / 5.4 / 2.3 | 3.0 / 3.9 / 5.0 / 2.1 |
+| u_ppo | 15.0 | 13.2 | 5.85 |
+
+- 两边都约 20 s，learner 略慢。所以只给 actor 提速，x_real 不会涨。
+
+**actor 侧的改动与实测**
+
+- **A-1**（7b29499）：新奖励项的记账向量化，只有持有物变了的记录才进 Python 循环，并去掉了一次 rows[sel] 的整行拷贝。奖励与原来的逐条循环逐位相同（6 个随机记录流）。
+- **A-2**（4c3ecfe）：非有限值改在 actor 图里计数，不再每次调用都在主机上扫一遍帧。
+- **A-3**（4229d8f）：v3 的 rollout 改存 ROWC + FrameArena（B45 的格式）。learner 按 ROW 布局重建字节，与 ROW rollout 逐位对照（字段字节和每帧）；dump 仍写 ROW。
+- **A-4**（2ffd8f8）：主循环取记录时只拷到帧尾（tok_obs.take_prefix，拷进复用的环），GraphActor 非 fold 路径的 stage 也只拷到本次调用里最长的帧。
+- **同口径冒烟**：seq1 的 u460 续跑，8 个 worker，lr 0，各 3–4 个更新，lane b。
+
+| 树 | p_book（s） | p_store（s） | 容器内存（GB） |
+|---|---|---|---|
+| m20b0fce（seq1 的树） | 6.3–7.5 | 2.7–3.9 | 15.4–17.8 |
+| m4229d8f（A-1、A-3） | 6.5–7.6 | 2.5–3.2 | 9.3–10.1 |
+| m2ffd8f8（A-1–A-4） | 5.9–7.4 | 2.4–3.2 | 9.3–10.0 |
+
+  errors 0，nonfinite 0。GPU 测试：m4229d8f 187 passed，m2ffd8f8 30 passed。
+- **更正**：之前估计 A-1 能让 book 5.6 → 3.1 s，以及“A-4 是 book 那 5 GB 拷贝的正解”，都不成立。A-1 / A-4 对 p_book 没有可测的效果。
+  - book 的开销是按调用算的：这个配置每次更新约 7500 次调用、每次 3.8 行，每次约 0.9 ms。
+  - 本机复现：arrive 每次约 380 us，几乎全是函数体里几十个小 numpy 运算的固定开销；整行拷贝只占几十 us。
+  - 要降 book，只能每次调用多带几行，或者把 book / store 挪出应答路径（cpp-actor 的 store 延后实验、P 包）。
+  - A-3 的内存效果成立：8 个 worker 下每份 rollout 约省 3 GB。A-4 保留：结果不变，拷贝更少，与 P 包 C++ 的拷入规则一致。
+- **cpp-actor 第 0 期的结论**（见 P-driver-design.md）：actor 每次调用的 GPU 时间约 2.6 ms，与行数基本无关。worker 加倍后每次调用的行数近乎翻倍，但每决策的 collect 一直在 0.47–0.52 ms，瓶颈是 Python 主循环每次调用的工作。
+
+**learner 侧（L-1）的分解**
+
+- **帧编码器各部分**（tools/v3_modprof.py，seq1 u460 的记录，3090，bf16，micro 2048）：
+  - 帧编码器前向+反向 98–122 ms，其中 4 层 Transformer 79–100 ms（约 80%）。
+  - 每条记录补齐后 70–86 个 token，真实的 43–45 个。
+  - torch.compile 后前向+反向 123.5 → 97.1 ms（−21%）。default 和 reduce-overhead 两种模式结果一样，首次编译分别 25 s 和 12.5 s。
+- **整个 update 的 GPU kernel 时间**（树 m21817ef，learner 的 v3 前向打 profiler 标记；rollout 8192，update 462；按前向标记和 autograd 序号把反向归到对应的前向段）。learner 卡共 1.60 s、4.5 万个 kernel：
+
+| 部分 | 时间 | 占比 |
+|---|---|---|
+| 帧编码器（前向 404 + 反向 706 ms + 未归属的 GEMM 权重梯度约 237 ms） | 约 1.35 s | 约 85% |
+| 懒解码 | 92 ms | 6% |
+| 头和时间侧（前向 26 + 反向 87 ms） | 113 ms | 7% |
+| 其余（时间侧输入、损失、aux、priv、clip / 优化器） | — | < 3% |
+
+  不开 profiler 时同口径的 u_ppo 是每 1/4 次更新 1.7 s，与 kernel 时间相当：learner 在算力上是满的，不是卡在 kernel 发射上。
+- **更正**：之前说“u_ppo 里剩下约 5 s 是时间侧、头和损失”不对，实际约 85% 在帧编码器。原因是 v3_modprof 只量了 PPO 那 48 个 micro，漏了重算 / 教师的几遍帧编码器。
+- **计划**：
+  - 打包前向（只算真实 token）交给 Codex，规格见共享笔记 codex-task-v3-packed-encoder.md；
+  - compile 按 E / N / S 桶组合接进 learner；
+  - 两者合起来测，预期 u_ppo 约 −40%。时间侧和头不动。
+
+**P 包的准备**（与 cpp-actor 对齐，见 P-interface-v2.md、P-driver-design.md）
+
+- 0191eb1：
+  - v3_input.reject_code / REJECT：把 check_batch 的结果写成 (code, record)。在 test_v3_check_batch 的全部用例和 1500 批随机缺陷上与 check_batch 一致。
+  - tok_policy.FoldLayout / fold_views / fold_pack / fold_defined：GraphActor fold 打包改成纯函数，与原打包逐字节相同。
+  - tools/p_golden.py：94 个金样本，带 --verify。
+
+- 原始文件：dgene bm1/c114/lprof/、c114/l1/、c114/l2/、c114/l3/（prof/ops.txt、trace.json）、c114/STATUS_l1、STATUS_l2、STATUS_l3；共享笔记 seq1-speed-next-and-P-prep.md。
 
 ### B67 visible-v3 生产端（C 包）：房型实测、坐标契约、金样本、越界审计、原生编码器（2026-11-17—18，验收；主线并入 05f1622，后并入 8fc3ab1）
 
