@@ -253,7 +253,7 @@ from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
 from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
 from isaac_bridge.learn_segments import SEG   # BM1: learner segment timing (ISAAC_BLOCK_TIMING=1 only)
-from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_PILL, ROW, ROWC, FrameArena,
+from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
                                       default_stub_list)
@@ -997,14 +997,17 @@ DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its gam
 
 # (2026-11-19, the user / the coordinator: three reward terms for the long run, each 0 by default -- then every reward
 #  is as before, bit for bit; Episodes.arrive, floor / run modes):
-#   item / trinket: a collectible (ROW inv ids with a count, and pitem[0], the active item) / a trinket (pitem[1:3])
-#     not yet rewarded in this episode: weight each; the episode's set starts as what its first record holds (a start
-#     build is not rewarded), so putting an item down and taking it again, swapping two actives or dropping a trinket
-#     and taking it again pays once; a rerolled item is a new id;
-#   depth: the exit and boss terms times 1 + depth x (n - 1), n the LevelStage of the floor -- for EV_EXIT the
-#     floor left (the stage of the record before), for EV_BOSS the record's;
-#   nohit: a room cleared (EV_CLEARED) in which the episode was never hurt, over every visit: the room is (stage, the
-#     first map cell of the player's room, ROW map channel 3); a record with hurt marks its room; no room known: none.
+#   item / trinket (Codex round 13, the coordinator's rule): ids never rewarded in this episode -- the episode's set
+#     starts as what its first record holds (a start build is not rewarded); a passive collectible only when the held
+#     collectibles' count (ROW pinv[6] x 16, distinct ids) rose since the record before, at most that many, an id of
+#     ROW inv (the newest 16) other than the active; the active slot (pitem[0]) changed to such an id: one; a trinket
+#     slot (pitem[1:3]) changed to such an id: one per slot. A reroll of the whole build (no count rise) pays nothing,
+#     a rerolled pedestal taken pays; putting down / swapping / dropping and taking again pays once;
+#   depth: the exit and boss terms times 1 + depth x (n - 1), n the LevelStage of the floor -- for EV_EXIT the floor
+#     left (the stage of the record before), only on a floor deeper than any the episode had reached; for EV_BOSS
+#     the record's;
+#   nohit: the worker's EV_NOHIT (tok_obs: a room that had monsters, cleared, never hurt in it over every visit, the
+#     engine's room index; once per room) -- not on a death record.
 #  These are the actor's rewards only: the workers' branch scores (tok_branch.step_reward: the teachers, cf) do not
 #  have them, as they never had heal / resource.
 NEW_TERMS = ('item', 'trinket', 'depth', 'nohit')
@@ -1058,64 +1061,70 @@ class Episodes:
         self.counts = np.zeros((workers, 3), np.int64)   # items, trinkets, no-hit rooms rewarded
         self.seen_c = [set() for _ in range(workers)]
         self.seen_t = [set() for _ in range(workers)]
-        self.room_hurt = [set() for _ in range(workers)]
         self.stage_prev = np.zeros(workers, np.int64)
+        self.stage_max = np.zeros(workers, np.int64)
+        self.held_prev = [None] * workers   # (active, trinket 0, trinket 1, collectibles' count) of the record before
 
     @staticmethod
-    def held_ids(r):
-        """(collectibles, trinkets) a record holds: ROW inv ids with a count and the active item; the trinket slots."""
-        c = {int(v) for v, n in r['inv'] if v > 0 and n > 0}
-        if r['pitem'][0] > 0:
-            c.add(int(r['pitem'][0]))
-        return c, {int(t) for t in r['pitem'][1:3] if t > 0}
+    def held(r):
+        """(active, trinket 0, trinket 1, collectibles' count: ROW pinv[6] x 16, distinct ids, at most 32)."""
+        return (int(r['pitem'][0]), int(r['pitem'][1]), int(r['pitem'][2]), int(round(float(r['pinv'][6]) * 16)))
 
-    @staticmethod
-    def room_keys(rows):
-        """Per record its room: stage * 256 + the first map cell of the player's room (ROW map channel 3), -1 if none."""
-        m = rows['map'][:, 3].reshape(len(rows), -1)
-        cell = np.where(m.any(1), m.argmax(1), -1).astype(np.int64)
-        return np.where(cell >= 0, rows['stage'].astype(np.int64) * 256 + cell, -1)
-
-    def new_terms(self, rows, sel, w, ev, hu):
+    def new_terms(self, rows, sel, w, ev, hu, d):
         """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w."""
         rw = self.rw
         out = np.zeros((len(w), 4))
         r_ = rows[sel]
-        keys = self.room_keys(r_)
         stage = r_['stage'].astype(np.int64)
         for j in range(len(w)):
             i = int(w[j])
-            if rw.get('item') or rw.get('trinket'):
-                c, t = self.held_ids(r_[j])
-                nc, nt = c - self.seen_c[i], t - self.seen_t[i]
-                if nc:
-                    self.seen_c[i] |= nc
-                    out[j, 0] = rw.get('item', 0.0) * len(nc)
-                    self.counts[i, 0] += len(nc)
-                if nt:
-                    self.seen_t[i] |= nt
-                    out[j, 1] = rw.get('trinket', 0.0) * len(nt)
-                    self.counts[i, 1] += len(nt)
+            r = r_[j]
+            if (rw.get('item') or rw.get('trinket')) and self.held_prev[i] is not None:
+                a0, t0, t1, n0 = self.held_prev[i]
+                a, ta, tb, n = self.held(r)
+                seen = self.seen_c[i]
+                got_c = 0
+                if a > 0 and a != a0 and a not in seen:   # the active slot: a new id
+                    seen.add(a)
+                    got_c += 1
+                rise = n - n0 - (1 if got_c else 0)   # (the active, when counted among the collectibles)
+                if rise > 0:   # passives: at most the rise, ids of the newest 16 never rewarded
+                    for v, c in r['inv']:
+                        v = int(v)
+                        if rise <= 0:
+                            break
+                        if v > 0 and c > 0 and v != a and v not in seen:
+                            seen.add(v)
+                            got_c += 1
+                            rise -= 1
+                got_t = 0
+                for tv, tp in ((ta, t0), (tb, t1)):
+                    if tv > 0 and tv != tp and tv not in self.seen_t[i]:
+                        self.seen_t[i].add(tv)
+                        got_t += 1
+                out[j, 0] = rw.get('item', 0.0) * got_c
+                out[j, 1] = rw.get('trinket', 0.0) * got_t
+                self.counts[i, 0] += got_c
+                self.counts[i, 1] += got_t
             if rw.get('depth'):
                 if self.run and (ev[j] & EV_EXIT):
-                    out[j, 2] += rw['exit'] * rw['depth'] * max(int(self.stage_prev[i]) - 1, 0)
+                    if stage[j] > self.stage_max[i]:   # (a floor deeper than any reached: the floor left scales it)
+                        out[j, 2] += rw['exit'] * rw['depth'] * max(int(self.stage_prev[i]) - 1, 0)
                 if ev[j] & 4:
                     out[j, 2] += rw['boss'] * rw['depth'] * max(int(stage[j]) - 1, 0)
-            if rw.get('nohit'):
-                k = int(keys[j])
-                if hu[j] > 0 and k >= 0:
-                    self.room_hurt[i].add(k)
-                if (ev[j] & 1) and k >= 0 and k not in self.room_hurt[i]:
-                    out[j, 3] = rw['nohit']
-                    self.counts[i, 2] += 1
+            if rw.get('nohit') and (ev[j] & EV_NOHIT) and d[j] != 2:
+                out[j, 3] = rw['nohit']
+                self.counts[i, 2] += 1
         return out
 
     def start_terms(self, rows, idx, first):
         """An episode's first record: the new terms' state from what it holds."""
         for j in np.flatnonzero(first):
             i = int(idx[j])
-            c, t = self.held_ids(rows[j])
-            self.seen_c[i], self.seen_t[i], self.room_hurt[i] = c, t, set()
+            r = rows[j]
+            self.seen_c[i] = {int(v) for v, n in r['inv'] if v > 0 and n > 0} | ({int(r['pitem'][0])} - {0})
+            self.seen_t[i] = {int(t) for t in r['pitem'][1:3] if t > 0}
+            self.stage_max[i] = int(r['stage'])
             self.counts[i] = 0
 
     @staticmethod
@@ -1236,7 +1245,7 @@ class Episodes:
                     tm[w, _RT['heal']] += rw['heal'] * np.maximum(dl[:, 0], 0)
                     tm[w, _RT['resource']] += rw['resource'] * np.maximum(dl[:, 1], 0)
                 if self.new_on:   # the new terms (each 0 by default: then nothing here)
-                    nt_ = self.new_terms(rows, has, w, ev, hu)
+                    nt_ = self.new_terms(rows, has, w, ev, hu, d)
                     reward = reward + nt_.sum(1)
                     tm[w, _RT['item']:_RT['nohit'] + 1] += nt_
             if self.run or self.items:
@@ -1262,10 +1271,13 @@ class Episodes:
         self.note_first(rows, idx, first)
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
             self.gains[idx] = self.cur_gains(rows)
-        if self.new_on:   # (2026-11-19) an episode's first record: its held ids and rooms; every record: its stage
+        if self.new_on:   # (2026-11-19) an episode's first record: its held ids; every record: its stage, holdings
             if first.any():
                 self.start_terms(rows, idx, first)
             self.stage_prev[idx] = rows['stage']
+            self.stage_max[idx] = np.maximum(self.stage_max[idx], rows['stage'])
+            for j in range(len(idx)):
+                self.held_prev[int(idx[j])] = self.held(rows[j])
         if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
             st0 = first
             if st0.any():
@@ -2303,6 +2315,18 @@ def main(argv=None, child=None, actor=None):
     why = obs_visible_conflict(args.obs_visible, os.environ.get('ISAAC_RL_VISIBLE_V3', '0'))
     if why:
         p.error(why)
+    # (2026-11-19: the reward terms item / trinket / depth / nohit, where they can be computed -- at once, before the
+    #  other checks of a configuration)
+    new_rw_ = {k.strip() for k, v in (kv.split('=') for kv in args.reward.split(',') if kv.strip())
+               if k.strip() in NEW_TERMS and float(v) != 0} if args.reward else set()
+    if new_rw_:
+        if args.mode not in ('floor', 'run'):
+            p.error('--reward item / trinket / depth / nohit: --mode floor or run only')
+        if args.block_memory:
+            p.error('--reward item / trinket / depth / nohit: not with --block-memory (the native consumer of its driver '
+                    'computes the rewards without them)')
+        if 'nohit' in new_rw_ and args.frame != 'v3':
+            p.error('--reward nohit: --frame v3 only (its workers encode every record in encode_row)')
     if not args.obs_visible:   # (seq-v1: before any worker / child process starts; tok_obs.encode_row reads it)
         os.environ['ISAAC_NO_VISIBLE'] = '1'
     shard_world = int(os.environ.get('ISAAC_SHARD_WORLD', '1') or 1)   # BM1 C: K shards as one run (shard_sync)
@@ -2594,12 +2618,8 @@ def main(argv=None, child=None, actor=None):
     rw.update({k: float(v) for k, v in (kv.split('=') for kv in (FLOOR_REWARD if floor else ROOM_REWARD).split(','))})
     if args.reward:
         rw.update({k: float(v) for k, v in (kv.split('=') for kv in args.reward.split(','))})
-    if any(rw.get(k_) for k_ in NEW_TERMS):   # (2026-11-19: item / trinket / depth / nohit)
-        if not floor:
-            p.error('--reward item / trinket / depth / nohit: --mode floor or run only')
-        if args.block_memory:
-            p.error('--reward item / trinket / depth / nohit: not with --block-memory (the native consumer of its driver '
-                    'computes the rewards without them)')
+    if rw.get('nohit'):   # (EV_NOHIT from the workers' encode_row: checked at parsing, above)
+        os.environ['ISAAC_RL_NOHIT'] = '1'
     if floor:   # the root instances are launched with the normal group's spec; the floor reset does not use its rooms
         names, assign = ['run' if run else 'floor'], [0] * args.workers
         specs = [load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))]

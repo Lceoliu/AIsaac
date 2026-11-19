@@ -71,6 +71,11 @@ EV_EXIT = 8           # run mode: the next floor was reached (the episode goes o
 EV_ITEM = 16          # items: a collectible was gained (a held id's count went up)
 EV_ACTIVE = 32        # items: the active item was used (its charge went down, or a used-up active is gone)
 EV_PILL = 64          # items: the pill / card in pocket slot 0 was used (the slot emptied)
+# (2026-11-19, the long run's nohit term; only with ISAAC_RL_NOHIT=1, set by train_tok --reward nohit=...: encode_row,
+#  the Python path a visible-v3 worker takes for every record) a room cleared that had monsters (their HP > 0 at a
+#  record in it, or damage dealt in it) and in which the episode was never hurt -- the engine's room index on the
+#  floor instance, a hurt step that changed rooms charged to the room left -- once per room and episode
+EV_NOHIT = 128
 # Item ids (user decision 2026-10-06: sized for Repentance / Repentance+ with headroom): collectibles 0..1023 (AB+ max
 # 552, Repentance+ 732), trinkets / pill effects / cards 0..255. ITEM_UNKNOWN: a pedestal under Curse of the Blind.
 N_COLLECTIBLE, N_TRINKET, N_PILL_EFFECT, N_CARD, N_PILL_COLOR = 1024, 256, 256, 256, 16
@@ -356,6 +361,31 @@ class EpisodeState:
         self.room = None           # whole floors: the room the record before was in, was it clear, rooms seen so far
         self.was_clear = True
         self.visited = set()
+        # (2026-11-19) EV_NOHIT: per (floor instance, room index) [had monsters, hurt in it, rewarded]
+        self.nohit_on = os.environ.get('ISAAC_RL_NOHIT') == '1'
+        self.nohit_rooms = {}
+        self.floor_n = 0
+
+
+def nohit_step(st, room_idx, next_floor, hurt, damage, monsters_hp, events):
+    """EV_NOHIT's bookkeeping for one record (encode_row, before st.room moves on): the hurt of the step charged to the
+    room left when the step changed rooms (else to this one), this room marked as having had monsters when their HP is
+    > 0 or damage was dealt; EV_NOHIT added to `events` on the clear of such a room never hurt in, once per room.
+    Rooms are (floor instance, the engine's room index): no visible map involved. Returns the events."""
+    left = (st.floor_n, st.room)
+    if next_floor:
+        st.floor_n += 1
+    here = (st.floor_n, room_idx)
+    nh = st.nohit_rooms
+    if st.room is not None and hurt > 0:
+        nh.setdefault(left if (room_idx != st.room or next_floor) else here, [False, False, False])[1] = True
+    e = nh.setdefault(here, [False, False, False])
+    if monsters_hp > 0 or damage > 0:
+        e[0] = True
+    if events & EV_CLEARED and e[0] and not e[1] and not e[2]:
+        events |= EV_NOHIT
+        e[2] = True
+    return events
 
 
 def _terrain(o, st):
@@ -584,6 +614,9 @@ def encode_row(o, st, row, t):
     if next_floor:   # the floor's exit reached: an event of its own, not a new room of the old floor
         events = (events & ~EV_NEW_ROOM) | EV_EXIT
         st.stage0 = room[5]
+    if st.nohit_on:   # (2026-11-19) EV_NOHIT
+        events = nohit_step(st, room_idx, next_floor, float(row['hurt'][0]), float(row['damage'][0]),
+                            float(o.monsters_hp), events)
     st.room, st.was_clear = room_idx, bool(o.clear)
     row['events'] = events
     st.previous = (o.damage_taken, o.monsters_hp)
