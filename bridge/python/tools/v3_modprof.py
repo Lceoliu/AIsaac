@@ -12,7 +12,10 @@ PPO pass takes them (lazy decode, the part's E / N / S buckets):
   compile   (--compile) torch.compile of the frame encoder on the part's fixed shapes: the first call's time and the
             forward + backward after it, modes default and reduce-overhead (CUDA graphs)
 
-   usage: python tools/v3_modprof.py <rollouts dir> [--micro 2048] [--parts 2] [--compile] [--out f.json]"""
+  blocks_t  (--blocks-t 86,70,44,31,24) the encoder's 4 blocks alone on random tokens [micro, T, width] (no padding),
+            forward + backward per T: what a frame of T tokens costs in the layers (e.g. fewer room tokens)
+
+   usage: python tools/v3_modprof.py <rollouts dir> [--micro 2048] [--parts 2] [--compile] [--blocks-t ...] [--out f]"""
 import argparse
 import glob
 import json
@@ -81,6 +84,7 @@ def main(argv=None):
     ap.add_argument('--micro', type=int, default=2048)
     ap.add_argument('--parts', type=int, default=2)
     ap.add_argument('--compile', action='store_true')
+    ap.add_argument('--blocks-t', default='')
     ap.add_argument('--out', default=None)
     a = ap.parse_args(argv)
     import torch
@@ -167,6 +171,23 @@ def main(argv=None):
             part['compile'] = comp
         out['parts'].append(part)
         print(json.dumps(part, indent=1), flush=True)
+    if a.blocks_t:   # the layers' cost per token count (random tokens, bf16, train mode)
+        bt = {}
+        D = enc.blocks[0].qkv.in_features
+        for T in [int(x) for x in a.blocks_t.split(',')]:
+            x0 = torch.randn((a.micro, T, D), device=dev)
+            bias = torch.zeros((a.micro, 1, 1, T), device=dev)
+
+            def fb(x0=x0, bias=bias):
+                m.zero_grad(set_to_none=True)
+                x = x0.clone().requires_grad_(True)
+                with torch.autocast('cuda', torch.bfloat16):
+                    for blk in enc.blocks:
+                        x = blk(x, bias)
+                x.float().sum().backward()
+            bt[T] = round(timed(torch, fb, 10, 3), 2)
+        out['blocks_t_fwd_bwd_ms'] = bt
+        print(json.dumps(dict(blocks_t_fwd_bwd_ms=bt)), flush=True)
     s = json.dumps(out, indent=1)
     if a.out:
         with open(a.out, 'w') as f:
