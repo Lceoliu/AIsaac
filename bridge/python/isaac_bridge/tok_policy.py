@@ -2147,20 +2147,59 @@ ROW_HEAD = ROW.fields['visible_bytes'][1]   # B42: every record field before the
 assert ROW_HEAD % 8 == 0
 
 
-def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, head=False):
+def _compact_v3_raw(rows, index, frames, stage):
+    """(A-3, 2026-11-19) compact ROWC records with v3 frames in their FrameArena `frames` -> [n, frame_at + w] uint8
+    (torch, CPU; in stage when given): each record's ROW bytes up to its frame (the head, all fixed fields) and its
+    frame's bytes (visible_bytes) at the frame field's offset, zeros after it; w the longest frame's bytes. The bytes
+    rows_to_device sends for ROW records with v3 frames, but for the frame field's tail past each record's own frame
+    (zeros here; whatever the ROW record held there: never decoded -- tests/test_rollout_compact.py)."""
+    from .schema_v3 import VERSION as V3_VERSION, FRAME_BYTES as V3_FRAME_BYTES
+    flat_ = rows.reshape(-1)
+    if len(index) and not np.all(flat_['visible_schema'][index] == V3_VERSION):
+        raise ValueError('rows_to_device: compact records without a v3 frame need head=True')
+    nb_ = np.asarray(flat_['visible_bytes'][index], np.int64)
+    if len(index) and (nb_.min() < 0 or nb_.max() > V3_FRAME_BYTES):
+        from .visible_producer import VisibleV3Fatal
+        raise VisibleV3Fatal(f'rows_to_device: visible_bytes {int(nb_.min())} .. {int(nb_.max())} outside '
+                             f'0 .. {V3_FRAME_BYTES}')
+    fa = ROW.fields['visible_frame'][1]
+    cols = fa + (-(-int(nb_.max() if len(index) else 0) // 4) * 4)
+    n = len(index)
+    out = (stage.view(-1)[:n * cols].view(n, cols) if stage is not None else torch.empty((n, cols), dtype=torch.uint8))
+    raw = torch.from_numpy(flat_.view(np.uint8).reshape(-1, rows.dtype.itemsize))[:, :fa]
+    idx = torch.from_numpy(np.ascontiguousarray(index, np.int64))
+    for lo in range(0, n, 1024):   # (in chunks: a gathered [1024, frame_at] block at a time, no GIL)
+        out[lo:lo + 1024, :fa].copy_(raw.index_select(0, idx[lo:lo + 1024]))
+    o_np = out.numpy()
+    o_np[:, fa:] = 0
+    buf = frames.buf
+    for i, (o, k) in enumerate(zip(np.asarray(flat_['visible_off'][index], np.int64), nb_)):
+        o_np[i, fa:fa + k] = buf[o:o + k]
+    return out
+
+
+def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, head=False, frames=None):
     """to_batch for a large set of records without numpy copies: rows a ROW array (any shape, C-contiguous), index the
     flat positions to take (numpy int64), pending [len(index), heads] int64. The gather runs in torch (no GIL held), one
     copy goes to the device and the fields are views of it (decode_rows). Same values as
     to_batch(rows.reshape(-1)[index], pending, device).
     stage (2026-10-10, B18): a pinned uint8 tensor [>= len(index), ROW_BYTES]: the records are gathered into it and
     copied asynchronously (the caller must not reuse it before the copy is done: a later sync of the device).
-    with_raw (B18): also return the records' bytes on the device and the actions under way: (batch, bytes, pending)."""
+    with_raw (B18): also return the records' bytes on the device and the actions under way: (batch, bytes, pending).
+    frames (A-3, 2026-11-19): the FrameArena of compact ROWC records with v3 frames (Rollout.frames): their bytes
+    rebuilt in ROW's layout up to the longest frame (_compact_v3_raw)."""
     # (B45: compact ROWC records share ROW's head layout; their own record size)
     raw = torch.from_numpy(rows.reshape(-1).view(np.uint8).reshape(-1, rows.dtype.itemsize))
     if head:   # B42 (block memory): the record head only, never the visible frame's padding
         raw, stage = raw[:, :ROW_HEAD], None
     elif rows.dtype.itemsize != ROW_BYTES:
-        raise ValueError('rows_to_device: compact records carry no frame (head=True only)')
+        if frames is None:
+            raise ValueError('rows_to_device: compact records carry no frame (head=True, or their frames)')
+        g_ = _compact_v3_raw(rows, index, frames, stage)
+        dev_raw = g_.to(device, non_blocking=stage is not None)
+        pend = torch.from_numpy(np.ascontiguousarray(pending, np.int64)).to(device)
+        out = decode_rows(dev_raw, pend, visible=True, counts=None)
+        return (out, dev_raw, pend) if with_raw else out
     else:
         # (seq-v1, the coordinator 2026-11-18: v3 frames fill about 15 KB of the 128-KiB frame field -- every record
         #  copied whole was 8 x the bytes. With v3 frames only, each record's bytes up to the longest frame of the

@@ -755,7 +755,7 @@ class Rollout:
     stored (store_temporal); the actor writes them on the device (GraphActor tdest / store's index_copy_)."""
 
     def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False, temporal=None, alloc=None, close=False,
-                 priv=None, block_steps=0):
+                 priv=None, block_steps=0, compact=False):
         # B38 step 2: alloc(shape, dtype) -> a zeroed array for every host array (SharedArrays: shared memory the
         # learner process maps); None: numpy's, as before
         zeros = np.zeros if alloc is None else alloc
@@ -797,9 +797,11 @@ class Rollout:
         self.h = zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
         # B45: block-memory rollouts store compact records (ROWC) and their visible frames in a byte arena (~11 KB each
         # instead of 128 KiB); others (and B38's shared-memory learner process) keep ROW
-        compact = bool(block_steps) and alloc is None
+        # (A-3, 2026-11-19: and v3-frame rollouts, compact=True -- the learner's rows_to_device rebuilds their bytes
+        #  from the arena; 5 GB of mostly empty frame budget per 32,768-decision rollout before)
+        compact = (bool(block_steps) or bool(compact)) and alloc is None
         self.rows = zeros((workers, capacity), ROWC if compact else ROW)
-        self.frames = FrameArena(workers * capacity * 12288) if compact else None
+        self.frames = FrameArena(workers * capacity * 16384) if compact else None
         self.pending = zeros((workers, capacity, n_heads), np.int64)
         self.actions = zeros((workers, capacity, n_heads), np.int64)
         self.logp = zeros((workers, capacity), np.float32)
@@ -1507,6 +1509,22 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
     roll.pending[a_idx, kk], roll.actions[a_idx, kk] = under_way, actions
     roll.logp[a_idx, kk], roll.value[a_idx, kk], roll.version[a_idx, kk] = logp, value, version
     roll.length[a_idx], roll.open[a_idx] = kk + 1, kk
+
+
+def expand_rows(roll, m):
+    """(A-3) roll.rows[:, :m] as ROW records (the dumps' format, the tools read it): compact ROWC records with their
+    frames from roll.frames (the frame field's tail past each frame zero); ROW records as they are."""
+    rows = roll.rows[:, :m]
+    if rows.dtype == ROW:
+        return rows
+    out = np.zeros(rows.shape, ROW)
+    fa = ROW.fields['visible_frame'][1]
+    o_ = out.reshape(-1).view(np.uint8).reshape(-1, ROW.itemsize)
+    o_[:, :fa] = np.ascontiguousarray(rows).reshape(-1).view(np.uint8).reshape(-1, ROWC.itemsize)[:, :fa]
+    buf = roll.frames.buf
+    for i, (o, k) in enumerate(zip(rows['visible_off'].reshape(-1), rows['visible_bytes'].reshape(-1))):
+        o_[i, fa:fa + int(k)] = buf[int(o):int(o) + int(k)]
+    return out
 
 
 def store_temporal(roll, a_idx, kk, rows, t):
@@ -3197,7 +3215,8 @@ def main(argv=None, child=None, actor=None):
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
     if child is None:
-        r_kw = dict(close=aux_on or log_on, priv=PRIV_DTYPE if priv_on else None,block_steps=128 if block_on else 0)
+        r_kw = dict(close=aux_on or log_on, priv=PRIV_DTYPE if priv_on else None,block_steps=128 if block_on else 0,
+                    compact=args.frame == 'v3' and os.environ.get('ISAAC_RL_V3_COMPACT', '1') == '1')
         roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw), \
             Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw)
         if n_act > 1 and actor is None:   # (the first actor: the shared arrays of all workers, its rows of them)
@@ -3608,7 +3627,7 @@ def main(argv=None, child=None, actor=None):
             m = int(lengths.max())
             (out / 'rollouts').mkdir(exist_ok=True)
             stem = out / 'rollouts' / f'rollout-{L["update"]:06d}'
-            np.savez(str(stem) + '.npz', **{k: getattr(rl, k)[:, :m] for k in (
+            np.savez(str(stem) + '.npz', **{k: (expand_rows(rl, m) if k == 'rows' else getattr(rl, k)[:, :m]) for k in (
                 'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version')},
                 **({'value_g': rl.value_g[:, :m]} if getattr(rl, 'value_g', None) is not None else {}),
                 length=rl.length, open=rl.open, update=L['update'])
@@ -3683,10 +3702,11 @@ def main(argv=None, child=None, actor=None):
                     L['stage_r'] = torch.empty((int(len(all_flat) * 1.25) + 64, ROW_BYTES),
                                                dtype=torch.uint8).pin_memory()
                 every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
-                                                      stage=L['stage_r'], with_raw=True)
+                                                      stage=L['stage_r'], with_raw=True, frames=rl.frames)
                 fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on, t_fb)
             else:
-                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
+                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
+                                       frames=rl.frames)
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
             # (memory: one GRU step from each decision's stored input state)
             h_all = torch.from_numpy(rl.h.reshape(-1, mem_dim)[all_flat]).to(device) if mem_on else None
@@ -3768,7 +3788,8 @@ def main(argv=None, child=None, actor=None):
                             t_p = temporal_rows(rl, idx_, capacity, device)
                             tk_ = dict(temporal=dict(mode='stored', o=t_p['o'], o_prev=t_p['o_prev'], has=t_p['has']))
                         with autocast():
-                            o_ = learner_model(rows_to_device(rl.rows, idx_, rl.pending.reshape(-1, nh)[idx_], device),
+                            o_ = learner_model(rows_to_device(rl.rows, idx_, rl.pending.reshape(-1, nh)[idx_], device,
+                                                              frames=rl.frames),
                                                packed=bool(args.packed), need_vg=True,
                                                mem=torch.from_numpy(rl.h.reshape(-1, mem_dim)[idx_]).to(device)
                                                if mem_on else None, **tk_)
@@ -3832,7 +3853,7 @@ def main(argv=None, child=None, actor=None):
                     L['stage'] = torch.empty((int(len(flat) * 1.25) + 64, ROW_BYTES), dtype=torch.uint8).pin_memory()
                 stage = L['stage']
             batch = rows_to_device(rl.rows, flat, rl.pending.reshape(-1, nh)[flat], device, stage=stage,
-                                   with_raw=fast, head=block_on)
+                                   with_raw=fast, head=block_on, frames=None if block_on else rl.frames)
             if fast:   # (B18: a minibatch's records are gathered as bytes, the fields are views of them)
                 batch, raw_all, pend_all = batch
         b_act =torch.from_numpy(rl.actions.reshape(-1, nh)[flat]).to(device)
