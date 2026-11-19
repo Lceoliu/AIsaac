@@ -52,6 +52,8 @@ struct TokDriver {
   std::vector<char> gone;
   abptok::MsgReader reader;
   std::vector<double> f_at;      // an 'F' waiting for its 'R' since (seconds)
+  std::vector<double> ready_t;   // when each worker's waiting record was read (the ready -> reply clock)
+  double rr_s = 0; i64 rr_n = 0;  // ready -> reply, summed over the replies (ends included)
   // control
   std::mutex mu; std::condition_variable cv;
   std::thread th; bool running = false, stop_req = false, pause_req = false, paused = false;
@@ -72,7 +74,7 @@ struct TokDriver {
     row_bytes = mid->L.row_bytes; nh = mid->L.nh;
     TORCH_CHECK((i64)fds.size() == W && nh <= 8, "set_sampler: one fd per worker, at most 8 heads");
     pending.assign((size_t)(W*nh), 0); ready_slot.assign((size_t)W, -1); gone.assign((size_t)W, 0);
-    reader.reset(W); f_at.assign((size_t)W, -1.0);
+    reader.reset(W); f_at.assign((size_t)W, -1.0); ready_t.assign((size_t)W, 0.0);
   }
   void set_rules(i64 off_done_, i64 off_first_, i64 off_t_, i64 done_branch_, i64 cap_t_, i64 trunc_) {
     off_done = off_done_; off_first = off_first_; off_t = off_t_; done_branch = done_branch_; cap_t = cap_t_; trunc = trunc_;
@@ -163,7 +165,7 @@ struct TokDriver {
     d["accepted"] = accepted; d["answered"] = answered; d["ended_records"] = ended_records; d["replies"] = replies;
     d["calls"] = calls_n; d["credit_waits"] = credit_waits; d["queue"] = (i64)q.size(); d["blocks_free"] = (i64)block_free.size();
     d["ring_used"] = ring_head-ring_released; d["ring_head"] = ring_head; d["t_credit_s"] = t_credit; d["t_call_s"] = t_call;
-    d["t_read_s"] = t_read;
+    d["t_read_s"] = t_read; d["rr_s"] = rr_s; d["rr_n"] = rr_n;
     return d;
   }
 
@@ -176,6 +178,7 @@ struct TokDriver {
   void reply(i64 w) {
     static const uint8_t R[5] = {0, 0, 0, 1, 'a'};
     if (::write(fds[(size_t)w], R, 5) == 5) replies++;
+    rr_s += now()-ready_t[(size_t)w]; rr_n++;
   }
   // read every readable fd: records into ready_slot, ends / gone into the queue, fatal / bad into the fatal state
   void read_fds(int timeout_ms) {
@@ -209,6 +212,7 @@ struct TokDriver {
             continue;
           }
           ready_slot[e.worker] = e.slot;
+          ready_t[(size_t)e.worker] = t;
         } else if (e.kind == abptok::MsgEvent::END || e.kind == abptok::MsgEvent::GONE) {
           gone[e.worker] = 1;
           Rec r{}; r.seq = seq++; r.call = -1; r.worker = e.worker; r.slot = -1; r.block = -1; r.brow = -1;

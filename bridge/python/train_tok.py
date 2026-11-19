@@ -5159,6 +5159,11 @@ def main(argv=None, child=None, actor=None):
             'p_tick': prof.get('tick', 0.0), 'p_control': prof.get('control', 0.0),
             'p_weights': prof.get('weights', 0.0), 'p_main_ready': prof.get('main_ready', 0.0),
             'p_store': prof['store'], 'polls': prof['polls'],
+            # (P package: ms per record from its poll / its read by the C++ driver to its reply; the driver's calls,
+            #  its time short of credits and in calls)
+            'p_ready_reply_ms': 1000 * prof.get('rr_s', 0.0) / max(prof.get('rr_n', 0), 1),
+            'p_drv_calls': prof.get('drv_calls', 0), 'p_drv_credit_s': prof.get('drv_credit_s', 0.0),
+            'p_drv_call_s': prof.get('drv_call_s', 0.0),
             'idle_share': dst['wait_s'] / max(n * job['cycle_s'], 1e-9), 'w_step': dst['step_s'],
             'w_wait': dst['wait_s'], 'w_encode': dst['encode_s'], 'w_fork': dst['fork_s'], 'w_teach': dst['teach_s'],
             'w_overrun': dst.get('overrun_s', 0.0), 'w_state': dst.get('state_s', 0.0),
@@ -6071,6 +6076,7 @@ def main(argv=None, child=None, actor=None):
         torch.cuda.synchronize()
 
     priv_pending = np.zeros(n, PRIV_DTYPE) if (priv_on and child is None) else None   # (tok_priv)
+    ready_at = np.zeros(n)   # (P package: when each worker's record was taken by a poll)
 
     def answer(prof, a_idx, sub, under_way, actions, logp, value, extra=None, ver=None, h=None, vg=None, t=None,
                block_context=None):
@@ -6102,6 +6108,8 @@ def main(argv=None, child=None, actor=None):
         sampler.reply(a_idx)
         t3 = time.perf_counter()
         prof['reply'] += t3 - t2
+        prof['rr_s'] = prof.get('rr_s', 0.0) + float((t3 - ready_at[a_idx]).sum())   # (P: ready -> reply)
+        prof['rr_n'] = prof.get('rr_n', 0) + len(a_idx)
         store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h, vg, t,
               priv_pending[a_idx] if priv_pending is not None else None,block_context=block_context)
         pending[a_idx] = actions
@@ -6518,6 +6526,7 @@ def main(argv=None, child=None, actor=None):
                 tb = time.perf_counter()
                 prof['poll'] += tb - ta
                 prof['polls'] += 1
+                ready_at[idx] = tb   # (P: the ready -> reply clock starts at the poll that took them)
                 if not len(idx):
                     if block_actor is not None:
                         _lane_tick(prof)
@@ -6540,6 +6549,8 @@ def main(argv=None, child=None, actor=None):
                 nv.pop()
                 if not go.all():   # records that end an episode only need their answer
                     sampler.reply(idx[~go])
+                    prof['rr_s'] = prof.get('rr_s', 0.0) + float((time.perf_counter() - ready_at[idx[~go]]).sum())
+                    prof['rr_n'] = prof.get('rr_n', 0) + int((~go).sum())
                 if not go.any():
                     prof['reply'] += time.perf_counter() - t1
                     if block_actor is not None:

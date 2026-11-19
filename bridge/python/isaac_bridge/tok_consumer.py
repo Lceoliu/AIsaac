@@ -66,6 +66,7 @@ class DriverCollect:
         """Records into the rollout until its committed usable count reaches target (or the workers end / a stop);
         tick(): the lanes' round (each loop); weights(): None, or a callable that swaps the weights (called with the
         driver paused and drained; returns the new version)."""
+        c0 = self.d.counters()
         if not self.started:
             self.d.start()
             self.started = True
@@ -80,6 +81,12 @@ class DriverCollect:
                 self.d.resume()
             self.step(roll, book, pending, prof, store, 0.002)
         self.drain(roll, book, pending, prof, store)
+        c1 = self.d.counters()   # (the driver's ready -> reply clock of this collect, as the Python loop's)
+        prof['rr_s'] = prof.get('rr_s', 0.0) + c1['rr_s'] - c0['rr_s']
+        prof['rr_n'] = prof.get('rr_n', 0) + c1['rr_n'] - c0['rr_n']
+        prof['drv_calls'] = prof.get('drv_calls', 0) + c1['calls'] - c0['calls']
+        prof['drv_credit_s'] = prof.get('drv_credit_s', 0.0) + c1['t_credit_s'] - c0['t_credit_s']
+        prof['drv_call_s'] = prof.get('drv_call_s', 0.0) + c1['t_call_s'] - c0['t_call_s']
 
     def drain(self, roll, book, pending, prof, store):
         """Pause the driver; every record it accepted committed (P-driver-design 11.1)."""
