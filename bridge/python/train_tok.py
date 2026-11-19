@@ -5982,13 +5982,17 @@ def main(argv=None, child=None, actor=None):
     tok_mode = int(os.environ.get('ISAAC_TOK_CPP_DRIVER', '0') or 0) if child is None else 0
     tok_dc = [None, False]
 
+    def _dev_key(d_):   # ('cuda', 0) for 'cuda' / 'cuda:0' / torch.device('cuda', 0)
+        d_ = torch.device(d_)
+        return d_.type, (d_.index or 0) if d_.type == 'cuda' else d_.index
+
     def tok_driver_start():
         from isaac_bridge import tok_consumer, tok_driver
         why = tok_consumer.supported(
             args, t_on=t_on, mem_on=mem_on, frame_v3=args.frame == 'v3', block_on=block_on, proc=proc, n_act=n_act,
             snaps=snaps, priv_on=priv_pending is not None, pf_on=pf_on, lab=lab is not None, aux=aux is not None,
             plr=getattr(book, 'plr', None) is not None,
-            lanes_gpu=lanes is not None and torch.device(getattr(lanes, 'device', device)) != torch.device(device),
+            lanes_gpu=lanes is not None and _dev_key(getattr(lanes, 'device', device)) != _dev_key(device),
             use_graphs=use_graphs, b52=cpp_driver is not None)
         mod = None if why else tok_driver.load(verbose=True)
         if why is None and mod is None:

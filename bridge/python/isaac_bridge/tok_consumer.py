@@ -59,6 +59,7 @@ class DriverCollect:
                       ptr(getattr(sampler, 'main_vg', None)), ptr(getattr(sampler, 'cf_snap', None)))
         d.set_rules(ROW.fields['done'][1], ROW.fields['first'][1], ROW.fields['t'][1], DONE_BRANCH, int(cap_t), int(trunc))
         origin = getattr(sampler, 'origin_column', None)
+        self.has_origin = origin is not None
         if origin is not None:   # (Codex 17-5: each record's ep_archive copied at its take, before the reply)
             d.set_origin(int(origin.ctypes.data), int(origin.strides[0]))
         d.set_blocks(int(self.blocks.ctypes.data), blocks, n, 0)
@@ -168,7 +169,7 @@ class DriverCollect:
         tb = time.perf_counter()
         # (Codex 17-5: each first record's fresh / archive from the column as it was at the record's take, not the
         #  live column the worker may have moved on since)
-        book.origin_rec = np.array([float(r['origin']) for r in recs]) if 'origin' in recs[0] else None
+        book.origin_rec = np.array([float(r['origin']) for r in recs]) if self.has_origin else None
         try:
             go = book.arrive(roll, rows, idx, pending)
         finally:
