@@ -10,5 +10,9 @@ if __name__ == '__main__':
     if '--' not in a:
         sys.exit('argv_wrap: no -- <script>')
     rest = a[a.index('--') + 1:]
-    sys.argv = rest
-    runpy.run_path(rest[0], run_name='__main__')
+    if rest[0] == '-m':   # (a module: -- -m pytest tests/x.py)
+        sys.argv = rest[1:]
+        runpy.run_module(rest[1], run_name='__main__', alter_sys=True)
+    else:
+        sys.argv = rest
+        runpy.run_path(rest[0], run_name='__main__')

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 namespace abptok {
@@ -178,5 +179,72 @@ static inline FoldOut fold_pack(const Fold &L, const uint8_t *rows, i64 k, const
   o.g = g; o.r = L.rsizes[ri]; o.graph = g+ri*(i64)L.sizes.size();
   return o;
 }
+
+// ---------------------------------------------------------------- the main workers' pipes (P-driver-design 11.4)
+// A worker's messages are multiprocessing Connection.send_bytes: a 4-byte big-endian length and the payload, possibly
+// split over reads. Payloads: '0' / '1' (a record in its slot 2 w + 0 / 1), 'x' (the worker ends), 'F' then a separate
+// 'R' + reason (a visible-v3 fatal). One reader per fd (the driver thread); feed() whatever a read returned, eof() at EOF.
+struct MsgEvent {
+  enum Kind { RECORD = 0, END = 1, FATAL = 2, BAD = 3, GONE = 4 };
+  int kind; i64 worker; i64 slot; std::string text;
+};
+
+struct MsgReader {
+  static constexpr i64 MAX_MSG = 1 << 20;   // (a reason is at most 8001 bytes; anything past this is not a worker's)
+  std::vector<std::string> buf;              // bytes read, not yet a whole message
+  std::vector<int> await_r;                   // 1: an 'F' came, its 'R' not yet
+  std::vector<int> closed;                    // 1: ended / fatal / gone (no more events)
+  explicit MsgReader(i64 workers = 0) { reset(workers); }
+  void reset(i64 workers) { buf.assign((size_t)workers, std::string()); await_r.assign((size_t)workers, 0);
+                            closed.assign((size_t)workers, 0); }
+
+  void feed(i64 w, const uint8_t *data, size_t n, std::vector<MsgEvent> &out) {
+    if (closed[w]) return;
+    std::string &b = buf[w];
+    b.append((const char *)data, n);
+    size_t at = 0;
+    while (b.size()-at >= 4) {
+      const uint8_t *h = (const uint8_t *)b.data()+at;
+      int64_t len = (int64_t)(int32_t)(((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | h[3]);
+      if (len < 1 || len > MAX_MSG) { bad(w, "a message length of " + std::to_string(len), out); return; }
+      if (b.size()-at-4 < (size_t)len) break;   // (half a message: the rest in a later read)
+      std::string msg = b.substr(at+4, (size_t)len);
+      at += 4+(size_t)len;
+      message(w, msg, out);
+      if (closed[w]) { b.clear(); return; }
+    }
+    b.erase(0, at);
+  }
+  void eof(i64 w, std::vector<MsgEvent> &out) {
+    if (closed[w]) return;
+    closed[w] = 1;
+    if (await_r[w]) out.push_back({MsgEvent::FATAL, w, -1, "visible-v3 fatal: the worker's reason ('R') never came (EOF)"});
+    else if (!buf[w].empty()) out.push_back({MsgEvent::BAD, w, -1, "EOF inside a message (" + std::to_string(buf[w].size()) + " bytes)"});
+    else out.push_back({MsgEvent::GONE, w, -1, ""});
+  }
+  // an 'F' whose 'R' did not come in time (the caller's clock): fatal without the reason
+  void r_timeout(i64 w, std::vector<MsgEvent> &out) {
+    if (closed[w] || !await_r[w]) return;
+    closed[w] = 1;
+    out.push_back({MsgEvent::FATAL, w, -1, "visible-v3 fatal: the worker's reason ('R') never came (timeout)"});
+  }
+
+ private:
+  void bad(i64 w, const std::string &why, std::vector<MsgEvent> &out) {
+    closed[w] = 1; buf[w].clear();
+    out.push_back({MsgEvent::BAD, w, -1, "worker " + std::to_string(w) + ": " + why});
+  }
+  void message(i64 w, const std::string &m, std::vector<MsgEvent> &out) {
+    if (await_r[w]) {
+      if (m[0] == 'R') { closed[w] = 1; out.push_back({MsgEvent::FATAL, w, -1, m.substr(1)}); }
+      else bad(w, "an 'F' not followed by its 'R'", out);
+      return;
+    }
+    if (m.size() == 1 && (m[0] == '0' || m[0] == '1')) { out.push_back({MsgEvent::RECORD, w, 2*w+(m[0]-'0'), ""}); return; }
+    if (m.size() == 1 && m[0] == 'x') { closed[w] = 1; out.push_back({MsgEvent::END, w, -1, ""}); return; }
+    if (m.size() == 1 && m[0] == 'F') { await_r[w] = 1; return; }
+    bad(w, "an unknown message of " + std::to_string(m.size()) + " bytes", out);
+  }
+};
 
 }  // namespace abptok

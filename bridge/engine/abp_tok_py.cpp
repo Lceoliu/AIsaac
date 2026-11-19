@@ -100,7 +100,25 @@ static arr<float> py_crn(arr<i64> keys, arr<i64> t, i64 columns) {
   return out;
 }
 
+// MsgReader for the tests: feed (worker, bytes) chunks and EOFs, collect the events as (kind, worker, slot, text)
+struct PyReader {
+  abptok::MsgReader r;
+  std::vector<abptok::MsgEvent> ev;
+  explicit PyReader(i64 workers) : r(workers) {}
+  void feed(i64 w, py::bytes data) { std::string s = data; r.feed(w, (const uint8_t *)s.data(), s.size(), ev); }
+  void eof(i64 w) { r.eof(w, ev); }
+  void r_timeout(i64 w) { r.r_timeout(w, ev); }
+  py::list take() {
+    py::list l;
+    for (auto &e : ev) l.append(py::make_tuple(e.kind, e.worker, e.slot, py::bytes(e.text)));
+    ev.clear();
+    return l;
+  }
+};
+
 PYBIND11_MODULE(TOK_EXTENSION_NAME, m) {
+  py::class_<PyReader>(m, "MsgReader").def(py::init<i64>()).def("feed", &PyReader::feed).def("eof", &PyReader::eof)
+      .def("r_timeout", &PyReader::r_timeout).def("take", &PyReader::take);
   m.doc() = "P package: abp_tok_core.h (v3 frame check, CRN, fold packing) for the golden samples and tests";
   m.def("check_batch", &py_check_batch, py::arg("consts"), py::arg("headers"), py::arg("versions"), py::arg("sizes"),
         py::arg("p0") = py::none(), py::arg("p_max") = py::none());
