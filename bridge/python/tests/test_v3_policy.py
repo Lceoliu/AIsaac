@@ -29,7 +29,8 @@ from isaac_bridge.frame_v3 import v3_tensors   # noqa: E402
 FIX = HERE / 'fixtures' / 'visible_v3'
 NAMES = [f['name'] for f in json.loads((FIX / 'manifest.json').read_text())['frames']]
 CFG = dict(items=True, width=64, layers=2, heads=4, global_token=True, temporal=True, temporal_width=32,
-           temporal_layers=2, temporal_heads=4, temporal_window=8, temporal_rooms=0, temporal_feedback=0, frame='v3')
+           temporal_layers=2, temporal_heads=4, temporal_window=8, temporal_rooms=0, temporal_feedback=0, frame='v3',
+           v3_inputs=VI.INPUT_REV)
 
 
 def build(seed=3):
@@ -400,3 +401,24 @@ def test_rows_to_device_copies_the_frame_prefix_only():
     bad['visible_bytes'][0] = 1 << 30
     with pytest.raises(VisibleV3Fatal, match='visible_bytes'):
         TP.rows_to_device(bad, idx, pend[idx], 'cpu')
+
+
+def test_input_revision_2():
+    """(2026-11-19) The model maps v3_input.WIDEN's columns back -- E age (minutes) to log2(1 + seconds) / 2, S charges
+    (120ths) linear in 12ths up to 1 and 1 + log2 past it -- and a configuration without the revision is refused."""
+    import math
+    from isaac_bridge.frame_v3 import FrameEncoderV3
+    enc = FrameEncoderV3(64, 1, 4)
+    ja = VI.PLAN['E']['num'].index(V3.col(V3.E_COLS, 'age'))
+    x = torch.zeros(3, len(VI.PLAN['E']['num']))
+    x[:, ja] = torch.tensor([0.0, 8 / 60, 8.0])   # (0 s, 8 s, the clamp: 8 min)
+    y = enc._log_inputs(x, 'E')
+    assert torch.allclose(y[:, ja], torch.tensor([0.0, math.log2(9) / 2, math.log2(481) / 2]))
+    assert torch.equal(torch.cat([y[:, :ja], y[:, ja + 1:]], 1), torch.cat([x[:, :ja], x[:, ja + 1:]], 1))
+    jc = VI.PLAN['S']['num'].index(V3.col(V3.S_COLS, 'charge'))
+    s = torch.zeros(3, len(VI.PLAN['S']['num']))
+    s[:, jc] = torch.tensor([0.05, 0.1, 0.8])   # (6 / 120, 12 / 120, 96 / 120)
+    assert torch.allclose(enc._log_inputs(s, 'S')[:, jc], torch.tensor([0.5, 1.0, 1 + math.log2(8)]))
+    with pytest.raises(ValueError, match='revision'):
+        TP.TokPolicy(**{k: v for k, v in CFG.items() if k != 'v3_inputs'})
+    assert build().config['v3_inputs'] == VI.INPUT_REV

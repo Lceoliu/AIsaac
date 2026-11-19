@@ -1051,7 +1051,7 @@ class TokPolicy(nn.Module):
                  temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128,
                  temporal_feedback=1,
                  obs_prices=False, obs_hearts=False, obs_room_type=False, block_memory=False, block_config=None,
-                 input_schema=None, frame=None):
+                 input_schema=None, frame=None, v3_inputs=None):
         super().__init__()
         if frame not in (None, 'row', 'v3'):
             raise ValueError(f'TokPolicy: frame {frame!r} (None / row: the ROW encoder; v3: FrameEncoderV3)')
@@ -1188,8 +1188,19 @@ class TokPolicy(nn.Module):
         if frame == 'v3':
             from .frame_v3 import FrameEncoderV3
             from .schema_v3 import DROP_BIAS, HEAD_SIZES
+            from .v3_input import INPUT_REV
+            # (input revision 2, 2026-11-19: v3_input.WIDEN / frame_v3.LOG_INPUTS / L_INIT_GAIN. A configuration
+            #  without it -- C115's v3t1 / v3t1b -- was trained on revision 1: refused here, never decoded silently in
+            #  the new units; a new model states it (train_tok --frame v3))
+            if v3_inputs is None or int(v3_inputs) != INPUT_REV:
+                raise ValueError(f'TokPolicy(frame=v3): v3 inputs revision {v3_inputs} (none: 1), this tree decodes '
+                                 f'revision {INPUT_REV}: evaluate or resume it with its own tree')
             self.config['frame'] = 'v3'
+            self.config['v3_inputs'] = INPUT_REV
             self.frame_v3 = FrameEncoderV3(width, layers, heads)
+            if self.gtok is not None:   # (input revision 2: the G token's initial scale as the other kinds')
+                from .frame_v3 import G_INIT_STD
+                nn.init.normal_(self.gtok.tok, std=G_INIT_STD)
             for name in ('type_emb', 'variant_emb', 'subtype_emb', 'item_emb', 'trinket_emb', 'pill_emb', 'effect_emb',
                          'card_emb', 'entity', 'patch', 'player', 'room', 'door', 'map', 'kind', 'blocks', 'char_emb',
                          'room_type_emb', 'itok'):

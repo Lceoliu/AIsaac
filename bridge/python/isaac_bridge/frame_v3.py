@@ -27,6 +27,11 @@ from . import schema_v3 as V3
 from . import v3_input as VI
 
 ID_EMB, ITEM_EMB, CAT_EMB, ANIM_EMB, ICON_EMB = 24, 24, 16, 16, 8
+# (input revision 2, the coordinator 2026-11-19: v3_input.WIDEN's columns mapped back inside the model, in float32:
+#  E age (minutes) -> log2(1 + seconds) / 2; S charge / max_charge (120ths) -> u = 12ths, u up to 1, 1 + log2(u) past it)
+LOG_INPUTS = {('E', 'age'): 'age', ('S', 'charge'): 'charge', ('S', 'max_charge'): 'charge'}
+L_INIT_GAIN = 5.0   # (the local patch token's initial scale: 0.027 -> ~0.14, as the other kinds; the range table's probe)
+G_INIT_STD = 0.15   # (the global token's parameter, TokPolicy.gtok.tok, for a v3 model: 0.02 -> 0.15, likewise)
 PENDING_HEADS = (9, 5, 2, 2, 2)   # the first arm's five heads (move, shoot, bomb, item, pill): drop is not an input
 KINDS = ('P', 'L', 'E', 'N', 'S', 'R', 'M', 'G')
 RC = V3.RC
@@ -72,6 +77,12 @@ class FrameEncoderV3(nn.Module):
         self.m_cnn = nn.Sequential(nn.Conv2d(4 + ICON_EMB, 32, 3, padding=1), nn.GELU(),
                                    nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.GELU(), nn.Flatten(),
                                    nn.Linear(64 * ((V3.MAP_SIDE + 1) // 2) ** 2, width))
+        with torch.no_grad():   # (input revision 2: the L token's initial output scaled as the other kinds')
+            self.l_cnn[-1].weight.mul_(L_INIT_GAIN)
+            self.l_cnn[-1].bias.mul_(L_INIT_GAIN)
+        self.log_cols = {t: [(VI.PLAN[t]['num'].index(V3.col(cols, name)), how)
+                             for (t_, name), how in LOG_INPUTS.items() if t_ == t]
+                         for t, cols in (('E', V3.E_COLS), ('S', V3.S_COLS))}
         self.kind = nn.Parameter(torch.zeros(len(KINDS), width))
         nn.init.normal_(self.kind, std=0.02)
         self.blocks = nn.ModuleList(Block(width, heads) for _ in range(layers))
@@ -84,6 +95,20 @@ class FrameEncoderV3(nn.Module):
             rows = torch.where(real[..., None], rows, torch.zeros_like(rows))
         e = table(rows.clamp(0, table.num_embeddings - 1))
         return e.reshape(*rows.shape[:-1], rows.shape[-1] * e.shape[-1])
+
+    def _log_inputs(self, x, t):
+        """x [..., numeric columns] of token type t with LOG_INPUTS' columns mapped back (float32; the clamp before)."""
+        if not self.log_cols.get(t):
+            return x
+        x = x.float().clone()
+        for j, how in self.log_cols[t]:
+            c = x[..., j]
+            if how == 'age':
+                x[..., j] = torch.log2(1 + 60 * c.clamp(min=0)) / 2
+            else:
+                u = 10 * c.clamp(min=0)
+                x[..., j] = torch.where(u <= 1, u, 1 + torch.log2(u.clamp(min=1)))
+        return x
 
     def tokens(self, v, pending, gtok):
         """v: v3_tensors(pad_batch(...)) on the model's device; pending [B, >= 5] long (the action under way); gtok [width]
@@ -105,13 +130,13 @@ class FrameEncoderV3(nn.Module):
         tp = self.p_mlp(P) + k[0]
         loc = z(v['local'], lm).permute(0, 1, 4, 2, 3).reshape(B * PM, RC, V3.LOCAL_SIDE, V3.LOCAL_SIDE)
         tl = self.l_cnn(loc).view(B, PM, -1) + k[1]
-        E = torch.cat([z(v['E_num'], em), z(v['E_flag'], em), self._emb(self.id_emb, v['E_id'], em),
+        E = torch.cat([z(self._log_inputs(v['E_num'], 'E'), em), z(v['E_flag'], em), self._emb(self.id_emb, v['E_id'], em),
                        self._emb(self.cat_emb, v['E_cat'], em), self._emb(self.anim_emb, v['E_anim'], em),
                        z(v['E_price'], em), z(v['E_rel'], em), z(v['E_laser_rel'], em)], -1)
         te = self.e_mlp(E) + k[2]
         Nn = torch.cat([z(v['N_num'], nm), z(v['N_flag'], nm), self._emb(self.item_emb, v['N_item'], nm)], -1)
         tn = self.n_mlp(Nn) + k[3]
-        S = torch.cat([z(v['S_num'], sm), z(v['S_flag'], sm), self._emb(self.cat_emb, v['S_cat'], sm),
+        S = torch.cat([z(self._log_inputs(v['S_num'], 'S'), sm), z(v['S_flag'], sm), self._emb(self.cat_emb, v['S_cat'], sm),
                        self._emb(self.item_emb, v['S_item'], sm)], -1)
         ts = self.s_mlp(S) + k[4]
         r = self.r_cnn(v['room'].permute(0, 3, 1, 2))                       # [B, 64, 4, 7]

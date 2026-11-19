@@ -2406,6 +2406,10 @@ def main(argv=None, child=None, actor=None):
             p.error(f'--frame v3 takes no item tokens (the N / S tokens of the frame carry the items): --item-tokens 0 '
                     f'--item-shared 0 --item-slots {INV_CAP} (got {args.item_tokens} / {args.item_shared} / {item_slots})')
         tok_kw['frame'] = 'v3'
+        from isaac_bridge.v3_input import INPUT_REV
+        # (a resume keeps its checkpoint's revision -- none: 1, refused by TokPolicy; a new run states the tree's)
+        tok_kw['v3_inputs'] = (torch.load(args.resume, map_location='cpu').get('config', {}).get('v3_inputs')
+                               if args.resume else INPUT_REV)
     elif VISIBLE_V3_MODE and args.obs_visible:
         p.error(f'ISAAC_RL_VISIBLE_V3={VISIBLE_V3_MODE} sends v3 frames: the model must read them (--frame v3) or '
                 'the workers write none (--obs-visible 0 is refused with it too): unset it')

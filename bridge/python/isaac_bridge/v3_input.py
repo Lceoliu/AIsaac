@@ -56,6 +56,15 @@ _MAIN = V3.BODY_ROLE['main']
 
 
 # ----------------------------------------------------------------------------------------------- column plans
+# (2026-11-19, the coordinator: the first arm's range table -- E age saturated at the clamp in 24 % of the entity rows
+#  (8 s), S charge / max_charge in timed items (frames). The model's view, not the wire: these columns decoded in a
+#  wider unit before the clamp -- age in minutes (the clamp at 8 min), charges in 120ths (at 960) -- and frame_v3 maps
+#  them back (frame_v3.LOG_INPUTS: log2(1 + age in s) / 2, the charges linear up to 12 and logarithmic past it).
+#  INPUT_REV 2: a model of an older revision (no config key) is refused, its tree decodes it.)
+INPUT_REV = 2
+WIDEN = {('E', 'age'): 60.0, ('S', 'charge'): 10.0, ('S', 'max_charge'): 10.0}
+
+
 def _plan(cols, table):
     """Per token type: the column indices of each decoded group, in column order."""
     g = dict(num=[], scale=[], known=[], bit=[], bits8=[], word16=[], cat=[], cat_ns=[], idn=[], item=[], item_ns=[],
@@ -63,7 +72,7 @@ def _plan(cols, table):
     for i, (name, kind, _unit, scale) in enumerate(cols):
         if kind == 'num':
             g['num'].append(i)
-            g['scale'].append(scale or 1.0)
+            g['scale'].append((scale or 1.0) * WIDEN.get((table, name), 1.0))
         elif kind in ('known', 'bit'):
             g[kind].append(i)
         elif kind == 'bits8':

@@ -395,7 +395,9 @@ def test_every_numeric_column_scaled_once_from_the_schema():
             for r in range(rows[t]):
                 for (c, sc), qq in zip(cols, q):
                     frame[at[t] + r * width[t] + c] = np.float32(qq * sc)
-            expect[t] = np.asarray(q, np.float32)
+            # (input revision 2: v3_input.WIDEN's columns in their wider unit -- the only scale not the schema's)
+            widen = [VI.WIDEN.get((t, nm), 1.0) for c_, nm, kind, _u, _s in sorted(spec[t]) if kind == 'num']
+            expect[t] = (np.asarray(q, np.float64) / np.asarray(widen)).astype(np.float32)
         d = decode(frame.tobytes())
         t_ = VI.decode_frame_torch(frame.tobytes(), V3.VERSION)
         for t in 'PENS':
@@ -563,3 +565,12 @@ def test_check_batch_refuses_and_counts():
         VI.check_batch(g[:, :8], [V3.VERSION] * 4, sizes)
     counts, trunc = VI.check_batch(F[:, :8], [V3.VERSION] * 4, sizes, VI.P_MAX, 0 + 1, 2)
     assert trunc['n'] == int((counts[:, 2] > 1).sum()) and trunc['s'] == int((counts[:, 3] > 2).sum())
+
+
+def test_widened_columns_are_the_listed_ones_only():
+    """(input revision 2) v3_input.WIDEN names three numeric columns; every other column keeps the schema's scale."""
+    assert set(VI.WIDEN) == {('E', 'age'), ('S', 'charge'), ('S', 'max_charge')} and VI.INPUT_REV == 2
+    for t, cols in (('P', V3.P_COLS), ('E', V3.E_COLS), ('N', V3.N_COLS), ('S', V3.S_COLS)):
+        for j, i in enumerate(VI.PLAN[t]['num']):
+            name, _kind, _u, sc = cols[i]
+            assert VI.PLAN[t]['scale'][j] == np.float32((sc or 1.0) * VI.WIDEN.get((t, name), 1.0)), (t, name)
