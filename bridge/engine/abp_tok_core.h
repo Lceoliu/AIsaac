@@ -17,8 +17,8 @@ namespace abptok {
 using i64 = int64_t;
 
 // ---------------------------------------------------------------- the v3 frame check (v3_input.REJECT's codes)
-enum Reject { R_OK = 0, R_SCHEMA = 1, R_BYTES = 2, R_NONWHOLE = 3, R_MAGIC = 4, R_VERSION_WORD = 5, R_COUNTS = 6,
-              R_SIZE = 7, R_P0 = 8, R_P_MAX = 9 };
+enum Reject { REJ_OK = 0, REJ_SCHEMA = 1, REJ_BYTES = 2, REJ_NONWHOLE = 3, REJ_MAGIC = 4, REJ_VERSION_WORD = 5, REJ_COUNTS = 6,
+              REJ_SIZE = 7, REJ_P0 = 8, REJ_P_MAX = 9 };
 
 struct V3 {   // schema_v3 / v3_input's numbers (set from Python)
   i64 header = 8, h_p = 2, fixed = 0, body = 0, ef = 0, nf = 0, sf = 0, frame_bytes = 0;
@@ -32,27 +32,27 @@ static inline bool whole(double x) { return std::isfinite(x) && x == std::trunc(
 
 // v3_input._reject_row: one record's 8 header words, its visible_schema and its byte count (as Python floats)
 static inline int check_row(const V3 &c, const float *h, double version, double nbytes, i64 cnt[4]) {
-  if (!std::isfinite(version) || version != c.version) return R_SCHEMA;
-  if (!std::isfinite(nbytes)) return R_BYTES;
+  if (!std::isfinite(version) || version != c.version) return REJ_SCHEMA;
+  if (!std::isfinite(nbytes)) return REJ_BYTES;
   double nb = std::trunc(nbytes);   // (int(nbytes))
-  if (nb < (double)(c.header*4) || nb > (double)c.frame_bytes) return R_BYTES;
+  if (nb < (double)(c.header*4) || nb > (double)c.frame_bytes) return REJ_BYTES;
   i64 n = (i64)nb;
-  if (n%4) return R_BYTES;
+  if (n%4) return REJ_BYTES;
   double w[8];
-  for (int j = 0; j < 8; j++) { w[j] = (double)h[j]; if (!whole(w[j])) return R_NONWHOLE; }
-  if (w[0] != c.magic) return R_MAGIC;
-  if (w[6] != c.version_word) return R_VERSION_WORD;
+  for (int j = 0; j < 8; j++) { w[j] = (double)h[j]; if (!whole(w[j])) return REJ_NONWHOLE; }
+  if (w[0] != c.magic) return REJ_MAGIC;
+  if (w[6] != c.version_word) return REJ_VERSION_WORD;
   double p = w[2], e = w[3], nn = w[4], ss = w[5];
-  if (!(p >= 1 && p <= (double)c.cap_body && e >= 0 && e <= (double)c.cap_entity && nn >= 0 && ss >= 0)) return R_COUNTS;
+  if (!(p >= 1 && p <= (double)c.cap_body && e >= 0 && e <= (double)c.cap_entity && nn >= 0 && ss >= 0)) return REJ_COUNTS;
   // (frame_floats; n / s past the byte budget on their own: 'size' as in Python, whatever their size)
-  if (nn > (double)c.frame_bytes || ss > (double)c.frame_bytes) return R_SIZE;
+  if (nn > (double)c.frame_bytes || ss > (double)c.frame_bytes) return REJ_SIZE;
   i64 want = c.fixed+(i64)p*c.body+(i64)e*c.ef+(i64)nn*c.nf+(i64)ss*c.sf;
-  if (w[1] != (double)want || want*4 > c.frame_bytes || n/4 != want) return R_SIZE;
+  if (w[1] != (double)want || want*4 > c.frame_bytes || n/4 != want) return REJ_SIZE;
   cnt[0] = (i64)p; cnt[1] = (i64)e; cnt[2] = (i64)nn; cnt[3] = (i64)ss;
-  return R_OK;
+  return REJ_OK;
 }
 
-struct CheckOut { int code = R_OK; i64 record = -1, trunc_n = 0, trunc_s = 0, e_bucket = -1; };
+struct CheckOut { int code = REJ_OK; i64 record = -1, trunc_n = 0, trunc_s = 0, e_bucket = -1; };
 
 // reject_code + check_batch: headers [b, hstride] float32, versions / sizes [b] (as doubles), p0 [b, 2] float32 or
 // null, p_max (has_p_max false: none); counts [b, 4] out (defined where the batch is accepted)
@@ -66,10 +66,10 @@ static inline CheckOut check_batch(const V3 &c, const float *headers, i64 hstrid
   }
   if (p0)
     for (i64 i = 0; i < b; i++)
-      if (!(p0[2*i] == (float)c.main_role && p0[2*i+1] == 1.0f)) { o.code = R_P0; o.record = i; return o; }
+      if (!(p0[2*i] == (float)c.main_role && p0[2*i+1] == 1.0f)) { o.code = REJ_P0; o.record = i; return o; }
   i64 emax = 0;
   for (i64 i = 0; i < b; i++) {
-    if (has_p_max && counts[4*i] > p_max) { o.code = R_P_MAX; o.record = -1; return o; }
+    if (has_p_max && counts[4*i] > p_max) { o.code = REJ_P_MAX; o.record = -1; return o; }
     if (counts[4*i+1] > emax) emax = counts[4*i+1];
     o.trunc_n += counts[4*i+2] > c.n_max;
     o.trunc_s += counts[4*i+3] > c.s_max;
