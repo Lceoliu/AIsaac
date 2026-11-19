@@ -1185,6 +1185,9 @@ class TokPolicy(nn.Module):
         # seq-v1 step 2 (frame='v3'): registered after everything else; the ROW input modules removed (the v3 frame is
         # the only observation), the norm, heads, global token's norm / value and the temporal side kept as T1's
         self.frame_v3 = None
+        # (L-1, 2026-11-19) the padded frame encoder's call in the learner: torch.compile of frame_v3 (train_tok
+        # --v3-encoder-compile, the learner's model only); None: frame_v3 itself. Not a module attribute (no state).
+        self.frame_v3_call = None
         if frame == 'v3':
             from .frame_v3 import FrameEncoderV3
             from .schema_v3 import DROP_BIAS, HEAD_SIZES
@@ -1502,7 +1505,7 @@ class TokPolicy(nn.Module):
             if packed:
                 x, _pad, g = self.frame_v3.forward_packed(v3, b['pending'], self.gtok.tok)
             else:
-                x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
+                x, _pad, g = (self.frame_v3_call or self.frame_v3)(v3, b['pending'], self.gtok.tok)
         with _mark('v3:heads'):
             return self._heads(x[:, 0], need_h, mem, x[:, g], need_vg, tctx)
 

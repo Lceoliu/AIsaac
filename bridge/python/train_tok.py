@@ -2217,6 +2217,10 @@ def main(argv=None, child=None, actor=None):
                         '(attention buckets, entity positions, the distinct grids: the same values up to summation '
                         'order), its records staged in pinned memory and kept as bytes, so that the PPO parts gather '
                         "bytes after it too (B18's raw gather; values identical), the item counts read from the fields")
+    p.add_argument('--v3-encoder-compile', default='',
+                   help="2026-11-19 (L-1, --frame v3 with --packed 0): torch.compile mode of the learner's padded frame "
+                        "encoder alone (fixed shapes: one compile per E / N / S bucket and part size; e.g. default, "
+                        "reduce-overhead); '': eager, as before. The actor's graphs and the evaluation are not compiled")
     p.add_argument('--learner-compile', default='',
                    help="2026-10-17 (B38 step 4, an experiment): torch.compile mode of the learner model's forward in "
                         "the PPO parts and the recompute pass (e.g. default, max-autotune-no-cudagraphs; dynamic "
@@ -3537,6 +3541,17 @@ def main(argv=None, child=None, actor=None):
     # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
     # --learner-compile, the same module and parameters)
     lm_call = learner_model
+    if args.v3_encoder_compile and (args.frame != 'v3' or args.packed):
+        p.error('--v3-encoder-compile: --frame v3 with --packed 0 only (the packed path has no fixed shapes)')
+    if args.v3_encoder_compile and (child is not None or not proc):   # (L-1: the frame encoder alone)
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = max(int(torch._dynamo.config.cache_size_limit),
+                                                    int(os.environ.get('ISAAC_RL_V3_COMPILE_CACHE', '64')))
+        # (object.__setattr__: a compiled module is a Module -- set as usual it would become a submodule and its
+        #  parameters a second time in the state dict)
+        object.__setattr__(learner_model, 'frame_v3_call',
+                           torch.compile(learner_model.frame_v3, mode=args.v3_encoder_compile, dynamic=False))
+        print(f'L-1: the learner\'s v3 frame encoder compiled ({args.v3_encoder_compile}, fixed shapes)', flush=True)
     if args.learner_compile and (child is not None or not proc):
         import torch._dynamo
         torch._dynamo.config.cache_size_limit = int(os.environ.get('ISAAC_RL_B38_COMPILE_CACHE', '64'))
