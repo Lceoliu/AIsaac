@@ -829,6 +829,60 @@ def check_batch(headers, versions, sizes, p_max=None, n_max=None, s_max=None, p0
     return counts, trunc
 
 
+# (P package, 2026-11-19) check_batch's outcome as a code -- for the C++ driver's frame_counts_v3, which has no
+# Python exception to raise: both are held to the same golden samples (tools/p_golden.py). The first record whose
+# header fails, in record order, with the reason of the first failing test in check_frame_header_v3's order; then
+# (all headers good) P row 0's contract over the batch; then the padded layout's bodies.
+REJECT = {k: i for i, k in enumerate(('ok', 'schema', 'bytes', 'nonwhole', 'magic', 'version_word', 'counts', 'size',
+                                         'p0', 'p_max'))}   # (ok 0, schema 1, ... p_max 9)
+
+
+def _reject_row(h, version, nbytes):
+    """The reason code (REJECT) of one record's header words h [8] float32, visible_schema and byte count; 0: good."""
+    vs = float(version)
+    if not np.isfinite(vs) or vs != V3.VERSION:
+        return REJECT['schema']
+    if not np.isfinite(float(nbytes)):
+        return REJECT['bytes']
+    n = int(nbytes)
+    if n % 4 or n < V3.HEADER * 4 or n > V3.FRAME_BYTES:
+        return REJECT['bytes']
+    w = [float(x) for x in h[:V3.HEADER]]
+    if not all(np.isfinite(x) and x == int(x) for x in w):
+        return REJECT['nonwhole']
+    magic, size, p, e, nn, ss, word, _ = (int(x) for x in w)
+    if magic != V3.MAGIC:
+        return REJECT['magic']
+    if word != V3.VERSION_WORD:
+        return REJECT['version_word']
+    if not (1 <= p <= V3.CAP_BODY and 0 <= e <= V3.CAP_ENTITY and nn >= 0 and ss >= 0):
+        return REJECT['counts']
+    want = V3.frame_floats(p, e, nn, ss)
+    if size != want or want * 4 > V3.FRAME_BYTES or n // 4 != want:
+        return REJECT['size']
+    return REJECT['ok']
+
+
+def reject_code(headers, versions, sizes, p0=None, p_max=None):
+    """(code, record) of check_batch(headers, versions, sizes, p_max, p0=p0) on the wire's arrays (headers [B, >= 8]
+    float32, versions / sizes [B], p0 [B, 2] float32): (0, -1) where it accepts, else REJECT's code of the refusal and
+    the record it names (-1 for p_max). Equal to check_batch on every input of tests/test_v3_check_batch.py and the
+    golden samples."""
+    headers = np.asarray(headers, np.float32)
+    for i in range(len(headers)):
+        c = _reject_row(headers[i], versions[i], sizes[i])
+        if c:
+            return c, i
+    if p0 is not None:
+        p0 = np.asarray(p0, np.float32)
+        bad = np.nonzero(~((p0[:, 0] == _MAIN) & (p0[:, 1] == 1)))[0]
+        if len(bad):
+            return REJECT['p0'], int(bad[0])
+    if p_max is not None and len(headers) and (headers[:, V3.H_P].astype(np.int64) > p_max).any():
+        return REJECT['p_max'], -1
+    return REJECT['ok'], -1
+
+
 def _t_rows(F, base, stride, m, width, count):
     """[B, m, width] rows gathered from frame floats F [B, W] at base + i * stride (i < count; others 0) and the
     validity mask [B, m]."""

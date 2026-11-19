@@ -2196,6 +2196,117 @@ def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, hea
     return (out, dev_raw, pend) if with_raw else out
 
 
+class FoldLayout(tuple):
+    """(P package, 2026-11-19) GraphActor(fold=True)'s staging layout: n rows (the largest call), nh heads (H logits in
+    all), the control block's width cw and its fields' byte offsets (fold_views), the record graphs' entity sizes and
+    row buckets, and which inputs the graphs read (mem: the GRU table row and keep; t_on: the temporal slot and the
+    rollout row; crn). A tuple: fold_pack's callers (GraphActor, the C++ driver's tests) build it once."""
+    __slots__ = ()
+    _f = ('n', 'nh', 'H', 'cw', 'dest_at', 'mem', 't_on', 'crn', 'sizes', 'rsizes', 'ent_span')
+
+    def __new__(cls, n, heads, mem, t_on, crn, sizes, rsizes):
+        H = int(sum(heads))
+        cw = -(-(20 + 4 * H) // 8) * 8
+        dest_at = cw
+        if t_on:
+            cw += 8
+        dt_e, off_e = ROW.fields['ent'][:2]
+        span = (off_e, dt_e.itemsize // dt_e.shape[0], off_e + dt_e.itemsize)
+        return tuple.__new__(cls, (int(n), len(heads), H, cw, dest_at, bool(mem), bool(t_on), bool(crn),
+                                   tuple(int(x) for x in sizes), tuple(int(x) for x in rsizes), span))
+
+    def __getattr__(self, k):
+        try:
+            return self[FoldLayout._f.index(k)]
+        except ValueError:
+            raise AttributeError(k) from None
+
+
+def fold_views(lay, ctrl):
+    """The control block's fields as numpy views of ctrl [n, cw] uint8: widx (int64: the GRU table row / the temporal
+    slot), keep (float32: 0 where an episode starts), dup (float32: 1 on a row past the call's records), cf (float32: 1
+    where the row's uniforms are given), cu [n, H] float32 (those uniforms), dest (int64: the record's rollout row;
+    temporal models only)."""
+    return dict(widx=ctrl[:, 0:8].view(np.int64)[:, 0], keep=ctrl[:, 8:12].view(np.float32)[:, 0],
+                dup=ctrl[:, 12:16].view(np.float32)[:, 0], cf=ctrl[:, 16:20].view(np.float32)[:, 0],
+                cu=ctrl[:, 20:20 + 4 * lay.H].view(np.float32),
+                dest=ctrl[:, lay.dest_at:lay.dest_at + 8].view(np.int64)[:, 0] if lay.t_on else None)
+
+
+def fold_pack(lay, rows, pending, widx=None, reset=None, dest=None, ukeys=None, *, stage, ctrl, cv=None, eb=None):
+    """(P package, 2026-11-19) The host side of one GraphActor(fold=True) call as a pure function of its inputs: the
+    records' bytes and the pending actions into stage [n, ROW_BYTES + 8 nh] uint8, the control block into ctrl [n, cw]
+    uint8 (numpy; cv: fold_views(lay, ctrl), built here when None), and which graph to replay. rows: a C-contiguous ROW
+    array of the call's records; pending [k, nh] int64; widx [k] (memory / temporal models), reset [k] bool or None,
+    dest [k] int64 the rollout rows (temporal models with a rollout; None: none), ukeys (keys [k], t [k]) or None, eb:
+    the v3 entity bucket of the call (v3 models; None: the entity graph from the records' n_ent).
+    Returns dict(g: the entity graph, r: the row bucket, graph: the graph's index (g + rsizes.index(r) x len(sizes)),
+    crn_rows: records whose uniforms came from their crn key).
+    The bytes it defines are fold_defined's; the others keep what the buffers held (stale: no graph reads them). The C++
+    driver packs the same defined bytes (tools/p_golden.py's samples)."""
+    cv = fold_views(lay, ctrl) if cv is None else cv
+    n = len(rows)
+    most = int(rows['n_ent'].max())
+    g = int(np.searchsorted(lay.sizes, most))
+    src = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
+    off_e, per_e, end_e = lay.ent_span
+    cut = off_e + per_e * lay.sizes[g]
+    stage[:n, :cut] = src[:, :cut]
+    stage[:n, end_e:ROW_BYTES] = src[:, end_e:]
+    stage[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * lay.nh)
+    if lay.mem or lay.t_on:   # ((B30) temporal: the slot of each row; the padded rows go to the scratch slot)
+        cv['widx'][:n] = widx
+        cv['widx'][n:] = widx[0]
+    if lay.mem:
+        cv['keep'][:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
+    if dest is not None:   # (B31) each record's rollout row
+        cv['dest'][:n] = dest
+    cv['dup'][:n] = 0.0
+    cv['dup'][n:] = 1.0
+    cv['cf'][:] = 0.0
+    crn_rows = 0
+    if lay.crn and 'crn' in rows.dtype.names:
+        crn = rows['crn']
+        if crn.any():
+            sel = np.flatnonzero(crn)
+            cv['cu'][sel] = crn_uniforms(crn[sel], rows['t'][sel], lay.H)
+            cv['cf'][sel] = 1.0
+            crn_rows = len(sel)
+    if ukeys is not None:   # (B36) every record's uniforms from its key (the graph's own draws unused)
+        cv['cu'][:n] = crn_uniforms(ukeys[0], ukeys[1], lay.H)
+        cv['cf'][:n] = 1.0
+    if eb is not None:   # (seq-v1 step 3: the v3 entity bucket's graph)
+        g = lay.sizes.index(eb)
+    r = lay.rsizes[int(np.searchsorted(lay.rsizes, n))]
+    return dict(g=g, r=r, graph=g + lay.rsizes.index(r) * len(lay.sizes), crn_rows=crn_rows)
+
+
+def fold_defined(lay, rows, dest=False, ukeys=False):
+    """(P package) The bytes fold_pack defines for a call of these records: (stage mask [k, ROW_BYTES + 8 nh], ctrl
+    mask [n, cw]) bool -- what a C++ packer must equal; the rest is stale and never read by the graph."""
+    k = len(rows)
+    off_e, per_e, end_e = lay.ent_span
+    g = int(np.searchsorted(lay.sizes, int(rows['n_ent'].max())))
+    sm = np.zeros((k, ROW_BYTES + 8 * lay.nh), bool)
+    sm[:, :off_e + per_e * lay.sizes[g]] = True
+    sm[:, end_e:] = True
+    cm = np.zeros((lay.n, lay.cw), bool)
+    if lay.mem or lay.t_on:
+        cm[:, 0:8] = True
+    if lay.mem:
+        cm[:k, 8:12] = True
+    cm[:, 12:20] = True
+    cf = np.zeros(k, bool)
+    if lay.crn and 'crn' in rows.dtype.names:
+        cf |= rows['crn'] != 0
+    if ukeys:
+        cf[:] = True
+    cm[:k, 20:20 + 4 * lay.H] = cf[:, None]
+    if dest and lay.t_on:
+        cm[:k, lay.dest_at:lay.dest_at + 8] = True
+    return sm, cm
+
+
 class GraphActor:
     """TokPolicy.act (sampling) as captured CUDA graphs on fixed shapes: `rows_max` records with `entities` entity
     tokens each, and a second graph with all ENT_CAP tokens for the records with more entities. Eager PyTorch spends
@@ -2339,18 +2450,18 @@ class GraphActor:
             raise ValueError('GraphActor: row_sizes needs fold=True')
         self.rsizes = sorted({min(int(r_), n) for r_ in (row_sizes or ())} | {n})
         if self.fold:   # (B29) the control block per row: table row (int64), keep, dup, crn flag (float32), crn uniforms
-            H = sum(heads)
-            cw = -(-(20 + 4 * H) // 8) * 8
-            self.c_dest_at = cw   # (B31, temporal: the record's rollout row (int64) after them)
-            if self.t_on:
-                cw += 8
+            # (P package, 2026-11-19: the layout and the packing are FoldLayout / fold_pack, shared with the C++
+            # driver's tests)
+            self.fold_lay = FoldLayout(n, heads, self.mem, self.t_on, self.crn, self.sizes, self.rsizes)
+            cw = self.fold_lay.cw
+            self.c_dest_at = self.fold_lay.dest_at   # (B31, temporal: the record's rollout row (int64) after them)
             self.ctrl_stage = torch.zeros((n, cw), dtype=torch.uint8).pin_memory()
             self.ctrl = torch.zeros((n, cw), dtype=torch.uint8, device=dev)
             cs = self.ctrl_stage.numpy()
-            self.c_widx, self.c_keep, self.c_dup, self.c_cf = (cs[:, 0:8].view(np.int64)[:, 0], cs[:, 8:12].view(
-                np.float32)[:, 0], cs[:, 12:16].view(np.float32)[:, 0], cs[:, 16:20].view(np.float32)[:, 0])
-            self.c_cu = cs[:, 20:20 + 4 * H].view(np.float32)
-            self.c_dest = cs[:, cw - 8:cw].view(np.int64)[:, 0] if self.t_on else None
+            self.c_views = fold_views(self.fold_lay, cs)
+            self.c_widx, self.c_keep, self.c_dup, self.c_cf = (self.c_views[k] for k in ('widx', 'keep', 'dup', 'cf'))
+            self.c_cu = self.c_views['cu']
+            self.c_dest = self.c_views['dest']
             self.c_dup[:] = 1.0
             self.c_keep[:] = 1.0
             # (the staging copy skips the entity rows a graph does not read: ROW 'ent' rows past its size; their bytes
@@ -2597,37 +2708,15 @@ class GraphActor:
         td['o'].index_copy_(0, rows + int(td.get('obase', 0)), o[:n].to(td['o'].dtype))
 
     def _pack_fold(self, rows, pending, widx, reset, ukeys=None):
-        """(fold) The records and the control block into the pinned staging buffers; returns the graph to replay."""
-        n = len(rows)
-        most = int(rows['n_ent'].max())
-        g = int(np.searchsorted(self.sizes, most))
-        src = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
-        off_e, per_e, end_e = self._ent_span
-        cut = off_e + per_e * self.sizes[g]
-        self.stage_np[:n, :cut] = src[:, :cut]
-        self.stage_np[:n, end_e:ROW_BYTES] = src[:, end_e:]
-        self.stage_np[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * self.nh)
-        if self.mem or self.t_on:   # ((B30) temporal: the slot of each row; the padded rows go to the scratch slot)
-            self.c_widx[:n] = widx
-            self.c_widx[n:] = widx[0]
-        if self.mem:
-            self.c_keep[:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
-        if self._tdest is not None:   # (B31) each record's rollout row
-            self.c_dest[:n] = self._tdest['rows']
-        self.c_dup[:n] = 0.0
-        self.c_dup[n:] = 1.0
-        self.c_cf[:] = 0.0
-        if self.crn and 'crn' in rows.dtype.names:
-            crn = rows['crn']
-            if crn.any():
-                sel = np.flatnonzero(crn)
-                self.c_cu[sel] = crn_uniforms(crn[sel], rows['t'][sel], self.u.shape[1])
-                self.c_cf[sel] = 1.0
-                self.crn_rows += len(sel)
-        if ukeys is not None:   # (B36) every record's uniforms from its key (the graph's own draws unused)
-            self.c_cu[:n] = crn_uniforms(ukeys[0], ukeys[1], self.u.shape[1])
-            self.c_cf[:n] = 1.0
-        return g
+        """(fold) The records and the control block into the pinned staging buffers (fold_pack); returns the graph to
+        replay."""
+        lay = self.fold_lay
+        if lay.sizes != tuple(self.sizes) or lay.rsizes != tuple(self.rsizes) or lay.H != self.u.shape[1]:
+            raise RuntimeError('GraphActor: the fold layout does not match the graphs')
+        res = fold_pack(lay, rows, pending, widx, reset, self._tdest['rows'] if self._tdest is not None else None,
+                        ukeys, stage=self.stage_np, ctrl=self.ctrl_stage.numpy(), cv=self.c_views)
+        self.crn_rows += res['crn_rows']
+        return res['g']
 
     def result(self):
         """(actions [n, heads] int64, log-probabilities [n], values [n]) of the submitted call, as numpy arrays."""
