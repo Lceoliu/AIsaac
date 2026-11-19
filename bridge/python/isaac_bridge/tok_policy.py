@@ -1299,7 +1299,7 @@ class TokPolicy(nn.Module):
         if self.block_memory is not None:
             return self._forward_block(b, entities, packed, need_h, need_vg, temporal)
         if self.frame_v3 is not None:   # (seq-v1 step 2)
-            return self._forward_v3(b, need_h, mem, need_vg, temporal)
+            return self._forward_v3(b, need_h, mem, need_vg, temporal, packed)
         tctx = hist = None
         if temporal is not None and self.tatt is not None:   # 2026-10-14 (B30)
             tctx, hist = self._temporal_in(b, temporal)
@@ -1483,7 +1483,7 @@ class TokPolicy(nn.Module):
             return self.block_memory.resampler(x, pad)
         return self._heads(x[:, 0], need_h, mem, x[:, -1] if G else None, need_vg, tctx)
 
-    def _forward_v3(self, b, need_h, mem, need_vg, temporal):
+    def _forward_v3(self, b, need_h, mem, need_vg, temporal, packed):
         """forward() of frame='v3' (seq-v1 step 2): the frame encoder's tokens of the batch's v3 tensors ('v3.<name>',
         v3_input.put_batch: v3_input.pad_batch's layout), the controlled body's token (0) and the global token (last) after its blocks, then the
         heads exactly as T1 (_heads -> _heads_temporal with a temporal context; no feedback token). The ROW fields the
@@ -1499,7 +1499,10 @@ class TokPolicy(nn.Module):
         if not v3:
             raise ValueError('TokPolicy(frame=v3): a batch without v3 tensors (records without a v3 frame)')
         with _mark('v3:frame'):
-            x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
+            if packed:
+                x, _pad, g = self.frame_v3.forward_packed(v3, b['pending'], self.gtok.tok)
+            else:
+                x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
         with _mark('v3:heads'):
             return self._heads(x[:, 0], need_h, mem, x[:, g], need_vg, tctx)
 
@@ -1903,6 +1906,38 @@ def packed_index(n_ent, n_doors, entities, n_item=None, item_tok=0, glob=0, hist
 BUCKET_COST = 2.0e5   # a bucket's fixed cost in record x token^2 units (its ~12 more kernels per layer; H20, B18)
 
 
+def _attention_buckets(cnt, buckets):
+    """Attention layout for positive per-record counts (numpy): row bases and (counts, width) per bucket."""
+    n = len(cnt)
+    top = int(cnt.max())
+    upto = np.cumsum(np.bincount(cnt, minlength=top + 1))   # records with c <= index
+    w = np.arange(top + 1, dtype=np.float64)
+    a, b = np.meshgrid(w, w, indexing='ij')                  # the bounds: (0, a], (a, b], (b, top]
+    na, nb = upto[a.astype(np.int64)], upto[b.astype(np.int64)]
+    n1, n2, n3 = na, nb - na, n - nb
+    # Keep B18's boolean arithmetic and argmin tie-break so existing ROW plans do not change.
+    cost = n1 * a ** 2 + n2 * b ** 2 + n3 * float(top) ** 2 + BUCKET_COST * ((n1 > 0) + (n2 > 0) + (n3 > 0))
+    cost[~((a <= b) & (b <= top))] = np.inf
+    if buckets < 3:
+        cost[(n1 > 0) & (n2 > 0) & (n3 > 0)] = np.inf
+    if buckets < 2:
+        cost[(n1 > 0) | (n2 > 0)] = np.inf
+    i, j = np.unravel_index(int(np.argmin(cost)), cost.shape)
+    group = np.where(cnt <= i, 0, np.where(cnt <= j, 1, 2))
+    base = np.zeros(n, np.int64)
+    layout = []
+    at = 0
+    for k in range(3):
+        r = np.flatnonzero(group == k)
+        if not len(r):
+            continue
+        width = int(cnt[r].max())
+        base[r] = at + np.arange(len(r)) * width
+        layout.append((cnt[r], width))
+        at += len(r) * width
+    return base, layout
+
+
 def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, glob=0, hist=None):
     """2026-10-10 (B18, the learner's fast path): forward(packed=True)'s token layout for a batch with `entities`
     entity tokens, planned on the host per record (counts only; plan_tokens expands it per token on the device). A
@@ -1937,34 +1972,11 @@ def learner_plan(n_ent, n_doors, entities, buckets=3, n_item=None, item_tok=0, g
         rec[:, 6], rec[:, 7] = ni, np.cumsum(ni) - ni
     if hs:
         rec[:, 8] = nh
-    top = int(cnt.max())
-    upto = np.cumsum(np.bincount(cnt, minlength=top + 1))   # records with c <= index
-    w = np.arange(top + 1, dtype=np.float64)
-    a, b = np.meshgrid(w, w, indexing='ij')                  # the bounds: (0, a], (a, b], (b, top]
-    na, nb = upto[a.astype(np.int64)], upto[b.astype(np.int64)]
-    n1, n2, n3 = na, nb - na, n - nb
-    cost = n1 * a ** 2 + n2 * b ** 2 + n3 * float(top) ** 2 + BUCKET_COST * ((n1 > 0) + (n2 > 0) + (n3 > 0))
-    cost[~((a <= b) & (b <= top))] = np.inf
-    if buckets < 3:
-        cost[(n1 > 0) & (n2 > 0) & (n3 > 0)] = np.inf
-    if buckets < 2:
-        cost[(n1 > 0) | (n2 > 0)] = np.inf
-    i, j = np.unravel_index(int(np.argmin(cost)), cost.shape)
-    group = np.where(cnt <= i, 0, np.where(cnt <= j, 1, 2))
-    base = np.zeros(n, np.int64)
+    base, layout = _attention_buckets(cnt, buckets)
     out = dict(rec=rec, base=base, m=int(cnt.sum()), m_doors=int(nd.sum()), m_ent=int(ne.sum()),
-               t=3 + DOOR_CAP + entities + item_tok + hs + glob, entities=entities, buckets=[])
+               t=3 + DOOR_CAP + entities + item_tok + hs + glob, entities=entities, buckets=layout)
     if fused:
         out.update(m_item=int(ni.sum()), item_tok=int(item_tok), glob=int(glob), hist=hs)
-    at = 0
-    for k in range(3):
-        r = np.flatnonzero(group == k)
-        if not len(r):
-            continue
-        width = int(cnt[r].max())
-        base[r] = at + np.arange(len(r)) * width
-        out['buckets'].append((cnt[r], width))
-        at += len(r) * width
     return out
 
 
