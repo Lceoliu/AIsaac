@@ -200,7 +200,7 @@ class _LoopEpisodes(T.Episodes):
     def _held1(r):
         return (int(r['pitem'][0]), int(r['pitem'][1]), int(r['pitem'][2]), int(round(float(r['pinv'][6]) * 16)))
 
-    def new_terms(self, rows, sel, w, ev, hu, d):
+    def new_terms(self, rows, sel, w, ev, hu, d, held_all=None):   # (held_all: A-5's argument, not used here)
         rw = self.rw
         out = np.zeros((len(w), 4))
         r_ = rows[sel]

@@ -1077,7 +1077,7 @@ class Episodes:
         pi = pitem.astype(np.int64)
         return np.stack([pi[:, 0], pi[:, 1], pi[:, 2], np.rint(pinv[:, 6].astype(np.float64) * 16).astype(np.int64)], 1)
 
-    def new_terms(self, rows, sel, w, ev, hu, d):
+    def new_terms(self, rows, sel, w, ev, hu, d, held_all=None):
         """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w.
         (A-1, 2026-11-19: vectorized; only records whose holdings changed -- the active slot or a trinket slot to
         another nonzero id, the collectibles' count up -- go through the per-record id sets. The rewards are the
@@ -1087,7 +1087,9 @@ class Episodes:
         at = np.flatnonzero(sel)   # (fields only: a whole ROW record is ~150 KB with its visible frame)
         stage = rows['stage'][at].astype(np.int64)
         if rw.get('item') or rw.get('trinket'):
-            cur, prev = self.held(rows['pitem'][at], rows['pinv'][at]), self.held_prev[w]
+            # (A-5: held_all, the call's holdings computed once by arrive)
+            cur = held_all[at] if held_all is not None else self.held(rows['pitem'][at], rows['pinv'][at])
+            prev = self.held_prev[w]
             chg = self.held_ok[w] & (((cur[:, 0] > 0) & (cur[:, 0] != prev[:, 0])) | (cur[:, 3] > prev[:, 3])
                                      | ((cur[:, 1] > 0) & (cur[:, 1] != prev[:, 1]))
                                      | ((cur[:, 2] > 0) & (cur[:, 2] != prev[:, 2])))
@@ -1118,12 +1120,12 @@ class Episodes:
                 out[j, 1] = rw.get('trinket', 0.0) * got_t
                 self.counts[i, 0] += got_c
                 self.counts[i, 1] += got_t
-        if rw.get('depth'):
+        if rw.get('depth') and (ev & (EV_EXIT | 4)).any():   # (A-5: nothing to add without an exit or a boss)
             if self.run:   # (the exit: to a floor deeper than any reached; the floor left scales it)
                 ex = ((ev & EV_EXIT) != 0) & (stage > self.stage_max[w])
                 out[:, 2] += np.where(ex, rw['exit'] * rw['depth'] * np.maximum(self.stage_prev[w] - 1, 0), 0.0)
             out[:, 2] += np.where((ev & 4) != 0, rw['boss'] * rw['depth'] * np.maximum(stage - 1, 0), 0.0)
-        if rw.get('nohit'):
+        if rw.get('nohit') and (ev & EV_NOHIT).any():   # (A-5)
             nh = ((ev & EV_NOHIT) != 0) & (d != 2)
             out[nh, 3] = rw['nohit']
             self.counts[w[nh], 2] += 1
@@ -1216,6 +1218,10 @@ class Episodes:
             if (~trunc).any():
                 self.close_broken(wb[~trunc])
         has = k >= 0
+        # (A-5, 2026-11-19: what the call needs twice, computed once: the gains' base, the holdings)
+        gains_now = self.cur_gains(rows) if self.gains is not None else None
+        held_all = (self.held(rows['pitem'], rows['pinv'])
+                    if self.new_on and (rw.get('item') or rw.get('trinket')) else None)
         cap = is_trunc(rows)   # (--cap-truncate / --stall-truncate: those ends, truncations)
         capped = is_cap(rows)
         if has.any():   # the reward of the decision before
@@ -1236,7 +1242,7 @@ class Episodes:
                 self.rooms[w] += (ev & 1) > 0
                 self.boss[w] += (ev & 4) > 0
                 if self.gains is not None:   # 2026-10-08: health units and resources gained since the record before
-                    dl = self.cur_gains(rows)[has] - self.gains[w]
+                    dl = gains_now[has] - self.gains[w]
                     reward = reward + rw['heal'] * np.maximum(dl[:, 0], 0) + rw['resource'] * np.maximum(dl[:, 1], 0)
                     self.healed[w] += np.maximum(dl[:, 0], 0)
                     self.gathered[w] += np.maximum(dl[:, 1], 0)
@@ -1257,7 +1263,7 @@ class Episodes:
                     tm[w, _RT['heal']] += rw['heal'] * np.maximum(dl[:, 0], 0)
                     tm[w, _RT['resource']] += rw['resource'] * np.maximum(dl[:, 1], 0)
                 if self.new_on:   # the new terms (each 0 by default: then nothing here)
-                    nt_ = self.new_terms(rows, has, w, ev, hu, d)
+                    nt_ = self.new_terms(rows, has, w, ev, hu, d, held_all)
                     reward = reward + nt_.sum(1)
                     tm[w, _RT['item']:_RT['nohit'] + 1] += nt_
             if self.run or self.items:
@@ -1282,13 +1288,13 @@ class Episodes:
             self.damage[w] += dmg
         self.note_first(rows, idx, first)
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
-            self.gains[idx] = self.cur_gains(rows)
+            self.gains[idx] = gains_now
         if self.new_on:   # (2026-11-19) an episode's first record: its held ids; every record: its stage, holdings
             if first.any():
                 self.start_terms(rows, idx, first)
             self.stage_prev[idx] = rows['stage']
             self.stage_max[idx] = np.maximum(self.stage_max[idx], rows['stage'])
-            self.held_prev[idx] = self.held(rows['pitem'], rows['pinv'])
+            self.held_prev[idx] = held_all if held_all is not None else self.held(rows['pitem'], rows['pinv'])
             self.held_ok[idx] = True
         if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
             st0 = first
