@@ -71,6 +71,11 @@ EV_EXIT = 8           # run mode: the next floor was reached (the episode goes o
 EV_ITEM = 16          # items: a collectible was gained (a held id's count went up)
 EV_ACTIVE = 32        # items: the active item was used (its charge went down, or a used-up active is gone)
 EV_PILL = 64          # items: the pill / card in pocket slot 0 was used (the slot emptied)
+# (2026-11-19, the long run's nohit term; only with ISAAC_RL_NOHIT=1, set by train_tok --reward nohit=...: encode_row,
+#  the Python path a visible-v3 worker takes for every record) a room cleared that had monsters (their HP > 0 at a
+#  record in it, or damage dealt in it) and in which the episode was never hurt -- the engine's room index on the
+#  floor instance, a hurt step that changed rooms charged to the room left -- once per room and episode
+EV_NOHIT = 128
 # Item ids (user decision 2026-10-06: sized for Repentance / Repentance+ with headroom): collectibles 0..1023 (AB+ max
 # 552, Repentance+ 732), trinkets / pill effects / cards 0..255. ITEM_UNKNOWN: a pedestal under Curse of the Blind.
 N_COLLECTIBLE, N_TRINKET, N_PILL_EFFECT, N_CARD, N_PILL_COLOR = 1024, 256, 256, 256, 16
@@ -356,6 +361,31 @@ class EpisodeState:
         self.room = None           # whole floors: the room the record before was in, was it clear, rooms seen so far
         self.was_clear = True
         self.visited = set()
+        # (2026-11-19) EV_NOHIT: per (floor instance, room index) [had monsters, hurt in it, rewarded]
+        self.nohit_on = os.environ.get('ISAAC_RL_NOHIT') == '1'
+        self.nohit_rooms = {}
+        self.floor_n = 0
+
+
+def nohit_step(st, room_idx, next_floor, hurt, damage, monsters_hp, events):
+    """EV_NOHIT's bookkeeping for one record (encode_row, before st.room moves on): the hurt of the step charged to the
+    room left when the step changed rooms (else to this one), this room marked as having had monsters when their HP is
+    > 0 or damage was dealt; EV_NOHIT added to `events` on the clear of such a room never hurt in, once per room.
+    Rooms are (floor instance, the engine's room index): no visible map involved. Returns the events."""
+    left = (st.floor_n, st.room)
+    if next_floor:
+        st.floor_n += 1
+    here = (st.floor_n, room_idx)
+    nh = st.nohit_rooms
+    if st.room is not None and hurt > 0:
+        nh.setdefault(left if (room_idx != st.room or next_floor) else here, [False, False, False])[1] = True
+    e = nh.setdefault(here, [False, False, False])
+    if monsters_hp > 0 or damage > 0:
+        e[0] = True
+    if events & EV_CLEARED and e[0] and not e[1] and not e[2]:
+        events |= EV_NOHIT
+        e[2] = True
+    return events
 
 
 def _terrain(o, st):
@@ -395,25 +425,49 @@ def _minimap(o, st):
                 m[special, y, x] = 1
 
 
+V3_FRAMES = [0, 0]   # (seq-v1 step 3) this process's v3 frames written: native, the reference encoder's
+
+
+def obs_visible_conflict(obs_visible, v3_raw):
+    """(seq-v1, the coordinator 2026-11-18) --obs-visible 0 (no visible frame at all) and ISAAC_RL_VISIBLE_V3 set to a
+    mode (a v3 worker writes a v3 frame for every record) contradict each other: write_visible would take
+    --obs-visible 0 first and write nothing. train_tok / eval_tok refuse the pair at their argument parsing: the
+    message, or None when the two agree."""
+    from .visible_producer import configured_mode
+    mode = configured_mode(v3_raw)
+    if not obs_visible and mode:
+        return (f'--obs-visible 0 (the workers write no visible frame) and ISAAC_RL_VISIBLE_V3={v3_raw} (mode {mode}: '
+                f'a v3 frame for every record) contradict each other: set one of them')
+    return None
+
+
 def write_visible(o, row):
     """encode_row's visible frame: v3 (the native frame or the raw block's reference frame), else v2, else none
     (visible_schema 0); a worker configured for v3 (visible_producer.VISIBLE_V3_MODE) refuses a record without a v3
-    frame. True when a v3 frame was written (its stall columns are encode_row's to fill)."""
+    frame. --obs-visible 0 (ISAAC_NO_VISIBLE=1) writes no frame at all, v3 or v2 (visible_schema 0). True when a v3
+    frame was written (its stall columns are encode_row's to fill)."""
     vis = getattr(o, 'visible', None)
     v3 = False
-    if getattr(o, 'visible_v3_frame', None) is not None or (isinstance(vis, dict) and
-                                                           vis.get('schema') == 'isaac-visible-raw-v3'):
-        if not _VP.VISIBLE_V3_MODE:   # (2026-11-18, Codex round 9: a mode 0 worker, which sends no mode query, refuses
-            # a v3 record before the ROW -- an ordinary protocol error: the episode's handlers take it, as 05f1622 took a
-            # bridge in another mode -- never a v3 frame in an old arm's ROW, never the worker's end)
-            raise ValueError('visible-v3: a v3 record (%s) in a worker not configured for v3 (ISAAC_RL_VISIBLE_V3=0): '
-                             'the game runs another visible mode' % ('native frame' if getattr(o, 'visible_v3_frame',
-                                                                                              None) is not None
-                                                                     else 'raw v3 block'))
+    is_v3 = getattr(o, 'visible_v3_frame', None) is not None or (isinstance(vis, dict) and
+                                                                vis.get('schema') == 'isaac-visible-raw-v3')
+    if is_v3 and not _VP.VISIBLE_V3_MODE:   # (2026-11-18, Codex round 9: a mode 0 worker, which sends no mode query,
+        # refuses a v3 record before the ROW -- an ordinary protocol error: the episode's handlers take it, as 05f1622
+        # took a bridge in another mode -- never a v3 frame in an old arm's ROW, never the worker's end; seq-v1's
+        # --obs-visible 0 below does not hide it)
+        raise ValueError('visible-v3: a v3 record (%s) in a worker not configured for v3 (ISAAC_RL_VISIBLE_V3=0): '
+                         'the game runs another visible mode' % ('native frame' if getattr(o, 'visible_v3_frame',
+                                                                                          None) is not None
+                                                                 else 'raw v3 block'))
+    if os.environ.get('ISAAC_NO_VISIBLE') == '1':   # (train_tok / eval_tok --obs-visible 0: no frame, v3 or v2)
+        row['visible_schema'] = 0
+    elif is_v3:
         # visible-v3 (package C): the native frame as it came, else (mode 1, or the native side handed back) the
         # reference encoder's frame of the raw block; the stall columns after the progress update below
         from .visible_producer import write_v3
+        native = getattr(o, 'visible_v3_frame', None) is not None
         v3 = write_v3(row, o)
+        if v3:
+            V3_FRAMES[0 if native else 1] += 1
     elif _VP.VISIBLE_V3_MODE:   # (2026-11-18, Codex round 2: a v3 worker writes a v3 frame for every record or stops)
         raise _VP.VisibleV3Fatal('visible-v3: this worker is configured for mode %d, the record has no v3 frame and %s'
                          % (_VP.VISIBLE_V3_MODE, 'no visible block' if vis is None else 'a visible block of schema %r'
@@ -560,6 +614,9 @@ def encode_row(o, st, row, t):
     if next_floor:   # the floor's exit reached: an event of its own, not a new room of the old floor
         events = (events & ~EV_NEW_ROOM) | EV_EXIT
         st.stage0 = room[5]
+    if st.nohit_on:   # (2026-11-19) EV_NOHIT
+        events = nohit_step(st, room_idx, next_floor, float(row['hurt'][0]), float(row['damage'][0]),
+                            float(o.monsters_hp), events)
     st.room, st.was_clear = room_idx, bool(o.clear)
     row['events'] = events
     st.previous = (o.damage_taken, o.monsters_hp)

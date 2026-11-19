@@ -634,17 +634,23 @@ class TemporalAttention(nn.Module):
     TEMPORAL_ATTENTION.md). width: the spatial width d; glob: the policy has a global token (s_t reads it, value_global's
     readout P_g exists); D, layers, heads, window W, rooms R."""
 
-    def __init__(self, width, glob, D=256, layers=4, heads=4, window=256, rooms=128):
+    def __init__(self, width, glob, D=256, layers=4, heads=4, window=256, rooms=128, feedback=True):
         super().__init__()
-        if D % heads or window < 2 or rooms < 1:
+        if D % heads or window < 2 or rooms < 0:
             raise ValueError(f'TemporalAttention: width {D} / heads {heads} / window {window} / rooms {rooms}')
-        self.D, self.L, self.H, self.W, self.R = int(D), int(layers), int(heads), int(window), int(rooms)
+        # seq-v1 (C114 T1, 2026-11-18): rooms 0 = no room token is ever made (step's create always False; the cache
+        # keeps one room slot, always masked, and the room modules stay, so a rooms-0 model and a rooms-1 model with
+        # no room made are the same parameters and the same outputs); feedback False = no feedback (history) token
+        # (_temporal_in: every record's has False -- a masked key in the eager layout, absent from the packed one,
+        # whose host plans the caller builds with has False; feed / hist_kind stay, unused)
+        self.rooms_on, self.feedback = int(rooms) > 0, bool(feedback)
+        self.D, self.L, self.H, self.W, self.R = int(D), int(layers), int(heads), int(window), max(int(rooms), 1)
         self.inp = nn.Linear(2 * width if glob else width, D)   # W_s
         self.layers = nn.ModuleList(TemporalLayer(D, heads, 4 * D) for _ in range(layers))
         self.norm = nn.LayerNorm(D)
         self.rel = nn.Parameter(torch.zeros(heads, window + 1))   # [h, distance 0 .. W-1], [h, W]: a room key
         self.room_in = nn.Linear(D, D)                            # W_r
-        self.room_emb = nn.Embedding(rooms, D)
+        self.room_emb = nn.Embedding(self.R, D)   # (seq-v1: rooms 0 keeps one row, never read)
         self.stage_emb = nn.Embedding(N_STAGE_EMB, D)
         self.read = nn.Linear(D, width)                           # P
         self.read_g = nn.Linear(D, width) if glob else None       # P_g
@@ -685,6 +691,8 @@ class TemporalAttention(nn.Module):
         shown = map3.any(1).bool()   # (a record without a current room on its map neither moves nor replaces the last one)
         moved = (shown & (map3 != pmap).any(1)) | ((rec['events'].long() & (EV_EXIT | EV_NEW_ROOM)) != 0)
         create = (~first) & (steps0 > 0) & moved & (nroom0 < R)
+        if not self.rooms_on:   # (seq-v1: --temporal-rooms 0)
+            create = torch.zeros_like(create)
         kroom = nroom0.clamp(max=R - 1)
         stage_prev = st.prev_stage.index_select(0, slot)
         r = self.room_token(st.prev_o.index_select(0, slot), kroom, stage_prev)
@@ -1023,13 +1031,40 @@ def temporal_part(td, cids, counts, qep_rows, table, to_dev=None):
     return tp
 
 
+class ActiveLinear(nn.Linear):
+    """(seq-v1 step 2, frame='v3') The policy layer with every head of schema_v3 (22 logits: move, shoot, bomb, item,
+    pill, drop) of which only the first `active` are used: forward returns those (the drop head's two logits take no
+    part in any distribution, sampling, log-probability, entropy or loss, and get no gradient). Opening the drop head
+    later is active = 22 with the same parameters."""
+
+    def __init__(self, n_in, n_out, active):
+        super().__init__(n_in, n_out)
+        self.active = int(active)
+
+    def forward(self, x):
+        return super().forward(x)[..., :self.active]
+
+
 class TokPolicy(nn.Module):
     def __init__(self, width=192, layers=4, heads=4, items=False, charge=False, choice=0, ent_ext=False, pchar=False,
                  memory=0, item_tokens=False, global_token=False, item_shared=False, item_slots=INV_CAP, temporal=False,
                  temporal_width=256, temporal_layers=4, temporal_heads=4, temporal_window=256, temporal_rooms=128,
+                 temporal_feedback=1,
                  obs_prices=False, obs_hearts=False, obs_room_type=False, block_memory=False, block_config=None,
-                 input_schema=None):
+                 input_schema=None, frame=None, v3_inputs=None, trigger_once=None):
         super().__init__()
+        if frame not in (None, 'row', 'v3'):
+            raise ValueError(f'TokPolicy: frame {frame!r} (None / row: the ROW encoder; v3: FrameEncoderV3)')
+        if frame == 'v3':   # (seq-v1 step 2: the first v3 arm is C114 T1 with its frame side replaced -- the ROW observation,
+            # the token / spatial encoder and the item tokens (they read ROW inv / pitem) by FrameEncoderV3, the items
+            # coming in as the frame's N / S tokens; the temporal side, heads, losses, gate and records as T1's)
+            bad = [k for k, ok in (('temporal', temporal), ('temporal_feedback 0', not int(temporal_feedback)),
+                                   ('temporal_rooms 0', not int(temporal_rooms)),
+                                   ('global_token', global_token), ('items', items), ('no item_tokens', not item_tokens),
+                                   ('no block_memory', not block_memory), ('memory 0', not memory)) if not ok]
+            if bad:
+                raise ValueError(f'TokPolicy(frame=v3) needs {", ".join(bad)} (the C114 T1 configuration with its frame side '
+                                 'replaced: no item tokens, the N / S tokens of the frame carry the items)')
         if int(item_slots) != INV_CAP and not item_tokens:
             raise ValueError('TokPolicy: item_slots needs item_tokens=True (B24)')
         if item_tokens and not items:
@@ -1134,9 +1169,12 @@ class TokPolicy(nn.Module):
             self.config.update(temporal=True, temporal_width=int(temporal_width), temporal_layers=int(temporal_layers),
                                temporal_heads=int(temporal_heads), temporal_window=int(temporal_window),
                                temporal_rooms=int(temporal_rooms))
+            if not int(temporal_feedback):   # (seq-v1: the key only when off; older configs are unchanged)
+                self.config['temporal_feedback'] = 0
             self.tatt = TemporalAttention(width, glob=self.global_token, D=int(temporal_width),
                                           layers=int(temporal_layers), heads=int(temporal_heads),
-                                          window=int(temporal_window), rooms=int(temporal_rooms))
+                                          window=int(temporal_window), rooms=int(temporal_rooms),
+                                          feedback=bool(int(temporal_feedback)))
         # 2026-10-16 (B35): the room-type table, registered after everything else, zero at the start (the module
         # docstring)
         self.room_type_emb = None
@@ -1144,6 +1182,43 @@ class TokPolicy(nn.Module):
             self.room_type_emb = nn.Embedding(N_ROOM_TYPE, width)
             nn.init.zeros_(self.room_type_emb.weight)
         self.block_memory = None
+        # seq-v1 step 2 (frame='v3'): registered after everything else; the ROW input modules removed (the v3 frame is
+        # the only observation), the norm, heads, global token's norm / value and the temporal side kept as T1's
+        self.frame_v3 = None
+        if frame == 'v3':
+            from .frame_v3 import FrameEncoderV3
+            from .schema_v3 import DROP_BIAS, HEAD_SIZES
+            from .v3_input import INPUT_REV
+            # (input revision 2, 2026-11-19: v3_input.WIDEN / frame_v3.LOG_INPUTS / L_INIT_GAIN. A configuration
+            #  without it -- C115's v3t1 / v3t1b -- was trained on revision 1: refused here, never decoded silently in
+            #  the new units; a new model states it (train_tok --frame v3))
+            if not (isinstance(v3_inputs, int) and not isinstance(v3_inputs, bool) and v3_inputs == INPUT_REV):
+                raise ValueError(f'TokPolicy(frame=v3): v3 inputs revision {v3_inputs} (none: 1), this tree decodes '
+                                 f'revision {INPUT_REV}: evaluate or resume it with its own tree')
+            self.config['frame'] = 'v3'
+            self.config['v3_inputs'] = INPUT_REV
+            if trigger_once is not None:   # (Codex round 12: the run's effective ISAAC_RL_TRIGGER_ONCE, kept with the
+                # weights -- a resume or an evaluation in the other trigger mode is refused: train_tok / eval_tok)
+                self.config['trigger_once'] = int(trigger_once)
+            self.frame_v3 = FrameEncoderV3(width, layers, heads)
+            if self.gtok is not None:   # (input revision 2: the G token's initial scale as the other kinds')
+                from .frame_v3 import G_INIT_STD
+                nn.init.normal_(self.gtok.tok, std=G_INIT_STD)
+            for name in ('type_emb', 'variant_emb', 'subtype_emb', 'item_emb', 'trinket_emb', 'pill_emb', 'effect_emb',
+                         'card_emb', 'entity', 'patch', 'player', 'room', 'door', 'map', 'kind', 'blocks', 'char_emb',
+                         'room_type_emb', 'itok'):
+                if hasattr(self, name):
+                    delattr(self, name)
+            self.itok, self.room_type_emb, self.char_emb = None, None, None
+            n = sum(self.heads)
+            assert tuple(HEAD_SIZES[:len(self.heads)]) == tuple(self.heads)
+            pi = ActiveLinear(width, sum(HEAD_SIZES), n)
+            nn.init.orthogonal_(pi.weight, gain=0.01)
+            nn.init.zeros_(pi.bias)
+            with torch.no_grad():   # (the first 20 as T1's; drop's "drop" at schema_v3.DROP_BIAS)
+                pi.bias[:n].copy_(self.pi.bias)
+                pi.bias[n + 1] = DROP_BIAS
+            self.pi = pi
         if block_memory:
             if self.memory:
                 raise ValueError('block memory replaces the GRU; use memory=0')
@@ -1177,7 +1252,12 @@ class TokPolicy(nn.Module):
         nhwc: the convolutions' inputs in channels-last layout (cuDNN's TF32 kernels work in it: no layout conversions
         of the activations before and after every convolution; the same convolutions); ln: the packed layer norms as
         _LayerNorm (the same function)."""
-        blocks=self.structured_spatial.blocks if self.block_memory is not None else self.blocks
+        if self.block_memory is not None:
+            blocks = self.structured_spatial.blocks
+        elif getattr(self, 'frame_v3', None) is not None:   # (seq-v1 step 2)
+            blocks = self.frame_v3.blocks
+        else:
+            blocks = self.blocks
         for block in blocks:
             block.math = bool(on)
             block.ln_fast = bool(on) if ln is None else bool(ln)
@@ -1218,6 +1298,8 @@ class TokPolicy(nn.Module):
             raise ValueError('TokPolicy.forward: need_vg needs a global-token model (global_token=True)')
         if self.block_memory is not None:
             return self._forward_block(b, entities, packed, need_h, need_vg, temporal)
+        if self.frame_v3 is not None:   # (seq-v1 step 2)
+            return self._forward_v3(b, need_h, mem, need_vg, temporal)
         tctx = hist = None
         if temporal is not None and self.tatt is not None:   # 2026-10-14 (B30)
             tctx, hist = self._temporal_in(b, temporal)
@@ -1401,6 +1483,22 @@ class TokPolicy(nn.Module):
             return self.block_memory.resampler(x, pad)
         return self._heads(x[:, 0], need_h, mem, x[:, -1] if G else None, need_vg, tctx)
 
+    def _forward_v3(self, b, need_h, mem, need_vg, temporal):
+        """forward() of frame='v3' (seq-v1 step 2): the frame encoder's tokens of the batch's v3 tensors ('v3.<name>',
+        v3_input.put_batch: v3_input.pad_batch's layout), the controlled body's token (0) and the global token (last) after its blocks, then the
+        heads exactly as T1 (_heads -> _heads_temporal with a temporal context; no feedback token). The ROW fields the
+        temporal step and the action gate read (first, map, events, stage; bombs, player column 22, pinv) still come
+        from b; no ROW observation field enters the encoder."""
+        tctx = None
+        if temporal is not None and self.tatt is not None:
+            tctx, _hist = self._temporal_in(b, temporal)   # (feedback 0: no history token)
+        from .v3_input import get_batch, materialize
+        v3 = materialize(get_batch(b))
+        if not v3:
+            raise ValueError('TokPolicy(frame=v3): a batch without v3 tensors (records without a v3 frame)')
+        x, _pad, g = self.frame_v3(v3, b['pending'], self.gtok.tok)
+        return self._heads(x[:, 0], need_h, mem, x[:, g], need_vg, tctx)
+
     def _block_packed_readout(self, xp, starts):
         counts = torch.cat((starts[1:], starts.new_tensor([len(xp)]))) - starts
         at = torch.arange(int(counts.max()), device=xp.device)[None]
@@ -1524,10 +1622,10 @@ class TokPolicy(nn.Module):
         """(B30) forward's temporal context (the mode's inputs and, for 'step', the records' fields) and the history
         token dict(y [n, width] float32 = Q(o_{t-1}) + kind_hist, has [n] bool: a previous step exists) for the blocks
         (B31: an ordinary token of the one attention, its key masked where has is False)."""
-        n = b['player'].shape[0]
+        n = b['pending'].shape[0]   # (seq-v1: the pending actions, in every batch -- a v3 batch has no ROW player)
         mode = temporal['mode']
         ta = self.tatt
-        dev = b['player'].device
+        dev = b['pending'].device
         tctx = dict(temporal, user=temporal)
         if mode == 'step':
             st, slot = temporal['state'], temporal['slot']
@@ -1551,6 +1649,8 @@ class TokPolicy(nn.Module):
         ctx = torch.autocast('cuda', enabled=False) if _autocast_on() else contextlib.nullcontext()
         with ctx:
             y = ta.feed(o_prev.to(dev).float()) + ta.hist_kind
+        if not ta.feedback:   # (seq-v1: --temporal-feedback 0, no feedback token)
+            has = torch.zeros_like(has)
         return tctx, dict(y=y, has=has.to(dev).bool())
 
     def _heads_temporal(self, x0, need_h, mem, yg, need_vg, tctx):
@@ -1754,6 +1854,10 @@ def to_batch(rows, pending, device):
         b[k] = torch.from_numpy(np.ascontiguousarray(rows[k][:, :used])).to(device, non_blocking=True)
     b['pending'] = torch.from_numpy(np.ascontiguousarray(pending)).to(device, non_blocking=True).long()
     if np.any(rows['visible_schema']):
+        from .schema_v3 import VERSION as V3_VERSION
+        if np.any(rows['visible_schema'] == V3_VERSION):   # (seq-v1: v3 frames, every record's checked: v3_input)
+            from .v3_input import batch_from_rows, put_batch
+            return put_batch(b, batch_from_rows(rows, device))
         from .structured_input import from_rows
         b.update(from_rows(rows,device))
     return b
@@ -1979,6 +2083,12 @@ def cat_batch(a, b):
         if k in ENTITY_FIELDS:
             x = F.pad(x, (0, 0, 0, e - x.shape[1])) if x.shape[1] < e else x
             y = F.pad(y, (0, 0, 0, e - y.shape[1])) if y.shape[1] < e else y
+        if k.startswith('v3.') and x.dim() >= 2 and x.shape[1] != y.shape[1]:
+            # (seq-v1, 184: a learner's two parts with different v3 widths -- the lazy frames' bytes, a bucket -- each
+            #  padded to the wider: zero bytes past a frame are never read, a padded row's mask is False)
+            w_ = max(x.shape[1], y.shape[1])
+            pad_ = lambda t: F.pad(t, (0, 0) * (t.dim() - 2) + (0, w_ - t.shape[1]))   # noqa: E731
+            x, y = pad_(x), pad_(y)
         out[k] = torch.cat([x, y.to(x.dtype)])
     return out
 
@@ -2020,6 +2130,11 @@ def decode_rows(raw, pending=None, entities=None, n_heads=3, *, visible=True, co
     # counts (B42): the records' host (p,e,n,s), already checked on the host (check_frames): the
     # visible frame decodes without reading device memory back (fixed buckets, no sync).
     if visible and (counts is not None or bool(versions.any())):
+        from .schema_v3 import VERSION as V3_VERSION
+        if counts is None and bool((versions == V3_VERSION).any()):   # (seq-v1: v3 frames; every record checked)
+            from .v3_input import lazy_from_raw, put_batch   # (decoded per forward: _forward_v3, materialize)
+            return put_batch(b, lazy_from_raw(raw, ROW.fields['visible_frame'][1], ROW.fields['visible_schema'][1],
+                                              ROW.fields['visible_bytes'][1]))
         from .structured_input import decode_frame, FRAME_BYTES
         off=ROW.fields['visible_frame'][1]
         sz=ROW.fields['visible_bytes'][1]
@@ -2046,9 +2161,25 @@ def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, hea
         raw, stage = raw[:, :ROW_HEAD], None
     elif rows.dtype.itemsize != ROW_BYTES:
         raise ValueError('rows_to_device: compact records carry no frame (head=True only)')
+    else:
+        # (seq-v1, the coordinator 2026-11-18: v3 frames fill about 15 KB of the 128-KiB frame field -- every record
+        #  copied whole was 8 x the bytes. With v3 frames only, each record's bytes up to the longest frame of the
+        #  set: the frame field is the record's last, every other field lies before it; a declared length past the
+        #  field is refused before anything is copied)
+        from .schema_v3 import VERSION as V3_VERSION, FRAME_BYTES as V3_FRAME_BYTES
+        flat_ = rows.reshape(-1)
+        if len(index) and np.all(flat_['visible_schema'][index] == V3_VERSION):
+            nb_ = np.asarray(flat_['visible_bytes'][index], np.int64)
+            if nb_.min() < 0 or nb_.max() > V3_FRAME_BYTES:
+                from .visible_producer import VisibleV3Fatal
+                raise VisibleV3Fatal(f'rows_to_device: visible_bytes {int(nb_.min())} .. {int(nb_.max())} outside '
+                                     f'0 .. {V3_FRAME_BYTES}')
+            raw = raw[:, :ROW.fields['visible_frame'][1] + (-(-int(nb_.max()) // 4) * 4)]
     index_t = torch.from_numpy(np.ascontiguousarray(index, np.int64))
     if stage is not None:
-        dev_raw = torch.index_select(raw, 0, index_t, out=stage[:len(index)]).to(device, non_blocking=True)
+        cols_ = raw.shape[1]   # (the pinned stage reinterpreted as [n, cols]: a contiguous target for the gather)
+        dst_ = stage.view(-1)[:len(index) * cols_].view(len(index), cols_)
+        dev_raw = torch.index_select(raw, 0, index_t, out=dst_).to(device, non_blocking=True)
     else:
         dev_raw = raw.index_select(0, index_t).to(device, non_blocking=False)
     pend = torch.from_numpy(np.ascontiguousarray(pending, np.int64)).to(device)
@@ -2189,6 +2320,19 @@ class GraphActor:
         self.done = torch.cuda.Event()
         ents = [entities] if np.ndim(entities) == 0 else list(entities)
         self.sizes = sorted({min(int(e), ENT_CAP) for e in ents} | {ENT_CAP})
+        # seq-v1 step 3 (frame='v3'): one graph per entity bucket of the v3 layout; each call's records checked on the
+        # host (v3_input.rows_counts: headers, versions, sizes; the call's time, bucket, truncations and non-finite
+        # floats into v3_input.STATS), their counts sent with them, the frames decoded on the device inside the graph
+        # (decode_frames_device from the records' bytes, no read-back)
+        self.v3 = getattr(model, 'frame_v3', None) is not None
+        if self.v3:
+            from . import v3_input as VI
+            self.VI = VI
+            self.sizes = list(VI.E_BUCKETS)
+            self.v3_counts = torch.zeros((n, 4), dtype=torch.int64, device=dev)
+            self.v3_counts_stage = torch.zeros((n, 4), dtype=torch.int64).pin_memory()
+            self.v3_counts_np = self.v3_counts_stage.numpy()
+            self.v3_frame_at = ROW.fields['visible_frame'][1]
         self.entities = self.sizes[0]
         self.fold = bool(fold)
         if row_sizes and not self.fold:
@@ -2276,13 +2420,23 @@ class GraphActor:
                     setattr(dcfg, name_, max(int(getattr(dcfg, name_)), v_))
         fn = core if not compile_mode else torch.compile(core, mode=compile_mode, dynamic=False)
 
+        def v3in(b, raw, tokens, r):
+            """(seq-v1 step 3) the v3 tensors ('v3.<name>', v3_input.put_batch) from the records' frame bytes and
+            the staged counts, on the device."""
+            if self.v3:
+                fa = self.v3_frame_at
+                frames = raw[:, fa:fa + self.VI.V3.FRAME_BYTES].view(torch.float32)
+                self.VI.put_batch(b, self.VI.decode_frames_device(frames, self.v3_counts[:r], tokens, self.VI.N_MAX_V3,
+                                                                  self.VI.S_MAX_V3, check=False))
+            return b
+
         def run(tokens, r=None):
             if not self.fold:
-                b = decode_rows(self.raw, entities=tokens, n_heads=nh, visible=False)
+                b = v3in(decode_rows(self.raw, entities=tokens, n_heads=nh, visible=False), self.raw, tokens, self.n)
                 out, self._h_last, self.extra_out, self._t_last = fn(b, self.u, self.h_in if self.mem else None, tokens,
                                                                      self.tslot if t_on else None)
                 return out
-            b = decode_rows(self.raw[:r], entities=tokens, n_heads=nh, visible=False)
+            b = v3in(decode_rows(self.raw[:r], entities=tokens, n_heads=nh, visible=False), self.raw[:r], tokens, r)
             c = self.ctrl[:r]   # (B29 fold: the control block decoded on the device, the per-call work inside the graph)
             widx, keep, dup, cf = (c[:, 0:8].view(torch.int64)[:, 0], c[:, 8:12].view(torch.float32)[:, 0],
                                    c[:, 12:16].view(torch.float32)[:, 0], c[:, 16:20].view(torch.float32)[:, 0])
@@ -2336,14 +2490,20 @@ class GraphActor:
         records or its row in the call); None: as before."""
         # This legacy graph has a fixed input layout. Validate on the host,
         # not with a data-dependent device bool inside CUDA graph capture.
-        if np.any(rows['visible_schema']):
+        if not getattr(self, 'v3', False) and np.any(rows['visible_schema']):
             raise ValueError('visible-v2 requires BlockActor, not the legacy GraphActor')
         n = len(rows)
         if n > self.n:
             return False
+        g_v3 = None
+        if self.v3:   # (seq-v1 step 3) the records' checks and counts on the host; the graph of their entity bucket
+            counts, eb = self.VI.rows_counts(rows)
+            self.v3_counts_np[:n] = counts
+            self.v3_counts_np[n:] = 0
+            g_v3 = self.sizes.index(eb)
         self._tdest = tdest if self.t_on else None
         if self.fold:
-            return self._submit_fold(rows, pending, widx, reset, ukeys)
+            return self._submit_fold(rows, pending, widx, reset, ukeys, g_v3)
         if self.mem:
             self.widx_np[:n] = widx
             self.keep_np[:n] = 1.0 if reset is None else (~np.asarray(reset, bool)).astype(np.float32)
@@ -2355,6 +2515,8 @@ class GraphActor:
         most = int(rows['n_ent'].max())
         g = 0 if most <= self.sizes[0] else (len(self.sizes) - 1 if len(self.sizes) == 2 else
                                              int(np.searchsorted(self.sizes, most)))
+        if g_v3 is not None:
+            g = g_v3
         self.stage_np[:n, :ROW_BYTES] = np.ascontiguousarray(rows).view(np.uint8).reshape(n, ROW_BYTES)
         self.stage_np[:n, ROW_BYTES:] = np.ascontiguousarray(pending, np.int64).view(np.uint8).reshape(n, 8 * self.nh)
         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
@@ -2373,6 +2535,8 @@ class GraphActor:
                 self.crn_rows += k
         with torch.cuda.stream(stream):
             self.raw[:n].copy_(self.stage[:n], non_blocking=True)
+            if self.v3:
+                self.v3_counts.copy_(self.v3_counts_stage, non_blocking=True)
             self.u.uniform_()
             if sel is not None:
                 k = len(sel)
@@ -2397,15 +2561,19 @@ class GraphActor:
         self._n = n
         return True
 
-    def _submit_fold(self, rows, pending, widx, reset, ukeys=None):
+    def _submit_fold(self, rows, pending, widx, reset, ukeys=None, g_v3=None):
         """submit() with fold (B29): records + control block in, the replay, the outputs out."""
         g = self._pack_fold(rows, pending, widx, reset, ukeys)
+        if g_v3 is not None:   # (seq-v1 step 3: the v3 entity bucket's graph)
+            g = g_v3
         n = len(rows)
         r = self.rsizes[int(np.searchsorted(self.rsizes, n))]
         g += self.rsizes.index(r) * len(self.sizes)
         stream = self.stream if self.stream is not None else torch.cuda.current_stream()
         with torch.cuda.stream(stream):
             self.raw[:n].copy_(self.stage[:n], non_blocking=True)
+            if self.v3:
+                self.v3_counts.copy_(self.v3_counts_stage, non_blocking=True)
             self.ctrl[:r].copy_(self.ctrl_stage[:r], non_blocking=True)
             with torch.inference_mode():   # (the graphs draw uniforms: replay advances the RNG state they captured,
                 self.graphs[g].replay()    # an inference tensor since the capture ran in inference mode)

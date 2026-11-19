@@ -253,7 +253,7 @@ from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
 from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
 from isaac_bridge.learn_segments import SEG   # BM1: learner segment timing (ISAAC_BLOCK_TIMING=1 only)
-from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_PILL, ROW, ROWC, FrameArena,
+from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
                                       default_stub_list)
@@ -502,7 +502,7 @@ def profile_learn(learn, job, path):
     print(f'B38: the profile of one update written to {path}', flush=True)
 
 
-def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on):
+def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on, t_fb=True):
     """(B38 step 4, train_tok --learner-fast 2) what the start-of-update pass needs for the B18 fast path's host plans
     of records at flat positions of a rollout: per record its entity / door / item counts and its history token's
     presence on the host, and (dedup) its ids among the distinct grids of rows_dev (the records on the device)."""
@@ -510,7 +510,8 @@ def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on)
     w_, t_ = flat // roll.cap, flat % roll.cap
     fr = dict(ne=roll.rows['n_ent'][w_, t_].astype(np.int64), nd=roll.rows['n_doors'][w_, t_].astype(np.int64),
               ni=item_count(row_fields(roll, flat, ('inv', 'pitem')), item_slots) if n_item_tok else None,
-              hist=(roll.t_step[w_, roll.tP + t_] > 0) if t_on else None, width=rows_dev['ent'].shape[1])
+              hist=((roll.t_step[w_, roll.tP + t_] > 0) & bool(t_fb)) if t_on else None,   # (seq-v1: t_fb, --temporal-feedback)
+              width=rows_dev['ent'].shape[1])
     fr['dd'] = {k_: distinct_ids(rows_dev[k_]).cpu().numpy() for k_ in DEDUP} if 'dedup' in fparts else {}
     fr['dd_size'] = {k_: int(v_.max()) + 1 for k_, v_ in fr['dd'].items()}
     return fr
@@ -994,6 +995,27 @@ COLLECT_EVERY = max(1, int(os.environ.get('ISAAC_BLOCK_COLLECT_EVERY', '1') or 1
 DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its game / worker failed before its end record)
 
 
+# (2026-11-19, the user / the coordinator: three reward terms for the long run, each 0 by default -- then every reward
+#  is as before, bit for bit; Episodes.arrive, floor / run modes):
+#   item / trinket (Codex round 13, the coordinator's rule): ids never rewarded in this episode -- the episode's set
+#     starts as what its first record holds (a start build is not rewarded); a passive collectible only when the held
+#     collectibles' count (ROW pinv[6] x 16, distinct ids) rose since the record before, at most that many, an id of
+#     ROW inv (the newest 16) other than the active; the active slot (pitem[0]) changed to such an id: one; a trinket
+#     slot (pitem[1:3]) changed to such an id: one per slot. A reroll of the whole build (no count rise) pays nothing,
+#     a rerolled pedestal taken pays; putting down / swapping / dropping and taking again pays once;
+#   depth: the exit and boss terms times 1 + depth x (n - 1), n the LevelStage of the floor -- for EV_EXIT the floor
+#     left (the stage of the record before), only on a floor deeper than any the episode had reached; for EV_BOSS
+#     the record's;
+#   nohit: the worker's EV_NOHIT (tok_obs: a room that had monsters, cleared, never hurt in it over every visit, the
+#     engine's room index; once per room) -- not on a death record.
+#  These are the actor's rewards only: the workers' branch scores (tok_branch.step_reward: the teachers, cf) do not
+#  have them, as they never had heal / resource.
+NEW_TERMS = ('item', 'trinket', 'depth', 'nohit')
+REWARD_TERMS = ('damage', 'hurt', 'time', 'win', 'death', 'timeout', 'room', 'explore', 'boss', 'exit', 'heal',
+                'resource') + NEW_TERMS
+_RT = {k: i for i, k in enumerate(REWARD_TERMS)}
+
+
 class Episodes:
     """The actor's bookkeeping of the records that arrive (vectorised over a poll's records): the reward of each
     worker's open decision, episode ends and their statistics, the action under way."""
@@ -1032,6 +1054,78 @@ class Episodes:
         # last record (the deltas' base) and the episode's gains so far
         self.gains = np.zeros((workers, 2)) if self.floor and (rw.get('heal') or rw.get('resource')) else None
         self.healed, self.gathered = np.zeros(workers), np.zeros(workers)
+        # (2026-11-19) each term's share of the episode's return (episodes.jsonl 'r', progress rw_<term>), and the new
+        # terms' state: per worker the ids rewarded (and held at the start), the rooms hurt in, the last stage
+        self.term = np.zeros((workers, len(REWARD_TERMS))) if self.floor else None
+        self.new_on = bool(self.floor and any(rw.get(k, 0.0) for k in NEW_TERMS))
+        self.counts = np.zeros((workers, 3), np.int64)   # items, trinkets, no-hit rooms rewarded
+        self.seen_c = [set() for _ in range(workers)]
+        self.seen_t = [set() for _ in range(workers)]
+        self.stage_prev = np.zeros(workers, np.int64)
+        self.stage_max = np.zeros(workers, np.int64)
+        self.held_prev = [None] * workers   # (active, trinket 0, trinket 1, collectibles' count) of the record before
+
+    @staticmethod
+    def held(r):
+        """(active, trinket 0, trinket 1, collectibles' count: ROW pinv[6] x 16, distinct ids, at most 32)."""
+        return (int(r['pitem'][0]), int(r['pitem'][1]), int(r['pitem'][2]), int(round(float(r['pinv'][6]) * 16)))
+
+    def new_terms(self, rows, sel, w, ev, hu, d):
+        """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w."""
+        rw = self.rw
+        out = np.zeros((len(w), 4))
+        r_ = rows[sel]
+        stage = r_['stage'].astype(np.int64)
+        for j in range(len(w)):
+            i = int(w[j])
+            r = r_[j]
+            if (rw.get('item') or rw.get('trinket')) and self.held_prev[i] is not None:
+                a0, t0, t1, n0 = self.held_prev[i]
+                a, ta, tb, n = self.held(r)
+                seen = self.seen_c[i]
+                got_c = 0
+                if a > 0 and a != a0 and a not in seen:   # the active slot: a new id
+                    seen.add(a)
+                    got_c += 1
+                rise = n - n0 - (1 if got_c else 0)   # (the active, when counted among the collectibles)
+                if rise > 0:   # passives: at most the rise, ids of the newest 16 never rewarded
+                    for v, c in r['inv']:
+                        v = int(v)
+                        if rise <= 0:
+                            break
+                        if v > 0 and c > 0 and v != a and v not in seen:
+                            seen.add(v)
+                            got_c += 1
+                            rise -= 1
+                got_t = 0
+                for tv, tp in ((ta, t0), (tb, t1)):
+                    if tv > 0 and tv != tp and tv not in self.seen_t[i]:
+                        self.seen_t[i].add(tv)
+                        got_t += 1
+                out[j, 0] = rw.get('item', 0.0) * got_c
+                out[j, 1] = rw.get('trinket', 0.0) * got_t
+                self.counts[i, 0] += got_c
+                self.counts[i, 1] += got_t
+            if rw.get('depth'):
+                if self.run and (ev[j] & EV_EXIT):
+                    if stage[j] > self.stage_max[i]:   # (a floor deeper than any reached: the floor left scales it)
+                        out[j, 2] += rw['exit'] * rw['depth'] * max(int(self.stage_prev[i]) - 1, 0)
+                if ev[j] & 4:
+                    out[j, 2] += rw['boss'] * rw['depth'] * max(int(stage[j]) - 1, 0)
+            if rw.get('nohit') and (ev[j] & EV_NOHIT) and d[j] != 2:
+                out[j, 3] = rw['nohit']
+                self.counts[i, 2] += 1
+        return out
+
+    def start_terms(self, rows, idx, first):
+        """An episode's first record: the new terms' state from what it holds."""
+        for j in np.flatnonzero(first):
+            i = int(idx[j])
+            r = rows[j]
+            self.seen_c[i] = {int(v) for v, n in r['inv'] if v > 0 and n > 0} | ({int(r['pitem'][0])} - {0})
+            self.seen_t[i] = {int(t) for t in r['pitem'][1:3] if t > 0}
+            self.stage_max[i] = int(r['stage'])
+            self.counts[i] = 0
 
     @staticmethod
     def cur_gains(rows):
@@ -1082,6 +1176,9 @@ class Episodes:
         self.ret[ws], self.hurt[ws], self.damage[ws], self.rooms[ws], self.boss[ws] = 0.0, 0.0, 0.0, 0, 0
         self.extra[ws] = 0
         self.healed[ws], self.gathered[ws] = 0.0, 0.0
+        if self.term is not None:   # (2026-11-19: never into the next episode's shares)
+            self.term[ws] = 0.0
+        self.counts[ws] = 0
         if self.plr is not None:
             self.v0[ws], self.gret[ws], self.steps[ws] = 0.0, 0.0, 0
 
@@ -1131,6 +1228,26 @@ class Episodes:
                     reward = reward + rw['heal'] * np.maximum(dl[:, 0], 0) + rw['resource'] * np.maximum(dl[:, 1], 0)
                     self.healed[w] += np.maximum(dl[:, 0], 0)
                     self.gathered[w] += np.maximum(dl[:, 1], 0)
+                # (2026-11-19) each term's share, for the log only (the reward above is the one trained on)
+                tm = self.term
+                tm[w, _RT['damage']] += rw['damage'] * dmg
+                tm[w, _RT['hurt']] -= rw['hurt'] * hu
+                tm[w, _RT['time']] -= rw['time']
+                tm[w, _RT['win']] += np.where(d == 1, self.end_bonus, 0.0)
+                tm[w, _RT['death']] -= np.where(d == 2, rw['death'], 0.0)
+                tm[w, _RT['timeout']] -= np.where((d == 3) & ~cap_h, rw['timeout'], 0.0)
+                tm[w, _RT['room']] += rw['room'] * ((ev & 1) > 0)
+                tm[w, _RT['explore']] += rw['explore'] * ((ev & 2) > 0)
+                tm[w, _RT['boss']] += rw['boss'] * ((ev & 4) > 0)
+                if self.run:
+                    tm[w, _RT['exit']] += rw['exit'] * ((ev & EV_EXIT) > 0)
+                if self.gains is not None:
+                    tm[w, _RT['heal']] += rw['heal'] * np.maximum(dl[:, 0], 0)
+                    tm[w, _RT['resource']] += rw['resource'] * np.maximum(dl[:, 1], 0)
+                if self.new_on:   # the new terms (each 0 by default: then nothing here)
+                    nt_ = self.new_terms(rows, has, w, ev, hu, d)
+                    reward = reward + nt_.sum(1)
+                    tm[w, _RT['item']:_RT['nohit'] + 1] += nt_
             if self.run or self.items:
                 ev = rows['events'][has].astype(np.int64)
                 x = self.extra
@@ -1154,6 +1271,13 @@ class Episodes:
         self.note_first(rows, idx, first)
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
             self.gains[idx] = self.cur_gains(rows)
+        if self.new_on:   # (2026-11-19) an episode's first record: its held ids; every record: its stage, holdings
+            if first.any():
+                self.start_terms(rows, idx, first)
+            self.stage_prev[idx] = rows['stage']
+            self.stage_max[idx] = np.maximum(self.stage_max[idx], rows['stage'])
+            for j in range(len(idx)):
+                self.held_prev[int(idx[j])] = self.held(rows[j])
         if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
             st0 = first
             if st0.any():
@@ -1208,6 +1332,13 @@ class Episodes:
                     fin['active0'] = self.active0[int(i)]
                 if self.gains is not None:   # 2026-10-08: health units healed, coins + bombs + keys gathered
                     fin.update(healed=float(self.healed[i]), gathered=float(self.gathered[i]))
+                if self.new_on:   # (2026-11-19) each reward term's share of 'ret' (with the new terms only: the
+                    # driver's native consumer, held to this one record for record, has neither)
+                    fin['r'] = {k: round(float(self.term[i, j]), 4) for j, k in enumerate(REWARD_TERMS)
+                                if self.term[i, j] != 0}
+                if self.new_on:
+                    fin.update(items_new=int(self.counts[i, 0]), trinkets_new=int(self.counts[i, 1]),
+                               nohit_rooms=int(self.counts[i, 2]))
                 if self.pick is not None:   # 2026-10-13 (B23): the pedestal build, the forcing draw and its decisions
                     fin.update(build_pedestals=self.pick['bped'].get(int(i), []), pickup_forced=int(r['pmode']),
                                forced_steps=int(self.pick['steps'][i]))
@@ -1227,6 +1358,10 @@ class Episodes:
             self.ret[e], self.hurt[e], self.damage[e], self.rooms[e], self.boss[e] = 0.0, 0.0, 0.0, 0, 0
             self.extra[e] = 0
             self.healed[e], self.gathered[e] = 0.0, 0.0
+            if self.term is not None:
+                self.term[e] = 0.0
+            if self.new_on:
+                self.counts[e] = 0
             if self.plr is not None:   # 2026-10-10 (archive_plr): the score of each finished ordinary episode
                 stats_, ST_, gamma_ = self.plr
                 for j in np.flatnonzero(ended):
@@ -2134,7 +2269,16 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--temporal-layers', type=int, default=4, help='(B30) its layers')
     p.add_argument('--temporal-heads', type=int, default=4, help='(B30) its heads')
     p.add_argument('--temporal-window', type=int, default=256, help='(B30) decisions a step token sees (itself included)')
-    p.add_argument('--temporal-rooms', type=int, default=128, help='(B30) room tokens per episode at most')
+    p.add_argument('--temporal-rooms', type=int, default=128,
+                   help='(B30) room tokens per episode at most; 0: none (seq-v1, C114 T1: no room token is made)')
+    p.add_argument('--temporal-feedback', type=int, default=1, choices=(0, 1),
+                   help='(seq-v1, C114 T1) 0: no feedback (history) token o_{t-1} in the frame encoder')
+    p.add_argument('--frame', default='row', choices=('row', 'v3'),
+                   help='(seq-v1 step 3) v3: TokPolicy(frame=v3) -- the visible-v3 frame encoder (needs the C114 T1 '
+                        'configuration and ISAAC_RL_VISIBLE_V3 set: the workers send v3 frames)')
+    p.add_argument('--obs-visible', type=int, default=1, choices=(0, 1),
+                   help='(seq-v1, C110 Q@maa) 0: the workers write no visible frame (ROW only; sets '
+                        'ISAAC_NO_VISIBLE=1 for this process and its children)')
     p.add_argument('--temporal-bptt', type=int, default=256,
                    help="(B30) decisions per learner chunk (with memory a multiple of --memory-bptt; a minibatch is "
                         '--minibatch // this chunks, --micro parts of whole chunks)')
@@ -2165,6 +2309,26 @@ def main(argv=None, child=None, actor=None):
                         'the learner thread runs Python (default of Python: 0.005; B62: the default from '
                         'ISAAC_SWITCH_INTERVAL_US, 500 us when unset)')
     args = p.parse_args(argv)
+    if args.temporal_rooms < 0:
+        p.error('--temporal-rooms must be >= 0')
+    from isaac_bridge.tok_obs import obs_visible_conflict
+    why = obs_visible_conflict(args.obs_visible, os.environ.get('ISAAC_RL_VISIBLE_V3', '0'))
+    if why:
+        p.error(why)
+    # (2026-11-19: the reward terms item / trinket / depth / nohit, where they can be computed -- at once, before the
+    #  other checks of a configuration)
+    new_rw_ = {k.strip() for k, v in (kv.split('=') for kv in args.reward.split(',') if kv.strip())
+               if k.strip() in NEW_TERMS and float(v) != 0} if args.reward else set()
+    if new_rw_:
+        if args.mode not in ('floor', 'run'):
+            p.error('--reward item / trinket / depth / nohit: --mode floor or run only')
+        if args.block_memory:
+            p.error('--reward item / trinket / depth / nohit: not with --block-memory (the native consumer of its driver '
+                    'computes the rewards without them)')
+        if 'nohit' in new_rw_ and args.frame != 'v3':
+            p.error('--reward nohit: --frame v3 only (its workers encode every record in encode_row)')
+    if not args.obs_visible:   # (seq-v1: before any worker / child process starts; tok_obs.encode_row reads it)
+        os.environ['ISAAC_NO_VISIBLE'] = '1'
     shard_world = int(os.environ.get('ISAAC_SHARD_WORLD', '1') or 1)   # BM1 C: K shards as one run (shard_sync)
     shard_rank = int(os.environ.get('ISAAC_SHARD_RANK', '0') or 0) if shard_world > 1 else 0
     seed_games = args.seed   # (the workers' start seeds: from the unshifted seed, interleaved across the shards below)
@@ -2295,6 +2459,9 @@ def main(argv=None, child=None, actor=None):
             args.temporal = 1
             for key_ in ('width', 'layers', 'heads', 'window', 'rooms'):
                 setattr(args, 'temporal_' + key_, int(ck_cfg['temporal_' + key_]))
+            args.temporal_feedback = int(ck_cfg.get('temporal_feedback', 1))   # (seq-v1)
+        if ck_cfg.get('frame'):   # (seq-v1 step 3: a v3 checkpoint keeps its frame encoder)
+            args.frame = ck_cfg['frame']
         tatt_fresh = bool(args.temporal) and not ck_cfg.get('temporal')
         del ck_cfg
     itok_on, gtok_on = bool(args.item_tokens), bool(args.global_token)
@@ -2353,6 +2520,7 @@ def main(argv=None, child=None, actor=None):
     if args.steady_updates and (not block_on or args.actor_processes!=1):
         p.error('--steady-updates is the single-actor-process block-memory verification gate')
     t_on = bool(args.temporal)   # 2026-10-14 (B30)
+    t_fb = bool(args.temporal_feedback)   # (seq-v1: False -- every record's history-token flag False in the host plans)
     T_t = int(args.temporal_bptt)
     # (B32: the learner's decisions in chunks: the GRU's (memory), the temporal ones (temporal; with memory the GRU
     # chunks nest inside), or none)
@@ -2366,7 +2534,51 @@ def main(argv=None, child=None, actor=None):
             p.error('--temporal 1: branches (--branch-share) are not supported (v1)')
         tok_kw.update(temporal=True, temporal_width=args.temporal_width, temporal_layers=args.temporal_layers,
                       temporal_heads=args.temporal_heads, temporal_window=args.temporal_window,
-                      temporal_rooms=args.temporal_rooms)
+                      temporal_rooms=args.temporal_rooms, temporal_feedback=args.temporal_feedback)
+    from isaac_bridge.visible_producer import VISIBLE_V3_MODE
+    if args.frame == 'v3':   # (seq-v1 step 3)
+        if not VISIBLE_V3_MODE:
+            p.error('--frame v3 needs ISAAC_RL_VISIBLE_V3 set (1 / 2 / 3: the workers send v3 frames)')
+        if not args.obs_visible:
+            p.error('--frame v3 needs --obs-visible 1')
+        # (2026-11-18, the coordinator: the v3 arm replaces the whole frame side -- the ROW observation, the token /
+        #  spatial encoder and the item tokens (they read ROW inv / pitem) -- by the v3 frame encoder; the items come in
+        #  as the frame's N / S tokens. The first smoke's command line, C114 T1's, carried --item-tokens 1: refused here
+        #  at once, not by the model's constructor inside a retried attempt)
+        if args.teach_merge and not args.teach_gpu:   # (Codex round 10: the CPU teacher merge joins an eager batch to
+            # the learner's lazy v3 one -- cat_batch has no 'v3.raw' on one side)
+            p.error('--frame v3 with --teach-merge 1 needs --teach-gpu 1 (the CPU teacher merge cannot join v3 batches)')
+        if args.item_tokens or args.item_shared or item_slots != INV_CAP:
+            p.error(f'--frame v3 takes no item tokens (the N / S tokens of the frame carry the items): --item-tokens 0 '
+                    f'--item-shared 0 --item-slots {INV_CAP} (got {args.item_tokens} / {args.item_shared} / {item_slots})')
+        tok_kw['frame'] = 'v3'
+        # (2026-11-19, the coordinator: a bug fix as the v3 arms' default -- AB+ answers ITEM / PILLCARD / BOMB's
+        #  "triggered" twice per press, 13 active items unusable or used twice; abp_bridge.lua TRIGGER_ONCE_ALL. The
+        #  games inherit the trainer's environment; an explicit ISAAC_RL_TRIGGER_ONCE=0 is kept)
+        os.environ.setdefault('ISAAC_RL_TRIGGER_ONCE', '1')
+        trig_ = os.environ['ISAAC_RL_TRIGGER_ONCE']
+        if trig_ not in ('0', '1'):
+            p.error(f'ISAAC_RL_TRIGGER_ONCE={trig_!r}: 0 or 1')
+        print(f"frame v3: ISAAC_RL_TRIGGER_ONCE={trig_}", flush=True)
+        from isaac_bridge.v3_input import INPUT_REV
+        # (Codex round 12: --init took any checkpoint's weights -- a revision-1 v3 model's, a ROW model's -- through
+        #  load_compatible, without a word. Its source must be a v3 model of this tree's input revision.)
+        if args.init:
+            init_cfg_ = torch.load(args.init, map_location='cpu', weights_only=False).get('config', {})
+            if init_cfg_.get('frame') != 'v3' or init_cfg_.get('v3_inputs') != INPUT_REV:
+                p.error(f"--init {args.init}: a v3 model of input revision {INPUT_REV} only (its config: frame "
+                        f"{init_cfg_.get('frame')}, v3_inputs {init_cfg_.get('v3_inputs')})")
+        if args.resume:   # (the trigger mode the checkpoint was trained in)
+            ck_trig_ = torch.load(args.resume, map_location='cpu', weights_only=False).get('config', {}).get('trigger_once')
+            if ck_trig_ is not None and int(ck_trig_) != int(trig_):
+                p.error(f'--resume: the checkpoint was trained with ISAAC_RL_TRIGGER_ONCE={ck_trig_}, this run has {trig_}')
+        tok_kw['trigger_once'] = int(trig_)
+        # (a resume keeps its checkpoint's revision -- none: 1, refused by TokPolicy; a new run states the tree's)
+        tok_kw['v3_inputs'] = (torch.load(args.resume, map_location='cpu').get('config', {}).get('v3_inputs')
+                               if args.resume else INPUT_REV)
+    elif VISIBLE_V3_MODE and args.obs_visible:
+        p.error(f'ISAAC_RL_VISIBLE_V3={VISIBLE_V3_MODE} sends v3 frames: the model must read them (--frame v3) or '
+                'the workers write none (--obs-visible 0 is refused with it too): unset it')
     aux_on = bool(args.aux_predict)   # 2026-11-03 (tok_aux)
     if aux_on:
         from isaac_bridge.tok_aux import (AuxNorm, EVENTS as AUX_EVENTS, REG_COLS as AUX_REG, STATE as AUX_STATE,
@@ -2406,6 +2618,8 @@ def main(argv=None, child=None, actor=None):
     rw.update({k: float(v) for k, v in (kv.split('=') for kv in (FLOOR_REWARD if floor else ROOM_REWARD).split(','))})
     if args.reward:
         rw.update({k: float(v) for k, v in (kv.split('=') for kv in args.reward.split(','))})
+    if rw.get('nohit'):   # (EV_NOHIT from the workers' encode_row: checked at parsing, above)
+        os.environ['ISAAC_RL_NOHIT'] = '1'
     if floor:   # the root instances are launched with the normal group's spec; the floor reset does not use its rooms
         names, assign = ['run' if run else 'floor'], [0] * args.workers
         specs = [load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))]
@@ -2968,7 +3182,7 @@ def main(argv=None, child=None, actor=None):
     capacity = args.rollout // args.workers * 4 + 64   # (per worker: the same in the actor and learner processes)
     # (B30; B31: the per-decision K / V, s and o on the device, a pool of --rollout + 4 x workers rows: a rollout ends
     # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
-    t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=args.temporal_rooms,
+    t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=max(1, args.temporal_rooms),
                  kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64) if t_on else None
     shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
     #                                                                                   learner maps)
@@ -3005,7 +3219,8 @@ def main(argv=None, child=None, actor=None):
         if (t_on and child is None) else None
     if t_state is not None:
         print(f'temporal (B30): width {args.temporal_width} x {args.temporal_layers} layers x {args.temporal_heads} '
-              f'heads, window {args.temporal_window}, rooms {args.temporal_rooms}, learner chunks of {T_t} decisions '
+              f'heads, window {args.temporal_window}, rooms {args.temporal_rooms}, feedback {args.temporal_feedback}, '
+              f'learner chunks of {T_t} decisions '
               + (f'(GRU chunks of {T_mem} inside)' if mem_on else '(no GRU: no nested chunks)')
               + f', K / V {args.temporal_kv}; actor cache '
               f'{t_state.kv.numel() * t_state.kv.element_size() / 2 ** 20:.0f} MiB', flush=True)
@@ -3460,7 +3675,7 @@ def main(argv=None, child=None, actor=None):
                                                dtype=torch.uint8).pin_memory()
                 every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
                                                       stage=L['stage_r'], with_raw=True)
-                fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on)
+                fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on, t_fb)
             else:
                 every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
@@ -4205,6 +4420,8 @@ def main(argv=None, child=None, actor=None):
                 xplan['hist'] = np.concatenate([has_h[part_h], np.zeros(len(ne_p) - len(part_h), bool)])
                 if vmerged:
                     xplan['hist'][len(ne_p) - len(vpick):] = L['v2_has'][vpick]
+                if not t_fb:   # (seq-v1: --temporal-feedback 0, as TokPolicy._temporal_in)
+                    xplan['hist'][:] = False
             if args.packed and fast:   # B18: + the entity positions and the attention buckets, one copy
                 plan = learner_plan(ne_p, nd_p, mb['ent'].shape[1], n_buckets, **xplan)
                 hn = ['rec', 'base']
@@ -5008,6 +5225,21 @@ def main(argv=None, child=None, actor=None):
                         'stage_mean': sum(e.get('stage', 0) for e in finished) / m_all})
             if cfg.start_build_prob > 0:   # 2026-10-08: start builds transplanted so far (worker totals)
                 row['start_builds'] = float(stats[:, ST['start_builds']].sum())
+        if args.frame == 'v3':   # (seq-v1 step 3) the actor's host side of the v3 calls (this process), this update
+            from isaac_bridge import v3_input as VI_
+            tot3 = dict(VI_.STATS)
+            prev3 = L.get('v3_prev') or dict.fromkeys(tot3, 0)
+            L['v3_prev'] = tot3
+            d3 = {k_: tot3[k_] - prev3[k_] for k_ in tot3}
+            row['v3_calls'], row['v3_records'] = d3['calls'], d3['records']
+            row['v3_host_ms'] = 1000 * d3['host_s'] / max(d3['calls'], 1)
+            row['v3_host_share'] = d3['host_s'] / max(job['collect_s'], 1e-9)
+            for b_ in VI_.E_BUCKETS:
+                row[f'v3_bucket{b_}'] = d3[f'bucket{b_}']
+            row['v3_trunc_n'], row['v3_trunc_s'], row['v3_nonfinite'] = d3['trunc_n'], d3['trunc_s'], d3['nonfinite']
+            if 'v3_native' in ST:   # (the workers' frames: native / the reference encoder's -- a handed-back step)
+                row['v3_native'] = float(stats[:, ST['v3_native']].sum())
+                row['v3_reference'] = float(stats[:, ST['v3_reference']].sum())
         if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): this update's worker deltas
             tot = {k_p: float(stats[:, ST[k_p]].sum()) for k_p in ('pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups')}
             prev = L.get('pf_prev') or dict.fromkeys(tot, 0.0)
@@ -5198,6 +5430,11 @@ def main(argv=None, child=None, actor=None):
                         f'{name}/seconds': sum(e['decisions'] for e in eps) / m * args.frames_per_decision / 30,
                         f'{name}/rooms': sum(e['rooms'] for e in eps) / m,
                         f'{name}/boss': sum(e['boss'] for e in eps) / m})
+        if floor and any(rw.get(k_) for k_ in NEW_TERMS):   # (2026-11-19) each term's mean share; the new terms' counts
+            m_ = max(len(finished), 1)
+            row.update({f'rw_{k}': sum(e.get('r', {}).get(k, 0.0) for e in finished) / m_ for k in REWARD_TERMS})
+            row.update({f'n_{k}': sum(e.get(f, 0) for e in finished) / m_
+                        for k, f in (('item', 'items_new'), ('trinket', 'trinkets_new'), ('nohit', 'nohit_rooms'))})
         if block_on:
             row.update({'block_ppo_'+key:value for key,value in block_ppo_counts.items()})
             ru1 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))

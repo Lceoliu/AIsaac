@@ -209,15 +209,22 @@ def main():
                    help='A28, floor / run modes: 1 = every collectible pedestal removed from the rooms entered')
     p.add_argument('--no-active', type=int, default=0,
                    help="B39, floor / run modes: 1 = player 0's active item removed at every episode's start")
+    p.add_argument('--obs-visible', type=int, default=1, choices=(0, 1),
+                   help='(seq-v1) 0: the evaluation workers write no visible frame (ROW only, as train_tok --obs-visible 0)')
     args = p.parse_args()
+    from isaac_bridge.tok_obs import obs_visible_conflict
+    why = obs_visible_conflict(args.obs_visible, os.environ.get('ISAAC_RL_VISIBLE_V3', '0'))
+    if why:
+        p.error(why)
+    if not args.obs_visible:   # (seq-v1: before the workers start; tok_obs.encode_row reads it)
+        os.environ['ISAAC_NO_VISIBLE'] = '1'
     if args.random and (args.item_slots is not None or args.ablate):
         p.error('--item-slots / --ablate need a checkpoint')
     if args.no_pedestals and args.mode not in ('floor', 'run'):
         p.error('--no-pedestals needs --mode floor or run')
     if args.no_active and args.mode not in ('floor', 'run'):
         p.error('--no-active needs --mode floor or run')
-    out = Path(args.out)
-    out.mkdir(parents=True, exist_ok=False)
+    out = Path(args.out)   # (made after the configuration checks below: a refused run leaves no directory, Codex round 10)
     run = args.mode == 'run'
     floor = args.mode == 'floor' or run
     if args.characters:   # 2026-10-08 (a bad spec fails here, not in the workers)
@@ -231,6 +238,24 @@ def main():
     ck = None
     if not args.random:
         ck = torch.load(args.checkpoint, map_location=os.environ.get('TOK_EVAL_DEVICE', 'cpu'))
+    if ck is not None:   # (seq-v1 step 4: the checkpoint's frame side and the workers' frames must agree, as in train_tok)
+        from isaac_bridge.visible_producer import VISIBLE_V3_MODE
+        if ck.get('config', {}).get('frame') == 'v3':
+            if not VISIBLE_V3_MODE or not args.obs_visible:
+                p.error('a v3 checkpoint (config frame v3) needs ISAAC_RL_VISIBLE_V3 set (1 / 2 / 3) and --obs-visible 1: '
+                        'its workers must send v3 frames')
+            if args.ablate or args.item_slots is not None:
+                p.error('--ablate / --item-slots: ROW-encoder options, not for a v3 checkpoint')
+            if ck.get('config', {}).get('v3_inputs'):   # (input revision 2 on: the trigger mode it was trained in)
+                ck_trig = ck['config'].get('trigger_once')
+                want = str(1 if ck_trig is None else int(ck_trig))
+                have = os.environ.setdefault('ISAAC_RL_TRIGGER_ONCE', want)
+                if have != want:
+                    p.error(f'ISAAC_RL_TRIGGER_ONCE={have}: the checkpoint was trained with {want} (Codex round 12)')
+                print(f'v3 checkpoint: ISAAC_RL_TRIGGER_ONCE={have}', flush=True)
+        elif VISIBLE_V3_MODE and args.obs_visible:
+            p.error(f'ISAAC_RL_VISIBLE_V3={VISIBLE_V3_MODE} sends v3 frames, this checkpoint reads ROW records: unset it')
+    out.mkdir(parents=True, exist_ok=False)
     items = bool(args.items or (ck is not None and ck.get('config', {}).get('items')))
     names, assign, eval_seeds = [], [], []
     first, count = (int(v) for v in args.seeds.split(':'))
