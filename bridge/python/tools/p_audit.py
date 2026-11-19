@@ -86,6 +86,7 @@ def main(argv=None):
     roll = TT.Rollout(W, cap, nh)
     pending = np.zeros((W, nh), np.int64)
     ident = {}             # (w, ep, t) -> the rebuild's decision index k
+    unread = set()         # decisions whose action the worker did not read (an answered end)
     order = [[] for _ in range(W)]   # the rebuild's decisions per worker, in order: (ep, t)
     last_ok = np.zeros(W, np.int64)  # records rebuilt per worker (stops at the first reply missing)
     for w in range(W):
@@ -98,9 +99,16 @@ def main(argv=None):
             go = book.arrive(roll, row, idx, pending)
             if go[0]:
                 r = replies.get((s['ep'], s['t']))
-                if r is None or r['actions'] is None:
+                if r is None:
                     break   # (no reply read: the log's end)
-                act = np.array([r['actions']], np.int64)
+                if r['actions'] is None:   # (an end answered with an action -- a branch's end, a truncation: its
+                    #                         boot -- that the worker, its episode over, never reads)
+                    if row['done'][0] == 0:
+                        break   # (an ordinary record: the run was closing)
+                    unread.add((w, s['ep'], s['t']))
+                    act = np.zeros((1, nh), np.int64)
+                else:
+                    act = np.array([r['actions']], np.int64)
                 k = int(roll.length[w])
                 TT.store(roll, idx, row, pending[idx].copy(), act, np.zeros(1, np.float32),
                          np.array([np.float32(r['value'] if r['value'] is not None else 0.0)]), 0)
@@ -134,11 +142,16 @@ def main(argv=None):
                                                     'terminal')}
                 if k == 0 and carry[w] is not None:   # (the open decision of the rollout before, carried)
                     ck, cr, cf_ = carry[w]
-                    same = ck == key and cr.tobytes() == r.tobytes() and all(
-                        np.array_equal(cf_[f], fields[f]) for f in ('pending', 'actions', 'logp', 'value', 'version',
-                                                                     'boot'))
-                    if not same:
-                        problem(f'rollout {upd} worker {w}: the carried decision differs ({ck} -> {key})')
+                    diff_f = [f for f in ('pending', 'actions', 'logp', 'value', 'version', 'boot')
+                              if np.asarray(cf_[f]).tobytes() != np.asarray(fields[f]).tobytes()]
+                    if cr.tobytes() != r.tobytes():
+                        rb0, rb1 = cr.view(np.uint8).reshape(-1), r.view(np.uint8).reshape(-1)
+                        diff_f += ['row.' + f for f in ROW.names if
+                                   rb0[ROW.fields[f][1]:ROW.fields[f][1] + ROW.fields[f][0].itemsize].tobytes() !=
+                                   rb1[ROW.fields[f][1]:ROW.fields[f][1] + ROW.fields[f][0].itemsize].tobytes()]
+                    if ck != key or diff_f:
+                        problem(f'rollout {upd} worker {w}: the carried decision differs ({ck} -> {key}: {diff_f[:6]}'
+                                f'{" " + str({f: (cf_[f], fields[f]) for f in diff_f if f in cf_}) if diff_f else ""})')
                     n_cmp['carried'] += 1
                     carry[w] = None
                     is_dup = True
@@ -171,9 +184,10 @@ def main(argv=None):
                 # the rebuild and the worker's reply
                 if not np.array_equal(fields['pending'], roll.pending[w, kr]):
                     problem(f'rollout {upd} worker {w} {key}: pending {fields["pending"]} vs {roll.pending[w, kr]}')
-                if not np.array_equal(fields['actions'], roll.actions[w, kr]):
+                if key not in unread and not np.array_equal(fields['actions'], roll.actions[w, kr]):
                     problem(f'rollout {upd} worker {w} {key}: actions {fields["actions"]} vs {roll.actions[w, kr]}')
                 rep = logs[w][1].get(key[1:])
+                n_cmp['unread'] = n_cmp.get('unread', 0) + int(key in unread)
                 if rep is not None and rep['value'] is not None and \
                         np.float32(fields['value']).tobytes() != np.float32(rep['value']).tobytes():
                     problem(f'rollout {upd} worker {w} {key}: value {fields["value"]} vs the reply {rep["value"]}')
@@ -184,6 +198,9 @@ def main(argv=None):
                 last_ver[w] = int(fields['version'])
                 if k == int(opn[w]):   # (open: its reward is still to come; carried into the next rollout)
                     carry[w] = (key, r.copy(), fields)
+                    continue
+                if int(roll.open[w]) == kr:   # (the rebuild's last decision, its next record past the log: still open)
+                    n_cmp['rebuild_open'] = n_cmp.get('rebuild_open', 0) + 1
                     continue
                 n_cmp['closed'] += 1
                 for f in ('reward', 'terminal', 'boot'):
