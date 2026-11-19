@@ -159,16 +159,26 @@ class DriverCollect:
             ring_seq = np.array([int(recs[j]['ring']) for j in g], np.int64)
             kg = len(g)
             r_ = ring_seq % self.K   # (the ring wraps: a call's rows are its sequence numbers mod K)
+            dev = self.ring['kv'].device
+            # (index tensors through pinned memory, non-blocking: a pageable H2D copy would hold this thread until the
+            #  driver's queued replays on the stream were done -- the consumer then as slow as the GPU)
+            to_dev = lambda a_: torch.from_numpy(np.ascontiguousarray(a_, np.int64)).pin_memory().to(  # noqa: E731
+                dev, non_blocking=True)
             if r_[-1] - r_[0] == kg - 1:
                 sel = lambda x: x[int(r_[0]):int(r_[0]) + kg]   # noqa: E731
             else:
-                ix = torch.from_numpy(r_).to(self.ring['kv'].device)
+                ix = to_dev(r_)
                 sel = lambda x: x.index_select(0, ix)   # noqa: E731
             tc = np.stack([recs[j]['tc'] for j in g])
-            t = dict(create=tc[:, 0] > 0, nroom=tc[:, 1], steps=tc[:, 2], stage_prev=tc[:, 3],
-                     kv=sel(self.ring['kv']), s=sel(self.ring['s']), o=sel(self.ring['o']))
+            t = dict(create=tc[:, 0] > 0, nroom=tc[:, 1], steps=tc[:, 2], stage_prev=tc[:, 3])
             priv = self.pblocks[b, :k][g] if self.pblocks is not None else None
             with torch.cuda.stream(self.stream):   # (the driver's stream: the copy before the rows' next write)
+                # the decisions' rollout rows (as GraphActor's tdest: Rollout.t_dest before store), K / V, s and o into
+                # them from the ring, then store with the counters only (store_temporal's GraphActor branch)
+                rows_t = to_dev(roll.t_assign(a_idx))
+                roll.t_kv.index_copy_(0, rows_t, sel(self.ring['kv']).to(roll.t_kv.dtype))
+                roll.t_s.index_copy_(0, rows_t, sel(self.ring['s']).to(roll.t_s.dtype))
+                roll.t_o.index_copy_(0, rows_t + int(roll.t_obase), sel(self.ring['o']).to(roll.t_o.dtype))
                 store(roll, a_idx, sub, under_way, actions, logp, value, ver, None, vg, t, priv)
             pending[a_idx] = actions
             self.d.release_ring(int(ring_seq[-1]) + 1)
