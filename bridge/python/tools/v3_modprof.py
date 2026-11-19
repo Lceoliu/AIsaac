@@ -85,6 +85,7 @@ def main(argv=None):
     ap.add_argument('--parts', type=int, default=2)
     ap.add_argument('--compile', action='store_true')
     ap.add_argument('--blocks-t', default='')
+    ap.add_argument('--packed', action='store_true', help='the packed forward (forward_packed) in whole and compile')
     ap.add_argument('--out', default=None)
     a = ap.parse_args(argv)
     import torch
@@ -116,14 +117,16 @@ def main(argv=None):
         part['tokens'] = dict(width=widths, real_mean=real, padded_total=sum(widths.values()) + 30,
                               real_total=round(sum(real.values()) + 30, 1))
 
+        call = enc.forward_packed if a.packed else enc
+
         def fwd():
             with torch.autocast('cuda', torch.bfloat16):
-                return enc(v, pe, m.gtok.tok)
+                return call(v, pe, m.gtok.tok)
 
         def fwd_bwd():
             m.zero_grad(set_to_none=True)
             with torch.autocast('cuda', torch.bfloat16):
-                x, _p, _g = enc(v, pe, m.gtok.tok)
+                x, _p, _g = call(v, pe, m.gtok.tok)
             x.float().sum().backward()
 
         def tok():
@@ -154,7 +157,7 @@ def main(argv=None):
                 try:
                     import torch._dynamo
                     torch._dynamo.reset()
-                    ce = torch.compile(enc, mode=mode, dynamic=False)
+                    ce = torch.compile(call, mode=mode, dynamic=bool(a.packed))
 
                     def cfb(ce=ce):
                         m.zero_grad(set_to_none=True)
