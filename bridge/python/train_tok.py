@@ -5968,6 +5968,32 @@ def main(argv=None, child=None, actor=None):
     wcols = ('step_s', 'wait_s', 'encode_s', 'fork_s', 'teach_s', 'overrun_s', 'state_s', 'close_s')
     sync_wait = 0.0
 
+    # P package phase 1 (2026-11-19): ISAAC_TOK_CPP_DRIVER=1 the main answers through the C++ driver where this run is
+    # one phase 1 supports (else the Python loop, the reason printed); 2: required (a run it does not support, or a
+    # failed build, ends here: the acceptance runs cannot pass on the Python loop); 0 / unset: the Python loop.
+    tok_mode = int(os.environ.get('ISAAC_TOK_CPP_DRIVER', '0') or 0) if child is None else 0
+    tok_dc = [None, False]
+
+    def tok_driver_start():
+        from isaac_bridge import tok_consumer, tok_driver
+        why = tok_consumer.supported(
+            args, t_on=t_on, mem_on=mem_on, frame_v3=args.frame == 'v3', block_on=block_on, proc=proc, n_act=n_act,
+            snaps=snaps, priv_on=priv_pending is not None, pf_on=pf_on, lab=lab is not None, aux=aux is not None,
+            plr=getattr(book, 'plr', None) is not None, lanes_gpu=False)
+        mod = None if why else tok_driver.load(verbose=True)
+        if why is None and mod is None:
+            why = f'the extension: {tok_driver.REASON}'
+        if why:
+            if tok_mode >= 2:
+                raise RuntimeError(f'P package: ISAAC_TOK_CPP_DRIVER=2 and the driver cannot run: {why}')
+            print(f'P package: the C++ driver off ({why}); the Python loop', flush=True)
+            return None
+        dc = tok_consumer.DriverCollect(mod, model, sampler, n, g_ents, gkw, t_state, bank_tstate, actor_stream,
+                                        version, CAP_T, TRUNC)
+        print(f'P package: the C++ driver on (graphs {dc.mid.m.n_graphs()}, blocks {len(dc.blocks)} x {n}, ring {dc.K} '
+              f'rows)', flush=True)
+        return dc
+
     def take_weights():
         nonlocal version, busy
         fresh.clear()
@@ -6437,7 +6463,26 @@ def main(argv=None, child=None, actor=None):
                 nv.push('actor.collect')   # (B57: the collect window, for the learner's per-window speeds)
                 run_driver_collect(prof)
                 nv.pop()
-            while cpp_driver is None and roll.usable() < rollout_actor and sampler.live and not stopped():
+            if tok_mode and tok_dc[0] is None and not tok_dc[1]:   # (P package phase 1: at the first collect)
+                tok_dc[0] = tok_driver_start()
+                tok_dc[1] = True
+            if tok_dc[0] is not None:   # (P package phase 1: the answers in the C++ driver, book / store here)
+                class _W:
+                    @staticmethod
+                    def ready():
+                        return busy and fresh.is_set()
+
+                    def __call__(self):
+                        if lanes is not None:
+                            lanes.quiesce()
+                        t_w_ = time.perf_counter()
+                        take_weights()
+                        prof['weights'] += time.perf_counter() - t_w_
+                        return version
+                tok_dc[0].collect(roll, book, pending, rollout_actor, prof, store,
+                                  tick=_lane_tick if lanes is not None else None, weights=_W(), stopped=stopped)
+            while (cpp_driver is None and tok_dc[0] is None and roll.usable() < rollout_actor and sampler.live
+                   and not stopped()):
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
                     if block_actor is None:
                         _lane_tick(prof)
@@ -6839,6 +6884,8 @@ def main(argv=None, child=None, actor=None):
             print(f'BM1 C shard {SYNC.rank}: {SYNC.stats}' + (f'; rank {SYNC.peer_lost[0]} ended first'
                                                              if SYNC.peer_lost else ''), flush=True)
             SYNC.close()
+        if tok_dc[0] is not None:   # (P package: the driver thread joined before the workers' pipes close)
+            tok_dc[0].close()
         sampler.close()
         if log_file is not None:
             log_file.close()

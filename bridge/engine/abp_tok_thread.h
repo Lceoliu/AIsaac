@@ -25,7 +25,7 @@
 
 struct Rec {
   i64 seq, call, worker, slot, block, brow, kind, go, ring, version, e_bucket, n_call;
-  i64 act[8], pend[8];
+  i64 act[8], pend[8];   // (pend: a go record's under_way, after Episodes.arrive's resets; others: before them)
   double logp, value, vg;
   i64 tc[4];
 };
@@ -357,6 +357,7 @@ struct TokDriver {
           r.kind = K_REC; r.go = go[i]; r.version = version; r.e_bucket = eb; r.n_call = k; r.ring = -1;
           for (i64 h = 0; h < nh; h++) r.pend[h] = before[i][h];
           if (go[i]) {
+            for (i64 h = 0; h < nh; h++) r.pend[h] = pend_c[j*nh+h];   // (the pending the call used: after the resets)
             const float *o = out_c.data()+j*mid->cols;
             for (i64 h = 0; h < nh; h++) r.act[h] = (i64)o[h];
             r.logp = o[nh]; r.value = o[nh+1]; r.vg = vg_on ? o[nh+2] : o[nh+1];
