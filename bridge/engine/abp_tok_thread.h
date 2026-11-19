@@ -42,6 +42,8 @@ struct TokDriver {
   i64 off_done = 0, off_first = 0, off_t = 0, done_branch = 4, cap_t = 0, trunc = 0;
   // the staging blocks [M, n, row_bytes] (Python owns them: numpy ROW arrays the consumer reads in place)
   uint8_t *blocks = nullptr; i64 M = 0, n = 0;
+  // (tok_priv) each slot's PRIV record beside its row (sampler.priv [2 W]) into priv blocks [M, n] at the same rows
+  uint8_t *priv_base = nullptr, *priv_blocks = nullptr; i64 priv_size = 0;
   std::vector<int> block_free;
   // the output ring: K rows, absolute sequence numbers (row = seq mod K; head: the next; released: below it free)
   i64 K = 0, ring_head = 0, ring_released = 0;
@@ -84,6 +86,9 @@ struct TokDriver {
     TORCH_CHECK(n_ >= 1 && n_ <= mid->L.n, "set_blocks: a block holds 1 .. the graphs' rows");
     block_free.clear(); for (i64 b = M-1; b >= 0; b--) block_free.push_back((int)b);
     q_cap = q_cap_ > 0 ? q_cap_ : M*n;
+  }
+  void set_priv(i64 src_ptr, i64 itemsize, i64 blocks_ptr) {
+    priv_base = (uint8_t *)src_ptr; priv_size = itemsize; priv_blocks = (uint8_t *)blocks_ptr;
   }
   void set_ring_rows(i64 K_) { K = K_; ring_head = ring_released = 0; }   // (K >= n: checked at start)
   void set_version(i64 v) { std::lock_guard<std::mutex> g(mu); version = v; }
@@ -292,6 +297,8 @@ struct TokDriver {
         int32_t vb; std::memcpy(&vb, src+off_bytes, 4);
         const i64 e = (vb >= 0 && vb <= cap) ? off_frame+(((i64)vb+3) & ~(i64)3) : row_bytes;
         std::memcpy(blk+i*row_bytes, src, (size_t)e);
+        if (priv_base)   // (the worker may overwrite its slot once answered: its PRIV record copied with the row)
+          std::memcpy(priv_blocks+(b*n+i)*priv_size, priv_base+slots[i]*priv_size, (size_t)priv_size);
         go[i] = is_go(blk+i*row_bytes);
       }
       gi.clear();

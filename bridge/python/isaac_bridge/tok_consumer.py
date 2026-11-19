@@ -22,7 +22,7 @@ def supported(args, *, t_on, mem_on, frame_v3, block_on, proc, n_act, snaps, pri
     """(P-driver-design 11.3) None when phase 1 supports this run, else why not."""
     why = [w for w, bad in (('not temporal', not t_on), ('a GRU', mem_on), ('not --frame v3', not frame_v3),
                             ('block memory', block_on), ('a learner process', proc), ('more actor processes', n_act != 1),
-                            ('branch snapshots', bool(snaps)), ('tok_priv', priv_on), ('pickup force', pf_on),
+                            ('branch snapshots', bool(snaps)), ('pickup force', pf_on),
                             ('the lab', lab), ('branch aux', aux), ('archive PLR', plr),
                             ('the teacher on its own GPU', lanes_gpu)) if bad]
     return ', '.join(why) or None
@@ -32,7 +32,7 @@ class DriverCollect:
     """The driver, its GraphActor(fold=True), the staging blocks and the output ring for one training run."""
 
     def __init__(self, mod, model, sampler, n, g_ents, gkw, t_state, bank_tstate, stream, version, cap_t, trunc,
-                 blocks=64, ring=8192):
+                 blocks=64, ring=8192, priv_dtype=None):
         import torch
         from .tok_driver import Middle
         from .tok_policy import GraphActor
@@ -55,6 +55,10 @@ class DriverCollect:
                       ptr(getattr(sampler, 'main_vg', None)), ptr(getattr(sampler, 'cf_snap', None)))
         d.set_rules(ROW.fields['done'][1], ROW.fields['first'][1], ROW.fields['t'][1], DONE_BRANCH, int(cap_t), int(trunc))
         d.set_blocks(int(self.blocks.ctypes.data), blocks, n, 0)
+        self.pblocks = None
+        if priv_dtype is not None:   # (tok_priv: each record's PRIV record copied by the driver beside its row)
+            self.pblocks = np.zeros((blocks, n), priv_dtype)
+            d.set_priv(int(sampler.priv.ctypes.data), priv_dtype.itemsize, int(self.pblocks.ctypes.data))
         d.set_ring_rows(ring)
         d.set_version(int(version))
         self.started = False
@@ -163,8 +167,9 @@ class DriverCollect:
             tc = np.stack([recs[j]['tc'] for j in g])
             t = dict(create=tc[:, 0] > 0, nroom=tc[:, 1], steps=tc[:, 2], stage_prev=tc[:, 3],
                      kv=sel(self.ring['kv']), s=sel(self.ring['s']), o=sel(self.ring['o']))
+            priv = self.pblocks[b, :k][g] if self.pblocks is not None else None
             with torch.cuda.stream(self.stream):   # (the driver's stream: the copy before the rows' next write)
-                store(roll, a_idx, sub, under_way, actions, logp, value, ver, None, vg, t, None)
+                store(roll, a_idx, sub, under_way, actions, logp, value, ver, None, vg, t, priv)
             pending[a_idx] = actions
             self.d.release_ring(int(ring_seq[-1]) + 1)
             prof['calls'] += 1

@@ -279,3 +279,52 @@ def test_a_ring_smaller_than_a_call_is_refused():
         rig.d.start()
     for s_ in rig.drv_socks + rig.wk_socks:
         s_.close()
+
+
+def test_each_records_priv_is_copied_beside_it():
+    """(tok_priv) The worker's slot can be overwritten once it is answered: the driver copies its PRIV record into the
+    priv block row of the record (the consumer reads that, never the slot)."""
+    W, T, ep = 4, 25, 6
+    PRIVD = np.dtype([('t', np.int64), ('w', np.int64), ('pad', np.uint8, 40)])
+    rig = Rig(W=W, blocks=2, n=8, K=16, episode=ep)
+    priv = np.zeros(2 * W, PRIVD)
+    pblocks = np.zeros((2, 8), PRIVD)
+    rig.d.set_priv(priv.ctypes.data, PRIVD.itemsize, pblocks.ctypes.data)
+    orig = rig.record
+
+    def record(w, t):
+        slot = orig(w, t)
+        priv[slot]['t'], priv[slot]['w'] = t, w
+        return slot
+    rig.record = record
+    seen = []
+    rig.d.start()
+    ths = [threading.Thread(daemon=True, target=rig.worker, args=(w, T)) for w in range(W)]
+    for t_ in ths:
+        t_.start()
+    try:
+        end = time.time() + 20
+        ends = 0
+        while ends < W and time.time() < end:
+            d = rig.d.take(64, 0.05)
+            for i in range(len(d['seq'])):
+                if d['kind'][i] == 1:
+                    ends += 1
+                    continue
+                b, r = int(d['block'][i]), int(d['brow'][i])
+                seen.append((int(d['worker'][i]), int(pblocks[b, r]['w']), int(pblocks[b, r]['t'])))
+                time.sleep(0.001)   # (a slow consumer: the workers move on meanwhile)
+            for c_, b_, k_ in zip(d['call'], d['block'], d['n_call']):
+                if b_ >= 0:
+                    rig._seen = getattr(rig, '_seen', {})
+                    rig._seen[int(c_)] = rig._seen.get(int(c_), 0) + 1
+                    if rig._seen[int(c_)] == int(k_):
+                        rig.d.release_block(int(b_))
+            rr = d['ring'][d['ring'] >= 0]
+            if len(rr):
+                rig.d.release_ring(int(rr.max()) + 1)
+    finally:
+        rig.close()
+    for w in range(W):
+        mine = [(pw, pt) for sw, pw, pt in seen if sw == w]
+        assert mine == [(w, t) for t in range(T)], (w, mine[:5])

@@ -299,7 +299,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   py::class_<TokDriver>(m, "TokDriver")
       .def(py::init<py::object>())
       .def("set_sampler", &TokDriver::set_sampler).def("set_rules", &TokDriver::set_rules)
-      .def("set_blocks", &TokDriver::set_blocks).def("set_ring_rows", &TokDriver::set_ring_rows)
+      .def("set_blocks", &TokDriver::set_blocks).def("set_priv", &TokDriver::set_priv).def("set_ring_rows", &TokDriver::set_ring_rows)
       .def("set_version", &TokDriver::set_version).def("set_pending", &TokDriver::set_pending)
       .def("pending_of", &TokDriver::pending_of)
       .def("start", &TokDriver::start).def("stop", &TokDriver::stop).def("pause", &TokDriver::pause)

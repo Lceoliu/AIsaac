@@ -5994,7 +5994,8 @@ def main(argv=None, child=None, actor=None):
             print(f'P package: the C++ driver off ({why}); the Python loop', flush=True)
             return None
         dc = tok_consumer.DriverCollect(mod, model, sampler, n, g_ents, gkw, t_state, bank_tstate, actor_stream,
-                                        version, CAP_T, TRUNC)
+                                        version, CAP_T, TRUNC,
+                                        priv_dtype=priv_pending.dtype if priv_pending is not None else None)
         print(f'P package: the C++ driver on (graphs {dc.mid.m.n_graphs()}, blocks {len(dc.blocks)} x {n}, ring {dc.K} '
               f'rows)', flush=True)
         return dc
