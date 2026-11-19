@@ -601,16 +601,26 @@ def main(argv=None):
         # the rows stored against the slot's bytes as the worker wrote them (the prefix the driver copies: the fixed
         # fields and the padding between them, then the frame's bytes)
         fa = ROW.fields['visible_frame'][1]
-        same_rows, row_diff, row_ex = 0, {}, []
+        same_rows, row_diff, row_ex, pad_rows = 0, {}, [], 0
         for x in keys:
             sr = drv[x]['row'].view(np.uint8).reshape(-1)
             rr = ref[x]['sent_row']
             nb_ = int(ref[x]['row']['visible_bytes'][0])
             e = min(fa + ((max(nb_, 0) + 3) & ~3), ROW.itemsize)
-            ok_ = bool(np.array_equal(sr[:e], rr[:e]))
+            # every named field and the frame's bytes; the padding between fields is not data (the consumer's
+            # rows[g] -- numpy fancy indexing of the padded record dtype -- copies field by field into fresh memory,
+            # its padding left uninitialised; store writes the rollout field by field): counted apart
+            m_ = np.zeros(e, bool)
+            for f in ROW.names:
+                o_ = ROW.fields[f][1]
+                if o_ < fa:
+                    m_[o_:o_ + ROW.fields[f][0].itemsize] = True
+            m_[fa:e] = True
+            ok_ = bool(np.array_equal(sr[:e][m_], rr[:e][m_]))
             same_rows += ok_
-            if not ok_:   # (where they differ: the fields, the padding between them, the frame)
-                d_ = np.flatnonzero(sr[:e] != rr[:e])
+            pad_rows += not np.array_equal(sr[:e][~m_], rr[:e][~m_])
+            if not ok_:   # (where they differ: the fields, the frame)
+                d_ = np.flatnonzero((sr[:e] != rr[:e]) & m_)
                 for o_ in d_[:64]:
                     f_ = next((f for f in ROW.names if ROW.fields[f][1] <= o_ < ROW.fields[f][1]
                                + ROW.fields[f][0].itemsize), 'padding')
@@ -618,7 +628,8 @@ def main(argv=None):
                 if len(row_ex) < 3:
                     row_ex.append(dict(key=x, n=int(len(d_)), first=int(d_[0]), e=int(e), nb=nb_,
                                        drv=sr[d_[0]:d_[0] + 8].tolist(), sent=rr[d_[0]:d_[0] + 8].tolist()))
-        g1['rows_prefix'] = dict(n=len(keys), equal=same_rows, where=row_diff, examples=row_ex)
+        g1['rows_prefix'] = dict(n=len(keys), equal=same_rows, where=row_diff, examples=row_ex,
+                                 padding_differs=int(pad_rows))
         for k in kept_d:
             g1[f'rollout_{k}'] = bitdiff(kept_d[k][dest], kept_r[k][dest])
         # what each worker read back against the reference's answer
