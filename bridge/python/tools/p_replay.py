@@ -30,7 +30,7 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 STATE = ('kv', 'steps', 'nroom', 'prev_o', 'prev_stage', 'prev_map')
-OUTS = ('actions', 'logp', 'value', 'vg', 'create', 'nroom', 'steps', 'stage_prev')
+OUTS = ('actions', 'logp', 'value', 'vg', 'create', 'nroom', 'steps', 'stage_prev', 'e_bucket')
 
 
 def schedule(length, steps, spec):
@@ -92,8 +92,15 @@ class PyBackend:
                     create=t['create'], nroom=t['nroom'], steps=t['steps'], stage_prev=t['stage_prev'])
 
     def state(self):
+        """The TemporalState's tensors of the worker slots, slot axis first (the scratch slot left out: the graphs'
+        padded rows write there, from whatever the staging rows held -- not a record's state)."""
         self.torch.cuda.synchronize()
-        return {k: getattr(self.ts, k).float().cpu().numpy() for k in STATE}
+        out = {}
+        for k in STATE:
+            v = getattr(self.ts, k).float().cpu().numpy()
+            v = np.moveaxis(v, 2, 0) if k == 'kv' else v
+            out[k] = v[:self.ts.scratch]
+        return out
 
     def kept(self):
         self.torch.cuda.synchronize()
@@ -111,6 +118,8 @@ def replay(backend, z, steps, spec):
         sub = np.ascontiguousarray(rows[w, t])
         res = backend.call(sub, np.ascontiguousarray(pend[w, t]), w.astype(np.int64), sub['first'] != 0,
                            (w * T + t).astype(np.int64), (w.astype(np.int64) + 1, np.full(len(w), t, np.int64)))
+        from isaac_bridge import v3_input as VI
+        res['e_bucket'] = np.full(len(w), VI.rows_counts(sub, stats=False)[1], np.int64)   # (the call's E bucket)
         for k, v in res.items():
             v = np.asarray(v)
             if k not in out:
@@ -172,6 +181,10 @@ def main(argv=None):
         rows_kept = da.reshape(-1)
         rec.update({f'kept_{k}': diff(ka[k], kb[k], rows_kept) for k in ka})
         rec.update({f'state_{k}': diff(sa[k], sb[k]) for k in sa})
+        same = da & (oa['e_bucket'] == ob['e_bucket'])   # (records whose calls had the same E bucket in both runs)
+        rec['same_bucket_records'] = int(same.sum())
+        rec.update({f'same_bucket_{k}': diff(oa[k], ob[k], same) for k in ('actions', 'logp', 'value')})
+        rec.update({f'same_bucket_kept_{k}': diff(ka[k], kb[k], same.reshape(-1)) for k in ka})
         rec['calls'] = [na, nb]
         rec['all_bit_equal'] = all(v['equal'] == v['n'] for k, v in rec.items() if isinstance(v, dict))
         res['pairs'][pair] = rec
