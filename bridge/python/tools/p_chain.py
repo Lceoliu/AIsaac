@@ -24,7 +24,7 @@ Gate 3 (asynchronous faults): small credits (--blocks, --ring), a slow consumer 
   each record's version the weights' version then.
 
    usage: python tools/p_chain.py <rollouts dir> [--steps 300] [--workers 16] [--fp32] [--blocks 64] [--ring 8192]
-          [--lag 0] [--pace 0] [--swaps 0] [--kill w:i] [--die-after 0] [--flat] [--alt single,wide] [--out f.json]
+          [--lag 0] [--pace 0] [--swaps 0] [--kill w:i] [--die-after 0] [--flat] [--ends n] [--alt single,wide] [--out f.json]
 Prints one JSON object (and --out)."""
 import argparse
 import glob
@@ -164,6 +164,8 @@ def main(argv=None):
     ap.add_argument('--kill', default='', help="w:i -- worker w's socket closed right after sending its i-th record")
     ap.add_argument('--die-after', type=int, default=0, help='store raises at this call (the consumer dies)')
     ap.add_argument('--flat', action='store_true')
+    ap.add_argument('--ends', type=int, default=0, help="every n-th record an episode's end (done 3, or DONE_BRANCH "
+                    "every other time: a branch's end, still answered), the next a new episode's first")
     ap.add_argument('--alt', default='', help='gate 2: single,wide')
     ap.add_argument('--seed', type=int, default=1)
     ap.add_argument('--timeout', type=float, default=1500)
@@ -261,6 +263,12 @@ def main(argv=None):
                     sampler.rows['first'][slot] = 1 if i == 0 else 0
                     sampler.rows['done'][slot] = 0
                     sampler.rows['t'][slot] = i
+                if a.ends:   # (an end record -- no action unless a branch's -- then a new episode at once)
+                    from isaac_bridge.tok_obs import DONE_BRANCH
+                    e_ = i // a.ends
+                    sampler.rows['first'][slot] = 1 if i % a.ends == 0 else 0
+                    sampler.rows['done'][slot] = (DONE_BRANCH if e_ % 2 else 3) if i % a.ends == a.ends - 1 else 0
+                    sampler.rows['t'][slot] = i
                 r = sampler.rows[slot]
                 sent[w].append((int(r['t']), int(r['first']), int(r['done'])))
                 s.sendall(struct.pack('!i', 1) + (b'0' if slot % 2 == 0 else b'1'))
@@ -302,7 +310,8 @@ def main(argv=None):
     t0 = time.perf_counter()
     for th in threads:
         th.start()
-    res = dict(rollout=os.path.basename(paths[0]), workers=W, steps=T, bf16=bf16, flat=a.flat, blocks=a.blocks,
+    res = dict(rollout=os.path.basename(paths[0]), workers=W, steps=T, bf16=bf16, flat=a.flat, ends=a.ends,
+               blocks=a.blocks,
                ring=a.ring, lag=a.lag, pace=a.pace, swaps=a.swaps, kill=a.kill, die_after=a.die_after,
                gpu=torch.cuda.get_device_name(0))
     died = None
