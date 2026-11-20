@@ -72,6 +72,8 @@ from .tok_branch import (RewindLedger, end_reward, rewind_cfg, AUX_LOGP, AUX_PRE
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
 from .tok_obs import ring_put   # noqa: E402
+from .tok_sampler import (attach_ring_gen, check_ring_mode, ring_open, ring_publish,   # noqa: E402
+                          tracemalloc_spec)
 from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
                       encode_row, fast_counts, fast_row_function, V3_FRAMES, child_start, fast_row_final)
 from . import tok_obs as TOB   # (its FAST_ROW_CHECKING: per worker, the canary -- read through the module)
@@ -109,25 +111,28 @@ def reap_child(pid, limit):
 def worker_tracemalloc(index):
     """(2026-11-20, the memory ledger's diagnostic; off unless set) ISAAC_WORKER_TRACEMALLOC=<dir>[:<seconds>[:<worker>]]:
     in worker <worker> (default 0) only, tracemalloc on from the worker's start (10 frames per traceback: it slows that
-    worker, the others not at all); every <seconds> (default 600) <dir>/worker<i>-tracemalloc-<n>.txt: the process's
-    RSS / anonymous / heap, the traced total, the top 40 allocation sites by size (file:line) and the top 15 by
-    traceback. Returns the tick to call from the worker's loop, or None. Measures only: nothing else changes."""
-    spec = os.environ.get('ISAAC_WORKER_TRACEMALLOC', '')
-    if not spec:
+    worker, the others not at all); every <seconds> (default 600) <dir>/worker<i>-pid<pid>-tracemalloc-<n>.txt: the
+    process's RSS / anonymous / heap, the traced total, the top 40 allocation sites by size (file:line) and the top 15
+    by traceback. Returns the tick to call from the worker's loop, or None. Measures only: nothing else changes.
+    (Codex round 25) The spec is checked by the trainer at its start (tok_sampler.tracemalloc_spec); a failed sample
+    turns tracing off (not retried); Python children forked from the worker trace nothing; the worker's own threads
+    (the teacher's) are traced with it. A diagnostic run only: never mixed with a speed or memory measurement."""
+    parsed = tracemalloc_spec(os.environ.get('ISAAC_WORKER_TRACEMALLOC', ''))
+    if parsed is None:
         return None
-    parts, nums = spec.split(':'), []
-    while len(parts) > 1 and len(nums) < 2 and all(ch in '0123456789.' for ch in parts[-1]):
-        nums.insert(0, parts.pop())   # (the trailing numbers: a directory may hold a ':')
-    out_dir = ':'.join(parts)
-    every = float(nums[0]) if nums and nums[0] else 600.0
-    if index != (int(nums[1]) if len(nums) > 1 and nums[1] else 0):
+    out_dir, every, which = parsed
+    if index != which:
         return None
     import tracemalloc
     tracemalloc.start(10)
-    state = dict(t=time.perf_counter(), n=0)
+    # (Codex round 25) a Python child forked from this worker (a teacher fork, a CF search) traces nothing; the
+    # worker's own threads (the teacher's) are traced with it -- a diagnostic run, never a speed or memory measurement
+    os.register_at_fork(after_in_child=lambda: tracemalloc.is_tracing() and tracemalloc.stop())
+    state = dict(t=time.perf_counter(), n=0, off=False)
+    pid = os.getpid()
 
     def tick():
-        if time.perf_counter() - state['t'] < every:
+        if state['off'] or time.perf_counter() - state['t'] < every:
             return
         state['t'] = time.perf_counter()
         state['n'] += 1
@@ -141,8 +146,8 @@ def worker_tracemalloc(index):
                         status[line.split(':')[0]] = line.split(':')[1].strip()
             except OSError:
                 pass
-            lines = [f'worker {index} sample {state["n"]}: traced {cur / 2 ** 20:.1f} MB (peak {peak / 2 ** 20:.1f}); '
-                     f'{status}', '', 'top 40 by file:line']
+            lines = [f'worker {index} pid {pid} sample {state["n"]}: traced {cur / 2 ** 20:.1f} MB '
+                     f'(peak {peak / 2 ** 20:.1f}); {status}', '', 'top 40 by file:line']
             for st_ in snap.statistics('lineno')[:40]:
                 lines.append(f'{st_.size / 2 ** 20:9.2f} MB {st_.count:9d} blocks  {st_.traceback[0]}')
             lines += ['', 'top 15 by traceback']
@@ -150,11 +155,13 @@ def worker_tracemalloc(index):
                 lines.append(f'{st_.size / 2 ** 20:9.2f} MB {st_.count:9d} blocks')
                 lines += ['      ' + str(fr) for fr in st_.traceback[:10]]
             os.makedirs(out_dir, exist_ok=True)
-            with open(os.path.join(out_dir, f'worker{index}-tracemalloc-{state["n"]}.txt'), 'w') as f:
+            with open(os.path.join(out_dir, f'worker{index}-pid{pid}-tracemalloc-{state["n"]}.txt'), 'w') as f:
                 f.write('\n'.join(lines) + '\n')
-        except Exception as exc:   # noqa: BLE001  (a diagnostic: never the worker's failure)
-            print(f'tok floor worker {index}: tracemalloc sample failed: {type(exc).__name__}: {exc}', file=sys.stderr,
-                  flush=True)
+        except Exception as exc:   # noqa: BLE001  (a diagnostic: never the worker's failure; off, not retried)
+            state['off'] = True
+            tracemalloc.stop()
+            print(f'tok floor worker {index}: tracemalloc sample failed, tracing off: {type(exc).__name__}: {exc}',
+                  file=sys.stderr, flush=True)
     return tick
 
 
@@ -344,6 +351,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     cfon = bool(getattr(cfg, 'cf', False)) and v2_names is not None and v2_conn is not None and not evaluation
     laneon = v2on or cfon   # (the lane, the episode's log and the V2 ring: teacher v2's machinery, shared)
     teaching = cfg.teacher and teacher_names is not None and not evaluation
+    check_ring_mode(cfg)   # (Codex round 25: the trainer's ISAAC_RL_RING_COMPACT, or refused)
+    teach_gen = v2_gen = None   # (Codex round 25) the rings' slot generations (tok_sampler.attach_ring_gen)
+    if cfg.ring_gen_block and (teaching or laneon):
+        gen_block, teach_gen, v2_gen = attach_ring_gen(cfg.ring_gen_block, cfg.workers)
+        blocks = blocks + [gen_block]
     if teaching:
         teach_blocks, teach_rows, teach_meta = attach_teacher(teacher_names, cfg.workers)
         blocks = blocks + teach_blocks
@@ -582,7 +594,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         for it, found in zip(items, founds):
             n_found += len(found)
             for k, at, under_way, lost, taken in found:
-                slot = int(mine[ST['teach']]) % TEACH_RING
+                c_ = int(mine[ST['teach']])
+                slot = c_ % TEACH_RING
+                ring_open(teach_gen, index, slot, c_)   # (Codex round 25: the slot's generation)
                 if block_on:
                     block_arrays[5][index,slot]=0
                 trow = teach_rows[index, slot:slot + 1]
@@ -592,6 +606,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 teach_meta[index, slot] = teach_meta_row(under_way, lost, taken, k, safe)
                 if block_on:
                     block_arrays[5][index,slot]=int(mine[ST['teach']])+1
+                ring_publish(teach_gen, index, slot, c_)
                 mine[ST['teach']] += 1
                 mine[ST['avoidable']] += bool(safe)
         mine[ST['teach_s']] += time.perf_counter() - t0
@@ -627,7 +642,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         """Imitation records into the worker's V2 ring (teacher v2's and, B34, the cf's; one writer at a time: the
         lane lock is held), with their GRU input states (memory) and temporal outputs (B34, temporal lanes)."""
         for j in range(len(rows_)):
-            slot = int(mine[ST['v2_records']]) % V2_RING
+            c_ = int(mine[ST['v2_records']])
+            slot = c_ % V2_RING
+            ring_open(v2_gen, index, slot, c_)   # (Codex round 25: the slot's generation)
             if block_on:
                 v2_t[index,slot,-1]=0
             ring_put(v2_rows[index, slot:slot + 1], rows_[j:j + 1])   # (ISAAC_RL_RING_COMPACT: its frame's bytes)
@@ -638,6 +655,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 v2_t[index, slot] = ts_[j] if ts_ is not None else 0.0
             if block_on:
                 v2_t[index,slot,-1]=int(mine[ST['v2_records']])+1
+            ring_publish(v2_gen, index, slot, c_)
             mine[ST['v2_records']] += 1
 
     def v2_search(pt):

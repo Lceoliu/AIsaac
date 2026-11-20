@@ -76,7 +76,7 @@ def main(argv=None):
                             k += 1
                     for w in range(W):
                         for j in range(R):
-                            TO.ring_take(ring[w, j:j + 1])
+                            TO.ring_take(ring, w, j)
                     rss = shm_rss_kb(shm.name) / 1024.0
                     print(f'workers {W:3d} {ring_name:8s} ring ({R} slots / worker) '
                           f'{"compact" if compact else "whole  "}: resident {rss:8.1f} MB '

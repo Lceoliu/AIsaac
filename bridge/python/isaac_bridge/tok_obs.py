@@ -189,7 +189,10 @@ ROW_SCHEMA = 8   # (2026-11-20) the ROW layout revision dumps record ('row_schem
 # each record's frame end -- ROW_FRAME_AT + visible_bytes, the bytes every reader uses -- so a slot's frame-budget
 # pages past it are never touched and never become resident (a read of a shared-memory hole allocates a page too).
 # A record taken from a ring then has zeros past its frame end where the whole-slot copy had the slot's stale bytes
-# of earlier records (no reader reads them: tests/test_ring_compact.py).
+# of earlier records (no reader reads them: tests/test_ring_compact.py). (Codex round 25) What it saves is resident
+# shared pages, not address space: a page a longer frame (or a whole-slot access) once touched stays resident. Every
+# process reads the switch from its own environment; the workers refuse a value other than the trainer's
+# (tok_sampler.check_ring_mode). Diagnostic dumps of the rings (B38 dump_job) differ past the frames between the modes.
 RING_COMPACT = os.environ.get('ISAAC_RL_RING_COMPACT', '0') == '1'
 ROWC = np.dtype([(name, ROW.fields[name][0]) for name in ROW.names if name != 'visible_frame'] +
                 [('visible_off', np.int64)], align=True)
@@ -253,9 +256,20 @@ class FrameArena:
         return new
 
 
+FRAME_W = ROW.fields['visible_frame'][0].itemsize   # (the frame field's width: 131,072 bytes)
+
+
 def row_frame_end(row1):
-    """The bytes of a 1-record ROW array every reader uses: every field before the frame, then visible_bytes of it."""
-    return ROW_FRAME_AT + max(0, min(int(row1['visible_bytes'][0]), ROW.itemsize - ROW_FRAME_AT))
+    """The bytes of a 1-record ROW array every reader uses: every field before the frame, then visible_bytes of it.
+    (Codex round 25) A record without a frame (visible_schema 0: its visible_bytes may be a reused slot's) ends at the
+    frame; a record with one whose length is outside [0, FRAME_W] is refused (ValueError), never clamped."""
+    if int(row1['visible_schema'][0]) == 0:
+        return ROW_FRAME_AT
+    vb = int(row1['visible_bytes'][0])
+    if not 0 <= vb <= FRAME_W:
+        raise ValueError(f'ring record: visible_bytes {vb} outside [0, {FRAME_W}] '
+                         f'(visible_schema {int(row1["visible_schema"][0])})')
+    return ROW_FRAME_AT + vb
 
 
 def ring_put(dst1, src1):
@@ -268,13 +282,16 @@ def ring_put(dst1, src1):
     dst1.view(np.uint8).reshape(-1)[:n] = src1.view(np.uint8).reshape(-1)[:n]
 
 
-def ring_take(src1):
-    """A copy (a ROW scalar) of the record in a ring slot (src1, its 1-record view): with RING_COMPACT its bytes up to
-    its frame end and zeros past them (the slot's tail is not read), otherwise the whole slot (as before)."""
+def ring_take(ring, i, slot):
+    """A copy (a ROW scalar) of the record in ring[i, slot]: with RING_COMPACT its bytes up to its frame end and zeros
+    past them (the slot's tail is not read), otherwise the whole slot (ring[i, slot].copy(), as before). A torn read
+    (the slot reused while it is copied, its length included) is the caller's to detect: the slot's generation
+    (tok_sampler.ring_open / ring_publish), read before and after."""
     if not RING_COMPACT:
-        return src1[0].copy()
-    out = np.zeros(1, ROW)
+        return ring[i, slot].copy()
+    src1 = ring[i, slot:slot + 1]
     n = row_frame_end(src1)
+    out = np.zeros(1, ROW)
     out.view(np.uint8)[:n] = src1.view(np.uint8).reshape(-1)[:n]
     return out[0]
 

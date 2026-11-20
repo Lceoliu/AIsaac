@@ -1,15 +1,28 @@
-"""(2026-11-20, the memory ledger: ISAAC_RL_RING_COMPACT) The workers' teacher and V2 rings written / read only up to
-each record's frame end. Checked against the whole-slot behaviour (the switch off) on the same records:
+"""(2026-11-20, the memory ledger: ISAAC_RL_RING_COMPACT; Codex round 25: the rings' slot generations) The workers'
+teacher and V2 rings written / read only up to each record's frame end, and every record a reader takes checked against
+its slot's generation (tok_sampler.ring_open / ring_publish) before and after it is copied, in both modes:
   (a) every record taken from a ring: its fixed fields (field by field) and its frame up to visible_bytes are the same
-      bytes (the dtype's alignment padding is not compared: the readers assemble their output with np.stack, which
-      leaves padding uninitialised in either mode, as before this change); past visible_bytes compact mode has zeros where the whole-slot copy had the
-      slot's stale bytes of earlier records -- and the readers downstream (tok_obs.compact_copy, the trainer's chunks;
-      tok_policy.to_batch, the learner's batches) give the same results from both;
-  (b) a full ring, a ring that wrapped, a reader that fell behind by more than the ring (the sampler's own readers,
-      teacher_records / v2_records, on stand-in samplers);
-  (c) Linux: a writer in another process (shared memory, as the workers write), and the slot pages a reader touches:
-      in compact mode the frame budget's tail stays unresident after the ring is read."""
+      bytes as the record written (real v3 frames of different lengths); past visible_bytes compact mode has zeros
+      where the whole-slot copy had the slot's stale bytes of earlier records. The dtype's alignment padding is not
+      compared: the readers assemble their output with np.stack, which leaves it uninitialised in either mode. The
+      readers downstream (tok_obs.compact_copy, the trainer's chunks; tok_policy.to_batch, the learner's batches) give
+      the same results from both;
+  (b) the lengths: a record without a frame (visible_schema 0) ends at the frame whatever its visible_bytes; a frame
+      length outside [0, 131,072] is refused (the readers count it, ring_bad, and skip it);
+  (c) the sampler's readers (teacher_records / v2_records) on stand-ins: a full ring, a ring that wrapped, a reader
+      that fell more than a ring behind -- the records taken checked one by one (their ids and meta), the ones written
+      over counted (ring_*_lapped);
+  (d) a writer in a forked child (shared memory, as the workers write) reusing the slot a reader is copying, forced at
+      two points -- after the reader read the record's length, and after it copied the ROW, before the meta: the
+      reader takes the complete older record or drops it (ring_*_torn), never the newer one's bytes as the older
+      record; a negative control (the same interleaving with the generations not kept) shows the check is what
+      catches it;
+  (e) a writer in a forked child writing without pause while the reader reads: every record taken is one record
+      whole, and taken + lapped + torn = written;
+  (f) Linux: the slot pages a reader touches: in compact mode the frame budget's tail stays unresident.
+The (d) interleavings take the reader as in 6aca452 (no generations) as their negative control."""
 import json
+import mmap
 import os
 import struct
 import sys
@@ -25,8 +38,13 @@ sys.path.insert(0, str(HERE))
 
 from isaac_bridge import abplus_lean as AL   # noqa: E402
 from isaac_bridge import tok_obs as TO   # noqa: E402
+from isaac_bridge import tok_sampler as TS   # noqa: E402
+from isaac_bridge import tok_teacher2 as T2   # noqa: E402
 from isaac_bridge import visible_producer as VP   # noqa: E402
-from isaac_bridge.tok_obs import ROW, ROW_FRAME_AT   # noqa: E402
+from isaac_bridge.tok_obs import FRAME_W, ROW, ROW_FRAME_AT   # noqa: E402
+
+FORK = pytest.mark.skipif(not hasattr(os, 'fork'), reason='os.fork / shared memory: Linux')
+FIELDS = [n for n in ROW.names if n != 'visible_frame']
 
 
 def _raw():
@@ -35,16 +53,22 @@ def _raw():
 
 
 def real_rows(n, seed=0):
-    """n ROW records encode_row wrote from synthetic v3 lean payloads (test_fast_row_v9's world), entities varied."""
+    """n ROW records encode_row wrote from synthetic v3 lean payloads (test_fast_row_v9's world): lean entities varied,
+    and the v3 frames' entities too (frames of 15-25 KB, each length different)."""
     import test_obs_v2_smoke as V
     old = VP.VISIBLE_V3_MODE
     VP.VISIBLE_V3_MODE = 2
     try:
-        frame = VP.observation_frame_v3(_raw())
+        raw = _raw()
+        frames = {}
         rng = np.random.default_rng(seed)
         rows = np.zeros(n, ROW)
         dec, st = AL.LeanDecoder(), TO.EpisodeState(10 ** 6, floor=True, stall=6)
         for k in range(n):
+            ne = int(rng.integers(1, 40))
+            if ne not in frames:
+                frames[ne] = VP.observation_frame_v3(dict(raw, entities=[raw['entities'][0]] * ne))
+            frame = frames[ne]
             p, d, e, room = V.world(0)
             e = np.resize(e, int(rng.integers(1, 40)))
             p['x'] = 300.0 + 2.0 * k
@@ -70,7 +94,8 @@ def stale_ring(shape, seed=1):
     ring = np.zeros(shape, ROW)
     raw = ring.view(np.uint8).reshape(-1, ROW.itemsize)
     raw[:] = rng.integers(0, 256, raw.shape, dtype=np.uint8)
-    ring['visible_bytes'] = ROW.itemsize - ROW_FRAME_AT
+    ring['visible_bytes'] = FRAME_W
+    ring['visible_schema'] = 3
     return ring
 
 
@@ -82,11 +107,8 @@ def put_take(rows, compact, monkeypatch, ring_shape=(1, 8)):
     for j in range(len(rows)):
         slot = j % ring_shape[1]
         TO.ring_put(ring[0, slot:slot + 1], rows[j:j + 1])
-        raw[j] = np.frombuffer(TO.ring_take(ring[0, slot:slot + 1]).tobytes(), np.uint8)
+        raw[j] = np.frombuffer(TO.ring_take(ring, 0, slot).tobytes(), np.uint8)
     return out
-
-
-FIELDS = [n for n in ROW.names if n != 'visible_frame']
 
 
 def same_fields(x, y, k):
@@ -95,12 +117,9 @@ def same_fields(x, y, k):
 
 
 def test_a_records_taken_are_the_same_up_to_their_frame_end(monkeypatch):
-    """Every field and the frame up to visible_bytes: the same. Not the same, by design: (1) past visible_bytes the
-    whole-slot copy has the slot's stale bytes, compact mode zeros; (2) the dtype's alignment padding between fields:
-    the whole-slot write is a structured assignment (fields only: the slot keeps stale padding, as before this
-    change), the compact write copies the record's bytes (its own padding). No reader reads either (the consumers
-    below give the same results)."""
+    """Every field and the frame up to visible_bytes: the same, on real v3 frames of different lengths."""
     rows = real_rows(24)
+    assert len(set(int(v) for v in rows['visible_bytes'])) > 5   # (frames of different lengths)
     whole = put_take(rows, False, monkeypatch)
     comp = put_take(rows, True, monkeypatch)
     bw, bc = whole.view(np.uint8).reshape(len(rows), -1), comp.view(np.uint8).reshape(len(rows), -1)
@@ -130,54 +149,307 @@ def test_a_records_taken_are_the_same_up_to_their_frame_end(monkeypatch):
             assert type(a) is type(b), k
 
 
-def test_b_full_wrapped_and_lagging_readers(monkeypatch):
-    """The sampler's readers on stand-ins: 3 workers, rings of 8, writes 5 / 8 / 21 (the last wrapped twice); the
-    reader called after each batch of writes and once after falling behind by more than the ring."""
-    from isaac_bridge import tok_sampler as TS
+def test_b_lengths_checked_against_the_frame_field(monkeypatch):
+    """No frame: the record ends at the frame (a reused slot's visible_bytes ignored). A frame: [0, 131,072] taken,
+    anything else refused, by the writer and the reader alike; the sampler's reader counts and skips it."""
+    assert FRAME_W == 131072
+    r = np.zeros(1, ROW)
+    for schema, vb, want in ((0, 0, ROW_FRAME_AT), (0, 9999, ROW_FRAME_AT), (0, -5, ROW_FRAME_AT),
+                             (3, 0, ROW_FRAME_AT), (3, 14000, ROW_FRAME_AT + 14000), (3, FRAME_W, ROW_FRAME_AT + FRAME_W)):
+        r['visible_schema'], r['visible_bytes'] = schema, vb
+        assert TO.row_frame_end(r) == want, (schema, vb)
+    for vb in (-1, FRAME_W + 1, FRAME_W + 4, 2 ** 31 - 1):
+        r['visible_schema'], r['visible_bytes'] = 3, vb
+        with pytest.raises(ValueError):
+            TO.row_frame_end(r)
+    monkeypatch.setattr(TO, 'RING_COMPACT', True)
+    ring = stale_ring((1, 2))
+    with pytest.raises(ValueError):
+        TO.ring_put(ring[0, 0:1], r)
+    with pytest.raises(ValueError):   # (the stale slot's own length is good; this one's is not)
+        ring['visible_bytes'][0, 1] = -7
+        TO.ring_take(ring, 0, 1)
+    # the reader: a published record with a bad length counted (ring_teach_bad) and skipped, the next one taken
+    S = stand_in(1, 4, 4, np.zeros)
+    for c, vb in enumerate((100, FRAME_W + 1, 200)):
+        write_record(S, 'teach', 0, c, frame_len=vb)
+    S.stats[0, TS.ST['teach']] = 3
+    monkeypatch.setattr(TS, 'TEACH_RING', 4)
+    rows, meta = TS.TokSampler.teacher_records(S)
+    assert [int(x) for x in meta[:, 0]] == [rid(0, 0), rid(0, 2)]
+    assert S.ring_skips['teach_bad'] == 1 and S.ring_skips['teach_torn'] == 0
+
+
+# ---------------------------------------------------------------- stand-in samplers and the workers' writer protocol
+def rid(w, c):
+    return 1 + w * 100000 + c
+
+
+def frame_of(ident, n):
+    return ((np.arange(n, dtype=np.int64) * (ident % 7 + 1) + ident) % 251 + 1).astype(np.uint8)
+
+
+def frame_len_of(ident):
+    return 9000 + (ident * 7919) % 30000
+
+
+def shared_zeros(shape, dtype):
+    """An array in anonymous shared memory (MAP_SHARED: a forked child writes the parent's pages)."""
+    n = int(np.prod(shape)) * np.dtype(dtype).itemsize
+    buf = mmap.mmap(-1, max(n, 1)) if hasattr(os, 'fork') else bytearray(max(n, 1))
+    return np.frombuffer(buf, dtype, count=int(np.prod(shape))).reshape(shape)
+
+
+def stand_in(W, RT, RV, alloc):
+    """The sampler's ring state as the readers see it (TokSampler.teacher_records / v2_records, called unbound)."""
     from isaac_bridge.tok_teacher2 import V2_META
-    rows = real_rows(30, seed=3)
-    for compact in (False, True):
-        monkeypatch.setattr(TO, 'RING_COMPACT', compact)
-        monkeypatch.setattr(TS, 'TEACH_RING', 8)
-        W, R = 3, 8
-        S = types.SimpleNamespace(cfg=types.SimpleNamespace(workers=W, memory_dim=0),
-                                  stats=np.zeros((W, len(TS.STATS))), teach_rows=stale_ring((W, R)),
-                                  teach_meta=np.zeros((W, R, TS.TEACH_META), np.int32), teach_seen=np.zeros(W, np.int64),
-                                  v2_rows=stale_ring((W, R)), v2_meta=np.zeros((W, R, V2_META)), v2_t=None, v2_h=None,
-                                  v2_seen=np.zeros(W, np.int64))
-        got_t = []
-        written = [0, 0, 0]
-        for burst in ((5, 8, 9), (0, 0, 12)):   # (the second: worker 2 falls 12 > 8 behind its last read)
-            for w, k in enumerate(burst):
-                for _ in range(k):
-                    c = written[w]
-                    src = rows[(w * 7 + c) % len(rows):(w * 7 + c) % len(rows) + 1]
-                    slot = c % R
-                    S.teach_rows[w, slot:slot + 1] = src   # (the floor worker encodes in place: the same bytes)
-                    TO.ring_put(S.v2_rows[w, slot:slot + 1], src)
-                    written[w] += 1
-                S.stats[w, TS.ST['teach']] = written[w]
-                S.stats[w, TS.ST['v2_records']] = written[w]
-            import isaac_bridge.tok_teacher2 as T2
-            monkeypatch.setattr(T2, 'V2_RING', R)
-            tr, _ = TS.TokSampler.teacher_records(S)
-            vr, _ = TS.TokSampler.v2_records(S)
-            got_t.append((tr, vr))
-        # a reader sees at most the last R of each worker's writes since its last read
-        flat_t = np.concatenate([g[0] for g in got_t])
-        flat_v = np.concatenate([g[1] for g in got_t])
-        assert len(flat_t) == len(flat_v) == 5 + 8 + 8 + 8   # (worker 2: 8 of its 9, then 8 of its 12)
-        for a, b in zip(flat_t, flat_v):
-            n = TO.row_frame_end(a.reshape(1))
-            assert all(a[f].tobytes() == b[f].tobytes() for f in FIELDS)
-            assert a.tobytes()[ROW_FRAME_AT:n] == b.tobytes()[ROW_FRAME_AT:n]
-            if compact:   # (the frame past visible_bytes; not the dtype's padding: the readers' np.stack leaves
-                #            that uninitialised in both modes, as before this change, and no reader reads it)
-                assert not np.frombuffer(b['visible_frame'].tobytes()[n - ROW_FRAME_AT:], np.uint8).any()
+    return types.SimpleNamespace(
+        cfg=types.SimpleNamespace(workers=W, memory_dim=0), stats=alloc((W, len(TS.STATS)), np.float64),
+        teach_rows=alloc((W, RT), ROW), teach_meta=alloc((W, RT, TS.TEACH_META), np.int32),
+        teach_gen=alloc((W, RT), np.int64), teach_seen=np.zeros(W, np.int64),
+        v2_rows=alloc((W, RV), ROW), v2_meta=alloc((W, RV, V2_META), np.float64), v2_gen=alloc((W, RV), np.int64),
+        v2_t=None, v2_h=None, v2_seen=np.zeros(W, np.int64), ring_skips=dict.fromkeys(TS.RING_SKIPS, 0))
 
 
-@pytest.mark.skipif(not hasattr(os, 'fork'), reason='os.fork / shared memory: Linux')
-def test_c_another_process_writes_and_the_tail_stays_unresident(monkeypatch):
+def write_record(S, kind, w, c, frame_len=None, gens=True, hook=None):
+    """Record c of worker w into its ring as the workers write it (tok_floor.ring_write / the teacher's encode):
+    ring_open, the ROW (ring_put), the meta, ring_publish; its id in episode and meta[0], a frame of its own (length
+    frame_len_of(id) unless given) -- everything a reader takes is checkable against the id alone. The count is the
+    caller's (the worker raises it after the record is published). hook(stage): between the parts (tests)."""
+    rows, meta, gen = ((S.teach_rows, S.teach_meta, S.teach_gen) if kind == 'teach' else
+                       (S.v2_rows, S.v2_meta, S.v2_gen))
+    R = rows.shape[1]
+    slot, ident = c % R, rid(w, c)
+    n = frame_len_of(ident) if frame_len is None else frame_len
+    src = np.zeros(1, ROW)
+    src['episode'], src['t'], src['visible_schema'], src['visible_bytes'] = ident, c, 3, n
+    if 0 <= n <= FRAME_W:
+        src['visible_frame'][0, :n] = frame_of(ident, n)
+    if gens:
+        TS.ring_open(gen, w, slot, c)
+    if 0 <= n <= FRAME_W or not TO.RING_COMPACT:
+        TO.ring_put(rows[w, slot:slot + 1], src)
+    else:   # (a bad length: written as is, bytes past the frame field not, for the reader's check)
+        rows[w, slot:slot + 1].view(np.uint8).reshape(-1)[:ROW_FRAME_AT] = src.view(np.uint8)[:ROW_FRAME_AT]
+    if hook:
+        hook('row')
+    meta[w, slot] = 0
+    meta[w, slot, 0] = ident
+    if gens:
+        TS.ring_publish(gen, w, slot, c)
+
+
+def check_whole(row, meta_row):
+    """A record taken is one record whole: its id in episode and meta, its frame that id's, zeros past it."""
+    ident = int(row['episode'])
+    n = int(row['visible_bytes'])
+    frame = np.frombuffer(row['visible_frame'].tobytes(), np.uint8)
+    assert int(meta_row[0]) == ident, ('meta of another record', ident, int(meta_row[0]))
+    assert n == frame_len_of(ident), ('length of another record', ident, n)
+    assert frame[:n].tobytes() == frame_of(ident, n).tobytes(), ('frame of another record', ident)
+    return ident
+
+
+def take(S, kind):
+    return (TS.TokSampler.teacher_records(S) if kind == 'teach' else TS.TokSampler.v2_records(S))[:2]
+
+
+@pytest.mark.parametrize('compact', (False, True))
+def test_c_full_wrapped_and_lagging_readers(monkeypatch, compact):
+    """3 workers, rings of 8; bursts (5, 8, 9) then (0, 0, 12): worker 2 falls 1, then 4 records behind (9 and 12
+    written, 8 kept). Both readers take exactly the last <= 8 of each worker's writes since its last read, each one
+    whole; the others are counted lapped."""
+    monkeypatch.setattr(TO, 'RING_COMPACT', compact)
+    monkeypatch.setattr(TS, 'TEACH_RING', 8)
+    monkeypatch.setattr(T2, 'V2_RING', 8)
+    W, R = 3, 8
+    S = stand_in(W, R, R, lambda shape, dt: (stale_ring(shape) if dt == ROW else np.zeros(shape, dt)))
+    written = [0] * W
+    for burst in ((5, 8, 9), (0, 0, 12)):
+        since = list(written)
+        for w, k in enumerate(burst):
+            for _ in range(k):
+                for kind in ('teach', 'v2'):
+                    write_record(S, kind, w, written[w])
+                written[w] += 1
+            S.stats[w, TS.ST['teach']] = S.stats[w, TS.ST['v2_records']] = written[w]
+        want = [rid(w, c) for w in range(W) for c in range(max(since[w], written[w] - R), written[w])]
+        for kind in ('teach', 'v2'):
+            rows, meta = take(S, kind)
+            got = [check_whole(rows[j], meta[j]) for j in range(len(rows))]
+            assert got == want, (kind, got, want)
+            if compact:   # (the frame past visible_bytes: zeros; not the dtype's padding, np.stack's)
+                assert all(not rows[j]['visible_frame'][int(rows[j]['visible_bytes']):].any() for j in range(len(rows)))
+    assert S.ring_skips['teach_lapped'] == S.ring_skips['v2_lapped'] == (9 - 8) + (12 - 8)
+    assert S.ring_skips['teach_torn'] == S.ring_skips['v2_torn'] == 0
+
+
+# ---------------------------------------------------------------- (d) forced interleavings, a forked writer
+class ForkWriter:
+    """A child process that writes record (kind, w, c) into the shared rings on request, then answers (the worker);
+    the parent reads (the trainer). gens False: the writer keeps no generations (the reader as before this check)."""
+
+    def __init__(self, S, gens=True):
+        self.S = S
+        self.req_r, self.req_w = os.pipe()
+        self.ans_r, self.ans_w = os.pipe()
+        self.pid = os.fork()
+        if self.pid == 0:
+            code = 1
+            try:
+                os.close(self.req_w)
+                os.close(self.ans_r)
+                f = os.fdopen(self.req_r, 'rb')
+                while True:
+                    line = f.readline()
+                    if not line:
+                        break
+                    kind, w, c = line.split()
+                    w, c = int(w), int(c)
+                    write_record(S, kind.decode(), w, c, gens=gens)
+                    S.stats[w, TS.ST['teach' if kind == b'teach' else 'v2_records']] = c + 1
+                    os.write(self.ans_w, b'k')
+                code = 0
+            finally:
+                os._exit(code)
+        os.close(self.req_r)
+        os.close(self.ans_w)
+
+    def write(self, kind, w, c):
+        os.write(self.req_w, f'{kind} {w} {c}\n'.encode())
+        assert os.read(self.ans_r, 1) == b'k'
+
+    def close(self):
+        os.close(self.req_w)
+        _, status = os.waitpid(self.pid, 0)
+        os.close(self.ans_r)
+        assert os.waitstatus_to_exitcode(status) == 0
+
+
+INTERLEAVINGS = [('teach', 'after_length', True), ('v2', 'after_length', True),
+                 ('teach', 'after_row', False), ('teach', 'after_row', True),
+                 ('v2', 'after_row', False), ('v2', 'after_row', True)]
+
+
+def interleave(monkeypatch, kind, point, compact, gens):
+    """Record 0 published; the reader starts on it; at `point` the writer (another process) publishes record R in
+    the same slot, whole, before the reader goes on. What the reader returns, and its counters."""
+    monkeypatch.setattr(TO, 'RING_COMPACT', compact)
+    R = 4
+    monkeypatch.setattr(TS, 'TEACH_RING', R)
+    monkeypatch.setattr(T2, 'V2_RING', R)
+    S = stand_in(1, R, R, shared_zeros)
+    child = ForkWriter(S, gens=gens)
+    try:
+        child.write(kind, 0, 0)
+        if not gens:   # (the negative control: the reader's generations say record 0, as nothing changes them)
+            (S.teach_gen if kind == 'teach' else S.v2_gen)[0, 0] = 1
+        S.stats[0, TS.ST['teach' if kind == 'teach' else 'v2_records']] = 1   # (the reader's count snapshot: 1)
+        fired = []
+
+        def fire():
+            if not fired:
+                fired.append(1)
+                child.write(kind, 0, R)   # (record R: slot 0 again, a longer frame of its own)
+        if point == 'after_length':
+            orig = TO.row_frame_end
+
+            def after_length(row1):
+                n = orig(row1)
+                fire()
+                return n
+            monkeypatch.setattr(TO, 'row_frame_end', after_length)
+        else:
+            orig_take = TS.ring_take
+
+            def after_row(ring, i, slot):
+                got = orig_take(ring, i, slot)
+                fire()
+                return got
+            monkeypatch.setattr(TS, 'ring_take', after_row)
+        rows, meta = take(S, kind)   # (its count snapshot: 1, record R not yet written)
+        assert fired, 'the interleaving never happened'
+        return rows, meta, S.ring_skips
+    finally:
+        monkeypatch.undo()
+        child.close()
+
+
+@FORK
+@pytest.mark.parametrize('kind,point,compact', INTERLEAVINGS)
+def test_d_slot_reused_while_read_older_record_whole_or_dropped(monkeypatch, kind, point, compact):
+    """Codex round 25's case (the compact read took the old length, then the new record's bytes): with the slots'
+    generations the record is dropped and counted, never taken as a mix."""
+    rows, meta, sk = interleave(monkeypatch, kind, point, compact, gens=True)
+    for j in range(len(rows)):
+        assert check_whole(rows[j], meta[j]) == rid(0, 0)   # (only ever the older record, whole)
+    assert len(rows) == 0 and sk[f'{kind}_torn'] == 1
+
+
+@FORK
+@pytest.mark.parametrize('kind,point,compact', INTERLEAVINGS)
+def test_d_negative_control_without_generations_a_mix_is_taken(monkeypatch, kind, point, compact):
+    """The same interleavings with the generations not kept (the readers as in 6aca452): a record that is not one
+    record whole is taken -- the check in test_d above is what refuses it."""
+    rows, meta, sk = interleave(monkeypatch, kind, point, compact, gens=False)
+    assert len(rows) == 1
+    with pytest.raises(AssertionError):
+        check_whole(rows[0], meta[0])
+
+
+# ---------------------------------------------------------------- (e) a writer that never waits
+@FORK
+@pytest.mark.parametrize('compact', (False, True))
+def test_e_concurrent_writer_every_record_taken_is_whole(monkeypatch, compact):
+    """A forked writer writes 3000 records per ring (2 workers, rings of 8: it laps the reader over and over) while
+    the parent reads with the sampler's readers as fast as it can: each record taken is one record whole, in order,
+    and taken + lapped + torn = written."""
+    monkeypatch.setattr(TO, 'RING_COMPACT', compact)
+    W, R, N = 2, 8, 3000
+    monkeypatch.setattr(TS, 'TEACH_RING', R)
+    monkeypatch.setattr(T2, 'V2_RING', R)
+    S = stand_in(W, R, R, shared_zeros)
+    done = shared_zeros((1,), np.int64)
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            for c in range(N):
+                for w in range(W):
+                    for kind, st in (('teach', 'teach'), ('v2', 'v2_records')):
+                        write_record(S, kind, w, c)
+                        S.stats[w, TS.ST[st]] = c + 1
+            done[0] = 1
+            code = 0
+        finally:
+            os._exit(code)
+    taken = {('teach', w): [] for w in range(W)}
+    taken.update({('v2', w): [] for w in range(W)})
+    try:
+        while True:
+            last = int(done[0])
+            for kind in ('teach', 'v2'):
+                rows, meta = take(S, kind)
+                for j in range(len(rows)):
+                    ident = check_whole(rows[j], meta[j])
+                    taken[(kind, (ident - 1) // 100000)].append(ident)
+            if last:
+                break
+    finally:
+        _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+    for (kind, w), ids in taken.items():
+        assert ids == sorted(ids) and len(set(ids)) == len(ids), (kind, w)
+    sk = S.ring_skips
+    for kind in ('teach', 'v2'):
+        n_taken = sum(len(v) for (k, _), v in taken.items() if k == kind)
+        assert n_taken + sk[f'{kind}_lapped'] + sk[f'{kind}_torn'] == W * N, (kind, n_taken, sk)
+        assert n_taken > 0
+
+
+# ---------------------------------------------------------------- (f) resident pages
+@FORK
+def test_f_another_process_writes_and_the_tail_stays_unresident(monkeypatch):
     """A writer in a forked child (as a worker), the reader here (as the trainer): the same records; and the ring's
     shared-memory pages resident after a full read: compact mode leaves the frame budget's tail out."""
     from multiprocessing import shared_memory
@@ -191,14 +463,17 @@ def test_c_another_process_writes_and_the_tail_stays_unresident(monkeypatch):
             ring = np.ndarray((W, R), ROW, buffer=shm.buf)
             pid = os.fork()
             if pid == 0:
+                code = 1
                 try:
                     for w in range(W):
                         for j in range(R):
                             TO.ring_put(ring[w, j:j + 1], rows[j:j + 1])
+                    code = 0
                 finally:
-                    os._exit(0)
-            os.waitpid(pid, 0)
-            taken = [TO.ring_take(ring[w, j:j + 1]) for w in range(W) for j in range(R)]
+                    os._exit(code)
+            _, status = os.waitpid(pid, 0)
+            assert os.waitstatus_to_exitcode(status) == 0
+            taken = [TO.ring_take(ring, w, j) for w in range(W) for j in range(R)]
             for i, a in enumerate(taken):
                 src = rows[i % R:i % R + 1]
                 n = TO.row_frame_end(src)
@@ -221,3 +496,15 @@ def test_c_another_process_writes_and_the_tail_stays_unresident(monkeypatch):
     full_kb = ROW.itemsize * W * R // 1024
     assert res[False] >= 0.9 * full_kb, res         # whole slots: every page resident
     assert res[True] <= 0.5 * full_kb, res           # compact: the frame budget's tail never touched
+
+
+def test_g_workers_refuse_another_ring_mode(monkeypatch):
+    """The trainer's ISAAC_RL_RING_COMPACT in cfg; a worker with another refuses to start; -1 (unset): no check."""
+    cfg = types.SimpleNamespace(ring_compact=1)
+    monkeypatch.setattr(TO, 'RING_COMPACT', False)
+    with pytest.raises(RuntimeError):
+        TS.check_ring_mode(cfg)
+    monkeypatch.setattr(TO, 'RING_COMPACT', True)
+    TS.check_ring_mode(cfg)
+    TS.check_ring_mode(types.SimpleNamespace(ring_compact=-1))
+    TS.check_ring_mode(types.SimpleNamespace())
