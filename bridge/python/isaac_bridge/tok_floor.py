@@ -364,6 +364,33 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     # reconciles them with the rollouts handed to the learner (--dump-rollouts)
     audit = None
     main_value = main_vg = cf_snap = None   # (set below when the lanes / the counterfactual teacher are on)
+    # (P-driver-design 15, the CPU ledger: a diagnostic, off unless set) ISAAC_WORKER_PROF=<dir>[:<seconds>]: worker 0's
+    # main loop under the standard library's cProfile for that many seconds of records (default 60), its stats to
+    # <dir>/worker0.pstats and worker0.txt (by own time and by cumulative time)
+    wprof = None
+    if index == 0 and os.environ.get('ISAAC_WORKER_PROF'):
+        import cProfile as cProfile_
+        wp_dir, _, wp_s = os.environ['ISAAC_WORKER_PROF'].partition(':')
+        wprof = dict(p=cProfile_.Profile(), dir=wp_dir, s=float(wp_s or 60), t=None, n=0)
+
+    def wprof_tick():
+        nonlocal wprof
+        now_ = time.perf_counter()
+        if wprof['t'] is None:
+            wprof['t'] = now_
+            wprof['p'].enable()
+            return
+        wprof['n'] += 1
+        if now_ - wprof['t'] >= wprof['s']:
+            wprof['p'].disable()
+            import pstats as pstats_
+            wprof['p'].dump_stats(os.path.join(wprof['dir'], 'worker0.pstats'))
+            with open(os.path.join(wprof['dir'], 'worker0.txt'), 'w') as f_:
+                f_.write(f'worker 0: {wprof["n"]} records in {now_ - wprof["t"]:.1f} s under cProfile' + chr(10))
+                ps_ = pstats_.Stats(wprof['p'], stream=f_)
+                ps_.sort_stats('tottime').print_stats(45)
+                ps_.sort_stats('cumulative').print_stats(45)
+            wprof = None
     if os.environ.get('ISAAC_TOK_AUDIT'):
         import pickle as pickle_
         from .tok_obs import ROW as ROW_
@@ -1853,6 +1880,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 bped_row[:len(bped)] = bped
             try:
                 while True:
+                    if wprof is not None:
+                        wprof_tick()
                     t0 = time.perf_counter()
                     row = slots[t_ep & 1]
                     inv_before = st.inv_counts   # (branches: a record that gains an item replaces the dict)

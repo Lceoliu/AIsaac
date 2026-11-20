@@ -48,7 +48,7 @@ def stat_of(path):
     r = s.rfind(')')
     f = s[r + 2:].split()
     return dict(comm=s[s.find('(') + 1:r], state=f[0], ppid=int(f[1]), ticks=int(f[11]) + int(f[12]),
-                cpu=int(f[36]) if len(f) > 36 else -1)
+                cpu=int(f[36]) if len(f) > 36 else -1, cticks=int(f[13]) + int(f[14]))
 
 
 def cpu_stat():
@@ -59,7 +59,7 @@ def cpu_stat():
             f = line.split()
             v = [int(x) for x in f[1:]]
             idle = v[3] + (v[4] if len(v) > 4 else 0)
-            out[int(f[0][3:])] = (sum(v[:8]) - idle, sum(v[:8]))
+            out[int(f[0][3:])] = (sum(v[:8]) - idle, sum(v[:8]), v[0] + v[1], v[2], v[5] + v[6])
     return out
 
 
@@ -175,6 +175,8 @@ def main():
     kinds = {}           # pid -> its kind once known
     per_tid = {}         # (pid, tid) -> [ticks in the window, kind, comm, last cpu]
     per_proc = {}        # pid -> [ticks in the window, kind, comm, parent]
+    child_acc = {}       # kind -> reaped children's ticks within the window (cutime + cstime: short-lived forks)
+    clast = {}           # pid -> cticks
     cs0 = cs1 = None
     procs_seen = {}      # pid -> (kind, comm)
     last = {}            # (pid, tid) -> ticks
@@ -211,6 +213,10 @@ def main():
                 kind = 'other'
             if kind == 'learner':
                 kinds[pid] = kind   # (fixed once its CUDA threads exist; a python process without them re-checked)
+            cp_ = clast.get(pid)
+            clast[pid] = st['cticks']
+            if open_ and cp_ is not None and st['cticks'] > cp_:
+                child_acc[kind] = child_acc.get(kind, 0) + st['cticks'] - cp_
             try:
                 tids = os.listdir(f'/proc/{pid}/task')
             except OSError:
@@ -288,12 +294,15 @@ def main():
             cpu_list += list(range(int(lo), int(hi) + 1))
         elif part:
             cpu_list.append(int(part))
-    per_cpu = {}
+    per_cpu, kern = {}, dict(user=0.0, system=0.0, irq_softirq=0.0)
     if cs0:
         for c in cpu_list:
-            b0, a0 = cs0.get(c, (0, 0))
-            b1, a1 = cs1.get(c, (0, 0))
-            per_cpu[c] = round((b1 - b0) / max(a1 - a0, 1), 3)
+            x0, x1 = cs0.get(c, (0, 0, 0, 0, 0)), cs1.get(c, (0, 0, 0, 0, 0))
+            per_cpu[c] = round((x1[0] - x0[0]) / max(x1[1] - x0[1], 1), 3)
+            kern['user'] += (x1[2] - x0[2]) / CLK / win if win else 0
+            kern['system'] += (x1[3] - x0[3]) / CLK / win if win else 0
+            kern['irq_softirq'] += (x1[4] - x0[4]) / CLK / win if win else 0
+    kern = {k: round(v, 3) for k, v in kern.items()}
     cores_ = {}
     for c in cpu_list:
         cores_.setdefault(siblings(c), []).append(per_cpu.get(c))
@@ -308,6 +317,8 @@ def main():
             work.append(dict(pid=pid, worker_cores=round(v[0] / CLK / win, 3) if win else None,
                              game_cores=round(g_ / CLK / win, 3) if win else None, cpus=allowed(pid)))
     out = dict(match=a.match, trainer_pid=root, processes=nk, per_cpu_busy=per_cpu,
+               lane_cpu_by_mode_cores=kern,
+               reaped_children_cores={k: round(v / CLK / win, 3) if win else None for k, v in child_acc.items()},
                per_physical_core={k: v for k, v in cores_.items()},
                top_threads=top_threads, workers=sorted(work, key=lambda d: -(d['worker_cores'] or 0)),
                window_s=round(win, 1), updates=[a.from_update, a.to_update], cpus=cpus, capacity=cap,
