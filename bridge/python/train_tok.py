@@ -1718,6 +1718,52 @@ def hand_off(roll, mirror, device, streams):
     return view, ev, nbytes
 
 
+def end_learner_process(learner, results, failure, L, wait_s=900.0, join_s=60.0, kill_s=10.0):
+    """(B38 step 2) the trainer's end of the learner process: its last messages ('error': a failure; 'done': its last
+    update saved, last.pt written), then its exit. (2026-11-20, Codex round 19: a run succeeds only with the 'done'
+    message AND exit code 0 -- before, a learner killed after its last fresh weights and before last.pt (exit code -9,
+    no 'done') left failure empty and the run 'finished' with rc 0.) A learner still alive join_s after its last
+    message is killed (it ignores SIGTERM: terminate() alone does not end it) and joined; a missing 'done', a nonzero
+    exit code or a learner that had to be killed is a failure (appended to `failure`). Returns whether 'done' came."""
+    import queue as queue_
+    import time as time_
+    got = False
+    t_lim = time_.perf_counter() + wait_s
+    while time_.perf_counter() < t_lim:
+        try:
+            kind, info = results.get(timeout=1.0)
+        except queue_.Empty:
+            if not learner.is_alive():
+                break
+            continue
+        if kind == 'error':
+            failure.append(RuntimeError('learner process:\n' + info))
+        elif kind == 'done':
+            L.update(update=info['update'], decisions=info['decisions'], seconds=info['seconds'])
+            got = True
+            break
+    learner.join(timeout=join_s)
+    killed = False
+    if learner.is_alive():
+        print('the learner process did not end; killed', flush=True)
+        learner.terminate()
+        learner.join(timeout=kill_s)
+        if learner.is_alive():
+            learner.kill()
+            learner.join(timeout=kill_s)
+        killed = True
+    if killed:
+        failure.append(RuntimeError(f'the learner process did not end {join_s:.0f} s after its last message: killed '
+                                    f'(exit code {learner.exitcode})'))
+    elif not got:
+        failure.append(RuntimeError(f'the learner process ended without its done message (exit code '
+                                    f'{learner.exitcode}): its last update and last.pt may be missing'))
+    elif learner.exitcode != 0:
+        failure.append(RuntimeError(f'the learner process ended with exit code {learner.exitcode} after its done '
+                                    f'message'))
+    return got
+
+
 def weight_mover(actor_params, learner_device):
     """(B38, --learner-device) the state of move_weights: byte views of the actor's parameters and buffers (in place:
     the actor's graphs read them where they are), a byte buffer of their total size on each GPU, a stream on the
@@ -6954,23 +7000,7 @@ def main(argv=None, child=None, actor=None):
         if actor is not None:   # (B38 step 5, a second actor: the first one stops the learner)
             pass
         elif proc:   # B38 step 2: the learner process finishes its update, saves last.pt and says 'done'
-            t_lim = time.perf_counter() + 900
-            while time.perf_counter() < t_lim:
-                try:
-                    kind, info = results.get(timeout=1.0)
-                except queue.Empty:
-                    if not learner.is_alive():
-                        break
-                    continue
-                if kind == 'error':
-                    failure.append(RuntimeError('learner process:\n' + info))
-                elif kind == 'done':
-                    L.update(update=info['update'], decisions=info['decisions'], seconds=info['seconds'])
-                    break
-            learner.join(timeout=60)
-            if learner.is_alive():
-                print('the learner process did not end; terminated', flush=True)
-                learner.terminate()
+            end_learner_process(learner, results, failure, L)
             if stop_b is not None:   # (B38 step 5: the learner is done; the second actor ends)
                 stop_b.set()
             torch.cuda.synchronize()
@@ -7016,7 +7046,8 @@ def main(argv=None, child=None, actor=None):
             if actor_b.exitcode not in (0, None) and not failure:   # (2026-11-18: its end checked, not only its join)
                 failure.append(RuntimeError(f'the actor process 1 ended with exit code {actor_b.exitcode}'))
         if actor is None:
-            print('finished', L['update'], 'updates', round(L['decisions'] * hours_per_decision, 1), 'game hours',
+            print('finished' if not failure else 'FAILED', L['update'], 'updates',
+                  round(L['decisions'] * hours_per_decision, 1), 'game hours',
                   round((time.perf_counter() - t_run) / 3600, 2), 'h')
         if prev_int is not None:   # (BM1: the SIGINT held during the shutdown, raised now)
             signal_.signal(signal_.SIGINT, prev_int)
