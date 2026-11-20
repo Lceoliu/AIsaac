@@ -85,7 +85,8 @@ from .abplus import ABP_HOME, FORK_ENV, action_code
 from .abplus_goexplore import GxConfig, Instance
 from .abplus_lean import LeanDecoder, read_lean, read_lean_raw
 from .env import BridgeError
-from .tok_obs import ROW, V3_FRAMES, EpisodeState, FastRow, encode_row, fast_row_function
+from .tok_obs import ROW, V3_FRAMES, EpisodeState, FastRow, encode_row, fast_counts, fast_row_final, fast_row_function
+from . import tok_obs as TO_
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal
 from .visible_producer import fatal_active as VP_fatal_active
 
@@ -180,6 +181,13 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # step the native side handed back: a cancelled lethal hit); tok_obs.V3_FRAMES. (Before A28's two: 184's gate,
          # 2026-11-18 -- test_cf_per_clear.test_plumbing; every reader indexes by name, ST)
          'v3_native', 'v3_reference',
+         # (2026-11-20, the native ROW encoder version 9: tok_obs.fast_counts) this worker's FastRow records so far --
+         # fast (abp_row_encode), slow (decode + encode_row), and the slow ones by abp_row_encode's hand-back: a block
+         # (-2: map / inventory / a changed terrain), a room or floor change (-4 / -5 / -6 / -8), the visible check
+         # (-13), a rewind or the first checkpoint (-11 / -12), the rest (-1 / -3 / -7 / -14; a record never offered)
+         'fr_fast', 'fr_slow', 'fr_slow_block', 'fr_slow_room', 'fr_slow_vis', 'fr_slow_rewind', 'fr_slow_other',
+         # (round 24 C) a check-mode worker's (the canary's) records compared and mismatches
+         'fr_check_records', 'fr_check_mismatch',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
@@ -1137,6 +1145,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
     mine = stats[index]
     slots = (rows[2 * index:2 * index + 1], rows[2 * index + 1:2 * index + 2])
     slot_address = (slots[0].ctypes.data, slots[1].ctypes.data)
+    TO_.configure_worker(index)   # (round 24 C: check mode in a canary worker)
     fast_fn = fast_row_function(row_library(cfg))   # None: LeanDecoder + encode_row as before
     group = cfg.assign[index]
     spec = cfg.specs[group]
@@ -1218,6 +1227,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         episodes_left, episode_n, state_seed = 0, 0, None
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
+            mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()
             if builder.stalled():   # the next start state's build hangs (training went on with the old one)
                 recover('stall')
             # the next start state: when this one has served its episodes and the next is built (training goes on with
@@ -1280,7 +1290,8 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
                 continue
             episode_n += 1
             st, t_ep, waiting, action = EpisodeState(limit, items=cfg.items), 0, False, (0, 0, 0, 0, 0)
-            enc = FastRow(fast_fn, st, decoder, episode_n, state_seed, group) if fast_fn is not None else None
+            enc = FastRow(fast_fn, st, decoder, episode_n, state_seed, group, tag='room') if fast_fn is not None \
+                else None
             item = obs   # the record's observation: a LeanObs, or with FastRow the step's raw payload
             applied, hurts = [], []
             try:
@@ -1349,7 +1360,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
                 episode = None
                 mine[ST['close_s']] += time.perf_counter() - t_close
     except VisibleV3Fatal as exc:
-        if VP_fatal_active():
+        if VP_fatal_active() or getattr(exc, 'always_fatal', False):   # (FastRowFatal too, in any mode)
             v3_fatal = exc
             report_fatal(index, conn, exc, fatal_dir=cfg.fatal_dir)   # (before the cleanup below)
         else:   # (mode 0: an ordinary error, as in 05f1622 -- no exit 86)
@@ -1360,6 +1371,12 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         mine[ST['errors']] += 1000
     finally:
         mine[ST['finished']] = 1
+        try:   # (check mode: this worker's final counts; round 24-2: a failure is the worker's fatal)
+            fast_row_final()
+        except Exception as exc_:   # noqa: BLE001
+            if v3_fatal is None:
+                v3_fatal = exc_
+                report_fatal(index, conn, exc_, fatal_dir=cfg.fatal_dir)
         # killed outright (SIGTERM) or a build still in flight (it may hang): the instance and its clones are killed;
         # otherwise closed as before
         hard = bool(terminated) or (builder is not None and not builder.ready.is_set())
@@ -1750,7 +1767,7 @@ class TokSampler:
         another one if its cleanup failed): self.fatal, with the reason (from the pipe, else the file) or a plain
         statement that none reached the parent."""
         # (mode 0: never, as 05f1622 -- unless --rewind 1: a worker's missing restore count, tok_floor.RewindFatal)
-        if self.fatal is not None or not (VP_fatal_active() or getattr(self.cfg, 'rewind', 0)):
+        if self.fatal is not None or not (VP_fatal_active() or getattr(self.cfg, 'rewind', 0) or TO_.FAST_ROW):
             return
         p = self.procs[i]
         code = p.exitcode

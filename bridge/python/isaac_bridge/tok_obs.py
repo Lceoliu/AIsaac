@@ -832,15 +832,49 @@ def _items_step(st, row, stage, active, charge, events):
 # the common case only (a payload whose terrain block, if any, is the same as the last one); a record it hands back (a
 # map block, a changed terrain block, the episode's first record, a room change, more than ENT_CAP entities, other door
 # records) goes through decode + encode_row here, and the EpisodeState and the decoder are kept in step both ways.
-# ISAAC_RL_FAST_ROW=0 switches it off.
-FAST_ROW = os.environ.get('ISAAC_RL_FAST_ROW', '1') != '0'
+# (2026-11-20, version 9 -- the coordinator: the native ROW encoder for ROW schema 8 back, OFF by default until the
+#  paired runs) ISAAC_RL_FAST_ROW: 0 / unset off (every record through decode + encode_row, as since f3264e0); 1 on;
+#  2 on and checked: every record the fast path takes is also encoded by decode + encode_row on copies of the decoder
+#  and the EpisodeState, the two ROW slots and the states compared byte for byte (FastRow._check).
+FAST_ROW_MODE = os.environ.get('ISAAC_RL_FAST_ROW', '0')
+FAST_ROW = FAST_ROW_MODE in ('1', '2')
+FAST_ROW_CHECKING = FAST_ROW_MODE == '2'   # (this process's: configure_worker sets it in a canary worker)
+# (Codex round 24, C: the canary) ISAAC_RL_FAST_ROW=1 and ISAAC_RL_FAST_ROW_CHECK_WORKERS=<worker indices, e.g. 0>: those
+# workers run check mode (every fast record also through encode_row, a difference stops the run), the others mode 1
+FAST_ROW_CHECK_WORKERS = {int(x) for x in os.environ.get('ISAAC_RL_FAST_ROW_CHECK_WORKERS', '').split(',') if x.strip()}
+
+
+def configure_worker(index):
+    """A sampler worker's FastRow mode, at its start: check mode when ISAAC_RL_FAST_ROW=2, or when the switch is on and
+    the worker is one of ISAAC_RL_FAST_ROW_CHECK_WORKERS (the canary); its reports say which worker it is."""
+    global FAST_ROW_CHECKING
+    _WORKER[0] = int(index)
+    if FAST_ROW and int(index) in FAST_ROW_CHECK_WORKERS:
+        FAST_ROW_CHECKING = True
 _ROW_FIELDS = ('player', 'ent', 'ent_id', 'doors', 'patch', 'grid', 'map', 'n_ent', 'n_doors', 't', 'hurt', 'damage',
                'done', 'bombs', 'events', 'episode', 'seed', 'group', 'first', 'ent_item', 'pcharge', 'pchar',
-               'ent_price', 'phearts', 'room_type')
+               'ent_price', 'phearts', 'room_type', 'rewind', 'visible_schema', 'visible_bytes', 'visible_frame',
+               'stage', 'inv', 'pitem', 'pinv')
 _ROW_OFFS_ITEMS = np.array([ROW.fields[k][1] for k in _ROW_FIELDS], np.int64)
 _ROW_OFFS = _ROW_OFFS_ITEMS.copy()
 _ROW_OFFS[_ROW_FIELDS.index('ent_item')] = -1   # without items abp_row_encode leaves ent_item alone (version 3)
-_ROW_VERSION = 8   # (8: 2026-11-20, the rewind count block, flag 128, handed back: -10) abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
+
+
+def _row_offs(items, run):
+    """abp_row_encode's offs for an episode: ent_item, inv, pitem, pinv written with items only, stage with items or a
+    run (encode_row's _items_step), every other field always."""
+    o = _ROW_OFFS_ITEMS.copy()
+    if not items:
+        for k in ('ent_item', 'inv', 'pitem', 'pinv'):
+            o[_ROW_FIELDS.index(k)] = -1
+    if not (items or run):
+        o[_ROW_FIELDS.index('stage')] = -1
+    return o
+
+
+_ROW_VERSION = 11   # (11: Codex round 24-1: the record before's active compared as a double, bombs < 0 handed back) (10: 2026-11-20, Codex round 23-1: -15, the integer conversions encode_row raises on) (9: 2026-11-20, ROW schema 8: the v3 frame, the rewind count, EV_NOHIT, --stall-progress first,
+#                    _items_step, the ext pointers) (8: 2026-11-20, the rewind count block, flag 128, handed back: -10)
+#                    abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
 #                    2026-10-08, abp-0.2.16's 144-byte entity records and ENT_F = 56; 6: 2026-10-08, abp-0.2.17's
 #                    39-double player record (PlayerType) and pchar; 7: 2026-10-16 (B35), abp-0.2.18's 148-byte entity
 #                    records (price) and ent_price, phearts, room_type)
@@ -850,8 +884,17 @@ _ROW_VERSION = 8   # (8: 2026-11-20, the rewind count block, flag 128, handed ba
 RC_TVERSION = RC_EXITS + 16
 (RC_TSEEN, RC_HURT, RC_EPISODE, RC_SEED, RC_GROUP, RC_FIRST, RC_RUN, RC_ITEMS, RC_STALL_MODE, RC_HAVE_RES,
  RC_PREV_RES) = range(RC_TVERSION + 1, RC_TVERSION + 12)
-RC_COUNT = RC_PREV_RES + 4   # B40 (2026-10-18): RC_STALL_MODE (1: --stall-progress pickups), RC_HAVE_RES, RC_PREV_RES
-#                              .. + 3 (coins, keys, bombs, health units at the record before): abp_turbo.c's RC_COUNT 46
+# B40 (2026-10-18): RC_STALL_MODE (1: --stall-progress pickups), RC_HAVE_RES, RC_PREV_RES .. + 3 (coins, keys, bombs,
+# health units at the record before). Version 9 (abp_turbo.c's comment): the worker's visible mode, the rewind count,
+# the nohit room, --stall-progress first's room keys, _items_step's state; out: a v3 frame written, the state changed
+(RC_VIS, RC_REWIND_ON, RC_RW_HAVE, RC_RW_COUNT, RC_CK_NONE, RC_NOHIT_ON) = range(RC_PREV_RES + 4, RC_PREV_RES + 10)
+RC_NH = RC_NOHIT_ON + 1
+RC_FIRST_MODE = RC_NH + 3
+RC_EVER = RC_FIRST_MODE + 1
+RC_POST = RC_EVER + 3
+(RC_PREV_A_HAVE, RC_PREV_A, RC_PREV_C, RC_PREV_MAXC, RC_MAX_CHARGE, RC_OUT_V3, RC_OUT_DIRTY) = range(RC_POST + 1,
+                                                                                                 RC_POST + 8)
+RC_COUNT = RC_OUT_DIRTY + 1   # abp_turbo.c's RC_COUNT 67
 # player 0's active item and charge, and the room's stage, in a raw lean payload (abplus_lean: header 16, room 48,
 # totals 32, then the player's doubles: active is field 24)
 _PAYLOAD_ACTIVE = struct.Struct('<dd')
@@ -864,54 +907,91 @@ def _address(b):
     return ctypes.cast(ctypes.c_char_p(b), ctypes.c_void_p).value
 
 
+class FastRowFatal(_VP.VisibleV3Fatal):
+    """(2026-11-20, Codex round 23-2) A FastRow failure that must stop the run, never a bad episode to retry: the
+    switch on (ISAAC_RL_FAST_ROW 1 / 2) without a library of this layout, an unknown hand-back code, and in check mode
+    a record the two encoders disagree on (or one the C side took and encode_row refuses), a hand-back that wrote, a
+    report not written. always_fatal: the worker ends with V3_FATAL_EXIT and the trainer fails, in any visible mode."""
+    always_fatal = True
+
+
+# abp_row_encode's hand-back codes (abp_turbo.c; -7: not offered -- no grid / terrain pointers yet); any other
+# negative return is a FastRowFatal
+_KNOWN_CODES = (-1, -2, -3, -4, -5, -6, -7, -8, -11, -12, -13, -14, -15)
+
+
 def fast_row_function(path):
-    """abp_row_encode of the libabp_turbo.so at path (ctypes), None when off, missing or of another layout."""
-    # Native row v7 cannot carry the new complete frame. The native fixed
-    # observation collector remains enabled; only the obsolete row encoder is off.
-    return None
-    if not FAST_ROW or not path or not os.path.isfile(path):
+    """abp_row_encode of the libabp_turbo.so at path (ctypes); None when the switch is off (ISAAC_RL_FAST_ROW unset /
+    0). Switched on (1 / 2) it is required (Codex round 23-2: an explicit feature never degrades silently): a missing
+    library, one of another version / layout, or check mode without ISAAC_RL_FAST_ROW_CHECK_DIR raise FastRowFatal.
+    (f3264e0 to 2026-11-20: always None -- the version 7 encoder could not carry the visible-v3 frame.)"""
+    if not FAST_ROW:
         return None
+    if FAST_ROW_CHECKING and not os.environ.get('ISAAC_RL_FAST_ROW_CHECK_DIR'):
+        raise FastRowFatal('ISAAC_RL_FAST_ROW=2 (check mode) needs ISAAC_RL_FAST_ROW_CHECK_DIR (every process\'s counts)')
+    if not path or not os.path.isfile(path):
+        raise FastRowFatal(f'ISAAC_RL_FAST_ROW={FAST_ROW_MODE} but no libabp_turbo.so at {path!r}')
     if path not in _LIBS:
-        fn = None
+        want = (_ROW_VERSION << 16) | (RC_COUNT << 8) | len(_ROW_FIELDS)
         try:
             lib = ctypes.CDLL(path, mode=getattr(os, 'RTLD_LOCAL', 0))
             version = lib.abp_row_encode_version
             version.restype = ctypes.c_int
-            if version() == (_ROW_VERSION << 16) | (RC_COUNT << 8) | len(_ROW_FIELDS) and ENT_CAP == 64 and \
-                    ENT_F == 56 and ENT_F0 == 33 and PCHARGE_F == 12 and N_CHAR == 32 and PHEART_F == 3 and \
-                    N_ROOM_TYPE == 32 and \
-                    DOOR_CAP == 8 and DOOR_F == 7 and PATCH == 9 and GRID == (7, 16, 28) and MAP == (8, 13, 13):
-                fn = lib.abp_row_encode
-                fn.restype = ctypes.c_int
-                fn.argtypes = [ctypes.c_char_p, ctypes.c_long] + [ctypes.c_void_p] * 7
-        except (OSError, AttributeError):
-            fn = None
+            got = version()
+        except (OSError, AttributeError) as exc:
+            raise FastRowFatal(f'ISAAC_RL_FAST_ROW={FAST_ROW_MODE}: {path} has no abp_row_encode ({exc})') from None
+        if got != want or not (ENT_CAP == 64 and ENT_F == 56 and ENT_F0 == 33 and PCHARGE_F == 12 and N_CHAR == 32 and
+                               PHEART_F == 3 and N_ROOM_TYPE == 32 and N_COLLECTIBLE == 1024 and INV_CAP == 16 and
+                               PINV_F == 12 and ROW.fields['visible_frame'][0].itemsize == 131072 and DOOR_CAP == 8
+                               and DOOR_F == 7 and PATCH == 9 and GRID == (7, 16, 28) and MAP == (8, 13, 13)):
+            raise FastRowFatal(f'ISAAC_RL_FAST_ROW={FAST_ROW_MODE}: {path} is abp_row_encode layout {got:#x}, this '
+                               f'tree needs {want:#x} (version {_ROW_VERSION}): build the game home from this tree')
+        fn = lib.abp_row_encode
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_char_p, ctypes.c_long] + [ctypes.c_void_p] * 8
         _LIBS[path] = fn
     return _LIBS[path]
-
-
 
 
 class FastRow:
     """One episode's records through abp_row_encode (fn from fast_row_function). encode(item, row, row_address, t):
     item is a raw lean payload (bytes) or a LeanObs; returns the done code like encode_row and sets self.hurt (half
     hearts were lost in the step that led here), self.obs (the LeanObs when the record went through encode_row, else
-    None). Writes episode, seed, group and first too (set_meta)."""
+    None). Writes episode, seed, group and first too (set_meta).
+    (Version 9, 2026-11-20) the EpisodeState is brought up to date from the C side's slots before a record goes through
+    encode_row and after a fast record that changed it (RC_OUT_DIRTY: the rewind count, the nohit room, the first-mode
+    keys, the active item's state); st.inv_gain (read only inside encode_row, reset by _inventory) is not kept.
+    tag: where the episode is played ('start' / 'archive' -- a main episode's fresh or archive start --, 'branch' -- a
+    branch point's --, 'lab', 'cf' / 'teacher' -- a cf / teacher v2 branch (tok_teacher2.play_branch) --, 'room'), for
+    check mode's boundary counts."""
 
-    def __init__(self, fn, st, decoder, episode=0, seed=0, group=0):
+    def __init__(self, fn, st, decoder, episode=0, seed=0, group=0, tag='main'):
         self.fn, self.st, self.decoder = fn, st, decoder
+        self.tag = tag if tag in _TAGS else 'other'
         self.ctx = np.zeros(RC_COUNT, np.float64)
         self._ctx_p = self.ctx.ctypes.data
-        self._offs_p = (_ROW_OFFS_ITEMS if st.items else _ROW_OFFS).ctypes.data
-        self.post = st.items or st.run   # items / run fields written here after abp_row_encode
+        self._offs = _row_offs(st.items, st.run)
+        self._offs_p = self._offs.ctypes.data
         self.refs = np.zeros(4, np.int64)   # the last terrain block's bytes, the door records of the grid: address, length
         self._refs_p = self.refs.ctypes.data
+        # (version 9) _items_step's arrays, written in place by abp_row_encode: inv, pitem, pinv
+        arrs = (st.inv_arr, st.pitem, st.pinv)
+        assert st.inv_arr.dtype == np.int16 and st.inv_arr.shape == (INV_CAP, 2) and st.pitem.dtype == np.int16 and \
+            st.pitem.shape == (6,) and st.pinv.dtype == np.float32 and st.pinv.shape == (PINV_F,) and \
+            all(a.flags['C_CONTIGUOUS'] for a in arrs)
+        self.ext = np.array([a.ctypes.data for a in arrs], np.int64)
+        self._ext_p = self.ext.ctypes.data
         self._keep = (None, None)
         self._ptrs = (None, None, None)
         self.hurt = False
         self.obs = None
         self.fast = self.slow = 0
         self.reasons = {}   # abp_row_encode's hand-back codes: how often
+        self._code = None   # (check mode's boundary counts) this record's hand-back code, payload; the last two paths
+        self._payload = None
+        self._paths = (None, None)
+        self._last_rw = 0
+        self._last_pchar = None
         c = self.ctx
         c[RC_LIMIT], c[RC_FLOOR], c[RC_STALL] = st.limit, float(st.floor), st.stall
         c[RC_STALL_MODE] = float(st.stall_pickups)   # B40
@@ -930,39 +1010,180 @@ class FastRow:
 
     def encode(self, item, row, row_address, t):
         c = self.ctx
-        # (visible-v3: abp_row_encode does not know the v3 frame or raw block -- by the payload's flags; and a worker
-        # configured for v3 sends every record through encode_row, whose check a record without one must meet:
-        # 2026-11-18, Codex rounds 2 / 3)
-        if type(item) is bytes and (_VP.VISIBLE_V3_MODE or _VP.needs_decode(item) or self.st.stall_first):
-            item = self.decoder.decode(item)
+        self._code = None
+        self._payload = item if type(item) is bytes else None
         if type(item) is bytes:
             c[RC_T] = t
             c[RC_FIRST] = t == 0
             g, pd, m = self._ptrs
-            done = self.fn(item, len(item), row_address, self._ctx_p, g, pd, m, self._offs_p, self._refs_p) \
-                if g else -7
+            if FAST_ROW_CHECKING and g:
+                return self._check(item, row, row_address, t)
+            done = self.fn(item, len(item), row_address, self._ctx_p, g, pd, m, self._offs_p, self._refs_p,
+                           self._ext_p) if g else -7
             if done >= 0:
-                self.fast += 1
-                row['rewind'] = 0   # (2026-11-20: the fast path never sees a rewind or a room change; slots are reused)
-                self.hurt = c[RC_HURT] != 0
-                self.obs = None
-                if c[RC_TSEEN]:   # the same terrain block again: the decoder's version follows it
-                    d = self.decoder
-                    d.terrain_version = int(c[RC_TVERSION])
-                    d.terrain['version'] = d.terrain_version
-                if self.post:   # encode_row's _items_step on the payload's values
-                    active, charge = _PAYLOAD_ACTIVE.unpack_from(item, 96 + 8 * 24)
-                    _items_step(self.st, row, _PAYLOAD_STAGE.unpack_from(item, 36)[0], active, charge, 0)
+                self._fast_done(row, item)
                 return done
-            self.reasons[done] = self.reasons.get(done, 0) + 1
+            self._handed(done)
             item = self.decoder.decode(item)
+        else:
+            _bump('slow_obs')
+        return self._slow(item, row, t)
+
+    def _handed(self, done):
+        if done not in _KNOWN_CODES:   # (Codex round 23-2: not a silent hand-back)
+            raise FastRowFatal(f'abp_row_encode returned {done}: not one of its hand-back codes {_KNOWN_CODES}')
+        self._code = done
+        self.reasons[done] = self.reasons.get(done, 0) + 1
+        _bump('slow_%d' % done)
+
+    def _fast_done(self, row, payload):
+        c = self.ctx
+        self.fast += 1
+        _bump('fast')
+        self.hurt = c[RC_HURT] != 0
+        self.obs = None
+        if c[RC_TSEEN]:   # the same terrain block again: the decoder's version follows it
+            d = self.decoder
+            d.terrain_version = int(c[RC_TVERSION])
+            d.terrain['version'] = d.terrain_version
+        if c[RC_OUT_V3]:
+            V3_FRAMES[0] += 1
+        dirty = int(c[RC_OUT_DIRTY])
+        if dirty:
+            self._to_st()
+            for bit, name in ((1, 'fast_rw'), (2, 'fast_nohit_state'), (4, 'fast_first_prog'), (8, 'fast_active_state')):
+                if dirty & bit:
+                    _bump(name)
+        ev = int(row['events'][0])
+        if ev & EV_NOHIT:
+            _bump('fast_ev_nohit')
+        if ev & EV_ACTIVE:
+            _bump('fast_ev_active')
+        if FAST_ROW_CHECKING:
+            self._track(True, row, payload)
+
+    def _slow(self, item, row, t):
         self.slow += 1
+        _bump('slow')
         self._to_st()
         done = encode_row(item, self.st, row, t)
         row['episode'], row['seed'], row['group'], row['first'] = self.meta[0], self.meta[1], self.meta[2], t == 0
         self.hurt = bool(row['hurt'][0] > 0)
         self.obs = item
         self._from_st()
+        if FAST_ROW_CHECKING:
+            self._track(False, row, None)
+        return done
+
+    def _track(self, fast, row, payload):
+        """(check mode; Codex rounds 23 / 24: by the real conditions) how often the boundaries the acceptance asks for
+        were met: a fast record with more than one body; a character change on a fast / a slow record; a raw payload
+        with exactly 64 old entities and the floor's exit tokens (fast) / exactly 65 (handed back, -3); a same-room boss
+        clear on a fast record; a map or inventory block (the payload's flags 8 / 16) on the record right after a
+        rewind; a rewind on a death / a time-limit (cap) / a stall record, apart; fast -> slow -> fast within an episode
+        by where it is played (tag: a fresh start, an archive start, a cf branch, a teacher branch, ...)."""
+        p2, p1 = self._paths
+        if fast and p1 is False and p2 is True:
+            _bump('hit_fsf_' + self.tag)
+        self._paths = (p1, fast)
+        rw = int(row['rewind'][0]) & REWIND_COUNT
+        done = int(row['done'][0])
+        if rw:
+            _bump('hit_rewind')
+            if done == 2:
+                _bump('hit_rewind_death')
+            elif done == 3:
+                _bump('hit_rewind_cap' if int(row['t'][0]) >= self.st.limit else 'hit_rewind_stall')
+        pl = payload if payload is not None else self._payload
+        flags = pl[12] if pl is not None and len(pl) > 12 else 0
+        if self._last_rw and flags & (8 | 16):
+            _bump('hit_block_after_rewind')
+        pc = int(row['pchar'][0])
+        if self._last_pchar is not None and pc != self._last_pchar:
+            _bump('hit_char_change_fast' if fast else 'hit_char_change_slow')
+        if pl is not None and len(pl) >= 16:
+            n_pl, n_dr = pl[13], pl[14]
+            at = 96 + 8 * 39 * n_pl + 16 * n_dr
+            n_ent = struct.unpack_from('<H', pl, at)[0] if len(pl) >= at + 2 else -1
+            exits = self.ctx[RC_N_EXITS] > 0
+            if fast and n_pl > 1:
+                _bump('hit_multi_player')
+            if fast and n_ent == ENT_CAP and exits:
+                _bump('hit_ent64_exit')
+            if not fast and n_ent == ENT_CAP + 1 and exits and self._code == -3:
+                _bump('hit_ent65_exit')
+        if fast and int(row['events'][0]) & EV_BOSS:
+            _bump('hit_boss_clear')
+        self._last_rw, self._last_pchar = rw, pc
+
+    def _check(self, item, row, row_address, t):
+        """(ISAAC_RL_FAST_ROW=2) the record through abp_row_encode and, on copies of the decoder and the EpisodeState
+        as they stand before it, through decode + encode_row; the ROW slots, the done codes, the hurt flags and the
+        states compared. (Codex round 23-2) A difference -- or a record the C side took and encode_row refuses, or a
+        hand-back that changed the ROW, ctx or the EpisodeState's arrays -- is dumped, reported and raised
+        (FastRowFatal: the run stops; never trained on, never retried)."""
+        import copy
+        c = self.ctx
+        self._to_st()
+        ref_st, ref_dec = copy.deepcopy(self.st), copy.deepcopy(self.decoder)
+        raw = row.view(np.uint8).reshape(-1)
+        before = raw.copy()
+        ctx0 = self.ctx.copy()
+        ext0 = [self.st.inv_arr.copy(), self.st.pitem.copy(), self.st.pinv.copy()]
+        g, pd, m = self._ptrs
+        done = self.fn(item, len(item), row_address, self._ctx_p, g, pd, m, self._offs_p, self._refs_p, self._ext_p)
+        if done < 0:   # handed back: nothing may have been written; then encode_row on the real state
+            wrote = [n for n, ok in (('ROW', np.array_equal(raw, before)),
+                                     ('ctx', self.ctx.tobytes() == ctx0.tobytes()),
+                                     ('inventory arrays', all(a.tobytes() == b.tobytes() for a, b in
+                                                              zip(ext0, (self.st.inv_arr, self.st.pitem,
+                                                                         self.st.pinv))))) if not ok]
+            if wrote:
+                _bump('check_mismatch')
+                _check_dump(item, before, raw.copy(), None, t, [f'hand-back {done} wrote ' + ', '.join(wrote)])
+                _check_report(True)
+                raise FastRowFatal(f'FastRow check: abp_row_encode handed record {t} back ({done}) after writing '
+                                   f'{", ".join(wrote)}')
+            self._handed(done)
+            return self._slow(self.decoder.decode(item), row, t)
+        self._fast_done(row, item)
+        self._to_st()
+        got = raw.copy()
+        raw[:] = before
+        v3_counts = list(V3_FRAMES)
+        try:
+            ref_done = encode_row(ref_dec.decode(item), ref_st, row, t)
+            row['episode'], row['seed'], row['group'], row['first'] = self.meta[0], self.meta[1], self.meta[2], t == 0
+            ref_hurt = bool(row['hurt'][0] > 0)
+            want = raw.copy()
+            err = None
+        except Exception as e:   # (encode_row refused a record the fast path took)
+            ref_done, ref_hurt, want, err = None, None, None, f'{type(e).__name__}: {e}'
+        V3_FRAMES[:] = v3_counts
+        raw[:] = got
+        _bump('check_records')
+        bad = []
+        if err is not None:
+            bad.append('encode_row raised: ' + err)
+        else:
+            if not np.array_equal(got, want):
+                a_, b_ = got.view(ROW)[0], want.view(ROW)[0]
+                bad.append('row fields ' + ','.join(k for k in ROW.names if a_[k].tobytes() != b_[k].tobytes()))
+            if ref_done != done:
+                bad.append(f'done {done} vs {ref_done}')
+            if ref_hurt != self.hurt:
+                bad.append(f'hurt {self.hurt} vs {ref_hurt}')
+        sd = _state_diff(self.st, ref_st)
+        if sd:
+            bad.append('state ' + ','.join(sd))
+        if ref_dec.terrain_version != self.decoder.terrain_version:
+            bad.append('decoder terrain_version')
+        if bad:
+            _bump('check_mismatch')
+            _check_dump(item, before, got, want, t, bad)
+            _check_report(True)
+            raise FastRowFatal(f'FastRow check: record {t} of episode {self.meta[0]} ({self.tag}): ' + '; '.join(bad))
+        _check_report()
         return done
 
     def _to_st(self):
@@ -974,6 +1195,21 @@ class FastRow:
             st.progress_t = int(c[RC_PROGRESS])
         if c[RC_HAVE_RES]:   # B40
             st.prev_res = tuple(float(v) for v in c[RC_PREV_RES:RC_PREV_RES + 4])
+        # (version 9)
+        if c[RC_RW_HAVE]:
+            st.rw_count = int(c[RC_RW_COUNT])
+        if st.room is not None:
+            if st.nohit_on:
+                e = st.nohit_rooms.setdefault((st.floor_n, st.room), [False, False, False])
+                e[0], e[1], e[2] = bool(c[RC_NH]), bool(c[RC_NH + 1]), bool(c[RC_NH + 2])
+            if st.stall_first:
+                key = (st.floor_k, st.room)
+                for j, s_ in enumerate((st.ever_rooms, st.ever_cleared, st.ever_hurt)):
+                    if c[RC_EVER + j]:
+                        s_.add(key)
+        if c[RC_PREV_A_HAVE]:
+            st.prev_active = (int(c[RC_PREV_A]), float(c[RC_PREV_C]))
+            st.prev_maxc = int(c[RC_PREV_MAXC])
 
     def _from_st(self):
         c, st = self.ctx, self.st
@@ -992,6 +1228,25 @@ class FastRow:
         c[RC_N_EXITS] = min(len(st.exits), 8)
         for i, (ex, ey) in enumerate(st.exits[:8]):
             c[RC_EXITS + 2 * i], c[RC_EXITS + 2 * i + 1] = ex, ey
+        # (version 9) the worker's visible mode (write_visible), the rewind count, the nohit room, the first-mode keys,
+        # _items_step's state
+        c[RC_VIS] = (1.0 if _VP.VISIBLE_V3_MODE else 0.0) + (2.0 if os.environ.get('ISAAC_NO_VISIBLE') == '1' else 0.0)
+        c[RC_REWIND_ON] = float(st.rewind_on)
+        c[RC_RW_HAVE] = st.rw_count is not None
+        c[RC_RW_COUNT] = st.rw_count if st.rw_count is not None else 0
+        c[RC_CK_NONE] = st.ck is None
+        c[RC_NOHIT_ON] = float(st.nohit_on)
+        nh = st.nohit_rooms.get((st.floor_n, st.room)) if (st.nohit_on and st.room is not None) else None
+        c[RC_NH:RC_NH + 3] = [float(x) for x in nh] if nh is not None else (0.0, 0.0, 0.0)
+        c[RC_FIRST_MODE] = float(st.stall_first)
+        key = (st.floor_k, st.room)
+        c[RC_EVER:RC_EVER + 3] = (key in st.ever_rooms, key in st.ever_cleared, key in st.ever_hurt) \
+            if (st.stall_first and st.room is not None) else (0.0, 0.0, 0.0)
+        c[RC_POST] = 2.0 if st.items else 1.0 if st.run else 0.0
+        c[RC_PREV_A_HAVE] = st.prev_active is not None
+        if st.prev_active is not None:
+            c[RC_PREV_A], c[RC_PREV_C] = st.prev_active
+        c[RC_PREV_MAXC], c[RC_MAX_CHARGE] = st.prev_maxc, st.max_charge
         terrain = self.decoder.terrain_raw
         doors = st.version[1] if st.version is not None else None
         arrays = (st.grid, st.padded, st.map)
@@ -1005,3 +1260,128 @@ class FastRow:
         else:   # every record goes through encode_row
             self._keep = (None, None)
             self._ptrs = (None, None, None)
+
+
+# (version 9 / 10) this process's FastRow counters, under fixed keys only (Codex round 23-3: a thread adding a key while
+# fast_counts or a report read the dict ended the worker): fast / slow records, the hand-back codes, what the fast
+# records did; in check mode the records compared, the mismatches, the children forked and the boundary counts
+_TAGS = ('start', 'archive', 'branch', 'lab', 'cf', 'teacher', 'room', 'other')
+_STAT_KEYS = (('fast', 'slow', 'slow_obs') + tuple('slow_%d' % c for c in _KNOWN_CODES) +
+              ('fast_rw', 'fast_nohit_state', 'fast_first_prog', 'fast_active_state', 'fast_ev_nohit', 'fast_ev_active',
+               'check_records', 'check_mismatch', 'children_forked', 'hit_multi_player', 'hit_char_change_fast',
+               'hit_char_change_slow', 'hit_ent64_exit', 'hit_ent65_exit', 'hit_boss_clear', 'hit_block_after_rewind',
+               'hit_rewind', 'hit_rewind_death', 'hit_rewind_cap', 'hit_rewind_stall') +
+              tuple('hit_fsf_' + t for t in _TAGS))
+FAST_STATS = dict.fromkeys(_STAT_KEYS, 0)
+_CHECK_DUMPS = [0]
+_CHECK_LAST = [0.0]
+_ROLE = ['worker']
+_WORKER = [-1]
+import threading as _threading   # noqa: E402
+_REPORT_LOCK = [_threading.Lock()]   # (Codex round 24-3: one report at a time per process; a forked child: its own)
+_FINAL = [False]                     # (no periodic report after the final one)
+
+
+def _bump(key, n=1):
+    """One of FAST_STATS' fixed keys up by n (an unknown key is a KeyError: no key is ever added)."""
+    FAST_STATS[key] += n
+
+
+def fast_counts():
+    """(fast, slow, slow by hand-back group: block, room / floor, visible, rewind, other, check mode's records compared,
+    mismatches) of this process's FastRow records so far -- tok_sampler's fr_* worker stats (the canary's compared /
+    mismatches in progress.csv). Reads fixed keys; never iterates the dict."""
+    s = FAST_STATS
+    g = lambda *codes: sum(s['slow_%d' % c] for c in codes)   # noqa: E731
+    return [s['fast'], s['slow'], g(-2), g(-4, -5, -6, -8), g(-13), g(-11, -12),
+            g(-1, -3, -7, -14, -15) + s['slow_obs'], s['check_records'], s['check_mismatch']]
+
+
+def child_start(role):
+    """(check mode) In a forked child (a cf point, a search): its own counts from zero, under its role, its own report
+    lock (the parent's may have been held by another thread at the fork) and no final yet."""
+    _REPORT_LOCK[0] = _threading.Lock()
+    _FINAL[0] = False
+    _ROLE[0] = role
+    for k in _STAT_KEYS:
+        FAST_STATS[k] = 0
+    _CHECK_LAST[0] = 0.0
+
+
+def note_child(pid, role):
+    """(check mode, in the parent right after a fork) the child's pid and role appended to
+    ISAAC_RL_FAST_ROW_CHECK_DIR/fastrow-children-<parent pid>.txt and counted (children_forked): tools/fastrow_verify.py
+    requires a final report of every child listed. Raises FastRowFatal when it cannot be written."""
+    _bump('children_forked')
+    d = os.environ.get('ISAAC_RL_FAST_ROW_CHECK_DIR')
+    try:
+        with _REPORT_LOCK[0]:
+            with open(os.path.join(d, f'fastrow-children-{os.getpid()}.txt'), 'a') as f:
+                f.write(f'{int(pid)} {role}\n')
+    except (OSError, TypeError) as exc:
+        raise FastRowFatal(f'FastRow check: the child {pid} could not be listed: {exc}') from None
+
+
+def fast_row_final():
+    """(check mode) This process's final counts (final: true), before it ends -- a worker's loop's end, a forked
+    child's os._exit (which runs no atexit). Raises FastRowFatal when they cannot be written."""
+    if FAST_ROW_CHECKING:
+        _check_report(True, final=True)
+
+
+def _same(a, b):
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        return isinstance(a, np.ndarray) and isinstance(b, np.ndarray) and a.shape == b.shape and \
+            a.dtype == b.dtype and a.tobytes() == b.tobytes()
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
+
+
+def _state_diff(st, ref):
+    """The EpisodeState attributes that differ (inv_gain: encode_row's own per-record flag, not kept by FastRow)."""
+    return [k for k in vars(ref) if k != 'inv_gain' and not _same(getattr(st, k, None), getattr(ref, k))]
+
+
+def _check_dump(payload, before, got, want, t, bad):
+    d = os.environ.get('ISAAC_RL_FAST_ROW_CHECK_DIR')
+    if not d or _CHECK_DUMPS[0] >= 20:
+        return
+    _CHECK_DUMPS[0] += 1
+    try:
+        np.savez(os.path.join(d, f'fastrow-mismatch-{os.getpid()}-{_CHECK_DUMPS[0]}.npz'),
+                 payload=np.frombuffer(payload, np.uint8), before=before, got=got,
+                 want=want if want is not None else np.zeros(0, np.uint8), t=t, bad=np.array(bad))
+    except OSError:
+        pass
+
+
+def _check_report(force=False, final=False):
+    """(check mode) This process's counts to ISAAC_RL_FAST_ROW_CHECK_DIR/fastrow-<pid>.json (at most every 30 s
+    unless forced), with its pid, parent, role and whether final. A failure to write raises FastRowFatal (Codex round
+    23-2: the counts must reach the check)."""
+    d = os.environ.get('ISAAC_RL_FAST_ROW_CHECK_DIR')
+    if not FAST_ROW_CHECKING:
+        return
+    if not d:
+        raise FastRowFatal('ISAAC_RL_FAST_ROW=2 without ISAAC_RL_FAST_ROW_CHECK_DIR')
+    import time as _time
+    now = _time.time()
+    if not force and now - _CHECK_LAST[0] < 30:
+        return
+    with _REPORT_LOCK[0]:   # (round 24-3: serialised; a final one is never overwritten by a later periodic one)
+        if _FINAL[0] and not final:
+            return
+        _CHECK_LAST[0] = now
+        try:
+            import json as _json
+            tmp = os.path.join(d, f'.fastrow-{os.getpid()}-{_threading.get_ident()}.json')
+            with open(tmp, 'w') as f:
+                _json.dump(dict({k: FAST_STATS[k] for k in _STAT_KEYS}, pid=os.getpid(), ppid=os.getppid(),
+                                role=_ROLE[0], worker=_WORKER[0], final=bool(final), time=now), f)
+            os.replace(tmp, os.path.join(d, f'fastrow-{os.getpid()}.json'))
+        except OSError as exc:
+            raise FastRowFatal(f'FastRow check: the counts could not be written to {d}: {exc}') from None
+        if final:
+            _FINAL[0] = True

@@ -3113,22 +3113,55 @@ char *getenv(const char *name) {
 // RC_STALL_MODE (1: tok_obs EpisodeState.stall_pickups, train_tok --stall-progress pickups: a gain in player 0's coins,
 // keys, bombs or health units is progress for the floor's stall rule too), RC_HAVE_RES and RC_PREV_RES .. + 3 (those
 // four at the record before), kept in step with encode_row by tok_obs.FastRow.
+// Version 9 (2026-11-20, the coordinator: the native ROW encoder v8 -- ROW schema 8 -- back on, off by default:
+// tok_obs ISAAC_RL_FAST_ROW=1; =2 checks every fast record against encode_row). The payload is walked to its end
+// (every block after the entities: lasers, terrain, the visible-v3 frame, the rewind count; a payload whose blocks do
+// not end at its end is handed back: -1). New in the fast record, each as encode_row does it:
+//   the visible frame (flag 64): checked as visible_producer.check_frame_header_v3(exact) (a frame it refuses: -13,
+//     encode_row raises), copied as it came (visible_bytes, visible_frame, visible_schema = ABP_V3_VERSION), its
+//     bodies' P 40 / 53 (stall share / known) written after the progress update (v3_backfill_stall); RC_VIS bit 0: the
+//     worker runs visible-v3 (a record without a frame: -13), bit 1: ISAAC_NO_VISIBLE (visible_schema 0); a record
+//     with a v2 visible or raw v3 block (flag 32), or a frame in a worker not configured for v3: -13;
+//   the rewind count (flag 128, RC_REWIND_ON): a record whose count went up (a Glowing Hour Glass restore) is handed
+//     back (-11), and so is a floor episode's record before its first checkpoint (RC_CK_NONE: -12); otherwise the
+//     count becomes RC_RW_COUNT and ROW 'rewind' is 0 (the same room: no checkpoint either);
+//   EV_NOHIT (RC_NOHIT_ON): the room's [had monsters, hurt in it, rewarded] (RC_NH .. + 2) as tok_obs.nohit_step;
+//   --stall-progress first (RC_FIRST_MODE): progress only for what is new to the episode -- the room's key in
+//     ever_rooms / ever_cleared / ever_hurt (RC_EVER .. + 2, set here when added); pickups' rule off in that mode;
+//   _items_step (RC_POST 1: a run -- ROW 'stage'; 2: items -- also 'inv', 'pitem', 'pinv' from the EpisodeState's
+//     arrays (ext[0 .. 2], pitem[0] / pinv[0] / pinv[7] written there as encode_row does) and EV_ACTIVE from
+//     RC_PREV_A* / RC_MAX_CHARGE).
+// Out: RC_OUT_V3 (a v3 frame written), RC_OUT_DIRTY (bits: 1 the rewind count, 2 the nohit room, 4 an ever_* set,
+// 8 the active item's state changed: tok_obs.FastRow brings its EpisodeState up to date).
+// Version 10 (2026-11-20, Codex round 23-1): before the first write, every player-0 value encode_row turns into an
+// integer -- soul and black hearts, bombs, the weapon bits, the player type, the patch's cell from x / y -- must be
+// finite and well inside the range of a long; otherwise the record is handed back (-15): encode_row raises where
+// Python does (int() / round() of a NaN or an infinity) and takes the large ones; no conversion of a NaN or an
+// out-of-range double to an integer type here (undefined behaviour). Every negative return writes nothing: not the
+// ROW, not ctx, not the EpisodeState's arrays (tests/test_fast_row_v9.py fills all three with non-zero bytes).
 enum {
     RC_T, RC_LIMIT, RC_FLOOR, RC_STALL, RC_PROGRESS, RC_STAGE0, RC_HP0, RC_PREV_DMG, RC_PREV_HP, RC_HAVE_PREV, RC_ROOM,
     RC_WAS_CLEAR, RC_ORIGIN_X, RC_ORIGIN_Y, RC_N_EXITS, RC_EXITS, RC_TVERSION = RC_EXITS + 16, RC_TSEEN, RC_HURT,
     RC_EPISODE, RC_SEED, RC_GROUP, RC_FIRST, RC_RUN, RC_ITEMS, RC_STALL_MODE, RC_HAVE_RES, RC_PREV_RES,
-    RC_COUNT = RC_PREV_RES + 4
+    RC_VIS = RC_PREV_RES + 4, RC_REWIND_ON, RC_RW_HAVE, RC_RW_COUNT, RC_CK_NONE, RC_NOHIT_ON, RC_NH,
+    RC_FIRST_MODE = RC_NH + 3, RC_EVER, RC_POST = RC_EVER + 3, RC_PREV_A_HAVE, RC_PREV_A, RC_PREV_C, RC_PREV_MAXC,
+    RC_MAX_CHARGE, RC_OUT_V3, RC_OUT_DIRTY, RC_COUNT
 };
-// offs: byte offsets of the ROW fields in this order
+// offs: byte offsets of the ROW fields in this order (< 0: not written)
 enum { RO_PLAYER, RO_ENT, RO_ENT_ID, RO_DOORS, RO_PATCH, RO_GRID, RO_MAP, RO_N_ENT, RO_N_DOORS, RO_T, RO_HURT, RO_DAMAGE,
        RO_DONE, RO_BOMBS, RO_EVENTS, RO_EPISODE, RO_SEED, RO_GROUP, RO_FIRST, RO_ENT_ITEM, RO_PCHARGE, RO_PCHAR,
-       RO_ENT_PRICE, RO_PHEARTS, RO_ROOM_TYPE, RO_COUNT };
+       RO_ENT_PRICE, RO_PHEARTS, RO_ROOM_TYPE, RO_REWIND, RO_VIS_SCHEMA, RO_VIS_BYTES, RO_VIS_FRAME, RO_STAGE, RO_INV,
+       RO_PITEM, RO_PINV, RO_COUNT };
 #define RE_PHEART_F 3          // version 7: tok_obs.PHEART_F
 #define RE_N_ROOM_TYPE 32      // version 7: tok_obs.N_ROOM_TYPE
 #define RE_PCHARGE_F 12
 #define RE_PLAYER_F 39         // doubles of a lean player record (version 6; 38 in versions 4 and 5)
 #define RE_N_CHAR 32           // tok_obs.N_CHAR: 'pchar' is clipped to 0 .. RE_N_CHAR - 1
 #define RE_ITEM_UNKNOWN 1023   // a pedestal's collectible id under Curse of the Blind (the game shows "?")
+#define RE_N_COLLECTIBLE 1024  // version 9: tok_obs.N_COLLECTIBLE
+#define RE_INV_CAP 16          // version 9: tok_obs.INV_CAP
+#define RE_PINV_F 12           // version 9: tok_obs.PINV_F
+#define RE_FRAME_ROOM 131072   // version 9: ROW 'visible_frame' bytes
 #define RE_CAP 64
 #define RE_F0 33            // the entity columns before version 5
 #define RE_FLAG_F 16
@@ -3156,21 +3189,46 @@ static inline double py_max(double a, double b) { return b > a ? b : a; }   // P
 static inline double rd_d(const unsigned char *p) { double v; memcpy(&v, p, 8); return v; }
 static inline float rd_f(const unsigned char *p) { float v; memcpy(&v, p, 4); return v; }
 static inline int32_t rd_i(const unsigned char *p) { int32_t v; memcpy(&v, p, 4); return v; }
+static inline uint32_t rd_u(const unsigned char *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static inline void wr_f(unsigned char *p, float v) { memcpy(p, &v, 4); }
 static inline long floor_mod(long a, long m) { long r = a % m; return r < 0 ? r + m : r; }
 
-// (8, 2026-11-20: a payload with the rewind count block, flag 128, is handed back: -10)
-int abp_row_encode_version(void) { return (8 << 16) | (RC_COUNT << 8) | RO_COUNT; }
+// visible_producer.check_frame_header_v3(f, exact=True) and write_frame_v3's budget: 1 when encode_row takes the frame
+// as it is (0: encode_row raises -- the record is handed back to it). *p_out: the bodies.
+static int re_v3_frame_ok(const unsigned char *f, long nbytes, long *p_out) {
+    if (nbytes % 4 || nbytes > ABP_V3_FRAME_BYTES || nbytes > RE_FRAME_ROOM) return 0;
+    long nf = nbytes / 4;
+    if (nf < ABP_V3_HEADER) return 0;
+    double h[ABP_V3_HEADER];
+    for (int i = 0; i < ABP_V3_HEADER; i++) {
+        double v = (double)rd_f(f + 4 * i);
+        if (!isfinite(v) || v != trunc(v) || fabs(v) > 1e15) return 0;   // (a larger whole word: encode_row decides)
+        h[i] = v;
+    }
+    long long magic = (long long)h[ABP_V3_H_MAGIC], size = (long long)h[ABP_V3_H_SIZE];
+    long long p = (long long)h[ABP_V3_H_P], e = (long long)h[ABP_V3_H_E], n = (long long)h[ABP_V3_H_N];
+    long long s = (long long)h[ABP_V3_H_S], word = (long long)h[6];
+    if (magic != ABP_V3_MAGIC || word != ABP_V3_VERSION_WORD) return 0;
+    if (!(1 <= p && p <= ABP_V3_CAP_BODY && 0 <= e && e <= ABP_V3_CAP_ENTITY && 0 <= n && n <= 1000000000LL &&
+          0 <= s && s <= 1000000000LL)) return 0;
+    long long want = ABP_V3_FIXED + p * ABP_V3_BODY + e * ABP_V3_EF + n * ABP_V3_NF + s * ABP_V3_SF;
+    if (size != want || want * 4 > ABP_V3_FRAME_BYTES || nf != want) return 0;
+    *p_out = (long)p;
+    return 1;
+}
+
+static inline int re_int_ok(double v) { return isfinite(v) && fabs(v) < 1e15; }   // (version 10: int() is safe)
+
+int abp_row_encode_version(void) { return (11 << 16) | (RC_COUNT << 8) | RO_COUNT; }   // (11: round 24-1)
 
 int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double *ctx, const unsigned char *grid,
-                   const unsigned char *padded, const unsigned char *map, const long *offs, const long *refs) {
+                   const unsigned char *padded, const unsigned char *map, const long *offs, const long *refs,
+                   const long *ext) {
     if (len < 96 || rd_i(pl) != (int32_t)LEAN_MAGIC) return -1;
     int flags = pl[12], n_players = pl[13], n_doors = pl[14], n_lasers = pl[15];
     if (flags & (8 | 16)) return -2;                 // a map or inventory block: the decoder must see it
-    if (flags & 64) return -9;                       // a native visible-v3 frame (2026-11-18): the decoder must see it
-    if (flags & 128) return -10;                     // the rewind count block (2026-11-20): the decoder must see it
+    if (flags & 32) return -13;                      // a visible block (v2, or a raw v3 one): encode_row's
     if (n_players < 1) return -1;
-    ctx[RC_TSEEN] = 0;
     if (!(ctx[RC_HAVE_PREV] != 0)) return -4;          // the episode's first record
     const unsigned char *room = pl + 16;
     int room_type = rd_i(room), room_idx = rd_i(room + 16), stage = rd_i(room + 20);
@@ -3193,22 +3251,77 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     if (len < ents_at + 2 + (long)LEAN_ENTITY_BYTES * n_ent) return -1;
     // the door records, against the ones the grid was built with (encode_row's _terrain key)
     if (refs[3] != 16L * n_doors || memcmp(pl + doors_at, (const void *)refs[2], (size_t)refs[3]) != 0) return -5;
-    if (flags & 2) {   // a terrain block: only the same as the last one (the bridge resends it every 30 logic frames)
-        long at = ents_at + 2 + (long)LEAN_ENTITY_BYTES * n_ent;
-        for (int i = 0; i < n_lasers; i++) {   // <qBddddddq + k samples of 2 doubles
-            if (len < at + 65) return -1;
-            int64_t k;
-            memcpy(&k, pl + at + 57, 8);
-            if (k < 0 || k > 100000) return -1;
-            at += 65 + 16 * k;
-        }
-        if (!refs[0] || len - (at + 4) != refs[1] || memcmp(pl + at + 4, (const void *)refs[0], (size_t)refs[1]) != 0)
-            return -2;
-        ctx[RC_TVERSION] = (double)(uint32_t)rd_i(pl + at);
-        ctx[RC_TSEEN] = 1;
+    // the blocks after the entities, to the payload's end (abplus_lean.LeanDecoder.decode's order)
+    long at = ents_at + 2 + (long)LEAN_ENTITY_BYTES * n_ent;
+    for (int i = 0; i < n_lasers; i++) {   // <qBddddddq + k samples of 2 doubles
+        if (len < at + 65) return -1;
+        int64_t k;
+        memcpy(&k, pl + at + 57, 8);
+        if (k < 0 || k > 100000) return -1;
+        at += 65 + 16 * k;
     }
+    if (len < at) return -1;
+    int tseen = 0;
+    double tversion = 0;
+    if (flags & 2) {   // a terrain block: only the same as the last one (the bridge resends it every 30 logic frames)
+        if (len < at + 12) return -1;
+        long tn = (long)rd_u(pl + at + 4);
+        if (len < at + 12 + tn) return -1;
+        long tn2 = (long)rd_u(pl + at + 8 + tn);
+        long traw = 8 + tn + tn2;   // the block without its version (LeanDecoder.terrain_raw)
+        if (len < at + 4 + traw) return -1;
+        if (!refs[0] || traw != refs[1] || memcmp(pl + at + 4, (const void *)refs[0], (size_t)refs[1]) != 0) return -2;
+        tversion = (double)rd_u(pl + at);
+        tseen = 1;
+        at += 4 + traw;
+    }
+    const unsigned char *frame = NULL;
+    long frame_bytes = 0;
+    if (flags & 64) {   // the native visible-v3 frame: <I size> + its bytes
+        if (len < at + 4) return -1;
+        frame_bytes = (long)rd_u(pl + at);
+        at += 4;
+        if (len < at + frame_bytes) return -1;
+        frame = pl + at;
+        at += frame_bytes;
+    }
+    int have_rw = 0;
+    int32_t rw = 0;
+    if (flags & 128) {   // the Glowing Hour Glass restore count: <i>
+        if (len < at + 4) return -1;
+        rw = rd_i(pl + at);
+        have_rw = 1;
+        at += 4;
+    }
+    if (at != len) return -1;   // (trailing bytes: LeanDecoder.decode raises)
+    // the visible frame (encode_row's write_visible)
+    int vis = (int)ctx[RC_VIS], v3_mode = vis & 1, no_vis = vis & 2;
+    if (frame && !v3_mode) return -13;
+    long bodies = 0;
+    int v3 = 0;
+    if (!no_vis) {
+        if (frame) {
+            if (!re_v3_frame_ok(frame, frame_bytes, &bodies)) return -13;
+            v3 = 1;
+        } else if (v3_mode) {
+            return -13;
+        }
+    }
+    // the rewind count (encode_row: a restore is the Python path's; otherwise the count is only kept)
+    int rewind_on = ctx[RC_REWIND_ON] != 0;
+    if (rewind_on && have_rw && ctx[RC_RW_HAVE] != 0 && (double)rw > ctx[RC_RW_COUNT]) return -11;
+    if (rewind_on && floor_ep && ctx[RC_CK_NONE] != 0) return -12;   // the episode's first checkpoint: encode_row's
+    int post = (int)ctx[RC_POST];
     double pv[RE_PLAYER_F];   // player 0 (abplus_lean.PLAYER_FIELDS)
     memcpy(pv, pl + 96, sizeof pv);
+    if (post == 2 && !(isfinite(pv[24]) && fabs(pv[24]) < 1e15)) return -14;   // (int(active): encode_row's)
+    // (version 10) the integer conversions of player 0's values and of the patch's cell: encode_row's when unsafe
+    // (round 24-1) and bombs below 0: encode_row's min(int(bombs), 255) into the uint8 field (NumPy refuses a negative)
+    if (!re_int_ok(pv[8]) || !re_int_ok(pv[9]) || !re_int_ok(pv[15]) || pv[15] <= -1.0 || !re_int_ok(pv[37]) ||
+        !re_int_ok(pv[38]) ||
+        !re_int_ok((pv[1] - ctx[RC_ORIGIN_X]) / 40.0) || !re_int_ok((pv[2] - ctx[RC_ORIGIN_Y]) / 40.0))
+        return -15;
+    int dirty = 0;
     double px = pv[1], py = pv[2];
     double tlx = rd_f(room + 32), tly = rd_f(room + 36), brx = rd_f(room + 40), bry = rd_f(room + 44);
     double w = py_max(brx - tlx, 1.0), h = py_max(bry - tly, 1.0);
@@ -3217,6 +3330,15 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     double units = ((pv[6] + pv[8]) + pv[11]) + 2 * pv[10];
     long t = (long)ctx[RC_T];
     double limit = ctx[RC_LIMIT], stall = ctx[RC_STALL], progress_t = ctx[RC_PROGRESS];
+    if (v3) {   // write_frame_v3
+        int32_t nb = (int32_t)frame_bytes, schema = ABP_V3_VERSION;
+        memcpy(row + offs[RO_VIS_BYTES], &nb, 4);
+        memcpy(row + offs[RO_VIS_FRAME], frame, (size_t)frame_bytes);
+        memcpy(row + offs[RO_VIS_SCHEMA], &schema, 4);
+    } else {
+        int32_t zero = 0;
+        memcpy(row + offs[RO_VIS_SCHEMA], &zero, 4);
+    }
     double pvec[31] = {
         (px - tlx) / w, (py - tly) / h, pv[3] / 10, pv[4] / 10, pv[6] / 12, pv[8] / 12,
         pv[7] / 12, units / 12, py_min(pv[15], 10) / 10, py_min(pv[16], 10) / 10, py_min(pv[14], 50) / 50,
@@ -3399,14 +3521,37 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
             for (int y = 0; y < RE_PATCH; y++)
                 memcpy(patch + (c * RE_PATCH + y) * RE_PATCH, padded + ((long)c * ph + r + y) * pw + col, RE_PATCH);
     }
+    // the rewind count kept (no restore here: those were handed back)
+    if (rewind_on && have_rw) {
+        if (!(ctx[RC_RW_HAVE] != 0) || ctx[RC_RW_COUNT] != (double)rw) dirty |= 1;
+        ctx[RC_RW_HAVE] = 1;
+        ctx[RC_RW_COUNT] = (double)rw;
+    }
     // rewards and the episode's end (the same room as the record before)
     int events = 0;
     float hurt = (float)(damage_taken - ctx[RC_PREV_DMG]);
     float dmg = (float)py_min(py_max(0.0, ctx[RC_PREV_HP] - monsters_hp) / ctx[RC_HP0], 1.0);
     if (clear && !(ctx[RC_WAS_CLEAR] != 0)) events |= 1 | (room_type == 5 ? 4 : 0);
+    if (ctx[RC_NOHIT_ON] != 0) {   // tok_obs.nohit_step for this room (the same room: no other room's entry moves)
+        int h0 = ctx[RC_NH] != 0, h1 = ctx[RC_NH + 1] != 0, h2 = ctx[RC_NH + 2] != 0;
+        int g0 = h0, g1 = h1, g2 = h2;
+        if (hurt > 0) g1 = 1;
+        if (monsters_hp > 0 || dmg > 0) g0 = 1;
+        if ((events & 1) && g0 && !g1 && !g2) {
+            events |= 128;   // EV_NOHIT
+            g2 = 1;
+        }
+        if (g0 != h0 || g1 != h1 || g2 != h2) {
+            ctx[RC_NH] = g0;
+            ctx[RC_NH + 1] = g1;
+            ctx[RC_NH + 2] = g2;
+            dirty |= 2;
+        }
+    }
     wr_f(row + offs[RO_HURT], hurt);
     wr_f(row + offs[RO_DAMAGE], dmg);
     row[offs[RO_EVENTS]] = (unsigned char)events;
+    row[offs[RO_REWIND]] = 0;   // (rewind on: no restore and no room change here; off: 0)
     ctx[RC_ROOM] = room_idx;
     ctx[RC_WAS_CLEAR] = clear ? 1 : 0;
     ctx[RC_PREV_DMG] = damage_taken;
@@ -3414,8 +3559,29 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     int dead = pv[33] != 0;
     int done;
     if (floor_ep) {
-        if (events || dmg > 0) ctx[RC_PROGRESS] = (double)t;   // a new or cleared room, or a monster hurt
-        if (ctx[RC_STALL_MODE] != 0) {   // B40: or a resource gained (coins, keys, bombs, health units)
+        int first_mode = ctx[RC_FIRST_MODE] != 0;
+        if (first_mode) {   // --stall-progress first: what this episode does for the first time (this room's key)
+            int prog = 0;
+            if (!(ctx[RC_EVER] != 0)) {
+                ctx[RC_EVER] = 1;
+                prog = 1;
+                dirty |= 4;
+            }
+            if ((events & 1) && !(ctx[RC_EVER + 1] != 0)) {
+                ctx[RC_EVER + 1] = 1;
+                prog = 1;
+                dirty |= 4;
+            }
+            if (dmg > 0 && !(ctx[RC_EVER + 2] != 0)) {
+                ctx[RC_EVER + 2] = 1;
+                prog = 1;
+                dirty |= 4;
+            }
+            if (prog) ctx[RC_PROGRESS] = (double)t;   // (an id held anew comes with an inventory block: handed back)
+        } else if (events || dmg > 0) {
+            ctx[RC_PROGRESS] = (double)t;   // a new or cleared room, or a monster hurt
+        }
+        if (ctx[RC_STALL_MODE] != 0 && !first_mode) {   // B40: or a resource gained (coins, keys, bombs, health units)
             double res[4] = {pv[14], pv[16], pv[15], units};
             if (ctx[RC_HAVE_RES] != 0)
                 for (int i = 0; i < 4; i++)
@@ -3431,9 +3597,52 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     } else {
         done = dead ? 2 : clear ? 1 : (double)t >= limit ? 3 : 0;
     }
+    if (v3) {   // v3_backfill_stall: P 40 / 53 of every body, with this record's progress counted
+        int known = floor_ep && stall > 0;
+        float share = known ? (float)py_min((double)(t - (long)ctx[RC_PROGRESS]) / stall, 1.0) : 0.0f;
+        float kn = known ? 1.0f : 0.0f;
+        unsigned char *fr = row + offs[RO_VIS_FRAME];
+        for (long i = 0; i < bodies; i++) {
+            long base = (ABP_V3_FIXED + i * ABP_V3_PF) * 4;
+            wr_f(fr + base + ABP_V3_P_STALL_SHARE * 4, share);
+            wr_f(fr + base + ABP_V3_P_STALL_KNOWN * 4, kn);
+        }
+    }
     int32_t tt = (int32_t)t;
     memcpy(row + offs[RO_T], &tt, 4);
     row[offs[RO_DONE]] = (unsigned char)done;
+    if (post && offs[RO_STAGE] >= 0) {   // encode_row's _items_step
+        row[offs[RO_STAGE]] = (unsigned char)(stage < 0 ? 0 : stage > 255 ? 255 : stage);
+        if (post == 2) {
+            double active = pv[24], charge = pv[25];
+            long a = (long)active;   // int(active)
+            int ev = 0;
+            if (ctx[RC_PREV_A_HAVE] != 0) {   // (Codex round 24-1: the record before's active, as a double -- it can
+                //  be a large value encode_row took on a hand-back; compared, never converted: an integer that came
+                //  from a double equals that double, so == on doubles is Python's == on ints here)
+                double pa = ctx[RC_PREV_A], ad = (double)a;
+                double pc = ctx[RC_PREV_C];
+                if ((ad == pa && a != 0 && charge < pc) || (pa != 0 && a == 0 && ctx[RC_PREV_MAXC] == 0)) ev |= 32;
+            }
+            if (!(ctx[RC_PREV_A_HAVE] != 0) || ctx[RC_PREV_A] != (double)a || !(ctx[RC_PREV_C] == charge) ||
+                ctx[RC_PREV_MAXC] != ctx[RC_MAX_CHARGE])
+                dirty |= 8;
+            ctx[RC_PREV_A_HAVE] = 1;
+            ctx[RC_PREV_A] = (double)a;
+            ctx[RC_PREV_C] = charge;
+            ctx[RC_PREV_MAXC] = ctx[RC_MAX_CHARGE];
+            int16_t *pitem = (int16_t *)ext[1];
+            float *pinv = (float *)ext[2];
+            pitem[0] = (int16_t)(a < 0 ? 0 : a > RE_N_COLLECTIBLE - 1 ? RE_N_COLLECTIBLE - 1 : a);
+            double mc = ctx[RC_MAX_CHARGE];
+            pinv[0] = mc > 0 ? (float)py_min(charge / mc, 1.0) : 0.0f;
+            pinv[7] = (float)((double)stage / 12);
+            memcpy(row + offs[RO_INV], (const void *)ext[0], RE_INV_CAP * 2 * 2);
+            memcpy(row + offs[RO_PITEM], pitem, 6 * 2);
+            memcpy(row + offs[RO_PINV], pinv, RE_PINV_F * 4);
+            if (ev) row[offs[RO_EVENTS]] |= (unsigned char)ev;
+        }
+    }
     int64_t episode = (int64_t)ctx[RC_EPISODE], seed = (int64_t)ctx[RC_SEED];
     int32_t group = (int32_t)ctx[RC_GROUP];
     memcpy(row + offs[RO_EPISODE], &episode, 8);
@@ -3441,6 +3650,10 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     memcpy(row + offs[RO_GROUP], &group, 4);
     row[offs[RO_FIRST]] = (unsigned char)(ctx[RC_FIRST] != 0);
     ctx[RC_HURT] = hurt > 0;
+    ctx[RC_TSEEN] = tseen;
+    if (tseen) ctx[RC_TVERSION] = tversion;
+    ctx[RC_OUT_V3] = v3;
+    ctx[RC_OUT_DIRTY] = dirty;
     return done;
 }
 
