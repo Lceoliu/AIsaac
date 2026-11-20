@@ -256,6 +256,7 @@ from isaac_bridge.learn_segments import SEG   # BM1: learner segment timing (ISA
 from isaac_bridge.tok_obs import ROW_FRAME_AT, take_prefix   # noqa: E402  (A-4, A-6)
 from isaac_bridge.tok_obs import (ROW_SCHEMA, DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
+from isaac_bridge.tok_sampler import CTRL_VERSION   # noqa: E402  (the actor's weights version's control slot)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
                                       default_stub_list)
 
@@ -6246,6 +6247,8 @@ def main(argv=None, child=None, actor=None):
     if child is None and getattr(sampler, 'stats', None) is not None and 'ep_archive' in ST:
         book.origin = sampler.stats[:, ST['ep_archive']]   # (2026-11-12: episodes.jsonl 'start', fresh / archive)
     version = update                                # the actor's weights: updates done
+    if getattr(sampler, 'control', None) is not None:   # (the workers' records: the weights version from the start)
+        sampler.control[CTRL_VERSION] = version
     version0 = version   # (B54: the policy-lag check at each hand-off counts from here)
     native_cons = False   # B58a+b: the driver's native consumer (Episodes.arrive's arithmetic and store in C++)
     if cpp_driver is not None:
@@ -6316,7 +6319,7 @@ def main(argv=None, child=None, actor=None):
         version += 1
         if block_actor is not None:
             block_actor.version = version
-        sampler.control[3] = version   # 2026-10-07: the actor's weights, for the workers' choice records
+        sampler.control[CTRL_VERSION] = version   # (the actor's weights, for the workers' records; [3] is the layout)
         if snaps and version % args.branch_snap_every == 0:   # Phase B2: the older snapshot takes these weights
             e = min(snaps, key=lambda e_: e_['id'])
             with torch.no_grad():

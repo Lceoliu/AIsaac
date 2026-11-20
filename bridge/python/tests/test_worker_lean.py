@@ -332,3 +332,57 @@ def test_d_an_older_worker_ends_the_run_with_the_switch_off(monkeypatch, tmp_pat
     cfg = TS.TokSamplerConfig(workers=2, teacher=False, name='abitest', port=os.getpid() % 30000 + 21000)
     with pytest.raises(VisibleV3Fatal, match=r'worker\(s\) 1 \(exit 1\) ended before confirming'):
         TS.TokSampler(cfg)
+
+
+# ---------------------------------------------------------------- (e) the actor's weights version (the coordinator)
+def stub_worker_version(index, cfg, names, conn, teacher_names=None, *args, **kw):
+    """Attach, confirm, then until the pipe closes: the actor's weights version as a worker reads it for its records
+    (tok_sampler.actor_version -- what tok_floor writes into branch comps, lab results, CF / V2 points), reported in
+    its stats column 'decisions'."""
+    import select as select_
+    from isaac_bridge import tok_sampler as S_
+    blocks, rows, actions, stats, control = S_.attach(names, cfg.workers)
+    gb, tg, vg, ack = S_.attach_ring_gen(cfg.ring_gen_block, cfg.workers)
+    S_.ring_confirm(ack, index)
+    while True:
+        stats[index, S_.ST['decisions']] = S_.actor_version(control)
+        if select_.select([conn], [], [], 0.01)[0]:
+            break
+    del tg, vg, ack, rows, actions, stats, control
+    _wait_closed(conn)
+
+
+def test_e_the_workers_record_the_trainers_weights_version(monkeypatch, tmp_path):
+    """The trainer publishes the actor's weights version (control[CTRL_VERSION], train_tok's take_weights); a worker
+    reads it for its records -- each change seen, equal to the trainer's, and the layout slot [3] untouched (before,
+    the version was written into [3] and the records showed the handshake number until the first update)."""
+    import select
+    import time
+    if not hasattr(select, 'poll'):
+        pytest.skip('TokSampler: select.poll (Linux)')
+    monkeypatch.setenv('ISAAC_RL_FATAL_DIR', str(tmp_path))
+    monkeypatch.setenv('ISAAC_RL_PNG_SHARED', '0')
+    monkeypatch.setenv('ISAAC_RL_RING_CONFIRM_S', '60')
+    monkeypatch.setattr(TS, 'worker_main', stub_worker_version)
+    cfg = TS.TokSamplerConfig(workers=2, teacher=False, name='vertest', port=os.getpid() % 30000 + 22000)
+    s = TS.TokSampler(cfg)
+    try:
+        abi = int(s.control[3])
+        assert abi == TS.shared_abi()
+        for v in (0, 7, 8):
+            s.control[TS.CTRL_VERSION] = v   # (as take_weights does)
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < 10 and any(int(x) != v for x in s.stats[:, TS.ST['decisions']]):
+                time.sleep(0.01)
+            assert [int(x) for x in s.stats[:, TS.ST['decisions']]] == [v, v], v
+        assert int(s.control[3]) == abi
+    finally:
+        s.close(timeout=2.0)
+
+
+def test_e_no_reader_of_the_old_slot():
+    """tok_floor reads the version through actor_version only; train_tok writes it to CTRL_VERSION only."""
+    src = (HERE.parent / 'isaac_bridge' / 'tok_floor.py').read_text(encoding='utf-8')
+    assert 'control[3]' not in src and src.count('actor_version(control)') == 7
+    tt = (HERE.parent / 'train_tok.py').read_text(encoding='utf-8')
+    assert 'control[3]' not in tt and tt.count('sampler.control[CTRL_VERSION] = version') == 2

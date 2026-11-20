@@ -51,7 +51,7 @@ V2_RING = 384        # imitation records per worker the trainer may fall behind 
 # per imitation record (float64): the action under way and the applied one (5 each, items / pill 0 without items),
 # the weight, the return-to-go G, the point's gain (best - taken), spread (|best - replicate|), taken and best scores,
 # the step j in the branch and its length n, the depth k, the hold h, the intent (0-8 a held move, 9 sticky), the
-# point's kind, its id, the worker, the actor's weights when the point started (control[3]), the actor's value and
+# point's kind, its id, the worker, the actor's weights when the point started (control[CTRL_VERSION]), the value and
 # log-probability at that record, the replicate's score
 V2_FIELDS = ('pend0', 'pend1', 'pend2', 'pend3', 'pend4', 'act0', 'act1', 'act2', 'act3', 'act4', 'weight', 'ret',
              'gain', 'spread', 'taken', 'best', 'j', 'n', 'depth', 'hold', 'intent', 'kind', 'point', 'worker',

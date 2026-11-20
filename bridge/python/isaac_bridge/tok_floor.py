@@ -73,6 +73,7 @@ from .tok_branch import (RewindLedger, end_reward, rewind_cfg, AUX_LOGP, AUX_PRE
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
 from .tok_obs import ring_put   # noqa: E402
 from .tok_obs import check_worker_torch   # noqa: E402
+from .tok_sampler import actor_version   # noqa: E402  (control[CTRL_VERSION]: the actor's weights version)
 from .tok_sampler import (attach_ring_gen, check_ring_mode, ring_confirm, ring_open, ring_publish,   # noqa: E402
                           tracemalloc_spec)
 from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
@@ -1258,7 +1259,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                                  cfg.clone_alarm, walk_cap)
         try:
             comp[CI['replicate']], comp[CI['pair']], comp[CI['opt']] = replicate, pair, j
-            comp[CI['crn']], comp[CI['reseed']], comp[CI['version']] = key != 0, reseed, int(control[3])
+            comp[CI['crn']], comp[CI['reseed']], comp[CI['version']] = key != 0, reseed, actor_version(control)
             mine[ST['b_walk_fail']] += notes['walk_fail']
             mine[ST['b_skip_took']] += notes['skip_took']
             mine[ST['b_prep_s']] += time.perf_counter() - t0
@@ -1311,7 +1312,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         options for doors, the twin, the unconditional replicate pair, the conditional ones), write the choice
         record."""
         t0, c0 = time.perf_counter(), time.thread_time()
-        v0 = int(control[3])
+        v0 = actor_version(control)
         comps, n_options, S, prep = [], 0, None, 0.0
         notes = {}
         twin = cfg.branch_twin > 0 and brng.random() < cfg.branch_twin
@@ -1388,7 +1389,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             slot = int(mine[ST['choices']]) % CHOICE_RING
             choice_rows[index, slot] = point.row
             choice_meta_ring[index, slot] = choice_meta(
-                point, index, comps, reseed1, v0, int(control[3]), prep, wall, n_options,
+                point, index, comps, reseed1, v0, actor_version(control), prep, wall, n_options,
                 dict(noise_var=sig2, pairs=pairs[0], shop_skip=notes.get('shop_skip', 0),
                      unreach_skip=notes.get('unreach_skip', 0)))
             mine[ST['choices']] += 1
@@ -1519,7 +1520,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         t0, c0 = time.perf_counter(), time.thread_time()
         res = np.zeros(RES_F, np.float64)
         res[RI['job']], res[RI['state']], res[RI['rep']], res[RI['worker']] = job_id, k, rep, index
-        res[RI['version0']] = int(control[3])
+        res[RI['version0']] = actor_version(control)
         res[RI['n_items']] = len(items)
         seed = int(cfg.lab_panel[k][1])
         reseed, crn = state_reseed(seed, rep), state_crn(k, rep)
@@ -1557,7 +1558,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     B.close()
                 except OSError:
                     pass
-        res[RI['version1']] = int(control[3])
+        res[RI['version1']] = actor_version(control)
         res[RI['wall_s']] = time.perf_counter() - t0
         res[RI['cpu_s']] = time.thread_time() - c0
         slot = int(mine[ST['lab_results']]) % LAB_RING
@@ -2185,7 +2186,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 base=parked, reseed=reseed_, applied=applied, log=v2log, at=at_, offset=offset,
                                 kind=kind, seed=seed_now, episode=episode_n, visited=parked.info.get('visited', ()),
                                 stage0=parked.info.get('stage0'), pid=index * 10 ** 9 + v2_n[0],
-                                version=int(control[3])))
+                                version=actor_version(control)))
                         v2_pts = []
                         excess = len(v2_queue) - cfg.teacher_v2_queue
                         if excess > 0:
@@ -2206,7 +2207,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 base=p_['base'], reseed=p_['reseed'], applied=applied, log=v2log, at=p_['at'],
                                 offset=p_['offset'], kind=KIND_CF, seed=seed_now, episode=episode_n,
                                 visited=p_['base'].info.get('visited', ()), stage0=p_['base'].info.get('stage0'),
-                                pid=index * 10 ** 9 + cf_n[0], version=int(control[3]), trig=p_['trig'],
+                                pid=index * 10 ** 9 + cf_n[0], version=actor_version(control), trig=p_['trig'],
                                 target=p_['target'], bank=p_['bank']))
                             mine[ST['cf_queued']] += 1
                         cf_quota.pending = []

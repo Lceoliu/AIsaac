@@ -431,7 +431,17 @@ class TokSamplerConfig:
     no_active: bool = False
 
 
-SHARED_ABI = 3   # (Codex round 29) 1: 25c630c's layout; 2: + ring_open_busy (exp/ring-compact); 3: + torch_held
+SHARED_ABI = 3   # (Codex round 29) 1: 25c630c's layout; 2: + ring_open_busy (exp/ring-compact); 3: + torch_held,
+#                  and the control block of CONTROL_N slots with the actor's weights version in its own (CTRL_VERSION)
+CONTROL_N = 8      # control: [0] stop, [1] the trainer is updating, [2] the release's monotonic ns, [3] shared_abi()
+#                    (immutable), [4] the actor's weights version (the trainer's take of new weights), [5:] spare
+CTRL_VERSION = 4   # (the coordinator, 2026-11-20) before, the trainer wrote the version into [3], the layout slot
+
+
+def actor_version(control):
+    """The actor's weights version the trainer last published (control[CTRL_VERSION]): what a worker records with its
+    branch comps, lab results and CF / V2 points ('version')."""
+    return int(control[CTRL_VERSION])
 
 
 def shared_abi():
@@ -443,7 +453,7 @@ def shared_abi():
     from .schema_v2 import VERSION   # (structured_input re-exports it, importing torch: not in a worker)
     from .tok_teacher2 import V2_RING
     key = (f'abi {SHARED_ABI}; visible {VERSION}; row {ROW.itemsize} {ROW.descr}; stats {len(STATS)} '
-           f'{",".join(STATS)}; rings {TEACH_RING} {V2_RING}')
+           f'{",".join(STATS)}; rings {TEACH_RING} {V2_RING}; control {CONTROL_N}')
     return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), 'little') & ((1 << 63) - 1)
 
 
@@ -453,19 +463,21 @@ def attach(names, workers, initialize=False):
     first: the trainer (initialize) writes shared_abi() to control[3], a worker refuses another value before it makes
     any other view (a block of another layout never mapped with this tree's strides)."""
     blocks = [shared_memory.SharedMemory(name=n) for n in names]
-    control = np.ndarray((4,), np.int64, buffer=blocks[3].buf)   # [0] stop, [1] the trainer is updating
+    head = np.ndarray((4,), np.int64, buffer=blocks[3].buf)   # (every tree's control block has these 4 slots)
     abi = shared_abi()
     if initialize:
-        control[3] = abi
-    elif int(control[3]) != abi:
-        have = int(control[3])
-        del control
+        head[3] = abi
+    elif int(head[3]) != abi:
+        have = int(head[3])
+        del head
         for b in blocks:
             b.close()
         from .schema_v2 import VERSION
         raise ValueError(f'sampler shared memory: layout {have:#x}, this tree {abi:#x} (SHARED_ABI {SHARED_ABI}: '
                          f'{len(STATS)} stats columns, ROW {ROW.itemsize} bytes, visible schema {VERSION}) -- a '
                          f'worker and a trainer of different trees')
+    del head
+    control = np.ndarray((CONTROL_N,), np.int64, buffer=blocks[3].buf)   # (CONTROL_N's note)
     rows = np.ndarray((2 * workers,), ROW, buffer=blocks[0].buf)
     actions = np.ndarray((workers, ACTION_F), np.int32, buffer=blocks[1].buf)
     stats = np.ndarray((workers, len(STATS)), np.float64, buffer=blocks[2].buf)
@@ -1585,7 +1597,7 @@ class TokSampler:
             cfg.fatal_dir = fatal_run_dir()
         self.cfg = cfg
         n = cfg.workers
-        sizes = (ROW.itemsize * 2 * n, 4 * ACTION_F * n, 8 * len(STATS) * n, 8 * 4)
+        sizes = (ROW.itemsize * 2 * n, 4 * ACTION_F * n, 8 * len(STATS) * n, 8 * CONTROL_N)
         self.blocks = [shared_memory.SharedMemory(create=True, size=s) for s in sizes]
         names = [b.name for b in self.blocks]
         self.attached, self.rows, self.actions, self.stats, self.control = attach(names, n, initialize=True)
@@ -1701,7 +1713,8 @@ class TokSampler:
                 self.block_arrays[2][:]=-1
                 self.attached += attached
         self.stats[:] = 0
-        self.control[:3] = 0  # slot 3 is the immutable schema/record-size handshake
+        self.control[:3] = 0  # slot 3 is the immutable layout handshake (shared_abi)
+        self.control[4:] = 0  # (CTRL_VERSION: the trainer publishes the actor's weights version there)
         if max(getattr(cfg, 'pickup_force', (0.0, 0.0)) or (0.0, 0.0)) > 0:   # 2026-10-13 (B23): the run's first p
             self.stats[:, ST['pf_p']] = float(cfg.pickup_force[0])        # (the trainer rewrites it after each update)
         # 2026-10-06: one decoded-PNG cache for all the instances of this sampler (abp_turbo ABP_PNG_CACHE_FILE) instead
