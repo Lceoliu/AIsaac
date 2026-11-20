@@ -153,6 +153,7 @@ def test_counters_have_fixed_keys_and_survive_a_writer_thread(check_mode):
     assert set(tok_obs.FAST_STATS) == set(tok_obs._STAT_KEYS)
 
 
+@pytest.mark.fork_in_process
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='os.fork: Linux')
 def test_a_forked_childs_last_record_mismatch_reaches_the_parent(check_mode):
     """The cf / search child pattern of tok_floor: child_start, the work, the final counts before os._exit (no
@@ -229,6 +230,7 @@ def test_the_canary_checks_only_its_workers(monkeypatch):
     assert tok_obs.FAST_ROW_CHECKING is False
 
 
+@pytest.mark.fork_in_process
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='os.fork: Linux')
 def test_a_child_that_ended_86_just_before_the_timeout_kill_keeps_its_status(monkeypatch):
     """(24-2) the child exits V3_FATAL_EXIT between the reaper's last look (WNOHANG: not yet) and its kill: reap_child

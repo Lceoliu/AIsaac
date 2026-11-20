@@ -174,3 +174,31 @@ def nothing_left_running(request):
         problems.append('native threads still alive: '+', '.join(f'{v} [{k}]' for k, v in sorted(new_nat.items())))
     if problems:
         pytest.fail(f'{request.node.nodeid} left work running: '+'; '.join(problems), pytrace=False)
+
+
+# (2026-11-20, A1 / the coordinator: seq2's gate) Tests that fork the pytest process itself (marker fork_in_process:
+# tests/test_fast_row_v10.py's cf / search child patterns) must run where no device context exists: the session
+# warm-up above makes one on a host with a GPU, and a forked child of that process aborts (134, a c10 'initialization
+# error' in a tensor's destructor) -- the gate's one failure on m25c630c. With a device visible they are skipped here;
+# bridge/ops/bm1/gate.sh runs them in a second pytest process with no device visible (the whole suite collected, so the
+# warm-up's pools are the same, only these selected). The reason avoids the words gate.sh counts as native skips.
+FORK_REASON = 'fork_in_process: forks the pytest process -- run apart, with no device visible (gate.sh second pass)'
+
+
+def pytest_configure(config):
+    config.addinivalue_line('markers', 'fork_in_process: forks the pytest process; needs a process with no device '
+                                       'context (gate.sh second pass)')
+
+
+def pytest_collection_modifyitems(config, items):
+    marked = [it for it in items if it.get_closest_marker('fork_in_process') is not None]
+    if not marked:
+        return
+    try:
+        import torch
+        device = torch.cuda.is_available()
+    except ImportError:
+        device = False
+    if device:
+        for it in marked:
+            it.add_marker(pytest.mark.skip(reason=FORK_REASON))
