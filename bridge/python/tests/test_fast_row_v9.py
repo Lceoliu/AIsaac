@@ -117,7 +117,9 @@ def fast(monkeypatch):
 @pytest.mark.parametrize('items', [False, True])
 @pytest.mark.parametrize('rewind_case', ['off', 'on', 'twice'])
 @pytest.mark.parametrize('nohit,hurt', [(False, False), (True, False), (True, True)])
-def test_fast_row_v9_equals_encode_row(fast, monkeypatch, run, v3, stall_mode, items, rewind_case, nohit, hurt):
+def test_fast_row_v9_equals_encode_row(fast, monkeypatch, tmp_path, run, v3, stall_mode, items, rewind_case, nohit,
+                                       hurt):
+    monkeypatch.setenv('ISAAC_RL_FAST_ROW_CHECK_DIR', str(tmp_path))   # (check mode: every process's counts)
     monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', v3)
     monkeypatch.setenv('ISAAC_RL_NOHIT', '1' if nohit else '0')
     monkeypatch.setattr(TO, 'FAST_ROW_CHECKING', True)
