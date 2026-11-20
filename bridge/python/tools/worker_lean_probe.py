@@ -49,7 +49,7 @@ def main():
     from isaac_bridge import tok_obs as TO
     from isaac_bridge import visible_producer as VP
     from isaac_bridge.tok_sampler import TokSampler, TokSamplerConfig
-    assert TO.WORKER_LEAN == bool(args.lean)
+    assert getattr(TO, 'WORKER_LEAN', False) == bool(args.lean)
     spec = load_spec(argparse.Namespace(groups_file=args.groups_file, group='normal', tasks='', seconds=0.0))
     stub = str(Path(default_preload()).parent / 'stub_render_g.txt')
     cfg = TokSamplerConfig(workers=args.workers, specs=[spec], assign=[0] * args.workers, frames_per_decision=4,
@@ -80,7 +80,8 @@ def main():
                 next_sample += 15.0
                 res['samples'].append([worker_memory(p.pid) for p in sampler.procs])
         res['teach_records'] = int(sampler.stats[:, sampler_st('teach')].sum())
-        res['torch_held'] = int(sampler.stats[:, sampler_st('torch_held')].sum())
+        if sampler_st('torch_held') is not None:   # (a tree before the count: the probe copied in for the comparison)
+            res['torch_held'] = int(sampler.stats[:, sampler_st('torch_held')].sum())
     finally:
         try:
             sampler.close(timeout=20.0)
@@ -97,7 +98,7 @@ def main():
 
 def sampler_st(name):
     from isaac_bridge.tok_sampler import ST
-    return ST[name]
+    return ST.get(name)
 
 
 if __name__ == '__main__':
