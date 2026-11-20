@@ -56,15 +56,31 @@ def cmdline(pid):
 
 
 def find_trainer(match):
+    """The trainer: the python process (not a wrapping shell / timeout) whose command line runs train_tok.py with
+    `match`, its parent not one of them."""
+    cand = []
     for p in os.listdir('/proc'):
         if not p.isdigit():
             continue
         c = cmdline(p)
-        if 'train_tok.py' in c and match in c:
-            st = stat_of(f'/proc/{p}/stat')
-            if st and 'train_tok.py' not in cmdline(st['ppid']):
-                return int(p)
-    return None
+        st = stat_of(f'/proc/{p}/stat')
+        if st and 'train_tok.py' in c and match in c and st['comm'].startswith('python'):
+            cand.append((int(p), st['ppid']))
+    pids = {p for p, _ in cand}
+    top = [p for p, pp in cand if pp not in pids]
+    return min(top) if top else None
+
+
+def uses_cuda(pid):
+    """A process with CUDA's event-handler thread (the trainer, the learner process: the workers never use CUDA)."""
+    try:
+        for t in os.listdir(f'/proc/{pid}/task'):
+            s = rd(f'/proc/{pid}/task/{t}/comm')
+            if s and s.startswith(b'cuda-EvtHandlr'):
+                return True
+    except OSError:
+        pass
+    return False
 
 
 def descendants(root):
@@ -120,6 +136,8 @@ def main():
             elif part:
                 n += 1
         return n
+    kinds = {}           # pid -> its kind once known
+    procs_seen = {}      # pid -> (kind, comm)
     last = {}            # (pid, tid) -> ticks
     acc = {}             # role -> ticks within the window
     seen = {}            # role -> set of tids
@@ -140,17 +158,18 @@ def main():
             st = stat_of(f'/proc/{pid}/stat')
             if st is None:
                 continue
-            c = cmdline(pid)
             if pid == root:
                 kind = 'trainer'
-            elif 'spawn_main' in c or 'multiprocessing.spawn' in c:
-                kind = 'learner'
+            elif pid in kinds:
+                kind = kinds[pid]
             elif st['comm'].startswith('isaac'):
                 kind = 'game'
-            elif 'python' in st['comm'] or 'python' in c.split(' ')[0]:
-                kind = 'workers'
+            elif st['comm'].startswith('python'):
+                kind = 'learner' if uses_cuda(pid) else 'workers'
             else:
                 kind = 'other'
+            if kind == 'learner':
+                kinds[pid] = kind   # (fixed once its CUDA threads exist; a python process without them re-checked)
             try:
                 tids = os.listdir(f'/proc/{pid}/task')
             except OSError:
@@ -171,6 +190,7 @@ def main():
                 else:
                     role = f"other:{st['comm']}"
                 key = (pid, int(t))
+                procs_seen[pid] = (kind, st['comm'])
                 prev = last.get(key)
                 last[key] = ts['ticks']
                 if open_ and prev is not None:
@@ -210,7 +230,10 @@ def main():
             groups['learner process'] += c_
         else:
             groups['other'] += c_
-    out = dict(match=a.match, window_s=round(win, 1), updates=[a.from_update, a.to_update], cpus=cpus, capacity=cap,
+    nk = {}
+    for k_, _ in procs_seen.values():
+        nk[k_] = nk.get(k_, 0) + 1
+    out = dict(match=a.match, trainer_pid=root, processes=nk, window_s=round(win, 1), updates=[a.from_update, a.to_update], cpus=cpus, capacity=cap,
                total_cores=round(total, 3), idle_cores=round(cap - total, 3), groups={k: round(v, 3) for k, v in groups.items()},
                roles=dict(sorted(roles.items(), key=lambda kv: -(kv[1]['cores'] or 0))))
     with open(a.out, 'w') as f:
