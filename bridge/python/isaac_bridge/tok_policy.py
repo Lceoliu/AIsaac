@@ -167,12 +167,7 @@ N_ITEM_TOK = INV_CAP + 4   # held collectibles, the active item, two trinkets, t
 _GOLDEN = np.uint64(0x9E3779B97F4A7C15)
 
 
-def _mix64(z):
-    """splitmix64's finaliser on a uint64 array (wrapping arithmetic)."""
-    with np.errstate(over='ignore'):
-        z = (z ^ (z >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
-        z = (z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
-        return z ^ (z >> np.uint64(31))
+from .tok_obs import mix64 as _mix64   # noqa: E402  (splitmix64's finaliser: in tok_obs, torch-free, for the workers)
 
 
 def crn_uniforms(keys, t, columns):

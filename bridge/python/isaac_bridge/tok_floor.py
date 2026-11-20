@@ -72,6 +72,7 @@ from .tok_branch import (RewindLedger, end_reward, rewind_cfg, AUX_LOGP, AUX_PRE
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
 from .tok_obs import ring_put   # noqa: E402
+from .tok_obs import check_worker_torch   # noqa: E402
 from .tok_sampler import (attach_ring_gen, check_ring_mode, ring_confirm, ring_open, ring_publish,   # noqa: E402
                           tracemalloc_spec)
 from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
@@ -1752,6 +1753,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         episodes_left, episode_n = 0, 0
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
+            check_worker_torch(index)   # (ISAAC_RL_WORKER_LEAN: torch loaded since the start ends the run)
             if tm_tick is not None:
                 tm_tick()
             mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()

@@ -327,6 +327,7 @@ class TokSamplerConfig:
     # the trainer's ISAAC_RL_RING_COMPACT (the workers refuse another; -1: not set, nothing checked)
     ring_gen_block: str = ''
     ring_compact: int = -1
+    worker_lean: int = -1   # (the memory ledger) the trainer's ISAAC_RL_WORKER_LEAN (-1: not set, nothing checked)
     mode: str = 'room'                          # 'room': one room per episode; 'floor' / 'run': tok_floor.py
     items: bool = False                           # 2026-10-06: the bridge's lean_items, ROW's item fields, 5 actions
     run_seconds: float = 1800.0                   # run: an episode's time limit (game seconds)
@@ -431,7 +432,10 @@ def attach(names, workers, initialize=False):
     actions = np.ndarray((workers, ACTION_F), np.int32, buffer=blocks[1].buf)
     stats = np.ndarray((workers, len(STATS)), np.float64, buffer=blocks[2].buf)
     control = np.ndarray((4,), np.int64, buffer=blocks[3].buf)   # [0] stop, [1] the trainer is updating
-    from .structured_input import VERSION
+    if TO_.WORKER_LEAN:   # (the same number: structured_input re-exports schema_v2's, and imports torch)
+        from .schema_v2 import VERSION
+    else:
+        from .structured_input import VERSION
     schema=(VERSION<<32)|ROW.itemsize
     if initialize:control[3]=schema
     elif int(control[3])!=schema:
@@ -461,24 +465,40 @@ def attach_ring_gen(name, workers):
     return block, gen[:, :TEACH_RING], gen[:, TEACH_RING:TEACH_RING + V2_RING], gen[:, -1]
 
 
-def ring_ack_value(compact):
-    """(Codex round 26) What a worker confirms: the ring protocol it writes, and its ISAAC_RL_RING_COMPACT."""
-    return (RING_PROTOCOL << 8) | 0x10 | int(bool(compact))
+ACK_LEAN, ACK_TORCH = 0x20, 0x40   # (ISAAC_RL_WORKER_LEAN) the worker's switch; torch loaded in the worker
+
+
+def ring_ack_value(compact, lean=False, torch_loaded=False):
+    """(Codex round 26) What a worker confirms: the ring protocol it writes, its ISAAC_RL_RING_COMPACT, and (the
+    memory ledger) its ISAAC_RL_WORKER_LEAN and whether it holds torch."""
+    return ((RING_PROTOCOL << 8) | 0x10 | int(bool(compact)) | (ACK_LEAN if lean else 0)
+            | (ACK_TORCH if torch_loaded else 0))
 
 
 def ring_ack_text(value):
     value = int(value)
     if value == 0:
         return 'no confirmation'
-    return f'ring protocol {value >> 8}, ISAAC_RL_RING_COMPACT {value & 1}'
+    return (f'ring protocol {value >> 8}, ISAAC_RL_RING_COMPACT {value & 1}, ISAAC_RL_WORKER_LEAN '
+            f'{int(bool(value & ACK_LEAN))}, torch {"loaded" if value & ACK_TORCH else "not loaded"}')
+
+
+def ring_ack_ok(value, want):
+    """A worker's confirmation against the trainer's (ring_ack_value of its own switches, no torch): the protocol and
+    both switches the same; with ISAAC_RL_WORKER_LEAN, torch not loaded (without it, whatever the worker holds)."""
+    value, want = int(value), int(want)
+    if (value & ~ACK_TORCH) != (want & ~ACK_TORCH):
+        return False
+    return not (want & ACK_LEAN and value & ACK_TORCH)
 
 
 def ring_confirm(ack, index):
-    """(Codex round 26) A worker's first act on the rings: its protocol and ring mode into its confirmation (the
+    """(Codex round 26) A worker's first act on the rings: its protocol and switches into its confirmation (the
     trainer waits for every worker's, TokSampler.confirm_rings, before it samples; a worker of an older tree writes
-    none and is refused there, never run with records it does not stamp)."""
+    none and is refused there, never run with records it does not stamp). (The memory ledger) also whether this
+    worker process holds torch now: it has imported its modules and attached its blocks."""
     from . import tok_obs
-    ack[index] = ring_ack_value(tok_obs.RING_COMPACT)
+    ack[index] = ring_ack_value(tok_obs.RING_COMPACT, tok_obs.WORKER_LEAN, 'torch' in sys.modules)
 
 
 def ring_open(gen, i, slot, c):
@@ -511,6 +531,10 @@ def check_ring_mode(cfg):
     want = int(getattr(cfg, 'ring_compact', -1))
     if want >= 0 and want != int(tok_obs.RING_COMPACT):
         raise RuntimeError(f'ISAAC_RL_RING_COMPACT: this worker {int(tok_obs.RING_COMPACT)}, the trainer {want} '
+                           f'(set it the same for every process)')
+    want = int(getattr(cfg, 'worker_lean', -1))
+    if want >= 0 and want != int(tok_obs.WORKER_LEAN):
+        raise RuntimeError(f'ISAAC_RL_WORKER_LEAN: this worker {int(tok_obs.WORKER_LEAN)}, the trainer {want} '
                            f'(set it the same for every process)')
 
 
@@ -1342,6 +1366,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         episodes_left, episode_n, state_seed = 0, 0, None
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
+            TO_.check_worker_torch(index)   # (ISAAC_RL_WORKER_LEAN: torch loaded since the start ends the run)
             mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()
             if builder.stalled():   # the next start state's build hangs (training went on with the old one)
                 recover('stall')
@@ -1548,6 +1573,7 @@ class TokSampler:
         gb = shared_memory.SharedMemory(create=True, size=ring_gen_size(n))
         self.blocks.append(gb)
         cfg.ring_gen_block, cfg.ring_compact = gb.name, int(RING_COMPACT)
+        cfg.worker_lean = int(TO_.WORKER_LEAN)
         attached_g, self.teach_gen, self.v2_gen, self.ring_ack = attach_ring_gen(gb.name, n)
         self.teach_gen[:], self.v2_gen[:], self.ring_ack[:] = 0, 0, 0
         self.attached.append(attached_g)
@@ -1697,7 +1723,7 @@ class TokSampler:
             self._lanes[c.fileno()] = i
             self._poller.register(c.fileno(), select.POLLIN)
             self._lane_poller.register(c.fileno(), select.POLLIN)
-        if self.teach_rows is not None or self.v2_rows is not None:   # (Codex round 26: before any sampling)
+        if self.teach_rows is not None or self.v2_rows is not None or TO_.WORKER_LEAN:   # (before any sampling)
             self.confirm_rings()
 
     def confirm_rings(self, timeout=None):
@@ -1707,12 +1733,12 @@ class TokSampler:
         default 600 s; a worker confirms when it attaches its blocks, before its games start) ends the run: the workers
         stopped, the blocks released, VisibleV3Fatal with the reason (train / eval exit non-zero; not retried)."""
         from .tok_obs import RING_COMPACT
-        want = ring_ack_value(RING_COMPACT)
+        want = ring_ack_value(RING_COMPACT, TO_.WORKER_LEAN)
         limit = float(timeout if timeout is not None else os.environ.get('ISAAC_RL_RING_CONFIRM_S', '600'))
         t0 = time.monotonic()
         while True:
             acks = [int(a) for a in self.ring_ack]
-            wrong = [(i, a) for i, a in enumerate(acks) if a and a != want]
+            wrong = [(i, a) for i, a in enumerate(acks) if a and not ring_ack_ok(a, want)]
             missing = [i for i, a in enumerate(acks) if not a]
             reason = None
             if wrong:
@@ -1945,7 +1971,8 @@ class TokSampler:
         another one if its cleanup failed): self.fatal, with the reason (from the pipe, else the file) or a plain
         statement that none reached the parent."""
         # (mode 0: never, as 05f1622 -- unless --rewind 1: a worker's missing restore count, tok_floor.RewindFatal)
-        if self.fatal is not None or not (VP_fatal_active() or getattr(self.cfg, 'rewind', 0) or TO_.FAST_ROW):
+        if self.fatal is not None or not (VP_fatal_active() or getattr(self.cfg, 'rewind', 0) or TO_.FAST_ROW or
+                                          TO_.WORKER_LEAN):
             return
         p = self.procs[i]
         code = p.exitcode
