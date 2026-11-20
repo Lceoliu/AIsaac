@@ -2155,6 +2155,8 @@ static int obs_lua_rewinds(lua_State *L) {
     return 1;
 }
 
+// (every Lua caller syncs rw_last through abp_native_rewinds before it -- rewind_block in abp_bridge.lua; a new call
+//  path that does not hands back here on every call: "rewind count changed" in the fallback reasons, slower, correct)
 static const char *obs_fixed(long long lf, int extra, size_t *len) {
     const char *why = NULL;
 #define OBS_GIVE_UP(reason) do { why = (reason); goto give_up; } while (0)

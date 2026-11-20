@@ -2635,6 +2635,8 @@ function lean_blocks(event, resend, here, clear, novis)
 end
 
 -- The fixed part of a lean observation (header .. entities .. lasers): native in mode 1 / 2 when it can, else Lua.
+-- (2026-11-20) every caller takes rewind_block first: the native part hands back while the game's restore count
+-- differs from the one abp_native_rewinds last returned (a new call path without it only falls back to Lua, slower)
 function lean_fixed(mode, here, extra)
 	if mode ~= 0 and next(state.lethal) == nil then
 		local s = ABP_NATIVE_OBS
