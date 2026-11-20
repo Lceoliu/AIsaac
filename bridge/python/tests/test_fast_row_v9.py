@@ -40,14 +40,27 @@ def _raw():
 
 
 def payload(k, hurt_at, rw_counts, inv_at, coin_at, active_used_at, dead_at, v3, frame, stage_at=10 ** 6,
-            raw_block=None):
+            raw_block=None, n_players=1, n_ent=None, room_type=None, ptype_at=10 ** 6, active_of=None):
     p, d, e, room = V.world(0)
+    if n_ent is not None:   # (round 24-4: exactly 64 / 65 old entities)
+        e = np.resize(e, n_ent)
+        e['x'] = e['x'] + 3.0 * np.arange(n_ent)
+    if room_type is not None:
+        room = (room_type,) + room[1:]
     if k >= stage_at:   # (the next floor: the same room index, another stage -- a run's EV_EXIT, a floor's end)
         room = room[:5] + (room[5] + 1,) + room[6:]
     p['x'], p['y'] = 300.0 + 2.0 * k, 280.0 - 1.0 * k
     p['coins'] = 17 + (1 if k >= coin_at else 0)
     p['active'], p['active_charge'] = 45.0, (0.0 if k >= active_used_at else 6.0)
     p['dead'] = 1.0 if k == dead_at else 0.0
+    if k >= ptype_at:
+        p['ptype'] = 3.0
+    if active_of is not None:
+        p['active'] = active_of(k)
+    if n_players > 1:   # (more bodies: the C side and encode_row read player 0)
+        q = p.copy()
+        q['x'] = q['x'] + 40.0
+        p = np.concatenate([p] + [q] * (n_players - 1))
     flags = (1 if k >= 9 else 0)   # the room's clear flag from record 9
     flags |= 2 if k % 7 == 0 else 0   # the same terrain block now and then (the fast path takes it)
     flags |= 16 if k in inv_at else 0
@@ -82,9 +95,9 @@ def payload(k, hurt_at, rw_counts, inv_at, coin_at, active_used_at, dead_at, v3,
     return out
 
 
-def state(stall_mode, items, rewind, run=False):
+def state(stall_mode, items, rewind, run=False, limit=10 ** 6, stall=STALL):
     pk, it = TO.stall_flags(stall_mode)
-    return TO.EpisodeState(10 ** 6, floor=True, run=run, stall=STALL, items=items, stall_pickups=pk, stall_items=it,
+    return TO.EpisodeState(limit, floor=True, run=run, stall=stall, items=items, stall_pickups=pk, stall_items=it,
                            stall_first=TO.stall_first(stall_mode), rewind=rewind)
 
 
@@ -337,3 +350,81 @@ def test_bad_numbers_go_to_encode_row(fast, monkeypatch, field, i, v):
         fr.encode(bad, row, row.ctypes.data, 1)
         assert row.tobytes() == ref.tobytes()
     assert fr.reasons.get(-15) == 1
+
+
+# ---- (Codex round 24) the record before's large active, negative bombs, the boundaries met on purpose
+
+
+def _run_both(fast, monkeypatch, tmp_path, n=N, st_kw=None, **pkw):
+    """FastRow in check mode and a pure encode_row reference over the same payloads; returns (got, ref, fr, stats)."""
+    monkeypatch.setenv('ISAAC_RL_FAST_ROW_CHECK_DIR', str(tmp_path))
+    monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', 0)
+    monkeypatch.setattr(TO, 'FAST_ROW_CHECKING', True)
+    TO.child_start('worker')
+    st_kw = st_kw or {}
+    sc = scenario(pkw.pop('rewind_case', 'off'), False)
+    sc.update({k: pkw.pop(k) for k in list(pkw) if k in sc})
+    pls = [payload(k, v3=False, frame=None, **sc, **pkw) for k in range(n)]
+    dec_r, st_r = AL.LeanDecoder(), state(**st_kw)
+    ref, ref_done = np.zeros(n, TO.ROW), []
+    for k in range(n):
+        ref_done.append(TO.encode_row(dec_r.decode(pls[k]), st_r, ref[k:k + 1], k))
+    ref['first'] = [1] + [0] * (n - 1)
+    dec, st = AL.LeanDecoder(), state(**st_kw)
+    fr = TO.FastRow(fast, st, dec, 0, 0, 0)
+    got, done = np.zeros(n, TO.ROW), []
+    for k in range(n):
+        s_ = got[k:k + 1]
+        done.append(fr.encode(dec.decode(pls[k]) if k == 0 else pls[k], s_, s_.ctypes.data, k))
+    bad = [nm for nm in TO.ROW.names if got[nm].tobytes() != ref[nm].tobytes()]
+    assert not bad and done == ref_done, (bad, done, ref_done, fr.reasons)
+    assert TO.FAST_STATS['check_mismatch'] == 0
+    return got, ref, fr, dict(TO.FAST_STATS)
+
+
+def test_a_large_active_then_a_normal_one(fast, monkeypatch, tmp_path):
+    """(24-1) items: active 1e300 at one record (handed back -14, encode_row keeps the large int as prev_active), 45 at
+    the next ones (the fast path again: the record before's active compared, never converted)."""
+    _, _, fr, st_ = _run_both(fast, monkeypatch, tmp_path, n=12, st_kw=dict(stall_mode='events', items=True,
+                                                                           rewind=False),
+                              active_of=lambda k: 1e300 if k == 5 else 45.0)
+    assert fr.reasons.get(-14) == 1 and st_['fast'] >= 8
+
+
+def test_negative_bombs_are_handed_back(fast, monkeypatch):
+    """(24-1) bombs -1: handed back (-15; the C side would wrap the uint8); FastRow then does what encode_row does."""
+    fr, pl, row = _base(fast, monkeypatch, rewind=False, items=False)
+    bad = _patch(pl, _PV + 8 * 15, '<d', -1.0)
+    code, same = _prefilled_call(fr, bad, row)
+    assert code == -15 and all(same)
+
+
+@pytest.mark.parametrize('case', ['multi', 'ent64', 'ent65', 'boss', 'char', 'block_after_rewind', 'rewind_death',
+                                  'rewind_cap', 'rewind_stall'])
+def test_boundaries_met_on_purpose(fast, monkeypatch, tmp_path, case):
+    """(24-4, the directed cases) each boundary the acceptance asks for, met by a synthetic sequence: the records equal
+    encode_row's and its hit counter moved (check mode)."""
+    st_kw = dict(stall_mode='events', items=True, rewind=True)
+    kw, want = {}, None
+    if case == 'multi':
+        kw, want = dict(n_players=2), 'hit_multi_player'
+    elif case == 'ent64':
+        kw, want = dict(n_ent=64), 'hit_ent64_exit'
+    elif case == 'ent65':
+        kw, want = dict(n_ent=65), 'hit_ent65_exit'
+    elif case == 'boss':
+        kw, want = dict(room_type=5), 'hit_boss_clear'
+    elif case == 'char':
+        kw, want = dict(ptype_at=20), 'hit_char_change_fast'
+    elif case == 'block_after_rewind':   # (a rewind at 14, an inventory block at 15)
+        kw, want = dict(rewind_case='on', inv_at={0, 15}), 'hit_block_after_rewind'
+    elif case == 'rewind_death':
+        kw, want = dict(rewind_case='on', dead_at=14), 'hit_rewind_death'
+    elif case == 'rewind_cap':
+        kw, want = dict(rewind_case='on'), 'hit_rewind_cap'
+        st_kw['limit'] = 14
+    elif case == 'rewind_stall':
+        kw, want = dict(rewind_case='on'), 'hit_rewind_stall'
+        st_kw['stall'] = 1
+    _, _, fr, st_ = _run_both(fast, monkeypatch, tmp_path, st_kw=st_kw, **kw)
+    assert st_[want] > 0, (want, {k: v for k, v in st_.items() if v})

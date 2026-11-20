@@ -3403,6 +3403,14 @@ def main(argv=None, child=None, actor=None):
     else:
         os.environ.setdefault('ISAAC_RL_FATAL_DIR', str(out))   # (a worker's visible-v3 fatal reason: tok_sampler)
         from isaac_bridge import tok_obs as TO_fr
+        if TO_fr.FAST_ROW_CHECK_WORKERS and not TO_fr.FAST_ROW:
+            raise SystemExit('native ROW encoder: ISAAC_RL_FAST_ROW_CHECK_WORKERS (the canary) needs ISAAC_RL_FAST_ROW=1')
+        if (TO_fr.FAST_ROW_CHECK_WORKERS or TO_fr.FAST_ROW_CHECKING) and \
+                not os.environ.get('ISAAC_RL_FAST_ROW_CHECK_DIR'):
+            raise SystemExit('native ROW encoder: check mode / the canary needs ISAAC_RL_FAST_ROW_CHECK_DIR')
+        if TO_fr.FAST_ROW_CHECK_WORKERS - set(range(cfg.workers)):
+            raise SystemExit(f'native ROW encoder: ISAAC_RL_FAST_ROW_CHECK_WORKERS {sorted(TO_fr.FAST_ROW_CHECK_WORKERS)}'
+                             f' not among the {cfg.workers} workers')
         if TO_fr.FAST_ROW:   # (Codex round 23-2: the switch on requires this tree's library, checked before any worker)
             from isaac_bridge.tok_sampler import row_library as row_library_
             try:
@@ -5582,7 +5590,7 @@ def main(argv=None, child=None, actor=None):
                 row['v3_reference'] = float(stats[:, ST['v3_reference']].sum())
         if 'fr_fast' in ST:   # (2026-11-20, the native ROW encoder: the workers' FastRow records so far, by path)
             for k_f in ('fr_fast', 'fr_slow', 'fr_slow_block', 'fr_slow_room', 'fr_slow_vis', 'fr_slow_rewind',
-                        'fr_slow_other'):
+                        'fr_slow_other', 'fr_check_records', 'fr_check_mismatch'):
                 row[k_f] = float(stats[:, ST[k_f]].sum())
         if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): this update's worker deltas
             tot = {k_p: float(stats[:, ST[k_p]].sum()) for k_p in ('pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups')}

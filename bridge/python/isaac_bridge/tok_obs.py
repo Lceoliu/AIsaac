@@ -838,7 +838,19 @@ def _items_step(st, row, stage, active, charge, events):
 #  and the EpisodeState, the two ROW slots and the states compared byte for byte (FastRow._check).
 FAST_ROW_MODE = os.environ.get('ISAAC_RL_FAST_ROW', '0')
 FAST_ROW = FAST_ROW_MODE in ('1', '2')
-FAST_ROW_CHECKING = FAST_ROW_MODE == '2'
+FAST_ROW_CHECKING = FAST_ROW_MODE == '2'   # (this process's: configure_worker sets it in a canary worker)
+# (Codex round 24, C: the canary) ISAAC_RL_FAST_ROW=1 and ISAAC_RL_FAST_ROW_CHECK_WORKERS=<worker indices, e.g. 0>: those
+# workers run check mode (every fast record also through encode_row, a difference stops the run), the others mode 1
+FAST_ROW_CHECK_WORKERS = {int(x) for x in os.environ.get('ISAAC_RL_FAST_ROW_CHECK_WORKERS', '').split(',') if x.strip()}
+
+
+def configure_worker(index):
+    """A sampler worker's FastRow mode, at its start: check mode when ISAAC_RL_FAST_ROW=2, or when the switch is on and
+    the worker is one of ISAAC_RL_FAST_ROW_CHECK_WORKERS (the canary); its reports say which worker it is."""
+    global FAST_ROW_CHECKING
+    _WORKER[0] = int(index)
+    if FAST_ROW and int(index) in FAST_ROW_CHECK_WORKERS:
+        FAST_ROW_CHECKING = True
 _ROW_FIELDS = ('player', 'ent', 'ent_id', 'doors', 'patch', 'grid', 'map', 'n_ent', 'n_doors', 't', 'hurt', 'damage',
                'done', 'bombs', 'events', 'episode', 'seed', 'group', 'first', 'ent_item', 'pcharge', 'pchar',
                'ent_price', 'phearts', 'room_type', 'rewind', 'visible_schema', 'visible_bytes', 'visible_frame',
@@ -860,7 +872,7 @@ def _row_offs(items, run):
     return o
 
 
-_ROW_VERSION = 10   # (10: 2026-11-20, Codex round 23-1: -15, the integer conversions encode_row raises on) (9: 2026-11-20, ROW schema 8: the v3 frame, the rewind count, EV_NOHIT, --stall-progress first,
+_ROW_VERSION = 11   # (11: Codex round 24-1: the record before's active compared as a double, bombs < 0 handed back) (10: 2026-11-20, Codex round 23-1: -15, the integer conversions encode_row raises on) (9: 2026-11-20, ROW schema 8: the v3 frame, the rewind count, EV_NOHIT, --stall-progress first,
 #                    _items_step, the ext pointers) (8: 2026-11-20, the rewind count block, flag 128, handed back: -10)
 #                    abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
 #                    2026-10-08, abp-0.2.16's 144-byte entity records and ENT_F = 56; 6: 2026-10-08, abp-0.2.17's
@@ -949,8 +961,9 @@ class FastRow:
     (Version 9, 2026-11-20) the EpisodeState is brought up to date from the C side's slots before a record goes through
     encode_row and after a fast record that changed it (RC_OUT_DIRTY: the rewind count, the nohit room, the first-mode
     keys, the active item's state); st.inv_gain (read only inside encode_row, reset by _inventory) is not kept.
-    tag: where the episode is played ('main' -- archive starts too --, 'branch' -- the cf / branch points' forks --,
-    'lab', 'teacher', 'room'), for check mode's boundary counts."""
+    tag: where the episode is played ('start' / 'archive' -- a main episode's fresh or archive start --, 'branch' -- a
+    branch point's --, 'lab', 'cf' / 'teacher' -- a cf / teacher v2 branch (tok_teacher2.play_branch) --, 'room'), for
+    check mode's boundary counts."""
 
     def __init__(self, fn, st, decoder, episode=0, seed=0, group=0, tag='main'):
         self.fn, self.st, self.decoder = fn, st, decoder
@@ -974,7 +987,8 @@ class FastRow:
         self.obs = None
         self.fast = self.slow = 0
         self.reasons = {}   # abp_row_encode's hand-back codes: how often
-        self._code = None   # (check mode's boundary counts) this record's hand-back code; the paths of the last two
+        self._code = None   # (check mode's boundary counts) this record's hand-back code, payload; the last two paths
+        self._payload = None
         self._paths = (None, None)
         self._last_rw = 0
         self._last_pchar = None
@@ -997,6 +1011,7 @@ class FastRow:
     def encode(self, item, row, row_address, t):
         c = self.ctx
         self._code = None
+        self._payload = item if type(item) is bytes else None
         if type(item) is bytes:
             c[RC_T] = t
             c[RC_FIRST] = t == 0
@@ -1061,10 +1076,12 @@ class FastRow:
         return done
 
     def _track(self, fast, row, payload):
-        """(check mode, Codex round 23) how often the boundaries the acceptance asks for were met: a multi-body lean
-        record or a character change, 64 old entities with the floor's exit / 65 (slow_-3), a same-room boss clear, a
-        map / inventory block right after a rewind, a rewind on a death / cap / stall record, fast -> slow -> fast in
-        an episode by its tag (archive starts are 'main' episodes, the cf / branch forks 'branch')."""
+        """(check mode; Codex rounds 23 / 24: by the real conditions) how often the boundaries the acceptance asks for
+        were met: a fast record with more than one body; a character change on a fast / a slow record; a raw payload
+        with exactly 64 old entities and the floor's exit tokens (fast) / exactly 65 (handed back, -3); a same-room boss
+        clear on a fast record; a map or inventory block (the payload's flags 8 / 16) on the record right after a
+        rewind; a rewind on a death / a time-limit (cap) / a stall record, apart; fast -> slow -> fast within an episode
+        by where it is played (tag: a fresh start, an archive start, a cf branch, a teacher branch, ...)."""
         p2, p1 = self._paths
         if fast and p1 is False and p2 is True:
             _bump('hit_fsf_' + self.tag)
@@ -1073,23 +1090,30 @@ class FastRow:
         done = int(row['done'][0])
         if rw:
             _bump('hit_rewind')
-            if done in (2, 3):
-                _bump('hit_rewind_done')
-        if not fast and self._last_rw and self._code == -2:
+            if done == 2:
+                _bump('hit_rewind_death')
+            elif done == 3:
+                _bump('hit_rewind_cap' if int(row['t'][0]) >= self.st.limit else 'hit_rewind_stall')
+        pl = payload if payload is not None else self._payload
+        flags = pl[12] if pl is not None and len(pl) > 12 else 0
+        if self._last_rw and flags & (8 | 16):
             _bump('hit_block_after_rewind')
         pc = int(row['pchar'][0])
         if self._last_pchar is not None and pc != self._last_pchar:
-            _bump('hit_char_change')
-        if fast:
-            n_pl, n_dr = payload[12 + 1], payload[12 + 2]
-            if n_pl > 1:
-                _bump('hit_multi_player')
+            _bump('hit_char_change_fast' if fast else 'hit_char_change_slow')
+        if pl is not None and len(pl) >= 16:
+            n_pl, n_dr = pl[13], pl[14]
             at = 96 + 8 * 39 * n_pl + 16 * n_dr
-            if len(payload) >= at + 2 and struct.unpack_from('<H', payload, at)[0] == ENT_CAP and \
-                    self.ctx[RC_N_EXITS] > 0:
+            n_ent = struct.unpack_from('<H', pl, at)[0] if len(pl) >= at + 2 else -1
+            exits = self.ctx[RC_N_EXITS] > 0
+            if fast and n_pl > 1:
+                _bump('hit_multi_player')
+            if fast and n_ent == ENT_CAP and exits:
                 _bump('hit_ent64_exit')
-            if int(row['events'][0]) & EV_BOSS:
-                _bump('hit_boss_clear')
+            if not fast and n_ent == ENT_CAP + 1 and exits and self._code == -3:
+                _bump('hit_ent65_exit')
+        if fast and int(row['events'][0]) & EV_BOSS:
+            _bump('hit_boss_clear')
         self._last_rw, self._last_pchar = rw, pc
 
     def _check(self, item, row, row_address, t):
@@ -1241,16 +1265,21 @@ class FastRow:
 # (version 9 / 10) this process's FastRow counters, under fixed keys only (Codex round 23-3: a thread adding a key while
 # fast_counts or a report read the dict ended the worker): fast / slow records, the hand-back codes, what the fast
 # records did; in check mode the records compared, the mismatches, the children forked and the boundary counts
-_TAGS = ('main', 'branch', 'lab', 'teacher', 'room', 'other')
+_TAGS = ('start', 'archive', 'branch', 'lab', 'cf', 'teacher', 'room', 'other')
 _STAT_KEYS = (('fast', 'slow', 'slow_obs') + tuple('slow_%d' % c for c in _KNOWN_CODES) +
               ('fast_rw', 'fast_nohit_state', 'fast_first_prog', 'fast_active_state', 'fast_ev_nohit', 'fast_ev_active',
-               'check_records', 'check_mismatch', 'children_forked', 'hit_multi_player', 'hit_char_change',
-               'hit_ent64_exit', 'hit_boss_clear', 'hit_block_after_rewind', 'hit_rewind', 'hit_rewind_done') +
+               'check_records', 'check_mismatch', 'children_forked', 'hit_multi_player', 'hit_char_change_fast',
+               'hit_char_change_slow', 'hit_ent64_exit', 'hit_ent65_exit', 'hit_boss_clear', 'hit_block_after_rewind',
+               'hit_rewind', 'hit_rewind_death', 'hit_rewind_cap', 'hit_rewind_stall') +
               tuple('hit_fsf_' + t for t in _TAGS))
 FAST_STATS = dict.fromkeys(_STAT_KEYS, 0)
 _CHECK_DUMPS = [0]
 _CHECK_LAST = [0.0]
 _ROLE = ['worker']
+_WORKER = [-1]
+import threading as _threading   # noqa: E402
+_REPORT_LOCK = [_threading.Lock()]   # (Codex round 24-3: one report at a time per process; a forked child: its own)
+_FINAL = [False]                     # (no periodic report after the final one)
 
 
 def _bump(key, n=1):
@@ -1259,20 +1288,38 @@ def _bump(key, n=1):
 
 
 def fast_counts():
-    """(fast, slow, slow by hand-back group: block, room / floor, visible, rewind, other) of this process's FastRow
-    records so far -- tok_sampler's fr_* worker stats. Reads fixed keys; never iterates the dict."""
+    """(fast, slow, slow by hand-back group: block, room / floor, visible, rewind, other, check mode's records compared,
+    mismatches) of this process's FastRow records so far -- tok_sampler's fr_* worker stats (the canary's compared /
+    mismatches in progress.csv). Reads fixed keys; never iterates the dict."""
     s = FAST_STATS
     g = lambda *codes: sum(s['slow_%d' % c] for c in codes)   # noqa: E731
     return [s['fast'], s['slow'], g(-2), g(-4, -5, -6, -8), g(-13), g(-11, -12),
-            g(-1, -3, -7, -14, -15) + s['slow_obs']]
+            g(-1, -3, -7, -14, -15) + s['slow_obs'], s['check_records'], s['check_mismatch']]
 
 
 def child_start(role):
-    """(check mode) In a forked child (a cf point, a search): its own counts from zero, under its role."""
+    """(check mode) In a forked child (a cf point, a search): its own counts from zero, under its role, its own report
+    lock (the parent's may have been held by another thread at the fork) and no final yet."""
+    _REPORT_LOCK[0] = _threading.Lock()
+    _FINAL[0] = False
     _ROLE[0] = role
     for k in _STAT_KEYS:
         FAST_STATS[k] = 0
     _CHECK_LAST[0] = 0.0
+
+
+def note_child(pid, role):
+    """(check mode, in the parent right after a fork) the child's pid and role appended to
+    ISAAC_RL_FAST_ROW_CHECK_DIR/fastrow-children-<parent pid>.txt and counted (children_forked): tools/fastrow_verify.py
+    requires a final report of every child listed. Raises FastRowFatal when it cannot be written."""
+    _bump('children_forked')
+    d = os.environ.get('ISAAC_RL_FAST_ROW_CHECK_DIR')
+    try:
+        with _REPORT_LOCK[0]:
+            with open(os.path.join(d, f'fastrow-children-{os.getpid()}.txt'), 'a') as f:
+                f.write(f'{int(pid)} {role}\n')
+    except (OSError, TypeError) as exc:
+        raise FastRowFatal(f'FastRow check: the child {pid} could not be listed: {exc}') from None
 
 
 def fast_row_final():
@@ -1323,13 +1370,18 @@ def _check_report(force=False, final=False):
     now = _time.time()
     if not force and now - _CHECK_LAST[0] < 30:
         return
-    _CHECK_LAST[0] = now
-    try:
-        import json as _json
-        tmp = os.path.join(d, f'.fastrow-{os.getpid()}.json')
-        with open(tmp, 'w') as f:
-            _json.dump(dict({k: FAST_STATS[k] for k in _STAT_KEYS}, pid=os.getpid(), ppid=os.getppid(),
-                            role=_ROLE[0], final=bool(final), time=now), f)
-        os.replace(tmp, os.path.join(d, f'fastrow-{os.getpid()}.json'))
-    except OSError as exc:
-        raise FastRowFatal(f'FastRow check: the counts could not be written to {d}: {exc}') from None
+    with _REPORT_LOCK[0]:   # (round 24-3: serialised; a final one is never overwritten by a later periodic one)
+        if _FINAL[0] and not final:
+            return
+        _CHECK_LAST[0] = now
+        try:
+            import json as _json
+            tmp = os.path.join(d, f'.fastrow-{os.getpid()}-{_threading.get_ident()}.json')
+            with open(tmp, 'w') as f:
+                _json.dump(dict({k: FAST_STATS[k] for k in _STAT_KEYS}, pid=os.getpid(), ppid=os.getppid(),
+                                role=_ROLE[0], worker=_WORKER[0], final=bool(final), time=now), f)
+            os.replace(tmp, os.path.join(d, f'fastrow-{os.getpid()}.json'))
+        except OSError as exc:
+            raise FastRowFatal(f'FastRow check: the counts could not be written to {d}: {exc}') from None
+        if final:
+            _FINAL[0] = True

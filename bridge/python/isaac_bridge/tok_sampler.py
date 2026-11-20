@@ -186,6 +186,8 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # (-2: map / inventory / a changed terrain), a room or floor change (-4 / -5 / -6 / -8), the visible check
          # (-13), a rewind or the first checkpoint (-11 / -12), the rest (-1 / -3 / -7 / -14; a record never offered)
          'fr_fast', 'fr_slow', 'fr_slow_block', 'fr_slow_room', 'fr_slow_vis', 'fr_slow_rewind', 'fr_slow_other',
+         # (round 24 C) a check-mode worker's (the canary's) records compared and mismatches
+         'fr_check_records', 'fr_check_mismatch',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
@@ -1143,6 +1145,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
     mine = stats[index]
     slots = (rows[2 * index:2 * index + 1], rows[2 * index + 1:2 * index + 2])
     slot_address = (slots[0].ctypes.data, slots[1].ctypes.data)
+    TO_.configure_worker(index)   # (round 24 C: check mode in a canary worker)
     fast_fn = fast_row_function(row_library(cfg))   # None: LeanDecoder + encode_row as before
     group = cfg.assign[index]
     spec = cfg.specs[group]
@@ -1224,7 +1227,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         episodes_left, episode_n, state_seed = 0, 0, None
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
-            mine[ST['fr_fast']:ST['fr_slow_other'] + 1] = fast_counts()
+            mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()
             if builder.stalled():   # the next start state's build hangs (training went on with the old one)
                 recover('stall')
             # the next start state: when this one has served its episodes and the next is built (training goes on with
@@ -1368,10 +1371,12 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         mine[ST['errors']] += 1000
     finally:
         mine[ST['finished']] = 1
-        try:   # (check mode: this worker's final counts)
+        try:   # (check mode: this worker's final counts; round 24-2: a failure is the worker's fatal)
             fast_row_final()
-        except Exception:
-            traceback.print_exc()
+        except Exception as exc_:   # noqa: BLE001
+            if v3_fatal is None:
+                v3_fatal = exc_
+                report_fatal(index, conn, exc_, fatal_dir=cfg.fatal_dir)
         # killed outright (SIGTERM) or a build still in flight (it may hang): the instance and its clones are killed;
         # otherwise closed as before
         hard = bool(terminated) or (builder is not None and not builder.ready.is_set())

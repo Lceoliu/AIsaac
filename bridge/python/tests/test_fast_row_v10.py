@@ -180,3 +180,105 @@ def test_a_forked_childs_last_record_mismatch_reaches_the_parent(check_mode):
     rep = json.loads((check_mode / f'fastrow-{pid}.json').read_text())
     assert rep['final'] and rep['role'] == 'cf-child' and rep['check_mismatch'] == 1 and rep['ppid'] == os.getpid()
     assert tok_obs.FAST_STATS['children_forked'] == 1
+
+
+# ---- Codex round 24
+
+def test_two_report_writers_never_collide_and_a_final_stays(check_mode, monkeypatch):
+    """(24-3) the main thread and a teacher / cf thread of one process both publishing reports: serialised (before,
+    one could rename the other's temporary file away: FastRowFatal in a healthy worker); after the final one, a later
+    periodic report does not overwrite it."""
+    real_replace = os.replace
+
+    def slow_replace(a, b):   # (widens the window between the write and the rename)
+        time.sleep(0.002)
+        real_replace(a, b)
+    monkeypatch.setattr(os, 'replace', slow_replace)
+    errors = []
+
+    def writer():
+        for _ in range(60):
+            try:
+                tok_obs._check_report(True)
+            except Exception as exc:   # noqa: BLE001
+                errors.append(repr(exc))
+                return
+    ths = [threading.Thread(target=writer) for _ in range(2)]
+    for th in ths:
+        th.start()
+    for th in ths:
+        th.join()
+    assert not errors, errors[:2]
+    tok_obs.fast_row_final()
+    tok_obs._check_report(True)   # (a periodic one after the final: ignored)
+    rep = json.loads((check_mode / f'fastrow-{os.getpid()}.json').read_text())
+    assert rep['final'] is True
+
+
+def test_the_canary_checks_only_its_workers(monkeypatch):
+    """(24 C) ISAAC_RL_FAST_ROW=1 with ISAAC_RL_FAST_ROW_CHECK_WORKERS=0: worker 0 runs check mode, the others mode 1."""
+    monkeypatch.setattr(tok_obs, 'FAST_ROW', True)
+    monkeypatch.setattr(tok_obs, 'FAST_ROW_CHECK_WORKERS', {0})
+    for index, want in ((1, False), (0, True)):
+        monkeypatch.setattr(tok_obs, 'FAST_ROW_CHECKING', False)
+        tok_obs.configure_worker(index)
+        assert tok_obs.FAST_ROW_CHECKING is want and tok_obs._WORKER[0] == index
+    monkeypatch.setattr(tok_obs, 'FAST_ROW', False)   # (the switch off: no canary either)
+    monkeypatch.setattr(tok_obs, 'FAST_ROW_CHECKING', False)
+    tok_obs.configure_worker(0)
+    assert tok_obs.FAST_ROW_CHECKING is False
+
+
+@pytest.mark.skipif(not hasattr(os, 'fork'), reason='os.fork: Linux')
+def test_a_child_that_ended_86_just_before_the_timeout_kill_keeps_its_status(monkeypatch):
+    """(24-2) the child exits V3_FATAL_EXIT between the reaper's last look (WNOHANG: not yet) and its kill: reap_child
+    returns that status (the caller raises ChildFatal), not -1 (before: an ordinary timeout)."""
+    from isaac_bridge import tok_floor
+    pid = os.fork()
+    if pid == 0:
+        os._exit(VP.V3_FATAL_EXIT)
+    time.sleep(0.2)   # (it has exited; the stand-in below hides that from the first look)
+    real_waitpid = os.waitpid
+    calls = []
+
+    def waitpid(p, flags):
+        calls.append(flags)
+        if flags == os.WNOHANG and len(calls) == 1:
+            return 0, 0
+        return real_waitpid(p, flags)
+    monkeypatch.setattr(os, 'waitpid', waitpid)
+    status, timed_out = tok_floor.reap_child(pid, 0.0)
+    assert timed_out and os.WIFEXITED(status) and os.WEXITSTATUS(status) == VP.V3_FATAL_EXIT
+
+
+def _verify_dir(tmp_path, workers=(0, 1), final=True, child_final=True, mismatch=0, child_listed=True):
+    d = tmp_path / 'chk'
+    d.mkdir()
+    base = {k: 0 for k in tok_obs._STAT_KEYS}
+    for w in workers:
+        r = dict(base, pid=100 + w, ppid=1, role='worker', worker=w, final=final, fast=10, check_records=10,
+                 check_mismatch=mismatch if w == 0 else 0, children_forked=1 if w == 0 else 0)
+        (d / f'fastrow-{100 + w}.json').write_text(json.dumps(r))
+    (d / 'fastrow-200.json').write_text(json.dumps(dict(base, pid=200, ppid=100, role='cf-child', worker=0,
+                                                        final=child_final, fast=3, check_records=3)))
+    if child_listed:
+        (d / 'fastrow-children-100.txt').write_text('200 cf-child\n')
+    return d
+
+
+def test_the_verifier(tmp_path):
+    """(24-4) tools/fastrow_verify.py: PASS only with every worker's and every listed child's final report, no mismatch."""
+    sys.path.insert(0, str(HERE.parent / 'tools'))
+    import fastrow_verify as FV
+    for i, (kw, ok) in enumerate((({}, True), ({'final': False}, False), ({'child_final': False}, False),
+                                  ({'mismatch': 1}, False), ({'child_listed': False}, False),
+                                  ({'workers': (0,)}, False))):
+        sub = tmp_path / f'c{i}'
+        sub.mkdir()
+        d = _verify_dir(sub, **kw)
+        assert (FV.main([str(d), '--workers', '0-1']) == 0) is ok, kw
+    log = tmp_path / 'run.stderr'
+    log.write_text('tok floor worker 3: visible-v3 protocol error, the worker stops: FastRowFatal ...\n')
+    sub = tmp_path / 'clog'
+    sub.mkdir()
+    assert FV.main([str(_verify_dir(sub)), '--workers', '0-1', '--log', str(log)]) == 1
