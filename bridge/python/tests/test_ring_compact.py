@@ -1,7 +1,8 @@
 """(2026-11-20, the memory ledger: ISAAC_RL_RING_COMPACT) The workers' teacher and V2 rings written / read only up to
 each record's frame end. Checked against the whole-slot behaviour (the switch off) on the same records:
-  (a) every record taken from a ring: its fixed fields (every byte before the frame, padding included) and its frame up
-      to visible_bytes are the same bytes; past visible_bytes compact mode has zeros where the whole-slot copy had the
+  (a) every record taken from a ring: its fixed fields (field by field) and its frame up to visible_bytes are the same
+      bytes (the dtype's alignment padding is not compared: the readers assemble their output with np.stack, which
+      leaves padding uninitialised in either mode, as before this change); past visible_bytes compact mode has zeros where the whole-slot copy had the
       slot's stale bytes of earlier records -- and the readers downstream (tok_obs.compact_copy, the trainer's chunks;
       tok_policy.to_batch, the learner's batches) give the same results from both;
   (b) a full ring, a ring that wrapped, a reader that fell behind by more than the ring (the sampler's own readers,
@@ -76,12 +77,13 @@ def stale_ring(shape, seed=1):
 def put_take(rows, compact, monkeypatch, ring_shape=(1, 8)):
     monkeypatch.setattr(TO, 'RING_COMPACT', compact)
     ring = stale_ring(ring_shape)
-    out = []
+    out = np.zeros(len(rows), ROW)   # (byte copies of what ring_take returned: np.stack leaves padding uninitialised)
+    raw = out.view(np.uint8).reshape(len(rows), -1)
     for j in range(len(rows)):
         slot = j % ring_shape[1]
         TO.ring_put(ring[0, slot:slot + 1], rows[j:j + 1])
-        out.append(TO.ring_take(ring[0, slot:slot + 1]))
-    return np.stack(out)
+        raw[j] = np.frombuffer(TO.ring_take(ring[0, slot:slot + 1]).tobytes(), np.uint8)
+    return out
 
 
 FIELDS = [n for n in ROW.names if n != 'visible_frame']
@@ -169,8 +171,9 @@ def test_b_full_wrapped_and_lagging_readers(monkeypatch):
             n = TO.row_frame_end(a.reshape(1))
             assert all(a[f].tobytes() == b[f].tobytes() for f in FIELDS)
             assert a.tobytes()[ROW_FRAME_AT:n] == b.tobytes()[ROW_FRAME_AT:n]
-            if compact:
-                assert not np.frombuffer(b.tobytes()[n:], np.uint8).any()
+            if compact:   # (the frame past visible_bytes; not the dtype's padding: the readers' np.stack leaves
+                #            that uninitialised in both modes, as before this change, and no reader reads it)
+                assert not np.frombuffer(b['visible_frame'].tobytes()[n - ROW_FRAME_AT:], np.uint8).any()
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='os.fork / shared memory: Linux')
