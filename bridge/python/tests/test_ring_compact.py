@@ -43,7 +43,13 @@ from isaac_bridge import tok_teacher2 as T2   # noqa: E402
 from isaac_bridge import visible_producer as VP   # noqa: E402
 from isaac_bridge.tok_obs import FRAME_W, ROW, ROW_FRAME_AT   # noqa: E402
 
-FORK = pytest.mark.skipif(not hasattr(os, 'fork'), reason='os.fork / shared memory: Linux')
+_NO_FORK = pytest.mark.skipif(not hasattr(os, 'fork'), reason='os.fork / shared memory: Linux')
+
+
+def FORK(f):
+    """Linux only, and (912ad10) fork_in_process: these tests fork the pytest process, so they run where no device
+    context exists (conftest skips them while a device is visible; gate.sh runs them in its second pass)."""
+    return pytest.mark.fork_in_process(_NO_FORK(f))
 FIELDS = [n for n in ROW.names if n != 'visible_frame']
 
 
