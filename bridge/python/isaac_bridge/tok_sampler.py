@@ -189,6 +189,9 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          'fr_fast', 'fr_slow', 'fr_slow_block', 'fr_slow_room', 'fr_slow_vis', 'fr_slow_rewind', 'fr_slow_other',
          # (round 24 C) a check-mode worker's (the canary's) records compared and mismatches
          'fr_check_records', 'fr_check_mismatch',
+         # (Codex round 25, A1's review) ring_open found its slot already open (generation negative): another writer of
+         # the same worker's ring (the single-writer rule broken), or the previous attempt at this record failed midway
+         'ring_open_busy',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
@@ -453,9 +456,18 @@ def attach_ring_gen(name, workers):
 def ring_open(gen, i, slot, c):
     """A writer starts record c in ring slot [i, slot]: unpublished until ring_publish (a reader of the slot's earlier
     record sees its generation changed). x86-64 keeps stores in order and loads in order (TSO), so these plain stores
-    and the reader's plain loads are enough; gen None: a ring without generations (nothing done)."""
-    if gen is not None:
-        gen[i, slot] = -(c + 1)
+    and the reader's plain loads are enough; gen None: a ring without generations (nothing done).
+    The precondition (A1's review): ONE writer per worker per ring at a time. Two writers holding the same c would
+    publish c + 1 over each other's unfinished bytes and a reader would take the mix: the teacher ring is written by
+    the worker's search thread only (a forked search: one child at a time, the parent waits for it; it encodes after),
+    the V2 ring by ring_write under the lane lock. Returns 1 when the slot was already open (its generation negative:
+    another writer, or the previous attempt at this record failed midway and the worker went on), else 0 -- the
+    worker's stats ring_open_busy, progress ring_open_busy."""
+    if gen is None:
+        return 0
+    busy = int(gen[i, slot] < 0)
+    gen[i, slot] = -(c + 1)
+    return busy
 
 
 def ring_publish(gen, i, slot, c):
@@ -1179,7 +1191,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
             for k, at, under_way, lost, taken in found:
                 c_ = int(mine[ST['teach']])
                 slot = c_ % TEACH_RING
-                ring_open(teach_gen, index, slot, c_)   # (Codex round 25: the slot's generation)
+                mine[ST['ring_open_busy']] += ring_open(teach_gen, index, slot, c_)   # (Codex round 25: its generation)
                 trow = teach_rows[index, slot:slot + 1]
                 encode_row(at, EpisodeState(limit, items=cfg.items), trow, it[3] - 1 - k)
                 trow['episode'], trow['seed'], trow['group'], trow['first'] = it[5], it[4], group, 0

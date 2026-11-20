@@ -522,3 +522,15 @@ def test_g_workers_refuse_another_ring_mode(monkeypatch):
     TS.check_ring_mode(cfg)
     TS.check_ring_mode(types.SimpleNamespace(ring_compact=-1))
     TS.check_ring_mode(types.SimpleNamespace())
+
+
+def test_h_ring_open_counts_a_slot_already_open():
+    """(A1's review) ring_open on a slot whose generation is negative (another writer has it open, or the previous
+    attempt at the record failed midway) returns 1 -- the worker's ring_open_busy; a published or fresh slot 0."""
+    gen = np.zeros((1, 2), np.int64)
+    assert TS.ring_open(gen, 0, 0, 0) == 0 and gen[0, 0] == -1
+    assert TS.ring_open(gen, 0, 0, 0) == 1        # (opened again before its publish)
+    TS.ring_publish(gen, 0, 0, 0)
+    assert gen[0, 0] == 1 and TS.ring_open(gen, 0, 0, 2) == 0 and gen[0, 0] == -3
+    assert TS.ring_open(None, 0, 0, 5) == 0
+    assert 'ring_open_busy' in TS.ST and TS.STATS[-2:] == ('np_runs', 'np_removed')

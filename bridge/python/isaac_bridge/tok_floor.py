@@ -596,7 +596,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             for k, at, under_way, lost, taken in found:
                 c_ = int(mine[ST['teach']])
                 slot = c_ % TEACH_RING
-                ring_open(teach_gen, index, slot, c_)   # (Codex round 25: the slot's generation)
+                mine[ST['ring_open_busy']] += ring_open(teach_gen, index, slot, c_)   # (Codex round 25: its generation)
                 if block_on:
                     block_arrays[5][index,slot]=0
                 trow = teach_rows[index, slot:slot + 1]
@@ -644,7 +644,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         for j in range(len(rows_)):
             c_ = int(mine[ST['v2_records']])
             slot = c_ % V2_RING
-            ring_open(v2_gen, index, slot, c_)   # (Codex round 25: the slot's generation)
+            mine[ST['ring_open_busy']] += ring_open(v2_gen, index, slot, c_)   # (Codex round 25: its generation)
             if block_on:
                 v2_t[index,slot,-1]=0
             ring_put(v2_rows[index, slot:slot + 1], rows_[j:j + 1])   # (ISAAC_RL_RING_COMPACT: its frame's bytes)

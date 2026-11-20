@@ -5570,8 +5570,9 @@ def main(argv=None, child=None, actor=None):
             if cfg.start_build_prob > 0:   # 2026-10-08: start builds transplanted so far (worker totals)
                 row['start_builds'] = float(stats[:, ST['start_builds']].sum())
         # (Codex round 25) the teacher / V2 rings' records not taken, totals: lapped (written over before the read: the
-        # reader a ring behind), torn (the slot reused while it was read, or not yet published), bad (a length outside
-        # the frame)
+        # reader a ring behind), torn (the slot reused while it was read; with block-memory also the lanes' own skips,
+        # as before), bad (a length outside the frame: report it); open_busy (the workers' ring_open on a slot already
+        # open: a second writer, or a write that failed midway: report it)
         for k_r, v_r in (job.get('ring_skips') or {}).items():
             row[f'ring_{k_r}'] = v_r
         if args.frame == 'v3':   # (seq-v1 step 3) the actor's host side of the v3 calls (this process), this update
@@ -6994,7 +6995,8 @@ def main(argv=None, child=None, actor=None):
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,
                        v2=sampler.v2_records(with_h=mem_on, with_t=t_on,with_block=block_on) if v2_on else None,
-                       ring_skips=dict(sampler.ring_skips),   # (Codex round 25: after both reads above; totals)
+                       ring_skips=dict(sampler.ring_skips,   # (Codex round 25: after both reads above; totals)
+                                       open_busy=float(sampler.stats[:, ST['ring_open_busy']].sum())),
                        branch_finished=book.branch_finished, broken=book.broken, broken_total=book.broken_total,
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,
