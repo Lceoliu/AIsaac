@@ -20,7 +20,9 @@ descendants born / exited per second by kind and the host's forks per second.
 Per role: cores (CPU seconds / window seconds), processes / threads seen; for the trainer's and the learner's threads,
 the share of samples on a CPU outside any syscall ('running': user code -- a spin wait counts here), in sched_yield
 (a yielding wait) and blocked in a syscall (futex / poll / ioctl ...: waiting without the CPU). The capacity is the
-trainer's Cpus_allowed_list; idle = capacity - all roles.
+lane: the trainer's container's effective cpuset (cgroup v2 cpuset.cpus.effective), else the union of the CPUs its
+process tree may run on (Codex round 22: not the trainer's own mask -- ISAAC_TOK_PIN narrows that to the actor's two
+CPUs); idle = capacity - all roles. 'masks': each role's threads' actual masks (Cpus_allowed_list), as last seen.
 
    usage: python3 p_cpuacct.py --match <str> --progress <progress.csv> --out <f.json> [--from-update 2]
           [--to-update 6] [--interval 1] [--timeout 1800]"""
@@ -29,7 +31,7 @@ import json
 import os
 import time
 
-CLK = os.sysconf('SC_CLK_TCK')
+CLK = os.sysconf('SC_CLK_TCK') if hasattr(os, 'sysconf') else 100   # (imported by tests elsewhere too)
 SYS_NAMES = {'0': 'read', '1': 'write', '7': 'poll', '16': 'ioctl', '23': 'select', '24': 'sched_yield',
              '35': 'nanosleep', '202': 'futex', '232': 'epoll_wait', '228': 'clock_gettime', '230': 'clock_nanosleep',
              '271': 'ppoll', '281': 'epoll_pwait', '45': 'recvfrom', '47': 'recvmsg', '44': 'sendto'}
@@ -94,6 +96,31 @@ def host_forks():
 def siblings(c):
     s = rd(f'/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list')
     return s.decode().strip() if s else str(c)
+
+
+def lane_of(pid):
+    """(Codex round 22) The trainer's container's effective cpuset (cgroup v2), None when not readable."""
+    for line in (rd(f'/proc/{pid}/cgroup') or b'').decode('latin-1').splitlines():
+        if line.startswith('0::'):
+            s = rd('/sys/fs/cgroup' + line[3:].strip() + '/cpuset.cpus.effective')
+            if s and s.strip():
+                return s.decode().strip()
+    return None
+
+
+def cpu_set(spec):
+    out = set()
+    for part in (spec or '').split(','):
+        if '-' in part:
+            lo, hi = part.split('-')
+            out.update(range(int(lo), int(hi) + 1))
+        elif part.strip().isdigit():
+            out.add(int(part))
+    return out
+
+
+def spec_of(cpus):
+    return ','.join(str(c) for c in sorted(cpus))
 
 
 def allowed(pid):
@@ -186,10 +213,11 @@ def main():
     if root is None:
         json.dump(dict(error='no trainer'), open(a.out, 'w'))
         return
-    cpus = ''
-    for line in (rd(f'/proc/{root}/status') or b'').decode('latin-1').splitlines():
-        if line.startswith('Cpus_allowed_list'):
-            cpus = line.split(':', 1)[1].strip()
+    cpus = lane_of(root)
+    lane_source = 'cgroup cpuset.cpus.effective'
+    if not cpus:   # (the union of the masks the trainer's tree may run on, grown while sampling)
+        lane_source = "the trainer's tree's masks"
+        cpus = spec_of(set().union(*(cpu_set(allowed(q)) for q in [root] + descendants(root))))
 
     def ncpu(spec):
         n = 0
@@ -302,6 +330,31 @@ def main():
         time.sleep(a.interval)
     if t1 is None:
         t1 = time.time()
+    # (Codex round 22) each role's threads' actual masks, as they stand at the window's end
+    masks = {}
+    for pid in descendants(root) if os.path.exists(f'/proc/{root}') else []:
+        kind = procs_seen.get(pid, ('other', ''))[0]
+        try:
+            tids = os.listdir(f'/proc/{pid}/task')
+        except OSError:
+            continue
+        for t in tids:
+            ts = stat_of(f'/proc/{pid}/task/{t}/stat')
+            if ts is None:
+                continue
+            if kind == 'trainer':
+                role = 'actor main thread' if int(t) == pid else (
+                    'driver thread' if ts['comm'] == 'tok-driver' else 'trainer: other threads')
+            elif kind == 'learner':
+                role = 'learner process'
+            else:
+                role = {'game': 'game engines', 'workers': 'python workers'}.get(kind, 'other')
+            m = '?'
+            for line in (rd(f'/proc/{pid}/task/{t}/status') or b'').decode('latin-1').splitlines():
+                if line.startswith('Cpus_allowed_list'):
+                    m = line.split(':', 1)[1].strip()
+            d = masks.setdefault(role, {})
+            d[m] = d.get(m, 0) + 1
     win = (t1 - t0) if t0 else 0.0
     roles = {}
     for r, tk in acc.items():
@@ -381,6 +434,7 @@ def main():
                per_physical_core={k: v for k, v in cores_.items()},
                top_threads=top_threads, workers=sorted(work, key=lambda d: -(d['worker_cores'] or 0)),
                window_s=round(win, 1), updates=[a.from_update, a.to_update], cpus=cpus, capacity=cap,
+               lane_source=lane_source, masks=masks,
                total_cores=round(total, 3), idle_cores=round(cap - total, 3), groups={k: round(v, 3) for k, v in groups.items()},
                roles=dict(sorted(roles.items(), key=lambda kv: -(kv[1]['cores'] or 0))))
     with open(a.out, 'w') as f:

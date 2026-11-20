@@ -24,3 +24,20 @@ def test_bf16_equal_rows_are_equal():
     u = t.clone()
     u[0, 1] = 0.0   # (+0 against -0: different bits)
     assert p_chain.bitdiff(p_chain.tensor_bits(t), p_chain.tensor_bits(u))['equal'] == 1
+
+
+def test_p_cpuacct_capacity_is_the_lane_not_the_pinned_mask(monkeypatch):
+    """(Codex round 22) p_cpuacct's capacity: the trainer's container's effective cpuset, not the trainer's own mask --
+    ISAAC_TOK_PIN narrows that to the actor's CPUs (before: a lane of 8 logical CPUs read as 2, idle -4)."""
+    import importlib
+    import sys as _sys
+    _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'tools'))
+    acct = importlib.import_module('p_cpuacct')
+    files = {'/proc/7/cgroup': b'0::/docker/abc\n',
+             '/sys/fs/cgroup/docker/abc/cpuset.cpus.effective': b'12-15,36-39\n',
+             '/proc/7/status': b'Name:\tpython\nCpus_allowed_list:\t19,43\n'}
+    monkeypatch.setattr(acct, 'rd', lambda path: files.get(path))
+    assert acct.lane_of(7) == '12-15,36-39' and len(acct.cpu_set(acct.lane_of(7))) == 8
+    assert acct.allowed(7) == '19,43'   # (the pinned mask: listed under 'masks', not the capacity)
+    files.pop('/sys/fs/cgroup/docker/abc/cpuset.cpus.effective')
+    assert acct.lane_of(7) is None
