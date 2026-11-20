@@ -65,7 +65,7 @@ from .abplus import FORK_ENV
 from .abplus_goexplore import GxConfig, Instance
 from .abplus_lean import LeanDecoder, lean_logic_frames, read_lean, read_lean_raw
 from .env import BridgeError
-from .tok_branch import (RewindLedger, rewind_cfg, AUX_LOGP, AUX_PRED, AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_UNCERT, AUX_USED, AUX_VALUE, BRANCH_MAX, CHOICE_RING, CI, END_BOSS, END_CAP,
+from .tok_branch import (RewindLedger, end_reward, rewind_cfg, AUX_LOGP, AUX_PRED, AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_UNCERT, AUX_USED, AUX_VALUE, BRANCH_MAX, CHOICE_RING, CI, END_BOSS, END_CAP,
                          END_DEATH, END_ERROR, END_EXIT, END_PREFIX_DEATH, END_STALL, END_STOP, KIND_DOOR, KIND_ITEM,
                          KIND_ITEM_LEFT, REP_COND, REP_FIRST, REP_NOISE, REP_TWIN, SCORE_HORIZONS, Point,
                          PointQueue, choice_meta,
@@ -1060,7 +1060,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     comp[CI['hurt']] += float(row['hurt'][0])
                     # the trainer's reward of the decision before this record, discounted from the branch's start
                     ret += disc * led_b.step(step_reward(float(row['damage'][0]), float(row['hurt'][0]), done, ev,
-                                                         rw_b, run), row['rewind'][0])
+                                                         rw_b, run), row['rewind'][0], end=end_reward(done, rw_b))
                     disc *= gamma
                     if t_ep in h_at and done in (0, DONE_BRANCH):
                         h_ret[t_ep] = (ret, disc)

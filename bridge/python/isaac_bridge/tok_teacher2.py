@@ -44,7 +44,7 @@ import time
 import numpy as np
 
 from .abplus_lean import LeanDecoder, lean_logic_frames, read_lean, read_lean_raw
-from .tok_branch import RewindLedger, rewind_cfg, step_reward
+from .tok_branch import RewindLedger, end_reward, rewind_cfg, step_reward
 from .tok_obs import RC_HP0, RC_PROGRESS, ROW, ROW_FRAME_AT, EpisodeState, FastRow, encode_row, stall_first, stall_flags
 
 V2_RING = 384        # imitation records per worker the trainer may fall behind by (a point writes <= cap of them)
@@ -298,7 +298,7 @@ def taken_score(log, d, cap, gamma, rw, run, values=None, exit_end=False, extra=
         r_ = (step_reward(log.damage[t], log.hurt[t], log.done[t], log.events[t], rw, run)
               + (extra[t] if extra is not None and t < len(extra) else 0.0))
         if led is not None:
-            r_ = led.step(r_, log.rewind[t] if t < len(log.rewind) else 0)
+            r_ = led.step(r_, log.rewind[t] if t < len(log.rewind) else 0, end=end_reward(log.done[t], rw))
             if flags is not None and led.crossed:   # (Codex round 20: a rewind past record d)
                 flags['rewind_cross'] = True
         g += disc * r_
@@ -395,7 +395,7 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
                     g_now = gains_of(row)
                     rews[-1] += gain_reward(g_prev, g_now, ctx.rw)
                     g_prev = g_now
-                rews[-1] = led_.step(rews[-1], row['rewind'][0])   # (2026-11-20: from the branch's start)
+                rews[-1] = led_.step(rews[-1], row['rewind'][0], end=end_reward(done, ctx.rw))   # (from the branch's start)
             if trace is not None:
                 trace.append((row[0].copy(), rews[-1] if j else 0.0))
             if done:
@@ -521,6 +521,9 @@ def search_point(pt, ctx, policy, rng, on_depth=None):
                 r = play_branch(S, ctx, pt, d, hp0, best['intent'], policy,
                                 reseed=int(rng.integers(1, 2 ** 31 - 1)), keep=False)
                 ctx.stats['replicates'] += 1
+                if r.get('rewind_cross'):   # (Codex round 21: the replicate's rewind past the point: dropped too)
+                    ctx.stats['rewind_cross'] += 1
+                    return None
                 rep, spread = r['score'], abs(best['score'] - r['score'])
             improving = rep is not None and gain > spread
             depths = (res['depths'] if res else 0) + 1

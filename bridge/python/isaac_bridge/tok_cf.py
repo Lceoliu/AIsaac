@@ -701,6 +701,9 @@ def cf_search(pt, ctx, policy, rng, branch=play_branch, restore_fn=restore):
             r = branch(S, ctx, pt, d, hp0, runs[bi]['intent'], policy, reseed=int(rng.integers(1, 2 ** 31 - 1)),
                        keep=False)
             ctx.stats['replicates'] += 1
+            if r.get('rewind_cross'):   # (Codex round 21: the replicate's rewind past the point -- dropped as well)
+                ctx.stats['rewind_cross'] = ctx.stats.get('rewind_cross', 0) + 1
+                return None
             rep = r['score']
         bi, gain, spread, improving = judge(taken, scores, rep, cfg.cf_margin)
     finally:

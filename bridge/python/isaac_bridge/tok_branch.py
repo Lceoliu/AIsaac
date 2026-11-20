@@ -166,6 +166,11 @@ def step_reward(damage, hurt, done, events, w, run):
     return r
 
 
+def end_reward(done, w):
+    """(Codex round 21) the end's own part of step_reward: the floor's end (done 1), a death (2), a timeout (3)."""
+    return w['exit'] if done == 1 else -w['death'] if done == 2 else -w['timeout'] if done == 3 else 0.0
+
+
 def rewind_cfg(cfg):
     """(on, interest, rtime, cmax) of a TokSamplerConfig's rewind ledger (reward-rewind-design.md); on 0: off."""
     return (int(getattr(cfg, 'rewind', 0)), int(getattr(cfg, 'rewind_interest', 1)), int(getattr(cfg, 'rewind_time', 0)),
@@ -192,7 +197,9 @@ class RewindLedger:
         self.ck_seen = False
         self.crossed = False
 
-    def step(self, r, rewind):
+    def step(self, r, rewind, end=0.0):
+        """end (Codex round 21): the end's own part of r (end_reward) -- kept on a rewind's record, added to the
+        rollback, as the trainer's book does."""
         if not self.on:
             return r
         rewind = int(rewind)
@@ -207,7 +214,7 @@ class RewindLedger:
             else:
                 back = -sum(self.led)
             self.led = []
-            return -self.wt + back
+            return -self.wt + back + float(end)
         self.led.append(r if self.rtime else r + self.wt)
         if rewind & 128:
             self.led = []

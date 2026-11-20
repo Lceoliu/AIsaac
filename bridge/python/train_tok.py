@@ -1032,7 +1032,8 @@ DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its gam
 #  have them, as they never had heal / resource.
 NEW_TERMS = ('item', 'trinket', 'depth', 'nohit')
 REWARD_TERMS = ('damage', 'hurt', 'time', 'win', 'death', 'timeout', 'room', 'explore', 'boss', 'exit', 'heal',
-                'resource') + NEW_TERMS + ('rewind',)   # ('rewind': 2026-11-20, the ledger's rollback, Episodes._rewind)
+                'resource') + NEW_TERMS + ('rewind', 'rewind_lost')   # ('rewind': 2026-11-20, the ledger's rollback,
+#   Episodes._rewind; 'rewind_lost': a rollback that found no open decision, never paid -- Codex round 21)
 _RT = {k: i for i, k in enumerate(REWARD_TERMS)}
 
 
@@ -1145,7 +1146,9 @@ class Episodes:
             self.seen_c[i], self.seen_t[i], self.stage_max[i] = set(sc), set(st_), smax
             if self.term is not None and tm is not None:
                 t_now, r_now = self.term[i, _RT['time']], self.term[i, _RT['rewind']]
+                l_now = self.term[i, _RT['rewind_lost']]
                 self.term[i] = tm
+                self.term[i, _RT['rewind_lost']] = l_now   # (never restored either)
                 self.term[i, _RT['time']] = t_now if not self.rw_time else tm[_RT['time']] - rw['time']
                 # (Codex round 20: the rollbacks' remainders accumulate -- the share is not restored with the others)
                 self.term[i, _RT['rewind']] = r_now + back + float(x.sum())
@@ -1404,6 +1407,10 @@ class Episodes:
                 i_ = int(idx[j])
                 amount = self._rewind(i_, int(rows['rewind'][j] & 127)) + rw['time']
                 self.rewind_lost += 1
+                if self.term is not None:   # (Codex round 21: _rewind booked the rollback in the shares, ret got none)
+                    self.term[i_, _RT['rewind_lost']] -= amount
+                    if self.rw_time:   # (its time term: no record's reward carries it)
+                        self.term[i_, _RT['time']] += rw['time']
                 print(f'rewind ledger: worker {i_} episode {int(rows[j]["episode"])} seed {int(rows[j]["seed"])}: a rewind '
                       f'with no open decision (dropped at the worker\'s capacity): its rollback {amount:+.4f} lost '
                       f'(rewind_lost {self.rewind_lost})', flush=True)
@@ -1881,6 +1888,12 @@ def gae(rollout, gamma, lam, value=None, reward=None):
         mask[i, :usable] = True
         mask[i, :usable] &= ~boot[:usable]
     return adv, adv + value, mask
+
+
+def global_targets(rollout, gamma_g, lam, value_g):
+    """(Codex round 21) value_global's GAE (advantages, returns, mask): its own rewards (reward_g, the rewind's
+    gamma_global rollback) and gamma_global -- the learner's one path for both its stored and recomputed values."""
+    return gae(rollout, gamma_g, lam, value_g, reward=reward_g(rollout))
 
 
 def reward_g(rollout):
@@ -4027,7 +4040,7 @@ def main(argv=None, child=None, actor=None):
                 sec('log')
         if gtok_on and len(all_flat) and vg_stored is not None and not vgs:   # (B24) the actor's values, as stored
             vg_now = vg_stored
-            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now, reward=reward_g(rl))
+            adv_g, ret_g, _ = global_targets(rl, args.gamma_global, args.lam, vg_now)
             del adv_g
         elif gtok_on and len(all_flat):   # 2026-10-12 (B22): value_global of every stored decision, for its returns
             vg_now = np.zeros_like(rl.value)
@@ -4048,7 +4061,7 @@ def main(argv=None, child=None, actor=None):
                                                if mem_on else None, **tk_)
                         vgs.append(o_[-1].float())
             vg_now.reshape(-1)[all_flat] = torch.cat(vgs).cpu().numpy()
-            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now, reward=reward_g(rl))
+            adv_g, ret_g, _ = global_targets(rl, args.gamma_global, args.lam, vg_now)
             del adv_g
             sec('recompute')
         adv, ret, mask = gae(rl, args.gamma, args.lam, value_now)

@@ -674,3 +674,180 @@ def test_two_rewinds_shares_still_add_up():
     b.rec(rewind=1, units=6)
     fin = b.rec(done=2).book.finished[-1]
     assert sum(fin['r'].values()) == pytest.approx(fin['ret'], abs=1e-4)
+
+
+# ---- Codex round 21 (its two CPU repros as regressions; the integration checks through the real paths) ----
+
+def _cf_setup(cross_on_replicate):
+    """cf_search with stand-ins (test_cf_smoke's): the target branch beats the taken continuation; only the best
+    branch's reseed replicate goes back past the point (rewind_cross) when cross_on_replicate."""
+    import test_cf_smoke as CS
+    from isaac_bridge import tok_cf as CF
+    from isaac_bridge import tok_teacher2 as T2
+    from isaac_bridge.tok_branch import parse_reward
+    rw = parse_reward(CS.FLOOR_REWARD)
+    log = CS.make_log(60, np.random.default_rng(3), rw)
+
+    class S_:
+        def close(self):
+            pass
+
+    def fake_restore(pt, d_, ctx):
+        return S_(), 10.0
+
+    def fake_branch(S, ctx, pt, d_, hp0, intent, policy, reseed=None, keep=True, trace=None):
+        base = {'target': 9.0, 'sticky': 0.5}[intent.kind]
+        return dict(score=base - (0.05 if reseed is not None else 0.0), n=30, end=T2.END_CAP, rows=[], pend=[],
+                    act=[], ret=np.zeros(0), value=[], logp=[],
+                    rewind_cross=bool(cross_on_replicate and reseed is not None))
+    cfg = type('C', (), dict(cf_branches=4, teacher_v2_sticky=4.0, cf_sticky_eps=0.25, cf_target_seconds=20.0,
+                             frames_per_decision=4, cf_margin=0.3, cf_distill_steps=8))()
+    ctx = type('X', (), dict(cfg=cfg, cap=20, gamma=0.99, rw=rw, run=True, exit_end=False, boot_vg=True, gains=True,
+                             stats=dict(replicates=0, rewind_cross=0), rewind=(1, 1, 0, 4.0)))()
+    pt = T2.V2Point(at=20, offset=5, log=log, target=('ent', 'coin'), bank=None)
+    return CF.cf_search(pt, ctx, None, np.random.default_rng(0), branch=fake_branch, restore_fn=fake_restore), ctx
+
+
+def test_cf_replicate_past_the_point_drops_the_point():
+    """(Codex round 21, 1) the first branches within the point, only the best one's replicate rewinds past it: the
+    point is dropped (None, cf_rewind_cross) -- before, cf_search returned improving=True and it went to the
+    teaching ring. Without the crossing the same point improves."""
+    res, ctx = _cf_setup(False)
+    assert res is not None and res['improving'] and ctx.stats['rewind_cross'] == 0
+    res, ctx = _cf_setup(True)
+    assert res is None and ctx.stats['rewind_cross'] == 1 and ctx.stats['replicates'] == 1
+
+
+def test_teacher_replicate_past_the_point_drops_the_point(monkeypatch):
+    """(Codex round 21, 1) the same in teacher v2's search_point."""
+    from isaac_bridge import tok_teacher2 as T2
+    import test_cf_smoke as CS
+    from isaac_bridge.tok_branch import parse_reward
+    rw = parse_reward(CS.FLOOR_REWARD)
+    log = CS.make_log(60, np.random.default_rng(3), rw)
+
+    class S_:
+        def close(self):
+            pass
+    monkeypatch.setattr(T2, 'restore', lambda pt, d, ctx: (S_(), 10.0))
+    monkeypatch.setattr(T2, 'candidates', lambda cfg, rng: [types.SimpleNamespace(kind='a'), types.SimpleNamespace(kind='b')])
+
+    def pb(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trace=None):
+        return dict(score=9.0 if intent.kind == 'a' else 0.0, rewind_cross=reseed is not None)
+    monkeypatch.setattr(T2, 'play_branch', pb)
+    cfg = types.SimpleNamespace(teacher_v2_margin=0.1, teacher_v2_depths=(0,), teacher_depths=(), teacher_death_depths=())
+    ctx = types.SimpleNamespace(cfg=cfg, cap=20, gamma=0.99, rw=rw, run=True, rewind=(1, 1, 0, 4.0),
+                                stats=dict(replicates=0, rewind_cross=0))
+    pt = T2.V2Point(at=21, offset=5, log=log, target=None, bank=None)
+    pt.kind = T2.KIND_RANDOM
+    assert T2.search_point(pt, ctx, None, np.random.default_rng(0)) is None
+    assert ctx.stats['rewind_cross'] == 1
+
+
+@pytest.mark.parametrize('done,end', [(2, -2.0), (3, -1.0), (1, 3.0)])
+def test_the_scorers_keep_an_end_on_the_rewind_record(done, end):
+    """(Codex round 21, 2) a continuation with its own checkpoint, a hurt, then a record that rewinds and ends (death,
+    a timeout, the floor's end): its score keeps the end's reward -- before, the rewind's record paid only its time
+    term and the rollback (Codex: -0.00597 for -1.98602 with a death)."""
+    from isaac_bridge.tok_teacher2 import taken_score
+    log = types.SimpleNamespace(damage=[0.0] * 4, hurt=[0.0, 0.0, 2.0, 0.0], done=[0, 0, 0, done], events=[0] * 4,
+                                rewind=[0, CK, 0, 1], value=[0.0] * 4)
+    fl = {}
+    got, m = taken_score(log, 0, 10, G, RW, True, rewind=(1, 1, 0, 4.0), flags=fl)
+    want = -0.002 + G * (-1.5 - 0.002) + G ** 2 * (-0.002 + 1.5 * G ** -1 + end)
+    assert not fl.get('rewind_cross') and m == 3
+    assert got == pytest.approx(want, abs=1e-12)
+    led = RewindLedger((1, 1, 0, 4.0), G, RW)
+    led.step(-0.002, CK)
+    led.step(-1.502, 0)
+    assert led.step(-0.002 + end, 1, end=end) == pytest.approx(-0.002 + 1.5 * G ** -1 + end, abs=1e-12)
+
+
+def test_a_lost_rollback_through_store_at_capacity_two():
+    """(Codex round 21, the integration) the real store with capacity 2: first record, the checkpoint, a clear
+    (+0.998 stored), its decision dropped at the cap; the rewind's record closes nothing -- rewind_lost 1, the state
+    back, the lost amount its own share (rewind_lost) so the shares add up to ret; in the next rollout (carried), a
+    second rewind charges only its time term (the dropped one is not taken again)."""
+    nh = 3
+
+    def answer(roll, rows, go):
+        a = np.flatnonzero(go)
+        if len(a):
+            T.store(roll, a, rows[a], np.zeros((len(a), nh), np.int64), np.zeros((len(a), nh), np.int64),
+                    np.zeros(len(a), np.float32), np.zeros(len(a), np.float32), 0)
+
+    rw = dict(RW)
+    roll = T.Rollout(1, 2, close=True)
+    book = T.Episodes(1, rw, True, run=True, items=True)
+    book.set_rewind(1, 0, 4.0, G, 64)
+    pend = np.zeros((1, nh), np.int64)
+    paid = []
+
+    def rec(roll, **kw):
+        k = int(roll.open[0])
+        rows = _row(**kw)
+        go = book.arrive(roll, rows, np.array([0]), pend)
+        if k >= 0:
+            paid.append(float(roll.reward[0, k]))
+        answer(roll, rows, go)
+    rec(roll, first=1)
+    rec(roll, rewind=CK)
+    rec(roll, events=EV_CLEARED)
+    assert getattr(roll, 'dropped', 0) == 1 and roll.open[0] == -1 and paid[-1] == pytest.approx(0.998)
+    rec(roll, rewind=1)
+    assert book.rewind_lost == 1 and book.rooms[0] == 0 and book.rewinds[0] == 1 and int(book.led_n[0]) == 0
+    roll2 = T.Rollout(1, 8, close=True)
+    roll2.carry(roll)
+    rec(roll2, rewind=CK)
+    rec(roll2, rewind=1)
+    assert paid[-1] == pytest.approx(-0.002, abs=1e-7)
+    rec(roll2, done=2)
+    fin = book.finished[-1]
+    assert fin['ret'] == pytest.approx(sum(paid), abs=1e-5)
+    assert sum(fin['r'].values()) == pytest.approx(fin['ret'], abs=1e-3)
+    # (the share 'rewind_lost': the rollback that was never paid -- what ret still holds of the rewound clear)
+    assert fin['r'].get('rewind_lost', 0.0) == pytest.approx(1.0 * G ** -1, abs=1e-3)
+
+
+def test_the_global_targets_take_the_heads_own_rollback():
+    """(Codex round 21, the integration) the learner's path (train_tok.global_targets, both its value sources): with
+    values 0 and lam 1 the target of the first decision after the checkpoint is the stretch's gamma_global return --
+    its time terms only; gae without reward_gd (the main head's rollback alone) is off by more than 1.5."""
+    import inspect
+    GG = 0.999
+    n = 200
+    b = Book(rewind=(1, 0, 4.0), gamma_g=GG, cap=n + 16)
+    b.rec(first=1)
+    b.rec(rewind=CK)
+    s = len(b.rewards)
+    b.rec(hurt=2.0, units=4)
+    for _ in range(n - 2):
+        b.rec(units=4)
+    b.rec(rewind=1, units=6)
+    zero = np.zeros_like(b.roll.value)
+    _, ret_g, _ = T.global_targets(b.roll, GG, 1.0, zero)
+    tg = -0.002 * sum(GG ** j for j in range(n))
+    assert ret_g[0, s] == pytest.approx(tg, abs=1e-5)
+    _, ret_plain, _ = T.gae(b.roll, GG, 1.0, zero)
+    assert ret_plain[0, s] - tg > 1.5
+    src = inspect.getsource(T)
+    assert src.count('global_targets(rl, args.gamma_global, args.lam, vg_now)') == 2
+
+
+@pytest.mark.parametrize('done,trunc,penalty,terminal', [(1, 0, 3.0, True), (3, 2, 0.0, False), (3, 1, 0.0, False)])
+def test_more_ends_on_the_rewind_record(done, trunc, penalty, terminal, monkeypatch):
+    """(Codex round 21) the floor's end (+exit), the stall's end truncated (--stall-truncate: t < the cap) and the
+    cap's: the rollback and the end's own reward; a truncated end is answered (its record evaluated: the decision
+    before bootstraps from it, store marks it boot)."""
+    monkeypatch.setattr(T, 'CAP_T', 50)
+    monkeypatch.setattr(T, 'TRUNC', trunc)
+    b = Book(rewind=(1, 0, 4.0))
+    b.rec(first=1)
+    b.rec(rewind=CK)
+    b.rec(hurt=2.0, units=4)
+    k = int(b.roll.open[0])
+    go = b.book.arrive(b.roll, _row(rewind=1, done=done, units=6, t=60 if trunc == 1 else 10), np.array([0]), b.pending)
+    assert float(b.roll.reward[0, k]) == pytest.approx(-0.002 + 1.5 * G ** -1 + penalty, abs=1e-6)
+    assert bool(b.roll.terminal[0, k]) == terminal
+    assert bool(go[0]) == (not terminal)
+    assert T.is_trunc(_row(done=done, t=60 if trunc == 1 else 10))[0] == (not terminal)

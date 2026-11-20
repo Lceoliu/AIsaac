@@ -14644,6 +14644,26 @@ seq1 的速度约为 T1 的四分之三：x_real 约 216，T1 约 289。协调�
 - **`--rewind 0`**：编码器不看计数，ROW rewind 写 0。用同一批 lean 流（12 条 × 160 条记录 × events / pickups 两档 = 3,840 条，含“计数上升且 damage_taken 增加”的记录）过 b53f14c 和本树的 encode_row，除偏移 20793 外每个 ROW 字节都相同。
 - **缺计数**：`--rewind 1` 时一局的第一条没有计数块，抛 `tok_floor.RewindFatal`（VisibleV3Fatal 的子类，不被当成坏局重试），worker 以致命错误停下，trainer 非零退出；任何 visible 模式下 sampler 都会读到这个退出。
 - **连续回溯**：分项 `rewind` 累加，不随快照恢复；各项之和等于 ret。
+**Codex 第 21 轮（增量审计 574ef45）的修复**
+
+- **复验越界**：CF（cf_search）和教师 v2（search_point）在用最优候选的换种复验分数之前，先查它的 `rewind_cross`；越界就整点作废，计 `cf_rewind_cross`。
+  - Codex 的 CPU 复现：只有复验越界时，旧版仍返回 improving=True。现在是回归用例：574ef45 上失败，新头上通过。
+- **打分端的同条终止**：`RewindLedger.step(r, rewind, end)` 在回溯记录上保留终止项（end_reward：过层 +exit、死亡 −death、超时 −timeout），加在冲销上；续行分数、分支分数、旧分支打分都传入。
+  - Codex 的 CPU 复现：分叉后已有检查点，受伤，再同条回溯并死亡。旧版得 −0.00597，现在得 −1.98602。回归用例：574ef45 上失败，新头上通过。
+- **丢行的分项**：没落行的冲销金额单列为分项 `rewind_lost`，即没扣的部分，为正。各项之和等于 ret。
+- **补实的集成测试**：
+  - 丢行用真实 `store` 跑容量 2，断言下一次回溯只扣时间项、ret 和分项相等；
+  - 全局头走生产路径 `global_targets`，学习器两处都调用它，漏传 reward_gd 就失败；
+  - 越界走到 cf_search 的最终判定；
+  - 终止补了过层终奖、stall 截断和 cap 截断：截断的结束记录会被应答（作自举行）。
+- **已知偏差（补记）**：
+  - 全局头（γ = 0.999）约 1,386 步才触到补齐上限；
+  - `--dump-rollouts` 不含 `reward_gd`，不能用转储复算全局残差；
+  - 多 actor 时 `merge_jobs` 没汇总非首 actor 的 `rewind_lost`，单 actor 臂不受影响；
+  - `cf_rewind_cross` 高时，剩下的教师样本不代表同样的选择点分布；
+  - 累计计数（`rewind_lost` 等）续跑后从零起，监控不要跨续跑作差；
+  - 开跑时监控要同时看 `rewind_lost` 和 `store_dropped`。
+
 - **门（184，lane b，树 mr8bac57d，库编进 bm1/home-rw）**：
   - 全量测试 820 passed、5 skipped、1 xfailed。
   - 游戏内端到端：回溯落在 4 次使用的记录上，检查点是 3 次进大房。第一次跑失败，因为探针自己的编码器没开 rewind（默认关），改正后复跑通过。
