@@ -832,15 +832,37 @@ def _items_step(st, row, stage, active, charge, events):
 # the common case only (a payload whose terrain block, if any, is the same as the last one); a record it hands back (a
 # map block, a changed terrain block, the episode's first record, a room change, more than ENT_CAP entities, other door
 # records) goes through decode + encode_row here, and the EpisodeState and the decoder are kept in step both ways.
-# ISAAC_RL_FAST_ROW=0 switches it off.
-FAST_ROW = os.environ.get('ISAAC_RL_FAST_ROW', '1') != '0'
+# (2026-11-20, version 9 -- the coordinator: the native ROW encoder for ROW schema 8 back, OFF by default until the
+#  paired runs) ISAAC_RL_FAST_ROW: 0 / unset off (every record through decode + encode_row, as since f3264e0); 1 on;
+#  2 on and checked: every record the fast path takes is also encoded by decode + encode_row on copies of the decoder
+#  and the EpisodeState, the two ROW slots and the states compared byte for byte (FastRow._check).
+FAST_ROW_MODE = os.environ.get('ISAAC_RL_FAST_ROW', '0')
+FAST_ROW = FAST_ROW_MODE in ('1', '2')
+FAST_ROW_CHECKING = FAST_ROW_MODE == '2'
 _ROW_FIELDS = ('player', 'ent', 'ent_id', 'doors', 'patch', 'grid', 'map', 'n_ent', 'n_doors', 't', 'hurt', 'damage',
                'done', 'bombs', 'events', 'episode', 'seed', 'group', 'first', 'ent_item', 'pcharge', 'pchar',
-               'ent_price', 'phearts', 'room_type')
+               'ent_price', 'phearts', 'room_type', 'rewind', 'visible_schema', 'visible_bytes', 'visible_frame',
+               'stage', 'inv', 'pitem', 'pinv')
 _ROW_OFFS_ITEMS = np.array([ROW.fields[k][1] for k in _ROW_FIELDS], np.int64)
 _ROW_OFFS = _ROW_OFFS_ITEMS.copy()
 _ROW_OFFS[_ROW_FIELDS.index('ent_item')] = -1   # without items abp_row_encode leaves ent_item alone (version 3)
-_ROW_VERSION = 8   # (8: 2026-11-20, the rewind count block, flag 128, handed back: -10) abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
+
+
+def _row_offs(items, run):
+    """abp_row_encode's offs for an episode: ent_item, inv, pitem, pinv written with items only, stage with items or a
+    run (encode_row's _items_step), every other field always."""
+    o = _ROW_OFFS_ITEMS.copy()
+    if not items:
+        for k in ('ent_item', 'inv', 'pitem', 'pinv'):
+            o[_ROW_FIELDS.index(k)] = -1
+    if not (items or run):
+        o[_ROW_FIELDS.index('stage')] = -1
+    return o
+
+
+_ROW_VERSION = 9   # (9: 2026-11-20, ROW schema 8: the v3 frame, the rewind count, EV_NOHIT, --stall-progress first,
+#                    _items_step, the ext pointers) (8: 2026-11-20, the rewind count block, flag 128, handed back: -10)
+#                    abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
 #                    2026-10-08, abp-0.2.16's 144-byte entity records and ENT_F = 56; 6: 2026-10-08, abp-0.2.17's
 #                    39-double player record (PlayerType) and pchar; 7: 2026-10-16 (B35), abp-0.2.18's 148-byte entity
 #                    records (price) and ent_price, phearts, room_type)
@@ -850,8 +872,17 @@ _ROW_VERSION = 8   # (8: 2026-11-20, the rewind count block, flag 128, handed ba
 RC_TVERSION = RC_EXITS + 16
 (RC_TSEEN, RC_HURT, RC_EPISODE, RC_SEED, RC_GROUP, RC_FIRST, RC_RUN, RC_ITEMS, RC_STALL_MODE, RC_HAVE_RES,
  RC_PREV_RES) = range(RC_TVERSION + 1, RC_TVERSION + 12)
-RC_COUNT = RC_PREV_RES + 4   # B40 (2026-10-18): RC_STALL_MODE (1: --stall-progress pickups), RC_HAVE_RES, RC_PREV_RES
-#                              .. + 3 (coins, keys, bombs, health units at the record before): abp_turbo.c's RC_COUNT 46
+# B40 (2026-10-18): RC_STALL_MODE (1: --stall-progress pickups), RC_HAVE_RES, RC_PREV_RES .. + 3 (coins, keys, bombs,
+# health units at the record before). Version 9 (abp_turbo.c's comment): the worker's visible mode, the rewind count,
+# the nohit room, --stall-progress first's room keys, _items_step's state; out: a v3 frame written, the state changed
+(RC_VIS, RC_REWIND_ON, RC_RW_HAVE, RC_RW_COUNT, RC_CK_NONE, RC_NOHIT_ON) = range(RC_PREV_RES + 4, RC_PREV_RES + 10)
+RC_NH = RC_NOHIT_ON + 1
+RC_FIRST_MODE = RC_NH + 3
+RC_EVER = RC_FIRST_MODE + 1
+RC_POST = RC_EVER + 3
+(RC_PREV_A_HAVE, RC_PREV_A, RC_PREV_C, RC_PREV_MAXC, RC_MAX_CHARGE, RC_OUT_V3, RC_OUT_DIRTY) = range(RC_POST + 1,
+                                                                                                 RC_POST + 8)
+RC_COUNT = RC_OUT_DIRTY + 1   # abp_turbo.c's RC_COUNT 67
 # player 0's active item and charge, and the room's stage, in a raw lean payload (abplus_lean: header 16, room 48,
 # totals 32, then the player's doubles: active is field 24)
 _PAYLOAD_ACTIVE = struct.Struct('<dd')
@@ -865,10 +896,8 @@ def _address(b):
 
 
 def fast_row_function(path):
-    """abp_row_encode of the libabp_turbo.so at path (ctypes), None when off, missing or of another layout."""
-    # Native row v7 cannot carry the new complete frame. The native fixed
-    # observation collector remains enabled; only the obsolete row encoder is off.
-    return None
+    """abp_row_encode of the libabp_turbo.so at path (ctypes), None when off (ISAAC_RL_FAST_ROW), missing or of another
+    layout. (f3264e0 to 2026-11-20: always None -- the version 7 encoder could not carry the visible-v3 frame.)"""
     if not FAST_ROW or not path or not os.path.isfile(path):
         return None
     if path not in _LIBS:
@@ -879,11 +908,12 @@ def fast_row_function(path):
             version.restype = ctypes.c_int
             if version() == (_ROW_VERSION << 16) | (RC_COUNT << 8) | len(_ROW_FIELDS) and ENT_CAP == 64 and \
                     ENT_F == 56 and ENT_F0 == 33 and PCHARGE_F == 12 and N_CHAR == 32 and PHEART_F == 3 and \
-                    N_ROOM_TYPE == 32 and \
+                    N_ROOM_TYPE == 32 and N_COLLECTIBLE == 1024 and INV_CAP == 16 and PINV_F == 12 and \
+                    ROW.fields['visible_frame'][0].itemsize == 131072 and \
                     DOOR_CAP == 8 and DOOR_F == 7 and PATCH == 9 and GRID == (7, 16, 28) and MAP == (8, 13, 13):
                 fn = lib.abp_row_encode
                 fn.restype = ctypes.c_int
-                fn.argtypes = [ctypes.c_char_p, ctypes.c_long] + [ctypes.c_void_p] * 7
+                fn.argtypes = [ctypes.c_char_p, ctypes.c_long] + [ctypes.c_void_p] * 8
         except (OSError, AttributeError):
             fn = None
         _LIBS[path] = fn
@@ -896,16 +926,26 @@ class FastRow:
     """One episode's records through abp_row_encode (fn from fast_row_function). encode(item, row, row_address, t):
     item is a raw lean payload (bytes) or a LeanObs; returns the done code like encode_row and sets self.hurt (half
     hearts were lost in the step that led here), self.obs (the LeanObs when the record went through encode_row, else
-    None). Writes episode, seed, group and first too (set_meta)."""
+    None). Writes episode, seed, group and first too (set_meta).
+    (Version 9, 2026-11-20) the EpisodeState is brought up to date from the C side's slots before a record goes through
+    encode_row and after a fast record that changed it (RC_OUT_DIRTY: the rewind count, the nohit room, the first-mode
+    keys, the active item's state); st.inv_gain (read only inside encode_row, reset by _inventory) is not kept."""
 
     def __init__(self, fn, st, decoder, episode=0, seed=0, group=0):
         self.fn, self.st, self.decoder = fn, st, decoder
         self.ctx = np.zeros(RC_COUNT, np.float64)
         self._ctx_p = self.ctx.ctypes.data
-        self._offs_p = (_ROW_OFFS_ITEMS if st.items else _ROW_OFFS).ctypes.data
-        self.post = st.items or st.run   # items / run fields written here after abp_row_encode
+        self._offs = _row_offs(st.items, st.run)
+        self._offs_p = self._offs.ctypes.data
         self.refs = np.zeros(4, np.int64)   # the last terrain block's bytes, the door records of the grid: address, length
         self._refs_p = self.refs.ctypes.data
+        # (version 9) _items_step's arrays, written in place by abp_row_encode: inv, pitem, pinv
+        arrs = (st.inv_arr, st.pitem, st.pinv)
+        assert st.inv_arr.dtype == np.int16 and st.inv_arr.shape == (INV_CAP, 2) and st.pitem.dtype == np.int16 and \
+            st.pitem.shape == (6,) and st.pinv.dtype == np.float32 and st.pinv.shape == (PINV_F,) and \
+            all(a.flags['C_CONTIGUOUS'] for a in arrs)
+        self.ext = np.array([a.ctypes.data for a in arrs], np.int64)
+        self._ext_p = self.ext.ctypes.data
         self._keep = (None, None)
         self._ptrs = (None, None, None)
         self.hurt = False
@@ -930,39 +970,111 @@ class FastRow:
 
     def encode(self, item, row, row_address, t):
         c = self.ctx
-        # (visible-v3: abp_row_encode does not know the v3 frame or raw block -- by the payload's flags; and a worker
-        # configured for v3 sends every record through encode_row, whose check a record without one must meet:
-        # 2026-11-18, Codex rounds 2 / 3)
-        if type(item) is bytes and (_VP.VISIBLE_V3_MODE or _VP.needs_decode(item) or self.st.stall_first):
-            item = self.decoder.decode(item)
         if type(item) is bytes:
             c[RC_T] = t
             c[RC_FIRST] = t == 0
             g, pd, m = self._ptrs
-            done = self.fn(item, len(item), row_address, self._ctx_p, g, pd, m, self._offs_p, self._refs_p) \
-                if g else -7
+            if FAST_ROW_CHECKING and g:
+                return self._check(item, row, row_address, t)
+            done = self.fn(item, len(item), row_address, self._ctx_p, g, pd, m, self._offs_p, self._refs_p,
+                           self._ext_p) if g else -7
             if done >= 0:
-                self.fast += 1
-                row['rewind'] = 0   # (2026-11-20: the fast path never sees a rewind or a room change; slots are reused)
-                self.hurt = c[RC_HURT] != 0
-                self.obs = None
-                if c[RC_TSEEN]:   # the same terrain block again: the decoder's version follows it
-                    d = self.decoder
-                    d.terrain_version = int(c[RC_TVERSION])
-                    d.terrain['version'] = d.terrain_version
-                if self.post:   # encode_row's _items_step on the payload's values
-                    active, charge = _PAYLOAD_ACTIVE.unpack_from(item, 96 + 8 * 24)
-                    _items_step(self.st, row, _PAYLOAD_STAGE.unpack_from(item, 36)[0], active, charge, 0)
+                self._fast_done(row)
                 return done
             self.reasons[done] = self.reasons.get(done, 0) + 1
+            FAST_STATS['slow_' + str(done)] = FAST_STATS.get('slow_' + str(done), 0) + 1
             item = self.decoder.decode(item)
+        return self._slow(item, row, t)
+
+    def _fast_done(self, row):
+        c = self.ctx
+        self.fast += 1
+        FAST_STATS['fast'] += 1
+        self.hurt = c[RC_HURT] != 0
+        self.obs = None
+        if c[RC_TSEEN]:   # the same terrain block again: the decoder's version follows it
+            d = self.decoder
+            d.terrain_version = int(c[RC_TVERSION])
+            d.terrain['version'] = d.terrain_version
+        if c[RC_OUT_V3]:
+            V3_FRAMES[0] += 1
+        dirty = int(c[RC_OUT_DIRTY])
+        if dirty:
+            self._to_st()
+            for bit, name in ((1, 'fast_rw'), (2, 'fast_nohit_state'), (4, 'fast_first_prog'), (8, 'fast_active_state')):
+                if dirty & bit:
+                    FAST_STATS[name] = FAST_STATS.get(name, 0) + 1
+        ev = int(row['events'][0])
+        if ev & EV_NOHIT:
+            FAST_STATS['fast_ev_nohit'] = FAST_STATS.get('fast_ev_nohit', 0) + 1
+        if ev & EV_ACTIVE:
+            FAST_STATS['fast_ev_active'] = FAST_STATS.get('fast_ev_active', 0) + 1
+
+    def _slow(self, item, row, t):
         self.slow += 1
+        FAST_STATS['slow'] += 1
         self._to_st()
         done = encode_row(item, self.st, row, t)
         row['episode'], row['seed'], row['group'], row['first'] = self.meta[0], self.meta[1], self.meta[2], t == 0
         self.hurt = bool(row['hurt'][0] > 0)
         self.obs = item
         self._from_st()
+        return done
+
+    def _check(self, item, row, row_address, t):
+        """(ISAAC_RL_FAST_ROW=2) the record through abp_row_encode and, on copies of the decoder and the EpisodeState
+        as they stand before it, through decode + encode_row; the ROW slots, the done codes, the hurt flags and the
+        states compared (FAST_STATS check_*; the first mismatches dumped to ISAAC_RL_FAST_ROW_CHECK_DIR). The worker
+        goes on with the fast path's record and state (the same, when nothing differs)."""
+        import copy
+        c = self.ctx
+        self._to_st()
+        ref_st, ref_dec = copy.deepcopy(self.st), copy.deepcopy(self.decoder)
+        raw = row.view(np.uint8).reshape(-1)
+        before = raw.copy()
+        g, pd, m = self._ptrs
+        done = self.fn(item, len(item), row_address, self._ctx_p, g, pd, m, self._offs_p, self._refs_p, self._ext_p)
+        if done < 0:   # handed back: encode_row on the real state, nothing to compare
+            self.reasons[done] = self.reasons.get(done, 0) + 1
+            FAST_STATS['slow_' + str(done)] = FAST_STATS.get('slow_' + str(done), 0) + 1
+            raw[:] = before
+            return self._slow(self.decoder.decode(item), row, t)
+        self._fast_done(row)
+        self._to_st()
+        got = raw.copy()
+        raw[:] = before
+        v3_counts = list(V3_FRAMES)
+        try:
+            ref_done = encode_row(ref_dec.decode(item), ref_st, row, t)
+            row['episode'], row['seed'], row['group'], row['first'] = self.meta[0], self.meta[1], self.meta[2], t == 0
+            ref_hurt = bool(row['hurt'][0] > 0)
+            want = raw.copy()
+            err = None
+        except Exception as e:   # (encode_row refused a record the fast path took)
+            ref_done, ref_hurt, want, err = None, None, None, f'{type(e).__name__}: {e}'
+        V3_FRAMES[:] = v3_counts
+        raw[:] = got
+        FAST_STATS['check_records'] += 1
+        bad = []
+        if err is not None:
+            bad.append('encode_row raised: ' + err)
+        else:
+            if not np.array_equal(got, want):
+                a_, b_ = got.view(ROW)[0], want.view(ROW)[0]
+                bad.append('row fields ' + ','.join(k for k in ROW.names if a_[k].tobytes() != b_[k].tobytes()))
+            if ref_done != done:
+                bad.append(f'done {done} vs {ref_done}')
+            if ref_hurt != self.hurt:
+                bad.append(f'hurt {self.hurt} vs {ref_hurt}')
+        sd = _state_diff(self.st, ref_st)
+        if sd:
+            bad.append('state ' + ','.join(sd))
+        if ref_dec.terrain_version != self.decoder.terrain_version:
+            bad.append('decoder terrain_version')
+        if bad:
+            FAST_STATS['check_mismatch'] += 1
+            _check_dump(item, before, got, want, t, bad)
+        _check_report()
         return done
 
     def _to_st(self):
@@ -974,6 +1086,21 @@ class FastRow:
             st.progress_t = int(c[RC_PROGRESS])
         if c[RC_HAVE_RES]:   # B40
             st.prev_res = tuple(float(v) for v in c[RC_PREV_RES:RC_PREV_RES + 4])
+        # (version 9)
+        if c[RC_RW_HAVE]:
+            st.rw_count = int(c[RC_RW_COUNT])
+        if st.room is not None:
+            if st.nohit_on:
+                e = st.nohit_rooms.setdefault((st.floor_n, st.room), [False, False, False])
+                e[0], e[1], e[2] = bool(c[RC_NH]), bool(c[RC_NH + 1]), bool(c[RC_NH + 2])
+            if st.stall_first:
+                key = (st.floor_k, st.room)
+                for j, s_ in enumerate((st.ever_rooms, st.ever_cleared, st.ever_hurt)):
+                    if c[RC_EVER + j]:
+                        s_.add(key)
+        if c[RC_PREV_A_HAVE]:
+            st.prev_active = (int(c[RC_PREV_A]), float(c[RC_PREV_C]))
+            st.prev_maxc = int(c[RC_PREV_MAXC])
 
     def _from_st(self):
         c, st = self.ctx, self.st
@@ -992,6 +1119,25 @@ class FastRow:
         c[RC_N_EXITS] = min(len(st.exits), 8)
         for i, (ex, ey) in enumerate(st.exits[:8]):
             c[RC_EXITS + 2 * i], c[RC_EXITS + 2 * i + 1] = ex, ey
+        # (version 9) the worker's visible mode (write_visible), the rewind count, the nohit room, the first-mode keys,
+        # _items_step's state
+        c[RC_VIS] = (1.0 if _VP.VISIBLE_V3_MODE else 0.0) + (2.0 if os.environ.get('ISAAC_NO_VISIBLE') == '1' else 0.0)
+        c[RC_REWIND_ON] = float(st.rewind_on)
+        c[RC_RW_HAVE] = st.rw_count is not None
+        c[RC_RW_COUNT] = st.rw_count if st.rw_count is not None else 0
+        c[RC_CK_NONE] = st.ck is None
+        c[RC_NOHIT_ON] = float(st.nohit_on)
+        nh = st.nohit_rooms.get((st.floor_n, st.room)) if (st.nohit_on and st.room is not None) else None
+        c[RC_NH:RC_NH + 3] = [float(x) for x in nh] if nh is not None else (0.0, 0.0, 0.0)
+        c[RC_FIRST_MODE] = float(st.stall_first)
+        key = (st.floor_k, st.room)
+        c[RC_EVER:RC_EVER + 3] = (key in st.ever_rooms, key in st.ever_cleared, key in st.ever_hurt) \
+            if (st.stall_first and st.room is not None) else (0.0, 0.0, 0.0)
+        c[RC_POST] = 2.0 if st.items else 1.0 if st.run else 0.0
+        c[RC_PREV_A_HAVE] = st.prev_active is not None
+        if st.prev_active is not None:
+            c[RC_PREV_A], c[RC_PREV_C] = st.prev_active
+        c[RC_PREV_MAXC], c[RC_MAX_CHARGE] = st.prev_maxc, st.max_charge
         terrain = self.decoder.terrain_raw
         doors = st.version[1] if st.version is not None else None
         arrays = (st.grid, st.padded, st.map)
@@ -1005,3 +1151,57 @@ class FastRow:
         else:   # every record goes through encode_row
             self._keep = (None, None)
             self._ptrs = (None, None, None)
+
+
+# (version 9) this process's FastRow counters: fast / slow records, the hand-back codes, what the fast records did; in
+# check mode the records compared and the mismatches (ISAAC_RL_FAST_ROW=2, reported to ISAAC_RL_FAST_ROW_CHECK_DIR)
+FAST_STATS = dict(fast=0, slow=0, check_records=0, check_mismatch=0)
+_CHECK_DUMPS = [0]
+_CHECK_LAST = [0.0]
+
+
+def _same(a, b):
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        return isinstance(a, np.ndarray) and isinstance(b, np.ndarray) and a.shape == b.shape and \
+            a.dtype == b.dtype and a.tobytes() == b.tobytes()
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
+
+
+def _state_diff(st, ref):
+    """The EpisodeState attributes that differ (inv_gain: encode_row's own per-record flag, not kept by FastRow)."""
+    return [k for k in vars(ref) if k != 'inv_gain' and not _same(getattr(st, k, None), getattr(ref, k))]
+
+
+def _check_dump(payload, before, got, want, t, bad):
+    d = os.environ.get('ISAAC_RL_FAST_ROW_CHECK_DIR')
+    if not d or _CHECK_DUMPS[0] >= 20:
+        return
+    _CHECK_DUMPS[0] += 1
+    try:
+        np.savez(os.path.join(d, f'fastrow-mismatch-{os.getpid()}-{_CHECK_DUMPS[0]}.npz'),
+                 payload=np.frombuffer(payload, np.uint8), before=before, got=got,
+                 want=want if want is not None else np.zeros(0, np.uint8), t=t, bad=np.array(bad))
+    except OSError:
+        pass
+
+
+def _check_report(force=False):
+    d = os.environ.get('ISAAC_RL_FAST_ROW_CHECK_DIR')
+    if not d:
+        return
+    import time as _time
+    now = _time.time()
+    if not force and now - _CHECK_LAST[0] < 30 and FAST_STATS['check_mismatch'] == 0:
+        return
+    _CHECK_LAST[0] = now
+    try:
+        import json as _json
+        tmp = os.path.join(d, f'.fastrow-{os.getpid()}.json')
+        with open(tmp, 'w') as f:
+            _json.dump(dict(FAST_STATS, pid=os.getpid(), time=now), f)
+        os.replace(tmp, os.path.join(d, f'fastrow-{os.getpid()}.json'))
+    except OSError:
+        pass
