@@ -1058,6 +1058,7 @@ class Episodes:
         # archive, read at its first record (the worker writes it before sending that record)
         self.origin = None
         self.origin_rec = None   # (P package, Codex 17-5) per record of this arrive: the column at each record's take
+        self.audit_last = None   # (P audit, Codex 19-2) (episode [W], t [W]) of each worker's last record arrived
         self.ep_start = {}
         self.seen_inv = None                     # 2026-10-08 (lab on): held collectibles at ordinary episodes' ends
         self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
@@ -1303,6 +1304,8 @@ class Episodes:
             self.hurt[w] += hu
             self.damage[w] += dmg
         self.note_first(rows, idx, first)
+        if self.audit_last is not None:   # (P audit, Codex 19-2: each worker's last record taken, any kind)
+            self.audit_last[0][idx], self.audit_last[1][idx] = rows['episode'], rows['t']
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
             self.gains[idx] = gains_now
         if self.new_on:   # (2026-11-19) an episode's first record: its held ids; every record: its stage, holdings
@@ -6232,6 +6235,7 @@ def main(argv=None, child=None, actor=None):
                                       rw=rw, floor=bool(floor), run=bool(run)), f_)
             except Exception as e_:
                 print(f'P audit: the book could not be saved: {type(e_).__name__}: {e_}', flush=True)
+            book.audit_last = (np.full(n, -1, np.int64), np.full(n, -1, np.int64))
         while True:
             go_on = ((handed < target_decisions if n_act == 1 and not args.max_updates else sent_handoffs < n_handoffs)
                      and sampler.live and not L.get('stop') and not stopped())
@@ -6848,6 +6852,11 @@ def main(argv=None, child=None, actor=None):
                 job['lroll'], job['lready'], job['lbytes'] = hand_off(roll, lmirror, ldev, hand_streams)
                 job['lhand_s'] = time.perf_counter() - t_h
             job.setdefault('lane_stat', dict(lane_stat))   # (this collect's counters, for this update's row)
+            if getattr(book, 'audit_last', None) is not None:   # (P audit, Codex 19-2: the hand-off's own boundary --
+                #   each worker's last record committed, an end that stores no row included; p_audit rebuilds each
+                #   rollout's rows, length and open from it, the last rollout's too)
+                np.savez(os.path.join(os.environ['ISAAC_TOK_AUDIT'], f'handoff-{sent_handoffs:06d}.npz'),
+                         ep=book.audit_last[0], t=book.audit_last[1], length=roll.length, open=roll.open)
             spare.carry(roll)
             roll, spare = spare, roll
             if lane_thread:   # (B58d d2: the lane thread goes on serving the lanes while the actor waits / collects)

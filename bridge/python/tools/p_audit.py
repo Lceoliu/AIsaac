@@ -26,7 +26,12 @@ The handed rollouts, per worker, against the rebuild -- the boundaries independe
     decreasing;
   - decisions past the rebuild (the log's cap) only as the tail of a worker's last rollouts, and only when its log was
     cut there.
-Boots: those observed (truncation / branch ends asked for) and those whose flag and reward were verified.
+Boots: those observed (truncation / branch ends asked for), those whose flag and reward were verified, and those
+whose VALUE -- the bootstrap PPO uses for the decision before -- matched what the worker read (Codex 19-1).
+The ends (Codex 19-2): at each hand-off the trainer writes each worker's last record committed (handoff-*.npz, any
+kind of record); each rollout must hold exactly the decisions that boundary implies -- the one carried from the
+boundary before, then every decision made after it up to this one -- with open iff the boundary record is a go record;
+the last rollout too.
 
    usage: python tools/p_audit.py <audit dir> <rollouts dir> [--log-cap 1500] [--out f.json]
 (--log-cap: for logs written before the 'cut' marker: a log of exactly that many records was cut.)
@@ -100,7 +105,7 @@ def main(argv=None):
     # ---- the rebuild
     book = TT.Episodes.__new__(TT.Episodes)
     book.__dict__.update(meta['book'])
-    book.origin, book.plr, book.origin_rec = None, None, None
+    book.origin, book.plr, book.origin_rec, book.audit_last = None, None, None, None
     cap = max(len(s) for s, _, _ in logs) + 2
     roll = TT.Rollout(W, cap, nh, value_g=True)
     pending = np.zeros((W, nh), np.int64)
@@ -110,15 +115,22 @@ def main(argv=None):
     raw_of, reply_of = {}, {}
     no_succ = [None] * W              # the rebuild's last decision when no record after it is in the log
     boots_seen = 0
+    rec_at = [dict() for _ in range(W)]   # (Codex 19-2) per worker: (ep, t) -> the record's index in its log
+    rec_go = [[] for _ in range(W)]       #   per record: needs an action (go)
+    dec_rec = [[] for _ in range(W)]      #   per decision of the rebuild: the index of the record that made it
+    rebuilt_upto = [-1] * W               #   the last record the rebuild took in
     for w in range(W):
         sends, replies, _ = logs[w]
         last_dec_i = -1
         for i, s in enumerate(sends):
+            rec_at[w][(s['ep'], s['t'])] = i
             row = np.zeros(1, ROW)
             b = row.view(np.uint8).reshape(-1)
             b[:len(s['raw'])] = np.frombuffer(s['raw'], np.uint8)
             idx = np.array([w], np.int64)
             go = book.arrive(roll, row, idx, pending)
+            rec_go[w].append(bool(go[0]))
+            rebuilt_upto[w] = i
             if not go[0]:
                 continue
             boots_seen += int(row['done'][0] != 0)
@@ -127,6 +139,7 @@ def main(argv=None):
             if r is None or (r['actions'] is None and row['done'][0] == 0):
                 if not last:   # (Codex 18-3: a reply missing in the middle of a log is an error, not its end)
                     problem(f'worker {w}: record {i} ({s["ep"]}, {s["t"]}) has no reply in the middle of the log')
+                rebuilt_upto[w] = i - 1
                 break
             if r['actions'] is None:
                 unread.add((w, s['ep'], s['t']))
@@ -140,6 +153,7 @@ def main(argv=None):
             key = (w, s['ep'], s['t'])
             ident[key] = k
             order[w].append((s['ep'], s['t']))
+            dec_rec[w].append(i)
             raw_of[key], reply_of[key] = s['raw'], r
             pending[idx] = act
             last_dec_i = i
@@ -154,7 +168,15 @@ def main(argv=None):
     carry = [None] * W
     beyond = [False] * W                # a worker's handed decisions went past its rebuild
     n_cmp = dict(rows=0, closed=0, carried=0, open=0, unread=0, no_successor=0, past_log=0, boots_verified=0,
-                 value_g=0)
+                 boots_value_verified=0, boots_value_unlogged=0, value_g=0, boundaries_checked=0,
+                 boundaries_past_log=0)
+    # (Codex 19-2) the hand-offs' own boundaries: each worker's last record committed at each hand-off
+    hand = sorted(glob.glob(os.path.join(a.audit, 'handoff-*.npz')))
+    res['handoffs_logged'] = len(hand)
+    if not hand:
+        problem('no hand-off boundaries in the audit dir (handoff-*.npz): the rollouts\' ends cannot be checked')
+    b_prev = [-1] * W                 # the boundary record of the hand-off before (-1: the run's start)
+    b_known = [True] * W              # the boundary before was within the rebuild
     last_ver = np.full(W, -1, np.int64)
     upd_prev, first_upd = None, None
     for p in paths:
@@ -167,6 +189,42 @@ def main(argv=None):
         upd_prev = upd
         rows, length, opn = z['rows'], z['length'], z['open']
         vg_d = z['value_g'] if 'value_g' in z.files else None
+        # (Codex 19-2) what this rollout must hold, per worker, from the hand-off's boundary and the rebuild alone:
+        # the decision made at the boundary before, when it was a go record (carried open), then every decision made
+        # by a record after that boundary up to this one; open iff this boundary's record is a go record
+        hi = upd - (first_upd if first_upd is not None else upd)
+        if hand and hi < len(hand):
+            hz = np.load(hand[hi])
+            if first_upd != 0:
+                problem(f'the first rollout dumped is update {first_upd}, the boundaries start at hand-off 0')
+            for w in range(W):
+                ep_, t_ = int(hz['ep'][w]), int(hz['t'][w])
+                b = rec_at[w].get((ep_, t_), None) if ep_ >= 0 else -1
+                ok_prev = b_known[w]
+                if b is None or (b >= 0 and b > rebuilt_upto[w]):
+                    if not cut[w]:
+                        problem(f'rollout {upd} worker {w}: the boundary record {(ep_, t_)} is not in its log')
+                    n_cmp['boundaries_past_log'] += 1
+                    b_known[w] = False
+                    continue
+                b_known[w] = True
+                if not ok_prev:
+                    b_prev[w] = b
+                    continue
+                want = []
+                if b_prev[w] >= 0 and rec_go[w][b_prev[w]]:
+                    want.append(order[w][dec_rec[w].index(b_prev[w])])
+                want += [order[w][j] for j, ri in enumerate(dec_rec[w]) if b_prev[w] < ri <= b]
+                o_want = len(want) - 1 if (b >= 0 and rec_go[w][b] and want) else -1
+                got = [(int(rows['episode'][w, k]), int(rows['t'][w, k])) for k in range(int(length[w]))]
+                if got != want or int(opn[w]) != o_want:
+                    miss_ = [x for x in want if x not in got][:3]
+                    extra_ = [x for x in got if x not in want][:3]
+                    problem(f'rollout {upd} worker {w}: by the hand-off\'s boundary {(ep_, t_)} it should hold '
+                            f'{len(want)} decisions, open {o_want}; it holds {len(got)}, open {int(opn[w])} '
+                            f'(missing {miss_}, extra {extra_})')
+                n_cmp['boundaries_checked'] += 1
+                b_prev[w] = b
         for w in range(W):
             L_, o_ = int(length[w]), int(opn[w])
             if not (o_ == -1 or (L_ > 0 and o_ == L_ - 1)):
@@ -233,8 +291,19 @@ def main(argv=None):
                 if not np.array_equal(fl['pending'], roll.pending[w, kr]):
                     problem(f'rollout {upd} worker {w} {key}: pending {fl["pending"]} vs {roll.pending[w, kr]}')
                 rep = reply_of[key]
-                if key in unread:
+                if key in unread:   # (no action read; Codex 19-1: its value is the bootstrap PPO uses -- compared)
                     n_cmp['unread'] += 1
+                    if rep['value'] is None:
+                        n_cmp['boots_value_unlogged'] += 1
+                    else:
+                        if np.float32(fl['value']).tobytes() != np.float32(rep['value']).tobytes():
+                            problem(f'rollout {upd} worker {w} {key}: the bootstrap value {fl["value"]} vs the '
+                                    f'reply {rep["value"]}')
+                        if 'value_g' in fl and rep['vg'] is not None and \
+                                np.float32(fl['value_g']).tobytes() != np.float32(rep['vg']).tobytes():
+                            problem(f'rollout {upd} worker {w} {key}: the bootstrap value_g {fl["value_g"]} vs the '
+                                    f'reply {rep["vg"]}')
+                        n_cmp['boots_value_verified'] += int(bool(fl['boot']))
                 else:
                     if not np.array_equal(fl['actions'], roll.actions[w, kr]):
                         problem(f'rollout {upd} worker {w} {key}: actions {fl["actions"]} vs {roll.actions[w, kr]}')
@@ -267,7 +336,7 @@ def main(argv=None):
     res.update(n_cmp)
     res['boots_seen_in_logs'] = int(boots_seen)
     res['n_problems'] = n_problems[0]
-    res['pass'] = n_problems[0] == 0 and n_cmp['rows'] > 0 and n_cmp['closed'] > 0
+    res['pass'] = n_problems[0] == 0 and n_cmp['rows'] > 0 and n_cmp['closed'] > 0 and n_cmp['boundaries_checked'] > 0
     s = json.dumps(res, indent=1, default=str)
     print(s)
     if a.out:

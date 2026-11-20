@@ -2027,8 +2027,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     if done or control[0]:
                         receive()   # nothing may be outstanding when the next episode starts
                         waiting = False
-                        if audit is not None:
-                            audit_got(None, None, None)
+                        if audit is not None:   # (no action taken; Codex 19-1: an end the actor answered -- a
+                            #   truncation / a branch's end -- has its value written for the bootstrap: logged)
+                            audit_got(None, float(main_value[index]) if main_value is not None else None,
+                                      float(main_vg[index]) if main_vg is not None else None)
                     t2 = time.perf_counter()
                     mine[ST['wait_s']] += t2 - t1
                     if done or control[0]:
