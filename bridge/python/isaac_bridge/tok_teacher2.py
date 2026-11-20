@@ -44,8 +44,8 @@ import time
 import numpy as np
 
 from .abplus_lean import LeanDecoder, lean_logic_frames, read_lean, read_lean_raw
-from .tok_branch import step_reward
-from .tok_obs import RC_HP0, RC_PROGRESS, ROW, ROW_FRAME_AT, EpisodeState, FastRow, encode_row, stall_flags
+from .tok_branch import RewindLedger, rewind_cfg, step_reward
+from .tok_obs import RC_HP0, RC_PROGRESS, ROW, ROW_FRAME_AT, EpisodeState, FastRow, encode_row, stall_first, stall_flags
 
 V2_RING = 384        # imitation records per worker the trainer may fall behind by (a point writes <= cap of them)
 # per imitation record (float64): the action under way and the applied one (5 each, items / pill 0 without items),
@@ -156,7 +156,8 @@ class V2Log:
     episode's first record). rows (block mode): each record as replay_value re-sends it -- since 2026-11-13 its bytes up
     to the end of its frame only (keep_row / put_row): every ROW field but the visible_frame budget's unused tail, about
     32 KB a record instead of 151,880 (main1: a 3600 s episode's 27,000 records were ~4 GB in its worker)."""
-    __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value', 'h', 'vg', 'gain_r', '_g','rows','pending')
+    __slots__ = ('damage', 'hurt', 'done', 'events', 'progress', 'value', 'h', 'vg', 'gain_r', '_g','rows','pending',
+                 'rewind')
 
     def __init__(self):
         self.damage, self.hurt, self.done, self.events, self.progress, self.value = [], [], [], [], [], []
@@ -164,6 +165,7 @@ class V2Log:
         self.vg = []
         self.gain_r, self._g = [], None
         self.rows,self.pending=[],[]
+        self.rewind = []   # (2026-11-20) each record's ROW 'rewind' byte (tok_branch.RewindLedger)
 
     def keep_row(self, row):
         """Record `row` (a 1-record ROW array) kept for replay_value: its bytes up to the end of its frame (offset
@@ -185,6 +187,7 @@ class V2Log:
         self.hurt.append(float(row['hurt'][0]))
         self.done.append(int(done))
         self.events.append(int(row['events'][0]))
+        self.rewind.append(int(row['rewind'][0]))
         self.progress.append(int(progress))
         if rw is not None:   # B34: the heal / resource term (train_tok Episodes: gains since the record before)
             g = gains_of(row)
@@ -266,6 +269,7 @@ class Context:
         self.row = row                                   # a length-1 ROW view (the lane slot, or a probe's buffer)
         self.address = row.ctypes.data
         self.rw = rw if isinstance(rw, dict) else parse_reward(rw)
+        self.rewind = rewind_cfg(cfg)   # (2026-11-20, reward-rewind-design.md: the branches' / continuations' ledger)
         self.gamma = float(cfg.branch_gamma if gamma is None else gamma)
         self.fpd, self.items, self.alarm = cfg.frames_per_decision, bool(cfg.items), cfg.clone_alarm
         sec = cfg.teacher_v2_seconds if seconds is None else seconds
@@ -275,7 +279,7 @@ class Context:
         self.stats = dict(branches=0, decisions=0, frames=0, replicates=0)
 
 
-def taken_score(log, d, cap, gamma, rw, run, values=None, exit_end=False, extra=None):
+def taken_score(log, d, cap, gamma, rw, run, values=None, exit_end=False, extra=None, rewind=None):
     """The episode's own continuation from record d over at most cap steps: (discounted return + gamma^m V(record
     d + m) when that record is not an end, steps m). The value of a record that has none (the log broke off) is 0.
     values (B34): the bootstrap values per record (None: log.value); exit_end (B34): a record with EV_EXIT ends the
@@ -285,12 +289,17 @@ def taken_score(log, d, cap, gamma, rw, run, values=None, exit_end=False, extra=
     n = len(log.done)
     vals = log.value if values is None else values
     g, disc, m = 0.0, 1.0, 0
+    # (2026-11-20, rewind: tok_branch.rewind_cfg's tuple -- the ledger from record d on)
+    led = RewindLedger(rewind, gamma, rw) if rewind is not None and rewind[0] else None
     for i in range(1, cap + 1):
         t = d + i
         if t >= n:
             break
-        g += disc * (step_reward(log.damage[t], log.hurt[t], log.done[t], log.events[t], rw, run)
-                     + (extra[t] if extra is not None and t < len(extra) else 0.0))
+        r_ = (step_reward(log.damage[t], log.hurt[t], log.done[t], log.events[t], rw, run)
+              + (extra[t] if extra is not None and t < len(extra) else 0.0))
+        if led is not None:
+            r_ = led.step(r_, log.rewind[t] if t < len(log.rewind) else 0)
+        g += disc * r_
         disc *= gamma
         m = i
         if log.done[t]:
@@ -330,6 +339,7 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
     intent.reset()
     out = dict(score=0.0, n=0, end=END_STOP, boot=False, v_end=0.0, frames=0)
     rows, pends, acts, vals, lps, rews, hs, ts = [], [], [], [], [], [], [], []
+    led_ = RewindLedger(getattr(ctx, 'rewind', (0, 1, 0, 4.0)), ctx.gamma, ctx.rw)   # (2026-11-20, reward-rewind-design.md: from the branch's start)
     n_keep = (1 << 62) if keep is True else int(keep or 0)
     keep_from = getattr(intent, 'keep_from', None)   # B40: a deferred intent's first own decision (None: not yet)
     kidx = []
@@ -352,8 +362,10 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
         #  accepted: the branch's EpisodeState does not know the ids the episode held before record d and no longer
         #  holds; in the branch those count as acquired for the first time.)
         pk_, it_ = stall_flags(getattr(ctx.cfg, 'stall_progress', 'events'))
+        # (2026-11-20, --stall-progress first: the branch's first-time sets start empty -- known, as the held ids above)
         st = EpisodeState(ctx.limit, floor=True, stall=ctx.stall, run=ctx.run, items=ctx.items,
-                          stall_pickups=pk_, stall_items=it_)
+                          stall_pickups=pk_, stall_items=it_,
+                          stall_first=stall_first(getattr(ctx.cfg, 'stall_progress', 'events')))
         st.visited = set(pt.visited)
         st.stage0 = int(pt.stage0) if pt.stage0 is not None else int(ob.room[5])
         st.progress_t = pt.log.progress[d - 1] if d >= 1 else d   # the stall counter before record d
@@ -380,6 +392,7 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
                     g_now = gains_of(row)
                     rews[-1] += gain_reward(g_prev, g_now, ctx.rw)
                     g_prev = g_now
+                rews[-1] = led_.step(rews[-1], row['rewind'][0])   # (2026-11-20: from the branch's start)
             if trace is not None:
                 trace.append((row[0].copy(), rews[-1] if j else 0.0))
             if done:
@@ -485,7 +498,7 @@ def search_point(pt, ctx, policy, rng, on_depth=None):
             break
         S, hp0 = restore(pt, d, ctx)
         try:
-            taken, steps = taken_score(pt.log, d, ctx.cap, ctx.gamma, ctx.rw, ctx.run)
+            taken, steps = taken_score(pt.log, d, ctx.cap, ctx.gamma, ctx.rw, ctx.run, rewind=getattr(ctx, 'rewind', None))
             best, scores = None, []
             for intent in candidates(cfg, rng):
                 b = play_branch(S, ctx, pt, d, hp0, intent, policy)

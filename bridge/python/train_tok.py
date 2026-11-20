@@ -254,7 +254,7 @@ from isaac_bridge.tok_aux import CLOSE_BROKE
 from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
 from isaac_bridge.learn_segments import SEG   # BM1: learner segment timing (ISAAC_BLOCK_TIMING=1 only)
 from isaac_bridge.tok_obs import ROW_FRAME_AT, take_prefix   # noqa: E402  (A-4, A-6)
-from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
+from isaac_bridge.tok_obs import (ROW_SCHEMA, DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
                                       default_stub_list)
@@ -1028,7 +1028,7 @@ DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its gam
 #  have them, as they never had heal / resource.
 NEW_TERMS = ('item', 'trinket', 'depth', 'nohit')
 REWARD_TERMS = ('damage', 'hurt', 'time', 'win', 'death', 'timeout', 'room', 'explore', 'boss', 'exit', 'heal',
-                'resource') + NEW_TERMS
+                'resource') + NEW_TERMS + ('rewind',)   # ('rewind': 2026-11-20, the ledger's rollback, Episodes._rewind)
 _RT = {k: i for i, k in enumerate(REWARD_TERMS)}
 
 
@@ -1082,6 +1082,60 @@ class Episodes:
         # per worker (active, trinket 0, trinket 1, collectibles' count) of the record before, and whether there is one
         self.held_prev = np.zeros((workers, 4), np.int64)
         self.held_ok = np.zeros(workers, bool)
+        # (2026-11-20, reward-rewind-design.md) the rewind ledger, off until set_rewind: per worker the cancellable part
+        # of each decision closed since the checkpoint (led[w, :led_n[w]]), the state at the checkpoint (ck: the
+        # episode's first record, then every ROW 'rewind' bit-7 record), the episode's rewinds
+        self.rw_on = False
+        self.led = self.led_n = None
+        self.ck = [None] * workers
+        self.rewinds = np.zeros(workers, np.int64)
+
+    def set_rewind(self, interest, rtime, cmax, gamma, limit):
+        """Roll the reward ledger back at the game's Glowing Hour Glass restores (ROW 'rewind' bits 0-6): the record
+        pays its time term and -sum_j c_j x_j over the decisions j since the checkpoint, x_j a decision's reward (less
+        its time term when rtime is 0), c_j = min(gamma^-(k - j), cmax) (interest 1; 1 otherwise), k - j the decisions
+        between; the episode's statistics, its once-per-episode sets and counts and each term's share go back to the
+        checkpoint (the time term's stays when rtime is 0); the share of the rollback beyond the restored shares is the
+        term 'rewind'. limit: the most decisions an episode has (the ledger's size)."""
+        n = len(self.ck)
+        self.rw_on, self.rw_interest, self.rw_time = True, bool(interest), bool(rtime)
+        self.rw_cmax, self.rw_gamma = float(cmax), float(gamma)
+        self.led = np.zeros((n, int(limit) + 8))
+        self.led_n = np.zeros(n, np.int64)
+
+    def _snap(self, i):
+        """Worker i's checkpoint: what a rewind restores."""
+        self.ck[i] = (float(self.hurt[i]), float(self.damage[i]), int(self.rooms[i]), int(self.boss[i]),
+                      self.extra[i].copy(), float(self.healed[i]), float(self.gathered[i]),
+                      self.term[i].copy() if self.term is not None else None, self.counts[i].copy(),
+                      set(self.seen_c[i]), set(self.seen_t[i]), int(self.stage_max[i]))
+        self.led_n[i] = 0
+
+    def _rewind(self, i, n_back):
+        """Worker i's record with n_back restores: its reward (time and the rollback), the state put back."""
+        rw = self.rw
+        n = int(self.led_n[i])
+        x = self.led[i, :n]
+        c = np.minimum(self.rw_gamma ** -(n - np.arange(n, dtype=np.float64)), self.rw_cmax) if self.rw_interest \
+            else np.ones(n)
+        back = -float((c * x).sum())
+        ck = self.ck[i]
+        if ck is not None:
+            (self.hurt[i], self.damage[i], self.rooms[i], self.boss[i], ex, self.healed[i], self.gathered[i], tm,
+             cnt, sc, st_, smax) = ck
+            uses = self.extra[i, 2]   # (uses: every real use counts, the rewind's own as well)
+            self.extra[i] = ex
+            self.extra[i, 2] = uses
+            self.counts[i] = cnt
+            self.seen_c[i], self.seen_t[i], self.stage_max[i] = set(sc), set(st_), smax
+            if self.term is not None and tm is not None:
+                t_now = self.term[i, _RT['time']]
+                self.term[i] = tm
+                self.term[i, _RT['time']] = t_now if not self.rw_time else tm[_RT['time']] - rw['time']
+                self.term[i, _RT['rewind']] += back + float(x.sum())
+        self.rewinds[i] += n_back
+        self.led_n[i] = 0
+        return -rw['time'] + back
 
     @staticmethod
     def held(pitem, pinv):
@@ -1206,6 +1260,10 @@ class Episodes:
         if self.term is not None:   # (2026-11-19: never into the next episode's shares)
             self.term[ws] = 0.0
         self.counts[ws] = 0
+        if self.rw_on:
+            self.led_n[ws] = 0
+            for i_ in ws:
+                self.ck[int(i_)] = None
         if self.plr is not None:
             self.v0[ws], self.gret[ws], self.steps[ws] = 0.0, 0.0, 0
 
@@ -1287,6 +1345,21 @@ class Episodes:
                 x[w, 2] += (ev & EV_ACTIVE) > 0
                 x[w, 3] += (ev & EV_PILL) > 0
                 x[w, 5] = np.maximum(x[w, 5], rows['stage'][has])
+            if self.rw_on:   # (2026-11-20) the rewind ledger
+                rb = rows['rewind'][has].astype(np.int64)
+                back = (rb & 127) > 0
+                nb = ~back
+                if nb.any():   # (each decision's cancellable part)
+                    wn = w[nb]
+                    pos = self.led_n[wn]
+                    if (pos >= self.led.shape[1]).any():
+                        raise RuntimeError('rewind ledger full: an episode longer than the limit given to set_rewind')
+                    self.led[wn, pos] = reward[nb] if self.rw_time else reward[nb] + rw['time']
+                    self.led_n[wn] = pos + 1
+                if back.any():
+                    reward = np.array(reward, np.float64)
+                    for j in np.flatnonzero(back):
+                        reward[j] = self._rewind(int(w[j]), int(rb[j] & 127))
             # (a branch's truncated end, DONE_BRANCH: not terminal, the decision bootstraps from the end's value)
             roll.reward[w, kk], roll.terminal[w, kk] = reward, (d != 0) & (d != DONE_BRANCH) & ~cap_h
             roll.open[w] = -1
@@ -1336,6 +1409,11 @@ class Episodes:
                     pk['bped'][int(idx[j])] = [int(v) for v in rows[j]['bped'] if v > 0]
                 pk['steps'][idx[first]] = 0
             pk['steps'][idx] += rows['pforce'] > 0
+        if self.rw_on:   # (2026-11-20) checkpoints: an episode's first record, a room / floor change (after its reward)
+            for j in np.flatnonzero(first | ((rows['rewind'] & 128) != 0)):
+                if first[j]:
+                    self.rewinds[int(idx[j])] = 0
+                self._snap(int(idx[j]))
         ended = done != 0
         if ended.any():
             for j in np.flatnonzero(ended):
@@ -1363,13 +1441,17 @@ class Episodes:
                     fin['active0'] = self.active0[int(i)]
                 if self.gains is not None:   # 2026-10-08: health units healed, coins + bombs + keys gathered
                     fin.update(healed=float(self.healed[i]), gathered=float(self.gathered[i]))
-                if self.new_on:   # (2026-11-19) each reward term's share of 'ret' (with the new terms only: the
-                    # driver's native consumer, held to this one record for record, has neither)
+                if self.new_on or self.rw_on:   # (2026-11-19) each reward term's share of 'ret' (with the new terms or
+                    # the rewind ledger only: the driver's native consumer, held to this one record for record, has neither)
                     fin['r'] = {k: round(float(self.term[i, j]), 4) for j, k in enumerate(REWARD_TERMS)
                                 if self.term[i, j] != 0}
                 if self.new_on:
                     fin.update(items_new=int(self.counts[i, 0]), trinkets_new=int(self.counts[i, 1]),
                                nohit_rooms=int(self.counts[i, 2]))
+                if self.rw_on:   # (2026-11-20) the episode's rewinds; the active item it ended with (odd-episode alerts)
+                    fin['rewinds'] = int(self.rewinds[i])
+                if self.items:
+                    fin['active_end'] = int(r['pitem'][0])
                 if self.pick is not None:   # 2026-10-13 (B23): the pedestal build, the forcing draw and its decisions
                     fin.update(build_pedestals=self.pick['bped'].get(int(i), []), pickup_forced=int(r['pmode']),
                                forced_steps=int(self.pick['steps'][i]))
@@ -1393,6 +1475,10 @@ class Episodes:
                 self.term[e] = 0.0
             if self.new_on:
                 self.counts[e] = 0
+            if self.rw_on:
+                self.led_n[e] = 0
+                for i_ in e:
+                    self.ck[int(i_)] = None
             if self.plr is not None:   # 2026-10-10 (archive_plr): the score of each finished ordinary episode
                 stats_, ST_, gamma_ = self.plr
                 for j in np.flatnonzero(ended):
@@ -1855,10 +1941,26 @@ def main(argv=None, child=None, actor=None):
                         'resumed checkpoint keeps its own setting, --init pads them with zeros')
     p.add_argument('--floor-seconds', type=float, default=480.0)
     p.add_argument('--floor-stall-seconds', type=float, default=60.0)
-    p.add_argument('--stall-progress', choices=('events', 'pickups', 'items'), default='events',
+    p.add_argument('--stall-progress', choices=('events', 'pickups', 'items', 'first'), default='events',
                    help="B40: what resets the floor's stall timer: 'events' (a new / cleared room, a monster hurt), "
                         "'pickups' (also a gain in coins / keys / bombs / health) or 'items' (2026-11-12: pickups and "
-                        "also a collectible gained, a trinket / pill / card acquired; needs --items)")
+                        "also a collectible gained, a trinket / pill / card acquired; needs --items); 'first' "
+                        "(2026-11-20, reward-rewind-design.md 3.3 v1): only what the episode does for the first time "
+                        "-- a room entered, cleared, its monsters hurt (per floor instance and room), an id held, a "
+                        "floor reached; never rolled back by a rewind; repeated clears (a rewind, D7) and resources "
+                        "are not progress")
+    p.add_argument('--rewind', type=int, default=0, choices=(0, 1),
+                   help='(2026-11-20, reward-rewind-design.md) 1: the reward ledger follows the game\'s Glowing Hour '
+                        'Glass restores (ROW rewind, the bridge\'s restore count): a restore\'s record pays its time '
+                        'term and the rollback of every reward since the last room / floor change (or the episode\'s '
+                        'start), the statistics and once-per-episode sets go back with it; floor / run modes, not with '
+                        '--block-memory; needs the native lean observation (abp_native_rewinds)')
+    p.add_argument('--rewind-interest', type=int, default=1, choices=(0, 1),
+                   help='(--rewind 1) 1: each rolled-back reward times min(gamma^-(k - j), --rewind-cmax) (k - j: the '
+                        'decisions since it), so the discounted return of a rewound stretch is 0; 0: as is')
+    p.add_argument('--rewind-time', type=int, default=0, choices=(0, 1),
+                   help='(--rewind 1) 1: the time terms of the rewound stretch rolled back too; 0 (the user, 11-20): kept')
+    p.add_argument('--rewind-cmax', type=float, default=4.0)
     p.add_argument('--archive-size', type=int, default=12)
     p.add_argument('--archive-prob', type=float, default=0.7)
     p.add_argument('--snapshot-prob', type=float, default=0.5)
@@ -2379,6 +2481,15 @@ def main(argv=None, child=None, actor=None):
                     'computes the rewards without them)')
         if 'nohit' in new_rw_ and args.frame != 'v3':
             p.error('--reward nohit: --frame v3 only (its workers encode every record in encode_row)')
+    if args.rewind:   # (2026-11-20, reward-rewind-design.md)
+        if args.mode not in ('floor', 'run'):
+            p.error('--rewind 1: --mode floor or run only')
+        if args.block_memory:
+            p.error('--rewind 1: not with --block-memory -- its driver\'s native consumer (abp_core.h) computes the '
+                    'rewards without the rewind ledger, and a rewind would then pay every rewound reward '
+                    '(reward-rewind-design.md R5)')
+        if args.rewind_cmax < 1:
+            p.error('--rewind-cmax: >= 1')
     if not args.obs_visible:   # (seq-v1: before any worker / child process starts; tok_obs.encode_row reads it)
         os.environ['ISAAC_NO_VISIBLE'] = '1'
     shard_world = int(os.environ.get('ISAAC_SHARD_WORLD', '1') or 1)   # BM1 C: K shards as one run (shard_sync)
@@ -2734,7 +2845,9 @@ def main(argv=None, child=None, actor=None):
                            if floor else (), teacher_death_margin=args.teacher_death_margin, teacher_thread=args.teacher_thread, teacher_fork=args.teacher_fork,
                            mode=args.mode,
                            floor_seconds=args.floor_seconds, floor_stall_seconds=args.floor_stall_seconds,
-                           stall_progress=args.stall_progress,
+                           stall_progress=args.stall_progress, rewind=args.rewind,
+                           rewind_interest=args.rewind_interest, rewind_time=args.rewind_time,
+                           rewind_cmax=args.rewind_cmax,
                            archive_size=args.archive_size, archive_prob=args.archive_prob,
                            snapshot_prob=args.snapshot_prob, archive_boss=args.archive_boss, build_timeout=args.build_timeout,
                            root_anon_mib=args.root_anon_mib, reset_timeout=args.reset_timeout,
@@ -3679,7 +3792,8 @@ def main(argv=None, child=None, actor=None):
             np.savez(str(stem) + '.npz', **{k: (expand_rows(rl, m) if k == 'rows' else getattr(rl, k)[:, :m]) for k in (
                 'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version')},
                 **({'value_g': rl.value_g[:, :m]} if getattr(rl, 'value_g', None) is not None else {}),
-                length=rl.length, open=rl.open, update=L['update'])
+                length=rl.length, open=rl.open, update=L['update'],
+                row_schema=ROW_SCHEMA)   # (2026-11-20: dumps without it carry padding bytes in ROW 'rewind')
             torch.save(dict(model=learner_model.state_dict(), config=learner_model.config, update=L['update']),
                        str(stem) + '.pt')
             t0 = time.perf_counter()
@@ -5512,11 +5626,12 @@ def main(argv=None, child=None, actor=None):
                         f'{name}/seconds': sum(e['decisions'] for e in eps) / m * args.frames_per_decision / 30,
                         f'{name}/rooms': sum(e['rooms'] for e in eps) / m,
                         f'{name}/boss': sum(e['boss'] for e in eps) / m})
-        if floor and any(rw.get(k_) for k_ in NEW_TERMS):   # (2026-11-19) each term's mean share; the new terms' counts
+        if floor and (any(rw.get(k_) for k_ in NEW_TERMS) or args.rewind):   # (2026-11-19) each term's mean share; the new terms' counts
             m_ = max(len(finished), 1)
             row.update({f'rw_{k}': sum(e.get('r', {}).get(k, 0.0) for e in finished) / m_ for k in REWARD_TERMS})
             row.update({f'n_{k}': sum(e.get(f, 0) for e in finished) / m_
-                        for k, f in (('item', 'items_new'), ('trinket', 'trinkets_new'), ('nohit', 'nohit_rooms'))})
+                        for k, f in (('item', 'items_new'), ('trinket', 'trinkets_new'), ('nohit', 'nohit_rooms'),
+                                     ('rewind', 'rewinds'))})
         if block_on:
             row.update({'block_ppo_'+key:value for key,value in block_ppo_counts.items()})
             ru1 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))
@@ -5949,6 +6064,9 @@ def main(argv=None, child=None, actor=None):
     # ------------------------------------------------------------------ actor (the main thread)
     pending = np.zeros((n, nh), np.int64)            # the action under way per worker
     book = Episodes(n, rw, floor, run=run, items=items)
+    if args.rewind:   # (2026-11-20, reward-rewind-design.md: the ledger; an episode's most decisions bound it)
+        book.set_rewind(args.rewind_interest, args.rewind_time, args.rewind_cmax, args.gamma,
+                        int(round((args.run_seconds if run else args.floor_seconds) * 30 / args.frames_per_decision)) + 1)
     if cfg.archive_plr > 0:   # 2026-10-10: the trainer reports each episode's learning-potential score to its worker
         book.plr = (sampler.stats, ST, args.gamma)
     if cfg.stat_aug_prob > 0:   # 2026-10-08: the start stats of every episode into episodes.jsonl

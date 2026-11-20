@@ -1755,6 +1755,20 @@ ABP_NATIVE_OBS = { available = native_lean ~= nil, native = 0, fallbacks = 0, la
 local native_visible = native_lean ~= nil and type(abp_native_visible) == "function" and abp_native_visible or nil
 -- (visible-v3) abp_native_v3(): the v3 frame bytes, or nil, why (abp_v3_native.c)
 local native_v3 = native_lean ~= nil and type(abp_native_v3) == "function" and abp_native_v3 or nil
+-- (2026-11-20, reward-rewind-design.md V2) abp_native_rewinds(): the game's Glowing Hour Glass restore count
+-- (Game+0x2a1568). rewind_block(event): its block (flag 128) at an episode's first observations (event ~= "step")
+-- and whenever the count changed since the last one sent; "", 0 otherwise or without the native function. Call it
+-- before lean_fixed: the native fixed part hands back while the count differs from the one last taken here.
+local native_rewinds = native_lean ~= nil and type(abp_native_rewinds) == "function" and abp_native_rewinds or nil
+function rewind_block(event)
+	if native_rewinds == nil then return "", 0 end
+	local n = native_rewinds()
+	if event ~= "step" or n ~= lean.rewinds then
+		lean.rewinds = n
+		return spack("<i4", n), 128
+	end
+	return "", 0
+end
 ABP_NATIVE_V3 = { available = native_v3 ~= nil, native = 0, fallbacks = 0, last_fallback = nil, flags = 32, reasons = {} }
 -- (the mode lives in the global ABP_NATIVE_VIS.mode: probes switch it in one clone with a lua command)
 ABP_NATIVE_VIS = { available = native_visible ~= nil, native = 0, fallbacks = 0, last_fallback = nil, checks = 0,
@@ -2570,8 +2584,9 @@ function pack_lean(event)
 	end
 	state.terrain_dirty = false
 	local terrain, map, inv, visible = lean_blocks(event, resend, here, clear)
-	return lean_fixed(mode, here, (state.visible_v3 ~= 0 and ABP_NATIVE_V3.flags or 32) + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) .. terrain
-		.. map .. inv .. visible
+	local rw, rwf = rewind_block(event)
+	return lean_fixed(mode, here, (state.visible_v3 ~= 0 and ABP_NATIVE_V3.flags or 32) + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0) + rwf) .. terrain
+		.. map .. inv .. visible .. rw
 end
 
 -- The terrain block (when the terrain check says resend) and the map block (when it is due and changed) of a lean
@@ -3355,8 +3370,9 @@ local function native_step_obs()
 		s.blocks = s.blocks + 1
 		local sent = send_lean_payload(function()
 			if not ok then error(terrain) end
-			return lean_fixed(1, here, (state.visible_v3 ~= 0 and ABP_NATIVE_V3.flags or 32) + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0)) ..
-				terrain .. map .. inv .. visible
+			local rw, rwf = rewind_block("step")
+			return lean_fixed(1, here, (state.visible_v3 ~= 0 and ABP_NATIVE_V3.flags or 32) + (resend and 2 or 0) + (map ~= "" and 8 or 0) + (inv ~= "" and 16 or 0) + rwf) ..
+				terrain .. map .. inv .. visible .. rw
 		end)
 		if sent then wait_command() end
 		return true
@@ -3376,8 +3392,8 @@ local function native_step_obs()
 		s.fallbacks, s.last_fallback = s.fallbacks + 1, a
 		if nvis then   -- (the Lua visible block: the step's observation always carries one)
 			local vb = visible_input_block()
-			if send_lean_payload(function() return lean_fixed(1, here, 32) .. vb end) then wait_command() end
-		elseif send_lean_payload(function() return lean_fixed(1, here, 0) end) then wait_command() end
+			if send_lean_payload(function() local rw, rwf = rewind_block("step") return lean_fixed(1, here, 32 + rwf) .. vb .. rw end) then wait_command() end
+		elseif send_lean_payload(function() local rw, rwf = rewind_block("step") return lean_fixed(1, here, rwf) .. rw end) then wait_command() end
 	else   -- the connection failed
 		disconnect(a)
 	end

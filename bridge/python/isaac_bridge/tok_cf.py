@@ -670,11 +670,13 @@ def cf_search(pt, ctx, policy, rng, branch=play_branch, restore_fn=restore):
             # Determine the unchanged scoring endpoint from rewards/events, then
             # evaluate that endpoint under the point's pinned teacher generation.
             vals=np.zeros(len(pt.log.done),np.float64)
-            _,end_steps=taken_score(pt.log,d,ctx.cap,ctx.gamma,ctx.rw,ctx.run,vals,ctx.exit_end,extra)
+            _,end_steps=taken_score(pt.log,d,ctx.cap,ctx.gamma,ctx.rw,ctx.run,vals,ctx.exit_end,extra,
+                                    rewind=getattr(ctx, 'rewind', None))
             endpoint=d+end_steps
             if not pt.log.done[endpoint]:
                 vals[endpoint]=policy.replay_value(pt.log,d,endpoint,pt.bank,ctx.row,global_value=ctx.boot_vg)
-        taken, steps = taken_score(pt.log, d, ctx.cap, ctx.gamma, ctx.rw, ctx.run, vals, ctx.exit_end, extra)
+        taken, steps = taken_score(pt.log, d, ctx.cap, ctx.gamma, ctx.rw, ctx.run, vals, ctx.exit_end, extra,
+                                   rewind=getattr(ctx, 'rewind', None))
         runs = []
         k_dist = int(cfg.cf_distill_steps)
         k_wall = max(k_dist, int(getattr(cfg, 'cf_wall_distill', k_dist)))

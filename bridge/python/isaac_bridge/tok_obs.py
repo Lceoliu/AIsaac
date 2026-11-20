@@ -162,6 +162,13 @@ ROW = np.dtype([
     ('ent_price', np.int16, (ENT_CAP, 1)),
     ('phearts', np.float32, (3,)),
     ('room_type', np.uint8),
+    # (2026-11-20, reward-rewind-design.md V2; in room_type's alignment padding: every other offset and the itemsize
+    #  unchanged) bits 0-6: Glowing Hour Glass restores since the record before (the game's restore count, abp_native_
+    #  rewinds; 0 at an episode's first record and when the count went down); bit 7 (REWIND_CHECKPOINT): this record
+    #  changed rooms or floors without a rewind -- the game stored its rewind state on the way (Game::ChangeRoom /
+    #  StartStageTransition), the reward ledger's checkpoint. Written by every encoder path (FastRow's fast records: 0).
+    #  Dumps without row_schema >= 8 carry padding bytes here: treat them as unknown (0).
+    ('rewind', np.uint8),
     # Full new visible contract, independently versioned. Legacy fields above are
     # kept for old policies and reward/statistics only; new Spatial never reads them.
     ('visible_schema', np.int32),
@@ -173,6 +180,10 @@ ROW = np.dtype([
 # offset of the record's frame (visible_bytes long) in a FrameArena. A rollout's ~11 KB frames then cost ~11 KB each,
 # not 128 KiB (B42: 151,880-byte records, ~5 GB per 32,768-decision rollout).
 ROW_FRAME_AT = ROW.fields['visible_frame'][1]
+assert ROW.fields['rewind'][1] == 20793 and ROW.itemsize == 151880   # (in the padding: no other offset moved)
+REWIND_CHECKPOINT = 128
+REWIND_COUNT = 127
+ROW_SCHEMA = 8   # (2026-11-20) the ROW layout revision dumps record ('row_schema'); 8: the rewind field
 ROWC = np.dtype([(name, ROW.fields[name][0]) for name in ROW.names if name != 'visible_frame'] +
                 [('visible_off', np.int64)], align=True)
 assert all(ROWC.fields[n][1] == ROW.fields[n][1] for n in ROW.names if n != 'visible_frame')
@@ -339,15 +350,24 @@ class ClearCounter:
 
 
 def stall_flags(mode):
-    """(stall_pickups, stall_items) of EpisodeState for --stall-progress `mode` ('events', 'pickups', 'items'): the one
-    rule the floor workers' episodes (tok_floor) and the teacher's branches (tok_teacher2.play_branch) share."""
+    """(stall_pickups, stall_items) of EpisodeState for --stall-progress `mode` ('events', 'pickups', 'items', 'first'):
+    the one rule the floor workers' episodes (tok_floor) and the teacher's branches (tok_teacher2.play_branch) share.
+    'first' (2026-11-20, reward-rewind-design.md section 3.3 v1): EpisodeState.stall_first instead (stall_first(mode))."""
     return mode in ('pickups', 'items'), mode == 'items'
+
+
+def stall_first(mode):
+    """--stall-progress first: progress is only what this episode does for the first time, never rolled back by a
+    rewind -- a room entered, a room cleared, a room's monsters hurt (each per (floor instance, room index)), an id held
+    (the items mode's seen sets), a floor reached; a repeated clear (a rewind, D7) or a resource is not progress."""
+    return mode == 'first'
 
 
 class EpisodeState:
     """What the encoder keeps between the records of one episode."""
 
-    def __init__(self, limit, floor=False, stall=0, run=False, items=False, stall_pickups=False, stall_items=False):
+    def __init__(self, limit, floor=False, stall=0, run=False, items=False, stall_pickups=False, stall_items=False,
+                 stall_first=False):
         self.limit = max(int(limit), 1)
         self.floor = floor or run  # a whole-floor episode: it ends at the floor's exit, not at a room's clear
         self.run = run             # a run (2026-10-06): the floor's exit is an event (EV_EXIT), the episode goes on
@@ -393,6 +413,27 @@ class EpisodeState:
         self.nohit_on = os.environ.get('ISAAC_RL_NOHIT') == '1'
         self.nohit_rooms = {}
         self.floor_n = 0
+        # (2026-11-20, reward-rewind-design.md) rewinds: the game's restore count at the record before (None: not
+        # known yet), the floor instance (+1 per floor reached), the state a rewind restores (taken at the episode's
+        # first record and at every checkpoint record: visited, nohit_rooms, floor_n, floor_k, stage0), rewinds seen
+        self.rw_count = None
+        self.floor_k = 0
+        self.ck = None
+        self.rewinds = 0
+        # --stall-progress first (stall_first): never rolled back
+        self.stall_first = bool(stall_first)
+        self.ever_rooms, self.ever_cleared, self.ever_hurt = set(), set(), set()
+        self.prev_maxc = 0   # items: the active item's max charge at the record before (EV_ACTIVE)
+
+
+def _checkpoint(st):
+    st.ck = (set(st.visited), {k: list(v) for k, v in st.nohit_rooms.items()}, st.floor_n, st.floor_k, st.stage0)
+
+
+def _restore(st):
+    if st.ck is not None:
+        v, nh, st.floor_n, st.floor_k, st.stage0 = st.ck
+        st.visited, st.nohit_rooms = set(v), {k: list(x) for k, x in nh.items()}
 
 
 def nohit_step(st, room_idx, next_floor, hurt, damage, monsters_hp, events):
@@ -619,10 +660,21 @@ def encode_row(o, st, row, t):
     row['patch'] = st.padded[:, r:r + PATCH, col:col + PATCH]
     events = 0
     room_idx = room[4]
+    # (2026-11-20) Glowing Hour Glass restores since the record before (the bridge's count block; None: not sent)
+    rw = getattr(o, 'rewinds', None)
+    rewound = 0
+    if rw is not None:
+        if st.rw_count is not None and st.previous is not None and rw > st.rw_count:
+            rewound = min(rw - st.rw_count, REWIND_COUNT)
+        st.rw_count = rw
+    if rewound:   # the game went back to its last store: so does what a rewind restores here
+        _restore(st)
+        st.rewinds += rewound
     # a run's next floor (2026-10-06): a room change even where the new start room has the old room's index
     next_floor = st.run and st.stage0 is not None and room[5] != st.stage0
     if next_floor:
         st.visited = set()
+        st.floor_k += 1
     if st.previous is None:
         st.hp0 = max(float(o.monsters_hp), 1.0)
         row['hurt'] = row['damage'] = 0.0
@@ -642,23 +694,47 @@ def encode_row(o, st, row, t):
     if next_floor:   # the floor's exit reached: an event of its own, not a new room of the old floor
         events = (events & ~EV_NEW_ROOM) | EV_EXIT
         st.stage0 = room[5]
-    if st.nohit_on:   # (2026-11-19) EV_NOHIT
+    if rewound:   # (2026-11-20) the rewind's own step: no event, no hurt, no damage (its jumps are not this timeline's)
+        events = 0
+        row['hurt'] = row['damage'] = 0.0
+    elif st.nohit_on:   # (2026-11-19) EV_NOHIT
         events = nohit_step(st, room_idx, next_floor, float(row['hurt'][0]), float(row['damage'][0]),
                             float(o.monsters_hp), events)
+    changed = st.room is not None and (room_idx != st.room or next_floor)
     st.room, st.was_clear = room_idx, bool(o.clear)
     row['events'] = events
     st.previous = (o.damage_taken, o.monsters_hp)
+    # (2026-11-20) the rewind field (bit 7: a checkpoint -- a room or floor change, not a rewind)
+    row['rewind'] = rewound | (REWIND_CHECKPOINT if changed and not rewound else 0)
     if st.floor:
         if st.stage0 is None:
             st.stage0, st.progress_t = room[5], t
-        if events or row['damage'][0] > 0:   # a new room, a cleared room, or a monster hurt during the step
+        if st.ck is None or (changed and not rewound):   # the state a rewind restores: here (and the first record)
+            _checkpoint(st)
+        if st.stall_first:   # (--stall-progress first: what this episode does for the first time; never rolled back)
+            key = (st.floor_k, room_idx)
+            prog = bool(events & EV_EXIT)
+            if not rewound:
+                if key not in st.ever_rooms:
+                    st.ever_rooms.add(key)
+                    prog = True
+                if events & EV_CLEARED and key not in st.ever_cleared:
+                    st.ever_cleared.add(key)
+                    prog = True
+                if row['damage'][0] > 0 and key not in st.ever_hurt:
+                    st.ever_hurt.add(key)
+                    prog = True
+                prog = prog or st.inv_gain
+            if prog:
+                st.progress_t = t
+        elif events or row['damage'][0] > 0:   # a new room, a cleared room, or a monster hurt during the step
             st.progress_t = t
-        if st.stall_pickups:   # B40: or a resource gained (coins, keys, bombs, health units; abp_row_encode the same)
+        if st.stall_pickups and not st.stall_first:   # B40: or a resource gained (coins, keys, bombs, health units; abp_row_encode the same)
             res = (float(p['coins']), float(p['keys']), float(p['bombs']), float(units))
             if st.prev_res is not None and any(a > b for a, b in zip(res, st.prev_res)):
                 st.progress_t = t
             st.prev_res = res
-        if st.stall_items and st.inv_gain:   # (--stall-progress items: an item, trinket, pill or card acquired)
+        if st.stall_items and st.inv_gain and not st.stall_first:   # (--stall-progress items: an item, trinket, pill or card acquired)
             st.progress_t = t
         stalled = st.stall > 0 and t - st.progress_t >= st.stall
         done = 2 if o.dead else 1 if (room[5] != st.stage0 and not st.run) else \
@@ -671,7 +747,9 @@ def encode_row(o, st, row, t):
         v3_backfill_stall(row, min((t - st.progress_t) / st.stall, 1.0) if known else 0.0, 1.0 if known else 0.0)
     row['t'], row['done'] = t, done
     if st.items or st.run:
-        _items_step(st, row, room[5], float(p['active']), float(p['active_charge']), inv_events)
+        # (2026-11-20) a rewind's step: its inventory jumps are not events; the use of the hour glass is (EV_ACTIVE)
+        _items_step(st, row, room[5], float(p['active']), float(p['active_charge']),
+                    EV_ACTIVE if rewound else inv_events)
     return done
 
 
@@ -728,9 +806,13 @@ def _items_step(st, row, stage, active, charge, events):
     a = int(active)
     if st.prev_active is not None:
         pa, pc = st.prev_active
-        if (a == pa and a != 0 and charge < pc) or (pa != 0 and a == 0):
+        # (2026-11-20, reward-rewind-design.md section 6: a real use only -- the same item's charge went down, or a
+        #  single-use item without charges is gone; not the empty slot of a pedestal swap's pickup animation, which
+        #  counted as a use before)
+        if (a == pa and a != 0 and charge < pc) or (pa != 0 and a == 0 and st.prev_maxc == 0):
             events |= EV_ACTIVE
     st.prev_active = (a, charge)
+    st.prev_maxc = st.max_charge
     st.pitem[0] = min(max(a, 0), N_COLLECTIBLE - 1)
     st.pinv[0] = min(charge / st.max_charge, 1.0) if st.max_charge > 0 else 0.0
     st.pinv[7] = stage / 12
@@ -755,7 +837,7 @@ _ROW_FIELDS = ('player', 'ent', 'ent_id', 'doors', 'patch', 'grid', 'map', 'n_en
 _ROW_OFFS_ITEMS = np.array([ROW.fields[k][1] for k in _ROW_FIELDS], np.int64)
 _ROW_OFFS = _ROW_OFFS_ITEMS.copy()
 _ROW_OFFS[_ROW_FIELDS.index('ent_item')] = -1   # without items abp_row_encode leaves ent_item alone (version 3)
-_ROW_VERSION = 7   # abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
+_ROW_VERSION = 8   # (8: 2026-11-20, the rewind count block, flag 128, handed back: -10) abp_row_encode_version's layout (4: 2026-10-07, the 38-double player record and pcharge; 5:
 #                    2026-10-08, abp-0.2.16's 144-byte entity records and ENT_F = 56; 6: 2026-10-08, abp-0.2.17's
 #                    39-double player record (PlayerType) and pchar; 7: 2026-10-16 (B35), abp-0.2.18's 148-byte entity
 #                    records (price) and ent_price, phearts, room_type)
@@ -848,7 +930,7 @@ class FastRow:
         # (visible-v3: abp_row_encode does not know the v3 frame or raw block -- by the payload's flags; and a worker
         # configured for v3 sends every record through encode_row, whose check a record without one must meet:
         # 2026-11-18, Codex rounds 2 / 3)
-        if type(item) is bytes and (_VP.VISIBLE_V3_MODE or _VP.needs_decode(item)):
+        if type(item) is bytes and (_VP.VISIBLE_V3_MODE or _VP.needs_decode(item) or self.st.stall_first):
             item = self.decoder.decode(item)
         if type(item) is bytes:
             c[RC_T] = t
@@ -858,6 +940,7 @@ class FastRow:
                 if g else -7
             if done >= 0:
                 self.fast += 1
+                row['rewind'] = 0   # (2026-11-20: the fast path never sees a rewind or a room change; slots are reused)
                 self.hurt = c[RC_HURT] != 0
                 self.obs = None
                 if c[RC_TSEEN]:   # the same terrain block again: the decoder's version follows it

@@ -204,6 +204,10 @@
 #define G_MANAGER 0xdbc4b0UL
 #define GAME_FRAMECOUNT 0x1f5db4UL
 #define GAME_FRAMECOUNT2 0x1f5db8UL
+// (2026-11-20, reward-rewind-design.md V2) Game: int, Glowing Hour Glass restores so far -- Game::
+// RestoreGlowingHourGlassState (RVA 0x2E26A0) adds 1 after RestoreState, Game::init_vars (0x2DAC70) zeroes it; nothing
+// else reads or writes it (Ghidra corpus analysis/abplus-linux)
+#define GAME_GHG_RESTORES 0x2a1568UL
 #define MANAGER_LOOPCOUNT 0xf2d0UL
 #define FRAME_NS 16666667ULL
 #define VALVE_READS 200000UL
@@ -2137,10 +2141,25 @@ static int obs_lua_lean(lua_State *L) {
     return 1;
 }
 
+// (2026-11-20, reward-rewind-design.md V2) the Glowing Hour Glass restore count: rw_last is the value the Lua code
+// last took (abp_native_rewinds); while the game's count differs, the native fixed part hands back (the Lua code then
+// builds the observation and appends the count block, flag 128). Forked children copy rw_last with the game's memory.
+static int32_t rw_last = INT32_MIN;
+static inline int32_t rw_now(void) {
+    uintptr_t g = obs_game();
+    return g ? *(volatile int32_t *)(g + GAME_GHG_RESTORES) : 0;
+}
+static int obs_lua_rewinds(lua_State *L) {
+    rw_last = rw_now();
+    LPUSHINT(L, rw_last);
+    return 1;
+}
+
 static const char *obs_fixed(long long lf, int extra, size_t *len) {
     const char *why = NULL;
 #define OBS_GIVE_UP(reason) do { why = (reason); goto give_up; } while (0)
     uintptr_t game = obs_game();
+    if (rw_now() != rw_last) OBS_GIVE_UP("rewind count changed");
     const void *room = game ? G0(const void *, G_ROOM, (const void *)game) : NULL;
     const void *level = game ? G0(const void *, G_LEVEL, (const void *)game) : NULL;
     const void *player0 = ((const void *(*)(int))FN(P_GET))(0);
@@ -2184,8 +2203,8 @@ static const char *obs_fixed(long long lf, int extra, size_t *len) {
     if (why) goto give_up;
     // header, room, totals
     int clear = gbool(FN(R_CLEAR), room);
-    // 16: items; 64: the native visible-v3 frame (2026-11-17)
-    int flags = (clear ? 1 : 0) + (extra & 122) + (gbool(FN(G_PAUSED), (const void *)game) ? 4 : 0);
+    // 16: items; 64: the native visible-v3 frame (2026-11-17); 128: the rewind count block (2026-11-20, appended by the Lua code)
+    int flags = (clear ? 1 : 0) + (extra & 250) + (gbool(FN(G_PAUSED), (const void *)game) ? 4 : 0);
     PUT(0, (uint32_t)LEAN_MAGIC);
     PUT(4, (uint32_t)lf);
     PUT(8, (uint32_t)game_frame);
@@ -2632,6 +2651,9 @@ static char *obs_init(void) {
     ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_native_terrain_key");
     ((void (*)(lua_State *, lua_cfn, int))FN(PUSHCCLOSURE))(L, obs_lua_charge, 0);
     ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_player_charge");
+    // (2026-11-20) abp_native_rewinds(): the Glowing Hour Glass restore count (GAME_GHG_RESTORES)
+    ((void (*)(lua_State *, lua_cfn, int))FN(PUSHCCLOSURE))(L, obs_lua_rewinds, 0);
+    ((void (*)(lua_State *, const char *))FN(SETGLOBAL))(L, "abp_native_rewinds");
     // 2026-10-08 (bridge abp-0.2.17): the doubles of a player record obs_player writes; the bridge uses the native obs
     // only when this equals its own LEAN_PLAYER_F
     LPUSHINT(L, OBS_PLAYER_F);
@@ -3135,7 +3157,8 @@ static inline int32_t rd_i(const unsigned char *p) { int32_t v; memcpy(&v, p, 4)
 static inline void wr_f(unsigned char *p, float v) { memcpy(p, &v, 4); }
 static inline long floor_mod(long a, long m) { long r = a % m; return r < 0 ? r + m : r; }
 
-int abp_row_encode_version(void) { return (7 << 16) | (RC_COUNT << 8) | RO_COUNT; }
+// (8, 2026-11-20: a payload with the rewind count block, flag 128, is handed back: -10)
+int abp_row_encode_version(void) { return (8 << 16) | (RC_COUNT << 8) | RO_COUNT; }
 
 int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double *ctx, const unsigned char *grid,
                    const unsigned char *padded, const unsigned char *map, const long *offs, const long *refs) {
@@ -3143,6 +3166,7 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     int flags = pl[12], n_players = pl[13], n_doors = pl[14], n_lasers = pl[15];
     if (flags & (8 | 16)) return -2;                 // a map or inventory block: the decoder must see it
     if (flags & 64) return -9;                       // a native visible-v3 frame (2026-11-18): the decoder must see it
+    if (flags & 128) return -10;                     // the rewind count block (2026-11-20): the decoder must see it
     if (n_players < 1) return -1;
     ctx[RC_TSEEN] = 0;
     if (!(ctx[RC_HAVE_PREV] != 0)) return -4;          // the episode's first record

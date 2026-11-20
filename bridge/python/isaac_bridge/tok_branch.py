@@ -166,6 +166,45 @@ def step_reward(damage, hurt, done, events, w, run):
     return r
 
 
+def rewind_cfg(cfg):
+    """(on, interest, rtime, cmax) of a TokSamplerConfig's rewind ledger (reward-rewind-design.md); on 0: off."""
+    return (int(getattr(cfg, 'rewind', 0)), int(getattr(cfg, 'rewind_interest', 1)), int(getattr(cfg, 'rewind_time', 0)),
+            float(getattr(cfg, 'rewind_cmax', 4.0)))
+
+
+class RewindLedger:
+    """(2026-11-20, reward-rewind-design.md) the workers' scorers' reward ledger -- the trainer's (train_tok
+    Episodes) for a branch, a lab or an episode's continuation, which start at their first record: step(r, rewind)
+    with r the reward of the decision a record closes and rewind its ROW 'rewind' byte returns the reward to count.
+    A record with Glowing Hour Glass restores (bits 0-6) pays only its time term and the rollback of every reward
+    since the last checkpoint (or the start): each one's cancellable part (all of it, rtime 1; less its time term,
+    rtime 0) times min(gamma^-(k - j), cmax) (interest 1; else 1), k - j the decisions between; the ledger then starts
+    anew (the game's store is the same). A checkpoint record (bit 7, a room or floor change) ends the ledger after its
+    own reward (that reward stays). cfg: rewind_cfg's tuple; gamma: the scorer's discount; w: its reward weights."""
+
+    def __init__(self, cfg, gamma, w):
+        self.on, self.interest, self.rtime, self.cmax = cfg
+        self.gamma, self.wt = float(gamma), float(w['time'])
+        self.led = []
+
+    def step(self, r, rewind):
+        if not self.on:
+            return r
+        rewind = int(rewind)
+        if rewind & 127:
+            n = len(self.led)
+            if self.interest:
+                back = -sum(min(self.gamma ** -(n - j), self.cmax) * x for j, x in enumerate(self.led))
+            else:
+                back = -sum(self.led)
+            self.led = []
+            return -self.wt + back
+        self.led.append(r if self.rtime else r + self.wt)
+        if rewind & 128:
+            self.led = []
+        return r
+
+
 def label_valid(c):
     """A branch whose score is a label: its prefix did what the option is (or the player died in it) and its episode
     ran to one of its own ends."""

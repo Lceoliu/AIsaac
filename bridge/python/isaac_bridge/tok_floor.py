@@ -65,13 +65,13 @@ from .abplus import FORK_ENV
 from .abplus_goexplore import GxConfig, Instance
 from .abplus_lean import LeanDecoder, lean_logic_frames, read_lean, read_lean_raw
 from .env import BridgeError
-from .tok_branch import (AUX_LOGP, AUX_PRED, AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_UNCERT, AUX_USED, AUX_VALUE, BRANCH_MAX, CHOICE_RING, CI, END_BOSS, END_CAP,
+from .tok_branch import (RewindLedger, rewind_cfg, AUX_LOGP, AUX_PRED, AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_UNCERT, AUX_USED, AUX_VALUE, BRANCH_MAX, CHOICE_RING, CI, END_BOSS, END_CAP,
                          END_DEATH, END_ERROR, END_EXIT, END_PREFIX_DEATH, END_STALL, END_STOP, KIND_DOOR, KIND_ITEM,
                          KIND_ITEM_LEFT, REP_COND, REP_FIRST, REP_NOISE, REP_TWIN, SCORE_HORIZONS, Point,
                          PointQueue, choice_meta,
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
-from .tok_obs import (stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
+from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
                       encode_row, fast_row_function, V3_FRAMES)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
@@ -377,6 +377,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     stall = int(round(cfg.floor_stall_seconds * 30 / cfg.frames_per_decision))
     # B40: gains count as progress (--stall-progress items: and acquired items, trinkets, pills, cards)
     stall_pk, stall_it = stall_flags(getattr(cfg, 'stall_progress', 'events'))
+    stall_fi = stall_first(getattr(cfg, 'stall_progress', 'events'))   # (2026-11-20, --stall-progress first)
     queue = []      # hurts to search: (parked base, reseed, applied actions, hurt_at, seed, episode, base's decision)
     archive = []
     # 2026-10-10 (teacher v2): its points (tok_teacher2.V2Point), searched by the search thread through the lane
@@ -1013,7 +1014,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         records, 'gamma_t' gamma^T, 'v_end' and 'boot' the actor's value of a truncated last record); returns (the end
         code, its EpisodeState). trace (a dict, Phase B2): filled with the records' state digests and the actions
         answered to them."""
-        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it)
+        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it,
+                              stall_first=stall_fi)
         st.visited = set(visited)
         st.stage0 = int(obs.room[5])
         for s in slots:
@@ -1022,6 +1024,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         item, lf_now = obs, obs.logic_frames
         t_ep, waiting, action, end = 0, False, (0, 0, 0, 0, 0), END_STOP
         gamma, ret, disc = cfg.branch_gamma, 0.0, 1.0
+        led_b = RewindLedger(rewind_cfg(cfg), gamma, rw_b)   # (2026-11-20: from the branch's start)
         snapping = aux[cfg.workers, AUX_SNAP_ON] > 0   # the actor answers with the point's pinned snapshot
         # the shorter horizons' scores: record index -> COMP column; the return and discount at that record, then the
         # actor's value of it when its answer comes
@@ -1050,7 +1053,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     comp[CI['damage']] += float(row['damage'][0])
                     comp[CI['hurt']] += float(row['hurt'][0])
                     # the trainer's reward of the decision before this record, discounted from the branch's start
-                    ret += disc * step_reward(float(row['damage'][0]), float(row['hurt'][0]), done, ev, rw_b, run)
+                    ret += disc * led_b.step(step_reward(float(row['damage'][0]), float(row['hurt'][0]), done, ev,
+                                                         rw_b, run), row['rewind'][0])
                     disc *= gamma
                     if t_ep in h_at and done in (0, DONE_BRANCH):
                         h_ret[t_ep] = (ret, disc)
@@ -1313,7 +1317,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         tagged ROW lab / lab_s / crn, actions from the actor. Ends: death, the room cleared / left, the cap (the last
         three DONE_BRANCH: a truncation), the floor's stall rule. Fills res (tok_lab RES)."""
         st = EpisodeState(lab_cap + 1, floor=True, stall=stall, run=run, items=cfg.items,
-                          stall_pickups=stall_pk, stall_items=stall_it)
+                          stall_pickups=stall_pk, stall_items=stall_it,
+                              stall_first=stall_fi)
         st.stage0 = int(obs.room[5])
         st.visited = set()
         for s in slots:
@@ -1786,7 +1791,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['ep_archive']] = float(from_archive)   # (before the episode's first record: its 'start')
             episode_n += 1
             seed_now = src.info['seed']
-            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it)
+            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it,
+                              stall_first=stall_fi)
             st.visited, st.stage0 = set(src.info['visited']), src.info['stage0']
             enc = FastRow(fast_fn, st, decoder, episode_n, seed_now, group) if fast_fn is not None else None
             item, lf_now = obs, obs.logic_frames   # with FastRow item is the step's raw payload
@@ -1799,6 +1805,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 base, base_reseed, base_t = src.hold(), reseed, 0
             room_now = None
             clear_ctr = ClearCounter()   # (2026-11-13: the main episode's rooms cleared after a fight)
+            cf_rooms = set()   # (2026-11-20, cfg.rewind: the (floor instance, room) clears that earned tokens)
             tracker = PedestalTracker() if branching else None
             # Phase B2: copies of the last records and the actor's outputs per record (the points' decision records)
             ring = deque(maxlen=8 + cfg.branch_left_back) if branching else None
@@ -1829,6 +1836,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         done = encode_row(obs, st, row, t_ep)
                         row['episode'], row['seed'], row['group'], row['first'] = episode_n, seed_now, group, t_ep == 0
                         hurt, room_idx = row['hurt'][0] > 0, obs.room[4]
+                    if t_ep == 0 and getattr(cfg, 'rewind', 0) and st.rw_count is None:
+                        # (2026-11-20) a ledger that cannot see the game's rewinds would pay every rewound reward
+                        raise RuntimeError('rewind ledger on but the bridge sent no Glowing Hour Glass restore count at '
+                                           "the episode's first record (abp_native_rewinds: native obs off, or an "
+                                           'older libabp_turbo / bridge)')
                     # (2026-10-09: the fatal hit does not raise the bridge's damage_taken, so a death record has hurt 0
                     # and was never a hurt to search; the death teacher queues it by its done code)
                     if pf_track:   # 2026-10-13 (B23): the forced move of this record (0: the policy's), the episode's
@@ -1898,6 +1910,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     room_now = room_idx
                     if cleared_:
                         mine[ST['clears']] += 1
+                    if fought_ and getattr(cfg, 'rewind', 0):   # (2026-11-20: once per (floor instance, room))
+                        key_ = (st.floor_k, int(room_idx))
+                        fought_ = key_ not in cf_rooms
+                        cf_rooms.add(key_)
                     if fought_:
                         mine[ST['clears_fought']] += 1
                         if cfon:   # (cfg.cf_per_clear: the points' earned bucket)

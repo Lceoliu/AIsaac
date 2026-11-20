@@ -318,6 +318,13 @@ class TokSamplerConfig:
     # before) or 'pickups' (also a gain in player 0's coins, keys, bombs or health units; tok_obs EpisodeState
     # stall_pickups, abp_row_encode RC_STALL_MODE). The stall share is a policy input (player column 30).
     stall_progress: str = 'events'
+    # (2026-11-20, reward-rewind-design.md) 1: the trainer rolls the reward ledger back at the game's Glowing Hour Glass
+    # restores (ROW 'rewind'); the workers then require the bridge's restore count (abp_native_rewinds) at every
+    # episode's first record, and a main episode earns cf_per_clear's tokens once per (floor instance, room) only
+    rewind: int = 0
+    rewind_interest: int = 1     # (the ledger's rollback: each reward times min(gamma^-(k - j), rewind_cmax); 0: as is)
+    rewind_time: int = 0         # (1: the time terms rolled back too)
+    rewind_cmax: float = 4.0
     archive_size: int = 12                        # floor: parked room-entry states per worker
     archive_prob: float = 0.7                     # floor: share of the episodes that start from one of them
     snapshot_prob: float = 0.5                    # floor: share of the room entries that are parked
