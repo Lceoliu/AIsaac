@@ -3112,6 +3112,11 @@ def main(argv=None, child=None, actor=None):
     if driver_cpus:
         os.sched_setaffinity(0, os.sched_getaffinity(0) - driver_cpus)
         print(f'driver CPUs (ISAAC_DRIVER_CPUS): {sorted(driver_cpus)}, dedicated to the C++ driver thread', flush=True)
+    # (P-driver-design 15, the CPU ledger) ISAAC_TOK_PIN=1 with the lane's ISAAC_DRIVER_CPUS: the actor's main thread
+    # (the Python loop, or the C++ driver's consumer) and the C++ driver's thread on those CPUs, off the saturated
+    # workers' set -- the main thread once the loop starts (the workers and the learner process started before
+    # it: they keep the rest); scheduling only, nothing computed differently
+    tok_pin = os.environ.get('ISAAC_TOK_PIN', '0') == '1' and bool(driver_cpus) and child is None
     # (P-driver-design 15, the split layout) ISAAC_ACTOR_CPUS with ISAAC_TOK_PIN=1: the actor's main thread (the Python
     # loop, or the C++ driver's consumer) on these CPUs instead of sharing ISAAC_DRIVER_CPUS with the driver thread;
     # kept off the workers' set like the driver's. Unset: as before (the main thread on the driver CPUs)
@@ -6066,11 +6071,6 @@ def main(argv=None, child=None, actor=None):
     # failed build, ends here: the acceptance runs cannot pass on the Python loop); 0 / unset: the Python loop.
     tok_mode = int(os.environ.get('ISAAC_TOK_CPP_DRIVER', '0') or 0) if child is None else 0
     tok_dc = [None, False]
-    # (P-driver-design 15, the CPU ledger) ISAAC_TOK_PIN=1 with the lane's ISAAC_DRIVER_CPUS: the actor's main thread
-    # (the Python loop, or the C++ driver's consumer) and the C++ driver's thread on those CPUs, off the saturated
-    # workers' set -- the main thread once the loop starts (the workers and the learner process started before
-    # it: they keep the rest); scheduling only, nothing computed differently
-    tok_pin = os.environ.get('ISAAC_TOK_PIN', '0') == '1' and bool(driver_cpus) and child is None
 
     def _dev_key(d_):   # ('cuda', 0) for 'cuda' / 'cuda:0' / torch.device('cuda', 0)
         d_ = torch.device(d_)
@@ -6273,11 +6273,11 @@ def main(argv=None, child=None, actor=None):
         n_handoffs = -(-(target_decisions - decisions_total) // args.rollout)
         sent_handoffs = 0
         rollout_actor = args.rollout // n_act
-        nsys_win = nv.profiler_window()
         if tok_pin:   # (P-driver-design 15: the actor's main thread off the workers' CPUs; its own with ISAAC_ACTOR_CPUS)
             os.sched_setaffinity(0, actor_cpus or driver_cpus)
             print(f'P package: the actor main thread on CPUs {sorted(actor_cpus or driver_cpus)} (ISAAC_TOK_PIN)',
                   flush=True)
+        nsys_win = nv.profiler_window()
         if os.environ.get('ISAAC_TOK_AUDIT') and child is None:   # (P package, Codex 17-4: the reconciliation's start --
             #   the book as configured before any record (its state), the rules; tools/p_audit.py rebuilds the
             #   rollouts from the workers' logs with it)
