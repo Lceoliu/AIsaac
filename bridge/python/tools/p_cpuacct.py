@@ -108,6 +108,20 @@ def lane_of(pid):
     return None
 
 
+def container_ancestors(pid):
+    """(3b) The trainer's ancestors in its own cgroup, nearest first; the last is the container's init (docker --init:
+    the reaper of every orphaned clone -- their CPU lands in its cutime, outside the trainer's tree)."""
+    cg = rd(f'/proc/{pid}/cgroup')
+    out, q = [], pid
+    for _ in range(64):
+        st = stat_of(f'/proc/{q}/stat')
+        if st is None or st['ppid'] <= 1 or rd(f"/proc/{st['ppid']}/cgroup") != cg:
+            break
+        q = st['ppid']
+        out.append(q)
+    return out
+
+
 def cpu_set(spec):
     out = set()
     for part in (spec or '').split(','):
@@ -235,6 +249,8 @@ def main():
     clast = {}           # pid -> cticks
     cs0 = cs1 = None
     cg0 = cg1 = fk0 = fk1 = None
+    anc = container_ancestors(root)   # (3b: the orphans' reaper and the wrappers between it and the trainer)
+    anc0 = anc1 = None
     alive = None         # (3b) the descendants at the sample before: births / exits within the window by kind
     born, gone = {}, {}
     procs_seen = {}      # pid -> (kind, comm)
@@ -250,10 +266,12 @@ def main():
             open_, t0 = True, time.time()
             cs0 = cpu_stat()
             cg0, fk0 = cg_stat(root), host_forks()
+            anc0 = {q: (stat_of(f'/proc/{q}/stat') or {}).get('cticks') for q in anc}
         if open_ and n_rows >= a.to_update:
             t1 = time.time()
             cs1 = cpu_stat()
             cg1, fk1 = cg_stat(root), host_forks()
+            anc1 = {q: (stat_of(f'/proc/{q}/stat') or {}).get('cticks') for q in anc}
             break
         if not os.path.exists(f'/proc/{root}'):
             break
@@ -425,6 +443,11 @@ def main():
     for q in born:
         k_ = procs_seen.get(q, ('?', ''))[0]
         bk[k_] = bk.get(k_, 0) + 1
+    if anc0 and anc1 and win:   # (3b) children reaped above the trainer: the init's are the orphaned clones
+        split['reaped_above_trainer_cores'] = {
+            f"{q} {(stat_of(f'/proc/{q}/stat') or {}).get('comm', '?')}{' (init)' if q == anc[-1] else ''}":
+                round((anc1[q] - anc0[q]) / CLK / win, 3)
+            for q in anc if anc0.get(q) is not None and anc1.get(q) is not None}
     split.update(born_per_s={k: round(v / win, 2) for k, v in bk.items()} if win else None,
                  exited_per_s={k: round(v / win, 2) for k, v in gone.items()} if win else None,
                  host_forks_per_s=round((fk1 - fk0) / win, 1) if (fk0 is not None and fk1 is not None and win) else None)
