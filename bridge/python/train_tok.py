@@ -1450,8 +1450,8 @@ class Episodes:
                                nohit_rooms=int(self.counts[i, 2]))
                 if self.rw_on:   # (2026-11-20) the episode's rewinds; the active item it ended with (odd-episode alerts)
                     fin['rewinds'] = int(self.rewinds[i])
-                if self.items:
-                    fin['active_end'] = int(r['pitem'][0])
+                    if self.items:   # (with the ledger only: the driver's native consumer, held to this one, has neither)
+                        fin['active_end'] = int(r['pitem'][0])
                 if self.pick is not None:   # 2026-10-13 (B23): the pedestal build, the forcing draw and its decisions
                     fin.update(build_pedestals=self.pick['bped'].get(int(i), []), pickup_forced=int(r['pmode']),
                                forced_steps=int(self.pick['steps'][i]))

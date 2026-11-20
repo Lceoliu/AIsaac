@@ -221,7 +221,7 @@ def test_without_rewinds_every_reward_is_the_old_one_bit_for_bit():
                 for w in ws[go]:
                     k = int(roll.length[w])
                     roll.open[w], roll.length[w] = k, k + 1
-            fin = [{k: v for k, v in f.items() if k not in ('rewinds',)} for f in book.finished]
+            fin = [{k: v for k, v in f.items() if k not in ('rewinds', 'active_end')} for f in book.finished]   # (the ledger's own fields)
             out.append((roll.reward.copy(), fin))
         assert np.array_equal(out[0][0], out[1][0]) and out[0][1] == out[1][1], seed
 
