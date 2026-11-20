@@ -445,8 +445,16 @@ def test_e_concurrent_writer_every_record_taken_is_whole(monkeypatch, compact):
             os._exit(code)
     taken = {('teach', w): [] for w in range(W)}
     taken.update({('v2', w): [] for w in range(W)})
+    import time
+    deadline = time.monotonic() + 300   # (Codex round 26: a writer that failed before setting done ends the wait)
     try:
         while True:
+            assert time.monotonic() < deadline, 'the writer never finished'
+            if pid is not None:
+                got_pid, status = os.waitpid(pid, os.WNOHANG)
+                if got_pid:   # (the writer ended: whole, or the test fails here instead of waiting forever)
+                    pid = None
+                    assert os.waitstatus_to_exitcode(status) == 0 and int(done[0]), 'the writer failed'
             last = int(done[0])
             for kind in ('teach', 'v2'):
                 rows, meta = take(S, kind)
@@ -456,8 +464,9 @@ def test_e_concurrent_writer_every_record_taken_is_whole(monkeypatch, compact):
             if last:
                 break
     finally:
-        _, status = os.waitpid(pid, 0)
-    assert os.waitstatus_to_exitcode(status) == 0
+        if pid is not None:
+            _, status = os.waitpid(pid, 0)
+            assert os.waitstatus_to_exitcode(status) == 0
     for (kind, w), ids in taken.items():
         assert ids == sorted(ids) and len(set(ids)) == len(ids), (kind, w)
     sk = S.ring_skips
@@ -540,3 +549,77 @@ def test_h_ring_open_counts_a_slot_already_open():
     assert gen[0, 0] == 1 and TS.ring_open(gen, 0, 0, 2) == 0 and gen[0, 0] == -3
     assert TS.ring_open(None, 0, 0, 5) == 0
     assert 'ring_open_busy' in TS.ST and TS.STATS[-2:] == ('np_runs', 'np_removed')
+
+
+# ---------------------------------------------------------------- (i) the workers' ring confirmation (Codex round 26)
+def _wait_closed(conn):
+    try:
+        conn.recv_bytes()
+    except (EOFError, OSError):
+        pass
+
+
+def stub_worker_old(index, cfg, names, conn, teacher_names=None, *args, **kw):
+    """A worker of a tree without the ring protocol (Codex round 26's stand-in): writes a teacher record and raises
+    the ring's count, no generation, no confirmation."""
+    from isaac_bridge import tok_sampler as S_
+    blocks, rows, actions, stats, control = S_.attach(names, cfg.workers)
+    tb, trows, tmeta = S_.attach_teacher(teacher_names, cfg.workers)
+    trows[index, 0]['episode'] = 7
+    stats[index, S_.ST['teach']] = 1
+    del rows, actions, stats, control, trows, tmeta
+    _wait_closed(conn)
+
+
+def stub_worker_new(index, cfg, names, conn, teacher_names=None, *args, **kw):
+    """A worker of this tree up to its games: confirms the protocol, then the mode check (tok_floor / worker_main's
+    order). ISAAC_RL_TEST_BAD_WORKER=<i>: worker i runs the other ring mode (its own environment, as a mixed launch)."""
+    from isaac_bridge import tok_obs as O_
+    from isaac_bridge import tok_sampler as S_
+    if str(index) == os.environ.get('ISAAC_RL_TEST_BAD_WORKER', ''):
+        O_.RING_COMPACT = not O_.RING_COMPACT
+    gb, tg, vg, ack = S_.attach_ring_gen(cfg.ring_gen_block, cfg.workers)
+    S_.ring_confirm(ack, index)
+    del tg, vg, ack
+    S_.check_ring_mode(cfg)   # (the bad one ends here: RuntimeError, exit 1)
+    _wait_closed(conn)
+
+
+def sampler_with(monkeypatch, tmp_path, target, workers=2, confirm_s='4'):
+    import select
+    if not hasattr(select, 'poll'):
+        pytest.skip('TokSampler: select.poll (Linux)')
+    monkeypatch.setenv('ISAAC_RL_FATAL_DIR', str(tmp_path))
+    monkeypatch.setenv('ISAAC_RL_PNG_SHARED', '0')
+    monkeypatch.setenv('ISAAC_RL_RING_CONFIRM_S', confirm_s)
+    monkeypatch.setattr(TS, 'worker_main', target)
+    cfg = TS.TokSamplerConfig(workers=workers, teacher=True, name='ringtest', port=os.getpid() % 30000 + 20000)
+    return TS.TokSampler(cfg)
+
+
+def test_i_a_worker_without_the_ring_protocol_ends_the_run(monkeypatch, tmp_path):
+    """Codex round 26: a worker that writes records without generations (an older tree) and a trainer of this one:
+    before, every record it wrote was counted torn and dropped, silently (1 written, 0 taken); now the trainer stops
+    at its start with the reason, nothing sampled."""
+    from isaac_bridge.visible_producer import VisibleV3Fatal
+    with pytest.raises(VisibleV3Fatal, match='confirmed nothing'):
+        sampler_with(monkeypatch, tmp_path, stub_worker_old)
+
+
+def test_i_one_worker_of_another_ring_mode_ends_the_run(monkeypatch, tmp_path):
+    """Codex round 26: one bad worker (another ISAAC_RL_RING_COMPACT), one good: the run ends with the bad worker's
+    confirmation in the reason -- not the bad worker alone dropped and the run going on with the other."""
+    from isaac_bridge.visible_producer import VisibleV3Fatal
+    monkeypatch.setenv('ISAAC_RL_TEST_BAD_WORKER', '0')
+    with pytest.raises(VisibleV3Fatal, match=r'worker 0: ring protocol 1, ISAAC_RL_RING_COMPACT'):
+        sampler_with(monkeypatch, tmp_path, stub_worker_new, confirm_s='60')
+
+
+def test_i_workers_that_confirm_start(monkeypatch, tmp_path):
+    """Both workers confirm the trainer's protocol and mode: the sampler starts (and closes cleanly)."""
+    monkeypatch.delenv('ISAAC_RL_TEST_BAD_WORKER', raising=False)
+    s = sampler_with(monkeypatch, tmp_path, stub_worker_new, confirm_s='60')
+    try:
+        assert [int(a) for a in s.ring_ack] == [TS.ring_ack_value(TO.RING_COMPACT)] * 2
+    finally:
+        s.close(timeout=2.0)

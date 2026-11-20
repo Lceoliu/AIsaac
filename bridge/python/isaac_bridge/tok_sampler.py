@@ -440,17 +440,45 @@ def attach(names, workers, initialize=False):
 
 
 RING_SKIPS = ('teach_lapped', 'teach_torn', 'teach_bad', 'v2_lapped', 'v2_torn', 'v2_bad')
+RING_PROTOCOL = 1   # (Codex round 26) the rings' slot generations; every worker confirms it (ring_confirm) at its start
+
+
+def ring_gen_size(workers):
+    """The generations block's bytes: per worker the teacher ring's and the V2 ring's slots, and its confirmation."""
+    from .tok_teacher2 import V2_RING
+    return 8 * workers * (TEACH_RING + V2_RING + 1)
 
 
 def attach_ring_gen(name, workers):
-    """(Codex round 25) (block, teacher generations [workers, TEACH_RING], V2 generations [workers, V2_RING]), int64:
-    a slot's generation is c + 1 once record c is in it whole (ring_publish), -(c + 1) while a writer is writing it
-    (ring_open), 0 before its first record. The readers take a record only when its generation is c + 1 before and
-    after every part of it (ROW, meta, GRU state, temporal outputs) is copied."""
+    """(Codex round 25) (block, teacher generations [workers, TEACH_RING], V2 generations [workers, V2_RING],
+    confirmations [workers]), int64: a slot's generation is c + 1 once record c is in it whole (ring_publish),
+    -(c + 1) while a writer is writing it (ring_open), 0 before its first record. The readers take a record only when
+    its generation is c + 1 before and after every part of it (ROW, meta, GRU state, temporal outputs) is copied.
+    (Codex round 26) A worker's confirmation: 0 until it wrote ring_ack_value (ring_confirm)."""
     from .tok_teacher2 import V2_RING
     block = shared_memory.SharedMemory(name=name)
-    gen = np.ndarray((workers, TEACH_RING + V2_RING), np.int64, buffer=block.buf)
-    return block, gen[:, :TEACH_RING], gen[:, TEACH_RING:]
+    gen = np.ndarray((workers, TEACH_RING + V2_RING + 1), np.int64, buffer=block.buf)
+    return block, gen[:, :TEACH_RING], gen[:, TEACH_RING:TEACH_RING + V2_RING], gen[:, -1]
+
+
+def ring_ack_value(compact):
+    """(Codex round 26) What a worker confirms: the ring protocol it writes, and its ISAAC_RL_RING_COMPACT."""
+    return (RING_PROTOCOL << 8) | 0x10 | int(bool(compact))
+
+
+def ring_ack_text(value):
+    value = int(value)
+    if value == 0:
+        return 'no confirmation'
+    return f'ring protocol {value >> 8}, ISAAC_RL_RING_COMPACT {value & 1}'
+
+
+def ring_confirm(ack, index):
+    """(Codex round 26) A worker's first act on the rings: its protocol and ring mode into its confirmation (the
+    trainer waits for every worker's, TokSampler.confirm_rings, before it samples; a worker of an older tree writes
+    none and is refused there, never run with records it does not stamp)."""
+    from . import tok_obs
+    ack[index] = ring_ack_value(tok_obs.RING_COMPACT)
 
 
 def ring_open(gen, i, slot, c):
@@ -1151,14 +1179,15 @@ def term_to_exit():
 def worker_main(index, cfg, names, conn, teacher_names=None):
     blocks, rows, actions, stats, control = attach(names, cfg.workers)
     teaching = cfg.teacher and teacher_names is not None and not cfg.eval_seeds
-    check_ring_mode(cfg)
     teach_gen = None
+    if cfg.ring_gen_block:   # (Codex round 26: confirmed first, then refused on a ring mode not the trainer's)
+        gen_block, teach_gen, _, ring_ack = attach_ring_gen(cfg.ring_gen_block, cfg.workers)
+        blocks = blocks + [gen_block]
+        ring_confirm(ring_ack, index)
+    check_ring_mode(cfg)
     if teaching:
         teach_blocks, teach_rows, teach_meta = attach_teacher(teacher_names, cfg.workers)
         blocks = blocks + teach_blocks
-        if cfg.ring_gen_block:
-            gen_block, teach_gen, _ = attach_ring_gen(cfg.ring_gen_block, cfg.workers)
-            blocks = blocks + [gen_block]
     t_begin = time.perf_counter()
     queue = []      # hurts to search: (template, reseed, applied actions, hurt_at, seed, episode)
 
@@ -1516,11 +1545,11 @@ class TokSampler:
         # (Codex round 25) the rings' slot generations (both rings, every run: 8 bytes a slot), the switch the workers
         # must match, the records the readers did not take (progress ring_*)
         from .tok_obs import RING_COMPACT
-        from .tok_teacher2 import V2_RING
-        gb = shared_memory.SharedMemory(create=True, size=8 * n * (TEACH_RING + V2_RING))
+        gb = shared_memory.SharedMemory(create=True, size=ring_gen_size(n))
         self.blocks.append(gb)
         cfg.ring_gen_block, cfg.ring_compact = gb.name, int(RING_COMPACT)
-        attached_g, self.teach_gen, self.v2_gen = attach_ring_gen(gb.name, n)
+        attached_g, self.teach_gen, self.v2_gen, self.ring_ack = attach_ring_gen(gb.name, n)
+        self.teach_gen[:], self.v2_gen[:], self.ring_ack[:] = 0, 0, 0
         self.attached.append(attached_g)
         self.ring_skips = dict.fromkeys(RING_SKIPS, 0)
         tracemalloc_spec(os.environ.get('ISAAC_WORKER_TRACEMALLOC', ''))   # (refused here, before any worker starts)
@@ -1668,6 +1697,40 @@ class TokSampler:
             self._lanes[c.fileno()] = i
             self._poller.register(c.fileno(), select.POLLIN)
             self._lane_poller.register(c.fileno(), select.POLLIN)
+        if self.teach_rows is not None or self.v2_rows is not None:   # (Codex round 26: before any sampling)
+            self.confirm_rings()
+
+    def confirm_rings(self, timeout=None):
+        """(Codex round 26) Every worker's ring confirmation (ring_confirm) before the trainer samples: its protocol
+        RING_PROTOCOL and its ISAAC_RL_RING_COMPACT the trainer's. A worker that confirms another (an older tree, a
+        mixed switch), ends before confirming, or confirms nothing within the timeout (ISAAC_RL_RING_CONFIRM_S,
+        default 600 s; a worker confirms when it attaches its blocks, before its games start) ends the run: the workers
+        stopped, the blocks released, VisibleV3Fatal with the reason (train / eval exit non-zero; not retried)."""
+        from .tok_obs import RING_COMPACT
+        want = ring_ack_value(RING_COMPACT)
+        limit = float(timeout if timeout is not None else os.environ.get('ISAAC_RL_RING_CONFIRM_S', '600'))
+        t0 = time.monotonic()
+        while True:
+            acks = [int(a) for a in self.ring_ack]
+            wrong = [(i, a) for i, a in enumerate(acks) if a and a != want]
+            missing = [i for i, a in enumerate(acks) if not a]
+            reason = None
+            if wrong:
+                reason = '; '.join(f'worker {i}: {ring_ack_text(a)}' for i, a in wrong)
+            elif missing and any(self.procs[i].exitcode is not None for i in missing):
+                reason = 'worker(s) ' + ', '.join(f'{i} (exit {self.procs[i].exitcode})' for i in missing
+                                                  if self.procs[i].exitcode is not None) + ' ended before confirming'
+            elif missing and time.monotonic() - t0 > limit:
+                reason = (f'worker(s) {missing} confirmed nothing within {limit:.0f} s (a worker of a tree without '
+                          f'the ring protocol writes records it does not stamp)')
+            if reason is not None:
+                self.fatal = (f'ring protocol check: the trainer needs {ring_ack_text(want)} from every worker; '
+                              f'{reason} -- the run stops (no worker is dropped, nothing is retried)')
+                self.close(timeout=5.0)   # (raises VisibleV3Fatal(self.fatal) once everything is closed)
+                raise VisibleV3Fatal(self.fatal)
+            if not missing:
+                return
+            time.sleep(0.02)
 
     def _lane_message(self, fd):
         """A lane's request (one 5-byte message) into lane_ready; a closed lane leaves the poll sets."""
@@ -2032,6 +2095,7 @@ class TokSampler:
         self.lane_rows = self.lane_io = self.lane_out = self.main_value = self.v2_rows = self.v2_meta = None
         self.main_h = self.lane_h = self.v2_h = None
         self.main_vg = self.cf_snap = self.lane_t = self.v2_t = None
+        self.teach_gen = self.v2_gen = self.ring_ack = None   # (the generations block's views, before it closes)
         for b in self.attached:
             b.close()
         for b in self.blocks:

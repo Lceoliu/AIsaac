@@ -72,7 +72,7 @@ from .tok_branch import (RewindLedger, end_reward, rewind_cfg, AUX_LOGP, AUX_PRE
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
 from .tok_obs import ring_put   # noqa: E402
-from .tok_sampler import (attach_ring_gen, check_ring_mode, ring_open, ring_publish,   # noqa: E402
+from .tok_sampler import (attach_ring_gen, check_ring_mode, ring_confirm, ring_open, ring_publish,   # noqa: E402
                           tracemalloc_spec)
 from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
                       encode_row, fast_counts, fast_row_function, V3_FRAMES, child_start, fast_row_final)
@@ -351,11 +351,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     cfon = bool(getattr(cfg, 'cf', False)) and v2_names is not None and v2_conn is not None and not evaluation
     laneon = v2on or cfon   # (the lane, the episode's log and the V2 ring: teacher v2's machinery, shared)
     teaching = cfg.teacher and teacher_names is not None and not evaluation
-    check_ring_mode(cfg)   # (Codex round 25: the trainer's ISAAC_RL_RING_COMPACT, or refused)
     teach_gen = v2_gen = None   # (Codex round 25) the rings' slot generations (tok_sampler.attach_ring_gen)
-    if cfg.ring_gen_block and (teaching or laneon):
-        gen_block, teach_gen, v2_gen = attach_ring_gen(cfg.ring_gen_block, cfg.workers)
+    if cfg.ring_gen_block:   # (Codex round 26: confirmed first -- the trainer waits for it -- then the mode check)
+        gen_block, teach_gen, v2_gen, ring_ack = attach_ring_gen(cfg.ring_gen_block, cfg.workers)
         blocks = blocks + [gen_block]
+        ring_confirm(ring_ack, index)
+    check_ring_mode(cfg)   # (Codex round 25: the trainer's ISAAC_RL_RING_COMPACT, or refused)
     if teaching:
         teach_blocks, teach_rows, teach_meta = attach_teacher(teacher_names, cfg.workers)
         blocks = blocks + teach_blocks
