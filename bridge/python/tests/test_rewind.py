@@ -653,7 +653,9 @@ def test_a_missing_count_is_a_protocol_error():
     assert issubclass(tok_floor.RewindFatal, VisibleV3Fatal) and not issubclass(tok_floor.RewindFatal, RuntimeError)
     src = inspect.getsource(tok_floor)
     assert "raise RewindFatal('rewind ledger on (--rewind 1)" in src
-    assert 'if fatal_active() or isinstance(exc, RewindFatal):' in src
+    # (Codex round 23: the worker's fatal by the exception's always_fatal -- RewindFatal, FastRowFatal, ChildFatal)
+    assert tok_floor.RewindFatal.always_fatal is True
+    assert "if fatal_active() or getattr(exc, 'always_fatal', False):" in src
     s = tok_sampler.TokSampler.__new__(tok_sampler.TokSampler)
     s.fatal, s._fatal_reason = None, {}
     s.cfg = types.SimpleNamespace(rewind=1, fatal_dir='')

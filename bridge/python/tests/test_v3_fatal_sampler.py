@@ -315,7 +315,19 @@ def test_the_exit_86_flag_is_set_only_by_a_visible_v3_fatal(module, func):
             for n in ast.walk(t):
                 if isinstance(n, ast.Name) and n.id == guard:
                     other.append(ast.unparse(node)[:80])
-    assert in_handler == 1 and len(other) == 2 and any(o.endswith('= None') for o in other), (guard, other)
+    # (Codex round 24-2: a check-mode worker's final counts failing is the worker's fatal too -- assigned in the
+    #  'finally' block, only when no fatal was taken before ('if <guard> is None:'), and only ever an exception)
+    in_final = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and ast.unparse(node.test).endswith(f'{guard} is None'):
+            for n in ast.walk(node):
+                if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == guard for t in n.targets):
+                    assert isinstance(n.value, ast.Name), ast.unparse(n)
+                    in_final += 1
+    assert in_handler == 1 and len(other) == 2 + in_final and in_final <= 1 and \
+        sum(o.endswith('= None') for o in other) == 1, (guard, other)
+    assert not any(isinstance(n, ast.Assign) and isinstance(n.value, ast.Constant) and n.value.value is not None and
+                   any(isinstance(t, ast.Name) and t.id == guard for t in n.targets) for n in ast.walk(tree))
 
 
 def test_mode_0_has_no_fatal_machinery(monkeypatch, tmp_path):
@@ -334,7 +346,9 @@ def test_mode_0_has_no_fatal_machinery(monkeypatch, tmp_path):
         i = src.rindex('except VisibleV3Fatal as exc:')   # (the worker's own: the last one)
         assert 'fatal_active()' in src[i:i + 200] and 'traceback.print_exc()' in src[i:i + 500]
     src = inspect.getsource(tok_floor)
-    assert src.count('code = V3_FATAL_EXIT if fatal_active() else 1') == 2
+    # (Codex round 23: a forked child's exit 86 also for an always-fatal error -- RewindFatal / FastRowFatal --, in any
+    #  mode; an ordinary VisibleV3Fatal in mode 0 still 1)
+    assert src.count("code = V3_FATAL_EXIT if (fatal_active() or getattr(exc_, 'always_fatal', False)) else 1") == 2
 
 
 @pytest.mark.skipif(__import__('os').name == 'nt', reason='a POSIX pipe (os.read on its fd)')
