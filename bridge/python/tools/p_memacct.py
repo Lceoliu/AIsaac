@@ -99,7 +99,12 @@ def mappings(pid):
             if cur is not None:
                 out.setdefault(cur, dict(Size=0, Rss=0, Pss=0, maps=0))['maps'] += 1
         elif cur is not None and len(parts) >= 2 and parts[0].rstrip(':') in ('Size', 'Rss', 'Pss'):
-            out[cur][parts[0].rstrip(':')] += int(parts[1])
+            key = parts[0].rstrip(':')
+            if key == 'Size':   # (11-20 fix: a segment mapped twice in one process -- tok_sampler creates it, then
+                #               attach_* opens it by name -- reserves it once: the largest mapping, not the sum)
+                out[cur]['Size'] = max(out[cur]['Size'], int(parts[1]))
+            else:   # (Pss: exact for pages seen through several mappings; Rss would count such a page per mapping)
+                out[cur][key] += int(parts[1])
     return out
 
 
@@ -158,7 +163,8 @@ def sample(root):
     for p, k in kinds.items():
         if k in ('trainer', 'learner'):
             for name, m in mappings(p).items():
-                e = maps.setdefault(name, dict(Size_mb=0.0, Rss_mb=0.0, Pss_mb=0.0, by=[]))
+                e = maps.setdefault(name, dict(Size_mb=0.0, Rss_mb=0.0, Pss_mb=0.0, by=[], maps=[]))
+                e['maps'].append(m['maps'])
                 e['Size_mb'] = max(e['Size_mb'], mb(m['Size']))
                 e['Rss_mb'] = max(e['Rss_mb'], mb(m['Rss']))
                 e['Pss_mb'] = round(e['Pss_mb'] + mb(m['Pss']), 1)
