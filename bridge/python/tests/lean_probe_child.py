@@ -58,7 +58,7 @@ def main():
     out = dict(lean=TO.WORKER_LEAN, old='old' in flags)
     from multiprocessing import shared_memory   # 1. the worker's handshake (where torch came in)
     n = 1
-    sizes = (TO.ROW.itemsize * 2 * n, 4 * TS.ACTION_F * n, 8 * len(TS.STATS) * n, 8 * 4)
+    sizes = (TO.ROW.itemsize * 2 * n, 4 * TS.ACTION_F * n, 8 * len(TS.STATS) * n, 8 * getattr(TS, 'CONTROL_N', 4))
     blocks = [shared_memory.SharedMemory(create=True, size=s) for s in sizes]
     try:
         got = TS.attach([b.name for b in blocks], n, initialize=True)
