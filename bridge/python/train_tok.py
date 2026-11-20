@@ -697,6 +697,7 @@ def merge_jobs(halves):
     j['t_start'] = min(h.get('t_start', j.get('t_start')) for h in halves)
     j['collect_actors'] = ' '.join(f"{h.get('collect_s', 0.0):.3f}" for h in halves)
     j['prof'], j['worker'], j['lane_stat'] = sum_dict('prof'), sum_dict('worker'), sum_dict('lane_stat')
+    j['ring_skips'] = sum_dict('ring_skips')   # (Codex round 26: every actor's rings, not the first actor's only)
     j['stats'] = np.concatenate([h['stats'] for h in halves])
     j['teach'], j['v2'], j['choices'] = cat_rec('teach'), cat_rec('v2'), cat_rec('choices')
     j['cpu_collect'] = float(np.mean([h.get('cpu_collect', 0.0) for h in halves]))

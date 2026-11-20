@@ -1728,7 +1728,9 @@ class TokSampler:
                               f'{reason} -- the run stops (no worker is dropped, nothing is retried)')
                 self.close(timeout=5.0)   # (raises VisibleV3Fatal(self.fatal) once everything is closed)
                 raise VisibleV3Fatal(self.fatal)
-            if not missing:
+            if not missing:   # (the launch check reads this line: every worker's confirmation, how long it took)
+                print(f'tok sampler: ring protocol confirmed by all {len(acks)} workers ({ring_ack_text(want)}) in '
+                      f'{time.monotonic() - t0:.1f} s', file=sys.stderr, flush=True)
                 return
             time.sleep(0.02)
 

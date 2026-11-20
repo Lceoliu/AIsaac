@@ -615,11 +615,30 @@ def test_i_one_worker_of_another_ring_mode_ends_the_run(monkeypatch, tmp_path):
         sampler_with(monkeypatch, tmp_path, stub_worker_new, confirm_s='60')
 
 
-def test_i_workers_that_confirm_start(monkeypatch, tmp_path):
-    """Both workers confirm the trainer's protocol and mode: the sampler starts (and closes cleanly)."""
+def test_i_workers_that_confirm_start(monkeypatch, tmp_path, capfd):
+    """Both workers confirm the trainer's protocol and mode: the sampler starts (and closes cleanly), and says so
+    in its log (the launch check after the merge: every worker's confirmation in the log)."""
     monkeypatch.delenv('ISAAC_RL_TEST_BAD_WORKER', raising=False)
     s = sampler_with(monkeypatch, tmp_path, stub_worker_new, confirm_s='60')
     try:
         assert [int(a) for a in s.ring_ack] == [TS.ring_ack_value(TO.RING_COMPACT)] * 2
+        assert 'ring protocol confirmed by all 2 workers (ring protocol 1' in capfd.readouterr().err
     finally:
         s.close(timeout=2.0)
+
+
+def test_j_two_actors_ring_skips_summed():
+    """Codex round 26: with two actor processes (merge_jobs) the rings' skip counters are every actor's -- rows
+    dropped by the second actor only reach progress (before: the first actor's dict was kept, zeros)."""
+    pytest.importorskip('torch')
+    import train_tok as TT
+    zero = dict.fromkeys(TS.RING_SKIPS, 0)
+    zero['open_busy'] = 0.0
+    h0 = dict(roll=None, bid=1, aid=0, seq=4, finished=[], branch_finished=[], collect_s=1.5, wait_learner_s=0.2,
+              cycle_s=2.0, cycle_wait_s=0.0, take_s=0.01, t_put=10.0, t_start=1.0, prof={}, worker={}, lane_stat={},
+              stats=np.ones((3, 4)), teach=None, v2=None, choices=None, cpu_collect=0.2, proc_cores=1.0, dec_min=5.0,
+              dec_max=9.0, dec_w='5 9 7', actor_mem=100, ring_skips=dict(zero))
+    h1 = dict(h0, aid=1, ring_skips=dict(zero, v2_torn=3, teach_lapped=2, open_busy=1.0))
+    j = TT.merge_jobs([h0, h1])
+    assert j['ring_skips'] == dict(zero, v2_torn=3, teach_lapped=2, open_busy=1.0)
+    assert TT.merge_jobs([h1, h1])['ring_skips']['v2_torn'] == 6
