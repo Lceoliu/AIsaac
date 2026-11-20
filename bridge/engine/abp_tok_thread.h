@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <poll.h>
+#include <pthread.h>
 #include <unistd.h>
 
 struct Rec {
@@ -131,6 +132,7 @@ struct TokDriver {
     TORCH_CHECK(K >= n, "TokDriver.start: the ring (", K, " rows) must hold a call (", n, " rows)");
     stop_req = pause_req = paused = false; running = true;
     th = std::thread([this] { loop(); });
+    pthread_setname_np(th.native_handle(), "tok-driver");   // (the CPU ledger: the driver thread by name)
   }
   void halt() {
     { std::lock_guard<std::mutex> g(mu); if (!running) return; stop_req = true; }

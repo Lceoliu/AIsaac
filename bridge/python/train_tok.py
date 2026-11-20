@@ -260,6 +260,37 @@ from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig
                                       default_stub_list)
 
 
+def _cuda_sched():
+    """(P package, 2026-11-20, the CPU ledger) ISAAC_CUDA_SCHED=spin | yield | blocking: the CUDA primary contexts'
+    scheduling policy, set before torch creates them in this process (the trainer, and the spawned learner process,
+    which imports this module again) -- one setting for every synchronisation: torch's on the Python path, the C++
+    driver's cudaStreamSynchronize. Unset: CUDA's default (auto: spin while the process has fewer active contexts than
+    the machine has cores, else yield). The forked workers never use CUDA."""
+    mode = os.environ.get('ISAAC_CUDA_SCHED', '')
+    if not mode:
+        return
+    flags = {'auto': 0, 'spin': 1, 'yield': 2, 'blocking': 4}
+    if mode not in flags:
+        raise SystemExit(f'ISAAC_CUDA_SCHED={mode!r}: auto, spin, yield or blocking')
+    import ctypes
+    cu = ctypes.CDLL('libcuda.so.1')
+    if cu.cuInit(0) != 0:
+        raise SystemExit('ISAAC_CUDA_SCHED: cuInit failed')
+    n = ctypes.c_int()
+    cu.cuDeviceGetCount(ctypes.byref(n))
+    set_flags = getattr(cu, 'cuDevicePrimaryCtxSetFlags_v2', None) or cu.cuDevicePrimaryCtxSetFlags
+    for i in range(n.value):
+        dev = ctypes.c_int()
+        cu.cuDeviceGet(ctypes.byref(dev), i)
+        r = set_flags(dev, ctypes.c_uint(flags[mode]))
+        if r != 0:
+            raise SystemExit(f'ISAAC_CUDA_SCHED: cuDevicePrimaryCtxSetFlags({i}, {mode}) failed ({r})')
+    print(f'CUDA scheduling: {mode} ({n.value} devices, pid {os.getpid()})', flush=True)
+
+
+_cuda_sched()
+
+
 ROOM_REWARD = 'damage=1,hurt=0.75,clear=1,death=2,timeout=1,time=0.002'
 # whole floors: room = a room with monsters cleared, explore = a room entered for the first time, boss = the boss
 # room cleared (on top of room), exit = the next floor reached
