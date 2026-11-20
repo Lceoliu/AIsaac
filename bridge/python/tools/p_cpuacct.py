@@ -14,6 +14,9 @@ Roles:
   python workers      the worker processes (the forked Python side: records, encoding, the game's I/O)
   game engines        isaac* processes (the engines the workers drive: they advance the game frames)
   other:<comm>        everything else under the trainer
+'unattributed' (3b): the lane's busy CPU (/proc/stat) split into the threads sampled, the container's own CPU the
+sampler missed (its cgroup's cpu.stat minus the sampled) and the CPU outside the container (the rest); the
+descendants born / exited per second by kind and the host's forks per second.
 Per role: cores (CPU seconds / window seconds), processes / threads seen; for the trainer's and the learner's threads,
 the share of samples on a CPU outside any syscall ('running': user code -- a spin wait counts here), in sched_yield
 (a yielding wait) and blocked in a syscall (futex / poll / ioctl ...: waiting without the CPU). The capacity is the
@@ -61,6 +64,31 @@ def cpu_stat():
             idle = v[3] + (v[4] if len(v) > 4 else 0)
             out[int(f[0][3:])] = (sum(v[:8]) - idle, sum(v[:8]), v[0] + v[1], v[2], v[5] + v[6])
     return out
+
+
+def cg_stat(pid):
+    """(3b) The container's own CPU from its cgroup (v2 cpu.stat, as the host sees it): every process in it, the
+    short-lived forks a sampler misses included; None when not readable."""
+    for line in (rd(f'/proc/{pid}/cgroup') or b'').decode('latin-1').splitlines():
+        if line.startswith('0::'):
+            s = rd('/sys/fs/cgroup' + line[3:].strip() + '/cpu.stat')
+            if s is None:
+                return None
+            d = {}
+            for l_ in s.decode('latin-1').splitlines():
+                k, _, v = l_.partition(' ')
+                if k in ('usage_usec', 'user_usec', 'system_usec'):
+                    d[k] = int(v)
+            return d or None
+    return None
+
+
+def host_forks():
+    """/proc/stat 'processes': the host's forks since boot (every tenant's)."""
+    for line in (rd('/proc/stat') or b'').decode('latin-1').splitlines():
+        if line.startswith('processes'):
+            return int(line.split()[1])
+    return None
 
 
 def siblings(c):
@@ -178,6 +206,9 @@ def main():
     child_acc = {}       # kind -> reaped children's ticks within the window (cutime + cstime: short-lived forks)
     clast = {}           # pid -> cticks
     cs0 = cs1 = None
+    cg0 = cg1 = fk0 = fk1 = None
+    alive = None         # (3b) the descendants at the sample before: births / exits within the window by kind
+    born, gone = {}, {}
     procs_seen = {}      # pid -> (kind, comm)
     last = {}            # (pid, tid) -> ticks
     acc = {}             # role -> ticks within the window
@@ -190,13 +221,23 @@ def main():
         if not open_ and n_rows >= a.from_update - 1:
             open_, t0 = True, time.time()
             cs0 = cpu_stat()
+            cg0, fk0 = cg_stat(root), host_forks()
         if open_ and n_rows >= a.to_update:
             t1 = time.time()
             cs1 = cpu_stat()
+            cg1, fk1 = cg_stat(root), host_forks()
             break
         if not os.path.exists(f'/proc/{root}'):
             break
         procs = descendants(root)
+        if open_ and alive is not None:
+            now_ = set(procs)
+            for q in now_ - alive:
+                born[q] = True
+            for q in alive - now_:
+                k_ = procs_seen.get(q, ('?', ''))[0]
+                gone[k_] = gone.get(k_, 0) + 1
+        alive = set(procs)
         for pid in procs:
             st = stat_of(f'/proc/{pid}/stat')
             if st is None:
@@ -316,7 +357,25 @@ def main():
             g_ = sum(x[0] for q, x in per_proc.items() if x[1] == 'game' and _under(q, pid, per_proc))
             work.append(dict(pid=pid, worker_cores=round(v[0] / CLK / win, 3) if win else None,
                              game_cores=round(g_ / CLK / win, 3) if win else None, cpus=allowed(pid)))
-    out = dict(match=a.match, trainer_pid=root, processes=nk, per_cpu_busy=per_cpu,
+    # (3b) where the lane's busy CPU goes: the threads sampled; the container's own CPU the sampler missed (forks
+    # living less than a sample, a process's ticks after its last sample); outside the container (other tenants'
+    # unpinned processes, kernel threads, interrupts) = the lane's busy CPU - the container's
+    lane_busy = round(sum(kern.values()), 3)
+    split = dict(lane_busy_cores=lane_busy, sampled_cores=round(total, 3))
+    if cg0 and cg1 and win:
+        cc = {k: round((cg1[k] - cg0[k]) / 1e6 / win, 3) for k in cg0 if k in cg1}
+        split.update(container_cores=cc, missed_in_container_cores=round(cc['usage_usec'] - total, 3),
+                     outside_container_cores=round(lane_busy - cc['usage_usec'], 3))
+    else:
+        split['container_cores'] = None
+    bk = {}
+    for q in born:
+        k_ = procs_seen.get(q, ('?', ''))[0]
+        bk[k_] = bk.get(k_, 0) + 1
+    split.update(born_per_s={k: round(v / win, 2) for k, v in bk.items()} if win else None,
+                 exited_per_s={k: round(v / win, 2) for k, v in gone.items()} if win else None,
+                 host_forks_per_s=round((fk1 - fk0) / win, 1) if (fk0 is not None and fk1 is not None and win) else None)
+    out = dict(match=a.match, trainer_pid=root, processes=nk, per_cpu_busy=per_cpu, unattributed=split,
                lane_cpu_by_mode_cores=kern,
                reaped_children_cores={k: round(v / CLK / win, 3) if win else None for k, v in child_acc.items()},
                per_physical_core={k: v for k, v in cores_.items()},
