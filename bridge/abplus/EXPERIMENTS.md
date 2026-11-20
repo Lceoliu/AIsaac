@@ -14623,6 +14623,33 @@ seq1 的速度约为 T1 的四分之三：x_real 约 216，T1 约 289。协调�
 - 分支 / 教师分支 / 续行打分仍缺四项新奖励（原有偏差）。lab（单房）在回溯换房时结束，它的分数只把回溯那一步记 0，不冲销之前的步。
 - first 档下，分支的“第一次”集合从空开始。
 - seq1 是旧代码，episodes.jsonl 里没有 `active_end`；rooms≥40 报警只能在下一条臂上带出主动道具。
+- **补齐上限的残差**（Codex 第 20 轮第 1 条；协调者裁决：接受，不改上限）。
+  - `rewind_cmax` = 4 时，回溯与被冲销奖励之间隔约 277 个决策（37 秒，γ^-277 = 4）以内，这段的折扣净值等于留下的时间项。
+  - 超过以后有界残差：检查点后 +1，隔 300 / 600 / 900 个决策回溯，这段的折扣净值是 −0.205 / +0.421 / +0.560；不设上限时都只剩时间项（−0.311 / −0.380 / −0.396）。
+  - 不去掉上限，是因为 900 步时补齐倍数会到 91 倍，奖励尖峰的风险更大；first 档下长间隔的循环最多一两轮就被截断。
+  - test_cmax_residue_is_the_known_one 固定了这组数。
+- **EV_ACTIVE 的口径变化**是一项独立修复：
+  - 道具台交换不再记成使用；回溯记一次使用。
+  - 影响 ROW events 第 5 位和转储，以及训练的 uses / active_uses、评测的 active_uses；不影响奖励，也不影响 events 档的卡死。
+  - `--rewind 0` 时其余一切与 b53f14c 逐位相同（见下）。
+- **旧转储**：b53f14c 及更早的转储没有 `row_schema`，偏移 20793 是填充字节（实测有 50、64、96）。读旧转储时要把 rewind 当作未知并清零。目前没有读取器读这个字段，契约记在这里。
+- **收尾等待没有总时限**：clean end 且仍 busy 时，先走没有总时限的 `wait_learner()`。子进程活着却永远不发 fresh 时，进不了 03a64e8 的收尾检查。原有缺陷，待修。
+
+**Codex 第 20 轮的修复（8bac57d）**
+
+- **丢行**：回溯到达而目标决策没有落行时（worker 的容量满了，store 丢弃），状态、集合、统计照常恢复，回滚奖励丢失，计 `rewind_lost`（progress 一列）并打印一行（worker、局、种子、金额）。
+- **同条终止**：回溯与终止落在同一条记录上时，死亡、非自举超时、过层自己的奖惩加在回滚之上，分项份额在恢复后补回。截断和 DONE_BRANCH 照旧没有。
+- **全局价值头**：Rollout 新列 `reward_gd` 是全局头的奖励减主奖励，只在回溯记录上非零，即按 γ_global 补齐的回滚差；value_global 的 GAE 用 reward + reward_gd。CF 打分器的冲销和自举本来就用同一个 γ（有全局头时 cf_gamma = gamma_global）。
+- **越过分叉点**：分支 / 续行在经过自己的第一个检查点之前发生回溯，这个点的评分作废，计 `cf_rewind_cross`。
+- **`--rewind 0`**：编码器不看计数，ROW rewind 写 0。用同一批 lean 流（12 条 × 160 条记录 × events / pickups 两档 = 3,840 条，含“计数上升且 damage_taken 增加”的记录）过 b53f14c 和本树的 encode_row，除偏移 20793 外每个 ROW 字节都相同。
+- **缺计数**：`--rewind 1` 时一局的第一条没有计数块，抛 `tok_floor.RewindFatal`（VisibleV3Fatal 的子类，不被当成坏局重试），worker 以致命错误停下，trainer 非零退出；任何 visible 模式下 sampler 都会读到这个退出。
+- **连续回溯**：分项 `rewind` 累加，不随快照恢复；各项之和等于 ret。
+- **门（184，lane b，树 mr8bac57d，库编进 bm1/home-rw）**：
+  - 全量测试 820 passed、5 skipped、1 xfailed。
+  - 游戏内端到端：回溯落在 4 次使用的记录上，检查点是 3 次进大房。第一次跑失败，因为探针自己的编码器没开 rewind（默认关），改正后复跑通过。
+  - 老库（bm1/home，没有 `abp_native_rewinds`）加 `--rewind 1`：训练启动约 20 秒后以 rc 1 退出，原因是 worker 的协议错误“rewind ledger on (--rewind 1) but the bridge sent no ... restore count”，没有重试。
+  - 下一条臂那一行（seq1 的 train_args 加 `--rewind 1 --stall-progress first --learner-process 1 --packed 1`，8 个 worker）跑 2 次更新：rc 0，rewind_lost 0，store_dropped 0，errors 0。
+  - 原始文件：c114/STATUS_rwgate2、c114/rwgate2/、reports/rwgate2-*。
 
 **原始文件**
 
