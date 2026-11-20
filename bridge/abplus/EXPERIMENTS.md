@@ -14644,6 +14644,15 @@ seq1 的速度约为 T1 的四分之三：x_real 约 216，T1 约 289。协调�
 - **`--rewind 0`**：编码器不看计数，ROW rewind 写 0。用同一批 lean 流（12 条 × 160 条记录 × events / pickups 两档 = 3,840 条，含“计数上升且 damage_taken 增加”的记录）过 b53f14c 和本树的 encode_row，除偏移 20793 外每个 ROW 字节都相同。
 - **缺计数**：`--rewind 1` 时一局的第一条没有计数块，抛 `tok_floor.RewindFatal`（VisibleV3Fatal 的子类，不被当成坏局重试），worker 以致命错误停下，trainer 非零退出；任何 visible 模式下 sampler 都会读到这个退出。
 - **连续回溯**：分项 `rewind` 累加，不随快照恢复；各项之和等于 ret。
+**放行（2026-11-20，协调者）**
+
+- exp/rewind-v1 头 1dc6e5f 放行，可用于下一条训练臂，不再送审。
+- 依据：
+  - Codex 第 20 轮（8289db1）提出的六条训练前必修项，在 8bac57d 修复；第 21 轮（增量审计 574ef45）确认其中五条和主路径的同条终止都已修好。
+  - 第 21 轮剩下的两条（复验越界、打分端的同条终止）在 1dc6e5f 修复。Codex 的两个 CPU 复现做成回归用例：在 574ef45 上失败（−0.005970、improving=True），在 1dc6e5f 上通过（−1.986020，与 Codex 一致；整点作废）。
+  - 184 上：全量门 820 passed（mr8bac57d）；相关 11 个测试文件 113 passed（mr1dc6e5f）；游戏内端到端通过；老库的真实首条拒绝通过；下一条臂那一行的冒烟通过。
+- exp/seq-v1 已快进到 1dc6e5f；并入 main 等 seq1 的结果条目写完后一起做（先跑全量门）。
+
 **Codex 第 21 轮（增量审计 574ef45）的修复**
 
 - **复验越界**：CF（cf_search）和教师 v2（search_point）在用最优候选的换种复验分数之前，先查它的 `rewind_cross`；越界就整点作废，计 `cf_rewind_cross`。
