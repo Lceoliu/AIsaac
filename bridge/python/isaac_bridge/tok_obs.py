@@ -1163,6 +1163,19 @@ if FAST_ROW_CHECKING:   # (the last counts at the worker's normal exit too)
     _atexit.register(lambda: _check_report(True))
 
 
+_FR_GROUPS = {-2: 2, -4: 3, -5: 3, -6: 3, -8: 3, -13: 4, -11: 5, -12: 5}
+
+
+def fast_counts():
+    """(fast, slow, slow by hand-back group: block, room / floor, visible, rewind, other) of this process's FastRow
+    records so far -- tok_sampler's fr_* worker stats."""
+    out = [FAST_STATS['fast'], FAST_STATS['slow'], 0, 0, 0, 0, 0]
+    for k, v in FAST_STATS.items():
+        if k.startswith('slow_'):
+            out[_FR_GROUPS.get(int(k[5:]), 6)] += v
+    return out
+
+
 def _same(a, b):
     if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
         return isinstance(a, np.ndarray) and isinstance(b, np.ndarray) and a.shape == b.shape and \

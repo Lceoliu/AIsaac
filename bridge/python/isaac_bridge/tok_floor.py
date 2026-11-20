@@ -72,7 +72,7 @@ from .tok_branch import (RewindLedger, end_reward, rewind_cfg, AUX_LOGP, AUX_PRE
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
 from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
-                      encode_row, fast_row_function, V3_FRAMES)
+                      encode_row, fast_counts, fast_row_function, V3_FRAMES)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal, fatal_active   # noqa: E402
@@ -1647,6 +1647,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         episodes_left, episode_n = 0, 0
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
+            mine[ST['fr_fast']:ST['fr_slow_other'] + 1] = fast_counts()
             if thread_fatal:
                 raise thread_fatal[0]
             mem_dump()

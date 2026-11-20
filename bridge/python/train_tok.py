@@ -5559,6 +5559,10 @@ def main(argv=None, child=None, actor=None):
             if 'v3_native' in ST:   # (the workers' frames: native / the reference encoder's -- a handed-back step)
                 row['v3_native'] = float(stats[:, ST['v3_native']].sum())
                 row['v3_reference'] = float(stats[:, ST['v3_reference']].sum())
+        if 'fr_fast' in ST:   # (2026-11-20, the native ROW encoder: the workers' FastRow records so far, by path)
+            for k_f in ('fr_fast', 'fr_slow', 'fr_slow_block', 'fr_slow_room', 'fr_slow_vis', 'fr_slow_rewind',
+                        'fr_slow_other'):
+                row[k_f] = float(stats[:, ST[k_f]].sum())
         if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): this update's worker deltas
             tot = {k_p: float(stats[:, ST[k_p]].sum()) for k_p in ('pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups')}
             prev = L.get('pf_prev') or dict.fromkeys(tot, 0.0)
