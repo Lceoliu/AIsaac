@@ -14607,7 +14607,15 @@ seq1 的速度约为 T1 的四分之三：x_real 约 216，T1 约 289。协调�
 | 回放页 1，每轮先掉 2 半心 | 5 | +1.39 | −0.093 | −0.076 |
 | 回放页 1，吃红心 | 5 | +2.88 | −0.107 | +0.340 |
 
-- 门：待跑（184，lane b：独立的 bm1/home-rw 编译库、全量测试、游戏内端到端）。
+- 门（184，lane b；库编进独立的 bm1/home-rw，不碰 seq1 用的 bm1/home）：
+  - 全量测试（树 mr03a64e8）：803 passed、6 failed、5 skipped、1 xfailed。
+    - 5 项是 test_b58_native_consumer：新字段 active_end 只有 Python 消费者写，c979061 改为只在 --rewind 1 时写（这时原生消费者被拒）。
+    - 1 项是 test_collect_every[cuda]：门脚本漏设 CUBLAS_WORKSPACE_CONFIG，属于跑法问题。
+    - 复跑（树 mrc979061，带 CUBLAS_WORKSPACE_CONFIG=:4096:8）：这两个文件加 test_rewind、test_learner_end、test_reward_terms、test_stall_items、test_cf_smoke，69 passed。
+  - 游戏内端到端（c114/in/a1rwe2e.py）：种子 476341，3 轮 2x2 房循环加一次连续使用。
+    - ROW rewind 正好落在 4 次使用的记录上（62、127、192、211），检查点是 3 次进大房（15、80、145）。
+    - 计数块只出现在第一条和这 4 条上（计数 0 → 4）。
+  - 原始文件：bm1/c114/STATUS_rwgate、bm1/reports/rwgate-*。
 
 **已知偏差**
 
