@@ -38,7 +38,7 @@ class DriverCollect:
     """The driver, its GraphActor(fold=True), the staging blocks and the output ring for one training run."""
 
     def __init__(self, mod, model, sampler, n, g_ents, gkw, t_state, bank_tstate, stream, version, cap_t, trunc,
-                 blocks=64, ring=8192, priv_dtype=None):
+                 blocks=64, ring=8192, priv_dtype=None, pin_cpus=None):
         import torch
         from .tok_driver import Middle
         from .tok_policy import GraphActor
@@ -79,6 +79,7 @@ class DriverCollect:
                   flush=True)
         d.set_version(int(version))
         self.started = False
+        self.pin_cpus = set(pin_cpus) if pin_cpus else None   # (the CPU ledger: the driver thread's CPUs)
         self.partial = {}   # call -> records taken so far (a take may end inside a call)
         self.next_seq = 0   # (Codex 17-1) every queued record / end consumed once, in sequence
         self.stat = dict(records=0, calls=0, ends=0, gone=0, take_s=0.0, waits=0, reply_fail=0, stored=0)
@@ -97,6 +98,16 @@ class DriverCollect:
         if not self.started:
             self.d.start()
             self.started = True
+            if self.pin_cpus:   # (P-driver-design 15: the driver thread onto the lane's driver CPUs, off the workers')
+                import os
+                for t_ in os.listdir('/proc/self/task'):
+                    try:
+                        with open(f'/proc/self/task/{t_}/comm') as f_:
+                            if f_.read().strip() == 'tok-driver':
+                                os.sched_setaffinity(int(t_), self.pin_cpus)
+                                print(f'P package: the driver thread {t_} on CPUs {sorted(self.pin_cpus)}', flush=True)
+                    except OSError:
+                        pass
         else:
             self.d.resume()
         while roll.usable() < target and self.sampler.live and not stopped():

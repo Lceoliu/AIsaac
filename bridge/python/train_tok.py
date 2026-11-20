@@ -6052,6 +6052,11 @@ def main(argv=None, child=None, actor=None):
     # failed build, ends here: the acceptance runs cannot pass on the Python loop); 0 / unset: the Python loop.
     tok_mode = int(os.environ.get('ISAAC_TOK_CPP_DRIVER', '0') or 0) if child is None else 0
     tok_dc = [None, False]
+    # (P-driver-design 15, the CPU ledger) ISAAC_TOK_PIN=1 with the lane's ISAAC_DRIVER_CPUS: the actor's main thread
+    # (the Python loop, or the C++ driver's consumer) and the C++ driver's thread on those CPUs, off the saturated
+    # workers' set -- the main thread once the loop starts (the workers and the learner process started before
+    # it: they keep the rest); scheduling only, nothing computed differently
+    tok_pin = os.environ.get('ISAAC_TOK_PIN', '0') == '1' and bool(driver_cpus) and child is None
 
     def _dev_key(d_):   # ('cuda', 0) for 'cuda' / 'cuda:0' / torch.device('cuda', 0)
         d_ = torch.device(d_)
@@ -6077,7 +6082,8 @@ def main(argv=None, child=None, actor=None):
             sampler.origin_column = book.origin
         dc = tok_consumer.DriverCollect(mod, model, sampler, n, g_ents, gkw, t_state, bank_tstate, actor_stream,
                                         version, CAP_T, TRUNC,
-                                        priv_dtype=priv_pending.dtype if priv_pending is not None else None)
+                                        priv_dtype=priv_pending.dtype if priv_pending is not None else None,
+                                        pin_cpus=driver_cpus if tok_pin else None)
         print(f'P package: the C++ driver on (graphs {dc.mid.m.n_graphs()}, blocks {len(dc.blocks)} x {n}, ring {dc.K} '
               f'rows)', flush=True)
         return dc
@@ -6254,6 +6260,9 @@ def main(argv=None, child=None, actor=None):
         sent_handoffs = 0
         rollout_actor = args.rollout // n_act
         nsys_win = nv.profiler_window()
+        if tok_pin:   # (P-driver-design 15: the actor's main thread off the workers' CPUs)
+            os.sched_setaffinity(0, driver_cpus)
+            print(f'P package: the actor main thread on CPUs {sorted(driver_cpus)} (ISAAC_TOK_PIN)', flush=True)
         if os.environ.get('ISAAC_TOK_AUDIT') and child is None:   # (P package, Codex 17-4: the reconciliation's start --
             #   the book as configured before any record (its state), the rules; tools/p_audit.py rebuilds the
             #   rollouts from the workers' logs with it)
