@@ -5577,7 +5577,7 @@ def main(argv=None, child=None, actor=None):
         # open: a second writer, or a write that failed midway: report it)
         for k_r, v_r in (job.get('ring_skips') or {}).items():
             row[f'ring_{k_r}'] = v_r
-        row['worker_torch'] = job.get('worker_torch', 0)   # (the memory ledger: workers holding torch; alarm > 0)
+        row['worker_torch'] = job.get('worker_torch', 0)   # (the main workers' latest observation, 0 / 1 each, summed; alarm > 0)
         if args.frame == 'v3':   # (seq-v1 step 3) the actor's host side of the v3 calls (this process), this update
             from isaac_bridge import v3_input as VI_
             tot3 = VI_.stats_snapshot()   # (A-2: with the actors' device counters)

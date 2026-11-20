@@ -76,6 +76,8 @@ def main():
     for j, pl in enumerate(obs):
         TO.write_visible(dec.decode(pl), rows[j:j + 1])
     out['v2'] = digest(rows)
+    from isaac_bridge import visible_native as VN   # (the native v2 encoder took the frames, or the reference did)
+    out['v2_native'] = bool(VN._DEFAULT and VN._DEFAULT[0] is not None)
     out['v2_bytes'] = [int(v) for v in rows['visible_bytes']]
     VP.VISIBLE_V3_MODE = 2   # 3. v3 records: encode_row, then FastRow (the native encoder) when given its library
     pls = inputs['v3']

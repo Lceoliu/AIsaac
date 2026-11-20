@@ -611,7 +611,7 @@ def test_i_one_worker_of_another_ring_mode_ends_the_run(monkeypatch, tmp_path):
     confirmation in the reason -- not the bad worker alone dropped and the run going on with the other."""
     from isaac_bridge.visible_producer import VisibleV3Fatal
     monkeypatch.setenv('ISAAC_RL_TEST_BAD_WORKER', '0')
-    with pytest.raises(VisibleV3Fatal, match=r'worker 0: ring protocol 1, ISAAC_RL_RING_COMPACT'):
+    with pytest.raises(VisibleV3Fatal, match=r'worker 0: ring protocol 2, ISAAC_RL_RING_COMPACT'):
         sampler_with(monkeypatch, tmp_path, stub_worker_new, confirm_s='60')
 
 
@@ -622,7 +622,7 @@ def test_i_workers_that_confirm_start(monkeypatch, tmp_path, capfd):
     s = sampler_with(monkeypatch, tmp_path, stub_worker_new, confirm_s='60')
     try:
         assert [int(a) for a in s.ring_ack] == [TS.ring_ack_value(TO.RING_COMPACT)] * 2
-        assert 'ring protocol confirmed by all 2 workers (ring protocol 1' in capfd.readouterr().err
+        assert 'ring protocol confirmed by all 2 workers (ring protocol 2' in capfd.readouterr().err
     finally:
         s.close(timeout=2.0)
 

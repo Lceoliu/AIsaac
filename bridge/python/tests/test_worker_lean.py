@@ -95,21 +95,35 @@ def probe_pkl(tmp_path_factory):
     return path
 
 
-def test_a_a_worker_holds_no_torch_and_writes_the_same_records(probe_pkl):
-    inputs = probe_pkl
+@pytest.fixture(scope='module')
+def probes(probe_pkl):
+    """The child run now (then train_tok imported as __mp_main__) and as a worker before (structured_input first)."""
     so = turbo_so()
-    new = run_probe(inputs, False, so, 'mp_main')
-    old = run_probe(inputs, False, so, 'old')
+    new = run_probe(probe_pkl, False, so, 'mp_main')
+    old = run_probe(probe_pkl, False, so, 'old')
     print(f'worker probe: now     {new}', f'worker probe: before  {old}', sep='\n')
+    return so, new, old
+
+
+def test_a_a_worker_holds_no_torch_and_writes_the_same_records(probes):
+    so, new, old = probes
     assert not new['torch_after_attach'] and not new['torch'] and not new['torch_after_mp_main']
     assert old['torch']   # (the comparison: a worker as before, with structured_input's torch)
-    for key in ('v2', 'v2_bytes', 'encode_row', 'fast_row', 'fast_row_fast'):
+    for key in ('v2', 'v2_bytes', 'v2_native', 'encode_row', 'fast_row', 'fast_row_fast'):
         assert new.get(key) == old.get(key), key
     assert len(set(new['v2_bytes'])) > 1 and min(new['v2_bytes']) > 0   # (real v2 frames, of different lengths)
-    if so:
-        assert new['fast_row_fast'] > 0   # (the native encoder took records)
     if new['private_mb'] is not None:
         assert old['private_mb'] - new['private_mb'] > 150, (old['private_mb'], new['private_mb'])
+
+
+def test_a_the_native_encoders_compared(probes):
+    """(Codex round 29: no silent pass) FastRow (libabp_turbo.so) and the native v2 encoder took records in both runs
+    and wrote the same: skipped -- visibly -- where the library is not built (Windows)."""
+    so, new, old = probes
+    if not so:
+        pytest.skip('no libabp_turbo.so (ISAAC_RL_TEST_TURBO_SO / ABP_HOME/tools): FastRow and native v2 not compared')
+    assert new['fast_row_fast'] > 0 and new['fast_row'] == old['fast_row'], (new.get('fast_row_fast'),)
+    assert new['v2_native'] and old['v2_native'], 'the native v2 encoder did not load'
 
 
 def test_b_the_same_objects():
@@ -136,11 +150,9 @@ def test_b_the_same_objects():
             return z ^ (z >> np.uint64(31))
     z = np.random.default_rng(0).integers(0, 2 ** 63, 1000, dtype=np.int64).astype(np.uint64)
     assert np.array_equal(TO.mix64(z), old(z))
-    for pid, pair in ((0, 0), (5, 3), (123456, 63), (2 ** 40, 7)):
+    for pid, pair in ((0, 0), (5, 3), (123456, 63), (2 ** 40, 7), (987654321, 1)):   # (crn_key as it was in 48f53a4)
         want = int(old(np.array([(int(pid) * 64 + int(pair)) & 0x7FFFFFFFFFFFFFFF], np.uint64))[0])
-        got = TB.crn_key(pid, pair)
-        assert got == TB.crn_key(pid, pair) and isinstance(got, (int, np.integer))
-        assert int(TO.mix64(np.array([(pid * 64 + pair) & 0x7FFFFFFFFFFFFFFF], np.uint64))[0]) == want
+        assert TB.crn_key(pid, pair) == ((want & 0x7FFFFFFFFFFFFFFF) or 1), (pid, pair)
 
 
 def test_c_confirmation_values():
@@ -241,3 +253,82 @@ def test_c_switch_off_counts_and_starts(monkeypatch, tmp_path, capfd):
         assert 'workers holding torch: 1/2' in capfd.readouterr().err
     finally:
         s.close(timeout=2.0)
+
+
+# ---------------------------------------------------------------- (d) the shared memory's layout (Codex round 29)
+ABI_COLUMNS = {   # SHARED_ABI -> (stats columns, crc32 of their names in order); a STATS change needs a new row here
+    3: (184, 0xfbc81f98),
+}
+
+
+def test_d_the_layout_version_is_bound_to_the_columns():
+    """Any change to STATS bumps SHARED_ABI (tok_sampler's rule): the current version's columns are the ones recorded
+    for it -- a column added, removed or moved without the bump fails here."""
+    import zlib
+    assert TS.SHARED_ABI in ABI_COLUMNS, f'SHARED_ABI {TS.SHARED_ABI}: add its row (len(STATS), crc32) to ABI_COLUMNS'
+    assert (len(TS.STATS), zlib.crc32('\n'.join(TS.STATS).encode())) == ABI_COLUMNS[TS.SHARED_ABI], \
+        'STATS changed without a new SHARED_ABI'
+    assert TS.RING_PROTOCOL == 2
+
+
+def old_layout_blocks(workers):
+    """A trainer of the trees before (25c630c's: 182 stats columns, control[3] = (visible schema << 32) | ROW size)."""
+    from multiprocessing import shared_memory
+    from isaac_bridge.schema_v2 import VERSION
+    sizes = (TO.ROW.itemsize * 2 * workers, 4 * TS.ACTION_F * workers, 8 * 182 * workers, 8 * 4)
+    blocks = [shared_memory.SharedMemory(create=True, size=s) for s in sizes]
+    control = np.ndarray((4,), np.int64, buffer=blocks[3].buf)
+    control[3] = (VERSION << 32) | TO.ROW.itemsize
+    del control
+    return blocks
+
+
+def test_d_a_worker_of_this_tree_refuses_an_older_trainers_memory():
+    """A new worker on segments an old trainer made: refused by the layout check, before any view (not by a NumPy
+    buffer error that a larger block would not raise)."""
+    blocks = old_layout_blocks(2)
+    try:
+        with pytest.raises(ValueError, match='sampler shared memory: layout'):
+            TS.attach([b.name for b in blocks], 2)
+    finally:
+        for b in blocks:
+            b.close()
+            b.unlink()
+
+
+def stub_worker_mixed(index, cfg, names, conn, teacher_names=None, *args, **kw):
+    """Worker ISAAC_RL_TEST_OLD_WORKER=<i> runs 25c630c's attach (its layout check, its 182-column stats, no ring
+    confirmation) and writes decisions / frames at its stride; the others are this tree's (stub_worker_lean)."""
+    if str(index) != os.environ.get('ISAAC_RL_TEST_OLD_WORKER', ''):
+        return stub_worker_lean(index, cfg, names, conn, teacher_names)
+    from multiprocessing import shared_memory
+    from isaac_bridge.schema_v2 import VERSION
+    blocks = [shared_memory.SharedMemory(name=n) for n in names]
+    stats = np.ndarray((cfg.workers, 182), np.float64, buffer=blocks[2].buf)
+    control = np.ndarray((4,), np.int64, buffer=blocks[3].buf)
+    if int(control[3]) != ((VERSION << 32) | TO.ROW.itemsize):
+        raise ValueError('sampler shared-memory visible schema/ROW size mismatch')   # (the old check, as it was)
+    stats[index, 0], stats[index, 1] = 17, 68   # (decisions, frames at the old stride)
+    del stats, control
+    _wait_closed(conn)
+
+
+def test_d_an_older_worker_ends_the_run_with_the_switch_off(monkeypatch, tmp_path):
+    """Two workers, one of the trees before; no ring (no teacher), ISAAC_RL_WORKER_LEAN off: the trainer still waits
+    for every confirmation and stops -- before, it started and the old worker wrote its counts into the wrong columns
+    (worker 0's np_removed, worker 1's decisions: Codex round 29)."""
+    import select
+    from isaac_bridge.visible_producer import VisibleV3Fatal
+    if not hasattr(select, 'poll'):
+        pytest.skip('TokSampler: select.poll (Linux)')
+    monkeypatch.setenv('ISAAC_RL_TEST_OLD_WORKER', '1')
+    monkeypatch.delenv('ISAAC_RL_TEST_TORCH_WORKER', raising=False)
+    monkeypatch.setattr(TS, 'worker_main', stub_worker_mixed)
+    monkeypatch.setenv('ISAAC_RL_FATAL_DIR', str(tmp_path))
+    monkeypatch.setenv('ISAAC_RL_PNG_SHARED', '0')
+    monkeypatch.setenv('ISAAC_RL_RING_CONFIRM_S', '60')
+    monkeypatch.setenv('ISAAC_RL_WORKER_LEAN', '0')
+    monkeypatch.setattr(TO, 'WORKER_LEAN', False)
+    cfg = TS.TokSamplerConfig(workers=2, teacher=False, name='abitest', port=os.getpid() % 30000 + 21000)
+    with pytest.raises(VisibleV3Fatal, match=r'worker\(s\) 1 \(exit 1\) ended before confirming'):
+        TS.TokSampler(cfg)

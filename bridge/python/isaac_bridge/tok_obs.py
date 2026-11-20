@@ -990,8 +990,11 @@ def check_worker_torch(index):
         return 0
     if not _TORCH_WARNED:
         _TORCH_WARNED.append(1)
-        print(f'tok worker {index}: WARNING torch was loaded in this worker process (a worker-side import of a torch '
-              f'module: about 220 MB more; progress worker_torch)', file=sys.stderr, flush=True)
+        try:   # (Codex round 29: a warning that cannot be written never ends the worker; the count stands)
+            print(f'tok worker {index}: WARNING torch was loaded in this worker process (a worker-side import of a '
+                  f'torch module: about 220 MB more; progress worker_torch)', file=sys.stderr, flush=True)
+        except (OSError, ValueError):
+            pass
     return 1
 
 

@@ -91,6 +91,10 @@ from . import tok_obs as TO_
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal
 from .visible_producer import fatal_active as VP_fatal_active
 
+# (Codex round 29: a general rule) ANY change to STATS (a column added, removed or moved), to ROW's fields or to the
+# rings' layout bumps SHARED_ABI below -- the shared memory's handshake (attach) refuses a worker and a trainer of
+# different layouts before any view is made; tests/test_worker_lean.py binds SHARED_ABI to the columns (a change without
+# the bump fails there).
 STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins', 'deaths', 'timeouts', 'empty',
          'step_s', 'wait_s', 'fork_s', 'encode_s', 'finished', 'extra_episodes', 'teach', 'teach_s', 'searches',
          'avoidable', 'hurts', 'snaps', 'archive', 'archive_starts',   # these three: tok_floor
@@ -427,24 +431,50 @@ class TokSamplerConfig:
     no_active: bool = False
 
 
+SHARED_ABI = 3   # (Codex round 29) 1: 25c630c's layout; 2: + ring_open_busy (exp/ring-compact); 3: + torch_held
+
+
+def shared_abi():
+    """(Codex round 29) The shared memory's layout as one number (control[3], written by the trainer, checked by
+    every worker before it makes a view): SHARED_ABI, the visible schema, ROW's size and fields, the stats columns in
+    their order, the rings' lengths -- a 63-bit hash, never the value of the trees before it ((visible schema << 32) |
+    ROW size)."""
+    import hashlib
+    from .schema_v2 import VERSION   # (structured_input re-exports it, importing torch: not in a worker)
+    from .tok_teacher2 import V2_RING
+    key = (f'abi {SHARED_ABI}; visible {VERSION}; row {ROW.itemsize} {ROW.descr}; stats {len(STATS)} '
+           f'{",".join(STATS)}; rings {TEACH_RING} {V2_RING}')
+    return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), 'little') & ((1 << 63) - 1)
+
+
 def attach(names, workers, initialize=False):
     """(blocks, rows [2 x workers], actions, stats, control) from the shared-memory names. Two rows per worker: it
-    writes its next record while the server may still read the one before."""
+    writes its next record while the server may still read the one before. (Codex round 29) The layout handshake
+    first: the trainer (initialize) writes shared_abi() to control[3], a worker refuses another value before it makes
+    any other view (a block of another layout never mapped with this tree's strides)."""
     blocks = [shared_memory.SharedMemory(name=n) for n in names]
+    control = np.ndarray((4,), np.int64, buffer=blocks[3].buf)   # [0] stop, [1] the trainer is updating
+    abi = shared_abi()
+    if initialize:
+        control[3] = abi
+    elif int(control[3]) != abi:
+        have = int(control[3])
+        del control
+        for b in blocks:
+            b.close()
+        from .schema_v2 import VERSION
+        raise ValueError(f'sampler shared memory: layout {have:#x}, this tree {abi:#x} (SHARED_ABI {SHARED_ABI}: '
+                         f'{len(STATS)} stats columns, ROW {ROW.itemsize} bytes, visible schema {VERSION}) -- a '
+                         f'worker and a trainer of different trees')
     rows = np.ndarray((2 * workers,), ROW, buffer=blocks[0].buf)
     actions = np.ndarray((workers, ACTION_F), np.int32, buffer=blocks[1].buf)
     stats = np.ndarray((workers, len(STATS)), np.float64, buffer=blocks[2].buf)
-    control = np.ndarray((4,), np.int64, buffer=blocks[3].buf)   # [0] stop, [1] the trainer is updating
-    from .schema_v2 import VERSION   # (structured_input re-exports it, importing torch: not in a worker)
-    schema=(VERSION<<32)|ROW.itemsize
-    if initialize:control[3]=schema
-    elif int(control[3])!=schema:
-        raise ValueError('sampler shared-memory visible schema/ROW size mismatch')
     return blocks, rows, actions, stats, control
 
 
 RING_SKIPS = ('teach_lapped', 'teach_torn', 'teach_bad', 'v2_lapped', 'v2_torn', 'v2_bad')
-RING_PROTOCOL = 1   # (Codex round 26) the rings' slot generations; every worker confirms it (ring_confirm) at its start
+RING_PROTOCOL = 2   # (Codex round 26) the rings' slot generations; every worker confirms it (ring_confirm) at its start
+#                     (2, Codex round 29: the torch bits and SHARED_ABI 3's stats)
 
 
 def ring_gen_size(workers):
@@ -1723,8 +1753,7 @@ class TokSampler:
             self._lanes[c.fileno()] = i
             self._poller.register(c.fileno(), select.POLLIN)
             self._lane_poller.register(c.fileno(), select.POLLIN)
-        if self.teach_rows is not None or self.v2_rows is not None or TO_.WORKER_LEAN:   # (before any sampling)
-            self.confirm_rings()
+        self.confirm_rings()   # (before any sampling; every configuration -- Codex round 29)
 
     def confirm_rings(self, timeout=None):
         """(Codex round 26) Every worker's ring confirmation (ring_confirm) before the trainer samples: its protocol
