@@ -16,7 +16,9 @@ Roles:
   other:<comm>        everything else under the trainer
 'unattributed' (3b): the lane's busy CPU (/proc/stat) split into the threads sampled, the container's own CPU the
 sampler missed (its cgroup's cpu.stat minus the sampled) and the CPU outside the container (the rest); the
-descendants born / exited per second by kind and the host's forks per second.
+descendants born / exited per second by kind and the host's forks per second. 'trainer_learner_threads': each
+thread of the trainer and the learner process (CPU over the window, mask at the end, on_worker_cpus: its mask reaches
+CPUs outside the trainer's and the learner's main threads' masks); 'on_worker_cpus_cores' sums those by process.
 Per role: cores (CPU seconds / window seconds), processes / threads seen; for the trainer's and the learner's threads,
 the share of samples on a CPU outside any syscall ('running': user code -- a spin wait counts here), in sched_yield
 (a yielding wait) and blocked in a syscall (futex / poll / ioctl ...: waiting without the CPU). The capacity is the
@@ -350,6 +352,7 @@ def main():
         t1 = time.time()
     # (Codex round 22) each role's threads' actual masks, as they stand at the window's end
     masks = {}
+    thread_masks = {}   # (pid, tid) -> mask: the trainer's and the learner's threads, listed one by one below
     for pid in descendants(root) if os.path.exists(f'/proc/{root}') else []:
         kind = procs_seen.get(pid, ('other', ''))[0]
         try:
@@ -373,6 +376,8 @@ def main():
                     m = line.split(':', 1)[1].strip()
             d = masks.setdefault(role, {})
             d[m] = d.get(m, 0) + 1
+            if kind in ('trainer', 'learner'):
+                thread_masks[(pid, int(t))] = m
     win = (t1 - t0) if t0 else 0.0
     roles = {}
     for r, tk in acc.items():
@@ -451,7 +456,24 @@ def main():
     split.update(born_per_s={k: round(v / win, 2) for k, v in bk.items()} if win else None,
                  exited_per_s={k: round(v / win, 2) for k, v in gone.items()} if win else None,
                  host_forks_per_s=round((fk1 - fk0) / win, 1) if (fk0 is not None and fk1 is not None and win) else None)
+    # (Codex round 22 / the coordinator) every thread of the trainer and of the learner process: its CPU over the
+    # window, its mask at the end, and whether the mask reaches the workers' CPUs (the lane minus the trainer's and
+    # the learner's main threads' masks)
+    reserved_ = cpu_set(thread_masks.get((root, root), '')) | set().union(
+        *(cpu_set(m) for (q, t_), m in thread_masks.items() if q == t_ and procs_seen.get(q, ('',))[0] == 'learner'))
+    workers_ = set(cpu_list) - reserved_
+    threads = []
+    for (q, t_), m in sorted(thread_masks.items()):
+        e_ = per_tid.get((q, t_))
+        threads.append(dict(pid=q, tid=t_, kind=procs_seen.get(q, ('?', ''))[0],
+                            comm=e_[2] if e_ else (stat_of(f'/proc/{q}/task/{t_}/stat') or {}).get('comm', '?'),
+                            cores=round(e_[0] / CLK / win, 4) if (e_ and win) else 0.0, mask=m,
+                            on_worker_cpus=bool(cpu_set(m) & workers_)))
+    threads.sort(key=lambda d: -d['cores'])
     out = dict(match=a.match, trainer_pid=root, processes=nk, per_cpu_busy=per_cpu, unattributed=split,
+               trainer_learner_threads=threads,
+               on_worker_cpus_cores={k: round(sum(d['cores'] for d in threads if d['kind'] == k and d['on_worker_cpus']),
+                                              4) for k in ('trainer', 'learner')},
                lane_cpu_by_mode_cores=kern,
                reaped_children_cores={k: round(v / CLK / win, 3) if win else None for k, v in child_acc.items()},
                per_physical_core={k: v for k, v in cores_.items()},
