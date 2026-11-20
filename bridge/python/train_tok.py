@@ -3093,6 +3093,8 @@ def main(argv=None, child=None, actor=None):
     episodes_path = open(out / 'episodes.jsonl', 'a')
     branch_path = open(out / 'branch_episodes.jsonl', 'a') if branching else None
     choice_path = open(out / 'choices.jsonl', 'a') if branching else None
+    # (Codex round 22: the lane -- the trainer's CPUs at its start, the container's cpuset -- for the CPU plan's check)
+    lane_cpus = os.sched_getaffinity(0)
     learner_cpus = set()   # 2026-10-10 (B18, --learner-cpus): before the workers start (they inherit the rest)
     # (BM1: or ISAAC_LEARNER_CPUS, the same list, when the flag is not given: the bm1 runners pass one EXTRA flag)
     for part_ in filter(None, (args.learner_cpus or os.environ.get('ISAAC_LEARNER_CPUS', '')).split(',')):
@@ -3131,6 +3133,17 @@ def main(argv=None, child=None, actor=None):
             p.error(f'ISAAC_ACTOR_CPUS {sorted(actor_cpus)} overlaps the learner / driver CPUs')
         os.sched_setaffinity(0, os.sched_getaffinity(0) - actor_cpus)
         print(f'actor CPUs (ISAAC_ACTOR_CPUS): {sorted(actor_cpus)}, the actor main thread\'s', flush=True)
+    # (Codex round 22, items 1 and 2) the CPU plan checked here, before any worker starts: ISAAC_TOK_PIN=1 without
+    # ISAAC_DRIVER_CPUS, a group outside the lane, exclusive groups sharing a CPU or a physical core (SMT siblings),
+    # an explicit ISAAC_RL_WORKER_CPUS / ISAAC_RL_SEARCH_CPUS outside the workers' CPUs: the run stops with the reason
+    #  (the trainer only: the spawned learner / actor processes start from its trimmed mask)
+    from isaac_bridge.cpu_plan import env_worker_masks, plan_problems, readback_problem
+    plan_bad = plan_problems(lane_cpus, learner_cpus, driver_cpus, actor_cpus,
+                             pin=os.environ.get('ISAAC_TOK_PIN', '0') == '1',
+                             learner_shared=os.environ.get('ISAAC_LEARNER_CPUS_SHARED', '0') == '1',
+                             worker_masks=env_worker_masks()) if (child is None and actor is None) else []
+    if plan_bad:
+        p.error('CPU plan: ' + '; '.join(plan_bad))
     if learner_cpus:
         print(f'learner CPUs (--learner-cpus): {sorted(learner_cpus)}, '
               + ('shared: the rest of the trainer, its workers and games may run on them too'
@@ -6275,8 +6288,11 @@ def main(argv=None, child=None, actor=None):
         rollout_actor = args.rollout // n_act
         if tok_pin:   # (P-driver-design 15: the actor's main thread off the workers' CPUs; its own with ISAAC_ACTOR_CPUS)
             os.sched_setaffinity(0, actor_cpus or driver_cpus)
-            print(f'P package: the actor main thread on CPUs {sorted(actor_cpus or driver_cpus)} (ISAAC_TOK_PIN)',
-                  flush=True)
+            got_pin = os.sched_getaffinity(0)   # (Codex round 22-1: read back, exactly the request, or the run stops)
+            bad_pin = readback_problem('the actor main thread (ISAAC_TOK_PIN)', actor_cpus or driver_cpus, got_pin)
+            if bad_pin:
+                raise SystemExit('CPU plan: ' + bad_pin)
+            print(f'P package: the actor main thread on CPUs {sorted(got_pin)} (ISAAC_TOK_PIN, read back)', flush=True)
         nsys_win = nv.profiler_window()
         if os.environ.get('ISAAC_TOK_AUDIT') and child is None:   # (P package, Codex 17-4: the reconciliation's start --
             #   the book as configured before any record (its state), the rules; tools/p_audit.py rebuilds the
