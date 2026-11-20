@@ -70,3 +70,8 @@ def test_siblings_from_sysfs(tmp_path):
         d.mkdir(parents=True)
         (d / 'thread_siblings_list').write_text(text + '\n')
     assert siblings_of({3, 27, 5}, root=str(tmp_path)) == {3: {3, 27}, 27: {3, 27}, 5: {5}}
+
+
+def test_unreadable_siblings_are_reported(tmp_path, capsys):   # (A1's review: not a silent fallback)
+    assert siblings_of({5}, root=str(tmp_path)) == {5: {5}}
+    assert 'SMT siblings of CPUs [5] are not readable' in capsys.readouterr().err

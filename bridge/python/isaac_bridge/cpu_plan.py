@@ -24,15 +24,21 @@ def parse_cpus(spec):
     return out
 
 
-def siblings_of(cpus, root='/sys/devices/system/cpu'):
-    """{cpu: its SMT siblings (itself included)} from sysfs; a CPU whose file is not readable is its own only."""
-    out = {}
+def siblings_of(cpus, root='/sys/devices/system/cpu', warn=True):
+    """{cpu: its SMT siblings (itself included)} from sysfs; a CPU whose file is not readable is its own only -- and
+    then (A1's review) a line says so: the physical-core check cannot see that CPU's siblings."""
+    out, unread = {}, []
     for c in cpus:
         try:
             with open(f'{root}/cpu{c}/topology/thread_siblings_list') as f:
                 out[c] = parse_cpus(f.read().strip()) | {c}
         except (OSError, ValueError):
             out[c] = {c}
+            unread.append(c)
+    if unread and warn:
+        import sys
+        print(f'CPU plan: WARNING the SMT siblings of CPUs {sorted(unread)} are not readable ({root}): the '
+              f'physical-core check does not cover them', file=sys.stderr, flush=True)
     return out
 
 
