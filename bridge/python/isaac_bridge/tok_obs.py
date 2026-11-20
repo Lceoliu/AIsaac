@@ -184,6 +184,13 @@ assert ROW.fields['rewind'][1] == 20793 and ROW.itemsize == 151880   # (in the p
 REWIND_CHECKPOINT = 128
 REWIND_COUNT = 127
 ROW_SCHEMA = 8   # (2026-11-20) the ROW layout revision dumps record ('row_schema'); 8: the rewind field
+# (2026-11-20, the memory ledger) ISAAC_RL_RING_COMPACT=1 (default off): the workers' shared teacher and V2 rings
+# (tok_sampler's teach_rows, tok_teacher2's v2_rows: whole ROW slots, 151,880 bytes) are written and read only up to
+# each record's frame end -- ROW_FRAME_AT + visible_bytes, the bytes every reader uses -- so a slot's frame-budget
+# pages past it are never touched and never become resident (a read of a shared-memory hole allocates a page too).
+# A record taken from a ring then has zeros past its frame end where the whole-slot copy had the slot's stale bytes
+# of earlier records (no reader reads them: tests/test_ring_compact.py).
+RING_COMPACT = os.environ.get('ISAAC_RL_RING_COMPACT', '0') == '1'
 ROWC = np.dtype([(name, ROW.fields[name][0]) for name in ROW.names if name != 'visible_frame'] +
                 [('visible_off', np.int64)], align=True)
 assert all(ROWC.fields[n][1] == ROW.fields[n][1] for n in ROW.names if n != 'visible_frame')
@@ -244,6 +251,32 @@ class FrameArena:
         self.used = need
         self.peak = max(self.peak, need)
         return new
+
+
+def row_frame_end(row1):
+    """The bytes of a 1-record ROW array every reader uses: every field before the frame, then visible_bytes of it."""
+    return ROW_FRAME_AT + max(0, min(int(row1['visible_bytes'][0]), ROW.itemsize - ROW_FRAME_AT))
+
+
+def ring_put(dst1, src1):
+    """A record (src1, a 1-record ROW array) into a ring slot (dst1, the slot's 1-record view): with RING_COMPACT its
+    bytes up to its frame end only, otherwise the whole record (as before)."""
+    if not RING_COMPACT:
+        dst1[0] = src1[0]
+        return
+    n = row_frame_end(src1)
+    dst1.view(np.uint8).reshape(-1)[:n] = src1.view(np.uint8).reshape(-1)[:n]
+
+
+def ring_take(src1):
+    """A copy (a ROW scalar) of the record in a ring slot (src1, its 1-record view): with RING_COMPACT its bytes up to
+    its frame end and zeros past them (the slot's tail is not read), otherwise the whole slot (as before)."""
+    if not RING_COMPACT:
+        return src1[0].copy()
+    out = np.zeros(1, ROW)
+    n = row_frame_end(src1)
+    out.view(np.uint8)[:n] = src1.view(np.uint8).reshape(-1)[:n]
+    return out[0]
 
 
 def compact_rows(rows, arena):

@@ -71,6 +71,7 @@ from .tok_branch import (RewindLedger, end_reward, rewind_cfg, AUX_LOGP, AUX_PRE
                          PointQueue, choice_meta,
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
+from .tok_obs import ring_put   # noqa: E402
 from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
                       encode_row, fast_counts, fast_row_function, V3_FRAMES, child_start, fast_row_final)
 from . import tok_obs as TOB   # (its FAST_ROW_CHECKING: per worker, the canary -- read through the module)
@@ -103,6 +104,58 @@ def reap_child(pid, limit):
             _, st_ = os.waitpid(pid, 0)
             return (st_ if os.WIFEXITED(st_) else -1), True
         time.sleep(0.01)
+
+
+def worker_tracemalloc(index):
+    """(2026-11-20, the memory ledger's diagnostic; off unless set) ISAAC_WORKER_TRACEMALLOC=<dir>[:<seconds>[:<worker>]]:
+    in worker <worker> (default 0) only, tracemalloc on from the worker's start (10 frames per traceback: it slows that
+    worker, the others not at all); every <seconds> (default 600) <dir>/worker<i>-tracemalloc-<n>.txt: the process's
+    RSS / anonymous / heap, the traced total, the top 40 allocation sites by size (file:line) and the top 15 by
+    traceback. Returns the tick to call from the worker's loop, or None. Measures only: nothing else changes."""
+    spec = os.environ.get('ISAAC_WORKER_TRACEMALLOC', '')
+    if not spec:
+        return None
+    parts, nums = spec.split(':'), []
+    while len(parts) > 1 and len(nums) < 2 and all(ch in '0123456789.' for ch in parts[-1]):
+        nums.insert(0, parts.pop())   # (the trailing numbers: a directory may hold a ':')
+    out_dir = ':'.join(parts)
+    every = float(nums[0]) if nums and nums[0] else 600.0
+    if index != (int(nums[1]) if len(nums) > 1 and nums[1] else 0):
+        return None
+    import tracemalloc
+    tracemalloc.start(10)
+    state = dict(t=time.perf_counter(), n=0)
+
+    def tick():
+        if time.perf_counter() - state['t'] < every:
+            return
+        state['t'] = time.perf_counter()
+        state['n'] += 1
+        try:
+            snap = tracemalloc.take_snapshot()
+            cur, peak = tracemalloc.get_traced_memory()
+            status = {}
+            try:
+                for line in open('/proc/self/status'):
+                    if line.startswith(('VmRSS', 'RssAnon', 'RssFile', 'RssShmem')):
+                        status[line.split(':')[0]] = line.split(':')[1].strip()
+            except OSError:
+                pass
+            lines = [f'worker {index} sample {state["n"]}: traced {cur / 2 ** 20:.1f} MB (peak {peak / 2 ** 20:.1f}); '
+                     f'{status}', '', 'top 40 by file:line']
+            for st_ in snap.statistics('lineno')[:40]:
+                lines.append(f'{st_.size / 2 ** 20:9.2f} MB {st_.count:9d} blocks  {st_.traceback[0]}')
+            lines += ['', 'top 15 by traceback']
+            for st_ in snap.statistics('traceback')[:15]:
+                lines.append(f'{st_.size / 2 ** 20:9.2f} MB {st_.count:9d} blocks')
+                lines += ['      ' + str(fr) for fr in st_.traceback[:10]]
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, f'worker{index}-tracemalloc-{state["n"]}.txt'), 'w') as f:
+                f.write('\n'.join(lines) + '\n')
+        except Exception as exc:   # noqa: BLE001  (a diagnostic: never the worker's failure)
+            print(f'tok floor worker {index}: tracemalloc sample failed: {type(exc).__name__}: {exc}', file=sys.stderr,
+                  flush=True)
+    return tick
 
 
 class ChildFatal(VisibleV3Fatal):
@@ -392,6 +445,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     slots = (rows[2 * index:2 * index + 1], rows[2 * index + 1:2 * index + 2])
     slot_address = (slots[0].ctypes.data, slots[1].ctypes.data)
     TOB.configure_worker(index)   # (round 24 C: check mode in a canary worker, ISAAC_RL_FAST_ROW_CHECK_WORKERS)
+    tm_tick = worker_tracemalloc(index)   # (the memory ledger's diagnostic: off unless ISAAC_WORKER_TRACEMALLOC)
     fast_fn = fast_row_function(row_library(cfg))   # None: LeanDecoder + encode_row as before
     # 2026-11-03 (tok_priv, cfg.priv): this worker's slots of the privileged records and its map version counter
     priv_on = bool(getattr(cfg, 'priv', False)) and not evaluation
@@ -576,7 +630,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             slot = int(mine[ST['v2_records']]) % V2_RING
             if block_on:
                 v2_t[index,slot,-1]=0
-            v2_rows[index, slot] = rows_[j]
+            ring_put(v2_rows[index, slot:slot + 1], rows_[j:j + 1])   # (ISAAC_RL_RING_COMPACT: its frame's bytes)
             v2_meta[index, slot] = meta_[j]
             if v2_h is not None:
                 v2_h[index, slot] = hs_[j] if hs_ is not None else 0.0
@@ -1679,6 +1733,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         episodes_left, episode_n = 0, 0
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
+            if tm_tick is not None:
+                tm_tick()
             mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()
             if thread_fatal:
                 raise thread_fatal[0]

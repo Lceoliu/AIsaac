@@ -19,7 +19,8 @@ if __name__ == '__main__':
     os.chdir(py)
     sys.path.insert(0, py)
     import pytest
-    rc = pytest.main(['-q', '-x', 'tests/test_fast_row_v9.py', 'tests/test_fast_row_v10.py', 'tests/test_visible_v3_worker.py', '-p', 'no:cacheprovider']
+    rc = pytest.main(['-q', '-x', 'tests/test_fast_row_v9.py', 'tests/test_fast_row_v10.py', 'tests/test_visible_v3_worker.py',
+                      'tests/test_ring_compact.py', '-p', 'no:cacheprovider']
                      + sys.argv[1:])
     for t in ('tests/test_stall_progress_smoke.py', 'tests/test_obs_v2_smoke.py'):
         r = subprocess.run([sys.executable, t], env=dict(os.environ)).returncode

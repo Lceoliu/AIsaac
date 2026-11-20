@@ -86,6 +86,7 @@ from .abplus_goexplore import GxConfig, Instance
 from .abplus_lean import LeanDecoder, read_lean, read_lean_raw
 from .env import BridgeError
 from .tok_obs import ROW, V3_FRAMES, EpisodeState, FastRow, encode_row, fast_counts, fast_row_final, fast_row_function
+from .tok_obs import ring_take
 from . import tok_obs as TO_
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal
 from .visible_producer import fatal_active as VP_fatal_active
@@ -1642,7 +1643,7 @@ class TokSampler:
             for c in range(first, count):
                 if with_block and self.v2_t[i,c%V2_RING,-1]!=c+1:
                     continue
-                row=self.v2_rows[i,c%V2_RING].copy()
+                row=ring_take(self.v2_rows[i,c%V2_RING:c%V2_RING+1])   # (ISAAC_RL_RING_COMPACT: to its frame end)
                 record_meta=self.v2_meta[i,c%V2_RING].copy()
                 record_t=self.v2_t[i,c%V2_RING].copy() if (with_block or with_t) and self.v2_t is not None else None
                 record_h=self.v2_h[i,c%V2_RING].copy() if with_h and self.v2_h is not None else None
@@ -1834,7 +1835,7 @@ class TokSampler:
             for c in range(first, count):
                 if with_block and self.block_arrays[5][i,c%TEACH_RING]!=c+1:
                     continue
-                row=self.teach_rows[i,c%TEACH_RING].copy()
+                row=ring_take(self.teach_rows[i,c%TEACH_RING:c%TEACH_RING+1])   # (ISAAC_RL_RING_COMPACT)
                 record_meta=self.teach_meta[i,c%TEACH_RING].copy()
                 if with_block and self.block_arrays[5][i,c%TEACH_RING]!=c+1:
                     continue
