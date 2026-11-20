@@ -152,6 +152,8 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          'cf_points', 'cf_done', 'cf_nodepth', 'cf_improving', 'cf_gain0', 'cf_taken', 'cf_spread', 'cf_branches',
          'cf_dec', 'cf_frames', 'cf_reps', 'cf_records', 'cf_target_best', 'cf_lane_calls', 'cf_s', 'cf_cpu',
          'cf_wait_s', 'cf_errors',
+         # (2026-11-20, Codex round 20, the rewind ledger) points dropped: a rewind went back past the point
+         'cf_rewind_cross',
          'cf_t_heart', 'cf_t_coin', 'cf_t_key', 'cf_t_bomb', 'cf_t_chest', 'cf_t_pill', 'cf_t_card', 'cf_t_trinket',
          'cf_t_pedestal', 'cf_t_locked', 'cf_t_shop', 'cf_t_treasure', 'cf_t_cleared', 'cf_t_random',
          # B40 (2026-10-18, cfg.cf_wall; zero unless on): wall points searched (cf_t_wall), of them with the bomb_at
@@ -1747,7 +1749,8 @@ class TokSampler:
         """A worker that ended with V3_FATAL_EXIT, or sent its reason / left its fatal_file (the exit code can be
         another one if its cleanup failed): self.fatal, with the reason (from the pipe, else the file) or a plain
         statement that none reached the parent."""
-        if self.fatal is not None or not VP_fatal_active():   # (mode 0: never, as 05f1622)
+        # (mode 0: never, as 05f1622 -- unless --rewind 1: a worker's missing restore count, tok_floor.RewindFatal)
+        if self.fatal is not None or not (VP_fatal_active() or getattr(self.cfg, 'rewind', 0)):
             return
         p = self.procs[i]
         code = p.exitcode

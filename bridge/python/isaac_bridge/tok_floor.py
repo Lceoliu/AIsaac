@@ -76,6 +76,12 @@ from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BO
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal, fatal_active   # noqa: E402
+
+
+class RewindFatal(VisibleV3Fatal):
+    """(2026-11-20, Codex round 20) --rewind 1 and an episode's first record without the bridge's Glowing Hour Glass
+    restore count (an older bridge or libabp_turbo, the native obs off): a protocol error, not a bad episode -- no retry;
+    the worker stops with V3_FATAL_EXIT and the trainer fails (TokSampler.check_fatal), whatever the visible-v3 mode."""
 from .tok_sampler import rng_key, start_seed, report_fatal   # noqa: E402  (a resumed run's / a shard's start seeds, random streams)
 from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, SearchSlots, StartBuilder, applied_action,
                           apply_instance_defaults, attach, attach_choices, attach_lab, attach_teacher, default_stub_list,
@@ -641,8 +647,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         mine[ST['cf_points']] += 1
         mine[ST['cf_t_' + CF_TRIGGERS[int(pt.trig)]]] += 1
         for k_s, name in (('branches', 'cf_branches'), ('decisions', 'cf_dec'), ('frames', 'cf_frames'),
-                          ('replicates', 'cf_reps')):
-            mine[ST[name]] += cfctx.stats[k_s] - s0[k_s]
+                          ('replicates', 'cf_reps'), ('rewind_cross', 'cf_rewind_cross')):
+            mine[ST[name]] += cfctx.stats.get(k_s, 0) - s0.get(k_s, 0)
         if res is None:
             mine[ST['cf_nodepth']] += 1
         else:
@@ -1015,7 +1021,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         code, its EpisodeState). trace (a dict, Phase B2): filled with the records' state digests and the actions
         answered to them."""
         st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it,
-                              stall_first=stall_fi)
+                              stall_first=stall_fi, rewind=bool(getattr(cfg, 'rewind', 0)))
         st.visited = set(visited)
         st.stage0 = int(obs.room[5])
         for s in slots:
@@ -1318,7 +1324,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         three DONE_BRANCH: a truncation), the floor's stall rule. Fills res (tok_lab RES)."""
         st = EpisodeState(lab_cap + 1, floor=True, stall=stall, run=run, items=cfg.items,
                           stall_pickups=stall_pk, stall_items=stall_it,
-                              stall_first=stall_fi)
+                              stall_first=stall_fi, rewind=bool(getattr(cfg, 'rewind', 0)))
         st.stage0 = int(obs.room[5])
         st.visited = set()
         for s in slots:
@@ -1792,7 +1798,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             episode_n += 1
             seed_now = src.info['seed']
             st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it,
-                              stall_first=stall_fi)
+                              stall_first=stall_fi, rewind=bool(getattr(cfg, 'rewind', 0)))
             st.visited, st.stage0 = set(src.info['visited']), src.info['stage0']
             enc = FastRow(fast_fn, st, decoder, episode_n, seed_now, group) if fast_fn is not None else None
             item, lf_now = obs, obs.logic_frames   # with FastRow item is the step's raw payload
@@ -1838,9 +1844,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         hurt, room_idx = row['hurt'][0] > 0, obs.room[4]
                     if t_ep == 0 and getattr(cfg, 'rewind', 0) and st.rw_count is None:
                         # (2026-11-20) a ledger that cannot see the game's rewinds would pay every rewound reward
-                        raise RuntimeError('rewind ledger on but the bridge sent no Glowing Hour Glass restore count at '
-                                           "the episode's first record (abp_native_rewinds: native obs off, or an "
-                                           'older libabp_turbo / bridge)')
+                        raise RewindFatal('rewind ledger on (--rewind 1) but the bridge sent no Glowing Hour Glass restore '
+                                          "count at the episode's first record (abp_native_rewinds: native obs off, "
+                                          'or an older libabp_turbo / bridge)')
                     # (2026-10-09: the fatal hit does not raise the bridge's damage_taken, so a death record has hurt 0
                     # and was never a hurt to search; the death teacher queues it by its done code)
                     if pf_track:   # 2026-10-13 (B23): the forced move of this record (0: the policy's), the episode's
@@ -2132,7 +2138,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             if labbing and not control[0]:   # 2026-10-08: posted lab jobs, within cfg.lab_share (tok_lab)
                 run_lab()
     except VisibleV3Fatal as exc:
-        if fatal_active():
+        if fatal_active() or isinstance(exc, RewindFatal):
             v3_fatal = exc
             report_fatal(index, conn, exc, 'tok floor worker', cfg.fatal_dir)   # (before the cleanup below)
         else:   # (mode 0: an ordinary error, as in 05f1622 -- no exit 86)

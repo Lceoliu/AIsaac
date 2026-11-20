@@ -610,6 +610,7 @@ def merge_rollouts(full, parts, mirror, device):
     view.__dict__.update({k: s0[k] for k in ('cap', 'nh') if k in s0})
     view.n = n_total
     view.value_g = full.get('value_g')
+    view.reward_gd = full.get('reward_gd')
     view.h = full.get('h')
     view.block = None
     if s0.get('block_payload') is not None:
@@ -797,6 +798,9 @@ class Rollout:
             self.rooms_n = zeros(workers, np.int64)
         # 2026-10-14 (B24, global-token models): value_global of each decision, as the actor computed it (None without)
         self.value_g = zeros((workers, capacity), np.float32) if value_g else None
+        # (Codex round 20, the rewind ledger) the global value head's reward less the reward, per decision: 0 but at a
+        # rewind's record, where the head's own rollback (its gamma_global interest) differs (Episodes._rewind)
+        self.reward_gd = zeros((workers, capacity), np.float32) if value_g else None
         # 2026-10-11 (memory): the GRU's input state of each decision (None without memory)
         self.h = zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
         # B45: block-memory rollouts store compact records (ROWC) and their visible frames in a byte arena (~11 KB each
@@ -1087,10 +1091,16 @@ class Episodes:
         # episode's first record, then every ROW 'rewind' bit-7 record), the episode's rewinds
         self.rw_on = False
         self.led = self.led_n = None
+        # (Codex round 20) rewinds whose record found no open decision (its decisions past a worker's capacity, dropped
+        # by store): the state still goes back, the rollback reward is lost -- counted, warned (progress rewind_lost)
+        self.rewind_lost = 0
+        # (Codex round 20) the global value head's rollback differs: its own interest gamma_global^-(k - j); the
+        # difference per rewind record goes to Rollout.reward_gd (set_rewind's gamma_g; None: no global head)
+        self.rw_gamma_g = None
         self.ck = [None] * workers
         self.rewinds = np.zeros(workers, np.int64)
 
-    def set_rewind(self, interest, rtime, cmax, gamma, limit):
+    def set_rewind(self, interest, rtime, cmax, gamma, limit, gamma_g=None):
         """Roll the reward ledger back at the game's Glowing Hour Glass restores (ROW 'rewind' bits 0-6): the record
         pays its time term and -sum_j c_j x_j over the decisions j since the checkpoint, x_j a decision's reward (less
         its time term when rtime is 0), c_j = min(gamma^-(k - j), cmax) (interest 1; 1 otherwise), k - j the decisions
@@ -1100,6 +1110,7 @@ class Episodes:
         n = len(self.ck)
         self.rw_on, self.rw_interest, self.rw_time = True, bool(interest), bool(rtime)
         self.rw_cmax, self.rw_gamma = float(cmax), float(gamma)
+        self.rw_gamma_g = None if gamma_g is None else float(gamma_g)
         self.led = np.zeros((n, int(limit) + 8))
         self.led_n = np.zeros(n, np.int64)
 
@@ -1112,13 +1123,17 @@ class Episodes:
         self.led_n[i] = 0
 
     def _rewind(self, i, n_back):
-        """Worker i's record with n_back restores: its reward (time and the rollback), the state put back."""
+        """Worker i's record with n_back restores: its reward (time and the rollback), the state put back; sets
+        self.rw_gd, the global value head's rollback less this one (its interest by gamma_g; 0 without)."""
         rw = self.rw
         n = int(self.led_n[i])
         x = self.led[i, :n]
-        c = np.minimum(self.rw_gamma ** -(n - np.arange(n, dtype=np.float64)), self.rw_cmax) if self.rw_interest \
-            else np.ones(n)
+        dist = n - np.arange(n, dtype=np.float64)
+        c = np.minimum(self.rw_gamma ** -dist, self.rw_cmax) if self.rw_interest else np.ones(n)
         back = -float((c * x).sum())
+        self.rw_gd = 0.0
+        if self.rw_gamma_g is not None and self.rw_interest:
+            self.rw_gd = -float((np.minimum(self.rw_gamma_g ** -dist, self.rw_cmax) * x).sum()) - back
         ck = self.ck[i]
         if ck is not None:
             (self.hurt[i], self.damage[i], self.rooms[i], self.boss[i], ex, self.healed[i], self.gathered[i], tm,
@@ -1129,10 +1144,11 @@ class Episodes:
             self.counts[i] = cnt
             self.seen_c[i], self.seen_t[i], self.stage_max[i] = set(sc), set(st_), smax
             if self.term is not None and tm is not None:
-                t_now = self.term[i, _RT['time']]
+                t_now, r_now = self.term[i, _RT['time']], self.term[i, _RT['rewind']]
                 self.term[i] = tm
                 self.term[i, _RT['time']] = t_now if not self.rw_time else tm[_RT['time']] - rw['time']
-                self.term[i, _RT['rewind']] += back + float(x.sum())
+                # (Codex round 20: the rollbacks' remainders accumulate -- the share is not restored with the others)
+                self.term[i, _RT['rewind']] = r_now + back + float(x.sum())
         self.rewinds[i] += n_back
         self.led_n[i] = 0
         return -rw['time'] + back
@@ -1302,8 +1318,9 @@ class Episodes:
             hu = rows['hurt'][has].astype(np.float64)
             if roll.close_hurt is not None:   # 2026-11-03 (--aux-predict): what closes these decisions
                 roll.close_hurt[w, kk], roll.close_done[w, kk], roll.close_ev[w, kk] = hu, d, rows['events'][has]
-            reward = rw['damage'] * dmg - rw['hurt'] * hu - rw['time'] + np.where(
-                d == 1, self.end_bonus, np.where(d == 2, -rw['death'], np.where((d == 3) & ~cap_h, -rw['timeout'], 0.0)))
+            endt = np.where(d == 1, self.end_bonus, np.where(d == 2, -rw['death'],
+                                                             np.where((d == 3) & ~cap_h, -rw['timeout'], 0.0)))
+            reward = rw['damage'] * dmg - rw['hurt'] * hu - rw['time'] + endt
             if self.floor:
                 ev = rows['events'][has].astype(np.int64)
                 reward = reward + (rw['room'] * ((ev & 1) > 0) + rw['explore'] * ((ev & 2) > 0)
@@ -1346,6 +1363,8 @@ class Episodes:
                 x[w, 3] += (ev & EV_PILL) > 0
                 x[w, 5] = np.maximum(x[w, 5], rows['stage'][has])
             if self.rw_on:   # (2026-11-20) the rewind ledger
+                if getattr(roll, 'reward_gd', None) is not None:
+                    roll.reward_gd[w, kk] = 0.0
                 rb = rows['rewind'][has].astype(np.int64)
                 back = (rb & 127) > 0
                 nb = ~back
@@ -1359,7 +1378,14 @@ class Episodes:
                 if back.any():
                     reward = np.array(reward, np.float64)
                     for j in np.flatnonzero(back):
-                        reward[j] = self._rewind(int(w[j]), int(rb[j] & 127))
+                        i_ = int(w[j])
+                        # (Codex round 20: an end on the same record keeps its own reward -- death, a timeout not
+                        #  bootstrapped, a floor's end -- added to the rollback, its share back after the restore)
+                        reward[j] = self._rewind(i_, int(rb[j] & 127)) + float(endt[j])
+                        if self.term is not None and endt[j] != 0:
+                            self.term[i_, _RT['win' if d[j] == 1 else 'death' if d[j] == 2 else 'timeout']] += float(endt[j])
+                        if self.rw_gd and getattr(roll, 'reward_gd', None) is not None:
+                            roll.reward_gd[i_, int(kk[j])] = self.rw_gd
             # (a branch's truncated end, DONE_BRANCH: not terminal, the decision bootstraps from the end's value)
             roll.reward[w, kk], roll.terminal[w, kk] = reward, (d != 0) & (d != DONE_BRANCH) & ~cap_h
             roll.open[w] = -1
@@ -1372,6 +1398,15 @@ class Episodes:
                 self.steps[w] += 1
             self.hurt[w] += hu
             self.damage[w] += dmg
+        if self.rw_on:   # (Codex round 20) a rewind whose record closes no decision: the state back, the reward lost
+            lost = ~has & ~first & ((rows['rewind'] & 127) != 0)
+            for j in np.flatnonzero(lost):
+                i_ = int(idx[j])
+                amount = self._rewind(i_, int(rows['rewind'][j] & 127)) + rw['time']
+                self.rewind_lost += 1
+                print(f'rewind ledger: worker {i_} episode {int(rows[j]["episode"])} seed {int(rows[j]["seed"])}: a rewind '
+                      f'with no open decision (dropped at the worker\'s capacity): its rollback {amount:+.4f} lost '
+                      f'(rewind_lost {self.rewind_lost})', flush=True)
         self.note_first(rows, idx, first)
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
             self.gains[idx] = gains_now
@@ -1819,10 +1854,12 @@ def temporal_bounds(tch, chunk_ids, micro):
     return bounds
 
 
-def gae(rollout, gamma, lam, value=None):
+def gae(rollout, gamma, lam, value=None, reward=None):
     """(advantages, returns, mask) [workers, capacity] over each worker's decisions that have their reward. value:
-    the values to use (default: the stored ones)."""
+    the values to use (default: the stored ones); reward: the rewards (default: the stored ones; the global head's:
+    reward_g(rollout))."""
     value = rollout.value if value is None else value
+    rewards = rollout.reward if reward is None else reward
     adv = np.zeros_like(rollout.reward)
     mask = np.zeros_like(rollout.terminal)
     for i in range(rollout.n):
@@ -1837,13 +1874,20 @@ def gae(rollout, gamma, lam, value=None):
                 running, nxt = 0.0, value[i, t]
                 continue
             live = 0.0 if rollout.terminal[i, t] else 1.0
-            delta = rollout.reward[i, t] + gamma * nxt * live - value[i, t]
+            delta = rewards[i, t] + gamma * nxt * live - value[i, t]
             running = delta + gamma * lam * live * running
             adv[i, t] = running
             nxt = value[i, t]
         mask[i, :usable] = True
         mask[i, :usable] &= ~boot[:usable]
     return adv, adv + value, mask
+
+
+def reward_g(rollout):
+    """(Codex round 20) the global value head's rewards: the stored ones, plus Rollout.reward_gd where a rewind's
+    rollback differs under gamma_global (None: the stored ones as they are)."""
+    gd = getattr(rollout, 'reward_gd', None)
+    return None if gd is None or not gd.any() else rollout.reward + gd
 
 
 def learner_child_entry(argv, init):
@@ -3983,7 +4027,7 @@ def main(argv=None, child=None, actor=None):
                 sec('log')
         if gtok_on and len(all_flat) and vg_stored is not None and not vgs:   # (B24) the actor's values, as stored
             vg_now = vg_stored
-            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now)
+            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now, reward=reward_g(rl))
             del adv_g
         elif gtok_on and len(all_flat):   # 2026-10-12 (B22): value_global of every stored decision, for its returns
             vg_now = np.zeros_like(rl.value)
@@ -4004,7 +4048,7 @@ def main(argv=None, child=None, actor=None):
                                                if mem_on else None, **tk_)
                         vgs.append(o_[-1].float())
             vg_now.reshape(-1)[all_flat] = torch.cat(vgs).cpu().numpy()
-            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now)
+            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now, reward=reward_g(rl))
             del adv_g
             sec('recompute')
         adv, ret, mask = gae(rl, args.gamma, args.lam, value_now)
@@ -5474,6 +5518,7 @@ def main(argv=None, child=None, actor=None):
             ap_ = job.get('arena_peak_mb') or []
             row['arena_peak_mb_a'], row['arena_peak_mb_b'] = (ap_ + [0.0, 0.0])[:2]
             row['store_dropped'] = job.get('store_dropped', 0)
+            row['rewind_lost'] = job.get('rewind_lost', 0)
             row['v3_host_ms'] = 1000 * d3['host_s'] / max(d3['calls'], 1)
             row['v3_host_share'] = d3['host_s'] / max(job['collect_s'], 1e-9)
             for b_ in VI_.E_BUCKETS:
@@ -6111,7 +6156,8 @@ def main(argv=None, child=None, actor=None):
     pending = np.zeros((n, nh), np.int64)            # the action under way per worker
     book = Episodes(n, rw, floor, run=run, items=items)
     if args.rewind:   # (2026-11-20, reward-rewind-design.md: the ledger; an episode's most decisions bound it)
-        book.set_rewind(args.rewind_interest, args.rewind_time, args.rewind_cmax, args.gamma,
+        book.set_rewind(args.rewind_interest, args.rewind_time, args.rewind_cmax, args.gamma, gamma_g=args.gamma_global
+                        if gtok_on else None, limit=
                         int(round((args.run_seconds if run else args.floor_seconds) * 30 / args.frames_per_decision)) + 1)
     if cfg.archive_plr > 0:   # 2026-10-10: the trainer reports each episode's learning-potential score to its worker
         book.plr = (sampler.stats, ST, args.gamma)
@@ -6866,6 +6912,7 @@ def main(argv=None, child=None, actor=None):
                        # (A-6, Codex round 16: the two arenas' high-water marks; decisions dropped at a worker's cap)
                        arena_peak_mb=[r_.frames.peak / 2 ** 20 for r_ in (roll, spare) if r_.frames is not None],
                        store_dropped=int(getattr(roll, 'dropped', 0)) + int(getattr(spare, 'dropped', 0)),
+                       rewind_lost=int(book.rewind_lost),   # (Codex round 20: cumulative)
                        **lab_job,
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,

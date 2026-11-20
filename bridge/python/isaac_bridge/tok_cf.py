@@ -675,8 +675,9 @@ def cf_search(pt, ctx, policy, rng, branch=play_branch, restore_fn=restore):
             endpoint=d+end_steps
             if not pt.log.done[endpoint]:
                 vals[endpoint]=policy.replay_value(pt.log,d,endpoint,pt.bank,ctx.row,global_value=ctx.boot_vg)
+        fl_ = {}
         taken, steps = taken_score(pt.log, d, ctx.cap, ctx.gamma, ctx.rw, ctx.run, vals, ctx.exit_end, extra,
-                                   rewind=getattr(ctx, 'rewind', None))
+                                   rewind=getattr(ctx, 'rewind', None), flags=fl_)
         runs = []
         k_dist = int(cfg.cf_distill_steps)
         k_wall = max(k_dist, int(getattr(cfg, 'cf_wall_distill', k_dist)))
@@ -688,6 +689,12 @@ def cf_search(pt, ctx, policy, rng, branch=play_branch, restore_fn=restore):
                 b['wall'] = intent.summary()
             runs.append(b)
         scores = [b_['score'] for b_ in runs]
+        if fl_.get('rewind_cross') or any(b_.get('rewind_cross') for b_ in runs):
+            # (Codex round 20: a rewind past the point -- the taken continuation's or a branch's ledger would miss what
+            #  was earned before the point: the point's scores are dropped, counted cf_rewind_cross)
+            if hasattr(ctx, 'stats'):
+                ctx.stats['rewind_cross'] = ctx.stats.get('rewind_cross', 0) + 1
+            return None
         bi = int(np.argmax(scores))
         rep = None
         if scores[bi] - taken > cfg.cf_margin:   # the noise floor: the best intent again from another reseed

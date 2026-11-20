@@ -276,10 +276,10 @@ class Context:
         self.cap = max(1, int(round(sec * 30 / cfg.frames_per_decision)))
         self.boot_vg, self.exit_end = bool(boot_vg), bool(exit_end)
         self.gains = bool(gains) and (self.rw.get('heal', 0.0) != 0 or self.rw.get('resource', 0.0) != 0)
-        self.stats = dict(branches=0, decisions=0, frames=0, replicates=0)
+        self.stats = dict(branches=0, decisions=0, frames=0, replicates=0, rewind_cross=0)
 
 
-def taken_score(log, d, cap, gamma, rw, run, values=None, exit_end=False, extra=None, rewind=None):
+def taken_score(log, d, cap, gamma, rw, run, values=None, exit_end=False, extra=None, rewind=None, flags=None):
     """The episode's own continuation from record d over at most cap steps: (discounted return + gamma^m V(record
     d + m) when that record is not an end, steps m). The value of a record that has none (the log broke off) is 0.
     values (B34): the bootstrap values per record (None: log.value); exit_end (B34): a record with EV_EXIT ends the
@@ -299,6 +299,8 @@ def taken_score(log, d, cap, gamma, rw, run, values=None, exit_end=False, extra=
               + (extra[t] if extra is not None and t < len(extra) else 0.0))
         if led is not None:
             r_ = led.step(r_, log.rewind[t] if t < len(log.rewind) else 0)
+            if flags is not None and led.crossed:   # (Codex round 20: a rewind past record d)
+                flags['rewind_cross'] = True
         g += disc * r_
         disc *= gamma
         m = i
@@ -365,7 +367,8 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
         # (2026-11-20, --stall-progress first: the branch's first-time sets start empty -- known, as the held ids above)
         st = EpisodeState(ctx.limit, floor=True, stall=ctx.stall, run=ctx.run, items=ctx.items,
                           stall_pickups=pk_, stall_items=it_,
-                          stall_first=stall_first(getattr(ctx.cfg, 'stall_progress', 'events')))
+                          stall_first=stall_first(getattr(ctx.cfg, 'stall_progress', 'events')),
+                          rewind=bool(getattr(ctx.cfg, 'rewind', 0)))
         st.visited = set(pt.visited)
         st.stage0 = int(pt.stage0) if pt.stage0 is not None else int(ob.room[5])
         st.progress_t = pt.log.progress[d - 1] if d >= 1 else d   # the stall counter before record d
@@ -436,7 +439,7 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
             pass
     n = len(rews)
     G = returns_to_go(rews, ctx.gamma, out['v_end'] if out['boot'] else 0.0)
-    out.update(score=float(G[0]), n=n, frames=lf - lf0, rews=rews,
+    out.update(score=float(G[0]), n=n, frames=lf - lf0, rews=rews, rewind_cross=bool(led_.crossed),
                **{'from': keep_from() if keep_from is not None else 0})
     if keep:
         k = min(n, len(rows))
@@ -498,14 +501,20 @@ def search_point(pt, ctx, policy, rng, on_depth=None):
             break
         S, hp0 = restore(pt, d, ctx)
         try:
-            taken, steps = taken_score(pt.log, d, ctx.cap, ctx.gamma, ctx.rw, ctx.run, rewind=getattr(ctx, 'rewind', None))
+            fl_ = {}
+            taken, steps = taken_score(pt.log, d, ctx.cap, ctx.gamma, ctx.rw, ctx.run, rewind=getattr(ctx, 'rewind', None),
+                                       flags=fl_)
             best, scores = None, []
             for intent in candidates(cfg, rng):
                 b = play_branch(S, ctx, pt, d, hp0, intent, policy)
                 b['intent'] = intent
                 scores.append(b['score'])
+                fl_['rewind_cross'] = fl_.get('rewind_cross', False) or b.get('rewind_cross', False)
                 if best is None or b['score'] > best['score']:
                     best = b
+            if fl_.get('rewind_cross'):   # (Codex round 20: a rewind past the point -- the point's scores dropped)
+                ctx.stats['rewind_cross'] += 1
+                return None
             gain = best['score'] - taken
             rep, spread = None, None
             if gain > cfg.teacher_v2_margin:   # the noise floor: the best intent again from another reseed

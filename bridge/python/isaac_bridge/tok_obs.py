@@ -367,7 +367,7 @@ class EpisodeState:
     """What the encoder keeps between the records of one episode."""
 
     def __init__(self, limit, floor=False, stall=0, run=False, items=False, stall_pickups=False, stall_items=False,
-                 stall_first=False):
+                 stall_first=False, rewind=False):
         self.limit = max(int(limit), 1)
         self.floor = floor or run  # a whole-floor episode: it ends at the floor's exit, not at a room's clear
         self.run = run             # a run (2026-10-06): the floor's exit is an event (EV_EXIT), the episode goes on
@@ -416,6 +416,9 @@ class EpisodeState:
         # (2026-11-20, reward-rewind-design.md) rewinds: the game's restore count at the record before (None: not
         # known yet), the floor instance (+1 per floor reached), the state a rewind restores (taken at the episode's
         # first record and at every checkpoint record: visited, nohit_rooms, floor_n, floor_k, stage0), rewinds seen
+        # (Codex round 20: the behaviour only with rewind on -- off, the count is not looked at, ROW 'rewind' is 0 and
+        #  every event, hurt, damage, state update and the stall are b53f14c's)
+        self.rewind_on = bool(rewind)
         self.rw_count = None
         self.floor_k = 0
         self.ck = None
@@ -661,7 +664,7 @@ def encode_row(o, st, row, t):
     events = 0
     room_idx = room[4]
     # (2026-11-20) Glowing Hour Glass restores since the record before (the bridge's count block; None: not sent)
-    rw = getattr(o, 'rewinds', None)
+    rw = getattr(o, 'rewinds', None) if st.rewind_on else None
     rewound = 0
     if rw is not None:
         if st.rw_count is not None and st.previous is not None and rw > st.rw_count:
@@ -705,11 +708,11 @@ def encode_row(o, st, row, t):
     row['events'] = events
     st.previous = (o.damage_taken, o.monsters_hp)
     # (2026-11-20) the rewind field (bit 7: a checkpoint -- a room or floor change, not a rewind)
-    row['rewind'] = rewound | (REWIND_CHECKPOINT if changed and not rewound else 0)
+    row['rewind'] = (rewound | (REWIND_CHECKPOINT if changed and not rewound else 0)) if st.rewind_on else 0
     if st.floor:
         if st.stage0 is None:
             st.stage0, st.progress_t = room[5], t
-        if st.ck is None or (changed and not rewound):   # the state a rewind restores: here (and the first record)
+        if st.rewind_on and (st.ck is None or (changed and not rewound)):   # what a rewind restores: here, the first
             _checkpoint(st)
         if st.stall_first:   # (--stall-progress first: what this episode does for the first time; never rolled back)
             key = (st.floor_k, room_idx)

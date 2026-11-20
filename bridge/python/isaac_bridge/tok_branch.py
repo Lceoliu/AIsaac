@@ -186,11 +186,20 @@ class RewindLedger:
         self.on, self.interest, self.rtime, self.cmax = cfg
         self.gamma, self.wt = float(gamma), float(w['time'])
         self.led = []
+        # (Codex round 20) a rewind before the scorer's first checkpoint goes back past its start (the fork point):
+        # what it rolls back was earned before the scorer started -- its score is not this ledger's to give (crossed;
+        # the scorers drop the point: cf_rewind_cross)
+        self.ck_seen = False
+        self.crossed = False
 
     def step(self, r, rewind):
         if not self.on:
             return r
         rewind = int(rewind)
+        if rewind & 127 and not self.ck_seen:
+            self.crossed = True
+        if rewind & 128:
+            self.ck_seen = True
         if rewind & 127:
             n = len(self.led)
             if self.interest:

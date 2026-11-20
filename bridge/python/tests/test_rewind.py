@@ -32,8 +32,9 @@ CK = TO.REWIND_CHECKPOINT
 
 
 def _row(first=0, events=0, hurt=0.0, damage=0.0, done=0, rewind=0, units=6, coins=0, active=0, inv=(), stage=1,
-         boss=False):
+         boss=False, t=0):
     r = np.zeros(1, ROW)
+    r['t'] = t
     r['first'], r['done'], r['seed'], r['group'] = first, done, 7, 0
     r['events'], r['hurt'], r['damage'], r['rewind'] = events, hurt, damage, rewind
     r['player'][0, 7] = units / 12
@@ -50,12 +51,12 @@ class Book:
     """One worker's records through Episodes.arrive; rewards[i]: the reward of the decision the (i + 1)-th record
     closed."""
 
-    def __init__(self, rewind=None, cap=512, **terms):
+    def __init__(self, rewind=None, cap=512, gamma_g=None, **terms):
         self.rw = dict(RW, **terms)
-        self.roll = T.Rollout(1, cap, close=True)
+        self.roll = T.Rollout(1, cap, close=True, value_g=gamma_g is not None)
         self.book = T.Episodes(1, self.rw, True, run=True, items=True)
         if rewind is not None:
-            self.book.set_rewind(*rewind, G, cap)
+            self.book.set_rewind(*rewind, G, cap, gamma_g=gamma_g)
         self.pending = np.zeros((1, 3), np.int64)
         self.rewards = []
 
@@ -260,9 +261,9 @@ def payload(k, room_idx, clear, damage_taken=0.0, monsters_hp=30.0, hearts=6, re
 
 
 class Worker:
-    def __init__(self, stall=0, first=False):
+    def __init__(self, stall=0, first=False, rewind=True):
         self.dec = AL.LeanDecoder()
-        self.st = TO.EpisodeState(10 ** 6, floor=True, stall=stall, run=True, stall_first=first)
+        self.st = TO.EpisodeState(10 ** 6, floor=True, stall=stall, run=True, stall_first=first, rewind=rewind)
         self.t = 0
         self.out = []
 
@@ -520,3 +521,156 @@ def test_user_req_u2_book_cancels_and_pays_nohit_once_per_timeline():
     assert b.rewards[-1] == pytest.approx(1.5 - 0.002)
     fin = b.rec(done=2).book.finished[-1]
     assert fin['nohit_rooms'] == 1 and fin['rooms'] == 1
+
+
+# ---- Codex round 20 ----
+
+def _gap(n, cmax):
+    """checkpoint, a room cleared (+1), n - 2 decisions of time, the rewind: the n decisions' discounted return from
+    the checkpoint (plan I, time kept)."""
+    b = Book(rewind=(1, 0, cmax), cap=n + 16)
+    b.rec(first=1)
+    b.rec(rewind=CK)
+    s = len(b.rewards)
+    b.rec(events=EV_CLEARED)
+    for _ in range(n - 2):
+        b.rec()
+    b.rec(rewind=1)
+    return sum(G ** j * x for j, x in enumerate(b.rewards[s:]))
+
+
+def test_cmax_residue_is_the_known_one():
+    """(Codex round 20, 1; the coordinator: accepted, written down) with rewind_cmax 4 a rollback older than ~277
+    decisions (gamma^-277 = 4) is capped: the discounted return of the stretch is its time terms plus a bounded
+    residue -- 600 decisions after a +1 the stretch still nets +0.421 (Codex's +0.4220). Pinned: a change here is a
+    change of the reward."""
+    def time_part(n):
+        return -0.002 * sum(G ** j for j in range(n))
+    assert _gap(277, 4.0) == pytest.approx(time_part(277), abs=1e-5)          # (not capped yet)
+    for n, net in ((300, -0.2047), (600, 0.4211), (900, 0.5602)):
+        assert _gap(n, 4.0) == pytest.approx(net, abs=2e-4), n
+        assert _gap(n, 1e9) == pytest.approx(time_part(n), abs=1e-5)         # (uncapped: the time terms only)
+
+
+@pytest.mark.parametrize('done,boot,penalty', [(2, False, -2.0), (3, False, -1.0), (3, True, 0.0), (4, True, 0.0)])
+def test_an_end_on_the_rewind_record_keeps_its_own_reward(done, boot, penalty, monkeypatch):
+    """(Codex round 20, 3) hurt (-1.5), then a record that both rewinds and ends: death (-2), a timeout not
+    bootstrapped (-1), a truncation (the cap with --cap-truncate: no penalty, bootstrapped) and a branch's end
+    (DONE_BRANCH: none) -- the rollback and the end's own reward both paid."""
+    if done == 3 and boot:
+        monkeypatch.setattr(T, 'CAP_T', 5)
+        monkeypatch.setattr(T, 'TRUNC', 1)
+    b = Book(rewind=(1, 0, 4.0))
+    b.rec(first=1)
+    b.rec(rewind=CK)
+    b.rec(hurt=2.0, units=4)
+    k = int(b.roll.open[0])
+    b.rec(rewind=1, done=done, units=6, t=10)
+    want = -0.002 + 1.5 * G ** -1 + penalty
+    assert b.rewards[-1] == pytest.approx(want, abs=1e-6)
+    assert bool(b.roll.terminal[0, k]) == (done in (2, 3) and not boot)
+    if done != 4:
+        fin = b.book.finished[-1]
+        assert sum(fin['r'].values()) == pytest.approx(fin['ret'], abs=1e-3)
+
+
+def test_a_rewind_with_no_open_decision_is_counted_lost():
+    """(Codex round 20, 2) the decisions after a clear dropped at the worker's capacity (store: open -1): the rewind's
+    record closes nothing -- the rollback is lost, counted (rewind_lost), the state goes back all the same."""
+    b = Book(rewind=(1, 0, 4.0))
+    b.rec(first=1)
+    b.rec(rewind=CK)
+    b.rec(events=EV_CLEARED)
+    assert b.book.rooms[0] == 1
+    b.roll.open[0] = -1                  # (as store leaves it when the record's decision was dropped)
+    go = b.book.arrive(b.roll, _row(rewind=1), np.array([0]), b.pending)
+    assert go[0] and b.book.rewind_lost == 1 and b.book.rooms[0] == 0 and b.book.rewinds[0] == 1
+
+
+def test_the_global_heads_rollback():
+    """(Codex round 20, 4a) value_global's returns use gamma_global 0.999: its reward at a rewind is its own rollback
+    (Rollout.reward_gd), so from the checkpoint its discounted return of the stretch is the time terms too -- a hurt
+    undone 200 decisions later nets about +1.85 under 0.999 with the main head's rollback alone (Codex)."""
+    GG = 0.999
+    n = 200
+    b = Book(rewind=(1, 0, 4.0), gamma_g=GG, cap=n + 16)
+    b.rec(first=1)
+    b.rec(rewind=CK)
+    s = len(b.rewards)
+    b.rec(hurt=2.0, units=4)
+    for _ in range(n - 2):
+        b.rec(units=4)
+    b.rec(rewind=1, units=6)
+    rm = np.array(b.rewards[s:])
+    rg = rm + b.roll.reward_gd[0, s:s + n]
+    tg = -0.002 * sum(GG ** j for j in range(n))
+    assert sum(GG ** j * x for j, x in enumerate(rg)) == pytest.approx(tg, abs=1e-5)
+    assert sum(G ** j * x for j, x in enumerate(rm)) == pytest.approx(-0.002 * sum(G ** j for j in range(n)), abs=1e-5)
+    assert sum(GG ** j * x for j, x in enumerate(rm)) - tg > 1.5   # (the main head's rollback under 0.999)
+    assert T.reward_g(b.roll) is not None
+    assert np.count_nonzero(b.roll.reward_gd) == 1
+
+
+def test_a_rewind_past_the_fork_point_drops_the_score():
+    """(Codex round 20, 4b) a branch / continuation whose first rewind comes before its own first checkpoint goes
+    back past its start: flagged (the scorers drop the point, cf_rewind_cross); after a checkpoint it is its own."""
+    led = RewindLedger((1, 1, 0, 4.0), G, RW)
+    led.step(1.0, 0)
+    led.step(-0.002, 1)
+    assert led.crossed
+    led = RewindLedger((1, 1, 0, 4.0), G, RW)
+    led.step(1.0, CK)
+    led.step(0.5, 0)
+    led.step(-0.002, 1)
+    assert not led.crossed
+    from isaac_bridge.tok_teacher2 import taken_score
+    log = types.SimpleNamespace(damage=[0.0, 1.0, 0.0, 0.0], hurt=[0.0] * 4, done=[0] * 4, events=[0] * 4,
+                                rewind=[0, 0, 1, 0], value=[0.0] * 4)
+    fl = {}
+    taken_score(log, 0, 3, G, RW, True, rewind=(1, 1, 0, 4.0), flags=fl)
+    assert fl.get('rewind_cross')
+
+
+def test_rewind_off_the_encoder_is_b53f14c():
+    """(Codex round 20, 5) --rewind 0: the count is not looked at -- a rising count with damage_taken up still gives
+    the hurt, the room change its events, ROW rewind 0 (b53f14c's encoding)."""
+    w = Worker(rewind=False)
+    A, B = 84, 85
+    w.rec(A, True, rewinds=0)
+    ev, rb, *_ = w.rec(B, False, monsters_hp=30.0)
+    assert ev & EV_NEW_ROOM and rb == 0
+    ev, rb, hu, dm, _ = w.rec(A, True, rewinds=1, damage_taken=1.0)
+    assert (rb, hu) == (0, 1.0)
+
+
+def test_a_missing_count_is_a_protocol_error():
+    """(Codex round 20, 6) --rewind 1 and no count at an episode's first record: tok_floor.RewindFatal -- a
+    VisibleV3Fatal (no BridgeError / RuntimeError: the workers' retry paths do not take it), raised where the main
+    episode's first record is encoded; the sampler reads a worker's fatal exit with --rewind 1 in any visible mode."""
+    import inspect
+    from isaac_bridge import tok_floor, tok_sampler
+    from isaac_bridge.visible_producer import V3_FATAL_EXIT, VisibleV3Fatal
+    assert issubclass(tok_floor.RewindFatal, VisibleV3Fatal) and not issubclass(tok_floor.RewindFatal, RuntimeError)
+    src = inspect.getsource(tok_floor)
+    assert "raise RewindFatal('rewind ledger on (--rewind 1)" in src
+    assert 'if fatal_active() or isinstance(exc, RewindFatal):' in src
+    s = tok_sampler.TokSampler.__new__(tok_sampler.TokSampler)
+    s.fatal, s._fatal_reason = None, {}
+    s.cfg = types.SimpleNamespace(rewind=1, fatal_dir='')
+    s.procs = [types.SimpleNamespace(exitcode=V3_FATAL_EXIT, pid=None)]
+    s._note_exit(0)
+    assert s.fatal is not None and ('exit ' + str(V3_FATAL_EXIT)) in s.fatal
+
+
+def test_two_rewinds_shares_still_add_up():
+    """(Codex round 20, later) consecutive rewinds: the share 'rewind' accumulates both remainders -- the shares add
+    up to the return."""
+    b = Book(rewind=(1, 0, 4.0))
+    b.rec(first=1)
+    b.rec(rewind=CK)
+    b.rec(events=EV_CLEARED)
+    b.rec(rewind=1)
+    b.rec(hurt=2.0, units=4)
+    b.rec(rewind=1, units=6)
+    fin = b.rec(done=2).book.finished[-1]
+    assert sum(fin['r'].values()) == pytest.approx(fin['ret'], abs=1e-4)
