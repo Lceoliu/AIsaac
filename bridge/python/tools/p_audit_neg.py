@@ -158,8 +158,20 @@ def main(argv=None):
         copy_rollouts(a.rollouts, os.path.join(a.scratch, 'rf'), {os.path.basename(last): z})
         res['f'] = dict(worker=w, k=k, result=run(a.tool, a.audit, os.path.join(a.scratch, 'rf'),
                                                   os.path.join(a.scratch, 'f.json')))
-    else:
-        res['f'] = dict(result=(None, ['no worker with a closed last decision in the last rollout'], ''))
+    else:   # (every worker's last decision open: drop it and pass the closed one before it off as open, reward 999 --
+        #      a shape only the hand-off's boundary can refute: the last rollout's open rows have no other witness)
+        z = dict(np.load(last))
+        w = next(w for w in range(len(z['length'])) if z['length'][w] > 1)
+        k = int(z['length'][w]) - 2
+        z['length'] = z['length'].copy()
+        z['length'][w] = k + 1
+        z['open'] = z['open'].copy()
+        z['open'][w] = k
+        z['reward'] = z['reward'].copy()
+        z['reward'][w, k] = 999.0
+        copy_rollouts(a.rollouts, os.path.join(a.scratch, 'rf'), {os.path.basename(last): z})
+        res['f'] = dict(worker=w, k=k, how='the open last row dropped, the closed one before it made open',
+                        result=run(a.tool, a.audit, os.path.join(a.scratch, 'rf'), os.path.join(a.scratch, 'f.json')))
     res['pass'] = bool(res['clean'][0] == 0 and all(res[x]['result'][0] == 1 for x in 'abcdef'))
     s = json.dumps(res, indent=1, default=str)
     print(s)
