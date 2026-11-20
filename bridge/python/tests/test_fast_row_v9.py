@@ -39,8 +39,11 @@ def _raw():
     return json.loads(hits[0].read_text())['raw']
 
 
-def payload(k, hurt_at, rw_counts, inv_at, coin_at, active_used_at, dead_at, v3, frame):
+def payload(k, hurt_at, rw_counts, inv_at, coin_at, active_used_at, dead_at, v3, frame, stage_at=10 ** 6,
+            raw_block=None):
     p, d, e, room = V.world(0)
+    if k >= stage_at:   # (the next floor: the same room index, another stage -- a run's EV_EXIT, a floor's end)
+        room = room[:5] + (room[5] + 1,) + room[6:]
     p['x'], p['y'] = 300.0 + 2.0 * k, 280.0 - 1.0 * k
     p['coins'] = 17 + (1 if k >= coin_at else 0)
     p['active'], p['active_charge'] = 45.0, (0.0 if k >= active_used_at else 6.0)
@@ -49,6 +52,7 @@ def payload(k, hurt_at, rw_counts, inv_at, coin_at, active_used_at, dead_at, v3,
     flags |= 2 if k % 7 == 0 else 0   # the same terrain block now and then (the fast path takes it)
     flags |= 16 if k in inv_at else 0
     flags |= 64 if v3 else 0
+    flags |= 32 if raw_block is not None else 0
     rw = rw_counts[k]
     flags |= 128 if rw is not None else 0
     damage_taken = 1.0 if k >= hurt_at else 0.0
@@ -68,6 +72,9 @@ def payload(k, hurt_at, rw_counts, inv_at, coin_at, active_used_at, dead_at, v3,
         arr = np.zeros(len(items), AL.INV_ITEM)
         arr['id'], arr['count'] = [i for i, _ in items], [c for _, c in items]
         out += arr.tobytes()
+    if flags & 32:
+        text = json.dumps(raw_block).encode()
+        out += struct.pack('<I', len(text)) + text
     if flags & 64:
         out += struct.pack('<I', len(frame)) + frame
     if flags & 128:
@@ -75,13 +82,13 @@ def payload(k, hurt_at, rw_counts, inv_at, coin_at, active_used_at, dead_at, v3,
     return out
 
 
-def state(stall_mode, items, rewind):
+def state(stall_mode, items, rewind, run=False):
     pk, it = TO.stall_flags(stall_mode)
-    return TO.EpisodeState(10 ** 6, floor=True, stall=STALL, items=items, stall_pickups=pk, stall_items=it,
+    return TO.EpisodeState(10 ** 6, floor=True, run=run, stall=STALL, items=items, stall_pickups=pk, stall_items=it,
                            stall_first=TO.stall_first(stall_mode), rewind=rewind)
 
 
-def scenario(rewind_case, hurt):
+def scenario(rewind_case, hurt, stage_at=10 ** 6):
     rw = [None] * N
     if rewind_case == 'on':
         for k in range(N):   # the bridge's count: at the first records, then whenever it changed (a restore at 14)
@@ -92,7 +99,7 @@ def scenario(rewind_case, hurt):
         for k in range(N):
             rw[k] = 0 if k < 14 else 1 if k == 14 else 2
     return dict(hurt_at=5 if hurt else 10 ** 6, rw_counts=rw, inv_at={0, 17}, coin_at=11, active_used_at=12,
-                dead_at=N - 1)
+                dead_at=N - 1, stage_at=stage_at)
 
 
 @pytest.fixture
@@ -104,30 +111,31 @@ def fast(monkeypatch):
     return fn
 
 
+@pytest.mark.parametrize('run', [False, True])
 @pytest.mark.parametrize('v3', [0, 2])
 @pytest.mark.parametrize('stall_mode', ['events', 'pickups', 'items', 'first'])
 @pytest.mark.parametrize('items', [False, True])
 @pytest.mark.parametrize('rewind_case', ['off', 'on', 'twice'])
 @pytest.mark.parametrize('nohit,hurt', [(False, False), (True, False), (True, True)])
-def test_fast_row_v9_equals_encode_row(fast, monkeypatch, v3, stall_mode, items, rewind_case, nohit, hurt):
+def test_fast_row_v9_equals_encode_row(fast, monkeypatch, run, v3, stall_mode, items, rewind_case, nohit, hurt):
     monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', v3)
     monkeypatch.setenv('ISAAC_RL_NOHIT', '1' if nohit else '0')
     monkeypatch.setattr(TO, 'FAST_ROW_CHECKING', True)
     for k_ in list(TO.FAST_STATS):
         TO.FAST_STATS[k_] = 0
     frame = VP.observation_frame_v3(_raw()) if v3 else None
-    sc = scenario(rewind_case, hurt)
+    sc = scenario(rewind_case, hurt, stage_at=24)   # (the next floor at 24: run -- EV_EXIT, handed back; a floor's end)
     rewind = rewind_case != 'off'
     pls = [payload(k, v3=bool(v3), frame=frame, **sc) for k in range(N)]
     # the reference: decode + encode_row on every record
-    dec_r, st_r = AL.LeanDecoder(), state(stall_mode, items, rewind)
+    dec_r, st_r = AL.LeanDecoder(), state(stall_mode, items, rewind, run)
     ref = np.zeros(N, TO.ROW)
     ref_done = []
     for k in range(N):
         ref_done.append(TO.encode_row(dec_r.decode(pls[k]), st_r, ref[k:k + 1], k))
     ref['first'] = [1] + [0] * (N - 1)
     # FastRow (two slots used in turn, as a worker does; copied out after each record)
-    dec, st = AL.LeanDecoder(), state(stall_mode, items, rewind)
+    dec, st = AL.LeanDecoder(), state(stall_mode, items, rewind, run)
     fr = TO.FastRow(fast, st, dec, 0, 0, 0)
     slots = np.zeros(2, TO.ROW)
     got = np.zeros(N, TO.ROW)
@@ -152,6 +160,8 @@ def test_fast_row_v9_equals_encode_row(fast, monkeypatch, v3, stall_mode, items,
     assert not diff, diff
     if rewind:
         assert fr.reasons.get(-11, 0) >= 1, tag   # the restore went through encode_row
+    if run:
+        assert fr.reasons.get(-8, 0) == 1 and int(got['events'][24]) & TO.EV_EXIT, tag   # the next floor: encode_row's
     if v3:
         assert TO.FAST_STATS['fast'] > 0 and int(got['visible_schema'][N // 2]) == VP.V3.VERSION
 
@@ -188,3 +198,43 @@ def test_fast_row_v9_trailing_bytes_handed_back(fast, monkeypatch):
     with pytest.raises(ValueError, match='trailing'):
         fr.encode(payload(1, v3=False, frame=None, **sc) + b'\0', row, row.ctypes.data, 1)
     assert fr.fast == 0 and fr.reasons.get(-1, 0) == 1
+
+
+def _seq(fast, monkeypatch, n, env_vis, mode, raw_block=None, frame=None):
+    monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', mode)
+    if env_vis:
+        monkeypatch.setenv('ISAAC_NO_VISIBLE', '1')
+    else:
+        monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
+    monkeypatch.setattr(TO, 'FAST_ROW_CHECKING', False)
+    sc = scenario('off', False)
+    pls = [payload(k, v3=frame is not None, frame=frame, raw_block=raw_block, **sc) for k in range(n)]
+    dec_r, st_r = AL.LeanDecoder(), state('events', False, False)
+    ref = np.zeros(n, TO.ROW)
+    for k in range(n):
+        TO.encode_row(dec_r.decode(pls[k]), st_r, ref[k:k + 1], k)
+    ref['first'] = [1] + [0] * (n - 1)
+    dec, st = AL.LeanDecoder(), state('events', False, False)
+    fr = TO.FastRow(fast, st, dec, 0, 0, 0)
+    got = np.zeros(n, TO.ROW)
+    for k in range(n):
+        s_ = got[k:k + 1]
+        fr.encode(dec.decode(pls[k]) if k == 0 else pls[k], s_, s_.ctypes.data, k)
+    bad = [nm for nm in TO.ROW.names if got[nm].tobytes() != ref[nm].tobytes()]
+    return fr, bad, got
+
+
+def test_fast_row_v9_visible_mode_1_raw_blocks_go_to_encode_row(fast, monkeypatch):
+    """(A1's review, B) a mode 1 worker: every record carries a raw v3 block (flag 32): the C path hands each back
+    (-13), the reference encoder writes the frame; the records equal encode_row's."""
+    fr, bad, got = _seq(fast, monkeypatch, 8, False, 1, raw_block=_raw())
+    assert not bad and fr.fast == 0 and fr.reasons.get(-13, 0) == 7, (bad, fr.reasons)
+    assert int(got['visible_schema'][3]) == VP.V3.VERSION
+
+
+def test_fast_row_v9_no_visible_writes_schema_0(fast, monkeypatch):
+    """(A1's review, B) ISAAC_NO_VISIBLE=1 (--obs-visible 0) in a v3 worker: the frames are not written (RC_VIS bit 1),
+    visible_schema 0, by the C path as by encode_row."""
+    fr, bad, got = _seq(fast, monkeypatch, 8, True, 2, frame=VP.observation_frame_v3(_raw()))
+    assert not bad and fr.fast == 7, (bad, fr.fast, fr.reasons)
+    assert int(got['visible_schema'][3]) == 0 and int(got['visible_bytes'][3]) == 0

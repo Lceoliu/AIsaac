@@ -85,7 +85,7 @@ from .abplus import ABP_HOME, FORK_ENV, action_code
 from .abplus_goexplore import GxConfig, Instance
 from .abplus_lean import LeanDecoder, read_lean, read_lean_raw
 from .env import BridgeError
-from .tok_obs import ROW, V3_FRAMES, EpisodeState, FastRow, encode_row, fast_row_function
+from .tok_obs import ROW, V3_FRAMES, EpisodeState, FastRow, encode_row, fast_counts, fast_row_function
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal
 from .visible_producer import fatal_active as VP_fatal_active
 
@@ -180,6 +180,11 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # step the native side handed back: a cancelled lethal hit); tok_obs.V3_FRAMES. (Before A28's two: 184's gate,
          # 2026-11-18 -- test_cf_per_clear.test_plumbing; every reader indexes by name, ST)
          'v3_native', 'v3_reference',
+         # (2026-11-20, the native ROW encoder version 9: tok_obs.fast_counts) this worker's FastRow records so far --
+         # fast (abp_row_encode), slow (decode + encode_row), and the slow ones by abp_row_encode's hand-back: a block
+         # (-2: map / inventory / a changed terrain), a room or floor change (-4 / -5 / -6 / -8), the visible check
+         # (-13), a rewind or the first checkpoint (-11 / -12), the rest (-1 / -3 / -7 / -14; a record never offered)
+         'fr_fast', 'fr_slow', 'fr_slow_block', 'fr_slow_room', 'fr_slow_vis', 'fr_slow_rewind', 'fr_slow_other',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
@@ -1218,6 +1223,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         episodes_left, episode_n, state_seed = 0, 0, None
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
+            mine[ST['fr_fast']:ST['fr_slow_other'] + 1] = fast_counts()
             if builder.stalled():   # the next start state's build hangs (training went on with the old one)
                 recover('stall')
             # the next start state: when this one has served its episodes and the next is built (training goes on with
