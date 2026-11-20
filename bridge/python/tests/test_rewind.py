@@ -418,3 +418,105 @@ def test_real_loops(name):
         net = sum(G ** (j - c - 1) * new[j - 1] for j in range(c + 1, k + 1))
         want = -0.002 * sum(G ** m for m in range(k - c))
         assert net == pytest.approx(want, abs=2e-5), (name, c, k, net, want)
+
+
+# ---- the user's two guarantees (2026-11-20, via the coordinator) ----
+# (The reward of a rewind lands, as every reward, on the decision its record closes: with the one-decision action lag
+#  the decision after the one that pressed the item button.)
+
+@pytest.mark.parametrize('interest', [1, 0])
+def test_user_req_u1_hurt_then_rewind_refunds_the_hurt(interest):
+    """U1: into B, hurt, nothing else, the hour glass: the rewind's reward at least the hurt's penalty (plan I: a
+    little more, the interest; plan P: equal, less the record's time term), the episode's hurt back to the checkpoint."""
+    b = Book(rewind=(interest, 0, 4.0))
+    b.rec(first=1)
+    b.rec(rewind=CK)
+    b.rec(hurt=2.0, units=4)                 # -1.5 (and its time)
+    hurt_before = float(b.book.hurt[0])
+    b.rec(rewind=1, units=6)
+    refund = b.rewards[-1] + 0.002           # (the rewind record's own time term kept)
+    assert hurt_before == 2.0 and float(b.book.hurt[0]) == 0.0
+    if interest:
+        assert refund == pytest.approx(1.5 * G ** -1, abs=1e-6) and refund > 1.5
+    else:
+        assert refund == pytest.approx(1.5, abs=1e-6)
+
+
+@pytest.mark.parametrize('interest', [1, 0])
+def test_user_req_u1_with_gains_in_the_room(interest):
+    """U1, a room where something was gained first: into B, 0.5 of its monsters' HP removed (damage +0.5), hurt
+    (-1.5), the hour glass: the rollback = the hurt refunded - the room's gains (each by its interest), here
+    1.5 / G - 0.5 / G^2 (plan I), 1.5 - 0.5 (plan P); with more gained than lost it is negative."""
+    for dmg, hurt in ((0.5, 2.0), (1.0, 0.5)):
+        b = Book(rewind=(interest, 0, 4.0))
+        b.rec(first=1)
+        b.rec(rewind=CK)
+        b.rec(damage=dmg)                        # +dmg
+        b.rec(hurt=hurt, units=6 - hurt)         # -0.75 hurt
+        b.rec(rewind=1, units=6)
+        back = b.rewards[-1] + 0.002
+        cd, ch = (G ** -2, G ** -1) if interest else (1.0, 1.0)
+        assert back == pytest.approx(0.75 * hurt * ch - dmg * cd, abs=1e-6), (dmg, hurt, back)
+        assert float(b.book.hurt[0]) == 0.0 and float(b.book.damage[0]) == 0.0
+    # (the second case: 1.0 gained, 0.375 lost -- the rollback is negative: what the user is asked to confirm)
+
+
+def test_user_req_u2_nohit_back_after_a_rewound_hurt(monkeypatch):
+    """U2 (worker): into B, hurt there (B loses its no-hit standing), the hour glass, into B again, cleared without a
+    hurt: EV_NOHIT on that clear -- the rewind restored B's standing with the hearts."""
+    monkeypatch.setenv('ISAAC_RL_NOHIT', '1')
+    w = Worker()
+    A, B = 84, 85
+    w.rec(A, True, rewinds=0)
+    w.rec(B, False, monsters_hp=30.0)
+    w.rec(B, False, monsters_hp=20.0, damage_taken=2.0)          # hurt in B
+    w.rec(A, True, rewinds=1, damage_taken=2.0)                  # rewound: the game's hearts back
+    w.rec(B, False, monsters_hp=30.0, damage_taken=2.0)
+    w.rec(B, False, monsters_hp=10.0, damage_taken=2.0)
+    ev = w.rec(B, True, monsters_hp=0.0, damage_taken=2.0)[0]
+    assert ev & TO.EV_CLEARED and ev & TO.EV_NOHIT
+
+
+def test_user_req_u2_variants(monkeypatch):
+    """U2 (a): B cleared without a hurt (EV_NOHIT), rewound, cleared again: EV_NOHIT again (the book cancelled the
+    first one), once -- a third clear in the same timeline gives none. (b) the hurt in an earlier visit of B, before
+    the checkpoint (out and in again): the rewind does not restore the standing (the game's hearts are not restored
+    either)."""
+    monkeypatch.setenv('ISAAC_RL_NOHIT', '1')
+    A, B = 84, 85
+    w = Worker()
+    w.rec(A, True, rewinds=0)
+    w.rec(B, False, monsters_hp=30.0)
+    w.rec(B, False, monsters_hp=10.0)
+    assert w.rec(B, True, monsters_hp=0.0)[0] & TO.EV_NOHIT        # the first no-hit clear
+    w.rec(A, True, rewinds=1)
+    w.rec(B, False, monsters_hp=30.0)
+    w.rec(B, False, monsters_hp=10.0)
+    assert w.rec(B, True, monsters_hp=0.0)[0] & TO.EV_NOHIT        # again, in the new timeline
+    w.rec(B, False, monsters_hp=5.0)
+    assert not w.rec(B, True, monsters_hp=0.0)[0] & TO.EV_NOHIT    # (once per room and timeline)
+    # (b)
+    w = Worker()
+    w.rec(A, True, rewinds=0)
+    w.rec(B, False, monsters_hp=30.0)
+    w.rec(B, False, monsters_hp=20.0, damage_taken=2.0)            # hurt in B, first visit
+    w.rec(A, True, damage_taken=2.0)                               # out (a checkpoint)
+    w.rec(B, False, monsters_hp=20.0, damage_taken=2.0)            # in again (a checkpoint: B already hurt in)
+    w.rec(A, True, rewinds=1, damage_taken=2.0)                    # rewound to that entry
+    w.rec(B, False, monsters_hp=20.0, damage_taken=2.0)
+    assert not w.rec(B, True, monsters_hp=0.0, damage_taken=2.0)[0] & TO.EV_NOHIT
+
+
+def test_user_req_u2_book_cancels_and_pays_nohit_once_per_timeline():
+    b = Book(rewind=(1, 0, 4.0), nohit=0.5)
+    b.rec(first=1)
+    b.rec(rewind=CK)
+    b.rec(events=EV_CLEARED | TO.EV_NOHIT)    # +1 room +0.5 nohit
+    assert b.rewards[-1] == pytest.approx(1.5 - 0.002) and int(b.book.counts[0, 2]) == 1
+    b.rec(rewind=1)
+    assert int(b.book.counts[0, 2]) == 0
+    b.rec(rewind=CK)
+    b.rec(events=EV_CLEARED | TO.EV_NOHIT)
+    assert b.rewards[-1] == pytest.approx(1.5 - 0.002)
+    fin = b.rec(done=2).book.finished[-1]
+    assert fin['nohit_rooms'] == 1 and fin['rooms'] == 1
