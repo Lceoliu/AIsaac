@@ -88,6 +88,20 @@ def real_rows(n, seed=0):
         VP.VISIBLE_V3_MODE = old
 
 
+@pytest.fixture(scope='module', autouse=True)
+def torch_pools():
+    """tok_policy.to_batch's first call starts torch's process-lifetime CPU pool (6 native threads when this file
+    runs alone; an earlier test starts it in the whole suite): started here, before any test's own thread check
+    (conftest.nothing_left_running), as conftest's session warm-up does for the pools it knows. No thread let off."""
+    try:
+        import torch
+    except ImportError:
+        return
+    from isaac_bridge import tok_policy as TP
+    rows = real_rows(2, seed=9)
+    TP.to_batch(rows, np.zeros((2, 5), np.int64), torch.device('cpu'))
+
+
 def stale_ring(shape, seed=1):
     """A ring whose slots hold earlier records with large frames and noise past them (a long-running ring)."""
     rng = np.random.default_rng(seed)
