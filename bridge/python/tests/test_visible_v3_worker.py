@@ -237,45 +237,42 @@ def test_needs_decode_by_the_payload():
 
 
 @pytest.mark.parametrize('m', [0, 2])
-def test_fastrow_never_lets_the_c_path_take_a_v3_payload(mode, monkeypatch, m):
-    """FastRow.encode on a raw payload with a v3 frame (flag 64) or raw block decodes it and hands the LeanObs to
-    encode_row, whatever the worker's own mode (before: decided by ISAAC_RL_VISIBLE_V3 at import, so a v2-configured
-    worker let abp_row_encode take the step and drop the frame). A payload without one goes to the C path only in a
-    v2 worker; a v3 worker sends it to encode_row too, whose check refuses it (2026-11-18, round 3)."""
+def test_fastrow_hands_what_the_c_path_returns_to_encode_row(mode, monkeypatch, m):
+    """(2026-11-20, abp_row_encode version 9: the C path takes a v3 frame itself, after the same checks as write_visible)
+    FastRow.encode gives every raw payload to the C path; whatever it hands back (a negative code: a raw v3 block, a
+    frame in a worker not configured for v3, a v3 worker's record without a frame, a frame it refuses) is decoded and
+    goes through encode_row, the reference, with its checks. Before (f3264e0 .. version 8): a v3 payload never reached
+    the C path."""
     mode(m)
     calls, slow = [], []
 
-    def fn(*a):
+    def fn(*a):   # (the C path's answer: hand back a payload with a v3 frame or raw block, take the others)
         calls.append(a)
-        return 0
+        return -13 if (a[0][12] & (32 | 64)) else 0
     monkeypatch.setattr(tok_obs, 'encode_row', lambda o, st, row, t: slow.append(o) or 0)
     fr = FastRow(fn, EpisodeState(1000), al.LeanDecoder())
     fr._ptrs = (1, 1, 1)   # (a grid as if the C path were set up)
     frame = VP.observation_frame_v3(RAW)
     row = np.zeros(1, ROW)
     for payload in (lean(raw=RAW, frame=frame), lean(frame=frame), lean(raw=RAW)):
+        fr._ptrs = (1, 1, 1)   # (a slow record resets them: _from_st)
         fr.encode(payload, row, row.ctypes.data, 1)
-    assert not calls and fr.slow == 3 and len(slow) == 3
+    assert len(calls) == 3 and fr.slow == 3 and len(slow) == 3 and fr.reasons == {-13: 3}
     assert slow[0].visible_v3_frame == frame and slow[1].visible_v3_frame == frame and slow[2].visible == RAW
-    fr._ptrs = (1, 1, 1)   # (a slow record resets them: _from_st)
-    fr.encode(lean(), row, row.ctypes.data, 2)   # no v3 in it: the C path in a v2 worker, encode_row in a v3 one
-    if m == 0:
-        assert len(calls) == 1 and fr.fast == 1
-    else:
-        assert not calls and fr.slow == 4 and slow[3].visible_v3_frame is None
-        monkeypatch.undo()   # the real encode_row: the v3 worker's check (undo resets the mode too: set again)
-        mode(m)
-        fr2 = FastRow(fn, EpisodeState(1000), al.LeanDecoder())
-        fr2._ptrs = (1, 1, 1)
-        with pytest.raises(VP.VisibleV3Fatal, match='no v3 frame'):
-            fr2.encode(lean(), np.zeros(1, ROW), row.ctypes.data, 2)
-        assert not calls
+    fr._ptrs = (1, 1, 1)
+    fr.encode(lean(), row, row.ctypes.data, 2)   # taken by the C path (in a v3 worker the real one hands it back)
+    assert len(calls) == 4 and fr.fast == 1
 
 
-def test_the_c_row_path_hands_a_v3_frame_back():
+def test_the_c_row_path_checks_a_v3_frame_as_write_visible():
     src = (PY.parent / 'engine' / 'abp_turbo.c').read_text(encoding='utf-8')
     at = src.index('int abp_row_encode(const unsigned char *pl')
-    assert 'if (flags & 64) return -9;' in src[at:at + 600]
+    body = src[at:at + 6000]
+    assert 'if (flags & 32) return -13;' in body and 'if (frame && !v3_mode) return -13;' in body
+    assert 're_v3_frame_ok(frame, frame_bytes, &bodies)' in body and '} else if (v3_mode) {' in body
+    ok = src[src.index('static int re_v3_frame_ok'):at]
+    for want in ('ABP_V3_MAGIC', 'ABP_V3_VERSION_WORD', 'ABP_V3_CAP_BODY', 'ABP_V3_CAP_ENTITY', 'nf != want'):
+        assert want in ok
 
 
 # ------------------------------------------------------------------ item 4: a short grid
@@ -509,13 +506,13 @@ def test_a_mode_0_worker_refuses_v3_records_before_the_row(mode, monkeypatch):
             write_visible(al.LeanDecoder().decode(payload), row)
         assert not isinstance(got.value, VP.VisibleV3Fatal)
         assert int(row['visible_schema'][0]) == 0 and int(row['visible_bytes'][0]) == 0
-    calls = []
-    fr = FastRow(lambda *a: calls.append(a) or 0, EpisodeState(1000), al.LeanDecoder())
+    calls = []   # (version 9: the C path hands a frame in a mode 0 worker back, -13; encode_row refuses it)
+    fr = FastRow(lambda *a: calls.append(a) or -13, EpisodeState(1000), al.LeanDecoder())
     fr._ptrs = (1, 1, 1)
     row = np.zeros(1, ROW)
     with pytest.raises(ValueError, match='not configured for v3'):
         fr.encode(lean(frame=good), row, row.ctypes.data, 1)
-    assert not calls and int(row['visible_schema'][0]) == 0
+    assert len(calls) == 1 and int(row['visible_schema'][0]) == 0
     mode(2)   # (a v3 worker writes the same valid frame)
     row = np.zeros(1, ROW)
     assert write_visible(al.LeanDecoder().decode(lean(frame=good)), row)
