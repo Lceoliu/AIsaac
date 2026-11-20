@@ -70,10 +70,11 @@ def main():
             b.close()
             b.unlink()
     out['torch_after_attach'] = 'torch' in sys.modules
-    obs = inputs['v2']   # 2. v2 visible frames (write_visible's write_frame)
+    obs = inputs['v2']   # 2. v2 visible frames (write_visible's write_frame; the native encoder when it loads)
     rows = np.zeros(len(obs), TO.ROW)
-    for j, o in enumerate(obs):
-        TO.write_visible(o, rows[j:j + 1])
+    dec = AL.LeanDecoder()
+    for j, pl in enumerate(obs):
+        TO.write_visible(dec.decode(pl), rows[j:j + 1])
     out['v2'] = digest(rows)
     out['v2_bytes'] = [int(v) for v in rows['visible_bytes']]
     VP.VISIBLE_V3_MODE = 2   # 3. v3 records: encode_row, then FastRow (the native encoder) when given its library

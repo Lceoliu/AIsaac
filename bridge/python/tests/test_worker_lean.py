@@ -38,30 +38,33 @@ def turbo_so():
 
 
 def probe_inputs(path):
-    """v2 observations (test_visible_review's packer world, entities varied) and 30 v3 lean payloads
-    (test_fast_row_v9's floor episode), pickled for the children."""
+    """Lean payloads, pickled for the children: 8 with a v2 visible block (flag 32; test_obs_v2_smoke's world,
+    entities varied, the terrain block on the first) and 30 v3 records (test_fast_row_v9's floor episode)."""
     pytest.importorskip('torch')   # (the test helpers below import it; the children never do)
+    import struct
     import test_fast_row_v9 as F
+    import test_obs_v2_smoke as V
+    from isaac_bridge import abplus_lean as AL
     from isaac_bridge import visible_producer as VP
-    from isaac_bridge.abplus_lean import ENTITY
-    from isaac_bridge.schema_v2 import P_FIELDS, SCHEMA
+    from isaac_bridge.schema_v2 import SCHEMA
     obs = []
-    for ne in (0, 3, 40, 170):
-        players = [dict.fromkeys(P_FIELDS, 0) for _ in range(2)]
-        for p in players:
-            p.update(hearts=6, max_hearts=8, soul=2, black=1, bone=1, eternal=1, golden=1)
-        players[1].update(x=20)
-        ents = np.zeros(ne, dtype=ENTITY)
-        ents['type'][:] = 10
-        ents['kind'][:] = 6
-        ents['x'] = np.arange(ne)[::-1]
-        obs.append(types.SimpleNamespace(
-            players=players, entities=ents, doors=[dict(x=0, y=0, open=1, locked=0, target_type=1, seen=3)],
-            grid=[(0, 17, 0, 0, 0, 0, 0)], room=[0, 0, 0, 0, 0, 7, 0, 0, 0, 0], map=[],
-            terrain=dict(width=1, height=1, cells=[(0, 0, 0, 0, 1, 1, 0, 0, 0, 0)]), visible_v3_frame=None,
-            visible=dict(schema=SCHEMA, stage=7, curses=(1 << 31) | 8 | 64, capabilities=1, inventory=[], slots=[],
-                         bodies=[dict(controller=i, controller_known=1, animation=0, animation_known=1)
-                                 for i in range(2)])))
+    for k in range(8):
+        p, d, e, room = V.world(0)   # (its first record's world; the entities varied)
+        e = np.resize(e, (0, 3, 9, 40, 1, 25, 64, 2)[k])
+        vis = json.dumps(dict(schema=SCHEMA, stage=3 + k, curses=8 if k % 2 else 0, capabilities=1, inventory=[],
+                              slots=[], bodies=[dict(controller=0, controller_known=1, animation=k % 3,
+                                                     animation_known=1) for _ in range(len(p))])).encode()
+        flags = 32 | (2 if k == 0 else 0)
+        out = struct.pack('<IIIBBBB', AL.MAGIC, 100 + 4 * k, 200 + 4 * k, flags, len(p), len(d), 0)
+        out += struct.pack('<iiiiiiiiffff', *room)
+        out += struct.pack('<dddd', 0.0, 30.0, 30.0, 1.0)
+        out += p.tobytes() + d.tobytes() + struct.pack('<H', len(e))
+        out += np.ascontiguousarray(e).view(np.uint8).reshape(len(e), AL.ENTITY.itemsize)[:, :148].tobytes()
+        if k == 0:
+            tj, gj = V.terrain_json()
+            out += struct.pack('<II', 7, len(tj)) + tj + struct.pack('<I', len(gj)) + gj
+        out += struct.pack('<I', len(vis)) + vis
+        obs.append(out)
     old = VP.VISIBLE_V3_MODE
     VP.VISIBLE_V3_MODE = 2
     try:
@@ -83,9 +86,17 @@ def run_probe(inputs, lean, so, *flags):
     return json.loads(lines[-1][len('LEAN_PROBE '):])
 
 
-def test_a_a_worker_holds_no_torch_and_writes_the_same_records(tmp_path):
-    inputs = tmp_path / 'inputs.pkl'
-    probe_inputs(inputs)
+@pytest.fixture(scope='module')
+def probe_pkl(tmp_path_factory):
+    """The children's inputs, built once per module (the helpers that build them import torch and may start its
+    pools: before the tests' own thread check, conftest.nothing_left_running)."""
+    path = tmp_path_factory.mktemp('lean') / 'inputs.pkl'
+    probe_inputs(path)
+    return path
+
+
+def test_a_a_worker_holds_no_torch_and_writes_the_same_records(probe_pkl):
+    inputs = probe_pkl
     so = turbo_so()
     new = run_probe(inputs, False, so, 'mp_main')
     old = run_probe(inputs, False, so, 'old')
