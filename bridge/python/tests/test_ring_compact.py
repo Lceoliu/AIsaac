@@ -84,20 +84,37 @@ def put_take(rows, compact, monkeypatch, ring_shape=(1, 8)):
     return np.stack(out)
 
 
+FIELDS = [n for n in ROW.names if n != 'visible_frame']
+
+
+def same_fields(x, y, k):
+    """Every fixed field of record k equal (field by field: the dtype's alignment padding is not a field)."""
+    return all(x[n][k].tobytes() == y[n][k].tobytes() for n in FIELDS)
+
+
 def test_a_records_taken_are_the_same_up_to_their_frame_end(monkeypatch):
+    """Every field and the frame up to visible_bytes: the same. Not the same, by design: (1) past visible_bytes the
+    whole-slot copy has the slot's stale bytes, compact mode zeros; (2) the dtype's alignment padding between fields:
+    the whole-slot write is a structured assignment (fields only: the slot keeps stale padding, as before this
+    change), the compact write copies the record's bytes (its own padding). No reader reads either (the consumers
+    below give the same results)."""
     rows = real_rows(24)
     whole = put_take(rows, False, monkeypatch)
     comp = put_take(rows, True, monkeypatch)
     bw, bc = whole.view(np.uint8).reshape(len(rows), -1), comp.view(np.uint8).reshape(len(rows), -1)
+    br = rows.view(np.uint8).reshape(len(rows), -1)
     for k in range(len(rows)):
         n = TO.row_frame_end(rows[k:k + 1])
         assert n < ROW.itemsize   # (real frames: far below the budget)
-        assert bw[k, :n].tobytes() == bc[k, :n].tobytes() == rows[k:k + 1].view(np.uint8)[:n].tobytes()
+        assert same_fields(whole, comp, k) and same_fields(rows, comp, k)
+        assert bw[k, ROW_FRAME_AT:n].tobytes() == bc[k, ROW_FRAME_AT:n].tobytes() == br[k, ROW_FRAME_AT:n].tobytes()
+        assert bc[k, :n].tobytes() == br[k, :n].tobytes()   # (compact: the record's own bytes, padding included)
         assert not bc[k, n:].any()   # compact: zeros past the frame end
     # the readers downstream: the trainer's compact chunks and the learner's batches
     cw, fw = TO.compact_copy(whole)
     cc, fc = TO.compact_copy(comp)
-    assert cw.tobytes() == cc.tobytes() and fw.tobytes() == fc.tobytes()
+    assert fw.tobytes() == fc.tobytes()
+    assert all(cw[n].tobytes() == cc[n].tobytes() for n in cw.dtype.names)
     torch = pytest.importorskip('torch')
     from isaac_bridge import tok_policy as TP
     pend = np.zeros((len(rows), 5), np.int64)
@@ -150,7 +167,8 @@ def test_b_full_wrapped_and_lagging_readers(monkeypatch):
         assert len(flat_t) == len(flat_v) == 5 + 8 + 8 + 8   # (worker 2: 8 of its 9, then 8 of its 12)
         for a, b in zip(flat_t, flat_v):
             n = TO.row_frame_end(a.reshape(1))
-            assert a.tobytes()[:n] == b.tobytes()[:n]
+            assert all(a[f].tobytes() == b[f].tobytes() for f in FIELDS)
+            assert a.tobytes()[ROW_FRAME_AT:n] == b.tobytes()[ROW_FRAME_AT:n]
             if compact:
                 assert not np.frombuffer(b.tobytes()[n:], np.uint8).any()
 
@@ -179,8 +197,10 @@ def test_c_another_process_writes_and_the_tail_stays_unresident(monkeypatch):
             os.waitpid(pid, 0)
             taken = [TO.ring_take(ring[w, j:j + 1]) for w in range(W) for j in range(R)]
             for i, a in enumerate(taken):
-                n = TO.row_frame_end(rows[i % R:i % R + 1])
-                assert a.tobytes()[:n] == rows[i % R:i % R + 1].tobytes()[:n]
+                src = rows[i % R:i % R + 1]
+                n = TO.row_frame_end(src)
+                assert all(a[f].tobytes() == src[f][0].tobytes() for f in FIELDS)
+                assert a.tobytes()[ROW_FRAME_AT:n] == src.tobytes()[ROW_FRAME_AT:n]
             rss = 0
             name = '/dev/shm/' + shm.name.lstrip('/')
             cur = None
