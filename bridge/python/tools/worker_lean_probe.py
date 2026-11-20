@@ -1,7 +1,8 @@
 """(2026-11-20, the memory ledger: ISAAC_RL_WORKER_LEAN) Real floor workers (their games, the training's teacher config:
 death teaching, the search thread and its forks) played with random actions on the CPU, the switch off or on: each
-worker's private memory and whether it maps libtorch, sampled while they play; the records; any fatal (a worker that
-loaded torch with the switch on ends the run: WorkerTorchFatal). No learner, no GPU, nothing written but <out>.
+worker's private memory and whether it maps libtorch, sampled while they play; the records; the workers' torch_held
+count; any fatal (with the switch on, a worker that confirms torch at its start ends the run). No learner, no GPU,
+nothing written but <out>.
 
 usage (bridge python dir, PYTHONPATH=.; the CPU runner adds --groups-file / --out):
   python tools/worker_lean_probe.py --groups-file ../abplus/catalog/scaling2_groups.json --out <dir> --lean 0|1
@@ -79,6 +80,7 @@ def main():
                 next_sample += 15.0
                 res['samples'].append([worker_memory(p.pid) for p in sampler.procs])
         res['teach_records'] = int(sampler.stats[:, sampler_st('teach')].sum())
+        res['torch_held'] = int(sampler.stats[:, sampler_st('torch_held')].sum())
     finally:
         try:
             sampler.close(timeout=20.0)
