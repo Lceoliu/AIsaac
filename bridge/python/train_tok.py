@@ -698,6 +698,7 @@ def merge_jobs(halves):
     j['collect_actors'] = ' '.join(f"{h.get('collect_s', 0.0):.3f}" for h in halves)
     j['prof'], j['worker'], j['lane_stat'] = sum_dict('prof'), sum_dict('worker'), sum_dict('lane_stat')
     j['ring_skips'] = sum_dict('ring_skips')   # (Codex round 26: every actor's rings, not the first actor's only)
+    j['worker_torch'] = sum(h.get('worker_torch', 0) for h in halves)   # (every actor's workers holding torch)
     j['stats'] = np.concatenate([h['stats'] for h in halves])
     j['teach'], j['v2'], j['choices'] = cat_rec('teach'), cat_rec('v2'), cat_rec('choices')
     j['cpu_collect'] = float(np.mean([h.get('cpu_collect', 0.0) for h in halves]))
@@ -5576,6 +5577,7 @@ def main(argv=None, child=None, actor=None):
         # open: a second writer, or a write that failed midway: report it)
         for k_r, v_r in (job.get('ring_skips') or {}).items():
             row[f'ring_{k_r}'] = v_r
+        row['worker_torch'] = job.get('worker_torch', 0)   # (the memory ledger: workers holding torch; alarm > 0)
         if args.frame == 'v3':   # (seq-v1 step 3) the actor's host side of the v3 calls (this process), this update
             from isaac_bridge import v3_input as VI_
             tot3 = VI_.stats_snapshot()   # (A-2: with the actors' device counters)
@@ -6997,8 +6999,8 @@ def main(argv=None, child=None, actor=None):
                        choices=sampler.choice_records() if branching else None,
                        v2=sampler.v2_records(with_h=mem_on, with_t=t_on,with_block=block_on) if v2_on else None,
                        ring_skips=dict(sampler.ring_skips,   # (Codex round 25: after both reads above; totals)
-                                       open_busy=float(sampler.stats[:, ST['ring_open_busy']].sum()),
-                                       workers_torch=float(sampler.stats[:, ST['torch_held']].sum())),
+                                       open_busy=float(sampler.stats[:, ST['ring_open_busy']].sum())),
+                       worker_torch=int(sampler.stats[:, ST['torch_held']].sum()),   # (workers holding torch now)
                        branch_finished=book.branch_finished, broken=book.broken, broken_total=book.broken_total,
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,

@@ -193,7 +193,7 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # the same worker's ring (the single-writer rule broken), or the previous attempt at this record failed midway
          'ring_open_busy',
          # (the memory ledger) 1 while this worker process holds torch (it should not: tok_obs.WORKER_LEAN's note; the
-         # workers' loop check sets it, progress workers_torch is the count)
+         # workers' loop check sets it, progress worker_torch is the count)
          'torch_held',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
@@ -1366,7 +1366,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         episodes_left, episode_n, state_seed = 0, 0, None
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
-            mine[ST['torch_held']] = TO_.check_worker_torch(index)   # (ISAAC_RL_WORKER_LEAN on: torch ends the run)
+            mine[ST['torch_held']] = TO_.check_worker_torch(index)   # (warned once, counted; never the run's end)
             mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()
             if builder.stalled():   # the next start state's build hangs (training went on with the old one)
                 recover('stall')
@@ -1973,8 +1973,7 @@ class TokSampler:
         another one if its cleanup failed): self.fatal, with the reason (from the pipe, else the file) or a plain
         statement that none reached the parent."""
         # (mode 0: never, as 05f1622 -- unless --rewind 1: a worker's missing restore count, tok_floor.RewindFatal)
-        if self.fatal is not None or not (VP_fatal_active() or getattr(self.cfg, 'rewind', 0) or TO_.FAST_ROW or
-                                          TO_.WORKER_LEAN):
+        if self.fatal is not None or not (VP_fatal_active() or getattr(self.cfg, 'rewind', 0) or TO_.FAST_ROW):
             return
         p = self.procs[i]
         code = p.exitcode

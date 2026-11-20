@@ -200,9 +200,10 @@ RING_COMPACT = os.environ.get('ISAAC_RL_RING_COMPACT', '0') == '1'
 # that re-exports them -- tok_sampler.attach's VERSION, write_visible's write_frame, visible_native's VERSION /
 # FRAME_BYTES / SCHEMA / observation_frame -- now taken from their own torch-free modules (schema_v2, visible_producer:
 # the same objects), and splitmix64's finaliser lives here (mix64). Every worker reports whether it holds torch with its
-# ring confirmation (the trainer logs how many do). ISAAC_RL_WORKER_LEAN=1 (default off) enforces it: the trainer
-# refuses a worker holding torch (or of the other setting) and a worker that loads it later ends the run
-# (WorkerTorchFatal). The trainer and the learner load torch as before. (tests/test_worker_lean.py)
+# ring confirmation (the trainer logs how many do) and in its loop (stats torch_held, progress worker_torch, a warning
+# line: never the run's end). ISAAC_RL_WORKER_LEAN=1 (default off) enforces it at the start: the trainer refuses a
+# worker holding torch (or of the other setting) before any sampling. The trainer and the learner load torch as
+# before. (tests/test_worker_lean.py)
 WORKER_LEAN = os.environ.get('ISAAC_RL_WORKER_LEAN', '0') == '1'
 
 
@@ -976,21 +977,21 @@ def _address(b):
     return ctypes.cast(ctypes.c_char_p(b), ctypes.c_void_p).value
 
 
-class WorkerTorchFatal(_VP.VisibleV3Fatal):
-    """(2026-11-20, ISAAC_RL_WORKER_LEAN) A sampler worker that was to run without torch has loaded it: the run stops
-    (the worker ends with V3_FATAL_EXIT, the trainer fails), never runs on with the memory it was to save."""
-    always_fatal = True
+_TORCH_WARNED = []
 
 
 def check_worker_torch(index):
-    """1 when this worker process holds torch (its stats torch_held, the trainer's progress workers_torch), else 0;
-    with ISAAC_RL_WORKER_LEAN on, WorkerTorchFatal instead of 1. Cheap (one dict lookup): the workers call it every
-    loop."""
+    """1 when this worker process holds torch (its stats torch_held; the trainer's progress worker_torch counts the
+    workers), else 0; the first time, a warning line with the worker's index. Never the run's end (the coordinator:
+    a memory cost, not a data error -- an arm stopped would resume with its buffers emptied); the start's check with
+    ISAAC_RL_WORKER_LEAN on (tok_sampler.confirm_rings) refuses before any sampling. Cheap (one dict lookup): the
+    workers call it every loop."""
     if 'torch' not in sys.modules:
         return 0
-    if WORKER_LEAN:
-        raise WorkerTorchFatal(f'tok worker {index}: torch was loaded in a worker started with ISAAC_RL_WORKER_LEAN=1 '
-                               f'(a worker-side import of a torch module: the run stops instead of running heavier)')
+    if not _TORCH_WARNED:
+        _TORCH_WARNED.append(1)
+        print(f'tok worker {index}: WARNING torch was loaded in this worker process (a worker-side import of a torch '
+              f'module: about 220 MB more; progress worker_torch)', file=sys.stderr, flush=True)
     return 1
 
 

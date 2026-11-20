@@ -143,14 +143,16 @@ def test_c_confirmation_values():
     assert 'torch loaded' in TS.ring_ack_text(TS.ring_ack_value(False, True, True))
 
 
-def test_c_loop_check(monkeypatch):
+def test_c_loop_check(monkeypatch, capfd):
+    """Torch loaded in a running worker: counted (stats torch_held) and warned once with the worker's index, the
+    switch on or off -- never the run's end (the coordinator)."""
     monkeypatch.setitem(sys.modules, 'torch', types.ModuleType('torch'))
-    monkeypatch.setattr(TO, 'WORKER_LEAN', False)
-    assert TO.check_worker_torch(3) == 1   # (switch off: counted, stats torch_held)
-    monkeypatch.setattr(TO, 'WORKER_LEAN', True)
-    with pytest.raises(TO.WorkerTorchFatal, match='tok worker 3: torch was loaded') as e:
-        TO.check_worker_torch(3)
-    assert e.value.always_fatal
+    monkeypatch.setattr(TO, '_TORCH_WARNED', [])
+    for lean in (False, True):
+        monkeypatch.setattr(TO, 'WORKER_LEAN', lean)
+        assert TO.check_worker_torch(3) == 1
+    err = capfd.readouterr().err
+    assert err.count('tok worker 3: WARNING torch was loaded') == 1
     monkeypatch.delitem(sys.modules, 'torch')
     assert TO.check_worker_torch(3) == 0
     assert 'torch_held' in TS.ST and TS.STATS[-2:] == ('np_runs', 'np_removed')
