@@ -274,7 +274,18 @@ trash() {
 
 # gpus_free <g[,g...]>: every listed GPU without another process (memory used under BM1_GPU_FREE_MB, default 500 MiB,
 # and no compute process); a busy GPU is logged and the caller exits 4 (shared hosts: never start on a used card)
+# (2026-11-20, A1 / the coordinator: seq2's evaluation beside its learner on our GPU 2) BM1_GPU_SHARE_WITH=<container>,
+# for one job's command only, default empty -- empty: exactly the check below. Set: it must name a running container
+# called aisaac-bench-*, and every compute process on each listed GPU must belong to it (its id in the process's
+# /proc/<pid>/cgroup); a process of anyone else, a nvidia-smi call that fails or times out, an output that does not
+# parse: refused (exit 4, fails closed). Only the "no compute process" condition is relaxed: the memory threshold
+# BM1_GPU_FREE_MB still holds (set it for that job). gpu_forbid (the forbidden devices, BM1_GPUS_OK) runs before this
+# in run.sh and is not touched. BM1_PROC: /proc (tests only).
 gpus_free() {
+  if [ -n "${BM1_GPU_SHARE_WITH:-}" ]; then
+    gpus_shared "$1"
+    return
+  fi
   for g in $(echo "$1" | tr ',' ' '); do
     m=$(smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
     p=$(smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -c . || true)
@@ -282,6 +293,30 @@ gpus_free() {
       log "GPU $g BUSY (memory used ${m:-?} MiB, ${p} compute process(es)): not started"
       exit 4
     fi
+  done
+}
+
+gpus_shared() {
+  c_=$BM1_GPU_SHARE_WITH
+  no_() { log "GPU SHARE REFUSED (with $c_): $*: not started"; printf 'bm1: GPU share refused: %s\n' "$*" >&2; exit 4; }
+  case "$c_" in aisaac-bench-?*) ;; *) no_ "not an aisaac-bench-* container name" ;; esac
+  case "$c_" in *[!a-zA-Z0-9_.-]*) no_ "invalid container name" ;; esac
+  id_=$(docker inspect -f '{{if .State.Running}}{{.Id}}{{end}}' "$c_" 2>/dev/null) || no_ "no such container"
+  case "$id_" in '') no_ "the container is not running" ;; *[!0-9a-f]*) no_ "its id does not parse" ;; esac
+  [ ${#id_} -ge 12 ] || no_ "its id does not parse"
+  for g in $(echo "$1" | tr ',' ' '); do
+    m=$(smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null) || no_ "GPU $g: nvidia-smi failed (memory)"
+    m=$(printf '%s' "$m" | tr -d ' ')
+    case "$m" in '' | *[!0-9]*) no_ "GPU $g: memory used does not parse" ;; esac
+    [ "$m" -lt "${BM1_GPU_FREE_MB:-500}" ] || no_ "GPU $g: memory used $m MiB >= ${BM1_GPU_FREE_MB:-500}"
+    pids_=$(smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null) || no_ "GPU $g: nvidia-smi failed (processes)"
+    n_=0
+    for pid_ in $(printf '%s\n' "$pids_" | tr -d ' '); do
+      case "$pid_" in *[!0-9]*) no_ "GPU $g: a process id does not parse" ;; esac
+      grep -qF "$id_" "${BM1_PROC:-/proc}/$pid_/cgroup" 2>/dev/null || no_ "GPU $g: process $pid_ is not $c_'s"
+      n_=$((n_ + 1))
+    done
+    log "GPU $g SHARED with $c_ (memory used $m MiB < ${BM1_GPU_FREE_MB:-500}, $n_ compute process(es), all its own)"
   done
 }
 
