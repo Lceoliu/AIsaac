@@ -39,7 +39,24 @@ if [ "$BM1_MODE" = docker ]; then
   EV=""; for kv in $KV; do EV="$EV -e $kv"; done
   PP=${PYTHONPATH_EXTRA:-$BM1_PYTHONPATH}
   lock_container "$BM1_NAME-$P"   # (the lock this job runs under stays held while its container runs)
-  exec docker run --rm --init --name "$BM1_NAME-$P" --runtime=nvidia --network none \
+  # (2026-11-20, Codex round 27) BM1_GPU_SHARE_WITH: the occupancy checked again right before the start (narrows the
+  #  window between the check and the start; no lease covers it -- common.sh's known deviation)
+  [ -z "${BM1_GPU_SHARE_WITH:-}" ] || gpus_free "$DEVICES"
+  # (2026-11-20, Codex round 27) every container this runner starts is registered: $BM/containers.reg, one line
+  #  "<date> <time> <name> <full id>" from docker's --cidfile (the registry gpus_shared requires of a shared container)
+  CIDF=$(mktemp -u "$R/.cid-$P-XXXXXX")
+  ( i_=0
+    while [ $i_ -lt 600 ]; do
+      if [ -s "$CIDF" ]; then
+        c_=$(cat "$CIDF")
+        case "$c_" in *[!0-9a-f]*) ;; *) [ ${#c_} -eq 64 ] && \
+          printf '%s %s %s\n' "$(date '+%F %T')" "$BM1_NAME-$P" "$c_" >> "$BM/containers.reg" ;; esac
+        break
+      fi
+      sleep 0.2; i_=$((i_ + 1))
+    done
+    rm -f "$CIDF" ) &
+  exec docker run --rm --init --cidfile "$CIDF" --name "$BM1_NAME-$P" --runtime=nvidia --network none \
     ${BM1_CPUSET:+--cpuset-cpus "$BM1_CPUSET"} ${BM1_MEMS:+--cpuset-mems "$BM1_MEMS"} \
     ${BM1_MEM:+--memory "$BM1_MEM" --memory-swap "$BM1_MEM"} --shm-size 8g --pids-limit "$BM1_PIDS" \
     --log-opt max-size=10m --log-opt max-file=2 --read-only --tmpfs /tmp:rw,exec,size=4g \

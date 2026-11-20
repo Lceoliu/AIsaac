@@ -139,3 +139,19 @@ bm1 是 2026-11-11 从租用的 4090 单卡机移植过来的（4090 当天到�
 - 4090 只采本卡的 `<tag>.gpu`；bm1 另外采全部 GPU 和 mpstat，用来判断有没有被其他租户污染。
 
 迁移和各轮计时的数字见 EXPERIMENTS.md 的"BM1 8x3090 环境"到"BM1 C"各节。
+
+## Sharing one of our GPUs with our own running container (BM1_GPU_SHARE_WITH, 2026-11-20)
+
+`gpus_free` (common.sh) refuses a GPU with any compute process. `BM1_GPU_SHARE_WITH=<container>`, set in one job's
+command only (default empty: the check unchanged), lets that job start beside the named container: the container must
+be running and registered in `containers.reg` (run.sh appends `<date> <time> <name> <full id>` for every container it
+starts, from docker's `--cidfile`; a container started before 2026-11-20 is registered by hand, with a bm1.log line),
+and every compute process on each requested GPU must be inside that container's cgroup (host `/proc/<pid>/cgroup`,
+whole path components: `/docker/<id>` or `/system.slice/docker-<id>.scope`, or below). Docker mode, on the host itself
+only; every failure refuses (exit 4). `BM1_GPU_FREE_MB` still applies; `gpu_forbid` (forbidden devices, `BM1_GPUS_OK`)
+runs before and is untouched. Tests: `test_gpu_share.sh` (stubs only).
+
+Known deviations (Codex round 27, the coordinator's ruling): (1) another tenant can take the card between the check
+and the start -- no lease shared by every tenant exists on this host; run.sh checks again right before `docker run`
+when the switch is set, which narrows the window only; (2) an occupancy nvidia-smi does not list as a compute process
+(graphics, MPS clients) is bounded by the memory threshold only, not attributed.

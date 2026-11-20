@@ -274,17 +274,24 @@ trash() {
 
 # gpus_free <g[,g...]>: every listed GPU without another process (memory used under BM1_GPU_FREE_MB, default 500 MiB,
 # and no compute process); a busy GPU is logged and the caller exits 4 (shared hosts: never start on a used card)
-# (2026-11-20, A1 / the coordinator: seq2's evaluation beside its learner on our GPU 2) BM1_GPU_SHARE_WITH=<container>,
-# for one job's command only, default empty -- empty: exactly the check below. Set: it must name a running container
-# called aisaac-bench-*, and every compute process on each listed GPU must belong to it (its id in the process's
-# /proc/<pid>/cgroup); a process of anyone else, a nvidia-smi call that fails or times out, an output that does not
-# parse: refused (exit 4, fails closed). Only the "no compute process" condition is relaxed: the memory threshold
-# BM1_GPU_FREE_MB still holds (set it for that job). gpu_forbid (the forbidden devices, BM1_GPUS_OK) runs before this
-# in run.sh and is not touched. BM1_PROC: /proc (tests only).
+# (2026-11-20, A1 / the coordinator; Codex round 27) BM1_GPU_SHARE_WITH=<container>, set for one job's command only,
+# default empty -- empty: exactly the check below, unchanged. Set (docker mode, on the host itself): the container must
+# be running, be registered in $BM/containers.reg (run.sh appends every container it starts: time, name, full id) with
+# its exact 64-hex id, and every compute process on each requested GPU must be inside that container's cgroup (every
+# line of the process's host /proc/<pid>/cgroup: the path /docker/<id> or /system.slice/docker-<id>.scope, or a path
+# below it -- a whole path component, never a substring); a process of anyone else, any query that fails or times out,
+# any output that does not parse, an empty device list: refused (exit 4, fails closed; the reason on stderr even when
+# bm1.log cannot be written). Only the "no compute process" condition is relaxed: the memory threshold BM1_GPU_FREE_MB
+# still holds (set it for that job). gpu_forbid (the forbidden devices, BM1_GPUS_OK) runs before this in run.sh and is
+# not touched; called on its own, gpus_free / gpus_shared only check occupancy, never the device rules.
+# Known deviations (README): (1) between the last check and the start another tenant may take the card -- no lease
+# shared by every tenant exists on this host; run.sh checks again right before docker run when the switch is set,
+# which narrows the window, not closes it; (2) an occupancy nvidia-smi does not list as a compute process (graphics, MPS
+# clients) is only bounded by the memory threshold, not attributed.
 gpus_free() {
   if [ -n "${BM1_GPU_SHARE_WITH:-}" ]; then
-    gpus_shared "$1"
-    return
+    gpus_shared "$1" || exit $?
+    return 0
   fi
   for g in $(echo "$1" | tr ',' ' '); do
     m=$(smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | tr -d ' ')
@@ -296,29 +303,66 @@ gpus_free() {
   done
 }
 
-gpus_shared() {
+# (gpus_shared's sources of evidence; the tests replace these two in their own copy of this file only)
+share_proc_cgroup() { cat "/proc/$1/cgroup"; }
+share_on_host() { [ ! -e /.dockerenv ] && [ ! -e /run/.containerenv ]; }
+
+gpus_shared() (
+  set -f
   c_=$BM1_GPU_SHARE_WITH
-  no_() { log "GPU SHARE REFUSED (with $c_): $*: not started"; printf 'bm1: GPU share refused: %s\n' "$*" >&2; exit 4; }
+  no_() {
+    log "GPU SHARE REFUSED (with $c_): $*: not started" 2>/dev/null || true
+    printf 'bm1: GPU share refused: %s\n' "$*" >&2
+    exit 4
+  }
+  [ "${BM1_MODE:-}" = docker ] || no_ "docker mode only"
+  share_on_host || no_ "not on the host itself (inside a container: nvidia-smi's pids are not this /proc's)"
   case "$c_" in aisaac-bench-?*) ;; *) no_ "not an aisaac-bench-* container name" ;; esac
   case "$c_" in *[!a-zA-Z0-9_.-]*) no_ "invalid container name" ;; esac
-  id_=$(docker inspect -f '{{if .State.Running}}{{.Id}}{{end}}' "$c_" 2>/dev/null) || no_ "no such container"
+  id_=$(timeout "${BM1_SMI_TIMEOUT:-20}" docker inspect -f '{{if .State.Running}}{{.Id}}{{end}}' "$c_" 2>/dev/null) \
+    || no_ "docker inspect failed (no such container, or timed out)"
   case "$id_" in '') no_ "the container is not running" ;; *[!0-9a-f]*) no_ "its id does not parse" ;; esac
-  [ ${#id_} -ge 12 ] || no_ "its id does not parse"
-  for g in $(echo "$1" | tr ',' ' '); do
-    m=$(smi -i $g --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null) || no_ "GPU $g: nvidia-smi failed (memory)"
-    m=$(printf '%s' "$m" | tr -d ' ')
+  [ ${#id_} -eq 64 ] || no_ "its id is not a full 64-hex id"
+  reg_="$BM/containers.reg"
+  [ -f "$reg_" ] || no_ "no container registry ($reg_)"
+  awk -v n="$c_" -v i="$id_" 'NF == 4 && $3 == n && $4 == i { f = 1 } END { exit !f }' "$reg_" \
+    || no_ "$c_ ($id_) is not registered in $reg_"
+  devs_=$(printf '%s\n' "$1" | tr ',' '\n') || no_ "the device list does not parse"
+  [ -n "$devs_" ] || no_ "empty device list"
+  n_dev_=0
+  while IFS= read -r g; do
+    case "$g" in '' | *[!a-zA-Z0-9-]*) no_ "a device in the list does not parse" ;; esac
+    m=$(smi -i "$g" --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null < /dev/null) || no_ "GPU $g: nvidia-smi failed (memory)"
+    m=$(printf '%s\n' "$m" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
     case "$m" in '' | *[!0-9]*) no_ "GPU $g: memory used does not parse" ;; esac
     [ "$m" -lt "${BM1_GPU_FREE_MB:-500}" ] || no_ "GPU $g: memory used $m MiB >= ${BM1_GPU_FREE_MB:-500}"
-    pids_=$(smi -i $g --query-compute-apps=pid --format=csv,noheader 2>/dev/null) || no_ "GPU $g: nvidia-smi failed (processes)"
+    pids_=$(smi -i "$g" --query-compute-apps=pid --format=csv,noheader 2>/dev/null < /dev/null) || no_ "GPU $g: nvidia-smi failed (processes)"
     n_=0
-    for pid_ in $(printf '%s\n' "$pids_" | tr -d ' '); do
-      case "$pid_" in *[!0-9]*) no_ "GPU $g: a process id does not parse" ;; esac
-      grep -qF "$id_" "${BM1_PROC:-/proc}/$pid_/cgroup" 2>/dev/null || no_ "GPU $g: process $pid_ is not $c_'s"
-      n_=$((n_ + 1))
-    done
-    log "GPU $g SHARED with $c_ (memory used $m MiB < ${BM1_GPU_FREE_MB:-500}, $n_ compute process(es), all its own)"
-  done
-}
+    if [ -n "$pids_" ]; then
+      lines_=$(printf '%s\n' "$pids_" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') || no_ "GPU $g: the process list does not parse"
+      while IFS= read -r pid_; do
+        case "$pid_" in '' | *[!0-9]*) no_ "GPU $g: a process id does not parse ($pid_)" ;; esac
+        cg_=$(share_proc_cgroup "$pid_" 2>/dev/null) || no_ "GPU $g: process $pid_ has no readable cgroup"
+        [ -n "$cg_" ] || no_ "GPU $g: process $pid_ has no readable cgroup"
+        printf '%s\n' "$cg_" | awk -v i="$id_" '
+          { p = $0; sub(/^[^:]*:[^:]*:/, "", p)
+            ok = (p == "/docker/" i || index(p, "/docker/" i "/") == 1 ||
+                  p == "/system.slice/docker-" i ".scope" || index(p, "/system.slice/docker-" i ".scope/") == 1)
+            if (!ok) bad = 1; n++ }
+          END { exit (bad || n == 0) }' || no_ "GPU $g: process $pid_ is not inside $c_'s cgroup"
+        n_=$((n_ + 1))
+      done <<EOF_PIDS
+$lines_
+EOF_PIDS
+    fi
+    log "GPU $g SHARED with $c_ (memory used $m MiB < ${BM1_GPU_FREE_MB:-500}, $n_ compute process(es), all its own)" \
+      2>/dev/null || true
+    n_dev_=$((n_dev_ + 1))
+  done <<EOF_DEVS
+$devs_
+EOF_DEVS
+  [ "$n_dev_" -gt 0 ] || no_ "no device checked"
+)
 
 # host_snapshot <label>: every GPU's memory / utilisation, the load average and the five busiest processes, one bm1.log
 # line (a timed run's start and end: a run disturbed by other tenants can be told)
