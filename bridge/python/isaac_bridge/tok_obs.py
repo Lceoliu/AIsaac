@@ -1158,6 +1158,9 @@ class FastRow:
 FAST_STATS = dict(fast=0, slow=0, check_records=0, check_mismatch=0)
 _CHECK_DUMPS = [0]
 _CHECK_LAST = [0.0]
+if FAST_ROW_CHECKING:   # (the last counts at the worker's normal exit too)
+    import atexit as _atexit
+    _atexit.register(lambda: _check_report(True))
 
 
 def _same(a, b):
