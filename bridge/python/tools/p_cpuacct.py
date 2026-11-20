@@ -16,7 +16,9 @@ Roles:
   other:<comm>        everything else under the trainer
 'unattributed' (3b): the lane's busy CPU (/proc/stat) split into the threads sampled, the container's own CPU the
 sampler missed (its cgroup's cpu.stat minus the sampled) and the CPU outside the container (the rest); the
-descendants born / exited per second by kind and the host's forks per second. 'trainer_learner_threads': each
+descendants born / exited per second by kind and the host's forks per second; 'faults': minor / major page faults per
+second by kind (live processes, their reaped children, the children reaped above the trainer -- the orphaned clones),
+and the container's kernel time per 1000 minor faults (an upper bound of one fault's cost: all kernel time counted). 'trainer_learner_threads': each
 thread of the trainer and the learner process (CPU over the window, mask at the end, on_worker_cpus: its mask reaches
 CPUs outside the trainer's and the learner's main threads' masks); 'on_worker_cpus_cores' sums those by process.
 Per role: cores (CPU seconds / window seconds), processes / threads seen; for the trainer's and the learner's threads,
@@ -55,7 +57,8 @@ def stat_of(path):
     r = s.rfind(')')
     f = s[r + 2:].split()
     return dict(comm=s[s.find('(') + 1:r], state=f[0], ppid=int(f[1]), ticks=int(f[11]) + int(f[12]),
-                cpu=int(f[36]) if len(f) > 36 else -1, cticks=int(f[13]) + int(f[14]))
+                cpu=int(f[36]) if len(f) > 36 else -1, cticks=int(f[13]) + int(f[14]),
+                minflt=int(f[7]), cminflt=int(f[8]), majflt=int(f[9]), cmajflt=int(f[10]))
 
 
 def cpu_stat():
@@ -253,6 +256,10 @@ def main():
     cg0 = cg1 = fk0 = fk1 = None
     anc = container_ancestors(root)   # (3b: the orphans' reaper and the wrappers between it and the trainer)
     anc0 = anc1 = None
+    ancf0 = ancf1 = None
+    flt_last = {}        # (page faults) pid -> (minflt, majflt, cminflt, cmajflt) at the sample before
+    flt_acc = {}         # kind -> [minor, major] faults of live processes within the window
+    cflt_acc = {}        # kind -> [minor, major] faults of their reaped children within the window
     alive = None         # (3b) the descendants at the sample before: births / exits within the window by kind
     born, gone = {}, {}
     procs_seen = {}      # pid -> (kind, comm)
@@ -269,11 +276,13 @@ def main():
             cs0 = cpu_stat()
             cg0, fk0 = cg_stat(root), host_forks()
             anc0 = {q: (stat_of(f'/proc/{q}/stat') or {}).get('cticks') for q in anc}
+            ancf0 = {q: (stat_of(f'/proc/{q}/stat') or {}).get('cminflt') for q in anc}
         if open_ and n_rows >= a.to_update:
             t1 = time.time()
             cs1 = cpu_stat()
             cg1, fk1 = cg_stat(root), host_forks()
             anc1 = {q: (stat_of(f'/proc/{q}/stat') or {}).get('cticks') for q in anc}
+            ancf1 = {q: (stat_of(f'/proc/{q}/stat') or {}).get('cminflt') for q in anc}
             break
         if not os.path.exists(f'/proc/{root}'):
             break
@@ -304,6 +313,16 @@ def main():
                 kinds[pid] = kind   # (fixed once its CUDA threads exist; a python process without them re-checked)
             cp_ = clast.get(pid)
             clast[pid] = st['cticks']
+            f_now = (st['minflt'], st['majflt'], st['cminflt'], st['cmajflt'])
+            f_prev = flt_last.get(pid)
+            flt_last[pid] = f_now
+            if open_ and f_prev is not None:   # (the page faults: a fork's copy-on-write ones among the minor)
+                a_ = flt_acc.setdefault(kind, [0, 0])
+                a_[0] += max(0, f_now[0] - f_prev[0])
+                a_[1] += max(0, f_now[1] - f_prev[1])
+                c_ = cflt_acc.setdefault(kind, [0, 0])
+                c_[0] += max(0, f_now[2] - f_prev[2])
+                c_[1] += max(0, f_now[3] - f_prev[3])
             if open_ and cp_ is not None and st['cticks'] > cp_:
                 child_acc[kind] = child_acc.get(kind, 0) + st['cticks'] - cp_
             try:
@@ -453,6 +472,24 @@ def main():
             f"{q} {(stat_of(f'/proc/{q}/stat') or {}).get('comm', '?')}{' (init)' if q == anc[-1] else ''}":
                 round((anc1[q] - anc0[q]) / CLK / win, 3)
             for q in anc if anc0.get(q) is not None and anc1.get(q) is not None}
+    if win:   # (the page faults per second; the container's kernel time per 1000 minor faults: a fork's cost)
+        tot_min = sum(v[0] for v in flt_acc.values()) + sum(v[0] for v in cflt_acc.values())
+        above = {}
+        if ancf0 and ancf1:
+            for q in anc:
+                if ancf0.get(q) is not None and ancf1.get(q) is not None:
+                    above[f"{q}{' (init)' if q == anc[-1] else ''}"] = round((ancf1[q] - ancf0[q]) / win, 1)
+        tot_min += sum(above.values()) * win
+        sys_c = (split.get('container_cores') or {}).get('system_usec')
+        split['faults'] = dict(
+            minor_per_s={k: round(v[0] / win, 1) for k, v in flt_acc.items()},
+            major_per_s={k: round(v[1] / win, 2) for k, v in flt_acc.items()},
+            reaped_children_minor_per_s={k: round(v[0] / win, 1) for k, v in cflt_acc.items()},
+            reaped_children_major_per_s={k: round(v[1] / win, 2) for k, v in cflt_acc.items()},
+            reaped_above_trainer_minor_per_s=above,
+            minor_total_per_s=round(tot_min / win, 1),
+            system_core_ms_per_1000_minor=(round(sys_c * 1000.0 / (tot_min / win) * 1000.0, 3)
+                                           if (sys_c and tot_min) else None))
     split.update(born_per_s={k: round(v / win, 2) for k, v in bk.items()} if win else None,
                  exited_per_s={k: round(v / win, 2) for k, v in gone.items()} if win else None,
                  host_forks_per_s=round((fk1 - fk0) / win, 1) if (fk0 is not None and fk1 is not None and win) else None)
