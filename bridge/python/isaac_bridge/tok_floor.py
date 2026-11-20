@@ -1753,7 +1753,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         episodes_left, episode_n = 0, 0
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
-            check_worker_torch(index)   # (ISAAC_RL_WORKER_LEAN: torch loaded since the start ends the run)
+            mine[ST['torch_held']] = check_worker_torch(index)   # (ISAAC_RL_WORKER_LEAN on: torch ends the run)
             if tm_tick is not None:
                 tm_tick()
             mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()

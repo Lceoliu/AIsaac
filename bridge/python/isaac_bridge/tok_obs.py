@@ -195,12 +195,14 @@ ROW_SCHEMA = 8   # (2026-11-20) the ROW layout revision dumps record ('row_schem
 # process reads the switch from its own environment; the workers refuse a value other than the trainer's
 # (tok_sampler.check_ring_mode). Diagnostic dumps of the rings (B38 dump_job) differ past the frames between the modes.
 RING_COMPACT = os.environ.get('ISAAC_RL_RING_COMPACT', '0') == '1'
-# (2026-11-20, the memory ledger) ISAAC_RL_WORKER_LEAN=1 (default off): the sampler's workers never load torch. A
-# worker loaded it (about 220 MB private per process: libtorch_cuda, cuBLAS / cuBLASLt's static data, ...) for two names
-# it took from structured_input, a torch module that only re-exports them -- tok_sampler.attach's VERSION (schema_v2)
-# and write_visible's write_frame (visible_producer): with the switch they come from those modules (the same objects).
-# The worker confirms it holds no torch (tok_sampler.ring_confirm; the trainer refuses a worker that does) and checks
-# again in its loop (WorkerTorchFatal). The trainer and the learner load torch as before.
+# (2026-11-20, the memory ledger) The sampler's workers do not load torch: they did (about 220 MB private per process:
+# libtorch_cuda, cuBLAS / cuBLASLt's static data, ...) only for names they took from structured_input, a torch module
+# that re-exports them -- tok_sampler.attach's VERSION, write_visible's write_frame, visible_native's VERSION /
+# FRAME_BYTES / SCHEMA / observation_frame -- now taken from their own torch-free modules (schema_v2, visible_producer:
+# the same objects), and splitmix64's finaliser lives here (mix64). Every worker reports whether it holds torch with its
+# ring confirmation (the trainer logs how many do). ISAAC_RL_WORKER_LEAN=1 (default off) enforces it: the trainer
+# refuses a worker holding torch (or of the other setting) and a worker that loads it later ends the run
+# (WorkerTorchFatal). The trainer and the learner load torch as before. (tests/test_worker_lean.py)
 WORKER_LEAN = os.environ.get('ISAAC_RL_WORKER_LEAN', '0') == '1'
 
 
@@ -612,10 +614,7 @@ def write_visible(o, row):
                          % (_VP.VISIBLE_V3_MODE, 'no visible block' if vis is None else 'a visible block of schema %r'
                             % (vis.get('schema') if isinstance(vis, dict) else type(vis).__name__)))
     elif vis is not None:
-        if WORKER_LEAN:   # (the same function: structured_input re-exports visible_producer's, and imports torch)
-            from .visible_producer import write_frame
-        else:
-            from .structured_input import write_frame
+        from .visible_producer import write_frame   # (structured_input re-exports it, importing torch: not here)
         from .visible_native import frame   # B45: the C encoder (observation_frame's bytes) when available
         write_frame(row,frame(o))
     else:
@@ -984,11 +983,15 @@ class WorkerTorchFatal(_VP.VisibleV3Fatal):
 
 
 def check_worker_torch(index):
-    """(ISAAC_RL_WORKER_LEAN) Raises WorkerTorchFatal when this worker process holds torch; a no-op with the switch off.
-    Cheap (one dict lookup): the workers call it every loop."""
-    if WORKER_LEAN and 'torch' in sys.modules:
+    """1 when this worker process holds torch (its stats torch_held, the trainer's progress workers_torch), else 0;
+    with ISAAC_RL_WORKER_LEAN on, WorkerTorchFatal instead of 1. Cheap (one dict lookup): the workers call it every
+    loop."""
+    if 'torch' not in sys.modules:
+        return 0
+    if WORKER_LEAN:
         raise WorkerTorchFatal(f'tok worker {index}: torch was loaded in a worker started with ISAAC_RL_WORKER_LEAN=1 '
                                f'(a worker-side import of a torch module: the run stops instead of running heavier)')
+    return 1
 
 
 class FastRowFatal(_VP.VisibleV3Fatal):

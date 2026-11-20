@@ -52,15 +52,11 @@ def build(source=SOURCE):
 
 
 def _si(*names):
-    """(ISAAC_RL_WORKER_LEAN) structured_input's names this module uses -- VERSION, FRAME_BYTES, SCHEMA (schema_v2's)
-    and observation_frame (visible_producer's), which structured_input only re-exports, importing torch: with the
-    switch from those torch-free modules (the same objects), as before without it."""
-    from . import tok_obs
-    if tok_obs.WORKER_LEAN:
-        from . import schema_v2, visible_producer
-        return tuple(getattr(schema_v2, n) if hasattr(schema_v2, n) else getattr(visible_producer, n) for n in names)
-    from . import structured_input
-    return tuple(getattr(structured_input, n) for n in names)
+    """structured_input's names this module uses -- VERSION, FRAME_BYTES, SCHEMA (schema_v2's) and observation_frame
+    (visible_producer's) -- taken from those torch-free modules (the same objects; structured_input only re-exports
+    them, and imports torch: never in a sampler worker)."""
+    from . import schema_v2, visible_producer
+    return tuple(getattr(schema_v2, n) if hasattr(schema_v2, n) else getattr(visible_producer, n) for n in names)
 
 
 class Library:

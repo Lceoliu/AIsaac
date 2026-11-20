@@ -192,6 +192,9 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          # (Codex round 25, A1's review) ring_open found its slot already open (generation negative): another writer of
          # the same worker's ring (the single-writer rule broken), or the previous attempt at this record failed midway
          'ring_open_busy',
+         # (the memory ledger) 1 while this worker process holds torch (it should not: tok_obs.WORKER_LEAN's note; the
+         # workers' loop check sets it, progress workers_torch is the count)
+         'torch_held',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
@@ -432,10 +435,7 @@ def attach(names, workers, initialize=False):
     actions = np.ndarray((workers, ACTION_F), np.int32, buffer=blocks[1].buf)
     stats = np.ndarray((workers, len(STATS)), np.float64, buffer=blocks[2].buf)
     control = np.ndarray((4,), np.int64, buffer=blocks[3].buf)   # [0] stop, [1] the trainer is updating
-    if TO_.WORKER_LEAN:   # (the same number: structured_input re-exports schema_v2's, and imports torch)
-        from .schema_v2 import VERSION
-    else:
-        from .structured_input import VERSION
+    from .schema_v2 import VERSION   # (structured_input re-exports it, importing torch: not in a worker)
     schema=(VERSION<<32)|ROW.itemsize
     if initialize:control[3]=schema
     elif int(control[3])!=schema:
@@ -1366,7 +1366,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         episodes_left, episode_n, state_seed = 0, 0, None
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
-            TO_.check_worker_torch(index)   # (ISAAC_RL_WORKER_LEAN: torch loaded since the start ends the run)
+            mine[ST['torch_held']] = TO_.check_worker_torch(index)   # (ISAAC_RL_WORKER_LEAN on: torch ends the run)
             mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()
             if builder.stalled():   # the next start state's build hangs (training went on with the old one)
                 recover('stall')
@@ -1755,8 +1755,10 @@ class TokSampler:
                 self.close(timeout=5.0)   # (raises VisibleV3Fatal(self.fatal) once everything is closed)
                 raise VisibleV3Fatal(self.fatal)
             if not missing:   # (the launch check reads this line: every worker's confirmation, how long it took)
+                held = sum(1 for a in acks if a & ACK_TORCH)
                 print(f'tok sampler: ring protocol confirmed by all {len(acks)} workers ({ring_ack_text(want)}) in '
-                      f'{time.monotonic() - t0:.1f} s', file=sys.stderr, flush=True)
+                      f'{time.monotonic() - t0:.1f} s; workers holding torch: {held}/{len(acks)}', file=sys.stderr,
+                      flush=True)
                 return
             time.sleep(0.02)
 

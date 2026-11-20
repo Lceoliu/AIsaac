@@ -4,7 +4,9 @@ libabp_turbo.so, through FastRow -- then reporting whether it holds torch, its p
 records it wrote. Run by tests/test_worker_lean.py with ISAAC_RL_WORKER_LEAN 0 / 1 (the inputs pickled by the test:
 this process imports no test helper, so nothing here loads torch but the code under test).
 
-   usage: python tests/lean_probe_child.py <inputs.pkl> <libabp_turbo.so or ''>"""
+   usage: python tests/lean_probe_child.py <inputs.pkl> <libabp_turbo.so or ''> [old] [mp_main]
+   old: structured_input imported first (what a worker did before: the comparison's memory and records);
+   mp_main: afterwards train_tok imported as spawn imports it in a child (run_name __mp_main__), torch checked again."""
 import hashlib
 import json
 import os
@@ -50,7 +52,10 @@ def episode_state():
 def main():
     inputs = pickle.load(open(sys.argv[1], 'rb'))
     so = sys.argv[2] if len(sys.argv) > 2 else ''
-    out = dict(lean=TO.WORKER_LEAN)
+    flags = set(sys.argv[3:])
+    if 'old' in flags:
+        import isaac_bridge.structured_input   # noqa: F401  (the worker before: its torch, its memory)
+    out = dict(lean=TO.WORKER_LEAN, old='old' in flags)
     from multiprocessing import shared_memory   # 1. the worker's handshake (where torch came in)
     n = 1
     sizes = (TO.ROW.itemsize * 2 * n, 4 * TS.ACTION_F * n, 8 * len(TS.STATS) * n, 8 * 4)
@@ -93,6 +98,10 @@ def main():
         out['fast_row_fast'] = int(fr.fast)
     out['torch'] = 'torch' in sys.modules
     out['private_mb'] = private_mb()
+    if 'mp_main' in flags:   # (spawn's import of the parent's main script in a worker: train_tok's top level)
+        import runpy
+        runpy.run_path(os.path.join(os.path.dirname(HERE), 'train_tok.py'), run_name='__mp_main__')
+        out['torch_after_mp_main'] = 'torch' in sys.modules
     print('LEAN_PROBE ' + json.dumps(out), flush=True)
 
 

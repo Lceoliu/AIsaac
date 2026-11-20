@@ -6997,7 +6997,8 @@ def main(argv=None, child=None, actor=None):
                        choices=sampler.choice_records() if branching else None,
                        v2=sampler.v2_records(with_h=mem_on, with_t=t_on,with_block=block_on) if v2_on else None,
                        ring_skips=dict(sampler.ring_skips,   # (Codex round 25: after both reads above; totals)
-                                       open_busy=float(sampler.stats[:, ST['ring_open_busy']].sum())),
+                                       open_busy=float(sampler.stats[:, ST['ring_open_busy']].sum()),
+                                       workers_torch=float(sampler.stats[:, ST['torch_held']].sum())),
                        branch_finished=book.branch_finished, broken=book.broken, broken_total=book.broken_total,
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,

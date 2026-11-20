@@ -1,14 +1,16 @@
-"""(2026-11-20, the memory ledger: ISAAC_RL_WORKER_LEAN, default off) The sampler's workers without torch. A worker
-loaded torch (about 220 MB private per process) only for two names it took from structured_input, a torch module that
-re-exports them; with the switch they come from their own torch-free modules (the same objects), splitmix64's
-finaliser lives in tok_obs, and the worker confirms it holds no torch (the trainer refuses one that does) and checks
-again in its loop. Checked here:
-  (a) a fresh process doing the worker's own work (tests/lean_probe_child.py: the shared-memory handshake, v2 visible
-      frames, v3 records through encode_row and, given a libabp_turbo.so, FastRow) with the switch off and on: the same
-      records byte for byte (every named field), no torch with the switch on, and the private memory saved (Linux);
-  (b) tok_policy's splitmix64 is tok_obs.mix64, crn_key's numbers unchanged;
-  (c) the confirmation: the trainer with the switch on refuses a worker holding torch or with the switch off, and
-      starts with clean ones (a real TokSampler, stub workers spawned: Linux); the loop check (WorkerTorchFatal).
+"""(2026-11-20, the memory ledger) The sampler's workers without torch. A worker loaded torch (about 220 MB private per
+process) only for names it took from structured_input, a torch module that re-exports them; they now come from their
+own torch-free modules (the same objects) and splitmix64's finaliser lives in tok_obs. Every worker reports whether it
+holds torch (ring confirmation, stats torch_held); ISAAC_RL_WORKER_LEAN=1 (default off) enforces it. Checked here:
+  (a) the regression guard: a fresh process doing a worker's own work (tests/lean_probe_child.py: the shared-memory
+      handshake, v2 visible frames, v3 records through encode_row and, given a libabp_turbo.so, FastRow), then train_tok
+      imported as spawn imports it (__mp_main__): no torch -- whoever adds a torch import on a worker path fails here;
+      the same records byte for byte as a process that loaded structured_input first (the worker before), and the
+      private memory that saves (Linux);
+  (b) the names are the same objects (structured_input's re-exports and their sources; tok_policy._mix64);
+  (c) the confirmation and the loop check: with the switch on the trainer refuses a worker holding torch or with the
+      switch off, and starts with clean ones; with it off it starts and logs the count (a real TokSampler, stub workers
+      spawned: Linux).
 This module imports no torch at its top level: the spawned stub workers import it."""
 import json
 import os
@@ -72,36 +74,48 @@ def probe_inputs(path):
         pickle.dump(dict(v2=obs, v3=pls), f)
 
 
-def run_probe(inputs, lean, so):
+def run_probe(inputs, lean, so, *flags):
     env = dict(os.environ, ISAAC_RL_WORKER_LEAN='1' if lean else '0')
-    out = subprocess.run([sys.executable, str(HERE / 'lean_probe_child.py'), str(inputs), so], env=env,
+    out = subprocess.run([sys.executable, str(HERE / 'lean_probe_child.py'), str(inputs), so, *flags], env=env,
                          capture_output=True, text=True, timeout=600)
     lines = [ln for ln in out.stdout.splitlines() if ln.startswith('LEAN_PROBE ')]
     assert out.returncode == 0 and lines, (out.returncode, out.stdout[-2000:], out.stderr[-4000:])
     return json.loads(lines[-1][len('LEAN_PROBE '):])
 
 
-def test_a_lean_worker_holds_no_torch_and_writes_the_same_records(tmp_path):
+def test_a_a_worker_holds_no_torch_and_writes_the_same_records(tmp_path):
     inputs = tmp_path / 'inputs.pkl'
     probe_inputs(inputs)
     so = turbo_so()
-    off, on = run_probe(inputs, False, so), run_probe(inputs, True, so)
-    print(f'\nworker lean probe: switch off {off}\nworker lean probe: switch on  {on}')
-    assert off['torch_after_attach'] and off['torch']   # (as before: the handshake loads torch)
-    assert not on['torch_after_attach'] and not on['torch'] and on['lean'] and not off['lean']
+    new = run_probe(inputs, False, so, 'mp_main')
+    old = run_probe(inputs, False, so, 'old')
+    print(f'worker probe: now     {new}', f'worker probe: before  {old}', sep='\n')
+    assert not new['torch_after_attach'] and not new['torch'] and not new['torch_after_mp_main']
+    assert old['torch']   # (the comparison: a worker as before, with structured_input's torch)
     for key in ('v2', 'v2_bytes', 'encode_row', 'fast_row', 'fast_row_fast'):
-        assert on.get(key) == off.get(key), key
-    assert len(set(on['v2_bytes'])) > 1 and min(on['v2_bytes']) > 0   # (real v2 frames, of different lengths)
+        assert new.get(key) == old.get(key), key
+    assert len(set(new['v2_bytes'])) > 1 and min(new['v2_bytes']) > 0   # (real v2 frames, of different lengths)
     if so:
-        assert on['fast_row_fast'] > 0   # (the native encoder took records)
-    if on['private_mb'] is not None:
-        assert off['private_mb'] - on['private_mb'] > 150, (off['private_mb'], on['private_mb'])
+        assert new['fast_row_fast'] > 0   # (the native encoder took records)
+    if new['private_mb'] is not None:
+        assert old['private_mb'] - new['private_mb'] > 150, (old['private_mb'], new['private_mb'])
 
 
-def test_b_splitmix64_moved_not_changed():
+def test_b_the_same_objects():
+    """The names a worker now takes from schema_v2 / visible_producer are structured_input's (it re-exports them);
+    tok_policy's splitmix64 is tok_obs.mix64 and gives the numbers it gave."""
     pytest.importorskip('torch')
+    from isaac_bridge import schema_v2 as S2
+    from isaac_bridge import structured_input as SI
     from isaac_bridge import tok_branch as TB
     from isaac_bridge import tok_policy as TP
+    from isaac_bridge import visible_native as VN
+    from isaac_bridge import visible_producer as VP
+    for name in ('VERSION', 'FRAME_BYTES', 'SCHEMA'):
+        assert getattr(SI, name) is getattr(S2, name) and VN._si(name)[0] is getattr(SI, name), name
+    for name in ('write_frame', 'observation_frame'):
+        assert getattr(SI, name) is getattr(VP, name), name
+    assert VN._si('observation_frame')[0] is SI.observation_frame
     assert TP._mix64 is TO.mix64
 
     def old(z):   # (tok_policy._mix64 as it was)
@@ -132,13 +146,14 @@ def test_c_confirmation_values():
 def test_c_loop_check(monkeypatch):
     monkeypatch.setitem(sys.modules, 'torch', types.ModuleType('torch'))
     monkeypatch.setattr(TO, 'WORKER_LEAN', False)
-    TO.check_worker_torch(3)   # (switch off: nothing)
+    assert TO.check_worker_torch(3) == 1   # (switch off: counted, stats torch_held)
     monkeypatch.setattr(TO, 'WORKER_LEAN', True)
     with pytest.raises(TO.WorkerTorchFatal, match='tok worker 3: torch was loaded') as e:
         TO.check_worker_torch(3)
     assert e.value.always_fatal
     monkeypatch.delitem(sys.modules, 'torch')
-    TO.check_worker_torch(3)
+    assert TO.check_worker_torch(3) == 0
+    assert 'torch_held' in TS.ST and TS.STATS[-2:] == ('np_runs', 'np_removed')
 
 
 def _wait_closed(conn):
@@ -162,7 +177,7 @@ def stub_worker_lean(index, cfg, names, conn, teacher_names=None, *args, **kw):
     _wait_closed(conn)
 
 
-def lean_sampler(monkeypatch, tmp_path, worker_lean_env):
+def lean_sampler(monkeypatch, tmp_path, worker_lean_env, trainer_lean=True):
     import select
     if not hasattr(select, 'poll'):
         pytest.skip('TokSampler: select.poll (Linux)')
@@ -170,9 +185,9 @@ def lean_sampler(monkeypatch, tmp_path, worker_lean_env):
     monkeypatch.setenv('ISAAC_RL_PNG_SHARED', '0')
     monkeypatch.setenv('ISAAC_RL_RING_CONFIRM_S', '60')
     monkeypatch.setenv('ISAAC_RL_WORKER_LEAN', worker_lean_env)   # (the workers' own environment)
-    monkeypatch.setattr(TO, 'WORKER_LEAN', True)                   # (the trainer's)
+    monkeypatch.setattr(TO, 'WORKER_LEAN', trainer_lean)           # (the trainer's)
     monkeypatch.setattr(TS, 'worker_main', stub_worker_lean)
-    cfg = TS.TokSamplerConfig(workers=2, teacher=False, name='leantest', port=os.getpid() % 30000 + 20000)
+    cfg = TS.TokSamplerConfig(workers=2, teacher=not trainer_lean, name='leantest', port=os.getpid() % 30000 + 20000)
     return TS.TokSampler(cfg)
 
 
@@ -199,5 +214,17 @@ def test_c_clean_workers_start(monkeypatch, tmp_path, capfd):
         want = TS.ring_ack_value(TO.RING_COMPACT, True, False)
         assert [int(a) for a in s.ring_ack] == [want] * 2
         assert 'ISAAC_RL_WORKER_LEAN 1, torch not loaded' in capfd.readouterr().err
+    finally:
+        s.close(timeout=2.0)
+
+
+def test_c_switch_off_counts_and_starts(monkeypatch, tmp_path, capfd):
+    """The switch off (the default), the teacher's ring on: a worker holding torch is not refused -- the run starts
+    and the log says how many workers hold it (the memory ledger's watch; the switch decides the refusal)."""
+    monkeypatch.setenv('ISAAC_RL_TEST_TORCH_WORKER', '1')
+    s = lean_sampler(monkeypatch, tmp_path, '0', trainer_lean=False)
+    try:
+        assert int(s.ring_ack[1]) & TS.ACK_TORCH and not int(s.ring_ack[0]) & TS.ACK_TORCH
+        assert 'workers holding torch: 1/2' in capfd.readouterr().err
     finally:
         s.close(timeout=2.0)
