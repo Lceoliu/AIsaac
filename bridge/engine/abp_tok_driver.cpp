@@ -310,5 +310,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       .def("release_block", &TokDriver::release_block).def("release_ring", &TokDriver::release_ring)
       .def("counters", &TokDriver::counters)
       .def_readwrite("r_timeout_s", &TokDriver::r_timeout_s).def_readwrite("test_call_delay", &TokDriver::test_call_delay)
-      .def_readwrite("test_ukeys", &TokDriver::test_ukeys);
+      .def_readwrite("test_ukeys", &TokDriver::test_ukeys)
+      .def_readwrite("batch_min", &TokDriver::batch_min).def_readwrite("batch_wait_s", &TokDriver::batch_wait_s);
 }

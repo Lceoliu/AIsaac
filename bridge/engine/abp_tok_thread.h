@@ -8,6 +8,7 @@
 // accepted: when one is short the records wait (so do their workers); nothing is overwritten or dropped. A stop and a
 // fatal wake every waiter (one mutex, one condition variable: every waiter re-checks every condition).
 #pragma once
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -83,6 +84,10 @@ struct TokDriver {
   // (the gates' tool p_chain: each record's sampling uniforms from (worker + 1, its ROW 't') -- B36's ukeys -- so a
   //  Python replay of the same calls draws the same numbers; off in training: the graphs' own draws)
   bool test_ukeys = false;
+  // (2026-11-20, the sampling breakdown: an experiment, off by default) hold a call while fewer than batch_min records
+  // are ready (or fewer than the live workers) and the oldest has waited less than batch_wait_s -- fewer calls of
+  // more rows against the workers' wait; batch_holds counts the loops that held
+  i64 batch_min = 0; double batch_wait_s = 0; i64 batch_holds = 0;
   std::vector<i64> uk_c, ut_c;
 
   explicit TokDriver(py::object middle) : mid_keep(middle) { mid = middle.cast<TokMiddle *>(); }
@@ -234,6 +239,7 @@ struct TokDriver {
     d["ring_used"] = ring_head-ring_released; d["ring_head"] = ring_head; d["t_credit_s"] = t_credit; d["t_call_s"] = t_call;
     d["t_read_s"] = t_read; d["rr_s"] = rr_s; d["rr_n"] = rr_n;
     d["reply_fail"] = reply_fail; d["cancelled"] = cancelled; d["cf_snaps"] = cf_snaps; d["pause_gen"] = pause_gen;
+    d["batch_holds"] = batch_holds;
     return d;
   }
 
@@ -390,6 +396,15 @@ struct TokDriver {
         for (i64 w = 0; w < W && (i64)take_w.size() < n; w++) if (ready_slot[w] >= 0) take_w.push_back(w);
       }
       if (take_w.empty()) continue;
+      if (batch_min > 1 && (i64)take_w.size() < batch_min) {   // (the batching experiment)
+        i64 live = 0;
+        for (i64 w = 0; w < W; w++) live += !gone[w];
+        if ((i64)take_w.size() < std::min(batch_min, live)) {
+          double oldest = 1e300;
+          for (i64 w : take_w) oldest = std::min(oldest, ready_t[(size_t)w]);
+          if (now()-oldest < batch_wait_s) { std::lock_guard<std::mutex> g(mu); batch_holds++; continue; }
+        }
+      }
       const i64 k = (i64)take_w.size();
       // credits for the whole call: a block, queue room for k records, k contiguous ring rows
       i64 b = -1, r0 = 0;

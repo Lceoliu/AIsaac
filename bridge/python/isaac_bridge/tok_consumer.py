@@ -70,6 +70,13 @@ class DriverCollect:
             self.pblocks = np.zeros((blocks, n), priv_dtype)
             d.set_priv(int(sampler.priv.ctypes.data), priv_dtype.itemsize, int(self.pblocks.ctypes.data))
         d.set_ring_rows(ring)
+        import os
+        bm = int(os.environ.get('ISAAC_TOK_BATCH_MIN', '0') or 0)
+        if bm > 1:   # (the sampling breakdown's batching experiment, off by default: P-driver-design 14)
+            d.batch_min = bm
+            d.batch_wait_s = float(os.environ.get('ISAAC_TOK_BATCH_WAIT_MS', '2') or 2) / 1e3
+            print(f'P package: batching experiment on (a call holds until {bm} records or {d.batch_wait_s * 1e3:.1f} ms)',
+                  flush=True)
         d.set_version(int(version))
         self.started = False
         self.partial = {}   # call -> records taken so far (a take may end inside a call)
@@ -115,6 +122,7 @@ class DriverCollect:
         prof['drv_call_s'] = prof.get('drv_call_s', 0.0) + c1['t_call_s'] - c0['t_call_s']
         prof['cf_snaps'] = prof.get('cf_snaps', 0) + c1['cf_snaps'] - c0['cf_snaps']   # (as the Python loop's)
         prof['drv_reply_fail'] = prof.get('drv_reply_fail', 0) + c1['reply_fail'] - c0['reply_fail']
+        prof['drv_batch_holds'] = prof.get('drv_batch_holds', 0) + c1['batch_holds'] - c0['batch_holds']
         if c1['reply_fail'] > c0['reply_fail']:   # (Codex 18, a known deviation: a failed write is taken for the
             #  worker's end -- stored as the Python loop stores it, its EOF expected; one that is not an EOF would leave
             #  a worker waiting: counted and reported, to be handled if it is ever seen)
