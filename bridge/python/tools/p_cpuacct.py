@@ -47,7 +47,32 @@ def stat_of(path):
     s = s.decode('latin-1')
     r = s.rfind(')')
     f = s[r + 2:].split()
-    return dict(comm=s[s.find('(') + 1:r], state=f[0], ppid=int(f[1]), ticks=int(f[11]) + int(f[12]))
+    return dict(comm=s[s.find('(') + 1:r], state=f[0], ppid=int(f[1]), ticks=int(f[11]) + int(f[12]),
+                cpu=int(f[36]) if len(f) > 36 else -1)
+
+
+def cpu_stat():
+    """/proc/stat per logical CPU: (busy ticks, all ticks)."""
+    out = {}
+    for line in (rd('/proc/stat') or b'').decode('latin-1').splitlines():
+        if line.startswith('cpu') and line[3:4].isdigit():
+            f = line.split()
+            v = [int(x) for x in f[1:]]
+            idle = v[3] + (v[4] if len(v) > 4 else 0)
+            out[int(f[0][3:])] = (sum(v[:8]) - idle, sum(v[:8]))
+    return out
+
+
+def siblings(c):
+    s = rd(f'/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list')
+    return s.decode().strip() if s else str(c)
+
+
+def allowed(pid):
+    for line in (rd(f'/proc/{pid}/status') or b'').decode('latin-1').splitlines():
+        if line.startswith('Cpus_allowed_list'):
+            return line.split(':', 1)[1].strip()
+    return '?'
 
 
 def cmdline(pid):
@@ -98,6 +123,17 @@ def descendants(root):
     return out
 
 
+def _under(q, root, per_proc):
+    """Is process q a descendant of root (by the parents seen)?"""
+    seen = set()
+    while q in per_proc and q not in seen:
+        seen.add(q)
+        q = per_proc[q][3]
+        if q == root:
+            return True
+    return False
+
+
 def rows_of(path):
     s = rd(path)
     return max(0, len([x for x in s.decode('latin-1').splitlines() if x.strip()]) - 1) if s else 0
@@ -137,6 +173,9 @@ def main():
                 n += 1
         return n
     kinds = {}           # pid -> its kind once known
+    per_tid = {}         # (pid, tid) -> [ticks in the window, kind, comm, last cpu]
+    per_proc = {}        # pid -> [ticks in the window, kind, comm, parent]
+    cs0 = cs1 = None
     procs_seen = {}      # pid -> (kind, comm)
     last = {}            # (pid, tid) -> ticks
     acc = {}             # role -> ticks within the window
@@ -148,8 +187,10 @@ def main():
         n_rows = rows_of(a.progress)
         if not open_ and n_rows >= a.from_update - 1:
             open_, t0 = True, time.time()
+            cs0 = cpu_stat()
         if open_ and n_rows >= a.to_update:
             t1 = time.time()
+            cs1 = cpu_stat()
             break
         if not os.path.exists(f'/proc/{root}'):
             break
@@ -195,6 +236,11 @@ def main():
                 last[key] = ts['ticks']
                 if open_ and prev is not None:
                     acc[role] = acc.get(role, 0) + ts['ticks'] - prev
+                    e_ = per_tid.setdefault(key, [0, kind, ts['comm'], -1])
+                    e_[0] += ts['ticks'] - prev
+                    e_[3] = ts['cpu']
+                    q_ = per_proc.setdefault(pid, [0, kind, st['comm'], st['ppid']])
+                    q_[0] += ts['ticks'] - prev
                     seen.setdefault(role, set()).add(key)
                     if kind in ('trainer', 'learner'):
                         sc = rd(f'/proc/{pid}/task/{t}/syscall')
@@ -233,7 +279,38 @@ def main():
     nk = {}
     for k_, _ in procs_seen.values():
         nk[k_] = nk.get(k_, 0) + 1
-    out = dict(match=a.match, trainer_pid=root, processes=nk, window_s=round(win, 1), updates=[a.from_update, a.to_update], cpus=cpus, capacity=cap,
+    if cs1 is None:
+        cs1 = cpu_stat()
+    cpu_list = []
+    for part in cpus.split(','):
+        if '-' in part:
+            lo, hi = part.split('-')
+            cpu_list += list(range(int(lo), int(hi) + 1))
+        elif part:
+            cpu_list.append(int(part))
+    per_cpu = {}
+    if cs0:
+        for c in cpu_list:
+            b0, a0 = cs0.get(c, (0, 0))
+            b1, a1 = cs1.get(c, (0, 0))
+            per_cpu[c] = round((b1 - b0) / max(a1 - a0, 1), 3)
+    cores_ = {}
+    for c in cpu_list:
+        cores_.setdefault(siblings(c), []).append(per_cpu.get(c))
+    top = sorted(per_tid.items(), key=lambda kv: -kv[1][0])[:20]
+    top_threads = [dict(pid=k[0], tid=k[1], kind=v[1], comm=v[2], cores=round(v[0] / CLK / win, 3) if win else None,
+                        last_cpu=v[3]) for k, v in top]
+    # each worker: its own process and its game engines (their descendants), with the CPUs they may run on
+    work = []
+    for pid, v in per_proc.items():
+        if v[1] == 'workers':
+            g_ = sum(x[0] for q, x in per_proc.items() if x[1] == 'game' and _under(q, pid, per_proc))
+            work.append(dict(pid=pid, worker_cores=round(v[0] / CLK / win, 3) if win else None,
+                             game_cores=round(g_ / CLK / win, 3) if win else None, cpus=allowed(pid)))
+    out = dict(match=a.match, trainer_pid=root, processes=nk, per_cpu_busy=per_cpu,
+               per_physical_core={k: v for k, v in cores_.items()},
+               top_threads=top_threads, workers=sorted(work, key=lambda d: -(d['worker_cores'] or 0)),
+               window_s=round(win, 1), updates=[a.from_update, a.to_update], cpus=cpus, capacity=cap,
                total_cores=round(total, 3), idle_cores=round(cap - total, 3), groups={k: round(v, 3) for k, v in groups.items()},
                roles=dict(sorted(roles.items(), key=lambda kv: -(kv[1]['cores'] or 0))))
     with open(a.out, 'w') as f:
