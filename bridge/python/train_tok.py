@@ -3291,6 +3291,25 @@ def main(argv=None, child=None, actor=None):
     if driver_cpus:
         os.sched_setaffinity(0, os.sched_getaffinity(0) - driver_cpus)
         print(f'driver CPUs (ISAAC_DRIVER_CPUS): {sorted(driver_cpus)}, dedicated to the C++ driver thread', flush=True)
+    # (P-driver-design 15, the CPU ledger) ISAAC_TOK_PIN=1 with the lane's ISAAC_DRIVER_CPUS: the actor's main thread
+    # (the Python loop, or the C++ driver's consumer) and the C++ driver's thread on those CPUs, off the saturated
+    # workers' set -- the main thread once the loop starts (the workers and the learner process started before
+    # it: they keep the rest); scheduling only, nothing computed differently
+    tok_pin = os.environ.get('ISAAC_TOK_PIN', '0') == '1' and bool(driver_cpus) and child is None
+    # (P-driver-design 15, the split layout) ISAAC_ACTOR_CPUS with ISAAC_TOK_PIN=1: the actor's main thread (the Python
+    # loop, or the C++ driver's consumer) on these CPUs instead of sharing ISAAC_DRIVER_CPUS with the driver thread;
+    # kept off the workers' set like the driver's. Unset: as before (the main thread on the driver CPUs)
+    actor_cpus = set()
+    for part_ in filter(None, os.environ.get('ISAAC_ACTOR_CPUS', '').split(',')):
+        lo_, _, hi_ = part_.partition('-')
+        actor_cpus.update(range(int(lo_), int(hi_ or lo_) + 1))
+    if actor_cpus:
+        if os.environ.get('ISAAC_TOK_PIN', '0') != '1' or not driver_cpus:
+            p.error('ISAAC_ACTOR_CPUS needs ISAAC_TOK_PIN=1 and ISAAC_DRIVER_CPUS')
+        if actor_cpus & (learner_cpus | driver_cpus):
+            p.error(f'ISAAC_ACTOR_CPUS {sorted(actor_cpus)} overlaps the learner / driver CPUs')
+        os.sched_setaffinity(0, os.sched_getaffinity(0) - actor_cpus)
+        print(f'actor CPUs (ISAAC_ACTOR_CPUS): {sorted(actor_cpus)}, the actor main thread\'s', flush=True)
     if learner_cpus:
         print(f'learner CPUs (--learner-cpus): {sorted(learner_cpus)}, '
               + ('shared: the rest of the trainer, its workers and games may run on them too'
@@ -6396,6 +6415,10 @@ def main(argv=None, child=None, actor=None):
         n_handoffs = -(-(target_decisions - decisions_total) // args.rollout)
         sent_handoffs = 0
         rollout_actor = args.rollout // n_act
+        if tok_pin:   # (P-driver-design 15: the actor's main thread off the workers' CPUs; its own with ISAAC_ACTOR_CPUS)
+            os.sched_setaffinity(0, actor_cpus or driver_cpus)
+            print(f'P package: the actor main thread on CPUs {sorted(actor_cpus or driver_cpus)} (ISAAC_TOK_PIN)',
+                  flush=True)
         nsys_win = nv.profiler_window()
         while True:
             go_on = ((handed < target_decisions if n_act == 1 and not args.max_updates else sent_handoffs < n_handoffs)
