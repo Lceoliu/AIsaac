@@ -3133,6 +3133,12 @@ char *getenv(const char *name) {
 //     RC_PREV_A* / RC_MAX_CHARGE).
 // Out: RC_OUT_V3 (a v3 frame written), RC_OUT_DIRTY (bits: 1 the rewind count, 2 the nohit room, 4 an ever_* set,
 // 8 the active item's state changed: tok_obs.FastRow brings its EpisodeState up to date).
+// Version 10 (2026-11-20, Codex round 23-1): before the first write, every player-0 value encode_row turns into an
+// integer -- soul and black hearts, bombs, the weapon bits, the player type, the patch's cell from x / y -- must be
+// finite and well inside the range of a long; otherwise the record is handed back (-15): encode_row raises where
+// Python does (int() / round() of a NaN or an infinity) and takes the large ones; no conversion of a NaN or an
+// out-of-range double to an integer type here (undefined behaviour). Every negative return writes nothing: not the
+// ROW, not ctx, not the EpisodeState's arrays (tests/test_fast_row_v9.py fills all three with non-zero bytes).
 enum {
     RC_T, RC_LIMIT, RC_FLOOR, RC_STALL, RC_PROGRESS, RC_STAGE0, RC_HP0, RC_PREV_DMG, RC_PREV_HP, RC_HAVE_PREV, RC_ROOM,
     RC_WAS_CLEAR, RC_ORIGIN_X, RC_ORIGIN_Y, RC_N_EXITS, RC_EXITS, RC_TVERSION = RC_EXITS + 16, RC_TSEEN, RC_HURT,
@@ -3211,7 +3217,9 @@ static int re_v3_frame_ok(const unsigned char *f, long nbytes, long *p_out) {
     return 1;
 }
 
-int abp_row_encode_version(void) { return (9 << 16) | (RC_COUNT << 8) | RO_COUNT; }
+static inline int re_int_ok(double v) { return isfinite(v) && fabs(v) < 1e15; }   // (version 10: int() is safe)
+
+int abp_row_encode_version(void) { return (10 << 16) | (RC_COUNT << 8) | RO_COUNT; }
 
 int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double *ctx, const unsigned char *grid,
                    const unsigned char *padded, const unsigned char *map, const long *offs, const long *refs,
@@ -3307,6 +3315,10 @@ int abp_row_encode(const unsigned char *pl, long len, unsigned char *row, double
     double pv[RE_PLAYER_F];   // player 0 (abplus_lean.PLAYER_FIELDS)
     memcpy(pv, pl + 96, sizeof pv);
     if (post == 2 && !(isfinite(pv[24]) && fabs(pv[24]) < 1e15)) return -14;   // (int(active): encode_row's)
+    // (version 10) the integer conversions of player 0's values and of the patch's cell: encode_row's when unsafe
+    if (!re_int_ok(pv[8]) || !re_int_ok(pv[9]) || !re_int_ok(pv[15]) || !re_int_ok(pv[37]) || !re_int_ok(pv[38]) ||
+        !re_int_ok((pv[1] - ctx[RC_ORIGIN_X]) / 40.0) || !re_int_ok((pv[2] - ctx[RC_ORIGIN_Y]) / 40.0))
+        return -15;
     int dirty = 0;
     double px = pv[1], py = pv[2];
     double tlx = rd_f(room + 32), tly = rd_f(room + 36), brx = rd_f(room + 40), bry = rd_f(room + 44);

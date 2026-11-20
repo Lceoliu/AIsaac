@@ -72,7 +72,8 @@ from .tok_branch import (RewindLedger, end_reward, rewind_cfg, AUX_LOGP, AUX_PRE
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
 from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
-                      encode_row, fast_counts, fast_row_function, V3_FRAMES)
+                      encode_row, fast_counts, fast_row_function, V3_FRAMES, FAST_ROW_CHECKING, child_start,
+                      fast_row_final, _bump as fr_bump)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal, fatal_active   # noqa: E402
@@ -82,6 +83,13 @@ class RewindFatal(VisibleV3Fatal):
     """(2026-11-20, Codex round 20) --rewind 1 and an episode's first record without the bridge's Glowing Hour Glass
     restore count (an older bridge or libabp_turbo, the native obs off): a protocol error, not a bad episode -- no retry;
     the worker stops with V3_FATAL_EXIT and the trainer fails (TokSampler.check_fatal), whatever the visible-v3 mode."""
+    always_fatal = True
+
+
+class ChildFatal(VisibleV3Fatal):
+    """(2026-11-20) A forked cf / search child that ended with V3_FATAL_EXIT (it does only for a fatal of its own -- a
+    visible-v3 one in a v3 worker, a FastRowFatal): raised again in the worker, which stops whatever the mode."""
+    always_fatal = True
 from .tok_sampler import rng_key, start_seed, report_fatal   # noqa: E402  (a resumed run's / a shard's start seeds, random streams)
 from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, SearchSlots, StartBuilder, applied_action,
                           apply_instance_defaults, attach, attach_choices, attach_lab, attach_teacher, default_stub_list,
@@ -706,15 +714,23 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         base_.release()
         pt.base = copy
         pid = os.fork()
+        if pid and FAST_ROW_CHECKING:
+            fr_bump('children_forked')
         if pid == 0:   # the child: the point on its own copy, records into the shared ring, then gone
             code = 0
+            if FAST_ROW_CHECKING:   # (Codex round 23-2: the child's own check counts, final before its os._exit)
+                child_start('cf-child')
             try:
                 cf_run(pt, child=True)
-            except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child; mode 0: 1)
-                code = V3_FATAL_EXIT if fatal_active() else 1
+            except VisibleV3Fatal as exc_:   # (2026-11-18: the parent raises it again when it reaps the child)
+                code = V3_FATAL_EXIT if (fatal_active() or getattr(exc_, 'always_fatal', False)) else 1
             except BaseException:
                 code = 1
             finally:
+                try:
+                    fast_row_final()
+                except BaseException:   # (the counts not written: the check's verdict is a failure)
+                    code = V3_FATAL_EXIT
                 os._exit(code)
         try:   # (the parent: its end of the copy's connection closed without the close command)
             sock = copy.clone._sock
@@ -748,7 +764,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 break
             time.sleep(0.01)
         if status > 0 and os.WIFEXITED(status) and os.WEXITSTATUS(status) == V3_FATAL_EXIT:
-            raise VisibleV3Fatal(f'cf child {pid}: a visible-v3 protocol error (its stderr has the reason)')
+            raise ChildFatal(f'cf child {pid}: a fatal error -- visible-v3 / FastRow check (its stderr has the reason)')
         if status != 0 and status != -1:
             mine[ST['errors']] += 1
             mine[ST['cf_errors']] += 1
@@ -832,15 +848,23 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             base_.release()
             child_item = (copy,) + tuple(item[1:])
             pid = os.fork()
+            if pid and FAST_ROW_CHECKING:
+                fr_bump('children_forked')
             if pid == 0:   # the child: the search on its own copy, records into the shared ring, then gone
                 code = 0
+                if FAST_ROW_CHECKING:   # (Codex round 23-2: the child's own check counts, final before its os._exit)
+                    child_start('search-child')
                 try:
                     search(child_item, pair=False)
-                except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child; mode 0: 1)
-                    code = V3_FATAL_EXIT if fatal_active() else 1
+                except VisibleV3Fatal as exc_:   # (2026-11-18: the parent raises it again when it reaps the child)
+                    code = V3_FATAL_EXIT if (fatal_active() or getattr(exc_, 'always_fatal', False)) else 1
                 except BaseException:
                     code = 1
                 finally:
+                    try:
+                        fast_row_final()
+                    except BaseException:   # (the counts not written: the check's verdict is a failure)
+                        code = V3_FATAL_EXIT
                     os._exit(code)
             # the parent: its end of the copy's connection closed without the close command (the clone lives on
             # with the child's end), then the child waited for (the thread blocks here; the GIL is free)
@@ -875,7 +899,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     break
                 time.sleep(0.01)
             if status > 0 and os.WIFEXITED(status) and os.WEXITSTATUS(status) == V3_FATAL_EXIT:
-                raise VisibleV3Fatal(f'search child {pid}: a visible-v3 protocol error (its stderr has the reason)')
+                raise ChildFatal(f'search child {pid}: a fatal error -- visible-v3 / FastRow check (its stderr has '
+                                 f'the reason)')
             if status != 0 and status != -1:
                 mine[ST['errors']] += 1
         finally:
@@ -1026,7 +1051,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         st.stage0 = int(obs.room[5])
         for s in slots:
             s['point'], s['branch'], s['crn'] = point.pid, number, key
-        enc = FastRow(fast_fn, st, decoder, point.episode, point.seed, group) if fast_fn is not None else None
+        enc = FastRow(fast_fn, st, decoder, point.episode, point.seed, group, tag='branch') \
+            if fast_fn is not None else None
         item, lf_now = obs, obs.logic_frames
         t_ep, waiting, action, end = 0, False, (0, 0, 0, 0, 0), END_STOP
         gamma, ret, disc = cfg.branch_gamma, 0.0, 1.0
@@ -1329,7 +1355,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         st.visited = set()
         for s in slots:
             s['lab'], s['lab_s'], s['crn'] = job_id, k + 1, crn
-        enc = FastRow(fast_fn, st, decoder, 0, int(cfg.lab_panel[k][1]), group) if fast_fn is not None else None
+        enc = FastRow(fast_fn, st, decoder, 0, int(cfg.lab_panel[k][1]), group, tag='lab') \
+            if fast_fn is not None else None
         item, lf0 = obs, obs.logic_frames
         lf_now = lf0
         room0 = int(obs.room[4])
@@ -1801,7 +1828,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it,
                               stall_first=stall_fi, rewind=bool(getattr(cfg, 'rewind', 0)))
             st.visited, st.stage0 = set(src.info['visited']), src.info['stage0']
-            enc = FastRow(fast_fn, st, decoder, episode_n, seed_now, group) if fast_fn is not None else None
+            enc = FastRow(fast_fn, st, decoder, episode_n, seed_now, group, tag='main') if fast_fn is not None \
+                else None
             item, lf_now = obs, obs.logic_frames   # with FastRow item is the step's raw payload
             t_ep, waiting, action = 0, False, (0, 0, 0, 0, 0)
             applied, hurts = [], []     # hurts: (decision, the restore point then, its reseed, its decision)
@@ -2139,7 +2167,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             if labbing and not control[0]:   # 2026-10-08: posted lab jobs, within cfg.lab_share (tok_lab)
                 run_lab()
     except VisibleV3Fatal as exc:
-        if fatal_active() or isinstance(exc, RewindFatal):
+        if fatal_active() or getattr(exc, 'always_fatal', False):   # (RewindFatal, FastRowFatal, ChildFatal)
             v3_fatal = exc
             report_fatal(index, conn, exc, 'tok floor worker', cfg.fatal_dir)   # (before the cleanup below)
         else:   # (mode 0: an ordinary error, as in 05f1622 -- no exit 86)
@@ -2150,6 +2178,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         mine[ST['errors']] += 1000
     finally:
         mine[ST['finished']] = 1
+        try:   # (check mode: this worker's final counts)
+            fast_row_final()
+        except Exception:
+            traceback.print_exc()
         search_stop.set()   # 2026-10-10: the search thread ends after its current search (daemon: never waited on)
         # killed outright (SIGTERM) or a build still in flight (it may hang): the instance and its clones are killed;
         # otherwise closed as before

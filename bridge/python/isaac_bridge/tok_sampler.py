@@ -85,7 +85,8 @@ from .abplus import ABP_HOME, FORK_ENV, action_code
 from .abplus_goexplore import GxConfig, Instance
 from .abplus_lean import LeanDecoder, read_lean, read_lean_raw
 from .env import BridgeError
-from .tok_obs import ROW, V3_FRAMES, EpisodeState, FastRow, encode_row, fast_counts, fast_row_function
+from .tok_obs import ROW, V3_FRAMES, EpisodeState, FastRow, encode_row, fast_counts, fast_row_final, fast_row_function
+from . import tok_obs as TO_
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal
 from .visible_producer import fatal_active as VP_fatal_active
 
@@ -1286,7 +1287,8 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
                 continue
             episode_n += 1
             st, t_ep, waiting, action = EpisodeState(limit, items=cfg.items), 0, False, (0, 0, 0, 0, 0)
-            enc = FastRow(fast_fn, st, decoder, episode_n, state_seed, group) if fast_fn is not None else None
+            enc = FastRow(fast_fn, st, decoder, episode_n, state_seed, group, tag='room') if fast_fn is not None \
+                else None
             item = obs   # the record's observation: a LeanObs, or with FastRow the step's raw payload
             applied, hurts = [], []
             try:
@@ -1355,7 +1357,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
                 episode = None
                 mine[ST['close_s']] += time.perf_counter() - t_close
     except VisibleV3Fatal as exc:
-        if VP_fatal_active():
+        if VP_fatal_active() or getattr(exc, 'always_fatal', False):   # (FastRowFatal too, in any mode)
             v3_fatal = exc
             report_fatal(index, conn, exc, fatal_dir=cfg.fatal_dir)   # (before the cleanup below)
         else:   # (mode 0: an ordinary error, as in 05f1622 -- no exit 86)
@@ -1366,6 +1368,10 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         mine[ST['errors']] += 1000
     finally:
         mine[ST['finished']] = 1
+        try:   # (check mode: this worker's final counts)
+            fast_row_final()
+        except Exception:
+            traceback.print_exc()
         # killed outright (SIGTERM) or a build still in flight (it may hang): the instance and its clones are killed;
         # otherwise closed as before
         hard = bool(terminated) or (builder is not None and not builder.ready.is_set())
@@ -1756,7 +1762,7 @@ class TokSampler:
         another one if its cleanup failed): self.fatal, with the reason (from the pipe, else the file) or a plain
         statement that none reached the parent."""
         # (mode 0: never, as 05f1622 -- unless --rewind 1: a worker's missing restore count, tok_floor.RewindFatal)
-        if self.fatal is not None or not (VP_fatal_active() or getattr(self.cfg, 'rewind', 0)):
+        if self.fatal is not None or not (VP_fatal_active() or getattr(self.cfg, 'rewind', 0) or TO_.FAST_ROW):
             return
         p = self.procs[i]
         code = p.exitcode

@@ -372,7 +372,8 @@ def play_branch(S, ctx, pt, d, hp0, intent, policy, reseed=None, keep=True, trac
         st.visited = set(pt.visited)
         st.stage0 = int(pt.stage0) if pt.stage0 is not None else int(ob.room[5])
         st.progress_t = pt.log.progress[d - 1] if d >= 1 else d   # the stall counter before record d
-        enc = FastRow(ctx.fast_fn, st, dec, pt.episode, pt.seed, ctx.group) if ctx.fast_fn is not None else None
+        enc = FastRow(ctx.fast_fn, st, dec, pt.episode, pt.seed, ctx.group, tag='teacher') \
+            if ctx.fast_fn is not None else None
         row = ctx.row
         item, t, j = ob, d, 0
         under = five(pt.applied[d])   # record d's action under way (the episode's own: decided before d)

@@ -3402,6 +3402,14 @@ def main(argv=None, child=None, actor=None):
         sampler = JobSampler(bench_stats)
     else:
         os.environ.setdefault('ISAAC_RL_FATAL_DIR', str(out))   # (a worker's visible-v3 fatal reason: tok_sampler)
+        from isaac_bridge import tok_obs as TO_fr
+        if TO_fr.FAST_ROW:   # (Codex round 23-2: the switch on requires this tree's library, checked before any worker)
+            from isaac_bridge.tok_sampler import row_library as row_library_
+            try:
+                TO_fr.fast_row_function(row_library_(cfg))
+            except TO_fr.FastRowFatal as exc_:
+                raise SystemExit(f'native ROW encoder: {exc_}') from None
+            print(f'native ROW encoder on (ISAAC_RL_FAST_ROW={TO_fr.FAST_ROW_MODE}): {row_library_(cfg)}', flush=True)
         sampler = TokSampler(cfg)
         if pf_on and total_h > 0 and decisions_total > 0:   # (a resumed run: the forcing probability where the run is,
             sampler.stats[:, ST['pf_p']] = pickup_force_p(   # not pickup_force[0] until the first update rewrites it)

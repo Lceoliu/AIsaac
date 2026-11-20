@@ -238,3 +238,100 @@ def test_fast_row_v9_no_visible_writes_schema_0(fast, monkeypatch):
     fr, bad, got = _seq(fast, monkeypatch, 8, True, 2, frame=VP.observation_frame_v3(_raw()))
     assert not bad and fr.fast == 7, (bad, fr.fast, fr.reasons)
     assert int(got['visible_schema'][3]) == 0 and int(got['visible_bytes'][3]) == 0
+
+
+# ---- (Codex round 23-1) every hand-back writes nothing: the ROW, ctx and the EpisodeState's arrays pre-filled with
+# non-zero bytes, each code provoked on a record after a real first one, all three compared after the call
+_PV = 96   # player 0's doubles (abplus_lean: header 16, room 48, totals 32)
+
+
+def _patch(pl, at, fmt, value):
+    b = bytearray(pl)
+    struct.pack_into(fmt, b, at, value)
+    return bytes(b)
+
+
+def _prefilled_call(fr, pl, row, t=1):
+    raw = row.view(np.uint8).reshape(-1)
+    raw[:] = 0x5A
+    for a in (fr.st.inv_arr, fr.st.pitem, fr.st.pinv):
+        a.view(np.uint8)[:] = 0x33
+    fr.ctx[TO.RC_T], fr.ctx[TO.RC_FIRST] = t, 0
+    ctx0, raw0 = fr.ctx.copy(), raw.copy()
+    ext0 = [a.copy() for a in (fr.st.inv_arr, fr.st.pitem, fr.st.pinv)]
+    g, pd, m = fr._ptrs
+    code = fr.fn(pl, len(pl), row.ctypes.data, fr._ctx_p, g, pd, m, fr._offs_p, fr._refs_p, fr._ext_p)
+    same = (np.array_equal(raw, raw0), fr.ctx.tobytes() == ctx0.tobytes(),
+            all(a.tobytes() == b.tobytes() for a, b in zip(ext0, (fr.st.inv_arr, fr.st.pitem, fr.st.pinv))))
+    return code, same
+
+
+def _base(fast, monkeypatch, run=False, rewind=True, items=True):
+    monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', 0)
+    monkeypatch.setattr(TO, 'FAST_ROW_CHECKING', False)
+    sc = scenario('twice' if rewind else 'off', False)
+    pls = [payload(k, v3=False, frame=None, **sc) for k in range(3)]
+    dec, st = AL.LeanDecoder(), state('events', items, rewind, run)
+    fr = TO.FastRow(fast, st, dec, 0, 0, 0)
+    row = np.zeros(1, TO.ROW)
+    fr.encode(dec.decode(pls[0]), row, row.ctypes.data, 0)
+    assert fr._ptrs[0], 'the first record did not set the C path up'
+    return fr, pls[1], row
+
+
+def test_every_hand_back_writes_nothing(fast, monkeypatch):
+    fr, pl, row = _base(fast, monkeypatch)
+    n_doors = pl[14]
+    ents_at = _PV + 8 * 39 * pl[13] + 16 * n_doors
+    cases = [
+        (-1, _patch(pl, 0, '<I', 0)),                                   # another magic
+        (-1, pl + b'\0'),                                              # a trailing byte
+        (-2, _patch(pl, 12, '<B', pl[12] | 8)),                         # a map block flag
+        (-3, _patch(pl, ents_at, '<H', 65)),                            # 65 old entities
+        (-4, _patch(pl, 32, '<i', struct.unpack_from('<i', pl, 32)[0] + 1)),   # another room
+        (-5, _patch(pl, _PV + 8 * 39 + 4, '<f', 1.5)),                  # a door record changed
+        (-11, _patch(pl, len(pl) - 4, '<i', 7)),                        # the restore count went up
+        (-13, _patch(pl, 12, '<B', pl[12] | 32)),                       # a visible block flag
+        (-14, _patch(pl, _PV + 8 * 24, '<d', float('nan'))),            # active: NaN (items)
+    ]
+    for name, i in (('x', 1), ('soul', 8), ('black', 9), ('bombs', 15), ('weapons', 37), ('ptype', 38)):
+        for v in (float('nan'), float('inf'), -float('inf')):
+            cases.append((-15, _patch(pl, _PV + 8 * i, '<d', v)))
+    cases.append((-15, _patch(pl, _PV + 8 * 1, '<d', 1e300)))           # a finite x out of a long's range
+    for want, p_ in cases:
+        code, same = _prefilled_call(fr, p_, row)
+        assert code == want and all(same), (want, code, same)
+    for want, edit in ((-6, lambda c: c.__setitem__(TO.RC_STAGE0, np.nan)), (-12, lambda c: c.__setitem__(TO.RC_CK_NONE, 1))):
+        keep = fr.ctx.copy()
+        edit(fr.ctx)
+        code, same = _prefilled_call(fr, pl, row)
+        fr.ctx[:] = keep
+        assert code == want and all(same), (want, code, same)
+    frr, plr, rowr = _base(fast, monkeypatch, run=True)
+    code, same = _prefilled_call(frr, _patch(plr, 36, '<i', struct.unpack_from('<i', plr, 36)[0] + 1), rowr)
+    assert code == -8 and all(same), (code, same)
+
+
+@pytest.mark.parametrize('field,i', [('x', 1), ('soul', 8), ('black', 9), ('bombs', 15), ('weapons', 37), ('ptype', 38)])
+@pytest.mark.parametrize('v', [float('nan'), float('inf'), 1e300])
+def test_bad_numbers_go_to_encode_row(fast, monkeypatch, field, i, v):
+    """(Codex round 23-1) a value encode_row turns into an integer, not safe for the C side: handed back (-15);
+    FastRow then raises what encode_row raises, or (a large finite value) writes encode_row's record."""
+    fr, pl, row = _base(fast, monkeypatch, rewind=False, items=False)
+    bad = _patch(pl, _PV + 8 * i, '<d', v)
+    dec_r, st_r = AL.LeanDecoder(), state('events', False, False)
+    ref = np.zeros(1, TO.ROW)
+    TO.encode_row(dec_r.decode(payload(0, v3=False, frame=None, **scenario('off', False))), st_r, ref, 0)
+    try:
+        TO.encode_row(dec_r.decode(bad), st_r, ref, 1)
+        ref['first'] = 0
+        want_exc = None
+    except Exception as exc:   # noqa: BLE001
+        want_exc = type(exc)
+    if want_exc is not None:
+        with pytest.raises(want_exc):
+            fr.encode(bad, row, row.ctypes.data, 1)
+    else:
+        fr.encode(bad, row, row.ctypes.data, 1)
+        assert row.tobytes() == ref.tobytes()
+    assert fr.reasons.get(-15) == 1

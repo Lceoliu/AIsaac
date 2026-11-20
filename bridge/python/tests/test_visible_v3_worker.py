@@ -262,6 +262,14 @@ def test_fastrow_hands_what_the_c_path_returns_to_encode_row(mode, monkeypatch, 
     fr._ptrs = (1, 1, 1)
     fr.encode(lean(), row, row.ctypes.data, 2)   # taken by the C path (in a v3 worker the real one hands it back)
     assert len(calls) == 4 and fr.fast == 1
+    if m == 2:   # (Codex round 23: restored) the real C path hands a v3 worker's record without a frame back (-13);
+        #          the real encode_row then refuses it, as it always did
+        monkeypatch.undo()
+        mode(m)
+        fr2 = FastRow(lambda *a: -13, EpisodeState(1000), al.LeanDecoder())
+        fr2._ptrs = (1, 1, 1)
+        with pytest.raises(VP.VisibleV3Fatal, match='no v3 frame'):
+            fr2.encode(lean(), np.zeros(1, ROW), row.ctypes.data, 2)
 
 
 def test_the_c_row_path_checks_a_v3_frame_as_write_visible():
