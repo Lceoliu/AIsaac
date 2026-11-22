@@ -83,6 +83,71 @@ def test_compact_rollout_gives_the_learner_the_same_records():
                     assert torch.equal(x, y)
 
 
+def test_recompute_stage_chunks_equal_take():
+    """(2026-11-22, train_tok --recompute-stage 1) the recompute pass's records staged once (rows_to_device into a stage
+    of stage_cols' bytes per record, with_raw) and each chunk decoded from a slice of the bytes with the host's entity
+    counts give take(every, part)'s batch: every field, the lazy v3 tensors materialized and the model's outputs equal,
+    for compact and ROW v3 rollouts."""
+    for compact in (True, False):
+        roll = _fill(compact, steps=6)
+        cap = roll.cap
+        flat = np.concatenate([w * cap + np.arange(int(roll.length[w])) for w in range(roll.n)]).astype(np.int64)
+        pend = roll.pending.reshape(-1, 5)[flat]
+        TP.stage_schema_check(roll.rows, flat)   # (all v3: accepted)
+        cols = TP.stage_cols(roll.rows, flat)
+        # (A1's review: a reused stage, larger than needed and holding old bytes -- 0xFF -- must not leak into a record)
+        stage = torch.full((len(flat) * cols + 3 * TP.ROW_BYTES,), 0xFF, dtype=torch.uint8)
+        every, raw_e, pend_e = TP.rows_to_device(roll.rows, flat, pend, 'cpu', stage=stage, with_raw=True,
+                                                 frames=roll.frames)
+        assert raw_e.shape[1] == cols, (compact, raw_e.shape, cols)
+        every0 = TP.rows_to_device(roll.rows, flat, pend, 'cpu', frames=roll.frames)   # (as with the switch off)
+        ne = roll.rows.reshape(-1)['n_ent'][flat].astype(np.int64)
+        wid = every['ent'].shape[1]
+        m = VP.build()
+        narrower = 0
+        for lo, hi in ((0, 7), (7, 19), (19, len(flat))):
+            part = torch.arange(lo, hi)
+            want = TP.take(every0, part)
+            ent_ = min(wid, TP.used_entities(ne[lo:hi]))
+            narrower += ent_ < wid   # (a chunk cut to fewer entity tokens than the whole set's)
+            got = TP.decode_rows(raw_e[lo:hi], pending=pend_e[lo:hi], entities=ent_)
+            assert got['ent'].shape[1] == want['ent'].shape[1] == ent_
+            assert set(got) == set(want), (set(got) ^ set(want))
+            for k in want:
+                if k == 'v3.raw':
+                    continue
+                x, y = got[k], want[k]
+                assert (torch.equal(x, y) if torch.is_tensor(x) else x == y), (compact, k)
+            vg, vw = VI.materialize(VI.get_batch(got)), VI.materialize(VI.get_batch(want))
+            assert set(vg) == set(vw) and vg
+            for k in vw:
+                assert torch.equal(vg[k], vw[k]), (compact, k)
+            with torch.no_grad():
+                for x, y in zip(m(got, need_vg=True), m(want, need_vg=True)):
+                    if torch.is_tensor(x):
+                        assert torch.equal(x, y), compact
+        assert narrower, 'no chunk narrower than the whole set: the entity cut untested'
+
+
+def test_recompute_stage_refuses_mixed_schemas():
+    """(A1's review) stage_schema_check: all v3 or all without a frame (schema 0) pass; a mix, or visible-v1 frames,
+    raise -- decode_rows picks the v3 decode per call, a chunk of only schema-0 records would decode otherwise."""
+    import pytest
+    from isaac_bridge.structured_input import VERSION as V1_VERSION
+    roll = _fill(False, steps=3)
+    flat = np.concatenate([w * roll.cap + np.arange(int(roll.length[w])) for w in range(roll.n)]).astype(np.int64)
+    TP.stage_schema_check(roll.rows, flat)
+    rows = roll.rows.copy()
+    rows.reshape(-1)['visible_schema'][flat[1]] = 0
+    with pytest.raises(ValueError, match='all v3'):
+        TP.stage_schema_check(rows, flat)
+    rows.reshape(-1)['visible_schema'][flat] = 0
+    TP.stage_schema_check(rows, flat)   # (no frame at all: accepted)
+    rows.reshape(-1)['visible_schema'][flat[2]] = V1_VERSION
+    with pytest.raises(ValueError, match='all v3'):
+        TP.stage_schema_check(rows, flat)
+
+
 def test_expand_rows_and_carry():
     rc, rr = _fill(True), _fill(False)
     m = int(rr.length.max())

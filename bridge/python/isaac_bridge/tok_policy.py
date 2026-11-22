@@ -2249,6 +2249,32 @@ def rows_to_device(rows, index, pending, device, stage=None, with_raw=False, hea
     return (out, dev_raw, pend) if with_raw else out
 
 
+def stage_cols(rows, index):
+    """(2026-11-22, train_tok --recompute-stage) the bytes per record rows_to_device(rows, index, ...) sends (head
+    False): what a stage for them must hold per record. Compact ROWC records, and ROW records with v3 frames only: up to
+    the longest frame (4-byte steps); other ROW records: ROW_BYTES."""
+    from .schema_v3 import VERSION as V3_VERSION
+    flat_ = rows.reshape(-1)
+    v3_ = len(index) and (rows.dtype.itemsize != ROW_BYTES or np.all(flat_['visible_schema'][index] == V3_VERSION))
+    if not v3_:
+        return ROW_BYTES
+    nb_ = int(np.asarray(flat_['visible_bytes'][index], np.int64).max())
+    return ROW.fields['visible_frame'][1] + (-(-max(nb_, 0) // 4) * 4)
+
+
+def stage_schema_check(rows, index):
+    """(2026-11-22, train_tok --recompute-stage, A1's review) the records' visible frames must be all v3 or all absent
+    (schema 0): decode_rows picks the v3 decode per call by whether its batch holds a v3 record, so a chunk's slice of a
+    mixed set could decode otherwise than the whole set's take(); visible-v1 frames take the host's frame counts, which
+    a slice does not carry. Raises ValueError otherwise."""
+    from .schema_v3 import VERSION as V3_VERSION
+    sch = rows.reshape(-1)['visible_schema'][index]
+    if len(sch) and not (np.all(sch == V3_VERSION) or np.all(sch == 0)):
+        kinds = sorted({int(v) for v in np.unique(sch)})
+        raise ValueError(f'--recompute-stage 1: the records\' visible frames must be all v3 ({V3_VERSION}) or all '
+                         f'absent (0); got schemas {kinds[:6]}')
+
+
 # (L-1, 2026-11-19, a measurement aid) True: TokPolicy's v3 forward marks its parts for the torch profiler
 # (record_function 'v3:decode' / 'v3:temporal_in' / 'v3:frame' / 'v3:heads'); train_tok sets it with
 # ISAAC_RL_B38_TORCHPROF. False: no marks.

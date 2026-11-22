@@ -44,7 +44,7 @@ class JobSampler:
     def __init__(self, stats):
         self.stats = stats
         self.aux = None
-        self.control = np.zeros(4, np.int64)
+        self.control = np.zeros(8, np.int64)   # (tok_sampler.CONTROL_N: train_tok writes the weights version to [4])
         self.live = True
         self.lane_rows = True
 
@@ -227,8 +227,22 @@ def run_bench(ctx):
     amp_ = ctx.get('amp')   # (train_tok's AMP: [True] in a --amp bf16 run)
     amp0 = amp_[0] if amp_ is not None else None
 
+    # (2026-11-22, the learner's update time) a path may end in overrides of the run's arguments, '@name=value' each:
+    #  micro (--micro), rchunk (--recompute-chunk) -- e.g. '1@micro=4096', '1@rchunk=8192@micro=4096'; every path
+    #  starts from the run's own values
+    over0 = dict(micro=args.micro, recompute_chunk=getattr(args, 'recompute_chunk', 0),
+                 recompute_stage=getattr(args, 'recompute_stage', 0))
+    over_names = dict(micro='micro', rchunk='recompute_chunk', rstage='recompute_stage')   # (rstage: --recompute-stage)
+
     def set_path(fast):
-        s_ = str(fast)
+        s_, *over_ = str(fast).split('@')
+        for k_, v_ in over0.items():
+            setattr(args, k_, v_)
+        for o_ in over_:
+            k_, _, v_ = o_.partition('=')
+            if k_ not in over_names or not v_.isdigit():
+                raise SystemExit(f'bench: path {fast}: unknown override {o_!r} (micro=N, rchunk=N, rstage=0/1)')
+            setattr(args, over_names[k_], int(v_))
         args.learner_fast = int(''.join(ch for ch in s_ if ch.isdigit()))
         L['p2_mode'] = next((m_ for ch, m_ in (('o', 'off'), ('s', 'serial'), ('p', 'two')) if ch in s_), None)
         bl_.SPATIAL_CKPT = 0 if 'k' in s_ else ckpt0
@@ -267,6 +281,13 @@ def run_bench(ctx):
                     U=dict(L['last_U']), trace=tr, peak=peak_,
                     weights=[p.detach().clone() for p in params] if trace else None)
 
+    if os.environ.get('ISAAC_RL_V3_PROBE') == '1':   # (2026-11-22: the a / b feasibility probe, measurement only)
+        from abplus_probe_v3 import probe
+        probe(ctx, one, Path(args.out))
+        _restore(start, model, opt, L)
+        L['bench'] = False
+        L['stop'] = True
+        return True
     for fast in list(paths):   # warm-up (first-call costs: cuDNN plans, allocator, compilation)
         try:
             for _ in range(2):

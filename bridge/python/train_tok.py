@@ -504,6 +504,40 @@ def profile_learn(learn, job, path):
     print(f'B38: the profile of one update written to {path}', flush=True)
 
 
+def recompute_stage_buffer(L, need, log=print):
+    """(2026-11-22, --recompute-stage 1) the pinned stage for an update's recompute pass of `need` bytes, kept in
+    L['stage_rc'] between updates, or None: this update recomputes unstaged (--recompute-stage 0's path, the same values
+    bit for bit). A stage too small is replaced by a larger one only when this torch can release its pinned cache
+    (torch._C._host_emptyCache): the old block would otherwise stay pinned in the caching host allocator beside the new
+    one, and the learner's RSS would step up at every growth (lane s: +1.9 -> +6 GB; Codex round 30). Each allocation,
+    growth and fallback is logged."""
+    import torch
+    from isaac_bridge.tok_policy import ROW_BYTES
+    cur = L.get('stage_rc')
+    if cur is not None and cur.numel() >= need:
+        return cur
+    release = getattr(torch._C, '_host_emptyCache', None)
+    size = int(need * 1.25) + 64 * ROW_BYTES
+    if cur is not None:
+        old = cur.numel()
+        if release is None:
+            L['stage_rc_fallbacks'] = L.get('stage_rc_fallbacks', 0) + 1
+            log(f'--recompute-stage: the stage ({old / 2 ** 20:.0f} MiB) is smaller than this update needs '
+                f'({need / 2 ** 20:.0f} MiB) and this torch has no pinned-cache release: this update recomputes '
+                f'unstaged (the same values), the stage kept (fallback {L["stage_rc_fallbacks"]})', flush=True)
+            return None
+        L['stage_rc'] = cur = None
+        release()   # (the old block, now free in the caching host allocator, unpinned before the new one)
+        L['stage_rc_grows'] = L.get('stage_rc_grows', 0) + 1
+        log(f'--recompute-stage: the stage grows {old / 2 ** 20:.0f} -> {size / 2 ** 20:.0f} MiB (the old block '
+            f'released first; growth {L["stage_rc_grows"]})', flush=True)
+    else:
+        how = 'available' if release is not None else 'not available: a larger need falls back to the unstaged pass'
+        log(f'--recompute-stage: the stage {size / 2 ** 20:.0f} MiB pinned (pinned-cache release {how})', flush=True)
+    L['stage_rc'] = torch.empty(size, dtype=torch.uint8).pin_memory()
+    return L['stage_rc']
+
+
 def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on, t_fb=True):
     """(B38 step 4, train_tok --learner-fast 2) what the start-of-update pass needs for the B18 fast path's host plans
     of records at flat positions of a rollout: per record its entity / door / item counts and its history token's
@@ -1969,7 +2003,8 @@ def main(argv=None, child=None, actor=None):
                                          drop_memory,
                                          ITEM_SHARED_KEY, share_item_table, item_count,
                                          pad_optimizer_state, plan_tokens, remap_optimizer_state, rows_to_device,
-                                         take, to_batch, used_entities, TemporalState, temporal_chunks,
+                                         take, to_batch, used_entities, stage_cols, stage_schema_check,
+                                         TemporalState, temporal_chunks,
                                          temporal_inputs, temporal_out, temporal_part)
     p = argparse.ArgumentParser()
     p.add_argument('--groups-file', required=True)
@@ -2009,6 +2044,17 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--micro', type=int, default=0,
                    help="rows per forward / backward pass: a minibatch's gradient is accumulated over parts of this "
                         'size (0: the whole minibatch at once). The step is the same, the GPU memory smaller')
+    p.add_argument("--recompute-chunk", type=int, default=0,
+                   help="(2026-11-22, the learner's update time) rows per forward pass of the recompute (the values / "
+                        "log-probabilities of the stored decisions from the weights at the update's start, no gradient): "
+                        "0 (default) --micro, or --minibatch without it, as before; larger: fewer passes, more memory")
+    p.add_argument('--recompute-stage', type=int, default=0, choices=(0, 1),
+                   help="(2026-11-22, the coordinator: --learner-fast 2's recompute staging on its own) 1: the "
+                        "recompute pass's records gathered once into a pinned buffer (sized to the bytes they need) and "
+                        "copied asynchronously; each chunk decoded from a slice of those bytes with its entity tokens "
+                        "from the host's counts (no gather of every field, no read of the device for the count). The "
+                        "same inputs, values and log-probabilities bit for bit; nothing else of --learner-fast (no host "
+                        "plans, no distinct grids, no fused Adam). 0 (default): as before")
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--lr-final', type=float, default=1e-4)
     p.add_argument('--lr-schedule', choices=('linear', 'cosine'), default='linear',
@@ -2569,6 +2615,16 @@ def main(argv=None, child=None, actor=None):
                         'the learner thread runs Python (default of Python: 0.005; B62: the default from '
                         'ISAAC_SWITCH_INTERVAL_US, 500 us when unset)')
     args = p.parse_args(argv)
+    if args.recompute_stage and args.learner_fast >= 2:
+        p.error('--recompute-stage 1 with --learner-fast 2: fast 2 stages the recompute pass already (one of them)')
+    if args.recompute_stage and args.block_memory:   # (A1's review: the block memory's recompute is a pass of its own)
+        p.error('--recompute-stage 1 does not act on --block-memory 1 (its recompute pass is block_learner\'s)')
+    if args.recompute_stage:   # (Codex round 30: whether a stage can grow, in the run's log from the start)
+        import torch as torch_rs_
+        how_ = ('available: a stage too small is replaced, the old one released'
+                if hasattr(torch_rs_._C, '_host_emptyCache') else
+                'not available: an update needing a larger stage recomputes unstaged, the stage kept')
+        print(f'--recompute-stage 1: pinned-cache release (torch._C._host_emptyCache) {how_}', flush=True)
     if args.temporal_rooms < 0:
         p.error('--temporal-rooms must be >= 0')
     from isaac_bridge.tok_obs import obs_visible_conflict
@@ -2817,6 +2873,15 @@ def main(argv=None, child=None, actor=None):
         if args.teach_merge and not args.teach_gpu:   # (Codex round 10: the CPU teacher merge joins an eager batch to
             # the learner's lazy v3 one -- cat_batch has no 'v3.raw' on one side)
             p.error('--frame v3 with --teach-merge 1 needs --teach-gpu 1 (the CPU teacher merge cannot join v3 batches)')
+        if args.learner_fast:   # (2026-11-22, the coordinator: a known defect, refused at once)
+            # B18's fast path predates the v3 frames: its raw minibatch merge joins the learner's record bytes, cut
+            # to the longest v3 frame of the set (rows_to_device, A-3 / seq-v1), to the teacher ring's whole ROW
+            # records -- torch.cat fails on the widths (part_prep, e.g. 49148 against 151880 bytes); and the v3
+            # forward reads none of its host plans (buckets / ekeep / xperm / distinct grids), its attention and
+            # layer norm parts only act in float32 outside --amp bf16 (P-driver-design.md / the learner notes)
+            p.error(f'--frame v3 does not support --learner-fast {args.learner_fast} (B18\'s raw minibatch merge '
+                    f'cannot join v3-truncated records with the teacher ring\'s; the fast path covers the old frame '
+                    f'encoder only): --learner-fast 0')
         if args.item_tokens or args.item_shared or item_slots != INV_CAP:
             p.error(f'--frame v3 takes no item tokens (the N / S tokens of the frame carry the items): --item-tokens 0 '
                     f'--item-shared 0 --item-slots {INV_CAP} (got {args.item_tokens} / {args.item_shared} / {item_slots})')
@@ -3928,6 +3993,8 @@ def main(argv=None, child=None, actor=None):
         # abplus_bench_learner.py --check, abplus_check_learner_fp64.py.
         fast = bool(args.learner_fast)
         fast2 = args.learner_fast >= 2   # (B38 step 4)
+        rstage = bool(args.recompute_stage) and not fast2   # (2026-11-22: fast 2's recompute staging alone)
+        rs_u = False   # (this update's recompute staged: rstage and recompute_stage_buffer gave a stage)
         # (ISAAC_RL_LEARNER_PARTS: a subset of the parts, for the bench's attribution; default all)
         fparts = set(os.environ.get('ISAAC_RL_LEARNER_PARTS', 'math,ekeep,buckets,nhwc,ln,dedup,logp,raw').split(',')
                      if fast else ())
@@ -4022,8 +4089,20 @@ def main(argv=None, child=None, actor=None):
                                                       stage=L['stage_r'], with_raw=True, frames=rl.frames)
                 fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on, t_fb)
             else:
-                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
-                                       frames=rl.frames)
+                stage_rc_ = None
+                if rstage:   # (--recompute-stage 1: fast 2's staging alone, the stage sized to the records' bytes)
+                    stage_schema_check(rl.rows, all_flat)   # (every record v3, or every one without a frame)
+                    stage_rc_ = recompute_stage_buffer(L, len(all_flat) * stage_cols(rl.rows, all_flat))
+                rs_u = stage_rc_ is not None   # (None: a fallback -- this update unstaged, as --recompute-stage 0)
+                if rs_u:
+                    every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat],
+                                                          device, stage=stage_rc_, with_raw=True, frames=rl.frames)
+                    ne_e = rl.rows.reshape(-1)['n_ent'][all_flat].astype(np.int64)   # (the host's entity counts)
+                    wid_e = every['ent'].shape[1]
+                else:
+                    every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
+                                           frames=rl.frames)
+                del stage_rc_
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
             # (memory: one GRU step from each decision's stored input state)
             h_all = torch.from_numpy(rl.h.reshape(-1, mem_dim)[all_flat]).to(device) if mem_on else None
@@ -4043,11 +4122,15 @@ def main(argv=None, child=None, actor=None):
                 U['log'] += time.perf_counter() - t_l0
             m_r = pmark('b38:recompute')
             with torch.inference_mode():
-                chunk = args.micro or args.minibatch
+                chunk = args.recompute_chunk or args.micro or args.minibatch
                 for at in range(0, len(all_flat), chunk):
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
                     b_p = fast_plan_rows(fr_, raw_e, pend_e, at, min(at + chunk, len(all_flat)), fparts, n_buckets,
                                          NI_f, G_f, t_on) if fast2 else None
+                    if rs_u:   # (--recompute-stage 1: take(every, part)'s batch, decoded from a slice of the bytes)
+                        hi_ = min(at + chunk, len(all_flat))
+                        b_p = decode_rows(raw_e[at:hi_], pending=pend_e[at:hi_],
+                                          entities=min(wid_e, used_entities(ne_e[at:hi_])))
                     if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
                         b_p = take(every, part) if b_p is None else b_p
                         tk_p = tk_all(part)
@@ -4084,6 +4167,8 @@ def main(argv=None, child=None, actor=None):
             else:
                 value_now = None
             prox_all = torch.cat(lps)
+            if rs_u:   # (lane s, 2026-11-22: the last chunk's batch is views of raw_e -- kept, it held the whole
+                b_p = None   #  records' bytes on the device through the PPO epochs, about 1.7 GB)
             pmark(None, m_r)
             sec('recompute')
             if s_plan is not None:   # (the host's records now: the rollout is the actor's again after `fresh`)
@@ -4097,7 +4182,7 @@ def main(argv=None, child=None, actor=None):
             vg_now = np.zeros_like(rl.value)
             if not vgs:   # (no recompute pass: one of its own, a chunk of records at a time)
                 with torch.inference_mode():
-                    chunk = args.micro or args.minibatch
+                    chunk = args.recompute_chunk or args.micro or args.minibatch
                     for at in range(0, len(all_flat), chunk):
                         idx_ = all_flat[at:at + chunk]
                         tk_ = {}
@@ -4162,6 +4247,8 @@ def main(argv=None, child=None, actor=None):
             if args.decoupled:
                 prox = prox_all[pos].clone()
             del every, prox_all
+            if rs_u:   # (A1's review of --recompute-stage: the records' bytes on the device not kept past here)
+                del raw_e, pend_e, ne_e
         else:
             stage = None
             if fast:   # B18: gathered into a pinned buffer kept between updates, copied asynchronously
