@@ -1969,7 +1969,8 @@ def main(argv=None, child=None, actor=None):
                                          drop_memory,
                                          ITEM_SHARED_KEY, share_item_table, item_count,
                                          pad_optimizer_state, plan_tokens, remap_optimizer_state, rows_to_device,
-                                         take, to_batch, used_entities, stage_cols, TemporalState, temporal_chunks,
+                                         take, to_batch, used_entities, stage_cols, stage_schema_check,
+                                         TemporalState, temporal_chunks,
                                          temporal_inputs, temporal_out, temporal_part)
     p = argparse.ArgumentParser()
     p.add_argument('--groups-file', required=True)
@@ -2580,6 +2581,10 @@ def main(argv=None, child=None, actor=None):
                         'the learner thread runs Python (default of Python: 0.005; B62: the default from '
                         'ISAAC_SWITCH_INTERVAL_US, 500 us when unset)')
     args = p.parse_args(argv)
+    if args.recompute_stage and args.learner_fast >= 2:
+        p.error('--recompute-stage 1 with --learner-fast 2: fast 2 stages the recompute pass already (one of them)')
+    if args.recompute_stage and args.block_memory:   # (A1's review: the block memory's recompute is a pass of its own)
+        p.error('--recompute-stage 1 does not act on --block-memory 1 (its recompute pass is block_learner\'s)')
     if args.temporal_rooms < 0:
         p.error('--temporal-rooms must be >= 0')
     from isaac_bridge.tok_obs import obs_visible_conflict
@@ -2815,8 +2820,6 @@ def main(argv=None, child=None, actor=None):
         tok_kw.update(temporal=True, temporal_width=args.temporal_width, temporal_layers=args.temporal_layers,
                       temporal_heads=args.temporal_heads, temporal_window=args.temporal_window,
                       temporal_rooms=args.temporal_rooms, temporal_feedback=args.temporal_feedback)
-    if args.recompute_stage and args.learner_fast >= 2:
-        p.error('--recompute-stage 1 with --learner-fast 2: fast 2 stages the recompute pass already (one of them)')
     from isaac_bridge.visible_producer import VISIBLE_V3_MODE
     if args.frame == 'v3':   # (seq-v1 step 3)
         if not VISIBLE_V3_MODE:
@@ -4045,10 +4048,7 @@ def main(argv=None, child=None, actor=None):
                                                       stage=L['stage_r'], with_raw=True, frames=rl.frames)
                 fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on, t_fb)
             elif rstage:   # (--recompute-stage 1: fast 2's staging alone, the stage sized to the records' bytes)
-                from isaac_bridge.structured_input import VERSION as V1_VERSION
-                if np.any(rl.rows.reshape(-1)['visible_schema'][all_flat] == V1_VERSION):   # (their decode takes the
-                    #   host's frame counts, which a chunk's slice does not carry: not covered)
-                    raise RuntimeError('--recompute-stage 1: records with visible-v1 frames are not supported')
+                stage_schema_check(rl.rows, all_flat)   # (every record v3, or every one without a frame)
                 need_ = len(all_flat) * stage_cols(rl.rows, all_flat)
                 if L.get('stage_rc') is None or L['stage_rc'].numel() < need_:
                     L['stage_rc'] = None
@@ -4202,6 +4202,8 @@ def main(argv=None, child=None, actor=None):
             if args.decoupled:
                 prox = prox_all[pos].clone()
             del every, prox_all
+            if rstage:   # (A1's review of --recompute-stage: the records' bytes on the device not kept past here)
+                del raw_e, pend_e, ne_e
         else:
             stage = None
             if fast:   # B18: gathered into a pinned buffer kept between updates, copied asynchronously

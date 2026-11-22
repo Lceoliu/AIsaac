@@ -93,8 +93,10 @@ def test_recompute_stage_chunks_equal_take():
         cap = roll.cap
         flat = np.concatenate([w * cap + np.arange(int(roll.length[w])) for w in range(roll.n)]).astype(np.int64)
         pend = roll.pending.reshape(-1, 5)[flat]
+        TP.stage_schema_check(roll.rows, flat)   # (all v3: accepted)
         cols = TP.stage_cols(roll.rows, flat)
-        stage = torch.zeros(len(flat) * cols, dtype=torch.uint8)   # (1-D, exactly the bytes: the train_tok layout)
+        # (A1's review: a reused stage, larger than needed and holding old bytes -- 0xFF -- must not leak into a record)
+        stage = torch.full((len(flat) * cols + 3 * TP.ROW_BYTES,), 0xFF, dtype=torch.uint8)
         every, raw_e, pend_e = TP.rows_to_device(roll.rows, flat, pend, 'cpu', stage=stage, with_raw=True,
                                                  frames=roll.frames)
         assert raw_e.shape[1] == cols, (compact, raw_e.shape, cols)
@@ -102,10 +104,14 @@ def test_recompute_stage_chunks_equal_take():
         ne = roll.rows.reshape(-1)['n_ent'][flat].astype(np.int64)
         wid = every['ent'].shape[1]
         m = VP.build()
+        narrower = 0
         for lo, hi in ((0, 7), (7, 19), (19, len(flat))):
             part = torch.arange(lo, hi)
             want = TP.take(every0, part)
-            got = TP.decode_rows(raw_e[lo:hi], pending=pend_e[lo:hi], entities=min(wid, TP.used_entities(ne[lo:hi])))
+            ent_ = min(wid, TP.used_entities(ne[lo:hi]))
+            narrower += ent_ < wid   # (a chunk cut to fewer entity tokens than the whole set's)
+            got = TP.decode_rows(raw_e[lo:hi], pending=pend_e[lo:hi], entities=ent_)
+            assert got['ent'].shape[1] == want['ent'].shape[1] == ent_
             assert set(got) == set(want), (set(got) ^ set(want))
             for k in want:
                 if k == 'v3.raw':
@@ -120,6 +126,26 @@ def test_recompute_stage_chunks_equal_take():
                 for x, y in zip(m(got, need_vg=True), m(want, need_vg=True)):
                     if torch.is_tensor(x):
                         assert torch.equal(x, y), compact
+        assert narrower, 'no chunk narrower than the whole set: the entity cut untested'
+
+
+def test_recompute_stage_refuses_mixed_schemas():
+    """(A1's review) stage_schema_check: all v3 or all without a frame (schema 0) pass; a mix, or visible-v1 frames,
+    raise -- decode_rows picks the v3 decode per call, a chunk of only schema-0 records would decode otherwise."""
+    import pytest
+    from isaac_bridge.structured_input import VERSION as V1_VERSION
+    roll = _fill(False, steps=3)
+    flat = np.concatenate([w * roll.cap + np.arange(int(roll.length[w])) for w in range(roll.n)]).astype(np.int64)
+    TP.stage_schema_check(roll.rows, flat)
+    rows = roll.rows.copy()
+    rows.reshape(-1)['visible_schema'][flat[1]] = 0
+    with pytest.raises(ValueError, match='all v3'):
+        TP.stage_schema_check(rows, flat)
+    rows.reshape(-1)['visible_schema'][flat] = 0
+    TP.stage_schema_check(rows, flat)   # (no frame at all: accepted)
+    rows.reshape(-1)['visible_schema'][flat[2]] = V1_VERSION
+    with pytest.raises(ValueError, match='all v3'):
+        TP.stage_schema_check(rows, flat)
 
 
 def test_expand_rows_and_carry():

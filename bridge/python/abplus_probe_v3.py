@@ -184,9 +184,11 @@ def probe(ctx, one, out_dir):
 
     # (b) compile: forward_packed, fixed shapes, then dynamic, forward + backward under the run's autocast
     if os.environ.get('ISAAC_RL_V3_PROBE_COMPILE', '1') == '1' and keep:
-        import torch._dynamo
-        from torch._dynamo.utils import counters
-        cfg = torch._dynamo.config
+        import importlib   # (not 'import torch._dynamo': that binds torch as a local name of probe(), and the
+        #                     census's wrapper, a closure, then finds it unassigned)
+        dynamo = importlib.import_module('torch._dynamo')
+        counters = importlib.import_module('torch._dynamo.utils').counters
+        cfg = dynamo.config
         for name_ in ('cache_size_limit', 'recompile_limit', 'accumulated_cache_size_limit',
                       'accumulated_recompile_limit'):
             if hasattr(cfg, name_):
@@ -212,7 +214,7 @@ def probe(ctx, one, out_dir):
         items = list(keep.values())
         comp = []
         for dyn in (False, True):
-            torch._dynamo.reset()
+            dynamo.reset()
             counters.clear()
             cfn = torch.compile(orig_fp, dynamic=dyn)
             rows_ = []
@@ -235,7 +237,7 @@ def probe(ctx, one, out_dir):
                              stats={k: {kk: int(vv) for kk, vv in list(v_.items())[:12]} for k, v_ in st.items()}))
             print(f'probe compile dynamic={dyn}: {json.dumps(comp[-1])}', flush=True)
         res['compile'] = comp
-        torch._dynamo.reset()
+        dynamo.reset()
     for p_ in model.parameters():
         p_.grad = None
     try:

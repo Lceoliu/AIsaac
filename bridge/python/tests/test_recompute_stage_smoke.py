@@ -56,3 +56,7 @@ def test_refuses_with_fast2(capsys, tmp_path):
         train_tok.main(['--groups-file', str(tmp_path / 'missing.json'), '--out', str(tmp_path / 'o'),
                         '--recompute-stage', '1', '--learner-fast', '2'])
     assert '--recompute-stage 1 with --learner-fast 2' in capsys.readouterr().err
+    with pytest.raises(SystemExit):   # (A1's review: the block memory's recompute is a pass of its own)
+        train_tok.main(['--groups-file', str(tmp_path / 'missing.json'), '--out', str(tmp_path / 'b'),
+                        '--recompute-stage', '1', '--block-memory', '1'])
+    assert '--recompute-stage 1 does not act on --block-memory 1' in capsys.readouterr().err
