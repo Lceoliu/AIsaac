@@ -280,6 +280,13 @@ def run_bench(ctx):
                     U=dict(L['last_U']), trace=tr, peak=peak_,
                     weights=[p.detach().clone() for p in params] if trace else None)
 
+    if os.environ.get('ISAAC_RL_V3_PROBE') == '1':   # (2026-11-22: the a / b feasibility probe, measurement only)
+        from abplus_probe_v3 import probe
+        probe(ctx, one, Path(args.out))
+        _restore(start, model, opt, L)
+        L['bench'] = False
+        L['stop'] = True
+        return True
     for fast in list(paths):   # warm-up (first-call costs: cuDNN plans, allocator, compilation)
         try:
             for _ in range(2):
