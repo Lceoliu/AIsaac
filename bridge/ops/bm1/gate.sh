@@ -21,9 +21,10 @@ while [ $i -le $RUNS ]; do
   rc=$?
   # (2026-11-20, A1 / the coordinator: seq2's gate) the second pass: the tests marked fork_in_process (they fork the
   #  pytest process; tests/conftest.py skips them while a device is visible) in their own pytest process with no device
-  #  visible -- the whole suite collected, only these selected; its summary line appended to the log
-  DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 -e CUDA_VISIBLE_DEVICES= ${ENVS:-}" \
-    $BM/run.sh gate2-$TREE $GPU sh -c "cd $BM1_IN/trees/$TREE/bridge/python && timeout 1800 $BM1_PY -m pytest tests -q -rs -p no:cacheprovider -m fork_in_process" > $GL.fork 2>&1
+  #  visible -- the whole suite collected, only these selected; its summary line appended to the log. (2026-11-22: the
+  #  device hidden inside the command -- run.sh refuses CUDA_VISIBLE_DEVICES in the environment it is given, exit 2)
+  DOCK_ENV="-e CUBLAS_WORKSPACE_CONFIG=:4096:8 ${ENVS:-}" \
+    $BM/run.sh gate2-$TREE $GPU sh -c "export CUDA_VISIBLE_DEVICES= && cd $BM1_IN/trees/$TREE/bridge/python && timeout 1800 $BM1_PY -m pytest tests -q -rs -p no:cacheprovider -m fork_in_process" > $GL.fork 2>&1
   rc2=$?
   fork_line="fork_in_process pass rc=$rc2: $(grep -a -E 'passed|failed|error' $GL.fork | tail -1 | cut -c1-120)"
   echo "$fork_line" >> $GL
