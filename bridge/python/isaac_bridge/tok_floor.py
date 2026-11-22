@@ -461,6 +461,67 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     slot_address = (slots[0].ctypes.data, slots[1].ctypes.data)
     TOB.configure_worker(index)   # (round 24 C: check mode in a canary worker, ISAAC_RL_FAST_ROW_CHECK_WORKERS)
     tm_tick = worker_tracemalloc(index)   # (the memory ledger's diagnostic: off unless ISAAC_WORKER_TRACEMALLOC)
+    # P package (Codex 17-4, the training run's reconciliation; ISAAC_TOK_AUDIT=<dir>): this worker's first
+    # ISAAC_TOK_AUDIT_N records as sent -- (episode, t, the snapshot request, the row's bytes up to its frame's end) --
+    # and each reply as read -- (episode, t of the record answered, the actions, main_value, main_vg); tools/p_audit.py
+    # reconciles them with the rollouts handed to the learner (--dump-rollouts)
+    audit = None
+    main_value = main_vg = cf_snap = None   # (set below when the lanes / the counterfactual teacher are on)
+    # (P-driver-design 15, the CPU ledger: a diagnostic, off unless set) ISAAC_WORKER_PROF=<dir>[:<seconds>]: worker 0's
+    # main loop under the standard library's cProfile for that many seconds of records (default 60), its stats to
+    # <dir>/worker0.pstats and worker0.txt (by own time and by cumulative time)
+    wprof = None
+    if index == 0 and os.environ.get('ISAAC_WORKER_PROF'):
+        import cProfile as cProfile_
+        wp_dir, _, wp_s = os.environ['ISAAC_WORKER_PROF'].partition(':')
+        wprof = dict(p=cProfile_.Profile(), dir=wp_dir, s=float(wp_s or 60), t=None, n=0)
+
+    def wprof_tick():
+        nonlocal wprof
+        now_ = time.perf_counter()
+        if wprof['t'] is None:
+            wprof['t'] = now_
+            wprof['p'].enable()
+            return
+        wprof['n'] += 1
+        if now_ - wprof['t'] >= wprof['s']:
+            wprof['p'].disable()
+            import pstats as pstats_
+            wprof['p'].dump_stats(os.path.join(wprof['dir'], 'worker0.pstats'))
+            with open(os.path.join(wprof['dir'], 'worker0.txt'), 'w') as f_:
+                f_.write(f'worker 0: {wprof["n"]} records in {now_ - wprof["t"]:.1f} s under cProfile' + chr(10))
+                ps_ = pstats_.Stats(wprof['p'], stream=f_)
+                ps_.sort_stats('tottime').print_stats(45)
+                ps_.sort_stats('cumulative').print_stats(45)
+            wprof = None
+    if os.environ.get('ISAAC_TOK_AUDIT'):
+        import pickle as pickle_
+        from .tok_obs import ROW as ROW_
+        audit = dict(f=open(os.path.join(os.environ['ISAAC_TOK_AUDIT'], f'w{index:03d}.pkl'), 'wb'), n=0,
+                     cap=int(os.environ.get('ISAAC_TOK_AUDIT_N', '1500')), last=None, dump=pickle_.dump,
+                     fa=ROW_.fields['visible_frame'][1])
+
+    def audit_sent(row, ep, t, cf):
+        if audit is None or audit['n'] >= audit['cap']:
+            if audit is not None:
+                audit['last'] = None
+                if not audit.get('cut'):   # (Codex 18-3: where the log stops, said in the log)
+                    audit['cut'] = True
+                    audit['dump'](('cut', audit['n'], int(ep), int(t)), audit['f'])
+                    audit['f'].flush()
+            return
+        audit['n'] += 1
+        nb_ = int(row['visible_bytes'][0])
+        e_ = min(audit['fa'] + ((max(nb_, 0) + 3) & ~3), row.dtype.itemsize)
+        audit['dump'](('s', int(ep), int(t), int(cf), row.view(np.uint8).reshape(-1)[:e_].tobytes()), audit['f'])
+        audit['last'] = (int(ep), int(t))
+
+    def audit_got(action, value, vg):
+        if audit is None or audit['last'] is None:
+            return
+        audit['dump'](('r',) + audit['last'] + (action, value, vg), audit['f'])
+        audit['last'] = None
+        audit['f'].flush()
     fast_fn = fast_row_function(row_library(cfg))   # None: LeanDecoder + encode_row as before
     # 2026-11-03 (tok_priv, cfg.priv): this worker's slots of the privileged records and its map version counter
     priv_on = bool(getattr(cfg, 'priv', False)) and not evaluation
@@ -1944,6 +2005,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 bped_row[:len(bped)] = bped
             try:
                 while True:
+                    if wprof is not None:
+                        wprof_tick()
                     t0 = time.perf_counter()
                     row = slots[t_ep & 1]
                     inv_before = st.inv_counts   # (branches: a record that gains an item replaces the dict)
@@ -2090,6 +2153,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     if waiting:   # the answer to the record before this one: the action of the step to come
                         receive()
                         action = tuple(int(v) for v in actions[index])
+                        if audit is not None:
+                            audit_got(action, float(main_value[index]) if main_value is not None else None,
+                                      float(main_vg[index]) if main_vg is not None else None)
                         if branching:   # Phase B2: the actor's outputs for record t_ep - 1 (hist[t] is record t's)
                             hist.append((float(aux[index, AUX_LOGP]), float(aux[index, AUX_PRED]),
                                          float(aux[index, AUX_UNCERT])))
@@ -2117,11 +2183,17 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         #             of this worker is outstanding)
                         cf_snap[index] = cf_snap_req
                         cf_snap_req = 0
+                    if audit is not None:
+                        audit_sent(slots[t_ep & 1], episode_n, t_ep, cf_snap[index] if cf_snap is not None else 0)
                     conn.send_bytes(b'1' if t_ep & 1 else b'0')
                     waiting = True
                     if done or control[0]:
                         receive()   # nothing may be outstanding when the next episode starts
                         waiting = False
+                        if audit is not None:   # (no action taken; Codex 19-1: an end the actor answered -- a
+                            #   truncation / a branch's end -- has its value written for the bootstrap: logged)
+                            audit_got(None, float(main_value[index]) if main_value is not None else None,
+                                      float(main_vg[index]) if main_vg is not None else None)
                     t2 = time.perf_counter()
                     mine[ST['wait_s']] += t2 - t1
                     if done or control[0]:
@@ -2224,6 +2296,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                           file=sys.stderr, flush=True)
                 if waiting:
                     conn.recv_bytes()
+                    if audit is not None:
+                        audit_got(None, None, None)
                 for h in hurts:
                     h[1].release()
                 for h in v2_pts:   # 2026-10-10 (teacher v2)
@@ -2304,6 +2378,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 inst.close()
         if gate is not None:
             gate.close()
+        if audit is not None:   # (Codex 18-3: the worker's end, said in its log)
+            try:
+                audit['dump'](('end', 'x', audit['n']), audit['f'])
+                audit['f'].close()
+            except (OSError, ValueError):
+                pass
         try:
             conn.send_bytes(b'x')
         except OSError:

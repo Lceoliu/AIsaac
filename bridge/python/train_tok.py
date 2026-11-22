@@ -261,6 +261,37 @@ from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig
                                       default_stub_list)
 
 
+def _cuda_sched():
+    """(P package, 2026-11-20, the CPU ledger) ISAAC_CUDA_SCHED=spin | yield | blocking: the CUDA primary contexts'
+    scheduling policy, set before torch creates them in this process (the trainer, and the spawned learner process,
+    which imports this module again) -- one setting for every synchronisation: torch's on the Python path, the C++
+    driver's cudaStreamSynchronize. Unset: CUDA's default (auto: spin while the process has fewer active contexts than
+    the machine has cores, else yield). The forked workers never use CUDA."""
+    mode = os.environ.get('ISAAC_CUDA_SCHED', '')
+    if not mode:
+        return
+    flags = {'auto': 0, 'spin': 1, 'yield': 2, 'blocking': 4}
+    if mode not in flags:
+        raise SystemExit(f'ISAAC_CUDA_SCHED={mode!r}: auto, spin, yield or blocking')
+    import ctypes
+    cu = ctypes.CDLL('libcuda.so.1')
+    if cu.cuInit(0) != 0:
+        raise SystemExit('ISAAC_CUDA_SCHED: cuInit failed')
+    n = ctypes.c_int()
+    cu.cuDeviceGetCount(ctypes.byref(n))
+    set_flags = getattr(cu, 'cuDevicePrimaryCtxSetFlags_v2', None) or cu.cuDevicePrimaryCtxSetFlags
+    for i in range(n.value):
+        dev = ctypes.c_int()
+        cu.cuDeviceGet(ctypes.byref(dev), i)
+        r = set_flags(dev, ctypes.c_uint(flags[mode]))
+        if r != 0:
+            raise SystemExit(f'ISAAC_CUDA_SCHED: cuDevicePrimaryCtxSetFlags({i}, {mode}) failed ({r})')
+    print(f'CUDA scheduling: {mode} ({n.value} devices, pid {os.getpid()})', flush=True)
+
+
+_cuda_sched()
+
+
 ROOM_REWARD = 'damage=1,hurt=0.75,clear=1,death=2,timeout=1,time=0.002'
 # whole floors: room = a room with monsters cleared, explore = a room entered for the first time, boss = the boss
 # room cleared (on top of room), exit = the next floor reached
@@ -1065,6 +1096,8 @@ class Episodes:
         # (2026-11-12) the workers' ep_archive stats column (a view; None: not known): each episode's 'start', fresh /
         # archive, read at its first record (the worker writes it before sending that record)
         self.origin = None
+        self.origin_rec = None   # (P package, Codex 17-5) per record of this arrive: the column at each record's take
+        self.audit_last = None   # (P audit, Codex 19-2) (episode [W], t [W]) of each worker's last record arrived
         self.ep_start = {}
         self.seen_inv = None                     # 2026-10-08 (lab on): held collectibles at ordinary episodes' ends
         self.inv0 = {}                           # 2026-10-08: worker -> collectibles held at the episode's first record
@@ -1243,7 +1276,9 @@ class Episodes:
         the episode's start (fresh / archive) when the workers' column is known."""
         for j in np.flatnonzero(first):
             r = rows[j]
-            if self.origin is not None:
+            if self.origin_rec is not None:
+                self.ep_start[int(idx[j])] = 'archive' if self.origin_rec[j] > 0 else 'fresh'
+            elif self.origin is not None:
                 self.ep_start[int(idx[j])] = 'archive' if self.origin[int(idx[j])] > 0 else 'fresh'
             self.ep_meta[int(idx[j])] = (int(r['group']), int(r['seed']), int(r['branch']), int(r['point']),
                                          int(r['lab']))
@@ -1418,6 +1453,8 @@ class Episodes:
                       f'with no open decision (dropped at the worker\'s capacity): its rollback {amount:+.4f} lost '
                       f'(rewind_lost {self.rewind_lost})', flush=True)
         self.note_first(rows, idx, first)
+        if self.audit_last is not None:   # (P audit, Codex 19-2: each worker's last record taken, any kind)
+            self.audit_last[0][idx], self.audit_last[1][idx] = rows['episode'], rows['t']
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
             self.gains[idx] = gains_now
         if self.new_on:   # (2026-11-19) an episode's first record: its held ids; every record: its stage, holdings
@@ -3944,7 +3981,7 @@ def main(argv=None, child=None, actor=None):
             (out / 'rollouts').mkdir(exist_ok=True)
             stem = out / 'rollouts' / f'rollout-{L["update"]:06d}'
             np.savez(str(stem) + '.npz', **{k: (expand_rows(rl, m) if k == 'rows' else getattr(rl, k)[:, :m]) for k in (
-                'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version')},
+                'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version', 'boot')},
                 **({'value_g': rl.value_g[:, :m]} if getattr(rl, 'value_g', None) is not None else {}),
                 length=rl.length, open=rl.open, update=L['update'],
                 row_schema=ROW_SCHEMA)   # (2026-11-20: dumps without it carry padding bytes in ROW 'rewind')
@@ -5461,6 +5498,11 @@ def main(argv=None, child=None, actor=None):
             'p_tick': prof.get('tick', 0.0), 'p_control': prof.get('control', 0.0),
             'p_weights': prof.get('weights', 0.0), 'p_main_ready': prof.get('main_ready', 0.0),
             'p_store': prof['store'], 'polls': prof['polls'],
+            # (P package: ms per record from its poll / its read by the C++ driver to its reply; the driver's calls,
+            #  its time short of credits and in calls)
+            'p_ready_reply_ms': 1000 * prof.get('rr_s', 0.0) / max(prof.get('rr_n', 0), 1),
+            'p_drv_calls': prof.get('drv_calls', 0), 'p_drv_credit_s': prof.get('drv_credit_s', 0.0),
+            'p_drv_call_s': prof.get('drv_call_s', 0.0),
             'idle_share': dst['wait_s'] / max(n * job['cycle_s'], 1e-9), 'w_step': dst['step_s'],
             'w_wait': dst['wait_s'], 'w_encode': dst['encode_s'], 'w_fork': dst['fork_s'], 'w_teach': dst['teach_s'],
             'w_overrun': dst.get('overrun_s', 0.0), 'w_state': dst.get('state_s', 0.0),
@@ -6292,6 +6334,42 @@ def main(argv=None, child=None, actor=None):
     wcols = ('step_s', 'wait_s', 'encode_s', 'fork_s', 'teach_s', 'overrun_s', 'state_s', 'close_s')
     sync_wait = 0.0
 
+    # P package phase 1 (2026-11-19): ISAAC_TOK_CPP_DRIVER=1 the main answers through the C++ driver where this run is
+    # one phase 1 supports (else the Python loop, the reason printed); 2: required (a run it does not support, or a
+    # failed build, ends here: the acceptance runs cannot pass on the Python loop); 0 / unset: the Python loop.
+    tok_mode = int(os.environ.get('ISAAC_TOK_CPP_DRIVER', '0') or 0) if child is None else 0
+    tok_dc = [None, False]
+
+    def _dev_key(d_):   # ('cuda', 0) for 'cuda' / 'cuda:0' / torch.device('cuda', 0)
+        d_ = torch.device(d_)
+        return d_.type, (d_.index or 0) if d_.type == 'cuda' else d_.index
+
+    def tok_driver_start():
+        from isaac_bridge import tok_consumer, tok_driver
+        why = tok_consumer.supported(
+            args, t_on=t_on, mem_on=mem_on, frame_v3=args.frame == 'v3', block_on=block_on, proc=proc, n_act=n_act,
+            snaps=snaps, priv_on=priv_pending is not None, pf_on=pf_on, lab=lab is not None, aux=aux is not None,
+            plr=getattr(book, 'plr', None) is not None,
+            lanes_gpu=lanes is not None and _dev_key(getattr(lanes, 'device', device)) != _dev_key(device),
+            use_graphs=use_graphs, b52=cpp_driver is not None)
+        mod = None if why else tok_driver.load(verbose=True)
+        if why is None and mod is None:
+            why = f'the extension: {tok_driver.REASON}'
+        if why:
+            if tok_mode >= 2:
+                raise RuntimeError(f'P package: ISAAC_TOK_CPP_DRIVER=2 and the driver cannot run: {why}')
+            print(f'P package: the C++ driver off ({why}); the Python loop', flush=True)
+            return None
+        if book.origin is not None:   # (Codex 17-5: the driver copies each record's ep_archive at its take)
+            sampler.origin_column = book.origin
+        dc = tok_consumer.DriverCollect(mod, model, sampler, n, g_ents, gkw, t_state, bank_tstate, actor_stream,
+                                        version, CAP_T, TRUNC,
+                                        priv_dtype=priv_pending.dtype if priv_pending is not None else None,
+                                        pin_cpus=driver_cpus if tok_pin else None)
+        print(f'P package: the C++ driver on (graphs {dc.mid.m.n_graphs()}, blocks {len(dc.blocks)} x {n}, ring {dc.K} '
+              f'rows)', flush=True)
+        return dc
+
     def take_weights():
         nonlocal version, busy
         fresh.clear()
@@ -6369,6 +6447,7 @@ def main(argv=None, child=None, actor=None):
         torch.cuda.synchronize()
 
     priv_pending = np.zeros(n, PRIV_DTYPE) if (priv_on and child is None) else None   # (tok_priv)
+    ready_at = np.zeros(n)   # (P package: when each worker's record was taken by a poll)
 
     def answer(prof, a_idx, sub, under_way, actions, logp, value, extra=None, ver=None, h=None, vg=None, t=None,
                block_context=None):
@@ -6400,6 +6479,8 @@ def main(argv=None, child=None, actor=None):
         sampler.reply(a_idx)
         t3 = time.perf_counter()
         prof['reply'] += t3 - t2
+        prof['rr_s'] = prof.get('rr_s', 0.0) + float((t3 - ready_at[a_idx]).sum())   # (P: ready -> reply)
+        prof['rr_n'] = prof.get('rr_n', 0) + len(a_idx)
         store(roll, a_idx, sub, under_way, actions, logp, value, version if ver is None else ver, h, vg, t,
               priv_pending[a_idx] if priv_pending is not None else None,block_context=block_context)
         pending[a_idx] = actions
@@ -6468,6 +6549,19 @@ def main(argv=None, child=None, actor=None):
                 raise SystemExit('CPU plan: ' + bad_pin)
             print(f'P package: the actor main thread on CPUs {sorted(got_pin)} (ISAAC_TOK_PIN, read back)', flush=True)
         nsys_win = nv.profiler_window()
+        if os.environ.get('ISAAC_TOK_AUDIT') and child is None:   # (P package, Codex 17-4: the reconciliation's start --
+            #   the book as configured before any record (its state), the rules; tools/p_audit.py rebuilds the
+            #   rollouts from the workers' logs with it)
+            import pickle as pickle_
+            try:
+                st_ = {k_: v_ for k_, v_ in vars(book).items() if k_ not in ('origin', 'plr')}
+                with open(os.path.join(os.environ['ISAAC_TOK_AUDIT'], 'book.pkl'), 'wb') as f_:
+                    pickle_.dump(dict(book=st_, cap_t=CAP_T, trunc=TRUNC, workers=n, nh=nh, capacity=capacity,
+                                      rollout=args.rollout, driver=tok_mode, mode=args.mode, items=bool(items),
+                                      rw=rw, floor=bool(floor), run=bool(run)), f_)
+            except Exception as e_:
+                print(f'P audit: the book could not be saved: {type(e_).__name__}: {e_}', flush=True)
+            book.audit_last = (np.full(n, -1, np.int64), np.full(n, -1, np.int64))
         while True:
             go_on = ((handed < target_decisions if n_act == 1 and not args.max_updates else sent_handoffs < n_handoffs)
                      and sampler.live and not L.get('stop') and not stopped())
@@ -6768,7 +6862,27 @@ def main(argv=None, child=None, actor=None):
                 nv.push('actor.collect')   # (B57: the collect window, for the learner's per-window speeds)
                 run_driver_collect(prof)
                 nv.pop()
-            while cpp_driver is None and roll.usable() < rollout_actor and sampler.live and not stopped():
+            if tok_mode and tok_dc[0] is None and not tok_dc[1]:   # (P package phase 1: at the first collect)
+                tok_dc[0] = tok_driver_start()
+                tok_dc[1] = True
+            if tok_dc[0] is not None:   # (P package phase 1: the answers in the C++ driver, book / store here)
+                class _W:
+                    @staticmethod
+                    def ready():
+                        return busy and fresh.is_set()
+
+                    def __call__(self):
+                        if lanes is not None:
+                            lanes.quiesce()
+                        t_w_ = time.perf_counter()
+                        take_weights()
+                        prof['weights'] += time.perf_counter() - t_w_
+                        return version
+                tok_dc[0].collect(roll, book, pending, rollout_actor, prof, store,
+                                  tick=_lane_tick if lanes is not None else None, weights=_W(), stopped=stopped,
+                                  version=version, watch=watch_workers)   # (take_weights may have run at the hand-off)
+            while (cpp_driver is None and tok_dc[0] is None and roll.usable() < rollout_actor and sampler.live
+                   and not stopped()):
                 if lanes is not None:   # 2026-10-10 (teacher v2): lane requests the last poll saw; B36: a finished
                     if block_actor is None:
                         _lane_tick(prof)
@@ -6804,6 +6918,7 @@ def main(argv=None, child=None, actor=None):
                 tb = time.perf_counter()
                 prof['poll'] += tb - ta
                 prof['polls'] += 1
+                ready_at[idx] = tb   # (P: the ready -> reply clock starts at the poll that took them)
                 if not len(idx):
                     if block_actor is not None:
                         _lane_tick(prof)
@@ -6826,6 +6941,8 @@ def main(argv=None, child=None, actor=None):
                 nv.pop()
                 if not go.all():   # records that end an episode only need their answer
                     sampler.reply(idx[~go])
+                    prof['rr_s'] = prof.get('rr_s', 0.0) + float((time.perf_counter() - ready_at[idx[~go]]).sum())
+                    prof['rr_n'] = prof.get('rr_n', 0) + int((~go).sum())
                 if not go.any():
                     prof['reply'] += time.perf_counter() - t1
                     if block_actor is not None:
@@ -6955,6 +7072,9 @@ def main(argv=None, child=None, actor=None):
                     pstats.Stats(actor_profile,stream=f).sort_stats('tottime').print_stats(30)
             collect_s = time.perf_counter() - t0
             if not sampler.live or stopped():
+                if tok_mode >= 2 and sent_handoffs == 0 and not stopped():   # (Codex 17-3: no zero-update "success")
+                    raise RuntimeError('P package: ISAAC_TOK_CPP_DRIVER=2 and every worker ended before the first '
+                                       'hand-off (no update)')
                 break
             check_actors()
             # ---- hand the rollout to the learner
@@ -7062,6 +7182,11 @@ def main(argv=None, child=None, actor=None):
                 job['lroll'], job['lready'], job['lbytes'] = hand_off(roll, lmirror, ldev, hand_streams)
                 job['lhand_s'] = time.perf_counter() - t_h
             job.setdefault('lane_stat', dict(lane_stat))   # (this collect's counters, for this update's row)
+            if getattr(book, 'audit_last', None) is not None:   # (P audit, Codex 19-2: the hand-off's own boundary --
+                #   each worker's last record committed, an end that stores no row included; p_audit rebuilds each
+                #   rollout's rows, length and open from it, the last rollout's too)
+                np.savez(os.path.join(os.environ['ISAAC_TOK_AUDIT'], f'handoff-{sent_handoffs:06d}.npz'),
+                         ep=book.audit_last[0], t=book.audit_last[1], length=roll.length, open=roll.open)
             spare.carry(roll)
             roll, spare = spare, roll
             if lane_thread:   # (B58d d2: the lane thread goes on serving the lanes while the actor waits / collects)
@@ -7113,6 +7238,14 @@ def main(argv=None, child=None, actor=None):
             if cpp_driver.lanes_running:
                 cpp_driver.lanes_stop()
             cpp_driver.stop()
+        if tok_dc[0] is not None:   # (P package, Codex 17-2: the driver stopped, its unanswered records cancelled and
+            #                          the workers closed before the learner's join and the last save)
+            try:
+                tok_dc[0].close()
+            except Exception as e_:   # (the shutdown goes on -- sampler.close still reaps the workers; Codex 18-2: the
+                #                        error kept for the run's end, a non-zero exit)
+                print(f'P package: the driver close failed: {type(e_).__name__}: {e_}', flush=True)
+                failure.append(e_)
         if actor is not None:   # (B38 step 5: whatever happened, the first actor need not wait for this one)
             actor['last'].set()
             # (2026-11-05: past this point nobody needs what is still unsent: a clean end has seen the stop, which comes after
