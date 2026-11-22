@@ -58,7 +58,7 @@ class LeanObs:
     __slots__ = ('logic_frames', 'game_frame', 'clear', 'paused', 'room', 'damage_taken', 'monsters_hp',
                  'blocking_hp', 'blocking_count', 'players', 'doors', 'entities', 'lasers', 'terrain', 'grid',
                  'terrain_version', 'terrain_changed', 'map', 'map_version', 'terrain_key', 'inv', 'inv_head',
-                 'inv_version', 'visible', 'visible_at', 'visible_v3_frame')
+                 'inv_version', 'visible', 'visible_at', 'visible_v3_frame', 'rewinds')
 
     @property
     def dead(self):
@@ -150,6 +150,13 @@ class LeanDecoder:
                 raise _structural(f'lean observation: the v3 frame ({size} bytes) runs past the payload end')
             o.visible_v3_frame = payload[off:off+size]
             off += size
+        # (2026-11-20, reward-rewind-design.md V2: the game's Glowing Hour Glass restore count, Game+0x2a1568, read by
+        #  abp_native_rewinds; the bridge appends it at an episode's first records and whenever it changed; None: not
+        #  sent with this record -- unchanged, or a bridge without the native function)
+        o.rewinds = None
+        if flags & 128:
+            o.rewinds = struct.unpack_from('<i', payload, off)[0]
+            off += 4
         if off != len(payload):
             raise _structural(f'lean observation has {len(payload) - off} trailing bytes')
         o.terrain, o.grid, o.terrain_version = self.terrain, self.grid, self.terrain_version

@@ -19,6 +19,7 @@ Each token type adds its own kind vector. Order [P, L, E, N, S, R, M, G]: the co
 token the last one. The embedding tables follow schema_v3's namespaces: identity (65,536 x 24, one table, the three id
 columns side by side), item (8,192 x 24), cat (1,024 x 16), anim (4,096 x 16), map icon (64 x 8); row 0 (none) is an
 ordinary row here (the decode's 0 means none / padding and the token's other inputs say so)."""
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -161,6 +162,34 @@ class FrameEncoderV3(nn.Module):
         for block in self.blocks:
             x = block(x, bias)
         return x, pad, g
+
+    def forward_packed(self, v, pending, gtok, buckets=3):
+        """Run the blocks on real tokens only; restore the original layout with zeros at padding positions."""
+        from .tok_policy import _attention_buckets
+
+        x, pad, g = self.tokens(v, pending, gtok)
+        # Read the mask in one transfer: finding the kept indices with CUDA nonzero would also synchronize.
+        real = ~pad.cpu().numpy()
+        count = real.sum(1)
+        base, layout = _attention_buckets(count, buckets)
+        keep = np.flatnonzero(real)
+        row = keep // real.shape[1]
+        starts = count.cumsum() - count
+        gpos = np.arange(len(keep)) + (base - starts)[row]
+        keep, gpos = torch.from_numpy(np.stack((keep, gpos))).to(x.device, non_blocking=True).unbind()
+
+        shape = dict(gpos=gpos, total=0, buckets=[])
+        for counts, width in layout:
+            key_pad = np.arange(width) >= counts[:, None]
+            bias = torch.from_numpy(key_pad).to(x.device, non_blocking=True)[:, None, None, :]
+            bias = x.new_zeros(bias.shape).masked_fill_(bias, -1e9)
+            shape['buckets'].append((len(counts), width, bias))
+            shape['total'] += len(counts) * width
+        flat = x.flatten(0, 1)
+        xp = flat.index_select(0, keep)
+        for block in self.blocks:
+            xp = block.forward_packed(xp, None, keep, shape)
+        return xp.new_zeros(flat.shape).index_copy_(0, keep, xp).view_as(x), pad, g
 
 
 def v3_tensors(padded, device):

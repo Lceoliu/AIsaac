@@ -136,7 +136,7 @@ PRICE_LUA = ("local s = '' for _, e in ipairs(Isaac.GetRoomEntities()) do if e.T
 
 def crn_key(pid, pair):
     """The policy-noise key of a point's branch pair (never 0)."""
-    from .tok_policy import _mix64
+    from .tok_obs import mix64 as _mix64   # (the same function as tok_policy._mix64; no torch in the worker)
     z = int(_mix64(np.array([(int(pid) * 64 + int(pair)) & 0x7FFFFFFFFFFFFFFF], np.uint64))[0])
     return (z & 0x7FFFFFFFFFFFFFFF) or 1
 
@@ -164,6 +164,61 @@ def step_reward(damage, hurt, done, events, w, run):
     if run:
         r += w['exit'] * bool(events & 8)
     return r
+
+
+def end_reward(done, w):
+    """(Codex round 21) the end's own part of step_reward: the floor's end (done 1), a death (2), a timeout (3)."""
+    return w['exit'] if done == 1 else -w['death'] if done == 2 else -w['timeout'] if done == 3 else 0.0
+
+
+def rewind_cfg(cfg):
+    """(on, interest, rtime, cmax) of a TokSamplerConfig's rewind ledger (reward-rewind-design.md); on 0: off."""
+    return (int(getattr(cfg, 'rewind', 0)), int(getattr(cfg, 'rewind_interest', 1)), int(getattr(cfg, 'rewind_time', 0)),
+            float(getattr(cfg, 'rewind_cmax', 4.0)))
+
+
+class RewindLedger:
+    """(2026-11-20, reward-rewind-design.md) the workers' scorers' reward ledger -- the trainer's (train_tok
+    Episodes) for a branch, a lab or an episode's continuation, which start at their first record: step(r, rewind)
+    with r the reward of the decision a record closes and rewind its ROW 'rewind' byte returns the reward to count.
+    A record with Glowing Hour Glass restores (bits 0-6) pays only its time term and the rollback of every reward
+    since the last checkpoint (or the start): each one's cancellable part (all of it, rtime 1; less its time term,
+    rtime 0) times min(gamma^-(k - j), cmax) (interest 1; else 1), k - j the decisions between; the ledger then starts
+    anew (the game's store is the same). A checkpoint record (bit 7, a room or floor change) ends the ledger after its
+    own reward (that reward stays). cfg: rewind_cfg's tuple; gamma: the scorer's discount; w: its reward weights."""
+
+    def __init__(self, cfg, gamma, w):
+        self.on, self.interest, self.rtime, self.cmax = cfg
+        self.gamma, self.wt = float(gamma), float(w['time'])
+        self.led = []
+        # (Codex round 20) a rewind before the scorer's first checkpoint goes back past its start (the fork point):
+        # what it rolls back was earned before the scorer started -- its score is not this ledger's to give (crossed;
+        # the scorers drop the point: cf_rewind_cross)
+        self.ck_seen = False
+        self.crossed = False
+
+    def step(self, r, rewind, end=0.0):
+        """end (Codex round 21): the end's own part of r (end_reward) -- kept on a rewind's record, added to the
+        rollback, as the trainer's book does."""
+        if not self.on:
+            return r
+        rewind = int(rewind)
+        if rewind & 127 and not self.ck_seen:
+            self.crossed = True
+        if rewind & 128:
+            self.ck_seen = True
+        if rewind & 127:
+            n = len(self.led)
+            if self.interest:
+                back = -sum(min(self.gamma ** -(n - j), self.cmax) * x for j, x in enumerate(self.led))
+            else:
+                back = -sum(self.led)
+            self.led = []
+            return -self.wt + back + float(end)
+        self.led.append(r if self.rtime else r + self.wt)
+        if rewind & 128:
+            self.led = []
+        return r
 
 
 def label_valid(c):

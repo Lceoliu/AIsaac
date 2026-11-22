@@ -430,3 +430,50 @@ def test_input_revision_2():
     with pytest.raises(ValueError, match='revision'):
         TP.TokPolicy(**{k: v for k, v in CFG.items() if k != 'v3_inputs'})
     assert build().config['v3_inputs'] == VI.INPUT_REV
+
+
+def test_stats_snapshot_adds_the_device_counters():
+    """(A-2, 2026-11-19) stats_snapshot: STATS with every registered device counter's count added; the host scan only
+    with scan=True."""
+    t = torch.zeros((), dtype=torch.int64)
+    VI.DEVICE_NONFINITE.add(t)
+    try:
+        base = VI.stats_snapshot()['nonfinite']
+        t += 5
+        assert VI.stats_snapshot()['nonfinite'] == base + 5
+        rows = _rows_with_frames(NAMES[:2])
+        rows['visible_frame'].view('<f4')[0, V3.FIXED + 3] = np.nan   # (a P row 0 float)
+        n0 = VI.STATS['nonfinite']
+        VI.rows_counts(rows, scan=False)
+        assert VI.STATS['nonfinite'] == n0
+        VI.rows_counts(rows)
+        assert VI.STATS['nonfinite'] == n0 + 1
+    finally:
+        VI.DEVICE_NONFINITE.discard(t)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA: GraphActor')
+@pytest.mark.parametrize('fold', [False, True])
+def test_graph_actor_counts_non_finite_floats_on_the_device(fold):
+    """(A-2) The graphs count each call's non-finite frame floats on the device (the records' rows only, not the
+    padded rows): stats_snapshot's count equals the host scan's on the same records, and nothing per padded row."""
+    cuda = torch.device('cuda')
+    m = build().to(cuda)
+    st = TP.TemporalState(m, 6, cuda, torch.float32)
+    actor = TP.GraphActor(m, 6, 32, stream=torch.cuda.Stream(), crn=False, temporal=st, fold=fold)
+    rng = np.random.default_rng(9)
+    want = 0
+    before = VI.stats_snapshot()['nonfinite']
+    for t in range(3):
+        rows = _rows_with_frames(NAMES[3 * t:3 * t + 3], seed=t)
+        f = rows['visible_frame'].view('<f4')
+        f[t % 3, V3.FIXED + 5] = np.nan                       # (P row 0)
+        f[(t + 1) % 3, V3.HEADER + 7] = np.inf                # (the canvas)
+        words = rows['visible_bytes'].astype(np.int64) // 4
+        live = np.arange(f.shape[1])[None] < words[:, None]
+        want += int((~np.isfinite(f) & live).sum())
+        pend = np.stack([rng.integers(0, k, 3) for k in m.heads], 1).astype(np.int64)
+        actor.act(rows, pend, np.array([0, 2, 4]), None, None)
+        torch.cuda.synchronize()
+    assert want == 6
+    assert VI.stats_snapshot()['nonfinite'] - before == want

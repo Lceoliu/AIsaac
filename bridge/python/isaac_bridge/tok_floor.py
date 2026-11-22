@@ -65,17 +65,112 @@ from .abplus import FORK_ENV
 from .abplus_goexplore import GxConfig, Instance
 from .abplus_lean import LeanDecoder, lean_logic_frames, read_lean, read_lean_raw
 from .env import BridgeError
-from .tok_branch import (AUX_LOGP, AUX_PRED, AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_UNCERT, AUX_USED, AUX_VALUE, BRANCH_MAX, CHOICE_RING, CI, END_BOSS, END_CAP,
+from .tok_branch import (RewindLedger, end_reward, rewind_cfg, AUX_LOGP, AUX_PRED, AUX_REQ, AUX_SNAP, AUX_SNAP_ON, AUX_UNCERT, AUX_USED, AUX_VALUE, BRANCH_MAX, CHOICE_RING, CI, END_BOSS, END_CAP,
                          END_DEATH, END_ERROR, END_EXIT, END_PREFIX_DEATH, END_STALL, END_STOP, KIND_DOOR, KIND_ITEM,
                          KIND_ITEM_LEFT, REP_COND, REP_FIRST, REP_NOISE, REP_TWIN, SCORE_HORIZONS, Point,
                          PointQueue, choice_meta,
                          crn_key, door_alternatives, gained_items, label_valid, nearest_door, options_of, pair_diffs,
                          parse_kinds, parse_reward, PedestalTracker, pedestals, prefix, restore, step_reward)
-from .tok_obs import (stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
-                      encode_row, fast_row_function, V3_FRAMES)
+from .tok_obs import ring_put   # noqa: E402
+from .tok_obs import check_worker_torch   # noqa: E402
+from .tok_sampler import actor_version   # noqa: E402  (control[CTRL_VERSION]: the actor's weights version)
+from .tok_sampler import (attach_ring_gen, check_ring_mode, ring_confirm, ring_open, ring_publish,   # noqa: E402
+                          tracemalloc_spec)
+from .tok_obs import (stall_first, stall_flags, ClearCounter, DONE_BRANCH, EV_BOSS, EV_CLEARED, EV_EXIT, EV_ITEM, EV_NEW_ROOM, EpisodeState, FastRow,
+                      encode_row, fast_counts, fast_row_function, V3_FRAMES, child_start, fast_row_final)
+from . import tok_obs as TOB   # (its FAST_ROW_CHECKING: per worker, the canary -- read through the module)
 from .tok_lab import (E_CAP, E_CLEAR, E_DEATH, E_ERROR, E_LEFT, E_STALL, E_STOP, JI, LAB_JOBS, LAB_RING, RES_F, RI,
                       STATS_F, build_panel_state, job_items, state_crn, state_reseed, stats_of, transplant_lua)
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal, fatal_active   # noqa: E402
+
+
+class RewindFatal(VisibleV3Fatal):
+    """(2026-11-20, Codex round 20) --rewind 1 and an episode's first record without the bridge's Glowing Hour Glass
+    restore count (an older bridge or libabp_turbo, the native obs off): a protocol error, not a bad episode -- no retry;
+    the worker stops with V3_FATAL_EXIT and the trainer fails (TokSampler.check_fatal), whatever the visible-v3 mode."""
+    always_fatal = True
+
+
+def reap_child(pid, limit):
+    """(Codex round 24-2) Wait for a forked cf / search child, at most limit seconds; then SIGKILL and wait. Returns
+    (status, timed_out): the child's own wait status whenever it exited by itself -- also when that happened between
+    the last look and the kill (an exit V3_FATAL_EXIT then still reaches the caller) --, -1 when the kill ended it."""
+    t_wait = time.perf_counter()
+    while True:
+        wpid, status = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            return status, False
+        if time.perf_counter() - t_wait > limit:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            _, st_ = os.waitpid(pid, 0)
+            return (st_ if os.WIFEXITED(st_) else -1), True
+        time.sleep(0.01)
+
+
+def worker_tracemalloc(index):
+    """(2026-11-20, the memory ledger's diagnostic; off unless set) ISAAC_WORKER_TRACEMALLOC=<dir>[:<seconds>[:<worker>]]:
+    in worker <worker> (default 0) only, tracemalloc on from the worker's start (10 frames per traceback: it slows that
+    worker, the others not at all); every <seconds> (default 600) <dir>/worker<i>-pid<pid>-tracemalloc-<n>.txt: the
+    process's RSS / anonymous / heap, the traced total, the top 40 allocation sites by size (file:line) and the top 15
+    by traceback. Returns the tick to call from the worker's loop, or None. Measures only: nothing else changes.
+    (Codex round 25) The spec is checked by the trainer at its start (tok_sampler.tracemalloc_spec); a failed sample
+    turns tracing off (not retried); Python children forked from the worker trace nothing; the worker's own threads
+    (the teacher's) are traced with it. A diagnostic run only: never mixed with a speed or memory measurement."""
+    parsed = tracemalloc_spec(os.environ.get('ISAAC_WORKER_TRACEMALLOC', ''))
+    if parsed is None:
+        return None
+    out_dir, every, which = parsed
+    if index != which:
+        return None
+    import tracemalloc
+    tracemalloc.start(10)
+    # (Codex round 25) a Python child forked from this worker (a teacher fork, a CF search) traces nothing; the
+    # worker's own threads (the teacher's) are traced with it -- a diagnostic run, never a speed or memory measurement
+    os.register_at_fork(after_in_child=lambda: tracemalloc.is_tracing() and tracemalloc.stop())
+    state = dict(t=time.perf_counter(), n=0, off=False)
+    pid = os.getpid()
+
+    def tick():
+        if state['off'] or time.perf_counter() - state['t'] < every:
+            return
+        state['t'] = time.perf_counter()
+        state['n'] += 1
+        try:
+            snap = tracemalloc.take_snapshot()
+            cur, peak = tracemalloc.get_traced_memory()
+            status = {}
+            try:
+                for line in open('/proc/self/status'):
+                    if line.startswith(('VmRSS', 'RssAnon', 'RssFile', 'RssShmem')):
+                        status[line.split(':')[0]] = line.split(':')[1].strip()
+            except OSError:
+                pass
+            lines = [f'worker {index} pid {pid} sample {state["n"]}: traced {cur / 2 ** 20:.1f} MB '
+                     f'(peak {peak / 2 ** 20:.1f}); {status}', '', 'top 40 by file:line']
+            for st_ in snap.statistics('lineno')[:40]:
+                lines.append(f'{st_.size / 2 ** 20:9.2f} MB {st_.count:9d} blocks  {st_.traceback[0]}')
+            lines += ['', 'top 15 by traceback']
+            for st_ in snap.statistics('traceback')[:15]:
+                lines.append(f'{st_.size / 2 ** 20:9.2f} MB {st_.count:9d} blocks')
+                lines += ['      ' + str(fr) for fr in st_.traceback[:10]]
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, f'worker{index}-pid{pid}-tracemalloc-{state["n"]}.txt'), 'w') as f:
+                f.write('\n'.join(lines) + '\n')
+        except Exception as exc:   # noqa: BLE001  (a diagnostic: never the worker's failure; off, not retried)
+            state['off'] = True
+            tracemalloc.stop()
+            print(f'tok floor worker {index}: tracemalloc sample failed, tracing off: {type(exc).__name__}: {exc}',
+                  file=sys.stderr, flush=True)
+    return tick
+
+
+class ChildFatal(VisibleV3Fatal):
+    """(2026-11-20) A forked cf / search child that ended with V3_FATAL_EXIT (it does only for a fatal of its own -- a
+    visible-v3 one in a v3 worker, a FastRowFatal): raised again in the worker, which stops whatever the mode."""
+    always_fatal = True
 from .tok_sampler import rng_key, start_seed, report_fatal   # noqa: E402  (a resumed run's / a shard's start seeds, random streams)
 from .tok_sampler import (ST, TEACH_PROF, _sched, TEACH_RING, WORKER_CPUS, SearchSlots, StartBuilder, applied_action,
                           apply_instance_defaults, attach, attach_choices, attach_lab, attach_teacher, default_stub_list,
@@ -258,6 +353,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     cfon = bool(getattr(cfg, 'cf', False)) and v2_names is not None and v2_conn is not None and not evaluation
     laneon = v2on or cfon   # (the lane, the episode's log and the V2 ring: teacher v2's machinery, shared)
     teaching = cfg.teacher and teacher_names is not None and not evaluation
+    teach_gen = v2_gen = None   # (Codex round 25) the rings' slot generations (tok_sampler.attach_ring_gen)
+    if cfg.ring_gen_block:   # (Codex round 26: confirmed first -- the trainer waits for it -- then the mode check)
+        gen_block, teach_gen, v2_gen, ring_ack = attach_ring_gen(cfg.ring_gen_block, cfg.workers)
+        blocks = blocks + [gen_block]
+        ring_confirm(ring_ack, index)
+    check_ring_mode(cfg)   # (Codex round 25: the trainer's ISAAC_RL_RING_COMPACT, or refused)
     if teaching:
         teach_blocks, teach_rows, teach_meta = attach_teacher(teacher_names, cfg.workers)
         blocks = blocks + teach_blocks
@@ -358,6 +459,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     mine = stats[index]
     slots = (rows[2 * index:2 * index + 1], rows[2 * index + 1:2 * index + 2])
     slot_address = (slots[0].ctypes.data, slots[1].ctypes.data)
+    TOB.configure_worker(index)   # (round 24 C: check mode in a canary worker, ISAAC_RL_FAST_ROW_CHECK_WORKERS)
+    tm_tick = worker_tracemalloc(index)   # (the memory ledger's diagnostic: off unless ISAAC_WORKER_TRACEMALLOC)
     fast_fn = fast_row_function(row_library(cfg))   # None: LeanDecoder + encode_row as before
     # 2026-11-03 (tok_priv, cfg.priv): this worker's slots of the privileged records and its map version counter
     priv_on = bool(getattr(cfg, 'priv', False)) and not evaluation
@@ -377,6 +480,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     stall = int(round(cfg.floor_stall_seconds * 30 / cfg.frames_per_decision))
     # B40: gains count as progress (--stall-progress items: and acquired items, trinkets, pills, cards)
     stall_pk, stall_it = stall_flags(getattr(cfg, 'stall_progress', 'events'))
+    stall_fi = stall_first(getattr(cfg, 'stall_progress', 'events'))   # (2026-11-20, --stall-progress first)
     queue = []      # hurts to search: (parked base, reseed, applied actions, hurt_at, seed, episode, base's decision)
     archive = []
     # 2026-10-10 (teacher v2): its points (tok_teacher2.V2Point), searched by the search thread through the lane
@@ -395,6 +499,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mem_blocks, main_h, lane_h, v2_h = attach_v2_mem(v2_names[6:], cfg.workers, cfg.memory_dim)
             blocks = blocks + mem_blocks
         v2ctx = V2Context(cfg, limit, stall, run, fast_fn, group, lane_rows[index:index + 1], cfg.branch_reward)
+        v2ctx.fr_tag = 'teacher'   # (FastRow's tag: the check's boundary counts by where a branch is played)
         v2_rng = np.random.default_rng(rng_key(cfg, index, 19))    # its own: the episodes' rng draws stay as without
         v2_srng = np.random.default_rng(rng_key(cfg, index, 23))   # the search thread's (candidates, reseeds)
         v2_p = cfg.teacher_v2_random * cfg.frames_per_decision / 30 / 3600   # random points per decision
@@ -417,6 +522,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         cfctx = V2Context(cfg, limit, stall, run, fast_fn, group, lane_rows[index:index + 1], cfg.branch_reward,
                           seconds=cfg.cf_seconds, gamma=cfg.cf_gamma, boot_vg=bool(cfg.cf_vglobal), exit_end=run,
                           gains=True)
+        cfctx.fr_tag = 'cf'
         cf_quota = CfQuota(cfg.cf_points, cfg.frames_per_decision, per_clear=getattr(cfg, 'cf_per_clear', 0.0))
         cf_rng = np.random.default_rng(rng_key(cfg, index, 31))   # its own: the episodes' rng draws stay as without
         cf_p = cfg.cf_random * cfg.frames_per_decision / 30 / 3600   # random points per decision
@@ -491,7 +597,9 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         for it, found in zip(items, founds):
             n_found += len(found)
             for k, at, under_way, lost, taken in found:
-                slot = int(mine[ST['teach']]) % TEACH_RING
+                c_ = int(mine[ST['teach']])
+                slot = c_ % TEACH_RING
+                mine[ST['ring_open_busy']] += ring_open(teach_gen, index, slot, c_)   # (Codex round 25: its generation)
                 if block_on:
                     block_arrays[5][index,slot]=0
                 trow = teach_rows[index, slot:slot + 1]
@@ -501,6 +609,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 teach_meta[index, slot] = teach_meta_row(under_way, lost, taken, k, safe)
                 if block_on:
                     block_arrays[5][index,slot]=int(mine[ST['teach']])+1
+                ring_publish(teach_gen, index, slot, c_)
                 mine[ST['teach']] += 1
                 mine[ST['avoidable']] += bool(safe)
         mine[ST['teach_s']] += time.perf_counter() - t0
@@ -536,10 +645,12 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         """Imitation records into the worker's V2 ring (teacher v2's and, B34, the cf's; one writer at a time: the
         lane lock is held), with their GRU input states (memory) and temporal outputs (B34, temporal lanes)."""
         for j in range(len(rows_)):
-            slot = int(mine[ST['v2_records']]) % V2_RING
+            c_ = int(mine[ST['v2_records']])
+            slot = c_ % V2_RING
+            mine[ST['ring_open_busy']] += ring_open(v2_gen, index, slot, c_)   # (Codex round 25: its generation)
             if block_on:
                 v2_t[index,slot,-1]=0
-            v2_rows[index, slot] = rows_[j]
+            ring_put(v2_rows[index, slot:slot + 1], rows_[j:j + 1])   # (ISAAC_RL_RING_COMPACT: its frame's bytes)
             v2_meta[index, slot] = meta_[j]
             if v2_h is not None:
                 v2_h[index, slot] = hs_[j] if hs_ is not None else 0.0
@@ -547,6 +658,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 v2_t[index, slot] = ts_[j] if ts_ is not None else 0.0
             if block_on:
                 v2_t[index,slot,-1]=int(mine[ST['v2_records']])+1
+            ring_publish(v2_gen, index, slot, c_)
             mine[ST['v2_records']] += 1
 
     def v2_search(pt):
@@ -640,8 +752,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         mine[ST['cf_points']] += 1
         mine[ST['cf_t_' + CF_TRIGGERS[int(pt.trig)]]] += 1
         for k_s, name in (('branches', 'cf_branches'), ('decisions', 'cf_dec'), ('frames', 'cf_frames'),
-                          ('replicates', 'cf_reps')):
-            mine[ST[name]] += cfctx.stats[k_s] - s0[k_s]
+                          ('replicates', 'cf_reps'), ('rewind_cross', 'cf_rewind_cross')):
+            mine[ST[name]] += cfctx.stats.get(k_s, 0) - s0.get(k_s, 0)
         if res is None:
             mine[ST['cf_nodepth']] += 1
         else:
@@ -699,15 +811,25 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         base_.release()
         pt.base = copy
         pid = os.fork()
+        if pid and TOB.FAST_ROW_CHECKING:
+            TOB.note_child(pid, 'cf-child')
         if pid == 0:   # the child: the point on its own copy, records into the shared ring, then gone
             code = 0
+            if TOB.FAST_ROW_CHECKING:   # (Codex round 23-2: the child's own check counts, final before its os._exit)
+                child_start('cf-child')
             try:
                 cf_run(pt, child=True)
-            except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child; mode 0: 1)
-                code = V3_FATAL_EXIT if fatal_active() else 1
+            except VisibleV3Fatal as exc_:   # (2026-11-18: the parent raises it again when it reaps the child)
+                code = V3_FATAL_EXIT if (fatal_active() or getattr(exc_, 'always_fatal', False)) else 1
+                print(f'tok floor worker {index}: cf child {os.getpid()}: {type(exc_).__name__}: {exc_}',
+                      file=sys.stderr, flush=True)   # (round 24-2: the reason in the child's stderr)
             except BaseException:
                 code = 1
             finally:
+                try:
+                    fast_row_final()
+                except BaseException:   # (the counts not written: the check's verdict is a failure)
+                    code = V3_FATAL_EXIT
                 os._exit(code)
         try:   # (the parent: its end of the copy's connection closed without the close command)
             sock = copy.clone._sock
@@ -719,29 +841,18 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         copy.clone = None
         Parked.live.discard(copy)
         pt.base = None
-        t_wait = time.perf_counter()
-        status = 0
-        while True:
-            wpid, status = os.waitpid(pid, os.WNOHANG)
-            if wpid == pid:
-                break
-            if time.perf_counter() - t_wait > CF_CHILD_LIMIT:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                os.waitpid(pid, 0)
-                status = -1
-                mine[ST['errors']] += 1
-                mine[ST['cf_errors']] += 1
-                if search_errors[0] < 5:
-                    search_errors[0] += 1
-                    print(f'tok floor worker {index}: cf child {pid} killed after {CF_CHILD_LIMIT:.0f} s',
-                          file=sys.stderr, flush=True)
-                break
-            time.sleep(0.01)
+        status, timed_out = reap_child(pid, CF_CHILD_LIMIT)   # (round 24-2: its own status when it ended by itself)
+        if timed_out:
+            mine[ST['errors']] += 1
+            mine[ST['cf_errors']] += 1
+            if search_errors[0] < 5:
+                search_errors[0] += 1
+                print(f'tok floor worker {index}: cf child {pid} killed after {CF_CHILD_LIMIT:.0f} s',
+                      file=sys.stderr, flush=True)
+            if status != -1:   # (it had ended by itself: counted once, as the timeout)
+                status = status if (os.WIFEXITED(status) and os.WEXITSTATUS(status) == V3_FATAL_EXIT) else -1
         if status > 0 and os.WIFEXITED(status) and os.WEXITSTATUS(status) == V3_FATAL_EXIT:
-            raise VisibleV3Fatal(f'cf child {pid}: a visible-v3 protocol error (its stderr has the reason)')
+            raise ChildFatal(f'cf child {pid}: a fatal error -- visible-v3 / FastRow check (its stderr has the reason)')
         if status != 0 and status != -1:
             mine[ST['errors']] += 1
             mine[ST['cf_errors']] += 1
@@ -825,15 +936,25 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             base_.release()
             child_item = (copy,) + tuple(item[1:])
             pid = os.fork()
+            if pid and TOB.FAST_ROW_CHECKING:
+                TOB.note_child(pid, 'search-child')
             if pid == 0:   # the child: the search on its own copy, records into the shared ring, then gone
                 code = 0
+                if TOB.FAST_ROW_CHECKING:   # (Codex round 23-2: the child's own check counts, final before its os._exit)
+                    child_start('search-child')
                 try:
                     search(child_item, pair=False)
-                except VisibleV3Fatal:   # (2026-11-18: the parent raises it again when it reaps the child; mode 0: 1)
-                    code = V3_FATAL_EXIT if fatal_active() else 1
+                except VisibleV3Fatal as exc_:   # (2026-11-18: the parent raises it again when it reaps the child)
+                    code = V3_FATAL_EXIT if (fatal_active() or getattr(exc_, 'always_fatal', False)) else 1
+                    print(f'tok floor worker {index}: search child {os.getpid()}: {type(exc_).__name__}: {exc_}',
+                          file=sys.stderr, flush=True)   # (round 24-2: the reason in the child's stderr)
                 except BaseException:
                     code = 1
                 finally:
+                    try:
+                        fast_row_final()
+                    except BaseException:   # (the counts not written: the check's verdict is a failure)
+                        code = V3_FATAL_EXIT
                     os._exit(code)
             # the parent: its end of the copy's connection closed without the close command (the clone lives on
             # with the child's end), then the child waited for (the thread blocks here; the GIL is free)
@@ -848,27 +969,18 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             Parked.live.discard(copy)
             # 2026-10-10 (C84 on HPC128: every worker's search thread froze within 800 game hours): the child is
             # waited for with a time limit; a hung child (a lock copied locked at fork time, a dead clone) is killed
-            t_wait = time.perf_counter()
-            while True:
-                wpid, status = os.waitpid(pid, os.WNOHANG)
-                if wpid == pid:
-                    break
-                if time.perf_counter() - t_wait > SEARCH_CHILD_LIMIT:
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except OSError:
-                        pass
-                    os.waitpid(pid, 0)
-                    status = -1
-                    mine[ST['errors']] += 1
-                    if search_errors[0] < 5:
-                        search_errors[0] += 1
-                        print(f'tok floor worker {index}: search child {pid} killed after {SEARCH_CHILD_LIMIT:.0f} s',
-                              file=sys.stderr, flush=True)
-                    break
-                time.sleep(0.01)
+            status, timed_out = reap_child(pid, SEARCH_CHILD_LIMIT)   # (round 24-2: its own status if it ended)
+            if timed_out:
+                mine[ST['errors']] += 1
+                if search_errors[0] < 5:
+                    search_errors[0] += 1
+                    print(f'tok floor worker {index}: search child {pid} killed after {SEARCH_CHILD_LIMIT:.0f} s',
+                          file=sys.stderr, flush=True)
+                if status != -1:   # (it had ended by itself: counted once, as the timeout)
+                    status = status if (os.WIFEXITED(status) and os.WEXITSTATUS(status) == V3_FATAL_EXIT) else -1
             if status > 0 and os.WIFEXITED(status) and os.WEXITSTATUS(status) == V3_FATAL_EXIT:
-                raise VisibleV3Fatal(f'search child {pid}: a visible-v3 protocol error (its stderr has the reason)')
+                raise ChildFatal(f'search child {pid}: a fatal error -- visible-v3 / FastRow check (its stderr has '
+                                 f'the reason)')
             if status != 0 and status != -1:
                 mine[ST['errors']] += 1
         finally:
@@ -1013,15 +1125,18 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         records, 'gamma_t' gamma^T, 'v_end' and 'boot' the actor's value of a truncated last record); returns (the end
         code, its EpisodeState). trace (a dict, Phase B2): filled with the records' state digests and the actions
         answered to them."""
-        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it)
+        st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it,
+                              stall_first=stall_fi, rewind=bool(getattr(cfg, 'rewind', 0)))
         st.visited = set(visited)
         st.stage0 = int(obs.room[5])
         for s in slots:
             s['point'], s['branch'], s['crn'] = point.pid, number, key
-        enc = FastRow(fast_fn, st, decoder, point.episode, point.seed, group) if fast_fn is not None else None
+        enc = FastRow(fast_fn, st, decoder, point.episode, point.seed, group, tag='branch') \
+            if fast_fn is not None else None
         item, lf_now = obs, obs.logic_frames
         t_ep, waiting, action, end = 0, False, (0, 0, 0, 0, 0), END_STOP
         gamma, ret, disc = cfg.branch_gamma, 0.0, 1.0
+        led_b = RewindLedger(rewind_cfg(cfg), gamma, rw_b)   # (2026-11-20: from the branch's start)
         snapping = aux[cfg.workers, AUX_SNAP_ON] > 0   # the actor answers with the point's pinned snapshot
         # the shorter horizons' scores: record index -> COMP column; the return and discount at that record, then the
         # actor's value of it when its answer comes
@@ -1050,7 +1165,8 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     comp[CI['damage']] += float(row['damage'][0])
                     comp[CI['hurt']] += float(row['hurt'][0])
                     # the trainer's reward of the decision before this record, discounted from the branch's start
-                    ret += disc * step_reward(float(row['damage'][0]), float(row['hurt'][0]), done, ev, rw_b, run)
+                    ret += disc * led_b.step(step_reward(float(row['damage'][0]), float(row['hurt'][0]), done, ev,
+                                                         rw_b, run), row['rewind'][0], end=end_reward(done, rw_b))
                     disc *= gamma
                     if t_ep in h_at and done in (0, DONE_BRANCH):
                         h_ret[t_ep] = (ret, disc)
@@ -1143,7 +1259,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                                  cfg.clone_alarm, walk_cap)
         try:
             comp[CI['replicate']], comp[CI['pair']], comp[CI['opt']] = replicate, pair, j
-            comp[CI['crn']], comp[CI['reseed']], comp[CI['version']] = key != 0, reseed, int(control[3])
+            comp[CI['crn']], comp[CI['reseed']], comp[CI['version']] = key != 0, reseed, actor_version(control)
             mine[ST['b_walk_fail']] += notes['walk_fail']
             mine[ST['b_skip_took']] += notes['skip_took']
             mine[ST['b_prep_s']] += time.perf_counter() - t0
@@ -1196,7 +1312,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         options for doors, the twin, the unconditional replicate pair, the conditional ones), write the choice
         record."""
         t0, c0 = time.perf_counter(), time.thread_time()
-        v0 = int(control[3])
+        v0 = actor_version(control)
         comps, n_options, S, prep = [], 0, None, 0.0
         notes = {}
         twin = cfg.branch_twin > 0 and brng.random() < cfg.branch_twin
@@ -1273,7 +1389,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             slot = int(mine[ST['choices']]) % CHOICE_RING
             choice_rows[index, slot] = point.row
             choice_meta_ring[index, slot] = choice_meta(
-                point, index, comps, reseed1, v0, int(control[3]), prep, wall, n_options,
+                point, index, comps, reseed1, v0, actor_version(control), prep, wall, n_options,
                 dict(noise_var=sig2, pairs=pairs[0], shop_skip=notes.get('shop_skip', 0),
                      unreach_skip=notes.get('unreach_skip', 0)))
             mine[ST['choices']] += 1
@@ -1313,12 +1429,14 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         tagged ROW lab / lab_s / crn, actions from the actor. Ends: death, the room cleared / left, the cap (the last
         three DONE_BRANCH: a truncation), the floor's stall rule. Fills res (tok_lab RES)."""
         st = EpisodeState(lab_cap + 1, floor=True, stall=stall, run=run, items=cfg.items,
-                          stall_pickups=stall_pk, stall_items=stall_it)
+                          stall_pickups=stall_pk, stall_items=stall_it,
+                              stall_first=stall_fi, rewind=bool(getattr(cfg, 'rewind', 0)))
         st.stage0 = int(obs.room[5])
         st.visited = set()
         for s in slots:
             s['lab'], s['lab_s'], s['crn'] = job_id, k + 1, crn
-        enc = FastRow(fast_fn, st, decoder, 0, int(cfg.lab_panel[k][1]), group) if fast_fn is not None else None
+        enc = FastRow(fast_fn, st, decoder, 0, int(cfg.lab_panel[k][1]), group, tag='lab') \
+            if fast_fn is not None else None
         item, lf0 = obs, obs.logic_frames
         lf_now = lf0
         room0 = int(obs.room[4])
@@ -1402,7 +1520,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         t0, c0 = time.perf_counter(), time.thread_time()
         res = np.zeros(RES_F, np.float64)
         res[RI['job']], res[RI['state']], res[RI['rep']], res[RI['worker']] = job_id, k, rep, index
-        res[RI['version0']] = int(control[3])
+        res[RI['version0']] = actor_version(control)
         res[RI['n_items']] = len(items)
         seed = int(cfg.lab_panel[k][1])
         reseed, crn = state_reseed(seed, rep), state_crn(k, rep)
@@ -1440,7 +1558,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     B.close()
                 except OSError:
                     pass
-        res[RI['version1']] = int(control[3])
+        res[RI['version1']] = actor_version(control)
         res[RI['wall_s']] = time.perf_counter() - t0
         res[RI['cpu_s']] = time.thread_time() - c0
         slot = int(mine[ST['lab_results']]) % LAB_RING
@@ -1636,6 +1754,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
         episodes_left, episode_n = 0, 0
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
+            mine[ST['torch_held']] = check_worker_torch(index)   # (warned once, counted; never the run's end)
+            if tm_tick is not None:
+                tm_tick()
+            mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()
             if thread_fatal:
                 raise thread_fatal[0]
             mem_dump()
@@ -1786,9 +1908,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             mine[ST['ep_archive']] = float(from_archive)   # (before the episode's first record: its 'start')
             episode_n += 1
             seed_now = src.info['seed']
-            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it)
+            st = EpisodeState(limit, floor=True, stall=stall, run=run, items=cfg.items, stall_pickups=stall_pk, stall_items=stall_it,
+                              stall_first=stall_fi, rewind=bool(getattr(cfg, 'rewind', 0)))
             st.visited, st.stage0 = set(src.info['visited']), src.info['stage0']
-            enc = FastRow(fast_fn, st, decoder, episode_n, seed_now, group) if fast_fn is not None else None
+            enc = FastRow(fast_fn, st, decoder, episode_n, seed_now, group,
+                          tag='archive' if from_archive else 'start') if fast_fn is not None else None
             item, lf_now = obs, obs.logic_frames   # with FastRow item is the step's raw payload
             t_ep, waiting, action = 0, False, (0, 0, 0, 0, 0)
             applied, hurts = [], []     # hurts: (decision, the restore point then, its reseed, its decision)
@@ -1799,6 +1923,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                 base, base_reseed, base_t = src.hold(), reseed, 0
             room_now = None
             clear_ctr = ClearCounter()   # (2026-11-13: the main episode's rooms cleared after a fight)
+            cf_rooms = set()   # (2026-11-20, cfg.rewind: the (floor instance, room) clears that earned tokens)
             tracker = PedestalTracker() if branching else None
             # Phase B2: copies of the last records and the actor's outputs per record (the points' decision records)
             ring = deque(maxlen=8 + cfg.branch_left_back) if branching else None
@@ -1829,6 +1954,11 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                         done = encode_row(obs, st, row, t_ep)
                         row['episode'], row['seed'], row['group'], row['first'] = episode_n, seed_now, group, t_ep == 0
                         hurt, room_idx = row['hurt'][0] > 0, obs.room[4]
+                    if t_ep == 0 and getattr(cfg, 'rewind', 0) and st.rw_count is None:
+                        # (2026-11-20) a ledger that cannot see the game's rewinds would pay every rewound reward
+                        raise RewindFatal('rewind ledger on (--rewind 1) but the bridge sent no Glowing Hour Glass restore '
+                                          "count at the episode's first record (abp_native_rewinds: native obs off, "
+                                          'or an older libabp_turbo / bridge)')
                     # (2026-10-09: the fatal hit does not raise the bridge's damage_taken, so a death record has hurt 0
                     # and was never a hurt to search; the death teacher queues it by its done code)
                     if pf_track:   # 2026-10-13 (B23): the forced move of this record (0: the policy's), the episode's
@@ -1898,6 +2028,10 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                     room_now = room_idx
                     if cleared_:
                         mine[ST['clears']] += 1
+                    if fought_ and getattr(cfg, 'rewind', 0):   # (2026-11-20: once per (floor instance, room))
+                        key_ = (st.floor_k, int(room_idx))
+                        fought_ = key_ not in cf_rooms
+                        cf_rooms.add(key_)
                     if fought_:
                         mine[ST['clears_fought']] += 1
                         if cfon:   # (cfg.cf_per_clear: the points' earned bucket)
@@ -2052,7 +2186,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 base=parked, reseed=reseed_, applied=applied, log=v2log, at=at_, offset=offset,
                                 kind=kind, seed=seed_now, episode=episode_n, visited=parked.info.get('visited', ()),
                                 stage0=parked.info.get('stage0'), pid=index * 10 ** 9 + v2_n[0],
-                                version=int(control[3])))
+                                version=actor_version(control)))
                         v2_pts = []
                         excess = len(v2_queue) - cfg.teacher_v2_queue
                         if excess > 0:
@@ -2073,7 +2207,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
                                 base=p_['base'], reseed=p_['reseed'], applied=applied, log=v2log, at=p_['at'],
                                 offset=p_['offset'], kind=KIND_CF, seed=seed_now, episode=episode_n,
                                 visited=p_['base'].info.get('visited', ()), stage0=p_['base'].info.get('stage0'),
-                                pid=index * 10 ** 9 + cf_n[0], version=int(control[3]), trig=p_['trig'],
+                                pid=index * 10 ** 9 + cf_n[0], version=actor_version(control), trig=p_['trig'],
                                 target=p_['target'], bank=p_['bank']))
                             mine[ST['cf_queued']] += 1
                         cf_quota.pending = []
@@ -2116,7 +2250,7 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
             if labbing and not control[0]:   # 2026-10-08: posted lab jobs, within cfg.lab_share (tok_lab)
                 run_lab()
     except VisibleV3Fatal as exc:
-        if fatal_active():
+        if fatal_active() or getattr(exc, 'always_fatal', False):   # (RewindFatal, FastRowFatal, ChildFatal)
             v3_fatal = exc
             report_fatal(index, conn, exc, 'tok floor worker', cfg.fatal_dir)   # (before the cleanup below)
         else:   # (mode 0: an ordinary error, as in 05f1622 -- no exit 86)
@@ -2128,6 +2262,25 @@ def floor_worker_main(index, cfg, names, conn, teacher_names=None, choice_names=
     finally:
         mine[ST['finished']] = 1
         search_stop.set()   # 2026-10-10: the search thread ends after its current search (daemon: never waited on)
+        if TOB.FAST_ROW_CHECKING:   # (Codex round 24-2) no new work (above), the search / cf threads drained (bounded),
+            #                         their fatal taken, then this worker's final counts; any failure is the worker's
+            #                         fatal, reported to the sampler (exit 86)
+            t_drain = time.perf_counter()
+            for th_ in (search_thread, cf_thread):
+                if th_ is not None and th_.is_alive():
+                    th_.join(max(0.0, 300.0 - (time.perf_counter() - t_drain)))
+            late = [th_.name for th_ in (search_thread, cf_thread) if th_ is not None and th_.is_alive()]
+            fin_exc = thread_fatal[0] if thread_fatal else None
+            if fin_exc is None and late:
+                fin_exc = TOB.FastRowFatal(f'FastRow check: thread(s) {", ".join(late)} still running at the worker\'s '
+                                           f'end: the final counts would miss their records')
+            try:
+                fast_row_final()
+            except Exception as exc_:   # noqa: BLE001
+                fin_exc = fin_exc or exc_
+            if fin_exc is not None and v3_fatal is None:
+                v3_fatal = fin_exc
+                report_fatal(index, conn, fin_exc, 'tok floor worker', cfg.fatal_dir)
         # killed outright (SIGTERM) or a build still in flight (it may hang): the instance and its clones are killed;
         # otherwise closed as before
         hard = bool(terminated) or (builder is not None and not builder.ready.is_set())

@@ -2,7 +2,8 @@
 --obs-visible 0, and the one pair of settings that cannot both hold. CPU only.
 
 - v3 on: a record with a v3 frame gets that frame (visible_schema = schema_v3.VERSION, the bytes as they came);
-- v3 off and a v2 visible block: the v2 frame (visible_native.frame -> structured_input.write_frame);
+- v3 off and a v2 visible block: the v2 frame (visible_native.frame -> visible_producer.write_frame, the function
+  structured_input re-exports: write_visible takes it from visible_producer, without torch -- tests/test_worker_lean.py);
 - --obs-visible 0 (ISAAC_NO_VISIBLE=1): no frame at all, v3 or v2, even with both present (visible_schema 0);
 - a worker configured for v3 without a v3 frame refuses the record (05f1622);
 - --obs-visible 0 together with ISAAC_RL_VISIBLE_V3 = a mode is refused by train_tok / eval_tok at argument parsing
@@ -15,7 +16,7 @@ import numpy as np
 import pytest
 
 from isaac_bridge import schema_v3 as V3
-from isaac_bridge import structured_input, tok_obs, visible_native
+from isaac_bridge import tok_obs, visible_native
 from isaac_bridge import visible_producer as VP
 from isaac_bridge.tok_obs import ROW
 
@@ -38,7 +39,7 @@ def v2_stub(monkeypatch):
     def write_frame(row, payload):
         calls.append(payload)
         row['visible_schema'] = V2_SCHEMA
-    monkeypatch.setattr(structured_input, 'write_frame', write_frame)
+    monkeypatch.setattr(VP, 'write_frame', write_frame)   # (where write_visible takes it; structured_input's is it)
     monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
     monkeypatch.setattr(VP, 'VISIBLE_V3_MODE', 0)
     return calls

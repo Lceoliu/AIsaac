@@ -107,10 +107,11 @@ def test_swaps_do_not_hold_off_the_stall():
 
 def test_encode_row_and_workers_use_it():
     src = inspect.getsource(TO.encode_row)
-    assert 'if st.stall_items and st.inv_gain:' in src
+    assert 'if st.stall_items and st.inv_gain and not st.stall_first:' in src   # (2026-11-20: and 'first')
     fl = inspect.getsource(tok_floor)
-    assert fl.count('stall_items=stall_it') == 3
+    assert fl.count('stall_items=stall_it') == 3 and fl.count('stall_first=stall_fi') == 3
     assert "stall_pk, stall_it = stall_flags(getattr(cfg, 'stall_progress', 'events'))" in fl
+    assert "stall_fi = stall_first(getattr(cfg, 'stall_progress', 'events'))" in fl
 
 
 def test_branches_use_the_main_rule():

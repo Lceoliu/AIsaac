@@ -253,8 +253,10 @@ from goexplore_abplus import default_bridge_lua, default_preload, load_spec
 from isaac_bridge.tok_aux import CLOSE_BROKE
 from isaac_bridge import block_nvtx as nv   # (B50 phase 0: NVTX ranges / nsys window, ISAAC_BLOCK_NVTX / ISAAC_NSYS_RANGE)
 from isaac_bridge.learn_segments import SEG   # BM1: learner segment timing (ISAAC_BLOCK_TIMING=1 only)
-from isaac_bridge.tok_obs import (DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
+from isaac_bridge.tok_obs import ROW_FRAME_AT, take_prefix   # noqa: E402  (A-4, A-6)
+from isaac_bridge.tok_obs import (ROW_SCHEMA, DONE_BRANCH, EV_ACTIVE, EV_EXIT, EV_ITEM, EV_NOHIT, EV_PILL, ROW, ROWC, FrameArena,
                                   compact_rows, compact_copy)
+from isaac_bridge.tok_sampler import CTRL_VERSION   # noqa: E402  (the actor's weights version's control slot)
 from isaac_bridge.tok_sampler import (ACTION_F, ST, TokSampler, TokSamplerConfig, apply_instance_defaults,
                                       default_stub_list)
 
@@ -609,6 +611,7 @@ def merge_rollouts(full, parts, mirror, device):
     view.__dict__.update({k: s0[k] for k in ('cap', 'nh') if k in s0})
     view.n = n_total
     view.value_g = full.get('value_g')
+    view.reward_gd = full.get('reward_gd')
     view.h = full.get('h')
     view.block = None
     if s0.get('block_payload') is not None:
@@ -695,6 +698,8 @@ def merge_jobs(halves):
     j['t_start'] = min(h.get('t_start', j.get('t_start')) for h in halves)
     j['collect_actors'] = ' '.join(f"{h.get('collect_s', 0.0):.3f}" for h in halves)
     j['prof'], j['worker'], j['lane_stat'] = sum_dict('prof'), sum_dict('worker'), sum_dict('lane_stat')
+    j['ring_skips'] = sum_dict('ring_skips')   # (Codex round 26: every actor's rings, not the first actor's only)
+    j['worker_torch'] = sum(h.get('worker_torch', 0) for h in halves)   # (every actor's workers holding torch)
     j['stats'] = np.concatenate([h['stats'] for h in halves])
     j['teach'], j['v2'], j['choices'] = cat_rec('teach'), cat_rec('v2'), cat_rec('choices')
     j['cpu_collect'] = float(np.mean([h.get('cpu_collect', 0.0) for h in halves]))
@@ -718,7 +723,9 @@ def rollout_scalars(roll):
     """(B38 step 2) a rollout's attributes that are neither arrays nor tensors (counters, sizes; None for the parts
     that are off): what the learner process's view needs per job besides the shared arrays."""
     import torch
-    result = {k: v for k, v in vars(roll).items() if k != 'block' and not isinstance(v, (np.ndarray, torch.Tensor))}
+    result = {k: v for k, v in vars(roll).items()
+              if k not in ('block', 'frames') and not isinstance(v, (np.ndarray, torch.Tensor))}   # (A-6: the arena
+    #                                                                       is the shared frames_buf, rebuilt by the view)
     if getattr(roll, 'block', None) is not None:
         result['block_payload'] = roll.block.payload()
     return result
@@ -734,6 +741,7 @@ def rollout_view(arrays, scalars, tensors):
     r.block = BlockRollout.from_payloads([(0,scalars['block_payload'])]) if scalars.get('block_payload') is not None else None
     if tensors is not None:
         r.t_kv, r.t_o, r.t_s = tensors[0], tensors[1], None
+    r.frames = FrameArena(buf=arrays['frames_buf']) if 'frames_buf' in arrays else None   # (A-6)
     return r
 
 
@@ -755,7 +763,7 @@ class Rollout:
     stored (store_temporal); the actor writes them on the device (GraphActor tdest / store's index_copy_)."""
 
     def __init__(self, workers, capacity, n_heads=3, mem_dim=0, value_g=False, temporal=None, alloc=None, close=False,
-                 priv=None, block_steps=0):
+                 priv=None, block_steps=0, compact=False):
         # B38 step 2: alloc(shape, dtype) -> a zeroed array for every host array (SharedArrays: shared memory the
         # learner process maps); None: numpy's, as before
         zeros = np.zeros if alloc is None else alloc
@@ -793,13 +801,28 @@ class Rollout:
             self.rooms_n = zeros(workers, np.int64)
         # 2026-10-14 (B24, global-token models): value_global of each decision, as the actor computed it (None without)
         self.value_g = zeros((workers, capacity), np.float32) if value_g else None
+        # (Codex round 20, the rewind ledger) the global value head's reward less the reward, per decision: 0 but at a
+        # rewind's record, where the head's own rollback (its gamma_global interest) differs (Episodes._rewind)
+        self.reward_gd = zeros((workers, capacity), np.float32) if value_g else None
         # 2026-10-11 (memory): the GRU's input state of each decision (None without memory)
         self.h = zeros((workers, capacity, mem_dim), np.float32) if mem_dim else None
         # B45: block-memory rollouts store compact records (ROWC) and their visible frames in a byte arena (~11 KB each
-        # instead of 128 KiB); others (and B38's shared-memory learner process) keep ROW
-        compact = bool(block_steps) and alloc is None
+        # instead of 128 KiB); with B38's shared-memory learner process block rollouts keep ROW
+        # (A-3, 2026-11-19: and v3-frame rollouts, compact=True -- the learner's rows_to_device rebuilds their bytes
+        #  from the arena; 5 GB of mostly empty frame budget per 32,768-decision rollout before)
+        # (A-6, 2026-11-19: v3 rollouts compact in shared memory too, --learner-process 1: the arena a fixed shared
+        #  byte array of the worst case -- every record a whole frame field -- whose untouched pages cost nothing;
+        #  frames_buf names it among the shared arrays, rollout_view rebuilds the arena over it)
+        compact = (bool(block_steps) and alloc is None) or bool(compact)
+        self.dropped = 0   # (A-6, Codex round 16: decisions past a worker's capacity, dropped by store)
         self.rows = zeros((workers, capacity), ROWC if compact else ROW)
-        self.frames = FrameArena(workers * capacity * 12288) if compact else None
+        if not compact:
+            self.frames = None
+        elif alloc is None:
+            self.frames = FrameArena(workers * capacity * 16384)
+        else:
+            self.frames = FrameArena(buf=alloc((workers * capacity * (ROW.itemsize - ROW_FRAME_AT),), np.uint8))
+            self.frames_buf = self.frames.buf
         self.pending = zeros((workers, capacity, n_heads), np.int64)
         self.actions = zeros((workers, capacity, n_heads), np.int64)
         self.logp = zeros((workers, capacity), np.float32)
@@ -1012,7 +1035,8 @@ DONE_BROKE = -1   # (episodes.jsonl 'done' of an episode that broke off: its gam
 #  have them, as they never had heal / resource.
 NEW_TERMS = ('item', 'trinket', 'depth', 'nohit')
 REWARD_TERMS = ('damage', 'hurt', 'time', 'win', 'death', 'timeout', 'room', 'explore', 'boss', 'exit', 'heal',
-                'resource') + NEW_TERMS
+                'resource') + NEW_TERMS + ('rewind', 'rewind_lost')   # ('rewind': 2026-11-20, the ledger's rollback,
+#   Episodes._rewind; 'rewind_lost': a rollback that found no open decision, never paid -- Codex round 21)
 _RT = {k: i for i, k in enumerate(REWARD_TERMS)}
 
 
@@ -1063,25 +1087,105 @@ class Episodes:
         self.seen_t = [set() for _ in range(workers)]
         self.stage_prev = np.zeros(workers, np.int64)
         self.stage_max = np.zeros(workers, np.int64)
-        self.held_prev = [None] * workers   # (active, trinket 0, trinket 1, collectibles' count) of the record before
+        # per worker (active, trinket 0, trinket 1, collectibles' count) of the record before, and whether there is one
+        self.held_prev = np.zeros((workers, 4), np.int64)
+        self.held_ok = np.zeros(workers, bool)
+        # (2026-11-20, reward-rewind-design.md) the rewind ledger, off until set_rewind: per worker the cancellable part
+        # of each decision closed since the checkpoint (led[w, :led_n[w]]), the state at the checkpoint (ck: the
+        # episode's first record, then every ROW 'rewind' bit-7 record), the episode's rewinds
+        self.rw_on = False
+        self.led = self.led_n = None
+        # (Codex round 20) rewinds whose record found no open decision (its decisions past a worker's capacity, dropped
+        # by store): the state still goes back, the rollback reward is lost -- counted, warned (progress rewind_lost)
+        self.rewind_lost = 0
+        # (Codex round 20) the global value head's rollback differs: its own interest gamma_global^-(k - j); the
+        # difference per rewind record goes to Rollout.reward_gd (set_rewind's gamma_g; None: no global head)
+        self.rw_gamma_g = None
+        self.ck = [None] * workers
+        self.rewinds = np.zeros(workers, np.int64)
+
+    def set_rewind(self, interest, rtime, cmax, gamma, limit, gamma_g=None):
+        """Roll the reward ledger back at the game's Glowing Hour Glass restores (ROW 'rewind' bits 0-6): the record
+        pays its time term and -sum_j c_j x_j over the decisions j since the checkpoint, x_j a decision's reward (less
+        its time term when rtime is 0), c_j = min(gamma^-(k - j), cmax) (interest 1; 1 otherwise), k - j the decisions
+        between; the episode's statistics, its once-per-episode sets and counts and each term's share go back to the
+        checkpoint (the time term's stays when rtime is 0); the share of the rollback beyond the restored shares is the
+        term 'rewind'. limit: the most decisions an episode has (the ledger's size)."""
+        n = len(self.ck)
+        self.rw_on, self.rw_interest, self.rw_time = True, bool(interest), bool(rtime)
+        self.rw_cmax, self.rw_gamma = float(cmax), float(gamma)
+        self.rw_gamma_g = None if gamma_g is None else float(gamma_g)
+        self.led = np.zeros((n, int(limit) + 8))
+        self.led_n = np.zeros(n, np.int64)
+
+    def _snap(self, i):
+        """Worker i's checkpoint: what a rewind restores."""
+        self.ck[i] = (float(self.hurt[i]), float(self.damage[i]), int(self.rooms[i]), int(self.boss[i]),
+                      self.extra[i].copy(), float(self.healed[i]), float(self.gathered[i]),
+                      self.term[i].copy() if self.term is not None else None, self.counts[i].copy(),
+                      set(self.seen_c[i]), set(self.seen_t[i]), int(self.stage_max[i]))
+        self.led_n[i] = 0
+
+    def _rewind(self, i, n_back):
+        """Worker i's record with n_back restores: its reward (time and the rollback), the state put back; sets
+        self.rw_gd, the global value head's rollback less this one (its interest by gamma_g; 0 without)."""
+        rw = self.rw
+        n = int(self.led_n[i])
+        x = self.led[i, :n]
+        dist = n - np.arange(n, dtype=np.float64)
+        c = np.minimum(self.rw_gamma ** -dist, self.rw_cmax) if self.rw_interest else np.ones(n)
+        back = -float((c * x).sum())
+        self.rw_gd = 0.0
+        if self.rw_gamma_g is not None and self.rw_interest:
+            self.rw_gd = -float((np.minimum(self.rw_gamma_g ** -dist, self.rw_cmax) * x).sum()) - back
+        ck = self.ck[i]
+        if ck is not None:
+            (self.hurt[i], self.damage[i], self.rooms[i], self.boss[i], ex, self.healed[i], self.gathered[i], tm,
+             cnt, sc, st_, smax) = ck
+            uses = self.extra[i, 2]   # (uses: every real use counts, the rewind's own as well)
+            self.extra[i] = ex
+            self.extra[i, 2] = uses
+            self.counts[i] = cnt
+            self.seen_c[i], self.seen_t[i], self.stage_max[i] = set(sc), set(st_), smax
+            if self.term is not None and tm is not None:
+                t_now, r_now = self.term[i, _RT['time']], self.term[i, _RT['rewind']]
+                l_now = self.term[i, _RT['rewind_lost']]
+                self.term[i] = tm
+                self.term[i, _RT['rewind_lost']] = l_now   # (never restored either)
+                self.term[i, _RT['time']] = t_now if not self.rw_time else tm[_RT['time']] - rw['time']
+                # (Codex round 20: the rollbacks' remainders accumulate -- the share is not restored with the others)
+                self.term[i, _RT['rewind']] = r_now + back + float(x.sum())
+        self.rewinds[i] += n_back
+        self.led_n[i] = 0
+        return -rw['time'] + back
 
     @staticmethod
-    def held(r):
-        """(active, trinket 0, trinket 1, collectibles' count: ROW pinv[6] x 16, distinct ids, at most 32)."""
-        return (int(r['pitem'][0]), int(r['pitem'][1]), int(r['pitem'][2]), int(round(float(r['pinv'][6]) * 16)))
+    def held(pitem, pinv):
+        """[n, 4] int64 per record (ROW pitem, pinv): active, trinket 0, trinket 1, collectibles' count (pinv[6] x 16,
+        distinct ids, at most 32; rounded half to even, as Python's round)."""
+        pi = pitem.astype(np.int64)
+        return np.stack([pi[:, 0], pi[:, 1], pi[:, 2], np.rint(pinv[:, 6].astype(np.float64) * 16).astype(np.int64)], 1)
 
-    def new_terms(self, rows, sel, w, ev, hu, d):
-        """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w."""
+    def new_terms(self, rows, sel, w, ev, hu, d, held_all=None):
+        """The new terms' rewards [len(w), 4] (item, trinket, depth, nohit) of records rows[sel] of workers w.
+        (A-1, 2026-11-19: vectorized; only records whose holdings changed -- the active slot or a trinket slot to
+        another nonzero id, the collectibles' count up -- go through the per-record id sets. The rewards are the
+        per-record loop's bit for bit: tests/test_reward_terms.py's random streams against that loop.)"""
         rw = self.rw
         out = np.zeros((len(w), 4))
-        r_ = rows[sel]
-        stage = r_['stage'].astype(np.int64)
-        for j in range(len(w)):
-            i = int(w[j])
-            r = r_[j]
-            if (rw.get('item') or rw.get('trinket')) and self.held_prev[i] is not None:
-                a0, t0, t1, n0 = self.held_prev[i]
-                a, ta, tb, n = self.held(r)
+        at = np.flatnonzero(sel)   # (fields only: a whole ROW record is ~150 KB with its visible frame)
+        stage = rows['stage'][at].astype(np.int64)
+        if rw.get('item') or rw.get('trinket'):
+            # (A-5: held_all, the call's holdings computed once by arrive)
+            cur = held_all[at] if held_all is not None else self.held(rows['pitem'][at], rows['pinv'][at])
+            prev = self.held_prev[w]
+            chg = self.held_ok[w] & (((cur[:, 0] > 0) & (cur[:, 0] != prev[:, 0])) | (cur[:, 3] > prev[:, 3])
+                                     | ((cur[:, 1] > 0) & (cur[:, 1] != prev[:, 1]))
+                                     | ((cur[:, 2] > 0) & (cur[:, 2] != prev[:, 2])))
+            for j in np.flatnonzero(chg):
+                i = int(w[j])
+                a0, t0, t1, n0 = (int(x) for x in prev[j])
+                a, ta, tb, n = (int(x) for x in cur[j])
                 seen = self.seen_c[i]
                 got_c = 0
                 if a > 0 and a != a0 and a not in seen:   # the active slot: a new id
@@ -1089,8 +1193,7 @@ class Episodes:
                     got_c += 1
                 rise = n - n0 - (1 if got_c else 0)   # (the active, when counted among the collectibles)
                 if rise > 0:   # passives: at most the rise, ids of the newest 16 never rewarded
-                    for v, c in r['inv']:
-                        v = int(v)
+                    for v, c in rows['inv'][at[j]].tolist():   # (Python ints: no numpy scalars per entry)
                         if rise <= 0:
                             break
                         if v > 0 and c > 0 and v != a and v not in seen:
@@ -1106,15 +1209,15 @@ class Episodes:
                 out[j, 1] = rw.get('trinket', 0.0) * got_t
                 self.counts[i, 0] += got_c
                 self.counts[i, 1] += got_t
-            if rw.get('depth'):
-                if self.run and (ev[j] & EV_EXIT):
-                    if stage[j] > self.stage_max[i]:   # (a floor deeper than any reached: the floor left scales it)
-                        out[j, 2] += rw['exit'] * rw['depth'] * max(int(self.stage_prev[i]) - 1, 0)
-                if ev[j] & 4:
-                    out[j, 2] += rw['boss'] * rw['depth'] * max(int(stage[j]) - 1, 0)
-            if rw.get('nohit') and (ev[j] & EV_NOHIT) and d[j] != 2:
-                out[j, 3] = rw['nohit']
-                self.counts[i, 2] += 1
+        if rw.get('depth') and (ev & (EV_EXIT | 4)).any():   # (A-5: nothing to add without an exit or a boss)
+            if self.run:   # (the exit: to a floor deeper than any reached; the floor left scales it)
+                ex = ((ev & EV_EXIT) != 0) & (stage > self.stage_max[w])
+                out[:, 2] += np.where(ex, rw['exit'] * rw['depth'] * np.maximum(self.stage_prev[w] - 1, 0), 0.0)
+            out[:, 2] += np.where((ev & 4) != 0, rw['boss'] * rw['depth'] * np.maximum(stage - 1, 0), 0.0)
+        if rw.get('nohit') and (ev & EV_NOHIT).any():   # (A-5)
+            nh = ((ev & EV_NOHIT) != 0) & (d != 2)
+            out[nh, 3] = rw['nohit']
+            self.counts[w[nh], 2] += 1
         return out
 
     def start_terms(self, rows, idx, first):
@@ -1179,6 +1282,10 @@ class Episodes:
         if self.term is not None:   # (2026-11-19: never into the next episode's shares)
             self.term[ws] = 0.0
         self.counts[ws] = 0
+        if self.rw_on:
+            self.led_n[ws] = 0
+            for i_ in ws:
+                self.ck[int(i_)] = None
         if self.plr is not None:
             self.v0[ws], self.gret[ws], self.steps[ws] = 0.0, 0.0, 0
 
@@ -1204,6 +1311,10 @@ class Episodes:
             if (~trunc).any():
                 self.close_broken(wb[~trunc])
         has = k >= 0
+        # (A-5, 2026-11-19: what the call needs twice, computed once: the gains' base, the holdings)
+        gains_now = self.cur_gains(rows) if self.gains is not None else None
+        held_all = (self.held(rows['pitem'], rows['pinv'])
+                    if self.new_on and (rw.get('item') or rw.get('trinket')) else None)
         cap = is_trunc(rows)   # (--cap-truncate / --stall-truncate: those ends, truncations)
         capped = is_cap(rows)
         if has.any():   # the reward of the decision before
@@ -1213,8 +1324,9 @@ class Episodes:
             hu = rows['hurt'][has].astype(np.float64)
             if roll.close_hurt is not None:   # 2026-11-03 (--aux-predict): what closes these decisions
                 roll.close_hurt[w, kk], roll.close_done[w, kk], roll.close_ev[w, kk] = hu, d, rows['events'][has]
-            reward = rw['damage'] * dmg - rw['hurt'] * hu - rw['time'] + np.where(
-                d == 1, self.end_bonus, np.where(d == 2, -rw['death'], np.where((d == 3) & ~cap_h, -rw['timeout'], 0.0)))
+            endt = np.where(d == 1, self.end_bonus, np.where(d == 2, -rw['death'],
+                                                             np.where((d == 3) & ~cap_h, -rw['timeout'], 0.0)))
+            reward = rw['damage'] * dmg - rw['hurt'] * hu - rw['time'] + endt
             if self.floor:
                 ev = rows['events'][has].astype(np.int64)
                 reward = reward + (rw['room'] * ((ev & 1) > 0) + rw['explore'] * ((ev & 2) > 0)
@@ -1224,7 +1336,7 @@ class Episodes:
                 self.rooms[w] += (ev & 1) > 0
                 self.boss[w] += (ev & 4) > 0
                 if self.gains is not None:   # 2026-10-08: health units and resources gained since the record before
-                    dl = self.cur_gains(rows)[has] - self.gains[w]
+                    dl = gains_now[has] - self.gains[w]
                     reward = reward + rw['heal'] * np.maximum(dl[:, 0], 0) + rw['resource'] * np.maximum(dl[:, 1], 0)
                     self.healed[w] += np.maximum(dl[:, 0], 0)
                     self.gathered[w] += np.maximum(dl[:, 1], 0)
@@ -1245,7 +1357,7 @@ class Episodes:
                     tm[w, _RT['heal']] += rw['heal'] * np.maximum(dl[:, 0], 0)
                     tm[w, _RT['resource']] += rw['resource'] * np.maximum(dl[:, 1], 0)
                 if self.new_on:   # the new terms (each 0 by default: then nothing here)
-                    nt_ = self.new_terms(rows, has, w, ev, hu, d)
+                    nt_ = self.new_terms(rows, has, w, ev, hu, d, held_all)
                     reward = reward + nt_.sum(1)
                     tm[w, _RT['item']:_RT['nohit'] + 1] += nt_
             if self.run or self.items:
@@ -1256,6 +1368,30 @@ class Episodes:
                 x[w, 2] += (ev & EV_ACTIVE) > 0
                 x[w, 3] += (ev & EV_PILL) > 0
                 x[w, 5] = np.maximum(x[w, 5], rows['stage'][has])
+            if self.rw_on:   # (2026-11-20) the rewind ledger
+                if getattr(roll, 'reward_gd', None) is not None:
+                    roll.reward_gd[w, kk] = 0.0
+                rb = rows['rewind'][has].astype(np.int64)
+                back = (rb & 127) > 0
+                nb = ~back
+                if nb.any():   # (each decision's cancellable part)
+                    wn = w[nb]
+                    pos = self.led_n[wn]
+                    if (pos >= self.led.shape[1]).any():
+                        raise RuntimeError('rewind ledger full: an episode longer than the limit given to set_rewind')
+                    self.led[wn, pos] = reward[nb] if self.rw_time else reward[nb] + rw['time']
+                    self.led_n[wn] = pos + 1
+                if back.any():
+                    reward = np.array(reward, np.float64)
+                    for j in np.flatnonzero(back):
+                        i_ = int(w[j])
+                        # (Codex round 20: an end on the same record keeps its own reward -- death, a timeout not
+                        #  bootstrapped, a floor's end -- added to the rollback, its share back after the restore)
+                        reward[j] = self._rewind(i_, int(rb[j] & 127)) + float(endt[j])
+                        if self.term is not None and endt[j] != 0:
+                            self.term[i_, _RT['win' if d[j] == 1 else 'death' if d[j] == 2 else 'timeout']] += float(endt[j])
+                        if self.rw_gd and getattr(roll, 'reward_gd', None) is not None:
+                            roll.reward_gd[i_, int(kk[j])] = self.rw_gd
             # (a branch's truncated end, DONE_BRANCH: not terminal, the decision bootstraps from the end's value)
             roll.reward[w, kk], roll.terminal[w, kk] = reward, (d != 0) & (d != DONE_BRANCH) & ~cap_h
             roll.open[w] = -1
@@ -1268,16 +1404,29 @@ class Episodes:
                 self.steps[w] += 1
             self.hurt[w] += hu
             self.damage[w] += dmg
+        if self.rw_on:   # (Codex round 20) a rewind whose record closes no decision: the state back, the reward lost
+            lost = ~has & ~first & ((rows['rewind'] & 127) != 0)
+            for j in np.flatnonzero(lost):
+                i_ = int(idx[j])
+                amount = self._rewind(i_, int(rows['rewind'][j] & 127)) + rw['time']
+                self.rewind_lost += 1
+                if self.term is not None:   # (Codex round 21: _rewind booked the rollback in the shares, ret got none)
+                    self.term[i_, _RT['rewind_lost']] -= amount
+                    if self.rw_time:   # (its time term: no record's reward carries it)
+                        self.term[i_, _RT['time']] += rw['time']
+                print(f'rewind ledger: worker {i_} episode {int(rows[j]["episode"])} seed {int(rows[j]["seed"])}: a rewind '
+                      f'with no open decision (dropped at the worker\'s capacity): its rollback {amount:+.4f} lost '
+                      f'(rewind_lost {self.rewind_lost})', flush=True)
         self.note_first(rows, idx, first)
         if self.gains is not None:   # every record (the first of an episode included): the next deltas' base
-            self.gains[idx] = self.cur_gains(rows)
+            self.gains[idx] = gains_now
         if self.new_on:   # (2026-11-19) an episode's first record: its held ids; every record: its stage, holdings
             if first.any():
                 self.start_terms(rows, idx, first)
             self.stage_prev[idx] = rows['stage']
             self.stage_max[idx] = np.maximum(self.stage_max[idx], rows['stage'])
-            for j in range(len(idx)):
-                self.held_prev[int(idx[j])] = self.held(rows[j])
+            self.held_prev[idx] = held_all if held_all is not None else self.held(rows['pitem'], rows['pinv'])
+            self.held_ok[idx] = True
         if self.run or self.items:   # an episode's first record: its stage, and the build it starts with
             st0 = first
             if st0.any():
@@ -1305,6 +1454,11 @@ class Episodes:
                     pk['bped'][int(idx[j])] = [int(v) for v in rows[j]['bped'] if v > 0]
                 pk['steps'][idx[first]] = 0
             pk['steps'][idx] += rows['pforce'] > 0
+        if self.rw_on:   # (2026-11-20) checkpoints: an episode's first record, a room / floor change (after its reward)
+            for j in np.flatnonzero(first | ((rows['rewind'] & 128) != 0)):
+                if first[j]:
+                    self.rewinds[int(idx[j])] = 0
+                self._snap(int(idx[j]))
         ended = done != 0
         if ended.any():
             for j in np.flatnonzero(ended):
@@ -1332,13 +1486,17 @@ class Episodes:
                     fin['active0'] = self.active0[int(i)]
                 if self.gains is not None:   # 2026-10-08: health units healed, coins + bombs + keys gathered
                     fin.update(healed=float(self.healed[i]), gathered=float(self.gathered[i]))
-                if self.new_on:   # (2026-11-19) each reward term's share of 'ret' (with the new terms only: the
-                    # driver's native consumer, held to this one record for record, has neither)
+                if self.new_on or self.rw_on:   # (2026-11-19) each reward term's share of 'ret' (with the new terms or
+                    # the rewind ledger only: the driver's native consumer, held to this one record for record, has neither)
                     fin['r'] = {k: round(float(self.term[i, j]), 4) for j, k in enumerate(REWARD_TERMS)
                                 if self.term[i, j] != 0}
                 if self.new_on:
                     fin.update(items_new=int(self.counts[i, 0]), trinkets_new=int(self.counts[i, 1]),
                                nohit_rooms=int(self.counts[i, 2]))
+                if self.rw_on:   # (2026-11-20) the episode's rewinds; the active item it ended with (odd-episode alerts)
+                    fin['rewinds'] = int(self.rewinds[i])
+                    if self.items:   # (with the ledger only: the driver's native consumer, held to this one, has neither)
+                        fin['active_end'] = int(r['pitem'][0])
                 if self.pick is not None:   # 2026-10-13 (B23): the pedestal build, the forcing draw and its decisions
                     fin.update(build_pedestals=self.pick['bped'].get(int(i), []), pickup_forced=int(r['pmode']),
                                forced_steps=int(self.pick['steps'][i]))
@@ -1362,6 +1520,10 @@ class Episodes:
                 self.term[e] = 0.0
             if self.new_on:
                 self.counts[e] = 0
+            if self.rw_on:
+                self.led_n[e] = 0
+                for i_ in e:
+                    self.ck[int(i_)] = None
             if self.plr is not None:   # 2026-10-10 (archive_plr): the score of each finished ordinary episode
                 stats_, ST_, gamma_ = self.plr
                 for j in np.flatnonzero(ended):
@@ -1472,6 +1634,7 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
     kk = roll.length[a_idx]
     ok = kk < roll.cap   # cannot fail with the trainer's capacity; drop rather than overrun
     if not ok.all():
+        roll.dropped = getattr(roll, 'dropped', 0) + int((~ok).sum())   # (counted: progress store_dropped)
         a_idx, kk, rows, under_way = a_idx[ok], kk[ok], rows[ok], under_way[ok]
         actions, logp, value = actions[ok], logp[ok], value[ok]
         h = h[ok] if h is not None else None
@@ -1498,6 +1661,22 @@ def store(roll, a_idx, rows, under_way, actions, logp, value, version, h=None, v
     roll.pending[a_idx, kk], roll.actions[a_idx, kk] = under_way, actions
     roll.logp[a_idx, kk], roll.value[a_idx, kk], roll.version[a_idx, kk] = logp, value, version
     roll.length[a_idx], roll.open[a_idx] = kk + 1, kk
+
+
+def expand_rows(roll, m):
+    """(A-3) roll.rows[:, :m] as ROW records (the dumps' format, the tools read it): compact ROWC records with their
+    frames from roll.frames (the frame field's tail past each frame zero); ROW records as they are."""
+    rows = roll.rows[:, :m]
+    if rows.dtype == ROW:
+        return rows
+    out = np.zeros(rows.shape, ROW)
+    fa = ROW.fields['visible_frame'][1]
+    o_ = out.reshape(-1).view(np.uint8).reshape(-1, ROW.itemsize)
+    o_[:, :fa] = np.ascontiguousarray(rows).reshape(-1).view(np.uint8).reshape(-1, ROWC.itemsize)[:, :fa]
+    buf = roll.frames.buf
+    for i, (o, k) in enumerate(zip(rows['visible_off'].reshape(-1), rows['visible_bytes'].reshape(-1))):
+        o_[i, fa:fa + int(k)] = buf[int(o):int(o) + int(k)]
+    return out
 
 
 def store_temporal(roll, a_idx, kk, rows, t):
@@ -1584,6 +1763,52 @@ def hand_off(roll, mirror, device, streams):
     return view, ev, nbytes
 
 
+def end_learner_process(learner, results, failure, L, wait_s=900.0, join_s=60.0, kill_s=10.0):
+    """(B38 step 2) the trainer's end of the learner process: its last messages ('error': a failure; 'done': its last
+    update saved, last.pt written), then its exit. (2026-11-20, Codex round 19: a run succeeds only with the 'done'
+    message AND exit code 0 -- before, a learner killed after its last fresh weights and before last.pt (exit code -9,
+    no 'done') left failure empty and the run 'finished' with rc 0.) A learner still alive join_s after its last
+    message is killed (it ignores SIGTERM: terminate() alone does not end it) and joined; a missing 'done', a nonzero
+    exit code or a learner that had to be killed is a failure (appended to `failure`). Returns whether 'done' came."""
+    import queue as queue_
+    import time as time_
+    got = False
+    t_lim = time_.perf_counter() + wait_s
+    while time_.perf_counter() < t_lim:
+        try:
+            kind, info = results.get(timeout=1.0)
+        except queue_.Empty:
+            if not learner.is_alive():
+                break
+            continue
+        if kind == 'error':
+            failure.append(RuntimeError('learner process:\n' + info))
+        elif kind == 'done':
+            L.update(update=info['update'], decisions=info['decisions'], seconds=info['seconds'])
+            got = True
+            break
+    learner.join(timeout=join_s)
+    killed = False
+    if learner.is_alive():
+        print('the learner process did not end; killed', flush=True)
+        learner.terminate()
+        learner.join(timeout=kill_s)
+        if learner.is_alive():
+            learner.kill()
+            learner.join(timeout=kill_s)
+        killed = True
+    if killed:
+        failure.append(RuntimeError(f'the learner process did not end {join_s:.0f} s after its last message: killed '
+                                    f'(exit code {learner.exitcode})'))
+    elif not got:
+        failure.append(RuntimeError(f'the learner process ended without its done message (exit code '
+                                    f'{learner.exitcode}): its last update and last.pt may be missing'))
+    elif learner.exitcode != 0:
+        failure.append(RuntimeError(f'the learner process ended with exit code {learner.exitcode} after its done '
+                                    f'message'))
+    return got
+
+
 def weight_mover(actor_params, learner_device):
     """(B38, --learner-device) the state of move_weights: byte views of the actor's parameters and buffers (in place:
     the actor's graphs read them where they are), a byte buffer of their total size on each GPU, a stream on the
@@ -1639,10 +1864,12 @@ def temporal_bounds(tch, chunk_ids, micro):
     return bounds
 
 
-def gae(rollout, gamma, lam, value=None):
+def gae(rollout, gamma, lam, value=None, reward=None):
     """(advantages, returns, mask) [workers, capacity] over each worker's decisions that have their reward. value:
-    the values to use (default: the stored ones)."""
+    the values to use (default: the stored ones); reward: the rewards (default: the stored ones; the global head's:
+    reward_g(rollout))."""
     value = rollout.value if value is None else value
+    rewards = rollout.reward if reward is None else reward
     adv = np.zeros_like(rollout.reward)
     mask = np.zeros_like(rollout.terminal)
     for i in range(rollout.n):
@@ -1657,13 +1884,26 @@ def gae(rollout, gamma, lam, value=None):
                 running, nxt = 0.0, value[i, t]
                 continue
             live = 0.0 if rollout.terminal[i, t] else 1.0
-            delta = rollout.reward[i, t] + gamma * nxt * live - value[i, t]
+            delta = rewards[i, t] + gamma * nxt * live - value[i, t]
             running = delta + gamma * lam * live * running
             adv[i, t] = running
             nxt = value[i, t]
         mask[i, :usable] = True
         mask[i, :usable] &= ~boot[:usable]
     return adv, adv + value, mask
+
+
+def global_targets(rollout, gamma_g, lam, value_g):
+    """(Codex round 21) value_global's GAE (advantages, returns, mask): its own rewards (reward_g, the rewind's
+    gamma_global rollback) and gamma_global -- the learner's one path for both its stored and recomputed values."""
+    return gae(rollout, gamma_g, lam, value_g, reward=reward_g(rollout))
+
+
+def reward_g(rollout):
+    """(Codex round 20) the global value head's rewards: the stored ones, plus Rollout.reward_gd where a rewind's
+    rollback differs under gamma_global (None: the stored ones as they are)."""
+    gd = getattr(rollout, 'reward_gd', None)
+    return None if gd is None or not gd.any() else rollout.reward + gd
 
 
 def learner_child_entry(argv, init):
@@ -1807,10 +2047,26 @@ def main(argv=None, child=None, actor=None):
                         'resumed checkpoint keeps its own setting, --init pads them with zeros')
     p.add_argument('--floor-seconds', type=float, default=480.0)
     p.add_argument('--floor-stall-seconds', type=float, default=60.0)
-    p.add_argument('--stall-progress', choices=('events', 'pickups', 'items'), default='events',
+    p.add_argument('--stall-progress', choices=('events', 'pickups', 'items', 'first'), default='events',
                    help="B40: what resets the floor's stall timer: 'events' (a new / cleared room, a monster hurt), "
                         "'pickups' (also a gain in coins / keys / bombs / health) or 'items' (2026-11-12: pickups and "
-                        "also a collectible gained, a trinket / pill / card acquired; needs --items)")
+                        "also a collectible gained, a trinket / pill / card acquired; needs --items); 'first' "
+                        "(2026-11-20, reward-rewind-design.md 3.3 v1): only what the episode does for the first time "
+                        "-- a room entered, cleared, its monsters hurt (per floor instance and room), an id held, a "
+                        "floor reached; never rolled back by a rewind; repeated clears (a rewind, D7) and resources "
+                        "are not progress")
+    p.add_argument('--rewind', type=int, default=0, choices=(0, 1),
+                   help='(2026-11-20, reward-rewind-design.md) 1: the reward ledger follows the game\'s Glowing Hour '
+                        'Glass restores (ROW rewind, the bridge\'s restore count): a restore\'s record pays its time '
+                        'term and the rollback of every reward since the last room / floor change (or the episode\'s '
+                        'start), the statistics and once-per-episode sets go back with it; floor / run modes, not with '
+                        '--block-memory; needs the native lean observation (abp_native_rewinds)')
+    p.add_argument('--rewind-interest', type=int, default=1, choices=(0, 1),
+                   help='(--rewind 1) 1: each rolled-back reward times min(gamma^-(k - j), --rewind-cmax) (k - j: the '
+                        'decisions since it), so the discounted return of a rewound stretch is 0; 0: as is')
+    p.add_argument('--rewind-time', type=int, default=0, choices=(0, 1),
+                   help='(--rewind 1) 1: the time terms of the rewound stretch rolled back too; 0 (the user, 11-20): kept')
+    p.add_argument('--rewind-cmax', type=float, default=4.0)
     p.add_argument('--archive-size', type=int, default=12)
     p.add_argument('--archive-prob', type=float, default=0.7)
     p.add_argument('--snapshot-prob', type=float, default=0.5)
@@ -2183,6 +2439,10 @@ def main(argv=None, child=None, actor=None):
                         '(attention buckets, entity positions, the distinct grids: the same values up to summation '
                         'order), its records staged in pinned memory and kept as bytes, so that the PPO parts gather '
                         "bytes after it too (B18's raw gather; values identical), the item counts read from the fields")
+    p.add_argument('--v3-encoder-compile', default='',
+                   help="2026-11-19 (L-1, --frame v3 with --packed 0): torch.compile mode of the learner's padded frame "
+                        "encoder alone (fixed shapes: one compile per E / N / S bucket and part size; e.g. default, "
+                        "reduce-overhead); '': eager, as before. The actor's graphs and the evaluation are not compiled")
     p.add_argument('--learner-compile', default='',
                    help="2026-10-17 (B38 step 4, an experiment): torch.compile mode of the learner model's forward in "
                         "the PPO parts and the recompute pass (e.g. default, max-autotune-no-cudagraphs; dynamic "
@@ -2327,6 +2587,15 @@ def main(argv=None, child=None, actor=None):
                     'computes the rewards without them)')
         if 'nohit' in new_rw_ and args.frame != 'v3':
             p.error('--reward nohit: --frame v3 only (its workers encode every record in encode_row)')
+    if args.rewind:   # (2026-11-20, reward-rewind-design.md)
+        if args.mode not in ('floor', 'run'):
+            p.error('--rewind 1: --mode floor or run only')
+        if args.block_memory:
+            p.error('--rewind 1: not with --block-memory -- its driver\'s native consumer (abp_core.h) computes the '
+                    'rewards without the rewind ledger, and a rewind would then pay every rewound reward '
+                    '(reward-rewind-design.md R5)')
+        if args.rewind_cmax < 1:
+            p.error('--rewind-cmax: >= 1')
     if not args.obs_visible:   # (seq-v1: before any worker / child process starts; tok_obs.encode_row reads it)
         os.environ['ISAAC_NO_VISIBLE'] = '1'
     shard_world = int(os.environ.get('ISAAC_SHARD_WORLD', '1') or 1)   # BM1 C: K shards as one run (shard_sync)
@@ -2682,7 +2951,9 @@ def main(argv=None, child=None, actor=None):
                            if floor else (), teacher_death_margin=args.teacher_death_margin, teacher_thread=args.teacher_thread, teacher_fork=args.teacher_fork,
                            mode=args.mode,
                            floor_seconds=args.floor_seconds, floor_stall_seconds=args.floor_stall_seconds,
-                           stall_progress=args.stall_progress,
+                           stall_progress=args.stall_progress, rewind=args.rewind,
+                           rewind_interest=args.rewind_interest, rewind_time=args.rewind_time,
+                           rewind_cmax=args.rewind_cmax,
                            archive_size=args.archive_size, archive_prob=args.archive_prob,
                            snapshot_prob=args.snapshot_prob, archive_boss=args.archive_boss, build_timeout=args.build_timeout,
                            root_anon_mib=args.root_anon_mib, reset_timeout=args.reset_timeout,
@@ -3004,6 +3275,8 @@ def main(argv=None, child=None, actor=None):
     episodes_path = open(out / 'episodes.jsonl', 'a')
     branch_path = open(out / 'branch_episodes.jsonl', 'a') if branching else None
     choice_path = open(out / 'choices.jsonl', 'a') if branching else None
+    # (Codex round 22: the lane -- the trainer's CPUs at its start, the container's cpuset -- for the CPU plan's check)
+    lane_cpus = os.sched_getaffinity(0)
     learner_cpus = set()   # 2026-10-10 (B18, --learner-cpus): before the workers start (they inherit the rest)
     # (BM1: or ISAAC_LEARNER_CPUS, the same list, when the flag is not given: the bm1 runners pass one EXTRA flag)
     for part_ in filter(None, (args.learner_cpus or os.environ.get('ISAAC_LEARNER_CPUS', '')).split(',')):
@@ -3023,6 +3296,36 @@ def main(argv=None, child=None, actor=None):
     if driver_cpus:
         os.sched_setaffinity(0, os.sched_getaffinity(0) - driver_cpus)
         print(f'driver CPUs (ISAAC_DRIVER_CPUS): {sorted(driver_cpus)}, dedicated to the C++ driver thread', flush=True)
+    # (P-driver-design 15, the CPU ledger) ISAAC_TOK_PIN=1 with the lane's ISAAC_DRIVER_CPUS: the actor's main thread
+    # (the Python loop, or the C++ driver's consumer) and the C++ driver's thread on those CPUs, off the saturated
+    # workers' set -- the main thread once the loop starts (the workers and the learner process started before
+    # it: they keep the rest); scheduling only, nothing computed differently
+    tok_pin = os.environ.get('ISAAC_TOK_PIN', '0') == '1' and bool(driver_cpus) and child is None
+    # (P-driver-design 15, the split layout) ISAAC_ACTOR_CPUS with ISAAC_TOK_PIN=1: the actor's main thread (the Python
+    # loop, or the C++ driver's consumer) on these CPUs instead of sharing ISAAC_DRIVER_CPUS with the driver thread;
+    # kept off the workers' set like the driver's. Unset: as before (the main thread on the driver CPUs)
+    actor_cpus = set()
+    for part_ in filter(None, os.environ.get('ISAAC_ACTOR_CPUS', '').split(',')):
+        lo_, _, hi_ = part_.partition('-')
+        actor_cpus.update(range(int(lo_), int(hi_ or lo_) + 1))
+    if actor_cpus:
+        if os.environ.get('ISAAC_TOK_PIN', '0') != '1' or not driver_cpus:
+            p.error('ISAAC_ACTOR_CPUS needs ISAAC_TOK_PIN=1 and ISAAC_DRIVER_CPUS')
+        if actor_cpus & (learner_cpus | driver_cpus):
+            p.error(f'ISAAC_ACTOR_CPUS {sorted(actor_cpus)} overlaps the learner / driver CPUs')
+        os.sched_setaffinity(0, os.sched_getaffinity(0) - actor_cpus)
+        print(f'actor CPUs (ISAAC_ACTOR_CPUS): {sorted(actor_cpus)}, the actor main thread\'s', flush=True)
+    # (Codex round 22, items 1 and 2) the CPU plan checked here, before any worker starts: ISAAC_TOK_PIN=1 without
+    # ISAAC_DRIVER_CPUS, a group outside the lane, exclusive groups sharing a CPU or a physical core (SMT siblings),
+    # an explicit ISAAC_RL_WORKER_CPUS / ISAAC_RL_SEARCH_CPUS outside the workers' CPUs: the run stops with the reason
+    #  (the trainer only: the spawned learner / actor processes start from its trimmed mask)
+    from isaac_bridge.cpu_plan import env_worker_masks, plan_problems, readback_problem
+    plan_bad = plan_problems(lane_cpus, learner_cpus, driver_cpus, actor_cpus,
+                             pin=os.environ.get('ISAAC_TOK_PIN', '0') == '1',
+                             learner_shared=os.environ.get('ISAAC_LEARNER_CPUS_SHARED', '0') == '1',
+                             worker_masks=env_worker_masks()) if (child is None and actor is None) else []
+    if plan_bad:
+        p.error('CPU plan: ' + '; '.join(plan_bad))
     if learner_cpus:
         print(f'learner CPUs (--learner-cpus): {sorted(learner_cpus)}, '
               + ('shared: the rest of the trainer, its workers and games may run on them too'
@@ -3102,6 +3405,22 @@ def main(argv=None, child=None, actor=None):
         sampler = JobSampler(bench_stats)
     else:
         os.environ.setdefault('ISAAC_RL_FATAL_DIR', str(out))   # (a worker's visible-v3 fatal reason: tok_sampler)
+        from isaac_bridge import tok_obs as TO_fr
+        if TO_fr.FAST_ROW_CHECK_WORKERS and not TO_fr.FAST_ROW:
+            raise SystemExit('native ROW encoder: ISAAC_RL_FAST_ROW_CHECK_WORKERS (the canary) needs ISAAC_RL_FAST_ROW=1')
+        if (TO_fr.FAST_ROW_CHECK_WORKERS or TO_fr.FAST_ROW_CHECKING) and \
+                not os.environ.get('ISAAC_RL_FAST_ROW_CHECK_DIR'):
+            raise SystemExit('native ROW encoder: check mode / the canary needs ISAAC_RL_FAST_ROW_CHECK_DIR')
+        if TO_fr.FAST_ROW_CHECK_WORKERS - set(range(cfg.workers)):
+            raise SystemExit(f'native ROW encoder: ISAAC_RL_FAST_ROW_CHECK_WORKERS {sorted(TO_fr.FAST_ROW_CHECK_WORKERS)}'
+                             f' not among the {cfg.workers} workers')
+        if TO_fr.FAST_ROW:   # (Codex round 23-2: the switch on requires this tree's library, checked before any worker)
+            from isaac_bridge.tok_sampler import row_library as row_library_
+            try:
+                TO_fr.fast_row_function(row_library_(cfg))
+            except TO_fr.FastRowFatal as exc_:
+                raise SystemExit(f'native ROW encoder: {exc_}') from None
+            print(f'native ROW encoder on (ISAAC_RL_FAST_ROW={TO_fr.FAST_ROW_MODE}): {row_library_(cfg)}', flush=True)
         sampler = TokSampler(cfg)
         if pf_on and total_h > 0 and decisions_total > 0:   # (a resumed run: the forcing probability where the run is,
             sampler.stats[:, ST['pf_p']] = pickup_force_p(   # not pickup_force[0] until the first update rewrites it)
@@ -3184,11 +3503,17 @@ def main(argv=None, child=None, actor=None):
     # at --rollout usable decisions, each worker adds at most three more (the open one, two answers in flight))
     t_cfg = dict(P=args.temporal_window - 1, L=args.temporal_layers, D=args.temporal_width, R=max(1, args.temporal_rooms),
                  kv=args.temporal_kv, device=device, rows=args.rollout // n_act + 4 * n + 64) if t_on else None
+    if (proc and args.frame == 'v3' and os.environ.get('ISAAC_RL_V3_COMPACT', '1') == '1'
+            and os.environ.get('ISAAC_RL_B38_DUMP')):
+        p.error('ISAAC_RL_B38_DUMP: not with compact v3 rollouts in shared memory (dump_job would copy the whole '
+                'arena, its reserve ~16 GiB at 32,768 decisions; Codex round 16) -- ISAAC_RL_V3_COMPACT=0 for it')
     shared = SharedArrays() if (proc and child is None and n_act == 1) else None   # (B38 step 2: host arrays the
     #                                                                                   learner maps)
     full_rolls = None   # (B38 step 5: per rollout buffer, the arrays of all workers, this actor's rows of them)
     if child is None:
-        r_kw = dict(close=aux_on or log_on, priv=PRIV_DTYPE if priv_on else None,block_steps=128 if block_on else 0)
+        r_kw = dict(close=aux_on or log_on, priv=PRIV_DTYPE if priv_on else None,block_steps=128 if block_on else 0,
+                    compact=args.frame == 'v3' and os.environ.get('ISAAC_RL_V3_COMPACT', '1') == '1'
+                    and n_act == 1)   # (A-6: not with several actor processes -- their merged full arrays are ROW)
         roll, spare = Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw), \
             Rollout(n, capacity, nh, mem_dim, gtok_on, t_cfg, alloc=shared, **r_kw)
         if n_act > 1 and actor is None:   # (the first actor: the shared arrays of all workers, its rows of them)
@@ -3319,6 +3644,12 @@ def main(argv=None, child=None, actor=None):
         lanes = BlockLaneService(sampler,model,device,wait=args.cf_lane_wait,quiet=args.cf_lane_quiet,
                                  distill_steps=args.cf_distill_steps,main_actor=block_actor,stat=lane_stat)
     inflight = collections.deque()   # (slot, workers, records, actions under way, submitted at, learner busy then)
+    # (A-4, 2026-11-19, v3 frames: each call's records taken up to their frame's end only (take_prefix) into a ring of
+    #  reused ROW buffers -- a call's records stay referenced while it is in flight (its own, the snapshots'), so the
+    #  ring is longer than the calls in flight can be; ISAAC_RL_ROW_PREFIX=0: sampler.rows[slots] as before)
+    row_ring = ([np.zeros(n, ROW) for _ in range(3 * max(1, args.actor_slots) + 3)]
+                if args.frame == 'v3' and child is None and os.environ.get('ISAAC_RL_ROW_PREFIX', '1') == '1' else None)
+    row_at = [0]
     # B54 experiment (ISAAC_BLOCK_STREAM_PRIO=learner): the learner's stream high priority, the actor's low (with the
     # C++ actor the collect is shorter than the update; the actor has slack to absorb the learner's kernels first)
     prio_learner = os.environ.get('ISAAC_BLOCK_STREAM_PRIO', 'actor') == 'learner'
@@ -3491,9 +3822,22 @@ def main(argv=None, child=None, actor=None):
         os.replace(tmp_, path)   # (atomic: a kill during the write leaves the previous file whole, never a torn one)
 
     b38_marks = bool(os.environ.get('ISAAC_RL_B38_TORCHPROF'))
+    import isaac_bridge.tok_policy as tp_marks_
+    tp_marks_.PROF_MARKS = b38_marks   # (L-1: the v3 forward's parts marked too)
     # (B38 step 4: the learner model's forward as the PPO parts and the recompute pass call it; compiled with
     # --learner-compile, the same module and parameters)
     lm_call = learner_model
+    if args.v3_encoder_compile and (args.frame != 'v3' or args.packed):
+        p.error('--v3-encoder-compile: --frame v3 with --packed 0 only (the packed path has no fixed shapes)')
+    if args.v3_encoder_compile and (child is not None or not proc):   # (L-1: the frame encoder alone)
+        import torch._dynamo
+        torch._dynamo.config.cache_size_limit = max(int(torch._dynamo.config.cache_size_limit),
+                                                    int(os.environ.get('ISAAC_RL_V3_COMPILE_CACHE', '64')))
+        # (object.__setattr__: a compiled module is a Module -- set as usual it would become a submodule and its
+        #  parameters a second time in the state dict)
+        object.__setattr__(learner_model, 'frame_v3_call',
+                           torch.compile(learner_model.frame_v3, mode=args.v3_encoder_compile, dynamic=False))
+        print(f'L-1: the learner\'s v3 frame encoder compiled ({args.v3_encoder_compile}, fixed shapes)', flush=True)
     if args.learner_compile and (child is not None or not proc):
         import torch._dynamo
         torch._dynamo.config.cache_size_limit = int(os.environ.get('ISAAC_RL_B38_COMPILE_CACHE', '64'))
@@ -3599,10 +3943,11 @@ def main(argv=None, child=None, actor=None):
             m = int(lengths.max())
             (out / 'rollouts').mkdir(exist_ok=True)
             stem = out / 'rollouts' / f'rollout-{L["update"]:06d}'
-            np.savez(str(stem) + '.npz', **{k: getattr(rl, k)[:, :m] for k in (
+            np.savez(str(stem) + '.npz', **{k: (expand_rows(rl, m) if k == 'rows' else getattr(rl, k)[:, :m]) for k in (
                 'rows', 'pending', 'actions', 'logp', 'value', 'reward', 'terminal', 'version')},
                 **({'value_g': rl.value_g[:, :m]} if getattr(rl, 'value_g', None) is not None else {}),
-                length=rl.length, open=rl.open, update=L['update'])
+                length=rl.length, open=rl.open, update=L['update'],
+                row_schema=ROW_SCHEMA)   # (2026-11-20: dumps without it carry padding bytes in ROW 'rewind')
             torch.save(dict(model=learner_model.state_dict(), config=learner_model.config, update=L['update']),
                        str(stem) + '.pt')
             t0 = time.perf_counter()
@@ -3674,10 +4019,11 @@ def main(argv=None, child=None, actor=None):
                     L['stage_r'] = torch.empty((int(len(all_flat) * 1.25) + 64, ROW_BYTES),
                                                dtype=torch.uint8).pin_memory()
                 every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
-                                                      stage=L['stage_r'], with_raw=True)
+                                                      stage=L['stage_r'], with_raw=True, frames=rl.frames)
                 fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on, t_fb)
             else:
-                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device)
+                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
+                                       frames=rl.frames)
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
             # (memory: one GRU step from each decision's stored input state)
             h_all = torch.from_numpy(rl.h.reshape(-1, mem_dim)[all_flat]).to(device) if mem_on else None
@@ -3745,7 +4091,7 @@ def main(argv=None, child=None, actor=None):
                 sec('log')
         if gtok_on and len(all_flat) and vg_stored is not None and not vgs:   # (B24) the actor's values, as stored
             vg_now = vg_stored
-            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now)
+            adv_g, ret_g, _ = global_targets(rl, args.gamma_global, args.lam, vg_now)
             del adv_g
         elif gtok_on and len(all_flat):   # 2026-10-12 (B22): value_global of every stored decision, for its returns
             vg_now = np.zeros_like(rl.value)
@@ -3759,13 +4105,14 @@ def main(argv=None, child=None, actor=None):
                             t_p = temporal_rows(rl, idx_, capacity, device)
                             tk_ = dict(temporal=dict(mode='stored', o=t_p['o'], o_prev=t_p['o_prev'], has=t_p['has']))
                         with autocast():
-                            o_ = learner_model(rows_to_device(rl.rows, idx_, rl.pending.reshape(-1, nh)[idx_], device),
+                            o_ = learner_model(rows_to_device(rl.rows, idx_, rl.pending.reshape(-1, nh)[idx_], device,
+                                                              frames=rl.frames),
                                                packed=bool(args.packed), need_vg=True,
                                                mem=torch.from_numpy(rl.h.reshape(-1, mem_dim)[idx_]).to(device)
                                                if mem_on else None, **tk_)
                         vgs.append(o_[-1].float())
             vg_now.reshape(-1)[all_flat] = torch.cat(vgs).cpu().numpy()
-            adv_g, ret_g, _ = gae(rl, args.gamma_global, args.lam, vg_now)
+            adv_g, ret_g, _ = global_targets(rl, args.gamma_global, args.lam, vg_now)
             del adv_g
             sec('recompute')
         adv, ret, mask = gae(rl, args.gamma, args.lam, value_now)
@@ -3823,7 +4170,7 @@ def main(argv=None, child=None, actor=None):
                     L['stage'] = torch.empty((int(len(flat) * 1.25) + 64, ROW_BYTES), dtype=torch.uint8).pin_memory()
                 stage = L['stage']
             batch = rows_to_device(rl.rows, flat, rl.pending.reshape(-1, nh)[flat], device, stage=stage,
-                                   with_raw=fast, head=block_on)
+                                   with_raw=fast, head=block_on, frames=None if block_on else rl.frames)
             if fast:   # (B18: a minibatch's records are gathered as bytes, the fields are views of them)
                 batch, raw_all, pend_all = batch
         b_act =torch.from_numpy(rl.actions.reshape(-1, nh)[flat]).to(device)
@@ -5225,13 +5572,24 @@ def main(argv=None, child=None, actor=None):
                         'stage_mean': sum(e.get('stage', 0) for e in finished) / m_all})
             if cfg.start_build_prob > 0:   # 2026-10-08: start builds transplanted so far (worker totals)
                 row['start_builds'] = float(stats[:, ST['start_builds']].sum())
+        # (Codex round 25) the teacher / V2 rings' records not taken, totals: lapped (written over before the read: the
+        # reader a ring behind), torn (the slot reused while it was read; with block-memory also the lanes' own skips,
+        # as before), bad (a length outside the frame: report it); open_busy (the workers' ring_open on a slot already
+        # open: a second writer, or a write that failed midway: report it)
+        for k_r, v_r in (job.get('ring_skips') or {}).items():
+            row[f'ring_{k_r}'] = v_r
+        row['worker_torch'] = job.get('worker_torch', 0)   # (the main workers' latest observation, 0 / 1 each, summed; alarm > 0)
         if args.frame == 'v3':   # (seq-v1 step 3) the actor's host side of the v3 calls (this process), this update
             from isaac_bridge import v3_input as VI_
-            tot3 = dict(VI_.STATS)
+            tot3 = VI_.stats_snapshot()   # (A-2: with the actors' device counters)
             prev3 = L.get('v3_prev') or dict.fromkeys(tot3, 0)
             L['v3_prev'] = tot3
             d3 = {k_: tot3[k_] - prev3[k_] for k_ in tot3}
             row['v3_calls'], row['v3_records'] = d3['calls'], d3['records']
+            ap_ = job.get('arena_peak_mb') or []
+            row['arena_peak_mb_a'], row['arena_peak_mb_b'] = (ap_ + [0.0, 0.0])[:2]
+            row['store_dropped'] = job.get('store_dropped', 0)
+            row['rewind_lost'] = job.get('rewind_lost', 0)
             row['v3_host_ms'] = 1000 * d3['host_s'] / max(d3['calls'], 1)
             row['v3_host_share'] = d3['host_s'] / max(job['collect_s'], 1e-9)
             for b_ in VI_.E_BUCKETS:
@@ -5240,6 +5598,10 @@ def main(argv=None, child=None, actor=None):
             if 'v3_native' in ST:   # (the workers' frames: native / the reference encoder's -- a handed-back step)
                 row['v3_native'] = float(stats[:, ST['v3_native']].sum())
                 row['v3_reference'] = float(stats[:, ST['v3_reference']].sum())
+        if 'fr_fast' in ST:   # (2026-11-20, the native ROW encoder: the workers' FastRow records so far, by path)
+            for k_f in ('fr_fast', 'fr_slow', 'fr_slow_block', 'fr_slow_room', 'fr_slow_vis', 'fr_slow_rewind',
+                        'fr_slow_other', 'fr_check_records', 'fr_check_mismatch'):
+                row[k_f] = float(stats[:, ST[k_f]].sum())
         if pf_on or cfg.start_build_mode == 'pedestal':   # 2026-10-13 (B23): this update's worker deltas
             tot = {k_p: float(stats[:, ST[k_p]].sum()) for k_p in ('pf_eps', 'pf_steps', 'pf_pickups', 'free_pickups')}
             prev = L.get('pf_prev') or dict.fromkeys(tot, 0.0)
@@ -5430,11 +5792,12 @@ def main(argv=None, child=None, actor=None):
                         f'{name}/seconds': sum(e['decisions'] for e in eps) / m * args.frames_per_decision / 30,
                         f'{name}/rooms': sum(e['rooms'] for e in eps) / m,
                         f'{name}/boss': sum(e['boss'] for e in eps) / m})
-        if floor and any(rw.get(k_) for k_ in NEW_TERMS):   # (2026-11-19) each term's mean share; the new terms' counts
+        if floor and (any(rw.get(k_) for k_ in NEW_TERMS) or args.rewind):   # (2026-11-19) each term's mean share; the new terms' counts
             m_ = max(len(finished), 1)
             row.update({f'rw_{k}': sum(e.get('r', {}).get(k, 0.0) for e in finished) / m_ for k in REWARD_TERMS})
             row.update({f'n_{k}': sum(e.get(f, 0) for e in finished) / m_
-                        for k, f in (('item', 'items_new'), ('trinket', 'trinkets_new'), ('nohit', 'nohit_rooms'))})
+                        for k, f in (('item', 'items_new'), ('trinket', 'trinkets_new'), ('nohit', 'nohit_rooms'),
+                                     ('rewind', 'rewinds'))})
         if block_on:
             row.update({'block_ppo_'+key:value for key,value in block_ppo_counts.items()})
             ru1 = resource_.getrusage(getattr(resource_, 'RUSAGE_THREAD', resource_.RUSAGE_SELF))
@@ -5867,6 +6230,10 @@ def main(argv=None, child=None, actor=None):
     # ------------------------------------------------------------------ actor (the main thread)
     pending = np.zeros((n, nh), np.int64)            # the action under way per worker
     book = Episodes(n, rw, floor, run=run, items=items)
+    if args.rewind:   # (2026-11-20, reward-rewind-design.md: the ledger; an episode's most decisions bound it)
+        book.set_rewind(args.rewind_interest, args.rewind_time, args.rewind_cmax, args.gamma, gamma_g=args.gamma_global
+                        if gtok_on else None, limit=
+                        int(round((args.run_seconds if run else args.floor_seconds) * 30 / args.frames_per_decision)) + 1)
     if cfg.archive_plr > 0:   # 2026-10-10: the trainer reports each episode's learning-potential score to its worker
         book.plr = (sampler.stats, ST, args.gamma)
     if cfg.stat_aug_prob > 0:   # 2026-10-08: the start stats of every episode into episodes.jsonl
@@ -5880,6 +6247,8 @@ def main(argv=None, child=None, actor=None):
     if child is None and getattr(sampler, 'stats', None) is not None and 'ep_archive' in ST:
         book.origin = sampler.stats[:, ST['ep_archive']]   # (2026-11-12: episodes.jsonl 'start', fresh / archive)
     version = update                                # the actor's weights: updates done
+    if getattr(sampler, 'control', None) is not None:   # (the workers' records: the weights version from the start)
+        sampler.control[CTRL_VERSION] = version
     version0 = version   # (B54: the policy-lag check at each hand-off counts from here)
     native_cons = False   # B58a+b: the driver's native consumer (Episodes.arrive's arithmetic and store in C++)
     if cpp_driver is not None:
@@ -5950,7 +6319,7 @@ def main(argv=None, child=None, actor=None):
         version += 1
         if block_actor is not None:
             block_actor.version = version
-        sampler.control[3] = version   # 2026-10-07: the actor's weights, for the workers' choice records
+        sampler.control[CTRL_VERSION] = version   # (the actor's weights, for the workers' records; [3] is the layout)
         if snaps and version % args.branch_snap_every == 0:   # Phase B2: the older snapshot takes these weights
             e = min(snaps, key=lambda e_: e_['id'])
             with torch.no_grad():
@@ -6091,6 +6460,13 @@ def main(argv=None, child=None, actor=None):
         n_handoffs = -(-(target_decisions - decisions_total) // args.rollout)
         sent_handoffs = 0
         rollout_actor = args.rollout // n_act
+        if tok_pin:   # (P-driver-design 15: the actor's main thread off the workers' CPUs; its own with ISAAC_ACTOR_CPUS)
+            os.sched_setaffinity(0, actor_cpus or driver_cpus)
+            got_pin = os.sched_getaffinity(0)   # (Codex round 22-1: read back, exactly the request, or the run stops)
+            bad_pin = readback_problem('the actor main thread (ISAAC_TOK_PIN)', actor_cpus or driver_cpus, got_pin)
+            if bad_pin:
+                raise SystemExit('CPU plan: ' + bad_pin)
+            print(f'P package: the actor main thread on CPUs {sorted(got_pin)} (ISAAC_TOK_PIN, read back)', flush=True)
         nsys_win = nv.profiler_window()
         while True:
             go_on = ((handed < target_decisions if n_act == 1 and not args.max_updates else sent_handoffs < n_handoffs)
@@ -6433,7 +6809,13 @@ def main(argv=None, child=None, actor=None):
                         _lane_tick(prof)
                     continue
                 nv.push('actor.book')
-                rows = sampler.rows[slots]
+                if row_ring is not None:   # (A-4)
+                    if len(inflight) > len(row_ring) - 2:
+                        raise RuntimeError('A-4: more calls in flight than the row ring holds')
+                    row_at[0] = (row_at[0] + 1) % len(row_ring)
+                    rows = take_prefix(sampler.rows, slots, row_ring[row_at[0]])
+                else:
+                    rows = sampler.rows[slots]
                 if priv_pending is not None:   # 2026-11-03 (tok_priv): one record per worker is outstanding at a time
                     priv_pending[idx] = sampler.priv[slots]
                 if block_actor is not None:
@@ -6611,10 +6993,17 @@ def main(argv=None, child=None, actor=None):
             if native_lin:   # B58c: the rollout's native sidecar as PagedSnapshots (what payload / plan read)
                 roll.block.materialize()
             job = dict(roll=roll, finished=book.finished, collect_s=collect_s, prof=prof, wait_learner_s=wait_s,
+                       # (A-6, Codex round 16: the two arenas' high-water marks; decisions dropped at a worker's cap)
+                       arena_peak_mb=[r_.frames.peak / 2 ** 20 for r_ in (roll, spare) if r_.frames is not None],
+                       store_dropped=int(getattr(roll, 'dropped', 0)) + int(getattr(spare, 'dropped', 0)),
+                       rewind_lost=int(book.rewind_lost),   # (Codex round 20: cumulative)
                        **lab_job,
                        teach=sampler.teacher_records(with_block=block_on) if args.teacher else None, t_start=t_run,
                        choices=sampler.choice_records() if branching else None,
                        v2=sampler.v2_records(with_h=mem_on, with_t=t_on,with_block=block_on) if v2_on else None,
+                       ring_skips=dict(sampler.ring_skips,   # (Codex round 25: after both reads above; totals)
+                                       open_busy=float(sampler.stats[:, ST['ring_open_busy']].sum())),
+                       worker_torch=int(sampler.stats[:, ST['torch_held']].sum()),   # (workers holding torch now)
                        branch_finished=book.branch_finished, broken=book.broken, broken_total=book.broken_total,
                        cycle_s=now - t_cycle, worker={c: float(dw[ST[c]]) for c in wcols if c in ST},
                        cpu_collect=cpu_share(cpu_c0, cpu_ticks()), cycle_wait_s=sync_wait,
@@ -6745,23 +7134,7 @@ def main(argv=None, child=None, actor=None):
         if actor is not None:   # (B38 step 5, a second actor: the first one stops the learner)
             pass
         elif proc:   # B38 step 2: the learner process finishes its update, saves last.pt and says 'done'
-            t_lim = time.perf_counter() + 900
-            while time.perf_counter() < t_lim:
-                try:
-                    kind, info = results.get(timeout=1.0)
-                except queue.Empty:
-                    if not learner.is_alive():
-                        break
-                    continue
-                if kind == 'error':
-                    failure.append(RuntimeError('learner process:\n' + info))
-                elif kind == 'done':
-                    L.update(update=info['update'], decisions=info['decisions'], seconds=info['seconds'])
-                    break
-            learner.join(timeout=60)
-            if learner.is_alive():
-                print('the learner process did not end; terminated', flush=True)
-                learner.terminate()
+            end_learner_process(learner, results, failure, L)
             if stop_b is not None:   # (B38 step 5: the learner is done; the second actor ends)
                 stop_b.set()
             torch.cuda.synchronize()
@@ -6807,7 +7180,8 @@ def main(argv=None, child=None, actor=None):
             if actor_b.exitcode not in (0, None) and not failure:   # (2026-11-18: its end checked, not only its join)
                 failure.append(RuntimeError(f'the actor process 1 ended with exit code {actor_b.exitcode}'))
         if actor is None:
-            print('finished', L['update'], 'updates', round(L['decisions'] * hours_per_decision, 1), 'game hours',
+            print('finished' if not failure else 'FAILED', L['update'], 'updates',
+                  round(L['decisions'] * hours_per_decision, 1), 'game hours',
                   round((time.perf_counter() - t_run) / 3600, 2), 'h')
         if prev_int is not None:   # (BM1: the SIGINT held during the shutdown, raised now)
             signal_.signal(signal_.SIGINT, prev_int)
