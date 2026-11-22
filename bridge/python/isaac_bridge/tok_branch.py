@@ -136,7 +136,7 @@ PRICE_LUA = ("local s = '' for _, e in ipairs(Isaac.GetRoomEntities()) do if e.T
 
 def crn_key(pid, pair):
     """The policy-noise key of a point's branch pair (never 0)."""
-    from .tok_policy import _mix64
+    from .tok_obs import mix64 as _mix64   # (the same function as tok_policy._mix64; no torch in the worker)
     z = int(_mix64(np.array([(int(pid) * 64 + int(pair)) & 0x7FFFFFFFFFFFFFFF], np.uint64))[0])
     return (z & 0x7FFFFFFFFFFFFFFF) or 1
 

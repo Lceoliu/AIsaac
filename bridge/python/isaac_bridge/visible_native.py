@@ -51,11 +51,19 @@ def build(source=SOURCE):
     return str(path)
 
 
+def _si(*names):
+    """structured_input's names this module uses -- VERSION, FRAME_BYTES, SCHEMA (schema_v2's) and observation_frame
+    (visible_producer's) -- taken from those torch-free modules (the same objects; structured_input only re-exports
+    them, and imports torch: never in a sampler worker)."""
+    from . import schema_v2, visible_producer
+    return tuple(getattr(schema_v2, n) if hasattr(schema_v2, n) else getattr(visible_producer, n) for n in names)
+
+
 class Library:
     def __init__(self, path):
         lib = ctypes.CDLL(path)
         lib.abp_visible_version.restype = ctypes.c_int
-        from .structured_input import VERSION
+        VERSION, = _si('VERSION')
         if lib.abp_visible_version() != VERSION:
             raise OSError('abp_visible schema version mismatch')
         fn = lib.abp_visible_encode
@@ -101,7 +109,7 @@ class Encoder:
     its terrain dict and grid list when the block's content changes)."""
 
     def __init__(self, lib):
-        from .structured_input import FRAME_BYTES
+        FRAME_BYTES, = _si('FRAME_BYTES')
         self.lib = lib
         self.out = np.zeros(FRAME_BYTES // 4, np.float32)
         self.key = None
@@ -123,7 +131,7 @@ class Encoder:
             self.key = key
 
     def frame(self, o):
-        from .structured_input import observation_frame, SCHEMA
+        observation_frame, SCHEMA = _si('observation_frame', 'SCHEMA')
         ext = o.visible
         if ext is None or ext['schema'] != SCHEMA or len(ext['bodies']) != len(o.players) or o.terrain is None or \
                 o.terrain['width'] > 28 or o.terrain['height'] > 16:
@@ -166,6 +174,6 @@ def frame(o):
         _DEFAULT.append(lib.encoder() if lib is not None else None)
     enc = _DEFAULT[0]
     if enc is None:
-        from .structured_input import observation_frame
+        observation_frame, = _si('observation_frame')
         return observation_frame(o)
     return enc.frame(o)

@@ -86,10 +86,15 @@ from .abplus_goexplore import GxConfig, Instance
 from .abplus_lean import LeanDecoder, read_lean, read_lean_raw
 from .env import BridgeError
 from .tok_obs import ROW, V3_FRAMES, EpisodeState, FastRow, encode_row, fast_counts, fast_row_final, fast_row_function
+from .tok_obs import ring_take
 from . import tok_obs as TO_
 from .visible_producer import V3_FATAL_EXIT, VisibleV3Fatal
 from .visible_producer import fatal_active as VP_fatal_active
 
+# (Codex round 29: a general rule) ANY change to STATS (a column added, removed or moved), to ROW's fields or to the
+# rings' layout bumps SHARED_ABI below -- the shared memory's handshake (attach) refuses a worker and a trainer of
+# different layouts before any view is made; tests/test_worker_lean.py binds SHARED_ABI to the columns (a change without
+# the bump fails there).
 STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins', 'deaths', 'timeouts', 'empty',
          'step_s', 'wait_s', 'fork_s', 'encode_s', 'finished', 'extra_episodes', 'teach', 'teach_s', 'searches',
          'avoidable', 'hurts', 'snaps', 'archive', 'archive_starts',   # these three: tok_floor
@@ -188,6 +193,12 @@ STATS = ('decisions', 'frames', 'episodes', 'forks', 'states', 'errors', 'wins',
          'fr_fast', 'fr_slow', 'fr_slow_block', 'fr_slow_room', 'fr_slow_vis', 'fr_slow_rewind', 'fr_slow_other',
          # (round 24 C) a check-mode worker's (the canary's) records compared and mismatches
          'fr_check_records', 'fr_check_mismatch',
+         # (Codex round 25, A1's review) ring_open found its slot already open (generation negative): another writer of
+         # the same worker's ring (the single-writer rule broken), or the previous attempt at this record failed midway
+         'ring_open_busy',
+         # (the memory ledger) 1 while this worker process holds torch (it should not: tok_obs.WORKER_LEAN's note; the
+         # workers' loop check sets it, progress worker_torch is the count)
+         'torch_held',
          # (A28's np_runs / np_removed stay the last columns: tests/test_eval_ablate_smoke.py)
          # A28 (2026-10-14, eval_tok --no-pedestals 1; zero unless cfg.no_pedestals): records whose pedestal removal
          # ran (tok_pickup.NO_PEDESTAL_LUA), collectible pedestals removed by it
@@ -319,6 +330,11 @@ class TokSamplerConfig:
     # its own (TokSampler.priv, named priv_block for the workers); never in ROW
     priv: bool = False
     priv_block: str = ''
+    # (Codex round 25) the teacher and V2 rings' slot generations (TokSampler.ring_gen, named for the workers), and
+    # the trainer's ISAAC_RL_RING_COMPACT (the workers refuse another; -1: not set, nothing checked)
+    ring_gen_block: str = ''
+    ring_compact: int = -1
+    worker_lean: int = -1   # (the memory ledger) the trainer's ISAAC_RL_WORKER_LEAN (-1: not set, nothing checked)
     mode: str = 'room'                          # 'room': one room per episode; 'floor' / 'run': tok_floor.py
     items: bool = False                           # 2026-10-06: the bridge's lean_items, ROW's item fields, 5 actions
     run_seconds: float = 1800.0                   # run: an episode's time limit (game seconds)
@@ -415,20 +431,176 @@ class TokSamplerConfig:
     no_active: bool = False
 
 
+SHARED_ABI = 3   # (Codex round 29) 1: 25c630c's layout; 2: + ring_open_busy (exp/ring-compact); 3: + torch_held,
+#                  and the control block of CONTROL_N slots with the actor's weights version in its own (CTRL_VERSION)
+CONTROL_N = 8      # control: [0] stop, [1] the trainer is updating, [2] the release's monotonic ns, [3] shared_abi()
+#                    (immutable), [4] the actor's weights version (the trainer's take of new weights), [5:] spare
+CTRL_VERSION = 4   # (the coordinator, 2026-11-20) before, the trainer wrote the version into [3], the layout slot
+
+
+def actor_version(control):
+    """The actor's weights version the trainer last published (control[CTRL_VERSION]): what a worker records with its
+    branch comps, lab results and CF / V2 points ('version')."""
+    return int(control[CTRL_VERSION])
+
+
+def shared_abi():
+    """(Codex round 29) The shared memory's layout as one number (control[3], written by the trainer, checked by
+    every worker before it makes a view): SHARED_ABI, the visible schema, ROW's size and fields, the stats columns in
+    their order, the rings' lengths -- a 63-bit hash, never the value of the trees before it ((visible schema << 32) |
+    ROW size)."""
+    import hashlib
+    from .schema_v2 import VERSION   # (structured_input re-exports it, importing torch: not in a worker)
+    from .tok_teacher2 import V2_RING
+    key = (f'abi {SHARED_ABI}; visible {VERSION}; row {ROW.itemsize} {ROW.descr}; stats {len(STATS)} '
+           f'{",".join(STATS)}; rings {TEACH_RING} {V2_RING}; control {CONTROL_N}')
+    return int.from_bytes(hashlib.blake2b(key.encode(), digest_size=8).digest(), 'little') & ((1 << 63) - 1)
+
+
 def attach(names, workers, initialize=False):
     """(blocks, rows [2 x workers], actions, stats, control) from the shared-memory names. Two rows per worker: it
-    writes its next record while the server may still read the one before."""
+    writes its next record while the server may still read the one before. (Codex round 29) The layout handshake
+    first: the trainer (initialize) writes shared_abi() to control[3], a worker refuses another value before it makes
+    any other view (a block of another layout never mapped with this tree's strides)."""
     blocks = [shared_memory.SharedMemory(name=n) for n in names]
+    head = np.ndarray((4,), np.int64, buffer=blocks[3].buf)   # (every tree's control block has these 4 slots)
+    abi = shared_abi()
+    if initialize:
+        head[3] = abi
+    elif int(head[3]) != abi:
+        have = int(head[3])
+        del head
+        for b in blocks:
+            b.close()
+        from .schema_v2 import VERSION
+        raise ValueError(f'sampler shared memory: layout {have:#x}, this tree {abi:#x} (SHARED_ABI {SHARED_ABI}: '
+                         f'{len(STATS)} stats columns, ROW {ROW.itemsize} bytes, visible schema {VERSION}) -- a '
+                         f'worker and a trainer of different trees')
+    del head
+    control = np.ndarray((CONTROL_N,), np.int64, buffer=blocks[3].buf)   # (CONTROL_N's note)
     rows = np.ndarray((2 * workers,), ROW, buffer=blocks[0].buf)
     actions = np.ndarray((workers, ACTION_F), np.int32, buffer=blocks[1].buf)
     stats = np.ndarray((workers, len(STATS)), np.float64, buffer=blocks[2].buf)
-    control = np.ndarray((4,), np.int64, buffer=blocks[3].buf)   # [0] stop, [1] the trainer is updating
-    from .structured_input import VERSION
-    schema=(VERSION<<32)|ROW.itemsize
-    if initialize:control[3]=schema
-    elif int(control[3])!=schema:
-        raise ValueError('sampler shared-memory visible schema/ROW size mismatch')
     return blocks, rows, actions, stats, control
+
+
+RING_SKIPS = ('teach_lapped', 'teach_torn', 'teach_bad', 'v2_lapped', 'v2_torn', 'v2_bad')
+RING_PROTOCOL = 2   # (Codex round 26) the rings' slot generations; every worker confirms it (ring_confirm) at its start
+#                     (2, Codex round 29: the torch bits and SHARED_ABI 3's stats)
+
+
+def ring_gen_size(workers):
+    """The generations block's bytes: per worker the teacher ring's and the V2 ring's slots, and its confirmation."""
+    from .tok_teacher2 import V2_RING
+    return 8 * workers * (TEACH_RING + V2_RING + 1)
+
+
+def attach_ring_gen(name, workers):
+    """(Codex round 25) (block, teacher generations [workers, TEACH_RING], V2 generations [workers, V2_RING],
+    confirmations [workers]), int64: a slot's generation is c + 1 once record c is in it whole (ring_publish),
+    -(c + 1) while a writer is writing it (ring_open), 0 before its first record. The readers take a record only when
+    its generation is c + 1 before and after every part of it (ROW, meta, GRU state, temporal outputs) is copied.
+    (Codex round 26) A worker's confirmation: 0 until it wrote ring_ack_value (ring_confirm)."""
+    from .tok_teacher2 import V2_RING
+    block = shared_memory.SharedMemory(name=name)
+    gen = np.ndarray((workers, TEACH_RING + V2_RING + 1), np.int64, buffer=block.buf)
+    return block, gen[:, :TEACH_RING], gen[:, TEACH_RING:TEACH_RING + V2_RING], gen[:, -1]
+
+
+ACK_LEAN, ACK_TORCH = 0x20, 0x40   # (ISAAC_RL_WORKER_LEAN) the worker's switch; torch loaded in the worker
+
+
+def ring_ack_value(compact, lean=False, torch_loaded=False):
+    """(Codex round 26) What a worker confirms: the ring protocol it writes, its ISAAC_RL_RING_COMPACT, and (the
+    memory ledger) its ISAAC_RL_WORKER_LEAN and whether it holds torch."""
+    return ((RING_PROTOCOL << 8) | 0x10 | int(bool(compact)) | (ACK_LEAN if lean else 0)
+            | (ACK_TORCH if torch_loaded else 0))
+
+
+def ring_ack_text(value):
+    value = int(value)
+    if value == 0:
+        return 'no confirmation'
+    return (f'ring protocol {value >> 8}, ISAAC_RL_RING_COMPACT {value & 1}, ISAAC_RL_WORKER_LEAN '
+            f'{int(bool(value & ACK_LEAN))}, torch {"loaded" if value & ACK_TORCH else "not loaded"}')
+
+
+def ring_ack_ok(value, want):
+    """A worker's confirmation against the trainer's (ring_ack_value of its own switches, no torch): the protocol and
+    both switches the same; with ISAAC_RL_WORKER_LEAN, torch not loaded (without it, whatever the worker holds)."""
+    value, want = int(value), int(want)
+    if (value & ~ACK_TORCH) != (want & ~ACK_TORCH):
+        return False
+    return not (want & ACK_LEAN and value & ACK_TORCH)
+
+
+def ring_confirm(ack, index):
+    """(Codex round 26) A worker's first act on the rings: its protocol and switches into its confirmation (the
+    trainer waits for every worker's, TokSampler.confirm_rings, before it samples; a worker of an older tree writes
+    none and is refused there, never run with records it does not stamp). (The memory ledger) also whether this
+    worker process holds torch now: it has imported its modules and attached its blocks."""
+    from . import tok_obs
+    ack[index] = ring_ack_value(tok_obs.RING_COMPACT, tok_obs.WORKER_LEAN, 'torch' in sys.modules)
+
+
+def ring_open(gen, i, slot, c):
+    """A writer starts record c in ring slot [i, slot]: unpublished until ring_publish (a reader of the slot's earlier
+    record sees its generation changed). x86-64 keeps stores in order and loads in order (TSO), so these plain stores
+    and the reader's plain loads are enough; gen None: a ring without generations (nothing done).
+    The precondition (A1's review): ONE writer per worker per ring at a time. Two writers holding the same c would
+    publish c + 1 over each other's unfinished bytes and a reader would take the mix: the teacher ring is written by
+    the worker's search thread only (a forked search: one child at a time, the parent waits for it; it encodes after),
+    the V2 ring by ring_write under the lane lock. Returns 1 when the slot was already open (its generation negative:
+    another writer, or the previous attempt at this record failed midway and the worker went on), else 0 -- the
+    worker's stats ring_open_busy, progress ring_open_busy."""
+    if gen is None:
+        return 0
+    busy = int(gen[i, slot] < 0)
+    gen[i, slot] = -(c + 1)
+    return busy
+
+
+def ring_publish(gen, i, slot, c):
+    """Record c is in ring slot [i, slot] whole: published (before the worker's count says so)."""
+    if gen is not None:
+        gen[i, slot] = c + 1
+
+
+def check_ring_mode(cfg):
+    """(Codex round 25) A worker whose ISAAC_RL_RING_COMPACT is not the trainer's is refused (mixed modes stay
+    compatible on stable slots but save nothing)."""
+    from . import tok_obs
+    want = int(getattr(cfg, 'ring_compact', -1))
+    if want >= 0 and want != int(tok_obs.RING_COMPACT):
+        raise RuntimeError(f'ISAAC_RL_RING_COMPACT: this worker {int(tok_obs.RING_COMPACT)}, the trainer {want} '
+                           f'(set it the same for every process)')
+    want = int(getattr(cfg, 'worker_lean', -1))
+    if want >= 0 and want != int(tok_obs.WORKER_LEAN):
+        raise RuntimeError(f'ISAAC_RL_WORKER_LEAN: this worker {int(tok_obs.WORKER_LEAN)}, the trainer {want} '
+                           f'(set it the same for every process)')
+
+
+def tracemalloc_spec(spec):
+    """(the memory ledger's diagnostic) ISAAC_WORKER_TRACEMALLOC=<dir>[:<seconds>[:<worker>]] parsed and checked:
+    (dir, seconds > 0, worker >= 0), or None when unset; ValueError otherwise (the trainer checks it at its start).
+    The numeric fields are taken from the right (a Windows drive letter's colon stays in dir)."""
+    if not spec:
+        return None
+    parts = spec.split(':')
+    nums = []
+    import math
+    import re
+    while len(parts) > 1 and len(nums) < 2 and re.fullmatch(r'[-+]?[0-9.eE+-]*[0-9][0-9.eE+-]*', parts[-1]):
+        nums.insert(0, parts.pop())
+    out_dir = ':'.join(parts)
+    try:
+        every = float(nums[0]) if nums else 600.0
+    except ValueError:
+        every = -1.0
+    worker = nums[1] if len(nums) > 1 else '0'
+    if not out_dir or not (every > 0 and math.isfinite(every)) or not worker.isdigit():
+        raise ValueError(f'ISAAC_WORKER_TRACEMALLOC={spec!r}: <dir>[:<seconds> > 0[:<worker> integer >= 0]]')
+    return out_dir, every, int(worker)
 
 
 def attach_teacher(names, workers):
@@ -1073,6 +1245,12 @@ def term_to_exit():
 def worker_main(index, cfg, names, conn, teacher_names=None):
     blocks, rows, actions, stats, control = attach(names, cfg.workers)
     teaching = cfg.teacher and teacher_names is not None and not cfg.eval_seeds
+    teach_gen = None
+    if cfg.ring_gen_block:   # (Codex round 26: confirmed first, then refused on a ring mode not the trainer's)
+        gen_block, teach_gen, _, ring_ack = attach_ring_gen(cfg.ring_gen_block, cfg.workers)
+        blocks = blocks + [gen_block]
+        ring_confirm(ring_ack, index)
+    check_ring_mode(cfg)
     if teaching:
         teach_blocks, teach_rows, teach_meta = attach_teacher(teacher_names, cfg.workers)
         blocks = blocks + teach_blocks
@@ -1106,12 +1284,15 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         for it, found in zip(items, founds):
             n_found += len(found)
             for k, at, under_way, lost, taken in found:
-                slot = int(mine[ST['teach']]) % TEACH_RING
+                c_ = int(mine[ST['teach']])
+                slot = c_ % TEACH_RING
+                mine[ST['ring_open_busy']] += ring_open(teach_gen, index, slot, c_)   # (Codex round 25: its generation)
                 trow = teach_rows[index, slot:slot + 1]
                 encode_row(at, EpisodeState(limit, items=cfg.items), trow, it[3] - 1 - k)
                 trow['episode'], trow['seed'], trow['group'], trow['first'] = it[5], it[4], group, 0
                 safe = [m for m in range(9) if lost[m] == 0]
                 teach_meta[index, slot] = teach_meta_row(under_way, lost, taken, k, safe)
+                ring_publish(teach_gen, index, slot, c_)
                 mine[ST['teach']] += 1
                 mine[ST['avoidable']] += bool(safe)
         mine[ST['teach_s']] += time.perf_counter() - t0
@@ -1227,6 +1408,7 @@ def worker_main(index, cfg, names, conn, teacher_names=None):
         episodes_left, episode_n, state_seed = 0, 0, None
         while not stopping():
             mine[ST['v3_native']], mine[ST['v3_reference']] = V3_FRAMES   # (seq-v1 step 3)
+            mine[ST['torch_held']] = TO_.check_worker_torch(index)   # (warned once, counted; never the run's end)
             mine[ST['fr_fast']:ST['fr_check_mismatch'] + 1] = fast_counts()
             if builder.stalled():   # the next start state's build hangs (training went on with the old one)
                 recover('stall')
@@ -1415,7 +1597,7 @@ class TokSampler:
             cfg.fatal_dir = fatal_run_dir()
         self.cfg = cfg
         n = cfg.workers
-        sizes = (ROW.itemsize * 2 * n, 4 * ACTION_F * n, 8 * len(STATS) * n, 8 * 4)
+        sizes = (ROW.itemsize * 2 * n, 4 * ACTION_F * n, 8 * len(STATS) * n, 8 * CONTROL_N)
         self.blocks = [shared_memory.SharedMemory(create=True, size=s) for s in sizes]
         names = [b.name for b in self.blocks]
         self.attached, self.rows, self.actions, self.stats, self.control = attach(names, n, initialize=True)
@@ -1427,6 +1609,18 @@ class TokSampler:
             cfg.priv_block = pb.name
             self.priv = np.ndarray((2 * n,), PRIV, buffer=pb.buf)
             self.priv['missing'] = 1
+        # (Codex round 25) the rings' slot generations (both rings, every run: 8 bytes a slot), the switch the workers
+        # must match, the records the readers did not take (progress ring_*)
+        from .tok_obs import RING_COMPACT
+        gb = shared_memory.SharedMemory(create=True, size=ring_gen_size(n))
+        self.blocks.append(gb)
+        cfg.ring_gen_block, cfg.ring_compact = gb.name, int(RING_COMPACT)
+        cfg.worker_lean = int(TO_.WORKER_LEAN)
+        attached_g, self.teach_gen, self.v2_gen, self.ring_ack = attach_ring_gen(gb.name, n)
+        self.teach_gen[:], self.v2_gen[:], self.ring_ack[:] = 0, 0, 0
+        self.attached.append(attached_g)
+        self.ring_skips = dict.fromkeys(RING_SKIPS, 0)
+        tracemalloc_spec(os.environ.get('ISAAC_WORKER_TRACEMALLOC', ''))   # (refused here, before any worker starts)
         teacher_names = None
         self.teach_rows = self.teach_meta = None
         if cfg.teacher and not cfg.eval_seeds:
@@ -1519,7 +1713,8 @@ class TokSampler:
                 self.block_arrays[2][:]=-1
                 self.attached += attached
         self.stats[:] = 0
-        self.control[:3] = 0  # slot 3 is the immutable schema/record-size handshake
+        self.control[:3] = 0  # slot 3 is the immutable layout handshake (shared_abi)
+        self.control[4:] = 0  # (CTRL_VERSION: the trainer publishes the actor's weights version there)
         if max(getattr(cfg, 'pickup_force', (0.0, 0.0)) or (0.0, 0.0)) > 0:   # 2026-10-13 (B23): the run's first p
             self.stats[:, ST['pf_p']] = float(cfg.pickup_force[0])        # (the trainer rewrites it after each update)
         # 2026-10-06: one decoded-PNG cache for all the instances of this sampler (abp_turbo ABP_PNG_CACHE_FILE) instead
@@ -1571,6 +1766,43 @@ class TokSampler:
             self._lanes[c.fileno()] = i
             self._poller.register(c.fileno(), select.POLLIN)
             self._lane_poller.register(c.fileno(), select.POLLIN)
+        self.confirm_rings()   # (before any sampling; every configuration -- Codex round 29)
+
+    def confirm_rings(self, timeout=None):
+        """(Codex round 26) Every worker's ring confirmation (ring_confirm) before the trainer samples: its protocol
+        RING_PROTOCOL and its ISAAC_RL_RING_COMPACT the trainer's. A worker that confirms another (an older tree, a
+        mixed switch), ends before confirming, or confirms nothing within the timeout (ISAAC_RL_RING_CONFIRM_S,
+        default 600 s; a worker confirms when it attaches its blocks, before its games start) ends the run: the workers
+        stopped, the blocks released, VisibleV3Fatal with the reason (train / eval exit non-zero; not retried)."""
+        from .tok_obs import RING_COMPACT
+        want = ring_ack_value(RING_COMPACT, TO_.WORKER_LEAN)
+        limit = float(timeout if timeout is not None else os.environ.get('ISAAC_RL_RING_CONFIRM_S', '600'))
+        t0 = time.monotonic()
+        while True:
+            acks = [int(a) for a in self.ring_ack]
+            wrong = [(i, a) for i, a in enumerate(acks) if a and not ring_ack_ok(a, want)]
+            missing = [i for i, a in enumerate(acks) if not a]
+            reason = None
+            if wrong:
+                reason = '; '.join(f'worker {i}: {ring_ack_text(a)}' for i, a in wrong)
+            elif missing and any(self.procs[i].exitcode is not None for i in missing):
+                reason = 'worker(s) ' + ', '.join(f'{i} (exit {self.procs[i].exitcode})' for i in missing
+                                                  if self.procs[i].exitcode is not None) + ' ended before confirming'
+            elif missing and time.monotonic() - t0 > limit:
+                reason = (f'worker(s) {missing} confirmed nothing within {limit:.0f} s (a worker of a tree without '
+                          f'the ring protocol writes records it does not stamp)')
+            if reason is not None:
+                self.fatal = (f'ring protocol check: the trainer needs {ring_ack_text(want)} from every worker; '
+                              f'{reason} -- the run stops (no worker is dropped, nothing is retried)')
+                self.close(timeout=5.0)   # (raises VisibleV3Fatal(self.fatal) once everything is closed)
+                raise VisibleV3Fatal(self.fatal)
+            if not missing:   # (the launch check reads this line: every worker's confirmation, how long it took)
+                held = sum(1 for a in acks if a & ACK_TORCH)
+                print(f'tok sampler: ring protocol confirmed by all {len(acks)} workers ({ring_ack_text(want)}) in '
+                      f'{time.monotonic() - t0:.1f} s; workers holding torch: {held}/{len(acks)}', file=sys.stderr,
+                      flush=True)
+                return
+            time.sleep(0.02)
 
     def _lane_message(self, fd):
         """A lane's request (one 5-byte message) into lane_ready; a closed lane leaves the poll sets."""
@@ -1636,17 +1868,33 @@ class TokSampler:
         rows, meta, hs, ts, contexts = [], [], [], [], []
         dim = int(self.cfg.memory_dim)
         tw = self.v2_t.shape[2] if self.v2_t is not None else 0
+        # (Codex round 25) every record checked against its slot's generation before and after it is copied: without
+        # block-memory the rings' own (ring_gen), with it the lanes' (v2_t[..., -1], the same protocol, as before)
+        gen = None if with_block else self.v2_gen
+        sk = getattr(self, 'ring_skips', None) or dict.fromkeys(RING_SKIPS, 0)
         for i in range(self.cfg.workers):
             count = int(self.stats[i, ST['v2_records']])
-            first = max(int(self.v2_seen[i]), count - V2_RING)
+            seen = int(self.v2_seen[i])
+            first = max(seen, count - V2_RING)
+            sk['v2_lapped'] += first - seen   # (written over before this read: the reader fell a ring behind)
             for c in range(first, count):
-                if with_block and self.v2_t[i,c%V2_RING,-1]!=c+1:
+                slot = c % V2_RING
+                if (self.v2_t[i,slot,-1] if with_block else gen[i, slot]) != c + 1:   # (written over, or unpublished)
+                    sk['v2_torn'] += 1
                     continue
-                row=self.v2_rows[i,c%V2_RING].copy()
-                record_meta=self.v2_meta[i,c%V2_RING].copy()
-                record_t=self.v2_t[i,c%V2_RING].copy() if (with_block or with_t) and self.v2_t is not None else None
-                record_h=self.v2_h[i,c%V2_RING].copy() if with_h and self.v2_h is not None else None
-                if with_block and (record_t[-1]!=c+1 or self.v2_t[i,c%V2_RING,-1]!=c+1):
+                try:
+                    row, bad = ring_take(self.v2_rows, i, slot), False   # (ISAAC_RL_RING_COMPACT: to its frame end)
+                except ValueError:   # (a length outside the frame: torn, or the writer's record bad)
+                    row, bad = None, True
+                record_meta=self.v2_meta[i,slot].copy()
+                record_t=self.v2_t[i,slot].copy() if (with_block or with_t) and self.v2_t is not None else None
+                record_h=self.v2_h[i,slot].copy() if with_h and self.v2_h is not None else None
+                torn = (record_t[-1] != c + 1 or self.v2_t[i,slot,-1] != c + 1) if with_block else gen[i, slot] != c + 1
+                if torn:   # (written over while copied: its length, ROW, meta, h, t not one record's)
+                    sk['v2_torn'] += 1
+                    continue
+                if bad:
+                    sk['v2_bad'] += 1
                     continue
                 rows.append(row)
                 meta.append(record_meta)
@@ -1828,15 +2076,30 @@ class TokSampler:
         if self.teach_rows is None:
             return None
         rows, meta, contexts = [], [], []
+        # (Codex round 25) every record checked against its slot's generation before and after it is copied: without
+        # block-memory the rings' own (ring_gen), with it the injury ring's (block_arrays[5], the same protocol, as before)
+        gen = self.block_arrays[5] if with_block else self.teach_gen
+        sk = getattr(self, 'ring_skips', None) or dict.fromkeys(RING_SKIPS, 0)
         for i in range(self.cfg.workers):
             count = int(self.stats[i, ST['teach']])
-            first = max(int(self.teach_seen[i]), count - TEACH_RING)
+            seen = int(self.teach_seen[i])
+            first = max(seen, count - TEACH_RING)
+            sk['teach_lapped'] += first - seen   # (written over before this read: the reader fell a ring behind)
             for c in range(first, count):
-                if with_block and self.block_arrays[5][i,c%TEACH_RING]!=c+1:
+                slot = c % TEACH_RING
+                if gen[i, slot] != c + 1:   # (being written over now, or not yet published)
+                    sk['teach_torn'] += 1
                     continue
-                row=self.teach_rows[i,c%TEACH_RING].copy()
-                record_meta=self.teach_meta[i,c%TEACH_RING].copy()
-                if with_block and self.block_arrays[5][i,c%TEACH_RING]!=c+1:
+                try:
+                    row, bad = ring_take(self.teach_rows, i, slot), False   # (ISAAC_RL_RING_COMPACT)
+                except ValueError:   # (a length outside the frame: torn, or the writer's record bad)
+                    row, bad = None, True
+                record_meta=self.teach_meta[i,slot].copy()
+                if gen[i, slot] != c + 1:   # (written over while copied: length, ROW and meta not one record's)
+                    sk['teach_torn'] += 1
+                    continue
+                if bad:
+                    sk['teach_bad'] += 1
                     continue
                 rows.append(row)
                 meta.append(record_meta)
@@ -1904,6 +2167,7 @@ class TokSampler:
         self.lane_rows = self.lane_io = self.lane_out = self.main_value = self.v2_rows = self.v2_meta = None
         self.main_h = self.lane_h = self.v2_h = None
         self.main_vg = self.cf_snap = self.lane_t = self.v2_t = None
+        self.teach_gen = self.v2_gen = self.ring_ack = None   # (the generations block's views, before it closes)
         for b in self.attached:
             b.close()
         for b in self.blocks:
