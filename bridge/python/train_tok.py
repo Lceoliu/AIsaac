@@ -4051,7 +4051,12 @@ def main(argv=None, child=None, actor=None):
                 stage_schema_check(rl.rows, all_flat)   # (every record v3, or every one without a frame)
                 need_ = len(all_flat) * stage_cols(rl.rows, all_flat)
                 if L.get('stage_rc') is None or L['stage_rc'].numel() < need_:
+                    # (lane s, 2026-11-22: a larger stage when the rollout's longest frame grows; the old block went
+                    #  back to torch's caching host allocator and stayed pinned -- the learner's RSS stepped from
+                    #  +1.9 to +6 GB. Its cached free blocks released before the new one: only one stage pinned)
                     L['stage_rc'] = None
+                    if hasattr(torch._C, '_host_emptyCache'):
+                        torch._C._host_emptyCache()
                     L['stage_rc'] = torch.empty(int(need_ * 1.25) + 64 * ROW_BYTES, dtype=torch.uint8).pin_memory()
                 every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
                                                       stage=L['stage_rc'], with_raw=True, frames=rl.frames)
@@ -4124,6 +4129,8 @@ def main(argv=None, child=None, actor=None):
             else:
                 value_now = None
             prox_all = torch.cat(lps)
+            if rstage:   # (lane s, 2026-11-22: the last chunk's batch is views of raw_e -- kept, it held the whole
+                b_p = None   #  records' bytes on the device through the PPO epochs, about 1.7 GB)
             pmark(None, m_r)
             sec('recompute')
             if s_plan is not None:   # (the host's records now: the rollout is the actor's again after `fresh`)
