@@ -126,6 +126,27 @@ def test_train_tok_frame_v3_refuses_item_tokens(monkeypatch, capsys, tmp_path):
     assert '--frame v3 takes no item tokens' not in capsys.readouterr().err
 
 
+def test_train_tok_frame_v3_refuses_learner_fast(monkeypatch, capsys, tmp_path):
+    """(2026-11-22, the coordinator: a known defect) --frame v3 with --learner-fast 1 / 2 is refused at argument
+    parsing: B18's raw minibatch merge cannot join v3-truncated records with the teacher ring's (torch.cat fails on the
+    widths inside the first update); --learner-fast 0 passes."""
+    import train_tok
+    from isaac_bridge import visible_producer
+    monkeypatch.setattr(visible_producer, 'VISIBLE_V3_MODE', 2)
+    monkeypatch.delenv('ISAAC_NO_VISIBLE', raising=False)
+    monkeypatch.setenv('ISAAC_RL_TRIGGER_ONCE', '0')
+    monkeypatch.delenv('ISAAC_RL_TRIGGER_ONCE')
+    base = ['--groups-file', str(tmp_path / 'missing.json'), '--frame', 'v3', '--temporal', '1', '--temporal-rooms', '0',
+            '--temporal-feedback', '0', '--global-token', '1']
+    for fast in ('1', '2'):
+        with pytest.raises(SystemExit):
+            train_tok.main(base + ['--out', str(tmp_path / f'f{fast}'), '--learner-fast', fast])
+        assert f'--frame v3 does not support --learner-fast {fast}' in capsys.readouterr().err
+    with pytest.raises(FileNotFoundError):   # (--learner-fast 0: the arguments pass, the missing groups file is next)
+        train_tok.main(base + ['--out', str(tmp_path / 'f0'), '--learner-fast', '0'])
+    assert 'does not support --learner-fast' not in capsys.readouterr().err
+
+
 def test_eval_tok_refuses_the_pair(monkeypatch, capsys, tmp_path):
     sys.path.insert(0, str(HERE.parent))
     import eval_tok

@@ -2821,6 +2821,15 @@ def main(argv=None, child=None, actor=None):
         if args.teach_merge and not args.teach_gpu:   # (Codex round 10: the CPU teacher merge joins an eager batch to
             # the learner's lazy v3 one -- cat_batch has no 'v3.raw' on one side)
             p.error('--frame v3 with --teach-merge 1 needs --teach-gpu 1 (the CPU teacher merge cannot join v3 batches)')
+        if args.learner_fast:   # (2026-11-22, the coordinator: a known defect, refused at once)
+            # B18's fast path predates the v3 frames: its raw minibatch merge joins the learner's record bytes, cut
+            # to the longest v3 frame of the set (rows_to_device, A-3 / seq-v1), to the teacher ring's whole ROW
+            # records -- torch.cat fails on the widths (part_prep, e.g. 49148 against 151880 bytes); and the v3
+            # forward reads none of its host plans (buckets / ekeep / xperm / distinct grids), its attention and
+            # layer norm parts only act in float32 outside --amp bf16 (P-driver-design.md / the learner notes)
+            p.error(f'--frame v3 does not support --learner-fast {args.learner_fast} (B18\'s raw minibatch merge '
+                    f'cannot join v3-truncated records with the teacher ring\'s; the fast path covers the old frame '
+                    f'encoder only): --learner-fast 0')
         if args.item_tokens or args.item_shared or item_slots != INV_CAP:
             p.error(f'--frame v3 takes no item tokens (the N / S tokens of the frame carry the items): --item-tokens 0 '
                     f'--item-shared 0 --item-slots {INV_CAP} (got {args.item_tokens} / {args.item_shared} / {item_slots})')
