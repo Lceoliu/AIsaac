@@ -83,6 +83,45 @@ def test_compact_rollout_gives_the_learner_the_same_records():
                     assert torch.equal(x, y)
 
 
+def test_recompute_stage_chunks_equal_take():
+    """(2026-11-22, train_tok --recompute-stage 1) the recompute pass's records staged once (rows_to_device into a stage
+    of stage_cols' bytes per record, with_raw) and each chunk decoded from a slice of the bytes with the host's entity
+    counts give take(every, part)'s batch: every field, the lazy v3 tensors materialized and the model's outputs equal,
+    for compact and ROW v3 rollouts."""
+    for compact in (True, False):
+        roll = _fill(compact, steps=6)
+        cap = roll.cap
+        flat = np.concatenate([w * cap + np.arange(int(roll.length[w])) for w in range(roll.n)]).astype(np.int64)
+        pend = roll.pending.reshape(-1, 5)[flat]
+        cols = TP.stage_cols(roll.rows, flat)
+        stage = torch.zeros(len(flat) * cols, dtype=torch.uint8)   # (1-D, exactly the bytes: the train_tok layout)
+        every, raw_e, pend_e = TP.rows_to_device(roll.rows, flat, pend, 'cpu', stage=stage, with_raw=True,
+                                                 frames=roll.frames)
+        assert raw_e.shape[1] == cols, (compact, raw_e.shape, cols)
+        every0 = TP.rows_to_device(roll.rows, flat, pend, 'cpu', frames=roll.frames)   # (as with the switch off)
+        ne = roll.rows.reshape(-1)['n_ent'][flat].astype(np.int64)
+        wid = every['ent'].shape[1]
+        m = VP.build()
+        for lo, hi in ((0, 7), (7, 19), (19, len(flat))):
+            part = torch.arange(lo, hi)
+            want = TP.take(every0, part)
+            got = TP.decode_rows(raw_e[lo:hi], pending=pend_e[lo:hi], entities=min(wid, TP.used_entities(ne[lo:hi])))
+            assert set(got) == set(want), (set(got) ^ set(want))
+            for k in want:
+                if k == 'v3.raw':
+                    continue
+                x, y = got[k], want[k]
+                assert (torch.equal(x, y) if torch.is_tensor(x) else x == y), (compact, k)
+            vg, vw = VI.materialize(VI.get_batch(got)), VI.materialize(VI.get_batch(want))
+            assert set(vg) == set(vw) and vg
+            for k in vw:
+                assert torch.equal(vg[k], vw[k]), (compact, k)
+            with torch.no_grad():
+                for x, y in zip(m(got, need_vg=True), m(want, need_vg=True)):
+                    if torch.is_tensor(x):
+                        assert torch.equal(x, y), compact
+
+
 def test_expand_rows_and_carry():
     rc, rr = _fill(True), _fill(False)
     m = int(rr.length.max())

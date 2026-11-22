@@ -230,8 +230,9 @@ def run_bench(ctx):
     # (2026-11-22, the learner's update time) a path may end in overrides of the run's arguments, '@name=value' each:
     #  micro (--micro), rchunk (--recompute-chunk) -- e.g. '1@micro=4096', '1@rchunk=8192@micro=4096'; every path
     #  starts from the run's own values
-    over0 = dict(micro=args.micro, recompute_chunk=getattr(args, 'recompute_chunk', 0))
-    over_names = dict(micro='micro', rchunk='recompute_chunk')
+    over0 = dict(micro=args.micro, recompute_chunk=getattr(args, 'recompute_chunk', 0),
+                 recompute_stage=getattr(args, 'recompute_stage', 0))
+    over_names = dict(micro='micro', rchunk='recompute_chunk', rstage='recompute_stage')   # (rstage: --recompute-stage)
 
     def set_path(fast):
         s_, *over_ = str(fast).split('@')
@@ -240,7 +241,7 @@ def run_bench(ctx):
         for o_ in over_:
             k_, _, v_ = o_.partition('=')
             if k_ not in over_names or not v_.isdigit():
-                raise SystemExit(f'bench: path {fast}: unknown override {o_!r} (micro=N, rchunk=N)')
+                raise SystemExit(f'bench: path {fast}: unknown override {o_!r} (micro=N, rchunk=N, rstage=0/1)')
             setattr(args, over_names[k_], int(v_))
         args.learner_fast = int(''.join(ch for ch in s_ if ch.isdigit()))
         L['p2_mode'] = next((m_ for ch, m_ in (('o', 'off'), ('s', 'serial'), ('p', 'two')) if ch in s_), None)

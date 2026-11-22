@@ -1969,7 +1969,7 @@ def main(argv=None, child=None, actor=None):
                                          drop_memory,
                                          ITEM_SHARED_KEY, share_item_table, item_count,
                                          pad_optimizer_state, plan_tokens, remap_optimizer_state, rows_to_device,
-                                         take, to_batch, used_entities, TemporalState, temporal_chunks,
+                                         take, to_batch, used_entities, stage_cols, TemporalState, temporal_chunks,
                                          temporal_inputs, temporal_out, temporal_part)
     p = argparse.ArgumentParser()
     p.add_argument('--groups-file', required=True)
@@ -2013,6 +2013,13 @@ def main(argv=None, child=None, actor=None):
                    help="(2026-11-22, the learner's update time) rows per forward pass of the recompute (the values / "
                         "log-probabilities of the stored decisions from the weights at the update's start, no gradient): "
                         "0 (default) --micro, or --minibatch without it, as before; larger: fewer passes, more memory")
+    p.add_argument('--recompute-stage', type=int, default=0, choices=(0, 1),
+                   help="(2026-11-22, the coordinator: --learner-fast 2's recompute staging on its own) 1: the "
+                        "recompute pass's records gathered once into a pinned buffer (sized to the bytes they need) and "
+                        "copied asynchronously; each chunk decoded from a slice of those bytes with its entity tokens "
+                        "from the host's counts (no gather of every field, no read of the device for the count). The "
+                        "same inputs, values and log-probabilities bit for bit; nothing else of --learner-fast (no host "
+                        "plans, no distinct grids, no fused Adam). 0 (default): as before")
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--lr-final', type=float, default=1e-4)
     p.add_argument('--lr-schedule', choices=('linear', 'cosine'), default='linear',
@@ -2808,6 +2815,8 @@ def main(argv=None, child=None, actor=None):
         tok_kw.update(temporal=True, temporal_width=args.temporal_width, temporal_layers=args.temporal_layers,
                       temporal_heads=args.temporal_heads, temporal_window=args.temporal_window,
                       temporal_rooms=args.temporal_rooms, temporal_feedback=args.temporal_feedback)
+    if args.recompute_stage and args.learner_fast >= 2:
+        p.error('--recompute-stage 1 with --learner-fast 2: fast 2 stages the recompute pass already (one of them)')
     from isaac_bridge.visible_producer import VISIBLE_V3_MODE
     if args.frame == 'v3':   # (seq-v1 step 3)
         if not VISIBLE_V3_MODE:
@@ -3941,6 +3950,7 @@ def main(argv=None, child=None, actor=None):
         # abplus_bench_learner.py --check, abplus_check_learner_fp64.py.
         fast = bool(args.learner_fast)
         fast2 = args.learner_fast >= 2   # (B38 step 4)
+        rstage = bool(args.recompute_stage) and not fast2   # (2026-11-22: fast 2's recompute staging alone)
         # (ISAAC_RL_LEARNER_PARTS: a subset of the parts, for the bench's attribution; default all)
         fparts = set(os.environ.get('ISAAC_RL_LEARNER_PARTS', 'math,ekeep,buckets,nhwc,ln,dedup,logp,raw').split(',')
                      if fast else ())
@@ -4034,6 +4044,19 @@ def main(argv=None, child=None, actor=None):
                 every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
                                                       stage=L['stage_r'], with_raw=True, frames=rl.frames)
                 fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on, t_fb)
+            elif rstage:   # (--recompute-stage 1: fast 2's staging alone, the stage sized to the records' bytes)
+                from isaac_bridge.structured_input import VERSION as V1_VERSION
+                if np.any(rl.rows.reshape(-1)['visible_schema'][all_flat] == V1_VERSION):   # (their decode takes the
+                    #   host's frame counts, which a chunk's slice does not carry: not covered)
+                    raise RuntimeError('--recompute-stage 1: records with visible-v1 frames are not supported')
+                need_ = len(all_flat) * stage_cols(rl.rows, all_flat)
+                if L.get('stage_rc') is None or L['stage_rc'].numel() < need_:
+                    L['stage_rc'] = None
+                    L['stage_rc'] = torch.empty(int(need_ * 1.25) + 64 * ROW_BYTES, dtype=torch.uint8).pin_memory()
+                every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
+                                                      stage=L['stage_rc'], with_raw=True, frames=rl.frames)
+                ne_e = rl.rows.reshape(-1)['n_ent'][all_flat].astype(np.int64)   # (the host's entity counts)
+                wid_e = every['ent'].shape[1]
             else:
                 every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
                                        frames=rl.frames)
@@ -4061,6 +4084,10 @@ def main(argv=None, child=None, actor=None):
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
                     b_p = fast_plan_rows(fr_, raw_e, pend_e, at, min(at + chunk, len(all_flat)), fparts, n_buckets,
                                          NI_f, G_f, t_on) if fast2 else None
+                    if rstage:   # (--recompute-stage 1: take(every, part)'s batch, decoded from a slice of the bytes)
+                        hi_ = min(at + chunk, len(all_flat))
+                        b_p = decode_rows(raw_e[at:hi_], pending=pend_e[at:hi_],
+                                          entities=min(wid_e, used_entities(ne_e[at:hi_])))
                     if gtok_on and (recompute or vg_stored is None):   # (B22: value_global in the same pass)
                         b_p = take(every, part) if b_p is None else b_p
                         tk_p = tk_all(part)
