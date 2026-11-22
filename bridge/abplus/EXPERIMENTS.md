@@ -15114,3 +15114,125 @@ seq1 的速度约为 T1 的四分之三：x_real 约 216，T1 约 289。协调�
 - **结论更新**：上面的结论 1–3 不变。同游戏小时下 CF 开 / 关没有可测的差别（Isaac 12 个存档 −0.06 ± 0.16；Magdalene、Cain 各 3 个存档，差都在一个 SE 之内）。存档间标准差 0.43–0.84，仍是评测里最大的噪声来源。
 - **全量门**：树 m6caf1c4（= exp/seq-v1 7b34faf 的代码），GPU 1，rc 0：1171 passed、7 skipped、1 xfailed；第二遍（无 GPU，fork_in_process）2 passed。
 - 原始文件：dgene bm1/c114/eval2/（s2-u7600 / 8000 / 8241-c0-256、s2n-u7600 / 8000-c0-256、s2n-last-c0、s2-* / s2n-*-c1-256、-c2-256）、c114/eval2/REPORT_ev3.txt、c114/STATUS_ev2、c114/STATUS_ev3、c114/GATE_ev3.txt、reports/gate-ev3-1122-101416-Rgk5Jr.log、gate2-ev3-1122-102721-epHQ2q.log。
+
+### B69 learner 端的提速批次：micro / 重算块、v3 上的 --learner-fast、CUDA 图与 compile 探针、--recompute-stage（2026-11-22，lane s，验收；exp/learner-speed e36cfc0）
+
+**实验目的**
+
+关 CF 时，24 个以上 worker 的吞吐卡在 learner 的 update_s 上，一次更新约 10 s，GPU 2 平均只有 55–67%。
+
+协调方批准的几项只量、或做成默认关的开关：
+- e：--micro 4096；
+- f：更大的重算块；
+- a：按桶捕获 CUDA 图（只量）；
+- b：帧编码器的 compile（只量）；
+- 另外核对 10 月为旧模型写的 --learner-fast 在 v3 模型上到底覆盖了哪些部分。
+
+要回答两件事：learner 还能快多少，瓶颈在主机调度还是显卡算力。
+
+**实验方法**
+
+- **位置**：lane s。GPU 1 跑 actor，GPU 2 跑 learner；CPU 0-11,24-35（node 0）；容器 40g。
+- **起点**：seq2n 的 last.pt；CF 关（`--cf 0`）。
+- **配置**：seq2n 的 train_args（`--frame v3 --temporal 1 --packed 1 --amp bf16 --micro 2048 --minibatch 4096 --epochs 3 --rollout 32768`），加上 `--rewind 1 --stall-progress first`；worker 不带 torch；原生 ROW 编码器。
+- **生产对比**：`--learner-process 1`，每次运行 40 次更新，取 u5 之后 36 行的均值。速度用 ×实时（x_real）表示。
+- **bench**：abplus_bench_learner，learner 在训练进程里，取第 8 次更新的 job 在进程内复跑，每条路径 3 次。
+- **数值核对**（--check）：tf32 和严格 fp32 各一遍，比较第一步损失、第一步梯度、27 步后的权重；底噪是“同一路径跑两次”的差。
+- **树**：l4efbe78、l3acdf64、l70d836a、le36cfc0（git archive，与提交一致）。
+- **提交**（exp/learner-speed，基于 exp/seq-v1 aaead2c）：
+  - 4efbe78：--recompute-chunk；bench 路径的参数覆盖（@micro=、@rchunk=）；
+  - 6d1fe4c：v3 拒绝 --learner-fast 1 / 2；
+  - d60ab46：a / b 探针（abplus_probe_v3.py，ISAAC_RL_V3_PROBE=1）；
+  - 3f5a229：--recompute-stage；
+  - 3acdf64：A1 的审查修改，以及探针 import 的修复；
+  - 70d836a：两处内存泄漏；
+  - e36cfc0：Codex 第 30 轮要求的扩容回退。
+
+**实验结果**
+
+1. **起点**（28 个 worker）：
+   - update_s 9.99，其中 recompute 2.85、ppo 5.79、teach_build 1.01、opt 0.19；
+   - ×实时 434.9，GPU 2 平均 67%。
+
+2. **micro 4096 / 重算块 8192**（e / f；28 个 worker，生产配置）：
+
+| 配置 | ×实时 | update_s | 重算 | ppo | teach_build | GPU 2 平均 / 显存峰值 |
+|---|---|---|---|---|---|---|
+| base（micro 2048） | 434.9 | 9.99 | 2.85 | 5.79 | 1.01 | 67% / 16.6 GB |
+| --micro 4096 | 452.1（+3.9%） | 9.60 | 3.03 | 3.03 | 3.15 | 71% / 23.2 GB |
+| + --recompute-chunk 8192 | 443.7（+2.0%） | 9.79 | 3.01 | 3.13 | 3.26 | 69% / 24.1 GB |
+
+   - ppo 和 teach_build 之间的此消彼长是时间归属的转移：异步的 GPU 工作在 teach_build 那里才被同步上。只看 update 总时间。
+   - bench 数值：
+     - micro 4096：第一步梯度范数相对差 5.6e-3，余弦 0.999984，tf32 和严格 fp32 一样大。原因是打包分桶的组成随 micro 变，求和顺序跟着变；第一步有一条决策因此越过 clip 边界（14/3592 → 15/3592）。27 步后的权重差是底噪的 3–5 倍。
+     - 重算块 8192：严格 fp32 下在底噪内，但重算并没有变快（2.69 → 2.71 s）。
+   - **决定**：两者都不进训练臂。micro 4096 的收益约 4%，代价是学习卡只剩约 1 GB 余量。参数保留，默认不变。
+
+3. **--learner-fast 在 v3 模型上的覆盖**（读码，再用 bench 印证）：
+   - **v3 帧编码器**：_forward_v3 不读 B18 的主机计划（分桶、ekeep、xperm、去重网格）。frame_v3.forward_packed 不管 fast 是几，都用自己的分桶，每次调用一次 pad.cpu() 同步。快 attention 和快 LayerNorm 只在 float32、不在 autocast 时生效，--amp bf16 下不生效。nhwc、去重、cnn_bucket 只作用于旧模型的 CNN。
+   - **时间主干**：没有快路径（直接用 SDPA 和 nn.LayerNorm）。
+   - **真正生效的**：头部的 log_prob_fast、fused Adam、按字节 gather 小批、teacher meta 留在 GPU 上；fast 2 再加上重算那一遍的 pinned 暂存。
+   - **跑不起来**：raw 合批时，learner 的记录字节被截到最长 v3 帧（49,148 B），教师环保留完整 ROW（151,880 B），torch.cat 宽度不一致。这是 A-3 的截断没有同步到 B18 的 raw 合批。
+   - **去掉 raw 后的 bench**：fast 0 / 1 / 2 是 9229 / 9246 / 8226 ms。1 和 2 对 0 的第一步损失、第一步梯度都逐位相同，证明 v3 上前向没变。fast 2 的收益全部来自重算的暂存（2.57 → 1.60 s）。
+   - **决定**：--frame v3 加 --learner-fast 1 / 2 启动即拒绝（6d1fe4c）。fast 2 的重算暂存拆成单独的开关，即第 5 项。
+
+4. **a / b 探针**（24 个 worker，bench，一次更新）：
+   - **形状**：帧编码器调用 72 次，训练 54 次、重算 18 次，形状签名各不相同。行数取到 256 的倍数、token 维取到 8 的倍数以后仍有约 60 种，而且每次更新都换一批；这样粗化本身就让 attention 的补齐开销变成 1.34–1.38 倍。
+   - **profile**：一次更新 9.40 s，其中 **GPU 忙 7.69 s（82%）**，主机暴露的只有 1.71 s；每次更新发射 17 万次 kernel。帧编码器前向占 GPU 2.02 s（训练 1.52 s，重算 0.50 s）。
+   - **结论**：24 个 worker、CF 关时，learner 受显卡算力限制，不受主机调度限制。
+   - **a，CUDA 图**：省的上限约 1.7 s / 更新，但每次更新要约 60 张、而且每次都换的图。不做。
+   - **b，compile**（forward_packed，前向 + 反向，bf16）：
+     - 编好以后单次快 25%（0.072 对 0.096 s）；
+     - 固定形状时，每个新形状要编译 48–68 s；
+     - dynamic=True：第一次 73 s，第二次 23 s，之后每个新形状约 2.5 s；
+     - 图在 4 处断开，都来自 forward_packed 里的主机端分桶（pad.cpu()、bincount、nonzero、numpy unravel_index）。
+     - 搁置，不为它改 forward_packed。
+   - **learner 进程模式下 compile 报错的真正原因**：容器里 uid 1000 没有 passwd 条目，torch._inductor 取默认缓存目录时报 `KeyError: getpwuid(): uid not found: 1000`，learner 进程一启动就死。设了 TORCHINDUCTOR_CACHE_DIR 以后，`--learner-process 1 --packed 0 --v3-encoder-compile default` 正常跑完（rc 0）。第一次更新 777.6 s 几乎全是编译，这期间游戏端断了 11 局。
+
+5. **--recompute-stage 1**（默认 0）：
+   - **做法**：重算那一遍的记录一次性 gather 进 pinned 缓冲（tok_policy.stage_cols 按实际字节算大小：截到最长 v3 帧，约 49 KB / 条；32,768 条约 2 GB），异步拷贝；每块从字节切片解码，实体数用主机上的计数。主机计划、去重网格、fused Adam 都不带。
+   - **拒绝**：和 --learner-fast 2 或 --block-memory 1 一起开时拒绝；记录的帧不全是 v3（或不全是无帧）时报错。
+   - **bench**（24 个 worker）：
+     - update 9584 → 8360 ms（−12.8%，树 l3acdf64）；修好泄漏以后 8558 → 7634 ms（−10.8%，树 l70d836a）；
+     - 第一步损失、第一步梯度逐位相同（tf32 和严格 fp32），27 步后的权重在底噪内。
+   - **生产对比**（CF 关，24 个 worker，交替进行）：
+
+| 运行 | 树 | ×实时 | update_s | 重算 | collect | wait_learner | GPU 2 显存峰值 | 容器峰值 | learner RSS |
+|---|---|---|---|---|---|---|---|---|---|
+| base b1 | 3acdf64 | 429.0 | 10.13 | 2.94 | 9.41 | 0.78 | 18.1 GB | 21.8 | 5.1–5.2 GB |
+| 开 s1 | 3acdf64 | 460.0 | 8.91 | 1.76 | 9.51 | 0.00 | 20.5 GB | 24.2 | 6.9–7.3 GB |
+| base b2 | 3acdf64 | 428.0 | 10.15 | 3.00 | 9.39 | 0.83 | 18.4 GB | 21.9 | 4.8–5.2 GB |
+| 开 s2 | 3acdf64 | 457.0 | 9.03 | 1.87 | 9.54 | 0.07 | 23.1 GB | 28.4 | 6.9 → 11.4 GB |
+| base b3 | 70d836a | 439.6 | 9.89 | 2.88 | 9.23 | 0.72 | 17.8 GB | 21.7 | 4.8–5.2 GB |
+| 开 s3 | 70d836a | 468.0 | 8.78 | 1.70 | 9.33 | 0.01 | 14.3 GB | 23.7 | 6.8–7.2 GB |
+
+   - **收益**：三对的 ×实时 +6.5% 到 +7.4%，update_s 约 −11%。
+   - **节拍器换了**：开了以后 update（8.8–9.0 s）比 collect（9.3–9.5 s）短，wait_learner 为 0，24 个 worker 下节拍器换成了采样端。
+   - **两处泄漏**（70d836a 已修）：
+     - 显存：重算最后一块的 batch 是记录字节的视图，留着它，整份字节就过完 PPO 才释放。bench 峰值 allocated 因此 +1.7 GB。修好以后 9.40 对 9.39 GB；s3 的 GPU 2 显存反而比 base 低，因为字节更早释放了。
+     - pinned：帧变长时缓冲要扩容，旧块留在 torch 的 pinned 缓存里，s2 第 32 行跳到 +6 GB。修好以后 learner RSS 稳定在 +2.0 GB，就是缓冲本身。
+   - **扩容的规则**（e36cfc0，Codex 第 30 轮要求）：只有 torch._C._host_emptyCache 存在才扩容，先放掉旧块；没有入口时这一次更新走不暂存的重算（逐位相同），保留原缓冲；分配、扩容、回退都打日志。
+   - **主机直接验证**（torch 2.7.1+cu128，进程 VmRSS）：pin 1 GiB 后 1608 MiB → 丢掉并调用释放后 584 → pin 2 GiB 后 2632；不调用释放时最后是 3656。
+   - **测试**（Linux 21 passed）：开对关逐位相同（真实的 learn()）；切片解码与 take 等价（紧凑和 ROW 两种 v3 rollout）；强制扩容、强制回退两条路径都与关逐位相同；各条拒绝。
+   - **审查**：
+     - A1：等价性成立，提出 2 处修改和 3 条补充，均已采纳（3acdf64）。
+     - Codex 第 30 轮：必须先改的只有扩容回退一处（e36cfc0）；另记两个不在长训配置里的入口：从存档恢复出的 block-memory 在早期检查之后才生效，bench 能在参数解析之后覆盖 fast / rstage。
+     - Codex 第 31 轮：可以在长训练中打开，无必须改的问题。
+
+**结论**
+
+1. --recompute-stage 1 可以用于训练臂：CF 关、24 个 worker 时 ×实时 +6.5% 到 +7.4%，update_s 约 −11%，第一步逐位相同；代价是 learner 进程多 2.0 GB pinned 内存。交付版本 e36cfc0，合入 exp/seq-v1 和门禁由 A1 做。
+2. micro 4096、重算块 8192、--learner-fast（v3 上拒绝）都不进训练。
+3. CUDA 图不做；帧编码器 compile 搁置。
+4. 24 个 worker、CF 关时，learner 受显卡算力限制（GPU 忙 82%）。开了 --recompute-stage 以后，节拍器换成了采样端。
+
+**遗留**（只记不做）
+- learner 进程死后 trainer 挂住不退，要等容器的超时；
+- watch.sh 自检；
+- 28 个 worker 加 --recompute-stage 的吞吐没有量：采样端重新成为瓶颈以后，下一个上限在哪里还不知道。
+
+- 原始文件：
+  - 184 bm1/c114/sweep/{lp28base,lp28m4096,lp28m4r8,ls28mr,ls28fnr,lp24probe2,lc24,lc24b,lr24chk,lr24chk2,lp24b1,lp24s1,lp24b2,lp24s2,lp24b3,lp24s3}/；
+  - c114/STATUS_sweepLS3、LP2–LP5；
+  - p0/RELAY_L_STATUS、RELAY_LP_STATUS、gpu_ls.csv、gpu_lp.csv、mem/memlp_lp24*.txt、pinchk.py；
+  - 共享笔记 learner-speed-1122.md。
