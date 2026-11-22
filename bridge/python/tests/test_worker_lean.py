@@ -32,8 +32,9 @@ from isaac_bridge import tok_sampler as TS   # noqa: E402
 
 
 def turbo_so():
-    so = os.environ.get('ISAAC_RL_TEST_TURBO_SO') or os.path.join(os.environ.get('ABP_HOME', ''), 'tools',
-                                                                  'libabp_turbo.so')
+    """ISAAC_RL_TEST_TURBO_SO only (as tests/test_fast_row_v9.py): a libabp_turbo.so built from this tree. Never a
+    game home's library found by itself -- the gate's ABP_HOME may hold an older layout's (refused, rightly, by FastRow)."""
+    so = os.environ.get('ISAAC_RL_TEST_TURBO_SO', '')
     return so if so and os.path.exists(so) else ''
 
 
@@ -121,7 +122,7 @@ def test_a_the_native_encoders_compared(probes):
     and wrote the same: skipped -- visibly -- where the library is not built (Windows)."""
     so, new, old = probes
     if not so:
-        pytest.skip('no libabp_turbo.so (ISAAC_RL_TEST_TURBO_SO / ABP_HOME/tools): FastRow and native v2 not compared')
+        pytest.skip('ISAAC_RL_TEST_TURBO_SO not set (a libabp_turbo.so of this tree): FastRow and native v2 not compared')
     assert new['fast_row_fast'] > 0 and new['fast_row'] == old['fast_row'], (new.get('fast_row_fast'),)
     assert new['v2_native'] and old['v2_native'], 'the native v2 encoder did not load'
 
