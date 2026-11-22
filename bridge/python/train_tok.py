@@ -2009,6 +2009,10 @@ def main(argv=None, child=None, actor=None):
     p.add_argument('--micro', type=int, default=0,
                    help="rows per forward / backward pass: a minibatch's gradient is accumulated over parts of this "
                         'size (0: the whole minibatch at once). The step is the same, the GPU memory smaller')
+    p.add_argument("--recompute-chunk", type=int, default=0,
+                   help="(2026-11-22, the learner's update time) rows per forward pass of the recompute (the values / "
+                        "log-probabilities of the stored decisions from the weights at the update's start, no gradient): "
+                        "0 (default) --micro, or --minibatch without it, as before; larger: fewer passes, more memory")
     p.add_argument('--lr', type=float, default=3e-4)
     p.add_argument('--lr-final', type=float, default=1e-4)
     p.add_argument('--lr-schedule', choices=('linear', 'cosine'), default='linear',
@@ -4043,7 +4047,7 @@ def main(argv=None, child=None, actor=None):
                 U['log'] += time.perf_counter() - t_l0
             m_r = pmark('b38:recompute')
             with torch.inference_mode():
-                chunk = args.micro or args.minibatch
+                chunk = args.recompute_chunk or args.micro or args.minibatch
                 for at in range(0, len(all_flat), chunk):
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
                     b_p = fast_plan_rows(fr_, raw_e, pend_e, at, min(at + chunk, len(all_flat)), fparts, n_buckets,
@@ -4097,7 +4101,7 @@ def main(argv=None, child=None, actor=None):
             vg_now = np.zeros_like(rl.value)
             if not vgs:   # (no recompute pass: one of its own, a chunk of records at a time)
                 with torch.inference_mode():
-                    chunk = args.micro or args.minibatch
+                    chunk = args.recompute_chunk or args.micro or args.minibatch
                     for at in range(0, len(all_flat), chunk):
                         idx_ = all_flat[at:at + chunk]
                         tk_ = {}
