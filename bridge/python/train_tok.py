@@ -504,6 +504,40 @@ def profile_learn(learn, job, path):
     print(f'B38: the profile of one update written to {path}', flush=True)
 
 
+def recompute_stage_buffer(L, need, log=print):
+    """(2026-11-22, --recompute-stage 1) the pinned stage for an update's recompute pass of `need` bytes, kept in
+    L['stage_rc'] between updates, or None: this update recomputes unstaged (--recompute-stage 0's path, the same values
+    bit for bit). A stage too small is replaced by a larger one only when this torch can release its pinned cache
+    (torch._C._host_emptyCache): the old block would otherwise stay pinned in the caching host allocator beside the new
+    one, and the learner's RSS would step up at every growth (lane s: +1.9 -> +6 GB; Codex round 30). Each allocation,
+    growth and fallback is logged."""
+    import torch
+    from isaac_bridge.tok_policy import ROW_BYTES
+    cur = L.get('stage_rc')
+    if cur is not None and cur.numel() >= need:
+        return cur
+    release = getattr(torch._C, '_host_emptyCache', None)
+    size = int(need * 1.25) + 64 * ROW_BYTES
+    if cur is not None:
+        old = cur.numel()
+        if release is None:
+            L['stage_rc_fallbacks'] = L.get('stage_rc_fallbacks', 0) + 1
+            log(f'--recompute-stage: the stage ({old / 2 ** 20:.0f} MiB) is smaller than this update needs '
+                f'({need / 2 ** 20:.0f} MiB) and this torch has no pinned-cache release: this update recomputes '
+                f'unstaged (the same values), the stage kept (fallback {L["stage_rc_fallbacks"]})', flush=True)
+            return None
+        L['stage_rc'] = cur = None
+        release()   # (the old block, now free in the caching host allocator, unpinned before the new one)
+        L['stage_rc_grows'] = L.get('stage_rc_grows', 0) + 1
+        log(f'--recompute-stage: the stage grows {old / 2 ** 20:.0f} -> {size / 2 ** 20:.0f} MiB (the old block '
+            f'released first; growth {L["stage_rc_grows"]})', flush=True)
+    else:
+        how = 'available' if release is not None else 'not available: a larger need falls back to the unstaged pass'
+        log(f'--recompute-stage: the stage {size / 2 ** 20:.0f} MiB pinned (pinned-cache release {how})', flush=True)
+    L['stage_rc'] = torch.empty(size, dtype=torch.uint8).pin_memory()
+    return L['stage_rc']
+
+
 def fast_plan_counts(roll, flat, rows_dev, fparts, item_slots, n_item_tok, t_on, t_fb=True):
     """(B38 step 4, train_tok --learner-fast 2) what the start-of-update pass needs for the B18 fast path's host plans
     of records at flat positions of a rollout: per record its entity / door / item counts and its history token's
@@ -2585,6 +2619,12 @@ def main(argv=None, child=None, actor=None):
         p.error('--recompute-stage 1 with --learner-fast 2: fast 2 stages the recompute pass already (one of them)')
     if args.recompute_stage and args.block_memory:   # (A1's review: the block memory's recompute is a pass of its own)
         p.error('--recompute-stage 1 does not act on --block-memory 1 (its recompute pass is block_learner\'s)')
+    if args.recompute_stage:   # (Codex round 30: whether a stage can grow, in the run's log from the start)
+        import torch as torch_rs_
+        how_ = ('available: a stage too small is replaced, the old one released'
+                if hasattr(torch_rs_._C, '_host_emptyCache') else
+                'not available: an update needing a larger stage recomputes unstaged, the stage kept')
+        print(f'--recompute-stage 1: pinned-cache release (torch._C._host_emptyCache) {how_}', flush=True)
     if args.temporal_rooms < 0:
         p.error('--temporal-rooms must be >= 0')
     from isaac_bridge.tok_obs import obs_visible_conflict
@@ -3954,6 +3994,7 @@ def main(argv=None, child=None, actor=None):
         fast = bool(args.learner_fast)
         fast2 = args.learner_fast >= 2   # (B38 step 4)
         rstage = bool(args.recompute_stage) and not fast2   # (2026-11-22: fast 2's recompute staging alone)
+        rs_u = False   # (this update's recompute staged: rstage and recompute_stage_buffer gave a stage)
         # (ISAAC_RL_LEARNER_PARTS: a subset of the parts, for the bench's attribution; default all)
         fparts = set(os.environ.get('ISAAC_RL_LEARNER_PARTS', 'math,ekeep,buckets,nhwc,ln,dedup,logp,raw').split(',')
                      if fast else ())
@@ -4047,24 +4088,21 @@ def main(argv=None, child=None, actor=None):
                 every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
                                                       stage=L['stage_r'], with_raw=True, frames=rl.frames)
                 fr_ = fast_plan_counts(rl, all_flat, every, fparts, item_slots, NI_f, t_on, t_fb)
-            elif rstage:   # (--recompute-stage 1: fast 2's staging alone, the stage sized to the records' bytes)
-                stage_schema_check(rl.rows, all_flat)   # (every record v3, or every one without a frame)
-                need_ = len(all_flat) * stage_cols(rl.rows, all_flat)
-                if L.get('stage_rc') is None or L['stage_rc'].numel() < need_:
-                    # (lane s, 2026-11-22: a larger stage when the rollout's longest frame grows; the old block went
-                    #  back to torch's caching host allocator and stayed pinned -- the learner's RSS stepped from
-                    #  +1.9 to +6 GB. Its cached free blocks released before the new one: only one stage pinned)
-                    L['stage_rc'] = None
-                    if hasattr(torch._C, '_host_emptyCache'):
-                        torch._C._host_emptyCache()
-                    L['stage_rc'] = torch.empty(int(need_ * 1.25) + 64 * ROW_BYTES, dtype=torch.uint8).pin_memory()
-                every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
-                                                      stage=L['stage_rc'], with_raw=True, frames=rl.frames)
-                ne_e = rl.rows.reshape(-1)['n_ent'][all_flat].astype(np.int64)   # (the host's entity counts)
-                wid_e = every['ent'].shape[1]
             else:
-                every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
-                                       frames=rl.frames)
+                stage_rc_ = None
+                if rstage:   # (--recompute-stage 1: fast 2's staging alone, the stage sized to the records' bytes)
+                    stage_schema_check(rl.rows, all_flat)   # (every record v3, or every one without a frame)
+                    stage_rc_ = recompute_stage_buffer(L, len(all_flat) * stage_cols(rl.rows, all_flat))
+                rs_u = stage_rc_ is not None   # (None: a fallback -- this update unstaged, as --recompute-stage 0)
+                if rs_u:
+                    every, raw_e, pend_e = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat],
+                                                          device, stage=stage_rc_, with_raw=True, frames=rl.frames)
+                    ne_e = rl.rows.reshape(-1)['n_ent'][all_flat].astype(np.int64)   # (the host's entity counts)
+                    wid_e = every['ent'].shape[1]
+                else:
+                    every = rows_to_device(rl.rows, all_flat, rl.pending.reshape(-1, nh)[all_flat], device,
+                                           frames=rl.frames)
+                del stage_rc_
             acts_all = torch.from_numpy(rl.actions.reshape(-1, nh)[all_flat]).to(device)
             # (memory: one GRU step from each decision's stored input state)
             h_all = torch.from_numpy(rl.h.reshape(-1, mem_dim)[all_flat]).to(device) if mem_on else None
@@ -4089,7 +4127,7 @@ def main(argv=None, child=None, actor=None):
                     part = torch.arange(at, min(at + chunk, len(all_flat)), device=device)
                     b_p = fast_plan_rows(fr_, raw_e, pend_e, at, min(at + chunk, len(all_flat)), fparts, n_buckets,
                                          NI_f, G_f, t_on) if fast2 else None
-                    if rstage:   # (--recompute-stage 1: take(every, part)'s batch, decoded from a slice of the bytes)
+                    if rs_u:   # (--recompute-stage 1: take(every, part)'s batch, decoded from a slice of the bytes)
                         hi_ = min(at + chunk, len(all_flat))
                         b_p = decode_rows(raw_e[at:hi_], pending=pend_e[at:hi_],
                                           entities=min(wid_e, used_entities(ne_e[at:hi_])))
@@ -4129,7 +4167,7 @@ def main(argv=None, child=None, actor=None):
             else:
                 value_now = None
             prox_all = torch.cat(lps)
-            if rstage:   # (lane s, 2026-11-22: the last chunk's batch is views of raw_e -- kept, it held the whole
+            if rs_u:   # (lane s, 2026-11-22: the last chunk's batch is views of raw_e -- kept, it held the whole
                 b_p = None   #  records' bytes on the device through the PPO epochs, about 1.7 GB)
             pmark(None, m_r)
             sec('recompute')
@@ -4209,7 +4247,7 @@ def main(argv=None, child=None, actor=None):
             if args.decoupled:
                 prox = prox_all[pos].clone()
             del every, prox_all
-            if rstage:   # (A1's review of --recompute-stage: the records' bytes on the device not kept past here)
+            if rs_u:   # (A1's review of --recompute-stage: the records' bytes on the device not kept past here)
                 del raw_e, pend_e, ne_e
         else:
             stage = None
