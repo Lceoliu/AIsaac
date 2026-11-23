@@ -259,6 +259,7 @@
 | C118 | 11-20/21 | 续训 seq2：从 seq1 最终存档再训 5000 游戏小时，加回溯账本、stall first、learner 进程、打包、原生 ROW 编码（金丝雀），16 个 worker，lane s | 正常结束；训练读数 4.26 → 4.75；与 C119 配对评测：同游戏小时无可分辨差别 |
 | C119 | 11-20/21 | 对照臂 seq2n：与 C118 只差 --cf 0，lane b；两臂的配对评测（单存档、换算墙钟、多存档） | 关 CF 快约 1.4 倍；9 个存档配对差 −0.12（SE 0.15）；存档间标准差 0.35 / 0.59；单存档比较的教训 |
 | C120 | 11-22 | 评测温度：seq2 / seq2n 存档的贪心、logits ÷ 0.5 / 0.35 / 0.25 / 0.15、分头降温，同种子配对 | 降温 0.15–0.35 各存档一致 +1.75 – +2.49 间；贪心卡死最多；收益主要来自移动头；降温口径下 u6400 → u8241 无进步 |
+| C121 | 11-23 起 | 熵系数 A/B：从 seq2n 末档续训两臂，seq3b ent-coef 0.001 / 20 worker（lane b）、seq3s 0.003 / 24 worker（lane s），各 +2500 游戏小时，--recompute-stage 1，树 m9eba1b2 | 进行中 |
 
 ## A. 桥接与环境
 
@@ -15296,3 +15297,45 @@ seq2n 末档（u8241），温度扫描（REPORT_ev5.txt）：
   - c114/STATUS_sweepLS3、LP2–LP5；
   - p0/RELAY_L_STATUS、RELAY_LP_STATUS、gpu_ls.csv、gpu_lp.csv、mem/memlp_lp24*.txt、pinchk.py；
   - 共享笔记 learner-speed-1122.md。
+
+### C121 熵系数 A/B：从 seq2n 末档续训两臂，ent-coef 0.001（seq3b）/ 0.003（seq3s），--recompute-stage 1，dgene（2026-11-23 起）
+
+**实验目的**
+
+- C120 发现评测时降温（logits ÷ 0.15–0.35）在各存档上一致多清约 1.8–2.5 间房，收益主要来自移动头。
+- 训练末段五个头的熵合计约 2.45：熵系数 0.01，五头共用一个系数，全程不衰减。移动头、射击头都还在最大熵的六成以上。
+- 要回答：把训练的熵系数调低（0.001 / 0.003）后，按训练口径（按概率采样）评测，策略是否能把一部分降温收益学进来；采样口径和降温口径之间的差是否缩小；卡死截断是否随之上升（C120：温度越低卡死越多）。
+- 顺带：两臂第一次长时间打开 --recompute-stage 1（B69 验收，Codex 第 30 / 31 轮），看它在 2500 游戏小时里是否稳定（扩容次数、回退次数、learner 常驻内存）。
+
+**实验方法**
+
+- **起点**：两臂都从 seq2n 的 last.pt 续训（u8241，9999.6 游戏小时；c114/keep/seq2n-last-u8241.pt，sha1 f4aa21dfe0a8），各复制一份到自己的目录，train_guard 从那里续跑。
+- **两臂**（用户 11-23 批准“按方案起”；除下表三项外与 seq2n 完全相同）：
+
+| 臂 | lane | ent-coef | worker | 时长 | 容器上限 / 看门停止线 |
+|---|---|---|---|---|---|
+| seq3b | b：GPU 3 actor + 4 learner，CPU 12-19,36-43，node 1 | 0.001 | 20 | +2500 游戏小时（到 12499.6） | 36g / ctr_mem_gb ≥ 34 |
+| seq3s | s：GPU 1 actor + 2 learner，CPU 0-11,24-35，node 0 | 0.003 | 24 | +2500 游戏小时（到 12499.6） | 40g / ctr_mem_gb ≥ 38 |
+
+- **相同部分**：树 m9eba1b2（exp/seq-v1 9eba1b2；全量门 rc 0：1203 passed、21 skipped、1 xfailed，fork_in_process 17 passed，native skips 0），库 home-s2 668fcb5fd63b。train_args = c114/seq2n/train_args（--cf 0、--rewind 1、--stall-progress first、--learner-process 1、--packed 1、学习率固定 1e-4），再加 `--workers W --ent-coef ENT --recompute-stage 1`。环境变量：梯度范数、visible v3、TOK_PIN、ISAAC_RL_WORKER_LEAN=1、原生 ROW 编码器（worker 0 做金丝雀）。
+- **存档**：每 100 次更新一个，留 3 个；每 200 次更新一个里程碑（约 243 游戏小时），不轮换。
+- **看门**（a1seq3w.py，每 300 s）：
+  - 写 STOP 并告警：errors 连续 3 次上升；rewind_lost / store_dropped > 0；金丝雀不一致；容器内存到停止线；x_real 近 50 次更新的中位数低于 0.8 × 基线（seq3b 300、seq3s 400）。
+  - 挂死规则：输出里有 Traceback，且 progress.csv 900 s 没动，就停掉这一臂的容器。
+  - recompute-stage：回退只计数；扩容累计超过 5 次告警一次。
+  - 每 500 游戏小时写一条读数。
+- **内存**：守护脚本每 30 秒采样一次各进程内存。我方容器合计：两臂同时训练 76g；一臂评估（2 × 18g）加另一臂训练最多 76g；都 ≤ 80g。
+- **评测**（a1arm3ev.sh，训练结束后自动接力）：
+  - 评测对象：update 是 400 的倍数的存档（约每 485 游戏小时一个）和最后一个存档。
+  - 口径同 C116 / C119 / C120：eval_tok --mode run --items，每局上限 1800 s，卡死规则 events 60 s，Isaac，种子 2147490000 起 256 个，树 m25c630c，库 home-s2。
+  - 两种口径都报：按概率采样，以及 logits ÷ 0.3（c114/in/eval_temp.py）。
+  - 每个存档都和 seq2n u8241 按种子配对：采样口径对 s2n-last-c0，降温口径对新跑的 s2n-u8241-c0-t03。
+  - 汇总表：c114/in/ev6_cmp.py → c114/eval2/REPORT_seq3b.txt / REPORT_seq3s.txt。
+- **已知偏差**：
+  - 两臂之间不只熵系数不同，worker 数（20 / 24）、lane（CPU 和 GPU 的位置）也不同。同游戏小时的比较能消掉一部分速度差，但两臂的差不能全归到熵系数上。
+  - 没有一条熵系数 0.01 继续训练的对照臂。各臂与起点（seq2n u8241）的差，混进了“多训 2500 小时”本身的效果；C120 在降温口径下看到 +2766 → +5000 小时没有进步，可以作为参照。
+  - C119：存档间标准差 0.43–0.84，单个存档不能定胜负，要看多存档的均值。
+
+**实验结果**
+
+（待评测完成后补。）
